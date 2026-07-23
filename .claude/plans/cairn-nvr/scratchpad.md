@@ -67,6 +67,12 @@ Append during /phx:work — do not rewrite history.
   seq/ts continuity with NO rewriting. Dedupe guard needed at the
   replay→live boundary (subscribe-then-snapshot, drop seq <= last
   replayed). Verdict: replay is safe; no seq rewriter built.
+  **REVISED 2026-07-22 (live testing)**: passthrough seq DIES at the SRTP
+  layer — ffmpeg's random initial seq wraps/regresses and libsrtp's
+  outbound replay protection rejects everything (`Unable to protect RTP:
+  :replay_old` → first frame renders, then freeze). The session now
+  rewrites seq with its own monotonic counter on every sent packet
+  (timestamps still pass through). Confirmed smooth in Ben's browser.
 
 ## Dead-ends already settled in research (do not revisit)
 

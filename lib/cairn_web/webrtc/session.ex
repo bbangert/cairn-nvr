@@ -9,9 +9,13 @@ defmodule CairnWeb.WebRTC.Session do
 
   On `:connected` the session replays the camera's last GOP
   (`Cairn.RTPHub.gop_snapshot/1`) for an instant first frame, then follows
-  the live RTP topic. Per the 7.3 spike, ex_webrtc passes seq/timestamps
-  through untouched, so replay + live from the same camera stream keeps
-  continuity; a seq guard drops the overlap at the boundary.
+  the live RTP topic. The session rewrites **sequence numbers** with its
+  own monotonic counter on every packet it sends: ffmpeg starts RTP at a
+  random seq, and any wrap/regression trips libsrtp's outbound replay
+  protection (`Unable to protect RTP: :replay_old` — learned live, revising
+  the 7.3 spike verdict). Timestamps pass through untouched. A guard on
+  the original camera seq drops duplicate content at the replay/live
+  boundary.
   """
 
   use GenServer, restart: :temporary
@@ -61,7 +65,8 @@ defmodule CairnWeb.WebRTC.Session do
        pc: pc,
        track_id: track.id,
        subscribed: false,
-       replay_last_seq: nil
+       replay_last_seq: nil,
+       out_seq: 0
      }}
   end
 
@@ -119,8 +124,7 @@ defmodule CairnWeb.WebRTC.Session do
     if replay_overlap?(state, packet) do
       {:noreply, state}
     else
-      PeerConnection.send_rtp(state.pc, state.track_id, packet)
-      {:noreply, %{state | replay_last_seq: nil}}
+      {:noreply, send_packet(%{state | replay_last_seq: nil}, packet)}
     end
   end
 
@@ -144,7 +148,7 @@ defmodule CairnWeb.WebRTC.Session do
   defp start_streaming(state) do
     Phoenix.PubSub.subscribe(Cairn.PubSub, Cairn.RTPHub.topic(state.camera_id))
     replay = safe_snapshot(state.camera_id)
-    Enum.each(replay, &PeerConnection.send_rtp(state.pc, state.track_id, &1))
+    state = Enum.reduce(replay, state, &send_packet(&2, &1))
 
     last_seq =
       case List.last(replay) do
@@ -153,6 +157,13 @@ defmodule CairnWeb.WebRTC.Session do
       end
 
     %{state | subscribed: true, replay_last_seq: last_seq}
+  end
+
+  # our own outbound seq keeps libsrtp's replay window strictly monotonic
+  defp send_packet(state, packet) do
+    packet = %{packet | sequence_number: rem(state.out_seq, 65_536)}
+    PeerConnection.send_rtp(state.pc, state.track_id, packet)
+    %{state | out_seq: state.out_seq + 1}
   end
 
   defp safe_snapshot(camera_id) do

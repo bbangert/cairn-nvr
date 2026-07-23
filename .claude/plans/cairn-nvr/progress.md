@@ -18,11 +18,10 @@ State: COMPLETED (review cycle 1 done; external gates below still open)
 
 ## External gates
 
-- **BROWSER VIDEO CHECK (open — needs a human)**: headless proxies all
-  pass against the real camera (2026-07-22). Remaining human step: server
-  is left running — open http://localhost:4000/ and confirm the
-  reolink_main tile renders moving video (MSE; HLS is the fallback).
-  Owner: Ben.
+- **BROWSER VIDEO CHECK: PASSED 2026-07-22** — Ben confirmed smooth live
+  video in-browser on BOTH paths: MSE (after live-edge cushion fix) and
+  WebRTC (after in-band SPS/PPS + outbound seq rewrite). Source of record
+  for the camera: Reolink HTTP-FLV (see scratchpad).
 
 - **DESIGN HANDOFF (open)**: `docs/design-handoff.md` delivered to Claude
   Design (created early, during Phase 5). Blocks: final visual styling of
@@ -181,3 +180,9 @@ State: COMPLETED (review cycle 1 done; external gates below still open)
 [19:56] Modified: /var/home/ben/.claude/projects/-var-home-ben-Programming-elixir-cairn-nvr/memory/never-pkill-by-pattern.md
 [20:04] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ffmpeg_port.ex
 [20:05] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/ffmpeg_port_test.exs
+[20:17] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/webrtc/session.ex
+[20:17] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/webrtc/session.ex
+[20:17] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/webrtc/session.ex
+[20:17] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/webrtc/session.ex
+[20:18] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.claude/plans/cairn-nvr/scratchpad.md
+[20:18] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.claude/plans/cairn-nvr/progress.md

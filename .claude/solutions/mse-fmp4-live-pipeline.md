@@ -32,3 +32,19 @@ module: Cairn.MP4.Demuxer / Cairn.RingBuffer / CairnWeb.StreamChannel
 - **-stimeout vs -timeout**: probe `ffmpeg -h demuxer=rtsp` once and cache;
   `-reconnect*` flags are HTTP-only (useful for Reolink FLV URLs, useless
   for RTSP — RTSP resilience is the respawn/watchdog loop).
+
+# WebRTC addendum (learned live, same camera)
+
+- **SRTP outbound replay protection rejects passthrough seq**: ffmpeg's
+  RTP output starts at a random sequence number; a 16-bit wrap or
+  replay-boundary regression makes libsrtp return `:replay_old` and the
+  viewer freezes after the first frame(s). The viewer session must own
+  outbound seq (monotonic counter, rewrite every packet); timestamps can
+  pass through.
+- **Container sources need in-band SPS/PPS for RTP consumers**: FLV keeps
+  them in extradata; ffmpeg's RTP mux only puts them in its own SDP
+  (sprop-parameter-sets), which custom signaling never sees. Add
+  `-bsf:v h264_mp4toannexb` to RTP outputs (no-op for RTSP sources).
+- **Reolink: prefer the HTTP-FLV URL over RTSP** — RTSP emits
+  non-monotonic DTS (stutter on every player); FLV + `-fflags
+  +genpts+discardcorrupt` is clean.
