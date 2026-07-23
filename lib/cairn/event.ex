@@ -10,7 +10,9 @@ defmodule Cairn.Event do
 
   `labels` is a time-indexed list of `%{t: seconds_since_start, label: l,
   score: s, object_id: id}` entries; `max_scores` maps label -> best score
-  seen.
+  seen. `trigger` is the single highest-scoring detection of the event
+  (`%{t, label, score, bbox}`) — the frame the snapshot is cut from, with the
+  box drawn on it.
   """
 
   @derive Jason.Encoder
@@ -24,6 +26,7 @@ defmodule Cairn.Event do
     labels: [],
     max_scores: %{},
     max_score: nil,
+    trigger: nil,
     path: nil,
     snapshot_path: nil
   ]

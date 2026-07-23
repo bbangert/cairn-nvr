@@ -178,5 +178,9 @@ defmodule Cairn.Events do
 
   defp labels_map(%Cairn.Event{} = event) do
     %{"entries" => event.labels, "max_scores" => event.max_scores}
+    |> maybe_put("trigger", event.trigger)
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end
