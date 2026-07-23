@@ -93,7 +93,8 @@ defmodule CairnWeb.ConfigLive do
       {"max event", "#{config.max_event_seconds}s"},
       {"udp range", "#{config.udp_base_port || "—"} +#{config.udp_port_range || 0}"},
       {"stall threshold", "#{config.stall_seconds}s"},
-      {"free-space floor", "#{config.free_space_min_mb} MB"}
+      {"free-space floor", "#{config.free_space_min_mb} MB"},
+      {"remux clips", if(config.remux_clips, do: "on", else: "off")}
     ]
   end
 

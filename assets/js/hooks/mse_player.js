@@ -33,7 +33,11 @@ const MsePlayer = {
     this.hlsUrl = this.el.dataset.hlsUrl
     this.queue = []
     this.rejoinMs = REJOIN_MIN_MS
-    this.destroyed = false
+    // NB: not `this.destroyed` — that is the LiveView lifecycle callback name,
+    // and assigning it replaces the method with a boolean, so teardown never
+    // runs and the rejoin loop below outlives the element.
+    this.stopped = false
+    this.rejoinTimer = null
 
     if (!("MediaSource" in window)) {
       // Safari/iOS: native HLS playback
@@ -44,12 +48,12 @@ const MsePlayer = {
   },
 
   destroyed() {
-    this.destroyed = true
+    this.stopped = true
     this.leave()
   },
 
   join() {
-    if (this.destroyed) return
+    if (this.stopped) return
     this.channel = socket().channel(`camera:${this.cameraId}`)
 
     this.channel.on("init", payload => this.onInit(payload))
@@ -63,6 +67,10 @@ const MsePlayer = {
   },
 
   leave() {
+    if (this.rejoinTimer) {
+      clearTimeout(this.rejoinTimer)
+      this.rejoinTimer = null
+    }
     if (this.channel) {
       this.channel.onClose(() => {})
       this.channel.leave()
@@ -72,11 +80,16 @@ const MsePlayer = {
   },
 
   scheduleRejoin() {
-    if (this.destroyed) return
+    // Re-entrant: onClose (incl. onError -> leave) and a join error reply can
+    // both fire for one disconnect. Bail if a rejoin is already pending so we
+    // never leak a timer and race two join()s (the churn this hook fixes).
+    if (this.stopped || this.rejoinTimer) return
     this.teardownMediaSource()
     const delay = this.rejoinMs
     this.rejoinMs = Math.min(this.rejoinMs * 2, REJOIN_MAX_MS)
-    setTimeout(() => {
+    this.rejoinTimer = setTimeout(() => {
+      this.rejoinTimer = null
+      if (this.stopped) return
       if (this.channel) { this.channel.leave(); this.channel = null }
       this.join()
     }, delay)

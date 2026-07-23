@@ -125,8 +125,9 @@ defmodule Cairn.EventExtractor do
     File.close(state.io)
 
     snapshot_fun = Keyword.get(state.opts, :snapshot_fun, &Cairn.Snapshot.take_async/2)
+    bytes = maybe_remux(state)
 
-    case Events.finalize(event, state.bytes) do
+    case Events.finalize(event, bytes) do
       {:ok, row} -> snapshot_fun.(row, state.config)
       {:error, reason} -> Logger.error("event #{event.id}: finalize failed: #{inspect(reason)}")
     end
@@ -134,7 +135,7 @@ defmodule Cairn.EventExtractor do
     :telemetry.execute(
       [:cairn, :extractor, :finalized],
       %{
-        bytes: state.bytes,
+        bytes: bytes,
         fragments: state.fragments,
         write_duration_ms: System.monotonic_time(:millisecond) - state.started_ms
       },
@@ -145,6 +146,21 @@ defmodule Cairn.EventExtractor do
   end
 
   # -- internals --------------------------------------------------------------
+
+  # Runs before the row is finalized so `bytes` and the snapshot both see the
+  # rewritten file. Costs one extra read+write of the clip; `remux_clips:
+  # false` skips it for setups that care more about disk writes than about
+  # clips reporting their true length (see `Cairn.ClipRemux`).
+  defp maybe_remux(%{config: %{remux_clips: false}} = state), do: state.bytes
+
+  defp maybe_remux(state) do
+    remux_fun = Keyword.get(state.opts, :remux_fun, &Cairn.ClipRemux.run/1)
+
+    case remux_fun.(state.path) do
+      {:ok, size} -> size
+      :error -> state.bytes
+    end
+  end
 
   defp write_fragment(state, frag) do
     state = write!(state, frag.data)
