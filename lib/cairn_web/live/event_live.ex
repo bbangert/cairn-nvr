@@ -21,8 +21,36 @@ defmodule CairnWeb.EventLive do
          |> push_navigate(to: ~p"/events")}
 
       event ->
+        if connected?(socket), do: Cairn.Event.subscribe()
         {:ok, assign(socket, event: event, page_title: "Event #{String.slice(id, 0, 8)}")}
     end
+  end
+
+  # Live status: if the event we're viewing is still recording, re-fetch it
+  # when it updates/finalizes so the badge, duration, and poster refresh.
+  @impl true
+  def handle_info({kind, %Cairn.Event{id: id}}, socket)
+      when kind in [:event_updated, :event_ended] do
+    if id == socket.assigns.event.id do
+      case Events.get(id) do
+        nil -> {:noreply, socket}
+        event -> {:noreply, assign(socket, event: event)}
+      end
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_info(_msg, socket), do: {:noreply, socket}
+
+  @impl true
+  def handle_event("delete", _params, socket) do
+    Events.delete(socket.assigns.event)
+
+    {:noreply,
+     socket
+     |> put_flash(:info, "Event deleted")
+     |> push_navigate(to: ~p"/events")}
   end
 
   # -- helpers ----------------------------------------------------------------
@@ -75,13 +103,44 @@ defmodule CairnWeb.EventLive do
     ~H"""
     <Layouts.app flash={@flash} page={:events}>
       <main style="flex: 1; padding: 20px; max-width: 1180px; width: 100%; margin: 0 auto; box-sizing: border-box;">
-        <.link
-          navigate={~p"/events"}
-          class="hs-btn hs-btn--ghost hs-btn--sm"
-          style="margin: -4px 0 12px -8px; color: var(--hs-fg-2); text-decoration: none;"
-        >
-          <span class="ms" style="font-size: 17px;">arrow_back</span>Back to events
-        </.link>
+        <div style="display: flex; align-items: center; gap: 10px; margin: -4px 0 12px -8px;">
+          <.link
+            navigate={~p"/events"}
+            class="hs-btn hs-btn--ghost hs-btn--sm"
+            style="color: var(--hs-fg-2); text-decoration: none;"
+          >
+            <span class="ms" style="font-size: 17px;">arrow_back</span>Back to events
+          </.link>
+
+          <span
+            :if={@event.status == :active}
+            class="hs-badge hs-badge--warning"
+            title="This event is still recording"
+            style="margin-left: 4px;"
+          >
+            <span
+              class="hs-dot"
+              style="animation: cairn-pulse 1.4s ease-in-out infinite;"
+            ></span>Recording
+          </span>
+          <span
+            :if={@event.status == :partial}
+            class="hs-badge hs-badge--warning"
+            title="Recording was interrupted"
+            style="margin-left: 4px;"
+          >
+            <span class="hs-dot"></span>Partial
+          </span>
+
+          <button
+            phx-click="delete"
+            data-confirm="Delete this event? The clip, snapshot, and index row are removed permanently."
+            class="hs-btn hs-btn--ghost hs-btn--sm"
+            style="margin-left: auto; color: var(--hs-danger);"
+          >
+            <span class="ms" style="font-size: 16px;">delete</span>Delete
+          </button>
+        </div>
 
         <div style="display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; align-items: start;">
           <div style="display: flex; flex-direction: column; gap: 16px; min-width: 0;">
@@ -99,6 +158,7 @@ defmodule CairnWeb.EventLive do
               id="labels-timeline"
               phx-hook="TimelineSeek"
               data-video-id="event-clip"
+              data-event-seconds={clip_seconds(@event)}
               class="hs-card"
               style="padding: 16px;"
             >
@@ -119,6 +179,7 @@ defmodule CairnWeb.EventLive do
                   <div style="flex: 1; height: 26px; position: relative; background: var(--hs-bg-sunken); border-radius: 6px;">
                     <button
                       :for={entry <- entries}
+                      data-t={entry["t"]}
                       data-seek={entry["t"]}
                       title={"#{label} #{fmt_score(entry["score"])} at #{fmt_clock(entry["t"])}"}
                       style={
@@ -135,7 +196,7 @@ defmodule CairnWeb.EventLive do
                   <div style="flex: 1; position: relative; height: 16px;">
                     <div
                       data-playhead
-                      style="position: absolute; left: 0%; top: -70px; bottom: 14px; width: 2px; background: var(--hs-accent); border-radius: 999px; pointer-events: none; transition: left var(--hs-dur-base) var(--hs-ease-standard);"
+                      style="position: absolute; left: 0%; top: -70px; bottom: 14px; width: 2px; background: var(--hs-accent); border-radius: 999px; pointer-events: none;"
                     >
                     </div>
                     <span
