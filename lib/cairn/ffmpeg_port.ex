@@ -34,7 +34,8 @@ defmodule Cairn.FFmpegPort do
             port: nil,
             os_pid: nil,
             demuxer: nil,
-            status: :connecting,
+            # :init so the first real transition (:connecting) is always emitted
+            status: :init,
             backoff_ms: nil,
             opts: [],
             got_fragment: false
@@ -71,13 +72,42 @@ defmodule Cairn.FFmpegPort do
   end
 
   @doc """
-  Builds the ffmpeg argv for a camera: three codec-copy outputs (fmp4 on
-  stdout, RTP to the plugin port, RTP to the WebRTC hub port).
-  `extra_ffmpeg_args` are spliced immediately before `-i`.
+  Is the opt-in hardware encoder (`h264_v4l2m2m`) available? Probed once
+  and cached. There is deliberately NO software (libx264) fallback.
   """
-  @spec build_argv(Cairn.Config.Camera.t(), {pos_integer(), pos_integer()}, String.t()) ::
-          [String.t()]
-  def build_argv(cam, {plugin_port, rtp_port}, timeout_flag) do
+  @spec transcode_available?() :: boolean()
+  def transcode_available? do
+    case :persistent_term.get({__MODULE__, :v4l2m2m}, nil) do
+      nil ->
+        available = probe_encoder()
+        :persistent_term.put({__MODULE__, :v4l2m2m}, available)
+        available
+
+      available ->
+        available
+    end
+  end
+
+  defp probe_encoder do
+    {out, 0} = System.cmd("ffmpeg", ["-hide_banner", "-encoders"], stderr_to_stdout: true)
+    String.contains?(out, "h264_v4l2m2m")
+  rescue
+    _ -> false
+  end
+
+  @doc """
+  Builds the ffmpeg argv for a camera: three outputs (fmp4 on stdout, RTP
+  to the plugin port, RTP to the WebRTC hub port) — codec-copy by default,
+  or `h264_v4l2m2m` with a probed-fps-derived GOP when the camera opts
+  into transcode. `extra_ffmpeg_args` are spliced immediately before `-i`.
+  """
+  @spec build_argv(
+          Cairn.Config.Camera.t(),
+          {pos_integer(), pos_integer()},
+          String.t(),
+          keyword()
+        ) :: [String.t()]
+  def build_argv(cam, {plugin_port, rtp_port}, timeout_flag, opts \\ []) do
     input_opts =
       cond do
         String.starts_with?(cam.rtsp_url, "rtsp://") ->
@@ -93,15 +123,27 @@ defmodule Cairn.FFmpegPort do
           ["-re", "-stream_loop", "-1"]
       end
 
+    codec_args =
+      if cam.transcode do
+        gop = Keyword.get(opts, :gop, 40)
+        ["-c:v", "h264_v4l2m2m", "-g", "#{gop}", "-bf", "0"]
+      else
+        ["-c:v", "copy"]
+      end
+
     ["ffmpeg", "-nostdin", "-nostats", "-loglevel", "warning"] ++
       input_opts ++
       cam.extra_ffmpeg_args ++
       ["-i", cam.rtsp_url] ++
-      ~w(-map 0:v -c:v copy -f mp4
-         -movflags +frag_keyframe+empty_moov+default_base_moof
+      ["-map", "0:v"] ++
+      codec_args ++
+      ~w(-f mp4 -movflags +frag_keyframe+empty_moov+default_base_moof
          -frag_duration 2000000 pipe:1) ++
-      ~w(-map 0:v -c:v copy -f rtp -payload_type 96 rtp://127.0.0.1:#{plugin_port}) ++
-      ~w(-map 0:v -c:v copy -f rtp -payload_type 96 rtp://127.0.0.1:#{rtp_port})
+      ["-map", "0:v"] ++
+      codec_args ++
+      ~w(-f rtp -payload_type 96 rtp://127.0.0.1:#{plugin_port}) ++
+      ["-map", "0:v"] ++
+      codec_args ++ ~w(-f rtp -payload_type 96 rtp://127.0.0.1:#{rtp_port})
   end
 
   @doc "Shell command wrapping `argv` with exec + stderr redirection."
@@ -133,7 +175,21 @@ defmodule Cairn.FFmpegPort do
 
   @impl true
   def handle_info(:spawn, state) do
-    {:noreply, spawn_ffmpeg(state)}
+    if state.camera.transcode and not transcode_capable?(state) do
+      # settled decision: refuse loudly, never fall back to libx264
+      Logger.error(
+        "camera #{state.camera.id}: transcode requested but h264_v4l2m2m is unavailable — " <>
+          "refusing to start (no software fallback)"
+      )
+
+      {:noreply, set_status(state, :transcode_unavailable)}
+    else
+      {:noreply, spawn_ffmpeg(state)}
+    end
+  end
+
+  defp transcode_capable?(state) do
+    Keyword.get_lazy(state.opts, :transcode_available, &transcode_available?/0)
   end
 
   def handle_info({port, {:data, data}}, %{port: port} = state) do
@@ -232,7 +288,7 @@ defmodule Cairn.FFmpegPort do
         ports = Cairn.UDPPorts.ports_for(state.config, state.index)
 
         state.camera
-        |> build_argv(ports, timeout_flag())
+        |> build_argv(ports, timeout_flag(), gop: gop_from_probe(state.camera.id))
         |> shell_command(log)
 
       command when is_binary(command) ->
@@ -287,6 +343,14 @@ defmodule Cairn.FFmpegPort do
     status_fun = Keyword.get(state.opts, :status_fun, &Cairn.CameraStatus.set/2)
     status_fun.(state.camera.id, status)
     %{state | status: status}
+  end
+
+  # GOP = 2 x probed fps (respawns pick up the probe; first spawn defaults)
+  defp gop_from_probe(camera_id) do
+    case Cairn.CameraStatus.get(camera_id) do
+      %{probe: %{fps: fps}} when is_number(fps) and fps > 0 -> round(2 * fps)
+      _ -> 40
+    end
   end
 
   defp backoff_min(state), do: Keyword.get(state.opts, :backoff_min_ms, @backoff_min_ms)

@@ -296,22 +296,22 @@ plugin ⇒ clip on disk, playable, indexed, snapshot present.
 
 ## Phase 7 — WebRTC path
 
-- [ ] 7.1 [infra] Add `ex_webrtc` dep (pin current release).
-- [ ] 7.2 [otp] `Cairn.RTPHub` (per camera): `gen_udp` active socket on
+- [x] 7.1 [infra] Add `ex_webrtc` dep (pin current release).
+- [x] 7.2 [otp] `Cairn.RTPHub` (per camera): `gen_udp` active socket on
       assigned port; parse RTP header (seq, ts, marker, payload type);
       H.264 payload inspection (NAL type incl. FU-A/STAP-A) to detect
       keyframe/SPS boundaries; maintain last-GOP replay buffer; broadcast
       `{:rtp, packet}` on `"camera:{id}:rtp"`.
-- [ ] 7.3 [otp] **Spike inside task**: verify ex_webrtc `send_rtp` semantics
+- [x] 7.3 [otp] **Spike inside task**: verify ex_webrtc `send_rtp` semantics
       for replayed GOP (sequence-number/timestamp continuity — likely needs
       seq rewriting on the outbound track). Then
       `CairnWeb.WebRTC.Session`: one process per viewer wrapping
       `ExWebRTC.PeerConnection` (sendonly H.264 track, no B-frames assumed);
       on connect: replay GOP buffer, then live RTP from PubSub; teardown on
       socket close.
-- [ ] 7.4 [liveview] Signaling over a Phoenix channel or LiveView events
+- [x] 7.4 [liveview] Signaling over a Phoenix channel or LiveView events
       (SDP offer/answer + ICE trickle); dashboard tile toggle MSE ↔ WebRTC.
-- [ ] 7.5 [test] RTP parser + GOP-buffer unit tests (fixture pcap/packet
+- [x] 7.5 [test] RTP parser + GOP-buffer unit tests (fixture pcap/packet
       list); session negotiation test against ex_webrtc's own APIs; manual
       checklist for browsers (Chrome/Firefox/Safari).
 

@@ -108,3 +108,13 @@ State: WORKING (Phase 5 in progress)
 [19:17] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/rtp_hub_test.exs
 [19:17] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn_web/webrtc/session_test.exs
 [19:17] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn_web/channels/webrtc_channel_test.exs
+[19:21] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/probe.ex
+[19:21] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/camera.ex
+[19:21] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ffmpeg_port.ex
+[19:22] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ffmpeg_port.ex
+[19:22] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ffmpeg_port.ex
+[19:22] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ffmpeg_port.ex
+[19:22] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ffmpeg_port.ex
+[19:22] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/probe_test.exs
+[19:22] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/transcode_test.exs
+[19:23] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ffmpeg_port.ex
