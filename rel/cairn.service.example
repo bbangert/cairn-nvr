@@ -1,0 +1,28 @@
+# Example systemd unit for a Cairn release tarball unpacked to /opt/cairn.
+# Requires ffmpeg (+ ffprobe) on PATH; python etc. only if your plugin
+# needs it.
+#
+#   sudo cp rel/cairn.service.example /etc/systemd/system/cairn.service
+#   sudo systemctl enable --now cairn
+[Unit]
+Description=Cairn NVR
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=cairn
+Group=cairn
+Environment=PHX_SERVER=true
+Environment=CAIRN_DATA_DIR=/var/lib/cairn
+Environment=CAIRN_CONFIG=/etc/cairn/config.yml
+Environment=PORT=4000
+ExecStart=/opt/cairn/bin/cairn start
+ExecStop=/opt/cairn/bin/cairn stop
+Restart=on-failure
+RestartSec=5
+# ffmpeg per camera + plugin processes
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target
