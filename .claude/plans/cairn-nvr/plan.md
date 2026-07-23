@@ -115,20 +115,20 @@ silent libx264 fallback.
 
 ## Phase 2 — Ingest plane: ffmpeg Port, fmp4 demuxer, ring buffer
 
-- [ ] 2.1 [otp] `Cairn.Camera` supervisor (`:rest_for_one`), child order:
+- [x] 2.1 [otp] `Cairn.Camera` supervisor (`:rest_for_one`), child order:
       `RingBuffer` → `FFmpegPort` → (Phase 4: `PluginPort`) → (Phase 7:
       `RTPHub`). Ring death restarts ffmpeg (new ring is empty anyway);
       ffmpeg death restarts downstream consumers of its UDP outputs only.
-- [ ] 2.2 [port] `Cairn.MP4.Demuxer` — pure, incremental byte-stream parser:
+- [x] 2.2 [port] `Cairn.MP4.Demuxer` — pure, incremental byte-stream parser:
       box framing; captures init segment (`ftyp`+`moov`); emits complete
       `moof`+`mdat` fragments; extracts `pts` from `tfdt`
       baseMediaDecodeTime, duration from `trun`, timescale from `mdhd`;
       extracts RFC 6381 codec string (`avc1.PPCCLL` from `avcC`) for MSE.
       Struct: `%Cairn.Fragment{camera_id, seq, pts, duration_ms, data}`.
-- [ ] 2.3 [infra] Fixture generator `mix cairn.gen.fixtures`: ffmpeg
+- [x] 2.3 [infra] Fixture generator `mix cairn.gen.fixtures`: ffmpeg
       `testsrc` → committed fmp4 fixture(s) with the exact `-movflags` used
       in production; used by demuxer/ring/extractor tests.
-- [ ] 2.4 [port] `Cairn.FFmpegPort`: argv builder (TCP transport, `-timeout`
+- [x] 2.4 [port] `Cairn.FFmpegPort`: argv builder (TCP transport, `-timeout`
       with `-stimeout` fallback detection, `-nostats -loglevel warning`,
       three outputs per architecture.md invocation, `extra_ffmpeg_args`
       splice point, transcode variant deferred to 8.2); spawn via
@@ -138,7 +138,7 @@ silent libx264 fallback.
       backoff state (1s→30s jittered) then respawn **inside** the GenServer
       (avoid supervisor restart-intensity blowout on a dead camera);
       emit status transitions (`:connecting/:running/:backoff`) for 3.4.
-- [ ] 2.5 [otp] `Cairn.RingBuffer`: `:queue` of fragments; evict on pts
+- [x] 2.5 [otp] `Cairn.RingBuffer`: `:queue` of fragments; evict on pts
       window (`pre_window_seconds`, 90kHz-aware via fragment pts+timescale);
       cache init segment + codec string; on each fragment: broadcast
       `{:fragment, frag}` on PubSub `"camera:{id}:fragments"` **and** send
@@ -146,10 +146,10 @@ silent libx264 fallback.
       `drain_and_subscribe(camera_id, since_pts, pid)` (correction #1):
       returns `{init_segment, fragments}`, adds+monitors pid; `unsubscribe/2`;
       `last_fragment_at` for the watchdog; `fetch_recent/2` for HLS.
-- [ ] 2.6 [otp] Stall watchdog: periodic timer in FFmpegPort checks ring's
+- [x] 2.6 [otp] Stall watchdog: periodic timer in FFmpegPort checks ring's
       `last_fragment_at`; silent stall > `stall_seconds` → close port,
       backoff-respawn, status `:stalled` → UI.
-- [ ] 2.7 [test] Demuxer against fixtures (incl. split-mid-box chunked
+- [x] 2.7 [test] Demuxer against fixtures (incl. split-mid-box chunked
       feeds, property: any chunking yields identical fragments); ring
       eviction/drain/monitor-cleanup tests; FFmpegPort lifecycle test with
       `test/support/fake_ffmpeg.sh` (cats fixture, sleeps, exits — asserts
