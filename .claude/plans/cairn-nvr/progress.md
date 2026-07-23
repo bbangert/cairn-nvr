@@ -7,7 +7,7 @@ State: COMPLETED (review cycle 1 done; external gates below still open)
 | Phase | Tasks | Gate (Verify) | Result |
 |-------|-------|---------------|--------|
 | 1 — Scaffold/config/index | 1.1–1.8 ✅ | `mix check` green; boots with example config.yml | PASS (28 tests) — commit `Phase 1` |
-| 2 — Ingest plane | 2.1–2.7 ✅ | `mix check`; fragments from a real camera in the ring | PASS (50 tests) + LIVE PASS 2026-07-22: real Reolink RTSP (192.168.2.152) ingested, ring serving fragments |
+| 2 — Ingest plane | 2.1–2.7 ✅ | `mix check`; fragments from a real camera in the ring | PASS (50 tests) + LIVE PASS 2026-07-22: real Reolink RTSP (<lan-camera>) ingested, ring serving fragments |
 | 3 — Live preview | 3.1–3.6 ✅ | `mix check`; MSE+HLS paths | PASS (62 tests) + LIVE PASS (server half): HLS init+segments from real camera ffprobe-decode (80 frames 2560×1920 H.264). Browser render check → external gate below |
 | 4 — Detection plane | 4.1–4.7 ✅ | `mix check`; mock plugin timeline drives start/update/end on `"events"` | PASS (81 tests) — commit `Phase 4` |
 | 5 — Event plane | 5.1–5.7 ✅ | `mix check`; e2e: real camera + mock plugin ⇒ playable, indexed clip | PASS (87 tests) + LIVE PASS 2026-07-22: 13.9s clip w/ pre-roll (200 frames, box-valid), row `finalized` 5.2MB max_score 0.93, 2560×1920 JPEG snapshot |
@@ -209,3 +209,10 @@ State: COMPLETED (review cycle 1 done; external gates below still open)
 [21:50] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/registry.ex
 [21:51] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ffmpeg_port.ex
 [21:51] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ring_buffer.ex
+[22:17] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.github/dependabot.yml
+[22:17] Modified: /var/home/ben/Programming/elixir/cairn-nvr/README.md
+[22:17] Modified: /var/home/ben/Programming/elixir/cairn-nvr/mise.toml
+[22:17] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.devcontainer/Dockerfile
+[22:18] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.devcontainer/devcontainer.json
+[22:18] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.devcontainer/post-create.sh
+[22:19] Modified: /var/home/ben/Programming/elixir/cairn-nvr/README.md

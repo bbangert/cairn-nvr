@@ -1,0 +1,10 @@
+# Toolchain pin — `mise install` gives you the same Erlang/Elixir everywhere
+# (devcontainer, CI parity, local). ffmpeg/ffprobe come from the OS.
+[tools]
+erlang = "29.0.3"
+elixir = "1.20.2-otp-29"
+
+[env]
+# quieter, faster Erlang source builds (no GUI/java/odbc bindings)
+KERL_CONFIGURE_OPTIONS = "--without-wx --without-javac --without-odbc --disable-debug"
+KERL_BUILD_DOCS = "no"
