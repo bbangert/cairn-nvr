@@ -87,6 +87,16 @@ defmodule Cairn.SnapshotTest do
     assert vf =~ "h=ih*0.1000"
   end
 
+  test "a malformed bbox falls back to the first frame, not no snapshot", %{config: config} do
+    # a list bbox of the wrong shape must not reach clamp_bbox and raise
+    row = insert(%{t: 0.0, label: "person", score: 0.9, bbox: [0.1, 0.2]}, @fixture)
+    args = Snapshot.args(row, "x.jpg", nil)
+    refute "-vf" in args
+    assert :ok = Snapshot.take(row, config)
+    assert %{snapshot_path: p} = Events.get(row.id)
+    assert File.exists?(p)
+  end
+
   test "draws the box but no label when no font is available", %{config: config} do
     Application.put_env(:cairn, :snapshot_font, "/no/such/font.ttf")
     on_exit(fn -> Application.delete_env(:cairn, :snapshot_font) end)

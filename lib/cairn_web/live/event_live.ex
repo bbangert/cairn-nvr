@@ -8,6 +8,8 @@ defmodule CairnWeb.EventLive do
 
   use CairnWeb, :live_view
 
+  require Logger
+
   alias Cairn.Events
   alias CairnWeb.EventsLive
 
@@ -59,12 +61,17 @@ defmodule CairnWeb.EventLive do
 
   @impl true
   def handle_event("delete", _params, socket) do
-    Events.delete(socket.assigns.event)
+    case Events.delete(socket.assigns.event) do
+      {:ok, _} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Event deleted")
+         |> push_navigate(to: ~p"/events")}
 
-    {:noreply,
-     socket
-     |> put_flash(:info, "Event deleted")
-     |> push_navigate(to: ~p"/events")}
+      {:error, reason} ->
+        Logger.warning("event #{socket.assigns.event.id}: delete failed: #{inspect(reason)}")
+        {:noreply, put_flash(socket, :error, "Could not delete event")}
+    end
   end
 
   # -- helpers ----------------------------------------------------------------

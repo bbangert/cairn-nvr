@@ -115,7 +115,13 @@ defmodule Cairn.Snapshot do
   # keys. Normalize to string keys so both work.
   defp trigger(%{labels: %{"trigger" => t}}) when is_map(t) do
     t = Map.new(t, fn {k, v} -> {to_string(k), v} end)
-    if is_list(t["bbox"]), do: t, else: nil
+    # require a well-formed [x,y,w,h] numeric bbox — a malformed one would make
+    # clamp_bbox raise; treat it as no trigger so the snapshot still falls back
+    # to the first frame rather than producing nothing
+    case t["bbox"] do
+      [x, y, w, h] when is_number(x) and is_number(y) and is_number(w) and is_number(h) -> t
+      _ -> nil
+    end
   end
 
   defp trigger(_), do: nil

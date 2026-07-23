@@ -21,6 +21,10 @@ const TimelineSeek = {
     this.el.addEventListener("click", e => {
       const marker = e.target.closest("[data-seek]")
       if (!marker || !this.video) return
+      // data-seek is the pre-roll-adjusted clip time, but placeMarkers only
+      // sets it once metadata loads; before that the video can't be seeked
+      // meaningfully anyway, so ignore the click
+      if (!isFinite(this.video.duration)) return
       this.video.currentTime = parseFloat(marker.dataset.seek)
       this.video.play()
     })

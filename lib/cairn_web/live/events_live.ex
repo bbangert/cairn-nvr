@@ -54,7 +54,10 @@ defmodule CairnWeb.EventsLive do
        showing_from: (result.page - 1) * @page_size + 1,
        showing_to: (result.page - 1) * @page_size + length(result.events),
        has_next: result.page * @page_size < result.total,
-       visible: MapSet.new(result.events, & &1.id)
+       # ids currently in the stream, capped like it (@page_size) and ordered
+       # newest-first — mirrors what's actually in the DOM so live updates never
+       # act on a row the :limit already evicted
+       visible: Enum.map(result.events, & &1.id)
      )
      |> stream(:events, result.events, reset: true, limit: @page_size)}
   end
@@ -88,7 +91,7 @@ defmodule CairnWeb.EventsLive do
     socket = live_update(socket, ev)
     # the snapshot is written async just after finalize with no broadcast of
     # its own; pull the row once more shortly so the thumbnail fills in
-    if MapSet.member?(socket.assigns.visible, ev.id) do
+    if ev.id in socket.assigns.visible do
       Process.send_after(self(), {:refresh_row, ev.id}, 1_500)
     end
 
@@ -104,7 +107,7 @@ defmodule CairnWeb.EventsLive do
   # New event: prepend only on the latest view (page 1, no conflicting filter),
   # so browsing an older page or a filtered slice stays put.
   defp live_insert(socket, ev) do
-    if socket.assigns.page == 1 and not MapSet.member?(socket.assigns.visible, ev.id) and
+    if socket.assigns.page == 1 and ev.id not in socket.assigns.visible and
          matches?(socket.assigns.filters, ev) do
       case Events.get(ev.id) do
         nil ->
@@ -112,10 +115,11 @@ defmodule CairnWeb.EventsLive do
 
         row ->
           # cap the stream so a busy camera can't grow the DOM without bound;
-          # at: 0 with a positive limit keeps the newest @page_size rows
+          # at: 0 with a positive limit keeps the newest @page_size rows, and
+          # `visible` is pruned the same way so it never goes stale
           socket
           |> stream_insert(:events, row, at: 0, limit: @page_size)
-          |> update(:visible, &MapSet.put(&1, ev.id))
+          |> update(:visible, &Enum.take([ev.id | &1], @page_size))
           |> update(:total, &(&1 + 1))
           |> update(:showing_to, &min(&1 + 1, @page_size))
       end
@@ -126,7 +130,7 @@ defmodule CairnWeb.EventsLive do
 
   # Status/snapshot change on an already-visible row: update in place by dom id.
   defp live_update(socket, ev) do
-    if MapSet.member?(socket.assigns.visible, ev.id) do
+    if ev.id in socket.assigns.visible do
       case Events.get(ev.id) do
         nil -> socket
         row -> stream_insert(socket, :events, row)
