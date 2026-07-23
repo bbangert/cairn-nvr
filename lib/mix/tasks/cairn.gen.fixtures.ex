@@ -1,0 +1,62 @@
+defmodule Mix.Tasks.Cairn.Gen.Fixtures do
+  @shortdoc "Generates committed fmp4 test fixtures with ffmpeg"
+
+  @moduledoc """
+  Regenerates the fmp4 fixtures used by demuxer/ring/extractor tests, using
+  the exact `-movflags` the production ffmpeg invocation uses.
+
+      mix cairn.gen.fixtures
+
+  Requires `ffmpeg` on PATH. Fixtures are committed, so this only needs to
+  run when the production muxer flags change.
+  """
+
+  use Mix.Task
+
+  @out_dir "test/support/fixtures/media"
+
+  @impl true
+  def run(_argv) do
+    File.mkdir_p!(@out_dir)
+    generate("testsrc.fmp4", duration: 6, rate: 10, gop: 10)
+    generate("testsrc_long.fmp4", duration: 30, rate: 10, gop: 10)
+    Mix.shell().info("fixtures written to #{@out_dir}")
+  end
+
+  defp generate(name, opts) do
+    out = Path.join(@out_dir, name)
+
+    args =
+      [
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=duration=#{opts[:duration]}:size=320x240:rate=#{opts[:rate]}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        "-g",
+        "#{opts[:gop]}",
+        "-movflags",
+        "+frag_keyframe+empty_moov+default_base_moof",
+        "-frag_duration",
+        "2000000",
+        "-f",
+        "mp4",
+        out
+      ]
+
+    {output, status} = System.cmd("ffmpeg", args, stderr_to_stdout: true)
+
+    if status != 0 do
+      Mix.raise("ffmpeg failed (#{status}): #{output}")
+    end
+  end
+end

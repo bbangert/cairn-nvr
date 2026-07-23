@@ -10,10 +10,12 @@ config :cairn, Cairn.Repo,
   pool_size: 5,
   pool: Ecto.Adapters.SQL.Sandbox
 
-# Tests use a fixed db path and a fixture YAML config
+# Tests use a fixed db path and a fixture YAML config; cameras (real
+# ffmpeg processes) are never auto-started in tests
 config :cairn,
   db_in_data_dir: false,
-  config_path: "test/support/fixtures/configs/valid.yml"
+  config_path: "test/support/fixtures/configs/valid.yml",
+  start_cameras: false
 
 # We don't run a server during test. If one is required,
 # you can enable the server option below.

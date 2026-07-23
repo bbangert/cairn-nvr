@@ -14,7 +14,10 @@ defmodule Cairn.Boot do
   @doc false
   def run(_opts) do
     reconcile()
-    Cairn.CameraSupervisor.sync(Cairn.Config.Server.get())
+
+    if Application.get_env(:cairn, :start_cameras, true) do
+      Cairn.CameraSupervisor.sync(Cairn.Config.Server.get())
+    end
   end
 
   # Phase 5 (task 5.4) replaces this with the disk-is-truth reconciliation.
