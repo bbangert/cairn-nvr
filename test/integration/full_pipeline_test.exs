@@ -15,7 +15,7 @@ defmodule Cairn.FullPipelineTest do
   @moduletag timeout: 120_000
 
   alias Cairn.Config.Camera
-  alias Cairn.{Config, Event, Events, MP4.Demuxer}
+  alias Cairn.{Config, Event, Events}
 
   @fixture Path.absname("test/support/fixtures/media/testsrc_long.fmp4")
   @mock Path.absname("priv/plugins/mock/mock_plugin.exs")
@@ -90,9 +90,22 @@ defmodule Cairn.FullPipelineTest do
     active_data_dir = Cairn.Config.Server.get().data_dir
     assert String.starts_with?(row.path, active_data_dir)
     _ = dir
-    {_d, events} = Demuxer.push(Demuxer.new("check"), File.read!(row.path))
-    assert [{:init, %{codec: "avc1." <> _}} | frags] = events
-    assert length(frags) >= 3
+
+    # remux_clips (default on) rewrites the fragmented clip into a plain mp4
+    # with a real moov, so the finalized file must probe as a valid, seekable
+    # clip whose duration is true and start offset is zero — the property the
+    # concatenated-fragment output could never report.
+    {probe, 0} =
+      System.cmd(
+        "ffprobe",
+        ~w(-v error -show_entries format=duration,start_time -of csv=p=0) ++ [row.path]
+      )
+
+    [start_time, duration] =
+      probe |> String.trim() |> String.split(",") |> Enum.map(&elem(Float.parse(&1), 0))
+
+    assert_in_delta start_time, 0.0, 0.001
+    assert duration > 0.0
 
     # snapshot lands async
     row =
