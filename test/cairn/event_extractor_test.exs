@@ -13,7 +13,14 @@ defmodule Cairn.EventExtractorTest do
 
     camera_id = "ex_#{System.unique_integer([:positive])}"
     camera = %Camera{id: camera_id, rtsp_url: "rtsp://h/1"}
-    config = %Config{data_dir: dir, udp_base_port: 17_000, udp_port_range: 10}
+    # remux off by default here so the fragment-level assertions below test the
+    # writer itself; the remux behaviour has its own tests.
+    config = %Config{
+      data_dir: dir,
+      udp_base_port: 17_000,
+      udp_port_range: 10,
+      remux_clips: false
+    }
 
     start_supervised!({RingBuffer, camera_id: camera_id, pre_window_seconds: 60})
 
@@ -89,6 +96,73 @@ defmodule Cairn.EventExtractorTest do
 
     assert length(out_frags) == length(frags)
     assert Enum.map(out_frags, & &1.pts) == Enum.map(frags, & &1.pts)
+  end
+
+  test "remux_clips rewrites the clip so it reports its real duration",
+       %{camera: camera, config: config, frags: frags} do
+    {path, _id} = run_to_finalize(camera, %{config | remux_clips: true}, frags)
+
+    # The bug this guards: fragments carry the camera's absolute decode times
+    # and declare no duration, so an un-remuxed clip starts partway into a
+    # timeline and reports its length as time-since-ffmpeg-started.
+    assert {out, 0} =
+             System.cmd(
+               "ffprobe",
+               ~w(-v error -show_entries format=duration,start_time -of csv=p=0) ++ [path]
+             )
+
+    [start_time, duration] =
+      out |> String.trim() |> String.split(",") |> Enum.map(&elem(Float.parse(&1), 0))
+
+    assert_in_delta start_time, 0.0, 0.001
+    assert duration > 0.0
+    # remuxed clips carry a real moov with sample tables instead of fragments
+    refute File.read!(path) =~ "moof"
+  end
+
+  test "remux_clips: false leaves the clip fragmented",
+       %{camera: camera, config: config, frags: frags} do
+    {path, _id} = run_to_finalize(camera, %{config | remux_clips: false}, frags)
+
+    {_d, events} = Demuxer.push(Demuxer.new("check"), File.read!(path))
+    assert [{:init, _} | _] = events
+  end
+
+  test "a failed remux keeps the original clip and its byte count",
+       %{camera: camera, config: config, frags: frags} do
+    {path, id} =
+      run_to_finalize(camera, %{config | remux_clips: true}, frags, remux_fun: fn _ -> :error end)
+
+    row = Events.get(id)
+    assert row.status == :finalized
+    assert row.bytes == File.stat!(path).size
+
+    {_d, events} = Demuxer.push(Demuxer.new("check"), File.read!(path))
+    assert [{:init, _} | _] = events
+  end
+
+  # Drives one event from first fragment to finalized, returning {path, id}.
+  defp run_to_finalize(camera, config, frags, opts \\ []) do
+    event = new_event(camera)
+
+    pid =
+      start_supervised!(
+        {EventExtractor,
+         [camera: camera, event: event, config: config, snapshot_fun: fn _row, _cfg -> :ok end] ++
+           opts},
+        id: {:extractor, event.id}
+      )
+
+    ref = Process.monitor(pid)
+    assert %{status: :active, path: path} = wait_row(event.id)
+
+    Enum.each(frags, &RingBuffer.put_fragment(camera.id, &1))
+    wait_until(fn -> :sys.get_state(pid).fragments == length(frags) end)
+
+    EventExtractor.finalize(pid, %{event | ended_at: DateTime.utc_now(), status: :finalized})
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
+
+    {path, event.id}
   end
 
   test "crash mid-event leaves an active row that reconciliation marks partial",
