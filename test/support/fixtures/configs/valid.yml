@@ -1,0 +1,30 @@
+data_dir: tmp/cairn_test_data
+stall_seconds: 15
+free_space_min_mb: 512
+
+udp:
+  base_port: 17000
+  range: 20
+
+events:
+  pre_window_seconds: 5
+  post_window_seconds: 10
+  max_event_seconds: 300
+
+retention:
+  days: 14
+  per_label:
+    person: 30
+
+cameras:
+  - id: cam_a
+    rtsp_url: rtsp://127.0.0.1:8554/a
+    min_score:
+      default: 0.5
+      person: 0.6
+  - id: cam_b
+    rtsp_url: rtsp://127.0.0.1:8554/b
+    transcode: false
+    extra_ffmpeg_args: []
+    retention:
+      days: 7
