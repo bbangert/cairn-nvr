@@ -1,5 +1,7 @@
 # Cairn
 
+[![CI](https://github.com/bbangert/cairn-nvr/actions/workflows/ci.yml/badge.svg)](https://github.com/bbangert/cairn-nvr/actions/workflows/ci.yml)
+
 An **event-clip NVR**: cameras stream in over RTSP, an inference plugin
 detects objects, and Cairn records **one mp4 clip per event** — with
 pre-roll — indexes it in SQLite, and gives you a LiveView UI to watch
@@ -80,9 +82,17 @@ Migrations run at boot. A systemd unit example lives in
 
 ## Development
 
+Toolchain is pinned in `mise.toml` (`mise install`), or open the repo in
+the **devcontainer** (`.devcontainer/`) which brings Erlang/Elixir via
+mise plus ffmpeg, sqlite3, inotify-tools, and Python for the reference
+plugin — `postCreate` runs `mix setup` and copies a starter `config.yml`.
+The first container start compiles Erlang from source (one-time).
+
 `mix check` = compile with warnings-as-errors, format check, credo,
-tests. The full-pipeline integration test (real ffmpeg, fixture-loop
-camera, mock plugin) runs with `mix test --include integration`.
+tests. CI additionally runs `mix dialyzer` and `mix sobelow --skip
+--exit --threshold medium`. The full-pipeline integration test (real
+ffmpeg, fixture-loop camera, mock plugin) runs with
+`mix test --include integration`.
 
 Docs: `docs/architecture.md` · `docs/plugin-contract.md` ·
 `docs/design-handoff.md` · `docs/frigate_comparison.md`

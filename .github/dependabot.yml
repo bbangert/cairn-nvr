@@ -1,0 +1,16 @@
+version: 2
+updates:
+  - package-ecosystem: mix
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      dev-tools:
+        patterns: ["credo", "dialyxir", "sobelow"]
+      phoenix:
+        patterns: ["phoenix*", "ecto*", "plug*", "bandit"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
