@@ -1,0 +1,37 @@
+import Config
+
+# Configure your database
+#
+# The MIX_TEST_PARTITION environment variable can be used
+# to provide built-in test partitioning in CI environment.
+# Run `mix help test` for more information.
+config :cairn, Cairn.Repo,
+  database: Path.expand("../cairn_test.db", __DIR__),
+  pool_size: 5,
+  pool: Ecto.Adapters.SQL.Sandbox
+
+# Tests use a fixed db path and a fixture YAML config
+config :cairn,
+  db_in_data_dir: false,
+  config_path: "test/support/fixtures/configs/valid.yml"
+
+# We don't run a server during test. If one is required,
+# you can enable the server option below.
+config :cairn, CairnWeb.Endpoint,
+  http: [ip: {127, 0, 0, 1}, port: 4002],
+  secret_key_base: "FMhbSHa4yyjkO18N0tQNrPx9fxTJG5BuRExs0A4amG4JXSA7jVd6BUpkR96WcKvM",
+  server: false
+
+# Print only warnings and errors during test
+config :logger, level: :warning
+
+# Initialize plugs at runtime for faster test compilation
+config :phoenix, :plug_init_mode, :runtime
+
+# Enable helpful, but potentially expensive runtime checks
+config :phoenix_live_view,
+  enable_expensive_runtime_checks: true
+
+# Sort query params output of verified routes for robust url comparisons
+config :phoenix,
+  sort_verified_routes_query_params: true

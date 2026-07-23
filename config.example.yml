@@ -1,0 +1,48 @@
+# Cairn NVR configuration — copy to config.yml (or set CAIRN_CONFIG).
+# The UI renders this read-only; apply changes via restart or the Reload
+# button on /config.
+
+# All mutable state (db, event clips, snapshots, logs) lives here.
+# Overridable with the CAIRN_DATA_DIR environment variable.
+data_dir: data
+
+# Seconds without a new fragment before a camera is considered stalled
+# and its ffmpeg process is bounced.
+stall_seconds: 15
+
+# Emergency cleanup: when free space on data_dir drops below this,
+# oldest events are deleted regardless of retention.
+free_space_min_mb: 2048
+
+# UDP ports handed to inference plugins / WebRTC RTP taps.
+# Each camera consumes 2 ports: base_port + 2*index, +1.
+udp:
+  base_port: 17000
+  range: 100
+
+# Event clip windows (per-camera overridable with the same keys).
+events:
+  pre_window_seconds: 5
+  post_window_seconds: 10
+  max_event_seconds: 300
+
+# Days to keep event clips; per-label overrides win.
+retention:
+  days: 14
+  per_label:
+    person: 30
+
+cameras: []
+#  - id: front_door
+#    rtsp_url: rtsp://user:pass@192.168.1.10:554/stream1
+#    # Inference plugin command (argv or string). Receives RTP on an
+#    # assigned UDP port, prints ndjson detections on stdout.
+#    plugin: ["python3", "plugins/cpu-reference/main.py"]
+#    min_score:
+#      default: 0.5
+#      person: 0.6
+#    extra_ffmpeg_args: []
+#    # Opt-in hardware transcode for non-H.264 cameras (v4l2m2m only).
+#    transcode: false
+#    retention:
+#      days: 7
