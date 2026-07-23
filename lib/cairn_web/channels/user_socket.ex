@@ -3,6 +3,8 @@ defmodule CairnWeb.UserSocket do
 
   # Live camera streams (binary fmp4 over the channel)
   channel "camera:*", CairnWeb.StreamChannel
+  # WebRTC signaling (sub-second live view)
+  channel "webrtc:*", CairnWeb.WebRTCChannel
 
   # No auth in v1: LAN-trusted deployment (documented in README)
   @impl true

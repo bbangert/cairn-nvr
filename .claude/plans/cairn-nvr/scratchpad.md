@@ -57,6 +57,17 @@ Append during /phx:work — do not rewrite history.
   doc with page map, components, states, events, and data contracts.
   Affects tasks 3.2, 3.3, 6.1–6.4, 7.4 (UI portions only).
 
+## Spike results
+
+- **7.3 ex_webrtc `send_rtp` GOP replay (2026-07-22)**: read
+  `ExWebRTC.RTPSender.do_send_packet/3` (v0.17.0) — it rewrites only
+  `payload_type` and `ssrc` (+ MID header ext). **Sequence numbers and
+  timestamps pass through untouched.** Replaying the GOP buffer then
+  continuing with live packets from the same camera RTP stream keeps
+  seq/ts continuity with NO rewriting. Dedupe guard needed at the
+  replay→live boundary (subscribe-then-snapshot, drop seq <= last
+  replayed). Verdict: replay is safe; no seq rewriter built.
+
 ## Dead-ends already settled in research (do not revisit)
 
 tmpfs ring, slice_ring_buffer/Rust sidecar, Live555, GStreamer-as-ingest,

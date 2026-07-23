@@ -26,12 +26,13 @@ import {hooks as colocatedHooks} from "phoenix-colocated/cairn"
 import topbar from "../vendor/topbar"
 import MsePlayer from "./hooks/mse_player"
 import TimelineSeek from "./hooks/timeline_seek"
+import WebrtcPlayer from "./hooks/webrtc_player"
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: {_csrf_token: csrfToken},
-  hooks: {...colocatedHooks, MsePlayer, TimelineSeek},
+  hooks: {...colocatedHooks, MsePlayer, TimelineSeek, WebrtcPlayer},
 })
 
 // Show progress bar on live navigation and form submits

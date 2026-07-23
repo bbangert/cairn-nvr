@@ -21,6 +21,8 @@ defmodule Cairn.Camera do
     index = Keyword.fetch!(opts, :index)
     windows = Cairn.Config.windows(config, cam)
 
+    {_plugin_port, rtp_port} = Cairn.UDPPorts.ports_for(config, index)
+
     children =
       [
         {Cairn.RingBuffer, camera_id: cam.id, pre_window_seconds: windows.pre},
@@ -30,7 +32,8 @@ defmodule Cairn.Camera do
           [{Cairn.PluginPort, camera: cam, config: config, index: index}]
         else
           []
-        end
+        end ++
+        [{Cairn.RTPHub, camera_id: cam.id, port: rtp_port}]
 
     Supervisor.init(children, strategy: :rest_for_one)
   end

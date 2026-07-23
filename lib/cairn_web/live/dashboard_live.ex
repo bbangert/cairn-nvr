@@ -29,6 +29,7 @@ defmodule CairnWeb.DashboardLive do
        cameras: Cairn.Config.Server.get().cameras,
        statuses: Cairn.CameraStatus.all(),
        live_events: %{},
+       transports: %{},
        disk_alert: disk_alert()
      )}
   end
@@ -37,6 +38,17 @@ defmodule CairnWeb.DashboardLive do
     Cairn.Retention.alert()
   catch
     :exit, _ -> %{active: false}
+  end
+
+  @impl true
+  def handle_event("toggle-transport", %{"camera" => camera_id}, socket) do
+    {:noreply,
+     update(socket, :transports, fn transports ->
+       Map.update(transports, camera_id, :webrtc, fn
+         :mse -> :webrtc
+         :webrtc -> :mse
+       end)
+     end)}
   end
 
   @impl true
@@ -85,8 +97,10 @@ defmodule CairnWeb.DashboardLive do
             </span>
           </header>
           <video
-            id={"camera-video-#{cam.id}"}
-            phx-hook="MsePlayer"
+            id={"camera-video-#{cam.id}-#{transport(@transports, cam.id)}"}
+            phx-hook={
+              if transport(@transports, cam.id) == :webrtc, do: "WebrtcPlayer", else: "MsePlayer"
+            }
             phx-update="ignore"
             data-camera-id={cam.id}
             data-hls-url={~p"/hls/#{cam.id}/index.m3u8"}
@@ -95,6 +109,15 @@ defmodule CairnWeb.DashboardLive do
             playsinline
             class="mt-2 w-full bg-black"
           ></video>
+          <button
+            id={"camera-transport-#{cam.id}"}
+            phx-click="toggle-transport"
+            phx-value-camera={cam.id}
+          >
+            {if transport(@transports, cam.id) == :webrtc,
+              do: "Low latency (WebRTC)",
+              else: "Standard (MSE)"}
+          </button>
         </article>
       </section>
     </Layouts.app>
@@ -104,4 +127,6 @@ defmodule CairnWeb.DashboardLive do
   defp status(statuses, camera_id) do
     statuses |> Map.get(camera_id, %{}) |> Map.get(:status, :unknown)
   end
+
+  defp transport(transports, camera_id), do: Map.get(transports, camera_id, :mse)
 end

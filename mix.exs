@@ -71,6 +71,7 @@ defmodule Cairn.MixProject do
       {:dns_cluster, "~> 0.2.0"},
       {:bandit, "~> 1.5"},
       {:yaml_elixir, "~> 2.11"},
+      {:ex_webrtc, "~> 0.17.0"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
   end
