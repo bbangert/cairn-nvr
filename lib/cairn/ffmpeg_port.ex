@@ -115,8 +115,10 @@ defmodule Cairn.FFmpegPort do
 
         String.starts_with?(cam.rtsp_url, "http") ->
           # live HTTP stream (e.g. Reolink FLV) — this is where ffmpeg's
-          # -reconnect flags actually apply (they are HTTP-protocol options)
-          ~w(-rw_timeout 10000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5)
+          # -reconnect flags actually apply (they are HTTP-protocol options).
+          # genpts/discardcorrupt smooth over camera timestamp jitter.
+          ~w(-rw_timeout 10000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5
+             -fflags +genpts+discardcorrupt)
 
         true ->
           # local file fixture loop for dev
@@ -131,6 +133,12 @@ defmodule Cairn.FFmpegPort do
         ["-c:v", "copy"]
       end
 
+    # RTP consumers (plugins, WebRTC browsers) need SPS/PPS **in-band**:
+    # container sources like FLV keep them in extradata only, and ffmpeg's
+    # RTP mux would otherwise only advertise them in its own SDP, which
+    # never reaches our consumers. No-op for already-annexb sources (RTSP).
+    rtp_bsf = ["-bsf:v", "h264_mp4toannexb"]
+
     ["ffmpeg", "-nostdin", "-nostats", "-loglevel", "warning"] ++
       input_opts ++
       cam.extra_ffmpeg_args ++
@@ -141,9 +149,11 @@ defmodule Cairn.FFmpegPort do
          -frag_duration 2000000 pipe:1) ++
       ["-map", "0:v"] ++
       codec_args ++
+      rtp_bsf ++
       ~w(-f rtp -payload_type 96 rtp://127.0.0.1:#{plugin_port}) ++
       ["-map", "0:v"] ++
-      codec_args ++ ~w(-f rtp -payload_type 96 rtp://127.0.0.1:#{rtp_port})
+      codec_args ++
+      rtp_bsf ++ ~w(-f rtp -payload_type 96 rtp://127.0.0.1:#{rtp_port})
   end
 
   @doc "Shell command wrapping `argv` with exec + stderr redirection."

@@ -21,9 +21,11 @@ defmodule CairnWeb.StreamChannel do
 
   @impl true
   def join("camera:" <> camera_id, _params, socket) do
+    # 3 fragments (~6s) of backlog lets the client start with a cushion
+    # instead of stalling at the live edge until the next fragment lands
     with {:ok, _cam} <- Cairn.Config.Server.camera(camera_id),
          ring when is_pid(ring) <- Cairn.Registry.whereis(camera_id, :ring_buffer),
-         {:ok, %{codec: codec} = data} <- RingBuffer.fetch_recent(camera_id, 1) do
+         {:ok, %{codec: codec} = data} <- RingBuffer.fetch_recent(camera_id, 3) do
       Phoenix.PubSub.subscribe(Cairn.PubSub, RingBuffer.topic(camera_id))
       send(self(), {:after_join, data})
       {:ok, %{codec: codec}, assign(socket, :camera_id, camera_id)}

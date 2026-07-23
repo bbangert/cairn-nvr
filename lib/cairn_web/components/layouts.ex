@@ -62,8 +62,9 @@ defmodule CairnWeb.Layouts do
       </div>
     </header>
 
-    <main class="px-4 py-20 sm:px-6 lg:px-8">
-      <div class="mx-auto max-w-2xl space-y-4">
+    <main class="px-4 py-8 sm:px-6 lg:px-8">
+      <!-- NVR pages are video-first: use the full viewport width -->
+      <div class="mx-auto w-full max-w-screen-2xl space-y-4">
         {render_slot(@inner_block)}
       </div>
     </main>

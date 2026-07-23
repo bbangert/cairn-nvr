@@ -109,15 +109,25 @@ defmodule CairnWeb.DashboardLive do
             playsinline
             class="mt-2 w-full bg-black"
           ></video>
-          <button
-            id={"camera-transport-#{cam.id}"}
-            phx-click="toggle-transport"
-            phx-value-camera={cam.id}
-          >
-            {if transport(@transports, cam.id) == :webrtc,
-              do: "Low latency (WebRTC)",
-              else: "Standard (MSE)"}
-          </button>
+          <div class="mt-2 flex items-center gap-2">
+            <button
+              id={"camera-transport-#{cam.id}"}
+              phx-click="toggle-transport"
+              phx-value-camera={cam.id}
+              class="btn btn-sm btn-primary"
+            >
+              {if transport(@transports, cam.id) == :webrtc,
+                do: "Switch to MSE (standard)",
+                else: "Switch to WebRTC (low latency)"}
+            </button>
+            <span
+              id={"camera-transport-state-#{cam.id}"}
+              class="badge badge-outline"
+              data-transport={transport(@transports, cam.id)}
+            >
+              now: {transport(@transports, cam.id) |> to_string() |> String.upcase()}
+            </span>
+          </div>
         </article>
       </section>
     </Layouts.app>
