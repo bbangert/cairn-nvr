@@ -17,6 +17,7 @@ defmodule Cairn.Application do
       {DNSCluster, query: Application.get_env(:cairn, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Cairn.PubSub},
       Cairn.Registry,
+      {Cairn.CameraStatus, []},
       {Cairn.DetectionAggregator, []},
       {Cairn.EventSupervisor, []},
       {Cairn.CameraSupervisor, []},

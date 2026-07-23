@@ -277,7 +277,7 @@ defmodule Cairn.FFmpegPort do
   defp set_status(%{status: status} = state, status), do: state
 
   defp set_status(state, status) do
-    status_fun = Keyword.get(state.opts, :status_fun, fn _camera_id, _status -> :ok end)
+    status_fun = Keyword.get(state.opts, :status_fun, &Cairn.CameraStatus.set/2)
     status_fun.(state.camera.id, status)
     %{state | status: status}
   end

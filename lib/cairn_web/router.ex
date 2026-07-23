@@ -17,7 +17,13 @@ defmodule CairnWeb.Router do
   scope "/", CairnWeb do
     pipe_through :browser
 
-    get "/", PageController, :home
+    live "/", DashboardLive
+  end
+
+  scope "/hls", CairnWeb do
+    get "/:camera/index.m3u8", HLSController, :playlist
+    get "/:camera/init.mp4", HLSController, :init_segment
+    get "/:camera/:segment", HLSController, :segment
   end
 
   # Other scopes may use custom stacks.
