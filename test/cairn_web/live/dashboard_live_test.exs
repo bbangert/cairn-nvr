@@ -15,6 +15,8 @@ defmodule CairnWeb.DashboardLiveTest do
   test "camera status updates live", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/")
 
+    # reset the globally-shared status table after the test
+    on_exit(fn -> Cairn.CameraStatus.merge("cam_a", %{status: :unknown}) end)
     Cairn.CameraStatus.set("cam_a", :running)
 
     assert render_async_status(view, "cam_a") =~ ~s(data-status="running")

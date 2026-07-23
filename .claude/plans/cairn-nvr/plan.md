@@ -340,22 +340,22 @@ works on hw with v4l2m2m (or cleanly refuses on dev box).
 
 ## Phase 9 — CPU reference plugin, release, docs, integration test
 
-- [ ] 9.1 [infra] CPU reference plugin `plugins/cpu-reference/` (Python:
+- [x] 9.1 [infra] CPU reference plugin `plugins/cpu-reference/` (Python:
       GStreamer or PyAV decode of RTP H.264 → sample ~5 fps → small ONNX
       model via onnxruntime → contract ndjson on stdout). Runs full
       pipeline on x86 dev machines; doubles as plugin-author documentation.
       Own README + requirements.txt; not part of the Elixir release.
-- [ ] 9.2 [docs] `docs/plugin-contract.md`: formal spec — argv/env inputs,
+- [x] 9.2 [docs] `docs/plugin-contract.md`: formal spec — argv/env inputs,
       UDP RTP input, ndjson output schema, stderr logging, restart/backoff
       expectations, mock + reference plugins as examples.
-- [ ] 9.3 [infra] Release: `mix release` with `runtime.exs` reading
+- [x] 9.3 [infra] Release: `mix release` with `runtime.exs` reading
       `CAIRN_DATA_DIR`/`CAIRN_CONFIG`/`PORT`; boot migrator (1.6); example
       `config.example.yml`; systemd unit example; optional Dockerfile;
       docs note: **no auth in v1 — LAN-trusted; reverse proxy / HA ingress
       for anything else**.
-- [ ] 9.4 [docs] README (positioning: event-clips NVR, HA-adjacent),
+- [x] 9.4 [docs] README (positioning: event-clips NVR, HA-adjacent),
       config reference, deployment guide, `docs/` cross-links.
-- [ ] 9.5 [test] Full-pipeline integration test (`@tag :integration`, skipped
+- [x] 9.5 [test] Full-pipeline integration test (`@tag :integration`, skipped
       unless ffmpeg present): camera configured with `file://` fixture +
       `-stream_loop -1` + `-re`, mock plugin timeline ⇒ assert event clip
       written, box-valid, indexed `finalized`, snapshot exists, `"events"`

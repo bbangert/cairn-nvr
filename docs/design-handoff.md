@@ -75,7 +75,7 @@ Filterable, paginated list of recorded event clips, newest first.
   `name="to"`). Empty option = "all".
 - **List rows/cards** (LiveView streams: container needs
   `id="events-list" phx-update="stream"`, each child id comes from the
-  stream): thumbnail (`event.snapshot_path` → `/media/snapshots/{event.id}.jpg`,
+  stream): thumbnail (`event.snapshot_path` → `/media/snapshots/{event.id}`,
   fallback placeholder when nil), camera id, started_at (local time),
   duration (ended_at − started_at), label chips with max score
   (`event.labels["max_scores"]` map), status badge (`finalized` normal,

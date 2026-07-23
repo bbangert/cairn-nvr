@@ -9,8 +9,6 @@ defmodule Cairn.Probe do
   dashboard badges.
   """
 
-  require Logger
-
   @timeout_ms 15_000
 
   @doc "Probes the camera and stores the result in `Cairn.CameraStatus`."

@@ -37,6 +37,13 @@ defmodule Cairn.DetectionAggregatorTest do
     ])
   end
 
+  defp token(agg, camera_id, kind), do: :sys.get_state(agg).cameras[camera_id][kind]
+
+  defp fire(agg, kind, camera_id, event_id) do
+    tk = token(agg, camera_id, if(kind == :post_window, do: :post_token, else: :max_token))
+    send(agg, {kind, camera_id, event_id, tk})
+  end
+
   test "detection starts an event with extractor and checkpoint", %{
     agg: agg,
     camera: camera,
@@ -77,7 +84,7 @@ defmodule Cairn.DetectionAggregatorTest do
     detect(agg, camera)
     assert_receive {:extractor_started, %Event{id: eid}, ex_pid}
 
-    send(agg, {:post_window, id, eid})
+    fire(agg, :post_window, id, eid)
 
     assert_receive {:extractor_finalized, ^ex_pid, %Event{id: ^eid, status: :finalized} = event}
     assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
@@ -93,7 +100,7 @@ defmodule Cairn.DetectionAggregatorTest do
     detect(agg, camera)
     assert_receive {:event_started, %Event{id: first}}
 
-    send(agg, {:max_event, id, first})
+    fire(agg, :max_event, id, first)
     assert_receive {:event_ended, %Event{id: ^first}}
 
     detect(agg, camera)
@@ -109,11 +116,34 @@ defmodule Cairn.DetectionAggregatorTest do
     detect(agg, camera)
     assert_receive {:event_started, %Event{id: eid}}
 
-    send(agg, {:post_window, id, eid})
+    old_token = token(agg, id, :post_token)
+    fire(agg, :post_window, id, eid)
     assert_receive {:event_ended, %Event{id: ^eid}}
 
-    send(agg, {:post_window, id, eid})
+    send(agg, {:post_window, id, eid, old_token})
     refute_receive {:event_ended, _}, 100
+  end
+
+  test "an already-delivered timer message from before a reschedule cannot finalize", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    detect(agg, camera)
+    assert_receive {:event_started, %Event{id: eid}}
+    stale_token = token(agg, id, :post_token)
+
+    # a new detection cancels + reschedules the post window; the stale
+    # message may already be in the mailbox — its token no longer matches
+    detect(agg, camera, 0.95, [0.12, 0.1, 0.2, 0.4])
+    assert_receive {:event_updated, %Event{id: ^eid}}
+
+    send(agg, {:post_window, id, eid, stale_token})
+    refute_receive {:event_ended, _}, 100
+
+    # the current token still finalizes
+    fire(agg, :post_window, id, eid)
+    assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
   end
 
   test "extractor crash mid-event ends the event as partial", %{
@@ -167,7 +197,7 @@ defmodule Cairn.DetectionAggregatorTest do
     eid = event.id
     refute_receive {:event_ended, %Event{id: ^eid}}, 100
 
-    send(agg, {:post_window, id, eid})
+    fire(agg, :post_window, id, eid)
     assert_receive {:extractor_finalized, ^extractor, %Event{id: ^eid}}
     assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
   end

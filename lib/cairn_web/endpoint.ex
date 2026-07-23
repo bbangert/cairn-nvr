@@ -11,8 +11,10 @@ defmodule CairnWeb.Endpoint do
     same_site: "Lax"
   ]
 
+  # check_origin :conn — accept only the origin the page was served from;
+  # works for LAN IPs without hardcoding hosts, never disable outright
   socket "/socket", CairnWeb.UserSocket,
-    websocket: true,
+    websocket: [check_origin: :conn],
     longpoll: false
 
   socket "/live", Phoenix.LiveView.Socket,

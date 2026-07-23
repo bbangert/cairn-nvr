@@ -10,6 +10,9 @@ defmodule Cairn.DataDir do
   @spec ensure!(Path.t()) :: :ok
   def ensure!(data_dir) do
     Enum.each([data_dir | Enum.map(@subdirs, &Path.join(data_dir, &1))], &File.mkdir_p!/1)
+    # ffmpeg/plugin logs can echo credentialed URLs — keep them private
+    File.chmod(log_dir(data_dir), 0o700)
+    :ok
   end
 
   @spec events_dir(Path.t(), String.t()) :: Path.t()

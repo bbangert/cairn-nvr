@@ -37,10 +37,34 @@ defmodule CairnWeb.ConfigLive do
     )
   end
 
+  @credential_params ~w(password pass pwd token secret user username)
+
   @doc false
-  # rtsp://user:secret@host/... -> rtsp://user:*****@host/...
+  # masks userinfo (rtsp://user:secret@host) AND credential-looking query
+  # params (Reolink-style http://host/flv?user=x&password=y)
   def mask_url(url) do
-    String.replace(url, ~r/(\/\/[^:\/@]+:)[^@\/]+@/, "\\1*****@")
+    masked = String.replace(url, ~r/(\/\/[^:\/@]+:)[^@\/]+@/, "\\1*****@")
+
+    case String.split(masked, "?", parts: 2) do
+      [base, query] -> base <> "?" <> mask_query(query)
+      [base] -> base
+    end
+  end
+
+  defp mask_query(query) do
+    query
+    |> String.split("&")
+    |> Enum.map_join("&", &mask_query_pair/1)
+  end
+
+  defp mask_query_pair(pair) do
+    case String.split(pair, "=", parts: 2) do
+      [key, _value] ->
+        if String.downcase(key) in @credential_params, do: "#{key}=*****", else: pair
+
+      _ ->
+        pair
+    end
   end
 
   defp probe(statuses, camera_id) do

@@ -29,7 +29,11 @@ defmodule CairnWeb.EventsLive do
       to: params["to"] || ""
     }
 
-    page = String.to_integer(params["page"] || "1")
+    page =
+      case Integer.parse(params["page"] || "1") do
+        {n, ""} when n >= 1 -> n
+        _ -> 1
+      end
 
     result =
       Events.list(

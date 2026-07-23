@@ -23,7 +23,7 @@ defmodule CairnWeb.WebRTC.Session do
   @spec start(String.t(), pid()) :: DynamicSupervisor.on_start_child()
   def start(camera_id, owner) do
     DynamicSupervisor.start_child(
-      Cairn.EventSupervisor,
+      CairnWeb.WebRTC.Supervisor,
       {__MODULE__, camera_id: camera_id, owner: owner}
     )
   end

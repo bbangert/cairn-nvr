@@ -11,10 +11,10 @@ State: WORKING (Phase 5 in progress)
 | 3 — Live preview | 3.1–3.6 ✅ | `mix check`; MSE+HLS paths | PASS (62 tests) + LIVE PASS (server half): HLS init+segments from real camera ffprobe-decode (80 frames 2560×1920 H.264). Browser render check → external gate below |
 | 4 — Detection plane | 4.1–4.7 ✅ | `mix check`; mock plugin timeline drives start/update/end on `"events"` | PASS (81 tests) — commit `Phase 4` |
 | 5 — Event plane | 5.1–5.7 ✅ | `mix check`; e2e: real camera + mock plugin ⇒ playable, indexed clip | PASS (87 tests) + LIVE PASS 2026-07-22: 13.9s clip w/ pre-roll (200 frames, box-valid), row `finalized` 5.2MB max_score 0.93, 2560×1920 JPEG snapshot |
-| 6 — Browser/config plumbing | pending | `mix check`; LiveView tests | — |
-| 7 — WebRTC | pending | `mix check`; spike verdict recorded | — |
-| 8 — Probe/transcode | pending | `mix check`; refusal path tested | — |
-| 9 — Release/docs/integration | pending | `mix check` + `@tag :integration` green; release boots | — |
+| 6 — Browser/config plumbing | 6.1–6.6 ✅ | `mix check`; LiveView tests; live endpoints | PASS (105 tests) + LIVE PASS: events list/detail/config vs real recorded event; Range 206; masked creds |
+| 7 — WebRTC | 7.1–7.5 ✅ | `mix check`; spike verdict recorded | PASS (120 tests); spike verdict in scratchpad (no seq rewrite needed); hub live on :17001 with real RTP; browser WebRTC on Ben's manual list |
+| 8 — Probe/transcode | 8.1–8.3 ✅ | `mix check`; refusal path tested | PASS (131 tests); real-ffprobe file probe + hung-probe timeout tested |
+| 9 — Release/docs/integration | 9.1–9.5 ✅ | `mix check` + `@tag :integration` green | PASS: integration test green in 12.5s (real ffmpeg + mock plugin ⇒ finalized playable indexed clip + snapshot). Release-tarball boot smoke not run (needs prod assets build) — on Ben's list or CI |
 
 ## External gates
 
@@ -131,3 +131,39 @@ State: WORKING (Phase 5 in progress)
 [19:27] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/test_helper.exs
 [19:27] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/integration/full_pipeline_test.exs
 [19:27] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/integration/full_pipeline_test.exs
+[19:28] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.claude/plans/cairn-nvr/progress.md
+[19:32] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/camera_supervisor_test.exs
+[19:32] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/camera_status_test.exs
+[19:32] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/udp_ports_test.exs
+[19:32] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn_web/live/dashboard_live_test.exs
+[19:32] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.claude/reviews/elixir.md
+[19:32] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/webrtc/supervisor.ex
+[19:32] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/webrtc/session.ex
+[19:32] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/application.ex
+[19:32] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/channels/webrtc_channel.ex
+[19:33] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/detection_aggregator.ex
+[19:33] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/detection_aggregator.ex
+[19:33] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/detection_aggregator.ex
+[19:33] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/detection_aggregator.ex
+[19:33] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/detection_aggregator.ex
+[19:33] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/mp4/demuxer.ex
+[19:33] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/events.ex
+[19:33] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ffmpeg_port.ex
+[19:33] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/live/config_live.ex
+[19:34] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/endpoint.ex
+[19:34] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/live/events_live.ex
+[19:34] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/data_dir.ex
+[19:34] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/detection_aggregator_test.exs
+[19:34] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/detection_aggregator_test.exs
+[19:34] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/detection_aggregator_test.exs
+[19:34] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/detection_aggregator_test.exs
+[19:34] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/detection_aggregator_test.exs
+[19:34] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn_web/live/config_live_test.exs
+[19:36] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/test_helper.exs
+[19:37] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/camera_status_test.exs
+[19:37] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/probe.ex
+[19:38] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ffmpeg_port.ex
+[19:38] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ffmpeg_port.ex
+[19:38] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/rtp_hub.ex
+[19:38] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/live/config_live.ex
+[19:38] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/transcode_test.exs

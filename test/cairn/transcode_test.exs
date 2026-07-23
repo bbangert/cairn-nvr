@@ -14,7 +14,7 @@ defmodule Cairn.TranscodeTest do
       argv = FFmpegPort.build_argv(camera(true), {5001, 5002}, "-timeout", gop: 30)
 
       assert Enum.count(argv, &(&1 == "h264_v4l2m2m")) == 3
-      assert Enum.count(argv, &(&1 == "copy")) == 0
+      refute "copy" in argv
       assert Enum.count(argv, &(&1 == "-g")) == 3
       assert "30" in argv
       assert Enum.count(argv, &(&1 == "-bf")) == 3
