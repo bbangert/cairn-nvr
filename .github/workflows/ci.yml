@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  MIX_ENV: test
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Compile · Format · Credo · Sobelow · Dialyzer · Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          elixir-version: "1.20"
+          otp-version: "28"
+
+      # the test suite drives real ffmpeg/ffprobe (fixtures, probe, e2e)
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Cache deps and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+
+      - name: Cache dialyzer PLTs
+        uses: actions/cache@v4
+        with:
+          path: priv/plts
+          key: plt-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            plt-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+
+      - run: mix deps.get
+
+      - run: mix compile --warnings-as-errors
+
+      - run: mix format --check-formatted
+
+      - run: mix credo
+
+      - run: mix sobelow --skip --exit --threshold medium
+
+      - run: mix dialyzer --format github
+
+      - run: mix test
+
+      - name: Full-pipeline integration test (real ffmpeg)
+        run: mix test --only integration

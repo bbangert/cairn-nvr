@@ -8,11 +8,14 @@ defmodule Cairn.Registry do
     Registry.child_spec(keys: :unique, name: __MODULE__)
   end
 
+  @typedoc "Process role: an atom, or `{:extractor, event_id}` for extractors."
+  @type role :: atom() | {atom(), String.t()}
+
   @doc "Via-tuple for registering/looking up a per-camera process."
-  @spec via(String.t(), atom()) :: {:via, Registry, {module(), {String.t(), atom()}}}
+  @spec via(String.t(), role()) :: {:via, Registry, {module(), {String.t(), role()}}}
   def via(camera_id, role), do: {:via, Registry, {__MODULE__, {camera_id, role}}}
 
-  @spec whereis(String.t(), atom()) :: pid() | nil
+  @spec whereis(String.t(), role()) :: pid() | nil
   def whereis(camera_id, role) do
     case Registry.lookup(__MODULE__, {camera_id, role}) do
       [{pid, _}] -> pid

@@ -77,7 +77,7 @@ defmodule Cairn.RingBuffer do
   end
 
   @doc "Init segment, codec and the most recent `count` fragments (for HLS)."
-  @spec fetch_recent(String.t(), pos_integer()) ::
+  @spec fetch_recent(String.t(), non_neg_integer()) ::
           {:ok, %{init: binary() | nil, codec: String.t() | nil, fragments: [Fragment.t()]}}
   def fetch_recent(camera_id, count) do
     GenServer.call(name(camera_id), {:fetch_recent, count})
