@@ -320,18 +320,18 @@ on join.
 
 ## Phase 8 — Codec probe + opt-in hardware transcode
 
-- [ ] 8.1 [port] `Cairn.Probe`: `ffprobe -v error -show_streams
+- [x] 8.1 [port] `Cairn.Probe`: `ffprobe -v error -show_streams
       -show_format -of json` with hard timeout (Task.yield + kill via sh
       wrapper `exec`); parse codec, resolution, fps, profile; run on camera
       start and on reload; store in CameraStatus → config page + dashboard
       badge. Non-H.264 → warning: "switch camera to H.264 or enable
       transcode".
-- [ ] 8.2 [port] Transcode argv variant (camera `transcode: true`):
+- [x] 8.2 [port] Transcode argv variant (camera `transcode: true`):
       `-c:v h264_v4l2m2m -g {2×fps} -bf 0` replacing `-c:v copy` on all
       three outputs' source; boot-time capability check (`ffmpeg -encoders`
       contains `h264_v4l2m2m`) — if unavailable, **refuse with a clear
       per-camera error status** (no libx264 fallback, settled decision).
-- [ ] 8.3 [test] Probe JSON parser fixtures (H.264/HEVC/MJPEG cams); argv
+- [x] 8.3 [test] Probe JSON parser fixtures (H.264/HEVC/MJPEG cams); argv
       builder tests for transcode + `-g` derivation from probed fps;
       refusal path test.
 

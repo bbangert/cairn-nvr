@@ -118,3 +118,16 @@ State: WORKING (Phase 5 in progress)
 [19:22] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/probe_test.exs
 [19:22] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/transcode_test.exs
 [19:23] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ffmpeg_port.ex
+[19:24] Modified: /var/home/ben/Programming/elixir/cairn-nvr/docs/plugin-contract.md
+[19:25] Modified: /var/home/ben/Programming/elixir/cairn-nvr/plugins/cpu-reference/main.py
+[19:25] Modified: /var/home/ben/Programming/elixir/cairn-nvr/plugins/cpu-reference/requirements.txt
+[19:25] Modified: /var/home/ben/Programming/elixir/cairn-nvr/plugins/cpu-reference/README.md
+[19:25] Modified: /var/home/ben/Programming/elixir/cairn-nvr/config/runtime.exs
+[19:25] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/release_secrets.ex
+[19:25] Modified: /var/home/ben/Programming/elixir/cairn-nvr/mix.exs
+[19:25] Modified: /var/home/ben/Programming/elixir/cairn-nvr/rel/cairn.service.example
+[19:26] Modified: /var/home/ben/Programming/elixir/cairn-nvr/Dockerfile
+[19:26] Modified: /var/home/ben/Programming/elixir/cairn-nvr/README.md
+[19:27] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/test_helper.exs
+[19:27] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/integration/full_pipeline_test.exs
+[19:27] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/integration/full_pipeline_test.exs
