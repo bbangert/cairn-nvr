@@ -11,8 +11,6 @@ defmodule Cairn.RTPHub do
 
   use GenServer
 
-  require Logger
-
   # bounds memory if a camera emits pathological GOPs (~4096 * ~1200B ≈ 5MB)
   @max_gop_packets 4096
 

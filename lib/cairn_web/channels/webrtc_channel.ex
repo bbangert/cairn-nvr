@@ -19,6 +19,7 @@ defmodule CairnWeb.WebRTCChannel do
       {:ok, assign(socket, :session, session)}
     else
       :error -> {:error, %{reason: "unknown camera"}}
+      {:error, :max_children} -> {:error, %{reason: "too many viewers"}}
       {:error, _} -> {:error, %{reason: "session failed"}}
     end
   end

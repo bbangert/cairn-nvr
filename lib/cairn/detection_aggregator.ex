@@ -70,12 +70,22 @@ defmodule Cairn.DetectionAggregator do
   end
 
   @impl true
-  def handle_info({:post_window, camera_id, event_id}, state) do
-    {:noreply, maybe_finalize(state, camera_id, event_id, :post_window)}
+  def handle_info({:post_window, camera_id, event_id, token}, state) do
+    # the token guards against a stale timer message that was already in
+    # the mailbox when a detection cancelled + rescheduled the window
+    if token == get_in(state.cameras, [camera_id, :post_token]) do
+      {:noreply, maybe_finalize(state, camera_id, event_id, :post_window)}
+    else
+      {:noreply, state}
+    end
   end
 
-  def handle_info({:max_event, camera_id, event_id}, state) do
-    {:noreply, maybe_finalize(state, camera_id, event_id, :max_event)}
+  def handle_info({:max_event, camera_id, event_id, token}, state) do
+    if token == get_in(state.cameras, [camera_id, :max_token]) do
+      {:noreply, maybe_finalize(state, camera_id, event_id, :max_event)}
+    else
+      {:noreply, state}
+    end
   end
 
   def handle_info({:DOWN, _ref, :process, pid, reason}, state) do
@@ -116,12 +126,17 @@ defmodule Cairn.DetectionAggregator do
         EventCheckpoint.put(camera.id, event)
         Event.broadcast(:event_started, event)
 
+        {post_ref, post_token} = schedule(:post_window, camera.id, event.id, windows.post)
+        {max_ref, max_token} = schedule(:max_event, camera.id, event.id, windows.max)
+
         %{
           cam
           | event: event,
             extractor: pid,
-            post_ref: schedule(:post_window, camera.id, event.id, windows.post),
-            max_ref: schedule(:max_event, camera.id, event.id, windows.max)
+            post_ref: post_ref,
+            post_token: post_token,
+            max_ref: max_ref,
+            max_token: max_token
         }
 
       {:error, reason} ->
@@ -144,11 +159,8 @@ defmodule Cairn.DetectionAggregator do
     EventCheckpoint.put(event.camera_id, event)
     Event.broadcast(:event_updated, event)
 
-    %{
-      cam
-      | event: event,
-        post_ref: schedule(:post_window, event.camera_id, event.id, windows.post)
-    }
+    {post_ref, post_token} = schedule(:post_window, event.camera_id, event.id, windows.post)
+    %{cam | event: event, post_ref: post_ref, post_token: post_token}
   end
 
   defp maybe_finalize(state, camera_id, event_id, cause) do
@@ -183,7 +195,17 @@ defmodule Cairn.DetectionAggregator do
           cam = %{new_cam() | event: event, extractor: pid}
           # windows are unknown here; use the global defaults conservatively
           windows = Cairn.Config.windows(config(), %Cairn.Config.Camera{id: camera_id})
-          cam = %{cam | post_ref: schedule(:post_window, camera_id, event.id, windows.post)}
+          {post_ref, post_token} = schedule(:post_window, camera_id, event.id, windows.post)
+          {max_ref, max_token} = schedule(:max_event, camera_id, event.id, windows.max)
+
+          cam = %{
+            cam
+            | post_ref: post_ref,
+              post_token: post_token,
+              max_ref: max_ref,
+              max_token: max_token
+          }
+
           put_cam(state, camera_id, cam)
       end
     end)
@@ -227,19 +249,38 @@ defmodule Cairn.DetectionAggregator do
   end
 
   defp schedule(kind, camera_id, event_id, seconds) do
-    Process.send_after(self(), {kind, camera_id, event_id}, seconds * 1_000)
+    token = make_ref()
+    tref = Process.send_after(self(), {kind, camera_id, event_id, token}, seconds * 1_000)
+    {tref, token}
   end
 
   defp cam_state(state, camera_id), do: state.cameras[camera_id] || new_cam()
 
   defp new_cam do
-    %{event: nil, extractor: nil, tracker: Tracker.new(), post_ref: nil, max_ref: nil}
+    %{
+      event: nil,
+      extractor: nil,
+      tracker: Tracker.new(),
+      post_ref: nil,
+      post_token: nil,
+      max_ref: nil,
+      max_token: nil
+    }
   end
 
   defp clear_event(cam) do
     if cam.post_ref, do: Process.cancel_timer(cam.post_ref)
     if cam.max_ref, do: Process.cancel_timer(cam.max_ref)
-    %{cam | event: nil, extractor: nil, post_ref: nil, max_ref: nil}
+
+    %{
+      cam
+      | event: nil,
+        extractor: nil,
+        post_ref: nil,
+        post_token: nil,
+        max_ref: nil,
+        max_token: nil
+    }
   end
 
   defp put_cam(state, camera_id, cam) do

@@ -62,8 +62,13 @@ defmodule Cairn.MP4.Demuxer do
 
   # -- box framing ------------------------------------------------------------
 
-  defp next_box(<<1::32, type::binary-size(4), largesize::64, _::binary>> = buf) do
+  defp next_box(<<1::32, type::binary-size(4), largesize::64, _::binary>> = buf)
+       when largesize >= 16 do
     framed(buf, type, largesize)
+  end
+
+  defp next_box(<<1::32, _type::binary-size(4), largesize::64, _::binary>>) do
+    {:error, {:bad_box_size, largesize}}
   end
 
   defp next_box(<<1::32, _::binary>>), do: :more

@@ -158,8 +158,14 @@ defmodule Cairn.Events do
   defp filter_label(query, ""), do: query
 
   defp filter_label(query, label) do
-    path = "$.max_scores.#{label}"
-    where(query, [e], not is_nil(fragment("json_extract(?, ?)", e.labels, ^path)))
+    # labels come from plugins ([\w -] in practice); anything else would
+    # make json_extract raise on a malformed JSONPath — match nothing instead
+    if label =~ ~r/^[a-zA-Z0-9_ -]+$/ do
+      path = "$.max_scores.#{label}"
+      where(query, [e], not is_nil(fragment("json_extract(?, ?)", e.labels, ^path)))
+    else
+      where(query, [e], false)
+    end
   end
 
   defp filter_time(query, nil, nil), do: query

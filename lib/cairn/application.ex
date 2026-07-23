@@ -26,6 +26,7 @@ defmodule Cairn.Application do
       {Cairn.EventSupervisor, []},
       {Cairn.CameraSupervisor, []},
       {Cairn.Retention, []},
+      {CairnWeb.WebRTC.Supervisor, []},
       # Reconcile index with disk, then start cameras from config
       {Cairn.Boot, []},
       # Start to serve requests, typically the last entry

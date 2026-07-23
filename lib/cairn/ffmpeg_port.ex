@@ -176,20 +176,20 @@ defmodule Cairn.FFmpegPort do
   @impl true
   def handle_info(:spawn, state) do
     if state.camera.transcode and not transcode_capable?(state) do
-      # settled decision: refuse loudly, never fall back to libx264
+      # settled decision: refuse loudly, never fall back to libx264.
+      # Re-check occasionally so a driver/module fix is picked up without
+      # a full restart.
       Logger.error(
         "camera #{state.camera.id}: transcode requested but h264_v4l2m2m is unavailable — " <>
           "refusing to start (no software fallback)"
       )
 
+      :persistent_term.erase({__MODULE__, :v4l2m2m})
+      Process.send_after(self(), :spawn, Keyword.get(state.opts, :recheck_ms, 60_000))
       {:noreply, set_status(state, :transcode_unavailable)}
     else
       {:noreply, spawn_ffmpeg(state)}
     end
-  end
-
-  defp transcode_capable?(state) do
-    Keyword.get_lazy(state.opts, :transcode_available, &transcode_available?/0)
   end
 
   def handle_info({port, {:data, data}}, %{port: port} = state) do
@@ -230,6 +230,10 @@ defmodule Cairn.FFmpegPort do
   end
 
   # -- internals --------------------------------------------------------------
+
+  defp transcode_capable?(state) do
+    Keyword.get_lazy(state.opts, :transcode_available, &transcode_available?/0)
+  end
 
   defp handle_event({:init, %{data: data, codec: codec, timescale: timescale}}, state) do
     Cairn.RingBuffer.put_init(state.camera.id, data, codec, timescale)
