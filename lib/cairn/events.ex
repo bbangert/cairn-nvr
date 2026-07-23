@@ -1,0 +1,176 @@
+defmodule Cairn.Events do
+  @moduledoc """
+  Event index context — the only module that touches the `events` table.
+  The aggregator/extractor/reconciler/retention all go through here.
+  """
+
+  import Ecto.Query
+
+  alias Cairn.Events.Event
+  alias Cairn.Repo
+
+  @type list_opts :: [
+          camera: String.t() | nil,
+          label: String.t() | nil,
+          from: DateTime.t() | nil,
+          to: DateTime.t() | nil,
+          page: pos_integer(),
+          page_size: pos_integer()
+        ]
+
+  @spec get(String.t()) :: Event.t() | nil
+  def get(id), do: Repo.get(Event, id)
+
+  @doc "Inserts the `active` row at event start (crash-safe reconciliation)."
+  @spec create_active(Cairn.Event.t(), Path.t()) ::
+          {:ok, Event.t()} | {:error, Ecto.Changeset.t()}
+  def create_active(%Cairn.Event{} = event, path) do
+    %Event{}
+    |> Event.changeset(%{
+      id: event.id,
+      camera_id: event.camera_id,
+      started_at: event.started_at,
+      status: :active,
+      path: path,
+      labels: labels_map(event)
+    })
+    |> Repo.insert()
+  end
+
+  @spec finalize(Cairn.Event.t(), non_neg_integer()) ::
+          {:ok, Event.t()} | {:error, term()}
+  def finalize(%Cairn.Event{} = event, bytes) do
+    case get(event.id) do
+      nil ->
+        {:error, :not_found}
+
+      row ->
+        row
+        |> Event.changeset(%{
+          status: :finalized,
+          ended_at: event.ended_at,
+          bytes: bytes,
+          labels: labels_map(event),
+          max_score: event.max_score
+        })
+        |> Repo.update()
+    end
+  end
+
+  @spec mark_partial(String.t(), map()) :: {:ok, Event.t()} | {:error, term()}
+  def mark_partial(id, attrs \\ %{}) do
+    case get(id) do
+      nil -> {:error, :not_found}
+      row -> row |> Event.changeset(Map.put(attrs, :status, :partial)) |> Repo.update()
+    end
+  end
+
+  @spec set_snapshot(String.t(), Path.t()) :: {:ok, Event.t()} | {:error, term()}
+  def set_snapshot(id, snapshot_path) do
+    case get(id) do
+      nil -> {:error, :not_found}
+      row -> row |> Event.changeset(%{snapshot_path: snapshot_path}) |> Repo.update()
+    end
+  end
+
+  @doc "Adopts an orphaned clip found on disk as a `partial` event."
+  @spec adopt_orphan(String.t(), String.t(), DateTime.t(), Path.t(), non_neg_integer()) ::
+          {:ok, Event.t()} | {:error, Ecto.Changeset.t()}
+  def adopt_orphan(event_id, camera_id, started_at, path, bytes) do
+    %Event{}
+    |> Event.changeset(%{
+      id: event_id,
+      camera_id: camera_id,
+      started_at: started_at,
+      status: :partial,
+      path: path,
+      bytes: bytes
+    })
+    |> Repo.insert()
+  end
+
+  @doc "Filterable, offset-paginated event list, newest first."
+  @spec list(list_opts()) :: %{events: [Event.t()], page: pos_integer(), total: non_neg_integer()}
+  def list(opts \\ []) do
+    page = max(Keyword.get(opts, :page, 1), 1)
+    page_size = min(Keyword.get(opts, :page_size, 50), 200)
+
+    query =
+      Event
+      |> filter_camera(opts[:camera])
+      |> filter_label(opts[:label])
+      |> filter_time(opts[:from], opts[:to])
+
+    total = Repo.aggregate(query, :count)
+
+    events =
+      query
+      |> order_by([e], desc: e.started_at)
+      |> limit(^page_size)
+      |> offset(^((page - 1) * page_size))
+      |> Repo.all()
+
+    %{events: events, page: page, total: total}
+  end
+
+  @doc "Distinct labels seen across all events (for filter dropdowns)."
+  @spec known_labels() :: [String.t()]
+  def known_labels do
+    Event
+    |> select([e], e.labels)
+    |> Repo.all()
+    |> Enum.flat_map(&Map.keys(Map.get(&1, "max_scores", %{})))
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  @spec all() :: [Event.t()]
+  def all, do: Repo.all(Event)
+
+  @doc "Finished (non-active) events, oldest first — emergency cleanup order."
+  @spec oldest_for_cleanup(pos_integer()) :: [Event.t()]
+  def oldest_for_cleanup(count) do
+    Event
+    |> where([e], e.status != :active)
+    |> order_by([e], asc: e.started_at)
+    |> limit(^count)
+    |> Repo.all()
+  end
+
+  @doc "Finished events started before `cutoff` (retention candidates)."
+  @spec finished_started_before(DateTime.t()) :: [Event.t()]
+  def finished_started_before(cutoff) do
+    Event
+    |> where([e], e.status != :active and e.started_at < ^cutoff)
+    |> Repo.all()
+  end
+
+  @spec delete_row(Event.t()) :: {:ok, Event.t()} | {:error, term()}
+  def delete_row(%Event{} = event), do: Repo.delete(event)
+
+  # -- filters ----------------------------------------------------------------
+
+  defp filter_camera(query, nil), do: query
+  defp filter_camera(query, ""), do: query
+  defp filter_camera(query, camera_id), do: where(query, [e], e.camera_id == ^camera_id)
+
+  defp filter_label(query, nil), do: query
+  defp filter_label(query, ""), do: query
+
+  defp filter_label(query, label) do
+    path = "$.max_scores.#{label}"
+    where(query, [e], not is_nil(fragment("json_extract(?, ?)", e.labels, ^path)))
+  end
+
+  defp filter_time(query, nil, nil), do: query
+  defp filter_time(query, from, nil), do: where(query, [e], e.started_at >= ^from)
+  defp filter_time(query, nil, to), do: where(query, [e], e.started_at <= ^to)
+
+  defp filter_time(query, from, to) do
+    where(query, [e], e.started_at >= ^from and e.started_at <= ^to)
+  end
+
+  defp labels_map(%Cairn.Event{} = event) do
+    %{"entries" => event.labels, "max_scores" => event.max_scores}
+  end
+end

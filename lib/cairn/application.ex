@@ -7,6 +7,8 @@ defmodule Cairn.Application do
 
   @impl true
   def start(_type, _args) do
+    Cairn.ExtractorTelemetry.attach()
+
     children = [
       CairnWeb.Telemetry,
       # Config first: everything else (Repo path, data dirs, cameras) hangs off it
@@ -19,9 +21,11 @@ defmodule Cairn.Application do
       Cairn.Registry,
       {Cairn.CameraStatus, []},
       {Cairn.EventCheckpoint, []},
+      {Task.Supervisor, name: Cairn.TaskSupervisor},
       {Cairn.DetectionAggregator, []},
       {Cairn.EventSupervisor, []},
       {Cairn.CameraSupervisor, []},
+      {Cairn.Retention, []},
       # Reconcile index with disk, then start cameras from config
       {Cairn.Boot, []},
       # Start to serve requests, typically the last entry
@@ -43,7 +47,8 @@ defmodule Cairn.Application do
   end
 
   defp skip_migrations?() do
-    # By default, sqlite migrations are run when using a release
-    System.get_env("RELEASE_NAME") == nil
+    # Migrations run at boot everywhere (Boot's reconciliation needs the
+    # schema); tests migrate via the mix test alias instead
+    Application.get_env(:cairn, :skip_boot_migrations, false)
   end
 end

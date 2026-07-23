@@ -89,7 +89,13 @@ defmodule Cairn.PluginPortTest do
   test "plugin exit triggers backoff respawn" do
     id = "plug_#{System.unique_integer([:positive])}"
 
-    agg = start_supervised!({DetectionAggregator, name: nil})
+    agg =
+      start_supervised!(
+        {DetectionAggregator,
+         name: nil,
+         start_extractor: fn _c, _e -> {:ok, spawn(fn -> Process.sleep(:infinity) end)} end}
+      )
+
     Event.subscribe()
 
     # exits immediately after one valid line; respawn emits it again

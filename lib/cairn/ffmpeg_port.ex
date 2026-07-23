@@ -79,11 +79,18 @@ defmodule Cairn.FFmpegPort do
           [String.t()]
   def build_argv(cam, {plugin_port, rtp_port}, timeout_flag) do
     input_opts =
-      if String.starts_with?(cam.rtsp_url, "rtsp://") do
-        ["-rtsp_transport", "tcp", timeout_flag, "10000000"]
-      else
-        # non-RTSP source (e.g. file:// fixture loop for dev)
-        ["-re", "-stream_loop", "-1"]
+      cond do
+        String.starts_with?(cam.rtsp_url, "rtsp://") ->
+          ["-rtsp_transport", "tcp", timeout_flag, "10000000"]
+
+        String.starts_with?(cam.rtsp_url, "http") ->
+          # live HTTP stream (e.g. Reolink FLV) — this is where ffmpeg's
+          # -reconnect flags actually apply (they are HTTP-protocol options)
+          ~w(-rw_timeout 10000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5)
+
+        true ->
+          # local file fixture loop for dev
+          ["-re", "-stream_loop", "-1"]
       end
 
     ["ffmpeg", "-nostdin", "-nostats", "-loglevel", "warning"] ++
