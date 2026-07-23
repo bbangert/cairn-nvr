@@ -15,9 +15,6 @@ defmodule Cairn.Boot do
   def run(_opts) do
     config = Cairn.Config.Server.get()
     Cairn.Reconciler.run(config)
-
-    if Application.get_env(:cairn, :start_cameras, true) do
-      Cairn.CameraSupervisor.sync(config)
-    end
+    Cairn.CameraSupervisor.sync(config)
   end
 end
