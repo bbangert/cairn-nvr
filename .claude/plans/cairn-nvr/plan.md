@@ -187,20 +187,20 @@ real camera/fixture loop, both MSE and HLS paths.
 
 ## Phase 4 — Detection plane: plugin Port, mock plugin, aggregator
 
-- [ ] 4.1 [otp] `Cairn.UDPPorts`: pure allocator — camera index → 
+- [x] 4.1 [otp] `Cairn.UDPPorts`: pure allocator — camera index → 
       `{plugin_port, rtp_port}` = base + 2×index (validated in 1.3).
-- [ ] 4.2 [port] `Cairn.PluginPort`: spawn configured plugin command with
+- [x] 4.2 [port] `Cairn.PluginPort`: spawn configured plugin command with
       argv `--camera-id --udp-port --min-score-json …` (contract: config via
       argv/env, RTP in on assigned UDP port, ndjson detections on stdout,
       logs on stderr → per-camera log via sh wrapper); Port opts
       `[:binary, {:line, 8192}, :exit_status]`; decode each line
       (`camera_id`, `pts`, `dets[{label,bbox,score}]`), forward to
       aggregator; malformed line → log + drop; backoff-respawn like 2.4.
-- [ ] 4.3 [infra] Mock plugin `priv/plugins/mock/mock_plugin.exs` (escript
+- [x] 4.3 [infra] Mock plugin `priv/plugins/mock/mock_plugin.exs` (escript
       or plain script): replays a scripted detection timeline (JSON file +
       timing), ignores UDP input; deterministic for ExUnit/CI — exercises
       full Port lifecycle.
-- [ ] 4.4 [otp] `Cairn.DetectionAggregator`: per-camera state
+- [x] 4.4 [otp] `Cairn.DetectionAggregator`: per-camera state
       (`active_event`, `last_detection_pts`, tracker); `min_score` per-label
       filter; greedy-IoU tracker assigning stable object ids; lifecycle:
       no-active + detection → start `EventExtractor` via EventSupervisor;
@@ -209,16 +209,16 @@ real camera/fixture loop, both MSE and HLS paths.
       `max_event_seconds` → finalize + reopen if detections continue.
       Overlapping detections merge into the one active event per camera.
       Inject clock/timer (send_after wrapper) for tests.
-- [ ] 4.5 [otp] Aggregator ETS checkpoint: public named table owned by the
+- [x] 4.5 [otp] Aggregator ETS checkpoint: public named table owned by the
       app supervisor; aggregator restores active-event refs on restart
       (re-attach or finalize orphaned extractors).
-- [ ] 4.6 [otp] **Event lifecycle contract (publisher-friendly — design
+- [x] 4.6 [otp] **Event lifecycle contract (publisher-friendly — design
       obligation)**: `Cairn.Event` struct + internal PubSub topic
       `"events"` emitting `{:event_started | :event_updated |
       :event_ended, %Cairn.Event{}}` with stable JSON-serializable shape
       (id first, media async later). Dashboard consumes it now; MQTT/webhooks
       bolt on later without touching the aggregator.
-- [ ] 4.7 [test] Tracker/lifecycle unit tests (fake clock: debounce, post
+- [x] 4.7 [test] Tracker/lifecycle unit tests (fake clock: debounce, post
       window, max-cap split, merge); PluginPort integration with mock
       plugin (spawn real Port, assert aggregator receives detections);
       checkpoint-restore test.
@@ -283,10 +283,14 @@ plugin ⇒ clip on disk, playable, indexed, snapshot present.
 - [ ] 6.5 [test] LiveView tests: event list filtering/pagination, Range
       controller (206 responses), reload flow with invalid YAML (old config
       retained, errors shown).
-- [ ] 6.6 [docs] `docs/design-handoff.md` for Claude Design: page map,
+- [x] 6.6 [docs] `docs/design-handoff.md` for Claude Design: page map,
       per-page components/states/empty-states, data contracts (assigns,
       PubSub topics, channel protocol, hook interfaces, endpoints),
       Tailwind/daisyUI baseline, export-back instructions.
+      **Done early (during Phase 5) so the design side can start in
+      parallel.** GATE: final visual styling of dashboard/events/config
+      is blocked on the design export returning; functional scaffolds
+      keep the app demoable meanwhile.
 
 **Verify**: `mix check`. Manual: browse and play back real recorded events.
 

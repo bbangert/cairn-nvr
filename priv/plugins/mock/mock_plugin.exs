@@ -18,7 +18,8 @@
       udp_port: :integer,
       min_score_json: :string,
       timeline: :string,
-      loop: :boolean
+      loop: :boolean,
+      hold: :boolean
     ]
   )
 
@@ -42,8 +43,16 @@ emit = fn entries ->
   end
 end
 
-if opts[:loop] do
-  Stream.repeatedly(fn -> emit.(timeline) end) |> Stream.run()
-else
-  emit.(timeline)
+cond do
+  opts[:loop] ->
+    Stream.repeatedly(fn -> emit.(timeline) end) |> Stream.run()
+
+  opts[:hold] ->
+    # emit once, then stay alive quietly — lets post-window finalization
+    # happen without the Port respawning us into a fresh replay
+    emit.(timeline)
+    Process.sleep(:infinity)
+
+  true ->
+    emit.(timeline)
 end

@@ -44,3 +44,4 @@ npm-debug.log
 config.yml
 /data/
 /tmp/
+.env.local

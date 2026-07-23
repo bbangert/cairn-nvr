@@ -58,6 +58,14 @@ defmodule Cairn.FFmpegPortTest do
       refute "-rtsp_transport" in argv
     end
 
+    test "http live input gets reconnect flags, no looping" do
+      cam = %Camera{id: "c", rtsp_url: "http://cam/flv?stream=ch0"}
+      argv = FFmpegPort.build_argv(cam, {5001, 5002}, "-timeout")
+      assert "-reconnect" in argv
+      refute "-stream_loop" in argv
+      refute "-rtsp_transport" in argv
+    end
+
     test "extra_ffmpeg_args are spliced before -i" do
       cam = %Camera{camera("c") | extra_ffmpeg_args: ["-analyzeduration", "5M"]}
       argv = FFmpegPort.build_argv(cam, {5001, 5002}, "-timeout")

@@ -15,7 +15,8 @@ config :cairn, Cairn.Repo,
 config :cairn,
   db_in_data_dir: false,
   config_path: "test/support/fixtures/configs/valid.yml",
-  start_cameras: false
+  start_cameras: false,
+  skip_boot_migrations: true
 
 # We don't run a server during test. If one is required,
 # you can enable the server option below.

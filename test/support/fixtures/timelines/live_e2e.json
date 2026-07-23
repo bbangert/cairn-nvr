@@ -1,0 +1,5 @@
+[
+  { "at_ms": 10000, "pts": 900000, "dets": [{ "label": "person", "score": 0.91, "bbox": [0.1, 0.1, 0.2, 0.4] }] },
+  { "at_ms": 10500, "pts": 945000, "dets": [{ "label": "person", "score": 0.88, "bbox": [0.15, 0.1, 0.2, 0.4] }] },
+  { "at_ms": 11000, "pts": 990000, "dets": [{ "label": "person", "score": 0.93, "bbox": [0.2, 0.1, 0.2, 0.4] }] }
+]
