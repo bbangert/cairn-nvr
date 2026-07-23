@@ -1,6 +1,10 @@
 {
   "name": "cairn-nvr",
   "build": { "dockerfile": "Dockerfile" },
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {},
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1": {}
+  },
   "postCreateCommand": ".devcontainer/post-create.sh",
   "forwardPorts": [4000],
   "portsAttributes": {
@@ -10,9 +14,13 @@
   "remoteEnv": {
     "PATH": "/home/vscode/.local/share/mise/shims:/home/vscode/.local/bin:${containerEnv:PATH}"
   },
+  "mounts": [
+    "source=claude-code-config,target=/home/vscode/.claude,type=volume"
+  ],
   "customizations": {
     "vscode": {
       "extensions": [
+        "anthropic.claude-code",
         "elixir-lsp.elixir-ls",
         "phoenixframework.phoenix",
         "bradlc.vscode-tailwindcss"
