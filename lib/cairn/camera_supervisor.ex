@@ -25,6 +25,14 @@ defmodule Cairn.CameraSupervisor do
   @doc "Starts all cameras from `config` that are not already running."
   @spec sync(Config.t()) :: :ok
   def sync(%Config{} = config) do
+    if Application.get_env(:cairn, :start_cameras, true) do
+      do_sync(config)
+    else
+      :ok
+    end
+  end
+
+  defp do_sync(config) do
     running = MapSet.new(Cairn.Registry.ids_for_role(:camera))
     wanted = MapSet.new(config.cameras, & &1.id)
 

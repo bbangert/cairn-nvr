@@ -18,12 +18,20 @@ defmodule CairnWeb.Router do
     pipe_through :browser
 
     live "/", DashboardLive
+    live "/events", EventsLive
+    live "/events/:id", EventLive
+    live "/config", ConfigLive
   end
 
   scope "/hls", CairnWeb do
     get "/:camera/index.m3u8", HLSController, :playlist
     get "/:camera/init.mp4", HLSController, :init_segment
     get "/:camera/:segment", HLSController, :segment
+  end
+
+  scope "/media", CairnWeb do
+    get "/events/:id", MediaController, :event_clip
+    get "/snapshots/:id", MediaController, :snapshot
   end
 
   # Other scopes may use custom stacks.

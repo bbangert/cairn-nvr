@@ -228,7 +228,7 @@ start/update/end messages on `"events"`.
 
 ## Phase 5 — Event plane: extractor, index, retention, reconciliation
 
-- [ ] 5.1 [otp] `Cairn.EventExtractor` (`:temporary` under EventSupervisor):
+- [x] 5.1 [otp] `Cairn.EventExtractor` (`:temporary` under EventSupervisor):
       init → insert `active` index row, open
       `events/{camera}/{event_id}_{camera}_{ts}.mp4` (`[:write, :binary,
       :raw, :delayed_write]`), write init segment,
@@ -238,26 +238,26 @@ start/update/end messages on `"events"`.
       finalize → close, update row (`finalized`, ended_at, bytes, labels,
       max_score), trigger 5.3, exit `:normal`. Crash → row stays `active`,
       reconciliation marks `partial`.
-- [ ] 5.2 [ecto] `Cairn.Events` context: `create_active/1`, `finalize/2`,
+- [x] 5.2 [ecto] `Cairn.Events` context: `create_active/1`, `finalize/2`,
       `mark_partial/1`, `list/1` (filter camera/label/time, paginate),
       `oldest_for_cleanup/1`, prune queries. Aggregator/extractor go through
       this context only.
-- [ ] 5.3 [otp] Snapshot per event: async Task post-finalize — `ffmpeg -i
+- [x] 5.3 [otp] Snapshot per event: async Task post-finalize — `ffmpeg -i
       clip -frames:v 1 -q:v 4 snapshots/{event_id}.jpg` (first keyframe),
       update `snapshot_path`; failure is non-fatal (log only).
-- [ ] 5.4 [otp] Startup reconciliation task (before cameras start; **disk is
+- [x] 5.4 [otp] Startup reconciliation task (before cameras start; **disk is
       truth**): index rows without files → delete row; orphaned mp4s
       (parse filename schema) → adopt as `partial`; `active` rows with file
       → `partial`. Log summary counts.
-- [ ] 5.5 [otp] Retention pruner (hourly): per-camera retention days with
+- [x] 5.5 [otp] Retention pruner (hourly): per-camera retention days with
       per-label override → delete clip + snapshot + row. **Emergency disk
       cleanup** (every 60s): free space below threshold → delete oldest
       events regardless of retention, broadcast persistent UI alert
       (`"system:alerts"`).
-- [ ] 5.6 [otp] Extractor instrumentation (`:telemetry`): write duration,
+- [x] 5.6 [otp] Extractor instrumentation (`:telemetry`): write duration,
       fragment count, bytes, finalization timing, drain size; attach a
       logger handler summarizing per event.
-- [ ] 5.7 [test] Extractor test: fixture fragments through a real ring →
+- [x] 5.7 [test] Extractor test: fixture fragments through a real ring →
       output file box-parses as valid fmp4 (re-use Demuxer), pre-window
       content present, no gap/duplicate at drain boundary; crash-mid-event
       → `partial` after reconciliation; retention + emergency cleanup tests
@@ -268,19 +268,19 @@ plugin ⇒ clip on disk, playable, indexed, snapshot present.
 
 ## Phase 6 — Event browser + config UI
 
-- [ ] 6.1 [liveview] `/events`: LiveView with streams-based paginated list,
+- [x] 6.1 [liveview] `/events`: LiveView with streams-based paginated list,
       filters (camera, label, date range), snapshot thumbnails (static route
       serving `snapshots/` read-only).
-- [ ] 6.2 [liveview] `/events/:id`: clip playback via
+- [x] 6.2 [liveview] `/events/:id`: clip playback via
       `GET /media/events/:id` controller with **HTTP Range support**
       (send_file + Range header handling — needed for `<video>` seeking);
       labels timeline + metadata panel; `partial` badge.
-- [ ] 6.3 [liveview] Dashboard live-event indicators (subscribe `"events"`)
+- [x] 6.3 [liveview] Dashboard live-event indicators (subscribe `"events"`)
       + disk-alert banner (subscribe `"system:alerts"`).
-- [ ] 6.4 [liveview] `/config`: read-only config render, per-camera probe
+- [x] 6.4 [liveview] `/config`: read-only config render, per-camera probe
       results/warnings (populated fully in Phase 8), Reload button →
       `Config.Server.reload/0`, render returned diff/warnings/errors.
-- [ ] 6.5 [test] LiveView tests: event list filtering/pagination, Range
+- [x] 6.5 [test] LiveView tests: event list filtering/pagination, Range
       controller (206 responses), reload flow with invalid YAML (old config
       retained, errors shown).
 - [x] 6.6 [docs] `docs/design-handoff.md` for Claude Design: page map,

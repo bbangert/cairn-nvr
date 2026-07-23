@@ -17,14 +17,26 @@ defmodule CairnWeb.DashboardLive do
 
   @impl true
   def mount(_params, _session, socket) do
-    if connected?(socket), do: Cairn.CameraStatus.subscribe()
+    if connected?(socket) do
+      Cairn.CameraStatus.subscribe()
+      Cairn.Event.subscribe()
+      Cairn.Retention.subscribe()
+    end
 
     {:ok,
      assign(socket,
        page_title: "Dashboard",
        cameras: Cairn.Config.Server.get().cameras,
-       statuses: Cairn.CameraStatus.all()
+       statuses: Cairn.CameraStatus.all(),
+       live_events: %{},
+       disk_alert: disk_alert()
      )}
+  end
+
+  defp disk_alert do
+    Cairn.Retention.alert()
+  catch
+    :exit, _ -> %{active: false}
   end
 
   @impl true
@@ -32,10 +44,28 @@ defmodule CairnWeb.DashboardLive do
     {:noreply, update(socket, :statuses, &Map.put(&1, camera_id, info))}
   end
 
+  def handle_info({kind, %Cairn.Event{} = event}, socket)
+      when kind in [:event_started, :event_updated] do
+    {:noreply, update(socket, :live_events, &Map.put(&1, event.camera_id, true))}
+  end
+
+  def handle_info({:event_ended, %Cairn.Event{} = event}, socket) do
+    {:noreply, update(socket, :live_events, &Map.delete(&1, event.camera_id))}
+  end
+
+  def handle_info({:disk_alert, alert}, socket) do
+    {:noreply, assign(socket, disk_alert: alert)}
+  end
+
   @impl true
   def render(assigns) do
     ~H"""
     <Layouts.app flash={@flash}>
+      <aside :if={@disk_alert.active} id="disk-alert" role="alert">
+        Low disk space ({@disk_alert[:free_mb]} MB free, floor {@disk_alert[:threshold_mb]} MB) —
+        emergency cleanup is deleting oldest events.
+      </aside>
+
       <section id="camera-grid" class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
         <p :if={@cameras == []} id="empty-state">
           No cameras configured. Add cameras to <code>config.yml</code> and reload.
@@ -45,6 +75,13 @@ defmodule CairnWeb.DashboardLive do
             <h2>{cam.id}</h2>
             <span id={"camera-status-#{cam.id}"} data-status={status(@statuses, cam.id)}>
               {status(@statuses, cam.id)}
+            </span>
+            <span
+              :if={@live_events[cam.id]}
+              id={"camera-live-event-#{cam.id}"}
+              class="live-event-marker"
+            >
+              ● REC
             </span>
           </header>
           <video
