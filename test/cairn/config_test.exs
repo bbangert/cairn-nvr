@@ -45,6 +45,20 @@ defmodule Cairn.ConfigTest do
       assert length(config.cameras) == 2
     end
 
+    test "remux_clips defaults on and accepts an explicit opt-out" do
+      assert {:ok, config, []} = Config.from_map(base_map())
+      assert config.remux_clips == true
+
+      assert {:ok, off, []} = Config.from_map(Map.put(base_map(), "remux_clips", false))
+      assert off.remux_clips == false
+    end
+
+    test "non-boolean remux_clips is an error" do
+      map = Map.put(base_map(), "remux_clips", "yes")
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "remux_clips must be true or false"))
+    end
+
     test "missing udp section is an error" do
       map = Map.delete(base_map(), "udp")
       assert {:error, errors} = Config.from_map(map)

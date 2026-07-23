@@ -12,7 +12,7 @@ defmodule Cairn.Config do
 
   alias Cairn.Config.Camera
 
-  @known_keys ~w(data_dir stall_seconds free_space_min_mb udp events retention cameras)
+  @known_keys ~w(data_dir stall_seconds free_space_min_mb remux_clips udp events retention cameras)
   @known_udp_keys ~w(base_port range)
   @known_events_keys ~w(pre_window_seconds post_window_seconds max_event_seconds)
   @known_retention_keys ~w(days per_label)
@@ -20,6 +20,7 @@ defmodule Cairn.Config do
   defstruct data_dir: "data",
             stall_seconds: 15,
             free_space_min_mb: 1024,
+            remux_clips: true,
             udp_base_port: nil,
             udp_port_range: nil,
             pre_window_seconds: 5,
@@ -99,6 +100,7 @@ defmodule Cairn.Config do
       data_dir: System.get_env("CAIRN_DATA_DIR") || Map.get(map, "data_dir", "data"),
       stall_seconds: Map.get(map, "stall_seconds", 15),
       free_space_min_mb: Map.get(map, "free_space_min_mb", 1024),
+      remux_clips: Map.get(map, "remux_clips", true),
       udp_base_port: get_in(map, ["udp", "base_port"]),
       udp_port_range: get_in(map, ["udp", "range"]),
       pre_window_seconds: get_in(map, ["events", "pre_window_seconds"]) || 5,
@@ -162,7 +164,13 @@ defmodule Cairn.Config do
     |> validate_windows(config)
     |> validate_udp(config)
     |> validate_numbers(config)
+    |> validate_remux(config)
   end
+
+  defp validate_remux(acc, %{remux_clips: v}) when is_boolean(v), do: acc
+
+  defp validate_remux(acc, _config),
+    do: add_error(acc, "remux_clips must be true or false")
 
   defp validate_ids(acc, config) do
     ids = Enum.map(config.cameras, & &1.id)

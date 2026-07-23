@@ -14,8 +14,19 @@ stall_seconds: 15
 # oldest events are deleted regardless of retention.
 free_space_min_mb: 2048
 
+# Rewrite each finished clip into a plain mp4 (ffmpeg -c copy, no re-encode).
+# Recording writes concatenated fmp4 fragments that carry the camera's absolute
+# decode times and declare no duration, so without this a clip reports its
+# length as "time since ffmpeg started" — a 60s event two hours in probes as a
+# two-hour file — and seeking is meaningless. Costs one extra read+write of the
+# clip at finalize. Set false only if minimising disk writes matters more than
+# clips knowing how long they are.
+remux_clips: true
+
 # UDP ports handed to inference plugins / WebRTC RTP taps.
-# Each camera consumes 2 ports: base_port + 2*index, +1.
+# Each camera consumes 4 ports: plugin RTP at base_port + 4*index and WebRTC
+# RTP at +2, with each odd port left free for the matching RTCP socket that
+# standard RTP receivers bind.
 udp:
   base_port: 17000
   range: 100
