@@ -9,6 +9,11 @@
 import {Socket} from "phoenix"
 
 const BUFFER_KEEP_SECONDS = 30
+// Fragments arrive in ~2s chunks; playing closer to the edge than one
+// fragment guarantees stall-and-burst playback. Sit ~1.5 fragments back
+// and only jump when we've fallen genuinely behind.
+const TARGET_LATENCY_S = 3.0
+const MAX_DRIFT_S = 8.0
 const REJOIN_MIN_MS = 1000
 const REJOIN_MAX_MS = 10000
 
@@ -130,8 +135,9 @@ const MsePlayer = {
   appendNext() {
     if (!this.sourceBuffer || this.sourceBuffer.updating) return
     if (this.trimBuffer()) return
+    this.nudgeToLiveEdge()
     const chunk = this.queue.shift()
-    if (!chunk) { this.nudgeToLiveEdge(); return }
+    if (!chunk) return
     this.rejoinMs = REJOIN_MIN_MS
     try {
       this.sourceBuffer.appendBuffer(chunk)
@@ -157,7 +163,13 @@ const MsePlayer = {
     const buffered = this.sourceBuffer && this.sourceBuffer.buffered
     if (!buffered || buffered.length === 0) return
     const end = buffered.end(buffered.length - 1)
-    if (end - this.el.currentTime > 5) this.el.currentTime = end - 0.5
+    // seek into the buffered range on first append / after resets
+    if (this.el.currentTime < buffered.start(0)) {
+      this.el.currentTime = Math.max(buffered.start(0), end - TARGET_LATENCY_S)
+    } else if (end - this.el.currentTime > MAX_DRIFT_S) {
+      this.el.currentTime = end - TARGET_LATENCY_S
+    }
+    if (this.el.paused) this.el.play().catch(() => {})
   },
 }
 

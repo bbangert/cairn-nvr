@@ -171,3 +171,13 @@ State: COMPLETED (review cycle 1 done; external gates below still open)
 [19:40] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.claude/solutions/boot-writes-escape-ecto-sandbox.md
 [19:40] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.claude/solutions/port-process-management-patterns.md
 [19:40] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.claude/solutions/mse-fmp4-live-pipeline.md
+[19:47] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/live/dashboard_live.ex
+[19:48] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/components/layouts.ex
+[19:50] Modified: /var/home/ben/Programming/elixir/cairn-nvr/assets/js/hooks/mse_player.js
+[19:51] Modified: /var/home/ben/Programming/elixir/cairn-nvr/assets/js/hooks/mse_player.js
+[19:51] Modified: /var/home/ben/Programming/elixir/cairn-nvr/assets/js/hooks/mse_player.js
+[19:51] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/channels/stream_channel.ex
+[19:54] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ffmpeg_port.ex
+[19:56] Modified: /var/home/ben/.claude/projects/-var-home-ben-Programming-elixir-cairn-nvr/memory/never-pkill-by-pattern.md
+[20:04] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ffmpeg_port.ex
+[20:05] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/ffmpeg_port_test.exs

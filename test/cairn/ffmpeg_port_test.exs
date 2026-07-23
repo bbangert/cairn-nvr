@@ -43,6 +43,11 @@ defmodule Cairn.FFmpegPortTest do
       assert "rtp://127.0.0.1:5001" in argv
       assert "rtp://127.0.0.1:5002" in argv
       assert Enum.count(argv, &(&1 == "copy")) == 3
+      # in-band SPS/PPS for both RTP outputs, never for the mp4 output
+      assert Enum.count(argv, &(&1 == "h264_mp4toannexb")) == 2
+
+      assert Enum.find_index(argv, &(&1 == "h264_mp4toannexb")) >
+               Enum.find_index(argv, &(&1 == "pipe:1"))
     end
 
     test "stimeout fallback flag is used verbatim" do
