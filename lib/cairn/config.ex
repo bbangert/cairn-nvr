@@ -205,7 +205,7 @@ defmodule Cairn.Config do
   end
 
   defp validate_udp(acc, %{udp_base_port: base, udp_port_range: range} = config) do
-    needed = 2 * length(config.cameras)
+    needed = Cairn.UDPPorts.ports_per_camera() * length(config.cameras)
 
     cond do
       is_nil(base) or is_nil(range) ->

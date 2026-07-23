@@ -31,6 +31,10 @@ device selection, `--timeline`, …) is passed through untouched.
 ### Video input
 
 - H.264 RTP/UDP on `127.0.0.1:{udp-port}`, payload type 96, 90 kHz clock.
+- `{udp-port} + 1` is reserved for you. Cairn sends no RTCP, but most RTP
+  receivers bind it anyway (ffmpeg's SDP demuxer refuses to open the stream
+  if it cannot, and ignores an `a=rtcp:` override) — so nothing else will be
+  placed there. Ports are allocated four per camera for this reason.
 - Sent by ffmpeg's `-f rtp` output (codec copy of the camera stream, or
   the transcoded stream when the camera opts into transcode).
 - No RTCP, no handshake: packets flow whether or not you listen.
