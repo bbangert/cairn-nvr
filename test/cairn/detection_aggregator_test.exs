@@ -77,6 +77,10 @@ defmodule Cairn.DetectionAggregatorTest do
     # a weaker one does not
     detect(agg, camera, 0.7)
     assert_receive {:event_updated, %Event{trigger: %{score: 0.92}}}
+
+    # a tie keeps the incumbent (earliest max wins) — the bbox does not change
+    detect(agg, camera, 0.92, [0.9, 0.9, 0.05, 0.05])
+    assert_receive {:event_updated, %Event{trigger: %{score: 0.92, bbox: [0.3, 0.2, 0.25, 0.5]}}}
   end
 
   test "below min_score never starts an event", %{agg: agg, camera: camera, camera_id: id} do

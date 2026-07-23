@@ -70,6 +70,17 @@ defmodule CairnWeb.EventsLiveTest do
     assert count == 1
   end
 
+  test "live inserts are capped to the page size", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/events")
+    # one more than a page (25); the oldest live row must fall out of the stream
+    evs = for _ <- 1..26, do: insert_active("cam_a", ["person"])
+    for ev <- evs, do: Cairn.Event.broadcast(:event_started, ev)
+
+    html = render(view)
+    refute html =~ "events-#{List.first(evs).id}"
+    assert html =~ "events-#{List.last(evs).id}"
+  end
+
   test "lists events and filters by camera", %{conn: conn} do
     a = seed("cam_a", 10, ["person"])
     b = seed("cam_b", 5, ["car"])

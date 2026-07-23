@@ -22,7 +22,7 @@ defmodule Cairn.Snapshot do
   @box_color "lime"
   @thickness 6
   @fontsize 40
-  @font "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+  @default_font "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
   @spec take_async(Events.Event.t(), Config.t()) :: {:ok, pid()}
   def take_async(row, config) do
@@ -134,13 +134,15 @@ defmodule Cairn.Snapshot do
   end
 
   defp label(trig, x, y) do
-    if File.exists?(@font) do
+    font = Application.get_env(:cairn, :snapshot_font, @default_font)
+
+    if File.exists?(font) do
       text = "#{sanitize(trig["label"])} #{fmt(round2(trig["score"]))}"
 
       # text= MUST precede fontfile= — `fontfile=<path>:text=` makes ffmpeg's
       # parser swallow the separator. drawtext frame dims are W/H (iw/ih are
       # drawbox-only); the escaped `\,` keeps the comma inside max().
-      "drawtext=text='#{text}':fontfile=#{@font}" <>
+      "drawtext=text='#{text}':fontfile=#{font}" <>
         ":x=W*#{fmt(x)}:y=max(H*#{fmt(y)}-th-#{@thickness}\\,0)" <>
         ":fontsize=#{@fontsize}:fontcolor=black:box=1:boxcolor=#{@box_color}:boxborderw=6"
     end

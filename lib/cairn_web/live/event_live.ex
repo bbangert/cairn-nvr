@@ -32,16 +32,30 @@ defmodule CairnWeb.EventLive do
   def handle_info({kind, %Cairn.Event{id: id}}, socket)
       when kind in [:event_updated, :event_ended] do
     if id == socket.assigns.event.id do
-      case Events.get(id) do
-        nil -> {:noreply, socket}
-        event -> {:noreply, assign(socket, event: event)}
-      end
+      # :event_ended is broadcast before the extractor's async finalize +
+      # snapshot land, so the immediate re-fetch can miss the finalized status
+      # and the snapshot. Schedule a follow-up so the badge and poster settle.
+      if kind == :event_ended, do: Process.send_after(self(), {:refresh_event, id}, 1_500)
+      {:noreply, refetch(socket, id)}
     else
       {:noreply, socket}
     end
   end
 
+  def handle_info({:refresh_event, id}, socket) do
+    if id == socket.assigns.event.id,
+      do: {:noreply, refetch(socket, id)},
+      else: {:noreply, socket}
+  end
+
   def handle_info(_msg, socket), do: {:noreply, socket}
+
+  defp refetch(socket, id) do
+    case Events.get(id) do
+      nil -> socket
+      event -> assign(socket, event: event)
+    end
+  end
 
   @impl true
   def handle_event("delete", _params, socket) do

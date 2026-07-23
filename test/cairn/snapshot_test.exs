@@ -86,4 +86,20 @@ defmodule Cairn.SnapshotTest do
     assert vf =~ "w=iw*0.1000"
     assert vf =~ "h=ih*0.1000"
   end
+
+  test "draws the box but no label when no font is available", %{config: config} do
+    Application.put_env(:cairn, :snapshot_font, "/no/such/font.ttf")
+    on_exit(fn -> Application.delete_env(:cairn, :snapshot_font) end)
+
+    row = insert(%{t: 0.0, label: "person", score: 0.9, bbox: [0.2, 0.2, 0.3, 0.4]}, @fixture)
+    out = Path.join(Cairn.DataDir.snapshots_dir(config.data_dir), "#{row.id}.jpg")
+
+    vf = Snapshot.args(row, out, 0.0) |> Enum.at(-2)
+    assert vf =~ "drawbox="
+    refute vf =~ "drawtext="
+
+    # still produces a valid image, just without the label
+    assert :ok = Snapshot.take(row, config)
+    assert File.stat!(out).size > 0
+  end
 end

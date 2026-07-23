@@ -56,7 +56,7 @@ defmodule CairnWeb.EventsLive do
        has_next: result.page * @page_size < result.total,
        visible: MapSet.new(result.events, & &1.id)
      )
-     |> stream(:events, result.events, reset: true)}
+     |> stream(:events, result.events, reset: true, limit: @page_size)}
   end
 
   @impl true
@@ -111,11 +111,13 @@ defmodule CairnWeb.EventsLive do
           socket
 
         row ->
+          # cap the stream so a busy camera can't grow the DOM without bound;
+          # at: 0 with a positive limit keeps the newest @page_size rows
           socket
-          |> stream_insert(:events, row, at: 0)
+          |> stream_insert(:events, row, at: 0, limit: @page_size)
           |> update(:visible, &MapSet.put(&1, ev.id))
           |> update(:total, &(&1 + 1))
-          |> update(:showing_to, &(&1 + 1))
+          |> update(:showing_to, &min(&1 + 1, @page_size))
       end
     else
       socket
