@@ -12,6 +12,9 @@ defmodule CairnWeb.MediaController do
 
   alias Cairn.Events
 
+  # paths come from index rows written by the extractor, never from the
+  # request (the id is only a primary-key lookup)
+  # sobelow_skip ["Traversal.SendFile"]
   def event_clip(conn, %{"id" => id}) do
     with %{path: path} when is_binary(path) <- Events.get(id) || :not_found,
          {:ok, %File.Stat{size: size}} <- File.stat(path) do
@@ -29,6 +32,7 @@ defmodule CairnWeb.MediaController do
     end
   end
 
+  # sobelow_skip ["Traversal.SendFile"]
   def snapshot(conn, %{"id" => id}) do
     with %{snapshot_path: path} when is_binary(path) <- Events.get(id) || :not_found,
          {:ok, _stat} <- File.stat(path) do
@@ -41,6 +45,7 @@ defmodule CairnWeb.MediaController do
     end
   end
 
+  # sobelow_skip ["Traversal.SendFile"]
   defp send_range(conn, path, size, range) do
     case parse_range(range, size) do
       {from, to} ->

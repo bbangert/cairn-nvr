@@ -12,6 +12,11 @@ defmodule Cairn.MixProject do
       deps: deps(),
       compilers: [:phoenix_live_view] ++ Mix.compilers(),
       listeners: [Phoenix.CodeReloader],
+      dialyzer: [
+        plt_add_apps: [:mix, :ex_unit],
+        plt_core_path: "priv/plts",
+        plt_local_path: "priv/plts"
+      ],
       releases: [
         cairn: [
           include_executables_for: [:unix],
@@ -78,7 +83,9 @@ defmodule Cairn.MixProject do
       {:bandit, "~> 1.5"},
       {:yaml_elixir, "~> 2.11"},
       {:ex_webrtc, "~> 0.17.0"},
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:sobelow, "~> 0.14", only: [:dev, :test], runtime: false}
     ]
   end
 

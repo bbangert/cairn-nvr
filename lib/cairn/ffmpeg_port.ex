@@ -310,15 +310,13 @@ defmodule Cairn.FFmpegPort do
     end
   end
 
-  defp enter_backoff(%{port: nil} = state) do
-    state = set_status(state, :backoff)
+  defp enter_backoff(state) do
+    state = state |> kill_port() |> set_status(:backoff)
     jitter = :rand.uniform()
     delay = trunc(state.backoff_ms * (0.5 + jitter))
     Process.send_after(self(), :spawn, delay)
     %{state | backoff_ms: min(state.backoff_ms * 2, backoff_max(state))}
   end
-
-  defp enter_backoff(state), do: enter_backoff(kill_port(state))
 
   defp kill_port(%{port: nil} = state), do: state
 

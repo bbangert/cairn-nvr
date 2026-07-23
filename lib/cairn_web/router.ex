@@ -1,13 +1,22 @@
 defmodule CairnWeb.Router do
   use CairnWeb, :router
 
+  # inline styles are part of the design-system port; fonts/icons come from
+  # the CDNs pinned in root.html.heex; media plays from blobs (MSE) and self
+  @csp "default-src 'self'; " <>
+         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://rsms.me; " <>
+         "font-src 'self' https://fonts.gstatic.com https://rsms.me; " <>
+         "img-src 'self' data:; media-src 'self' blob:; " <>
+         "connect-src 'self' ws: wss:; script-src 'self'; " <>
+         "object-src 'none'; frame-ancestors 'self'"
+
   pipeline :browser do
     plug :accepts, ["html"]
     plug :fetch_session
     plug :fetch_live_flash
     plug :put_root_layout, html: {CairnWeb.Layouts, :root}
     plug :protect_from_forgery
-    plug :put_secure_browser_headers
+    plug :put_secure_browser_headers, %{"content-security-policy" => @csp}
   end
 
   pipeline :api do

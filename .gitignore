@@ -45,3 +45,6 @@ config.yml
 /data/
 /tmp/
 .env.local
+
+# Dialyzer PLTs
+/priv/plts/

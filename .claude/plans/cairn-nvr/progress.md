@@ -199,3 +199,13 @@ State: COMPLETED (review cycle 1 done; external gates below still open)
 [21:10] Modified: /var/home/ben/Programming/elixir/cairn-nvr/assets/js/app.js
 [21:10] Modified: /var/home/ben/Programming/elixir/cairn-nvr/assets/js/app.js
 [21:11] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/live/config_live.ex
+[21:47] Modified: /var/home/ben/Programming/elixir/cairn-nvr/mix.exs
+[21:48] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/router.ex
+[21:48] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/controllers/media_controller.ex
+[21:48] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/controllers/media_controller.ex
+[21:48] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/controllers/media_controller.ex
+[21:48] Modified: /var/home/ben/Programming/elixir/cairn-nvr/mix.exs
+[21:49] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.github/workflows/ci.yml
+[21:50] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/registry.ex
+[21:51] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ffmpeg_port.ex
+[21:51] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/ring_buffer.ex
