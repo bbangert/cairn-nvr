@@ -73,3 +73,14 @@ Append during /phx:work — do not rewrite history.
 tmpfs ring, slice_ring_buffer/Rust sidecar, Live555, GStreamer-as-ingest,
 webrtcbin-in-plugin, membrane_http_adaptive_stream, raw exqlite, raw
 WebSock for MSE, dynamic UDP port handshake, libx264 fallback.
+
+## Review cycle results (2026-07-22, /phx:full REVIEWING)
+
+3 agents (elixir-reviewer, security-analyzer, testing-reviewer). Full
+elixir findings: .claude/reviews/elixir.md. All confirmed findings fixed
+in commit "Review fixes:...". Accepted-as-is (documented, not fixed):
+known_labels/0 full-table scan (thousands of rows by design),
+label_entries O(n) append (capped at 5000), System.cmd("kill") briefly
+blocking terminate, creds visible in local `ps` (LAN/dev tradeoff).
+Clean surfaces per security agent: shell escaping, SQL injection, path
+traversal, atom exhaustion, XSS.

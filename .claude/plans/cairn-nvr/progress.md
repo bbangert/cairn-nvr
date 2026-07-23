@@ -1,6 +1,6 @@
 # Progress: cairn-nvr
 
-State: WORKING (Phase 5 in progress)
+State: COMPLETED (review cycle 1 done; external gates below still open)
 
 ## Phase gates
 
@@ -167,3 +167,7 @@ State: WORKING (Phase 5 in progress)
 [19:38] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn/rtp_hub.ex
 [19:38] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/live/config_live.ex
 [19:38] Modified: /var/home/ben/Programming/elixir/cairn-nvr/test/cairn/transcode_test.exs
+[19:40] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.claude/solutions/genserver-timer-cancel-race.md
+[19:40] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.claude/solutions/boot-writes-escape-ecto-sandbox.md
+[19:40] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.claude/solutions/port-process-management-patterns.md
+[19:40] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.claude/solutions/mse-fmp4-live-pipeline.md
