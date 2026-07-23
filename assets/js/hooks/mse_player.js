@@ -80,7 +80,10 @@ const MsePlayer = {
   },
 
   scheduleRejoin() {
-    if (this.stopped) return
+    // Re-entrant: onClose (incl. onError -> leave) and a join error reply can
+    // both fire for one disconnect. Bail if a rejoin is already pending so we
+    // never leak a timer and race two join()s (the churn this hook fixes).
+    if (this.stopped || this.rejoinTimer) return
     this.teardownMediaSource()
     const delay = this.rejoinMs
     this.rejoinMs = Math.min(this.rejoinMs * 2, REJOIN_MAX_MS)
