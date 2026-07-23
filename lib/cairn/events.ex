@@ -148,6 +148,14 @@ defmodule Cairn.Events do
   @spec delete_row(Event.t()) :: {:ok, Event.t()} | {:error, term()}
   def delete_row(%Event{} = event), do: Repo.delete(event)
 
+  @doc "Deletes an event whole: its clip file, snapshot, and index row."
+  @spec delete(Event.t()) :: {:ok, Event.t()} | {:error, term()}
+  def delete(%Event{} = event) do
+    if event.path, do: File.rm(event.path)
+    if event.snapshot_path, do: File.rm(event.snapshot_path)
+    delete_row(event)
+  end
+
   # -- filters ----------------------------------------------------------------
 
   defp filter_camera(query, nil), do: query
@@ -178,5 +186,9 @@ defmodule Cairn.Events do
 
   defp labels_map(%Cairn.Event{} = event) do
     %{"entries" => event.labels, "max_scores" => event.max_scores}
+    |> maybe_put("trigger", event.trigger)
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end

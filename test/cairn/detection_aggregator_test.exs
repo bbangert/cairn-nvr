@@ -61,6 +61,28 @@ defmodule Cairn.DetectionAggregatorTest do
              Enum.filter(EventCheckpoint.all(), fn {cid, _} -> cid == id end)
   end
 
+  test "captures the highest-scoring detection as the snapshot trigger", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    detect(agg, camera, 0.6, [0.1, 0.1, 0.2, 0.4])
+    assert_receive {:event_started, %Event{camera_id: ^id, trigger: t0}}
+    assert %{label: "person", score: 0.6, bbox: [0.1, 0.1, 0.2, 0.4], t: +0.0} = t0
+
+    # a stronger detection replaces the trigger, its bbox included
+    detect(agg, camera, 0.92, [0.3, 0.2, 0.25, 0.5])
+    assert_receive {:event_updated, %Event{trigger: %{score: 0.92, bbox: [0.3, 0.2, 0.25, 0.5]}}}
+
+    # a weaker one does not
+    detect(agg, camera, 0.7)
+    assert_receive {:event_updated, %Event{trigger: %{score: 0.92}}}
+
+    # a tie keeps the incumbent (earliest max wins) — the bbox does not change
+    detect(agg, camera, 0.92, [0.9, 0.9, 0.05, 0.05])
+    assert_receive {:event_updated, %Event{trigger: %{score: 0.92, bbox: [0.3, 0.2, 0.25, 0.5]}}}
+  end
+
   test "below min_score never starts an event", %{agg: agg, camera: camera, camera_id: id} do
     detect(agg, camera, 0.3)
     refute_receive {:event_started, %Event{camera_id: ^id}}, 200
