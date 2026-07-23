@@ -115,7 +115,8 @@ defmodule Cairn.DetectionAggregator do
       started_at: now(),
       status: :active,
       labels: label_entries([], dets, now()),
-      max_scores: max_scores(%{}, dets)
+      max_scores: max_scores(%{}, dets),
+      trigger: best_trigger(nil, dets, 0.0)
     }
 
     event = %{event | max_score: event.max_scores |> Map.values() |> Enum.max(fn -> nil end)}
@@ -152,7 +153,13 @@ defmodule Cairn.DetectionAggregator do
       event
       | labels: label_entries(event.labels, dets, event.started_at),
         max_scores: max_scores,
-        max_score: max_scores |> Map.values() |> Enum.max(fn -> nil end)
+        max_score: max_scores |> Map.values() |> Enum.max(fn -> nil end),
+        trigger:
+          best_trigger(
+            event.trigger,
+            dets,
+            DateTime.diff(now(), event.started_at, :millisecond) / 1000
+          )
     }
 
     if cam.post_ref, do: Process.cancel_timer(cam.post_ref)
@@ -245,6 +252,19 @@ defmodule Cairn.DetectionAggregator do
   defp max_scores(acc, dets) do
     Enum.reduce(dets, acc, fn det, acc ->
       Map.update(acc, det.label, det.score, &max(&1, det.score))
+    end)
+  end
+
+  # The event's single highest-scoring detection, kept with its bbox and time
+  # offset — the frame the snapshot is cut from (see Cairn.Snapshot). Keeps the
+  # incumbent on ties so the earliest such detection wins.
+  defp best_trigger(current, dets, t) do
+    Enum.reduce(dets, current, fn det, best ->
+      if is_nil(best) or det.score > best.score do
+        %{t: Float.round(max(t, 0.0), 2), label: det.label, score: det.score, bbox: det.bbox}
+      else
+        best
+      end
     end)
   end
 

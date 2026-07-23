@@ -23,6 +23,64 @@ defmodule CairnWeb.EventsLiveTest do
     row
   end
 
+  defp insert_active(camera_id, labels) do
+    id = Ecto.UUID.generate()
+
+    ev = %Cairn.Event{
+      id: id,
+      camera_id: camera_id,
+      started_at: DateTime.utc_now(),
+      status: :active,
+      labels: [],
+      max_scores: Map.new(labels, &{&1, 0.8})
+    }
+
+    {:ok, _} = Events.create_active(ev, "/tmp/#{id}.mp4")
+    ev
+  end
+
+  test "a new event appears live on the latest view", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/events")
+    ev = insert_active("cam_a", ["person"])
+
+    Cairn.Event.broadcast(:event_started, ev)
+
+    assert render(view) =~ ev.id
+  end
+
+  test "a live event that fails the active filter is not inserted", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/events?camera=cam_a")
+    ev = insert_active("cam_b", ["car"])
+
+    Cairn.Event.broadcast(:event_started, ev)
+
+    refute render(view) =~ ev.id
+  end
+
+  test "a repeated broadcast does not duplicate the row", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/events")
+    ev = insert_active("cam_a", ["person"])
+
+    Cairn.Event.broadcast(:event_started, ev)
+    Cairn.Event.broadcast(:event_started, ev)
+
+    # the stream row's dom id must appear exactly once
+    dom_id = "events-#{ev.id}"
+    count = render(view) |> String.split(dom_id) |> length() |> Kernel.-(1)
+    assert count == 1
+  end
+
+  test "live inserts are capped to the page size", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/events")
+    # one more than a page (25); the oldest live row must fall out of the stream
+    evs = for _ <- 1..26, do: insert_active("cam_a", ["person"])
+    for ev <- evs, do: Cairn.Event.broadcast(:event_started, ev)
+
+    html = render(view)
+    refute html =~ "events-#{List.first(evs).id}"
+    assert html =~ "events-#{List.last(evs).id}"
+  end
+
   test "lists events and filters by camera", %{conn: conn} do
     a = seed("cam_a", 10, ["person"])
     b = seed("cam_b", 5, ["car"])

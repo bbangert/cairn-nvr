@@ -8,12 +8,14 @@ defmodule CairnWeb.EventsLive do
 
   use CairnWeb, :live_view
 
-  alias Cairn.Events
+  alias Cairn.{Event, Events}
 
   @page_size 25
 
   @impl true
   def mount(_params, _session, socket) do
+    if connected?(socket), do: Event.subscribe()
+
     {:ok,
      assign(socket, page_title: "Events", cameras: camera_ids(), labels: Events.known_labels())}
   end
@@ -51,9 +53,13 @@ defmodule CairnWeb.EventsLive do
        total: result.total,
        showing_from: (result.page - 1) * @page_size + 1,
        showing_to: (result.page - 1) * @page_size + length(result.events),
-       has_next: result.page * @page_size < result.total
+       has_next: result.page * @page_size < result.total,
+       # ids currently in the stream, capped like it (@page_size) and ordered
+       # newest-first — mirrors what's actually in the DOM so live updates never
+       # act on a row the :limit already evicted
+       visible: Enum.map(result.events, & &1.id)
      )
-     |> stream(:events, result.events, reset: true)}
+     |> stream(:events, result.events, reset: true, limit: @page_size)}
   end
 
   @impl true
@@ -68,6 +74,87 @@ defmodule CairnWeb.EventsLive do
   def handle_event("clear-filters", _params, socket) do
     {:noreply, push_patch(socket, to: ~p"/events")}
   end
+
+  # Live updates off the "events" topic. Rows are re-fetched from the DB so the
+  # stream always holds the same shape handle_params produces (the broadcast
+  # struct's labels is a list, not the "max_scores" map the row renders).
+  @impl true
+  def handle_info({:event_started, %Event{} = ev}, socket) do
+    {:noreply, live_insert(socket, ev)}
+  end
+
+  def handle_info({:event_updated, %Event{} = ev}, socket) do
+    {:noreply, live_update(socket, ev)}
+  end
+
+  def handle_info({:event_ended, %Event{} = ev}, socket) do
+    socket = live_update(socket, ev)
+    # the snapshot is written async just after finalize with no broadcast of
+    # its own; pull the row once more shortly so the thumbnail fills in
+    if ev.id in socket.assigns.visible do
+      Process.send_after(self(), {:refresh_row, ev.id}, 1_500)
+    end
+
+    {:noreply, socket}
+  end
+
+  def handle_info({:refresh_row, id}, socket) do
+    {:noreply, live_update(socket, %Event{id: id, camera_id: "", started_at: DateTime.utc_now()})}
+  end
+
+  def handle_info(_msg, socket), do: {:noreply, socket}
+
+  # New event: prepend only on the latest view (page 1, no conflicting filter),
+  # so browsing an older page or a filtered slice stays put.
+  defp live_insert(socket, ev) do
+    if socket.assigns.page == 1 and ev.id not in socket.assigns.visible and
+         matches?(socket.assigns.filters, ev) do
+      case Events.get(ev.id) do
+        nil ->
+          socket
+
+        row ->
+          # cap the stream so a busy camera can't grow the DOM without bound;
+          # at: 0 with a positive limit keeps the newest @page_size rows, and
+          # `visible` is pruned the same way so it never goes stale
+          socket
+          |> stream_insert(:events, row, at: 0, limit: @page_size)
+          |> update(:visible, &Enum.take([ev.id | &1], @page_size))
+          |> update(:total, &(&1 + 1))
+          |> update(:showing_to, &min(&1 + 1, @page_size))
+      end
+    else
+      socket
+    end
+  end
+
+  # Status/snapshot change on an already-visible row: update in place by dom id.
+  defp live_update(socket, ev) do
+    if ev.id in socket.assigns.visible do
+      case Events.get(ev.id) do
+        nil -> socket
+        row -> stream_insert(socket, :events, row)
+      end
+    else
+      socket
+    end
+  end
+
+  defp matches?(filters, ev) do
+    camera_ok = blank?(filters.camera) or ev.camera_id == filters.camera
+    label_ok = blank?(filters.label) or Map.has_key?(ev.max_scores || %{}, filters.label)
+    camera_ok and label_ok and within_dates?(filters, ev.started_at)
+  end
+
+  defp within_dates?(filters, %DateTime{} = at) do
+    after_from = parse_date(filters.from, ~T[00:00:00])
+    before_to = parse_date(filters.to, ~T[23:59:59])
+
+    (is_nil(after_from) or DateTime.compare(at, after_from) != :lt) and
+      (is_nil(before_to) or DateTime.compare(at, before_to) != :gt)
+  end
+
+  defp blank?(v), do: v in ["", nil]
 
   defp filter_query(params, page) do
     %{

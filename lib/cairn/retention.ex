@@ -200,11 +200,7 @@ defmodule Cairn.Retention do
 
   # -- shared -----------------------------------------------------------------
 
-  defp delete_event(row) do
-    if row.path, do: File.rm(row.path)
-    if row.snapshot_path, do: File.rm(row.snapshot_path)
-    Events.delete_row(row)
-  end
+  defp delete_event(row), do: Events.delete(row)
 
   defp free_space_bytes(data_dir) do
     case System.cmd("df", ["-Pk", data_dir], stderr_to_stdout: true) do

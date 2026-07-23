@@ -2,13 +2,14 @@ FROM mcr.microsoft.com/devcontainers/base:bookworm
 
 # - build-essential/autoconf/m4/libssl/ncurses: kerl builds Erlang from source
 # - ffmpeg: ingest/probe/snapshots (the test suite drives the real binaries)
+# - fonts-dejavu-core: drawtext label on the Frigate-style event snapshot
 # - inotify-tools: Phoenix live reload
 # - sqlite3: poke the event index by hand
 # - python3 + venv: the CPU reference plugin
 RUN apt-get update -qq && export DEBIAN_FRONTEND=noninteractive \
   && apt-get install -y -qq --no-install-recommends \
     build-essential autoconf m4 libssl-dev libncurses-dev \
-    ffmpeg inotify-tools sqlite3 \
+    ffmpeg fonts-dejavu-core inotify-tools sqlite3 \
     python3 python3-venv python3-pip \
     curl git unzip ca-certificates \
   && rm -rf /var/lib/apt/lists/*
