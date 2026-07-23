@@ -27,12 +27,13 @@ import topbar from "../vendor/topbar"
 import MsePlayer from "./hooks/mse_player"
 import TimelineSeek from "./hooks/timeline_seek"
 import WebrtcPlayer from "./hooks/webrtc_player"
+import CopyText from "./hooks/copy_text"
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: {_csrf_token: csrfToken},
-  hooks: {...colocatedHooks, MsePlayer, TimelineSeek, WebrtcPlayer},
+  hooks: {...colocatedHooks, MsePlayer, TimelineSeek, WebrtcPlayer, CopyText},
 })
 
 // Show progress bar on live navigation and form submits

@@ -15,7 +15,7 @@ defmodule CairnWeb.ConfigLiveTest do
 
   test "mask_url hides rtsp credentials" do
     assert CairnWeb.ConfigLive.mask_url("rtsp://admin:s3cret@10.0.0.5:554/s1") ==
-             "rtsp://admin:*****@10.0.0.5:554/s1"
+             "rtsp://admin:•••••@10.0.0.5:554/s1"
 
     assert CairnWeb.ConfigLive.mask_url("rtsp://10.0.0.5:554/s1") == "rtsp://10.0.0.5:554/s1"
   end
@@ -23,17 +23,17 @@ defmodule CairnWeb.ConfigLiveTest do
   test "mask_url hides credential query params (http-flv style)" do
     assert CairnWeb.ConfigLive.mask_url(
              "http://10.0.0.5/flv?port=1935&stream=ch0&user=admin&password=hunter2"
-           ) == "http://10.0.0.5/flv?port=1935&stream=ch0&user=*****&password=*****"
+           ) == "http://10.0.0.5/flv?port=1935&stream=ch0&user=•••••&password=•••••"
 
     assert CairnWeb.ConfigLive.mask_url("http://10.0.0.5/flv?Token=abc&x=1") ==
-             "http://10.0.0.5/flv?Token=*****&x=1"
+             "http://10.0.0.5/flv?Token=•••••&x=1"
   end
 
   test "reload with valid config shows result", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/config")
 
     html = render_click(view, "reload", %{})
-    assert html =~ "Reloaded."
+    assert html =~ "Config reloaded — changes are live"
   end
 
   test "reload with invalid YAML keeps old config and shows errors", %{conn: conn} do
@@ -45,7 +45,7 @@ defmodule CairnWeb.ConfigLiveTest do
     File.write!(@fixture, "cameras: [{id: broken}]\n")
     html = render_click(view, "reload", %{})
 
-    assert html =~ "previous config still active"
+    assert html =~ "previous config is still active"
     assert html =~ "rtsp_url is required"
     # old config still rendered
     assert html =~ "config-camera-cam_a"

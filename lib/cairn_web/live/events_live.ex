@@ -1,11 +1,9 @@
 defmodule CairnWeb.EventsLive do
   @moduledoc """
-  Event browser (functional scaffold — visual design from the Claude
-  Design handoff).
-
-  Data contract: filters form (`phx-change="filter"`, fields
-  camera/label/from/to), streams-based list (`#events-list`,
-  `phx-update="stream"`), pagination (`phx-click="page"`).
+  Event browser, styled per the Claude Design handoff. Functional
+  contracts preserved: `phx-change="filter"` form (camera/label/from/to),
+  streams container `#events-list` with `phx-update="stream"`,
+  `phx-click="page"` pagination.
   """
 
   use CairnWeb, :live_view
@@ -51,6 +49,8 @@ defmodule CairnWeb.EventsLive do
        filters: filters,
        page: result.page,
        total: result.total,
+       showing_from: (result.page - 1) * @page_size + 1,
+       showing_to: (result.page - 1) * @page_size + length(result.events),
        has_next: result.page * @page_size < result.total
      )
      |> stream(:events, result.events, reset: true)}
@@ -63,6 +63,10 @@ defmodule CairnWeb.EventsLive do
 
   def handle_event("page", %{"page" => page}, socket) do
     {:noreply, push_patch(socket, to: ~p"/events?#{filter_query(socket.assigns.filters, page)}")}
+  end
+
+  def handle_event("clear-filters", _params, socket) do
+    {:noreply, push_patch(socket, to: ~p"/events")}
   end
 
   defp filter_query(params, page) do
@@ -90,63 +94,239 @@ defmodule CairnWeb.EventsLive do
 
   defp camera_ids, do: Enum.map(Cairn.Config.Server.get().cameras, & &1.id)
 
-  defp duration(%{started_at: s, ended_at: %DateTime{} = e}), do: "#{DateTime.diff(e, s)}s"
-  defp duration(_), do: "—"
+  defp filters_active?(filters) do
+    Enum.any?([filters.camera, filters.label, filters.from, filters.to], &(&1 != ""))
+  end
+
+  # -- shared design helpers (also used by EventLive) -------------------------
+
+  @doc false
+  def label_chip_style(label) do
+    {bg, color} =
+      case label do
+        "person" -> {"var(--hs-accent-soft)", "var(--hs-blue-300)"}
+        "car" -> {"var(--hs-success-soft)", "var(--hs-success)"}
+        "cat" -> {"rgba(139,92,246,0.14)", "var(--hs-purple-500)"}
+        "dog" -> {"rgba(236,72,153,0.14)", "var(--hs-pink-500)"}
+        "package" -> {"var(--hs-warning-soft)", "var(--hs-warning)"}
+        _ -> {"var(--hs-accent-soft)", "var(--hs-blue-300)"}
+      end
+
+    "display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; " <>
+      "border-radius: 6px; font-size: 12px; font-weight: 500; " <>
+      "font-variant-numeric: tabular-nums; background: #{bg}; color: #{color};"
+  end
+
+  @doc false
+  def label_color(label) do
+    case label do
+      "person" -> "var(--hs-blue-300)"
+      "car" -> "var(--hs-success)"
+      "cat" -> "var(--hs-purple-500)"
+      "dog" -> "var(--hs-pink-500)"
+      "package" -> "var(--hs-warning)"
+      _ -> "var(--hs-blue-300)"
+    end
+  end
+
+  @doc false
+  def fmt_time(%DateTime{} = dt), do: Calendar.strftime(dt, "%b %-d, %H:%M:%S")
+
+  @doc false
+  def fmt_duration(%{started_at: s, ended_at: %DateTime{} = e}) do
+    total = max(DateTime.diff(e, s), 0)
+
+    if total >= 60 do
+      "#{div(total, 60)}m #{rem(total, 60)}s"
+    else
+      "#{total}s"
+    end
+  end
+
+  def fmt_duration(_), do: "—"
+
+  defp fmt_score(score), do: :erlang.float_to_binary(score / 1, decimals: 2)
 
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.app flash={@flash}>
-      <h1>Events</h1>
+    <Layouts.app flash={@flash} page={:events}>
+      <main style="flex: 1; padding: 20px; max-width: 1080px; width: 100%; margin: 0 auto; box-sizing: border-box;">
+        <div style="display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px;">
+          <h1 style="margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.01em; color: var(--hs-fg-1);">
+            Events
+          </h1>
+          <span class="tnum" style="font-size: 13px; color: var(--hs-fg-3);">
+            {@total} {if @total == 1, do: "event", else: "events"}{if filters_active?(@filters),
+              do: " match",
+              else: ""}
+          </span>
+        </div>
 
-      <form id="event-filters" phx-change="filter">
-        <select name="camera">
-          <option value="">All cameras</option>
-          <option :for={c <- @cameras} value={c} selected={@filters.camera == c}>{c}</option>
-        </select>
-        <select name="label">
-          <option value="">All labels</option>
-          <option :for={l <- @labels} value={l} selected={@filters.label == l}>{l}</option>
-        </select>
-        <input type="date" name="from" value={@filters.from} />
-        <input type="date" name="to" value={@filters.to} />
-      </form>
-
-      <p :if={@total == 0} id="events-empty">No events match.</p>
-
-      <ul id="events-list" phx-update="stream">
-        <li :for={{dom_id, event} <- @streams.events} id={dom_id}>
-          <.link navigate={~p"/events/#{event.id}"}>
-            <img
-              :if={event.snapshot_path}
-              src={~p"/media/snapshots/#{event.id}"}
-              alt=""
-              width="160"
-              loading="lazy"
+        <form
+          id="event-filters"
+          phx-change="filter"
+          class="hs-card"
+          style="display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; padding: 12px 14px; margin-bottom: 16px;"
+        >
+          <div class="hs-field" style="width: 170px;">
+            <label>Camera</label>
+            <select name="camera" class="hs-input" style="height: 34px;">
+              <option value="">All cameras</option>
+              <option :for={c <- @cameras} value={c} selected={@filters.camera == c}>{c}</option>
+            </select>
+          </div>
+          <div class="hs-field" style="width: 150px;">
+            <label>Label</label>
+            <select name="label" class="hs-input" style="height: 34px;">
+              <option value="">All labels</option>
+              <option :for={l <- @labels} value={l} selected={@filters.label == l}>{l}</option>
+            </select>
+          </div>
+          <div class="hs-field" style="width: 160px;">
+            <label>From</label>
+            <input
+              type="date"
+              name="from"
+              class="hs-input"
+              value={@filters.from}
+              style="height: 34px;"
             />
-            <span class="camera">{event.camera_id}</span>
-            <time datetime={DateTime.to_iso8601(event.started_at)}>
-              {Calendar.strftime(event.started_at, "%Y-%m-%d %H:%M:%S")}
-            </time>
-            <span class="duration">{duration(event)}</span>
-            <span
-              :for={{label, score} <- Map.get(event.labels, "max_scores", %{})}
-              class="label-chip"
-            >
-              {label} {trunc(score * 100)}%
-            </span>
-            <span :if={event.status == :partial} class="badge-partial">partial</span>
-          </.link>
-        </li>
-      </ul>
+          </div>
+          <div class="hs-field" style="width: 160px;">
+            <label>To</label>
+            <input type="date" name="to" class="hs-input" value={@filters.to} style="height: 34px;" />
+          </div>
+          <div style="flex: 1;"></div>
+          <button
+            :if={filters_active?(@filters)}
+            type="button"
+            phx-click="clear-filters"
+            class="hs-btn hs-btn--ghost hs-btn--sm"
+            style="color: var(--hs-fg-2);"
+          >
+            <span class="ms" style="font-size: 16px;">filter_alt_off</span>Clear filters
+          </button>
+        </form>
 
-      <nav id="events-pagination">
-        <button :if={@page > 1} phx-click="page" phx-value-page={@page - 1}>Previous</button>
-        <span>page {@page} — {@total} events</span>
-        <button :if={@has_next} phx-click="page" phx-value-page={@page + 1}>
-          Next
-        </button>
-      </nav>
+        <div
+          id="events-list"
+          phx-update="stream"
+          style="display: flex; flex-direction: column; gap: 10px;"
+        >
+          <.link
+            :for={{dom_id, event} <- @streams.events}
+            navigate={~p"/events/#{event.id}"}
+            id={dom_id}
+            class="hs-card cairn-event-row"
+            style="display: flex; align-items: center; gap: 14px; padding: 10px 14px 10px 10px; cursor: pointer; text-decoration: none; color: inherit;"
+          >
+            <div style="width: 136px; height: 76px; flex: none; border-radius: 6px; overflow: hidden; background: var(--hs-bg-sunken); display: flex; align-items: center; justify-content: center;">
+              <img
+                :if={event.snapshot_path}
+                src={~p"/media/snapshots/#{event.id}"}
+                alt=""
+                loading="lazy"
+                style="width: 100%; height: 100%; object-fit: cover;"
+              />
+              <span
+                :if={!event.snapshot_path}
+                class="ms"
+                style="font-size: 22px; color: var(--hs-fg-4);"
+              >
+                videocam
+              </span>
+            </div>
+            <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px;">
+              <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+                <span style="font-family: var(--hs-font-mono); font-size: 13px; font-weight: 500; color: var(--hs-fg-1);">
+                  {event.camera_id}
+                </span>
+                <span
+                  :if={event.status == :partial}
+                  class="hs-badge hs-badge--warning"
+                  title="Recording was interrupted"
+                >
+                  <span class="hs-dot"></span>partial
+                </span>
+              </div>
+              <div
+                class="tnum"
+                style="display: flex; align-items: center; gap: 14px; font-size: 13px; color: var(--hs-fg-3);"
+              >
+                <time
+                  datetime={DateTime.to_iso8601(event.started_at)}
+                  style="display: inline-flex; align-items: center; gap: 5px;"
+                >
+                  <span class="ms" style="font-size: 15px;">schedule</span>{fmt_time(event.started_at)}
+                </time>
+                <span style="display: inline-flex; align-items: center; gap: 5px;">
+                  <span class="ms" style="font-size: 15px;">timelapse</span>{fmt_duration(event)}
+                </span>
+              </div>
+            </div>
+            <div style="display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end;">
+              <span
+                :for={{label, score} <- Map.get(event.labels, "max_scores", %{})}
+                class="label-chip"
+                style={label_chip_style(label)}
+              >
+                {label} <span style="opacity: 0.75; font-size: 11px;">{fmt_score(score)}</span>
+              </span>
+            </div>
+            <span class="ms" style="font-size: 20px; color: var(--hs-fg-4); flex: none;">
+              chevron_right
+            </span>
+          </.link>
+        </div>
+
+        <div
+          :if={@total == 0}
+          id="events-empty"
+          style="display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 72px 20px; text-align: center;"
+        >
+          <span class="ms" style="font-size: 46px; color: var(--hs-fg-4);">videocam_off</span>
+          <div style="font-size: 15px; font-weight: 500; color: var(--hs-fg-1);">No events match</div>
+          <div style="font-size: 13px; color: var(--hs-fg-3);">
+            Try widening the date range or removing a filter.
+          </div>
+          <button
+            :if={filters_active?(@filters)}
+            phx-click="clear-filters"
+            class="hs-btn hs-btn--secondary hs-btn--sm"
+            style="margin-top: 6px;"
+          >
+            Clear filters
+          </button>
+        </div>
+
+        <nav
+          :if={@total > 0}
+          id="events-pagination"
+          style="display: flex; align-items: center; gap: 10px; margin-top: 16px;"
+        >
+          <span class="tnum" style="font-size: 13px; color: var(--hs-fg-3);">
+            Showing {@showing_from}–{@showing_to} of {@total}
+          </span>
+          <div style="flex: 1;"></div>
+          <button
+            phx-click="page"
+            phx-value-page={@page - 1}
+            disabled={@page <= 1}
+            class="hs-btn hs-btn--secondary hs-btn--sm"
+          >
+            <span class="ms" style="font-size: 16px;">chevron_left</span>Previous
+          </button>
+          <button
+            phx-click="page"
+            phx-value-page={@page + 1}
+            disabled={!@has_next}
+            class="hs-btn hs-btn--secondary hs-btn--sm"
+          >
+            Next<span class="ms" style="font-size: 16px;">chevron_right</span>
+          </button>
+        </nav>
+      </main>
     </Layouts.app>
     """
   end

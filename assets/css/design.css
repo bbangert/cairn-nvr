@@ -1,0 +1,608 @@
+/* ==========================================================================
+   Hassever Design System — Colors & Type
+   ==========================================================================
+   Core design tokens for the Hassever brand. HA-adjacent (blue-forward,
+   card-based) but distinct: warmer neutrals, softer surface shadows,
+   humanist-trending system sans.
+
+   Use the CSS vars directly (e.g. color: var(--hs-fg-1)) or via semantic
+   helpers further down.
+   ========================================================================== */
+
+
+/* ----- 1. PRIMITIVE COLOR SCALES --------------------------------------- */
+/* These should rarely be used directly; prefer semantic tokens below.    */
+
+:root {
+  /* Hassever Blue — primary brand (HA-aligned cyan-blue family) */
+  --hs-blue-50:  #eaf7fe;
+  --hs-blue-100: #cceafc;
+  --hs-blue-200: #9fd8f8;
+  --hs-blue-300: #5fc0f5;
+  --hs-blue-400: #29ade9;
+  --hs-blue-500: #03a9f4;   /* HA classic cyan — primary */
+  --hs-blue-600: #0288d1;
+  --hs-blue-700: #026aa3;
+  --hs-blue-800: #024e78;
+  --hs-blue-900: #013452;
+
+  /* Slate — neutral cool grey, slightly warm to feel less sterile */
+  --hs-slate-50:  #f6f8fa;
+  --hs-slate-100: #ecf0f4;
+  --hs-slate-200: #dde3ea;
+  --hs-slate-300: #c3ccd6;
+  --hs-slate-400: #9aa6b3;
+  --hs-slate-500: #6c7885;
+  --hs-slate-600: #4b5661;
+  --hs-slate-700: #343d47;
+  --hs-slate-800: #222a33;
+  --hs-slate-900: #141a21;
+  --hs-slate-950: #0b0f14;
+
+  /* Semantic color families */
+  --hs-green-100: #d8f3e1;
+  --hs-green-500: #2fb866;   /* success, on, connected */
+  --hs-green-600: #219653;
+
+  --hs-amber-100: #fcecc9;
+  --hs-amber-500: #f0a818;   /* warning, pending */
+  --hs-amber-600: #c6860b;
+
+  --hs-red-100:   #fbdcd7;
+  --hs-red-500:   #e5484d;   /* error, offline, destructive */
+  --hs-red-600:   #c63439;
+
+  --hs-purple-500:#8b5cf6;   /* automation accent */
+  --hs-pink-500:  #ec4899;   /* scene accent */
+}
+
+
+/* ----- 2. SEMANTIC TOKENS (Light theme, default) ----------------------- */
+
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+
+  /* Backgrounds — layered surfaces */
+  --hs-bg-canvas: #f2f5f8;           /* dashboard base */
+  --hs-bg-surface: #ffffff;          /* cards, panels */
+  --hs-bg-sunken: #e8edf2;           /* nested wells, code blocks */
+  --hs-bg-raised: #ffffff;           /* modals, popovers */
+  --hs-bg-overlay: rgba(20, 26, 33, 0.48);
+
+  /* Foregrounds — text on surface */
+  --hs-fg-1: #141a21;                /* primary text */
+  --hs-fg-2: #4b5661;                /* secondary text, descriptions */
+  --hs-fg-3: #6c7885;                /* tertiary, captions, meta */
+  --hs-fg-4: #9aa6b3;                /* placeholder, disabled */
+  --hs-fg-on-accent: #ffffff;        /* text on primary blue */
+  --hs-fg-link: var(--hs-blue-600);
+
+  /* Borders & dividers */
+  --hs-border-1: #dde3ea;            /* default card border */
+  --hs-border-2: #ecf0f4;            /* subtle divider */
+  --hs-border-strong: #c3ccd6;       /* input border, focus outline */
+
+  /* Brand + accents */
+  --hs-accent: var(--hs-blue-500);
+  --hs-accent-hover: var(--hs-blue-600);
+  --hs-accent-press: var(--hs-blue-700);
+  --hs-accent-soft: var(--hs-blue-50);
+  --hs-accent-soft-border: var(--hs-blue-100);
+
+  /* State colors (on light surface) */
+  --hs-success: var(--hs-green-600);
+  --hs-success-soft: var(--hs-green-100);
+  --hs-warning: var(--hs-amber-600);
+  --hs-warning-soft: var(--hs-amber-100);
+  --hs-danger: var(--hs-red-600);
+  --hs-danger-soft: var(--hs-red-100);
+
+  /* Entity-state tints (dashboard cards) */
+  --hs-state-on: var(--hs-amber-500);           /* lights, switches on */
+  --hs-state-on-soft: #fff3dc;
+  --hs-state-off: var(--hs-slate-400);
+  --hs-state-unavailable: var(--hs-slate-300);
+
+  /* Elevation shadows — subtle, soft; avoid harsh drop-shadow look */
+  --hs-shadow-xs: 0 1px 2px rgba(17, 24, 33, 0.04);
+  --hs-shadow-sm: 0 1px 3px rgba(17, 24, 33, 0.06), 0 1px 2px rgba(17, 24, 33, 0.04);
+  --hs-shadow-md: 0 4px 12px rgba(17, 24, 33, 0.06), 0 2px 4px rgba(17, 24, 33, 0.04);
+  --hs-shadow-lg: 0 16px 32px rgba(17, 24, 33, 0.08), 0 4px 8px rgba(17, 24, 33, 0.04);
+  --hs-shadow-focus: 0 0 0 3px rgba(3, 169, 244, 0.25);
+}
+
+
+/* ----- 3. SEMANTIC TOKENS (Dark theme) --------------------------------- */
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --hs-bg-canvas: #0b0f14;
+  --hs-bg-surface: #171e26;
+  --hs-bg-sunken: #0f141a;
+  --hs-bg-raised: #1e262f;
+  --hs-bg-overlay: rgba(0, 0, 0, 0.6);
+
+  --hs-fg-1: #f2f5f8;
+  --hs-fg-2: #c3ccd6;
+  --hs-fg-3: #9aa6b3;
+  --hs-fg-4: #6c7885;
+  --hs-fg-on-accent: #ffffff;
+  --hs-fg-link: var(--hs-blue-300);
+
+  --hs-border-1: #2a333d;
+  --hs-border-2: #1f2730;
+  --hs-border-strong: #3b4652;
+
+  --hs-accent: var(--hs-blue-400);
+  --hs-accent-hover: var(--hs-blue-300);
+  --hs-accent-press: var(--hs-blue-200);
+  --hs-accent-soft: rgba(3, 169, 244, 0.12);
+  --hs-accent-soft-border: rgba(3, 169, 244, 0.28);
+
+  --hs-success: #5ed08a;
+  --hs-success-soft: rgba(47, 184, 102, 0.14);
+  --hs-warning: #f5ba49;
+  --hs-warning-soft: rgba(240, 168, 24, 0.14);
+  --hs-danger: #ff7a7e;
+  --hs-danger-soft: rgba(229, 72, 77, 0.14);
+
+  --hs-state-on: #ffc75c;
+  --hs-state-on-soft: rgba(255, 199, 92, 0.14);
+  --hs-state-off: #6c7885;
+  --hs-state-unavailable: #4b5661;
+
+  --hs-shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --hs-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4), 0 1px 2px rgba(0, 0, 0, 0.3);
+  --hs-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.45), 0 2px 4px rgba(0, 0, 0, 0.3);
+  --hs-shadow-lg: 0 16px 32px rgba(0, 0, 0, 0.55), 0 4px 8px rgba(0, 0, 0, 0.3);
+  --hs-shadow-focus: 0 0 0 3px rgba(41, 173, 233, 0.45);
+}
+
+
+/* ----- 4. SPACING, RADII, MOTION --------------------------------------- */
+
+:root {
+  /* 4px base spacing scale */
+  --hs-space-0: 0;
+  --hs-space-1: 4px;
+  --hs-space-2: 8px;
+  --hs-space-3: 12px;
+  --hs-space-4: 16px;
+  --hs-space-5: 20px;
+  --hs-space-6: 24px;
+  --hs-space-8: 32px;
+  --hs-space-10: 40px;
+  --hs-space-12: 48px;
+  --hs-space-16: 64px;
+  --hs-space-20: 80px;
+
+  /* Corner radii — HA uses generous radii; we follow with a pinch less softness */
+  --hs-radius-xs: 4px;
+  --hs-radius-sm: 6px;
+  --hs-radius-md: 10px;     /* default card, input */
+  --hs-radius-lg: 14px;     /* larger surfaces, modals */
+  --hs-radius-xl: 20px;
+  --hs-radius-pill: 999px;
+
+  /* Motion — quick, gentle; never bouncy, never slow */
+  --hs-ease-standard: cubic-bezier(0.2, 0, 0, 1);   /* Material-style decelerate */
+  --hs-ease-emphasized: cubic-bezier(0.3, 0, 0, 1);
+  --hs-ease-linear: linear;
+  --hs-dur-instant: 80ms;
+  --hs-dur-fast: 150ms;
+  --hs-dur-base: 220ms;
+  --hs-dur-slow: 360ms;
+}
+
+
+/* ----- 5. TYPOGRAPHY ---------------------------------------------------- */
+
+:root {
+  /* System sans stack — invisible, OS-native, readable at small sizes */
+  --hs-font-sans:
+    "Inter", "Inter var",
+    -apple-system, BlinkMacSystemFont,
+    "Segoe UI Variable", "Segoe UI",
+    Roboto, "Helvetica Neue", Arial,
+    "Noto Sans", sans-serif,
+    "Apple Color Emoji", "Segoe UI Emoji";
+
+  /* Mono for numeric readouts (sensor values, logs, code) */
+  --hs-font-mono:
+    "JetBrains Mono", "SF Mono", ui-monospace,
+    "Menlo", "Consolas", "Roboto Mono", monospace;
+
+  /* Type scale — 1.200 minor third, anchored at 14px body */
+  --hs-text-xs:   11px;   /* badges, micro-labels */
+  --hs-text-sm:   13px;   /* meta, captions */
+  --hs-text-base: 14px;   /* body default (HA-weight; readable, compact) */
+  --hs-text-md:   16px;   /* emphasized body */
+  --hs-text-lg:   18px;
+  --hs-text-xl:   22px;
+  --hs-text-2xl:  28px;
+  --hs-text-3xl:  34px;
+  --hs-text-4xl:  44px;
+
+  /* Line heights */
+  --hs-leading-tight:  1.2;
+  --hs-leading-snug:   1.35;
+  --hs-leading-normal: 1.5;
+  --hs-leading-loose:  1.7;
+
+  /* Weights */
+  --hs-weight-regular: 400;
+  --hs-weight-medium:  500;
+  --hs-weight-semibold:600;
+  --hs-weight-bold:    700;
+
+  /* Tracking — use sparingly */
+  --hs-tracking-tight:  -0.01em;
+  --hs-tracking-normal: 0;
+  --hs-tracking-wide:   0.04em;
+  --hs-tracking-caps:   0.08em;
+
+  /* Numeric readout (tabular for dashboards, sensor cards) */
+  --hs-font-feature-tabular: "tnum" 1, "cv11" 1;
+}
+
+
+/* ----- 6. SEMANTIC TYPE HELPERS ---------------------------------------- */
+
+.hs-display,
+.hs-h0 {
+  font-family: var(--hs-font-sans);
+  font-size: var(--hs-text-4xl);
+  line-height: var(--hs-leading-tight);
+  font-weight: var(--hs-weight-bold);
+  letter-spacing: var(--hs-tracking-tight);
+  color: var(--hs-fg-1);
+}
+
+.hs-h1 {
+  font-family: var(--hs-font-sans);
+  font-size: var(--hs-text-3xl);
+  line-height: var(--hs-leading-tight);
+  font-weight: var(--hs-weight-bold);
+  letter-spacing: var(--hs-tracking-tight);
+  color: var(--hs-fg-1);
+}
+
+.hs-h2 {
+  font-family: var(--hs-font-sans);
+  font-size: var(--hs-text-2xl);
+  line-height: var(--hs-leading-snug);
+  font-weight: var(--hs-weight-semibold);
+  letter-spacing: var(--hs-tracking-tight);
+  color: var(--hs-fg-1);
+}
+
+.hs-h3 {
+  font-family: var(--hs-font-sans);
+  font-size: var(--hs-text-xl);
+  line-height: var(--hs-leading-snug);
+  font-weight: var(--hs-weight-semibold);
+  color: var(--hs-fg-1);
+}
+
+.hs-h4 {
+  font-family: var(--hs-font-sans);
+  font-size: var(--hs-text-lg);
+  line-height: var(--hs-leading-snug);
+  font-weight: var(--hs-weight-semibold);
+  color: var(--hs-fg-1);
+}
+
+.hs-eyebrow {
+  font-family: var(--hs-font-sans);
+  font-size: var(--hs-text-xs);
+  line-height: var(--hs-leading-snug);
+  font-weight: var(--hs-weight-semibold);
+  letter-spacing: var(--hs-tracking-caps);
+  text-transform: uppercase;
+  color: var(--hs-fg-3);
+}
+
+.hs-p,
+.hs-body {
+  font-family: var(--hs-font-sans);
+  font-size: var(--hs-text-base);
+  line-height: var(--hs-leading-normal);
+  font-weight: var(--hs-weight-regular);
+  color: var(--hs-fg-1);
+}
+
+.hs-body-lg {
+  font-family: var(--hs-font-sans);
+  font-size: var(--hs-text-md);
+  line-height: var(--hs-leading-normal);
+  color: var(--hs-fg-1);
+}
+
+.hs-meta,
+.hs-caption {
+  font-family: var(--hs-font-sans);
+  font-size: var(--hs-text-sm);
+  line-height: var(--hs-leading-snug);
+  color: var(--hs-fg-3);
+}
+
+.hs-label {
+  font-family: var(--hs-font-sans);
+  font-size: var(--hs-text-sm);
+  line-height: var(--hs-leading-snug);
+  font-weight: var(--hs-weight-medium);
+  color: var(--hs-fg-2);
+}
+
+.hs-mono,
+.hs-code {
+  font-family: var(--hs-font-mono);
+  font-size: 0.92em;
+  font-feature-settings: var(--hs-font-feature-tabular);
+}
+
+.hs-readout {
+  /* sensor values, big numbers */
+  font-family: var(--hs-font-sans);
+  font-feature-settings: var(--hs-font-feature-tabular);
+  font-variant-numeric: tabular-nums;
+  font-weight: var(--hs-weight-semibold);
+  letter-spacing: var(--hs-tracking-tight);
+  color: var(--hs-fg-1);
+}
+
+
+/* ----- 7. BASE RESETS (opt-in, scoped to .hs-root) --------------------- */
+
+.hs-root {
+  font-family: var(--hs-font-sans);
+  font-size: var(--hs-text-base);
+  line-height: var(--hs-leading-normal);
+  color: var(--hs-fg-1);
+  background: var(--hs-bg-canvas);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+.hs-root *,
+.hs-root *::before,
+.hs-root *::after {
+  box-sizing: border-box;
+}
+
+.hs-root :focus-visible {
+  outline: none;
+  box-shadow: var(--hs-shadow-focus);
+  border-radius: var(--hs-radius-sm);
+}
+/* Shared UI-kit primitives — button, input, card, toggle, etc.
+   Consumed by all three kits (addon, integration, admin). */
+
+.hs-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  height: 36px; padding: 0 16px;
+  border-radius: var(--hs-radius-md);
+  font-family: var(--hs-font-sans); font-size: 14px; font-weight: 500;
+  border: 1px solid transparent; cursor: pointer;
+  transition: background var(--hs-dur-fast) var(--hs-ease-standard),
+              transform var(--hs-dur-instant);
+  white-space: nowrap;
+}
+.hs-btn:active { transform: scale(0.98); }
+.hs-btn:focus-visible { outline: none; box-shadow: var(--hs-shadow-focus); }
+.hs-btn--primary { background: var(--hs-accent); color: var(--hs-fg-on-accent); }
+.hs-btn--primary:hover { background: var(--hs-accent-hover); }
+.hs-btn--secondary { background: var(--hs-bg-surface); color: var(--hs-fg-1); border-color: var(--hs-border-strong); }
+.hs-btn--secondary:hover { background: var(--hs-bg-sunken); }
+.hs-btn--ghost { background: transparent; color: var(--hs-fg-1); }
+.hs-btn--ghost:hover { background: var(--hs-bg-sunken); }
+.hs-btn--danger { background: var(--hs-danger); color: white; }
+.hs-btn--danger:hover { filter: brightness(0.94); }
+.hs-btn--icon { width: 36px; padding: 0; }
+.hs-btn--sm { height: 28px; padding: 0 10px; font-size: 13px; }
+.hs-btn:disabled { opacity: 0.4; pointer-events: none; }
+
+.hs-input {
+  font-family: var(--hs-font-sans); font-size: 14px;
+  height: 36px; padding: 0 12px; width: 100%;
+  background: var(--hs-bg-surface); color: var(--hs-fg-1);
+  border: 1px solid var(--hs-border-strong);
+  border-radius: var(--hs-radius-md);
+  outline: none;
+  transition: border-color var(--hs-dur-fast), box-shadow var(--hs-dur-fast);
+}
+.hs-input:focus { border-color: var(--hs-accent); box-shadow: var(--hs-shadow-focus); }
+.hs-input--error { border-color: var(--hs-danger); }
+
+.hs-field { display: flex; flex-direction: column; gap: 6px; }
+.hs-field label { font-size: 13px; font-weight: 500; color: var(--hs-fg-2); }
+.hs-field .hs-help { font-size: 12px; color: var(--hs-fg-3); }
+.hs-field .hs-err { font-size: 12px; color: var(--hs-danger); }
+
+.hs-card {
+  background: var(--hs-bg-surface);
+  border: 1px solid var(--hs-border-1);
+  border-radius: var(--hs-radius-md);
+  box-shadow: var(--hs-shadow-sm);
+}
+.hs-card--flush { padding: 0; }
+.hs-card--p { padding: 16px; }
+.hs-card--lg { padding: 20px; }
+
+.hs-tog { width: 40px; height: 22px; border-radius: 999px; background: var(--hs-slate-300); position: relative; flex: none; cursor: pointer; transition: background var(--hs-dur-fast); border: none; padding: 0; }
+.hs-tog::after { content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; background: white; border-radius: 50%; box-shadow: var(--hs-shadow-xs); transition: transform var(--hs-dur-fast) var(--hs-ease-standard); }
+.hs-tog[aria-checked="true"] { background: var(--hs-accent); }
+.hs-tog[aria-checked="true"]::after { transform: translateX(18px); }
+
+.hs-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 10px; border-radius: 999px;
+  font-size: 11px; font-weight: 600;
+  font-family: var(--hs-font-sans);
+  letter-spacing: 0.02em;
+}
+.hs-badge .hs-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.hs-badge--success { background: var(--hs-success-soft); color: var(--hs-success); }
+.hs-badge--warning { background: var(--hs-warning-soft); color: var(--hs-warning); }
+.hs-badge--danger  { background: var(--hs-danger-soft);  color: var(--hs-danger); }
+.hs-badge--accent  { background: var(--hs-accent-soft);  color: var(--hs-accent); }
+.hs-badge--neutral { background: var(--hs-bg-sunken); color: var(--hs-fg-2); }
+
+.hs-topbar {
+  height: 56px;
+  display: flex; align-items: center; gap: 16px;
+  padding: 0 20px;
+  background: var(--hs-bg-surface);
+  border-bottom: 1px solid var(--hs-border-1);
+}
+.hs-topbar__brand { display: flex; align-items: center; gap: 10px; color: var(--hs-accent); }
+.hs-topbar__brand svg { width: 24px; height: 24px; }
+.hs-topbar__title { font-size: 15px; font-weight: 600; color: var(--hs-fg-1); letter-spacing: -0.01em; }
+.hs-topbar__grow { flex: 1; }
+
+.hs-sidebar {
+  width: 240px;
+  background: var(--hs-bg-surface);
+  border-right: 1px solid var(--hs-border-1);
+  display: flex; flex-direction: column;
+}
+.hs-nav-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px 16px;
+  font-size: 14px; color: var(--hs-fg-1);
+  cursor: pointer;
+  border-left: 3px solid transparent;
+  transition: background var(--hs-dur-fast);
+}
+.hs-nav-item:hover { background: var(--hs-bg-sunken); }
+.hs-nav-item--active {
+  background: var(--hs-accent-soft);
+  color: var(--hs-accent);
+  border-left-color: var(--hs-accent);
+  font-weight: 500;
+}
+.hs-nav-item svg { width: 18px; height: 18px; flex: none; }
+.hs-nav-item .hs-count { margin-left: auto; font-size: 11px; color: inherit; opacity: 0.7; font-variant-numeric: tabular-nums; }
+
+.hs-section-title {
+  font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--hs-fg-3);
+  padding: 16px 16px 6px;
+}
+
+.hs-divider { height: 1px; background: var(--hs-border-2); border: 0; margin: 0; }
+
+/* Modal */
+.hs-modal-backdrop {
+  position: fixed; inset: 0; background: var(--hs-bg-overlay);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 100; padding: 20px;
+  animation: hs-fade 150ms var(--hs-ease-standard);
+}
+.hs-modal {
+  background: var(--hs-bg-raised);
+  border-radius: var(--hs-radius-lg);
+  box-shadow: var(--hs-shadow-lg);
+  max-width: 520px; width: 100%;
+  animation: hs-pop 220ms var(--hs-ease-standard);
+}
+.hs-modal__head { padding: 20px 24px 12px; }
+.hs-modal__title { font-size: 18px; font-weight: 600; color: var(--hs-fg-1); margin: 0; }
+.hs-modal__sub { font-size: 13px; color: var(--hs-fg-2); margin-top: 4px; }
+.hs-modal__body { padding: 0 24px 20px; }
+.hs-modal__foot { display: flex; justify-content: flex-end; gap: 8px; padding: 16px 24px; border-top: 1px solid var(--hs-border-2); }
+@keyframes hs-fade { from { opacity: 0 } to { opacity: 1 } }
+@keyframes hs-pop { from { opacity: 0; transform: translateY(8px) scale(0.98) } to { opacity: 1; transform: none } }
+
+/* Entity card */
+.hs-entity {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 14px 16px;
+}
+.hs-entity__ico {
+  width: 36px; height: 36px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center; flex: none;
+  background: var(--hs-bg-sunken); color: var(--hs-fg-3);
+}
+.hs-entity__ico--on { background: var(--hs-state-on-soft); color: var(--hs-state-on); }
+.hs-entity__ico--blue { background: var(--hs-accent-soft); color: var(--hs-accent); }
+.hs-entity__ico svg { width: 20px; height: 20px; }
+.hs-entity__name { font-size: 14px; font-weight: 500; color: var(--hs-fg-1); }
+.hs-entity__sub { font-size: 12px; color: var(--hs-fg-3); margin-top: 1px; }
+
+/* Layout helpers */
+.hs-stack > * + * { margin-top: var(--hs-stack-gap, 16px); }
+.hs-row { display: flex; align-items: center; gap: 12px; }
+.hs-grow { flex: 1; }
+
+/* Table */
+.hs-table { width: 100%; border-collapse: collapse; }
+.hs-table th {
+  text-align: left; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--hs-fg-3);
+  background: var(--hs-bg-canvas);
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--hs-border-1);
+}
+.hs-table td {
+  padding: 12px 16px;
+  font-size: 13px;
+  color: var(--hs-fg-1);
+  border-bottom: 1px solid var(--hs-border-2);
+}
+.hs-table tbody tr:hover td { background: var(--hs-bg-sunken); }
+.hs-table tbody tr:last-child td { border-bottom: none; }
+.hs-mono-cell { font-family: var(--hs-font-mono); font-size: 12px; color: var(--hs-fg-2); }
+
+/* --- Cairn additions (from the design prototype) ------------------------ */
+
+.ms {
+  font-family: "Material Symbols Outlined";
+  font-weight: 400;
+  font-style: normal;
+  line-height: 1;
+  display: inline-block;
+  letter-spacing: normal;
+  text-transform: none;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  font-variation-settings: "opsz" 24;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+.ms--fill { font-variation-settings: "opsz" 24, "FILL" 1; }
+
+@keyframes cairn-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@keyframes cairn-rec   { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+@keyframes cairn-spin  { to { transform: rotate(360deg); } }
+
+select.hs-input option { background: var(--hs-bg-raised); color: var(--hs-fg-1); }
+
+.cairn-link { color: var(--hs-blue-300); text-decoration: none; }
+.cairn-link:hover { color: var(--hs-blue-200); text-decoration: underline; }
+
+/* tabular numerics on every timestamp/duration/score/size readout */
+.tnum { font-variant-numeric: tabular-nums; }
+
+/* nav items in the topbar */
+.cairn-nav {
+  display: inline-flex; align-items: center; gap: 7px;
+  height: 36px; padding: 0 12px; border-radius: var(--hs-radius-md);
+  font-size: 14px; font-weight: 500; color: var(--hs-fg-2);
+  border: none; background: transparent; cursor: pointer;
+  transition: background var(--hs-dur-fast) var(--hs-ease-standard);
+  text-decoration: none;
+}
+.cairn-nav:hover { background: var(--hs-bg-sunken); text-decoration: none; color: var(--hs-fg-2); }
+.cairn-nav--active { background: var(--hs-accent-soft); color: var(--hs-accent); }
+.cairn-nav--active:hover { background: var(--hs-accent-soft); color: var(--hs-accent); }
+
+/* event rows are links */
+.cairn-event-row { transition: background var(--hs-dur-fast) var(--hs-ease-standard); }
+.cairn-event-row:hover { background: var(--hs-bg-raised); }

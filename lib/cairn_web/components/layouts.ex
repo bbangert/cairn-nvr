@@ -31,46 +31,50 @@ defmodule CairnWeb.Layouts do
     default: nil,
     doc: "the current [scope](https://phoenix.hexdocs.pm/scopes.html)"
 
+  attr :page, :atom,
+    default: nil,
+    doc: "which topbar nav item is active (:dashboard | :events | :config)"
+
   slot :inner_block, required: true
 
   def app(assigns) do
     ~H"""
-    <header class="navbar px-4 sm:px-6 lg:px-8">
-      <div class="flex-1">
-        <a href="/" class="flex-1 flex w-fit items-center gap-2">
-          <img src={~p"/images/logo.svg"} width="36" />
-          <span class="text-sm font-semibold">v{Application.spec(:phoenix, :vsn)}</span>
-        </a>
-      </div>
-      <div class="flex-none">
-        <ul class="flex flex-column px-1 space-x-4 items-center">
-          <li>
-            <a href="https://phoenixframework.org/" class="btn btn-ghost">Website</a>
-          </li>
-          <li>
-            <a href="https://github.com/phoenixframework/phoenix" class="btn btn-ghost">GitHub</a>
-          </li>
-          <li>
-            <.theme_toggle />
-          </li>
-          <li>
-            <a href="https://phoenix.hexdocs.pm/overview.html" class="btn btn-primary">
-              Get Started <span aria-hidden="true">&rarr;</span>
-            </a>
-          </li>
-        </ul>
-      </div>
-    </header>
+    <div style="min-height: 100vh; display: flex; flex-direction: column; background: var(--hs-bg-canvas);">
+      <header style="height: 56px; display: flex; align-items: center; gap: 8px; padding: 0 20px; background: var(--hs-bg-surface); border-bottom: 1px solid var(--hs-border-1); position: sticky; top: 0; z-index: 50; flex: none;">
+        <div style="display: flex; align-items: center; gap: 9px; color: var(--hs-accent); margin-right: 16px;">
+          <span class="ms" style="font-size: 24px;">terrain</span>
+          <span style="font-size: 16px; font-weight: 700; letter-spacing: -0.01em; color: var(--hs-fg-1);">
+            Cairn
+          </span>
+        </div>
+        <nav style="display: flex; align-items: center; gap: 4px;">
+          <.link navigate={~p"/"} class={["cairn-nav", @page == :dashboard && "cairn-nav--active"]}>
+            <span class="ms" style="font-size: 19px;">videocam</span>Dashboard
+          </.link>
+          <.link navigate={~p"/events"} class={["cairn-nav", @page == :events && "cairn-nav--active"]}>
+            <span class="ms" style="font-size: 19px;">video_library</span>Events
+          </.link>
+          <.link navigate={~p"/config"} class={["cairn-nav", @page == :config && "cairn-nav--active"]}>
+            <span class="ms" style="font-size: 19px;">tune</span>Config
+          </.link>
+        </nav>
+        <div style="flex: 1;"></div>
+        <span style="font-family: var(--hs-font-mono); font-size: 12px; color: var(--hs-fg-4);">
+          {host_readout()}
+        </span>
+      </header>
 
-    <main class="px-4 py-8 sm:px-6 lg:px-8">
-      <!-- NVR pages are video-first: use the full viewport width -->
-      <div class="mx-auto w-full max-w-screen-2xl space-y-4">
-        {render_slot(@inner_block)}
-      </div>
-    </main>
+      {render_slot(@inner_block)}
+    </div>
 
     <.flash_group flash={@flash} />
     """
+  end
+
+  defp host_readout do
+    config = CairnWeb.Endpoint.config(:http) || []
+    port = get_in(config, [:port]) || 4000
+    "#{CairnWeb.Endpoint.host()}:#{port}"
   end
 
   @doc """
