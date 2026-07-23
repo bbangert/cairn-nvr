@@ -160,26 +160,26 @@ silent libx264 fallback.
 
 ## Phase 3 — Live preview: MSE channel + minimal dashboard + HLS
 
-- [ ] 3.1 [liveview] `CairnWeb.StreamChannel` (`"camera:{id}"`): join reply
+- [x] 3.1 [liveview] `CairnWeb.StreamChannel` (`"camera:{id}"`): join reply
       carries codec string; push init segment then live fragments as binary
       frames (`{:binary, data}`). **Slow-consumer policy (explicit design
       obligation)**: every fragment, check transport pid
       `message_queue_len`; > high-water (e.g. 8 fragments) → stop channel
       with `:slow_consumer` (client reconnects fresh at live edge).
-- [ ] 3.2 [js] MSE LiveView hook (vanilla, ~40 lines): Phoenix Channel
+- [x] 3.2 [js] MSE LiveView hook (vanilla, ~40 lines): Phoenix Channel
       binary frames → `MediaSource`/`SourceBuffer` (codec from join reply),
       trim buffered ranges > 30s, rejoin-on-close with backoff, fall back
       to HLS `<video src>` when `MediaSource` unsupported.
-- [ ] 3.3 [liveview] Dashboard v0 (`/`): camera grid from config, per-tile
+- [x] 3.3 [liveview] Dashboard v0 (`/`): camera grid from config, per-tile
       MSE player + status badge; subscribes `"cameras:status"`.
-- [ ] 3.4 [otp] `Cairn.CameraStatus`: ETS + PubSub broadcast of per-camera
+- [x] 3.4 [otp] `Cairn.CameraStatus`: ETS + PubSub broadcast of per-camera
       status (`connecting/running/stalled/backoff` + probe results later);
       written by FFmpegPort/watchdog.
-- [ ] 3.5 [liveview] HLS fallback: controller `GET /hls/:camera/index.m3u8`
+- [x] 3.5 [liveview] HLS fallback: controller `GET /hls/:camera/index.m3u8`
       (playlist over `RingBuffer.fetch_recent`, `EXT-X-MAP` init URL) +
       `GET /hls/:camera/init.mp4` + `/hls/:camera/:seq.m4s`. ~100 lines, no
       library.
-- [ ] 3.6 [test] Channel join/binary-push/slow-consumer tests; HLS playlist
+- [x] 3.6 [test] Channel join/binary-push/slow-consumer tests; HLS playlist
       correctness; dashboard LiveView render test.
 
 **Verify**: `mix check`. Manual milestone: **live video in browser** from a

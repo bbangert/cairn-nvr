@@ -21,10 +21,16 @@ defmodule Cairn.Camera do
     index = Keyword.fetch!(opts, :index)
     windows = Cairn.Config.windows(config, cam)
 
-    children = [
-      {Cairn.RingBuffer, camera_id: cam.id, pre_window_seconds: windows.pre},
-      {Cairn.FFmpegPort, camera: cam, config: config, index: index}
-    ]
+    children =
+      [
+        {Cairn.RingBuffer, camera_id: cam.id, pre_window_seconds: windows.pre},
+        {Cairn.FFmpegPort, camera: cam, config: config, index: index}
+      ] ++
+        if cam.plugin do
+          [{Cairn.PluginPort, camera: cam, config: config, index: index}]
+        else
+          []
+        end
 
     Supervisor.init(children, strategy: :rest_for_one)
   end
