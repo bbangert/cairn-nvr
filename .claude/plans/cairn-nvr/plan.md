@@ -71,14 +71,14 @@ silent libx264 fallback.
 
 ## Phase 1 — Scaffold, config core, event index
 
-- [ ] 1.1 [infra] Generate project in repo root: `mix phx.new . --app cairn
+- [x] 1.1 [infra] Generate project in repo root: `mix phx.new . --app cairn
       --database sqlite3 --no-mailer --no-gettext` (LiveView default). Keep
       `docs/`. `git init`, add `credo` + `mix format`; CI-ready aliases
       (`mix check` = compile --warnings-as-errors, format --check-formatted,
       credo, test).
-- [ ] 1.2 [infra] Deps: `yaml_elixir` (config), `jason` (already). Defer
+- [x] 1.2 [infra] Deps: `yaml_elixir` (config), `jason` (already). Defer
       `ex_webrtc` to Phase 7.
-- [ ] 1.3 [otp] `Cairn.Config`: typed structs (`Config`, `Config.Camera`)
+- [x] 1.3 [otp] `Cairn.Config`: typed structs (`Config`, `Config.Camera`)
       + `load/1` from YAML + validation returning `{:error, [msg]}`:
       required fields, `pre/post/max` window sanity, UDP base+range present,
       **reject overlapping/exhausted UDP ranges** (2 ports per camera),
@@ -86,27 +86,27 @@ silent libx264 fallback.
       `extra_ffmpeg_args`, `transcode: false`, retention days + per-label
       override). Globals: `data_dir`, `stall_seconds` (15), free-space
       emergency threshold, retention defaults.
-- [ ] 1.4 [otp] `Cairn.Config.Server`: holds active config; `reload/0`
+- [x] 1.4 [otp] `Cairn.Config.Server`: holds active config; `reload/0`
       re-reads YAML, validates, diffs cameras (added/removed/changed →
       start/stop/restart camera children), returns diff + warnings for UI.
       Invalid reload keeps old config and returns errors.
-- [ ] 1.5 [otp] `Cairn.DataDir`: resolve + ensure `events/ snapshots/ log/`
+- [x] 1.5 [otp] `Cairn.DataDir`: resolve + ensure `events/ snapshots/ log/`
       subdirs at boot.
-- [ ] 1.6 [ecto] Repo on `{data_dir}/cairn.db`: `busy_timeout: 5_000`,
+- [x] 1.6 [ecto] Repo on `{data_dir}/cairn.db`: `busy_timeout: 5_000`,
       `pool_size: 2`, WAL (adapter default). Migration `events`: `id`
       (uuid/string PK), `camera_id`, `started_at`, `ended_at`, `status`
       (`active|finalized|partial`), `path`, `bytes`, `labels` (JSON:
       time-indexed label entries + max scores), `max_score`,
       `snapshot_path`, timestamps. Indexes: `(camera_id, started_at)`,
       `status`. Migrations run at application boot (release-safe migrator).
-- [ ] 1.7 [otp] Supervision skeleton per architecture tree: `Cairn.PubSub`,
+- [x] 1.7 [otp] Supervision skeleton per architecture tree: `Cairn.PubSub`,
       Repo, `Cairn.Registry` (per-camera process names via
       `{camera_id, role}` keys), `Cairn.CameraSupervisor` (DynamicSupervisor),
       `Cairn.DetectionAggregator` (stub), `Cairn.EventSupervisor`
       (DynamicSupervisor), Endpoint. Camera children started from config at
       boot (after reconciliation task lands in 5.4, order: repo → reconcile
       → cameras).
-- [ ] 1.8 [test] Config load/validation tests (fixtures incl. UDP overlap,
+- [x] 1.8 [test] Config load/validation tests (fixtures incl. UDP overlap,
       bad windows, unknown keys warning); reload diff tests; migration
       smoke test.
 

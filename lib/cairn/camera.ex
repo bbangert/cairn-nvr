@@ -5,9 +5,6 @@ defmodule Cairn.Camera do
   Child order: `RingBuffer` -> `FFmpegPort` -> (`PluginPort`) -> (`RTPHub`).
   Ring death restarts ffmpeg (a fresh ring is empty anyway); ffmpeg death
   restarts only the downstream consumers of its UDP outputs.
-
-  Phase 1: skeleton with no children yet; registers under
-  `{camera_id, :camera}` so config reloads can find and stop it.
   """
 
   use Supervisor
@@ -18,8 +15,16 @@ defmodule Cairn.Camera do
   end
 
   @impl true
-  def init(_opts) do
-    children = []
+  def init(opts) do
+    cam = Keyword.fetch!(opts, :camera)
+    config = Keyword.fetch!(opts, :config)
+    index = Keyword.fetch!(opts, :index)
+    windows = Cairn.Config.windows(config, cam)
+
+    children = [
+      {Cairn.RingBuffer, camera_id: cam.id, pre_window_seconds: windows.pre},
+      {Cairn.FFmpegPort, camera: cam, config: config, index: index}
+    ]
 
     Supervisor.init(children, strategy: :rest_for_one)
   end
