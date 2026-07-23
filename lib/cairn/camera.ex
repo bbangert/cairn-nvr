@@ -25,6 +25,11 @@ defmodule Cairn.Camera do
 
     children =
       [
+        %{
+          id: :probe,
+          start: {Task, :start_link, [Cairn.Probe, :run_and_store, [cam]]},
+          restart: :temporary
+        },
         {Cairn.RingBuffer, camera_id: cam.id, pre_window_seconds: windows.pre},
         {Cairn.FFmpegPort, camera: cam, config: config, index: index}
       ] ++
