@@ -1,6 +1,6 @@
 # Cairn NVR — Claude Design Handoff
 
-**Status**: OPEN — design side can start now. Backend contracts below are
+**Status**: RETURNED & IMPLEMENTED 2026-07-22 — the Claude Design export (docs/design/cairn-nvr-prototype.zip) has been recreated in the LiveViews. This doc remains the functional-contract reference.
 implemented (Phases 1–5) or frozen (Phase 6–7 endpoints); attribute/id
 contracts will not change without updating this doc.
 

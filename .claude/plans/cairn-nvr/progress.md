@@ -23,11 +23,11 @@ State: COMPLETED (review cycle 1 done; external gates below still open)
   WebRTC (after in-band SPS/PPS + outbound seq rewrite). Source of record
   for the camera: Reolink HTTP-FLV (see scratchpad).
 
-- **DESIGN HANDOFF (open)**: `docs/design-handoff.md` delivered to Claude
-  Design (created early, during Phase 5). Blocks: final visual styling of
-  dashboard, events list/detail, labels timeline, config page, nav chrome.
-  When the export returns: wire markup into existing LiveViews keeping the
-  id/`data-*`/`phx-*` contracts (see doc §Round trip).
+- **DESIGN HANDOFF: CLOSED 2026-07-22** — Claude Design export returned
+  (docs/design/cairn-nvr-prototype.zip) and implemented: token/component
+  CSS layer (assets/css/design.css), dark-only chrome + topbar, all four
+  views recreated to spec with functional contracts intact. 141 tests
+  green; pages live-verified.
 
 ## Scope changes
 
@@ -186,3 +186,16 @@ State: COMPLETED (review cycle 1 done; external gates below still open)
 [20:17] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/webrtc/session.ex
 [20:18] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.claude/plans/cairn-nvr/scratchpad.md
 [20:18] Modified: /var/home/ben/Programming/elixir/cairn-nvr/.claude/plans/cairn-nvr/progress.md
+[21:07] Modified: /var/home/ben/Programming/elixir/cairn-nvr/assets/css/app.css
+[21:07] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/components/layouts/root.html.heex
+[21:08] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/components/layouts.ex
+[21:08] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/live/dashboard_live.ex
+[21:09] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/live/events_live.ex
+[21:09] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/live/events_live.ex
+[21:09] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/live/events_live.ex
+[21:10] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/live/event_live.ex
+[21:10] Modified: /var/home/ben/Programming/elixir/cairn-nvr/assets/js/hooks/timeline_seek.js
+[21:10] Modified: /var/home/ben/Programming/elixir/cairn-nvr/assets/js/hooks/copy_text.js
+[21:10] Modified: /var/home/ben/Programming/elixir/cairn-nvr/assets/js/app.js
+[21:10] Modified: /var/home/ben/Programming/elixir/cairn-nvr/assets/js/app.js
+[21:11] Modified: /var/home/ben/Programming/elixir/cairn-nvr/lib/cairn_web/live/config_live.ex

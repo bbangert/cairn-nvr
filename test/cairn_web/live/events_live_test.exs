@@ -57,15 +57,15 @@ defmodule CairnWeb.EventsLiveTest do
     for i <- 1..30, do: seed("cam_a", i, ["person"])
 
     {:ok, view, html} = live(conn, "/events")
-    assert html =~ "page 1 — 30 events"
+    assert html =~ "Showing 1–25 of 30"
 
     html = render_click(view, "page", %{"page" => "2"})
-    assert html =~ "page 2 — 30 events"
+    assert html =~ "Showing 26–30 of 30"
   end
 
   test "shows empty state", %{conn: conn} do
     {:ok, _view, html} = live(conn, "/events")
-    assert html =~ "No events match."
+    assert html =~ "No events match"
   end
 
   test "event detail renders clip, timeline and metadata", %{conn: conn} do

@@ -3,6 +3,8 @@
 
 @import "tailwindcss" source(none);
 @import "phoenix-colocated/cairn/colocated.css";
+/* Cairn design system (Claude Design handoff round-trip) */
+@import "./design.css";
 @source "../css";
 @source "../js";
 @source "../../lib/cairn_web";
