@@ -43,6 +43,13 @@ retention:
   per_label:
     person: 30
 
+# Third-party integrations. The Home Assistant API (/api) is disabled unless a
+# token is set here; requests must send it as `Authorization: Bearer <token>`
+# (or `?access_token=<token>` for media URLs). Generate one with e.g.
+# `openssl rand -hex 32`. Leave commented out to keep /api returning 401.
+# integrations:
+#   token: "replace-with-a-long-random-secret"
+
 cameras: []
 #  - id: front_door
 #    rtsp_url: rtsp://user:pass@192.168.1.10:554/stream1
