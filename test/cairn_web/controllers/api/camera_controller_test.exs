@@ -37,6 +37,8 @@ defmodule CairnWeb.Api.CameraControllerTest do
     # CameraStatus stores probe failures as {:error, term}, which Jason can't
     # encode — the list must sanitize it, not crash.
     Cairn.CameraStatus.set_probe("cam_a", {:error, :timeout})
+    # set_probe is an async cast; flush it so the ETS write lands before we read
+    _ = :sys.get_state(Cairn.CameraStatus)
     on_exit(fn -> Cairn.CameraStatus.set_probe("cam_a", nil) end)
 
     body = conn |> get("/api/cameras") |> json_response(200)
