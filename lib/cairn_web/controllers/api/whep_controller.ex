@@ -27,6 +27,7 @@ defmodule CairnWeb.Api.WhepController do
     else
       :unknown_camera -> send_error(conn, 404, "unknown camera")
       :no_offer -> send_error(conn, 400, "missing sdp offer")
+      :too_large -> send_error(conn, 413, "sdp offer too large")
     end
   end
 
@@ -102,7 +103,9 @@ defmodule CairnWeb.Api.WhepController do
       _ ->
         case read_body(conn, length: @max_sdp_bytes) do
           {:ok, body, _conn} when byte_size(body) > 0 -> {:ok, body}
-          # {:more, ...} (offer exceeds the cap) also falls through as no_offer
+          # an offer larger than the cap comes back as {:more, _, _}: it was
+          # provided, just too big — distinct from a missing body (413 vs 400)
+          {:more, _partial, _conn} -> :too_large
           _ -> :no_offer
         end
     end
