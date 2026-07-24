@@ -97,6 +97,9 @@ defmodule CairnWeb.Api.WhepController do
   # `application/sdp` body (passed through unparsed by Plug.Parsers).
   defp read_offer(conn, params) do
     case params["sdp"] do
+      sdp when is_binary(sdp) and byte_size(sdp) > @max_sdp_bytes ->
+        :too_large
+
       sdp when is_binary(sdp) and sdp != "" ->
         {:ok, sdp}
 

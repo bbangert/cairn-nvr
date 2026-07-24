@@ -44,9 +44,14 @@ defmodule CairnWeb.Api.WhepControllerTest do
     assert json_response(conn, 400)
   end
 
-  test "413s an oversized offer (distinct from missing)", %{conn: conn} do
+  test "413s an oversized raw offer (distinct from missing)", %{conn: conn} do
     oversized = String.duplicate("a", 70_000)
     conn = sdp_post(conn, "/api/cameras/cam_a/webrtc", oversized)
+    assert json_response(conn, 413)["error"] =~ "too large"
+  end
+
+  test "413s an oversized JSON {sdp} offer too", %{conn: conn} do
+    conn = post(conn, "/api/cameras/cam_a/webrtc", %{sdp: String.duplicate("a", 70_000)})
     assert json_response(conn, 413)["error"] =~ "too large"
   end
 

@@ -27,6 +27,13 @@ defmodule CairnWeb.Router do
     plug CairnWeb.Plugs.ApiAuth
   end
 
+  # Media is token-authed like :api but negotiates no format: MediaController
+  # sets the content-type itself (mp4/jpg), and restricting `:accepts` would 406
+  # a player sending `Accept: video/mp4` / `image/jpeg`.
+  pipeline :api_media do
+    plug CairnWeb.Plugs.ApiAuth
+  end
+
   scope "/", CairnWeb do
     pipe_through :browser
 
@@ -67,7 +74,7 @@ defmodule CairnWeb.Router do
   # Media reuse: the browser's MediaController (Range-capable) served under the
   # token-authed :api pipeline, so HA's Media Browser resolves clips/snapshots.
   scope "/api/media", CairnWeb do
-    pipe_through :api
+    pipe_through :api_media
 
     get "/events/:id", MediaController, :event_clip
     get "/snapshots/:id", MediaController, :snapshot

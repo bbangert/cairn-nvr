@@ -38,12 +38,20 @@ defmodule Cairn.DetectionAggregatorControlTest do
     ])
   end
 
+  # `detections/5` is an async cast; flushing the aggregator's mailbox with
+  # :sys.get_state guarantees it (and its synchronous PubSub broadcast) is done,
+  # so we can assert "no event" with no timing window.
+  defp refute_event_started(agg) do
+    :sys.get_state(agg)
+    refute_received {:event_started, _}
+  end
+
   test "detection_enabled=false drops batches — no event starts", ctx do
     CameraControl.set(ctx.camera_id, %{detection_enabled: false})
 
     detect(ctx.agg, ctx.camera)
 
-    refute_receive {:event_started, _}, 200
+    refute_event_started(ctx.agg)
   end
 
   test "recording_enabled=false suppresses event start", ctx do
@@ -51,7 +59,7 @@ defmodule Cairn.DetectionAggregatorControlTest do
 
     detect(ctx.agg, ctx.camera)
 
-    refute_receive {:event_started, _}, 200
+    refute_event_started(ctx.agg)
   end
 
   test "min_score override raises the threshold", ctx do
@@ -59,7 +67,7 @@ defmodule Cairn.DetectionAggregatorControlTest do
 
     # 0.9 is above the configured 0.5 but below the 0.95 override → filtered out
     detect(ctx.agg, ctx.camera, 0.9)
-    refute_receive {:event_started, _}, 200
+    refute_event_started(ctx.agg)
 
     # above the override → passes
     detect(ctx.agg, ctx.camera, 0.99)
