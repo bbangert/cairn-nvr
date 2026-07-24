@@ -33,6 +33,17 @@ defmodule CairnWeb.Api.CameraControllerTest do
     assert cam_a["windows"]["post_seconds"] == 10
   end
 
+  test "index does not 500 when a camera probe is an error tuple", %{conn: conn} do
+    # CameraStatus stores probe failures as {:error, term}, which Jason can't
+    # encode — the list must sanitize it, not crash.
+    Cairn.CameraStatus.set_probe("cam_a", {:error, :timeout})
+    on_exit(fn -> Cairn.CameraStatus.set_probe("cam_a", nil) end)
+
+    body = conn |> get("/api/cameras") |> json_response(200)
+    cam_a = Enum.find(body["cameras"], &(&1["id"] == "cam_a"))
+    assert cam_a["probe"] == %{"error" => ":timeout"}
+  end
+
   test "control updates detection and min_score override", %{conn: conn} do
     body =
       conn

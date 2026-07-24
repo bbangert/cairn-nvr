@@ -44,13 +44,35 @@ defmodule Cairn.CameraControl do
   @spec all() :: %{String.t() => control()}
   def all, do: Map.new(:ets.tab2list(@table))
 
+  @known_keys ~w(detection_enabled recording_enabled min_score)a
+  @string_keys Map.new(@known_keys, &{Atom.to_string(&1), &1})
+
   @doc """
   Merges `attrs` (a subset of `:detection_enabled`, `:recording_enabled`,
-  `:min_score`) into a camera's control and returns the new control.
+  `:min_score`) into a camera's control and returns the new control. Accepts
+  either atom or string keys; unknown keys are ignored.
   """
   @spec set(String.t(), map()) :: control()
   def set(camera_id, attrs) when is_map(attrs) do
-    GenServer.call(__MODULE__, {:set, camera_id, attrs})
+    GenServer.call(__MODULE__, {:set, camera_id, normalize(attrs)})
+  end
+
+  # Accept string- or atom-keyed input, keeping only the known keys. Only maps
+  # a fixed set of strings to atoms (never String.to_atom on arbitrary input).
+  defp normalize(attrs) do
+    Enum.reduce(attrs, %{}, fn
+      {k, v}, acc when is_atom(k) and k in @known_keys ->
+        Map.put(acc, k, v)
+
+      {k, v}, acc when is_binary(k) ->
+        case Map.fetch(@string_keys, k) do
+          {:ok, atom} -> Map.put(acc, atom, v)
+          :error -> acc
+        end
+
+      _kv, acc ->
+        acc
+    end)
   end
 
   @doc "Removes control for cameras no longer configured (on reload)."

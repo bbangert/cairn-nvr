@@ -58,10 +58,17 @@ defmodule CairnWeb.Api.CameraController do
         max_seconds: windows.max
       },
       status: Map.get(status, :status, :unknown),
-      probe: Map.get(status, :probe),
+      probe: safe_probe(Map.get(status, :probe)),
       control: control
     }
   end
+
+  # CameraStatus probe may be `{:error, term}` (camera in backoff/error) — a
+  # tuple Jason can't encode, which would 500 the whole list. Sanitize like the
+  # SSE feed does.
+  defp safe_probe(probe) when is_map(probe), do: probe
+  defp safe_probe({:error, reason}), do: %{error: inspect(reason)}
+  defp safe_probe(_), do: nil
 
   defp camera(camera_id) do
     case Server.camera(camera_id) do

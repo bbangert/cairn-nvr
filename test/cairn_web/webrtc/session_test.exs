@@ -82,10 +82,24 @@ defmodule CairnWeb.WebRTC.SessionTest do
 
     test "a self-owned session survives its starter process exiting" do
       whep_id = "whep_#{System.unique_integer([:positive])}"
-      session = start_whep(whep_id)
-      # no owner is monitored, so nothing external should stop it here
-      Process.sleep(50)
+      test = self()
+
+      # start the session from a short-lived process, then let it exit
+      starter = spawn(fn -> send(test, {:started, Session.start_whep("cam_a", whep_id)}) end)
+      starter_ref = Process.monitor(starter)
+
+      # PeerConnection.start_link in the session's init can take a moment
+      assert_receive {:started, {:ok, session}}, 5_000
+      assert_receive {:DOWN, ^starter_ref, :process, ^starter, _reason}, 1_000
+
+      # the DynamicSupervisor owns the session (no owner monitor), so the
+      # starter's exit must not take it down
       assert Process.alive?(session)
+
+      on_exit(fn ->
+        if Process.alive?(session),
+          do: DynamicSupervisor.terminate_child(CairnWeb.WebRTC.Supervisor, session)
+      end)
     end
 
     @tag :integration

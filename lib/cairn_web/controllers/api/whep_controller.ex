@@ -17,6 +17,9 @@ defmodule CairnWeb.Api.WhepController do
   alias CairnWeb.WebRTC.Session
   alias CairnWeb.WebRTC.Supervisor
 
+  # SDP offers are a few KB; cap the body to shrink the request-body DoS surface.
+  @max_sdp_bytes 65_536
+
   def create(conn, %{"id" => camera_id} = params) do
     with {:ok, _cam} <- camera(camera_id),
          {:ok, offer} <- read_offer(conn, params) do
@@ -97,8 +100,9 @@ defmodule CairnWeb.Api.WhepController do
         {:ok, sdp}
 
       _ ->
-        case read_body(conn) do
+        case read_body(conn, length: @max_sdp_bytes) do
           {:ok, body, _conn} when byte_size(body) > 0 -> {:ok, body}
+          # {:more, ...} (offer exceeds the cap) also falls through as no_offer
           _ -> :no_offer
         end
     end
