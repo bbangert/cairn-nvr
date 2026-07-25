@@ -37,6 +37,10 @@ extraction — no Python video decoding dependency needed.
 ```bash
 # yolov10n.pt is auto-downloaded by ultralytics on first use if not present
 yolo export model=yolov10n.pt format=onnx imgsz=640 batch=1 dynamic=False simplify=True nms=False
+
+# The .onnx lands next to the .pt (cwd). Its canonical home is the plugin
+# root — where the plugin's --model flag and .gitignore expect it:
+mv yolov10n.onnx ..   # when running from plugins/cairn-detect/model/
 ```
 
 This produces `yolov10n.onnx` with:
@@ -102,12 +106,12 @@ frame extraction and the loop variable.
 Run the calibration + `quantize_static` pipeline:
 
 ```bash
-yolo-export-venv/bin/python3 quantize_yolov10n.py \
-    --model yolo-export-venv/yolov10n.onnx \
-    --calib-dir calib_frames \
-    --out yolov10n-int8.onnx \
-    --preprocessed yolov10n-preproc.onnx
+yolo-export-venv/bin/python3 quantize_yolov10n.py
 ```
+
+The defaults match the repo layout: `--model ../yolov10n.onnx` (plugin
+root), `--calib-dir calib_frames`, `--out ../yolov10n-int8.onnx` — pass
+them explicitly only to deviate.
 
 See `quantize_yolov10n.py` in this directory for the full, documented,
 runnable script. Key points, in order:

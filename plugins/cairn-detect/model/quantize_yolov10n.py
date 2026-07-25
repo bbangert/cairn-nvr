@@ -83,9 +83,11 @@ def get_input_name(model_path: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="yolo-export-venv/yolov10n.onnx")
+    # Model artifacts live in the plugin root (one level up) — that is where
+    # the plugin's --model flag and .gitignore expect them.
+    ap.add_argument("--model", default="../yolov10n.onnx")
     ap.add_argument("--calib-dir", default="calib_frames")
-    ap.add_argument("--out", default="yolov10n-int8.onnx")
+    ap.add_argument("--out", default="../yolov10n-int8.onnx")
     ap.add_argument(
         "--preprocessed",
         default="yolov10n-preproc.onnx",

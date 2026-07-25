@@ -8,6 +8,7 @@ Verify the INT8-quantized yolov10n ONNX model against the FP32 original:
 Usage:
     yolo-export-venv/bin/python3 verify_models.py
 """
+import argparse
 import glob
 import os
 import time
@@ -18,9 +19,13 @@ import onnxruntime as ort
 from PIL import Image
 
 SP = os.path.dirname(os.path.abspath(__file__))
-FP32_PATH = os.path.join(SP, "yolo-export-venv", "yolov10n.onnx")
-INT8_PATH = os.path.join(SP, "yolov10n-int8.onnx")
-HELDOUT_DIR = os.path.join(SP, "heldout10")
+# Defaults follow the repo layout: model artifacts live in the plugin root
+# (one level up, where the plugin's --model flag and .gitignore expect them);
+# held-out frames are produced by the extraction steps in export-model.md.
+# Overridable via argv (see main).
+FP32_PATH = os.path.join(SP, "..", "yolov10n.onnx")
+INT8_PATH = os.path.join(SP, "..", "yolov10n-int8.onnx")
+HELDOUT_DIR = os.path.join(SP, "heldout_frames")
 
 # COCO class names (yolov10n is trained on COCO-80)
 COCO = [
@@ -148,6 +153,23 @@ def bench_latency(sess: ort.InferenceSession, x: np.ndarray, warmup=3, runs=20):
 
 
 def main():
+    global FP32_PATH, INT8_PATH, HELDOUT_DIR
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fp32", default=FP32_PATH)
+    ap.add_argument("--int8", default=INT8_PATH)
+    ap.add_argument("--frames-dir", default=HELDOUT_DIR,
+                    help="dir of 640x640 held-out PNGs (see export-model.md)")
+    args = ap.parse_args()
+    FP32_PATH, INT8_PATH, HELDOUT_DIR = args.fp32, args.int8, args.frames_dir
+    for path in (FP32_PATH, INT8_PATH):
+        if not os.path.isfile(path):
+            raise SystemExit(
+                f"model not found: {path} — export/quantize first (export-model.md)")
+    if not os.path.isdir(HELDOUT_DIR):
+        raise SystemExit(
+            f"frames dir not found: {HELDOUT_DIR} — extract held-out frames "
+            "per export-model.md, or pass --frames-dir")
+
     print("=== 1. I/O parity check ===")
     check_io_parity()
 
@@ -164,7 +186,9 @@ def main():
 
     print("=== 4. Held-out frame detections (score >= 0.5) ===")
     paths = sorted(glob.glob(os.path.join(HELDOUT_DIR, "*.png")))
-    assert len(paths) == 10, f"expected 10 held-out frames, found {len(paths)}"
+    if not paths:
+        raise SystemExit(f"no .png frames in {HELDOUT_DIR}")
+    print(f"({len(paths)} frames from {HELDOUT_DIR})")
 
     total_matches = 0
     total_fp32_dets = 0

@@ -74,6 +74,8 @@ cameras:
     plugin:
       - plugins/cairn-detect/target/release/cairn-detect
       - --model
+      # .onnx files are gitignored — produce this one with the export step
+      # in model/export-model.md (or drop in any NMS-free [1,N,6] model).
       - plugins/cairn-detect/yolov10n.onnx
       - --labels
       - plugins/cairn-detect/coco.names
