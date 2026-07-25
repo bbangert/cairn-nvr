@@ -7,10 +7,13 @@ whole interface — any language, any runtime, any model.
 
 Reference implementations:
 
+- `plugins/cairn-detect/` — **the one to deploy.** Single Rust binary,
+  hardware decode (VAAPI/QSV/NVDEC/V4L2/VideoToolbox) with software
+  fallback, NMS-free YOLO on onnxruntime.
+- `plugins/cpu-reference/` — the minimal Python example (PyAV decode →
+  ONNX), kept short on purpose for people writing their own plugin.
 - `priv/plugins/mock/mock_plugin.exs` — deterministic timeline replay
   (used by Cairn's own tests; ignores the video entirely).
-- `plugins/cpu-reference/` — real CPU inference (PyAV decode → ONNX),
-  doubles as the documented example.
 
 ## Inputs
 
