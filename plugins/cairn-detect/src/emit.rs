@@ -38,8 +38,10 @@ pub fn line(camera_id: &str, pts: i64, dets: &[Det]) -> (String, usize) {
             dets: &dets[..kept],
         })
         .expect("contract line is always serializable");
-        // `<` rather than `<=`: the trailing newline counts against the budget.
-        if kept == 0 || json.len() < MAX_LINE_BYTES {
+        // `<=`: Cairn reads with erlang line mode `{:line, 8192}`, whose limit
+        // applies to the line data excluding the newline delimiter — a JSON
+        // payload of exactly 8192 bytes is still delivered whole.
+        if kept == 0 || json.len() <= MAX_LINE_BYTES {
             return (json, kept);
         }
         kept -= 1;
@@ -96,7 +98,7 @@ mod tests {
             .collect();
         let (json, kept) = line("cam", 1, &dets);
         assert!(kept > 0 && kept < dets.len());
-        assert!(json.len() < MAX_LINE_BYTES);
+        assert!(json.len() <= MAX_LINE_BYTES);
         assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
     }
 

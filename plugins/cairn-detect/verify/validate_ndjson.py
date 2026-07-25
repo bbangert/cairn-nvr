@@ -72,7 +72,7 @@ def validate_det(det, idx):
 
 
 def validate_line(raw: bytes):
-    """Returns (record, dets_flat) on success; raises ValueError on failure."""
+    """Returns the decoded JSON object on success; raises ValueError on failure."""
     if len(raw) > MAX_LINE_BYTES:
         fail(f"line is {len(raw)} bytes, exceeds {MAX_LINE_BYTES}")
     try:
