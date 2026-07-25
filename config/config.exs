@@ -63,6 +63,18 @@ config :logger, :default_formatter,
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
 
+# Keep the HA integration token (accepted as `?access_token=` on media URLs)
+# and raw SDP out of request logs. Default only filters "password".
+config :phoenix, :filter_parameters, ["password", "access_token", "token", "sdp"]
+
+# Extra MIME types the HA `/api` surface negotiates: SSE for the event feed
+# and SDP for the WHEP WebRTC offer/answer. Registering them lets the `:api`
+# pipeline's `:accepts` allow these formats.
+config :mime, :types, %{
+  "text/event-stream" => ["sse"],
+  "application/sdp" => ["sdp"]
+}
+
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
 import_config "#{config_env()}.exs"

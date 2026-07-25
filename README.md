@@ -58,11 +58,31 @@ See `config.example.yml` — every key is documented inline. Summary:
 | `events.pre/post/max_*_seconds` | clip windows (per-camera overridable) |
 | `retention.days` / `retention.per_label` | pruning (camera overrides win; multi-label events keep the longest) |
 | `cameras[]` | `id`, `rtsp_url`, `plugin` (argv), `min_score` per label, `extra_ffmpeg_args`, `transcode`, `retention` |
+| `integrations.token` | bearer token that enables the Home Assistant API (see below); absent ⇒ `/api` disabled |
 
 Non-H.264 cameras: Cairn probes each stream and warns. Opt-in
 `transcode: true` uses hardware `h264_v4l2m2m` only — if unavailable the
 camera refuses to start with a clear status; there is deliberately no
 silent CPU-encode fallback.
+
+## Home Assistant integration
+
+Cairn exposes a token-authed `/api` surface for Home Assistant (camera/event
+sensors, snapshots, event clips, an SSE live feed, WHEP WebRTC live streams, and
+runtime detection/recording control). It is **disabled until you set a token**:
+
+```yaml
+integrations:
+  token: "a-long-random-secret"   # e.g. openssl rand -hex 32
+```
+
+Requests authenticate with `Authorization: Bearer <token>` (or `?access_token=`
+for media URLs). The browser UI (`/`, `/media`, `/hls`) is unaffected. The full
+endpoint contract is in [`docs/ha-api.md`](docs/ha-api.md).
+
+The **Python HACS integration that consumes this API lives in a separate repo**;
+`docs/ha-api.md` is the interface it builds against. Serve the API over TLS or a
+trusted LAN only — the token is a bearer secret.
 
 ## Deployment
 

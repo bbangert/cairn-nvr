@@ -19,8 +19,19 @@ defmodule CairnWeb.Router do
     plug :put_secure_browser_headers, %{"content-security-policy" => @csp}
   end
 
+  # Home Assistant surface: token-authed, JSON. Distinct from :browser so the
+  # cookie-authed LiveView pages are unaffected. HA fetches server-side, so CORS
+  # is not needed; requests carry `Authorization: Bearer <token>`.
   pipeline :api do
-    plug :accepts, ["json"]
+    plug :accepts, ["json", "sse", "sdp"]
+    plug CairnWeb.Plugs.ApiAuth
+  end
+
+  # Media is token-authed like :api but negotiates no format: MediaController
+  # sets the content-type itself (mp4/jpg), and restricting `:accepts` would 406
+  # a player sending `Accept: video/mp4` / `image/jpeg`.
+  pipeline :api_media do
+    plug CairnWeb.Plugs.ApiAuth
   end
 
   scope "/", CairnWeb do
@@ -43,10 +54,31 @@ defmodule CairnWeb.Router do
     get "/snapshots/:id", MediaController, :snapshot
   end
 
-  # Other scopes may use custom stacks.
-  # scope "/api", CairnWeb do
-  #   pipe_through :api
-  # end
+  # Home Assistant integration API (token-authed). Controllers live under
+  # CairnWeb.Api.*; see docs/ha-api.md for the contract.
+  scope "/api", CairnWeb.Api do
+    pipe_through :api
+
+    get "/cameras", CameraController, :index
+    post "/cameras/:id/control", CameraController, :control
+    get "/events", EventController, :index
+    get "/events/:id", EventController, :show
+    get "/labels", EventController, :labels
+    get "/stream", EventStreamController, :stream
+
+    # WHEP WebRTC live stream: POST an offer, DELETE the returned resource.
+    post "/cameras/:id/webrtc", WhepController, :create
+    delete "/webrtc/:resource_id", WhepController, :delete
+  end
+
+  # Media reuse: the browser's MediaController (Range-capable) served under the
+  # token-authed :api pipeline, so HA's Media Browser resolves clips/snapshots.
+  scope "/api/media", CairnWeb do
+    pipe_through :api_media
+
+    get "/events/:id", MediaController, :event_clip
+    get "/snapshots/:id", MediaController, :snapshot
+  end
 
   # Enable LiveDashboard in development
   if Application.compile_env(:cairn, :dev_routes) do

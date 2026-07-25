@@ -20,6 +20,8 @@ defmodule Cairn.Application do
       {Phoenix.PubSub, name: Cairn.PubSub},
       Cairn.Registry,
       {Cairn.CameraStatus, []},
+      {Cairn.CameraControl, []},
+      {CairnWeb.Api.StreamLimiter, []},
       {Cairn.EventCheckpoint, []},
       {Task.Supervisor, name: Cairn.TaskSupervisor},
       {Cairn.DetectionAggregator, []},

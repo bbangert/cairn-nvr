@@ -16,6 +16,9 @@ retention:
   per_label:
     person: 30
 
+integrations:
+  token: test-ha-token
+
 cameras:
   - id: cam_a
     rtsp_url: rtsp://127.0.0.1:8554/a

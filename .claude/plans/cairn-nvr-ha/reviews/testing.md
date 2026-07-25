@@ -1,0 +1,34 @@
+# Test Review: Home Assistant `/api` integration
+
+## Summary
+Solid unit-level coverage of CameraControl, auth, camera/event controllers, and
+SSE frame formatting. The biggest gaps are at the HTTP boundary of the new WHEP
+endpoint (zero controller tests) and around the disabled-integration path.
+Shared global state (`CameraControl` ETS, `cam_a`) is handled correctly —
+`async: false` for the mutating suite avoids overlap with the `async: true`
+`camera_control_test.exs` since ExUnit never interleaves sync and async groups.
+
+## Iron Law Violations
+None found. `CameraControl` is app-owned (not mocked), `refute_receive` is used
+instead of `Process.sleep` (see timing caveat below), no DB/internal mocking.
+
+## Issues Found
+
+### Critical
+- [ ] **No controller-level tests for `WhepController`** (`lib/cairn_web/controllers/api/whep_controller.ex`) — no test file exists for `POST /api/cameras/:id/webrtc` or `DELETE /api/webrtc/:resource_id`. Per escalation rules, a new public HTTP surface with zero request-level coverage is a blocker: untested paths include unknown camera → 404, missing SDP → 400, bad offer → 400 (with session teardown), 503 on `max_children`, and successful 201 + `Location` header + DELETE → 204 → 404 on repeat delete. `test/cairn_web/webrtc/session_test.exs` only exercises `Session` directly, never through the router/plug pipeline (so `ApiAuth` gating of this route is also unverified).
+- [ ] **No `ApiAuth` test for the "integration disabled" (token nil) case** — `api_auth_test.exs:1-40` only covers "wrong token" and "no token" against a *configured* token. The plug's documented behaviour ("When no token is configured... every request is rejected with 401", `lib/cairn_web/plugs/api_auth.ex:10-12`) is never exercised. Since `Server.ha_token()` is read from the same globally-shared `Config.Server`, this can't easily be tested in-process without a second config server instance — but that's exactly the gap: nothing proves the disabled state actually 401s rather than, say, crashing on `nil` in `secure_compare/2`.
+
+### Warnings
+- [ ] `test/cairn_web/controllers/api/event_stream_test.exs` unit-tests `SSE.frame_for/1` only — the actual `stream/2` action (send_chunked loop, PubSub subscribe, ping timer, disconnect handling, `: connected\n\n` preamble) has zero coverage. Given the module doc explicitly calls out disconnect-exit and ping behavior (`event_stream_controller.ex:6-11,49`) as load-bearing, this is a meaningful coverage gap, not just a nice-to-have. At minimum a `ConnCase` test asserting the response is chunked with the correct `content-type` and that the preamble arrives would catch router/plug wiring regressions that frame_for tests cannot.
+- [ ] `test/cairn/detection_aggregator_control_test.exs:46,54,62` — `refute_receive {:event_started, _}, 200` is a timing gamble: it proves nothing happened within 200ms, not that nothing will happen. If `DetectionAggregator.detections/5` is genuinely synchronous up to the point of deciding whether to start an event, prefer asserting a synchronous return/side-effect (e.g. `:sys.get_state` or a `handle_call`) instead of a bounded negative wait; if async is unavoidable, at least follow up each `refute_receive` with a positive control assertion in the same test to prove the pipeline is otherwise live (only the third test, `min_score override`, does this — the first two rely purely on the negative wait).
+- [ ] `test/cairn_web/controllers/api/event_controller_test.exs` and `camera_controller_test.exs` are both `async: false` for DB-touching tests without a comment explaining why (unlike `camera_controller_test.exs`'s comment about `cam_a` global state, which only applies to the control-mutation tests, not `event_controller_test.exs`). `Events` context calls go through `Ecto.Adapters.SQL.Sandbox` per `ConnCase`, so DB isolation should permit `async: true` — worth confirming there's no other shared-state reason (e.g. `Events.create_active` touching a global path/dir) before leaving these serialized; if there is a reason, add a comment like the sibling file has.
+- [ ] `test/cairn_web/webrtc/session_test.exs:83-89` — "a self-owned session survives its starter process exiting" uses `Process.sleep(50)` to assert nothing happened, which is exactly the `Process.sleep`-for-timing anti-pattern (Iron Law 6), even though it's checking a negative/absence rather than driving the assertion. A monitor + `refute_receive {:DOWN, ...}, 100` would be more idiomatic and no less flaky-prone, though the underlying assertion (no external monitor exists) is inherently a "nothing happens" property that's hard to prove deterministically either way — consider instead asserting `Process.alive?/1` after some real supervised event (e.g. after the starter's normal exit is *processed*, not just slept past).
+
+### Suggestions
+- [ ] `test/support/fixtures/configs/valid.yml:19-20` — adding `integrations.token` is confirmed safe: `config_server_test.exs` builds its own inline YAML fixtures (never reads `valid.yml`) and `full_pipeline_test.exs` constructs a `%Config{}` struct directly, bypassing the file entirely. No other consumer of `valid.yml` was found. Still, since this file is shared, a one-line comment noting it's now relied upon by the HA `/api` auth tests would help future editors avoid silently breaking `api_auth_test.exs` by removing the key.
+- [ ] `camera_controller_test.exs:21-34` "index lists configured cameras" — assertions are meaningful (checks specific fixture-derived values like `windows.post_seconds == 10` and absence of `rtsp_url`), not tautological. No issue, noted as a positive control for the audit trail.
+- [ ] No test asserts `/api/stream` (or whichever route maps to `EventStreamController.stream/2`) actually uses `Transfer-Encoding: chunked` / that multiple frames arrive incrementally on one connection — ties into the Warning above about loop coverage; a `Phoenix.ConnTest` test with `conn |> get(...) |> response_content_type` plus reading a couple of chunks via `Plug.Test` chunking support would close this.
+- [ ] `test/cairn_web/webrtc/session_test.exs:91-107` — the single `@tag :integration` full-connect test is reasonable to exclude from the default run, but there's no non-integration fallback asserting the negotiated SDP answer is *usable* (e.g. asserting ICE candidate lines are well-formed) short of full connection — currently correctness of the embedded candidates is only checked via string-contains `"a=candidate"` in the non-integration WHEP test (`session_test.exs:74`), which is weak but acceptable given the integration test covers the real property.
+
+## Pre-existing tests
+Not reviewed in depth beyond checking for fixture-sharing side effects (`config_server_test.exs`, `full_pipeline_test.exs`); both are unaffected by the `valid.yml` change.

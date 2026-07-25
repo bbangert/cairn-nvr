@@ -21,7 +21,7 @@ defmodule Cairn.DetectionAggregator do
 
   require Logger
 
-  alias Cairn.{Event, EventCheckpoint, Tracker}
+  alias Cairn.{CameraControl, Event, EventCheckpoint, Tracker}
 
   @max_label_entries 5_000
 
@@ -53,21 +53,40 @@ defmodule Cairn.DetectionAggregator do
 
   @impl true
   def handle_cast({:detections, camera, windows, pts, dets}, state) do
+    control = CameraControl.get(camera.id)
+
+    if control.detection_enabled do
+      {:noreply, process_detections(state, camera, windows, pts, dets, control)}
+    else
+      # detection disabled at runtime: drop the batch. An in-flight event is
+      # left to finalize naturally on its post-window timer.
+      {:noreply, state}
+    end
+  end
+
+  defp process_detections(state, camera, windows, pts, dets, control) do
     cam = cam_state(state, camera.id)
     {tracker, tagged} = Tracker.track(cam.tracker, dets)
     cam = %{cam | tracker: tracker}
 
-    passing = Enum.filter(tagged, &passes_min_score?(&1, camera.min_score))
+    passing = Enum.filter(tagged, &passes_min_score?(&1, effective_min_score(camera, control)))
 
     cam =
       cond do
         passing == [] -> cam
+        # recording disabled: evaluate detections but don't open a new event
+        cam.event == nil and not control.recording_enabled -> cam
         cam.event == nil -> start_event(state, camera, windows, pts, passing, cam)
         true -> update_event(cam, windows, passing)
       end
 
-    {:noreply, put_cam(state, camera.id, cam)}
+    put_cam(state, camera.id, cam)
   end
+
+  # A runtime min_score override replaces the camera's configured thresholds
+  # (applied as the default for every label); nil means "use config".
+  defp effective_min_score(camera, %{min_score: nil}), do: camera.min_score
+  defp effective_min_score(_camera, %{min_score: override}), do: %{"default" => override}
 
   @impl true
   def handle_info({:post_window, camera_id, event_id, token}, state) do
