@@ -124,7 +124,10 @@ def main() -> int:
                 proc.kill()
                 proc.wait()
 
-    return 0 if stopping or args.duration is not None else (proc.returncode or 0)
+    # 0 only for intentional stops (signal or elapsed --duration, both set
+    # `stopping`); an early ffmpeg death propagates its real exit code so
+    # harness failures aren't masked.
+    return 0 if stopping else (proc.returncode or 0)
 
 
 if __name__ == "__main__":

@@ -180,9 +180,12 @@ def main() -> int:
     try:
         for line_no, raw in enumerate(src, start=1):
             raw = raw.rstrip(b"\n")
-            if not raw:
-                continue
             stats.total += 1
+            if not raw:
+                # contract: one JSON object per line — a blank line is
+                # non-contract stdout output, not ignorable whitespace
+                stats.record_error(line_no, "empty line (not a JSON object)", raw)
+                continue
             try:
                 obj = validate_line(raw)
             except ValueError as e:
