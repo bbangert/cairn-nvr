@@ -12,10 +12,11 @@ defmodule Cairn.Config do
 
   alias Cairn.Config.Camera
 
-  @known_keys ~w(data_dir stall_seconds free_space_min_mb remux_clips udp events retention cameras)
+  @known_keys ~w(data_dir stall_seconds free_space_min_mb remux_clips udp events retention cameras integrations)
   @known_udp_keys ~w(base_port range)
   @known_events_keys ~w(pre_window_seconds post_window_seconds max_event_seconds)
   @known_retention_keys ~w(days per_label)
+  @known_integrations_keys ~w(token)
 
   defstruct data_dir: "data",
             stall_seconds: 15,
@@ -28,7 +29,8 @@ defmodule Cairn.Config do
             max_event_seconds: 300,
             retention_days: 14,
             retention_per_label: %{},
-            cameras: []
+            cameras: [],
+            ha_token: nil
 
   @type t :: %__MODULE__{}
 
@@ -94,6 +96,9 @@ defmodule Cairn.Config do
     acc = warn_unknown(acc, Map.get(map, "events"), @known_events_keys, "events")
     acc = warn_unknown(acc, Map.get(map, "retention"), @known_retention_keys, "retention")
 
+    acc =
+      warn_unknown(acc, Map.get(map, "integrations"), @known_integrations_keys, "integrations")
+
     {cameras, acc} = parse_cameras(Map.get(map, "cameras", []), acc)
 
     config = %__MODULE__{
@@ -108,7 +113,8 @@ defmodule Cairn.Config do
       max_event_seconds: get_in(map, ["events", "max_event_seconds"]) || 300,
       retention_days: get_in(map, ["retention", "days"]) || 14,
       retention_per_label: get_in(map, ["retention", "per_label"]) || %{},
-      cameras: cameras
+      cameras: cameras,
+      ha_token: get_in(map, ["integrations", "token"])
     }
 
     acc = validate(config, acc)
@@ -165,7 +171,16 @@ defmodule Cairn.Config do
     |> validate_udp(config)
     |> validate_numbers(config)
     |> validate_remux(config)
+    |> validate_ha_token(config)
   end
+
+  defp validate_ha_token(acc, %{ha_token: nil}), do: acc
+
+  defp validate_ha_token(acc, %{ha_token: token}) when is_binary(token) and token != "",
+    do: acc
+
+  defp validate_ha_token(acc, _config),
+    do: add_error(acc, "integrations.token must be a non-empty string")
 
   defp validate_remux(acc, %{remux_clips: v}) when is_boolean(v), do: acc
 

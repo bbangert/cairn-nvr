@@ -24,11 +24,30 @@ defmodule CairnWeb.WebRTC.Session do
 
   alias ExWebRTC.{ICECandidate, MediaStreamTrack, PeerConnection, SessionDescription}
 
+  # Non-trickle WHEP: reply with the answer once ICE gathering finishes, or
+  # after this fallback (LAN host candidates gather in well under this).
+  @gather_timeout_ms 2_000
+  # Self-owned (WHEP) sessions with no client ever connecting are reaped.
+  @connect_deadline_ms 30_000
+
   @spec start(String.t(), pid()) :: DynamicSupervisor.on_start_child()
   def start(camera_id, owner) do
     DynamicSupervisor.start_child(
       CairnWeb.WebRTC.Supervisor,
       {__MODULE__, camera_id: camera_id, owner: owner}
+    )
+  end
+
+  @doc """
+  Starts a self-owned session for WHEP (HTTP) signaling, registered in
+  `Cairn.Registry` under `{whep_id, :whep}` so `DELETE` can find and stop it.
+  Unlike `start/2` it has no owner process and survives the request.
+  """
+  @spec start_whep(String.t(), String.t()) :: DynamicSupervisor.on_start_child()
+  def start_whep(camera_id, whep_id) do
+    DynamicSupervisor.start_child(
+      CairnWeb.WebRTC.Supervisor,
+      {__MODULE__, camera_id: camera_id, owner: nil, whep_id: whep_id}
     )
   end
 
@@ -39,6 +58,14 @@ defmodule CairnWeb.WebRTC.Session do
   @spec handle_offer(pid(), String.t()) :: {:ok, String.t()} | {:error, term()}
   def handle_offer(pid, sdp_offer), do: GenServer.call(pid, {:offer, sdp_offer})
 
+  @doc """
+  Non-trickle offer/answer: blocks until ICE gathering completes (or a short
+  timeout), returning an answer SDP with candidates already embedded.
+  """
+  @spec handle_offer_await(pid(), String.t()) :: {:ok, String.t()} | {:error, term()}
+  def handle_offer_await(pid, sdp_offer),
+    do: GenServer.call(pid, {:offer_await, sdp_offer}, @gather_timeout_ms + 3_000)
+
   @spec add_ice(pid(), map()) :: :ok
   def add_ice(pid, candidate_json), do: GenServer.cast(pid, {:ice, candidate_json})
 
@@ -46,7 +73,15 @@ defmodule CairnWeb.WebRTC.Session do
   def init(opts) do
     camera_id = Keyword.fetch!(opts, :camera_id)
     owner = Keyword.fetch!(opts, :owner)
-    Process.monitor(owner)
+    whep_id = Keyword.get(opts, :whep_id)
+
+    if is_pid(owner) do
+      Process.monitor(owner)
+    else
+      # self-owned (WHEP): register for DELETE lookup; reap if never connected
+      if whep_id, do: Registry.register(Cairn.Registry, {whep_id, :whep}, nil)
+      Process.send_after(self(), :connect_deadline, @connect_deadline_ms)
+    end
 
     # LAN-only deployment: no STUN/TURN needed (host candidates suffice)
     {:ok, pc} =
@@ -66,7 +101,9 @@ defmodule CairnWeb.WebRTC.Session do
        track_id: track.id,
        subscribed: false,
        replay_last_seq: nil,
-       out_seq: 0
+       out_seq: 0,
+       await_from: nil,
+       gather_timer: nil
      }}
   end
 
@@ -83,6 +120,24 @@ defmodule CairnWeb.WebRTC.Session do
     else
       error ->
         Logger.warning("webrtc #{state.camera_id}: offer failed: #{inspect(error)}")
+        {:reply, {:error, :bad_offer}, state}
+    end
+  end
+
+  # Non-trickle: set up the answer, then defer the reply until gathering ends.
+  def handle_call({:offer_await, sdp}, from, state) do
+    with :ok <-
+           PeerConnection.set_remote_description(state.pc, %SessionDescription{
+             type: :offer,
+             sdp: sdp
+           }),
+         {:ok, answer} <- PeerConnection.create_answer(state.pc),
+         :ok <- PeerConnection.set_local_description(state.pc, answer) do
+      timer = Process.send_after(self(), :gather_timeout, @gather_timeout_ms)
+      {:noreply, %{state | await_from: from, gather_timer: timer}}
+    else
+      error ->
+        Logger.warning("webrtc #{state.camera_id}: whep offer failed: #{inspect(error)}")
         {:reply, {:error, :bad_offer}, state}
     end
   end
@@ -105,8 +160,22 @@ defmodule CairnWeb.WebRTC.Session do
 
   @impl true
   def handle_info({:ex_webrtc, pc, {:ice_candidate, candidate}}, %{pc: pc} = state) do
-    send(state.owner, {:webrtc_signal, {:ice, ICECandidate.to_json(candidate)}})
+    # trickle only applies to owner-driven (browser) sessions; WHEP embeds
+    # candidates in the answer instead
+    if is_pid(state.owner) do
+      send(state.owner, {:webrtc_signal, {:ice, ICECandidate.to_json(candidate)}})
+    end
+
     {:noreply, state}
+  end
+
+  # Non-trickle answer is ready once gathering completes.
+  def handle_info(
+        {:ex_webrtc, pc, {:ice_gathering_state_change, :complete}},
+        %{pc: pc, await_from: from} = state
+      )
+      when not is_nil(from) do
+    {:noreply, reply_answer(state)}
   end
 
   def handle_info({:ex_webrtc, pc, {:connection_state_change, :connected}}, %{pc: pc} = state) do
@@ -132,6 +201,18 @@ defmodule CairnWeb.WebRTC.Session do
     {:stop, :normal, state}
   end
 
+  # Gathering didn't finish in time: answer with whatever we have (LAN host
+  # candidates are effectively immediate, so this rarely fires).
+  def handle_info(:gather_timeout, %{await_from: from} = state) when not is_nil(from) do
+    {:noreply, reply_answer(state)}
+  end
+
+  # WHEP session whose client never connected: reap it.
+  def handle_info(:connect_deadline, %{subscribed: false} = state) do
+    Logger.info("webrtc #{state.camera_id}: whep session idle (never connected), stopping")
+    {:stop, :normal, state}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
@@ -140,6 +221,14 @@ defmodule CairnWeb.WebRTC.Session do
     :ok
   catch
     _, _ -> :ok
+  end
+
+  # Reply to the deferred non-trickle offer with the fully-gathered answer.
+  defp reply_answer(state) do
+    if state.gather_timer, do: Process.cancel_timer(state.gather_timer)
+    answer = PeerConnection.get_local_description(state.pc)
+    GenServer.reply(state.await_from, {:ok, answer.sdp})
+    %{state | await_from: nil, gather_timer: nil}
   end
 
   # subscribe first, then snapshot: no gap; the seq guard drops the overlap

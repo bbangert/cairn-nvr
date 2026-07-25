@@ -35,6 +35,10 @@ defmodule Cairn.Config.Server do
   @spec data_dir(GenServer.server()) :: String.t()
   def data_dir(server \\ __MODULE__), do: get(server).data_dir
 
+  @doc "Configured HA integration token, or `nil` when the integration is disabled."
+  @spec ha_token(GenServer.server()) :: String.t() | nil
+  def ha_token(server \\ __MODULE__), do: get(server).ha_token
+
   @doc "Warnings and errors from the last load/reload attempt (for the UI)."
   @spec last_load(GenServer.server()) :: %{warnings: [String.t()], errors: [String.t()]}
   def last_load(server \\ __MODULE__), do: GenServer.call(server, :last_load)
