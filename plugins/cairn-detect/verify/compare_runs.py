@@ -56,8 +56,9 @@ def analyze(frames):
                 label, {"count": 0, "frame_hits": 0, "scores": [], "buckets": set()}
             )
             entry["count"] += 1
-            if isinstance(score, (int, float)):
-                entry["scores"].append(score)
+            # bool is a subclass of int — exclude it like validate_ndjson.py
+            if not isinstance(score, bool) and isinstance(score, (int, float)):
+                entry["scores"].append(float(score))
             entry["buckets"].add(bucket)
             seen_labels_this_frame.add(label)
         for label in seen_labels_this_frame:

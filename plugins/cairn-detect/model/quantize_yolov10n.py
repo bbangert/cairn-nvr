@@ -95,14 +95,9 @@ def main():
     )
     ap.add_argument(
         "--per-channel",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Use per-channel weight quantization (recommended for CNNs).",
-    )
-    ap.add_argument(
-        "--no-per-channel",
-        dest="per_channel",
-        action="store_false",
     )
     args = ap.parse_args()
 
