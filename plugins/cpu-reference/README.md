@@ -1,5 +1,9 @@
 # CPU reference plugin
 
+> Deploying rather than reading? Use `plugins/cairn-detect/` — a single Rust
+> binary with hardware decode and ~7x lower CPU on the same clip. This plugin
+> stays as the short, readable example of what the contract asks for.
+
 Real CPU inference for Cairn on x86 dev machines: PyAV decodes the H.264
 RTP feed, frames are sampled at ~5 fps, and a YOLOv8-style ONNX model runs
 via onnxruntime. It exists to (a) exercise the full pipeline without
