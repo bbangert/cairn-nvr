@@ -212,7 +212,9 @@ only changes across restarts.
 
 ## Model
 
-Input is always `images`, float32 `[1, 3, H, W]`, RGB, 0..1, CHW. Two output
+Input is the model's **first input** — named `images` in Ultralytics exports,
+but the name is taken from the model and logged at startup, not assumed —
+float32 `[1, 3, H, W]`, RGB, 0..1, CHW. Two output
 layouts are supported, and **which one a model uses is auto-detected** — there
 is no flag, because the two shapes cannot be confused:
 

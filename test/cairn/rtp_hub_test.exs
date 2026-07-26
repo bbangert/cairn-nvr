@@ -97,20 +97,23 @@ defmodule Cairn.RTPHubTest do
           )
         )
 
-      assert is_pid(pid)
-      assert Process.alive?(pid)
+      # get_state proves the server is responsive and holds a bound socket,
+      # which Process.alive?/1 alone would not.
+      assert is_port(:sys.get_state(pid).socket)
     end
 
     test "fails with the original error shape once the budget is spent", ctx do
       {:ok, holder} = :gen_udp.open(ctx.busy_port, [:binary, ip: {127, 0, 0, 1}])
       on_exit(fn -> :gen_udp.close(holder) end)
 
+      # The failed start_link sends this linked test process a non-normal
+      # EXIT ({:udp_open_failed, ...}); without trapping, the test dies
+      # instead of asserting.
       Process.flag(:trap_exit, true)
+      %{busy_port: busy_port} = ctx
 
-      assert {:error, {:udp_open_failed, busy_port, :eaddrinuse}} =
-               RTPHub.start_link(camera_id: ctx.busy_id, port: ctx.busy_port, open_attempts: 3)
-
-      assert busy_port == ctx.busy_port
+      assert {:error, {:udp_open_failed, ^busy_port, :eaddrinuse}} =
+               RTPHub.start_link(camera_id: ctx.busy_id, port: busy_port, open_attempts: 3)
     end
   end
 
