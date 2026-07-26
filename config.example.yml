@@ -50,11 +50,24 @@ retention:
 # integrations:
 #   token: "replace-with-a-long-random-secret"
 
+# Named plugin groups: one process serves every camera that names it, launched
+# with a --cameras-json array of its members instead of the per-camera flags.
+# Use this for an accelerator only one process can hold at a time (a Coral Edge
+# TPU is the motivating case); otherwise give each camera its own inline
+# command below. A group is restarted only when its command, membership, or a
+# member's min_score or UDP port changes — never when a member camera stops.
+# plugins:
+#   detect:
+#     command: ./cairn-detect --model yolov10n.onnx --labels coco.names
+
 cameras: []
 #  - id: front_door
 #    rtsp_url: rtsp://user:pass@192.168.1.10:554/stream1
-#    # Inference plugin command (argv or string). Receives RTP on an
-#    # assigned UDP port, prints ndjson detections on stdout.
+#    # Inference plugin. A list, or a string with whitespace, is an inline
+#    # command run as this camera's own process; a single whitespace-free
+#    # token names a group under `plugins:` above (undefined ⇒ config error).
+#    # An inline command of one token must therefore be a one-element list.
+#    # Receives RTP on an assigned UDP port, prints ndjson detections on stdout.
 #    plugin: ["python3", "plugins/cpu-reference/main.py"]
 #    min_score:
 #      default: 0.5
