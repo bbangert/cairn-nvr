@@ -268,19 +268,26 @@ impl Labels {
     }
 }
 
-/// Spatial dims declared by an NCHW model input, if it pins them.
+/// Spatial dims declared by a `[N, 3, H, W]` model input, if it pins them.
 ///
-/// `None` covers every shape we cannot take a size from: a non-tensor input,
-/// a rank we do not recognise, and — the common case — an export with dynamic
-/// axes, where onnxruntime reports a symbolic dimension as `-1`.
+/// Only a confidently NCHW 3-channel shape yields a size. Everything else —
+/// a non-tensor input, a rank other than 4, an NHWC `[1, H, W, 3]`, a dynamic
+/// or non-3 channel axis, and the common case of an export with dynamic
+/// spatial axes (which onnxruntime reports as `-1`) — returns `None` and
+/// leaves the size to `--input-size`.
+///
+/// The channel axis is checked rather than skipped over because the whole
+/// pipeline hardcodes 3-channel RGB: [`RgbScaler`] emits RGB24 and
+/// [`InputSize::tensor_len`] packs `3 * w * h`. Without the check an NHWC
+/// export reads as `w = 3`, which builds a 3-pixel-wide scaler and a garbage
+/// tensor before onnxruntime ever sees the mismatch.
+///
+/// [`RgbScaler`]: crate::decode::RgbScaler
 fn declared_input_size(dtype: &ValueType) -> Option<InputSize> {
     let ValueType::Tensor { shape, .. } = dtype else {
         return None;
     };
-    // NCHW: H and W are the last two dims. Rank is checked rather than assumed
-    // so a [N, H, W, C] or 3-D input falls through to --input-size instead of
-    // silently transposing.
-    if shape.len() != 4 {
+    if shape.len() != 4 || shape[1] != 3 {
         return None;
     }
     let (h, w) = (shape[2], shape[3]);
@@ -1136,6 +1143,19 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn a_channels_last_input_declares_nothing() {
+        // [1, H, W, 3] is rank 4 like NCHW, so only the channel axis tells
+        // them apart: read positionally it would give w=3 and build a
+        // 3-pixel-wide scaler.
+        assert_eq!(declared_input_size(&nchw([1, 640, 640, 3])), None);
+        assert_eq!(declared_input_size(&nchw([1, 352, 640, 3])), None);
+        // a dynamic or non-3 channel axis is equally unreadable
+        assert_eq!(declared_input_size(&nchw([1, -1, 640, 640])), None);
+        assert_eq!(declared_input_size(&nchw([1, 1, 640, 640])), None);
+        assert_eq!(declared_input_size(&nchw([1, 4, 640, 640])), None);
     }
 
     #[test]
