@@ -18,6 +18,14 @@ defmodule Cairn.PluginPortTest do
 
   defp config, do: %Cairn.Config{data_dir: "tmp/plugin_port_test", udp_base_port: 19_100}
 
+  defp printf(lines), do: "printf '#{Enum.join(lines, "\\n")}\\n'"
+
+  defp det_line(pts, dets), do: ~s({"pts": #{pts}, "dets": [#{Enum.join(dets, ", ")}]})
+
+  defp det(label, score, bbox) do
+    ~s({"label": "#{label}", "score": #{score}, "bbox": #{bbox}})
+  end
+
   test "build_argv appends contract arguments" do
     argv = PluginPort.build_argv(camera("c"), 17_002)
 
@@ -83,6 +91,71 @@ defmodule Cairn.PluginPortTest do
       )
 
     assert_receive {:event_started, %Cairn.Event{camera_id: ^id}}, 5_000
+    assert Process.alive?(pid)
+  end
+
+  test "invalid dets are dropped individually and the valid ones still forward" do
+    id = "plug_#{System.unique_integer([:positive])}"
+
+    malformed =
+      det_line(1, [
+        det("person", "0.9", "[0, 0, 1]"),
+        det("person", ~s("0.9"), "[0, 0, 1, 1]"),
+        det("person", "5.0", "[0, 0, 1, 1]"),
+        det("person", "0.9", "[-0.5, 0, 1, 1]"),
+        det("person", "0.9", "[0, 0, 2, 2]"),
+        det("cat", "0.8", "[0.1, 0.1, 0.2, 0.2]")
+      ])
+
+    bad_pts = det_line(~s("later"), [det("person", "0.9", "[0, 0, 1, 1]")])
+    good = det_line(3, [det("person", "0.9", "[0, 0, 1, 1]")])
+
+    command = printf([malformed, bad_pts, good]) <> "; sleep 30"
+
+    pid =
+      start_supervised!(
+        {PluginPort,
+         camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
+      )
+
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, _windows, 1, dets}}, 5_000
+    assert dets == [%{label: "cat", score: 0.8, bbox: [0.1, 0.1, 0.2, 0.2]}]
+
+    # the non-numeric pts line is dropped whole, so the next cast is the last line
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, _windows, 3, good_dets}}, 5_000
+    assert good_dets == [%{label: "person", score: 0.9, bbox: [0, 0, 1, 1]}]
+    assert Process.alive?(pid)
+  end
+
+  test "a malformed bbox never reaches the tracker through the aggregator" do
+    id = "plug_#{System.unique_integer([:positive])}"
+
+    agg =
+      start_supervised!(
+        {DetectionAggregator,
+         name: nil,
+         start_extractor: fn _c, _e -> {:ok, spawn(fn -> Process.sleep(:infinity) end)} end}
+      )
+
+    Event.subscribe()
+
+    # a 3-element bbox used to be tracked, then crash Tracker.iou/2 on the
+    # next same-label batch, taking every camera's event tracking with it
+    command =
+      printf([
+        det_line(1, [det("person", "0.9", "[0, 0, 1]")]),
+        det_line(2, [det("person", "0.9", "[0, 0, 1, 1]")])
+      ]) <> "; sleep 30"
+
+    pid =
+      start_supervised!(
+        {PluginPort,
+         camera: camera(id), config: config(), index: 0, command: command, aggregator: agg}
+      )
+
+    assert_receive {:event_started, %Event{camera_id: ^id} = event}, 5_000
+    assert [%{label: "person"}] = event.labels
+    assert Process.alive?(agg)
     assert Process.alive?(pid)
   end
 

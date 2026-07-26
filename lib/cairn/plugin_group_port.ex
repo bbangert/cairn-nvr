@@ -13,7 +13,8 @@ defmodule Cairn.PluginGroupPort do
   Every line must carry `camera_id`; it is routed to
   `Cairn.DetectionAggregator` with that camera's config and effective
   windows. Lines for an unknown or missing camera are dropped, as are
-  malformed ones — counted always, logged periodically. Exit -> jittered
+  malformed ones and individual detections `Cairn.PluginProtocol` rejects —
+  counted always, logged periodically. Exit -> jittered
   backoff respawn, same policy as `Cairn.PluginPort`.
 
   The whole group shares one failure domain: a crash restarts every member's
@@ -28,10 +29,11 @@ defmodule Cairn.PluginGroupPort do
   require Logger
 
   alias Cairn.Config
+  alias Cairn.PluginProtocol
 
   @backoff_min_ms 1_000
   @backoff_max_ms 30_000
-  @max_line 8_192
+  @max_line 65_536
   # A plugin pointed at the wrong group produces an undeliverable line per
   # frame per camera, and this log shares its volume with the recordings.
   @drop_log_every 100
@@ -158,7 +160,8 @@ defmodule Cairn.PluginGroupPort do
 
   defp handle_line(line, state) do
     case Jason.decode(line) do
-      {:ok, %{"camera_id" => camera_id, "pts" => pts, "dets" => dets}} when is_list(dets) ->
+      {:ok, %{"camera_id" => camera_id, "pts" => pts, "dets" => dets}}
+      when is_number(pts) and is_list(dets) ->
         route(state, camera_id, pts, dets)
 
       {:ok, _other} ->
@@ -173,7 +176,6 @@ defmodule Cairn.PluginGroupPort do
     case Map.fetch(state.routes, camera_id) do
       {:ok, {cam, windows}} ->
         forward(state, cam, windows, pts, dets)
-        state
 
       :error ->
         note_drop(state, "line for unknown camera #{preview(camera_id)}")
@@ -200,14 +202,18 @@ defmodule Cairn.PluginGroupPort do
   defp preview(other), do: inspect(other, limit: 3, printable_limit: @id_preview)
 
   defp forward(state, cam, windows, pts, dets) do
-    dets =
-      for %{"label" => label, "score" => score, "bbox" => bbox} <- dets,
-          is_binary(label) and is_number(score) and is_list(bbox) do
-        %{label: label, score: score / 1, bbox: bbox}
-      end
+    {dets, invalid} = PluginProtocol.validate_dets(dets)
 
     aggregator = Keyword.get(state.opts, :aggregator, Cairn.DetectionAggregator)
     Cairn.DetectionAggregator.detections(aggregator, cam, windows, pts, dets)
+
+    note_invalid_dets(state, invalid)
+  end
+
+  defp note_invalid_dets(state, 0), do: state
+
+  defp note_invalid_dets(state, count) do
+    Enum.reduce(1..count//1, state, fn _, state -> note_drop(state, "invalid det") end)
   end
 
   defp spawn_plugin(state) do

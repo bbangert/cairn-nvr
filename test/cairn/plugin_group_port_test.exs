@@ -44,8 +44,15 @@ defmodule Cairn.PluginGroupPortTest do
   end
 
   defp det_line(camera_id, pts, score) do
-    ~s({"camera_id": "#{camera_id}", "pts": #{pts}, ) <>
-      ~s("dets": [{"label": "person", "score": #{score}, "bbox": [0,0,1,1]}]})
+    line(camera_id, pts, [det("person", score, "[0,0,1,1]")])
+  end
+
+  defp line(camera_id, pts, dets) do
+    ~s({"camera_id": "#{camera_id}", "pts": #{pts}, "dets": [#{Enum.join(dets, ", ")}]})
+  end
+
+  defp det(label, score, bbox) do
+    ~s({"label": "#{label}", "score": #{score}, "bbox": #{bbox}})
   end
 
   defp printf(lines), do: "printf '#{Enum.join(lines, "\\n")}\\n'"
@@ -121,13 +128,72 @@ defmodule Cairn.PluginGroupPortTest do
 
   test "over-long lines are skipped and the next line still routes" do
     a = camera("gp_long_#{System.unique_integer([:positive])}")
-    long = String.duplicate("x", 9_000)
+    long = String.duplicate("x", 70_000)
 
     command = printf([long, det_line(a.id, 7, 0.9)]) <> "; sleep 30"
     pid = start_group_port([a], command: command, aggregator: self())
 
     a_id = a.id
     assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _windows, 7, _dets}}, 5_000
+    assert Process.alive?(pid)
+  end
+
+  test "invalid dets are dropped individually and the valid ones still route" do
+    a = camera("gp_det_#{System.unique_integer([:positive])}")
+
+    malformed =
+      line(a.id, 1, [
+        det("person", "0.9", "[0, 0, 1]"),
+        det("person", ~s("0.9"), "[0, 0, 1, 1]"),
+        det("person", "5.0", "[0, 0, 1, 1]"),
+        det("person", "0.9", "[-0.5, 0, 1, 1]"),
+        det("person", "0.9", "[0, 0, 2, 2]"),
+        det("cat", "0.8", "[0.1, 0.1, 0.2, 0.2]")
+      ])
+
+    bad_pts = line(a.id, ~s("later"), [det("person", "0.9", "[0, 0, 1, 1]")])
+    good = line(a.id, 3, [det("person", "0.9", "[0, 0, 1, 1]")])
+
+    command = printf([malformed, bad_pts, good]) <> "; sleep 30"
+    pid = start_group_port([a], command: command, aggregator: self())
+
+    a_id = a.id
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _windows, 1, dets}}, 5_000
+    assert dets == [%{label: "cat", score: 0.8, bbox: [0.1, 0.1, 0.2, 0.2]}]
+
+    # the non-numeric pts line is dropped whole, so the next cast is the last line
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _windows, 3, good_dets}},
+                   5_000
+
+    assert good_dets == [%{label: "person", score: 0.9, bbox: [0, 0, 1, 1]}]
+    assert Process.alive?(pid)
+  end
+
+  test "a malformed bbox never reaches the tracker through the aggregator" do
+    a = camera("gp_bbox_#{System.unique_integer([:positive])}")
+
+    agg =
+      start_supervised!(
+        {DetectionAggregator,
+         name: nil,
+         start_extractor: fn _c, _e -> {:ok, spawn(fn -> Process.sleep(:infinity) end)} end}
+      )
+
+    Event.subscribe()
+
+    # a 3-element bbox used to be tracked, then crash Tracker.iou/2 on the
+    # next same-label batch, taking every camera's event tracking with it
+    command =
+      printf([
+        line(a.id, 1, [det("person", "0.9", "[0, 0, 1]")]),
+        line(a.id, 2, [det("person", "0.9", "[0, 0, 1, 1]")])
+      ]) <> "; sleep 30"
+
+    pid = start_group_port([a], command: command, aggregator: agg)
+
+    a_id = a.id
+    assert_receive {:event_started, %Event{camera_id: ^a_id}}, 5_000
+    assert Process.alive?(agg)
     assert Process.alive?(pid)
   end
 

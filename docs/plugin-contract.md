@@ -57,7 +57,7 @@ A plugin serving a group is configured with one argument instead — see
 ## Output
 
 One JSON object per line on **stdout** (ndjson), flushed per line, at most
-8192 bytes per line:
+65536 bytes (64 KiB) per line:
 
 ```json
 {"camera_id": "front_door", "pts": 90000, "dets": [
@@ -70,8 +70,11 @@ One JSON object per line on **stdout** (ndjson), flushed per line, at most
   `[x, y, w, h]` normalized to 0..1.
 - Emit at whatever rate you sample; ~5 fps is plenty. Empty `dets` lines
   are fine (and useful as a liveness signal).
-- Malformed lines are logged and dropped by Cairn — they will not crash
-  anything, but they also won't detect anything.
+- Malformed lines are dropped by Cairn — they will not crash anything, but
+  they also won't detect anything. A detection that breaks the rules above
+  (`w`/`h` must also be greater than zero, `label` at most 64 bytes) is
+  dropped on its own; the rest of the line still counts. Drops are counted
+  and logged periodically.
 
 ## Logging
 
