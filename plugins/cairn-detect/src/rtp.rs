@@ -134,6 +134,20 @@ impl Drop for SdpFile {
 /// dead port surfaces as a plugin crash in Cairn's log rather than a silent
 /// spin.
 pub fn open_stream(port: u16) -> Result<AVFormatContextInput> {
+    open_stream_within(port, MAX_OPEN_ATTEMPTS)
+}
+
+/// One open attempt, for callers that own their own retry policy.
+///
+/// Multiplexed mode re-opens a dark member forever on its own backoff
+/// (`multiplex::stream_loop`), so it must not also pay the 12x5s budget —
+/// nor log a per-attempt line for every cycle of a camera that is simply
+/// stopped.
+pub fn open_stream_once(port: u16) -> Result<AVFormatContextInput> {
+    open_stream_within(port, 1)
+}
+
+fn open_stream_within(port: u16, max_attempts: u32) -> Result<AVFormatContextInput> {
     let sdp = SdpFile::write(port)?;
     let url = CString::new(sdp.path.to_string_lossy().as_bytes())
         .context("sdp path contains a NUL byte")?;
@@ -141,7 +155,8 @@ pub fn open_stream(port: u16) -> Result<AVFormatContextInput> {
         anyhow!("libavformat has no sdp demuxer; this build of FFmpeg cannot read RTP")
     })?;
 
-    for attempt in 1..=MAX_OPEN_ATTEMPTS {
+    let mut last_error = None;
+    for attempt in 1..=max_attempts {
         let mut options = Some(stream_options());
         match AVFormatContextInput::builder()
             .url(&url)
@@ -151,17 +166,19 @@ pub fn open_stream(port: u16) -> Result<AVFormatContextInput> {
         {
             Ok(input) => return Ok(input),
             Err(e) => {
-                eprintln!(
-                    "stream open attempt {attempt}/{MAX_OPEN_ATTEMPTS} failed ({e}); waiting for a keyframe"
-                );
-                if attempt < MAX_OPEN_ATTEMPTS {
+                if attempt < max_attempts {
+                    eprintln!(
+                        "stream open attempt {attempt}/{max_attempts} failed ({e}); waiting for a keyframe"
+                    );
                     sleep(OPEN_RETRY);
                 }
+                last_error = Some(e);
             }
         }
     }
     Err(anyhow!(
-        "no decodable stream on udp port {port} after {MAX_OPEN_ATTEMPTS} attempts"
+        "no decodable stream on udp port {port} after {max_attempts} attempts: {}",
+        last_error.expect("a failed open always records its error")
     ))
 }
 

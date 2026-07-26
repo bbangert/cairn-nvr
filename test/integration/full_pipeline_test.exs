@@ -46,7 +46,7 @@ defmodule Cairn.FullPipelineTest do
     camera = %Camera{
       id: "e2e_cam",
       rtsp_url: "file://" <> @fixture,
-      plugin: ["elixir", @mock, "--timeline", timeline, "--hold"],
+      plugin: {:inline, ["elixir", @mock, "--timeline", timeline, "--hold"]},
       min_score: %{"default" => 0.5}
     }
 

@@ -1,8 +1,8 @@
 defmodule Cairn.Boot do
   @moduledoc """
   One-shot boot task, run after the Repo (and migrations) are up:
-  reconciles the event index with disk (Phase 5), then starts camera
-  trees from the active config.
+  reconciles the event index with disk (Phase 5), then starts plugin groups
+  and camera trees from the active config.
   """
 
   use Task, restart: :transient
@@ -15,6 +15,7 @@ defmodule Cairn.Boot do
   def run(_opts) do
     config = Cairn.Config.Server.get()
     Cairn.Reconciler.run(config)
+    Cairn.PluginGroupSupervisor.sync(config)
     Cairn.CameraSupervisor.sync(config)
   end
 end

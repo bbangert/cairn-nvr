@@ -30,10 +30,15 @@ impl ScoreFloors {
     pub fn parse(json: &str) -> Result<Self> {
         let raw: HashMap<String, f64> = serde_json::from_str(json)
             .context("--min-score-json is not a JSON object of number")?;
-        Ok(Self {
+        Ok(Self::from_map(raw))
+    }
+
+    /// Same floors from an already-decoded map (the `--cameras-json` form).
+    pub fn from_map(raw: HashMap<String, f64>) -> Self {
+        Self {
             default: raw.get("default").copied().unwrap_or(0.5),
             by_label: raw,
-        })
+        }
     }
 
     pub fn floor_for(&self, label: &str) -> f64 {
