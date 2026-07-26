@@ -212,8 +212,8 @@ defmodule Cairn.Config do
   # plugin" error on top of the group's error.
   defp declared_plugin_names(map) do
     case Map.get(map, "plugins") do
-      plugins when is_map(plugins) -> MapSet.new(Map.keys(plugins), &to_string/1)
-      _other -> MapSet.new()
+      plugins when is_map(plugins) -> Enum.map(Map.keys(plugins), &to_string/1)
+      _other -> []
     end
   end
 
@@ -222,7 +222,7 @@ defmodule Cairn.Config do
       MapSet.member?(names, name) ->
         {%{cam | plugin: {:group, name}}, acc}
 
-      MapSet.member?(declared, name) ->
+      name in declared ->
         {%{cam | plugin: nil}, acc}
 
       true ->
