@@ -28,7 +28,7 @@ use crossbeam_channel::{bounded, Receiver};
 use rsmpeg::ffi;
 
 use decode::{DecoderKind, Sample};
-use infer::{Detector, Labels, ScoreFloors};
+use infer::{Detector, InputSize, Labels, ScoreFloors};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -69,6 +69,11 @@ struct Args {
     #[arg(long)]
     labels: Option<PathBuf>,
 
+    /// Model input geometry, `N` (square) or `WxH`. Read from the model when
+    /// omitted; required for a model with dynamic spatial dims.
+    #[arg(long, value_parser = InputSize::parse)]
+    input_size: Option<InputSize>,
+
     /// Decode backend. Probed at startup; any failure falls back to software.
     #[arg(long, value_enum, default_value_t = DecoderKind::Auto)]
     decoder: DecoderKind,
@@ -95,9 +100,11 @@ fn run() -> Result<()> {
 fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
     let specs = multiplex::parse_specs(cameras_json)?;
     let labels = Labels::load(args.labels.as_deref())?;
-    let detector = Detector::open(&args.model)?;
+    // Before any decoder: every scaler and GPU filter graph is built for the
+    // size the model resolves to.
+    let detector = Detector::open(&args.model, args.input_size, &labels)?;
     eprintln!(
-        "cairn-detect up: cameras=[{}] model={} input={} decoder={}",
+        "cairn-detect up: cameras=[{}] model={} input={} input size={} ({}) layout={} decoder={}",
         specs
             .iter()
             .map(|spec| format!("{}@{}", spec.id, spec.udp_port))
@@ -105,6 +112,9 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
             .join(", "),
         args.model.display(),
         detector.input_name(),
+        detector.input_size(),
+        detector.input_size_source(),
+        detector.layout_summary(),
         args.decoder
     );
 
@@ -124,13 +134,18 @@ fn run_single(args: &Args) -> Result<()> {
         .expect("clap requires --udp-port unless --cameras-json is given");
     let floors = ScoreFloors::parse(args.min_score_json.as_deref().unwrap_or("{}"))?;
     let labels = Labels::load(args.labels.as_deref())?;
-    let detector = Detector::open(&args.model)?;
+    // Before the stream opens: `decode::open` below needs the resolved size.
+    let detector = Detector::open(&args.model, args.input_size, &labels)?;
+    let input_size = detector.input_size();
     eprintln!(
-        "cairn-detect up: camera={} udp={} model={} input={} decoder={}",
+        "cairn-detect up: camera={} udp={} model={} input={} input size={} ({}) layout={} decoder={}",
         camera_id,
         udp_port,
         args.model.display(),
         detector.input_name(),
+        input_size,
+        detector.input_size_source(),
+        detector.layout_summary(),
         args.decoder
     );
 
@@ -153,7 +168,7 @@ fn run_single(args: &Args) -> Result<()> {
         let stream = &input.streams()[stream_index];
         (
             stream.time_base,
-            decode::open(args.decoder, &stream.codecpar())?,
+            decode::open(args.decoder, &stream.codecpar(), input_size)?,
         )
     };
 
@@ -230,6 +245,28 @@ mod tests {
         assert!(parse(&["--cameras-json", "[]", "--camera-id", "front"]).is_err());
         assert!(parse(&["--cameras-json", "[]", "--udp-port", "17000"]).is_err());
         assert!(parse(&["--cameras-json", "[]", "--min-score-json", "{}"]).is_err());
+    }
+
+    #[test]
+    fn input_size_is_optional_and_accepts_both_forms() {
+        let base = &["--camera-id", "front", "--udp-port", "17000"];
+        let with = |spec: &str| {
+            let mut argv = base.to_vec();
+            argv.extend_from_slice(&["--input-size", spec]);
+            parse(&argv)
+        };
+        // absent means "take it from the model"
+        assert!(parse(base).unwrap().input_size.is_none());
+        assert_eq!(
+            with("320").unwrap().input_size,
+            Some(InputSize::square(320))
+        );
+        assert_eq!(
+            with("640x352").unwrap().input_size,
+            Some(InputSize { w: 640, h: 352 })
+        );
+        assert!(with("0").is_err());
+        assert!(with("huge").is_err());
     }
 
     #[test]
