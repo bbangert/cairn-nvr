@@ -24,9 +24,10 @@ closes it. Details in `docs/architecture.md`.
 
 - **Live view**: MSE over a Phoenix channel (default), HLS fallback,
   WebRTC for sub-second latency.
-- **Plugins**: any language — H.264 RTP in, ndjson out
-  (`docs/plugin-contract.md`; a mock plugin and a Python CPU reference
-  implementation ship in-tree).
+- **Plugins**: any language — H.264 RTP in, ndjson out. One process per
+  camera, or one shared "group" process serving several cameras when the
+  accelerator can only be held by one process (`docs/plugin-contract.md`;
+  a mock plugin and a Python CPU reference implementation ship in-tree).
 - **Retention**: per-label day counts, plus emergency cleanup that
   deletes oldest events when disk runs low.
 
@@ -54,10 +55,11 @@ See `config.example.yml` — every key is documented inline. Summary:
 | `data_dir` | all state: `cairn.db`, `events/`, `snapshots/`, `log/` (env `CAIRN_DATA_DIR` wins) |
 | `stall_seconds` | silent-stream watchdog before ffmpeg is bounced |
 | `free_space_min_mb` | emergency-cleanup threshold |
-| `udp.base_port` / `udp.range` | loopback ports for plugins + WebRTC taps (2 per camera) |
+| `udp.base_port` / `udp.range` | loopback ports for plugins + WebRTC taps (4 per camera — each RTP port reserves the next for RTCP) |
 | `events.pre/post/max_*_seconds` | clip windows (per-camera overridable) |
 | `retention.days` / `retention.per_label` | pruning (camera overrides win; multi-label events keep the longest) |
-| `cameras[]` | `id`, `rtsp_url`, `plugin` (argv), `min_score` per label, `extra_ffmpeg_args`, `transcode`, `retention` |
+| `cameras[]` | `id`, `rtsp_url`, `plugin` (argv or multi-word string ⇒ its own process; single token ⇒ a `plugins:` group name), `min_score` per label, `extra_ffmpeg_args`, `transcode`, `retention` |
+| `plugins` | named plugin groups (`name: {command: ...}`) — one process serving every camera that names it |
 | `integrations.token` | bearer token that enables the Home Assistant API (see below); absent ⇒ `/api` disabled |
 
 Non-H.264 cameras: Cairn probes each stream and warns. Opt-in

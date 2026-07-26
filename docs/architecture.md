@@ -48,7 +48,7 @@ flowchart TD
 The architecture has three independent data planes that meet only at well-defined boundaries:
 
 - **Encoded video plane.** RTSP comes in, gets demuxed once by ffmpeg, and fans out three ways. ffmpeg owns this entire plane and BEAM never sees raw network bytes.
-- **Inference plane.** The plugin owns decode and inference end-to-end. Its only inputs are H.264 RTP packets; its only outputs are detection events as JSON.
+- **Inference plane.** The plugin owns decode and inference end-to-end. Its only inputs are H.264 RTP packets; its only outputs are detection events as JSON. It runs as one process per camera, or — for hardware a single process must hold exclusively — one process per named plugin group serving several cameras.
 - **Event plane.** Detection aggregation, event lifecycle, and clip extraction happen in BEAM. This plane consumes from the encoded plane (via PubSub) and produces files on disk.
 
 The separation is deliberate: each plane has different latency, throughput, and failure characteristics, and centralizing them in a single process would force the worst case of all three.
@@ -98,7 +98,7 @@ The plugin is a `Port`-supervised external process. It runs whatever decode and 
 
 Inputs:
 
-- H.264 RTP packets on a fixed UDP port assigned by Elixir at plugin start.
+- H.264 RTP packets on a fixed UDP port per camera served, assigned by Elixir at plugin start.
 - Camera ID and configuration provided as CLI arguments or environment variables.
 
 Outputs:
@@ -110,6 +110,14 @@ Outputs:
 - Log messages on stderr.
 
 The plugin does *not* handle RTSP, fragment writing, muxing, ring buffering, event lifecycle, or WebRTC. A new plugin author targeting a different accelerator only needs to implement the decode-to-inference pipeline; everything else is provided by the Elixir host.
+
+### One process per camera, or one per group
+
+Two process shapes share this contract. The default is one plugin process per camera. The alternative is a named **plugin group**: a command declared once under a top-level `plugins:` map, joined by every camera that says `plugin: <name>`, and launched as a single process with a `--cameras-json` array of its members instead of the per-camera flags. Group output is the same ndjson, except `camera_id` is required — it is the only thing routing a line, since one process now speaks for several cameras.
+
+The motivating case is an accelerator that only one process can hold at a time (a Coral Edge TPU), which a process per camera can never share. The mode is a config-shape decision, not a count: a group with one member is still launched as a group.
+
+A group's lifecycle is deliberately decoupled from its members. It is restarted only when its config changes — the command, the membership, a member's score floors, or a member's UDP port — and never by anything a camera does at runtime, so a stopped member simply stops sending packets. Plugins serving a group must therefore treat a silent stream as normal and re-open it forever rather than exit: the group is one failure domain, and exiting over one stream stops detection for every member. `docs/plugin-contract.md` is the authoritative spec.
 
 ## The ring buffer
 
@@ -279,9 +287,10 @@ NVR.Supervisor
 │   ├── NVR.Camera (one per camera, Supervisor)
 │   │   ├── NVR.FFmpegPort         (supervises ffmpeg subprocess)
 │   │   ├── NVR.RingBuffer         (in-memory fragment buffer)
-│   │   ├── NVR.PluginPort         (supervises plugin subprocess)
+│   │   ├── NVR.PluginPort         (supervises plugin subprocess; absent for group members)
 │   │   └── NVR.RTPHub             (UDP receiver for WebRTC)
 │   └── ... (more cameras)
+├── NVR.PluginGroupSupervisor      (one plugin Port per named group, serving N cameras)
 ├── NVR.DetectionAggregator        (receives JSON from all plugin ports)
 ├── NVR.EventSupervisor (DynamicSupervisor)
 │   └── NVR.EventExtractor         (one per active event, transient)
@@ -291,6 +300,7 @@ NVR.Supervisor
 Restart strategies:
 
 - A camera supervisor uses `:rest_for_one`: if ffmpeg dies, restart it (state is recoverable from the camera). If the ring buffer dies, restart ffmpeg too (since the new ring won't have the old fragments anyway).
+- A plugin group sits outside any one camera's supervisor, because it outlives them individually: it is started and restarted only on config change, and members stopping or starting leave it running. That makes the group one failure domain — a crash costs every member detection until the backoff restart — which is the price of sharing the device.
 - Event extractors are `:temporary` — if one crashes, the event is lost (logged as `partial` in the index) but other events continue.
 - The aggregator has a small persistent state (active events) checkpointed to ETS for crash recovery.
 
@@ -309,7 +319,7 @@ Approximate budget for 8 cameras at 1080p H.264, 30fps, 4 Mbps:
 
 The two scaling dimensions worth watching:
 
-- **Inference budget.** Adding cameras hits this first. The plugin's per-camera cost is fixed; total cost scales linearly.
+- **Inference budget.** Adding cameras hits this first. With a plugin process per camera, the per-camera cost is fixed and the total scales linearly. A plugin group instead shares one process — and one model, and one accelerator — across its members, so the ceiling is that device's throughput rather than the camera count; for a device only one process can hold (Coral Edge TPU), it is the only shape that works at all.
 - **Disk capacity.** Long retention windows for event clips dominate. Continuous recording, if added, dominates by an order of magnitude.
 
 Memory and BEAM CPU are not the bottleneck and are not expected to become so.

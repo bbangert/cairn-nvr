@@ -2,7 +2,8 @@
 //!
 //! The whole point is what does *not* happen here: decoded surfaces stay on
 //! the device at full frame rate, and only the ~5 fps that survive the sample
-//! gate are scaled to 640x640 *on the GPU* and then downloaded. Downloading
+//! gate are scaled to the model's input size *on the GPU* and then
+//! downloaded. Downloading
 //! first and scaling on the CPU would move ~34 Mbps of full-resolution frames
 //! through system memory and eat the entire saving, so a backend without a
 //! GPU scaler is treated as unavailable rather than silently taking that
@@ -18,8 +19,8 @@ use rsmpeg::avutil::{AVFrame, AVHWDeviceContext};
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 
-use crate::decode::{cap_frame_size, Decoder, Rgb640};
-use crate::infer::INPUT_SIZE;
+use crate::decode::{cap_frame_size, Decoder, RgbScaler};
+use crate::infer::InputSize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HwBackend {
@@ -90,12 +91,15 @@ impl HwBackend {
     /// Filter graph run on sampled frames only.
     ///
     /// NV12 rather than RGB because every backend's scaler supports it; the
-    /// 640x640 NV12 -> RGB24 convert afterwards is 0.4 MP of CPU work per
-    /// sample. `format=nv12` after `hwdownload` pins the download format,
-    /// which otherwise depends on the frames pool's software format.
-    fn filter_spec(self) -> Option<String> {
+    /// NV12 -> RGB24 convert afterwards is a fraction of a megapixel of CPU
+    /// work per sample. `format=nv12` after `hwdownload` pins the download
+    /// format, which otherwise depends on the frames pool's software format.
+    fn filter_spec(self, size: InputSize) -> Option<String> {
         self.scale_filter().map(|scale| {
-            format!("{scale}=w={INPUT_SIZE}:h={INPUT_SIZE}:format=nv12,hwdownload,format=nv12")
+            format!(
+                "{scale}=w={}:h={}:format=nv12,hwdownload,format=nv12",
+                size.w, size.h
+            )
         })
     }
 }
@@ -130,13 +134,14 @@ pub struct HwDecoder {
     /// Built on the first hardware frame: the graph needs the decoder's frames
     /// pool, which does not exist until something has been decoded.
     graph: Option<(AVFilterGraph, GraphKey)>,
-    rgb: Rgb640,
+    size: InputSize,
+    rgb: RgbScaler,
     /// Set once we have warned that the backend is not producing device frames.
     degraded: bool,
 }
 
 impl HwDecoder {
-    pub fn open(backend: HwBackend, codecpar: &AVCodecParameters) -> Result<Self> {
+    pub fn open(backend: HwBackend, codecpar: &AVCodecParameters, size: InputSize) -> Result<Self> {
         if let Some(scale) = backend.scale_filter() {
             let name = CString::new(scale).expect("filter names are ascii");
             if AVFilter::get_by_name(&name).is_none() {
@@ -161,7 +166,7 @@ impl HwDecoder {
         ctx.open(None)
             .map_err(|e| anyhow!("opening the {backend} decoder: {e}"))?;
 
-        match backend.filter_spec() {
+        match backend.filter_spec(size) {
             Some(spec) => eprintln!(
                 "decoder: {backend} hardware ({}), sampled frames via \"{spec}\"",
                 codec.name().to_string_lossy()
@@ -176,7 +181,8 @@ impl HwDecoder {
             ctx,
             backend,
             graph: None,
-            rgb: Rgb640::new()?,
+            size,
+            rgb: RgbScaler::new(size)?,
             degraded: false,
         })
     }
@@ -185,7 +191,7 @@ impl HwDecoder {
     fn build_graph(&self, frame: &AVFrame) -> Result<AVFilterGraph> {
         let spec = self
             .backend
-            .filter_spec()
+            .filter_spec(self.size)
             .ok_or_else(|| anyhow!("{} has no filter graph", self.backend))?;
         let spec = CString::new(spec).expect("filter specs are ascii");
 
@@ -328,7 +334,7 @@ impl Decoder for HwDecoder {
                     Ok(frame) => latest = Some(frame),
                     Err(RsmpegError::BufferSinkDrainError) => break,
                     Err(e) => {
-                        return Err(e).context("reading the downloaded 640x640 frame");
+                        return Err(e).context("reading the downloaded frame");
                     }
                 }
             }
@@ -359,36 +365,50 @@ mod tests {
         // hwdownload must never come before the scaler, or a full-resolution
         // frame crosses the bus.
         for backend in [HwBackend::Vaapi, HwBackend::Qsv, HwBackend::Nvdec] {
-            let spec = backend.filter_spec().expect("gpu backends have a graph");
+            let spec = backend
+                .filter_spec(InputSize::square(640))
+                .expect("gpu backends have a graph");
             let scale = spec.find(backend.scale_filter().unwrap()).unwrap();
             let download = spec.find("hwdownload").unwrap();
             assert!(scale < download, "{backend}: {spec}");
-            assert!(
-                spec.contains(&format!("w={INPUT_SIZE}:h={INPUT_SIZE}")),
-                "{spec}"
-            );
+            assert!(spec.contains("w=640:h=640"), "{spec}");
         }
     }
 
     #[test]
     fn filter_specs_are_the_documented_ones() {
+        let square = InputSize::square(640);
         assert_eq!(
-            HwBackend::Vaapi.filter_spec().unwrap(),
+            HwBackend::Vaapi.filter_spec(square).unwrap(),
             "scale_vaapi=w=640:h=640:format=nv12,hwdownload,format=nv12"
         );
         assert_eq!(
-            HwBackend::Qsv.filter_spec().unwrap(),
+            HwBackend::Qsv.filter_spec(square).unwrap(),
             "scale_qsv=w=640:h=640:format=nv12,hwdownload,format=nv12"
         );
         assert_eq!(
-            HwBackend::Nvdec.filter_spec().unwrap(),
+            HwBackend::Nvdec.filter_spec(square).unwrap(),
             "scale_cuda=w=640:h=640:format=nv12,hwdownload,format=nv12"
         );
     }
 
     #[test]
+    fn a_non_square_input_keeps_w_and_h_apart() {
+        // Transposing here would scale to the wrong aspect *and* mismatch the
+        // tensor the same size builds, so the axes are asserted separately.
+        assert_eq!(
+            HwBackend::Vaapi
+                .filter_spec(InputSize { w: 640, h: 352 })
+                .unwrap(),
+            "scale_vaapi=w=640:h=352:format=nv12,hwdownload,format=nv12"
+        );
+    }
+
+    #[test]
     fn v4l2m2m_has_no_graph() {
-        assert!(HwBackend::V4l2.filter_spec().is_none());
+        assert!(HwBackend::V4l2
+            .filter_spec(InputSize::square(640))
+            .is_none());
         assert!(HwBackend::V4l2.device_type().is_none());
     }
 
@@ -452,7 +472,7 @@ mod tests {
             raw.height = 1080;
         }
         for backend in [HwBackend::Vaapi, HwBackend::Qsv, HwBackend::Nvdec] {
-            let _ = HwDecoder::open(backend, &codecpar);
+            let _ = HwDecoder::open(backend, &codecpar, InputSize::square(640));
         }
     }
 }

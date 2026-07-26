@@ -26,7 +26,7 @@ use serde::Deserialize;
 
 use crate::decode::{self, DecoderKind, Sample, SampleSink};
 use crate::emit;
-use crate::infer::{Detector, Labels, ScoreFloors};
+use crate::infer::{Detector, InputSize, Labels, ScoreFloors};
 use crate::rtp;
 
 /// First wait after a stream drops, doubled up to [`REOPEN_MAX`].
@@ -78,6 +78,9 @@ pub fn run(
     labels: &Labels,
 ) -> Result<()> {
     let floors = floors_for(specs);
+    // One resolved size for the whole group: the members share the detector,
+    // so they share the geometry every decoder has to produce.
+    let input_size = detector.input_size();
     let mut slots = Vec::with_capacity(specs.len());
 
     for spec in specs {
@@ -86,7 +89,7 @@ pub fn run(
         let owned = spec.clone();
         thread::Builder::new()
             .name(format!("stream-{}", spec.id))
-            .spawn(move || stream_loop(&owned, kind, &sink))
+            .spawn(move || stream_loop(&owned, kind, input_size, &sink))
             .with_context(|| format!("spawning the decode thread for camera {}", spec.id))?;
     }
 
@@ -99,13 +102,18 @@ pub fn run(
 /// 30s read timeout is fatal so Cairn restarts the process (see `run_single`
 /// in main.rs). Here the process serves other cameras that are still live,
 /// and a member's silence is an expected state rather than a fault.
-fn stream_loop(spec: &CameraSpec, kind: DecoderKind, sink: &LatestSink<Sample>) {
+fn stream_loop(
+    spec: &CameraSpec,
+    kind: DecoderKind,
+    input_size: InputSize,
+    sink: &LatestSink<Sample>,
+) {
     let mut delay = REOPEN_MIN;
     let mut failures: u64 = 0;
 
     loop {
         let started = Instant::now();
-        let outcome = open_and_run(spec, kind, sink);
+        let outcome = open_and_run(spec, kind, input_size, sink);
         if started.elapsed() >= HEALTHY_RUN {
             failures = 0;
             delay = REOPEN_MIN;
@@ -130,7 +138,12 @@ fn stream_loop(spec: &CameraSpec, kind: DecoderKind, sink: &LatestSink<Sample>) 
     }
 }
 
-fn open_and_run(spec: &CameraSpec, kind: DecoderKind, sink: &LatestSink<Sample>) -> Result<()> {
+fn open_and_run(
+    spec: &CameraSpec,
+    kind: DecoderKind,
+    input_size: InputSize,
+    sink: &LatestSink<Sample>,
+) -> Result<()> {
     let mut input = rtp::open_stream_once(spec.udp_port)?;
     let (stream_index, _) = input
         .find_best_stream(ffi::AVMEDIA_TYPE_VIDEO)
@@ -140,7 +153,7 @@ fn open_and_run(spec: &CameraSpec, kind: DecoderKind, sink: &LatestSink<Sample>)
         let stream = &input.streams()[stream_index];
         (
             stream.time_base,
-            decode::open(kind, &stream.codecpar())
+            decode::open(kind, &stream.codecpar(), input_size)
                 .with_context(|| format!("opening a decoder for camera {}", spec.id))?,
         )
     };

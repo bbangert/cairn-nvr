@@ -1,10 +1,12 @@
 # cairn-detect
 
 Cairn's shippable reference detection plugin: a single Rust binary that takes
-H.264 RTP on a UDP port and prints contract ndjson on stdout (see
+H.264 RTP on a UDP port — or on several at once, serving a whole plugin group
+from one process — and prints contract ndjson on stdout (see
 `docs/plugin-contract.md`). It decodes on the video ASIC when one is
-available, samples to ~5 fps, and runs an NMS-free YOLO model on the CPU
-through onnxruntime.
+available, samples to ~5 fps, and runs a YOLO detection model on the CPU
+through onnxruntime — either an end-to-end (NMS-free) export or a stock
+YOLOv8/YOLOv11 one, told apart automatically.
 
 It is a drop-in replacement for the Python `plugins/cpu-reference` command —
 same argv, same output, no Cairn-side changes — and it is what you should
@@ -17,9 +19,9 @@ people writing their own plugin.
 udp:127.0.0.1:{port}  ->  sdp demuxer (generated SDP, retried mid-GOP)
    -> decode (hardware if a backend opens, else software)
       -> wall-clock sample to 5 fps          <- full-rate frames end here
-         -> 640x640 RGB24 -> CHW f32 0..1    <- GPU scale + download on HW
+         -> WxH RGB24 -> CHW f32 0..1        <- GPU scale + download on HW
             -> [size-1 channel, try_send: drop when inference is behind]
-               -> onnxruntime (CPU EP) -> score gate -> ndjson on stdout
+               -> onnxruntime (CPU EP) -> decode + gate -> ndjson on stdout
 ```
 
 Everything expensive happens *after* the sample gate: a hardware decoder
@@ -69,13 +71,14 @@ directory Cairn runs from:
 cameras:
   - id: front_door
     rtsp_url: rtsp://user:pass@192.168.1.10:554/stream1
-    # Inference plugin command (argv or string). Receives RTP on an
-    # assigned UDP port, prints ndjson detections on stdout.
+    # An argv list (or a multi-word string) is an inline command: this
+    # camera's own process. Receives RTP on an assigned UDP port, prints
+    # ndjson detections on stdout.
     plugin:
       - plugins/cairn-detect/target/release/cairn-detect
       - --model
       # .onnx files are gitignored — produce this one with the export step
-      # in model/export-model.md (or drop in any NMS-free [1,N,6] model).
+      # in model/export-model.md (or drop in any supported model; see Model).
       - plugins/cairn-detect/yolov10n.onnx
       - --labels
       - plugins/cairn-detect/coco.names
@@ -89,11 +92,89 @@ cameras:
 Logs land in `{data_dir}/log/plugin-front_door.log`. `--decoder auto` is the
 default and can be omitted.
 
+To serve several cameras from one process, declare the same command once as a
+named group under `plugins:` and point cameras at it by name — see
+[Multiplexed mode](#multiplexed-mode).
+
 | flag | required | meaning |
 |------|----------|---------|
-| `--model` | yes | NMS-free ONNX detection model |
+| `--model` | yes | ONNX detection model, end-to-end `[1,N,6]` or raw `[1,4+nc,A]` (see [Model](#model)) |
 | `--labels` | no | newline-separated class names, indexed by class id; unknown ids fall back to the numeric id |
+| `--input-size` | no | model input `WxH` (or `N` for a square N×N). Read from the model when omitted; required when the model's spatial dims are dynamic |
 | `--decoder` | no | `auto` (default), `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` |
+
+## Multiplexed mode
+
+The same binary also serves a whole plugin group from one process. Reach for
+it when the hardware is the constraint rather than the camera count: an
+accelerator that only one process can hold at a time (a Coral Edge TPU is the
+motivating case) can never be shared by a process per camera, and one model
+loaded once is cheaper than N copies even where sharing is merely wasteful.
+
+Declare the command once and let cameras join it by name:
+
+```yaml
+plugins:
+  detect:
+    command:
+      - plugins/cairn-detect/target/release/cairn-detect
+      - --model
+      - plugins/cairn-detect/yolov10n.onnx
+      - --labels
+      - plugins/cairn-detect/coco.names
+
+cameras:
+  - id: front_door
+    rtsp_url: rtsp://user:pass@192.168.1.10:554/stream1
+    plugin: detect
+    min_score:
+      default: 0.5
+      person: 0.6
+  - id: driveway
+    rtsp_url: rtsp://user:pass@192.168.1.11:554/stream1
+    plugin: detect
+```
+
+Cairn then appends one argument instead of the per-camera three:
+
+| flag | required | meaning |
+|------|----------|---------|
+| `--cameras-json` | in group mode | JSON array of `{id, udp_port, min_score}`, one entry per member, in config order |
+
+It conflicts with `--camera-id`/`--udp-port`/`--min-score-json`; give one set
+or the other. Each member gets its own decode thread and its own
+newest-wins sample slot, and a single inference thread drains the slots —
+picking at random among the ready ones, so a busy camera cannot starve a quiet
+one. Score floors are applied per member. Startup logs the whole roster
+(`cameras=[front_door@17000, driveway@17004]`) to the group's shared
+`{data_dir}/log/plugin-detect.log`.
+
+Every output line carries the `camera_id` of the member it describes — in
+group mode Cairn routes by that field alone, so an untagged line has nowhere
+to go and is dropped.
+
+**A silent stream is normal here, not a fault.** Cairn leaves a group running
+when a member camera is stopped or its ffmpeg is bouncing, so each stream is
+an open → decode → log → re-open loop, forever, backing off 5 s → 30 s (reset
+after a minute of healthy run). This is the mirror image of per-camera mode,
+where a failed open or the 30 s read timeout is fatal *by design* so Cairn
+restarts the process. Only a model-load or inference failure exits, and it
+takes every member's detection down with it until the backoff restart — the
+group is one failure domain, which is exactly why per-stream trouble is kept
+per-stream.
+
+Driving it by hand, in the style of the [verify](#verifying-changes) recipe:
+
+```bash
+python3 verify/feed.py --clip /path/to/fixture.mp4 --port 17000 &
+timeout 30 ./target/release/cairn-detect \
+    --cameras-json '[{"id":"front_door","udp_port":17000,"min_score":{"default":0.5}},
+                     {"id":"driveway","udp_port":17004,"min_score":{"default":0.5}}]' \
+    --model yolov10n.onnx --labels coco.names | python3 verify/validate_ndjson.py
+```
+
+Feeding only the first port is a fine test: `driveway` just logs
+`stream down ... reopening` and the process keeps serving `front_door`.
 
 ## Decoder selection
 
@@ -106,9 +187,11 @@ the next candidate is tried, ending at software decode — a forced
 `--decoder vaapi` on a host without VAAPI runs slowly rather than
 crash-looping under Cairn's restart backoff.
 
-Sampled frames only — never the full stream — are scaled to 640x640 on the
-GPU and then downloaded, because downloading full-resolution frames would cost
-more than the decode saving:
+Sampled frames only — never the full stream — are scaled to the model input
+size on the GPU and then downloaded, because downloading full-resolution
+frames would cost more than the decode saving. The filter graphs below are
+shown for a 640x640 model; `w=`/`h=` carry whatever the resolved input size
+is:
 
 | backend | device | decoder | sampled-frame filter graph |
 |---------|--------|---------|----------------------------|
@@ -120,7 +203,7 @@ more than the decode saving:
 | `sw` | — | `h264` | none |
 
 NV12 is the download format because every backend's scaler supports it; the
-640x640 NV12 → RGB24 convert afterwards is negligible. If the FFmpeg build
+NV12 → RGB24 convert afterwards is negligible at model-input resolution. If the FFmpeg build
 lacks the backend's scaler filter, that backend is reported unavailable rather
 than silently downloading full-resolution frames.
 
@@ -129,18 +212,44 @@ only changes across restarts.
 
 ## Model
 
-The model must be **NMS-free** (YOLOv10 / YOLO26 style):
+Input is the model's **first input** — named `images` in Ultralytics exports,
+but the name is taken from the model and logged at startup, not assumed —
+float32 `[1, 3, H, W]`, RGB, 0..1, CHW. Two output
+layouts are supported, and **which one a model uses is auto-detected** — there
+is no flag, because the two shapes cannot be confused:
 
-- input `images`, float32 `[1, 3, 640, 640]`, RGB, 0..1, CHW
-- output `[1, N, 6]`, rows of `[x1, y1, x2, y2, score, class_id]` in
-  640-pixel space, sorted by score descending
+| family | output | what the plugin does |
+|--------|--------|----------------------|
+| **end-to-end / NMS-free** — YOLOv10, YOLO26 | `[1, N, 6]`, rows of `[x1, y1, x2, y2, score, class_id]` in input-pixel space, sorted by score | normalize, clamp, gate on the score floors |
+| **raw detect head** — YOLOv8, YOLOv11 (what Frigate commonly ships) | `[1, 4 + nc, A]`, channels-first over `A` anchors: `cx, cy, w, h` in input pixels then `nc` sigmoided class scores, no objectness row | argmax class per anchor, centers → corners, class-aware NMS at IoU 0.45, then the same normalize/clamp/gate |
 
-A plain YOLOv8 export (`(1, 84, 8400)`, which `plugins/cpu-reference`
-consumes) is rejected at startup — there is deliberately no NMS in this
-plugin, because the model already did it.
+`6` is the *row width* of the first layout while `A` is an anchor count that
+runs into the thousands (8400 at 640×640, scaling with the input size), so
+detection is by shape alone: from the session's output metadata at startup, or
+from the first real output when the export leaves its output shape dynamic.
+Anything matching neither is rejected with the shape it saw and both expected
+forms. With `--labels` given, a raw head whose `nc` disagrees with the label
+count logs a warning and keeps running — unknown ids are emitted as numbers.
 
-**`yolov10n.onnx` (FP32) is the default.** Re-export it with ultralytics in a
-throwaway venv:
+YOLOv5's `[1, 25200, 85]` is *not* supported: it carries an objectness row
+that has to be folded into the class scores.
+
+`H` and `W` need not be 640, and need not be equal. They are read from the
+model's input shape at startup and every scaler, GPU filter graph and tensor
+in the process is built for them. An export with dynamic spatial axes declares
+nothing to read, so it needs `--input-size` (`320`, `640x352`, ...); giving
+the flag a size the model contradicts is rejected at startup rather than left
+to fail on the first frame. The startup line records the resolved size and
+layout, and where each came from:
+
+```
+cairn-detect up: camera=front udp=17000 model=yolov10n.onnx input=images \
+    input size=640x640 (from model) layout=yolov10 (from model) decoder=auto
+```
+
+**`yolov10n.onnx` (FP32) is the default**, and the end-to-end layout is the
+one to prefer: the NMS is inside the model, where it is faster and already
+tuned. Re-export it with ultralytics in a throwaway venv:
 
 ```bash
 python3 -m venv yolo-export-venv && . yolo-export-venv/bin/activate
@@ -318,15 +427,18 @@ timeout 30 ./target/release/cairn-detect --camera-id t --udp-port 17910 \
 ```
 
 Unit tests (`cargo test`) cover postprocessing, score-floor parsing, the SDP
-string, emit line-size guarding, pts rescaling, tensor packing, decoder probe
-order and the per-backend filter strings; none need network, a model, or a
-GPU.
+string, emit line-size guarding, pts rescaling, tensor packing, input-size
+parsing and resolution, output-layout detection, the raw-head decode (argmax,
+box conversion, IoU/NMS, prefilter), decoder probe order and the per-backend
+filter strings; none need network, a model, or a GPU.
 
 ## Implementation notes
 
 - Joining mid-stream is normal. The open is retried 12 times, 5 s apart, with
   a generous `analyzeduration` so the probe waits out a GOP instead of failing
   with "Invalid data found"; after that we exit loudly and let Cairn back off.
+  In multiplexed mode that budget is unbounded instead — one member's open
+  failure re-opens forever rather than taking the group's other cameras down.
 - The udp `timeout` option (30 s, matching the Python plugin's `timeout=30`)
   bounds both ends: without it a silent port blocks forever inside the probe,
   so the retry loop never gets a second attempt, and a mid-run silence parks
@@ -355,6 +467,11 @@ GPU.
   several at once.
 - Resizing is a letterbox-free stretch. Bboxes are normalized, so only ratios
   matter.
+- NMS runs for the raw layout only — an end-to-end export did it inside the
+  model — and over at most the top 300 anchors by score, which bounds an
+  O(k²) pass that would otherwise start from 8400. The prefilter feeding it
+  cuts at the *lowest* configured `min_score` floor, so it can never drop a
+  detection some per-label floor would have admitted.
 - The hardware filter graph is built on the first sampled frame, not at open:
   it needs the decoder's frames pool, which does not exist until something has
   been decoded.

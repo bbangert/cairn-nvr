@@ -24,7 +24,7 @@ use rsmpeg::swscale::SwsContext;
 use rsmpeg::UnsafeDerefMut;
 
 use crate::hwdecode::{HwBackend, HwDecoder};
-use crate::infer::INPUT_SIZE;
+use crate::infer::InputSize;
 
 pub const SAMPLE_FPS: u32 = 5;
 
@@ -58,7 +58,7 @@ impl fmt::Display for DecoderKind {
 
 pub struct Sample {
     pub pts_90k: i64,
-    /// CHW RGB f32 in 0..1, `3 * INPUT_SIZE * INPUT_SIZE` long.
+    /// CHW RGB f32 in 0..1, `3 * w * h` long for the resolved model input.
     pub tensor: Vec<f32>,
 }
 
@@ -120,13 +120,17 @@ const MAX_PIXELS: i64 = 32 * 1024 * 1024;
 /// always the last resort, including when `--decoder <hw>` names a backend
 /// explicitly. Crash-looping on a box without the hardware would be worse
 /// than running slowly on it.
-pub fn open(kind: DecoderKind, codecpar: &AVCodecParameters) -> Result<Box<dyn Decoder>> {
+pub fn open(
+    kind: DecoderKind,
+    codecpar: &AVCodecParameters,
+    size: InputSize,
+) -> Result<Box<dyn Decoder>> {
     let order = probe_order(kind);
     if order.is_empty() && kind != DecoderKind::Sw && kind != DecoderKind::Auto {
         eprintln!("decoder {kind} is not available on this platform");
     }
     for backend in order {
-        match HwDecoder::open(backend, codecpar) {
+        match HwDecoder::open(backend, codecpar, size) {
             Ok(decoder) => return Ok(Box::new(decoder)),
             Err(e) => eprintln!("hardware decoder {backend} unavailable: {e:#}"),
         }
@@ -134,7 +138,7 @@ pub fn open(kind: DecoderKind, codecpar: &AVCodecParameters) -> Result<Box<dyn D
     if kind != DecoderKind::Sw {
         eprintln!("no hardware decoder opened; falling back to software decode");
     }
-    Ok(Box::new(SwDecoder::open(codecpar)?))
+    Ok(Box::new(SwDecoder::open(codecpar, size)?))
 }
 
 /// Backends to try, in order, for a given `--decoder` value.
@@ -173,25 +177,31 @@ const AUTO_ORDER: &[HwBackend] = &[HwBackend::V4l2];
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const AUTO_ORDER: &[HwBackend] = &[];
 
-/// Scale-and-convert into the model's 640x640 RGB input.
+/// Scale-and-convert into the model's RGB input.
 ///
 /// Shared by both paths: the hardware path scales on the GPU and downloads
-/// NV12 at 640x640, then lands here for the NV12 -> RGB24 conversion.
-pub struct Rgb640 {
+/// NV12 already at the model's size, then lands here for the NV12 -> RGB24
+/// conversion.
+pub struct RgbScaler {
+    size: InputSize,
     /// Rebuilt if the input ever changes geometry or pixel format mid-run.
     sws: Option<(SwsContext, (i32, i32, i32))>,
     rgb: AVFrame,
 }
 
-impl Rgb640 {
-    pub fn new() -> Result<Self> {
+impl RgbScaler {
+    pub fn new(size: InputSize) -> Result<Self> {
         let mut rgb = AVFrame::new();
-        rgb.set_width(INPUT_SIZE as i32);
-        rgb.set_height(INPUT_SIZE as i32);
+        rgb.set_width(size.w as i32);
+        rgb.set_height(size.h as i32);
         rgb.set_format(ffi::AV_PIX_FMT_RGB24);
         rgb.alloc_buffer()
             .context("allocating the RGB scale target")?;
-        Ok(Self { sws: None, rgb })
+        Ok(Self {
+            size,
+            sws: None,
+            rgb,
+        })
     }
 
     fn ensure_scaler(&mut self, frame: &AVFrame) -> Result<()> {
@@ -203,8 +213,8 @@ impl Rgb640 {
                 frame.width,
                 frame.height,
                 frame.format,
-                INPUT_SIZE as i32,
-                INPUT_SIZE as i32,
+                self.size.w as i32,
+                self.size.h as i32,
                 ffi::AV_PIX_FMT_RGB24,
                 ffi::SWS_BILINEAR,
                 None,
@@ -234,22 +244,22 @@ impl Rgb640 {
 
         let stride = self.rgb.linesize[0] as usize;
         // SAFETY: `self.rgb` is our own `alloc_buffer`'d RGB24 frame of
-        // INPUT_SIZE x INPUT_SIZE, so data[0] is non-null and the allocation
-        // covers linesize[0] * height bytes. Both invariants break if
-        // `Rgb640::new` ever stops allocating the frame it describes.
+        // `self.size`, so data[0] is non-null and the allocation covers
+        // linesize[0] * height bytes. Both invariants break if
+        // `RgbScaler::new` ever stops allocating the frame it describes.
         let plane =
-            unsafe { slice::from_raw_parts(self.rgb.data[0] as *const u8, stride * INPUT_SIZE) };
-        Ok(rgb_to_chw(plane, stride))
+            unsafe { slice::from_raw_parts(self.rgb.data[0] as *const u8, stride * self.size.h) };
+        Ok(rgb_to_chw(plane, stride, self.size))
     }
 }
 
 struct SwDecoder {
     ctx: AVCodecContext,
-    rgb: Rgb640,
+    rgb: RgbScaler,
 }
 
 impl SwDecoder {
-    fn open(codecpar: &AVCodecParameters) -> Result<Self> {
+    fn open(codecpar: &AVCodecParameters, size: InputSize) -> Result<Self> {
         let codec = AVCodec::find_decoder(codecpar.codec_id)
             .ok_or_else(|| anyhow!("no decoder for codec id {}", codecpar.codec_id))?;
         let mut ctx = AVCodecContext::new(&codec);
@@ -261,7 +271,7 @@ impl SwDecoder {
         eprintln!("decoder: software ({})", codec.name().to_string_lossy());
         Ok(Self {
             ctx,
-            rgb: Rgb640::new()?,
+            rgb: RgbScaler::new(size)?,
         })
     }
 }
@@ -296,16 +306,16 @@ pub fn cap_frame_size(ctx: &mut AVCodecContext) {
 }
 
 /// Packed RGB24 rows (`stride` may exceed the row width) -> CHW f32 in 0..1.
-fn rgb_to_chw(plane: &[u8], stride: usize) -> Vec<f32> {
-    let plane_len = INPUT_SIZE * INPUT_SIZE;
-    let mut tensor = vec![0f32; 3 * plane_len];
-    for y in 0..INPUT_SIZE {
-        let row = &plane[y * stride..y * stride + INPUT_SIZE * 3];
-        for x in 0..INPUT_SIZE {
+fn rgb_to_chw(plane: &[u8], stride: usize, size: InputSize) -> Vec<f32> {
+    let plane_len = size.w * size.h;
+    let mut tensor = vec![0f32; size.tensor_len()];
+    for y in 0..size.h {
+        let row = &plane[y * stride..y * stride + size.w * 3];
+        for x in 0..size.w {
             let px = &row[x * 3..x * 3 + 3];
-            tensor[y * INPUT_SIZE + x] = f32::from(px[0]) / 255.0;
-            tensor[plane_len + y * INPUT_SIZE + x] = f32::from(px[1]) / 255.0;
-            tensor[2 * plane_len + y * INPUT_SIZE + x] = f32::from(px[2]) / 255.0;
+            tensor[y * size.w + x] = f32::from(px[0]) / 255.0;
+            tensor[plane_len + y * size.w + x] = f32::from(px[1]) / 255.0;
+            tensor[2 * plane_len + y * size.w + x] = f32::from(px[2]) / 255.0;
         }
     }
     tensor
@@ -462,7 +472,7 @@ mod tests {
             raw.width = 1920;
             raw.height = 1080;
         }
-        let decoder = SwDecoder::open(&codecpar).unwrap();
+        let decoder = SwDecoder::open(&codecpar, InputSize::square(640)).unwrap();
         assert_eq!(decoder.ctx.max_pixels, MAX_PIXELS);
         // Generous enough for 8K, small enough that a 16384x16384 SPS fails.
         const { assert!(MAX_PIXELS > 7680 * 4320) };
@@ -472,18 +482,21 @@ mod tests {
     #[test]
     fn packs_rgb_rows_into_planes() {
         // One padded row of red, green, blue pixels; the rest stays black.
-        let stride = INPUT_SIZE * 3 + 16;
-        let mut plane = vec![0u8; stride * INPUT_SIZE];
-        plane[0..9].copy_from_slice(&[255, 0, 0, 0, 255, 0, 0, 0, 255]);
+        for size in [InputSize::square(640), InputSize { w: 320, h: 192 }] {
+            let stride = size.w * 3 + 16;
+            let mut plane = vec![0u8; stride * size.h];
+            plane[0..9].copy_from_slice(&[255, 0, 0, 0, 255, 0, 0, 0, 255]);
 
-        let tensor = rgb_to_chw(&plane, stride);
-        let plane_len = INPUT_SIZE * INPUT_SIZE;
-        assert_eq!(tensor.len(), 3 * plane_len);
-        assert_eq!(tensor[0], 1.0);
-        assert_eq!(tensor[plane_len + 1], 1.0);
-        assert_eq!(tensor[2 * plane_len + 2], 1.0);
-        assert_eq!(tensor[1], 0.0);
-        assert!(tensor.iter().all(|v| (0.0..=1.0).contains(v)));
+            let tensor = rgb_to_chw(&plane, stride, size);
+            let plane_len = size.w * size.h;
+            assert_eq!(tensor.len(), size.tensor_len());
+            assert_eq!(tensor.len(), 3 * plane_len);
+            assert_eq!(tensor[0], 1.0);
+            assert_eq!(tensor[plane_len + 1], 1.0);
+            assert_eq!(tensor[2 * plane_len + 2], 1.0);
+            assert_eq!(tensor[1], 0.0);
+            assert!(tensor.iter().all(|v| (0.0..=1.0).contains(v)));
+        }
     }
 
     #[test]
