@@ -8,6 +8,8 @@ defmodule Cairn.CameraSupervisorTest do
   alias Cairn.Config.Camera
 
   setup do
+    # Registered first so LIFO runs it last, after the cameras are stopped
+    on_exit(fn -> File.rm_rf!("tmp/camsup_test") end)
     Application.put_env(:cairn, :start_cameras, true)
     on_exit(fn -> Application.put_env(:cairn, :start_cameras, false) end)
 

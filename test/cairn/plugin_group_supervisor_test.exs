@@ -12,6 +12,8 @@ defmodule Cairn.PluginGroupSupervisorTest do
 
   setup do
     File.mkdir_p!(Path.join(@data_dir, "log"))
+    # Registered first so LIFO runs it last, after the groups are stopped
+    on_exit(fn -> File.rm_rf!(@data_dir) end)
     Application.put_env(:cairn, :start_cameras, true)
     on_exit(fn -> Application.put_env(:cairn, :start_cameras, false) end)
 
