@@ -98,7 +98,7 @@ defmodule Cairn.PluginGroupPortTest do
 
     a_id = a.id
     assert_receive {:event_started, %Event{camera_id: ^a_id}}, 5_000
-    refute_received {:event_started, %Event{camera_id: _}}
+    refute_receive {:event_started, %Event{camera_id: _}}, 200
   end
 
   test "unknown and missing camera_id lines are dropped without crashing" do

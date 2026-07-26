@@ -253,6 +253,17 @@ defmodule Cairn.ConfigTest do
       assert Enum.any?(errors, &(&1 =~ "plugin detect: command must be"))
     end
 
+    test "a camera referencing a group that failed to parse gets no extra error" do
+      map =
+        base_map()
+        |> with_plugins(%{"detect" => %{"command" => 42}})
+        |> put_plugin(0, "detect")
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "plugin detect: command must be"))
+      refute Enum.any?(errors, &(&1 =~ "unknown plugin"))
+    end
+
     test "an invalid group name is an error" do
       map = with_plugins(base_map(), %{"Detect Group" => %{"command" => ["./detect"]}})
 

@@ -123,7 +123,7 @@ defmodule Cairn.Config do
       ha_token: get_in(map, ["integrations", "token"])
     }
 
-    {config, acc} = resolve_plugins(config, acc)
+    {config, acc} = resolve_plugins(config, acc, declared_plugin_names(map))
     acc = validate(config, acc)
 
     case acc.errors do
@@ -196,28 +196,46 @@ defmodule Cairn.Config do
   # Cameras leave `Camera.parse/3` with `{:pending, name}` for a single-token
   # `plugin:` string; only here is the full `plugins:` map known, so a name
   # becomes a `{:group, name}` reference or (typo) a config error.
-  defp resolve_plugins(config, acc) do
+  defp resolve_plugins(config, acc, declared) do
     names = MapSet.new(config.plugin_groups, & &1.name)
-    {cameras, acc} = Enum.map_reduce(config.cameras, acc, &resolve_camera_plugin(&1, &2, names))
+
+    {cameras, acc} =
+      Enum.map_reduce(config.cameras, acc, &resolve_camera_plugin(&1, &2, names, declared))
+
     config = %{config | cameras: cameras}
 
     {%{config | plugin_groups: resolve_members(config)}, acc}
   end
 
-  defp resolve_camera_plugin(%Camera{plugin: {:pending, name}} = cam, acc, names) do
-    if MapSet.member?(names, name) do
-      {%{cam | plugin: {:group, name}}, acc}
-    else
-      {%{cam | plugin: nil},
-       add_error(
-         acc,
-         "camera #{cam.id}: unknown plugin #{inspect(name)} — define it under plugins: " <>
-           "or write an inline command as a list"
-       )}
+  # Names present in the raw plugins: map, including entries whose own parse
+  # failed — a camera referencing those must not pile a misleading "unknown
+  # plugin" error on top of the group's error.
+  defp declared_plugin_names(map) do
+    case Map.get(map, "plugins") do
+      plugins when is_map(plugins) -> MapSet.new(Map.keys(plugins), &to_string/1)
+      _other -> MapSet.new()
     end
   end
 
-  defp resolve_camera_plugin(cam, acc, _names), do: {cam, acc}
+  defp resolve_camera_plugin(%Camera{plugin: {:pending, name}} = cam, acc, names, declared) do
+    cond do
+      MapSet.member?(names, name) ->
+        {%{cam | plugin: {:group, name}}, acc}
+
+      MapSet.member?(declared, name) ->
+        {%{cam | plugin: nil}, acc}
+
+      true ->
+        {%{cam | plugin: nil},
+         add_error(
+           acc,
+           "camera #{cam.id}: unknown plugin #{inspect(name)} — define it under plugins: " <>
+             "or write an inline command as a list"
+         )}
+    end
+  end
+
+  defp resolve_camera_plugin(cam, acc, _names, _declared), do: {cam, acc}
 
   defp resolve_members(%__MODULE__{udp_base_port: base} = config) when is_integer(base) do
     Enum.map(config.plugin_groups, &%{&1 | members: members_for(config, &1.name)})
