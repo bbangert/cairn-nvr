@@ -92,10 +92,12 @@ defmodule Cairn.Config.Server do
       {:ok, new_config, warnings} ->
         group_diff = diff_plugin_groups(state.config, new_config)
         diff = diff_cameras(state.config, new_config)
+        # Before the diffs: newly spawned ports redirect logs into the (possibly
+        # changed) data_dir, so its log subdir must already exist
+        Cairn.DataDir.ensure!(new_config.data_dir)
         log_group_diff(group_diff)
         state.apply_group_diff.(group_diff, new_config)
         state.apply_diff.(diff, new_config)
-        Cairn.DataDir.ensure!(new_config.data_dir)
         state = %{state | config: new_config, warnings: warnings, errors: []}
         {:reply, {:ok, diff, warnings}, state}
 

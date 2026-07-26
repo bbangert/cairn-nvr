@@ -19,7 +19,7 @@ defmodule Cairn.Config do
   @known_events_keys ~w(pre_window_seconds post_window_seconds max_event_seconds)
   @known_retention_keys ~w(days per_label)
   @known_integrations_keys ~w(token)
-  @name_regex ~r/^[a-z0-9][a-z0-9_-]*$/
+  @name_regex ~r/\A[a-z0-9][a-z0-9_-]*\z/
 
   defstruct data_dir: "data",
             stall_seconds: 15,
