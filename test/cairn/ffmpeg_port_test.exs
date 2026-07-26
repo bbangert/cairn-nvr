@@ -5,6 +5,7 @@ defmodule Cairn.FFmpegPortTest do
   alias Cairn.Config.Camera
   alias Cairn.FFmpegPort
   alias Cairn.RingBuffer
+  alias Cairn.StreamEpochs
 
   @fixture Path.absname("test/support/fixtures/media/testsrc.fmp4")
   @fake Path.absname("test/support/fake_ffmpeg.sh")
@@ -120,6 +121,48 @@ defmodule Cairn.FFmpegPortTest do
       assert_receive {:status, ^id, :stalled}, 5_000
       assert_receive {:status, ^id, :backoff}, 2_000
       assert_receive {:status, ^id, :connecting}, 2_000
+    end
+  end
+
+  describe "stream epochs" do
+    test "every spawn mints a new epoch" do
+      id = "ff_#{System.unique_integer([:positive])}"
+      StreamEpochs.subscribe()
+
+      # fake exits with 42 after streaming -> backoff -> second spawn
+      start_pipeline(id, "#{@fake} #{@fixture} 0.05 42", [])
+
+      assert_receive {:stream_epoch, ^id, first, :started}, 2_000
+      assert_receive {:stream_epoch, ^id, second, :source_lost}, 5_000
+      assert first != second
+
+      assert {:ok, current} = StreamEpochs.current(id)
+      assert current != first
+    end
+
+    test "a stall bounce mints its epoch with the :stall_bounce reason" do
+      id = "ff_#{System.unique_integer([:positive])}"
+      StreamEpochs.subscribe()
+
+      # cats fixture then sleeps far longer than stall_seconds (1s)
+      start_pipeline(id, "#{@fake} #{@fixture} 30 0", [])
+
+      assert_receive {:stream_epoch, ^id, _first, :started}, 2_000
+      assert_receive {:stream_epoch, ^id, _second, :stall_bounce}, 5_000
+    end
+
+    test "stopping the camera announces the end of the stream" do
+      id = "ff_#{System.unique_integer([:positive])}"
+      StreamEpochs.subscribe()
+
+      pid = start_pipeline(id, "#{@fake} #{@fixture} 30 0", [])
+      assert_receive {:stream_epoch, ^id, _epoch, :started}, 2_000
+
+      ref = Process.monitor(pid)
+      stop_supervised!(FFmpegPort)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
+
+      assert_receive {:stream_epoch, ^id, _stopped, :camera_stopped}
     end
   end
 

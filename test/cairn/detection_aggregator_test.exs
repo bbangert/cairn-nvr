@@ -102,6 +102,23 @@ defmodule Cairn.DetectionAggregatorTest do
     assert [%{object_id: oid}, %{object_id: oid}] = event.labels
   end
 
+  test "a new stream epoch ends tracks: object ids are not inherited", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    detect(agg, camera)
+    assert_receive {:event_started, %Event{labels: [%{object_id: first}]}}
+
+    send(agg, {:stream_epoch, id, Cairn.ULID.generate(), :source_lost})
+
+    # identical bbox: only the epoch reset stops the tracker from matching it
+    # onto the object from before the outage
+    detect(agg, camera)
+    assert_receive {:event_updated, %Event{labels: [_, %{object_id: second}]}}
+    refute second == first
+  end
+
   test "post-window timeout finalizes", %{agg: agg, camera: camera, camera_id: id} do
     detect(agg, camera)
     assert_receive {:extractor_started, %Event{id: eid}, ex_pid}

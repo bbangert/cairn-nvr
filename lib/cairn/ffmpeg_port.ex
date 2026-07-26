@@ -17,6 +17,10 @@ defmodule Cairn.FFmpegPort do
 
   Status transitions (`:connecting | :running | :backoff | :stalled`) are
   reported through the `:status_fun` callback (wired to `Cairn.CameraStatus`).
+
+  Every spawn mints a new stream epoch (`Cairn.StreamEpochs`) — one epoch is
+  one continuous decode, so nothing (object ids, pts) carries across a
+  respawn.
   """
 
   use GenServer
@@ -38,7 +42,10 @@ defmodule Cairn.FFmpegPort do
             status: :init,
             backoff_ms: nil,
             opts: [],
-            got_fragment: false
+            got_fragment: false,
+            epoch: nil,
+            # reason carried into the *next* spawn's epoch
+            spawn_reason: :started
 
   def start_link(opts) do
     cam = Keyword.fetch!(opts, :camera)
@@ -210,7 +217,7 @@ defmodule Cairn.FFmpegPort do
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     Logger.warning("camera #{state.camera.id}: ffmpeg exited with status #{status}")
-    {:noreply, enter_backoff(%{state | port: nil, os_pid: nil})}
+    {:noreply, enter_backoff(%{state | port: nil, os_pid: nil}, :source_lost)}
   end
 
   def handle_info(:watchdog, state) do
@@ -220,7 +227,7 @@ defmodule Cairn.FFmpegPort do
       true ->
         Logger.warning("camera #{state.camera.id}: stalled (no fragments), bouncing ffmpeg")
         state = set_status(state, :stalled)
-        {:noreply, enter_backoff(kill_port(state))}
+        {:noreply, enter_backoff(kill_port(state), :stall_bounce)}
 
       false ->
         {:noreply, state}
@@ -228,7 +235,7 @@ defmodule Cairn.FFmpegPort do
   end
 
   def handle_info({:EXIT, port, _reason}, %{port: port} = state) do
-    {:noreply, enter_backoff(%{state | port: nil, os_pid: nil})}
+    {:noreply, enter_backoff(%{state | port: nil, os_pid: nil}, :source_lost)}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -236,6 +243,9 @@ defmodule Cairn.FFmpegPort do
   @impl true
   def terminate(_reason, state) do
     kill_port(state)
+    # tells epoch subscribers the stream ended; the minted epoch is one
+    # nothing ever streams under
+    Cairn.StreamEpochs.new_epoch(state.camera.id, :camera_stopped)
     :ok
   end
 
@@ -246,7 +256,7 @@ defmodule Cairn.FFmpegPort do
   end
 
   defp handle_event({:init, %{data: data, codec: codec, timescale: timescale}}, state) do
-    Cairn.RingBuffer.put_init(state.camera.id, data, codec, timescale)
+    Cairn.RingBuffer.put_init(state.camera.id, data, codec, timescale, state.epoch)
     state
   end
 
@@ -263,7 +273,7 @@ defmodule Cairn.FFmpegPort do
 
   defp handle_event({:error, reason}, state) do
     Logger.warning("camera #{state.camera.id}: fmp4 desync #{inspect(reason)}, bouncing ffmpeg")
-    enter_backoff(kill_port(state))
+    enter_backoff(kill_port(state), :source_lost)
   end
 
   defp spawn_ffmpeg(state) do
@@ -283,13 +293,15 @@ defmodule Cairn.FFmpegPort do
       end
 
     state = set_status(state, :connecting)
+    epoch = Cairn.StreamEpochs.new_epoch(state.camera.id, state.spawn_reason)
 
     %{
       state
       | port: port,
         os_pid: os_pid,
         demuxer: Demuxer.new(state.camera.id),
-        got_fragment: false
+        got_fragment: false,
+        epoch: epoch
     }
   end
 
@@ -310,12 +322,12 @@ defmodule Cairn.FFmpegPort do
     end
   end
 
-  defp enter_backoff(state) do
+  defp enter_backoff(state, reason) do
     state = state |> kill_port() |> set_status(:backoff)
     jitter = :rand.uniform()
     delay = trunc(state.backoff_ms * (0.5 + jitter))
     Process.send_after(self(), :spawn, delay)
-    %{state | backoff_ms: min(state.backoff_ms * 2, backoff_max(state))}
+    %{state | backoff_ms: min(state.backoff_ms * 2, backoff_max(state)), spawn_reason: reason}
   end
 
   defp kill_port(%{port: nil} = state), do: state

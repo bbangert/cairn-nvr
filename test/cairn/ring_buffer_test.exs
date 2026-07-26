@@ -8,9 +8,10 @@ defmodule Cairn.RingBufferTest do
 
   setup do
     camera_id = "ring_#{System.unique_integer([:positive])}"
+    epoch = Cairn.ULID.generate()
     start_supervised!({RingBuffer, camera_id: camera_id, pre_window_seconds: 4})
-    RingBuffer.put_init(camera_id, <<"INIT">>, "avc1.64001f", @timescale)
-    %{camera_id: camera_id}
+    RingBuffer.put_init(camera_id, <<"INIT">>, "avc1.64001f", @timescale, epoch)
+    %{camera_id: camera_id, epoch: epoch}
   end
 
   defp frag(camera_id, second) do
@@ -40,7 +41,7 @@ defmodule Cairn.RingBufferTest do
 
   test "re-stamps seq monotonically across init resets", %{camera_id: id} do
     fill(id, 0..2)
-    RingBuffer.put_init(id, <<"INIT2">>, "avc1.64001f", @timescale)
+    RingBuffer.put_init(id, <<"INIT2">>, "avc1.64001f", @timescale, Cairn.ULID.generate())
     fill(id, 0..1)
 
     {:ok, %{init: init, fragments: frags}} = RingBuffer.fetch_recent(id, 100)
@@ -99,11 +100,24 @@ defmodule Cairn.RingBufferTest do
   test "broadcasts fragments and init on PubSub", %{camera_id: id} do
     Phoenix.PubSub.subscribe(Cairn.PubSub, RingBuffer.topic(id))
 
-    RingBuffer.put_init(id, <<"INIT3">>, "avc1.64001f", @timescale)
+    RingBuffer.put_init(id, <<"INIT3">>, "avc1.64001f", @timescale, Cairn.ULID.generate())
     assert_receive {:init_segment, %{camera_id: ^id, codec: "avc1.64001f"}}
 
     RingBuffer.put_fragment(id, frag(id, 0))
     assert_receive {:fragment, %Fragment{}}
+  end
+
+  test "init segments are tagged with the stream epoch", %{camera_id: id, epoch: epoch} do
+    Phoenix.PubSub.subscribe(Cairn.PubSub, RingBuffer.topic(id))
+
+    assert {:ok, %{epoch: ^epoch}} = RingBuffer.drain_and_subscribe(id, nil, self())
+
+    # a respawn's init segment replaces the epoch everywhere it is reported
+    next = Cairn.ULID.generate()
+    RingBuffer.put_init(id, <<"INIT2">>, "avc1.64001f", @timescale, next)
+
+    assert_receive {:init_segment, %{camera_id: ^id, epoch: ^next}}
+    assert {:ok, %{epoch: ^next}} = RingBuffer.drain_and_subscribe(id, nil, self())
   end
 
   test "last_fragment_at is tracked", %{camera_id: id} do

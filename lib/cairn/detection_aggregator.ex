@@ -12,6 +12,9 @@ defmodule Cairn.DetectionAggregator do
     * `post_window` seconds of quiet -> finalizes; `max_event` seconds ->
       finalizes and lets the next detection open a fresh event
 
+  Subscribes to `Cairn.StreamEpochs`: a new epoch for a camera resets that
+  camera's tracker, so object ids are never inherited across an outage.
+
   Active events are checkpointed to `Cairn.EventCheckpoint` (ETS owned
   elsewhere): on restart the aggregator re-attaches to live extractors and
   finalizes orphans.
@@ -21,7 +24,7 @@ defmodule Cairn.DetectionAggregator do
 
   require Logger
 
-  alias Cairn.{CameraControl, Event, EventCheckpoint, Tracker}
+  alias Cairn.{CameraControl, Event, EventCheckpoint, StreamEpochs, Tracker}
 
   @max_label_entries 5_000
 
@@ -42,6 +45,8 @@ defmodule Cairn.DetectionAggregator do
 
   @impl true
   def init(opts) do
+    StreamEpochs.subscribe()
+
     state = %{
       cameras: %{},
       start_extractor: Keyword.get(opts, :start_extractor, &Cairn.EventExtractor.start/2),
@@ -105,6 +110,18 @@ defmodule Cairn.DetectionAggregator do
     else
       {:noreply, state}
     end
+  end
+
+  # A new epoch is a new continuous decode: the camera may have moved during
+  # the outage, so no track may span the boundary — otherwise a box that
+  # happens to overlap the last one inherits its object id. `Tracker.reset/1`
+  # (not `new/0`) keeps the id counter advancing, so an event whose labels
+  # straddle the boundary never reports one id for two objects. An in-flight
+  # event keeps running and finalizes on its own timers.
+  def handle_info({:stream_epoch, camera_id, epoch, _reason}, state) do
+    cam = cam_state(state, camera_id)
+    cam = %{cam | tracker: Tracker.reset(cam.tracker), current_epoch: epoch}
+    {:noreply, put_cam(state, camera_id, cam)}
   end
 
   def handle_info({:DOWN, _ref, :process, pid, reason}, state) do
@@ -300,6 +317,7 @@ defmodule Cairn.DetectionAggregator do
       event: nil,
       extractor: nil,
       tracker: Tracker.new(),
+      current_epoch: nil,
       post_ref: nil,
       post_token: nil,
       max_ref: nil,

@@ -9,7 +9,7 @@ defmodule CairnWeb.HLSControllerTest do
 
   setup do
     start_supervised!({RingBuffer, camera_id: @camera, pre_window_seconds: 60})
-    RingBuffer.put_init(@camera, <<"INIT">>, "avc1.64001f", @timescale)
+    RingBuffer.put_init(@camera, <<"INIT">>, "avc1.64001f", @timescale, Cairn.ULID.generate())
 
     for second <- 0..3 do
       RingBuffer.put_fragment(@camera, %Fragment{
