@@ -1,0 +1,26 @@
+data_dir: tmp/cairn_test_data
+stall_seconds: 15
+
+udp:
+  base_port: 17000
+  range: 20
+
+plugins:
+  detect:
+    command: ./cairn-detect --model m.onnx
+  spare:
+    command: ["./spare-plugin"]
+
+cameras:
+  - id: cam_a
+    rtsp_url: rtsp://127.0.0.1:8554/a
+    plugin: detect
+    min_score:
+      default: 0.5
+      person: 0.6
+  - id: cam_b
+    rtsp_url: rtsp://127.0.0.1:8554/b
+    plugin: python3 plug.py --x
+  - id: cam_c
+    rtsp_url: rtsp://127.0.0.1:8554/c
+    plugin: detect

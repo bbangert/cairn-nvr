@@ -11,7 +11,7 @@ defmodule Cairn.PluginPortTest do
     %Camera{
       id: id,
       rtsp_url: "rtsp://h/1",
-      plugin: ["elixir", @mock],
+      plugin: {:inline, ["elixir", @mock]},
       min_score: %{"default" => 0.5}
     }
   end

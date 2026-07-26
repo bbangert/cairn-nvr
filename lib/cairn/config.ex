@@ -11,12 +11,15 @@ defmodule Cairn.Config do
   """
 
   alias Cairn.Config.Camera
+  alias Cairn.Config.PluginGroup
 
-  @known_keys ~w(data_dir stall_seconds free_space_min_mb remux_clips udp events retention cameras integrations)
+  @known_keys ~w(data_dir stall_seconds free_space_min_mb remux_clips udp events retention cameras
+                 plugins integrations)
   @known_udp_keys ~w(base_port range)
   @known_events_keys ~w(pre_window_seconds post_window_seconds max_event_seconds)
   @known_retention_keys ~w(days per_label)
   @known_integrations_keys ~w(token)
+  @name_regex ~r/\A[a-z0-9][a-z0-9_-]*\z/
 
   defstruct data_dir: "data",
             stall_seconds: 15,
@@ -30,6 +33,7 @@ defmodule Cairn.Config do
             retention_days: 14,
             retention_per_label: %{},
             cameras: [],
+            plugin_groups: [],
             ha_token: nil
 
   @type t :: %__MODULE__{}
@@ -100,6 +104,7 @@ defmodule Cairn.Config do
       warn_unknown(acc, Map.get(map, "integrations"), @known_integrations_keys, "integrations")
 
     {cameras, acc} = parse_cameras(Map.get(map, "cameras", []), acc)
+    {plugin_groups, acc} = parse_plugins(Map.get(map, "plugins"), acc)
 
     config = %__MODULE__{
       data_dir: System.get_env("CAIRN_DATA_DIR") || Map.get(map, "data_dir", "data"),
@@ -114,9 +119,11 @@ defmodule Cairn.Config do
       retention_days: get_in(map, ["retention", "days"]) || 14,
       retention_per_label: get_in(map, ["retention", "per_label"]) || %{},
       cameras: cameras,
+      plugin_groups: plugin_groups,
       ha_token: get_in(map, ["integrations", "token"])
     }
 
+    {config, acc} = resolve_plugins(config, acc, declared_plugin_names(map))
     acc = validate(config, acc)
 
     case acc.errors do
@@ -162,11 +169,96 @@ defmodule Cairn.Config do
     {[], add_error(acc, "cameras must be a list")}
   end
 
+  # -- plugin group parsing ---------------------------------------------------
+
+  defp parse_plugins(nil, acc), do: {[], acc}
+
+  defp parse_plugins(plugins, acc) when is_map(plugins) do
+    {groups, acc} =
+      plugins
+      |> Enum.sort_by(fn {name, _raw} -> name end)
+      |> Enum.reduce({[], acc}, fn
+        {name, raw}, {groups, acc} when is_binary(name) ->
+          {group, acc} = PluginGroup.parse(raw, name, acc)
+          {[group | groups], acc}
+
+        {name, _raw}, {groups, acc} ->
+          {groups, add_error(acc, "plugin #{inspect(name)}: name must be a string")}
+      end)
+
+    {groups |> Enum.reject(&is_nil/1) |> Enum.reverse(), acc}
+  end
+
+  defp parse_plugins(_other, acc) do
+    {[], add_error(acc, "plugins must be a mapping of name to plugin")}
+  end
+
+  # Cameras leave `Camera.parse/3` with `{:pending, name}` for a single-token
+  # `plugin:` string; only here is the full `plugins:` map known, so a name
+  # becomes a `{:group, name}` reference or (typo) a config error.
+  defp resolve_plugins(config, acc, declared) do
+    names = MapSet.new(config.plugin_groups, & &1.name)
+
+    {cameras, acc} =
+      Enum.map_reduce(config.cameras, acc, &resolve_camera_plugin(&1, &2, names, declared))
+
+    config = %{config | cameras: cameras}
+
+    {%{config | plugin_groups: resolve_members(config)}, acc}
+  end
+
+  # Names present in the raw plugins: map, including entries whose own parse
+  # failed — a camera referencing those must not pile a misleading "unknown
+  # plugin" error on top of the group's error.
+  defp declared_plugin_names(map) do
+    case Map.get(map, "plugins") do
+      plugins when is_map(plugins) -> Enum.map(Map.keys(plugins), &to_string/1)
+      _other -> []
+    end
+  end
+
+  defp resolve_camera_plugin(%Camera{plugin: {:pending, name}} = cam, acc, names, declared) do
+    cond do
+      MapSet.member?(names, name) ->
+        {%{cam | plugin: {:group, name}}, acc}
+
+      name in declared ->
+        {%{cam | plugin: nil}, acc}
+
+      true ->
+        {%{cam | plugin: nil},
+         add_error(
+           acc,
+           "camera #{cam.id}: unknown plugin #{inspect(name)} — define it under plugins: " <>
+             "or write an inline command as a list"
+         )}
+    end
+  end
+
+  defp resolve_camera_plugin(cam, acc, _names, _declared), do: {cam, acc}
+
+  defp resolve_members(%__MODULE__{udp_base_port: base} = config) when is_integer(base) do
+    Enum.map(config.plugin_groups, &%{&1 | members: members_for(config, &1.name)})
+  end
+
+  defp resolve_members(config), do: config.plugin_groups
+
+  defp members_for(config, name) do
+    config.cameras
+    |> Enum.with_index()
+    |> Enum.filter(fn {cam, _index} -> cam.plugin == {:group, name} end)
+    |> Enum.map(fn {cam, index} ->
+      {udp_port, _rtp_port} = Cairn.UDPPorts.ports_for(config, index)
+      %{id: cam.id, udp_port: udp_port, min_score: cam.min_score}
+    end)
+  end
+
   # -- validation -------------------------------------------------------------
 
   defp validate(config, acc) do
     acc
     |> validate_ids(config)
+    |> validate_plugins(config)
     |> validate_windows(config)
     |> validate_udp(config)
     |> validate_numbers(config)
@@ -192,6 +284,24 @@ defmodule Cairn.Config do
     dups = Enum.uniq(ids -- Enum.uniq(ids))
 
     Enum.reduce(dups, acc, &add_error(&2, "duplicate camera id: #{&1}"))
+  end
+
+  # Group names and camera ids share the `plugin-{name}.log` namespace, so
+  # they must not collide.
+  defp validate_plugins(acc, config) do
+    camera_ids = MapSet.new(config.cameras, & &1.id)
+    # Names are keys of the plugins: mapping, so they are unique by
+    # construction (YAML duplicate keys collapse at parse time).
+    names = Enum.map(config.plugin_groups, & &1.name)
+
+    Enum.reduce(names, acc, fn name, acc ->
+      acc
+      |> check(name =~ @name_regex, "plugin #{name}: name must be lowercase [a-z0-9_-]")
+      |> check(
+        not MapSet.member?(camera_ids, name),
+        "plugin #{name}: name collides with a camera id"
+      )
+    end)
   end
 
   defp validate_windows(acc, config) do

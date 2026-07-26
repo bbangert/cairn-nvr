@@ -3,8 +3,17 @@ defmodule Cairn.Config.Camera do
   Per-camera configuration parsed from the `cameras:` list in the YAML file.
 
   `min_score` is a map of label => minimum detection score, with a
-  `"default"` key applied to labels not listed. `plugin` is the argv of the
-  inference plugin command (absent = no detection for this camera).
+  `"default"` key applied to labels not listed.
+
+  `plugin` selects the inference plugin (absent = no detection for this
+  camera) and resolves to `nil | {:inline, argv} | {:group, name}`. A string
+  without whitespace is a reference to a named group in the top-level
+  `plugins:` map — an undefined name is a config error, not a command. A
+  string with whitespace or an argv list is an inline per-camera command; the
+  list form is the escape hatch for an inline command that takes no flags.
+
+  Group references leave `parse/3` as `{:pending, name}` and are resolved
+  against the parsed `plugins:` map by `Cairn.Config`.
   """
 
   alias Cairn.Config
@@ -105,18 +114,27 @@ defmodule Cairn.Config.Camera do
   end
 
   defp parse_plugin(nil, _id, acc), do: {nil, acc}
-  defp parse_plugin(cmd, _id, acc) when is_binary(cmd), do: {String.split(cmd), acc}
 
-  defp parse_plugin(argv, id, acc) when is_list(argv) do
-    if Enum.all?(argv, &is_binary/1) and argv != [] do
-      {argv, acc}
-    else
-      {nil, add_error(acc, "camera #{id}: plugin must be a command string or argv list")}
+  defp parse_plugin(cmd, id, acc) when is_binary(cmd) do
+    case String.split(cmd) do
+      [name] -> {{:pending, name}, acc}
+      [_ | _] = argv -> {{:inline, argv}, acc}
+      [] -> {nil, invalid_plugin(acc, id)}
     end
   end
 
-  defp parse_plugin(_other, id, acc) do
-    {nil, add_error(acc, "camera #{id}: plugin must be a command string or argv list")}
+  defp parse_plugin(argv, id, acc) when is_list(argv) do
+    if Enum.all?(argv, &is_binary/1) and argv != [] do
+      {{:inline, argv}, acc}
+    else
+      {nil, invalid_plugin(acc, id)}
+    end
+  end
+
+  defp parse_plugin(_other, id, acc), do: {nil, invalid_plugin(acc, id)}
+
+  defp invalid_plugin(acc, id) do
+    add_error(acc, "camera #{id}: plugin must be a plugin name, command string or argv list")
   end
 
   defp parse_extra_args(nil, _id, acc), do: {[], acc}

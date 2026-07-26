@@ -5,6 +5,9 @@ defmodule Cairn.Camera do
   Child order: `RingBuffer` -> `FFmpegPort` -> (`PluginPort`) -> (`RTPHub`).
   Ring death restarts ffmpeg (a fresh ring is empty anyway); ffmpeg death
   restarts only the downstream consumers of its UDP outputs.
+
+  Only a camera with an inline plugin command owns a `PluginPort`; cameras
+  served by a named plugin group are just Ring -> FFmpeg -> RTPHub here.
   """
 
   use Supervisor
@@ -33,13 +36,17 @@ defmodule Cairn.Camera do
         {Cairn.RingBuffer, camera_id: cam.id, pre_window_seconds: windows.pre},
         {Cairn.FFmpegPort, camera: cam, config: config, index: index}
       ] ++
-        if cam.plugin do
-          [{Cairn.PluginPort, camera: cam, config: config, index: index}]
-        else
-          []
-        end ++
+        plugin_child(cam, config, index) ++
         [{Cairn.RTPHub, camera_id: cam.id, port: rtp_port}]
 
     Supervisor.init(children, strategy: :rest_for_one)
   end
+
+  # A `{:group, _}` camera's detections come from a shared process owned by
+  # `Cairn.PluginGroupSupervisor`, not from this tree.
+  defp plugin_child(%{plugin: {:inline, _argv}} = cam, config, index) do
+    [{Cairn.PluginPort, camera: cam, config: config, index: index}]
+  end
+
+  defp plugin_child(_cam, _config, _index), do: []
 end
