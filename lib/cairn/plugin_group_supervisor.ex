@@ -92,8 +92,12 @@ defmodule Cairn.PluginGroupSupervisor do
   @spec stop_group(String.t()) :: :ok
   def stop_group(group_name) do
     case Cairn.Registry.whereis(group_name, :plugin_group) do
-      nil -> :ok
-      pid -> DynamicSupervisor.terminate_child(__MODULE__, pid)
+      nil ->
+        :ok
+
+      pid ->
+        DynamicSupervisor.terminate_child(__MODULE__, pid)
+        Cairn.Registry.await_unregistered(group_name, :plugin_group)
     end
   end
 end
