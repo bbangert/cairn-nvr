@@ -26,6 +26,17 @@ use crate::emit::Det;
 
 pub const MAX_DETS: usize = 32;
 
+/// Ceiling on either input dimension, enforced wherever a size is resolved.
+///
+/// Nothing downstream re-checks it: the resolved size is cast to `i32` for
+/// FFmpeg frame and scaler geometry, and multiplied out as `3 * w * h` for
+/// every tensor allocation. Without a bound, a typo'd `--input-size` or a
+/// model declaring nonsense truncates on the cast or asks for a colossal
+/// allocation, which panics or OOMs mid-run instead of failing at startup.
+/// 8192 is far past any real detector input — Ultralytics tops out around
+/// 1280 — and leaves both well inside their types.
+const MAX_INPUT_DIM: usize = 8192;
+
 /// The model's input geometry, resolved once at startup.
 ///
 /// Every scaler, GPU filter graph and tensor in the process is built for
@@ -293,18 +304,25 @@ fn resolve_input_size(
     requested: Option<InputSize>,
     model: &Path,
 ) -> Result<(InputSize, InputSizeSource)> {
-    match (requested, declared) {
+    let (size, source) = match (requested, declared) {
         (Some(requested), Some(declared)) if requested != declared => bail!(
             "--input-size {requested} contradicts model {}, whose input is {declared}",
             model.display()
         ),
-        (Some(requested), _) => Ok((requested, InputSizeSource::Flag)),
-        (None, Some(declared)) => Ok((declared, InputSizeSource::Model)),
+        (Some(requested), _) => (requested, InputSizeSource::Flag),
+        (None, Some(declared)) => (declared, InputSizeSource::Model),
         (None, None) => bail!(
             "model {} does not pin its input width and height; pass --input-size WxH (or N)",
             model.display()
         ),
+    };
+    // Both provenances funnel through here, so the ceiling covers a model's
+    // declared dims as well as a typo'd flag. Zero is already impossible:
+    // `dim` rejects it on the flag and `declared_input_size` requires `> 0`.
+    if size.w > MAX_INPUT_DIM || size.h > MAX_INPUT_DIM {
+        bail!("input size {size} ({source}) exceeds the {MAX_INPUT_DIM} per-dimension limit");
     }
+    Ok((size, source))
 }
 
 pub struct Detector {
@@ -1102,6 +1120,10 @@ mod tests {
         // onnxruntime reports a symbolic axis as -1
         assert_eq!(declared_input_size(&nchw([1, 3, -1, -1])), None);
         assert_eq!(declared_input_size(&nchw([-1, 3, 640, -1])), None);
+        // a zero axis declares nothing either, so it can never reach the
+        // scaler as a 0-wide frame
+        assert_eq!(declared_input_size(&nchw([1, 3, 0, 640])), None);
+        assert_eq!(declared_input_size(&nchw([1, 3, 640, 0])), None);
         assert_eq!(
             declared_input_size(&ValueType::Tensor {
                 ty: ort::value::TensorElementType::Float32,
@@ -1138,6 +1160,64 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("--input-size"), "{err}");
+    }
+
+    #[test]
+    fn an_absurd_size_is_rejected_whichever_provenance_it_came_from() {
+        let model = Path::new("m.onnx");
+        let absurd = InputSize::square(64_000_000);
+        // a typo'd flag...
+        let err = resolve_input_size(None, Some(absurd), model)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("64000000x64000000"), "{err}");
+        assert!(err.contains("8192"), "{err}");
+        assert!(err.contains("--input-size"), "{err}");
+
+        // ...and a model declaring the same nonsense, which no flag touches
+        let err = resolve_input_size(Some(absurd), None, model)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("64000000x64000000"), "{err}");
+        assert!(err.contains("8192"), "{err}");
+        assert!(err.contains("from model"), "{err}");
+
+        // one oversized axis is enough
+        assert!(resolve_input_size(
+            None,
+            Some(InputSize {
+                w: MAX_INPUT_DIM + 1,
+                h: 640
+            }),
+            model
+        )
+        .is_err());
+        assert!(resolve_input_size(
+            Some(InputSize {
+                w: 640,
+                h: MAX_INPUT_DIM + 1
+            }),
+            None,
+            model
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_limit_itself_is_allowed() {
+        let model = Path::new("m.onnx");
+        let at_limit = InputSize::square(MAX_INPUT_DIM);
+        assert_eq!(
+            resolve_input_size(None, Some(at_limit), model).unwrap(),
+            (at_limit, InputSizeSource::Flag)
+        );
+        assert_eq!(
+            resolve_input_size(Some(at_limit), None, model).unwrap(),
+            (at_limit, InputSizeSource::Model)
+        );
+        // the ceiling is what it protects: both stay inside their types
+        assert!(i32::try_from(MAX_INPUT_DIM).is_ok());
+        assert!(at_limit.tensor_len() < usize::MAX);
     }
 
     #[test]
