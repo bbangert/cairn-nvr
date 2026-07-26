@@ -11,8 +11,19 @@ defmodule Cairn.RTPHub do
 
   use GenServer
 
+  require Logger
+
   # bounds memory if a camera emits pathological GOPs (~4096 * ~1200B ≈ 5MB)
   @max_gop_packets 4096
+
+  # UDP ports are positional (`Cairn.UDPPorts`), so a reload that reorders
+  # cameras hands a port to a successor while the predecessor's socket fd is
+  # still being released — a beat after the registry already agrees it is gone
+  # (`Cairn.Registry.await_unregistered/3`). Bounded (25 ms * 20 = 500 ms) and
+  # only for `:eaddrinuse`: a genuine conflict with a foreign listener must
+  # still surface as a start failure rather than be waited out silently.
+  @open_retry_ms 25
+  @open_attempts 20
 
   def start_link(opts) do
     camera_id = Keyword.fetch!(opts, :camera_id)
@@ -32,13 +43,32 @@ defmodule Cairn.RTPHub do
   def init(opts) do
     camera_id = Keyword.fetch!(opts, :camera_id)
     port = Keyword.fetch!(opts, :port)
+    attempts = Keyword.get(opts, :open_attempts, @open_attempts)
 
-    case :gen_udp.open(port, [:binary, active: true, ip: {127, 0, 0, 1}, recbuf: 1_048_576]) do
+    case open(port, attempts) do
       {:ok, socket} ->
         {:ok, %{camera_id: camera_id, socket: socket, gop: [], gop_count: 0, gop_ts: nil}}
 
       {:error, reason} ->
         {:stop, {:udp_open_failed, port, reason}}
+    end
+  end
+
+  defp open(port, attempts, waited_ms \\ 0) do
+    case :gen_udp.open(port, [:binary, active: true, ip: {127, 0, 0, 1}, recbuf: 1_048_576]) do
+      {:ok, socket} ->
+        if waited_ms > 0 do
+          Logger.info("rtp hub port #{port} freed after #{waited_ms}ms — predecessor lingered")
+        end
+
+        {:ok, socket}
+
+      {:error, :eaddrinuse} when attempts > 1 ->
+        Process.sleep(@open_retry_ms)
+        open(port, attempts - 1, waited_ms + @open_retry_ms)
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

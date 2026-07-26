@@ -69,6 +69,51 @@ defmodule Cairn.RTPHubTest do
     assert [10, 11, 12] = RTPHub.gop_snapshot(id) |> Enum.map(& &1.sequence_number)
   end
 
+  describe "udp open retry" do
+    setup do
+      %{
+        busy_port: 30_000 + :rand.uniform(10_000),
+        busy_id: "retry_#{System.unique_integer([:positive])}"
+      }
+    end
+
+    test "starts once a lingering predecessor releases the port", ctx do
+      test_pid = self()
+
+      {:ok, _holder} =
+        Task.start_link(fn ->
+          {:ok, socket} = :gen_udp.open(ctx.busy_port, [:binary, ip: {127, 0, 0, 1}])
+          send(test_pid, :bound)
+          Process.sleep(75)
+          :gen_udp.close(socket)
+        end)
+
+      assert_receive :bound, 1_000
+
+      pid =
+        start_supervised!(
+          Supervisor.child_spec({RTPHub, camera_id: ctx.busy_id, port: ctx.busy_port},
+            id: :retry_hub
+          )
+        )
+
+      assert is_pid(pid)
+      assert Process.alive?(pid)
+    end
+
+    test "fails with the original error shape once the budget is spent", ctx do
+      {:ok, holder} = :gen_udp.open(ctx.busy_port, [:binary, ip: {127, 0, 0, 1}])
+      on_exit(fn -> :gen_udp.close(holder) end)
+
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {:udp_open_failed, busy_port, :eaddrinuse}} =
+               RTPHub.start_link(camera_id: ctx.busy_id, port: ctx.busy_port, open_attempts: 3)
+
+      assert busy_port == ctx.busy_port
+    end
+  end
+
   test "undecodable datagrams are dropped", %{camera_id: id, send_packet: send_packet} do
     Phoenix.PubSub.subscribe(Cairn.PubSub, RTPHub.topic(id))
 
