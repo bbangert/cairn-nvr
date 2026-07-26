@@ -108,7 +108,7 @@ defmodule CairnWeb.ConfigLive do
     windows = Config.windows(config, cam)
 
     [
-      {"plugin", (cam.plugin && Enum.join(cam.plugin, " ")) || "none"},
+      {"plugin", plugin_label(cam.plugin)},
       {"min_score", Enum.map_join(cam.min_score, " ", fn {l, s} -> "#{l}: #{s}" end)},
       {"windows", "#{windows.pre}s / #{windows.post}s / #{windows.max}s"},
       {"retention",
@@ -116,6 +116,10 @@ defmodule CairnWeb.ConfigLive do
          "inherit"}
     ]
   end
+
+  defp plugin_label({:inline, argv}), do: Enum.join(argv, " ")
+  defp plugin_label({:group, name}), do: name
+  defp plugin_label(nil), do: "none"
 
   defp not_h264?(statuses, cam) do
     case probe(statuses, cam.id) do

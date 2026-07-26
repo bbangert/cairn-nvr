@@ -4,6 +4,7 @@ defmodule Cairn.ConfigTest do
   alias Cairn.Config
 
   @valid_fixture "test/support/fixtures/configs/valid.yml"
+  @groups_fixture "test/support/fixtures/configs/plugin_groups.yml"
 
   defp base_map do
     %{
@@ -144,14 +145,152 @@ defmodule Cairn.ConfigTest do
       assert Enum.any?(warnings, &(&1 =~ ~s(unknown key "typo_key" in camera #0)))
     end
 
-    test "plugin accepts string or argv list" do
+    test "plugin accepts a multi-token command string or an argv list" do
       map =
         update_in(base_map(), ["cameras"], fn [a, b] ->
           [Map.put(a, "plugin", "python3 plug.py --x"), Map.put(b, "plugin", ["./plug"])]
         end)
 
       assert {:ok, config, _} = Config.from_map(map)
-      assert [%{plugin: ["python3", "plug.py", "--x"]}, %{plugin: ["./plug"]}] = config.cameras
+
+      assert [
+               %{plugin: {:inline, ["python3", "plug.py", "--x"]}},
+               %{plugin: {:inline, ["./plug"]}}
+             ] = config.cameras
+    end
+  end
+
+  describe "plugin groups" do
+    defp with_plugins(map, plugins), do: Map.put(map, "plugins", plugins)
+
+    defp put_plugin(map, index, plugin) do
+      update_in(map, ["cameras"], fn cams ->
+        List.update_at(cams, index, &Map.put(&1, "plugin", plugin))
+      end)
+    end
+
+    test "loads the plugin group fixture" do
+      assert {:ok, config, []} = Config.load(@groups_fixture)
+
+      assert [detect, spare] = config.plugin_groups
+      assert detect.name == "detect"
+      assert detect.command == ["./cairn-detect", "--model", "m.onnx"]
+      assert spare.command == ["./spare-plugin"]
+      assert spare.members == []
+
+      assert [
+               %{id: "cam_a", plugin: {:group, "detect"}},
+               %{id: "cam_b", plugin: {:inline, ["python3", "plug.py", "--x"]}},
+               %{id: "cam_c", plugin: {:group, "detect"}}
+             ] = config.cameras
+
+      assert detect.members == [
+               %{id: "cam_a", udp_port: 17_000, min_score: %{"default" => 0.5, "person" => 0.6}},
+               %{id: "cam_c", udp_port: 17_008, min_score: %{"default" => 0.5}}
+             ]
+    end
+
+    test "a single-token plugin string references a named group" do
+      map =
+        base_map()
+        |> with_plugins(%{"detect" => %{"command" => "./detect --model m.onnx"}})
+        |> put_plugin(0, "detect")
+
+      assert {:ok, config, []} = Config.from_map(map)
+      assert [%{plugin: {:group, "detect"}}, %{plugin: nil}] = config.cameras
+
+      assert [%{name: "detect", command: ["./detect", "--model", "m.onnx"]}] =
+               config.plugin_groups
+    end
+
+    test "a single-token plugin string with no matching group is an error" do
+      map = put_plugin(base_map(), 0, "detekt")
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ ~s(camera cam_a: unknown plugin "detekt")))
+    end
+
+    test "a one-element list is the inline escape hatch, not a group reference" do
+      map = put_plugin(base_map(), 0, ["./my-plugin"])
+
+      assert {:ok, config, []} = Config.from_map(map)
+      assert [%{plugin: {:inline, ["./my-plugin"]}}, _] = config.cameras
+    end
+
+    test "members carry each referencing camera's port and min_score in config order" do
+      map =
+        base_map()
+        |> with_plugins(%{"detect" => %{"command" => ["./detect"]}})
+        |> put_plugin(1, "detect")
+        |> put_plugin(0, "detect")
+        |> update_in(["cameras"], fn [a, b] ->
+          [Map.put(a, "min_score", %{"person" => 0.7}), b]
+        end)
+
+      assert {:ok, config, []} = Config.from_map(map)
+      assert [%{members: members}] = config.plugin_groups
+
+      assert members == [
+               %{id: "cam_a", udp_port: 17_000, min_score: %{"default" => 0.5, "person" => 0.7}},
+               %{id: "cam_b", udp_port: 17_004, min_score: %{"default" => 0.5}}
+             ]
+    end
+
+    test "a group nobody references parses with empty members" do
+      map = with_plugins(base_map(), %{"detect" => %{"command" => ["./detect"]}})
+
+      assert {:ok, config, []} = Config.from_map(map)
+      assert [%{name: "detect", members: []}] = config.plugin_groups
+    end
+
+    test "command is required and must be a string or argv list" do
+      assert {:error, errors} = Config.from_map(with_plugins(base_map(), %{"detect" => %{}}))
+      assert Enum.any?(errors, &(&1 =~ "plugin detect: command is required"))
+
+      assert {:error, errors} =
+               Config.from_map(with_plugins(base_map(), %{"detect" => %{"command" => 42}}))
+
+      assert Enum.any?(errors, &(&1 =~ "plugin detect: command must be"))
+    end
+
+    test "a camera referencing a group that failed to parse gets no extra error" do
+      map =
+        base_map()
+        |> with_plugins(%{"detect" => %{"command" => 42}})
+        |> put_plugin(0, "detect")
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "plugin detect: command must be"))
+      refute Enum.any?(errors, &(&1 =~ "unknown plugin"))
+    end
+
+    test "an invalid group name is an error" do
+      map = with_plugins(base_map(), %{"Detect Group" => %{"command" => ["./detect"]}})
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "plugin Detect Group: name must be lowercase"))
+    end
+
+    test "a group name colliding with a camera id is an error" do
+      map = with_plugins(base_map(), %{"cam_a" => %{"command" => ["./detect"]}})
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "plugin cam_a: name collides with a camera id"))
+    end
+
+    test "a non-map plugins value is an error" do
+      assert {:error, errors} = Config.from_map(with_plugins(base_map(), ["detect"]))
+      assert Enum.any?(errors, &(&1 =~ "plugins must be a mapping"))
+    end
+
+    test "unknown keys inside a plugin produce warnings" do
+      map =
+        with_plugins(base_map(), %{
+          "detect" => %{"command" => ["./detect"], "typo_key" => true}
+        })
+
+      assert {:ok, _config, warnings} = Config.from_map(map)
+      assert Enum.any?(warnings, &(&1 =~ ~s(unknown key "typo_key" in plugin detect)))
     end
   end
 

@@ -73,8 +73,12 @@ defmodule Cairn.CameraSupervisor do
   @spec stop_camera(String.t()) :: :ok
   def stop_camera(camera_id) do
     case Cairn.Registry.whereis(camera_id, :camera) do
-      nil -> :ok
-      pid -> DynamicSupervisor.terminate_child(__MODULE__, pid)
+      nil ->
+        :ok
+
+      pid ->
+        DynamicSupervisor.terminate_child(__MODULE__, pid)
+        Cairn.Registry.await_unregistered(camera_id, :camera)
     end
   end
 end

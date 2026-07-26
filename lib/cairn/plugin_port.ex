@@ -37,10 +37,10 @@ defmodule Cairn.PluginPort do
     GenServer.start_link(__MODULE__, opts, name: Cairn.Registry.via(cam.id, :plugin))
   end
 
-  @doc "Argv for the configured plugin command plus contract arguments."
+  @doc "Argv for the camera's inline plugin command plus contract arguments."
   @spec build_argv(Cairn.Config.Camera.t(), pos_integer()) :: [String.t()]
-  def build_argv(cam, udp_port) do
-    cam.plugin ++
+  def build_argv(%Cairn.Config.Camera{plugin: {:inline, argv}} = cam, udp_port) do
+    argv ++
       [
         "--camera-id",
         cam.id,

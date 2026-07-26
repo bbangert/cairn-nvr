@@ -62,6 +62,32 @@ pub struct Sample {
     pub tensor: Vec<f32>,
 }
 
+/// Where [`run`] hands sampled frames to inference.
+///
+/// Never blocks: stalling the decode loop stalls the socket read, and at
+/// camera bitrates the kernel receive buffer overflows inside that window —
+/// which corrupts the stream rather than merely dropping a sample. A busy
+/// consumer therefore costs a sample, and which one is the implementation's
+/// choice (a plain channel keeps the pending one; a group's slot replaces
+/// it).
+pub trait SampleSink {
+    /// `Ok(true)` when the sample reached the consumer, `Ok(false)` when a
+    /// sample was skipped because the consumer is still busy, `Err` when the
+    /// consumer is gone.
+    fn offer(&self, sample: Sample) -> Result<bool>;
+}
+
+/// The single-camera handoff: one pending sample, newer ones skipped.
+impl SampleSink for Sender<Sample> {
+    fn offer(&self, sample: Sample) -> Result<bool> {
+        match self.try_send(sample) {
+            Ok(()) => Ok(true),
+            Err(TrySendError::Full(_)) => Ok(false),
+            Err(TrySendError::Disconnected(_)) => bail!("inference thread is gone"),
+        }
+    }
+}
+
 pub trait Decoder: Send {
     fn send_packet(&mut self, packet: &rsmpeg::avcodec::AVPacket) -> Result<()>;
 
@@ -294,7 +320,7 @@ pub fn run(
     stream_index: usize,
     time_base: AVRational,
     decoder: &mut dyn Decoder,
-    tx: &Sender<Sample>,
+    sink: &dyn SampleSink,
 ) -> Result<()> {
     let interval = Duration::from_secs_f64(1.0 / f64::from(SAMPLE_FPS));
     // Wall-clock sampling, not PTS sampling: the point is to cap how often we
@@ -348,21 +374,11 @@ pub fn run(
                     continue;
                 }
             };
-            let sample = Sample { pts_90k, tensor };
-            match tx.try_send(sample) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    // Still busy with the previous sample; skip rather than
-                    // queue up. Blocking here stalls the socket read, and at
-                    // this bitrate the kernel receive buffer overflows inside
-                    // that window — which corrupts the stream rather than
-                    // merely dropping a sample.
-                    dropped += 1;
-                    if dropped.is_multiple_of(50) {
-                        eprintln!("inference behind: {dropped} samples skipped so far");
-                    }
+            if !sink.offer(Sample { pts_90k, tensor })? {
+                dropped += 1;
+                if dropped.is_multiple_of(50) {
+                    eprintln!("inference behind: {dropped} samples skipped so far");
                 }
-                Err(TrySendError::Disconnected(_)) => bail!("inference thread is gone"),
             }
         }
     }

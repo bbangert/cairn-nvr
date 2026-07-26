@@ -8,6 +8,8 @@ defmodule Cairn.CameraSupervisorTest do
   alias Cairn.Config.Camera
 
   setup do
+    # Registered first so LIFO runs it last, after the cameras are stopped
+    on_exit(fn -> File.rm_rf!("tmp/camsup_test") end)
     Application.put_env(:cairn, :start_cameras, true)
     on_exit(fn -> Application.put_env(:cairn, :start_cameras, false) end)
 
@@ -64,6 +66,7 @@ defmodule Cairn.CameraSupervisorTest do
     assert Cairn.Registry.whereis(c.id, :camera)
 
     new_b = wait_new_pid(b.id, old_b)
+    assert is_pid(new_b)
     assert new_b != old_b
   end
 
@@ -82,6 +85,17 @@ defmodule Cairn.CameraSupervisorTest do
     refute Cairn.Registry.whereis(a.id, :plugin)
   end
 
+  test "a camera served by a plugin group gets no plugin port of its own" do
+    a = %Camera{camera("cs_grp_#{System.unique_integer([:positive])}") | plugin: {:group, "det"}}
+    :ok = CameraSupervisor.sync(config([a], 19_720))
+
+    assert Cairn.Registry.whereis(a.id, :ffmpeg)
+    assert Cairn.Registry.whereis(a.id, :rtp_hub)
+    refute Cairn.Registry.whereis(a.id, :plugin)
+  end
+
+  # Flunks rather than returning nil: a "restarted" assertion that compares
+  # against the old pid passes trivially on nil.
   defp wait_new_pid(id, old, attempts \\ 100) do
     case Cairn.Registry.whereis(id, :camera) do
       pid when is_pid(pid) and pid != old ->
@@ -91,8 +105,8 @@ defmodule Cairn.CameraSupervisorTest do
         Process.sleep(10)
         wait_new_pid(id, old, attempts - 1)
 
-      other ->
-        other
+      _ ->
+        flunk("camera #{id} never came back with a new pid (was #{inspect(old)})")
     end
   end
 end

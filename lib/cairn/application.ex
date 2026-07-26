@@ -26,6 +26,8 @@ defmodule Cairn.Application do
       {Task.Supervisor, name: Cairn.TaskSupervisor},
       {Cairn.DetectionAggregator, []},
       {Cairn.EventSupervisor, []},
+      # Groups before cameras: a group listens on its members' UDP ports
+      {Cairn.PluginGroupSupervisor, []},
       {Cairn.CameraSupervisor, []},
       {Cairn.Retention, []},
       {CairnWeb.WebRTC.Supervisor, []},
