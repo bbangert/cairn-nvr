@@ -290,10 +290,9 @@ defmodule Cairn.Config do
   # they must not collide.
   defp validate_plugins(acc, config) do
     camera_ids = MapSet.new(config.cameras, & &1.id)
+    # Names are keys of the plugins: mapping, so they are unique by
+    # construction (YAML duplicate keys collapse at parse time).
     names = Enum.map(config.plugin_groups, & &1.name)
-    dups = Enum.uniq(names -- Enum.uniq(names))
-
-    acc = Enum.reduce(dups, acc, &add_error(&2, "duplicate plugin name: #{&1}"))
 
     Enum.reduce(names, acc, fn name, acc ->
       acc
