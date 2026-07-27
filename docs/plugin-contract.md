@@ -65,16 +65,26 @@ One JSON object per line on **stdout** (ndjson), flushed per line, at most
 ]}
 ```
 
-- `pts` — the RTP timestamp (90 kHz) of the analyzed frame. Required.
-- `dets` — possibly empty list. `label` string, `score` 0..1, `bbox`
-  `[x, y, w, h]` normalized to 0..1.
+- `pts` — the RTP timestamp (90 kHz) of the analyzed frame, as a **JSON
+  number**, not a string. Required; a line whose `pts` is `"90000"` is
+  dropped whole, and some JSON emitters do that to 64-bit values by default.
+- `dets` — possibly empty list, **at most 64 entries**. A longer list is a
+  contract violation, not a crowded frame: the whole line is dropped. (Cairn
+  tracks objects across batches at a cost quadratic in detections per line,
+  in one process shared by every camera.)
 - Emit at whatever rate you sample; ~5 fps is plenty. Empty `dets` lines
   are fine (and useful as a liveness signal).
 - Malformed lines are dropped by Cairn — they will not crash anything, but
-  they also won't detect anything. A detection that breaks the rules above
-  (`w`/`h` must also be greater than zero, `label` at most 64 bytes) is
-  dropped on its own; the rest of the line still counts. Drops are counted
-  and logged periodically.
+  they also won't detect anything. A detection that breaks the rules is
+  dropped on its own; the rest of the line still counts. Precisely, a
+  detection is kept iff:
+  - `label` is a string of 1..64 **bytes** (not characters) with no control
+    characters or escape sequences — printable text only;
+  - `score` is a number in 0..1;
+  - `bbox` is exactly four numbers `[x, y, w, h]` with `x`/`y` in 0..1 and
+    `w`/`h` in 0..1 and greater than zero.
+- Drops are counted per reason and logged at most once every few seconds,
+  with the running totals.
 
 ## Logging
 

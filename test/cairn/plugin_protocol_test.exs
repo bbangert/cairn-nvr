@@ -23,6 +23,9 @@ defmodule Cairn.PluginProtocolTest do
     {"multibyte label over 64 bytes", %{"label" => String.duplicate("é", 33)}},
     {"non-binary label", %{"label" => 12}},
     {"nil label", %{"label" => nil}},
+    {"label with a NUL byte", %{"label" => "per\0son"}},
+    {"label with an ANSI escape", %{"label" => "\e[2Jperson"}},
+    {"label with a newline", %{"label" => "person\nfake log line"}},
     {"string score", %{"score" => "0.9"}},
     {"score above 1", %{"score" => 5.0}},
     {"negative score", %{"score" => -0.1}},
@@ -86,5 +89,22 @@ defmodule Cairn.PluginProtocolTest do
 
   test "validate_dets on an empty list" do
     assert PluginProtocol.validate_dets([]) == {[], 0}
+  end
+
+  test "validate_dets keeps a list at the 64-det cap" do
+    dets = List.duplicate(@base, 64)
+    assert {kept, 0} = PluginProtocol.validate_dets(dets)
+    assert length(kept) == 64
+  end
+
+  test "validate_dets rejects an over-cap list whole, counting every entry" do
+    dets = List.duplicate(@base, 65)
+    assert PluginProtocol.validate_dets(dets) == {[], 65}
+  end
+
+  test "validate_dets is total on a non-list" do
+    assert PluginProtocol.validate_dets(%{"label" => "person"}) == {[], 1}
+    assert PluginProtocol.validate_dets("dets") == {[], 1}
+    assert PluginProtocol.validate_dets(nil) == {[], 1}
   end
 end

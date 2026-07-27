@@ -26,9 +26,11 @@ defmodule Cairn.PluginPort do
   @backoff_min_ms 1_000
   @backoff_max_ms 30_000
   @max_line 65_536
-  # A broken plugin produces a drop per frame, and this log shares its volume
-  # with the recordings.
-  @drop_log_every 100
+  # A broken plugin produces a drop per frame — thousands per line, if the line
+  # is one long list of invalid dets — and this log shares its volume with the
+  # recordings. Time, not a drop count, is what has to bound the log rate: a
+  # counter limiter emits once per burst, and bursts are attacker-sized.
+  @drop_log_interval_ms 5_000
 
   defstruct camera: nil,
             config: nil,
@@ -37,7 +39,8 @@ defmodule Cairn.PluginPort do
             os_pid: nil,
             backoff_ms: nil,
             skipping_long_line: false,
-            drops: 0,
+            drops: %{},
+            last_drop_log_ms: nil,
             opts: []
 
   def start_link(opts) do
@@ -122,11 +125,14 @@ defmodule Cairn.PluginPort do
       {:ok, %{"pts" => pts, "dets" => dets}} when is_number(pts) and is_list(dets) ->
         forward(state, pts, dets)
 
+      {:ok, %{"pts" => _pts, "dets" => dets}} when is_list(dets) ->
+        note_drops(state, 1, :non_numeric_pts)
+
       {:ok, _other} ->
-        note_drop(state, "line missing pts/dets")
+        note_drops(state, 1, :missing_fields)
 
       {:error, _} ->
-        note_drop(state, "malformed line")
+        note_drops(state, 1, :malformed_line)
     end
   end
 
@@ -137,25 +143,32 @@ defmodule Cairn.PluginPort do
     aggregator = Keyword.get(state.opts, :aggregator, Cairn.DetectionAggregator)
     Cairn.DetectionAggregator.detections(aggregator, state.camera, windows, pts, dets)
 
-    note_invalid_dets(state, invalid)
+    note_drops(state, invalid, :invalid_det)
   end
 
-  defp note_invalid_dets(state, 0), do: state
+  # Counted per reason class, always; logged at most once per
+  # @drop_log_interval_ms, summarizing every class seen so far. The counters
+  # reset with the OS process, so a fixed plugin logs again after its restart.
+  # `class` is a fixed atom — never plugin-supplied data, which would make the
+  # map a plugin-growable term.
+  defp note_drops(state, 0, _class), do: state
 
-  defp note_invalid_dets(state, count) do
-    Enum.reduce(1..count//1, state, fn _, state -> note_drop(state, "invalid det") end)
-  end
+  defp note_drops(state, count, class) do
+    drops = Map.update(state.drops, class, count, &(&1 + count))
+    now = System.monotonic_time(:millisecond)
 
-  # Counted always, logged first and every @drop_log_every-th; the counter
-  # resets with the OS process, so a fixed plugin logs again after its restart.
-  defp note_drop(state, reason) do
-    drops = state.drops + 1
-
-    if rem(drops, @drop_log_every) == 1 do
-      Logger.warning("camera #{state.camera.id}: #{reason}, dropped (#{drops} so far)")
+    if state.last_drop_log_ms == nil or now - state.last_drop_log_ms >= @drop_log_interval_ms do
+      Logger.warning("camera #{state.camera.id}: dropped lines/dets: #{summarize_drops(drops)}")
+      %{state | drops: drops, last_drop_log_ms: now}
+    else
+      %{state | drops: drops}
     end
+  end
 
-    %{state | drops: drops}
+  defp summarize_drops(drops) do
+    total = drops |> Map.values() |> Enum.sum()
+    detail = Enum.map_join(Enum.sort(drops), ", ", fn {class, n} -> "#{class} ×#{n}" end)
+    "#{detail} (#{total} total)"
   end
 
   defp spawn_plugin(state) do
@@ -175,7 +188,14 @@ defmodule Cairn.PluginPort do
         nil -> nil
       end
 
-    %{state | port: port, os_pid: os_pid, skipping_long_line: false, drops: 0}
+    %{
+      state
+      | port: port,
+        os_pid: os_pid,
+        skipping_long_line: false,
+        drops: %{},
+        last_drop_log_ms: nil
+    }
   end
 
   defp spawn_command(state) do

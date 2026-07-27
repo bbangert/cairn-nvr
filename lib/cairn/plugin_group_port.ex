@@ -35,8 +35,11 @@ defmodule Cairn.PluginGroupPort do
   @backoff_max_ms 30_000
   @max_line 65_536
   # A plugin pointed at the wrong group produces an undeliverable line per
-  # frame per camera, and this log shares its volume with the recordings.
-  @drop_log_every 100
+  # frame per camera — and one line of invalid dets is thousands of drops on
+  # its own — while this log shares its volume with the recordings. Time, not
+  # a drop count, is what has to bound the log rate: a counter limiter emits
+  # once per burst, and bursts are attacker-sized.
+  @drop_log_interval_ms 5_000
   @id_preview 64
 
   defstruct group: nil,
@@ -46,7 +49,8 @@ defmodule Cairn.PluginGroupPort do
             os_pid: nil,
             backoff_ms: nil,
             skipping_long_line: false,
-            drops: 0,
+            drops: %{},
+            last_drop_log_ms: nil,
             opts: []
 
   def start_link(opts) do
@@ -164,11 +168,14 @@ defmodule Cairn.PluginGroupPort do
       when is_number(pts) and is_list(dets) ->
         route(state, camera_id, pts, dets)
 
+      {:ok, %{"camera_id" => _id, "pts" => _pts, "dets" => dets}} when is_list(dets) ->
+        note_drops(state, 1, :non_numeric_pts)
+
       {:ok, _other} ->
-        note_drop(state, "line missing camera_id/pts/dets")
+        note_drops(state, 1, :missing_fields)
 
       {:error, _} ->
-        note_drop(state, "malformed line")
+        note_drops(state, 1, :malformed_line)
     end
   end
 
@@ -178,28 +185,49 @@ defmodule Cairn.PluginGroupPort do
         forward(state, cam, windows, pts, dets)
 
       :error ->
-        note_drop(state, "line for unknown camera #{preview(camera_id)}")
+        note_drops(state, 1, :unknown_camera, preview(camera_id))
     end
   end
 
-  # Counted always, logged first and every @drop_log_every-th; the counter
-  # resets with the OS process, so a fixed plugin logs again after its restart.
-  defp note_drop(state, reason) do
-    drops = state.drops + 1
+  # Counted per reason class, always; logged at most once per
+  # @drop_log_interval_ms, summarizing every class seen so far. The counters
+  # reset with the OS process, so a fixed plugin logs again after its restart.
+  # `class` is a fixed atom — never plugin-supplied data, which would make the
+  # map a plugin-growable term. Plugin-supplied `detail` stays in the message.
+  defp note_drops(state, count, class, detail \\ nil)
 
-    if rem(drops, @drop_log_every) == 1 do
-      Logger.warning("plugin group #{state.group.name}: #{reason}, dropped (#{drops} so far)")
+  defp note_drops(state, 0, _class, _detail), do: state
+
+  defp note_drops(state, count, class, detail) do
+    drops = Map.update(state.drops, class, count, &(&1 + count))
+    now = System.monotonic_time(:millisecond)
+
+    if state.last_drop_log_ms == nil or now - state.last_drop_log_ms >= @drop_log_interval_ms do
+      Logger.warning(
+        "plugin group #{state.group.name}: dropped lines/dets: " <>
+          summarize_drops(drops) <> latest_detail(class, detail)
+      )
+
+      %{state | drops: drops, last_drop_log_ms: now}
+    else
+      %{state | drops: drops}
     end
-
-    %{state | drops: drops}
   end
+
+  defp summarize_drops(drops) do
+    total = drops |> Map.values() |> Enum.sum()
+    detail = Enum.map_join(Enum.sort(drops), ", ", fn {class, n} -> "#{class} ×#{n}" end)
+    "#{detail} (#{total} total)"
+  end
+
+  defp latest_detail(_class, nil), do: ""
+  defp latest_detail(class, detail), do: "; latest #{class}: #{detail}"
 
   # `camera_id` is plugin-supplied and can be any JSON value up to the line
-  # limit; only a short prefix is worth logging.
-  defp preview(camera_id) when is_binary(camera_id),
-    do: camera_id |> String.slice(0, @id_preview) |> inspect()
-
-  defp preview(other), do: inspect(other, limit: 3, printable_limit: @id_preview)
+  # limit. `inspect/2` escapes control bytes (no forged log lines) and
+  # `printable_limit` bounds a binary by *bytes* — `String.slice/3` would not,
+  # since one grapheme cluster can be arbitrarily long.
+  defp preview(camera_id), do: inspect(camera_id, limit: 3, printable_limit: @id_preview)
 
   defp forward(state, cam, windows, pts, dets) do
     {dets, invalid} = PluginProtocol.validate_dets(dets)
@@ -207,13 +235,7 @@ defmodule Cairn.PluginGroupPort do
     aggregator = Keyword.get(state.opts, :aggregator, Cairn.DetectionAggregator)
     Cairn.DetectionAggregator.detections(aggregator, cam, windows, pts, dets)
 
-    note_invalid_dets(state, invalid)
-  end
-
-  defp note_invalid_dets(state, 0), do: state
-
-  defp note_invalid_dets(state, count) do
-    Enum.reduce(1..count//1, state, fn _, state -> note_drop(state, "invalid det") end)
+    note_drops(state, invalid, :invalid_det)
   end
 
   defp spawn_plugin(state) do
@@ -233,7 +255,14 @@ defmodule Cairn.PluginGroupPort do
         nil -> nil
       end
 
-    %{state | port: port, os_pid: os_pid, skipping_long_line: false, drops: 0}
+    %{
+      state
+      | port: port,
+        os_pid: os_pid,
+        skipping_long_line: false,
+        drops: %{},
+        last_drop_log_ms: nil
+    }
   end
 
   defp spawn_command(state) do

@@ -27,13 +27,25 @@ defmodule Cairn.TrackerTest do
       arities ++
         for(v <- values, do: [v, 0.1, 0.2, 0.2]) ++ for(v <- values, do: [0.1, 0.1, v, 0.2])
 
-    for bbox <- bboxes,
-        {:ok, valid} <- [
-          PluginProtocol.validate_det(%{"label" => "person", "score" => 0.9, "bbox" => bbox})
-        ] do
-      assert [a, b, c, d] = valid.bbox
+    valid =
+      for bbox <- bboxes,
+          {:ok, det} <- [
+            PluginProtocol.validate_det(%{"label" => "person", "score" => 0.9, "bbox" => bbox})
+          ],
+          do: det
+
+    # non-vacuity: the generator silently skips every :error, so a validator
+    # that rejected everything would otherwise pass this test with no assertions
+    assert length(valid) == 6
+
+    for det <- valid do
+      assert [a, b, c, d] = det.bbox
       assert Enum.all?([a, b, c, d], &is_number/1)
-      assert {_tracker, [%{object_id: _}]} = Tracker.track(Tracker.new(), [valid])
+
+      # a stored object compared against a follow-up same-label batch is the
+      # path that calls iou/2 — tracking against an empty tracker never does
+      {tracker, [%{object_id: id}]} = Tracker.track(Tracker.new(), [det])
+      assert {_t, [%{object_id: ^id}]} = Tracker.track(tracker, [det])
     end
   end
 
