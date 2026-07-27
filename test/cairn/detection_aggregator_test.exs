@@ -1,8 +1,8 @@
 defmodule Cairn.DetectionAggregatorTest do
   use ExUnit.Case, async: false
 
-  alias Cairn.{DetectionAggregator, Event, EventCheckpoint}
   alias Cairn.Config.Camera
+  alias Cairn.{DetectionAggregator, Event, EventCheckpoint, StreamEpochs}
 
   @windows %{pre: 5, post: 10, max: 300}
 
@@ -100,6 +100,109 @@ defmodule Cairn.DetectionAggregatorTest do
     assert event.max_scores == %{"person" => 0.95}
     # same physical object keeps its tracker id
     assert [%{object_id: oid}, %{object_id: oid}] = event.labels
+  end
+
+  test "a new stream epoch ends tracks: object ids are not inherited", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    detect(agg, camera)
+    assert_receive {:event_started, %Event{labels: [%{object_id: first}]}}
+
+    # minted through the real server, so dropping StreamEpochs.subscribe/0 from
+    # the aggregator fails here. new_epoch/2 returns only once the broadcast has
+    # been delivered, and the barrier keeps the next batch behind it — the two
+    # senders differ, so nothing else orders them.
+    StreamEpochs.new_epoch(id, :source_lost)
+    _ = :sys.get_state(agg)
+
+    # identical bbox: only the epoch reset stops the tracker from matching it
+    # onto the object from before the outage
+    detect(agg, camera)
+    assert_receive {:event_updated, %Event{labels: [_, %{object_id: second}]}}
+    refute second == first
+    # Tracker.reset/1 keeps the id counter advancing; Tracker.new/0 would not
+    assert second > first
+  end
+
+  test "a repeat of the current epoch does not end tracks", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    detect(agg, camera)
+    assert_receive {:event_started, %Event{labels: [%{object_id: first}]}}
+
+    epoch = StreamEpochs.new_epoch(id, :source_lost)
+    _ = :sys.get_state(agg)
+
+    detect(agg, camera)
+    assert_receive {:event_updated, %Event{labels: [_, %{object_id: second}]}}
+    refute second == first
+
+    # StreamEpochs may announce one mint twice (degraded caller-side broadcast
+    # plus a late server broadcast of the same epoch) — the repeat must not cut
+    # the tracks that the first announcement already started
+    send(agg, {:stream_epoch, id, epoch, :source_lost})
+    _ = :sys.get_state(agg)
+
+    detect(agg, camera)
+    assert_receive {:event_updated, %Event{labels: [_, _, %{object_id: ^second}]}}
+  end
+
+  test "a repeat of an epoch announced before the first detection does not end tracks", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    # the real order of events for every camera: ffmpeg spawns and mints an
+    # epoch, and only then does the plugin produce anything to track
+    epoch = StreamEpochs.new_epoch(id, :started)
+    _ = :sys.get_state(agg)
+
+    detect(agg, camera)
+    assert_receive {:event_started, %Event{labels: [%{object_id: first}]}}
+
+    # the same mint announced a second time (degraded caller broadcast plus a
+    # late server broadcast). No boundary was crossed, so the track that the
+    # camera's very first epoch already covers must survive
+    send(agg, {:stream_epoch, id, epoch, :started})
+    _ = :sys.get_state(agg)
+
+    detect(agg, camera)
+    assert_receive {:event_updated, %Event{labels: [_, %{object_id: ^first}]}}
+  end
+
+  test "an epoch announced before the first detection still yields to a new one", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    StreamEpochs.new_epoch(id, :started)
+    _ = :sys.get_state(agg)
+
+    detect(agg, camera)
+    assert_receive {:event_started, %Event{labels: [%{object_id: first}]}}
+
+    StreamEpochs.new_epoch(id, :source_lost)
+    _ = :sys.get_state(agg)
+
+    detect(agg, camera)
+    assert_receive {:event_updated, %Event{labels: [_, %{object_id: second}]}}
+    refute second == first
+  end
+
+  test "a stopped camera's epoch is forgotten", %{agg: agg, camera_id: id} do
+    epoch = StreamEpochs.new_epoch(id, :started)
+    _ = :sys.get_state(agg)
+    assert :sys.get_state(agg).epochs[id] == epoch
+
+    # nothing decodes under a :camera_stopped epoch, so remembering it would
+    # only retain a row for a camera that may never come back
+    StreamEpochs.new_epoch(id, :camera_stopped)
+    _ = :sys.get_state(agg)
+    refute Map.has_key?(:sys.get_state(agg).epochs, id)
   end
 
   test "post-window timeout finalizes", %{agg: agg, camera: camera, camera_id: id} do

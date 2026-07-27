@@ -13,7 +13,8 @@ defmodule Cairn.RingBuffer do
       extractors (drain + subscribe happen atomically in one call).
 
   A new init segment (ffmpeg respawn) clears the ring: pts restart at ~0,
-  so pre-window content from the old session is no longer addressable.
+  so pre-window content from the old session is no longer addressable. Each
+  init segment is tagged with the stream epoch it opened (`Cairn.StreamEpochs`).
   Fragment `seq` is re-stamped with a per-camera counter that is monotonic
   across sessions (HLS media sequence relies on this).
   """
@@ -29,6 +30,7 @@ defmodule Cairn.RingBuffer do
             init: nil,
             codec: nil,
             timescale: 90_000,
+            epoch: nil,
             next_seq: 0,
             subscribers: %{},
             last_fragment_at: nil
@@ -44,9 +46,11 @@ defmodule Cairn.RingBuffer do
   @spec topic(String.t()) :: String.t()
   def topic(camera_id), do: "camera:#{camera_id}:fragments"
 
-  @spec put_init(String.t(), binary(), String.t() | nil, pos_integer()) :: :ok
-  def put_init(camera_id, data, codec, timescale) do
-    GenServer.cast(name(camera_id), {:init, data, codec, timescale})
+  @doc "Stores the init segment of the `epoch` (see `Cairn.StreamEpochs`) it belongs to."
+  @spec put_init(String.t(), binary(), String.t() | nil, pos_integer(), Cairn.ULID.t() | nil) ::
+          :ok
+  def put_init(camera_id, data, codec, timescale, epoch) do
+    GenServer.cast(name(camera_id), {:init, data, codec, timescale, epoch})
   end
 
   @spec put_fragment(String.t(), Fragment.t()) :: :ok
@@ -60,7 +64,13 @@ defmodule Cairn.RingBuffer do
   subsequent fragment as `{:ring_fragment, frag}`.
   """
   @spec drain_and_subscribe(String.t(), non_neg_integer() | nil, pid()) ::
-          {:ok, %{init: binary() | nil, codec: String.t() | nil, fragments: [Fragment.t()]}}
+          {:ok,
+           %{
+             init: binary() | nil,
+             codec: String.t() | nil,
+             epoch: Cairn.ULID.t() | nil,
+             fragments: [Fragment.t()]
+           }}
   def drain_and_subscribe(camera_id, since_pts, pid) do
     GenServer.call(name(camera_id), {:drain_and_subscribe, since_pts, pid})
   end
@@ -97,12 +107,20 @@ defmodule Cairn.RingBuffer do
   end
 
   @impl true
-  def handle_cast({:init, data, codec, timescale}, state) do
-    meta = %{camera_id: state.camera_id, codec: codec, timescale: timescale}
+  def handle_cast({:init, data, codec, timescale, epoch}, state) do
+    meta = %{camera_id: state.camera_id, codec: codec, timescale: timescale, epoch: epoch}
     broadcast(state, {:init_segment, meta})
 
     {:noreply,
-     %{state | init: data, codec: codec, timescale: timescale, frags: :queue.new(), count: 0}}
+     %{
+       state
+       | init: data,
+         codec: codec,
+         timescale: timescale,
+         epoch: epoch,
+         frags: :queue.new(),
+         count: 0
+     }}
   end
 
   def handle_cast({:fragment, %Fragment{} = frag}, state) do
@@ -143,7 +161,9 @@ defmodule Cairn.RingBuffer do
         %{state | subscribers: Map.put(state.subscribers, pid, ref)}
       end
 
-    {:reply, {:ok, %{init: state.init, codec: state.codec, fragments: fragments}}, state}
+    {:reply,
+     {:ok, %{init: state.init, codec: state.codec, epoch: state.epoch, fragments: fragments}},
+     state}
   end
 
   def handle_call(:last_fragment_at, _from, state) do

@@ -96,4 +96,13 @@ defmodule Cairn.TrackerTest do
 
     refute a.object_id == b.object_id
   end
+
+  test "reset drops objects without reusing their ids" do
+    box = [0.1, 0.1, 0.2, 0.4]
+    {t, [a]} = Tracker.track(Tracker.new(), [det("person", box)])
+
+    {_t, [b]} = Tracker.track(Tracker.reset(t), [det("person", box)])
+
+    refute b.object_id == a.object_id
+  end
 end

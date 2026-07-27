@@ -5,6 +5,7 @@ defmodule Cairn.FFmpegPortTest do
   alias Cairn.Config.Camera
   alias Cairn.FFmpegPort
   alias Cairn.RingBuffer
+  alias Cairn.StreamEpochs
 
   @fixture Path.absname("test/support/fixtures/media/testsrc.fmp4")
   @fake Path.absname("test/support/fake_ffmpeg.sh")
@@ -123,6 +124,55 @@ defmodule Cairn.FFmpegPortTest do
     end
   end
 
+  describe "stream epochs" do
+    test "every spawn mints a new epoch and tags its init segment with it" do
+      id = "ff_#{System.unique_integer([:positive])}"
+      StreamEpochs.subscribe()
+      Phoenix.PubSub.subscribe(Cairn.PubSub, RingBuffer.topic(id))
+
+      # fake exits with 42 after streaming -> backoff -> second spawn
+      start_pipeline(id, "#{@fake} #{@fixture} 0.05 42", [])
+
+      # each half of this is separately covered (minting here, propagation in
+      # RingBufferTest); only asserting both together pins that the port hands
+      # the ring the epoch of the spawn that produced the init segment
+      assert_receive {:stream_epoch, ^id, first, :started}, 2_000
+      assert_receive {:init_segment, %{camera_id: ^id, epoch: ^first}}, 3_000
+
+      assert_receive {:stream_epoch, ^id, second, :source_lost}, 5_000
+      assert_receive {:init_segment, %{camera_id: ^id, epoch: ^second}}, 5_000
+      assert first != second
+
+      assert {:ok, current} = StreamEpochs.current(id)
+      assert current != first
+    end
+
+    test "a stall bounce mints its epoch with the :stall_bounce reason" do
+      id = "ff_#{System.unique_integer([:positive])}"
+      StreamEpochs.subscribe()
+
+      # cats fixture then sleeps far longer than stall_seconds (1s)
+      start_pipeline(id, "#{@fake} #{@fixture} 30 0", [])
+
+      assert_receive {:stream_epoch, ^id, _first, :started}, 2_000
+      assert_receive {:stream_epoch, ^id, _second, :stall_bounce}, 5_000
+    end
+
+    test "stopping the camera announces the end of the stream" do
+      id = "ff_#{System.unique_integer([:positive])}"
+      StreamEpochs.subscribe()
+
+      pid = start_pipeline(id, "#{@fake} #{@fixture} 30 0", [])
+      assert_receive {:stream_epoch, ^id, _epoch, :started}, 2_000
+
+      ref = Process.monitor(pid)
+      stop_supervised!(FFmpegPort)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
+
+      assert_receive {:stream_epoch, ^id, _stopped, :camera_stopped}
+    end
+  end
+
   defp wait_for_fragments(id, min_count, deadline_ms \\ 3_000) do
     deadline = System.monotonic_time(:millisecond) + deadline_ms
     do_wait(id, min_count, deadline)
@@ -136,7 +186,7 @@ defmodule Cairn.FFmpegPortTest do
         {:ok, result}
 
       System.monotonic_time(:millisecond) > deadline ->
-        {:ok, result}
+        flunk("only #{length(frags)} fragments buffered for #{id}, wanted #{min_count}")
 
       true ->
         Process.sleep(50)
