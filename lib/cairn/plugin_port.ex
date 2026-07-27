@@ -11,17 +11,26 @@ defmodule Cairn.PluginPort do
   Each decoded line (`{"pts": _, "dets": [{"label", "score", "bbox"}]}`)
   is forwarded to `Cairn.DetectionAggregator` together with the camera's
   config and effective windows, so the aggregator never has to look up
-  config. Malformed lines are logged and dropped. Exit -> jittered backoff
-  respawn, same policy as `Cairn.FFmpegPort`.
+  config. Lines that do not match the contract are dropped, as are
+  individual detections `Cairn.PluginProtocol` rejects — counted always,
+  logged periodically. Exit -> jittered backoff respawn, same policy as
+  `Cairn.FFmpegPort`.
   """
 
   use GenServer
 
   require Logger
 
+  alias Cairn.PluginProtocol
+
   @backoff_min_ms 1_000
   @backoff_max_ms 30_000
-  @max_line 8_192
+  @max_line 65_536
+  # A broken plugin produces a drop per frame — thousands per line, if the line
+  # is one long list of invalid dets — and this log shares its volume with the
+  # recordings. Time, not a drop count, is what has to bound the log rate: a
+  # counter limiter emits once per burst, and bursts are attacker-sized.
+  @drop_log_interval_ms 5_000
 
   defstruct camera: nil,
             config: nil,
@@ -30,6 +39,8 @@ defmodule Cairn.PluginPort do
             os_pid: nil,
             backoff_ms: nil,
             skipping_long_line: false,
+            drops: %{},
+            last_drop_log_ms: nil,
             opts: []
 
   def start_link(opts) do
@@ -78,8 +89,7 @@ defmodule Cairn.PluginPort do
     if state.skipping_long_line do
       {:noreply, %{state | skipping_long_line: false}}
     else
-      handle_line(line, state)
-      {:noreply, state}
+      {:noreply, handle_line(line, state)}
     end
   end
 
@@ -112,27 +122,53 @@ defmodule Cairn.PluginPort do
 
   defp handle_line(line, state) do
     case Jason.decode(line) do
-      {:ok, %{"pts" => pts, "dets" => dets}} when is_list(dets) ->
+      {:ok, %{"pts" => pts, "dets" => dets}} when is_number(pts) and is_list(dets) ->
         forward(state, pts, dets)
 
+      {:ok, %{"pts" => _pts, "dets" => dets}} when is_list(dets) ->
+        note_drops(state, 1, :non_numeric_pts)
+
       {:ok, _other} ->
-        Logger.warning("camera #{state.camera.id}: plugin line missing pts/dets, dropped")
+        note_drops(state, 1, :missing_fields)
 
       {:error, _} ->
-        Logger.warning("camera #{state.camera.id}: malformed plugin line dropped")
+        note_drops(state, 1, :malformed_line)
     end
   end
 
   defp forward(state, pts, dets) do
-    dets =
-      for %{"label" => label, "score" => score, "bbox" => bbox} <- dets,
-          is_binary(label) and is_number(score) and is_list(bbox) do
-        %{label: label, score: score / 1, bbox: bbox}
-      end
+    {dets, invalid} = PluginProtocol.validate_dets(dets)
 
     windows = Cairn.Config.windows(state.config, state.camera)
     aggregator = Keyword.get(state.opts, :aggregator, Cairn.DetectionAggregator)
     Cairn.DetectionAggregator.detections(aggregator, state.camera, windows, pts, dets)
+
+    note_drops(state, invalid, :invalid_det)
+  end
+
+  # Counted per reason class, always; logged at most once per
+  # @drop_log_interval_ms, summarizing every class seen so far. The counters
+  # reset with the OS process, so a fixed plugin logs again after its restart.
+  # `class` is a fixed atom — never plugin-supplied data, which would make the
+  # map a plugin-growable term.
+  defp note_drops(state, 0, _class), do: state
+
+  defp note_drops(state, count, class) do
+    drops = Map.update(state.drops, class, count, &(&1 + count))
+    now = System.monotonic_time(:millisecond)
+
+    if state.last_drop_log_ms == nil or now - state.last_drop_log_ms >= @drop_log_interval_ms do
+      Logger.warning("camera #{state.camera.id}: dropped lines/dets: #{summarize_drops(drops)}")
+      %{state | drops: drops, last_drop_log_ms: now}
+    else
+      %{state | drops: drops}
+    end
+  end
+
+  defp summarize_drops(drops) do
+    total = drops |> Map.values() |> Enum.sum()
+    detail = Enum.map_join(Enum.sort(drops), ", ", fn {class, n} -> "#{class} ×#{n}" end)
+    "#{detail} (#{total} total)"
   end
 
   defp spawn_plugin(state) do
@@ -152,7 +188,14 @@ defmodule Cairn.PluginPort do
         nil -> nil
       end
 
-    %{state | port: port, os_pid: os_pid, skipping_long_line: false}
+    %{
+      state
+      | port: port,
+        os_pid: os_pid,
+        skipping_long_line: false,
+        drops: %{},
+        last_drop_log_ms: nil
+    }
   end
 
   defp spawn_command(state) do
