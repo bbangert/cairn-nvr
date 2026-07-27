@@ -487,7 +487,7 @@ defmodule Cairn.TrackerTest do
     assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
   end
 
-  describe "end_all/2" do
+  describe "end_all/3" do
     test "ends every live track with the given reason and returns a fresh tracker" do
       dets = [det("person", [0.1, 0.1, 0.2, 0.4]), det("cat", [0.7, 0.1, 0.2, 0.4])]
       {t, tagged, _} = track(Tracker.new(), dets)
@@ -502,6 +502,38 @@ defmodule Cairn.TrackerTest do
       # nothing matches across the cut
       {_t, [a], _} = track(fresh, [det("person", [0.1, 0.1, 0.2, 0.4])], media_ms: 200)
       refute a.object_id in Enum.map(tagged, & &1.object_id)
+    end
+
+    test "keep_ended: true carries the ended plugin ids over the cut" do
+      {t, [a], _} =
+        track(
+          Tracker.new(),
+          [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1")],
+          plugin_ctx([])
+        )
+
+      {t, _, _} = track(t, [], plugin_ctx(media_ms: 200, ended_tracks: ["t1"]))
+
+      # the cut keeps the epoch, so "t1" is still an id the plugin ended
+      {kept, _} = Tracker.end_all(t, :detection_disabled, keep_ended: true)
+
+      {{_t, [reused], _}, log} =
+        with_log(fn ->
+          track(kept, [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1")], plugin_ctx([]))
+        end)
+
+      assert log =~ "reused track id \"t1\" after ending it"
+      refute reused.object_id == a.object_id
+
+      # the default drops it: correct only where the epoch changes too
+      {dropped, _} = Tracker.end_all(t, :stream_reset)
+
+      {_result, log} =
+        with_log(fn ->
+          track(dropped, [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1")], plugin_ctx([]))
+        end)
+
+      refute log =~ "reused track id"
     end
   end
 

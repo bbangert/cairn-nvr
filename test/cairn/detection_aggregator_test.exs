@@ -2,6 +2,7 @@ defmodule Cairn.DetectionAggregatorTest do
   use ExUnit.Case, async: false
 
   import Cairn.TrackAssertions
+  import ExUnit.CaptureLog, only: [capture_log: 1]
 
   alias Cairn.Config.Camera
   alias Cairn.{DetectionAggregator, Event, EventCheckpoint, Observation, StreamEpochs, Track}
@@ -370,6 +371,41 @@ defmodule Cairn.DetectionAggregatorTest do
     detect(agg, camera)
     _ = :sys.get_state(agg)
     refute_received {:track_ended, _}
+  end
+
+  test "an id the plugin ended is still known after a detection toggle", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    live = object("person", 0.9, [0.0, 0.0, 0.1, 0.1], "detected", "t1")
+    other = object("person", 0.9, [0.8, 0.8, 0.1, 0.1], "detected", "t2")
+
+    observe(agg, camera, [live, other], tracking: true)
+    assert_receive {:track_started, %Track{object_id: ended_oid, plugin_track_id: "t1"}}
+    assert_receive {:track_started, %Track{plugin_track_id: "t2"}}
+
+    # "t1" is ended by the plugin; "t2" stays live so the toggle below has
+    # something to end
+    observe(agg, camera, [other], tracking: true, media_ms: 1_200.0, ended_tracks: ["t1"])
+    assert_receive {:track_ended, %Track{object_id: ^ended_oid, end_reason: :plugin_ended}}
+
+    Cairn.CameraControl.set(id, %{detection_enabled: false})
+    observe(agg, camera, [other], tracking: true, media_ms: 1_400.0)
+    assert_receive {:track_ended, %Track{plugin_track_id: "t2", end_reason: :detection_disabled}}
+    Cairn.CameraControl.set(id, %{detection_enabled: true})
+
+    # the toggle did not change the epoch, so reusing "t1" is the same contract
+    # violation it was before it — reported, and given a fresh identity
+    log =
+      capture_log(fn ->
+        observe(agg, camera, [live], tracking: true, media_ms: 1_600.0)
+        _ = :sys.get_state(agg)
+      end)
+
+    assert log =~ ~s(reused track id "t1" after ending it)
+    assert_receive {:track_started, %Track{object_id: new_oid, plugin_track_id: "t1"}}
+    refute new_oid == ended_oid
   end
 
   test "checkpoint writes are throttled between an event's first and last", %{

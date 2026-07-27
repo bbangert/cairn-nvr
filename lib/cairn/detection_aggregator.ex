@@ -219,9 +219,14 @@ defmodule Cairn.DetectionAggregator do
     }
   end
 
+  # `keep_ended: true`, unlike the epoch cuts below: the epoch is unchanged
+  # across a detection toggle, so the plugin ids already declared ended must
+  # stay known — reusing one after re-enabling is the same contract violation
+  # it was before.
   defp end_tracks_disabled(state, camera_id) do
     with %{^camera_id => cam} <- state.cameras,
-         {tracker, [_ | _] = ended} <- Tracker.end_all(cam.tracker, :detection_disabled) do
+         {tracker, [_ | _] = ended} <-
+           Tracker.end_all(cam.tracker, :detection_disabled, keep_ended: true) do
       put_cam(state, camera_id, publish_tracks(%{cam | tracker: tracker}, ended, state))
     else
       # no tracker state, or nothing live: the second disabled batch onwards is

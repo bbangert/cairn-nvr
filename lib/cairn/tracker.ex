@@ -149,14 +149,27 @@ defmodule Cairn.Tracker do
   end
 
   @doc """
-  Ends every live track with `reason` and returns a fresh tracker.
+  Ends every live track with `reason` and returns an emptied tracker.
 
   Used at a stream-epoch boundary: no track may span the cut, and every track
   owes its consumers a final summary.
+
+  `keep_ended: true` carries the plugin ids already declared ended over to the
+  new tracker, so their reuse is still reported as the contract violation it
+  is. Which of the two is right follows from the identity key: an epoch cut
+  changes `epoch`, so a stale ended entry can never match again and is dropped
+  with the rest of the state. A cut *inside* an epoch (detection toggled off
+  and back on) leaves the key untouched — drop the memory there and a plugin
+  reusing an id it ended is silently given a fresh identity instead.
   """
-  @spec end_all(t(), Track.end_reason()) :: {t(), [event()]}
-  def end_all(%__MODULE__{} = tracker, reason) do
-    {new(), for({_id, object} <- tracker.objects, do: {:ended, to_track(object, reason)})}
+  @spec end_all(t(), Track.end_reason(), keyword()) :: {t(), [event()]}
+  def end_all(%__MODULE__{} = tracker, reason, opts \\ []) do
+    emptied =
+      if Keyword.get(opts, :keep_ended, false),
+        do: %__MODULE__{ended: tracker.ended, ended_seq: tracker.ended_seq},
+        else: new()
+
+    {emptied, for({_id, object} <- tracker.objects, do: {:ended, to_track(object, reason)})}
   end
 
   @doc "Summaries of the currently live tracks (ULID order, so mint order)."
