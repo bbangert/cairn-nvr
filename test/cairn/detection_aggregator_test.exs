@@ -1,8 +1,8 @@
 defmodule Cairn.DetectionAggregatorTest do
   use ExUnit.Case, async: false
 
-  alias Cairn.{DetectionAggregator, Event, EventCheckpoint}
   alias Cairn.Config.Camera
+  alias Cairn.{DetectionAggregator, Event, EventCheckpoint, StreamEpochs}
 
   @windows %{pre: 5, post: 10, max: 300}
 
@@ -110,13 +110,20 @@ defmodule Cairn.DetectionAggregatorTest do
     detect(agg, camera)
     assert_receive {:event_started, %Event{labels: [%{object_id: first}]}}
 
-    send(agg, {:stream_epoch, id, Cairn.ULID.generate(), :source_lost})
+    # minted through the real server, so dropping StreamEpochs.subscribe/0 from
+    # the aggregator fails here. new_epoch/2 returns only once the broadcast has
+    # been delivered, and the barrier keeps the next batch behind it — the two
+    # senders differ, so nothing else orders them.
+    StreamEpochs.new_epoch(id, :source_lost)
+    _ = :sys.get_state(agg)
 
     # identical bbox: only the epoch reset stops the tracker from matching it
     # onto the object from before the outage
     detect(agg, camera)
     assert_receive {:event_updated, %Event{labels: [_, %{object_id: second}]}}
     refute second == first
+    # Tracker.reset/1 keeps the id counter advancing; Tracker.new/0 would not
+    assert second > first
   end
 
   test "post-window timeout finalizes", %{agg: agg, camera: camera, camera_id: id} do

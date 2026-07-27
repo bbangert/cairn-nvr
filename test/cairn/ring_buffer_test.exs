@@ -86,12 +86,22 @@ defmodule Cairn.RingBufferTest do
   end
 
   test "dead subscribers are cleaned up via monitor", %{camera_id: id} do
+    ring = GenServer.whereis(Cairn.Registry.via(id, :ring_buffer))
+
     pid = spawn(fn -> Process.sleep(:infinity) end)
     {:ok, _} = RingBuffer.drain_and_subscribe(id, nil, pid)
-    Process.exit(pid, :kill)
+    assert map_size(:sys.get_state(ring).subscribers) == 1
 
-    # give the ring time to process :DOWN, then ensure no crash on fanout
-    Process.sleep(50)
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+
+    # the ring's own :DOWN comes from a different sender than our calls, so
+    # nothing orders it against them — poll for the handler having run.
+    # Fanning out to a dead pid never raises, so the subscriber map is the
+    # only observable difference the :DOWN handler makes.
+    wait_until(fn -> map_size(:sys.get_state(ring).subscribers) == 0 end)
+
     fill(id, 0..1)
     {:ok, %{fragments: frags}} = RingBuffer.fetch_recent(id, 10)
     assert length(frags) == 2
@@ -124,5 +134,19 @@ defmodule Cairn.RingBufferTest do
     assert RingBuffer.last_fragment_at(id) == nil
     fill(id, 0..0)
     assert is_integer(RingBuffer.last_fragment_at(id))
+  end
+
+  defp wait_until(fun, attempts \\ 200) do
+    cond do
+      fun.() ->
+        :ok
+
+      attempts == 0 ->
+        flunk("condition was still false after 2s")
+
+      true ->
+        Process.sleep(10)
+        wait_until(fun, attempts - 1)
+    end
   end
 end

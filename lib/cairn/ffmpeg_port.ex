@@ -211,7 +211,19 @@ defmodule Cairn.FFmpegPort do
 
   def handle_info({port, {:data, data}}, %{port: port} = state) do
     {demuxer, events} = Demuxer.push(state.demuxer, data)
-    state = Enum.reduce(events, %{state | demuxer: demuxer}, &handle_event/2)
+
+    state =
+      Enum.reduce_while(events, %{state | demuxer: demuxer}, fn event, state ->
+        case handle_event(event, state) do
+          # a desync bounced ffmpeg: the rest of the batch belongs to the dead
+          # session. Folding it on would let a trailing fragment set the status
+          # back to :running with no port, and a trailing init segment be
+          # tagged with the epoch of the session that just ended.
+          %{port: nil} = state -> {:halt, state}
+          state -> {:cont, state}
+        end
+      end)
+
     {:noreply, state}
   end
 
@@ -241,13 +253,25 @@ defmodule Cairn.FFmpegPort do
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
-  def terminate(_reason, state) do
+  def terminate(reason, state) do
+    # Only a deliberate stop ends the stream: after a crash the restart mints
+    # its own epoch, and announcing :camera_stopped in between would make
+    # consumers see a stopped -> started flap. Minted *before* the blocking
+    # kill so it is not the first casualty of the supervisor's shutdown budget.
+    # Never a guarantee either way — a brutal kill skips terminate/2 entirely,
+    # so consumers must keep their own timeouts as the backstop.
+    if stop_reason?(reason) do
+      Cairn.StreamEpochs.new_epoch(state.camera.id, :camera_stopped)
+    end
+
     kill_port(state)
-    # tells epoch subscribers the stream ended; the minted epoch is one
-    # nothing ever streams under
-    Cairn.StreamEpochs.new_epoch(state.camera.id, :camera_stopped)
     :ok
   end
+
+  defp stop_reason?(:normal), do: true
+  defp stop_reason?(:shutdown), do: true
+  defp stop_reason?({:shutdown, _}), do: true
+  defp stop_reason?(_reason), do: false
 
   # -- internals --------------------------------------------------------------
 
@@ -279,6 +303,12 @@ defmodule Cairn.FFmpegPort do
   defp spawn_ffmpeg(state) do
     command = spawn_command(state)
 
+    # Mint before the port exists. Nothing between acquiring the port and
+    # folding it into state may fail: an unwind there would leave an ffmpeg
+    # holding the RTSP session with its pid nowhere in state, so `kill_port/1`
+    # would no-op on it and the next spawn could not bind the same UDP ports.
+    epoch = Cairn.StreamEpochs.new_epoch(state.camera.id, state.spawn_reason)
+
     port =
       Port.open({:spawn_executable, "/bin/sh"}, [
         :binary,
@@ -293,7 +323,6 @@ defmodule Cairn.FFmpegPort do
       end
 
     state = set_status(state, :connecting)
-    epoch = Cairn.StreamEpochs.new_epoch(state.camera.id, state.spawn_reason)
 
     %{
       state

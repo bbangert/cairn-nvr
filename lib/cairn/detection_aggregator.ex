@@ -118,10 +118,25 @@ defmodule Cairn.DetectionAggregator do
   # (not `new/0`) keeps the id counter advancing, so an event whose labels
   # straddle the boundary never reports one id for two objects. An in-flight
   # event keeps running and finalizes on its own timers.
+  #
+  # Known residual race: detection casts already in flight when this arrives
+  # are processed *after* the reset. They come from the plugin ports, not from
+  # `Cairn.StreamEpochs`, and the BEAM only orders messages per sender pair, so
+  # a batch from before the boundary can seed the fresh tracker. Closing it
+  # needs the epoch to travel with the batch (tagged at the producer, stale
+  # batches dropped here), which is protocol v1 Phase 2; `current_epoch` is
+  # stored as the anchor that comparison will read.
   def handle_info({:stream_epoch, camera_id, epoch, _reason}, state) do
-    cam = cam_state(state, camera_id)
-    cam = %{cam | tracker: Tracker.reset(cam.tracker), current_epoch: epoch}
-    {:noreply, put_cam(state, camera_id, cam)}
+    case state.cameras do
+      %{^camera_id => cam} ->
+        cam = %{cam | tracker: Tracker.reset(cam.tracker), current_epoch: epoch}
+        {:noreply, put_cam(state, camera_id, cam)}
+
+      _ ->
+        # no tracker to cut. Allocating state here would retain an entry for
+        # every camera that never emits detections, deleted ones included.
+        {:noreply, state}
+    end
   end
 
   def handle_info({:DOWN, _ref, :process, pid, reason}, state) do

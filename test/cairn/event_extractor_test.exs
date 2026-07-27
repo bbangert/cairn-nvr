@@ -1,8 +1,8 @@
 defmodule Cairn.EventExtractorTest do
   use Cairn.DataCase, async: false
 
-  alias Cairn.Config.Camera
   alias Cairn.{Config, Event, EventExtractor, Events, MP4.Demuxer, Reconciler, RingBuffer}
+  alias Cairn.Config.Camera
 
   @fixture "test/support/fixtures/media/testsrc.fmp4"
 

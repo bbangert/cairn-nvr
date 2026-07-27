@@ -43,22 +43,30 @@ defmodule Cairn.StreamEpochs do
   @spec new_epoch(String.t(), reason()) :: Cairn.ULID.t()
   def new_epoch(camera_id, reason) do
     GenServer.call(__MODULE__, {:new_epoch, camera_id, reason})
+  catch
+    :exit, _ ->
+      # This server being down (restart window, overload) must never take a
+      # camera with it: mint locally so the caller still gets a usable epoch.
+      # The ETS row then stays missing until the next successful mint, so
+      # `current/1` answers `:unknown` in the meantime — the same state a
+      # restart leaves behind anyway, and a re-mint is a change, which is the
+      # conservative outcome for consumers.
+      epoch = Cairn.ULID.generate()
+      try_broadcast(camera_id, epoch, reason)
+      epoch
   end
 
   @doc "Current epoch for `camera_id`, read directly from ETS."
   @spec current(String.t()) :: {:ok, Cairn.ULID.t()} | :unknown
   def current(camera_id) do
-    # the table is gone between an owner crash and its restart
-    case :ets.whereis(@table) do
-      :undefined ->
-        :unknown
-
-      table ->
-        case :ets.lookup(table, camera_id) do
-          [{^camera_id, epoch, _started_at}] -> {:ok, epoch}
-          [] -> :unknown
-        end
+    case :ets.lookup(@table, camera_id) do
+      [{^camera_id, epoch, _started_at}] -> {:ok, epoch}
+      [] -> :unknown
     end
+  rescue
+    # the table is gone between an owner crash and its restart. Checking
+    # `:ets.whereis/1` first would not help: it is not atomic with the lookup.
+    ArgumentError -> :unknown
   end
 
   @impl true
@@ -70,8 +78,31 @@ defmodule Cairn.StreamEpochs do
   @impl true
   def handle_call({:new_epoch, camera_id, reason}, _from, state) do
     epoch = Cairn.ULID.generate()
+    # insert before the broadcast: a subscriber reacting to {:stream_epoch, e}
+    # by calling current/1 must never read something staler than e
     :ets.insert(@table, {camera_id, epoch, DateTime.utc_now()})
-    Phoenix.PubSub.broadcast(Cairn.PubSub, @topic, {:stream_epoch, camera_id, epoch, reason})
+    broadcast(camera_id, epoch, reason)
     {:reply, epoch, state}
+  end
+
+  # local_broadcast, not broadcast: the epoch table is a node-local named ETS
+  # table, so a remote subscriber could never resolve what it was told about.
+  defp broadcast(camera_id, epoch, reason) do
+    Phoenix.PubSub.local_broadcast(
+      Cairn.PubSub,
+      @topic,
+      {:stream_epoch, camera_id, epoch, reason}
+    )
+  end
+
+  # Degraded path only: it runs in the caller (a camera's spawn path), where
+  # a best-effort announcement must not raise. PubSub being down raises
+  # ArgumentError from its registry lookup.
+  defp try_broadcast(camera_id, epoch, reason) do
+    broadcast(camera_id, epoch, reason)
+  rescue
+    ArgumentError -> :ok
+  catch
+    :exit, _ -> :ok
   end
 end

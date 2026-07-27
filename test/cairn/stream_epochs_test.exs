@@ -36,7 +36,7 @@ defmodule Cairn.StreamEpochsTest do
   end
 
   test "the table dies with the owner and the next spawn re-mints", %{id: id} do
-    StreamEpochs.new_epoch(id, :started)
+    before = StreamEpochs.new_epoch(id, :started)
 
     pid = Process.whereis(StreamEpochs)
     ref = Process.monitor(pid)
@@ -53,6 +53,10 @@ defmodule Cairn.StreamEpochsTest do
     assert restarted != pid
 
     epoch = StreamEpochs.new_epoch(id, :started)
+    # the re-mint must be a *new* epoch: an implementation that survived the
+    # crash with the same one (heir, :public table, DETS) would defeat the
+    # "a re-mint is a change, which ends tracks" argument above
+    assert epoch != before
     assert StreamEpochs.current(id) == {:ok, epoch}
   end
 

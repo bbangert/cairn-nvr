@@ -125,15 +125,22 @@ defmodule Cairn.FFmpegPortTest do
   end
 
   describe "stream epochs" do
-    test "every spawn mints a new epoch" do
+    test "every spawn mints a new epoch and tags its init segment with it" do
       id = "ff_#{System.unique_integer([:positive])}"
       StreamEpochs.subscribe()
+      Phoenix.PubSub.subscribe(Cairn.PubSub, RingBuffer.topic(id))
 
       # fake exits with 42 after streaming -> backoff -> second spawn
       start_pipeline(id, "#{@fake} #{@fixture} 0.05 42", [])
 
+      # each half of this is separately covered (minting here, propagation in
+      # RingBufferTest); only asserting both together pins that the port hands
+      # the ring the epoch of the spawn that produced the init segment
       assert_receive {:stream_epoch, ^id, first, :started}, 2_000
+      assert_receive {:init_segment, %{camera_id: ^id, epoch: ^first}}, 3_000
+
       assert_receive {:stream_epoch, ^id, second, :source_lost}, 5_000
+      assert_receive {:init_segment, %{camera_id: ^id, epoch: ^second}}, 5_000
       assert first != second
 
       assert {:ok, current} = StreamEpochs.current(id)
@@ -179,7 +186,7 @@ defmodule Cairn.FFmpegPortTest do
         {:ok, result}
 
       System.monotonic_time(:millisecond) > deadline ->
-        {:ok, result}
+        flunk("only #{length(frags)} fragments buffered for #{id}, wanted #{min_count}")
 
       true ->
         Process.sleep(50)
