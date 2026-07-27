@@ -6,7 +6,10 @@ defmodule Cairn.Event do
   `{:event_started | :event_updated | :event_ended, %Cairn.Event{}}` with a
   stable, JSON-serializable shape. The dashboard consumes it today;
   MQTT/webhook publishers can bolt on later without touching the
-  aggregator. `Cairn.Track` publishes the object lifecycle on the same topic.
+  aggregator. `Cairn.Track` publishes the object lifecycle on the same topic,
+  and `Cairn.EventArtifact` the readiness of an event's clip and snapshot —
+  `:event_ended` means the detection window closed, nothing more, so the
+  media it names is not yet fetchable.
 
   `labels` is a time-indexed list of `%{t: seconds_since_start, label: l,
   score: s, object_id: id}` entries; `max_scores` maps label -> best score

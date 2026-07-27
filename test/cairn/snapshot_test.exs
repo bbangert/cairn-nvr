@@ -1,7 +1,9 @@
 defmodule Cairn.SnapshotTest do
   use Cairn.DataCase, async: false
 
-  alias Cairn.{Config, Event, Events, Snapshot}
+  import ExUnit.CaptureLog, only: [capture_log: 1]
+
+  alias Cairn.{Config, Event, EventArtifact, Events, Snapshot}
 
   @fixture "test/support/fixtures/media/testsrc.fmp4"
 
@@ -9,6 +11,7 @@ defmodule Cairn.SnapshotTest do
     dir = Path.join(System.tmp_dir!(), "cairn_snap_#{System.unique_integer([:positive])}")
     Cairn.DataDir.ensure!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
+    Event.subscribe()
     %{dir: dir, config: %Config{data_dir: dir, pre_window_seconds: 0}}
   end
 
@@ -56,6 +59,63 @@ defmodule Cairn.SnapshotTest do
 
     assert String.trim(codec) in ["mjpeg", "jpeg"]
     assert %{snapshot_path: ^out} = Events.get(row.id)
+
+    # the broadcast is the only signal a consumer gets that the jpg is fetchable
+    event_id = row.id
+    size = File.stat!(out).size
+
+    assert_receive {:event_snapshot_ready,
+                    %EventArtifact{
+                      event_id: ^event_id,
+                      camera_id: "snap_cam",
+                      path: ^out,
+                      bytes: ^size,
+                      reason: nil
+                    }}
+
+    refute_received {:event_snapshot_failed, _}
+  end
+
+  test "a snapshot that produces no output announces its failure", %{config: config} do
+    row = insert(nil, @fixture)
+    # a clip ffmpeg cannot decode: it writes nothing and still exits 0
+    broken = Path.join(config.data_dir, "broken.mp4")
+    File.write!(broken, "not an mp4")
+    row = %{row | path: broken}
+
+    log = capture_log(fn -> assert :ok = Snapshot.take(row, config) end)
+    assert log =~ "snapshot produced no output"
+    assert %{snapshot_path: nil} = Events.get(row.id)
+
+    event_id = row.id
+
+    assert_receive {:event_snapshot_failed,
+                    %EventArtifact{
+                      event_id: ^event_id,
+                      camera_id: "snap_cam",
+                      path: nil,
+                      bytes: nil,
+                      reason: :no_output
+                    }}
+
+    refute_received {:event_snapshot_ready, _}
+  end
+
+  # The silence this phase exists to break: the jpg was written but the row
+  # update lost, so `snapshot_url` never resolves and nothing said so.
+  test "a snapshot the index will not accept announces its failure", %{config: config} do
+    row = insert(nil, @fixture)
+    {:ok, _} = Events.delete_row(row)
+
+    log = capture_log(fn -> assert :ok = Snapshot.take(row, config) end)
+    assert log =~ "snapshot not recorded"
+
+    event_id = row.id
+
+    assert_receive {:event_snapshot_failed,
+                    %EventArtifact{event_id: ^event_id, camera_id: "snap_cam", reason: :not_found}}
+
+    refute_received {:event_snapshot_ready, _}
   end
 
   test "seek is clamped inside the clip so a short clip still yields a frame",

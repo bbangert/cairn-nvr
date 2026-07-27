@@ -22,10 +22,10 @@ defmodule CairnWeb.DashboardLiveTest do
     assert render_async_status(view, "cam_a") =~ ~s(data-status="running")
   end
 
-  # The "events" topic carries the per-object track lifecycle as well as
-  # events, and gains kinds over time (artifact lifecycle is next). The grid
-  # must ignore what it does not know rather than die on it.
-  test "track lifecycle broadcasts do not crash the grid", %{conn: conn} do
+  # The "events" topic carries the per-object track and artifact lifecycles as
+  # well as events, and gains kinds over time. The grid must ignore what it
+  # does not know rather than die on it.
+  test "track and artifact lifecycle broadcasts do not crash the grid", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/")
 
     track = %Cairn.Track{
@@ -44,8 +44,26 @@ defmodule CairnWeb.DashboardLiveTest do
     Cairn.Track.broadcast(:track_updated, track)
     Cairn.Track.broadcast(:track_ended, %{track | end_reason: :unseen})
 
-    # the three track kinds are ones the grid may legitimately grow a clause
-    # for; the forward-compat claim is about a kind it has never heard of
+    artifact = %Cairn.EventArtifact{event_id: Cairn.ULID.generate(), camera_id: "cam_a"}
+
+    Cairn.EventArtifact.broadcast(:event_clip_ready, %{
+      artifact
+      | path: "/tmp/clip.mp4",
+        bytes: 1_024
+    })
+
+    Cairn.EventArtifact.broadcast(:event_clip_failed, %{artifact | reason: :not_found})
+
+    Cairn.EventArtifact.broadcast(:event_snapshot_ready, %{
+      artifact
+      | path: "/tmp/snap.jpg",
+        bytes: 512
+    })
+
+    Cairn.EventArtifact.broadcast(:event_snapshot_failed, %{artifact | reason: :no_output})
+
+    # the track and artifact kinds are ones the grid may legitimately grow a
+    # clause for; the forward-compat claim is about a kind it has never heard of
     Phoenix.PubSub.local_broadcast(
       Cairn.PubSub,
       Cairn.Event.topic(),

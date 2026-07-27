@@ -13,6 +13,11 @@ defmodule Cairn.DetectionAggregator do
     * `post_window` seconds of quiet -> finalizes; `max_event` seconds ->
       finalizes and lets the next detection open a fresh event
 
+  `{:event_ended, event}` means the detection window closed and nothing more:
+  it is broadcast before the extractor is even told to finalize, so the clip
+  is still being written and the snapshot does not exist. The media itself is
+  announced by `Cairn.EventArtifact`.
+
   Event times come from the observation, not from the clock: `started_at`,
   `labels[].t` and `trigger.t` derive from `observation.observed_at`, which a
   v1 plugin captured next to the frame. Wall-clock time is still what closes
@@ -483,9 +488,13 @@ defmodule Cairn.DetectionAggregator do
       %{event: %Event{id: ^event_id} = event} = cam ->
         Logger.info("event #{event.id} (#{camera_id}): finalizing (#{cause})")
         event = %{event | ended_at: now(), status: :finalized}
+        # Ended first, then the extractor is told: the extractor's
+        # `:event_clip_ready` can only follow the cast, so a subscriber is
+        # guaranteed to learn the window closed before it learns the clip
+        # landed. The reverse order lets a fast finalize overtake it.
+        Event.broadcast(:event_ended, event)
         state.finalize_extractor.(cam.extractor, event)
         EventCheckpoint.delete(camera_id)
-        Event.broadcast(:event_ended, event)
         put_cam(state, camera_id, clear_event(cam))
 
       _ ->

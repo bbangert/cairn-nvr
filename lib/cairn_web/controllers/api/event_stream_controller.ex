@@ -2,8 +2,8 @@ defmodule CairnWeb.Api.EventStreamController do
   @moduledoc """
   Server-Sent Events feed for Home Assistant.
 
-  Subscribes the request process to the `"events"` (event *and* track
-  lifecycle), `"cameras:status"` and `"system:alerts"` PubSub topics and
+  Subscribes the request process to the `"events"` (event, artifact *and*
+  track lifecycle), `"cameras:status"` and `"system:alerts"` PubSub topics and
   streams each message as an SSE frame
   (`event: <kind>\\ndata: <json>\\n\\n`) via chunked transfer. A comment
   heartbeat every 20s keeps intermediaries from closing an idle connection;
@@ -102,6 +102,16 @@ defmodule CairnWeb.Api.EventStreamController do
     encode_frame(event_name(kind), EventJSON.shape_live(event))
   end
 
+  def frame_for({kind, %Cairn.EventArtifact{} = artifact})
+      when kind in [
+             :event_clip_ready,
+             :event_clip_failed,
+             :event_snapshot_ready,
+             :event_snapshot_failed
+           ] do
+    encode_frame(artifact_name(kind), EventJSON.shape_artifact(kind, artifact))
+  end
+
   def frame_for({kind, %Cairn.Track{} = track})
       when kind in [:track_started, :track_updated, :track_ended] do
     encode_frame(track_name(kind), EventJSON.shape_track(track))
@@ -149,6 +159,11 @@ defmodule CairnWeb.Api.EventStreamController do
   defp track_name(:track_started), do: "track_started"
   defp track_name(:track_updated), do: "track_updated"
   defp track_name(:track_ended), do: "track_ended"
+
+  defp artifact_name(:event_clip_ready), do: "event_clip_ready"
+  defp artifact_name(:event_clip_failed), do: "event_clip_failed"
+  defp artifact_name(:event_snapshot_ready), do: "event_snapshot_ready"
+  defp artifact_name(:event_snapshot_failed), do: "event_snapshot_failed"
 
   defp schedule_heartbeat, do: Process.send_after(self(), :heartbeat, @heartbeat_ms)
 end

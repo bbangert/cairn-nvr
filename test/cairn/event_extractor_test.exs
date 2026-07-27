@@ -1,10 +1,30 @@
 defmodule Cairn.EventExtractorTest do
   use Cairn.DataCase, async: false
 
-  alias Cairn.{Config, Event, EventExtractor, Events, MP4.Demuxer, Reconciler, RingBuffer}
+  import ExUnit.CaptureLog, only: [capture_log: 1]
+
+  alias Cairn.{
+    Config,
+    Event,
+    EventArtifact,
+    EventExtractor,
+    Events,
+    MP4.Demuxer,
+    Reconciler,
+    RingBuffer
+  }
+
   alias Cairn.Config.Camera
 
   @fixture "test/support/fixtures/media/testsrc.fmp4"
+
+  @artifact_kinds [
+    :event_clip_ready,
+    :event_clip_failed,
+    :event_snapshot_ready,
+    :event_snapshot_failed
+  ]
+  @lifecycle_kinds [:event_started, :event_updated, :event_ended | @artifact_kinds]
 
   setup do
     dir = Path.join(System.tmp_dir!(), "cairn_ex_#{System.unique_integer([:positive])}")
@@ -23,6 +43,8 @@ defmodule Cairn.EventExtractorTest do
     }
 
     start_supervised!({RingBuffer, camera_id: camera_id, pre_window_seconds: 60})
+
+    Event.subscribe()
 
     {init_meta, frags} = fixture_events(camera_id)
 
@@ -172,6 +194,104 @@ defmodule Cairn.EventExtractorTest do
     {path, event.id}
   end
 
+  # The point of the artifact kinds: `event_ended` is the detection window
+  # closing, `event_clip_ready` is the file becoming fetchable, and a consumer
+  # must never be handed them the other way round.
+  test "the clip is announced ready after event_ended, carrying its post-remux size",
+       %{camera: camera, config: config, frags: frags} do
+    config = %{config | remux_clips: true}
+    event = new_event(camera)
+    test_pid = self()
+
+    pid =
+      start_supervised!(
+        {EventExtractor,
+         camera: camera,
+         event: event,
+         config: config,
+         snapshot_fun: fn row, _cfg -> send(test_pid, {:snapshot_requested, row.id}) end}
+      )
+
+    ref = Process.monitor(pid)
+    assert %{status: :active, path: path} = wait_row(event.id)
+
+    Enum.each(frags, &RingBuffer.put_fragment(camera.id, &1))
+    wait_until(fn -> :sys.get_state(pid).fragments == length(frags) end)
+    written = :sys.get_state(pid).bytes
+
+    finalized = %{event | ended_at: DateTime.utc_now(), status: :finalized}
+    # exactly what `DetectionAggregator.maybe_finalize/4` does, in its order
+    Event.broadcast(:event_ended, finalized)
+    EventExtractor.finalize(pid, finalized)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
+
+    event_id = event.id
+    camera_id = camera.id
+
+    assert {:event_ended, %Event{id: ^event_id}} = next_lifecycle()
+
+    assert {:event_clip_ready,
+            %EventArtifact{
+              event_id: ^event_id,
+              camera_id: ^camera_id,
+              path: ^path,
+              reason: nil
+            } = clip} = next_lifecycle()
+
+    # the size announced is the remuxed file's, not the bytes the writer
+    # streamed: a client sizing a download off it would be lied to otherwise
+    assert clip.bytes == File.stat!(path).size
+    refute clip.bytes == written
+    assert Events.get(event_id).bytes == clip.bytes
+  end
+
+  test "a clip the index will not accept is announced failed, not silently dropped",
+       %{camera: camera, config: config, frags: frags} do
+    event = new_event(camera)
+    test_pid = self()
+
+    pid =
+      start_supervised!(
+        {EventExtractor,
+         camera: camera,
+         event: event,
+         config: config,
+         snapshot_fun: fn row, _cfg -> send(test_pid, {:snapshot_requested, row.id}) end}
+      )
+
+    ref = Process.monitor(pid)
+    assert %{status: :active} = row = wait_row(event.id)
+    Enum.each(Enum.take(frags, 2), &RingBuffer.put_fragment(camera.id, &1))
+
+    # retention deleting the event mid-recording: `Events.finalize` then has
+    # nothing to update and the clip never becomes reachable
+    {:ok, _} = Events.delete_row(row)
+
+    log =
+      capture_log(fn ->
+        EventExtractor.finalize(pid, %{event | ended_at: DateTime.utc_now(), status: :finalized})
+        assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
+      end)
+
+    assert log =~ "finalize failed"
+
+    event_id = event.id
+    camera_id = camera.id
+
+    assert_receive {:event_clip_failed,
+                    %EventArtifact{
+                      event_id: ^event_id,
+                      camera_id: ^camera_id,
+                      path: nil,
+                      bytes: nil,
+                      reason: :not_found
+                    }}
+
+    refute_received {:event_clip_ready, _}
+    # no row, no snapshot to cut from it
+    refute_received {:snapshot_requested, _}
+  end
+
   test "crash mid-event leaves an active row that reconciliation marks partial",
        %{camera: camera, config: config, frags: frags} do
     Enum.each(Enum.take(frags, 2), &RingBuffer.put_fragment(camera.id, &1))
@@ -195,6 +315,10 @@ defmodule Cairn.EventExtractorTest do
     summary = Reconciler.run(config)
     assert summary.partialed == 1
     assert %{status: :partial} = Events.get(event.id)
+
+    # a half-written clip is not a ready one: neither the crash nor the
+    # cleanup may claim the media landed
+    refute_artifacts(camera.id)
   end
 
   test "reconciliation deletes rows with missing files and adopts orphans",
@@ -219,6 +343,32 @@ defmodule Cairn.EventExtractorTest do
     assert orphan.status == :partial
     assert orphan.camera_id == camera.id
     assert orphan.bytes == 8
+
+    # adopting a clip found on disk is bookkeeping, not an artifact landing
+    refute_artifacts(camera.id)
+  end
+
+  defp next_lifecycle(timeout \\ 2_000) do
+    receive do
+      {kind, _payload} = msg when kind in @lifecycle_kinds -> msg
+    after
+      timeout -> flunk("no event lifecycle message within #{timeout}ms")
+    end
+  end
+
+  # No artifact kind was broadcast — with a canary afterwards, so a subscription
+  # that silently stopped working cannot make this pass by default.
+  defp refute_artifacts(camera_id) do
+    Enum.each(@artifact_kinds, fn kind -> refute_received {^kind, _} end)
+
+    EventArtifact.broadcast(:event_clip_ready, %EventArtifact{
+      event_id: "canary",
+      camera_id: camera_id,
+      path: "/canary.mp4",
+      bytes: 1
+    })
+
+    assert_receive {:event_clip_ready, %EventArtifact{event_id: "canary"}}
   end
 
   defp wait_row(id, attempts \\ 100) do

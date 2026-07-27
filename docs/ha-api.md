@@ -135,6 +135,8 @@ the connection. Event kinds:
 | `event:` | `data` |
 |----------|--------|
 | `event_started` / `event_updated` / `event_ended` | live event object (id, camera_id, status, max_score, max_scores, trigger, snapshot_url, clip_url) |
+| `event_clip_ready` / `event_clip_failed` | artifact object (below), with `clip_url` |
+| `event_snapshot_ready` / `event_snapshot_failed` | artifact object (below), with `snapshot_url` |
 | `track_started` / `track_updated` / `track_ended` | track object (below) |
 | `camera_status` | `{camera_id, status, probe, plugin_status}` |
 | `camera_control` | `{camera_id, detection_enabled, recording_enabled, min_score}` |
@@ -149,6 +151,56 @@ the connection. Event kinds:
 > `object_id` on every track frame, and it is the key that ties them together.
 > Clients that stored or compared it as a number must treat it as an opaque
 > string. There is no compatibility mode.
+
+#### Artifact frames
+
+`event_ended` means one thing only: **the detection window closed**. At that
+moment the clip is still being remuxed and the snapshot has not been taken, so
+`clip_url`/`snapshot_url` on the `event_ended` frame may still be `null` and a
+fetch of them may 404. The artifact frames are the signal that the media is on
+disk and fetchable:
+
+```json
+{
+  "event_id": "e2c…",
+  "camera_id": "front_door",
+  "bytes": 1234567,
+  "reason": null,
+  "clip_url": "/api/media/events/e2c…"
+}
+```
+
+- `event_clip_ready` — the clip is closed, remuxed and indexed. `bytes` is its
+  final (post-remux) size; `clip_url` is fetchable now.
+- `event_snapshot_ready` — the jpg exists and is recorded on the event. `bytes`
+  is its size, and the frame carries `snapshot_url` in place of `clip_url`.
+- `event_clip_failed` / `event_snapshot_failed` — that artifact is not coming
+  for this event. `bytes` and the URL field are `null`, and `reason` is one of
+  `no_output` (ffmpeg wrote nothing usable), `not_found` (the event was gone by
+  the time the artifact landed), `index_write_failed` (the index rejected the
+  update) or `exception`. Nothing retries; a failed snapshot leaves the clip
+  unaffected.
+
+Each artifact is announced at most once per event, and exactly one of
+`_ready`/`_failed` per attempt. Ordering is guaranteed: `event_ended` precedes
+`event_clip_*`, which precedes `event_snapshot_*` (the snapshot is cut from the
+finished clip). On-disk paths are never emitted — fetch through the `*_url`
+fields, as everywhere else.
+
+Recommended client flow:
+
+1. Drive entity state (motion/occupancy `binary_sensor`, attributes) off
+   `event_started` / `event_updated` / `event_ended`. Do not wait for media.
+2. Fetch media only on the matching `*_ready` — the clip on `event_clip_ready`,
+   the thumbnail on `event_snapshot_ready`. Tie them to the event by `event_id`.
+3. On `*_failed`, stop waiting for that artifact: keep the event, show the
+   placeholder, and do not poll `/api/events/:id` for a URL that is not coming.
+4. An event whose recording crashed emits **no** artifact frames at all; it is
+   announced as `event_ended` with `"status": "partial"`. Treat that as "no
+   media is coming" too.
+5. If the connection dropped between `event_ended` and a `*_ready`, re-read
+   `GET /api/events/:id` on reconnect: `clip_url`/`snapshot_url` are non-`null`
+   there exactly when the file exists.
 
 #### Track frames
 

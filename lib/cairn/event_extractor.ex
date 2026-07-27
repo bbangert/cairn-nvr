@@ -11,16 +11,18 @@ defmodule Cairn.EventExtractor do
   written as they arrive, with a datasync roughly every 2s of media.
 
   Finalize: closes the file, updates the row (`finalized`, ended_at,
-  bytes, labels, max_score), kicks off the async snapshot, emits
-  `[:cairn, :extractor, :finalized]` telemetry, exits `:normal`. A crash
-  leaves the row `active`; boot reconciliation marks it `partial`.
+  bytes, labels, max_score), broadcasts `:event_clip_ready` with the
+  post-remux size (or `:event_clip_failed`), kicks off the async snapshot,
+  emits `[:cairn, :extractor, :finalized]` telemetry, exits `:normal`. A
+  crash leaves the row `active` and announces no artifact at all; boot
+  reconciliation marks it `partial`.
   """
 
   use GenServer, restart: :temporary
 
   require Logger
 
-  alias Cairn.{DataDir, Events, RingBuffer}
+  alias Cairn.{DataDir, EventArtifact, Events, RingBuffer}
 
   @fsync_media_ms 2_000
 
@@ -128,8 +130,27 @@ defmodule Cairn.EventExtractor do
     bytes = maybe_remux(state)
 
     case Events.finalize(event, bytes) do
-      {:ok, row} -> snapshot_fun.(row, state.config)
-      {:error, reason} -> Logger.error("event #{event.id}: finalize failed: #{inspect(reason)}")
+      {:ok, row} ->
+        # After the row, which is what makes `clip_url` resolve, and before
+        # the snapshot is kicked off, so a consumer always sees the clip's
+        # outcome ahead of the snapshot's.
+        EventArtifact.broadcast(:event_clip_ready, %EventArtifact{
+          event_id: event.id,
+          camera_id: state.camera.id,
+          path: state.path,
+          bytes: bytes
+        })
+
+        snapshot_fun.(row, state.config)
+
+      {:error, reason} ->
+        Logger.error("event #{event.id}: finalize failed: #{inspect(reason)}")
+
+        EventArtifact.broadcast(:event_clip_failed, %EventArtifact{
+          event_id: event.id,
+          camera_id: state.camera.id,
+          reason: clip_reason(reason)
+        })
     end
 
     :telemetry.execute(
@@ -146,6 +167,12 @@ defmodule Cairn.EventExtractor do
   end
 
   # -- internals --------------------------------------------------------------
+
+  # `Events.finalize` can fail because the row vanished under us (retention
+  # deleted the event mid-recording) or because the update was rejected; keep
+  # the wire reason to that closed set.
+  defp clip_reason(:not_found), do: :not_found
+  defp clip_reason(_other), do: :index_write_failed
 
   # Runs before the row is finalized so `bytes` and the snapshot both see the
   # rewritten file. Costs one extra read+write of the clip; `remux_clips:

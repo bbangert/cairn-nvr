@@ -1,8 +1,10 @@
 defmodule Cairn.Snapshot do
   @moduledoc """
   Per-event snapshot as `snapshots/{event_id}.jpg`, extracted async
-  post-finalize. Failure is non-fatal (log only) — the UI falls back to a
-  placeholder.
+  post-finalize. Failure is non-fatal — the UI falls back to a placeholder —
+  but it is never silent: every attempt ends in exactly one
+  `:event_snapshot_ready` or `:event_snapshot_failed` broadcast
+  (`Cairn.EventArtifact`), so a consumer knows whether to fetch or to give up.
 
   When the event carries a `trigger` (the highest-scoring detection, captured
   by `Cairn.DetectionAggregator`), the frame is cut from that detection's
@@ -15,7 +17,7 @@ defmodule Cairn.Snapshot do
 
   require Logger
 
-  alias Cairn.{Config, DataDir, Events}
+  alias Cairn.{Config, DataDir, EventArtifact, Events}
 
   # tuned for HD+ camera frames; fontsize is not an ffmpeg expression so it
   # can't scale with resolution — a fixed size reads fine from ~640p up.
@@ -38,19 +40,24 @@ defmodule Cairn.Snapshot do
 
     # ffmpeg exits 0 even when a seek lands past the end and writes nothing, so
     # trust the file, not the exit code — a bogus snapshot_path 404s the UI.
-    if File.exists?(out) and File.stat!(out).size > 0 do
-      Events.set_snapshot(row.id, out)
-    else
-      Logger.warning(
-        "event #{row.id}: snapshot produced no output (ffmpeg #{status}): " <>
-          String.slice(output, 0, 200)
-      )
+    case File.stat(out) do
+      {:ok, %{size: size}} when size > 0 ->
+        record(row, out, size)
+
+      _ ->
+        Logger.warning(
+          "event #{row.id}: snapshot produced no output (ffmpeg #{status}): " <>
+            String.slice(output, 0, 200)
+        )
+
+        failed(row, :no_output)
     end
 
     :ok
   rescue
     e ->
       Logger.warning("event #{row.id}: snapshot error: #{Exception.message(e)}")
+      failed(row, :exception)
       :ok
   end
 
@@ -75,6 +82,37 @@ defmodule Cairn.Snapshot do
   end
 
   # -- internals --------------------------------------------------------------
+
+  # The row update, not the file write, is what makes the jpg reachable
+  # (`snapshot_url`), so `ready` follows it. The event can have gone away
+  # while ffmpeg ran — retention deleted it, the recording was reconciled —
+  # and that used to be swallowed whole.
+  defp record(row, out, size) do
+    case Events.set_snapshot(row.id, out) do
+      {:ok, _} ->
+        EventArtifact.broadcast(:event_snapshot_ready, %EventArtifact{
+          event_id: row.id,
+          camera_id: row.camera_id,
+          path: out,
+          bytes: size
+        })
+
+      {:error, reason} ->
+        Logger.warning("event #{row.id}: snapshot not recorded: #{inspect(reason)}")
+        failed(row, snapshot_reason(reason))
+    end
+  end
+
+  defp failed(row, reason) do
+    EventArtifact.broadcast(:event_snapshot_failed, %EventArtifact{
+      event_id: row.id,
+      camera_id: row.camera_id,
+      reason: reason
+    })
+  end
+
+  defp snapshot_reason(:not_found), do: :not_found
+  defp snapshot_reason(_other), do: :index_write_failed
 
   # Clip time to cut the snapshot from: the trigger's moment (pre-roll + its
   # offset), clamped inside the clip. A freshly-started camera has less than a

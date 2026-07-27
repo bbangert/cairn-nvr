@@ -5,7 +5,16 @@ defmodule Cairn.DetectionAggregatorTest do
   import ExUnit.CaptureLog, only: [capture_log: 1]
 
   alias Cairn.Config.Camera
-  alias Cairn.{DetectionAggregator, Event, EventCheckpoint, Observation, StreamEpochs, Track}
+
+  alias Cairn.{
+    DetectionAggregator,
+    Event,
+    EventArtifact,
+    EventCheckpoint,
+    Observation,
+    StreamEpochs,
+    Track
+  }
 
   @policy %{pre: 5, post: 10, max: 300, max_unseen_ms: 3_000, max_live_tracks: 128}
 
@@ -445,9 +454,12 @@ defmodule Cairn.DetectionAggregatorTest do
     assert_receive {:event_updated, %Event{labels: [_, _, _]}}
     assert [{^id, %Event{labels: [_, _, _]}, _tracks}] = checkpoint(id)
 
-    # and the other transition that matters for restore is the delete
+    # and the other transition that matters for restore is the delete —
+    # which `event_ended` does not announce: it is broadcast first, before the
+    # extractor is even told, so the state call is the barrier here
     fire(agg, :post_window, id, eid)
     assert_receive {:event_ended, %Event{id: ^eid}}
+    _ = :sys.get_state(agg)
     assert checkpoint(id) == []
   end
 
@@ -508,7 +520,63 @@ defmodule Cairn.DetectionAggregatorTest do
     assert_receive {:extractor_finalized, ^ex_pid, %Event{id: ^eid, status: :finalized} = event}
     assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
     assert %DateTime{} = event.ended_at
+
+    # neither message is a barrier for the checkpoint: both are emitted from
+    # inside the callback that deletes it, and `event_ended` deliberately goes
+    # out first of all. The state call is what waits for the callback.
+    _ = :sys.get_state(agg)
     assert checkpoint(id) == []
+  end
+
+  # The extractor's `event_clip_ready` can only follow the finalize cast, so
+  # the window closing has to be broadcast *before* the cast — otherwise an
+  # extractor that finalizes fast enough announces the media before the event
+  # it belongs to has ended.
+  test "event_ended precedes the clip's readiness even when finalizing is instant", %{
+    camera: camera,
+    camera_id: id
+  } do
+    test_pid = self()
+
+    agg =
+      start_supervised!(
+        {DetectionAggregator,
+         name: nil,
+         start_extractor: fn _camera, event ->
+           pid = spawn(fn -> Process.sleep(:infinity) end)
+           send(test_pid, {:extractor_started, event, pid})
+           {:ok, pid}
+         end,
+         finalize_extractor: fn _pid, event ->
+           EventArtifact.broadcast(:event_clip_ready, %EventArtifact{
+             event_id: event.id,
+             camera_id: event.camera_id,
+             path: "/clip.mp4",
+             bytes: 1
+           })
+         end},
+        id: :agg_ordering
+      )
+
+    detect(agg, camera)
+    assert_receive {:extractor_started, %Event{id: eid}, _pid}
+    assert_receive {:event_started, %Event{id: ^eid}}
+
+    fire(agg, :post_window, id, eid)
+
+    # arrival order, not mere presence: `assert_receive` would match either way
+    assert [{:event_ended, %Event{id: ^eid}}, {:event_clip_ready, %EventArtifact{event_id: ^eid}}] =
+             [next_lifecycle(), next_lifecycle()]
+  end
+
+  defp next_lifecycle(timeout \\ 2_000) do
+    receive do
+      {kind, _payload} = msg
+      when kind in [:event_started, :event_updated, :event_ended, :event_clip_ready] ->
+        msg
+    after
+      timeout -> flunk("no event lifecycle message within #{timeout}ms")
+    end
   end
 
   test "max-cap finalizes and the next detection reopens", %{
