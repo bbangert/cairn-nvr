@@ -374,4 +374,18 @@ defmodule Cairn.TrackerTest do
     assert [%Track{object_id: id, end_reason: nil}] = Tracker.live_tracks(t)
     assert id == a.object_id
   end
+
+  test "live_tracks/1 returns tracks in ULID order" do
+    # More than 32 tracks on purpose: below that the tracker's `objects` map is
+    # a flatmap whose iteration order happens to be sorted, so a smaller scene
+    # would pass whether or not the sort is there.
+    dets = for i <- 0..39, do: det("person", [i * 0.02, 0.1, 0.01, 0.4])
+    {t, tagged, _} = track(Tracker.new(), dets)
+
+    ids = Enum.map(Tracker.live_tracks(t), & &1.object_id)
+
+    assert length(ids) == 40
+    assert ids == Enum.sort(ids)
+    assert ids == Enum.sort(Enum.map(tagged, & &1.object_id))
+  end
 end

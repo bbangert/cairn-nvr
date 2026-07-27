@@ -120,7 +120,12 @@ defmodule Cairn.Tracker do
   @doc "Summaries of the currently live tracks (ULID order, so mint order)."
   @spec live_tracks(t()) :: [Track.t()]
   def live_tracks(%__MODULE__{} = tracker) do
-    for {_id, object} <- tracker.objects, do: to_track(object)
+    # Sorted explicitly: map iteration order is only incidentally sorted while
+    # `objects` is a small (flat) map, and checkpointed track lists must not
+    # reshuffle once a busy scene pushes it past that boundary.
+    tracker.objects
+    |> Enum.sort_by(fn {id, _object} -> id end)
+    |> Enum.map(fn {_id, object} -> to_track(object) end)
   end
 
   @doc "Intersection-over-union of two `[x, y, w, h]` boxes."
@@ -342,8 +347,12 @@ defmodule Cairn.Tracker do
 
   # -- plugin identity map ----------------------------------------------------
 
-  # A plugin process restart restarts its track ids, and so does a new epoch;
-  # both are in the key so neither can hand an old identity to a new object.
+  # Identity is scoped to `(plugin_instance, epoch, track_id)`. `plugin_instance`
+  # separates concurrent plugins (camera id inline, group name for a group) and
+  # `epoch` cuts identity at every ffmpeg respawn, so no track id crosses a
+  # stream restart. It does *not* cover a plugin process restarting within an
+  # epoch: the instance is static across respawns, so a restarted plugin that
+  # reuses its old track ids resumes the ULIDs they were bound to.
   defp plugin_key(track_id, context),
     do: {context.plugin_instance, context.epoch, track_id}
 
