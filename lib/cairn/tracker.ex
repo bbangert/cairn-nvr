@@ -267,13 +267,19 @@ defmodule Cairn.Tracker do
     )
   end
 
+  defp warn_reuse(tracker, object, context) do
+    warn_once(
+      tracker,
+      context,
+      :reused_track_id,
+      "camera #{context.camera_id}: plugin #{inspect(context.plugin_instance)} reused " <>
+        "track id #{inspect(object.track_id)} after ending it — tracking it as a new object"
+    )
+  end
+
   defp plugin_identity(tracker, key, object, context) do
     if Map.has_key?(tracker.ended, key) do
-      Logger.warning(
-        "camera #{context.camera_id}: plugin #{inspect(context.plugin_instance)} reused " <>
-          "track id #{inspect(object.track_id)} after ending it — tracking it as a new object"
-      )
-
+      tracker = warn_reuse(tracker, object, context)
       object_id = ULID.generate()
       {tracker |> forget_ended(key) |> bind(key, object_id), object_id}
     else
