@@ -25,6 +25,31 @@ defmodule Cairn.StreamEpochsTest do
     assert StreamEpochs.current(id) == {:ok, next}
   end
 
+  test "the returned epoch is the stored epoch is the broadcast epoch", %{id: id} do
+    StreamEpochs.subscribe()
+
+    returned = StreamEpochs.new_epoch(id, :started)
+
+    assert_receive {:stream_epoch, ^id, broadcast, :started}
+    assert {:ok, stored} = StreamEpochs.current(id)
+
+    # single source of truth: the caller mints, so no path can hand the caller
+    # one epoch while ETS and subscribers learn about another
+    assert returned == broadcast
+    assert returned == stored
+  end
+
+  test "a late-served request stores the caller's epoch, not a fresh one", %{id: id} do
+    epoch = StreamEpochs.new_epoch(id, :started)
+
+    # what a call that exited with :timeout leaves behind: the request is still
+    # queued and gets served afterwards. It carries the epoch the caller
+    # already returned, so replaying it must be a no-op on `current/1`.
+    GenServer.call(StreamEpochs, {:new_epoch, id, epoch, :started})
+
+    assert StreamEpochs.current(id) == {:ok, epoch}
+  end
+
   test "epochs are per camera", %{id: id} do
     other = "ep_#{System.unique_integer([:positive])}"
 

@@ -126,6 +126,31 @@ defmodule Cairn.DetectionAggregatorTest do
     assert second > first
   end
 
+  test "a repeat of the current epoch does not end tracks", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    detect(agg, camera)
+    assert_receive {:event_started, %Event{labels: [%{object_id: first}]}}
+
+    epoch = StreamEpochs.new_epoch(id, :source_lost)
+    _ = :sys.get_state(agg)
+
+    detect(agg, camera)
+    assert_receive {:event_updated, %Event{labels: [_, %{object_id: second}]}}
+    refute second == first
+
+    # StreamEpochs may announce one mint twice (degraded caller-side broadcast
+    # plus a late server broadcast of the same epoch) — the repeat must not cut
+    # the tracks that the first announcement already started
+    send(agg, {:stream_epoch, id, epoch, :source_lost})
+    _ = :sys.get_state(agg)
+
+    detect(agg, camera)
+    assert_receive {:event_updated, %Event{labels: [_, _, %{object_id: ^second}]}}
+  end
+
   test "post-window timeout finalizes", %{agg: agg, camera: camera, camera_id: id} do
     detect(agg, camera)
     assert_receive {:extractor_started, %Event{id: eid}, ex_pid}

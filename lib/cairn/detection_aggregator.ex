@@ -128,6 +128,14 @@ defmodule Cairn.DetectionAggregator do
   # stored as the anchor that comparison will read.
   def handle_info({:stream_epoch, camera_id, epoch, _reason}, state) do
     case state.cameras do
+      %{^camera_id => %{current_epoch: ^epoch}} ->
+        # One mint can be announced twice by design: `Cairn.StreamEpochs`
+        # broadcasts from the caller when its server is unreachable, and a
+        # call that exited with :timeout may still be served afterwards. The
+        # epoch is the same either way, so a repeat means no boundary was
+        # crossed — resetting again would cut tracks mid-stream.
+        {:noreply, state}
+
       %{^camera_id => cam} ->
         cam = %{cam | tracker: Tracker.reset(cam.tracker), current_epoch: epoch}
         {:noreply, put_cam(state, camera_id, cam)}

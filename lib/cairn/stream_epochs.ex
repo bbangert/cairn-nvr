@@ -37,23 +37,39 @@ defmodule Cairn.StreamEpochs do
   @doc """
   Mints, stores and broadcasts a new epoch for `camera_id`, returning it.
 
+  The *caller* mints the ULID and hands it to the server, which stores and
+  broadcasts exactly that value: the epoch returned here, the one in ETS and
+  the one carried by the broadcast are always the same. That matters because
+  a `GenServer.call/3` that exits with `:timeout` leaves the request queued —
+  a server that minted its own would later store and announce an epoch the
+  caller never saw, while the caller's already tags ring-buffer init segments.
+
+  The cost of the contract is that one mint may be *announced twice* (the
+  degraded path below broadcasts, and a call that timed out may still be
+  served). Consumers must treat a repeat of the epoch they already hold as a
+  no-op — see `Cairn.DetectionAggregator`.
+
   `:camera_stopped` mints an epoch nobody streams under — it is how the end
   of a stream is announced to subscribers.
   """
   @spec new_epoch(String.t(), reason()) :: Cairn.ULID.t()
   def new_epoch(camera_id, reason) do
-    GenServer.call(__MODULE__, {:new_epoch, camera_id, reason})
-  catch
-    :exit, _ ->
-      # This server being down (restart window, overload) must never take a
-      # camera with it: mint locally so the caller still gets a usable epoch.
-      # The ETS row then stays missing until the next successful mint, so
-      # `current/1` answers `:unknown` in the meantime — the same state a
-      # restart leaves behind anyway, and a re-mint is a change, which is the
-      # conservative outcome for consumers.
-      epoch = Cairn.ULID.generate()
-      try_broadcast(camera_id, epoch, reason)
+    epoch = Cairn.ULID.generate()
+
+    try do
+      GenServer.call(__MODULE__, {:new_epoch, camera_id, epoch, reason})
       epoch
+    catch
+      :exit, _ ->
+        # This server being down (restart window, overload) must never take a
+        # camera with it: announce locally so the caller still gets a usable
+        # epoch. The ETS row may stay missing until the next successful mint,
+        # so `current/1` can answer `:unknown` in the meantime — the same state
+        # a restart leaves behind anyway, and a re-mint is a change, which is
+        # the conservative outcome for consumers.
+        try_broadcast(camera_id, epoch, reason)
+        epoch
+    end
   end
 
   @doc "Current epoch for `camera_id`, read directly from ETS."
@@ -76,13 +92,15 @@ defmodule Cairn.StreamEpochs do
   end
 
   @impl true
-  def handle_call({:new_epoch, camera_id, reason}, _from, state) do
-    epoch = Cairn.ULID.generate()
+  def handle_call({:new_epoch, camera_id, epoch, reason}, _from, state) do
+    # the epoch is the caller's; this server never mints one of its own. See
+    # new_epoch/2 for why.
+    #
     # insert before the broadcast: a subscriber reacting to {:stream_epoch, e}
     # by calling current/1 must never read something staler than e
     :ets.insert(@table, {camera_id, epoch, DateTime.utc_now()})
     broadcast(camera_id, epoch, reason)
-    {:reply, epoch, state}
+    {:reply, :ok, state}
   end
 
   # local_broadcast, not broadcast: the epoch table is a node-local named ETS
