@@ -129,22 +129,59 @@ ndjson on stdout, at most 65536 bytes.
 | `frame.observed_at` | ISO8601 string | **required.** When the frame was observed — capture it *before* inference, not after. Event times derive from it. More than 30 s from Cairn's own clock and it is replaced by arrival time (the observation is still used, and marked as arrival-quality) — run NTP |
 | `emitted_at` | ISO8601 string | optional, informational |
 | `objects` | list | required, may be empty, at most **64** entries |
-| `ended_tracks` | list of strings | optional, default `[]`, at most 64, each ≤ 64 bytes |
+| `ended_tracks` | list of strings | optional, default `[]`, at most 64, each a printable `track_id` ≤ 64 bytes |
 
 An object is a v0 detection (`label`, `score`, `bbox` — same rules) plus:
 
 | field | type | rule |
 |---|---|---|
-| `track_id` | string ≤ 64 bytes | optional; your own identity for this object, stable within an epoch |
+| `track_id` | printable string ≤ 64 bytes | optional; your own identity for this object, stable within an epoch. Same charset rule as `label`: no control bytes, no ANSI escapes, valid UTF-8 |
 | `observation_kind` | `"detected"` or `"tracked"` | optional, default `"detected"` |
 
 `"tracked"` means *you predicted this object without detecting it in this
 frame*. It keeps the object's track alive but is never evidence: it cannot
 open an event, extend one, or add to its labels. Send `"detected"` for
-anything the model actually found in this frame.
+anything the model actually found in this frame. A track you keep predicting
+for longer than the camera's `tracking.max_unseen_ms` is flagged
+*stale-predicted* and stays out of event evidence until something detects it
+again.
 
 An empty `objects` list is a perfectly valid observation. It is not a
 liveness protocol and Cairn draws no conclusion from its absence.
+
+#### Track ids
+
+`track_id` is honoured **only** if your `plugin.hello` declared
+`capabilities.object_tracking: true`. Without that promise Cairn ignores the
+field and tracks host-side by box overlap; nothing breaks, the ids are simply
+decoration. With it:
+
+- `(your process, camera, stream epoch, track_id)` maps 1:1 onto a public
+  ULID that Cairn publishes as `object_id`. Reuse a `track_id` for the same
+  object and it keeps that identity; no box matching runs.
+- Ids are scoped to the epoch. After a `stream.started` for a new epoch,
+  Cairn has ended every track from the old one — reusing an id across the
+  boundary gets you a new object, not the old one.
+- List an id in `ended_tracks` when the object is gone. Cairn ends the track
+  and sends its final summary.
+- **Never reuse an id you have ended.** Cairn logs a contract violation and
+  treats it as a brand-new object.
+- Cairn expires a track you stop mentioning after `max_unseen_ms` of *stream*
+  time (default 3 s, configurable per camera) — `ended_tracks` is a courtesy,
+  not a requirement.
+
+Two host-side bounds apply on top, because stream time is *your* clock and the
+tracker lives in a process shared by every camera. Neither should ever be
+reachable by a plugin that behaves:
+
+- A track is also expired after ten times `max_unseen_ms` of **host** time
+  since its last update, whatever your `pts` says. A frozen or rewound frame
+  clock cannot keep tracks alive.
+- Each camera holds at most `tracking.max_live_tracks` live tracks (default
+  128, configurable per camera). At the cap, minting a new identity retires
+  the least recently seen one with a final summary. Minting a fresh
+  `track_id` per frame is what this exists for; a real scene is capped at 64
+  objects per line anyway.
 
 ### `plugin.hello`
 
@@ -167,6 +204,13 @@ at most 16 integers in 0..1000; `capabilities` is a map of at most 32
 printable keys (≤ 32 bytes) to **booleans**. Anything else — or a field of
 the wrong shape — is dropped. The message is not: a plugin that mis-declares
 itself still runs.
+
+`capabilities.object_tracking` is load-bearing: it is the promise that your
+`track_id`s are stable within a stream epoch, and the only thing that makes
+Cairn use them instead of its own box matching (see *Track ids* above).
+Declare it `false` (or omit it) if you only detect. Because it is read as a
+boolean, a string `"true"` is dropped by the bounds above and reads as no
+promise at all.
 
 ### `plugin.status`
 

@@ -14,12 +14,24 @@ defmodule Cairn.Config do
   alias Cairn.Config.PluginGroup
 
   @known_keys ~w(data_dir stall_seconds free_space_min_mb remux_clips udp events retention cameras
-                 plugins integrations)
+                 plugins integrations tracking)
   @known_udp_keys ~w(base_port range)
   @known_events_keys ~w(pre_window_seconds post_window_seconds max_event_seconds)
   @known_retention_keys ~w(days per_label)
   @known_integrations_keys ~w(token)
+  @known_tracking_keys ~w(max_unseen_ms max_live_tracks)
   @name_regex ~r/\A[a-z0-9][a-z0-9_-]*\z/
+
+  # How long a track survives without being seen, in *media* time. Long
+  # enough to ride out an occlusion, short enough that a parked identity does
+  # not get handed to whatever next overlaps it.
+  @default_max_unseen_ms 3_000
+  # How many tracks one camera may hold live at once. The tracker lives in the
+  # singleton aggregator and a plugin picks its own track ids, so this is what
+  # stops one camera's plugin from growing every camera's blast radius. Large
+  # enough for a crowded scene at 64 objects per frame; small enough that a
+  # hostile plugin cannot mint its way out of memory.
+  @default_max_live_tracks 128
 
   defstruct data_dir: "data",
             stall_seconds: 15,
@@ -32,6 +44,8 @@ defmodule Cairn.Config do
             max_event_seconds: 300,
             retention_days: 14,
             retention_per_label: %{},
+            max_unseen_ms: @default_max_unseen_ms,
+            max_live_tracks: @default_max_live_tracks,
             cameras: [],
             plugin_groups: [],
             ha_token: nil
@@ -103,6 +117,8 @@ defmodule Cairn.Config do
     acc =
       warn_unknown(acc, Map.get(map, "integrations"), @known_integrations_keys, "integrations")
 
+    acc = warn_unknown(acc, Map.get(map, "tracking"), @known_tracking_keys, "tracking")
+
     {cameras, acc} = parse_cameras(Map.get(map, "cameras", []), acc)
     {plugin_groups, acc} = parse_plugins(Map.get(map, "plugins"), acc)
 
@@ -118,6 +134,8 @@ defmodule Cairn.Config do
       max_event_seconds: get_in(map, ["events", "max_event_seconds"]) || 300,
       retention_days: get_in(map, ["retention", "days"]) || 14,
       retention_per_label: get_in(map, ["retention", "per_label"]) || %{},
+      max_unseen_ms: configured_max_unseen_ms(map),
+      max_live_tracks: configured_max_live_tracks(map),
       cameras: cameras,
       plugin_groups: plugin_groups,
       ha_token: get_in(map, ["integrations", "token"])
@@ -141,6 +159,52 @@ defmodule Cairn.Config do
       max: cam.max_event_seconds || config.max_event_seconds
     }
   end
+
+  defp configured_max_unseen_ms(map),
+    do: get_in(map, ["tracking", "max_unseen_ms"]) || @default_max_unseen_ms
+
+  defp configured_max_live_tracks(map),
+    do: get_in(map, ["tracking", "max_live_tracks"]) || @default_max_live_tracks
+
+  @doc """
+  Everything the detection pipeline needs for a camera in one map: the event
+  windows plus the tracking settings.
+
+  The plugin ports resolve it once and hand it to `Cairn.DetectionAggregator`
+  with every observation, so the aggregator never calls the config server on
+  a per-frame path.
+  """
+  @spec policy(t(), Camera.t()) :: %{
+          pre: pos_integer(),
+          post: pos_integer(),
+          max: pos_integer(),
+          max_unseen_ms: pos_integer(),
+          max_live_tracks: pos_integer()
+        }
+  def policy(%__MODULE__{} = config, %Camera{} = cam) do
+    config
+    |> windows(cam)
+    |> Map.put(:max_unseen_ms, max_unseen_ms(config, cam))
+    |> Map.put(:max_live_tracks, max_live_tracks(config, cam))
+  end
+
+  @doc "Effective track expiry (media milliseconds) for a camera."
+  @spec max_unseen_ms(t(), Camera.t()) :: pos_integer()
+  def max_unseen_ms(%__MODULE__{} = config, %Camera{} = cam),
+    do: cam.max_unseen_ms || config.max_unseen_ms
+
+  @doc "Track expiry used when no config is available (media milliseconds)."
+  @spec default_max_unseen_ms() :: pos_integer()
+  def default_max_unseen_ms, do: @default_max_unseen_ms
+
+  @doc "Effective live-track cap for a camera."
+  @spec max_live_tracks(t(), Camera.t()) :: pos_integer()
+  def max_live_tracks(%__MODULE__{} = config, %Camera{} = cam),
+    do: cam.max_live_tracks || config.max_live_tracks
+
+  @doc "Live-track cap used when no config is available."
+  @spec default_max_live_tracks() :: pos_integer()
+  def default_max_live_tracks, do: @default_max_live_tracks
 
   @doc "Effective retention days for a camera and label."
   @spec retention_days(t(), Camera.t(), String.t()) :: pos_integer()
@@ -260,6 +324,7 @@ defmodule Cairn.Config do
     |> validate_ids(config)
     |> validate_plugins(config)
     |> validate_windows(config)
+    |> validate_tracking(config)
     |> validate_udp(config)
     |> validate_numbers(config)
     |> validate_remux(config)
@@ -324,6 +389,31 @@ defmodule Cairn.Config do
         c.max_event_seconds >= c.post_window_seconds,
         "#{prefix}max_event_seconds must be >= post_window_seconds"
       )
+    end)
+  end
+
+  # Media-time expiry: below ~100 ms a single dropped frame ends every track;
+  # above an hour a track outlives the epoch it belongs to. The live-track cap
+  # has to leave room for a full 64-object frame at the low end and stay a
+  # bound worth having at the high end.
+  defp validate_tracking(acc, config) do
+    acc
+    |> validate_tracking_key(config, :max_unseen_ms, 100, 3_600_000)
+    |> validate_tracking_key(config, :max_live_tracks, 1, 10_000)
+  end
+
+  defp validate_tracking_key(acc, config, key, min, max) do
+    values =
+      [{nil, Map.fetch!(config, key)} | Enum.map(config.cameras, &{&1.id, Map.fetch!(&1, key)})]
+
+    Enum.reduce(values, acc, fn
+      {_id, nil}, acc ->
+        acc
+
+      {id, value}, acc ->
+        prefix = if id, do: "camera #{id}: ", else: "tracking."
+
+        check(acc, int?(value, min, max), "#{prefix}#{key} must be #{min}..#{max}")
     end)
   end
 

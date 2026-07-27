@@ -6,13 +6,17 @@ defmodule Cairn.Event do
   `{:event_started | :event_updated | :event_ended, %Cairn.Event{}}` with a
   stable, JSON-serializable shape. The dashboard consumes it today;
   MQTT/webhook publishers can bolt on later without touching the
-  aggregator.
+  aggregator. `Cairn.Track` publishes the object lifecycle on the same topic.
 
   `labels` is a time-indexed list of `%{t: seconds_since_start, label: l,
   score: s, object_id: id}` entries; `max_scores` maps label -> best score
   seen. `trigger` is the single highest-scoring detection of the event
-  (`%{t, label, score, bbox}`) — the frame the snapshot is cut from, with the
-  box drawn on it.
+  (`%{t, label, score, bbox, object_id}`) — the frame the snapshot is cut
+  from, with the box drawn on it.
+
+  `object_id` is a `Cairn.ULID` **string**, the identity of the track the
+  detection belongs to (`%Cairn.Track{}.object_id`) — unique for the life of
+  the installation, never reused across a stream epoch or a restart.
   """
 
   @derive Jason.Encoder

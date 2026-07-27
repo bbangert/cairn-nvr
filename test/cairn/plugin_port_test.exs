@@ -192,14 +192,21 @@ defmodule Cairn.PluginPortTest do
       )
 
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^id}, _windows, %Observation{pts: 1} = obs}},
+                    {:detections, %Camera{id: ^id}, policy, %Observation{pts: 1} = obs}},
                    5_000
+
+    # resolved once at spawn and carried on every cast — the per-frame path
+    # must never reach the config server, and the aggregator reads
+    # `max_unseen_ms` from here to expire tracks
+    assert policy == Cairn.Config.policy(config(), camera(id))
+    assert policy == :sys.get_state(pid).policy
+    assert is_number(policy.max_unseen_ms)
 
     assert [%{label: "cat", score: 0.8, bbox: [0.1, 0.1, 0.2, 0.2]}] = obs.objects
 
     # the non-numeric pts line is dropped whole, so the next cast is the last line
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^id}, _windows, %Observation{pts: 3} = good}},
+                    {:detections, %Camera{id: ^id}, _policy, %Observation{pts: 3} = good}},
                    5_000
 
     assert [%{label: "person", score: 0.9, bbox: [0, 0, 1, 1]}] = good.objects
@@ -258,8 +265,7 @@ defmodule Cairn.PluginPortTest do
          camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
       )
 
-    assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^id}, _windows, %Observation{pts: 7}}},
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, _policy, %Observation{pts: 7}}},
                    5_000
 
     assert %PluginPort{} = :sys.get_state(pid)
@@ -282,7 +288,7 @@ defmodule Cairn.PluginPortTest do
 
         # ordered after the flood: the port handles lines in order
         assert_receive {:"$gen_cast",
-                        {:detections, %Camera{id: ^id}, _windows, %Observation{pts: 2}}},
+                        {:detections, %Camera{id: ^id}, _policy, %Observation{pts: 2}}},
                        5_000
       end)
 
@@ -409,11 +415,13 @@ defmodule Cairn.PluginPortTest do
          camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
       )
 
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, _w, %Observation{sequence: 1}}},
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^id}, _policy, %Observation{sequence: 1}}},
                    5_000
 
     # the stale line never reaches the aggregator; the next good one does
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, _w, %Observation{sequence: 5}}},
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^id}, _policy, %Observation{sequence: 5}}},
                    5_000
 
     # sequences 2..4 (the stale line's number included) are a gap of 3
@@ -507,7 +515,8 @@ defmodule Cairn.PluginPortTest do
 
     # ordered after all three: the port handles lines in order, so the last
     # line arriving proves the first three were dropped rather than pending
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, _w, %Observation{sequence: 3}}},
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^id}, _policy, %Observation{sequence: 3}}},
                    5_000
 
     state = :sys.get_state(pid)
@@ -539,14 +548,15 @@ defmodule Cairn.PluginPortTest do
 
     # an hour-ahead plugin clock would future-date the event past every
     # retention sweep, and its labels/snapshot offsets with it
-    assert_receive {:"$gen_cast", {:detections, _cam, _w, %Observation{sequence: 1} = skewed}},
+    assert_receive {:"$gen_cast",
+                    {:detections, _cam, _policy, %Observation{sequence: 1} = skewed}},
                    5_000
 
     assert abs(DateTime.diff(skewed.observed_at, DateTime.utc_now(), :second)) < 30
     assert skewed.time_quality == :arrival
 
     # a plausible clock is left alone, still marked as the plugin's own
-    assert_receive {:"$gen_cast", {:detections, _cam, _w, %Observation{sequence: 2} = kept}},
+    assert_receive {:"$gen_cast", {:detections, _cam, _policy, %Observation{sequence: 2} = kept}},
                    5_000
 
     assert DateTime.diff(now, kept.observed_at, :second) == 5
@@ -584,6 +594,43 @@ defmodule Cairn.PluginPortTest do
     assert [_, _, _, ended, restarted] = await_control(path, 5)
     assert %{"type" => "stream.ended", "stream_epoch" => ^second} = ended
     assert %{"type" => "stream.started", "stream_epoch" => ^third} = restarted
+  end
+
+  # The capability is the plugin's promise that its track ids are stable, and
+  # the observation is where `Cairn.Tracker` reads that promise.
+  test "the object_tracking capability marks the observations it produces" do
+    for {capabilities, tracking} <- [{%{"object_tracking" => true}, true}, {%{}, false}] do
+      id = "plug_cap_#{System.unique_integer([:positive])}"
+      epoch = StreamEpochs.new_epoch(id, :started)
+
+      hello =
+        Jason.encode!(%{
+          "spec" => "cairn.plugin",
+          "version" => 1,
+          "type" => "plugin.hello",
+          "hello" => %{
+            "name" => "fake",
+            "supported_versions" => [1],
+            "capabilities" => capabilities
+          }
+        })
+
+      objects = [Map.put(object("person", 0.9), "track_id", "t1")]
+      command = printf([hello, v1_line(id, epoch, 1, objects)]) <> "; sleep 30"
+
+      start_supervised!(
+        {PluginPort,
+         camera: camera(id), config: config(), index: 0, command: command, aggregator: self()},
+        id: {:cap, tracking}
+      )
+
+      assert_receive {:"$gen_cast",
+                      {:detections, %Camera{id: ^id}, _policy, %Observation{sequence: 1} = obs}},
+                     5_000
+
+      assert obs.tracking == tracking
+      assert [%{track_id: "t1"}] = obs.objects
+    end
   end
 
   test "plugin exit triggers backoff respawn" do

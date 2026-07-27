@@ -22,6 +22,39 @@ defmodule CairnWeb.DashboardLiveTest do
     assert render_async_status(view, "cam_a") =~ ~s(data-status="running")
   end
 
+  # The "events" topic carries the per-object track lifecycle as well as
+  # events, and gains kinds over time (artifact lifecycle is next). The grid
+  # must ignore what it does not know rather than die on it.
+  test "track lifecycle broadcasts do not crash the grid", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/")
+
+    track = %Cairn.Track{
+      object_id: Cairn.ULID.generate(),
+      camera_id: "cam_a",
+      label: "person",
+      score: 0.9,
+      best_score: 0.9,
+      bbox: [0.1, 0.1, 0.2, 0.4],
+      source: :host,
+      started_at: DateTime.utc_now(),
+      last_seen_at: DateTime.utc_now()
+    }
+
+    Cairn.Track.broadcast(:track_started, track)
+    Cairn.Track.broadcast(:track_updated, track)
+    Cairn.Track.broadcast(:track_ended, %{track | end_reason: :unseen})
+
+    # the three track kinds are ones the grid may legitimately grow a clause
+    # for; the forward-compat claim is about a kind it has never heard of
+    Phoenix.PubSub.local_broadcast(
+      Cairn.PubSub,
+      Cairn.Event.topic(),
+      {:totally_unknown_kind, %{}}
+    )
+
+    assert render(view) =~ "camera-tile-cam_a"
+  end
+
   defp render_async_status(view, camera_id, attempts \\ 50) do
     html = render(view)
     selector = ~s(#camera-status-#{camera_id})

@@ -8,6 +8,8 @@ defmodule CairnWeb.Api.EventJSON do
     * `shape_live/1` — a runtime `Cairn.Event` broadcast on the `"events"`
       PubSub topic (the SSE feed).
 
+  `shape_track/1` shapes the track lifecycle broadcast on the same topic.
+
   On-disk paths (`path`, `snapshot_path`) are never emitted; media is reached
   only through the opaque, token-authed `clip_url` / `snapshot_url`.
   """
@@ -45,6 +47,31 @@ defmodule CairnWeb.Api.EventJSON do
       trigger: e.trigger,
       snapshot_url: media_url(e.snapshot_path, "/api/media/snapshots/#{e.id}"),
       clip_url: media_url(e.path, "/api/media/events/#{e.id}")
+    }
+  end
+
+  @doc """
+  Shapes a runtime `Cairn.Track` (SSE track lifecycle frame).
+
+  Self-contained by design: a client that only ever sees `track_ended` still
+  learns what the track was. `end_reason` is `null` while the track is live.
+  """
+  @spec shape_track(Cairn.Track.t()) :: map()
+  def shape_track(%Cairn.Track{} = t) do
+    %{
+      object_id: t.object_id,
+      camera_id: t.camera_id,
+      label: t.label,
+      score: t.score,
+      best_score: t.best_score,
+      bbox: t.bbox,
+      source: t.source,
+      plugin_track_id: t.plugin_track_id,
+      started_at: t.started_at,
+      last_seen_at: t.last_seen_at,
+      last_detected_at: t.last_detected_at,
+      stale_predicted: t.stale_predicted,
+      end_reason: t.end_reason
     }
   end
 
