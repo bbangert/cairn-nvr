@@ -227,16 +227,22 @@ it.
   `reason`: `started`, `source_lost`, `stall_bounce`, `camera_stopped`)
   precedes the new `stream.started` when Cairn had already announced a live
   epoch to you.
-- `reason: "camera_stopped"` ends a stream that nothing replaces: no
-  `stream.started` follows until that camera streams again.
+- `reason: "camera_stopped"` ends a stream that nothing replaces: while your
+  process keeps running, no `stream.started` follows until that camera
+  streams again.
 - **Stamp every `frame.objects` line with the epoch of the camera it
   describes.** Lines carrying a stale or unknown epoch are dropped — that is
   the point: they describe a stream that no longer exists.
 - On a new epoch, drop your decoder state and your track identities for that
   camera and resync on the next keyframe.
-- Cairn restarting your process does not restart the streams: expect a
-  `stream.started` for every camera right after you start, whatever was
-  happening before.
+- **`stream.started` is the last known stream identity, not proof of live
+  media.** The per-spawn announcement is replayed from Cairn's record of the
+  last epoch for each camera you serve, and that record survives your process
+  while the announcement state does not — so after a restart you may be told
+  `stream.started` for the last epoch of a camera that has since stopped, with
+  no `stream.ended` to follow. Use it to *tag* lines; judge liveness from RTP
+  flow, and expect a camera you have been "started" for to send nothing at
+  all.
 
 ## Logging
 

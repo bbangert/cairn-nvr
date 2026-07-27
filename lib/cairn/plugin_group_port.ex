@@ -375,6 +375,11 @@ defmodule Cairn.PluginGroupPort do
   # and SSE client per line — multiplied by member count when the line names
   # no camera — so it is re-sent only as a slow heartbeat.
   defp push_status(state, camera_id, status) do
+    # `camera_id` has finished its routing job in `note_status/2`; what is
+    # stored is keyed by camera already, so carrying it in the payload only
+    # duplicates the key (and would differ from an unrouted status that is
+    # otherwise identical, defeating the change detection below).
+    status = Map.delete(status, "camera_id")
     now = System.monotonic_time(:millisecond)
 
     if status_due?(status, Map.get(state.last_statuses, camera_id), now) do

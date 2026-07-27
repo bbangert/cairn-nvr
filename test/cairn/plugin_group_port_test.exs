@@ -114,9 +114,16 @@ defmodule Cairn.PluginGroupPortTest do
       end
 
     cond do
-      length(lines) >= count -> lines
-      attempts == 0 -> flunk("plugin received #{length(lines)} control lines, wanted #{count}")
-      true -> Process.sleep(25) && await_control(path, count, attempts - 1)
+      length(lines) >= count ->
+        lines
+
+      attempts == 0 ->
+        flunk("plugin received #{length(lines)} control lines, wanted #{count}")
+
+      true ->
+        # the poll interval — without it the attempts burn out in microseconds
+        Process.sleep(25)
+        await_control(path, count, attempts - 1)
     end
   end
 
@@ -524,6 +531,11 @@ defmodule Cairn.PluginGroupPortTest do
     assert_receive {:camera_status, ^a_id, %{plugin_status: %{"state" => "ready"}}}, 5_000
     assert_receive {:camera_status, ^b_id, %{plugin_status: %{"state" => "ready"}}}, 5_000
     assert_receive {:camera_status, ^a_id, %{plugin_status: %{"state" => "degraded"}}}, 5_000
+
+    # the envelope's camera_id routed the status and stops there: what is
+    # stored is keyed by camera already
+    assert Cairn.CameraStatus.get(a_id).plugin_status == %{"state" => "degraded"}
+    assert Cairn.CameraStatus.get(b_id).plugin_status == %{"state" => "ready"}
 
     # the repeat is gated: b never hears about a, and a is not told twice
     refute_receive {:camera_status, ^b_id, %{plugin_status: %{"state" => "degraded"}}}, 200

@@ -78,9 +78,16 @@ defmodule Cairn.PluginPortTest do
       end
 
     cond do
-      length(lines) >= count -> lines
-      attempts == 0 -> flunk("plugin received #{length(lines)} control lines, wanted #{count}")
-      true -> Process.sleep(25) && await_control(path, count, attempts - 1)
+      length(lines) >= count ->
+        lines
+
+      attempts == 0 ->
+        flunk("plugin received #{length(lines)} control lines, wanted #{count}")
+
+      true ->
+        # the poll interval — without it the attempts burn out in microseconds
+        Process.sleep(25)
+        await_control(path, count, attempts - 1)
     end
   end
 
@@ -430,11 +437,15 @@ defmodule Cairn.PluginPortTest do
         }
       })
 
+    # a per-camera plugin serves exactly one camera, so the envelope's
+    # `camera_id` is at best redundant and at worst a plugin naming someone
+    # else's camera: it must not reach what is stored and broadcast
     status =
       Jason.encode!(%{
         "spec" => "cairn.plugin",
         "version" => 1,
         "type" => "plugin.status",
+        "camera_id" => "plug_hello_spoofed",
         "status" => %{"state" => "ready", "detail" => "model loaded"}
       })
 
@@ -460,6 +471,7 @@ defmodule Cairn.PluginPortTest do
 
         assert_receive {:camera_status, ^id, info}, 5_000
         assert info.plugin_status == %{"state" => "ready", "detail" => "model loaded"}
+        refute Map.has_key?(info.plugin_status, "camera_id")
 
         assert %{"name" => "fake-detect"} = :sys.get_state(pid).plugin
       end)

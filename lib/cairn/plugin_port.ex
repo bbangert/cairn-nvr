@@ -312,6 +312,10 @@ defmodule Cairn.PluginPort do
   # An unchanged status is an ETS write plus a broadcast to every dashboard
   # and SSE client per line, so it is re-sent only as a slow heartbeat.
   defp note_status(state, status) do
+    # `camera_id` is envelope routing, not status: what is stored is already
+    # keyed by camera, and a per-camera plugin naming another camera here would
+    # otherwise have that id broadcast as if Cairn had said it.
+    status = Map.delete(status, "camera_id")
     now = System.monotonic_time(:millisecond)
 
     if status_due?(status, state.last_status, now) do

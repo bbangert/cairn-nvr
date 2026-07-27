@@ -61,9 +61,10 @@ defmodule Cairn.PluginProtocol do
   @max_capability_key_bytes 32
   # status is retained per camera in ETS and broadcast to every dashboard and
   # SSE client, so it is a whitelist rather than a passthrough. `camera_id` is
-  # part of the shaped status too, but it is only ever taken from the
-  # envelope: a payload-supplied one would let a plugin address a member it
-  # was not talking about.
+  # part of the shaped status too, but only as routing for the caller — it is
+  # only ever taken from the envelope (a payload-supplied one would let a
+  # plugin address a member it was not talking about) and the port drops it
+  # before storing.
   @status_keys ~w(state detail fps)
   @max_status_state_bytes 32
   @max_status_detail_bytes 256
