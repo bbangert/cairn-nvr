@@ -14,8 +14,9 @@ defmodule Cairn.PluginGroupPort do
   `Cairn.PluginProtocol.decode_line/2` (protocol v1 or the v0
   `{"camera_id", "pts", "dets"}` shape) it is routed as a
   `Cairn.Observation` to `Cairn.DetectionAggregator` with that camera's
-  config and effective windows. Lines for an unknown or missing camera are
-  dropped, as are malformed ones, observations from a stale stream epoch and
+  config and effective policy (event windows + tracking). Lines for an unknown
+  or missing camera are dropped, as are malformed ones, observations from a
+  stale stream epoch and
   individual detections `Cairn.PluginProtocol` rejects — counted always,
   logged periodically. Exit -> jittered backoff respawn, same policy as
   `Cairn.PluginPort`.
@@ -188,7 +189,7 @@ defmodule Cairn.PluginGroupPort do
     Enum.reduce(group.members, %{}, fn member, routes ->
       case Map.fetch(cameras, member.id) do
         {:ok, cam} ->
-          Map.put(routes, cam.id, {cam, Config.windows(config, cam)})
+          Map.put(routes, cam.id, {cam, Config.policy(config, cam)})
 
         :error ->
           Logger.error(
@@ -234,18 +235,18 @@ defmodule Cairn.PluginGroupPort do
 
   defp route(state, observation) do
     case Map.fetch(state.routes, observation.camera_id) do
-      {:ok, {cam, windows}} ->
-        observe(state, cam, windows, observation)
+      {:ok, {cam, policy}} ->
+        observe(state, cam, policy, observation)
 
       :error ->
         note_drops(state, 1, :unknown_camera, preview(observation.camera_id))
     end
   end
 
-  defp observe(state, cam, windows, observation) do
+  defp observe(state, cam, policy, observation) do
     {observation, skew} =
       observation
-      |> attribute(cam.id, state.group.name)
+      |> attribute(cam.id, state.group.name, tracking?(state.plugin))
       |> clamp_observed_at()
 
     state = note_drops(state, skew, :clock_skew, preview(cam.id))
@@ -253,7 +254,7 @@ defmodule Cairn.PluginGroupPort do
     if current_epoch?(observation, cam.id) do
       state
       |> note_sequence(observation)
-      |> forward(cam, windows, observation)
+      |> forward(cam, policy, observation)
       |> note_drops(observation.invalid_objects, :invalid_det)
     else
       note_drops(state, 1, :stale_epoch, preview(cam.id))
@@ -262,7 +263,7 @@ defmodule Cairn.PluginGroupPort do
 
   # v0 lines carry neither epoch nor time: the epoch is whatever is current
   # right now, and arrival is the only timestamp available.
-  defp attribute(%Observation{protocol: :v0} = observation, camera_id, group_name) do
+  defp attribute(%Observation{protocol: :v0} = observation, camera_id, group_name, tracking) do
     epoch =
       case StreamEpochs.current(camera_id) do
         {:ok, epoch} -> epoch
@@ -275,12 +276,24 @@ defmodule Cairn.PluginGroupPort do
         plugin_instance: group_name,
         epoch: epoch,
         observed_at: DateTime.utc_now(),
-        time_quality: :arrival
+        time_quality: :arrival,
+        tracking: tracking
     }
   end
 
-  defp attribute(observation, camera_id, group_name),
-    do: %{observation | camera_id: camera_id, plugin_instance: group_name}
+  defp attribute(observation, camera_id, group_name, tracking),
+    do: %{
+      observation
+      | camera_id: camera_id,
+        plugin_instance: group_name,
+        tracking: tracking
+    }
+
+  # Track ids are only honoured from a plugin that promised, in its hello,
+  # that they are stable (see `Cairn.Tracker`). One process, one promise: it
+  # covers every member camera.
+  defp tracking?(%{"capabilities" => %{"object_tracking" => true}}), do: true
+  defp tracking?(_hello), do: false
 
   # `observed_at` is the plugin's own clock and it is what event `started_at`,
   # label offsets and snapshot seeks derive from, while `ended_at` and the
@@ -435,9 +448,9 @@ defmodule Cairn.PluginGroupPort do
   # since one grapheme cluster can be arbitrarily long.
   defp preview(value), do: inspect(value, limit: 3, printable_limit: @id_preview)
 
-  defp forward(state, cam, windows, observation) do
+  defp forward(state, cam, policy, observation) do
     aggregator = Keyword.get(state.opts, :aggregator, Cairn.DetectionAggregator)
-    Cairn.DetectionAggregator.detections(aggregator, cam, windows, observation)
+    Cairn.DetectionAggregator.detections(aggregator, cam, policy, observation)
     state
   end
 

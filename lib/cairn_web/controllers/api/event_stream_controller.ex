@@ -2,8 +2,9 @@ defmodule CairnWeb.Api.EventStreamController do
   @moduledoc """
   Server-Sent Events feed for Home Assistant.
 
-  Subscribes the request process to the `"events"`, `"cameras:status"` and
-  `"system:alerts"` PubSub topics and streams each message as an SSE frame
+  Subscribes the request process to the `"events"` (event *and* track
+  lifecycle), `"cameras:status"` and `"system:alerts"` PubSub topics and
+  streams each message as an SSE frame
   (`event: <kind>\\ndata: <json>\\n\\n`) via chunked transfer. A comment
   heartbeat every 20s keeps intermediaries from closing an idle connection;
   HA follows entity availability off this connection.
@@ -101,6 +102,11 @@ defmodule CairnWeb.Api.EventStreamController do
     encode_frame(event_name(kind), EventJSON.shape_live(event))
   end
 
+  def frame_for({kind, %Cairn.Track{} = track})
+      when kind in [:track_started, :track_updated, :track_ended] do
+    encode_frame(track_name(kind), EventJSON.shape_track(track))
+  end
+
   def frame_for({:camera_status, camera_id, info}) do
     encode_frame("camera_status", %{
       camera_id: camera_id,
@@ -139,6 +145,10 @@ defmodule CairnWeb.Api.EventStreamController do
   defp event_name(:event_started), do: "event_started"
   defp event_name(:event_updated), do: "event_updated"
   defp event_name(:event_ended), do: "event_ended"
+
+  defp track_name(:track_started), do: "track_started"
+  defp track_name(:track_updated), do: "track_updated"
+  defp track_name(:track_ended), do: "track_ended"
 
   defp schedule_heartbeat, do: Process.send_after(self(), :heartbeat, @heartbeat_ms)
 end

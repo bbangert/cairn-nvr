@@ -37,6 +37,12 @@ events:
   post_window_seconds: 10
   max_event_seconds: 300
 
+# Object tracking (per-camera overridable with the same key). A track that
+# goes unseen for this much *stream* time is ended; its object_id (a ULID) is
+# never handed to anything else.
+tracking:
+  max_unseen_ms: 3000
+
 # Days to keep event clips; per-label overrides win.
 retention:
   days: 14

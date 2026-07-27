@@ -149,17 +149,17 @@ defmodule Cairn.PluginGroupPortTest do
     b_id = b.id
 
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^a_id}, windows_a, %Observation{pts: 1} = obs_a}},
+                    {:detections, %Camera{id: ^a_id}, policy_a, %Observation{pts: 1} = obs_a}},
                    5_000
 
-    assert windows_a == %{pre: 5, post: 10, max: 300}
+    assert policy_a == %{pre: 5, post: 10, max: 300, max_unseen_ms: 3_000}
     assert [%{label: "person", score: 0.9}] = obs_a.objects
 
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^b_id}, windows_b, %Observation{pts: 2}}},
+                    {:detections, %Camera{id: ^b_id}, policy_b, %Observation{pts: 2}}},
                    5_000
 
-    assert windows_b == %{pre: 5, post: 42, max: 300}
+    assert policy_b == %{pre: 5, post: 42, max: 300, max_unseen_ms: 3_000}
   end
 
   test "each camera's own min_score applies through the aggregator" do
@@ -202,7 +202,7 @@ defmodule Cairn.PluginGroupPortTest do
     a_id = a.id
 
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^a_id}, _windows, %Observation{pts: 3}}},
+                    {:detections, %Camera{id: ^a_id}, _policy, %Observation{pts: 3}}},
                    5_000
 
     assert %PluginGroupPort{} = :sys.get_state(pid)
@@ -218,7 +218,7 @@ defmodule Cairn.PluginGroupPortTest do
     a_id = a.id
 
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^a_id}, _windows, %Observation{pts: 7}}},
+                    {:detections, %Camera{id: ^a_id}, _policy, %Observation{pts: 7}}},
                    5_000
 
     assert %PluginGroupPort{} = :sys.get_state(pid)
@@ -285,14 +285,14 @@ defmodule Cairn.PluginGroupPortTest do
     a_id = a.id
 
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^a_id}, _windows, %Observation{pts: 1} = obs}},
+                    {:detections, %Camera{id: ^a_id}, _policy, %Observation{pts: 1} = obs}},
                    5_000
 
     assert [%{label: "cat", score: 0.8, bbox: [0.1, 0.1, 0.2, 0.2]}] = obs.objects
 
     # the non-numeric pts line is dropped whole, so the next cast is the last line
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^a_id}, _windows, %Observation{pts: 3} = good}},
+                    {:detections, %Camera{id: ^a_id}, _policy, %Observation{pts: 3} = good}},
                    5_000
 
     assert [%{label: "person", score: 0.9, bbox: [0, 0, 1, 1]}] = good.objects
@@ -347,10 +347,10 @@ defmodule Cairn.PluginGroupPortTest do
     a_id = a.id
 
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^a_id}, windows, %Observation{pts: 1}}},
+                    {:detections, %Camera{id: ^a_id}, policy, %Observation{pts: 1}}},
                    5_000
 
-    assert windows.post == 10
+    assert policy.post == 10
     os_pid = :sys.get_state(pid).os_pid
 
     # the group is unchanged; only a camera field the argv never carried moved
@@ -376,7 +376,7 @@ defmodule Cairn.PluginGroupPortTest do
       capture_log(fn ->
         start_group_port([a], command: command, aggregator: self())
         # ordered after all five drops: the port handles lines in order
-        assert_receive {:"$gen_cast", {:detections, _cam, _windows, %Observation{pts: 99}}}, 5_000
+        assert_receive {:"$gen_cast", {:detections, _cam, _policy, %Observation{pts: 99}}}, 5_000
       end)
 
     assert length(Regex.scan(~r/dropped lines\/dets/, log)) == 1

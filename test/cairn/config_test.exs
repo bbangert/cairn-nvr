@@ -102,6 +102,23 @@ defmodule Cairn.ConfigTest do
       assert Enum.any?(errors, &(&1 =~ "camera cam_a: post_window_seconds"))
     end
 
+    test "tracking.max_unseen_ms must be a sane number of milliseconds" do
+      map = Map.put(base_map(), "tracking", %{"max_unseen_ms" => 10})
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "tracking.max_unseen_ms must be 100..3600000"))
+    end
+
+    test "per-camera max_unseen_ms overrides are validated" do
+      map =
+        update_in(base_map(), ["cameras"], fn [a, b] ->
+          [Map.put(a, "max_unseen_ms", "soon"), b]
+        end)
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "camera cam_a: max_unseen_ms must be 100..3600000"))
+    end
+
     test "duplicate camera ids are an error" do
       map =
         update_in(base_map(), ["cameras"], fn [a, _b] ->
@@ -304,6 +321,26 @@ defmodule Cairn.ConfigTest do
       [cam_a, cam_b] = config.cameras
       assert Config.windows(config, cam_a) == %{pre: 9, post: 10, max: 300}
       assert Config.windows(config, cam_b) == %{pre: 5, post: 10, max: 300}
+    end
+
+    test "max_unseen_ms defaults, is globally settable and per-camera overridable" do
+      {:ok, defaults, _} = Config.from_map(base_map())
+      [cam_a, _cam_b] = defaults.cameras
+      assert defaults.max_unseen_ms == 3_000
+      assert Config.max_unseen_ms(defaults, cam_a) == 3_000
+
+      {:ok, config, _} =
+        base_map()
+        |> Map.put("tracking", %{"max_unseen_ms" => 5_000})
+        |> update_in(["cameras"], fn [a, b] -> [Map.put(a, "max_unseen_ms", 800), b] end)
+        |> Config.from_map()
+
+      [cam_a, cam_b] = config.cameras
+      assert Config.max_unseen_ms(config, cam_a) == 800
+      assert Config.max_unseen_ms(config, cam_b) == 5_000
+
+      # the ports hand the aggregator windows and tracking as one map
+      assert Config.policy(config, cam_a) == %{pre: 5, post: 10, max: 300, max_unseen_ms: 800}
     end
 
     test "retention precedence: camera per-label > camera days > global per-label > global" do

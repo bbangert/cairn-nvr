@@ -105,6 +105,11 @@ defmodule CairnWeb.DashboardLive do
     {:noreply, assign(socket, disk_alert: alert)}
   end
 
+  # The `"events"` topic also carries the per-object track lifecycle, and
+  # gains kinds over time; the grid only cares about whether a camera has a
+  # live event.
+  def handle_info(_msg, socket), do: {:noreply, socket}
+
   # -- view helpers -----------------------------------------------------------
 
   defp status(statuses, camera_id) do

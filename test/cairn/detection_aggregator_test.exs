@@ -2,9 +2,9 @@ defmodule Cairn.DetectionAggregatorTest do
   use ExUnit.Case, async: false
 
   alias Cairn.Config.Camera
-  alias Cairn.{DetectionAggregator, Event, EventCheckpoint, Observation, StreamEpochs}
+  alias Cairn.{DetectionAggregator, Event, EventCheckpoint, Observation, StreamEpochs, Track}
 
-  @windows %{pre: 5, post: 10, max: 300}
+  @policy %{pre: 5, post: 10, max: 300, max_unseen_ms: 3_000}
 
   setup do
     camera_id = "agg_#{System.unique_integer([:positive])}"
@@ -36,7 +36,7 @@ defmodule Cairn.DetectionAggregatorTest do
   end
 
   defp observe(agg, camera, objects, opts \\ []) do
-    DetectionAggregator.detections(agg, camera, @windows, observation(objects, opts))
+    DetectionAggregator.detections(agg, camera, @policy, observation(objects, opts))
   end
 
   defp observation(objects, opts) do
@@ -44,16 +44,22 @@ defmodule Cairn.DetectionAggregatorTest do
       camera_id: Keyword.get(opts, :camera_id),
       epoch: Keyword.get(opts, :epoch),
       pts: 90_000,
-      media_ms: 1_000.0,
+      media_ms: Keyword.get(opts, :media_ms, 1_000.0),
       observed_at: Keyword.get(opts, :observed_at, DateTime.utc_now()),
       time_quality: :arrival,
       objects: objects,
+      ended_tracks: Keyword.get(opts, :ended_tracks, []),
+      tracking: Keyword.get(opts, :tracking, false),
       protocol: :v0
     }
   end
 
-  defp object(label, score, bbox, kind \\ "detected") do
-    %{label: label, score: score, bbox: bbox, track_id: nil, observation_kind: kind}
+  defp object(label, score, bbox, kind \\ "detected", track_id \\ nil) do
+    %{label: label, score: score, bbox: bbox, track_id: track_id, observation_kind: kind}
+  end
+
+  defp checkpoint(camera_id) do
+    Enum.filter(EventCheckpoint.all(), fn {cid, _event, _tracks} -> cid == camera_id end)
   end
 
   defp token(agg, camera_id, kind), do: :sys.get_state(agg).cameras[camera_id][kind]
@@ -73,11 +79,13 @@ defmodule Cairn.DetectionAggregatorTest do
     assert_receive {:extractor_started, %Event{camera_id: ^id} = event, _pid}
     assert_receive {:event_started, %Event{id: eid, camera_id: ^id}}
     assert event.id == eid
-    assert [%{label: "person", object_id: 1}] = event.labels
+    assert [%{label: "person", object_id: object_id}] = event.labels
+    # object ids are public ULIDs now, not the old per-tracker integers
+    assert is_binary(object_id) and String.length(object_id) == 26
+    assert event.trigger.object_id == object_id
     assert event.max_scores == %{"person" => 0.9}
 
-    assert [{^id, %Event{id: ^eid}}] =
-             Enum.filter(EventCheckpoint.all(), fn {cid, _} -> cid == id end)
+    assert [{^id, %Event{id: ^eid}, [%Track{object_id: ^object_id}]}] = checkpoint(id)
   end
 
   test "captures the highest-scoring detection as the snapshot trigger", %{
@@ -128,6 +136,7 @@ defmodule Cairn.DetectionAggregatorTest do
   } do
     detect(agg, camera)
     assert_receive {:event_started, %Event{labels: [%{object_id: first}]}}
+    assert_receive {:track_started, %Track{object_id: ^first}}
 
     # minted through the real server, so dropping StreamEpochs.subscribe/0 from
     # the aggregator fails here. new_epoch/2 returns only once the broadcast has
@@ -136,13 +145,21 @@ defmodule Cairn.DetectionAggregatorTest do
     StreamEpochs.new_epoch(id, :source_lost)
     _ = :sys.get_state(agg)
 
+    # the outage owes every live track a final, self-contained summary
+    assert_receive {:track_ended, %Track{object_id: ^first} = final}
+    assert final.end_reason == :stream_reset
+    assert final.camera_id == id
+    assert final.label == "person"
+    assert final.best_score == 0.9
+
     # identical bbox: only the epoch reset stops the tracker from matching it
     # onto the object from before the outage
     detect(agg, camera)
     assert_receive {:event_updated, %Event{labels: [_, %{object_id: second}]}}
+    # A ULID is minted once and never handed out again, so "not inherited" is
+    # the whole property: object ids no longer come from a counter, and two
+    # minted in the same millisecond sort by their random halves (Cairn.ULID).
     refute second == first
-    # Tracker.reset/1 keeps the id counter advancing; Tracker.new/0 would not
-    assert second > first
   end
 
   test "a repeat of the current epoch does not end tracks", %{
@@ -299,7 +316,8 @@ defmodule Cairn.DetectionAggregatorTest do
     # it still updated the tracker: the detected object that overlaps it
     # inherits that track's id rather than opening a second one
     observe(agg, camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])])
-    assert_receive {:event_started, %Event{labels: [%{object_id: 1}]}}
+    assert_receive {:track_started, %Track{object_id: track_id, source: :host}}
+    assert_receive {:event_started, %Event{labels: [%{object_id: ^track_id}]}}
   end
 
   test "an observation from a stale epoch is dropped", %{
@@ -326,7 +344,7 @@ defmodule Cairn.DetectionAggregatorTest do
     assert_receive {:extractor_finalized, ^ex_pid, %Event{id: ^eid, status: :finalized} = event}
     assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
     assert %DateTime{} = event.ended_at
-    assert Enum.filter(EventCheckpoint.all(), fn {cid, _} -> cid == id end) == []
+    assert checkpoint(id) == []
   end
 
   test "max-cap finalizes and the next detection reopens", %{
@@ -395,7 +413,7 @@ defmodule Cairn.DetectionAggregatorTest do
     Process.exit(ex_pid, :kill)
 
     assert_receive {:event_ended, %Event{id: ^eid, status: :partial}}
-    assert Enum.filter(EventCheckpoint.all(), fn {cid, _} -> cid == id end) == []
+    assert checkpoint(id) == []
   end
 
   test "orphaned checkpoint entries are ended as partial on restart", %{camera_id: id} do
@@ -406,7 +424,7 @@ defmodule Cairn.DetectionAggregatorTest do
 
     eid = event.id
     assert_receive {:event_ended, %Event{id: ^eid, status: :partial}}
-    assert Enum.filter(EventCheckpoint.all(), fn {cid, _} -> cid == id end) == []
+    assert checkpoint(id) == []
   end
 
   test "restart re-attaches to a live extractor and can finalize it", %{camera_id: id} do
@@ -437,5 +455,155 @@ defmodule Cairn.DetectionAggregatorTest do
     fire(agg, :post_window, id, eid)
     assert_receive {:extractor_finalized, ^extractor, %Event{id: ^eid}}
     assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
+  end
+
+  test "restored tracks end as :host_restart and their ids are never reassigned", %{
+    camera: camera,
+    camera_id: id
+  } do
+    object_id = Cairn.ULID.generate()
+
+    event = %Event{
+      id: Ecto.UUID.generate(),
+      camera_id: id,
+      started_at: DateTime.utc_now(),
+      labels: [%{t: 0.0, label: "person", score: 0.9, object_id: object_id}]
+    }
+
+    track = %Track{
+      object_id: object_id,
+      camera_id: id,
+      label: "person",
+      score: 0.9,
+      best_score: 0.9,
+      bbox: [0.1, 0.1, 0.2, 0.4],
+      source: :host,
+      started_at: event.started_at,
+      last_seen_at: event.started_at
+    }
+
+    EventCheckpoint.put(id, event, [track])
+
+    test_pid = self()
+
+    agg =
+      start_supervised!(
+        {DetectionAggregator,
+         name: nil,
+         start_extractor: fn _camera, ev ->
+           pid = spawn(fn -> Process.sleep(:infinity) end)
+           send(test_pid, {:extractor_started, ev, pid})
+           {:ok, pid}
+         end},
+        id: :agg_restore_tracks
+      )
+
+    # the tracker that owned it died with the aggregator: it owes a final,
+    # self-contained summary
+    assert_receive {:track_ended, %Track{object_id: ^object_id} = final}
+    assert final.end_reason == :host_restart
+    assert final.label == "person"
+    assert final.best_score == 0.9
+
+    # a ULID is minted once, so the restored event's label id can never be
+    # handed to a new object — the old integer-counter collision is gone
+    detect(agg, camera)
+    assert_receive {:event_started, %Event{labels: [%{object_id: fresh_id}]}}
+    refute fresh_id == object_id
+  end
+
+  describe "track lifecycle" do
+    test "started and ended always broadcast; updates are throttled", %{
+      camera: camera,
+      camera_id: id
+    } do
+      {:ok, clock} = start_supervised({Agent, fn -> 0 end})
+      test_pid = self()
+
+      agg =
+        start_supervised!(
+          {DetectionAggregator,
+           name: nil,
+           monotonic_ms: fn -> Agent.get(clock, & &1) end,
+           start_extractor: fn _camera, ev ->
+             pid = spawn(fn -> Process.sleep(:infinity) end)
+             send(test_pid, {:extractor_started, ev, pid})
+             {:ok, pid}
+           end},
+          id: :agg_throttle
+        )
+
+      detect(agg, camera, 0.6)
+      assert_receive {:track_started, %Track{object_id: oid, camera_id: ^id}}
+
+      # same score, no wall clock elapsed: nothing goes out
+      detect(agg, camera, 0.6, [0.12, 0.1, 0.2, 0.4])
+      :sys.get_state(agg)
+      refute_received {:track_updated, %Track{object_id: ^oid}}
+
+      # a better score is always worth sending
+      detect(agg, camera, 0.8, [0.12, 0.1, 0.2, 0.4])
+      assert_receive {:track_updated, %Track{object_id: ^oid, best_score: 0.8}}
+
+      # ...and so is a second of wall clock, however dull the frame
+      detect(agg, camera, 0.7, [0.12, 0.1, 0.2, 0.4])
+      :sys.get_state(agg)
+      refute_received {:track_updated, %Track{object_id: ^oid}}
+
+      Agent.update(clock, &(&1 + 1_000))
+      detect(agg, camera, 0.7, [0.12, 0.1, 0.2, 0.4])
+      assert_receive {:track_updated, %Track{object_id: ^oid, score: 0.7, best_score: 0.8}}
+
+      # expiry is media time: 3.1s after the last sighting the track ends
+      observe(agg, camera, [], media_ms: 4_200.0)
+      assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :unseen}}
+    end
+
+    test "a plugin's own track ids are honoured when it declared the capability", %{
+      agg: agg,
+      camera: camera
+    } do
+      observe(agg, camera, [object("person", 0.9, [0.0, 0.0, 0.1, 0.1], "detected", "t1")],
+        tracking: true
+      )
+
+      assert_receive {:track_started,
+                      %Track{object_id: oid, source: :plugin, plugin_track_id: "t1"}}
+
+      # nowhere near the previous box: only the plugin's id keeps it the same
+      # object
+      observe(agg, camera, [object("person", 0.95, [0.8, 0.8, 0.1, 0.1], "detected", "t1")],
+        tracking: true,
+        media_ms: 1_200.0
+      )
+
+      assert_receive {:track_updated, %Track{object_id: ^oid, best_score: 0.95}}
+
+      observe(agg, camera, [], tracking: true, media_ms: 1_400.0, ended_tracks: ["t1"])
+      assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :plugin_ended}}
+    end
+
+    test "predictions alone can neither open nor extend an event", %{
+      agg: agg,
+      camera: camera,
+      camera_id: id
+    } do
+      predicted = [object("person", 0.99, [0.1, 0.1, 0.2, 0.4], "tracked")]
+
+      observe(agg, camera, predicted, media_ms: 1_000.0)
+      observe(agg, camera, predicted, media_ms: 2_000.0)
+      :sys.get_state(agg)
+      refute_received {:event_started, %Event{camera_id: ^id}}
+
+      # a detection opens the event; the plugin then keeps predicting the same
+      # object, which must not hold the event open
+      detect(agg, camera)
+      assert_receive {:event_started, %Event{camera_id: ^id}}
+
+      observe(agg, camera, predicted, media_ms: 3_000.0)
+      observe(agg, camera, predicted, media_ms: 4_500.0)
+      :sys.get_state(agg)
+      refute_received {:event_updated, %Event{camera_id: ^id}}
+    end
   end
 end

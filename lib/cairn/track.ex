@@ -1,0 +1,58 @@
+defmodule Cairn.Track do
+  @moduledoc """
+  One tracked object's public identity and lifecycle.
+
+  Broadcast on the same `"events"` PubSub topic as `Cairn.Event` as
+  `{:track_started | :track_updated | :track_ended, %Cairn.Track{}}`.
+  `object_id` is a `Cairn.ULID` minted by `Cairn.Tracker` — the same string
+  that appears in an event's `labels[].object_id` and `trigger.object_id`.
+
+  A summary is **self-contained**: everything a consumer needs about the
+  track is in the message, so a client that only ever sees the final
+  `track_ended` still learns what the track was (ONVIF Analytics §A.10 —
+  the final summary SHALL be sent and stands on its own).
+
+    * `source` — `:host` when Cairn's own IoU tracker owns the identity,
+      `:plugin` when the plugin declared `object_tracking` and supplied
+      `plugin_track_id`.
+    * `score` is the latest observation's score, `best_score` the highest
+      seen over the track's life.
+    * `stale_predicted` — the track is alive but has not been *detected*
+      recently (the plugin keeps predicting it). Never event evidence.
+    * `end_reason` is `nil` until the track ends: `:unseen` (expired),
+      `:plugin_ended` (named in `ended_tracks`), `:stream_reset` (new stream
+      epoch), `:host_restart` (restored from a checkpoint after a crash).
+
+  Times are the observation's own (`observed_at`), not the wall clock of
+  the moment the message was built.
+  """
+
+  @derive Jason.Encoder
+  @enforce_keys [:object_id, :camera_id]
+  defstruct [
+    :object_id,
+    :camera_id,
+    :label,
+    :score,
+    :best_score,
+    :bbox,
+    :source,
+    :plugin_track_id,
+    :epoch,
+    :started_at,
+    :last_seen_at,
+    :last_detected_at,
+    :end_reason,
+    stale_predicted: false
+  ]
+
+  @type t :: %__MODULE__{}
+  @type kind :: :track_started | :track_updated | :track_ended
+  @type end_reason :: :unseen | :plugin_ended | :stream_reset | :host_restart
+
+  @spec broadcast(kind(), t()) :: :ok
+  def broadcast(kind, %__MODULE__{} = track)
+      when kind in [:track_started, :track_updated, :track_ended] do
+    Phoenix.PubSub.broadcast(Cairn.PubSub, Cairn.Event.topic(), {kind, track})
+  end
+end

@@ -586,6 +586,43 @@ defmodule Cairn.PluginPortTest do
     assert %{"type" => "stream.started", "stream_epoch" => ^third} = restarted
   end
 
+  # The capability is the plugin's promise that its track ids are stable, and
+  # the observation is where `Cairn.Tracker` reads that promise.
+  test "the object_tracking capability marks the observations it produces" do
+    for {capabilities, tracking} <- [{%{"object_tracking" => true}, true}, {%{}, false}] do
+      id = "plug_cap_#{System.unique_integer([:positive])}"
+      epoch = StreamEpochs.new_epoch(id, :started)
+
+      hello =
+        Jason.encode!(%{
+          "spec" => "cairn.plugin",
+          "version" => 1,
+          "type" => "plugin.hello",
+          "hello" => %{
+            "name" => "fake",
+            "supported_versions" => [1],
+            "capabilities" => capabilities
+          }
+        })
+
+      objects = [Map.put(object("person", 0.9), "track_id", "t1")]
+      command = printf([hello, v1_line(id, epoch, 1, objects)]) <> "; sleep 30"
+
+      start_supervised!(
+        {PluginPort,
+         camera: camera(id), config: config(), index: 0, command: command, aggregator: self()},
+        id: {:cap, tracking}
+      )
+
+      assert_receive {:"$gen_cast",
+                      {:detections, %Camera{id: ^id}, _policy, %Observation{sequence: 1} = obs}},
+                     5_000
+
+      assert obs.tracking == tracking
+      assert [%{track_id: "t1"}] = obs.objects
+    end
+  end
+
   test "plugin exit triggers backoff respawn" do
     id = "plug_#{System.unique_integer([:positive])}"
 

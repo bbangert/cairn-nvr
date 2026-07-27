@@ -135,9 +135,69 @@ the connection. Event kinds:
 | `event:` | `data` |
 |----------|--------|
 | `event_started` / `event_updated` / `event_ended` | live event object (id, camera_id, status, max_score, max_scores, trigger, snapshot_url, clip_url) |
-| `camera_status` | `{camera_id, status, probe}` |
+| `track_started` / `track_updated` / `track_ended` | track object (below) |
+| `camera_status` | `{camera_id, status, probe, plugin_status}` |
 | `camera_control` | `{camera_id, detection_enabled, recording_enabled, min_score}` |
 | `disk_alert` | `{active, free_mb, threshold_mb}` |
+
+> **Breaking change — `object_id` is now a ULID string.** It used to be a small
+> per-camera integer (`1`, `2`, …) that was reused after a restart or a stream
+> reconnect, so two different objects could share an id. It is now a 26-character
+> Crockford-base32 ULID (`"01J8ZQ0P8B7X0N2R4C6D8E0F2G"`), minted once and never
+> reused — across cameras, stream reconnects or host restarts. It appears in an
+> event's `trigger.object_id`, in the stored `labels.entries[].object_id`, and as
+> `object_id` on every track frame, and it is the key that ties them together.
+> Clients that stored or compared it as a number must treat it as an opaque
+> string. There is no compatibility mode.
+
+#### Track frames
+
+A **track** is one physical object followed through time. Cairn assigns the
+identity itself (IoU on the detections) unless the plugin declares the
+`object_tracking` capability, in which case the plugin's own ids are honoured
+and mapped onto ULIDs.
+
+```json
+{
+  "object_id": "01J8ZQ0P8B7X0N2R4C6D8E0F2G",
+  "camera_id": "front_door",
+  "label": "person",
+  "score": 0.81,
+  "best_score": 0.9,
+  "bbox": [0.12, 0.4, 0.2, 0.5],
+  "source": "host",
+  "plugin_track_id": null,
+  "started_at": "2026-07-24T00:00:00.000000Z",
+  "last_seen_at": "2026-07-24T00:00:02.000000Z",
+  "last_detected_at": "2026-07-24T00:00:01.000000Z",
+  "stale_predicted": false,
+  "end_reason": null
+}
+```
+
+Same schema for all three kinds:
+
+- `track_started` — a new identity. Always sent.
+- `track_updated` — **throttled**: sent only when `best_score` improves or at
+  most once a second per track. It is deliberately *not* a per-frame feed; do
+  not use it to drive animation.
+- `track_ended` — always sent, and **self-contained**: everything above is
+  filled in, so a client that missed every other frame still learns what the
+  track was. `end_reason` is one of `unseen` (not seen for the configured
+  `tracking.max_unseen_ms` of stream time), `plugin_ended` (the plugin said so),
+  `stream_reset` (the camera's stream reconnected — nothing may span the cut) or
+  `host_restart` (Cairn restarted; the track is over whatever the camera sees).
+
+- `bbox` is `[x, y, w, h]`, normalized 0..1, origin top-left.
+- `source` is `"host"` or `"plugin"`; `plugin_track_id` is the plugin's own id
+  when `source` is `"plugin"`, else `null`.
+- `score` is the latest observation, `best_score` the best over the track's life.
+- `stale_predicted: true` means the track is alive but has not actually been
+  *detected* recently — the plugin is predicting it. Cairn never treats such an
+  object as evidence, and neither should an automation.
+- A track is not an event: tracks come and go inside one event, and exist even
+  when recording is off. Events remain the thing to drive `binary_sensor` state
+  from.
 
 ### Media
 

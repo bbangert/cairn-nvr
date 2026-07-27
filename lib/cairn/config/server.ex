@@ -146,10 +146,13 @@ defmodule Cairn.Config.Server do
   end
 
   # A camera's UDP ports are positional, so moving in the `cameras:` list is
-  # as much a restart as changing a field.
+  # as much a restart as changing a field. The effective policy is compared
+  # too: a global window or tracking change leaves the camera struct itself
+  # untouched, but the port bakes the resolved policy into every observation
+  # it forwards.
   defp camera_changed?(old, new, {old_cam, old_index}, {new_cam, new_index}) do
     old_cam != new_cam or old_index != new_index or
-      Config.windows(old, old_cam) != Config.windows(new, new_cam)
+      Config.policy(old, old_cam) != Config.policy(new, new_cam)
   end
 
   defp index_by_id(cameras) do

@@ -11,9 +11,10 @@ defmodule Cairn.PluginPort do
   Every line goes through `Cairn.PluginProtocol.decode_line/2` (protocol v1
   or the v0 `{"pts", "dets"}` shape). A `frame.objects` line becomes a
   `Cairn.Observation` forwarded to `Cairn.DetectionAggregator` together with
-  the camera's config and effective windows, so the aggregator never has to
-  look up config; `plugin.hello` is recorded here and `plugin.status` lands
-  in `Cairn.CameraStatus`. Lines that do not match the contract are dropped,
+  the camera's config and effective policy (event windows + tracking), so the
+  aggregator never has to look up config; `plugin.hello` is recorded here —
+  its `object_tracking` capability is what marks an observation `tracking` —
+  and `plugin.status` lands in `Cairn.CameraStatus`. Lines that do not match the contract are dropped,
   as are observations from a stream epoch that is no longer current —
   counted always, logged periodically. Exit -> jittered backoff respawn,
   same policy as `Cairn.FFmpegPort`.
@@ -52,7 +53,7 @@ defmodule Cairn.PluginPort do
 
   defstruct camera: nil,
             config: nil,
-            windows: nil,
+            policy: nil,
             index: 0,
             port: nil,
             os_pid: nil,
@@ -99,10 +100,10 @@ defmodule Cairn.PluginPort do
       camera: camera,
       config: config,
       # Computed once, not per line: a reload that changes a camera's
-      # effective windows also restarts its tree, because
-      # `Cairn.Config.Server.camera_changed?/4` compares `Config.windows/2`
+      # effective policy also restarts its tree, because
+      # `Cairn.Config.Server.camera_changed?/4` compares `Config.policy/2`
       # (not just the camera struct) when diffing.
-      windows: Cairn.Config.windows(config, camera),
+      policy: Cairn.Config.policy(config, camera),
       index: Keyword.get(opts, :index, 0),
       backoff_ms: Keyword.get(opts, :backoff_min_ms, @backoff_min_ms),
       opts: opts
@@ -198,7 +199,7 @@ defmodule Cairn.PluginPort do
   defp observe(state, observation) do
     {observation, skew} =
       observation
-      |> attribute(state.camera.id)
+      |> attribute(state.camera.id, tracking?(state.plugin))
       |> clamp_observed_at()
 
     state = note_drops(state, skew, :clock_skew)
@@ -232,7 +233,7 @@ defmodule Cairn.PluginPort do
 
   # v0 lines carry neither epoch nor time: the epoch is whatever is current
   # right now, and arrival is the only timestamp available.
-  defp attribute(%Observation{protocol: :v0} = observation, camera_id) do
+  defp attribute(%Observation{protocol: :v0} = observation, camera_id, tracking) do
     epoch =
       case StreamEpochs.current(camera_id) do
         {:ok, epoch} -> epoch
@@ -245,12 +246,23 @@ defmodule Cairn.PluginPort do
         plugin_instance: camera_id,
         epoch: epoch,
         observed_at: DateTime.utc_now(),
-        time_quality: :arrival
+        time_quality: :arrival,
+        tracking: tracking
     }
   end
 
-  defp attribute(observation, camera_id),
-    do: %{observation | camera_id: camera_id, plugin_instance: camera_id}
+  defp attribute(observation, camera_id, tracking),
+    do: %{
+      observation
+      | camera_id: camera_id,
+        plugin_instance: camera_id,
+        tracking: tracking
+    }
+
+  # Track ids are only honoured from a plugin that promised, in its hello,
+  # that they are stable (see `Cairn.Tracker`).
+  defp tracking?(%{"capabilities" => %{"object_tracking" => true}}), do: true
+  defp tracking?(_hello), do: false
 
   # v0 observations were stamped with the current epoch a line ago, so only a
   # plugin-supplied (v1) epoch can be stale here.
@@ -280,7 +292,7 @@ defmodule Cairn.PluginPort do
 
   defp forward(state, observation) do
     aggregator = Keyword.get(state.opts, :aggregator, Cairn.DetectionAggregator)
-    Cairn.DetectionAggregator.detections(aggregator, state.camera, state.windows, observation)
+    Cairn.DetectionAggregator.detections(aggregator, state.camera, state.policy, observation)
     state
   end
 
