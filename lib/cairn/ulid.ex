@@ -37,7 +37,9 @@ defmodule Cairn.ULID do
   end
 
   @doc """
-  Whether `candidate` names an *earlier millisecond* than `held`.
+  `superseded?(held, candidate)` — whether the incoming `candidate` (second
+  argument) names an *earlier millisecond* than the consumer's currently
+  `held` epoch (first argument), i.e. the announcement should be ignored.
 
   This is how every stream-epoch consumer decides to ignore an announcement:
   an older epoch delivered after a newer one (a port's spawn-time ETS pull
