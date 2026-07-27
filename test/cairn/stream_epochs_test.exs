@@ -50,6 +50,25 @@ defmodule Cairn.StreamEpochsTest do
     assert StreamEpochs.current(id) == {:ok, epoch}
   end
 
+  test "an out-of-order mint from an earlier millisecond is neither stored nor announced", %{
+    id: id
+  } do
+    StreamEpochs.subscribe()
+
+    current = StreamEpochs.new_epoch(id, :started)
+    assert_receive {:stream_epoch, ^id, ^current, :started}
+
+    # two calls minted close together can be served out of order; the older one
+    # would otherwise roll `current/1` back to a stream nothing decodes under,
+    # while consumers that already applied the newer one stay on it — every
+    # observation dropped as stale until the camera's next mint
+    stale = Cairn.ULID.generate(1)
+    GenServer.call(StreamEpochs, {:new_epoch, id, stale, :source_lost})
+
+    assert StreamEpochs.current(id) == {:ok, current}
+    refute_receive {:stream_epoch, ^id, ^stale, _reason}, 100
+  end
+
   test "epochs are per camera", %{id: id} do
     other = "ep_#{System.unique_integer([:positive])}"
 

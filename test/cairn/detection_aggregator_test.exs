@@ -212,6 +212,52 @@ defmodule Cairn.DetectionAggregatorTest do
     refute second == first
   end
 
+  test "an epoch older than the one already applied is ignored", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    detect(agg, camera)
+    assert_receive {:event_started, %Event{labels: [%{object_id: first}]}}
+
+    current = StreamEpochs.new_epoch(id, :source_lost)
+    _ = :sys.get_state(agg)
+
+    detect(agg, camera)
+    assert_receive {:event_updated, %Event{labels: [_, %{object_id: second}]}}
+    refute second == first
+
+    # A mint from an earlier millisecond, delivered late: a port's spawn-time
+    # ETS pull racing a queued broadcast, or StreamEpochs' degraded
+    # caller-side broadcast, which has no ordering relation to the server's.
+    # Applying it would roll `current_epoch` back to a stream nothing decodes
+    # under, and `stale?/3` would then drop every observation the ports still
+    # forward — until the camera's *next* mint, hours away for a healthy one.
+    send(agg, {:stream_epoch, id, Cairn.ULID.generate(1), :source_lost})
+    _ = :sys.get_state(agg)
+
+    assert :sys.get_state(agg).cameras[id].current_epoch == current
+
+    # not a boundary, so the tracks it did not cut stay uncut
+    detect(agg, camera)
+    assert_receive {:event_updated, %Event{labels: [_, _, %{object_id: ^second}]}}
+  end
+
+  test "an observation with no observed_at cannot take the aggregator down", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    # unreachable through the codec — both ports stamp it — but `detections/4`
+    # is a public, @spec'd API whose type admits nil, and this is the
+    # singleton holding every camera's in-flight event state
+    observe(agg, camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], observed_at: nil)
+
+    assert_receive {:event_started, %Event{camera_id: ^id} = event}
+    assert %DateTime{} = event.started_at
+    assert [%{t: +0.0}] = event.labels
+  end
+
   test "a stopped camera's epoch is forgotten", %{agg: agg, camera_id: id} do
     epoch = StreamEpochs.new_epoch(id, :started)
     _ = :sys.get_state(agg)

@@ -70,6 +70,8 @@ anything new, and keep reading here for the rules v1 inherits.
 - `pts` — the RTP timestamp (90 kHz) of the analyzed frame, as a **JSON
   number**, not a string. Required; a line whose `pts` is `"90000"` is
   dropped whole, and some JSON emitters do that to 64-bit values by default.
+  Magnitude at most 2^62 — a 90 kHz clock reaches that in a million
+  centuries, so this only ever rejects a number no arithmetic could hold.
 - `dets` — possibly empty list, **at most 64 entries**. A longer list is a
   contract violation, not a crowded frame: the whole line is dropped. (Cairn
   tracks objects across batches at a cost quadratic in detections per line,
@@ -121,10 +123,10 @@ ndjson on stdout, at most 65536 bytes.
 |---|---|---|
 | `camera_id` | string | **required for a group**, optional (and ignored) for a per-camera plugin |
 | `stream_epoch` | string | the epoch Cairn gave you for this camera on stdin; a line from any other epoch is dropped |
-| `sequence` | integer ≥ 0 | your own per-camera counter, +1 per emitted line. Gaps are counted, not fatal |
-| `frame.pts` | number | presentation timestamp of the analyzed frame, in `time_base` units |
-| `frame.time_base` | `[num, den]` | positive integers, default `[1, 90000]` (the RTP clock) |
-| `frame.observed_at` | ISO8601 string | **required.** When the frame was observed — capture it *before* inference, not after. Event times derive from it |
+| `sequence` | integer 0..2^62 | your own per-camera counter, +1 per emitted line. Gaps are counted, not fatal |
+| `frame.pts` | number, \|pts\| ≤ 2^62 | presentation timestamp of the analyzed frame, in `time_base` units |
+| `frame.time_base` | `[num, den]` | integers in 1..1000000000, default `[1, 90000]` (the RTP clock) |
+| `frame.observed_at` | ISO8601 string | **required.** When the frame was observed — capture it *before* inference, not after. Event times derive from it. More than 30 s from Cairn's own clock and it is replaced by arrival time (the observation is still used, and marked as arrival-quality) — run NTP |
 | `emitted_at` | ISO8601 string | optional, informational |
 | `objects` | list | required, may be empty, at most **64** entries |
 | `ended_tracks` | list of strings | optional, default `[]`, at most 64, each ≤ 64 bytes |
@@ -159,6 +161,13 @@ The body may also be sent flat (alongside the envelope) — but nesting keeps
 your `version` clear of the protocol `version`. Cairn logs it and warns if
 `supported_versions` does not include 1.
 
+Only these four fields are kept, and each is bounded: `name` and `version`
+are printable strings of at most 64 bytes; `supported_versions` is a list of
+at most 16 integers in 0..1000; `capabilities` is a map of at most 32
+printable keys (≤ 32 bytes) to **booleans**. Anything else — or a field of
+the wrong shape — is dropped. The message is not: a plugin that mis-declares
+itself still runs.
+
 ### `plugin.status`
 
 Your own health, whenever it changes:
@@ -169,11 +178,20 @@ Your own health, whenever it changes:
  "status":{"state":"ready","detail":"model loaded"}}
 ```
 
-`state` is a required string; anything else in the body is passed through.
+`state` is required: a printable string of 1..32 bytes. `detail` (printable,
+≤ 256 bytes) and `fps` (number, 0..10000) are optional. **Nothing else is
+kept** — the status is retained per camera and pushed to every dashboard and
+API subscriber, so it is a fixed set of small fields, not a scratch space.
+A missing or unusable `state` drops the line.
+
 It surfaces as `plugin_status` on the camera's status (dashboard, `/api`
 camera list, and the `camera_status` SSE frame). For a group, a status with
 a `camera_id` applies to that member; without one it applies to every
-member.
+member (a `camera_id` inside the `status` body is ignored — routing comes
+from the envelope).
+
+Send it *when it changes*. An unchanged status is forwarded at most once
+every 5 s; the rest are dropped and counted.
 
 ### Forward compatibility
 
@@ -187,9 +205,12 @@ member.
 Cairn writes ndjson to your **stdin**. One line per message, same envelope.
 
 **You MUST read (or at least drain) stdin.** Writes never block Cairn: when
-your stdin buffer fills, control lines are dropped and counted, and you will
-be left believing an epoch that has ended. A plugin that ignores stdin
-should still read and discard it.
+your stdin buffer fills, control lines are dropped and counted, and you are
+left believing an epoch that has ended — your lines are then dropped as
+stale. Cairn does not resend the dropped line, but it does not consider the
+epoch announced either, so the next epoch change (or your next restart)
+tells you again. A plugin that ignores stdin should still read and discard
+it.
 
 ```json
 {"spec":"cairn.plugin","version":1,"type":"stream.started",

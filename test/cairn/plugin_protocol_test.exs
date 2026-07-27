@@ -280,6 +280,46 @@ defmodule Cairn.PluginProtocolTest do
                PluginProtocol.decode_line(line, :group)
     end
 
+    # Jason decodes JSON integer tokens at arbitrary precision. Unbounded,
+    # `Observation.media_ms/2` (pts / den * num * 1000) raises ArithmeticError
+    # on a value no float can hold — which killed the port, and the plugin
+    # replays the line after every respawn.
+    @huge String.to_integer(String.duplicate("9", 400))
+
+    test "a bignum pts is a contract violation, not an exception" do
+      assert PluginProtocol.decode_line(frame(%{"pts" => @huge}), :group) ==
+               {:error, :invalid_pts}
+
+      assert PluginProtocol.decode_line(frame(%{"pts" => -@huge}), :group) ==
+               {:error, :invalid_pts}
+    end
+
+    test "a bignum time_base component is a contract violation" do
+      assert PluginProtocol.decode_line(frame(%{"time_base" => [@huge, 1]}), :group) ==
+               {:error, :invalid_time_base}
+
+      assert PluginProtocol.decode_line(frame(%{"time_base" => [1, @huge]}), :group) ==
+               {:error, :invalid_time_base}
+    end
+
+    test "a bignum sequence is a contract violation" do
+      assert PluginProtocol.decode_line(v1(%{"sequence" => @huge}), :group) ==
+               {:error, :invalid_sequence}
+    end
+
+    test "media_ms stays finite at the accepted bounds" do
+      max_pts = 4_611_686_018_427_387_904
+
+      assert {:objects, obs} =
+               PluginProtocol.decode_line(
+                 frame(%{"pts" => max_pts, "time_base" => [1_000_000_000, 1]}),
+                 :group
+               )
+
+      assert is_float(obs.media_ms)
+      assert obs.media_ms < 1.0e40
+    end
+
     test "an unknown observation_kind invalidates the object" do
       line = v1(%{"objects" => [Map.put(@base, "observation_kind", "guessed")]})
 
@@ -339,6 +379,111 @@ defmodule Cairn.PluginProtocolTest do
       line = message("plugin.status", %{"status" => %{"state" => "ready"}})
       assert {:status, status} = PluginProtocol.decode_line(line, :camera)
       refute Map.has_key?(status, "camera_id")
+    end
+
+    # The status is retained per camera in ETS and broadcast to every
+    # dashboard and SSE client on every line, so it is a whitelist: what a
+    # plugin can park there and amplify is fixed here, not by the plugin.
+    test "status keeps only the contract keys, bounded" do
+      line =
+        message("plugin.status", %{
+          "status" => %{
+            "state" => "ready",
+            "detail" => "model loaded",
+            "fps" => 19.5,
+            "blob" => String.duplicate("x", 10_000),
+            "nested" => %{"deep" => [1, 2, 3]}
+          }
+        })
+
+      assert {:status, status} = PluginProtocol.decode_line(line, :camera)
+      assert status == %{"state" => "ready", "detail" => "model loaded", "fps" => 19.5}
+    end
+
+    test "an out-of-bounds status field is dropped, not the line" do
+      status = fn fields ->
+        line = message("plugin.status", %{"status" => Map.merge(%{"state" => "ready"}, fields)})
+        {:status, shaped} = PluginProtocol.decode_line(line, :camera)
+        shaped
+      end
+
+      refute Map.has_key?(status.(%{"detail" => String.duplicate("d", 257)}), "detail")
+      refute Map.has_key?(status.(%{"detail" => "line\nbreak"}), "detail")
+      refute Map.has_key?(status.(%{"detail" => 42}), "detail")
+      refute Map.has_key?(status.(%{"fps" => 10_001}), "fps")
+      refute Map.has_key?(status.(%{"fps" => -1}), "fps")
+      refute Map.has_key?(status.(%{"fps" => "fast"}), "fps")
+    end
+
+    test "an unusable state drops the line" do
+      invalid = [
+        %{"state" => String.duplicate("s", 33)},
+        %{"state" => ""},
+        %{"state" => "\e[2Jready"},
+        %{"state" => "ready\nfake log line"},
+        %{"state" => 1},
+        %{"detail" => "no state at all"}
+      ]
+
+      for body <- invalid do
+        line = message("plugin.status", %{"status" => body})
+        assert PluginProtocol.decode_line(line, :group) == {:error, :invalid_status}
+      end
+    end
+
+    test "a payload camera_id cannot address another member" do
+      line =
+        message("plugin.status", %{
+          "status" => %{"state" => "ready", "camera_id" => "someone_else"}
+        })
+
+      assert {:status, status} = PluginProtocol.decode_line(line, :group)
+      refute Map.has_key?(status, "camera_id")
+    end
+
+    # `hello` is held in port state and interpolated into logs; a map where a
+    # string belongs used to raise Protocol.UndefinedError and kill the port.
+    test "hello fields that do not match the contract are dropped, not the line" do
+      hello = %{
+        "name" => %{"not" => "a string"},
+        "version" => String.duplicate("v", 65),
+        "supported_versions" => "one",
+        "capabilities" => ["object_tracking"],
+        "extra" => String.duplicate("x", 10_000)
+      }
+
+      assert PluginProtocol.decode_line(message("plugin.hello", %{"hello" => hello}), :camera) ==
+               {:hello, %{}}
+    end
+
+    test "hello lists and maps are filtered and capped" do
+      hello = %{
+        "name" => "cairn-detect",
+        "supported_versions" => [1, "2", 3.0, -1, 10_000] ++ Enum.to_list(1..20),
+        "capabilities" =>
+          %{"object_tracking" => true, "audio" => "yes", String.duplicate("k", 33) => true}
+          |> Map.merge(Map.new(1..40, &{"cap_#{&1}", true}))
+      }
+
+      assert {:hello, shaped} =
+               PluginProtocol.decode_line(message("plugin.hello", %{"hello" => hello}), :camera)
+
+      assert shaped["name"] == "cairn-detect"
+      # non-integers and out-of-range versions go, and the list is capped
+      assert length(shaped["supported_versions"]) <= 16
+      assert Enum.all?(shaped["supported_versions"], &(is_integer(&1) and &1 in 0..1_000))
+      # only boolean values with short printable keys survive, capped at 32
+      assert map_size(shaped["capabilities"]) == 32
+      refute Map.has_key?(shaped["capabilities"], "audio")
+      refute Enum.any?(Map.keys(shaped["capabilities"]), &(byte_size(&1) > 32))
+      assert Enum.all?(Map.values(shaped["capabilities"]), &is_boolean/1)
+    end
+
+    test "a hello with no usable body is an empty map, never a crash" do
+      assert PluginProtocol.decode_line(message("plugin.hello", %{"hello" => 42}), :camera) ==
+               {:hello, %{}}
+
+      assert PluginProtocol.decode_line(message("plugin.hello", %{}), :camera) == {:hello, %{}}
     end
   end
 

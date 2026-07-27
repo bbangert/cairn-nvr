@@ -70,6 +70,7 @@ defmodule Cairn.DetectionAggregator do
   @impl true
   def handle_cast({:detections, camera, windows, observation}, state) do
     control = CameraControl.get(camera.id)
+    observation = with_observed_at(observation)
 
     cond do
       not control.detection_enabled ->
@@ -84,6 +85,17 @@ defmodule Cairn.DetectionAggregator do
         {:noreply, process_detections(state, camera, windows, observation, control)}
     end
   end
+
+  # Invariant: every observation leaving a port carries a `%DateTime{}` — the
+  # codec parses one for v1 and the port stamps arrival for v0 — and every
+  # time in an event derives from it. This is a *singleton* holding every
+  # camera's in-flight event state, so a `nil` slipping through must not be a
+  # `FunctionClauseError` in `DateTime.diff/3` here.
+  defp with_observed_at(%Observation{observed_at: at} = observation)
+       when is_struct(at, DateTime),
+       do: observation
+
+  defp with_observed_at(observation), do: %{observation | observed_at: now()}
 
   # Belt and braces: the ports already refuse observations from an epoch that
   # is no longer current, and this closes the window where a port's line and
@@ -186,30 +198,16 @@ defmodule Cairn.DetectionAggregator do
   # the boundary would otherwise seed the fresh tracker. The epoch now travels
   # with the batch — tagged at the producer, compared in `stale?/3` against the
   # `current_epoch` stored here — so such a batch is dropped instead.
+  # An epoch older than the one already held is ignored (see
+  # `Cairn.ULID.superseded?/2`): applying it would roll `current_epoch` back
+  # to a stream nothing decodes under, and `stale?/3` would then drop every
+  # observation the ports still forward — a silent, sustained outage for that
+  # camera until its next mint.
   def handle_info({:stream_epoch, camera_id, epoch, reason}, state) do
-    state = remember_epoch(state, camera_id, epoch, reason)
-
-    case state.cameras do
-      %{^camera_id => %{current_epoch: ^epoch}} ->
-        # One mint can be announced twice by design: `Cairn.StreamEpochs`
-        # broadcasts from the caller when its server is unreachable, and a
-        # call that exited with :timeout may still be served afterwards. The
-        # epoch is the same either way, so a repeat means no boundary was
-        # crossed — resetting again would cut tracks mid-stream. The repeat
-        # is caught even when the first announcement arrived before this
-        # camera had any tracker state: `epochs` remembered it, and the state
-        # created by the first detection starts out carrying it.
-        {:noreply, state}
-
-      %{^camera_id => cam} ->
-        cam = %{cam | tracker: Tracker.reset(cam.tracker), current_epoch: epoch}
-        {:noreply, put_cam(state, camera_id, cam)}
-
-      _ ->
-        # no tracker to cut. Allocating full camera state here would retain a
-        # tracker for every camera that never emits detections, deleted ones
-        # included; the epoch alone (one string) is cheap enough to keep.
-        {:noreply, state}
+    if Cairn.ULID.superseded?(current_epoch(state, camera_id), epoch) do
+      {:noreply, state}
+    else
+      {:noreply, apply_epoch(state, camera_id, epoch, reason)}
     end
   end
 
@@ -230,6 +228,33 @@ defmodule Cairn.DetectionAggregator do
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  defp apply_epoch(state, camera_id, epoch, reason) do
+    state = remember_epoch(state, camera_id, epoch, reason)
+
+    case state.cameras do
+      %{^camera_id => %{current_epoch: ^epoch}} ->
+        # One mint can be announced twice by design: `Cairn.StreamEpochs`
+        # broadcasts from the caller when its server is unreachable, and a
+        # call that exited with :timeout may still be served afterwards. The
+        # epoch is the same either way, so a repeat means no boundary was
+        # crossed — resetting again would cut tracks mid-stream. The repeat
+        # is caught even when the first announcement arrived before this
+        # camera had any tracker state: `epochs` remembered it, and the state
+        # created by the first detection starts out carrying it.
+        state
+
+      %{^camera_id => cam} ->
+        cam = %{cam | tracker: Tracker.reset(cam.tracker), current_epoch: epoch}
+        put_cam(state, camera_id, cam)
+
+      _ ->
+        # no tracker to cut. Allocating full camera state here would retain a
+        # tracker for every camera that never emits detections, deleted ones
+        # included; the epoch alone (one string) is cheap enough to keep.
+        state
+    end
+  end
 
   # -- lifecycle --------------------------------------------------------------
 

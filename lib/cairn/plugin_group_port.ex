@@ -52,6 +52,15 @@ defmodule Cairn.PluginGroupPort do
   # once per burst, and bursts are attacker-sized.
   @drop_log_interval_ms 5_000
   @id_preview 64
+  # Beyond this the plugin's clock is not the host's, and `observed_at` sets
+  # event start times while the host clock closes them: a skewed plugin yields
+  # negative durations, snapshot seeks outside the segment, and future-dated
+  # events that retention never prunes.
+  @max_clock_skew_ms 30_000
+  # A status is retained in ETS and broadcast to every subscriber — per member
+  # when the line names none — so an unchanged one is only re-sent as a
+  # liveness heartbeat at this interval.
+  @status_min_interval_ms 5_000
 
   defstruct group: nil,
             config: nil,
@@ -64,6 +73,7 @@ defmodule Cairn.PluginGroupPort do
             last_drop_log_ms: nil,
             plugin: nil,
             last_sequences: %{},
+            last_statuses: %{},
             epochs: %{},
             opts: []
 
@@ -133,7 +143,7 @@ defmodule Cairn.PluginGroupPort do
   end
 
   def handle_info({port, {:data, {:noeol, _partial}}}, %{port: port} = state) do
-    unless state.skipping_long_line do
+    if !state.skipping_long_line do
       Logger.warning("plugin group #{state.group.name}: line > #{@max_line} bytes, dropping")
     end
 
@@ -143,10 +153,10 @@ defmodule Cairn.PluginGroupPort do
   # Never a restart: the group keeps running and the member's plugin state is
   # reset through the control channel instead.
   def handle_info({:stream_epoch, camera_id, epoch, reason}, state) do
-    if Map.has_key?(state.routes, camera_id) do
-      {:noreply, announce_epoch(state, camera_id, epoch, reason)}
-    else
-      {:noreply, state}
+    cond do
+      not Map.has_key?(state.routes, camera_id) -> {:noreply, state}
+      superseded?(Map.get(state.epochs, camera_id), epoch) -> {:noreply, state}
+      true -> {:noreply, announce_epoch(state, camera_id, epoch, reason)}
     end
   end
 
@@ -155,8 +165,11 @@ defmodule Cairn.PluginGroupPort do
     {:noreply, enter_backoff(%{state | port: nil, os_pid: nil})}
   end
 
+  # A port can die with its OS process still alive — `:epipe` on a control
+  # write to a plugin that closed stdin is exactly that — and the orphan
+  # keeps every member's UDP port bound, so the respawn would never see RTP.
   def handle_info({:EXIT, port, _reason}, %{port: port} = state) do
-    {:noreply, enter_backoff(%{state | port: nil, os_pid: nil})}
+    {:noreply, enter_backoff(kill_port(state))}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -187,7 +200,27 @@ defmodule Cairn.PluginGroupPort do
     end)
   end
 
+  # The codec is total by construction and the dispatch below is host code,
+  # but neither is worth the group's life: a plugin respawn replays the line
+  # that killed it, and one line would then cost every member's inference.
+  # A line can cost a drop; it can never cost the process.
   defp handle_line(line, state) do
+    decode_and_dispatch(line, state)
+  rescue
+    exception ->
+      Logger.error(
+        "plugin group #{state.group.name}: plugin line raised " <>
+          Exception.format(:error, exception, __STACKTRACE__)
+      )
+
+      note_drops(state, 1, :codec_crash)
+  catch
+    kind, reason ->
+      Logger.error("plugin group #{state.group.name}: plugin line #{kind} #{inspect(reason)}")
+      note_drops(state, 1, :codec_crash)
+  end
+
+  defp decode_and_dispatch(line, state) do
     case PluginProtocol.decode_line(line, :group) do
       {:objects, observation} -> route(state, observation)
       {:hello, hello} -> note_hello(state, hello)
@@ -210,7 +243,12 @@ defmodule Cairn.PluginGroupPort do
   end
 
   defp observe(state, cam, windows, observation) do
-    observation = attribute(observation, cam.id, state.group.name)
+    {observation, skew} =
+      observation
+      |> attribute(cam.id, state.group.name)
+      |> clamp_observed_at()
+
+    state = note_drops(state, skew, :clock_skew, preview(cam.id))
 
     if current_epoch?(observation, cam.id) do
       state
@@ -244,6 +282,23 @@ defmodule Cairn.PluginGroupPort do
   defp attribute(observation, camera_id, group_name),
     do: %{observation | camera_id: camera_id, plugin_instance: group_name}
 
+  # `observed_at` is the plugin's own clock and it is what event `started_at`,
+  # label offsets and snapshot seeks derive from, while `ended_at` and the
+  # event timers are the host's. Past @max_clock_skew_ms apart they are not
+  # the same clock, so the host's is substituted and the timing is honestly
+  # reported as arrival quality.
+  defp clamp_observed_at(%Observation{observed_at: %DateTime{} = at} = observation) do
+    now = DateTime.utc_now()
+
+    if abs(DateTime.diff(at, now, :millisecond)) > @max_clock_skew_ms do
+      {%{observation | observed_at: now, time_quality: :arrival}, 1}
+    else
+      {observation, 0}
+    end
+  end
+
+  defp clamp_observed_at(observation), do: {observation, 0}
+
   # v0 observations were stamped with the current epoch a line ago, so only a
   # plugin-supplied (v1) epoch can be stale here.
   defp current_epoch?(%Observation{protocol: :v0}, _camera_id), do: true
@@ -275,18 +330,21 @@ defmodule Cairn.PluginGroupPort do
     put_in(state.last_sequences[observation.camera_id], observation.sequence)
   end
 
+  # The codec bounds every field of `hello`, and these are logged through
+  # `inspect/2` anyway: nothing plugin-supplied is interpolated raw, so no
+  # value shape can raise `Protocol.UndefinedError` here.
   defp note_hello(state, hello) do
     Logger.info(
-      "plugin group #{state.group.name}: plugin hello — #{hello["name"] || "unnamed"} " <>
-        "#{hello["version"] || "?"}, capabilities #{inspect(hello["capabilities"])}"
+      "plugin group #{state.group.name}: plugin hello — #{preview(hello["name"])} " <>
+        "#{preview(hello["version"])}, capabilities #{preview(hello["capabilities"])}"
     )
 
     case hello["supported_versions"] do
       versions when is_list(versions) ->
-        unless 1 in versions do
+        if 1 not in versions do
           Logger.warning(
             "plugin group #{state.group.name}: plugin does not list protocol 1 in " <>
-              "supported_versions (#{inspect(versions)})"
+              "supported_versions (#{preview(versions)})"
           )
         end
 
@@ -303,17 +361,34 @@ defmodule Cairn.PluginGroupPort do
     case status["camera_id"] do
       camera_id when is_binary(camera_id) ->
         if Map.has_key?(state.routes, camera_id) do
-          Cairn.CameraStatus.set_plugin_status(camera_id, status)
-          state
+          push_status(state, camera_id, status)
         else
           note_drops(state, 1, :unknown_camera, preview(camera_id))
         end
 
       _none ->
-        Enum.each(Map.keys(state.routes), &Cairn.CameraStatus.set_plugin_status(&1, status))
-        state
+        Enum.reduce(Map.keys(state.routes), state, &push_status(&2, &1, status))
     end
   end
+
+  # An unchanged status is an ETS write plus a broadcast to every dashboard
+  # and SSE client per line — multiplied by member count when the line names
+  # no camera — so it is re-sent only as a slow heartbeat.
+  defp push_status(state, camera_id, status) do
+    now = System.monotonic_time(:millisecond)
+
+    if status_due?(status, Map.get(state.last_statuses, camera_id), now) do
+      Cairn.CameraStatus.set_plugin_status(camera_id, status)
+      put_in(state.last_statuses[camera_id], {status, now})
+    else
+      note_drops(state, 1, :status_rate_limited, preview(camera_id))
+    end
+  end
+
+  defp status_due?(_status, nil, _now), do: true
+
+  defp status_due?(status, {last, last_ms}, now),
+    do: status != last or now - last_ms >= @status_min_interval_ms
 
   # Counted per reason class, always; logged at most once per
   # @drop_log_interval_ms, summarizing every class seen so far. The counters
@@ -349,11 +424,11 @@ defmodule Cairn.PluginGroupPort do
   defp latest_detail(_class, nil), do: ""
   defp latest_detail(class, detail), do: "; latest #{class}: #{detail}"
 
-  # `camera_id` is plugin-supplied and can be any JSON value up to the line
-  # limit. `inspect/2` escapes control bytes (no forged log lines) and
+  # Plugin-supplied values can be any JSON term up to the line limit.
+  # `inspect/2` escapes control bytes (no forged log lines) and
   # `printable_limit` bounds a binary by *bytes* — `String.slice/3` would not,
   # since one grapheme cluster can be arbitrarily long.
-  defp preview(camera_id), do: inspect(camera_id, limit: 3, printable_limit: @id_preview)
+  defp preview(value), do: inspect(value, limit: 3, printable_limit: @id_preview)
 
   defp forward(state, cam, windows, observation) do
     aggregator = Keyword.get(state.opts, :aggregator, Cairn.DetectionAggregator)
@@ -388,6 +463,7 @@ defmodule Cairn.PluginGroupPort do
         drops: %{},
         last_drop_log_ms: nil,
         last_sequences: %{},
+        last_statuses: %{},
         epochs: %{},
         plugin: nil
     })
@@ -404,31 +480,55 @@ defmodule Cairn.PluginGroupPort do
   # `:camera_stopped` mints an epoch nothing streams under, so it ends the
   # prior stream and starts nothing; it is still recorded, so the next real
   # epoch is announced as a start rather than as a replacement.
+  #
+  # A write the plugin never received is not an announcement: recording it
+  # anyway would leave the plugin tagging that member's lines with an epoch
+  # the host does not expect, and `current_epoch?/2` would then drop every
+  # one of them until the *next* epoch change. On a failed write the
+  # member's last-sent state is left where it was, so the next broadcast (or
+  # the next spawn's ETS pull) re-announces.
   defp announce_epoch(state, camera_id, epoch, reason) do
-    state =
-      case Map.get(state.epochs, camera_id) do
-        {^epoch, _liveness} ->
-          state
+    case Map.get(state.epochs, camera_id) do
+      {^epoch, _liveness} ->
+        state
 
-        {prior, :live} ->
-          state
-          |> write_control(stream_ended(camera_id, prior, reason))
-          |> maybe_start(camera_id, epoch, reason)
+      {prior, :live} ->
+        case write_control(state, stream_ended(camera_id, prior, reason)) do
+          {:ok, state} ->
+            state = put_in(state.epochs[camera_id], {prior, :ended})
+            start_and_record(state, camera_id, epoch, reason)
 
-        _none ->
-          maybe_start(state, camera_id, epoch, reason)
-      end
+          {:error, state} ->
+            state
+        end
 
-    put_in(state.epochs[camera_id], {epoch, liveness(reason)})
+      _none ->
+        start_and_record(state, camera_id, epoch, reason)
+    end
   end
 
-  defp maybe_start(state, _camera_id, _epoch, :camera_stopped), do: state
+  defp start_and_record(state, camera_id, epoch, reason) do
+    case maybe_start(state, camera_id, epoch, reason) do
+      {:ok, state} -> put_in(state.epochs[camera_id], {epoch, liveness(reason)})
+      {:error, state} -> state
+    end
+  end
+
+  defp maybe_start(state, _camera_id, _epoch, :camera_stopped), do: {:ok, state}
 
   defp maybe_start(state, camera_id, epoch, _reason),
     do: write_control(state, stream_started(camera_id, epoch))
 
   defp liveness(:camera_stopped), do: :ended
   defp liveness(_reason), do: :live
+
+  # An epoch older than the one this plugin process was already told about
+  # for that member is ignored (see `Cairn.ULID.superseded?/2`): announcing
+  # it would leave the plugin tagging that member's lines with a dead epoch
+  # while `current_epoch?/2` compares against ETS, so every one of its
+  # observations would be dropped as `:stale_epoch` until the next respawn.
+  defp superseded?(nil, _epoch), do: false
+  defp superseded?({held, _liveness}, epoch), do: Cairn.ULID.superseded?(held, epoch)
 
   # The epoch in ETS at spawn time may belong to a stopped camera; the plugin
   # is told the stream started either way and simply sees no packets on that
@@ -468,7 +568,10 @@ defmodule Cairn.PluginGroupPort do
   # `:nosuspend` is what keeps a plugin that never reads its stdin from
   # blocking this GenServer — and with it every other member's detections: a
   # full port queue drops the line and is counted.
-  defp write_control(%{port: nil} = state, _line), do: state
+  # There is no plugin to tell during backoff; the spawn re-announces from
+  # ETS, so this is a loss the caller must not record as an announcement
+  # either.
+  defp write_control(%{port: nil} = state, _line), do: {:error, state}
 
   defp write_control(state, line) do
     result =
@@ -479,9 +582,9 @@ defmodule Cairn.PluginGroupPort do
       end
 
     case result do
-      true -> state
-      false -> note_drops(state, 1, :control_stdin_busy)
-      :closed -> note_drops(state, 1, :control_stdin_closed)
+      true -> {:ok, state}
+      false -> {:error, note_drops(state, 1, :control_stdin_busy)}
+      :closed -> {:error, note_drops(state, 1, :control_stdin_closed)}
     end
   end
 

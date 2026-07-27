@@ -20,6 +20,14 @@ defmodule Cairn.PluginProtocol do
   Forward compatibility is one-directional: unknown top-level fields and
   unknown `type` values are ignored, but a *malformed* known field drops the
   line. Nothing partially valid is forwarded.
+
+  Every value that survives is bounded here, because everything downstream
+  treats it as trustworthy: numbers that reach arithmetic have a magnitude
+  bound (a JSON integer decodes at arbitrary precision, and a bignum in
+  `Observation.media_ms/2` raises `ArithmeticError`), and the `hello` and
+  `status` bodies are whitelisted and byte-capped rather than passed
+  through — a status is retained per camera and broadcast to every
+  subscriber on every line.
   """
 
   alias Cairn.Observation
@@ -36,6 +44,30 @@ defmodule Cairn.PluginProtocol do
   @max_camera_id_bytes 256
   @default_time_base {1, 90_000}
   @kinds ["detected", "tracked"]
+  # JSON integers decode at arbitrary precision, so every number that reaches
+  # arithmetic needs a magnitude bound: `Observation.media_ms/2` raises
+  # ArithmeticError on a value that cannot be an IEEE double, and a bignum
+  # sequence gap would flow into telemetry measurements and log lines. 2^62
+  # leaves ample headroom over any real pts (a 90 kHz clock takes 1.6 million
+  # years to reach it) while keeping `pts * num * 1000` finite.
+  @max_pts 4_611_686_018_427_387_904
+  @max_sequence 4_611_686_018_427_387_904
+  @max_time_base 1_000_000_000
+  # hello is plugin-controlled, held in port state and interpolated into logs.
+  @max_hello_bytes 64
+  @max_supported_versions 16
+  @max_protocol_version 1_000
+  @max_capabilities 32
+  @max_capability_key_bytes 32
+  # status is retained per camera in ETS and broadcast to every dashboard and
+  # SSE client, so it is a whitelist rather than a passthrough. `camera_id` is
+  # part of the shaped status too, but it is only ever taken from the
+  # envelope: a payload-supplied one would let a plugin address a member it
+  # was not talking about.
+  @status_keys ~w(state detail fps)
+  @max_status_state_bytes 32
+  @max_status_detail_bytes 256
+  @max_status_fps 10_000
   # v1 routing/versioning fields; anything else in a hello/status message is
   # the payload, for plugins that send it flat rather than nested.
   @envelope_keys ~w(spec version type camera_id stream_epoch sequence)
@@ -79,7 +111,7 @@ defmodule Cairn.PluginProtocol do
   defp decode_v1(%{"version" => 1, "type" => type} = msg, mode) when is_binary(type) do
     case type do
       "frame.objects" -> decode_objects(msg, mode)
-      "plugin.hello" -> {:hello, payload(msg, "hello")}
+      "plugin.hello" -> {:hello, shape_hello(payload(msg, "hello"))}
       "plugin.status" -> decode_status(msg)
       _other -> {:ignore, :unknown_type}
     end
@@ -119,19 +151,99 @@ defmodule Cairn.PluginProtocol do
   end
 
   defp decode_status(msg) do
-    payload = payload(msg, "status")
+    case shape_status(payload(msg, "status")) do
+      {:ok, status} ->
+        if is_binary(msg["camera_id"]) do
+          {:status, Map.put(status, "camera_id", msg["camera_id"])}
+        else
+          {:status, status}
+        end
 
-    cond do
-      not is_binary(payload["state"]) ->
+      :error ->
         {:error, :invalid_status}
-
-      is_binary(msg["camera_id"]) ->
-        {:status, Map.put(payload, "camera_id", msg["camera_id"])}
-
-      true ->
-        {:status, Map.delete(payload, "camera_id")}
     end
   end
+
+  # Whitelist, not passthrough: what survives here is stored per camera and
+  # fanned out to every status subscriber on every line.
+  defp shape_status(payload) do
+    case Map.take(payload, @status_keys) do
+      %{"state" => state} = status when is_binary(state) ->
+        if byte_size(state) in 1..@max_status_state_bytes and printable_label?(state) do
+          {:ok, status |> shape_status_detail() |> shape_status_fps()}
+        else
+          :error
+        end
+
+      _other ->
+        :error
+    end
+  end
+
+  defp shape_status_detail(%{"detail" => detail} = status)
+       when is_binary(detail) do
+    if byte_size(detail) <= @max_status_detail_bytes and printable_label?(detail),
+      do: status,
+      else: Map.delete(status, "detail")
+  end
+
+  defp shape_status_detail(status), do: Map.delete(status, "detail")
+
+  defp shape_status_fps(%{"fps" => fps} = status)
+       when is_number(fps) and fps >= 0 and fps <= @max_status_fps,
+       do: status
+
+  defp shape_status_fps(status), do: Map.delete(status, "fps")
+
+  # `hello` is held in port state and interpolated into logs. Malformed
+  # fields are dropped rather than dropping the line: a plugin that
+  # mis-declares its name is still a plugin worth running.
+  defp shape_hello(hello) do
+    %{}
+    |> shape_hello_string(hello, "name")
+    |> shape_hello_string(hello, "version")
+    |> shape_supported_versions(hello)
+    |> shape_capabilities(hello)
+  end
+
+  defp shape_hello_string(shaped, hello, key) do
+    case Map.get(hello, key) do
+      value
+      when is_binary(value) and byte_size(value) in 1..@max_hello_bytes ->
+        if printable_label?(value), do: Map.put(shaped, key, value), else: shaped
+
+      _other ->
+        shaped
+    end
+  end
+
+  defp shape_supported_versions(shaped, %{"supported_versions" => versions})
+       when is_list(versions) do
+    kept =
+      versions
+      |> Enum.take(@max_supported_versions)
+      |> Enum.filter(&(is_integer(&1) and &1 in 0..@max_protocol_version))
+
+    Map.put(shaped, "supported_versions", kept)
+  end
+
+  defp shape_supported_versions(shaped, _hello), do: shaped
+
+  defp shape_capabilities(shaped, %{"capabilities" => capabilities})
+       when is_map(capabilities) do
+    kept =
+      capabilities
+      |> Enum.filter(fn {key, value} ->
+        is_binary(key) and byte_size(key) in 1..@max_capability_key_bytes and
+          printable_label?(key) and is_boolean(value)
+      end)
+      |> Enum.take(@max_capabilities)
+      |> Map.new()
+
+    Map.put(shaped, "capabilities", kept)
+  end
+
+  defp shape_capabilities(shaped, _hello), do: shaped
 
   # A hello/status body may be nested under its type's key (canonical — it
   # keeps the plugin's own "version" clear of the protocol version) or sent
@@ -159,7 +271,7 @@ defmodule Cairn.PluginProtocol do
 
   defp sequence(msg) do
     case Map.get(msg, "sequence") do
-      seq when is_integer(seq) and seq >= 0 -> {:ok, seq}
+      seq when is_integer(seq) and seq >= 0 and seq <= @max_sequence -> {:ok, seq}
       _other -> {:error, :invalid_sequence}
     end
   end
@@ -180,7 +292,7 @@ defmodule Cairn.PluginProtocol do
 
   defp fetch_number(msg, key, error) do
     case Map.get(msg, key) do
-      value when is_number(value) -> {:ok, value}
+      value when is_number(value) and value >= -@max_pts and value <= @max_pts -> {:ok, value}
       _other -> {:error, error}
     end
   end
@@ -190,7 +302,9 @@ defmodule Cairn.PluginProtocol do
       :absent ->
         {:ok, @default_time_base}
 
-      [num, den] when is_integer(num) and is_integer(den) and num > 0 and den > 0 ->
+      [num, den]
+      when is_integer(num) and is_integer(den) and
+             num in 1..@max_time_base and den in 1..@max_time_base ->
         {:ok, {num, den}}
 
       _other ->
@@ -276,7 +390,7 @@ defmodule Cairn.PluginProtocol do
   # No epoch and no timestamp on the wire: the port completes both, which is
   # why `time_quality` is `:arrival` for everything decoded here.
   defp decode_v0(%{"pts" => pts, "dets" => dets} = msg, mode)
-       when is_number(pts) and is_list(dets) do
+       when is_number(pts) and pts >= -@max_pts and pts <= @max_pts and is_list(dets) do
     with {:ok, camera_id} <- camera_id(msg, mode) do
       {objects, invalid} = validate_dets(dets)
 
