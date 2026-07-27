@@ -108,8 +108,9 @@ defmodule CairnWeb.Api.EventStreamTest do
     # ONVIF AN §A.10: the final summary stands on its own — a client that
     # missed every other frame still learns what the track was.
     test "the final frame is self-contained and names its end reason" do
-      assert {:ok, frame} =
-               SSE.frame_for({:track_ended, %{track() | end_reason: :stream_reset}})
+      final = Cairn.TrackAssertions.assert_self_contained(%{track() | end_reason: :stream_reset})
+
+      assert {:ok, frame} = SSE.frame_for({:track_ended, final})
 
       assert frame =~ "event: track_ended\n"
       assert frame =~ ~s("end_reason":"stream_reset")

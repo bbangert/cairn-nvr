@@ -1,10 +1,12 @@
 defmodule Cairn.DetectionAggregatorTest do
   use ExUnit.Case, async: false
 
+  import Cairn.TrackAssertions
+
   alias Cairn.Config.Camera
   alias Cairn.{DetectionAggregator, Event, EventCheckpoint, Observation, StreamEpochs, Track}
 
-  @policy %{pre: 5, post: 10, max: 300, max_unseen_ms: 3_000}
+  @policy %{pre: 5, post: 10, max: 300, max_unseen_ms: 3_000, max_live_tracks: 128}
 
   setup do
     camera_id = "agg_#{System.unique_integer([:positive])}"
@@ -150,6 +152,7 @@ defmodule Cairn.DetectionAggregatorTest do
 
     # the outage owes every live track a final, self-contained summary
     assert_receive {:track_ended, %Track{object_id: ^first} = final}
+    assert_self_contained(final)
     assert final.end_reason == :stream_reset
     assert final.camera_id == id
     assert final.label == "person"
@@ -311,6 +314,105 @@ defmodule Cairn.DetectionAggregatorTest do
     StreamEpochs.new_epoch(id, :camera_stopped)
     _ = :sys.get_state(agg)
     refute Map.has_key?(:sys.get_state(agg).epochs, id)
+  end
+
+  test "a :camera_stopped epoch ends the tracks but never becomes current_epoch", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    epoch = StreamEpochs.new_epoch(id, :started)
+    _ = :sys.get_state(agg)
+
+    observe(agg, camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], epoch: epoch)
+    assert_receive {:event_started, %Event{camera_id: ^id}}
+    assert_receive {:track_started, %Track{object_id: first}}
+
+    # a camera's stop and its start are announced by different processes, and
+    # on StreamEpochs' degraded caller-side path they have no ordering
+    # relation: a stop epoch minted after a live start must not be adopted.
+    StreamEpochs.new_epoch(id, :camera_stopped)
+    _ = :sys.get_state(agg)
+
+    # the stream that owned them is over, so the tracks are
+    assert_receive {:track_ended, %Track{object_id: ^first, end_reason: :stream_reset}}
+    assert :sys.get_state(agg).cameras[id].current_epoch == epoch
+
+    # ...and observations tagged with the epoch that is actually being decoded
+    # are still accepted. Letting the stop epoch become current would drop
+    # every one of them until an ffmpeg respawn that a healthy camera never has.
+    observe(agg, camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], epoch: epoch)
+    assert_receive {:event_updated, %Event{camera_id: ^id}}
+  end
+
+  test "disabling detection ends the live tracks, once", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    detect(agg, camera)
+    assert_receive {:event_started, %Event{camera_id: ^id}}
+    assert_receive {:track_started, %Track{object_id: oid}}
+
+    # nothing advances a track while detection is off, so leaving them live
+    # would strand every consumer's entities indefinitely
+    Cairn.CameraControl.set(id, %{detection_enabled: false})
+    detect(agg, camera)
+
+    assert_receive {:track_ended,
+                    %Track{object_id: ^oid, end_reason: :detection_disabled} = final}
+
+    assert_self_contained(final)
+    assert live_tracks(agg, id) == []
+    assert :sys.get_state(agg).cameras[id].track_updates == %{}
+
+    # the next disabled batch has nothing left to end
+    detect(agg, camera)
+    _ = :sys.get_state(agg)
+    refute_received {:track_ended, _}
+  end
+
+  test "checkpoint writes are throttled between an event's first and last", %{
+    camera: camera,
+    camera_id: id
+  } do
+    {:ok, clock} = start_supervised({Agent, fn -> 0 end})
+    test_pid = self()
+
+    agg =
+      start_supervised!(
+        {DetectionAggregator,
+         name: nil,
+         monotonic_ms: fn -> Agent.get(clock, & &1) end,
+         start_extractor: fn _camera, ev ->
+           pid = spawn(fn -> Process.sleep(:infinity) end)
+           send(test_pid, {:extractor_started, ev, pid})
+           {:ok, pid}
+         end},
+        id: :agg_checkpoint
+      )
+
+    # the event's first frame is never throttled: restore has to see the row
+    detect(agg, camera)
+    assert_receive {:event_started, %Event{id: eid}}
+    assert [{^id, %Event{id: ^eid, labels: [_]}, _tracks}] = checkpoint(id)
+
+    # inside the window the event grows and the ETS row does not — the copy is
+    # the whole event plus the whole track list, per batch
+    detect(agg, camera, 0.95, [0.12, 0.1, 0.2, 0.4])
+    assert_receive {:event_updated, %Event{labels: [_, _]}}
+    assert [{^id, %Event{labels: [_]}, _tracks}] = checkpoint(id)
+
+    # a second of wall clock later it catches up in one write
+    Agent.update(clock, &(&1 + 1_000))
+    detect(agg, camera, 0.95, [0.12, 0.1, 0.2, 0.4])
+    assert_receive {:event_updated, %Event{labels: [_, _, _]}}
+    assert [{^id, %Event{labels: [_, _, _]}, _tracks}] = checkpoint(id)
+
+    # and the other transition that matters for restore is the delete
+    fire(agg, :post_window, id, eid)
+    assert_receive {:event_ended, %Event{id: ^eid}}
+    assert checkpoint(id) == []
   end
 
   test "event times come from the observation, not from the clock", %{agg: agg, camera: camera} do
@@ -526,7 +628,10 @@ defmodule Cairn.DetectionAggregatorTest do
 
     # the tracker that owned it died with the aggregator: it owes a final,
     # self-contained summary
+    # the summary is rebuilt from ETS, which is the end path most likely to
+    # lose a field on the way through
     assert_receive {:track_ended, %Track{object_id: ^object_id} = final}
+    assert_self_contained(final)
     assert final.end_reason == :host_restart
     assert final.label == "person"
     assert final.best_score == 0.9

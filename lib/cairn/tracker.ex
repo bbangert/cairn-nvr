@@ -32,6 +32,24 @@ defmodule Cairn.Tracker do
   expires anything; across epochs the aggregator ends every track and starts
   a fresh tracker.
 
+  ## Host policy: the live set is bounded, on both counts
+
+  `media_ms` is the plugin's own `pts`, so media-time expiry alone leaves the
+  plugin holding the clock that retires its tracks. Two host-side bounds close
+  that, and both belong here rather than in the codec because they are about
+  accumulated state, not about one line:
+
+    * **A cap on live tracks** (`max_live_tracks`, per camera). At the cap,
+      minting a new identity retires the least recently seen live track with a
+      final summary (`:evicted`). Tracks that this batch already assigned are
+      never the victim.
+    * **A host-clock backstop.** A track whose age on the *host's* monotonic
+      clock (`now_ms`, supplied by the caller) exceeds ten times
+      `max_unseen_ms` is expired (`:unseen`) whatever media time says, so a
+      frozen or rewound `pts` cannot pin tracks alive. The factor is
+      deliberately lax: media time is the real rule, and this must never fire
+      for a stream that is merely slow.
+
   Bboxes are `[x, y, w, h]` in any consistent unit (normalized or pixels).
   """
 
@@ -45,8 +63,14 @@ defmodule Cairn.Tracker do
   # Plugin track ids that have been ended, kept so their reuse can be caught.
   # Only live tracks bound the rest of the state; this set is bounded here.
   @max_ended_keys 4_096
+  # How much slower than media time the host clock is allowed to be before a
+  # track is expired regardless. See the moduledoc: a backstop, not the rule.
+  @host_clock_factor 10
+  # Every warning here is driven by plugin output, and plugin output is a
+  # per-line primitive: unrate-limited they are a log-flood of their own.
+  @warn_interval_ms 5_000
 
-  defstruct objects: %{}, index: %{}, ended: %{}, ended_seq: 0
+  defstruct objects: %{}, index: %{}, ended: %{}, ended_seq: 0, warned_at: %{}
 
   @type bbox :: [number()]
   @type t :: %__MODULE__{}
@@ -60,8 +84,13 @@ defmodule Cairn.Tracker do
           observed_at: DateTime.t() | nil,
           tracking: boolean(),
           ended_tracks: [String.t()],
-          max_unseen_ms: number()
+          max_unseen_ms: number(),
+          max_live_tracks: pos_integer(),
+          now_ms: number()
         }
+
+  @typedoc "The host-side tracking policy for one camera."
+  @type policy :: %{max_unseen_ms: number(), max_live_tracks: pos_integer()}
 
   @type event :: {:started | :updated | :ended, Track.t()}
 
@@ -74,9 +103,13 @@ defmodule Cairn.Tracker do
   `camera_id` is the caller's — the aggregator keys its state by the
   *configured* camera, and that is what a track summary must name, whatever
   the plugin put on the wire.
+
+  `now_ms` is the host's monotonic clock, injected rather than read here so
+  the tracker stays pure and the host-clock backstop is testable without
+  sleeping.
   """
-  @spec context(Observation.t(), String.t(), number()) :: context()
-  def context(%Observation{} = observation, camera_id, max_unseen_ms) do
+  @spec context(Observation.t(), String.t(), policy(), number()) :: context()
+  def context(%Observation{} = observation, camera_id, policy, now_ms) do
     %{
       camera_id: camera_id,
       epoch: observation.epoch,
@@ -85,7 +118,9 @@ defmodule Cairn.Tracker do
       observed_at: observation.observed_at,
       tracking: observation.tracking,
       ended_tracks: observation.ended_tracks,
-      max_unseen_ms: max_unseen_ms
+      max_unseen_ms: policy.max_unseen_ms,
+      max_live_tracks: policy.max_live_tracks,
+      now_ms: now_ms
     }
   end
 
@@ -95,15 +130,22 @@ defmodule Cairn.Tracker do
   Returns `{tracker, tagged_objects, events}`: every object tagged with its
   `object_id` (ULID) and `stale_predicted` flag, in the order given, and the
   lifecycle events this observation caused.
+
+  An object the tracker refuses — a `track_id` repeated inside this batch, or
+  a new identity at the live-track cap with nothing evictable — is absent from
+  the tagged list, so `tagged` may be shorter than `objects`.
+
+  Staleness is refreshed *before* expiry so that an expiring track's final
+  summary reports this batch's `stale_predicted`, not the previous batch's.
   """
   @spec track(t(), [map()], context()) :: {t(), [map()], [event()]}
   def track(%__MODULE__{} = tracker, objects, context) do
     {tracker, ended} = end_plugin_tracks(tracker, context)
     {tracker, assignments} = assign(tracker, objects, context)
     {tracker, tagged, lifecycle} = apply_assignments(tracker, objects, assignments, context)
-    {tracker, expired} = expire(tracker, context)
+    {tracker, expired} = tracker |> refresh_stale(context) |> expire(context)
 
-    {refresh_stale(tracker, context), tagged, ended ++ lifecycle ++ expired}
+    {tracker, tagged, ended ++ lifecycle ++ expired}
   end
 
   @doc """
@@ -168,7 +210,8 @@ defmodule Cairn.Tracker do
 
   # -- assignment -------------------------------------------------------------
 
-  # `%{object index => object_id}`; an index with no entry is a new track.
+  # `%{object index => object_id | :drop}`; an index with no entry is a new
+  # track, `:drop` an object the tracker refuses.
   defp assign(tracker, objects, context) do
     {plugin, host} =
       objects
@@ -179,12 +222,36 @@ defmodule Cairn.Tracker do
     {tracker, Map.merge(plugin_assignments, assign_host(tracker, host))}
   end
 
+  # One `track_id` names one object. Two objects in the same batch claiming the
+  # same id would otherwise share a ULID — one `:started` and one `:updated`
+  # for the same identity, with the second box overwriting the first — so the
+  # first occurrence wins and the rest are refused. Same class of contract
+  # violation as reuse-after-`ended_tracks`, treated the same way.
   defp assign_plugin(tracker, indexed, context) do
-    Enum.reduce(indexed, {tracker, %{}}, fn {object, index}, {tracker, assignments} ->
-      key = plugin_key(object.track_id, context)
-      {tracker, object_id} = plugin_identity(tracker, key, object, context)
-      {tracker, Map.put(assignments, index, object_id)}
-    end)
+    {tracker, assignments, _seen} =
+      Enum.reduce(indexed, {tracker, %{}, MapSet.new()}, fn {object, index},
+                                                            {tracker, assignments, seen} ->
+        key = plugin_key(object.track_id, context)
+
+        if MapSet.member?(seen, key) do
+          {warn_duplicate(tracker, object, context), Map.put(assignments, index, :drop), seen}
+        else
+          {tracker, object_id} = plugin_identity(tracker, key, object, context)
+          {tracker, Map.put(assignments, index, object_id), MapSet.put(seen, key)}
+        end
+      end)
+
+    {tracker, assignments}
+  end
+
+  defp warn_duplicate(tracker, object, context) do
+    warn_once(
+      tracker,
+      context,
+      :duplicate_track_id,
+      "camera #{context.camera_id}: plugin #{inspect(context.plugin_instance)} sent track id " <>
+        "#{inspect(object.track_id)} twice in one batch — dropping the duplicate object"
+    )
   end
 
   defp plugin_identity(tracker, key, object, context) do
@@ -222,9 +289,14 @@ defmodule Cairn.Tracker do
         {overlap, index, id}
       end
 
+    # A total sort key, not just `-overlap`: `pairs` is built by comprehension
+    # over a map, whose iteration order is unsorted past 32 keys, and a stable
+    # sort would then resolve two identically-overlapping candidates by that
+    # incidental order. `index` before `id` keeps "earlier object in the batch
+    # wins", matching the incumbent-wins convention elsewhere.
     {assignments, _used_objects, _used_tracks} =
       pairs
-      |> Enum.sort_by(fn {overlap, _index, _id} -> -overlap end)
+      |> Enum.sort_by(fn {overlap, index, id} -> {-overlap, index, id} end)
       |> Enum.reduce({%{}, MapSet.new(), MapSet.new()}, fn {_overlap, index, id},
                                                            {assignments, objects, tracks} ->
         if MapSet.member?(objects, index) or MapSet.member?(tracks, id) do
@@ -238,25 +310,115 @@ defmodule Cairn.Tracker do
   end
 
   defp apply_assignments(tracker, objects, assignments, context) do
+    # Tracks this batch already spoke for: retiring one to make room for a new
+    # identity would churn the very tracks the cap exists to protect.
+    protected = for {_index, id} <- assignments, is_binary(id), into: MapSet.new(), do: id
+
     {tracker, tagged, events} =
       objects
       |> Enum.with_index()
-      |> Enum.reduce({tracker, [], []}, fn {object, index}, {tracker, tagged, events} ->
-        object_id = Map.get(assignments, index) || ULID.generate()
-
-        {tracked, kind} =
-          case Map.fetch(tracker.objects, object_id) do
-            {:ok, existing} -> {update_track(existing, object, context), :updated}
-            :error -> {new_track(object_id, object, context), :started}
-          end
-
-        tracker = %{tracker | objects: Map.put(tracker.objects, object_id, tracked)}
-        tag = Map.merge(object, %{object_id: object_id, stale_predicted: tracked.stale_predicted})
-
-        {tracker, [tag | tagged], [{kind, to_track(tracked)} | events]}
+      |> Enum.reduce({tracker, [], []}, fn {object, index}, acc ->
+        apply_object(acc, object, Map.get(assignments, index, :new), protected, context)
       end)
 
     {tracker, Enum.reverse(tagged), Enum.reverse(events)}
+  end
+
+  defp apply_object(acc, _object, :drop, _protected, _context), do: acc
+
+  defp apply_object({tracker, tagged, events}, object, assigned, protected, context) do
+    case fetch_assigned(tracker, assigned) do
+      {:ok, object_id, existing} ->
+        tracked = update_track(existing, object, context)
+
+        {store(tracker, object_id, tracked), [tag(object, object_id, tracked) | tagged],
+         [{:updated, to_track(tracked)} | events]}
+
+      :error ->
+        case make_room(tracker, protected, context) do
+          {:ok, tracker, evicted} ->
+            object_id = new_object_id(assigned)
+            tracked = new_track(object_id, object, context)
+
+            {store(tracker, object_id, tracked), [tag(object, object_id, tracked) | tagged],
+             [{:started, to_track(tracked)} | Enum.reverse(evicted) ++ events]}
+
+          {:full, tracker} ->
+            {tracker, tagged, events}
+        end
+    end
+  end
+
+  defp fetch_assigned(_tracker, :new), do: :error
+
+  defp fetch_assigned(tracker, object_id) do
+    case Map.fetch(tracker.objects, object_id) do
+      {:ok, existing} -> {:ok, object_id, existing}
+      :error -> :error
+    end
+  end
+
+  defp new_object_id(:new), do: ULID.generate()
+  defp new_object_id(object_id), do: object_id
+
+  defp store(tracker, object_id, tracked),
+    do: %{tracker | objects: Map.put(tracker.objects, object_id, tracked)}
+
+  defp tag(object, object_id, tracked),
+    do: Map.merge(object, %{object_id: object_id, stale_predicted: tracked.stale_predicted})
+
+  # -- the live-track cap -----------------------------------------------------
+
+  defp make_room(tracker, protected, context) do
+    if map_size(tracker.objects) < context.max_live_tracks do
+      {:ok, tracker, []}
+    else
+      evict_oldest(tracker, protected, context)
+    end
+  end
+
+  defp evict_oldest(tracker, protected, context) do
+    candidates =
+      for {id, object} <- tracker.objects, not MapSet.member?(protected, id), do: {id, object}
+
+    case candidates do
+      [] ->
+        {:full,
+         warn_cap(tracker, context, "every live track is in this batch — dropping the new object")}
+
+      _ ->
+        # `{last_seen_ms, id}` rather than `last_seen_ms` alone: ties must not
+        # be broken by map iteration order.
+        {id, object} = Enum.min_by(candidates, fn {id, o} -> {o.last_seen_ms, id} end)
+        tracker = warn_cap(tracker, context, "evicting the least recently seen track #{id}")
+
+        {:ok, remove_object(tracker, id), [{:ended, to_track(object, :evicted)}]}
+    end
+  end
+
+  defp warn_cap(tracker, context, detail) do
+    warn_once(
+      tracker,
+      context,
+      :track_cap,
+      "camera #{context.camera_id}: at the #{context.max_live_tracks} live-track cap — #{detail}"
+    )
+  end
+
+  defp remove_object(tracker, object_id) do
+    index = for {key, id} <- tracker.index, id != object_id, into: %{}, do: {key, id}
+    %{tracker | objects: Map.delete(tracker.objects, object_id), index: index}
+  end
+
+  defp warn_once(tracker, context, class, message) do
+    last = Map.get(tracker.warned_at, class)
+
+    if is_nil(last) or context.now_ms - last >= @warn_interval_ms do
+      Logger.warning(message)
+      %{tracker | warned_at: Map.put(tracker.warned_at, class, context.now_ms)}
+    else
+      tracker
+    end
   end
 
   defp new_track(object_id, object, context) do
@@ -278,6 +440,7 @@ defmodule Cairn.Tracker do
         last_detected_at: if(detected?, do: context.observed_at),
         last_seen_ms: context.media_ms,
         last_detected_ms: if(detected?, do: context.media_ms),
+        last_seen_host_ms: context.now_ms,
         stale_predicted: not detected?
       },
       context
@@ -296,6 +459,7 @@ defmodule Cairn.Tracker do
           best_score: max(tracked.best_score, object.score),
           last_seen_at: context.observed_at || tracked.last_seen_at,
           last_seen_ms: context.media_ms,
+          last_seen_host_ms: context.now_ms,
           last_detected_at:
             if(detected?, do: context.observed_at, else: tracked.last_detected_at),
           last_detected_ms: if(detected?, do: context.media_ms, else: tracked.last_detected_ms)
@@ -306,13 +470,13 @@ defmodule Cairn.Tracker do
 
   # -- expiry -----------------------------------------------------------------
 
-  # Elapsed media time, never negative: a backwards pts jump inside an epoch
-  # must not expire the whole scene at once.
+  # A backwards pts jump inside an epoch makes the elapsed media time negative,
+  # which is always `<= max_unseen_ms`, so it expires nothing — deliberate: the
+  # whole scene must not die at once because a new ffmpeg run restarted the
+  # timeline. The host clock is the backstop for the other direction, where the
+  # elapsed media time never grows at all.
   defp expire(tracker, context) do
-    {live, expired} =
-      Enum.split_with(tracker.objects, fn {_id, object} ->
-        context.media_ms - object.last_seen_ms <= context.max_unseen_ms
-      end)
+    {live, expired} = Enum.split_with(tracker.objects, fn {_id, o} -> live?(o, context) end)
 
     case expired do
       [] ->
@@ -330,6 +494,11 @@ defmodule Cairn.Tracker do
         {%{tracker | objects: Map.new(live), index: index},
          for({_id, object} <- expired, do: {:ended, to_track(object, :unseen)})}
     end
+  end
+
+  defp live?(object, context) do
+    context.media_ms - object.last_seen_ms <= context.max_unseen_ms and
+      context.now_ms - object.last_seen_host_ms <= @host_clock_factor * context.max_unseen_ms
   end
 
   defp refresh_stale(tracker, context) do

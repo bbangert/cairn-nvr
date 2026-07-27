@@ -1,6 +1,7 @@
 defmodule Cairn.TrackerTest do
   use ExUnit.Case, async: true
 
+  import Cairn.TrackAssertions
   import ExUnit.CaptureLog, only: [with_log: 1]
 
   alias Cairn.PluginProtocol
@@ -28,7 +29,9 @@ defmodule Cairn.TrackerTest do
       observed_at: Keyword.get(opts, :observed_at, ~U[2026-07-26 12:00:00Z]),
       tracking: Keyword.get(opts, :tracking, false),
       ended_tracks: Keyword.get(opts, :ended_tracks, []),
-      max_unseen_ms: Keyword.get(opts, :max_unseen_ms, @max_unseen)
+      max_unseen_ms: Keyword.get(opts, :max_unseen_ms, @max_unseen),
+      max_live_tracks: Keyword.get(opts, :max_live_tracks, 128),
+      now_ms: Keyword.get(opts, :now_ms, 0)
     }
   end
 
@@ -165,8 +168,9 @@ defmodule Cairn.TrackerTest do
       {t, [], []} = track(t, [], media_ms: 3_000)
       {t, [], ended} = track(t, [], media_ms: 3_100)
 
-      assert [{:ended, %Track{object_id: id, end_reason: :unseen}}] = ended
+      assert [{:ended, %Track{object_id: id, end_reason: :unseen} = final}] = ended
       assert id == a.object_id
+      assert_self_contained(final)
 
       {_t, [b], _} = track(t, [det("person", [0.1, 0.1, 0.2, 0.4])], media_ms: 3_200)
       refute b.object_id == a.object_id
@@ -185,7 +189,11 @@ defmodule Cairn.TrackerTest do
       {_t, [b], events} = track(t, [det("person", [0.1, 0.1, 0.2, 0.4])], media_ms: 2_100)
 
       assert b.object_id == a.object_id
-      assert ids(events, :ended) == []
+      # positively, not as a refute: `ids/2` silently drops anything that is
+      # not a `{kind, %Track{}}` pair, so `== []` alone would also pass on a
+      # tracker that emitted garbage or renamed the tag.
+      assert [{:updated, %Track{object_id: updated}}] = events
+      assert updated == a.object_id
     end
 
     test "a predicted object keeps the track alive; only detections clear the stale flag" do
@@ -211,10 +219,15 @@ defmodule Cairn.TrackerTest do
       dets = [det("person", [0.1, 0.1, 0.2, 0.4]), det("cat", [0.7, 0.1, 0.2, 0.4])]
       {t, [a, _b], _} = track(Tracker.new(), dets, media_ms: 900_000)
 
-      {_t, [c], events} = track(t, [det("person", [0.1, 0.1, 0.2, 0.4])], media_ms: 0)
+      {t, [c], events} = track(t, [det("person", [0.1, 0.1, 0.2, 0.4])], media_ms: 0)
 
-      assert ids(events, :ended) == []
+      # the whole event list, so "no ended" cannot be satisfied by a tracker
+      # that emitted nothing at all, and the cat's survival is checked rather
+      # than inferred from the absence of a final
+      assert [{:updated, %Track{object_id: updated}}] = events
+      assert updated == a.object_id
       assert c.object_id == a.object_id
+      assert length(Tracker.live_tracks(t)) == 2
     end
   end
 
@@ -269,6 +282,7 @@ defmodule Cairn.TrackerTest do
       {_t, [], [{:ended, final}]} =
         track(t, [], plugin_ctx(media_ms: 200, ended_tracks: ["t1"]))
 
+      assert_self_contained(final)
       assert final.object_id == a.object_id
       assert final.end_reason == :plugin_ended
       assert final.camera_id == "cam_a"
@@ -351,6 +365,128 @@ defmodule Cairn.TrackerTest do
     end
   end
 
+  describe "bounded live set" do
+    # `media_ms` is the plugin's own pts. A plugin that never advances it holds
+    # the clock that expires its tracks, so the host clock has to be able to
+    # retire one on its own.
+    test "a frozen media clock cannot pin a track alive: the host clock expires it" do
+      {t, [a], _} = track(Tracker.new(), [det("person", [0.1, 0.1, 0.2, 0.4])], now_ms: 0)
+
+      # same pts, 30s of host time later: well inside the backstop, still live
+      {t, [_], events} = track(t, [det("person", [0.1, 0.1, 0.2, 0.4])], now_ms: 30_000)
+      assert [{:updated, %Track{}}] = events
+      assert [%Track{}] = Tracker.live_tracks(t)
+
+      # 10 x max_unseen_ms of host time with media time standing still
+      {t, [], ended} = track(t, [], now_ms: 60_001)
+
+      assert [{:ended, %Track{object_id: id, end_reason: :unseen} = final}] = ended
+      assert id == a.object_id
+      assert_self_contained(final)
+      assert Tracker.live_tracks(t) == []
+    end
+
+    test "at the live-track cap the least recently seen track is evicted with a final" do
+      capped = fn opts -> plugin_ctx(Keyword.put(opts, :max_live_tracks, 2)) end
+
+      {t, [a], _} =
+        track(Tracker.new(), [det("person", [0.0, 0.0, 0.05, 0.05], track_id: "t1")], capped.([]))
+
+      {t, [b], _} =
+        track(
+          t,
+          [det("person", [0.5, 0.5, 0.05, 0.05], track_id: "t2")],
+          capped.(media_ms: 100)
+        )
+
+      # only t2 is refreshed, so t1 is the least recently seen of the two
+      {t, _, _} =
+        track(
+          t,
+          [det("person", [0.5, 0.5, 0.05, 0.05], track_id: "t2")],
+          capped.(media_ms: 200)
+        )
+
+      {{t, [c], events}, log} =
+        with_log(fn ->
+          track(
+            t,
+            [det("person", [0.9, 0.9, 0.05, 0.05], track_id: "t3")],
+            capped.(media_ms: 300)
+          )
+        end)
+
+      assert log =~ "live-track cap"
+
+      assert [{:ended, %Track{end_reason: :evicted} = final}, {:started, %Track{}}] = events
+      assert final.object_id == a.object_id
+      assert_self_contained(final)
+
+      # the cap holds, and it retired the right one
+      assert Enum.map(Tracker.live_tracks(t), & &1.object_id) ==
+               Enum.sort([b.object_id, c.object_id])
+    end
+
+    test "the ended set is bounded and evicts the oldest ids first" do
+      # nothing is ever live here: `ended_tracks` remembers an id whether or
+      # not it named a live track, which is the growth this bound exists for
+      t =
+        1..4_200
+        |> Enum.map(&"t#{&1}")
+        |> Enum.chunk_every(64)
+        |> Enum.reduce(Tracker.new(), fn chunk, t ->
+          {t, [], []} = track(t, [], plugin_ctx(ended_tracks: chunk))
+          t
+        end)
+
+      # halved at 4_097 (to 2_048), then the remaining 103 ids appended
+      assert map_size(t.ended) == 2_151
+
+      # the newest id survived: reusing it is still caught as a violation
+      {{_t, _, _}, log} =
+        with_log(fn ->
+          track(t, [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t4200")], plugin_ctx([]))
+        end)
+
+      assert log =~ "reused track id"
+
+      # the oldest was evicted, so its reuse is (only) no longer reported —
+      # the identity outcome is a fresh ULID either way
+      {{_t, _, _}, log} =
+        with_log(fn ->
+          track(t, [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1")], plugin_ctx([]))
+        end)
+
+      refute log =~ "reused track id"
+    end
+  end
+
+  test "an exact IoU tie is broken deterministically, not by map order" do
+    same = [0.1, 0.1, 0.2, 0.4]
+    {t, [a, b], _} = track(Tracker.new(), [det("person", same), det("person", same)])
+    refute a.object_id == b.object_id
+
+    # both candidates overlap perfectly; only the total sort key separates them
+    {_t, [c], _} = track(t, [det("person", same)], media_ms: 200)
+    assert c.object_id == Enum.min([a.object_id, b.object_id])
+  end
+
+  test "a track id repeated inside one batch binds once; the duplicate is dropped" do
+    objects = [
+      det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1"),
+      det("person", [0.7, 0.1, 0.2, 0.4], track_id: "t1")
+    ]
+
+    {{t, tagged, events}, log} = with_log(fn -> track(Tracker.new(), objects, plugin_ctx([])) end)
+
+    assert log =~ ~s(track id "t1" twice in one batch)
+
+    # the first occurrence wins: one identity, one object, one lifecycle event
+    assert [%{bbox: [0.1, 0.1, 0.2, 0.4], object_id: id}] = tagged
+    assert [{:started, %Track{object_id: ^id}}] = events
+    assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+  end
+
   describe "end_all/2" do
     test "ends every live track with the given reason and returns a fresh tracker" do
       dets = [det("person", [0.1, 0.1, 0.2, 0.4]), det("cat", [0.7, 0.1, 0.2, 0.4])]
@@ -360,6 +496,7 @@ defmodule Cairn.TrackerTest do
 
       assert Enum.sort(ids(events, :ended)) == Enum.sort(Enum.map(tagged, & &1.object_id))
       assert Enum.all?(events, fn {:ended, track} -> track.end_reason == :stream_reset end)
+      for {:ended, track} <- events, do: assert_self_contained(track)
       assert Tracker.live_tracks(fresh) == []
 
       # nothing matches across the cut

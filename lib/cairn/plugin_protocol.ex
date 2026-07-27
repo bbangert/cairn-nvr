@@ -361,9 +361,18 @@ defmodule Cairn.PluginProtocol do
     end
   end
 
+  # Same printability rule as `label`, and for the same reasons: a `track_id`
+  # reaches `Cairn.Track.plugin_track_id`, the SSE frames built from it and the
+  # checkpoint ETS row. Invalid UTF-8 there makes `Jason.encode/1` fail, which
+  # drops the *whole* frame — selective suppression of a chosen track's
+  # lifecycle — and control bytes would reach an operator's terminal through
+  # any future log line. A plugin that cannot name its tracks printably has
+  # violated the contract, so the object is refused rather than the field
+  # dropped.
   defp track_id(%{"track_id" => id})
-       when is_binary(id) and byte_size(id) in 1..@max_track_id_bytes,
-       do: {:ok, id}
+       when is_binary(id) and byte_size(id) in 1..@max_track_id_bytes do
+    if printable_label?(id), do: {:ok, id}, else: :error
+  end
 
   defp track_id(%{"track_id" => _other}), do: :error
   defp track_id(_object), do: {:ok, nil}
@@ -375,7 +384,7 @@ defmodule Cairn.PluginProtocol do
   defp ended_tracks(msg) do
     case Map.get(msg, "ended_tracks", []) do
       ids when is_list(ids) and length(ids) <= @max_ended_tracks ->
-        if Enum.all?(ids, &(is_binary(&1) and byte_size(&1) in 1..@max_track_id_bytes)) do
+        if Enum.all?(ids, &valid_track_id?/1) do
           {:ok, ids}
         else
           {:error, :invalid_ended_tracks}
@@ -484,6 +493,9 @@ defmodule Cairn.PluginProtocol do
   end
 
   defp valid_bbox?(_other), do: false
+
+  defp valid_track_id?(id),
+    do: is_binary(id) and byte_size(id) in 1..@max_track_id_bytes and printable_label?(id)
 
   defp printable_label?(label),
     do: String.printable?(label) and not String.contains?(label, @label_escapes)

@@ -181,12 +181,23 @@ Same schema for all three kinds:
 - `track_updated` — **throttled**: sent only when `best_score` improves or at
   most once a second per track. It is deliberately *not* a per-frame feed; do
   not use it to drive animation.
-- `track_ended` — always sent, and **self-contained**: everything above is
-  filled in, so a client that missed every other frame still learns what the
-  track was. `end_reason` is one of `unseen` (not seen for the configured
-  `tracking.max_unseen_ms` of stream time), `plugin_ended` (the plugin said so),
-  `stream_reset` (the camera's stream reconnected — nothing may span the cut) or
+- `track_ended` — **self-contained**: everything above is filled in, so a
+  client that missed every other frame still learns what the track was.
+  `end_reason` is one of `unseen` (not seen for the configured
+  `tracking.max_unseen_ms` of stream time, or ten times that of *host* time —
+  the backstop for a plugin whose stream clock stops moving), `plugin_ended`
+  (the plugin said so), `stream_reset` (the camera's stream reconnected —
+  nothing may span the cut), `evicted` (the camera hit its
+  `tracking.max_live_tracks` cap and this was the least recently seen track),
+  `detection_disabled` (detection was switched off for this camera) or
   `host_restart` (Cairn restarted; the track is over whatever the camera sees).
+
+  **It is sent for every ending Cairn observes, but it is not a guarantee
+  across a Cairn restart.** Tracks belonging to a camera with an event in
+  flight are checkpointed and end as `host_restart`; tracks on a camera with
+  no open event are lost with the process and get no final at all. Treat the
+  SSE stream reconnecting after a Cairn restart as the end of every track you
+  are holding, not just the ones you were told about.
 
 - `bbox` is `[x, y, w, h]`, normalized 0..1, origin top-left.
 - `source` is `"host"` or `"plugin"`; `plugin_track_id` is the plugin's own id

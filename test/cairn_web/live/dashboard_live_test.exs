@@ -44,6 +44,14 @@ defmodule CairnWeb.DashboardLiveTest do
     Cairn.Track.broadcast(:track_updated, track)
     Cairn.Track.broadcast(:track_ended, %{track | end_reason: :unseen})
 
+    # the three track kinds are ones the grid may legitimately grow a clause
+    # for; the forward-compat claim is about a kind it has never heard of
+    Phoenix.PubSub.local_broadcast(
+      Cairn.PubSub,
+      Cairn.Event.topic(),
+      {:totally_unknown_kind, %{}}
+    )
+
     assert render(view) =~ "camera-tile-cam_a"
   end
 
