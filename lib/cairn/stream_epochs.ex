@@ -51,22 +51,26 @@ defmodule Cairn.StreamEpochs do
 
   `:camera_stopped` mints an epoch nobody streams under — it is how the end
   of a stream is announced to subscribers.
+
+  `timeout` bounds the wait on this server. Callers running under a shutdown
+  budget (a supervisor's worker timeout) must pass one well below it, or a
+  wedged server eats the budget and they are brutally killed mid-cleanup.
   """
-  @spec new_epoch(String.t(), reason()) :: Cairn.ULID.t()
-  def new_epoch(camera_id, reason) do
+  @spec new_epoch(String.t(), reason(), timeout()) :: Cairn.ULID.t()
+  def new_epoch(camera_id, reason, timeout \\ 5000) do
     epoch = Cairn.ULID.generate()
 
     try do
-      GenServer.call(__MODULE__, {:new_epoch, camera_id, epoch, reason})
+      GenServer.call(__MODULE__, {:new_epoch, camera_id, epoch, reason}, timeout)
       epoch
     catch
       :exit, _ ->
-        # This server being down (restart window, overload) must never take a
-        # camera with it: announce locally so the caller still gets a usable
-        # epoch. The ETS row may stay missing until the next successful mint,
-        # so `current/1` can answer `:unknown` in the meantime — the same state
-        # a restart leaves behind anyway, and a re-mint is a change, which is
-        # the conservative outcome for consumers.
+        # This server being down (restart window, overload) or too slow must
+        # never take a camera with it: announce locally so the caller still
+        # gets a usable epoch. The ETS row may stay missing until the next
+        # successful mint, so `current/1` can answer `:unknown` in the meantime
+        # — the same state a restart leaves behind anyway, and a re-mint is a
+        # change, which is the conservative outcome for consumers.
         try_broadcast(camera_id, epoch, reason)
         epoch
     end
@@ -94,7 +98,7 @@ defmodule Cairn.StreamEpochs do
   @impl true
   def handle_call({:new_epoch, camera_id, epoch, reason}, _from, state) do
     # the epoch is the caller's; this server never mints one of its own. See
-    # new_epoch/2 for why.
+    # new_epoch/3 for why.
     #
     # insert before the broadcast: a subscriber reacting to {:stream_epoch, e}
     # by calling current/1 must never read something staler than e
@@ -113,7 +117,8 @@ defmodule Cairn.StreamEpochs do
     )
   end
 
-  # Degraded path only: it runs in the caller (a camera's spawn path), where
+  # Degraded path only: it runs in the caller (a camera's spawn or shutdown
+  # path), where
   # a best-effort announcement must not raise. PubSub being down raises
   # ArgumentError from its registry lookup.
   defp try_broadcast(camera_id, epoch, reason) do

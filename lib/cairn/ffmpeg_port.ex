@@ -260,8 +260,12 @@ defmodule Cairn.FFmpegPort do
     # kill so it is not the first casualty of the supervisor's shutdown budget.
     # Never a guarantee either way — a brutal kill skips terminate/2 entirely,
     # so consumers must keep their own timeouts as the backstop.
+    # Short timeout: shutdown must not be gated on epoch bookkeeping. A wedged
+    # StreamEpochs would otherwise eat the shutdown budget and get us killed
+    # before kill_port/1, orphaning ffmpeg; the degraded path still
+    # best-effort-broadcasts.
     if stop_reason?(reason) do
-      Cairn.StreamEpochs.new_epoch(state.camera.id, :camera_stopped)
+      Cairn.StreamEpochs.new_epoch(state.camera.id, :camera_stopped, 500)
     end
 
     kill_port(state)
