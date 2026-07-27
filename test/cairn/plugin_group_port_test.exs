@@ -6,7 +6,7 @@ defmodule Cairn.PluginGroupPortTest do
 
   alias Cairn.Config.Camera
   alias Cairn.Config.PluginGroup
-  alias Cairn.{DetectionAggregator, Event, PluginGroupPort}
+  alias Cairn.{DetectionAggregator, Event, Observation, PluginGroupPort, StreamEpochs}
 
   defp camera(id, opts \\ []) do
     %Camera{
@@ -56,6 +56,28 @@ defmodule Cairn.PluginGroupPortTest do
     ~s({"label": "#{label}", "score": #{score}, "bbox": #{bbox}})
   end
 
+  defp v1_line(camera_id, epoch, sequence, objects) do
+    Jason.encode!(%{
+      "spec" => "cairn.plugin",
+      "version" => 1,
+      "type" => "frame.objects",
+      "camera_id" => camera_id,
+      "stream_epoch" => epoch,
+      "sequence" => sequence,
+      # the port clamps an `observed_at` far from host time, so a line that is
+      # not about clock skew has to carry a live one
+      "frame" => %{
+        "pts" => sequence * 3_000,
+        "observed_at" => DateTime.to_iso8601(DateTime.utc_now())
+      },
+      "objects" => objects
+    })
+  end
+
+  defp object(label, score) do
+    %{"label" => label, "score" => score, "bbox" => [0.1, 0.1, 0.2, 0.4]}
+  end
+
   # A valid line padded with an ignored field to exactly `bytes` bytes, for the
   # boundaries of the {:line, 65_536} chunking.
   defp padded_line(camera_id, pts, bytes) do
@@ -68,6 +90,42 @@ defmodule Cairn.PluginGroupPortTest do
   # in a payload would otherwise change the line's shape. Payloads must
   # contain no single quotes.
   defp printf(lines), do: "printf '%s\\n' " <> Enum.map_join(lines, " ", &"'#{&1}'")
+
+  # A plugin that reads its stdin and appends every control line to a file:
+  # the only way to see what the port actually wrote.
+  defp stdin_recorder do
+    path =
+      Path.join(System.tmp_dir!(), "cairn_group_ctl_#{System.unique_integer([:positive])}.ndjson")
+
+    on_exit(fn -> File.rm(path) end)
+    {path, ~s(while IFS= read -r line; do printf '%s\\n' "$line" >> #{path}; done)}
+  end
+
+  # Flunks rather than returning what it has: a "the port wrote it" assertion
+  # must not pass on a timeout.
+  defp await_control(path, count, attempts \\ 200) do
+    lines =
+      case File.read(path) do
+        {:ok, contents} ->
+          contents |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+
+        {:error, _} ->
+          []
+      end
+
+    cond do
+      length(lines) >= count ->
+        lines
+
+      attempts == 0 ->
+        flunk("plugin received #{length(lines)} control lines, wanted #{count}")
+
+      true ->
+        # the poll interval — without it the attempts burn out in microseconds
+        Process.sleep(25)
+        await_control(path, count, attempts - 1)
+    end
+  end
 
   test "build_argv passes the members as --cameras-json" do
     cams = [camera("g_a"), camera("g_b", min_score: %{"default" => 0.9})]
@@ -90,11 +148,17 @@ defmodule Cairn.PluginGroupPortTest do
     a_id = a.id
     b_id = b.id
 
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, windows_a, 1, dets_a}}, 5_000
-    assert windows_a == %{pre: 5, post: 10, max: 300}
-    assert [%{label: "person", score: 0.9}] = dets_a
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^a_id}, windows_a, %Observation{pts: 1} = obs_a}},
+                   5_000
 
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^b_id}, windows_b, 2, _dets}}, 5_000
+    assert windows_a == %{pre: 5, post: 10, max: 300}
+    assert [%{label: "person", score: 0.9}] = obs_a.objects
+
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^b_id}, windows_b, %Observation{pts: 2}}},
+                   5_000
+
     assert windows_b == %{pre: 5, post: 42, max: 300}
   end
 
@@ -136,7 +200,11 @@ defmodule Cairn.PluginGroupPortTest do
     pid = start_group_port([a], command: command, aggregator: self())
 
     a_id = a.id
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _windows, 3, _dets}}, 5_000
+
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^a_id}, _windows, %Observation{pts: 3}}},
+                   5_000
+
     assert %PluginGroupPort{} = :sys.get_state(pid)
   end
 
@@ -148,7 +216,11 @@ defmodule Cairn.PluginGroupPortTest do
     pid = start_group_port([a], command: command, aggregator: self())
 
     a_id = a.id
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _windows, 7, _dets}}, 5_000
+
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^a_id}, _windows, %Observation{pts: 7}}},
+                   5_000
+
     assert %PluginGroupPort{} = :sys.get_state(pid)
   end
 
@@ -163,8 +235,12 @@ defmodule Cairn.PluginGroupPortTest do
     pid = start_group_port([a], command: command, aggregator: self())
 
     a_id = a.id
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _windows, 11, dets}}, 5_000
-    assert [%{label: "person"}] = dets
+
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^a_id}, _windows, %Observation{pts: 11} = obs}},
+                   5_000
+
+    assert [%{label: "person"}] = obs.objects
     assert %PluginGroupPort{} = :sys.get_state(pid)
   end
 
@@ -179,8 +255,11 @@ defmodule Cairn.PluginGroupPortTest do
     pid = start_group_port([a], command: command, aggregator: self())
 
     a_id = a.id
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _windows, pts, _dets}}, 5_000
-    assert pts == 13
+
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^a_id}, _windows, %Observation{pts: 13}}},
+                   5_000
+
     assert %PluginGroupPort{} = :sys.get_state(pid)
   end
 
@@ -204,14 +283,19 @@ defmodule Cairn.PluginGroupPortTest do
     pid = start_group_port([a], command: command, aggregator: self())
 
     a_id = a.id
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _windows, 1, dets}}, 5_000
-    assert dets == [%{label: "cat", score: 0.8, bbox: [0.1, 0.1, 0.2, 0.2]}]
 
-    # the non-numeric pts line is dropped whole, so the next cast is the last line
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _windows, 3, good_dets}},
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^a_id}, _windows, %Observation{pts: 1} = obs}},
                    5_000
 
-    assert good_dets == [%{label: "person", score: 0.9, bbox: [0, 0, 1, 1]}]
+    assert [%{label: "cat", score: 0.8, bbox: [0.1, 0.1, 0.2, 0.2]}] = obs.objects
+
+    # the non-numeric pts line is dropped whole, so the next cast is the last line
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^a_id}, _windows, %Observation{pts: 3} = good}},
+                   5_000
+
+    assert [%{label: "person", score: 0.9, bbox: [0, 0, 1, 1]}] = good.objects
     assert %PluginGroupPort{} = :sys.get_state(pid)
   end
 
@@ -262,7 +346,10 @@ defmodule Cairn.PluginGroupPortTest do
     pid = start_group_port([a], command: command, aggregator: self())
     a_id = a.id
 
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, windows, 1, _dets}}, 5_000
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^a_id}, windows, %Observation{pts: 1}}},
+                   5_000
+
     assert windows.post == 10
     os_pid = :sys.get_state(pid).os_pid
 
@@ -273,8 +360,8 @@ defmodule Cairn.PluginGroupPortTest do
     :sys.get_state(pid)
 
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^a_id, post_window_seconds: 42}, %{post: 42}, 2,
-                     _dets}},
+                    {:detections, %Camera{id: ^a_id, post_window_seconds: 42}, %{post: 42},
+                     %Observation{pts: 2}}},
                    10_000
 
     assert :sys.get_state(pid).os_pid == os_pid
@@ -289,11 +376,242 @@ defmodule Cairn.PluginGroupPortTest do
       capture_log(fn ->
         start_group_port([a], command: command, aggregator: self())
         # ordered after all five drops: the port handles lines in order
-        assert_receive {:"$gen_cast", {:detections, _cam, _windows, 99, _dets}}, 5_000
+        assert_receive {:"$gen_cast", {:detections, _cam, _windows, %Observation{pts: 99}}}, 5_000
       end)
 
     assert length(Regex.scan(~r/dropped lines\/dets/, log)) == 1
     assert log =~ ~s|unknown_camera ×1 (1 total); latest unknown_camera: "stranger"|
+  end
+
+  test "every member's epoch is announced on stdin, and only that member's" do
+    a = camera("gp_ctl_a_#{System.unique_integer([:positive])}")
+    b = camera("gp_ctl_b_#{System.unique_integer([:positive])}")
+
+    a_epoch = StreamEpochs.new_epoch(a.id, :started)
+    b_epoch = StreamEpochs.new_epoch(b.id, :started)
+    {path, command} = stdin_recorder()
+
+    pid = start_group_port([a, b], command: command, aggregator: self())
+
+    started = await_control(path, 2)
+    assert Enum.all?(started, &(&1["type"] == "stream.started"))
+
+    assert Map.new(started, &{&1["camera_id"], &1["stream_epoch"]}) == %{
+             a.id => a_epoch,
+             b.id => b_epoch
+           }
+
+    # one member bouncing touches that member only — and never the process
+    os_pid = :sys.get_state(pid).os_pid
+    a_next = StreamEpochs.new_epoch(a.id, :stall_bounce)
+
+    assert [_, _, ended, restarted] = await_control(path, 4)
+
+    assert %{"type" => "stream.ended", "reason" => "stall_bounce", "stream_epoch" => ^a_epoch} =
+             ended
+
+    assert ended["camera_id"] == a.id
+    assert %{"type" => "stream.started", "stream_epoch" => ^a_next} = restarted
+    assert restarted["camera_id"] == a.id
+
+    # a camera that is not a member of this group is not its business.
+    # new_epoch/3 returns only once the broadcast has been delivered, so the
+    # :sys.get_state barrier proves the port *handled* it; the sentinel below
+    # then proves it wrote nothing for it.
+    StreamEpochs.new_epoch("gp_ctl_stranger_#{System.unique_integer([:positive])}", :started)
+    _ = :sys.get_state(pid)
+
+    b_next = StreamEpochs.new_epoch(b.id, :stall_bounce)
+    assert [_, _, _, _, b_ended, b_restarted] = await_control(path, 6)
+    assert %{"type" => "stream.ended", "stream_epoch" => ^b_epoch} = b_ended
+    assert b_ended["camera_id"] == b.id
+    assert %{"type" => "stream.started", "stream_epoch" => ^b_next} = b_restarted
+
+    assert %PluginGroupPort{os_pid: ^os_pid} = :sys.get_state(pid)
+  end
+
+  test "v1 lines route per member, with per-camera sequence and epoch state" do
+    a = camera("gp_v1_a_#{System.unique_integer([:positive])}")
+    b = camera("gp_v1_b_#{System.unique_integer([:positive])}")
+
+    a_epoch = StreamEpochs.new_epoch(a.id, :started)
+    b_epoch = StreamEpochs.new_epoch(b.id, :started)
+    test_pid = self()
+
+    handler = "gp_seq_gap_#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:cairn, :plugin, :sequence_gap],
+      fn _event, measurements, metadata, _ -> send(test_pid, {:gap, measurements, metadata}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    command =
+      printf([
+        v1_line(a.id, a_epoch, 5, [object("person", 0.9)]),
+        # b's first line is sequence 1: per-camera counters, so a's 5 is not
+        # a baseline for it and this must not read as a gap
+        v1_line(b.id, b_epoch, 1, [object("person", 0.9)]),
+        # a stale epoch for a is dropped and leaves b's state alone
+        v1_line(a.id, "01OTHEREPOCH0000000000000", 6, [object("person", 0.9)]),
+        v1_line(b.id, b_epoch, 2, [object("person", 0.9)]),
+        v1_line(a.id, a_epoch, 9, [object("person", 0.9)])
+      ]) <> "; exec sleep 30"
+
+    pid = start_group_port([a, b], command: command, aggregator: self())
+
+    a_id = a.id
+    b_id = b.id
+
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^a_id}, _w, %Observation{sequence: 5}}},
+                   5_000
+
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^b_id}, _w, %Observation{sequence: 1}}},
+                   5_000
+
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^b_id}, _w, %Observation{sequence: 2}}},
+                   5_000
+
+    # the stale line never reaches the aggregator; the next good one does
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^a_id}, _w, %Observation{sequence: 9}}},
+                   5_000
+
+    # sequences 6..8 (the stale line's number included) are a gap of 3 for a…
+    assert_receive {:gap, %{count: 3}, %{camera_id: ^a_id}}, 5_000
+    # …and b, whose counter ran 1 -> 2 independently, contributed none
+    refute_received {:gap, _measurements, %{camera_id: ^b_id}}
+    assert :sys.get_state(pid).drops == %{stale_epoch: 1, sequence_gap: 3}
+  end
+
+  test "a v1 hello and status route through the group" do
+    a = camera("gp_v1_hs_a_#{System.unique_integer([:positive])}")
+    b = camera("gp_v1_hs_b_#{System.unique_integer([:positive])}")
+
+    message = fn fields ->
+      Jason.encode!(Map.merge(%{"spec" => "cairn.plugin", "version" => 1}, fields))
+    end
+
+    command =
+      printf([
+        message.(%{
+          "type" => "plugin.hello",
+          "hello" => %{"name" => "fake", "version" => "2.0", "supported_versions" => [1]}
+        }),
+        message.(%{"type" => "plugin.status", "status" => %{"state" => "ready"}}),
+        message.(%{
+          "type" => "plugin.status",
+          "camera_id" => a.id,
+          "status" => %{"state" => "degraded"}
+        }),
+        # unchanged and inside the min interval: not a second broadcast
+        message.(%{
+          "type" => "plugin.status",
+          "camera_id" => a.id,
+          "status" => %{"state" => "degraded"}
+        })
+      ]) <> "; exec sleep 30"
+
+    Cairn.CameraStatus.subscribe()
+
+    on_exit(fn ->
+      Cairn.CameraStatus.prune(Map.keys(Cairn.CameraStatus.all()) -- [a.id, b.id])
+    end)
+
+    pid = start_group_port([a, b], command: command, aggregator: self())
+
+    a_id = a.id
+    b_id = b.id
+    assert_receive {:camera_status, ^a_id, %{plugin_status: %{"state" => "ready"}}}, 5_000
+    assert_receive {:camera_status, ^b_id, %{plugin_status: %{"state" => "ready"}}}, 5_000
+    assert_receive {:camera_status, ^a_id, %{plugin_status: %{"state" => "degraded"}}}, 5_000
+
+    # the envelope's camera_id routed the status and stops there: what is
+    # stored is keyed by camera already
+    assert Cairn.CameraStatus.get(a_id).plugin_status == %{"state" => "degraded"}
+    assert Cairn.CameraStatus.get(b_id).plugin_status == %{"state" => "ready"}
+
+    # the repeat is gated: b never hears about a, and a is not told twice
+    refute_receive {:camera_status, ^b_id, %{plugin_status: %{"state" => "degraded"}}}, 200
+    refute_received {:camera_status, ^a_id, %{plugin_status: %{"state" => "degraded"}}}
+
+    state = :sys.get_state(pid)
+    assert %{"name" => "fake"} = state.plugin
+    assert %{status_rate_limited: 1} = state.drops
+  end
+
+  test "an epoch older than the one already announced is ignored per member" do
+    a = camera("gp_order_a_#{System.unique_integer([:positive])}")
+    b = camera("gp_order_b_#{System.unique_integer([:positive])}")
+
+    StreamEpochs.new_epoch(a.id, :started)
+    b_epoch = StreamEpochs.new_epoch(b.id, :started)
+    {path, command} = stdin_recorder()
+
+    pid = start_group_port([a, b], command: command, aggregator: self())
+    assert [_, _] = await_control(path, 2)
+
+    a_second = StreamEpochs.new_epoch(a.id, :source_lost)
+    assert [_, _, _, _] = await_control(path, 4)
+
+    # a late broadcast for an earlier mint. Applying it would leave the plugin
+    # stamping a's lines with a dead epoch while `current_epoch?/2` compares
+    # against ETS — every one of a's observations dropped until the next
+    # respawn — and it must not touch b either.
+    send(pid, {:stream_epoch, a.id, Cairn.ULID.generate(1), :source_lost})
+    state = :sys.get_state(pid)
+    assert state.epochs[a.id] == {a_second, :live}
+    assert state.epochs[b.id] == {b_epoch, :live}
+
+    # sentinel: the next real mint for a ends `a_second`, so nothing was
+    # written for the stale one in between
+    a_third = StreamEpochs.new_epoch(a.id, :stall_bounce)
+    assert [_, _, _, _, ended, restarted] = await_control(path, 6)
+    assert %{"type" => "stream.ended", "stream_epoch" => ^a_second} = ended
+    assert %{"type" => "stream.started", "stream_epoch" => ^a_third} = restarted
+  end
+
+  test "status routes to the named member, or to all of them" do
+    a = camera("gp_st_a_#{System.unique_integer([:positive])}")
+    b = camera("gp_st_b_#{System.unique_integer([:positive])}")
+
+    status = fn fields ->
+      Jason.encode!(
+        Map.merge(
+          %{"spec" => "cairn.plugin", "version" => 1, "type" => "plugin.status"},
+          fields
+        )
+      )
+    end
+
+    command =
+      printf([
+        status.(%{"status" => %{"state" => "ready"}}),
+        status.(%{"camera_id" => a.id, "status" => %{"state" => "degraded"}})
+      ]) <> "; exec sleep 30"
+
+    Cairn.CameraStatus.subscribe()
+
+    on_exit(fn ->
+      Cairn.CameraStatus.prune(Map.keys(Cairn.CameraStatus.all()) -- [a.id, b.id])
+    end)
+
+    start_group_port([a, b], command: command, aggregator: self())
+
+    a_id = a.id
+    b_id = b.id
+    assert_receive {:camera_status, ^a_id, %{plugin_status: %{"state" => "ready"}}}, 5_000
+    assert_receive {:camera_status, ^b_id, %{plugin_status: %{"state" => "ready"}}}, 5_000
+
+    # the second line names one member: only that member changes
+    assert_receive {:camera_status, ^a_id, %{plugin_status: %{"state" => "degraded"}}}, 5_000
+    assert Cairn.CameraStatus.get(b_id).plugin_status["state"] == "ready"
   end
 
   test "plugin exit triggers backoff respawn" do
@@ -310,7 +628,11 @@ defmodule Cairn.PluginGroupPortTest do
     )
 
     a_id = a.id
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _w, 1, _dets}}, 5_000
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _w, 1, _dets}}, 5_000
+
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _w, %Observation{pts: 1}}},
+                   5_000
+
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _w, %Observation{pts: 1}}},
+                   5_000
   end
 end

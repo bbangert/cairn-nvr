@@ -99,12 +99,32 @@ defmodule Cairn.StreamEpochs do
   def handle_call({:new_epoch, camera_id, epoch, reason}, _from, state) do
     # the epoch is the caller's; this server never mints one of its own. See
     # new_epoch/3 for why.
-    #
-    # insert before the broadcast: a subscriber reacting to {:stream_epoch, e}
-    # by calling current/1 must never read something staler than e
-    :ets.insert(@table, {camera_id, epoch, DateTime.utc_now()})
-    broadcast(camera_id, epoch, reason)
-    {:reply, :ok, state}
+    if superseded?(camera_id, epoch) do
+      # Two calls minted close together can be served out of order, which
+      # would roll `current/1` back to an older but legitimate epoch — and a
+      # consumer that had already applied the newer one would then be told to
+      # go back to a stream nothing decodes under. Neither stored nor
+      # announced: every consumer guards the same way
+      # (`Cairn.ULID.superseded?/2`), so an announcement they would discard
+      # is not worth sending. The caller still gets its epoch back and tags
+      # its own artifacts with it; nothing downstream will match it, which is
+      # the same outcome as the mint never having happened.
+      {:reply, :ok, state}
+    else
+      # insert before the broadcast: a subscriber reacting to
+      # {:stream_epoch, e} by calling current/1 must never read something
+      # staler than e
+      :ets.insert(@table, {camera_id, epoch, DateTime.utc_now()})
+      broadcast(camera_id, epoch, reason)
+      {:reply, :ok, state}
+    end
+  end
+
+  defp superseded?(camera_id, epoch) do
+    case current(camera_id) do
+      {:ok, held} -> Cairn.ULID.superseded?(held, epoch)
+      :unknown -> false
+    end
   end
 
   # local_broadcast, not broadcast: the epoch table is a node-local named ETS

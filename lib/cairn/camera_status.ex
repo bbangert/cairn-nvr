@@ -1,11 +1,12 @@
 defmodule Cairn.CameraStatus do
   @moduledoc """
   ETS-backed per-camera runtime status (`:connecting | :running | :backoff |
-  :stalled | :transcode_unavailable`) plus probe results (Phase 8), with
-  PubSub change notifications on `"cameras:status"`.
+  :stalled | :transcode_unavailable`) plus probe results (Phase 8) and the
+  last `plugin.status` the camera's plugin reported, with PubSub change
+  notifications on `"cameras:status"`.
 
-  Written by `Cairn.FFmpegPort` / the watchdog; read by the dashboard and
-  config LiveViews.
+  Written by `Cairn.FFmpegPort` / the watchdog and by the plugin ports; read
+  by the dashboard and config LiveViews and by the HA API.
   """
 
   use GenServer
@@ -28,6 +29,13 @@ defmodule Cairn.CameraStatus do
   @spec set_probe(String.t(), map() | {:error, term()}) :: :ok
   def set_probe(camera_id, probe), do: merge(camera_id, %{probe: probe})
 
+  @doc """
+  Stores the plugin's own last reported state (a decoded `plugin.status`
+  payload — string-keyed and JSON-safe, since it arrived as JSON).
+  """
+  @spec set_plugin_status(String.t(), map() | nil) :: :ok
+  def set_plugin_status(camera_id, status), do: merge(camera_id, %{plugin_status: status})
+
   @spec merge(String.t(), map()) :: :ok
   def merge(camera_id, attrs) when is_map(attrs) do
     GenServer.cast(__MODULE__, {:merge, camera_id, attrs})
@@ -37,9 +45,17 @@ defmodule Cairn.CameraStatus do
   def get(camera_id) do
     case :ets.lookup(@table, camera_id) do
       [{^camera_id, info}] -> info
-      [] -> %{status: :unknown, probe: nil}
+      [] -> unknown()
     end
+  rescue
+    # the table is gone between an owner crash and its restart. Checking
+    # `:ets.whereis/1` first would not help: it is not atomic with the lookup.
+    # A reader (dashboard, HA API) lands in that window and sees :unknown
+    # rather than crashing — same treatment as `Cairn.StreamEpochs.current/1`.
+    ArgumentError -> unknown()
   end
+
+  defp unknown, do: %{status: :unknown, probe: nil, plugin_status: nil}
 
   @spec all() :: %{String.t() => map()}
   def all, do: Map.new(:ets.tab2list(@table))
@@ -58,7 +74,10 @@ defmodule Cairn.CameraStatus do
   def handle_cast({:merge, camera_id, attrs}, state) do
     info = Map.merge(get(camera_id), attrs)
     :ets.insert(@table, {camera_id, info})
-    Phoenix.PubSub.broadcast(Cairn.PubSub, @topic, {:camera_status, camera_id, info})
+    # local_broadcast, not broadcast: the backing table is a node-local named
+    # ETS table, so a remote subscriber could never read what it was told
+    # about — and plugin status arrives at line rate, one message per member.
+    Phoenix.PubSub.local_broadcast(Cairn.PubSub, @topic, {:camera_status, camera_id, info})
     {:noreply, state}
   end
 

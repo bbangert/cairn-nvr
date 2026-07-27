@@ -2,7 +2,7 @@ defmodule Cairn.DetectionAggregatorTest do
   use ExUnit.Case, async: false
 
   alias Cairn.Config.Camera
-  alias Cairn.{DetectionAggregator, Event, EventCheckpoint, StreamEpochs}
+  alias Cairn.{DetectionAggregator, Event, EventCheckpoint, Observation, StreamEpochs}
 
   @windows %{pre: 5, post: 10, max: 300}
 
@@ -32,9 +32,28 @@ defmodule Cairn.DetectionAggregatorTest do
   end
 
   defp detect(agg, camera, score \\ 0.9, bbox \\ [0.1, 0.1, 0.2, 0.4]) do
-    DetectionAggregator.detections(agg, camera, @windows, 90_000, [
-      %{label: "person", score: score, bbox: bbox}
-    ])
+    observe(agg, camera, [object("person", score, bbox)])
+  end
+
+  defp observe(agg, camera, objects, opts \\ []) do
+    DetectionAggregator.detections(agg, camera, @windows, observation(objects, opts))
+  end
+
+  defp observation(objects, opts) do
+    %Observation{
+      camera_id: Keyword.get(opts, :camera_id),
+      epoch: Keyword.get(opts, :epoch),
+      pts: 90_000,
+      media_ms: 1_000.0,
+      observed_at: Keyword.get(opts, :observed_at, DateTime.utc_now()),
+      time_quality: :arrival,
+      objects: objects,
+      protocol: :v0
+    }
+  end
+
+  defp object(label, score, bbox, kind \\ "detected") do
+    %{label: label, score: score, bbox: bbox, track_id: nil, observation_kind: kind}
   end
 
   defp token(agg, camera_id, kind), do: :sys.get_state(agg).cameras[camera_id][kind]
@@ -193,6 +212,52 @@ defmodule Cairn.DetectionAggregatorTest do
     refute second == first
   end
 
+  test "an epoch older than the one already applied is ignored", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    detect(agg, camera)
+    assert_receive {:event_started, %Event{labels: [%{object_id: first}]}}
+
+    current = StreamEpochs.new_epoch(id, :source_lost)
+    _ = :sys.get_state(agg)
+
+    detect(agg, camera)
+    assert_receive {:event_updated, %Event{labels: [_, %{object_id: second}]}}
+    refute second == first
+
+    # A mint from an earlier millisecond, delivered late: a port's spawn-time
+    # ETS pull racing a queued broadcast, or StreamEpochs' degraded
+    # caller-side broadcast, which has no ordering relation to the server's.
+    # Applying it would roll `current_epoch` back to a stream nothing decodes
+    # under, and `stale?/3` would then drop every observation the ports still
+    # forward — until the camera's *next* mint, hours away for a healthy one.
+    send(agg, {:stream_epoch, id, Cairn.ULID.generate(1), :source_lost})
+    _ = :sys.get_state(agg)
+
+    assert :sys.get_state(agg).cameras[id].current_epoch == current
+
+    # not a boundary, so the tracks it did not cut stay uncut
+    detect(agg, camera)
+    assert_receive {:event_updated, %Event{labels: [_, _, %{object_id: ^second}]}}
+  end
+
+  test "an observation with no observed_at cannot take the aggregator down", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    # unreachable through the codec — both ports stamp it — but `detections/4`
+    # is a public, @spec'd API whose type admits nil, and this is the
+    # singleton holding every camera's in-flight event state
+    observe(agg, camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], observed_at: nil)
+
+    assert_receive {:event_started, %Event{camera_id: ^id} = event}
+    assert %DateTime{} = event.started_at
+    assert [%{t: +0.0}] = event.labels
+  end
+
   test "a stopped camera's epoch is forgotten", %{agg: agg, camera_id: id} do
     epoch = StreamEpochs.new_epoch(id, :started)
     _ = :sys.get_state(agg)
@@ -203,6 +268,53 @@ defmodule Cairn.DetectionAggregatorTest do
     StreamEpochs.new_epoch(id, :camera_stopped)
     _ = :sys.get_state(agg)
     refute Map.has_key?(:sys.get_state(agg).epochs, id)
+  end
+
+  test "event times come from the observation, not from the clock", %{agg: agg, camera: camera} do
+    # the plugin observed this 10s ago; the queue it sat in must not move the
+    # event onto the wall clock of the moment it was finally processed
+    past = DateTime.add(DateTime.utc_now(), -10, :second)
+    observe(agg, camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], observed_at: past)
+
+    assert_receive {:event_started, %Event{} = event}
+    assert DateTime.compare(event.started_at, past) == :eq
+    assert [%{t: +0.0}] = event.labels
+    assert event.trigger.t == +0.0
+
+    # offsets are source-time deltas: 2s later in the stream is t = 2.0
+    observe(agg, camera, [object("person", 0.95, [0.1, 0.1, 0.2, 0.4])],
+      observed_at: DateTime.add(past, 2, :second)
+    )
+
+    assert_receive {:event_updated, %Event{labels: [_, %{t: 2.0}], trigger: %{t: 2.0}}}
+  end
+
+  test "predicted (tracked) objects are not evidence", %{agg: agg, camera: camera, camera_id: id} do
+    observe(agg, camera, [object("person", 0.99, [0.1, 0.1, 0.2, 0.4], "tracked")])
+
+    # the cast and its (synchronous) broadcast are done once the mailbox flushes
+    :sys.get_state(agg)
+    refute_received {:event_started, %Event{camera_id: ^id}}
+
+    # it still updated the tracker: the detected object that overlaps it
+    # inherits that track's id rather than opening a second one
+    observe(agg, camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])])
+    assert_receive {:event_started, %Event{labels: [%{object_id: 1}]}}
+  end
+
+  test "an observation from a stale epoch is dropped", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    send(agg, {:stream_epoch, id, "epoch_two", :source_lost})
+
+    observe(agg, camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], epoch: "epoch_one")
+    :sys.get_state(agg)
+    refute_received {:event_started, %Event{camera_id: ^id}}
+
+    observe(agg, camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], epoch: "epoch_two")
+    assert_receive {:event_started, %Event{camera_id: ^id}}
   end
 
   test "post-window timeout finalizes", %{agg: agg, camera: camera, camera_id: id} do

@@ -41,6 +41,21 @@ defmodule CairnWeb.Api.EventStreamTest do
     assert status =~ "event: camera_status\n"
   end
 
+  test "the camera_status frame carries the plugin's own reported state" do
+    assert {:ok, frame} =
+             SSE.frame_for(
+               {:camera_status, "cam_a",
+                %{
+                  status: :running,
+                  probe: nil,
+                  plugin_status: %{"state" => "degraded", "detail" => "decoder fallback"}
+                }}
+             )
+
+    assert frame =~ ~s("plugin_status":{)
+    assert frame =~ ~s("state":"degraded")
+  end
+
   test "an error-tuple probe is sanitized rather than crashing the encode" do
     assert {:ok, frame} =
              SSE.frame_for(
@@ -53,5 +68,42 @@ defmodule CairnWeb.Api.EventStreamTest do
 
   test "unknown messages are ignored" do
     assert SSE.frame_for({:something_else, 1}) == :ignore
+  end
+end
+
+defmodule CairnWeb.Api.EventStreamEndpointTest do
+  # async: false — drives the global Cairn.CameraStatus and its PubSub topic
+  use CairnWeb.ConnCase, async: false
+
+  @token "test-ha-token"
+
+  # The controller loop stops on `{:plug_conn, :sent}`, which is how the test
+  # adapter reports a response to the conn's *owner*. Building the conn here
+  # and running the endpoint in a task keeps the test process as that owner:
+  # the message becomes this test's "the stream is open, and it subscribed"
+  # barrier, and the loop only ends when we send it one ourselves.
+  test "a plugin status reaches the live SSE endpoint as a camera_status frame" do
+    id = "sse_#{System.unique_integer([:positive])}"
+    on_exit(fn -> Cairn.CameraStatus.prune(Map.keys(Cairn.CameraStatus.all()) -- [id]) end)
+
+    conn = build_conn(:get, "/api/stream?access_token=#{@token}")
+    stream = Task.async(fn -> CairnWeb.Endpoint.call(conn, []) end)
+
+    assert_receive {:plug_conn, :sent}, 5_000
+
+    Cairn.CameraStatus.set_plugin_status(id, %{"state" => "degraded", "detail" => "cpu fallback"})
+    # the cast, and the broadcast inside it, are done once the server's mailbox
+    # flushes — so the frame is in the stream's mailbox ahead of the stop below
+    _ = :sys.get_state(Cairn.CameraStatus)
+    send(stream.pid, {:plug_conn, :sent})
+
+    body = Task.await(stream, 5_000).resp_body
+
+    assert body =~ ": connected\n\n"
+    assert body =~ "event: camera_status\n"
+    assert body =~ ~s("camera_id":"#{id}")
+    assert body =~ ~s("plugin_status":{)
+    assert body =~ ~s("state":"degraded")
+    assert body =~ ~s("detail":"cpu fallback")
   end
 end

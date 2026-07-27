@@ -59,6 +59,7 @@ defmodule CairnWeb.Api.CameraController do
       },
       status: Map.get(status, :status, :unknown),
       probe: safe_probe(Map.get(status, :probe)),
+      plugin_status: Map.get(status, :plugin_status),
       control: control
     }
   end
