@@ -30,6 +30,37 @@ defmodule Cairn.ULIDTest do
     assert ulids |> Enum.map(&binary_part(&1, 0, 10)) |> Enum.uniq() |> length() == 1
   end
 
+  describe "superseded?/2" do
+    test "an earlier millisecond is superseded by a later one" do
+      older = ULID.generate(1_700_000_000_000)
+      newer = ULID.generate(1_700_000_000_001)
+
+      assert ULID.superseded?(newer, older)
+      refute ULID.superseded?(older, newer)
+    end
+
+    test "nothing held supersedes nothing" do
+      refute ULID.superseded?(nil, ULID.generate())
+    end
+
+    # deliberate: the random halves order two same-millisecond mints at
+    # random, and calling one "older" would discard a legitimate epoch
+    # announcement — the exact failure the guard exists to prevent
+    test "same-millisecond mints never supersede each other" do
+      held = ULID.generate(1_700_000_000_000)
+
+      for _ <- 1..200 do
+        refute ULID.superseded?(held, ULID.generate(1_700_000_000_000))
+      end
+    end
+
+    test "is total on binaries that are not ULIDs" do
+      refute ULID.superseded?("epoch_one", "epoch_two")
+      assert ULID.superseded?("epoch_two", "epoch_one")
+      refute ULID.superseded?("a", "b")
+    end
+  end
+
   test "a timestamp outside 48 bits raises instead of wrapping" do
     assert byte_size(ULID.generate(0)) == 26
     assert byte_size(ULID.generate(281_474_976_710_655)) == 26

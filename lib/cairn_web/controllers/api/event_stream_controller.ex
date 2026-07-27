@@ -105,7 +105,8 @@ defmodule CairnWeb.Api.EventStreamController do
     encode_frame("camera_status", %{
       camera_id: camera_id,
       status: Map.get(info, :status),
-      probe: safe_probe(Map.get(info, :probe))
+      probe: safe_probe(Map.get(info, :probe)),
+      plugin_status: Map.get(info, :plugin_status)
     })
   end
 

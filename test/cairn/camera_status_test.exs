@@ -10,7 +10,19 @@ defmodule Cairn.CameraStatusTest do
   end
 
   test "unknown cameras read as :unknown", %{id: id} do
-    assert CameraStatus.get(id) == %{status: :unknown, probe: nil}
+    assert CameraStatus.get(id) == %{status: :unknown, probe: nil, plugin_status: nil}
+  end
+
+  test "plugin status is merged and broadcast like any other field", %{id: id} do
+    CameraStatus.subscribe()
+
+    CameraStatus.set(id, :running)
+    assert_receive {:camera_status, ^id, %{status: :running}}
+
+    CameraStatus.set_plugin_status(id, %{"state" => "ready", "detail" => "model loaded"})
+    assert_receive {:camera_status, ^id, info}
+    assert info.status == :running
+    assert info.plugin_status == %{"state" => "ready", "detail" => "model loaded"}
   end
 
   test "set/merge accumulate and broadcast", %{id: id} do

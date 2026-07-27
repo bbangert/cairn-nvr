@@ -2,7 +2,7 @@ defmodule Cairn.DetectionAggregatorControlTest do
   # verifies runtime CameraControl toggles change aggregator behavior
   use ExUnit.Case, async: false
 
-  alias Cairn.{CameraControl, DetectionAggregator, Event, EventCheckpoint}
+  alias Cairn.{CameraControl, DetectionAggregator, Event, EventCheckpoint, Observation}
   alias Cairn.Config.Camera
 
   @windows %{pre: 5, post: 10, max: 300}
@@ -33,12 +33,24 @@ defmodule Cairn.DetectionAggregatorControlTest do
   end
 
   defp detect(agg, camera, score \\ 0.9) do
-    DetectionAggregator.detections(agg, camera, @windows, 90_000, [
-      %{label: "person", score: score, bbox: [0.1, 0.1, 0.2, 0.4]}
-    ])
+    observation = %Observation{
+      pts: 90_000,
+      observed_at: DateTime.utc_now(),
+      objects: [
+        %{
+          label: "person",
+          score: score,
+          bbox: [0.1, 0.1, 0.2, 0.4],
+          track_id: nil,
+          observation_kind: "detected"
+        }
+      ]
+    }
+
+    DetectionAggregator.detections(agg, camera, @windows, observation)
   end
 
-  # `detections/5` is an async cast; flushing the aggregator's mailbox with
+  # `detections/4` is an async cast; flushing the aggregator's mailbox with
   # :sys.get_state guarantees it (and its synchronous PubSub broadcast) is done,
   # so we can assert "no event" with no timing window.
   defp refute_event_started(agg) do
