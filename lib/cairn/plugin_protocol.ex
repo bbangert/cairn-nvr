@@ -58,12 +58,17 @@ defmodule Cairn.PluginProtocol do
   Total on any term: a non-list counts as a single drop.
   """
   @spec validate_dets(term()) :: {[det()], non_neg_integer()}
-  def validate_dets(dets) when is_list(dets) and length(dets) > @max_dets do
-    # The caller still casts the empty batch, which is the plugin's liveness signal.
-    {[], length(dets)}
+  def validate_dets(dets) when is_list(dets) do
+    count = length(dets)
+
+    # An over-cap batch is still cast as an empty one, which is the plugin's
+    # liveness signal.
+    if count > @max_dets, do: {[], count}, else: reduce_dets(dets)
   end
 
-  def validate_dets(dets) when is_list(dets) do
+  def validate_dets(_other), do: {[], 1}
+
+  defp reduce_dets(dets) do
     {valid, dropped} =
       Enum.reduce(dets, {[], 0}, fn det, {valid, dropped} ->
         case validate_det(det) do
@@ -74,8 +79,6 @@ defmodule Cairn.PluginProtocol do
 
     {Enum.reverse(valid), dropped}
   end
-
-  def validate_dets(_other), do: {[], 1}
 
   # Range comparisons also reject infinities and NaN, neither of which Jason
   # can produce but both of which would reach `Cairn.Tracker` arithmetic.

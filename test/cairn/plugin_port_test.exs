@@ -101,7 +101,7 @@ defmodule Cairn.PluginPortTest do
       )
 
     assert_receive {:event_started, %Cairn.Event{camera_id: ^id}}, 5_000
-    assert Process.alive?(pid)
+    assert %PluginPort{} = :sys.get_state(pid)
   end
 
   test "invalid dets are dropped individually and the valid ones still forward" do
@@ -134,7 +134,7 @@ defmodule Cairn.PluginPortTest do
     # the non-numeric pts line is dropped whole, so the next cast is the last line
     assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, _windows, 3, good_dets}}, 5_000
     assert good_dets == [%{label: "person", score: 0.9, bbox: [0, 0, 1, 1]}]
-    assert Process.alive?(pid)
+    assert %PluginPort{} = :sys.get_state(pid)
   end
 
   test "a malformed bbox never reaches the tracker through the aggregator" do
@@ -158,8 +158,6 @@ defmodule Cairn.PluginPortTest do
         det_line(3, [det("person", "0.9", "[0.01, 0, 0.99, 1]")])
       ]) <> "; exec sleep 30"
 
-    ref = Process.monitor(agg)
-
     pid =
       start_supervised!(
         {PluginPort,
@@ -172,9 +170,10 @@ defmodule Cairn.PluginPortTest do
     # only reachable if the batch *after* the poisoned one was tracked: pre-fix
     # :event_started fired on line 1 and the crash landed on line 2
     assert_receive {:event_updated, %Event{camera_id: ^id}}, 5_000
-    refute_received {:DOWN, ^ref, :process, _, _}
-    assert Process.alive?(agg)
-    assert Process.alive?(pid)
+    # a round-trip through each: the aggregator survived the poisoned batch and
+    # the port survived forwarding it
+    assert %{} = :sys.get_state(agg)
+    assert %PluginPort{} = :sys.get_state(pid)
   end
 
   test "an over-long line is skipped and the next line still parses" do
@@ -191,7 +190,7 @@ defmodule Cairn.PluginPortTest do
       )
 
     assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, _windows, 7, _dets}}, 5_000
-    assert Process.alive?(pid)
+    assert %PluginPort{} = :sys.get_state(pid)
   end
 
   test "one line of many invalid dets emits at most one warning" do

@@ -137,7 +137,7 @@ defmodule Cairn.PluginGroupPortTest do
 
     a_id = a.id
     assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _windows, 3, _dets}}, 5_000
-    assert Process.alive?(pid)
+    assert %PluginGroupPort{} = :sys.get_state(pid)
   end
 
   test "over-long lines are skipped and the next line still routes" do
@@ -149,7 +149,7 @@ defmodule Cairn.PluginGroupPortTest do
 
     a_id = a.id
     assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _windows, 7, _dets}}, 5_000
-    assert Process.alive?(pid)
+    assert %PluginGroupPort{} = :sys.get_state(pid)
   end
 
   test "a line at exactly the 65_536-byte limit still routes" do
@@ -165,7 +165,7 @@ defmodule Cairn.PluginGroupPortTest do
     a_id = a.id
     assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _windows, 11, dets}}, 5_000
     assert [%{label: "person"}] = dets
-    assert Process.alive?(pid)
+    assert %PluginGroupPort{} = :sys.get_state(pid)
   end
 
   test "a line one byte over the limit is dropped and the next line still routes" do
@@ -181,7 +181,7 @@ defmodule Cairn.PluginGroupPortTest do
     a_id = a.id
     assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _windows, pts, _dets}}, 5_000
     assert pts == 13
-    assert Process.alive?(pid)
+    assert %PluginGroupPort{} = :sys.get_state(pid)
   end
 
   test "invalid dets are dropped individually and the valid ones still route" do
@@ -212,7 +212,7 @@ defmodule Cairn.PluginGroupPortTest do
                    5_000
 
     assert good_dets == [%{label: "person", score: 0.9, bbox: [0, 0, 1, 1]}]
-    assert Process.alive?(pid)
+    assert %PluginGroupPort{} = :sys.get_state(pid)
   end
 
   test "a malformed bbox never reaches the tracker through the aggregator" do
@@ -236,7 +236,6 @@ defmodule Cairn.PluginGroupPortTest do
         line(a.id, 3, [det("person", "0.9", "[0.01, 0, 0.99, 1]")])
       ]) <> "; exec sleep 30"
 
-    ref = Process.monitor(agg)
     pid = start_group_port([a], command: command, aggregator: agg)
 
     a_id = a.id
@@ -245,9 +244,10 @@ defmodule Cairn.PluginGroupPortTest do
     # only reachable if the batch *after* the poisoned one was tracked: pre-fix
     # :event_started fired on line 1 and the crash landed on line 2
     assert_receive {:event_updated, %Event{camera_id: ^a_id}}, 5_000
-    refute_received {:DOWN, ^ref, :process, _, _}
-    assert Process.alive?(agg)
-    assert Process.alive?(pid)
+    # a round-trip through each: the aggregator survived the poisoned batch and
+    # the port survived forwarding it
+    assert %{} = :sys.get_state(agg)
+    assert %PluginGroupPort{} = :sys.get_state(pid)
   end
 
   test "refresh swaps the routes without restarting the plugin process" do
@@ -277,7 +277,6 @@ defmodule Cairn.PluginGroupPortTest do
                      _dets}},
                    10_000
 
-    assert Process.alive?(pid)
     assert :sys.get_state(pid).os_pid == os_pid
   end
 
