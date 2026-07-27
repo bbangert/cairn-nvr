@@ -151,6 +151,60 @@ defmodule Cairn.DetectionAggregatorTest do
     assert_receive {:event_updated, %Event{labels: [_, _, %{object_id: ^second}]}}
   end
 
+  test "a repeat of an epoch announced before the first detection does not end tracks", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    # the real order of events for every camera: ffmpeg spawns and mints an
+    # epoch, and only then does the plugin produce anything to track
+    epoch = StreamEpochs.new_epoch(id, :started)
+    _ = :sys.get_state(agg)
+
+    detect(agg, camera)
+    assert_receive {:event_started, %Event{labels: [%{object_id: first}]}}
+
+    # the same mint announced a second time (degraded caller broadcast plus a
+    # late server broadcast). No boundary was crossed, so the track that the
+    # camera's very first epoch already covers must survive
+    send(agg, {:stream_epoch, id, epoch, :started})
+    _ = :sys.get_state(agg)
+
+    detect(agg, camera)
+    assert_receive {:event_updated, %Event{labels: [_, %{object_id: ^first}]}}
+  end
+
+  test "an epoch announced before the first detection still yields to a new one", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    StreamEpochs.new_epoch(id, :started)
+    _ = :sys.get_state(agg)
+
+    detect(agg, camera)
+    assert_receive {:event_started, %Event{labels: [%{object_id: first}]}}
+
+    StreamEpochs.new_epoch(id, :source_lost)
+    _ = :sys.get_state(agg)
+
+    detect(agg, camera)
+    assert_receive {:event_updated, %Event{labels: [_, %{object_id: second}]}}
+    refute second == first
+  end
+
+  test "a stopped camera's epoch is forgotten", %{agg: agg, camera_id: id} do
+    epoch = StreamEpochs.new_epoch(id, :started)
+    _ = :sys.get_state(agg)
+    assert :sys.get_state(agg).epochs[id] == epoch
+
+    # nothing decodes under a :camera_stopped epoch, so remembering it would
+    # only retain a row for a camera that may never come back
+    StreamEpochs.new_epoch(id, :camera_stopped)
+    _ = :sys.get_state(agg)
+    refute Map.has_key?(:sys.get_state(agg).epochs, id)
+  end
+
   test "post-window timeout finalizes", %{agg: agg, camera: camera, camera_id: id} do
     detect(agg, camera)
     assert_receive {:extractor_started, %Event{id: eid}, ex_pid}
