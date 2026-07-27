@@ -64,6 +64,9 @@ defmodule Cairn.DetectionAggregatorTest do
 
   defp token(agg, camera_id, kind), do: :sys.get_state(agg).cameras[camera_id][kind]
 
+  defp live_tracks(agg, camera_id),
+    do: Cairn.Tracker.live_tracks(:sys.get_state(agg).cameras[camera_id].tracker)
+
   defp fire(agg, kind, camera_id, event_id) do
     tk = token(agg, camera_id, if(kind == :post_window, do: :post_token, else: :max_token))
     send(agg, {kind, camera_id, event_id, tk})
@@ -173,8 +176,13 @@ defmodule Cairn.DetectionAggregatorTest do
     epoch = StreamEpochs.new_epoch(id, :source_lost)
     _ = :sys.get_state(agg)
 
+    # positive control for the refute below: a real boundary *does* end the
+    # track it cut, so an aggregator that never ended anything cannot pass
+    assert_receive {:track_ended, %Track{object_id: ^first, end_reason: :stream_reset}}
+
     detect(agg, camera)
     assert_receive {:event_updated, %Event{labels: [_, %{object_id: second}]}}
+    assert_receive {:track_started, %Track{object_id: ^second}}
     refute second == first
 
     # StreamEpochs may announce one mint twice (degraded caller-side broadcast
@@ -182,6 +190,12 @@ defmodule Cairn.DetectionAggregatorTest do
     # the tracks that the first announcement already started
     send(agg, {:stream_epoch, id, epoch, :source_lost})
     _ = :sys.get_state(agg)
+
+    # both halves are load-bearing: no final summary went out, *and* the track
+    # is still in the tracker. Ending it and starting a new one under the same
+    # id would satisfy either one alone.
+    refute_received {:track_ended, _}
+    assert [%Track{object_id: ^second}] = live_tracks(agg, id)
 
     detect(agg, camera)
     assert_receive {:event_updated, %Event{labels: [_, _, %{object_id: ^second}]}}
@@ -199,12 +213,16 @@ defmodule Cairn.DetectionAggregatorTest do
 
     detect(agg, camera)
     assert_receive {:event_started, %Event{labels: [%{object_id: first}]}}
+    assert_receive {:track_started, %Track{object_id: ^first}}
 
     # the same mint announced a second time (degraded caller broadcast plus a
     # late server broadcast). No boundary was crossed, so the track that the
     # camera's very first epoch already covers must survive
     send(agg, {:stream_epoch, id, epoch, :started})
     _ = :sys.get_state(agg)
+
+    refute_received {:track_ended, _}
+    assert [%Track{object_id: ^first}] = live_tracks(agg, id)
 
     detect(agg, camera)
     assert_receive {:event_updated, %Event{labels: [_, %{object_id: ^first}]}}
@@ -240,8 +258,12 @@ defmodule Cairn.DetectionAggregatorTest do
     current = StreamEpochs.new_epoch(id, :source_lost)
     _ = :sys.get_state(agg)
 
+    # positive control, and it clears the mailbox for the refute below
+    assert_receive {:track_ended, %Track{object_id: ^first, end_reason: :stream_reset}}
+
     detect(agg, camera)
     assert_receive {:event_updated, %Event{labels: [_, %{object_id: second}]}}
+    assert_receive {:track_started, %Track{object_id: ^second}}
     refute second == first
 
     # A mint from an earlier millisecond, delivered late: a port's spawn-time
@@ -255,7 +277,11 @@ defmodule Cairn.DetectionAggregatorTest do
 
     assert :sys.get_state(agg).cameras[id].current_epoch == current
 
-    # not a boundary, so the tracks it did not cut stay uncut
+    # not a boundary, so the tracks it did not cut stay uncut — and nothing
+    # was told they ended
+    refute_received {:track_ended, _}
+    assert [%Track{object_id: ^second}] = live_tracks(agg, id)
+
     detect(agg, camera)
     assert_receive {:event_updated, %Event{labels: [_, _, %{object_id: ^second}]}}
   end
