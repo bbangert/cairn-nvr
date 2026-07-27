@@ -18,7 +18,7 @@ defmodule Cairn.PluginGroupPortTest do
     }
   end
 
-  defp group(cameras) do
+  defp group(cameras, name \\ "detect") do
     members =
       cameras
       |> Enum.with_index()
@@ -26,7 +26,7 @@ defmodule Cairn.PluginGroupPortTest do
         %{id: cam.id, udp_port: 19_200 + 4 * index, min_score: cam.min_score}
       end)
 
-    %PluginGroup{name: "detect", command: ["./detect"], members: members}
+    %PluginGroup{name: name, command: ["./detect"], members: members}
   end
 
   defp config(cameras) do
@@ -38,10 +38,17 @@ defmodule Cairn.PluginGroupPortTest do
     }
   end
 
+  # A group port registers under its group name, so a test that runs two of
+  # them at once has to name them apart (and give the supervisor distinct ids).
   defp start_group_port(cameras, opts) do
-    start_supervised!(
-      {PluginGroupPort, [group: group(cameras), config: config(cameras)] |> Keyword.merge(opts)}
-    )
+    {id, opts} = Keyword.pop(opts, :id)
+    {name, opts} = Keyword.pop(opts, :group_name, "detect")
+
+    spec =
+      {PluginGroupPort,
+       [group: group(cameras, name), config: config(cameras)] |> Keyword.merge(opts)}
+
+    if id, do: start_supervised!(spec, id: id), else: start_supervised!(spec)
   end
 
   defp det_line(camera_id, pts, score) do
@@ -149,17 +156,30 @@ defmodule Cairn.PluginGroupPortTest do
     b_id = b.id
 
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^a_id}, windows_a, %Observation{pts: 1} = obs_a}},
+                    {:detections, %Camera{id: ^a_id}, policy_a, %Observation{pts: 1} = obs_a}},
                    5_000
 
-    assert windows_a == %{pre: 5, post: 10, max: 300}
+    assert policy_a == %{
+             pre: 5,
+             post: 10,
+             max: 300,
+             max_unseen_ms: 3_000,
+             max_live_tracks: 128
+           }
+
     assert [%{label: "person", score: 0.9}] = obs_a.objects
 
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^b_id}, windows_b, %Observation{pts: 2}}},
+                    {:detections, %Camera{id: ^b_id}, policy_b, %Observation{pts: 2}}},
                    5_000
 
-    assert windows_b == %{pre: 5, post: 42, max: 300}
+    assert policy_b == %{
+             pre: 5,
+             post: 42,
+             max: 300,
+             max_unseen_ms: 3_000,
+             max_live_tracks: 128
+           }
   end
 
   test "each camera's own min_score applies through the aggregator" do
@@ -202,7 +222,7 @@ defmodule Cairn.PluginGroupPortTest do
     a_id = a.id
 
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^a_id}, _windows, %Observation{pts: 3}}},
+                    {:detections, %Camera{id: ^a_id}, _policy, %Observation{pts: 3}}},
                    5_000
 
     assert %PluginGroupPort{} = :sys.get_state(pid)
@@ -218,7 +238,7 @@ defmodule Cairn.PluginGroupPortTest do
     a_id = a.id
 
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^a_id}, _windows, %Observation{pts: 7}}},
+                    {:detections, %Camera{id: ^a_id}, _policy, %Observation{pts: 7}}},
                    5_000
 
     assert %PluginGroupPort{} = :sys.get_state(pid)
@@ -285,14 +305,14 @@ defmodule Cairn.PluginGroupPortTest do
     a_id = a.id
 
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^a_id}, _windows, %Observation{pts: 1} = obs}},
+                    {:detections, %Camera{id: ^a_id}, _policy, %Observation{pts: 1} = obs}},
                    5_000
 
     assert [%{label: "cat", score: 0.8, bbox: [0.1, 0.1, 0.2, 0.2]}] = obs.objects
 
     # the non-numeric pts line is dropped whole, so the next cast is the last line
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^a_id}, _windows, %Observation{pts: 3} = good}},
+                    {:detections, %Camera{id: ^a_id}, _policy, %Observation{pts: 3} = good}},
                    5_000
 
     assert [%{label: "person", score: 0.9, bbox: [0, 0, 1, 1]}] = good.objects
@@ -347,10 +367,10 @@ defmodule Cairn.PluginGroupPortTest do
     a_id = a.id
 
     assert_receive {:"$gen_cast",
-                    {:detections, %Camera{id: ^a_id}, windows, %Observation{pts: 1}}},
+                    {:detections, %Camera{id: ^a_id}, policy, %Observation{pts: 1}}},
                    5_000
 
-    assert windows.post == 10
+    assert policy.post == 10
     os_pid = :sys.get_state(pid).os_pid
 
     # the group is unchanged; only a camera field the argv never carried moved
@@ -376,7 +396,7 @@ defmodule Cairn.PluginGroupPortTest do
       capture_log(fn ->
         start_group_port([a], command: command, aggregator: self())
         # ordered after all five drops: the port handles lines in order
-        assert_receive {:"$gen_cast", {:detections, _cam, _windows, %Observation{pts: 99}}}, 5_000
+        assert_receive {:"$gen_cast", {:detections, _cam, _policy, %Observation{pts: 99}}}, 5_000
       end)
 
     assert length(Regex.scan(~r/dropped lines\/dets/, log)) == 1
@@ -612,6 +632,77 @@ defmodule Cairn.PluginGroupPortTest do
     # the second line names one member: only that member changes
     assert_receive {:camera_status, ^a_id, %{plugin_status: %{"state" => "degraded"}}}, 5_000
     assert Cairn.CameraStatus.get(b_id).plugin_status["state"] == "ready"
+  end
+
+  # The capability is the plugin's promise that its track ids are stable, and
+  # `Cairn.Tracker` reads that promise off the observation. One plugin process
+  # makes it once, for every member it serves — and the v0 and v1 attribution
+  # paths stamp the flag separately, so both are driven here.
+  test "the object_tracking capability marks every member's observations" do
+    for {capabilities, tracking} <- [{%{"object_tracking" => true}, true}, {%{}, false}] do
+      a = camera("gp_cap_a_#{System.unique_integer([:positive])}")
+      b = camera("gp_cap_b_#{System.unique_integer([:positive])}")
+
+      a_epoch = StreamEpochs.new_epoch(a.id, :started)
+      b_epoch = StreamEpochs.new_epoch(b.id, :started)
+
+      hello =
+        Jason.encode!(%{
+          "spec" => "cairn.plugin",
+          "version" => 1,
+          "type" => "plugin.hello",
+          "hello" => %{
+            "name" => "fake",
+            "supported_versions" => [1],
+            "capabilities" => capabilities
+          }
+        })
+
+      tracked = [Map.put(object("person", 0.9), "track_id", "t1")]
+
+      command =
+        printf([
+          hello,
+          v1_line(a.id, a_epoch, 1, tracked),
+          v1_line(b.id, b_epoch, 1, tracked),
+          # v0 lines are attributed by a separate clause that stamps the flag
+          # of its own; neither port had it under test
+          det_line(a.id, 7, 0.9)
+        ]) <> "; exec sleep 30"
+
+      start_group_port([a, b],
+        command: command,
+        aggregator: self(),
+        group_name: "detect_cap_#{tracking}",
+        id: {:cap, tracking}
+      )
+
+      a_id = a.id
+      b_id = b.id
+
+      assert_receive {:"$gen_cast",
+                      {:detections, %Camera{id: ^a_id}, _policy,
+                       %Observation{protocol: :v1} = obs_a}},
+                     5_000
+
+      assert obs_a.tracking == tracking
+      assert [%{track_id: "t1"}] = obs_a.objects
+
+      assert_receive {:"$gen_cast",
+                      {:detections, %Camera{id: ^b_id}, _policy,
+                       %Observation{protocol: :v1} = obs_b}},
+                     5_000
+
+      assert obs_b.tracking == tracking
+      assert [%{track_id: "t1"}] = obs_b.objects
+
+      assert_receive {:"$gen_cast",
+                      {:detections, %Camera{id: ^a_id}, _policy,
+                       %Observation{protocol: :v0} = obs_v0}},
+                     5_000
+
+      assert obs_v0.tracking == tracking
+    end
   end
 
   test "plugin exit triggers backoff respawn" do

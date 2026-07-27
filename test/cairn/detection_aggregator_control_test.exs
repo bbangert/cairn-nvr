@@ -5,7 +5,7 @@ defmodule Cairn.DetectionAggregatorControlTest do
   alias Cairn.{CameraControl, DetectionAggregator, Event, EventCheckpoint, Observation}
   alias Cairn.Config.Camera
 
-  @windows %{pre: 5, post: 10, max: 300}
+  @policy %{pre: 5, post: 10, max: 300, max_unseen_ms: 3_000}
 
   setup do
     camera_id = "aggc_#{System.unique_integer([:positive])}"
@@ -47,7 +47,7 @@ defmodule Cairn.DetectionAggregatorControlTest do
       ]
     }
 
-    DetectionAggregator.detections(agg, camera, @windows, observation)
+    DetectionAggregator.detections(agg, camera, @policy, observation)
   end
 
   # `detections/4` is an async cast; flushing the aggregator's mailbox with

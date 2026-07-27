@@ -69,6 +69,56 @@ defmodule CairnWeb.Api.EventStreamTest do
   test "unknown messages are ignored" do
     assert SSE.frame_for({:something_else, 1}) == :ignore
   end
+
+  describe "track lifecycle frames" do
+    defp track do
+      %Cairn.Track{
+        object_id: "01J8ZQ0P8B7X0N2R4C6D8E0F2G",
+        camera_id: "cam_a",
+        label: "person",
+        score: 0.81,
+        best_score: 0.9,
+        bbox: [0.1, 0.1, 0.2, 0.4],
+        source: :plugin,
+        plugin_track_id: "t1",
+        epoch: "01J8ZQ0P8B7X0N2R4C6D8E0F2G",
+        started_at: ~U[2026-07-24 00:00:00Z],
+        last_seen_at: ~U[2026-07-24 00:00:02Z],
+        last_detected_at: ~U[2026-07-24 00:00:01Z]
+      }
+    end
+
+    test "started and updated carry the full identity" do
+      assert {:ok, frame} = SSE.frame_for({:track_started, track()})
+      assert frame =~ "event: track_started\n"
+      assert frame =~ ~s("object_id":"01J8ZQ0P8B7X0N2R4C6D8E0F2G")
+      assert frame =~ ~s("camera_id":"cam_a")
+      assert frame =~ ~s("label":"person")
+      assert frame =~ ~s("best_score":0.9)
+      assert frame =~ ~s("source":"plugin")
+      assert frame =~ ~s("plugin_track_id":"t1")
+      assert frame =~ ~s("stale_predicted":false)
+      assert frame =~ ~s("end_reason":null)
+      assert String.ends_with?(frame, "\n\n")
+
+      assert {:ok, updated} = SSE.frame_for({:track_updated, track()})
+      assert updated =~ "event: track_updated\n"
+    end
+
+    # ONVIF AN §A.10: the final summary stands on its own — a client that
+    # missed every other frame still learns what the track was.
+    test "the final frame is self-contained and names its end reason" do
+      final = Cairn.TrackAssertions.assert_self_contained(%{track() | end_reason: :stream_reset})
+
+      assert {:ok, frame} = SSE.frame_for({:track_ended, final})
+
+      assert frame =~ "event: track_ended\n"
+      assert frame =~ ~s("end_reason":"stream_reset")
+      assert frame =~ ~s("label":"person")
+      assert frame =~ ~s("started_at":"2026-07-24T00:00:00Z")
+      assert frame =~ ~s("last_seen_at":"2026-07-24T00:00:02Z")
+    end
+  end
 end
 
 defmodule CairnWeb.Api.EventStreamEndpointTest do

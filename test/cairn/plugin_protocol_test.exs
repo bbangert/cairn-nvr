@@ -280,6 +280,40 @@ defmodule Cairn.PluginProtocolTest do
                PluginProtocol.decode_line(line, :group)
     end
 
+    # A `track_id` reaches `Cairn.Track.plugin_track_id` and the SSE frames
+    # built from it: a value `Jason.encode/1` refuses drops the *whole* frame,
+    # which is selective suppression of a chosen track's lifecycle, and control
+    # bytes would reach an operator's terminal through any log line.
+    test "unprintable track ids are refused, like labels" do
+      for {name, id} <- [
+            {"NUL byte", "t\0" <> "1"},
+            {"ANSI escape", "\e[2Jt1"},
+            {"tab", "t\t1"}
+          ] do
+        line = v1(%{"objects" => [Map.put(@base, "track_id", id)]})
+
+        assert {:objects, %{objects: [], invalid_objects: 1}} =
+                 PluginProtocol.decode_line(line, :group),
+               "#{name} was accepted as a track_id"
+
+        ended = v1(%{"objects" => [], "ended_tracks" => [id]})
+        assert PluginProtocol.decode_line(ended, :group) == {:error, :invalid_ended_tracks}
+      end
+    end
+
+    # Invalid UTF-8 is the case the SSE encoder cannot survive. Jason rejects
+    # it before the codec ever sees it — both as raw bytes and as an unpaired
+    # surrogate escape — so the line dies as malformed JSON. Pinned here
+    # because the printability rule above is what would have to hold if a
+    # future decoder were laxer.
+    test "invalid UTF-8 in a track id cannot reach an observation" do
+      raw = <<"{\"track_id\":\"", 0xFF, "\"}">>
+      assert PluginProtocol.decode_line(raw, :group) == {:error, :malformed_json}
+
+      surrogate = ~s({"spec":"cairn.plugin","track_id":"\\udead"})
+      assert PluginProtocol.decode_line(surrogate, :group) == {:error, :malformed_json}
+    end
+
     # Jason decodes JSON integer tokens at arbitrary precision. Unbounded,
     # `Observation.media_ms/2` (pts / den * num * 1000) raises ArithmeticError
     # on a value no float can hold — which killed the port, and the plugin
