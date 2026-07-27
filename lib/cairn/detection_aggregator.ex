@@ -2,8 +2,9 @@ defmodule Cairn.DetectionAggregator do
   @moduledoc """
   Owns the event lifecycle, one active event per camera.
 
-  Receives decoded detection batches from `Cairn.PluginPort`, filters by
-  per-label `min_score`, assigns stable object ids (`Cairn.Tracker`), and:
+  Receives decoded `Cairn.Observation`s from `Cairn.PluginPort` /
+  `Cairn.PluginGroupPort`, filters by per-label `min_score`, assigns stable
+  object ids (`Cairn.Tracker`), and:
 
     * no active event + detection -> starts a `Cairn.EventExtractor` and
       broadcasts `{:event_started, event}` on `"events"`
@@ -11,6 +12,12 @@ defmodule Cairn.DetectionAggregator do
       the post-window timer, broadcasts `{:event_updated, event}`
     * `post_window` seconds of quiet -> finalizes; `max_event` seconds ->
       finalizes and lets the next detection open a fresh event
+
+  Event times come from the observation, not from the clock: `started_at`,
+  `labels[].t` and `trigger.t` derive from `observation.observed_at`, which a
+  v1 plugin captured next to the frame. Wall-clock time is still what closes
+  an event — `ended_at`, the post-window and max-event timers — because
+  quiet produces no observations to measure quiet with.
 
   Subscribes to `Cairn.StreamEpochs`: a new epoch for a camera resets that
   camera's tracker, so object ids are never inherited across an outage.
@@ -24,7 +31,7 @@ defmodule Cairn.DetectionAggregator do
 
   require Logger
 
-  alias Cairn.{CameraControl, Event, EventCheckpoint, StreamEpochs, Tracker}
+  alias Cairn.{CameraControl, Event, EventCheckpoint, Observation, StreamEpochs, Tracker}
 
   @max_label_entries 5_000
 
@@ -35,10 +42,10 @@ defmodule Cairn.DetectionAggregator do
     end
   end
 
-  @doc "Called by `Cairn.PluginPort` with a decoded, config-tagged batch."
-  @spec detections(GenServer.server(), Cairn.Config.Camera.t(), map(), number(), [map()]) :: :ok
-  def detections(server \\ __MODULE__, camera, windows, pts, dets) do
-    GenServer.cast(server, {:detections, camera, windows, pts, dets})
+  @doc "Called by the plugin ports with a decoded, config-tagged observation."
+  @spec detections(GenServer.server(), Cairn.Config.Camera.t(), map(), Observation.t()) :: :ok
+  def detections(server \\ __MODULE__, camera, windows, %Observation{} = observation) do
+    GenServer.cast(server, {:detections, camera, windows, observation})
   end
 
   # -- server -----------------------------------------------------------------
@@ -61,32 +68,56 @@ defmodule Cairn.DetectionAggregator do
   end
 
   @impl true
-  def handle_cast({:detections, camera, windows, pts, dets}, state) do
+  def handle_cast({:detections, camera, windows, observation}, state) do
     control = CameraControl.get(camera.id)
 
-    if control.detection_enabled do
-      {:noreply, process_detections(state, camera, windows, pts, dets, control)}
-    else
-      # detection disabled at runtime: drop the batch. An in-flight event is
-      # left to finalize naturally on its post-window timer.
-      {:noreply, state}
+    cond do
+      not control.detection_enabled ->
+        # detection disabled at runtime: drop the batch. An in-flight event is
+        # left to finalize naturally on its post-window timer.
+        {:noreply, state}
+
+      stale?(state, camera.id, observation) ->
+        {:noreply, state}
+
+      true ->
+        {:noreply, process_detections(state, camera, windows, observation, control)}
     end
   end
 
-  defp process_detections(state, camera, windows, pts, dets, control) do
-    cam = cam_state(state, camera.id)
-    {tracker, tagged} = Tracker.track(cam.tracker, dets)
-    cam = %{cam | tracker: tracker}
+  # Belt and braces: the ports already refuse observations from an epoch that
+  # is no longer current, and this closes the window where a port's line and
+  # the epoch broadcast cross. An observation with no epoch (v0 before the
+  # first ffmpeg spawn) is accepted, as is the first one seen for a camera.
+  defp stale?(_state, _camera_id, %Observation{epoch: nil}), do: false
 
-    passing = Enum.filter(tagged, &passes_min_score?(&1, effective_min_score(camera, control)))
+  defp stale?(state, camera_id, %Observation{epoch: epoch}) do
+    case cam_state(state, camera_id).current_epoch do
+      nil -> false
+      ^epoch -> false
+      _other -> true
+    end
+  end
+
+  defp process_detections(state, camera, windows, observation, control) do
+    cam = cam_state(state, camera.id)
+    {tracker, tagged} = Tracker.track(cam.tracker, observation.objects)
+    cam = %{cam | tracker: tracker, current_epoch: cam.current_epoch || observation.epoch}
+
+    # Predicted ("tracked") objects keep the tracker warm but are not
+    # evidence: they can neither open an event nor hold one open.
+    min_score = effective_min_score(camera, control)
+
+    passing =
+      Enum.filter(tagged, &(Observation.detected?(&1) and passes_min_score?(&1, min_score)))
 
     cam =
       cond do
         passing == [] -> cam
         # recording disabled: evaluate detections but don't open a new event
         cam.event == nil and not control.recording_enabled -> cam
-        cam.event == nil -> start_event(state, camera, windows, pts, passing, cam)
-        true -> update_event(cam, windows, passing)
+        cam.event == nil -> start_event(state, camera, windows, observation, passing, cam)
+        true -> update_event(cam, windows, observation, passing)
       end
 
     put_cam(state, camera.id, cam)
@@ -177,13 +208,15 @@ defmodule Cairn.DetectionAggregator do
 
   # -- lifecycle --------------------------------------------------------------
 
-  defp start_event(state, camera, windows, _pts, dets, cam) do
+  defp start_event(state, camera, windows, observation, dets, cam) do
+    observed_at = observation.observed_at
+
     event = %Event{
       id: Ecto.UUID.generate(),
       camera_id: camera.id,
-      started_at: now(),
+      started_at: observed_at,
       status: :active,
-      labels: label_entries([], dets, now()),
+      labels: label_entries([], dets, observed_at, observed_at),
       max_scores: max_scores(%{}, dets),
       trigger: best_trigger(nil, dets, 0.0)
     }
@@ -215,19 +248,20 @@ defmodule Cairn.DetectionAggregator do
     end
   end
 
-  defp update_event(%{event: event} = cam, windows, dets) do
+  defp update_event(%{event: event} = cam, windows, observation, dets) do
     max_scores = max_scores(event.max_scores, dets)
+    observed_at = observation.observed_at
 
     event = %{
       event
-      | labels: label_entries(event.labels, dets, event.started_at),
+      | labels: label_entries(event.labels, dets, event.started_at, observed_at),
         max_scores: max_scores,
         max_score: max_scores |> Map.values() |> Enum.max(fn -> nil end),
         trigger:
           best_trigger(
             event.trigger,
             dets,
-            DateTime.diff(now(), event.started_at, :millisecond) / 1000
+            DateTime.diff(observed_at, event.started_at, :millisecond) / 1000
           )
     }
 
@@ -302,8 +336,8 @@ defmodule Cairn.DetectionAggregator do
     det.score >= threshold
   end
 
-  defp label_entries(entries, dets, started_at) do
-    t = DateTime.diff(now(), started_at, :millisecond) / 1000
+  defp label_entries(entries, dets, started_at, observed_at) do
+    t = DateTime.diff(observed_at, started_at, :millisecond) / 1000
 
     new =
       for det <- dets do

@@ -5,7 +5,7 @@ defmodule Cairn.PluginPortTest do
   import ExUnit.CaptureLog
 
   alias Cairn.Config.Camera
-  alias Cairn.{DetectionAggregator, Event, PluginPort}
+  alias Cairn.{DetectionAggregator, Event, Observation, PluginPort, StreamEpochs}
 
   @mock Path.absname("priv/plugins/mock/mock_plugin.exs")
   @timeline Path.absname("test/support/fixtures/timelines/person_walkthrough.json")
@@ -32,6 +32,52 @@ defmodule Cairn.PluginPortTest do
     ~s({"label": "#{label}", "score": #{score}, "bbox": #{bbox}})
   end
 
+  defp v1_line(camera_id, epoch, sequence, objects) do
+    Jason.encode!(%{
+      "spec" => "cairn.plugin",
+      "version" => 1,
+      "type" => "frame.objects",
+      "camera_id" => camera_id,
+      "stream_epoch" => epoch,
+      "sequence" => sequence,
+      "frame" => %{"pts" => sequence * 3_000, "observed_at" => "2026-07-26T12:00:00Z"},
+      "objects" => objects
+    })
+  end
+
+  defp object(label, score) do
+    %{"label" => label, "score" => score, "bbox" => [0.1, 0.1, 0.2, 0.4]}
+  end
+
+  # A plugin that reads its stdin and appends every control line to a file:
+  # the only way to see what the port actually wrote.
+  defp stdin_recorder do
+    path =
+      Path.join(System.tmp_dir!(), "cairn_control_#{System.unique_integer([:positive])}.ndjson")
+
+    on_exit(fn -> File.rm(path) end)
+    {path, ~s(while IFS= read -r line; do printf '%s\\n' "$line" >> #{path}; done)}
+  end
+
+  # Flunks rather than returning what it has: a "the port wrote it" assertion
+  # must not pass on a timeout.
+  defp await_control(path, count, attempts \\ 200) do
+    lines =
+      case File.read(path) do
+        {:ok, contents} ->
+          contents |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+
+        {:error, _} ->
+          []
+      end
+
+    cond do
+      length(lines) >= count -> lines
+      attempts == 0 -> flunk("plugin received #{length(lines)} control lines, wanted #{count}")
+      true -> Process.sleep(25) && await_control(path, count, attempts - 1)
+    end
+  end
+
   test "build_argv appends contract arguments" do
     argv = PluginPort.build_argv(camera("c"), 17_002)
 
@@ -44,6 +90,10 @@ defmodule Cairn.PluginPortTest do
   test "mock plugin timeline drives the aggregator through a full Port" do
     id = "plug_#{System.unique_integer([:positive])}"
     test_pid = self()
+
+    # the mock speaks v1: it stamps its lines with the epoch the port hands it
+    # on stdin, and the port drops anything from another epoch
+    StreamEpochs.new_epoch(id, :started)
 
     agg =
       start_supervised!(
@@ -128,12 +178,18 @@ defmodule Cairn.PluginPortTest do
          camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
       )
 
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, _windows, 1, dets}}, 5_000
-    assert dets == [%{label: "cat", score: 0.8, bbox: [0.1, 0.1, 0.2, 0.2]}]
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^id}, _windows, %Observation{pts: 1} = obs}},
+                   5_000
+
+    assert [%{label: "cat", score: 0.8, bbox: [0.1, 0.1, 0.2, 0.2]}] = obs.objects
 
     # the non-numeric pts line is dropped whole, so the next cast is the last line
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, _windows, 3, good_dets}}, 5_000
-    assert good_dets == [%{label: "person", score: 0.9, bbox: [0, 0, 1, 1]}]
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^id}, _windows, %Observation{pts: 3} = good}},
+                   5_000
+
+    assert [%{label: "person", score: 0.9, bbox: [0, 0, 1, 1]}] = good.objects
     assert %PluginPort{} = :sys.get_state(pid)
   end
 
@@ -189,7 +245,10 @@ defmodule Cairn.PluginPortTest do
          camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
       )
 
-    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, _windows, 7, _dets}}, 5_000
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^id}, _windows, %Observation{pts: 7}}},
+                   5_000
+
     assert %PluginPort{} = :sys.get_state(pid)
   end
 
@@ -209,11 +268,181 @@ defmodule Cairn.PluginPortTest do
         )
 
         # ordered after the flood: the port handles lines in order
-        assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, _windows, 2, _dets}}, 5_000
+        assert_receive {:"$gen_cast",
+                        {:detections, %Camera{id: ^id}, _windows, %Observation{pts: 2}}},
+                       5_000
       end)
 
     assert length(Regex.scan(~r/dropped lines\/dets/, log)) == 1
     assert log =~ "invalid_det ×60 (60 total)"
+  end
+
+  test "the plugin is told the current epoch on spawn and every change after" do
+    id = "plug_ctl_#{System.unique_integer([:positive])}"
+    first = StreamEpochs.new_epoch(id, :started)
+    {path, command} = stdin_recorder()
+
+    start_supervised!(
+      {PluginPort,
+       camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
+    )
+
+    # pulled from ETS at spawn: no broadcast is involved, so nothing is lost
+    # when the plugin starts after the stream did
+    assert [started] = await_control(path, 1)
+
+    assert %{
+             "spec" => "cairn.plugin",
+             "version" => 1,
+             "type" => "stream.started",
+             "camera_id" => ^id,
+             "stream_epoch" => ^first,
+             "rtp" => %{"clock_rate" => 90_000}
+           } = started
+
+    # a new epoch ends the one the plugin knows about, then starts the new one
+    second = StreamEpochs.new_epoch(id, :source_lost)
+    assert [_, ended, restarted] = await_control(path, 3)
+
+    assert %{"type" => "stream.ended", "stream_epoch" => ^first, "reason" => "source_lost"} =
+             ended
+
+    assert %{"type" => "stream.started", "stream_epoch" => ^second} = restarted
+
+    # :camera_stopped mints an epoch nothing streams under: it ends the live
+    # stream and starts nothing
+    StreamEpochs.new_epoch(id, :camera_stopped)
+    assert [_, _, _, stopped] = await_control(path, 4)
+
+    assert %{"type" => "stream.ended", "stream_epoch" => ^second, "reason" => "camera_stopped"} =
+             stopped
+
+    Process.sleep(50)
+    assert length(await_control(path, 4)) == 4
+  end
+
+  test "a plugin that never reads stdin costs drops, not the port" do
+    id = "plug_deaf_#{System.unique_integer([:positive])}"
+    StreamEpochs.new_epoch(id, :started)
+
+    pid =
+      start_supervised!({
+        PluginPort,
+        # `exec` so the port's SIGTERM reaches the sleep itself: a plain
+        # `sleep` is a child of the sh the port kills, and would outlive the
+        # test holding its inherited stdout open
+        camera: camera(id),
+        config: config(),
+        index: 0,
+        command: "exec sleep 60",
+        aggregator: self()
+      })
+
+    # far more than the pipe buffer plus the port's busy watermark, so the
+    # writes must go through the :nosuspend path that drops instead of blocking
+    capture_log(fn -> for _ <- 1..1_000, do: StreamEpochs.new_epoch(id, :stall_bounce) end)
+
+    state = :sys.get_state(pid)
+    assert Process.alive?(pid)
+    assert state.drops[:control_stdin_busy] > 0
+    # the port kept up: the last epoch minted is the one it recorded
+    assert {epoch, :live} = state.epoch
+    assert {:ok, ^epoch} = StreamEpochs.current(id)
+  end
+
+  test "stale-epoch lines are dropped and sequence gaps are counted" do
+    id = "plug_seq_#{System.unique_integer([:positive])}"
+    epoch = StreamEpochs.new_epoch(id, :started)
+    test_pid = self()
+
+    handler = "seq_gap_#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:cairn, :plugin, :sequence_gap],
+      fn _event, measurements, metadata, _ -> send(test_pid, {:gap, measurements, metadata}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    command =
+      printf([
+        v1_line(id, epoch, 1, [object("person", 0.9)]),
+        v1_line(id, "01OTHEREPOCH0000000000000", 2, [object("person", 0.9)]),
+        v1_line(id, epoch, 5, [object("person", 0.9)])
+      ]) <> "; sleep 30"
+
+    pid =
+      start_supervised!(
+        {PluginPort,
+         camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
+      )
+
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, _w, %Observation{sequence: 1}}},
+                   5_000
+
+    # the stale line never reaches the aggregator; the next good one does
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, _w, %Observation{sequence: 5}}},
+                   5_000
+
+    # sequences 2..4 (the stale line's number included) are a gap of 3
+    assert_receive {:gap, %{count: 3}, %{camera_id: ^id}}, 5_000
+    assert :sys.get_state(pid).drops == %{stale_epoch: 1, sequence_gap: 3}
+  end
+
+  test "hello and status reach the log and CameraStatus" do
+    id = "plug_hello_#{System.unique_integer([:positive])}"
+
+    hello =
+      Jason.encode!(%{
+        "spec" => "cairn.plugin",
+        "version" => 1,
+        "type" => "plugin.hello",
+        "hello" => %{
+          "name" => "fake-detect",
+          "version" => "9.9",
+          "supported_versions" => [2],
+          "capabilities" => %{"object_tracking" => true}
+        }
+      })
+
+    status =
+      Jason.encode!(%{
+        "spec" => "cairn.plugin",
+        "version" => 1,
+        "type" => "plugin.status",
+        "status" => %{"state" => "ready", "detail" => "model loaded"}
+      })
+
+    Cairn.CameraStatus.subscribe()
+    on_exit(fn -> Cairn.CameraStatus.prune(Map.keys(Cairn.CameraStatus.all()) -- [id]) end)
+
+    # the hello line is info, and the suite runs at :warning
+    previous_level = Logger.level()
+    Logger.configure(level: :info)
+    on_exit(fn -> Logger.configure(level: previous_level) end)
+
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!(
+            {PluginPort,
+             camera: camera(id),
+             config: config(),
+             index: 0,
+             command: printf([hello, status]) <> "; sleep 30",
+             aggregator: self()}
+          )
+
+        assert_receive {:camera_status, ^id, info}, 5_000
+        assert info.plugin_status == %{"state" => "ready", "detail" => "model loaded"}
+
+        assert %{"name" => "fake-detect"} = :sys.get_state(pid).plugin
+      end)
+
+    assert log =~ "plugin hello — fake-detect 9.9"
+    assert log =~ "does not list protocol 1 in supported_versions"
   end
 
   test "plugin exit triggers backoff respawn" do

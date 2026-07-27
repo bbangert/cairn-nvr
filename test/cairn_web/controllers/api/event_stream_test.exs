@@ -41,6 +41,21 @@ defmodule CairnWeb.Api.EventStreamTest do
     assert status =~ "event: camera_status\n"
   end
 
+  test "the camera_status frame carries the plugin's own reported state" do
+    assert {:ok, frame} =
+             SSE.frame_for(
+               {:camera_status, "cam_a",
+                %{
+                  status: :running,
+                  probe: nil,
+                  plugin_status: %{"state" => "degraded", "detail" => "decoder fallback"}
+                }}
+             )
+
+    assert frame =~ ~s("plugin_status":{)
+    assert frame =~ ~s("state":"degraded")
+  end
+
   test "an error-tuple probe is sanitized rather than crashing the encode" do
     assert {:ok, frame} =
              SSE.frame_for(

@@ -1,11 +1,12 @@
 defmodule Cairn.CameraStatus do
   @moduledoc """
   ETS-backed per-camera runtime status (`:connecting | :running | :backoff |
-  :stalled | :transcode_unavailable`) plus probe results (Phase 8), with
-  PubSub change notifications on `"cameras:status"`.
+  :stalled | :transcode_unavailable`) plus probe results (Phase 8) and the
+  last `plugin.status` the camera's plugin reported, with PubSub change
+  notifications on `"cameras:status"`.
 
-  Written by `Cairn.FFmpegPort` / the watchdog; read by the dashboard and
-  config LiveViews.
+  Written by `Cairn.FFmpegPort` / the watchdog and by the plugin ports; read
+  by the dashboard and config LiveViews and by the HA API.
   """
 
   use GenServer
@@ -28,6 +29,13 @@ defmodule Cairn.CameraStatus do
   @spec set_probe(String.t(), map() | {:error, term()}) :: :ok
   def set_probe(camera_id, probe), do: merge(camera_id, %{probe: probe})
 
+  @doc """
+  Stores the plugin's own last reported state (a decoded `plugin.status`
+  payload — string-keyed and JSON-safe, since it arrived as JSON).
+  """
+  @spec set_plugin_status(String.t(), map() | nil) :: :ok
+  def set_plugin_status(camera_id, status), do: merge(camera_id, %{plugin_status: status})
+
   @spec merge(String.t(), map()) :: :ok
   def merge(camera_id, attrs) when is_map(attrs) do
     GenServer.cast(__MODULE__, {:merge, camera_id, attrs})
@@ -37,7 +45,7 @@ defmodule Cairn.CameraStatus do
   def get(camera_id) do
     case :ets.lookup(@table, camera_id) do
       [{^camera_id, info}] -> info
-      [] -> %{status: :unknown, probe: nil}
+      [] -> %{status: :unknown, probe: nil, plugin_status: nil}
     end
   end
 
