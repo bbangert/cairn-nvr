@@ -390,8 +390,7 @@ defmodule Cairn.PluginGroupPortTest do
     Process.sleep(50)
     assert length(await_control(path, 4)) == 4
 
-    assert Process.alive?(pid)
-    assert :sys.get_state(pid).os_pid == os_pid
+    assert %PluginGroupPort{os_pid: ^os_pid} = :sys.get_state(pid)
   end
 
   test "status routes to the named member, or to all of them" do
@@ -411,7 +410,7 @@ defmodule Cairn.PluginGroupPortTest do
       printf([
         status.(%{"status" => %{"state" => "ready"}}),
         status.(%{"camera_id" => a.id, "status" => %{"state" => "degraded"}})
-      ]) <> "; sleep 30"
+      ]) <> "; exec sleep 30"
 
     Cairn.CameraStatus.subscribe()
 

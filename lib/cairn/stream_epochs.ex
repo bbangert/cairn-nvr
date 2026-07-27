@@ -100,6 +100,12 @@ defmodule Cairn.StreamEpochs do
     # the epoch is the caller's; this server never mints one of its own. See
     # new_epoch/3 for why.
     #
+    # Open question, deliberately unanswered: two calls minted close together
+    # can be served out of order, rolling `current/1` back to an older but
+    # legitimate epoch (plain ULIDs only order across milliseconds). A
+    # per-camera monotonic guard — ignore an insert whose epoch sorts below
+    # the stored one — would go here, ahead of the insert.
+    #
     # insert before the broadcast: a subscriber reacting to {:stream_epoch, e}
     # by calling current/1 must never read something staler than e
     :ets.insert(@table, {camera_id, epoch, DateTime.utc_now()})

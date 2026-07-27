@@ -343,7 +343,8 @@ defmodule Cairn.PluginPortTest do
     capture_log(fn -> for _ <- 1..1_000, do: StreamEpochs.new_epoch(id, :stall_bounce) end)
 
     state = :sys.get_state(pid)
-    assert Process.alive?(pid)
+    assert %PluginPort{} = state
+    # the plugin never read its stdin, so the writes were dropped, not queued
     assert state.drops[:control_stdin_busy] > 0
     # the port kept up: the last epoch minted is the one it recorded
     assert {epoch, :live} = state.epoch
@@ -371,7 +372,7 @@ defmodule Cairn.PluginPortTest do
         v1_line(id, epoch, 1, [object("person", 0.9)]),
         v1_line(id, "01OTHEREPOCH0000000000000", 2, [object("person", 0.9)]),
         v1_line(id, epoch, 5, [object("person", 0.9)])
-      ]) <> "; sleep 30"
+      ]) <> "; exec sleep 30"
 
     pid =
       start_supervised!(
@@ -431,7 +432,7 @@ defmodule Cairn.PluginPortTest do
              camera: camera(id),
              config: config(),
              index: 0,
-             command: printf([hello, status]) <> "; sleep 30",
+             command: printf([hello, status]) <> "; exec sleep 30",
              aggregator: self()}
           )
 

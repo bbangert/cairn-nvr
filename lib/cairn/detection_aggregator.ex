@@ -87,15 +87,41 @@ defmodule Cairn.DetectionAggregator do
 
   # Belt and braces: the ports already refuse observations from an epoch that
   # is no longer current, and this closes the window where a port's line and
-  # the epoch broadcast cross. An observation with no epoch (v0 before the
-  # first ffmpeg spawn) is accepted, as is the first one seen for a camera.
+  # the epoch broadcast cross. Compared against the same `current_epoch` the
+  # epoch broadcast maintains — including for a camera with no tracker state
+  # yet, whose announced epoch is remembered in `epochs`.
+  #
+  # An observation with no epoch (v0 before the first ffmpeg spawn) is
+  # accepted, as is one for a camera whose epoch is not known here yet: that
+  # first observation's epoch is adopted in `process_detections/5`.
   defp stale?(_state, _camera_id, %Observation{epoch: nil}), do: false
 
   defp stale?(state, camera_id, %Observation{epoch: epoch}) do
-    case cam_state(state, camera_id).current_epoch do
-      nil -> false
-      ^epoch -> false
-      _other -> true
+    case current_epoch(state, camera_id) do
+      nil ->
+        false
+
+      ^epoch ->
+        false
+
+      _other ->
+        # Rare by construction, so it is counted rather than logged per line:
+        # a steady rate here means a port is forwarding across a boundary.
+        :telemetry.execute([:cairn, :aggregator, :stale_observation], %{count: 1}, %{
+          camera_id: camera_id
+        })
+
+        Logger.debug("camera #{camera_id}: dropped observation from stale epoch #{epoch}")
+        true
+    end
+  end
+
+  # The camera's own state is authoritative once it exists; before that, the
+  # last announced epoch is all there is.
+  defp current_epoch(state, camera_id) do
+    case state.cameras do
+      %{^camera_id => cam} -> cam.current_epoch
+      _absent -> state.epochs[camera_id]
     end
   end
 
@@ -154,13 +180,12 @@ defmodule Cairn.DetectionAggregator do
   # straddle the boundary never reports one id for two objects. An in-flight
   # event keeps running and finalizes on its own timers.
   #
-  # Known residual race: detection casts already in flight when this arrives
-  # are processed *after* the reset. They come from the plugin ports, not from
-  # `Cairn.StreamEpochs`, and the BEAM only orders messages per sender pair, so
-  # a batch from before the boundary can seed the fresh tracker. Closing it
-  # needs the epoch to travel with the batch (tagged at the producer, stale
-  # batches dropped here), which is protocol v1 Phase 2; `current_epoch` is
-  # stored as the anchor that comparison will read.
+  # Detection casts already in flight when this arrives are processed *after*
+  # the reset: they come from the plugin ports, not from `Cairn.StreamEpochs`,
+  # and the BEAM only orders messages per sender pair, so a batch from before
+  # the boundary would otherwise seed the fresh tracker. The epoch now travels
+  # with the batch — tagged at the producer, compared in `stale?/3` against the
+  # `current_epoch` stored here — so such a batch is dropped instead.
   def handle_info({:stream_epoch, camera_id, epoch, reason}, state) do
     state = remember_epoch(state, camera_id, epoch, reason)
 
