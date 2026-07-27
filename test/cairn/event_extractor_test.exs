@@ -1,8 +1,8 @@
 defmodule Cairn.EventExtractorTest do
   use Cairn.DataCase, async: false
 
-  alias Cairn.Config.Camera
   alias Cairn.{Config, Event, EventExtractor, Events, MP4.Demuxer, Reconciler, RingBuffer}
+  alias Cairn.Config.Camera
 
   @fixture "test/support/fixtures/media/testsrc.fmp4"
 
@@ -25,7 +25,14 @@ defmodule Cairn.EventExtractorTest do
     start_supervised!({RingBuffer, camera_id: camera_id, pre_window_seconds: 60})
 
     {init_meta, frags} = fixture_events(camera_id)
-    RingBuffer.put_init(camera_id, init_meta.data, init_meta.codec, init_meta.timescale)
+
+    RingBuffer.put_init(
+      camera_id,
+      init_meta.data,
+      init_meta.codec,
+      init_meta.timescale,
+      Cairn.ULID.generate()
+    )
 
     %{camera: camera, config: config, dir: dir, init: init_meta, frags: frags}
   end

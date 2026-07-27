@@ -23,6 +23,13 @@ defmodule Cairn.Tracker do
   @spec new() :: t()
   def new, do: %__MODULE__{}
 
+  @doc """
+  Drops every tracked object while keeping the id counter, so nothing
+  matches across the cut and no id is ever handed out twice.
+  """
+  @spec reset(t()) :: t()
+  def reset(%__MODULE__{} = tracker), do: %{tracker | objects: %{}}
+
   @doc "Returns `{tracker, detections_with_object_id}`."
   @spec track(t(), [detection()]) :: {t(), [map()]}
   def track(%__MODULE__{} = tracker, dets) do

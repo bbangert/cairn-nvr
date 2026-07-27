@@ -28,6 +28,8 @@ defmodule Cairn.Application do
       {Cairn.EventSupervisor, []},
       # Groups before cameras: a group listens on its members' UDP ports
       {Cairn.PluginGroupSupervisor, []},
+      # Before the cameras that mint epochs into it
+      {Cairn.StreamEpochs, []},
       {Cairn.CameraSupervisor, []},
       {Cairn.Retention, []},
       {CairnWeb.WebRTC.Supervisor, []},

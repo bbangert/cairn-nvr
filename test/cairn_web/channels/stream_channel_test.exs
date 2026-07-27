@@ -10,7 +10,7 @@ defmodule CairnWeb.StreamChannelTest do
 
   setup do
     start_supervised!({RingBuffer, camera_id: @camera, pre_window_seconds: 60})
-    RingBuffer.put_init(@camera, <<"INIT">>, "avc1.64001f", @timescale)
+    RingBuffer.put_init(@camera, <<"INIT">>, "avc1.64001f", @timescale, Cairn.ULID.generate())
     put_fragment(0)
 
     {:ok, _, socket} =
@@ -44,7 +44,7 @@ defmodule CairnWeb.StreamChannelTest do
 
   test "new init segment (ffmpeg respawn) is re-pushed" do
     assert_push "init", {:binary, <<"INIT">>}
-    RingBuffer.put_init(@camera, <<"INIT2">>, "avc1.64001f", @timescale)
+    RingBuffer.put_init(@camera, <<"INIT2">>, "avc1.64001f", @timescale, Cairn.ULID.generate())
     assert_push "init", {:binary, <<"INIT2">>}
   end
 

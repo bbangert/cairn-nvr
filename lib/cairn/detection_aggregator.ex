@@ -12,6 +12,9 @@ defmodule Cairn.DetectionAggregator do
     * `post_window` seconds of quiet -> finalizes; `max_event` seconds ->
       finalizes and lets the next detection open a fresh event
 
+  Subscribes to `Cairn.StreamEpochs`: a new epoch for a camera resets that
+  camera's tracker, so object ids are never inherited across an outage.
+
   Active events are checkpointed to `Cairn.EventCheckpoint` (ETS owned
   elsewhere): on restart the aggregator re-attaches to live extractors and
   finalizes orphans.
@@ -21,7 +24,7 @@ defmodule Cairn.DetectionAggregator do
 
   require Logger
 
-  alias Cairn.{CameraControl, Event, EventCheckpoint, Tracker}
+  alias Cairn.{CameraControl, Event, EventCheckpoint, StreamEpochs, Tracker}
 
   @max_label_entries 5_000
 
@@ -42,8 +45,14 @@ defmodule Cairn.DetectionAggregator do
 
   @impl true
   def init(opts) do
+    StreamEpochs.subscribe()
+
     state = %{
       cameras: %{},
+      # last announced epoch per camera, kept whether or not that camera has
+      # tracker state yet: the first epoch of a camera's life is minted at
+      # ffmpeg spawn, long before any detection creates `cameras[camera_id]`.
+      epochs: %{},
       start_extractor: Keyword.get(opts, :start_extractor, &Cairn.EventExtractor.start/2),
       finalize_extractor: Keyword.get(opts, :finalize_extractor, &Cairn.EventExtractor.finalize/2)
     }
@@ -104,6 +113,47 @@ defmodule Cairn.DetectionAggregator do
       {:noreply, maybe_finalize(state, camera_id, event_id, :max_event)}
     else
       {:noreply, state}
+    end
+  end
+
+  # A new epoch is a new continuous decode: the camera may have moved during
+  # the outage, so no track may span the boundary — otherwise a box that
+  # happens to overlap the last one inherits its object id. `Tracker.reset/1`
+  # (not `new/0`) keeps the id counter advancing, so an event whose labels
+  # straddle the boundary never reports one id for two objects. An in-flight
+  # event keeps running and finalizes on its own timers.
+  #
+  # Known residual race: detection casts already in flight when this arrives
+  # are processed *after* the reset. They come from the plugin ports, not from
+  # `Cairn.StreamEpochs`, and the BEAM only orders messages per sender pair, so
+  # a batch from before the boundary can seed the fresh tracker. Closing it
+  # needs the epoch to travel with the batch (tagged at the producer, stale
+  # batches dropped here), which is protocol v1 Phase 2; `current_epoch` is
+  # stored as the anchor that comparison will read.
+  def handle_info({:stream_epoch, camera_id, epoch, reason}, state) do
+    state = remember_epoch(state, camera_id, epoch, reason)
+
+    case state.cameras do
+      %{^camera_id => %{current_epoch: ^epoch}} ->
+        # One mint can be announced twice by design: `Cairn.StreamEpochs`
+        # broadcasts from the caller when its server is unreachable, and a
+        # call that exited with :timeout may still be served afterwards. The
+        # epoch is the same either way, so a repeat means no boundary was
+        # crossed — resetting again would cut tracks mid-stream. The repeat
+        # is caught even when the first announcement arrived before this
+        # camera had any tracker state: `epochs` remembered it, and the state
+        # created by the first detection starts out carrying it.
+        {:noreply, state}
+
+      %{^camera_id => cam} ->
+        cam = %{cam | tracker: Tracker.reset(cam.tracker), current_epoch: epoch}
+        {:noreply, put_cam(state, camera_id, cam)}
+
+      _ ->
+        # no tracker to cut. Allocating full camera state here would retain a
+        # tracker for every camera that never emits detections, deleted ones
+        # included; the epoch alone (one string) is cheap enough to keep.
+        {:noreply, state}
     end
   end
 
@@ -293,13 +343,26 @@ defmodule Cairn.DetectionAggregator do
     {tref, token}
   end
 
-  defp cam_state(state, camera_id), do: state.cameras[camera_id] || new_cam()
+  # `:camera_stopped` announces the end of a stream — nothing will ever decode
+  # under that epoch. Dropping the entry instead of storing it is what keeps
+  # `epochs` from growing one row per camera ever removed.
+  defp remember_epoch(state, camera_id, _epoch, :camera_stopped),
+    do: %{state | epochs: Map.delete(state.epochs, camera_id)}
 
-  defp new_cam do
+  defp remember_epoch(state, camera_id, epoch, _reason),
+    do: %{state | epochs: Map.put(state.epochs, camera_id, epoch)}
+
+  # State created here starts on the camera's last announced epoch, so a
+  # repeat of that announcement is recognised as one and cuts nothing.
+  defp cam_state(state, camera_id),
+    do: state.cameras[camera_id] || new_cam(state.epochs[camera_id])
+
+  defp new_cam(current_epoch \\ nil) do
     %{
       event: nil,
       extractor: nil,
       tracker: Tracker.new(),
+      current_epoch: current_epoch,
       post_ref: nil,
       post_token: nil,
       max_ref: nil,
