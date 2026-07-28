@@ -48,3 +48,6 @@ config.yml
 
 # Dialyzer PLTs
 /priv/plts/
+
+# Claude Code working files (plans, reviews, solutions) — local only.
+.claude/
