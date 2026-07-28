@@ -47,14 +47,8 @@ defmodule Cairn.DataCase do
   """
   @spec reset_checkpoints() :: :ok
   def reset_checkpoints do
-    clear_checkpoints()
-    on_exit(&clear_checkpoints/0)
-  end
-
-  defp clear_checkpoints do
-    Enum.each(Cairn.EventCheckpoint.all(), fn {camera_id, _event, _tracks} ->
-      Cairn.EventCheckpoint.delete(camera_id)
-    end)
+    Cairn.EventCheckpoint.clear()
+    on_exit(&Cairn.EventCheckpoint.clear/0)
   end
 
   @doc """
