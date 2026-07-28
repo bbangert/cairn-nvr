@@ -118,6 +118,44 @@ defmodule Cairn.SnapshotTest do
     refute_received {:event_snapshot_ready, _}
   end
 
+  # `:exception` is the catch-all reason, and it has two independent windows:
+  # the ffmpeg side and the index side. Neither may end in silence, and the
+  # index side must not contradict a `_ready` that already went out.
+  test "a snapshot whose ffmpeg call blows up announces :exception", %{config: config} do
+    row = insert(nil, @fixture)
+    # no clip path: the argv is malformed and System.cmd raises
+    row = %{row | path: nil}
+
+    log = capture_log(fn -> assert :ok = Snapshot.take(row, config) end)
+    assert log =~ "snapshot error"
+
+    event_id = row.id
+
+    assert_receive {:event_snapshot_failed,
+                    %EventArtifact{
+                      event_id: ^event_id,
+                      camera_id: "snap_cam",
+                      path: nil,
+                      bytes: nil,
+                      reason: :exception
+                    }}
+
+    refute_received {:event_snapshot_ready, _}
+  end
+
+  test "a jpg the index call blows up on announces :exception, never ready", %{config: config} do
+    row = insert(nil, @fixture)
+    # the jpg is written, then the index call raises on the way in — a
+    # stand-in for anything Ecto throws once ffmpeg has already succeeded
+    row = %{row | id: 42}
+
+    log = capture_log(fn -> assert :ok = Snapshot.take(row, config) end)
+    assert log =~ "snapshot not recorded"
+
+    assert_receive {:event_snapshot_failed, %EventArtifact{reason: :exception}}
+    refute_received {:event_snapshot_ready, _}
+  end
+
   test "seek is clamped inside the clip so a short clip still yields a frame",
        %{dir: dir, config: config} do
     # a trigger far past the tiny fixture's duration must not seek past the end

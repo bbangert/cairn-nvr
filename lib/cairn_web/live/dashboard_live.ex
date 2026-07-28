@@ -15,6 +15,8 @@ defmodule CairnWeb.DashboardLive do
 
   use CairnWeb, :live_view
 
+  alias Cairn.Config
+
   @status_meta %{
     connecting: %{label: "Connecting", color: "var(--hs-warning)", pulse: true},
     running: %{label: "Running", color: "var(--hs-success)"},
@@ -53,7 +55,7 @@ defmodule CairnWeb.DashboardLive do
     {:ok,
      assign(socket,
        page_title: "Dashboard",
-       cameras: Cairn.Config.Server.get().cameras,
+       cameras: Config.Server.get().cameras,
        statuses: Cairn.CameraStatus.all(),
        live_events: %{},
        transports: %{},

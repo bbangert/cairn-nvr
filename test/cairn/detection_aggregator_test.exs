@@ -1,5 +1,7 @@
 defmodule Cairn.DetectionAggregatorTest do
-  use ExUnit.Case, async: false
+  # DataCase, not ExUnit.Case: restore consults the event index before it
+  # decides whether an interrupted event still owes an `event_ended`.
+  use Cairn.DataCase, async: false
 
   import Cairn.TrackAssertions
   import ExUnit.CaptureLog, only: [capture_log: 1]
@@ -11,6 +13,7 @@ defmodule Cairn.DetectionAggregatorTest do
     Event,
     EventArtifact,
     EventCheckpoint,
+    Events,
     Observation,
     StreamEpochs,
     Track
@@ -531,32 +534,26 @@ defmodule Cairn.DetectionAggregatorTest do
   # The extractor's `event_clip_ready` can only follow the finalize cast, so
   # the window closing has to be broadcast *before* the cast — otherwise an
   # extractor that finalizes fast enough announces the media before the event
-  # it belongs to has ended.
+  # it belongs to has ended. The stub announces from inside `maybe_finalize/4`'s
+  # own call stack, which is stronger than reality (the real finalize is a
+  # cast, so its latency is strictly positive) and is what makes swapping the
+  # two lines a guaranteed failure rather than a race. Two things it cannot
+  # cover: both messages come from one process, so it cannot tell "ordered by
+  # the code" from "ordered by single-sender FIFO" (the end-to-end test in
+  # `EventExtractorTest` does that), and each run pins one artifact kind.
   test "event_ended precedes the clip's readiness even when finalizing is instant", %{
     camera: camera,
     camera_id: id
   } do
-    test_pid = self()
-
     agg =
-      start_supervised!(
-        {DetectionAggregator,
-         name: nil,
-         start_extractor: fn _camera, event ->
-           pid = spawn(fn -> Process.sleep(:infinity) end)
-           send(test_pid, {:extractor_started, event, pid})
-           {:ok, pid}
-         end,
-         finalize_extractor: fn _pid, event ->
-           EventArtifact.broadcast(:event_clip_ready, %EventArtifact{
-             event_id: event.id,
-             camera_id: event.camera_id,
-             path: "/clip.mp4",
-             bytes: 1
-           })
-         end},
-        id: :agg_ordering
-      )
+      ordering_agg(:agg_ordering, fn event ->
+        EventArtifact.broadcast(:event_clip_ready, %EventArtifact{
+          event_id: event.id,
+          camera_id: event.camera_id,
+          path: "/clip.mp4",
+          bytes: 1
+        })
+      end)
 
     detect(agg, camera)
     assert_receive {:extractor_started, %Event{id: eid}, _pid}
@@ -566,16 +563,68 @@ defmodule Cairn.DetectionAggregatorTest do
 
     # arrival order, not mere presence: `assert_receive` would match either way
     assert [{:event_ended, %Event{id: ^eid}}, {:event_clip_ready, %EventArtifact{event_id: ^eid}}] =
-             [next_lifecycle(), next_lifecycle()]
+             [next_lifecycle(id), next_lifecycle(id)]
   end
 
-  defp next_lifecycle(timeout \\ 2_000) do
+  # The failure kind takes the *other* branch in the extractor and is the one
+  # a stuck consumer depends on most; it must not overtake `event_ended` either.
+  test "event_ended precedes the clip's failure even when finalizing is instant", %{
+    camera: camera,
+    camera_id: id
+  } do
+    agg =
+      ordering_agg(:agg_ordering_failed, fn event ->
+        EventArtifact.broadcast(:event_clip_failed, %EventArtifact{
+          event_id: event.id,
+          camera_id: event.camera_id,
+          reason: :index_write_failed
+        })
+      end)
+
+    detect(agg, camera)
+    assert_receive {:extractor_started, %Event{id: eid}, _pid}
+    assert_receive {:event_started, %Event{id: ^eid}}
+
+    fire(agg, :post_window, id, eid)
+
+    assert [
+             {:event_ended, %Event{id: ^eid}},
+             {:event_clip_failed, %EventArtifact{event_id: ^eid, reason: :index_write_failed}}
+           ] = [next_lifecycle(id), next_lifecycle(id)]
+  end
+
+  # An aggregator whose "extractor" announces the artifact synchronously,
+  # inside the finalize call itself.
+  defp ordering_agg(id, announce) do
+    test_pid = self()
+
+    start_supervised!(
+      {DetectionAggregator,
+       name: nil,
+       start_extractor: fn _camera, event ->
+         pid = spawn(fn -> Process.sleep(:infinity) end)
+         send(test_pid, {:extractor_started, event, pid})
+         {:ok, pid}
+       end,
+       finalize_extractor: fn _pid, event -> announce.(event) end},
+      id: id
+    )
+  end
+
+  # Scoped to this test's camera: the `"events"` topic is global, so another
+  # test's leftover timer can drop a foreign lifecycle message between the two
+  # this is comparing.
+  defp next_lifecycle(camera_id, timeout \\ 2_000) do
     receive do
-      {kind, _payload} = msg
-      when kind in [:event_started, :event_updated, :event_ended, :event_clip_ready] ->
+      {kind, %Event{camera_id: ^camera_id}} = msg
+      when kind in [:event_started, :event_updated, :event_ended] ->
+        msg
+
+      {kind, %EventArtifact{camera_id: ^camera_id}} = msg
+      when kind in [:event_clip_ready, :event_clip_failed] ->
         msg
     after
-      timeout -> flunk("no event lifecycle message within #{timeout}ms")
+      timeout -> flunk("no event lifecycle message for #{camera_id} within #{timeout}ms")
     end
   end
 
@@ -656,6 +705,23 @@ defmodule Cairn.DetectionAggregatorTest do
 
     eid = event.id
     assert_receive {:event_ended, %Event{id: ^eid, status: :partial}}
+    assert checkpoint(id) == []
+  end
+
+  # The other half of that crash window: the finalize cast was already in the
+  # extractor's mailbox, so the extractor finalized the row and announced
+  # `event_clip_ready` before exiting. Re-announcing the event as `:partial`
+  # here would invert the artifact ordering and mislabel a clean event.
+  test "restore leaves an event the extractor already finalized alone", %{camera_id: id} do
+    event = %Event{id: Ecto.UUID.generate(), camera_id: id, started_at: DateTime.utc_now()}
+    {:ok, _} = Events.create_active(event, "clip.mp4")
+    {:ok, _} = Events.finalize(%{event | ended_at: DateTime.utc_now()}, 1_024)
+    EventCheckpoint.put(id, event)
+
+    start_supervised!({DetectionAggregator, name: nil}, id: :agg_restore_finalized)
+
+    eid = event.id
+    refute_receive {:event_ended, %Event{id: ^eid}}, 100
     assert checkpoint(id) == []
   end
 

@@ -121,6 +121,24 @@ defmodule CairnWeb.Api.EventStreamTest do
       assert snap =~ ~s("bytes":null)
     end
 
+    # Substring assertions cannot catch a *stray* key: a clip frame that also
+    # carried `snapshot_url` would pass every one of them. The key set is the
+    # contract, so assert the key set — for all four kinds.
+    test "each kind emits exactly its own keys, no others" do
+      base = ~w(bytes camera_id event_id reason)
+
+      for {kind, artifact, url_key} <- [
+            {:event_clip_ready, artifact(path: "/x.mp4", bytes: 1), "clip_url"},
+            {:event_clip_failed, artifact(reason: :not_found), "clip_url"},
+            {:event_snapshot_ready, artifact(path: "/x.jpg", bytes: 1), "snapshot_url"},
+            {:event_snapshot_failed, artifact(reason: :no_output), "snapshot_url"}
+          ] do
+        assert {:ok, frame} = SSE.frame_for({kind, artifact})
+        assert [_, json] = Regex.run(~r/^data: (.*)\n\n$/m, frame)
+        assert json |> Jason.decode!() |> Map.keys() |> Enum.sort() == Enum.sort([url_key | base])
+      end
+    end
+
     # the four kinds only mean anything if they stay apart on the wire
     test "each kind names itself" do
       for kind <- [:event_clip_ready, :event_snapshot_ready] do

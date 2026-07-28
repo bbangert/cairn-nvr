@@ -46,7 +46,7 @@ defmodule Cairn.DetectionAggregator do
 
   require Logger
 
-  alias Cairn.{CameraControl, Config, Event, EventCheckpoint, Observation, StreamEpochs}
+  alias Cairn.{CameraControl, Config, Event, EventCheckpoint, Events, Observation, StreamEpochs}
   alias Cairn.{Track, Tracker}
 
   @max_label_entries 5_000
@@ -515,12 +515,13 @@ defmodule Cairn.DetectionAggregator do
 
       case Cairn.Registry.whereis(camera_id, {:extractor, event.id}) do
         nil ->
-          # extractor gone: the index row (if any) stays active on disk and
-          # boot-time reconciliation will mark it partial
-          EventCheckpoint.delete(camera_id)
-          Event.broadcast(:event_ended, %{event | status: :partial, ended_at: now()})
+          end_orphan(camera_id, event)
           state
 
+        # Alive but possibly mid-finalize: the `{:DOWN, _, _, _, :normal}` that
+        # follows clears the camera silently, which is only correct because the
+        # aggregator broadcasts `:event_ended` *before* the finalize cast (see
+        # `maybe_finalize/4`) — the pre-crash aggregator already announced it.
         pid ->
           Process.monitor(pid)
           cam = %{new_cam() | event: event, extractor: pid}
@@ -540,6 +541,24 @@ defmodule Cairn.DetectionAggregator do
           put_cam(state, camera_id, cam)
       end
     end)
+  end
+
+  # Extractor gone: the index row (if any) stays active on disk and boot-time
+  # reconciliation will mark it partial.
+  #
+  # Unless the extractor got there first: the crash window includes "the
+  # finalize cast was already in its mailbox", in which case it finalized the
+  # row and announced `:event_clip_ready` before exiting `:normal`.
+  # Re-announcing that event as `:partial` here would both invert the artifact
+  # ordering and mislabel a clean event — so the index, which the extractor
+  # wrote, decides.
+  defp end_orphan(camera_id, event) do
+    EventCheckpoint.delete(camera_id)
+
+    case Events.get(event.id) do
+      %{status: :finalized} -> :ok
+      _ -> Event.broadcast(:event_ended, %{event | status: :partial, ended_at: now()})
+    end
   end
 
   defp config do

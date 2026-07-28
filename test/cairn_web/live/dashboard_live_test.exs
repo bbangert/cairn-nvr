@@ -19,7 +19,12 @@ defmodule CairnWeb.DashboardLiveTest do
     on_exit(fn -> Cairn.CameraStatus.merge("cam_a", %{status: :unknown}) end)
     Cairn.CameraStatus.set("cam_a", :running)
 
-    assert render_async_status(view, "cam_a") =~ ~s(data-status="running")
+    # the set is a cast whose broadcast happens inside the callback, so once
+    # the server's mailbox has flushed the frame is already in the view's —
+    # ahead of the render call that follows. No polling needed.
+    _ = :sys.get_state(Cairn.CameraStatus)
+
+    assert render(view) =~ ~s(data-status="running")
   end
 
   # The "events" topic carries the per-object track and artifact lifecycles as
@@ -70,23 +75,10 @@ defmodule CairnWeb.DashboardLiveTest do
       {:totally_unknown_kind, %{}}
     )
 
-    assert render(view) =~ "camera-tile-cam_a"
-  end
-
-  defp render_async_status(view, camera_id, attempts \\ 50) do
     html = render(view)
-    selector = ~s(#camera-status-#{camera_id})
-
-    cond do
-      html =~ ~s(data-status="running") ->
-        element(view, selector) |> render()
-
-      attempts == 0 ->
-        element(view, selector) |> render()
-
-      true ->
-        Process.sleep(20)
-        render_async_status(view, camera_id, attempts - 1)
-    end
+    assert html =~ "camera-tile-cam_a"
+    # tolerated, not acted on: none of these announces an event *opening*, so
+    # the REC marker must stay off — the tile alone renders either way
+    refute html =~ "camera-live-event-cam_a"
   end
 end

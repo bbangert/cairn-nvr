@@ -104,7 +104,10 @@ defmodule CairnWeb.Api.EventJSON do
     %{event_id: a.event_id, camera_id: a.camera_id, bytes: a.bytes, reason: a.reason}
   end
 
-  # Only advertise a URL once the underlying file exists on disk.
+  # A URL only once a path has been recorded for it. That is not the same as
+  # "the file is complete": `path` is written when recording *starts*, so an
+  # `active` or `partial` row advertises a clip that may be truncated (see
+  # ha-api.md). `snapshot_path` is written after the jpg exists.
   defp media_url(nil, _url), do: nil
   defp media_url(path, url) when is_binary(path), do: url
 end

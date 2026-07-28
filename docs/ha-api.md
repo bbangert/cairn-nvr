@@ -179,13 +179,21 @@ disk and fetchable:
   `no_output` (ffmpeg wrote nothing usable), `not_found` (the event was gone by
   the time the artifact landed), `index_write_failed` (the index rejected the
   update) or `exception`. Nothing retries; a failed snapshot leaves the clip
-  unaffected.
+  unaffected. `event_clip_failed` is terminal for the whole event: the snapshot
+  is cut from the finished clip, so it is not attempted and **no**
+  `event_snapshot_*` frame follows — do not wait for one.
 
 Each artifact is announced at most once per event, and exactly one of
 `_ready`/`_failed` per attempt. Ordering is guaranteed: `event_ended` precedes
 `event_clip_*`, which precedes `event_snapshot_*` (the snapshot is cut from the
 finished clip). On-disk paths are never emitted — fetch through the `*_url`
 fields, as everywhere else.
+
+`event_ended` itself is **at-least-once**: if Cairn crashes in the window
+between announcing it and recording that it announced it, the event is
+announced again on restart (the replay may carry `"status": "partial"` and a
+later `ended_at`). Dedupe on the event `id` — a second `event_ended` for an id
+you have already finished is a repeat, not a second event.
 
 Recommended client flow:
 
@@ -199,8 +207,13 @@ Recommended client flow:
    announced as `event_ended` with `"status": "partial"`. Treat that as "no
    media is coming" too.
 5. If the connection dropped between `event_ended` and a `*_ready`, re-read
-   `GET /api/events/:id` on reconnect: `clip_url`/`snapshot_url` are non-`null`
-   there exactly when the file exists.
+   `GET /api/events/:id` on reconnect. Mind what those URLs mean there:
+   `clip_url` is non-`null` once a clip path has been *recorded*, which happens
+   when recording starts — so an `active` row (recording in flight) or a
+   `partial` one (the recorder crashed) can return a `clip_url` for a file that
+   is truncated, unplayable or already gone. Only a `finalized` status, or the
+   `event_clip_ready` frame, means the clip is complete. `snapshot_url` is
+   written after the jpg exists, so it is safe once non-`null`.
 
 #### Track frames
 

@@ -11,6 +11,10 @@ defmodule Cairn.Event do
   `:event_ended` means the detection window closed, nothing more, so the
   media it names is not yet fetchable.
 
+  `:event_ended` is **at-least-once**: an aggregator crash between the
+  broadcast and the checkpoint delete replays it on restart (the replay may
+  carry `status: :partial`). Consumers dedupe on `id`.
+
   `labels` is a time-indexed list of `%{t: seconds_since_start, label: l,
   score: s, object_id: id}` entries; `max_scores` maps label -> best score
   seen. `trigger` is the single highest-scoring detection of the event
