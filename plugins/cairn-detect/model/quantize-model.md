@@ -5,13 +5,16 @@ How to get `yolox_nano.onnx` (FP32) and produce `yolox_nano-int8.onnx`
 data used to validate a quantized model against the cairn-detect plugin's
 exact preprocessing.
 
-Everything here is model-agnostic — `quantize_model.py` and
-`verify_models.py` read geometry, layout and preprocessing off the model —
-but the documented path is YOLOX, which is **Apache-2.0**, the same license
-as Cairn. YOLOv8/v10/v11 weights and the `ultralytics` CLI are AGPL-3.0; the
-scripts will happily process such a model if you bring one, and nothing in
-this repository fetches or installs them. See the plugin README's *Model*
-section.
+Everything here is model-agnostic **across the single-tensor families** —
+`quantize_model.py` and `verify_models.py` read geometry and layout off the
+model and take the preprocessing from the profile that layout resolves to
+(yolox, yolov10, yolov8). **RF-DETR is not covered**: its two-tensor layout is
+not one they decode and its ImageNet-normalized encoding is not one they
+build, so quantizing it has not been evaluated. The documented path is YOLOX,
+which is **Apache-2.0**, the same license as Cairn. YOLOv8/v10/v11 weights and
+the `ultralytics` CLI are AGPL-3.0; the scripts will happily process such a
+model if you bring one, and nothing in this repository fetches or installs
+them. See the plugin README's *Model* section.
 
 ## 1. Environment
 
@@ -58,8 +61,15 @@ release.
 - The **grid/stride decode is not folded in**: `x, y` are offsets inside the
   anchor's own grid cell and `w, h` are log extents, both relative to the
   cell's stride. Objectness and the class scores *are* sigmoided in the
-  graph. The plugin does the decode (`postprocess_yolox` in
-  `src/infer.rs`); `verify_models.py` mirrors it.
+  graph. The plugin does the decode (`grid_objectness` in `src/infer.rs`);
+  `verify_models.py` mirrors it.
+- **opset 11** (the 0.1.1rc0 release export). This decides whether per-channel
+  weight quantization is available: it emits a `DequantizeLinear` carrying an
+  `axis` attribute, which only exists from opset 13, and below that
+  onnxruntime loads the quantized model and then refuses it with
+  "Unrecognized attribute: axis for operator DequantizeLinear".
+  `quantize_model.py` reads the opset and turns per-channel off by itself,
+  saying so on stdout. §6 is where that costs something.
 
 To confirm any of that for a model you did not download from here:
 
@@ -70,30 +80,55 @@ python3 -c "import sys; sys.path.insert(0,'.'); \
 
 ## 3. Calibration + held-out frame extraction
 
-Preprocessing must match the plugin exactly (see `rgb_to_chw` in
-`plugins/cairn-detect/src/decode.rs`): **plain stretch resize to the model's
-own HxW (no letterbox), bilinear interpolation (`SWS_BILINEAR`), float32,
-CHW, NCHW batch of 1**, and then per family:
+Preprocessing must match the plugin exactly, and **it is per family, resize
+policy included**. The plugin composes it from the resolved profile —
+`InputSpec { size, encoding, resize }` in `plugins/cairn-detect/src/infer.rs`,
+applied by `ResizePolicy::fit` and `pack_chw` in `src/decode.rs`, with the
+per-family channel order and scale in `TensorEncoding::packing`. The scripts
+mirror that table in `quantize_model.PROFILES`:
 
-| layout | channel order | scale |
-|---|---|---|
-| yolox | BGR | none (0..255) |
-| yolov10, yolov8 | RGB | ÷255 (0..1) |
+| layout | channel order | scale | resize |
+|---|---|---|---|
+| yolox | BGR | none (0..255) | **letterbox**, aspect preserved, pad 114 |
+| yolov10, yolov8 | RGB | ÷255 (0..1) | stretch to the model's own HxW |
+| rfdetr | RGB | ImageNet mean/std | stretch — **not supported by these scripts** |
 
-The extracted PNGs are always plain RGB at the model's size; the BGR swap and
-the scaling happen in `load_image_chw`, so the same frame set serves either
-family. **Extract at the model's input size**: 416 for yolox_nano, 640 for
-yolox_s or a yolov10 export.
+Common to all: bilinear interpolation (`SWS_BILINEAR`), float32, CHW, NCHW
+batch of 1. Under letterbox the content sits at the **top-left** with the
+padding bottom-right (what YOLOX's own `preproc` does), each side is rounded
+down to an even number of pixels, and the pad goes in as a *pixel value*
+before the encoding — so a `raw-bgr` model sees 114 and a `unit-rgb` model
+would see 114/255.
+
+The resize policy is not cosmetic for calibration: it decides the pixel
+distribution MinMax activation ranges are measured over. Calibrating YOLOX on
+stretched frames measures ranges for a model nobody is running.
+
+`load_image_chw` applies the resolved profile's policy to **whatever size PNG
+it is handed**, reproducing what the plugin would build from a camera frame of
+that size. A frame set already at the model's geometry is a fixed point of
+both policies, so the extraction below — which bakes the letterbox in with
+ffmpeg — passes through untouched, and so would a set of full-resolution
+frames.
 
 200 calibration frames are sampled from **20 of the 28** fixture clips under
 `data/events/reolink_main/` (10 frames each, every 20th decoded frame),
-reserving the other **8** clips entirely for a disjoint 10-frame held-out
-evaluation set (different videos, not just different timestamps, so there is
-no leakage). All clips are 2560x1920 H.264 @ 20fps.
+reserving the other **8** clips entirely for a disjoint held-out evaluation
+set (different videos, not just different timestamps, so there is no leakage):
+2 frames per clip at another phase offset, 16 candidates subsampled to the 10
+that §5 and §6 evaluate. All clips are 2560x1920 H.264 @ 20fps, which
+letterboxes into 416x416 as 416x312 of picture over 104 rows of pad.
 
 ```bash
 SRC=/workspaces/cairn-nvr/data/events/reolink_main
 SIZE=416   # the model's input size; 640 for yolox_s / a yolov10 export
+
+# The plugin's letterbox, as an ffmpeg filter: scale down preserving aspect,
+# even sides, then pad to square from the top-left with 114 (0x72). For a
+# stretch-policy family (yolov10 / yolov8) this is just `scale=$SIZE:$SIZE`.
+LB="scale=$SIZE:$SIZE:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=bilinear"
+LB="$LB,pad=$SIZE:$SIZE:0:0:color=0x727272"
+
 ls "$SRC"/*.mp4 | xargs -n1 basename | sort > all_videos.txt
 head -20 all_videos.txt > calib_videos.txt   # 20 clips -> calibration
 tail -8  all_videos.txt > heldout_videos.txt  # 8 clips  -> held-out (disjoint)
@@ -103,7 +138,7 @@ mkdir -p calib_frames
 while read -r f <&3; do
   base=$(basename "$f" .mp4)
   ffmpeg -nostdin -y -v error -i "$SRC/$f" \
-    -vf "select='not(mod(n\,20))',scale=$SIZE:$SIZE:flags=bilinear" \
+    -vf "select='not(mod(n\,20))',$LB" \
     -vsync 0 -frames:v 10 -f image2 "calib_frames/${base}_%02d.png" </dev/null
 done 3< calib_videos.txt
 
@@ -113,10 +148,14 @@ mkdir -p heldout_frames
 while read -r f <&3; do
   base=$(basename "$f" .mp4)
   ffmpeg -nostdin -y -v error -i "$SRC/$f" \
-    -vf "select='eq(mod(n\,90)\,7)',scale=$SIZE:$SIZE:flags=bilinear" \
+    -vf "select='eq(mod(n\,90)\,7)',$LB" \
     -vsync 0 -frames:v 2 -f image2 "heldout_frames/${base}_%02d.png" </dev/null
 done 3< heldout_videos.txt
 ```
+
+To check the letterbox landed where the plugin puts it, the bottom-right
+pixel of any extracted frame should be exactly `114, 114, 114` and row 312 the
+first padded one.
 
 Note: pass `-nostdin` and redirect ffmpeg's stdin from `/dev/null` inside a
 `while read` loop — otherwise ffmpeg's interactive keyboard-command reader
@@ -134,9 +173,17 @@ python3 quantize_model.py
 
 The defaults match the repo layout: `--model ../yolox_nano.onnx` (plugin
 root), `--calib-dir calib_frames`, `--out ../yolox_nano-int8.onnx` — pass
-them explicitly only to deviate. `--input-encoding` overrides what the script
-infers from the layout, which it only gets wrong for an export whose output
-shape is dynamic.
+them explicitly only to deviate. `--input-encoding` overrides the *encoding*
+the script infers from the layout, which it only gets wrong for an export
+whose output shape is dynamic; the resize policy follows the profile and has
+no flag, because a wrong one is silent and there is nothing to override it
+with for a layout the script did not recognize in the first place. The run
+prints what it resolved:
+
+```
+      model: input 'images' 416x416, opset 11, output [1, 3549, 85],
+      layout yolox, calibrating with raw-bgr / letterbox (pad 114)
+```
 
 See `quantize_model.py` for the full, documented, runnable script. Key points,
 in order:
@@ -174,6 +221,9 @@ in order:
    Conv nodes:
 
    ```bash
+   # historical — the YOLOv10 run, and the only command line here naming an
+   # AGPL-3.0 model. Kept as the evidence for the trap; the same flags apply
+   # to any head, including yolox_nano.onnx.
    python3 quantize_model.py --model ../yolov10n.onnx \
      --exclude-suffix one2one_cv3.0.2/Conv \
      --exclude-suffix one2one_cv3.1.2/Conv \
@@ -199,10 +249,13 @@ python3 verify_models.py --fp32 ../yolox_nano.onnx --int8 ../yolox_nano-int8.onn
 
 See `verify_models.py` for the full script. It:
 
-- reports the geometry, layout and preprocessing it read off the FP32 model
+- reports the geometry and layout it read off the FP32 model, and the
+  encoding *and resize policy* of the profile that layout resolves to — the
+  same `load_image_chw` the calibration used, so a letterboxing family is
+  verified letterboxed
 - asserts input/output names + shapes are identical between FP32 and INT8
 - runs both models on the same 10 held-out frames (disjoint clips from
-  calibration), decodes detections with score >= 0.5 through the layout's
+  calibration; `--frames-dir heldout10`), decodes detections with score >= 0.5 through the layout's
   own decode path (mirroring `src/infer.rs`, including the yolox grid/stride
   decode and `objectness × class_score`), greedy-matches FP32 vs INT8
   detections by same class + IoU > 0.5, and reports per-frame labels/scores
@@ -214,35 +267,49 @@ See `verify_models.py` for the full script. It:
 
 ## 6. Results
 
-### YOLOX-Nano: INT8 is not worth it (measured 2026-07-28)
+### YOLOX-Nano: INT8 is not worth it (re-measured 2026-07-28, letterboxed)
 
-A quantization run on `yolox_nano.onnx` with 24 calibration frames and 6
-held-out frames, on the same dev container:
+The full §3 protocol — 200 calibration frames from 20 clips, 10 held-out
+frames from the 8 disjoint clips, all letterboxed with pad 114 and fed
+`raw-bgr`, which is what the plugin does. Both models measured in the same
+run on the same dev container, score threshold 0.5:
 
 | | FP32 | INT8 |
 |---|---|---|
-| Latency, mean of 20 runs | 20.3 ms | 47.6 ms (**2.3x slower**) |
-| Detections on held-out frames (score >= 0.3) | 4 | 4, none matching |
+| File size | 3,659,407 B (3.66 MB) | 1,082,662 B (1.08 MB), **-70.4%** |
+| Latency, mean of 20 runs | 7.56 ms (std 1.15) | 11.83 ms (std 1.88), **1.6x slower** |
+| Latency, min observed | 6.92 ms | 10.57 ms |
+| Detections on 10 held-out frames | 6 | 1 |
 | Match rate (same class, IoU > 0.5) | — | **0%** |
 
-The INT8 model emitted the *same* detection — `zebra`, score `0.393` — on
-three different frames while missing every real one: the classification-score
-collapse described in §4.3, arriving here as a constant rather than as
-`0.500`. It is also slower, because per-channel quantization had to be
-disabled (§2: opset 11) and the per-tensor QDQ nodes cost more than the INT8
-kernels save at this size.
+INT8 loses almost every detection rather than shifting them: FP32's `car`
+0.601, `person` 0.836, `chair` 0.550 and three `potted plant`s (0.610–0.674)
+all fall under the threshold, and the one detection INT8 does emit is a
+spurious `banana` 0.536 on a frame where FP32 says `potted plant` 0.646.
+Nothing matches. It is also slower, because per-channel quantization had to
+be disabled (§2 — the export is opset 11) and the per-tensor QDQ nodes cost
+more than the INT8 kernels save at this size.
 
-Two things could be tuned — many more calibration frames, and an opset
-upgrade to re-enable per-channel — but the ceiling is low: **YOLOX-Nano is
-already 3.6 MB**, so the entire prize is a couple of megabytes on disk. Ship
-FP32. This section exists mostly to show the verification catching a bad
+An earlier scouting run (24 calibration frames, 6 held-out, and — before the
+plugin letterboxed — stretched frames) failed differently and more visibly:
+the INT8 model emitted the *same* detection, `zebra` at 0.393, on 3 of the 6
+frames while missing every real one, which is the classification-score
+collapse of §4 item 3 arriving as a constant rather than as `0.500`. The
+verdict did not change when the preprocessing was corrected; the symptom did.
+
+Two things could be tuned — a larger and more varied calibration set, and an
+opset upgrade to re-enable per-channel — but the ceiling is low: **YOLOX-Nano
+is already 3.6 MB**, so the entire prize is a couple of megabytes on disk.
+Ship FP32. This section exists mostly to show the verification catching a bad
 quantization, which is what it is for.
 
 ### YOLOv10 (historical)
 
 These numbers are from the earlier `yolov10n.onnx` (640x640, 9.48 MB) run,
 kept because they are the measured evidence for "INT8 is a size win, not a
-speed win" on a model large enough for the question to arise.
+speed win" on a model large enough for the question to arise. yolov10 is a
+**stretch** family, so unlike the YOLOX numbers above these were never
+measured under the wrong resize policy and did not need re-running.
 
 | | FP32 | INT8 |
 |---|---|---|
@@ -267,11 +334,15 @@ Detection agreement on 10 held-out frames (score >= 0.5 threshold):
 - `quantize_model.py` — the quantization script (documented, runnable)
 - `verify_models.py` — the verification/benchmark script; also the reference
   Python implementation of all three decode paths
-- `calib_frames/` — 200 calibration PNGs at the model's input size
-- `heldout_frames/` / `heldout10/` — held-out PNGs, `heldout10/` is the exact
-  10-frame evaluation set
+- `calib_frames/` — 200 calibration PNGs at the model's input geometry,
+  under the profile's own resize policy (letterboxed with pad 114 for yolox)
+- `heldout_frames/` / `heldout10/` — held-out PNGs, same treatment;
+  `heldout10/` is the exact 10-frame evaluation set
 - `all_videos.txt`, `calib_videos.txt`, `heldout_videos.txt`,
   `heldout_selected.txt` — bookkeeping for which source clips went where
 
 `*.onnx` in and above this directory is gitignored: the FP32 model is a
-download and the INT8 model is a build product.
+download and the INT8 model is a build product. So are `quant-venv/`, the
+frame sets and the bookkeeping `.txt` files — every one of them is
+reproducible from §1 and §3, and the calibration set alone is tens of
+megabytes.

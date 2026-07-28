@@ -1,3 +1,16 @@
 /target/
 *.onnx
 __pycache__/
+
+# Quantization working artifacts: the venv from quantize-model.md §1, the
+# extracted calibration/held-out frame sets from §3 and the bookkeeping that
+# records which source clip went where. All are reproducible from the steps
+# in that document, and the frame sets run to tens of megabytes.
+model/quant-venv/
+model/calib_frames/
+model/heldout_frames/
+model/heldout10/
+model/all_videos.txt
+model/calib_videos.txt
+model/heldout_videos.txt
+model/heldout_selected.txt

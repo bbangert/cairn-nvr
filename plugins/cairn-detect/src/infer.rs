@@ -581,6 +581,17 @@ pub struct ModelProfile {
     pub aliases: &'static [&'static str],
     pub input: InputSpec,
     pub output: OutputSpec,
+    /// The resolutions this family's variants are trained at, for a family
+    /// whose exports leave their spatial axes dynamic.
+    ///
+    /// `Some` means `input.size` is *not* a usable default and
+    /// [`resolve_input_size`] must refuse rather than fall back to it. The
+    /// consequence of guessing is not a wrong-but-working run: an RF-DETR
+    /// `small` export fed Nano's 384 produces zero detections and zero
+    /// warnings, and nothing in the graph says which variant it is — every
+    /// variant declares the same 300 queries and 91 logits. So the text here
+    /// is what the error offers instead of a guess.
+    pub variant_sizes: Option<&'static str>,
 }
 
 /// Megvii YOLOX (nano / tiny / s). Apache-2.0, the documented default.
@@ -600,6 +611,7 @@ pub const YOLOX: ModelProfile = ModelProfile {
         score: ScoreComposition::ObjTimesClass,
         nms: Some(DEFAULT_NMS),
     },
+    variant_sizes: None,
 };
 
 /// Ultralytics end-to-end / NMS-free heads (yolov10, YOLO26).
@@ -623,6 +635,7 @@ pub const YOLOV10: ModelProfile = ModelProfile {
         score: ScoreComposition::Class,
         nms: None,
     },
+    variant_sizes: None,
 };
 
 /// Stock Ultralytics detect exports.
@@ -647,14 +660,15 @@ pub const YOLOV8: ModelProfile = ModelProfile {
         score: ScoreComposition::Class,
         nms: Some(DEFAULT_NMS),
     },
+    variant_sizes: None,
 };
 
-/// Roboflow RF-DETR (nano / small / medium / base / large). Apache-2.0.
+/// Roboflow RF-DETR (nano / small / base / medium / large). Apache-2.0.
 ///
-/// The size here is Nano's. Every RF-DETR export leaves its input spatial axes
-/// dynamic, so a larger variant will happily run at 384 and quietly lose
-/// accuracy instead of failing — the other resolutions (small 512, medium 576,
-/// base 560, large 704) have to come from `--input-size`.
+/// The size here is Nano's, and it is deliberately *not* a default: every
+/// RF-DETR export leaves its input spatial axes dynamic, so a larger variant
+/// fed 384 runs to completion and detects nothing. `variant_sizes` is what
+/// makes [`resolve_input_size`] refuse to guess and ask for `--input-size`.
 pub const RFDETR: ModelProfile = ModelProfile {
     name: "rfdetr",
     aliases: &["rf-detr"],
@@ -672,6 +686,7 @@ pub const RFDETR: ModelProfile = ModelProfile {
         score: ScoreComposition::SigmoidClass,
         nms: None,
     },
+    variant_sizes: Some("nano 384, small 512, base 560, medium 576, large 704"),
 };
 
 /// Every profile `--model-profile` accepts and sniffing considers, in the
@@ -792,6 +807,12 @@ fn static_output_dims(dtype: &ValueType) -> Option<Vec<i64>> {
 /// axis is the logits. Two candidates for a role (a genuinely 4-class DETR
 /// would do it) or none is an error naming what the model offers, never a
 /// guess at which is which.
+///
+/// An export that pins *no* shape at all — `optimum`'s `dynamic_axes` will
+/// happily leave the query axis symbolic, giving `[?, ?, 4]` / `[?, ?, 91]` —
+/// leaves the shape rule nothing to read, and falls back to
+/// [`bind_detr_by_name`]. See its comment for why that is safe here and not a
+/// general licence to bind by name.
 fn bind(roles: Roles, declared: &[Declared]) -> Result<Outputs<Declared>> {
     match roles {
         Outputs::One(()) => declared
@@ -825,15 +846,68 @@ fn bind(roles: Roles, declared: &[Declared]) -> Result<Outputs<Declared>> {
                 }
                 _ => None,
             };
-            paired.ok_or_else(|| {
-                anyhow!(
-                    "expected one [1, Q, 4] box output and one [1, Q, nc] logit output over the \
-                     same Q queries, but the model offers {}",
-                    describe_outputs(declared)
-                )
-            })
+            // Only when the export pins nothing: a model that declares shapes
+            // and does not fit is a mismatch to report, not a name to guess at.
+            let unshaped = declared.iter().all(|output| output.dims.is_none());
+            paired
+                .or_else(|| unshaped.then(|| bind_detr_by_name(declared)).flatten())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "expected one [1, Q, 4] box output and one [1, Q, nc] logit output over \
+                         the same Q queries, but the model offers {}{}",
+                        describe_outputs(declared),
+                        // The shape rule had nothing to read, so say what the
+                        // fallback wanted rather than repeating shapes.
+                        if unshaped {
+                            "; with no shape to read the roles from, the names have to say which \
+                             is which (pred_boxes/logits or dets/labels)"
+                        } else {
+                            ""
+                        }
+                    )
+                })
         }
     }
+}
+
+/// Bind a DETR pair by name, for an export that pins neither shape.
+///
+/// This is the fallback the shape rule refuses to be: names are a weaker
+/// signal, and the two RF-DETR exporters disagree about them, which is exactly
+/// why `bind` reads shapes first. It is safe as a *last* resort because the
+/// binding is not trusted — [`decode_output`] re-runs [`validate_layout`]
+/// against the real runtime dims on every frame, so a pair bound the wrong way
+/// round fails loudly on the first output (the boxes tensor would not have a
+/// last axis of 4) instead of decoding garbage. Without it, an export whose
+/// query axis is symbolic cannot be run at all, not even with
+/// `--model-profile rfdetr`, and the error blames the profile rather than the
+/// export.
+///
+/// Both known exporters are covered — Roboflow's `dets`/`labels` and the
+/// transformers conversion's `pred_boxes`/`logits`. A name that claims both
+/// roles or neither settles nothing, and two claims on one role is an
+/// ambiguity to report rather than an order to trust.
+fn bind_detr_by_name(declared: &[Declared]) -> Option<Outputs<Declared>> {
+    let (mut boxes, mut logits) = (None, None);
+    for output in declared {
+        let name = output.name.to_ascii_lowercase();
+        let says_boxes = name.contains("box") || name.contains("det");
+        let says_logits =
+            name.contains("logit") || name.contains("label") || name.contains("score");
+        let slot = match (says_boxes, says_logits) {
+            (true, false) => &mut boxes,
+            (false, true) => &mut logits,
+            _ => continue,
+        };
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(output.clone());
+    }
+    Some(Outputs::BoxesAndLogits {
+        boxes: boxes?,
+        logits: logits?,
+    })
 }
 
 /// The shapes bound to a layout's roles, when the export pins all of them.
@@ -999,7 +1073,12 @@ fn resolve_profile(
         Some(shapes) => Some(fit_output(profile.output, &shapes, size).with_context(mismatch)?),
         // A dynamic output shape declares nothing to validate against; the
         // input half is still fully known, so frames can be packed correctly
-        // and only `nc` waits for the first real output.
+        // and only `nc` waits for the first real output. This covers the
+        // two-tensor families as well as the one-tensor ones: `bind` has
+        // already settled the roles above — by shape where the export pins
+        // them, by name where it pins nothing — and `decode_output` re-checks
+        // the layout against the real dims on every frame, so a deferral that
+        // guessed wrong fails on the first output rather than decoding it.
         None => None,
     };
     Ok((profile, bound.map(|output| output.name.clone()), output))
@@ -1191,12 +1270,21 @@ fn declared_input_size(dtype: &ValueType) -> Option<InputSize> {
 /// the message is onnxruntime's and the process has already been running for
 /// a minute. A profile's own size is only a last resort: it is a family
 /// default, not a statement about this export.
+///
+/// A profile carrying [`ModelProfile::variant_sizes`] has no usable default at
+/// all, so it supplies none: for a family whose every export leaves its spatial
+/// axes dynamic, one variant's resolution guessed at another's is not a
+/// wrong-but-working run, it is a camera that silently detects nothing. The
+/// error lists the resolutions instead of picking one.
 fn resolve_input_size(
     declared: Option<InputSize>,
     requested: Option<InputSize>,
-    fallback: Option<InputSize>,
+    profile: Option<ModelProfile>,
     model: &Path,
 ) -> Result<(InputSize, InputSizeSource)> {
+    let fallback = profile
+        .filter(|profile| profile.variant_sizes.is_none())
+        .map(|profile| profile.input.size);
     let (size, source) = match (requested, declared) {
         (Some(requested), Some(declared)) if requested != declared => bail!(
             "--input-size {requested} contradicts model {}, whose input is {declared}",
@@ -1204,9 +1292,21 @@ fn resolve_input_size(
         ),
         (Some(requested), _) => (requested, InputSizeSource::Flag),
         (None, Some(declared)) => (declared, InputSizeSource::Model),
-        (None, None) => match fallback {
-            Some(fallback) => (fallback, InputSizeSource::Profile),
-            None => bail!(
+        (None, None) => match (fallback, profile.and_then(|p| p.variant_sizes)) {
+            (Some(fallback), _) => (fallback, InputSizeSource::Profile),
+            // The profile is known and still cannot answer: say so, and say
+            // what the answer is likely to be, rather than reporting a bare
+            // "does not pin" that reads as if the profile were missing too.
+            (None, Some(sizes)) => bail!(
+                "model {} does not pin its input width and height, and the {} profile has no \
+                 default to fall back on — every export in the family leaves its spatial axes \
+                 dynamic and declares nothing that says which variant it is. Pass --input-size \
+                 WxH (or N); the variants are trained at {sizes}. A wrong size here is silent: \
+                 the model runs and detects nothing.",
+                model.display(),
+                profile.map(|p| p.name).unwrap_or_default(),
+            ),
+            (None, None) => bail!(
                 "model {} does not pin its input width and height; pass --input-size WxH (or N)",
                 model.display()
             ),
@@ -1264,7 +1364,7 @@ impl Detector {
         let (input_size, input_size_source) = resolve_input_size(
             declared_input_size(input.dtype()),
             requested,
-            profile.map(|p| p.input.size),
+            profile,
             model,
         )?;
         let declared: Vec<Declared> = session
@@ -1392,8 +1492,21 @@ fn decode_output(
     projection: &Projection,
 ) -> Result<Vec<Det>> {
     validate_layout(output.layout, &raw.map(|tensor| tensor.dims.clone()), size)?;
-    let candidates = candidates_from(output, raw, size, floors.min_floor())?;
+    let candidates = candidates_from(output, raw, size, labels, floors)?;
     Ok(finish(candidates, output.nms, labels, floors, projection))
+}
+
+/// The floor each of a layout's `nc` classes is held to, resolved once per
+/// decode rather than per anchor.
+///
+/// [`ScoreFloors`] is keyed by label and [`Labels::label_for`] allocates, so
+/// looking a floor up inside a `Q x nc` loop would allocate tens of thousands
+/// of strings a frame. The class id is the only thing a decode has, and this
+/// is the map between them.
+fn class_floors(nc: usize, labels: &Labels, floors: &ScoreFloors) -> Vec<f64> {
+    (0..nc)
+        .map(|class_id| floors.floor_for(&labels.label_for(class_id)))
+        .collect()
 }
 
 /// One proposal in model-space pixels, before NMS and un-projection.
@@ -1404,17 +1517,21 @@ struct Candidate {
     corners: [f64; 4],
 }
 
-/// Pull every anchor/row the layout offers above `prefilter` into candidates.
+/// Pull every anchor/row the layout offers above its floor into candidates.
 ///
-/// `prefilter` is the lowest floor any label could carry: the cut runs before
-/// a candidate's label is known, so anything higher would drop detections that
-/// a per-label floor admits.
+/// The single-tensor layouts cut on `prefilter`, the lowest floor any label
+/// could carry: the cut runs before a candidate's label is known, so anything
+/// higher would drop detections that a per-label floor admits. A DETR head
+/// knows every class's score for a query at once, so it can apply the real
+/// per-label floors instead — see [`detr_queries`].
 fn candidates_from(
     output: OutputSpec,
     raw: &Outputs<Raw>,
     size: InputSize,
-    prefilter: f64,
+    labels: &Labels,
+    floors: &ScoreFloors,
 ) -> Result<Vec<Candidate>> {
+    let prefilter = floors.min_floor();
     // `validate_layout` has already agreed the roles, so a mismatch here is
     // unreachable rather than a case to handle.
     match (output.layout, raw) {
@@ -1453,7 +1570,7 @@ fn candidates_from(
                 queries,
                 size,
                 output.score,
-                prefilter,
+                &class_floors(nc, labels, floors),
             ))
         }
         (layout, raw) => bail!(
@@ -1603,12 +1720,23 @@ fn grid_objectness(
 /// exactly; the point is that a DETR run against a padded frame is not
 /// silently off by the padding.
 ///
-/// One candidate per query, its argmax class. RF-DETR's own postprocess
-/// instead takes the top k of the flattened query x class matrix, which can
-/// enter one query twice under two labels — with [`MAX_DETS`] detections
-/// leaving this plugin and per-label floors around 0.5 the two agree on
-/// everything that survives, and per-query argmax is what every other layout
-/// here already does.
+/// One candidate per query: the best-scoring class that clears *its own*
+/// floor, which is not always the query's argmax.
+///
+/// RF-DETR's own postprocess takes the top k of the flattened query x class
+/// matrix, so one query can leave under several labels. Plain argmax matches
+/// that for everything that survives a *uniform* floor — sigmoid is monotonic,
+/// so the argmax class is the only one that can clear a floor its runners-up
+/// do not. Cairn's floors are not uniform: `default: 1.0` as an allowlist with
+/// `person: 0.6` is the documented pattern, and under `car: 0.9, truck: 0.4` a
+/// query scoring car 0.85 / truck 0.60 is a truck the argmax throws away with
+/// its box. Scoring every class against its own floor costs nothing — the loop
+/// already reads all `nc` logits — and collapses to argmax when the floors are
+/// uniform.
+///
+/// `floors` is one floor per class id, from [`class_floors`]. The per-label
+/// gate in [`finish`] re-applies it after NMS; picking here only decides which
+/// label the box leaves under.
 fn detr_queries(
     boxes: &[f32],
     logits: &[f32],
@@ -1616,22 +1744,39 @@ fn detr_queries(
     queries: usize,
     size: InputSize,
     score: ScoreComposition,
-    prefilter: f64,
+    floors: &[f64],
 ) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     for query in 0..queries {
-        let (class_id, best) = argmax(nc, |c| f64::from(logits[query * nc + c]));
-        let score = match score {
-            ScoreComposition::SigmoidClass => sigmoid(best),
-            // An export that already squashed its logits, read as it stands.
-            ScoreComposition::Class | ScoreComposition::ObjTimesClass => best,
-        };
-        // NaN wins total_cmp's argmax and survives every comparison against a
-        // floor, then serializes as `null` and takes the whole output line out
-        // of the contract.
-        if score.is_nan() || score < prefilter {
+        let mut best: Option<(usize, f64)> = None;
+        let mut poisoned = false;
+        // `zip` rather than indexing: `floors` carries one entry per class by
+        // construction, and pairing them is what says so without a panic path.
+        for (class_id, floor) in (0..nc).zip(floors) {
+            let logit = f64::from(logits[query * nc + class_id]);
+            let value = match score {
+                ScoreComposition::SigmoidClass => sigmoid(logit),
+                // An export that already squashed its logits, read as it stands.
+                ScoreComposition::Class | ScoreComposition::ObjTimesClass => logit,
+            };
+            // A NaN poisons the whole query, not just its own class: it
+            // survives every comparison against a floor and serializes as
+            // `null`, which would take the entire output line — and every real
+            // detection on it — out of the contract.
+            if value.is_nan() {
+                poisoned = true;
+                break;
+            }
+            if value >= *floor && best.is_none_or(|(_, high)| value > high) {
+                best = Some((class_id, value));
+            }
+        }
+        if poisoned {
             continue;
         }
+        let Some((class_id, score)) = best else {
+            continue;
+        };
         let row = &boxes[query * 4..query * 4 + 4];
         let (w, h) = (size.w as f64, size.h as f64);
         if let Some(corners) = centered(
@@ -3016,6 +3161,9 @@ mod tests {
 
     #[test]
     fn detr_takes_the_argmax_class_of_each_query() {
+        // Under a uniform floor the best class that clears its floor *is* the
+        // argmax — sigmoid is monotonic, so no runner-up can clear a bar the
+        // argmax misses. The asymmetric case is the next test.
         let mut out = DetrOutput::new(3, 3);
         out.put(0, [0.5, 0.5, 0.2, 0.2], 2, 3.0);
         // a weaker person logit on the same query must not win
@@ -3023,6 +3171,60 @@ mod tests {
         let dets = out.decode(&open(), SQUARE);
         assert_eq!(dets.len(), 1);
         assert_eq!(dets[0].label, "car");
+    }
+
+    #[test]
+    fn detr_keeps_the_best_class_that_clears_its_own_floor_not_the_argmax() {
+        // Cairn's documented floor pattern is an allowlist: `default: 1.0`
+        // admits nothing, and each wanted label names its own bar. Under that
+        // shape the argmax class is routinely the *wrong* one to score by —
+        // this is the reviewer's case, a query the model reads as car 0.85 /
+        // truck 0.60 with floors car 0.9, truck 0.4. Argmax picks car, car
+        // fails its own 0.9, and the whole detection — box included — vanishes,
+        // even though truck is over its bar and is what RF-DETR's own flattened
+        // top-k postprocess would emit.
+        let names = Labels(vec!["person".into(), "car".into(), "truck".into()]);
+        let asymmetric = floors(r#"{"default":1.0,"person":0.6,"car":0.9,"truck":0.4}"#);
+        let logit = |p: f64| (p / (1.0 - p)).ln() as f32;
+
+        let mut out = DetrOutput::new(2, 3);
+        out.put(0, [0.5, 0.5, 0.2, 0.2], 1, logit(0.85)).put(
+            0,
+            [0.5, 0.5, 0.2, 0.2],
+            2,
+            logit(0.60),
+        );
+
+        let decode = |floors: &ScoreFloors, names: &Labels| {
+            decode_output(
+                out.spec(),
+                &raw_detr(&out.boxes, &out.logits, 2, 3),
+                names,
+                floors,
+                SQUARE,
+                &Projection::stretch(SQUARE),
+            )
+            .unwrap()
+        };
+
+        let dets = decode(&asymmetric, &names);
+        assert_eq!(dets.len(), 1, "the detection must survive: {dets:?}");
+        assert_eq!(dets[0].label, "truck");
+        assert_eq!(dets[0].score, 0.6);
+        // the box is the query's box, unchanged by which label it left under
+        assert_eq!(dets[0].bbox, [0.4, 0.4, 0.2, 0.2]);
+
+        // Behaviour under a uniform floor is untouched: car is the argmax and
+        // clears 0.5, so it wins and truck is not emitted alongside it.
+        let dets = decode(&floors(r#"{"default":0.5}"#), &names);
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].label, "car");
+        assert_eq!(dets[0].score, 0.85);
+
+        // And a label the allowlist does not name stays out: with `default`
+        // at 1.0 and neither class listed, nothing clears anything.
+        let unlisted = Labels(vec!["kite".into(), "spoon".into(), "vase".into()]);
+        assert!(decode(&asymmetric, &unlisted).is_empty());
     }
 
     #[test]
@@ -3136,6 +3338,99 @@ mod tests {
                 logits: "labels".into()
             }
         );
+    }
+
+    #[test]
+    fn a_detr_export_pinning_no_shape_at_all_is_bound_by_name_instead() {
+        // `optimum`'s dynamic_axes leaves the query axis symbolic, so both
+        // tensors read as [?, ?, N] and neither declares a shape. Without a
+        // fallback such an export cannot be run at all — not even with
+        // `--model-profile rfdetr`, whose whole job is to answer for an export
+        // that says nothing.
+        let roles = Layout::DetrQueries { nc: 91 }.roles();
+        let dynamic = |names: [&str; 2]| -> Vec<Declared> {
+            names
+                .iter()
+                .map(|name| Declared {
+                    name: (*name).into(),
+                    dims: None,
+                })
+                .collect()
+        };
+        for names in [
+            ["pred_boxes", "logits"],
+            ["logits", "pred_boxes"],
+            ["dets", "labels"],
+            ["labels", "dets"],
+        ] {
+            let bound = bind(roles, &dynamic(names))
+                .unwrap()
+                .map(|o| o.name.clone());
+            let expected = |role: fn(&str) -> bool| {
+                names.iter().copied().find(|n| role(n)).unwrap().to_string()
+            };
+            assert_eq!(
+                bound,
+                Outputs::BoxesAndLogits {
+                    boxes: expected(|n| n.contains("box") || n.contains("det")),
+                    logits: expected(|n| n.contains("logit") || n.contains("label")),
+                },
+                "{names:?}"
+            );
+        }
+
+        // ...and the profile that names it then starts, deferring `nc` to the
+        // first real output exactly as a one-tensor family does.
+        let (profile, outputs, output) = resolve_profile(
+            Some(RFDETR),
+            &dynamic(["pred_boxes", "logits"]),
+            InputSize::square(384),
+            Path::new("rfdetr_dynamic.onnx"),
+        )
+        .unwrap();
+        assert_eq!(profile.name, "rfdetr");
+        assert_eq!(
+            outputs,
+            Outputs::BoxesAndLogits {
+                boxes: "pred_boxes".into(),
+                logits: "logits".into()
+            }
+        );
+        assert!(output.is_none(), "nc waits for the first real output");
+    }
+
+    #[test]
+    fn names_that_settle_nothing_are_an_error_rather_than_an_output_order() {
+        let roles = Layout::DetrQueries { nc: 91 }.roles();
+        let unnamed = |names: [&str; 2]| -> Vec<Declared> {
+            names
+                .iter()
+                .map(|name| Declared {
+                    name: (*name).into(),
+                    dims: None,
+                })
+                .collect()
+        };
+        // nothing in either name claims a role, and position is not a signal
+        let err = bind(roles, &unnamed(["output0", "output1"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pred_boxes/logits"), "{err}");
+        assert!(err.contains("(dynamic)"), "{err}");
+        // two claims on one role is an ambiguity, not a first-wins
+        assert!(bind(roles, &unnamed(["pred_boxes", "dets"])).is_err());
+        // a name claiming both roles claims neither
+        assert!(bind(roles, &unnamed(["box_logits", "logits"])).is_err());
+
+        // An export that *does* pin its shapes and misses is a shape mismatch
+        // to report; the name fallback must not paper over it.
+        let shaped = vec![Declared {
+            name: "pred_boxes".into(),
+            dims: Some(vec![1, 300, 6]),
+        }];
+        let err = bind(roles, &shaped).unwrap_err().to_string();
+        assert!(err.contains("[1, 300, 6]"), "{err}");
+        assert!(!err.contains("pred_boxes/logits"), "{err}");
     }
 
     #[test]
@@ -3502,7 +3797,7 @@ mod tests {
         // ...and it outranks a profile's family default, which is only a
         // fallback for an export that declares nothing
         assert_eq!(
-            resolve_input_size(declared, None, Some(YOLOX_416), model).unwrap(),
+            resolve_input_size(declared, None, Some(YOLOX), model).unwrap(),
             (InputSize::square(320), InputSizeSource::Model)
         );
     }
@@ -3516,12 +3811,12 @@ mod tests {
         );
         // the flag outranks a profile default too
         assert_eq!(
-            resolve_input_size(None, Some(SQUARE), Some(YOLOX_416), model).unwrap(),
+            resolve_input_size(None, Some(SQUARE), Some(YOLOX), model).unwrap(),
             (SQUARE, InputSizeSource::Flag)
         );
         // a profile default is the last resort...
         assert_eq!(
-            resolve_input_size(None, None, Some(YOLOX_416), model).unwrap(),
+            resolve_input_size(None, None, Some(YOLOX), model).unwrap(),
             (YOLOX_416, InputSizeSource::Profile)
         );
         // ...and without any of the three there is nothing to build a scaler
@@ -3530,6 +3825,40 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("--input-size"), "{err}");
+    }
+
+    #[test]
+    fn a_multi_resolution_profile_refuses_to_supply_a_size_it_cannot_know() {
+        let model = Path::new("rfdetr_small.onnx");
+        // Nano's 384 sits in the profile, but every RF-DETR export leaves its
+        // spatial axes dynamic and declares nothing that says which variant it
+        // is, so a `small` fed 384 runs to completion and detects nothing.
+        // Refusing is the only honest answer; the error carries the set.
+        let err = resolve_input_size(None, None, Some(RFDETR), model)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--input-size"), "{err}");
+        assert!(err.contains("rfdetr"), "{err}");
+        assert!(err.contains(&model.display().to_string()), "{err}");
+        for size in ["384", "512", "560", "576", "704"] {
+            assert!(err.contains(size), "variant {size} missing from {err}");
+        }
+
+        // The flag it asks for is all it needs.
+        assert_eq!(
+            resolve_input_size(None, Some(InputSize::square(512)), Some(RFDETR), model).unwrap(),
+            (InputSize::square(512), InputSizeSource::Flag)
+        );
+        // A model that pins its own size answers for itself, profile or not.
+        assert_eq!(
+            resolve_input_size(Some(InputSize::square(512)), None, Some(RFDETR), model).unwrap(),
+            (InputSize::square(512), InputSizeSource::Model)
+        );
+        // A family whose exports pin their geometry still gets its default.
+        assert_eq!(
+            resolve_input_size(None, None, Some(YOLOX), model).unwrap(),
+            (YOLOX_416, InputSizeSource::Profile)
+        );
     }
 
     #[test]

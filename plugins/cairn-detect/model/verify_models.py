@@ -5,9 +5,12 @@ Verify an INT8-quantized cairn-detect model against its FP32 original:
   - detection agreement on held-out frames (not used for calibration)
   - single-frame CPU latency and file size for both models
 
-Model-agnostic: geometry, layout and preprocessing are read off the model by
-`quantize_model.describe`, and the decode mirrors src/infer.rs for the three
-single-tensor layouts (yolox, yolov10 end-to-end, yolov8 raw head). The
+Model-agnostic across the single-tensor families: geometry and layout are
+read off the model by `quantize_model.describe`, the preprocessing (encoding
+*and* resize policy) comes from `quantize_model.preprocessing`, and the decode
+mirrors src/infer.rs for the three single-tensor layouts (yolox, yolov10
+end-to-end, yolov8 raw head). Frames go through the same `load_image_chw` the
+calibration uses, so a letterboxing family is verified letterboxed. The
 two-tensor RF-DETR layout is not covered here -- quantizing it has not been
 evaluated, and the plugin's own end-to-end harness in verify/ is what
 exercises that path. Defaults target yolox_nano.onnx, which is Apache-2.0
@@ -29,7 +32,12 @@ import numpy as np
 import onnx
 import onnxruntime as ort
 
-from quantize_model import YOLOX_STRIDES, describe, load_image_chw
+from quantize_model import (
+    YOLOX_STRIDES,
+    describe,
+    load_image_chw,
+    preprocessing,
+)
 
 SP = os.path.dirname(os.path.abspath(__file__))
 # Defaults follow the repo layout: model artifacts live in the plugin root
@@ -227,10 +235,11 @@ def main():
     ap.add_argument("--fp32", default=FP32_PATH)
     ap.add_argument("--int8", default=INT8_PATH)
     ap.add_argument("--frames-dir", default=HELDOUT_DIR,
-                    help="dir of held-out PNGs at the model's input size "
-                         "(see quantize-model.md)")
+                    help="dir of held-out PNGs; any size, they go through the "
+                         "profile's own resize (see quantize-model.md)")
     ap.add_argument("--input-encoding", choices=("raw-bgr", "unit-rgb"), default=None,
-                    help="override the preprocessing inferred from the layout")
+                    help="override the channel order/scale inferred from the "
+                         "layout; the resize policy still follows the profile")
     ap.add_argument("--score-thresh", type=float, default=0.5)
     args = ap.parse_args()
 
@@ -247,9 +256,13 @@ def main():
     width, height, layout = info["width"], info["height"], info["layout"]
     if not width or not height:
         raise SystemExit(f"{args.fp32} leaves its spatial dims dynamic")
-    encoding = args.input_encoding or ("raw-bgr" if layout == "yolox" else "unit-rgb")
+    profile = preprocessing(layout, args.input_encoding)
+    resize = profile["resize"]
+    if resize == "letterbox":
+        resize += f" (pad {profile['pad']})"
     print(f"=== 0. Model ===\n{width}x{height}, output {info['output_dims']}, "
-          f"layout {layout or 'unrecognized'}, feeding {encoding}\n")
+          f"layout {layout or 'unrecognized'}, feeding {profile['encoding']} "
+          f"/ {resize}\n")
 
     print("=== 1. I/O parity check ===")
     check_io_parity(args.fp32, args.int8)
@@ -277,7 +290,8 @@ def main():
     all_score_deltas = []
 
     for p in paths:
-        x = load_image_chw(p, width, height, encoding)
+        x = load_image_chw(p, width, height, profile["encoding"],
+                           profile["resize"], profile["pad"])
         dets_fp32 = decode_detections(
             run(sess_fp32, x), layout, width, height, args.score_thresh)
         dets_int8 = decode_detections(
@@ -316,7 +330,8 @@ def main():
         print("No matched detections to compute score delta.")
 
     print("\n=== 6. Latency (CPU, onnxruntime defaults, 3 warmup + 20 runs) ===")
-    x = load_image_chw(paths[0], width, height, encoding)
+    x = load_image_chw(paths[0], width, height, profile["encoding"],
+                       profile["resize"], profile["pad"])
     mean_f, std_f, min_f, max_f = bench_latency(sess_fp32, x)
     mean_i, std_i, min_i, max_i = bench_latency(sess_int8, x)
     print(f"FP32: mean={mean_f*1000:.2f}ms std={std_f*1000:.2f}ms "

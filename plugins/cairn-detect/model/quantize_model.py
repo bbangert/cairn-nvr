@@ -13,12 +13,21 @@ well on a yolov10 / yolov8 export you have brought yourself; note those
 weights are AGPL-3.0 and this repository does not ship or fetch them.
 
 Preprocessing MUST match the inference plugin exactly, which means it depends
-on the model family:
+on the model family. The families and their preprocessing are in PROFILES
+below, mirroring ModelProfile in src/infer.rs:
 
-  - plain resize to the model's own HxW (no letterbox / no aspect padding)
-  - yolox:            BGR channel order, float32 in 0..255
-  - yolov10 / yolov8: RGB channel order, float32 scaled to 0..1
-  - CHW layout, batch dim of 1
+  - yolox:            BGR in 0..255, letterboxed (aspect preserved, pad 114)
+  - yolov10 / yolov8: RGB scaled to 0..1, stretched to the model's own HxW
+  - CHW layout, batch dim of 1, always
+
+Calibration under the wrong resize policy is not a small error: it measures
+MinMax activation ranges over a distribution the deployed model never sees.
+`load_image_chw` applies the resolved profile's policy to whatever it is
+handed, so a frame set extracted at the source resolution and one extracted
+at the model's geometry both produce the same tensor.
+
+RF-DETR is not covered: its two-tensor layout is not one this script
+recognizes, and its ImageNet-normalized encoding is not one it offers.
 
 Usage:
     python3 -m venv quant-venv && . quant-venv/bin/activate
@@ -32,6 +41,7 @@ Usage:
 """
 import argparse
 import glob
+import math
 import os
 import sys
 
@@ -50,9 +60,61 @@ from onnxruntime.quantization.shape_inference import quant_pre_process
 # src/infer.rs; the anchor count they imply is what identifies the layout.
 YOLOX_STRIDES = (8, 16, 32)
 
+# The input half of each ModelProfile in src/infer.rs. Encoding and resize
+# policy travel together because they are both properties of how the family
+# was trained, and calibrating under either one wrong measures activation
+# ranges for a model nobody is deploying.
+#
+# Kept in step with `YOLOX.input` / `YOLOV10.input` / `YOLOV8.input` there.
+# RF-DETR is deliberately absent: its layout is not one `describe` reads and
+# its ImageNet normalization is not one this script encodes.
+PROFILES = {
+    "yolox": {"encoding": "raw-bgr", "resize": "letterbox", "pad": 114},
+    "yolov10": {"encoding": "unit-rgb", "resize": "stretch", "pad": 0},
+    "yolov8": {"encoding": "unit-rgb", "resize": "stretch", "pad": 0},
+}
+
+# What an unrecognized layout falls back to, which the caller warns about.
+UNKNOWN_PROFILE = {"encoding": "unit-rgb", "resize": "stretch", "pad": 0}
+
+
+def preprocessing(layout, encoding: str = None) -> dict:
+    """The resolved profile's preprocessing: encoding, resize policy, pad.
+
+    `encoding` overrides only the encoding — the resize policy comes from the
+    layout either way, because it is not something a flag has ever selected
+    and guessing it wrong is silent.
+    """
+    profile = dict(PROFILES.get(layout, UNKNOWN_PROFILE))
+    if encoding:
+        profile["encoding"] = encoding
+    return profile
+
 
 def yolox_anchors(width: int, height: int) -> int:
     return sum((width // s) * (height // s) for s in YOLOX_STRIDES)
+
+
+def scaled_dim(side: int, ratio: float, limit: int) -> int:
+    """A letterboxed side length. Mirrors `scaled_dim` in src/infer.rs:
+    floor(side * ratio), forced even, clamped into 1..=limit."""
+    scaled = max(0, int(math.floor(side * ratio)))
+    even = (min(scaled, limit) // 2) * 2
+    return max(1, min(limit, max(2, even)))
+
+
+def content_size(source, width: int, height: int, resize: str):
+    """Where a `source`-sized frame lands inside a width x height tensor.
+
+    Mirrors `ResizePolicy::fit` in src/infer.rs. The content always sits at
+    the top-left and the padding lands bottom-right, which is what YOLOX's own
+    `preproc` does (`padded_img[: int(h*r), : int(w*r)] = resized`).
+    """
+    if resize != "letterbox":
+        return width, height
+    src_w, src_h = source
+    ratio = min(width / src_w, height / src_h)
+    return scaled_dim(src_w, ratio, width), scaled_dim(src_h, ratio, height)
 
 
 def _dims(value_info) -> list:
@@ -106,17 +168,32 @@ def describe(model_path: str) -> dict:
     }
 
 
-def load_image_chw(path: str, width: int, height: int, encoding: str) -> np.ndarray:
+def load_image_chw(
+    path: str, width: int, height: int, encoding: str, resize: str = "stretch",
+    pad: int = 0,
+) -> np.ndarray:
     """A calibration PNG -> the model's exact input tensor.
 
-    The calibration/held-out PNGs should already be at the model's size, from
-    a plain ffmpeg `scale=W:H` (no letterboxing), matching the plugin. The
-    resize below is only a guard for a caller that passes something else.
+    The geometry comes from the resolved profile, not from the caller's frame
+    set: whatever size the PNG is, this reproduces what the plugin would build
+    from a camera frame of that size, under the same policy. A frame already
+    at the model's geometry is a fixed point of both policies, so a frame set
+    extracted per quantize-model.md passes through untouched.
+
+    Padding goes in *before* the encoding, as a pixel value, because that is
+    where the plugin puts it (`pack_chw` in src/decode.rs encodes pad bytes
+    through the same `Packing` as real pixels) — the model was trained on a
+    padded picture, not on an out-of-range constant.
     """
     im = Image.open(path).convert("RGB")
-    if im.size != (width, height):
-        # matches the plugin's SWS_BILINEAR stretch
-        im = im.resize((width, height), Image.BILINEAR)
+    inner = content_size(im.size, width, height, resize)
+    if im.size != inner:
+        # matches the plugin's SWS_BILINEAR resize
+        im = im.resize(inner, Image.BILINEAR)
+    if inner != (width, height):
+        canvas = Image.new("RGB", (width, height), (pad, pad, pad))
+        canvas.paste(im, (0, 0))
+        im = canvas
     arr = np.asarray(im, dtype=np.float32)  # HWC, RGB, 0..255
     if encoding == "raw-bgr":
         arr = arr[:, :, ::-1]
@@ -130,11 +207,11 @@ def load_image_chw(path: str, width: int, height: int, encoding: str) -> np.ndar
 class FolderCalibrationDataReader(CalibrationDataReader):
     """Feeds every image in a folder to the model once, in filename order."""
 
-    def __init__(self, calib_dir, input_name, width, height, encoding):
+    def __init__(self, calib_dir, input_name, width, height, profile):
         self.input_name = input_name
         self.width = width
         self.height = height
-        self.encoding = encoding
+        self.profile = profile
         self.paths = sorted(glob.glob(os.path.join(calib_dir, "*.png")))
         if not self.paths:
             raise RuntimeError(f"No calibration PNGs found in {calib_dir}")
@@ -146,7 +223,12 @@ class FolderCalibrationDataReader(CalibrationDataReader):
             return None
         return {
             self.input_name: load_image_chw(
-                path, self.width, self.height, self.encoding
+                path,
+                self.width,
+                self.height,
+                self.profile["encoding"],
+                self.profile["resize"],
+                self.profile["pad"],
             )
         }
 
@@ -177,7 +259,9 @@ def main():
         "--input-encoding",
         choices=("raw-bgr", "unit-rgb"),
         default=None,
-        help="Override the preprocessing inferred from the detected layout.",
+        help="Override the channel order/scale inferred from the detected "
+        "layout. The resize policy still follows the profile. There is no "
+        "imagenet option: RF-DETR is not quantized here.",
     )
     ap.add_argument(
         "--exclude-node",
@@ -213,16 +297,18 @@ def main():
             f"{args.model} leaves its spatial dims dynamic; this script needs a "
             f"pinned input size to build calibration tensors"
         )
-    encoding = args.input_encoding or (
-        "raw-bgr" if info["layout"] == "yolox" else "unit-rgb"
-    )
+    profile = preprocessing(info["layout"], args.input_encoding)
+    resize = profile["resize"]
+    if resize == "letterbox":
+        resize += f" (pad {profile['pad']})"
     per_channel = args.per_channel
     if per_channel is None:
         per_channel = bool(info["opset"] and info["opset"] >= 13)
     print(
         f"      model: input {info['input_name']!r} {width}x{height}, opset "
         f"{info['opset']}, output {info['output_dims']}, layout "
-        f"{info['layout'] or 'unrecognized'}, calibrating with {encoding}"
+        f"{info['layout'] or 'unrecognized'}, calibrating with "
+        f"{profile['encoding']} / {resize}"
     )
     if args.per_channel is None and not per_channel:
         print(
@@ -230,10 +316,12 @@ def main():
             f"DequantizeLinear's `axis` attribute (opset 13), and onnxruntime "
             f"rejects the resulting model at load time"
         )
-    if info["layout"] is None and args.input_encoding is None:
+    if info["layout"] is None:
         print(
-            "      warning: layout not recognized, defaulting to unit-rgb; pass "
-            "--input-encoding if that is wrong",
+            "      warning: layout not recognized, so the preprocessing above is "
+            "a guess (unit-rgb, stretched). --input-encoding fixes the encoding; "
+            "the resize policy has no flag, so a letterboxing family that fails "
+            "to be recognized cannot be calibrated correctly here",
             file=sys.stderr,
         )
 
@@ -295,7 +383,7 @@ def main():
     frames = len(glob.glob(os.path.join(args.calib_dir, "*.png")))
     print(f"[2/3] building calibration reader from {args.calib_dir} ({frames} frames)")
     reader = FolderCalibrationDataReader(
-        args.calib_dir, info["input_name"], width, height, encoding
+        args.calib_dir, info["input_name"], width, height, profile
     )
 
     print(

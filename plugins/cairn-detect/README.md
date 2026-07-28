@@ -110,7 +110,7 @@ named group under `plugins:` and point cameras at it by name — see
 |------|----------|---------|
 | `--model` | yes | ONNX detection model: yolox `[1,A,5+nc]`, detr `[1,Q,4]`+`[1,Q,nc]`, end-to-end `[1,N,6]` or raw `[1,4+nc,A]` (see [Model](#model)) |
 | `--labels` | no | newline-separated class names, indexed by class id; unknown ids fall back to the numeric id |
-| `--input-size` | no | model input `WxH` (or `N` for a square N×N). Read from the model when omitted; required when the model's spatial dims are dynamic, which every RF-DETR export leaves them |
+| `--input-size` | no, except RF-DETR | model input `WxH` (or `N` for a square N×N). Read from the model when omitted; **required** when the model's spatial dims are dynamic, which every RF-DETR export leaves them — `--model-profile` does not substitute for it there (see [Geometry](#geometry)) |
 | `--model-profile` | no | `yolox`, `rfdetr`, `yolov10` or `yolov8` (plus the aliases `rf-detr`, `yolo26`, `yolov9`, `yolo11`, `yolov11`) — the preprocessing and decode steps to run the model under. Sniffed from the model when omitted; required when a shape fits more than one profile or the model's *output* shape is dynamic (see [Model profiles](#model-profiles)) |
 | `--decoder` | no | `auto` (default), `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` |
 
@@ -274,11 +274,14 @@ the next candidate is tried, ending at software decode — a forced
 `--decoder vaapi` on a host without VAAPI runs slowly rather than
 crash-looping under Cairn's restart backoff.
 
-Sampled frames only — never the full stream — are scaled to the model input
-size on the GPU and then downloaded, because downloading full-resolution
-frames would cost more than the decode saving. The filter graphs below are
-shown for a 640x640 model; `w=`/`h=` carry whatever the resolved input size
-is:
+Sampled frames only — never the full stream — are scaled on the GPU and then
+downloaded, because downloading full-resolution frames would cost more than
+the decode saving. They are scaled to the **content rectangle** the resize
+policy asks for, which under a stretch policy is the model input size and
+under a letterbox is the aspect-preserved picture inside it — the padding is
+added on the CPU side, where the tensor is packed. So `w=`/`h=` below are
+`640x640` for a 640 stretch model, but a 416 YOLOX on a 16:9 camera emits
+`scale_vaapi=w=416:h=234:...`. The graphs are shown for the square case:
 
 | backend | device | decoder | sampled-frame filter graph |
 |---------|--------|---------|----------------------------|
@@ -334,11 +337,15 @@ curl -L -o rfdetr_nano.onnx \
     --input-size 384 ...
 ```
 
-`rfdetr_small`, `rfdetr_medium`, `rfdetr_base` and `rfdetr_large` exist at the
+`rfdetr_small`, `rfdetr_base`, `rfdetr_medium` and `rfdetr_large` exist at the
 same URL shape. **Every RF-DETR export leaves its input geometry dynamic**, so
-a larger variant will happily run at the wrong resolution and quietly lose
-accuracy rather than failing — pass `--input-size` to match it: nano 384,
-small 512, base 560, medium 576, large 704. `coco91.names` in this directory
+`--input-size` is not optional for this family — the plugin refuses to start
+without it rather than guess a variant's resolution (see [Geometry](#geometry)).
+The resolutions, ascending, are **nano 384, small 512, base 560, medium 576,
+large 704** — note `base` is smaller than `medium`, which is why they are
+listed in that order here and in the error text. These come from Roboflow's
+published variant table; only nano is exercised in this repo, so check yours
+against upstream before deploying it. `coco91.names` in this directory
 is RF-DETR's label list, which is *not* `coco.names`: RF-DETR indexes its
 logits by the raw COCO category id (1 = person, 3 = car, 64 = potted plant),
 so the file is 91 lines with the retired ids left as bare numbers.
@@ -356,7 +363,7 @@ three are not.
 |---|---|---|
 | **YOLOX** (Megvii) — nano / tiny / s | **Apache-2.0** | **recommended, documented, default** |
 | **RF-DETR** (Roboflow) — nano / small / medium / base / large | **Apache-2.0** | **recommended, documented** |
-| YOLOv9 | GPL-3.0 | decodes; bring your own weights, not documented here |
+| YOLOv9 | GPL-3.0 (AGPL-3.0 via Ultralytics) | decodes; bring your own weights, not documented here |
 | YOLOv10, YOLO26, YOLOv8, YOLOv11 | AGPL-3.0 | decodes; bring your own weights, not documented here |
 | the `ultralytics` package (the `yolo export` CLI) | AGPL-3.0 | not used, not installed, not invoked by anything here |
 
@@ -384,7 +391,7 @@ contract:
 | profile (and the names it answers to) | default size | input encoding | resize | output layout | score | NMS | weights license |
 |---|---|---|---|---|---|---|---|
 | **`yolox`** — nano, tiny, s | 416 | `0..255` **BGR** | **letterbox**, pad 114 | `[1, A, 5 + nc]` grid-objectness, strides 8/16/32 | `objectness × class` | IoU 0.45, top 300 | Apache-2.0 |
-| **`rfdetr`** (`rf-detr`) — nano … large | 384 | **ImageNet-normalized** RGB | stretch | `[1, Q, 4]` + `[1, Q, nc]` detr-queries (**two tensors**) | `sigmoid(class logit)` | none (set prediction) | Apache-2.0 |
+| **`rfdetr`** (`rf-detr`) — nano … large | none — `--input-size` required | **ImageNet-normalized** RGB | stretch | `[1, Q, 4]` + `[1, Q, nc]` detr-queries (**two tensors**) | `sigmoid(class logit)` | none (set prediction) | Apache-2.0 |
 | **`yolov10`** (`yolo26`) | 640 | `0..1` **RGB** | stretch | `[1, N, 6]` end-to-end | class | none (the model did it) | AGPL-3.0 |
 | **`yolov8`** (`yolov9`, `yolo11`, `yolov11`) — what Frigate commonly ships | 640 | `0..1` **RGB** | stretch | `[1, 4 + nc, A]` raw-classes | class | IoU 0.45, top 300 | AGPL-3.0 (GPL-3.0 for YOLOv9) |
 
@@ -488,17 +495,29 @@ You need the flag in three cases:
     is read off the first real output.
   * the export leaves its **input geometry dynamic** and you have not passed
     `--input-size`. Every RF-DETR export does; a symbolic *batch* axis on its
-    own does not count, since this plugin always feeds one frame. Either flag
-    is enough — `--model-profile rfdetr` supplies the family default of 384,
-    `--input-size 384` lets the profile itself still be sniffed.
+    own does not count, since this plugin always feeds one frame. Here the
+    profile is **not** a substitute for the size: `--model-profile rfdetr`
+    refuses to supply one, because RF-DETR's variants are trained at five
+    different resolutions and nothing in any export says which variant it is.
+    `--input-size 384` is what a nano run needs, and it lets the profile
+    itself still be sniffed.
+
+```
+fatal: model rfdetr_small.onnx does not pin its input width and height, and
+       the rfdetr profile has no default to fall back on — every export in the
+       family leaves its spatial axes dynamic and declares nothing that says
+       which variant it is. Pass --input-size WxH (or N); the variants are
+       trained at nano 384, small 512, base 560, medium 576, large 704. A wrong
+       size here is silent: the model runs and detects nothing.
+```
 
 #### Ambiguity is an error, never a guess
 
 A shape that fits two profiles is refused with both names:
 
 ```
-fatal: model m.onnx has output shape [1, 5040, 6], which at input 640x384 fits
-       more than one profile: yolox and yolov10. Nothing in the shape says
+fatal: model m.onnx has outputs "output0" [1, 5040, 6], which at input 640x384
+       fit more than one profile: yolox and yolov10. Nothing in the shapes says
        which, and they decode differently — pass --model-profile <yolox|yolov10>
        to say.
 ```
@@ -620,22 +639,28 @@ filter graph and tensor in the process is built for them. In precedence order:
      contradicts is rejected at startup rather than left to fail on the first
      frame;
   2. the model's own declared input shape;
-  3. the profile's family default (416 for `yolox`, 384 for `rfdetr`, 640
-     otherwise), which only applies to an export with dynamic spatial axes
-     *and* an explicit `--model-profile`.
+  3. the profile's family default (416 for `yolox`, 640 otherwise), which
+     only applies to an export with dynamic spatial axes *and* an explicit
+     `--model-profile` — and **only for a family whose exports pin their
+     geometry**, which excludes `rfdetr`.
 
 The startup line records which of the three it came from. RF-DETR is the case
-where this matters most: its exports declare `[?, 3, ?, ?]`, so **nothing in
-the model constrains the resolution** and a `base` export handed the nano
-default of 384 runs without complaint at the wrong size. Pass `--input-size`
-for anything but nano.
+that shapes the rule: its exports declare `[?, 3, ?, ?]`, so **nothing in the
+model constrains the resolution**, and its five variants are trained at five
+different resolutions that no export distinguishes — every one of them
+declares 300 queries and 91 logits. A `small` export handed Nano's 384 does
+not run badly, it runs *blind*: frames flow, the protocol stays valid, and it
+emits zero detections with nothing on stderr. So the profile declines to
+guess and `--input-size` is required for RF-DETR, with the known resolutions
+in the error text.
 
 ### Quantization
 
-**Don't, for YOLOX-Nano.** Measured: 2.3x *slower* than FP32 and a 0% detection
-match rate against it (the classification-score collapse below, arriving as a
-constant `zebra` on every frame). It is 3.6 MB to begin with, so there is
-almost nothing to win, and its opset-11 graph cannot carry the per-channel
+**Don't, for YOLOX-Nano.** Measured on 200 letterboxed calibration frames and
+10 held-out ones: **1.6x slower** than FP32 (11.83 ms vs 7.56 ms) and a **0%**
+detection match rate against it — 6 FP32 detections became 1, and that one is
+a `banana` where FP32 saw a potted plant. It is 3.6 MB to begin with, so there
+is almost nothing to win, and its opset-11 graph cannot carry the per-channel
 quantization that would make the arithmetic pay. On the larger models where
 the question is worth asking, static QDQ measured *no* latency improvement on
 x86 with AVX-512 and slightly worse recall near the score threshold — a size
@@ -650,15 +675,20 @@ python3 quantize_model.py --model ../yolox_nano.onnx \
 ```
 
 Note what is *not* in that `pip install`: no `ultralytics`, no `torch`. The
-quantization and verification tooling here is model-agnostic and
-Apache-2.0-clean.
+tooling is Apache-2.0-clean, and model-agnostic **across the single-tensor
+families** — it takes geometry and layout off the model and the preprocessing
+(encoding *and* resize policy) off the profile that layout resolves to, so
+calibration frames are letterboxed for YOLOX exactly as the plugin letterboxes
+camera frames. RF-DETR is the exception and is not quantizable here: its
+two-tensor layout is not one these scripts decode.
 
 Whatever you quantize, run `model/verify_models.py` against the FP32 original
 before deploying it. The trap it exists to catch: a detector's
 classification-head convs may have to be excluded, or every confident
 detection's score collapses to one value — measured on YOLOv10 (the three
 `/model.23/one2one_cv3.{0,1,2}.2/Conv` nodes, collapsing to `0.500`) and again
-on YOLOX-Nano (a constant `zebra:0.393`). `--exclude-node` and
+on YOLOX-Nano, where an early scouting run returned a constant `zebra:0.393`
+on 3 of 6 held-out frames. `--exclude-node` and
 `--exclude-suffix` are there for it, and `--preprocess-only` lists the graph's
 conv nodes so you can aim them.
 
