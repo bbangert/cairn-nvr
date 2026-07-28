@@ -218,27 +218,65 @@ pub fn stdout_line(line: &str) -> std::io::Result<()> {
     write_line(&mut std::io::stdout().lock(), line)
 }
 
-/// The per-camera output state every `frame.objects` line needs: the epoch
-/// the host is currently expecting, and this camera's sequence counter.
+/// How often a repeating suppression is logged: the first one, then every
+/// hundredth. A camera the host has not started yet suppresses every frame it
+/// decodes, which is a line per frame at the stream's full rate.
+const SUPPRESSED_LOG_EVERY: u64 = 100;
+
+fn log_suppression(count: u64) -> bool {
+    count == 1 || count.is_multiple_of(SUPPRESSED_LOG_EVERY)
+}
+
+/// Everything one camera carries between frames: its sequence counter and the
+/// tallies behind the rate-limited "not emitted" diagnostics.
 ///
-/// One publisher serves the whole process — a single inference thread emits
-/// for every camera in group mode — so the counters live in a map rather
-/// than in a per-camera struct.
-pub struct Publisher {
-    streams: Arc<Streams>,
-    sequences: HashMap<String, u64>,
+/// The tallies are per camera because the diagnostics name a camera. One
+/// publisher serves the whole process — in group mode a single inference
+/// thread emits for every member — so a process-wide count would be printed
+/// beside a camera id it did not describe, and several ungated members would
+/// each inherit the others' frames.
+#[derive(Default)]
+struct CameraState {
+    sequence: u64,
     ungated: u64,
     unbounded_pts: u64,
+}
+
+/// The per-camera output state every `frame.objects` line needs: the epoch
+/// the host is currently expecting, and this camera's counters.
+pub struct Publisher {
+    streams: Arc<Streams>,
+    cameras: HashMap<String, CameraState>,
 }
 
 impl Publisher {
     pub fn new(streams: Arc<Streams>) -> Self {
         Self {
             streams,
-            sequences: HashMap::new(),
-            ungated: 0,
-            unbounded_pts: 0,
+            cameras: HashMap::new(),
         }
+    }
+
+    /// This camera's state, allocating its key only when the camera is new.
+    ///
+    /// `HashMap<String, _>` looks up by `&str` through `Borrow`, so the frame
+    /// path costs a hash and no allocation. `entry` cannot: it takes an owned
+    /// key, so asking whether the camera is already known would build a
+    /// `String` for every frame of every stream and drop it again.
+    ///
+    /// The probe is `contains_key` rather than the one-lookup
+    /// `match self.cameras.get_mut(id) { Some(s) => s, None => insert }`,
+    /// which the borrow checker rejects (E0499) without Polonius: the `Some`
+    /// arm's borrow is held for the whole return lifetime. Two hashes of a
+    /// short id still beat the allocation this exists to avoid.
+    fn state_of(&mut self, camera_id: &str) -> &mut CameraState {
+        if !self.cameras.contains_key(camera_id) {
+            self.cameras
+                .insert(camera_id.to_string(), CameraState::default());
+        }
+        self.cameras
+            .get_mut(camera_id)
+            .expect("the camera was just inserted if it was missing")
     }
 
     /// The line to write for one frame, or `None` when this camera has no
@@ -268,13 +306,18 @@ impl Publisher {
         observed_at: SystemTime,
         dets: &[Det],
     ) -> Option<String> {
-        let Some(epoch) = self.streams.epoch_of(camera_id) else {
-            self.ungated += 1;
-            if self.ungated.is_multiple_of(100) || self.ungated == 1 {
+        // Read before the state is borrowed: `epoch_of` hands back an owned
+        // epoch, so nothing of `self.streams` is still borrowed below.
+        let epoch = self.streams.epoch_of(camera_id);
+        let state = self.state_of(camera_id);
+
+        let Some(epoch) = epoch else {
+            state.ungated += 1;
+            if log_suppression(state.ungated) {
                 eprintln!(
                     "camera {camera_id}: no stream epoch yet, \
                      {} frame(s) not emitted so far",
-                    self.ungated
+                    state.ungated
                 );
             }
             return None;
@@ -283,27 +326,27 @@ impl Publisher {
         // `(-MAX..=MAX)`, not `pts.abs()`: `i64::MIN.abs()` is itself an
         // overflow, and `i64::MIN` is exactly the saturated value at issue.
         if !(-MAX_PTS..=MAX_PTS).contains(&pts) {
-            self.unbounded_pts += 1;
-            if self.unbounded_pts.is_multiple_of(100) || self.unbounded_pts == 1 {
+            state.unbounded_pts += 1;
+            if log_suppression(state.unbounded_pts) {
                 eprintln!(
                     "camera {camera_id}: pts {pts} is outside the contract's +-2^62, \
                      {} frame(s) not emitted so far",
-                    self.unbounded_pts
+                    state.unbounded_pts
                 );
             }
             return None;
         }
 
-        let sequence = self.sequences.entry(camera_id.to_string()).or_insert(0);
+        let sequence = state.sequence;
+        state.sequence += 1;
         let (json, kept) = objects_line(
             camera_id,
             &epoch,
-            *sequence,
+            sequence,
             pts,
             &rfc3339_utc(observed_at),
             dets,
         );
-        *sequence += 1;
 
         if kept < dets.len() {
             eprintln!(
@@ -703,6 +746,94 @@ mod tests {
             assert_eq!(line["stream_epoch"], OTHER);
             // the counter is per camera, not per epoch: it keeps climbing
             assert_eq!(line["sequence"], 1);
+        }
+
+        fn state<'a>(publisher: &'a Publisher, camera_id: &str) -> &'a CameraState {
+            publisher
+                .cameras
+                .get(camera_id)
+                .expect("a camera that has produced a frame is in the map")
+        }
+
+        #[test]
+        fn suppressed_frames_are_counted_per_camera() {
+            // The diagnostic names one camera, so the number beside it has to
+            // be that camera's. In group mode several members are ungated at
+            // once — a shared counter would report each one's frames on all of
+            // them.
+            let (streams, mut publisher) = publisher(&["front", "drive"]);
+            for _ in 0..3 {
+                assert!(publish(&mut publisher, "front").is_none());
+            }
+            assert!(publish(&mut publisher, "drive").is_none());
+
+            assert_eq!(state(&publisher, "front").ungated, 3);
+            assert_eq!(state(&publisher, "drive").ungated, 1);
+
+            // one member starting leaves the other's tally where it was
+            start(&streams, "front", EPOCH);
+            assert_eq!(publish(&mut publisher, "front").unwrap()["sequence"], 0);
+            assert_eq!(state(&publisher, "front").ungated, 3);
+            assert!(publish(&mut publisher, "drive").is_none());
+            assert_eq!(state(&publisher, "drive").ungated, 2);
+        }
+
+        #[test]
+        fn out_of_range_pts_is_counted_per_camera() {
+            let (streams, mut publisher) = publisher(&["front", "drive"]);
+            start(&streams, "front", EPOCH);
+            start(&streams, "drive", OTHER);
+
+            for _ in 0..2 {
+                assert!(publish_pts(&mut publisher, "front", i64::MIN).is_none());
+            }
+            assert!(publish_pts(&mut publisher, "drive", MAX_PTS + 1).is_none());
+
+            assert_eq!(state(&publisher, "front").unbounded_pts, 2);
+            assert_eq!(state(&publisher, "drive").unbounded_pts, 1);
+            // the two suppressions are counted apart from each other
+            assert_eq!(state(&publisher, "front").ungated, 0);
+        }
+
+        #[test]
+        fn the_rate_limit_fires_on_the_first_and_every_hundredth() {
+            assert!(log_suppression(1));
+            assert!(!log_suppression(2));
+            assert!(log_suppression(SUPPRESSED_LOG_EVERY));
+            assert!(log_suppression(2 * SUPPRESSED_LOG_EVERY));
+            assert!(!log_suppression(SUPPRESSED_LOG_EVERY + 1));
+            // never asked about 0: the counter is incremented before the check,
+            // so the first call is always 1
+        }
+
+        #[test]
+        fn a_running_camera_reuses_its_entry_and_a_new_one_is_added() {
+            // The per-frame path looks the camera up by `&str`; only a camera
+            // it has never seen owns a key. Entry count is the observable side
+            // of that: a map that grew per frame would show it here.
+            let (streams, mut publisher) = publisher(&["front", "drive", "gate"]);
+            start(&streams, "front", EPOCH);
+            start(&streams, "drive", OTHER);
+            start(&streams, "gate", OTHER);
+
+            for expected in 0..200u64 {
+                assert_eq!(
+                    publish(&mut publisher, "front").unwrap()["sequence"],
+                    expected
+                );
+                assert_eq!(
+                    publish(&mut publisher, "drive").unwrap()["sequence"],
+                    expected
+                );
+            }
+            assert_eq!(publisher.cameras.len(), 2);
+
+            // a camera seen for the first time still gets its own state
+            let line = publish(&mut publisher, "gate").unwrap();
+            assert_eq!(line["camera_id"], "gate");
+            assert_eq!(line["sequence"], 0);
+            assert_eq!(publisher.cameras.len(), 3);
+            assert_eq!(state(&publisher, "front").sequence, 200);
         }
     }
 
