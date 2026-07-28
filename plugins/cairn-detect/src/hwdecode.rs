@@ -96,7 +96,7 @@ impl HwBackend {
     /// format, which otherwise depends on the frames pool's software format.
     ///
     /// `target` is the *content* rectangle, not the model input: under a
-    /// letterbox those differ, and the GPU has to produce the aspect-preserving
+    /// letterbox, those differ, and the GPU has to produce the aspect-preserving
     /// size or the padding added afterwards would be padding around an already
     /// distorted picture. The padding itself is added on the CPU while packing
     /// — no backend here has a portable hardware pad filter, and at the fitted
