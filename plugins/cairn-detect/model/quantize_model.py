@@ -56,6 +56,12 @@ from onnxruntime.quantization import (
 )
 from onnxruntime.quantization.shape_inference import quant_pre_process
 
+# Calibration frames are ordinary camera stills, and Pillow's default is to
+# *warn* on a decompression bomb rather than refuse one. Say the bound out
+# loud so a third-party frame set cannot turn `Image.open` into a multi-GB
+# allocation: 64 Mpx is twice an 8K frame and far past anything a camera emits.
+Image.MAX_IMAGE_PIXELS = 64 * 1024 * 1024
+
 # The FPN strides a yolox head emits anchors for. Mirrors YOLOX_STRIDES in
 # src/infer.rs; the anchor count they imply is what identifies the layout.
 YOLOX_STRIDES = (8, 16, 32)

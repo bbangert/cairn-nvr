@@ -33,13 +33,29 @@ pub const MAX_DETS: usize = 32;
 /// Ceiling on either input dimension, enforced wherever a size is resolved.
 ///
 /// Nothing downstream re-checks it: the resolved size is cast to `i32` for
-/// FFmpeg frame and scaler geometry, and multiplied out as `3 * w * h` for
-/// every tensor allocation. Without a bound, a typo'd `--input-size` or a
-/// model declaring nonsense truncates on the cast or asks for a colossal
-/// allocation, which panics or OOMs mid-run instead of failing at startup.
-/// 8192 is far past any real detector input — Ultralytics tops out around
-/// 1280 — and leaves both well inside their types.
+/// FFmpeg frame and scaler geometry. Without a bound, a typo'd `--input-size`
+/// or a model declaring nonsense truncates on the cast instead of failing at
+/// startup. 8192 is far past any real detector input — Ultralytics tops out
+/// around 1280 — and leaves the cast well inside its type.
+///
+/// This bounds each axis and *not* the allocation: see [`MAX_INPUT_PIXELS`],
+/// which is the one that bounds memory.
 const MAX_INPUT_DIM: usize = 8192;
+
+/// Ceiling on the input *area*, enforced alongside [`MAX_INPUT_DIM`].
+///
+/// A per-axis bound says nothing about how much memory a size asks for, and
+/// the size can come straight off the model: `declared_input_size` reads
+/// `shape[2]`/`shape[3]` of an untrusted ONNX. At `8192x8192` — inside the
+/// per-axis limit — the first frame allocates a 768 MiB `pack_chw` tensor and
+/// a 192 MiB RGB24 AVFrame, per decode thread, plus one tensor parked in each
+/// multiplexed member's slot. Four cameras is over 4 GB of steady-state RSS on
+/// the NVR host, all of it decided by a file the operator downloaded.
+///
+/// So the model-declared path gets the rule `decode::MAX_PIXELS` already
+/// applies to camera frames: bound the area. 4 Mpx is `2048x2048`, an order of
+/// magnitude past RF-DETR-Large's 704 and Ultralytics' 1280.
+const MAX_INPUT_PIXELS: usize = 4 * 1024 * 1024;
 
 /// The model's input geometry, resolved once at startup.
 ///
@@ -547,7 +563,12 @@ pub struct NmsSpec {
     ///
     /// A 640x640 raw head offers 8400 anchors and NMS is O(k^2); the cap
     /// bounds that at a few thousand IoU computations. It is applied *after*
-    /// the score sort, so it can only ever discard the weakest candidates.
+    /// the score sort, so it can only ever discard the weakest candidates —
+    /// and only ones already past their own class's floor, because every
+    /// layout that reaches NMS gates per class at candidate time
+    /// ([`candidates_from`]). Truncating before that gate would let a flood of
+    /// high-scoring boxes in excluded classes push out the one class an
+    /// allowlist configuration asked for.
     pub max_candidates: usize,
 }
 
@@ -741,6 +762,34 @@ fn grid_anchors(size: InputSize, strides: &[usize]) -> usize {
         .iter()
         .map(|stride| (size.w / stride) * (size.h / stride))
         .sum()
+}
+
+/// A grid head only decodes at a size its strides divide.
+///
+/// [`grid_anchors`] floor-divides, and so does the walk in
+/// [`grid_objectness`]. At a size the coarsest stride does not divide, both
+/// agree with each other and neither agrees with the model: a real head lays
+/// its cells out by the ceiling its own downsampling produced. The total-count
+/// check in [`validate_layout`] catches that whenever the two totals differ,
+/// but they can coincide — and when they do every box lands in the wrong cell,
+/// which is wrong coordinates with nothing on stderr. So the size is rejected
+/// at startup instead, where the operator who typed it is still watching.
+fn check_grid_divides_input(layout: Layout, size: InputSize) -> Result<()> {
+    let Layout::GridObjectness { strides, .. } = layout else {
+        return Ok(());
+    };
+    let Some(&coarsest) = strides.iter().max() else {
+        return Ok(());
+    };
+    if !size.w.is_multiple_of(coarsest) || !size.h.is_multiple_of(coarsest) {
+        bail!(
+            "input size {size} is not a multiple of {coarsest}, the coarsest stride of a \
+             grid-objectness head — its cells would be walked in a layout the model does not \
+             use, putting every box in the wrong cell. Round each axis to a multiple of \
+             {coarsest}."
+        );
+    }
+    Ok(())
 }
 
 /// One of the model's outputs, as its own metadata declares it.
@@ -1030,10 +1079,16 @@ fn fit_output(spec: OutputSpec, shapes: &Shapes, size: InputSize) -> Result<Outp
 
 /// Which built-in profiles this output shape could be.
 ///
-/// Returning every match rather than the first is the whole point: at 640 a
-/// `[1, 8400, 84]` output is a 79-class yolox *and* nothing else distinguishes
-/// it from a transposed Ultralytics head, and picking one silently would
-/// decode boxes out of a grid that does not exist.
+/// Returning every match rather than the first is the whole point: at 640x384
+/// a `[1, 5040, 6]` output is a 1-class yolox grid head *and* an end-to-end
+/// `[1, N, 6]` row set, because 5040 is exactly that input's anchor count and
+/// 6 is exactly the end-to-end row width. Picking one silently would read four
+/// numbers that are cell offsets and log extents as final pixel corners, or
+/// the reverse — plausible boxes, wrong ones.
+///
+/// (`[1, 8400, 84]` at 640 is *not* an example of this: `RawClasses` requires
+/// `dims[2] > dims[1] * 4`, which an anchor-major shape fails, so that one
+/// sniffs as yolox alone.)
 fn sniff(declared: &[Declared], size: InputSize) -> Vec<ModelProfile> {
     PROFILES
         .iter()
@@ -1145,20 +1200,39 @@ fn sniff_profile(
     }
 }
 
-/// A label file that does not describe the model's classes is a degraded
-/// output, not a fault: ids past the end of the file render as bare numbers,
-/// and `--labels` is optional to begin with.
-fn warn_on_label_mismatch(layout: Layout, labels: &Labels) {
+/// A label file that does not describe the model's classes is a fault, not a
+/// degraded output.
+///
+/// [`Labels::label_for`] indexes the file *positionally*, so a count mismatch
+/// is not "some ids render as numbers" — it is every detection carrying
+/// another class's name. The two documented models make the trap concrete:
+/// YOLOX emits dense COCO-80 class indices and RF-DETR emits the raw COCO
+/// category id (1 = person, 3 = car), so `coco.names` against an RF-DETR
+/// export renders every person as `bicycle` and every car as `motorcycle`.
+/// Nothing downstream can tell: Cairn records events, crops snapshots and
+/// drives Home Assistant under the wrong label, and the per-label score floors
+/// gate the wrong class on the way. Swapping `--model` and forgetting
+/// `--labels` is the likely operator path and its symptom is plausible data,
+/// so it fails at startup instead.
+///
+/// Only a *count* mismatch is detectable from here; a same-length file in the
+/// wrong order is not, and no check can find it.
+fn check_label_count(layout: Layout, labels: &Labels, allow_mismatch: bool) -> Result<()> {
     let Some(classes) = layout.classes() else {
-        return;
+        return Ok(());
     };
     let provided = labels.count();
-    if provided != 0 && provided != classes {
-        eprintln!(
-            "labels: model has {classes} classes but the label file lists {provided}; \
-             class ids past the end will be emitted as numbers"
-        );
+    // 0 is "--labels was not given", which is supported: ids render as numbers.
+    if provided == 0 || provided == classes || allow_mismatch {
+        return Ok(());
     }
+    bail!(
+        "--labels lists {provided} names but the model has {classes} classes. Labels are indexed \
+         by class id, so every detection would be emitted under another class's name — and the \
+         per-label min_score floors would gate the wrong class. coco.names is the 80-entry dense \
+         COCO class list (yolox, yolov8/v10); coco91.names is the 91-slot COCO *category id* \
+         space RF-DETR indexes its logits by. Pass --allow-label-mismatch to run anyway."
+    )
 }
 
 /// Per-class score floor from `--min-score-json`. Cairn enforces these again
@@ -1190,30 +1264,67 @@ impl ScoreFloors {
 
     /// The lowest floor any label could be held to.
     ///
-    /// A raw head prefilters anchors on this before it knows their label, so
-    /// it has to be the floor no configured label can undercut — anything
-    /// higher would silently drop detections a per-label floor admits.
+    /// Only [`Layout::EndToEnd`] needs it: its class id is a number in the
+    /// output row rather than an index into a known `nc`, so there is no
+    /// per-class floor table to look one up in. It has to be the floor no
+    /// configured label can undercut — anything higher would silently drop
+    /// detections a per-label floor admits.
     pub fn min_floor(&self) -> f64 {
         self.by_label.values().copied().fold(self.default, f64::min)
     }
 }
 
+#[derive(Debug)]
 pub struct Labels(Vec<String>);
+
+/// Cap on the `--labels` file, which is operator-supplied and otherwise read
+/// whole: `--labels /dev/zero` would never return.
+const MAX_LABELS_BYTES: u64 = 1 << 20;
+
+/// Cap on entries, for the same reason from the other direction. Past any real
+/// class space — the largest here is COCO's 91-slot id space, and Open Images
+/// tops out around 600.
+const MAX_LABELS: usize = 4096;
 
 impl Labels {
     pub fn load(path: Option<&Path>) -> Result<Self> {
         let Some(path) = path else {
             return Ok(Self(Vec::new()));
         };
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading labels from {}", path.display()))?;
-        Ok(Self(
-            text.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect(),
-        ))
+        let read = || -> std::io::Result<String> {
+            use std::io::Read;
+            let mut text = String::new();
+            std::fs::File::open(path)?
+                .take(MAX_LABELS_BYTES + 1)
+                .read_to_string(&mut text)?;
+            Ok(text)
+        };
+        let text = read().with_context(|| format!("reading labels from {}", path.display()))?;
+        if text.len() as u64 > MAX_LABELS_BYTES {
+            bail!(
+                "labels file {} is over {MAX_LABELS_BYTES} bytes; it is read whole and indexed by \
+                 class id, so it is a class list, not a corpus",
+                path.display()
+            );
+        }
+        // Positions are the class ids, so a blank line is an *unnamed slot*,
+        // not something to skip: filtering one out would shift every later
+        // label by one, permanently and silently. A gap is the natural way to
+        // write a retired id in a COCO-91 file, and `label_for` already renders
+        // an empty entry the way it renders a missing one — as the bare id.
+        // Only the trailing newline every text file ends with is dropped.
+        let mut names: Vec<String> = text.lines().map(|line| line.trim().to_string()).collect();
+        while names.last().is_some_and(String::is_empty) {
+            names.pop();
+        }
+        if names.len() > MAX_LABELS {
+            bail!(
+                "labels file {} lists {} names, over the {MAX_LABELS} cap",
+                path.display(),
+                names.len()
+            );
+        }
+        Ok(Self(names))
     }
 
     /// Names loaded; 0 when `--labels` was not given.
@@ -1222,10 +1333,14 @@ impl Labels {
     }
 
     /// Unknown class ids fall back to their numeric id, so a mismatched label
-    /// file degrades the output instead of hiding detections.
+    /// file degrades the output instead of hiding detections. An *unnamed*
+    /// slot — a blank line, which a gap-id file writes for a retired id —
+    /// falls back the same way rather than emitting `""`, which the host
+    /// refuses.
     pub fn label_for(&self, class_id: usize) -> String {
         self.0
             .get(class_id)
+            .filter(|name| !name.is_empty())
             .cloned()
             .unwrap_or_else(|| class_id.to_string())
     }
@@ -1312,11 +1427,23 @@ fn resolve_input_size(
             ),
         },
     };
-    // Every provenance funnels through here, so the ceiling covers a model's
+    // Every provenance funnels through here, so both ceilings cover a model's
     // declared dims as well as a typo'd flag. Zero is already impossible:
     // `dim` rejects it on the flag and `declared_input_size` requires `> 0`.
     if size.w > MAX_INPUT_DIM || size.h > MAX_INPUT_DIM {
         bail!("input size {size} ({source}) exceeds the {MAX_INPUT_DIM} per-dimension limit");
+    }
+    // The per-axis bound is about casts; this one is about memory, and a size
+    // inside the first can be far outside the second (8192x8192 is a 1 GB
+    // working set per camera). `saturating_mul` because the product is exactly
+    // what is being questioned.
+    let pixels = size.w.saturating_mul(size.h);
+    if pixels > MAX_INPUT_PIXELS {
+        bail!(
+            "input size {size} ({source}) is {pixels} pixels, over the {MAX_INPUT_PIXELS}-pixel \
+             limit (2048x2048): the CHW f32 tensor alone would be {} MB, per camera",
+            pixels.saturating_mul(3 * std::mem::size_of::<f32>()) / (1024 * 1024),
+        );
     }
     Ok((size, source))
 }
@@ -1333,17 +1460,21 @@ pub struct Detector {
     /// `None` until the first output settles `nc`, which only happens for an
     /// export that leaves its output shape dynamic.
     output: Option<OutputSpec>,
+    /// `--allow-label-mismatch`, carried because a deferred layout only
+    /// settles `nc` on the first real output — see [`check_label_count`].
+    allow_label_mismatch: bool,
 }
 
 impl Detector {
     /// `requested` is `--input-size`, `profile` is `--model-profile`; absent,
-    /// the profile is sniffed from the model's own I/O. `labels` is only read
-    /// to warn about a class-count mismatch.
+    /// the profile is sniffed from the model's own I/O. `labels` is read to
+    /// reject a class-count mismatch, which would mislabel every detection.
     pub fn open(
         model: &Path,
         requested: Option<InputSize>,
         profile: Option<ModelProfile>,
         labels: &Labels,
+        allow_label_mismatch: bool,
     ) -> Result<Self> {
         // ort's builder errors carry the builder itself for recovery, which
         // makes them neither Send nor Sync; flatten them to a message.
@@ -1379,8 +1510,9 @@ impl Detector {
             bail!("model {} has no outputs", model.display());
         }
         let (profile, outputs, output) = resolve_profile(profile, &declared, input_size, model)?;
+        check_grid_divides_input(profile.output.layout, input_size)?;
         if let Some(output) = output {
-            warn_on_label_mismatch(output.layout, labels);
+            check_label_count(output.layout, labels, allow_label_mismatch)?;
         }
         Ok(Self {
             session,
@@ -1390,6 +1522,7 @@ impl Detector {
             input_size,
             input_size_source,
             output,
+            allow_label_mismatch,
         })
     }
 
@@ -1462,7 +1595,7 @@ impl Detector {
             None => {
                 let output = fit_output(self.profile.output, &shapes, self.input_size)
                     .with_context(|| format!("--model-profile {}", self.profile))?;
-                warn_on_label_mismatch(output.layout, labels);
+                check_label_count(output.layout, labels, self.allow_label_mismatch)?;
                 eprintln!("output layout: {} (from first output)", output.layout);
                 self.output = Some(output);
                 output
@@ -1500,9 +1633,14 @@ fn decode_output(
 /// decode rather than per anchor.
 ///
 /// [`ScoreFloors`] is keyed by label and [`Labels::label_for`] allocates, so
-/// looking a floor up inside a `Q x nc` loop would allocate tens of thousands
-/// of strings a frame. The class id is the only thing a decode has, and this
-/// is the map between them.
+/// looking a floor up inside a `Q x nc` or `A x nc` loop would allocate tens of
+/// thousands of strings a frame. The class id is the only thing a decode has,
+/// and this is the map between them.
+///
+/// Built per decode rather than cached on [`Detector`] because the floors are
+/// per *camera*: one multiplexed process serves a group whose members each
+/// carry their own `min_score`, so a table cached beside the session would be
+/// the wrong one for every member but the first.
 fn class_floors(nc: usize, labels: &Labels, floors: &ScoreFloors) -> Vec<f64> {
     (0..nc)
         .map(|class_id| floors.floor_for(&labels.label_for(class_id)))
@@ -1519,11 +1657,19 @@ struct Candidate {
 
 /// Pull every anchor/row the layout offers above its floor into candidates.
 ///
-/// The single-tensor layouts cut on `prefilter`, the lowest floor any label
-/// could carry: the cut runs before a candidate's label is known, so anything
-/// higher would drop detections that a per-label floor admits. A DETR head
-/// knows every class's score for a query at once, so it can apply the real
-/// per-label floors instead — see [`detr_queries`].
+/// Every layout that knows a candidate's class id at candidate time gates on
+/// that class's *own* floor here, not on a common lower bound. That is what
+/// keeps [`finish`]'s `truncate(max_candidates)` honest: it must only ever see
+/// candidates that could survive, or a flood of high-scoring boxes in classes
+/// the operator excluded (`default: 1.0` as an allowlist is the documented
+/// pattern) crowds out the one class they asked for, silently.
+///
+/// [`Layout::EndToEnd`] is the exception and cannot join them: its class id is
+/// a number in the output row rather than an index into a known `nc`, so there
+/// is no floor table to look up. It cuts on the lowest floor any label could
+/// carry instead — sound because that layout is NMS-free by construction, so
+/// nothing truncates its candidates and the real per-label gate in [`finish`]
+/// sees them all.
 fn candidates_from(
     output: OutputSpec,
     raw: &Outputs<Raw>,
@@ -1531,38 +1677,38 @@ fn candidates_from(
     labels: &Labels,
     floors: &ScoreFloors,
 ) -> Result<Vec<Candidate>> {
-    let prefilter = floors.min_floor();
     // `validate_layout` has already agreed the roles, so a mismatch here is
     // unreachable rather than a case to handle.
     match (output.layout, raw) {
-        (Layout::EndToEnd, Outputs::One(one)) => Ok(end_to_end(one.values, prefilter)),
+        (Layout::EndToEnd, Outputs::One(one)) => Ok(end_to_end(one.values, floors.min_floor())),
         (Layout::RawClasses { nc }, Outputs::One(one)) => {
             let anchors = one.dims[2] as usize;
-            require_values(one.values.len(), (4 + nc) * anchors, &one.dims)?;
+            require_values(one.values.len(), 4 + nc, anchors, &one.dims)?;
             Ok(raw_classes(
                 one.values,
                 nc,
                 anchors,
+                size,
                 output.score,
-                prefilter,
+                &class_floors(nc, labels, floors),
             ))
         }
         (Layout::GridObjectness { nc, strides }, Outputs::One(one)) => {
             let anchors = grid_anchors(size, strides);
-            require_values(one.values.len(), anchors * (5 + nc), &one.dims)?;
+            require_values(one.values.len(), anchors, 5 + nc, &one.dims)?;
             Ok(grid_objectness(
                 one.values,
                 nc,
                 strides,
                 size,
                 output.score,
-                prefilter,
+                &class_floors(nc, labels, floors),
             ))
         }
         (Layout::DetrQueries { nc }, Outputs::BoxesAndLogits { boxes, logits }) => {
             let queries = logits.dims[1] as usize;
-            require_values(boxes.values.len(), queries * 4, &boxes.dims)?;
-            require_values(logits.values.len(), queries * nc, &logits.dims)?;
+            require_values(boxes.values.len(), queries, 4, &boxes.dims)?;
+            require_values(logits.values.len(), queries, nc, &logits.dims)?;
             Ok(detr_queries(
                 boxes.values,
                 logits.values,
@@ -1580,7 +1726,17 @@ fn candidates_from(
     }
 }
 
-fn require_values(have: usize, need: usize, dims: &[i64]) -> Result<()> {
+/// Does this tensor carry the `rows * row` values the layout is about to index?
+///
+/// The product is `checked_mul` rather than `*` because both factors come off
+/// a *runtime* tensor shape. onnxruntime's extents are consistent with the
+/// buffer it hands back, so a wrap is unreachable today — but this is the one
+/// place the "trust the dims" pattern is not defended, and a wrapped `need`
+/// would pass the length check and let the decode loop walk off the slice.
+fn require_values(have: usize, rows: usize, row: usize, dims: &[i64]) -> Result<()> {
+    let need = rows
+        .checked_mul(row)
+        .ok_or_else(|| anyhow!("output {dims:?} declares an impossible element count"))?;
     if have < need {
         bail!("output {dims:?} declares {need} values but carries {have}");
     }
@@ -1619,12 +1775,17 @@ fn end_to_end(rows: &[f32], prefilter: f64) -> Vec<Candidate> {
 /// `[1, 4 + nc, A]` channels-first: channel `c` of anchor `a` is at
 /// `c * anchors + a`. Rows 0..4 are `cx, cy, w, h` in input pixels; rows 4..
 /// are per-class scores, already sigmoided.
+///
+/// `floors` is one floor per class id, from [`class_floors`]: the argmax names
+/// the class, so this head can hold each candidate to its own floor rather
+/// than to a common lower bound — see [`candidates_from`].
 fn raw_classes(
     values: &[f32],
     nc: usize,
     anchors: usize,
+    size: InputSize,
     score: ScoreComposition,
-    prefilter: f64,
+    floors: &[f64],
 ) -> Vec<Candidate> {
     // This layout has no objectness column, so the composition has nothing to
     // fold in either way — see `ScoreComposition::ObjTimesClass`.
@@ -1636,14 +1797,17 @@ fn raw_classes(
         // than left to be compared against a floor (where every comparison is
         // false) and serialized as `null`, which would take the whole output
         // line out of the contract.
-        if score.is_nan() || score < prefilter {
+        //
+        // `floors` carries one entry per class by construction and `argmax`
+        // ranges over the same `nc`, so the lookup is total.
+        if score.is_nan() || floors.get(class_id).is_none_or(|floor| score < *floor) {
             continue;
         }
         let cx = f64::from(values[a]);
         let cy = f64::from(values[anchors + a]);
         let w = f64::from(values[2 * anchors + a]);
         let h = f64::from(values[3 * anchors + a]);
-        if let Some(corners) = centered(cx, cy, w, h) {
+        if let Some(corners) = centered(cx, cy, w, h, size) {
             candidates.push(Candidate {
                 score,
                 class_id,
@@ -1662,13 +1826,17 @@ fn raw_classes(
 /// stride, which is why they need the grid walked in the same order the model
 /// concatenated it (all of the first stride's cells row-major, then the next).
 /// Entry 4 is objectness and the rest are class scores, both already sigmoided.
+///
+/// `floors` is one floor per class id, from [`class_floors`]: the argmax names
+/// the class, so this head can hold each candidate to its own floor rather
+/// than to a common lower bound — see [`candidates_from`].
 fn grid_objectness(
     values: &[f32],
     nc: usize,
     strides: &[usize],
     size: InputSize,
     score: ScoreComposition,
-    prefilter: f64,
+    floors: &[f64],
 ) -> Vec<Candidate> {
     let row = 5 + nc;
     let mut candidates = Vec::new();
@@ -1688,8 +1856,11 @@ fn grid_objectness(
                 // NaN wins total_cmp's argmax and survives every comparison
                 // against a floor, then serializes as `null` and takes the
                 // whole output line out of the contract.
+                //
+                // `floors` carries one entry per class by construction and
+                // `argmax` ranges over the same `nc`, so the lookup is total.
                 let score = objectness * class_score;
-                if score.is_nan() || score < prefilter {
+                if score.is_nan() || floors.get(class_id).is_none_or(|floor| score < *floor) {
                     continue;
                 }
                 let cx = (f64::from(values[base]) + gx as f64) * stride;
@@ -1698,7 +1869,7 @@ fn grid_objectness(
                 // number, so `centered`'s finite check catches it.
                 let w = f64::from(values[base + 2]).exp() * stride;
                 let h = f64::from(values[base + 3]).exp() * stride;
-                if let Some(corners) = centered(cx, cy, w, h) {
+                if let Some(corners) = centered(cx, cy, w, h, size) {
                     candidates.push(Candidate {
                         score,
                         class_id,
@@ -1784,6 +1955,7 @@ fn detr_queries(
             f64::from(row[1]) * h,
             f64::from(row[2]) * w,
             f64::from(row[3]) * h,
+            size,
         ) {
             candidates.push(Candidate {
                 score,
@@ -1813,10 +1985,23 @@ fn argmax(n: usize, score: impl Fn(usize) -> f64) -> (usize, f64) {
         .expect("a detect head has at least one class")
 }
 
-/// Center/extent -> corners, dropping anything non-finite.
-fn centered(cx: f64, cy: f64, w: f64, h: f64) -> Option<[f64; 4]> {
-    (cx.is_finite() && cy.is_finite() && w.is_finite() && h.is_finite())
-        .then(|| [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0])
+/// Center/extent -> corners, dropping anything non-finite or absurdly large.
+///
+/// The extent bound is not tidiness. `exp()` in the grid decode stays finite up
+/// to `exp(88)`, so a broken or int8-collapsed export can emit a box of `1e38`
+/// model pixels that every finite check accepts and [`det_from`]'s clamp then
+/// turns into exactly `[0, 0, 1, 1]` — a full-frame detection, which is the
+/// worst possible false positive for something that drives recording. Nothing
+/// real is `MAX_EXTENT` times the input rectangle, so cutting there costs
+/// nothing and removes the failure mode.
+fn centered(cx: f64, cy: f64, w: f64, h: f64, size: InputSize) -> Option<[f64; 4]> {
+    /// How far past the input rectangle an extent may still be a real box.
+    /// Generous: a letterboxed decode legitimately puts boxes outside the
+    /// content rectangle, and un-projection is what brings them back.
+    const MAX_EXTENT: f64 = 4.0;
+    let finite = cx.is_finite() && cy.is_finite() && w.is_finite() && h.is_finite();
+    let bounded = w <= MAX_EXTENT * size.w as f64 && h <= MAX_EXTENT * size.h as f64;
+    (finite && bounded).then(|| [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0])
 }
 
 /// Where every layout converges: NMS if the head needs it, then the per-label
@@ -1840,9 +2025,11 @@ fn finish(
         .into_iter()
         .filter_map(|candidate| {
             let label = labels.label_for(candidate.class_id);
-            // The per-label floor waits until after NMS because it needs the
-            // label. Nothing is lost by waiting: NMS only ever drops a box
-            // weaker than one of its own class, which shares its floor.
+            // Re-applied here because [`Layout::EndToEnd`] cannot gate at
+            // candidate time (it has no class table) and because this is the
+            // one place every layout converges. For the rest it is a no-op:
+            // they gated on the same floor already, and NMS only ever drops a
+            // box weaker than one of its own class, which shares it.
             (candidate.score >= floors.floor_for(&label)).then(|| {
                 (
                     candidate.score,
@@ -1904,7 +2091,12 @@ fn det_from(corners: [f64; 4], score: f64, label: String, projection: &Projectio
         // `--labels` is arbitrary user text and the host refuses a label it
         // cannot print; shaping it here keeps the detection instead.
         label: crate::emit::shape_label(&label),
-        score: round_to(score, 3),
+        // Same reason as the bbox clamp below: the host's `validate_det`
+        // requires a 0..1 score and drops the whole detection otherwise, so a
+        // corrupt or badly-quantized export emitting 3.7 would lose a real
+        // detection rather than report an odd number. Non-finite scores are
+        // already rejected upstream, which is what makes `clamp` total here.
+        score: round_to(score.clamp(0.0, 1.0), 3),
         bbox: [
             round_to(x0, 4),
             round_to(y0, 4),
@@ -2709,6 +2901,54 @@ mod tests {
     }
 
     #[test]
+    fn an_out_of_range_score_is_clamped_rather_than_dropped_by_the_host() {
+        // The host's `validate_det` requires a 0..1 score and drops the whole
+        // detection otherwise, which is the one failure mode this module
+        // exists to prevent — same reason the bbox is clamped and the label
+        // shaped. A badly-quantized export emitting 3.7 is a real detection
+        // reported oddly, not a detection to lose.
+        let dets = v8(
+            3,
+            &[
+                (320.0, 320.0, 64.0, 64.0, 0, 3.7),
+                (80.0, 80.0, 64.0, 64.0, 2, -0.5),
+            ],
+            &floors(r#"{"default":-1.0}"#),
+            SQUARE,
+        );
+        // ordered by the *unclamped* score, so the 3.7 is still the strongest
+        assert_eq!(dets.len(), 2);
+        assert_eq!(dets[0].label, "person");
+        assert_eq!(dets[0].score, 1.0);
+        assert_eq!(dets[1].score, 0.0);
+    }
+
+    #[test]
+    fn a_box_far_larger_than_the_input_is_not_a_full_frame_detection() {
+        // `exp(logit) * stride` stays finite to about 1e38, so an int8-
+        // collapsed or corrupt export can emit a box of 1e30 model pixels.
+        // Every finite check accepts it and `det_from`'s clamp turns it into
+        // exactly [0, 0, 1, 1] — a whole-frame detection, the worst possible
+        // false positive for something that triggers recording.
+        assert!(centered(320.0, 320.0, 1e30, 1e30, SQUARE).is_none());
+        assert!(centered(320.0, 320.0, 64.0, 1e30, SQUARE).is_none());
+        let dets = v8(
+            3,
+            &[
+                (320.0, 320.0, 1e30, 1e30, 0, 0.99),
+                (80.0, 80.0, 64.0, 64.0, 2, 0.9),
+            ],
+            &open(),
+            SQUARE,
+        );
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].label, "car");
+        // a box merely outside the input rectangle is still a real box: a
+        // letterboxed decode puts them there and un-projection brings them back
+        assert!(centered(320.0, 320.0, 2.0 * SQUARE.w as f64, 64.0, SQUARE).is_some());
+    }
+
+    #[test]
     fn iou_is_symmetric_and_bounded() {
         let a = [0.0, 0.0, 10.0, 10.0];
         assert_eq!(iou(&a, &a), 1.0);
@@ -2746,6 +2986,57 @@ mod tests {
         assert_eq!(dets.len(), 1);
         assert_eq!(dets[0].label, "car");
         assert_eq!(dets[0].score, 0.03);
+    }
+
+    #[test]
+    fn a_raw_head_gates_per_class_before_the_nms_truncation() {
+        // The documented allowlist pattern: everything excluded, one class
+        // admitted. `truncate(max_candidates)` runs on score alone, so a flood
+        // of stronger candidates in an excluded class must not be able to push
+        // the admitted one out of the cut — they are all discarded anyway, and
+        // losing the person is silent, with nothing on stderr and no line.
+        let floors = floors(r#"{"default":1.0,"person":0.6}"#);
+        let mut anchors: Vec<_> = (0..(DEFAULT_NMS.max_candidates + 200))
+            .map(|i| {
+                // distinct cars, every one of them stronger than the person
+                // and every one of them under the 1.0 that excludes cars
+                let x = (i % 600) as f32;
+                let y = (i / 600) as f32;
+                (x, y, 4.0, 4.0, 2usize, 0.99)
+            })
+            .collect();
+        anchors.push((320.0, 320.0, 64.0, 64.0, 0, 0.65));
+        let dets = v8(3, &anchors, &floors, SQUARE);
+        assert_eq!(
+            dets,
+            vec![Det {
+                label: "person".into(),
+                score: 0.65,
+                bbox: [0.45, 0.45, 0.1, 0.1],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_grid_head_gates_per_class_before_the_nms_truncation() {
+        // The same, for the other head that truncates. 640x640 is 8400
+        // anchors, so there is room to bury the one admitted class under 300+
+        // stronger excluded ones.
+        let floors = floors(r#"{"default":1.0,"person":0.6}"#);
+        let mut out = GridOutput::new(SQUARE, 3);
+        let mut buried = 0;
+        for gy in 0..20 {
+            for gx in 0..20 {
+                out.put((32, gx, gy), [0.0, 0.0, 0.0, 0.0], 1.0, 2, 0.99);
+                buried += 1;
+            }
+        }
+        assert!(buried > DEFAULT_NMS.max_candidates);
+        out.put((8, 40, 40), [0.5, 0.5, 0.0, 0.0], 1.0, 0, 0.65);
+        let dets = out.decode(&floors);
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].label, "person");
+        assert_eq!(dets[0].score, 0.65);
     }
 
     #[test]
@@ -2977,9 +3268,13 @@ mod tests {
 
     #[test]
     fn grid_clamps_boxes_to_the_frame() {
-        // A cell at the edge with a box far wider than the input.
+        // A box wider than the input on both axes, centered: -32..96 over a
+        // 64px input, which clamps to the whole frame. Twice the input rather
+        // than the `exp(4)` = 27x it used to be, because `centered` now drops
+        // an extent that far out — see
+        // `a_box_far_larger_than_the_input_is_not_a_full_frame_detection`.
         let mut out = GridOutput::new(TINY, 3);
-        out.put((32, 0, 0), [0.0, 0.0, 4.0, 4.0], 1.0, 2, 0.9);
+        out.put((32, 0, 0), [1.0, 1.0, 4f32.ln(), 4f32.ln()], 1.0, 2, 0.9);
         assert_eq!(out.decode(&open())[0].bbox, [0.0, 0.0, 1.0, 1.0]);
     }
 
@@ -3704,27 +3999,99 @@ mod tests {
     }
 
     #[test]
-    fn label_count_mismatch_is_a_warning_not_a_failure() {
-        // labels() has 3 names; the call must return either way
+    fn a_label_count_the_model_contradicts_is_fatal() {
+        // labels() has 3 names, so an 80-class head is the coco.names-against-
+        // rfdetr case: every detection would come out under another class's
+        // name, which nothing downstream can detect.
         for layout in [
             Layout::RawClasses { nc: 80 },
-            Layout::RawClasses { nc: 3 },
             Layout::GridObjectness {
                 nc: 80,
                 strides: STRIDES,
             },
-            Layout::GridObjectness {
-                nc: 3,
-                strides: STRIDES,
-            },
-            Layout::EndToEnd,
+            Layout::DetrQueries { nc: 91 },
         ] {
-            warn_on_label_mismatch(layout, &labels());
+            let err = check_label_count(layout, &labels(), false)
+                .unwrap_err()
+                .to_string();
+            // both counts, and the way out
+            assert!(err.contains("3 names"), "{err}");
+            assert!(
+                err.contains(&format!("{} classes", layout.classes().unwrap())),
+                "{err}"
+            );
+            assert!(
+                err.contains("coco.names") && err.contains("coco91.names"),
+                "{err}"
+            );
+            assert!(err.contains("--allow-label-mismatch"), "{err}");
+            // ...which is honoured
+            assert!(check_label_count(layout, &labels(), true).is_ok());
         }
+    }
+
+    #[test]
+    fn a_label_count_the_model_cannot_contradict_is_fine() {
+        // agreeing is not a mismatch
+        assert!(check_label_count(Layout::RawClasses { nc: 3 }, &labels(), false).is_ok());
+        // no --labels at all is supported: ids render as numbers
+        assert!(check_label_count(
+            Layout::RawClasses { nc: 80 },
+            &Labels::load(None).unwrap(),
+            false
+        )
+        .is_ok());
+        // and an end-to-end head declares no class count to check against
+        assert!(check_label_count(Layout::EndToEnd, &labels(), false).is_ok());
         assert_eq!(Layout::EndToEnd.classes(), None);
         assert_eq!(Layout::RawClasses { nc: 7 }.classes(), Some(7));
         assert_eq!(labels().count(), 3);
         assert_eq!(Labels::load(None).unwrap().count(), 0);
+    }
+
+    /// A labels file, written to a unique path under the test tempdir.
+    fn labels_file(name: &str, text: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("cairn-detect-{name}.names"));
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_blank_line_is_an_unnamed_slot_not_a_line_to_skip() {
+        // The natural way to write COCO-91's retired ids. Dropping the blanks
+        // would shift `car` from 3 to 2 and every later class with it —
+        // permanently, silently, and in a file the count check then passes.
+        let path = labels_file("gaps", "unlabeled\nperson\n\ncar\n\n\nbus\n");
+        let loaded = Labels::load(Some(&path)).unwrap();
+        assert_eq!(loaded.count(), 7);
+        assert_eq!(loaded.label_for(1), "person");
+        assert_eq!(loaded.label_for(3), "car");
+        assert_eq!(loaded.label_for(6), "bus");
+        // an unnamed slot renders like a missing one, never as an empty label
+        assert_eq!(loaded.label_for(2), "2");
+        assert_eq!(loaded.label_for(4), "4");
+        assert_eq!(loaded.label_for(99), "99");
+        // only the trailing newline is dropped, so the count still describes
+        // the id space and `check_label_count` can compare it
+        assert!(check_label_count(Layout::DetrQueries { nc: 7 }, &loaded, false).is_ok());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_labels_file_is_bounded() {
+        // `--labels /dev/zero` is the shape of this: read whole, it never ends
+        let path = labels_file("huge", &"x\n".repeat(MAX_LABELS + 1));
+        let err = Labels::load(Some(&path)).unwrap_err().to_string();
+        assert!(err.contains(&MAX_LABELS.to_string()), "{err}");
+        std::fs::remove_file(&path).ok();
+
+        let path = labels_file(
+            "wide",
+            &format!("{}\n", "x".repeat(MAX_LABELS_BYTES as usize)),
+        );
+        let err = Labels::load(Some(&path)).unwrap_err().to_string();
+        assert!(err.contains(&MAX_LABELS_BYTES.to_string()), "{err}");
+        std::fs::remove_file(&path).ok();
     }
 
     // ---- input size resolution ---------------------------------------------
@@ -3907,7 +4274,14 @@ mod tests {
     #[test]
     fn the_limit_itself_is_allowed() {
         let model = Path::new("m.onnx");
-        let at_limit = InputSize::square(MAX_INPUT_DIM);
+        // The widest shape both limits admit: 8192 on one axis is what the
+        // i32 casts are bounded for, and 512 on the other keeps the area
+        // inside what the allocations are bounded for.
+        let at_limit = InputSize {
+            w: MAX_INPUT_DIM,
+            h: MAX_INPUT_PIXELS / MAX_INPUT_DIM,
+        };
+        assert_eq!(at_limit.w * at_limit.h, MAX_INPUT_PIXELS);
         assert_eq!(
             resolve_input_size(None, Some(at_limit), None, model).unwrap(),
             (at_limit, InputSizeSource::Flag)
@@ -3916,9 +4290,78 @@ mod tests {
             resolve_input_size(Some(at_limit), None, None, model).unwrap(),
             (at_limit, InputSizeSource::Model)
         );
-        // the ceiling is what it protects: both stay inside their types
+        // the ceilings are what they protect: the cast stays inside its type
+        // and the tensor inside a working set an NVR host can hold
         assert!(i32::try_from(MAX_INPUT_DIM).is_ok());
-        assert!(at_limit.tensor_len() < usize::MAX);
+        assert_eq!(at_limit.tensor_len(), 3 * MAX_INPUT_PIXELS);
+        assert!(at_limit.tensor_len() * 4 <= 64 * 1024 * 1024);
+        // the square at the same area is admitted too
+        assert!(resolve_input_size(Some(InputSize::square(2048)), None, None, model).is_ok());
+    }
+
+    #[test]
+    fn a_size_inside_the_per_axis_limit_can_still_be_too_large_to_allocate() {
+        // The case the per-axis bound alone lets through: a hostile or corrupt
+        // ONNX declaring [1, 3, 8192, 8192] passes every dimension check and
+        // then asks for an 805 MB tensor plus a 201 MB RGB frame on the first
+        // frame, per decode thread, plus one parked in every multiplexed
+        // member's slot. Four cameras is over 4 GB of RSS decided by a file.
+        let model = Path::new("hostile.onnx");
+        let square = InputSize::square(MAX_INPUT_DIM);
+        assert!(square.w <= MAX_INPUT_DIM && square.h <= MAX_INPUT_DIM);
+        for (declared, requested, source) in [
+            (Some(square), None, "from model"),
+            (None, Some(square), "--input-size"),
+        ] {
+            let err = resolve_input_size(declared, requested, None, model)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("8192x8192"), "{err}");
+            assert!(err.contains(&MAX_INPUT_PIXELS.to_string()), "{err}");
+            assert!(err.contains(source), "{err}");
+            // the number that makes the case, in MB
+            assert!(err.contains("768 MB"), "{err}");
+        }
+        // one pixel over is over, on either axis
+        for over in [
+            InputSize {
+                w: 2048,
+                h: 2048 + 1,
+            },
+            InputSize {
+                w: 2048 + 1,
+                h: 2048,
+            },
+        ] {
+            assert!(resolve_input_size(None, Some(over), None, model).is_err());
+        }
+    }
+
+    #[test]
+    fn a_grid_head_refuses_an_input_its_strides_do_not_divide() {
+        let grid = Layout::GridObjectness {
+            nc: 80,
+            strides: STRIDES,
+        };
+        // 350 is not a multiple of 32: `grid_anchors` and the decode walk both
+        // floor-divide and agree with each other, and a real head at that size
+        // lays its cells out differently. The total-count check only catches
+        // that when the totals differ; when they coincide every box lands in
+        // the wrong cell, which is wrong coordinates with nothing on stderr.
+        let err = check_grid_divides_input(grid, InputSize { w: 640, h: 350 })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("640x350"), "{err}");
+        assert!(err.contains("32"), "{err}");
+
+        // the sizes that matter still pass
+        for size in [YOLOX_416, SQUARE, TINY, InputSize { w: 640, h: 384 }] {
+            assert!(check_grid_divides_input(grid, size).is_ok(), "{size}");
+        }
+        // and no other layout has a grid to divide
+        for layout in [Layout::EndToEnd, Layout::RawClasses { nc: 80 }] {
+            assert!(check_grid_divides_input(layout, InputSize { w: 640, h: 350 }).is_ok());
+        }
     }
 
     #[test]

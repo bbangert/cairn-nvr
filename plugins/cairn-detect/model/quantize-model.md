@@ -24,6 +24,16 @@ source quant-venv/bin/activate
 pip install onnx onnxruntime pillow numpy sympy
 ```
 
+**Run this on a workstation, not on the NVR host.** `onnx.load` and
+`quant_pre_process` do not merely read the model — they parse and *optimize* a
+protobuf in native code, on a file you downloaded. Verify its checksum first
+(the plugin README publishes one per documented model) and do the work
+somewhere a bad parse costs you a container, not your recorder. The scripts
+themselves shell out to nothing and evaluate nothing; the exposure is the
+libraries' parsers, and `Image.open` on any calibration frames that did not
+come from your own cameras (`Image.MAX_IMAGE_PIXELS` is pinned in
+`quantize_model.py` for exactly that).
+
 `sympy` is optional: without it, onnxruntime's symbolic shape inference is
 unavailable and `quantize_model.py` falls back to plain ONNX shape inference
 (see §4.1), which is sufficient. No `torch`, no `ultralytics`, no model

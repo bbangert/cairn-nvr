@@ -90,6 +90,10 @@ cameras:
       # .onnx files are gitignored — fetch this one with the curl in the
       # Model section (or drop in any supported model; see Model).
       - plugins/cairn-detect/yolox_nano.onnx
+      # The labels file belongs to the model above it, not to the plugin:
+      # coco.names is the 80-entry list YOLOX and the Ultralytics families
+      # emit, RF-DETR needs the 91-entry coco91.names. Changing --model
+      # without changing this is a startup error, not a silent mislabel.
       - --labels
       - plugins/cairn-detect/coco.names
       - --decoder
@@ -109,7 +113,8 @@ named group under `plugins:` and point cameras at it by name — see
 | flag | required | meaning |
 |------|----------|---------|
 | `--model` | yes | ONNX detection model: yolox `[1,A,5+nc]`, detr `[1,Q,4]`+`[1,Q,nc]`, end-to-end `[1,N,6]` or raw `[1,4+nc,A]` (see [Model](#model)) |
-| `--labels` | no | newline-separated class names, indexed by class id; unknown ids fall back to the numeric id |
+| `--labels` | no | newline-separated class names, **indexed by class id** — line 1 is class 0. Must match the model: a count that disagrees with the model's class count is a startup error, because positional indexing would emit every detection under another class's name. Ids past the end, and blank lines (unnamed slots), fall back to the numeric id |
+| `--allow-label-mismatch` | no | start anyway when `--labels` and the model disagree about the class count. For a deliberately partial label file; the mislabelling it permits is silent |
 | `--input-size` | no, except RF-DETR | model input `WxH` (or `N` for a square N×N). Read from the model when omitted; **required** when the model's spatial dims are dynamic, which every RF-DETR export leaves them — `--model-profile` does not substitute for it there (see [Geometry](#geometry)) |
 | `--model-profile` | no | `yolox`, `rfdetr`, `yolov10` or `yolov8` (plus the aliases `rf-detr`, `yolo26`, `yolov9`, `yolo11`, `yolov11`) — the preprocessing and decode steps to run the model under. Sniffed from the model when omitted; required when a shape fits more than one profile or the model's *output* shape is dynamic (see [Model profiles](#model-profiles)) |
 | `--decoder` | no | `auto` (default), `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` |
@@ -199,6 +204,8 @@ plugins:
       - plugins/cairn-detect/target/release/cairn-detect
       - --model
       - plugins/cairn-detect/yolox_nano.onnx
+      # coco.names goes with yolox (and yolov8/v10); an rfdetr model needs
+      # coco91.names — see --labels above
       - --labels
       - plugins/cairn-detect/coco.names
 
@@ -309,20 +316,37 @@ the same license as Cairn — so nothing about running them, redistributing
 them, or building on top of them reaches back into your own code. Neither
 needs a CLI installed or a venv built; both are a single `curl`.
 
+**Verify what you downloaded.** The `.onnx` file decides what your NVR
+records, and this plugin reads its input geometry straight off it. Every URL
+below is pinned to an immutable revision and carries the SHA-256 of the exact
+bytes that revision serves, checked against the files this repo's harness was
+run with — so `sha256sum -c` is a real check, not a formality. A mismatch means
+you did not get the file this README describes; stop rather than run it.
+
 **YOLOX-Nano** — 3.6 MB, COCO-80, 416×416. The smaller and faster of the two,
 and the long-standing default here:
 
 ```bash
 cd plugins/cairn-detect
+# a release-asset URL: the 0.1.1rc0 tag is immutable
 curl -L -o yolox_nano.onnx \
   https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_nano.onnx
+echo "c789161ed43c8269fcd4e67c67eeeb4e80c622da2eb296a20bc6007bd18a0b7d  yolox_nano.onnx" \
+  | sha256sum -c
 ```
 
 The same [Megvii release](https://github.com/Megvii-BaseDetection/YOLOX)
 publishes `yolox_tiny.onnx` and `yolox_s.onnx` if you want more accuracy for
 more CPU; drop either in and the plugin reads its geometry and layout off the
-model. `coco.names` in this directory is the COCO-80 label list these weights
-use.
+model. Same URL shape, same tag, and their SHA-256s from that release are:
+
+| file | sha256 |
+|---|---|
+| `yolox_nano.onnx` | `c789161ed43c8269fcd4e67c67eeeb4e80c622da2eb296a20bc6007bd18a0b7d` |
+| `yolox_tiny.onnx` | `427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7` |
+| `yolox_s.onnx` | `c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063` |
+
+`coco.names` in this directory is the COCO-80 label list these weights use.
 
 **RF-DETR-Nano** — 108 MB, COCO-91, 384×384. Roboflow's transformer detector;
 noticeably stronger than YOLOX-Nano on the same footage for noticeably more
@@ -330,15 +354,31 @@ CPU. The `onnx-community` conversions are the ready-made exports:
 
 ```bash
 cd plugins/cairn-detect
+# `resolve/<commit>` rather than `resolve/main`: main is a branch ref and
+# moves. This commit is the repo state as of 2025-07-24.
 curl -L -o rfdetr_nano.onnx \
-  https://huggingface.co/onnx-community/rfdetr_nano-ONNX/resolve/main/onnx/model.onnx
+  https://huggingface.co/onnx-community/rfdetr_nano-ONNX/resolve/eae21cee0687a91bcf9fa071605c48d7705d2d91/onnx/model.onnx
+echo "9cbac6b11ce34a03034e4d5a24cfac5f18632fd6761d1311dd640232088d7fee  rfdetr_nano.onnx" \
+  | sha256sum -c
 
 ./target/release/cairn-detect --model rfdetr_nano.onnx --labels coco91.names \
     --input-size 384 ...
 ```
 
+That SHA-256 is also the file's Git-LFS object id, so it can be confirmed
+against the Hub without downloading anything:
+
+```bash
+curl -s -X POST -H 'Content-Type: application/json' -d '{"paths":["onnx/model.onnx"]}' \
+  https://huggingface.co/api/models/onnx-community/rfdetr_nano-ONNX/paths-info/eae21cee0687a91bcf9fa071605c48d7705d2d91
+```
+
 `rfdetr_small`, `rfdetr_base`, `rfdetr_medium` and `rfdetr_large` exist at the
-same URL shape. **Every RF-DETR export leaves its input geometry dynamic**, so
+same URL shape, in their own repos — resolve each one's own commit and
+checksum the same way, and note the sibling files in these repos
+(`model_fp16.onnx`, `model_int8.onnx`, ...) are *different models*, not
+different encodings of the pinned one. **Every RF-DETR export leaves its input
+geometry dynamic**, so
 `--input-size` is not optional for this family — the plugin refuses to start
 without it rather than guess a variant's resolution (see [Geometry](#geometry)).
 The resolutions, ascending, are **nano 384, small 512, base 560, medium 576,
@@ -562,8 +602,33 @@ Shapes that are *not* ambiguous, and why:
     `A` exactly 3× a YOLOX's and its boxes are already in pixels. YOLOX at
     strides other than 8/16/32 (a P6 head) is out for the same reason.
 
-With `--labels` given, a head whose `nc` disagrees with the label count logs a
-warning and keeps running — unknown ids are emitted as numbers.
+#### Labels belong to the model
+
+`--labels` is indexed **positionally** — line 1 is class 0 — so a file that
+does not describe the model's classes does not degrade the output, it
+falsifies it. The two documented models make the trap concrete: YOLOX emits
+dense COCO-80 class indices, RF-DETR emits the raw COCO **category id**, and
+`coco.names` against an RF-DETR export renders every `person` as `bicycle` and
+every `car` as `motorcycle`. Cairn then records events, crops snapshots and
+drives Home Assistant under the wrong label — and the per-label `min_score`
+floors gate the wrong class on the way in. So a count mismatch is a startup
+error:
+
+```
+fatal: --labels lists 80 names but the model has 91 classes. Labels are indexed
+       by class id, so every detection would be emitted under another class's
+       name — and the per-label min_score floors would gate the wrong class.
+       coco.names is the 80-entry dense COCO class list (yolox, yolov8/v10);
+       coco91.names is the 91-slot COCO *category id* space RF-DETR indexes its
+       logits by. Pass --allow-label-mismatch to run anyway.
+```
+
+Swapping `--model` and forgetting `--labels` is the likely operator path and
+its symptom is plausible data, which is why it fails loudly instead. Omitting
+`--labels` entirely is still supported — ids are then emitted as numbers — and
+so is a blank line, which is how a gap-id file writes a retired id: the slot
+keeps its position and renders as its number. Only the *count* is checkable; a
+same-length file in the wrong order is not, by anything.
 
 ### Input
 
@@ -643,6 +708,19 @@ filter graph and tensor in the process is built for them. In precedence order:
      only applies to an export with dynamic spatial axes *and* an explicit
      `--model-profile` — and **only for a family whose exports pin their
      geometry**, which excludes `rfdetr`.
+
+Whichever of the three answered, the size is bounded before anything is built
+for it: **8192 on either axis** (what the `i32` FFmpeg geometry casts are good
+for) and **4 Mpx of area**, i.e. 2048×2048 (what the allocations are good for).
+The area bound is the one that matters, and it exists because the size can come
+straight off an untrusted model file: `[1, 3, 8192, 8192]` is inside every
+per-axis check and then asks for a 768 MB tensor plus a 201 MB RGB frame **per
+camera** on the first frame. Both limits are an order of magnitude past any
+real detector input — RF-DETR-Large is 704 and Ultralytics tops out at 1280 —
+so hitting one means a typo or a bad model, and it is a startup error either
+way. A `yolox` grid head additionally requires each axis to be a multiple of
+32, its coarsest stride: at a size the strides do not divide, the cell walk
+cannot match the one the model was exported with.
 
 The startup line records which of the three it came from. RF-DETR is the case
 that shapes the rule: its exports declare `[?, 3, ?, ?]`, so **nothing in the
@@ -897,12 +975,14 @@ cap, line-size shedding, RFC3339 formatting), control-line parsing and the
 epoch map it drives (start, restart, a stale `ended`, an unserved camera),
 per-camera sequence isolation and the pre-epoch gate, plus postprocessing,
 score-floor parsing, the SDP string, pts rescaling, tensor packing,
-input-size parsing and resolution, profile resolution (sniffing, the
-ambiguity refusal, an explicit profile validated against the model), the
-resize policies and the projection they imply (including a full-frame
-round-trip under both), the raw-head and grid decodes (argmax, box conversion,
-IoU/NMS, prefilter), decoder probe order and the per-backend filter strings;
-none need network, a model, or a GPU.
+input-size parsing and resolution (including the per-axis and area ceilings),
+profile resolution (sniffing, the ambiguity refusal, an explicit profile
+validated against the model), label loading (gap slots, the count check, the
+file bounds), the resize policies and the projection they imply (including a
+full-frame round-trip under both), the raw-head and grid decodes (argmax, box
+conversion, IoU/NMS, the per-class gate ahead of the NMS truncation, score and
+extent bounds), decoder probe order and the per-backend filter strings; none
+need network, a model, or a GPU.
 
 ## Implementation notes
 
@@ -944,9 +1024,21 @@ none need network, a model, or a GPU.
   boxes against the input rectangle instead of the frame.
 - NMS runs for the raw layout only — an end-to-end export did it inside the
   model — and over at most the top 300 anchors by score, which bounds an
-  O(k²) pass that would otherwise start from 8400. The prefilter feeding it
-  cuts at the *lowest* configured `min_score` floor, so it can never drop a
-  detection some per-label floor would have admitted.
+  O(k²) pass that would otherwise start from 8400. Every layout that reaches
+  that cut gates each candidate on **its own class's** `min_score` floor
+  first, because the cut is by score alone: under the documented allowlist
+  pattern (`default: 1.0` with one class lower) 300 stronger candidates in
+  excluded classes would otherwise push the one configured class out, and all
+  300 are discarded a step later anyway. The end-to-end layout is the
+  exception — its class id is a number in the output row, not an index into a
+  known class table, so it cuts at the lowest configured floor instead, which
+  is safe because that layout is never truncated.
+- A score is clamped to 0..1 and a box to the frame before either is emitted,
+  for the same reason the label is trimmed: the host validates every field and
+  drops the whole *detection* on an out-of-contract one. A box more than 4×
+  the model input is dropped rather than clamped — that is not a box, it is an
+  `exp()` overflow in a broken export, and clamping it would report a
+  full-frame detection.
 - The hardware filter graph is built on the first sampled frame, not at open:
   it needs the decoder's frames pool, which does not exist until something has
   been decoded.

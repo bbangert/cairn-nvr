@@ -86,6 +86,13 @@ struct Args {
     #[arg(long)]
     labels: Option<PathBuf>,
 
+    /// Start even when `--labels` lists a different number of names than the
+    /// model has classes. Off by default: labels are indexed positionally, so
+    /// a count mismatch means every detection is emitted under another class's
+    /// name and the per-label `min_score` floors gate the wrong class.
+    #[arg(long)]
+    allow_label_mismatch: bool,
+
     /// Model input geometry, `N` (square) or `WxH`. Read from the model when
     /// omitted; required for a model with dynamic spatial dims.
     #[arg(long, value_parser = InputSize::parse)]
@@ -140,7 +147,13 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
     let labels = Labels::load(args.labels.as_deref())?;
     // Before any decoder: every scaler and GPU filter graph is built for the
     // size the model resolves to.
-    let detector = Detector::open(&args.model, args.input_size, args.model_profile, &labels)?;
+    let detector = Detector::open(
+        &args.model,
+        args.input_size,
+        args.model_profile,
+        &labels,
+        args.allow_label_mismatch,
+    )?;
     eprintln!(
         "cairn-detect up: cameras=[{}] {}",
         specs
@@ -184,7 +197,13 @@ fn run_single(args: &Args) -> Result<()> {
     let floors = ScoreFloors::parse(args.min_score_json.as_deref().unwrap_or("{}"))?;
     let labels = Labels::load(args.labels.as_deref())?;
     // Before the stream opens: `decode::open` below needs the resolved size.
-    let detector = Detector::open(&args.model, args.input_size, args.model_profile, &labels)?;
+    let detector = Detector::open(
+        &args.model,
+        args.input_size,
+        args.model_profile,
+        &labels,
+        args.allow_label_mismatch,
+    )?;
     let input_spec = detector.input_spec();
     eprintln!(
         "cairn-detect up: camera={camera_id} udp={udp_port} {}",
