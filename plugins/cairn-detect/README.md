@@ -1,17 +1,16 @@
 # cairn-detect
 
-Cairn's shippable reference detection plugin: a single Rust binary that takes
-H.264 RTP on a UDP port — or on several at once, serving a whole plugin group
-from one process — and prints contract ndjson on stdout (see
-`docs/plugin-contract.md`). It decodes on the video ASIC when one is
+Cairn's reference detection plugin: a single Rust binary that takes H.264 RTP
+on a UDP port — or on several at once, serving a whole plugin group from one
+process — and speaks the plugin contract's protocol v1 on stdout and stdin
+(see `docs/plugin-contract.md`). It decodes on the video ASIC when one is
 available, samples to ~5 fps, and runs a YOLO detection model on the CPU
 through onnxruntime — either an end-to-end (NMS-free) export or a stock
 YOLOv8/YOLOv11 one, told apart automatically.
 
-It is a drop-in replacement for the Python `plugins/cpu-reference` command —
-same argv, same output, no Cairn-side changes — and it is what you should
-deploy. `plugins/cpu-reference/` stays as the minimal, readable example for
-people writing their own plugin.
+It is both what you should deploy and the worked example to read when writing
+your own plugin: everything the contract requires of a plugin is exercised
+here, in the two modes Cairn can launch one in.
 
 ## At a glance
 
@@ -19,15 +18,20 @@ people writing their own plugin.
 udp:127.0.0.1:{port}  ->  sdp demuxer (generated SDP, retried mid-GOP)
    -> decode (hardware if a backend opens, else software)
       -> wall-clock sample to 5 fps          <- full-rate frames end here
-         -> WxH RGB24 -> CHW f32 0..1        <- GPU scale + download on HW
+         -> stamp observed_at, WxH RGB24 -> CHW f32 0..1
             -> [size-1 channel, try_send: drop when inference is behind]
-               -> onnxruntime (CPU EP) -> decode + gate -> ndjson on stdout
+               -> onnxruntime (CPU EP) -> decode + gate
+                  -> frame.objects ndjson on stdout, per-camera epoch + sequence
+
+stdin  ->  control thread  ->  per-camera stream epoch map
 ```
 
 Everything expensive happens *after* the sample gate: a hardware decoder
 never pays to scale or download the ~55 fps of frames it is about to discard,
 and inference runs on its own thread so a slow model pass can never stall the
-socket read.
+socket read. stdin has a thread of its own for the same reason in reverse —
+Cairn writes epochs without waiting for us, so they have to be read without
+waiting for anything else.
 
 ## Build (dev container)
 
@@ -103,6 +107,73 @@ named group under `plugins:` and point cameras at it by name — see
 | `--input-size` | no | model input `WxH` (or `N` for a square N×N). Read from the model when omitted; required when the model's spatial dims are dynamic |
 | `--decoder` | no | `auto` (default), `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` |
 
+## The wire protocol
+
+stdout carries protocol v1 ndjson and nothing else — one JSON object per
+line, flushed as it is written, capped at 8192 bytes. Every diagnostic goes
+to stderr, where Cairn logs it. Three message types leave this plugin:
+
+```jsonc
+// once, before the model load
+{"spec":"cairn.plugin","version":1,"type":"plugin.hello",
+ "hello":{"name":"cairn-detect","version":"0.1.0","supported_versions":[1],
+          "capabilities":{"object_tracking":false}}}
+
+// on transitions only; the host rate-limits these to change-or-heartbeat
+{"spec":"cairn.plugin","version":1,"type":"plugin.status",
+ "camera_id":"front_door","status":{"state":"ready"}}
+
+// one per sampled frame
+{"spec":"cairn.plugin","version":1,"type":"frame.objects",
+ "camera_id":"front_door","stream_epoch":"01K…","sequence":41,
+ "frame":{"pts":3735000,"time_base":[1,90000],
+          "observed_at":"2026-07-26T12:34:56.789Z"},
+ "objects":[{"label":"person","score":0.87,"bbox":[0.12,0.34,0.2,0.4]}]}
+```
+
+`capabilities.object_tracking` is `false`: this plugin detects and does not
+track, so every object is a fresh observation and Cairn runs its own tracker
+over them. `observation_kind` is omitted, which the host reads as
+`"detected"` — spelling it out on all 64 objects would cost a quarter of the
+line budget to say the default.
+
+`bbox` is `[x, y, w, h]` normalized to 0..1 against the *frame*, origin
+top-left, y down. `sequence` counts from 0 per camera and only advances for
+lines actually written, so a jump the host sees really is frames lost between
+us and it. `observed_at` is captured when the frame clears the sample gate,
+before inference — it places the frame on Cairn's timeline and is not a
+measure of how long the model took.
+
+### The control channel
+
+Cairn writes back on the plugin's **stdin**, and this is not optional
+reading. A camera's *stream epoch* — a ULID minted per ffmpeg run — only ever
+arrives this way:
+
+```jsonc
+{"spec":"cairn.plugin","version":1,"type":"stream.started",
+ "camera_id":"front_door","stream_epoch":"01K…","rtp":{"clock_rate":90000}}
+{"spec":"cairn.plugin","version":1,"type":"stream.ended",
+ "camera_id":"front_door","stream_epoch":"01K…","reason":"restarted"}
+```
+
+A dedicated thread owns stdin from before the model load until the process
+exits. Cairn writes with `:nosuspend`: a plugin that stops draining does not
+slow the host down, it silently *loses* announcements — and a lost epoch
+means every line that camera produces afterwards is discarded host-side as
+stale. Unknown message types and other protocol versions are ignored rather
+than treated as errors; a malformed line is logged and skipped.
+
+**Frames decoded before a camera's first `stream.started` produce no output
+for that camera.** There is no epoch to put on them that Cairn would accept,
+so a line emitted then is work paid for and thrown away. Decoding continues
+throughout — the first control line simply starts the output, and the count
+of suppressed frames is logged. In group mode the gate is per member: a
+camera Cairn has not announced (or has stopped) is silent while its
+neighbours keep going. A `stream.ended` clears the epoch only when it names
+the one currently held, so a late `ended` from a bounce cannot blank the
+epoch that replaced it.
+
 ## Multiplexed mode
 
 The same binary also serves a whole plugin group from one process. Reach for
@@ -149,9 +220,12 @@ one. Score floors are applied per member. Startup logs the whole roster
 (`cameras=[front_door@17000, driveway@17004]`) to the group's shared
 `{data_dir}/log/plugin-detect.log`.
 
-Every output line carries the `camera_id` of the member it describes — in
-group mode Cairn routes by that field alone, so an untagged line has nowhere
-to go and is dropped.
+Every output line carries the `camera_id` of the member it describes, and the
+`stream_epoch` Cairn last announced for *that* member — in group mode Cairn
+routes by `camera_id` alone, so an untagged line has nowhere to go and is
+dropped, and a line under the wrong epoch is dropped as stale. Sequence
+counters are per member too; a busy camera's count never leaks into a quiet
+one's.
 
 **A silent stream is normal here, not a fault.** Cairn leaves a group running
 when a member camera is stopped or its ffmpeg is bouncing, so each stream is
@@ -167,14 +241,19 @@ Driving it by hand, in the style of the [verify](#verifying-changes) recipe:
 
 ```bash
 python3 verify/feed.py --clip /path/to/fixture.mp4 --port 17000 &
-timeout 30 ./target/release/cairn-detect \
-    --cameras-json '[{"id":"front_door","udp_port":17000,"min_score":{"default":0.5}},
-                     {"id":"driveway","udp_port":17004,"min_score":{"default":0.5}}]' \
-    --model yolov10n.onnx --labels coco.names | python3 verify/validate_ndjson.py
+{ echo '{"spec":"cairn.plugin","version":1,"type":"stream.started","camera_id":"front_door","stream_epoch":"01K0TESTEPOCH00000000000000","rtp":{"clock_rate":90000}}'
+  sleep 30; } \
+  | timeout 30 ./target/release/cairn-detect \
+      --cameras-json '[{"id":"front_door","udp_port":17000,"min_score":{"default":0.5}},
+                       {"id":"driveway","udp_port":17004,"min_score":{"default":0.5}}]' \
+      --model yolov10n.onnx --labels coco.names | python3 verify/validate_ndjson.py
 ```
 
 Feeding only the first port is a fine test: `driveway` just logs
 `stream down ... reopening` and the process keeps serving `front_door`.
+Announcing only the first camera is the other half of the same test — the
+group emits `front_door` frames and logs `no stream epoch yet` for
+`driveway`, which is what a stopped member looks like from in here.
 
 ## Decoder selection
 
@@ -290,16 +369,18 @@ weights.
 ## Performance
 
 Measured 2026-07-25 in this dev container (AMD Ryzen 9 7950X3D, 32 threads,
-Debian 12), 90 s against the same looped 2560x1920 H.264 @ 20 fps fixture,
-both plugins sampling at 5 fps:
+Debian 12), 90 s against a looped 2560x1920 H.264 @ 20 fps fixture, sampling
+at 5 fps:
 
 | plugin | CPU |
 |--------|-----|
-| `plugins/cpu-reference` (Python, PyAV software decode) | ~840% of a core |
+| the Python reference plugin it replaced (PyAV software decode, since removed) | ~840% of a core |
 | `cairn-detect`, software decode | ~114% of a core |
 
-That is a **7.3x reduction before any hardware decode** — most of the Python
-plugin's cost was software-decoding full-rate 2K frames it then threw away.
+That is a **7.3x reduction before any hardware decode**, and it is worth
+knowing where it came from: most of the Python plugin's cost was
+software-decoding full-rate 2K frames it then threw away, which is the
+mistake the sample gate above exists to avoid.
 
 Caveats: the container has no GPU (`/dev/dri` and CUDA both absent), so this
 is the software path only — the hardware backends are implemented and fall
@@ -414,23 +495,33 @@ time instead of the host's.
 
 `verify/` holds the local harness: `feed.py` replays a fixture clip to a UDP
 port with the exact ffmpeg argv Cairn uses, `validate_ndjson.py` checks a
-plugin's stdout against the contract (line validity, pts monotonicity,
-effective sample rate, score/label histogram), and `compare_runs.py` diffs two
-runs — e.g. this plugin against the Python one on the same clip. See
-`verify/README.md` for the two-terminal recipe. A typical run:
+plugin's stdout against protocol v1 (envelope and field bounds, per-camera
+sequence continuity, pts monotonicity, effective sample rate, score/label
+histogram), and `compare_runs.py` diffs two runs on the same clip — FP32
+against INT8, a hardware backend against software. See `verify/README.md` for
+the two-terminal recipe. A typical run, where the brace group stands in for
+Cairn's control channel:
 
 ```bash
 python3 verify/feed.py --clip /path/to/fixture.mp4 --port 17910 &
-timeout 30 ./target/release/cairn-detect --camera-id t --udp-port 17910 \
-    --min-score-json '{"default":0.5}' --model yolov10n.onnx \
-    --labels coco.names | python3 verify/validate_ndjson.py
+{ echo '{"spec":"cairn.plugin","version":1,"type":"stream.started","camera_id":"t","stream_epoch":"01K0TESTEPOCH00000000000000","rtp":{"clock_rate":90000}}'
+  sleep 30; } \
+  | timeout 30 ./target/release/cairn-detect --camera-id t --udp-port 17910 \
+      --min-score-json '{"default":0.5}' --model yolov10n.onnx \
+      --labels coco.names | python3 verify/validate_ndjson.py
 ```
 
-Unit tests (`cargo test`) cover postprocessing, score-floor parsing, the SDP
-string, emit line-size guarding, pts rescaling, tensor packing, input-size
-parsing and resolution, output-layout detection, the raw-head decode (argmax,
-box conversion, IoU/NMS, prefilter), decoder probe order and the per-backend
-filter strings; none need network, a model, or a GPU.
+Drop the control line and the run is still valid — just empty: `hello` and
+`status` arrive, no frames do, and the validator exits nonzero saying so.
+
+Unit tests (`cargo test`) cover the v1 envelope (shape, field bounds, object
+cap, line-size shedding, RFC3339 formatting), control-line parsing and the
+epoch map it drives (start, restart, a stale `ended`, an unserved camera),
+per-camera sequence isolation and the pre-epoch gate, plus postprocessing,
+score-floor parsing, the SDP string, pts rescaling, tensor packing,
+input-size parsing and resolution, output-layout detection, the raw-head
+decode (argmax, box conversion, IoU/NMS, prefilter), decoder probe order and
+the per-backend filter strings; none need network, a model, or a GPU.
 
 ## Implementation notes
 
@@ -439,8 +530,8 @@ filter strings; none need network, a model, or a GPU.
   with "Invalid data found"; after that we exit loudly and let Cairn back off.
   In multiplexed mode that budget is unbounded instead — one member's open
   failure re-opens forever rather than taking the group's other cameras down.
-- The udp `timeout` option (30 s, matching the Python plugin's `timeout=30`)
-  bounds both ends: without it a silent port blocks forever inside the probe,
+- The udp `timeout` option (30 s) bounds both ends: without it a silent port
+  blocks forever inside the probe,
   so the retry loop never gets a second attempt, and a mid-run silence parks
   the packet read instead of exiting for Cairn to restart.
 - The socket binds loopback explicitly (`localaddr`). The SDP's
@@ -462,9 +553,8 @@ filter strings; none need network, a model, or a GPU.
   stalls the socket read long enough to overflow the receive buffer at
   multi-megabit bitrates, which corrupts the stream rather than just dropping
   a sample. Samples are dropped, never queued; every 50th drop is logged.
-- Sampling is wall-clock, not PTS-based, matching the Python plugin: the goal
-  is capping model passes per second, and a bursty stream would otherwise fire
-  several at once.
+- Sampling is wall-clock, not PTS-based: the goal is capping model passes per
+  second, and a bursty stream would otherwise fire several at once.
 - Resizing is a letterbox-free stretch. Bboxes are normalized, so only ratios
   matter.
 - NMS runs for the raw layout only — an end-to-end export did it inside the
@@ -476,4 +566,17 @@ filter strings; none need network, a model, or a GPU.
   it needs the decoder's frames pool, which does not exist until something has
   been decoded.
 - Output lines are capped at 8192 bytes by shedding the lowest-scoring
-  detections; an oversized line would be dropped by Cairn anyway.
+  detections; an oversized line would be dropped by Cairn anyway. The object
+  list is cut at 64 first, and for a harsher reason: an over-cap `objects`
+  list is a contract violation that costs the *whole* line host-side, not
+  just the surplus.
+- stdout is locked per line, never held. `plugin.status` is written from the
+  main thread while the inference thread is emitting frames, and a held
+  `StdoutLock` would park one of them for the life of the process.
+- Labels are shaped where the detection is built: `--labels` is arbitrary
+  user text, and the host refuses a label over 64 bytes or carrying control
+  characters. Trimming keeps the detection; sending it as-is loses it.
+- `observed_at` is stamped at the sample gate, not at emit time. A sample can
+  wait behind a busy model pass, and the host uses this to place the frame on
+  its timeline — stamping it late would fold our own latency into the
+  timeline it feeds.

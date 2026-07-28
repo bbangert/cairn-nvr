@@ -10,7 +10,7 @@
 
 use std::fmt;
 use std::slice;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::ValueEnum;
@@ -58,6 +58,11 @@ impl fmt::Display for DecoderKind {
 
 pub struct Sample {
     pub pts_90k: i64,
+    /// Wall clock at the moment this frame cleared the sample gate — the
+    /// contract's `observed_at`. Captured here rather than at emit time
+    /// because a sample can wait behind a busy model pass, and the host uses
+    /// this to place the frame on its timeline, not to measure our latency.
+    pub observed_at: SystemTime,
     /// CHW RGB f32 in 0..1, `3 * w * h` long for the resolved model input.
     pub tensor: Vec<f32>,
 }
@@ -370,6 +375,7 @@ pub fn run(
                 continue;
             }
             last_sample = Some(now);
+            let observed_at = SystemTime::now();
 
             let pts_90k = pts_90k(&frame, time_base);
             // A frame we cannot convert costs one sample, not the process:
@@ -384,7 +390,11 @@ pub fn run(
                     continue;
                 }
             };
-            if !sink.offer(Sample { pts_90k, tensor })? {
+            if !sink.offer(Sample {
+                pts_90k,
+                observed_at,
+                tensor,
+            })? {
                 dropped += 1;
                 if dropped.is_multiple_of(50) {
                     eprintln!("inference behind: {dropped} samples skipped so far");

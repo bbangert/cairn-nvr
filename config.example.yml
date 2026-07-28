@@ -78,7 +78,7 @@ cameras: []
 #    # token names a group under `plugins:` above (undefined ⇒ config error).
 #    # An inline command of one token must therefore be a one-element list.
 #    # Receives RTP on an assigned UDP port, prints ndjson detections on stdout.
-#    plugin: ["python3", "plugins/cpu-reference/main.py"]
+#    plugin: ["plugins/cairn-detect/target/release/cairn-detect"]
 #    min_score:
 #      default: 0.5
 #      person: 0.6

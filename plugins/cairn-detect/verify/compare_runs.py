@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Drift-tolerant parity comparison between two ndjson detection captures.
 
-Meant for comparing two different plugins/models fed the *same* fixture
-clip (e.g. via feed.py), each piped through validate_ndjson.py's `tee`
-pattern to capture raw ndjson. This is NOT an exact diff -- two different
-models will legitimately disagree on borderline scores and frame sampling
-phase. It reports rates and rough temporal overlap so a human can judge
-"close enough" rather than asserting equality.
+Meant for comparing two runs fed the *same* fixture clip (e.g. via feed.py),
+each piped through validate_ndjson.py's `tee` pattern to capture raw ndjson
+— two models, FP32 against INT8, a decoder backend against software. This is
+NOT an exact diff: two models will legitimately disagree on borderline
+scores and frame sampling phase. It reports rates and rough temporal overlap
+so a human can judge "close enough" rather than asserting equality.
+
+Reads protocol v1 `frame.objects` lines; every other message type is skipped
+without counting against either run.
 
 Usage:
-    ./compare_runs.py --a pythonplugin.ndjson --b rustplugin.ndjson
+    ./compare_runs.py --a fp32.ndjson --b int8.ndjson
     ./compare_runs.py --a a.ndjson --b b.ndjson --labels-only
 """
 import argparse
@@ -21,8 +24,9 @@ BUCKET_TICKS = 90000  # 1 second at the 90kHz RTP clock
 
 
 def load(path):
-    """Parse an ndjson capture. Malformed lines are skipped (not this
-    tool's job to flag -- use validate_ndjson.py for that), but counted."""
+    """Parse the frame.objects lines of an ndjson capture. hello/status lines
+    are not frames and are passed over silently; a malformed line is skipped
+    and counted (not this tool's job to flag -- use validate_ndjson.py)."""
     frames = []
     skipped = 0
     with open(path) as f:
@@ -32,12 +36,14 @@ def load(path):
                 continue
             try:
                 obj = json.loads(raw)
-                pts = int(obj["pts"])
-                dets = obj["dets"]
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                if obj.get("type") != "frame.objects":
+                    continue
+                pts = int(obj["frame"]["pts"])
+                objects = obj["objects"]
+            except (json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError):
                 skipped += 1
                 continue
-            frames.append((pts, dets))
+            frames.append((pts, objects))
     return frames, skipped
 
 
@@ -46,10 +52,10 @@ def analyze(frames):
     of that label), scores (list), buckets (set of 1s pts buckets hit)."""
     total_frames = len(frames)
     by_label = {}
-    for pts, dets in frames:
+    for pts, objects in frames:
         seen_labels_this_frame = set()
         bucket = pts // BUCKET_TICKS
-        for det in dets:
+        for det in objects:
             label = det.get("label", "?")
             score = det.get("score")
             entry = by_label.setdefault(

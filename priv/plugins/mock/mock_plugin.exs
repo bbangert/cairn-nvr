@@ -23,9 +23,20 @@
 # In multiplexed mode every timeline entry additionally carries the
 # "camera_id" it belongs to, and each emitted line echoes that id.
 #
+# Two entry keys exist for driving epoch tests deterministically, without the
+# test sleeping on a race it cannot observe:
+#
+#   "await_epoch_change": true — block until the host announces a *different*
+#     epoch for this entry's camera before emitting.
+#   "epoch": "previous"        — stamp the line with the epoch that most
+#     recently ended instead of the current one, i.e. deliberately emit a
+#     stale-epoch line the host must drop.
+#
 # Protocol v1 is emitted by default: `plugin.hello`, `plugin.status`, then
 # `frame.objects` lines stamped with the `stream_epoch` this plugin was told
 # on stdin. `--v0` emits the original `{"pts", "dets"}` shape instead.
+# `--object-tracking` declares the `object_tracking` capability, which is what
+# makes the host honour per-object "track_id".
 {opts, _rest, _invalid} =
   OptionParser.parse(System.argv(),
     strict: [
@@ -37,6 +48,7 @@
       loop: :boolean,
       hold: :boolean,
       v0: :boolean,
+      object_tracking: :boolean,
       epoch_wait_ms: :integer
     ]
   )
@@ -48,12 +60,14 @@ defmodule MockPlugin do
   def emit(message), do: IO.puts(JSON.encode!(message))
 
   @table :mock_plugin_epochs
+  @previous :mock_plugin_previous_epochs
   @sequences :mock_plugin_sequences
 
   @doc "Public tables the stdin reader writes and the emitter reads."
   @spec new_tables() :: :ok
   def new_tables do
     :ets.new(@table, [:named_table, :public, :set])
+    :ets.new(@previous, [:named_table, :public, :set])
     :ets.new(@sequences, [:named_table, :public, :set])
     :ok
   end
@@ -65,6 +79,15 @@ defmodule MockPlugin do
   @spec epoch(String.t()) :: String.t()
   def epoch(camera_id) do
     case :ets.lookup(@table, camera_id) do
+      [{^camera_id, epoch}] -> epoch
+      [] -> "unknown"
+    end
+  end
+
+  @doc "The epoch most recently ended for this camera — a stale one, by definition."
+  @spec previous_epoch(String.t()) :: String.t()
+  def previous_epoch(camera_id) do
+    case :ets.lookup(@previous, camera_id) do
       [{^camera_id, epoch}] -> epoch
       [] -> "unknown"
     end
@@ -96,11 +119,17 @@ defmodule MockPlugin do
   defp record({:ok, %{"type" => "stream.ended"} = msg}) do
     with camera_id when is_binary(camera_id) <- msg["camera_id"] do
       IO.puts(:stderr, "mock plugin: stream.ended #{camera_id} (#{msg["reason"]})")
+      remember_previous(camera_id, msg["stream_epoch"])
       :ets.delete(@table, camera_id)
     end
   end
 
   defp record(_other), do: :ok
+
+  defp remember_previous(camera_id, epoch) when is_binary(epoch),
+    do: :ets.insert(@previous, {camera_id, epoch})
+
+  defp remember_previous(_camera_id, _epoch), do: :ok
 
   @doc """
   Waits until every camera has an epoch, or the deadline passes.
@@ -119,6 +148,28 @@ defmodule MockPlugin do
       await_epochs(camera_ids, wait_ms - 10)
     end
   end
+
+  @doc """
+  Blocks until this camera's stream has been *replaced* — a `stream.ended`
+  followed by a `stream.started` — at least once since this process started,
+  or the deadline passes.
+
+  Deliberately a state test, not an edge test: "the epoch differs from the one
+  I sampled a moment ago" loses the replacement that landed while the emitter
+  was still working through earlier entries. Having a previous epoch *and* a
+  current one is monotonic, so a caller cannot arrive too late for it.
+  """
+  @spec await_epoch_change(String.t(), integer()) :: :ok
+  def await_epoch_change(_camera_id, wait_ms) when wait_ms <= 0, do: :ok
+
+  def await_epoch_change(camera_id, wait_ms) do
+    if previous_epoch(camera_id) != "unknown" and epoch(camera_id) != "unknown" do
+      :ok
+    else
+      Process.sleep(5)
+      await_epoch_change(camera_id, wait_ms - 5)
+    end
+  end
 end
 
 cameras =
@@ -131,6 +182,7 @@ camera_id = if cameras, do: nil, else: Keyword.fetch!(opts, :camera_id)
 camera_ids = if cameras, do: Enum.map(cameras, & &1["id"]), else: [camera_id]
 timeline_path = Keyword.fetch!(opts, :timeline)
 v1? = !opts[:v0]
+epoch_wait_ms = opts[:epoch_wait_ms] || 3_000
 
 if cameras do
   members = Enum.map_join(cameras, ", ", &"#{&1["id"]}@#{&1["udp_port"]}")
@@ -156,7 +208,7 @@ if v1? do
       "name" => "mock",
       "version" => "1.0.0",
       "supported_versions" => [1],
-      "capabilities" => %{"object_tracking" => false}
+      "capabilities" => %{"object_tracking" => !!opts[:object_tracking]}
     }
   })
 
@@ -167,7 +219,7 @@ if v1? do
     "status" => %{"state" => "ready"}
   })
 
-  MockPlugin.await_epochs(camera_ids, opts[:epoch_wait_ms] || 3_000)
+  MockPlugin.await_epochs(camera_ids, epoch_wait_ms)
 end
 
 emit = fn entries ->
@@ -178,13 +230,19 @@ emit = fn entries ->
     if delay > 0, do: Process.sleep(delay)
     id = if cameras, do: Map.fetch!(entry, "camera_id"), else: camera_id
 
+    if entry["await_epoch_change"], do: MockPlugin.await_epoch_change(id, epoch_wait_ms)
+
     if v1? do
       MockPlugin.emit(%{
         "spec" => "cairn.plugin",
         "version" => 1,
         "type" => "frame.objects",
         "camera_id" => id,
-        "stream_epoch" => MockPlugin.epoch(id),
+        "stream_epoch" =>
+          if(entry["epoch"] == "previous",
+            do: MockPlugin.previous_epoch(id),
+            else: MockPlugin.epoch(id)
+          ),
         "sequence" => MockPlugin.next_sequence(id),
         "frame" => %{
           "pts" => pts,

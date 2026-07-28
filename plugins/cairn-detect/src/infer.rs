@@ -644,7 +644,9 @@ fn det_from(corners: [f64; 4], score: f64, label: String, size: InputSize) -> De
     let x1 = (corners[2] / sx).clamp(0.0, 1.0);
     let y1 = (corners[3] / sy).clamp(0.0, 1.0);
     Det {
-        label,
+        // `--labels` is arbitrary user text and the host refuses a label it
+        // cannot print; shaping it here keeps the detection instead.
+        label: crate::emit::shape_label(&label),
         score: round_to(score, 3),
         bbox: [
             round_to(x0, 4),
