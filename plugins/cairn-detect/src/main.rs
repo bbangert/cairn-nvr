@@ -36,7 +36,7 @@ use rsmpeg::ffi;
 use control::Streams;
 use decode::{DecoderKind, Sample};
 use emit::Publisher;
-use infer::{Detector, InputSize, Labels, ScoreFloors};
+use infer::{Detector, InputSize, Labels, ModelProfile, ScoreFloors};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -69,9 +69,18 @@ struct Args {
     #[arg(long)]
     cameras_json: Option<String>,
 
-    /// NMS-free ONNX detection model ([1, N, 6] output).
+    /// ONNX detection model: a yolox, rfdetr, yolov10/yolo26 or
+    /// yolov8/yolov9/yolo11 head.
     #[arg(long)]
     model: PathBuf,
+
+    /// Preprocessing and decode steps to run this model under: `yolox`,
+    /// `rfdetr`, `yolov10` (or `yolo26`) or `yolov8` (or `yolov9`, `yolo11`,
+    /// `yolov11`). Sniffed from the model's own input and output when
+    /// omitted; required when a shape fits more than one profile, and for
+    /// rfdetr, whose exports leave their input geometry dynamic.
+    #[arg(long, value_parser = ModelProfile::parse)]
+    model_profile: Option<ModelProfile>,
 
     /// Newline-separated label names, indexed by class id.
     #[arg(long)]
@@ -131,20 +140,15 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
     let labels = Labels::load(args.labels.as_deref())?;
     // Before any decoder: every scaler and GPU filter graph is built for the
     // size the model resolves to.
-    let detector = Detector::open(&args.model, args.input_size, &labels)?;
+    let detector = Detector::open(&args.model, args.input_size, args.model_profile, &labels)?;
     eprintln!(
-        "cairn-detect up: cameras=[{}] model={} input={} input size={} ({}) layout={} decoder={}",
+        "cairn-detect up: cameras=[{}] {}",
         specs
             .iter()
             .map(|spec| format!("{}@{}", spec.id, spec.udp_port))
             .collect::<Vec<_>>()
             .join(", "),
-        args.model.display(),
-        detector.input_name(),
-        detector.input_size(),
-        detector.input_size_source(),
-        detector.layout_summary(),
-        args.decoder
+        model_summary(args, &detector)
     );
     // The decoders open per member, and re-open forever after a drop, so the
     // process is as ready as it gets once the model is loaded.
@@ -180,18 +184,11 @@ fn run_single(args: &Args) -> Result<()> {
     let floors = ScoreFloors::parse(args.min_score_json.as_deref().unwrap_or("{}"))?;
     let labels = Labels::load(args.labels.as_deref())?;
     // Before the stream opens: `decode::open` below needs the resolved size.
-    let detector = Detector::open(&args.model, args.input_size, &labels)?;
-    let input_size = detector.input_size();
+    let detector = Detector::open(&args.model, args.input_size, args.model_profile, &labels)?;
+    let input_spec = detector.input_spec();
     eprintln!(
-        "cairn-detect up: camera={} udp={} model={} input={} input size={} ({}) layout={} decoder={}",
-        camera_id,
-        udp_port,
-        args.model.display(),
-        detector.input_name(),
-        input_size,
-        detector.input_size_source(),
-        detector.layout_summary(),
-        args.decoder
+        "cairn-detect up: camera={camera_id} udp={udp_port} {}",
+        model_summary(args, &detector)
     );
 
     // Inference runs off the decode thread. Held inline, a ~100ms model pass
@@ -217,7 +214,7 @@ fn run_single(args: &Args) -> Result<()> {
         let stream = &input.streams()[stream_index];
         (
             stream.time_base,
-            decode::open(args.decoder, &stream.codecpar(), input_size)?,
+            decode::open(args.decoder, &stream.codecpar(), input_spec)?,
         )
     };
 
@@ -235,6 +232,26 @@ fn run_single(args: &Args) -> Result<()> {
     decoded
 }
 
+/// The one line that says what this process will actually run, so a wrong
+/// model or a wrong profile is visible before any frame arrives rather than
+/// inferred later from bad boxes.
+fn model_summary(args: &Args, detector: &Detector) -> String {
+    let spec = detector.input_spec();
+    format!(
+        "model={} profile={} input={} input size={} ({}) encoding={} resize={} layout={} \
+         decoder={}",
+        args.model.display(),
+        detector.profile(),
+        detector.input_name(),
+        spec.size,
+        detector.input_size_source(),
+        spec.encoding,
+        spec.resize,
+        detector.layout_summary(),
+        args.decoder
+    )
+}
+
 fn infer_loop(
     rx: &Receiver<Sample>,
     mut detector: Detector,
@@ -244,7 +261,7 @@ fn infer_loop(
     publisher: &mut Publisher,
 ) -> Result<()> {
     while let Ok(sample) = rx.recv() {
-        let dets = detector.detect(sample.tensor, labels, floors)?;
+        let dets = detector.detect(sample.input.tensor, sample.input.projection, labels, floors)?;
         if let Some(line) = publisher.line_for(camera_id, sample.pts_90k, sample.observed_at, &dets)
         {
             emit::stdout_line(&line).context("writing to stdout")?;

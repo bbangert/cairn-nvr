@@ -70,7 +70,7 @@ retention:
 #   detect:
 #     # the path to your built binary, resolved from Cairn's own working
 #     # directory — not from the plugin's
-#     command: plugins/cairn-detect/target/release/cairn-detect --model yolov10n.onnx --labels coco.names
+#     command: plugins/cairn-detect/target/release/cairn-detect --model yolox_nano.onnx --labels coco.names
 
 cameras: []
 #  - id: front_door

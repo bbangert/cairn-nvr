@@ -26,7 +26,7 @@ validates it live:
 # announcement, then a sleep that holds stdin open for the run
 { echo '{"spec":"cairn.plugin","version":1,"type":"stream.started","camera_id":"test","stream_epoch":"01K0TESTEPOCH00000000000000","rtp":{"clock_rate":90000}}'
   sleep 40; } \
-  | ../target/release/cairn-detect --model ../yolov10n.onnx \
+  | ../target/release/cairn-detect --model ../yolox_nano.onnx \
       --labels ../coco.names --camera-id test --udp-port 17000 \
       --min-score-json '{}' \
   | tee fp32.ndjson | ./validate_ndjson.py

@@ -1,18 +1,22 @@
 //! ONNX inference and postprocess.
 //!
-//! Two detect-head layouts are supported, told apart by the output shape
-//! alone (see [`Layout`]):
+//! Everything that differs between detector families is stated once, as data,
+//! in a [`ModelProfile`]: how frames must be *fed* to the model ([`InputSpec`])
+//! and how its output must be read ([`OutputSpec`]). Adding a family is adding
+//! a profile to [`PROFILES`]; the code below is family-agnostic.
 //!
-//!   * end-to-end / NMS-free (yolov10, YOLO26): `[1, N, 6]` rows of
-//!     `[x1, y1, x2, y2, score, class_id]` in input-pixel space, already
-//!     sorted by score and already de-duplicated by the model.
-//!   * raw (a stock Ultralytics yolov8 / yolo11 detect export):
-//!     `[1, 4 + nc, A]` channels-first over A anchors, `cx, cy, w, h` in
-//!     input pixels and `nc` sigmoided class scores. This one has *not* had
-//!     NMS applied, so this file applies it.
+//! A profile is either named on the command line (`--model-profile`) or
+//! sniffed from the model's own I/O. Sniffing is deliberately strict: a shape
+//! that fits *two* built-in profiles is an error naming both, never a silent
+//! pick — the two are decoded completely differently and the wrong one emits
+//! plausible garbage rather than failing.
 //!
-//! Both converge on the same [`Det`] emission: normalize by the input size,
-//! clamp, sort by score, cap at [`MAX_DETS`].
+//! None of the input half is declared by an ONNX graph. The channel order, the
+//! 0..1-vs-0..255 scaling and the resize policy live in the model's training
+//! transform and an export inherits them as unwritten preconditions. Feeding
+//! the wrong ones is not a small accuracy loss: YOLOX-Nano fed 0..1 RGB
+//! returns no detection at all above 0.3 on a frame where 0..255 BGR finds a
+//! car and a potted plant.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -94,11 +98,252 @@ impl fmt::Display for InputSize {
     }
 }
 
+/// How a decoded frame's bytes are packed into the model's input tensor.
+///
+/// Callers never match on this: they ask for a [`Packing`] and apply it. That
+/// is what lets a mean/std-normalizing family be added as one more variant and
+/// one more `packing` arm, with nothing else to touch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TensorEncoding {
+    /// 0..1 RGB. Ultralytics (yolov8 / yolov10 / yolo11) divides by 255 in its
+    /// preprocessing and works in RGB.
+    UnitRgb,
+    /// 0..255 BGR. YOLOX's `preproc` does no scaling at all and reads images
+    /// through OpenCV, which hands back BGR.
+    RawBgr,
+    /// RGB scaled to 0..1 and then standardized by ImageNet's per-channel
+    /// mean and standard deviation. RF-DETR's transform ends in a `Normalize`
+    /// over [`IMAGENET_MEAN`]/[`IMAGENET_STD`] and its ONNX exports do *not*
+    /// fold it into the graph — measured, not assumed: on one camera frame the
+    /// same rfdetr-nano export scores its best box 0.14 fed 0..255, 0.48 fed
+    /// 0..1, and 0.78 fed this. Only the last one is a detection.
+    ImageNetRgb,
+}
+
+/// ImageNet's channel statistics in RGB order, over a 0..1 range.
+///
+/// Reproduced from RF-DETR's own `kornia_transforms.IMAGENET_MEAN`/`_STD`,
+/// which is also what its exported `preprocessor_config.json` reports.
+const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
+
+impl TensorEncoding {
+    /// The per-plane affine and channel pick this encoding amounts to.
+    pub fn packing(self) -> Packing {
+        match self {
+            Self::UnitRgb => Packing {
+                source: [0, 1, 2],
+                scale: [1.0 / 255.0; 3],
+                bias: [0.0; 3],
+            },
+            Self::RawBgr => Packing {
+                source: [2, 1, 0],
+                scale: [1.0; 3],
+                bias: [0.0; 3],
+            },
+            // (v/255 - mean) / std, distributed over the affine this type
+            // already applies: scale 1/(255*std), bias -mean/std.
+            Self::ImageNetRgb => Packing {
+                source: [0, 1, 2],
+                scale: [
+                    1.0 / 255.0 / IMAGENET_STD[0],
+                    1.0 / 255.0 / IMAGENET_STD[1],
+                    1.0 / 255.0 / IMAGENET_STD[2],
+                ],
+                bias: [
+                    -IMAGENET_MEAN[0] / IMAGENET_STD[0],
+                    -IMAGENET_MEAN[1] / IMAGENET_STD[1],
+                    -IMAGENET_MEAN[2] / IMAGENET_STD[2],
+                ],
+            },
+        }
+    }
+}
+
+/// An encoding reduced to arithmetic: for each output plane, which byte of an
+/// RGB24 pixel feeds it and the affine applied on the way in.
+///
+/// Per-plane rather than scalar so a `mean`/`std` normalization is expressible
+/// here without changing a single caller.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Packing {
+    /// Index into an RGB24 pixel for output plane 0, 1, 2.
+    pub source: [usize; 3],
+    pub scale: [f32; 3],
+    pub bias: [f32; 3],
+}
+
+impl Packing {
+    /// One byte of one plane, encoded.
+    pub fn value(&self, plane: usize, byte: u8) -> f32 {
+        f32::from(byte) * self.scale[plane] + self.bias[plane]
+    }
+}
+
+impl fmt::Display for TensorEncoding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::UnitRgb => "0..1 rgb",
+            Self::RawBgr => "0..255 bgr",
+            Self::ImageNetRgb => "imagenet-normalized rgb",
+        })
+    }
+}
+
+/// How a source frame is made to fit the model's input rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizePolicy {
+    /// Scale each axis independently to fill the input exactly. Cheap and
+    /// correct only for a model trained the same way.
+    Stretch,
+    /// Scale by the smaller of the two ratios and fill the remainder with
+    /// `pad`, preserving aspect. The content goes at the top-left corner and
+    /// the padding lands bottom-right, which is what YOLOX's own `preproc`
+    /// does (`padded_img[: int(h*r), : int(w*r)] = resized`).
+    Letterbox { pad: u8 },
+}
+
+impl fmt::Display for ResizePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stretch => f.write_str("stretch"),
+            Self::Letterbox { pad } => write!(f, "letterbox (pad {pad})"),
+        }
+    }
+}
+
+impl ResizePolicy {
+    /// Where a `source`-sized frame lands inside an `input`-sized tensor.
+    pub fn fit(self, input: InputSize, source: InputSize) -> Fit {
+        match self {
+            Self::Stretch => Fit {
+                inner: input,
+                offset: (0, 0),
+                pad: 0,
+            },
+            Self::Letterbox { pad } => {
+                let ratio = f64::min(
+                    input.w as f64 / source.w as f64,
+                    input.h as f64 / source.h as f64,
+                );
+                Fit {
+                    inner: InputSize {
+                        w: scaled_dim(source.w, ratio, input.w),
+                        h: scaled_dim(source.h, ratio, input.h),
+                    },
+                    offset: (0, 0),
+                    pad,
+                }
+            }
+        }
+    }
+
+    /// The un-projection a `source`-sized frame implies under this policy.
+    ///
+    /// The pipeline itself goes through [`Fit`], which it needs anyway to
+    /// build the scaler; this is the same thing for a caller that only wants
+    /// the coordinate mapping.
+    #[cfg(test)]
+    pub fn project(self, input: InputSize, source: InputSize) -> Projection {
+        self.fit(input, source).projection(source)
+    }
+}
+
+/// A letterboxed side length: `floor(side * ratio)`, forced even and clamped
+/// into `1..=limit`.
+///
+/// Even because the hardware path scales into NV12, whose chroma planes are
+/// half resolution on both axes — an odd side there is either rejected by the
+/// GPU scaler or silently rounded, and a silent round would shift every box by
+/// the rounding it did not tell us about. Losing up to one pixel of content to
+/// the pad is the cheaper side of that trade, and it costs nothing in accuracy
+/// because [`Fit::projection`] is derived from the side we actually produced,
+/// not from `ratio`.
+fn scaled_dim(side: usize, ratio: f64, limit: usize) -> usize {
+    let scaled = (side as f64 * ratio).floor().max(0.0) as usize;
+    let even = (scaled.min(limit) / 2) * 2;
+    even.max(2).min(limit).max(1)
+}
+
+/// Where the scaled frame sits inside the input rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fit {
+    /// Size the source is scaled to. Equal to the input under `Stretch`.
+    pub inner: InputSize,
+    /// Top-left corner of that content within the input rectangle.
+    pub offset: (usize, usize),
+    /// Fill for everything outside `inner`.
+    pub pad: u8,
+}
+
+impl Fit {
+    /// The inverse of this fit: model-space pixels back to the source frame.
+    pub fn projection(self, source: InputSize) -> Projection {
+        Projection {
+            scale: (
+                self.inner.w as f64 / source.w as f64,
+                self.inner.h as f64 / source.h as f64,
+            ),
+            offset: (self.offset.0 as f64, self.offset.1 as f64),
+            source: (source.w as f64, source.h as f64),
+        }
+    }
+}
+
+/// Model-space box -> normalized original-frame box.
+///
+/// Every decode path takes one of these rather than an [`InputSize`], because
+/// under a letterbox the model's coordinate space is *not* the frame's: part
+/// of it is padding that never held any pixels. Dividing by the input size
+/// there — the stretch rule — reports every box short and shifted. Making the
+/// un-projection a value the decoder is handed is what makes forgetting it
+/// impossible.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Projection {
+    /// Model pixels per source pixel, per axis.
+    scale: (f64, f64),
+    /// Top-left of the content in model space.
+    offset: (f64, f64),
+    /// Original frame size, which the result is normalized by.
+    source: (f64, f64),
+}
+
+impl Projection {
+    /// `[x0, y0, x1, y1]` in model pixels -> the same box normalized 0..1
+    /// against the original frame. Not clamped: [`det_from`] does that.
+    pub fn unproject(&self, corners: [f64; 4]) -> [f64; 4] {
+        let x = |v: f64| (v - self.offset.0) / self.scale.0 / self.source.0;
+        let y = |v: f64| (v - self.offset.1) / self.scale.1 / self.source.1;
+        [x(corners[0]), y(corners[1]), x(corners[2]), y(corners[3])]
+    }
+
+    /// The stretch projection for an input size, for callers with no frame in
+    /// hand. Sound because under `Stretch` the source cancels out entirely.
+    #[cfg(test)]
+    pub fn stretch(input: InputSize) -> Self {
+        ResizePolicy::Stretch.project(input, input)
+    }
+}
+
+/// Everything a decoder needs to build a tensor this model will accept.
+///
+/// Carried as one value because the three parts are settled together at
+/// startup and every scaler and GPU filter graph in the process is built for
+/// all of them at once. In a built-in profile `size` is only a fallback: the
+/// model's own declared geometry and `--input-size` both outrank it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputSpec {
+    pub size: InputSize,
+    pub encoding: TensorEncoding,
+    pub resize: ResizePolicy,
+}
+
 /// Where the resolved [`InputSize`] came from, for the startup line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputSizeSource {
     Model,
     Flag,
+    Profile,
 }
 
 impl fmt::Display for InputSizeSource {
@@ -106,87 +351,726 @@ impl fmt::Display for InputSizeSource {
         f.write_str(match self {
             Self::Model => "from model",
             Self::Flag => "from --input-size",
+            Self::Profile => "from --model-profile default",
         })
     }
 }
 
-/// IoU above which two same-class boxes are the same detection.
+/// The model outputs one decode reads, in the roles its layout reads them.
 ///
-/// Ultralytics' own default for a detect head, and only the raw layout ever
-/// reaches it — an end-to-end export has already done this inside the model.
-const NMS_IOU: f64 = 0.45;
+/// Generic over what is carried so a layout's role structure is stated exactly
+/// once and then reused at every stage: `Outputs<()>` is the role set itself,
+/// `Outputs<Declared>` is what the export offers for those roles,
+/// `Outputs<Vec<i64>>` their shapes, `Outputs<Raw>` the tensors a decode
+/// reads. A single-output family never mentions any of this — its layout says
+/// [`Outputs::One`] and everything downstream keeps working on one tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outputs<T> {
+    /// One tensor, whatever the export calls it. Every grid, raw-classes and
+    /// end-to-end head: the box and the class scores share it.
+    One(T),
+    /// DETR's pair, which cannot be one tensor because the boxes are a
+    /// regression over queries and the logits a classification over the same
+    /// queries, with different trailing extents.
+    BoxesAndLogits { boxes: T, logits: T },
+}
 
-/// Candidates carried into NMS, after sorting by score.
-///
-/// A 640x640 raw head offers 8400 anchors and NMS is O(k^2); the cap bounds
-/// that at a few thousand IoU computations. It is applied *after* the score
-/// sort, so it can only ever discard the weakest candidates, and 300 of them
-/// is an order of magnitude more than [`MAX_DETS`] can emit.
-const MAX_CANDIDATES: usize = 300;
+/// A layout's role structure with nothing attached.
+pub type Roles = Outputs<()>;
+/// The shape of each tensor a layout reads.
+pub type Shapes = Outputs<Vec<i64>>;
 
-/// Which detect-head layout the model's output is in.
+impl<T> Outputs<T> {
+    /// Rebuild the same roles over a different payload.
+    fn map<U>(&self, mut f: impl FnMut(&T) -> U) -> Outputs<U> {
+        match self {
+            Self::One(one) => Outputs::One(f(one)),
+            Self::BoxesAndLogits { boxes, logits } => Outputs::BoxesAndLogits {
+                boxes: f(boxes),
+                logits: f(logits),
+            },
+        }
+    }
+
+    /// The same, for a payload that may be missing — `None` if any role's is.
+    fn try_map<U>(&self, mut f: impl FnMut(&T) -> Option<U>) -> Option<Outputs<U>> {
+        Some(match self {
+            Self::One(one) => Outputs::One(f(one)?),
+            Self::BoxesAndLogits { boxes, logits } => Outputs::BoxesAndLogits {
+                boxes: f(boxes)?,
+                logits: f(logits)?,
+            },
+        })
+    }
+
+    /// Every role's payload, in the order an error message lists them.
+    fn each(&self) -> Vec<&T> {
+        match self {
+            Self::One(one) => vec![one],
+            Self::BoxesAndLogits { boxes, logits } => vec![boxes, logits],
+        }
+    }
+}
+
+/// How a detect head's output tensor is laid out.
 ///
-/// Resolved once — from the session's output metadata at startup when the
-/// export pins its shape, otherwise from the first real output.
+/// The counts here (`nc`, and the anchor total the strides imply) are read off
+/// the model's real output shape by [`fit_layout`]; a built-in profile carries
+/// COCO's 80 only as the shape of the thing to fit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
-    /// `[1, N, 6]`, already NMS'd by the model.
-    Yolov10,
-    /// `[1, 4 + nc, A]`, raw: needs argmax, box conversion and NMS.
-    Yolov8 { classes: usize },
+    /// `[1, N, 6]` rows of `[x1, y1, x2, y2, score, class_id]` in input
+    /// pixels, already de-duplicated by the model (yolov10, YOLO26).
+    EndToEnd,
+    /// `[1, 4 + nc, A]` channels-first over A anchors: `cx, cy, w, h` in input
+    /// pixels then `nc` class scores, no objectness (yolov8, yolo11).
+    RawClasses { nc: usize },
+    /// `[1, A, 5 + nc]` anchor-major, one anchor per cell of each stride's
+    /// grid, the grids concatenated in `strides` order. `x, y` are offsets
+    /// inside the anchor's own cell and `w, h` are log extents, both relative
+    /// to that cell's stride; column 4 is objectness (yolox).
+    GridObjectness {
+        nc: usize,
+        strides: &'static [usize],
+    },
+    /// DETR set prediction over a fixed number of object queries, across two
+    /// tensors: `[1, Q, 4]` normalized `cx, cy, w, h` and `[1, Q, nc]` raw
+    /// per-class logits.
+    ///
+    /// Nothing about this is a grid. There is no stride, no cell offset, no
+    /// `exp` on the extents and no anchor: a query is a learned slot and its
+    /// box is already the whole picture's coordinates, 0..1. Duplicates are
+    /// suppressed by the bipartite matching the model was trained under, so
+    /// there is no NMS either — running one would merge the distinct boxes two
+    /// queries legitimately place on neighbouring objects.
+    DetrQueries { nc: usize },
+}
+
+impl Layout {
+    /// Classes the head emits, where the shape says.
+    pub fn classes(self) -> Option<usize> {
+        match self {
+            Self::EndToEnd => None,
+            Self::RawClasses { nc }
+            | Self::GridObjectness { nc, .. }
+            | Self::DetrQueries { nc } => Some(nc),
+        }
+    }
+
+    /// Which of the model's outputs this layout reads, and as what.
+    pub fn roles(self) -> Roles {
+        match self {
+            Self::EndToEnd | Self::RawClasses { .. } | Self::GridObjectness { .. } => {
+                Outputs::One(())
+            }
+            Self::DetrQueries { .. } => Outputs::BoxesAndLogits {
+                boxes: (),
+                logits: (),
+            },
+        }
+    }
+
+    /// The output shape this layout expects, for error messages.
+    fn expected(self, size: InputSize) -> String {
+        match self {
+            Self::EndToEnd => "[1, N, 6]".to_string(),
+            Self::RawClasses { .. } => "[1, 4 + nc, A] with A far longer than 4 + nc".to_string(),
+            Self::GridObjectness { strides, .. } => format!(
+                "[1, {}, 5 + nc] at input {size}",
+                grid_anchors(size, strides)
+            ),
+            Self::DetrQueries { .. } => "[1, Q, 4] boxes with [1, Q, nc] logits".to_string(),
+        }
+    }
 }
 
 impl fmt::Display for Layout {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Yolov10 => f.write_str("yolov10"),
-            Self::Yolov8 { classes } => write!(f, "yolov8 (nc={classes})"),
+            Self::EndToEnd => f.write_str("end-to-end [1, N, 6]"),
+            Self::RawClasses { nc } => write!(f, "raw-classes [1, 4 + {nc}, A]"),
+            Self::GridObjectness { nc, strides } => {
+                let strides: Vec<String> = strides.iter().map(usize::to_string).collect();
+                write!(
+                    f,
+                    "grid-objectness [1, A, 5 + {nc}] strides {}",
+                    strides.join("/")
+                )
+            }
+            Self::DetrQueries { nc } => write!(f, "detr-queries [1, Q, 4] + [1, Q, {nc}]"),
         }
     }
 }
 
-/// Output dims when the export pins all of them, `None` when any is dynamic.
+/// How an anchor's score is built from the columns the layout offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreComposition {
+    /// The argmax class score stands alone (Ultralytics heads).
+    Class,
+    /// `objectness * class_score`. A YOLOX class score is confidently high on
+    /// background cells that objectness is what rejects, so reading the class
+    /// score alone keeps boxes the model meant to discard.
+    ///
+    /// Requires a layout with an objectness column ([`Layout::GridObjectness`]);
+    /// with [`Layout::RawClasses`] there is none and this behaves as `Class`.
+    ObjTimesClass,
+    /// The argmax class *logit*, squashed by a sigmoid.
+    ///
+    /// Every other family here sigmoids inside the graph and hands out
+    /// probabilities; a DETR export hands out raw logits and leaves the
+    /// squash to its postprocess (`prob = out_logits.sigmoid()`), so a score
+    /// floor applied to them directly would compare 0.5 against a number
+    /// living in roughly -12..+2.
+    ///
+    /// Requires a layout whose scores are logits ([`Layout::DetrQueries`]).
+    /// The grid and raw heads sigmoid inside the graph, so under those this
+    /// behaves as `Class` rather than squashing a probability twice.
+    SigmoidClass,
+}
+
+impl fmt::Display for ScoreComposition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Class => "class",
+            Self::ObjTimesClass => "objectness x class",
+            Self::SigmoidClass => "sigmoid(class logit)",
+        })
+    }
+}
+
+/// Class-aware greedy NMS parameters, for heads that emit raw proposals.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NmsSpec {
+    /// IoU above which two same-class boxes are the same detection.
+    pub iou: f64,
+    /// Candidates carried into NMS, after sorting by score.
+    ///
+    /// A 640x640 raw head offers 8400 anchors and NMS is O(k^2); the cap
+    /// bounds that at a few thousand IoU computations. It is applied *after*
+    /// the score sort, so it can only ever discard the weakest candidates.
+    pub max_candidates: usize,
+}
+
+/// Ultralytics' own default for a detect head, and YOLOX's demo value too.
+const DEFAULT_NMS: NmsSpec = NmsSpec {
+    iou: 0.45,
+    max_candidates: 300,
+};
+
+/// How this model's output is read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OutputSpec {
+    pub layout: Layout,
+    pub score: ScoreComposition,
+    /// `None` for a head that has already de-duplicated inside the model.
+    pub nms: Option<NmsSpec>,
+}
+
+/// One detector family, start to finish.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelProfile {
+    pub name: &'static str,
+    /// Other names `--model-profile` accepts for this exact profile.
+    ///
+    /// An alias is a *name*, never a second entry in [`PROFILES`]: several
+    /// Ultralytics generations export byte-identical tensor layouts, and
+    /// listing each as its own profile would make every ordinary detect head
+    /// sniff as three candidates and hard-error on an ambiguity that does not
+    /// exist. Naming them here keeps `--model-profile yolo11` working while
+    /// sniffing still sees one profile per distinct decode.
+    pub aliases: &'static [&'static str],
+    pub input: InputSpec,
+    pub output: OutputSpec,
+}
+
+/// Megvii YOLOX (nano / tiny / s). Apache-2.0, the documented default.
+pub const YOLOX: ModelProfile = ModelProfile {
+    name: "yolox",
+    aliases: &[],
+    input: InputSpec {
+        size: InputSize::square(416),
+        encoding: TensorEncoding::RawBgr,
+        resize: ResizePolicy::Letterbox { pad: 114 },
+    },
+    output: OutputSpec {
+        layout: Layout::GridObjectness {
+            nc: 80,
+            strides: &[8, 16, 32],
+        },
+        score: ScoreComposition::ObjTimesClass,
+        nms: Some(DEFAULT_NMS),
+    },
+};
+
+/// Ultralytics end-to-end / NMS-free heads (yolov10, YOLO26).
 ///
-/// A dynamic axis anywhere defers the decision to the first real output
-/// rather than guessing: the concrete dims are unambiguous and cost one
-/// classification on one frame.
+/// `yolo26` is an **unverified** alias: YOLO26 is documented as end-to-end and
+/// NMS-free like yolov10, but no YOLO26 export has been run against this
+/// decode — its weights are AGPL-3.0 and none is distributed here. If a real
+/// one turns out to emit a different row width, sniffing rejects it outright
+/// rather than decoding it wrong, and `--model-profile yolo26` fails the same
+/// `fit_output` check.
+pub const YOLOV10: ModelProfile = ModelProfile {
+    name: "yolov10",
+    aliases: &["yolo26"],
+    input: InputSpec {
+        size: InputSize::square(640),
+        encoding: TensorEncoding::UnitRgb,
+        resize: ResizePolicy::Stretch,
+    },
+    output: OutputSpec {
+        layout: Layout::EndToEnd,
+        score: ScoreComposition::Class,
+        nms: None,
+    },
+};
+
+/// Stock Ultralytics detect exports.
+///
+/// yolov8, yolov9, yolo11 and yolov11 are all this one profile: every
+/// generation's detect head exports the same `[1, 4 + nc, A]` channels-first
+/// tensor with no objectness, fed 0..1 RGB stretched to a square, and needs
+/// the same NMS afterwards. They differ in weights and backbone, which is not
+/// something a decode can see. Verified against a yolov8n export; the others
+/// are the same tensor contract by construction, and any export that is not is
+/// rejected by `fit_output` rather than decoded wrong.
+pub const YOLOV8: ModelProfile = ModelProfile {
+    name: "yolov8",
+    aliases: &["yolov9", "yolo11", "yolov11"],
+    input: InputSpec {
+        size: InputSize::square(640),
+        encoding: TensorEncoding::UnitRgb,
+        resize: ResizePolicy::Stretch,
+    },
+    output: OutputSpec {
+        layout: Layout::RawClasses { nc: 80 },
+        score: ScoreComposition::Class,
+        nms: Some(DEFAULT_NMS),
+    },
+};
+
+/// Roboflow RF-DETR (nano / small / medium / base / large). Apache-2.0.
+///
+/// The size here is Nano's. Every RF-DETR export leaves its input spatial axes
+/// dynamic, so a larger variant will happily run at 384 and quietly lose
+/// accuracy instead of failing — the other resolutions (small 512, medium 576,
+/// base 560, large 704) have to come from `--input-size`.
+pub const RFDETR: ModelProfile = ModelProfile {
+    name: "rfdetr",
+    aliases: &["rf-detr"],
+    input: InputSpec {
+        size: InputSize::square(384),
+        encoding: TensorEncoding::ImageNetRgb,
+        resize: ResizePolicy::Stretch,
+    },
+    output: OutputSpec {
+        // 91 is COCO's *id* space, not its class count: RF-DETR indexes
+        // logits by the raw COCO category id (1 = person, 3 = car, 64 =
+        // potted plant), leaving 0 and the eleven retired ids unused. A
+        // `--labels` file for it therefore has 91 lines, not 80.
+        layout: Layout::DetrQueries { nc: 91 },
+        score: ScoreComposition::SigmoidClass,
+        nms: None,
+    },
+};
+
+/// Every profile `--model-profile` accepts and sniffing considers, in the
+/// order an ambiguity error lists them.
+pub const PROFILES: &[ModelProfile] = &[YOLOX, YOLOV10, YOLOV8, RFDETR];
+
+impl ModelProfile {
+    /// `--model-profile` value parser, so a typo's error names the real set.
+    pub fn parse(name: &str) -> Result<Self> {
+        let wanted = name.trim().to_ascii_lowercase();
+        PROFILES
+            .iter()
+            .find(|profile| profile.name == wanted || profile.aliases.contains(&wanted.as_str()))
+            .copied()
+            .ok_or_else(|| {
+                anyhow!(
+                    "unknown model profile {name:?}; expected one of {}",
+                    names()
+                )
+            })
+    }
+}
+
+/// Every accepted `--model-profile` value, aliases shown against the profile
+/// they resolve to so the error says what `yolo11` will actually do.
+fn names() -> String {
+    PROFILES
+        .iter()
+        .map(|profile| match profile.aliases {
+            [] => profile.name.to_string(),
+            aliases => format!("{} (or {})", profile.name, aliases.join(", ")),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+impl fmt::Display for ModelProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name)
+    }
+}
+
+/// Anchors a grid head produces at `size`: one per cell of each stride's grid.
+///
+/// This is both the decode table's length and the thing that tells a YOLOX
+/// output apart from the other `[1, A, 5 + nc]` head in the wild — yolov5,
+/// whose three anchor boxes per cell make A exactly 3x this and whose boxes
+/// are already in pixels. Decoding one as the other would emit plausible
+/// garbage, so the count is checked rather than assumed.
+fn grid_anchors(size: InputSize, strides: &[usize]) -> usize {
+    strides
+        .iter()
+        .map(|stride| (size.w / stride) * (size.h / stride))
+        .sum()
+}
+
+/// One of the model's outputs, as its own metadata declares it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declared {
+    pub name: String,
+    /// Dims when the export pins the ones that identify a layout, `None`
+    /// otherwise. See [`static_output_dims`].
+    pub dims: Option<Vec<i64>>,
+}
+
+/// The model's outputs, for an error that has to say what it actually found.
+fn describe_outputs(declared: &[Declared]) -> String {
+    if declared.is_empty() {
+        return "no outputs".to_string();
+    }
+    declared
+        .iter()
+        .map(|output| match &output.dims {
+            Some(dims) => format!("{:?} {dims:?}", output.name),
+            None => format!("{:?} (dynamic)", output.name),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Output dims when the export pins the ones that matter, `None` when it does
+/// not.
+///
+/// A symbolic *batch* axis is not a dynamic layout. This plugin feeds exactly
+/// one frame per run, so axis 0 is 1 whatever the export left there, and
+/// refusing to read the rest would leave every RF-DETR export — which pins
+/// `[?, 300, 4]` and `[?, 300, 91]` and nothing else — unsniffable for a
+/// reason that says nothing about how it decodes. Every *other* axis carries
+/// a count a layout is identified by, and a symbolic one there really does
+/// leave nothing to go on.
 fn static_output_dims(dtype: &ValueType) -> Option<Vec<i64>> {
     let ValueType::Tensor { shape, .. } = dtype else {
         return None;
     };
-    shape.iter().all(|d| *d > 0).then(|| shape.to_vec())
+    let mut dims = shape.to_vec();
+    let (batch, rest) = dims.split_first_mut()?;
+    if !rest.iter().all(|d| *d > 0) {
+        return None;
+    }
+    if *batch < 0 {
+        *batch = 1;
+    }
+    Some(dims)
 }
 
-/// Pick the layout from an output shape.
+/// Bind a layout's roles to this model's actual outputs.
 ///
-/// The two are structurally distinct, which is why there is no override flag:
-/// `6` is the *row width* of an end-to-end output, while a raw head's anchor
-/// axis is thousands of entries long (8400 at 640x640, and it scales with the
-/// input size) against a channel axis of `4 + nc`. Neither can be mistaken
-/// for the other at any nc or any input size.
-fn classify_layout(dims: &[i64]) -> Result<Layout> {
-    if dims.len() == 3 && dims[0] == 1 {
-        if dims[2] == 6 {
-            return Ok(Layout::Yolov10);
-        }
-        if dims[1] >= 5 && dims[2] > dims[1] * 4 {
-            return Ok(Layout::Yolov8 {
-                classes: (dims[1] - 4) as usize,
-            });
+/// [`Outputs::One`] takes the model's first output, exactly as every
+/// single-output family always has: an export with auxiliary outputs stays
+/// readable rather than becoming newly fatal.
+///
+/// [`Outputs::BoxesAndLogits`] reads the roles off the *shapes* rather than
+/// the names, because the two RF-DETR export toolchains disagree about names
+/// and agree about shapes — Roboflow's own `export()` emits `dets`/`labels`,
+/// the transformers/onnx-community conversion emits `pred_boxes`/`logits`, and
+/// a name table would reject whichever it did not list. The rank-3 output
+/// whose last axis is 4 is the boxes; the rank-3 output over the same query
+/// axis is the logits. Two candidates for a role (a genuinely 4-class DETR
+/// would do it) or none is an error naming what the model offers, never a
+/// guess at which is which.
+fn bind(roles: Roles, declared: &[Declared]) -> Result<Outputs<Declared>> {
+    match roles {
+        Outputs::One(()) => declared
+            .first()
+            .cloned()
+            .map(Outputs::One)
+            .ok_or_else(|| anyhow!("model has no outputs")),
+        Outputs::BoxesAndLogits { .. } => {
+            let (mut boxes, mut logits) = (None, None);
+            let mut clash = false;
+            for output in declared {
+                let Some(dims) = output.dims.as_deref() else {
+                    continue;
+                };
+                if dims.len() != 3 || dims[0] != 1 || dims[1] < 1 || dims[2] < 1 {
+                    continue;
+                }
+                let slot = if dims[2] == 4 {
+                    &mut boxes
+                } else {
+                    &mut logits
+                };
+                clash |= slot.is_some();
+                *slot = Some(output.clone());
+            }
+            let paired = match (boxes, logits) {
+                (Some(boxes), Some(logits)) if !clash => {
+                    let queries = |output: &Declared| output.dims.as_ref().map(|d| d[1]);
+                    (queries(&boxes) == queries(&logits))
+                        .then_some(Outputs::BoxesAndLogits { boxes, logits })
+                }
+                _ => None,
+            };
+            paired.ok_or_else(|| {
+                anyhow!(
+                    "expected one [1, Q, 4] box output and one [1, Q, nc] logit output over the \
+                     same Q queries, but the model offers {}",
+                    describe_outputs(declared)
+                )
+            })
         }
     }
-    bail!(
-        "unsupported model output shape {dims:?}; expected [1, N, 6] \
-         (end-to-end yolov10 / YOLO26) or [1, 4 + nc, A] (a raw yolov8 / \
-         yolo11 detect head)"
-    )
+}
+
+/// The shapes bound to a layout's roles, when the export pins all of them.
+fn static_shapes(roles: Roles, declared: &[Declared]) -> Option<Shapes> {
+    bind(roles, declared)
+        .ok()?
+        .try_map(|output| output.dims.clone())
+}
+
+/// The bound shapes, as an error message lists them.
+fn show(shapes: &Shapes) -> String {
+    shapes
+        .each()
+        .into_iter()
+        .map(|dims| format!("{dims:?}"))
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// Read a layout's own counts off a real output shape, or say why it does not
+/// fit.
+///
+/// Nothing here guesses: the layout kind is given, and this only fills in what
+/// the shape declares (`nc`) and refuses shapes the kind cannot describe.
+fn fit_layout(layout: Layout, shapes: &Shapes, size: InputSize) -> Result<Layout> {
+    // Every arm requires the roles to match first, so a two-tensor shape can
+    // never be read as a one-tensor head or the reverse.
+    let fitted = match (layout, shapes) {
+        (Layout::EndToEnd, Outputs::One(dims)) if rank3(dims) && dims[2] == 6 => {
+            Some(Layout::EndToEnd)
+        }
+        // The anchor axis of a channels-first head runs into the thousands
+        // against a channel axis of `4 + nc`, which is what orients it.
+        (Layout::RawClasses { .. }, Outputs::One(dims))
+            if rank3(dims) && dims[1] >= 5 && dims[2] > dims[1] * 4 =>
+        {
+            Some(Layout::RawClasses {
+                nc: (dims[1] - 4) as usize,
+            })
+        }
+        (Layout::GridObjectness { strides, .. }, Outputs::One(dims))
+            if rank3(dims) && dims[2] >= 6 && dims[1] == grid_anchors(size, strides) as i64 =>
+        {
+            Some(Layout::GridObjectness {
+                nc: (dims[2] - 5) as usize,
+                strides,
+            })
+        }
+        (Layout::DetrQueries { .. }, Outputs::BoxesAndLogits { boxes, logits })
+            if rank3(boxes)
+                && rank3(logits)
+                && boxes[2] == 4
+                && logits[2] >= 1
+                && boxes[1] == logits[1] =>
+        {
+            Some(Layout::DetrQueries {
+                nc: logits[2] as usize,
+            })
+        }
+        _ => None,
+    };
+    fitted.ok_or_else(|| {
+        anyhow!(
+            "output shape {} does not fit {layout}; expected {}",
+            show(shapes),
+            layout.expected(size)
+        )
+    })
+}
+
+/// A single-frame rank-3 output, the shape every layout here indexes.
+fn rank3(dims: &[i64]) -> bool {
+    dims.len() == 3 && dims[0] == 1
+}
+
+/// Does a *resolved* layout describe `dims` exactly?
+///
+/// Deliberately not [`fit_layout`]: that one discriminates between kinds and
+/// leans on heuristics ("the anchor axis is far longer than the channel axis")
+/// to do it. Once the kind and its counts are settled, the only question left
+/// is whether this tensor has the extents that layout indexes by — a head with
+/// one anchor is perfectly decodable and the sniffing heuristic would refuse
+/// it.
+fn validate_layout(layout: Layout, shapes: &Shapes, size: InputSize) -> Result<()> {
+    let ok = match (layout, shapes) {
+        (Layout::EndToEnd, Outputs::One(dims)) => rank3(dims) && dims[2] == 6,
+        (Layout::RawClasses { nc }, Outputs::One(dims)) => {
+            rank3(dims) && dims[1] == (4 + nc) as i64
+        }
+        (Layout::GridObjectness { nc, strides }, Outputs::One(dims)) => {
+            rank3(dims)
+                && dims[1] == grid_anchors(size, strides) as i64
+                && dims[2] == (5 + nc) as i64
+        }
+        (Layout::DetrQueries { nc }, Outputs::BoxesAndLogits { boxes, logits }) => {
+            rank3(boxes)
+                && rank3(logits)
+                && boxes[2] == 4
+                && boxes[1] == logits[1]
+                && logits[2] == nc as i64
+        }
+        _ => false,
+    };
+    if !ok {
+        bail!(
+            "expected a {layout} output at input {size}, got {}",
+            show(shapes)
+        );
+    }
+    Ok(())
+}
+
+/// The same, for a whole output half.
+fn fit_output(spec: OutputSpec, shapes: &Shapes, size: InputSize) -> Result<OutputSpec> {
+    Ok(OutputSpec {
+        layout: fit_layout(spec.layout, shapes, size)?,
+        ..spec
+    })
+}
+
+/// Which built-in profiles this output shape could be.
+///
+/// Returning every match rather than the first is the whole point: at 640 a
+/// `[1, 8400, 84]` output is a 79-class yolox *and* nothing else distinguishes
+/// it from a transposed Ultralytics head, and picking one silently would
+/// decode boxes out of a grid that does not exist.
+fn sniff(declared: &[Declared], size: InputSize) -> Vec<ModelProfile> {
+    PROFILES
+        .iter()
+        .filter_map(|profile| {
+            let shapes = static_shapes(profile.output.layout.roles(), declared)?;
+            fit_output(profile.output, &shapes, size)
+                .ok()
+                .map(|output| ModelProfile { output, ..*profile })
+        })
+        .collect()
+}
+
+/// Settle which profile this model is run under.
+///
+/// `explicit` is `--model-profile`; it wins outright and is then *validated*
+/// against the model's real output, because a profile that does not describe
+/// the model is worse than no profile at all.
+fn resolve_profile(
+    explicit: Option<ModelProfile>,
+    declared: &[Declared],
+    size: InputSize,
+    model: &Path,
+) -> Result<(ModelProfile, Outputs<String>, Option<OutputSpec>)> {
+    let Some(profile) = explicit else {
+        return sniff_profile(declared, size, model);
+    };
+    let mismatch = || {
+        format!(
+            "--model-profile {profile} does not describe model {}",
+            model.display()
+        )
+    };
+    // A profile that names roles the model does not offer is settled here,
+    // before any frame is packed for it.
+    let bound = bind(profile.output.layout.roles(), declared).with_context(mismatch)?;
+    let output = match bound.try_map(|output| output.dims.clone()) {
+        Some(shapes) => Some(fit_output(profile.output, &shapes, size).with_context(mismatch)?),
+        // A dynamic output shape declares nothing to validate against; the
+        // input half is still fully known, so frames can be packed correctly
+        // and only `nc` waits for the first real output.
+        None => None,
+    };
+    Ok((profile, bound.map(|output| output.name.clone()), output))
+}
+
+/// The `--model-profile`-less half of [`resolve_profile`].
+fn sniff_profile(
+    declared: &[Declared],
+    size: InputSize,
+    model: &Path,
+) -> Result<(ModelProfile, Outputs<String>, Option<OutputSpec>)> {
+    let mut candidates = sniff(declared, size);
+    let named = |profiles: &[ModelProfile], sep: &str| {
+        profiles
+            .iter()
+            .map(|p| p.name)
+            .collect::<Vec<_>>()
+            .join(sep)
+    };
+    match candidates.len() {
+        1 => {
+            let profile = candidates.remove(0);
+            let bound = bind(profile.output.layout.roles(), declared)?;
+            Ok((
+                profile,
+                bound.map(|output| output.name.clone()),
+                Some(profile.output),
+            ))
+        }
+        // Nothing bound *and* pinned its shapes for any profile: there is no
+        // shape here to have found unsupported, only an export that declined
+        // to declare one.
+        0 if !PROFILES
+            .iter()
+            .any(|p| static_shapes(p.output.layout.roles(), declared).is_some()) =>
+        {
+            bail!(
+                "model {} leaves its output shape dynamic, so there is nothing to sniff a \
+                 profile from — and the encoding and resize policy have to be settled before \
+                 the first frame is converted. Pass --model-profile <{}>.",
+                model.display(),
+                names()
+            )
+        }
+        0 => bail!(
+            "model {} has unsupported outputs {} at input {size}; expected {}",
+            model.display(),
+            describe_outputs(declared),
+            PROFILES
+                .iter()
+                .map(|p| format!("{} ({})", p.output.layout.expected(size), p.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        _ => bail!(
+            "model {} has outputs {}, which at input {size} fit more than one profile: {}. \
+             Nothing in the shapes says which, and they decode differently — pass \
+             --model-profile <{}> to say.",
+            model.display(),
+            describe_outputs(declared),
+            named(&candidates, " and "),
+            named(&candidates, "|")
+        ),
+    }
 }
 
 /// A label file that does not describe the model's classes is a degraded
 /// output, not a fault: ids past the end of the file render as bare numbers,
 /// and `--labels` is optional to begin with.
 fn warn_on_label_mismatch(layout: Layout, labels: &Labels) {
-    let Layout::Yolov8 { classes } = layout else {
+    let Some(classes) = layout.classes() else {
         return;
     };
     let provided = labels.count();
@@ -227,8 +1111,8 @@ impl ScoreFloors {
 
     /// The lowest floor any label could be held to.
     ///
-    /// The raw layout prefilters anchors on this before it knows their label,
-    /// so it has to be the floor no configured label can undercut — anything
+    /// A raw head prefilters anchors on this before it knows their label, so
+    /// it has to be the floor no configured label can undercut — anything
     /// higher would silently drop detections a per-label floor admits.
     pub fn min_floor(&self) -> f64 {
         self.by_label.values().copied().fold(self.default, f64::min)
@@ -274,7 +1158,7 @@ impl Labels {
 /// a non-tensor input, a rank other than 4, an NHWC `[1, H, W, 3]`, a dynamic
 /// or non-3 channel axis, and the common case of an export with dynamic
 /// spatial axes (which onnxruntime reports as `-1`) — returns `None` and
-/// leaves the size to `--input-size`.
+/// leaves the size to `--input-size` or the profile's default.
 ///
 /// The channel axis is checked rather than skipped over because the whole
 /// pipeline hardcodes 3-channel RGB: [`RgbScaler`] emits RGB24 and
@@ -305,10 +1189,12 @@ fn declared_input_size(dtype: &ValueType) -> Option<InputSize> {
 /// A flag that contradicts a model's static shape is rejected here rather
 /// than left to fail inside `Session::run` on the first sampled frame, where
 /// the message is onnxruntime's and the process has already been running for
-/// a minute.
+/// a minute. A profile's own size is only a last resort: it is a family
+/// default, not a statement about this export.
 fn resolve_input_size(
     declared: Option<InputSize>,
     requested: Option<InputSize>,
+    fallback: Option<InputSize>,
     model: &Path,
 ) -> Result<(InputSize, InputSizeSource)> {
     let (size, source) = match (requested, declared) {
@@ -318,12 +1204,15 @@ fn resolve_input_size(
         ),
         (Some(requested), _) => (requested, InputSizeSource::Flag),
         (None, Some(declared)) => (declared, InputSizeSource::Model),
-        (None, None) => bail!(
-            "model {} does not pin its input width and height; pass --input-size WxH (or N)",
-            model.display()
-        ),
+        (None, None) => match fallback {
+            Some(fallback) => (fallback, InputSizeSource::Profile),
+            None => bail!(
+                "model {} does not pin its input width and height; pass --input-size WxH (or N)",
+                model.display()
+            ),
+        },
     };
-    // Both provenances funnel through here, so the ceiling covers a model's
+    // Every provenance funnels through here, so the ceiling covers a model's
     // declared dims as well as a typo'd flag. Zero is already impossible:
     // `dim` rejects it on the flag and `declared_input_size` requires `> 0`.
     if size.w > MAX_INPUT_DIM || size.h > MAX_INPUT_DIM {
@@ -335,17 +1224,27 @@ fn resolve_input_size(
 pub struct Detector {
     session: Session,
     input_name: String,
-    output_name: String,
+    /// The model's own name for each tensor this profile's layout reads,
+    /// settled at startup so a decode never looks one up by index.
+    outputs: Outputs<String>,
+    profile: ModelProfile,
     input_size: InputSize,
     input_size_source: InputSizeSource,
-    /// `None` until the first output settles it: see [`static_output_dims`].
-    layout: Option<Layout>,
+    /// `None` until the first output settles `nc`, which only happens for an
+    /// export that leaves its output shape dynamic.
+    output: Option<OutputSpec>,
 }
 
 impl Detector {
-    /// `requested` is `--input-size`; absent, the model must declare one.
-    /// `labels` is only read to warn about a class-count mismatch.
-    pub fn open(model: &Path, requested: Option<InputSize>, labels: &Labels) -> Result<Self> {
+    /// `requested` is `--input-size`, `profile` is `--model-profile`; absent,
+    /// the profile is sniffed from the model's own I/O. `labels` is only read
+    /// to warn about a class-count mismatch.
+    pub fn open(
+        model: &Path,
+        requested: Option<InputSize>,
+        profile: Option<ModelProfile>,
+        labels: &Labels,
+    ) -> Result<Self> {
         // ort's builder errors carry the builder itself for recovery, which
         // makes them neither Send nor Sync; flatten them to a message.
         let session = Session::builder()
@@ -362,27 +1261,35 @@ impl Detector {
             .first()
             .ok_or_else(|| anyhow!("model {} has no inputs", model.display()))?;
         let input_name = input.name().to_string();
-        let (input_size, input_size_source) =
-            resolve_input_size(declared_input_size(input.dtype()), requested, model)?;
-        let output = session
+        let (input_size, input_size_source) = resolve_input_size(
+            declared_input_size(input.dtype()),
+            requested,
+            profile.map(|p| p.input.size),
+            model,
+        )?;
+        let declared: Vec<Declared> = session
             .outputs()
-            .first()
-            .ok_or_else(|| anyhow!("model {} has no outputs", model.display()))?;
-        let output_name = output.name().to_string();
-        let layout = static_output_dims(output.dtype())
-            .map(|dims| classify_layout(&dims))
-            .transpose()
-            .with_context(|| format!("model {}", model.display()))?;
-        if let Some(layout) = layout {
-            warn_on_label_mismatch(layout, labels);
+            .iter()
+            .map(|output| Declared {
+                name: output.name().to_string(),
+                dims: static_output_dims(output.dtype()),
+            })
+            .collect();
+        if declared.is_empty() {
+            bail!("model {} has no outputs", model.display());
+        }
+        let (profile, outputs, output) = resolve_profile(profile, &declared, input_size, model)?;
+        if let Some(output) = output {
+            warn_on_label_mismatch(output.layout, labels);
         }
         Ok(Self {
             session,
             input_name,
-            output_name,
+            outputs,
+            profile,
             input_size,
             input_size_source,
-            layout,
+            output,
         })
     }
 
@@ -390,9 +1297,17 @@ impl Detector {
         &self.input_name
     }
 
-    /// The geometry every decoder in this process must scale to.
-    pub fn input_size(&self) -> InputSize {
-        self.input_size
+    pub fn profile(&self) -> ModelProfile {
+        self.profile
+    }
+
+    /// Everything a decoder needs to build a tensor this model accepts,
+    /// with the size the *model* resolved to rather than the profile default.
+    pub fn input_spec(&self) -> InputSpec {
+        InputSpec {
+            size: self.input_size,
+            ..self.profile.input
+        }
     }
 
     pub fn input_size_source(&self) -> InputSizeSource {
@@ -402,15 +1317,16 @@ impl Detector {
     /// Startup description of the output layout, deferred when the export
     /// leaves its output shape dynamic.
     pub fn layout_summary(&self) -> String {
-        match self.layout {
-            Some(layout) => format!("{layout} (from model)"),
-            None => "pending (from first output)".to_string(),
+        match self.output {
+            Some(output) => format!("{} (from model)", output.layout),
+            None => format!("{} (nc from first output)", self.profile.output.layout),
         }
     }
 
     pub fn detect(
         &mut self,
         tensor: Vec<f32>,
+        projection: Projection,
         labels: &Labels,
         floors: &ScoreFloors,
     ) -> Result<Vec<Det>> {
@@ -420,80 +1336,143 @@ impl Detector {
             .session
             .run(ort::inputs![self.input_name.as_str() => input])
             .context("running inference")?;
-        let (shape, values) = outputs
-            .get(self.output_name.as_str())
-            .ok_or_else(|| anyhow!("model produced no output named {}", self.output_name))?
-            .try_extract_tensor::<f32>()
-            .context("model output is not an f32 tensor")?;
-        let dims: Vec<i64> = shape.iter().copied().collect();
-        let layout = match self.layout {
-            Some(layout) => layout,
+        // Extract every role this profile reads, by the name settled at
+        // startup, so a two-tensor family never depends on output ordering.
+        let extract = |name: &String| -> Result<Raw> {
+            let (shape, values) = outputs
+                .get(name.as_str())
+                .ok_or_else(|| anyhow!("model produced no output named {name}"))?
+                .try_extract_tensor::<f32>()
+                .with_context(|| format!("model output {name} is not an f32 tensor"))?;
+            Ok(Raw {
+                dims: shape.iter().copied().collect(),
+                values,
+            })
+        };
+        let raw = match &self.outputs {
+            Outputs::One(name) => Outputs::One(extract(name)?),
+            Outputs::BoxesAndLogits { boxes, logits } => Outputs::BoxesAndLogits {
+                boxes: extract(boxes)?,
+                logits: extract(logits)?,
+            },
+        };
+        let shapes = raw.map(|tensor| tensor.dims.clone());
+        let output = match self.output {
+            Some(output) => output,
             None => {
-                let layout = classify_layout(&dims)?;
-                warn_on_label_mismatch(layout, labels);
-                eprintln!("output layout: {layout} (from first output)");
-                self.layout = Some(layout);
-                layout
+                let output = fit_output(self.profile.output, &shapes, self.input_size)
+                    .with_context(|| format!("--model-profile {}", self.profile))?;
+                warn_on_label_mismatch(output.layout, labels);
+                eprintln!("output layout: {} (from first output)", output.layout);
+                self.output = Some(output);
+                output
             }
         };
-        decode_output(layout, values, &dims, labels, floors, self.input_size)
+        decode_output(output, &raw, labels, floors, self.input_size, &projection)
     }
 }
 
-/// Send the output down the branch its layout calls for.
+/// One extracted output tensor: the values and the shape they came with.
+struct Raw<'a> {
+    dims: Vec<i64>,
+    values: &'a [f32],
+}
+
+/// Read one output tensor into contract detections.
 ///
-/// The dims are re-checked against the layout even when it came from
-/// metadata: an export whose declared shape and real shape disagree would
-/// otherwise index a tensor by the wrong stride and emit plausible garbage.
+/// The dims are re-checked against the layout even when it came from metadata:
+/// an export whose declared shape and real shape disagree would otherwise
+/// index a tensor by the wrong stride and emit plausible garbage.
 fn decode_output(
-    layout: Layout,
-    values: &[f32],
-    dims: &[i64],
+    output: OutputSpec,
+    raw: &Outputs<Raw>,
     labels: &Labels,
     floors: &ScoreFloors,
     size: InputSize,
+    projection: &Projection,
 ) -> Result<Vec<Det>> {
-    match layout {
-        Layout::Yolov10 => {
-            if dims.len() != 3 || dims[0] != 1 || dims[2] != 6 {
-                bail!("expected a [1, N, 6] end-to-end output, got {dims:?}");
-            }
-            Ok(postprocess(values, labels, floors, size))
-        }
-        Layout::Yolov8 { classes } => {
-            if dims.len() != 3 || dims[0] != 1 || dims[1] != (4 + classes) as i64 {
-                bail!(
-                    "expected a [1, {}, A] raw detect head, got {dims:?}",
-                    4 + classes
-                );
-            }
-            let anchors = dims[2] as usize;
-            if values.len() < (4 + classes) * anchors {
-                bail!(
-                    "output {dims:?} declares {} values but carries {}",
-                    (4 + classes) * anchors,
-                    values.len()
-                );
-            }
-            Ok(postprocess_yolov8(
-                values, classes, anchors, labels, floors, size,
+    validate_layout(output.layout, &raw.map(|tensor| tensor.dims.clone()), size)?;
+    let candidates = candidates_from(output, raw, size, floors.min_floor())?;
+    Ok(finish(candidates, output.nms, labels, floors, projection))
+}
+
+/// One proposal in model-space pixels, before NMS and un-projection.
+struct Candidate {
+    score: f64,
+    class_id: usize,
+    /// `[x0, y0, x1, y1]`.
+    corners: [f64; 4],
+}
+
+/// Pull every anchor/row the layout offers above `prefilter` into candidates.
+///
+/// `prefilter` is the lowest floor any label could carry: the cut runs before
+/// a candidate's label is known, so anything higher would drop detections that
+/// a per-label floor admits.
+fn candidates_from(
+    output: OutputSpec,
+    raw: &Outputs<Raw>,
+    size: InputSize,
+    prefilter: f64,
+) -> Result<Vec<Candidate>> {
+    // `validate_layout` has already agreed the roles, so a mismatch here is
+    // unreachable rather than a case to handle.
+    match (output.layout, raw) {
+        (Layout::EndToEnd, Outputs::One(one)) => Ok(end_to_end(one.values, prefilter)),
+        (Layout::RawClasses { nc }, Outputs::One(one)) => {
+            let anchors = one.dims[2] as usize;
+            require_values(one.values.len(), (4 + nc) * anchors, &one.dims)?;
+            Ok(raw_classes(
+                one.values,
+                nc,
+                anchors,
+                output.score,
+                prefilter,
             ))
         }
+        (Layout::GridObjectness { nc, strides }, Outputs::One(one)) => {
+            let anchors = grid_anchors(size, strides);
+            require_values(one.values.len(), anchors * (5 + nc), &one.dims)?;
+            Ok(grid_objectness(
+                one.values,
+                nc,
+                strides,
+                size,
+                output.score,
+                prefilter,
+            ))
+        }
+        (Layout::DetrQueries { nc }, Outputs::BoxesAndLogits { boxes, logits }) => {
+            let queries = logits.dims[1] as usize;
+            require_values(boxes.values.len(), queries * 4, &boxes.dims)?;
+            require_values(logits.values.len(), queries * nc, &logits.dims)?;
+            Ok(detr_queries(
+                boxes.values,
+                logits.values,
+                nc,
+                queries,
+                size,
+                output.score,
+                prefilter,
+            ))
+        }
+        (layout, raw) => bail!(
+            "{layout} cannot be read from {}",
+            show(&raw.map(|tensor| tensor.dims.clone()))
+        ),
     }
 }
 
-/// `[1, N, 6]` rows of `[x1, y1, x2, y2, score, class_id]` -> contract dets.
-///
-/// `size` is the geometry the rows are in: model coordinates are input pixels,
-/// which for a non-square input normalize by a different divisor per axis.
-pub fn postprocess(
-    rows: &[f32],
-    labels: &Labels,
-    floors: &ScoreFloors,
-    size: InputSize,
-) -> Vec<Det> {
-    let dets: Vec<(f64, Det)> = rows
-        .chunks_exact(6)
+fn require_values(have: usize, need: usize, dims: &[i64]) -> Result<()> {
+    if have < need {
+        bail!("output {dims:?} declares {need} values but carries {have}");
+    }
+    Ok(())
+}
+
+/// `[1, N, 6]` rows of `[x1, y1, x2, y2, score, class_id]`, already final.
+fn end_to_end(rows: &[f32], prefilter: f64) -> Vec<Candidate> {
+    rows.chunks_exact(6)
         .filter_map(|row| {
             // NaN survives `score < floor` (the comparison is false) and
             // serde_json writes non-finite floats as `null` — one such row
@@ -503,54 +1482,43 @@ pub fn postprocess(
                 return None;
             }
             let score = f64::from(row[4]);
-            let class_id = row[5].max(0.0).round() as usize;
-            let label = labels.label_for(class_id);
-            if score < floors.floor_for(&label) {
+            if score < prefilter {
                 return None;
             }
-            let corners = [
-                f64::from(row[0]),
-                f64::from(row[1]),
-                f64::from(row[2]),
-                f64::from(row[3]),
-            ];
-            Some((score, det_from(corners, score, label, size)))
+            Some(Candidate {
+                score,
+                class_id: row[5].max(0.0).round() as usize,
+                corners: [
+                    f64::from(row[0]),
+                    f64::from(row[1]),
+                    f64::from(row[2]),
+                    f64::from(row[3]),
+                ],
+            })
         })
-        .collect();
-
-    top_dets(dets)
+        .collect()
 }
 
-/// `[1, 4 + nc, A]` channels-first raw detect head -> contract dets.
-///
-/// `values` is channel-major: channel `c` of anchor `a` sits at
+/// `[1, 4 + nc, A]` channels-first: channel `c` of anchor `a` is at
 /// `c * anchors + a`. Rows 0..4 are `cx, cy, w, h` in input pixels; rows 4..
-/// are per-class scores, already sigmoided, with no objectness row to fold
-/// in. Unlike the end-to-end layout these are raw proposals — several anchors
-/// fire on one object, which is what [`nms`] is here for.
-pub fn postprocess_yolov8(
+/// are per-class scores, already sigmoided.
+fn raw_classes(
     values: &[f32],
-    classes: usize,
+    nc: usize,
     anchors: usize,
-    labels: &Labels,
-    floors: &ScoreFloors,
-    size: InputSize,
-) -> Vec<Det> {
-    // The prefilter runs before an anchor's label is known, so it cuts at the
-    // lowest floor any label could carry. Anything higher would drop
-    // detections that a per-label floor admits.
-    let prefilter = floors.min_floor();
-    let mut candidates: Vec<Candidate> = Vec::new();
-
+    score: ScoreComposition,
+    prefilter: f64,
+) -> Vec<Candidate> {
+    // This layout has no objectness column, so the composition has nothing to
+    // fold in either way — see `ScoreComposition::ObjTimesClass`.
+    let _ = score;
+    let mut candidates = Vec::new();
     for a in 0..anchors {
-        let (class_id, score) = (0..classes)
-            .map(|c| (c, f64::from(values[(4 + c) * anchors + a])))
-            .max_by(|x, y| x.1.total_cmp(&y.1))
-            .expect("a raw detect head has at least one class");
-        // A NaN score wins `total_cmp`'s argmax, so it is rejected here
-        // rather than left to be compared against a floor (where every
-        // comparison is false) and serialized as `null`, which would take the
-        // whole output line out of the contract.
+        let (class_id, score) = argmax(nc, |c| f64::from(values[(4 + c) * anchors + a]));
+        // A NaN score wins `total_cmp`'s argmax, so it is rejected here rather
+        // than left to be compared against a floor (where every comparison is
+        // false) and serialized as `null`, which would take the whole output
+        // line out of the contract.
         if score.is_nan() || score < prefilter {
             continue;
         }
@@ -558,20 +1526,172 @@ pub fn postprocess_yolov8(
         let cy = f64::from(values[anchors + a]);
         let w = f64::from(values[2 * anchors + a]);
         let h = f64::from(values[3 * anchors + a]);
-        if !(cx.is_finite() && cy.is_finite() && w.is_finite() && h.is_finite()) {
+        if let Some(corners) = centered(cx, cy, w, h) {
+            candidates.push(Candidate {
+                score,
+                class_id,
+                corners,
+            });
+        }
+    }
+    candidates
+}
+
+/// `[1, A, 5 + nc]` anchor-major: anchor `a` occupies `5 + nc` contiguous
+/// entries at `a * (5 + nc)`.
+///
+/// The first four are *not* pixels — `x, y` are an offset inside the anchor's
+/// own grid cell and `w, h` are log extents, both relative to that cell's
+/// stride, which is why they need the grid walked in the same order the model
+/// concatenated it (all of the first stride's cells row-major, then the next).
+/// Entry 4 is objectness and the rest are class scores, both already sigmoided.
+fn grid_objectness(
+    values: &[f32],
+    nc: usize,
+    strides: &[usize],
+    size: InputSize,
+    score: ScoreComposition,
+    prefilter: f64,
+) -> Vec<Candidate> {
+    let row = 5 + nc;
+    let mut candidates = Vec::new();
+    let mut anchor = 0usize;
+    for stride in strides {
+        let (cols, rows) = (size.w / stride, size.h / stride);
+        let stride = *stride as f64;
+        for gy in 0..rows {
+            for gx in 0..cols {
+                let base = anchor * row;
+                anchor += 1;
+                let objectness = match score {
+                    ScoreComposition::ObjTimesClass => f64::from(values[base + 4]),
+                    ScoreComposition::Class | ScoreComposition::SigmoidClass => 1.0,
+                };
+                let (class_id, class_score) = argmax(nc, |c| f64::from(values[base + 5 + c]));
+                // NaN wins total_cmp's argmax and survives every comparison
+                // against a floor, then serializes as `null` and takes the
+                // whole output line out of the contract.
+                let score = objectness * class_score;
+                if score.is_nan() || score < prefilter {
+                    continue;
+                }
+                let cx = (f64::from(values[base]) + gx as f64) * stride;
+                let cy = (f64::from(values[base + 1]) + gy as f64) * stride;
+                // exp() turns a large logit into inf rather than a wrong
+                // number, so `centered`'s finite check catches it.
+                let w = f64::from(values[base + 2]).exp() * stride;
+                let h = f64::from(values[base + 3]).exp() * stride;
+                if let Some(corners) = centered(cx, cy, w, h) {
+                    candidates.push(Candidate {
+                        score,
+                        class_id,
+                        corners,
+                    });
+                }
+            }
+        }
+    }
+    candidates
+}
+
+/// DETR set prediction: `[1, Q, 4]` normalized `cx, cy, w, h` alongside
+/// `[1, Q, nc]` raw class logits over the same queries.
+///
+/// The boxes are scaled up into model pixels rather than reported as they
+/// stand, so the same [`Projection`] that un-does a letterbox for every other
+/// family un-does it here too. Under this profile's `Stretch` the two cancel
+/// exactly; the point is that a DETR run against a padded frame is not
+/// silently off by the padding.
+///
+/// One candidate per query, its argmax class. RF-DETR's own postprocess
+/// instead takes the top k of the flattened query x class matrix, which can
+/// enter one query twice under two labels — with [`MAX_DETS`] detections
+/// leaving this plugin and per-label floors around 0.5 the two agree on
+/// everything that survives, and per-query argmax is what every other layout
+/// here already does.
+fn detr_queries(
+    boxes: &[f32],
+    logits: &[f32],
+    nc: usize,
+    queries: usize,
+    size: InputSize,
+    score: ScoreComposition,
+    prefilter: f64,
+) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    for query in 0..queries {
+        let (class_id, best) = argmax(nc, |c| f64::from(logits[query * nc + c]));
+        let score = match score {
+            ScoreComposition::SigmoidClass => sigmoid(best),
+            // An export that already squashed its logits, read as it stands.
+            ScoreComposition::Class | ScoreComposition::ObjTimesClass => best,
+        };
+        // NaN wins total_cmp's argmax and survives every comparison against a
+        // floor, then serializes as `null` and takes the whole output line out
+        // of the contract.
+        if score.is_nan() || score < prefilter {
             continue;
         }
-        candidates.push(Candidate {
-            score,
-            class_id,
-            corners: [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0],
-        });
+        let row = &boxes[query * 4..query * 4 + 4];
+        let (w, h) = (size.w as f64, size.h as f64);
+        if let Some(corners) = centered(
+            f64::from(row[0]) * w,
+            f64::from(row[1]) * h,
+            f64::from(row[2]) * w,
+            f64::from(row[3]) * h,
+        ) {
+            candidates.push(Candidate {
+                score,
+                class_id,
+                corners,
+            });
+        }
     }
+    candidates
+}
 
-    candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
-    candidates.truncate(MAX_CANDIDATES);
+/// The squash a DETR head leaves to its postprocess.
+///
+/// Saturates instead of overflowing — an infinite logit lands on 0 or 1, both
+/// of which a score floor compares meaningfully — so NaN is the only input the
+/// caller still has to reject.
+fn sigmoid(logit: f64) -> f64 {
+    1.0 / (1.0 + (-logit).exp())
+}
 
-    let dets = nms(candidates)
+/// Argmax over `n` scores. `total_cmp` orders NaN, so a NaN wins — every
+/// caller rejects the result rather than letting one reach the output.
+fn argmax(n: usize, score: impl Fn(usize) -> f64) -> (usize, f64) {
+    (0..n)
+        .map(|c| (c, score(c)))
+        .max_by(|x, y| x.1.total_cmp(&y.1))
+        .expect("a detect head has at least one class")
+}
+
+/// Center/extent -> corners, dropping anything non-finite.
+fn centered(cx: f64, cy: f64, w: f64, h: f64) -> Option<[f64; 4]> {
+    (cx.is_finite() && cy.is_finite() && w.is_finite() && h.is_finite())
+        .then(|| [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0])
+}
+
+/// Where every layout converges: NMS if the head needs it, then the per-label
+/// floor, un-projection, score order and the [`MAX_DETS`] cap.
+fn finish(
+    mut candidates: Vec<Candidate>,
+    spec: Option<NmsSpec>,
+    labels: &Labels,
+    floors: &ScoreFloors,
+    projection: &Projection,
+) -> Vec<Det> {
+    let kept = match spec {
+        Some(spec) => {
+            candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+            candidates.truncate(spec.max_candidates);
+            nms(candidates, spec.iou)
+        }
+        None => candidates,
+    };
+    let dets = kept
         .into_iter()
         .filter_map(|candidate| {
             let label = labels.label_for(candidate.class_id);
@@ -581,20 +1701,12 @@ pub fn postprocess_yolov8(
             (candidate.score >= floors.floor_for(&label)).then(|| {
                 (
                     candidate.score,
-                    det_from(candidate.corners, candidate.score, label, size),
+                    det_from(candidate.corners, candidate.score, label, projection),
                 )
             })
         })
         .collect();
     top_dets(dets)
-}
-
-/// One anchor of a raw detect head, in input pixels, before NMS.
-struct Candidate {
-    score: f64,
-    class_id: usize,
-    /// `[x0, y0, x1, y1]`.
-    corners: [f64; 4],
 }
 
 /// Class-aware greedy NMS.
@@ -605,12 +1717,12 @@ struct Candidate {
 /// whether it matters.
 ///
 /// `candidates` must already be sorted by descending score.
-fn nms(candidates: Vec<Candidate>) -> Vec<Candidate> {
+fn nms(candidates: Vec<Candidate>, threshold: f64) -> Vec<Candidate> {
     let mut kept: Vec<Candidate> = Vec::new();
     for candidate in candidates {
         let suppressed = kept.iter().any(|keeper| {
             keeper.class_id == candidate.class_id
-                && iou(&keeper.corners, &candidate.corners) >= NMS_IOU
+                && iou(&keeper.corners, &candidate.corners) >= threshold
         });
         if !suppressed {
             kept.push(candidate);
@@ -633,16 +1745,16 @@ fn iou(a: &[f64; 4], b: &[f64; 4]) -> f64 {
     }
 }
 
-/// Input-pixel corners -> the contract's normalized `[x, y, w, h]`.
+/// Model-space corners -> the contract's normalized `[x, y, w, h]`.
 ///
-/// Contract: bbox normalized 0..1 — boxes can run past the frame edge, and a
-/// non-square input normalizes each axis by its own side.
-fn det_from(corners: [f64; 4], score: f64, label: String, size: InputSize) -> Det {
-    let (sx, sy) = (size.w as f64, size.h as f64);
-    let x0 = (corners[0] / sx).clamp(0.0, 1.0);
-    let y0 = (corners[1] / sy).clamp(0.0, 1.0);
-    let x1 = (corners[2] / sx).clamp(0.0, 1.0);
-    let y1 = (corners[3] / sy).clamp(0.0, 1.0);
+/// Contract: bbox normalized 0..1 against the *original* frame — which is what
+/// the projection knows and the input size does not.
+fn det_from(corners: [f64; 4], score: f64, label: String, projection: &Projection) -> Det {
+    let normalized = projection.unproject(corners);
+    let x0 = normalized[0].clamp(0.0, 1.0);
+    let y0 = normalized[1].clamp(0.0, 1.0);
+    let x1 = normalized[2].clamp(0.0, 1.0);
+    let y1 = normalized[3].clamp(0.0, 1.0);
     Det {
         // `--labels` is arbitrary user text and the host refuses a label it
         // cannot print; shaping it here keeps the detection instead.
@@ -657,7 +1769,7 @@ fn det_from(corners: [f64; 4], score: f64, label: String, size: InputSize) -> De
     }
 }
 
-/// Score-order and cap, where both layouts converge.
+/// Score-order and cap, where every layout converges.
 fn top_dets(mut dets: Vec<(f64, Det)>) -> Vec<Det> {
     // yolov10 exports are already score-ordered; sorting keeps the MAX_DETS
     // cut meaningful for exports that are not, and NMS output never is.
@@ -679,21 +1791,121 @@ mod tests {
         Labels(vec!["person".into(), "bicycle".into(), "car".into()])
     }
 
-    fn row(x1: f32, y1: f32, x2: f32, y2: f32, score: f32, class_id: f32) -> [f32; 6] {
-        [x1, y1, x2, y2, score, class_id]
+    fn floors(json: &str) -> ScoreFloors {
+        ScoreFloors::parse(json).unwrap()
+    }
+
+    fn open() -> ScoreFloors {
+        floors("{}")
+    }
+
+    /// The shapes of a one-tensor head, as a layout reads them.
+    fn one(dims: &[i64]) -> Shapes {
+        Outputs::One(dims.to_vec())
+    }
+
+    /// A model declaring exactly one static output, as sniffing sees it.
+    fn declared(dims: &[i64]) -> Vec<Declared> {
+        vec![Declared {
+            name: "output".into(),
+            dims: Some(dims.to_vec()),
+        }]
+    }
+
+    /// A model that pins nothing about its output.
+    fn dynamic() -> Vec<Declared> {
+        vec![Declared {
+            name: "output".into(),
+            dims: None,
+        }]
+    }
+
+    /// An RF-DETR-shaped model: boxes and logits over the same queries, under
+    /// the names the transformers/onnx-community conversion uses.
+    fn declared_detr(queries: i64, nc: i64) -> Vec<Declared> {
+        vec![
+            Declared {
+                name: "pred_boxes".into(),
+                dims: Some(vec![1, queries, 4]),
+            },
+            Declared {
+                name: "logits".into(),
+                dims: Some(vec![1, queries, nc]),
+            },
+        ]
+    }
+
+    fn detr_shapes(queries: i64, nc: i64) -> Shapes {
+        Outputs::BoxesAndLogits {
+            boxes: vec![1, queries, 4],
+            logits: vec![1, queries, nc],
+        }
     }
 
     const SQUARE: InputSize = InputSize::square(640);
+    /// What `yolox_nano.onnx` from the Megvii 0.1.1rc0 release declares.
+    const YOLOX_416: InputSize = InputSize::square(416);
+    /// 8^2 + 4^2 + 2^2 = 84 anchors: small enough to reason about by hand.
+    const TINY: InputSize = InputSize::square(64);
+    const STRIDES: &[usize] = &[8, 16, 32];
+
+    /// Decode as a resolved profile would, under the stretch projection its
+    /// input size implies.
+    fn decode(
+        output: OutputSpec,
+        values: &[f32],
+        dims: &[i64],
+        floors: &ScoreFloors,
+        size: InputSize,
+    ) -> Vec<Det> {
+        decode_output(
+            output,
+            &raw_one(values, dims),
+            &labels(),
+            floors,
+            size,
+            &Projection::stretch(size),
+        )
+        .unwrap()
+    }
+
+    /// One tensor in the role a single-output layout reads.
+    fn raw_one<'a>(values: &'a [f32], dims: &[i64]) -> Outputs<Raw<'a>> {
+        Outputs::One(Raw {
+            dims: dims.to_vec(),
+            values,
+        })
+    }
+
+    /// A DETR pair, in the roles [`Layout::DetrQueries`] reads.
+    fn raw_detr<'a>(
+        boxes: &'a [f32],
+        logits: &'a [f32],
+        queries: i64,
+        nc: i64,
+    ) -> Outputs<Raw<'a>> {
+        Outputs::BoxesAndLogits {
+            boxes: Raw {
+                dims: vec![1, queries, 4],
+                values: boxes,
+            },
+            logits: Raw {
+                dims: vec![1, queries, nc],
+                values: logits,
+            },
+        }
+    }
+
+    // ---- score floors, labels, input size parsing -------------------------
 
     #[test]
     fn floors_default_to_half() {
-        let floors = ScoreFloors::parse("{}").unwrap();
-        assert_eq!(floors.floor_for("person"), 0.5);
+        assert_eq!(open().floor_for("person"), 0.5);
     }
 
     #[test]
     fn floors_are_per_label_with_a_default() {
-        let floors = ScoreFloors::parse(r#"{"default":0.4,"person":0.8}"#).unwrap();
+        let floors = floors(r#"{"default":0.4,"person":0.8}"#);
         assert_eq!(floors.floor_for("person"), 0.8);
         assert_eq!(floors.floor_for("car"), 0.4);
     }
@@ -708,80 +1920,6 @@ mod tests {
     fn unknown_class_ids_fall_back_to_the_number() {
         assert_eq!(labels().label_for(0), "person");
         assert_eq!(labels().label_for(77), "77");
-    }
-
-    #[test]
-    fn normalizes_and_rounds_boxes() {
-        let rows = row(64.0, 128.0, 192.0, 320.0, 0.876_54, 0.0);
-        let dets = postprocess(&rows, &labels(), &ScoreFloors::parse("{}").unwrap(), SQUARE);
-        assert_eq!(
-            dets,
-            vec![Det {
-                label: "person".into(),
-                score: 0.877,
-                bbox: [0.1, 0.2, 0.2, 0.3],
-            }]
-        );
-    }
-
-    #[test]
-    fn normalizes_each_axis_by_its_own_side() {
-        // The same box under a 320x160 input: x by 320, y by 160.
-        let rows = row(32.0, 32.0, 160.0, 80.0, 0.9, 0.0);
-        let dets = postprocess(
-            &rows,
-            &labels(),
-            &ScoreFloors::parse("{}").unwrap(),
-            InputSize { w: 320, h: 160 },
-        );
-        assert_eq!(dets[0].bbox, [0.1, 0.2, 0.4, 0.3]);
-    }
-
-    #[test]
-    fn gates_on_the_per_class_floor() {
-        let floors = ScoreFloors::parse(r#"{"default":0.5,"person":0.9}"#).unwrap();
-        let mut rows = Vec::new();
-        rows.extend_from_slice(&row(0.0, 0.0, 64.0, 64.0, 0.85, 0.0)); // person, under 0.9
-        rows.extend_from_slice(&row(0.0, 0.0, 64.0, 64.0, 0.85, 2.0)); // car, over 0.5
-        rows.extend_from_slice(&row(0.0, 0.0, 64.0, 64.0, 0.40, 2.0)); // car, under 0.5
-        let dets = postprocess(&rows, &labels(), &floors, SQUARE);
-        assert_eq!(dets.len(), 1);
-        assert_eq!(dets[0].label, "car");
-    }
-
-    #[test]
-    fn clamps_boxes_to_the_frame() {
-        let rows = row(-320.0, -640.0, 1280.0, 1280.0, 0.9, 2.0);
-        let dets = postprocess(&rows, &labels(), &ScoreFloors::parse("{}").unwrap(), SQUARE);
-        assert_eq!(dets[0].bbox, [0.0, 0.0, 1.0, 1.0]);
-    }
-
-    #[test]
-    fn drops_non_finite_rows() {
-        let floors = ScoreFloors::parse("{}").unwrap();
-        let mut rows = Vec::new();
-        rows.extend_from_slice(&row(0.0, 0.0, 64.0, 64.0, f32::NAN, 0.0));
-        rows.extend_from_slice(&row(f32::NAN, 0.0, 64.0, 64.0, 0.9, 0.0));
-        rows.extend_from_slice(&row(0.0, 0.0, f32::INFINITY, 64.0, 0.9, 0.0));
-        rows.extend_from_slice(&row(0.0, 0.0, 64.0, 64.0, 0.9, 2.0));
-        let dets = postprocess(&rows, &labels(), &floors, SQUARE);
-        assert_eq!(dets.len(), 1);
-        assert_eq!(dets[0].label, "car");
-        let json = serde_json::to_string(&dets).unwrap();
-        assert!(!json.contains("null"), "{json}");
-    }
-
-    #[test]
-    fn caps_and_sorts_detections() {
-        let mut rows = Vec::new();
-        for i in 0..(MAX_DETS + 10) {
-            let score = 0.6 + i as f32 / 1000.0;
-            rows.extend_from_slice(&row(0.0, 0.0, 64.0, 64.0, score, 2.0));
-        }
-        let dets = postprocess(&rows, &labels(), &ScoreFloors::parse("{}").unwrap(), SQUARE);
-        assert_eq!(dets.len(), MAX_DETS);
-        assert!(dets[0].score > dets[MAX_DETS - 1].score);
-        assert!(dets.windows(2).all(|w| w[0].score >= w[1].score));
     }
 
     #[test]
@@ -816,6 +1954,535 @@ mod tests {
         assert!(InputSize::parse("640x352x1").is_err());
     }
 
+    // ---- resize policy and projection -------------------------------------
+
+    /// The 16:9 source the fix exists for: 1920x1080 into a 416x416 model.
+    const WIDE: InputSize = InputSize { w: 1920, h: 1080 };
+
+    #[test]
+    fn stretch_fills_the_whole_input_and_ignores_the_source() {
+        for source in [WIDE, InputSize { w: 2560, h: 1920 }, YOLOX_416] {
+            let fit = ResizePolicy::Stretch.fit(YOLOX_416, source);
+            assert_eq!(fit.inner, YOLOX_416);
+            assert_eq!(fit.offset, (0, 0));
+        }
+    }
+
+    #[test]
+    fn letterbox_scales_by_the_smaller_ratio_and_pads_bottom_right() {
+        // min(416/1920, 416/1080) = 0.21667 -> 416 x 234, 182 rows of pad
+        // under it. Content at the origin is what YOLOX's own preproc does:
+        // `padded_img[: int(h*r), : int(w*r)] = resized`.
+        let fit = ResizePolicy::Letterbox { pad: 114 }.fit(YOLOX_416, WIDE);
+        assert_eq!(fit.inner, InputSize { w: 416, h: 234 });
+        assert_eq!(fit.offset, (0, 0));
+        assert_eq!(fit.pad, 114);
+        // the aspect the model sees is the camera's, to within the even-side
+        // rounding: 416/234 = 1.778 against 1920/1080 = 1.778
+        let seen = fit.inner.w as f64 / fit.inner.h as f64;
+        let real = WIDE.w as f64 / WIDE.h as f64;
+        assert!((seen - real).abs() < 0.01, "{seen} vs {real}");
+    }
+
+    #[test]
+    fn letterbox_sides_are_even_and_never_exceed_the_input() {
+        // A source whose exact fit is odd still lands on an even side, because
+        // the hardware path scales into NV12 and a silently rounded side would
+        // shift every box.
+        let odd = ResizePolicy::Letterbox { pad: 114 }.fit(InputSize::square(101), WIDE);
+        assert_eq!(odd.inner.w % 2, 0);
+        assert_eq!(odd.inner.h % 2, 0);
+        assert!(odd.inner.w <= 101 && odd.inner.h <= 101);
+        // a square source fills the square input exactly
+        let square = ResizePolicy::Letterbox { pad: 114 }.fit(YOLOX_416, InputSize::square(1080));
+        assert_eq!(square.inner, YOLOX_416);
+        // an absurdly thin source still leaves a usable side
+        let sliver =
+            ResizePolicy::Letterbox { pad: 114 }.fit(YOLOX_416, InputSize { w: 4000, h: 2 });
+        assert!(sliver.inner.h >= 1 && sliver.inner.w <= 416);
+    }
+
+    #[test]
+    fn a_full_frame_box_round_trips_under_both_policies() {
+        // The property that makes a projection right: whatever the model sees
+        // of the whole frame must come back as the whole frame.
+        for source in [WIDE, InputSize { w: 2560, h: 1920 }, SQUARE] {
+            for policy in [ResizePolicy::Stretch, ResizePolicy::Letterbox { pad: 114 }] {
+                let fit = policy.fit(YOLOX_416, source);
+                let projection = fit.projection(source);
+                let whole = [0.0, 0.0, fit.inner.w as f64, fit.inner.h as f64];
+                let back = projection.unproject(whole);
+                assert_eq!(back[0], 0.0, "{policy} {source}");
+                assert_eq!(back[1], 0.0, "{policy} {source}");
+                assert!((back[2] - 1.0).abs() < 1e-9, "{policy} {source}: {back:?}");
+                assert!((back[3] - 1.0).abs() < 1e-9, "{policy} {source}: {back:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn stretch_un_projection_is_a_divide_by_the_input_size() {
+        // The pre-existing rule, unchanged: independent of the source frame.
+        let projection = ResizePolicy::Stretch.project(SQUARE, WIDE);
+        assert_eq!(
+            projection.unproject([64.0, 128.0, 192.0, 320.0]),
+            [0.1, 0.2, 0.3, 0.5]
+        );
+        // ...and the same box under the same input from a different source
+        let other = ResizePolicy::Stretch.project(SQUARE, InputSize::square(720));
+        assert_eq!(
+            other.unproject([64.0, 128.0, 192.0, 320.0]),
+            projection.unproject([64.0, 128.0, 192.0, 320.0])
+        );
+    }
+
+    #[test]
+    fn letterbox_un_projection_ignores_the_padding() {
+        // 1920x1080 -> 416x234 content with 182 rows of pad below it. A box
+        // filling the content's lower half is the frame's lower half.
+        let projection = ResizePolicy::Letterbox { pad: 114 }.project(YOLOX_416, WIDE);
+        let back = projection.unproject([0.0, 117.0, 416.0, 234.0]);
+        assert!((back[0] - 0.0).abs() < 1e-9, "{back:?}");
+        assert!((back[1] - 0.5).abs() < 1e-9, "{back:?}");
+        assert!((back[2] - 1.0).abs() < 1e-9, "{back:?}");
+        assert!((back[3] - 1.0).abs() < 1e-9, "{back:?}");
+        // A box down in the padding un-projects past the bottom of the frame,
+        // which `det_from` clamps away rather than reporting as content.
+        assert!(projection.unproject([0.0, 300.0, 10.0, 320.0])[1] > 1.0);
+    }
+
+    #[test]
+    fn stretch_and_letterbox_disagree_on_a_16_by_9_frame() {
+        // The bug this fix exists for, stated as a number: a box that is
+        // square in the camera's frame is decoded from a model that saw it
+        // squashed to 9/16 of its height under stretch, so reading it back
+        // with the stretch rule stretches it again.
+        let source = WIDE;
+        let letterbox = ResizePolicy::Letterbox { pad: 114 }.project(YOLOX_416, source);
+        let stretch = ResizePolicy::Stretch.project(YOLOX_416, source);
+        // the same model-space box read both ways
+        let box_ = [104.0, 58.0, 312.0, 176.0];
+        let good = letterbox.unproject(box_);
+        let bad = stretch.unproject(box_);
+        assert!((good[0] - bad[0]).abs() < 1e-9, "x is unaffected");
+        // The letterboxed picture only occupies the top 234 of 416 rows, so
+        // reading it with the stretch rule squashes every box's height by
+        // exactly the aspect ratio, 1080/1920.
+        let good_h = good[3] - good[1];
+        let bad_h = bad[3] - bad[1];
+        assert!(
+            (bad_h / good_h - 1080.0 / 1920.0).abs() < 0.001,
+            "{bad_h} vs {good_h}"
+        );
+        // and every box is pulled toward the top of the frame as well
+        assert!(bad[1] < good[1], "{bad:?} vs {good:?}");
+    }
+
+    // ---- profiles: layout fitting, sniffing, ambiguity ---------------------
+
+    fn tensor_type(dims: &[i64]) -> ValueType {
+        ValueType::Tensor {
+            ty: ort::value::TensorElementType::Float32,
+            shape: ort::value::Shape::new(dims.to_vec()),
+            dimension_symbols: ort::value::SymbolicDimensions::new(
+                dims.iter().map(|_| String::default()),
+            ),
+        }
+    }
+
+    #[test]
+    fn every_built_in_profile_is_reachable_by_name() {
+        for profile in PROFILES {
+            assert_eq!(ModelProfile::parse(profile.name).unwrap(), *profile);
+        }
+        assert_eq!(ModelProfile::parse("  YOLOX ").unwrap(), YOLOX);
+        assert_eq!(ModelProfile::parse("RFDETR").unwrap(), RFDETR);
+        let err = ModelProfile::parse("yolov7").unwrap_err().to_string();
+        for expected in ["yolox", "yolov10", "yolov8", "rfdetr"] {
+            assert!(err.contains(expected), "{err}");
+        }
+        // and the error names the aliases too, because `yolo11` resolving to
+        // the yolov8 profile is exactly the thing a reader needs told
+        assert!(err.contains("yolo11"), "{err}");
+    }
+
+    #[test]
+    fn the_ultralytics_generations_are_aliases_of_one_profile_not_profiles() {
+        // Every one of these exports the same tensor, so each is a *name* for
+        // the yolov8 profile. Were they separate entries in `PROFILES`, an
+        // ordinary `[1, 84, 8400]` head would sniff as four candidates and
+        // hard-error on an ambiguity that does not exist.
+        for name in ["yolov8", "yolov9", "yolo11", "yolov11"] {
+            assert_eq!(ModelProfile::parse(name).unwrap(), YOLOV8, "{name}");
+        }
+        // yolo26 is end-to-end like yolov10 — UNVERIFIED against a real
+        // export, which is why it is an alias rather than its own decode.
+        assert_eq!(ModelProfile::parse("yolo26").unwrap(), YOLOV10);
+        assert_eq!(ModelProfile::parse("rf-detr").unwrap(), RFDETR);
+        // an alias resolves to the profile's canonical identity, so the
+        // startup line and every error say `yolov8`, not the alias
+        assert_eq!(ModelProfile::parse("yolo11").unwrap().to_string(), "yolov8");
+        // ...and one profile per distinct decode keeps sniffing unambiguous
+        assert_eq!(PROFILES.len(), 4);
+        assert_eq!(sniff(&declared(&[1, 84, 8400]), SQUARE).len(), 1);
+        assert_eq!(sniff(&declared(&[1, 300, 6]), SQUARE).len(), 1);
+    }
+
+    #[test]
+    fn the_built_in_profiles_are_the_documented_steps() {
+        assert_eq!(YOLOX.input.encoding, TensorEncoding::RawBgr);
+        assert_eq!(YOLOX.input.resize, ResizePolicy::Letterbox { pad: 114 });
+        assert_eq!(YOLOX.input.size, YOLOX_416);
+        assert_eq!(YOLOX.output.score, ScoreComposition::ObjTimesClass);
+        assert!(YOLOX.output.nms.is_some());
+
+        assert_eq!(YOLOV10.input.encoding, TensorEncoding::UnitRgb);
+        assert_eq!(YOLOV10.input.resize, ResizePolicy::Stretch);
+        assert_eq!(YOLOV10.output.layout, Layout::EndToEnd);
+        assert_eq!(YOLOV10.output.score, ScoreComposition::Class);
+        assert!(YOLOV10.output.nms.is_none());
+
+        assert_eq!(YOLOV8.input.encoding, TensorEncoding::UnitRgb);
+        assert_eq!(YOLOV8.input.resize, ResizePolicy::Stretch);
+        assert_eq!(YOLOV8.output.score, ScoreComposition::Class);
+        assert!(YOLOV8.output.nms.is_some());
+
+        // Measured against onnx-community/rfdetr_nano-ONNX, not assumed: the
+        // export's own `preprocessor_config.json` and RF-DETR's
+        // `kornia_transforms` agree on ImageNet mean/std, its square
+        // `A.Resize` is a stretch, its `postprocess` sigmoids raw logits, and
+        // set prediction means no NMS.
+        assert_eq!(RFDETR.input.encoding, TensorEncoding::ImageNetRgb);
+        assert_eq!(RFDETR.input.resize, ResizePolicy::Stretch);
+        assert_eq!(RFDETR.input.size, InputSize::square(384));
+        assert_eq!(RFDETR.output.layout, Layout::DetrQueries { nc: 91 });
+        assert_eq!(RFDETR.output.score, ScoreComposition::SigmoidClass);
+        assert!(RFDETR.output.nms.is_none());
+        // it is the only family here that reads more than one tensor
+        for profile in PROFILES {
+            let two = matches!(
+                profile.output.layout.roles(),
+                Outputs::BoxesAndLogits { .. }
+            );
+            assert_eq!(two, profile.name == "rfdetr", "{}", profile.name);
+        }
+    }
+
+    #[test]
+    fn a_row_width_of_six_is_the_end_to_end_layout() {
+        // yolov10n's own export
+        assert_eq!(sniff(&declared(&[1, 300, 6]), SQUARE), vec![YOLOV10]);
+        assert_eq!(
+            fit_layout(Layout::EndToEnd, &one(&[1, 300, 6]), SQUARE).unwrap(),
+            Layout::EndToEnd
+        );
+    }
+
+    #[test]
+    fn a_long_anchor_axis_is_the_raw_detect_head() {
+        // coco yolov8n at 640x640
+        let sniffed = sniff(&declared(&[1, 84, 8400]), SQUARE);
+        assert_eq!(sniffed.len(), 1);
+        assert_eq!(sniffed[0].name, "yolov8");
+        assert_eq!(sniffed[0].output.layout, Layout::RawClasses { nc: 80 });
+        // a single-class model at a small input still has far more anchors
+        // than channels
+        assert_eq!(
+            fit_layout(
+                Layout::RawClasses { nc: 80 },
+                &one(&[1, 5, 189]),
+                InputSize::square(128)
+            )
+            .unwrap(),
+            Layout::RawClasses { nc: 1 }
+        );
+    }
+
+    #[test]
+    fn the_grid_anchor_count_is_what_names_the_yolox_layout() {
+        // yolox_nano.onnx from the Megvii 0.1.1rc0 release: 416x416 input,
+        // 52^2 + 26^2 + 13^2 = 3549 anchors, 5 + 80 columns
+        assert_eq!(grid_anchors(YOLOX_416, STRIDES), 3549);
+        let sniffed = sniff(&declared(&[1, 3549, 85]), YOLOX_416);
+        assert_eq!(sniffed.len(), 1);
+        assert_eq!(sniffed[0].name, "yolox");
+        assert_eq!(
+            sniffed[0].output.layout,
+            Layout::GridObjectness {
+                nc: 80,
+                strides: STRIDES
+            }
+        );
+        assert_eq!(grid_anchors(SQUARE, STRIDES), 8400);
+    }
+
+    #[test]
+    fn a_shape_that_fits_two_profiles_is_an_error_naming_both() {
+        // A 1-class yolox head is `[1, A, 6]`, and 6 is also the end-to-end
+        // row width. At 640x384 that is 5040 anchors either way and nothing in
+        // the shape says which — one decodes boxes out of a stride grid, the
+        // other reads them as final pixel corners, so picking silently emits
+        // plausible garbage.
+        let wide = InputSize { w: 640, h: 384 };
+        assert_eq!(grid_anchors(wide, STRIDES), 80 * 48 + 40 * 24 + 20 * 12);
+        assert_eq!(
+            sniff(&declared(&[1, 5040, 6]), wide)
+                .iter()
+                .map(|p| p.name)
+                .collect::<Vec<_>>(),
+            vec!["yolox", "yolov10"]
+        );
+        let err = resolve_profile(None, &declared(&[1, 5040, 6]), wide, Path::new("m.onnx"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("yolox"), "{err}");
+        assert!(err.contains("yolov10"), "{err}");
+        assert!(err.contains("--model-profile"), "{err}");
+        assert!(err.contains("[1, 5040, 6]"), "{err}");
+        // the same collision at the default square input
+        assert_eq!(sniff(&declared(&[1, 8400, 6]), SQUARE).len(), 2);
+    }
+
+    #[test]
+    fn a_transposed_looking_shape_is_yolox_alone_because_ultralytics_is_channels_first() {
+        // Worth pinning: `[1, 8400, 84]` at 640 *looks* like it could be
+        // either family, and it is a 79-class yolox. It is not ambiguous
+        // because a stock Ultralytics detect head is channels-first — its
+        // anchor axis is the long one — so `RawClasses` refuses this
+        // orientation outright rather than reading nc as 8396.
+        let sniffed = sniff(&declared(&[1, 8400, 84]), SQUARE);
+        assert_eq!(sniffed.len(), 1, "{sniffed:?}");
+        assert_eq!(sniffed[0].name, "yolox");
+        assert_eq!(
+            sniffed[0].output.layout,
+            Layout::GridObjectness {
+                nc: 79,
+                strides: STRIDES
+            }
+        );
+        // adding a transposed-Ultralytics profile would make this genuinely
+        // ambiguous, and the resolution above is what would then catch it
+        assert!(fit_layout(Layout::RawClasses { nc: 80 }, &one(&[1, 8400, 84]), SQUARE).is_err());
+    }
+
+    #[test]
+    fn an_explicit_profile_resolves_a_shape_that_is_otherwise_ambiguous() {
+        let (profile, _names, output) = resolve_profile(
+            Some(YOLOX),
+            &declared(&[1, 8400, 84]),
+            SQUARE,
+            Path::new("m.onnx"),
+        )
+        .unwrap();
+        assert_eq!(profile.name, "yolox");
+        assert_eq!(
+            output.unwrap().layout,
+            Layout::GridObjectness {
+                nc: 79,
+                strides: STRIDES
+            }
+        );
+        // ...and the other reading of the same shape is available too
+        let (profile, _names, output) = resolve_profile(
+            Some(YOLOV10),
+            &declared(&[1, 5040, 6]),
+            InputSize { w: 640, h: 384 },
+            Path::new("m.onnx"),
+        )
+        .unwrap();
+        assert_eq!(profile.name, "yolov10");
+        assert_eq!(output.unwrap().layout, Layout::EndToEnd);
+    }
+
+    #[test]
+    fn an_explicit_profile_that_does_not_fit_the_model_fails_loudly() {
+        // yolox at an input size whose grid the output does not match: 3549
+        // anchors are 416's, not 640's
+        let err = resolve_profile(
+            Some(YOLOX),
+            &declared(&[1, 3549, 85]),
+            SQUARE,
+            Path::new("m.onnx"),
+        )
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("--model-profile yolox"), "{text}");
+        assert!(text.contains("[1, 8400, 5 + nc]"), "{text}");
+        // an end-to-end profile pointed at a raw head
+        assert!(resolve_profile(
+            Some(YOLOV10),
+            &declared(&[1, 84, 8400]),
+            SQUARE,
+            Path::new("m.onnx")
+        )
+        .is_err());
+        // a channels-first profile pointed at an anchor-major head
+        assert!(resolve_profile(
+            Some(YOLOV8),
+            &declared(&[1, 8400, 84]),
+            SQUARE,
+            Path::new("m.onnx")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_unrecognizable_shape_names_every_profile() {
+        for (dims, size) in [
+            (vec![1, 84, 84], SQUARE),      // no axis long enough to be anchors
+            (vec![1, 3, 640, 640], SQUARE), // rank 4
+            // yolov5 at 640: same rank and row width as a yolox head, but
+            // three anchor boxes per cell make A exactly 3x a yolox's, and
+            // its boxes are already in pixels — decoding it against the yolox
+            // grid would emit plausible garbage
+            (vec![1, 25200, 85], SQUARE),
+            // a real yolox shape read against the wrong input size
+            (vec![1, 3549, 85], SQUARE),
+            (vec![1, 8400, 85], YOLOX_416),
+            (vec![2, 84, 8400], SQUARE), // batched
+        ] {
+            assert!(
+                sniff(&declared(&dims), size).is_empty(),
+                "{dims:?} matched something"
+            );
+            let err = resolve_profile(None, &declared(&dims), size, Path::new("m.onnx"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("yolox"), "{err}");
+            assert!(err.contains("yolov10"), "{err}");
+            assert!(err.contains("yolov8"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_static_output_shape_settles_the_profile_at_startup() {
+        let dims = static_output_dims(&tensor_type(&[1, 84, 8400])).unwrap();
+        assert_eq!(sniff(&declared(&dims), SQUARE)[0].name, "yolov8");
+        let dims = static_output_dims(&tensor_type(&[1, 3549, 85])).unwrap();
+        assert_eq!(sniff(&declared(&dims), YOLOX_416)[0].name, "yolox");
+    }
+
+    #[test]
+    fn a_dynamic_output_shape_needs_the_flag_and_settles_nc_later() {
+        assert!(static_output_dims(&tensor_type(&[1, 84, -1])).is_none());
+        assert!(static_output_dims(&tensor_type(&[-1, -1, -1])).is_none());
+        // nothing to sniff, and the encoding has to be known before the first
+        // frame is converted, so this is a startup failure rather than a guess
+        let err = resolve_profile(None, &dynamic(), SQUARE, Path::new("m.onnx"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--model-profile"), "{err}");
+        assert!(err.contains("yolox"), "{err}");
+        // with the flag, the input half is settled now and nc waits
+        let (profile, _names, output) =
+            resolve_profile(Some(YOLOX), &dynamic(), SQUARE, Path::new("m.onnx")).unwrap();
+        assert_eq!(profile.input.encoding, TensorEncoding::RawBgr);
+        assert!(output.is_none());
+    }
+
+    // ---- end-to-end layout ------------------------------------------------
+
+    fn row(x1: f32, y1: f32, x2: f32, y2: f32, score: f32, class_id: f32) -> [f32; 6] {
+        [x1, y1, x2, y2, score, class_id]
+    }
+
+    fn e2e(rows: &[f32], floors: &ScoreFloors, size: InputSize) -> Vec<Det> {
+        let dims = [1, (rows.len() / 6) as i64, 6];
+        decode(YOLOV10.output, rows, &dims, floors, size)
+    }
+
+    #[test]
+    fn normalizes_and_rounds_boxes() {
+        let dets = e2e(
+            &row(64.0, 128.0, 192.0, 320.0, 0.876_54, 0.0),
+            &open(),
+            SQUARE,
+        );
+        assert_eq!(
+            dets,
+            vec![Det {
+                label: "person".into(),
+                score: 0.877,
+                bbox: [0.1, 0.2, 0.2, 0.3],
+            }]
+        );
+    }
+
+    #[test]
+    fn normalizes_each_axis_by_its_own_side() {
+        // The same box under a 320x160 input: x by 320, y by 160.
+        let dets = e2e(
+            &row(32.0, 32.0, 160.0, 80.0, 0.9, 0.0),
+            &open(),
+            InputSize { w: 320, h: 160 },
+        );
+        assert_eq!(dets[0].bbox, [0.1, 0.2, 0.4, 0.3]);
+    }
+
+    #[test]
+    fn gates_on_the_per_class_floor() {
+        let floors = floors(r#"{"default":0.5,"person":0.9}"#);
+        let mut rows = Vec::new();
+        rows.extend_from_slice(&row(0.0, 0.0, 64.0, 64.0, 0.85, 0.0)); // person, under 0.9
+        rows.extend_from_slice(&row(0.0, 0.0, 64.0, 64.0, 0.85, 2.0)); // car, over 0.5
+        rows.extend_from_slice(&row(0.0, 0.0, 64.0, 64.0, 0.40, 2.0)); // car, under 0.5
+        let dets = e2e(&rows, &floors, SQUARE);
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].label, "car");
+    }
+
+    #[test]
+    fn clamps_boxes_to_the_frame() {
+        let dets = e2e(
+            &row(-320.0, -640.0, 1280.0, 1280.0, 0.9, 2.0),
+            &open(),
+            SQUARE,
+        );
+        assert_eq!(dets[0].bbox, [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn drops_non_finite_rows() {
+        let mut rows = Vec::new();
+        rows.extend_from_slice(&row(0.0, 0.0, 64.0, 64.0, f32::NAN, 0.0));
+        rows.extend_from_slice(&row(f32::NAN, 0.0, 64.0, 64.0, 0.9, 0.0));
+        rows.extend_from_slice(&row(0.0, 0.0, f32::INFINITY, 64.0, 0.9, 0.0));
+        rows.extend_from_slice(&row(0.0, 0.0, 64.0, 64.0, 0.9, 2.0));
+        let dets = e2e(&rows, &open(), SQUARE);
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].label, "car");
+        let json = serde_json::to_string(&dets).unwrap();
+        assert!(!json.contains("null"), "{json}");
+    }
+
+    #[test]
+    fn caps_and_sorts_detections() {
+        let mut rows = Vec::new();
+        for i in 0..(MAX_DETS + 10) {
+            let score = 0.6 + i as f32 / 1000.0;
+            rows.extend_from_slice(&row(0.0, 0.0, 64.0, 64.0, score, 2.0));
+        }
+        let dets = e2e(&rows, &open(), SQUARE);
+        assert_eq!(dets.len(), MAX_DETS);
+        assert!(dets[0].score > dets[MAX_DETS - 1].score);
+        assert!(dets.windows(2).all(|w| w[0].score >= w[1].score));
+    }
+
+    #[test]
+    fn an_end_to_end_head_is_not_run_through_nms() {
+        // Three identical boxes of one class: NMS would collapse them, and
+        // the yolov10 profile does not ask for it because the model already
+        // did the de-duplication.
+        assert!(YOLOV10.output.nms.is_none());
+        let mut rows = Vec::new();
+        for _ in 0..3 {
+            rows.extend_from_slice(&row(0.0, 0.0, 64.0, 64.0, 0.9, 2.0));
+        }
+        assert_eq!(e2e(&rows, &open(), SQUARE).len(), 3);
+    }
+
+    // ---- raw-classes layout ------------------------------------------------
+
     /// Channels-first `[1, 4 + nc, A]`, one entry per anchor.
     fn v8_output(nc: usize, anchors: &[(f32, f32, f32, f32, usize, f32)]) -> Vec<f32> {
         let a = anchors.len();
@@ -830,6 +2497,13 @@ mod tests {
         out
     }
 
+    fn v8_spec(nc: usize) -> OutputSpec {
+        OutputSpec {
+            layout: Layout::RawClasses { nc },
+            ..YOLOV8.output
+        }
+    }
+
     fn v8(
         nc: usize,
         anchors: &[(f32, f32, f32, f32, usize, f32)],
@@ -837,95 +2511,14 @@ mod tests {
         size: InputSize,
     ) -> Vec<Det> {
         let values = v8_output(nc, anchors);
-        postprocess_yolov8(&values, nc, anchors.len(), &labels(), floors, size)
-    }
-
-    fn tensor_type(dims: &[i64]) -> ValueType {
-        ValueType::Tensor {
-            ty: ort::value::TensorElementType::Float32,
-            shape: ort::value::Shape::new(dims.to_vec()),
-            dimension_symbols: ort::value::SymbolicDimensions::new(
-                dims.iter().map(|_| String::default()),
-            ),
-        }
-    }
-
-    #[test]
-    fn a_row_width_of_six_is_the_end_to_end_layout() {
-        assert_eq!(classify_layout(&[1, 300, 6]).unwrap(), Layout::Yolov10);
-        // yolov10n's own export
-        assert_eq!(
-            classify_layout(&[1, 300, 6]).unwrap().to_string(),
-            "yolov10"
-        );
-    }
-
-    #[test]
-    fn a_long_anchor_axis_is_the_raw_detect_head() {
-        // coco yolov8n at 640x640
-        assert_eq!(
-            classify_layout(&[1, 84, 8400]).unwrap(),
-            Layout::Yolov8 { classes: 80 }
-        );
-        // a single-class model at a small input still has far more anchors
-        // than channels
-        assert_eq!(
-            classify_layout(&[1, 5, 189]).unwrap(),
-            Layout::Yolov8 { classes: 1 }
-        );
-        assert_eq!(
-            classify_layout(&[1, 84, 8400]).unwrap().to_string(),
-            "yolov8 (nc=80)"
-        );
-    }
-
-    #[test]
-    fn an_unrecognizable_shape_names_both_layouts() {
-        for dims in [
-            vec![1, 84, 84],      // no axis long enough to be anchors
-            vec![1, 3, 640, 640], // rank 4
-            vec![1, 8400, 84],    // transposed raw head: not what ort emits
-            vec![1, 25200, 85],   // yolov5, which carries an objectness row
-            vec![2, 84, 8400],    // batched
-        ] {
-            let err = classify_layout(&dims).unwrap_err().to_string();
-            assert!(
-                err.contains("[1, N, 6]") && err.contains("[1, 4 + nc, A]"),
-                "{err}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_static_output_shape_settles_the_layout_at_startup() {
-        let dims = static_output_dims(&tensor_type(&[1, 84, 8400])).unwrap();
-        assert_eq!(
-            classify_layout(&dims).unwrap(),
-            Layout::Yolov8 { classes: 80 }
-        );
-    }
-
-    #[test]
-    fn a_dynamic_output_shape_defers_to_the_first_output() {
-        // nothing to classify at startup...
-        assert!(static_output_dims(&tensor_type(&[1, 84, -1])).is_none());
-        assert!(static_output_dims(&tensor_type(&[-1, -1, -1])).is_none());
-        // ...and the concrete dims of the first output settle it
-        assert_eq!(
-            classify_layout(&[1, 84, 8400]).unwrap(),
-            Layout::Yolov8 { classes: 80 }
-        );
+        let dims = [1, (4 + nc) as i64, anchors.len() as i64];
+        decode(v8_spec(nc), &values, &dims, floors, size)
     }
 
     #[test]
     fn decodes_raw_boxes_from_centers() {
         // cx=320 cy=320 w=128 h=192 -> corners 256,224..384,416
-        let dets = v8(
-            3,
-            &[(320.0, 320.0, 128.0, 192.0, 0, 0.9)],
-            &ScoreFloors::parse("{}").unwrap(),
-            SQUARE,
-        );
+        let dets = v8(3, &[(320.0, 320.0, 128.0, 192.0, 0, 0.9)], &open(), SQUARE);
         assert_eq!(
             dets,
             vec![Det {
@@ -941,14 +2534,7 @@ mod tests {
         let mut values = v8_output(3, &[(320.0, 320.0, 64.0, 64.0, 2, 0.8)]);
         // a weaker person score on the same anchor must not win
         values[4] = 0.6;
-        let dets = postprocess_yolov8(
-            &values,
-            3,
-            1,
-            &labels(),
-            &ScoreFloors::parse("{}").unwrap(),
-            SQUARE,
-        );
+        let dets = decode(v8_spec(3), &values, &[1, 7, 1], &open(), SQUARE);
         assert_eq!(dets.len(), 1);
         assert_eq!(dets[0].label, "car");
         assert_eq!(dets[0].score, 0.8);
@@ -956,7 +2542,6 @@ mod tests {
 
     #[test]
     fn nms_collapses_same_class_overlap_but_keeps_other_classes() {
-        let floors = ScoreFloors::parse("{}").unwrap();
         let dets = v8(
             3,
             &[
@@ -970,7 +2555,7 @@ mod tests {
                 // a person far away: no overlap, survives
                 (80.0, 80.0, 60.0, 60.0, 0, 0.60),
             ],
-            &floors,
+            &open(),
             SQUARE,
         );
         let mut seen: Vec<(&str, f64)> = dets.iter().map(|d| (d.label.as_str(), d.score)).collect();
@@ -995,19 +2580,14 @@ mod tests {
     fn raw_boxes_normalize_per_axis_too() {
         let size = InputSize { w: 320, h: 160 };
         // cx=160 cy=80 w=64 h=32 -> 128,64..192,96
-        let dets = v8(
-            3,
-            &[(160.0, 80.0, 64.0, 32.0, 0, 0.9)],
-            &ScoreFloors::parse("{}").unwrap(),
-            size,
-        );
+        let dets = v8(3, &[(160.0, 80.0, 64.0, 32.0, 0, 0.9)], &open(), size);
         assert_eq!(dets[0].bbox, [0.4, 0.4, 0.2, 0.2]);
     }
 
     #[test]
     fn the_prefilter_never_cuts_above_a_configured_floor() {
         // the lowest configured floor is what the prefilter may cut at
-        let floors = ScoreFloors::parse(r#"{"default":0.5,"car":0.02}"#).unwrap();
+        let floors = floors(r#"{"default":0.5,"car":0.02}"#);
         assert_eq!(floors.min_floor(), 0.02);
         let dets = v8(
             3,
@@ -1027,21 +2607,20 @@ mod tests {
     fn a_flood_of_raw_anchors_still_fits_the_contract() {
         // Distinct, non-overlapping boxes so NMS keeps every one of them:
         // the MAX_DETS cap, not NMS, is what has to hold the line.
-        let anchors: Vec<_> = (0..(MAX_CANDIDATES + 500))
+        let anchors: Vec<_> = (0..(DEFAULT_NMS.max_candidates + 500))
             .map(|i| {
                 let x = (i % 600) as f32;
                 let y = (i / 600) as f32;
                 (x, y, 0.5, 0.5, i % 3, 0.6 + (i % 100) as f32 / 1000.0)
             })
             .collect();
-        let dets = v8(3, &anchors, &ScoreFloors::parse("{}").unwrap(), SQUARE);
+        let dets = v8(3, &anchors, &open(), SQUARE);
         assert_eq!(dets.len(), MAX_DETS);
         assert!(dets.windows(2).all(|w| w[0].score >= w[1].score));
     }
 
     #[test]
     fn raw_non_finite_anchors_never_reach_the_output() {
-        let floors = ScoreFloors::parse("{}").unwrap();
         let mut values = v8_output(
             3,
             &[
@@ -1052,7 +2631,446 @@ mod tests {
         );
         // a NaN class score wins total_cmp's argmax, so it needs its own guard
         values[4 * 3] = f32::NAN;
-        let dets = postprocess_yolov8(&values, 3, 3, &labels(), &floors, SQUARE);
+        let dets = decode(v8_spec(3), &values, &[1, 7, 3], &open(), SQUARE);
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].label, "car");
+        let json = serde_json::to_string(&dets).unwrap();
+        assert!(!json.contains("null"), "{json}");
+    }
+
+    // ---- grid-objectness layout --------------------------------------------
+
+    /// Anchor-major `[1, A, 5 + nc]`, addressed by grid cell so a test can
+    /// say which stride and which cell a box came out of.
+    struct GridOutput {
+        size: InputSize,
+        classes: usize,
+        values: Vec<f32>,
+    }
+
+    impl GridOutput {
+        fn new(size: InputSize, classes: usize) -> Self {
+            Self {
+                size,
+                classes,
+                values: vec![0f32; grid_anchors(size, STRIDES) * (5 + classes)],
+            }
+        }
+
+        /// Independently of `grid_objectness`'s own walk: strides in order,
+        /// each grid row-major.
+        fn base_of(&self, stride: usize, gx: usize, gy: usize) -> usize {
+            let mut anchor = 0;
+            for s in STRIDES {
+                let (cols, rows) = (self.size.w / s, self.size.h / s);
+                if *s == stride {
+                    assert!(gx < cols && gy < rows, "cell {gx},{gy} is off stride {s}");
+                    return (anchor + gy * cols + gx) * (5 + self.classes);
+                }
+                anchor += cols * rows;
+            }
+            panic!("{stride} is not a stride of this profile");
+        }
+
+        /// `raw` is what the model emits: `x, y` offsets inside the cell and
+        /// `w, h` in log space, all relative to the cell's stride.
+        fn put(
+            &mut self,
+            (stride, gx, gy): (usize, usize, usize),
+            raw: [f32; 4],
+            objectness: f32,
+            class: usize,
+            class_score: f32,
+        ) -> &mut Self {
+            let base = self.base_of(stride, gx, gy);
+            self.values[base..base + 4].copy_from_slice(&raw);
+            self.values[base + 4] = objectness;
+            self.values[base + 5 + class] = class_score;
+            self
+        }
+
+        fn spec(&self) -> OutputSpec {
+            OutputSpec {
+                layout: Layout::GridObjectness {
+                    nc: self.classes,
+                    strides: STRIDES,
+                },
+                ..YOLOX.output
+            }
+        }
+
+        fn dims(&self) -> [i64; 3] {
+            [
+                1,
+                grid_anchors(self.size, STRIDES) as i64,
+                (5 + self.classes) as i64,
+            ]
+        }
+
+        fn decode(&self, floors: &ScoreFloors) -> Vec<Det> {
+            decode(self.spec(), &self.values, &self.dims(), floors, self.size)
+        }
+    }
+
+    #[test]
+    fn grid_boxes_come_out_of_the_cell_they_were_emitted_in() {
+        // stride 8, cell (4, 2), centered half a cell in x and a quarter in y:
+        // cx = (0.5 + 4) * 8 = 36, cy = (0.25 + 2) * 8 = 18. exp(0) * 8 = 8
+        // on both extents, so corners are 32,14..40,22.
+        let mut out = GridOutput::new(TINY, 3);
+        out.put((8, 4, 2), [0.5, 0.25, 0.0, 0.0], 0.8, 0, 0.75);
+        assert_eq!(
+            out.decode(&open()),
+            vec![Det {
+                label: "person".into(),
+                score: 0.6, // 0.8 objectness * 0.75 class
+                bbox: [0.5, 0.2188, 0.125, 0.125],
+            }]
+        );
+    }
+
+    #[test]
+    fn the_final_score_is_objectness_times_the_class_score() {
+        // The anchor with the far better class score loses on objectness.
+        // Reading the class score alone — the `Class` composition — would keep
+        // it and drop the other.
+        let mut out = GridOutput::new(TINY, 3);
+        out.put((8, 1, 1), [0.0, 0.0, 0.0, 0.0], 0.10, 0, 0.99).put(
+            (8, 6, 6),
+            [0.0, 0.0, 0.0, 0.0],
+            0.90,
+            2,
+            0.80,
+        );
+        let dets = out.decode(&open());
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].label, "car");
+        assert_eq!(dets[0].score, 0.72);
+
+        // ...and the same output read with `Class` keeps the other one, which
+        // is exactly what the composition is for.
+        let spec = OutputSpec {
+            score: ScoreComposition::Class,
+            ..out.spec()
+        };
+        let dets = decode(spec, &out.values, &out.dims(), &open(), TINY);
+        let mut seen: Vec<&str> = dets.iter().map(|d| d.label.as_str()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec!["car", "person"]);
+    }
+
+    #[test]
+    fn the_argmax_is_over_class_scores_and_objectness_scales_all_of_them() {
+        let mut out = GridOutput::new(TINY, 3);
+        let base = out.base_of(8, 3, 3);
+        out.values[base + 4] = 0.8;
+        out.values[base + 5] = 0.6; // person
+        out.values[base + 7] = 0.9; // car wins
+        let dets = out.decode(&open());
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].label, "car");
+        assert_eq!(dets[0].score, 0.72);
+    }
+
+    #[test]
+    fn the_grids_are_walked_in_the_order_the_model_concatenated_them() {
+        // Strides 8, 16, 32, each grid row-major. Reading them in any other
+        // order puts these three boxes in the wrong places, and the centers
+        // are far enough apart that no near-miss passes.
+        let mut out = GridOutput::new(TINY, 3);
+        out
+            // first anchor of all: stride 8, cell (0,0) -> center 0,0
+            .put((8, 0, 0), [0.0, 0.0, 0.0, 0.0], 1.0, 0, 0.9)
+            // stride 16, cell (3,0) -> center 48,0
+            .put((16, 3, 0), [0.0, 0.0, 0.0, 0.0], 1.0, 1, 0.9)
+            // last anchor of all: stride 32, cell (1,1) -> center 32,32
+            .put((32, 1, 1), [0.0, 0.0, 0.0, 0.0], 1.0, 2, 0.9);
+        let mut seen: Vec<(String, [f64; 4])> = out
+            .decode(&open())
+            .into_iter()
+            .map(|d| (d.label, d.bbox))
+            .collect();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            seen,
+            vec![
+                // 48,0 with an exp(0)*16 = 16 box -> 40,-8..56,8, clamped
+                ("bicycle".to_string(), [0.625, 0.0, 0.25, 0.125]),
+                // 32,32 with an exp(0)*32 = 32 box -> 16,16..48,48
+                ("car".to_string(), [0.25, 0.25, 0.5, 0.5]),
+                // 0,0 with an exp(0)*8 = 8 box -> -4,-4..4,4, clamped
+                ("person".to_string(), [0.0, 0.0, 0.0625, 0.0625]),
+            ]
+        );
+        // and the walk covers every anchor exactly once
+        assert_eq!(
+            out.values.len() / (5 + out.classes),
+            grid_anchors(TINY, STRIDES)
+        );
+    }
+
+    #[test]
+    fn grid_extents_are_log_scale() {
+        // exp(ln 4) * 8 = 32 wide against exp(0) * 8 = 8 tall.
+        let mut out = GridOutput::new(TINY, 3);
+        out.put((8, 4, 4), [0.0, 0.0, 4f32.ln(), 0.0], 1.0, 0, 0.9);
+        let dets = out.decode(&open());
+        // center 32,32; 32x8 -> 16,28..48,36
+        assert_eq!(dets[0].bbox, [0.25, 0.4375, 0.5, 0.125]);
+    }
+
+    #[test]
+    fn grid_boxes_normalize_per_axis_too() {
+        // 8*4 + 4*2 + 2*1 = 42 anchors
+        let size = InputSize { w: 64, h: 32 };
+        let mut out = GridOutput::new(size, 3);
+        // stride 8, cell (3, 1) -> center 28,12; exp(0)*8 box -> 24,8..32,16
+        out.put((8, 3, 1), [0.5, 0.5, 0.0, 0.0], 1.0, 0, 0.9);
+        let dets = out.decode(&open());
+        assert_eq!(dets[0].bbox, [0.375, 0.25, 0.125, 0.25]);
+    }
+
+    #[test]
+    fn grid_clamps_boxes_to_the_frame() {
+        // A cell at the edge with a box far wider than the input.
+        let mut out = GridOutput::new(TINY, 3);
+        out.put((32, 0, 0), [0.0, 0.0, 4.0, 4.0], 1.0, 2, 0.9);
+        assert_eq!(out.decode(&open())[0].bbox, [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn grid_reuses_the_same_nms() {
+        let mut out = GridOutput::new(TINY, 3);
+        // Four stride-8 cells whose offsets all put the center at 28,28 with
+        // a 24px box, so they land on top of each other.
+        let big = 3f32.ln();
+        out.put((8, 3, 3), [0.5, 0.5, big, big], 1.0, 0, 0.90)
+            .put((8, 4, 3), [-0.5, 0.5, big, big], 1.0, 0, 0.85)
+            .put((8, 3, 4), [0.5, -0.5, big, big], 1.0, 0, 0.80)
+            // a car on the same object: a different class is never suppressed
+            // by a person, and it has to be its own anchor because one anchor
+            // only ever contributes its argmax class
+            .put((8, 4, 4), [-0.5, -0.5, big, big], 1.0, 2, 0.70)
+            // a person over in the corner: IoU 0.19, under the NMS threshold
+            .put((32, 0, 0), [0.5, 0.5, 0.0, 0.0], 1.0, 0, 0.60);
+        let mut seen: Vec<(String, f64)> = out
+            .decode(&open())
+            .into_iter()
+            .map(|d| (d.label, d.score))
+            .collect();
+        seen.sort_by(|a, b| b.1.total_cmp(&a.1));
+        assert_eq!(
+            seen,
+            vec![
+                ("person".to_string(), 0.9),
+                ("car".to_string(), 0.7),
+                ("person".to_string(), 0.6)
+            ]
+        );
+    }
+
+    #[test]
+    fn grid_prefilters_at_the_lowest_configured_floor() {
+        let floors = floors(r#"{"default":0.5,"car":0.02}"#);
+        let mut out = GridOutput::new(TINY, 3);
+        // car at 0.03: over its own floor, under the default
+        out.put((8, 1, 1), [0.0, 0.0, 0.0, 0.0], 0.1, 2, 0.3)
+            // person at the same 0.03: under the 0.5 default
+            .put((8, 6, 6), [0.0, 0.0, 0.0, 0.0], 0.1, 0, 0.3);
+        let dets = out.decode(&floors);
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].label, "car");
+        assert_eq!(dets[0].score, 0.03);
+    }
+
+    #[test]
+    fn a_flood_of_grid_anchors_still_fits_the_contract() {
+        // Every stride-8 cell fires a tiny, non-overlapping box, so NMS keeps
+        // all 64 and only the MAX_DETS cap can hold the line.
+        let mut out = GridOutput::new(TINY, 3);
+        for gy in 0..8 {
+            for gx in 0..8 {
+                let score = 0.6 + (gy * 8 + gx) as f32 / 1000.0;
+                out.put((8, gx, gy), [0.0, 0.0, -3.0, -3.0], 1.0, gx % 3, score);
+            }
+        }
+        let dets = out.decode(&open());
+        assert_eq!(dets.len(), MAX_DETS);
+        assert!(dets.windows(2).all(|w| w[0].score >= w[1].score));
+    }
+
+    #[test]
+    fn grid_non_finite_anchors_never_reach_the_output() {
+        let mut out = GridOutput::new(TINY, 3);
+        out.put((8, 0, 0), [f32::NAN, 0.0, 0.0, 0.0], 1.0, 0, 0.9)
+            .put((8, 2, 0), [0.0, f32::INFINITY, 0.0, 0.0], 1.0, 0, 0.9)
+            // exp() of a huge logit is inf, which the corner check catches
+            .put((8, 4, 0), [0.0, 0.0, 1e30, 0.0], 1.0, 0, 0.9)
+            // a NaN objectness makes the product NaN
+            .put((8, 6, 0), [0.0, 0.0, 0.0, 0.0], f32::NAN, 0, 0.9)
+            .put((16, 1, 1), [0.0, 0.0, 0.0, 0.0], 1.0, 2, 0.9);
+        // a NaN class score wins total_cmp's argmax, so it needs its own guard
+        let base = out.base_of(8, 7, 7);
+        out.values[base + 4] = 1.0;
+        out.values[base + 5] = f32::NAN;
+
+        let dets = out.decode(&open());
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].label, "car");
+        let json = serde_json::to_string(&dets).unwrap();
+        assert!(!json.contains("null"), "{json}");
+    }
+
+    // ---- detr-queries layout ------------------------------------------------
+
+    /// A DETR head: `[1, Q, 4]` normalized `cx, cy, w, h` beside `[1, Q, nc]`
+    /// raw logits over the same queries.
+    struct DetrOutput {
+        queries: usize,
+        classes: usize,
+        boxes: Vec<f32>,
+        logits: Vec<f32>,
+    }
+
+    impl DetrOutput {
+        fn new(queries: usize, classes: usize) -> Self {
+            Self {
+                queries,
+                classes,
+                boxes: vec![0.0; queries * 4],
+                // sigmoid(-20) is 2e-9. A logit of 0 would sigmoid to 0.5 and
+                // clear the default floor, so an untouched query has to start
+                // well below it rather than at zero.
+                logits: vec![-20.0; queries * classes],
+            }
+        }
+
+        fn put(&mut self, query: usize, cxcywh: [f32; 4], class: usize, logit: f32) -> &mut Self {
+            self.boxes[query * 4..query * 4 + 4].copy_from_slice(&cxcywh);
+            self.logits[query * self.classes + class] = logit;
+            self
+        }
+
+        fn spec(&self) -> OutputSpec {
+            OutputSpec {
+                layout: Layout::DetrQueries { nc: self.classes },
+                ..RFDETR.output
+            }
+        }
+
+        fn decode(&self, floors: &ScoreFloors, size: InputSize) -> Vec<Det> {
+            decode_output(
+                self.spec(),
+                &raw_detr(
+                    &self.boxes,
+                    &self.logits,
+                    self.queries as i64,
+                    self.classes as i64,
+                ),
+                &labels(),
+                floors,
+                size,
+                &Projection::stretch(size),
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn detr_boxes_are_normalized_centers_not_pixels_or_corners() {
+        // cx=0.5 cy=0.5 w=0.25 h=0.5 of a 640 square -> 320,320 center with a
+        // 160x320 box -> corners 240,160..400,480 -> the frame's middle.
+        //
+        // Read as xyxy instead this would be a box from 0.5,0.5 to 0.25,0.5 —
+        // inverted, and clamped to nothing.
+        let mut out = DetrOutput::new(4, 3);
+        out.put(0, [0.5, 0.5, 0.25, 0.5], 2, 4.0);
+        assert_eq!(
+            out.decode(&open(), SQUARE),
+            vec![Det {
+                label: "car".into(),
+                score: 0.982, // sigmoid(4)
+                bbox: [0.375, 0.25, 0.25, 0.5],
+            }]
+        );
+    }
+
+    #[test]
+    fn detr_scores_are_the_sigmoid_of_the_logit_not_the_logit() {
+        // The distinguishing case: a logit of 0.2 sigmoids to 0.5498, which
+        // clears the 0.5 default floor, while the bare logit 0.2 does not.
+        // Reading logits as probabilities would drop this detection and report
+        // every surviving score wrong besides.
+        let mut out = DetrOutput::new(2, 3);
+        out.put(0, [0.5, 0.5, 0.1, 0.1], 0, 0.2);
+        let dets = out.decode(&open(), SQUARE);
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].score, 0.55);
+        assert_eq!(RFDETR.output.score, ScoreComposition::SigmoidClass);
+
+        // ...and a strongly negative logit, which is what an unfired query
+        // carries, stays far under any floor rather than landing near 0.5.
+        assert!(sigmoid(-20.0) < 1e-8);
+        assert_eq!(sigmoid(0.0), 0.5);
+    }
+
+    #[test]
+    fn detr_takes_the_argmax_class_of_each_query() {
+        let mut out = DetrOutput::new(3, 3);
+        out.put(0, [0.5, 0.5, 0.2, 0.2], 2, 3.0);
+        // a weaker person logit on the same query must not win
+        out.logits[0] = 1.0;
+        let dets = out.decode(&open(), SQUARE);
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].label, "car");
+    }
+
+    #[test]
+    fn detr_is_never_run_through_nms() {
+        // Three queries on the same box and class. A grid head would need NMS
+        // and this must not get it: DETR's bipartite matching is what stops
+        // duplicates, and suppressing here would silently merge the distinct
+        // boxes two queries place on neighbouring objects.
+        assert!(RFDETR.output.nms.is_none());
+        let mut out = DetrOutput::new(4, 3);
+        for query in 0..3 {
+            out.put(query, [0.5, 0.5, 0.4, 0.4], 2, 3.0);
+        }
+        assert_eq!(out.decode(&open(), SQUARE).len(), 3);
+    }
+
+    #[test]
+    fn detr_gates_on_the_per_label_floor_and_caps_like_every_other_layout() {
+        let floors = floors(r#"{"default":0.5,"person":0.99}"#);
+        let mut out = DetrOutput::new(3, 3);
+        // sigmoid(3) = 0.953: over the default, under person's 0.99
+        out.put(0, [0.2, 0.2, 0.1, 0.1], 0, 3.0)
+            .put(1, [0.7, 0.7, 0.1, 0.1], 2, 3.0);
+        let dets = out.decode(&floors, SQUARE);
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].label, "car");
+
+        // and the MAX_DETS cap holds with the score order intact
+        let mut flood = DetrOutput::new(MAX_DETS + 20, 3);
+        for query in 0..(MAX_DETS + 20) {
+            flood.put(query, [0.5, 0.5, 0.2, 0.2], 2, 1.0 + query as f32 / 100.0);
+        }
+        let dets = flood.decode(&open(), SQUARE);
+        assert_eq!(dets.len(), MAX_DETS);
+        assert!(dets.windows(2).all(|w| w[0].score >= w[1].score));
+    }
+
+    #[test]
+    fn detr_non_finite_queries_never_reach_the_output() {
+        let mut out = DetrOutput::new(5, 3);
+        out.put(0, [f32::NAN, 0.5, 0.1, 0.1], 0, 4.0)
+            .put(1, [0.5, f32::INFINITY, 0.1, 0.1], 0, 4.0)
+            .put(2, [0.5, 0.5, f32::INFINITY, 0.1], 0, 4.0)
+            .put(3, [0.5, 0.5, 0.2, 0.2], 2, 4.0);
+        // a NaN logit wins total_cmp's argmax, so it needs its own guard
+        out.put(4, [0.5, 0.5, 0.1, 0.1], 1, f32::NAN);
+
+        let dets = out.decode(&open(), SQUARE);
         assert_eq!(dets.len(), 1);
         assert_eq!(dets[0].label, "car");
         let json = serde_json::to_string(&dets).unwrap();
@@ -1060,48 +3078,361 @@ mod tests {
     }
 
     #[test]
-    fn the_dispatcher_rejects_dims_the_layout_does_not_fit() {
-        let floors = ScoreFloors::parse("{}").unwrap();
-        // metadata promised a raw head; the real output is end-to-end
-        assert!(decode_output(
-            Layout::Yolov8 { classes: 80 },
-            &[0.0; 6],
-            &[1, 1, 6],
+    fn detr_boxes_go_through_the_projection_like_everything_else() {
+        // Normalized boxes are scaled into model pixels precisely so the
+        // letterbox un-projection applies to them too. A DETR fed a padded
+        // 16:9 frame is otherwise off by the padding.
+        let mut out = DetrOutput::new(2, 3);
+        // the box covering the top 234 of 416 rows: the whole content area
+        out.put(0, [0.5, 234.0 / 416.0 / 2.0, 1.0, 234.0 / 416.0], 2, 4.0);
+        let projection = ResizePolicy::Letterbox { pad: 114 }.project(YOLOX_416, WIDE);
+        let dets = decode_output(
+            out.spec(),
+            &raw_detr(&out.boxes, &out.logits, 2, 3),
             &labels(),
-            &floors,
-            SQUARE,
+            &open(),
+            YOLOX_416,
+            &projection,
         )
-        .is_err());
-        assert!(decode_output(
-            Layout::Yolov10,
-            &[0.0; 8],
-            &[1, 84, 8400],
-            &labels(),
-            &floors,
-            SQUARE,
+        .unwrap();
+        assert_eq!(dets[0].bbox, [0.0, 0.0, 1.0, 1.0]);
+        // read with the stretch rule the same box loses the bottom 44%
+        assert_eq!(
+            out.decode(&open(), YOLOX_416)[0].bbox,
+            [0.0, 0.0, 1.0, 0.5625]
+        );
+    }
+
+    // ---- multi-output binding ----------------------------------------------
+
+    #[test]
+    fn a_detr_pair_is_bound_by_shape_so_either_export_convention_works() {
+        let roles = Layout::DetrQueries { nc: 91 }.roles();
+        // the transformers / onnx-community conversion
+        let bound = bind(roles, &declared_detr(300, 91)).unwrap();
+        assert_eq!(
+            bound.map(|output| output.name.clone()),
+            Outputs::BoxesAndLogits {
+                boxes: "pred_boxes".into(),
+                logits: "logits".into()
+            }
+        );
+        // Roboflow's own export(): different names, and nothing says the
+        // boxes come first, so the roles are read off the shapes.
+        let roboflow = vec![
+            Declared {
+                name: "labels".into(),
+                dims: Some(vec![1, 300, 91]),
+            },
+            Declared {
+                name: "dets".into(),
+                dims: Some(vec![1, 300, 4]),
+            },
+        ];
+        assert_eq!(
+            bind(roles, &roboflow).unwrap().map(|o| o.name.clone()),
+            Outputs::BoxesAndLogits {
+                boxes: "dets".into(),
+                logits: "labels".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_pair_that_cannot_be_told_apart_is_an_error_naming_the_outputs() {
+        let roles = Layout::DetrQueries { nc: 91 }.roles();
+        // a single-output model has no pair at all
+        let err = bind(roles, &declared(&[1, 300, 91]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[1, Q, 4]"), "{err}");
+        assert!(err.contains("\"output\""), "{err}");
+
+        // a genuinely 4-class DETR: both tensors end in 4 and nothing says
+        // which is the box regression
+        let four = vec![
+            Declared {
+                name: "pred_boxes".into(),
+                dims: Some(vec![1, 300, 4]),
+            },
+            Declared {
+                name: "logits".into(),
+                dims: Some(vec![1, 300, 4]),
+            },
+        ];
+        assert!(bind(roles, &four).is_err());
+
+        // a pair whose query axes disagree is not a pair
+        let mismatched = vec![
+            Declared {
+                name: "pred_boxes".into(),
+                dims: Some(vec![1, 300, 4]),
+            },
+            Declared {
+                name: "logits".into(),
+                dims: Some(vec![1, 100, 91]),
+            },
+        ];
+        assert!(bind(roles, &mismatched).is_err());
+
+        // and a single-output layout is unaffected by any of it: it takes the
+        // first output and leaves an export's extras alone
+        assert_eq!(
+            bind(Layout::EndToEnd.roles(), &declared_detr(300, 91)).unwrap(),
+            Outputs::One(Declared {
+                name: "pred_boxes".into(),
+                dims: Some(vec![1, 300, 4])
+            })
+        );
+    }
+
+    #[test]
+    fn a_two_tensor_model_sniffs_as_rfdetr_and_a_one_tensor_model_never_does() {
+        // what rfdetr_nano.onnx declares, at its own 384
+        let size = InputSize::square(384);
+        let sniffed = sniff(&declared_detr(300, 91), size);
+        assert_eq!(sniffed.len(), 1, "{sniffed:?}");
+        assert_eq!(sniffed[0].name, "rfdetr");
+        assert_eq!(sniffed[0].output.layout, Layout::DetrQueries { nc: 91 });
+        assert_eq!(sniffed[0].input.encoding, TensorEncoding::ImageNetRgb);
+
+        // The roles are what keep the families apart: no single-tensor head
+        // can match a layout that reads two, and `pred_boxes` on its own fits
+        // none of the one-tensor layouts either.
+        for dims in [
+            vec![1, 300, 6],
+            vec![1, 84, 8400],
+            vec![1, 3549, 85],
+            vec![1, 300, 4],
+        ] {
+            assert!(
+                sniff(&declared(&dims), size)
+                    .iter()
+                    .all(|p| p.name != "rfdetr"),
+                "{dims:?} sniffed as rfdetr"
+            );
+        }
+        assert_eq!(
+            fit_layout(Layout::DetrQueries { nc: 91 }, &detr_shapes(300, 91), size).unwrap(),
+            Layout::DetrQueries { nc: 91 }
+        );
+    }
+
+    #[test]
+    fn a_detr_whose_logits_come_first_can_collide_with_the_yolox_grid() {
+        // The new ambiguity the fifth profile introduces, and the reason
+        // binding a role is not the same as sniffing a profile.
+        //
+        // A single-tensor layout binds the model's *first* output. At 128x128
+        // a yolox grid has 16^2 + 8^2 + 4^2 = 336 anchors, so a 336-query DETR
+        // that happens to declare its logits first offers `[1, 336, 85]` — a
+        // perfectly good 80-class yolox head — while the pair is a perfectly
+        // good rfdetr. Nothing in the shapes says which, and they decode
+        // completely differently.
+        let size = InputSize::square(128);
+        assert_eq!(grid_anchors(size, STRIDES), 336);
+        let logits_first = vec![
+            Declared {
+                name: "logits".into(),
+                dims: Some(vec![1, 336, 85]),
+            },
+            Declared {
+                name: "pred_boxes".into(),
+                dims: Some(vec![1, 336, 4]),
+            },
+        ];
+        assert_eq!(
+            sniff(&logits_first, size)
+                .iter()
+                .map(|p| p.name)
+                .collect::<Vec<_>>(),
+            vec!["yolox", "rfdetr"]
+        );
+        let err = resolve_profile(None, &logits_first, size, Path::new("m.onnx"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("yolox"), "{err}");
+        assert!(err.contains("rfdetr"), "{err}");
+        assert!(err.contains("--model-profile"), "{err}");
+        // the error has to name the outputs, since the shapes alone no longer
+        // identify what was looked at
+        assert!(err.contains("\"logits\""), "{err}");
+
+        // ...and naming the profile settles it either way
+        let (profile, _names, output) =
+            resolve_profile(Some(RFDETR), &logits_first, size, Path::new("m.onnx")).unwrap();
+        assert_eq!(profile.name, "rfdetr");
+        assert_eq!(output.unwrap().layout, Layout::DetrQueries { nc: 85 });
+    }
+
+    #[test]
+    fn naming_a_profile_whose_roles_the_model_lacks_fails_at_startup() {
+        // rfdetr pointed at a one-tensor yolo export: caught here rather than
+        // by an output lookup failing inside the inference thread.
+        let err = resolve_profile(
+            Some(RFDETR),
+            &declared(&[1, 300, 6]),
+            InputSize::square(384),
+            Path::new("m.onnx"),
         )
-        .is_err());
-        // a raw head whose values do not cover its own dims
-        assert!(decode_output(
-            Layout::Yolov8 { classes: 1 },
-            &[0.0; 10],
-            &[1, 5, 100],
-            &labels(),
-            &floors,
-            SQUARE,
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("--model-profile rfdetr"), "{text}");
+        assert!(text.contains("[1, Q, 4]"), "{text}");
+
+        // and the reverse: a single-tensor profile against a DETR export
+        // binds `pred_boxes` and then fails to fit it
+        assert!(resolve_profile(
+            Some(YOLOV10),
+            &declared_detr(300, 91),
+            InputSize::square(384),
+            Path::new("m.onnx")
         )
         .is_err());
     }
 
     #[test]
+    fn a_dynamic_batch_axis_is_not_a_dynamic_layout() {
+        // Every RF-DETR export pins its query and class axes and leaves batch
+        // symbolic. Reading that as "nothing to sniff" would make the family
+        // permanently unsniffable for a reason that says nothing about how it
+        // decodes.
+        assert_eq!(
+            static_output_dims(&tensor_type(&[-1, 300, 4])),
+            Some(vec![1, 300, 4])
+        );
+        assert_eq!(
+            static_output_dims(&tensor_type(&[-1, 84, 8400])),
+            Some(vec![1, 84, 8400])
+        );
+        // a symbolic axis anywhere else still declares nothing
+        assert!(static_output_dims(&tensor_type(&[-1, 84, -1])).is_none());
+        assert!(static_output_dims(&tensor_type(&[1, -1, 8400])).is_none());
+        assert!(static_output_dims(&tensor_type(&[-1, -1, -1])).is_none());
+        // and a static batch of 2 is a real batched export, which no layout
+        // here indexes
+        assert_eq!(
+            static_output_dims(&tensor_type(&[2, 84, 8400])),
+            Some(vec![2, 84, 8400])
+        );
+        assert!(sniff(&declared(&[2, 84, 8400]), SQUARE).is_empty());
+    }
+
+    // ---- decode plumbing ---------------------------------------------------
+
+    #[test]
+    fn a_letterboxed_decode_reports_boxes_against_the_original_frame() {
+        // The whole reason a projection is threaded through: the same model
+        // output, read against a 16:9 source, has to come back as the frame's
+        // own geometry rather than the input rectangle's.
+        let source = WIDE;
+        let projection = ResizePolicy::Letterbox { pad: 114 }.project(YOLOX_416, source);
+        // a box filling the content area exactly
+        let rows = row(0.0, 0.0, 416.0, 234.0, 0.9, 2.0);
+        let dets = decode_output(
+            YOLOV10.output,
+            &raw_one(&rows, &[1, 1, 6]),
+            &labels(),
+            &open(),
+            YOLOX_416,
+            &projection,
+        )
+        .unwrap();
+        assert_eq!(dets[0].bbox, [0.0, 0.0, 1.0, 1.0]);
+        // and the stretch reading of the same output loses the bottom 41%
+        let dets = decode(YOLOV10.output, &rows, &[1, 1, 6], &open(), YOLOX_416);
+        assert_eq!(dets[0].bbox, [0.0, 0.0, 1.0, 0.5625]);
+    }
+
+    #[test]
+    fn the_dispatcher_rejects_dims_the_layout_does_not_fit() {
+        let projection = Projection::stretch(SQUARE);
+        let reject = |output, values: &[f32], dims: &[i64], size| {
+            decode_output(
+                output,
+                &raw_one(values, dims),
+                &labels(),
+                &open(),
+                size,
+                &projection,
+            )
+            .is_err()
+        };
+        // metadata promised a raw head; the real output is end-to-end
+        assert!(reject(v8_spec(80), &[0.0; 6], &[1, 1, 6], SQUARE));
+        assert!(reject(YOLOV10.output, &[0.0; 8], &[1, 84, 8400], SQUARE));
+        // a raw head whose values do not cover its own dims
+        assert!(reject(v8_spec(1), &[0.0; 10], &[1, 5, 100], SQUARE));
+        // a raw head whose declared nc disagrees with the real channel axis
+        assert!(reject(
+            v8_spec(80),
+            &vec![0.0; 84 * 8400],
+            &[1, 20, 8400],
+            SQUARE
+        ));
+        // ...but one anchor is a decodable raw head, not a shape error: the
+        // "anchors far outnumber channels" rule is for telling layouts apart,
+        // not for decoding one already settled
+        assert!(!reject(v8_spec(3), &[0.0; 7], &[1, 7, 1], SQUARE));
+
+        let yolox = |nc| OutputSpec {
+            layout: Layout::GridObjectness {
+                nc,
+                strides: STRIDES,
+            },
+            ..YOLOX.output
+        };
+        // a grid head read at an input size whose grid it does not match:
+        // 3549 anchors are 416's, not 640's
+        assert!(reject(
+            yolox(80),
+            &vec![0.0; 3549 * 85],
+            &[1, 3549, 85],
+            SQUARE
+        ));
+        // the right anchor count, the wrong row width
+        assert!(reject(
+            yolox(80),
+            &vec![0.0; 3549 * 84],
+            &[1, 3549, 84],
+            YOLOX_416
+        ));
+        // dims that fit, values that do not cover them
+        assert!(reject(yolox(80), &[0.0; 10], &[1, 3549, 85], YOLOX_416));
+        // ...and the shape that does fit is accepted
+        assert!(!reject(
+            yolox(80),
+            &vec![0.0; 3549 * 85],
+            &[1, 3549, 85],
+            YOLOX_416
+        ));
+    }
+
+    #[test]
     fn label_count_mismatch_is_a_warning_not_a_failure() {
         // labels() has 3 names; the call must return either way
-        warn_on_label_mismatch(Layout::Yolov8 { classes: 80 }, &labels());
-        warn_on_label_mismatch(Layout::Yolov8 { classes: 3 }, &labels());
-        warn_on_label_mismatch(Layout::Yolov10, &labels());
+        for layout in [
+            Layout::RawClasses { nc: 80 },
+            Layout::RawClasses { nc: 3 },
+            Layout::GridObjectness {
+                nc: 80,
+                strides: STRIDES,
+            },
+            Layout::GridObjectness {
+                nc: 3,
+                strides: STRIDES,
+            },
+            Layout::EndToEnd,
+        ] {
+            warn_on_label_mismatch(layout, &labels());
+        }
+        assert_eq!(Layout::EndToEnd.classes(), None);
+        assert_eq!(Layout::RawClasses { nc: 7 }.classes(), Some(7));
         assert_eq!(labels().count(), 3);
         assert_eq!(Labels::load(None).unwrap().count(), 0);
     }
+
+    // ---- input size resolution ---------------------------------------------
 
     fn nchw(dims: [i64; 4]) -> ValueType {
         ValueType::Tensor {
@@ -1165,7 +3496,13 @@ mod tests {
         let model = Path::new("m.onnx");
         let declared = Some(InputSize { w: 320, h: 320 });
         assert_eq!(
-            resolve_input_size(declared, None, model).unwrap(),
+            resolve_input_size(declared, None, None, model).unwrap(),
+            (InputSize::square(320), InputSizeSource::Model)
+        );
+        // ...and it outranks a profile's family default, which is only a
+        // fallback for an export that declares nothing
+        assert_eq!(
+            resolve_input_size(declared, None, Some(YOLOX_416), model).unwrap(),
             (InputSize::square(320), InputSizeSource::Model)
         );
     }
@@ -1174,11 +3511,22 @@ mod tests {
     fn the_flag_supplies_the_size_a_dynamic_model_cannot() {
         let model = Path::new("m.onnx");
         assert_eq!(
-            resolve_input_size(None, Some(SQUARE), model).unwrap(),
+            resolve_input_size(None, Some(SQUARE), None, model).unwrap(),
             (SQUARE, InputSizeSource::Flag)
         );
-        // ...and without it there is nothing to build a scaler from
-        let err = resolve_input_size(None, None, model)
+        // the flag outranks a profile default too
+        assert_eq!(
+            resolve_input_size(None, Some(SQUARE), Some(YOLOX_416), model).unwrap(),
+            (SQUARE, InputSizeSource::Flag)
+        );
+        // a profile default is the last resort...
+        assert_eq!(
+            resolve_input_size(None, None, Some(YOLOX_416), model).unwrap(),
+            (YOLOX_416, InputSizeSource::Profile)
+        );
+        // ...and without any of the three there is nothing to build a scaler
+        // from
+        let err = resolve_input_size(None, None, None, model)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--input-size"), "{err}");
@@ -1189,7 +3537,7 @@ mod tests {
         let model = Path::new("m.onnx");
         let absurd = InputSize::square(64_000_000);
         // a typo'd flag...
-        let err = resolve_input_size(None, Some(absurd), model)
+        let err = resolve_input_size(None, Some(absurd), None, model)
             .unwrap_err()
             .to_string();
         assert!(err.contains("64000000x64000000"), "{err}");
@@ -1197,7 +3545,7 @@ mod tests {
         assert!(err.contains("--input-size"), "{err}");
 
         // ...and a model declaring the same nonsense, which no flag touches
-        let err = resolve_input_size(Some(absurd), None, model)
+        let err = resolve_input_size(Some(absurd), None, None, model)
             .unwrap_err()
             .to_string();
         assert!(err.contains("64000000x64000000"), "{err}");
@@ -1211,6 +3559,7 @@ mod tests {
                 w: MAX_INPUT_DIM + 1,
                 h: 640
             }),
+            None,
             model
         )
         .is_err());
@@ -1219,6 +3568,7 @@ mod tests {
                 w: 640,
                 h: MAX_INPUT_DIM + 1
             }),
+            None,
             None,
             model
         )
@@ -1230,11 +3580,11 @@ mod tests {
         let model = Path::new("m.onnx");
         let at_limit = InputSize::square(MAX_INPUT_DIM);
         assert_eq!(
-            resolve_input_size(None, Some(at_limit), model).unwrap(),
+            resolve_input_size(None, Some(at_limit), None, model).unwrap(),
             (at_limit, InputSizeSource::Flag)
         );
         assert_eq!(
-            resolve_input_size(Some(at_limit), None, model).unwrap(),
+            resolve_input_size(Some(at_limit), None, None, model).unwrap(),
             (at_limit, InputSizeSource::Model)
         );
         // the ceiling is what it protects: both stay inside their types
@@ -1247,12 +3597,52 @@ mod tests {
         let err = resolve_input_size(
             Some(InputSize::square(640)),
             Some(InputSize::square(320)),
+            None,
             Path::new("m.onnx"),
         )
         .unwrap_err()
         .to_string();
         assert!(err.contains("640x640") && err.contains("320x320"), "{err}");
         // agreeing is not a contradiction
-        assert!(resolve_input_size(Some(SQUARE), Some(SQUARE), Path::new("m.onnx")).is_ok());
+        assert!(resolve_input_size(Some(SQUARE), Some(SQUARE), None, Path::new("m.onnx")).is_ok());
+    }
+
+    // ---- encodings ----------------------------------------------------------
+
+    #[test]
+    fn an_encoding_is_a_per_plane_affine_over_a_channel_pick() {
+        let unit = TensorEncoding::UnitRgb.packing();
+        assert_eq!(unit.source, [0, 1, 2]);
+        assert_eq!(unit.value(0, 255), 1.0);
+        assert_eq!(unit.value(2, 0), 0.0);
+
+        let raw = TensorEncoding::RawBgr.packing();
+        // plane 0 is blue, plane 2 is red
+        assert_eq!(raw.source, [2, 1, 0]);
+        assert_eq!(raw.value(0, 255), 255.0);
+        assert_eq!(raw.value(1, 114), 114.0);
+    }
+
+    #[test]
+    fn the_imagenet_encoding_is_standardization_folded_into_the_same_affine() {
+        // (v/255 - mean) / std, which the per-plane scale and bias exist to
+        // express without any caller learning a third code path.
+        let packing = TensorEncoding::ImageNetRgb.packing();
+        assert_eq!(packing.source, [0, 1, 2]);
+        for plane in 0..3 {
+            let expect =
+                |byte: u8| (f32::from(byte) / 255.0 - IMAGENET_MEAN[plane]) / IMAGENET_STD[plane];
+            for byte in [0u8, 1, 114, 200, 255] {
+                let got = packing.value(plane, byte);
+                assert!(
+                    (got - expect(byte)).abs() < 1e-5,
+                    "plane {plane} byte {byte}: {got} vs {}",
+                    expect(byte)
+                );
+            }
+        }
+        // black is the most negative value and white the most positive, on
+        // every plane — the sign convention a wrong mean/std would flip
+        assert!(packing.value(0, 0) < -2.0 && packing.value(0, 255) > 2.0);
     }
 }

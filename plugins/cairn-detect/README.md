@@ -4,9 +4,14 @@ Cairn's reference detection plugin: a single Rust binary that takes H.264 RTP
 on a UDP port — or on several at once, serving a whole plugin group from one
 process — and speaks the plugin contract's protocol v1 on stdout and stdin
 (see `docs/plugin-contract.md`). It decodes on the video ASIC when one is
-available, samples to ~5 fps, and runs a YOLO detection model on the CPU
-through onnxruntime — either an end-to-end (NMS-free) export or a stock
-YOLOv8/YOLOv11 one, told apart automatically.
+available, samples to ~5 fps, and runs an object-detection model on the CPU
+through onnxruntime. The two documented defaults are **YOLOX-Nano** and
+**RF-DETR-Nano**, both Apache-2.0 like Cairn itself; end-to-end (YOLOv10,
+YOLO26) and raw Ultralytics (YOLOv8/v9/v11) heads also decode if you bring
+your own weights. Which family a model belongs to — and so how frames must be
+fed to it and how its output must be read — is one
+[profile](#model-profiles), sniffed from the model itself unless the shape is
+genuinely ambiguous, in which case the plugin refuses to guess.
 
 It is both what you should deploy and the worked example to read when writing
 your own plugin: everything the contract requires of a plugin is exercised
@@ -18,7 +23,8 @@ here, in the two modes Cairn can launch one in.
 udp:127.0.0.1:{port}  ->  sdp demuxer (generated SDP, retried mid-GOP)
    -> decode (hardware if a backend opens, else software)
       -> wall-clock sample to 5 fps          <- full-rate frames end here
-         -> stamp observed_at, WxH RGB24 -> CHW f32 0..1
+         -> stamp observed_at, resize per profile (stretch | letterbox),
+            RGB24 -> CHW f32, and the projection back to frame coordinates
             -> [size-1 channel, try_send: drop when inference is behind]
                -> onnxruntime (CPU EP) -> decode + gate
                   -> frame.objects ndjson on stdout, per-camera epoch + sequence
@@ -81,9 +87,9 @@ cameras:
     plugin:
       - plugins/cairn-detect/target/release/cairn-detect
       - --model
-      # .onnx files are gitignored — produce this one with the export step
-      # in model/export-model.md (or drop in any supported model; see Model).
-      - plugins/cairn-detect/yolov10n.onnx
+      # .onnx files are gitignored — fetch this one with the curl in the
+      # Model section (or drop in any supported model; see Model).
+      - plugins/cairn-detect/yolox_nano.onnx
       - --labels
       - plugins/cairn-detect/coco.names
       - --decoder
@@ -102,9 +108,10 @@ named group under `plugins:` and point cameras at it by name — see
 
 | flag | required | meaning |
 |------|----------|---------|
-| `--model` | yes | ONNX detection model, end-to-end `[1,N,6]` or raw `[1,4+nc,A]` (see [Model](#model)) |
+| `--model` | yes | ONNX detection model: yolox `[1,A,5+nc]`, detr `[1,Q,4]`+`[1,Q,nc]`, end-to-end `[1,N,6]` or raw `[1,4+nc,A]` (see [Model](#model)) |
 | `--labels` | no | newline-separated class names, indexed by class id; unknown ids fall back to the numeric id |
-| `--input-size` | no | model input `WxH` (or `N` for a square N×N). Read from the model when omitted; required when the model's spatial dims are dynamic |
+| `--input-size` | no | model input `WxH` (or `N` for a square N×N). Read from the model when omitted; required when the model's spatial dims are dynamic, which every RF-DETR export leaves them |
+| `--model-profile` | no | `yolox`, `rfdetr`, `yolov10` or `yolov8` (plus the aliases `rf-detr`, `yolo26`, `yolov9`, `yolo11`, `yolov11`) — the preprocessing and decode steps to run the model under. Sniffed from the model when omitted; required when a shape fits more than one profile or the model's *output* shape is dynamic (see [Model profiles](#model-profiles)) |
 | `--decoder` | no | `auto` (default), `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` |
 
 ## The wire protocol
@@ -191,7 +198,7 @@ plugins:
     command:
       - plugins/cairn-detect/target/release/cairn-detect
       - --model
-      - plugins/cairn-detect/yolov10n.onnx
+      - plugins/cairn-detect/yolox_nano.onnx
       - --labels
       - plugins/cairn-detect/coco.names
 
@@ -247,7 +254,7 @@ python3 verify/feed.py --clip /path/to/fixture.mp4 --port 17000 &
   | timeout 30 ./target/release/cairn-detect \
       --cameras-json '[{"id":"front_door","udp_port":17000,"min_score":{"default":0.5}},
                        {"id":"driveway","udp_port":17004,"min_score":{"default":0.5}}]' \
-      --model yolov10n.onnx --labels coco.names | python3 verify/validate_ndjson.py
+      --model yolox_nano.onnx --labels coco.names | python3 verify/validate_ndjson.py
 ```
 
 Feeding only the first port is a fine test: `driveway` just logs
@@ -292,86 +299,381 @@ only changes across restarts.
 
 ## Model
 
-Input is the model's **first input** — named `images` in Ultralytics exports,
-but the name is taken from the model and logged at startup, not assumed —
-float32 `[1, 3, H, W]`, RGB, 0..1, CHW. Two output
-layouts are supported, and **which one a model uses is auto-detected** — there
-is no flag, because the two shapes cannot be confused:
+### Getting one: YOLOX-Nano or RF-DETR-Nano
 
-| family | output | what the plugin does |
-|--------|--------|----------------------|
-| **end-to-end / NMS-free** — YOLOv10, YOLO26 | `[1, N, 6]`, rows of `[x1, y1, x2, y2, score, class_id]` in input-pixel space, sorted by score | normalize, clamp, gate on the score floors |
-| **raw detect head** — YOLOv8, YOLOv11 (what Frigate commonly ships) | `[1, 4 + nc, A]`, channels-first over `A` anchors: `cx, cy, w, h` in input pixels then `nc` sigmoided class scores, no objectness row | argmax class per anchor, centers → corners, class-aware NMS at IoU 0.45, then the same normalize/clamp/gate |
+**These two are the models this project documents.** Both are Apache-2.0 —
+the same license as Cairn — so nothing about running them, redistributing
+them, or building on top of them reaches back into your own code. Neither
+needs a CLI installed or a venv built; both are a single `curl`.
 
-`6` is the *row width* of the first layout while `A` is an anchor count that
-runs into the thousands (8400 at 640×640, scaling with the input size), so
-detection is by shape alone: from the session's output metadata at startup, or
-from the first real output when the export leaves its output shape dynamic.
-Anything matching neither is rejected with the shape it saw and both expected
-forms. With `--labels` given, a raw head whose `nc` disagrees with the label
-count logs a warning and keeps running — unknown ids are emitted as numbers.
-
-YOLOv5's `[1, 25200, 85]` is *not* supported: it carries an objectness row
-that has to be folded into the class scores.
-
-`H` and `W` need not be 640, and need not be equal. They are read from the
-model's input shape at startup and every scaler, GPU filter graph and tensor
-in the process is built for them. An export with dynamic spatial axes declares
-nothing to read, so it needs `--input-size` (`320`, `640x352`, ...); giving
-the flag a size the model contradicts is rejected at startup rather than left
-to fail on the first frame. The startup line records the resolved size and
-layout, and where each came from:
-
-```
-cairn-detect up: camera=front udp=17000 model=yolov10n.onnx input=images \
-    input size=640x640 (from model) layout=yolov10 (from model) decoder=auto
-```
-
-**`yolov10n.onnx` (FP32) is the default**, and the end-to-end layout is the
-one to prefer: the NMS is inside the model, where it is faster and already
-tuned. Re-export it with ultralytics in a throwaway venv:
+**YOLOX-Nano** — 3.6 MB, COCO-80, 416×416. The smaller and faster of the two,
+and the long-standing default here:
 
 ```bash
-python3 -m venv yolo-export-venv && . yolo-export-venv/bin/activate
-pip install ultralytics onnx onnxruntime torch \
-    --index-url https://download.pytorch.org/whl/cpu
-yolo export model=yolov10n.pt format=onnx \
-    imgsz=640 batch=1 dynamic=False simplify=True nms=False
+cd plugins/cairn-detect
+curl -L -o yolox_nano.onnx \
+  https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_nano.onnx
 ```
 
-The `--index-url` matters: a plain `pip install ultralytics` drags in the
-CUDA build of torch.
+The same [Megvii release](https://github.com/Megvii-BaseDetection/YOLOX)
+publishes `yolox_tiny.onnx` and `yolox_s.onnx` if you want more accuracy for
+more CPU; drop either in and the plugin reads its geometry and layout off the
+model. `coco.names` in this directory is the COCO-80 label list these weights
+use.
 
-**INT8 is an opt-in for low-storage hosts, not a speed win.** Static QDQ
-quantization takes the model from 9.5 MB to 2.95 MB but measured *no* latency
-improvement on x86 with AVX-512 (~27 ms/frame either way) and slightly worse
-recall near the score threshold. Bother with it only when disk or transfer
-size matters:
+**RF-DETR-Nano** — 108 MB, COCO-91, 384×384. Roboflow's transformer detector;
+noticeably stronger than YOLOX-Nano on the same footage for noticeably more
+CPU. The `onnx-community` conversions are the ready-made exports:
 
 ```bash
-cd model   # with the export venv active
-python3 quantize_yolov10n.py --model ../yolov10n.onnx \
-    --calib-dir calib_frames --out ../yolov10n-int8.onnx
+cd plugins/cairn-detect
+curl -L -o rfdetr_nano.onnx \
+  https://huggingface.co/onnx-community/rfdetr_nano-ONNX/resolve/main/onnx/model.onnx
+
+./target/release/cairn-detect --model rfdetr_nano.onnx --labels coco91.names \
+    --input-size 384 ...
 ```
 
-One trap worth knowing before you run it: the three classification-head convs
-(`/model.23/one2one_cv3.{0,1,2}.2/Conv`) must be excluded from quantization or
-every confident detection's score collapses to exactly `0.500`. The script
-already excludes them.
+`rfdetr_small`, `rfdetr_medium`, `rfdetr_base` and `rfdetr_large` exist at the
+same URL shape. **Every RF-DETR export leaves its input geometry dynamic**, so
+a larger variant will happily run at the wrong resolution and quietly lose
+accuracy rather than failing — pass `--input-size` to match it: nano 384,
+small 512, base 560, medium 576, large 704. `coco91.names` in this directory
+is RF-DETR's label list, which is *not* `coco.names`: RF-DETR indexes its
+logits by the raw COCO category id (1 = person, 3 = car, 64 = potted plant),
+so the file is 91 lines with the retired ids left as bare numbers.
 
-`model/export-model.md` is the detailed reference — calibration/held-out frame
-extraction, the shape-inference workaround, and the full FP32-vs-INT8
-comparison. `model/quantize_yolov10n.py` and `model/verify_models.py` expect
-the calibration artifacts that document describes.
+`.onnx` files are gitignored, so downloading one is a per-checkout step. The
+startup line reports the geometry, encoding, resize and layout the plugin
+actually settled on, so you never have to assume them.
 
-`coco.names` in this directory is the COCO-80 label list matching these
-weights.
+### Licensing
+
+Cairn is Apache-2.0. So are two of the five families it can decode; the other
+three are not.
+
+| family | weights license | status here |
+|---|---|---|
+| **YOLOX** (Megvii) — nano / tiny / s | **Apache-2.0** | **recommended, documented, default** |
+| **RF-DETR** (Roboflow) — nano / small / medium / base / large | **Apache-2.0** | **recommended, documented** |
+| YOLOv9 | GPL-3.0 | decodes; bring your own weights, not documented here |
+| YOLOv10, YOLO26, YOLOv8, YOLOv11 | AGPL-3.0 | decodes; bring your own weights, not documented here |
+| the `ultralytics` package (the `yolo export` CLI) | AGPL-3.0 | not used, not installed, not invoked by anything here |
+
+Supporting a *tensor layout* carries no license implication — a shape is not
+copyrightable, and the YOLOv10, YOLOv8 and YOLOv9 decode paths stay in the
+plugin so existing deployments keep working. What does carry an implication is
+the weights you actually run and the tooling you install to produce them, and
+the AGPL's network-use clause is a live question for an NVR that serves a web
+UI. Anything exported through the `ultralytics` CLI inherits AGPL-3.0 whatever
+the architecture is called, which is why there are no export instructions here
+that need it.
+
+If you already have Ultralytics or YOLOv9 weights and have satisfied yourself
+about the license, point `--model` at them and everything below still applies.
+This README will not walk you through obtaining them.
+
+### Model profiles
+
+Everything that differs between detector families lives in one **profile**: how
+frames are fed to the model, and how its output is read. Four ship built in,
+covering five families — the Ultralytics generations are *aliases*, not
+separate profiles, because their exports are byte-for-byte the same tensor
+contract:
+
+| profile (and the names it answers to) | default size | input encoding | resize | output layout | score | NMS | weights license |
+|---|---|---|---|---|---|---|---|
+| **`yolox`** — nano, tiny, s | 416 | `0..255` **BGR** | **letterbox**, pad 114 | `[1, A, 5 + nc]` grid-objectness, strides 8/16/32 | `objectness × class` | IoU 0.45, top 300 | Apache-2.0 |
+| **`rfdetr`** (`rf-detr`) — nano … large | 384 | **ImageNet-normalized** RGB | stretch | `[1, Q, 4]` + `[1, Q, nc]` detr-queries (**two tensors**) | `sigmoid(class logit)` | none (set prediction) | Apache-2.0 |
+| **`yolov10`** (`yolo26`) | 640 | `0..1` **RGB** | stretch | `[1, N, 6]` end-to-end | class | none (the model did it) | AGPL-3.0 |
+| **`yolov8`** (`yolov9`, `yolo11`, `yolov11`) — what Frigate commonly ships | 640 | `0..1` **RGB** | stretch | `[1, 4 + nc, A]` raw-classes | class | IoU 0.45, top 300 | AGPL-3.0 (GPL-3.0 for YOLOv9) |
+
+An alias resolves to the profile's canonical identity, so `--model-profile
+yolo11` runs and reports `profile=yolov8`. Two of the aliases are worth
+calling out:
+
+  * **`yolov9`** and **`yolov11`/`yolo11`** are *verified by construction*, not
+    against a downloaded export — their detect heads emit the same
+    `[1, 4 + nc, A]` tensor as YOLOv8 and no AGPL/GPL weights are fetched by
+    anything in this repo. An export that turns out not to match is rejected
+    by the shape check rather than decoded wrong.
+  * **`yolo26` is UNVERIFIED.** YOLO26 is documented as end-to-end and NMS-free
+    like YOLOv10, so it is an alias of that profile, but no YOLO26 export has
+    ever been run against this decode. The same shape check applies: a
+    mismatch fails loudly instead of emitting plausible garbage.
+
+`yolox` and `rfdetr` are verified against real downloaded models —
+`yolox_nano.onnx` from the Megvii 0.1.1rc0 release and
+`onnx-community/rfdetr_nano-ONNX` — and `yolov10` against `yolov10n.onnx`.
+
+What each layout means, and what the plugin does with it:
+
+| layout | tensor | decode |
+|--------|--------|--------|
+| `[1, A, 5 + nc]` grid-objectness | anchor-major: `x, y, w, h` **not in pixels** — offsets inside the anchor's own grid cell, extents in log space — then objectness, then `nc` sigmoided class scores | walk the stride grids in the order the model concatenated them, argmax class per anchor, centers → corners, NMS, then un-project/clamp/gate |
+| `[1, N, 6]` end-to-end | rows of `[x1, y1, x2, y2, score, class_id]` in input pixels, already sorted and de-duplicated | un-project, clamp, gate on the score floors |
+| `[1, 4 + nc, A]` raw-classes | channels-first over `A` anchors: `cx, cy, w, h` in input pixels then `nc` sigmoided class scores, no objectness row | argmax class per anchor, centers → corners, NMS, then the same un-project/clamp/gate |
+| `[1, Q, 4]` + `[1, Q, nc]` detr-queries | **two tensors** over `Q` learned object queries: normalized `cx, cy, w, h` in `0..1`, and **raw** class logits (roughly `-12..+2`, not probabilities) | argmax class per query, `sigmoid` the logit, scale the box into model pixels, centers → corners, **no NMS**, then the same un-project/clamp/gate |
+
+The DETR layout is the one that breaks the older assumptions, in two ways.
+It reads **more than one output tensor**, and it has **no grid**: there is no
+stride, no cell offset, no `exp` on the extents and no anchor, because a query
+is a learned slot whose box is already the whole picture's coordinates.
+Duplicates are suppressed by the bipartite matching the model was trained
+under, which is why running NMS over it would be actively wrong — it would
+merge the distinct boxes two queries legitimately place on neighbouring cars.
+
+Because RF-DETR's two exporters disagree about output *names* — Roboflow's own
+`export()` emits `dets`/`labels`, the transformers/onnx-community conversion
+emits `pred_boxes`/`logits` — the plugin binds the roles by **shape**: the
+rank-3 output ending in 4 is the boxes, the rank-3 output over the same query
+axis is the logits. Both export conventions work, and a model where the pair
+is genuinely ambiguous is an error naming the outputs rather than a guess.
+
+**Adding a family is adding a profile**, not editing the decode path: a
+`ModelProfile` is a name, an `InputSpec` (size, encoding, resize policy) and an
+`OutputSpec` (layout, score composition, optional NMS). Nothing in `infer.rs`
+below the profile table branches on a model family.
+
+#### Picking one
+
+You normally don't. With no flag the profile is **sniffed** from the model's own
+input and output shapes, and the startup line says which one won:
+
+```
+cairn-detect up: camera=test udp=17000 model=yolox_nano.onnx profile=yolox \
+    input=images input size=416x416 (from model) encoding=0..255 bgr \
+    resize=letterbox (pad 114) \
+    layout=grid-objectness [1, A, 5 + 80] strides 8/16/32 (from model) \
+    decoder=auto
+```
+
+Sniffing looks at the model's whole output *set*, not just its first tensor,
+so a two-tensor DETR export and a one-tensor YOLO head can never be confused
+for one another. RF-DETR sniffs cleanly given its geometry:
+
+```
+cairn-detect up: camera=test udp=17000 model=rfdetr_nano.onnx profile=rfdetr \
+    input=pixel_values input size=384x384 (from --input-size) \
+    encoding=imagenet-normalized rgb resize=stretch \
+    layout=detr-queries [1, Q, 4] + [1, Q, 91] (from model) decoder=auto
+```
+
+`--model-profile <name>` names one explicitly. It wins outright and is then
+**validated against the model**, so pointing it at the wrong export fails at
+startup rather than emitting plausible garbage for a week:
+
+```
+fatal: --model-profile yolov10 does not describe model yolox_nano.onnx:
+       output shape [1, 3549, 85] does not fit end-to-end [1, N, 6];
+       expected [1, N, 6]
+```
+
+Naming a profile whose *roles* the model does not offer fails the same way,
+before any frame is packed for it:
+
+```
+fatal: --model-profile rfdetr does not describe model yolov10n.onnx:
+       expected one [1, Q, 4] box output and one [1, Q, nc] logit output over
+       the same Q queries, but the model offers "output0" [1, 300, 6]
+```
+
+You need the flag in three cases:
+
+  * the shape fits **more than one** profile (below),
+  * the export leaves its **output shape dynamic** (YOLOX's own
+    `export_onnx.py --dynamic` does). There is then nothing to sniff, and the
+    encoding and resize policy have to be settled *before* the first frame is
+    converted — so this is a startup error naming the flag, not a guess. `nc`
+    is read off the first real output.
+  * the export leaves its **input geometry dynamic** and you have not passed
+    `--input-size`. Every RF-DETR export does; a symbolic *batch* axis on its
+    own does not count, since this plugin always feeds one frame. Either flag
+    is enough — `--model-profile rfdetr` supplies the family default of 384,
+    `--input-size 384` lets the profile itself still be sniffed.
+
+#### Ambiguity is an error, never a guess
+
+A shape that fits two profiles is refused with both names:
+
+```
+fatal: model m.onnx has output shape [1, 5040, 6], which at input 640x384 fits
+       more than one profile: yolox and yolov10. Nothing in the shape says
+       which, and they decode differently — pass --model-profile <yolox|yolov10>
+       to say.
+```
+
+That is the real collision: a **1-class YOLOX** head is `[1, A, 6]`, and `6` is
+also the end-to-end row width, so at any input size where `A` happens to equal
+the grid anchor count the two are indistinguishable. One reads the four numbers
+as final pixel corners; the other decodes them out of a stride grid with log
+extents. Picking silently would emit boxes that look reasonable and are wrong.
+
+Adding RF-DETR introduced a second, subtler collision. A single-tensor layout
+binds the model's **first** output, so a DETR export that happens to declare
+its logits first offers that tensor to the one-tensor profiles too. At 128×128
+a YOLOX grid has `16² + 8² + 4² = 336` anchors, so a 336-query DETR's
+`[1, 336, 85]` logits are also a perfectly good 80-class YOLOX head while the
+pair is a perfectly good `rfdetr`:
+
+```
+fatal: model m.onnx has outputs "logits" [1, 336, 85], "pred_boxes" [1, 336, 4],
+       which at input 128x128 fit more than one profile: yolox and rfdetr.
+       Nothing in the shapes says which, and they decode differently — pass
+       --model-profile <yolox|rfdetr> to say.
+```
+
+Shapes that are *not* ambiguous, and why:
+
+  * A **two-tensor DETR export against the one-tensor families**, in general.
+    The roles are what separate them: no single-tensor head can match a layout
+    that reads two, and `pred_boxes` `[1, Q, 4]` on its own fits none of the
+    one-tensor layouts — `4` is neither the end-to-end row width of 6 nor a
+    plausible `4 + nc` channel axis. The 128×128 case above is the exception
+    that has to be checked for, not the rule.
+
+  * `[1, 8400, 84]` at 640×640 is a **79-class YOLOX**, uniquely. It looks like
+    it could be a transposed Ultralytics head, but a stock Ultralytics detect
+    export is channels-first — its anchor axis is the long one — so
+    `raw-classes` refuses that orientation rather than reading `nc` as 8396.
+    (Add a transposed-Ultralytics profile and this *becomes* ambiguous, which
+    the machinery above already handles.)
+  * **YOLOv5's `[1, 25200, 85]`** fits nothing and is still rejected. Same rank
+    and row width as a 640×640 YOLOX head, but three anchor boxes per cell make
+    `A` exactly 3× a YOLOX's and its boxes are already in pixels. YOLOX at
+    strides other than 8/16/32 (a P6 head) is out for the same reason.
+
+With `--labels` given, a head whose `nc` disagrees with the label count logs a
+warning and keeps running — unknown ids are emitted as numbers.
+
+### Input
+
+Input is the model's **first input** — named `images` in both Ultralytics and
+YOLOX exports and `pixel_values` in RF-DETR's, but the name is taken from the
+model and logged at startup, not assumed — float32 `[1, 3, H, W]`, CHW.
+
+The *encoding* of those floats is not something an ONNX graph declares: it
+lives in the training transform and an export inherits it as an unwritten
+precondition. Getting it wrong is not a small accuracy loss, and both
+documented models prove it on the same camera frame:
+
+  * Fed `0..1` RGB, **YOLOX-Nano** returns *nothing* above 0.30 on a frame
+    where `0..255` BGR finds a car and a potted plant.
+  * **RF-DETR-Nano** scores its best box **0.14** fed `0..255`, **0.48** fed
+    `0..1`, and **0.78** fed ImageNet-normalized RGB. Only the last is a
+    detection. Its `preprocessor_config.json` says `do_normalize: false`,
+    which is about what the *converter* did, not what the graph wants — the
+    normalization is emphatically not baked in.
+
+The profile is what states it, and the startup line always says which encoding
+is in force. The three encodings reduce to one per-plane affine over a channel
+pick, so `0..255` BGR, `0..1` RGB and `(v/255 - mean) / std` share a single
+packing path rather than three.
+
+#### Letterbox vs stretch
+
+Neither is the resize policy — **the profile says which**, because a model was
+trained one way and only that way.
+
+  * **stretch** (`rfdetr`, `yolov10`, `yolov8`) scales each axis independently
+    to fill `H × W`. For RF-DETR this is its own transform: a square
+    `A.Resize(height=s, width=s)` with `do_pad: false`.
+  * **letterbox** (`yolox`) scales by `min(W/w_src, H/h_src)`, places the
+    picture at the **top-left corner** and fills the rest with the pad value
+    (114). That is what YOLOX's own `preproc` does —
+    `padded_img[: int(h*r), : int(w*r)] = resized` over a canvas of 114 — and
+    matching it exactly is the point, so the un-projection matches the
+    reference's `boxes /= ratio`.
+
+> **Changed:** every model used to be stretched, on the reasoning that bboxes
+> come out normalized so only ratios matter. That reasoning is sound about
+> *coordinates* and wrong about the *model*: YOLOX was trained on
+> aspect-preserved, 114-padded input, and on a 16:9 camera a stretch feeds it a
+> picture 1.78× too tall. Measured on a 2560×1440 fixture at 416×416,
+> stretch-vs-letterbox is mean IoU **0.87** on the detections both find, box
+> heights **12.6% short**, and — the part that matters — the stretch run found
+> **no cars at all** where the letterbox run found 7. See
+> [Verifying changes](#verifying-changes).
+
+Because a letterbox makes the model's coordinate space differ from the frame's,
+every decode path is handed an explicit **projection** (built per source frame
+size, alongside the scaler) rather than an input size to divide by. Under a
+stretch it is exactly the old divide; under a letterbox it subtracts the offset,
+divides by the real scale, and normalizes by the **original** frame dimensions.
+It travels with the tensor, so a decode path cannot forget to apply it.
+
+On the hardware path the GPU scaler is built for the *content* rectangle rather
+than the full input, so the aspect-preserving scale still happens on the device;
+only the padding is filled in on the CPU while packing the tensor. Letterboxed
+side lengths are rounded down to even, because the GPU scalers work in NV12 and
+a silently rounded odd side would shift every box by a rounding it never
+reported. The projection is derived from the side actually produced, so that
+costs at most one pixel of content and nothing in accuracy.
+
+### Geometry
+
+`H` and `W` need not be 640, and need not be equal — YOLOX-Nano is 416×416 and
+RF-DETR-Nano 384×384. They are resolved once at startup, and every scaler, GPU
+filter graph and tensor in the process is built for them. In precedence order:
+
+  1. `--input-size` (`320`, `640x352`, ...) — giving it a size the model
+     contradicts is rejected at startup rather than left to fail on the first
+     frame;
+  2. the model's own declared input shape;
+  3. the profile's family default (416 for `yolox`, 384 for `rfdetr`, 640
+     otherwise), which only applies to an export with dynamic spatial axes
+     *and* an explicit `--model-profile`.
+
+The startup line records which of the three it came from. RF-DETR is the case
+where this matters most: its exports declare `[?, 3, ?, ?]`, so **nothing in
+the model constrains the resolution** and a `base` export handed the nano
+default of 384 runs without complaint at the wrong size. Pass `--input-size`
+for anything but nano.
+
+### Quantization
+
+**Don't, for YOLOX-Nano.** Measured: 2.3x *slower* than FP32 and a 0% detection
+match rate against it (the classification-score collapse below, arriving as a
+constant `zebra` on every frame). It is 3.6 MB to begin with, so there is
+almost nothing to win, and its opset-11 graph cannot carry the per-channel
+quantization that would make the arithmetic pay. On the larger models where
+the question is worth asking, static QDQ measured *no* latency improvement on
+x86 with AVX-512 and slightly worse recall near the score threshold — a size
+win only. If disk or transfer size genuinely matters:
+
+```bash
+cd model
+python3 -m venv quant-venv && . quant-venv/bin/activate
+pip install onnx onnxruntime pillow numpy sympy
+python3 quantize_model.py --model ../yolox_nano.onnx \
+    --calib-dir calib_frames --out ../yolox_nano-int8.onnx
+```
+
+Note what is *not* in that `pip install`: no `ultralytics`, no `torch`. The
+quantization and verification tooling here is model-agnostic and
+Apache-2.0-clean.
+
+Whatever you quantize, run `model/verify_models.py` against the FP32 original
+before deploying it. The trap it exists to catch: a detector's
+classification-head convs may have to be excluded, or every confident
+detection's score collapses to one value — measured on YOLOv10 (the three
+`/model.23/one2one_cv3.{0,1,2}.2/Conv` nodes, collapsing to `0.500`) and again
+on YOLOX-Nano (a constant `zebra:0.393`). `--exclude-node` and
+`--exclude-suffix` are there for it, and `--preprocess-only` lists the graph's
+conv nodes so you can aim them.
+
+`model/quantize-model.md` is the detailed reference — where the model comes
+from, calibration/held-out frame extraction, the shape-inference workaround,
+and the FP32-vs-INT8 comparison method. `model/quantize_model.py` and
+`model/verify_models.py` expect the calibration artifacts it describes.
 
 ## Performance
 
 Measured 2026-07-25 in this dev container (AMD Ryzen 9 7950X3D, 32 threads,
 Debian 12), 90 s against a looped 2560x1920 H.264 @ 20 fps fixture, sampling
-at 5 fps:
+at 5 fps, with a 640x640 model. YOLOX-Nano at 416x416 is a smaller model at a
+smaller input, so it can only be cheaper than this — the numbers below are an
+upper bound on the default, not a measurement of it:
 
 | plugin | CPU |
 |--------|-----|
@@ -508,21 +810,69 @@ python3 verify/feed.py --clip /path/to/fixture.mp4 --port 17910 &
 { echo '{"spec":"cairn.plugin","version":1,"type":"stream.started","camera_id":"t","stream_epoch":"01K0TESTEPOCH00000000000000","rtp":{"clock_rate":90000}}'
   sleep 30; } \
   | timeout 30 ./target/release/cairn-detect --camera-id t --udp-port 17910 \
-      --min-score-json '{"default":0.5}' --model yolov10n.onnx \
+      --min-score-json '{"default":0.5}' --model yolox_nano.onnx \
       --labels coco.names | python3 verify/validate_ndjson.py
 ```
 
 Drop the control line and the run is still valid — just empty: `hello` and
 `status` arrive, no frames do, and the validator exits nonzero saying so.
 
+The same recipe with `--model rfdetr_nano.onnx --labels coco91.names
+--input-size 384` exercises the DETR path. On a 26 s doorbell fixture at
+2560×1920 the two Apache-2.0 models both validate clean (exit 0, 48–49 frames,
+no sequence gaps, ~4.7 fps effective) and disagree about how much they see:
+
+| | detections | score min / mean / max |
+|---|---|---|
+| `yolox_nano.onnx` @ 416 | car 27, person 23, remote 1 | 0.510 / 0.666 / 0.878 |
+| `rfdetr_nano.onnx` @ 384 | car 123, potted plant 27, person 24 | 0.506 / 0.723 / 0.958 |
+
+Counts move by a few percent between runs — the sample gate is wall-clock, so
+two runs of the same clip do not land on quite the same frames — but the gap
+does not. RF-DETR finds the parked cars and the porch planter that YOLOX-Nano
+mostly misses, out of a model 30× the size. Which one is right for a camera is
+a CPU budget question, not a correctness one.
+
+### Measured: the YOLOX resize policy
+
+Both models run clean end-to-end against the harness (validator exit 0,
+sequence continuity intact, ~4.7 fps effective). The resize change is the one
+worth a number, so it was measured on a **2560×1440 (16:9)** fixture at
+YOLOX-Nano's 416×416, 20 s, software decode, `min_score 0.4`, one build
+letterboxing and one stretching, compared frame-by-frame on matching `pts`:
+
+| | letterbox | stretch |
+|---|---|---|
+| detections | 42 (35 potted plant, **7 car**) | 35 (35 potted plant, **0 car**) |
+| score mean / max | 0.623 / 0.706 | 0.586 / 0.631 |
+| mean IoU against the other run | — | **0.868** |
+| box height, vs letterbox | — | **12.6% short** (mean `dh` −0.037) |
+| box top edge, vs letterbox | — | 0.026 lower (mean `dy` +0.026) |
+| box left edge / width | — | unchanged (mean `dx`, `dw` < 0.001) |
+
+Two things to read off that. First, the horizontal axis does not move at all:
+a 16:9 frame into a square input is letterboxed only vertically, and the
+per-axis normalization already handled `x`. Second — and this is the real cost
+— the harm is not a coordinate bug. Stretching *and* un-stretching are
+self-consistent, so the old pipeline's boxes were where it thought they were.
+What it got wrong was the picture it handed the model: YOLOX trained on
+aspect-preserved input sees a 16:9 frame 1.78× too tall under a stretch, and it
+localizes worse (mean IoU 0.87) and **misses objects outright** — every car
+detection in this fixture.
+
+So: not negligible.
+
 Unit tests (`cargo test`) cover the v1 envelope (shape, field bounds, object
 cap, line-size shedding, RFC3339 formatting), control-line parsing and the
 epoch map it drives (start, restart, a stale `ended`, an unserved camera),
 per-camera sequence isolation and the pre-epoch gate, plus postprocessing,
 score-floor parsing, the SDP string, pts rescaling, tensor packing,
-input-size parsing and resolution, output-layout detection, the raw-head
-decode (argmax, box conversion, IoU/NMS, prefilter), decoder probe order and
-the per-backend filter strings; none need network, a model, or a GPU.
+input-size parsing and resolution, profile resolution (sniffing, the
+ambiguity refusal, an explicit profile validated against the model), the
+resize policies and the projection they imply (including a full-frame
+round-trip under both), the raw-head and grid decodes (argmax, box conversion,
+IoU/NMS, prefilter), decoder probe order and the per-backend filter strings;
+none need network, a model, or a GPU.
 
 ## Implementation notes
 
@@ -556,8 +906,12 @@ the per-backend filter strings; none need network, a model, or a GPU.
   a sample. Samples are dropped, never queued; every 50th drop is logged.
 - Sampling is wall-clock, not PTS-based: the goal is capping model passes per
   second, and a bursty stream would otherwise fire several at once.
-- Resizing is a letterbox-free stretch. Bboxes are normalized, so only ratios
-  matter.
+- The resize policy comes from the model's profile, because a model was
+  trained one way and only that way: stretch for the Ultralytics families,
+  aspect-preserving letterbox with 114 padding at the top-left for YOLOX,
+  matching its own `preproc`. Every decode path is handed an explicit
+  projection built alongside the scaler, so a letterboxed run cannot report
+  boxes against the input rectangle instead of the frame.
 - NMS runs for the raw layout only — an end-to-end export did it inside the
   model — and over at most the top 300 anchors by score, which bounds an
   O(k²) pass that would otherwise start from 8400. The prefilter feeding it

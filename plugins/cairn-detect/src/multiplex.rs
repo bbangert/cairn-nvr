@@ -25,7 +25,7 @@ use serde::Deserialize;
 
 use crate::decode::{self, DecoderKind, Sample, SampleSink};
 use crate::emit::{self, Publisher};
-use crate::infer::{Detector, InputSize, Labels, ScoreFloors};
+use crate::infer::{Detector, InputSpec, Labels, ScoreFloors};
 use crate::rtp;
 
 /// First wait after a stream drops, doubled up to [`REOPEN_MAX`].
@@ -78,9 +78,10 @@ pub fn run(
     publisher: Publisher,
 ) -> Result<()> {
     let floors = floors_for(specs);
-    // One resolved size for the whole group: the members share the detector,
-    // so they share the geometry every decoder has to produce.
-    let input_size = detector.input_size();
+    // One resolved spec for the whole group: the members share the detector,
+    // so they share the geometry, the encoding *and* the resize policy every
+    // decoder has to produce.
+    let input_spec = detector.input_spec();
     let mut slots = Vec::with_capacity(specs.len());
 
     for spec in specs {
@@ -89,7 +90,7 @@ pub fn run(
         let owned = spec.clone();
         thread::Builder::new()
             .name(format!("stream-{}", spec.id))
-            .spawn(move || stream_loop(&owned, kind, input_size, &sink))
+            .spawn(move || stream_loop(&owned, kind, input_spec, &sink))
             .with_context(|| format!("spawning the decode thread for camera {}", spec.id))?;
     }
 
@@ -105,7 +106,7 @@ pub fn run(
 fn stream_loop(
     spec: &CameraSpec,
     kind: DecoderKind,
-    input_size: InputSize,
+    input_spec: InputSpec,
     sink: &LatestSink<Sample>,
 ) {
     let mut delay = REOPEN_MIN;
@@ -113,7 +114,7 @@ fn stream_loop(
 
     loop {
         let started = Instant::now();
-        let outcome = open_and_run(spec, kind, input_size, sink);
+        let outcome = open_and_run(spec, kind, input_spec, sink);
         if started.elapsed() >= HEALTHY_RUN {
             failures = 0;
             delay = REOPEN_MIN;
@@ -141,7 +142,7 @@ fn stream_loop(
 fn open_and_run(
     spec: &CameraSpec,
     kind: DecoderKind,
-    input_size: InputSize,
+    input_spec: InputSpec,
     sink: &LatestSink<Sample>,
 ) -> Result<()> {
     let mut input = rtp::open_stream_once(spec.udp_port)?;
@@ -153,7 +154,7 @@ fn open_and_run(
         let stream = &input.streams()[stream_index];
         (
             stream.time_base,
-            decode::open(kind, &stream.codecpar(), input_size)
+            decode::open(kind, &stream.codecpar(), input_spec)
                 .with_context(|| format!("opening a decoder for camera {}", spec.id))?,
         )
     };
@@ -171,7 +172,12 @@ fn infer_loop(
 ) -> Result<()> {
     for (index, sample) in Slots::new(slots) {
         let camera_id = &specs[index].id;
-        let dets = detector.detect(sample.tensor, labels, &floors[index])?;
+        let dets = detector.detect(
+            sample.input.tensor,
+            sample.input.projection,
+            labels,
+            &floors[index],
+        )?;
         // The epoch gate is per member: a camera Cairn has not announced yet
         // (or has stopped) emits nothing while its neighbours keep going.
         if let Some(line) = publisher.line_for(camera_id, sample.pts_90k, sample.observed_at, &dets)
