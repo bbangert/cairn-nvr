@@ -564,10 +564,42 @@ defmodule Cairn.DetectionAggregator do
   defp end_orphan(camera_id, event) do
     EventCheckpoint.delete(camera_id)
 
-    case Events.get(event.id) do
-      %{status: :finalized} -> :ok
+    case indexed_status(event.id) do
+      :finalized -> :ok
       _ -> Event.broadcast(:event_ended, %{event | status: :partial, ended_at: now()})
     end
+  end
+
+  # This runs inside `init/1` — the only Repo call the aggregator makes before
+  # it is alive — and the aggregator is a singleton handling detections for
+  # every camera. An unreachable, locked or (in tests) unowned database must
+  # not turn into a supervisor restart loop on that one process, so a storage
+  # failure degrades to "index says nothing" and the caller announces the
+  # event `:partial`. Mislabelling a finalized event that way is recoverable:
+  # `event_ended` is at-least-once and consumers dedupe on the event id (see
+  # docs/ha-api.md). Only the storage layer's own failures are caught — a bug
+  # in here still raises.
+  defp indexed_status(event_id) do
+    case Events.get(event_id) do
+      %{status: status} -> status
+      _ -> nil
+    end
+  rescue
+    e in [DBConnection.ConnectionError, DBConnection.OwnershipError, Exqlite.Error] ->
+      log_index_unavailable(event_id, Exception.message(e))
+      nil
+  catch
+    # the connection pool or the repo process itself is gone
+    :exit, reason ->
+      log_index_unavailable(event_id, inspect(reason))
+      nil
+  end
+
+  defp log_index_unavailable(event_id, reason) do
+    Logger.warning(
+      "event #{event_id}: could not consult the event index during restore " <>
+        "(#{reason}); announcing it as partial"
+    )
   end
 
   defp config do

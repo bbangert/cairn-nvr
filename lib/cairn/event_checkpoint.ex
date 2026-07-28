@@ -24,6 +24,15 @@ defmodule Cairn.EventCheckpoint do
   @spec all() :: [{String.t(), Cairn.Event.t(), [Cairn.Track.t()]}]
   def all, do: :ets.tab2list(@table)
 
+  @doc """
+  Empties the table in one operation.
+
+  Deleting row by row off `all/0` is not atomic: anything inserting between
+  the read and the deletes survives.
+  """
+  @spec clear() :: true
+  def clear, do: :ets.delete_all_objects(@table)
+
   @impl true
   def init(_opts) do
     :ets.new(@table, [:named_table, :set, :public, write_concurrency: true])

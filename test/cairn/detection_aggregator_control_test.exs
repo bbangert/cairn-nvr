@@ -1,6 +1,9 @@
 defmodule Cairn.DetectionAggregatorControlTest do
   # verifies runtime CameraControl toggles change aggregator behavior
-  use ExUnit.Case, async: false
+  #
+  # DataCase, not ExUnit.Case: starting an aggregator runs checkpoint restore,
+  # which consults the event index — that Repo call needs a sandbox owner.
+  use Cairn.DataCase, async: false
 
   alias Cairn.{CameraControl, DetectionAggregator, Event, EventCheckpoint, Observation}
   alias Cairn.Config.Camera

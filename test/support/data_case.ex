@@ -29,7 +29,26 @@ defmodule Cairn.DataCase do
 
   setup tags do
     Cairn.DataCase.setup_sandbox(tags)
+    Cairn.DataCase.reset_checkpoints()
     :ok
+  end
+
+  @doc """
+  Empties `Cairn.EventCheckpoint`'s table around the test.
+
+  That table is a public named ETS table owned by an application process, so
+  it outlives the test that wrote to it — and every
+  `Cairn.DetectionAggregator.init/1` iterates *all* of it and consults the
+  event index for each row. A row one test leaves behind is therefore restored
+  by an aggregator some later test starts, in that test's sandbox.
+
+  Call it from any test that starts an aggregator or writes a checkpoint, even
+  one that does not `use Cairn.DataCase`.
+  """
+  @spec reset_checkpoints() :: :ok
+  def reset_checkpoints do
+    Cairn.EventCheckpoint.clear()
+    on_exit(&Cairn.EventCheckpoint.clear/0)
   end
 
   @doc """
