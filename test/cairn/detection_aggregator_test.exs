@@ -3,6 +3,7 @@ defmodule Cairn.DetectionAggregatorTest do
   # decides whether an interrupted event still owes an `event_ended`.
   use Cairn.DataCase, async: false
 
+  import Cairn.RegistryHelpers, only: [stale_entry: 2]
   import Cairn.TrackAssertions
   import ExUnit.CaptureLog, only: [capture_log: 1]
 
@@ -723,6 +724,27 @@ defmodule Cairn.DetectionAggregatorTest do
     eid = event.id
     refute_receive {:event_ended, %Event{id: ^eid}}, 100
     assert checkpoint(id) == []
+  end
+
+  # The registry hands back a corpse for a moment after the extractor exits, so
+  # restore can monitor a dead pid — `Process.monitor/1` answers `:noproc`
+  # immediately. `:noproc` is not a crash: the event finalized cleanly and must
+  # not be re-announced as `:partial`.
+  test "restore over a stale extractor entry is a clean finish, not a crash", %{camera_id: id} do
+    event = %Event{id: Ecto.UUID.generate(), camera_id: id, started_at: DateTime.utc_now()}
+    stale = stale_entry(id, {:extractor, event.id})
+    refute Process.alive?(stale)
+    EventCheckpoint.put(id, event)
+
+    eid = event.id
+
+    log =
+      capture_log(fn ->
+        start_supervised!({DetectionAggregator, name: nil}, id: :agg_restore_stale)
+        refute_receive {:event_ended, %Event{id: ^eid}}, 200
+      end)
+
+    refute log =~ "extractor crashed"
   end
 
   test "restart re-attaches to a live extractor and can finalize it", %{camera_id: id} do

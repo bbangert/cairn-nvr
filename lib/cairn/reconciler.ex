@@ -63,6 +63,13 @@ defmodule Cairn.Reconciler do
   end
 
   # An extractor still holds this row's file open and will finalize it itself.
+  #
+  # A registry entry outlives its process briefly, so this can read a dead
+  # extractor as live — safe here, and deliberately not waited out: a stale
+  # read errs toward *inaction* (the row is left active rather than wrongly
+  # marked partial), and the next boot's reconcile catches it. `run/1` is
+  # called once, from `Cairn.Boot`; there is no periodic reconcile to
+  # self-correct, so the conservative direction is the whole guarantee.
   defp recording?(row) do
     Cairn.Registry.whereis(row.camera_id, {:extractor, row.id}) != nil
   end

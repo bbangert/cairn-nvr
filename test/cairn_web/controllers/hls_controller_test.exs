@@ -1,5 +1,9 @@
 defmodule CairnWeb.HLSControllerTest do
+  # async: false is load-bearing: the stale-entry test suspends
+  # `Cairn.Registry`'s partition, which the whole application shares.
   use CairnWeb.ConnCase, async: false
+
+  import Cairn.RegistryHelpers, only: [stale_entry: 2]
 
   alias Cairn.Fragment
   alias Cairn.RingBuffer
@@ -59,5 +63,17 @@ defmodule CairnWeb.HLSControllerTest do
     assert conn |> get("/hls/offline_cam/index.m3u8") |> response(404)
     assert conn |> get("/hls/offline_cam/init.mp4") |> response(404)
     assert conn |> get("/hls/offline_cam/0.m4s") |> response(404)
+  end
+
+  # The registry lists the ring for a moment after it dies, so the whereis
+  # guard passes and the via-tuple `fetch_recent` exits `:noproc`. That must
+  # still be a 404, not a 500.
+  test "a stale ring registry entry is 404, not a 500", %{conn: conn} do
+    ring = stale_entry("stale_cam", :ring_buffer)
+    refute Process.alive?(ring)
+
+    assert conn |> get("/hls/stale_cam/index.m3u8") |> response(404)
+    assert conn |> get("/hls/stale_cam/init.mp4") |> response(404)
+    assert conn |> get("/hls/stale_cam/0.m4s") |> response(404)
   end
 end

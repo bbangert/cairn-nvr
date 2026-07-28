@@ -69,10 +69,14 @@ defmodule CairnWeb.HLSController do
     end
   end
 
+  # `fetch_recent_safe/2` and not `fetch_recent/2`: the whereis can hand back a
+  # ring the registry has not reaped yet, and a via-tuple call on a dead pid
+  # exits — every caller here matches on values, so that would 500 instead of
+  # 404.
   defp ring_data(camera_id, count) do
     case Cairn.Registry.whereis(camera_id, :ring_buffer) do
       nil -> {:error, :offline}
-      _pid -> RingBuffer.fetch_recent(camera_id, count)
+      _pid -> RingBuffer.fetch_recent_safe(camera_id, count)
     end
   end
 
