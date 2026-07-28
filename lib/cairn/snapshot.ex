@@ -1,8 +1,10 @@
 defmodule Cairn.Snapshot do
   @moduledoc """
   Per-event snapshot as `snapshots/{event_id}.jpg`, extracted async
-  post-finalize. Failure is non-fatal (log only) — the UI falls back to a
-  placeholder.
+  post-finalize. Failure is non-fatal — the UI falls back to a placeholder —
+  but it is never silent: every attempt ends in exactly one
+  `:event_snapshot_ready` or `:event_snapshot_failed` broadcast
+  (`Cairn.EventArtifact`), so a consumer knows whether to fetch or to give up.
 
   When the event carries a `trigger` (the highest-scoring detection, captured
   by `Cairn.DetectionAggregator`), the frame is cut from that detection's
@@ -15,7 +17,7 @@ defmodule Cairn.Snapshot do
 
   require Logger
 
-  alias Cairn.{Config, DataDir, Events}
+  alias Cairn.{Config, DataDir, EventArtifact, Events}
 
   # tuned for HD+ camera frames; fontsize is not an ffmpeg expression so it
   # can't scale with resolution — a fixed size reads fine from ~640p up.
@@ -31,27 +33,22 @@ defmodule Cairn.Snapshot do
 
   @spec take(Events.Event.t(), Config.t()) :: :ok
   def take(row, config) do
-    out = Path.join(DataDir.snapshots_dir(config.data_dir), "#{row.id}.jpg")
+    # Structural "exactly one frame per attempt": every step that can raise or
+    # exit is inside `capture/2` or `record/2`, and the broadcast is the last
+    # thing that happens — so a failure can never contradict a frame already
+    # on the wire, and cannot swallow the frame either.
+    case capture(row, config) do
+      {:ok, out, size} ->
+        case record(row, out) do
+          :ok -> ready(row, out, size)
+          {:error, reason} -> failed(row, reason)
+        end
 
-    {output, status} =
-      System.cmd("ffmpeg", args(row, out, clip_seek(row, config)), stderr_to_stdout: true)
-
-    # ffmpeg exits 0 even when a seek lands past the end and writes nothing, so
-    # trust the file, not the exit code — a bogus snapshot_path 404s the UI.
-    if File.exists?(out) and File.stat!(out).size > 0 do
-      Events.set_snapshot(row.id, out)
-    else
-      Logger.warning(
-        "event #{row.id}: snapshot produced no output (ffmpeg #{status}): " <>
-          String.slice(output, 0, 200)
-      )
+      {:error, reason} ->
+        failed(row, reason)
     end
 
     :ok
-  rescue
-    e ->
-      Logger.warning("event #{row.id}: snapshot error: #{Exception.message(e)}")
-      :ok
   end
 
   @doc """
@@ -75,6 +72,84 @@ defmodule Cairn.Snapshot do
   end
 
   # -- internals --------------------------------------------------------------
+
+  # ffmpeg and the file it may or may not have written. `rescue`/`catch` both:
+  # a raise (a bad argv, an unreadable dir) and an exit (a port that dies under
+  # us) must still end in a frame.
+  defp capture(row, config) do
+    out = Path.join(DataDir.snapshots_dir(config.data_dir), "#{row.id}.jpg")
+
+    {output, status} =
+      System.cmd("ffmpeg", args(row, out, clip_seek(row, config)), stderr_to_stdout: true)
+
+    # ffmpeg exits 0 even when a seek lands past the end and writes nothing, so
+    # trust the file, not the exit code — a bogus snapshot_path 404s the UI.
+    case File.stat(out) do
+      {:ok, %{size: size}} when size > 0 ->
+        {:ok, out, size}
+
+      _ ->
+        Logger.warning(
+          "event #{row.id}: snapshot produced no output (ffmpeg #{status}): " <>
+            String.slice(output, 0, 200)
+        )
+
+        {:error, :no_output}
+    end
+  rescue
+    e ->
+      Logger.warning("event #{row.id}: snapshot error: #{Exception.message(e)}")
+      {:error, :exception}
+  catch
+    :exit, reason ->
+      Logger.warning("event #{row.id}: snapshot exited: #{inspect(reason)}")
+      {:error, :exception}
+  end
+
+  # The row update, not the file write, is what makes the jpg reachable
+  # (`snapshot_url`), so `ready` follows it. The event can have gone away
+  # while ffmpeg ran — retention deleted it, the recording was reconciled —
+  # and that used to be swallowed whole. Ecto is the other half of the reason
+  # for the `catch`: a pool checkout timeout surfaces as an exit, not a raise,
+  # and `rescue` alone would let the task die with nothing announced.
+  defp record(row, out) do
+    case Events.set_snapshot(row.id, out) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("event #{row.id}: snapshot not recorded: #{inspect(reason)}")
+        {:error, snapshot_reason(reason)}
+    end
+  rescue
+    e ->
+      Logger.warning("event #{row.id}: snapshot not recorded: #{Exception.message(e)}")
+      {:error, :exception}
+  catch
+    :exit, reason ->
+      Logger.warning("event #{row.id}: snapshot record exited: #{inspect(reason)}")
+      {:error, :exception}
+  end
+
+  defp ready(row, out, size) do
+    EventArtifact.broadcast(:event_snapshot_ready, %EventArtifact{
+      event_id: row.id,
+      camera_id: row.camera_id,
+      path: out,
+      bytes: size
+    })
+  end
+
+  defp failed(row, reason) do
+    EventArtifact.broadcast(:event_snapshot_failed, %EventArtifact{
+      event_id: row.id,
+      camera_id: row.camera_id,
+      reason: reason
+    })
+  end
+
+  defp snapshot_reason(:not_found), do: :not_found
+  defp snapshot_reason(_other), do: :index_write_failed
 
   # Clip time to cut the snapshot from: the trigger's moment (pre-roll + its
   # offset), clamped inside the clip. A freshly-started camera has less than a

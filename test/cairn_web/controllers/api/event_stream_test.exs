@@ -70,6 +70,93 @@ defmodule CairnWeb.Api.EventStreamTest do
     assert SSE.frame_for({:something_else, 1}) == :ignore
   end
 
+  describe "artifact frames" do
+    defp artifact(fields) do
+      struct!(%Cairn.EventArtifact{event_id: "evt-1", camera_id: "cam_a"}, fields)
+    end
+
+    test "clip_ready carries the fetchable url and the post-remux size" do
+      assert {:ok, frame} =
+               SSE.frame_for(
+                 {:event_clip_ready,
+                  artifact(path: "/data/events/cam_a/evt-1.mp4", bytes: 1_234_567)}
+               )
+
+      assert frame =~ "event: event_clip_ready\n"
+      assert frame =~ ~s("event_id":"evt-1")
+      assert frame =~ ~s("camera_id":"cam_a")
+      assert frame =~ ~s("bytes":1234567)
+      assert frame =~ ~s("clip_url":"/api/media/events/evt-1")
+      assert frame =~ ~s("reason":null)
+      # the on-disk path is never on the wire
+      refute frame =~ "/data/events"
+      refute frame =~ "path"
+      assert String.ends_with?(frame, "\n\n")
+    end
+
+    test "snapshot_ready carries the snapshot url" do
+      assert {:ok, frame} =
+               SSE.frame_for(
+                 {:event_snapshot_ready, artifact(path: "/data/snap/evt-1.jpg", bytes: 4_096)}
+               )
+
+      assert frame =~ "event: event_snapshot_ready\n"
+      assert frame =~ ~s("snapshot_url":"/api/media/snapshots/evt-1")
+      assert frame =~ ~s("bytes":4096)
+      refute frame =~ "clip_url"
+      refute frame =~ "/data/snap"
+    end
+
+    test "failures name the reason and advertise no url" do
+      assert {:ok, clip} = SSE.frame_for({:event_clip_failed, artifact(reason: :not_found)})
+      assert clip =~ "event: event_clip_failed\n"
+      assert clip =~ ~s("reason":"not_found")
+      assert clip =~ ~s("clip_url":null)
+      assert clip =~ ~s("bytes":null)
+
+      assert {:ok, snap} = SSE.frame_for({:event_snapshot_failed, artifact(reason: :no_output)})
+      assert snap =~ "event: event_snapshot_failed\n"
+      assert snap =~ ~s("reason":"no_output")
+      assert snap =~ ~s("snapshot_url":null)
+      assert snap =~ ~s("bytes":null)
+    end
+
+    # Substring assertions cannot catch a *stray* key: a clip frame that also
+    # carried `snapshot_url` would pass every one of them. The key set is the
+    # contract, so assert the key set — for all four kinds.
+    test "each kind emits exactly its own keys, no others" do
+      base = ~w(bytes camera_id event_id reason)
+
+      for {kind, artifact, url_key} <- [
+            {:event_clip_ready, artifact(path: "/x.mp4", bytes: 1), "clip_url"},
+            {:event_clip_failed, artifact(reason: :not_found), "clip_url"},
+            {:event_snapshot_ready, artifact(path: "/x.jpg", bytes: 1), "snapshot_url"},
+            {:event_snapshot_failed, artifact(reason: :no_output), "snapshot_url"}
+          ] do
+        assert {:ok, frame} = SSE.frame_for({kind, artifact})
+        assert [_, json] = Regex.run(~r/^data: (.*)\n\n$/m, frame)
+        assert json |> Jason.decode!() |> Map.keys() |> Enum.sort() == Enum.sort([url_key | base])
+      end
+    end
+
+    # the four kinds only mean anything if they stay apart on the wire
+    test "each kind names itself" do
+      for kind <- [:event_clip_ready, :event_snapshot_ready] do
+        assert {:ok, frame} = SSE.frame_for({kind, artifact(path: "/x", bytes: 1)})
+        assert frame =~ "event: #{kind}\n"
+      end
+
+      for kind <- [:event_clip_failed, :event_snapshot_failed] do
+        assert {:ok, frame} = SSE.frame_for({kind, artifact(reason: :exception)})
+        assert frame =~ "event: #{kind}\n"
+      end
+    end
+
+    test "an artifact struct under an unknown kind is ignored, not crashed on" do
+      assert SSE.frame_for({:event_clip_maybe, artifact(bytes: 1)}) == :ignore
+    end
+  end
+
   describe "track lifecycle frames" do
     defp track do
       %Cairn.Track{

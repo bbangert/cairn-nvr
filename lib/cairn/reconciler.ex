@@ -7,6 +7,13 @@ defmodule Cairn.Reconciler do
     * `active` rows with a file (crash mid-event) -> mark `partial`
     * orphaned mp4s with no row (filename encodes identity) -> adopt as
       `partial`
+
+  A row whose `Cairn.EventExtractor` is still registered is skipped: disk is
+  truth only for files nobody is writing. It cannot happen on a clean boot
+  (cameras start after this runs), but `Cairn.Boot` is `:transient` — a later
+  failure in one of its sync steps re-runs the whole task with extractors
+  live, and deleting a row out from under one turns a healthy clip into a
+  false `event_clip_failed{reason: :not_found}`.
   """
 
   require Logger
@@ -24,6 +31,9 @@ defmodule Cairn.Reconciler do
     {deleted, partialed} =
       Enum.reduce(rows, {0, 0}, fn row, {deleted, partialed} ->
         cond do
+          recording?(row) ->
+            {deleted, partialed}
+
           is_nil(row.path) or not File.exists?(row.path) ->
             Events.delete_row(row)
             {deleted + 1, partialed}
@@ -50,6 +60,11 @@ defmodule Cairn.Reconciler do
     end
 
     summary
+  end
+
+  # An extractor still holds this row's file open and will finalize it itself.
+  defp recording?(row) do
+    Cairn.Registry.whereis(row.camera_id, {:extractor, row.id}) != nil
   end
 
   defp adopt_orphans(config, known_ids) do

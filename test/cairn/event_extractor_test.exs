@@ -1,10 +1,35 @@
 defmodule Cairn.EventExtractorTest do
   use Cairn.DataCase, async: false
 
-  alias Cairn.{Config, Event, EventExtractor, Events, MP4.Demuxer, Reconciler, RingBuffer}
+  import ExUnit.CaptureLog, only: [capture_log: 1]
+
+  alias Cairn.{
+    Config,
+    DetectionAggregator,
+    Event,
+    EventArtifact,
+    EventCheckpoint,
+    EventExtractor,
+    Events,
+    MP4.Demuxer,
+    Observation,
+    Reconciler,
+    RingBuffer
+  }
+
   alias Cairn.Config.Camera
 
+  @policy %{pre: 5, post: 10, max: 300, max_unseen_ms: 3_000, max_live_tracks: 128}
+
   @fixture "test/support/fixtures/media/testsrc.fmp4"
+
+  @artifact_kinds [
+    :event_clip_ready,
+    :event_clip_failed,
+    :event_snapshot_ready,
+    :event_snapshot_failed
+  ]
+  @lifecycle_kinds [:event_started, :event_updated, :event_ended | @artifact_kinds]
 
   setup do
     dir = Path.join(System.tmp_dir!(), "cairn_ex_#{System.unique_integer([:positive])}")
@@ -23,6 +48,8 @@ defmodule Cairn.EventExtractorTest do
     }
 
     start_supervised!({RingBuffer, camera_id: camera_id, pre_window_seconds: 60})
+
+    Event.subscribe()
 
     {init_meta, frags} = fixture_events(camera_id)
 
@@ -172,6 +199,274 @@ defmodule Cairn.EventExtractorTest do
     {path, event.id}
   end
 
+  # What this measures: the clip is never announced before the extractor is
+  # told to finalize, it carries its post-remux size, and the snapshot is only
+  # kicked off afterwards. The *aggregator's* ordering is pinned by the two
+  # tests below and by the stub test in `DetectionAggregatorTest`.
+  test "the clip is announced only once finalized, carrying its post-remux size",
+       %{camera: camera, config: config, frags: frags} do
+    config = %{config | remux_clips: true}
+    event = new_event(camera)
+    test_pid = self()
+
+    pid =
+      start_supervised!(
+        {EventExtractor,
+         camera: camera,
+         event: event,
+         config: config,
+         snapshot_fun: fn row, _cfg -> send(test_pid, {:snapshot_requested, row.id}) end}
+      )
+
+    ref = Process.monitor(pid)
+    assert %{status: :active, path: path} = wait_row(event.id)
+
+    Enum.each(frags, &RingBuffer.put_fragment(camera.id, &1))
+    wait_until(fn -> :sys.get_state(pid).fragments == length(frags) end)
+    written = :sys.get_state(pid).bytes
+
+    finalized = %{event | ended_at: DateTime.utc_now(), status: :finalized}
+    Event.broadcast(:event_ended, finalized)
+    EventExtractor.finalize(pid, finalized)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
+
+    event_id = event.id
+    camera_id = camera.id
+
+    assert {:event_ended, %Event{id: ^event_id}} = next_lifecycle(camera_id)
+
+    assert {:event_clip_ready,
+            %EventArtifact{
+              event_id: ^event_id,
+              camera_id: ^camera_id,
+              path: ^path,
+              reason: nil
+            } = clip} = next_lifecycle(camera_id)
+
+    # the snapshot is kicked off *after* the clip frame, from the same
+    # process — so finding it behind that frame in this mailbox is the proof
+    assert_received {:snapshot_requested, ^event_id}
+
+    # the size announced is the remuxed file's, not the bytes the writer
+    # streamed: a client sizing a download off it would be lied to otherwise
+    assert clip.bytes == File.stat!(path).size
+    refute clip.bytes == written
+    assert Events.get(event_id).bytes == clip.bytes
+  end
+
+  # B2: the guarantee end to end. The aggregator's own `maybe_finalize/4`
+  # supplies the interleaving here — no stub extractor funs, a real extractor
+  # doing a real close/remux/index/broadcast on the other side of the cast.
+  test "a real aggregator finalizing a real extractor announces event_ended first",
+       %{camera: camera, config: config, frags: frags} do
+    test_pid = self()
+    on_exit(fn -> EventCheckpoint.delete(camera.id) end)
+
+    agg =
+      start_supervised!({
+        DetectionAggregator,
+        # the real extractor; only its data_dir is pinned to this test's, and
+        # the snapshot is stubbed so no ffmpeg runs. `finalize_extractor` is
+        # left at its default — the real cast.
+        name: nil,
+        start_extractor: fn cam, event ->
+          DynamicSupervisor.start_child(
+            Cairn.EventSupervisor,
+            {EventExtractor,
+             camera: cam,
+             event: event,
+             config: config,
+             snapshot_fun: fn row, _cfg -> send(test_pid, {:snapshot_requested, row.id}) end}
+          )
+        end
+      })
+
+    Enum.each(frags, &RingBuffer.put_fragment(camera.id, &1))
+    DetectionAggregator.detections(agg, camera, @policy, observation(camera.id))
+
+    assert {:event_started, %Event{id: event_id}} = next_lifecycle(camera.id)
+    assert %{status: :active} = wait_row(event_id)
+
+    # fire the post-window timer the aggregator armed, with its own token
+    cam = :sys.get_state(agg).cameras[camera.id]
+    send(agg, {:post_window, camera.id, event_id, cam.post_token})
+
+    assert {:event_ended, %Event{id: ^event_id, status: :finalized}} = next_lifecycle(camera.id)
+
+    assert {:event_clip_ready, %EventArtifact{event_id: ^event_id, reason: nil}} =
+             next_lifecycle(camera.id, 5_000)
+  end
+
+  defp observation(camera_id) do
+    %Observation{
+      camera_id: camera_id,
+      pts: 90_000,
+      media_ms: 1_000.0,
+      observed_at: DateTime.utc_now(),
+      time_quality: :arrival,
+      objects: [
+        %{
+          label: "person",
+          score: 0.9,
+          bbox: [0.1, 0.1, 0.2, 0.4],
+          track_id: nil,
+          observation_kind: "detected"
+        }
+      ],
+      ended_tracks: [],
+      tracking: false,
+      protocol: :v0
+    }
+  end
+
+  test "a clip the index will not accept is announced failed, not silently dropped",
+       %{camera: camera, config: config, frags: frags} do
+    event = new_event(camera)
+    test_pid = self()
+
+    pid =
+      start_supervised!(
+        {EventExtractor,
+         camera: camera,
+         event: event,
+         config: config,
+         snapshot_fun: fn row, _cfg -> send(test_pid, {:snapshot_requested, row.id}) end}
+      )
+
+    ref = Process.monitor(pid)
+    assert %{status: :active} = row = wait_row(event.id)
+    Enum.each(Enum.take(frags, 2), &RingBuffer.put_fragment(camera.id, &1))
+
+    # retention deleting the event mid-recording: `Events.finalize` then has
+    # nothing to update and the clip never becomes reachable
+    {:ok, _} = Events.delete_row(row)
+
+    log =
+      capture_log(fn ->
+        EventExtractor.finalize(pid, %{event | ended_at: DateTime.utc_now(), status: :finalized})
+        assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
+      end)
+
+    assert log =~ "finalize failed"
+
+    event_id = event.id
+    camera_id = camera.id
+
+    assert_receive {:event_clip_failed,
+                    %EventArtifact{
+                      event_id: ^event_id,
+                      camera_id: ^camera_id,
+                      path: nil,
+                      bytes: nil,
+                      reason: :not_found
+                    }}
+
+    refute_received {:event_clip_ready, _}
+    # no row, no snapshot to cut from it
+    refute_received {:snapshot_requested, _}
+  end
+
+  # An update the index rejects is a different failure from a missing row, and
+  # the wire reason has to say so: `index_write_failed`, not `not_found`.
+  test "an index update the changeset refuses is announced index_write_failed",
+       %{camera: camera, config: config, frags: frags} do
+    event = new_event(camera)
+
+    # a max_score that is not a number: `Events.finalize`'s changeset refuses
+    # the cast, so the row keeps its `active` state and the clip is unreachable
+    log = finalize_broken(camera, config, frags, event, %{event | max_score: "very high"}, [])
+
+    assert log =~ "finalize failed"
+    event_id = event.id
+
+    assert_receive {:event_clip_failed,
+                    %EventArtifact{event_id: ^event_id, reason: :index_write_failed}}
+
+    refute_received {:event_clip_ready, _}
+    assert %{status: :active} = Events.get(event.id)
+  end
+
+  # B3: `event_ended` is already on the wire by the time finalize runs, so a
+  # crash in there must not leave a consumer waiting for a clip frame forever.
+  test "a finalize that raises still announces the clip as failed",
+       %{camera: camera, config: config, frags: frags} do
+    event = new_event(camera)
+    finalized = %{event | ended_at: DateTime.utc_now(), status: :finalized}
+
+    log =
+      finalize_broken(camera, config, frags, event, finalized,
+        remux_clips: true,
+        remux_fun: fn _path -> raise "ffmpeg went sideways" end
+      )
+
+    assert log =~ "finalize crashed"
+    assert_exception_failed(event, camera)
+  end
+
+  test "a finalize that exits still announces the clip as failed",
+       %{camera: camera, config: config, frags: frags} do
+    event = new_event(camera)
+    finalized = %{event | ended_at: DateTime.utc_now(), status: :finalized}
+
+    log =
+      finalize_broken(camera, config, frags, event, finalized,
+        remux_clips: true,
+        # what an Ecto pool checkout timeout looks like from in here: an exit,
+        # which `rescue` alone would not catch
+        remux_fun: fn _path -> exit({:timeout, {DBConnection.Holder, :checkout, []}}) end
+      )
+
+    assert log =~ "finalize exited"
+    assert_exception_failed(event, camera)
+  end
+
+  defp assert_exception_failed(event, camera) do
+    event_id = event.id
+    camera_id = camera.id
+
+    assert_receive {:event_clip_failed,
+                    %EventArtifact{
+                      event_id: ^event_id,
+                      camera_id: ^camera_id,
+                      path: nil,
+                      bytes: nil,
+                      reason: :exception
+                    }}
+
+    refute_received {:event_clip_ready, _}
+    # a clip that never landed has no frame to cut a snapshot from
+    refute_received {:snapshot_requested, _}
+  end
+
+  # Runs an extractor to finalize with a deliberately broken step, returning
+  # the captured log. `opts` are extra extractor options (`remux_fun` etc).
+  defp finalize_broken(camera, config, frags, event, finalized, opts) do
+    test_pid = self()
+    {config_opts, opts} = Keyword.split(opts, [:remux_clips])
+    config = struct!(config, config_opts)
+
+    pid =
+      start_supervised!(
+        {EventExtractor,
+         [
+           camera: camera,
+           event: event,
+           config: config,
+           snapshot_fun: fn row, _cfg -> send(test_pid, {:snapshot_requested, row.id}) end
+         ] ++ opts},
+        id: {:extractor, event.id}
+      )
+
+    ref = Process.monitor(pid)
+    assert %{status: :active} = wait_row(event.id)
+    Enum.each(Enum.take(frags, 2), &RingBuffer.put_fragment(camera.id, &1))
+
+    capture_log(fn ->
+      EventExtractor.finalize(pid, finalized)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
+    end)
+  end
+
   test "crash mid-event leaves an active row that reconciliation marks partial",
        %{camera: camera, config: config, frags: frags} do
     Enum.each(Enum.take(frags, 2), &RingBuffer.put_fragment(camera.id, &1))
@@ -195,6 +490,10 @@ defmodule Cairn.EventExtractorTest do
     summary = Reconciler.run(config)
     assert summary.partialed == 1
     assert %{status: :partial} = Events.get(event.id)
+
+    # a half-written clip is not a ready one: neither the crash nor the
+    # cleanup may claim the media landed
+    refute_artifacts(camera.id)
   end
 
   test "reconciliation deletes rows with missing files and adopts orphans",
@@ -219,6 +518,79 @@ defmodule Cairn.EventExtractorTest do
     assert orphan.status == :partial
     assert orphan.camera_id == camera.id
     assert orphan.bytes == 8
+
+    # adopting a clip found on disk is bookkeeping, not an artifact landing
+    refute_artifacts(camera.id)
+  end
+
+  # `Cairn.Boot` is `:transient`: a failure in one of its later sync steps
+  # re-runs reconciliation with cameras — and extractors — already live. Disk
+  # is truth only for files nobody is writing; deleting or partialing a row out
+  # from under a live extractor makes it announce a false clip failure for a
+  # clip that is perfectly fine.
+  test "reconciliation leaves a row whose extractor is still recording alone",
+       %{camera: camera, config: config, frags: frags} do
+    event = new_event(camera)
+    test_pid = self()
+
+    pid =
+      start_supervised!(
+        {EventExtractor,
+         camera: camera,
+         event: event,
+         config: config,
+         snapshot_fun: fn row, _cfg -> send(test_pid, {:snapshot_requested, row.id}) end}
+      )
+
+    ref = Process.monitor(pid)
+    assert %{status: :active} = wait_row(event.id)
+    Enum.each(Enum.take(frags, 2), &RingBuffer.put_fragment(camera.id, &1))
+    wait_until(fn -> :sys.get_state(pid).fragments == 2 end)
+
+    assert %{deleted: 0, partialed: 0, adopted: 0} = Reconciler.run(config)
+    assert %{status: :active} = Events.get(event.id)
+
+    # and the event still finalizes into a ready clip, not a false failure
+    EventExtractor.finalize(pid, %{event | ended_at: DateTime.utc_now(), status: :finalized})
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
+
+    event_id = event.id
+    assert_receive {:event_clip_ready, %EventArtifact{event_id: ^event_id}}
+    refute_received {:event_clip_failed, _}
+  end
+
+  # Scoped to one camera: the `"events"` topic is global and a leftover timer
+  # in another test's aggregator can drop a foreign `event_ended` into this
+  # mailbox between the two messages an ordering assertion is comparing.
+  defp next_lifecycle(camera_id, timeout \\ 2_000) do
+    receive do
+      {kind, %Event{camera_id: ^camera_id}} = msg when kind in @lifecycle_kinds -> msg
+      {kind, %EventArtifact{camera_id: ^camera_id}} = msg when kind in @artifact_kinds -> msg
+    after
+      timeout -> flunk("no event lifecycle message for #{camera_id} within #{timeout}ms")
+    end
+  end
+
+  # No artifact kind was broadcast. The canary goes FIRST and is waited for:
+  # it travels the same topic through the same `EventArtifact.broadcast/2`, so
+  # a subscription that silently stopped working cannot make the refutes
+  # vacuous, and anything a producer sent before now is already ahead of it in
+  # this mailbox — which makes the refutes "nothing arrived up to this point"
+  # rather than "nothing has arrived yet", even if a producer later grows an
+  # async step.
+  defp refute_artifacts(camera_id) do
+    EventArtifact.broadcast(:event_clip_ready, %EventArtifact{
+      event_id: "canary",
+      camera_id: camera_id,
+      path: "/canary.mp4",
+      bytes: 1
+    })
+
+    assert_receive {:event_clip_ready, %EventArtifact{event_id: "canary"}}
+
+    Enum.each(@artifact_kinds, fn kind ->
+      refute_received {^kind, %EventArtifact{camera_id: ^camera_id}}
+    end)
   end
 
   defp wait_row(id, attempts \\ 100) do
