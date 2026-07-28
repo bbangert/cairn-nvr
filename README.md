@@ -24,10 +24,12 @@ closes it. Details in `docs/architecture.md`.
 
 - **Live view**: MSE over a Phoenix channel (default), HLS fallback,
   WebRTC for sub-second latency.
-- **Plugins**: any language — H.264 RTP in, ndjson out. One process per
-  camera, or one shared "group" process serving several cameras when the
-  accelerator can only be held by one process (`docs/plugin-contract.md`;
-  a mock plugin and a Python CPU reference implementation ship in-tree).
+- **Plugins**: any language — H.264 RTP in, ndjson out, stream lifecycle
+  back on stdin. One process per camera, or one shared "group" process
+  serving several cameras when the accelerator can only be held by one
+  process. The wire protocol is [`docs/plugin-contract.md`](docs/plugin-contract.md);
+  `plugins/cairn-detect` (Rust, hardware decode, ONNX) is the reference
+  implementation and a mock plugin ships in-tree for tests.
 - **Retention**: per-label day counts, plus emergency cleanup that
   deletes oldest events when disk runs low.
 
@@ -106,9 +108,9 @@ Migrations run at boot. A systemd unit example lives in
 
 Toolchain is pinned in `mise.toml` (`mise install`), or open the repo in
 the **devcontainer** (`.devcontainer/`) which brings Erlang/Elixir via
-mise plus ffmpeg, sqlite3, inotify-tools, and Python for the reference
-plugin — `postCreate` runs `mix setup` and copies a starter `config.yml`.
-The first container start compiles Erlang from source (one-time).
+mise plus ffmpeg, sqlite3 and inotify-tools — `postCreate` runs `mix setup`
+and copies a starter `config.yml`. The first container start compiles
+Erlang from source (one-time).
 
 `mix check` = compile with warnings-as-errors, format check, credo,
 tests. CI additionally runs `mix dialyzer` and `mix sobelow --skip
@@ -116,5 +118,8 @@ tests. CI additionally runs `mix dialyzer` and `mix sobelow --skip
 ffmpeg, fixture-loop camera, mock plugin) runs with
 `mix test --include integration`.
 
-Docs: `docs/architecture.md` · `docs/plugin-contract.md` ·
-`docs/design-handoff.md` · `docs/frigate_comparison.md`
+Docs: [`docs/architecture.md`](docs/architecture.md) ·
+[`docs/plugin-contract.md`](docs/plugin-contract.md) (plugin wire protocol
+v1) · [`docs/ha-api.md`](docs/ha-api.md) ·
+[`docs/design-handoff.md`](docs/design-handoff.md) ·
+[`docs/frigate_comparison.md`](docs/frigate_comparison.md)

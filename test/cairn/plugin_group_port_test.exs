@@ -512,6 +512,65 @@ defmodule Cairn.PluginGroupPortTest do
     assert :sys.get_state(pid).drops == %{stale_epoch: 1, sequence_gap: 3}
   end
 
+  test "an epoch change re-baselines that member's sequence, and only that member's" do
+    a = camera("gp_seqep_a_#{System.unique_integer([:positive])}")
+    b = camera("gp_seqep_b_#{System.unique_integer([:positive])}")
+
+    a_first = StreamEpochs.new_epoch(a.id, :started)
+    b_epoch = StreamEpochs.new_epoch(b.id, :started)
+
+    # a plugin that emits nothing: every line below is fed by hand, so the
+    # epoch change lands at an exact point in the stream rather than wherever
+    # the shell's output happens to be
+    pid = start_group_port([a, b], command: "exec sleep 30", aggregator: self())
+    port = :sys.get_state(pid).port
+    feed = fn line -> send(pid, {port, {:data, {:eol, line}}}) end
+
+    a_id = a.id
+    b_id = b.id
+
+    feed.(v1_line(a.id, a_first, 0, [object("person", 0.9)]))
+    feed.(v1_line(b.id, b_epoch, 0, [object("person", 0.9)]))
+
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^a_id}, _w, %Observation{sequence: 0}}},
+                   5_000
+
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^b_id}, _w, %Observation{sequence: 0}}},
+                   5_000
+
+    a_second = StreamEpochs.new_epoch(a.id, :stall_bounce)
+
+    # a's last line under the retired epoch, refused as stale: it consumed
+    # sequence 1 and no accepted line ever will, so counting it again as a
+    # lost frame would describe something that did not happen
+    feed.(v1_line(a.id, a_first, 1, [object("person", 0.9)]))
+    feed.(v1_line(a.id, a_second, 0, [object("person", 0.9)]))
+    # b never bounced: its own timeline is untouched and still gap-checked
+    feed.(v1_line(b.id, b_epoch, 1, [object("person", 0.9)]))
+
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^a_id}, _w, %Observation{sequence: 0}}},
+                   5_000
+
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^b_id}, _w, %Observation{sequence: 1}}},
+                   5_000
+
+    assert :sys.get_state(pid).drops == %{stale_epoch: 1}
+
+    # and a forward jump *within* an epoch is still a gap for the member that
+    # made it
+    feed.(v1_line(b.id, b_epoch, 4, [object("person", 0.9)]))
+
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^b_id}, _w, %Observation{sequence: 4}}},
+                   5_000
+
+    assert :sys.get_state(pid).drops == %{stale_epoch: 1, sequence_gap: 2}
+  end
+
   test "a v1 hello and status route through the group" do
     a = camera("gp_v1_hs_a_#{System.unique_integer([:positive])}")
     b = camera("gp_v1_hs_b_#{System.unique_integer([:positive])}")

@@ -1,4 +1,4 @@
-//! Cairn detection plugin: H.264 RTP in, contract ndjson out.
+//! Cairn detection plugin: H.264 RTP in, protocol v1 ndjson out.
 //!
 //! See `docs/plugin-contract.md`. Cairn appends the arguments of one of the
 //! two contract variants to whatever command it is configured with; the model
@@ -9,7 +9,13 @@
 //!     it (`run_single` below).
 //!   * multiplexed: `--cameras-json` — one process for a whole plugin group,
 //!     where a member's silence is normal and never exits ([`multiplex`]).
+//!
+//! Both directions of the protocol are live in both modes: detections go out
+//! on stdout, and Cairn's per-camera stream epochs come in on stdin
+//! ([`control`]). stdout carries protocol lines and nothing else — every
+//! diagnostic in this crate goes to stderr, where Cairn logs it.
 
+mod control;
 mod decode;
 mod emit;
 mod glibc_compat;
@@ -18,8 +24,8 @@ mod infer;
 mod multiplex;
 mod rtp;
 
-use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::{anyhow, Context, Result};
@@ -27,7 +33,9 @@ use clap::Parser;
 use crossbeam_channel::{bounded, Receiver};
 use rsmpeg::ffi;
 
+use control::Streams;
 use decode::{DecoderKind, Sample};
+use emit::Publisher;
 use infer::{Detector, InputSize, Labels, ScoreFloors};
 
 #[derive(Parser, Debug)]
@@ -89,6 +97,9 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+    // Before the model load, which is seconds: the host logs the hello and
+    // checks that protocol 1 is in `supported_versions`.
+    emit::stdout_line(&emit::hello_line())?;
 
     match args.cameras_json.as_deref() {
         Some(json) => run_multiplexed(&args, json),
@@ -96,9 +107,27 @@ fn run() -> Result<()> {
     }
 }
 
+/// The control thread, started before anything slow.
+///
+/// Cairn writes `stream.started` for every camera as soon as it spawns us,
+/// with `:nosuspend` — an unread pipe loses those announcements rather than
+/// queueing them, and a lost epoch means every line that camera produces is
+/// dropped host-side until the next restart. So stdin is drained from the
+/// first moment, all the way through the model load.
+fn start_control<'a>(camera_ids: impl IntoIterator<Item = &'a str>) -> Result<Arc<Streams>> {
+    let streams = Arc::new(Streams::new(camera_ids));
+    control::spawn_reader(Arc::clone(&streams))?;
+    Ok(streams)
+}
+
 /// One process, a whole plugin group: see [`multiplex`] for the error policy.
 fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
     let specs = multiplex::parse_specs(cameras_json)?;
+    let streams = start_control(specs.iter().map(|spec| spec.id.as_str()))?;
+    // No `camera_id`: this is the process talking, and the group host applies
+    // an untargeted status to every member.
+    emit::stdout_line(&emit::status_line(None, "starting", Some("loading model")))?;
+
     let labels = Labels::load(args.labels.as_deref())?;
     // Before any decoder: every scaler and GPU filter graph is built for the
     // size the model resolves to.
@@ -117,8 +146,17 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
         detector.layout_summary(),
         args.decoder
     );
+    // The decoders open per member, and re-open forever after a drop, so the
+    // process is as ready as it gets once the model is loaded.
+    emit::stdout_line(&emit::status_line(None, "ready", None))?;
 
-    multiplex::run(&specs, args.decoder, detector, &labels)
+    multiplex::run(
+        &specs,
+        args.decoder,
+        detector,
+        &labels,
+        Publisher::new(streams),
+    )
 }
 
 /// One process, one camera. Any stream failure is fatal by design: Cairn
@@ -132,6 +170,13 @@ fn run_single(args: &Args) -> Result<()> {
     let udp_port = args
         .udp_port
         .expect("clap requires --udp-port unless --cameras-json is given");
+    let streams = start_control([camera_id.as_str()])?;
+    emit::stdout_line(&emit::status_line(
+        Some(&camera_id),
+        "starting",
+        Some("loading model"),
+    ))?;
+
     let floors = ScoreFloors::parse(args.min_score_json.as_deref().unwrap_or("{}"))?;
     let labels = Labels::load(args.labels.as_deref())?;
     // Before the stream opens: `decode::open` below needs the resolved size.
@@ -154,10 +199,14 @@ fn run_single(args: &Args) -> Result<()> {
     // overflows inside that window — which corrupts the stream rather than
     // merely dropping a sample. The decode loop must never block.
     let (tx, rx) = bounded::<Sample>(1);
-    let worker = thread::Builder::new()
-        .name("infer".into())
-        .spawn(move || infer_loop(&rx, detector, &labels, &floors, &camera_id))
-        .context("spawning the inference thread")?;
+    let mut publisher = Publisher::new(streams);
+    let worker = {
+        let camera_id = camera_id.clone();
+        thread::Builder::new()
+            .name("infer".into())
+            .spawn(move || infer_loop(&rx, detector, &labels, &floors, &camera_id, &mut publisher))
+            .context("spawning the inference thread")?
+    };
 
     let mut input = rtp::open_stream(udp_port)?;
     let (stream_index, _) = input
@@ -171,6 +220,8 @@ fn run_single(args: &Args) -> Result<()> {
             decode::open(args.decoder, &stream.codecpar(), input_size)?,
         )
     };
+
+    emit::stdout_line(&emit::status_line(Some(&camera_id), "ready", None))?;
 
     let decoded = decode::run(&mut input, stream_index, time_base, decoder.as_mut(), &tx);
     drop(tx);
@@ -190,13 +241,15 @@ fn infer_loop(
     labels: &Labels,
     floors: &ScoreFloors,
     camera_id: &str,
+    publisher: &mut Publisher,
 ) -> Result<()> {
-    let mut out = std::io::stdout().lock();
     while let Ok(sample) = rx.recv() {
         let dets = detector.detect(sample.tensor, labels, floors)?;
-        emit::emit(&mut out, camera_id, sample.pts_90k, &dets).context("writing to stdout")?;
+        if let Some(line) = publisher.line_for(camera_id, sample.pts_90k, sample.observed_at, &dets)
+        {
+            emit::stdout_line(&line).context("writing to stdout")?;
+        }
     }
-    out.flush().context("flushing stdout")?;
     Ok(())
 }
 

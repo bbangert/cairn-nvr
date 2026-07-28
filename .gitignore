@@ -48,8 +48,3 @@ config.yml
 
 # Dialyzer PLTs
 /priv/plts/
-
-# CPU reference plugin: local venv and model weights (coco.names is tracked)
-/plugins/cpu-reference/.venv/
-/plugins/cpu-reference/__pycache__/
-/plugins/cpu-reference/*.onnx

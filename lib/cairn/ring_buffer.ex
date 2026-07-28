@@ -93,6 +93,23 @@ defmodule Cairn.RingBuffer do
     GenServer.call(name(camera_id), {:fetch_recent, count})
   end
 
+  @doc """
+  `fetch_recent/2`, answering `nil` instead of exiting when the ring is gone.
+
+  A registry entry outlives its process: unregistration rides the async DOWN
+  the registry partition sends itself, so a `whereis` guard can hand back a
+  dead pid and the via-tuple call then exits `:noproc` in the caller. Viewer
+  transports treat a missing ring as "camera offline", which has to be a
+  return value — an exit turns it into a channel-join crash or a 500.
+  """
+  @spec fetch_recent_safe(String.t(), non_neg_integer()) ::
+          {:ok, %{init: binary() | nil, codec: String.t() | nil, fragments: [Fragment.t()]}} | nil
+  def fetch_recent_safe(camera_id, count) do
+    fetch_recent(camera_id, count)
+  catch
+    :exit, _reason -> nil
+  end
+
   defp name(camera_id), do: Cairn.Registry.via(camera_id, :ring_buffer)
 
   # -- server -----------------------------------------------------------------

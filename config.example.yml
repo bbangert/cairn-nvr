@@ -68,7 +68,9 @@ retention:
 # member's min_score or UDP port changes — never when a member camera stops.
 # plugins:
 #   detect:
-#     command: ./cairn-detect --model yolov10n.onnx --labels coco.names
+#     # the path to your built binary, resolved from Cairn's own working
+#     # directory — not from the plugin's
+#     command: plugins/cairn-detect/target/release/cairn-detect --model yolov10n.onnx --labels coco.names
 
 cameras: []
 #  - id: front_door
@@ -78,7 +80,7 @@ cameras: []
 #    # token names a group under `plugins:` above (undefined ⇒ config error).
 #    # An inline command of one token must therefore be a one-element list.
 #    # Receives RTP on an assigned UDP port, prints ndjson detections on stdout.
-#    plugin: ["python3", "plugins/cpu-reference/main.py"]
+#    plugin: ["plugins/cairn-detect/target/release/cairn-detect"]
 #    min_score:
 #      default: 0.5
 #      person: 0.6

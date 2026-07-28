@@ -1,7 +1,15 @@
 defmodule CairnWeb.Api.WhepControllerTest do
   # exercises the WHEP HTTP surface end-to-end (real ExWebRTC negotiation);
-  # touches the global WebRTC.Supervisor, so async: false
+  # touches the global WebRTC.Supervisor, so async: false.
+  #
+  # async: false is also load-bearing for a second reason: the stale-entry test
+  # suspends `Cairn.Registry`'s partition, a process the whole application
+  # shares. It is hermetic only because ExUnit runs every async module to
+  # completion before any sync one, so nothing else is registering while the
+  # partition is down. Do not flip this file to async: true.
   use CairnWeb.ConnCase, async: false
+
+  import Cairn.RegistryHelpers, only: [suspend_registry_reaping: 0]
 
   alias ExWebRTC.PeerConnection
 
@@ -71,6 +79,34 @@ defmodule CairnWeb.Api.WhepControllerTest do
 
     del2 = delete(conn, location)
     assert json_response(del2, 404)
+  end
+
+  test "404s a DELETE for an id that never existed", %{conn: conn} do
+    assert json_response(delete(conn, "/api/webrtc/never-existed"), 404)
+  end
+
+  # Registry unregistration rides the async EXIT the registry partition sends
+  # itself, so a `whereis` right after a teardown can still hand back the dead
+  # session. Suspending the partition holds that window open deterministically —
+  # under load it opened on its own and the repeat DELETE answered 204.
+  #
+  # The window is opened before the *first* DELETE on purpose: that teardown is
+  # the only thing that can create the stale entry.
+  test "repeat DELETE 404s while the registry still lists the dead session", %{conn: conn} do
+    post_conn = sdp_post(conn, "/api/cameras/cam_a/webrtc", nontrickle_offer())
+    assert post_conn.status == 201
+    assert [location] = get_resp_header(post_conn, "location")
+    whep_id = Path.basename(location)
+
+    suspend_registry_reaping()
+
+    assert response(delete(conn, location), 204)
+
+    pid = Cairn.Registry.whereis(whep_id, :whep)
+    assert is_pid(pid)
+    refute Process.alive?(pid)
+
+    assert json_response(delete(conn, location), 404)
   end
 
   test "accepts a JSON {sdp} offer as well", %{conn: conn} do

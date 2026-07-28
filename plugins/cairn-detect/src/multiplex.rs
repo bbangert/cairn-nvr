@@ -14,7 +14,6 @@
 //! restart of the whole group).
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,7 +24,7 @@ use rsmpeg::ffi;
 use serde::Deserialize;
 
 use crate::decode::{self, DecoderKind, Sample, SampleSink};
-use crate::emit;
+use crate::emit::{self, Publisher};
 use crate::infer::{Detector, InputSize, Labels, ScoreFloors};
 use crate::rtp;
 
@@ -76,6 +75,7 @@ pub fn run(
     kind: DecoderKind,
     detector: Detector,
     labels: &Labels,
+    publisher: Publisher,
 ) -> Result<()> {
     let floors = floors_for(specs);
     // One resolved size for the whole group: the members share the detector,
@@ -93,7 +93,7 @@ pub fn run(
             .with_context(|| format!("spawning the decode thread for camera {}", spec.id))?;
     }
 
-    infer_loop(&slots, specs, &floors, detector, labels)
+    infer_loop(&slots, specs, &floors, detector, labels, publisher)
 }
 
 /// Open -> decode -> log -> re-open, forever. Never returns.
@@ -167,16 +167,19 @@ fn infer_loop(
     floors: &[ScoreFloors],
     mut detector: Detector,
     labels: &Labels,
+    mut publisher: Publisher,
 ) -> Result<()> {
-    let mut out = std::io::stdout().lock();
-
     for (index, sample) in Slots::new(slots) {
+        let camera_id = &specs[index].id;
         let dets = detector.detect(sample.tensor, labels, &floors[index])?;
-        emit::emit(&mut out, &specs[index].id, sample.pts_90k, &dets)
-            .context("writing to stdout")?;
+        // The epoch gate is per member: a camera Cairn has not announced yet
+        // (or has stopped) emits nothing while its neighbours keep going.
+        if let Some(line) = publisher.line_for(camera_id, sample.pts_90k, sample.observed_at, &dets)
+        {
+            emit::stdout_line(&line).context("writing to stdout")?;
+        }
     }
 
-    out.flush().context("flushing stdout")?;
     // Only reachable once every decode thread is gone, which they never do on
     // their own — so this is a real fault worth restarting the group for.
     bail!("every camera stream is gone")

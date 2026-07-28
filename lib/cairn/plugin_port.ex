@@ -274,21 +274,32 @@ defmodule Cairn.PluginPort do
   # A gap means frames were lost between plugin and host — counted, never a
   # reason to drop the line that revealed it. It shares the drop counters so a
   # plugin that skips every other sequence cannot outrun the log rate limit.
+  #
+  # The baseline is held together with the epoch it was observed under, and a
+  # new epoch re-baselines instead of comparing: an epoch is a new sequence
+  # timeline (the contract lets a plugin restart the counter at 0 for each
+  # one), and the plugin's last line under the retired epoch — refused as
+  # `:stale_epoch` — consumed a number that no accepted line will ever
+  # account for. Comparing across the boundary reports that refusal a second
+  # time as a lost frame, which is not what happened.
   defp note_sequence(state, %Observation{sequence: nil}), do: state
 
-  defp note_sequence(%{last_sequence: last} = state, %Observation{sequence: sequence})
-       when is_integer(last) and sequence > last + 1 do
+  defp note_sequence(
+         %{last_sequence: {epoch, last}} = state,
+         %Observation{epoch: epoch, sequence: sequence}
+       )
+       when sequence > last + 1 do
     gap = sequence - last - 1
 
     :telemetry.execute([:cairn, :plugin, :sequence_gap], %{count: gap}, %{
       camera_id: state.camera.id
     })
 
-    %{note_drops(state, gap, :sequence_gap) | last_sequence: sequence}
+    %{note_drops(state, gap, :sequence_gap) | last_sequence: {epoch, sequence}}
   end
 
-  defp note_sequence(state, %Observation{sequence: sequence}),
-    do: %{state | last_sequence: sequence}
+  defp note_sequence(state, %Observation{epoch: epoch, sequence: sequence}),
+    do: %{state | last_sequence: {epoch, sequence}}
 
   defp forward(state, observation) do
     aggregator = Keyword.get(state.opts, :aggregator, Cairn.DetectionAggregator)

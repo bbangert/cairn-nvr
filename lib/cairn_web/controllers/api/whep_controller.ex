@@ -31,14 +31,27 @@ defmodule CairnWeb.Api.WhepController do
     end
   end
 
+  # The supervisor, not the registry, decides whether this DELETE tore anything
+  # down. A Registry entry outlives its process briefly — unregistration rides
+  # the async DOWN/EXIT the registry partition sends itself — so a lookup right
+  # after a teardown still hands back the dead pid, and a repeat DELETE would
+  # answer 204 for a session that is already gone. `terminate_child/2` removes
+  # the child from supervisor state in the same `handle_call` return that
+  # replies, so a repeat DELETE is deterministically `{:error, :not_found}`.
+  #
+  # That is not total precision. A DELETE racing the session's *own* exit (the
+  # connect-deadline reap, a peer connection going `:failed`/`:closed`) can be
+  # dequeued ahead of the child's EXIT: `monitor_child/1`'s `receive ... after 0`
+  # consumes the queued EXIT, `{:error, :normal}` is dropped for a `:temporary`
+  # child, and the reply is still `:ok` → 204 for a session already gone.
+  # Defensible for DELETE — the resource is gone either way — but it is a 204,
+  # not a 404.
   def delete(conn, %{"resource_id" => whep_id}) do
-    case Cairn.Registry.whereis(whep_id, :whep) do
-      nil ->
-        send_error(conn, 404, "unknown session")
-
-      pid ->
-        DynamicSupervisor.terminate_child(Supervisor, pid)
-        send_resp(conn, 204, "")
+    with pid when is_pid(pid) <- Cairn.Registry.whereis(whep_id, :whep),
+         :ok <- DynamicSupervisor.terminate_child(Supervisor, pid) do
+      send_resp(conn, 204, "")
+    else
+      _ -> send_error(conn, 404, "unknown session")
     end
   end
 

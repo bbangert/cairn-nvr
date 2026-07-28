@@ -138,7 +138,7 @@ the connection. Event kinds:
 | `event_clip_ready` / `event_clip_failed` | artifact object (below), with `clip_url` |
 | `event_snapshot_ready` / `event_snapshot_failed` | artifact object (below), with `snapshot_url` |
 | `track_started` / `track_updated` / `track_ended` | track object (below) |
-| `camera_status` | `{camera_id, status, probe, plugin_status}` |
+| `camera_status` | `{camera_id, status, probe, plugin_status}` — `plugin_status` is the plugin's own `{state, detail, fps}` ([`plugin.status`](plugin-contract.md#pluginstatus)), `null` until it reports one |
 | `camera_control` | `{camera_id, detection_enabled, recording_enabled, min_score}` |
 | `disk_alert` | `{active, free_mb, threshold_mb}` |
 
@@ -220,7 +220,9 @@ Recommended client flow:
 A **track** is one physical object followed through time. Cairn assigns the
 identity itself (IoU on the detections) unless the plugin declares the
 `object_tracking` capability, in which case the plugin's own ids are honoured
-and mapped onto ULIDs.
+and mapped onto ULIDs. The producing side of this — who owns identity, how it
+is scoped, and what bounds it — is
+[`docs/plugin-contract.md` → Track identity](plugin-contract.md#track-identity).
 
 ```json
 {
@@ -264,7 +266,10 @@ Same schema for all three kinds:
   SSE stream reconnecting after a Cairn restart as the end of every track you
   are holding, not just the ones you were told about.
 
-- `bbox` is `[x, y, w, h]`, normalized 0..1, origin top-left.
+- `bbox` is `[x, y, w, h]`, normalized 0..1, origin top-left, y increasing
+  **downward** — deliberately not ONVIF's centre-origin, y-up frame. The
+  conversion and the reasoning are in
+  [`docs/plugin-contract.md` → Geometry](plugin-contract.md#geometry).
 - `source` is `"host"` or `"plugin"`; `plugin_track_id` is the plugin's own id
   when `source` is `"plugin"`, else `null`.
 - `score` is the latest observation, `best_score` the best over the track's life.

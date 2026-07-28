@@ -289,9 +289,15 @@ defmodule Cairn.DetectionAggregator do
     end
   end
 
+  # `:noproc` is a clean finish, not a crash. `restore_from_checkpoint/1` can
+  # monitor a pid the registry still lists but whose process is already gone
+  # (unregistration rides the async DOWN the partition sends itself), and
+  # `Process.monitor/1` on a corpse answers `:noproc` immediately. Treating it
+  # as a crash logs a cleanly finalised event as crashed and re-announces it as
+  # `:partial` in the event index.
   def handle_info({:DOWN, _ref, :process, pid, reason}, state) do
     case Enum.find(state.cameras, fn {_id, cam} -> cam.extractor == pid end) do
-      {camera_id, %{event: %Event{} = event} = cam} when reason != :normal ->
+      {camera_id, %{event: %Event{} = event} = cam} when reason not in [:normal, :noproc] ->
         Logger.warning("event #{event.id}: extractor crashed (#{inspect(reason)})")
         EventCheckpoint.delete(camera_id)
         Event.broadcast(:event_ended, %{event | status: :partial, ended_at: now()})
@@ -522,6 +528,9 @@ defmodule Cairn.DetectionAggregator do
         # follows clears the camera silently, which is only correct because the
         # aggregator broadcasts `:event_ended` *before* the finalize cast (see
         # `maybe_finalize/4`) — the pre-crash aggregator already announced it.
+        # Possibly not even alive: the entry may be a corpse the registry has
+        # not reaped yet, in which case the monitor answers `:noproc`, which
+        # `handle_info/2` treats as the same clean finish.
         pid ->
           Process.monitor(pid)
           cam = %{new_cam() | event: event, extractor: pid}

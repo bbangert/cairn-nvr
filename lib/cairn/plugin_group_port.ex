@@ -322,15 +322,25 @@ defmodule Cairn.PluginGroupPort do
   # A gap means frames were lost between plugin and host — counted, never a
   # reason to drop the line that revealed it. It shares the drop counters so a
   # plugin that skips every other sequence cannot outrun the log rate limit.
+  #
+  # Each member's baseline is held together with the epoch it was observed
+  # under, and a new epoch re-baselines instead of comparing: an epoch is a
+  # new sequence timeline (the contract lets a plugin restart the counter at 0
+  # for each one), and that member's last line under the retired epoch —
+  # refused as `:stale_epoch` — consumed a number no accepted line will ever
+  # account for. Comparing across the boundary reports that refusal a second
+  # time as a lost frame, which is not what happened.
   defp note_sequence(state, %Observation{sequence: nil}), do: state
 
-  defp note_sequence(state, %Observation{camera_id: camera_id, sequence: sequence} = observation) do
+  defp note_sequence(state, %Observation{} = observation) do
+    %Observation{camera_id: camera_id, epoch: epoch, sequence: sequence} = observation
+
     case Map.get(state.last_sequences, camera_id) do
-      last when is_integer(last) and sequence > last + 1 ->
+      {^epoch, last} when sequence > last + 1 ->
         note_gap(state, observation, sequence - last - 1)
 
-      _first_or_reset ->
-        put_in(state.last_sequences[camera_id], sequence)
+      _first_or_new_epoch ->
+        put_in(state.last_sequences[camera_id], {epoch, sequence})
     end
   end
 
@@ -340,7 +350,7 @@ defmodule Cairn.PluginGroupPort do
     })
 
     state = note_drops(state, gap, :sequence_gap, preview(observation.camera_id))
-    put_in(state.last_sequences[observation.camera_id], observation.sequence)
+    put_in(state.last_sequences[observation.camera_id], {observation.epoch, observation.sequence})
   end
 
   # The codec bounds every field of `hello`, and these are logged through

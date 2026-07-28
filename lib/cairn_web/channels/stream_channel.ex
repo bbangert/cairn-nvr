@@ -22,10 +22,15 @@ defmodule CairnWeb.StreamChannel do
   @impl true
   def join("camera:" <> camera_id, _params, socket) do
     # 3 fragments (~6s) of backlog lets the client start with a cushion
-    # instead of stalling at the live edge until the next fragment lands
+    # instead of stalling at the live edge until the next fragment lands.
+    #
+    # `fetch_recent_safe/2` and not `fetch_recent/2`: the whereis below can hand
+    # back a ring the registry has not reaped yet, and a via-tuple call on a
+    # dead pid exits — this `else` matches values, so the join would crash
+    # instead of answering "camera offline".
     with {:ok, _cam} <- Cairn.Config.Server.camera(camera_id),
          ring when is_pid(ring) <- Cairn.Registry.whereis(camera_id, :ring_buffer),
-         {:ok, %{codec: codec} = data} <- RingBuffer.fetch_recent(camera_id, 3) do
+         {:ok, %{codec: codec} = data} <- RingBuffer.fetch_recent_safe(camera_id, 3) do
       Phoenix.PubSub.subscribe(Cairn.PubSub, RingBuffer.topic(camera_id))
       send(self(), {:after_join, data})
       {:ok, %{codec: codec}, assign(socket, :camera_id, camera_id)}
@@ -53,7 +58,7 @@ defmodule CairnWeb.StreamChannel do
 
   def handle_info({:init_segment, _meta}, socket) do
     # ffmpeg respawned: pts restart, client must reset its MediaSource
-    case RingBuffer.fetch_recent(socket.assigns.camera_id, 0) do
+    case RingBuffer.fetch_recent_safe(socket.assigns.camera_id, 0) do
       {:ok, %{init: init}} when is_binary(init) -> push(socket, "init", {:binary, init})
       _ -> :noop
     end
