@@ -26,13 +26,23 @@ forward compatibility is one-directional on the host too.
                     y + h <= 1.0001
           - "observation_kind": optional, "detected" or "tracked"
   "plugin.hello"
-      - "hello" (or the envelope itself) with a "name" and a
-        "supported_versions" list that includes 1
+      - "hello" (or the envelope itself) with:
+          - "name":    str, 1..64 bytes, no control characters
+          - "version": optional, same rule as "name"
+          - "supported_versions": list that includes 1
   "plugin.status"
-      - "status" (or the envelope itself) with a non-empty "state" string
+      - "status" (or the envelope itself) with:
+          - "state":  str, 1..32 bytes, no control characters
+          - "detail": optional str, <= 256 bytes, no control characters
+          - "fps":    optional number, 0..10000
 
-The raw line must be <= 8192 bytes (UTF-8 encoded, excluding the trailing
-newline) whatever its type.
+The raw line must be <= 65536 bytes (UTF-8 encoded, excluding the trailing
+newline) whatever its type -- the contract's framing bound, which is what
+both host ports open a plugin with (`{:line, 65_536}`).
+
+Note that the host drops an over-cap `detail`/`fps` as a *field* and keeps
+the status, where this validator fails the line: a gate is stricter than the
+host on purpose, so a plugin does not ship a field that silently vanishes.
 
 A summary goes to stderr on EOF or SIGINT/SIGTERM: total/valid/invalid line
 counts (with up to 5 sample errors), the hello and the last status seen, a
@@ -56,12 +66,16 @@ import re
 import signal
 import sys
 
-MAX_LINE_BYTES = 8192
+MAX_LINE_BYTES = 65536
 MAX_OBJECTS = 64
 MAX_LABEL_BYTES = 64
 MAX_CAMERA_ID_BYTES = 256
 MAX_MAGNITUDE = 2**62
 MAX_TIME_BASE = 1_000_000_000
+MAX_HELLO_FIELD_BYTES = 64
+MAX_STATUS_STATE_BYTES = 32
+MAX_STATUS_DETAIL_BYTES = 256
+MAX_STATUS_FPS = 10_000
 EPS = 1e-4
 
 # RFC3339 with an explicit offset; the host parses with DateTime.from_iso8601,
@@ -70,6 +84,10 @@ RFC3339 = re.compile(
     r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$"
 )
 KINDS = ("detected", "tracked")
+# The host's @envelope_keys: routing/versioning, never part of a flat body.
+ENVELOPE_KEYS = frozenset(
+    ("spec", "version", "type", "camera_id", "stream_epoch", "sequence")
+)
 
 
 def fail(reason: str):
@@ -173,15 +191,38 @@ def validate_objects_line(obj):
 
 
 def payload(obj, key):
-    """A hello/status body may be nested under its type's key or sent flat."""
+    """A hello/status body may be nested under its type's key or sent flat.
+
+    The flat form drops the envelope's own routing/versioning fields first --
+    the host's @envelope_keys -- so a protocol "version" of 1 is not read as
+    the plugin's own version string.
+    """
     nested = obj.get(key)
-    return nested if isinstance(nested, dict) else obj
+    if isinstance(nested, dict):
+        return nested
+    return {k: v for k, v in obj.items() if k not in ENVELOPE_KEYS}
+
+
+def validate_bounded_str(value, field, low, high):
+    """A printable string of low..high bytes, the host's rule for these."""
+    if not isinstance(value, str):
+        fail(f"{field} missing/not str: {value!r}")
+    size = len(value.encode("utf-8"))
+    if not low <= size <= high:
+        fail(f"{field} is {size} bytes, outside {low}..{high}")
+    if not printable(value):
+        fail(f"{field} has control characters: {value!r}")
 
 
 def validate_hello(obj):
     hello = payload(obj, "hello")
-    if not isinstance(hello.get("name"), str) or not hello["name"]:
-        fail("hello.name missing/empty")
+    # the host drops an over-cap name/version as a field and keeps the hello;
+    # a plugin shipping one is still shipping a field nobody will ever see
+    validate_bounded_str(hello.get("name"), "hello.name", 1, MAX_HELLO_FIELD_BYTES)
+    if "version" in hello:
+        validate_bounded_str(
+            hello["version"], "hello.version", 1, MAX_HELLO_FIELD_BYTES
+        )
     versions = hello.get("supported_versions")
     if not isinstance(versions, list) or 1 not in versions:
         fail(f"hello.supported_versions does not include 1: {versions!r}")
@@ -189,9 +230,19 @@ def validate_hello(obj):
 
 def validate_status(obj):
     status = payload(obj, "status")
-    state = status.get("state")
-    if not isinstance(state, str) or not 1 <= len(state.encode("utf-8")) <= 32:
-        fail(f"status.state missing or not a 1..32-byte string: {state!r}")
+    validate_bounded_str(
+        status.get("state"), "status.state", 1, MAX_STATUS_STATE_BYTES
+    )
+    if "detail" in status:
+        validate_bounded_str(
+            status["detail"], "status.detail", 0, MAX_STATUS_DETAIL_BYTES
+        )
+    if "fps" in status:
+        fps = status["fps"]
+        if not is_number(fps):
+            fail(f"status.fps not numeric: {fps!r}")
+        if not 0 <= fps <= MAX_STATUS_FPS:
+            fail(f"status.fps outside 0..{MAX_STATUS_FPS}: {fps!r}")
 
 
 def validate_line(raw: bytes):

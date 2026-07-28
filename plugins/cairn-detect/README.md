@@ -110,8 +110,9 @@ named group under `plugins:` and point cameras at it by name — see
 ## The wire protocol
 
 stdout carries protocol v1 ndjson and nothing else — one JSON object per
-line, flushed as it is written, capped at 8192 bytes. Every diagnostic goes
-to stderr, where Cairn logs it. Three message types leave this plugin:
+line, flushed as it is written, capped at the contract's 65 536 bytes. Every
+diagnostic goes to stderr, where Cairn logs it. Three message types leave
+this plugin:
 
 ```jsonc
 // once, before the model load
@@ -565,17 +566,31 @@ the per-backend filter strings; none need network, a model, or a GPU.
 - The hardware filter graph is built on the first sampled frame, not at open:
   it needs the decoder's frames pool, which does not exist until something has
   been decoded.
-- Output lines are capped at 8192 bytes by shedding the lowest-scoring
-  detections; an oversized line would be dropped by Cairn anyway. The object
-  list is cut at 64 first, and for a harsher reason: an over-cap `objects`
-  list is a contract violation that costs the *whole* line host-side, not
-  just the surplus.
+- Output lines are capped at the contract's 65 536 bytes — the bound both
+  host ports open us with (`{:line, 65_536}`) — by shedding the lowest-scoring
+  detections; an oversized line would be dropped by Cairn anyway. At 64
+  shaped objects a line runs to roughly 11 KB, so that shedding is a guard
+  rather than a working part of the path. The object list is cut at 64 first,
+  and for a harsher reason: an over-cap `objects` list is a contract
+  violation that costs the *whole* line host-side, not just the surplus.
 - stdout is locked per line, never held. `plugin.status` is written from the
   main thread while the inference thread is emitting frames, and a held
   `StdoutLock` would park one of them for the life of the process.
 - Labels are shaped where the detection is built: `--labels` is arbitrary
   user text, and the host refuses a label over 64 bytes or carrying control
-  characters. Trimming keeps the detection; sending it as-is loses it.
+  characters. Trimming keeps the detection; sending it as-is loses it. A
+  label with nothing printable left becomes `object` rather than `""`, which
+  the host refuses just as hard.
+- A `pts` outside the contract's ±2^62 is refused before it is emitted, with
+  a rate-limited stderr note and no sequence number consumed. It means the
+  rescale from the stream's time base overflowed (`av_rescale_q` saturates to
+  `i64::MIN`), and the host drops such a line whole — liveness signal
+  included — rather than just the field.
+- The control thread ending ends the process. EOF, a read error or a panic on
+  it means no epoch will ever change again, and a frozen epoch map turns into
+  every later line being dropped host-side as stale while this process keeps
+  the accelerator busy. Exiting non-zero is the recovery: both host ports
+  respawn on exit and neither watches for a wedged plugin.
 - `observed_at` is stamped at the sample gate, not at emit time. A sample can
   wait behind a busy model pass, and the host uses this to place the frame on
   its timeline — stamping it late would fold our own latency into the

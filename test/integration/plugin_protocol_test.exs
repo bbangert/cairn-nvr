@@ -33,14 +33,17 @@ defmodule Cairn.PluginProtocolIntegrationTest do
   @moduletag :integration
   @moduletag timeout: 120_000
 
-  alias Cairn.Config.Camera
   alias Cairn.{CameraControl, Config, PluginGroupPort, PluginPort, StreamEpochs, Track}
+  alias Cairn.Config.Camera
   alias CairnWeb.Api.EventStreamController
 
   @mock Path.absname("priv/plugins/mock/mock_plugin.exs")
-  # Generous: the mock blocks until the host announces the replacement epoch,
-  # and this is only the deadline on that block giving up.
-  @epoch_wait_ms "20000"
+  # The host announces the replacement epoch synchronously, from this process,
+  # the moment `track_started` arrives — so this is slack for a loaded CI box,
+  # not a wait anything is expected to use. Sized well under the 30 s
+  # `assert_receive`s below: exceeding it halts the mock, which fails those
+  # assertions immediately instead of eating their budget.
+  @epoch_wait_ms "5000"
 
   setup do
     dir = Path.join(System.tmp_dir!(), "cairn_proto_#{System.unique_integer([:positive])}")
@@ -57,20 +60,26 @@ defmodule Cairn.PluginProtocolIntegrationTest do
 
       timeline =
         write_timeline(dir, [
+          # The only line accepted under the first epoch: the test mints the
+          # replacement the moment this one's track is published, and every
+          # entry after it waits for that mint. Scores are distinct so the
+          # final summary names which lines reached the track.
           %{at_ms: 0, pts: 90_000, dets: [det(0.90, "t1")]},
-          %{at_ms: 120, pts: 99_000, dets: [det(0.91, "t1")]},
           # Blocks until the host announces the replacement epoch, then emits
           # one line stamped with the epoch that just ended: a stale line the
           # host must refuse, produced deterministically rather than raced for.
           %{
-            at_ms: 240,
+            at_ms: 120,
             pts: 108_000,
             dets: [det(0.92, "t1")],
             await_epoch_change: true,
             epoch: "previous"
           },
-          # Same track id as before the cut. Identity must NOT carry over.
-          %{at_ms: 360, pts: 9_000, dets: [det(0.93, "t1")]}
+          # The same envelope and the same track id as the refused line, with
+          # a live epoch instead of a retired one. It is accepted, which is
+          # what makes the refusal above about the epoch and nothing else —
+          # and identity must NOT carry over.
+          %{at_ms: 240, pts: 9_000, dets: [det(0.93, "t1")]}
         ])
 
       camera = camera(camera_id, ["--timeline", timeline, "--object-tracking"])
@@ -109,6 +118,20 @@ defmodule Cairn.PluginProtocolIntegrationTest do
                       } = ended},
                      30_000
 
+      # What the refused line did *not* do, by score rather than by a counter:
+      # `best_score` is a monotone max with no throttle on it, the only line
+      # this track ever accepted carries 0.90, and both lines after it carry
+      # more. So the summary reads 0.90 exactly when nothing crossed the cut
+      # in either direction.
+      #
+      # Note what this cannot show: the aggregator ends live tracks on the
+      # epoch broadcast itself, so the summary is closed before the stale line
+      # is even emitted. A line refused *after* the cut could never have
+      # reached it, and the port's refusal is proven by the exact drops map
+      # below plus the next line — same shape, same track id, live epoch —
+      # being accepted.
+      assert ended.best_score == 0.90, "a post-boundary line reached the pre-boundary track"
+
       # ...and that is what a Home Assistant client actually receives.
       assert {:ok, frame} = EventStreamController.frame_for({:track_ended, ended})
       assert frame =~ "event: track_ended\n"
@@ -129,8 +152,12 @@ defmodule Cairn.PluginProtocolIntegrationTest do
       assert object_b != object_a
 
       # That post-boundary line was emitted after the stale one on the same
-      # stdout, so by now the port has already accounted for the stale line.
-      assert :sys.get_state(port).drops[:stale_epoch] >= 1
+      # stdout, so by now the port has already accounted for the stale line —
+      # and pinned exactly, because the classes a refusal is reported under
+      # are what an operator reads. The refused line consumed one of the
+      # plugin's sequence numbers; the epoch that replaced it starts a new
+      # sequence timeline, so that number is not also a lost frame.
+      assert :sys.get_state(port).drops == %{stale_epoch: 1}
 
       # The plugin was told, on stdin, in the documented order.
       log = File.read!(Path.join(Cairn.DataDir.log_dir(dir), "plugin-#{camera_id}.log"))
@@ -177,7 +204,12 @@ defmodule Cairn.PluginProtocolIntegrationTest do
       port = start_supervised!({PluginGroupPort, group: group, config: config})
 
       assert_receive {:track_started,
-                      %Track{camera_id: ^cam_a, object_id: object_a1, plugin_track_id: "ta"}},
+                      %Track{
+                        camera_id: ^cam_a,
+                        object_id: object_a1,
+                        plugin_track_id: "ta",
+                        epoch: ^epoch_a1
+                      }},
                      30_000
 
       assert_receive {:track_started,
@@ -197,15 +229,38 @@ defmodule Cairn.PluginProtocolIntegrationTest do
                         object_id: ^object_a1,
                         end_reason: :stream_reset,
                         epoch: ^epoch_a1
-                      }},
+                      } = ended_a},
                      30_000
+
+      # Per camera, which the group's own drop counters are not (see below):
+      # the only line this track accepted carries 0.90, and both cam_a lines
+      # after it carry more, so the summary reads 0.90 exactly when nothing
+      # crossed the cut in either direction. As in the per-camera test, this
+      # cannot show the *port's* refusal on its own — the aggregator closes
+      # the summary on the epoch broadcast, before the stale line is emitted.
+      assert ended_a.best_score == 0.90, "a post-boundary line reached the pre-boundary track"
+
+      # ...and that is what a Home Assistant client actually receives. The
+      # group path reaches the SSE boundary the same way the per-camera one
+      # does; these events arrive on `Cairn.Event.topic()`, which is the topic
+      # `CairnWeb.Api.EventStreamController` subscribes to.
+      assert {:ok, frame} = EventStreamController.frame_for({:track_ended, ended_a})
+      assert frame =~ "event: track_ended\n"
+      assert frame =~ ~s("end_reason":"stream_reset")
+      assert frame =~ ~s("camera_id":"#{cam_a}")
+      assert frame =~ object_a1
 
       assert_receive {:track_started,
                       %Track{camera_id: ^cam_a, object_id: object_a2, epoch: ^epoch_a2}},
                      30_000
 
       assert object_a2 != object_a1
-      assert :sys.get_state(port).drops[:stale_epoch] >= 1
+
+      # A group's drop counters are flat across its members — the camera
+      # appears only in the log detail — so this pins *what* was refused and
+      # how often, not whose it was. Only cam_a emits a stale line, and its
+      # `best_score` above is the per-camera half of the proof.
+      assert :sys.get_state(port).drops == %{stale_epoch: 1}
 
       # The other member kept its identity across its neighbour's boundary.
       # This message and cam_a's `track_ended` come from the same aggregator

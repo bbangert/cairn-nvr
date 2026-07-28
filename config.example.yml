@@ -68,7 +68,9 @@ retention:
 # member's min_score or UDP port changes — never when a member camera stops.
 # plugins:
 #   detect:
-#     command: ./cairn-detect --model yolov10n.onnx --labels coco.names
+#     # the path to your built binary, resolved from Cairn's own working
+#     # directory — not from the plugin's
+#     command: plugins/cairn-detect/target/release/cairn-detect --model yolov10n.onnx --labels coco.names
 
 cameras: []
 #  - id: front_door

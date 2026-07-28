@@ -147,20 +147,34 @@ impl Streams {
             Control::Ignored => return,
         };
 
-        let mut epochs = self.lock();
-        let Some(held) = epochs.get_mut(&camera_id) else {
-            eprintln!("control: ignoring a stream event for unserved camera {camera_id}");
-            return;
+        // The map moves first; the log line is written after the guard drops.
+        // `eprintln!` panics on a failed write, and stderr here is the host's
+        // append-redirect into a log file (ENOSPC, a rotated-away fd), so
+        // logging *before* the assignment would lose the very epoch it was
+        // announcing and freeze this camera on a retired one. A blocking
+        // write under the lock would also stall the inference thread, which
+        // takes the same lock once per frame.
+        let announcement = {
+            let mut epochs = self.lock();
+            match epochs.get_mut(&camera_id) {
+                None => Some(format!(
+                    "control: ignoring a stream event for unserved camera {camera_id}"
+                )),
+                Some(held) if started => {
+                    let changed = held.as_deref() != Some(epoch.as_str());
+                    *held = Some(epoch.clone());
+                    changed.then(|| format!("camera {camera_id}: stream epoch {epoch}"))
+                }
+                Some(held) if held.as_deref() == Some(epoch.as_str()) => {
+                    *held = None;
+                    Some(format!("camera {camera_id}: stream epoch {epoch} ended"))
+                }
+                Some(_stale_end) => None,
+            }
         };
 
-        if started {
-            if held.as_deref() != Some(epoch.as_str()) {
-                eprintln!("camera {camera_id}: stream epoch {epoch}");
-            }
-            *held = Some(epoch);
-        } else if held.as_deref() == Some(epoch.as_str()) {
-            eprintln!("camera {camera_id}: stream epoch {epoch} ended");
-            *held = None;
+        if let Some(message) = announcement {
+            eprintln!("{message}");
         }
     }
 
@@ -172,10 +186,31 @@ impl Streams {
 }
 
 /// Start the control thread. It owns stdin for the life of the process.
+///
+/// The thread ending — EOF, a read error, or a panic — ends the *process*.
+/// Without that the epoch map freezes: a stream bounce is never learned, and
+/// every line emitted afterwards is discarded host-side as `stale_epoch`
+/// while this process stays alive and keeps the accelerator busy. Neither
+/// `Cairn.PluginPort` nor `Cairn.PluginGroupPort` watches for that; both
+/// respawn on exit, which is why exiting is the recovery.
 pub fn spawn_reader(streams: Arc<Streams>) -> Result<()> {
     thread::Builder::new()
         .name("control".into())
-        .spawn(move || read_loop(&streams, std::io::stdin().lock()))
+        .spawn(move || {
+            // `catch_unwind` rather than `panic = "abort"`: the release
+            // profile is shared with the inference thread, whose panic is
+            // reported with a diagnostic worth keeping. `Streams::lock`
+            // absorbs poisoning, so nothing here is left unsound by an
+            // unwind.
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                read_loop(&streams, std::io::stdin().lock());
+            }))
+            .is_err();
+            let cause = if panicked { "panicked" } else { "stdin closed" };
+            eprintln!("control: control channel gone ({cause}), exiting so Cairn respawns us");
+            // Non-zero: this is an abnormal end, and the host logs the status.
+            std::process::exit(3);
+        })
         .context("spawning the control thread")?;
     Ok(())
 }
@@ -184,8 +219,8 @@ pub fn spawn_reader(streams: Arc<Streams>) -> Result<()> {
 ///
 /// A malformed line is logged and skipped: the host is trusted to frame its
 /// own writes, and one bad line must not cost every epoch announcement after
-/// it. Closed stdin ends the thread quietly — the host is on its way out, and
-/// the decode threads will notice their own way.
+/// it. Returning at all — closed stdin, or a read error — means no epoch will
+/// ever change again, which [`spawn_reader`] turns into a process exit.
 pub fn read_loop(streams: &Streams, input: impl BufRead) {
     let mut malformed: u64 = 0;
     for line in input.lines() {

@@ -32,6 +32,10 @@
 #     recently ended instead of the current one, i.e. deliberately emit a
 #     stale-epoch line the host must drop.
 #
+# Both are fatal (exit 3, with a stderr line) when what they need never
+# arrives: a mock that shrugs and emits something plausible instead turns a
+# host-side assertion into one that cannot fail.
+#
 # Protocol v1 is emitted by default: `plugin.hello`, `plugin.status`, then
 # `frame.objects` lines stamped with the `stream_epoch` this plugin was told
 # on stdin. `--v0` emits the original `{"pts", "dets"}` shape instead.
@@ -61,6 +65,7 @@ defmodule MockPlugin do
 
   @table :mock_plugin_epochs
   @previous :mock_plugin_previous_epochs
+  @consumed :mock_plugin_consumed_epochs
   @sequences :mock_plugin_sequences
 
   @doc "Public tables the stdin reader writes and the emitter reads."
@@ -68,6 +73,7 @@ defmodule MockPlugin do
   def new_tables do
     :ets.new(@table, [:named_table, :public, :set])
     :ets.new(@previous, [:named_table, :public, :set])
+    :ets.new(@consumed, [:named_table, :public, :set])
     :ets.new(@sequences, [:named_table, :public, :set])
     :ok
   end
@@ -84,13 +90,30 @@ defmodule MockPlugin do
     end
   end
 
-  @doc "The epoch most recently ended for this camera — a stale one, by definition."
+  @doc """
+  The epoch most recently ended for this camera — a stale one, by definition.
+
+  Fatal when there is none. A timeline entry asking for `epoch: "previous"`
+  before any stream ended is a test-authoring error, and the fabricated
+  `"unknown"` it used to return is refused host-side as `:stale_epoch` too —
+  so the test would pass while proving nothing about a real prior epoch.
+  """
   @spec previous_epoch(String.t()) :: String.t()
   def previous_epoch(camera_id) do
     case :ets.lookup(@previous, camera_id) do
-      [{^camera_id, epoch}] -> epoch
-      [] -> "unknown"
+      [{^camera_id, epoch}] ->
+        epoch
+
+      [] ->
+        die("no epoch has ended for #{camera_id}: nothing to stamp as `previous`")
     end
+  end
+
+  @doc "Loud and fatal: a mock that gives up quietly turns a red test green."
+  @spec die(String.t()) :: no_return()
+  def die(message) do
+    IO.puts(:stderr, "mock plugin: #{message}")
+    System.halt(3)
   end
 
   @doc "Reads control lines forever, recording the epoch of every stream.started."
@@ -132,42 +155,77 @@ defmodule MockPlugin do
   defp remember_previous(_camera_id, _epoch), do: :ok
 
   @doc """
-  Waits until every camera has an epoch, or the deadline passes.
+  Waits until every camera has an epoch.
 
   Emitting before the host has announced the stream is legal but pointless:
-  the epoch would not match and the host would drop the line.
+  the epoch would not match and the host would drop the line. The deadline is
+  fatal — a plugin that gives up and emits anyway produces lines the host
+  refuses for a *second* reason, which is a green test that proved nothing.
   """
   @spec await_epochs([String.t()], integer()) :: :ok
-  def await_epochs(_camera_ids, wait_ms) when wait_ms <= 0, do: :ok
-
   def await_epochs(camera_ids, wait_ms) do
-    if Enum.all?(camera_ids, &(epoch(&1) != "unknown")) do
-      :ok
-    else
-      Process.sleep(10)
-      await_epochs(camera_ids, wait_ms - 10)
-    end
+    # A monotonic deadline computed once: decrementing by the sleep interval
+    # drifts optimistically under load, since each turn costs the sleep plus
+    # its scheduling.
+    poll(
+      fn -> Enum.all?(camera_ids, &(epoch(&1) != "unknown")) end,
+      deadline(wait_ms),
+      10,
+      "no stream epoch for #{Enum.join(camera_ids, ", ")} after #{wait_ms}ms"
+    )
   end
 
   @doc """
   Blocks until this camera's stream has been *replaced* — a `stream.ended`
-  followed by a `stream.started` — at least once since this process started,
-  or the deadline passes.
+  followed by a `stream.started` — once more than the last satisfied wait for
+  this camera.
 
   Deliberately a state test, not an edge test: "the epoch differs from the one
   I sampled a moment ago" loses the replacement that landed while the emitter
-  was still working through earlier entries. Having a previous epoch *and* a
-  current one is monotonic, so a caller cannot arrive too late for it.
+  was still working through earlier entries. Recording which replacement was
+  consumed is what keeps a *second* wait in one timeline honest without giving
+  that up — the predicate stays level-triggered, it just moves on.
   """
   @spec await_epoch_change(String.t(), integer()) :: :ok
-  def await_epoch_change(_camera_id, wait_ms) when wait_ms <= 0, do: :ok
-
   def await_epoch_change(camera_id, wait_ms) do
-    if previous_epoch(camera_id) != "unknown" and epoch(camera_id) != "unknown" do
-      :ok
-    else
-      Process.sleep(5)
-      await_epoch_change(camera_id, wait_ms - 5)
+    consumed = consumed_change(camera_id)
+
+    poll(
+      fn -> changed?(camera_id, consumed) end,
+      deadline(wait_ms),
+      5,
+      "the epoch for #{camera_id} did not change within #{wait_ms}ms"
+    )
+
+    :ets.insert(@consumed, {camera_id, previous_epoch(camera_id)})
+    :ok
+  end
+
+  defp changed?(camera_id, consumed) do
+    ended = :ets.lookup(@previous, camera_id)
+    ended != [] and ended != [{camera_id, consumed}] and epoch(camera_id) != "unknown"
+  end
+
+  defp consumed_change(camera_id) do
+    case :ets.lookup(@consumed, camera_id) do
+      [{^camera_id, epoch}] -> epoch
+      [] -> nil
+    end
+  end
+
+  defp deadline(wait_ms), do: System.monotonic_time(:millisecond) + wait_ms
+
+  defp poll(predicate, deadline, interval_ms, timed_out) do
+    cond do
+      predicate.() ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        die(timed_out)
+
+      true ->
+        Process.sleep(interval_ms)
+        poll(predicate, deadline, interval_ms, timed_out)
     end
   end
 end

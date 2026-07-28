@@ -431,6 +431,58 @@ defmodule Cairn.PluginPortTest do
     assert :sys.get_state(pid).drops == %{stale_epoch: 1, sequence_gap: 3}
   end
 
+  test "an epoch change re-baselines the sequence instead of reporting a gap" do
+    id = "plug_seqep_#{System.unique_integer([:positive])}"
+    first = StreamEpochs.new_epoch(id, :started)
+
+    pid =
+      start_supervised!({
+        PluginPort,
+        # a plugin that emits nothing: every line below is fed by hand, so
+        # the epoch changes land at an exact point in the stream rather than
+        # wherever the shell's output happens to be
+        camera: camera(id),
+        config: config(),
+        index: 0,
+        command: "exec sleep 30",
+        aggregator: self()
+      })
+
+    port = :sys.get_state(pid).port
+    feed = fn line -> send(pid, {port, {:data, {:eol, line}}}) end
+
+    feed.(v1_line(id, first, 0, [object("person", 0.9)]))
+    feed.(v1_line(id, first, 1, [object("person", 0.9)]))
+    assert_receive {:"$gen_cast", {:detections, _cam, _p, %Observation{sequence: 0}}}, 5_000
+    assert_receive {:"$gen_cast", {:detections, _cam, _p, %Observation{sequence: 1}}}, 5_000
+
+    second = StreamEpochs.new_epoch(id, :source_lost)
+
+    # The plugin's last line under the retired epoch, refused as stale. It
+    # consumed sequence 2 and no accepted line ever will — reporting that as a
+    # lost frame on top of the refusal tells an operator about a gap that
+    # never happened.
+    feed.(v1_line(id, first, 2, [object("person", 0.9)]))
+    # A plugin that restarts its counter per epoch, which the contract allows.
+    feed.(v1_line(id, second, 0, [object("person", 0.9)]))
+    assert_receive {:"$gen_cast", {:detections, _cam, _p, %Observation{sequence: 0}}}, 5_000
+    assert :sys.get_state(pid).drops == %{stale_epoch: 1}
+
+    # …and a plugin that keeps it monotonic across the boundary instead is
+    # re-baselined the same way: the jump is another epoch's numbering, not a
+    # loss.
+    third = StreamEpochs.new_epoch(id, :stall_bounce)
+    feed.(v1_line(id, third, 12, [object("person", 0.9)]))
+    assert_receive {:"$gen_cast", {:detections, _cam, _p, %Observation{sequence: 12}}}, 5_000
+    assert :sys.get_state(pid).drops == %{stale_epoch: 1}
+
+    # Within one epoch a forward jump is still a gap: the re-baselining is
+    # scoped to the boundary, not a blanket amnesty.
+    feed.(v1_line(id, third, 14, [object("person", 0.9)]))
+    assert_receive {:"$gen_cast", {:detections, _cam, _p, %Observation{sequence: 14}}}, 5_000
+    assert :sys.get_state(pid).drops == %{stale_epoch: 1, sequence_gap: 1}
+  end
+
   test "hello and status reach the log and CameraStatus" do
     id = "plug_hello_#{System.unique_integer([:positive])}"
 

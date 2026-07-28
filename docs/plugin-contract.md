@@ -96,10 +96,13 @@ A plugin serving a group is configured with one argument instead — see
 ### Framing
 
 One JSON object per line on **stdout** (ndjson), flushed per line, at most
-**65 536 bytes (64 KiB) of content per line**, excluding the newline. A
-longer line is discarded whole — the truncated head is not parsed, and
-neither is the remainder. Anything on stdout that is not contract ndjson is
-dropped with a warning; logs go to [stderr](#logging).
+**65 536 bytes (64 KiB) of content per line**, excluding the newline. The
+bound is inclusive: Cairn reads with `{:line, 65_536}`, and a line of exactly
+65 536 content bytes still arrives whole — 65 537 is the first that does not
+(measured, not inferred). A longer line is discarded whole — the truncated
+head is not parsed, and neither is the remainder. Anything on stdout that is
+not contract ndjson is dropped with a warning; logs go to
+[stderr](#logging).
 
 ### The envelope
 
@@ -439,12 +442,16 @@ Rules, all of them enforced:
    camera and resync on the next keyframe.
 5. Epochs are strictly per camera and never shared. In a group, one member's
    epoch change must not reset anything belonging to another member.
-6. **You will never be told about an epoch older than one you have already
-   been given** for that camera. Announcements can race (Cairn's degraded
-   broadcast path has no ordering relation to its server's), so Cairn drops
-   an out-of-order older announcement rather than walking you backwards onto
-   a dead stream. A repeat of the epoch you already hold is likewise
-   suppressed — but treat a repeat as a no-op anyway.
+6. **You will never be told about an epoch minted in an earlier millisecond
+   than one you have already been given** for that camera. Announcements can
+   race (Cairn's degraded broadcast path has no ordering relation to its
+   server's), so Cairn drops an out-of-order older announcement rather than
+   walking you backwards onto a dead stream. The comparison is on the ULID's
+   10-character timestamp prefix, so two epochs minted in the *same*
+   millisecond count as one instant and the later announcement is applied —
+   in practice mints for one camera are an ffmpeg respawn plus backoff apart.
+   A repeat of the epoch you already hold is likewise suppressed — but treat
+   a repeat as a no-op anyway.
 7. A duplicate epoch is possible by design elsewhere in Cairn; idempotence on
    your side costs nothing.
 
@@ -472,9 +479,11 @@ process and Cairn is visible rather than silent.
 
 **Across an epoch boundary, both conventions are valid.** You may restart the
 counter at 0 for each new epoch, or keep it monotonic for the life of the
-camera. Cairn only ever looks for a forward jump, and a lower value
-re-baselines silently, so neither costs you a false gap.
-`plugins/cairn-detect` keeps it monotonic per camera.
+camera. Cairn re-baselines its own comparison when a camera's epoch changes —
+a new epoch is a new sequence timeline — so neither convention costs you a
+false gap, and neither does the line you had already emitted under the
+retired epoch (refused as `stale_epoch`, and never counted a second time as
+a lost frame). `plugins/cairn-detect` keeps it monotonic per camera.
 
 **Only accepted lines move the host's baseline.** A line Cairn refused — a
 stale epoch, a malformed field — never advances it. So if you suppress
@@ -508,8 +517,11 @@ Who decides identity depends on one capability:
 
 **Without `capabilities.object_tracking: true`,** `track_id` is ignored
 entirely. Cairn matches boxes host-side by greedy IoU (threshold 0.1) among
-live tracks of the same label. Nothing breaks if you send ids anyway — they
-are simply decoration.
+the live tracks *Cairn itself owns* of the same label. Nothing breaks if you
+send ids anyway — they are simply decoration. Tracks a plugin owns are never
+IoU candidates, which matters only if you turn the capability off mid-run:
+the tracks you owned until then are unmatchable afterwards and expire on
+`max_unseen_ms` rather than being adopted.
 
 **With it,** Cairn honours your ids and runs no box matching:
 
@@ -604,16 +616,17 @@ only that much.
 | ended-`track_id` memory | 4 096 per camera tracker | halved; older reuse goes unreported |
 | host IoU match threshold | 0.1 | below it, a new track is minted |
 | `track_updated` throttle | best-score improvement, or 1 000 ms | update not published |
-| respawn backoff | 1 s → 30 s, jittered | — |
+| respawn backoff | 1 s → 30 s base, ×0.5–1.5 jitter (≈0.5 s → ≈45 s) | — |
 | UDP ports per camera | 4 (`base + 4i` plugin, `+1` its RTCP) | — |
 
 ## What gets dropped
 
 Malformed input never crashes anything and never kills the plugin — but it
 also never detects anything. Every drop is counted per class, and the running
-totals are logged to the plugin's stderr log at most once every 5 s. Counters
-reset with your OS process, so a fixed plugin logs a fresh summary after its
-restart.
+totals are logged **by Cairn, to its own log**, at most once every 5 s — not
+to `{data_dir}/log/plugin-{camera}.log`, which is a redirect of *your* stderr
+and carries nothing Cairn writes. Counters reset with your OS process, so a
+fixed plugin logs a fresh summary after its restart.
 
 The classes you will actually see, and what they mean:
 
@@ -623,7 +636,7 @@ The classes you will actually see, and what they mean:
 | `not_an_object` | valid JSON, but not an object |
 | `unknown_spec` | `spec` present and not `"cairn.plugin"` |
 | `unsupported_version` | `version` present and not `1` |
-| `invalid_envelope` | `spec`/`version` fine, `type` missing or not a string |
+| `invalid_envelope` | `spec` fine, but `version` is missing or not an integer, or `type` is missing or not a string (a *present* `version` other than 1 is `unsupported_version` instead) |
 | `missing_camera_id` | group mode: `camera_id` absent or out of bounds |
 | `unknown_camera` | group mode: `camera_id` names no member of this group |
 | `invalid_stream_epoch` | `stream_epoch` missing or not a non-empty string |
@@ -703,7 +716,9 @@ command keep the per-camera contract alongside any groups.
 ```yaml
 plugins:
   detect:
-    command: ./cairn-detect --model yolov10n.onnx --labels coco.names
+    # the path to your built binary, resolved from Cairn's own working
+    # directory — not from the plugin's
+    command: plugins/cairn-detect/target/release/cairn-detect --model yolov10n.onnx --labels coco.names
 
 cameras:
   - id: front_door

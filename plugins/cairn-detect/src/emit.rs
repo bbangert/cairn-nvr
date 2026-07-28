@@ -21,7 +21,19 @@ use crate::control::Streams;
 
 /// Cairn drops any line longer than this, so a too-long line is a lost
 /// sample rather than a soft error — we shed detections to stay under it.
-pub const MAX_LINE_BYTES: usize = 8192;
+///
+/// This is the contract's framing bound (`docs/plugin-contract.md` §Framing):
+/// both host ports open the plugin with `{:line, 65_536}`.
+pub const MAX_LINE_BYTES: usize = 65_536;
+
+/// The host's `|pts| <= 2^62` bound. `av_rescale_q` saturates to `i64::MIN`
+/// on overflow, whose magnitude is past this, and the host drops the *whole*
+/// line for it — including the empty-`objects` liveness signal.
+pub const MAX_PTS: i64 = 4_611_686_018_427_387_904;
+
+/// What a label shapes down to when nothing printable survives. The host
+/// requires 1..64 bytes, so an empty label costs the detection outright.
+const FALLBACK_LABEL: &str = "object";
 
 /// Host cap on one frame's `objects`; an over-cap list drops the line there,
 /// so the list is cut here instead.
@@ -47,7 +59,7 @@ pub struct Det {
 
 // `observation_kind` is deliberately absent: the host defaults it to
 // "detected", which is the only kind this plugin produces, and 64 copies of
-// the field would cost ~1.9 KB of the 8 KB line budget.
+// the field would add ~1.9 KB per line for nothing.
 #[derive(Serialize)]
 struct Objects<'a> {
     spec: &'static str,
@@ -149,6 +161,9 @@ pub fn status_line(camera_id: Option<&str>, state: &str, detail: Option<&str>) -
 /// the least interesting ones. A line with zero objects is emitted even if it
 /// somehow still exceeds the budget: a valid oversized line is dropped by
 /// Cairn, a truncated one would be malformed for every consumer.
+///
+/// At 64 shaped objects a full line runs to roughly 11 KB, so the shedding
+/// loop is a guard on the framing bound rather than a routine path.
 pub fn objects_line(
     camera_id: &str,
     stream_epoch: &str,
@@ -173,9 +188,10 @@ pub fn objects_line(
             },
             objects: &dets[..kept],
         });
-        // `<=`: Cairn reads with erlang line mode `{:line, 8192}`, whose limit
-        // applies to the line data excluding the newline delimiter — a JSON
-        // payload of exactly 8192 bytes is still delivered whole.
+        // `<=`: Cairn reads with erlang line mode `{:line, 65_536}`, whose
+        // limit applies to the line data excluding the newline delimiter and
+        // is inclusive — a payload of exactly 65 536 bytes still arrives as
+        // one `{:eol, _}`, and only 65 537 splits.
         if kept == 0 || json.len() <= MAX_LINE_BYTES {
             return (json, kept);
         }
@@ -212,6 +228,7 @@ pub struct Publisher {
     streams: Arc<Streams>,
     sequences: HashMap<String, u64>,
     ungated: u64,
+    unbounded_pts: u64,
 }
 
 impl Publisher {
@@ -220,6 +237,7 @@ impl Publisher {
             streams,
             sequences: HashMap::new(),
             ungated: 0,
+            unbounded_pts: 0,
         }
     }
 
@@ -238,6 +256,11 @@ impl Publisher {
     /// The sequence counter advances only for lines actually emitted: the
     /// host reads a jump as frames lost between us and it, and a suppressed
     /// frame was never on the wire to lose.
+    ///
+    /// A `pts` outside the host's ±2^62 is refused the same way. It means the
+    /// rescale from the stream's time base overflowed (`av_rescale_q`
+    /// saturates to `i64::MIN`), so the timestamp is not a timestamp; the
+    /// host would drop the line whole for it anyway.
     pub fn line_for(
         &mut self,
         camera_id: &str,
@@ -256,6 +279,20 @@ impl Publisher {
             }
             return None;
         };
+
+        // `(-MAX..=MAX)`, not `pts.abs()`: `i64::MIN.abs()` is itself an
+        // overflow, and `i64::MIN` is exactly the saturated value at issue.
+        if !(-MAX_PTS..=MAX_PTS).contains(&pts) {
+            self.unbounded_pts += 1;
+            if self.unbounded_pts.is_multiple_of(100) || self.unbounded_pts == 1 {
+                eprintln!(
+                    "camera {camera_id}: pts {pts} is outside the contract's +-2^62, \
+                     {} frame(s) not emitted so far",
+                    self.unbounded_pts
+                );
+            }
+            return None;
+        }
 
         let sequence = self.sequences.entry(camera_id.to_string()).or_insert(0);
         let (json, kept) = objects_line(
@@ -279,12 +316,15 @@ impl Publisher {
     }
 }
 
-/// Shape a label into what the host accepts: printable, at most
+/// Shape a label into what the host accepts: non-empty, printable, at most
 /// [`MAX_LABEL_BYTES`] bytes.
 ///
 /// Labels come from the user's `--labels` file, which is arbitrary text. The
 /// host refuses a label with control bytes or over its cap and drops that
 /// detection, so the trimming happens here where the detection survives it.
+/// A line of nothing but control bytes survives `Labels::load`'s `trim`
+/// (which only strips whitespace) and would shape down to `""`, which the
+/// host refuses just as hard — so it becomes [`FALLBACK_LABEL`] instead.
 pub fn shape_label(label: &str) -> String {
     let cleaned: String = label.chars().filter(|c| !c.is_control()).collect();
     let end = cleaned
@@ -293,6 +333,9 @@ pub fn shape_label(label: &str) -> String {
         .take_while(|&end| end <= MAX_LABEL_BYTES)
         .last()
         .unwrap_or(0);
+    if end == 0 {
+        return FALLBACK_LABEL.to_string();
+    }
     cleaned[..end].to_string()
 }
 
@@ -420,13 +463,30 @@ mod tests {
     }
 
     #[test]
-    fn sheds_objects_to_fit_the_byte_budget() {
-        // The object cap alone does not bound the line: `infer` rounds its
-        // numbers, but a full-precision f64 serializes to 18 characters, and
-        // a capped label plus five of those runs a full frame past 8 KB.
+    fn a_full_shaped_frame_is_nowhere_near_the_framing_bound() {
+        // 64 objects with capped labels and full-precision f64s — the worst
+        // line `det_from` can produce — against the contract's 64 KiB. The
+        // shedding loop below is a guard, not a working part of the emit path.
         let dets: Vec<Det> = (0..MAX_OBJECTS)
             .map(|i| Det {
                 label: "x".repeat(MAX_LABEL_BYTES),
+                score: 0.8123456789012345 - f64::from(i as u32) * 1e-16,
+                bbox: [0.1234567890123456; 4],
+            })
+            .collect();
+
+        let (json, kept) = objects(&dets);
+        assert_eq!(kept, MAX_OBJECTS);
+        assert!(json.len() < MAX_LINE_BYTES / 4, "{} bytes", json.len());
+    }
+
+    #[test]
+    fn sheds_objects_to_fit_the_byte_budget() {
+        // Reaching the guard takes labels no shaped detection carries: a
+        // 64-byte cap times 64 objects cannot fill 64 KiB on its own.
+        let dets: Vec<Det> = (0..MAX_OBJECTS)
+            .map(|i| Det {
+                label: "x".repeat(2_000),
                 score: 0.8123456789012345 - f64::from(i as u32) * 1e-16,
                 bbox: [0.1234567890123456; 4],
             })
@@ -495,6 +555,10 @@ mod tests {
         let wide = shape_label(&"é".repeat(100));
         assert!(wide.len() <= MAX_LABEL_BYTES);
         assert_eq!(wide.chars().count(), MAX_LABEL_BYTES / 2);
+        // a labels line of pure control bytes survives `Labels::load`'s trim;
+        // shaping it to "" would lose the detection the shaping exists to keep
+        assert_eq!(shape_label("\u{1}\u{2}"), FALLBACK_LABEL);
+        assert_eq!(shape_label(""), FALLBACK_LABEL);
     }
 
     #[test]
@@ -547,9 +611,36 @@ mod tests {
         }
 
         fn publish(publisher: &mut Publisher, camera_id: &str) -> Option<serde_json::Value> {
+            publish_pts(publisher, camera_id, 900)
+        }
+
+        fn publish_pts(
+            publisher: &mut Publisher,
+            camera_id: &str,
+            pts: i64,
+        ) -> Option<serde_json::Value> {
             publisher
-                .line_for(camera_id, 900, SystemTime::UNIX_EPOCH, &[])
+                .line_for(camera_id, pts, SystemTime::UNIX_EPOCH, &[])
                 .map(|json| parse(&json))
+        }
+
+        #[test]
+        fn a_pts_outside_the_contract_range_is_refused_whole() {
+            // `av_rescale_q` saturates to `i64::MIN` on overflow; emitting it
+            // costs the host the whole line, liveness signal included.
+            let (streams, mut publisher) = publisher(&["front"]);
+            start(&streams, "front", EPOCH);
+
+            for pts in [i64::MIN, i64::MAX, MAX_PTS + 1, -MAX_PTS - 1] {
+                assert!(publish_pts(&mut publisher, "front", pts).is_none(), "{pts}");
+            }
+            // the bounds themselves are emittable, and nothing above consumed
+            // a sequence number: a frame never on the wire cannot be a gap
+            for pts in [-MAX_PTS, MAX_PTS] {
+                let line = publish_pts(&mut publisher, "front", pts).unwrap();
+                assert_eq!(line["frame"]["pts"].as_i64(), Some(pts));
+            }
+            assert_eq!(publish(&mut publisher, "front").unwrap()["sequence"], 2);
         }
 
         #[test]

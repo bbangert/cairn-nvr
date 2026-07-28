@@ -10,7 +10,9 @@ some_plugin --udp-port 17000 --camera-id test | tee run.ndjson | ./validate_ndjs
 sends one `stream.started` per camera on the plugin's stdin at spawn, and a
 `frame.objects` line has no valid `stream_epoch` to carry before that — so a
 run driven by hand has to supply the control line itself, and keep stdin open
-afterwards so the reader thread does not see EOF.
+afterwards. EOF on stdin **exits the plugin** (an epoch map that can never
+change again is worse than a restart), so a run whose control channel closes
+early ends there rather than going quietly silent.
 
 End-to-end: terminal 1 feeds a fixture clip as RTP; terminal 2 runs the
 plugin under test against that port, tees its stdout to a file, and
