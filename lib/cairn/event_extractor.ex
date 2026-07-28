@@ -11,16 +11,21 @@ defmodule Cairn.EventExtractor do
   written as they arrive, with a datasync roughly every 2s of media.
 
   Finalize: closes the file, updates the row (`finalized`, ended_at,
-  bytes, labels, max_score), kicks off the async snapshot, emits
-  `[:cairn, :extractor, :finalized]` telemetry, exits `:normal`. A crash
-  leaves the row `active`; boot reconciliation marks it `partial`.
+  bytes, labels, max_score), broadcasts `:event_clip_ready` with the
+  post-remux size (or `:event_clip_failed`), kicks off the async snapshot,
+  emits `[:cairn, :extractor, :finalized]` telemetry, exits `:normal`. A
+  crash *while recording* leaves the row `active` and announces no artifact at
+  all; boot reconciliation marks it `partial`. A crash inside finalize is
+  different: `:event_ended` has already been broadcast by then, so the failure
+  is caught and announced as `:event_clip_failed` with `:exception` rather
+  than leaving a consumer waiting for a frame that is never coming.
   """
 
   use GenServer, restart: :temporary
 
   require Logger
 
-  alias Cairn.{DataDir, Events, RingBuffer}
+  alias Cairn.{Config, DataDir, EventArtifact, Events, RingBuffer}
 
   @fsync_media_ms 2_000
 
@@ -54,7 +59,7 @@ defmodule Cairn.EventExtractor do
     state = %{
       camera: Keyword.fetch!(opts, :camera),
       event: Keyword.fetch!(opts, :event),
-      config: Keyword.get_lazy(opts, :config, &Cairn.Config.Server.get/0),
+      config: Keyword.get_lazy(opts, :config, &Config.Server.get/0),
       opts: opts,
       io: nil,
       path: nil,
@@ -121,15 +126,31 @@ defmodule Cairn.EventExtractor do
 
   @impl true
   def handle_cast({:finalize, event}, state) do
-    RingBuffer.unsubscribe(state.camera.id, self())
-    File.close(state.io)
-
     snapshot_fun = Keyword.get(state.opts, :snapshot_fun, &Cairn.Snapshot.take_async/2)
-    bytes = maybe_remux(state)
+    {outcome, bytes} = close_clip(event, state)
 
-    case Events.finalize(event, bytes) do
-      {:ok, row} -> snapshot_fun.(row, state.config)
-      {:error, reason} -> Logger.error("event #{event.id}: finalize failed: #{inspect(reason)}")
+    case outcome do
+      {:ok, row} ->
+        # After the row, which is what makes `clip_url` resolve, and before
+        # the snapshot is kicked off, so a consumer always sees the clip's
+        # outcome ahead of the snapshot's.
+        EventArtifact.broadcast(:event_clip_ready, %EventArtifact{
+          event_id: event.id,
+          camera_id: state.camera.id,
+          path: state.path,
+          bytes: bytes
+        })
+
+        snapshot_fun.(row, state.config)
+
+      {:error, reason} ->
+        Logger.error("event #{event.id}: finalize failed: #{inspect(reason)}")
+
+        EventArtifact.broadcast(:event_clip_failed, %EventArtifact{
+          event_id: event.id,
+          camera_id: state.camera.id,
+          reason: clip_reason(reason)
+        })
     end
 
     :telemetry.execute(
@@ -146,6 +167,36 @@ defmodule Cairn.EventExtractor do
   end
 
   # -- internals --------------------------------------------------------------
+
+  # Everything between "the window closed" and "we know what the clip is":
+  # closing a `:delayed_write` handle (a deferred write error surfaces here),
+  # the remux (ffmpeg port, File ops) and the index update (Ecto can raise, or
+  # *exit* on a pool checkout timeout). All of it is bracketed because
+  # `:event_ended` has already gone out by the time this runs: dying here would
+  # leave a consumer that committed to waiting for `clip_ready`/`clip_failed`
+  # waiting forever. The broadcast itself is deliberately outside, so a failure
+  # after it can never contradict a frame already on the wire.
+  defp close_clip(event, state) do
+    RingBuffer.unsubscribe(state.camera.id, self())
+    File.close(state.io)
+    bytes = maybe_remux(state)
+    {Events.finalize(event, bytes), bytes}
+  rescue
+    e ->
+      Logger.error("event #{event.id}: finalize crashed: #{Exception.message(e)}")
+      {{:error, :exception}, state.bytes}
+  catch
+    :exit, reason ->
+      Logger.error("event #{event.id}: finalize exited: #{inspect(reason)}")
+      {{:error, :exception}, state.bytes}
+  end
+
+  # `Events.finalize` can fail because the row vanished under us (retention
+  # deleted the event mid-recording) or because the update was rejected; keep
+  # the wire reason to that closed set.
+  defp clip_reason(:not_found), do: :not_found
+  defp clip_reason(:exception), do: :exception
+  defp clip_reason(_other), do: :index_write_failed
 
   # Runs before the row is finalized so `bytes` and the snapshot both see the
   # rewritten file. Costs one extra read+write of the clip; `remux_clips:

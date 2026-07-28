@@ -1,6 +1,8 @@
 defmodule Cairn.PluginGroupPortTest do
-  # async: false — these tests share the "events" PubSub topic and capture_log
-  use ExUnit.Case, async: false
+  # async: false — these tests share the "events" PubSub topic and capture_log.
+  # DataCase because they start a real aggregator, whose checkpoint restore
+  # consults the event index.
+  use Cairn.DataCase, async: false
 
   import ExUnit.CaptureLog
 

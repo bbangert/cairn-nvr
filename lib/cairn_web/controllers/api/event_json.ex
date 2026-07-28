@@ -8,7 +8,8 @@ defmodule CairnWeb.Api.EventJSON do
     * `shape_live/1` — a runtime `Cairn.Event` broadcast on the `"events"`
       PubSub topic (the SSE feed).
 
-  `shape_track/1` shapes the track lifecycle broadcast on the same topic.
+  `shape_track/1` shapes the track lifecycle broadcast on the same topic, and
+  `shape_artifact/2` the artifact-readiness kinds.
 
   On-disk paths (`path`, `snapshot_path`) are never emitted; media is reached
   only through the opaque, token-authed `clip_url` / `snapshot_url`.
@@ -75,7 +76,38 @@ defmodule CairnWeb.Api.EventJSON do
     }
   end
 
-  # Only advertise a URL once the underlying file exists on disk.
+  @doc """
+  Shapes a `Cairn.EventArtifact` broadcast (clip/snapshot ready or failed).
+
+  A `_ready` carries the URL the media is now fetchable at, a `_failed`
+  carries that same key as `null` plus the `reason`. The broadcast's on-disk
+  `path` is dropped — same rule as everywhere else in this module.
+  """
+  @spec shape_artifact(Cairn.EventArtifact.kind(), Cairn.EventArtifact.t()) :: map()
+  def shape_artifact(:event_clip_ready, %Cairn.EventArtifact{} = a) do
+    Map.put(base_artifact(a), :clip_url, "/api/media/events/#{a.event_id}")
+  end
+
+  def shape_artifact(:event_clip_failed, %Cairn.EventArtifact{} = a) do
+    Map.put(base_artifact(a), :clip_url, nil)
+  end
+
+  def shape_artifact(:event_snapshot_ready, %Cairn.EventArtifact{} = a) do
+    Map.put(base_artifact(a), :snapshot_url, "/api/media/snapshots/#{a.event_id}")
+  end
+
+  def shape_artifact(:event_snapshot_failed, %Cairn.EventArtifact{} = a) do
+    Map.put(base_artifact(a), :snapshot_url, nil)
+  end
+
+  defp base_artifact(%Cairn.EventArtifact{} = a) do
+    %{event_id: a.event_id, camera_id: a.camera_id, bytes: a.bytes, reason: a.reason}
+  end
+
+  # A URL only once a path has been recorded for it. That is not the same as
+  # "the file is complete": `path` is written when recording *starts*, so an
+  # `active` or `partial` row advertises a clip that may be truncated (see
+  # ha-api.md). `snapshot_path` is written after the jpg exists.
   defp media_url(nil, _url), do: nil
   defp media_url(path, url) when is_binary(path), do: url
 end

@@ -70,12 +70,16 @@ defmodule Cairn.Track do
           | :detection_disabled
           | :host_restart
 
-  # `local_broadcast`, as for `Cairn.StreamEpochs` and `Cairn.CameraStatus`: a
-  # track identity is node-local state, so handing every message to the cluster
-  # adapter for every remote node buys nothing.
+  # Cluster `broadcast`, like `Cairn.Event` and `Cairn.EventArtifact`: the
+  # `"events"` topic is consumer-facing (SSE, dashboard) and a subscriber may
+  # sit on any node, so one delivery mode has to cover the whole topic — a
+  # remote consumer that saw `event_ended` but never the track or artifact
+  # frames that follow it is stuck, not merely stale. Node-local, ETS-backed
+  # internals (`Cairn.StreamEpochs`, `Cairn.CameraStatus`) stay on
+  # `local_broadcast`: a remote subscriber could not read what they announce.
   @spec broadcast(kind(), t()) :: :ok
   def broadcast(kind, %__MODULE__{} = track)
       when kind in [:track_started, :track_updated, :track_ended] do
-    Phoenix.PubSub.local_broadcast(Cairn.PubSub, Cairn.Event.topic(), {kind, track})
+    Phoenix.PubSub.broadcast(Cairn.PubSub, Cairn.Event.topic(), {kind, track})
   end
 end
