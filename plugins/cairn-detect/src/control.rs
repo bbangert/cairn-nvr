@@ -208,8 +208,29 @@ pub fn spawn_reader(streams: Arc<Streams>) -> Result<()> {
             .is_err();
             let cause = if panicked { "panicked" } else { "stdin closed" };
             eprintln!("control: control channel gone ({cause}), exiting so Cairn respawns us");
+            // `_exit`, not `process::exit`, because this fires on a thread while
+            // the main thread may be anywhere — including inside onnxruntime's
+            // session constructor. `spawn_reader` is called *before* the model
+            // load on purpose (an unread pipe drops the `stream.started` lines
+            // Cairn writes at spawn), so that overlap is the normal case, not a
+            // corner. `process::exit` runs atexit handlers and C++ static
+            // destructors, and doing that under a half-built session killed
+            // roughly 40% of runs with SIGSEGV and gave the rest a fabricated
+            // error such as `Invalid tensor data type 3` (#19).
+            //
+            // `_exit` ends the process at the kernel and runs no user-space
+            // teardown at all, which is what makes it safe from any thread at
+            // any time. Nothing is lost by skipping the flush: `emit::write_line`
+            // flushes every protocol line as it writes it — the host is reading a
+            // pipe and a buffered detection is an undelivered one — and
+            // `eprintln!` is unbuffered.
+            //
             // Non-zero: this is an abnormal end, and the host logs the status.
-            std::process::exit(3);
+            //
+            // SAFETY: `_exit` is async-signal-safe and terminates immediately.
+            // It touches no Rust state, so there is nothing for another thread
+            // to observe half-done.
+            unsafe { libc::_exit(3) };
         })
         .context("spawning the control thread")?;
     Ok(())
