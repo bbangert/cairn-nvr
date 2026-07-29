@@ -2,8 +2,8 @@
 //!
 //! Everything that differs between detector families is stated once, as data,
 //! in a [`ModelProfile`]: how frames must be *fed* to the model ([`InputSpec`])
-//! and how its output must be read ([`OutputSpec`]). Adding a family is adding
-//! a profile to [`PROFILES`]; the code below is family-agnostic.
+//! and how its output must be read ([`profile::OutputSpec`]). Adding a family
+//! is adding a profile to [`catalog::PROFILES`]; the code is family-agnostic.
 //!
 //! A profile is either named on the command line (`--model-profile`) or
 //! sniffed from the model's own I/O. Sniffing is deliberately strict: a shape

@@ -101,7 +101,8 @@ impl<T> Outputs<T> {
 /// How a detect head's output tensor is laid out.
 ///
 /// The counts here (`nc`, and the anchor total the strides imply) are read off
-/// the model's real output shape by [`fit_layout`]; a built-in profile carries
+/// the model's real output shape by `resolve::fit_layout`; a built-in profile
+/// carries
 /// COCO's 80 only as the shape of the thing to fit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
@@ -236,7 +237,8 @@ pub struct NmsSpec {
     /// the score sort, so it can only ever discard the weakest candidates —
     /// and only ones already past their own class's floor, because every
     /// layout that reaches NMS gates per class at candidate time
-    /// ([`candidates_from`]). Truncating before that gate would let a flood of
+    /// ([`super::heads::candidates_from`]). Truncating before that gate would let
+    /// a flood of
     /// high-scoring boxes in excluded classes push out the one class an
     /// allowlist configuration asked for.
     pub max_candidates: usize,
@@ -263,7 +265,8 @@ pub struct ModelProfile {
     pub name: &'static str,
     /// Other names `--model-profile` accepts for this exact profile.
     ///
-    /// An alias is a *name*, never a second entry in [`PROFILES`]: several
+    /// An alias is a *name*, never a second entry in [`super::catalog::PROFILES`]:
+    /// several
     /// Ultralytics generations export byte-identical tensor layouts, and
     /// listing each as its own profile would make every ordinary detect head
     /// sniff as three candidates and hard-error on an ambiguity that does not
@@ -276,7 +279,8 @@ pub struct ModelProfile {
     /// whose exports leave their spatial axes dynamic.
     ///
     /// `Some` means `input.size` is *not* a usable default and
-    /// [`resolve_input_size`] must refuse rather than fall back to it. The
+    /// [`super::resolve::resolve_input_size`] must refuse rather than fall back to
+    /// it. The
     /// consequence of guessing is not a wrong-but-working run: an RF-DETR
     /// `small` export fed Nano's 384 produces zero detections and zero
     /// warnings, and nothing in the graph says which variant it is — every

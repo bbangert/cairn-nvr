@@ -19,7 +19,8 @@ use super::profile::{
 /// A grid head only decodes at a size its strides divide.
 ///
 /// [`grid_anchors`] floor-divides, and so does the walk in
-/// [`grid_objectness`]. At a size the coarsest stride does not divide, both
+/// `heads::grid_objectness`. At a size the coarsest stride does not divide,
+/// both
 /// agree with each other and neither agrees with the model: a real head lays
 /// its cells out by the ceiling its own downsampling produced. The total-count
 /// check in [`validate_layout`] catches that whenever the two totals differ,
@@ -176,7 +177,8 @@ fn bind(roles: Roles, declared: &[Declared]) -> Result<Outputs<Declared>> {
 /// This is the fallback the shape rule refuses to be: names are a weaker
 /// signal, and the two RF-DETR exporters disagree about them, which is exactly
 /// why `bind` reads shapes first. It is safe as a *last* resort because the
-/// binding is not trusted — [`decode_output`] re-runs [`validate_layout`]
+/// binding is not trusted — [`super::heads::decode_output`] re-runs
+/// [`validate_layout`]
 /// against the real runtime dims on every frame, so a pair bound the wrong way
 /// round fails loudly on the first output (the boxes tensor would not have a
 /// last axis of 4) instead of decoding garbage. Without it, an export whose

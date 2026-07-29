@@ -86,7 +86,8 @@ pub const YOLOV8: ModelProfile = ModelProfile {
 /// The size here is Nano's, and it is deliberately *not* a default: every
 /// RF-DETR export leaves its input spatial axes dynamic, so a larger variant
 /// fed 384 runs to completion and detects nothing. `variant_sizes` is what
-/// makes [`resolve_input_size`] refuse to guess and ask for `--input-size`.
+/// makes [`super::resolve::resolve_input_size`] refuse to guess and ask for
+/// `--input-size`.
 pub const RFDETR: ModelProfile = ModelProfile {
     name: "rfdetr",
     aliases: &["rf-detr"],

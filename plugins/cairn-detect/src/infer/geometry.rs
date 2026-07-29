@@ -213,7 +213,7 @@ pub struct Projection {
 
 impl Projection {
     /// `[x0, y0, x1, y1]` in model pixels -> the same box normalized 0..1
-    /// against the original frame. Not clamped: [`det_from`] does that.
+    /// against the original frame. Not clamped: `det_from` does that.
     pub fn unproject(&self, corners: [f64; 4]) -> [f64; 4] {
         let x = |v: f64| (v - self.offset.0) / self.scale.0 / self.source.0;
         let y = |v: f64| (v - self.offset.1) / self.scale.1 / self.source.1;

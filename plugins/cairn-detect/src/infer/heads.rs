@@ -46,7 +46,8 @@ pub(super) fn decode_output(
 /// thousands of strings a frame. The class id is the only thing a decode has,
 /// and this is the map between them.
 ///
-/// Built per decode rather than cached on [`Detector`] because the floors are
+/// Built per decode rather than cached on [`super::detector::Detector`]
+/// because the floors are
 /// per *camera*: one multiplexed process serves a group whose members each
 /// carry their own `min_score`, so a table cached beside the session would be
 /// the wrong one for every member but the first.
