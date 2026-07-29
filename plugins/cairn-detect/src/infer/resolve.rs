@@ -19,20 +19,27 @@ use super::profile::{
 /// Every way this module can refuse to settle a profile or an input size.
 ///
 /// One variant per operator-facing failure, each carrying the *values* its
-/// message interpolates rather than a pre-formatted string. The wording lives
-/// in the `#[error]` attributes and nowhere else, so a caller — or a test — can
-/// tell an ambiguity from a shape mismatch without reading prose, and rewording
-/// a message for an operator is no longer a test change.
+/// message interpolates. **No variant stores rendered prose**, which is the
+/// property that matters: the wording lives in the `#[error]` attributes and in
+/// the three helpers they call — [`unbindable_hint`], [`expected_profiles`] and
+/// [`describe_outputs`], each a pure function of the values the variant already
+/// holds. So a caller — or a test — can tell an ambiguity from a shape mismatch
+/// without reading prose, and rewording a message for an operator touches the
+/// one message test that asserts that message.
 ///
-/// The messages themselves are unchanged from the `bail!`/`with_context` sites
-/// they replace; several were tuned during review and the notes explaining
-/// *why* a given sentence is worded as it is sit on the variants below.
+/// The notes explaining *why* a given sentence is worded as it is sit on the
+/// variants below.
 ///
-/// `anyhow` still owns the boundary. Nothing here is public: `Detector::open`
-/// converts via [`std::error::Error`] the moment one of these leaves `infer`,
-/// and [`ProfileMismatch`] is the one variant that wraps another, so an
-/// `err.chain()` at that boundary still reads outer-then-inner exactly as the
-/// `with_context` it replaced did.
+/// `anyhow` owns the boundary, and the conversion into it happens at **three**
+/// sites, not one: `Detector::open` once at startup, and per frame both
+/// `Detector::detect` (`with_context` on [`fit_output`]) and
+/// `heads::decode_output` (`?` on [`validate_layout`]). An audit that reads
+/// only the first misses the two that run on every frame. All three are
+/// inside `infer` — `ResolveError` is
+/// `pub(super)`, so no typed error ever leaves the module tree.
+/// [`ProfileMismatch`] is the one variant that wraps another, and its
+/// `#[source]` is what makes an `err.chain()` at those boundaries read
+/// outer-then-inner.
 ///
 /// [`ProfileMismatch`]: ResolveError::ProfileMismatch
 #[derive(Debug, Error)]
@@ -100,15 +107,19 @@ pub(super) enum ResolveError {
     ///
     /// The wrapped `source` is the underlying refusal — a role that would not
     /// bind, or a shape that would not fit — and it is a genuine
-    /// [`std::error::Error`] source, so the operator sees both lines exactly as
-    /// they did when this was `with_context`.
+    /// [`std::error::Error`] source rather than a clause spliced into the
+    /// sentence above, so `anyhow` renders the two as two lines.
     ///
     /// `profile` is the profile's *name* rather than the whole
     /// [`ModelProfile`]: the name is its canonical identity — an alias resolves
     /// to it and [`ModelProfile`]'s own `Display` writes nothing else — and a
-    /// profile by value is 136 bytes riding the `Err` side of every function in
-    /// this module, which `clippy::result_large_err` rightly objects to. With
-    /// the name instead, the whole enum is 104.
+    /// profile by value rides the `Err` side of every function in this module,
+    /// which `clippy::result_large_err` objects to once it crosses 128 bytes.
+    /// Measured under `rustc -O` when this was written: `ModelProfile` is 136
+    /// bytes and would put the enum at 168, where the name keeps it at 104.
+    /// Those are a measurement at one point in time, not an invariant —
+    /// `result_large_err` is the gate, the numbers are only what motivated the
+    /// choice.
     #[error("--model-profile {profile} does not describe model {}", model.display())]
     ProfileMismatch {
         profile: &'static str,
@@ -1129,6 +1140,31 @@ mod tests {
     }
 
     #[test]
+    fn a_settled_layout_refuses_a_tensor_by_its_own_name_not_the_sniffers() {
+        // `LayoutDoesNotFit` above and `OutputShapeMismatch` here carry
+        // identical field triples, so which one a site constructs is one
+        // identifier and nothing but this test observes it: `validate_layout`'s
+        // only caller is `heads::decode_output`, which `?`s it straight into
+        // `anyhow`. The two are not interchangeable — `fit_layout` is
+        // discriminating between kinds and says what a kind expects, this one
+        // re-checks a kind already settled and states it — and that difference
+        // exists only in the message.
+        let err = validate_layout(Layout::EndToEnd, &one(&[1, 300, 7]), SQUARE).unwrap_err();
+        let ResolveError::OutputShapeMismatch { layout, size, got } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(*layout, Layout::EndToEnd);
+        assert_eq!(*size, SQUARE);
+        assert_eq!(*got, one(&[1, 300, 7]));
+
+        // A resolved layout is checked on extents alone, so the shape the
+        // sniffing heuristic would refuse — one anchor is not "far longer" than
+        // anything — is fine here.
+        assert!(validate_layout(Layout::EndToEnd, &one(&[1, 300, 6]), SQUARE).is_ok());
+        assert!(validate_layout(Layout::RawClasses { nc: 80 }, &one(&[1, 84, 1]), SQUARE).is_ok());
+    }
+
+    #[test]
     fn an_unrecognizable_shape_names_every_profile() {
         for (dims, size) in [
             (vec![1, 84, 84], SQUARE),      // no axis long enough to be anchors
@@ -1822,7 +1858,22 @@ mod tests {
             panic!("{err:?}");
         };
         assert_eq!(*size, InputSize { w: 640, h: 350 });
-        // the coarsest stride, not the one that happens to fail first
+        // the coarsest stride, not the one that happens to fail first: 350 is
+        // divisible by none of 8, 16 and 32, so a check that reported the first
+        // failing stride would say 8 here
+        assert_eq!(*stride, 32);
+
+        // The two axes are separate limbs of one `||`, and a size that fails on
+        // height alone exercises only the second: drop the width limb and 640x350
+        // still refuses. So a width-only failure has to be here too — height a
+        // multiple of 32, width not. (400 *is* a multiple of 8 and of 16, so 32
+        // is the only stride it fails; the coarsest-vs-first distinction above is
+        // 640x350's to make, not this case's.)
+        let err = check_grid_divides_input(grid, InputSize { w: 400, h: 416 }).unwrap_err();
+        let ResolveError::GridDoesNotDivide { size, stride } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(*size, InputSize { w: 400, h: 416 });
         assert_eq!(*stride, 32);
 
         // the sizes that matter still pass
@@ -1945,17 +1996,24 @@ mod tests {
 
     #[test]
     fn the_profile_mismatch_message_blames_the_flag_and_keeps_the_reason_as_a_source() {
-        let err = ResolveError::ProfileMismatch {
-            profile: RFDETR.name,
-            model: Path::new("m.onnx").to_path_buf(),
-            source: Box::new(ResolveError::NoOutputs),
-        };
+        // Driven through the resolver rather than hand-built, because the pair
+        // is the point: which refusal ends up wrapped is `resolve_profile`'s
+        // decision, and a chain assembled here could assert a combination no
+        // call site produces. rfdetr against a one-tensor export is the real
+        // one — the roles never bind.
+        let err = resolve_profile(
+            Some(RFDETR),
+            &declared(&[1, 300, 6]),
+            InputSize::square(384),
+            Path::new("m.onnx"),
+        )
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "--model-profile rfdetr does not describe model m.onnx"
         );
         // The reason is a *link*, not a clause: `anyhow` renders both at the
-        // boundary and the golden fixtures record the chain as two entries.
+        // boundary, which is the two lines an operator reads.
         let chain: Vec<String> = anyhow::Error::from(err)
             .chain()
             .map(|e| e.to_string())
@@ -1964,7 +2022,8 @@ mod tests {
             chain,
             [
                 "--model-profile rfdetr does not describe model m.onnx",
-                "model has no outputs"
+                "expected one [1, Q, 4] box output and one [1, Q, nc] logit output over the same \
+                 Q queries, but the model offers \"output\" [1, 300, 6]"
             ]
         );
     }
@@ -2013,6 +2072,33 @@ mod tests {
             "model m.onnx has outputs \"output\" [1, 5040, 6], which at input 640x384 fit more \
              than one profile: yolox and yolov10. Nothing in the shapes says which, and they \
              decode differently — pass --model-profile <yolox|yolov10> to say."
+        );
+        // Two declared outputs, because `describe_outputs` joins them with
+        // ", " and every other message rendered anywhere in this file carries
+        // exactly one — a separator no assertion renders is a separator free to
+        // change. The 336-query DETR whose logits come first is the real
+        // multi-output case: at 128x128 its first output is also a perfectly
+        // good 80-class yolox grid, so the pair is ambiguous.
+        assert_eq!(
+            ResolveError::AmbiguousProfile {
+                model: Path::new("m.onnx").to_path_buf(),
+                declared: vec![
+                    Declared {
+                        name: "logits".into(),
+                        dims: Some(vec![1, 336, 85]),
+                    },
+                    Declared {
+                        name: "pred_boxes".into(),
+                        dims: Some(vec![1, 336, 4]),
+                    },
+                ],
+                size: InputSize::square(128),
+                candidates: vec!["yolox", "rfdetr"],
+            }
+            .to_string(),
+            "model m.onnx has outputs \"logits\" [1, 336, 85], \"pred_boxes\" [1, 336, 4], which \
+             at input 128x128 fit more than one profile: yolox and rfdetr. Nothing in the shapes \
+             says which, and they decode differently — pass --model-profile <yolox|rfdetr> to say."
         );
     }
 
