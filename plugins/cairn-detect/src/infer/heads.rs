@@ -423,6 +423,10 @@ fn centered(cx: f64, cy: f64, w: f64, h: f64, size: InputSize) -> Option<ModelBo
 
 /// Where every layout converges: NMS if the head needs it, then the per-label
 /// floor, un-projection, score order and the [`MAX_DETS`] cap.
+///
+/// Un-projection is also where a candidate can stop being a detection at all:
+/// [`det_from`] returns `None` for a box the clamp leaves with no area, and the
+/// `?` below is what drops it before it can occupy a slot the cap measures.
 pub(super) fn finish(
     mut candidates: Vec<Candidate>,
     spec: Option<NmsSpec>,
@@ -447,16 +451,15 @@ pub(super) fn finish(
             // one place every layout converges. For the rest it is a no-op:
             // they gated on the same floor already, and NMS only ever drops a
             // box weaker than one of its own class, which shares it.
-            (candidate.score >= floors.floor_for(&label)).then(|| {
-                (
-                    candidate.score,
-                    det_from(
-                        projection.unproject(candidate.corners),
-                        candidate.score,
-                        label,
-                    ),
-                )
-            })
+            if candidate.score < floors.floor_for(&label) {
+                return None;
+            }
+            let det = det_from(
+                projection.unproject(candidate.corners),
+                candidate.score,
+                label,
+            )?;
+            Some((candidate.score, det))
         })
         .collect();
     top_dets(dets)
@@ -470,6 +473,21 @@ pub(super) fn finish(
 /// whether it matters.
 ///
 /// `candidates` must already be sorted by descending score.
+///
+/// Known residual, left alone deliberately: this runs *before* un-projection,
+/// on model-space boxes, where a box lying wholly in the letterbox pad still
+/// has ordinary area. So a pad-only ghost can suppress a real box of its own
+/// class here, and [`det_from`] dropping the ghost afterwards cannot bring the
+/// suppressed box back. It takes an IoU of at least `threshold` between the
+/// two — 0.45 for every built-in family — and a pad-only box is disjoint from
+/// the content rectangle, so the real box has to extend well into the pad
+/// itself. At 1920x1080 into yolox 416 the content is the top 234 rows: two
+/// same-width boxes, one predicted at rows 190..280 and a ghost at 234..314,
+/// overlap by 46 of a 124 union — IoU 0.37, under the threshold. Clearing it
+/// takes a "real" box that is mostly pad, whose surviving clamped remnant is a
+/// sliver. Narrow but non-empty; the complete fix is to reject pad-only
+/// candidates in model space before this runs, which the projection already
+/// knows enough to do.
 fn nms(candidates: Vec<Candidate>, threshold: f64) -> Vec<Candidate> {
     let mut kept: Vec<Candidate> = Vec::new();
     for candidate in candidates {
@@ -499,19 +517,42 @@ fn iou(a: &ModelBox, b: &ModelBox) -> f64 {
     }
 }
 
-/// Already-un-projected corners -> the contract's normalized `[x, y, w, h]`.
+/// Already-un-projected corners -> the contract's normalized `[x, y, w, h]`,
+/// or `None` for a box the host would refuse anyway.
 ///
 /// Contract: bbox normalized 0..1 against the *original* frame — which is what
 /// the projection knows and the input size does not. Taking a [`NormBox`] is
 /// what says so in the type: only [`Projection::unproject`] makes one, so
 /// there is no way to reach here holding model pixels.
-fn det_from(bbox: NormBox, score: f64, label: String) -> Det {
+///
+/// The mapping is partial because clamping to that frame can leave a box with
+/// no area: one lying wholly in the letterbox pad collapses to a line, and the
+/// host requires `w > 0 and h > 0`. Returning `None` rather than a flat `Det`
+/// is what keeps such a box from consuming a [`MAX_DETS`] slot ahead of
+/// [`top_dets`]'s truncate and displacing a real detection. The body comment on
+/// the check says why it reads the rounded extents rather than the raw ones;
+/// [`finish`] is the caller that drops the `None`.
+fn det_from(bbox: NormBox, score: f64, label: String) -> Option<Det> {
     let normalized = bbox.corners();
     let x0 = normalized.x1.clamp(0.0, 1.0);
     let y0 = normalized.y1.clamp(0.0, 1.0);
     let x1 = normalized.x2.clamp(0.0, 1.0);
     let y1 = normalized.y2.clamp(0.0, 1.0);
-    Det {
+    let w = round_to((x1 - x0).max(0.0), 4);
+    let h = round_to((y1 - y0).max(0.0), 4);
+    // A box lying entirely in the letterbox pad clamps to a line: `w` or `h`
+    // comes out 0 and the host refuses the detection outright
+    // (`validate_det` requires `w > 0 and h > 0`). Dropping it here rather
+    // than emitting it is not tidiness — an emitted ghost consumes a
+    // `MAX_DETS` slot *ahead of* `top_dets`'s truncate, so it can displace a
+    // real detection that would otherwise have been reported.
+    //
+    // Tested on the rounded extents, not the raw ones: rounding is what the
+    // host sees, so a sliver narrower than 0.00005 already reaches it as 0.
+    if w == 0.0 || h == 0.0 {
+        return None;
+    }
+    Some(Det {
         // `--labels` is arbitrary user text and the host refuses a label it
         // cannot print; shaping it here keeps the detection instead.
         label: crate::emit::shape_label(&label),
@@ -521,13 +562,8 @@ fn det_from(bbox: NormBox, score: f64, label: String) -> Det {
         // detection rather than report an odd number. Non-finite scores are
         // already rejected upstream, which is what makes `clamp` total here.
         score: round_to(score.clamp(0.0, 1.0), 3),
-        bbox: [
-            round_to(x0, 4),
-            round_to(y0, 4),
-            round_to((x1 - x0).max(0.0), 4),
-            round_to((y1 - y0).max(0.0), 4),
-        ],
-    }
+        bbox: [round_to(x0, 4), round_to(y0, 4), w, h],
+    })
 }
 
 /// Score-order and cap, where every layout converges.
@@ -1545,6 +1581,9 @@ mod tests {
             0.9,
             "car".into(),
         );
+        // Both have area, so neither is dropped as a pad-only ghost.
+        let letterboxed = letterboxed.expect("a full-content box has area");
+        let stretched = stretched.expect("a full-content box has area");
         // the content rectangle of a 16:9 letterbox *is* the whole frame...
         assert_eq!(letterboxed.bbox, [0.0, 0.0, 1.0, 1.0]);
         // ...while the stretch rule reads those same rows as its top 234/416
@@ -1553,17 +1592,19 @@ mod tests {
 
     #[test]
     fn det_from_shapes_the_label_on_its_way_to_the_wire() {
-        // No golden fixture reaches `shape_label` — every one of them decodes
-        // under names that are already clean — and `det_from`'s signature is
-        // what Phase 2 rewrites. `--labels` is arbitrary user text and the
-        // host refuses a detection whose label it cannot print, so a dropped
-        // call here loses real detections with every other gate green.
+        // Nothing else in this module reaches `shape_label`: every other test
+        // decodes under names that are already clean, so the call is invisible
+        // to all of them including the composed-tail ones. `--labels` is
+        // arbitrary user text and the host refuses a detection whose label it
+        // cannot print, so a dropped call here loses real detections with
+        // every other gate green.
         let raw = "ca\u{7}r\n";
         let det = det_from(
             Projection::stretch(SQUARE).unproject(model_box(0.0, 0.0, 64.0, 64.0)),
             0.5,
             raw.to_string(),
-        );
+        )
+        .expect("a 64x64 box has area");
         assert_eq!(det.label, "car");
         assert_eq!(det.label, crate::emit::shape_label(raw));
     }
@@ -1705,5 +1746,569 @@ mod tests {
         assert_eq!(Layout::RawClasses { nc: 7 }.classes(), Some(7));
         assert_eq!(labels().count(), 3);
         assert_eq!(Labels::load(None).unwrap().count(), 0);
+    }
+
+    // ---- the composed tail, one head at a time ------------------------------
+    //
+    // Every test above states one rule about one step. These eight — four heads
+    // under two projections — pin the whole `Vec<Det>` a planted tensor decodes
+    // to, which is the one thing a per-feature test structurally cannot do:
+    // what `finish` -> `nms` -> `det_from` -> `top_dets` -> `Projection` do
+    // *together*. A suppression that silently reorders, a rounding that loses a
+    // digit or a projection applied one call late satisfies every rule stated
+    // above and reaches the wire as a wrong box.
+    //
+    // The tensors and the expected detections were recorded and hand-verified
+    // against the arithmetic during the characterization phase, then
+    // independently reproduced in a separate model. They are moved here, not
+    // re-derived; the fixture files and their bless-and-diff harness are what
+    // was retired, because a blob states no intent and invites re-recording
+    // where a named test invites investigation.
+    //
+    // These deliberately share `labels()` and `floors()` with the rest of the
+    // module. The characterization suite deliberately did not — a golden built
+    // from the constructors it guards moves with them and proves nothing — but
+    // that reasoning was about catching a *move*, and nothing is moving now.
+
+    /// A non-uniform floor table, which is the configuration that makes the
+    /// per-class gates observable: `car` is held to 0.8 while everything else
+    /// clears at 0.3.
+    fn mixed_floors() -> ScoreFloors {
+        floors(r#"{"default": 0.3, "car": 0.8}"#)
+    }
+
+    /// The second projection every head below is read under: a 16:9 camera
+    /// into a square input, whose vertical scale is *not* the input size.
+    /// A decode that skips the un-projection reports every box short and
+    /// shifted, and each letterboxed test says so in its own numbers.
+    fn letterboxed(input: InputSize) -> Projection {
+        ResizePolicy::Letterbox { pad: 114 }.project(input, WIDE)
+    }
+
+    /// Decode one planted tensor under a projection the test names.
+    fn decode_under(
+        output: OutputSpec,
+        raw: &Outputs<Raw>,
+        size: InputSize,
+        projection: &Projection,
+    ) -> Vec<Det> {
+        decode_output(output, raw, &labels(), &mixed_floors(), size, projection)
+            .expect("the planted tensors are well-formed for their layout")
+    }
+
+    fn det(label: &str, score: f64, bbox: [f64; 4]) -> Det {
+        Det {
+            label: label.into(),
+            score,
+            bbox,
+        }
+    }
+
+    /// Three classes, so an argmax has something to choose between and a class
+    /// id past the end exercises the numeric fallback.
+    const NC: usize = 3;
+
+    const END_TO_END: OutputSpec = OutputSpec {
+        layout: Layout::EndToEnd,
+        score: ScoreComposition::Class,
+        nms: None,
+    };
+    const RAW_CLASSES: OutputSpec = OutputSpec {
+        layout: Layout::RawClasses { nc: NC },
+        score: ScoreComposition::Class,
+        nms: Some(DEFAULT_NMS),
+    };
+    const GRID_OBJECTNESS: OutputSpec = OutputSpec {
+        layout: Layout::GridObjectness {
+            nc: NC,
+            strides: STRIDES,
+        },
+        score: ScoreComposition::ObjTimesClass,
+        nms: Some(DEFAULT_NMS),
+    };
+    const DETR_QUERIES: OutputSpec = OutputSpec {
+        layout: Layout::DetrQueries { nc: NC },
+        score: ScoreComposition::SigmoidClass,
+        nms: None,
+    };
+
+    // ---- head 1: end-to-end `[1, N, 6]` -------------------------------------
+
+    /// Rows of `[x1, y1, x2, y2, score, class_id]` in model pixels.
+    ///
+    /// This head is NMS-free by construction, so rows 0 and 1 overlapping
+    /// heavily is the *interesting* case rather than the suppressed one: both
+    /// have to survive, because the model already de-duplicated and a second
+    /// pass would merge two objects the export deliberately kept apart.
+    fn end_to_end_rows() -> Vec<f32> {
+        #[rustfmt::skip]
+        let rows = vec![
+            // strong person
+             32.0,  32.0, 160.0, 160.0, 0.90, 0.0,
+            // a second person over the top of it — kept, no NMS on this head
+             40.0,  40.0, 168.0, 168.0, 0.85, 0.0,
+            // bicycle, over the 0.3 default
+            200.0, 200.0, 300.0, 300.0, 0.55, 1.0,
+            // car at 0.75, under its own 0.8 floor — dropped in `finish`
+            320.0, 320.0, 420.0, 420.0, 0.75, 2.0,
+            // under the default floor, dropped by the prefilter
+             10.0,  10.0,  20.0,  20.0, 0.20, 0.0,
+            // class 7 has no label: renders as the bare id. Under the letterbox
+            // this box also lands entirely in the pad.
+            500.0, 500.0, 600.0, 600.0, 0.65, 7.0,
+        ];
+        rows
+    }
+
+    fn end_to_end_output(rows: &[f32]) -> Outputs<Raw<'_>> {
+        raw_one(rows, &[1, (rows.len() / 6) as i64, 6])
+    }
+
+    #[test]
+    fn a_stretched_end_to_end_head_keeps_both_overlaps_and_drops_only_what_the_floors_refuse() {
+        let rows = end_to_end_rows();
+        let dets = decode_under(
+            END_TO_END,
+            &end_to_end_output(&rows),
+            SQUARE,
+            &Projection::stretch(SQUARE),
+        );
+        // The rows are already corners in model pixels and the stretch divides
+        // by the input size on both axes, so every number below is that row
+        // over 640: the first box is 32..160, hence 32/640 = 0.05 with a width
+        // of 128/640 = 0.2.
+        assert_eq!(
+            dets,
+            vec![
+                // both overlapping persons survive: this head runs no NMS
+                det("person", 0.9, [0.05, 0.05, 0.2, 0.2]),
+                det("person", 0.85, [0.0625, 0.0625, 0.2, 0.2]),
+                // class 7 has no name, so the id itself is the label
+                det("7", 0.65, [0.7813, 0.7813, 0.1563, 0.1563]),
+                det("bicycle", 0.55, [0.3125, 0.3125, 0.1563, 0.1563]),
+            ]
+        );
+        // ...and the two rows that are gone: a 0.75 car under car's own 0.8,
+        // and a 0.20 person under the 0.3 the prefilter cuts at.
+    }
+
+    #[test]
+    fn a_letterboxed_end_to_end_head_reports_its_rows_against_the_original_frame() {
+        let rows = end_to_end_rows();
+        let dets = decode_under(
+            END_TO_END,
+            &end_to_end_output(&rows),
+            SQUARE,
+            &letterboxed(SQUARE),
+        );
+        // The content occupies the top 360 of 640 rows, so every `y` is read
+        // against 360 rather than 640 and comes out 1.78x further down the
+        // frame than the stretch reading above. `x` is untouched.
+        assert_eq!(
+            dets,
+            vec![
+                det("person", 0.9, [0.05, 0.0889, 0.2, 0.3556]),
+                det("person", 0.85, [0.0625, 0.1111, 0.2, 0.3556]),
+                det("bicycle", 0.55, [0.3125, 0.5556, 0.1563, 0.2778]),
+            ]
+        );
+        // The class-7 row is missing rather than reordered: 500..600 is below
+        // the content entirely, so it lies in the pad and is dropped — see
+        // `a_box_lying_wholly_in_the_letterbox_pad_is_dropped_not_emitted_flat`.
+    }
+
+    // ---- head 2: raw classes `[1, 4 + nc, A]` -------------------------------
+
+    /// One planted anchor of a channels-first head: box in model pixels, one
+    /// score per class.
+    struct RawAnchor {
+        cx: f32,
+        cy: f32,
+        w: f32,
+        h: f32,
+        classes: [f32; NC],
+    }
+
+    /// Anchors long enough to satisfy the channels-first orientation rule
+    /// (`A > (4 + nc) * 4`), short enough to write out.
+    const RAW_ANCHORS: usize = 32;
+
+    fn raw_classes_tensor() -> Vec<f32> {
+        // A data table: one planted row per line, which is how it is read.
+        #[rustfmt::skip]
+        let planted = [
+            // strong person
+            RawAnchor { cx: 100.0, cy: 100.0, w: 60.0, h: 60.0, classes: [0.90, 0.0, 0.0] },
+            // 0.68 IoU with the one above, same class — NMS suppresses it
+            RawAnchor { cx: 108.0, cy: 104.0, w: 60.0, h: 60.0, classes: [0.70, 0.0, 0.0] },
+            // car at 0.75, under its own 0.8 floor — never becomes a candidate
+            RawAnchor { cx: 200.0, cy: 200.0, w: 40.0, h: 40.0, classes: [0.0, 0.0, 0.75] },
+            // bicycle, elsewhere in the frame. 380..420 in model pixels, so
+            // under the letterbox — 360 rows of content — it lands entirely in
+            // the pad and is dropped rather than clipped.
+            RawAnchor { cx: 400.0, cy: 400.0, w: 80.0, h: 40.0, classes: [0.0, 0.60, 0.0] },
+            // under the default floor
+            RawAnchor { cx: 300.0, cy: 100.0, w: 20.0, h: 20.0, classes: [0.25, 0.0, 0.0] },
+            // a second person far enough away that NMS keeps it
+            RawAnchor { cx: 100.0, cy: 300.0, w: 60.0, h: 60.0, classes: [0.55, 0.0, 0.0] },
+        ];
+        // The rest stay zero, and stay dropped — by `car`'s 0.8 rather than by
+        // the 0.3 default, which is the intuitive reading and the wrong one.
+        // See `an_anchor_with_nothing_to_choose_between_argmaxes_to_the_last_class`.
+        let mut values = vec![0.0f32; (4 + NC) * RAW_ANCHORS];
+        for (a, anchor) in planted.iter().enumerate() {
+            let at = |channel: usize| channel * RAW_ANCHORS + a;
+            values[at(0)] = anchor.cx;
+            values[at(1)] = anchor.cy;
+            values[at(2)] = anchor.w;
+            values[at(3)] = anchor.h;
+            for (c, score) in anchor.classes.iter().enumerate() {
+                values[at(4 + c)] = *score;
+            }
+        }
+        values
+    }
+
+    fn raw_classes_output(values: &[f32]) -> Outputs<Raw<'_>> {
+        raw_one(values, &[1, (4 + NC) as i64, RAW_ANCHORS as i64])
+    }
+
+    #[test]
+    fn a_stretched_raw_classes_head_suppresses_its_overlap_and_holds_each_class_to_its_own_floor() {
+        let values = raw_classes_tensor();
+        let dets = decode_under(
+            RAW_CLASSES,
+            &raw_classes_output(&values),
+            SQUARE,
+            &Projection::stretch(SQUARE),
+        );
+        // These rows are centers and extents, so a corner is the center less
+        // half the extent in model pixels, and the stretch then divides by 640.
+        // The first person is centered at (100, 100) with extent 60x60: corner
+        // 70/640 = 0.1094, extent 60/640 = 0.0938. The bicycle is centered at
+        // (400, 400) with extent 80x40: 360/640 = 0.5625, 380/640 = 0.5938.
+        assert_eq!(
+            dets,
+            vec![
+                // the 0.70 person at IoU 0.68 with this one is suppressed
+                det("person", 0.9, [0.1094, 0.1094, 0.0938, 0.0938]),
+                det("bicycle", 0.6, [0.5625, 0.5938, 0.125, 0.0625]),
+                // far enough from the first person that NMS keeps it
+                det("person", 0.55, [0.1094, 0.4219, 0.0938, 0.0938]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_letterboxed_raw_classes_head_drops_the_box_that_lands_wholly_in_the_pad() {
+        let values = raw_classes_tensor();
+        let dets = decode_under(
+            RAW_CLASSES,
+            &raw_classes_output(&values),
+            SQUARE,
+            &letterboxed(SQUARE),
+        );
+        // The bicycle at cy 400 is 380..420 in model pixels, entirely below the
+        // 360-row content area, so it un-projects past the bottom of the frame
+        // and clamps to a line with no area at all. It is dropped rather than
+        // emitted flat — the host refuses `w == 0 || h == 0` outright, and an
+        // emitted ghost would burn a `MAX_DETS` slot ahead of the truncate.
+        assert_eq!(
+            dets,
+            vec![
+                det("person", 0.9, [0.1094, 0.1944, 0.0938, 0.1667]),
+                det("person", 0.55, [0.1094, 0.75, 0.0938, 0.1667]),
+            ]
+        );
+    }
+
+    // ---- head 3: grid objectness `[1, A, 5 + nc]` ---------------------------
+
+    /// One planted cell of a grid head.
+    struct GridCell {
+        stride: usize,
+        gx: usize,
+        gy: usize,
+        /// Offsets inside the cell, in cell units — what the head actually
+        /// emits.
+        off: (f32, f32),
+        /// Box extent in model pixels; stored as the log extent the head emits.
+        extent: (f64, f64),
+        objectness: f32,
+        classes: [f32; NC],
+    }
+
+    /// Where a cell lands in the concatenated grid: every earlier stride's
+    /// cells, then row-major within this one. Deliberately re-derived here
+    /// rather than borrowed from the decode, so a decode that walks the grid
+    /// differently shows up as a failure instead of cancelling out.
+    fn grid_index(size: InputSize, stride: usize, gx: usize, gy: usize) -> usize {
+        let before: usize = STRIDES
+            .iter()
+            .take_while(|s| **s != stride)
+            .map(|s| (size.w / s) * (size.h / s))
+            .sum();
+        before + gy * (size.w / stride) + gx
+    }
+
+    fn grid_objectness_tensor() -> Vec<f32> {
+        // A data table: one planted row per line, which is how it is read.
+        #[rustfmt::skip]
+        let planted = [
+            // person at 0.95 x 0.95 = 0.9025, a 32px box centered in cell (3, 3)
+            GridCell { stride: 8, gx: 3, gy: 3, off: (0.5, 0.5), extent: (32.0, 32.0),
+                       objectness: 0.95, classes: [0.95, 0.0, 0.0] },
+            // 0.60 IoU with it, same class — NMS suppresses it
+            GridCell { stride: 8, gx: 4, gy: 3, off: (0.5, 0.5), extent: (32.0, 32.0),
+                       objectness: 0.90, classes: [0.90, 0.0, 0.0] },
+            // car at 0.9 x 0.9 = 0.81, just over its 0.8 floor
+            GridCell { stride: 16, gx: 1, gy: 1, off: (0.5, 0.5), extent: (16.0, 16.0),
+                       objectness: 0.90, classes: [0.0, 0.0, 0.90] },
+            // car at 0.9 x 0.85 = 0.765, just under it — the objectness product
+            // is what decides, not the class score
+            GridCell { stride: 16, gx: 2, gy: 2, off: (0.5, 0.5), extent: (16.0, 16.0),
+                       objectness: 0.90, classes: [0.0, 0.0, 0.85] },
+            // bicycle on the coarsest stride, flush with the top and right edges
+            // of the input rectangle — inside it, so nothing here clamps
+            GridCell { stride: 32, gx: 1, gy: 0, off: (0.5, 0.5), extent: (32.0, 32.0),
+                       objectness: 0.80, classes: [0.0, 0.70, 0.0] },
+        ];
+        let row = 5 + NC;
+        // Re-derived here rather than taken from `profile::grid_anchors`, for
+        // the same reason `grid_index` below re-derives the walk: a tensor
+        // sized by the production count is sized to agree with whatever that
+        // count says, so a count that changed would resize the planted tensor
+        // to match itself instead of showing up as a failure.
+        let anchors = STRIDES
+            .iter()
+            .map(|s| (TINY.w / s) * (TINY.h / s))
+            .sum::<usize>();
+        // Zero elsewhere: objectness 0 times anything is 0, under every floor.
+        let mut values = vec![0.0f32; anchors * row];
+        for cell in &planted {
+            let base = grid_index(TINY, cell.stride, cell.gx, cell.gy) * row;
+            let log_extent = |pixels: f64| (pixels / cell.stride as f64).ln() as f32;
+            values[base] = cell.off.0;
+            values[base + 1] = cell.off.1;
+            values[base + 2] = log_extent(cell.extent.0);
+            values[base + 3] = log_extent(cell.extent.1);
+            values[base + 4] = cell.objectness;
+            for (c, score) in cell.classes.iter().enumerate() {
+                values[base + 5 + c] = *score;
+            }
+        }
+        values
+    }
+
+    fn grid_objectness_output(values: &[f32]) -> Outputs<Raw<'_>> {
+        raw_one(
+            values,
+            &[1, (values.len() / (5 + NC)) as i64, (5 + NC) as i64],
+        )
+    }
+
+    #[test]
+    fn a_stretched_grid_head_scores_objectness_times_class_and_suppresses_the_neighbouring_cell() {
+        let values = grid_objectness_tensor();
+        let dets = decode_under(
+            GRID_OBJECTNESS,
+            &grid_objectness_output(&values),
+            TINY,
+            &Projection::stretch(TINY),
+        );
+        // A cell's center is `(g + off) * stride` and its extent is the planted
+        // pixel figure, so the corner is that center less half the extent; the
+        // stretch then divides by the 64-pixel input. The person is cell (3, 3)
+        // on stride 8, so center 28 and extent 32: 12/64 = 0.1875, 32/64 = 0.5.
+        // The car is cell (1, 1) on stride 16, center 24 extent 16: 16/64 =
+        // 0.25 both ways.
+        assert_eq!(
+            dets,
+            vec![
+                // 0.95 objectness x 0.95 class; the cell beside it is at IoU
+                // 0.60 with the same class and does not survive
+                det("person", 0.902, [0.1875, 0.1875, 0.5, 0.5]),
+                // 0.9 x 0.9 = 0.81 clears car's 0.8; the 0.9 x 0.85 = 0.765
+                // cell does not, and it is the *product* that decides
+                det("car", 0.81, [0.25, 0.25, 0.25, 0.25]),
+                det("bicycle", 0.56, [0.5, 0.0, 0.5, 0.5]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_letterboxed_grid_head_reads_every_row_against_the_content_area_not_the_input() {
+        let values = grid_objectness_tensor();
+        let dets = decode_under(
+            GRID_OBJECTNESS,
+            &grid_objectness_output(&values),
+            TINY,
+            &letterboxed(TINY),
+        );
+        // 1920x1080 into a 64x64 input is 64x36 of content, so `y` is read
+        // against 36 rows rather than 64 — every box the same width and 1.78x
+        // taller, with the same three surviving the same gates.
+        assert_eq!(
+            dets,
+            vec![
+                det("person", 0.902, [0.1875, 0.3333, 0.5, 0.6667]),
+                det("car", 0.81, [0.25, 0.4444, 0.25, 0.4444]),
+                det("bicycle", 0.56, [0.5, 0.0, 0.5, 0.8889]),
+            ]
+        );
+    }
+
+    // ---- head 4: DETR queries `[1, Q, 4]` + `[1, Q, nc]` --------------------
+
+    /// One planted query: a normalized `cx, cy, w, h` box and raw class logits.
+    struct Query {
+        box_: [f32; 4],
+        logits: [f32; NC],
+    }
+
+    fn detr_tensors() -> (Vec<f32>, Vec<f32>) {
+        // A data table: one planted row per line, which is how it is read.
+        #[rustfmt::skip]
+        let planted = [
+            // person, sigmoid(2.0) = 0.881
+            Query { box_: [0.25, 0.25, 0.20, 0.20], logits: [2.0, -4.0, -4.0] },
+            // car, sigmoid(2.5) = 0.924, over its 0.8 floor
+            Query { box_: [0.50, 0.50, 0.10, 0.10], logits: [-4.0, -4.0, 2.5] },
+            // the argmax is car at sigmoid(1.0) = 0.731, under car's 0.8 floor;
+            // bicycle at sigmoid(0.5) = 0.622 clears its own. This query leaves
+            // as a bicycle, which a plain argmax would have thrown away with
+            // its box.
+            Query { box_: [0.75, 0.25, 0.10, 0.20], logits: [-4.0, 0.5, 1.0] },
+            // nothing clears anything
+            Query { box_: [0.10, 0.90, 0.05, 0.05], logits: [-5.0, -5.0, -5.0] },
+            // all but on top of query 0 — kept, because bipartite matching
+            // already de-duplicated and this head runs no NMS
+            Query { box_: [0.26, 0.26, 0.20, 0.20], logits: [2.2, -4.0, -4.0] },
+            // sigmoid(-1.0) = 0.269, just under the 0.3 default
+            Query { box_: [0.40, 0.40, 0.30, 0.30], logits: [-1.0, -1.0, -1.0] },
+        ];
+        let boxes = planted.iter().flat_map(|q| q.box_).collect();
+        let logits = planted.iter().flat_map(|q| q.logits).collect();
+        (boxes, logits)
+    }
+
+    #[test]
+    fn a_stretched_detr_head_emits_one_box_per_query_that_clears_a_floor_and_runs_no_nms() {
+        let (boxes, logits) = detr_tensors();
+        let queries = (boxes.len() / 4) as i64;
+        let dets = decode_under(
+            DETR_QUERIES,
+            &raw_detr(&boxes, &logits, queries, NC as i64),
+            SQUARE,
+            &Projection::stretch(SQUARE),
+        );
+        // These queries are already normalized centers and extents — against
+        // the *input*. The decode scales them to model pixels and the stretch
+        // divides by that same 640, so under this projection the two cancel and
+        // the expectation is the planted row read as a corner: the car at
+        // center 0.50 extent 0.10 is 0.50 - 0.05 = 0.45.
+        assert_eq!(
+            dets,
+            vec![
+                det("car", 0.924, [0.45, 0.45, 0.1, 0.1]),
+                // two all-but-identical queries, both kept
+                det("person", 0.9, [0.16, 0.16, 0.2, 0.2]),
+                det("person", 0.881, [0.15, 0.15, 0.2, 0.2]),
+                // the query whose argmax was car, leaving under its runner-up
+                det("bicycle", 0.622, [0.7, 0.15, 0.1, 0.2]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_letterboxed_detr_head_un_projects_its_normalized_queries_like_every_other_family() {
+        let (boxes, logits) = detr_tensors();
+        let queries = (boxes.len() / 4) as i64;
+        let dets = decode_under(
+            DETR_QUERIES,
+            &raw_detr(&boxes, &logits, queries, NC as i64),
+            SQUARE,
+            &letterboxed(SQUARE),
+        );
+        // The queries are already 0..1 — against the *input*, not the frame.
+        // Scaling them into model pixels is what lets the same un-projection
+        // apply, so a DETR fed a padded frame is not off by the padding.
+        assert_eq!(
+            dets,
+            vec![
+                det("car", 0.924, [0.45, 0.8, 0.1, 0.1778]),
+                det("person", 0.9, [0.16, 0.2844, 0.2, 0.3556]),
+                det("person", 0.881, [0.15, 0.2667, 0.2, 0.3556]),
+                det("bicycle", 0.622, [0.7, 0.2667, 0.1, 0.3556]),
+            ]
+        );
+    }
+
+    // ---- behaviors the composed tests above depend on, stated alone ---------
+
+    #[test]
+    fn a_box_lying_wholly_in_the_letterbox_pad_is_dropped_not_emitted_flat() {
+        // A box below the content area un-projects to a normalized `y` past
+        // 1.0 — rows of frame that never held a pixel. Both corners clamp to
+        // 1.0, so `h` is exactly 0 and the host refuses the whole detection:
+        // `validate_det` requires `w > 0 and h > 0`. Emitting it anyway is not
+        // merely useless — it consumes a `MAX_DETS` slot *ahead of*
+        // `top_dets`'s truncate, so a pad-only ghost can displace a real
+        // detection that would otherwise have been reported.
+        let projection = letterboxed(SQUARE);
+        let ghost = model_box(500.0, 500.0, 600.0, 600.0);
+        assert!(projection.unproject(ghost).corners().y1 > 1.0);
+        assert!(det_from(projection.unproject(ghost), 0.99, "person".into()).is_none());
+
+        // The displacement, in the numbers that make it matter: MAX_DETS real
+        // boxes plus one pad-only ghost scoring higher than any of them. The
+        // ghost must not be what the cap keeps.
+        let mut rows = Vec::new();
+        rows.extend_from_slice(&row(500.0, 500.0, 600.0, 600.0, 0.99, 0.0));
+        for i in 0..MAX_DETS {
+            let x = i as f32 * 10.0;
+            // inside the top 360 rows, so each of these has real area
+            rows.extend_from_slice(&row(x, 0.0, x + 8.0, 36.0, 0.5 + i as f32 / 1000.0, 0.0));
+        }
+        let dets = decode_under(END_TO_END, &end_to_end_output(&rows), SQUARE, &projection);
+        assert_eq!(dets.len(), MAX_DETS);
+        assert!(dets.iter().all(|d| d.bbox[2] > 0.0 && d.bbox[3] > 0.0));
+        // every real box survived, including the weakest — nothing was pushed
+        // off the cut by a detection the host would have thrown away
+        assert!(dets.iter().all(|d| d.score < 0.99));
+        assert_eq!(dets[MAX_DETS - 1].score, 0.5);
+    }
+
+    #[test]
+    fn an_anchor_with_nothing_to_choose_between_argmaxes_to_the_last_class() {
+        // `argmax` is `max_by`, which returns the *last* of several equal
+        // maxima. So an anchor whose class scores are all equal — every
+        // untouched anchor of a sparse tensor — comes out as the *highest*
+        // class id, not class 0. Which floor then drops it is decided by that
+        // last class, and reading it the intuitive way gets the wrong one.
+        assert_eq!(argmax(NC, |_| 0.0), (NC - 1, 0.0));
+
+        let flat = v8_output(3, &[(320.0, 320.0, 64.0, 64.0, 0, 0.0)]);
+        // admitted at a floor every class clears, it leaves as `car` — id 2,
+        // the last — and not as `person`
+        let dets = decode(
+            v8_spec(3),
+            &flat,
+            &[1, 7, 1],
+            &floors(r#"{"default":-1.0}"#),
+            SQUARE,
+        );
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].label, "car");
+        // ...so it is car's own floor that drops it, even though the default
+        // that person and bicycle answer to would have kept it
+        let dets = decode(
+            v8_spec(3),
+            &flat,
+            &[1, 7, 1],
+            &floors(r#"{"default":-1.0,"car":0.8}"#),
+            SQUARE,
+        );
+        assert!(dets.is_empty(), "{dets:?}");
     }
 }

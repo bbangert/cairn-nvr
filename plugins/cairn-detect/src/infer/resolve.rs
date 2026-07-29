@@ -959,8 +959,8 @@ mod tests {
         // Asserted by literal value, not by symbol. Every other test that
         // mentions these writes `DEFAULT_NMS.max_candidates + 200` or similar,
         // so a changed value stays self-consistent and nothing notices — and
-        // the golden fixtures pin `iou` only to the band the planted overlaps
-        // straddle (their IoUs are 0.679 and 0.600), so a typo'd 0.5 would
+        // the composed-tail tests in `heads` pin `iou` only to the band their
+        // planted overlaps straddle (0.679 and 0.600), so a typo'd 0.5 would
         // suppress and keep exactly the same boxes.
         //
         // 0.45 is Ultralytics' own default for a detect head and YOLOX's demo
@@ -1105,6 +1105,127 @@ mod tests {
         .unwrap();
         assert_eq!(profile.name, "yolov10");
         assert_eq!(output.unwrap().layout, Layout::EndToEnd);
+    }
+
+    #[test]
+    fn the_same_six_wide_rows_are_a_one_class_grid_under_yolox_and_final_boxes_under_yolov10() {
+        // The narrowest grid head there is — one class, so `5 + 1` columns — is
+        // exactly as wide as an end-to-end row, and at 640x384 the anchor count
+        // is exactly a plausible row count. So these bytes carry no evidence at
+        // all of which head produced them: left to sniff they are a refusal
+        // (`a_shape_that_fits_two_profiles_is_an_error_naming_both`), and naming
+        // a profile is the operator supplying the evidence the export did not.
+        //
+        // The two readings are not variations on each other. One walks a stride
+        // grid and exponentiates its extents, gates on objectness x class and
+        // runs NMS; the other reads final pixel corners the model already
+        // de-duplicated. Picking wrong emits plausible boxes and says nothing.
+        let wide = InputSize { w: 640, h: 384 };
+        let ambiguous = declared(&[1, 5040, 6]);
+        assert_eq!(grid_anchors(wide, STRIDES), 5040);
+
+        let (profile, _names, output) =
+            resolve_profile(Some(YOLOX), &ambiguous, wide, Path::new("m.onnx")).unwrap();
+        let output = output.expect("a statically shaped export settles its output half");
+        assert_eq!(profile.name, "yolox");
+        // `nc: 1` is the substance: the class column is one wide. Fitting the
+        // same row at any other width reads part of the box as a class score.
+        assert_eq!(
+            output.layout,
+            Layout::GridObjectness {
+                nc: 1,
+                strides: STRIDES
+            }
+        );
+        assert_eq!(output.score, ScoreComposition::ObjTimesClass);
+        assert_eq!(output.nms, Some(DEFAULT_NMS));
+
+        let (profile, _names, output) =
+            resolve_profile(Some(YOLOV10), &ambiguous, wide, Path::new("m.onnx")).unwrap();
+        let output = output.expect("a statically shaped export settles its output half");
+        assert_eq!(profile.name, "yolov10");
+        assert_eq!(output.layout, Layout::EndToEnd);
+        assert_eq!(output.score, ScoreComposition::Class);
+        assert!(output.nms.is_none());
+
+        // ...and with neither named, nothing in the shape chooses between them.
+        let err = resolve_profile(None, &ambiguous, wide, Path::new("m.onnx")).unwrap_err();
+        assert!(
+            matches!(err, ResolveError::AmbiguousProfile { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn resolving_a_model_settles_the_whole_output_half_not_only_the_layout() {
+        // `resolve_profile` hands back an `OutputSpec`, and only its `layout`
+        // is fitted to the model — `score` and `nms` come through from the
+        // profile untouched. Nothing else asserts them *through resolution*:
+        // `the_built_in_profiles_are_the_documented_steps` pins the constants
+        // and every other test here reads `.layout` alone, so a `fit_output`
+        // that rebuilt the spec rather than replacing one field of it would
+        // run YOLOX with no objectness or RF-DETR with no sigmoid, silently
+        // and with plausible boxes.
+        let model = Path::new("m.onnx");
+        let resolved = |declared: &[Declared], size| {
+            let (profile, names, output) = resolve_profile(None, declared, size, model).unwrap();
+            (
+                profile.name,
+                names,
+                output.expect("a statically shaped export settles its output half"),
+            )
+        };
+
+        let (name, names, output) = resolved(&declared(&[1, 3549, 85]), YOLOX_416);
+        assert_eq!(name, "yolox");
+        assert_eq!(names, Outputs::One("output".to_string()));
+        assert_eq!(
+            output.layout,
+            Layout::GridObjectness {
+                nc: 80,
+                strides: STRIDES
+            }
+        );
+        assert_eq!(output.score, ScoreComposition::ObjTimesClass);
+        assert_eq!(output.nms, Some(DEFAULT_NMS));
+        // ...and `nc` is read off the real row width rather than the profile's
+        // COCO 80: the same family, one class short
+        let (_, _, output) = resolved(&declared(&[1, 3549, 84]), YOLOX_416);
+        assert_eq!(
+            output.layout,
+            Layout::GridObjectness {
+                nc: 79,
+                strides: STRIDES
+            }
+        );
+
+        let (name, _, output) = resolved(&declared(&[1, 84, 8400]), SQUARE);
+        assert_eq!(name, "yolov8");
+        assert_eq!(output.layout, Layout::RawClasses { nc: 80 });
+        assert_eq!(output.score, ScoreComposition::Class);
+        assert_eq!(output.nms, Some(DEFAULT_NMS));
+
+        let (name, _, output) = resolved(&declared(&[1, 300, 6]), SQUARE);
+        assert_eq!(name, "yolov10");
+        assert_eq!(output.layout, Layout::EndToEnd);
+        assert_eq!(output.score, ScoreComposition::Class);
+        assert_eq!(
+            output.nms, None,
+            "an end-to-end head has de-duplicated already"
+        );
+
+        let (name, names, output) = resolved(&declared_detr(300, 91), InputSize::square(384));
+        assert_eq!(name, "rfdetr");
+        assert_eq!(
+            names,
+            Outputs::BoxesAndLogits {
+                boxes: "pred_boxes".to_string(),
+                logits: "logits".to_string(),
+            }
+        );
+        assert_eq!(output.layout, Layout::DetrQueries { nc: 91 });
+        assert_eq!(output.score, ScoreComposition::SigmoidClass);
+        assert_eq!(output.nms, None, "set prediction needs no NMS");
     }
 
     #[test]
@@ -1931,8 +2052,12 @@ mod tests {
         };
         assert_eq!(*requested, InputSize::square(320));
         assert_eq!(*declared, InputSize::square(640));
-        // agreeing is not a contradiction
-        assert!(resolve_input_size(Some(SQUARE), Some(SQUARE), None, Path::new("m.onnx")).is_ok());
+        // Agreeing is not a contradiction — and the flag is still what the
+        // startup line credits, because it is the branch that answered.
+        assert_eq!(
+            resolve_input_size(Some(SQUARE), Some(SQUARE), None, Path::new("m.onnx")).unwrap(),
+            (SQUARE, InputSizeSource::Flag)
+        );
     }
 
     // ---- the operator-facing messages ---------------------------------------

@@ -345,6 +345,8 @@ mod tests {
             let fit = ResizePolicy::Stretch.fit(YOLOX_416, source);
             assert_eq!(fit.inner, YOLOX_416);
             assert_eq!(fit.offset, (0, 0));
+            // nothing is padded, so there is no fill to choose
+            assert_eq!(fit.pad, 0);
         }
     }
 
@@ -467,5 +469,94 @@ mod tests {
         );
         // and every box is pulled toward the top of the frame as well
         assert!(bad.y1 < good.y1, "{bad:?} vs {good:?}");
+    }
+
+    #[test]
+    fn an_odd_scaled_side_is_forced_even_and_the_projection_follows_the_side_produced() {
+        // 100x33 into a 64x64 input: the ratio is min(64/100, 64/33) = 0.64,
+        // and the exact height is floor(33 * 0.64) = 21 — odd. The hardware
+        // path scales into NV12, whose chroma planes are half resolution on
+        // both axes, so an odd side there is either refused by the GPU scaler
+        // or silently rounded — and a silent round shifts every box by a
+        // rounding nobody was told about. 21 becomes 20.
+        let input = InputSize::square(64);
+        let source = InputSize { w: 100, h: 33 };
+        let letterbox = ResizePolicy::Letterbox { pad: 114 };
+        assert_eq!(
+            letterbox.fit(input, source).inner,
+            InputSize { w: 64, h: 20 }
+        );
+
+        // Losing that row of content costs nothing in accuracy because the
+        // projection is derived from the side actually produced rather than
+        // from the ratio: 20 rows of content are exactly the whole frame.
+        let projection = letterbox.project(input, source);
+        let content = projection
+            .unproject(model_box(0.0, 0.0, 64.0, 20.0))
+            .corners();
+        assert!((content.x2 - 1.0).abs() < 1e-9, "{content:?}");
+        assert!((content.y2 - 1.0).abs() < 1e-9, "{content:?}");
+        // Derived from the ratio instead, the same rows would have read back as
+        // 20 / 21.12 of the frame — every box short by 5% with nothing to say so.
+        assert!((20.0f64 / (33.0 * 0.64) - 0.947).abs() < 0.001);
+
+        // The rest of the input rectangle is pad, and reads past the bottom:
+        // 64 model rows are 3.2 frames tall at this scale.
+        let whole = projection
+            .unproject(model_box(0.0, 0.0, 64.0, 64.0))
+            .corners();
+        assert!((whole.y2 - 3.2).abs() < 1e-9, "{whole:?}");
+        // ...and a corner outside the rectangle keeps its sign on both axes,
+        // which is what `det_from`'s clamp then cuts away.
+        let outside = projection
+            .unproject(model_box(-8.0, -8.0, 8.0, 8.0))
+            .corners();
+        assert!((outside.x1 + 0.125).abs() < 1e-9, "{outside:?}");
+        assert!((outside.y1 + 0.4).abs() < 1e-9, "{outside:?}");
+    }
+
+    #[test]
+    fn a_portrait_source_pads_the_width_and_reads_that_pad_past_the_right_edge() {
+        // Every other letterbox here pads below. A source taller than it is
+        // wide pads to the *right* instead, and it is `x` that leaves the
+        // frame — the mirror case, and the one an implementation that assumed
+        // landscape gets wrong.
+        let source = InputSize { w: 480, h: 640 };
+        let letterbox = ResizePolicy::Letterbox { pad: 114 };
+        assert_eq!(
+            letterbox.fit(SQUARE, source).inner,
+            InputSize { w: 480, h: 640 }
+        );
+        let projection = letterbox.project(SQUARE, source);
+        let content = projection
+            .unproject(model_box(0.0, 0.0, 480.0, 640.0))
+            .corners();
+        assert!((content.x2 - 1.0).abs() < 1e-9, "{content:?}");
+        assert!((content.y2 - 1.0).abs() < 1e-9, "{content:?}");
+        // the full input rectangle runs 640/480 frames wide and exactly one tall
+        let whole = projection
+            .unproject(model_box(0.0, 0.0, 640.0, 640.0))
+            .corners();
+        assert!((whole.x2 - 640.0 / 480.0).abs() < 1e-9, "{whole:?}");
+        assert!((whole.y2 - 1.0).abs() < 1e-9, "{whole:?}");
+    }
+
+    #[test]
+    fn a_source_smaller_than_the_input_is_scaled_up_rather_than_left_at_its_own_size() {
+        // Nothing about the letterbox assumes the frame is the larger of the
+        // two: 320x180 into 640 is a ratio of 2.0, filling the width and
+        // padding 280 rows below.
+        let source = InputSize { w: 320, h: 180 };
+        let letterbox = ResizePolicy::Letterbox { pad: 114 };
+        assert_eq!(
+            letterbox.fit(SQUARE, source).inner,
+            InputSize { w: 640, h: 360 }
+        );
+        let back = letterbox
+            .project(SQUARE, source)
+            .unproject(model_box(0.0, 0.0, 640.0, 360.0))
+            .corners();
+        assert!((back.x2 - 1.0).abs() < 1e-9, "{back:?}");
+        assert!((back.y2 - 1.0).abs() < 1e-9, "{back:?}");
     }
 }

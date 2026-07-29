@@ -318,3 +318,69 @@ pub(super) fn show(shapes: &Shapes) -> String {
         .collect::<Vec<_>>()
         .join(" + ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_vocabulary_a_resolved_model_is_described_in_names_the_shape_the_score_and_where_the_size_came_from(
+    ) {
+        // `main::model_summary` is the one line an operator reads before any
+        // frame arrives. Two of the three enums below reach it: `Layout`
+        // through `Detector::layout_summary`, and `InputSizeSource` as the
+        // parenthetical beside the size. `Layout` interpolates the counts it
+        // was resolved with, so a layout printing the profile's COCO 80 while
+        // decoding 79 would make that line say the opposite of what the
+        // process is doing.
+        //
+        // `ScoreComposition` is the exception, and it is worth stating plainly
+        // rather than leaving for the next reader to discover: nothing outside
+        // this test formats it. Its `Display` interpolates nothing — three
+        // static strings — `model_summary` has no score field, and the only
+        // other caller it ever had was the fixture renderer retired with the
+        // characterization suite. It is kept because it is vocabulary from the
+        // same table as `Layout`'s and costs three lines, and pinned here so a
+        // rewording is a decision rather than a slip. But it is a live choice:
+        // wire it into `model_summary` — nothing there says whether the process
+        // will multiply by objectness or sigmoid a logit — or delete it. What
+        // it is not is something an operator can read today.
+        assert_eq!(Layout::EndToEnd.to_string(), "end-to-end [1, N, 6]");
+        assert_eq!(
+            Layout::RawClasses { nc: 80 }.to_string(),
+            "raw-classes [1, 4 + 80, A]"
+        );
+        assert_eq!(
+            Layout::GridObjectness {
+                nc: 79,
+                strides: &[8, 16, 32]
+            }
+            .to_string(),
+            "grid-objectness [1, A, 5 + 79] strides 8/16/32"
+        );
+        assert_eq!(
+            Layout::DetrQueries { nc: 91 }.to_string(),
+            "detr-queries [1, Q, 4] + [1, Q, 91]"
+        );
+
+        assert_eq!(ScoreComposition::Class.to_string(), "class");
+        assert_eq!(
+            ScoreComposition::ObjTimesClass.to_string(),
+            "objectness x class"
+        );
+        assert_eq!(
+            ScoreComposition::SigmoidClass.to_string(),
+            "sigmoid(class logit)"
+        );
+
+        // The provenance is the parenthetical beside the size, and it is what
+        // says whether a surprising input size came from the export, the flag
+        // or a family default nobody chose.
+        assert_eq!(InputSizeSource::Model.to_string(), "from model");
+        assert_eq!(InputSizeSource::Flag.to_string(), "from --input-size");
+        assert_eq!(
+            InputSizeSource::Profile.to_string(),
+            "from --model-profile default"
+        );
+    }
+}
