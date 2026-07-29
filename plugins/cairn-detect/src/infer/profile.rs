@@ -318,3 +318,54 @@ pub(super) fn show(shapes: &Shapes) -> String {
         .collect::<Vec<_>>()
         .join(" + ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_vocabulary_the_startup_line_prints_names_the_shape_and_where_it_came_from() {
+        // `main::model_summary` is the one line an operator reads before any
+        // frame arrives, and these three enums are three of its fields. Each
+        // interpolates the counts it was resolved with — a layout that printed
+        // the profile's COCO 80 while decoding 79 would make the line say the
+        // opposite of what the process is doing.
+        assert_eq!(Layout::EndToEnd.to_string(), "end-to-end [1, N, 6]");
+        assert_eq!(
+            Layout::RawClasses { nc: 80 }.to_string(),
+            "raw-classes [1, 4 + 80, A]"
+        );
+        assert_eq!(
+            Layout::GridObjectness {
+                nc: 79,
+                strides: &[8, 16, 32]
+            }
+            .to_string(),
+            "grid-objectness [1, A, 5 + 79] strides 8/16/32"
+        );
+        assert_eq!(
+            Layout::DetrQueries { nc: 91 }.to_string(),
+            "detr-queries [1, Q, 4] + [1, Q, 91]"
+        );
+
+        assert_eq!(ScoreComposition::Class.to_string(), "class");
+        assert_eq!(
+            ScoreComposition::ObjTimesClass.to_string(),
+            "objectness x class"
+        );
+        assert_eq!(
+            ScoreComposition::SigmoidClass.to_string(),
+            "sigmoid(class logit)"
+        );
+
+        // The provenance is the parenthetical beside the size, and it is what
+        // says whether a surprising input size came from the export, the flag
+        // or a family default nobody chose.
+        assert_eq!(InputSizeSource::Model.to_string(), "from model");
+        assert_eq!(InputSizeSource::Flag.to_string(), "from --input-size");
+        assert_eq!(
+            InputSizeSource::Profile.to_string(),
+            "from --model-profile default"
+        );
+    }
+}

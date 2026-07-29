@@ -27,9 +27,6 @@ mod labels;
 mod profile;
 mod resolve;
 
-#[cfg(test)]
-mod golden;
-
 /// Cap on detections in one frame's output line.
 ///
 /// `pub(super)` rather than `pub`: `heads` is the only caller, and nothing

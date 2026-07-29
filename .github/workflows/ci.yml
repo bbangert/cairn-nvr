@@ -139,10 +139,10 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: plugins/cairn-detect
 
-      # Includes the golden characterization fixtures under src/infer/golden/,
-      # which are what prove a refactor of infer.rs was output-identical.
-      # CAIRN_GOLDEN_BLESS must never be set here: it re-records rather than
-      # compares, and a run that compared nothing must not read as a pass.
+      # Includes the composed-tail tests in src/infer/heads.rs, which pin a
+      # whole decoded `Vec<Det>` per head per projection. They replaced the
+      # checked-in golden fixtures the infer.rs refactor was built on: the
+      # coverage stayed, the re-record-on-red machinery did not.
       - run: cargo test
         working-directory: plugins/cairn-detect
 
