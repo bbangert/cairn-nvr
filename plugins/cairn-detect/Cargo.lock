@@ -155,6 +155,7 @@ dependencies = [
  "anyhow",
  "clap",
  "crossbeam-channel",
+ "libc",
  "ort",
  "rsmpeg",
  "serde",

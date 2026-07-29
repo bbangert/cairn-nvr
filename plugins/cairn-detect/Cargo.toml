@@ -15,6 +15,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 crossbeam-channel = "0.5"
 anyhow = "1.0"
+# For `_exit` only: see `control::spawn_reader`. Already in the lock file
+# transitively, so this adds no compilation.
+libc = "0.2"
 # Typed errors for `infer::resolve`; `anyhow` still owns everything above it.
 thiserror = "2.0"
 
