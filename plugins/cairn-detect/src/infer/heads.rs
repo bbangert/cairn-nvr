@@ -421,12 +421,17 @@ fn centered(cx: f64, cy: f64, w: f64, h: f64, size: InputSize) -> Option<ModelBo
     })
 }
 
-/// Where every layout converges: NMS if the head needs it, then the per-label
-/// floor, un-projection, score order and the [`MAX_DETS`] cap.
+/// Where every layout converges: pad-only candidates out, then NMS if the head
+/// needs it, then the per-label floor, un-projection, score order and the
+/// [`MAX_DETS`] cap.
 ///
-/// Un-projection is also where a candidate can stop being a detection at all:
-/// [`det_from`] returns `None` for a box the clamp leaves with no area, and the
-/// `?` below is what drops it before it can occupy a slot the cap measures.
+/// The `retain` below is where a candidate stops being a detection at all: a
+/// box the clamp leaves with no area — see [`wire_bbox`] — is dropped there,
+/// which both keeps it from occupying a slot the cap measures and, the reason
+/// it goes first, keeps it out of [`nms`]. [`det_from`] tests the same predicate
+/// again on the way out. Nothing that reaches it can fail it, the input and the
+/// predicate both being the same; it stays because a conversion that can decline
+/// is what its signature promises every caller, not just this one.
 pub(super) fn finish(
     mut candidates: Vec<Candidate>,
     spec: Option<NmsSpec>,
@@ -434,6 +439,17 @@ pub(super) fn finish(
     floors: &ScoreFloors,
     projection: &Projection,
 ) -> Vec<Det> {
+    // Ahead of everything, because [`nms`] works in model space and cannot see
+    // that a box lying wholly in the letterbox pad is not a detection: there it
+    // has ordinary area, so it can suppress a real box of its own class, and
+    // dropping it afterwards at [`det_from`] cannot bring that box back. Also
+    // ahead of the cut below, so a ghost cannot spend a `max_candidates` slot.
+    //
+    // The survivors are un-projected a second time in `det_from`. Left that
+    // way on purpose: carrying the result through NMS would mean a second box
+    // per candidate, and what it saves is a couple of dozen flops against a
+    // frame that has just been through a whole model.
+    candidates.retain(|candidate| wire_bbox(projection.unproject(candidate.corners)).is_some());
     let kept = match spec {
         Some(spec) => {
             candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -474,20 +490,24 @@ pub(super) fn finish(
 ///
 /// `candidates` must already be sorted by descending score.
 ///
-/// Known residual, left alone deliberately: this runs *before* un-projection,
-/// on model-space boxes, where a box lying wholly in the letterbox pad still
-/// has ordinary area. So a pad-only ghost can suppress a real box of its own
-/// class here, and [`det_from`] dropping the ghost afterwards cannot bring the
-/// suppressed box back. It takes an IoU of at least `threshold` between the
-/// two — 0.45 for every built-in family — and a pad-only box is disjoint from
-/// the content rectangle, so the real box has to extend well into the pad
-/// itself. At 1920x1080 into yolox 416 the content is the top 234 rows: two
-/// same-width boxes, one predicted at rows 190..280 and a ghost at 234..314,
-/// overlap by 46 of a 124 union — IoU 0.37, under the threshold. Clearing it
-/// takes a "real" box that is mostly pad, whose surviving clamped remnant is a
-/// sliver. Narrow but non-empty; the complete fix is to reject pad-only
-/// candidates in model space before this runs, which the projection already
-/// knows enough to do.
+/// This runs on model-space boxes, where a box lying wholly in the letterbox
+/// pad still has ordinary area and is therefore indistinguishable from a real
+/// detection. [`finish`] is what keeps such a box from reaching here, and it
+/// has to: suppression is not recoverable afterwards, so a ghost that got this
+/// far would take a real box with it and then be dropped itself.
+///
+/// Nor does that need a contrived overlap. Take a ghost covering exactly the
+/// part of a real box that hangs past the content rectangle: the overlap is the
+/// whole of the ghost, so the union is the real box alone and
+///
+/// ```text
+/// IoU = (extent of the real box in the pad) / (extent of the real box)
+/// ```
+///
+/// — the real box's pad fraction, nothing else. `threshold` 0.45 therefore
+/// needs only 45% of it in the pad, leaving the majority as content and an
+/// ordinary edge-of-frame detection to lose. See
+/// `a_pad_only_ghost_is_dropped_before_nms_so_it_cannot_suppress_a_real_box`.
 fn nms(candidates: Vec<Candidate>, threshold: f64) -> Vec<Candidate> {
     let mut kept: Vec<Candidate> = Vec::new();
     for candidate in candidates {
@@ -525,14 +545,20 @@ fn iou(a: &ModelBox, b: &ModelBox) -> f64 {
 /// what says so in the type: only [`Projection::unproject`] makes one, so
 /// there is no way to reach here holding model pixels.
 ///
-/// The mapping is partial because clamping to that frame can leave a box with
-/// no area: one lying wholly in the letterbox pad collapses to a line, and the
-/// host requires `w > 0 and h > 0`. Returning `None` rather than a flat `Det`
-/// is what keeps such a box from consuming a [`MAX_DETS`] slot ahead of
-/// [`top_dets`]'s truncate and displacing a real detection. The body comment on
-/// the check says why it reads the rounded extents rather than the raw ones;
-/// [`finish`] is the caller that drops the `None`.
-fn det_from(bbox: NormBox, score: f64, label: String) -> Option<Det> {
+/// **This is the definition of "pad-only", and the only one.** A box lying
+/// wholly in the letterbox pad clamps to a line, so `w` or `h` comes out 0 and
+/// the host refuses the detection outright (`validate_det` requires
+/// `w > 0 and h > 0`). The predicate is therefore not a separate rule but the
+/// arithmetic below: whatever this declines is a ghost. [`finish`] applies it
+/// twice — once directly, before NMS, which is where the drop saves a real box,
+/// and once through [`det_from`], so a box that reaches the wire has area by
+/// construction.
+///
+/// The rounded extents are what it reads, not the raw ones: rounding is what
+/// the host sees, so a sliver narrower than 0.00005 already reaches it as 0.
+/// `.max(0.0)` folds an inverted box (`x2 < x1`, which no head checks for and
+/// only a broken export produces) into the same zero, and it is dropped too.
+fn wire_bbox(bbox: NormBox) -> Option<[f64; 4]> {
     let normalized = bbox.corners();
     let x0 = normalized.x1.clamp(0.0, 1.0);
     let y0 = normalized.y1.clamp(0.0, 1.0);
@@ -540,29 +566,27 @@ fn det_from(bbox: NormBox, score: f64, label: String) -> Option<Det> {
     let y1 = normalized.y2.clamp(0.0, 1.0);
     let w = round_to((x1 - x0).max(0.0), 4);
     let h = round_to((y1 - y0).max(0.0), 4);
-    // A box lying entirely in the letterbox pad clamps to a line: `w` or `h`
-    // comes out 0 and the host refuses the detection outright
-    // (`validate_det` requires `w > 0 and h > 0`). Dropping it here rather
-    // than emitting it is not tidiness — an emitted ghost consumes a
-    // `MAX_DETS` slot *ahead of* `top_dets`'s truncate, so it can displace a
-    // real detection that would otherwise have been reported.
-    //
-    // Tested on the rounded extents, not the raw ones: rounding is what the
-    // host sees, so a sliver narrower than 0.00005 already reaches it as 0.
     if w == 0.0 || h == 0.0 {
         return None;
     }
+    Some([round_to(x0, 4), round_to(y0, 4), w, h])
+}
+
+/// A scored, labelled detection from an un-projected box, or `None` when
+/// [`wire_bbox`] declines the box as one the host would refuse.
+fn det_from(bbox: NormBox, score: f64, label: String) -> Option<Det> {
+    let bbox = wire_bbox(bbox)?;
     Some(Det {
         // `--labels` is arbitrary user text and the host refuses a label it
         // cannot print; shaping it here keeps the detection instead.
         label: crate::emit::shape_label(&label),
-        // Same reason as the bbox clamp below: the host's `validate_det`
+        // Same reason as `wire_bbox`'s clamp: the host's `validate_det`
         // requires a 0..1 score and drops the whole detection otherwise, so a
         // corrupt or badly-quantized export emitting 3.7 would lose a real
         // detection rather than report an odd number. Non-finite scores are
         // already rejected upstream, which is what makes `clamp` total here.
         score: round_to(score.clamp(0.0, 1.0), 3),
-        bbox: [round_to(x0, 4), round_to(y0, 4), w, h],
+        bbox,
     })
 }
 
@@ -2381,6 +2405,65 @@ mod tests {
         // off the cut by a detection the host would have thrown away
         assert!(dets.iter().all(|d| d.score < 0.99));
         assert_eq!(dets[MAX_DETS - 1].score, 0.5);
+    }
+
+    #[test]
+    fn a_pad_only_ghost_is_dropped_before_nms_so_it_cannot_suppress_a_real_box() {
+        // NMS runs in model space, where a box lying wholly in the letterbox
+        // pad still has ordinary area. Left in, a ghost that outscores a real
+        // box of its own class suppresses it there and is then dropped itself
+        // by `det_from` — the real box gone, the ghost reported as nothing.
+        // `finish`'s pre-filter is what keeps that from happening.
+        //
+        // The projection is yolox's real one — the only built-in family that
+        // letterboxes — read against a 1080p camera: 1920x1080 into a 416 input
+        // is 416x234 of content, so model rows 234..416 are padding. The head
+        // below is the raw-classes one only because it takes model pixels
+        // literally and so states the geometry plainly; the defect is in
+        // `finish`, which every head converges on.
+        //
+        // Both boxes span x 104..208. The ghost is rows 234..306 — wholly pad.
+        // The real person is rows 180..306: 54 rows of content and 72 of pad.
+        // Their overlap is the ghost exactly, so the union is the real box
+        // alone and the IoU is 72/126 = 0.571, over `DEFAULT_NMS`'s 0.45.
+        //
+        // Reaching the threshold is about *choosing* the ghost, not about
+        // finding a lucky frame. Fix the ghost's extent first and then measure
+        // the overlap it happens to get, and the number lands under 0.45 — an
+        // earlier reading of this got 0.37 that way and concluded the case was
+        // unreachable. Let the ghost be exactly the overhang and 0.45 asks only
+        // that 45% of the real box lie in the pad, leaving the majority of it as
+        // content. Pad placement is not the point either: the same arithmetic
+        // holds for a centered letterbox. This one is bottom-right only because
+        // `fit` hard-codes a `(0, 0)` offset in both arms.
+        let projection = letterboxed(YOLOX_416);
+        let ghost = model_box(104.0, 234.0, 208.0, 306.0);
+        let real = model_box(104.0, 180.0, 208.0, 306.0);
+        assert!(iou(&ghost, &real) >= DEFAULT_NMS.iou);
+        // the ghost is pad-only: it is what `det_from` declines to emit
+        assert!(det_from(projection.unproject(ghost), 0.9, "person".into()).is_none());
+        // and the real box is not: it keeps the 54 content rows
+        assert!(det_from(projection.unproject(real), 0.7, "person".into()).is_some());
+
+        let values = v8_output(
+            NC,
+            &[
+                // the ghost, outscoring the real box so NMS ranks it first
+                (156.0, 270.0, 104.0, 72.0, 0, 0.9),
+                // the real person at the bottom edge of the frame
+                (156.0, 243.0, 104.0, 126.0, 0, 0.7),
+            ],
+        );
+        let dets = decode_under(
+            RAW_CLASSES,
+            &raw_one(&values, &[1, (4 + NC) as i64, 2]),
+            YOLOX_416,
+            &projection,
+        );
+        // x is read against all 416 columns: 104..208 is 0.25 wide from 0.25.
+        // y is read against the 234 content rows: 180/234 = 0.7692, and the
+        // bottom corner clamps to the frame edge, leaving 0.2308 of height.
+        assert_eq!(dets, vec![det("person", 0.7, [0.25, 0.7692, 0.25, 0.2308])]);
     }
 
     #[test]
