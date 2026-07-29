@@ -89,6 +89,11 @@ jobs:
       CARGO_TERM_COLOR: always
 
     steps:
+      # All eight libav*/libsw*/libpostproc dev packages, not just the five the
+      # crate names: rusty_ffmpeg's build script pkg-configs the whole FFmpeg
+      # library set, so one missing .pc fails the build even though nothing
+      # here calls into it.
+      #
       # libssl-dev is not obvious and not optional: ort-sys's *build script*
       # fetches the prebuilt onnxruntime over TLS via ureq -> native-tls ->
       # openssl-sys, so a missing libssl-dev fails the build before any of
@@ -99,8 +104,8 @@ jobs:
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
             build-essential pkg-config clang libclang-dev \
-            libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
-            libswscale-dev libswresample-dev \
+            libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev \
+            libavutil-dev libpostproc-dev libswresample-dev libswscale-dev \
             libssl-dev \
             curl ca-certificates git
 
