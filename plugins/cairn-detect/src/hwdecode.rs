@@ -19,8 +19,8 @@ use rsmpeg::avutil::{AVFrame, AVHWDeviceContext};
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 
-use crate::decode::{cap_frame_size, Decoder, RgbScaler};
-use crate::infer::InputSize;
+use crate::decode::{cap_frame_size, source_size, Decoder, ModelInput, RgbScaler};
+use crate::infer::{InputSize, InputSpec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HwBackend {
@@ -94,11 +94,18 @@ impl HwBackend {
     /// NV12 -> RGB24 convert afterwards is a fraction of a megapixel of CPU
     /// work per sample. `format=nv12` after `hwdownload` pins the download
     /// format, which otherwise depends on the frames pool's software format.
-    fn filter_spec(self, size: InputSize) -> Option<String> {
+    ///
+    /// `target` is the *content* rectangle, not the model input: under a
+    /// letterbox, those differ, and the GPU has to produce the aspect-preserving
+    /// size or the padding added afterwards would be padding around an already
+    /// distorted picture. The padding itself is added on the CPU while packing
+    /// — no backend here has a portable hardware pad filter, and at the fitted
+    /// size the fill is a few hundred KB of memset per sample.
+    fn filter_spec(self, target: InputSize) -> Option<String> {
         self.scale_filter().map(|scale| {
             format!(
                 "{scale}=w={}:h={}:format=nv12,hwdownload,format=nv12",
-                size.w, size.h
+                target.w, target.h
             )
         })
     }
@@ -134,14 +141,14 @@ pub struct HwDecoder {
     /// Built on the first hardware frame: the graph needs the decoder's frames
     /// pool, which does not exist until something has been decoded.
     graph: Option<(AVFilterGraph, GraphKey)>,
-    size: InputSize,
+    spec: InputSpec,
     rgb: RgbScaler,
     /// Set once we have warned that the backend is not producing device frames.
     degraded: bool,
 }
 
 impl HwDecoder {
-    pub fn open(backend: HwBackend, codecpar: &AVCodecParameters, size: InputSize) -> Result<Self> {
+    pub fn open(backend: HwBackend, codecpar: &AVCodecParameters, spec: InputSpec) -> Result<Self> {
         if let Some(scale) = backend.scale_filter() {
             let name = CString::new(scale).expect("filter names are ascii");
             if AVFilter::get_by_name(&name).is_none() {
@@ -166,13 +173,23 @@ impl HwDecoder {
         ctx.open(None)
             .map_err(|e| anyhow!("opening the {backend} decoder: {e}"))?;
 
-        match backend.filter_spec(size) {
-            Some(spec) => eprintln!(
-                "decoder: {backend} hardware ({}), sampled frames via \"{spec}\"",
-                codec.name().to_string_lossy()
-            ),
+        // The real target depends on the source geometry, which is only
+        // certain once frames arrive; the stream's declared size is what the
+        // graph will almost certainly be built for, so the startup line quotes
+        // that rather than a shape nothing will use.
+        match declared_size(codecpar).map(|source| spec.resize.fit(spec.size, source).inner) {
+            Some(target) => match backend.filter_spec(target) {
+                Some(filter) => eprintln!(
+                    "decoder: {backend} hardware ({}), sampled frames via \"{filter}\"",
+                    codec.name().to_string_lossy()
+                ),
+                None => eprintln!(
+                    "decoder: {backend} hardware ({}), frames land in system memory",
+                    codec.name().to_string_lossy()
+                ),
+            },
             None => eprintln!(
-                "decoder: {backend} hardware ({}), frames land in system memory",
+                "decoder: {backend} hardware ({}), graph built on the first frame",
                 codec.name().to_string_lossy()
             ),
         }
@@ -181,17 +198,18 @@ impl HwDecoder {
             ctx,
             backend,
             graph: None,
-            size,
-            rgb: RgbScaler::new(size)?,
+            spec,
+            rgb: RgbScaler::new(spec)?,
             degraded: false,
         })
     }
 
     /// buffer -> GPU scale -> hwdownload -> buffersink.
-    fn build_graph(&self, frame: &AVFrame) -> Result<AVFilterGraph> {
+    fn build_graph(&self, frame: &AVFrame, source: InputSize) -> Result<AVFilterGraph> {
+        let target = self.spec.resize.fit(self.spec.size, source).inner;
         let spec = self
             .backend
-            .filter_spec(self.size)
+            .filter_spec(target)
             .ok_or_else(|| anyhow!("{} has no filter graph", self.backend))?;
         let spec = CString::new(spec).expect("filter specs are ascii");
 
@@ -287,7 +305,10 @@ impl Decoder for HwDecoder {
         }
     }
 
-    fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<Vec<f32>>> {
+    fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<ModelInput>> {
+        // Read before the graph consumes the frame: this is the geometry the
+        // camera sent, and the downloaded frame below is already scaled.
+        let source = source_size(&frame)?;
         if frame.hw_frames_ctx.is_null() {
             // v4l2m2m decodes on the ASIC but returns system memory, so this
             // is its normal path. For every other backend it means the codec
@@ -304,12 +325,12 @@ impl Decoder for HwDecoder {
                     self.backend, self.backend
                 );
             }
-            return self.rgb.tensor_from(&frame).map(Some);
+            return self.rgb.tensor_from(&frame, source).map(Some);
         }
 
         let key = graph_key(&frame);
         if self.graph.as_ref().map(|(_, k)| *k) != Some(key) {
-            self.graph = Some((self.build_graph(&frame)?, key));
+            self.graph = Some((self.build_graph(&frame, source)?, key));
         }
         let (graph, _) = self.graph.as_ref().expect("graph was just built");
 
@@ -343,8 +364,17 @@ impl Decoder for HwDecoder {
             return Ok(None);
         };
 
-        self.rgb.tensor_from(&downloaded).map(Some)
+        self.rgb.tensor_from(&downloaded, source).map(Some)
     }
+}
+
+/// Geometry the stream's parameter sets declare, when they declare a usable
+/// one. Only the startup log reads it; every graph is built from a real frame.
+fn declared_size(codecpar: &AVCodecParameters) -> Option<InputSize> {
+    (codecpar.width > 0 && codecpar.height > 0).then(|| InputSize {
+        w: codecpar.width as usize,
+        h: codecpar.height as usize,
+    })
 }
 
 #[cfg(test)]
@@ -472,7 +502,15 @@ mod tests {
             raw.height = 1080;
         }
         for backend in [HwBackend::Vaapi, HwBackend::Qsv, HwBackend::Nvdec] {
-            let _ = HwDecoder::open(backend, &codecpar, InputSize::square(640));
+            let _ = HwDecoder::open(
+                backend,
+                &codecpar,
+                InputSpec {
+                    size: InputSize::square(640),
+                    encoding: crate::infer::TensorEncoding::UnitRgb,
+                    resize: crate::infer::ResizePolicy::Stretch,
+                },
+            );
         }
     }
 }

@@ -69,8 +69,12 @@ retention:
 # plugins:
 #   detect:
 #     # the path to your built binary, resolved from Cairn's own working
-#     # directory — not from the plugin's
-#     command: plugins/cairn-detect/target/release/cairn-detect --model yolov10n.onnx --labels coco.names
+#     # directory — not from the plugin's. --labels belongs to the --model
+#     # above it: coco.names is the 80-entry list yolox and the Ultralytics
+#     # families emit, an rfdetr model needs the 91-entry coco91.names.
+#     # cairn-detect refuses to start on a count mismatch rather than emit
+#     # every detection under the wrong class name.
+#     command: plugins/cairn-detect/target/release/cairn-detect --model yolox_nano.onnx --labels coco.names
 
 cameras: []
 #  - id: front_door

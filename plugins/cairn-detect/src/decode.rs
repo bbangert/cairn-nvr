@@ -24,7 +24,7 @@ use rsmpeg::swscale::SwsContext;
 use rsmpeg::UnsafeDerefMut;
 
 use crate::hwdecode::{HwBackend, HwDecoder};
-use crate::infer::InputSize;
+use crate::infer::{Fit, InputSize, InputSpec, Projection};
 
 pub const SAMPLE_FPS: u32 = 5;
 
@@ -63,8 +63,23 @@ pub struct Sample {
     /// because a sample can wait behind a busy model pass, and the host uses
     /// this to place the frame on its timeline, not to measure our latency.
     pub observed_at: SystemTime,
-    /// CHW RGB f32 in 0..1, `3 * w * h` long for the resolved model input.
+    pub input: ModelInput,
+}
+
+/// One frame as the model takes it, plus the way back out.
+///
+/// The two travel together because they are two halves of the same decision:
+/// how this frame was fitted into the input rectangle is what says where the
+/// model's output boxes were in the original picture. Splitting them is how a
+/// letterboxed run silently reports every box against the wrong geometry.
+pub struct ModelInput {
+    /// CHW f32, `3 * w * h` long for the resolved model input, in whichever
+    /// [`TensorEncoding`] the detector asked for.
+    ///
+    /// [`TensorEncoding`]: crate::infer::TensorEncoding
     pub tensor: Vec<f32>,
+    /// Model-space boxes back to this frame's own normalized coordinates.
+    pub projection: Projection,
 }
 
 /// Where [`run`] hands sampled frames to inference.
@@ -105,7 +120,26 @@ pub trait Decoder: Send {
     /// into a filter graph, which consumes it. `Ok(None)` means "no tensor
     /// for this frame, try the next one" — a filter graph that has not
     /// produced output yet is not an error.
-    fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<Vec<f32>>>;
+    fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<ModelInput>>;
+}
+
+/// A decoded frame's own geometry, which is what a projection is built from.
+///
+/// Refused rather than clamped when either axis is non-positive: a scaler
+/// built for it fails much later and a projection built for it divides by
+/// zero.
+pub fn source_size(frame: &AVFrame) -> Result<InputSize> {
+    if frame.width <= 0 || frame.height <= 0 {
+        bail!(
+            "decoded frame has no usable geometry ({}x{})",
+            frame.width,
+            frame.height
+        );
+    }
+    Ok(InputSize {
+        w: frame.width as usize,
+        h: frame.height as usize,
+    })
 }
 
 /// Cap on decoded frame size, applied to every codec context.
@@ -128,14 +162,14 @@ const MAX_PIXELS: i64 = 32 * 1024 * 1024;
 pub fn open(
     kind: DecoderKind,
     codecpar: &AVCodecParameters,
-    size: InputSize,
+    spec: InputSpec,
 ) -> Result<Box<dyn Decoder>> {
     let order = probe_order(kind);
     if order.is_empty() && kind != DecoderKind::Sw && kind != DecoderKind::Auto {
         eprintln!("decoder {kind} is not available on this platform");
     }
     for backend in order {
-        match HwDecoder::open(backend, codecpar, size) {
+        match HwDecoder::open(backend, codecpar, spec) {
             Ok(decoder) => return Ok(Box::new(decoder)),
             Err(e) => eprintln!("hardware decoder {backend} unavailable: {e:#}"),
         }
@@ -143,7 +177,7 @@ pub fn open(
     if kind != DecoderKind::Sw {
         eprintln!("no hardware decoder opened; falling back to software decode");
     }
-    Ok(Box::new(SwDecoder::open(codecpar, size)?))
+    Ok(Box::new(SwDecoder::open(codecpar, spec)?))
 }
 
 /// Backends to try, in order, for a given `--decoder` value.
@@ -188,73 +222,89 @@ const AUTO_ORDER: &[HwBackend] = &[];
 /// NV12 already at the model's size, then lands here for the NV12 -> RGB24
 /// conversion.
 pub struct RgbScaler {
-    size: InputSize,
-    /// Rebuilt if the input ever changes geometry or pixel format mid-run.
-    sws: Option<(SwsContext, (i32, i32, i32))>,
+    spec: InputSpec,
+    /// Rebuilt if the source ever changes geometry or pixel format mid-run.
+    target: Option<Target>,
+}
+
+/// Everything settled by one (source geometry, pixel format) pair.
+struct Target {
+    key: (i32, i32, i32, InputSize),
+    sws: SwsContext,
+    fit: Fit,
+    /// RGB24 at `fit.inner` — the *content* rectangle, not the whole input.
+    /// Padding is added while packing rather than scaled into, so swscale
+    /// never has to write into a sub-rectangle of a larger frame.
     rgb: AVFrame,
 }
 
 impl RgbScaler {
-    pub fn new(size: InputSize) -> Result<Self> {
+    pub fn new(spec: InputSpec) -> Result<Self> {
+        Ok(Self { spec, target: None })
+    }
+
+    /// `source` is the geometry of the frame as the *camera* sent it, which is
+    /// not always `frame`'s: on the hardware path the GPU has already scaled
+    /// the frame down to the fit's content size, and the fit — and so the
+    /// projection — is still the original frame's.
+    fn ensure_target(&mut self, frame: &AVFrame, source: InputSize) -> Result<()> {
+        let key = (frame.width, frame.height, frame.format, source);
+        if self.target.as_ref().map(|t| t.key) == Some(key) {
+            return Ok(());
+        }
+        let fit = self.spec.resize.fit(self.spec.size, source);
         let mut rgb = AVFrame::new();
-        rgb.set_width(size.w as i32);
-        rgb.set_height(size.h as i32);
+        rgb.set_width(fit.inner.w as i32);
+        rgb.set_height(fit.inner.h as i32);
         rgb.set_format(ffi::AV_PIX_FMT_RGB24);
         rgb.alloc_buffer()
             .context("allocating the RGB scale target")?;
-        Ok(Self {
-            size,
-            sws: None,
-            rgb,
-        })
-    }
-
-    fn ensure_scaler(&mut self, frame: &AVFrame) -> Result<()> {
-        let key = (frame.width, frame.height, frame.format);
-        if self.sws.as_ref().map(|(_, k)| *k) != Some(key) {
-            // Letterbox-free stretch: bboxes are normalized, so only ratios
-            // matter and the model sees the whole frame either way.
-            let sws = SwsContext::get_context(
+        let sws = SwsContext::get_context(
+            frame.width,
+            frame.height,
+            frame.format,
+            fit.inner.w as i32,
+            fit.inner.h as i32,
+            ffi::AV_PIX_FMT_RGB24,
+            ffi::SWS_BILINEAR,
+            None,
+            None,
+            None,
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "no scaler for {}x{} pixel format {} to {}",
                 frame.width,
                 frame.height,
                 frame.format,
-                self.size.w as i32,
-                self.size.h as i32,
-                ffi::AV_PIX_FMT_RGB24,
-                ffi::SWS_BILINEAR,
-                None,
-                None,
-                None,
+                fit.inner
             )
-            .ok_or_else(|| {
-                anyhow!(
-                    "no scaler for {}x{} pixel format {}",
-                    frame.width,
-                    frame.height,
-                    frame.format
-                )
-            })?;
-            self.sws = Some((sws, key));
-        }
+        })?;
+        self.target = Some(Target { key, sws, fit, rgb });
         Ok(())
     }
 
-    pub fn tensor_from(&mut self, frame: &AVFrame) -> Result<Vec<f32>> {
+    pub fn tensor_from(&mut self, frame: &AVFrame, source: InputSize) -> Result<ModelInput> {
         let height = frame.height;
-        self.ensure_scaler(frame)?;
-        let (scaler, _) = self.sws.as_mut().expect("scaler was just set");
-        scaler
-            .scale_frame(frame, 0, height, &mut self.rgb)
+        self.ensure_target(frame, source)?;
+        let target = self.target.as_mut().expect("target was just set");
+        target
+            .sws
+            .scale_frame(frame, 0, height, &mut target.rgb)
             .context("scaling to the model input size")?;
 
-        let stride = self.rgb.linesize[0] as usize;
-        // SAFETY: `self.rgb` is our own `alloc_buffer`'d RGB24 frame of
-        // `self.size`, so data[0] is non-null and the allocation covers
-        // linesize[0] * height bytes. Both invariants break if
-        // `RgbScaler::new` ever stops allocating the frame it describes.
-        let plane =
-            unsafe { slice::from_raw_parts(self.rgb.data[0] as *const u8, stride * self.size.h) };
-        Ok(rgb_to_chw(plane, stride, self.size))
+        let stride = target.rgb.linesize[0] as usize;
+        // SAFETY: `target.rgb` is our own `alloc_buffer`'d RGB24 frame of
+        // `target.fit.inner`, so data[0] is non-null and the allocation covers
+        // linesize[0] * height bytes. Both invariants break if `ensure_target`
+        // ever stops allocating the frame it describes.
+        let plane = unsafe {
+            slice::from_raw_parts(target.rgb.data[0] as *const u8, stride * target.fit.inner.h)
+        };
+        Ok(ModelInput {
+            tensor: pack_chw(plane, stride, target.fit, self.spec),
+            projection: target.fit.projection(source),
+        })
     }
 }
 
@@ -264,7 +314,7 @@ struct SwDecoder {
 }
 
 impl SwDecoder {
-    fn open(codecpar: &AVCodecParameters, size: InputSize) -> Result<Self> {
+    fn open(codecpar: &AVCodecParameters, spec: InputSpec) -> Result<Self> {
         let codec = AVCodec::find_decoder(codecpar.codec_id)
             .ok_or_else(|| anyhow!("no decoder for codec id {}", codecpar.codec_id))?;
         let mut ctx = AVCodecContext::new(&codec);
@@ -276,7 +326,7 @@ impl SwDecoder {
         eprintln!("decoder: software ({})", codec.name().to_string_lossy());
         Ok(Self {
             ctx,
-            rgb: RgbScaler::new(size)?,
+            rgb: RgbScaler::new(spec)?,
         })
     }
 }
@@ -300,8 +350,9 @@ impl Decoder for SwDecoder {
         }
     }
 
-    fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<Vec<f32>>> {
-        self.rgb.tensor_from(&frame).map(Some)
+    fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<ModelInput>> {
+        let source = source_size(&frame)?;
+        self.rgb.tensor_from(&frame, source).map(Some)
     }
 }
 
@@ -310,17 +361,37 @@ pub fn cap_frame_size(ctx: &mut AVCodecContext) {
     unsafe { ctx.deref_mut() }.max_pixels = MAX_PIXELS;
 }
 
-/// Packed RGB24 rows (`stride` may exceed the row width) -> CHW f32 in 0..1.
-fn rgb_to_chw(plane: &[u8], stride: usize, size: InputSize) -> Vec<f32> {
+/// Packed RGB24 rows (`stride` may exceed the row width) -> CHW f32, placed
+/// into the model's input rectangle according to `fit`.
+///
+/// The scale target is always RGB24 because that is one pixel format for
+/// swscale to reach from anything; the encoding decides only what happens on
+/// the way into the planes — the affine, and for BGR which source byte each
+/// plane draws from.
+///
+/// The padding goes through the same encoding as the pixels: the model was
+/// trained on a padded picture, not on an out-of-range constant. Under a
+/// stretch `fit.inner` *is* the input, so there is no padding and the fill is
+/// skipped rather than written and immediately overwritten.
+fn pack_chw(plane: &[u8], stride: usize, fit: Fit, spec: InputSpec) -> Vec<f32> {
+    let size = spec.size;
+    let packing = spec.encoding.packing();
     let plane_len = size.w * size.h;
     let mut tensor = vec![0f32; size.tensor_len()];
-    for y in 0..size.h {
-        let row = &plane[y * stride..y * stride + size.w * 3];
-        for x in 0..size.w {
+    if fit.inner != size {
+        for (p, chunk) in tensor.chunks_exact_mut(plane_len).enumerate() {
+            chunk.fill(packing.value(p, fit.pad));
+        }
+    }
+    let (ox, oy) = fit.offset;
+    for y in 0..fit.inner.h {
+        let row = &plane[y * stride..y * stride + fit.inner.w * 3];
+        for x in 0..fit.inner.w {
             let px = &row[x * 3..x * 3 + 3];
-            tensor[y * size.w + x] = f32::from(px[0]) / 255.0;
-            tensor[plane_len + y * size.w + x] = f32::from(px[1]) / 255.0;
-            tensor[2 * plane_len + y * size.w + x] = f32::from(px[2]) / 255.0;
+            let at = (oy + y) * size.w + ox + x;
+            for (p, source) in packing.source.iter().enumerate() {
+                tensor[p * plane_len + at] = packing.value(p, px[*source]);
+            }
         }
     }
     tensor
@@ -382,8 +453,8 @@ pub fn run(
             // sws has no path for a mid-stream format change, a filter graph
             // rebuild can fail transiently, and restarting is expensive (model
             // load plus up to a minute of open retries).
-            let tensor = match decoder.to_tensor(frame) {
-                Ok(Some(tensor)) => tensor,
+            let input = match decoder.to_tensor(frame) {
+                Ok(Some(input)) => input,
                 Ok(None) => continue,
                 Err(e) => {
                     note_error(&mut tensor_errors, "sample conversion", &e);
@@ -393,7 +464,7 @@ pub fn run(
             if !sink.offer(Sample {
                 pts_90k,
                 observed_at,
-                tensor,
+                input,
             })? {
                 dropped += 1;
                 if dropped.is_multiple_of(50) {
@@ -428,6 +499,32 @@ fn pts_90k(frame: &AVFrame, time_base: AVRational) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::infer::{ResizePolicy, TensorEncoding};
+
+    fn spec(size: InputSize, encoding: TensorEncoding, resize: ResizePolicy) -> InputSpec {
+        InputSpec {
+            size,
+            encoding,
+            resize,
+        }
+    }
+
+    fn unit_rgb(size: InputSize) -> InputSpec {
+        spec(size, TensorEncoding::UnitRgb, ResizePolicy::Stretch)
+    }
+
+    /// Pack a whole `size`-sized RGB24 buffer with no padding, which is what
+    /// `Stretch` always produces.
+    fn stretched(
+        plane: &[u8],
+        stride: usize,
+        size: InputSize,
+        encoding: TensorEncoding,
+    ) -> Vec<f32> {
+        let spec = spec(size, encoding, ResizePolicy::Stretch);
+        pack_chw(plane, stride, ResizePolicy::Stretch.fit(size, size), spec)
+    }
 
     #[test]
     fn rescales_pts_to_90khz() {
@@ -482,7 +579,7 @@ mod tests {
             raw.width = 1920;
             raw.height = 1080;
         }
-        let decoder = SwDecoder::open(&codecpar, InputSize::square(640)).unwrap();
+        let decoder = SwDecoder::open(&codecpar, unit_rgb(InputSize::square(640))).unwrap();
         assert_eq!(decoder.ctx.max_pixels, MAX_PIXELS);
         // Generous enough for 8K, small enough that a 16384x16384 SPS fails.
         const { assert!(MAX_PIXELS > 7680 * 4320) };
@@ -497,7 +594,7 @@ mod tests {
             let mut plane = vec![0u8; stride * size.h];
             plane[0..9].copy_from_slice(&[255, 0, 0, 0, 255, 0, 0, 0, 255]);
 
-            let tensor = rgb_to_chw(&plane, stride, size);
+            let tensor = stretched(&plane, stride, size, TensorEncoding::UnitRgb);
             let plane_len = size.w * size.h;
             assert_eq!(tensor.len(), size.tensor_len());
             assert_eq!(tensor.len(), 3 * plane_len);
@@ -507,6 +604,157 @@ mod tests {
             assert_eq!(tensor[1], 0.0);
             assert!(tensor.iter().all(|v| (0.0..=1.0).contains(v)));
         }
+    }
+
+    #[test]
+    fn raw_bgr_keeps_the_byte_values_and_swaps_the_outer_planes() {
+        let size = InputSize { w: 320, h: 192 };
+        let stride = size.w * 3 + 16;
+        let mut plane = vec![0u8; stride * size.h];
+        // pixel 0 is pure red, pixel 1 pure green, pixel 2 pure blue
+        plane[0..9].copy_from_slice(&[255, 0, 0, 0, 255, 0, 0, 0, 255]);
+
+        let tensor = stretched(&plane, stride, size, TensorEncoding::RawBgr);
+        let plane_len = size.w * size.h;
+        assert_eq!(tensor.len(), size.tensor_len());
+        // 0..255, not 0..1
+        assert_eq!(tensor[2 * plane_len], 255.0);
+        // plane 0 is blue, plane 2 is red: the red pixel lands in the last
+        // plane and the blue one in the first
+        assert_eq!(tensor[2], 255.0);
+        assert_eq!(tensor[plane_len + 1], 255.0);
+        assert_eq!(tensor[0], 0.0);
+        assert!(tensor.iter().all(|v| (0.0..=255.0).contains(v)));
+    }
+
+    #[test]
+    fn imagenet_normalization_reaches_the_tensor() {
+        // The plumbing, not the arithmetic (which `infer` pins): an encoding
+        // with a non-zero bias has to survive the packer, which for a long
+        // time could only express a scale.
+        let size = InputSize { w: 64, h: 32 };
+        let stride = size.w * 3;
+        // every pixel pure red
+        let mut plane = vec![0u8; stride * size.h];
+        for px in plane.chunks_exact_mut(3) {
+            px[0] = 255;
+        }
+        let tensor = stretched(&plane, stride, size, TensorEncoding::ImageNetRgb);
+        let plane_len = size.w * size.h;
+        assert_eq!(tensor.len(), size.tensor_len());
+        // red plane is (1 - 0.485) / 0.229, green and blue are (0 - mean)/std:
+        // negative, which no other encoding here can produce
+        assert!((tensor[0] - 2.2489).abs() < 1e-3, "{}", tensor[0]);
+        assert!(
+            (tensor[plane_len] - -2.0357).abs() < 1e-3,
+            "{}",
+            tensor[plane_len]
+        );
+        assert!(
+            (tensor[2 * plane_len] - -1.8044).abs() < 1e-3,
+            "{}",
+            tensor[2 * plane_len]
+        );
+        assert!(tensor.iter().any(|v| *v < 0.0), "bias was dropped");
+    }
+
+    #[test]
+    fn only_the_encoding_differs_between_the_two_packings() {
+        // Same bytes, same geometry: every value is the other's, scaled and
+        // with the outer planes exchanged. Nothing else may move.
+        let size = InputSize { w: 64, h: 32 };
+        let stride = size.w * 3;
+        let plane: Vec<u8> = (0..stride * size.h).map(|i| (i % 251) as u8).collect();
+        let plane_len = size.w * size.h;
+
+        let unit = stretched(&plane, stride, size, TensorEncoding::UnitRgb);
+        let raw = stretched(&plane, stride, size, TensorEncoding::RawBgr);
+        for i in 0..plane_len {
+            for (raw, unit) in [
+                (raw[i], unit[2 * plane_len + i]),
+                (raw[plane_len + i], unit[plane_len + i]),
+                (raw[2 * plane_len + i], unit[i]),
+            ] {
+                assert!((0.0..=255.0).contains(&raw));
+                assert!((raw / 255.0 - unit).abs() < 1e-6, "{raw} vs {unit}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_letterboxed_pack_places_the_content_at_the_origin_and_pads_the_rest() {
+        // 1920x1080 into a 416x416 input: 416x234 of picture with 182 rows of
+        // 114 under it, which is what YOLOX's own preproc builds.
+        let input = InputSize::square(416);
+        let source = InputSize { w: 1920, h: 1080 };
+        let resize = ResizePolicy::Letterbox { pad: 114 };
+        let fit = resize.fit(input, source);
+        assert_eq!(fit.inner, InputSize { w: 416, h: 234 });
+
+        let stride = fit.inner.w * 3 + 8;
+        let plane = vec![255u8; stride * fit.inner.h];
+        let tensor = pack_chw(
+            &plane,
+            stride,
+            fit,
+            spec(input, TensorEncoding::RawBgr, resize),
+        );
+
+        assert_eq!(tensor.len(), input.tensor_len());
+        let plane_len = input.w * input.h;
+        for p in 0..3 {
+            // the content rows carry the picture...
+            assert_eq!(tensor[p * plane_len], 255.0, "plane {p} row 0");
+            assert_eq!(
+                tensor[p * plane_len + (fit.inner.h - 1) * input.w + input.w - 1],
+                255.0,
+                "plane {p} last content pixel"
+            );
+            // ...and every row below them is the pad, in the tensor's own
+            // encoding rather than a raw 114 that a 0..1 model would read as
+            // an impossible value
+            assert_eq!(
+                tensor[p * plane_len + fit.inner.h * input.w],
+                114.0,
+                "plane {p} first pad row"
+            );
+            assert_eq!(tensor[(p + 1) * plane_len - 1], 114.0, "plane {p} last pad");
+        }
+        let pad_count = tensor.iter().filter(|v| **v == 114.0).count();
+        assert_eq!(pad_count, 3 * (input.h - fit.inner.h) * input.w);
+    }
+
+    #[test]
+    fn the_letterbox_pad_goes_through_the_encoding() {
+        // The same 114 grey, packed for a 0..1 model: 114/255, not 114.
+        let input = InputSize::square(64);
+        let resize = ResizePolicy::Letterbox { pad: 114 };
+        let fit = resize.fit(input, InputSize { w: 128, h: 64 });
+        assert_eq!(fit.inner, InputSize { w: 64, h: 32 });
+        let stride = fit.inner.w * 3;
+        let plane = vec![0u8; stride * fit.inner.h];
+        let tensor = pack_chw(
+            &plane,
+            stride,
+            fit,
+            spec(input, TensorEncoding::UnitRgb, resize),
+        );
+        let first_pad = fit.inner.h * input.w;
+        assert!(
+            (tensor[first_pad] - 114.0 / 255.0).abs() < 1e-6,
+            "{}",
+            tensor[first_pad]
+        );
+        assert!(tensor.iter().all(|v| (0.0..=1.0).contains(v)));
+    }
+
+    #[test]
+    fn a_stretch_pack_leaves_no_padding_at_all() {
+        let size = InputSize { w: 64, h: 32 };
+        let stride = size.w * 3;
+        let plane = vec![7u8; stride * size.h];
+        let tensor = stretched(&plane, stride, size, TensorEncoding::RawBgr);
+        assert!(tensor.iter().all(|v| *v == 7.0));
     }
 
     #[test]

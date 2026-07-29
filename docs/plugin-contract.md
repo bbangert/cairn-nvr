@@ -242,7 +242,7 @@ Your own health, whenever it changes:
 attach any meaning to it: it stores the string and shows it. `"starting"`,
 `"ready"` and `"error"` are the conventional values and what the reference
 plugin emits — a plugin covering model load would send
-`{"state":"starting","detail":"loading yolov10n.onnx"}` and then
+`{"state":"starting","detail":"loading yolox_nano.onnx"}` and then
 `{"state":"ready"}` — but any printable 1..32-byte string is valid, and no
 behavior anywhere changes with it.
 
@@ -718,7 +718,7 @@ plugins:
   detect:
     # the path to your built binary, resolved from Cairn's own working
     # directory — not from the plugin's
-    command: plugins/cairn-detect/target/release/cairn-detect --model yolov10n.onnx --labels coco.names
+    command: plugins/cairn-detect/target/release/cairn-detect --model yolox_nano.onnx --labels coco.names
 
 cameras:
   - id: front_door
@@ -733,7 +733,7 @@ cameras:
   - id: garage
     rtsp_url: rtsp://user:pass@10.0.0.12:554/stream1
     # inline command: its own process, per-camera contract, as before
-    plugin: ["./cairn-detect", "--model", "yolov10n.onnx"]
+    plugin: ["./cairn-detect", "--model", "yolox_nano.onnx"]
 ```
 
 - `plugins:` maps a group name to a `command` — a string (split on
