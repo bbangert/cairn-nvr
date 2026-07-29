@@ -449,6 +449,85 @@ mod tests {
     }
 
     #[test]
+    fn a_centered_letterbox_reads_its_content_rectangle_back_as_the_whole_frame() {
+        // `ResizePolicy::fit` hard-codes `offset: (0, 0)` in both of its arms, so
+        // no production path can hand `unproject` a non-zero one and its two
+        // `v - self.offset.N` terms subtract a constant nothing everywhere the
+        // pipeline runs. The field is not unused — `decode::pack_chw` reads it to
+        // place the scaled content inside the input rectangle — and it is what a
+        // *centered* letterbox would set. `Fit`'s fields are public, so this
+        // builds that `Fit` directly and gives both terms a caller that notices
+        // if either goes.
+        //
+        // 1920x1080 into 416x416. `inner` is what
+        // `letterbox_scales_by_the_smaller_ratio_and_pads_bottom_right` already
+        // pins for this pair: the ratio is min(416/1920, 416/1080) = 13/60 and
+        // floor(1080 * 13/60) = 234, already even. Centering splits the
+        // remaining 416 - 234 = 182 rows evenly, so the content starts at row
+        // (416 - 234) / 2 = 91 and runs to 91 + 234 = 325.
+        //
+        // `Fit::projection` takes the scale from `inner` rather than from the
+        // ratio, so it is (416/1920, 234/1080): those 234 model rows are exactly
+        // the frame's 1080, and columns 0..416 exactly its 1920.
+        let projection = Fit {
+            inner: InputSize { w: 416, h: 234 },
+            offset: (0, 91),
+            pad: 114,
+        }
+        .projection(WIDE);
+        assert_eq!(
+            projection
+                .unproject(model_box(0.0, 91.0, 416.0, 325.0))
+                .corners(),
+            Bbox {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 1.0,
+                y2: 1.0
+            }
+        );
+        // Rows 0..91 are the pad *above* the content, so they read back above
+        // the top of the frame, which `det_from`'s clamp then cuts away. That
+        // sign is the difference the offset makes: with the padding all
+        // bottom-right, no model row inside the input rectangle un-projects to a
+        // negative `y` at all.
+        let above = projection
+            .unproject(model_box(0.0, 0.0, 416.0, 45.0))
+            .corners();
+        assert!(above.y2 < 0.0, "{above:?}");
+
+        // The mirror case, so the `x` term is pinned as well: a portrait source
+        // centers horizontally. 480x640 into 640x640 has ratio min(640/480,
+        // 640/640) = 1.0, so `inner` is the source size — the same `inner`
+        // `a_portrait_source_pads_the_width_and_reads_that_pad_past_the_right_edge`
+        // pins — and the spare 640 - 480 = 160 columns split into 80 each side,
+        // putting the content at 80..560.
+        let portrait = InputSize { w: 480, h: 640 };
+        let projection = Fit {
+            inner: portrait,
+            offset: (80, 0),
+            pad: 114,
+        }
+        .projection(portrait);
+        assert_eq!(
+            projection
+                .unproject(model_box(80.0, 0.0, 560.0, 640.0))
+                .corners(),
+            Bbox {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 1.0,
+                y2: 1.0
+            }
+        );
+        // ...and the pad to its left reads back past the frame's left edge.
+        let left = projection
+            .unproject(model_box(0.0, 0.0, 40.0, 640.0))
+            .corners();
+        assert!(left.x2 < 0.0, "{left:?}");
+    }
+
+    #[test]
     fn stretch_and_letterbox_disagree_on_a_16_by_9_frame() {
         // The bug this fix exists for, stated as a number: a box that is
         // square in the camera's frame is decoded from a model that saw it
