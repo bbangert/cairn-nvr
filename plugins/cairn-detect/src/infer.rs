@@ -2121,6 +2121,9 @@ fn round_to(value: f64, places: u32) -> f64 {
 }
 
 #[cfg(test)]
+mod golden;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2470,8 +2473,15 @@ mod tests {
         assert_eq!(YOLOX.input.encoding, TensorEncoding::RawBgr);
         assert_eq!(YOLOX.input.resize, ResizePolicy::Letterbox { pad: 114 });
         assert_eq!(YOLOX.input.size, YOLOX_416);
+        assert_eq!(
+            YOLOX.output.layout,
+            Layout::GridObjectness {
+                nc: 80,
+                strides: &[8, 16, 32]
+            }
+        );
         assert_eq!(YOLOX.output.score, ScoreComposition::ObjTimesClass);
-        assert!(YOLOX.output.nms.is_some());
+        assert_eq!(YOLOX.output.nms, Some(DEFAULT_NMS));
 
         assert_eq!(YOLOV10.input.encoding, TensorEncoding::UnitRgb);
         assert_eq!(YOLOV10.input.resize, ResizePolicy::Stretch);
@@ -2481,8 +2491,9 @@ mod tests {
 
         assert_eq!(YOLOV8.input.encoding, TensorEncoding::UnitRgb);
         assert_eq!(YOLOV8.input.resize, ResizePolicy::Stretch);
+        assert_eq!(YOLOV8.output.layout, Layout::RawClasses { nc: 80 });
         assert_eq!(YOLOV8.output.score, ScoreComposition::Class);
-        assert!(YOLOV8.output.nms.is_some());
+        assert_eq!(YOLOV8.output.nms, Some(DEFAULT_NMS));
 
         // Measured against onnx-community/rfdetr_nano-ONNX, not assumed: the
         // export's own `preprocessor_config.json` and RF-DETR's
@@ -2503,6 +2514,22 @@ mod tests {
             );
             assert_eq!(two, profile.name == "rfdetr", "{}", profile.name);
         }
+    }
+
+    #[test]
+    fn the_nms_defaults_are_the_upstream_ones() {
+        // Asserted by literal value, not by symbol. Every other test that
+        // mentions these writes `DEFAULT_NMS.max_candidates + 200` or similar,
+        // so a changed value stays self-consistent and nothing notices — and
+        // the golden fixtures pin `iou` only to the band the planted overlaps
+        // straddle (their IoUs are 0.679 and 0.600), so a typo'd 0.5 would
+        // suppress and keep exactly the same boxes.
+        //
+        // 0.45 is Ultralytics' own default for a detect head and YOLOX's demo
+        // value; 300 is the candidate cap that bounds NMS's O(k^2) against a
+        // 640x640 head's 8400 anchors.
+        assert_eq!(DEFAULT_NMS.iou, 0.45);
+        assert_eq!(DEFAULT_NMS.max_candidates, 300);
     }
 
     #[test]
