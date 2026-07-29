@@ -74,9 +74,8 @@ pub struct Sample {
 /// letterboxed run silently reports every box against the wrong geometry.
 pub struct ModelInput {
     /// CHW f32, `3 * w * h` long for the resolved model input, in whichever
-    /// [`TensorEncoding`] the detector asked for.
+    /// `TensorEncoding` the detector asked for.
     ///
-    /// [`TensorEncoding`]: crate::infer::TensorEncoding
     pub tensor: Vec<f32>,
     /// Model-space boxes back to this frame's own normalized coordinates.
     pub projection: Projection,
