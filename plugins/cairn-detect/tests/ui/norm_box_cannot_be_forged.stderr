@@ -1,0 +1,16 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/ui/support/infer.rs
+  |
+  |         NormBox(b)
+  |         ^^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> tests/ui/support/../../../src/infer/geometry.rs
+  |
+  | pub(super) struct NormBox(Bbox);
+  |                           ^^^^ private field
+help: consider making the field publicly accessible
+ --> tests/ui/support/../../../src/infer/geometry.rs
+  |
+  | pub(super) struct NormBox(pub Bbox);
+  |                           +++
