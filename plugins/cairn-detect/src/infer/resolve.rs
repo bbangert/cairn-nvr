@@ -91,10 +91,11 @@ pub(super) enum ResolveError {
     /// only thing keeping the two apart mechanically. They are otherwise the
     /// same three field types, both construction sites use field-init
     /// shorthand, and swapping one variant name for the other compiled clean
-    /// and passed all 188 tests until `a_settled_layout_refuses_a_tensor_by_
-    /// its_own_name_not_the_sniffers` was written for it. A differing field
-    /// name makes that swap `E0559` at both sites — verified in both
-    /// directions — which is a guard no test can offer.
+    /// and passed all 188 tests until
+    /// `a_settled_layout_refuses_a_tensor_by_its_own_name_not_the_sniffers`
+    /// was written for it. A differing field name makes that swap `E0559` at
+    /// both sites — verified in both directions — which is a guard no test
+    /// can offer.
     ///
     /// [`OutputShapeMismatch`]: ResolveError::OutputShapeMismatch
     #[error("output shape {} does not fit {proposed}; expected {}", show(got), proposed.expected(*size))]
