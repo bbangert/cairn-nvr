@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use super::catalog::{RFDETR, YOLOV10, YOLOV8, YOLOX};
-use super::geometry::{InputSize, Projection, ResizePolicy};
+use super::geometry::{Bbox, InputSize, ModelBox, Projection, ResizePolicy};
 use super::heads::{decode_output, Raw};
 use super::labels::{Labels, ScoreFloors};
 use super::profile::{Layout, ModelProfile, OutputSpec, Outputs, ScoreComposition, DEFAULT_NMS};
@@ -483,16 +483,20 @@ fn one<'a>(values: &'a [f32], dims: &[i64]) -> Outputs<Raw<'a>> {
 /// rectangle, a box inside it, a box that reaches into the letterbox padding,
 /// and one that starts outside the rectangle entirely — which a real
 /// letterboxed decode does emit and un-projection is what brings back.
-fn probes(input: InputSize) -> Vec<(&'static str, [f64; 4])> {
+fn probes(input: InputSize) -> Vec<(&'static str, ModelBox)> {
     let (w, h) = (input.w as f64, input.h as f64);
+    let corners = |x1, y1, x2, y2| ModelBox(Bbox { x1, y1, x2, y2 });
     vec![
-        ("full_input", [0.0, 0.0, w, h]),
+        ("full_input", corners(0.0, 0.0, w, h)),
         (
             "centered_quarter",
-            [w / 4.0, h / 4.0, 3.0 * w / 4.0, 3.0 * h / 4.0],
+            corners(w / 4.0, h / 4.0, 3.0 * w / 4.0, 3.0 * h / 4.0),
         ),
-        ("into_the_pad", [w / 2.0, h / 2.0, w, h]),
-        ("outside_top_left", [-w / 8.0, -h / 8.0, w / 8.0, h / 8.0]),
+        ("into_the_pad", corners(w / 2.0, h / 2.0, w, h)),
+        (
+            "outside_top_left",
+            corners(-w / 8.0, -h / 8.0, w / 8.0, h / 8.0),
+        ),
     ]
 }
 
@@ -564,7 +568,14 @@ fn golden_projections() {
         let projection = policy.project(input, source);
         let unprojected: serde_json::Map<String, Value> = probes(input)
             .into_iter()
-            .map(|(probe, corners)| (probe.to_string(), json!(projection.unproject(corners))))
+            .map(|(probe, corners)| {
+                // Rendered as the four corners explicitly rather than by
+                // serializing a `NormBox`: the fixture is a checked-in wire
+                // format and must not be the reason a production type grows a
+                // `Serialize` derive.
+                let b = projection.unproject(corners).corners();
+                (probe.to_string(), json!([b.x1, b.y1, b.x2, b.y2]))
+            })
             .collect();
         fixture.insert(
             name.to_string(),

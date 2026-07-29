@@ -193,6 +193,44 @@ impl Fit {
     }
 }
 
+/// A box as its two corners: `x1, y1` top-left, `x2, y2` bottom-right.
+///
+/// Named fields rather than `[f64; 4]` so a transposed index is a
+/// compile error rather than a box that decodes to the wrong rectangle. It
+/// carries no coordinate space of its own — [`ModelBox`] and [`NormBox`] are
+/// what say which space a given box is in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Bbox {
+    pub(super) x1: f64,
+    pub(super) y1: f64,
+    pub(super) x2: f64,
+    pub(super) y2: f64,
+}
+
+/// Corners in model-input pixels: the space every decode head works in.
+///
+/// Freely constructible inside `infer`, because producing one is what the
+/// heads do. Consuming one is the restricted direction — see [`NormBox`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ModelBox(pub(super) Bbox);
+
+/// Corners normalized 0..1 against the *original* frame: the contract's space.
+///
+/// The inner field is private to this module on purpose, so
+/// [`Projection::unproject`] is the **only** way to obtain one. That is what
+/// makes a missed un-projection a compile error rather than a box reported
+/// against the model's input rectangle — which under a letterbox is not the
+/// frame at all, part of it being padding that never held a pixel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct NormBox(Bbox);
+
+impl NormBox {
+    /// The corners, for the one consumer that turns them into a `Det`.
+    pub(super) fn corners(self) -> Bbox {
+        self.0
+    }
+}
+
 /// Model-space box -> normalized original-frame box.
 ///
 /// Every decode path takes one of these rather than an [`InputSize`], because
@@ -212,12 +250,22 @@ pub struct Projection {
 }
 
 impl Projection {
-    /// `[x0, y0, x1, y1]` in model pixels -> the same box normalized 0..1
-    /// against the original frame. Not clamped: `det_from` does that.
-    pub fn unproject(&self, corners: [f64; 4]) -> [f64; 4] {
+    /// Model pixels -> the same box normalized 0..1 against the original
+    /// frame. Not clamped: `det_from` does that.
+    ///
+    /// The sole constructor of a [`NormBox`], which is what makes skipping
+    /// this call fail to compile rather than silently report model-space
+    /// numbers as frame-relative ones.
+    pub(super) fn unproject(&self, corners: ModelBox) -> NormBox {
         let x = |v: f64| (v - self.offset.0) / self.scale.0 / self.source.0;
         let y = |v: f64| (v - self.offset.1) / self.scale.1 / self.source.1;
-        [x(corners[0]), y(corners[1]), x(corners[2]), y(corners[3])]
+        let ModelBox(corners) = corners;
+        NormBox(Bbox {
+            x1: x(corners.x1),
+            y1: y(corners.y1),
+            x2: x(corners.x2),
+            y2: y(corners.y2),
+        })
     }
 
     /// The stretch projection for an input size, for callers with no frame in
@@ -273,6 +321,11 @@ mod tests {
     /// The 16:9 source the fix exists for: 1920x1080 into a 416x416 model.
     const WIDE: InputSize = InputSize { w: 1920, h: 1080 };
 
+    /// A model-space box from corners a test names literally.
+    fn model_box(x1: f64, y1: f64, x2: f64, y2: f64) -> ModelBox {
+        ModelBox(Bbox { x1, y1, x2, y2 })
+    }
+
     #[test]
     fn stretch_fills_the_whole_input_and_ignores_the_source() {
         for source in [WIDE, InputSize { w: 2560, h: 1920 }, YOLOX_416] {
@@ -324,12 +377,12 @@ mod tests {
             for policy in [ResizePolicy::Stretch, ResizePolicy::Letterbox { pad: 114 }] {
                 let fit = policy.fit(YOLOX_416, source);
                 let projection = fit.projection(source);
-                let whole = [0.0, 0.0, fit.inner.w as f64, fit.inner.h as f64];
-                let back = projection.unproject(whole);
-                assert_eq!(back[0], 0.0, "{policy} {source}");
-                assert_eq!(back[1], 0.0, "{policy} {source}");
-                assert!((back[2] - 1.0).abs() < 1e-9, "{policy} {source}: {back:?}");
-                assert!((back[3] - 1.0).abs() < 1e-9, "{policy} {source}: {back:?}");
+                let whole = model_box(0.0, 0.0, fit.inner.w as f64, fit.inner.h as f64);
+                let back = projection.unproject(whole).corners();
+                assert_eq!(back.x1, 0.0, "{policy} {source}");
+                assert_eq!(back.y1, 0.0, "{policy} {source}");
+                assert!((back.x2 - 1.0).abs() < 1e-9, "{policy} {source}: {back:?}");
+                assert!((back.y2 - 1.0).abs() < 1e-9, "{policy} {source}: {back:?}");
             }
         }
     }
@@ -338,16 +391,19 @@ mod tests {
     fn stretch_un_projection_is_a_divide_by_the_input_size() {
         // The pre-existing rule, unchanged: independent of the source frame.
         let projection = ResizePolicy::Stretch.project(SQUARE, WIDE);
+        let probe = model_box(64.0, 128.0, 192.0, 320.0);
         assert_eq!(
-            projection.unproject([64.0, 128.0, 192.0, 320.0]),
-            [0.1, 0.2, 0.3, 0.5]
+            projection.unproject(probe).corners(),
+            Bbox {
+                x1: 0.1,
+                y1: 0.2,
+                x2: 0.3,
+                y2: 0.5
+            }
         );
         // ...and the same box under the same input from a different source
         let other = ResizePolicy::Stretch.project(SQUARE, InputSize::square(720));
-        assert_eq!(
-            other.unproject([64.0, 128.0, 192.0, 320.0]),
-            projection.unproject([64.0, 128.0, 192.0, 320.0])
-        );
+        assert_eq!(other.unproject(probe), projection.unproject(probe));
     }
 
     #[test]
@@ -355,14 +411,22 @@ mod tests {
         // 1920x1080 -> 416x234 content with 182 rows of pad below it. A box
         // filling the content's lower half is the frame's lower half.
         let projection = ResizePolicy::Letterbox { pad: 114 }.project(YOLOX_416, WIDE);
-        let back = projection.unproject([0.0, 117.0, 416.0, 234.0]);
-        assert!((back[0] - 0.0).abs() < 1e-9, "{back:?}");
-        assert!((back[1] - 0.5).abs() < 1e-9, "{back:?}");
-        assert!((back[2] - 1.0).abs() < 1e-9, "{back:?}");
-        assert!((back[3] - 1.0).abs() < 1e-9, "{back:?}");
+        let back = projection
+            .unproject(model_box(0.0, 117.0, 416.0, 234.0))
+            .corners();
+        assert!((back.x1 - 0.0).abs() < 1e-9, "{back:?}");
+        assert!((back.y1 - 0.5).abs() < 1e-9, "{back:?}");
+        assert!((back.x2 - 1.0).abs() < 1e-9, "{back:?}");
+        assert!((back.y2 - 1.0).abs() < 1e-9, "{back:?}");
         // A box down in the padding un-projects past the bottom of the frame,
         // which `det_from` clamps away rather than reporting as content.
-        assert!(projection.unproject([0.0, 300.0, 10.0, 320.0])[1] > 1.0);
+        assert!(
+            projection
+                .unproject(model_box(0.0, 300.0, 10.0, 320.0))
+                .corners()
+                .y1
+                > 1.0
+        );
     }
 
     #[test]
@@ -375,20 +439,20 @@ mod tests {
         let letterbox = ResizePolicy::Letterbox { pad: 114 }.project(YOLOX_416, source);
         let stretch = ResizePolicy::Stretch.project(YOLOX_416, source);
         // the same model-space box read both ways
-        let box_ = [104.0, 58.0, 312.0, 176.0];
-        let good = letterbox.unproject(box_);
-        let bad = stretch.unproject(box_);
-        assert!((good[0] - bad[0]).abs() < 1e-9, "x is unaffected");
+        let box_ = model_box(104.0, 58.0, 312.0, 176.0);
+        let good = letterbox.unproject(box_).corners();
+        let bad = stretch.unproject(box_).corners();
+        assert!((good.x1 - bad.x1).abs() < 1e-9, "x is unaffected");
         // The letterboxed picture only occupies the top 234 of 416 rows, so
         // reading it with the stretch rule squashes every box's height by
         // exactly the aspect ratio, 1080/1920.
-        let good_h = good[3] - good[1];
-        let bad_h = bad[3] - bad[1];
+        let good_h = good.y2 - good.y1;
+        let bad_h = bad.y2 - bad.y1;
         assert!(
             (bad_h / good_h - 1080.0 / 1920.0).abs() < 0.001,
             "{bad_h} vs {good_h}"
         );
         // and every box is pulled toward the top of the frame as well
-        assert!(bad[1] < good[1], "{bad:?} vs {good:?}");
+        assert!(bad.y1 < good.y1, "{bad:?} vs {good:?}");
     }
 }

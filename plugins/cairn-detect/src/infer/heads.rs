@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::emit::Det;
 
-use super::geometry::{InputSize, Projection};
+use super::geometry::{Bbox, InputSize, ModelBox, NormBox, Projection};
 use super::labels::{Labels, ScoreFloors};
 use super::profile::{grid_anchors, show, Layout, NmsSpec, OutputSpec, Outputs, ScoreComposition};
 use super::resolve::validate_layout;
@@ -61,8 +61,8 @@ fn class_floors(nc: usize, labels: &Labels, floors: &ScoreFloors) -> Vec<f64> {
 pub(super) struct Candidate {
     score: f64,
     class_id: usize,
-    /// `[x0, y0, x1, y1]`.
-    corners: [f64; 4],
+    /// Corners in model-input pixels, still to be un-projected.
+    corners: ModelBox,
 }
 
 /// Pull every anchor/row the layout offers above its floor into candidates.
@@ -171,12 +171,12 @@ fn end_to_end(rows: &[f32], prefilter: f64) -> Vec<Candidate> {
             Some(Candidate {
                 score,
                 class_id: row[5].max(0.0).round() as usize,
-                corners: [
-                    f64::from(row[0]),
-                    f64::from(row[1]),
-                    f64::from(row[2]),
-                    f64::from(row[3]),
-                ],
+                corners: ModelBox(Bbox {
+                    x1: f64::from(row[0]),
+                    y1: f64::from(row[1]),
+                    x2: f64::from(row[2]),
+                    y2: f64::from(row[3]),
+                }),
             })
         })
         .collect()
@@ -404,14 +404,21 @@ fn argmax(n: usize, score: impl Fn(usize) -> f64) -> (usize, f64) {
 /// worst possible false positive for something that drives recording. Nothing
 /// real is `MAX_EXTENT` times the input rectangle, so cutting there costs
 /// nothing and removes the failure mode.
-fn centered(cx: f64, cy: f64, w: f64, h: f64, size: InputSize) -> Option<[f64; 4]> {
+fn centered(cx: f64, cy: f64, w: f64, h: f64, size: InputSize) -> Option<ModelBox> {
     /// How far past the input rectangle an extent may still be a real box.
     /// Generous: a letterboxed decode legitimately puts boxes outside the
     /// content rectangle, and un-projection is what brings them back.
     const MAX_EXTENT: f64 = 4.0;
     let finite = cx.is_finite() && cy.is_finite() && w.is_finite() && h.is_finite();
     let bounded = w <= MAX_EXTENT * size.w as f64 && h <= MAX_EXTENT * size.h as f64;
-    (finite && bounded).then(|| [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0])
+    (finite && bounded).then(|| {
+        ModelBox(Bbox {
+            x1: cx - w / 2.0,
+            y1: cy - h / 2.0,
+            x2: cx + w / 2.0,
+            y2: cy + h / 2.0,
+        })
+    })
 }
 
 /// Where every layout converges: NMS if the head needs it, then the per-label
@@ -443,7 +450,11 @@ pub(super) fn finish(
             (candidate.score >= floors.floor_for(&label)).then(|| {
                 (
                     candidate.score,
-                    det_from(candidate.corners, candidate.score, label, projection),
+                    det_from(
+                        projection.unproject(candidate.corners),
+                        candidate.score,
+                        label,
+                    ),
                 )
             })
         })
@@ -473,12 +484,13 @@ fn nms(candidates: Vec<Candidate>, threshold: f64) -> Vec<Candidate> {
     kept
 }
 
-/// Intersection over union of two `[x0, y0, x1, y1]` boxes.
-fn iou(a: &[f64; 4], b: &[f64; 4]) -> f64 {
-    let overlap_w = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
-    let overlap_h = (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
+/// Intersection over union of two boxes, both in model-input pixels.
+fn iou(a: &ModelBox, b: &ModelBox) -> f64 {
+    let (ModelBox(a), ModelBox(b)) = (a, b);
+    let overlap_w = (a.x2.min(b.x2) - a.x1.max(b.x1)).max(0.0);
+    let overlap_h = (a.y2.min(b.y2) - a.y1.max(b.y1)).max(0.0);
     let overlap = overlap_w * overlap_h;
-    let area = |r: &[f64; 4]| (r[2] - r[0]).max(0.0) * (r[3] - r[1]).max(0.0);
+    let area = |r: &Bbox| (r.x2 - r.x1).max(0.0) * (r.y2 - r.y1).max(0.0);
     let union = area(a) + area(b) - overlap;
     if union <= 0.0 {
         0.0
@@ -487,16 +499,18 @@ fn iou(a: &[f64; 4], b: &[f64; 4]) -> f64 {
     }
 }
 
-/// Model-space corners -> the contract's normalized `[x, y, w, h]`.
+/// Already-un-projected corners -> the contract's normalized `[x, y, w, h]`.
 ///
 /// Contract: bbox normalized 0..1 against the *original* frame — which is what
-/// the projection knows and the input size does not.
-fn det_from(corners: [f64; 4], score: f64, label: String, projection: &Projection) -> Det {
-    let normalized = projection.unproject(corners);
-    let x0 = normalized[0].clamp(0.0, 1.0);
-    let y0 = normalized[1].clamp(0.0, 1.0);
-    let x1 = normalized[2].clamp(0.0, 1.0);
-    let y1 = normalized[3].clamp(0.0, 1.0);
+/// the projection knows and the input size does not. Taking a [`NormBox`] is
+/// what says so in the type: only [`Projection::unproject`] makes one, so
+/// there is no way to reach here holding model pixels.
+fn det_from(bbox: NormBox, score: f64, label: String) -> Det {
+    let normalized = bbox.corners();
+    let x0 = normalized.x1.clamp(0.0, 1.0);
+    let y0 = normalized.y1.clamp(0.0, 1.0);
+    let x1 = normalized.x2.clamp(0.0, 1.0);
+    let y1 = normalized.y2.clamp(0.0, 1.0);
     Det {
         // `--labels` is arbitrary user text and the host refuses a label it
         // cannot print; shaping it here keeps the detection instead.
@@ -549,6 +563,11 @@ mod tests {
 
     fn open() -> ScoreFloors {
         floors("{}")
+    }
+
+    /// A model-space box from corners a test names literally.
+    fn model_box(x1: f64, y1: f64, x2: f64, y2: f64) -> ModelBox {
+        ModelBox(Bbox { x1, y1, x2, y2 })
     }
 
     const SQUARE: InputSize = InputSize::square(640);
@@ -840,15 +859,15 @@ mod tests {
 
     #[test]
     fn iou_is_symmetric_and_bounded() {
-        let a = [0.0, 0.0, 10.0, 10.0];
+        let a = model_box(0.0, 0.0, 10.0, 10.0);
         assert_eq!(iou(&a, &a), 1.0);
-        assert_eq!(iou(&a, &[20.0, 20.0, 30.0, 30.0]), 0.0);
+        assert_eq!(iou(&a, &model_box(20.0, 20.0, 30.0, 30.0)), 0.0);
         // half-overlap: 50 shared of 150 union
-        let b = [5.0, 0.0, 15.0, 10.0];
+        let b = model_box(5.0, 0.0, 15.0, 10.0);
         assert!((iou(&a, &b) - 1.0 / 3.0).abs() < 1e-12);
         assert_eq!(iou(&a, &b), iou(&b, &a));
         // a degenerate box shares no area with anything
-        assert_eq!(iou(&a, &[1.0, 1.0, 1.0, 1.0]), 0.0);
+        assert_eq!(iou(&a, &model_box(1.0, 1.0, 1.0, 1.0)), 0.0);
     }
 
     #[test]
@@ -1491,6 +1510,50 @@ mod tests {
     }
 
     // ---- decode plumbing ---------------------------------------------------
+
+    #[test]
+    fn only_an_un_projection_can_produce_the_box_det_from_accepts() {
+        // `det_from` takes a `NormBox` and `Projection::unproject` is its only
+        // constructor, so there is no way to reach the wire format still
+        // holding model pixels. What that buys is here in numbers: the same
+        // model-space corners under two projections are two different
+        // detections, and the type is what stops one being mistaken for the
+        // other by omitting the call.
+        let corners = model_box(0.0, 0.0, 416.0, 234.0);
+        let letterboxed = det_from(
+            ResizePolicy::Letterbox { pad: 114 }
+                .project(YOLOX_416, WIDE)
+                .unproject(corners),
+            0.9,
+            "car".into(),
+        );
+        let stretched = det_from(
+            Projection::stretch(YOLOX_416).unproject(corners),
+            0.9,
+            "car".into(),
+        );
+        // the content rectangle of a 16:9 letterbox *is* the whole frame...
+        assert_eq!(letterboxed.bbox, [0.0, 0.0, 1.0, 1.0]);
+        // ...while the stretch rule reads those same rows as its top 234/416
+        assert_eq!(stretched.bbox, [0.0, 0.0, 1.0, 0.5625]);
+    }
+
+    #[test]
+    fn det_from_shapes_the_label_on_its_way_to_the_wire() {
+        // No golden fixture reaches `shape_label` — every one of them decodes
+        // under names that are already clean — and `det_from`'s signature is
+        // what Phase 2 rewrites. `--labels` is arbitrary user text and the
+        // host refuses a detection whose label it cannot print, so a dropped
+        // call here loses real detections with every other gate green.
+        let raw = "ca\u{7}r\n";
+        let det = det_from(
+            Projection::stretch(SQUARE).unproject(model_box(0.0, 0.0, 64.0, 64.0)),
+            0.5,
+            raw.to_string(),
+        );
+        assert_eq!(det.label, "car");
+        assert_eq!(det.label, crate::emit::shape_label(raw));
+    }
 
     #[test]
     fn a_letterboxed_decode_reports_boxes_against_the_original_frame() {
