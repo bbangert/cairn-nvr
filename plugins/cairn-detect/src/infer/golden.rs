@@ -165,8 +165,8 @@ fn floors() -> ScoreFloors {
     ScoreFloors::parse(r#"{"default": 0.3, "car": 0.8}"#).expect("a literal floor table")
 }
 
-/// The model path every resolution error names. Nothing opens it — the
-/// resolvers only quote it back.
+/// The model path every resolver here is handed. Nothing opens it — a resolver
+/// only quotes it back when it refuses.
 const MODEL_PATH: &str = "model.onnx";
 
 const MODEL: InputSize = InputSize::square(640);
@@ -610,49 +610,38 @@ fn detr_outputs(queries: i64, nc: i64) -> Vec<Declared> {
     ]
 }
 
-/// An error as the fixture records it: one array entry per link of the chain.
-///
-/// Deliberately not `format!("{err:#}")`. That flattens the chain into one
-/// string using a format `anyhow` owns, and Phase 3 replaces these errors with
-/// `thiserror`, which ignores `{:#}` — every multi-link entry would collapse to
-/// its outer message and the diff would read like a reworded string while
-/// actually recording *lost context*. An array makes the link count part of
-/// what is pinned.
-fn error_chain(err: &anyhow::Error) -> Value {
-    json!({
-        "error": err.chain().map(ToString::to_string).collect::<Vec<_>>(),
-    })
-}
-
 /// A resolution outcome, as the fixture records it: the profile it settled on
-/// and how the whole output half was read, or the error chain the operator
-/// would see.
+/// and how the whole output half was read.
+///
+/// Only the cases that *resolve* are recorded. A refusal is pinned by variant
+/// and field in `resolve.rs`'s own tests, with its wording asserted once beside
+/// the variant it belongs to — recording the prose a second time here would
+/// make every deliberate rewording read as a regression.
 fn resolution(explicit: Option<ModelProfile>, outputs: &[Declared], size: InputSize) -> Value {
-    match resolve_profile(explicit, outputs, size, Path::new(MODEL_PATH)) {
-        Ok((profile, names, output)) => json!({
-            "profile": profile.name,
-            "outputs": match &names {
-                Outputs::One(one) => json!({ "one": one }),
-                Outputs::BoxesAndLogits { boxes, logits } => json!({
-                    "boxes": boxes,
-                    "logits": logits,
-                }),
-            },
-            // `None` is the deferred case: the export pinned no shape and `nc`
-            // waits for the first real output.
-            "layout": output.map(|output| output.layout.to_string()),
-            // The rest of the `OutputSpec`, which nothing else compares by
-            // value. Phase 1 hand-copies the profile table into new modules, so
-            // a family silently rewired to the wrong score composition or NMS
-            // parameters is exactly the mistake that phase can make.
-            "score": output.map(|output| output.score.to_string()),
-            "nms": output.and_then(|output| output.nms).map(|nms| json!({
-                "iou": nms.iou,
-                "max_candidates": nms.max_candidates,
-            })),
-        }),
-        Err(err) => error_chain(&err),
-    }
+    let (profile, names, output) = resolve_profile(explicit, outputs, size, Path::new(MODEL_PATH))
+        .expect("every case below resolves; the refusals live in resolve.rs");
+    json!({
+        "profile": profile.name,
+        "outputs": match &names {
+            Outputs::One(one) => json!({ "one": one }),
+            Outputs::BoxesAndLogits { boxes, logits } => json!({
+                "boxes": boxes,
+                "logits": logits,
+            }),
+        },
+        // `None` is the deferred case: the export pinned no shape and `nc`
+        // waits for the first real output.
+        "layout": output.map(|output| output.layout.to_string()),
+        // The rest of the `OutputSpec`, which nothing else compares by
+        // value. Phase 1 hand-copies the profile table into new modules, so
+        // a family silently rewired to the wrong score composition or NMS
+        // parameters is exactly the mistake that phase can make.
+        "score": output.map(|output| output.score.to_string()),
+        "nms": output.and_then(|output| output.nms).map(|nms| json!({
+            "iou": nms.iou,
+            "max_candidates": nms.max_candidates,
+        })),
+    })
 }
 
 #[test]
@@ -690,27 +679,12 @@ fn golden_profile_resolution() {
             detr_outputs(300, 91),
             InputSize::square(384),
         ),
-        // --- the documented ambiguities ---
+        // --- the documented ambiguity, settled by naming a profile ---
         // 5040 is both this input's yolox anchor count and a plausible N of
         // end-to-end rows; 6 is both `5 + 1` class and the end-to-end width.
-        (
-            "ambiguous_yolox_1class_vs_end_to_end",
-            None,
-            vec![declared("output", Some(vec![1, 5040, 6]))],
-            wide,
-        ),
-        // A 336-query DETR that declares its logits first offers a perfectly
-        // good 80-class yolox grid as its first output, at 128x128.
-        (
-            "ambiguous_detr_logits_first_vs_yolox_grid",
-            None,
-            vec![
-                declared("logits", Some(vec![1, 336, 85])),
-                declared("pred_boxes", Some(vec![1, 336, 4])),
-            ],
-            InputSize::square(128),
-        ),
-        // --- naming a profile settles both of them ---
+        // Left to sniff, that shape is a refusal — pinned by variant in
+        // `resolve.rs`. Named, the same bytes decode two entirely different
+        // ways, and *that* is what these two records are for.
         (
             "explicit_yolox_on_the_ambiguous_shape",
             Some(YOLOX),
@@ -722,31 +696,6 @@ fn golden_profile_resolution() {
             Some(YOLOV10),
             vec![declared("output", Some(vec![1, 5040, 6]))],
             wide,
-        ),
-        // --- failures ---
-        (
-            "no_profile_fits",
-            None,
-            vec![declared("output", Some(vec![1, 10, 7]))],
-            MODEL,
-        ),
-        (
-            "nothing_to_sniff_from",
-            None,
-            vec![declared("output", None)],
-            MODEL,
-        ),
-        (
-            "explicit_profile_mismatch",
-            Some(RFDETR),
-            vec![declared("output", Some(vec![1, 300, 6]))],
-            InputSize::square(384),
-        ),
-        (
-            "explicit_profile_wrong_shape",
-            Some(YOLOV8),
-            vec![declared("output", Some(vec![1, 300, 6]))],
-            MODEL,
         ),
         // --- deferral: shapes dynamic but the roles still bind by name ---
         (
@@ -780,42 +729,40 @@ struct SizeCase {
     profile: Option<ModelProfile>,
 }
 
-/// The other half of resolution, which Phase 3's typed errors also cover:
-/// where the input size comes from and when a grid head refuses one.
+/// The other half of resolution: which of the three sources the input size
+/// comes from, and the sizes a stride-walking head accepts.
+///
+/// The refusals either half can produce — a flag contradicting the model, a
+/// size nothing pins, a size past a limit, a grid the strides do not divide —
+/// are pinned by variant in `resolve.rs`, one message assertion each. They are
+/// deliberately not recorded here as prose.
 #[test]
 fn golden_input_size_resolution() {
     // A data table: one case per line, which is how it is read.
     #[rustfmt::skip]
     let cases = [
-        SizeCase { name: "model_pins_it",                 declared: Some(MODEL), requested: None,                                 profile: Some(YOLOV8) },
-        SizeCase { name: "flag_supplies_it",              declared: None,        requested: Some(InputSize::square(512)),         profile: Some(RFDETR) },
-        SizeCase { name: "profile_default",               declared: None,        requested: None,                                 profile: Some(YOLOX)  },
-        SizeCase { name: "flag_contradicts_model",        declared: Some(MODEL), requested: Some(InputSize::square(416)),         profile: Some(YOLOX)  },
-        SizeCase { name: "flag_agrees_with_model",        declared: Some(MODEL), requested: Some(MODEL),                          profile: Some(YOLOV8) },
-        // A family whose every export leaves its spatial axes dynamic supplies
-        // no default at all, so this one has nowhere left to look.
-        SizeCase { name: "variant_family_has_no_default", declared: None,        requested: None,                                 profile: Some(RFDETR) },
-        SizeCase { name: "no_profile_and_nothing_pinned", declared: None,        requested: None,                                 profile: None         },
-        SizeCase { name: "over_the_per_axis_limit",       declared: None,        requested: Some(InputSize { w: 9000, h: 64 }),   profile: None         },
-        // Inside the per-axis limit and far outside the area one.
-        SizeCase { name: "over_the_pixel_limit",          declared: None,        requested: Some(InputSize { w: 4096, h: 2048 }), profile: None         },
+        SizeCase { name: "model_pins_it",          declared: Some(MODEL), requested: None,                         profile: Some(YOLOV8) },
+        SizeCase { name: "flag_supplies_it",       declared: None,        requested: Some(InputSize::square(512)), profile: Some(RFDETR) },
+        SizeCase { name: "profile_default",        declared: None,        requested: None,                         profile: Some(YOLOX)  },
+        SizeCase { name: "flag_agrees_with_model", declared: Some(MODEL), requested: Some(MODEL),                  profile: Some(YOLOV8) },
     ];
 
     let mut sizes = serde_json::Map::new();
     for case in cases {
-        let outcome = match resolve_input_size(
+        let (size, source) = resolve_input_size(
             case.declared,
             case.requested,
             case.profile,
             Path::new(MODEL_PATH),
-        ) {
-            Ok((size, source)) => json!({
+        )
+        .expect("every case above resolves; the refusals live in resolve.rs");
+        sizes.insert(
+            case.name.to_string(),
+            json!({
                 "size": [size.w, size.h],
                 "source": source.to_string(),
             }),
-            Err(err) => error_chain(&err),
-        };
-        sizes.insert(case.name.to_string(), outcome);
+        );
     }
 
     let grid_layout = Layout::GridObjectness {
@@ -825,17 +772,8 @@ fn golden_input_size_resolution() {
     let divisibility: Vec<(&str, Layout, InputSize)> = vec![
         ("grid_416_square", grid_layout, InputSize::square(416)),
         ("grid_640x384", grid_layout, InputSize { w: 640, h: 384 }),
-        (
-            "grid_400_not_a_multiple_of_32",
-            grid_layout,
-            InputSize::square(400),
-        ),
-        (
-            "grid_640x300_height_only",
-            grid_layout,
-            InputSize { w: 640, h: 300 },
-        ),
-        // Only a grid head has strides to divide by; the rest never refuse.
+        // 400 is not a multiple of the coarsest stride, and only a grid head
+        // has strides to divide by: the same size a grid refuses passes here.
         (
             "end_to_end_ignores_strides",
             Layout::EndToEnd,
@@ -844,11 +782,9 @@ fn golden_input_size_resolution() {
     ];
     let mut grids = serde_json::Map::new();
     for (name, layout, size) in divisibility {
-        let outcome = match check_grid_divides_input(layout, size) {
-            Ok(()) => json!({ "ok": true }),
-            Err(err) => error_chain(&err),
-        };
-        grids.insert(name.to_string(), outcome);
+        check_grid_divides_input(layout, size)
+            .expect("every size above is accepted; the refusals live in resolve.rs");
+        grids.insert(name.to_string(), json!({ "ok": true }));
     }
 
     check(

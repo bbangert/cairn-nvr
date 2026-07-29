@@ -159,6 +159,7 @@ dependencies = [
  "rsmpeg",
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
