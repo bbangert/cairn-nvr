@@ -83,9 +83,23 @@ pub(super) enum ResolveError {
     /// A shape that cannot be read as the given layout kind, from
     /// [`fit_layout`] — the discriminating check, which is why the message
     /// names what the kind expects.
-    #[error("output shape {} does not fit {layout}; expected {}", show(got), layout.expected(*size))]
+    ///
+    /// The field is `proposed` rather than `layout`, and not only for accuracy
+    /// — though it is that too: [`fit_layout`] receives a profile's *candidate*
+    /// layout and asks whether the shape can be read as one, while
+    /// [`OutputShapeMismatch`] receives one already settled. It is also the
+    /// only thing keeping the two apart mechanically. They are otherwise the
+    /// same three field types, both construction sites use field-init
+    /// shorthand, and swapping one variant name for the other compiled clean
+    /// and passed all 188 tests until `a_settled_layout_refuses_a_tensor_by_
+    /// its_own_name_not_the_sniffers` was written for it. A differing field
+    /// name makes that swap `E0559` at both sites — verified in both
+    /// directions — which is a guard no test can offer.
+    ///
+    /// [`OutputShapeMismatch`]: ResolveError::OutputShapeMismatch
+    #[error("output shape {} does not fit {proposed}; expected {}", show(got), proposed.expected(*size))]
     LayoutDoesNotFit {
-        layout: Layout,
+        proposed: Layout,
         size: InputSize,
         got: Shapes,
     },
@@ -504,7 +518,7 @@ fn fit_layout(layout: Layout, shapes: &Shapes, size: InputSize) -> Result<Layout
         _ => None,
     };
     fitted.ok_or_else(|| ResolveError::LayoutDoesNotFit {
-        layout,
+        proposed: layout,
         size,
         got: shapes.clone(),
     })
@@ -1112,12 +1126,17 @@ mod tests {
             panic!("{err:?}");
         };
         assert_eq!(*profile, "yolox");
-        let ResolveError::LayoutDoesNotFit { layout, size, got } = &**source else {
+        let ResolveError::LayoutDoesNotFit {
+            proposed,
+            size,
+            got,
+        } = &**source
+        else {
             panic!("{source:?}");
         };
         assert!(
-            matches!(layout, Layout::GridObjectness { .. }),
-            "{layout:?}"
+            matches!(proposed, Layout::GridObjectness { .. }),
+            "{proposed:?}"
         );
         assert_eq!(*size, SQUARE);
         assert_eq!(*got, one(&[1, 3549, 85]));
@@ -1141,14 +1160,17 @@ mod tests {
 
     #[test]
     fn a_settled_layout_refuses_a_tensor_by_its_own_name_not_the_sniffers() {
-        // `LayoutDoesNotFit` above and `OutputShapeMismatch` here carry
-        // identical field triples, so which one a site constructs is one
-        // identifier and nothing but this test observes it: `validate_layout`'s
-        // only caller is `heads::decode_output`, which `?`s it straight into
-        // `anyhow`. The two are not interchangeable — `fit_layout` is
-        // discriminating between kinds and says what a kind expects, this one
-        // re-checks a kind already settled and states it — and that difference
-        // exists only in the message.
+        // The two are not interchangeable — `fit_layout` discriminates between
+        // kinds and says what a kind expects, this one re-checks a kind already
+        // settled and states it — and that difference exists only in the
+        // message. `validate_layout`'s only caller is `heads::decode_output`,
+        // which `?`s the error straight into `anyhow`, so nothing downstream
+        // observes which variant it was.
+        //
+        // Constructing the wrong one used to compile and pass every test; the
+        // field names now differ (`proposed` vs `layout`), so it is `E0559` at
+        // both sites. This test remains the check that the *right* one is
+        // built — a compile error catches a swap, not an original mistake.
         let err = validate_layout(Layout::EndToEnd, &one(&[1, 300, 7]), SQUARE).unwrap_err();
         let ResolveError::OutputShapeMismatch { layout, size, got } = &err else {
             panic!("{err:?}");
@@ -1971,7 +1993,7 @@ mod tests {
     fn the_layout_does_not_fit_message_says_what_the_kind_expects() {
         assert_eq!(
             ResolveError::LayoutDoesNotFit {
-                layout: Layout::RawClasses { nc: 80 },
+                proposed: Layout::RawClasses { nc: 80 },
                 size: SQUARE,
                 got: one(&[1, 300, 6]),
             }
