@@ -8,12 +8,35 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::emit::Det;
 
-use super::detector::Raw;
 use super::geometry::{InputSize, Projection};
 use super::labels::{Labels, ScoreFloors};
-use super::profile::{grid_anchors, Layout, NmsSpec, OutputSpec, Outputs, ScoreComposition};
-use super::resolve::show;
+use super::profile::{grid_anchors, show, Layout, NmsSpec, OutputSpec, Outputs, ScoreComposition};
+use super::resolve::validate_layout;
 use super::MAX_DETS;
+
+/// One extracted output tensor: the values and the shape they came with.
+pub(super) struct Raw<'a> {
+    pub(super) dims: Vec<i64>,
+    pub(super) values: &'a [f32],
+}
+
+/// Read one output tensor into contract detections.
+///
+/// The dims are re-checked against the layout even when it came from metadata:
+/// an export whose declared shape and real shape disagree would otherwise
+/// index a tensor by the wrong stride and emit plausible garbage.
+pub(super) fn decode_output(
+    output: OutputSpec,
+    raw: &Outputs<Raw>,
+    labels: &Labels,
+    floors: &ScoreFloors,
+    size: InputSize,
+    projection: &Projection,
+) -> Result<Vec<Det>> {
+    validate_layout(output.layout, &raw.map(|tensor| tensor.dims.clone()), size)?;
+    let candidates = candidates_from(output, raw, size, labels, floors)?;
+    Ok(finish(candidates, output.nms, labels, floors, projection))
+}
 
 /// The floor each of a layout's `nc` classes is held to, resolved once per
 /// decode rather than per anchor.
@@ -509,7 +532,6 @@ fn round_to(value: f64, places: u32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::super::catalog::{RFDETR, YOLOV10, YOLOV8, YOLOX};
-    use super::super::detector::{decode_output, Raw};
     use super::super::geometry::{InputSize, Projection, ResizePolicy};
     use super::super::labels::{check_label_count, Labels, ScoreFloors};
     use super::super::profile::*;
@@ -531,8 +553,9 @@ mod tests {
     const SQUARE: InputSize = InputSize::square(640);
     /// What `yolox_nano.onnx` from the Megvii 0.1.1rc0 release declares.
     const YOLOX_416: InputSize = InputSize::square(416);
-    /// 8^2 + 4^2 + 2^2 = 84 anchors: small enough to reason about by hand.
+    /// The 16:9 source the letterbox fix exists for: 1920x1080 into the model.
     const WIDE: InputSize = InputSize { w: 1920, h: 1080 };
+    /// 8^2 + 4^2 + 2^2 = 84 anchors: small enough to reason about by hand.
     const TINY: InputSize = InputSize::square(64);
     const STRIDES: &[usize] = &[8, 16, 32];
 

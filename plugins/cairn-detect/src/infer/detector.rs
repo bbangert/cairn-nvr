@@ -9,13 +9,13 @@ use ort::value::Tensor;
 use crate::emit::Det;
 
 use super::geometry::{InputSize, Projection};
-use super::heads::{candidates_from, finish};
+use super::heads::{decode_output, Raw};
 use super::labels::{check_label_count, Labels, ScoreFloors};
 use super::profile::InputSpec;
 use super::profile::{InputSizeSource, ModelProfile, OutputSpec, Outputs};
 use super::resolve::{
     check_grid_divides_input, declared_input_size, fit_output, resolve_input_size, resolve_profile,
-    static_output_dims, validate_layout, Declared,
+    static_output_dims, Declared,
 };
 
 pub struct Detector {
@@ -173,28 +173,4 @@ impl Detector {
         };
         decode_output(output, &raw, labels, floors, self.input_size, &projection)
     }
-}
-
-/// One extracted output tensor: the values and the shape they came with.
-pub(super) struct Raw<'a> {
-    pub(super) dims: Vec<i64>,
-    pub(super) values: &'a [f32],
-}
-
-/// Read one output tensor into contract detections.
-///
-/// The dims are re-checked against the layout even when it came from metadata:
-/// an export whose declared shape and real shape disagree would otherwise
-/// index a tensor by the wrong stride and emit plausible garbage.
-pub(super) fn decode_output(
-    output: OutputSpec,
-    raw: &Outputs<Raw>,
-    labels: &Labels,
-    floors: &ScoreFloors,
-    size: InputSize,
-    projection: &Projection,
-) -> Result<Vec<Det>> {
-    validate_layout(output.layout, &raw.map(|tensor| tensor.dims.clone()), size)?;
-    let candidates = candidates_from(output, raw, size, labels, floors)?;
-    Ok(finish(candidates, output.nms, labels, floors, projection))
 }

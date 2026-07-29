@@ -13,7 +13,7 @@ use ort::value::ValueType;
 use super::catalog::{names, PROFILES};
 use super::geometry::{InputSize, MAX_INPUT_DIM, MAX_INPUT_PIXELS};
 use super::profile::{
-    grid_anchors, InputSizeSource, Layout, ModelProfile, OutputSpec, Outputs, Roles, Shapes,
+    grid_anchors, show, InputSizeSource, Layout, ModelProfile, OutputSpec, Outputs, Roles, Shapes,
 };
 
 /// A grid head only decodes at a size its strides divide.
@@ -216,16 +216,6 @@ fn static_shapes(roles: Roles, declared: &[Declared]) -> Option<Shapes> {
     bind(roles, declared)
         .ok()?
         .try_map(|output| output.dims.clone())
-}
-
-/// The bound shapes, as an error message lists them.
-pub(super) fn show(shapes: &Shapes) -> String {
-    shapes
-        .each()
-        .into_iter()
-        .map(|dims| format!("{dims:?}"))
-        .collect::<Vec<_>>()
-        .join(" + ")
 }
 
 /// Read a layout's own counts off a real output shape, or say why it does not
@@ -612,6 +602,7 @@ mod tests {
     const SQUARE: InputSize = InputSize::square(640);
     /// What `yolox_nano.onnx` from the Megvii 0.1.1rc0 release declares.
     const YOLOX_416: InputSize = InputSize::square(416);
+    /// 8^2 + 4^2 + 2^2 = 84 anchors: small enough to reason about by hand.
     const TINY: InputSize = InputSize::square(64);
     const STRIDES: &[usize] = &[8, 16, 32];
 

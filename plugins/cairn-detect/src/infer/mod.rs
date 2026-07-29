@@ -31,19 +31,25 @@ mod resolve;
 mod golden;
 
 /// Cap on detections in one frame's output line.
-pub const MAX_DETS: usize = 32;
+///
+/// `pub(super)` rather than `pub`: `heads` is the only caller, and nothing
+/// outside `infer` names it (T1.4).
+pub(super) const MAX_DETS: usize = 32;
 
-// The public surface is unchanged: `crate::infer::X` keeps resolving for
-// main.rs, decode.rs, hwdecode.rs and multiplex.rs exactly as it did when this
-// was one file.
+// What `crate::infer::X` still resolves to for main.rs, decode.rs, hwdecode.rs
+// and multiplex.rs. Deliberately *narrower* than the pre-split surface: fifteen
+// items that were `pub` only because everything shared one module — PROFILES,
+// the four family constants, Layout, Outputs, Declared and the rest — are named
+// nowhere outside `infer` and are no longer re-exported (T1.4).
 pub use detector::Detector;
 pub use geometry::{Fit, InputSize, Projection};
 pub use labels::{Labels, ScoreFloors};
 pub use profile::{InputSpec, ModelProfile};
 
-// `decode.rs` names these two only from its own tests, and a binary crate has
-// no consumer outside itself — so an unconditional re-export reads as dead to
-// rustc. Gated rather than blanket-`#[allow(unused_imports)]`, which would also
-// hide a re-export that really had gone dead.
+// decode.rs and hwdecode.rs name these two only from their own test modules,
+// and a binary crate has no consumer outside itself — so an unconditional
+// re-export reads as dead to rustc and `-D warnings` makes that fatal. Gated
+// rather than blanket-`#[allow(unused_imports)]`, which would also hide a
+// re-export that really had gone dead.
 #[cfg(test)]
 pub use {encoding::TensorEncoding, geometry::ResizePolicy};

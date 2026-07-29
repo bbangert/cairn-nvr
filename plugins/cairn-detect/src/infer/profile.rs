@@ -304,3 +304,13 @@ pub(super) fn grid_anchors(size: InputSize, strides: &[usize]) -> usize {
         .map(|stride| (size.w / stride) * (size.h / stride))
         .sum()
 }
+
+/// The bound shapes, as an error message lists them.
+pub(super) fn show(shapes: &Shapes) -> String {
+    shapes
+        .each()
+        .into_iter()
+        .map(|dims| format!("{dims:?}"))
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
