@@ -38,7 +38,12 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use super::*;
+use super::catalog::{RFDETR, YOLOV10, YOLOV8, YOLOX};
+use super::detector::{decode_output, Raw};
+use super::geometry::{InputSize, Projection, ResizePolicy};
+use super::labels::{Labels, ScoreFloors};
+use super::profile::{Layout, ModelProfile, OutputSpec, Outputs, ScoreComposition, DEFAULT_NMS};
+use super::resolve::{check_grid_divides_input, resolve_input_size, resolve_profile, Declared};
 
 /// Set to rewrite every fixture from current behavior. See the module docs.
 const BLESS: &str = "CAIRN_GOLDEN_BLESS";
