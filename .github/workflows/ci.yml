@@ -143,6 +143,15 @@ jobs:
       # whole decoded `Vec<Det>` per head per projection. They replaced the
       # checked-in golden fixtures the infer.rs refactor was built on: the
       # coverage stayed, the re-record-on-red machinery did not.
+      #
+      # Also runs tests/norm_box_invariant.rs, the trybuild compile-fail case
+      # that guards NormBox's private field. It needs no step of its own, but it
+      # does need a warm ~/.cargo/registry: trybuild builds a scratch crate under
+      # target/tests/trybuild and runs a second cargo over it with --offline. The
+      # generated manifest carries no dev-dependencies of its own, so what has to
+      # be present is only what the case itself compiles — which the
+      # `cargo clippy --all-targets` step above has already fetched. Verified by
+      # deleting target/tests/trybuild and re-running with this job's env.
       - run: cargo test
         working-directory: plugins/cairn-detect
 

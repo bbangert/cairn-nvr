@@ -996,6 +996,14 @@ conversion, IoU/NMS, the per-class gate ahead of the NMS truncation, score and
 extent bounds), decoder probe order and the per-backend filter strings; none
 need network, a model, or a GPU.
 
+`cargo test` also drives one compile-*fail* case, `tests/norm_box_invariant.rs`,
+through `trybuild`. `infer::geometry`'s `NormBox` keeps its inner box private so
+that `Projection::unproject` is the only way to obtain one, which is what makes a
+missed un-projection a type error rather than a box reported against the model's
+input rectangle. The case mounts the real `geometry.rs` and fails if that field
+is ever widened. It is a `trybuild` case and not a doctest because this crate has
+no library target, so doctests never run.
+
 ## Implementation notes
 
 - Joining mid-stream is normal. The open is retried 12 times, 5 s apart, with

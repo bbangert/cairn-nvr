@@ -226,10 +226,14 @@ pub(super) struct ModelBox(pub(super) Bbox);
 /// the two is the whole mechanism, not an oversight: a `ModelBox` is something
 /// the heads make freely, a `NormBox` is something only the projection can
 /// mint. Writing `NormBox(pub(super) Bbox)` for consistency would restore the
-/// ability to hand `det_from` model pixels — and no test, lint or doc gate in
-/// this crate would notice, because the guarantee is the privacy itself. (It
-/// cannot be defended by a `compile_fail` doctest either: this crate has no
-/// library target, so doctests never run.)
+/// ability to hand `det_from` model pixels, and because the guarantee is the
+/// privacy itself, no unit test or lint can see it go.
+///
+/// One thing can: `tests/norm_box_invariant.rs` drives a `trybuild` case that
+/// compiles this very file and forges a `NormBox` from a sibling module,
+/// requiring the compiler to refuse. Widen the field and that case compiles,
+/// which fails the test. A `compile_fail` doctest could not have done it — this
+/// crate has no library target, so doctests never run at all.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct NormBox(Bbox);
 

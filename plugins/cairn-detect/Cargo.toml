@@ -26,3 +26,9 @@ lto = "thin"
 # Most of the binary is the statically linked onnxruntime; its debug info is
 # dead weight in a plugin whose only diagnostics are stderr lines.
 strip = true
+
+[dev-dependencies]
+# One compile-fail case, `tests/norm_box_invariant.rs`: `NormBox`'s field
+# privacy is a build-time guarantee and a `#[test]` cannot observe it. Not a
+# doctest, because this crate has no library target and doctests never run.
+trybuild = "1.0.118"
