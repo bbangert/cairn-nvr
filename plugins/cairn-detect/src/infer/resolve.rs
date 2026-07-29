@@ -1108,6 +1108,55 @@ mod tests {
     }
 
     #[test]
+    fn the_same_six_wide_rows_are_a_one_class_grid_under_yolox_and_final_boxes_under_yolov10() {
+        // The narrowest grid head there is — one class, so `5 + 1` columns — is
+        // exactly as wide as an end-to-end row, and at 640x384 the anchor count
+        // is exactly a plausible row count. So these bytes carry no evidence at
+        // all of which head produced them: left to sniff they are a refusal
+        // (`a_shape_that_fits_two_profiles_is_an_error_naming_both`), and naming
+        // a profile is the operator supplying the evidence the export did not.
+        //
+        // The two readings are not variations on each other. One walks a stride
+        // grid and exponentiates its extents, gates on objectness x class and
+        // runs NMS; the other reads final pixel corners the model already
+        // de-duplicated. Picking wrong emits plausible boxes and says nothing.
+        let wide = InputSize { w: 640, h: 384 };
+        let ambiguous = declared(&[1, 5040, 6]);
+        assert_eq!(grid_anchors(wide, STRIDES), 5040);
+
+        let (profile, _names, output) =
+            resolve_profile(Some(YOLOX), &ambiguous, wide, Path::new("m.onnx")).unwrap();
+        let output = output.expect("a statically shaped export settles its output half");
+        assert_eq!(profile.name, "yolox");
+        // `nc: 1` is the substance: the class column is one wide. Fitting the
+        // same row at any other width reads part of the box as a class score.
+        assert_eq!(
+            output.layout,
+            Layout::GridObjectness {
+                nc: 1,
+                strides: STRIDES
+            }
+        );
+        assert_eq!(output.score, ScoreComposition::ObjTimesClass);
+        assert_eq!(output.nms, Some(DEFAULT_NMS));
+
+        let (profile, _names, output) =
+            resolve_profile(Some(YOLOV10), &ambiguous, wide, Path::new("m.onnx")).unwrap();
+        let output = output.expect("a statically shaped export settles its output half");
+        assert_eq!(profile.name, "yolov10");
+        assert_eq!(output.layout, Layout::EndToEnd);
+        assert_eq!(output.score, ScoreComposition::Class);
+        assert!(output.nms.is_none());
+
+        // ...and with neither named, nothing in the shape chooses between them.
+        let err = resolve_profile(None, &ambiguous, wide, Path::new("m.onnx")).unwrap_err();
+        assert!(
+            matches!(err, ResolveError::AmbiguousProfile { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn resolving_a_model_settles_the_whole_output_half_not_only_the_layout() {
         // `resolve_profile` hands back an `OutputSpec`, and only its `layout`
         // is fitted to the model — `score` and `nms` come through from the

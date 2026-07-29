@@ -423,6 +423,10 @@ fn centered(cx: f64, cy: f64, w: f64, h: f64, size: InputSize) -> Option<ModelBo
 
 /// Where every layout converges: NMS if the head needs it, then the per-label
 /// floor, un-projection, score order and the [`MAX_DETS`] cap.
+///
+/// Un-projection is also where a candidate can stop being a detection at all:
+/// [`det_from`] returns `None` for a box the clamp leaves with no area, and the
+/// `?` below is what drops it before it can occupy a slot the cap measures.
 pub(super) fn finish(
     mut candidates: Vec<Candidate>,
     spec: Option<NmsSpec>,
@@ -469,6 +473,21 @@ pub(super) fn finish(
 /// whether it matters.
 ///
 /// `candidates` must already be sorted by descending score.
+///
+/// Known residual, left alone deliberately: this runs *before* un-projection,
+/// on model-space boxes, where a box lying wholly in the letterbox pad still
+/// has ordinary area. So a pad-only ghost can suppress a real box of its own
+/// class here, and [`det_from`] dropping the ghost afterwards cannot bring the
+/// suppressed box back. It takes an IoU of at least `threshold` between the
+/// two — 0.45 for every built-in family — and a pad-only box is disjoint from
+/// the content rectangle, so the real box has to extend well into the pad
+/// itself. At 1920x1080 into yolox 416 the content is the top 234 rows: two
+/// same-width boxes, one predicted at rows 190..280 and a ghost at 234..314,
+/// overlap by 46 of a 124 union — IoU 0.37, under the threshold. Clearing it
+/// takes a "real" box that is mostly pad, whose surviving clamped remnant is a
+/// sliver. Narrow but non-empty; the complete fix is to reject pad-only
+/// candidates in model space before this runs, which the projection already
+/// knows enough to do.
 fn nms(candidates: Vec<Candidate>, threshold: f64) -> Vec<Candidate> {
     let mut kept: Vec<Candidate> = Vec::new();
     for candidate in candidates {
@@ -498,12 +517,21 @@ fn iou(a: &ModelBox, b: &ModelBox) -> f64 {
     }
 }
 
-/// Already-un-projected corners -> the contract's normalized `[x, y, w, h]`.
+/// Already-un-projected corners -> the contract's normalized `[x, y, w, h]`,
+/// or `None` for a box the host would refuse anyway.
 ///
 /// Contract: bbox normalized 0..1 against the *original* frame — which is what
 /// the projection knows and the input size does not. Taking a [`NormBox`] is
 /// what says so in the type: only [`Projection::unproject`] makes one, so
 /// there is no way to reach here holding model pixels.
+///
+/// The mapping is partial because clamping to that frame can leave a box with
+/// no area: one lying wholly in the letterbox pad collapses to a line, and the
+/// host requires `w > 0 and h > 0`. Returning `None` rather than a flat `Det`
+/// is what keeps such a box from consuming a [`MAX_DETS`] slot ahead of
+/// [`top_dets`]'s truncate and displacing a real detection. The body comment on
+/// the check says why it reads the rounded extents rather than the raw ones;
+/// [`finish`] is the caller that drops the `None`.
 fn det_from(bbox: NormBox, score: f64, label: String) -> Option<Det> {
     let normalized = bbox.corners();
     let x0 = normalized.x1.clamp(0.0, 1.0);
@@ -1845,6 +1873,10 @@ mod tests {
             SQUARE,
             &Projection::stretch(SQUARE),
         );
+        // The rows are already corners in model pixels and the stretch divides
+        // by the input size on both axes, so every number below is that row
+        // over 640: the first box is 32..160, hence 32/640 = 0.05 with a width
+        // of 128/640 = 0.2.
         assert_eq!(
             dets,
             vec![
@@ -1911,8 +1943,9 @@ mod tests {
             RawAnchor { cx: 108.0, cy: 104.0, w: 60.0, h: 60.0, classes: [0.70, 0.0, 0.0] },
             // car at 0.75, under its own 0.8 floor — never becomes a candidate
             RawAnchor { cx: 200.0, cy: 200.0, w: 40.0, h: 40.0, classes: [0.0, 0.0, 0.75] },
-            // bicycle, elsewhere in the frame. Under the letterbox its lower
-            // edge falls in the pad.
+            // bicycle, elsewhere in the frame. 380..420 in model pixels, so
+            // under the letterbox — 360 rows of content — it lands entirely in
+            // the pad and is dropped rather than clipped.
             RawAnchor { cx: 400.0, cy: 400.0, w: 80.0, h: 40.0, classes: [0.0, 0.60, 0.0] },
             // under the default floor
             RawAnchor { cx: 300.0, cy: 100.0, w: 20.0, h: 20.0, classes: [0.25, 0.0, 0.0] },
@@ -1949,6 +1982,11 @@ mod tests {
             SQUARE,
             &Projection::stretch(SQUARE),
         );
+        // These rows are centers and extents, so a corner is the center less
+        // half the extent in model pixels, and the stretch then divides by 640.
+        // The first person is centered at (100, 100) with extent 60x60: corner
+        // 70/640 = 0.1094, extent 60/640 = 0.0938. The bicycle is centered at
+        // (400, 400) with extent 80x40: 360/640 = 0.5625, 380/640 = 0.5938.
         assert_eq!(
             dets,
             vec![
@@ -2036,8 +2074,17 @@ mod tests {
                        objectness: 0.80, classes: [0.0, 0.70, 0.0] },
         ];
         let row = 5 + NC;
+        // Re-derived here rather than taken from `profile::grid_anchors`, for
+        // the same reason `grid_index` below re-derives the walk: a tensor
+        // sized by the production count is sized to agree with whatever that
+        // count says, so a count that changed would resize the planted tensor
+        // to match itself instead of showing up as a failure.
+        let anchors = STRIDES
+            .iter()
+            .map(|s| (TINY.w / s) * (TINY.h / s))
+            .sum::<usize>();
         // Zero elsewhere: objectness 0 times anything is 0, under every floor.
-        let mut values = vec![0.0f32; grid_anchors(TINY, STRIDES) * row];
+        let mut values = vec![0.0f32; anchors * row];
         for cell in &planted {
             let base = grid_index(TINY, cell.stride, cell.gx, cell.gy) * row;
             let log_extent = |pixels: f64| (pixels / cell.stride as f64).ln() as f32;
@@ -2069,6 +2116,12 @@ mod tests {
             TINY,
             &Projection::stretch(TINY),
         );
+        // A cell's center is `(g + off) * stride` and its extent is the planted
+        // pixel figure, so the corner is that center less half the extent; the
+        // stretch then divides by the 64-pixel input. The person is cell (3, 3)
+        // on stride 8, so center 28 and extent 32: 12/64 = 0.1875, 32/64 = 0.5.
+        // The car is cell (1, 1) on stride 16, center 24 extent 16: 16/64 =
+        // 0.25 both ways.
         assert_eq!(
             dets,
             vec![
@@ -2149,6 +2202,11 @@ mod tests {
             SQUARE,
             &Projection::stretch(SQUARE),
         );
+        // These queries are already normalized centers and extents — against
+        // the *input*. The decode scales them to model pixels and the stretch
+        // divides by that same 640, so under this projection the two cancel and
+        // the expectation is the planted row read as a corner: the car at
+        // center 0.50 extent 0.10 is 0.50 - 0.05 = 0.45.
         assert_eq!(
             dets,
             vec![
