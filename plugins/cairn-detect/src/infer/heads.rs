@@ -447,16 +447,15 @@ pub(super) fn finish(
             // one place every layout converges. For the rest it is a no-op:
             // they gated on the same floor already, and NMS only ever drops a
             // box weaker than one of its own class, which shares it.
-            (candidate.score >= floors.floor_for(&label)).then(|| {
-                (
-                    candidate.score,
-                    det_from(
-                        projection.unproject(candidate.corners),
-                        candidate.score,
-                        label,
-                    ),
-                )
-            })
+            if candidate.score < floors.floor_for(&label) {
+                return None;
+            }
+            let det = det_from(
+                projection.unproject(candidate.corners),
+                candidate.score,
+                label,
+            )?;
+            Some((candidate.score, det))
         })
         .collect();
     top_dets(dets)
@@ -505,13 +504,27 @@ fn iou(a: &ModelBox, b: &ModelBox) -> f64 {
 /// the projection knows and the input size does not. Taking a [`NormBox`] is
 /// what says so in the type: only [`Projection::unproject`] makes one, so
 /// there is no way to reach here holding model pixels.
-fn det_from(bbox: NormBox, score: f64, label: String) -> Det {
+fn det_from(bbox: NormBox, score: f64, label: String) -> Option<Det> {
     let normalized = bbox.corners();
     let x0 = normalized.x1.clamp(0.0, 1.0);
     let y0 = normalized.y1.clamp(0.0, 1.0);
     let x1 = normalized.x2.clamp(0.0, 1.0);
     let y1 = normalized.y2.clamp(0.0, 1.0);
-    Det {
+    let w = round_to((x1 - x0).max(0.0), 4);
+    let h = round_to((y1 - y0).max(0.0), 4);
+    // A box lying entirely in the letterbox pad clamps to a line: `w` or `h`
+    // comes out 0 and the host refuses the detection outright
+    // (`validate_det` requires `w > 0 and h > 0`). Dropping it here rather
+    // than emitting it is not tidiness — an emitted ghost consumes a
+    // `MAX_DETS` slot *ahead of* `top_dets`'s truncate, so it can displace a
+    // real detection that would otherwise have been reported.
+    //
+    // Tested on the rounded extents, not the raw ones: rounding is what the
+    // host sees, so a sliver narrower than 0.00005 already reaches it as 0.
+    if w == 0.0 || h == 0.0 {
+        return None;
+    }
+    Some(Det {
         // `--labels` is arbitrary user text and the host refuses a label it
         // cannot print; shaping it here keeps the detection instead.
         label: crate::emit::shape_label(&label),
@@ -521,13 +534,8 @@ fn det_from(bbox: NormBox, score: f64, label: String) -> Det {
         // detection rather than report an odd number. Non-finite scores are
         // already rejected upstream, which is what makes `clamp` total here.
         score: round_to(score.clamp(0.0, 1.0), 3),
-        bbox: [
-            round_to(x0, 4),
-            round_to(y0, 4),
-            round_to((x1 - x0).max(0.0), 4),
-            round_to((y1 - y0).max(0.0), 4),
-        ],
-    }
+        bbox: [round_to(x0, 4), round_to(y0, 4), w, h],
+    })
 }
 
 /// Score-order and cap, where every layout converges.
@@ -1545,6 +1553,9 @@ mod tests {
             0.9,
             "car".into(),
         );
+        // Both have area, so neither is dropped as a pad-only ghost.
+        let letterboxed = letterboxed.expect("a full-content box has area");
+        let stretched = stretched.expect("a full-content box has area");
         // the content rectangle of a 16:9 letterbox *is* the whole frame...
         assert_eq!(letterboxed.bbox, [0.0, 0.0, 1.0, 1.0]);
         // ...while the stretch rule reads those same rows as its top 234/416
@@ -1563,7 +1574,8 @@ mod tests {
             Projection::stretch(SQUARE).unproject(model_box(0.0, 0.0, 64.0, 64.0)),
             0.5,
             raw.to_string(),
-        );
+        )
+        .expect("a 64x64 box has area");
         assert_eq!(det.label, "car");
         assert_eq!(det.label, crate::emit::shape_label(raw));
     }
