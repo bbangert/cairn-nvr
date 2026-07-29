@@ -129,8 +129,11 @@ fn report(path: &Path, expected: &str, actual: &str) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    // Names the fixture rather than the subject: this helper serves the
+    // projection and resolution fixtures too, and "decode output changed" on a
+    // projection diff sends the reader to the wrong file.
     format!(
-        "decode output changed against {}\n\nfirst difference at line {}\n\nexpected:\n{}\n\n\
+        "{} no longer matches current behavior\n\nfirst difference at line {}\n\nexpected:\n{}\n\n\
          actual:\n{}\n\nIf this change is intended, re-record with {BLESS}=1 cargo test -p \
          cairn-detect golden — and read the diff.",
         path.display(),
