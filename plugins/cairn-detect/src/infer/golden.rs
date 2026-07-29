@@ -15,7 +15,7 @@
 //! So: a fixed synthetic tensor per head, the resulting `Vec<Det>` serialized
 //! to the precision a `Det` carries, and the whole table checked in under
 //! `golden/`. A diff there during a "pure move" phase is the phase not being a
-//! pure move. (Not to *full* precision — [`det_from`] rounds score to 3 places
+//! pure move. (Not to *full* precision — `det_from` rounds score to 3 places
 //! and bbox to 4 before a `Det` exists, so those roundings are themselves part
 //! of what is pinned.)
 //!

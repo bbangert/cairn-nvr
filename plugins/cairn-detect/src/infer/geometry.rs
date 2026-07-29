@@ -221,6 +221,15 @@ pub(super) struct ModelBox(pub(super) Bbox);
 /// makes a missed un-projection a compile error rather than a box reported
 /// against the model's input rectangle — which under a letterbox is not the
 /// frame at all, part of it being padding that never held a pixel.
+///
+/// **Do not widen that field to match [`ModelBox`]'s.** The asymmetry between
+/// the two is the whole mechanism, not an oversight: a `ModelBox` is something
+/// the heads make freely, a `NormBox` is something only the projection can
+/// mint. Writing `NormBox(pub(super) Bbox)` for consistency would restore the
+/// ability to hand `det_from` model pixels — and no test, lint or doc gate in
+/// this crate would notice, because the guarantee is the privacy itself. (It
+/// cannot be defended by a `compile_fail` doctest either: this crate has no
+/// library target, so doctests never run.)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct NormBox(Bbox);
 
@@ -236,9 +245,13 @@ impl NormBox {
 /// Every decode path takes one of these rather than an [`InputSize`], because
 /// under a letterbox the model's coordinate space is *not* the frame's: part
 /// of it is padding that never held any pixels. Dividing by the input size
-/// there — the stretch rule — reports every box short and shifted. Making the
-/// un-projection a value the decoder is handed is what makes forgetting it
-/// impossible.
+/// there — the stretch rule — reports every box short and shifted.
+///
+/// Handing the decoder this value is *not* what makes forgetting it impossible
+/// — that is a common misreading, and this comment used to make it. A
+/// parameter can be accepted and ignored. What actually forbids it is
+/// [`NormBox`]: only [`Projection::unproject`] can produce one, and only a
+/// `NormBox` reaches the wire.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Projection {
     /// Model pixels per source pixel, per axis.

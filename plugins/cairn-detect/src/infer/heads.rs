@@ -868,6 +868,15 @@ mod tests {
         assert_eq!(iou(&a, &b), iou(&b, &a));
         // a degenerate box shares no area with anything
         assert_eq!(iou(&a, &model_box(1.0, 1.0, 1.0, 1.0)), 0.0);
+        // Every other box here is square, which makes `w * h` and `w * w`
+        // indistinguishable — so a copy-pasted area factor that never had its
+        // axis letters changed passes all of the above. One wide box and one
+        // tall one is what separates them: 40x10 and 10x50 overlap in a 10x10
+        // corner, for 100 of 800.
+        let wide = model_box(0.0, 0.0, 40.0, 10.0);
+        let tall = model_box(20.0, 0.0, 30.0, 50.0);
+        assert_eq!(iou(&wide, &tall), 0.125);
+        assert_eq!(iou(&wide, &tall), iou(&tall, &wide));
     }
 
     #[test]
@@ -1512,13 +1521,17 @@ mod tests {
     // ---- decode plumbing ---------------------------------------------------
 
     #[test]
-    fn only_an_un_projection_can_produce_the_box_det_from_accepts() {
-        // `det_from` takes a `NormBox` and `Projection::unproject` is its only
-        // constructor, so there is no way to reach the wire format still
-        // holding model pixels. What that buys is here in numbers: the same
-        // model-space corners under two projections are two different
-        // detections, and the type is what stops one being mistaken for the
-        // other by omitting the call.
+    fn det_from_reports_the_projection_it_was_given_not_the_model_rectangle() {
+        // Named for what it can actually observe. An earlier name claimed this
+        // test guarded "only an un-projection can produce the box `det_from`
+        // accepts" — it cannot: that is a type-system property, and if it broke
+        // the crate would still compile and this test would still pass. The
+        // privacy of `NormBox`'s field is what guards it (see the note there).
+        //
+        // What *is* checkable is the consequence, at the seam rather than
+        // end-to-end: one model-space box, two projections, two different
+        // detections. Deleting `unproject` cannot be tested here, but reading
+        // it from the wrong projection can.
         let corners = model_box(0.0, 0.0, 416.0, 234.0);
         let letterboxed = det_from(
             ResizePolicy::Letterbox { pad: 114 }
