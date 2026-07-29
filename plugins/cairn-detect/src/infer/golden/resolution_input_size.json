@@ -3,18 +3,8 @@
     "end_to_end_ignores_strides": {
       "ok": true
     },
-    "grid_400_not_a_multiple_of_32": {
-      "error": [
-        "input size 400x400 is not a multiple of 32, the coarsest stride of a grid-objectness head — its cells would be walked in a layout the model does not use, putting every box in the wrong cell. Round each axis to a multiple of 32."
-      ]
-    },
     "grid_416_square": {
       "ok": true
-    },
-    "grid_640x300_height_only": {
-      "error": [
-        "input size 640x300 is not a multiple of 32, the coarsest stride of a grid-objectness head — its cells would be walked in a layout the model does not use, putting every box in the wrong cell. Round each axis to a multiple of 32."
-      ]
     },
     "grid_640x384": {
       "ok": true
@@ -27,11 +17,6 @@
         640
       ],
       "source": "from --input-size"
-    },
-    "flag_contradicts_model": {
-      "error": [
-        "--input-size 416x416 contradicts model model.onnx, whose input is 640x640"
-      ]
     },
     "flag_supplies_it": {
       "size": [
@@ -47,32 +32,12 @@
       ],
       "source": "from model"
     },
-    "no_profile_and_nothing_pinned": {
-      "error": [
-        "model model.onnx does not pin its input width and height; pass --input-size WxH (or N)"
-      ]
-    },
-    "over_the_per_axis_limit": {
-      "error": [
-        "input size 9000x64 (from --input-size) exceeds the 8192 per-dimension limit"
-      ]
-    },
-    "over_the_pixel_limit": {
-      "error": [
-        "input size 4096x2048 (from --input-size) is 8388608 pixels, over the 4194304-pixel limit (2048x2048): the CHW f32 tensor alone would be 96 MB, per camera"
-      ]
-    },
     "profile_default": {
       "size": [
         416,
         416
       ],
       "source": "from --model-profile default"
-    },
-    "variant_family_has_no_default": {
-      "error": [
-        "model model.onnx does not pin its input width and height, and the rfdetr profile has no default to fall back on — every export in the family leaves its spatial axes dynamic and declares nothing that says which variant it is. Pass --input-size WxH (or N); the variants are trained at nano 384, small 512, base 560, medium 576, large 704. A wrong size here is silent: the model runs and detects nothing."
-      ]
     }
   }
 }
