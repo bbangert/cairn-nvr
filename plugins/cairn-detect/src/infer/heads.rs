@@ -1010,6 +1010,110 @@ mod tests {
     }
 
     #[test]
+    fn a_score_tie_at_a_truncation_boundary_keeps_whichever_the_head_emitted_first() {
+        // Two truncations decide what gets reported, and each is fed by a
+        // stable `sort_by`: `finish`'s cut at `max_candidates` ahead of NMS, and
+        // `top_dets`'s cut at `MAX_DETS`. Stability is the whole of the tie
+        // rule — equal scores keep the order the head emitted them in, so the
+        // survivors of a cut that lands inside a tied group are its
+        // earliest-emitted members. `sort_unstable_by` orders a tie by nothing
+        // at all, and it is the swap someone reaches for on the grounds that it
+        // is typically faster and allocates nothing, so this test is what stands
+        // between that and a different set of detections.
+        //
+        // Both halves below thread the tied group *through* the stronger one on
+        // purpose: Rust's `sort_unstable_by` detects an input already in order
+        // and returns it unchanged, an all-equal input included, so a tie group
+        // appended after the strong group is a shape the swap never disturbs.
+
+        // --- `finish`: the cut at `max_candidates`, before NMS ---------------
+        //
+        // Twenty persons tied at 0.65, one planted every fifteenth anchor among
+        // `max_candidates - 10` cars at 0.99 (290 of them today). In descending
+        // score order every car comes first, so `truncate(max_candidates)`
+        // admits exactly the first ten persons and discards the other ten — a
+        // cut straight through the tie. The cars are one repeated box, so NMS
+        // collapses them to a single detection and the ten persons that survived
+        // the cut are the rest of the output, which is what makes *which* ten of
+        // the twenty visible.
+        let mut anchors = Vec::new();
+        let mut tied = 0;
+        for i in 0..(DEFAULT_NMS.max_candidates - 10) {
+            if i % 15 == 0 && tied < 20 {
+                // 32x32 persons on a 64-pixel pitch, ten to a row: distinct
+                // boxes, and disjoint, so NMS keeps every one that gets in.
+                let cx = 32.0 + 64.0 * (tied % 10) as f32;
+                let cy = 32.0 + 64.0 * (tied / 10) as f32;
+                anchors.push((cx, cy, 32.0, 32.0, 0usize, 0.65));
+                tied += 1;
+            }
+            anchors.push((320.0, 320.0, 64.0, 64.0, 2usize, 0.99));
+        }
+        assert_eq!(tied, 20, "the cut has to land inside the tie");
+        assert_eq!(anchors.len(), DEFAULT_NMS.max_candidates + 10);
+        // The persons are centers and extents in model pixels and the stretch
+        // divides by 640: person `k` has corner 16 + 64k, hence 0.025 on a 0.1
+        // pitch, and extent 32/640 = 0.05. The second row of ten sits at 0.125
+        // down the frame and is the half the truncation drops, so no bbox below
+        // carries that `y`. The car is 288..352 on both axes.
+        assert_eq!(
+            v8(3, &anchors, &open(), SQUARE),
+            vec![
+                det("car", 0.99, [0.45, 0.45, 0.1, 0.1]),
+                det("person", 0.65, [0.025, 0.025, 0.05, 0.05]),
+                det("person", 0.65, [0.125, 0.025, 0.05, 0.05]),
+                det("person", 0.65, [0.225, 0.025, 0.05, 0.05]),
+                det("person", 0.65, [0.325, 0.025, 0.05, 0.05]),
+                det("person", 0.65, [0.425, 0.025, 0.05, 0.05]),
+                det("person", 0.65, [0.525, 0.025, 0.05, 0.05]),
+                det("person", 0.65, [0.625, 0.025, 0.05, 0.05]),
+                det("person", 0.65, [0.725, 0.025, 0.05, 0.05]),
+                det("person", 0.65, [0.825, 0.025, 0.05, 0.05]),
+                det("person", 0.65, [0.925, 0.025, 0.05, 0.05]),
+            ]
+        );
+
+        // --- `top_dets`: the cut at `MAX_DETS` -------------------------------
+        //
+        // The raw head above cannot reach this one: `finish` hands `top_dets` a
+        // list its own sort already put in descending order, which an unstable
+        // sort would leave alone. `Layout::EndToEnd` is the head that runs no
+        // NMS and therefore no sort of its own, so `top_dets` receives the rows
+        // in tensor order and its sort is the only one there is.
+        //
+        // 31 identical cars at 0.9 — one short of the cap, and this head keeps
+        // overlaps — with 20 persons tied at 0.65 threaded through them. One
+        // slot is left for the tie, and the first-emitted person is the one
+        // entitled to it.
+        let mut rows = Vec::new();
+        let mut tied = 0;
+        for _ in 0..(MAX_DETS - 1) {
+            if tied < 20 {
+                let x1 = 16.0 + 64.0 * (tied % 10) as f32;
+                let y1 = 16.0 + 64.0 * (tied / 10) as f32;
+                rows.extend_from_slice(&row(x1, y1, x1 + 32.0, y1 + 32.0, 0.65, 0.0));
+                tied += 1;
+            }
+            rows.extend_from_slice(&row(288.0, 288.0, 352.0, 352.0, 0.9, 2.0));
+        }
+        assert_eq!(tied, 20, "the cut has to land inside the tie");
+        let dets = e2e(&rows, &open(), SQUARE);
+        assert_eq!(dets.len(), MAX_DETS);
+        // These rows are corners already, so the same 640 divide applies: the
+        // first person is 16..48 and the cars are 288..352.
+        assert!(
+            dets[..MAX_DETS - 1]
+                .iter()
+                .all(|d| *d == det("car", 0.9, [0.45, 0.45, 0.1, 0.1])),
+            "{dets:?}"
+        );
+        assert_eq!(
+            dets[MAX_DETS - 1],
+            det("person", 0.65, [0.025, 0.025, 0.05, 0.05])
+        );
+    }
+
+    #[test]
     fn raw_non_finite_anchors_never_reach_the_output() {
         let mut values = v8_output(
             3,
