@@ -5,16 +5,256 @@
 //! completely differently and the wrong one emits plausible garbage rather
 //! than failing.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
 use ort::value::ValueType;
+use thiserror::Error;
 
 use super::catalog::{names, PROFILES};
 use super::geometry::{InputSize, MAX_INPUT_DIM, MAX_INPUT_PIXELS};
 use super::profile::{
     grid_anchors, show, InputSizeSource, Layout, ModelProfile, OutputSpec, Outputs, Roles, Shapes,
 };
+
+/// Every way this module can refuse to settle a profile or an input size.
+///
+/// One variant per operator-facing failure, each carrying the *values* its
+/// message interpolates rather than a pre-formatted string. The wording lives
+/// in the `#[error]` attributes and nowhere else, so a caller — or a test — can
+/// tell an ambiguity from a shape mismatch without reading prose, and rewording
+/// a message for an operator is no longer a test change.
+///
+/// The messages themselves are unchanged from the `bail!`/`with_context` sites
+/// they replace; several were tuned during review and the notes explaining
+/// *why* a given sentence is worded as it is sit on the variants below.
+///
+/// `anyhow` still owns the boundary. Nothing here is public: `Detector::open`
+/// converts via [`std::error::Error`] the moment one of these leaves `infer`,
+/// and [`ProfileMismatch`] is the one variant that wraps another, so an
+/// `err.chain()` at that boundary still reads outer-then-inner exactly as the
+/// `with_context` it replaced did.
+///
+/// [`ProfileMismatch`]: ResolveError::ProfileMismatch
+#[derive(Debug, Error)]
+pub(super) enum ResolveError {
+    /// A grid head asked to decode at a size its coarsest stride does not
+    /// divide. See [`check_grid_divides_input`] for why this is fatal rather
+    /// than approximated.
+    #[error(
+        "input size {size} is not a multiple of {stride}, the coarsest stride of a \
+         grid-objectness head — its cells would be walked in a layout the model does not \
+         use, putting every box in the wrong cell. Round each axis to a multiple of \
+         {stride}."
+    )]
+    GridDoesNotDivide { size: InputSize, stride: usize },
+
+    /// A single-output layout bound against a model that declares no output at
+    /// all. `Detector::open` rejects that earlier with its own message, so this
+    /// is reachable only through a direct [`bind`].
+    #[error("model has no outputs")]
+    NoOutputs,
+
+    /// A two-tensor layout whose roles the model's outputs do not settle:
+    /// either no pair fits, or two candidates claim one role. Naming what the
+    /// model offers is the point — a guess at which tensor is which decodes
+    /// plausible garbage.
+    #[error(
+        "expected one [1, Q, 4] box output and one [1, Q, nc] logit output over \
+         the same Q queries, but the model offers {}{}",
+        describe_outputs(declared),
+        unbindable_hint(*unshaped)
+    )]
+    RolesUnbindable {
+        declared: Vec<Declared>,
+        /// The export pinned no shape anywhere, so [`bind_detr_by_name`] was
+        /// the last resort and it is the *names* that failed. The message says
+        /// what that fallback wanted rather than repeating shapes there are
+        /// none of.
+        unshaped: bool,
+    },
+
+    /// A shape that cannot be read as the given layout kind, from
+    /// [`fit_layout`] — the discriminating check, which is why the message
+    /// names what the kind expects.
+    #[error("output shape {} does not fit {layout}; expected {}", show(got), layout.expected(*size))]
+    LayoutDoesNotFit {
+        layout: Layout,
+        size: InputSize,
+        got: Shapes,
+    },
+
+    /// A tensor whose extents disagree with an *already resolved* layout, from
+    /// [`validate_layout`]. Distinct from [`LayoutDoesNotFit`]: the kind and
+    /// its counts are settled here and only the extents are in question, so
+    /// the message states the layout rather than what a kind expects.
+    ///
+    /// [`LayoutDoesNotFit`]: ResolveError::LayoutDoesNotFit
+    #[error("expected a {layout} output at input {size}, got {}", show(got))]
+    OutputShapeMismatch {
+        layout: Layout,
+        size: InputSize,
+        got: Shapes,
+    },
+
+    /// `--model-profile` named a profile that does not describe this model.
+    ///
+    /// The wrapped `source` is the underlying refusal — a role that would not
+    /// bind, or a shape that would not fit — and it is a genuine
+    /// [`std::error::Error`] source, so the operator sees both lines exactly as
+    /// they did when this was `with_context`.
+    ///
+    /// `profile` is the profile's *name* rather than the whole
+    /// [`ModelProfile`]: the name is its canonical identity — an alias resolves
+    /// to it and [`ModelProfile`]'s own `Display` writes nothing else — and a
+    /// profile by value is 136 bytes riding the `Err` side of every function in
+    /// this module, which `clippy::result_large_err` rightly objects to. With
+    /// the name instead, the whole enum is 104.
+    #[error("--model-profile {profile} does not describe model {}", model.display())]
+    ProfileMismatch {
+        profile: &'static str,
+        model: PathBuf,
+        #[source]
+        source: Box<ResolveError>,
+    },
+
+    /// No profile was named and the export pins no shape to sniff one from.
+    /// The encoding and resize policy have to be settled before the first frame
+    /// is converted, so this cannot be deferred the way `nc` can.
+    #[error(
+        "model {} leaves its output shape dynamic, so there is nothing to sniff a \
+         profile from — and the encoding and resize policy have to be settled before \
+         the first frame is converted. Pass --model-profile <{}>.",
+        model.display(),
+        names()
+    )]
+    NothingToSniff { model: PathBuf },
+
+    /// The export declares a shape and no built-in profile fits it.
+    #[error(
+        "model {} has unsupported outputs {} at input {size}; expected {}",
+        model.display(),
+        describe_outputs(declared),
+        expected_profiles(*size)
+    )]
+    NoProfileFits {
+        model: PathBuf,
+        declared: Vec<Declared>,
+        size: InputSize,
+    },
+
+    /// The shape fits more than one built-in profile. Never a silent pick: the
+    /// candidates decode completely differently, and the message lists them
+    /// twice — prose-joined to read, `|`-joined to paste after
+    /// `--model-profile`.
+    #[error(
+        "model {} has outputs {}, which at input {size} fit more than one profile: {}. \
+         Nothing in the shapes says which, and they decode differently — pass \
+         --model-profile <{}> to say.",
+        model.display(),
+        describe_outputs(declared),
+        candidates.join(" and "),
+        candidates.join("|")
+    )]
+    AmbiguousProfile {
+        model: PathBuf,
+        declared: Vec<Declared>,
+        size: InputSize,
+        /// The names of every profile that fits, in [`PROFILES`] order.
+        candidates: Vec<&'static str>,
+    },
+
+    /// `--input-size` disagrees with a size the model itself pins. Rejected at
+    /// startup rather than left to fail inside `Session::run` a minute in.
+    #[error(
+        "--input-size {requested} contradicts model {}, whose input is {declared}",
+        model.display()
+    )]
+    InputSizeContradiction {
+        requested: InputSize,
+        declared: InputSize,
+        model: PathBuf,
+    },
+
+    /// The profile is known and still cannot answer, because its family's
+    /// exports all leave their spatial axes dynamic.
+    ///
+    /// The message says so and offers the variant resolutions rather than
+    /// reporting a bare "does not pin", which would read as if the profile were
+    /// missing too. Guessing is not a wrong-but-working run: a variant fed
+    /// another's resolution detects nothing, silently.
+    #[error(
+        "model {} does not pin its input width and height, and the {profile} profile has no \
+         default to fall back on — every export in the family leaves its spatial axes \
+         dynamic and declares nothing that says which variant it is. Pass --input-size \
+         WxH (or N); the variants are trained at {variants}. A wrong size here is silent: \
+         the model runs and detects nothing.",
+        model.display()
+    )]
+    SizeUnknowable {
+        model: PathBuf,
+        profile: &'static str,
+        variants: &'static str,
+    },
+
+    /// Nothing pinned a size and nothing offered a default.
+    #[error(
+        "model {} does not pin its input width and height; pass --input-size WxH (or N)",
+        model.display()
+    )]
+    SizeUndeclared { model: PathBuf },
+
+    /// A size past the per-axis ceiling, whichever provenance it came from.
+    ///
+    /// The field is `provenance` rather than `source` only because `thiserror`
+    /// reserves that name for the error chain; the message still shows it as
+    /// the parenthetical the operator reads.
+    #[error(
+        "input size {size} ({provenance}) exceeds the {} per-dimension limit",
+        MAX_INPUT_DIM
+    )]
+    InputSizeOverAxisLimit {
+        size: InputSize,
+        provenance: InputSizeSource,
+    },
+
+    /// A size inside the per-axis ceiling and outside the area one. The
+    /// megabytes are what makes the case, so the message computes them.
+    #[error(
+        "input size {size} ({provenance}) is {pixels} pixels, over the {}-pixel \
+         limit (2048x2048): the CHW f32 tensor alone would be {} MB, per camera",
+        MAX_INPUT_PIXELS,
+        pixels.saturating_mul(3 * std::mem::size_of::<f32>()) / (1024 * 1024)
+    )]
+    InputSizeOverPixelLimit {
+        size: InputSize,
+        pixels: usize,
+        provenance: InputSizeSource,
+    },
+}
+
+/// The tail of [`ResolveError::RolesUnbindable`], when there was no shape to
+/// read the roles from.
+///
+/// The shape rule had nothing to work with, so the message says what the name
+/// fallback wanted rather than repeating shapes the export never declared.
+fn unbindable_hint(unshaped: bool) -> &'static str {
+    if unshaped {
+        "; with no shape to read the roles from, the names have to say which \
+         is which (pred_boxes/logits or dets/labels)"
+    } else {
+        ""
+    }
+}
+
+/// Every built-in profile's expected output shape, as
+/// [`ResolveError::NoProfileFits`] lists them.
+fn expected_profiles(size: InputSize) -> String {
+    PROFILES
+        .iter()
+        .map(|p| format!("{} ({})", p.output.layout.expected(size), p.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// A grid head only decodes at a size its strides divide.
 ///
@@ -27,7 +267,10 @@ use super::profile::{
 /// but they can coincide — and when they do every box lands in the wrong cell,
 /// which is wrong coordinates with nothing on stderr. So the size is rejected
 /// at startup instead, where the operator who typed it is still watching.
-pub(super) fn check_grid_divides_input(layout: Layout, size: InputSize) -> Result<()> {
+pub(super) fn check_grid_divides_input(
+    layout: Layout,
+    size: InputSize,
+) -> Result<(), ResolveError> {
     let Layout::GridObjectness { strides, .. } = layout else {
         return Ok(());
     };
@@ -35,12 +278,10 @@ pub(super) fn check_grid_divides_input(layout: Layout, size: InputSize) -> Resul
         return Ok(());
     };
     if !size.w.is_multiple_of(coarsest) || !size.h.is_multiple_of(coarsest) {
-        bail!(
-            "input size {size} is not a multiple of {coarsest}, the coarsest stride of a \
-             grid-objectness head — its cells would be walked in a layout the model does not \
-             use, putting every box in the wrong cell. Round each axis to a multiple of \
-             {coarsest}."
-        );
+        return Err(ResolveError::GridDoesNotDivide {
+            size,
+            stride: coarsest,
+        });
     }
     Ok(())
 }
@@ -115,13 +356,13 @@ pub(super) fn static_output_dims(dtype: &ValueType) -> Option<Vec<i64>> {
 /// leaves the shape rule nothing to read, and falls back to
 /// [`bind_detr_by_name`]. See its comment for why that is safe here and not a
 /// general licence to bind by name.
-fn bind(roles: Roles, declared: &[Declared]) -> Result<Outputs<Declared>> {
+fn bind(roles: Roles, declared: &[Declared]) -> Result<Outputs<Declared>, ResolveError> {
     match roles {
         Outputs::One(()) => declared
             .first()
             .cloned()
             .map(Outputs::One)
-            .ok_or_else(|| anyhow!("model has no outputs")),
+            .ok_or(ResolveError::NoOutputs),
         Outputs::BoxesAndLogits { .. } => {
             let (mut boxes, mut logits) = (None, None);
             let mut clash = false;
@@ -153,20 +394,9 @@ fn bind(roles: Roles, declared: &[Declared]) -> Result<Outputs<Declared>> {
             let unshaped = declared.iter().all(|output| output.dims.is_none());
             paired
                 .or_else(|| unshaped.then(|| bind_detr_by_name(declared)).flatten())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "expected one [1, Q, 4] box output and one [1, Q, nc] logit output over \
-                         the same Q queries, but the model offers {}{}",
-                        describe_outputs(declared),
-                        // The shape rule had nothing to read, so say what the
-                        // fallback wanted rather than repeating shapes.
-                        if unshaped {
-                            "; with no shape to read the roles from, the names have to say which \
-                             is which (pred_boxes/logits or dets/labels)"
-                        } else {
-                            ""
-                        }
-                    )
+                .ok_or_else(|| ResolveError::RolesUnbindable {
+                    declared: declared.to_vec(),
+                    unshaped,
                 })
         }
     }
@@ -225,7 +455,7 @@ fn static_shapes(roles: Roles, declared: &[Declared]) -> Option<Shapes> {
 ///
 /// Nothing here guesses: the layout kind is given, and this only fills in what
 /// the shape declares (`nc`) and refuses shapes the kind cannot describe.
-fn fit_layout(layout: Layout, shapes: &Shapes, size: InputSize) -> Result<Layout> {
+fn fit_layout(layout: Layout, shapes: &Shapes, size: InputSize) -> Result<Layout, ResolveError> {
     // Every arm requires the roles to match first, so a two-tensor shape can
     // never be read as a one-tensor head or the reverse.
     let fitted = match (layout, shapes) {
@@ -262,12 +492,10 @@ fn fit_layout(layout: Layout, shapes: &Shapes, size: InputSize) -> Result<Layout
         }
         _ => None,
     };
-    fitted.ok_or_else(|| {
-        anyhow!(
-            "output shape {} does not fit {layout}; expected {}",
-            show(shapes),
-            layout.expected(size)
-        )
+    fitted.ok_or_else(|| ResolveError::LayoutDoesNotFit {
+        layout,
+        size,
+        got: shapes.clone(),
     })
 }
 
@@ -284,7 +512,11 @@ fn rank3(dims: &[i64]) -> bool {
 /// is whether this tensor has the extents that layout indexes by — a head with
 /// one anchor is perfectly decodable and the sniffing heuristic would refuse
 /// it.
-pub(super) fn validate_layout(layout: Layout, shapes: &Shapes, size: InputSize) -> Result<()> {
+pub(super) fn validate_layout(
+    layout: Layout,
+    shapes: &Shapes,
+    size: InputSize,
+) -> Result<(), ResolveError> {
     let ok = match (layout, shapes) {
         (Layout::EndToEnd, Outputs::One(dims)) => rank3(dims) && dims[2] == 6,
         (Layout::RawClasses { nc }, Outputs::One(dims)) => {
@@ -305,16 +537,21 @@ pub(super) fn validate_layout(layout: Layout, shapes: &Shapes, size: InputSize) 
         _ => false,
     };
     if !ok {
-        bail!(
-            "expected a {layout} output at input {size}, got {}",
-            show(shapes)
-        );
+        return Err(ResolveError::OutputShapeMismatch {
+            layout,
+            size,
+            got: shapes.clone(),
+        });
     }
     Ok(())
 }
 
 /// The same, for a whole output half.
-pub(super) fn fit_output(spec: OutputSpec, shapes: &Shapes, size: InputSize) -> Result<OutputSpec> {
+pub(super) fn fit_output(
+    spec: OutputSpec,
+    shapes: &Shapes,
+    size: InputSize,
+) -> Result<OutputSpec, ResolveError> {
     Ok(OutputSpec {
         layout: fit_layout(spec.layout, shapes, size)?,
         ..spec
@@ -355,21 +592,20 @@ pub(super) fn resolve_profile(
     declared: &[Declared],
     size: InputSize,
     model: &Path,
-) -> Result<(ModelProfile, Outputs<String>, Option<OutputSpec>)> {
+) -> Result<(ModelProfile, Outputs<String>, Option<OutputSpec>), ResolveError> {
     let Some(profile) = explicit else {
         return sniff_profile(declared, size, model);
     };
-    let mismatch = || {
-        format!(
-            "--model-profile {profile} does not describe model {}",
-            model.display()
-        )
+    let mismatch = |source: ResolveError| ResolveError::ProfileMismatch {
+        profile: profile.name,
+        model: model.to_path_buf(),
+        source: Box::new(source),
     };
     // A profile that names roles the model does not offer is settled here,
     // before any frame is packed for it.
-    let bound = bind(profile.output.layout.roles(), declared).with_context(mismatch)?;
+    let bound = bind(profile.output.layout.roles(), declared).map_err(mismatch)?;
     let output = match bound.try_map(|output| output.dims.clone()) {
-        Some(shapes) => Some(fit_output(profile.output, &shapes, size).with_context(mismatch)?),
+        Some(shapes) => Some(fit_output(profile.output, &shapes, size).map_err(mismatch)?),
         // A dynamic output shape declares nothing to validate against; the
         // input half is still fully known, so frames can be packed correctly
         // and only `nc` waits for the first real output. This covers the
@@ -388,15 +624,8 @@ fn sniff_profile(
     declared: &[Declared],
     size: InputSize,
     model: &Path,
-) -> Result<(ModelProfile, Outputs<String>, Option<OutputSpec>)> {
+) -> Result<(ModelProfile, Outputs<String>, Option<OutputSpec>), ResolveError> {
     let mut candidates = sniff(declared, size);
-    let named = |profiles: &[ModelProfile], sep: &str| {
-        profiles
-            .iter()
-            .map(|p| p.name)
-            .collect::<Vec<_>>()
-            .join(sep)
-    };
     match candidates.len() {
         1 => {
             let profile = candidates.remove(0);
@@ -414,33 +643,21 @@ fn sniff_profile(
             .iter()
             .any(|p| static_shapes(p.output.layout.roles(), declared).is_some()) =>
         {
-            bail!(
-                "model {} leaves its output shape dynamic, so there is nothing to sniff a \
-                 profile from — and the encoding and resize policy have to be settled before \
-                 the first frame is converted. Pass --model-profile <{}>.",
-                model.display(),
-                names()
-            )
+            Err(ResolveError::NothingToSniff {
+                model: model.to_path_buf(),
+            })
         }
-        0 => bail!(
-            "model {} has unsupported outputs {} at input {size}; expected {}",
-            model.display(),
-            describe_outputs(declared),
-            PROFILES
-                .iter()
-                .map(|p| format!("{} ({})", p.output.layout.expected(size), p.name))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        _ => bail!(
-            "model {} has outputs {}, which at input {size} fit more than one profile: {}. \
-             Nothing in the shapes says which, and they decode differently — pass \
-             --model-profile <{}> to say.",
-            model.display(),
-            describe_outputs(declared),
-            named(&candidates, " and "),
-            named(&candidates, "|")
-        ),
+        0 => Err(ResolveError::NoProfileFits {
+            model: model.to_path_buf(),
+            declared: declared.to_vec(),
+            size,
+        }),
+        _ => Err(ResolveError::AmbiguousProfile {
+            model: model.to_path_buf(),
+            declared: declared.to_vec(),
+            size,
+            candidates: candidates.iter().map(|p| p.name).collect(),
+        }),
     }
 }
 
@@ -494,42 +711,47 @@ pub(super) fn resolve_input_size(
     requested: Option<InputSize>,
     profile: Option<ModelProfile>,
     model: &Path,
-) -> Result<(InputSize, InputSizeSource)> {
+) -> Result<(InputSize, InputSizeSource), ResolveError> {
     let fallback = profile
         .filter(|profile| profile.variant_sizes.is_none())
         .map(|profile| profile.input.size);
     let (size, source) = match (requested, declared) {
-        (Some(requested), Some(declared)) if requested != declared => bail!(
-            "--input-size {requested} contradicts model {}, whose input is {declared}",
-            model.display()
-        ),
+        (Some(requested), Some(declared)) if requested != declared => {
+            return Err(ResolveError::InputSizeContradiction {
+                requested,
+                declared,
+                model: model.to_path_buf(),
+            })
+        }
         (Some(requested), _) => (requested, InputSizeSource::Flag),
         (None, Some(declared)) => (declared, InputSizeSource::Model),
         (None, None) => match (fallback, profile.and_then(|p| p.variant_sizes)) {
             (Some(fallback), _) => (fallback, InputSizeSource::Profile),
-            // The profile is known and still cannot answer: say so, and say
-            // what the answer is likely to be, rather than reporting a bare
-            // "does not pin" that reads as if the profile were missing too.
-            (None, Some(sizes)) => bail!(
-                "model {} does not pin its input width and height, and the {} profile has no \
-                 default to fall back on — every export in the family leaves its spatial axes \
-                 dynamic and declares nothing that says which variant it is. Pass --input-size \
-                 WxH (or N); the variants are trained at {sizes}. A wrong size here is silent: \
-                 the model runs and detects nothing.",
-                model.display(),
-                profile.map(|p| p.name).unwrap_or_default(),
-            ),
-            (None, None) => bail!(
-                "model {} does not pin its input width and height; pass --input-size WxH (or N)",
-                model.display()
-            ),
+            // The profile is known and still cannot answer — see
+            // [`ResolveError::SizeUnknowable`] for why it refuses rather than
+            // falling back to one variant's resolution.
+            (None, Some(variants)) => {
+                return Err(ResolveError::SizeUnknowable {
+                    model: model.to_path_buf(),
+                    profile: profile.map(|p| p.name).unwrap_or_default(),
+                    variants,
+                })
+            }
+            (None, None) => {
+                return Err(ResolveError::SizeUndeclared {
+                    model: model.to_path_buf(),
+                })
+            }
         },
     };
     // Every provenance funnels through here, so both ceilings cover a model's
     // declared dims as well as a typo'd flag. Zero is already impossible:
     // `dim` rejects it on the flag and `declared_input_size` requires `> 0`.
     if size.w > MAX_INPUT_DIM || size.h > MAX_INPUT_DIM {
-        bail!("input size {size} ({source}) exceeds the {MAX_INPUT_DIM} per-dimension limit");
+        return Err(ResolveError::InputSizeOverAxisLimit {
+            size,
+            provenance: source,
+        });
     }
     // The per-axis bound is about casts; this one is about memory, and a size
     // inside the first can be far outside the second (8192x8192 is a 1 GB
@@ -537,11 +759,11 @@ pub(super) fn resolve_input_size(
     // what is being questioned.
     let pixels = size.w.saturating_mul(size.h);
     if pixels > MAX_INPUT_PIXELS {
-        bail!(
-            "input size {size} ({source}) is {pixels} pixels, over the {MAX_INPUT_PIXELS}-pixel \
-             limit (2048x2048): the CHW f32 tensor alone would be {} MB, per camera",
-            pixels.saturating_mul(3 * std::mem::size_of::<f32>()) / (1024 * 1024),
-        );
+        return Err(ResolveError::InputSizeOverPixelLimit {
+            size,
+            pixels,
+            provenance: source,
+        });
     }
     Ok((size, source))
 }
@@ -786,13 +1008,24 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["yolox", "yolov10"]
         );
-        let err = resolve_profile(None, &declared(&[1, 5040, 6]), wide, Path::new("m.onnx"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("yolox"), "{err}");
-        assert!(err.contains("yolov10"), "{err}");
-        assert!(err.contains("--model-profile"), "{err}");
-        assert!(err.contains("[1, 5040, 6]"), "{err}");
+        let err =
+            resolve_profile(None, &declared(&[1, 5040, 6]), wide, Path::new("m.onnx")).unwrap_err();
+        let ResolveError::AmbiguousProfile {
+            candidates,
+            declared: offered,
+            size,
+            model,
+        } = &err
+        else {
+            panic!("{err:?}");
+        };
+        // Both readings are named, in profile order, and the outputs that
+        // produced the collision are carried so the operator can see them.
+        assert_eq!(candidates, &["yolox", "yolov10"]);
+        assert_eq!(*size, wide);
+        assert_eq!(model, Path::new("m.onnx"));
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].dims.as_deref(), Some(&[1, 5040, 6][..]));
         // the same collision at the default square input
         assert_eq!(sniff(&declared(&[1, 8400, 6]), SQUARE).len(), 2);
     }
@@ -859,9 +1092,24 @@ mod tests {
             Path::new("m.onnx"),
         )
         .unwrap_err();
-        let text = format!("{err:#}");
-        assert!(text.contains("--model-profile yolox"), "{text}");
-        assert!(text.contains("[1, 8400, 5 + nc]"), "{text}");
+        // The named profile is blamed, and the reason it did not fit is a
+        // *source* of that blame rather than a second sentence spliced into it.
+        let ResolveError::ProfileMismatch {
+            profile, source, ..
+        } = &err
+        else {
+            panic!("{err:?}");
+        };
+        assert_eq!(*profile, "yolox");
+        let ResolveError::LayoutDoesNotFit { layout, size, got } = &**source else {
+            panic!("{source:?}");
+        };
+        assert!(
+            matches!(layout, Layout::GridObjectness { .. }),
+            "{layout:?}"
+        );
+        assert_eq!(*size, SQUARE);
+        assert_eq!(*got, one(&[1, 3549, 85]));
         // an end-to-end profile pointed at a raw head
         assert!(resolve_profile(
             Some(YOLOV10),
@@ -899,13 +1147,24 @@ mod tests {
                 sniff(&declared(&dims), size).is_empty(),
                 "{dims:?} matched something"
             );
-            let err = resolve_profile(None, &declared(&dims), size, Path::new("m.onnx"))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("yolox"), "{err}");
-            assert!(err.contains("yolov10"), "{err}");
-            assert!(err.contains("yolov8"), "{err}");
+            let err =
+                resolve_profile(None, &declared(&dims), size, Path::new("m.onnx")).unwrap_err();
+            // Not `NothingToSniff`: this export *did* declare a shape, and the
+            // distinction is the whole reason the two are separate variants.
+            let ResolveError::NoProfileFits {
+                declared: offered,
+                size: at,
+                ..
+            } = &err
+            else {
+                panic!("{dims:?}: {err:?}");
+            };
+            assert_eq!(*at, size);
+            assert_eq!(offered[0].dims.as_ref(), Some(&dims));
         }
+        // The variant is what says "none of them fit"; that it then *names*
+        // every family is the message's job, pinned once in
+        // `the_no_profile_fits_message_lists_every_family`.
     }
 
     #[test]
@@ -922,11 +1181,11 @@ mod tests {
         assert!(static_output_dims(&tensor_type(&[-1, -1, -1])).is_none());
         // nothing to sniff, and the encoding has to be known before the first
         // frame is converted, so this is a startup failure rather than a guess
-        let err = resolve_profile(None, &dynamic(), SQUARE, Path::new("m.onnx"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--model-profile"), "{err}");
-        assert!(err.contains("yolox"), "{err}");
+        let err = resolve_profile(None, &dynamic(), SQUARE, Path::new("m.onnx")).unwrap_err();
+        let ResolveError::NothingToSniff { model } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(model, Path::new("m.onnx"));
         // with the flag, the input half is settled now and nc waits
         let (profile, _names, output) =
             resolve_profile(Some(YOLOX), &dynamic(), SQUARE, Path::new("m.onnx")).unwrap();
@@ -1041,11 +1300,21 @@ mod tests {
                 .collect()
         };
         // nothing in either name claims a role, and position is not a signal
-        let err = bind(roles, &unnamed(["output0", "output1"]))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("pred_boxes/logits"), "{err}");
-        assert!(err.contains("(dynamic)"), "{err}");
+        let err = bind(roles, &unnamed(["output0", "output1"])).unwrap_err();
+        // `unshaped` is what selects the "the names have to say which is which"
+        // half of the message, so it is the field that has to be true here.
+        let ResolveError::RolesUnbindable {
+            declared: offered,
+            unshaped,
+        } = &err
+        else {
+            panic!("{err:?}");
+        };
+        assert!(unshaped, "{err:?}");
+        assert!(
+            offered.iter().all(|output| output.dims.is_none()),
+            "{err:?}"
+        );
         // two claims on one role is an ambiguity, not a first-wins
         assert!(bind(roles, &unnamed(["pred_boxes", "dets"])).is_err());
         // a name claiming both roles claims neither
@@ -1057,20 +1326,35 @@ mod tests {
             name: "pred_boxes".into(),
             dims: Some(vec![1, 300, 6]),
         }];
-        let err = bind(roles, &shaped).unwrap_err().to_string();
-        assert!(err.contains("[1, 300, 6]"), "{err}");
-        assert!(!err.contains("pred_boxes/logits"), "{err}");
+        let err = bind(roles, &shaped).unwrap_err();
+        let ResolveError::RolesUnbindable {
+            declared: offered,
+            unshaped,
+        } = &err
+        else {
+            panic!("{err:?}");
+        };
+        assert!(!unshaped, "{err:?}");
+        assert_eq!(offered[0].dims.as_deref(), Some(&[1, 300, 6][..]));
     }
 
     #[test]
     fn a_pair_that_cannot_be_told_apart_is_an_error_naming_the_outputs() {
         let roles = Layout::DetrQueries { nc: 91 }.roles();
         // a single-output model has no pair at all
-        let err = bind(roles, &declared(&[1, 300, 91]))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("[1, Q, 4]"), "{err}");
-        assert!(err.contains("\"output\""), "{err}");
+        let err = bind(roles, &declared(&[1, 300, 91])).unwrap_err();
+        let ResolveError::RolesUnbindable {
+            declared: offered,
+            unshaped,
+        } = &err
+        else {
+            panic!("{err:?}");
+        };
+        // it declared a shape, so this is a shape mismatch and the message must
+        // not fall back to talking about names
+        assert!(!unshaped, "{err:?}");
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].name, "output");
 
         // a genuinely 4-class DETR: both tensors end in 4 and nothing says
         // which is the box regression
@@ -1172,15 +1456,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["yolox", "rfdetr"]
         );
-        let err = resolve_profile(None, &logits_first, size, Path::new("m.onnx"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("yolox"), "{err}");
-        assert!(err.contains("rfdetr"), "{err}");
-        assert!(err.contains("--model-profile"), "{err}");
-        // the error has to name the outputs, since the shapes alone no longer
+        let err = resolve_profile(None, &logits_first, size, Path::new("m.onnx")).unwrap_err();
+        let ResolveError::AmbiguousProfile {
+            candidates,
+            declared: offered,
+            ..
+        } = &err
+        else {
+            panic!("{err:?}");
+        };
+        assert_eq!(candidates, &["yolox", "rfdetr"]);
+        // the error has to carry the outputs, since the shapes alone no longer
         // identify what was looked at
-        assert!(err.contains("\"logits\""), "{err}");
+        assert_eq!(
+            offered.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(),
+            ["logits", "pred_boxes"]
+        );
 
         // ...and naming the profile settles it either way
         let (profile, _names, output) =
@@ -1200,9 +1491,18 @@ mod tests {
             Path::new("m.onnx"),
         )
         .unwrap_err();
-        let text = format!("{err:#}");
-        assert!(text.contains("--model-profile rfdetr"), "{text}");
-        assert!(text.contains("[1, Q, 4]"), "{text}");
+        let ResolveError::ProfileMismatch {
+            profile, source, ..
+        } = &err
+        else {
+            panic!("{err:?}");
+        };
+        assert_eq!(*profile, "rfdetr");
+        // the roles never bound, so this is not a shape that failed to fit
+        assert!(
+            matches!(**source, ResolveError::RolesUnbindable { .. }),
+            "{source:?}"
+        );
 
         // and the reverse: a single-tensor profile against a DETR export
         // binds `pred_boxes` and then fails to fit it
@@ -1336,10 +1636,13 @@ mod tests {
         );
         // ...and without any of the three there is nothing to build a scaler
         // from
-        let err = resolve_input_size(None, None, None, model)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--input-size"), "{err}");
+        let err = resolve_input_size(None, None, None, model).unwrap_err();
+        // No profile was in play, so this is the bare refusal rather than
+        // `SizeUnknowable`, which exists to say a profile *was* known.
+        let ResolveError::SizeUndeclared { model: named } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(named, model);
     }
 
     #[test]
@@ -1349,14 +1652,21 @@ mod tests {
         // spatial axes dynamic and declares nothing that says which variant it
         // is, so a `small` fed 384 runs to completion and detects nothing.
         // Refusing is the only honest answer; the error carries the set.
-        let err = resolve_input_size(None, None, Some(RFDETR), model)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--input-size"), "{err}");
-        assert!(err.contains("rfdetr"), "{err}");
-        assert!(err.contains(&model.display().to_string()), "{err}");
+        let err = resolve_input_size(None, None, Some(RFDETR), model).unwrap_err();
+        let ResolveError::SizeUnknowable {
+            model: named,
+            profile,
+            variants,
+        } = &err
+        else {
+            panic!("{err:?}");
+        };
+        assert_eq!(named, model);
+        assert_eq!(*profile, "rfdetr");
+        // the set the error offers instead of a guess is the profile's own
+        assert_eq!(Some(*variants), RFDETR.variant_sizes);
         for size in ["384", "512", "560", "576", "704"] {
-            assert!(err.contains(size), "variant {size} missing from {err}");
+            assert!(variants.contains(size), "variant {size} missing");
         }
 
         // The flag it asks for is all it needs.
@@ -1380,21 +1690,26 @@ mod tests {
     fn an_absurd_size_is_rejected_whichever_provenance_it_came_from() {
         let model = Path::new("m.onnx");
         let absurd = InputSize::square(64_000_000);
-        // a typo'd flag...
-        let err = resolve_input_size(None, Some(absurd), None, model)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("64000000x64000000"), "{err}");
-        assert!(err.contains("8192"), "{err}");
-        assert!(err.contains("--input-size"), "{err}");
-
-        // ...and a model declaring the same nonsense, which no flag touches
-        let err = resolve_input_size(Some(absurd), None, None, model)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("64000000x64000000"), "{err}");
-        assert!(err.contains("8192"), "{err}");
-        assert!(err.contains("from model"), "{err}");
+        // The provenance is carried rather than described, so both readings
+        // land in the same variant and differ only in the field the message
+        // shows in parentheses.
+        for (declared, requested, provenance) in [
+            (None, Some(absurd), InputSizeSource::Flag),
+            // a model declaring the same nonsense, which no flag touches
+            (Some(absurd), None, InputSizeSource::Model),
+        ] {
+            let err = resolve_input_size(declared, requested, None, model).unwrap_err();
+            let ResolveError::InputSizeOverAxisLimit {
+                size,
+                provenance: from,
+            } = &err
+            else {
+                panic!("{err:?}");
+            };
+            assert_eq!(*size, absurd);
+            assert_eq!(*from, provenance);
+            assert!(size.w > MAX_INPUT_DIM && size.h > MAX_INPUT_DIM);
+        }
 
         // one oversized axis is enough
         assert!(resolve_input_size(
@@ -1457,18 +1772,24 @@ mod tests {
         let model = Path::new("hostile.onnx");
         let square = InputSize::square(MAX_INPUT_DIM);
         assert!(square.w <= MAX_INPUT_DIM && square.h <= MAX_INPUT_DIM);
-        for (declared, requested, source) in [
-            (Some(square), None, "from model"),
-            (None, Some(square), "--input-size"),
+        for (declared, requested, from) in [
+            (Some(square), None, InputSizeSource::Model),
+            (None, Some(square), InputSizeSource::Flag),
         ] {
-            let err = resolve_input_size(declared, requested, None, model)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("8192x8192"), "{err}");
-            assert!(err.contains(&MAX_INPUT_PIXELS.to_string()), "{err}");
-            assert!(err.contains(source), "{err}");
-            // the number that makes the case, in MB
-            assert!(err.contains("768 MB"), "{err}");
+            let err = resolve_input_size(declared, requested, None, model).unwrap_err();
+            let ResolveError::InputSizeOverPixelLimit {
+                size,
+                pixels,
+                provenance,
+            } = &err
+            else {
+                panic!("{err:?}");
+            };
+            assert_eq!(*size, square);
+            assert_eq!(*provenance, from);
+            assert!(*pixels > MAX_INPUT_PIXELS);
+            // the number that makes the case, in MB, as the message computes it
+            assert_eq!(pixels * 3 * std::mem::size_of::<f32>() / (1024 * 1024), 768);
         }
         // one pixel over is over, on either axis
         for over in [
@@ -1496,11 +1817,13 @@ mod tests {
         // lays its cells out differently. The total-count check only catches
         // that when the totals differ; when they coincide every box lands in
         // the wrong cell, which is wrong coordinates with nothing on stderr.
-        let err = check_grid_divides_input(grid, InputSize { w: 640, h: 350 })
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("640x350"), "{err}");
-        assert!(err.contains("32"), "{err}");
+        let err = check_grid_divides_input(grid, InputSize { w: 640, h: 350 }).unwrap_err();
+        let ResolveError::GridDoesNotDivide { size, stride } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(*size, InputSize { w: 640, h: 350 });
+        // the coarsest stride, not the one that happens to fail first
+        assert_eq!(*stride, 32);
 
         // the sizes that matter still pass
         for size in [YOLOX_416, SQUARE, TINY, InputSize { w: 640, h: 384 }] {
@@ -1520,10 +1843,244 @@ mod tests {
             None,
             Path::new("m.onnx"),
         )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("640x640") && err.contains("320x320"), "{err}");
+        .unwrap_err();
+        // Both sides are carried, and in their own fields: which number came
+        // from the flag and which from the model is exactly what a transposed
+        // message would get wrong.
+        let ResolveError::InputSizeContradiction {
+            requested,
+            declared,
+            ..
+        } = &err
+        else {
+            panic!("{err:?}");
+        };
+        assert_eq!(*requested, InputSize::square(320));
+        assert_eq!(*declared, InputSize::square(640));
         // agreeing is not a contradiction
         assert!(resolve_input_size(Some(SQUARE), Some(SQUARE), None, Path::new("m.onnx")).is_ok());
+    }
+
+    // ---- the operator-facing messages ---------------------------------------
+    //
+    // One test per variant, and the only place any of this prose is asserted.
+    // Every other test above matches the variant and its fields, so rewording a
+    // message for an operator touches exactly one test — which is the point of
+    // the type. These are `assert_eq!` on the whole rendered string rather than
+    // substrings: a message is either what was reviewed or it is not.
+
+    #[test]
+    fn the_grid_does_not_divide_message_names_the_stride_and_what_to_do() {
+        assert_eq!(
+            ResolveError::GridDoesNotDivide {
+                size: InputSize { w: 640, h: 350 },
+                stride: 32,
+            }
+            .to_string(),
+            "input size 640x350 is not a multiple of 32, the coarsest stride of a grid-objectness \
+             head — its cells would be walked in a layout the model does not use, putting every \
+             box in the wrong cell. Round each axis to a multiple of 32."
+        );
+    }
+
+    #[test]
+    fn the_no_outputs_message_is_the_bare_fact() {
+        assert_eq!(ResolveError::NoOutputs.to_string(), "model has no outputs");
+        // and it is what an empty output list actually produces
+        assert_eq!(
+            bind(Layout::EndToEnd.roles(), &[]).unwrap_err().to_string(),
+            "model has no outputs"
+        );
+    }
+
+    #[test]
+    fn the_roles_unbindable_message_falls_back_to_names_only_when_unshaped() {
+        let shaped = ResolveError::RolesUnbindable {
+            declared: declared(&[1, 300, 6]),
+            unshaped: false,
+        };
+        assert_eq!(
+            shaped.to_string(),
+            "expected one [1, Q, 4] box output and one [1, Q, nc] logit output over the same Q \
+             queries, but the model offers \"output\" [1, 300, 6]"
+        );
+        let unshaped = ResolveError::RolesUnbindable {
+            declared: dynamic(),
+            unshaped: true,
+        };
+        assert_eq!(
+            unshaped.to_string(),
+            "expected one [1, Q, 4] box output and one [1, Q, nc] logit output over the same Q \
+             queries, but the model offers \"output\" (dynamic); with no shape to read the roles \
+             from, the names have to say which is which (pred_boxes/logits or dets/labels)"
+        );
+    }
+
+    #[test]
+    fn the_layout_does_not_fit_message_says_what_the_kind_expects() {
+        assert_eq!(
+            ResolveError::LayoutDoesNotFit {
+                layout: Layout::RawClasses { nc: 80 },
+                size: SQUARE,
+                got: one(&[1, 300, 6]),
+            }
+            .to_string(),
+            "output shape [1, 300, 6] does not fit raw-classes [1, 4 + 80, A]; expected \
+             [1, 4 + nc, A] with A far longer than 4 + nc"
+        );
+    }
+
+    #[test]
+    fn the_output_shape_mismatch_message_states_the_resolved_layout() {
+        assert_eq!(
+            ResolveError::OutputShapeMismatch {
+                layout: Layout::EndToEnd,
+                size: SQUARE,
+                got: one(&[1, 300, 7]),
+            }
+            .to_string(),
+            "expected a end-to-end [1, N, 6] output at input 640x640, got [1, 300, 7]"
+        );
+    }
+
+    #[test]
+    fn the_profile_mismatch_message_blames_the_flag_and_keeps_the_reason_as_a_source() {
+        let err = ResolveError::ProfileMismatch {
+            profile: RFDETR.name,
+            model: Path::new("m.onnx").to_path_buf(),
+            source: Box::new(ResolveError::NoOutputs),
+        };
+        assert_eq!(
+            err.to_string(),
+            "--model-profile rfdetr does not describe model m.onnx"
+        );
+        // The reason is a *link*, not a clause: `anyhow` renders both at the
+        // boundary and the golden fixtures record the chain as two entries.
+        let chain: Vec<String> = anyhow::Error::from(err)
+            .chain()
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(
+            chain,
+            [
+                "--model-profile rfdetr does not describe model m.onnx",
+                "model has no outputs"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_nothing_to_sniff_message_lists_every_name_the_flag_accepts() {
+        assert_eq!(
+            ResolveError::NothingToSniff {
+                model: Path::new("m.onnx").to_path_buf(),
+            }
+            .to_string(),
+            "model m.onnx leaves its output shape dynamic, so there is nothing to sniff a profile \
+             from — and the encoding and resize policy have to be settled before the first frame \
+             is converted. Pass --model-profile <yolox, yolov10 (or yolo26), yolov8 (or yolov9, \
+             yolo11, yolov11), rfdetr (or rf-detr)>."
+        );
+    }
+
+    #[test]
+    fn the_no_profile_fits_message_lists_every_family() {
+        assert_eq!(
+            ResolveError::NoProfileFits {
+                model: Path::new("m.onnx").to_path_buf(),
+                declared: declared(&[1, 10, 7]),
+                size: SQUARE,
+            }
+            .to_string(),
+            "model m.onnx has unsupported outputs \"output\" [1, 10, 7] at input 640x640; \
+             expected [1, 8400, 5 + nc] at input 640x640 (yolox), [1, N, 6] (yolov10), \
+             [1, 4 + nc, A] with A far longer than 4 + nc (yolov8), [1, Q, 4] boxes with \
+             [1, Q, nc] logits (rfdetr)"
+        );
+    }
+
+    #[test]
+    fn the_ambiguous_profile_message_lists_the_candidates_twice() {
+        // Once prose-joined to read, once `|`-joined to paste after the flag.
+        assert_eq!(
+            ResolveError::AmbiguousProfile {
+                model: Path::new("m.onnx").to_path_buf(),
+                declared: declared(&[1, 5040, 6]),
+                size: InputSize { w: 640, h: 384 },
+                candidates: vec!["yolox", "yolov10"],
+            }
+            .to_string(),
+            "model m.onnx has outputs \"output\" [1, 5040, 6], which at input 640x384 fit more \
+             than one profile: yolox and yolov10. Nothing in the shapes says which, and they \
+             decode differently — pass --model-profile <yolox|yolov10> to say."
+        );
+    }
+
+    #[test]
+    fn the_input_size_contradiction_message_names_both_sides() {
+        assert_eq!(
+            ResolveError::InputSizeContradiction {
+                requested: InputSize::square(416),
+                declared: SQUARE,
+                model: Path::new("m.onnx").to_path_buf(),
+            }
+            .to_string(),
+            "--input-size 416x416 contradicts model m.onnx, whose input is 640x640"
+        );
+    }
+
+    #[test]
+    fn the_size_unknowable_message_offers_the_variants_instead_of_a_guess() {
+        assert_eq!(
+            ResolveError::SizeUnknowable {
+                model: Path::new("rfdetr_small.onnx").to_path_buf(),
+                profile: "rfdetr",
+                variants: RFDETR.variant_sizes.unwrap(),
+            }
+            .to_string(),
+            "model rfdetr_small.onnx does not pin its input width and height, and the rfdetr \
+             profile has no default to fall back on — every export in the family leaves its \
+             spatial axes dynamic and declares nothing that says which variant it is. Pass \
+             --input-size WxH (or N); the variants are trained at nano 384, small 512, base 560, \
+             medium 576, large 704. A wrong size here is silent: the model runs and detects \
+             nothing."
+        );
+    }
+
+    #[test]
+    fn the_size_undeclared_message_asks_for_the_flag() {
+        assert_eq!(
+            ResolveError::SizeUndeclared {
+                model: Path::new("m.onnx").to_path_buf(),
+            }
+            .to_string(),
+            "model m.onnx does not pin its input width and height; pass --input-size WxH (or N)"
+        );
+    }
+
+    #[test]
+    fn the_over_axis_limit_message_shows_the_provenance_in_parentheses() {
+        assert_eq!(
+            ResolveError::InputSizeOverAxisLimit {
+                size: InputSize { w: 9000, h: 64 },
+                provenance: InputSizeSource::Flag,
+            }
+            .to_string(),
+            "input size 9000x64 (from --input-size) exceeds the 8192 per-dimension limit"
+        );
+    }
+
+    #[test]
+    fn the_over_pixel_limit_message_carries_the_megabytes_that_make_the_case() {
+        assert_eq!(
+            ResolveError::InputSizeOverPixelLimit {
+                size: InputSize { w: 4096, h: 2048 },
+                pixels: 4096 * 2048,
+                provenance: InputSizeSource::Flag,
+            }
+            .to_string(),
+            "input size 4096x2048 (from --input-size) is 8388608 pixels, over the 4194304-pixel \
+             limit (2048x2048): the CHW f32 tensor alone would be 96 MB, per camera"
+        );
     }
 }

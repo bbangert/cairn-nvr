@@ -613,12 +613,18 @@ fn detr_outputs(queries: i64, nc: i64) -> Vec<Declared> {
 /// An error as the fixture records it: one array entry per link of the chain.
 ///
 /// Deliberately not `format!("{err:#}")`. That flattens the chain into one
-/// string using a format `anyhow` owns, and Phase 3 replaces these errors with
-/// `thiserror`, which ignores `{:#}` — every multi-link entry would collapse to
-/// its outer message and the diff would read like a reworded string while
-/// actually recording *lost context*. An array makes the link count part of
-/// what is pinned.
-fn error_chain(err: &anyhow::Error) -> Value {
+/// string using a format `anyhow` owns, and the resolver's errors are
+/// `thiserror` types, which ignore `{:#}` — every multi-link entry would
+/// collapse to its outer message and the diff would read like a reworded string
+/// while actually recording *lost context*. An array makes the link count part
+/// of what is pinned.
+///
+/// Takes anything `anyhow` can absorb, because that absorption is exactly what
+/// the plugin does at its own boundary: a `ResolveError` becomes an
+/// `anyhow::Error` on its way out of `infer`, and its `#[source]` links become
+/// chain links.
+fn error_chain(err: impl Into<anyhow::Error>) -> Value {
+    let err = err.into();
     json!({
         "error": err.chain().map(ToString::to_string).collect::<Vec<_>>(),
     })
@@ -651,7 +657,7 @@ fn resolution(explicit: Option<ModelProfile>, outputs: &[Declared], size: InputS
                 "max_candidates": nms.max_candidates,
             })),
         }),
-        Err(err) => error_chain(&err),
+        Err(err) => error_chain(err),
     }
 }
 
@@ -813,7 +819,7 @@ fn golden_input_size_resolution() {
                 "size": [size.w, size.h],
                 "source": source.to_string(),
             }),
-            Err(err) => error_chain(&err),
+            Err(err) => error_chain(err),
         };
         sizes.insert(case.name.to_string(), outcome);
     }
@@ -846,7 +852,7 @@ fn golden_input_size_resolution() {
     for (name, layout, size) in divisibility {
         let outcome = match check_grid_divides_input(layout, size) {
             Ok(()) => json!({ "ok": true }),
-            Err(err) => error_chain(&err),
+            Err(err) => error_chain(err),
         };
         grids.insert(name.to_string(), outcome);
     }
