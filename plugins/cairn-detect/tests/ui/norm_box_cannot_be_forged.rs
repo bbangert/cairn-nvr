@@ -6,10 +6,13 @@
 //! symmetry with `ModelBox` and this case starts compiling, which is the
 //! regression it exists to catch.
 //!
-//! The attempt itself is in `support/infer.rs`, because it has to be made from
-//! a sibling module *inside* `infer`: from this crate root, `geometry`'s
-//! `pub(super)` items are not nameable at all and the error would be the wrong
-//! one.
+//! The attempt itself is in `support/infer.rs`. Not because it has to be —
+//! `pub(super)` in a top-level module resolves to the crate root, so these
+//! items are nameable from here and the forge yields the identical `E0423`.
+//! The nesting is for *fidelity*: `det_from` really does live in a sibling
+//! module of `geometry` inside `infer`, and the case should fail the way the
+//! shipping code would. See `support/infer.rs` for the mounting constraint that
+//! actually forces the extra file.
 // Nothing in the tree below is ever called — it exists to be type-checked, and
 // `geometry.rs` brings a module's worth of items in with it.
 #![allow(dead_code)]

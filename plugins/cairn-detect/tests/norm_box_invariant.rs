@@ -21,8 +21,38 @@
 //! disappeared error means the invariant is gone, not that the expectation is
 //! stale.
 
+/// The recorded expectation, so the assertion below can read it without
+/// resolving a path at runtime.
+const EXPECTED: &str = include_str!("ui/norm_box_cannot_be_forged.stderr");
+
 /// Rejects a `NormBox` forged from a `Bbox` by a sibling module of `geometry`.
 #[test]
 fn norm_box_cannot_be_forged_outside_geometry() {
     trybuild::TestCases::new().compile_fail("tests/ui/norm_box_cannot_be_forged.rs");
+}
+
+/// The expectation still has to be *about* the private field.
+///
+/// `trybuild` already refuses to re-record a case that unexpectedly compiled,
+/// so a widened field cannot be blessed away. What it does not guard is a
+/// *replaced* error: add a `use super::…` to `geometry.rs` that the shim does
+/// not satisfy and the case still fails to compile, just with `E0432` instead.
+/// One blind `TRYBUILD=overwrite` then pins that, and the gate keeps passing
+/// forever while checking nothing about privacy.
+///
+/// Asserting on the recorded text is what makes that loud. It is deliberately
+/// coarse — the error code and the phrase rustc uses for this class — so a
+/// wording change does not break it, but a different *error* does.
+#[test]
+fn the_recorded_expectation_is_still_about_a_private_field() {
+    assert!(
+        EXPECTED.contains("E0423"),
+        "the recorded stderr no longer carries E0423; if `geometry.rs` now fails \
+         to compile in the ui case for some other reason, fix that rather than \
+         re-recording — otherwise this gate stops checking the invariant:\n{EXPECTED}"
+    );
+    assert!(
+        EXPECTED.contains("private field"),
+        "the recorded stderr no longer names a private field:\n{EXPECTED}"
+    );
 }

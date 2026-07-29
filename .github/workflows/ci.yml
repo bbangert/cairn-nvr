@@ -146,11 +146,12 @@ jobs:
       #
       # Also runs tests/norm_box_invariant.rs, the trybuild compile-fail case
       # that guards NormBox's private field. It needs no step of its own, but it
-      # does need the caches above: trybuild copies Cargo.lock into a scratch
-      # crate under target/tests/trybuild and runs a second, --offline cargo over
-      # it, so every dependency has to be in ~/.cargo/registry already —
-      # which the `--all-targets` clippy step above has seen to, dev-dependencies
-      # included.
+      # does need a warm ~/.cargo/registry: trybuild builds a scratch crate under
+      # target/tests/trybuild and runs a second cargo over it with --offline. The
+      # generated manifest carries no dev-dependencies of its own, so what has to
+      # be present is only what the case itself compiles — which the
+      # `cargo clippy --all-targets` step above has already fetched. Verified by
+      # deleting target/tests/trybuild and re-running with this job's env.
       - run: cargo test
         working-directory: plugins/cairn-detect
 
