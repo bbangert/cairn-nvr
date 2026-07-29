@@ -148,3 +148,13 @@ jobs:
 
       - run: cargo build --release
         working-directory: plugins/cairn-detect
+
+      # Broken intra-doc links are a *rustdoc* lint, so clippy and
+      # -D warnings cannot see them — the module split in #22 broke twelve of
+      # them with every other gate green. --document-private-items because
+      # this is a binary crate: the docs exist for maintainers, and every
+      # cross-module reference in `infer` points at a private item.
+      - run: cargo doc --no-deps --document-private-items
+        working-directory: plugins/cairn-detect
+        env:
+          RUSTDOCFLAGS: -D warnings
