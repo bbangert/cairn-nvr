@@ -89,6 +89,11 @@ jobs:
       CARGO_TERM_COLOR: always
 
     steps:
+      # libssl-dev is not obvious and not optional: ort-sys's *build script*
+      # fetches the prebuilt onnxruntime over TLS via ureq -> native-tls ->
+      # openssl-sys, so a missing libssl-dev fails the build before any of
+      # this crate compiles. It is present in the dev container only because
+      # the Dockerfile installs it for kerl.
       - name: Install build dependencies
         run: |
           apt-get update -qq
@@ -96,6 +101,7 @@ jobs:
             build-essential pkg-config clang libclang-dev \
             libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
             libswscale-dev libswresample-dev \
+            libssl-dev \
             curl ca-certificates git
 
       - uses: actions/checkout@v7
