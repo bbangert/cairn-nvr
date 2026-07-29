@@ -15,6 +15,8 @@ jobs:
   ci:
     name: Compile · Format · Credo · Sobelow · Dialyzer · Test
     runs-on: ubuntu-latest
+    # Elixir only. The Rust plugin is a separate crate with its own toolchain
+    # and its own gates — see the `cairn-detect` job below.
 
     steps:
       - uses: actions/checkout@v7
@@ -63,3 +65,86 @@ jobs:
 
       - name: Full-pipeline integration test (real ffmpeg)
         run: mix test --only integration
+
+  cairn-detect:
+    name: Rust · Format · Clippy · Test · Release build
+    runs-on: ubuntu-latest
+    # Debian 13 (trixie) ships FFmpeg 7.1, which is what rsmpeg's `ffmpeg7_1`
+    # feature binds against — the runner image's own Ubuntu 24.04 ships 6.1 and
+    # would need a different feature. It is also one of the two targets
+    # plugins/cairn-detect/README.md documents as "builds as-is", so this job
+    # doubles as a check that those instructions still work. glibc 2.41 here is
+    # past onnxruntime's 2.38 requirement, so src/glibc_compat.rs stays inert.
+    container: debian:13
+
+    env:
+      # Both overrides are mandatory outside the dev container:
+      # .cargo/config.toml pins FFMPEG_PKG_CONFIG_PATH at /opt/ffmpeg7 (and the
+      # build panics when that is absent) and bakes an rpath to it. Cargo's
+      # [env] does not override a value already in the environment, and
+      # RUSTFLAGS wins over [build] rustflags — so setting both here leaves the
+      # dev loop untouched. Same pair the README gives for a fresh Debian 13.
+      FFMPEG_PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
+      RUSTFLAGS: ""
+      CARGO_TERM_COLOR: always
+
+    steps:
+      # All eight libav*/libsw*/libpostproc dev packages, not just the five the
+      # crate names: rusty_ffmpeg's build script pkg-configs the whole FFmpeg
+      # library set, so one missing .pc fails the build even though nothing
+      # here calls into it.
+      #
+      # libssl-dev is not obvious and not optional: ort-sys's *build script*
+      # fetches the prebuilt onnxruntime over TLS via ureq -> native-tls ->
+      # openssl-sys, so a missing libssl-dev fails the build before any of
+      # this crate compiles. It is present in the dev container only because
+      # the Dockerfile installs it for kerl.
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            build-essential pkg-config clang libclang-dev \
+            libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev \
+            libavutil-dev libpostproc-dev libswresample-dev libswscale-dev \
+            libssl-dev \
+            curl ca-certificates git
+
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --component rustfmt,clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # ort downloads a ~90 MB prebuilt static onnxruntime on a cold build.
+      - name: Cache cargo registry, target and the onnxruntime download
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/ort.pyke.io
+            plugins/cairn-detect/target
+          key: cargo-debian13-${{ hashFiles('plugins/cairn-detect/Cargo.lock') }}
+          restore-keys: |
+            cargo-debian13-
+
+      # working-directory is set per step rather than as a job default: the apt
+      # step above runs before checkout, when plugins/cairn-detect does not yet
+      # exist and a job-wide default would fail it.
+      - run: cargo fmt --check
+        working-directory: plugins/cairn-detect
+
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: plugins/cairn-detect
+
+      # Includes the golden characterization fixtures under src/infer/golden/,
+      # which are what prove a refactor of infer.rs was output-identical.
+      # CAIRN_GOLDEN_BLESS must never be set here: it re-records rather than
+      # compares, and a run that compared nothing must not read as a pass.
+      - run: cargo test
+        working-directory: plugins/cairn-detect
+
+      - run: cargo build --release
+        working-directory: plugins/cairn-detect

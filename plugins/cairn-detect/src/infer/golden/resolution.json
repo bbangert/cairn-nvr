@@ -1,0 +1,129 @@
+{
+  "ambiguous_detr_logits_first_vs_yolox_grid": {
+    "error": [
+      "model model.onnx has outputs \"logits\" [1, 336, 85], \"pred_boxes\" [1, 336, 4], which at input 128x128 fit more than one profile: yolox and rfdetr. Nothing in the shapes says which, and they decode differently — pass --model-profile <yolox|rfdetr> to say."
+    ]
+  },
+  "ambiguous_yolox_1class_vs_end_to_end": {
+    "error": [
+      "model model.onnx has outputs \"output\" [1, 5040, 6], which at input 640x384 fit more than one profile: yolox and yolov10. Nothing in the shapes says which, and they decode differently — pass --model-profile <yolox|yolov10> to say."
+    ]
+  },
+  "detr_deferred_by_name": {
+    "layout": null,
+    "nms": null,
+    "outputs": {
+      "boxes": "dets",
+      "logits": "labels"
+    },
+    "profile": "rfdetr",
+    "score": null
+  },
+  "explicit_profile_mismatch": {
+    "error": [
+      "--model-profile rfdetr does not describe model model.onnx",
+      "expected one [1, Q, 4] box output and one [1, Q, nc] logit output over the same Q queries, but the model offers \"output\" [1, 300, 6]"
+    ]
+  },
+  "explicit_profile_wrong_shape": {
+    "error": [
+      "--model-profile yolov8 does not describe model model.onnx",
+      "output shape [1, 300, 6] does not fit raw-classes [1, 4 + 80, A]; expected [1, 4 + nc, A] with A far longer than 4 + nc"
+    ]
+  },
+  "explicit_yolov10_on_the_ambiguous_shape": {
+    "layout": "end-to-end [1, N, 6]",
+    "nms": null,
+    "outputs": {
+      "one": "output"
+    },
+    "profile": "yolov10",
+    "score": "class"
+  },
+  "explicit_yolox_on_the_ambiguous_shape": {
+    "layout": "grid-objectness [1, A, 5 + 1] strides 8/16/32",
+    "nms": {
+      "iou": 0.45,
+      "max_candidates": 300
+    },
+    "outputs": {
+      "one": "output"
+    },
+    "profile": "yolox",
+    "score": "objectness x class"
+  },
+  "no_profile_fits": {
+    "error": [
+      "model model.onnx has unsupported outputs \"output\" [1, 10, 7] at input 640x640; expected [1, 8400, 5 + nc] at input 640x640 (yolox), [1, N, 6] (yolov10), [1, 4 + nc, A] with A far longer than 4 + nc (yolov8), [1, Q, 4] boxes with [1, Q, nc] logits (rfdetr)"
+    ]
+  },
+  "nothing_to_sniff_from": {
+    "error": [
+      "model model.onnx leaves its output shape dynamic, so there is nothing to sniff a profile from — and the encoding and resize policy have to be settled before the first frame is converted. Pass --model-profile <yolox, yolov10 (or yolo26), yolov8 (or yolov9, yolo11, yolov11), rfdetr (or rf-detr)>."
+    ]
+  },
+  "one_tensor_deferred": {
+    "layout": null,
+    "nms": null,
+    "outputs": {
+      "one": "output"
+    },
+    "profile": "yolox",
+    "score": null
+  },
+  "rfdetr_384": {
+    "layout": "detr-queries [1, Q, 4] + [1, Q, 91]",
+    "nms": null,
+    "outputs": {
+      "boxes": "pred_boxes",
+      "logits": "logits"
+    },
+    "profile": "rfdetr",
+    "score": "sigmoid(class logit)"
+  },
+  "yolov10_640": {
+    "layout": "end-to-end [1, N, 6]",
+    "nms": null,
+    "outputs": {
+      "one": "output0"
+    },
+    "profile": "yolov10",
+    "score": "class"
+  },
+  "yolov8_640": {
+    "layout": "raw-classes [1, 4 + 80, A]",
+    "nms": {
+      "iou": 0.45,
+      "max_candidates": 300
+    },
+    "outputs": {
+      "one": "output0"
+    },
+    "profile": "yolov8",
+    "score": "class"
+  },
+  "yolox_416": {
+    "layout": "grid-objectness [1, A, 5 + 80] strides 8/16/32",
+    "nms": {
+      "iou": 0.45,
+      "max_candidates": 300
+    },
+    "outputs": {
+      "one": "output"
+    },
+    "profile": "yolox",
+    "score": "objectness x class"
+  },
+  "yolox_79_classes": {
+    "layout": "grid-objectness [1, A, 5 + 79] strides 8/16/32",
+    "nms": {
+      "iou": 0.45,
+      "max_candidates": 300
+    },
+    "outputs": {
+      "one": "output"
+    },
+    "profile": "yolox",
+    "score": "objectness x class"
+  }
+}

@@ -838,13 +838,25 @@ Build on a fresh Debian 13 (or Ubuntu 25.04+):
 
 ```bash
 sudo apt install -y build-essential pkg-config clang libclang-dev \
-    libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libswscale-dev
+    libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev \
+    libavutil-dev libpostproc-dev libswresample-dev libswscale-dev \
+    libssl-dev
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 cd plugins/cairn-detect
 RUSTFLAGS="" FFMPEG_PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig \
     cargo build --release
 ```
+
+That is the full FFmpeg dev set, not just the five libraries this crate calls
+into: `rusty_ffmpeg`'s build script pkg-configs all eight, so a missing
+`libavdevice.pc` or `libpostproc.pc` fails the build regardless.
+
+`libssl-dev` is there for a non-obvious reason: `ort-sys`'s *build script*
+downloads the prebuilt onnxruntime over TLS (`ureq` → `native-tls` →
+`openssl-sys`), so without it the build fails at `openssl-sys` before any of
+this crate compiles. The dev container has it only because the Dockerfile
+installs it for kerl, which is why this recipe went a while without it.
 
 Both overrides are mandatory, because `.cargo/config.toml` is a
 dev-container file: it pins `FFMPEG_PKG_CONFIG_PATH` to `/opt/ffmpeg7/...`
