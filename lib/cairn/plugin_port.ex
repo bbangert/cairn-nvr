@@ -11,8 +11,9 @@ defmodule Cairn.PluginPort do
   Every line goes through `Cairn.PluginProtocol.decode_line/2` (protocol v1
   or the v0 `{"pts", "dets"}` shape). A `frame.objects` line becomes a
   `Cairn.Observation` forwarded to `Cairn.DetectionAggregator` together with
-  the camera's config and effective policy (event windows + tracking), so the
-  aggregator never has to look up config; `plugin.hello` is recorded here —
+  the camera's config and effective policy (event windows, tracking bounds and
+  the `track:` / `record:` tiers), so the aggregator never has to look up
+  config; `plugin.hello` is recorded here —
   its `object_tracking` capability is what marks an observation `tracking` —
   and `plugin.status` lands in `Cairn.CameraStatus`. Lines that do not match the contract are dropped,
   as are observations from a stream epoch that is no longer current —

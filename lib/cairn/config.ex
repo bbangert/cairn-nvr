@@ -184,11 +184,18 @@ defmodule Cairn.Config do
 
   @doc """
   Everything the detection pipeline needs for a camera in one map: the event
-  windows plus the tracking settings.
+  windows, the tracking settings, and the two host-side threshold tiers.
 
   The plugin ports resolve it once and hand it to `Cairn.DetectionAggregator`
   with every observation, so the aggregator never calls the config server on
-  a per-frame path.
+  a per-frame path. `Cairn.PluginPort` and `Cairn.PluginGroupPort` both take
+  their whole policy from this function and forward it unmodified, so every
+  key added here reaches the aggregator through that same plumbing.
+
+  `:track` and `:record` are the camera's parsed tiers verbatim, `nil` when
+  the block is absent. Resolve a label against one with `tier_threshold/3`
+  rather than reading the map directly — `nil` and an unlisted label mean
+  opposite things.
   """
   @spec policy(t(), Camera.t()) :: %{
           pre: pos_integer(),
@@ -196,7 +203,9 @@ defmodule Cairn.Config do
           max: pos_integer(),
           max_unseen_ms: pos_integer(),
           max_live_tracks: pos_integer(),
-          stationary_after_ms: pos_integer()
+          stationary_after_ms: pos_integer(),
+          track: Camera.tier() | nil,
+          record: Camera.tier() | nil
         }
   def policy(%__MODULE__{} = config, %Camera{} = cam) do
     config
@@ -204,7 +213,51 @@ defmodule Cairn.Config do
     |> Map.put(:max_unseen_ms, max_unseen_ms(config, cam))
     |> Map.put(:max_live_tracks, max_live_tracks(config, cam))
     |> Map.put(:stationary_after_ms, stationary_after_ms(config, cam))
+    |> Map.put(:track, cam.track)
+    |> Map.put(:record, cam.record)
   end
+
+  @doc """
+  The score `label` must reach to qualify for one tier, or `:excluded`.
+
+  `rules` is a camera's parsed `track` or `record` tier (or `nil`), and
+  `min_score` its wire-floor map — the `min_score` field, which always carries
+  a `"default"` key.
+
+    * tier absent (`nil`) — today's behaviour, where everything the plugin
+      emits qualifies, so the answer is the label's own wire floor.
+    * tier present — the label's own rule, else the tier's `"default"` rule,
+      else `:excluded`. A present tier lists what it wants; an unlisted label
+      with no `default:` is out of that tier, which is the whole point of
+      having one.
+
+  A returned number is a floor to compare a detection's score against. Given a
+  camera's *configured* `min_score` it never comes back below that label's
+  wire floor: a config where a tier resolves under `min_score` is rejected at
+  load time, because the plugin never emits that band and the rule could only
+  ever fire zero times. A runtime override (`Cairn.CameraControl`'s
+  `min_score`) goes through no such validation and can sit above a tier.
+
+  Between the two tiers, validation leaves one invariant worth relying on: for
+  a given label the `record` answer is never a number below the `track`
+  answer. Either it is higher, or `record` returned `:excluded` because a
+  present `record:` block left the label out — the rows-without-video case.
+  """
+  @spec tier_threshold(Camera.tier() | nil, String.t(), %{optional(String.t()) => float()}) ::
+          float() | :excluded
+  def tier_threshold(nil, label, min_score), do: wire_floor(min_score, label)
+
+  def tier_threshold(rules, label, _min_score) when is_map(rules) do
+    case Map.get(rules, label) || Map.get(rules, "default") do
+      %{min_score: score} -> score
+      nil -> :excluded
+    end
+  end
+
+  # Both `Camera.parse/3` and the struct's own default guarantee a "default"
+  # key, so this resolves to a number for any camera that came from either.
+  defp wire_floor(min_score, label),
+    do: Map.get(min_score, label) || Map.get(min_score, "default")
 
   @doc "Effective track expiry (media milliseconds) for a camera."
   @spec max_unseen_ms(t(), Camera.t()) :: pos_integer()
@@ -352,6 +405,7 @@ defmodule Cairn.Config do
     |> validate_plugins(config)
     |> validate_windows(config)
     |> validate_tracking(config)
+    |> validate_tiers(config)
     |> validate_udp(config)
     |> validate_numbers(config)
     |> validate_remux(config)
@@ -447,6 +501,85 @@ defmodule Cairn.Config do
         check(acc, int?(value, min, max), "#{prefix}#{key} must be #{min}..#{max}")
     end)
   end
+
+  # Per label, effective `record >= track >= min_score`. A tier below the wire
+  # floor can never fire — the plugin drops that band and the host never sees
+  # it — so a `record.person` of 0.6 under a `min_score.person` of 0.7 is a
+  # rule that silently records nothing. The check runs over the union of labels
+  # across all three maps, each resolved through its own default chain, so a
+  # tier's catch-all `default:` under a per-label floor is caught as well.
+  #
+  # "Effective" is what makes the record side asymmetric: an absent `record:`
+  # block resolves to the wire floor rather than to nothing, because absent
+  # means everything the plugin emits records. A `track:` raised above that
+  # floor with no `record:` block therefore leaves a band that films but is
+  # never written down. A *present* block that excludes the label is the
+  # opposite case and imposes nothing: rows without video is the tier working.
+  defp validate_tiers(acc, config) do
+    Enum.reduce(config.cameras, acc, &validate_camera_tiers(&2, &1))
+  end
+
+  defp validate_camera_tiers(acc, cam) do
+    Enum.reduce(tier_labels(cam), acc, fn label, acc ->
+      wire = wire_floor(cam.min_score, label)
+      track = own_threshold(cam.track, label, cam.min_score)
+      record = own_threshold(cam.record, label, cam.min_score)
+
+      acc
+      |> check_tier_order(cam.id, label, {"track", track}, {"min_score", wire})
+      |> check_tier_order(cam.id, label, {"record", record}, {"min_score", wire})
+      |> check_record_covers_track(cam.id, label, track, cam.record, record, wire)
+    end)
+  end
+
+  # With no `record:` block the effective record threshold is the wire floor,
+  # and `track` above it is the gap: video for a detection whose track row is
+  # gated out. There is no `record:` key to point the operator at, so the
+  # message has to carry the implication.
+  defp check_record_covers_track(acc, id, label, track, nil = _rules, _record, wire)
+       when is_number(track) do
+    check(
+      acc,
+      wire >= track,
+      "camera #{id}: track.#{label} (#{track}) must be <= the effective record threshold " <>
+        "(#{wire}) — with no record: block video falls back to min_score, so a clip could " <>
+        "exist with no track row. Give #{label} a record: rule, or lower track.#{label}"
+    )
+  end
+
+  defp check_record_covers_track(acc, id, label, track, _rules, record, _wire) do
+    check_tier_order(acc, id, label, {"record", record}, {"track", track})
+  end
+
+  # "default" is deliberately left in the union: resolving it through every
+  # chain is what compares one block's catch-all against another's.
+  defp tier_labels(cam) do
+    [cam.min_score, cam.track || %{}, cam.record || %{}]
+    |> Enum.flat_map(&Map.keys/1)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  # `nil` where the block is absent, rather than the wire floor
+  # `tier_threshold/3` falls back to: against `min_score` an absent block only
+  # echoes the floor, so resolving it here would report one violation twice.
+  # `check_record_covers_track/7` is the one pairing that does want the floor,
+  # and resolves it there.
+  defp own_threshold(nil, _label, _min_score), do: nil
+  defp own_threshold(rules, label, min_score), do: tier_threshold(rules, label, min_score)
+
+  defp check_tier_order(acc, id, label, {high_key, high}, {low_key, low})
+       when is_number(high) and is_number(low) do
+    check(
+      acc,
+      high >= low,
+      "camera #{id}: #{high_key}.#{label} (#{high}) must be >= #{low_key}.#{label} (#{low})"
+    )
+  end
+
+  # A side that is not a number is `:excluded` or an absent block, neither of
+  # which is a threshold: a label a tier does not admit imposes no ordering.
+  defp check_tier_order(acc, _id, _label, _high, _low), do: acc
 
   defp windows_map(config, cam) do
     w = windows(config, cam)
