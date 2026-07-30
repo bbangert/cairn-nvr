@@ -27,6 +27,24 @@ defmodule Cairn.Tracker do
   aggregator refuses it as event evidence however long the plugin keeps
   predicting it.
 
+  A track the tracker has judged **stationary** (see below) expires at
+  `@stationary_unseen_factor` times that bound instead, and for as long as it
+  sits inside that extended grace — already unseen for longer than
+  `max_unseen_ms` — nothing may re-match it at less than
+  `@stationary_match_iou` overlap. The patience is paid for with pickiness: a
+  parked object survives an occlusion that would end a moving track, and its
+  identity still cannot be handed to whatever next overlaps it. Outside the
+  grace a stationary track matches at the same `@iou_threshold` as everything
+  else.
+
+  What the grace does not require is *detections*: `last_seen_ms` moves on
+  predicted observations too and the stillness rule ignores them, so a plugin
+  that keeps predicting a box at the parked position holds the identity and
+  the stationary flag for as long as it predicts, no matter how long that is.
+  That is the "slow inference must not kill a track" contract above, over a
+  window the grace makes longer; `stale_predicted` is what keeps it from
+  counting as evidence.
+
   Media time may jump backwards (a new ffmpeg run restarts the RTP timeline).
   Within an epoch that only makes the elapsed time negative, which never
   expires anything; across epochs the aggregator ends every track and starts
@@ -44,9 +62,13 @@ defmodule Cairn.Tracker do
       final summary (`:evicted`). Tracks that this batch already assigned are
       never the victim.
     * **A host-clock backstop.** A track whose age on the *host's* monotonic
-      clock (`now_ms`, supplied by the caller) exceeds ten times
-      `max_unseen_ms` is expired (`:unseen`) whatever media time says, so a
-      frozen or rewound `pts` cannot pin tracks alive. The factor is
+      clock (`now_ms`, supplied by the caller) exceeds ten times its effective
+      unseen bound — `max_unseen_ms`, or the grace-extended bound above for a
+      stationary track — is expired (`:unseen`) whatever media time says, so a
+      frozen or rewound `pts` cannot pin tracks alive. It scales off the same
+      bound as the media-time rule on purpose: left at the plain one it would
+      retire a stationary track at exactly the bound the grace exists to
+      extend, cancelling the grace without a trace of why. The factor is
       deliberately lax: media time is the real rule, and this must never fire
       for a stream that is merely slow.
 
@@ -81,6 +103,10 @@ defmodule Cairn.Tracker do
       or a car idling, keeps a motionless box and reads as stationary. The
       metric is the box, not what is happening inside it.
 
+  The flag is not only reported: expiry keys off it, so anything that reads as
+  stationary — either blind spot included — also gets the longer unseen bound
+  and the strict re-match threshold that comes with it.
+
   Bboxes are `[x, y, w, h]` in any consistent unit (normalized or pixels).
   """
 
@@ -91,6 +117,23 @@ defmodule Cairn.Tracker do
   alias Cairn.ULID
 
   @iou_threshold 0.1
+  # What a stationary track in extended grace demands of a box before it will
+  # answer to it. The two thresholds are a pair and neither works alone:
+  # applied to a track that is still being seen, this one rejects ordinary
+  # detector jitter, the match fails, and the object gets a second, duplicate
+  # track. Applied only where it belongs — a track already unseen past
+  # `max_unseen_ms`, where every overlapping box is a candidate to inherit an
+  # identity nothing is currently confirming — it is what makes the grace safe.
+  # Getting that pairing wrong is a silent identity bug, which is why neither
+  # number is config.
+  @stationary_match_iou 0.7
+  # The unseen bound for a stationary track, as a multiplier of
+  # `max_unseen_ms` (the `@host_clock_factor` precedent: policy the operator
+  # sets the base for, scaled here by a fixed factor). A parked object is
+  # occluded for as long as whatever parked in front of it stays, which is not
+  # the timescale a moving track needs; the patience is paid for with
+  # `@stationary_match_iou`.
+  @stationary_unseen_factor 5
   # Overlap between the anchor and the smoothed current box that still counts
   # as "has not moved". Not config, on the same rule as `@iou_threshold`: an
   # operator looking at a camera view cannot reason about an IoU number, and
@@ -282,7 +325,7 @@ defmodule Cairn.Tracker do
       |> Enum.split_with(fn {object, _index} -> plugin_tracked?(object, context) end)
 
     {tracker, plugin_assignments} = assign_plugin(tracker, plugin, context)
-    {tracker, Map.merge(plugin_assignments, assign_host(tracker, host))}
+    {tracker, Map.merge(plugin_assignments, assign_host(tracker, host, context))}
   end
 
   # One `track_id` names one object. Two objects in the same batch claiming the
@@ -345,8 +388,10 @@ defmodule Cairn.Tracker do
   end
 
   # Greedy IoU, best overlap first, each object and each track used once. Only
-  # host-owned tracks are candidates: a plugin's identities are its own.
-  defp assign_host(tracker, indexed) do
+  # host-owned tracks are candidates: a plugin's identities are its own. The
+  # threshold is per candidate track (`match_threshold/2`), so it decides which
+  # pairs exist and never how the ones that exist are ordered.
+  defp assign_host(tracker, indexed, context) do
     candidates = for {id, object} <- tracker.objects, object.source == :host, do: {id, object}
 
     pairs =
@@ -354,7 +399,7 @@ defmodule Cairn.Tracker do
           {id, tracked} <- candidates,
           tracked.label == object.label,
           overlap = iou(tracked.bbox, object.bbox),
-          overlap >= @iou_threshold do
+          overlap >= match_threshold(tracked, context) do
         {overlap, index, id}
       end
 
@@ -377,6 +422,19 @@ defmodule Cairn.Tracker do
 
     assignments
   end
+
+  # Strict only while a stationary track is in extended grace — already unseen
+  # past `max_unseen_ms`, so nothing is currently confirming the identity an
+  # overlapping box would inherit. A track being seen normally matches at the
+  # base threshold, and must: see `@stationary_match_iou` for what dropping
+  # that distinction costs.
+  defp match_threshold(%{stationary: true} = tracked, context) do
+    if context.media_ms - tracked.last_seen_ms > context.max_unseen_ms,
+      do: @stationary_match_iou,
+      else: @iou_threshold
+  end
+
+  defp match_threshold(_tracked, _context), do: @iou_threshold
 
   defp apply_assignments(tracker, objects, assignments, context) do
     # Tracks this batch already spoke for: retiring one to make room for a new
@@ -471,6 +529,12 @@ defmodule Cairn.Tracker do
       _ ->
         # `{last_seen_ms, id}` rather than `last_seen_ms` alone: ties must not
         # be broken by map iteration order.
+        #
+        # LRU on `last_seen_ms` already prefers a track nothing is detecting
+        # any more — one riding out its grace included — over the ones this
+        # scene is actively seeing, which is the preference the cap wants:
+        # extended grace buys time against expiry, not against a full live set,
+        # and is deliberately not exempted here.
         {id, object} = Enum.min_by(candidates, fn {id, o} -> {o.last_seen_ms, id} end)
         tracker = warn_cap(tracker, context, "evicting the least recently seen track #{id}")
 
@@ -645,9 +709,21 @@ defmodule Cairn.Tracker do
   end
 
   defp live?(object, context) do
-    context.media_ms - object.last_seen_ms <= context.max_unseen_ms and
-      context.now_ms - object.last_seen_host_ms <= @host_clock_factor * context.max_unseen_ms
+    bound = unseen_bound(object, context)
+
+    context.media_ms - object.last_seen_ms <= bound and
+      context.now_ms - object.last_seen_host_ms <= @host_clock_factor * bound
   end
+
+  # Both of `live?/2`'s conditions read this one value. Scale only the
+  # media-time side and the backstop still caps a stationary track at
+  # `@host_clock_factor * max_unseen_ms` of *host* time, which is the shorter
+  # of the two on exactly the streams the grace has to survive — a stalled or
+  # slow pts, where media time never reaches the extended bound at all.
+  defp unseen_bound(%{stationary: true}, context),
+    do: context.max_unseen_ms * @stationary_unseen_factor
+
+  defp unseen_bound(_object, context), do: context.max_unseen_ms
 
   defp refresh_stale(tracker, context) do
     %{tracker | objects: Map.new(tracker.objects, fn {id, o} -> {id, stale(o, context)} end)}
