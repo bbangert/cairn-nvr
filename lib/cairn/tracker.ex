@@ -126,17 +126,17 @@ defmodule Cairn.Tracker do
           observed_at: DateTime.t() | nil,
           tracking: boolean(),
           ended_tracks: [String.t()],
-          max_unseen_ms: number(),
+          max_unseen_ms: pos_integer(),
           max_live_tracks: pos_integer(),
-          stationary_after_ms: number(),
+          stationary_after_ms: pos_integer(),
           now_ms: number()
         }
 
   @typedoc "The host-side tracking policy for one camera."
   @type policy :: %{
-          max_unseen_ms: number(),
+          max_unseen_ms: pos_integer(),
           max_live_tracks: pos_integer(),
-          stationary_after_ms: number()
+          stationary_after_ms: pos_integer()
         }
 
   @type event ::
