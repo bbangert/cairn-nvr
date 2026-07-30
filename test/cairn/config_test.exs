@@ -145,6 +145,44 @@ defmodule Cairn.ConfigTest do
       assert Enum.any?(errors, &(&1 =~ "camera cam_a: max_unseen_ms must be 100..3600000"))
     end
 
+    test "tracking.stationary_after_ms must be a sane number of milliseconds" do
+      for value <- [999, 3_600_001, "a while"] do
+        map = Map.put(base_map(), "tracking", %{"stationary_after_ms" => value})
+
+        assert {:error, errors} = Config.from_map(map)
+        assert Enum.any?(errors, &(&1 =~ "tracking.stationary_after_ms must be 1000..3600000"))
+      end
+    end
+
+    test "per-camera stationary_after_ms overrides are validated" do
+      map =
+        update_in(base_map(), ["cameras"], fn [a, b] ->
+          [Map.put(a, "stationary_after_ms", 100), b]
+        end)
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "camera cam_a: stationary_after_ms must be 1000..3600000"))
+    end
+
+    test "stationary_after_ms is a known key in both places it may appear" do
+      map =
+        base_map()
+        |> Map.put("tracking", %{"stationary_after_ms" => 20_000})
+        |> update_in(["cameras"], fn [a, b] ->
+          [Map.put(a, "stationary_after_ms", 5_000), b]
+        end)
+
+      assert {:ok, _config, warnings} = Config.from_map(map)
+      refute Enum.any?(warnings, &(&1 =~ "stationary_after_ms"))
+    end
+
+    test "an unknown tracking key is still only a warning" do
+      map = Map.put(base_map(), "tracking", %{"stationary_after_millis" => 20_000})
+
+      assert {:ok, _config, warnings} = Config.from_map(map)
+      assert Enum.any?(warnings, &(&1 =~ ~s(unknown key "stationary_after_millis" in tracking)))
+    end
+
     test "duplicate camera ids are an error" do
       map =
         update_in(base_map(), ["cameras"], fn [a, _b] ->
@@ -389,8 +427,30 @@ defmodule Cairn.ConfigTest do
                post: 10,
                max: 300,
                max_unseen_ms: 800,
-               max_live_tracks: 128
+               max_live_tracks: 128,
+               stationary_after_ms: 10_000
              }
+    end
+
+    test "stationary_after_ms defaults, is globally settable and per-camera overridable" do
+      {:ok, defaults, _} = Config.from_map(base_map())
+      [cam_a, _cam_b] = defaults.cameras
+      assert defaults.stationary_after_ms == 10_000
+      assert Config.stationary_after_ms(defaults, cam_a) == 10_000
+
+      {:ok, config, _} =
+        base_map()
+        |> Map.put("tracking", %{"stationary_after_ms" => 30_000})
+        |> update_in(["cameras"], fn [a, b] -> [Map.put(a, "stationary_after_ms", 2_000), b] end)
+        |> Config.from_map()
+
+      [cam_a, cam_b] = config.cameras
+      assert Config.stationary_after_ms(config, cam_a) == 2_000
+      assert Config.stationary_after_ms(config, cam_b) == 30_000
+
+      # the tracker reads it off the policy map, not off the config server
+      assert Config.policy(config, cam_a).stationary_after_ms == 2_000
+      assert Config.policy(config, cam_b).stationary_after_ms == 30_000
     end
 
     test "retention precedence: camera per-label > camera days > global per-label > global" do

@@ -9,6 +9,7 @@ defmodule Cairn.TrackerTest do
   alias Cairn.Tracker
 
   @max_unseen 3_000
+  @stationary_after 10_000
 
   defp det(label, bbox, opts \\ []) do
     %{
@@ -31,6 +32,7 @@ defmodule Cairn.TrackerTest do
       ended_tracks: Keyword.get(opts, :ended_tracks, []),
       max_unseen_ms: Keyword.get(opts, :max_unseen_ms, @max_unseen),
       max_live_tracks: Keyword.get(opts, :max_live_tracks, 128),
+      stationary_after_ms: Keyword.get(opts, :stationary_after_ms, @stationary_after),
       now_ms: Keyword.get(opts, :now_ms, 0)
     }
   end
@@ -42,6 +44,39 @@ defmodule Cairn.TrackerTest do
   end
 
   defp plugin_ctx(opts), do: Keyword.merge([tracking: true, plugin_instance: "grp"], opts)
+
+  # Observation time derived from media time, so a `stationary_since` can be
+  # checked against the step that set it.
+  defp at(ms), do: DateTime.add(~U[2026-07-26 12:00:00Z], trunc(ms), :millisecond)
+
+  # One plugin-tracked object over `{media_ms, bbox}` (or `{media_ms, bbox,
+  # kind}`) steps, returning the last step's `track/3` result. Plugin mode on
+  # purpose: identity is pinned by the track id, so what these tests exercise
+  # is the stillness rule and not IoU matching.
+  defp feed(tracker, steps) do
+    Enum.reduce(steps, {tracker, [], []}, fn step, {tracker, _tagged, _events} ->
+      {ms, bbox, kind} =
+        case step do
+          {ms, bbox} -> {ms, bbox, "detected"}
+          {ms, bbox, kind} -> {ms, bbox, kind}
+        end
+
+      track(
+        tracker,
+        [det("person", bbox, track_id: "t1", kind: kind)],
+        plugin_ctx(media_ms: ms, observed_at: at(ms))
+      )
+    end)
+  end
+
+  # Every event of the whole run, for the tests that are about what never
+  # happened.
+  defp feed_all(tracker, steps) do
+    Enum.reduce(steps, {tracker, []}, fn step, {tracker, seen} ->
+      {tracker, _tagged, events} = feed(tracker, [step])
+      {tracker, seen ++ events}
+    end)
+  end
 
   # `iou/2` only matches `[x, y, w, h]`, and a stored object's bbox comes
   # straight from the detection that created it — so a bbox of any other arity
@@ -362,6 +397,216 @@ defmodule Cairn.TrackerTest do
         )
 
       refute b.object_id == a.object_id
+    end
+  end
+
+  describe "stationary detection" do
+    test "a box that holds still flips stationary only after stationary_after_ms" do
+      box = [0.2, 0.2, 0.4, 0.4]
+
+      {t, [tagged], events} = feed(Tracker.new(), for(n <- 0..9, do: {n * 1_000, box}))
+
+      refute tagged.stationary
+      assert [{:updated, %Track{stationary: false, stationary_since: nil}}] = events
+
+      {t, [tagged], events} = feed(t, [{10_000, box}])
+
+      assert tagged.stationary
+      assert [{:updated, %Track{}}, {:became_stationary, %Track{} = flipped}] = events
+      assert flipped.stationary
+      assert flipped.stationary_since == at(10_000)
+      assert flipped.stationary_ms == 0
+      assert [%Track{stationary: true}] = Tracker.live_tracks(t)
+
+      # the transition is an edge, not a level: staying still emits it once
+      {_t, _tagged, events} = feed(t, [{11_000, box}])
+      assert [{:updated, %Track{stationary: true, stationary_ms: 1_000}}] = events
+    end
+
+    test "a slow drift never reads stationary, however long it runs" do
+      # each box overlaps the one before it well past @stationary_iou, so a
+      # rule that compared consecutive boxes would call this motionless
+      assert Tracker.iou([0.0, 0.0, 1.0, 1.0], [0.1, 0.0, 1.0, 1.0]) > 0.8
+
+      steps = for n <- 0..20, do: {n * 1_000, [n * 0.1, 0.0, 1.0, 1.0]}
+      {t, events} = feed_all(Tracker.new(), steps)
+
+      # 20s of drift under a 10s threshold, and the anchor reset every time
+      assert length(ids(events, :updated)) == 20
+      assert for({:became_stationary, _} = e <- events, do: e) == []
+      assert [%Track{stationary: false, stationary_ms: 0}] = Tracker.live_tracks(t)
+    end
+
+    test "detector jitter around a fixed point is absorbed by the median" do
+      base = [0.0, 0.0, 1.0, 1.0]
+      spike = [0.25, 0.0, 1.0, 1.0]
+
+      # unsmoothed, a single spike box would reset the anchor on its own
+      assert Tracker.iou(base, spike) < 0.8
+
+      steps = for n <- 0..10, do: {n * 1_000, if(rem(n, 4) == 2, do: spike, else: base)}
+      {_t, [tagged], events} = feed(Tracker.new(), steps)
+
+      assert tagged.stationary
+      assert [{:updated, _}, {:became_stationary, %Track{stationary_since: since}}] = events
+      assert since == at(10_000)
+    end
+
+    test "the anchor is established by the first detection, not by a predicted first frame" do
+      box = [0.0, 0.0, 1.0, 1.0]
+
+      {t, events} =
+        feed_all(Tracker.new(), [{0, box, "tracked"} | for(n <- 1..10, do: {n * 1_000, box})])
+
+      # the anchor starts at the detection at 1_000, so 10_000 is still short
+      assert for({:became_stationary, _} = e <- events, do: e) == []
+
+      {_t, [tagged], events} = feed(t, [{11_000, box}])
+      assert tagged.stationary
+      assert [{:updated, _}, {:became_stationary, %Track{stationary_since: since}}] = events
+      assert since == at(11_000)
+    end
+
+    test "predicted observations neither advance nor reset stillness" do
+      box = [0.0, 0.0, 1.0, 1.0]
+      elsewhere = [0.9, 0.0, 1.0, 1.0]
+
+      {t, [tagged], _} = feed(Tracker.new(), for(n <- 0..10, do: {n * 1_000, box}))
+      assert tagged.stationary
+
+      # a predicted stretch, moved boxes included: nothing about stillness moves
+      {t, [tagged], events} = feed(t, for(n <- 11..13, do: {n * 1_000, elsewhere, "tracked"}))
+
+      assert tagged.stationary
+
+      assert [{:updated, %Track{stationary: true, stationary_ms: 0} = still}] = events
+      assert still.stationary_since == at(10_000)
+
+      # the accrual is between detections, so the next one credits the gap
+      {_t, _tagged, events} = feed(t, [{14_000, box}])
+      assert [{:updated, %Track{stationary: true, stationary_ms: 4_000}}] = events
+    end
+
+    test "motion after a stationary stretch flips back and emits started_moving" do
+      box = [0.0, 0.0, 1.0, 1.0]
+      moved = [0.5, 0.0, 1.0, 1.0]
+
+      {t, _, _} = feed(Tracker.new(), for(n <- 0..10, do: {n * 1_000, box}))
+
+      # the median carries a real move once it holds the majority of the window
+      {t, [held], _} = feed(t, [{11_000, moved}, {12_000, moved}])
+      assert held.stationary
+
+      {t, [tagged], events} = feed(t, [{13_000, moved}])
+
+      refute tagged.stationary
+      assert [{:updated, _}, {:started_moving, %Track{} = flipped}] = events
+      refute flipped.stationary
+      assert flipped.stationary_since == nil
+      assert flipped.stationary_ms == 2_000
+      assert [%Track{stationary: false}] = Tracker.live_tracks(t)
+    end
+
+    test "stationary_ms is a total: it survives a stationary -> moving -> stationary cycle" do
+      box = [0.0, 0.0, 1.0, 1.0]
+      moved = [0.5, 0.0, 1.0, 1.0]
+
+      {t, _, _} =
+        feed(Tracker.new(), for(n <- 0..12, do: {n * 1_000, if(n > 10, do: moved, else: box)}))
+
+      {t, [tagged], events} = feed(t, [{13_000, moved}])
+      refute tagged.stationary
+      assert [_updated, {:started_moving, %Track{stationary_ms: 2_000}}] = events
+
+      # the second stretch is measured from the move, and adds to the first
+      {t, [tagged], events} = feed(t, for(n <- 14..23, do: {n * 1_000, moved}))
+      assert tagged.stationary
+      assert [_updated, {:became_stationary, %Track{stationary_ms: 2_000}}] = events
+
+      {_t, _tagged, events} = feed(t, [{24_000, moved}, {25_000, moved}])
+      assert [{:updated, %Track{stationary: true, stationary_ms: 4_000}}] = events
+    end
+
+    test "a backwards media-time jump while stationary accrues nothing" do
+      box = [0.0, 0.0, 1.0, 1.0]
+
+      {t, _, _} = feed(Tracker.new(), for(n <- 0..11, do: {n * 1_000, box}))
+      {t, _, events} = feed(t, [{9_000, box}])
+
+      assert [{:updated, %Track{stationary: true, stationary_ms: 1_000}}] = events
+      assert [%Track{stationary_ms: 1_000}] = Tracker.live_tracks(t)
+    end
+
+    test "stillness is measured on every axis: y and height jitter, then a move in y" do
+      base = [0.0, 0.0, 1.0, 1.0]
+      lower = [0.0, 0.25, 1.0, 1.0]
+      shorter = [0.0, 0.0, 1.0, 0.6]
+      moved = [0.0, 0.5, 1.0, 1.0]
+
+      # each spike alone is below @stationary_iou, on a different axis
+      assert Tracker.iou(base, lower) < 0.8
+      assert Tracker.iou(base, shorter) < 0.8
+
+      steps =
+        for n <- 0..10 do
+          {n * 1_000,
+           case rem(n, 4) do
+             2 -> lower
+             3 -> shorter
+             _ -> base
+           end}
+        end
+
+      {t, [tagged], events} = feed(Tracker.new(), steps)
+
+      assert tagged.stationary
+      assert [{:updated, _}, {:became_stationary, %Track{stationary_since: since}}] = events
+      assert since == at(10_000)
+
+      # a real move in y, which the median carries once it holds the window
+      {t, events} = feed_all(t, for(n <- 11..13, do: {n * 1_000, moved}))
+
+      assert [{:started_moving, %Track{stationary: false}}] =
+               for({:started_moving, _} = e <- events, do: e)
+
+      assert [%Track{stationary: false, stationary_ms: 1_000}] = Tracker.live_tracks(t)
+    end
+
+    test "a host-matched track goes stationary on the same stillness path" do
+      box = [0.3, 0.3, 0.2, 0.2]
+      jitter = [0.31, 0.3, 0.2, 0.2]
+
+      # no track_id: identity is host IoU, and consecutive boxes overlap far
+      # above @iou_threshold, so what this test can fail on is stillness
+      assert Tracker.iou(box, jitter) > 0.9
+
+      {t, events} =
+        Enum.reduce(0..10, {Tracker.new(), []}, fn n, {tracker, seen} ->
+          bbox = if rem(n, 2) == 0, do: box, else: jitter
+
+          {tracker, [_tagged], events} =
+            track(tracker, [det("person", bbox)], media_ms: n * 1_000, observed_at: at(n * 1_000))
+
+          {tracker, seen ++ events}
+        end)
+
+      assert [id] = ids(events, :started)
+      assert ids(events, :updated) == List.duplicate(id, 10)
+
+      assert [{:became_stationary, %Track{} = flipped}] =
+               for({:became_stationary, _} = e <- events, do: e)
+
+      assert flipped.object_id == id
+      assert flipped.source == :host
+      assert flipped.plugin_track_id == nil
+      assert flipped.stationary_since == at(10_000)
+      assert [%Track{stationary: true}] = Tracker.live_tracks(t)
+    end
+
+    test "every tagged object carries the stationary flag, moving or not" do
+      {_t, [tagged], _} = track(Tracker.new(), [det("person", [0.1, 0.1, 0.2, 0.4])])
+
+      assert Map.fetch!(tagged, :stationary) == false
     end
   end
 

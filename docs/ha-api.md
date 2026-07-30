@@ -238,9 +238,19 @@ is scoped, and what bounds it — is
   "last_seen_at": "2026-07-24T00:00:02.000000Z",
   "last_detected_at": "2026-07-24T00:00:01.000000Z",
   "stale_predicted": false,
+  "stationary": false,
+  "stationary_since": null,
+  "stationary_ms": 0,
   "end_reason": null
 }
 ```
+
+`stationary` is true once the object's box has held still for the camera's
+`tracking.stationary_after_ms` of stream time; `stationary_since` is when it
+flipped (`null` while moving) and `stationary_ms` the total stream time it has
+spent stationary over the whole track, which only grows. The measure is the
+box, so a camera that pans moves every track at once, and someone standing in
+place is stationary whatever they are doing.
 
 Same schema for all three kinds:
 

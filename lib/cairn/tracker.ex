@@ -50,6 +50,37 @@ defmodule Cairn.Tracker do
       deliberately lax: media time is the real rule, and this must never fire
       for a stream that is merely slow.
 
+  ## Stationary detection
+
+  A track is stationary once its box has held still for the camera's
+  `stationary_after_ms` of media time. "Still" is measured against an
+  **anchor** — the box the object was last seen to move to — not against the
+  previous box: comparing consecutive boxes calls a slow walk motionless,
+  because every step is within jitter of the one before it. The anchor is
+  reset only when the object moves, so it answers "has it moved since it last
+  moved" however long the track lives.
+
+  The current box is the per-coordinate median of the last few **detected**
+  boxes rather than the newest one, so a single mis-sized box cannot flip a
+  motionless object into motion, nor a moving one out of it.
+
+  Every stationary update is gated on `Cairn.Observation.detected?/1`, for the
+  same reason as `stale_predicted`: a predicted box repeats the plugin's own
+  extrapolation, so counting it would manufacture stillness out of the
+  plugin's guesses. Predicted observations leave the anchor and every
+  stationary field untouched.
+
+  Two things this cannot see, both because the host has boxes and not pixels:
+
+    * **Camera motion.** A PTZ move or a knocked mount shifts every box in the
+      frame, so every stationary track starts moving together as the median
+      follows the new view, and every one of them settles again a threshold
+      after it stops. There is no motion compensation here — the host has no
+      view geometry to compensate with.
+    * **Motion inside a still box.** Someone standing in place and gesturing,
+      or a car idling, keeps a motionless box and reads as stationary. The
+      metric is the box, not what is happening inside it.
+
   Bboxes are `[x, y, w, h]` in any consistent unit (normalized or pixels).
   """
 
@@ -60,6 +91,17 @@ defmodule Cairn.Tracker do
   alias Cairn.ULID
 
   @iou_threshold 0.1
+  # Overlap between the anchor and the smoothed current box that still counts
+  # as "has not moved". Not config, on the same rule as `@iou_threshold`: an
+  # operator looking at a camera view cannot reason about an IoU number, and
+  # the knob that answers the question they actually have — "how long before
+  # you call it parked" — is `stationary_after_ms`.
+  @stationary_iou 0.8
+  # Detected boxes kept for the per-coordinate median. Odd, so a full window's
+  # median is a value the detector actually reported on each axis (a warming-up
+  # window can be even and average two); short, so a real move reaches the
+  # smoothed box within a handful of detections at any frame rate.
+  @recent_boxes 5
   # Plugin track ids that have been ended, kept so their reuse can be caught.
   # Only live tracks bound the rest of the state; this set is bounded here.
   @max_ended_keys 4_096
@@ -84,15 +126,22 @@ defmodule Cairn.Tracker do
           observed_at: DateTime.t() | nil,
           tracking: boolean(),
           ended_tracks: [String.t()],
-          max_unseen_ms: number(),
+          max_unseen_ms: pos_integer(),
           max_live_tracks: pos_integer(),
+          stationary_after_ms: pos_integer(),
           now_ms: number()
         }
 
   @typedoc "The host-side tracking policy for one camera."
-  @type policy :: %{max_unseen_ms: number(), max_live_tracks: pos_integer()}
+  @type policy :: %{
+          max_unseen_ms: pos_integer(),
+          max_live_tracks: pos_integer(),
+          stationary_after_ms: pos_integer()
+        }
 
-  @type event :: {:started | :updated | :ended, Track.t()}
+  @type event ::
+          {:started | :updated | :ended, Track.t()}
+          | {:became_stationary | :started_moving, Track.t()}
 
   @spec new() :: t()
   def new, do: %__MODULE__{}
@@ -120,6 +169,7 @@ defmodule Cairn.Tracker do
       ended_tracks: observation.ended_tracks,
       max_unseen_ms: policy.max_unseen_ms,
       max_live_tracks: policy.max_live_tracks,
+      stationary_after_ms: policy.stationary_after_ms,
       now_ms: now_ms
     }
   end
@@ -128,8 +178,8 @@ defmodule Cairn.Tracker do
   Folds one observation's objects into the tracker.
 
   Returns `{tracker, tagged_objects, events}`: every object tagged with its
-  `object_id` (ULID) and `stale_predicted` flag, in the order given, and the
-  lifecycle events this observation caused.
+  `object_id` (ULID) and its track's `stale_predicted` and `stationary` flags,
+  in the order given, and the lifecycle events this observation caused.
 
   An object the tracker refuses — a `track_id` repeated inside this batch, or
   a new identity at the live-track cap with nothing evictable — is absent from
@@ -349,9 +399,10 @@ defmodule Cairn.Tracker do
     case fetch_assigned(tracker, assigned) do
       {:ok, object_id, existing} ->
         tracked = update_track(existing, object, context)
+        summary = to_track(tracked)
 
         {store(tracker, object_id, tracked), [tag(object, object_id, tracked) | tagged],
-         [{:updated, to_track(tracked)} | events]}
+         transition(existing, tracked, summary) ++ [{:updated, summary} | events]}
 
       :error ->
         case make_room(tracker, protected, context) do
@@ -383,8 +434,20 @@ defmodule Cairn.Tracker do
   defp store(tracker, object_id, tracked),
     do: %{tracker | objects: Map.put(tracker.objects, object_id, tracked)}
 
-  defp tag(object, object_id, tracked),
-    do: Map.merge(object, %{object_id: object_id, stale_predicted: tracked.stale_predicted})
+  # The transition follows its own `:updated` in the event list: that summary
+  # carries the stationary fields the flip is about, so a consumer that folds
+  # events in order has them before it is told the edge happened.
+  defp transition(%{stationary: was}, %{stationary: was}, _summary), do: []
+  defp transition(_existing, %{stationary: true}, summary), do: [{:became_stationary, summary}]
+  defp transition(_existing, %{stationary: false}, summary), do: [{:started_moving, summary}]
+
+  defp tag(object, object_id, tracked) do
+    Map.merge(object, %{
+      object_id: object_id,
+      stale_predicted: tracked.stale_predicted,
+      stationary: tracked.stationary
+    })
+  end
 
   # -- the live-track cap -----------------------------------------------------
 
@@ -460,7 +523,15 @@ defmodule Cairn.Tracker do
         last_seen_ms: context.media_ms,
         last_detected_ms: if(detected?, do: context.media_ms),
         last_seen_host_ms: context.now_ms,
-        stale_predicted: not detected?
+        stale_predicted: not detected?,
+        # A track whose first observation is predicted has no anchor yet: the
+        # first *detected* box is what the stillness rule measures against.
+        anchor_bbox: if(detected?, do: object.bbox),
+        anchor_ms: if(detected?, do: context.media_ms),
+        recent_boxes: if(detected?, do: [object.bbox], else: []),
+        stationary: false,
+        stationary_since: nil,
+        stationary_ms: 0
       },
       context
     )
@@ -468,23 +539,81 @@ defmodule Cairn.Tracker do
 
   defp update_track(tracked, object, context) do
     detected? = Observation.detected?(object)
+    # Read before `last_detected_ms` moves below: stationary time accrues over
+    # the gap between two *detections*, which is what this value is until then.
+    previous_detected_ms = tracked.last_detected_ms
 
-    stale(
-      %{
-        tracked
-        | label: object.label,
-          bbox: object.bbox,
-          score: object.score,
-          best_score: max(tracked.best_score, object.score),
-          last_seen_at: context.observed_at || tracked.last_seen_at,
-          last_seen_ms: context.media_ms,
-          last_seen_host_ms: context.now_ms,
-          last_detected_at:
-            if(detected?, do: context.observed_at, else: tracked.last_detected_at),
-          last_detected_ms: if(detected?, do: context.media_ms, else: tracked.last_detected_ms)
-      },
-      context
-    )
+    %{
+      tracked
+      | label: object.label,
+        bbox: object.bbox,
+        score: object.score,
+        best_score: max(tracked.best_score, object.score),
+        last_seen_at: context.observed_at || tracked.last_seen_at,
+        last_seen_ms: context.media_ms,
+        last_seen_host_ms: context.now_ms,
+        last_detected_at: if(detected?, do: context.observed_at, else: tracked.last_detected_at),
+        last_detected_ms: if(detected?, do: context.media_ms, else: tracked.last_detected_ms)
+    }
+    |> stillness(object, detected?, previous_detected_ms, context)
+    |> stale(context)
+  end
+
+  # -- stillness --------------------------------------------------------------
+
+  # A predicted box is the plugin repeating itself, so it neither advances nor
+  # resets stillness — see the moduledoc.
+  defp stillness(tracked, _object, false, _previous_detected_ms, _context), do: tracked
+
+  defp stillness(tracked, object, true, previous_detected_ms, context) do
+    recent = Enum.take([object.bbox | tracked.recent_boxes], @recent_boxes)
+    tracked = %{tracked | recent_boxes: recent}
+
+    cond do
+      is_nil(tracked.anchor_bbox) ->
+        anchor(tracked, object.bbox, context)
+
+      iou(tracked.anchor_bbox, median_box(recent)) >= @stationary_iou ->
+        still(tracked, previous_detected_ms, context)
+
+      true ->
+        moved(tracked, object.bbox, context)
+    end
+  end
+
+  # The anchor stays where it is for as long as the object does not move, so
+  # the comparison spans the whole still stretch rather than one frame of it.
+  defp still(%{stationary: true} = tracked, previous_detected_ms, context) do
+    elapsed = max(context.media_ms - previous_detected_ms, 0)
+    %{tracked | stationary_ms: tracked.stationary_ms + elapsed}
+  end
+
+  defp still(tracked, _previous_detected_ms, context) do
+    if context.media_ms - tracked.anchor_ms >= context.stationary_after_ms do
+      %{tracked | stationary: true, stationary_since: context.observed_at}
+    else
+      tracked
+    end
+  end
+
+  defp moved(tracked, bbox, context) do
+    %{anchor(tracked, bbox, context) | stationary: false, stationary_since: nil}
+  end
+
+  defp anchor(tracked, bbox, context),
+    do: %{tracked | anchor_bbox: bbox, anchor_ms: context.media_ms}
+
+  defp median_box(boxes), do: for(axis <- 0..3, do: median(Enum.map(boxes, &Enum.at(&1, axis))))
+
+  defp median(values) do
+    sorted = Enum.sort(values)
+    mid = div(length(values), 2)
+
+    if rem(length(values), 2) == 1 do
+      Enum.at(sorted, mid)
+    else
+      (Enum.at(sorted, mid - 1) + Enum.at(sorted, mid)) / 2
+    end
   end
 
   # -- expiry -----------------------------------------------------------------
@@ -588,6 +717,9 @@ defmodule Cairn.Tracker do
       last_seen_at: tracked.last_seen_at,
       last_detected_at: tracked.last_detected_at,
       stale_predicted: tracked.stale_predicted,
+      stationary: tracked.stationary,
+      stationary_since: tracked.stationary_since,
+      stationary_ms: tracked.stationary_ms,
       end_reason: end_reason
     }
   end

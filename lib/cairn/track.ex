@@ -18,6 +18,12 @@ defmodule Cairn.Track do
       seen over the track's life.
     * `stale_predicted` — the track is alive but has not been *detected*
       recently (the plugin keeps predicting it). Never event evidence.
+    * `stationary` — the object's box has held still for the camera's
+      `stationary_after_ms` of media time; `stationary_since` is the
+      observation time it flipped (`nil` while moving) and `stationary_ms`
+      the total media time it has spent stationary over the track's whole
+      life, which only ever grows — a track that moves and settles again
+      carries the sum of both stretches.
     * `end_reason` is `nil` until the track ends: `:unseen` (expired),
       `:plugin_ended` (named in `ended_tracks`), `:stream_reset` (new stream
       epoch), `:evicted` (the camera hit its live-track cap and this was the
@@ -57,7 +63,10 @@ defmodule Cairn.Track do
     :last_seen_at,
     :last_detected_at,
     :end_reason,
-    stale_predicted: false
+    stale_predicted: false,
+    stationary_since: nil,
+    stationary: false,
+    stationary_ms: 0
   ]
 
   @type t :: %__MODULE__{}
