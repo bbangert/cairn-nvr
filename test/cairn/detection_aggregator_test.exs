@@ -88,6 +88,52 @@ defmodule Cairn.DetectionAggregatorTest do
     send(agg, {kind, camera_id, event_id, tk})
   end
 
+  # -- stationary helpers -------------------------------------------------------
+
+  # The default `stationary_after_ms` is 10s of media time; at one hand-fed
+  # frame per simulated second that is ten frames before the edge under test.
+  @stationary_policy Map.put(@policy, :stationary_after_ms, 2_000)
+  @parked_box [0.1, 0.1, 0.2, 0.4]
+  # Overlaps the parked box at 0.54 — under `@stationary_iou` (0.8), so it
+  # reads as movement, and well over the match threshold, so it is the same
+  # track that moved rather than a second one.
+  @moved_box [0.16, 0.1, 0.2, 0.4]
+
+  defp detect_at(agg, camera, media_ms, bbox \\ @parked_box) do
+    DetectionAggregator.detections(
+      agg,
+      camera,
+      @stationary_policy,
+      observation([object("person", 0.9, bbox)], media_ms: media_ms)
+    )
+  end
+
+  # Object arrives, holds still past the threshold, event finalizes: the state
+  # the parked-car loop used to restart from. Returns `{event_id, object_id}`.
+  defp park_and_finalize(agg, camera, camera_id) do
+    detect_at(agg, camera, 1_000)
+    # the event-lifecycle messages are consumed here so a caller refuting a
+    # *second* event is refuting one, not tripping over this one; the track
+    # broadcasts (`track_started`, the flip's `track_updated`) are NOT drained
+    # — a caller asserting on those must account for these batches
+
+    assert_receive {:extractor_started, %Event{id: eid}, _pid}
+    assert_receive {:event_started, %Event{id: ^eid}}
+
+    detect_at(agg, camera, 2_000)
+    assert_receive {:event_updated, %Event{id: ^eid}}
+
+    # read off the tracker rather than off the broadcast: what this asserts is
+    # the evidence rule, not how the flip reaches a subscriber (below)
+    detect_at(agg, camera, 3_000)
+    assert [%Track{object_id: oid, stationary: true}] = live_tracks(agg, camera_id)
+
+    fire(agg, :post_window, camera_id, eid)
+    assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
+
+    {eid, oid}
+  end
+
   test "detection starts an event with extractor and checkpoint", %{
     agg: agg,
     camera: camera,
@@ -927,6 +973,114 @@ defmodule Cairn.DetectionAggregatorTest do
       observe(agg, camera, predicted, media_ms: 4_500.0)
       :sys.get_state(agg)
       refute_received {:event_updated, %Event{camera_id: ^id}}
+    end
+  end
+
+  describe "stationary tracks" do
+    test "a parked object stops holding its event open", %{
+      agg: agg,
+      camera: camera,
+      camera_id: id
+    } do
+      detect_at(agg, camera, 1_000)
+      assert_receive {:event_started, %Event{id: eid, camera_id: ^id}}
+
+      # still moving as far as the tracker is concerned — it has not held the
+      # box for `stationary_after_ms` yet — so this one still resets the window
+      detect_at(agg, camera, 2_000)
+      assert_receive {:event_updated, %Event{id: ^eid}}
+      armed = token(agg, id, :post_token)
+
+      detect_at(agg, camera, 3_000)
+      assert [%Track{stationary: true}] = live_tracks(agg, id)
+
+      # from here the detections keep coming and stop counting: no update, and
+      # — the part that closes the event on schedule — the same post-window
+      # timer as before, not a fresh one per frame
+      detect_at(agg, camera, 4_000)
+      detect_at(agg, camera, 5_000)
+      :sys.get_state(agg)
+      refute_received {:event_updated, %Event{camera_id: ^id}}
+      assert token(agg, id, :post_token) == armed
+
+      fire(agg, :post_window, id, eid)
+      assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
+    end
+
+    test "a parked object cannot open a fresh event", %{
+      agg: agg,
+      camera: camera,
+      camera_id: id
+    } do
+      {_eid, _oid} = park_and_finalize(agg, camera, id)
+
+      # the car is still there and still detected every frame. Before the
+      # stationary rule this is where the loop was: evidence -> new event ->
+      # post window -> finalize -> evidence, for as long as it stayed parked.
+      for media_ms <- [4_000, 5_000, 6_000], do: detect_at(agg, camera, media_ms)
+      :sys.get_state(agg)
+
+      refute_received {:event_started, %Event{camera_id: ^id}}
+      refute_received {:extractor_started, _event, _pid}
+    end
+
+    test "an object that starts moving is evidence again", %{
+      agg: agg,
+      camera: camera,
+      camera_id: id
+    } do
+      {_eid, oid} = park_and_finalize(agg, camera, id)
+
+      # the smoothed box is the median of the last few detections, so a move
+      # reaches it on the third frame at the new position — before that the
+      # object is still, by the only measure the host has
+      detect_at(agg, camera, 4_000, @moved_box)
+      detect_at(agg, camera, 5_000, @moved_box)
+      :sys.get_state(agg)
+      refute_received {:event_started, %Event{camera_id: ^id}}
+
+      detect_at(agg, camera, 6_000, @moved_box)
+      assert [%Track{object_id: ^oid, stationary: false}] = live_tracks(agg, id)
+      assert_receive {:event_started, %Event{camera_id: ^id, labels: [%{object_id: ^oid}]}}
+    end
+
+    test "a transition is published inside the update throttle's window", %{
+      camera: camera,
+      camera_id: id
+    } do
+      {:ok, clock} = start_supervised({Agent, fn -> 0 end})
+      test_pid = self()
+
+      agg =
+        start_supervised!(
+          {DetectionAggregator,
+           name: nil,
+           monotonic_ms: fn -> Agent.get(clock, & &1) end,
+           start_extractor: fn _camera, ev ->
+             pid = spawn(fn -> Process.sleep(:infinity) end)
+             send(test_pid, {:extractor_started, ev, pid})
+             {:ok, pid}
+           end},
+          id: :agg_stationary_throttle
+        )
+
+      detect_at(agg, camera, 1_000)
+      assert_receive {:track_started, %Track{object_id: oid, camera_id: ^id}}
+
+      # same score, no wall clock elapsed: the throttle is armed and swallows
+      # this update
+      detect_at(agg, camera, 2_000)
+      :sys.get_state(agg)
+      refute_received {:track_updated, %Track{object_id: ^oid}}
+
+      # the flip arrives inside that same window and goes out anyway — a
+      # consumer must not learn a second late that the object stopped counting
+      detect_at(agg, camera, 3_000)
+      assert_receive {:track_updated, %Track{object_id: ^oid, stationary: true}}
+
+      # and exactly once: the tracker pairs the transition with an `:updated`
+      # carrying the same summary, which the throttle swallowed
+      refute_received {:track_updated, %Track{object_id: ^oid}}
     end
   end
 end

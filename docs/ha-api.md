@@ -252,12 +252,18 @@ spent stationary over the whole track, which only grows. The measure is the
 box, so a camera that pans moves every track at once, and someone standing in
 place is stationary whatever they are doing.
 
+A stationary object is **not event evidence**: a car that parks in view stops
+holding its event open, so that event ends on the post window and nothing it
+does while parked opens another. It counts again the moment it moves.
+
 Same schema for all three kinds:
 
 - `track_started` — a new identity. Always sent.
 - `track_updated` — **throttled**: sent only when `best_score` improves or at
   most once a second per track. It is deliberately *not* a per-frame feed; do
-  not use it to drive animation.
+  not use it to drive animation. One frame is never throttled: the one where
+  `stationary` flips, in either direction. Cairn's own event logic keys off
+  that flag, so it is sent the moment it changes.
 - `track_ended` — **self-contained**: everything above is filled in, so a
   client that missed every other frame still learns what the track was.
   `end_reason` is one of `unseen` (not seen for the configured

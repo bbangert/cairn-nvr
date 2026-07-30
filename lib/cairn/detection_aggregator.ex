@@ -6,12 +6,19 @@ defmodule Cairn.DetectionAggregator do
   `Cairn.PluginGroupPort`, filters by per-label `min_score`, assigns stable
   object identities (`Cairn.Tracker`, ULID strings), and:
 
-    * no active event + detection -> starts a `Cairn.EventExtractor` and
+    * no active event + evidence -> starts a `Cairn.EventExtractor` and
       broadcasts `{:event_started, event}` on `"events"`
-    * detection during an event -> accumulates time-indexed labels, resets
+    * evidence during an event -> accumulates time-indexed labels, resets
       the post-window timer, broadcasts `{:event_updated, event}`
     * `post_window` seconds of quiet -> finalizes; `max_event` seconds ->
-      finalizes and lets the next detection open a fresh event
+      finalizes and lets the next piece of evidence open a fresh event
+
+  Not every detection is evidence (`evidence?/2`, the one gate both of the
+  first two bullets pass through): a predicted ("tracked") object is refused,
+  and so is one whose track the tracker has judged **stationary**. A parked car
+  therefore stops resetting the post-window, the event closes on schedule and
+  stays closed — nothing reopens it while the car sits there — and the car is
+  evidence again the moment it moves.
 
   `{:event_ended, event}` means the detection window closed and nothing more:
   it is broadcast before the extractor is even told to finalize, so the clip
@@ -28,7 +35,10 @@ defmodule Cairn.DetectionAggregator do
   `%Cairn.Track{}` summaries: `track_started` and `track_ended` always,
   `track_updated` only when the track's best score improves or a second of
   wall clock has passed since its last update — a 5 fps stream with a dozen
-  objects must not become a firehose of identical frames.
+  objects must not become a firehose of identical frames. A stationary
+  transition is published immediately whatever the throttle says: the flag
+  decides whether the object is evidence, so a consumer must not learn of the
+  flip up to a second after this module has already acted on it.
 
   Subscribes to `Cairn.StreamEpochs`: a new epoch for a camera ends every
   live track (`:stream_reset`) and starts a fresh tracker, so no identity is
@@ -189,9 +199,10 @@ defmodule Cairn.DetectionAggregator do
       %{cam | tracker: tracker, current_epoch: cam.current_epoch || observation.epoch}
       |> publish_tracks(track_events, state)
 
-    # Neither a predicted ("tracked") object nor a track the plugin keeps
-    # predicting long after anything last detected it is evidence: they keep
-    # the tracker warm but can neither open an event nor hold one open.
+    # A predicted ("tracked") object, a track the plugin keeps predicting long
+    # after anything last detected it, and a track that has held still past the
+    # camera's `stationary_after_ms` are all not evidence: they keep the
+    # tracker warm but can neither open an event nor hold one open.
     min_score = effective_min_score(camera, control)
     passing = Enum.filter(tagged, &evidence?(&1, min_score))
 
@@ -207,12 +218,24 @@ defmodule Cairn.DetectionAggregator do
     put_cam(state, camera.id, cam)
   end
 
+  # The single gate: the objects this accepts are `passing`, which is what both
+  # `start_event/6` and `update_event/5` are handed, so what is refused here
+  # can neither open an event nor hold one open. That pairing is the whole
+  # point of the stationary rule — a parked car keeps producing detections, and
+  # refusing them is what lets the post-window run out instead of being reset
+  # by every frame of a car that is going nowhere.
+  #
+  # `object.stationary` is read directly rather than defaulted: every object
+  # this is called with came out of `Tracker.track/3`, which tags `object_id`,
+  # `stale_predicted` and `stationary` onto every object it returns.
+  #
   # `stale_predicted` is not checked here and must not be: the tracker sets it
   # from the last *detection*, so an object that is detected in this batch
   # always carries `false`. The staleness rule bites through `detected?/1`
   # instead — a track the plugin keeps predicting arrives as `"tracked"`.
   defp evidence?(object, min_score) do
-    Observation.detected?(object) and passes_min_score?(object, min_score)
+    Observation.detected?(object) and not object.stationary and
+      passes_min_score?(object, min_score)
   end
 
   # Defensive on a public, @spec'd entry point (`detections/4`) that any caller
@@ -370,9 +393,11 @@ defmodule Cairn.DetectionAggregator do
 
   # -- track lifecycle --------------------------------------------------------
 
-  # `track_started` and `track_ended` always go out: a subscriber that only
-  # ever sees the final summary still learns what the track was. Updates are
-  # throttled per track — best-score improvement or a second of wall clock.
+  # `track_started`, `track_ended` and the stationary transitions always go
+  # out: a subscriber that only ever sees the final summary still learns what
+  # the track was, and the flag this module gates evidence on must not arrive
+  # late. Plain updates are throttled per track — best-score improvement or a
+  # second of wall clock.
   defp publish_tracks(cam, events, state) do
     Enum.reduce(events, cam, fn
       {:started, track}, cam ->
@@ -386,10 +411,21 @@ defmodule Cairn.DetectionAggregator do
         Track.broadcast(:track_ended, track)
         %{cam | track_updates: Map.delete(cam.track_updates, track.object_id)}
 
-      # The stationary transitions annotate the `:updated` beside them and
-      # carry no fields of their own; nothing is broadcast for them.
-      {kind, _track}, cam when kind in [:became_stationary, :started_moving] ->
-        cam
+      # Broadcast as a `track_updated` — the transition carries no fields of
+      # its own, it is the `%Track{}` the flip is about — and noted, the same
+      # throttle bypass `:started` gets.
+      #
+      # The tracker emits the paired `{:updated, track}` immediately before
+      # this one carrying the *same* summary, so when the throttle happens to
+      # let that one through a consumer sees one identical frame twice: a
+      # repeat of a state snapshot, not a second transition. Running
+      # `note_update` for both costs nothing — it overwrites one entry with the
+      # same track's `best_score` at the same instant — and what it buys is
+      # that the *next* `:updated` is throttled from the flip rather than from
+      # whatever went out before it.
+      {kind, track}, cam when kind in [:became_stationary, :started_moving] ->
+        Track.broadcast(:track_updated, track)
+        note_update(cam, track, state)
     end)
   end
 
