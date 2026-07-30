@@ -399,7 +399,7 @@ fn argmax(n: usize, score: impl Fn(usize) -> f64) -> (usize, f64) {
 ///
 /// The extent bound is not tidiness. `exp()` in the grid decode stays finite up
 /// to `exp(88)`, so a broken or int8-collapsed export can emit a box of `1e38`
-/// model pixels that every finite check accepts and [`det_from`]'s clamp then
+/// model pixels that every finite check accepts and [`wire_bbox`]'s clamp then
 /// turns into exactly `[0, 0, 1, 1]` — a full-frame detection, which is the
 /// worst possible false positive for something that drives recording. Nothing
 /// real is `MAX_EXTENT` times the input rectangle, so cutting there costs
@@ -421,17 +421,24 @@ fn centered(cx: f64, cy: f64, w: f64, h: f64, size: InputSize) -> Option<ModelBo
     })
 }
 
-/// Where every layout converges: pad-only candidates out, then NMS if the head
-/// needs it, then the per-label floor, un-projection, score order and the
-/// [`MAX_DETS`] cap.
+/// Where every layout converges, in this order: candidates the host would
+/// refuse are dropped; then, on a head that asks for NMS, a descending-score
+/// sort, a `truncate` to `max_candidates`, and [`nms`]; then the per-label
+/// floor, un-projection, and last [`top_dets`]'s own score sort and
+/// [`MAX_DETS`] cap. A head with `nms: None` skips those three middle steps
+/// entirely — no sort and no `max_candidates` cut — so [`top_dets`] is the only
+/// thing that orders its output.
 ///
 /// The `retain` below is where a candidate stops being a detection at all: a
-/// box the clamp leaves with no area — see [`wire_bbox`] — is dropped there,
-/// which both keeps it from occupying a slot the cap measures and, the reason
-/// it goes first, keeps it out of [`nms`]. [`det_from`] tests the same predicate
-/// again on the way out. Nothing that reaches it can fail it, the input and the
-/// predicate both being the same; it stays because a conversion that can decline
-/// is what its signature promises every caller, not just this one.
+/// box whose clamped extent rounds to zero — see [`wire_bbox`] — is dropped
+/// there. Its position ahead of that middle block is what earns both halves of
+/// the argument in the body comment: ahead of the `truncate`, so a ghost cannot
+/// spend a `max_candidates` slot, and ahead of [`nms`], where a suppression a
+/// ghost causes cannot afterwards be undone. [`det_from`] tests the same
+/// predicate again on the way out. Nothing that reaches it can fail it, the
+/// input and the predicate both being the same; it stays because a conversion
+/// that can decline is what its signature promises every caller, not just this
+/// one.
 pub(super) fn finish(
     mut candidates: Vec<Candidate>,
     spec: Option<NmsSpec>,
@@ -444,6 +451,13 @@ pub(super) fn finish(
     // has ordinary area, so it can suppress a real box of its own class, and
     // dropping it afterwards at [`det_from`] cannot bring that box back. Also
     // ahead of the cut below, so a ghost cannot spend a `max_candidates` slot.
+    //
+    // Unconditional, though on a `nms: None` head — yolov10 and rfdetr — it
+    // cannot change the output: there is no NMS to protect and no
+    // `max_candidates` cut, `retain` preserves relative order, and `det_from`
+    // then declines exactly the same candidates. Left that way rather than
+    // moved into the `Some` arm below, so that "a candidate the host would
+    // refuse never gets past here" holds for every head with no arm to check.
     //
     // The survivors are un-projected a second time in `det_from`. Left that
     // way on purpose: carrying the result through NMS would mean a second box
@@ -490,11 +504,12 @@ pub(super) fn finish(
 ///
 /// `candidates` must already be sorted by descending score.
 ///
-/// This runs on model-space boxes, where a box lying wholly in the letterbox
-/// pad still has ordinary area and is therefore indistinguishable from a real
-/// detection. [`finish`] is what keeps such a box from reaching here, and it
-/// has to: suppression is not recoverable afterwards, so a ghost that got this
-/// far would take a real box with it and then be dropped itself.
+/// This runs on model-space boxes, where pad pixels count as area like any
+/// other, so a box lying wholly in the letterbox pad is indistinguishable here
+/// from a real detection. [`finish`] drops those before they reach this
+/// function, and it has to: suppression is not recoverable afterwards, so a
+/// ghost that got this far would take a real box with it and then be dropped
+/// itself.
 ///
 /// Nor does that need a contrived overlap. Take a ghost covering exactly the
 /// part of a real box that hangs past the content rectangle: the overlap is the
@@ -508,6 +523,38 @@ pub(super) fn finish(
 /// needs only 45% of it in the pad, leaving the majority as content and an
 /// ordinary edge-of-frame detection to lose. See
 /// `a_pad_only_ghost_is_dropped_before_nms_so_it_cannot_suppress_a_real_box`.
+///
+/// **Known residual, still unfixed.** That filter closes the *wholly*-pad case
+/// and only it. What [`wire_bbox`] declines is a box whose clamped extent
+/// rounds to zero, so a ghost holding even one row of content passes and
+/// arrives here with its whole model-space extent — pad included — counting
+/// towards its area. It is as indistinguishable from a real detection as a
+/// pad-only box was, and can still suppress one. Under the projection that test
+/// uses (1920x1080 into yolox's 416 input, so content rows 0..234), two
+/// same-class candidates spanning x 65..130:
+///
+/// ```text
+/// score 0.9   y 233..500   267 tall, one row of it content
+/// score 0.8   y 150..500   350 tall
+/// IoU = 267 / 350 = 0.7629                              >= threshold 0.45
+///
+/// output  [Det { "person", 0.9, [0.1563, 0.9957, 0.1563, 0.0043] }]
+/// the 0.8 box alone would have given [0.1563, 0.641, 0.1563, 0.359]
+/// ```
+///
+/// So the 0.8 detection is suppressed and never reported, and what reaches the
+/// host in its place is the 0.9 box clamped to that one content row: a sliver
+/// 0.43% of the frame's height. This note has been deleted once already, on the
+/// reading that the pre-filter above had closed the class. It has not.
+///
+/// The complete fix is to clamp each [`ModelBox`] to the content rectangle
+/// before computing [`iou`]. That keeps the comparison in model space, so it
+/// does not disturb the reason NMS is not done on un-projected boxes instead:
+/// un-projection divides the two axes by differing source dimensions, which
+/// does not preserve IoU and so would change suppression everywhere, pad or no
+/// pad. Deliberately not done here — clamping changes the IoU of every pair
+/// that overlaps the pad, legitimate edge-of-frame detections included, and
+/// that is a behaviour decision rather than a correction.
 fn nms(candidates: Vec<Candidate>, threshold: f64) -> Vec<Candidate> {
     let mut kept: Vec<Candidate> = Vec::new();
     for candidate in candidates {
@@ -545,14 +592,18 @@ fn iou(a: &ModelBox, b: &ModelBox) -> f64 {
 /// what says so in the type: only [`Projection::unproject`] makes one, so
 /// there is no way to reach here holding model pixels.
 ///
-/// **This is the definition of "pad-only", and the only one.** A box lying
-/// wholly in the letterbox pad clamps to a line, so `w` or `h` comes out 0 and
-/// the host refuses the detection outright (`validate_det` requires
-/// `w > 0 and h > 0`). The predicate is therefore not a separate rule but the
-/// arithmetic below: whatever this declines is a ghost. [`finish`] applies it
-/// twice — once directly, before NMS, which is where the drop saves a real box,
-/// and once through [`det_from`], so a box that reaches the wire has area by
-/// construction.
+/// **What this declines is "a box the host would refuse", and nothing
+/// narrower.** The condition is the arithmetic below and only that: `w` or `h`
+/// rounds to 0, which `validate_det` on the host rejects outright since it
+/// requires `w > 0 and h > 0`. A box lying wholly in the letterbox pad clamps
+/// to a line and so satisfies it — that is the instance worth knowing about,
+/// and the reason [`finish`] runs this ahead of [`nms`] — but it is not the
+/// only one. A box wholly outside the frame clamps to a line too, pad or no pad:
+/// reachable under [`super::geometry::ResizePolicy::Stretch`], where there is no
+/// pad to lie in at all. So does an inverted box, per the paragraph below.
+/// [`finish`] applies the predicate twice — once directly, before NMS, which is
+/// where the drop saves a real box, and once through [`det_from`], so a box that
+/// reaches the wire has area by construction.
 ///
 /// The rounded extents are what it reads, not the raw ones: rounding is what
 /// the host sees, so a sliver narrower than 0.00005 already reaches it as 0.
@@ -896,7 +947,7 @@ mod tests {
     fn a_box_far_larger_than_the_input_is_not_a_full_frame_detection() {
         // `exp(logit) * stride` stays finite to about 1e38, so an int8-
         // collapsed or corrupt export can emit a box of 1e30 model pixels.
-        // Every finite check accepts it and `det_from`'s clamp turns it into
+        // Every finite check accepts it and `wire_bbox`'s clamp turns it into
         // exactly [0, 0, 1, 1] — a whole-frame detection, the worst possible
         // false positive for something that triggers recording.
         assert!(centered(320.0, 320.0, 1e30, 1e30, SQUARE).is_none());
