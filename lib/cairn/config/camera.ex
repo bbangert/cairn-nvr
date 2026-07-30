@@ -5,7 +5,8 @@ defmodule Cairn.Config.Camera do
   `min_score` is a map of label => minimum detection score, with a
   `"default"` key applied to labels not listed.
 
-  The window seconds, `max_unseen_ms` and `max_live_tracks` are overrides:
+  The window seconds, `max_unseen_ms`, `max_live_tracks` and
+  `stationary_after_ms` are overrides:
   `nil` means "use the global value" (`Cairn.Config.policy/2` resolves them).
 
   `plugin` selects the inference plugin (absent = no detection for this
@@ -23,7 +24,7 @@ defmodule Cairn.Config.Camera do
 
   @known_keys ~w(id rtsp_url plugin min_score extra_ffmpeg_args transcode retention
                  pre_window_seconds post_window_seconds max_event_seconds max_unseen_ms
-                 max_live_tracks)
+                 max_live_tracks stationary_after_ms)
 
   defstruct id: nil,
             rtsp_url: nil,
@@ -37,7 +38,8 @@ defmodule Cairn.Config.Camera do
             post_window_seconds: nil,
             max_event_seconds: nil,
             max_unseen_ms: nil,
-            max_live_tracks: nil
+            max_live_tracks: nil,
+            stationary_after_ms: nil
 
   @type t :: %__MODULE__{}
 
@@ -82,7 +84,8 @@ defmodule Cairn.Config.Camera do
       post_window_seconds: Map.get(raw, "post_window_seconds"),
       max_event_seconds: Map.get(raw, "max_event_seconds"),
       max_unseen_ms: Map.get(raw, "max_unseen_ms"),
-      max_live_tracks: Map.get(raw, "max_live_tracks")
+      max_live_tracks: Map.get(raw, "max_live_tracks"),
+      stationary_after_ms: Map.get(raw, "stationary_after_ms")
     }
 
     {cam, acc}

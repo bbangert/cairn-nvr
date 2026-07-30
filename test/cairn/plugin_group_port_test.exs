@@ -166,7 +166,8 @@ defmodule Cairn.PluginGroupPortTest do
              post: 10,
              max: 300,
              max_unseen_ms: 3_000,
-             max_live_tracks: 128
+             max_live_tracks: 128,
+             stationary_after_ms: 10_000
            }
 
     assert [%{label: "person", score: 0.9}] = obs_a.objects
@@ -180,7 +181,8 @@ defmodule Cairn.PluginGroupPortTest do
              post: 42,
              max: 300,
              max_unseen_ms: 3_000,
-             max_live_tracks: 128
+             max_live_tracks: 128,
+             stationary_after_ms: 10_000
            }
   end
 

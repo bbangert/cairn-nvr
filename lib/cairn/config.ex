@@ -19,7 +19,7 @@ defmodule Cairn.Config do
   @known_events_keys ~w(pre_window_seconds post_window_seconds max_event_seconds)
   @known_retention_keys ~w(days per_label)
   @known_integrations_keys ~w(token)
-  @known_tracking_keys ~w(max_unseen_ms max_live_tracks)
+  @known_tracking_keys ~w(max_unseen_ms max_live_tracks stationary_after_ms)
   @name_regex ~r/\A[a-z0-9][a-z0-9_-]*\z/
 
   # How long a track survives without being seen, in *media* time. Long
@@ -32,6 +32,11 @@ defmodule Cairn.Config do
   # enough for a crowded scene at 64 objects per frame; small enough that a
   # hostile plugin cannot mint its way out of memory.
   @default_max_live_tracks 128
+  # How long an object must hold still, in *media* time, before it counts as
+  # stationary. Long enough that someone standing at a door or a car waiting
+  # at a gate is not called parked; short enough that a package left on the
+  # step is reported while the event that dropped it is still open.
+  @default_stationary_after_ms 10_000
 
   defstruct data_dir: "data",
             stall_seconds: 15,
@@ -46,6 +51,7 @@ defmodule Cairn.Config do
             retention_per_label: %{},
             max_unseen_ms: @default_max_unseen_ms,
             max_live_tracks: @default_max_live_tracks,
+            stationary_after_ms: @default_stationary_after_ms,
             cameras: [],
             plugin_groups: [],
             ha_token: nil
@@ -136,6 +142,7 @@ defmodule Cairn.Config do
       retention_per_label: get_in(map, ["retention", "per_label"]) || %{},
       max_unseen_ms: configured_max_unseen_ms(map),
       max_live_tracks: configured_max_live_tracks(map),
+      stationary_after_ms: configured_stationary_after_ms(map),
       cameras: cameras,
       plugin_groups: plugin_groups,
       ha_token: get_in(map, ["integrations", "token"])
@@ -166,6 +173,9 @@ defmodule Cairn.Config do
   defp configured_max_live_tracks(map),
     do: get_in(map, ["tracking", "max_live_tracks"]) || @default_max_live_tracks
 
+  defp configured_stationary_after_ms(map),
+    do: get_in(map, ["tracking", "stationary_after_ms"]) || @default_stationary_after_ms
+
   @doc """
   Everything the detection pipeline needs for a camera in one map: the event
   windows plus the tracking settings.
@@ -179,13 +189,15 @@ defmodule Cairn.Config do
           post: pos_integer(),
           max: pos_integer(),
           max_unseen_ms: pos_integer(),
-          max_live_tracks: pos_integer()
+          max_live_tracks: pos_integer(),
+          stationary_after_ms: pos_integer()
         }
   def policy(%__MODULE__{} = config, %Camera{} = cam) do
     config
     |> windows(cam)
     |> Map.put(:max_unseen_ms, max_unseen_ms(config, cam))
     |> Map.put(:max_live_tracks, max_live_tracks(config, cam))
+    |> Map.put(:stationary_after_ms, stationary_after_ms(config, cam))
   end
 
   @doc "Effective track expiry (media milliseconds) for a camera."
@@ -205,6 +217,15 @@ defmodule Cairn.Config do
   @doc "Live-track cap used when no config is available."
   @spec default_max_live_tracks() :: pos_integer()
   def default_max_live_tracks, do: @default_max_live_tracks
+
+  @doc "Effective stillness threshold (media milliseconds) for a camera."
+  @spec stationary_after_ms(t(), Camera.t()) :: pos_integer()
+  def stationary_after_ms(%__MODULE__{} = config, %Camera{} = cam),
+    do: cam.stationary_after_ms || config.stationary_after_ms
+
+  @doc "Stillness threshold used when no config is available (media milliseconds)."
+  @spec default_stationary_after_ms() :: pos_integer()
+  def default_stationary_after_ms, do: @default_stationary_after_ms
 
   @doc "Effective retention days for a camera and label."
   @spec retention_days(t(), Camera.t(), String.t()) :: pos_integer()
@@ -395,11 +416,15 @@ defmodule Cairn.Config do
   # Media-time expiry: below ~100 ms a single dropped frame ends every track;
   # above an hour a track outlives the epoch it belongs to. The live-track cap
   # has to leave room for a full 64-object frame at the low end and stay a
-  # bound worth having at the high end.
+  # bound worth having at the high end. The stillness threshold is bounded the
+  # same way from above — beyond an hour it can never fire inside an epoch —
+  # and from below at a second, under which detector jitter, not the object,
+  # decides whether something is stationary.
   defp validate_tracking(acc, config) do
     acc
     |> validate_tracking_key(config, :max_unseen_ms, 100, 3_600_000)
     |> validate_tracking_key(config, :max_live_tracks, 1, 10_000)
+    |> validate_tracking_key(config, :stationary_after_ms, 1_000, 3_600_000)
   end
 
   defp validate_tracking_key(acc, config, key, min, max) do

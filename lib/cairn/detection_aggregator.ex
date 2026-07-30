@@ -220,7 +220,9 @@ defmodule Cairn.DetectionAggregator do
   defp tracking_policy(policy) do
     %{
       max_unseen_ms: Map.get(policy, :max_unseen_ms) || Config.default_max_unseen_ms(),
-      max_live_tracks: Map.get(policy, :max_live_tracks) || Config.default_max_live_tracks()
+      max_live_tracks: Map.get(policy, :max_live_tracks) || Config.default_max_live_tracks(),
+      stationary_after_ms:
+        Map.get(policy, :stationary_after_ms) || Config.default_stationary_after_ms()
     }
   end
 
@@ -383,6 +385,11 @@ defmodule Cairn.DetectionAggregator do
       {:ended, track}, cam ->
         Track.broadcast(:track_ended, track)
         %{cam | track_updates: Map.delete(cam.track_updates, track.object_id)}
+
+      # The stationary transitions annotate the `:updated` beside them and
+      # carry no fields of their own; nothing is broadcast for them.
+      {kind, _track}, cam when kind in [:became_stationary, :started_moving] ->
+        cam
     end)
   end
 
