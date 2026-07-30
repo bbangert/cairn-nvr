@@ -24,7 +24,13 @@ defmodule Cairn.Config do
 
   # How long a track survives without being seen, in *media* time. Long
   # enough to ride out an occlusion, short enough that a parked identity does
-  # not get handed to whatever next overlaps it.
+  # not get handed to whatever next overlaps it. The tracker makes one gated
+  # exception to that second half: a track it has judged stationary gets a
+  # bound `@stationary_unseen_factor` times this one, and pays for the extra
+  # patience by refusing to re-match below `@stationary_match_iou` for as long
+  # as it is over this bound — so a parked identity still goes to the object
+  # that was parked there and to nothing else. Both constants live in
+  # `Cairn.Tracker`; they are a pair, and neither is config.
   @default_max_unseen_ms 3_000
   # How many tracks one camera may hold live at once. The tracker lives in the
   # singleton aggregator and a plugin picks its own track ids, so this is what

@@ -69,6 +69,24 @@ defmodule Cairn.TrackerTest do
     end)
   end
 
+  # One host-mode object detected every second at `box`, from media time 0
+  # through @stationary_after (10_000): stationary as of the last step, with
+  # `last_seen_ms` 10_000 and `last_seen_host_ms` 0 (the ctx default). Host
+  # mode on purpose — what the grace tests are about is IoU identity, which a
+  # plugin track id would pin regardless.
+  defp parked(box) do
+    {tracker, id} =
+      Enum.reduce(0..10, {Tracker.new(), nil}, fn n, {tracker, id} ->
+        {tracker, [tagged], _events} =
+          track(tracker, [det("person", box)], media_ms: n * 1_000, observed_at: at(n * 1_000))
+
+        {tracker, id || tagged.object_id}
+      end)
+
+    assert [%Track{object_id: ^id, stationary: true}] = Tracker.live_tracks(tracker)
+    {tracker, id}
+  end
+
   # Every event of the whole run, for the tests that are about what never
   # happened.
   defp feed_all(tracker, steps) do
@@ -607,6 +625,210 @@ defmodule Cairn.TrackerTest do
       {_t, [tagged], _} = track(Tracker.new(), [det("person", [0.1, 0.1, 0.2, 0.4])])
 
       assert Map.fetch!(tagged, :stationary) == false
+    end
+  end
+
+  describe "stationary grace" do
+    # @max_unseen is 3_000 and the tracker's @stationary_unseen_factor is 5, so
+    # a stationary track's unseen bound is 15_000 of media time. `parked/1`
+    # leaves `last_seen_ms` at 10_000, so the grace runs from 13_000 (past the
+    # plain bound) to 25_000 (the extended one) of media time.
+    test "a stationary track keeps its ULID across an occlusion past max_unseen_ms" do
+      box = [0.0, 0.0, 0.4, 0.4]
+      {t, id} = parked(box)
+
+      # 4_000 unseen: a moving track would already be gone
+      {t, [], events} = track(t, [], media_ms: 14_000)
+      assert events == []
+
+      {t, [tagged], events} =
+        track(t, [det("person", box)], media_ms: 15_000, observed_at: at(15_000))
+
+      assert tagged.object_id == id
+      # the whole event list: no second `:started`, no `:ended` before it
+      assert [{:updated, %Track{object_id: ^id}}] = events
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+    end
+
+    test "a passer-by in the grace does not take the parked identity" do
+      box = [0.0, 0.0, 0.4, 0.4]
+      passer = [0.2, 0.0, 0.4, 0.4]
+
+      # non-vacuity: this box overlaps the parked one well above the base
+      # @iou_threshold (0.1), so at the base threshold it would match and the
+      # parked track would answer to it — only the grace threshold
+      # (@stationary_match_iou, 0.7) refuses it
+      assert_in_delta Tracker.iou(box, passer), 1 / 3, 0.001
+      assert Tracker.iou(box, passer) > 0.1
+      assert Tracker.iou(box, passer) < 0.7
+
+      {t, id} = parked(box)
+
+      # 4_000 unseen: inside the grace, so the parked track is a candidate and
+      # this box is the one thing overlapping it
+      {t, [tagged], events} =
+        track(t, [det("person", passer)], media_ms: 14_000, observed_at: at(14_000))
+
+      assert [{:started, %Track{object_id: passer_id}}] = events
+      assert tagged.object_id == passer_id
+      refute passer_id == id
+      assert Enum.map(Tracker.live_tracks(t), & &1.object_id) == Enum.sort([id, passer_id])
+
+      # and the identity was held, not merely withheld: the parked object is
+      # still itself when it is detected again at 5_000 unseen
+      {_t, [redetected], events} =
+        track(t, [det("person", box)], media_ms: 15_000, observed_at: at(15_000))
+
+      assert redetected.object_id == id
+      assert ids(events, :started) == []
+      assert ids(events, :updated) == [id]
+    end
+
+    test "a stationary track being seen normally still matches at the base threshold" do
+      box = [0.0, 0.0, 0.4, 0.4]
+      jitter = [0.2, 0.0, 0.4, 0.4]
+
+      # between the base @iou_threshold (0.1) and @stationary_match_iou (0.7):
+      # the strict threshold applied to a track that is still being seen would
+      # reject this detection and mint a second track for the same object
+      assert Tracker.iou(box, jitter) > 0.1
+      assert Tracker.iou(box, jitter) < 0.7
+
+      {t, id} = parked(box)
+
+      # 1_000 unseen, well inside max_unseen_ms: not in grace
+      {t, [tagged], events} =
+        track(t, [det("person", jitter)], media_ms: 11_000, observed_at: at(11_000))
+
+      assert tagged.object_id == id
+      assert ids(events, :started) == []
+      assert ids(events, :updated) == [id]
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+    end
+
+    # The grace is entered at strictly more than max_unseen_ms unseen, the same
+    # edge expiry uses, so the two rules can never disagree about whether a
+    # track is in grace.
+    test "the strict threshold starts one millisecond past max_unseen_ms, not at it" do
+      box = [0.0, 0.0, 0.4, 0.4]
+      jitter = [0.2, 0.0, 0.4, 0.4]
+
+      assert Tracker.iou(box, jitter) > 0.1
+      assert Tracker.iou(box, jitter) < 0.7
+
+      {t, id} = parked(box)
+
+      # 10_000 + 3_000: unseen is exactly max_unseen_ms, so this is still
+      # normal tracking and the base threshold matches
+      {seen, [tagged], events} =
+        track(t, [det("person", jitter)], media_ms: 13_000, observed_at: at(13_000))
+
+      assert tagged.object_id == id
+      assert [{:updated, %Track{object_id: ^id}}] = events
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(seen)
+
+      # one millisecond later, from the same parked tracker: in grace, so the
+      # same box is refused and gets an identity of its own
+      {refused, [tagged], events} =
+        track(t, [det("person", jitter)], media_ms: 13_001, observed_at: at(13_001))
+
+      assert [{:started, %Track{object_id: other}}] = events
+      assert tagged.object_id == other
+      refute other == id
+      assert Enum.map(Tracker.live_tracks(refused), & &1.object_id) == Enum.sort([id, other])
+    end
+
+    test "a box above the grace threshold does re-match, deep inside the grace" do
+      box = [0.0, 0.0, 0.4, 0.4]
+      offset = [0.05, 0.0, 0.4, 0.4]
+
+      # 0.14 / 0.18: above @stationary_match_iou (0.7), and below 0.8 so a
+      # threshold raised even a little would reject it — the accept side of the
+      # same rule the passer-by test checks the reject side of
+      assert Tracker.iou(box, offset) > 0.7
+      assert Tracker.iou(box, offset) < 0.8
+
+      {t, id} = parked(box)
+
+      # 10_000 unseen: over three times max_unseen_ms, inside the 15_000 grace
+      {t, [tagged], events} =
+        track(t, [det("person", offset)], media_ms: 20_000, observed_at: at(20_000))
+
+      assert tagged.object_id == id
+      assert [{:updated, %Track{object_id: ^id}}] = events
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+    end
+
+    # The bound is on the track, not on how it got its identity. A plugin track
+    # has no duplicate-identity risk to weigh — its id is pinned by `track_id`,
+    # not by IoU — so nothing here has to hold it to the plain bound.
+    test "a stationary plugin-mode track gets the same extended bound" do
+      box = [0.0, 0.0, 0.4, 0.4]
+
+      {t, [tagged], _} = feed(Tracker.new(), for(n <- 0..10, do: {n * 1_000, box}))
+      assert tagged.stationary
+      id = tagged.object_id
+
+      # 10_000 unseen: past max_unseen_ms, inside 5 x 3_000
+      {t, [], []} = track(t, [], plugin_ctx(media_ms: 20_000))
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+
+      # past 10_000 + 15_000
+      {t, [], ended} = track(t, [], plugin_ctx(media_ms: 25_100))
+      assert [{:ended, %Track{object_id: ^id, end_reason: :unseen}}] = ended
+      assert Tracker.live_tracks(t) == []
+    end
+
+    test "the grace has an end: extended bound for a stationary track, plain for a moving one" do
+      box = [0.0, 0.0, 0.4, 0.4]
+      {t, id} = parked(box)
+
+      # a second track, elsewhere in the frame and never stationary, last seen
+      # at the same 10_000 of media time
+      {t, [mover], _} =
+        track(t, [det("person", [0.6, 0.6, 0.2, 0.2])], media_ms: 10_000, observed_at: at(10_000))
+
+      refute mover.object_id == id
+
+      # 3_100 unseen: past max_unseen_ms (3_000) for the mover, and 3_100 of
+      # the parked track's 15_000 (5 x 3_000)
+      {t, [], events} = track(t, [], media_ms: 13_100)
+      assert [{:ended, %Track{object_id: gone, end_reason: :unseen}}] = events
+      assert gone == mover.object_id
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+
+      # exactly at the extended bound (10_000 + 15_000): still live
+      {t, [], []} = track(t, [], media_ms: 25_000)
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+
+      {t, [], events} = track(t, [], media_ms: 25_100)
+      assert [{:ended, %Track{object_id: ^id, end_reason: :unseen} = final}] = events
+      assert_self_contained(final)
+      assert Tracker.live_tracks(t) == []
+    end
+
+    # The media-time rule and the host-clock backstop are one boolean; a
+    # backstop left on the plain bound would retire this track at 10 x 3_000 of
+    # host time whatever its media-time grace said — and a frozen pts is
+    # precisely when the media-time side never expires anything.
+    test "the host-clock backstop scales with the grace too" do
+      box = [0.0, 0.0, 0.4, 0.4]
+      {t, id} = parked(box)
+
+      # pts frozen at 10_000 from here on: only host time moves. 60_001 is past
+      # the 10 x max_unseen_ms that expires a plain track (see "a frozen media
+      # clock cannot pin a track alive")
+      {t, [], []} = track(t, [], media_ms: 10_000, now_ms: 60_001)
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+
+      # 10 x (5 x 3_000) of host time: the last moment it is alive
+      {t, [], []} = track(t, [], media_ms: 10_000, now_ms: 150_000)
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+
+      {t, [], ended} = track(t, [], media_ms: 10_000, now_ms: 150_001)
+      assert [{:ended, %Track{object_id: ^id, end_reason: :unseen} = final}] = ended
+      assert_self_contained(final)
+      assert Tracker.live_tracks(t) == []
     end
   end
 
