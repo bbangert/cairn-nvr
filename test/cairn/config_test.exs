@@ -241,6 +241,300 @@ defmodule Cairn.ConfigTest do
     end
   end
 
+  describe "track/record tiers" do
+    # The wire floor is pinned below every threshold used here so that these
+    # tests exercise parsing only; the monotonic check between the floor and
+    # the tiers has its own describe block below.
+    defp with_tiers(map, tiers) do
+      update_in(map, ["cameras"], fn [a, b] ->
+        [a |> Map.put("min_score", 0.3) |> Map.merge(tiers), b]
+      end)
+    end
+
+    defp cam_a(map) do
+      assert {:ok, config, warnings} = Config.from_map(map)
+      [cam_a, _cam_b] = config.cameras
+      {cam_a, config, warnings}
+    end
+
+    test "absent blocks parse to nil and change nothing" do
+      {cam, config, []} = cam_a(base_map())
+
+      assert cam.track == nil
+      assert cam.record == nil
+      assert Config.policy(config, cam).track == nil
+      assert Config.policy(config, cam).record == nil
+    end
+
+    test "a bare number and the map form parse identically" do
+      {bare, _config, []} = cam_a(with_tiers(base_map(), %{"track" => %{"person" => 0.4}}))
+
+      {mapped, _config, []} =
+        cam_a(with_tiers(base_map(), %{"track" => %{"person" => %{"min_score" => 0.4}}}))
+
+      assert bare.track == %{"person" => %{min_score: 0.4}}
+      assert bare.track == mapped.track
+    end
+
+    test "both tiers parse, integers are floats, and no default is injected" do
+      {cam, _config, []} =
+        cam_a(
+          with_tiers(base_map(), %{
+            "track" => %{"person" => 0.4, "cat" => %{"min_score" => 0.5}},
+            "record" => %{"person" => 0.6, "dog" => 1}
+          })
+        )
+
+      assert cam.track == %{"person" => %{min_score: 0.4}, "cat" => %{min_score: 0.5}}
+      assert cam.record == %{"person" => %{min_score: 0.6}, "dog" => %{min_score: 1.0}}
+      refute Map.has_key?(cam.track, "default")
+      refute Map.has_key?(cam.record, "default")
+    end
+
+    test "a default: key is honoured like min_score's" do
+      {cam, _config, []} =
+        cam_a(with_tiers(base_map(), %{"track" => %{"default" => 0.3, "person" => 0.4}}))
+
+      assert cam.track == %{"default" => %{min_score: 0.3}, "person" => %{min_score: 0.4}}
+    end
+
+    test "the tier keys are known keys, so they warn about nothing" do
+      {_cam, _config, warnings} =
+        cam_a(with_tiers(base_map(), %{"track" => %{"person" => 0.4}, "record" => %{}}))
+
+      assert warnings == []
+    end
+
+    test "a non-map block is an error" do
+      assert {:error, errors} = Config.from_map(with_tiers(base_map(), %{"track" => 0.4}))
+      assert Enum.any?(errors, &(&1 =~ "camera cam_a: track must be a mapping of label"))
+
+      assert {:error, errors} = Config.from_map(with_tiers(base_map(), %{"record" => ["person"]}))
+      assert Enum.any?(errors, &(&1 =~ "camera cam_a: record must be a mapping of label"))
+    end
+
+    test "bad label values are one error naming every offending label" do
+      map =
+        with_tiers(base_map(), %{
+          "track" => %{"person" => 1.5, "cat" => "yes", "dog" => 0.4, "bird" => %{}}
+        })
+
+      assert {:error, errors} = Config.from_map(map)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~
+                   "camera cam_a: track values must be a number or a map of " <>
+                     "{min_score: 0..1} (bird, cat, person)")
+             )
+    end
+
+    test "an out-of-range score inside the map form is caught like the sugar form" do
+      map = with_tiers(base_map(), %{"record" => %{"person" => %{"min_score" => 1.5}}})
+
+      assert {:error, errors} = Config.from_map(map)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~
+                   "camera cam_a: record values must be a number or a map of " <>
+                     "{min_score: 0..1} (person)")
+             )
+    end
+
+    test "a rule map with a key this version does not implement is an error" do
+      map = with_tiers(base_map(), %{"record" => %{"person" => %{"min_area" => 100}}})
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "camera cam_a: record values must be"))
+    end
+  end
+
+  describe "tier monotonicity" do
+    defp put_cam_a(map, fields) do
+      update_in(map, ["cameras"], fn [a, b] -> [Map.merge(a, fields), b] end)
+    end
+
+    test "a track threshold under the wire floor is an error naming camera and label" do
+      map =
+        put_cam_a(base_map(), %{
+          "min_score" => %{"person" => 0.7},
+          "track" => %{"person" => 0.4}
+        })
+
+      assert {:error, errors} = Config.from_map(map)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "camera cam_a: track.person (0.4) must be >= min_score.person (0.7)")
+             )
+    end
+
+    test "a record threshold under its own track threshold is an error" do
+      map =
+        put_cam_a(base_map(), %{
+          "track" => %{"person" => 0.6},
+          "record" => %{"person" => 0.5}
+        })
+
+      assert {:error, errors} = Config.from_map(map)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "camera cam_a: record.person (0.5) must be >= track.person (0.6)")
+             )
+    end
+
+    test "the default chains are compared too, on both sides" do
+      map =
+        put_cam_a(base_map(), %{
+          "min_score" => %{"default" => 0.6},
+          "record" => %{"default" => 0.5}
+        })
+
+      assert {:error, errors} = Config.from_map(map)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "camera cam_a: record.default (0.5) must be >= min_score.default (0.6)")
+             )
+
+      # a per-label floor against the tier's catch-all: "person" is only in
+      # min_score, and record resolves it through its own default.
+      map =
+        put_cam_a(base_map(), %{
+          "min_score" => %{"person" => 0.8},
+          "record" => %{"default" => 0.7}
+        })
+
+      assert {:error, errors} = Config.from_map(map)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "camera cam_a: record.person (0.7) must be >= min_score.person (0.8)")
+             )
+    end
+
+    test "the track pair is compared across the default chains too" do
+      map =
+        put_cam_a(base_map(), %{
+          "min_score" => %{"default" => 0.4, "person" => 0.7},
+          "track" => %{"default" => 0.5}
+        })
+
+      assert {:error, errors} = Config.from_map(map)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "camera cam_a: track.person (0.5) must be >= min_score.person (0.7)")
+             )
+    end
+
+    test "equal thresholds pass: the rule is >=, not >" do
+      # record == track for "person"; the 0.6 band is both logged and filmed.
+      assert {:ok, _config, []} =
+               base_map()
+               |> put_cam_a(%{
+                 "min_score" => %{"default" => 0.4},
+                 "track" => %{"person" => 0.6},
+                 "record" => %{"person" => 0.6}
+               })
+               |> Config.from_map()
+
+      # track == min_score for "person": the tier admits the whole band the
+      # plugin emits for that label, which is the natural way to write it.
+      assert {:ok, _config, []} =
+               base_map()
+               |> put_cam_a(%{
+                 "min_score" => %{"default" => 0.4, "person" => 0.5},
+                 "track" => %{"person" => 0.5}
+               })
+               |> Config.from_map()
+    end
+
+    test "a label a tier excludes imposes no constraint" do
+      map =
+        put_cam_a(base_map(), %{
+          "min_score" => %{"default" => 0.5, "person" => 0.7},
+          # No tier default, so "person" is in neither tier and its 0.7 floor
+          # constrains nothing; "cat" is constrained by the 0.5 default floor.
+          "track" => %{"cat" => 0.5},
+          "record" => %{"cat" => 0.6}
+        })
+
+      assert {:ok, _config, []} = Config.from_map(map)
+    end
+
+    test "an absent tier reports the violation once, against min_score" do
+      map = put_cam_a(base_map(), %{"min_score" => 0.6, "record" => %{"default" => 0.4}})
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.filter(errors, &(&1 =~ "record.default")) |> length() == 1
+      assert Enum.any?(errors, &(&1 =~ "must be >= min_score.default (0.6)"))
+    end
+
+    test "a per-camera tier is validated against that camera's own min_score" do
+      map =
+        base_map()
+        |> put_cam_a(%{"min_score" => %{"default" => 0.2}, "track" => %{"person" => 0.3}})
+        |> update_in(["cameras"], fn [a, b] ->
+          [a, Map.merge(b, %{"min_score" => %{"default" => 0.9}, "track" => %{"person" => 0.3}})]
+        end)
+
+      assert {:error, errors} = Config.from_map(map)
+      refute Enum.any?(errors, &(&1 =~ "camera cam_a"))
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "camera cam_b: track.person (0.3) must be >= min_score.person (0.9)")
+             )
+    end
+
+    test "the ordering that Phases 6 and 7 rely on is accepted end to end" do
+      map =
+        put_cam_a(base_map(), %{
+          "min_score" => %{"default" => 0.4},
+          "track" => %{"person" => 0.4, "cat" => 0.5},
+          "record" => %{"person" => 0.6}
+        })
+
+      assert {:ok, _config, []} = Config.from_map(map)
+    end
+  end
+
+  describe "tier_threshold/3" do
+    @min_score %{"default" => 0.5, "person" => 0.7}
+
+    test "an absent tier falls back to the wire floor for the label" do
+      assert Config.tier_threshold(nil, "person", @min_score) == 0.7
+      assert Config.tier_threshold(nil, "cat", @min_score) == 0.5
+    end
+
+    test "a present tier excludes labels it does not list" do
+      rules = %{"person" => %{min_score: 0.8}}
+
+      assert Config.tier_threshold(rules, "person", @min_score) == 0.8
+      assert Config.tier_threshold(rules, "cat", @min_score) == :excluded
+    end
+
+    test "an empty tier excludes everything" do
+      assert Config.tier_threshold(%{}, "person", @min_score) == :excluded
+    end
+
+    test "the tier's own default catches unlisted labels" do
+      rules = %{"default" => %{min_score: 0.6}}
+
+      assert Config.tier_threshold(rules, "cat", @min_score) == 0.6
+    end
+
+    test "an explicit label wins over the tier default" do
+      rules = %{"default" => %{min_score: 0.6}, "person" => %{min_score: 0.9}}
+
+      assert Config.tier_threshold(rules, "person", @min_score) == 0.9
+      assert Config.tier_threshold(rules, "cat", @min_score) == 0.6
+    end
+  end
+
   describe "plugin groups" do
     defp with_plugins(map, plugins), do: Map.put(map, "plugins", plugins)
 
@@ -428,7 +722,9 @@ defmodule Cairn.ConfigTest do
                max: 300,
                max_unseen_ms: 800,
                max_live_tracks: 128,
-               stationary_after_ms: 10_000
+               stationary_after_ms: 10_000,
+               track: nil,
+               record: nil
              }
     end
 

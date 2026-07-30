@@ -14,7 +14,8 @@ defmodule Cairn.PluginGroupPort do
   `Cairn.PluginProtocol.decode_line/2` (protocol v1 or the v0
   `{"camera_id", "pts", "dets"}` shape) it is routed as a
   `Cairn.Observation` to `Cairn.DetectionAggregator` with that camera's
-  config and effective policy (event windows + tracking). Lines for an unknown
+  config and effective policy (event windows, tracking bounds and the
+  `track:` / `record:` tiers). Lines for an unknown
   or missing camera are dropped, as are malformed ones, observations from a
   stale stream epoch and
   individual detections `Cairn.PluginProtocol` rejects — counted always,

@@ -88,9 +88,39 @@ cameras: []
 #    # An inline command of one token must therefore be a one-element list.
 #    # Receives RTP on an assigned UDP port, prints ndjson detections on stdout.
 #    plugin: ["plugins/cairn-detect/target/release/cairn-detect"]
+#    # Three levels of threshold, per label. Each answers a different
+#    # question, and they must not fight: `record` >= `track` >= `min_score`
+#    # for every label all three resolve, or the config is rejected.
+#    #
+#    #   min_score  does the plugin emit the detection at all — the wire
+#    #              floor. It reaches the plugin process as argv, so the host
+#    #              never sees anything below it and changing it restarts the
+#    #              camera. A label under this floor is invisible, which is
+#    #              why a `record` below it could only ever fire zero times.
+#    #   track      does the detection earn a row in the track log.
+#    #   record     does the detection trigger video.
+#    #
+#    # With the three blocks below: everything above 0.4 reaches the host;
+#    # people at 0.4 and cats at 0.5 get track rows; only people, and only at
+#    # 0.6, ever start a recording. So cats are logged but never filmed, and
+#    # every other COCO class is neither logged nor filmed.
 #    min_score:
-#      default: 0.5
-#      person: 0.6
+#      default: 0.4
+#      person: 0.4
+#    track:
+#      person: 0.4
+#      cat: 0.5
+#    record:
+#      # A bare number is shorthand for `{min_score: n}`. The map form is
+#      # where per-label filters (area, aspect, zones) will be added, so
+#      # writing it today costs nothing and migrates to nothing.
+#      person:
+#        min_score: 0.6
+#    # Omitting `track:` or `record:` entirely is exactly today's behaviour:
+#    # everything above `min_score` is tracked and everything above it
+#    # records. Once a block is present it is a whitelist — a label with no
+#    # entry of its own and no `default:` entry is excluded from that tier.
+#    # Add `default: 0.5` inside a block to keep a catch-all.
 #    extra_ffmpeg_args: []
 #    # Opt-in hardware transcode for non-H.264 cameras (v4l2m2m only).
 #    transcode: false

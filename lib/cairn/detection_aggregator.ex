@@ -83,9 +83,9 @@ defmodule Cairn.DetectionAggregator do
   @doc """
   Called by the plugin ports with a decoded, config-tagged observation.
 
-  `policy` is `Cairn.Config.policy/2` for the camera: the event windows and
-  the track expiry, resolved at the port so this per-frame path never calls
-  the config server.
+  `policy` is `Cairn.Config.policy/2` for the camera: the event windows, the
+  tracking bounds and the host-side `track:` / `record:` tiers, resolved at
+  the port so this per-frame path never calls the config server.
   """
   @spec detections(GenServer.server(), Cairn.Config.Camera.t(), map(), Observation.t()) :: :ok
   def detections(server \\ __MODULE__, camera, policy, %Observation{} = observation) do

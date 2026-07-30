@@ -3,7 +3,18 @@ defmodule Cairn.Config.Camera do
   Per-camera configuration parsed from the `cameras:` list in the YAML file.
 
   `min_score` is a map of label => minimum detection score, with a
-  `"default"` key applied to labels not listed.
+  `"default"` key applied to labels not listed. It is the **wire floor**: it
+  reaches the plugin subprocess as argv, the plugin drops everything below it,
+  and changing it restarts the camera.
+
+  `track` and `record` are the two host-side tiers layered on that floor —
+  which detections earn a database row, and which earn video. Each is a
+  per-label map of rules (`%{min_score: float}`) or `nil` when the block is
+  absent. Absent means today's behaviour: everything above `min_score`
+  qualifies. In a *present* tier a label with no rule of its own and no
+  `"default"` rule is excluded from that tier — which is why, unlike
+  `min_score`, no `"default"` is invented here. `Cairn.Config.tier_threshold/3`
+  is where that distinction is spelled out; nothing else should re-derive it.
 
   The window seconds, `max_unseen_ms`, `max_live_tracks` and
   `stationary_after_ms` are overrides:
@@ -22,14 +33,18 @@ defmodule Cairn.Config.Camera do
 
   alias Cairn.Config
 
-  @known_keys ~w(id rtsp_url plugin min_score extra_ffmpeg_args transcode retention
+  @known_keys ~w(id rtsp_url plugin min_score track record extra_ffmpeg_args transcode retention
                  pre_window_seconds post_window_seconds max_event_seconds max_unseen_ms
                  max_live_tracks stationary_after_ms)
+
+  @default_min_score %{"default" => 0.5}
 
   defstruct id: nil,
             rtsp_url: nil,
             plugin: nil,
-            min_score: %{"default" => 0.5},
+            min_score: @default_min_score,
+            track: nil,
+            record: nil,
             extra_ffmpeg_args: [],
             transcode: false,
             retention_days: nil,
@@ -42,6 +57,13 @@ defmodule Cairn.Config.Camera do
             stationary_after_ms: nil
 
   @type t :: %__MODULE__{}
+
+  @typedoc """
+  One parsed tier: label => rule. A rule is a map, not a bare number, so that
+  per-label area, aspect and zone filters can join `:min_score` inside it later
+  without changing the config shape; `:min_score` is the only key today.
+  """
+  @type tier :: %{optional(String.t()) => %{min_score: float()}}
 
   @doc false
   @spec parse(term(), non_neg_integer(), map()) :: {t() | nil, map()}
@@ -68,6 +90,8 @@ defmodule Cairn.Config.Camera do
 
   defp build(raw, id, rtsp_url, acc) do
     {min_score, acc} = parse_min_score(Map.get(raw, "min_score"), id, acc)
+    {track, acc} = parse_tier(Map.get(raw, "track"), id, "track", acc)
+    {record, acc} = parse_tier(Map.get(raw, "record"), id, "record", acc)
     {plugin, acc} = parse_plugin(Map.get(raw, "plugin"), id, acc)
     {extra_args, acc} = parse_extra_args(Map.get(raw, "extra_ffmpeg_args"), id, acc)
 
@@ -76,6 +100,8 @@ defmodule Cairn.Config.Camera do
       rtsp_url: rtsp_url,
       plugin: plugin,
       min_score: min_score,
+      track: track,
+      record: record,
       extra_ffmpeg_args: extra_args,
       transcode: Map.get(raw, "transcode", false) == true,
       retention_days: get_in(raw, ["retention", "days"]),
@@ -91,38 +117,100 @@ defmodule Cairn.Config.Camera do
     {cam, acc}
   end
 
-  defp parse_min_score(nil, _id, acc), do: {%{"default" => 0.5}, acc}
+  defp parse_min_score(nil, _id, acc), do: {@default_min_score, acc}
 
+  # A bare number is the block's `"default"`; routing it through the map clause
+  # keeps one validation path and one error message.
   defp parse_min_score(score, id, acc) when is_number(score) do
-    validate_scores(%{"default" => score / 1}, id, acc)
+    parse_min_score(%{"default" => score}, id, acc)
   end
 
   defp parse_min_score(scores, id, acc) when is_map(scores) do
-    scores
-    |> Map.new(fn {label, score} -> {to_string(label), score} end)
-    |> Map.put_new("default", 0.5)
-    |> validate_scores(id, acc)
-  end
+    case label_rules(scores, &min_score_rule/1) do
+      {:ok, rules} ->
+        # A catch-all is invented here and nowhere else: without one, a label
+        # the operator did not list would have no wire floor at all.
+        {Map.merge(@default_min_score, rules), acc}
 
-  defp parse_min_score(_other, id, acc) do
-    {%{"default" => 0.5}, add_error(acc, "camera #{id}: min_score must be a number or map")}
-  end
-
-  defp validate_scores(scores, id, acc) do
-    bad = for {label, s} <- scores, not (is_number(s) and s >= 0 and s <= 1), do: label
-
-    case bad do
-      [] ->
-        {Map.new(scores, fn {label, s} -> {label, s / 1} end), acc}
-
-      labels ->
-        {scores,
+      {:error, labels} ->
+        {@default_min_score,
          add_error(
            acc,
            "camera #{id}: min_score values must be 0..1 (#{Enum.join(labels, ", ")})"
          )}
     end
   end
+
+  defp parse_min_score(_other, id, acc) do
+    {@default_min_score, add_error(acc, "camera #{id}: min_score must be a number or map")}
+  end
+
+  # The `track:` / `record:` tiers. Unlike `min_score`: an absent block is
+  # `nil` rather than a default map; the block itself must be a mapping (a bare
+  # number would have to mean "default", and an accidental catch-all is what
+  # these tiers exist to avoid); each rule is a map rather than a bare score;
+  # and no `"default"` is injected — see the moduledoc on why an absent default
+  # has to keep meaning "nothing else qualifies".
+  defp parse_tier(nil, _id, _key, acc), do: {nil, acc}
+
+  defp parse_tier(block, id, key, acc) when is_map(block) do
+    case label_rules(block, &tier_rule/1) do
+      {:ok, rules} ->
+        {rules, acc}
+
+      {:error, labels} ->
+        {nil,
+         add_error(
+           acc,
+           "camera #{id}: #{key} values must be a number or a map of {min_score: 0..1} " <>
+             "(#{Enum.join(labels, ", ")})"
+         )}
+    end
+  end
+
+  defp parse_tier(_other, id, key, acc) do
+    {nil, add_error(acc, "camera #{id}: #{key} must be a mapping of label to threshold")}
+  end
+
+  # Shared by `min_score` and both tiers: stringify every label, run `extract`
+  # over every value, and name every label that failed in a single error. What
+  # differs between the callers — what `extract` accepts, the shape of a parsed
+  # rule, and what happens to a missing `"default"` — stays in the wrappers.
+  defp label_rules(block, extract) do
+    parsed = Map.new(block, fn {label, value} -> {to_string(label), extract.(value)} end)
+
+    case Enum.sort(for {label, :error} <- parsed, do: label) do
+      [] -> {:ok, Map.new(parsed, fn {label, {:ok, rule}} -> {label, rule} end)}
+      labels -> {:error, labels}
+    end
+  end
+
+  defp min_score_rule(score) when is_number(score) and score >= 0 and score <= 1,
+    do: {:ok, score / 1}
+
+  defp min_score_rule(_other), do: :error
+
+  # A bare number is sugar for the map form, which is where per-label filters
+  # beyond a score will be added.
+  defp tier_rule(score) when is_number(score), do: tier_rule(%{"min_score" => score})
+
+  defp tier_rule(rule) when is_map(rule) do
+    # Unknown keys are an error rather than the warning unknown keys get
+    # elsewhere: a filter this file does not implement yet must not look
+    # applied. The set grows as the filters land.
+    case Map.new(rule, fn {key, value} -> {to_string(key), value} end) do
+      %{"min_score" => score} = normalized when map_size(normalized) == 1 ->
+        case min_score_rule(score) do
+          {:ok, score} -> {:ok, %{min_score: score}}
+          :error -> :error
+        end
+
+      _other ->
+        :error
+    end
+  end
+
+  defp tier_rule(_other), do: :error
 
   defp parse_plugin(nil, _id, acc), do: {nil, acc}
 
