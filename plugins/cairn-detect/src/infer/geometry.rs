@@ -268,7 +268,7 @@ pub struct Projection {
 
 impl Projection {
     /// Model pixels -> the same box normalized 0..1 against the original
-    /// frame. Not clamped: `det_from` does that.
+    /// frame. Not clamped: `wire_bbox`, on the way to the wire, does that.
     ///
     /// The sole constructor of a [`NormBox`], which is what makes skipping
     /// this call fail to compile rather than silently report model-space
@@ -438,7 +438,7 @@ mod tests {
         assert!((back.x2 - 1.0).abs() < 1e-9, "{back:?}");
         assert!((back.y2 - 1.0).abs() < 1e-9, "{back:?}");
         // A box down in the padding un-projects past the bottom of the frame,
-        // which `det_from` clamps away rather than reporting as content.
+        // which `wire_bbox` clamps away rather than reporting as content.
         assert!(
             projection
                 .unproject(model_box(0.0, 300.0, 10.0, 320.0))
@@ -487,7 +487,7 @@ mod tests {
             }
         );
         // Rows 0..91 are the pad *above* the content, so they read back above
-        // the top of the frame, which `det_from`'s clamp then cuts away. That
+        // the top of the frame, which `wire_bbox`'s clamp then cuts away. That
         // sign is the difference the offset makes: with the padding all
         // bottom-right, no model row inside the input rectangle un-projects to a
         // negative `y` at all.
@@ -590,7 +590,7 @@ mod tests {
             .corners();
         assert!((whole.y2 - 3.2).abs() < 1e-9, "{whole:?}");
         // ...and a corner outside the rectangle keeps its sign on both axes,
-        // which is what `det_from`'s clamp then cuts away.
+        // which is what `wire_bbox`'s clamp then cuts away.
         let outside = projection
             .unproject(model_box(-8.0, -8.0, 8.0, 8.0))
             .corners();
