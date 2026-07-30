@@ -278,7 +278,7 @@ fn model_summary(args: &Args, detector: &Detector) -> String {
     let spec = detector.input_spec();
     format!(
         "model={} profile={} input={} input size={} ({}) encoding={} resize={} layout={} \
-         decoder={}",
+         score={} decoder={}",
         args.model.display(),
         detector.profile(),
         detector.input_name(),
@@ -287,6 +287,10 @@ fn model_summary(args: &Args, detector: &Detector) -> String {
         spec.encoding,
         spec.resize,
         detector.layout_summary(),
+        // Not deferred the way the layout's `nc` can be: `resolve::fit_output`
+        // rewrites only `layout` and keeps the rest of the profile's
+        // `OutputSpec`, so the composition is settled before any frame arrives.
+        detector.profile().output.score,
         args.decoder
     )
 }
