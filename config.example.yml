@@ -89,8 +89,14 @@ cameras: []
 #    # Receives RTP on an assigned UDP port, prints ndjson detections on stdout.
 #    plugin: ["plugins/cairn-detect/target/release/cairn-detect"]
 #    # Three levels of threshold, per label. Each answers a different
-#    # question, and they must not fight: `record` >= `track` >= `min_score`
-#    # for every label all three resolve, or the config is rejected.
+#    # question, and they must not fight: effective `record` >= `track` >=
+#    # `min_score` for every label, or the config is rejected. "Effective"
+#    # is what an omitted `record:` block resolves to — the wire floor, since
+#    # without it everything above `min_score` records — so raising `track:`
+#    # above that floor with no `record:` block is rejected as well: it would
+#    # leave a band that films but is never written down. A label a *present*
+#    # `record:` block leaves out is fine; that is rows without video, which
+#    # is what these tiers are for.
 #    #
 #    #   min_score  does the plugin emit the detection at all — the wire
 #    #              floor. It reaches the plugin process as argv, so the host
@@ -120,7 +126,8 @@ cameras: []
 #    # everything above `min_score` is tracked and everything above it
 #    # records. Once a block is present it is a whitelist — a label with no
 #    # entry of its own and no `default:` entry is excluded from that tier.
-#    # Add `default: 0.5` inside a block to keep a catch-all.
+#    # Add `default: 0.5` inside a block to keep a catch-all. Raising `track:`
+#    # is therefore a two-block edit: a `record:` block has to say what films.
 #    extra_ffmpeg_args: []
 #    # Opt-in hardware transcode for non-H.264 cameras (v4l2m2m only).
 #    transcode: false

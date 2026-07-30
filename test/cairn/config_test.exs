@@ -242,13 +242,17 @@ defmodule Cairn.ConfigTest do
   end
 
   describe "track/record tiers" do
-    # The wire floor is pinned below every threshold used here so that these
-    # tests exercise parsing only; the monotonic check between the floor and
-    # the tiers has its own describe block below.
+    # A wire floor below every threshold used here, plus a catch-all record
+    # rule above them unless the case supplies its own: a `track:` above the
+    # floor with no `record:` block is a monotonicity error, and monotonicity
+    # has its own describe block below. These cases are about parsing.
     defp with_tiers(map, tiers) do
-      update_in(map, ["cameras"], fn [a, b] ->
-        [a |> Map.put("min_score", 0.3) |> Map.merge(tiers), b]
-      end)
+      fields =
+        %{"min_score" => 0.3}
+        |> Map.merge(tiers)
+        |> Map.put_new("record", %{"default" => 1.0})
+
+      update_in(map, ["cameras"], fn [a, b] -> [Map.merge(a, fields), b] end)
     end
 
     defp cam_a(map) do
@@ -419,7 +423,10 @@ defmodule Cairn.ConfigTest do
       map =
         put_cam_a(base_map(), %{
           "min_score" => %{"default" => 0.4, "person" => 0.7},
-          "track" => %{"default" => 0.5}
+          "track" => %{"default" => 0.5},
+          # a record catch-all above both, so the only rule this case can
+          # violate is track-vs-min_score
+          "record" => %{"default" => 1.0}
         })
 
       assert {:error, errors} = Config.from_map(map)
@@ -430,14 +437,57 @@ defmodule Cairn.ConfigTest do
              )
     end
 
+    test "a track above the wire floor with no record: block is an error" do
+      map =
+        put_cam_a(base_map(), %{
+          "min_score" => %{"default" => 0.4},
+          "track" => %{"person" => 0.6}
+        })
+
+      assert {:error, errors} = Config.from_map(map)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~
+                   "camera cam_a: track.person (0.6) must be <= the effective record " <>
+                     "threshold (0.4) — with no record: block video falls back to min_score, " <>
+                     "so a clip could exist with no track row. Give person a record: rule, " <>
+                     "or lower track.person")
+             )
+    end
+
+    test "a present record: block that excludes the label imposes nothing" do
+      # tracking without video is the tier working, not a gap: an empty but
+      # present record: block means nothing records at all.
+      map =
+        put_cam_a(base_map(), %{
+          "min_score" => %{"default" => 0.4},
+          "track" => %{"person" => 0.6},
+          "record" => %{}
+        })
+
+      assert {:ok, _config, []} = Config.from_map(map)
+    end
+
+    test "a record rule at the track threshold closes the gap" do
+      map =
+        put_cam_a(base_map(), %{
+          "min_score" => %{"default" => 0.4},
+          "track" => %{"person" => 0.6},
+          "record" => %{"person" => 0.6}
+        })
+
+      assert {:ok, _config, []} = Config.from_map(map)
+    end
+
     test "equal thresholds pass: the rule is >=, not >" do
-      # record == track for "person"; the 0.6 band is both logged and filmed.
+      # record == track for "person": the 0.7 band is both logged and filmed.
       assert {:ok, _config, []} =
                base_map()
                |> put_cam_a(%{
                  "min_score" => %{"default" => 0.4},
-                 "track" => %{"person" => 0.6},
-                 "record" => %{"person" => 0.6}
+                 "track" => %{"person" => 0.7},
+                 "record" => %{"person" => 0.7}
                })
                |> Config.from_map()
 
@@ -476,7 +526,13 @@ defmodule Cairn.ConfigTest do
     test "a per-camera tier is validated against that camera's own min_score" do
       map =
         base_map()
-        |> put_cam_a(%{"min_score" => %{"default" => 0.2}, "track" => %{"person" => 0.3}})
+        |> put_cam_a(%{
+          "min_score" => %{"default" => 0.2},
+          "track" => %{"person" => 0.3},
+          # cam_a's track sits above its own floor, so it needs a record rule
+          # to stay legal; cam_b's sits below its floor and needs none.
+          "record" => %{"person" => 0.3}
+        })
         |> update_in(["cameras"], fn [a, b] ->
           [a, Map.merge(b, %{"min_score" => %{"default" => 0.9}, "track" => %{"person" => 0.3}})]
         end)

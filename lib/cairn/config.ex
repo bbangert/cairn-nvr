@@ -237,6 +237,11 @@ defmodule Cairn.Config do
   load time, because the plugin never emits that band and the rule could only
   ever fire zero times. A runtime override (`Cairn.CameraControl`'s
   `min_score`) goes through no such validation and can sit above a tier.
+
+  Between the two tiers, validation leaves one invariant worth relying on: for
+  a given label the `record` answer is never a number below the `track`
+  answer. Either it is higher, or `record` returned `:excluded` because a
+  present `record:` block left the label out — the rows-without-video case.
   """
   @spec tier_threshold(Camera.tier() | nil, String.t(), %{optional(String.t()) => float()}) ::
           float() | :excluded
@@ -497,13 +502,19 @@ defmodule Cairn.Config do
     end)
   end
 
-  # Per label, `record >= track >= min_score` wherever a tier resolves that
-  # label to a number. A tier below the wire floor can never fire — the plugin
-  # drops that band and the host never sees it — so a `record.person` of 0.6
-  # under a `min_score.person` of 0.7 is a rule that silently records nothing.
-  # The check runs over the union of labels across all three maps, each
-  # resolved through its own default chain, so a tier's catch-all `default:`
-  # under a per-label floor is caught as well.
+  # Per label, effective `record >= track >= min_score`. A tier below the wire
+  # floor can never fire — the plugin drops that band and the host never sees
+  # it — so a `record.person` of 0.6 under a `min_score.person` of 0.7 is a
+  # rule that silently records nothing. The check runs over the union of labels
+  # across all three maps, each resolved through its own default chain, so a
+  # tier's catch-all `default:` under a per-label floor is caught as well.
+  #
+  # "Effective" is what makes the record side asymmetric: an absent `record:`
+  # block resolves to the wire floor rather than to nothing, because absent
+  # means everything the plugin emits records. A `track:` raised above that
+  # floor with no `record:` block therefore leaves a band that films but is
+  # never written down. A *present* block that excludes the label is the
+  # opposite case and imposes nothing: rows without video is the tier working.
   defp validate_tiers(acc, config) do
     Enum.reduce(config.cameras, acc, &validate_camera_tiers(&2, &1))
   end
@@ -517,8 +528,27 @@ defmodule Cairn.Config do
       acc
       |> check_tier_order(cam.id, label, {"track", track}, {"min_score", wire})
       |> check_tier_order(cam.id, label, {"record", record}, {"min_score", wire})
-      |> check_tier_order(cam.id, label, {"record", record}, {"track", track})
+      |> check_record_covers_track(cam.id, label, track, cam.record, record, wire)
     end)
+  end
+
+  # With no `record:` block the effective record threshold is the wire floor,
+  # and `track` above it is the gap: video for a detection whose track row is
+  # gated out. There is no `record:` key to point the operator at, so the
+  # message has to carry the implication.
+  defp check_record_covers_track(acc, id, label, track, nil = _rules, _record, wire)
+       when is_number(track) do
+    check(
+      acc,
+      wire >= track,
+      "camera #{id}: track.#{label} (#{track}) must be <= the effective record threshold " <>
+        "(#{wire}) — with no record: block video falls back to min_score, so a clip could " <>
+        "exist with no track row. Give #{label} a record: rule, or lower track.#{label}"
+    )
+  end
+
+  defp check_record_covers_track(acc, id, label, track, _rules, record, _wire) do
+    check_tier_order(acc, id, label, {"record", record}, {"track", track})
   end
 
   # "default" is deliberately left in the union: resolving it through every
@@ -531,9 +561,10 @@ defmodule Cairn.Config do
   end
 
   # `nil` where the block is absent, rather than the wire floor
-  # `tier_threshold/3` falls back to: an absent block constrains nothing, and
-  # returning the floor here would report the same violation twice — once
-  # against `min_score` and once against a tier that is only echoing it.
+  # `tier_threshold/3` falls back to: against `min_score` an absent block only
+  # echoes the floor, so resolving it here would report one violation twice.
+  # `check_record_covers_track/7` is the one pairing that does want the floor,
+  # and resolves it there.
   defp own_threshold(nil, _label, _min_score), do: nil
   defp own_threshold(rules, label, min_score), do: tier_threshold(rules, label, min_score)
 
