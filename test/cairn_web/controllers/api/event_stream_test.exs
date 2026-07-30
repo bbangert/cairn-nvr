@@ -185,11 +185,30 @@ defmodule CairnWeb.Api.EventStreamTest do
       assert frame =~ ~s("source":"plugin")
       assert frame =~ ~s("plugin_track_id":"t1")
       assert frame =~ ~s("stale_predicted":false)
+      assert frame =~ ~s("stationary":false)
+      assert frame =~ ~s("stationary_since":null)
+      assert frame =~ ~s("stationary_ms":0)
       assert frame =~ ~s("end_reason":null)
       assert String.ends_with?(frame, "\n\n")
 
       assert {:ok, updated} = SSE.frame_for({:track_updated, track()})
       assert updated =~ "event: track_updated\n"
+    end
+
+    # The frame a parked object's transition rides out on: the aggregator gates
+    # event evidence on this flag, so a client has to be able to see it.
+    test "a stationary track carries the flip and the time it has accrued" do
+      parked = %{
+        track()
+        | stationary: true,
+          stationary_since: ~U[2026-07-24 00:00:01Z],
+          stationary_ms: 4_000
+      }
+
+      assert {:ok, frame} = SSE.frame_for({:track_updated, parked})
+      assert frame =~ ~s("stationary":true)
+      assert frame =~ ~s("stationary_since":"2026-07-24T00:00:01Z")
+      assert frame =~ ~s("stationary_ms":4000)
     end
 
     # ONVIF AN §A.10: the final summary stands on its own — a client that

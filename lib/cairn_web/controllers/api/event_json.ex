@@ -72,6 +72,9 @@ defmodule CairnWeb.Api.EventJSON do
       last_seen_at: t.last_seen_at,
       last_detected_at: t.last_detected_at,
       stale_predicted: t.stale_predicted,
+      stationary: t.stationary,
+      stationary_since: t.stationary_since,
+      stationary_ms: t.stationary_ms,
       end_reason: t.end_reason
     }
   end
