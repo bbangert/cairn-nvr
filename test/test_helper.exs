@@ -5,6 +5,11 @@ File.rm_rf!("tmp/cairn_test_data/events")
 File.rm_rf!("tmp/cairn_test_data/snapshots")
 Cairn.DataDir.ensure!("tmp/cairn_test_data")
 Cairn.Repo.delete_all(Cairn.Events.Event)
+# Child first so this cleanup works whatever the cascade or the connection's
+# `PRAGMA foreign_keys` happens to be — no order here can raise (deleting
+# parents first would just cascade), but only this one depends on neither.
+Cairn.Repo.delete_all(Cairn.Tracks.TrackEvent)
+Cairn.Repo.delete_all(Cairn.Tracks.Track)
 
 # The full-pipeline integration test needs ffmpeg + several seconds of
 # realtime streaming; run it explicitly with: mix test --include integration
