@@ -88,7 +88,12 @@ defmodule Cairn.TrackRecorder do
   end
 
   @doc """
-  Buffers a finished track, to be written with `event_id` (nil = not recorded).
+  Buffers a finished track, to be written as a row linked to `event_id`.
+
+  `nil` means the track ended with no event open — the row is still written,
+  and its nil `event_id` is exactly what `Cairn.Tracks.list(recorded: false)`
+  reads as "seen but never in a clip". Whether a no-event track gets a row at
+  all is the caller's gate, not this module's.
 
   `track` is the runtime `%Cairn.Track{}` final summary — the same struct the
   aggregator broadcasts as `track_ended`.
@@ -338,7 +343,9 @@ defmodule Cairn.TrackRecorder do
       stationary_since: track.stationary_since,
       stationary_ms: track.stationary_ms,
       # Nil when the `:appeared` moment is absent: the track started before
-      # this process did, or its moment lost the per-track cap.
+      # this process did, or its whole moment buffer was swept as an orphan
+      # before the final arrived. Never the per-track cap — that keeps the
+      # earliest moments, and `:appeared` is always first.
       entry_bbox: entry_bbox(moments),
       exit_bbox: track.bbox,
       # Schema-reserved and left nil here: `%Cairn.Track{}` carries
