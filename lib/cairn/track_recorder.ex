@@ -31,8 +31,8 @@ defmodule Cairn.TrackRecorder do
   it is skipped on a brutal kill and when the VM dies, which are the cases that
   lose data, so a flush there would cover only the orderly stop while reading
   as a guarantee that the crash is covered too. The modules here that do define
-  one — `Cairn.FfmpegPort`, `Cairn.PluginPort`, `Cairn.PluginGroupPort` — use
-  it to reap an OS process, and `Cairn.FfmpegPort`'s own comment says the same
+  one — `Cairn.FFmpegPort`, `Cairn.PluginPort`, `Cairn.PluginGroupPort` — use
+  it to reap an OS process, and `Cairn.FFmpegPort`'s own comment says the same
   thing about how far it reaches. This is a reviewed decision, not an omission.
 
   `init/1` deliberately does no Repo work, not even an empty flush: in

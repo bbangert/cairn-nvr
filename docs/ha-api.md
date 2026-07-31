@@ -271,8 +271,10 @@ Same schema for all three kinds:
 - `track_ended` — **self-contained**: everything above is filled in, so a
   client that missed every other frame still learns what the track was.
   `end_reason` is one of `unseen` (not seen for the configured
-  `tracking.max_unseen_ms` of stream time, or ten times that of *host* time —
-  the backstop for a plugin whose stream clock stops moving), `plugin_ended`
+  `tracking.max_unseen_ms` of stream time — five times that while the track is
+  `stationary`, which is what lets a parked object ride out an occlusion — or
+  ten times whichever of those two bounds applies, of *host* time, the
+  backstop for a plugin whose stream clock stops moving), `plugin_ended`
   (the plugin said so), `stream_reset` (the camera's stream reconnected —
   nothing may span the cut), `evicted` (the camera hit its
   `tracking.max_live_tracks` cap and this was the least recently seen track),
@@ -280,11 +282,13 @@ Same schema for all three kinds:
   `host_restart` (Cairn restarted; the track is over whatever the camera sees).
 
   **It is sent for every ending Cairn observes, but it is not a guarantee
-  across a Cairn restart.** Tracks belonging to a camera with an event in
-  flight are checkpointed and end as `host_restart`; tracks on a camera with
-  no open event are lost with the process and get no final at all. Treat the
-  SSE stream reconnecting after a Cairn restart as the end of every track you
-  are holding, not just the ones you were told about.
+  across a restart.** The checkpoint it would be replayed from is in memory
+  and only exists while a camera has an event in flight: if Cairn's detection
+  process alone restarts, those cameras' tracks are replayed as
+  `host_restart` and a camera with no open event has nothing to replay; if
+  Cairn itself restarts, the checkpoints go with it and no track gets a final
+  at all. Treat the SSE stream reconnecting after any Cairn restart as the end
+  of every track you are holding, not just the ones you were told about.
 
 - `bbox` is `[x, y, w, h]`, normalized 0..1, origin top-left, y increasing
   **downward** — deliberately not ONVIF's centre-origin, y-up frame. The

@@ -86,9 +86,10 @@ defmodule Cairn.PluginGroupSupervisor do
   Hands a still-running group the new config.
 
   A reload that changes the group restarts it; one that only changes camera
-  fields the argv never carried (windows, retention) leaves it running, and
-  it would otherwise keep routing detections with the pre-reload camera
-  structs.
+  fields the argv never carried (the `post` and `max` windows, the tracking
+  bounds, the `track:` / `record:` tiers, retention) leaves it running, and it
+  would otherwise keep routing detections with the pre-reload camera structs
+  and policies.
   """
   @spec refresh_group(Config.t(), Config.PluginGroup.t()) :: :ok
   def refresh_group(%Config{} = config, group) do
