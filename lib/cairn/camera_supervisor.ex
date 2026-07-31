@@ -55,10 +55,18 @@ defmodule Cairn.CameraSupervisor do
   pre-reload policy, so it is handed the new one instead of being restarted.
   """
   @spec apply_diff(Config.Server.diff(), Config.t()) :: :ok
-  def apply_diff(diff, %Config{} = new_config) do
-    Enum.each(diff.removed ++ diff.changed, &stop_camera/1)
+  # The full diff shape is matched in the head: all four keys are the
+  # contract (`Cairn.Config.Server.diff/0`), and a caller handing a partial
+  # map should fail here, loudly, not by KeyError three lines in — and not be
+  # silently tolerated with defaults, which would let a malformed diff skip
+  # work it named.
+  def apply_diff(
+        %{removed: removed, changed: changed, refreshed: refreshed, added: _},
+        %Config{} = new_config
+      ) do
+    Enum.each(removed ++ changed, &stop_camera/1)
     sync(new_config)
-    Enum.each(diff.refreshed, &refresh_camera(new_config, &1))
+    Enum.each(refreshed, &refresh_camera(new_config, &1))
   end
 
   @doc """

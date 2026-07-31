@@ -147,9 +147,26 @@ defmodule Cairn.PluginPort do
   end
 
   @impl true
-  def handle_cast({:refresh, camera, config}, state) do
+  def handle_cast(
+        {:refresh, %Cairn.Config.Camera{id: id} = camera, config},
+        %{camera: %Cairn.Config.Camera{id: id}} = state
+      ) do
     {:noreply,
      %{state | camera: camera, config: config, policy: Cairn.Config.policy(config, camera)}}
+  end
+
+  # A refresh for a different camera id than this process is registered and
+  # holds state for: accepting it would leave the registry name and every
+  # line this port forwards attributed to one camera while the policy and
+  # config belong to another. No caller in the tree can produce this —
+  # `Cairn.CameraSupervisor.refresh_camera/2` resolves the pid by the same id
+  # it looks the camera up with — so it is refused, not repaired.
+  def handle_cast({:refresh, %Cairn.Config.Camera{} = camera, _config}, state) do
+    Logger.warning(
+      "camera #{state.camera.id}: refused a refresh carrying camera #{inspect(camera.id)}"
+    )
+
+    {:noreply, state}
   end
 
   @impl true
