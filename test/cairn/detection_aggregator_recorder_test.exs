@@ -114,6 +114,9 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
 
   defp tier(rules), do: Map.put(@policy, :track, rules)
 
+  defp tiers(track, record),
+    do: @policy |> Map.put(:track, track) |> Map.put(:record, record)
+
   # -- the gate ---------------------------------------------------------------
 
   describe "a track that ended while an event was open" do
@@ -274,6 +277,65 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
       flush(ctx.agg, ctx.rec)
 
       assert Tracks.get(first).end_reason == :evicted
+    end
+  end
+
+  # -- the two tiers together ---------------------------------------------------
+
+  describe "a label the record: tier leaves out" do
+    # config.example.yml's worked example, made real: everything over 0.4
+    # reaches the host, people at 0.4 and cats at 0.5 earn a track row, and
+    # only people, and only at 0.6, ever start a recording. Cats are logged and
+    # never filmed — which is the whole reason the two tiers are separate.
+    @example_min_score %{"default" => 0.4, "person" => 0.4}
+    @example_track %{"person" => %{min_score: 0.4}, "cat" => %{min_score: 0.5}}
+    @example_record %{"person" => %{min_score: 0.6}}
+
+    setup ctx do
+      camera = %{
+        ctx.camera
+        | min_score: @example_min_score,
+          track: @example_track,
+          record: @example_record
+      }
+
+      # recording is *enabled* throughout, unlike the tier-gated cases above:
+      # what stops the event here is the `record:` block, not the runtime toggle
+      %{ctx | camera: camera}
+    end
+
+    test "gets a row and no event, however high it scores", ctx do
+      oid =
+        start_and_end_track(ctx,
+          label: "cat",
+          score: 0.9,
+          policy: tiers(@example_track, @example_record)
+        )
+
+      flush(ctx.agg, ctx.rec)
+      refute_received {:event_started, _}
+
+      row = Tracks.get(oid)
+      assert row.label == "cat"
+      assert row.best_score == 0.9
+      # no event was ever open, so the row is the tier-gated kind: unlinked
+      assert row.event_id == nil
+      assert Tracks.list(camera: ctx.camera_id).total == 1
+    end
+
+    test "a person over the record threshold on the same camera does open one", ctx do
+      oid =
+        start_and_end_track(ctx,
+          label: "person",
+          score: 0.65,
+          policy: tiers(@example_track, @example_record)
+        )
+
+      assert_receive {:extractor_started, %Event{id: eid}, _pid}
+
+      flush(ctx.agg, ctx.rec)
+
+      assert Tracks.get(oid).event_id == eid
     end
   end
 

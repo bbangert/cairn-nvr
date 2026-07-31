@@ -3,8 +3,9 @@ defmodule Cairn.DetectionAggregator do
   Owns the event lifecycle, one active event per camera.
 
   Receives decoded `Cairn.Observation`s from `Cairn.PluginPort` /
-  `Cairn.PluginGroupPort`, filters by per-label `min_score`, assigns stable
-  object identities (`Cairn.Tracker`, ULID strings), and:
+  `Cairn.PluginGroupPort`, filters by per-label `min_score` and the camera's
+  `record:` tier, assigns stable object identities (`Cairn.Tracker`, ULID
+  strings), and:
 
     * no active event + evidence -> starts a `Cairn.EventExtractor` and
       broadcasts `{:event_started, event}` on `"events"`
@@ -13,12 +14,18 @@ defmodule Cairn.DetectionAggregator do
     * `post_window` seconds of quiet -> finalizes; `max_event` seconds ->
       finalizes and lets the next piece of evidence open a fresh event
 
-  Not every detection is evidence (`evidence?/2`, the one gate both of the
+  Not every detection is evidence (`evidence?/3`, the one gate both of the
   first two bullets pass through): a predicted ("tracked") object is refused,
   and so is one whose track the tracker has judged **stationary**. A parked car
   therefore stops resetting the post-window, the event closes on schedule and
   stays closed — nothing reopens it while the car sits there — and the car is
   evidence again the moment it moves.
+
+  The camera's `record:` tier refuses on the detection itself rather than on
+  its track: a present block is the whitelist of what earns video, applied on
+  top of the `min_score` floor, so a label it leaves out never opens or extends
+  an event however high it scores. An absent block is the older behaviour —
+  everything the floor admits records.
 
   `{:event_ended, event}` means the detection window closed and nothing more:
   it is broadcast before the extractor is even told to finalize, so the clip
@@ -227,9 +234,15 @@ defmodule Cairn.DetectionAggregator do
     # A predicted ("tracked") object, a track the plugin keeps predicting long
     # after anything last detected it, and a track that has held still past the
     # camera's `stationary_after_ms` are all not evidence: they keep the
-    # tracker warm but can neither open an event nor hold one open.
+    # tracker warm but can neither open an event nor hold one open. Nor is a
+    # detection the camera's `record:` tier does not admit.
+    #
+    # `Map.get/2` for the same reason as `tracking_policy/1`: `detections/4` is
+    # a public entry point any caller can hand a bare map, and a missing key
+    # has to read as an absent block rather than raise on this path.
     min_score = effective_min_score(camera, control)
-    passing = Enum.filter(tagged, &evidence?(&1, min_score))
+    record_tier = Map.get(policy, :record)
+    passing = Enum.filter(tagged, &evidence?(&1, min_score, record_tier))
 
     cam =
       cond do
@@ -258,9 +271,32 @@ defmodule Cairn.DetectionAggregator do
   # from the last *detection*, so an object that is detected in this batch
   # always carries `false`. The staleness rule bites through `detected?/1`
   # instead — a track the plugin keeps predicting arrives as `"tracked"`.
-  defp evidence?(object, min_score) do
+  defp evidence?(object, min_score, record_tier) do
     Observation.detected?(object) and not object.stationary and
-      passes_min_score?(object, min_score)
+      earns_video?(object, min_score, record_tier)
+  end
+
+  # No `record:` block: the (possibly overridden) `min_score` floor decides
+  # alone, and everything it admits earns video.
+  defp earns_video?(object, min_score, nil), do: passes_min_score?(object, min_score)
+
+  # Where the runtime `control.min_score` override and the config tier meet.
+  # They answer different questions — the tier says whether this label at this
+  # score deserves video, the override raises or lowers the floor right now —
+  # so evidence needs **both**: `score >= max(effective_min_score, tier)`, with
+  # `:excluded` beating any floor. An override can therefore raise the bar at
+  # runtime, but never un-exclude a label or undercut a tier.
+  #
+  # With no override in force the floor half is implied rather than load-
+  # bearing: a tier below the camera's *configured* `min_score` is a load-time
+  # error, so clearing the tier already clears the floor. The override is what
+  # makes the `max` bite — it goes through no such validation and can land
+  # either side of a tier (see `Cairn.Config.tier_threshold/3`).
+  defp earns_video?(object, min_score, rules) do
+    case Config.tier_threshold(rules, object.label, min_score) do
+      :excluded -> false
+      threshold -> passes_min_score?(object, min_score) and object.score >= threshold
+    end
   end
 
   # Defensive on a public, @spec'd entry point (`detections/4`) that any caller
@@ -291,7 +327,9 @@ defmodule Cairn.DetectionAggregator do
   end
 
   # A runtime min_score override replaces the camera's configured thresholds
-  # (applied as the default for every label); nil means "use config".
+  # (applied as the default for every label); nil means "use config". It moves
+  # the floor and only the floor — the `record:` tier applies on top of
+  # whatever comes out of here (see `earns_video?/3`).
   defp effective_min_score(camera, %{min_score: nil}), do: camera.min_score
   defp effective_min_score(_camera, %{min_score: override}), do: %{"default" => override}
 

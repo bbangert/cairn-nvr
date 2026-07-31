@@ -236,7 +236,9 @@ defmodule Cairn.Config do
   wire floor: a config where a tier resolves under `min_score` is rejected at
   load time, because the plugin never emits that band and the rule could only
   ever fire zero times. A runtime override (`Cairn.CameraControl`'s
-  `min_score`) goes through no such validation and can sit above a tier.
+  `min_score`) goes through no such validation and can sit above a tier —
+  `Cairn.DetectionAggregator` resolves the clash by demanding both, so an
+  override raises the bar without ever lowering a tier's.
 
   Between the two tiers, validation leaves one invariant worth relying on: for
   a given label the `record` answer is never a number below the `track`
