@@ -16,7 +16,11 @@ config :cairn,
   db_in_data_dir: false,
   config_path: "test/support/fixtures/configs/valid.yml",
   start_cameras: false,
-  skip_boot_migrations: true
+  skip_boot_migrations: true,
+  # The application's own `Cairn.TrackRecorder` buffers whatever any test's
+  # aggregator casts at it; without this its timer would flush those tracks
+  # into whichever sandbox connection happens to be checked out at the time.
+  track_recorder_manual: true
 
 # We don't run a server during test. If one is required,
 # you can enable the server option below.
