@@ -85,7 +85,11 @@ Body (any subset; JSON):
 
 - `detection_enabled` / `recording_enabled` — booleans.
 - `min_score` — number `0..1` applied as the threshold for all labels, or `null`
-  to clear the override and fall back to configured per-label `min_score`.
+  to clear the override and fall back to configured per-label `min_score`. It
+  moves the floor and only the floor: on a camera with a `record:` block a
+  detection still has to clear that tier's own threshold to open or extend an
+  event, so the override can raise the bar but cannot bring back a label the
+  block leaves out.
 
 Returns `200 {"id": "...", "control": {...}}`. Invalid field → `422`; unknown
 camera → `404`. Changes take effect immediately in the detection pipeline and are

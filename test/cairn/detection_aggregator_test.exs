@@ -7,6 +7,7 @@ defmodule Cairn.DetectionAggregatorTest do
   import Cairn.TrackAssertions
   import ExUnit.CaptureLog, only: [capture_log: 1]
 
+  alias Cairn.Config
   alias Cairn.Config.Camera
 
   alias Cairn.{
@@ -1088,6 +1089,122 @@ defmodule Cairn.DetectionAggregatorTest do
       # and exactly once: the tracker pairs the transition with an `:updated`
       # carrying the same summary, which the throttle swallowed
       refute_received {:track_updated, %Track{object_id: ^oid}}
+    end
+  end
+
+  describe "the record: tier" do
+    # Everything over 0.4 reaches the host; only people, and only at 0.6, earn
+    # video. No `track:` block: what is under test here is which detections may
+    # open or extend an event, which is the `record:` tier's question alone.
+    @wire_floor %{"default" => 0.4}
+    @record_rules %{"person" => %{min_score: 0.6}}
+    @record_policy Map.put(@policy, :record, @record_rules)
+
+    defp record_detect(agg, camera, score, policy) do
+      DetectionAggregator.detections(
+        agg,
+        camera,
+        policy,
+        observation([object("person", score, [0.1, 0.1, 0.2, 0.4])], [])
+      )
+    end
+
+    test "opens and extends only at its own threshold",
+         %{
+           agg: agg,
+           camera_id: id
+         } = ctx do
+      camera = %{ctx.camera | min_score: @wire_floor, record: @record_rules}
+
+      # over the wire floor, under record.person: the plugin emitted it and it
+      # buys nothing
+      record_detect(agg, camera, 0.5, @record_policy)
+      :sys.get_state(agg)
+      refute_received {:event_started, %Event{camera_id: ^id}}
+
+      record_detect(agg, camera, 0.65, @record_policy)
+      assert_receive {:event_started, %Event{id: eid, camera_id: ^id}}
+      armed = token(agg, id, :post_token)
+
+      # inside the event the same 0.5 detection still counts for nothing: no
+      # update, and the post-window timer it would have rearmed is untouched
+      record_detect(agg, camera, 0.5, @record_policy)
+      :sys.get_state(agg)
+      refute_received {:event_updated, %Event{camera_id: ^id}}
+      assert token(agg, id, :post_token) == armed
+
+      record_detect(agg, camera, 0.65, @record_policy)
+      assert_receive {:event_updated, %Event{id: ^eid}}
+      assert token(agg, id, :post_token) != armed
+    end
+
+    test "an absent block is the pre-tier behaviour, and an empty block is not absent",
+         %{
+           agg: agg,
+           camera_id: id
+         } = ctx do
+      camera = %{ctx.camera | min_score: @wire_floor}
+
+      # `record: {}` is a *present* whitelist that lists nothing, so it excludes
+      # every label — the opposite of leaving the block out
+      empty = Map.put(@policy, :record, %{})
+      record_detect(agg, %{camera | record: %{}}, 0.99, empty)
+      :sys.get_state(agg)
+      refute_received {:event_started, %Event{camera_id: ^id}}
+
+      # no `record:` key at all: the floor decides alone, exactly as before the
+      # tier existed — 0.5 clears the camera's 0.4 and opens an event
+      record_detect(agg, camera, 0.5, @policy)
+      assert_receive {:event_started, %Event{camera_id: ^id, max_scores: %{"person" => 0.5}}}
+    end
+
+    test "a config-loaded camera's record tier is always reachable by the plugin", %{
+      agg: agg,
+      camera_id: id
+    } do
+      # The end-to-end half of the monotonicity rule Config enforces (its own
+      # rejections are covered in Cairn.ConfigTest): a tier that resolves below
+      # the wire floor names a band the plugin never emits in, so what a valid
+      # config guarantees is that every number the record tier answers with is
+      # one a detection can actually carry.
+      {:ok, config, []} =
+        Config.from_map(%{
+          "data_dir" => "tmp/cfg_test",
+          "udp" => %{"base_port" => 17_000, "range" => 20},
+          "cameras" => [
+            %{
+              "id" => id,
+              "rtsp_url" => "rtsp://h/1",
+              "min_score" => %{"default" => 0.4},
+              "track" => %{"person" => 0.4, "cat" => 0.5},
+              "record" => %{"person" => 0.6}
+            }
+          ]
+        })
+
+      [cam] = config.cameras
+      policy = Config.policy(config, cam)
+
+      for label <- ["person", "cat", "car"] do
+        floor = Map.get(cam.min_score, label) || cam.min_score["default"]
+
+        case Config.tier_threshold(policy.record, label, cam.min_score) do
+          # rows without video: no band to be reachable
+          :excluded -> assert label in ["cat", "car"]
+          threshold -> assert threshold >= floor
+        end
+      end
+
+      # the plugin emits anywhere over 0.4, and the band between the floor and
+      # the tier is the one that earns a row but no video
+      record_detect(agg, cam, 0.5, policy)
+      :sys.get_state(agg)
+      refute_received {:event_started, %Event{camera_id: ^id}}
+
+      # and the plugin does reach the tier: a detection exactly at its number
+      # opens an event
+      record_detect(agg, cam, 0.6, policy)
+      assert_receive {:event_started, %Event{camera_id: ^id}}
     end
   end
 end

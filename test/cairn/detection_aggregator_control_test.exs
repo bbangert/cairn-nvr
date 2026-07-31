@@ -35,13 +35,15 @@ defmodule Cairn.DetectionAggregatorControlTest do
     %{agg: agg, camera: camera, camera_id: camera_id}
   end
 
-  defp detect(agg, camera, score \\ 0.9) do
+  defp detect(agg, camera, score \\ 0.9), do: detect(agg, camera, "person", score, @policy)
+
+  defp detect(agg, camera, label, score, policy) do
     observation = %Observation{
       pts: 90_000,
       observed_at: DateTime.utc_now(),
       objects: [
         %{
-          label: "person",
+          label: label,
           score: score,
           bbox: [0.1, 0.1, 0.2, 0.4],
           track_id: nil,
@@ -50,7 +52,7 @@ defmodule Cairn.DetectionAggregatorControlTest do
       ]
     }
 
-    DetectionAggregator.detections(agg, camera, @policy, observation)
+    DetectionAggregator.detections(agg, camera, policy, observation)
   end
 
   # `detections/4` is an async cast; flushing the aggregator's mailbox with
@@ -94,5 +96,49 @@ defmodule Cairn.DetectionAggregatorControlTest do
     detect(ctx.agg, ctx.camera, 0.9)
     assert_receive {:event_started, %Event{camera_id: cid}}
     assert cid == ctx.camera_id
+  end
+
+  describe "a min_score override under a record: tier" do
+    # The override moves the floor; the tier says what earns video. Evidence
+    # needs both — `score >= max(effective_min_score, tier)` — so the override
+    # can raise the bar at runtime but can neither undercut the tier nor
+    # un-exclude a label the block leaves out.
+    @record_rules %{"person" => %{min_score: 0.6}}
+    @record_policy Map.put(@policy, :record, @record_rules)
+
+    setup ctx do
+      %{ctx | camera: %{ctx.camera | min_score: %{"default" => 0.4}, record: @record_rules}}
+    end
+
+    test "an override above the tier raises the bar", ctx do
+      CameraControl.set(ctx.camera_id, %{min_score: 0.8})
+
+      # clears record.person (0.6) but not the override
+      detect(ctx.agg, ctx.camera, "person", 0.7, @record_policy)
+      refute_event_started(ctx.agg)
+
+      detect(ctx.agg, ctx.camera, "person", 0.85, @record_policy)
+      assert_receive {:event_started, %Event{camera_id: _}}
+    end
+
+    test "an override below the tier does not lower it", ctx do
+      CameraControl.set(ctx.camera_id, %{min_score: 0.3})
+
+      # clears the lowered floor, still under record.person
+      detect(ctx.agg, ctx.camera, "person", 0.5, @record_policy)
+      refute_event_started(ctx.agg)
+
+      detect(ctx.agg, ctx.camera, "person", 0.65, @record_policy)
+      assert_receive {:event_started, %Event{camera_id: _}}
+    end
+
+    test "a label the block leaves out stays out whatever the override", ctx do
+      for override <- [nil, 0.1, 0.99] do
+        CameraControl.set(ctx.camera_id, %{min_score: override})
+
+        detect(ctx.agg, ctx.camera, "cat", 0.99, @record_policy)
+        refute_event_started(ctx.agg)
+      end
+    end
   end
 end
