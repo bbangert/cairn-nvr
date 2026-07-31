@@ -498,9 +498,14 @@ defmodule Cairn.EventExtractorTest do
 
   test "reconciliation deletes rows with missing files and adopts orphans",
        %{camera: camera, config: config} do
-    # row without file
+    # row without file, but with the sidecar its clip left behind. Nothing else
+    # would ever collect it: `adopt_orphans/2` globs `*.mp4`, and once the row
+    # is gone no route can derive the path again.
     gone = new_event(camera)
-    {:ok, _} = Events.create_active(gone, Path.join(config.data_dir, "nope.mp4"))
+    gone_path = Path.join(config.data_dir, "nope.mp4")
+    {:ok, _} = Events.create_active(gone, gone_path)
+    gone_sidecar = Cairn.DataDir.trackpath_for_clip(gone_path)
+    File.write!(gone_sidecar, "tracks")
 
     # orphan clip on disk with parseable identity
     orphan_id = Ecto.UUID.generate()
@@ -514,6 +519,8 @@ defmodule Cairn.EventExtractorTest do
     assert summary.adopted == 1
 
     assert Events.get(gone.id) == nil
+    refute File.exists?(gone_sidecar)
+
     orphan = Events.get(orphan_id)
     assert orphan.status == :partial
     assert orphan.camera_id == camera.id
@@ -559,6 +566,408 @@ defmodule Cairn.EventExtractorTest do
     refute_received {:event_clip_failed, _}
   end
 
+  describe "the track path sidecar" do
+    # The pre-roll `run_with_boxes/5` drains unless a test passes
+    # `pre_roll: false`: the fixture's second and third fragments, pts 10_240
+    # and 20_480 at timescale 10_240, 1_000 ms each. Not the first two, so a
+    # first_pts of 0 cannot pass for a captured anchor.
+    @first_pts 10_240
+    @timescale 10_240
+    # (20_480 − 10_240) / 10_240 × 1000 = 1_000 ms between the two decode
+    # times, plus the last fragment's own 1_000 ms to reach the end of the
+    # drained media.
+    @drained_span_ms 2_000
+
+    defp pre_roll(frags), do: Enum.slice(frags, 1, 2)
+
+    # Drives one event to finalized with `batches` cast in as the aggregator
+    # would, returning `%{path:, event:, opened_ms:}`.
+    #
+    # `opts` may carry `pre_roll: false` (start with an empty ring),
+    # `max_path_entries:` (passed to the extractor), and `on_clip_ready:`, a
+    # one-arity fun handed the clip path at the moment the artifact frame
+    # arrives and *before* `:DOWN` — the only window in which the sidecar
+    # write's ordering against the broadcast is observable at all.
+    defp run_with_boxes(camera, config, frags, batches, opts \\ []) do
+      if Keyword.get(opts, :pre_roll, true) do
+        Enum.each(pre_roll(frags), &RingBuffer.put_fragment(camera.id, &1))
+      end
+
+      event = new_event(camera)
+
+      pid =
+        start_supervised!(
+          {EventExtractor,
+           [camera: camera, event: event, config: config, snapshot_fun: fn _row, _cfg -> :ok end] ++
+             Keyword.take(opts, [:max_path_entries])},
+          id: {:extractor, event.id}
+        )
+
+      ref = Process.monitor(pid)
+      assert %{status: :active, path: path} = wait_row(event.id)
+
+      # The row is inserted at the top of `handle_continue(:open, ...)`, so
+      # `wait_row/1` alone proves nothing about the drain. This sync does: a
+      # system message is only answered once the continue has returned, so the
+      # anchor's wall clock was read strictly before the mark below.
+      _ = :sys.get_state(pid)
+      opened_ms = DateTime.to_unix(DateTime.utc_now(), :millisecond)
+
+      # Not a poll and not a settle for a race: this sleep *is* the instrument
+      # the `drain_wall_ms` bracket is made of. The anchor's clock is supposed
+      # to be read at the drain, and the only thing that distinguishes that
+      # from a clock read in the finalize handler is real elapsed time between
+      # the mark above and the finalize below. Opt-in, so one test pays for it.
+      if settle = opts[:settle_ms], do: Process.sleep(settle)
+
+      Enum.each(batches, &GenServer.cast(pid, {:track_boxes, &1}))
+
+      # Same sender, same receiver as the batches: the finalize cast cannot
+      # overtake them. That is the whole reason the flush needs no draining
+      # handshake — see `Cairn.DetectionAggregator.forward_boxes/3`.
+      EventExtractor.finalize(pid, %{event | ended_at: DateTime.utc_now(), status: :finalized})
+
+      if fun = Keyword.get(opts, :on_clip_ready) do
+        event_id = event.id
+        assert_receive {:event_clip_ready, %EventArtifact{event_id: ^event_id}}, 10_000
+        fun.(path)
+      end
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 10_000
+
+      %{path: path, event: event, opened_ms: opened_ms}
+    end
+
+    defp sidecar!(clip_path) do
+      path = Cairn.DataDir.trackpath_for_clip(clip_path)
+      assert File.exists?(path), "no sidecar at #{path}"
+      assert {:ok, map} = Cairn.TrackPath.decode(File.read!(path))
+      map
+    end
+
+    test "buffered batches become a sidecar beside the clip, anchored to the drain",
+         %{camera: camera, config: config, frags: frags} do
+      before_ms = DateTime.to_unix(DateTime.utc_now(), :millisecond)
+
+      %{path: path, event: event, opened_ms: opened_ms} =
+        run_with_boxes(
+          camera,
+          config,
+          frags,
+          [
+            %{t_ms: 0, boxes: [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], false}]},
+            %{t_ms: 500, boxes: [{"obj-a", "person", [0.5, 0.25, 0.3, 0.4], true}]}
+          ],
+          settle_ms: 25
+        )
+
+      map = sidecar!(path)
+
+      assert map["v"] == 1
+      assert map["event_id"] == event.id
+      assert map["camera_id"] == camera.id
+      assert map["truncated"] == false
+
+      # Stored exactly as `Cairn.TrackPath` documents it: quantized by 10_000
+      # and delta-encoded, both columns and axis. Literals, not a call back
+      # into the encoder — the browser overlay has to match these bytes.
+      assert map["ts"] == [0, 500]
+
+      assert [
+               %{
+                 "id" => "obj-a",
+                 "label" => "person",
+                 "truncated" => false,
+                 "ti" => [0, 1],
+                 "x" => [1_000, 4_000],
+                 "y" => [2_000, 500],
+                 "w" => [3_000, 0],
+                 "h" => [4_000, 0]
+               }
+             ] = map["tracks"]
+
+      assert %{
+               "first_pts" => @first_pts,
+               "timescale" => @timescale,
+               "drained_span_ms" => @drained_span_ms
+             } = map["anchor"]
+
+      assert map["anchor"]["event_started_ms"] ==
+               DateTime.to_unix(event.started_at, :millisecond)
+
+      # Bracketed by "before the extractor existed" and "the open had returned",
+      # so a clock read anywhere later — in the finalize handler, say — falls
+      # outside. `Cairn.EventExtractor`'s anchor is only worth having because
+      # it is read *at* the drain.
+      assert map["anchor"]["drain_wall_ms"] >= before_ms
+      assert map["anchor"]["drain_wall_ms"] <= opened_ms
+    end
+
+    test "the sidecar is on disk before event_clip_ready goes out",
+         %{camera: camera, config: config, frags: frags} do
+      # `Cairn.EventExtractor` puts the write ahead of the broadcast so a
+      # consumer that answers `:event_clip_ready` by fetching the sidecar
+      # cannot race it. The assertion runs on the frame, not after `:DOWN`, so
+      # everything the extractor does afterwards is outside the window.
+      #
+      # 10_000 boxes, deliberately: encoding, gzipping and writing them takes
+      # long enough that a write moved below the broadcast loses the race to
+      # this process, which the broadcast has already made runnable. A
+      # two-sample sidecar is written too fast for the swap to be visible.
+      batches =
+        for t <- 0..199 do
+          %{
+            t_ms: t * 10,
+            boxes: for(i <- 1..50, do: {"obj-#{i}", "person", [i / 100, 0.1, 0.1, 0.1], false})
+          }
+        end
+
+      run_with_boxes(camera, config, frags, batches,
+        on_clip_ready: fn clip ->
+          assert File.exists?(Cairn.DataDir.trackpath_for_clip(clip)),
+                 "the sidecar was not on disk when :event_clip_ready went out"
+        end
+      )
+    end
+
+    test "an empty pre-roll leaves the anchor's media half nil and the clocks set",
+         %{camera: camera, config: config, frags: frags} do
+      # Nothing put into the ring: a camera whose pre-window has not filled yet.
+      # The browser's documented fallback (`duration − event_seconds`) exists
+      # for exactly this file, so the nils have to be real.
+      %{path: path, event: event} =
+        run_with_boxes(
+          camera,
+          config,
+          frags,
+          [%{t_ms: 0, boxes: [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], false}]}],
+          pre_roll: false
+        )
+
+      assert %{
+               "first_pts" => nil,
+               "timescale" => nil,
+               "drained_span_ms" => nil,
+               "drain_wall_ms" => drain_wall_ms,
+               "event_started_ms" => event_started_ms
+             } = sidecar!(path)["anchor"]
+
+      assert is_integer(drain_wall_ms)
+      assert event_started_ms == DateTime.to_unix(event.started_at, :millisecond)
+    end
+
+    test "an event that saw no boxes writes no file at all",
+         %{camera: camera, config: config, frags: frags} do
+      %{path: path} = run_with_boxes(camera, config, frags, [])
+
+      # the clip is fine — it is the sidecar that is deliberately absent, which
+      # is how a reader is told this event has no path to draw
+      assert File.exists?(path)
+      refute File.exists?(Cairn.DataDir.trackpath_for_clip(path))
+    end
+
+    test "an empty batch leaves no file and costs nothing against the cap",
+         %{camera: camera, config: config, frags: frags} do
+      # A batch whose tagged list came back empty is not "a path with no
+      # samples", it is no path — and a cap of one box proves the two empty
+      # batches around it consumed none of the budget.
+      %{path: path} =
+        run_with_boxes(
+          camera,
+          config,
+          frags,
+          [
+            %{t_ms: 0, boxes: []},
+            %{t_ms: 100, boxes: [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], false}]},
+            %{t_ms: 200, boxes: []}
+          ],
+          max_path_entries: 1
+        )
+
+      map = sidecar!(path)
+      assert map["truncated"] == false
+      assert Enum.map(map["tracks"], & &1["id"]) == ["obj-a"]
+      # only the batch that carried a box is on the axis
+      assert map["ts"] == [100]
+
+      %{path: empty} =
+        run_with_boxes(camera, config, frags, [%{t_ms: 0, boxes: []}], max_path_entries: 1)
+
+      refute File.exists?(Cairn.DataDir.trackpath_for_clip(empty))
+    end
+
+    test "the global entry cap drops the tail and says so in the header",
+         %{camera: camera, config: config, frags: frags} do
+      # 20 boxes exactly — the cap itself, which is allowed — spread over four
+      # object ids, then the one box that does not fit. Run at an overridden
+      # cap rather than the 200k default: the boundary is the whole assertion
+      # and it is the same boundary at either number.
+      ids = ["obj-a", "obj-b", "obj-c", "obj-d"]
+
+      full =
+        for batch <- 0..3 do
+          boxes =
+            for i <- 1..5 do
+              {Enum.at(ids, rem(i - 1, 4)), "person", [0.1, 0.1, 0.2, 0.4], false}
+            end
+
+          %{t_ms: batch * 100, boxes: boxes}
+        end
+
+      over = %{t_ms: 9_999, boxes: [{"obj-late", "car", [0.5, 0.5, 0.1, 0.1], false}]}
+
+      log =
+        capture_log(fn ->
+          %{path: path} =
+            run_with_boxes(camera, config, frags, full ++ [over], max_path_entries: 20)
+
+          map = sidecar!(path)
+
+          assert map["truncated"] == true
+          # the dropped batch is the only source of this id, so its absence is
+          # the drop, and the four that fit are all still there
+          assert Enum.map(map["tracks"], & &1["id"]) == ids
+          # The axis is delta-encoded, so its running sum ends at the last
+          # *kept* batch — 3 × 100 ms — and never at the 9_999 of the batch the
+          # cap dropped. The cap takes the tail, not the head.
+          assert Enum.sum(map["ts"]) == 300
+        end)
+
+      assert log =~ "track path capped at 20 boxes"
+    end
+
+    test "past the cap every later batch is dropped, however small",
+         %{camera: camera, config: config, frags: frags} do
+      # 15 boxes in, a cap of 20, and then a batch of 10 that cannot fit. The
+      # 5 boxes of headroom it leaves behind are the point: the single-box
+      # batch after it *would* fit, and is dropped anyway, because a path with
+      # interleaved holes is drawn as straight lines across them while a path
+      # that stops is announced by `truncated`.
+      ids = ["obj-a", "obj-b", "obj-c"]
+
+      full =
+        for batch <- 0..4 do
+          boxes = for id <- ids, do: {id, "person", [0.1, 0.1, 0.2, 0.4], false}
+          %{t_ms: batch * 100, boxes: boxes}
+        end
+
+      over = %{
+        t_ms: 500,
+        boxes: for(i <- 1..10, do: {"obj-over-#{i}", "car", [0.5, 0.5, 0.1, 0.1], false})
+      }
+
+      fits = %{t_ms: 600, boxes: [{"obj-after", "person", [0.2, 0.2, 0.1, 0.1], false}]}
+
+      log =
+        capture_log(fn ->
+          %{path: path} =
+            run_with_boxes(camera, config, frags, full ++ [over, fits], max_path_entries: 20)
+
+          map = sidecar!(path)
+
+          assert map["truncated"] == true
+          assert Enum.map(map["tracks"], & &1["id"]) == ids
+          # the axis stops at the last kept batch, 4 × 100 ms
+          assert Enum.sum(map["ts"]) == 400
+        end)
+
+      # one line, not one per dropped batch
+      assert log |> String.split("track path capped") |> length() == 2
+    end
+
+    test "a clip the index refuses leaves no sidecar behind",
+         %{camera: camera, config: config, frags: frags} do
+      Enum.each(pre_roll(frags), &RingBuffer.put_fragment(camera.id, &1))
+      event = new_event(camera)
+
+      pid =
+        start_supervised!(
+          {EventExtractor, camera: camera, event: event, config: config},
+          id: {:extractor, event.id}
+        )
+
+      ref = Process.monitor(pid)
+      assert %{status: :active, path: path} = row = wait_row(event.id)
+
+      GenServer.cast(
+        pid,
+        {:track_boxes, %{t_ms: 0, boxes: [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], false}]}}
+      )
+
+      # retention deleting the event mid-recording: `Events.finalize` has
+      # nothing to update, so the clip never becomes reachable — and an
+      # unreachable clip must not leave a sidecar for a reader to find
+      {:ok, _} = Events.delete_row(row)
+
+      capture_log(fn ->
+        EventExtractor.finalize(pid, %{event | ended_at: DateTime.utc_now(), status: :finalized})
+        assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
+      end)
+
+      event_id = event.id
+      assert_receive {:event_clip_failed, %EventArtifact{event_id: ^event_id}}
+      refute File.exists?(Cairn.DataDir.trackpath_for_clip(path))
+    end
+
+    test "a sidecar that cannot be written costs the clip nothing",
+         %{camera: camera, config: config, frags: frags} do
+      Enum.each(pre_roll(frags), &RingBuffer.put_fragment(camera.id, &1))
+      event = new_event(camera)
+
+      pid =
+        start_supervised!(
+          {EventExtractor,
+           camera: camera, event: event, config: config, snapshot_fun: fn _row, _cfg -> :ok end},
+          id: {:extractor, event.id}
+        )
+
+      ref = Process.monitor(pid)
+      assert %{status: :active, path: path} = wait_row(event.id)
+
+      # a directory standing where the file goes, so `File.write/2` can only
+      # answer `{:error, :eisdir}`
+      File.mkdir_p!(Cairn.DataDir.trackpath_for_clip(path))
+
+      GenServer.cast(
+        pid,
+        {:track_boxes, %{t_ms: 0, boxes: [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], false}]}}
+      )
+
+      log =
+        capture_log(fn ->
+          EventExtractor.finalize(pid, %{event | ended_at: DateTime.utc_now(), status: :finalized})
+
+          assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
+        end)
+
+      assert log =~ "track path write failed"
+
+      # the clip is announced exactly as it would have been: losing the path
+      # loses the overlay, not the video
+      event_id = event.id
+      assert_receive {:event_clip_ready, %EventArtifact{event_id: ^event_id}}
+      refute_received {:event_clip_failed, _}
+      assert %{status: :finalized} = Events.get(event_id)
+    end
+
+    test "deleting the event deletes the sidecar with the clip",
+         %{camera: camera, config: config, frags: frags} do
+      %{path: path, event: event} =
+        run_with_boxes(camera, config, frags, [
+          %{t_ms: 0, boxes: [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], false}]}
+        ])
+
+      sidecar = Cairn.DataDir.trackpath_for_clip(path)
+      assert File.exists?(sidecar)
+
+      assert {:ok, _} = Events.delete(Events.get(event.id))
+
+      refute File.exists?(sidecar)
+      refute File.exists?(path)
+      assert Events.get(event.id) == nil
+    end
+  end
+
   # Scoped to one camera: the `"events"` topic is global and a leftover timer
   # in another test's aggregator can drop a foreign `event_ended` into this
   # mailbox between the two messages an ordering assertion is comparing.
@@ -593,11 +1002,17 @@ defmodule Cairn.EventExtractorTest do
     end)
   end
 
+  # Flunks rather than answering `nil`: every caller today pattern-matches
+  # `%{status: ...}` and so would fail anyway, but a future `assert wait_row(id)
+  # != x` would silently pass on the exhausted case.
   defp wait_row(id, attempts \\ 100) do
     case Events.get(id) do
       nil when attempts > 0 ->
         Process.sleep(10)
         wait_row(id, attempts - 1)
+
+      nil ->
+        flunk("no index row for event #{id} within 1s")
 
       row ->
         row

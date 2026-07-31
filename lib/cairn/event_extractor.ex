@@ -1,19 +1,30 @@
 defmodule Cairn.EventExtractor do
   @moduledoc """
   One `:temporary` process per active event, streaming fragments to a
-  single mp4 on disk.
+  single mp4 on disk and writing the track-path sidecar that goes beside it.
 
   On start: inserts the `active` index row, opens
   `events/{camera}/{event_id}_{camera}_{ts}.mp4`, writes the init segment,
   then atomically drains the ring's pre-window and subscribes for live
   fragments (`Cairn.RingBuffer.drain_and_subscribe/3` — race-free
-  boundary). Memory stays constant w.r.t. event length: fragments are
-  written as they arrive, with a datasync roughly every 2s of media.
+  boundary). That drain is also the only moment the clip's time-zero is
+  knowable, in the media clock and the wall clock at once: the anchor taken
+  there (`anchor/3`) is kept for the sidecar header and would otherwise be
+  discarded with the fragments.
+
+  The media path holds nothing: a fragment is written as it arrives and let
+  go, with a datasync roughly every 2s of media, so the clip's own length
+  costs no memory. The box buffer is the exception — `Cairn.DetectionAggregator`
+  casts every tagged box of the open event here, and that list grows with the
+  event until `@max_path_entries` stops it. It is transient heap in a process
+  that exists only for this event.
 
   Finalize: closes the file, updates the row (`finalized`, ended_at,
-  bytes, labels, max_score), broadcasts `:event_clip_ready` with the
-  post-remux size (or `:event_clip_failed`), kicks off the async snapshot,
-  emits `[:cairn, :extractor, :finalized]` telemetry, exits `:normal`. A
+  bytes, labels, max_score), writes the sidecar, broadcasts
+  `:event_clip_ready` with the post-remux size (or `:event_clip_failed`),
+  kicks off the async snapshot, emits `[:cairn, :extractor, :finalized]`
+  telemetry, exits `:normal`. Only a clip the index accepted gets a sidecar,
+  and failing to write one never changes what the event is announced as. A
   crash *while recording* leaves the row `active` and announces no artifact at
   all; boot reconciliation marks it `partial`. A crash inside finalize is
   different: `:event_ended` has already been broadcast by then, so the failure
@@ -25,9 +36,20 @@ defmodule Cairn.EventExtractor do
 
   require Logger
 
-  alias Cairn.{Config, DataDir, EventArtifact, Events, RingBuffer}
+  alias Cairn.{Config, DataDir, EventArtifact, Events, RingBuffer, TrackPath}
 
   @fsync_media_ms 2_000
+  # Box entries, not batches, and global rather than per track: `max_live_tracks`
+  # (128) bounds what is live at one instant, not how many distinct objects a
+  # long event sees, so a per-track cap alone bounds nothing. At the maximum
+  # `max_event_seconds` (86,400) this is what the buffer is actually held to;
+  # 200k entries is tens of MB of transient heap. `Cairn.TrackPath` applies its
+  # own per-track cap on top, after keyframe selection.
+  #
+  # The default only: `:max_path_entries` in the start opts overrides it, read
+  # once into state at init so a test can reach the cap's boundary without
+  # pushing 200k tuples through a real process.
+  @max_path_entries 200_000
 
   def start_link(opts) do
     camera = Keyword.fetch!(opts, :camera)
@@ -66,7 +88,16 @@ defmodule Cairn.EventExtractor do
       bytes: 0,
       fragments: 0,
       unsynced_media_ms: 0,
-      started_ms: System.monotonic_time(:millisecond)
+      started_ms: System.monotonic_time(:millisecond),
+      # The dense box buffer the aggregator feeds, newest batch first: a cast
+      # prepends and the flush reverses. `track_entries` counts boxes, not
+      # batches, so the cap can be checked without walking the list.
+      track_boxes: [],
+      track_entries: 0,
+      track_truncated: false,
+      max_path_entries: Keyword.get(opts, :max_path_entries, @max_path_entries),
+      # Taken at the drain in `handle_continue(:open, ...)`; nil until then.
+      anchor: nil
     }
 
     {:ok, state, {:continue, :open}}
@@ -91,7 +122,13 @@ defmodule Cairn.EventExtractor do
       {:ok, %{init: init, fragments: drained}} =
         RingBuffer.drain_and_subscribe(camera.id, nil, self())
 
-      state = %{state | io: io, path: path}
+      # Read here and nowhere later: this instant is the one that corresponds
+      # in media time to the end of the drained pre-roll, which is the whole
+      # value of the anchor. A wall clock taken after the fragments are written
+      # would be an unknown amount of I/O later.
+      drain_wall_ms = DateTime.to_unix(DateTime.utc_now(), :millisecond)
+
+      state = %{state | io: io, path: path, anchor: anchor(drained, event, drain_wall_ms)}
 
       state =
         if is_binary(init) do
@@ -125,12 +162,20 @@ defmodule Cairn.EventExtractor do
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
+  def handle_cast({:track_boxes, %{t_ms: t_ms, boxes: boxes}}, state) do
+    {:noreply, buffer_boxes(state, t_ms, boxes)}
+  end
+
   def handle_cast({:finalize, event}, state) do
     snapshot_fun = Keyword.get(state.opts, :snapshot_fun, &Cairn.Snapshot.take_async/2)
     {outcome, bytes} = close_clip(event, state)
 
     case outcome do
       {:ok, row} ->
+        # Ahead of the broadcast: a consumer that answers `:event_clip_ready`
+        # by fetching the sidecar must not race the write that produces it.
+        write_track_path(event, state)
+
         # After the row, which is what makes `clip_url` resolve, and before
         # the snapshot is kicked off, so a consumer always sees the clip's
         # outcome ahead of the snapshot's.
@@ -167,6 +212,118 @@ defmodule Cairn.EventExtractor do
   end
 
   # -- internals --------------------------------------------------------------
+
+  # The clip's time-zero in both clocks, captured while the head of the clip is
+  # still in hand. An empty pre-window — a camera whose ring has not filled yet
+  # — has no media half at all: those three fields go `nil` and the wall-clock
+  # pair still places the path (`Cairn.TrackPath` reads every field with
+  # `Map.get/2` for exactly this case).
+  defp anchor([], event, drain_wall_ms) do
+    %{
+      first_pts: nil,
+      timescale: nil,
+      drained_span_ms: nil,
+      drain_wall_ms: drain_wall_ms,
+      event_started_ms: DateTime.to_unix(event.started_at, :millisecond)
+    }
+  end
+
+  defp anchor([first | _] = drained, event, drain_wall_ms) do
+    last = List.last(drained)
+
+    %{
+      first_pts: first.pts,
+      timescale: first.timescale,
+      # `pts` is a decode time, so the difference between the first and the
+      # last spans the pre-roll's *starts*; the last fragment's own duration is
+      # what carries it to the end of the drained media.
+      drained_span_ms: round((last.pts - first.pts) * 1000 / first.timescale) + last.duration_ms,
+      drain_wall_ms: drain_wall_ms,
+      event_started_ms: DateTime.to_unix(event.started_at, :millisecond)
+    }
+  end
+
+  # Prepend and count. Never `++`, and never `length/1` over the accumulator:
+  # this runs once per observation batch for the whole life of the event, and
+  # the accumulator is the thing that grows.
+  #
+  # The cap is a clean tail cut. The first batch that would cross it is dropped
+  # whole rather than split, and every batch after it is dropped too, however
+  # small — that is what the first clause is for. Letting later batches that
+  # still fit trickle in would leave the stored path sampled at random
+  # intervals with nothing marking the holes, and a viewer draws a straight
+  # line across each one; a path that simply stops is the honest answer, and
+  # `truncated` in the header is what explains it. An event long enough to
+  # reach the cap has already recorded the minutes someone opened it for, and
+  # the tail is the cheaper end to lose.
+  defp buffer_boxes(%{track_truncated: true} = state, _t_ms, _boxes), do: state
+  defp buffer_boxes(state, _t_ms, []), do: state
+
+  defp buffer_boxes(state, t_ms, boxes) do
+    count = length(boxes)
+
+    if state.track_entries + count > state.max_path_entries do
+      warn_capped(state)
+    else
+      %{
+        state
+        | track_boxes: [{t_ms, boxes} | state.track_boxes],
+          track_entries: state.track_entries + count
+      }
+    end
+  end
+
+  # Reached exactly once per event: the batch that trips the cap sets the flag,
+  # and the clause above drops every later batch without coming back here. At
+  # the ~10 batches a second the aggregator forwards, a per-batch line would be
+  # a log file.
+  defp warn_capped(state) do
+    Logger.warning(
+      "event #{state.event.id}: track path capped at #{state.max_path_entries} boxes; " <>
+        "the rest of the event is not recorded in it"
+    )
+
+    %{state | track_truncated: true}
+  end
+
+  # The sidecar, and only for a clip the index accepted: the failure branches
+  # never call this, and an event whose recording crashed never reaches
+  # finalize at all. An event that buffered no boxes writes no file either —
+  # "has this event a path to draw" is then one `File.exists?` for every case
+  # rather than a decode that finds zero tracks.
+  #
+  # Non-fatal, and total: the clip and its row are already good by the time
+  # this runs, so nothing here may change what the event is announced as. A
+  # failure leaves the same absent file as an event with no boxes.
+  defp write_track_path(_event, %{track_boxes: []}), do: :ok
+
+  defp write_track_path(event, state) do
+    header = %{
+      event_id: event.id,
+      camera_id: state.camera.id,
+      truncated: state.track_truncated,
+      anchor: state.anchor
+    }
+
+    case File.write(
+           DataDir.trackpath_for_clip(state.path),
+           TrackPath.encode(header, state.track_boxes)
+         ) do
+      :ok -> :ok
+      {:error, reason} -> log_track_path_failed(event, inspect(reason))
+    end
+  rescue
+    # As broad as `close_clip/2`'s rescue and for the same reason: this call
+    # sits after `:event_ended` and before `:event_clip_ready`, so anything
+    # raised in encoding or writing would strand a consumer waiting on a frame
+    # for a clip that is finished and indexed. The sidecar is the one thing
+    # here that is allowed to be lost.
+    e -> log_track_path_failed(event, Exception.message(e))
+  end
+
+  defp log_track_path_failed(event, reason) do
+    Logger.error("event #{event.id}: track path write failed: #{reason}")
+  end
 
   # Everything between "the window closed" and "we know what the clip is":
   # closing a `:delayed_write` handle (a deferred write error surfaces here),

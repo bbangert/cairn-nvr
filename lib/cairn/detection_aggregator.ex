@@ -56,6 +56,14 @@ defmodule Cairn.DetectionAggregator do
   `record_final/3`). Recording being disabled at runtime does not enter into
   it: rows without video are the point of the two tiers.
 
+  While an event is open, the tagged boxes of every batch are also cast to
+  that event's `Cairn.EventExtractor`, which buffers them and writes the dense
+  track-path sidecar next to the clip when it finalizes (`Cairn.TrackPath`).
+  Those casts are unfiltered where everything above is filtered — a path is
+  drawn for objects that never earned video, predicted and stationary ones
+  included — and their delivery order relative to the finalize cast is what
+  keeps the last batch of an event; see `forward_boxes/3`.
+
   Subscribes to `Cairn.StreamEpochs`: a new epoch for a camera ends every
   live track (`:stream_reset`) and starts a fresh tracker, so no identity is
   ever inherited across an outage. Turning detection off at runtime ends them
@@ -255,8 +263,45 @@ defmodule Cairn.DetectionAggregator do
         true -> update_event(cam, policy, observation, passing, state)
       end
 
+    # After the lifecycle `cond` and on its result, deliberately: the batch
+    # that opens an event is part of that event's path (at `t_ms` 0), and
+    # before the `cond` `cam.event` would still be nil for it.
+    forward_boxes(cam, observation, tagged)
+
     put_cam(state, camera.id, cam)
   end
+
+  # The dense half of the track viewer: every tagged box of an open event, in
+  # the compact shape `Cairn.TrackPath` reads (`box_entry`).
+  #
+  # Deliberately unfiltered — no `min_score`, no `record:` tier, predicted and
+  # stationary objects kept — because what earns video is a different question
+  # from what is drawn over video already recorded, and a path with holes in it
+  # reads as a second object rather than as a gap.
+  #
+  # **Ordering dependency.** "No last batch is lost" rests on one fact: this
+  # cast and the finalize cast in `maybe_finalize/4` share a sender *and* a
+  # receiver, and the BEAM orders messages per sender/receiver pair — so every
+  # batch sent before finalize is in the extractor's mailbox before it. If
+  # finalize ever becomes a `call`, moves to another process, or travels by
+  # PubSub, the sidecar silently loses however much of its tail the scheduler
+  # decided to, with nothing raised and nothing logged.
+  #
+  # A cast to an extractor that has already exited is a no-op, so nothing here
+  # checks whether the pid is alive.
+  defp forward_boxes(%{event: %Event{} = event, extractor: pid}, observation, tagged)
+       when is_pid(pid) do
+    GenServer.cast(
+      pid,
+      {:track_boxes,
+       %{
+         t_ms: DateTime.diff(observation.observed_at, event.started_at, :millisecond),
+         boxes: Enum.map(tagged, &{&1.object_id, &1.label, &1.bbox, &1.stationary})
+       }}
+    )
+  end
+
+  defp forward_boxes(_cam, _observation, _tagged), do: :ok
 
   # The single gate: the objects this accepts are `passing`, which is what both
   # `start_event/6` and `update_event/5` are handed, so what is refused here
@@ -684,6 +729,12 @@ defmodule Cairn.DetectionAggregator do
         # `:event_clip_ready` can only follow the cast, so a subscriber is
         # guaranteed to learn the window closed before it learns the clip
         # landed. The reverse order lets a fast finalize overtake it.
+        #
+        # That this is a *cast from this process* is load-bearing beyond the
+        # ordering above: it is what puts every `{:track_boxes, _}` this
+        # process already sent (`forward_boxes/3`) ahead of it in the same
+        # mailbox. A `call` here, or a finalize routed through anything else,
+        # truncates the event's track path silently.
         Event.broadcast(:event_ended, event)
         state.finalize_extractor.(cam.extractor, event)
         EventCheckpoint.delete(camera_id)

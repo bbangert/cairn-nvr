@@ -28,8 +28,8 @@ defmodule CairnWeb.Router do
   end
 
   # Media is token-authed like :api but negotiates no format: MediaController
-  # sets the content-type itself (mp4/jpg), and restricting `:accepts` would 406
-  # a player sending `Accept: video/mp4` / `image/jpeg`.
+  # sets the content-type itself (mp4/jpg/msgpack), and restricting `:accepts`
+  # would 406 a player sending `Accept: video/mp4` / `image/jpeg`.
   pipeline :api_media do
     plug CairnWeb.Plugs.ApiAuth
   end
@@ -51,6 +51,7 @@ defmodule CairnWeb.Router do
 
   scope "/media", CairnWeb do
     get "/events/:id", MediaController, :event_clip
+    get "/events/:id/tracks", MediaController, :event_tracks
     get "/snapshots/:id", MediaController, :snapshot
   end
 
@@ -71,12 +72,15 @@ defmodule CairnWeb.Router do
     delete "/webrtc/:resource_id", WhepController, :delete
   end
 
-  # Media reuse: the browser's MediaController (Range-capable) served under the
-  # token-authed :api pipeline, so HA's Media Browser resolves clips/snapshots.
+  # Media reuse: the browser's MediaController (Range-capable on clips) served
+  # under the token-authed :api pipeline, so HA's Media Browser resolves
+  # clips/snapshots. The track sidecar rides along for parity; no HA response
+  # links to it yet.
   scope "/api/media", CairnWeb do
     pipe_through :api_media
 
     get "/events/:id", MediaController, :event_clip
+    get "/events/:id/tracks", MediaController, :event_tracks
     get "/snapshots/:id", MediaController, :snapshot
   end
 

@@ -40,6 +40,7 @@ defmodule Cairn.Tracks do
           from: DateTime.t() | nil,
           to: DateTime.t() | nil,
           recorded: boolean() | nil,
+          zone: String.t() | nil,
           min_stationary_ms: non_neg_integer() | nil,
           page: pos_integer(),
           page_size: pos_integer()
@@ -119,6 +120,30 @@ defmodule Cairn.Tracks do
     |> Repo.all()
   end
 
+  @doc """
+  Every track recorded into one event, oldest first.
+
+  Unpaginated on purpose: a single event's tracks are bounded by what the
+  tracker can hold live, so this is the whole panel in one query. It reads
+  `tracks.event_id`, which carries no foreign key — an event whose row is gone
+  still answers with the tracks that named it.
+
+  `nil` answers `[]` rather than raising. The column is nullable — most tracks
+  never earn video — so `for_event(track.event_id)` is a natural call, and
+  Ecto's `== ^nil` would reject it at the database with "comparison with nil is
+  forbidden". There is no track whose `event_id` is "no event", so the empty
+  list is the honest answer, not a swallowed error.
+  """
+  @spec for_event(String.t() | nil) :: [Track.t()]
+  def for_event(nil), do: []
+
+  def for_event(event_id) do
+    Track
+    |> where([t], t.event_id == ^event_id)
+    |> order_by([t], asc: t.started_at)
+    |> Repo.all()
+  end
+
   @doc "Filterable, offset-paginated track list, newest first."
   @spec list(list_opts()) :: %{tracks: [Track.t()], page: pos_integer(), total: non_neg_integer()}
   def list(opts \\ []) do
@@ -131,6 +156,7 @@ defmodule Cairn.Tracks do
       |> filter_label(opts[:label])
       |> filter_time(opts[:from], opts[:to])
       |> filter_recorded(opts[:recorded])
+      |> filter_zone(opts[:zone])
       |> filter_stationary(opts[:min_stationary_ms])
 
     total = Repo.aggregate(query, :count)
@@ -243,6 +269,31 @@ defmodule Cairn.Tracks do
   defp filter_recorded(query, nil), do: query
   defp filter_recorded(query, true), do: where(query, [t], not is_nil(t.event_id))
   defp filter_recorded(query, false), do: where(query, [t], is_nil(t.event_id))
+
+  defp filter_zone(query, nil), do: query
+  defp filter_zone(query, ""), do: query
+
+  # `zones` is a `{:array, :string}` column, which ecto_sqlite3 stores as JSON
+  # text, so membership is a `json_each` walk rather than a comparison. Like
+  # `filter_label/2` above and unlike `Cairn.Events.filter_label/2`, it needs no
+  # injection-guard regex: the zone is a pinned bind compared against
+  # `json_each.value`, not interpolated into a JSONPath string — there is no
+  # string being built and nothing to guard.
+  #
+  # This has to be SQL: `list/1` counts `total` and pages with limit/offset in
+  # the database, so a post-fetch Elixir filter would return short pages and a
+  # total that ignores the filter.
+  defp filter_zone(query, zone) do
+    where(
+      query,
+      [t],
+      fragment(
+        "EXISTS (SELECT 1 FROM json_each(?) WHERE json_each.value = ?)",
+        t.zones,
+        ^zone
+      )
+    )
+  end
 
   defp filter_stationary(query, nil), do: query
   defp filter_stationary(query, ms), do: where(query, [t], t.stationary_ms >= ^ms)

@@ -6,6 +6,7 @@ defmodule Cairn.Events do
 
   import Ecto.Query
 
+  alias Cairn.DataDir
   alias Cairn.Events.Event
   alias Cairn.Repo
 
@@ -148,10 +149,23 @@ defmodule Cairn.Events do
   @spec delete_row(Event.t()) :: {:ok, Event.t()} | {:error, term()}
   def delete_row(%Event{} = event), do: Repo.delete(event)
 
-  @doc "Deletes an event whole: its clip file, snapshot, and index row."
+  @doc "Deletes an event whole: its clip file, snapshot, track path, and index row."
   @spec delete(Event.t()) :: {:ok, Event.t()} | {:error, term()}
   def delete(%Event{} = event) do
-    if event.path, do: File.rm(event.path)
+    if event.path do
+      File.rm(event.path)
+      # The track-path sidecar is derived from the clip path rather than stored
+      # (`Cairn.DataDir.trackpath_for_clip/1`), so removing it needs no column
+      # and cannot dangle. Retention prune, emergency cleanup (both
+      # `Cairn.Retention.delete_event/1`) and the event page's delete button all
+      # route through here. `Cairn.Reconciler` is the one caller that does not:
+      # it calls `delete_row/1` directly, for a row whose clip file has already
+      # gone missing, and sheds the sidecar itself for the same reason.
+      # Events older than the feature simply have no such file, and `File.rm/1`'s
+      # error is discarded here exactly as the clip's is.
+      File.rm(DataDir.trackpath_for_clip(event.path))
+    end
+
     if event.snapshot_path, do: File.rm(event.snapshot_path)
     delete_row(event)
   end

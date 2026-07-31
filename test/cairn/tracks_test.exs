@@ -165,6 +165,77 @@ defmodule Cairn.TracksTest do
     assert %{tracks: []} = Tracks.list(page: 9, page_size: 2)
   end
 
+  test "for_event returns only that event's tracks, oldest first" do
+    now = DateTime.utc_now()
+    second = seed(%{event_id: "evt_1", started_at: now})
+    first = seed(%{event_id: "evt_1", started_at: DateTime.add(now, -60)})
+    other = seed(%{event_id: "evt_2", started_at: DateTime.add(now, -30)})
+    unrecorded = seed(%{event_id: nil, started_at: DateTime.add(now, -45)})
+
+    assert [a, b] = Tracks.for_event("evt_1")
+    assert [a.id, b.id] == [first.id, second.id]
+
+    assert [%{id: other_id}] = Tracks.for_event("evt_2")
+    assert other_id == other.id
+    assert Tracks.for_event("evt_missing") == []
+
+    # the unrecorded track belongs to no event and must not leak into either
+    refute unrecorded.id in Enum.map(Tracks.for_event("evt_1"), & &1.id)
+  end
+
+  test "for_event(nil) is an empty list, not a database error" do
+    # `event_id` is nullable — most tracks never earn video — so
+    # `for_event(track.event_id)` is a natural call. Ecto rejects `== ^nil`
+    # outright ("comparison with nil is forbidden"), and there is no track
+    # whose event is "no event", so the empty list is the honest answer.
+    seed(%{event_id: nil})
+    seed(%{event_id: "evt_1"})
+
+    assert Tracks.for_event(nil) == []
+  end
+
+  test "zone filter matches array membership and pages on the filtered set" do
+    now = DateTime.utc_now()
+    driveway = seed(%{zones: ["driveway", "porch"], started_at: now})
+    porch_only = seed(%{zones: ["porch"], started_at: DateTime.add(now, -60)})
+    zoneless = seed(%{zones: [], started_at: DateTime.add(now, -120)})
+
+    assert %{total: 1, tracks: [row]} = Tracks.list(zone: "driveway")
+    assert row.id == driveway.id
+    assert row.zones == ["driveway", "porch"]
+
+    assert %{total: 2, tracks: rows} = Tracks.list(zone: "porch")
+    assert Enum.map(rows, & &1.id) == [driveway.id, porch_only.id]
+
+    # no match, and a row with an empty zones array is never a match
+    assert %{total: 0, tracks: []} = Tracks.list(zone: "sidewalk")
+    refute zoneless.id in Enum.map(Tracks.list(zone: "porch").tracks, & &1.id)
+
+    # substring and quoting attempts are compared as whole values, pinned
+    assert %{total: 0} = Tracks.list(zone: "porc")
+    assert %{total: 0} = Tracks.list(zone: "porch' OR 1=1 --")
+
+    # `total` reflects the filter, not the table: 2 of 3 rows match, so page 2
+    # of size 1 is the second match and page 3 is empty
+    assert %{total: 2, page: 2, tracks: [second]} =
+             Tracks.list(zone: "porch", page: 2, page_size: 1)
+
+    assert second.id == porch_only.id
+    assert %{total: 2, tracks: []} = Tracks.list(zone: "porch", page: 3, page_size: 1)
+  end
+
+  test "zone filter passes through on nil and empty string" do
+    seed(%{zones: ["driveway"]})
+    seed(%{zones: []})
+
+    assert %{total: 2} = Tracks.list(zone: nil)
+    assert %{total: 2} = Tracks.list(zone: "")
+    assert %{total: 2} = Tracks.list()
+    # combines with the other filters rather than replacing them
+    assert %{total: 1} = Tracks.list(zone: "driveway", camera: "cam_a")
+    assert %{total: 0} = Tracks.list(zone: "driveway", camera: "cam_b")
+  end
+
   test "moments come back oldest first regardless of insert order" do
     now = DateTime.utc_now()
     later = DateTime.add(now, 10)
