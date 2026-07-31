@@ -1,23 +1,26 @@
 defmodule Cairn.Retention do
   @moduledoc """
-  Two periodic sweeps over the event index:
+  Two periodic sweeps over the stored history:
 
     * **Retention prune** (hourly): deletes clip + snapshot + row once an
       event outlives its effective retention — the max of the per-label
       overrides for labels present in the event (camera-level overrides
-      win over globals, see `Cairn.Config.retention_days/3`).
+      win over globals, see `Cairn.Config.retention_days/3`). The same pass
+      then expires track rows on their own, much longer clock
+      (`retention.tracks_days`), which has no per-camera or per-label form.
     * **Emergency disk cleanup** (every 60s): when free space under
       `data_dir` drops below `free_space_min_mb`, deletes oldest events
       regardless of retention until above the threshold, and broadcasts a
       persistent alert on `"system:alerts"` (`{:disk_alert, %{active:
-      boolean, free_mb: n, threshold_mb: n}}`).
+      boolean, free_mb: n, threshold_mb: n}}`). Tracks are never touched by
+      this path.
   """
 
   use GenServer
 
   require Logger
 
-  alias Cairn.{Config, Events}
+  alias Cairn.{Config, Events, Tracks}
 
   @topic "system:alerts"
   @prune_interval_ms :timer.hours(1)
@@ -110,10 +113,29 @@ defmodule Cairn.Retention do
       end)
 
     if deleted > 0, do: Logger.info("retention: pruned #{deleted} events")
+
+    prune_tracks(config, now)
+
+    # the return is the event count alone — the track sweep reports through the
+    # log, since nothing calls this for a total
     deleted
   end
 
-  # the earliest anything could expire — used to narrow the candidate query
+  # Track rows run on their own clock, off the same `now` as the event sweep so
+  # one pass has one notion of the present. Live tracks are never eligible
+  # however old they are — `delete_ended_before/1` compares `ended_at`, which is
+  # NULL until a track finishes. Moments go with their track by cascade.
+  defp prune_tracks(config, now) do
+    count =
+      now
+      |> DateTime.add(-config.retention_tracks_days * 86_400, :second)
+      |> Tracks.delete_ended_before()
+
+    if count > 0, do: Logger.info("retention: pruned #{count} tracks")
+    count
+  end
+
+  # the earliest any event could expire — used to narrow the candidate query
   defp min_retention_days(config) do
     camera_days =
       for cam <- config.cameras,
@@ -138,6 +160,12 @@ defmodule Cairn.Retention do
 
   # -- emergency --------------------------------------------------------------
 
+  # Clips only, deliberately: this path deletes events and never tracks. A
+  # track row is a few hundred bytes against megabytes for a clip, so pruning
+  # tracks would reclaim nothing worth having while destroying the audit record
+  # — "what did the system see and not record?" — that is the reason to keep
+  # them past the clips at all. If deleting every event still leaves the disk
+  # full, the track index is not what filled it.
   defp run_emergency(state) do
     config = state.config_fun.()
     threshold = config.free_space_min_mb * 1024 * 1024

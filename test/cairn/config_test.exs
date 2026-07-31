@@ -176,6 +176,32 @@ defmodule Cairn.ConfigTest do
       refute Enum.any?(warnings, &(&1 =~ "stationary_after_ms"))
     end
 
+    test "retention.tracks_days defaults to a year and parses" do
+      assert {:ok, default, []} = Config.from_map(base_map())
+      assert default.retention_tracks_days == 365
+
+      map = Map.put(base_map(), "retention", %{"days" => 14, "tracks_days" => 90})
+      assert {:ok, config, []} = Config.from_map(map)
+      assert config.retention_tracks_days == 90
+    end
+
+    test "retention.tracks_days is rejected at both ends of the range" do
+      for value <- [0, 10_001, "a year"] do
+        map = Map.put(base_map(), "retention", %{"tracks_days" => value})
+
+        assert {:error, errors} = Config.from_map(map)
+        assert Enum.any?(errors, &(&1 =~ "retention.tracks_days must be >= 1"))
+      end
+    end
+
+    test "an unknown retention key is still only a warning" do
+      map = Map.put(base_map(), "retention", %{"track_days" => 90})
+
+      assert {:ok, config, warnings} = Config.from_map(map)
+      assert Enum.any?(warnings, &(&1 =~ ~s(unknown key "track_days" in retention)))
+      assert config.retention_tracks_days == 365
+    end
+
     test "an unknown tracking key is still only a warning" do
       map = Map.put(base_map(), "tracking", %{"stationary_after_millis" => 20_000})
 
