@@ -38,11 +38,13 @@ events:
   max_event_seconds: 300
 
 # Object tracking (every key here is per-camera overridable under the camera).
-# A track that goes unseen for this much *stream* time is ended; its object_id
-# (a ULID) is never handed to anything else. max_live_tracks caps how many
-# tracks one camera may hold at once — at the cap the least recently seen one
-# is retired (end_reason "evicted"), so a plugin that mints a fresh track id
-# every frame cannot grow the host's state without bound.
+# A track that goes unseen for this much *stream* time is ended — five times
+# that while it is stationary, so a parked object outlasts what parks in front
+# of it; its object_id (a ULID) is never handed to anything else.
+# max_live_tracks caps how many tracks one camera may hold at once — at the cap
+# the least recently seen one is retired (end_reason "evicted"), so a plugin
+# that mints a fresh track id every frame cannot grow the host's state without
+# bound.
 # stationary_after_ms is how long an object's box must hold still, in stream
 # time, before the track is reported as stationary.
 tracking:

@@ -35,13 +35,36 @@ defmodule Cairn.Track do
 
   A final is emitted for every lifecycle transition the aggregator observes:
   expiry, `ended_tracks`, an epoch boundary, an eviction, detection being
-  disabled. It is **not** an unconditional guarantee across a host crash.
-  `Cairn.EventCheckpoint` rows exist only while an event is open, so after an
-  aggregator crash the tracks restored from a checkpoint end as
-  `:host_restart` — and tracks that were live on a camera with *no* open event
-  are simply lost, with no final. A consumer that materializes entities from
-  `track_started` must therefore treat an aggregator restart, not only a
-  `track_ended`, as the end of everything it holds.
+  disabled. It is **not** an unconditional guarantee across a crash, and what
+  a crash costs is different for the two things a final feeds.
+
+  `Cairn.EventCheckpoint` is behind both. It is an ETS table owned outside the
+  aggregator, carrying a row per camera *only while that camera has an open
+  event*, so it survives an aggregator crash but not the node — and even when
+  it survives it knows nothing about a camera that had no event running.
+
+    * **The `"events"` broadcast.** After an aggregator crash the tracks
+      restored from a checkpoint are broadcast as `track_ended` with
+      `:host_restart`. Tracks that were live on a camera with no open event
+      are restored from nothing and get no `track_ended` at all, and a whole
+      node restart loses the table, so nothing is restored and nothing gets a
+      final. A consumer that materializes entities from `track_started` must
+      therefore treat an aggregator restart, not only a `track_ended`, as the
+      end of everything it holds.
+    * **The track index** (`Cairn.Tracks`). `Cairn.TrackRecorder` buffers
+      finished tracks and their moments in its own heap and writes them in
+      batches, so a crash that takes *that* process or the node down loses
+      whatever it had not flushed — deliberately, and on the same terms as an
+      interrupted event written `:partial` (see that module's "Lossy by
+      design"). Past that tail the checkpoint decides the same way:
+      `Cairn.DetectionAggregator`'s restore writes a row for every
+      checkpointed track, linked to the event it was live during, while a
+      track that died on a camera with no open event gets no row either.
+
+  Closing that second gap would be a change to what is checkpointed rather
+  than to this contract: `Cairn.EventCheckpoint` already carries a track list,
+  and only the "while an event is open" rule keeps a quiet camera's live
+  tracks out of it.
 
   Times are the observation's own (`observed_at`), not the wall clock of
   the moment the message was built.

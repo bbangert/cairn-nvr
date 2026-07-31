@@ -105,7 +105,9 @@ defmodule Cairn.Tracker do
 
   The flag is not only reported: expiry keys off it, so anything that reads as
   stationary — either blind spot included — also gets the longer unseen bound
-  and the strict re-match threshold that comes with it.
+  and the strict re-match threshold that comes with it, and
+  `Cairn.DetectionAggregator` refuses it as event evidence for as long as it
+  is set.
 
   Bboxes are `[x, y, w, h]` in any consistent unit (normalized or pixels).
   """

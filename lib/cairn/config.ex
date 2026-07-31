@@ -5,7 +5,9 @@ defmodule Cairn.Config do
   `load/1` parses and validates the file, returning `{:ok, config, warnings}`
   or `{:error, errors}`. Validation is strict on errors (bad values, missing
   required fields, UDP port exhaustion) and lenient on unknown keys, which
-  only produce warnings.
+  only produce warnings. One deliberate exception: an unknown key *inside* a
+  `track:` / `record:` tier rule is an error, because a filter this codebase
+  does not implement yet must not look applied (`Cairn.Config.Camera`).
 
   `CAIRN_DATA_DIR` (env) overrides `data_dir` from the file.
   """
@@ -496,11 +498,13 @@ defmodule Cairn.Config do
 
   # Media-time expiry: below ~100 ms a single dropped frame ends every track;
   # above an hour a track outlives the epoch it belongs to. The live-track cap
-  # has to leave room for a full 64-object frame at the low end and stay a
-  # bound worth having at the high end. The stillness threshold is bounded the
-  # same way from above — beyond an hour it can never fire inside an epoch —
-  # and from below at a second, under which detector jitter, not the object,
-  # decides whether something is stationary.
+  # is bounded only against nonsense — 1 is legal and means a scene of one
+  # track plus an eviction per new object, which is an operator's choice to
+  # make; 10_000 is where it stops being a bound worth having, given a plugin
+  # may send 64 objects per line (`Cairn.PluginProtocol`). The stillness
+  # threshold is bounded the same way from above — beyond an hour it can never
+  # fire inside an epoch — and from below at a second, under which detector
+  # jitter, not the object, decides whether something is stationary.
   defp validate_tracking(acc, config) do
     acc
     |> validate_tracking_key(config, :max_unseen_ms, 100, 3_600_000)

@@ -63,9 +63,11 @@ defmodule Cairn.DetectionAggregator do
 
   Active events are checkpointed to `Cairn.EventCheckpoint` (ETS owned
   elsewhere) together with the tracks live at that moment: on restart the
-  aggregator re-attaches to live extractors, finalizes orphans and ends every
-  restored track (`:host_restart`). Writes are throttled to one a second per
-  camera apart from the event's first and last.
+  aggregator re-attaches to live extractors, finalizes orphans, and ends every
+  restored track (`:host_restart`) — broadcasting it and recording it against
+  the checkpointed event, the open-event rule above. Writes are throttled to
+  one a second per camera apart from the event's first and last. How far that
+  reaches, and what it does not cover, is `Cairn.Track`'s moduledoc.
   """
 
   use GenServer
@@ -530,8 +532,7 @@ defmodule Cairn.DetectionAggregator do
   #
   # The `track:` tier gates only the tracks no event was open for — the audit
   # trail of what the system saw and did not record, where the tier is the
-  # knob for how much of it to keep. (User decision, 2026-07-31, deviating
-  # from the phase plan's unconditional gate.)
+  # knob for how much of it to keep.
   #
   # Every end reason goes through the same rule. `:evicted`, `:stream_reset`,
   # `:detection_disabled` and `:host_restart` are the reasons a reader is most

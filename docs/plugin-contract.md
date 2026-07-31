@@ -177,6 +177,13 @@ for longer than the camera's `tracking.max_unseen_ms` is flagged
 *stale-predicted* and stays out of event evidence until something detects it
 again.
 
+A track is also out of event evidence while Cairn has it flagged
+**stationary** — its box has held still for `tracking.stationary_after_ms` of
+media time. Detections keep coming and the track stays alive; they simply stop
+opening or extending events until the object moves again. Stillness is
+measured from *detected* boxes only, so predictions neither create it nor
+break it.
+
 ### `plugin.hello`
 
 Send once at startup, **before anything else and before you load your model**.
@@ -516,8 +523,9 @@ and on every `track_started` / `track_updated` / `track_ended` frame (see
 Who decides identity depends on one capability:
 
 **Without `capabilities.object_tracking: true`,** `track_id` is ignored
-entirely. Cairn matches boxes host-side by greedy IoU (threshold 0.1) among
-the live tracks *Cairn itself owns* of the same label. Nothing breaks if you
+entirely. Cairn matches boxes host-side by greedy IoU (threshold 0.1, raised
+to 0.7 for a stationary track riding out the extended grace below) among the
+live tracks *Cairn itself owns* of the same label. Nothing breaks if you
 send ids anyway — they are simply decoration. Tracks a plugin owns are never
 IoU candidates, which matters only if you turn the capability off mid-run:
 the tracks you owned until then are unmatchable afterwards and expire on
@@ -545,7 +553,9 @@ the tracks you owned until then are unmatchable afterwards and expire on
   object is dropped.
 - Cairn expires a track you stop mentioning after `max_unseen_ms` of *media*
   time (default 3 s, per-camera configurable) — `ended_tracks` is a courtesy,
-  not a requirement.
+  not a requirement. A track Cairn has judged **stationary** (its box held
+  still for `tracking.stationary_after_ms`) gets five times that bound
+  instead, so a parked object outlasts whatever parks in front of it.
 
 ### Host policy: the live set is bounded
 
@@ -553,8 +563,9 @@ the tracks you owned until then are unmatchable afterwards and expire on
 holding the key to Cairn's memory. Two host-side bounds close that. Neither
 should ever be reachable by a plugin that behaves:
 
-- **Host-clock backstop.** A track whose age on the *host's* clock exceeds
-  **ten times** `max_unseen_ms` is expired whatever your `pts` says. A frozen
+- **Host-clock backstop.** A track unseen on the *host's* clock for more than
+  **ten times** its media-time bound — `max_unseen_ms`, or five times that
+  for a stationary track — is expired whatever your `pts` says. A frozen
   or rewound frame clock cannot keep tracks alive.
 - **Live-track cap.** Each camera holds at most `tracking.max_live_tracks`
   live tracks (default 128, per-camera configurable). At the cap, minting a
@@ -610,11 +621,12 @@ only that much.
 | `status.fps` | 0..10 000 | field dropped |
 | identical `plugin.status` resend | at most 1 per 5 000 ms | extras dropped, counted |
 | drop-summary log | at most 1 per 5 000 ms | — |
-| `tracking.max_unseen_ms` | default 3 000 ms of media time | track ended (`unseen`) |
-| host-clock backstop | 10 × `max_unseen_ms` | track ended (`unseen`) |
+| `tracking.max_unseen_ms` | default 3 000 ms of media time (× 5 while stationary) | track ended (`unseen`) |
+| host-clock backstop | 10 × the applicable media-time bound | track ended (`unseen`) |
 | `tracking.max_live_tracks` | default 128 per camera | least recently seen track evicted |
+| `tracking.stationary_after_ms` | default 10 000 ms of media time | track flagged `stationary`, and no longer event evidence |
 | ended-`track_id` memory | 4 096 per camera tracker | halved; older reuse goes unreported |
-| host IoU match threshold | 0.1 | below it, a new track is minted |
+| host IoU match threshold | 0.1 (0.7 for a stationary track in extended grace) | below it, a new track is minted |
 | `track_updated` throttle | best-score improvement, or 1 000 ms | update not published |
 | respawn backoff | 1 s → 30 s base, ×0.5–1.5 jitter (≈0.5 s → ≈45 s) | — |
 | UDP ports per camera | 4 (`base + 4i` plugin, `+1` its RTCP) | — |
