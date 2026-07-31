@@ -43,6 +43,9 @@ defmodule Cairn.Repo.Migrations.CreateTracksAndTrackEvents do
     end
 
     create index(:tracks, [:camera_id, :started_at])
+    # The default listing is global newest-first; the composite above only
+    # serves it once a camera filter is applied.
+    create index(:tracks, [:started_at])
     create index(:tracks, [:label])
     create index(:tracks, [:event_id])
     # The retention sweep's cutoff column.
@@ -62,6 +65,8 @@ defmodule Cairn.Repo.Migrations.CreateTracksAndTrackEvents do
       # inserted at flush time would only record the recorder's buffering lag.
     end
 
-    create index(:track_events, [:track_id])
+    # Composite rather than `track_id` alone: `moments/1` filters by track and
+    # orders by `at`, and this serves both without a separate sort.
+    create index(:track_events, [:track_id, :at])
   end
 end
