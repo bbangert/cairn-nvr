@@ -738,6 +738,13 @@ defmodule Cairn.DetectionAggregatorTest do
     assert_receive {:extractor_started, %Event{id: eid}, ex_pid}
     assert_receive {:event_started, _}
 
+    # The stub hands the extractor pid to the test *before* `start_event/6`
+    # has monitored it, so a kill delivered inside that window makes
+    # `Process.monitor/1` answer `:noproc` — which the DOWN handler reads as a
+    # clean finish, and no `:partial` is ever announced. Draining the
+    # aggregator's mailbox first puts the kill unambiguously after the monitor,
+    # which is the case under test.
+    _ = :sys.get_state(agg)
     Process.exit(ex_pid, :kill)
 
     assert_receive {:event_ended, %Event{id: ^eid, status: :partial}}
