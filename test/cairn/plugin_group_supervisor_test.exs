@@ -122,6 +122,28 @@ defmodule Cairn.PluginGroupSupervisorTest do
     assert {%Camera{post_window_seconds: 42}, %{post: 42}} = :sys.get_state(pid).routes[cam.id]
   end
 
+  test "apply_diff refreshes surviving groups whatever the diff's camera list says" do
+    a = "gs_refdiff_#{System.unique_integer([:positive])}"
+    cam = camera("cam_#{a}")
+
+    :ok = PluginGroupSupervisor.sync(config([group(a, [cam.id])], [cam]))
+    pid = Cairn.Registry.whereis(a, :plugin_group)
+
+    # `refreshed` is a *camera* classification and this supervisor ignores it:
+    # the member's window moved, the group did not, and the empty list is no
+    # reason to leave the routes on the pre-reload camera struct
+    widened = %Camera{cam | post_window_seconds: 42}
+
+    :ok =
+      PluginGroupSupervisor.apply_diff(
+        %{added: [], removed: [], changed: [], refreshed: []},
+        config([group(a, [cam.id])], [widened])
+      )
+
+    assert Cairn.Registry.whereis(a, :plugin_group) == pid
+    assert {%Camera{post_window_seconds: 42}, %{post: 42}} = :sys.get_state(pid).routes[cam.id]
+  end
+
   test "apply_diff stops removed groups" do
     a = "gs_rm_#{System.unique_integer([:positive])}"
     cam = camera("cam_#{a}")

@@ -203,11 +203,13 @@ defmodule Cairn.Config do
   Everything the detection pipeline needs for a camera in one map: the event
   windows, the tracking settings, and the two host-side threshold tiers.
 
-  The plugin ports resolve it once and hand it to `Cairn.DetectionAggregator`
-  with every observation, so the aggregator never calls the config server on
-  a per-frame path. `Cairn.PluginPort` and `Cairn.PluginGroupPort` both take
-  their whole policy from this function and forward it unmodified, so every
-  key added here reaches the aggregator through that same plumbing.
+  The plugin ports resolve it off the per-frame path — at init and again on
+  each `refresh/3` — and hand the result to `Cairn.DetectionAggregator` with
+  every observation, so the aggregator never calls the config server per
+  frame. `Cairn.PluginPort` and `Cairn.PluginGroupPort` both take their whole
+  policy from this function and forward it unmodified, so every key added
+  here reaches the aggregator through that same plumbing — and reaches a
+  *running* camera only through those two refreshes.
 
   `:track` and `:record` are the camera's parsed tiers verbatim, `nil` when
   the block is absent. Resolve a label against one with `tier_threshold/3`

@@ -49,7 +49,16 @@ defmodule Cairn.PluginGroupSupervisor do
     end)
   end
 
-  @doc "Applies a `Cairn.Config.Server` reload diff against `new_config`."
+  @doc """
+  Applies a `Cairn.Config.Server` reload diff against `new_config`.
+
+  A group diff's `refreshed` list is always empty, and this function would
+  ignore it either way: `sync/1` already hands every surviving group the new
+  config unconditionally, and it has to. `diff_plugin_groups/2` compares
+  groups, while what a refresh carries is the *member cameras'* host-side
+  fields — those move without the group itself changing at all, so nothing in
+  this diff could single them out.
+  """
   @spec apply_diff(Config.Server.diff(), Config.t()) :: :ok
   def apply_diff(diff, %Config{} = new_config) do
     Enum.each(diff.removed ++ diff.changed, &stop_group/1)
