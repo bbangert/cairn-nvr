@@ -168,7 +168,7 @@ defmodule CairnWeb.ConfigLive do
           <div
             :if={
               @reload_result.diff.added != [] or @reload_result.diff.removed != [] or
-                @reload_result.diff.changed != []
+                @reload_result.diff.changed != [] or @reload_result.diff.refreshed != []
             }
             style="display: flex; gap: 6px; flex-wrap: wrap;"
           >
@@ -179,7 +179,14 @@ defmodule CairnWeb.ConfigLive do
               <span class="hs-dot"></span>removed {id}
             </span>
             <span :for={id <- @reload_result.diff.changed} class="hs-badge hs-badge--accent">
-              <span class="hs-dot"></span>changed {id}
+              <span class="hs-dot"></span>restarted {id}
+            </span>
+            <%!-- Distinguished from "restarted" because the difference is what the
+                  operator will see: a refreshed camera keeps its stream and its
+                  live tracks, which is the whole point of tuning thresholds on a
+                  running system. --%>
+            <span :for={id <- @reload_result.diff.refreshed} class="hs-badge">
+              <span class="hs-dot"></span>updated {id}
             </span>
           </div>
           <div

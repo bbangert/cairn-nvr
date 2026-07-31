@@ -27,6 +27,13 @@ defmodule Cairn.PluginPort do
   resent as such; what a failed write does is leave the epoch unrecorded, so
   the next epoch event — or the next spawn's pull from ETS — announces it
   again rather than leaving the plugin on an epoch the host never gave it.
+
+  The argv is fixed for the process's lifetime — a config change to anything
+  it carries restarts the camera, as does `pre_window_seconds` (the ring is
+  sized at tree init). Camera fields the argv does not carry (the `post` and
+  `max` windows, the tracking bounds, the `track:` / `record:` tiers,
+  retention) are refreshed in place by `refresh/3` instead (see
+  `Cairn.CameraSupervisor`).
   """
 
   use GenServer
@@ -73,6 +80,29 @@ defmodule Cairn.PluginPort do
     GenServer.start_link(__MODULE__, opts, name: Cairn.Registry.via(cam.id, :plugin))
   end
 
+  @doc """
+  Point a running plugin at a new camera and config without touching its OS
+  process.
+
+  Camera fields the launch argv does not carry — the `post` and `max` event
+  windows, the tracking bounds, the `track:` / `record:` tiers, the camera
+  struct handed to the aggregator — change on reload without changing the
+  subprocess, so `state.policy` has to be recomputed in place. Restarting an
+  accelerator-holding process over Elixir-side state is exactly what the
+  restart-only-on-config-change policy exists to avoid, and it would cut
+  every live track on the camera.
+
+  This never touches `state.port`, the stdin control channel's framing, the
+  epoch this plugin process has been told about, or the backoff. The fields
+  that *do* reach the argv (and `pre_window_seconds`, baked into the ring at
+  tree init) restart the camera instead — see
+  `Cairn.Config.Server.diff_cameras/2`.
+  """
+  @spec refresh(GenServer.server(), Cairn.Config.Camera.t(), Cairn.Config.t()) :: :ok
+  def refresh(server, %Cairn.Config.Camera{} = camera, %Cairn.Config{} = config) do
+    GenServer.cast(server, {:refresh, camera, config})
+  end
+
   @doc "Argv for the camera's inline plugin command plus contract arguments."
   @spec build_argv(Cairn.Config.Camera.t(), pos_integer()) :: [String.t()]
   def build_argv(%Cairn.Config.Camera{plugin: {:inline, argv}} = cam, udp_port) do
@@ -100,10 +130,12 @@ defmodule Cairn.PluginPort do
     state = %__MODULE__{
       camera: camera,
       config: config,
-      # Computed once, not per line: a reload that changes a camera's
-      # effective policy also restarts its tree, because
-      # `Cairn.Config.Server.camera_changed?/4` compares `Config.policy/2`
-      # (not just the camera struct) when diffing.
+      # Resolved once, not per line: the per-frame path must never reach the
+      # config server. A reload that moves the effective policy without
+      # touching this camera's argv does *not* restart the tree — it is
+      # `refreshed` in `Cairn.Config.Server.diff_cameras/2` — so `refresh/3`
+      # is what keeps this field current, and any new policy input has to
+      # arrive through it or go stale here.
       policy: Cairn.Config.policy(config, camera),
       index: Keyword.get(opts, :index, 0),
       backoff_ms: Keyword.get(opts, :backoff_min_ms, @backoff_min_ms),
@@ -112,6 +144,12 @@ defmodule Cairn.PluginPort do
 
     send(self(), :spawn)
     {:ok, state}
+  end
+
+  @impl true
+  def handle_cast({:refresh, camera, config}, state) do
+    {:noreply,
+     %{state | camera: camera, config: config, policy: Cairn.Config.policy(config, camera)}}
   end
 
   @impl true

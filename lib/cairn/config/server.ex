@@ -2,7 +2,8 @@ defmodule Cairn.Config.Server do
   @moduledoc """
   Holds the active `Cairn.Config`. Loads YAML at boot; `reload/0` re-reads,
   validates, diffs plugin groups and cameras against the running set and
-  applies both diffs (start/stop/restart group and camera children). An
+  applies both diffs (start/stop/restart group and camera children, and
+  refresh in place the cameras whose change reaches no subprocess). An
   invalid reload keeps the old config and returns the errors.
 
   Group children are applied before camera children: a group bakes its
@@ -16,7 +17,12 @@ defmodule Cairn.Config.Server do
 
   alias Cairn.Config
 
-  @type diff :: %{added: [String.t()], removed: [String.t()], changed: [String.t()]}
+  @type diff :: %{
+          added: [String.t()],
+          removed: [String.t()],
+          changed: [String.t()],
+          refreshed: [String.t()]
+        }
 
   def start_link(opts) do
     case Keyword.get(opts, :name, __MODULE__) do
@@ -116,17 +122,22 @@ defmodule Cairn.Config.Server do
     old_ids = MapSet.new(Map.keys(old_by_id))
     new_ids = MapSet.new(Map.keys(new_by_id))
 
-    changed =
-      for id <- MapSet.intersection(old_ids, new_ids),
-          camera_changed?(
-            old,
-            new,
-            {old_by_id[id], old_index[id]},
-            {new_by_id[id], new_index[id]}
-          ),
-          do: id
+    # `changed` restarts the camera's tree, `refreshed` hands the running one
+    # the new config: a camera is in exactly one of them, and in neither when
+    # nothing about it moved.
+    {changed, refreshed} =
+      Enum.reduce(MapSet.intersection(old_ids, new_ids), {[], []}, fn id, {changed, refreshed} ->
+        old_side = {old_by_id[id], old_index[id]}
+        new_side = {new_by_id[id], new_index[id]}
 
-    diff(old_ids, new_ids, changed)
+        cond do
+          camera_changed?(old, new, old_side, new_side) -> {[id | changed], refreshed}
+          camera_refreshed?(old, new, old_side, new_side) -> {changed, [id | refreshed]}
+          true -> {changed, refreshed}
+        end
+      end)
+
+    diff(old_ids, new_ids, changed, refreshed)
   end
 
   @doc false
@@ -142,28 +153,81 @@ defmodule Cairn.Config.Server do
           old_by_name[name] != new_by_name[name],
           do: name
 
-    diff(old_names, new_names, changed)
+    # Groups never classify as `refreshed`: `Cairn.PluginGroupSupervisor`
+    # refreshes every surviving group on every sync, whether or not anything
+    # about it moved, so there is nothing for this diff to single out.
+    diff(old_names, new_names, changed, [])
   end
 
-  # A camera's UDP ports are positional, so moving in the `cameras:` list is
-  # as much a restart as changing a field. The effective policy is compared
-  # too: a global window or tracking change leaves the camera struct itself
-  # untouched, but the port bakes the resolved policy into every observation
-  # it forwards.
+  # The camera inputs that reach a subprocess or are baked into a child spec
+  # at tree init, and so cannot be swapped into a running camera:
+  # `rtsp_url`, `transcode` and `extra_ffmpeg_args` are ffmpeg's argv;
+  # `plugin` and `min_score` are the plugin's (`--min-score-json` inline, the
+  # member entry in a group's `--cameras-json`).
+  #
+  # `min_score` is here for the *inline* camera. For a `{:group, _}` one the
+  # tree restart delivers nothing — the group's argv is rebuilt from
+  # `Cairn.Config`'s `members_for/2` and reaches the plugin through
+  # `diff_plugin_groups/2`'s whole-struct comparison instead — but the bounce
+  # is harmless, and dropping the field for group members would silently stop
+  # inline cameras from ever seeing a new wire floor.
+  #
+  # The contract for a field added to `Cairn.Config.Camera` later: the
+  # default is refresh-only. Nothing lands in this list by being new — it
+  # goes here only on the deliberate finding that it reaches a subprocess.
+  @restart_fields [:rtsp_url, :plugin, :min_score, :transcode, :extra_ffmpeg_args]
+
+  # Two things are compared *resolved* rather than read off the camera
+  # struct, because both are baked at tree init out of config the struct does
+  # not carry:
+  #
+  #   * the UDP ports. They are positional (`Cairn.UDPPorts`), so moving in
+  #     the `cameras:` list shifts them — and so does a global
+  #     `udp.base_port` edit, which moves every camera's ports while leaving
+  #     every camera struct and every index untouched. The index is what the
+  #     tree is handed; the ports are what it means, and only comparing the
+  #     ports catches the global edit.
+  #   * `pre_window_seconds` (camera override or global). `Cairn.Camera.init/1`
+  #     bakes it into the RingBuffer child spec, so a pre-window refreshed in
+  #     place would leave the ring at its old capacity while everything else
+  #     believed the new one.
+  #
+  # The rest of the effective policy — `post`/`max`, the tracking bounds, the
+  # `track:` / `record:` tiers — is host-side and refreshes
+  # (`Cairn.PluginPort.refresh/3`).
   defp camera_changed?(old, new, {old_cam, old_index}, {new_cam, new_index}) do
-    old_cam != new_cam or old_index != new_index or
-      Config.policy(old, old_cam) != Config.policy(new, new_cam)
+    old_index != new_index or
+      udp_ports(old, old_index) != udp_ports(new, new_index) or
+      Map.take(old_cam, @restart_fields) != Map.take(new_cam, @restart_fields) or
+      Config.windows(old, old_cam).pre != Config.windows(new, new_cam).pre
+  end
+
+  # A validated config always carries an integer `udp_base_port` (`Cairn.Config`
+  # rejects a missing one), but this compares two arbitrary configs: an
+  # unvalidated one answers `nil` here rather than raising out of a reload.
+  defp udp_ports(%Config{udp_base_port: base} = config, index) when is_integer(base),
+    do: Cairn.UDPPorts.ports_for(config, index)
+
+  defp udp_ports(_config, _index), do: nil
+
+  # Everything else the running camera was handed: the camera struct itself
+  # (the tiers, retention, the refresh-only windows) and its effective
+  # policy, which a *global* window or tracking edit moves without touching
+  # the struct.
+  defp camera_refreshed?(old, new, {old_cam, _old_index}, {new_cam, _new_index}) do
+    old_cam != new_cam or Config.policy(old, old_cam) != Config.policy(new, new_cam)
   end
 
   defp index_by_id(cameras) do
     cameras |> Enum.with_index() |> Map.new(fn {cam, index} -> {cam.id, index} end)
   end
 
-  defp diff(old_keys, new_keys, changed) do
+  defp diff(old_keys, new_keys, changed, refreshed) do
     %{
       added: MapSet.difference(new_keys, old_keys) |> Enum.sort(),
       removed: MapSet.difference(old_keys, new_keys) |> Enum.sort(),
-      changed: Enum.sort(changed)
+      changed: Enum.sort(changed),
+      refreshed: Enum.sort(refreshed)
     }
   end
 

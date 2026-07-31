@@ -687,6 +687,92 @@ defmodule Cairn.PluginPortTest do
     end
   end
 
+  test "refresh swaps the policy without restarting the plugin process" do
+    id = "plug_refresh_#{System.unique_integer([:positive])}"
+
+    # the second line has to arrive after the refresh cast is handled, so the
+    # fake's window is wide and the cast is flushed synchronously below
+    command =
+      printf([det_line(1, [det("person", "0.9", "[0, 0, 1, 1]")])]) <>
+        "; sleep 5; " <>
+        printf([det_line(2, [det("person", "0.9", "[0, 0, 1, 1]")])]) <> "; exec sleep 30"
+
+    pid =
+      start_supervised!(
+        {PluginPort,
+         camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
+      )
+
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, policy, %Observation{pts: 1}}},
+                   5_000
+
+    assert policy.post == 10
+    %PluginPort{port: port, os_pid: os_pid} = :sys.get_state(pid)
+
+    # a camera field the argv never carried: the subprocess has nothing to
+    # learn about it, so it keeps running
+    widened = %Camera{camera(id) | post_window_seconds: 42}
+    :ok = PluginPort.refresh(pid, widened, config())
+    # flush the cast: it must be handled before the fake emits line 2
+    _ = :sys.get_state(pid)
+
+    assert_receive {:"$gen_cast",
+                    {:detections, %Camera{id: ^id, post_window_seconds: 42}, %{post: 42},
+                     %Observation{pts: 2}}},
+                   10_000
+
+    # same Port and same OS process: no respawn, no epoch re-announcement,
+    # nothing the plugin can observe
+    assert %PluginPort{port: ^port, os_pid: ^os_pid} = :sys.get_state(pid)
+  end
+
+  test "refresh during backoff swaps the policy and leaves the respawn alone" do
+    id = "plug_bkoff_#{System.unique_integer([:positive])}"
+
+    # exits at once and then waits out a backoff long enough that the respawn
+    # cannot land inside this test
+    pid =
+      start_supervised!(
+        {PluginPort,
+         camera: camera(id),
+         config: config(),
+         index: 0,
+         command: "exit 0",
+         aggregator: self(),
+         backoff_min_ms: 60_000,
+         backoff_max_ms: 60_000}
+      )
+
+    capture_log(fn ->
+      %PluginPort{backoff_ms: backoff} = await_backoff(pid)
+
+      widened = %Camera{camera(id) | post_window_seconds: 42}
+      :ok = PluginPort.refresh(pid, widened, config())
+
+      # there is no port to write to and the cast never looks for one: the
+      # scheduled respawn, the backoff it will use and the epoch state are
+      # all left exactly where the exit put them
+      assert %PluginPort{
+               port: nil,
+               os_pid: nil,
+               epoch: nil,
+               backoff_ms: ^backoff,
+               policy: %{post: 42},
+               camera: %Camera{post_window_seconds: 42}
+             } = :sys.get_state(pid)
+    end)
+  end
+
+  # Flunks rather than returning the pre-exit state: "refreshed during
+  # backoff" proves nothing if the port was still up.
+  defp await_backoff(pid, attempts \\ 200) do
+    case :sys.get_state(pid) do
+      %PluginPort{port: nil} = state -> state
+      _ when attempts > 0 -> Process.sleep(25) && await_backoff(pid, attempts - 1)
+      _ -> flunk("plugin port never entered backoff")
+    end
+  end
+
   test "plugin exit triggers backoff respawn" do
     id = "plug_#{System.unique_integer([:positive])}"
 

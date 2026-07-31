@@ -44,9 +44,14 @@ mix phx.server                     # http://localhost:4000
 ```
 
 `config.yml` is the source of truth (path via `CAIRN_CONFIG`); the UI
-renders it read-only and can hot-reload it (`/config` → Reload —
-added/removed/changed cameras are started/stopped/restarted, invalid
-files are rejected with the old config kept).
+renders it read-only and can hot-reload it (`/config` → Reload — added and
+removed cameras are started and stopped; a change that reaches a subprocess
+(`rtsp_url`, `plugin`, `min_score`, `transcode`, `extra_ffmpeg_args`, the
+pre-event window, or anything that shifts its UDP ports — its position in the
+list, or a global `udp.base_port`) restarts that camera, and everything else — the `track:` / `record:` tiers, the post/max windows,
+tracking bounds, retention — is applied to the running camera without cutting
+its stream or its live tracks. Invalid files are rejected with the old config
+kept).
 
 ## Configuration reference
 

@@ -111,6 +111,10 @@ cameras: []
 #    #   track      does the detection earn a row in the track log.
 #    #   record     does the detection trigger video.
 #    #
+#    # Unlike `min_score`, the two host-side tiers are applied to a running
+#    # camera on Reload: tuning them costs neither the stream nor the live
+#    # tracks you are tuning against.
+#    #
 #    # With the three blocks below: everything above 0.4 reaches the host;
 #    # people at 0.4 and cats at 0.5 get track rows; only people, and only at
 #    # 0.6, ever start a recording. So cats are logged but never filmed, and
