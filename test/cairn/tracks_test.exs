@@ -110,6 +110,16 @@ defmodule Cairn.TracksTest do
     assert Tracks.get(recent_ended.id) != nil
   end
 
+  test "delete_ended_before is exclusive at the cutoff instant" do
+    cutoff = DateTime.add(DateTime.utc_now(), -7 * 86_400)
+    at_cutoff = seed(%{started_at: cutoff, ended_at: cutoff})
+
+    # strictly `<`: a track that ended at the cutoff instant survives this
+    # sweep and falls to the next one
+    assert Tracks.delete_ended_before(cutoff) == 0
+    assert Tracks.get(at_cutoff.id) != nil
+  end
+
   test "recorded: false lists exactly the tracks that never made a clip" do
     unrecorded = seed(%{label: "cat"})
     recorded = seed(%{event_id: "evt_1"})

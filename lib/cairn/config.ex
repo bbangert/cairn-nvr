@@ -17,7 +17,7 @@ defmodule Cairn.Config do
                  plugins integrations tracking)
   @known_udp_keys ~w(base_port range)
   @known_events_keys ~w(pre_window_seconds post_window_seconds max_event_seconds)
-  @known_retention_keys ~w(days per_label)
+  @known_retention_keys ~w(days per_label tracks_days)
   @known_integrations_keys ~w(token)
   @known_tracking_keys ~w(max_unseen_ms max_live_tracks stationary_after_ms)
   @name_regex ~r/\A[a-z0-9][a-z0-9_-]*\z/
@@ -43,6 +43,13 @@ defmodule Cairn.Config do
   # at a gate is not called parked; short enough that a package left on the
   # step is reported while the event that dropped it is still open.
   @default_stationary_after_ms 10_000
+  # How long track rows outlive the clips they describe. Deliberately far
+  # longer than `retention_days`: the track log is the instrument for tuning
+  # the filters, and a year of "what did the system see and not record?" is the
+  # whole point of keeping it. It costs almost nothing — a track row is
+  # hundreds of bytes against megabytes for a clip — so the two clocks are not
+  # trading off against each other.
+  @default_retention_tracks_days 365
 
   defstruct data_dir: "data",
             stall_seconds: 15,
@@ -55,6 +62,7 @@ defmodule Cairn.Config do
             max_event_seconds: 300,
             retention_days: 14,
             retention_per_label: %{},
+            retention_tracks_days: @default_retention_tracks_days,
             max_unseen_ms: @default_max_unseen_ms,
             max_live_tracks: @default_max_live_tracks,
             stationary_after_ms: @default_stationary_after_ms,
@@ -146,6 +154,7 @@ defmodule Cairn.Config do
       max_event_seconds: get_in(map, ["events", "max_event_seconds"]) || 300,
       retention_days: get_in(map, ["retention", "days"]) || 14,
       retention_per_label: get_in(map, ["retention", "per_label"]) || %{},
+      retention_tracks_days: configured_retention_tracks_days(map),
       max_unseen_ms: configured_max_unseen_ms(map),
       max_live_tracks: configured_max_live_tracks(map),
       stationary_after_ms: configured_stationary_after_ms(map),
@@ -181,6 +190,14 @@ defmodule Cairn.Config do
 
   defp configured_stationary_after_ms(map),
     do: get_in(map, ["tracking", "stationary_after_ms"]) || @default_stationary_after_ms
+
+  # Global only: one clock for the whole track log, with none of the
+  # per-camera or per-label forms `retention.days` has. Those exist to buy disk
+  # back on clips. Splitting the audit record by label instead would make "what
+  # did the system see and not record?" answerable only for the labels someone
+  # already thought to keep, which is the question backwards.
+  defp configured_retention_tracks_days(map),
+    do: get_in(map, ["retention", "tracks_days"]) || @default_retention_tracks_days
 
   @doc """
   Everything the detection pipeline needs for a camera in one map: the event
@@ -623,6 +640,7 @@ defmodule Cairn.Config do
     |> check(int?(config.stall_seconds, 1, 3600), "stall_seconds must be 1..3600")
     |> check(int?(config.free_space_min_mb, 0, 10_000_000), "free_space_min_mb must be >= 0")
     |> check(int?(config.retention_days, 1, 10_000), "retention.days must be >= 1")
+    |> check(int?(config.retention_tracks_days, 1, 10_000), "retention.tracks_days must be >= 1")
     |> check(is_binary(config.data_dir), "data_dir must be a string")
   end
 

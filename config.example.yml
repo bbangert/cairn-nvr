@@ -50,11 +50,16 @@ tracking:
   max_live_tracks: 128
   stationary_after_ms: 10000
 
-# Days to keep event clips; per-label overrides win.
+# Days to keep event clips; per-label overrides win. Track rows keep their own
+# clock (tracks_days) and are exempt from emergency disk cleanup.
 retention:
   days: 14
   per_label:
     person: 30
+  # Days to keep track rows — the log of what was seen, recorded or not. One
+  # global clock, no per-camera or per-label form, and far longer than `days`:
+  # rows cost hundreds of bytes where clips cost megabytes.
+  tracks_days: 365
 
 # Third-party integrations. The Home Assistant API (/api) is disabled unless a
 # token is set here; requests must send it as `Authorization: Bearer <token>`

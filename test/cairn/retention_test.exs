@@ -2,7 +2,7 @@ defmodule Cairn.RetentionTest do
   use Cairn.DataCase, async: false
 
   alias Cairn.Config.Camera
-  alias Cairn.{Config, Event, Events, Retention}
+  alias Cairn.{Config, Event, Events, Retention, Tracks}
 
   setup do
     dir = Path.join(System.tmp_dir!(), "cairn_ret_#{System.unique_integer([:positive])}")
@@ -44,6 +44,29 @@ defmodule Cairn.RetentionTest do
     row
   end
 
+  # `ended_days_ago` nil is a live track: still running, never ended.
+  defp seed_track(started_days_ago, ended_days_ago) do
+    now = DateTime.utc_now()
+    id = Cairn.ULID.generate()
+    started = DateTime.add(now, -started_days_ago * 86_400)
+    ended = ended_days_ago && DateTime.add(now, -ended_days_ago * 86_400)
+
+    {:ok, _counts} =
+      Tracks.insert_batch([
+        {%{
+           id: id,
+           camera_id: "c1",
+           started_at: started,
+           ended_at: ended,
+           label: "person",
+           source: :host,
+           end_reason: ended && :unseen
+         }, [%{at: started, kind: :appeared, bbox: [1, 2, 3, 4]}]}
+      ])
+
+    id
+  end
+
   test "prune respects per-label overrides (max wins) and camera overrides", %{dir: dir} do
     cam = %Camera{id: "c1", rtsp_url: "r", retention_days: 2}
     cfg = config(dir, [cam])
@@ -66,6 +89,55 @@ defmodule Cairn.RetentionTest do
     assert Events.get(old_person.id)
     # unconfigured camera falls back to global 7d
     assert Events.get(other_cam.id) == nil
+  end
+
+  test "prune expires tracks past tracks_days, moments with them", %{dir: dir} do
+    cfg = %{config(dir) | retention_tracks_days: 30}
+    old = seed_track(41, 40)
+
+    Retention.run_prune(cfg)
+
+    assert Tracks.get(old) == nil
+    assert Tracks.moments(old) == []
+  end
+
+  test "prune keeps tracks inside tracks_days, and live tracks of any age", %{dir: dir} do
+    cfg = %{config(dir) | retention_tracks_days: 30}
+    # inside the track clock, but far outside the 7d event clock the same pass
+    # applies to clips — the two are independent
+    recent = seed_track(21, 20)
+    ancient_live = seed_track(400, nil)
+
+    Retention.run_prune(cfg)
+
+    assert Tracks.get(recent)
+    assert Tracks.get(ancient_live)
+  end
+
+  test "emergency cleanup deletes every event before it touches a track", %{dir: dir} do
+    cfg = config(dir)
+    event = seed_event(dir, "c1", 5, ["car"])
+    track = seed_track(400, 400)
+
+    # never satisfied while any event remains: the sweep runs the index dry
+    free_fun = fn _dir ->
+      if Events.all() == [], do: {:ok, 500 * 1024 * 1024}, else: {:ok, 10 * 1024 * 1024}
+    end
+
+    ret =
+      start_supervised!(
+        {Retention, name: nil, manual: true, config_fun: fn -> cfg end, free_space_fun: free_fun}
+      )
+
+    Retention.subscribe()
+    send(ret, :emergency)
+
+    assert_receive {:disk_alert, %{active: true}}, 2_000
+    wait_until(fn -> Events.get(event.id) == nil end)
+
+    # older than everything the sweep deleted, and still here
+    assert Tracks.get(track)
+    assert Tracks.moments(track) != []
   end
 
   test "emergency cleanup deletes oldest until above threshold and alerts", %{dir: dir} do

@@ -60,6 +60,7 @@ See `config.example.yml` — every key is documented inline. Summary:
 | `udp.base_port` / `udp.range` | loopback ports for plugins + WebRTC taps (4 per camera — each RTP port reserves the next for RTCP) |
 | `events.pre/post/max_*_seconds` | clip windows (per-camera overridable) |
 | `retention.days` / `retention.per_label` | pruning (camera overrides win; multi-label events keep the longest) |
+| `retention.tracks_days` | how long track rows live (default 365; global only, and exempt from emergency cleanup) |
 | `cameras[]` | `id`, `rtsp_url`, `plugin` (argv or multi-word string ⇒ its own process; single token ⇒ a `plugins:` group name), `min_score` per label, `extra_ffmpeg_args`, `transcode`, `retention` |
 | `plugins` | named plugin groups (`name: {command: ...}`) — one process serving every camera that names it |
 | `integrations.token` | bearer token that enables the Home Assistant API (see below); absent ⇒ `/api` disabled |
