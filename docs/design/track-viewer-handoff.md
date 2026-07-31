@@ -10,7 +10,11 @@ new page and two additions to an existing page:
    rows, no thumbnails. Filter bar + pagination in the Events-page pattern.
 2. **Event detail (`/events/:id`) — tracked-objects side panel**: per-object
    rows with an expandable list of that object's transitions; clicking a
-   transition seeks the clip.
+   transition seeks the clip when its moment is in *this* clip, and
+   navigates to the clip that has it when it is not. A long-lived track
+   spans multiple clips — a car that arrives (clip 1), parks for hours
+   (nothing recorded), and leaves (clip 2) — and its transitions list is
+   how the clips cross-link.
 3. **Event detail — bbox overlay**: a `<canvas>` layered over the existing
    `<video controls>`, drawing the selected objects' boxes as the clip plays.
 
@@ -62,13 +66,23 @@ src={"/media/events/#{@event.id}"}>` with no hook). **New entries:**
 - **Per-object toggle** — `phx-click="toggle-track" phx-value-id={object_id}`
   on the object row (or its visibility control). Selected/unselected is server
   state; the overlay draws only selected objects.
-- **Transition rows** — each carries `data-t={t}` (seconds since event start)
-  and must live **inside the `TimelineSeek`-hooked region** (either the existing
-  `#labels-timeline` section or a second element with `phx-hook="TimelineSeek"`
-  and its own `data-video-id` / `data-event-seconds`). That hook rewrites
-  `data-t` into a pre-roll-corrected `data-seek` on `loadedmetadata` — a
-  transition row outside it seeks to the wrong place. Rows are therefore
-  `<button>`s, not `<div>`s.
+- **Transition rows** — three functional variants, decided by where the
+  moment falls:
+  - *In this clip*: a `<button>` carrying `data-t={t}` (seconds since event
+    start), living **inside the `TimelineSeek`-hooked region** (either the
+    existing `#labels-timeline` section or a second element with
+    `phx-hook="TimelineSeek"` and its own `data-video-id` /
+    `data-event-seconds`). That hook rewrites `data-t` into a
+    pre-roll-corrected `data-seek` on `loadedmetadata` — a seek row outside
+    it seeks to the wrong place.
+  - *In another clip*: a plain navigation link (`<.link navigate=...>`) to
+    `~p"/events/#{other_event_id}?track=#{object_id}&t=#{seconds}"` — same
+    object pre-selected there, seeked once metadata loads. Not a `data-t`
+    button.
+  - *Not recorded*: inert, no interactive element.
+- **Event-page URL params** — `?track={object_id}` pre-selects the object;
+  `?t={seconds}` seeks after `loadedmetadata` (same pre-roll correction).
+  Both are part of the contract; cross-clip links depend on them.
 - **Per-object color assignment** — every object gets one color, used
   identically by its row marker/chip and by its box on the canvas. The
   assignment rule is an open question (below); whatever you pick, the row and
@@ -131,14 +145,18 @@ see and not record?* Rows exist for objects that never triggered a clip
   - Optional if it earns its place: `source` (`host` | `plugin`),
     `stationary_ms`, `object_id` (a 26-char ULID — mono, and it is the same id
     that appears in an event's labels).
-- **Row link**: navigates to `~p"/events/#{event_id}?track=#{object_id}"`,
-  which opens Event detail with that object pre-selected in the panel and its
-  boxes already drawn.
-- **Pruned / never-recorded rows render unlinked.** A track whose `event_id` is
-  nil was never recorded; a track whose event has since been pruned points at
-  nothing. Both render as a non-navigable row — no chevron, no pointer, no
-  hover lift — and need a quiet affordance saying why ("not recorded" /
-  "clip expired"). This is the single most common state on a busy camera: most
+- **Row link**: navigates to `~p"/events/#{event_id}?track=#{object_id}"`
+  for the clip containing the track's **first** recorded moment
+  (chronological: an arriving car's row opens its arrival clip), opening
+  Event detail with that object pre-selected and its boxes drawn. A track
+  may overlap several clips; the transitions list on the event page is the
+  cross-clip navigation — the row itself links only to the first. Linkage
+  is resolved by time overlap with surviving clips, not a stored id.
+- **Unlinked rows.** A row renders unlinked when **no surviving clip
+  overlaps the track's life** — it never triggered a recording, or every
+  clip that did overlap has since been pruned. Non-navigable: no chevron,
+  no pointer, no hover lift, plus a quiet affordance saying why ("no
+  clip"). This is the single most common state on a busy camera: most
   tracks never become events. Make it read as normal, not as an error.
 - **Pagination** footer identical to Events: "Showing 1–25 of N" left, sm
   secondary Previous/Next right, disabled at 40% opacity.
@@ -155,7 +173,10 @@ alternative. Show us your call.
 
 - Header "Tracked objects" 14px/600 + count, and a hint mirroring the
   detections card's "click a marker to seek".
-- **Object row** (one per track on this event, ordered by `started_at`):
+- **Object row** — one per track whose **lifetime overlaps this clip's
+  window**, ordered by `started_at`; not just tracks that ended during it.
+  The parked car that arrived in this clip and left during a later one
+  lists here (and on the later clip's page too). Per row:
   label chip + `best_score` (2 decimals) + the object's assigned color, a
   visibility control (`toggle-track`), and a disclosure for its transitions.
   Selected vs. unselected must be legible at a glance — the row's color is
@@ -163,9 +184,16 @@ alternative. Show us your call.
 - **Transitions list** (expanded): one timestamped row per moment, oldest
   first. Kinds from `Cairn.Tracks.TrackEvent`: `appeared`,
   `became_stationary`, `started_moving` — plus a synthesized final **`ended`**
-  row carrying the track's `end_reason`. Each row shows a clock offset
-  (`0:12`, the `fmt_clock/1` format) and the kind; each is a seek button
-  (`data-t`). An icon per kind would help; propose the four glyphs.
+  row carrying the track's `end_reason`. Three row states (see the
+  functional contract):
+  - **In this clip** — seek button, clock offset (`0:12`, `fmt_clock/1`).
+  - **In another clip** — navigation link to that clip; show absolute
+    time/date rather than an offset, plus a visible "leaves this clip"
+    affordance (open question 4). The parked car's arrival clip links to
+    its departure clip through these rows, and vice versa.
+  - **Not recorded** — no clip covers the moment; muted, inert, quiet
+    "no clip" hint.
+  An icon per kind would help; propose the four glyphs.
 - Panel and rows must survive a track with `label` nil, `best_score` nil, and
   zero moments (a track can have none — it appeared and was evicted).
 
@@ -200,6 +228,11 @@ alternative. Show us your call.
   **hide the overlay affordance entirely, or disable it with an explanation?**
   Give us the copy either way.
 - **Pruned / never-recorded track row** on `/tracks` — unlinked, per above.
+- **Track spanning multiple clips** — the panel row appears on every
+  overlapping clip's page; each page's overlay draws only that clip's box
+  data; transitions cross-link the clips (rows in another clip navigate,
+  rows in no clip go quiet). The commonest case: car arrives (clip 1),
+  parks for hours unrecorded, leaves (clip 2).
 - **Live track row** on `/tracks` — `ended_at` and `end_reason` nil, duration
   `—`. Worth a subtle "live" treatment, or worth nothing; your call.
 - **Truncated sidecar** — a very long event can hit the capture cap, so boxes
@@ -210,11 +243,13 @@ alternative. Show us your call.
 - **TracksLive**: filter params (camera, label, zone, from, to) + page, all in
   the URL so back-nav from an event restores the list; a page of rows and a
   total; a set of `event_id`s resolved once per page to decide which rows link.
-- **EventLive** (additions): `@tracks` for the event, moments per track, the
-  `?track=` param as an initially-selected object, the selected-object set
-  (server-side, driven by `toggle-track`), and a single boolean for sidecar
-  availability computed once at mount. Expansion of a transitions list can be
-  client-only if you prefer `<details>`; say which you assumed.
+- **EventLive** (additions): `@tracks` = tracks overlapping the clip's
+  window, moments per track each resolved to its containing clip (this one /
+  another / none), the `?track=` param as an initially-selected object,
+  `?t=` as an initial seek, the selected-object set (server-side, driven by
+  `toggle-track`), and a single boolean for sidecar availability computed
+  once at mount. Expansion of a transitions list can be client-only if you
+  prefer `<details>`; say which you assumed.
 
 ## Open questions — please answer these explicitly
 1. **Nav placement for `/tracks`.** A fourth topbar item next to Dashboard /
@@ -233,6 +268,11 @@ alternative. Show us your call.
    flickering object can produce dozens of pairs. Do we collapse a run into a
    single "stationary for 2h 14m" row (expandable), or list every moment
    verbatim?
+4. **Cross-clip transition affordance.** How loud should "this row leaves
+   the current clip" be — an inline glyph + clip date on the row, or the
+   transitions list grouped under per-clip subheadings with the current
+   clip's group open? It must not be mistakable for an in-clip seek, and
+   the arrival↔departure hop is the case to optimize for.
 
 ## Files (expected back)
 - Prototype HTML for `/tracks` and the updated `/events/:id`.
