@@ -33,7 +33,9 @@ defmodule Cairn.PluginGroupPort do
   change to either restarts the group. Camera fields the argv does not carry
   (the `post` and `max` windows, the tracking bounds, the `track:` / `record:`
   tiers, retention, the camera struct itself) are refreshed in place by
-  `refresh/3` instead (see `Cairn.PluginGroupSupervisor`).
+  `refresh/3` instead (see `Cairn.PluginGroupSupervisor`). `pre` is the one
+  window that is not refresh-only: it restarts the member camera — its ring
+  is sized at tree init — though never this group process.
   """
 
   use GenServer
@@ -98,7 +100,9 @@ defmodule Cairn.PluginGroupPort do
   windows, the tracking bounds, the `track:` / `record:` tiers, retention, the
   camera struct handed to the aggregator — change on reload without changing
   the group, so the routing map (each member's camera paired with its
-  `Cairn.Config.policy/2`) has to be rebuilt in place. Restarting an
+  `Cairn.Config.policy/2`) has to be rebuilt in place. (`pre` rides along in
+  that policy map, but a `pre` change never arrives here alone: it restarts
+  the member camera, whose ring is sized at tree init.) Restarting an
   accelerator-holding process over Elixir-side state is exactly what the
   restart-only-on-config-change policy exists to avoid, and it would cut every
   live track on every member.

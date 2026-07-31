@@ -89,7 +89,8 @@ defmodule Cairn.PluginGroupSupervisor do
   fields the argv never carried (the `post` and `max` windows, the tracking
   bounds, the `track:` / `record:` tiers, retention) leaves it running, and it
   would otherwise keep routing detections with the pre-reload camera structs
-  and policies.
+  and policies. `pre` is deliberately not in that list: it restarts the member
+  camera (ring sized at tree init), not this group.
   """
   @spec refresh_group(Config.t(), Config.PluginGroup.t()) :: :ok
   def refresh_group(%Config{} = config, group) do
