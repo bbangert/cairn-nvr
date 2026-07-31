@@ -23,7 +23,7 @@ defmodule CairnWeb.MediaControllerTest do
     {:ok, _} = Events.create_active(event, clip)
     {:ok, _} = Events.set_snapshot(event.id, snapshot)
 
-    %{event: event}
+    %{event: event, dir: dir}
   end
 
   test "serves the whole clip without a range header", %{conn: conn, event: event} do
@@ -65,5 +65,44 @@ defmodule CairnWeb.MediaControllerTest do
     assert conn |> get("/media/snapshots/#{event.id}") |> response(200) == "JPGDATA"
     assert conn |> get("/media/events/#{Ecto.UUID.generate()}") |> response(404)
     assert conn |> get("/media/snapshots/#{Ecto.UUID.generate()}") |> response(404)
+  end
+
+  test "serves the track sidecar derived from the clip path", %{
+    conn: conn,
+    event: event,
+    dir: dir
+  } do
+    File.write!(Path.join(dir, "clip.tracks"), "TRACKBYTES")
+
+    conn = get(conn, "/media/events/#{event.id}/tracks")
+
+    assert response(conn, 200) == "TRACKBYTES"
+    assert get_resp_header(conn, "content-type") == ["application/vnd.msgpack"]
+    assert get_resp_header(conn, "content-encoding") == ["gzip"]
+    assert get_resp_header(conn, "cache-control") == ["private, max-age=3600"]
+    # whole-file only: no Range support is advertised for the sidecar
+    assert get_resp_header(conn, "accept-ranges") == []
+  end
+
+  test "404s the sidecar for a missing row, a nil path, and a clip with no sidecar", %{
+    conn: conn,
+    event: event
+  } do
+    # the clip exists, its sidecar does not — the file stat is what decides
+    assert conn |> get("/media/events/#{event.id}/tracks") |> response(404)
+    assert conn |> get("/media/events/#{Ecto.UUID.generate()}/tracks") |> response(404)
+
+    pathless =
+      %Cairn.Events.Event{}
+      |> Cairn.Events.Event.changeset(%{
+        id: Ecto.UUID.generate(),
+        camera_id: "cam_a",
+        started_at: DateTime.utc_now(),
+        status: :partial
+      })
+      |> Cairn.Repo.insert!()
+
+    assert pathless.path == nil
+    assert conn |> get("/media/events/#{pathless.id}/tracks") |> response(404)
   end
 end

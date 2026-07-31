@@ -1207,4 +1207,166 @@ defmodule Cairn.DetectionAggregatorTest do
       assert_receive {:event_started, %Event{camera_id: ^id}}
     end
   end
+
+  describe "track boxes forwarded to the extractor" do
+    # An aggregator whose "extractor" is a relay: everything that reaches its
+    # mailbox is forwarded to the test in arrival order, which is what makes a
+    # refutation below provable rather than a race (see `probe/1`).
+    defp relay_agg(id) do
+      test_pid = self()
+
+      start_supervised!(
+        {DetectionAggregator,
+         name: nil,
+         start_extractor: fn _camera, event ->
+           pid = spawn(fn -> relay(test_pid) end)
+           send(test_pid, {:extractor_started, event, pid})
+           {:ok, pid}
+         end,
+         finalize_extractor: fn pid, event ->
+           send(test_pid, {:extractor_finalized, pid, event})
+         end},
+        id: id
+      )
+    end
+
+    defp relay(test_pid) do
+      receive do
+        msg ->
+          send(test_pid, {:extractor_got, msg})
+          relay(test_pid)
+      end
+    end
+
+    # A barrier through the relay: it forwards in FIFO order, so once the probe
+    # comes back, anything the aggregator cast before it is already in this
+    # mailbox. `refute_received` after this reads "nothing was sent up to here"
+    # instead of "nothing has arrived yet".
+    defp probe(extractor) do
+      send(extractor, :probe)
+      assert_receive {:extractor_got, :probe}
+    end
+
+    test "the batch that opens an event is forwarded, and carries what the event refused",
+         %{camera: camera, camera_id: id} do
+      agg = relay_agg(:agg_boxes_open)
+
+      observe(agg, camera, [
+        object("person", 0.9, [0.1, 0.1, 0.2, 0.4]),
+        object("cat", 0.2, [0.6, 0.6, 0.1, 0.1])
+      ])
+
+      assert_receive {:extractor_started, %Event{camera_id: ^id}, _pid}
+      assert_receive {:extractor_got, {:"$gen_cast", {:track_boxes, batch}}}
+
+      # zero, because an event's `started_at` *is* the observed_at of the batch
+      # that opened it — the opening batch is the first sample of the path
+      assert batch.t_ms == 0
+
+      assert [
+               {person_id, "person", [0.1, 0.1, 0.2, 0.4], false},
+               {cat_id, "cat", [0.6, 0.6, 0.1, 0.1], false}
+             ] = batch.boxes
+
+      assert is_binary(person_id) and String.length(person_id) == 26
+      assert is_binary(cat_id) and cat_id != person_id
+
+      # the cat is under `min_score`, so it is in no way this event's evidence
+      # — the forwarded batch carrying it anyway is the dense-capture rule
+      assert_receive {:event_started, %Event{labels: [%{object_id: ^person_id}]}}
+    end
+
+    # The flag the extractor's sidecar turns into a keyframe: `Cairn.TrackPath`
+    # keeps every sample whose `stationary` differs from the last kept one, so
+    # a `false` hardcoded anywhere on this path would silently cost the format
+    # its stationary transitions. Driven through the real tracker rather than
+    # asserted on a hand-built tuple — nothing else connects the two.
+    test "a track the tracker judges stationary is forwarded with the flag set",
+         %{camera: camera, camera_id: id} do
+      agg = relay_agg(:agg_boxes_stationary)
+      # media time, not wall clock, is what the stillness rule measures
+      policy = Map.put(@policy, :stationary_after_ms, 1_000)
+      t0 = DateTime.utc_now()
+      still = [0.1, 0.1, 0.2, 0.4]
+
+      DetectionAggregator.detections(
+        agg,
+        camera,
+        policy,
+        observation([object("person", 0.9, still)], observed_at: t0, media_ms: 1_000.0)
+      )
+
+      assert_receive {:extractor_started, %Event{camera_id: ^id}, _pid}
+
+      assert_receive {:extractor_got,
+                      {:"$gen_cast", {:track_boxes, %{boxes: [{oid, "person", ^still, false}]}}}}
+
+      # the same box one `stationary_after_ms` of media time later: the tracker
+      # flips the track, and the flip reaches the extractor
+      DetectionAggregator.detections(
+        agg,
+        camera,
+        policy,
+        observation([object("person", 0.9, still)],
+          observed_at: DateTime.add(t0, 1, :second),
+          media_ms: 2_000.0
+        )
+      )
+
+      assert_receive {:extractor_got,
+                      {:"$gen_cast", {:track_boxes, %{boxes: [{^oid, "person", ^still, true}]}}}}
+
+      # the tracker's own publication of the same flip, so the `true` above is
+      # tracker output reaching the extractor and not a shape this test built
+      assert_receive {:track_updated, %Track{object_id: ^oid, stationary: true}}
+    end
+
+    test "no batch is forwarded before an event has opened",
+         %{camera: camera, camera_id: id} do
+      agg = relay_agg(:agg_boxes_pre_event)
+
+      # under `min_score`: `cam.event` is nil and there is no extractor, which
+      # is the same catch-all clause the post-event case below falls through
+      observe(agg, camera, [object("cat", 0.2, [0.6, 0.6, 0.1, 0.1])])
+      _ = :sys.get_state(agg)
+      refute_received {:extractor_started, _event, _pid}
+
+      # the next batch does open one, and the first thing the relay ever sees
+      # is that batch — the idle one was dropped, not held back
+      observe(agg, camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])])
+      assert_receive {:extractor_started, %Event{camera_id: ^id}, extractor}
+      assert_receive {:extractor_got, {:"$gen_cast", {:track_boxes, batch}}}
+      assert [{_id, "person", [0.1, 0.1, 0.2, 0.4], false}] = batch.boxes
+
+      probe(extractor)
+      refute_received {:extractor_got, {:"$gen_cast", {:track_boxes, _}}}
+    end
+
+    test "batches stop at the event's end and none is sent after it",
+         %{camera: camera, camera_id: id} do
+      agg = relay_agg(:agg_boxes_idle)
+      t0 = DateTime.utc_now()
+
+      observe(agg, camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], observed_at: t0)
+      assert_receive {:extractor_started, %Event{id: eid}, extractor}
+      assert_receive {:extractor_got, {:"$gen_cast", {:track_boxes, %{t_ms: 0}}}}
+
+      observe(agg, camera, [object("person", 0.9, [0.12, 0.1, 0.2, 0.4])],
+        observed_at: DateTime.add(t0, 2, :second)
+      )
+
+      assert_receive {:extractor_got, {:"$gen_cast", {:track_boxes, %{t_ms: 2_000}}}}
+
+      fire(agg, :post_window, id, eid)
+      assert_receive {:event_ended, %Event{id: ^eid}}
+
+      # the window is closed and `cam.extractor` cleared, so a batch that would
+      # have been forwarded a moment ago now goes nowhere. Under `min_score` so
+      # that it opens no second event to forward to.
+      observe(agg, camera, [object("person", 0.2, [0.1, 0.1, 0.2, 0.4])])
+      _ = :sys.get_state(agg)
+      probe(extractor)
+      refute_received {:extractor_got, {:"$gen_cast", {:track_boxes, _}}}
+    end
+  end
 end

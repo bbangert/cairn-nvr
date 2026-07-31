@@ -43,8 +43,13 @@ trusted LAN; the token is a bearer secret sent in clear unless fronted by TLS.
 | `GET` | `/api/stream` | SSE feed of live events / status / control / alerts |
 | `GET` | `/api/media/events/:id` | Event clip (mp4, HTTP Range supported) |
 | `GET` | `/api/media/snapshots/:id` | Event snapshot (jpg) |
+| `GET` | `/api/media/events/:id/tracks` | Track-path sidecar (gzipped msgpack); 404 when none exists |
 | `POST` | `/api/cameras/:id/webrtc` | WHEP: start a live WebRTC stream |
 | `DELETE` | `/api/webrtc/:resource_id` | WHEP: tear a stream down |
+
+`/api/media/events/:id/tracks` is stored gzipped and served as stored:
+`content-encoding: gzip` is set unconditionally, without consulting
+`accept-encoding`, so a client must inflate it even if it asked for `identity`.
 
 Maps to HA-side mechanisms: cameras/events/labels → `binary_sensor` + `sensor` +
 Media Browser tree; `/api/stream` → push updates for entity state/availability;

@@ -5,11 +5,14 @@ defmodule CairnWeb.MediaController do
 
   `GET /media/events/:id` supports HTTP Range requests (single range) so
   `<video>` seeking works; `GET /media/snapshots/:id` serves the event's
-  snapshot jpg.
+  snapshot jpg; `GET /media/events/:id/tracks` serves the event's bbox
+  sidecar whole-file — it is fetched in one piece by the overlay, so no Range
+  handling is offered there.
   """
 
   use CairnWeb, :controller
 
+  alias Cairn.DataDir
   alias Cairn.Events
 
   # paths come from index rows written by the extractor, never from the
@@ -38,6 +41,26 @@ defmodule CairnWeb.MediaController do
          {:ok, _stat} <- File.stat(path) do
       conn
       |> put_resp_content_type("image/jpeg")
+      |> put_resp_header("cache-control", "private, max-age=3600")
+      |> send_file(200, path)
+    else
+      _ -> send_resp(conn, 404, "not found")
+    end
+  end
+
+  # The sidecar path is derived from the clip path on the index row, so it is
+  # as request-independent as the clip itself. The file is gzipped msgpack at
+  # rest and is served as stored: `content-encoding: gzip` is what makes the
+  # browser's `fetch` decompress it.
+  # sobelow_skip ["Traversal.SendFile"]
+  def event_tracks(conn, %{"id" => id}) do
+    with %{path: clip_path} when is_binary(clip_path) <- Events.get(id) || :not_found,
+         path = DataDir.trackpath_for_clip(clip_path),
+         {:ok, _stat} <- File.stat(path) do
+      conn
+      # nil charset: msgpack is binary, and `; charset=utf-8` would be a lie
+      |> put_resp_content_type("application/vnd.msgpack", nil)
+      |> put_resp_header("content-encoding", "gzip")
       |> put_resp_header("cache-control", "private, max-age=3600")
       |> send_file(200, path)
     else

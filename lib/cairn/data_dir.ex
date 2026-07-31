@@ -34,6 +34,19 @@ defmodule Cairn.DataDir do
   end
 
   @doc """
+  The `Cairn.TrackPath` sidecar path for a clip: the same name with `.tracks`
+  in place of `.mp4`.
+
+  Derived rather than stored in an index column, which is what keeps
+  `Cairn.Reconciler`'s orphan adoption (adopt_orphans/2) working unchanged — an
+  event adopted from a clip file the index never knew about finds its sidecar
+  by the same derivation, with nothing to look up and no column left dangling
+  at a file that was pruned.
+  """
+  @spec trackpath_for_clip(Path.t()) :: Path.t()
+  def trackpath_for_clip(clip_path), do: Path.rootname(clip_path, ".mp4") <> ".tracks"
+
+  @doc """
   Parses an event clip filename back into its identity parts.
   Returns `{:ok, event_id, camera_id, unix_ts}` or `:error`.
   """

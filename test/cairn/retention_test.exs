@@ -38,7 +38,7 @@ defmodule Cairn.RetentionTest do
       max_scores: Map.new(labels, &{&1, 0.9})
     }
 
-    {:ok, row} = Events.create_active(event, path)
+    {:ok, _row} = Events.create_active(event, path)
     {:ok, row} = Events.finalize(%{event | ended_at: started, status: :finalized}, 4)
     {:ok, row} = Events.set_snapshot(row.id, snapshot)
     row

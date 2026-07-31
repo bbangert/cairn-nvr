@@ -3,7 +3,8 @@ defmodule Cairn.Reconciler do
   Startup reconciliation between the event index and the filesystem —
   **disk is truth**. Runs before cameras start:
 
-    * index rows whose clip file is missing -> delete the row
+    * index rows whose clip file is missing -> delete the row and the
+      `Cairn.TrackPath` sidecar derived from its clip path
     * `active` rows with a file (crash mid-event) -> mark `partial`
     * orphaned mp4s with no row (filename encodes identity) -> adopt as
       `partial`
@@ -35,6 +36,12 @@ defmodule Cairn.Reconciler do
             {deleted, partialed}
 
           is_nil(row.path) or not File.exists?(row.path) ->
+            # `delete_row/1` is the index alone; this is the one caller that
+            # reaches it without going through `Events.delete/1`, so the
+            # derived sidecar has to be shed here or nothing ever collects it —
+            # `adopt_orphans/2` globs `*.mp4`, and no row is left to name the
+            # file. `File.rm/1`'s error is discarded exactly as it is there.
+            if row.path, do: File.rm(DataDir.trackpath_for_clip(row.path))
             Events.delete_row(row)
             {deleted + 1, partialed}
 
