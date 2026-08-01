@@ -27,6 +27,11 @@ defmodule Cairn.TrackerTest do
   @car_fragment [0.40, 0.50, 0.081, 0.12]
   # same box shifted half its width: IoU 1/3, below the suppression threshold
   @car_neighbour [0.49, 0.50, 0.18, 0.12]
+  # the second box a detector without NMS emits for the *same* car, nudged on
+  # both axes: IoU 0.783, which is the overlap the live failure's two anchors
+  # had — far above @duplicate_suppression_iou and above @stationary_match_iou
+  # too, so nothing about it looks like a second object
+  @car_double [0.415, 0.505, 0.18, 0.12]
   # tall where the car boxes are wide, and displaced in y rather than x
   @walker [0.30, 0.20, 0.10, 0.30]
   # IoU 0.5 with @walker, the same overlap @car_drift has with @parked_car
@@ -873,9 +878,12 @@ defmodule Cairn.TrackerTest do
   end
 
   describe "duplicate suppression" do
-    # Every test here parks at 10_000 and then arrives at 14_000: 4_000 unseen,
-    # inside the grace (past @max_unseen 3_000, well short of 5 x 3_000), which
-    # is where a track is picky enough to refuse a box in the first place.
+    # The tests about a track *refusing* a box park at 10_000 and then arrive at
+    # 14_000: 4_000 unseen, inside the grace (past @max_unseen 3_000, well short
+    # of 5 x 3_000), which is where a track is picky enough to refuse in the
+    # first place. The ones about two boxes for one object need no grace at all
+    # — the track takes the first box in the ordinary way — and arrive at
+    # 11_000 instead.
     test "a drifted re-detection of a parked object is dropped, not minted" do
       # non-vacuity: refused by @stationary_match_iou (0.7), caught by
       # @duplicate_suppression_iou (0.4) — the band the whole rule is about
@@ -968,6 +976,60 @@ defmodule Cairn.TrackerTest do
       assert parked.label == "car"
     end
 
+    # A detector without NMS emits two boxes for one object often enough to
+    # matter. The first takes the track; the second is left over with nothing
+    # left to match, and minting for it is how one parked car ends up with two
+    # concurrent live tracks in the same epoch.
+    test "two boxes for one object in one batch update one track and mint nothing" do
+      # the overlap the two anchors of the observed failure had: nothing about
+      # it looks like a second object — it is over @stationary_match_iou (0.7),
+      # let alone @duplicate_suppression_iou
+      assert_in_delta Tracker.iou(@parked_car, @car_double), 0.783, 0.001
+
+      {t, id} = parked(@parked_car, "car")
+
+      # one second after the track's last sighting, so no grace is involved:
+      # the track takes the first box at the base @iou_threshold
+      {t, tagged, events} =
+        track(t, [det("car", @parked_car), det("car", @car_double, score: 0.95)],
+          media_ms: 11_000,
+          observed_at: at(11_000)
+        )
+
+      assert [%{object_id: ^id, bbox: @parked_car}] = tagged
+      assert [{:updated, %Track{object_id: ^id}}] = events
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+    end
+
+    # The asymmetry in `seen/3`: presence is what a refused box is worth to a
+    # track *nothing* observed. A track this batch matched was observed for
+    # real, so the refusal must not add to it — and there is nothing left for it
+    # to add.
+    test "a second box over a matched track is refused, not merged into it" do
+      {t, id} = parked(@parked_car, "car")
+
+      {t, _tagged, _events} =
+        track(t, [det("car", @parked_car, score: 0.6), det("car", @car_double, score: 0.95)],
+          media_ms: 11_000,
+          observed_at: at(11_000)
+        )
+
+      assert [%Track{object_id: ^id} = still] = Tracker.live_tracks(t)
+
+      # every believed field is the *matched* detection's: the refused box's
+      # geometry is not in `bbox` and its 0.95 is in neither `score` nor
+      # `best_score` (0.9 is the best `parked/2` ever fed)
+      assert still.bbox == @parked_car
+      assert still.score == 0.6
+      assert still.best_score == 0.9
+
+      # and unlike a refusal against an unmatched track, which moves
+      # `last_seen_at` and nothing else, this track's evidence clock moved too
+      assert still.last_seen_at == at(11_000)
+      assert still.last_detected_at == at(11_000)
+      refute still.stale_predicted
+    end
+
     # Pixel units and an exact ratio on purpose: 80/200 is 0.4 in binary
     # floating point with nothing to round, so this is the one place in the
     # suite where `>=` and `>` on the threshold give different answers.
@@ -1050,22 +1112,28 @@ defmodule Cairn.TrackerTest do
       assert [{:updated, %Track{object_id: ^id, stationary: true, bbox: @car_drift}}] = events
     end
 
-    # Suppression looks only at tracks this batch left unmatched, and that is
-    # what keeps a genuinely new object over a tracked one mintable.
-    test "a track this batch matched does not suppress a second object over it" do
+    # Suppression considers every live host track, matched or not, so the only
+    # thing keeping a genuinely new object over a tracked one mintable is the
+    # same-label guard in `duplicate_of/2`. This is the case that guard is for —
+    # a person stepping in front of a tracked car — and the same geometry with
+    # one label is the double-detection test above, which must not mint.
+    test "a different-label object over a track this batch matched still mints" do
       assert_in_delta Tracker.iou(@walker, @walker_step), 0.5, 0.001
 
-      {t, [a], _} = track(Tracker.new(), [det("person", @walker)])
+      {t, [a], _} = track(Tracker.new(), [det("car", @walker)])
 
       {t, [a2, b], events} =
-        track(t, [det("person", @walker), det("person", @walker_step)],
+        track(t, [det("car", @walker), det("person", @walker_step)],
           media_ms: 200,
           observed_at: at(200)
         )
 
       assert a2.object_id == a.object_id
       assert ids(events, :updated) == [a.object_id]
-      assert [{:started, %Track{object_id: other}}] = for({:started, _} = e <- events, do: e)
+
+      assert [{:started, %Track{object_id: other, label: "person"}}] =
+               for({:started, _} = e <- events, do: e)
+
       assert b.object_id == other
       refute other == a.object_id
       assert length(Tracker.live_tracks(t)) == 2
@@ -1501,6 +1569,30 @@ defmodule Cairn.TrackerTest do
       refute other == id
       # the suspension is untouched: it was neither adopted nor spent
       assert [%Track{object_id: ^id}] = Tracker.suspended_tracks(t)
+    end
+
+    # The stitching-era form of the double-detection failure, on the same
+    # fixtures. `adopt/4` runs before `suppress_duplicates/4`, so the track it
+    # revives is in the live set by the time the leftover box is judged and is a
+    # suppression candidate like any other — which it can only be if the
+    # candidate list is read after the adoption rather than before it.
+    test "a second box of a just-adopted object in the same batch is suppressed" do
+      {t, id} = parked(@parked_car, "car")
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      # 300 ms of outage, so both boxes clear `@adoption_match_iou`; the exact
+      # one wins the suspension and the 0.783 one is left with nothing to adopt
+      {t, tagged, events} =
+        track(t, [det("car", @parked_car), det("car", @car_double)],
+          epoch: "epoch_two",
+          media_ms: 22_000,
+          observed_at: at(10_300)
+        )
+
+      assert [%{object_id: ^id, bbox: @parked_car}] = tagged
+      assert [{:updated, %Track{object_id: ^id}}, {:adopted, %Track{object_id: ^id}}] = events
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+      assert Tracker.suspended_tracks(t) == []
     end
 
     test "a short gap resumes a parked track's identity, its stillness and its clocks" do
