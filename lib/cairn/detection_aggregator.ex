@@ -286,6 +286,12 @@ defmodule Cairn.DetectionAggregator do
   # from what is drawn over video already recorded, and a path with holes in it
   # reads as a second object rather than as a gap.
   #
+  # The one gap left is upstream: a box `Cairn.Tracker` refused and suppressed
+  # as a duplicate never reaches `tagged` at all, and cannot, because it has no
+  # `object_id` to draw it under. That is the trade the tracker makes on
+  # purpose — a gap in one path, rather than a second path over the same
+  # object for as long as the duplicate identity lives.
+  #
   # **Ordering dependency.** "No last batch is lost" rests on one fact: this
   # cast and the finalize cast in `maybe_finalize/4` share a sender *and* a
   # receiver, and the BEAM orders messages per sender/receiver pair — so every

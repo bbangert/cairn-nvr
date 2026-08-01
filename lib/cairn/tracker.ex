@@ -22,20 +22,59 @@ defmodule Cairn.Tracker do
   Expiry is media time, not batches: a track is ended (`:unseen`) once
   `media_ms - last_seen_ms > max_unseen_ms`. `last_seen_ms` moves on *any*
   observation of the track, predicted ones included — slow inference must not
-  kill a track. Evidence policy is separate: a track whose last **detection**
-  is older than `max_unseen_ms` is flagged `stale_predicted`, and the
-  aggregator refuses it as event evidence however long the plugin keeps
-  predicting it.
+  kill a track — and, as below, on a box the track refuses. Evidence policy is
+  separate: a track whose last **detection** is older than `max_unseen_ms` is
+  flagged `stale_predicted`, and the aggregator refuses it as event evidence
+  however long the plugin keeps predicting it.
 
   A track the tracker has judged **stationary** (see below) expires at
   `@stationary_unseen_factor` times that bound instead, and for as long as it
   sits inside that extended grace — already unseen for longer than
   `max_unseen_ms` — nothing may re-match it at less than
   `@stationary_match_iou` overlap. The patience is paid for with pickiness: a
-  parked object survives an occlusion that would end a moving track, and its
-  identity still cannot be handed to whatever next overlaps it. Outside the
-  grace a stationary track matches at the same `@iou_threshold` as everything
-  else.
+  parked object survives an occlusion that would end a moving track, and while
+  the grace holds no lesser overlap inherits its identity. Outside the grace a
+  stationary track matches at the same `@iou_threshold` as everything else.
+
+  Pickiness governs *geometry*, not *presence*. A host-mode detection that no
+  track would take, but that still overlaps a live host track this batch left
+  unmatched by at least `@duplicate_suppression_iou`, is **dropped** rather
+  than minted, and marks that track seen — its `last_seen_ms` (and the
+  `last_seen_at` that reports it) move, and nothing else does. Both halves are
+  needed. Without the drop, refusing a box is itself how a second identity
+  gets made for the object that was refused, since an unmatched detection
+  mints; the strict threshold would hand a parked car two or three concurrent
+  tracks rather than none. Without the mark, the refusal repeats on every
+  batch for as long as the object sits there and nothing ever re-acquires it.
+  Together a refusal usually costs one batch: the refreshed clock takes the
+  track out of the grace, so a batch arriving within `max_unseen_ms` of it
+  matches the same box at `@iou_threshold` and adopts it normally. Where
+  batches are further apart than that — inference slower than the camera's own
+  unseen bound — every batch finds the track back in its grace and the refusal
+  repeats, and what ends that is the host-clock backstop below rather than a
+  match.
+
+  Being marked seen is not being observed. The box was refused, so nothing
+  about it is believed — not the anchor, not the stillness window, not
+  `last_detected_ms`, so a track kept alive this way still goes
+  `stale_predicted` on the evidence policy's own schedule and cannot be
+  dragged off its anchor by what it refused. Nor is `last_seen_host_ms`
+  touched: the host-clock backstop below is the one bound a suppression cannot
+  refresh away, so a track that only ever gets suppressions is still retired
+  rather than living forever.
+
+  What this gives up is the far half of the pickiness, and it is a deliberate
+  trade. A box between the two thresholds is refused *once*, not forever, so
+  an object whose very first detection lands that close to a parked track's
+  stale box inherits that identity on the following batch rather than minting
+  one of its own. The alternative — refusing it for as long as the track lives
+  — leaves whatever is really there untracked for the whole extended grace,
+  and that is the worse error for the case the grace is for: the thing sitting
+  at 0.4 to 0.7 overlap with an unconfirmed parked track is nearly always that
+  track's own object, re-detected slightly off after its detections flickered,
+  while a genuinely new object has usually minted a track of its own where it
+  entered the frame long before it gets there — and a track that matched this
+  batch never suppresses.
 
   What the grace does not require is *detections*: `last_seen_ms` moves on
   predicted observations too and the stillness rule ignores them, so a plugin
@@ -122,13 +161,38 @@ defmodule Cairn.Tracker do
   # What a stationary track in extended grace demands of a box before it will
   # answer to it. The two thresholds are a pair and neither works alone:
   # applied to a track that is still being seen, this one rejects ordinary
-  # detector jitter, the match fails, and the object gets a second, duplicate
-  # track. Applied only where it belongs — a track already unseen past
-  # `max_unseen_ms`, where every overlapping box is a candidate to inherit an
-  # identity nothing is currently confirming — it is what makes the grace safe.
+  # detector jitter and the match fails, which costs the object its box on
+  # every batch (`@duplicate_suppression_iou` drops it and the track never
+  # stops being strict) or, where the jitter is wide enough to clear that one
+  # too, a second duplicate track. Applied only where it belongs — a track
+  # already unseen past `max_unseen_ms`, where every overlapping box is a
+  # candidate to inherit an identity nothing is currently confirming — it is
+  # what makes the grace safe.
   # Getting that pairing wrong is a silent identity bug, which is why neither
   # number is config.
   @stationary_match_iou 0.7
+  # What an unmatched detection has to overlap a live host track this batch
+  # also left unmatched before it reads as that track's object seen badly —
+  # and is dropped — instead of as a new object. Refusal is the only way both
+  # sides are left free at once: greedy matching pairs anything overlapping a
+  # track at `@iou_threshold`, which is the threshold for every track not in
+  # extended grace, so a free track and a free detection overlapping this much
+  # means some `match_threshold/2` said no. That makes this the other half of
+  # `@stationary_match_iou`: without it, every box the grace refuses mints the
+  # duplicate identity the grace exists to prevent.
+  #
+  # 0.4 splits the band below `@stationary_match_iou` where the two mistakes
+  # trade off, and the geometry either side of it is what picks the number.
+  # Equal-sized boxes offset by half their extent — two people shoulder to
+  # shoulder, two cars nose to tail — sit at 1/3, so they stay below this and
+  # still mint; drop under 1/3 and an adjacent object of the same label is
+  # dropped every batch and never tracked at all. A box wholly inside the
+  # track's own sits at the fraction of it that it covers, so a detector that
+  # fires on two fifths of a parked car is read as that car. Raise it towards
+  # `@stationary_match_iou` and the small-box case it exists for — where a
+  # box a few pixels of drift wide of the track's is already well under 0.7 —
+  # falls back through and duplicates again.
+  @duplicate_suppression_iou 0.4
   # The unseen bound for a stationary track, as a multiplier of
   # `max_unseen_ms` (the `@host_clock_factor` precedent: policy the operator
   # sets the base for, scaled here by a fixed factor). A parked object is
@@ -226,9 +290,11 @@ defmodule Cairn.Tracker do
   `object_id` (ULID) and its track's `stale_predicted` and `stationary` flags,
   in the order given, and the lifecycle events this observation caused.
 
-  An object the tracker refuses — a `track_id` repeated inside this batch, or
-  a new identity at the live-track cap with nothing evictable — is absent from
-  the tagged list, so `tagged` may be shorter than `objects`.
+  An object the tracker refuses — a `track_id` repeated inside this batch, a
+  new identity at the live-track cap with nothing evictable, or a host-mode
+  detection dropped as a duplicate of the live track that refused it
+  (`@duplicate_suppression_iou`) — is absent from the tagged list, so `tagged`
+  may be shorter than `objects`.
 
   Staleness is refreshed *before* expiry so that an expiring track's final
   summary reports this batch's `stale_predicted`, not the previous batch's.
@@ -327,7 +393,8 @@ defmodule Cairn.Tracker do
       |> Enum.split_with(fn {object, _index} -> plugin_tracked?(object, context) end)
 
     {tracker, plugin_assignments} = assign_plugin(tracker, plugin, context)
-    {tracker, Map.merge(plugin_assignments, assign_host(tracker, host, context))}
+    {tracker, host_assignments} = assign_host(tracker, host, context)
+    {tracker, Map.merge(plugin_assignments, host_assignments)}
   end
 
   # One `track_id` names one object. Two objects in the same batch claiming the
@@ -393,6 +460,11 @@ defmodule Cairn.Tracker do
   # host-owned tracks are candidates: a plugin's identities are its own. The
   # threshold is per candidate track (`match_threshold/2`), so it decides which
   # pairs exist and never how the ones that exist are ordered.
+  #
+  # What is left over then goes through `suppress_duplicates/5`, so the result
+  # can also carry `:drop`s and a tracker whose refused tracks have been marked
+  # seen — which is why this returns a tracker where the greedy half alone
+  # would not have to.
   defp assign_host(tracker, indexed, context) do
     candidates = for {id, object} <- tracker.objects, object.source == :host, do: {id, object}
 
@@ -410,7 +482,7 @@ defmodule Cairn.Tracker do
     # sort would then resolve two identically-overlapping candidates by that
     # incidental order. `index` before `id` keeps "earlier object in the batch
     # wins", matching the incumbent-wins convention elsewhere.
-    {assignments, _used_objects, _used_tracks} =
+    matched =
       pairs
       |> Enum.sort_by(fn {overlap, index, id} -> {-overlap, index, id} end)
       |> Enum.reduce({%{}, MapSet.new(), MapSet.new()}, fn {_overlap, index, id},
@@ -422,7 +494,74 @@ defmodule Cairn.Tracker do
         end
       end)
 
-    assignments
+    suppress_duplicates(tracker, indexed, candidates, matched, context)
+  end
+
+  # Every object the greedy pass left unmatched, against every track it left
+  # unmatched: an overlap of `@duplicate_suppression_iou` or more here is a
+  # detection that some track's `match_threshold/2` refused, and minting for it
+  # is how one object ends up with several live tracks. It is dropped instead,
+  # and the one track it overlaps most is marked seen — see `seen/3` for how
+  # little that means.
+  #
+  # Tracks this batch *did* match are excluded, which is what keeps a genuinely
+  # new object over a tracked one mintable: the tracked object's own detection
+  # takes its track, and a newcomer overlapping both is left to mint. It is
+  # also why nothing here needs to ask whether a track is stationary or in
+  # grace — a track matching at the base `@iou_threshold` cannot both be free
+  # and be overlapped this much by a free detection.
+  defp suppress_duplicates(tracker, indexed, candidates, {assignments, objects, tracks}, context) do
+    free = for {id, tracked} <- candidates, not MapSet.member?(tracks, id), do: {id, tracked}
+
+    unmatched =
+      for {object, index} <- indexed, not MapSet.member?(objects, index), do: {object, index}
+
+    Enum.reduce(unmatched, {tracker, assignments}, fn {object, index},
+                                                      {tracker, assignments} = acc ->
+      case duplicate_of(free, object) do
+        nil -> acc
+        id -> {seen(tracker, id, context), Map.put(assignments, index, :drop)}
+      end
+    end)
+  end
+
+  # The track whose identity the box would have inherited had anything let it:
+  # most overlapping first, ties broken by id so that map iteration order never
+  # decides it (the same job the sort key in `assign_host/3` does). Only that
+  # one is marked seen. A second track overlapping the same box is a duplicate
+  # from an earlier batch, and holding every one of them alive off one box
+  # would preserve exactly the pile-up this rule exists to drain.
+  defp duplicate_of(free, object) do
+    overlaps =
+      for {id, tracked} <- free,
+          tracked.label == object.label,
+          overlap = iou(tracked.bbox, object.bbox),
+          overlap >= @duplicate_suppression_iou,
+          do: {overlap, id}
+
+    case overlaps do
+      [] -> nil
+      _ -> overlaps |> Enum.min_by(fn {overlap, id} -> {-overlap, id} end) |> elem(1)
+    end
+  end
+
+  # Presence without adoption: this moves the media-time clock that expiry and
+  # `match_threshold/2` read, and its `last_seen_at` twin, and no other field.
+  # Not `bbox`, `score` or `best_score` — the box was refused, so nothing about
+  # it may be believed. Not `last_detected_ms`, so `stale_predicted` still
+  # arrives on schedule and a suppression can never manufacture evidence. Not
+  # the anchor or `recent_boxes`, which the stillness rule compares against
+  # boxes the track actually adopted. And not `last_seen_host_ms`: leaving the
+  # host-clock backstop counting from the last *adopted* observation is what
+  # bounds a track whose only remaining sign of life is being refused.
+  defp seen(tracker, object_id, context) do
+    tracked = Map.fetch!(tracker.objects, object_id)
+
+    store(tracker, object_id, %{
+      tracked
+      | last_seen_ms: context.media_ms,
+        last_seen_at: context.observed_at || tracked.last_seen_at
+    })
   end
 
   # Strict only while a stationary track is in extended grace — already unseen
@@ -439,8 +578,12 @@ defmodule Cairn.Tracker do
   defp match_threshold(_tracked, _context), do: @iou_threshold
 
   defp apply_assignments(tracker, objects, assignments, context) do
-    # Tracks this batch already spoke for: retiring one to make room for a new
-    # identity would churn the very tracks the cap exists to protect.
+    # Tracks this batch assigned a detection to: retiring one to make room for
+    # a new identity would churn the very tracks the cap exists to protect. A
+    # track merely marked seen by a suppression is not in here — it is not in
+    # `assignments` under an id — but its refreshed `last_seen_ms` ties it with
+    # the tracks this batch did match, which is as far from the LRU victim as
+    # anything in the live set gets.
     protected = for {_index, id} <- assignments, is_binary(id), into: MapSet.new(), do: id
 
     {tracker, tagged, events} =
@@ -536,7 +679,10 @@ defmodule Cairn.Tracker do
         # any more — one riding out its grace included — over the ones this
         # scene is actively seeing, which is the preference the cap wants:
         # extended grace buys time against expiry, not against a full live set,
-        # and is deliberately not exempted here.
+        # and is deliberately not exempted here. The one grace-riding track it
+        # does not prefer is one a suppression just marked seen, which is the
+        # right exception for the same reason the mark exists: an overlapping
+        # box this batch says the object is still there.
         {id, object} = Enum.min_by(candidates, fn {id, o} -> {o.last_seen_ms, id} end)
         tracker = warn_cap(tracker, context, "evicting the least recently seen track #{id}")
 

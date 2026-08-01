@@ -11,6 +11,27 @@ defmodule Cairn.TrackerTest do
   @max_unseen 3_000
   @stationary_after 10_000
 
+  # The duplicate-suppression fixtures. Small and non-square on purpose: the
+  # rule exists for boxes like these (a parked car at roughly 0.18 x 0.12
+  # normalized), where a few pixels of detector drift cost far more IoU than
+  # they do on the 0.4 x 0.4 boxes the rest of this file parks — and where a
+  # box that only drifts in x, or only ever square, would hide an area factor
+  # or a threshold comparison that lost an axis. Each is a different size and
+  # aspect ratio, and the walker pair below drifts along the other axis.
+  @parked_car [0.40, 0.50, 0.18, 0.12]
+  # same box shifted a third of its width: IoU 0.5, between
+  # @duplicate_suppression_iou (0.4) and @stationary_match_iou (0.7)
+  @car_drift [0.46, 0.50, 0.18, 0.12]
+  # wholly inside @parked_car and covering 45% of it, so IoU 0.45 — a detector
+  # firing on part of the car rather than a box that moved
+  @car_fragment [0.40, 0.50, 0.081, 0.12]
+  # same box shifted half its width: IoU 1/3, below the suppression threshold
+  @car_neighbour [0.49, 0.50, 0.18, 0.12]
+  # tall where the car boxes are wide, and displaced in y rather than x
+  @walker [0.30, 0.20, 0.10, 0.30]
+  # IoU 0.5 with @walker, the same overlap @car_drift has with @parked_car
+  @walker_step [0.30, 0.30, 0.10, 0.30]
+
   defp det(label, bbox, opts \\ []) do
     %{
       label: label,
@@ -69,16 +90,17 @@ defmodule Cairn.TrackerTest do
     end)
   end
 
-  # One host-mode object detected every second at `box`, from media time 0
-  # through @stationary_after (10_000): stationary as of the last step, with
-  # `last_seen_ms` 10_000 and `last_seen_host_ms` 0 (the ctx default). Host
+  # One host-mode object of `label` detected every second at `box`, from media
+  # time 0 through @stationary_after (10_000): stationary as of the last step,
+  # with `last_seen_ms` 10_000, `last_seen_at` at(10_000) and
+  # `last_seen_host_ms` 0 (the ctx default). Host
   # mode on purpose — what the grace tests are about is IoU identity, which a
   # plugin track id would pin regardless.
-  defp parked(box) do
+  defp parked(box, label \\ "person") do
     {tracker, id} =
       Enum.reduce(0..10, {Tracker.new(), nil}, fn n, {tracker, id} ->
         {tracker, [tagged], _events} =
-          track(tracker, [det("person", box)], media_ms: n * 1_000, observed_at: at(n * 1_000))
+          track(tracker, [det(label, box)], media_ms: n * 1_000, observed_at: at(n * 1_000))
 
         {tracker, id || tagged.object_id}
       end)
@@ -829,6 +851,368 @@ defmodule Cairn.TrackerTest do
       assert [{:ended, %Track{object_id: ^id, end_reason: :unseen} = final}] = ended
       assert_self_contained(final)
       assert Tracker.live_tracks(t) == []
+    end
+  end
+
+  describe "duplicate suppression" do
+    # Every test here parks at 10_000 and then arrives at 14_000: 4_000 unseen,
+    # inside the grace (past @max_unseen 3_000, well short of 5 x 3_000), which
+    # is where a track is picky enough to refuse a box in the first place.
+    test "a drifted re-detection of a parked object is dropped, not minted" do
+      # non-vacuity: refused by @stationary_match_iou (0.7), caught by
+      # @duplicate_suppression_iou (0.4) — the band the whole rule is about
+      assert_in_delta Tracker.iou(@parked_car, @car_drift), 0.5, 0.001
+
+      {t, id} = parked(@parked_car, "car")
+
+      {t, tagged, events} =
+        track(t, [det("car", @car_drift, score: 0.95)],
+          media_ms: 14_000,
+          observed_at: at(14_000)
+        )
+
+      # the object is absent from the tagged list and nothing happened to any
+      # track's lifecycle: no second `:started`, no `:updated`, no `:ended`
+      assert tagged == []
+      assert events == []
+
+      # marked seen, and nothing more: the refused box is not in `bbox`, its
+      # higher score is not in `best_score`, and the last *detection* is still
+      # the parked one, so this is still not evidence
+      assert [%Track{object_id: ^id, bbox: @parked_car, stationary: true} = still] =
+               Tracker.live_tracks(t)
+
+      assert still.last_seen_at == at(14_000)
+      assert still.score == 0.9
+      assert still.best_score == 0.9
+      assert still.stale_predicted
+
+      # and the media clock really moved: 25_100 is past the extended bound
+      # measured from the parked track's last *match* (10_000 + 15_000) and
+      # inside it measured from the refusal (14_000 + 15_000)
+      {t, [], []} = track(t, [], media_ms: 25_100)
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+
+      {t, [], ended} = track(t, [], media_ms: 29_100)
+      assert [{:ended, %Track{object_id: ^id, end_reason: :unseen} = final}] = ended
+      assert_self_contained(final)
+      assert Tracker.live_tracks(t) == []
+    end
+
+    test "a fragment of a parked object's box is dropped, not minted" do
+      assert_in_delta Tracker.iou(@parked_car, @car_fragment), 0.45, 0.001
+
+      {t, id} = parked(@parked_car, "car")
+
+      {t, tagged, events} =
+        track(t, [det("car", @car_fragment)], media_ms: 14_000, observed_at: at(14_000))
+
+      assert tagged == []
+      assert events == []
+      assert [%Track{object_id: ^id, bbox: @parked_car}] = Tracker.live_tracks(t)
+    end
+
+    test "a same-label box below the threshold is a new object: it mints, and marks nothing" do
+      assert_in_delta Tracker.iou(@parked_car, @car_neighbour), 1 / 3, 0.001
+
+      {t, id} = parked(@parked_car, "car")
+
+      {t, [tagged], events} =
+        track(t, [det("car", @car_neighbour)], media_ms: 14_000, observed_at: at(14_000))
+
+      assert [{:started, %Track{object_id: other}}] = events
+      refute other == id
+      assert tagged.object_id == other
+
+      assert Enum.map(Tracker.live_tracks(t), & &1.object_id) == Enum.sort([id, other])
+
+      # and the parked track was not marked seen by a box that did not suppress
+      assert [parked] = Enum.filter(Tracker.live_tracks(t), &(&1.object_id == id))
+      assert parked.last_seen_at == at(10_000)
+    end
+
+    test "a different label overlapping a parked track still mints" do
+      # a person standing in front of the parked car: far above the suppression
+      # threshold, so only the same-label guard keeps it mintable
+      assert Tracker.iou(@parked_car, @car_drift) >= 0.4
+
+      {t, id} = parked(@parked_car, "car")
+
+      {t, [tagged], events} =
+        track(t, [det("person", @car_drift)], media_ms: 14_000, observed_at: at(14_000))
+
+      assert [{:started, %Track{object_id: other, label: "person"}}] = events
+      refute other == id
+      assert tagged.object_id == other
+
+      assert [parked] = Enum.filter(Tracker.live_tracks(t), &(&1.object_id == id))
+      assert parked.last_seen_at == at(10_000)
+      assert parked.label == "car"
+    end
+
+    # Pixel units and an exact ratio on purpose: 80/200 is 0.4 in binary
+    # floating point with nothing to round, so this is the one place in the
+    # suite where `>=` and `>` on the threshold give different answers.
+    test "the suppression threshold includes its own boundary" do
+      box = [640, 360, 20, 10]
+      exactly = [640, 360, 8, 10]
+      under = [640, 360, 7, 10]
+
+      assert Tracker.iou(box, exactly) === 0.4
+      assert Tracker.iou(box, under) === 0.35
+
+      {t, id} = parked(box, "car")
+
+      {_t, tagged, events} =
+        track(t, [det("car", exactly)], media_ms: 14_000, observed_at: at(14_000))
+
+      assert tagged == []
+      assert events == []
+
+      # the same tracker, one pixel of width less: below the threshold, so it
+      # is a new object again
+      {_t, [tagged], events} =
+        track(t, [det("car", under)], media_ms: 14_000, observed_at: at(14_000))
+
+      assert [{:started, %Track{object_id: other}}] = events
+      refute other == id
+      assert tagged.object_id == other
+    end
+
+    # The other half of the rule: a refusal is not permanent. Without the mark,
+    # the parked track would sit in its grace refusing this box on every batch
+    # until it expired, and the car would go untracked for the whole 15_000.
+    test "a parked object whose detections flicker keeps one identity, not two or three" do
+      {t, id} = parked(@parked_car, "car")
+
+      # the observed failure: detections drop out for longer than max_unseen_ms
+      # and come back a little off, at a score nothing would filter out
+      {t, [], []} =
+        track(t, [det("car", @car_drift, score: 0.7)],
+          media_ms: 14_000,
+          observed_at: at(14_000)
+        )
+
+      # from here it is detected every second at the drifted box. The refusal
+      # took the track out of its grace, so the base threshold matches
+      {t, seen_ids, started} =
+        Enum.reduce(15_000..20_000//1_000, {t, [], []}, fn ms, {t, seen_ids, started} ->
+          {t, [tagged], events} =
+            track(t, [det("car", @car_drift, score: 0.7)], media_ms: ms, observed_at: at(ms))
+
+          {t, [tagged.object_id | seen_ids], started ++ ids(events, :started)}
+        end)
+
+      assert length(seen_ids) == 6
+      assert Enum.uniq(seen_ids) == [id]
+      assert started == []
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+    end
+
+    # A refusal every 4_000 of media time is refused every time: each mark
+    # leaves the next batch 4_000 unseen, back inside the grace.
+    test "repeated refusals mint nothing and leave the stillness window untouched" do
+      {t, id} = parked(@parked_car, "car")
+
+      t =
+        Enum.reduce([14_000, 18_000, 22_000, 26_000, 30_000], t, fn ms, t ->
+          {t, [], []} = track(t, [det("car", @car_drift)], media_ms: ms, observed_at: at(ms))
+          assert [%Track{object_id: ^id, bbox: @parked_car}] = Tracker.live_tracks(t)
+          t
+        end)
+
+      # five refusals is a full @recent_boxes window. Adopting the drifted box
+      # now still reads as *still*, because the median of the smoothing window
+      # is the parked box — which is only true if none of the five refusals
+      # went into `recent_boxes`, and if the anchor is still the parked box
+      {_t, [tagged], events} =
+        track(t, [det("car", @car_drift)], media_ms: 31_000, observed_at: at(31_000))
+
+      assert tagged.object_id == id
+      assert [{:updated, %Track{object_id: ^id, stationary: true, bbox: @car_drift}}] = events
+    end
+
+    # Suppression looks only at tracks this batch left unmatched, and that is
+    # what keeps a genuinely new object over a tracked one mintable.
+    test "a track this batch matched does not suppress a second object over it" do
+      assert_in_delta Tracker.iou(@walker, @walker_step), 0.5, 0.001
+
+      {t, [a], _} = track(Tracker.new(), [det("person", @walker)])
+
+      {t, [a2, b], events} =
+        track(t, [det("person", @walker), det("person", @walker_step)],
+          media_ms: 200,
+          observed_at: at(200)
+        )
+
+      assert a2.object_id == a.object_id
+      assert ids(events, :updated) == [a.object_id]
+      assert [{:started, %Track{object_id: other}}] = for({:started, _} = e <- events, do: e)
+      assert b.object_id == other
+      refute other == a.object_id
+      assert length(Tracker.live_tracks(t)) == 2
+    end
+
+    # Why suppression never has to ask whether a track is stationary: a track
+    # matching at the base @iou_threshold takes a box like this outright, so it
+    # is never both free and overlapped this much.
+    test "a moving track adopts a drifted box outright rather than being marked seen" do
+      {t, [a], _} = track(Tracker.new(), [det("person", @walker)])
+
+      {t, [b], events} =
+        track(t, [det("person", @walker_step)], media_ms: 200, observed_at: at(200))
+
+      id = a.object_id
+      assert b.object_id == id
+      # adopted, not merely kept alive: the box moves and an `:updated` is
+      # emitted, neither of which a suppression does
+      assert [{:updated, %Track{object_id: ^id, bbox: @walker_step}}] = events
+
+      assert [
+               %Track{
+                 object_id: ^id,
+                 bbox: @walker_step,
+                 last_seen_at: ~U[2026-07-26 12:00:00.200Z]
+               }
+             ] =
+               Tracker.live_tracks(t)
+    end
+
+    # Where two tracks already sit on one object — the pile-up this rule stops
+    # being made, seen from after it was made — one box may not hold both
+    # alive, or the pile could never drain.
+    test "only the most overlapping of several refusing tracks is marked seen" do
+      nearer = [0.50, 0.50, 0.18, 0.12]
+
+      # both refuse the drifted box (@stationary_match_iou is 0.7) and both are
+      # above the suppression threshold, `nearer` by more
+      assert_in_delta Tracker.iou(nearer, @car_drift), 0.636, 0.001
+      assert_in_delta Tracker.iou(@parked_car, @car_drift), 0.5, 0.001
+
+      {t, ids} =
+        Enum.reduce(0..10, {Tracker.new(), nil}, fn n, {t, ids} ->
+          {t, tagged, _} =
+            track(t, [det("car", @parked_car), det("car", nearer)],
+              media_ms: n * 1_000,
+              observed_at: at(n * 1_000)
+            )
+
+          {t, ids || Enum.map(tagged, & &1.object_id)}
+        end)
+
+      assert [far_id, near_id] = ids
+      assert [%Track{stationary: true}, %Track{stationary: true}] = Tracker.live_tracks(t)
+
+      {t, tagged, events} =
+        track(t, [det("car", @car_drift)], media_ms: 14_000, observed_at: at(14_000))
+
+      assert tagged == []
+      assert events == []
+
+      seen_at = Map.new(Tracker.live_tracks(t), &{&1.object_id, &1.last_seen_at})
+      assert seen_at[near_id] == at(14_000)
+      assert seen_at[far_id] == at(10_000)
+
+      # so the one the box did not vouch for still expires on its own clock
+      {t, [], ended} = track(t, [], media_ms: 25_100)
+      assert [{:ended, %Track{object_id: ^far_id, end_reason: :unseen}}] = ended
+      assert [%Track{object_id: ^near_id}] = Tracker.live_tracks(t)
+    end
+
+    # The counterpart of "an exact IoU tie is broken deterministically": with
+    # two tracks refusing the same box by the same margin, which one is marked
+    # seen is decided by the sort key and never by map iteration order.
+    test "an exact overlap tie between two refusing tracks is broken by id" do
+      # pixel units again: an exact tie has to survive being computed two ways,
+      # and 120/280 is one double however it is reached
+      left = [600, 360, 20, 10]
+      drift = [608, 360, 20, 10]
+      right = [616, 360, 20, 10]
+
+      assert Tracker.iou(left, drift) === Tracker.iou(right, drift)
+      assert_in_delta Tracker.iou(left, drift), 0.4286, 0.001
+      # and not with each other, or one would suppress the other's detections
+      assert_in_delta Tracker.iou(left, right), 0.111, 0.001
+
+      {t, ids} =
+        Enum.reduce(0..10, {Tracker.new(), nil}, fn n, {t, ids} ->
+          {t, tagged, _} =
+            track(t, [det("car", left), det("car", right)],
+              media_ms: n * 1_000,
+              observed_at: at(n * 1_000)
+            )
+
+          {t, ids || Enum.map(tagged, & &1.object_id)}
+        end)
+
+      {t, [], []} = track(t, [det("car", drift)], media_ms: 14_000, observed_at: at(14_000))
+
+      seen_at = Map.new(Tracker.live_tracks(t), &{&1.object_id, &1.last_seen_at})
+      assert seen_at[Enum.min(ids)] == at(14_000)
+      assert seen_at[Enum.max(ids)] == at(10_000)
+    end
+
+    test "a plugin-owned track is not a suppression candidate" do
+      {t, [plugin_object], _} =
+        track(Tracker.new(), [det("car", @parked_car, track_id: "c1")], plugin_ctx([]))
+
+      # host mode (no track_id) against a plugin-owned track it overlaps at
+      # 0.5: `assign_host/3` only ever considers host-owned tracks, so this
+      # neither matches nor is suppressed by it
+      {_t, [host_object], events} =
+        track(t, [det("car", @car_drift)], plugin_ctx(media_ms: 200))
+
+      assert [{:started, %Track{object_id: other, source: :host}}] = events
+      refute other == plugin_object.object_id
+      assert host_object.object_id == other
+    end
+
+    # `seen/3` deliberately leaves `last_seen_host_ms` alone, so the backstop
+    # keeps counting from the last *adopted* observation. Without that, a
+    # detection the tracker refuses every batch would hold a track alive for
+    # ever — the one case where the media clock cannot bound it, because the
+    # refusals themselves keep moving it.
+    test "refusals cannot hold a track alive past the host-clock backstop" do
+      {t, id} = parked(@parked_car, "car")
+
+      # 10 x the extended bound (10 x 5 x 3_000) of host time since the parked
+      # track's last match, which `parked/2` leaves at host 0: the last moment
+      # it is alive
+      {t, [], []} =
+        track(t, [det("car", @car_drift)],
+          media_ms: 14_000,
+          observed_at: at(14_000),
+          now_ms: 150_000
+        )
+
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+
+      # one host millisecond later, with the media clock refreshed by this
+      # batch's refusal too — so only the backstop can be what ends it
+      {t, tagged, ended} =
+        track(t, [det("car", @car_drift)],
+          media_ms: 18_000,
+          observed_at: at(18_000),
+          now_ms: 150_001
+        )
+
+      assert tagged == []
+      assert [{:ended, %Track{object_id: ^id, end_reason: :unseen} = final}] = ended
+      assert_self_contained(final)
+      assert Tracker.live_tracks(t) == []
+
+      # and the object is tracked again on the next batch: the identity the
+      # refusals were protecting is gone, so nothing refuses this one
+      {_t, [tagged], events} =
+        track(t, [det("car", @car_drift)],
+          media_ms: 19_000,
+          observed_at: at(19_000),
+          now_ms: 150_002
+        )
+
+      assert [{:started, %Track{object_id: fresh}}] = events
+      refute fresh == id
+      assert tagged.object_id == fresh
     end
   end
 
