@@ -14,6 +14,12 @@ defmodule Cairn.TrackRecorderNoSandboxTest do
   # empty buffer" is the property that keeps those wakeups free — two modules
   # deep, `Cairn.Tracks.insert_batch/1` also short-circuits an empty list, so
   # this pins the behaviour rather than either implementation.
+  #
+  # What the stand-in does *not* reach: the ownership error is raised by the
+  # pool checkout, before a single row is dumped, so nothing a batch's own
+  # contents could do to a flush — a column value Ecto refuses to encode, say —
+  # is observable from here. Those belong in `Cairn.TrackRecorderTest`, where
+  # the flush gets as far as the database.
   use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog, only: [capture_log: 1]

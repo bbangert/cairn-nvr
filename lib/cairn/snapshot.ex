@@ -17,7 +17,7 @@ defmodule Cairn.Snapshot do
 
   require Logger
 
-  alias Cairn.{Config, DataDir, EventArtifact, Events}
+  alias Cairn.{Config, DataDir, EventArtifact, Events, TrackPath}
 
   # tuned for HD+ camera frames; fontsize is not an ffmpeg expression so it
   # can't scale with resolution — a fixed size reads fine from ~640p up.
@@ -68,6 +68,47 @@ defmodule Cairn.Snapshot do
 
       _ ->
         base ++ ["-i", row.path] ++ frame ++ [out]
+    end
+  end
+
+  @doc """
+  Clip time (seconds) to cut the snapshot from — the trigger's moment, clamped
+  inside the clip — or nil when the event carries no usable trigger. Public for
+  tests.
+
+  Two ways to place that moment, in preference order.
+
+  The sidecar header's `drained_span_ms` / `drain_wall_ms` /
+  `event_started_ms` (`Cairn.TrackPath`) place the event's t=0 from what the
+  writer actually drained, which is the same arithmetic the browser overlay
+  uses — so a poster frame cut this way agrees with the boxes drawn over the
+  video.
+
+  Failing that, `pre_window(config, camera)` — the *configured* pre-roll, not
+  the retained one. That is an approximation: a ring that had not filled yet
+  yields a shorter head than the config promises, and the clamp is what keeps
+  the error inside the clip. On a camera whose ring was full the two agree to
+  within tens of milliseconds; on one that had just started they disagree by
+  however much pre-roll was missing, which is a second or more.
+
+  The sidecar is never *required*: it is allowed to be absent (no boxes, a
+  failed write, a clip older than the feature), allowed to be corrupt, and
+  allowed to carry a nil anchor, and a poster frame must render anyway. Every
+  one of those falls back to the pre-window estimate rather than failing.
+  """
+  @spec clip_seek(Events.Event.t(), Config.t()) :: number() | nil
+  def clip_seek(row, config) do
+    case trigger(row) do
+      nil ->
+        nil
+
+      trig ->
+        raw = anchored_seek(row, trig) || pre_window(config, row.camera_id) + trigger_t(trig)
+
+        case probe_duration(row.path) do
+          {:ok, dur} when dur > 0 -> min(raw, max(dur - 0.2, 0.0))
+          _ -> raw
+        end
     end
   end
 
@@ -151,33 +192,34 @@ defmodule Cairn.Snapshot do
   defp snapshot_reason(:not_found), do: :not_found
   defp snapshot_reason(_other), do: :index_write_failed
 
-  # Clip time to cut the snapshot from: the trigger's moment (pre-roll + its
-  # offset), clamped inside the clip. A freshly-started camera has less than a
-  # full pre-window of pre-roll, so the raw offset can run past a short clip.
-  #
-  # `pre_window(config, camera)` is the *configured* pre-roll, not the retained
-  # one, so this is an approximation: a ring that had not filled yet yields a
-  # shorter head than the config promises, and the clamp above is what keeps
-  # the error inside the clip. A better anchor now exists — the sidecar
-  # header's `drained_span_ms` / `drain_wall_ms` / `event_started_ms`
-  # (`Cairn.TrackPath`) place the event's t=0 from what the writer actually
-  # drained — and it is deliberately not read here: the sidecar is allowed to
-  # be absent (no boxes, a failed write, a clip older than the feature) and a
-  # poster frame must not depend on a file that may not exist.
-  defp clip_seek(row, config) do
-    case trigger(row) do
-      nil ->
-        nil
-
-      trig ->
-        raw = pre_window(config, row.camera_id) + (trig["t"] || 0.0)
-
-        case probe_duration(row.path) do
-          {:ok, dur} when dur > 0 -> min(raw, max(dur - 0.2, 0.0))
-          _ -> raw
-        end
+  # nil on every miss, which is the whole contract with `clip_seek/2` above:
+  # no clip path, no sidecar next to it, bytes that are not a sidecar, no
+  # anchor, an anchor missing any of the three fields the arithmetic needs, or
+  # a result before the start of the clip (a mismatched sidecar, or a trigger
+  # from before the drain). A negative seek is worse than the estimate it would
+  # replace, so it is treated as a miss rather than clamped to zero.
+  defp anchored_seek(%{path: path}, trig) when is_binary(path) do
+    with {:ok, bytes} <- File.read(DataDir.trackpath_for_clip(path)),
+         {:ok, %{"anchor" => anchor}} <- TrackPath.decode(bytes),
+         %{
+           "drained_span_ms" => span_ms,
+           "drain_wall_ms" => wall_ms,
+           "event_started_ms" => started_ms
+         }
+         when is_number(span_ms) and is_number(wall_ms) and is_number(started_ms) <- anchor,
+         seek when seek >= 0 <- (span_ms + started_ms - wall_ms) / 1000 + trigger_t(trig) do
+      seek
+    else
+      _miss -> nil
     end
   end
+
+  defp anchored_seek(_row, _trig), do: nil
+
+  # The trigger's offset into the event, in seconds. A JSON round-trip can put
+  # anything in there; anything but a number is read as the event's own start.
+  defp trigger_t(%{"t" => t}) when is_number(t), do: t
+  defp trigger_t(_trig), do: 0.0
 
   defp probe_duration(path) do
     case System.cmd("ffprobe", ~w(-v error -show_entries format=duration -of csv=p=0) ++ [path],

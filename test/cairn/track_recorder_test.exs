@@ -188,6 +188,43 @@ defmodule Cairn.TrackRecorderTest do
     end
   end
 
+  describe "timestamp precision" do
+    # Every other fixture in this file times its tracks with
+    # `DateTime.utc_now()`, which is microsecond precision — the one value the
+    # `:utc_datetime_usec` columns accept. A real final never is: the plugin
+    # writes three decimals, `DateTime.from_iso8601/1` keeps the precision the
+    # string carried, and `insert_all` dumps without casting, so a wire-timed
+    # final used to raise `ArgumentError` out of `Ecto.Type.check_usec!` and
+    # take the recorder down with the whole buffer. Precision is the dimension
+    # this corpus held constant (see
+    # `.claude/solutions/fixture-corpus-uniform-in-a-dimension-20260729.md`).
+    test "a final timed from the wire is written, not fatal", %{camera_id: cam} do
+      rec = start_recorder()
+      {:ok, started, 0} = DateTime.from_iso8601("2026-08-01T15:33:14.194Z")
+      {:ok, last_seen, 0} = DateTime.from_iso8601("2026-08-01T15:33:18.421Z")
+      assert started.microsecond == {194_000, 3}
+
+      final =
+        track(cam, %{
+          started_at: started,
+          last_seen_at: last_seen,
+          stationary_since: started
+        })
+
+      TrackRecorder.record_moment(rec, final.object_id, started, :appeared, [0.1, 0.1, 0.2, 0.2])
+      TrackRecorder.record_final(rec, final, nil)
+      flush(rec)
+
+      assert Process.alive?(rec)
+      row = Tracks.get(final.object_id)
+      assert row
+      assert DateTime.compare(row.started_at, started) == :eq
+      assert DateTime.compare(row.ended_at, last_seen) == :eq
+      assert DateTime.compare(row.stationary_since, started) == :eq
+      assert [%{kind: :appeared}] = Tracks.moments(final.object_id)
+    end
+  end
+
   describe "bounds" do
     test "buffered finals are capped, oldest dropped", %{camera_id: cam} do
       rec = start_recorder(max_buffered_finals: 3)

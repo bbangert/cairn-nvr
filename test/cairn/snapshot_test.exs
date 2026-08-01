@@ -195,6 +195,114 @@ defmodule Cairn.SnapshotTest do
     assert File.exists?(p)
   end
 
+  describe "clip_seek/2" do
+    # Lifted from a real reolink event. The drain returned 36 ms *after* the
+    # event's own start and had drained 1000 ms of pre-roll, so the event's
+    # t=0 sits 0.964 s into the clip — not the 1.0 s the config promised. Every
+    # expected value below is written out by hand rather than recomputed from
+    # these, so that an arithmetic slip in `clip_seek/2` cannot slip through
+    # the test with it.
+    @span_ms 1_000
+    @wall_ms 1_785_597_751_542
+    @started_ms 1_785_597_751_506
+    @anchor %{
+      first_pts: 0,
+      timescale: 90_000,
+      drained_span_ms: @span_ms,
+      drain_wall_ms: @wall_ms,
+      event_started_ms: @started_ms
+    }
+    @trig %{t: 0.75, label: "person", score: 0.9, bbox: [0.2, 0.2, 0.3, 0.4]}
+
+    # The fixture is 6.0 s long, so the clamp sits at 5.8 and none of the
+    # expectations below reach it — except the one that means to.
+    defp clip(dir) do
+      path = Path.join(dir, "clip.mp4")
+      File.cp!(@fixture, path)
+      path
+    end
+
+    defp sidecar!(path, anchor) do
+      bytes = Cairn.TrackPath.encode(%{event_id: "e", camera_id: "snap_cam", anchor: anchor}, [])
+      File.write!(Cairn.DataDir.trackpath_for_clip(path), bytes)
+    end
+
+    # 1.0 s of configured pre-roll: distinct from the 0.964 s the anchor
+    # measures, so which of the two answered is visible in the result.
+    defp seek_config(config), do: %{config | pre_window_seconds: 1.0}
+
+    test "the anchor places the seek when the sidecar has one", ctx do
+      path = clip(ctx.dir)
+      sidecar!(path, @anchor)
+      row = insert(@trig, path)
+
+      # (1000 + 1785597751506 − 1785597751542) / 1000 + 0.75
+      assert Snapshot.clip_seek(row, seek_config(ctx.config)) == 1.714
+    end
+
+    test "no sidecar falls back to the configured pre-window", ctx do
+      row = insert(@trig, clip(ctx.dir))
+
+      # 1.0 + 0.75, the approximation, and 36 ms off the anchor's answer
+      assert Snapshot.clip_seek(row, seek_config(ctx.config)) == 1.75
+    end
+
+    test "a file that is not a sidecar falls back", ctx do
+      path = clip(ctx.dir)
+      File.write!(Cairn.DataDir.trackpath_for_clip(path), "not gzip, not msgpack")
+      row = insert(@trig, path)
+
+      assert Snapshot.clip_seek(row, seek_config(ctx.config)) == 1.75
+    end
+
+    test "a sidecar with no anchor at all falls back", ctx do
+      path = clip(ctx.dir)
+      sidecar!(path, nil)
+      row = insert(@trig, path)
+
+      assert Snapshot.clip_seek(row, seek_config(ctx.config)) == 1.75
+    end
+
+    # The header type allows every anchor field to be nil on its own, so an
+    # anchor whose media fields were captured and whose wall-clock ones were
+    # not is a shape this has to survive rather than divide by.
+    test "an anchor missing the wall-clock fields falls back", ctx do
+      path = clip(ctx.dir)
+      sidecar!(path, %{first_pts: 0, timescale: 90_000})
+      row = insert(@trig, path)
+
+      assert Snapshot.clip_seek(row, seek_config(ctx.config)) == 1.75
+    end
+
+    # A sidecar from another clip, or a trigger from before the drain: the
+    # anchor is well-formed and the answer is still not a position in this
+    # file. Better the estimate than a seek ffmpeg reads as 0.
+    test "an anchor that places the trigger before the clip falls back", ctx do
+      path = clip(ctx.dir)
+      sidecar!(path, %{@anchor | drain_wall_ms: @started_ms + 30_000})
+      row = insert(@trig, path)
+
+      assert Snapshot.clip_seek(row, seek_config(ctx.config)) == 1.75
+    end
+
+    test "the anchored seek is clamped inside the clip like the estimate", ctx do
+      path = clip(ctx.dir)
+      sidecar!(path, %{@anchor | drained_span_ms: 60_000})
+      row = insert(@trig, path)
+
+      # 60.714 would land past the end of a 6.0 s clip and write nothing
+      assert Snapshot.clip_seek(row, seek_config(ctx.config)) == 5.8
+    end
+
+    test "no trigger means no seek, sidecar or not", ctx do
+      path = clip(ctx.dir)
+      sidecar!(path, @anchor)
+      row = insert(nil, path)
+
+      assert Snapshot.clip_seek(row, seek_config(ctx.config)) == nil
+    end
+  end
+
   test "draws the box but no label when no font is available", %{config: config} do
     Application.put_env(:cairn, :snapshot_font, "/no/such/font.ttf")
     on_exit(fn -> Application.delete_env(:cairn, :snapshot_font) end)

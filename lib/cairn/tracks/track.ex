@@ -25,6 +25,13 @@ defmodule Cairn.Tracks.Track do
   Rows are written only by `Cairn.Tracks.insert_batch/1` via `insert_all`, so
   there is no changeset — the recorder's rows are machine-generated, the column
   types dump-check them, and `NOT NULL` covers what is required.
+
+  A dump check is not a validation, though: it raises inside the caller's
+  process instead of returning an error, and the caller is a batch writer that
+  loses its whole buffer when it dies. That is why the writer normalizes what a
+  column type is strict about — the microsecond precision the
+  `:utc_datetime_usec` fields below demand — before it inserts, rather than
+  leaving the dump to reject it.
   """
 
   use Ecto.Schema

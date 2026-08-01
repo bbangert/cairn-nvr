@@ -139,7 +139,7 @@ defmodule Cairn.PluginProtocolTest do
       assert obs.pts == 90_000
       assert obs.time_base == {1, 90_000}
       assert obs.media_ms == 1_000.0
-      assert obs.observed_at == ~U[2026-07-26 12:00:00.500Z]
+      assert obs.observed_at == ~U[2026-07-26 12:00:00.500000Z]
       assert obs.time_quality == :source
       assert obs.protocol == :v1
       assert obs.ended_tracks == []
@@ -158,6 +158,32 @@ defmodule Cairn.PluginProtocolTest do
 
       assert obs.time_base == {1, 60}
       assert obs.media_ms == 2_000.0
+    end
+
+    # The wire carries three decimals and `DateTime.from_iso8601/1` keeps the
+    # precision it was given, but every column this time reaches is
+    # `:utc_datetime_usec`, which Ecto dumps only at precision 6. A
+    # `{_, 3}` here is a crash in `Cairn.TrackRecorder`'s flush, not a rounding
+    # detail, so the precision is asserted rather than the instant alone —
+    # `==` on `DateTime` compares the tuple, but `~U` sigils are easy to write
+    # with the wrong number of digits and read as if they matched.
+    test "a millisecond wire time is padded to microsecond precision" do
+      assert {:objects, obs} =
+               PluginProtocol.decode_line(
+                 frame(%{"observed_at" => "2026-08-01T15:33:14.194Z"}),
+                 :camera
+               )
+
+      assert obs.observed_at.microsecond == {194_000, 6}
+
+      # a whole second on the wire pads from zero digits, not from three
+      assert {:objects, whole} =
+               PluginProtocol.decode_line(
+                 frame(%{"observed_at" => "2026-08-01T15:33:14Z"}),
+                 :camera
+               )
+
+      assert whole.observed_at.microsecond == {0, 6}
     end
 
     test "objects carry track_id and observation_kind" do

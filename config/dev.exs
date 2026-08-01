@@ -53,6 +53,11 @@ config :cairn, dev_routes: true
 # Do not include metadata nor timestamps in development logs
 config :logger, :default_formatter, format: "[$level] $message\n"
 
+# Surface supervisor child-restart reports: without them a crash-looping
+# GenServer prints N identical "terminating" blocks with nothing tying them
+# to a restart storm (how the TrackRecorder precision crash-loop hid).
+config :logger, handle_sasl_reports: true
+
 # Set a higher stacktrace during development. Avoid configuring such
 # in production as building large stacktraces may be expensive.
 config :phoenix, :stacktrace_depth, 20

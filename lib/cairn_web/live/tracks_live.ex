@@ -115,8 +115,14 @@ defmodule CairnWeb.TracksLive do
       filters: filters,
       page: result.page,
       total: result.total,
-      showing_from: (result.page - 1) * @page_size + 1,
-      showing_to: (result.page - 1) * @page_size + length(result.tracks),
+      # An out-of-range ?page= yields an empty page while `total` stays
+      # positive; "Showing 0–0 of N" beats the nonsense range "201–200 of 2".
+      showing_from: if(result.tracks == [], do: 0, else: (result.page - 1) * @page_size + 1),
+      showing_to:
+        if(result.tracks == [],
+          do: 0,
+          else: (result.page - 1) * @page_size + length(result.tracks)
+        ),
       has_next: result.page * @page_size < result.total,
       rows: Enum.map(result.tracks, &row(&1, links, moments, now))
     )

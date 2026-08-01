@@ -306,12 +306,19 @@ defmodule Cairn.TrackRecorder do
     end
   rescue
     # `Cairn.Tracks` turns SQLite's own refusals into `{:error, _}`; an
-    # ownership error is the one "the database is not answering" case it does
-    # not cover, and it is what every Repo call from this process looks like in
-    # a test that did not arrange a sandbox for it. Surviving it costs a batch
+    # ownership error is the "the database is not answering" case it does not
+    # cover, and it is what every Repo call from this process looks like in a
+    # test that did not arrange a sandbox for it. Surviving it costs a batch
     # that was already declared droppable — the same judgement
     # `Cairn.DetectionAggregator.indexed_status/1` makes about its own Repo
     # call.
+    #
+    # Deliberately narrow. A row Ecto refuses to *dump* raises here too
+    # (`ArgumentError` out of `Ecto.Type.check_usec!` for a datetime that does
+    # not declare microseconds), and that is a bug in what this process built,
+    # not a database that is busy: it would raise on every retry and eat the
+    # buffer every flush interval, silently, forever. It is prevented where the
+    # row is built (`Cairn.Tracks`) rather than swallowed here.
     e in [DBConnection.OwnershipError] -> dropped(state, entries, Exception.message(e))
   catch
     # the pool or the Repo process itself is gone

@@ -19,12 +19,14 @@ defmodule Cairn.TrackPath do
   path `Cairn.DataDir.trackpath_for_clip/1` derives, holding the box of every
   tagged observation seen while the event was open.
 
-  This module is the format's single source of truth. The reader that matters
-  is a browser, which cannot share this code: `assets/js/hooks/track_overlay.js`
-  re-implements the arithmetic below in JavaScript. The layout is therefore a
-  contract between two implementations rather than an internal detail of one —
-  a change here is a change there — and it is written down here because there
-  is nowhere else it could be.
+  This module is the format's single source of truth. The reader that draws the
+  boxes is a browser, which cannot share this code:
+  `assets/js/hooks/track_overlay.js` re-implements the arithmetic below in
+  JavaScript. The layout is therefore a contract between two implementations
+  rather than an internal detail of one — a change here is a change there — and
+  it is written down here because there is nowhere else it could be.
+  (`Cairn.Snapshot.clip_seek/2` reads the header too, through `decode/1`, for
+  the anchor alone.)
 
   Per-frame boxes and track identity meet in exactly one place in this system,
   `Cairn.Tracker`'s `tagged` list; every consumer downstream of it sees one or
@@ -67,7 +69,8 @@ defmodule Cairn.TrackPath do
   pre-roll, and the wall clock at the instant that drain returned.
 
   Three of those map an event-relative `"ts"` onto a position in the clip, and
-  are the three the browser reader uses:
+  are the three every reader of the anchor uses — the browser overlay, and
+  `Cairn.Snapshot.clip_seek/2` for the poster frame's own `ts`:
 
       clip_seconds = (drained_span_ms + event_started_ms − drain_wall_ms + ts) / 1000
 
@@ -78,8 +81,8 @@ defmodule Cairn.TrackPath do
 
   The whole map is `nil` when the writer had no anchor to offer, and each field
   is `nil`-able on its own; a consumer that finds one of the three missing falls
-  back to the `duration − event_seconds` pre-roll estimate the event timeline
-  already uses.
+  back to a pre-roll estimate of its own — `duration − event_seconds` for the
+  event timeline, the *configured* pre-window for `Cairn.Snapshot`.
 
   ## Coordinates
 

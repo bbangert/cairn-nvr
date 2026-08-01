@@ -202,6 +202,17 @@ defmodule CairnWeb.TracksLiveTest do
     assert html =~ "Showing 26–30 of 30"
   end
 
+  test "a page past the end shows an empty range, not an inverted one", %{conn: conn} do
+    seed_track(%{})
+    seed_track(%{})
+
+    {:ok, _view, html} = live(conn, "/tracks?page=9")
+
+    # 2 rows, page 9: the page is empty but total is not — the range must
+    # read as empty rather than "201–200 of 2"-style nonsense
+    assert html =~ "Showing 0–0 of 2"
+  end
+
   test "an absurd ?page= is clamped, not turned into the offset it asks for", %{conn: conn} do
     seed_track(%{})
 

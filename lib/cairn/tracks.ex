@@ -84,6 +84,12 @@ defmodule Cairn.Tracks do
   the result, and moments it buffered for a track it never finished are simply
   never passed here.
 
+  Every `DateTime` passed here is padded to microsecond precision on the way
+  in, whatever precision it declares — a caller holding wire time does not have
+  to pad it, and one that already did changes nothing. The reason is with the
+  row builders: these columns are `:utc_datetime_usec`, `insert_all` dumps
+  without casting, and that dump *raises* on any other precision.
+
   Tracks insert with `on_conflict: :nothing`: an id can be offered twice — a
   checkpoint restore finalizes tracks as `:host_restart` that a crash-time
   flush may already have written — and the row written
@@ -458,16 +464,16 @@ defmodule Cairn.Tracks do
     %{
       id: Map.fetch!(attrs, :id),
       camera_id: Map.fetch!(attrs, :camera_id),
-      started_at: Map.fetch!(attrs, :started_at),
+      started_at: attrs |> Map.fetch!(:started_at) |> usec(),
       event_id: attrs[:event_id],
       label: attrs[:label],
       best_score: attrs[:best_score],
       source: attrs[:source],
       plugin_track_id: attrs[:plugin_track_id],
       epoch: attrs[:epoch],
-      ended_at: attrs[:ended_at],
+      ended_at: usec(attrs[:ended_at]),
       end_reason: attrs[:end_reason],
-      stationary_since: attrs[:stationary_since],
+      stationary_since: usec(attrs[:stationary_since]),
       stationary_ms: Map.get(attrs, :stationary_ms, 0),
       entry_bbox: attrs[:entry_bbox],
       exit_bbox: attrs[:exit_bbox],
@@ -481,11 +487,31 @@ defmodule Cairn.Tracks do
   defp moment_row(attrs, track_id) do
     %{
       track_id: track_id,
-      at: Map.fetch!(attrs, :at),
+      at: attrs |> Map.fetch!(:at) |> usec(),
       kind: Map.fetch!(attrs, :kind),
       bbox: attrs[:bbox]
     }
   end
+
+  # Every `DateTime` written here lands in a `:utc_datetime_usec` column, and
+  # Ecto dumps that type only at precision 6: anything else raises
+  # `ArgumentError` from `Ecto.Type.check_usec!`, inside the transaction and
+  # inside the caller's process. `insert_all` never casts, so no changeset pads
+  # it on the way in — the invariant "a datetime reaching this table already
+  # declares microseconds" has to hold at the call site, and the caller is a
+  # lossy batch writer whose whole batch dies with it.
+  #
+  # Wire time is padded where it enters the system
+  # (`Cairn.PluginProtocol`, which parses the plugin's three decimals). This
+  # restates that at the table so a second time source — a checkpoint restored
+  # from an older host, a fixture, a plugin variant — cannot turn a batch into
+  # a crash. It pads the declared precision only; the microsecond count is
+  # untouched. Anything that is not a `DateTime` passes through to fail on dump
+  # as it would have.
+  defp usec(%DateTime{microsecond: {value, _digits}} = at),
+    do: %{at | microsecond: {value, 6}}
+
+  defp usec(other), do: other
 
   # -- filters ----------------------------------------------------------------
 
