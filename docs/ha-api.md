@@ -270,9 +270,16 @@ Same schema for all three kinds:
 - `track_started` — a new identity. Always sent.
 - `track_updated` — **throttled**: sent only when `best_score` improves or at
   most once a second per track. It is deliberately *not* a per-frame feed; do
-  not use it to drive animation. One frame is never throttled: the one where
-  `stationary` flips, in either direction. Cairn's own event logic keys off
-  that flag, so it is sent the moment it changes.
+  not use it to drive animation. Two frames are never throttled: the one where
+  `stationary` flips, in either direction — Cairn's own event logic keys off
+  that flag, so it is sent the moment it changes — and the one where a track
+  resumes after its camera's stream reconnected, which carries the new
+  `epoch`. A host-tracked object still sitting where it was is *not* given a
+  new identity by a reconnect: it keeps its `object_id` and its `started_at`,
+  and the only sign of the outage is `epoch` changing on that frame. A track
+  the reconnect really did lose ends `stream_reset` instead, up to a minute
+  after the cut, timestamped at the last observation before it — which on a
+  stream that had already gone quiet is earlier again.
 - `track_ended` — **self-contained**: everything above is filled in, so a
   client that missed every other frame still learns what the track was.
   `end_reason` is one of `unseen` (not seen for the configured
@@ -280,9 +287,10 @@ Same schema for all three kinds:
   `stationary`, which is what lets a parked object ride out an occlusion — or
   ten times whichever of those two bounds applies, of *host* time, the
   backstop for a plugin whose stream clock stops moving), `plugin_ended`
-  (the plugin said so), `stream_reset` (the camera's stream reconnected —
-  nothing may span the cut), `evicted` (the camera hit its
-  `tracking.max_live_tracks` cap and this was the least recently seen track),
+  (the plugin said so), `stream_reset` (the camera's stream reconnected and
+  nothing on the far side turned out to be this object), `evicted` (the camera
+  hit its `tracking.max_live_tracks` cap and this was the least recently seen
+  track),
   `detection_disabled` (detection was switched off for this camera) or
   `host_restart` (Cairn restarted; the track is over whatever the camera sees).
 

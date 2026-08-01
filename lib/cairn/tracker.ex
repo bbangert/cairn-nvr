@@ -86,8 +86,97 @@ defmodule Cairn.Tracker do
 
   Media time may jump backwards (a new ffmpeg run restarts the RTP timeline).
   Within an epoch that only makes the elapsed time negative, which never
-  expires anything; across epochs the aggregator ends every track and starts
-  a fresh tracker.
+  expires anything; across epochs `suspend/3` cuts the live set from the new
+  stream's matching, and the clocks of everything that survives the cut are
+  re-based on the new epoch (see below).
+
+  ## Surviving a stream reset: suspension and adoption
+
+  An ffmpeg respawn or reconnect mints a new epoch, and the object in frame is
+  usually the same object. `suspend/3` therefore does not end the live
+  host-mode tracks at the boundary: it moves them aside, keeping their
+  identity, `started_at`, `best_score`, stationary flag and anchor, and
+  excluding them from ordinary matching. Nothing downstream is told they
+  ended, because they may not have.
+
+  A detection in the new epoch may then **adopt** a suspended track — same
+  ULID, no `:started`, no `:ended`. Adoption is geometry across a blind gap,
+  so it is scaled by how long the gap was, measured in wall clock (the media
+  clocks either side of a cut are different streams and cannot be compared):
+
+    * **Absent no longer than `max_unseen_ms` and no longer than
+      `@mover_adoption_max_ms`**, whichever is shorter — the camera's own
+      definition of how long absence is ordinary, bounded by how far a mover
+      can travel and still overlap its own last box — any suspended track is
+      adoptable at `@adoption_match_iou`. A hiccup of a second or two barely
+      moves anything, so movers are included here.
+    * **Longer than that**, out to `@adoption_window_ms` from the cut, only a
+      track that was **stationary** when it was suspended is adoptable, and
+      only at `@stationary_match_iou`. Over a gap nothing observed, geometry
+      identifies only what provably does not move.
+
+  Those are two different clocks, deliberately. *How much overlap is demanded*
+  scales with the **track's own** absence — measured from its last sighting,
+  which may be well before the cut, because a track already halfway through
+  its unseen bound when the stream dropped has been gone that much longer.
+  *How long the offer stands* is `@adoption_window_ms` from **the cut**
+  (`within_window?/2`): it bounds the waiting, not the confidence. A stream
+  that had already been quiet for a minute before ffmpeg respawned therefore
+  still gets a full window to come back in — its tracks are simply past the
+  short tier for all of it, so only the stationary ones can be resumed.
+
+  Adoption is refused for a predicted box: an identity nothing confirmed for
+  the length of the outage may not be resumed by the plugin's extrapolation of
+  where it would have been.
+
+  What resumes with the identity is deliberately split. Media-clock fields
+  (`last_seen_ms`, `last_detected_ms`, `anchor_ms`) are re-based on the new
+  epoch, because mixing two streams' clocks in one subtraction is garbage.
+  Wall-clock fields (`started_at`, `stationary_since`) are kept, and so is the
+  `stationary` flag itself: a car that matches its own parking space was
+  parked for the whole gap, so it resumes **already** stationary and its
+  settle window does not re-arm — which is the point of all of this, since
+  `Cairn.DetectionAggregator` refuses a stationary track as evidence and a
+  re-minted one would spend `stationary_after_ms` looking like a new arrival,
+  i.e. like a clip. Resuming the flag is not the same as freezing it: what
+  happens to it on the adopting batch is below.
+
+  The anchor keeps its box and takes the new clock, which splits the two
+  questions stillness asks. *Has it moved* is still measured against where the
+  object was before the cut, and it is asked on the adopting batch itself: the
+  median window (`@recent_boxes`) is emptied at the adoption, so the first
+  smoothed box of the new epoch is the adopting box and nothing else. *How
+  long has it held still* restarts at the adoption, which is all the tracker
+  can honestly say about a gap it did not watch.
+
+  So `stationary` crosses the cut but is **not** guaranteed to survive the
+  batch that adopts: it is re-derived from the adopting box by the ordinary
+  rule, exactly as it would be for a track that never left. A car back in its
+  own space stays stationary; one whose box has drifted off the anchor by more
+  than `@stationary_iou` reads as moving, and reads so immediately rather than
+  once a median has caught up. Note that the long tier's
+  `@stationary_match_iou` is *below* `@stationary_iou`, so a box adopted
+  between the two resumes the identity and is called movement in the same
+  batch — the same answer the ordinary rule gives for a box that far off its
+  anchor. What the adoption does buy unconditionally is that the settle window
+  does not re-arm: a resumed track that is still where it was is stationary
+  from its first detection instead of spending `stationary_after_ms` looking
+  like a new arrival.
+
+  `epoch` follows the track: it names the epoch the track was last observed
+  under, not the one it was minted in, so an adopted track's summaries carry
+  the current stream. A track's samples may therefore span the cut.
+
+  A suspended track that nothing adopts is ended `:stream_reset`.
+  `expire_suspended/2` is what waits out the window; two paths do not wait —
+  `end_all/3` gives up on every suspension at once (detection off, camera
+  stopped), and `suspend/3` drops the oldest generation when a reconnect loop
+  pushes the set past its cap. Whichever gets there, the summary carries the
+  timestamps the track already had, so it reports the instant it was last
+  actually seen; the waiting is bookkeeping, not observation. Plugin-owned tracks do not suspend at all:
+  their identity is the plugin's, keyed on `(plugin_instance, epoch,
+  track_id)`, so the plugin has already severed them at the cut and a host-side
+  IoU revival would be contradicted by the plugin's own next line.
 
   ## Host policy: the live set is bounded, on both counts
 
@@ -99,7 +188,13 @@ defmodule Cairn.Tracker do
     * **A cap on live tracks** (`max_live_tracks`, per camera). At the cap,
       minting a new identity retires the least recently seen live track with a
       final summary (`:evicted`). Tracks that this batch already assigned are
-      never the victim.
+      never the victim. Suspended tracks are neither counted nor evictable:
+      they are not in the live set, nothing can advance them, and counting them
+      would stop the new epoch's scene from minting while last epoch's ghosts
+      wait out their window. They are bounded by the same number instead —
+      `suspend/3` trims the suspended set to `max_live_tracks`, oldest
+      suspension first — so a camera's worst case is twice the cap for at most
+      `@adoption_window_ms`.
     * **A host-clock backstop.** A track whose age on the *host's* monotonic
       clock (`now_ms`, supplied by the caller) exceeds ten times its effective
       unseen bound — `max_unseen_ms`, or the grace-extended bound above for a
@@ -193,6 +288,66 @@ defmodule Cairn.Tracker do
   # box a few pixels of drift wide of the track's is already well under 0.7 —
   # falls back through and duplicates again.
   @duplicate_suppression_iou 0.4
+  # How long after a stream reset a suspended track may still be adopted, in
+  # wall-clock milliseconds — the only clock the two sides of a cut share.
+  #
+  # The two mistakes are not symmetric, which is what picks the number. Too
+  # short and a parked car re-minted after an ffmpeg reconnect spends its whole
+  # `stationary_after_ms` reading as a new arrival, which is evidence, which is
+  # a clip — the failure this mechanism exists to remove, and one that repeats
+  # on every reset a flaky camera has. Too long and a box landing on a departed
+  # object's spot inherits its identity; at the 0.7 overlap the long tier
+  # demands that means the same parking space, and over a minute "what was
+  # there is still there" holds far more often than not. A minute is also what
+  # bounds the waiting: nothing suspended outlives a minute past the cut.
+  #
+  # Past the cut, and not past the last sighting — so this is a bound on the
+  # *waiting*, not on how long the object has actually been unobserved. A
+  # stream that went quiet ten minutes before ffmpeg gave up on it hands its
+  # ghosts to a new epoch ten minutes stale, and they are adoptable for a
+  # minute more. That is deliberate: nothing about that camera was observed
+  # for either stretch, so the two are the same blindness, and the tier the
+  # stale ones land in is the stationary one, which is the tier that holds up
+  # over long silences. What it does mean is that "unobserved for at most a
+  # minute" is not something an adopted track's timestamps guarantee — read
+  # `last_seen_at` for that.
+  @adoption_window_ms 60_000
+  # What a detection must overlap a suspended track's last box to resume that
+  # identity across a *short* outage. Deliberately more than `@iou_threshold`,
+  # for the same reason `@stationary_match_iou` is more: nothing observed the
+  # gap, so the geometry is the only evidence there is, and the ordinary
+  # threshold is calibrated for a track something is currently confirming.
+  #
+  # The number comes from the same case as `@duplicate_suppression_iou`: equal
+  # boxes offset by half their extent — two cars nose to tail, two people
+  # shoulder to shoulder — sit at 1/3, so a neighbour cannot take the
+  # identity, while a walker over a 300 ms hiccup is still up around 0.5. It is
+  # a separate constant from that one because it answers a different question:
+  # that threshold decides whether to *drop* a box, this one whether to
+  # *resume* an identity, and a tuning pass on either has no business moving
+  # the other.
+  @adoption_match_iou 0.4
+  # The longest absence the mover tier above covers, whatever `max_unseen_ms`
+  # says. `max_unseen_ms` bounds that tier too, and does so first — a camera
+  # calling a shorter absence extraordinary has already answered the question —
+  # but it is operator config, and it answers a different one: how patient to be
+  # with a slow plugin or a flaky link. This bound is about how far a thing can
+  # move, which is not the operator's to set.
+  #
+  # What the tier rests on is that the object cannot have left its own last
+  # box: `@adoption_match_iou` still has to be cleared, and equal boxes stop
+  # overlapping that much once they are offset by three sevenths of their
+  # extent. Anything crossing a frame is past that in well under a second, so
+  # for a walker or a car the geometry closes the tier long before any clock
+  # does. Three seconds is the outer edge of the case the clock is for — an
+  # object slow enough to still be inside its old box, a queue shuffling
+  # forward or a car in stop-and-go — and past it an overlapping box is as
+  # easily a *different* object standing where the first one was, which is the
+  # point at which only the stationary tier is honest. Left riding
+  # `max_unseen_ms`, an operator raising that to 15 s to ride out slow
+  # inference would also be handing a walker's ULID to whoever next steps into
+  # the doorway, and nothing in the config would say so.
+  @mover_adoption_max_ms 3_000
   # The unseen bound for a stationary track, as a multiplier of
   # `max_unseen_ms` (the `@host_clock_factor` precedent: policy the operator
   # sets the base for, scaled here by a fixed factor). A parked object is
@@ -221,10 +376,39 @@ defmodule Cairn.Tracker do
   # per-line primitive: unrate-limited they are a log-flood of their own.
   @warn_interval_ms 5_000
 
-  defstruct objects: %{}, index: %{}, ended: %{}, ended_seq: 0, warned_at: %{}
+  # `suspended` is `%{object_id => %{tracked: object, suspended_at: DateTime}}`
+  # — the live objects a stream reset moved aside, each with the wall instant
+  # of the cut that moved it, which is what `within_window?/2` measures the
+  # adoption window from. `last_observed_at` is a different instant: the wall
+  # time of the most recent observation of any kind, i.e. the last sign of life
+  # before the cut. It is what the outage gap is reported against, and the two
+  # differ by however long the stream had already been quiet.
+  defstruct objects: %{},
+            suspended: %{},
+            index: %{},
+            ended: %{},
+            ended_seq: 0,
+            warned_at: %{},
+            last_observed_at: nil
 
   @type bbox :: [number()]
   @type t :: %__MODULE__{}
+
+  @typedoc """
+  What one `suspend/3` did, for the caller's link-health report: how many
+  tracks are waiting for adoption, how many were ended instead — which is
+  exactly the length of the event list returned beside it: plugin-owned tracks,
+  any older suspension the cap pushed out, and any whose window had already run
+  out — and `at`, the last observation before the cut, which is the instant an
+  outage gap is measured from. `at` is `nil` when this camera has never been
+  observed (in which case nothing was suspended). It is not the cut: see
+  `suspend/3`.
+  """
+  @type suspension :: %{
+          suspended: non_neg_integer(),
+          ended: non_neg_integer(),
+          at: DateTime.t() | nil
+        }
 
   @typedoc "Everything about the observation the tracker needs, and nothing else."
   @type context :: %{
@@ -250,7 +434,7 @@ defmodule Cairn.Tracker do
 
   @type event ::
           {:started | :updated | :ended, Track.t()}
-          | {:became_stationary | :started_moving, Track.t()}
+          | {:became_stationary | :started_moving | :adopted, Track.t()}
 
   @spec new() :: t()
   def new, do: %__MODULE__{}
@@ -298,22 +482,40 @@ defmodule Cairn.Tracker do
 
   Staleness is refreshed *before* expiry so that an expiring track's final
   summary reports this batch's `stale_predicted`, not the previous batch's.
+
+  Suspensions are settled *before* anything else: one whose window ran out is
+  ended here rather than left to be adopted by this batch's detections.
   """
   @spec track(t(), [map()], context()) :: {t(), [map()], [event()]}
   def track(%__MODULE__{} = tracker, objects, context) do
+    {tracker, lapsed} = expire_suspended(tracker, context.observed_at)
     {tracker, ended} = end_plugin_tracks(tracker, context)
-    {tracker, assignments} = assign(tracker, objects, context)
-    {tracker, tagged, lifecycle} = apply_assignments(tracker, objects, assignments, context)
+    {tracker, assignments, adopted} = assign(tracker, objects, context)
+
+    {tracker, tagged, lifecycle} =
+      apply_assignments(tracker, objects, assignments, adopted, context)
+
     {tracker, expired} = tracker |> refresh_stale(context) |> expire(context)
 
-    {tracker, tagged, ended ++ lifecycle ++ expired}
+    {observed(tracker, context), tagged, lapsed ++ ended ++ lifecycle ++ expired}
   end
 
-  @doc """
-  Ends every live track with `reason` and returns an emptied tracker.
+  # The wall instant a later `suspend/3` reports its outage gap from. Moved on
+  # every batch, predicted and empty ones included: what it dates is the last
+  # sign of life from the stream, not the last detection in it. It is not what
+  # bounds the adoption window — that runs from the cut, which `suspend/3` is
+  # handed.
+  defp observed(tracker, %{observed_at: nil}), do: tracker
+  defp observed(tracker, context), do: %{tracker | last_observed_at: context.observed_at}
 
-  Used at a stream-epoch boundary: no track may span the cut, and every track
-  owes its consumers a final summary.
+  @doc """
+  Ends every live track with `reason`, and every suspended one, returning an
+  emptied tracker.
+
+  Used where nothing may be waited for any longer: detection turned off, a
+  camera stopped, a shutdown. A suspended track ends `:stream_reset` whatever
+  `reason` is — the reset is what it was last seen by, and a path that gives up
+  on the wait early does not change what happened to it.
 
   `keep_ended: true` carries the plugin ids already declared ended over to the
   new tracker, so their reuse is still reported as the contract violation it
@@ -327,21 +529,156 @@ defmodule Cairn.Tracker do
   def end_all(%__MODULE__{} = tracker, reason, opts \\ []) do
     emptied =
       if Keyword.get(opts, :keep_ended, false),
-        do: %__MODULE__{ended: tracker.ended, ended_seq: tracker.ended_seq},
-        else: new()
+        do: %__MODULE__{
+          ended: tracker.ended,
+          ended_seq: tracker.ended_seq,
+          last_observed_at: tracker.last_observed_at
+        },
+        else: %__MODULE__{last_observed_at: tracker.last_observed_at}
 
-    {emptied, for({_id, object} <- tracker.objects, do: {:ended, to_track(object, reason)})}
+    live = for {_id, object} <- tracker.objects, do: {:ended, to_track(object, reason)}
+    {emptied, live ++ suspension_ends(tracker.suspended)}
   end
+
+  @doc """
+  Moves the live host tracks aside at a stream-epoch boundary.
+
+  The new epoch decodes a stream whose media clock and identities have nothing
+  to do with the old one's, so the tracker is emptied of live tracks and of the
+  plugin identity map — but the host tracks are *kept*, suspended, so a
+  detection in the new epoch can adopt one instead of minting a duplicate of
+  the object that was already there. See the moduledoc for what adoption
+  demands and what it resumes.
+
+  `cut_at` is the wall instant of the boundary itself, and it is what the
+  adoption window is measured from — not `last_observed_at`, which is the last
+  sign of life *before* the cut and can be a long way behind it on a stream
+  that went quiet before ffmpeg noticed. The two are separate on purpose: the
+  window bounds how long the caller waits for a stream to come back, and the
+  waiting starts when the stream is cut. `suspension.at` still reports
+  `last_observed_at`, because that is what an outage gap is measured to.
+
+  Three kinds of track do not survive this: plugin-owned ones (the plugin's own
+  identity key already ended them at the cut), everything at all if this camera
+  has never been observed, and the oldest suspensions beyond `max_suspended` —
+  a camera reconnecting in a loop must not accumulate a generation of ghosts
+  per attempt. All of them are returned as `:stream_reset` finals, and so is
+  any suspension whose window has run out by `cut_at`.
+
+  Returns `{tracker, events, suspension}`; the counts in `suspension` are the
+  caller's link-health report.
+  """
+  @spec suspend(t(), pos_integer(), DateTime.t()) :: {t(), [event()], suspension()}
+  # A camera no observation has ever reached. In production that is a tracker
+  # with nothing in it — `Cairn.DetectionAggregator` stamps every observation
+  # with a wall clock before the tracker sees one — so this ends nothing. Where
+  # it is not, the tracks it holds could not be adopted anyway: `adopt/4`
+  # refuses a batch that carries no wall clock, so suspending them would only
+  # postpone the same finals by a minute.
+  def suspend(%__MODULE__{last_observed_at: nil} = tracker, _max_suspended, _cut_at) do
+    {tracker, events} = end_all(tracker, :stream_reset)
+    {tracker, events, %{suspended: 0, ended: length(events), at: nil}}
+  end
+
+  def suspend(%__MODULE__{} = tracker, max_suspended, cut_at) do
+    at = tracker.last_observed_at
+    {tracker, lapsed} = expire_suspended(tracker, cut_at)
+
+    {host, plugin} = Enum.split_with(tracker.objects, fn {_id, o} -> o.source == :host end)
+
+    entering = Map.new(host, fn {id, o} -> {id, %{tracked: o, suspended_at: cut_at}} end)
+
+    {suspended, evicted} =
+      trim_suspended(Map.merge(tracker.suspended, entering), max_suspended, cut_at)
+
+    severed =
+      for({_id, object} <- plugin, do: {:ended, to_track(object, :stream_reset)}) ++
+        suspension_ends(evicted)
+
+    tracker = %__MODULE__{
+      # `warned_at` rides across the cut: it rate-limits log lines against the
+      # host's own monotonic clock, and a camera flapping between epochs is
+      # exactly when that matters.
+      warned_at: tracker.warned_at,
+      last_observed_at: at,
+      suspended: suspended
+    }
+
+    events = lapsed ++ severed
+    {tracker, events, %{suspended: map_size(suspended), ended: length(events), at: at}}
+  end
+
+  @doc """
+  Ends every suspended track whose adoption window has run out at `at`.
+
+  Driven twice over: by `track/3` on every batch, and by the caller's own timer
+  for a camera whose stream never comes back — nothing would otherwise collect
+  a suspension on a dead link, and the final summary its consumers are owed
+  would never go out.
+
+  A `nil` `at` expires nothing: without a wall clock there is no gap to measure
+  and the caller's timer is the backstop that does have one.
+  """
+  @spec expire_suspended(t(), DateTime.t() | nil) :: {t(), [event()]}
+  def expire_suspended(%__MODULE__{suspended: suspended} = tracker, at)
+      when map_size(suspended) > 0 do
+    {kept, lapsed} = Enum.split_with(suspended, fn {_id, entry} -> within_window?(entry, at) end)
+    {%{tracker | suspended: Map.new(kept)}, suspension_ends(lapsed)}
+  end
+
+  def expire_suspended(%__MODULE__{} = tracker, _at), do: {tracker, []}
+
+  @doc "How long a suspended track stays adoptable, in wall-clock milliseconds."
+  @spec adoption_window_ms() :: pos_integer()
+  def adoption_window_ms, do: @adoption_window_ms
 
   @doc "Summaries of the currently live tracks (ULID order, so mint order)."
   @spec live_tracks(t()) :: [Track.t()]
   def live_tracks(%__MODULE__{} = tracker) do
     # Sorted explicitly: map iteration order is only incidentally sorted while
-    # `objects` is a small (flat) map, and checkpointed track lists must not
-    # reshuffle once a busy scene pushes it past that boundary.
+    # `objects` is a small (flat) map, and the checkpointed track lists this
+    # feeds (`checkpoint_tracks/1`) must not reshuffle once a busy scene pushes
+    # it past that boundary.
     tracker.objects
     |> Enum.sort_by(fn {id, _object} -> id end)
     |> Enum.map(fn {_id, object} -> to_track(object) end)
+  end
+
+  @doc """
+  Summaries of the tracks suspended at a stream reset, waiting for adoption
+  (ULID order).
+
+  Their fields are the ones they were suspended with, the old epoch included:
+  a suspended track has been observed by nothing since the cut.
+  """
+  @spec suspended_tracks(t()) :: [Track.t()]
+  def suspended_tracks(%__MODULE__{} = tracker) do
+    tracker.suspended
+    |> Enum.sort_by(fn {id, _entry} -> id end)
+    |> Enum.map(fn {_id, entry} -> to_track(entry.tracked) end)
+  end
+
+  @doc """
+  How many tracks are still waiting for adoption.
+
+  For a caller deciding whether it still owes anything — `suspended_tracks/1`
+  builds a `Cairn.Track` per entry, which is a summary nobody asking this
+  question wants.
+  """
+  @spec suspended_count(t()) :: non_neg_integer()
+  def suspended_count(%__MODULE__{suspended: suspended}), do: map_size(suspended)
+
+  @doc """
+  Every track this tracker still owes a final summary for: the live ones and
+  the suspended ones together, in ULID order.
+
+  What a checkpoint has to hold. A restore ends all of them (`:host_restart`):
+  the tracker that could have adopted a suspension died with the process, and
+  the fresh one has nothing to adopt it into.
+  """
+  @spec checkpoint_tracks(t()) :: [Track.t()]
+  def checkpoint_tracks(%__MODULE__{} = tracker) do
+    Enum.sort_by(live_tracks(tracker) ++ suspended_tracks(tracker), & &1.object_id)
   end
 
   @doc "Intersection-over-union of two `[x, y, w, h]` boxes."
@@ -382,10 +719,57 @@ defmodule Cairn.Tracker do
   defp ended_event(nil, _reason), do: []
   defp ended_event(object, reason), do: [{:ended, to_track(object, reason)}]
 
+  # -- suspension -------------------------------------------------------------
+
+  # A suspended track ends as what it was last seen by. Sorted by id so a
+  # caller's event order does not ride on map iteration order.
+  defp suspension_ends(entries) do
+    entries
+    |> Enum.sort_by(fn {id, _entry} -> id end)
+    |> Enum.map(fn {_id, entry} -> {:ended, to_track(entry.tracked, :stream_reset)} end)
+  end
+
+  # Oldest suspension first, ties by id: the ghosts of the reset before last
+  # are the ones a reconnect loop should lose, and they are also the ones
+  # closest to their window running out anyway.
+  #
+  # Keyed on elapsed milliseconds and never on the `%DateTime{}` itself.
+  # Erlang term order over a struct is its fields in *key* order — `day`
+  # before `hour` before `month` before `year` — so sorting datetimes directly
+  # is chronological only by luck, and the luck runs out at the end of every
+  # month.
+  defp trim_suspended(suspended, max_suspended, at) do
+    if map_size(suspended) <= max_suspended do
+      {suspended, []}
+    else
+      {kept, evicted} =
+        suspended
+        |> Enum.sort_by(fn {id, entry} -> {elapsed_ms(at, entry.suspended_at), id} end)
+        |> Enum.split(max_suspended)
+
+      {Map.new(kept), evicted}
+    end
+  end
+
+  # The waiting, bounded from the cut that started it: `suspended_at` is the
+  # boundary instant, not the track's last sighting. `adoption_threshold/2` is
+  # the rule that scales with the track's own absence.
+  defp within_window?(entry, at), do: elapsed_ms(at, entry.suspended_at) <= @adoption_window_ms
+
+  # Wall-clock milliseconds between two observation instants, floored at zero:
+  # `observed_at` comes off the wire for a v1 plugin, so two of them can arrive
+  # out of order or across a host clock adjustment, and a negative gap must read
+  # as "no time has passed" rather than as time running backwards.
+  defp elapsed_ms(nil, _then), do: 0
+  defp elapsed_ms(_now, nil), do: 0
+  defp elapsed_ms(now, then), do: max(DateTime.diff(now, then, :millisecond), 0)
+
   # -- assignment -------------------------------------------------------------
 
   # `%{object index => object_id | :drop}`; an index with no entry is a new
-  # track, `:drop` an object the tracker refuses.
+  # track, `:drop` an object the tracker refuses. The third element is the ids
+  # this batch adopted out of suspension, which the assignment map alone does
+  # not distinguish from an ordinary match.
   defp assign(tracker, objects, context) do
     {plugin, host} =
       objects
@@ -393,8 +777,8 @@ defmodule Cairn.Tracker do
       |> Enum.split_with(fn {object, _index} -> plugin_tracked?(object, context) end)
 
     {tracker, plugin_assignments} = assign_plugin(tracker, plugin, context)
-    {tracker, host_assignments} = assign_host(tracker, host, context)
-    {tracker, Map.merge(plugin_assignments, host_assignments)}
+    {tracker, host_assignments, adopted} = assign_host(tracker, host, context)
+    {tracker, Map.merge(plugin_assignments, host_assignments), adopted}
   end
 
   # One `track_id` names one object. Two objects in the same batch claiming the
@@ -461,10 +845,18 @@ defmodule Cairn.Tracker do
   # threshold is per candidate track (`match_threshold/2`), so it decides which
   # pairs exist and never how the ones that exist are ordered.
   #
-  # What is left over then goes through `suppress_duplicates/5`, so the result
-  # can also carry `:drop`s and a tracker whose refused tracks have been marked
-  # seen — which is why this returns a tracker where the greedy half alone
-  # would not have to.
+  # What is left over then goes through `adopt/4` and `suppress_duplicates/5`,
+  # so the result can also carry `:drop`s, revived suspensions and a tracker
+  # whose refused tracks have been marked seen — which is why this returns a
+  # tracker where the greedy half alone would not have to.
+  #
+  # The three run in that order for two separate reasons. Adoption comes after
+  # the live pass because a track this scene is *currently* seeing outranks a
+  # ghost of it: the incumbent-wins convention, applied across the cut. It
+  # comes before suppression because a suspended track is unmatched by
+  # definition and a box that would have been dropped as somebody's duplicate
+  # may be the very detection that resumes an identity — the drop must be the
+  # last answer, not the first.
   defp assign_host(tracker, indexed, context) do
     candidates = for {id, object} <- tracker.objects, object.source == :host, do: {id, object}
 
@@ -494,15 +886,155 @@ defmodule Cairn.Tracker do
         end
       end)
 
-    suppress_duplicates(tracker, indexed, candidates, matched, context)
+    {tracker, matched, adopted} = adopt(tracker, indexed, matched, context)
+    {tracker, assignments} = suppress_duplicates(tracker, indexed, candidates, matched, context)
+    {tracker, assignments, adopted}
   end
 
-  # Every object the greedy pass left unmatched, against every track it left
-  # unmatched: an overlap of `@duplicate_suppression_iou` or more here is a
-  # detection that some track's `match_threshold/2` refused, and minting for it
-  # is how one object ends up with several live tracks. It is dropped instead,
-  # and the one track it overlaps most is marked seen — see `seen/3` for how
-  # little that means.
+  # Every object the live pass left unmatched, against the tracks a stream
+  # reset suspended: the best overlap that clears `adoption_threshold/2` takes
+  # the identity back, each object and each suspension used once, and the
+  # revived track joins the live set as if it had matched there.
+  #
+  # Only detections. A predicted box is the plugin extrapolating where the
+  # object would be if it were still there, and across a gap nothing observed
+  # that is precisely the question — resuming an identity on it would let a
+  # plugin talk a departed object back into existence for as long as it keeps
+  # guessing.
+  defp adopt(tracker, _indexed, matched, %{observed_at: nil}), do: {tracker, matched, []}
+
+  defp adopt(%{suspended: suspended} = tracker, indexed, matched, context)
+       when map_size(suspended) > 0 do
+    {_assignments, objects, _tracks} = matched
+
+    # `not MapSet.member?(objects, index)` here is a pre-filter and not the
+    # invariant: the reduce below rejects the same pairs, and dropping this
+    # line changes nothing but the length of the list that gets sorted. What
+    # the reduce's copy of the check does that this one cannot is reject an
+    # object *this pass* has already spent — one box overlapping two ghosts
+    # would otherwise resume both identities and hand the second one no
+    # detection at all.
+    pairs =
+      for {object, index} <- indexed,
+          not MapSet.member?(objects, index),
+          Observation.detected?(object),
+          {id, entry} <- suspended,
+          entry.tracked.label == object.label,
+          threshold = adoption_threshold(entry, context),
+          is_number(threshold),
+          overlap = iou(entry.tracked.bbox, object.bbox),
+          overlap >= threshold do
+        {overlap, index, id}
+      end
+
+    # Same total sort key as the live pass, for the same reason: `suspended` is
+    # a map, and two equal overlaps must not be resolved by its iteration order.
+    pairs
+    |> Enum.sort_by(fn {overlap, index, id} -> {-overlap, index, id} end)
+    |> Enum.reduce({tracker, matched, []}, fn {_overlap, index, id},
+                                              {tracker, {assignments, objects, tracks}, adopted} =
+                                                acc ->
+      if MapSet.member?(objects, index) or MapSet.member?(tracks, id) do
+        acc
+      else
+        {tracker |> revive(id, context),
+         {Map.put(assignments, index, id), MapSet.put(objects, index), MapSet.put(tracks, id)},
+         [id | adopted]}
+      end
+    end)
+  end
+
+  defp adopt(tracker, _indexed, matched, _context), do: {tracker, matched, []}
+
+  # How much overlap this suspended track demands right now, or `:none` if it
+  # is past adopting. Measured against the track's own last sighting rather
+  # than against the instant of the cut: `max_unseen_ms` is the camera's
+  # statement about how long *absence* is ordinary, and a track already halfway
+  # through its unseen bound when the stream dropped has been absent that much
+  # longer. The window in `within_window?/2` is the one measured from the cut —
+  # it bounds the waiting, not the confidence.
+  #
+  # A track with no last sighting at all — every observation of it carried no
+  # wall clock — falls back to the cut, which is then the only instant there is.
+  defp adoption_threshold(entry, context) do
+    absent = elapsed_ms(context.observed_at, entry.tracked.last_seen_at || entry.suspended_at)
+
+    cond do
+      absent <= min(context.max_unseen_ms, @mover_adoption_max_ms) -> @adoption_match_iou
+      entry.tracked.stationary -> @stationary_match_iou
+      true -> :none
+    end
+  end
+
+  # Back into the live set, on the new epoch's clocks. Every media-time field
+  # is re-based here, because the only thing the old epoch's numbers can do in
+  # a subtraction against the new epoch's `media_ms` is lie — in either
+  # direction, depending on which stream had been running longer. The nil-ness
+  # of each is preserved: a track that has never been detected still has no
+  # anchor and no `last_detected_ms`, and inventing one here would manufacture
+  # the detection the object never had.
+  #
+  # Two of the four are also overwritten by the update this batch applies
+  # immediately afterwards (`last_seen_ms` and `last_seen_host_ms`, which every
+  # observation moves). They are re-based here anyway: the invariant is that a
+  # track in the live set never carries another stream's clock, and it belongs
+  # to this function rather than to what its one caller happens to do next.
+  # `last_detected_ms` is not one of them — `update_track/3` reads it before it
+  # moves it, and that read is the stationary accrual.
+  #
+  # What is deliberately *not* touched is every wall-clock field and every
+  # judgement: `started_at`, `stationary`, `stationary_since`, `stationary_ms`,
+  # `best_score` and the anchor box all carry over, which is what lets an
+  # adopted parked car resume already parked rather than as a new arrival. The
+  # anchor keeps its box but takes the new clock, so movement is still measured
+  # against where the object last was while the *duration* of stillness
+  # restarts here.
+  #
+  # `recent_boxes` is the one piece of geometry that does not carry over, and
+  # emptying it is what makes the sentence above mean something. It is the
+  # window the stillness rule takes a median over, and every box in it belongs
+  # to the stream that just died: left in place it outvotes the adopting box
+  # for as many batches as it has entries, so a track that really did move
+  # during the gap goes on reading `stationary` — refused as evidence — until
+  # the median catches up, and the number of batches that takes is whatever the
+  # window happened to hold at the cut. Emptied, it is refilled by the update
+  # this batch applies immediately afterwards and ends the batch holding
+  # exactly the one detection the new epoch has produced, which is the shape
+  # `new_track/3` leaves for a track's first detection. `stationary` is then
+  # re-derived from the adopting box against the anchor, and from nothing else.
+  #
+  # That the window is never *observed* empty is `adopt/4`'s doing: it revives
+  # a track only for a detected object it has just assigned to it, so
+  # `update_track/3` refills it in the same `track/3` call. (`median_box/1`
+  # could not be handed the empty list in any case — `stillness/5` prepends the
+  # current box before it takes the median.)
+  defp revive(tracker, id, context) do
+    {entry, suspended} = Map.pop(tracker.suspended, id)
+
+    tracked = %{
+      entry.tracked
+      | epoch: context.epoch,
+        last_seen_ms: context.media_ms,
+        last_seen_host_ms: context.now_ms,
+        last_detected_ms: if(entry.tracked.last_detected_ms, do: context.media_ms),
+        anchor_ms: if(entry.tracked.anchor_bbox, do: context.media_ms),
+        recent_boxes: []
+    }
+
+    %{tracker | suspended: suspended, objects: Map.put(tracker.objects, id, tracked)}
+  end
+
+  # Every object still unmatched after the greedy pass and `adopt/4`, against
+  # every live track the greedy pass left unmatched: an overlap of
+  # `@duplicate_suppression_iou` or more here is a detection that some track's
+  # `match_threshold/2` refused, and minting for it is how one object ends up
+  # with several live tracks. It is dropped instead, and the one track it
+  # overlaps most is marked seen — see `seen/3` for how little that means.
+  #
+  # Suspended tracks are not among the candidates and must not be: a suspension
+  # is unmatched by definition, so counting one here would drop every first
+  # detection near a ghost — including the ones `adopt/4` has just refused,
+  # leaving whatever is really there untracked for a whole minute.
   #
   # Tracks this batch *did* match are excluded, which is what keeps a genuinely
   # new object over a tracked one mintable: the tracked object's own detection
@@ -577,7 +1109,8 @@ defmodule Cairn.Tracker do
 
   defp match_threshold(_tracked, _context), do: @iou_threshold
 
-  defp apply_assignments(tracker, objects, assignments, context) do
+  defp apply_assignments(tracker, objects, assignments, adopted, context) do
+    adopted = MapSet.new(adopted)
     # Tracks this batch assigned a detection to: retiring one to make room for
     # a new identity would churn the very tracks the cap exists to protect. A
     # track merely marked seen by a suppression is not in here — it is not in
@@ -590,22 +1123,23 @@ defmodule Cairn.Tracker do
       objects
       |> Enum.with_index()
       |> Enum.reduce({tracker, [], []}, fn {object, index}, acc ->
-        apply_object(acc, object, Map.get(assignments, index, :new), protected, context)
+        apply_object(acc, object, Map.get(assignments, index, :new), adopted, protected, context)
       end)
 
     {tracker, Enum.reverse(tagged), Enum.reverse(events)}
   end
 
-  defp apply_object(acc, _object, :drop, _protected, _context), do: acc
+  defp apply_object(acc, _object, :drop, _adopted, _protected, _context), do: acc
 
-  defp apply_object({tracker, tagged, events}, object, assigned, protected, context) do
+  defp apply_object({tracker, tagged, events}, object, assigned, adopted, protected, context) do
     case fetch_assigned(tracker, assigned) do
       {:ok, object_id, existing} ->
         tracked = update_track(existing, object, context)
         summary = to_track(tracked)
 
         {store(tracker, object_id, tracked), [tag(object, object_id, tracked) | tagged],
-         transition(existing, tracked, summary) ++ [{:updated, summary} | events]}
+         transition(existing, tracked, summary) ++
+           resumed(adopted, object_id, summary) ++ [{:updated, summary} | events]}
 
       :error ->
         case make_room(tracker, protected, context) do
@@ -636,6 +1170,16 @@ defmodule Cairn.Tracker do
 
   defp store(tracker, object_id, tracked),
     do: %{tracker | objects: Map.put(tracker.objects, object_id, tracked)}
+
+  # `{:adopted, summary}` sits between the track's own `:updated` and any
+  # stationary transition, for the reason the transition sits after `:updated`
+  # at all: a consumer folding the events in order has the resumed summary —
+  # new epoch, old identity — before it is told either thing about it. It is
+  # only ever emitted for a track that was suspended, so no consumer sees it on
+  # a track it has not already been told about.
+  defp resumed(adopted, object_id, summary) do
+    if MapSet.member?(adopted, object_id), do: [{:adopted, summary}], else: []
+  end
 
   # The transition follows its own `:updated` in the event list: that summary
   # carries the stationary fields the flip is about, so a consumer that folds

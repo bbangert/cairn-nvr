@@ -49,6 +49,7 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
     policy = Keyword.get(opts, :policy, @policy)
 
     observation = %Observation{
+      epoch: Keyword.get(opts, :epoch),
       pts: 90_000,
       media_ms: Keyword.get(opts, :media_ms, 1_000.0),
       observed_at: Keyword.get(opts, :observed_at, DateTime.utc_now()),
@@ -530,12 +531,32 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
     @parked_box [0.1, 0.1, 0.2, 0.4]
 
     test "`:appeared` and the stationary flip carry observation times", ctx do
-      first = DateTime.utc_now()
+      # The stream reset below has to be a cut whose adoption window has
+      # already run out by the time the sweep runs, or the track is not yet
+      # owed the close this test reads the row back through. The window runs
+      # from the cut, so it is the cut that is put in the past; the
+      # observations sit ten seconds behind it, where the stream went quiet.
+      agg =
+        start_supervised!(
+          {DetectionAggregator,
+           name: nil,
+           recorder: ctx.rec,
+           cut_clock: fn -> DateTime.add(DateTime.utc_now(), -90, :second) end,
+           start_extractor: fn _camera, _event ->
+             {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+           end,
+           finalize_extractor: fn _pid, _event -> :ok end},
+          id: :agg_moments
+        )
+
+      on_exit(fn -> EventCheckpoint.delete(ctx.camera_id) end)
+
+      first = DateTime.add(DateTime.utc_now(), -100, :second)
       second = DateTime.add(first, 1)
       third = DateTime.add(first, 2)
 
       for {at, media_ms} <- [{first, 1_000.0}, {second, 2_000.0}, {third, 3_000.0}] do
-        observe(ctx.agg, ctx.camera, [object("person", 0.9, @parked_box)],
+        observe(agg, ctx.camera, [object("person", 0.9, @parked_box)],
           observed_at: at,
           media_ms: media_ms,
           policy: @stationary_policy
@@ -545,12 +566,13 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
       assert_receive {:track_started, %Track{object_id: oid}}
       assert_receive {:track_updated, %Track{object_id: ^oid, stationary: true}}
 
-      # a fresh epoch ends the live track; the event is still open, so the row
-      # carries its id
-      send(ctx.agg, {:stream_epoch, ctx.camera_id, Cairn.ULID.generate(), :source_lost})
+      # a fresh epoch suspends the live track, and the window sweep is what
+      # ends it; the event is still open, so the row carries its id
+      send(agg, {:stream_epoch, ctx.camera_id, Cairn.ULID.generate(), :source_lost})
+      send(agg, {:adoption_window, ctx.camera_id})
       assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :stream_reset}}
 
-      flush(ctx.agg, ctx.rec)
+      flush(agg, ctx.rec)
 
       assert [appeared, flip] = Tracks.moments(oid)
       assert appeared.kind == :appeared
@@ -564,6 +586,87 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
       assert row.entry_bbox == @parked_box
       assert row.exit_bbox == @parked_box
       assert row.stationary_since != nil
+    end
+  end
+
+  # -- stream resets ----------------------------------------------------------
+
+  describe "stream reset" do
+    @reset_box [0.1, 0.1, 0.2, 0.4]
+
+    # The recorder's mailbox read directly. Every entry point of
+    # `Cairn.TrackRecorder` is a cast, so a plain pid in its place receives
+    # them verbatim — which is the only way to tell one close from two, since
+    # both write the same upsert and leave the same row.
+    defp aggregator_casting_to_self(ctx, id, opts \\ []) do
+      start_supervised!(
+        {DetectionAggregator,
+         Keyword.merge(
+           [
+             name: nil,
+             recorder: self(),
+             start_extractor: fn _camera, _event ->
+               {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+             end,
+             finalize_extractor: fn _pid, _event -> :ok end
+           ],
+           opts
+         )},
+        id: id
+      )
+      |> tap(fn _agg -> on_exit(fn -> EventCheckpoint.delete(ctx.camera_id) end) end)
+    end
+
+    test "a suspension nothing adopts closes its row exactly once, at the cut", ctx do
+      # the adoption window runs from the cut, so it is the cut that has to be
+      # far enough back for the sweep to find anything
+      agg =
+        aggregator_casting_to_self(ctx, :agg_close_once,
+          cut_clock: fn -> DateTime.add(DateTime.utc_now(), -90, :second) end
+        )
+
+      seen_at = DateTime.add(DateTime.utc_now(), -100, :second)
+      observe(agg, ctx.camera, [object("person", 0.9, @reset_box)], observed_at: seen_at)
+
+      assert_receive {:"$gen_cast", {:open, %Track{object_id: oid}, _event_id}}
+
+      send(agg, {:stream_epoch, ctx.camera_id, Cairn.ULID.generate(), :source_lost})
+      _ = :sys.get_state(agg)
+      # the cut itself closes nothing: the track may yet come back
+      refute_received {:"$gen_cast", {:final, _track, _event}}
+
+      send(agg, {:adoption_window, ctx.camera_id})
+      _ = :sys.get_state(agg)
+
+      assert_receive {:"$gen_cast", {:final, %Track{object_id: ^oid} = final, _event}}
+      assert final.end_reason == :stream_reset
+      # the row's `ended_at` is built from this: the last observation, not the
+      # minute of waiting that followed it
+      assert DateTime.compare(final.last_seen_at, seen_at) == :eq
+
+      send(agg, {:adoption_window, ctx.camera_id})
+      _ = :sys.get_state(agg)
+      refute_received {:"$gen_cast", {:final, _track, _event}}
+    end
+
+    test "an adopted track's row is refreshed onto the new epoch, never closed", ctx do
+      agg = aggregator_casting_to_self(ctx, :agg_adopted_row)
+      epoch_a = Cairn.ULID.generate()
+      epoch_b = Cairn.ULID.generate()
+
+      observe(agg, ctx.camera, [object("person", 0.9, @reset_box)], epoch: epoch_a)
+      assert_receive {:"$gen_cast", {:open, %Track{object_id: oid, epoch: ^epoch_a}, _event}}
+
+      send(agg, {:stream_epoch, ctx.camera_id, epoch_b, :source_lost})
+      _ = :sys.get_state(agg)
+
+      observe(agg, ctx.camera, [object("person", 0.9, @reset_box)], epoch: epoch_b)
+      _ = :sys.get_state(agg)
+
+      # the same row, moved to the stream it is now being seen in
+      assert_receive {:"$gen_cast", {:update, %Track{object_id: ^oid, epoch: ^epoch_b}, _event}}
+      refute_received {:"$gen_cast", {:final, _track, _event}}
+      refute_received {:"$gen_cast", {:discard, _id}}
     end
   end
 

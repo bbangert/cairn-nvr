@@ -124,12 +124,12 @@ defmodule Cairn.PluginProtocolIntegrationTest do
       # more. So the summary reads 0.90 exactly when nothing crossed the cut
       # in either direction.
       #
-      # Note what this cannot show: the aggregator ends live tracks on the
-      # epoch broadcast itself, so the summary is closed before the stale line
-      # is even emitted. A line refused *after* the cut could never have
-      # reached it, and the port's refusal is proven by the exact drops map
-      # below plus the next line — same shape, same track id, live epoch —
-      # being accepted.
+      # Note what this cannot show: a *plugin-owned* track is ended by the
+      # epoch broadcast itself (only host-mode tracks are suspended for
+      # adoption), so this summary is closed before the stale line is even
+      # emitted. A line refused *after* the cut could never have reached it,
+      # and the port's refusal is proven by the exact drops map below plus the
+      # next line — same shape, same track id, live epoch — being accepted.
       assert ended.best_score == 0.90, "a post-boundary line reached the pre-boundary track"
 
       # ...and that is what a Home Assistant client actually receives.
@@ -236,8 +236,9 @@ defmodule Cairn.PluginProtocolIntegrationTest do
       # the only line this track accepted carries 0.90, and both cam_a lines
       # after it carry more, so the summary reads 0.90 exactly when nothing
       # crossed the cut in either direction. As in the per-camera test, this
-      # cannot show the *port's* refusal on its own — the aggregator closes
-      # the summary on the epoch broadcast, before the stale line is emitted.
+      # cannot show the *port's* refusal on its own — this track is
+      # plugin-owned, so the epoch broadcast closes its summary outright,
+      # before the stale line is emitted.
       assert ended_a.best_score == 0.90, "a post-boundary line reached the pre-boundary track"
 
       # ...and that is what a Home Assistant client actually receives. The

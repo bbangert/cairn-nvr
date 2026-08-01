@@ -531,15 +531,29 @@ IoU candidates, which matters only if you turn the capability off mid-run:
 the tracks you owned until then are unmatchable afterwards and expire on
 `max_unseen_ms` rather than being adopted.
 
+A host-side identity can **survive a stream reset**. At an epoch boundary
+these tracks are suspended rather than ended, and a detection on the far side
+that lands on one of them resumes it — same `object_id`, same `started_at`,
+new `epoch`. How much overlap that takes depends on how long the outage was:
+inside `max_unseen_ms` of absence — and at most three seconds of it, whatever
+`max_unseen_ms` is set to — any suspended track will answer at 0.4, beyond it
+only one Cairn had judged stationary will, and only at 0.7. A minute after the
+**cut** nothing is adoptable any more and the track ends `stream_reset`,
+timestamped at the last observation before the cut, which on a stream that had
+already gone quiet can be well over a minute earlier. None of this needs
+anything from you: it is geometry over the boxes you send.
+
 **With it,** Cairn honours your ids and runs no box matching:
 
 - `(your plugin instance, stream epoch, track_id)` maps 1:1 onto a ULID for
   the life of that triple. Reuse a `track_id` for the same object and it
   keeps its identity. The plugin instance is your camera id (per-camera) or
   your group name (group).
-- **Ids are scoped to the epoch.** At an epoch boundary Cairn ends every live
-  track with a final summary (`stream_reset`) and starts fresh — reusing an
-  id across the boundary gets you a new object, not the old one.
+- **Ids are scoped to the epoch.** At an epoch boundary Cairn ends every track
+  it holds for you with a final summary (`stream_reset`) and starts fresh —
+  reusing an id across the boundary gets you a new object, not the old one.
+  (Only *host*-owned tracks survive a boundary, by geometry; an identity you
+  own is yours, and Cairn will not revive one behind your back.)
 - List an id in `ended_tracks` when the object is gone. Cairn ends the track
   and sends its final summary (`plugin_ended`). `ended_tracks` is honoured
   only under the capability, same as `track_id`.

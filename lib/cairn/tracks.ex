@@ -75,10 +75,16 @@ defmodule Cairn.Tracks do
 
   # The columns a later offer of the same id may overwrite. Everything left out
   # is either the track's identity (`camera_id`, `started_at`, `source`,
-  # `plugin_track_id`, `epoch` — none of which change over a track's life), the
-  # instant the row first appeared (`inserted_at`), or `entry_bbox`, which comes
-  # from the `:appeared` moment and is therefore known only to the writer that
+  # `plugin_track_id` — none of which change over a track's life), the instant
+  # the row first appeared (`inserted_at`), or `entry_bbox`, which comes from
+  # the `:appeared` moment and is therefore known only to the writer that
   # opened the row: a later offer carries nil there and must not blank it.
+  #
+  # `epoch` is in the list and is *not* identity: a host track that survives a
+  # stream reset by being adopted out of suspension keeps its id and moves to
+  # the new epoch (`Cairn.Tracker`), so the column means the stream this track
+  # was last observed under, which is the one a reader wanting its media should
+  # look in.
   #
   # `updated_at` is in the list and load-bearing beyond bookkeeping —
   # `close_live/0` reads it as the instant a row was last known live.
@@ -86,6 +92,7 @@ defmodule Cairn.Tracks do
     :event_id,
     :label,
     :best_score,
+    :epoch,
     :ended_at,
     :end_reason,
     :stationary_since,
