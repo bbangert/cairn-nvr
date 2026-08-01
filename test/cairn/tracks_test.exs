@@ -120,19 +120,6 @@ defmodule Cairn.TracksTest do
     assert Tracks.get(at_cutoff.id) != nil
   end
 
-  test "recorded: false lists exactly the tracks that never made a clip" do
-    unrecorded = seed(%{label: "cat"})
-    recorded = seed(%{event_id: "evt_1"})
-
-    assert %{total: 1, tracks: [row]} = Tracks.list(recorded: false)
-    assert row.id == unrecorded.id
-
-    assert %{total: 1, tracks: [row]} = Tracks.list(recorded: true)
-    assert row.id == recorded.id
-
-    assert %{total: 2} = Tracks.list()
-  end
-
   test "list filters by camera, label, time and stationary_ms; paginates newest-first" do
     now = DateTime.utc_now()
     seed(%{camera_id: "cam_a", started_at: DateTime.add(now, -1 * 86_400), label: "person"})
@@ -165,33 +152,388 @@ defmodule Cairn.TracksTest do
     assert %{tracks: []} = Tracks.list(page: 9, page_size: 2)
   end
 
-  test "for_event returns only that event's tracks, oldest first" do
-    now = DateTime.utc_now()
-    second = seed(%{event_id: "evt_1", started_at: now})
-    first = seed(%{event_id: "evt_1", started_at: DateTime.add(now, -60)})
-    other = seed(%{event_id: "evt_2", started_at: DateTime.add(now, -30)})
-    unrecorded = seed(%{event_id: nil, started_at: DateTime.add(now, -45)})
+  describe "first_overlapping_event_ids/2" do
+    # A clip row, inserted directly: these tests need windows placed to the
+    # second around a track, which the capture pipeline's own writers do not
+    # expose.
+    defp clip(camera_id, started_at, ended_at) do
+      %Cairn.Events.Event{}
+      |> Cairn.Events.Event.changeset(%{
+        id: Ecto.UUID.generate(),
+        camera_id: camera_id,
+        started_at: started_at,
+        ended_at: ended_at,
+        status: if(ended_at, do: :finalized, else: :active),
+        path: "/tmp/#{System.unique_integer([:positive])}.mp4"
+      })
+      |> Cairn.Repo.insert!()
+    end
 
-    assert [a, b] = Tracks.for_event("evt_1")
-    assert [a.id, b.id] == [first.id, second.id]
+    defp track_struct(attrs), do: Tracks.get(seed(attrs).id)
 
-    assert [%{id: other_id}] = Tracks.for_event("evt_2")
-    assert other_id == other.id
-    assert Tracks.for_event("evt_missing") == []
+    test "links to the earliest of several overlapping clips" do
+      t0 = DateTime.utc_now()
 
-    # the unrecorded track belongs to no event and must not leak into either
-    refute unrecorded.id in Enum.map(Tracks.for_event("evt_1"), & &1.id)
+      track =
+        track_struct(%{
+          camera_id: "cam_a",
+          started_at: DateTime.add(t0, 10),
+          ended_at: DateTime.add(t0, 200)
+        })
+
+      # Inserted late-clip-first, so the expected answer is not also the
+      # insertion order. That does not make the `order_by` deletable-and-caught:
+      # this query filters on `camera_id` + `started_at`, which SQLite serves
+      # from `events_camera_id_started_at_index`, so the rows arrive sorted
+      # with or without the clause. What dies here is a reversal to `desc`.
+      second = clip("cam_a", DateTime.add(t0, 100), DateTime.add(t0, 160))
+      first = clip("cam_a", t0, DateTime.add(t0, 60))
+
+      assert Tracks.first_overlapping_event_ids([track]) == %{track.id => first.id}
+      # …and the later clip really does overlap too, so the assertion above is
+      # about ordering, not about the second clip being unreachable.
+      assert second.started_at |> DateTime.compare(track.ended_at) == :lt
+    end
+
+    test "a clip whose window contains the track entirely links" do
+      t0 = DateTime.utc_now()
+
+      track =
+        track_struct(%{
+          camera_id: "cam_a",
+          started_at: DateTime.add(t0, 30),
+          ended_at: DateTime.add(t0, 40)
+        })
+
+      containing = clip("cam_a", t0, DateTime.add(t0, 300))
+
+      assert Tracks.first_overlapping_event_ids([track]) == %{track.id => containing.id}
+    end
+
+    test "a track that ends between two clips links to neither" do
+      t0 = DateTime.utc_now()
+
+      track =
+        track_struct(%{
+          camera_id: "cam_a",
+          started_at: DateTime.add(t0, 70),
+          ended_at: DateTime.add(t0, 90)
+        })
+
+      clip("cam_a", t0, DateTime.add(t0, 60))
+      clip("cam_a", DateTime.add(t0, 100), DateTime.add(t0, 160))
+
+      assert Tracks.first_overlapping_event_ids([track]) == %{}
+    end
+
+    test "overlap is inclusive at both boundaries" do
+      t0 = DateTime.utc_now()
+
+      track =
+        track_struct(%{
+          camera_id: "cam_a",
+          started_at: DateTime.add(t0, 100),
+          ended_at: DateTime.add(t0, 200)
+        })
+
+      # ends exactly when the track starts, and starts exactly when it ends
+      before = clip("cam_a", t0, DateTime.add(t0, 100))
+      clip("cam_a", DateTime.add(t0, 200), DateTime.add(t0, 300))
+
+      assert Tracks.first_overlapping_event_ids([track]) == %{track.id => before.id}
+    end
+
+    test "a clip one second short of the track does not link" do
+      t0 = DateTime.utc_now()
+
+      track =
+        track_struct(%{
+          camera_id: "cam_a",
+          started_at: DateTime.add(t0, 100),
+          ended_at: DateTime.add(t0, 200)
+        })
+
+      clip("cam_a", t0, DateTime.add(t0, 99))
+
+      assert Tracks.first_overlapping_event_ids([track]) == %{}
+    end
+
+    test "a still-recording clip has no end, so it overlaps everything after its start" do
+      t0 = DateTime.utc_now()
+
+      track =
+        track_struct(%{
+          camera_id: "cam_a",
+          started_at: DateTime.add(t0, 500),
+          ended_at: DateTime.add(t0, 520)
+        })
+
+      recording = clip("cam_a", t0, nil)
+
+      assert Tracks.first_overlapping_event_ids([track]) == %{track.id => recording.id}
+    end
+
+    test "a live track's window runs to now, so a clip opened after it started links" do
+      now = DateTime.utc_now()
+
+      track =
+        track_struct(%{camera_id: "cam_a", started_at: DateTime.add(now, -600), ended_at: nil})
+
+      later = clip("cam_a", DateTime.add(now, -60), DateTime.add(now, -30))
+
+      assert Tracks.first_overlapping_event_ids([track], now) == %{track.id => later.id}
+      # the same clip is out of reach when `now` is taken before it opened
+      assert Tracks.first_overlapping_event_ids([track], DateTime.add(now, -300)) == %{}
+      assert later.id
+    end
+
+    test "a clip on another camera never links, however well the windows line up" do
+      t0 = DateTime.utc_now()
+
+      track =
+        track_struct(%{
+          camera_id: "cam_a",
+          started_at: DateTime.add(t0, 10),
+          ended_at: DateTime.add(t0, 20)
+        })
+
+      clip("cam_b", t0, DateTime.add(t0, 60))
+
+      assert Tracks.first_overlapping_event_ids([track]) == %{}
+    end
+
+    test "a page of tracks across cameras resolves in one pass" do
+      t0 = DateTime.utc_now()
+
+      a = track_struct(%{camera_id: "cam_a", started_at: t0, ended_at: DateTime.add(t0, 10)})
+      b = track_struct(%{camera_id: "cam_b", started_at: t0, ended_at: DateTime.add(t0, 10)})
+      c = track_struct(%{camera_id: "cam_c", started_at: t0, ended_at: DateTime.add(t0, 10)})
+
+      clip_a = clip("cam_a", t0, DateTime.add(t0, 30))
+      clip_b = clip("cam_b", t0, DateTime.add(t0, 30))
+
+      assert Tracks.first_overlapping_event_ids([a, b, c]) ==
+               %{a.id => clip_a.id, b.id => clip_b.id}
+
+      assert c.id
+    end
+
+    test "an empty page asks nothing" do
+      assert Tracks.first_overlapping_event_ids([]) == %{}
+    end
   end
 
-  test "for_event(nil) is an empty list, not a database error" do
-    # `event_id` is nullable — most tracks never earn video — so
-    # `for_event(track.event_id)` is a natural call. Ecto rejects `== ^nil`
-    # outright ("comparison with nil is forbidden"), and there is no track
-    # whose event is "no event", so the empty list is the honest answer.
-    seed(%{event_id: nil})
-    seed(%{event_id: "evt_1"})
+  describe "overlapping_event/3" do
+    test "takes every track whose window meets the clip's, and nothing else" do
+      t0 = DateTime.utc_now()
+      event = clip("cam_a", DateTime.add(t0, 100), DateTime.add(t0, 200))
 
-    assert Tracks.for_event(nil) == []
+      # Seeded newest-first, so the expected order is not also the insertion
+      # order. As above, that pins the direction of the `order_by` and not its
+      # presence: `tracks_camera_id_started_at_index` already returns these
+      # rows sorted, so only a reversal to `desc` fails here.
+      #
+      # started inside, still going long after — the row a read of
+      # `tracks.event_id` misses, since it ended with no event open
+      spanning = seed(%{started_at: DateTime.add(t0, 150), ended_at: DateTime.add(t0, 9000)})
+      # started before the clip, ended inside it
+      into = seed(%{started_at: DateTime.add(t0, 50), ended_at: DateTime.add(t0, 150)})
+      # wholly before and wholly after
+      seed(%{started_at: t0, ended_at: DateTime.add(t0, 90)})
+      seed(%{started_at: DateTime.add(t0, 300), ended_at: DateTime.add(t0, 400)})
+      # same window, different camera
+      seed(%{
+        camera_id: "cam_b",
+        started_at: DateTime.add(t0, 120),
+        ended_at: DateTime.add(t0, 130)
+      })
+
+      assert Enum.map(Tracks.overlapping_event(event), & &1.id) == [into.id, spanning.id]
+    end
+
+    test "boundaries are inclusive at both ends" do
+      t0 = DateTime.utc_now()
+      event = clip("cam_a", DateTime.add(t0, 100), DateTime.add(t0, 200))
+
+      # again seeded out of chronological order, so the assertion cannot be
+      # satisfied by insertion order alone
+      starts_at_end = seed(%{started_at: DateTime.add(t0, 200), ended_at: DateTime.add(t0, 300)})
+      ends_at_start = seed(%{started_at: t0, ended_at: DateTime.add(t0, 100)})
+      # one millisecond outside each boundary is out
+      seed(%{
+        started_at: t0,
+        ended_at: DateTime.add(t0, 100, :second) |> DateTime.add(-1, :millisecond)
+      })
+
+      seed(%{
+        started_at: DateTime.add(t0, 200, :second) |> DateTime.add(1, :millisecond),
+        ended_at: DateTime.add(t0, 300)
+      })
+
+      assert Enum.map(Tracks.overlapping_event(event), & &1.id) ==
+               [ends_at_start.id, starts_at_end.id]
+    end
+
+    test "limit: takes the earliest n, and one more than n is how a caller sees truncation" do
+      t0 = DateTime.utc_now()
+      event = clip("cam_a", t0, DateTime.add(t0, 300))
+
+      # seeded newest-first: the limit must cut by `started_at`, not by rowid
+      third = seed(%{started_at: DateTime.add(t0, 30), ended_at: DateTime.add(t0, 40)})
+      second = seed(%{started_at: DateTime.add(t0, 20), ended_at: DateTime.add(t0, 30)})
+      first = seed(%{started_at: DateTime.add(t0, 10), ended_at: DateTime.add(t0, 20)})
+
+      assert Enum.map(Tracks.overlapping_event(event, t0, limit: 2), & &1.id) ==
+               [first.id, second.id]
+
+      # asking for one more than the cap is what tells the caller it truncated:
+      # three rows back for a limit of 3 means there may be a fourth
+      assert length(Tracks.overlapping_event(event, t0, limit: 3)) == 3
+      # …and with the cap above the row count, the extra row never arrives
+      assert Enum.map(Tracks.overlapping_event(event, t0, limit: 4), & &1.id) ==
+               [first.id, second.id, third.id]
+
+      # no limit is still no limit
+      assert length(Tracks.overlapping_event(event, t0)) == 3
+    end
+
+    test "a live track overlaps a clip that has already ended" do
+      t0 = DateTime.utc_now()
+      event = clip("cam_a", DateTime.add(t0, -600), DateTime.add(t0, -500))
+      live = seed(%{started_at: DateTime.add(t0, -550), ended_at: nil})
+
+      assert Enum.map(Tracks.overlapping_event(event), & &1.id) == [live.id]
+    end
+
+    test "a still-recording clip's window ends at `now`" do
+      t0 = DateTime.utc_now()
+      recording = clip("cam_a", DateTime.add(t0, -600), nil)
+      recent = seed(%{started_at: DateTime.add(t0, -60), ended_at: DateTime.add(t0, -30)})
+
+      assert Enum.map(Tracks.overlapping_event(recording, t0), & &1.id) == [recent.id]
+      # asked as of a moment before that track existed, the clip has not
+      # reached it yet
+      assert Tracks.overlapping_event(recording, DateTime.add(t0, -300)) == []
+    end
+  end
+
+  describe "moment_clips/3" do
+    test "sorts instants into this clip, another clip, and no clip at all" do
+      t0 = DateTime.utc_now()
+      here = clip("cam_a", t0, DateTime.add(t0, 60))
+      other = clip("cam_a", DateTime.add(t0, 500), DateTime.add(t0, 560))
+
+      inside = DateTime.add(t0, 10)
+      gap = DateTime.add(t0, 200)
+      elsewhere = DateTime.add(t0, 520)
+
+      assert Tracks.moment_clips([inside, gap, elsewhere], "cam_a", here.id) == %{
+               inside => :here,
+               gap => :none,
+               elsewhere => {:other, other.id, 20}
+             }
+    end
+
+    test "a clip on another camera contains nothing" do
+      t0 = DateTime.utc_now()
+      clip("cam_b", t0, DateTime.add(t0, 60))
+      at = DateTime.add(t0, 10)
+
+      assert Tracks.moment_clips([at], "cam_a", nil) == %{at => :none}
+    end
+
+    test "a still-recording clip contains everything after its start" do
+      t0 = DateTime.utc_now()
+      recording = clip("cam_a", t0, nil)
+      before = DateTime.add(t0, -1)
+      after_start = DateTime.add(t0, 3_600)
+
+      assert Tracks.moment_clips([before, after_start], "cam_a", nil) == %{
+               before => :none,
+               after_start => {:other, recording.id, 3_600}
+             }
+    end
+
+    test "containment is inclusive at both edges" do
+      t0 = DateTime.utc_now()
+      c = clip("cam_a", t0, DateTime.add(t0, 60))
+      just_before = DateTime.add(t0, -1, :millisecond)
+      just_after = DateTime.add(t0, 60, :second) |> DateTime.add(1, :millisecond)
+
+      assert Tracks.moment_clips([t0], "cam_a", c.id) == %{t0 => :here}
+
+      assert Tracks.moment_clips([DateTime.add(t0, 60)], "cam_a", c.id) == %{
+               DateTime.add(t0, 60) => :here
+             }
+
+      assert Tracks.moment_clips([just_before, just_after], "cam_a", c.id) == %{
+               just_before => :none,
+               just_after => :none
+             }
+    end
+
+    test "no instants asks nothing" do
+      assert Tracks.moment_clips([], "cam_a", "whatever") == %{}
+    end
+  end
+
+  describe "moments_for/1" do
+    test "groups many tracks' moments, oldest first inside each" do
+      t0 = DateTime.utc_now()
+
+      a =
+        seed(%{}, [
+          moment(:started_moving, DateTime.add(t0, 9)),
+          moment(:appeared, DateTime.add(t0, 1)),
+          moment(:became_stationary, DateTime.add(t0, 4))
+        ])
+
+      b = seed(%{}, [moment(:appeared, DateTime.add(t0, 2))])
+      quiet = seed(%{}, [])
+
+      grouped = Tracks.moments_for([a.id, b.id, quiet.id])
+
+      assert Enum.map(grouped[a.id], & &1.kind) == [
+               :appeared,
+               :became_stationary,
+               :started_moving
+             ]
+
+      assert Enum.map(grouped[b.id], & &1.kind) == [:appeared]
+      # a track with no moments is absent, not an empty list
+      refute Map.has_key?(grouped, quiet.id)
+    end
+
+    test "an id with no track answers nothing, and an empty list asks nothing" do
+      assert Tracks.moments_for([Cairn.ULID.generate()]) == %{}
+      assert Tracks.moments_for([]) == %{}
+    end
+  end
+
+  test "known_labels and known_zones list the distinct values, sorted" do
+    seed(%{label: "person", zones: ["porch", "walkway"]})
+    seed(%{label: "car", zones: ["driveway", "porch"]})
+    seed(%{label: "person", zones: []})
+    seed(%{label: nil, zones: ["driveway"]})
+
+    assert Tracks.known_labels() == ["car", "person"]
+    assert Tracks.known_zones() == ["driveway", "porch", "walkway"]
+  end
+
+  test "known_labels and known_zones collapse the duplicates in SQL, not in Elixir" do
+    # 60 rows, 120 zone entries, two of each value. Neither function sorts or
+    # dedups what SQLite hands back, so a result longer than the distinct set
+    # is a `DISTINCT` that stopped happening in the database — the whole point
+    # of these two queries on a table that keeps a row per tracked object for
+    # 365 days.
+    for i <- 1..30 do
+      seed(%{label: "person", zones: ["porch", "walkway"], started_at: DateTime.utc_now()})
+      seed(%{label: "car", zones: ["driveway"], started_at: DateTime.add(DateTime.utc_now(), -i)})
+    end
+
+    assert %{total: 60} = Tracks.list()
+    assert Tracks.known_labels() == ["car", "person"]
+    assert Tracks.known_zones() == ["driveway", "porch", "walkway"]
   end
 
   test "zone filter matches array membership and pages on the filtered set" do

@@ -606,3 +606,19 @@ select.hs-input option { background: var(--hs-bg-raised); color: var(--hs-fg-1);
 /* event rows are links */
 .cairn-event-row { transition: background var(--hs-dur-fast) var(--hs-ease-standard); }
 .cairn-event-row:hover { background: var(--hs-bg-raised); }
+
+/* track rows expand in place: a plain <details>, so the moments list costs no
+   round trip and no server-held open/closed state. The marker rules strip the
+   browser's disclosure triangle — the row draws its own expand_more/chevron. */
+.cairn-track-row { transition: background var(--hs-dur-fast) var(--hs-ease-standard); }
+.cairn-track-row:hover { background: var(--hs-bg-raised); }
+.cairn-track-row > summary { list-style: none; cursor: pointer; }
+.cairn-track-row > summary::-webkit-details-marker { display: none; }
+.cairn-track-row > summary::marker { content: ""; }
+.cairn-track-row[open] > summary .cairn-disclosure--more { display: none; }
+.cairn-track-row:not([open]) > summary .cairn-disclosure--less { display: none; }
+
+/* moment rows in the tracked-objects panel: the in-clip seek <button> and the
+   cross-clip <a> share one hover surface, so the two read as one list */
+.cairn-moment { transition: background var(--hs-dur-fast) var(--hs-ease-standard); }
+.cairn-moment:hover { background: var(--hs-bg-sunken); }

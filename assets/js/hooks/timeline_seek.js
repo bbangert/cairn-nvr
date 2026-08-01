@@ -13,6 +13,13 @@
 // duration), so markers are placed against the real video.duration once it's
 // known — which also self-corrects when less than the configured pre-roll was
 // captured.
+//
+// The event page mounts two instances of this hook against the same video: the
+// detections timeline, and the tracked-objects panel's #track-moments region.
+// The second has no [data-playhead] (so the rAF loop stays idle) and its
+// [data-t] rows are not positioned, so the `left` placeMarkers writes is inert
+// there — what it wants is the data-seek rewrite, which is the same pre-roll
+// correction the markers get.
 const TimelineSeek = {
   mounted() {
     this.video = document.getElementById(this.el.dataset.videoId)
@@ -43,8 +50,28 @@ const TimelineSeek = {
       }
     }
 
-    this.video.addEventListener("loadedmetadata", this.placeMarkers)
-    this.placeMarkers() // metadata may already be available
+    // data-initial-t is the ?t= param: event-relative seconds, exactly like a
+    // marker's data-t, so it gets the same pre-roll correction. Applied once —
+    // a later re-render must not yank the video back to where the link pointed.
+    this.seekInitial = () => {
+      if (this.initialSeeked || this.el.dataset.initialT == null) return
+      const d = this.video.duration
+      if (!d || !isFinite(d)) return
+      const t = parseFloat(this.el.dataset.initialT)
+      if (!isFinite(t)) return
+      const eventSeconds = parseFloat(this.el.dataset.eventSeconds) || 0
+      const preRoll = Math.max(d - eventSeconds, 0)
+      this.initialSeeked = true
+      this.video.currentTime = Math.min(preRoll + t, d)
+    }
+
+    this.onMetadata = () => {
+      this.placeMarkers()
+      this.seekInitial()
+    }
+
+    this.video.addEventListener("loadedmetadata", this.onMetadata)
+    this.onMetadata() // metadata may already be available
 
     if (this.playhead) {
       this.render = () => {
@@ -88,7 +115,7 @@ const TimelineSeek = {
   destroyed() {
     cancelAnimationFrame(this.raf)
     if (!this.video) return
-    this.video.removeEventListener("loadedmetadata", this.placeMarkers)
+    this.video.removeEventListener("loadedmetadata", this.onMetadata)
     this.video.removeEventListener("play", this.start)
     this.video.removeEventListener("pause", this.stop)
     this.video.removeEventListener("ended", this.stop)

@@ -5,17 +5,27 @@ defmodule Cairn.Tracks do
   go through here.
 
   The tables exist for one question the event index cannot answer: *what did
-  the system see and not record?* `list(recorded: false)` is that query — the
-  tracks whose `event_id` is nil never made it into a clip, and because
-  `event_id` carries no foreign key it keeps saying "recorded" long after the
-  clip itself has aged out.
+  the system see and not record?* Every track gets a row whether or not a clip
+  was open, so the rows themselves are the answer; which of them a clip holds
+  is decided by time overlap, not by `tracks.event_id` — see
+  `first_overlapping_event_ids/2` and `Cairn.Tracks.Track`'s moduledoc for why
+  that column cannot carry it.
 
   `Cairn.Tracks.Track` here is the row, not `Cairn.Track` the runtime broadcast
   struct — the same distinction as `Cairn.Events.Event` and `Cairn.Event`.
+
+  Writes stay inside the two tables named above. Reads do not: relating a track
+  to a clip is a question about time and the `events` table, asked three ways —
+  `first_overlapping_event_ids/2` (which clip does this track belong to?),
+  `overlapping_event/3` (which tracks belong to this clip?) and
+  `moment_clips/3` (which clip contains this instant?). All three select from
+  `Cairn.Events.Event` here rather than making the callers stitch two contexts
+  together per page.
   """
 
   import Ecto.Query
 
+  alias Cairn.Events.Event
   alias Cairn.Repo
   alias Cairn.Tracks.Track
   alias Cairn.Tracks.TrackEvent
@@ -39,7 +49,6 @@ defmodule Cairn.Tracks do
           label: String.t() | nil,
           from: DateTime.t() | nil,
           to: DateTime.t() | nil,
-          recorded: boolean() | nil,
           zone: String.t() | nil,
           min_stationary_ms: non_neg_integer() | nil,
           page: pos_integer(),
@@ -121,26 +130,265 @@ defmodule Cairn.Tracks do
   end
 
   @doc """
-  Every track recorded into one event, oldest first.
+  The moments of many tracks at once, as `%{track_id => [TrackEvent.t()]}`.
 
-  Unpaginated on purpose: a single event's tracks are bounded by what the
-  tracker can hold live, so this is the whole panel in one query. It reads
-  `tracks.event_id`, which carries no foreign key — an event whose row is gone
-  still answers with the tracks that named it.
+  One query for a whole page of rows, so a track list never fans out into a
+  `moments/1` per row. `Enum.group_by/2` keeps the enumeration order inside each
+  group, so every list comes back oldest moment first, exactly like `moments/1`.
 
-  `nil` answers `[]` rather than raising. The column is nullable — most tracks
-  never earn video — so `for_event(track.event_id)` is a natural call, and
-  Ecto's `== ^nil` would reject it at the database with "comparison with nil is
-  forbidden". There is no track whose `event_id` is "no event", so the empty
-  list is the honest answer, not a swallowed error.
+  A track with no moments is simply absent from the map — callers read it with
+  `Map.get(map, id, [])`, which is also what an unknown id answers.
   """
-  @spec for_event(String.t() | nil) :: [Track.t()]
-  def for_event(nil), do: []
+  @spec moments_for([String.t()]) :: %{String.t() => [TrackEvent.t()]}
+  def moments_for([]), do: %{}
 
-  def for_event(event_id) do
+  def moments_for(track_ids) when is_list(track_ids) do
+    TrackEvent
+    |> where([m], m.track_id in ^track_ids)
+    |> order_by([m], asc: m.at)
+    |> Repo.all()
+    |> Enum.group_by(& &1.track_id)
+  end
+
+  @doc """
+  Maps each track to the first surviving clip it overlaps: `%{track_id =>
+  event_id}`. Tracks with no overlapping event row are absent from the map.
+
+  Linking is by **time overlap on the same camera**, not by `tracks.event_id`:
+  that column names the event that was open when the track *ended*, so a track
+  spanning two clips, or one that ended between them, points at the wrong clip
+  or at none. Overlap is the honest question — "was a camera recording while
+  this object was in frame?"
+
+  The rule, with a track's window `[started_at, ended_at || now]` and an event's
+  `[started_at, ended_at || still recording]`:
+
+      event.started_at <= track_end AND (event.ended_at IS NULL OR event.ended_at >= track.started_at)
+
+  A NULL `events.ended_at` means the clip is still being written, so its window
+  has no end yet and only the first half of the test can fail. Boundaries are
+  inclusive: an event that starts at the exact instant a track ends overlaps it.
+
+  Two passes, one query total, whatever the page size: the events that could
+  possibly overlap *any* track on the page are fetched in one go (bounded by the
+  page's cameras and its outermost instants), then each track picks the earliest
+  of them that overlaps it. The `events` table is small next to a page of tracks
+  — a clip is minutes of many tracks — so the per-track match runs in Elixir
+  rather than as a lateral subquery SQLite would have to plan per row.
+  """
+  @spec first_overlapping_event_ids([Track.t()], DateTime.t()) :: %{String.t() => String.t()}
+  def first_overlapping_event_ids(tracks, now \\ DateTime.utc_now())
+
+  def first_overlapping_event_ids([], _now), do: %{}
+
+  def first_overlapping_event_ids(tracks, now) when is_list(tracks) do
+    cameras = tracks |> Enum.map(& &1.camera_id) |> Enum.uniq()
+    window_start = tracks |> Enum.map(& &1.started_at) |> Enum.min(DateTime)
+    window_end = tracks |> Enum.map(&track_end(&1, now)) |> Enum.max(DateTime)
+
+    by_camera =
+      Event
+      |> where([e], e.camera_id in ^cameras)
+      |> where([e], e.started_at <= ^window_end)
+      |> where([e], is_nil(e.ended_at) or e.ended_at >= ^window_start)
+      |> order_by([e], asc: e.started_at)
+      |> select([e], %{
+        id: e.id,
+        camera_id: e.camera_id,
+        started_at: e.started_at,
+        ended_at: e.ended_at
+      })
+      |> Repo.all()
+      |> Enum.group_by(& &1.camera_id)
+
+    Enum.reduce(tracks, %{}, fn track, acc ->
+      track_end = track_end(track, now)
+
+      by_camera
+      |> Map.get(track.camera_id, [])
+      |> Enum.find(&overlaps?(&1, track.started_at, track_end))
+      |> case do
+        nil -> acc
+        event -> Map.put(acc, track.id, event.id)
+      end
+    end)
+  end
+
+  defp track_end(%Track{ended_at: nil}, now), do: now
+  defp track_end(%Track{ended_at: ended_at}, _now), do: ended_at
+
+  defp overlaps?(event, track_start, track_end) do
+    DateTime.compare(event.started_at, track_end) != :gt and
+      (is_nil(event.ended_at) or DateTime.compare(event.ended_at, track_start) != :lt)
+  end
+
+  @doc """
+  Every track whose lifetime overlaps one clip's window, oldest first.
+
+  The mirror of `first_overlapping_event_ids/2` — same relation, asked from the
+  other side — and the same reason for existing: `tracks.event_id` names the
+  event that was open when a track *ended*, so a track spanning two clips, or
+  one that ended between them, is missing from or wrong in any read of that
+  column. This answers the question the panel actually asks: *what was in frame
+  while this clip was being written?*
+
+  With a track's window `[started_at, ended_at || now]` and the event's
+  `[started_at, ended_at || now]`:
+
+      track.started_at <= event_end AND (track.ended_at IS NULL OR track.ended_at >= event.started_at)
+
+  A NULL `ended_at` on either side means "still going", so that side's window
+  has no end yet. Boundaries are inclusive, exactly as in
+  `first_overlapping_event_ids/2`: a track that starts at the instant a clip
+  ends overlaps it.
+
+  Unbounded unless `:limit` says otherwise. A clip of ordinary length overlaps
+  a handful of tracks and the panel wants all of them, but a day-long event on
+  a busy camera was in frame of thousands, and `CairnWeb.EventLive` loads a
+  moment list for every row it gets back — so that caller passes a `:limit`.
+  `limit: n` takes the *earliest* n by `started_at`, which is also the order
+  the results come back in, so a caller that asks for `n + 1` and gets `n + 1`
+  knows it was truncated and can say so. Nothing here reports truncation on its
+  own: this returns rows, and only the caller knows what it promised the reader.
+  """
+  @type overlapping_opts :: [limit: pos_integer() | nil]
+
+  @spec overlapping_event(Event.t() | map(), DateTime.t(), overlapping_opts()) :: [Track.t()]
+  def overlapping_event(event, now \\ DateTime.utc_now(), opts \\ [])
+
+  def overlapping_event(%{camera_id: camera_id, started_at: started_at} = event, now, opts) do
+    event_end = event.ended_at || now
+
     Track
-    |> where([t], t.event_id == ^event_id)
+    |> where([t], t.camera_id == ^camera_id)
+    |> where([t], t.started_at <= ^event_end)
+    |> where([t], is_nil(t.ended_at) or t.ended_at >= ^started_at)
     |> order_by([t], asc: t.started_at)
+    |> maybe_limit(opts[:limit])
+    |> Repo.all()
+  end
+
+  defp maybe_limit(query, nil), do: query
+
+  defp maybe_limit(query, n) when is_integer(n) and n > 0, do: limit(query, ^n)
+
+  @typedoc """
+  Where a moment falls relative to the clip being viewed: inside it, inside
+  another surviving clip (with the moment's offset into that clip, in seconds),
+  or in no clip at all.
+  """
+  @type clip_ref :: :here | {:other, String.t(), non_neg_integer()} | :none
+
+  @doc """
+  Classifies each instant against the clips that survive on one camera.
+
+  Containment, not overlap: an instant belongs to the clip whose window covers
+  it — `started_at <= at <= ended_at`, with a NULL `ended_at` meaning the clip
+  is still recording and so contains everything after its start. Clips on a
+  camera do not overlap in practice; should two contain the same instant, the
+  one that started earlier wins, and `current_event_id` beats both.
+
+  One query for a whole panel's worth of moments, whatever the track count: the
+  clips that could contain *any* of the instants are fetched in one go (bounded
+  by the camera and the outermost instants), and the per-instant match runs in
+  Elixir — the same two-pass shape, and the same reasoning, as
+  `first_overlapping_event_ids/2`.
+
+  Keyed by the instant rather than by a moment id, because the caller has
+  moments the `track_events` table never held: a track's `ended_at` is a row on
+  the track, and it renders as a moment like any other.
+
+  `{:other, event_id, seconds}` carries the offset because the caller cannot
+  compute it — that is the *other* clip's `started_at`, which only this query
+  read. `:here` carries none: the caller holds the current event and measures
+  offsets from it exactly as the detections timeline does.
+  """
+  @spec moment_clips([DateTime.t()], String.t(), String.t() | nil) :: %{
+          DateTime.t() => clip_ref()
+        }
+  def moment_clips(instants, camera_id, current_event_id)
+
+  def moment_clips([], _camera_id, _current_event_id), do: %{}
+
+  def moment_clips(instants, camera_id, current_event_id) when is_list(instants) do
+    instants = Enum.uniq(instants)
+    first = Enum.min(instants, DateTime)
+    last = Enum.max(instants, DateTime)
+
+    clips =
+      Event
+      |> where([e], e.camera_id == ^camera_id)
+      |> where([e], e.started_at <= ^last)
+      |> where([e], is_nil(e.ended_at) or e.ended_at >= ^first)
+      |> order_by([e], asc: e.started_at)
+      |> select([e], %{id: e.id, started_at: e.started_at, ended_at: e.ended_at})
+      |> Repo.all()
+
+    Map.new(instants, &{&1, classify(&1, clips, current_event_id)})
+  end
+
+  defp classify(at, clips, current_event_id) do
+    case Enum.filter(clips, &contains?(&1, at)) do
+      [] ->
+        :none
+
+      containing ->
+        if Enum.any?(containing, &(&1.id == current_event_id)) do
+          :here
+        else
+          # No clamp on the offset: this branch is only reached for a clip
+          # `contains?/2` accepted, which already required `clip.started_at <=
+          # at`, so the difference cannot come out negative.
+          clip = hd(containing)
+          {:other, clip.id, DateTime.diff(at, clip.started_at)}
+        end
+    end
+  end
+
+  defp contains?(clip, at) do
+    DateTime.compare(clip.started_at, at) != :gt and
+      (is_nil(clip.ended_at) or DateTime.compare(clip.ended_at, at) != :lt)
+  end
+
+  @doc """
+  Every distinct non-nil track label, sorted — the label filter's options.
+
+  Deliberately the `tracks` table and not `Cairn.Events.known_labels/0`: a label
+  that only ever appeared on tracks nothing recorded has no event row to be read
+  out of, and those are the rows this page exists to show.
+
+  Both the `DISTINCT` and the sort happen in SQLite. The filter needs a handful
+  of options and the table keeps a row per tracked object for 365 days, so
+  what must never cross into the BEAM is the row count: this returns as many
+  values as there are labels, whatever the table's size.
+  """
+  @spec known_labels() :: [String.t()]
+  def known_labels do
+    Track
+    |> where([t], not is_nil(t.label))
+    |> distinct(true)
+    |> select([t], t.label)
+    |> order_by([t], asc: t.label)
+    |> Repo.all()
+  end
+
+  @doc """
+  Every distinct zone named by any track, sorted — the zone filter's options.
+
+  `zones` is a `{:array, :string}` column that ecto_sqlite3 stores as JSON
+  text, so reaching inside it takes the same `json_each` walk the `zone:` filter
+  uses — here as a join, so that `DISTINCT` and `ORDER BY` are the database's
+  work. The alternative (select the column, `Enum.concat |> Enum.uniq` in
+  Elixir) decodes one JSON array per row of a 365-day table to fill a `<select>`
+  with six options; the cost of that is the row count, not the column.
+  """
+  @spec known_zones() :: [String.t()]
+  def known_zones do
+    Track
+    |> join(:inner, [t], z in fragment("json_each(?)", t.zones), on: true)
+    |> distinct(true)
+    |> select([_t, z], type(z.value, :string))
+    |> order_by([_t, z], asc: z.value)
     |> Repo.all()
   end
 
@@ -155,7 +403,6 @@ defmodule Cairn.Tracks do
       |> filter_camera(opts[:camera])
       |> filter_label(opts[:label])
       |> filter_time(opts[:from], opts[:to])
-      |> filter_recorded(opts[:recorded])
       |> filter_zone(opts[:zone])
       |> filter_stationary(opts[:min_stationary_ms])
 
@@ -264,11 +511,11 @@ defmodule Cairn.Tracks do
     where(query, [t], t.started_at >= ^from and t.started_at <= ^to)
   end
 
-  # The audit query: `recorded: false` is every track the system saw and never
-  # put in a clip.
-  defp filter_recorded(query, nil), do: query
-  defp filter_recorded(query, true), do: where(query, [t], not is_nil(t.event_id))
-  defp filter_recorded(query, false), do: where(query, [t], is_nil(t.event_id))
+  # No filter on `event_id`. "Which rows claimed an event id?" is not the same
+  # question as "which tracks does a clip hold?" — a track that ended between
+  # two clips, or on a stream reset, has a null `event_id` while video of it
+  # exists — and only the second question has a page. That one is answered by
+  # `first_overlapping_event_ids/2`, on time overlap.
 
   defp filter_zone(query, nil), do: query
   defp filter_zone(query, ""), do: query

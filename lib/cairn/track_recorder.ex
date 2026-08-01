@@ -91,9 +91,10 @@ defmodule Cairn.TrackRecorder do
   Buffers a finished track, to be written as a row linked to `event_id`.
 
   `nil` means the track ended with no event open — the row is still written,
-  and its nil `event_id` is exactly what `Cairn.Tracks.list(recorded: false)`
-  reads as "seen but never in a clip". Whether a no-event track gets a row at
-  all is the caller's gate, not this module's.
+  with a nil `event_id`. That is a statement about the instant the track ended
+  and not about whether a clip holds it (`Cairn.Tracks.Track`'s moduledoc has
+  the cases); readers that need the latter resolve it by time overlap. Whether
+  a no-event track gets a row at all is the caller's gate, not this module's.
 
   `track` is the runtime `%Cairn.Track{}` final summary — the same struct the
   aggregator broadcasts as `track_ended`.

@@ -20,10 +20,11 @@ defmodule Cairn.TrackPath do
   tagged observation seen while the event was open.
 
   This module is the format's single source of truth. The reader that matters
-  is a browser, which cannot share this code — it re-implements the arithmetic
-  below in JavaScript — so the layout is a contract between two
-  implementations rather than an internal detail of one, and it is written
-  down here because there is nowhere else it could be.
+  is a browser, which cannot share this code: `assets/js/hooks/track_overlay.js`
+  re-implements the arithmetic below in JavaScript. The layout is therefore a
+  contract between two implementations rather than an internal detail of one —
+  a change here is a change there — and it is written down here because there
+  is nowhere else it could be.
 
   Per-frame boxes and track identity meet in exactly one place in this system,
   `Cairn.Tracker`'s `tagged` list; every consumer downstream of it sees one or
@@ -63,12 +64,22 @@ defmodule Cairn.TrackPath do
 
   `"anchor"` is the clip's time-zero as the writer knew it: the pts and
   timescale the clip's first fragment carried, the media span of the drained
-  pre-roll, and the wall clock at the instant that drain returned. Together
-  with `"event_started_ms"` they map an event-relative `"ts"` onto a position
-  in the clip. The whole map is `nil` when the writer had no anchor to offer,
-  and each field is `nil`-able on its own; a consumer that finds one missing
-  falls back to the `duration − event_seconds` pre-roll estimate the event
-  timeline already uses.
+  pre-roll, and the wall clock at the instant that drain returned.
+
+  Three of those map an event-relative `"ts"` onto a position in the clip, and
+  are the three the browser reader uses:
+
+      clip_seconds = (drained_span_ms + event_started_ms − drain_wall_ms + ts) / 1000
+
+  — the drained pre-roll's media span, shifted by where the event's own start
+  falls relative to the instant the drain returned. `"first_pts"` and
+  `"timescale"` take no part in it; they are carried so a reader can relate the
+  same position to the clip's own media clock without re-probing the file.
+
+  The whole map is `nil` when the writer had no anchor to offer, and each field
+  is `nil`-able on its own; a consumer that finds one of the three missing falls
+  back to the `duration − event_seconds` pre-roll estimate the event timeline
+  already uses.
 
   ## Coordinates
 

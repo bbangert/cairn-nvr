@@ -568,12 +568,16 @@ defmodule Cairn.DetectionAggregator do
   # Whether a finished track earns a row, and with which event.
   #
   # **An open event records the track unconditionally.** Every track live
-  # during a clip is then queryable from that clip by construction, which is
-  # the audit invariant the table exists for: without it a camera whose
-  # `record:` block admits a label its `track:` block excludes would produce
-  # clips whose contents cannot be enumerated — a cat that triggers a clip
-  # through an absent `record:` block would have no row while the video of it
-  # sits on disk.
+  # during a clip therefore has a row, which is the audit property the table
+  # exists for: without it a camera whose `record:` block admits a label its
+  # `track:` block excludes would produce clips whose contents cannot be
+  # enumerated — a cat that triggers a clip through an absent `record:` block
+  # would have no row while the video of it sits on disk.
+  #
+  # A row, not a link: `event_id` only names the event open at the instant the
+  # track ended, so a track that outlives the clip it appeared in carries nil
+  # or the *next* event's id. Reading a clip's contents back is a time-overlap
+  # query (`Cairn.Tracks.overlapping_event/3`) for exactly that reason.
   #
   # The `track:` tier gates only the tracks no event was open for — the audit
   # trail of what the system saw and did not record, where the tier is the

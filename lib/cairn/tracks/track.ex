@@ -9,8 +9,18 @@ defmodule Cairn.Tracks.Track do
   (row).
 
   `event_id` is a plain string, not an association: events are pruned long
-  before tracks are, so it dangles by design (see the migration). Nil means the
-  track was never recorded, which is the audit question the table answers.
+  before tracks are, so it dangles by design (see the migration). It names the
+  event that was open at the instant the track *ended*, and nothing more. Nil
+  therefore means "no event was open when this track ended" — **not** "never
+  recorded": a track can end in the quiet between two clips, or on a stream
+  reset, while a clip that ran earlier holds video of it. Equally, a track that
+  spans two clips names only the second.
+
+  Whether a clip holds a given track is a question about time, answered by
+  `Cairn.Tracks.first_overlapping_event_ids/2` and `Cairn.Tracks.overlapping_event/3`
+  (camera plus window overlap) — which is what the track browser and the event
+  page's panel both use. This column is the cheap exact link, kept because it
+  is the one a row can carry.
 
   Rows are written only by `Cairn.Tracks.insert_batch/1` via `insert_all`, so
   there is no changeset — the recorder's rows are machine-generated, the column

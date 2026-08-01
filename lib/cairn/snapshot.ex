@@ -154,6 +154,16 @@ defmodule Cairn.Snapshot do
   # Clip time to cut the snapshot from: the trigger's moment (pre-roll + its
   # offset), clamped inside the clip. A freshly-started camera has less than a
   # full pre-window of pre-roll, so the raw offset can run past a short clip.
+  #
+  # `pre_window(config, camera)` is the *configured* pre-roll, not the retained
+  # one, so this is an approximation: a ring that had not filled yet yields a
+  # shorter head than the config promises, and the clamp above is what keeps
+  # the error inside the clip. A better anchor now exists — the sidecar
+  # header's `drained_span_ms` / `drain_wall_ms` / `event_started_ms`
+  # (`Cairn.TrackPath`) place the event's t=0 from what the writer actually
+  # drained — and it is deliberately not read here: the sidecar is allowed to
+  # be absent (no boxes, a failed write, a clip older than the feature) and a
+  # poster frame must not depend on a file that may not exist.
   defp clip_seek(row, config) do
     case trigger(row) do
       nil ->
