@@ -339,6 +339,190 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
     end
   end
 
+  # -- live rows ----------------------------------------------------------------
+
+  describe "a track that qualifies" do
+    setup ctx do
+      # recording off throughout: these are about the `track:` tier and the row
+      # it opens, and an open event would record every track unconditionally.
+      CameraControl.set(ctx.camera_id, %{recording_enabled: false})
+      :ok
+    end
+
+    test "has a row while it is still running, closed in place when it ends", ctx do
+      observe(ctx.agg, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4], "t1")],
+        tracking: true
+      )
+
+      assert_receive {:track_started, %Track{object_id: oid}}
+      flush(ctx.agg, ctx.rec)
+
+      row = Tracks.get(oid)
+      assert row
+      # live: the row is there and says the object has not left
+      assert row.ended_at == nil
+      assert row.end_reason == nil
+      assert row.best_score == 0.9
+      # and its timeline is readable already
+      assert [%{kind: :appeared}] = Tracks.moments(oid)
+      assert row.entry_bbox == [0.1, 0.1, 0.2, 0.4]
+
+      observe(ctx.agg, ctx.camera, [], tracking: true, media_ms: 2_000.0, ended_tracks: ["t1"])
+      assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :plugin_ended}}
+      flush(ctx.agg, ctx.rec)
+
+      closed = Tracks.get(oid)
+      assert closed.ended_at != nil
+      assert closed.end_reason == :plugin_ended
+      # closed in place — the open and the close are the same row
+      assert Tracks.list(camera: ctx.camera_id).total == 1
+      assert [%{kind: :appeared}] = Tracks.moments(oid)
+    end
+
+    test "picks up a better score on the update the throttle releases", ctx do
+      observe(ctx.agg, ctx.camera, [object("person", 0.6, [0.1, 0.1, 0.2, 0.4], "t1")],
+        tracking: true
+      )
+
+      assert_receive {:track_started, %Track{object_id: oid}}
+      flush(ctx.agg, ctx.rec)
+      assert Tracks.get(oid).best_score == 0.6
+
+      # an improving `best_score` is exactly what `maybe_publish_update/3` lets
+      # through, so the row moves with the broadcast
+      observe(ctx.agg, ctx.camera, [object("person", 0.85, [0.3, 0.3, 0.2, 0.4], "t1")],
+        tracking: true,
+        media_ms: 1_500.0
+      )
+
+      assert_receive {:track_updated, %Track{object_id: ^oid, best_score: 0.85}}
+      flush(ctx.agg, ctx.rec)
+
+      row = Tracks.get(oid)
+      assert row.best_score == 0.85
+      assert row.exit_bbox == [0.3, 0.3, 0.2, 0.4]
+      assert row.ended_at == nil
+      assert Tracks.list(camera: ctx.camera_id).total == 1
+    end
+  end
+
+  describe "a track under the track: tier" do
+    setup ctx do
+      CameraControl.set(ctx.camera_id, %{recording_enabled: false})
+      camera = %{ctx.camera | track: %{"person" => %{min_score: 0.8}}}
+      %{ctx | camera: camera}
+    end
+
+    test "gets its row when its score first crosses, not before", ctx do
+      policy = tier(%{"person" => %{min_score: 0.8}})
+
+      observe(ctx.agg, ctx.camera, [object("person", 0.6, [0.1, 0.1, 0.2, 0.4], "t1")],
+        tracking: true,
+        policy: policy
+      )
+
+      assert_receive {:track_started, %Track{object_id: oid}}
+      flush(ctx.agg, ctx.rec)
+
+      # over the wire floor, under the tier: tracked, broadcast, not indexed
+      assert Tracks.get(oid) == nil
+
+      observe(ctx.agg, ctx.camera, [object("person", 0.85, [0.3, 0.3, 0.2, 0.4], "t1")],
+        tracking: true,
+        media_ms: 1_500.0,
+        policy: policy
+      )
+
+      assert_receive {:track_updated, %Track{object_id: ^oid, best_score: 0.85}}
+      flush(ctx.agg, ctx.rec)
+
+      row = Tracks.get(oid)
+      assert row
+      assert row.ended_at == nil
+      assert row.best_score == 0.85
+      # the moment buffered before it qualified is written with the row it
+      # finally earned, so the timeline starts where the track did
+      assert [%{kind: :appeared}] = Tracks.moments(oid)
+      assert row.entry_bbox == [0.1, 0.1, 0.2, 0.4]
+    end
+
+    test "gets one at exactly the threshold — the tier is a floor, not a bar to beat", ctx do
+      policy = tier(%{"person" => %{min_score: 0.8}})
+
+      observe(ctx.agg, ctx.camera, [object("person", 0.8, [0.1, 0.1, 0.2, 0.4], "t1")],
+        tracking: true,
+        policy: policy
+      )
+
+      assert_receive {:track_started, %Track{object_id: oid, best_score: 0.8}}
+      flush(ctx.agg, ctx.rec)
+
+      assert Tracks.get(oid)
+    end
+
+    test "keeps the row it earned when the tier moves out from under it", ctx do
+      # A camera reloaded mid-track, with a `track:` block that no longer lists
+      # "person". The row exists, so it must be closed rather than abandoned —
+      # nothing else would ever close it, and a live row outlives the host that
+      # forgot it.
+      observe(ctx.agg, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4], "t1")],
+        tracking: true,
+        policy: tier(nil)
+      )
+
+      assert_receive {:track_started, %Track{object_id: oid}}
+      flush(ctx.agg, ctx.rec)
+      assert Tracks.get(oid).ended_at == nil
+
+      excluding = %{"car" => %{min_score: 0.5}}
+      ctx = %{ctx | camera: %{ctx.camera | track: excluding}}
+
+      observe(ctx.agg, ctx.camera, [],
+        tracking: true,
+        media_ms: 2_000.0,
+        ended_tracks: ["t1"],
+        policy: tier(excluding)
+      )
+
+      assert_receive {:track_ended, %Track{object_id: ^oid}}
+      flush(ctx.agg, ctx.rec)
+
+      row = Tracks.get(oid)
+      assert row.ended_at != nil
+      assert row.end_reason == :plugin_ended
+    end
+
+    test "that never crosses it has no row, live or ended", ctx do
+      policy = tier(%{"person" => %{min_score: 0.8}})
+
+      for media_ms <- [1_000.0, 1_500.0] do
+        observe(ctx.agg, ctx.camera, [object("person", 0.6, [0.1, 0.1, 0.2, 0.4], "t1")],
+          tracking: true,
+          media_ms: media_ms,
+          policy: policy
+        )
+      end
+
+      assert_receive {:track_started, %Track{object_id: oid}}
+      flush(ctx.agg, ctx.rec)
+      assert Tracks.get(oid) == nil
+
+      observe(ctx.agg, ctx.camera, [],
+        tracking: true,
+        media_ms: 2_000.0,
+        ended_tracks: ["t1"],
+        policy: policy
+      )
+
+      assert_receive {:track_ended, %Track{object_id: ^oid}}
+      flush(ctx.agg, ctx.rec)
+
+      assert Tracks.get(oid) == nil
+      assert Tracks.moments(oid) == []
+      assert Tracks.list(camera: ctx.camera_id).total == 0
+    end
+  end
+
   # -- moments ----------------------------------------------------------------
 
   describe "timeline moments" do

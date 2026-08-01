@@ -316,11 +316,22 @@ defmodule Cairn.PluginProtocol do
   defp observed_at(frame) do
     with value when is_binary(value) <- Map.get(frame, "observed_at"),
          {:ok, datetime, _offset} <- DateTime.from_iso8601(value) do
-      {:ok, datetime}
+      {:ok, microsecond_precision(datetime)}
     else
       _other -> {:error, :invalid_observed_at}
     end
   end
+
+  # `DateTime.from_iso8601/1` keeps whatever precision the string carried, and
+  # the plugin writes three decimals — so a parsed `observed_at` is `{n, 3}`.
+  # It is the time every track index row is stamped with, and every datetime
+  # column there is `:utc_datetime_usec`, a type Ecto *refuses* to dump at any
+  # precision but 6 (`Ecto.Type.check_usec!` raises `ArgumentError`). A
+  # changeset would pad on cast, but `Cairn.Tracks` writes with `insert_all`,
+  # which dumps without casting. The count of microseconds is unchanged — only
+  # the declared precision moves — so this pads, it does not round.
+  defp microsecond_precision(%DateTime{microsecond: {value, _digits}} = datetime),
+    do: %{datetime | microsecond: {value, 6}}
 
   defp objects(msg) do
     case Map.get(msg, "objects") do

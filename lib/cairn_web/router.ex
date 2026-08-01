@@ -40,6 +40,7 @@ defmodule CairnWeb.Router do
     live "/", DashboardLive
     live "/events", EventsLive
     live "/events/:id", EventLive
+    live "/tracks", TracksLive
     live "/config", ConfigLive
   end
 

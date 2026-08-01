@@ -9,11 +9,17 @@ defmodule Cairn.TrackPathTest do
 
   alias Cairn.TrackPath
 
+  # The moduledoc's own example, so the format's documentation and the bytes
+  # this file pins are the same numbers. The two halves deliberately disagree:
+  # the drain half puts the event's t=0 at 0.0 s into the clip and the live half
+  # at 0.3 s, which is the 300 ms of in-flight fragment the drain could not see.
   @anchor %{
     first_pts: 1_234,
     timescale: 90_000,
     drained_span_ms: 4_800,
     drain_wall_ms: 1_700_000_000_000,
+    live_media_ms: 6_800,
+    live_wall_ms: 1_700_000_001_700,
     event_started_ms: 1_699_999_995_200
   }
 
@@ -56,6 +62,8 @@ defmodule Cairn.TrackPathTest do
                "timescale" => 90_000,
                "drained_span_ms" => 4_800,
                "drain_wall_ms" => 1_700_000_000_000,
+               "live_media_ms" => 6_800,
+               "live_wall_ms" => 1_700_000_001_700,
                "event_started_ms" => 1_699_999_995_200
              }
 
@@ -346,6 +354,102 @@ defmodule Cairn.TrackPathTest do
       # 0xD4 is fixext1: type byte then one data byte. Msgpax hands it back as
       # `%Msgpax.Ext{}`, which `%{}` would happily match — a struct is a map.
       assert TrackPath.decode(:zlib.gzip(<<0xD4, 0x00, 0x00>>)) == {:error, :malformed}
+    end
+  end
+
+  describe "anchor_clip_ms/2" do
+    # Every expectation below is arithmetic done here, not a call back into the
+    # module. @anchor's halves are 300 ms apart by construction, so which one
+    # answered is visible in the number rather than inferred from it.
+    #
+    #   drain: 4_800 + 1_699_999_995_200 − 1_700_000_000_000 =     0
+    #   live:  6_800 + 1_699_999_995_200 − 1_700_000_001_700 =   300
+    @stored Map.new(@anchor, fn {k, v} -> {to_string(k), v} end)
+
+    test "the live half is preferred when it is there" do
+      assert TrackPath.anchor_clip_ms(@stored, 0) == {:ok, 300}
+      assert TrackPath.anchor_clip_ms(@stored, 1_500) == {:ok, 1_800}
+    end
+
+    test "a missing live half falls through to the drain half" do
+      anchor = %{@stored | "live_media_ms" => nil, "live_wall_ms" => nil}
+
+      assert TrackPath.anchor_clip_ms(anchor, 0) == {:ok, 0}
+      assert TrackPath.anchor_clip_ms(anchor, 1_500) == {:ok, 1_500}
+    end
+
+    # A sidecar written before the live half existed: the two keys are absent
+    # from the map rather than nil. Old files are read by the same path.
+    test "an anchor that never had the live keys at all falls through" do
+      anchor = Map.drop(@stored, ["live_media_ms", "live_wall_ms"])
+
+      assert TrackPath.anchor_clip_ms(anchor, 1_500) == {:ok, 1_500}
+    end
+
+    test "half a live half is no live half" do
+      assert TrackPath.anchor_clip_ms(%{@stored | "live_wall_ms" => nil}, 0) == {:ok, 0}
+      assert TrackPath.anchor_clip_ms(%{@stored | "live_media_ms" => nil}, 0) == {:ok, 0}
+    end
+
+    # An ffmpeg respawn restarts pts under a `first_pts` from the old session,
+    # so the extractor's subtraction goes negative. The drain half is untouched
+    # by that and answers instead.
+    test "a negative live media position falls through rather than answering" do
+      anchor = %{@stored | "live_media_ms" => -2_000}
+
+      assert TrackPath.anchor_clip_ms(anchor, 0) == {:ok, 0}
+    end
+
+    # The line above is only the easy case: −2_000 drags the whole sum under
+    # zero, so the "not before the clip" rule would have caught it on its own.
+    # This is the case that needs the media position checked in its own right —
+    # a wall clock that sits *before* the event's start, which no fragment
+    # arrival can produce and only a wrong file can, adds back exactly as much
+    # as the position is short and lands on a plausible-looking number.
+    test "a negative media position is refused even when the sum comes out plausible" do
+      anchor = %{
+        @stored
+        | "live_media_ms" => -5_000,
+          "live_wall_ms" => @stored["event_started_ms"] - 10_000
+      }
+
+      # 5_000 is what an unchecked live half would answer here
+      assert TrackPath.anchor_clip_ms(anchor, 0) == {:ok, 0}
+    end
+
+    test "a half that places the time before the clip is not used" do
+      # started 30 s before the wall clock the media was paired with: whatever
+      # this file is, it is not this clip's.
+      wall = @stored["event_started_ms"] + 30_000
+      anchor = %{@stored | "live_wall_ms" => wall, "drain_wall_ms" => wall}
+
+      assert TrackPath.anchor_clip_ms(anchor, 0) == :error
+
+      # ...and the same anchor answers again once the time asked about is far
+      # enough into the event to land inside the clip after all.
+      assert TrackPath.anchor_clip_ms(anchor, 40_000) == {:ok, 16_800}
+    end
+
+    test "no anchor, no usable field, and a non-numeric time are all :error" do
+      assert TrackPath.anchor_clip_ms(nil, 0) == :error
+      assert TrackPath.anchor_clip_ms(%{}, 0) == :error
+      assert TrackPath.anchor_clip_ms(%{"event_started_ms" => 1_699_999_995_200}, 0) == :error
+      assert TrackPath.anchor_clip_ms(@stored, nil) == :error
+      assert TrackPath.anchor_clip_ms(@stored, "0") == :error
+    end
+
+    test "a non-numeric field is refused rather than added" do
+      assert TrackPath.anchor_clip_ms(%{@stored | "live_media_ms" => "6800"}, 0) == {:ok, 0}
+      assert TrackPath.anchor_clip_ms(%{@stored | "event_started_ms" => nil}, 0) == :error
+    end
+
+    # The one test that crosses the writer and the reader: `encode/2` names the
+    # fields and this function looks them up, and nothing else in the suite
+    # would notice a key renamed in both halves of one file.
+    test "reads the keys encode/2 actually writes" do
+      map = roundtrip(header(%{anchor: @anchor}), [{0, [{"a", "person", @still, false}]}])
+
+      assert TrackPath.anchor_clip_ms(map["anchor"], 0) == {:ok, 300}
     end
   end
 

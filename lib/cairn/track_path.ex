@@ -19,11 +19,14 @@ defmodule Cairn.TrackPath do
   path `Cairn.DataDir.trackpath_for_clip/1` derives, holding the box of every
   tagged observation seen while the event was open.
 
-  This module is the format's single source of truth. The reader that matters
-  is a browser, which cannot share this code — it re-implements the arithmetic
-  below in JavaScript — so the layout is a contract between two
-  implementations rather than an internal detail of one, and it is written
-  down here because there is nowhere else it could be.
+  This module is the format's single source of truth. The reader that draws the
+  boxes is a browser, which cannot share this code:
+  `assets/js/hooks/track_overlay.js` re-implements the arithmetic below in
+  JavaScript. The layout is therefore a contract between two implementations
+  rather than an internal detail of one — a change here is a change there — and
+  it is written down here because there is nowhere else it could be.
+  (`Cairn.Snapshot.clip_seek/2` reads the header too, through `decode/1`, for
+  the anchor alone.)
 
   Per-frame boxes and track identity meet in exactly one place in this system,
   `Cairn.Tracker`'s `tagged` list; every consumer downstream of it sees one or
@@ -46,6 +49,8 @@ defmodule Cairn.TrackPath do
           "first_pts" => 1_234, "timescale" => 90_000,
           "drained_span_ms" => 4_800,
           "drain_wall_ms" => 1_700_000_000_000,
+          "live_media_ms" => 6_800,
+          "live_wall_ms" => 1_700_000_001_700,
           "event_started_ms" => 1_699_999_995_200
         },
         "ts" => [0, 400, 100, ...],
@@ -61,14 +66,66 @@ defmodule Cairn.TrackPath do
   module's: that track had more kept samples than the per-track cap below.
   Both are plain booleans and neither implies the other.
 
-  `"anchor"` is the clip's time-zero as the writer knew it: the pts and
-  timescale the clip's first fragment carried, the media span of the drained
-  pre-roll, and the wall clock at the instant that drain returned. Together
-  with `"event_started_ms"` they map an event-relative `"ts"` onto a position
-  in the clip. The whole map is `nil` when the writer had no anchor to offer,
-  and each field is `nil`-able on its own; a consumer that finds one missing
-  falls back to the `duration − event_seconds` pre-roll estimate the event
-  timeline already uses.
+  `"anchor"` is the clip's time-zero as the writer knew it, in two halves that
+  pair a media position with a wall clock. The **drain half** — `"first_pts"`,
+  `"timescale"`, `"drained_span_ms"`, `"drain_wall_ms"` — is what the extractor
+  had in hand when it drained the ring's pre-window. The **live half** —
+  `"live_media_ms"`, `"live_wall_ms"` — is the position the first fragment to
+  arrive *live* ends at, against the wall clock at its arrival.
+  `"event_started_ms"` belongs to both.
+
+  Either half maps an event-relative `"ts"` onto a position in the clip, by the
+  same arithmetic:
+
+      clip_seconds = (media_ms + event_started_ms − wall_ms + ts) / 1000
+
+  — a known media position, shifted by where the event's own start falls
+  relative to the wall instant that position was paired with.
+
+  A reader tries the live half first and falls back to the drain half, because
+  the two pairings are not equally tight. A fragment reaches the extractor once
+  it is *complete*, so `"live_wall_ms"` trails the media at `"live_media_ms"`
+  by the transport and the demux alone. `"drain_wall_ms"` trails the media at
+  `"drained_span_ms"` by that plus however much of the next fragment ffmpeg had
+  accumulated and not yet written — up to one `-frag_duration` (~2 s), wherever
+  the boundary happened to fall. That surplus is time the drain half does not
+  know about, so it places every observation that much too early, which a
+  viewer sees as boxes running ahead of what they are drawn around.
+
+  `anchor_clip_ms/2` is that preference order for Elixir readers — it is where
+  `Cairn.Snapshot.clip_seek/2` sends its anchor rather than choosing a half
+  itself; `assets/js/hooks/track_overlay.js` re-implements it. Both require a
+  half's
+  three fields to be numbers and its media position to be non-negative, and a
+  half that fails either is skipped for the one below it.
+
+  Where they part is what counts as an impossible answer, because they know
+  different things. `anchor_clip_ms/2` refuses a position before the start of
+  the clip and has no opinion about the end: its caller has the file and can
+  clamp. The overlay has the `<video>` element, so it refuses a half that puts
+  the event's t=0 past the end of the video, and it tolerates up to a second
+  before the start — clamping that to zero rather than falling back, since a
+  fraction of a second out is still far better than the estimate below it.
+
+  `"first_pts"` and `"timescale"` take no part in either mapping; they are
+  carried so a reader can relate the same position to the clip's own media
+  clock without re-probing the file.
+
+  The whole map is `nil` when the writer had no anchor to offer, and each field
+  is `nil`-able on its own: an event that finalized before any fragment arrived
+  live has no live half, a camera whose ring had not filled has no drained
+  span, and a file written before either half existed has neither. A consumer
+  left with no usable half falls back to a pre-roll estimate of its own —
+  `duration − event_seconds` for the event timeline, the *configured*
+  pre-window for `Cairn.Snapshot`.
+
+  Neither half is exact. The live one still carries whatever the camera, the
+  transport and the demux cost between a frame being exposed and its fragment
+  arriving at the extractor — on the order of 100 ms, roughly constant for a
+  given setup, and in the same direction (boxes ahead of the subject). Nothing
+  corrects for it. If it ever earns a constant, this is where the decision
+  belongs, applied in `anchor_clip_ms/2` and mirrored in the overlay, rather
+  than tuned separately in each reader.
 
   ## Coordinates
 
@@ -225,6 +282,62 @@ defmodule Cairn.TrackPath do
     end
   end
 
+  @doc """
+  Places an event-relative time on the clip's own timeline, from a decoded
+  anchor: `{:ok, clip_ms}`, or `:error` when the anchor cannot place it.
+
+  `anchor` is the `"anchor"` value `decode/1` returns — string keys, `nil`
+  included — and `t_ms` is a time in the same milliseconds-since-`started_at`
+  the `"ts"` column is in. Passing `0` yields where the event's t=0 sits inside
+  the clip, which is the form a reader stepping through many samples wants.
+
+  The live half is preferred over the drain half and the reasons are in the
+  moduledoc's anchor section; each half is used only if its three fields are
+  numbers, its media position is not negative, and the position it produces is
+  not before the start of the clip. A half that fails any of those is skipped,
+  so a live half spoiled by an ffmpeg respawn (`pts` restarts, the difference
+  goes negative) still leaves the drain half to answer.
+
+  `:error` is the caller's cue to use whatever pre-roll estimate it has; it is
+  never a reason to refuse to draw or to seek. Nothing here raises: the anchor
+  arrives off disk, so a value of the wrong type anywhere in it — or in `t_ms`,
+  which the spec asks for a number of and this does not trust to be one — is
+  `:error` like any other unusable half.
+  """
+  @spec anchor_clip_ms(map() | nil, number()) :: {:ok, number()} | :error
+  def anchor_clip_ms(anchor, t_ms)
+
+  def anchor_clip_ms(%{} = anchor, t_ms) when is_number(t_ms) do
+    started_ms = Map.get(anchor, "event_started_ms")
+
+    with :error <-
+           place(
+             Map.get(anchor, "live_media_ms"),
+             Map.get(anchor, "live_wall_ms"),
+             started_ms,
+             t_ms
+           ) do
+      place(
+        Map.get(anchor, "drained_span_ms"),
+        Map.get(anchor, "drain_wall_ms"),
+        started_ms,
+        t_ms
+      )
+    end
+  end
+
+  def anchor_clip_ms(_no_anchor, _t_ms), do: :error
+
+  defp place(media_ms, wall_ms, started_ms, t_ms)
+       when is_number(media_ms) and media_ms >= 0 and is_number(wall_ms) and is_number(started_ms) do
+    case media_ms + started_ms - wall_ms + t_ms do
+      clip_ms when clip_ms >= 0 -> {:ok, clip_ms}
+      _before_the_clip -> :error
+    end
+  end
+
+  defp place(_media_ms, _wall_ms, _started_ms, _t_ms), do: :error
+
   defp gunzip(binary) do
     {:ok, :zlib.gunzip(binary)}
   rescue
@@ -363,7 +476,8 @@ defmodule Cairn.TrackPath do
 
   # Every field is read with `Map.get/2`: a caller that could only capture some
   # of the anchor writes `nil` for the rest rather than no anchor at all, which
-  # is what lets a reader mix a media-domain field with a wall-clock fallback.
+  # is what lets `anchor_clip_ms/2` fall from a half that is missing to one that
+  # is there. A sidecar written before a field existed reads the same way.
   defp anchor(nil), do: nil
 
   defp anchor(%{} = fields) do
@@ -372,6 +486,8 @@ defmodule Cairn.TrackPath do
       "timescale" => Map.get(fields, :timescale),
       "drained_span_ms" => Map.get(fields, :drained_span_ms),
       "drain_wall_ms" => Map.get(fields, :drain_wall_ms),
+      "live_media_ms" => Map.get(fields, :live_media_ms),
+      "live_wall_ms" => Map.get(fields, :live_wall_ms),
       "event_started_ms" => Map.get(fields, :event_started_ms)
     }
   end

@@ -4,6 +4,13 @@ defmodule CairnWeb.EventsLive do
   contracts preserved: `phx-change="filter"` form (camera/label/from/to),
   streams container `#events-list` with `phx-update="stream"`,
   `phx-click="page"` pagination.
+
+  It is also where the design helpers `CairnWeb.EventLive` and
+  `CairnWeb.TracksLive` share live — label chips and colours, `fmt_time/1`,
+  `fmt_duration/1`, and `track_color/2`, whose output the event page's canvas
+  overlay has to agree with. They are public functions on this LiveView rather
+  than a component module because this is the page they were written for; the
+  "shared design helpers" section marks them.
   """
 
   use CairnWeb, :live_view
@@ -185,48 +192,97 @@ defmodule CairnWeb.EventsLive do
     Enum.any?([filters.camera, filters.label, filters.from, filters.to], &(&1 != ""))
   end
 
-  # -- shared design helpers (also used by EventLive) -------------------------
+  # -- shared design helpers (also used by EventLive and TracksLive) ----------
 
   @doc false
   def label_chip_style(label) do
-    {bg, color} =
+    bg =
       case label do
-        "person" -> {"var(--hs-accent-soft)", "var(--hs-blue-300)"}
-        "car" -> {"var(--hs-success-soft)", "var(--hs-success)"}
-        "cat" -> {"rgba(139,92,246,0.14)", "var(--hs-purple-500)"}
-        "dog" -> {"rgba(236,72,153,0.14)", "var(--hs-pink-500)"}
-        "package" -> {"var(--hs-warning-soft)", "var(--hs-warning)"}
-        _ -> {"var(--hs-accent-soft)", "var(--hs-blue-300)"}
+        "car" -> "var(--hs-success-soft)"
+        "cat" -> "rgba(139,92,246,0.14)"
+        "dog" -> "rgba(236,72,153,0.14)"
+        "package" -> "var(--hs-warning-soft)"
+        _person_or_unknown -> "var(--hs-accent-soft)"
       end
 
     "display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; " <>
       "border-radius: 6px; font-size: 12px; font-weight: 500; " <>
-      "font-variant-numeric: tabular-nums; background: #{bg}; color: #{color};"
+      "font-variant-numeric: tabular-nums; background: #{bg}; color: #{label_color(label)};"
   end
 
   @doc false
-  def label_color(label) do
-    case label do
-      "person" -> "var(--hs-blue-300)"
-      "car" -> "var(--hs-success)"
-      "cat" -> "var(--hs-purple-500)"
-      "dog" -> "var(--hs-pink-500)"
-      "package" -> "var(--hs-warning)"
-      _ -> "var(--hs-blue-300)"
-    end
+  def label_color(label), do: "var(#{elem(chip_hue(label), 0)})"
+
+  # The chip hue as both the token a stylesheet wants and the literal a canvas
+  # needs: `<canvas>` has no cascade, so `TrackOverlay` cannot be handed
+  # `var(--hs-blue-300)` and must be given #5fc0f5. Declaring the pair once is
+  # what keeps the box on the video the same colour as the chip beside it — the
+  # dark-theme values live in `assets/css/design.css`.
+  @chip_hue %{
+    "person" => {"--hs-blue-300", "#5fc0f5"},
+    "car" => {"--hs-success", "#5ed08a"},
+    "cat" => {"--hs-purple-500", "#8b5cf6"},
+    "dog" => {"--hs-pink-500", "#ec4899"},
+    "package" => {"--hs-warning", "#f5ba49"}
+  }
+
+  # Per label, three steps around that hue. An object's colour is
+  # `palette[label][nth % 3]`, so colour still *means* label at a glance while
+  # two people in one frame stay apart.
+  @track_palette %{
+    "person" => ["#5fc0f5", "#29ade9", "#9fd8f8"],
+    "car" => ["#5ed08a", "#2fb866", "#8fe0ac"],
+    "cat" => ["#a78bfa", "#8b5cf6", "#c4b5fd"],
+    "dog" => ["#f472b6", "#ec4899", "#f9a8d4"],
+    "package" => ["#f5ba49", "#f0a818", "#f8cd77"]
+  }
+
+  # Compile-time pairing: a palette must contain its own chip hue, so the two
+  # maps above cannot drift into a swatch that is no shade of the label's chip.
+  # Which step holds it varies — person, car and package sit at 0, cat and dog
+  # at 1 — which is why this is checked rather than assumed.
+  for {label, {_var, hex}} <- @chip_hue do
+    steps = Map.fetch!(@track_palette, label)
+
+    hex in steps ||
+      raise "track palette for #{label} does not contain its chip hue #{hex}: #{inspect(steps)}"
+  end
+
+  defp chip_hue(label), do: Map.get(@chip_hue, label) || Map.fetch!(@chip_hue, "person")
+
+  @doc """
+  One tracked object's colour, as a literal hex: the label's hue varied by
+  `nth`, the object's ordinal among same-label tracks on the same clip.
+
+  The single source for both the panel swatch and the canvas box — they take
+  the same `(label, nth)` and must not disagree. An unknown or `nil` label
+  borrows the person palette, exactly as `label_color/1` does.
+  """
+  @spec track_color(String.t() | nil, non_neg_integer()) :: String.t()
+  def track_color(label, nth) do
+    steps = Map.get(@track_palette, label) || Map.fetch!(@track_palette, "person")
+    Enum.at(steps, rem(nth, 3))
   end
 
   @doc false
   def fmt_time(%DateTime{} = dt), do: Calendar.strftime(dt, "%b %-d, %H:%M:%S")
 
-  @doc false
+  @doc """
+  A span as "45s" / "3m 20s" / "2h 28m", from anything with `:started_at` and
+  `:ended_at`; "—" when there is no end.
+
+  The hours form matters beyond this page: `max_event_seconds` reaches 86,400,
+  and a track can stay in frame (a parked car) for far longer than the clip that
+  caught it — `CairnWeb.TracksLive` renders every track duration through here,
+  passing `now` as `:ended_at` for a track that has not ended yet.
+  """
   def fmt_duration(%{started_at: s, ended_at: %DateTime{} = e}) do
     total = max(DateTime.diff(e, s), 0)
 
-    if total >= 60 do
-      "#{div(total, 60)}m #{rem(total, 60)}s"
-    else
-      "#{total}s"
+    cond do
+      total >= 3600 -> "#{div(total, 3600)}h #{div(rem(total, 3600), 60)}m"
+      total >= 60 -> "#{div(total, 60)}m #{rem(total, 60)}s"
+      true -> "#{total}s"
     end
   end
 

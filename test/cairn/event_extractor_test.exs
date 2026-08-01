@@ -581,17 +581,18 @@ defmodule Cairn.EventExtractorTest do
     defp pre_roll(frags), do: Enum.slice(frags, 1, 2)
 
     # Drives one event to finalized with `batches` cast in as the aggregator
-    # would, returning `%{path:, event:, opened_ms:}`.
+    # would, returning `%{path:, event:, opened_ms:, live_ms:}`.
     #
     # `opts` may carry `pre_roll: false` (start with an empty ring),
-    # `max_path_entries:` (passed to the extractor), and `on_clip_ready:`, a
-    # one-arity fun handed the clip path at the moment the artifact frame
-    # arrives and *before* `:DOWN` — the only window in which the sidecar
-    # write's ordering against the broadcast is observable at all.
+    # `live:` (fragments put into the ring *after* the extractor subscribed,
+    # so they reach it as live ones), `max_path_entries:` (passed to the
+    # extractor), and `on_clip_ready:`, a one-arity fun handed the clip path at
+    # the moment the artifact frame arrives and *before* `:DOWN` — the only
+    # window in which the sidecar write's ordering against the broadcast is
+    # observable at all.
     defp run_with_boxes(camera, config, frags, batches, opts \\ []) do
-      if Keyword.get(opts, :pre_roll, true) do
-        Enum.each(pre_roll(frags), &RingBuffer.put_fragment(camera.id, &1))
-      end
+      drained = if Keyword.get(opts, :pre_roll, true), do: pre_roll(frags), else: []
+      Enum.each(drained, &RingBuffer.put_fragment(camera.id, &1))
 
       event = new_event(camera)
 
@@ -610,7 +611,7 @@ defmodule Cairn.EventExtractorTest do
       # `wait_row/1` alone proves nothing about the drain. This sync does: a
       # system message is only answered once the continue has returned, so the
       # anchor's wall clock was read strictly before the mark below.
-      _ = :sys.get_state(pid)
+      drained_count = :sys.get_state(pid).fragments
       opened_ms = DateTime.to_unix(DateTime.utc_now(), :millisecond)
 
       # Not a poll and not a settle for a race: this sleep *is* the instrument
@@ -619,6 +620,16 @@ defmodule Cairn.EventExtractorTest do
       # from a clock read in the finalize handler is real elapsed time between
       # the mark above and the finalize below. Opt-in, so one test pays for it.
       if settle = opts[:settle_ms], do: Process.sleep(settle)
+
+      # The same instrument, for the live half of the anchor: the mark is taken
+      # after the drain has provably returned, so a `live_wall_ms` at or after
+      # it cannot be the clock the drain read. The wait counts up from what the
+      # drain wrote — a camera whose ring still holds an earlier test's
+      # fragments drains more than `pre_roll/1` put there.
+      live = Keyword.get(opts, :live, [])
+      live_ms = DateTime.to_unix(DateTime.utc_now(), :millisecond)
+      Enum.each(live, &RingBuffer.put_fragment(camera.id, &1))
+      wait_until(fn -> :sys.get_state(pid).fragments == drained_count + length(live) end)
 
       Enum.each(batches, &GenServer.cast(pid, {:track_boxes, &1}))
 
@@ -635,7 +646,7 @@ defmodule Cairn.EventExtractorTest do
 
       assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 10_000
 
-      %{path: path, event: event, opened_ms: opened_ms}
+      %{path: path, event: event, opened_ms: opened_ms, live_ms: live_ms}
     end
 
     defp sidecar!(clip_path) do
@@ -689,7 +700,12 @@ defmodule Cairn.EventExtractorTest do
       assert %{
                "first_pts" => @first_pts,
                "timescale" => @timescale,
-               "drained_span_ms" => @drained_span_ms
+               "drained_span_ms" => @drained_span_ms,
+               # No fragment arrived after the subscribe, so the live half was
+               # never taken — the shape a reader must fall back from, and the
+               # shape every sidecar written before it existed has.
+               "live_media_ms" => nil,
+               "live_wall_ms" => nil
              } = map["anchor"]
 
       assert map["anchor"]["event_started_ms"] ==
@@ -701,6 +717,86 @@ defmodule Cairn.EventExtractorTest do
       # it is read *at* the drain.
       assert map["anchor"]["drain_wall_ms"] >= before_ms
       assert map["anchor"]["drain_wall_ms"] <= opened_ms
+    end
+
+    test "the first live fragment adds the sharper half of the anchor",
+         %{camera: camera, config: config, frags: frags} do
+      # Pre-roll is frags 1 and 2 (pts 10_240 and 20_480); frag 3 arrives live
+      # at pts 30_720. Its end on the clip's timeline, by hand:
+      #   (30_720 − 10_240) / 10_240 × 1000 = 2_000 ms from the clip's t=0 to
+      #   this fragment's start, plus its own 1_000 ms to its end.
+      %{path: path, live_ms: live_ms} =
+        run_with_boxes(
+          camera,
+          config,
+          frags,
+          [%{t_ms: 0, boxes: [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], false}]}],
+          live: [Enum.at(frags, 3)],
+          settle_ms: 25
+        )
+
+      anchor = sidecar!(path)["anchor"]
+
+      assert anchor["live_media_ms"] == 3_000
+
+      # The 25 ms settle sits between the drain and the mark, so a live clock
+      # read at the drain — the bug this half exists to fix — lands below it.
+      assert anchor["live_wall_ms"] >= live_ms
+      assert anchor["live_wall_ms"] > anchor["drain_wall_ms"]
+
+      # and the drain half is still written beside it, not replaced by it
+      assert anchor["drained_span_ms"] == @drained_span_ms
+      assert anchor["first_pts"] == @first_pts
+    end
+
+    test "only the first live fragment sets it, not every one after",
+         %{camera: camera, config: config, frags: frags} do
+      # frags 3 and 4, in that order. Were the anchor re-taken per fragment,
+      # frag 4 (pts 40_960) would leave 4_000 here instead of 3_000, and a
+      # later clock with it.
+      %{path: path} =
+        run_with_boxes(
+          camera,
+          config,
+          frags,
+          [%{t_ms: 0, boxes: [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], false}]}],
+          live: [Enum.at(frags, 3), Enum.at(frags, 4)]
+        )
+
+      assert sidecar!(path)["anchor"]["live_media_ms"] == 3_000
+    end
+
+    test "with no pre-roll drained, the first live fragment is the clip's t=0",
+         %{camera: camera, config: config, frags: frags} do
+      # Nothing in the ring, so frag 3 is the first thing written after the
+      # init segment: the clip is rebased to *its* pts, and its own 1_000 ms is
+      # the whole of the media before its end. Reading its pts as an offset
+      # instead would put 4_000 here.
+      %{path: path} =
+        run_with_boxes(
+          camera,
+          config,
+          frags,
+          [%{t_ms: 0, boxes: [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], false}]}],
+          pre_roll: false,
+          live: [Enum.at(frags, 3)]
+        )
+
+      anchor = sidecar!(path)["anchor"]
+
+      assert anchor["live_media_ms"] == 1_000
+      assert anchor["drained_span_ms"] == nil
+
+      # The whole point of the case: with only a drain half this file placed
+      # nothing at all — `drained_span_ms` is the field the arithmetic needs —
+      # and the live half is what makes it placeable.
+      drain_only = Map.drop(anchor, ["live_media_ms", "live_wall_ms"])
+      assert Cairn.TrackPath.anchor_clip_ms(drain_only, 5_000) == :error
+      assert {:ok, clip_ms} = Cairn.TrackPath.anchor_clip_ms(anchor, 5_000)
+      # 5_000 shifted by the sub-second gap between the event's start and the
+      # fragment's arrival — a bound and not a literal, because that gap is
+      # real elapsed time.
+      assert clip_ms > 4_000
     end
 
     test "the sidecar is on disk before event_clip_ready goes out",
@@ -730,9 +826,10 @@ defmodule Cairn.EventExtractorTest do
       )
     end
 
-    test "an empty pre-roll leaves the anchor's media half nil and the clocks set",
+    test "an empty pre-roll and no live fragment leaves both media positions nil",
          %{camera: camera, config: config, frags: frags} do
-      # Nothing put into the ring: a camera whose pre-window has not filled yet.
+      # Nothing put into the ring and nothing arriving after: a camera whose
+      # pre-window has not filled yet, on an event too short to see a fragment.
       # The browser's documented fallback (`duration − event_seconds`) exists
       # for exactly this file, so the nils have to be real.
       %{path: path, event: event} =
@@ -749,11 +846,17 @@ defmodule Cairn.EventExtractorTest do
                "timescale" => nil,
                "drained_span_ms" => nil,
                "drain_wall_ms" => drain_wall_ms,
+               "live_media_ms" => nil,
+               "live_wall_ms" => nil,
                "event_started_ms" => event_started_ms
              } = sidecar!(path)["anchor"]
 
       assert is_integer(drain_wall_ms)
       assert event_started_ms == DateTime.to_unix(event.started_at, :millisecond)
+
+      # Two wall clocks and not one media position between them: nothing here
+      # can place a path, and a reader has to say so rather than guess.
+      assert Cairn.TrackPath.anchor_clip_ms(sidecar!(path)["anchor"], 0) == :error
     end
 
     test "an event that saw no boxes writes no file at all",

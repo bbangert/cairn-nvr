@@ -2,18 +2,22 @@ defmodule Cairn.Retention do
   @moduledoc """
   Two periodic sweeps over the stored history:
 
-    * **Retention prune** (hourly): deletes clip + snapshot + row once an
-      event outlives its effective retention — the max of the per-label
-      overrides for labels present in the event (camera-level overrides
-      win over globals, see `Cairn.Config.retention_days/3`). The same pass
-      then expires track rows on their own, much longer clock
-      (`retention.tracks_days`), which has no per-camera or per-label form.
+    * **Retention prune** (hourly): deletes clip + snapshot + track-path
+      sidecar + row (`Cairn.Events.delete/1`) once an event outlives its
+      effective retention — the max of the per-label overrides for labels
+      present in the event (camera-level overrides win over globals, see
+      `Cairn.Config.retention_days/3`). The same pass then expires track rows
+      on their own, much longer clock (`retention.tracks_days`), which has no
+      per-camera or per-label form.
     * **Emergency disk cleanup** (every 60s): when free space under
       `data_dir` drops below `free_space_min_mb`, deletes oldest events
       regardless of retention until above the threshold, and broadcasts a
       persistent alert on `"system:alerts"` (`{:disk_alert, %{active:
-      boolean, free_mb: n, threshold_mb: n}}`). Tracks are never touched by
-      this path.
+      boolean, free_mb: n, threshold_mb: n}}`).
+
+  Track *rows* are never touched by the emergency path, and outlive the clips
+  either way. A clip's bbox sidecar is not a row: it is part of the event's
+  media and goes whenever the event does, by either sweep.
   """
 
   use GenServer
@@ -124,7 +128,11 @@ defmodule Cairn.Retention do
   # Track rows run on their own clock, off the same `now` as the event sweep so
   # one pass has one notion of the present. Live tracks are never eligible
   # however old they are — `delete_ended_before/1` compares `ended_at`, which is
-  # NULL until a track finishes. Moments go with their track by cascade.
+  # NULL from the instant a row is opened until the track finishes. That is a
+  # real state and not a transient one: a row outlives the host that opened it,
+  # and what makes such a row collectable again is
+  # `Cairn.Tracks.close_live/0` at the next boot, not anything here. Moments go
+  # with their track by cascade.
   defp prune_tracks(config, now) do
     count =
       now
@@ -160,8 +168,9 @@ defmodule Cairn.Retention do
 
   # -- emergency --------------------------------------------------------------
 
-  # Clips only, deliberately: this path deletes events and never tracks. A
-  # track row is a few hundred bytes against megabytes for a clip, so pruning
+  # Clips only, deliberately: this path deletes events — clip, snapshot and
+  # bbox sidecar with them — and never track rows. A track row is a few hundred
+  # bytes against megabytes for a clip, so pruning
   # tracks would reclaim nothing worth having while destroying the audit record
   # — "what did the system see and not record?" — that is the reason to keep
   # them past the clips at all. If deleting every event still leaves the disk

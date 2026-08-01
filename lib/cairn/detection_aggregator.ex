@@ -48,13 +48,20 @@ defmodule Cairn.DetectionAggregator do
   flip up to a second after this module has already acted on it.
 
   The same lifecycle feeds the track index through `Cairn.TrackRecorder`:
-  `:appeared` and the stationary flips are buffered as timeline moments, and a
-  finished track is handed over as a row. Everything sent there is a cast —
-  this process never touches `Cairn.Repo` on the detection path. A track live
-  during an open event is recorded unconditionally with that event's id; only a
-  track no event was open for is gated on the camera's `track:` tier (see
-  `record_final/3`). Recording being disabled at runtime does not enter into
-  it: rows without video are the point of the two tiers.
+  `:appeared` and the stationary flips are buffered as timeline moments, and
+  the track itself is handed over in three kinds of write — opened as a live
+  row the moment it first passes the camera's `track:` tier, refreshed on every
+  update the throttle lets through, and closed when it ends. Everything sent
+  there is a cast — this process never touches `Cairn.Repo` on the detection
+  path.
+
+  The tier alone gates *opening* a row, so a track that never reaches it never
+  has one while it runs. What ends up in the table is gated more loosely, and
+  deliberately: at the end a track live during an open event is recorded
+  unconditionally with that event's id, and so is one that already has a row,
+  whatever the tier says by then (see `record_final/3`). Recording being
+  disabled at runtime does not enter into it: rows without video are the point
+  of the two tiers.
 
   While an event is open, the tagged boxes of every batch are also cast to
   that event's `Cairn.EventExtractor`, which buffers them and writes the dense
@@ -278,6 +285,12 @@ defmodule Cairn.DetectionAggregator do
   # stationary objects kept — because what earns video is a different question
   # from what is drawn over video already recorded, and a path with holes in it
   # reads as a second object rather than as a gap.
+  #
+  # The one gap left is upstream: a box `Cairn.Tracker` refused and suppressed
+  # as a duplicate never reaches `tagged` at all, and cannot, because it has no
+  # `object_id` to draw it under. That is the trade the tracker makes on
+  # purpose — a gap in one path, rather than a second path over the same
+  # object for as long as the duplicate identity lives.
   #
   # **Ordering dependency.** "No last batch is lost" rests on one fact: this
   # cast and the finalize cast in `maybe_finalize/4` share a sender *and* a
@@ -565,19 +578,33 @@ defmodule Cairn.DetectionAggregator do
     end)
   end
 
-  # Whether a finished track earns a row, and with which event.
+  # Whether a finished track's row is closed or its buffer thrown away, and
+  # with which event.
   #
   # **An open event records the track unconditionally.** Every track live
-  # during a clip is then queryable from that clip by construction, which is
-  # the audit invariant the table exists for: without it a camera whose
-  # `record:` block admits a label its `track:` block excludes would produce
-  # clips whose contents cannot be enumerated — a cat that triggers a clip
-  # through an absent `record:` block would have no row while the video of it
-  # sits on disk.
+  # during a clip therefore has a row, which is the audit property the table
+  # exists for: without it a camera whose `record:` block admits a label its
+  # `track:` block excludes would produce clips whose contents cannot be
+  # enumerated — a cat that triggers a clip through an absent `record:` block
+  # would have no row while the video of it sits on disk.
   #
-  # The `track:` tier gates only the tracks no event was open for — the audit
-  # trail of what the system saw and did not record, where the tier is the
-  # knob for how much of it to keep.
+  # A row, not a link: `event_id` only names the event open at the instant the
+  # track ended, so a track that outlives the clip it appeared in carries nil
+  # or the *next* event's id. Reading a clip's contents back is a time-overlap
+  # query (`Cairn.Tracks.overlapping_event/3`) for exactly that reason.
+  #
+  # At the end, the `track:` tier gates only the tracks no event was open for —
+  # the audit trail of what the system saw and did not record, where the tier is
+  # the knob for how much of it to keep.
+  #
+  # *Opening* a row is gated by the tier alone, event or no event (see
+  # `record_live/3`), and the two gates are deliberately not the same. A track
+  # under its camera's `track:` tier that is live during a clip therefore has no
+  # row while it runs and gets one here, when it ends: the audit property is
+  # about what the table says once a clip is complete, and the alternative —
+  # opening a row for every object in frame during a recording — would put rows
+  # in the index that the tier exists to keep out for as long as the event
+  # happened to be open.
   #
   # Every end reason goes through the same rule. `:evicted`, `:stream_reset`,
   # `:detection_disabled` and `:host_restart` are the reasons a reader is most
@@ -594,26 +621,38 @@ defmodule Cairn.DetectionAggregator do
     TrackRecorder.record_final(state.recorder, track, event_id)
   end
 
+  # A track that already has a row is closed whatever the tier answers now.
+  # The two are usually the same answer — `best_score` only grows, so a track
+  # that crossed its threshold is still over it — but not always: a camera's
+  # policy can be refreshed mid-track, and a track's label follows its latest
+  # detection, so either can move the tier out from under a row that exists.
+  # Leaving that row open would strand it as live until the next boot, and
+  # deleting it is not on offer here (this process makes no Repo call). Closing
+  # it is the only answer that leaves the table describing what happened.
   defp record_final(cam, track, state) do
-    # Belt and braces on the cached pair: every path that can produce a live
-    # track today has been through `process_detections/5`, which caches both —
-    # a tracker only exists on a camera that has had a detection. An end path
-    # that ever skips it must not silently exclude the track, so an absent
-    # policy is read as an absent `track:` block, i.e. the label's wire floor
-    # off a default camera.
+    if rowed?(cam, track.object_id) or qualifies?(cam, track) do
+      TrackRecorder.record_final(state.recorder, track, nil)
+    else
+      TrackRecorder.discard(state.recorder, track.object_id)
+    end
+  end
+
+  # The `track:` tier, resolved for one track. The gate on opening a row and,
+  # for a track that never opened one, on writing it at the end.
+  #
+  # Belt and braces on the cached pair: every path that can produce a live
+  # track today has been through `process_detections/5`, which caches both —
+  # a tracker only exists on a camera that has had a detection. An end path
+  # that ever skips it must not silently exclude the track, so an absent
+  # policy is read as an absent `track:` block, i.e. the label's wire floor
+  # off a default camera.
+  defp qualifies?(cam, track) do
     camera = cam.camera || %Config.Camera{id: track.camera_id}
     tier = cam.policy && Map.get(cam.policy, :track)
 
     case Config.tier_threshold(tier, track.label, camera.min_score) do
-      :excluded ->
-        TrackRecorder.discard(state.recorder, track.object_id)
-
-      threshold when is_number(threshold) ->
-        if track.best_score >= threshold do
-          TrackRecorder.record_final(state.recorder, track, nil)
-        else
-          TrackRecorder.discard(state.recorder, track.object_id)
-        end
+      :excluded -> false
+      threshold when is_number(threshold) -> track.best_score >= threshold
     end
   end
 
@@ -634,10 +673,56 @@ defmodule Cairn.DetectionAggregator do
     end
   end
 
+  # The throttle's bookkeeping, and with it the track index's live row: every
+  # call here is a moment a `%Track{}` went out on the wire — a mint, a
+  # stationary flip, or an update the throttle released — so writing the row
+  # from here gives it the rhythm of the broadcast rather than of the frame
+  # rate. Nothing on this path touches the database — `Cairn.TrackRecorder`
+  # takes casts and batches them.
+  #
+  # `rowed?` is this process's memory of having opened one. It is not
+  # authoritative — the recorder owns that, and refuses an update for an id it
+  # does not know — but it is what keeps the tier from being re-asked per
+  # update, and what tells `record_final/3` that a row is out there needing to
+  # be closed.
   defp note_update(cam, track, state) do
-    entry = %{at: state.monotonic_ms.(), best_score: track.best_score}
+    rowed? = record_live(cam, track, state)
+    entry = %{at: state.monotonic_ms.(), best_score: track.best_score, rowed?: rowed?}
     %{cam | track_updates: Map.put(cam.track_updates, track.object_id, entry)}
   end
+
+  # A track's row is opened by the first update that finds it over the camera's
+  # `track:` tier — at mint if it is already there, later if its `best_score`
+  # climbs into it. A crossing driven by the score is never delayed by the
+  # throttle: `maybe_publish_update/3` releases on any improvement in
+  # `best_score`, and that is what a crossing is. A crossing driven by the
+  # *threshold* moving instead — the track's label followed a new detection, or
+  # the camera's policy was refreshed — waits for the next release, so at most
+  # `@update_throttle_ms`.
+  defp record_live(cam, track, state) do
+    cond do
+      rowed?(cam, track.object_id) ->
+        TrackRecorder.record_update(state.recorder, track, open_event_id(cam))
+        true
+
+      qualifies?(cam, track) ->
+        TrackRecorder.record_open(state.recorder, track, open_event_id(cam))
+        true
+
+      true ->
+        false
+    end
+  end
+
+  defp rowed?(cam, object_id), do: match?(%{rowed?: true}, Map.get(cam.track_updates, object_id))
+
+  # The event open right now, which for a live row is a best guess at the clip
+  # it will be read against and is replaced on every write until the closing
+  # one. Only that last value carries the column's documented meaning — the
+  # event open when the track *ended* — and even it is not how a clip's contents
+  # are read back (`Cairn.Tracks.overlapping_event/3` asks about time).
+  defp open_event_id(%{event: %Event{id: id}}), do: id
+  defp open_event_id(_cam), do: nil
 
   defp default_monotonic_ms, do: System.monotonic_time(:millisecond)
 

@@ -31,9 +31,14 @@ defmodule CairnWeb.Layouts do
     default: nil,
     doc: "the current [scope](https://phoenix.hexdocs.pm/scopes.html)"
 
+  # The active nav item is the caller's to declare, not something derived from
+  # the URL here: event detail lives under /events but is reached from either
+  # browse page, and the one opened from a track row (`?track=` present) keeps
+  # Tracks lit and offers "Back to tracks". So a LiveView may pass an assign
+  # rather than a literal.
   attr :page, :atom,
     default: nil,
-    doc: "which topbar nav item is active (:dashboard | :events | :config)"
+    doc: "which topbar nav item is active (:dashboard | :events | :tracks | :config)"
 
   slot :inner_block, required: true
 
@@ -53,6 +58,9 @@ defmodule CairnWeb.Layouts do
           </.link>
           <.link navigate={~p"/events"} class={["cairn-nav", @page == :events && "cairn-nav--active"]}>
             <span class="ms" style="font-size: 19px;">video_library</span>Events
+          </.link>
+          <.link navigate={~p"/tracks"} class={["cairn-nav", @page == :tracks && "cairn-nav--active"]}>
+            <span class="ms" style="font-size: 19px;">route</span>Tracks
           </.link>
           <.link navigate={~p"/config"} class={["cairn-nav", @page == :config && "cairn-nav--active"]}>
             <span class="ms" style="font-size: 19px;">tune</span>Config

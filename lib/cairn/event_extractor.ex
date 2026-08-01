@@ -7,10 +7,12 @@ defmodule Cairn.EventExtractor do
   `events/{camera}/{event_id}_{camera}_{ts}.mp4`, writes the init segment,
   then atomically drains the ring's pre-window and subscribes for live
   fragments (`Cairn.RingBuffer.drain_and_subscribe/3` — race-free
-  boundary). That drain is also the only moment the clip's time-zero is
-  knowable, in the media clock and the wall clock at once: the anchor taken
-  there (`anchor/3`) is kept for the sidecar header and would otherwise be
-  discarded with the fragments.
+  boundary). Those drained fragments are the only sight anyone gets of the
+  clip's own time-zero, so the anchor taken there (`anchor/3`) pairs it with a
+  wall clock for the sidecar header; it would otherwise be discarded with the
+  fragments. The first fragment to arrive *live* completes that anchor with a
+  second, tighter pairing (`note_live_fragment/2`) — the one a reader prefers,
+  and the reason `Cairn.TrackPath` documents two.
 
   The media path holds nothing: a fragment is written as it arrives and let
   go, with a datasync roughly every 2s of media, so the clip's own length
@@ -96,7 +98,8 @@ defmodule Cairn.EventExtractor do
       track_entries: 0,
       track_truncated: false,
       max_path_entries: Keyword.get(opts, :max_path_entries, @max_path_entries),
-      # Taken at the drain in `handle_continue(:open, ...)`; nil until then.
+      # Built at the drain in `handle_continue(:open, ...)` — nil until then —
+      # and completed with its live half by the first fragment to arrive after.
       anchor: nil
     }
 
@@ -122,10 +125,13 @@ defmodule Cairn.EventExtractor do
       {:ok, %{init: init, fragments: drained}} =
         RingBuffer.drain_and_subscribe(camera.id, nil, self())
 
-      # Read here and nowhere later: this instant is the one that corresponds
-      # in media time to the end of the drained pre-roll, which is the whole
-      # value of the anchor. A wall clock taken after the fragments are written
-      # would be an unknown amount of I/O later.
+      # Read here and nowhere later: the drained fragments are in hand and none
+      # of them has been written yet, so this is as close as a wall clock gets
+      # to the end of the drained media. Close, not equal — ffmpeg is part-way
+      # through a fragment it has not written out, and that fragment's content
+      # was captured before this read, so the pair understates how much media
+      # exists by up to one fragment. `note_live_fragment/2` is the pair without
+      # that surplus; this one is what an event has until a fragment arrives.
       drain_wall_ms = DateTime.to_unix(DateTime.utc_now(), :millisecond)
 
       state = %{state | io: io, path: path, anchor: anchor(drained, event, drain_wall_ms)}
@@ -156,7 +162,10 @@ defmodule Cairn.EventExtractor do
 
   @impl true
   def handle_info({:ring_fragment, frag}, state) do
-    {:noreply, write_fragment(state, frag)}
+    # The anchor before the write: `write_fragment/2` can block on a datasync,
+    # and the wall clock this fragment is paired with has to be the one at its
+    # arrival.
+    {:noreply, state |> note_live_fragment(frag) |> write_fragment(frag)}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -213,17 +222,23 @@ defmodule Cairn.EventExtractor do
 
   # -- internals --------------------------------------------------------------
 
-  # The clip's time-zero in both clocks, captured while the head of the clip is
-  # still in hand. An empty pre-window — a camera whose ring has not filled yet
-  # — has no media half at all: those three fields go `nil` and the wall-clock
-  # pair still places the path (`Cairn.TrackPath` reads every field with
-  # `Map.get/2` for exactly this case).
+  # The drain half of the anchor: a media position and the wall clock read
+  # beside it, captured while the head of the clip is still in hand. The live
+  # half is `nil` here and stays that way until a fragment arrives.
+  #
+  # An empty pre-window — a camera whose ring has not filled yet — has no media
+  # position to offer, so `drained_span_ms` goes `nil` along with the two pts
+  # fields and this half can place nothing at all. That file is placeable only
+  # once the live half lands (`Cairn.TrackPath` reads every field with
+  # `Map.get/2` and skips a half it cannot use).
   defp anchor([], event, drain_wall_ms) do
     %{
       first_pts: nil,
       timescale: nil,
       drained_span_ms: nil,
       drain_wall_ms: drain_wall_ms,
+      live_media_ms: nil,
+      live_wall_ms: nil,
       event_started_ms: DateTime.to_unix(event.started_at, :millisecond)
     }
   end
@@ -239,8 +254,51 @@ defmodule Cairn.EventExtractor do
       # what carries it to the end of the drained media.
       drained_span_ms: round((last.pts - first.pts) * 1000 / first.timescale) + last.duration_ms,
       drain_wall_ms: drain_wall_ms,
+      live_media_ms: nil,
+      live_wall_ms: nil,
       event_started_ms: DateTime.to_unix(event.started_at, :millisecond)
     }
+  end
+
+  # The live half: the wall clock at the arrival of the first fragment to reach
+  # us live, paired with the media position that fragment *ends* at. A fragment
+  # is handed over only once it is complete, so this pair is off by the
+  # transport and the demux and nothing else — where the drain's pair also
+  # carries however much of the in-flight fragment ffmpeg had not written yet.
+  #
+  # One-shot, and `live_wall_ms` being nil is the whole of the test: the second
+  # clause takes every later fragment, and a nil anchor with it.
+  defp note_live_fragment(%{anchor: %{live_wall_ms: nil} = anchor} = state, frag) do
+    anchor = %{
+      anchor
+      | live_wall_ms: DateTime.to_unix(DateTime.utc_now(), :millisecond),
+        live_media_ms: live_media_ms(anchor, frag)
+    }
+
+    %{state | anchor: anchor}
+  end
+
+  defp note_live_fragment(state, _frag), do: state
+
+  # Where a live fragment ends on the clip's own timeline, in ms from the t=0
+  # `Cairn.ClipRemux` rebases the clip to — the first fragment the file holds.
+  # The two clauses are `anchor/3`'s two, in the same order and for the same
+  # reason.
+  #
+  # A `first_pts` of nil is an empty drain, so the fragment in hand is itself
+  # the first thing written after the init segment: it starts at the clip's t=0
+  # and its own duration is where it ends. Otherwise the clip starts at the head
+  # of the drain and the position is measured from that `pts`. Either way the
+  # fragment's duration is what carries a decode time to the end of its media.
+  #
+  # An ffmpeg respawn mid-event restarts `pts` near zero while `first_pts` still
+  # names the old session, which makes the difference negative. Nothing is done
+  # about it here: a negative media position is what `Cairn.TrackPath` rejects a
+  # half on, and the drain half answers instead.
+  defp live_media_ms(%{first_pts: nil}, frag), do: frag.duration_ms
+
+  defp live_media_ms(%{first_pts: first_pts, timescale: timescale}, frag) do
+    round((frag.pts - first_pts) * 1000 / timescale) + frag.duration_ms
   end
 
   # Prepend and count. Never `++`, and never `length/1` over the accumulator:

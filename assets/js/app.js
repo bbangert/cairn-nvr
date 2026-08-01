@@ -23,9 +23,17 @@ import "phoenix_html"
 import {Socket} from "phoenix"
 import {LiveSocket} from "phoenix_live_view"
 import {hooks as colocatedHooks} from "phoenix-colocated/cairn"
+// Vendored, per the first option above (this project has no package.json):
+//   topbar 3.0.0                 http://buunguyen.github.io/topbar
+//   @msgpack/msgpack 3.1.3       https://unpkg.com/@msgpack/msgpack@3.1.3/dist.umd/msgpack.min.js
+// The msgpack build is imported by vendor_msgpack.js and by nothing else — it
+// owns the CommonJS interop shim the UMD bundle needs. hooks/track_overlay.js
+// decodes the per-event bbox sidecar through that wrapper; each file's own
+// header repeats its provenance.
 import topbar from "../vendor/topbar"
 import MsePlayer from "./hooks/mse_player"
 import TimelineSeek from "./hooks/timeline_seek"
+import TrackOverlay from "./hooks/track_overlay"
 import WebrtcPlayer from "./hooks/webrtc_player"
 import CopyText from "./hooks/copy_text"
 
@@ -33,7 +41,7 @@ const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: {_csrf_token: csrfToken},
-  hooks: {...colocatedHooks, MsePlayer, TimelineSeek, WebrtcPlayer, CopyText},
+  hooks: {...colocatedHooks, MsePlayer, TimelineSeek, TrackOverlay, WebrtcPlayer, CopyText},
 })
 
 // Show progress bar on live navigation and form submits
