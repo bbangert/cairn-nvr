@@ -15,16 +15,24 @@ defmodule Cairn.Reconciler do
   failure in one of its sync steps re-runs the whole task with extractors
   live, and deleting a row out from under one turns a healthy clip into a
   false `event_clip_failed{reason: :not_found}`.
+
+  The track index gets the same treatment on the way past, for the same reason
+  the event index does — nothing that could still be writing those rows is
+  running yet. A track row is open while its track is live and only its own
+  writer ever closes it, so the ones left open here belong to a host that is
+  gone: `Cairn.Tracks.close_live/0` closes them as `:host_restart`, which is
+  what a track that outlives its host ended as.
   """
 
   require Logger
 
-  alias Cairn.{DataDir, Events}
+  alias Cairn.{DataDir, Events, Tracks}
 
   @spec run(Cairn.Config.t()) :: %{
           deleted: non_neg_integer(),
           partialed: non_neg_integer(),
-          adopted: non_neg_integer()
+          adopted: non_neg_integer(),
+          tracks_closed: non_neg_integer()
         }
   def run(config) do
     rows = Events.all()
@@ -57,12 +65,29 @@ defmodule Cairn.Reconciler do
     known_ids = MapSet.new(rows, & &1.id)
     adopted = adopt_orphans(config, known_ids)
 
-    summary = %{deleted: deleted, partialed: partialed, adopted: adopted}
+    # Deliberately not coordinated with the aggregator's checkpoint restore,
+    # which closes the tracks of cameras that had an open event. That restore
+    # has already run (the aggregator starts before `Cairn.Boot`), but it hands
+    # its closes to `Cairn.TrackRecorder`, which writes them a flush interval
+    # later — so either write can reach the table first. Both say
+    # `:host_restart` and track rows upsert, so whichever lands second wins and
+    # the only thing at stake is `ended_at`: the restore's `last_seen_at` (the
+    # track's own last observation) against the `updated_at` this derives from,
+    # which is the same instant give or take a flush interval.
+    tracks_closed = Tracks.close_live()
 
-    if deleted + partialed + adopted > 0 do
+    summary = %{
+      deleted: deleted,
+      partialed: partialed,
+      adopted: adopted,
+      tracks_closed: tracks_closed
+    }
+
+    if deleted + partialed + adopted + tracks_closed > 0 do
       Logger.info(
         "reconciliation: #{deleted} rows deleted (missing files), " <>
-          "#{partialed} active rows marked partial, #{adopted} orphan clips adopted"
+          "#{partialed} active rows marked partial, #{adopted} orphan clips adopted, " <>
+          "#{tracks_closed} live track rows closed"
       )
     end
 

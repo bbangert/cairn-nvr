@@ -323,8 +323,15 @@ defmodule CairnWeb.EventLive do
     Enum.reject([panel_note(event, sidecar?), truncation_note(truncated?)], &is_nil/1)
   end
 
+  # A track earns its row as soon as it qualifies, so a clip still being written
+  # already lists what is in frame — but this panel is loaded once and reloaded
+  # only when the clip closes (`handle_info/2`), and the boxes come from the
+  # sidecar that same finalize writes. So the note promises the reload, not a
+  # feed.
   defp panel_note(%{status: :active}, _sidecar?),
-    do: "Still recording — tracks appear here as they end."
+    do:
+      "Still recording — objects tracked so far are listed. " <>
+        "Boxes, and anything tracked since, arrive when the clip closes."
 
   defp panel_note(_event, false),
     do:

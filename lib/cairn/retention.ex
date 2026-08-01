@@ -128,7 +128,11 @@ defmodule Cairn.Retention do
   # Track rows run on their own clock, off the same `now` as the event sweep so
   # one pass has one notion of the present. Live tracks are never eligible
   # however old they are — `delete_ended_before/1` compares `ended_at`, which is
-  # NULL until a track finishes. Moments go with their track by cascade.
+  # NULL from the instant a row is opened until the track finishes. That is a
+  # real state and not a transient one: a row outlives the host that opened it,
+  # and what makes such a row collectable again is
+  # `Cairn.Tracks.close_live/0` at the next boot, not anything here. Moments go
+  # with their track by cascade.
   defp prune_tracks(config, now) do
     count =
       now

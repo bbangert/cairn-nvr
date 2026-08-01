@@ -1,9 +1,10 @@
 defmodule Cairn.TrackRecorderTest do
   # async: false and DataCase: the recorder writes through the real pool, and
   # `Cairn.Tracks` notes that async sandboxing is not recommended outside
-  # PostgreSQL. Every assertion here is on rows the recorder actually wrote —
-  # the buffers are internal state and asserting on them would pass whether or
-  # not a flush ever reached SQLite.
+  # PostgreSQL. Every assertion that something *was* written is on the row in
+  # SQLite — asserting on the buffers would pass whether or not a flush ever
+  # reached the database. Three tests read internal state as well, and only to
+  # pin what is being held back or forgotten, which by definition no row shows.
   use Cairn.DataCase, async: false
 
   import ExUnit.CaptureLog, only: [capture_log: 1]
@@ -117,6 +118,146 @@ defmodule Cairn.TrackRecorderTest do
     end
   end
 
+  describe "live rows" do
+    test "a row exists while the track is still running", %{camera_id: cam} do
+      rec = start_recorder()
+      live = track(cam, %{end_reason: nil})
+
+      TrackRecorder.record_moment(rec, live.object_id, live.started_at, :appeared, [1, 1, 2, 2])
+      TrackRecorder.record_open(rec, live, "event-1")
+      flush(rec)
+
+      row = Tracks.get(live.object_id)
+      assert row
+      # what "live" means in this table, and what every reader keys off
+      assert row.ended_at == nil
+      assert row.end_reason == nil
+      assert row.event_id == "event-1"
+      assert row.best_score == 0.91
+      # the timeline is readable while the track is still running
+      assert [%{kind: :appeared}] = Tracks.moments(live.object_id)
+      assert row.entry_bbox == [1, 1, 2, 2]
+    end
+
+    test "an update refreshes the live row in place", %{camera_id: cam} do
+      rec = start_recorder()
+      live = track(cam, %{best_score: 0.55, stationary_ms: 0, end_reason: nil})
+
+      TrackRecorder.record_open(rec, live, nil)
+      flush(rec)
+      assert Tracks.get(live.object_id).best_score == 0.55
+
+      moved =
+        track(cam, %{
+          object_id: live.object_id,
+          best_score: 0.88,
+          stationary_ms: 7_000,
+          stationary_since: live.started_at,
+          bbox: [0.7, 0.7, 0.1, 0.1],
+          end_reason: nil
+        })
+
+      TrackRecorder.record_update(rec, moved, nil)
+      flush(rec)
+
+      row = Tracks.get(live.object_id)
+      assert row.best_score == 0.88
+      assert row.stationary_ms == 7_000
+      assert row.stationary_since != nil
+      assert row.exit_bbox == [0.7, 0.7, 0.1, 0.1]
+      # still live, and still one row
+      assert row.ended_at == nil
+      assert Tracks.list(camera: cam).total == 1
+    end
+
+    test "a moment recorded after the row is open lands with the next batch", %{camera_id: cam} do
+      rec = start_recorder()
+      live = track(cam, %{end_reason: nil})
+
+      TrackRecorder.record_moment(rec, live.object_id, live.started_at, :appeared, [1, 1, 2, 2])
+      TrackRecorder.record_open(rec, live, nil)
+      flush(rec)
+      assert [%{kind: :appeared}] = Tracks.moments(live.object_id)
+
+      TrackRecorder.record_moment(
+        rec,
+        live.object_id,
+        DateTime.add(live.started_at, 5),
+        :became_stationary,
+        [1, 1, 2, 2]
+      )
+
+      flush(rec)
+
+      # the flushed `:appeared` is not written a second time — the recorder
+      # forgets a track's moments once they are in
+      assert [%{kind: :appeared}, %{kind: :became_stationary}] = Tracks.moments(live.object_id)
+    end
+
+    test "the final closes the row that is already there", %{camera_id: cam} do
+      rec = start_recorder()
+      live = track(cam, %{end_reason: nil})
+
+      TrackRecorder.record_open(rec, live, nil)
+      flush(rec)
+      assert Tracks.get(live.object_id).ended_at == nil
+
+      TrackRecorder.record_final(rec, %{live | end_reason: :unseen}, "event-1")
+      flush(rec)
+
+      row = Tracks.get(live.object_id)
+      assert row.end_reason == :unseen
+      assert DateTime.compare(row.ended_at, live.last_seen_at) == :eq
+      assert row.event_id == "event-1"
+      # closed in place: the open and the close are one row
+      assert Tracks.list(camera: cam).total == 1
+    end
+
+    test "an update for a track with no row writes nothing", %{camera_id: cam} do
+      rec = start_recorder()
+      never = track(cam, %{end_reason: nil})
+
+      # the shape of a track that never passed the caller's tier: moments
+      # buffered, no open ever sent
+      TrackRecorder.record_moment(rec, never.object_id, never.started_at, :appeared, [0, 0, 1, 1])
+      TrackRecorder.record_update(rec, never, nil)
+      flush(rec)
+
+      assert Tracks.get(never.object_id) == nil
+      assert Tracks.list(camera: cam).total == 0
+
+      # and it is still only an update away from nothing: the open is what
+      # creates the row, and it brings the buffered moment with it
+      TrackRecorder.record_update(rec, never, nil)
+      flush(rec)
+      assert Tracks.get(never.object_id) == nil
+
+      TrackRecorder.record_open(rec, never, nil)
+      flush(rec)
+      assert Tracks.get(never.object_id).entry_bbox == [0, 0, 1, 1]
+    end
+
+    test "a re-sent open is an update, not a second row", %{camera_id: cam} do
+      rec = start_recorder()
+      live = track(cam, %{best_score: 0.6, end_reason: nil})
+
+      TrackRecorder.record_moment(rec, live.object_id, live.started_at, :appeared, [1, 1, 2, 2])
+      TrackRecorder.record_open(rec, live, nil)
+      flush(rec)
+
+      TrackRecorder.record_open(rec, %{live | best_score: 0.77}, nil)
+      flush(rec)
+
+      row = Tracks.get(live.object_id)
+      assert row.best_score == 0.77
+      # nothing resets: the `:appeared` moment neither doubles nor disappears,
+      # and `entry_bbox` survives a write that no longer knows it
+      assert [%{kind: :appeared}] = Tracks.moments(live.object_id)
+      assert row.entry_bbox == [1, 1, 2, 2]
+      assert Tracks.list(camera: cam).total == 1
+    end
+  end
+
   describe "pairing" do
     test "a track and its moments land in one batch", %{camera_id: cam} do
       rec = start_recorder()
@@ -152,21 +293,21 @@ defmodule Cairn.TrackRecorderTest do
       assert [%{kind: :appeared}, %{kind: :became_stationary}] = Tracks.moments(final.object_id)
     end
 
-    test "moments buffered for a track with no final stay buffered", %{camera_id: cam} do
+    test "moments buffered for a track with no row stay buffered", %{camera_id: cam} do
       rec = start_recorder()
-      live = Cairn.ULID.generate()
+      unqualified = Cairn.ULID.generate()
       final = track(cam)
 
-      TrackRecorder.record_moment(rec, live, DateTime.utc_now(), :appeared, [0, 0, 1, 1])
+      TrackRecorder.record_moment(rec, unqualified, DateTime.utc_now(), :appeared, [0, 0, 1, 1])
       TrackRecorder.record_moment(rec, final.object_id, final.started_at, :appeared, [1, 1, 2, 2])
       TrackRecorder.record_final(rec, final, nil)
       flush(rec)
 
       assert Tracks.get(final.object_id).entry_bbox == [1, 1, 2, 2]
       # unpaired and therefore never offered to `insert_batch/1` (its parent
-      # row does not exist yet, and `track_events.track_id` is a real FK)
-      assert Tracks.moments(live) == []
-      assert %{^live => _entry} = :sys.get_state(rec).moments
+      # row does not exist, and `track_events.track_id` is a real FK)
+      assert Tracks.moments(unqualified) == []
+      assert %{^unqualified => %{attrs: nil}} = :sys.get_state(rec).tracks
     end
 
     test "discard drops a track's buffered moments", %{camera_id: cam} do
@@ -223,12 +364,59 @@ defmodule Cairn.TrackRecorderTest do
       assert DateTime.compare(row.stationary_since, started) == :eq
       assert [%{kind: :appeared}] = Tracks.moments(final.object_id)
     end
+
+    test "the live paths are timed from the wire too", %{camera_id: cam} do
+      # The open and the update are new ways into the same dump, and they carry
+      # the same wire time — a live row is written from `started_at` and
+      # `stationary_since` long before any final exists to pad them.
+      rec = start_recorder()
+      {:ok, started, 0} = DateTime.from_iso8601("2026-08-01T15:33:14.194Z")
+      {:ok, later, 0} = DateTime.from_iso8601("2026-08-01T15:33:16.007Z")
+      assert started.microsecond == {194_000, 3}
+      assert later.microsecond == {7_000, 3}
+
+      live =
+        track(cam, %{
+          started_at: started,
+          last_seen_at: started,
+          stationary_since: nil,
+          end_reason: nil
+        })
+
+      TrackRecorder.record_moment(rec, live.object_id, started, :appeared, [0.1, 0.1, 0.2, 0.2])
+      TrackRecorder.record_open(rec, live, nil)
+      flush(rec)
+
+      assert Process.alive?(rec)
+      assert DateTime.compare(Tracks.get(live.object_id).started_at, started) == :eq
+
+      TrackRecorder.record_update(
+        rec,
+        %{live | stationary_since: later, stationary_ms: 1_800},
+        nil
+      )
+
+      TrackRecorder.record_moment(rec, live.object_id, later, :became_stationary, [
+        0.1,
+        0.1,
+        0.2,
+        0.2
+      ])
+
+      flush(rec)
+
+      assert Process.alive?(rec)
+      row = Tracks.get(live.object_id)
+      assert DateTime.compare(row.stationary_since, later) == :eq
+      assert row.ended_at == nil
+      assert [%{kind: :appeared}, %{kind: :became_stationary}] = Tracks.moments(live.object_id)
+    end
   end
 
   describe "bounds" do
-    test "buffered finals are capped, oldest dropped", %{camera_id: cam} do
-      rec = start_recorder(max_buffered_finals: 3)
-      finals = for _ <- 1..5, do: track(cam)
+    test "queued writes are capped, least recently touched dropped", %{camera_id: cam} do
+      rec = start_recorder(max_tracks: 4)
+      finals = for _ <- 1..6, do: track(cam)
 
       log =
         capture_log(fn ->
@@ -241,12 +429,52 @@ defmodule Cairn.TrackRecorderTest do
       flush(rec)
 
       kept = Enum.map(Tracks.list(camera: cam).tracks, & &1.id)
-      assert length(kept) == 3
+      # 6 casts against a cap of 4: the fifth trips the sweep back to 3, so the
+      # oldest two are gone and the sixth arrives after it
+      assert length(kept) == 4
       [oldest, second | rest] = finals
       assert Enum.sort(kept) == rest |> Enum.map(& &1.object_id) |> Enum.sort()
       refute oldest.object_id in kept
       refute second.object_id in kept
-      assert log =~ "buffered finals over 3"
+      assert log =~ "buffering over 4 unfinished tracks"
+    end
+
+    test "a swept live track still gets its row closed", %{camera_id: cam} do
+      rec = start_recorder(max_tracks: 4)
+      live = track(cam, %{end_reason: nil})
+
+      TrackRecorder.record_open(rec, live, nil)
+      flush(rec)
+
+      # push the entry out of the recorder's memory entirely
+      capture_log(fn ->
+        for _ <- 1..6 do
+          TrackRecorder.record_moment(rec, Cairn.ULID.generate(), DateTime.utc_now(), :appeared, [
+            0,
+            0,
+            1,
+            1
+          ])
+        end
+
+        _ = :sys.get_state(rec)
+      end)
+
+      refute Map.has_key?(:sys.get_state(rec).tracks, live.object_id)
+
+      # an update for a forgotten track is ignored, but the close still lands:
+      # nothing may leave a row live because this process lost its memory of it
+      TrackRecorder.record_update(rec, %{live | best_score: 0.99}, nil)
+      flush(rec)
+      assert Tracks.get(live.object_id).best_score == 0.91
+
+      TrackRecorder.record_final(rec, track(cam, %{object_id: live.object_id}), nil)
+      flush(rec)
+
+      row = Tracks.get(live.object_id)
+      assert row.end_reason == :unseen
+      assert row.ended_at != nil
+      assert Tracks.list(camera: cam).total == 1
     end
 
     test "a track's moments are capped, and `:appeared` survives", %{camera_id: cam} do
@@ -272,7 +500,7 @@ defmodule Cairn.TrackRecorderTest do
     end
 
     test "moments for tracks that never finish are swept, least recent first", %{camera_id: cam} do
-      rec = start_recorder(max_moment_tracks: 8)
+      rec = start_recorder(max_tracks: 8)
       ids = for _ <- 1..12, do: Cairn.ULID.generate()
       now = DateTime.utc_now()
 
@@ -285,7 +513,7 @@ defmodule Cairn.TrackRecorderTest do
           _ = :sys.get_state(rec)
         end)
 
-      assert map_size(:sys.get_state(rec).moments) <= 8
+      assert map_size(:sys.get_state(rec).tracks) <= 8
       assert log =~ "over 8 unfinished tracks"
 
       first = List.first(ids)

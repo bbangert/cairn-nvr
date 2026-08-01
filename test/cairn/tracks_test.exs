@@ -606,24 +606,123 @@ defmodule Cairn.TracksTest do
     assert Tracks.get(attrs.id) == nil
   end
 
-  test "a re-offered track id is kept as first written, and does not fail the batch" do
-    first_moment = DateTime.utc_now()
-    attrs = seed(%{label: "person"}, [moment(:appeared, first_moment)])
+  describe "upsert" do
+    test "a re-offered track id rewrites its row rather than adding one" do
+      # The live-row path in one call pair: a row opened while the track runs,
+      # then the same id offered again to close it.
+      opened = DateTime.utc_now()
 
-    assert {:ok, %{tracks: 0, moments: 1}} =
-             Tracks.insert_batch([
-               {%{attrs | label: "car"}, [moment(:started_moving, DateTime.add(first_moment, 5))]}
-             ])
+      attrs =
+        seed(
+          %{
+            camera_id: "cam_upsert",
+            label: "person",
+            best_score: 0.6,
+            ended_at: nil,
+            entry_bbox: [1, 1, 2, 2]
+          },
+          [moment(:appeared, opened, [1, 1, 2, 2])]
+        )
 
-    # The surviving row is the first batch's, field for field — `:nothing`
-    # keeps, it does not merge.
-    row = Tracks.get(attrs.id)
-    assert row.label == "person"
-    assert row.end_reason == :unseen
+      before = Tracks.get(attrs.id)
+      assert before.ended_at == nil
 
-    # The moments of both batches are on the timeline: only the parent insert is
-    # conflict-guarded, which is the duplicate-moment cost the context documents
-    # accepting.
-    assert [%{kind: :appeared}, %{kind: :started_moving}] = Tracks.moments(attrs.id)
+      closed =
+        Map.merge(attrs, %{
+          label: "car",
+          best_score: 0.82,
+          ended_at: DateTime.add(opened, 30),
+          end_reason: :unseen,
+          stationary_ms: 4_000,
+          exit_bbox: [9, 9, 1, 1],
+          # what a later write cannot know: `entry_bbox` came from the
+          # `:appeared` moment, and `camera_id` is the track's identity
+          entry_bbox: nil,
+          camera_id: "cam_elsewhere"
+        })
+
+      assert {:ok, %{tracks: 1, moments: 1}} =
+               Tracks.insert_batch([{closed, [moment(:started_moving, DateTime.add(opened, 5))]}])
+
+      row = Tracks.get(attrs.id)
+      # replaced
+      assert row.label == "car"
+      assert row.best_score == 0.82
+      assert row.end_reason == :unseen
+      assert DateTime.compare(row.ended_at, DateTime.add(opened, 30)) == :eq
+      assert row.stationary_ms == 4_000
+      assert row.exit_bbox == [9, 9, 1, 1]
+      # kept
+      assert row.camera_id == "cam_upsert"
+      assert row.entry_bbox == [1, 1, 2, 2]
+      assert row.inserted_at == before.inserted_at
+      # `updated_at` moves, and has to: `close_live/0` reads it as the instant
+      # the row was last known live
+      assert DateTime.compare(row.updated_at, before.updated_at) == :gt
+
+      # one row, not two — the whole point of the conflict target
+      assert Tracks.list(camera: "cam_upsert").total == 1
+
+      # The moments of both writes are on the timeline: only the parent insert
+      # is conflict-guarded, which is the duplicate-moment cost the context
+      # documents accepting.
+      assert [%{kind: :appeared}, %{kind: :started_moving}] = Tracks.moments(attrs.id)
+    end
+
+    test "a live row's nil ended_at and end_reason are written, not merely absent" do
+      # Ecto's `insert_all` has no notion of a partial row, so this pins the
+      # other direction of the replace list: closing a row and then re-offering
+      # it live would blank both columns.
+      attrs = seed(%{ended_at: DateTime.utc_now(), end_reason: :unseen})
+      assert Tracks.get(attrs.id).end_reason == :unseen
+
+      {:ok, _} = Tracks.insert_batch([{%{attrs | ended_at: nil, end_reason: nil}, []}])
+
+      row = Tracks.get(attrs.id)
+      assert row.ended_at == nil
+      assert row.end_reason == nil
+    end
+  end
+
+  describe "close_live/0" do
+    test "closes a live row at its own updated_at, as :host_restart" do
+      live = seed(%{ended_at: nil, end_reason: nil})
+      ended_at = DateTime.add(DateTime.utc_now(), -60)
+      already = seed(%{ended_at: ended_at, end_reason: :plugin_ended})
+      before = Tracks.get(live.id)
+
+      assert Tracks.close_live() == 1
+
+      row = Tracks.get(live.id)
+      assert row.end_reason == :host_restart
+      # the instant the row was last known live, not the clock of this call
+      assert row.updated_at == before.updated_at
+      assert row.ended_at == before.updated_at
+
+      # a row that closed itself is left exactly as it was
+      untouched = Tracks.get(already.id)
+      assert untouched.end_reason == :plugin_ended
+      assert DateTime.compare(untouched.ended_at, ended_at) == :eq
+    end
+
+    test "a closed row is not closed twice, and a later write still wins" do
+      live = seed(%{ended_at: nil, end_reason: nil})
+
+      assert Tracks.close_live() == 1
+      assert Tracks.close_live() == 0
+
+      # The aggregator's checkpoint restore, arriving after the boot-time close:
+      # both say `:host_restart`, and the restore's own `last_seen_at` replaces
+      # the derived one.
+      last_seen = DateTime.add(DateTime.utc_now(), -5)
+
+      {:ok, _} =
+        Tracks.insert_batch([{%{live | ended_at: last_seen, end_reason: :host_restart}, []}])
+
+      row = Tracks.get(live.id)
+      assert DateTime.compare(row.ended_at, last_seen) == :eq
+      assert row.end_reason == :host_restart
+      assert Tracks.close_live() == 0
+    end
   end
 end

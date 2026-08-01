@@ -51,20 +51,26 @@ defmodule Cairn.Track do
       final. A consumer that materializes entities from `track_started` must
       therefore treat an aggregator restart, not only a `track_ended`, as the
       end of everything it holds.
-    * **The track index** (`Cairn.Tracks`). `Cairn.TrackRecorder` buffers
-      finished tracks and their moments in its own heap and writes them in
-      batches, so a crash that takes *that* process or the node down loses
-      whatever it had not flushed — deliberately, and on the same terms as an
-      interrupted event written `:partial` (see that module's "Lossy by
-      design"). Past that tail the checkpoint decides the same way:
-      `Cairn.DetectionAggregator`'s restore writes a row for every
-      checkpointed track, linked to the event it was live during, while a
-      track that died on a camera with no open event gets no row either.
+    * **The track index** (`Cairn.Tracks`). Here a crash costs much less,
+      because the row does not wait for the final: `Cairn.TrackRecorder` opens
+      it as soon as the track passes the camera's `track:` tier and refreshes
+      it as the track runs. A crash that takes that process or the node down
+      loses only what it had not flushed — at most a batch, deliberately, and
+      on the same terms as an interrupted event written `:partial` (see that
+      module's "Lossy by design"). What is lost is the *tail* of a row that
+      exists, or the whole of one for a track that qualified within the last
+      flush interval.
 
-  Closing that second gap would be a change to what is checkpointed rather
-  than to this contract: `Cairn.EventCheckpoint` already carries a track list,
-  and only the "while an event is open" rule keeps a quiet camera's live
-  tracks out of it.
+      The row is left open by such a crash, since the close is what went
+      missing. Two things close it afterwards, neither needing a broadcast:
+      `Cairn.DetectionAggregator`'s restore finalizes every checkpointed track
+      against the event it was live during, and `Cairn.Tracks.close_live/0`
+      closes everything still open at the next boot — including the tracks of
+      quiet cameras, which no checkpoint ever held.
+
+  So the second gap above is a gap in the *broadcast* contract only. A
+  consumer that needs the tracks of a camera with no open event to survive a
+  crash reads them out of the index, where they are.
 
   Times are the observation's own (`observed_at`), not the wall clock of
   the moment the message was built.

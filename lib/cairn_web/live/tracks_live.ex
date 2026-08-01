@@ -170,21 +170,25 @@ defmodule CairnWeb.TracksLive do
       # says "live" instead, which is the more useful of the two.
       note: if(is_nil(event_id) and not live?, do: "no clip"),
       moments: moment_rows(track, Map.get(moments, track.id, []), now),
-      # Only unlinked rows explain themselves. `event_id` on the row names a
-      # clip that once held this track, so a row carrying one that no longer
-      # resolves is read as pruned. It is not a proof: a track that ends on a
-      # stream reset can be written with a nil `event_id` while a clip was in
-      # fact recording, and reads as "never recorded" here. The two hints are a
-      # best guess at browse level, which is why the row surface says only "no
-      # clip" either way.
-      no_clip_hint:
-        cond do
-          event_id != nil -> nil
-          track.event_id != nil -> "clip expired — moments only"
-          true -> "never recorded — moments only"
-        end
+      no_clip_hint: no_clip_hint(track, event_id, live?)
     }
   end
+
+  # Only unlinked rows that have ended explain themselves. `event_id` on the row
+  # names a clip that once held this track, so a row carrying one that no longer
+  # resolves is read as pruned. It is not a proof: a track that ends on a stream
+  # reset can be written with a nil `event_id` while a clip was in fact
+  # recording, and reads as "never recorded" here. The two hints are a best
+  # guess at browse level, which is why the row surface says only "no clip"
+  # either way.
+  #
+  # A live row gets neither. Both are verdicts on a track's whole life, and this
+  # one is still being lived — an object in frame right now with no clip yet may
+  # well earn one before it leaves.
+  defp no_clip_hint(_track, _event_id, true), do: nil
+  defp no_clip_hint(_track, event_id, _live?) when event_id != nil, do: nil
+  defp no_clip_hint(%{event_id: nil}, _event_id, _live?), do: "never recorded — moments only"
+  defp no_clip_hint(_track, _event_id, _live?), do: "clip expired — moments only"
 
   defp end_or(%{ended_at: nil}, now), do: now
   defp end_or(%{ended_at: ended_at}, _now), do: ended_at
@@ -325,10 +329,10 @@ defmodule CairnWeb.TracksLive do
               writer-side cap — `Cairn.TrackRecorder`'s `@max_moments_per_track`
               (32) refuses a track's 33rd moment — so a full page is at most 25 ×
               (32 + the synthetic "ended" row) list items, not "however long the
-              track was". The cap binds what the recorder writes, not the table:
-              a track id re-offered across a crash flush inserts its moments
-              twice (see `Cairn.Tracks.insert_batch/1`), so read 32 as the
-              shape of a row, not as a database invariant. --%>
+              track was". The cap binds what one recorder writes, not the table:
+              the count lives with that process's entry for the track, so a
+              recorder restart or an orphan sweep mid-track starts a fresh 32.
+              Read it as the shape of a row, not as a database invariant. --%>
         <div id="tracks-list" style="display: flex; flex-direction: column; gap: 10px;">
           <details
             :for={row <- @rows}

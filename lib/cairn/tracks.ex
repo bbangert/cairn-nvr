@@ -11,6 +11,12 @@ defmodule Cairn.Tracks do
   `first_overlapping_event_ids/2` and `Cairn.Tracks.Track`'s moduledoc for why
   that column cannot carry it.
 
+  A row appears while its track is still running and is rewritten as the track
+  changes, so `insert_batch/1` upserts rather than inserts (`ended_at IS NULL`
+  is the live state). `close_live/0` is the other half of that: nothing but a
+  writer's own close ends a row, so a host that died mid-track leaves one live
+  forever until boot reconciliation closes it.
+
   `Cairn.Tracks.Track` here is the row, not `Cairn.Track` the runtime broadcast
   struct — the same distinction as `Cairn.Events.Event` and `Cairn.Event`.
 
@@ -67,8 +73,31 @@ defmodule Cairn.Tracks do
   @spec get(String.t()) :: Track.t() | nil
   def get(id), do: Repo.get(Track, id)
 
+  # The columns a later offer of the same id may overwrite. Everything left out
+  # is either the track's identity (`camera_id`, `started_at`, `source`,
+  # `plugin_track_id`, `epoch` — none of which change over a track's life), the
+  # instant the row first appeared (`inserted_at`), or `entry_bbox`, which comes
+  # from the `:appeared` moment and is therefore known only to the writer that
+  # opened the row: a later offer carries nil there and must not blank it.
+  #
+  # `updated_at` is in the list and load-bearing beyond bookkeeping —
+  # `close_live/0` reads it as the instant a row was last known live.
+  @replace_on_conflict [
+    :event_id,
+    :label,
+    :best_score,
+    :ended_at,
+    :end_reason,
+    :stationary_since,
+    :stationary_ms,
+    :exit_bbox,
+    :best_bbox,
+    :zones,
+    :updated_at
+  ]
+
   @doc """
-  Writes finished tracks and their timeline moments in one transaction.
+  Writes tracks and their timeline moments in one transaction.
 
   Takes each track paired with its own moments — a list of
   `{track_attrs, [moment_attrs]}`. `track_attrs` is a map with atom keys;
@@ -79,10 +108,9 @@ defmodule Cairn.Tracks do
   with. That is the point of the shape. `track_events.track_id` is a real
   foreign key, so a moment whose parent is not in the same batch would fail the
   insert and take the whole transaction with it — pairing makes that row
-  unrepresentable. It also suits a caller that buffers finished tracks in a list
-  and their moments in a map keyed by the same id: it zips the two and passes
-  the result, and moments it buffered for a track it never finished are simply
-  never passed here.
+  unrepresentable. It also suits a caller that holds a track's row and its
+  timeline together: it passes the pair, and moments buffered for a track whose
+  row does not exist yet are simply never passed here.
 
   Every `DateTime` passed here is padded to microsecond precision on the way
   in, whatever precision it declares — a caller holding wire time does not have
@@ -90,19 +118,28 @@ defmodule Cairn.Tracks do
   row builders: these columns are `:utc_datetime_usec`, `insert_all` dumps
   without casting, and that dump *raises* on any other precision.
 
-  Tracks insert with `on_conflict: :nothing`: an id can be offered twice — a
-  checkpoint restore finalizes tracks as `:host_restart` that a crash-time
-  flush may already have written — and the row written
-  closer to the events it describes is the one to keep. The conflicting track's
-  moments still insert, so that rare race can duplicate moments — harmless in a
-  timeline read, and preferable to dropping the audit row.
+  Tracks **upsert** on `:id`, replacing the columns listed in
+  `@replace_on_conflict` and keeping the rest. Offering an id repeatedly is the
+  normal path, not a race: `Cairn.TrackRecorder` opens a row while the track is
+  still running, offers the same id again on every update, and once more to
+  close it. Last write wins, which also makes the genuine races harmless — a
+  checkpoint restore finalizes tracks as `:host_restart` that a crash-time flush
+  may already have written, and a boot-time `close_live/0` may have closed
+  before either.
 
-  Returns `{:ok, %{tracks: n, moments: n}}`, counting rows actually inserted, or
-  `{:error, exception}` if SQLite refuses the write (busy, locked, constraint) —
-  a value rather than an exit, because the caller is expected to be lossy and
-  drop the batch rather than retry against a database that is already
-  contended. A refused batch leaves nothing behind: both inserts share one
-  transaction.
+  Moments have no such guard: offer one twice and it is on the timeline twice —
+  harmless to read, and preferable to dropping the audit row. The recorder never
+  does, because it forgets a track's moments once they are written, so a
+  re-offered track carries none.
+
+  Returns `{:ok, %{tracks: n, moments: n}}`, or `{:error, exception}` if SQLite
+  refuses the write (busy, locked, constraint) — a value rather than an exit,
+  because the caller is expected to be lossy and drop the batch rather than
+  retry against a database that is already contended. A refused batch leaves
+  nothing behind: both inserts share one transaction.
+
+  `tracks` counts rows **written**, an update the same as an insert: SQLite
+  reports a `DO UPDATE` row as changed and nothing here can tell the two apart.
   """
   @spec insert_batch([entry()]) :: {:ok, counts()} | {:error, Exception.t()}
   def insert_batch([]), do: {:ok, %{tracks: 0, moments: 0}}
@@ -118,7 +155,11 @@ defmodule Cairn.Tracks do
 
     Repo.transaction(fn ->
       %{
-        tracks: insert_chunked(Track, track_rows, on_conflict: :nothing),
+        tracks:
+          insert_chunked(Track, track_rows,
+            on_conflict: {:replace, @replace_on_conflict},
+            conflict_target: :id
+          ),
         moments: insert_chunked(TrackEvent, moment_rows, [])
       }
     end)
@@ -422,6 +463,41 @@ defmodule Cairn.Tracks do
       |> Repo.all()
 
     %{tracks: tracks, page: page, total: total}
+  end
+
+  @doc """
+  Closes every row still marked live, and returns how many.
+
+  A live row (`ended_at IS NULL`) means a writer opened it and has not closed
+  it. Only that writer ever will, so a row whose writer died — the host went
+  down mid-track — would sit there for good: `delete_ended_before/1` compares
+  against a NULL and never matches it, and the emergency sweep does not touch
+  track rows at all. It would read on the page as an object still in frame,
+  years later.
+
+  `ended_at` becomes the row's own `updated_at`, the instant it was last known
+  live, which for a track being refreshed on the recorder's rhythm is within a
+  flush interval of when the host stopped. `updated_at` itself is deliberately
+  left alone: it is the evidence `ended_at` is derived from, and re-stamping it
+  with the boot's clock would erase it.
+
+  `:host_restart` is the same reason `Cairn.DetectionAggregator`'s checkpoint
+  restore gives the tracks it ends, and for the same event — the two cover
+  different sets (a checkpoint holds only the tracks of cameras with an open
+  event, and only until the node dies) and overlap without conflict: both write
+  `:host_restart`, and `insert_batch/1` is last-write-wins, so a restore that
+  lands after this one replaces the derived `ended_at` with the track's own
+  `last_seen_at`, which is strictly the better value.
+  """
+  @spec close_live() :: non_neg_integer()
+  def close_live do
+    {count, _} =
+      Track
+      |> where([t], is_nil(t.ended_at))
+      |> update([t], set: [ended_at: t.updated_at, end_reason: ^:host_restart])
+      |> Repo.update_all([])
+
+    count
   end
 
   @doc """

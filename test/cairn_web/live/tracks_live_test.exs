@@ -328,6 +328,11 @@ defmodule CairnWeb.TracksLiveTest do
     assert html =~ "· ongoing — 1h 0m so far"
     # a live track has not ended, so there is no "ended" moment
     refute html =~ ">ended<"
+    # nor either unlinked-row verdict: both are statements about a whole life,
+    # and this object may still earn a clip before it leaves
+    refute html =~ "never recorded — moments only"
+    refute html =~ "clip expired — moments only"
+    refute html =~ "no clip"
   end
 
   test "a closed stationary run collapses into one row in the 'for' form", %{conn: conn} do

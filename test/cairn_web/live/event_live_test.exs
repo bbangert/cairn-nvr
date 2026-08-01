@@ -527,11 +527,28 @@ defmodule CairnWeb.EventLiveTest do
     refute html =~ "We couldn&#39;t find this clip&#39;s track file"
   end
 
+  test "a clip still recording lists the objects tracked so far", %{conn: conn} do
+    # What the "still recording" note promises: a track earns its row while it
+    # is running, so the panel of an open clip is not empty by construction.
+    %{id: id, started_at: t0} = seed(:active)
+
+    # started with the clip and still running: the panel's window for an open
+    # clip ends at `now`, so a track cannot be seeded into its future
+    live_track =
+      seed_track(%{started_at: t0, ended_at: nil, end_reason: nil}, [moment(:appeared, t0)])
+
+    {:ok, _view, html} = live(conn, "/events/#{id}")
+
+    assert html =~ ~s(id="track-object-#{live_track.id}")
+    refute html =~ "No tracked objects"
+    assert html =~ "Still recording — objects tracked so far are listed."
+  end
+
   test "the panel picks up tracks written by the async finalize", %{conn: conn} do
     %{id: id, clip: clip, started_at: t0} = seed(:active)
     {:ok, view, html} = live(conn, "/events/#{id}")
 
-    assert html =~ "Still recording — tracks appear here as they end."
+    assert html =~ "Still recording — objects tracked so far are listed."
     assert html =~ "No tracked objects"
 
     track = seed_track(%{started_at: DateTime.add(t0, 1), ended_at: DateTime.add(t0, 10)})
@@ -556,6 +573,6 @@ defmodule CairnWeb.EventLiveTest do
 
     assert html =~ ~s(id="track-object-#{track.id}")
     assert html =~ ~s(data-selected="#{track.id}")
-    refute html =~ "Still recording — tracks appear here as they end."
+    refute html =~ "Still recording — objects tracked so far are listed."
   end
 end
