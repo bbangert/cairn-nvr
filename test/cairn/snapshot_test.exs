@@ -212,6 +212,17 @@ defmodule Cairn.SnapshotTest do
       drain_wall_ms: @wall_ms,
       event_started_ms: @started_ms
     }
+    # No live half at all — the shape every sidecar written before it existed
+    # has, and the shape an event that finalized before a fragment arrived
+    # still has. Which makes the drain-half expectations below the
+    # old-file-compatibility test as much as anything.
+    #
+    # The live half of the same event: a fragment reached the extractor 1_700 ms
+    # after the drain returned, ending 3_000 ms into the clip's media — 1_000 ms
+    # drained plus its own 2_000. It places the event's t=0 at 1.264 s rather
+    # than the drain half's 0.964, and that 300 ms is the fragment ffmpeg had
+    # not written out when the drain was taken.
+    @live_anchor Map.merge(@anchor, %{live_media_ms: 3_000, live_wall_ms: 1_785_597_753_242})
     @trig %{t: 0.75, label: "person", score: 0.9, bbox: [0.2, 0.2, 0.3, 0.4]}
 
     # The fixture is 6.0 s long, so the clamp sits at 5.8 and none of the
@@ -231,12 +242,33 @@ defmodule Cairn.SnapshotTest do
     # measures, so which of the two answered is visible in the result.
     defp seek_config(config), do: %{config | pre_window_seconds: 1.0}
 
-    test "the anchor places the seek when the sidecar has one", ctx do
+    test "the anchor's drain half places the seek when it is all there is", ctx do
       path = clip(ctx.dir)
       sidecar!(path, @anchor)
       row = insert(@trig, path)
 
       # (1000 + 1785597751506 − 1785597751542) / 1000 + 0.75
+      assert Snapshot.clip_seek(row, seek_config(ctx.config)) == 1.714
+    end
+
+    test "the live half is preferred over the drain half", ctx do
+      path = clip(ctx.dir)
+      sidecar!(path, @live_anchor)
+      row = insert(@trig, path)
+
+      # (3000 + 1785597751506 − 1785597753242) / 1000 + 0.75 — 300 ms later
+      # than the drain half's answer, and 300 ms is what the drain could not
+      # see. The poster frame moves with the boxes or it stops matching them.
+      assert Snapshot.clip_seek(row, seek_config(ctx.config)) == 2.014
+    end
+
+    test "a live half that cannot place the trigger leaves the drain half to", ctx do
+      path = clip(ctx.dir)
+      # An ffmpeg respawn under the anchor: pts restarted, the extractor's
+      # subtraction went negative, and the media position is not one.
+      sidecar!(path, %{@live_anchor | live_media_ms: -4_000})
+      row = insert(@trig, path)
+
       assert Snapshot.clip_seek(row, seek_config(ctx.config)) == 1.714
     end
 

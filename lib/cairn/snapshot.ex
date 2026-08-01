@@ -78,11 +78,11 @@ defmodule Cairn.Snapshot do
 
   Two ways to place that moment, in preference order.
 
-  The sidecar header's `drained_span_ms` / `drain_wall_ms` /
-  `event_started_ms` (`Cairn.TrackPath`) place the event's t=0 from what the
-  writer actually drained, which is the same arithmetic the browser overlay
-  uses — so a poster frame cut this way agrees with the boxes drawn over the
-  video.
+  The sidecar header's anchor, through `Cairn.TrackPath.anchor_clip_ms/2`,
+  places it from media the writer actually held — its live half for choice, its
+  drain half otherwise. That is the same function the browser overlay mirrors,
+  so a poster frame cut this way lands on the frame the overlay draws its boxes
+  over.
 
   Failing that, `pre_window(config, camera)` — the *configured* pre-roll, not
   the retained one. That is an approximation: a ring that had not filled yet
@@ -193,22 +193,18 @@ defmodule Cairn.Snapshot do
   defp snapshot_reason(_other), do: :index_write_failed
 
   # nil on every miss, which is the whole contract with `clip_seek/2` above:
-  # no clip path, no sidecar next to it, bytes that are not a sidecar, no
-  # anchor, an anchor missing any of the three fields the arithmetic needs, or
-  # a result before the start of the clip (a mismatched sidecar, or a trigger
-  # from before the drain). A negative seek is worse than the estimate it would
-  # replace, so it is treated as a miss rather than clamped to zero.
+  # no clip path, no sidecar next to it, or bytes that are not a sidecar. The
+  # anchor's own misses — no anchor, a half missing a field it needs, a result
+  # before the start of the clip (a mismatched sidecar, or a trigger from
+  # before the media the anchor pairs) — are `anchor_clip_ms/2`'s `:error`,
+  # decided there so this and the browser overlay cannot drift apart on which
+  # anchor answers. A negative seek is worse than the estimate it would
+  # replace, so it is a miss there rather than something clamped to zero here.
   defp anchored_seek(%{path: path}, trig) when is_binary(path) do
     with {:ok, bytes} <- File.read(DataDir.trackpath_for_clip(path)),
          {:ok, %{"anchor" => anchor}} <- TrackPath.decode(bytes),
-         %{
-           "drained_span_ms" => span_ms,
-           "drain_wall_ms" => wall_ms,
-           "event_started_ms" => started_ms
-         }
-         when is_number(span_ms) and is_number(wall_ms) and is_number(started_ms) <- anchor,
-         seek when seek >= 0 <- (span_ms + started_ms - wall_ms) / 1000 + trigger_t(trig) do
-      seek
+         {:ok, clip_ms} <- TrackPath.anchor_clip_ms(anchor, trigger_t(trig) * 1000) do
+      clip_ms / 1000
     else
       _miss -> nil
     end

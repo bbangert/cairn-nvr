@@ -183,31 +183,57 @@ const TrackOverlay = {
   // clip position to get seconds since the event's started_at; the caller
   // scales that to the milliseconds the sidecar's `ts` column is in.
   //
-  // The anchor is the writer's own account of where the event begins inside
-  // the clip: the drained pre-roll's media span, shifted by where the event's
-  // start sits relative to the instant that drain returned (the drain happens
-  // after the event opens, so that shift is normally negative). When any of
-  // the three fields is missing or the result lands outside the clip (remux
-  // disabled, a partial capture), we fall back to the estimate the detections
+  // This is Cairn.TrackPath.anchor_clip_ms/2 at t_ms = 0, mirrored: the anchor
+  // holds two pairings of a media position with a wall clock, and the live one
+  // — the first fragment to reach the extractor after it subscribed — is
+  // preferred over the drain one, which understates the media that existed by
+  // however much of a fragment ffmpeg had not written out yet. That understate
+  // is what makes boxes run ahead of the subject, so preferring the live pair
+  // is not a refinement, it is the fix. The Elixir moduledoc has the full
+  // argument and is the contract this file is answerable to.
+  //
+  // Residual, deliberately uncorrected: even the live pair is late by whatever
+  // the camera, the transport and the demux cost — roughly 100 ms, roughly
+  // constant per setup, and still in the "boxes ahead" direction. If that ever
+  // earns a constant it goes in anchor_clip_ms/2 and is mirrored here; a number
+  // added in this file alone would silently disagree with the poster frame.
+  //
+  // With neither pairing usable we fall back to the estimate the detections
   // timeline already uses — duration − event duration is exactly the retained
   // pre-roll.
   clipOffsetSeconds() {
     const a = this.paths && this.paths.anchor
     const d = this.video.duration
     if (a) {
-      const span = a["drained_span_ms"]
-      const drain = a["drain_wall_ms"]
       const started = a["event_started_ms"]
-      if (span != null && drain != null && started != null) {
-        const offset = (span + started - drain) / 1000
-        if (isFinite(offset) && offset >= -1 && (!isFinite(d) || offset <= d)) {
-          return Math.max(offset, 0)
-        }
-      }
+      const live = this.anchorOffset(a["live_media_ms"], a["live_wall_ms"], started, d)
+      if (live !== null) return live
+      const drain = this.anchorOffset(a["drained_span_ms"], a["drain_wall_ms"], started, d)
+      if (drain !== null) return drain
     }
     if (!isFinite(d)) return 0
     const eventSeconds = parseFloat(this.el.dataset.eventSeconds) || 0
     return Math.max(d - eventSeconds, 0)
+  },
+
+  // One half of the anchor, or null to try the next thing. A msgpack file can
+  // hold anything, so the three fields have to be numbers and the media
+  // position non-negative — a negative one is an ffmpeg respawn having restarted
+  // pts under the anchor, and the other half is the better answer.
+  //
+  // The two bounds on the result are this reader's own, and anchor_clip_ms/2
+  // has neither: it cannot see the video element, so it refuses anything before
+  // the clip and leaves the far end to its caller. Here, a half placing the
+  // event past the end of the video is no use, and one placing it up to a
+  // second before the start is clamped rather than rejected — a fraction of a
+  // second out still beats the duration−event estimate underneath.
+  anchorOffset(mediaMs, wallMs, startedMs, duration) {
+    if (typeof mediaMs !== "number" || typeof wallMs !== "number") return null
+    if (typeof startedMs !== "number" || !(mediaMs >= 0)) return null
+    const offset = (mediaMs + startedMs - wallMs) / 1000
+    if (!isFinite(offset) || offset < -1) return null
+    if (isFinite(duration) && offset > duration) return null
+    return Math.max(offset, 0)
   },
 
   // The sample at `tMs`, interpolated between the two keyframes around it, or

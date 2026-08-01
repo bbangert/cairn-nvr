@@ -411,6 +411,65 @@ defmodule Cairn.TrackRecorderTest do
       assert row.ended_at == nil
       assert [%{kind: :appeared}, %{kind: :became_stationary}] = Tracks.moments(live.object_id)
     end
+
+    test "a float stationary_ms rides every live path without killing the flush",
+         %{camera_id: cam} do
+      # The media clock is float arithmetic: a stationary track's live summary
+      # carries stationary_ms like 4366.666666666666, and the :integer column
+      # dumps strictly. The fixtures here were uniform in exactly this
+      # dimension (integers throughout) while the crash-loop ate every close
+      # in production — the third value-shape incident of this kind.
+      rec = start_recorder()
+      live = track(cam, %{stationary_ms: 4366.666666666666, end_reason: nil})
+
+      TrackRecorder.record_open(rec, live, nil)
+      flush(rec)
+      assert Process.alive?(rec)
+      assert Tracks.get(live.object_id).stationary_ms == 4367
+
+      TrackRecorder.record_update(rec, %{live | stationary_ms: 3699.988888888882}, nil)
+      flush(rec)
+      assert Process.alive?(rec)
+      assert Tracks.get(live.object_id).stationary_ms == 3700
+
+      TrackRecorder.record_final(rec, %{live | stationary_ms: 139_999.99999999997}, nil)
+      flush(rec)
+      assert Process.alive?(rec)
+      row = Tracks.get(live.object_id)
+      assert row.stationary_ms == 140_000
+      assert row.ended_at != nil
+    end
+
+    test "a batch Ecto refuses to dump is dropped loudly, not a crash-loop",
+         %{camera_id: cam} do
+      # Belt to the boundary's braces: if a future value shape slips past
+      # track_row/2's normalization, one batch dies with a warning and the
+      # process keeps closing rows — the alternative was every buffered write
+      # (closes included) lost on every flush, forever, which is how 51 rows
+      # went orphan-live in production.
+      rec = start_recorder()
+      good = track(cam, %{end_reason: nil})
+      TrackRecorder.record_open(rec, good, nil)
+      flush(rec)
+      assert Tracks.get(good.object_id)
+
+      poison = track(cam, %{end_reason: nil, stationary_ms: "not milliseconds"})
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          TrackRecorder.record_open(rec, poison, nil)
+          flush(rec)
+        end)
+
+      assert Process.alive?(rec)
+      assert log =~ "dropped a batch"
+      refute Tracks.get(poison.object_id)
+
+      # the process still writes after the poison: the good track's close lands
+      TrackRecorder.record_final(rec, %{good | end_reason: :unseen}, nil)
+      flush(rec)
+      assert Tracks.get(good.object_id).ended_at != nil
+    end
   end
 
   describe "bounds" do

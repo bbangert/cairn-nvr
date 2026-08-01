@@ -461,13 +461,22 @@ defmodule Cairn.TrackRecorder do
     # `Cairn.DetectionAggregator.indexed_status/1` makes about its own Repo
     # call.
     #
-    # Deliberately narrow. A row Ecto refuses to *dump* raises here too
-    # (`ArgumentError` out of `Ecto.Type.check_usec!` for a datetime that does
-    # not declare microseconds), and that is a bug in what this process built,
-    # not a database that is busy: it would raise on every retry and eat the
-    # buffer every flush interval, silently, forever. It is prevented where the
-    # row is built (`Cairn.Tracks`) rather than swallowed here.
-    e in [DBConnection.OwnershipError] -> dropped(state, entries, Exception.message(e))
+    # A row Ecto refuses to *dump* also raises out of the insert
+    # (`Ecto.ChangeError` for a value that does not match its column type,
+    # `ArgumentError` out of `Ecto.Type.check_usec!` for a datetime that does
+    # not declare microseconds). That is a bug in what this process built, and
+    # the primary defense is prevention where the row is built
+    # (`Cairn.Tracks.track_row/2` normalizes datetimes and float
+    # milliseconds). But prevention has now been beaten twice by value shapes
+    # the fixtures were uniform in — wire-precision datetimes, then the media
+    # clock's float `stationary_ms` — and each time the narrow rescue turned
+    # one bad value into a crash-loop that silently ate every buffered write,
+    # closes included, forever. So dump refusals are dropped-and-logged like
+    # an unanswered database: one loud lost batch, a process that keeps
+    # closing rows, and boot reconciliation covering whatever the lost batch
+    # held.
+    e in [DBConnection.OwnershipError, Ecto.ChangeError, ArgumentError] ->
+      dropped(state, entries, Exception.message(e))
   catch
     # the pool or the Repo process itself is gone
     :exit, reason -> dropped(state, entries, inspect(reason))

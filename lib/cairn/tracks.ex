@@ -550,7 +550,7 @@ defmodule Cairn.Tracks do
       ended_at: usec(attrs[:ended_at]),
       end_reason: attrs[:end_reason],
       stationary_since: usec(attrs[:stationary_since]),
-      stationary_ms: Map.get(attrs, :stationary_ms, 0),
+      stationary_ms: attrs |> Map.get(:stationary_ms, 0) |> whole_ms(),
       entry_bbox: attrs[:entry_bbox],
       exit_bbox: attrs[:exit_bbox],
       best_bbox: attrs[:best_bbox],
@@ -588,6 +588,15 @@ defmodule Cairn.Tracks do
     do: %{at | microsecond: {value, 6}}
 
   defp usec(other), do: other
+
+  # Same invariant, second dimension: `stationary_ms` is an `:integer` column,
+  # and the tracker's media clock is float arithmetic — a live summary carries
+  # `4366.666...`, which `insert_all` dumps strictly (`Ecto.ChangeError`, no
+  # cast to save it). The finished-track path never showed this because a
+  # track that ended while moving carries the integer 0. Round — the value is
+  # milliseconds of stillness; sub-millisecond truth does not exist here.
+  defp whole_ms(ms) when is_float(ms), do: round(ms)
+  defp whole_ms(ms), do: ms
 
   # -- filters ----------------------------------------------------------------
 
