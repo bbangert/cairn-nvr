@@ -73,14 +73,14 @@ defmodule Cairn.DetectionAggregator do
   keeps the last batch of an event; see `forward_boxes/3`.
 
   Subscribes to `Cairn.StreamEpochs`: a new epoch for a camera **suspends**
-  its live host-mode tracks rather than ending them (`Cairn.Tracker.suspend/3`),
-  so a detection in the new stream can adopt an identity the outage
-  interrupted instead of minting a second one for the same parked car. What
-  adoption demands of it, and what it resumes, is the tracker's moduledoc. A
-  suspension nothing adopts inside the window ends `:stream_reset` — on a
-  later batch, or on this process's own timer for a camera whose stream never
-  returns — with the timestamps it had at the cut. Plugin-owned tracks still
-  end at the boundary, and so does everything on a camera that stops. Turning
+  its live tracks rather than ending them (`Cairn.Tracker.suspend/3`), so a
+  detection in the new stream can adopt an identity the outage interrupted
+  instead of minting a second one for the same parked car. What adoption
+  demands of it, and what it resumes, is the tracker's moduledoc. A suspension
+  nothing adopts inside the window ends `:stream_reset` — on a later batch, or
+  on this process's own timer for a camera whose stream never returns — with
+  the timestamps it had at the cut. Everything on a camera that *stops* ends
+  at the boundary instead: nothing is coming that could adopt it. Turning
   detection off at runtime ends both sets (`:detection_disabled` for the live
   ones, `:stream_reset` for anything still suspended) — nothing would advance
   them while it is off.
@@ -403,18 +403,16 @@ defmodule Cairn.DetectionAggregator do
     }
   end
 
-  # `keep_ended: true`, unlike the epoch cuts below: the epoch is unchanged
-  # across a detection toggle, so the plugin ids already declared ended must
-  # stay known — reusing one after re-enabling is the same contract violation
-  # it was before.
+  # Detection off ends every track outright: nothing will observe this camera
+  # again until it is turned back on, so there is nothing left to wait for and
+  # no suspension to offer (that is the epoch cuts' business, below).
   defp end_tracks_disabled(state, camera_id) do
     with %{^camera_id => cam} <- state.cameras,
-         {tracker, [_ | _] = ended} <-
-           Tracker.end_all(cam.tracker, :detection_disabled, keep_ended: true) do
+         {tracker, [_ | _] = ended} <- Tracker.end_all(cam.tracker, :detection_disabled) do
       put_cam(state, camera_id, publish_tracks(%{cam | tracker: tracker}, ended, state))
     else
       # no tracker state, or nothing live: the second disabled batch onwards is
-      # a no-op, and the tracker is left alone so its ended-id memory survives.
+      # a no-op, and the tracker is left alone rather than replaced.
       _ -> state
     end
   end
@@ -450,11 +448,11 @@ defmodule Cairn.DetectionAggregator do
   # objects either side are the same objects, and ending them all was itself a
   # defect: a parked car severed by a 300 ms reconnect re-minted, spent its
   # settle window looking like a new arrival, and that is evidence, and
-  # evidence is a clip. The live host tracks are therefore suspended (see the
+  # evidence is a clip. The live tracks are therefore suspended (see the
   # moduledoc and `Cairn.Tracker.suspend/3`) and only what cannot be adopted —
-  # plugin-owned tracks, a generation of ghosts the cap pushed out, a
-  # suspension whose window already lapsed — gets a final summary here. An
-  # in-flight event keeps running and finalizes on its own timers.
+  # a generation of ghosts the cap pushed out, a suspension whose window
+  # already lapsed — gets a final summary here. An in-flight event keeps
+  # running and finalizes on its own timers.
   #
   # Detection casts already in flight when this arrives are processed *after*
   # the reset: they come from the plugin ports, not from `Cairn.StreamEpochs`,

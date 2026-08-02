@@ -11,9 +11,10 @@ defmodule Cairn.Track do
   track is in the message, so a client that only ever sees the final
   `track_ended` still learns what the track was (ONVIF Analytics §A.10).
 
-    * `source` — `:host` when Cairn's own IoU tracker owns the identity,
-      `:plugin` when the plugin declared `object_tracking` and supplied
-      `plugin_track_id`.
+    * `source` — always `:host`: Cairn's own IoU tracker owns every identity
+      it mints. Plugin-owned tracking was removed, so `:plugin` appears only
+      on historical rows in the track index, and `plugin_track_id` is reserved
+      and unused (nothing sets it for a new track).
     * `score` is the latest observation's score, `best_score` the highest
       seen over the track's life.
     * `stale_predicted` — the track is alive but has not been *detected*
@@ -34,11 +35,12 @@ defmodule Cairn.Track do
       on the far side of it (`Cairn.Tracker`), keeping its `object_id` and its
       `started_at` while its `epoch` moves on.
     * `end_reason` is `nil` until the track ends: `:unseen` (expired),
-      `:plugin_ended` (named in `ended_tracks`), `:stream_reset` (a new stream
-      epoch severed it and nothing adopted it), `:evicted` (the camera hit its
-      live-track cap and this was the least recently seen track),
-      `:detection_disabled` (detection was turned off at runtime),
-      `:host_restart` (restored from a checkpoint after a crash).
+      `:stream_reset` (a new stream epoch severed it and nothing adopted it),
+      `:evicted` (the camera hit its live-track cap and this was the least
+      recently seen track), `:detection_disabled` (detection was turned off at
+      runtime), `:host_restart` (restored from a checkpoint after a crash).
+      `:plugin_ended` is retained in the type but no longer emitted — like
+      `:plugin` above, it appears only on historical rows.
 
   A `:stream_reset` final can arrive long after the times it carries. A host
   track cut by a stream reset is suspended rather than ended, and only when its
@@ -53,7 +55,7 @@ defmodule Cairn.Track do
   ## How far the final-summary guarantee reaches
 
   A final is emitted for every lifecycle transition the aggregator observes:
-  expiry, `ended_tracks`, an epoch boundary, an eviction, detection being
+  expiry, an epoch boundary, an eviction, detection being
   disabled. It is **not** an unconditional guarantee across a crash, and what
   a crash costs is different for the two things a final feeds.
 

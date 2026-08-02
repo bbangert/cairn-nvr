@@ -372,14 +372,14 @@ defmodule Cairn.PluginProtocol do
     end
   end
 
-  # Same printability rule as `label`, and for the same reasons: a `track_id`
-  # reaches `Cairn.Track.plugin_track_id`, the SSE frames built from it and the
-  # checkpoint ETS row. Invalid UTF-8 there makes `Jason.encode/1` fail, which
-  # drops the *whole* frame — selective suppression of a chosen track's
-  # lifecycle — and control bytes would reach an operator's terminal through
-  # any future log line. A plugin that cannot name its tracks printably has
-  # violated the contract, so the object is refused rather than the field
-  # dropped.
+  # Parsed for wire compatibility; the host currently ignores it (reserved) —
+  # `Cairn.Tracker` assigns every identity itself. Validated on the same
+  # printability rule as `label` regardless, and for the same reasons: whatever
+  # reads this field next would carry it into JSON frames and ETS rows, where
+  # invalid UTF-8 makes `Jason.encode/1` fail and drops the *whole* frame, and
+  # control bytes would reach an operator's terminal through any log line. A
+  # plugin that cannot name its tracks printably has violated the contract, so
+  # the object is refused rather than the field dropped.
   defp track_id(%{"track_id" => id})
        when is_binary(id) and byte_size(id) in 1..@max_track_id_bytes do
     if printable_label?(id), do: {:ok, id}, else: :error

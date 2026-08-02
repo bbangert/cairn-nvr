@@ -17,9 +17,9 @@ defmodule Cairn.Observation do
   comparable across epochs, and it is *not* an address into the recording:
   the mapping between plugin pts and fMP4 `tfdt` is undefined.
 
-  `tracking` is not on the wire: it is the port's answer to "did this plugin
-  declare the `object_tracking` capability in its `plugin.hello`?", and it is
-  what decides whether `Cairn.Tracker` honours the objects' `track_id`s.
+  An object's `track_id` and the line's `ended_tracks` are decoded and carried
+  here for wire compatibility, but nothing consumes them: `Cairn.Tracker`
+  assigns every identity itself. They are reserved.
   """
 
   @type time_base :: {pos_integer(), pos_integer()}
@@ -45,7 +45,6 @@ defmodule Cairn.Observation do
           objects: [object()],
           ended_tracks: [String.t()],
           invalid_objects: non_neg_integer(),
-          tracking: boolean(),
           protocol: :v0 | :v1
         }
 
@@ -61,7 +60,6 @@ defmodule Cairn.Observation do
             objects: [],
             ended_tracks: [],
             invalid_objects: 0,
-            tracking: false,
             protocol: :v0
 
   @doc "`pts` in milliseconds of the stream clock described by `time_base`."

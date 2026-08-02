@@ -229,10 +229,9 @@ Recommended client flow:
 #### Track frames
 
 A **track** is one physical object followed through time. Cairn assigns the
-identity itself (IoU on the detections) unless the plugin declares the
-`object_tracking` capability, in which case the plugin's own ids are honoured
-and mapped onto ULIDs. The producing side of this — who owns identity, how it
-is scoped, and what bounds it — is
+identity itself (IoU on the detections); a plugin's own `track_id`s are
+accepted on the wire but ignored. The producing side of this — how identity is
+scoped and what bounds it — is
 [`docs/plugin-contract.md` → Track identity](plugin-contract.md#track-identity).
 
 ```json
@@ -296,8 +295,8 @@ Same schema for all three kinds:
   `tracking.max_unseen_ms` of stream time — five times that while the track is
   `stationary`, which is what lets a parked object ride out an occlusion — or
   ten times whichever of those two bounds applies, of *host* time, the
-  backstop for a plugin whose stream clock stops moving), `plugin_ended`
-  (the plugin said so), `stream_reset` (the camera's stream reconnected and
+  backstop for a plugin whose stream clock stops moving),
+  `stream_reset` (the camera's stream reconnected and
   nothing on the far side turned out to be this object), `evicted` (the camera
   hit its `tracking.max_live_tracks` cap and this was the least recently seen
   track),
@@ -317,8 +316,10 @@ Same schema for all three kinds:
   **downward** — deliberately not ONVIF's centre-origin, y-up frame. The
   conversion and the reasoning are in
   [`docs/plugin-contract.md` → Geometry](plugin-contract.md#geometry).
-- `source` is `"host"` or `"plugin"`; `plugin_track_id` is the plugin's own id
-  when `source` is `"plugin"`, else `null`.
+- `source` is `"host"` on every track Cairn mints today, and `plugin_track_id`
+  is `null`. Plugin-owned tracking was removed; both fields are kept in the
+  frame shape, and `"plugin"` can still be read back out of the track index
+  for rows recorded before the removal.
 - `score` is the latest observation, `best_score` the best over the track's life.
 - `stale_predicted: true` means the track is alive but has not actually been
   *detected* recently — the plugin is predicting it. Cairn never treats such an

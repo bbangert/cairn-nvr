@@ -701,12 +701,12 @@ defmodule Cairn.PluginGroupPortTest do
     assert Cairn.CameraStatus.get(b_id).plugin_status["state"] == "ready"
   end
 
-  # The capability is the plugin's promise that its track ids are stable, and
-  # `Cairn.Tracker` reads that promise off the observation. One plugin process
-  # makes it once, for every member it serves — and the v0 and v1 attribution
-  # paths stamp the flag separately, so both are driven here.
-  test "the object_tracking capability marks every member's observations" do
-    for {capabilities, tracking} <- [{%{"object_tracking" => true}, true}, {%{}, false}] do
+  # The capability buys a plugin nothing — the host tracks every object itself —
+  # so declaring it is warned about once for the whole group and changes nothing
+  # about any member's observations, whose `track_id`s still arrive and are
+  # still ignored. Both attribution paths (v0 and v1) are driven here.
+  test "an object_tracking declaration is warned about and changes no observation" do
+    for {capabilities, declared} <- [{%{"object_tracking" => true}, true}, {%{}, false}] do
       a = camera("gp_cap_a_#{System.unique_integer([:positive])}")
       b = camera("gp_cap_b_#{System.unique_integer([:positive])}")
 
@@ -737,38 +737,44 @@ defmodule Cairn.PluginGroupPortTest do
           det_line(a.id, 7, 0.9)
         ]) <> "; exec sleep 30"
 
-      start_group_port([a, b],
-        command: command,
-        aggregator: self(),
-        group_name: "detect_cap_#{tracking}",
-        id: {:cap, tracking}
-      )
-
       a_id = a.id
       b_id = b.id
 
-      assert_receive {:"$gen_cast",
-                      {:detections, %Camera{id: ^a_id}, _policy,
-                       %Observation{protocol: :v1} = obs_a}},
-                     5_000
+      log =
+        capture_log(fn ->
+          start_group_port([a, b],
+            command: command,
+            aggregator: self(),
+            group_name: "detect_cap_#{declared}",
+            id: {:cap, declared}
+          )
 
-      assert obs_a.tracking == tracking
-      assert [%{track_id: "t1"}] = obs_a.objects
+          assert_receive {:"$gen_cast",
+                          {:detections, %Camera{id: ^a_id}, _policy,
+                           %Observation{protocol: :v1} = obs_a}},
+                         5_000
 
-      assert_receive {:"$gen_cast",
-                      {:detections, %Camera{id: ^b_id}, _policy,
-                       %Observation{protocol: :v1} = obs_b}},
-                     5_000
+          # the ids are on the wire and reach every member's observation;
+          # nothing acts on them
+          assert [%{track_id: "t1"}] = obs_a.objects
 
-      assert obs_b.tracking == tracking
-      assert [%{track_id: "t1"}] = obs_b.objects
+          assert_receive {:"$gen_cast",
+                          {:detections, %Camera{id: ^b_id}, _policy,
+                           %Observation{protocol: :v1} = obs_b}},
+                         5_000
 
-      assert_receive {:"$gen_cast",
-                      {:detections, %Camera{id: ^a_id}, _policy,
-                       %Observation{protocol: :v0} = obs_v0}},
-                     5_000
+          assert [%{track_id: "t1"}] = obs_b.objects
 
-      assert obs_v0.tracking == tracking
+          assert_receive {:"$gen_cast",
+                          {:detections, %Camera{id: ^a_id}, _policy, %Observation{protocol: :v0}}},
+                         5_000
+        end)
+
+      assert log =~ "declares object_tracking" == declared
+
+      if declared do
+        assert log =~ "host-side tracking is used and plugin track ids are ignored"
+      end
     end
   end
 

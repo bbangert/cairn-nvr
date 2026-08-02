@@ -255,7 +255,7 @@ defmodule Cairn.PluginGroupPort do
   defp observe(state, cam, policy, observation) do
     {observation, skew} =
       observation
-      |> attribute(cam.id, state.group.name, tracking?(state.plugin))
+      |> attribute(cam.id, state.group.name)
       |> clamp_observed_at()
 
     state = note_drops(state, skew, :clock_skew, preview(cam.id))
@@ -272,7 +272,7 @@ defmodule Cairn.PluginGroupPort do
 
   # v0 lines carry neither epoch nor time: the epoch is whatever is current
   # right now, and arrival is the only timestamp available.
-  defp attribute(%Observation{protocol: :v0} = observation, camera_id, group_name, tracking) do
+  defp attribute(%Observation{protocol: :v0} = observation, camera_id, group_name) do
     epoch =
       case StreamEpochs.current(camera_id) do
         {:ok, epoch} -> epoch
@@ -285,24 +285,12 @@ defmodule Cairn.PluginGroupPort do
         plugin_instance: group_name,
         epoch: epoch,
         observed_at: DateTime.utc_now(),
-        time_quality: :arrival,
-        tracking: tracking
+        time_quality: :arrival
     }
   end
 
-  defp attribute(observation, camera_id, group_name, tracking),
-    do: %{
-      observation
-      | camera_id: camera_id,
-        plugin_instance: group_name,
-        tracking: tracking
-    }
-
-  # Track ids are only honoured from a plugin that promised, in its hello,
-  # that they are stable (see `Cairn.Tracker`). One process, one promise: it
-  # covers every member camera.
-  defp tracking?(%{"capabilities" => %{"object_tracking" => true}}), do: true
-  defp tracking?(_hello), do: false
+  defp attribute(observation, camera_id, group_name),
+    do: %{observation | camera_id: camera_id, plugin_instance: group_name}
 
   # `observed_at` is the plugin's own clock and it is what event `started_at`,
   # label offsets and snapshot seeks derive from, while `ended_at` and the
@@ -384,8 +372,26 @@ defmodule Cairn.PluginGroupPort do
         :ok
     end
 
+    warn_object_tracking(state, hello["capabilities"])
+
     %{state | plugin: hello}
   end
+
+  # The capability is still accepted on the wire and still parsed, but the host
+  # tracks every object itself and reads no plugin track id, so declaring it
+  # buys the plugin nothing and its ids will not be honoured. One process
+  # serves every member camera, so one warning covers them all; it fires per
+  # hello *line* (`note_hello/2` does not dedup, so a plugin that re-sends its
+  # hello is re-warned) and is never a reason to refuse the plugin, whose
+  # detections are what Cairn wants.
+  defp warn_object_tracking(state, %{"object_tracking" => true}) do
+    Logger.warning(
+      "plugin group #{state.group.name}: plugin declares object_tracking — unsupported; " <>
+        "host-side tracking is used and plugin track ids are ignored"
+    )
+  end
+
+  defp warn_object_tracking(_state, _capabilities), do: :ok
 
   # One process serves every member, so a status without a `camera_id` is
   # about the process and applies to all of them.
