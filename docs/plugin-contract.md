@@ -225,8 +225,9 @@ detects, and is simply logged as it described itself.
 Cairn performs its own tracking and ignores plugin track ids, so no capability
 changes how identity is decided (see [Track identity](#track-identity)).
 Declaring it `true` is not an error and does not stop the plugin, but Cairn
-logs a warning once per plugin process saying the declaration is unsupported.
-Declare it `false`, or omit it.
+logs a warning for each `plugin.hello` that declares it — once per process
+for a plugin that sends hello once, again if you re-send it — saying the
+declaration is unsupported. Declare it `false`, or omit it.
 
 Sending `plugin.hello` again later replaces the recorded hello. There is no
 reason to.
