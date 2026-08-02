@@ -27,10 +27,37 @@ defmodule Cairn.TrackerTest do
   @car_fragment [0.40, 0.50, 0.081, 0.12]
   # same box shifted half its width: IoU 1/3, below the suppression threshold
   @car_neighbour [0.49, 0.50, 0.18, 0.12]
+  # the second box a detector without NMS emits for the *same* car, nudged on
+  # both axes: IoU 0.783, which is the overlap the live failure's two anchors
+  # had — far above @duplicate_suppression_iou and above @stationary_match_iou
+  # too, so nothing about it looks like a second object
+  @car_double [0.415, 0.505, 0.18, 0.12]
   # tall where the car boxes are wide, and displaced in y rather than x
   @walker [0.30, 0.20, 0.10, 0.30]
   # IoU 0.5 with @walker, the same overlap @car_drift has with @parked_car
   @walker_step [0.30, 0.30, 0.10, 0.30]
+
+  # The stationary-hysteresis fixtures, and the measured ones: the car of the
+  # live failure was about 0.17 by 0.09 of the frame, and the detector put
+  # roughly 0.02 of drift on it in *y*. That is under a quarter of the box's
+  # short axis and nothing like motion, but on a box that short it takes the
+  # IoU against the anchor to 0.636 — well under @stationary_iou (0.8), which
+  # is what made the flag flap.
+  #
+  # A wide box drifting on its *short* axis, deliberately. Every other box in
+  # this file that moves at all moves along its own long axis (@car_drift in x
+  # on a wide box, @walker_step in y on a tall one), and the stillness tests
+  # above all park a 1.0 x 1.0 or 0.4 x 0.4 square — so "small", "wide" and
+  # "displaced across the short side" are three dimensions this corpus
+  # otherwise holds constant, and the live failure needed all three.
+  @small_car [0.40, 0.50, 0.17, 0.09]
+  @small_car_jitter [0.40, 0.52, 0.17, 0.09]
+  # A creep of 0.004 per batch on the same box. Against the box before it that
+  # is IoU 0.915 — a rule comparing consecutive boxes calls it motionless — and
+  # against a fixed anchor it crosses 0.8 once the drift passes 0.01, which the
+  # median reaches two batches later. This is the slow walk the anchor exists
+  # to catch, at the scale the parked car actually lives at.
+  @small_car_creep 0.004
 
   defp det(label, bbox, opts \\ []) do
     %{
@@ -108,6 +135,57 @@ defmodule Cairn.TrackerTest do
     assert [%Track{object_id: ^id, stationary: true}] = Tracker.live_tracks(tracker)
     {tracker, id}
   end
+
+  # One host-mode object detected once per second of media time along `boxes`,
+  # from media time 0. It has moved on every step, so it is not stationary and
+  # its anchor is the last box in the list, anchored at `(length - 1) * 1_000`.
+  defp moving(boxes, label \\ "person") do
+    {tracker, id} =
+      boxes
+      |> Enum.with_index()
+      |> Enum.reduce({Tracker.new(), nil}, fn {box, n}, {tracker, id} ->
+        {tracker, [tagged], _events} =
+          track(tracker, [det(label, box)], media_ms: n * 1_000, observed_at: at(n * 1_000))
+
+        {tracker, id || tagged.object_id}
+      end)
+
+    assert [%Track{object_id: ^id, stationary: false}] = Tracker.live_tracks(tracker)
+    {tracker, id}
+  end
+
+  # Two detections a second, which is a plausible inference rate and — the part
+  # that matters — short enough that the excursions below are several
+  # evaluations rather than one.
+  @batch_ms 500
+
+  # The small parked car of the hysteresis tests: plugin-tracked, so identity
+  # is pinned and the stillness rule is the only thing under test, detected
+  # every @batch_ms from media 0 through @stationary_after (10_000). It is
+  # stationary as of the last step, anchored on @small_car, with a median
+  # window holding nothing but @small_car.
+  defp parked_small do
+    {tracker, [tagged], _events} =
+      feed(
+        Tracker.new(),
+        for(n <- 0..div(@stationary_after, @batch_ms), do: {n * @batch_ms, @small_car})
+      )
+
+    assert tagged.stationary
+    tracker
+  end
+
+  # `boxes` fed one per @batch_ms starting at `from_ms`, with every event of
+  # the run — the excursions are about what never happened.
+  defp excursion(tracker, from_ms, boxes) do
+    feed_all(
+      tracker,
+      for({bbox, n} <- Enum.with_index(boxes), do: {from_ms + n * @batch_ms, bbox})
+    )
+  end
+
+  # The same car creeping `@small_car_creep` down the frame per batch.
+  defp creep(n), do: [0.40, 0.50 + n * @small_car_creep, 0.17, 0.09]
 
   # Every event of the whole run, for the tests that are about what never
   # happened.
@@ -527,7 +605,7 @@ defmodule Cairn.TrackerTest do
       assert [{:updated, %Track{stationary: true, stationary_ms: 4_000}}] = events
     end
 
-    test "motion after a stationary stretch flips back and emits started_moving" do
+    test "motion after a stationary stretch flips back once the failure sustains" do
       box = [0.0, 0.0, 1.0, 1.0]
       moved = [0.5, 0.0, 1.0, 1.0]
 
@@ -537,13 +615,24 @@ defmodule Cairn.TrackerTest do
       {t, [held], _} = feed(t, [{11_000, moved}, {12_000, moved}])
       assert held.stationary
 
-      {t, [tagged], events} = feed(t, [{13_000, moved}])
+      # 13_000 is the first evaluation the median fails, and it opens the exit
+      # window rather than closing the flag: @stationary_exit_ms (2_500) of
+      # unbroken failure is what closes it, so 14_000 and 15_000 are still
+      # inside it and the flag is still set on all three.
+      {t, held_events} = feed_all(t, for(n <- 13..15, do: {n * 1_000, moved}))
+
+      assert for({:started_moving, _} = e <- held_events, do: e) == []
+      assert [%Track{stationary: true}] = Tracker.live_tracks(t)
+
+      {t, [tagged], events} = feed(t, [{16_000, moved}])
 
       refute tagged.stationary
       assert [{:updated, _}, {:started_moving, %Track{} = flipped}] = events
       refute flipped.stationary
       assert flipped.stationary_since == nil
-      assert flipped.stationary_ms == 2_000
+      # the window accrues: the flag was set for every one of those batches, and
+      # `stationary_ms` counts the media time the flag was set
+      assert flipped.stationary_ms == 5_000
       assert [%Track{stationary: false}] = Tracker.live_tracks(t)
     end
 
@@ -554,17 +643,20 @@ defmodule Cairn.TrackerTest do
       {t, _, _} =
         feed(Tracker.new(), for(n <- 0..12, do: {n * 1_000, if(n > 10, do: moved, else: box)}))
 
-      {t, [tagged], events} = feed(t, [{13_000, moved}])
+      # the median first fails at 13_000; the flag goes at 16_000, the first
+      # evaluation @stationary_exit_ms (2_500) past it
+      {t, _, _} = feed(t, for(n <- 13..15, do: {n * 1_000, moved}))
+      {t, [tagged], events} = feed(t, [{16_000, moved}])
       refute tagged.stationary
-      assert [_updated, {:started_moving, %Track{stationary_ms: 2_000}}] = events
+      assert [_updated, {:started_moving, %Track{stationary_ms: 5_000}}] = events
 
       # the second stretch is measured from the move, and adds to the first
-      {t, [tagged], events} = feed(t, for(n <- 14..23, do: {n * 1_000, moved}))
+      {t, [tagged], events} = feed(t, for(n <- 17..26, do: {n * 1_000, moved}))
       assert tagged.stationary
-      assert [_updated, {:became_stationary, %Track{stationary_ms: 2_000}}] = events
+      assert [_updated, {:became_stationary, %Track{stationary_ms: 5_000}}] = events
 
-      {_t, _tagged, events} = feed(t, [{24_000, moved}, {25_000, moved}])
-      assert [{:updated, %Track{stationary: true, stationary_ms: 4_000}}] = events
+      {_t, _tagged, events} = feed(t, [{27_000, moved}, {28_000, moved}])
+      assert [{:updated, %Track{stationary: true, stationary_ms: 7_000}}] = events
     end
 
     test "a backwards media-time jump while stationary accrues nothing" do
@@ -603,13 +695,17 @@ defmodule Cairn.TrackerTest do
       assert [{:updated, _}, {:became_stationary, %Track{stationary_since: since}}] = events
       assert since == at(10_000)
 
-      # a real move in y, which the median carries once it holds the window
-      {t, events} = feed_all(t, for(n <- 11..13, do: {n * 1_000, moved}))
+      # A real move in y, which the median carries once it holds the window: it
+      # fails from 12_000, and the flag goes at 15_000 — the first evaluation
+      # @stationary_exit_ms (2_500) past the first failure, not the first
+      # failure itself.
+      {t, events} = feed_all(t, for(n <- 11..15, do: {n * 1_000, moved}))
 
-      assert [{:started_moving, %Track{stationary: false}}] =
+      assert [{:started_moving, %Track{stationary: false, last_seen_at: flipped_at}}] =
                for({:started_moving, _} = e <- events, do: e)
 
-      assert [%Track{stationary: false, stationary_ms: 1_000}] = Tracker.live_tracks(t)
+      assert flipped_at == at(15_000)
+      assert [%Track{stationary: false, stationary_ms: 4_000}] = Tracker.live_tracks(t)
     end
 
     test "a host-matched track goes stationary on the same stillness path" do
@@ -647,6 +743,205 @@ defmodule Cairn.TrackerTest do
       {_t, [tagged], _} = track(Tracker.new(), [det("person", [0.1, 0.1, 0.2, 0.4])])
 
       assert Map.fetch!(tagged, :stationary) == false
+    end
+  end
+
+  describe "stationary exit hysteresis" do
+    test "the fixtures straddle @stationary_iou the way the live failure did" do
+      # Asserted by literal, because every test below writes the boxes and
+      # never the numbers: a fixture nudged to something that no longer
+      # straddles 0.8 would leave the whole block green and testing nothing.
+      assert_in_delta Tracker.iou(@small_car, @small_car_jitter), 0.636, 0.001
+      # one creep step is well *above* the threshold against the box before it,
+      # which is what makes it a slow walk rather than a jitter spike
+      assert_in_delta Tracker.iou(creep(3), creep(4)), 0.915, 0.001
+      # and three of them are below it against a fixed anchor
+      assert Tracker.iou(@small_car, creep(3)) < 0.8
+    end
+
+    test "a jitter excursion the median cannot absorb flips nothing" do
+      t = parked_small()
+
+      # Three jittered batches, which is the shortest excursion this rule can
+      # even see: the median needs three of its five boxes to move before it
+      # moves at all, and once three are in it they hold it for three
+      # evaluations. So the failure runs 11_500 through 12_500 — a full second,
+      # and still nowhere near @stationary_exit_ms (2_500).
+      {t, events} =
+        excursion(t, 10_500, [
+          @small_car_jitter,
+          @small_car_jitter,
+          @small_car_jitter,
+          @small_car,
+          @small_car,
+          @small_car,
+          @small_car
+        ])
+
+      assert ids(events, :started_moving) == []
+      # not merely un-emitted: the flag itself never wavered, batch by batch,
+      # which is what the aggregator reads to decide the car is not evidence
+      assert for({:updated, tr} <- events, do: tr.stationary) == List.duplicate(true, 7)
+      assert [%Track{stationary: true, stationary_since: since}] = Tracker.live_tracks(t)
+      assert since == at(10_000)
+    end
+
+    test "a two-second excursion flips nothing either, and the window accrues" do
+      t = parked_small()
+
+      # Five jittered batches: the median fails from 11_500 through 13_500,
+      # two full seconds of continuous failure, and 13_500 is the last of them
+      # because the window has turned back over by 14_000.
+      {t, events} =
+        excursion(
+          t,
+          10_500,
+          List.duplicate(@small_car_jitter, 5) ++ List.duplicate(@small_car, 3)
+        )
+
+      assert ids(events, :started_moving) == []
+      assert [%Track{stationary: true, stationary_since: since}] = Tracker.live_tracks(t)
+      assert since == at(10_000)
+
+      # `stationary_ms` counts the media time the flag was set, and it was set
+      # throughout: 10_000 to 14_000 with nothing skipped over the excursion.
+      assert [%Track{stationary_ms: 4_000}] = Tracker.live_tracks(t)
+    end
+
+    test "two excursions separated by a passing batch are not one long excursion" do
+      t = parked_small()
+
+      # Two of the two-second excursions above, with the median passing in
+      # between. Four seconds of failure in total, more than
+      # @stationary_exit_ms — and no flip, because the window measures an
+      # unbroken run and not a total. This is the load-bearing difference from
+      # a counter: a counter would have flipped somewhere in the second one.
+      {t, first} =
+        excursion(
+          t,
+          10_500,
+          List.duplicate(@small_car_jitter, 5) ++ List.duplicate(@small_car, 3)
+        )
+
+      {t, second} =
+        excursion(
+          t,
+          14_500,
+          List.duplicate(@small_car_jitter, 5) ++ List.duplicate(@small_car, 3)
+        )
+
+      assert ids(first ++ second, :started_moving) == []
+      assert [%Track{stationary: true, stationary_since: since}] = Tracker.live_tracks(t)
+      assert since == at(10_000)
+    end
+
+    test "an excursion leaves nothing behind: the flag, its instant, the whole settle" do
+      t = parked_small()
+
+      # The excursion ends and the car is back where it was parked, for ten
+      # seconds — long enough that a window left half-open, or a pending state
+      # that decayed into anything other than "no failure is running", would
+      # have had time to show.
+      #
+      # What this does *not* pin is the anchor, and no test shaped like it can:
+      # a car that returns to its own spot cannot tell a stable anchor from one
+      # that re-baselined onto the jitter, because the median walks the anchor
+      # back to the same place either way. The slow departure below is where
+      # anchor stability is observable, and it is the test that dies for it.
+      {t, events} =
+        excursion(
+          t,
+          10_500,
+          List.duplicate(@small_car_jitter, 3) ++ List.duplicate(@small_car, 20)
+        )
+
+      assert ids(events, :started_moving) == []
+      assert [%Track{stationary: true, stationary_since: since}] = Tracker.live_tracks(t)
+      assert since == at(10_000)
+    end
+
+    test "a slow departure still leaves the flag: the anchor holds through the window" do
+      t = parked_small()
+
+      # The slow walk, on a parked car: 0.004 of drift per batch, every step of
+      # it inside @stationary_iou of the step before it. The median crosses the
+      # anchor's threshold at 12_500 and never comes back, because the anchor
+      # does not follow — so this is a genuine departure and it flips
+      # @stationary_exit_ms later, at 15_000.
+      #
+      # This is where anchor stability is load-bearing and where it is
+      # observable. An anchor that re-baselined while the window was open —
+      # on every failure, or once when the window opened — would compare the
+      # car against where it was a batch or two ago, pass the very next
+      # evaluation, clear the window, and let it creep out of frame still
+      # flagged as parked. Neither variant flips this track at all.
+      {t, events} = excursion(t, 10_500, for(n <- 1..8, do: creep(n)))
+
+      assert ids(events, :started_moving) == []
+
+      {t, events} = excursion(t, 14_500, [creep(9), creep(10)])
+
+      assert [{:started_moving, %Track{last_seen_at: flipped_at}}] =
+               for({:started_moving, _} = e <- events, do: e)
+
+      assert flipped_at == at(15_000)
+      assert [%Track{stationary: false, stationary_since: nil}] = Tracker.live_tracks(t)
+    end
+
+    test "the window closes at @stationary_exit_ms exactly, and closes once" do
+      t = parked_small()
+
+      # The jitter that does not end: three batches to move the median, so the
+      # failure runs unbroken from 11_500.
+      {t, events} = excursion(t, 10_500, List.duplicate(@small_car_jitter, 3))
+      assert ids(events, :started_moving) == []
+
+      # One millisecond short of the window, from the same tracker state
+      {_short, [tagged], events} = feed(t, [{11_500 + 2_499, @small_car_jitter}])
+      assert ids(events, :started_moving) == []
+      assert tagged.stationary
+
+      # and exactly on it
+      {flipped, [tagged], events} = feed(t, [{11_500 + 2_500, @small_car_jitter}])
+
+      assert [{:started_moving, %Track{} = moved}] =
+               for({:started_moving, _} = e <- events, do: e)
+
+      refute tagged.stationary
+      refute moved.stationary
+      assert moved.stationary_since == nil
+      # the moment `Cairn.DetectionAggregator` records is timed by this, and it
+      # is the batch that closed the window rather than the one that opened it
+      assert moved.last_seen_at == at(14_000)
+
+      # once, not per failing evaluation: the flag is already clear, and the
+      # flip re-anchored onto the jittered box, so the jitter that follows is
+      # an ordinary settle
+      {_t, more} = excursion(flipped, 14_500, List.duplicate(@small_car_jitter, 4))
+      assert ids(more, :started_moving) == []
+    end
+
+    test "a detection gap neither closes a pending window nor clears it" do
+      t = parked_small()
+
+      {t, events} = excursion(t, 10_500, List.duplicate(@small_car_jitter, 3))
+      assert ids(events, :started_moving) == []
+
+      # Predicted boxes across a stretch far longer than @stationary_exit_ms.
+      # They do not evaluate stillness, so they neither complete the window nor
+      # clear it: media time passing with nothing to judge is not evidence the
+      # car left, and a gap that goes on is ended by the unseen bound.
+      {t, events} =
+        feed_all(t, for(n <- 1..5, do: {11_500 + n * 500, @small_car_jitter, "tracked"}))
+
+      assert ids(events, :started_moving) == []
+      assert [%Track{stationary: true}] = Tracker.live_tracks(t)
+
+      # the run is still open, and the next *detection* past the window closes
+      # it — the two failures bracket a stretch nothing contradicted
+      {_t, [tagged], events} = feed(t, [{14_000, @small_car_jitter}])
+      assert ids(events, :started_moving) != []
+      refute tagged.stationary
     end
   end
 
@@ -855,9 +1150,12 @@ defmodule Cairn.TrackerTest do
   end
 
   describe "duplicate suppression" do
-    # Every test here parks at 10_000 and then arrives at 14_000: 4_000 unseen,
-    # inside the grace (past @max_unseen 3_000, well short of 5 x 3_000), which
-    # is where a track is picky enough to refuse a box in the first place.
+    # The tests about a track *refusing* a box park at 10_000 and then arrive at
+    # 14_000: 4_000 unseen, inside the grace (past @max_unseen 3_000, well short
+    # of 5 x 3_000), which is where a track is picky enough to refuse in the
+    # first place. The ones about two boxes for one object need no grace at all
+    # — the track takes the first box in the ordinary way — and arrive at
+    # 11_000 instead.
     test "a drifted re-detection of a parked object is dropped, not minted" do
       # non-vacuity: refused by @stationary_match_iou (0.7), caught by
       # @duplicate_suppression_iou (0.4) — the band the whole rule is about
@@ -950,6 +1248,60 @@ defmodule Cairn.TrackerTest do
       assert parked.label == "car"
     end
 
+    # A detector without NMS emits two boxes for one object often enough to
+    # matter. The first takes the track; the second is left over with nothing
+    # left to match, and minting for it is how one parked car ends up with two
+    # concurrent live tracks in the same epoch.
+    test "two boxes for one object in one batch update one track and mint nothing" do
+      # the overlap the two anchors of the observed failure had: nothing about
+      # it looks like a second object — it is over @stationary_match_iou (0.7),
+      # let alone @duplicate_suppression_iou
+      assert_in_delta Tracker.iou(@parked_car, @car_double), 0.783, 0.001
+
+      {t, id} = parked(@parked_car, "car")
+
+      # one second after the track's last sighting, so no grace is involved:
+      # the track takes the first box at the base @iou_threshold
+      {t, tagged, events} =
+        track(t, [det("car", @parked_car), det("car", @car_double, score: 0.95)],
+          media_ms: 11_000,
+          observed_at: at(11_000)
+        )
+
+      assert [%{object_id: ^id, bbox: @parked_car}] = tagged
+      assert [{:updated, %Track{object_id: ^id}}] = events
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+    end
+
+    # The asymmetry in `seen/3`: presence is what a refused box is worth to a
+    # track *nothing* observed. A track this batch matched was observed for
+    # real, so the refusal must not add to it — and there is nothing left for it
+    # to add.
+    test "a second box over a matched track is refused, not merged into it" do
+      {t, id} = parked(@parked_car, "car")
+
+      {t, _tagged, _events} =
+        track(t, [det("car", @parked_car, score: 0.6), det("car", @car_double, score: 0.95)],
+          media_ms: 11_000,
+          observed_at: at(11_000)
+        )
+
+      assert [%Track{object_id: ^id} = still] = Tracker.live_tracks(t)
+
+      # every believed field is the *matched* detection's: the refused box's
+      # geometry is not in `bbox` and its 0.95 is in neither `score` nor
+      # `best_score` (0.9 is the best `parked/2` ever fed)
+      assert still.bbox == @parked_car
+      assert still.score == 0.6
+      assert still.best_score == 0.9
+
+      # and unlike a refusal against an unmatched track, which moves
+      # `last_seen_at` and nothing else, this track's evidence clock moved too
+      assert still.last_seen_at == at(11_000)
+      assert still.last_detected_at == at(11_000)
+      refute still.stale_predicted
+    end
+
     # Pixel units and an exact ratio on purpose: 80/200 is 0.4 in binary
     # floating point with nothing to round, so this is the one place in the
     # suite where `>=` and `>` on the threshold give different answers.
@@ -1032,22 +1384,28 @@ defmodule Cairn.TrackerTest do
       assert [{:updated, %Track{object_id: ^id, stationary: true, bbox: @car_drift}}] = events
     end
 
-    # Suppression looks only at tracks this batch left unmatched, and that is
-    # what keeps a genuinely new object over a tracked one mintable.
-    test "a track this batch matched does not suppress a second object over it" do
+    # Suppression considers every live host track, matched or not, so the only
+    # thing keeping a genuinely new object over a tracked one mintable is the
+    # same-label guard in `duplicate_of/2`. This is the case that guard is for —
+    # a person stepping in front of a tracked car — and the same geometry with
+    # one label is the double-detection test above, which must not mint.
+    test "a different-label object over a track this batch matched still mints" do
       assert_in_delta Tracker.iou(@walker, @walker_step), 0.5, 0.001
 
-      {t, [a], _} = track(Tracker.new(), [det("person", @walker)])
+      {t, [a], _} = track(Tracker.new(), [det("car", @walker)])
 
       {t, [a2, b], events} =
-        track(t, [det("person", @walker), det("person", @walker_step)],
+        track(t, [det("car", @walker), det("person", @walker_step)],
           media_ms: 200,
           observed_at: at(200)
         )
 
       assert a2.object_id == a.object_id
       assert ids(events, :updated) == [a.object_id]
-      assert [{:started, %Track{object_id: other}}] = for({:started, _} = e <- events, do: e)
+
+      assert [{:started, %Track{object_id: other, label: "person"}}] =
+               for({:started, _} = e <- events, do: e)
+
       assert b.object_id == other
       refute other == a.object_id
       assert length(Tracker.live_tracks(t)) == 2
@@ -1385,6 +1743,928 @@ defmodule Cairn.TrackerTest do
         end)
 
       refute log =~ "reused track id"
+    end
+  end
+
+  describe "suspension and adoption" do
+    # `parked/1` leaves a stationary track last detected at media 10_000 and at
+    # wall `at(10_000)`, which is the instant every gap below is measured from.
+    # Every `suspend/3` here is handed that same instant as the cut — a stream
+    # cut while it was still producing — so the two clocks the module keeps
+    # apart coincide. A test that needs them apart passes a later cut and says
+    # in its name which of the two it is about.
+    #
+    # The new epoch's media clock is deliberately set *ahead* of the old one's
+    # in these tests. Media time is per-stream and the tracker treats it as
+    # opaque, but only that direction exposes a clock the reset failed to
+    # re-base: an old-epoch instant left behind by a pts that restarted near
+    # zero yields a negative elapsed time, which every rule here already floors
+    # at zero, so the bug would pass unseen.
+    @box [0.0, 0.0, 0.4, 0.4]
+    # IoU 1/3 with @box — the two-objects-side-by-side case, under
+    # `@adoption_match_iou` (0.4), so it is nobody's identity
+    @shift_2 [0.2, 0.0, 0.4, 0.4]
+    # IoU 0.6: over the short tier's floor, under the long tier's
+    @shift_1 [0.1, 0.0, 0.4, 0.4]
+    # IoU 0.778: over `@stationary_match_iou` (0.7), under `@stationary_iou`
+    # (0.8), so both tiers adopt it and the stillness rule calls it movement
+    @shift_05 [0.05, 0.0, 0.4, 0.4]
+    # IoU 0.905 with @box, 0.379 with @shift_2
+    @shift_02 [0.02, 0.0, 0.4, 0.4]
+
+    # Pixel units and exact binary ratios, for the two tests that pin the
+    # adoption thresholds to the bit rather than to a band. `@brick` is
+    # 1_000 x 1_000 and every box below sits wholly inside it, so the union is
+    # `@brick`'s own area and the overlap is exactly the fraction of it the box
+    # covers — the same trick the pixel-unit fixtures elsewhere in this file
+    # use, and the only way to write "one thousandth under the constant"
+    # without hoping a float lands where the arithmetic says.
+    @brick [0, 0, 1000, 1000]
+    # 400_000 / 1_000_000 = `@adoption_match_iou`
+    @brick_40 [0, 0, 500, 800]
+    # 399_000 / 1_000_000
+    @brick_399 [0, 0, 500, 798]
+    # 700_000 / 1_000_000 = `@stationary_match_iou`
+    @brick_70 [0, 0, 1000, 700]
+    # 699_000 / 1_000_000
+    @brick_699 [0, 0, 1000, 699]
+
+    # Small and tall, against the one 0.4 x 0.4 square the fixtures above
+    # displace along x. `@adoption_match_iou`'s own reasoning is drawn from a
+    # car-sized box a few pixels of drift wide, and nothing above is either
+    # car-sized or displaced in y.
+    #
+    # 0.05 x 0.04 nudged along *both* axes: IoU 3/7, over the mover floor
+    @small_car [0.40, 0.50, 0.05, 0.04]
+    @small_car_drift [0.41, 0.51, 0.05, 0.04]
+    # `@walker` (0.10 x 0.30) nudged 0.04 down the frame: IoU 13/17, over the
+    # stationary floor
+    @walker_nudge [0.30, 0.24, 0.10, 0.30]
+    # and stepped 0.15 down it: IoU 1/3, under the mover floor — an overlap
+    # that ignored the y axis would read both of these as 1.0
+    @walker_stride [0.30, 0.35, 0.10, 0.30]
+
+    test "a stream reset suspends the live host tracks instead of ending them" do
+      {t, id} = parked(@box)
+      {t, events, info} = Tracker.suspend(t, 128, at(10_000))
+
+      # nothing ended, so nothing downstream is told anything
+      assert events == []
+      assert info == %{suspended: 1, ended: 0, at: at(10_000)}
+      assert Tracker.live_tracks(t) == []
+
+      assert [%Track{object_id: ^id, stationary: true, end_reason: nil}] =
+               Tracker.suspended_tracks(t)
+
+      # and it is still a track a checkpoint owes a final summary for
+      assert [%Track{object_id: ^id}] = Tracker.checkpoint_tracks(t)
+    end
+
+    test "a suspended track is out of ordinary matching" do
+      # far over the ordinary @iou_threshold (0.1): a *live* track would answer
+      # to this box without hesitating
+      assert_in_delta Tracker.iou(@box, @shift_2), 1 / 3, 0.001
+      assert Tracker.iou(@box, @shift_2) > 0.1
+
+      {t, id} = parked(@box)
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      {t, [tagged], events} =
+        track(t, [det("person", @shift_2)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(10_500)
+        )
+
+      assert [{:started, %Track{object_id: other}}] = events
+      assert tagged.object_id == other
+      refute other == id
+      # the suspension is untouched: it was neither adopted nor spent
+      assert [%Track{object_id: ^id}] = Tracker.suspended_tracks(t)
+    end
+
+    # The stitching-era form of the double-detection failure, on the same
+    # fixtures. `adopt/4` runs before `suppress_duplicates/4`, so the track it
+    # revives is in the live set by the time the leftover box is judged and is a
+    # suppression candidate like any other — which it can only be if the
+    # candidate list is read after the adoption rather than before it.
+    test "a second box of a just-adopted object in the same batch is suppressed" do
+      {t, id} = parked(@parked_car, "car")
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      # 300 ms of outage, so both boxes clear `@adoption_match_iou`; the exact
+      # one wins the suspension and the 0.783 one is left with nothing to adopt
+      {t, tagged, events} =
+        track(t, [det("car", @parked_car), det("car", @car_double)],
+          epoch: "epoch_two",
+          media_ms: 22_000,
+          observed_at: at(10_300)
+        )
+
+      assert [%{object_id: ^id, bbox: @parked_car}] = tagged
+      assert [{:updated, %Track{object_id: ^id}}, {:adopted, %Track{object_id: ^id}}] = events
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+      assert Tracker.suspended_tracks(t) == []
+    end
+
+    test "a short gap resumes a parked track's identity, its stillness and its clocks" do
+      {t, id} = parked(@box)
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      # 300 ms of outage, and a worse-scoring detection than the track's best
+      {t, [tagged], events} =
+        track(t, [det("person", @box, score: 0.4)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(10_300)
+        )
+
+      assert tagged.object_id == id
+      # the whole event list: no `:started`, no `:ended`, and the resumed
+      # summary immediately after the update it describes
+      assert [{:updated, updated}, {:adopted, adopted}] = events
+      assert updated == adopted
+      assert adopted.object_id == id
+      assert Tracker.suspended_tracks(t) == []
+
+      # the epoch follows the track to the stream it is now being seen in...
+      assert adopted.epoch == "epoch_two"
+      # ...while everything wall-clock about it is the track it always was
+      assert adopted.started_at == at(0)
+      assert adopted.best_score == 0.9
+      assert adopted.stationary
+      assert adopted.stationary_since == at(10_000)
+      # the settle window is not re-armed and the gap is not stillness anyone
+      # saw: `stationary_ms` counts media time this tracker actually watched it
+      # hold still, and it has watched none of the new epoch yet
+      assert adopted.stationary_ms == 0
+
+      # a second of the new epoch's media clock accrues a second, which is only
+      # true if the adoption re-based `last_detected_ms`: left on the old
+      # epoch's 10_000 this batch would have booked the 2_000 ms between two
+      # streams' clocks as time spent parked
+      {t, [_tagged], _events} =
+        track(t, [det("person", @box)],
+          epoch: "epoch_two",
+          media_ms: 13_000,
+          observed_at: at(11_300)
+        )
+
+      assert [%Track{object_id: ^id, stationary: true, stationary_ms: 1_000}] =
+               Tracker.live_tracks(t)
+    end
+
+    test "an adopted track that was not stationary settles on the new epoch's clock" do
+      held = [0.0, 0.0, 0.1, 0.3]
+      # moves once, then holds — anchored at `held` as of media 1_000, and
+      # nowhere near `stationary_after_ms` (10_000) of stillness by media 3_000
+      {t, id} = moving([[0.0, 0.2, 0.1, 0.3], held, held, held])
+      {t, [], info} = Tracker.suspend(t, 128, at(3_000))
+      assert info.at == at(3_000)
+
+      {t, [tagged], _events} =
+        track(t, [det("person", held)],
+          epoch: "epoch_two",
+          media_ms: 13_000,
+          observed_at: at(4_000)
+        )
+
+      assert tagged.object_id == id
+      # the anchor's clock came with it: on the old epoch's 1_000 this box
+      # would have read as 12_000 ms of stillness and flipped here
+      assert [%Track{stationary: false}] = Tracker.live_tracks(t)
+
+      {t, [_], events} =
+        track(t, [det("person", held)],
+          epoch: "epoch_two",
+          media_ms: 22_999,
+          observed_at: at(13_999)
+        )
+
+      assert ids(events, :became_stationary) == []
+
+      {_t, [_], events} =
+        track(t, [det("person", held)],
+          epoch: "epoch_two",
+          media_ms: 23_000,
+          observed_at: at(14_000)
+        )
+
+      # exactly `stationary_after_ms` after the adoption, on the new clock
+      assert ids(events, :became_stationary) == [id]
+    end
+
+    test "past the short bound only a stationary track is adoptable" do
+      last = [0.0, 0.0, 0.1, 0.3]
+      {mover, mover_id} = moving([[0.0, 0.2, 0.1, 0.3], last])
+      {mover, [], _info} = Tracker.suspend(mover, 128, at(1_000))
+
+      # 3_001 ms of absence, one past the camera's max_unseen_ms, and a box
+      # the track's own — nothing geometric refuses it, only the tier
+      {mover, [tagged], events} =
+        track(mover, [det("person", last)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(1_000 + 3_001)
+        )
+
+      assert [{:started, %Track{object_id: fresh}}] = events
+      assert tagged.object_id == fresh
+      refute fresh == mover_id
+      # refused, not spent: it waits out the rest of its window
+      assert [%Track{object_id: ^mover_id}] = Tracker.suspended_tracks(mover)
+
+      {parked, parked_id} = parked(@box)
+      {parked, [], _info} = Tracker.suspend(parked, 128, at(10_000))
+
+      {_parked, [tagged], events} =
+        track(parked, [det("person", @box)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(10_000 + 3_001)
+        )
+
+      assert tagged.object_id == parked_id
+      assert ids(events, :adopted) == [parked_id]
+      assert ids(events, :started) == []
+    end
+
+    test "the tier boundary is max_unseen_ms exactly, and the tiers demand different overlap" do
+      assert_in_delta Tracker.iou(@box, @shift_1), 0.6, 0.001
+      assert_in_delta Tracker.iou(@box, @shift_05), 0.778, 0.001
+
+      {t, id} = parked(@box)
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      # absence of exactly max_unseen_ms is still the short tier, where 0.6 is
+      # over `@adoption_match_iou`
+      {_short, [tagged], _events} =
+        track(t, [det("person", @shift_1)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(13_000)
+        )
+
+      assert tagged.object_id == id
+
+      # one millisecond later, from the same suspension: the long tier, where
+      # 0.6 is under `@stationary_match_iou` and buys nothing
+      {_long, [tagged], events} =
+        track(t, [det("person", @shift_1)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(13_001)
+        )
+
+      assert [{:started, %Track{object_id: other}}] = events
+      assert tagged.object_id == other
+      refute other == id
+
+      # ...and 0.78, at the same instant, does
+      {_long, [tagged], _events} =
+        track(t, [det("person", @shift_05)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(13_001)
+        )
+
+      assert tagged.object_id == id
+    end
+
+    test "the tier is measured from the track's own last sighting, not from the cut" do
+      {t, id} = parked(@box)
+      # an empty batch: the camera is still being observed, this track is not
+      {t, [], []} = track(t, [], media_ms: 11_000, observed_at: at(11_000))
+      {t, [], info} = Tracker.suspend(t, 128, at(11_000))
+      assert info.at == at(11_000)
+
+      # 2_500 ms after the cut — inside max_unseen_ms if the cut were what
+      # counted — but 3_500 ms since anything saw this track, which is not.
+      # Same box the short tier adopts at in the test above.
+      {t, [tagged], events} =
+        track(t, [det("person", @shift_1)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(13_500)
+        )
+
+      assert [{:started, %Track{object_id: other}}] = events
+      assert tagged.object_id == other
+      refute other == id
+      assert [%Track{object_id: ^id}] = Tracker.suspended_tracks(t)
+    end
+
+    test "a suspension is adoptable up to the window and ends where it was last seen" do
+      {t, id} = parked(@box)
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      # `@adoption_window_ms` (60_000) after the cut, to the millisecond
+      {_adopted, [tagged], _events} =
+        track(t, [det("person", @box)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(70_000)
+        )
+
+      assert tagged.object_id == id
+
+      # one millisecond past it: the suspension is settled before this batch's
+      # detections are matched, so the box that would have adopted it mints
+      {expired, [tagged], events} =
+        track(t, [det("person", @box)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(70_001)
+        )
+
+      assert [{:ended, final}, {:started, %Track{object_id: other}}] = events
+      assert tagged.object_id == other
+      refute other == id
+      assert final.object_id == id
+      assert final.end_reason == :stream_reset
+      assert_self_contained(final)
+
+      # the instant it was last actually seen, not the instant the waiting
+      # stopped: a minute of hoping is bookkeeping, not observation
+      assert final.last_seen_at == at(10_000)
+      assert final.last_detected_at == at(10_000)
+      assert final.started_at == at(0)
+      assert final.stationary
+
+      assert Tracker.suspended_tracks(expired) == []
+    end
+
+    test "expire_suspended/2 ends a lapsed suspension once, and needs a clock" do
+      {t, id} = parked(@box)
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      # inside the window, so nothing is owed yet
+      {same, []} = Tracker.expire_suspended(t, at(70_000))
+      assert [%Track{object_id: ^id}] = Tracker.suspended_tracks(same)
+
+      # no clock at all: the caller's timer is what has one
+      {unchanged, []} = Tracker.expire_suspended(t, nil)
+      assert [%Track{object_id: ^id}] = Tracker.suspended_tracks(unchanged)
+
+      {ended, [{:ended, final}]} = Tracker.expire_suspended(t, at(70_001))
+      assert final.object_id == id
+      assert final.end_reason == :stream_reset
+      assert final.last_seen_at == at(10_000)
+
+      # once, whoever asks again and however much later
+      assert Tracker.suspended_tracks(ended) == []
+      assert {^ended, []} = Tracker.expire_suspended(ended, at(999_999))
+    end
+
+    test "end_all/3 ends a suspension as the reset that made it, whatever reason it is given" do
+      {t, suspended_id} = parked(@box)
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      {t, [live], _events} =
+        track(t, [det("cat", [0.6, 0.6, 0.2, 0.2])],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(10_100)
+        )
+
+      {emptied, events} = Tracker.end_all(t, :detection_disabled)
+
+      # the live track ends of the thing that happened to it; the suspended one
+      # ends of the thing that happened to it, which was the reset
+      assert [{:ended, cat}, {:ended, ghost}] =
+               Enum.sort_by(events, fn {:ended, track} -> track.label end)
+
+      assert cat.object_id == live.object_id
+      assert cat.end_reason == :detection_disabled
+      assert ghost.object_id == suspended_id
+      assert ghost.end_reason == :stream_reset
+      assert ghost.last_seen_at == at(10_000)
+
+      assert Tracker.live_tracks(emptied) == []
+      assert Tracker.suspended_tracks(emptied) == []
+    end
+
+    test "a plugin-owned track is severed by the cut rather than suspended" do
+      {t, [a], _events} =
+        track(Tracker.new(), [det("person", @box, track_id: "t1")], plugin_ctx([]))
+
+      {t, events, info} = Tracker.suspend(t, 128, at(0))
+
+      assert [{:ended, final}] = events
+      assert final.object_id == a.object_id
+      assert final.source == :plugin
+      assert final.end_reason == :stream_reset
+      assert %{suspended: 0, ended: 1} = info
+      assert DateTime.compare(info.at, at(0)) == :eq
+      assert Tracker.suspended_tracks(t) == []
+    end
+
+    test "the suspended set is trimmed to the cap, oldest generation first" do
+      # 100 ms apart across a month boundary, deliberately. Erlang term order
+      # over a `%DateTime{}` is its fields in key order — `day` before `month`
+      # before `year` — so on any two instants inside one month, sorting the
+      # structs directly agrees with sorting the instants, and every other
+      # fixture in this file would let that mistake through.
+      older = ~U[2026-07-31 23:59:59.900Z]
+      newer = ~U[2026-08-01 00:00:00.000Z]
+
+      {t, [first], _events} =
+        track(Tracker.new(), [det("person", @box)], media_ms: 0, observed_at: older)
+
+      {t, [], _info} = Tracker.suspend(t, 2, older)
+
+      {t, [second], _events} =
+        track(t, [det("cat", [0.6, 0.6, 0.2, 0.2])],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: newer
+        )
+
+      # a camera reconnecting in a loop must not stack a generation of ghosts
+      # per attempt: at a cap of one, the older suspension is the one that goes
+      {t, events, info} = Tracker.suspend(t, 1, newer)
+
+      assert [{:ended, %Track{object_id: ended_id, end_reason: :stream_reset}}] = events
+      assert ended_id == first.object_id
+      assert info == %{suspended: 1, ended: 1, at: newer}
+      assert [%Track{object_id: id}] = Tracker.suspended_tracks(t)
+      assert id == second.object_id
+    end
+
+    test "a live track outranks a suspended one for the same box" do
+      {t, ghost} = parked(@box)
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      # under the adoption floor, so this mints rather than adopting
+      {t, [fresh], _events} =
+        track(t, [det("person", @shift_2)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(10_100)
+        )
+
+      refute fresh.object_id == ghost
+
+      # a box the ghost would take at 0.9 and the live track only at 0.38 —
+      # but the live pass runs first, and an object something is currently
+      # seeing outranks the ghost of one nothing has seen since the cut
+      assert Tracker.iou(@box, @shift_02) > 0.7
+      assert Tracker.iou(@shift_2, @shift_02) > 0.1
+
+      {t, [tagged], events} =
+        track(t, [det("person", @shift_02)],
+          epoch: "epoch_two",
+          media_ms: 12_500,
+          observed_at: at(10_600)
+        )
+
+      assert tagged.object_id == fresh.object_id
+      assert ids(events, :adopted) == []
+      assert [%Track{object_id: ^ghost}] = Tracker.suspended_tracks(t)
+    end
+
+    test "one box resumes one identity, however many suspensions it overlaps" do
+      # Two generations of ghost, from two cuts a fifth of a second apart: a
+      # parked car and, from the epoch after it, a walker that minted its own
+      # identity because it was under the adoption floor from the car.
+      {t, parked_id} = parked(@box)
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      {t, [walker], _events} =
+        track(t, [det("person", @shift_2)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(10_100)
+        )
+
+      refute walker.object_id == parked_id
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_200))
+      assert length(Tracker.suspended_tracks(t)) == 2
+
+      # a box between the two, adoptable by *both* on the mover tier
+      assert_in_delta Tracker.iou(@box, @shift_05), 0.778, 0.001
+      assert_in_delta Tracker.iou(@shift_2, @shift_05), 0.4545, 0.001
+
+      {t, [tagged], events} =
+        track(t, [det("person", @shift_05)],
+          epoch: "epoch_three",
+          media_ms: 20_000,
+          observed_at: at(10_300)
+        )
+
+      # the better overlap takes it, and only it: one detection is one object,
+      # so the second suspension is left waiting rather than revived beside it
+      assert tagged.object_id == parked_id
+      assert ids(events, :adopted) == [parked_id]
+      assert ids(events, :started) == []
+      assert [%Track{object_id: still_waiting}] = Tracker.suspended_tracks(t)
+      assert still_waiting == walker.object_id
+    end
+
+    test "a suspension already past its window is collected by the next cut" do
+      {t, id} = parked(@box)
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      # No batch ever arrives, so the camera's last observation is still
+      # at(10_000) — but the second cut is a minute and a bit after the first,
+      # and the window this suspension is judged against is the one that
+      # started at the first cut.
+      {t, events, info} = Tracker.suspend(t, 128, at(70_001))
+
+      assert [{:ended, %Track{object_id: ^id, end_reason: :stream_reset}}] = events
+      assert info == %{suspended: 0, ended: 1, at: at(10_000)}
+      assert Tracker.suspended_tracks(t) == []
+    end
+
+    test "a box a suspended track will not answer to is minted, not dropped as its duplicate" do
+      last = [0.0, 0.0, 0.4, 0.4]
+      {t, id} = moving([[0.2, 0.2, 0.4, 0.4], last])
+      {t, [], _info} = Tracker.suspend(t, 128, at(1_000))
+
+      # 0.6 overlap, which is over `@duplicate_suppression_iou` (0.4): an
+      # unmatched *live* track this close would have this box dropped and be
+      # marked seen by it. A suspended one is not in that pass either — it is
+      # not a live track, and a drop would leave whatever is really there
+      # untracked while the ghost it was blamed on cannot be seen at all.
+      {_t, [tagged], events} =
+        track(t, [det("person", @shift_1)],
+          epoch: "epoch_two",
+          media_ms: 13_000,
+          observed_at: at(1_000 + 5_000)
+        )
+
+      assert [{:started, %Track{object_id: other}}] = events
+      assert tagged.object_id == other
+      refute other == id
+    end
+
+    test "a predicted box may not resume an identity, however well it overlaps" do
+      {t, id} = parked(@box)
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      # the plugin's own extrapolation of where the object would be if it were
+      # still there — which, across a gap nothing observed, is the question
+      {predicted, [tagged], events} =
+        track(t, [det("person", @box, kind: "tracked")],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(10_300)
+        )
+
+      assert [{:started, %Track{object_id: other}}] = events
+      assert tagged.object_id == other
+      refute other == id
+      assert [%Track{object_id: ^id}] = Tracker.suspended_tracks(predicted)
+
+      # withheld rather than lost: from the same suspension, the same box
+      # *detected* resumes the identity
+      {detected, [tagged], events} =
+        track(t, [det("person", @box)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(10_300)
+        )
+
+      assert tagged.object_id == id
+      assert ids(events, :adopted) == [id]
+      assert Tracker.suspended_tracks(detected) == []
+    end
+
+    test "an adopted track that came back where it was stays stationary, batch after batch" do
+      {t, id} = parked(@box)
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      # 0.905 overlap with the space it was parked in: the same car, seen a
+      # couple of pixels off. It resumes already stationary — which is the
+      # whole point of suspending rather than ending it, since
+      # `Cairn.DetectionAggregator` refuses a stationary track as evidence —
+      # and it stays that way. Four batches, because the failure this guards
+      # against is a stillness window that only turns over after a few of them.
+      {_t, adopting} =
+        Enum.reduce(0..3, {t, nil}, fn n, {t, first} ->
+          {t, [tagged], events} =
+            track(t, [det("person", @shift_02)],
+              epoch: "epoch_two",
+              media_ms: 12_000 + n * 1_000,
+              observed_at: at(10_300 + n * 1_000)
+            )
+
+          assert tagged.object_id == id
+          assert tagged.stationary
+          assert ids(events, :started_moving) == []
+
+          assert [%Track{object_id: ^id, stationary: true, stationary_since: since}] =
+                   Tracker.live_tracks(t)
+
+          # the settle window never re-armed: this is the instant it first
+          # held still, before the cut
+          assert since == at(10_000)
+          {t, first || events}
+        end)
+
+      assert ids(adopting, :adopted) == [id]
+    end
+
+    test "an adopted track whose box has shifted off its anchor fails stillness at once, and flips a window later" do
+      {t, id} = parked(@box)
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      # 0.778 overlap: adoptable on either tier, and under `@stationary_iou`
+      # (0.8), so it is a shift the stillness rule calls a failure. It is
+      # called that on the adopting batch, because `revive/3` empties the
+      # median window — the four boxes that used to outvote this one belong to
+      # a stream that is gone, and while they held the majority a car that
+      # drove off during the outage went on reading as parked, which is to say
+      # as something the aggregator refuses as evidence.
+      #
+      # The flag itself does not go on that batch. A shifted adoption is a real
+      # sustained departure — the object is not where it was and, unlike
+      # jitter, will not be back — so it takes the ordinary exit window rather
+      # than an exemption, and reports 2.5 s later than it used to. Against a
+      # departure that is fine: it costs the trigger @stationary_exit_ms, which
+      # is well inside an event's pre-roll.
+      {t, [tagged], events} =
+        track(t, [det("person", @shift_05)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(10_300)
+        )
+
+      assert tagged.object_id == id
+      assert ids(events, :adopted) == [id]
+      assert ids(events, :started_moving) == []
+      assert tagged.stationary
+      assert [%Track{object_id: ^id, stationary: true}] = Tracker.live_tracks(t)
+
+      # still inside the window
+      {t, [tagged], events} =
+        track(t, [det("person", @shift_05)],
+          epoch: "epoch_two",
+          media_ms: 14_499,
+          observed_at: at(12_799)
+        )
+
+      assert ids(events, :started_moving) == []
+      assert tagged.stationary
+
+      # @stationary_exit_ms (2_500) of unbroken failure from the adopting batch
+      {t, [tagged], events} =
+        track(t, [det("person", @shift_05)],
+          epoch: "epoch_two",
+          media_ms: 14_500,
+          observed_at: at(12_800)
+        )
+
+      assert ids(events, :started_moving) == [id]
+      refute tagged.stationary
+      assert [%Track{object_id: ^id, stationary: false}] = Tracker.live_tracks(t)
+
+      # and it settles again on the new epoch's clock, from the box it moved to
+      {t, [_], events} =
+        track(t, [det("person", @shift_05)],
+          epoch: "epoch_two",
+          media_ms: 15_500,
+          observed_at: at(13_800)
+        )
+
+      assert ids(events, :became_stationary) == []
+
+      {_t, [_], events} =
+        track(t, [det("person", @shift_05)],
+          epoch: "epoch_two",
+          media_ms: 24_500,
+          observed_at: at(22_800)
+        )
+
+      # `stationary_after_ms` (10_000) after the flip re-anchored it
+      assert ids(events, :became_stationary) == [id]
+    end
+
+    test "the window runs from the cut, not from the camera's last sighting" do
+      {t, id} = parked(@box)
+
+      # the stream goes quiet at at(10_000) and ffmpeg only gives up on it
+      # forty seconds later, so the cut and the last sighting are far apart
+      {t, [], info} = Tracker.suspend(t, 128, at(50_000))
+      # the outage *gap* is still reported to the last sighting — that is what
+      # a gap is — and it is not what bounds the waiting
+      assert info.at == at(10_000)
+
+      # 50 s after the cut and 90 s after the last sighting: measured from the
+      # sighting this suspension lapsed half a minute ago, measured from the
+      # cut it has ten seconds left. Same box it was parked at, so the
+      # stationary tier — the only one still open this far out — takes it back.
+      {adopted, [tagged], events} =
+        track(t, [det("person", @box)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(100_000)
+        )
+
+      assert tagged.object_id == id
+      assert ids(events, :adopted) == [id]
+      assert ids(events, :started) == []
+      assert Tracker.suspended_tracks(adopted) == []
+
+      # `@adoption_window_ms` (60_000) from the cut, to the millisecond
+      {_last_chance, [tagged], _events} =
+        track(t, [det("person", @box)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(110_000)
+        )
+
+      assert tagged.object_id == id
+
+      # and one past it the box mints instead
+      {_expired, [tagged], events} =
+        track(t, [det("person", @box)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(110_001)
+        )
+
+      assert [{:ended, final}, {:started, %Track{object_id: other}}] = events
+      assert tagged.object_id == other
+      assert final.object_id == id
+      assert final.end_reason == :stream_reset
+      # the summary is still timestamped where the object was last seen, which
+      # is a hundred seconds before the waiting stopped
+      assert final.last_seen_at == at(10_000)
+      refute other == id
+    end
+
+    test "the mover tier is capped short of an operator's max_unseen_ms" do
+      last = [0.0, 0.0, 0.1, 0.3]
+      {mover, mover_id} = moving([[0.0, 0.2, 0.1, 0.3], last])
+      {mover, [], _info} = Tracker.suspend(mover, 128, at(1_000))
+
+      # A deployment that has raised `max_unseen_ms` to 15 s to ride out slow
+      # inference. That is patience with the plugin, not a claim about how far
+      # a walker can get, so the mover tier still closes at
+      # `@mover_adoption_max_ms` (3_000) and a box arriving one millisecond
+      # later is a new object however well it overlaps.
+      {_t, [tagged], events} =
+        track(mover, [det("person", last)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          max_unseen_ms: 15_000,
+          observed_at: at(1_000 + 3_001)
+        )
+
+      assert [{:started, %Track{object_id: other}}] = events
+      assert tagged.object_id == other
+      refute other == mover_id
+
+      # a millisecond earlier, the same box under the same config resumes it
+      {_t, [tagged], events} =
+        track(mover, [det("person", last)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          max_unseen_ms: 15_000,
+          observed_at: at(1_000 + 3_000)
+        )
+
+      assert tagged.object_id == mover_id
+      assert ids(events, :adopted) == [mover_id]
+
+      # below the cap the config is still what bounds the tier: a camera that
+      # calls one second of absence extraordinary is taken at its word
+      {_t, [tagged], events} =
+        track(mover, [det("person", last)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          max_unseen_ms: 1_000,
+          observed_at: at(1_000 + 1_001)
+        )
+
+      assert [{:started, %Track{object_id: fresh}}] = events
+      assert tagged.object_id == fresh
+      refute fresh == mover_id
+
+      {_t, [tagged], events} =
+        track(mover, [det("person", last)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          max_unseen_ms: 1_000,
+          observed_at: at(1_000 + 1_000)
+        )
+
+      assert tagged.object_id == mover_id
+      assert ids(events, :adopted) == [mover_id]
+    end
+
+    test "the mover tier's floor is @adoption_match_iou exactly" do
+      assert Tracker.iou(@brick, @brick_40) === 0.4
+      assert Tracker.iou(@brick, @brick_399) === 0.399
+
+      {t, id} = parked(@brick)
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      # one second of absence, so this is the mover tier and 0.4 is its floor
+      {_adopted, [tagged], events} =
+        track(t, [det("person", @brick_40)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(11_000)
+        )
+
+      assert tagged.object_id == id
+      assert ids(events, :adopted) == [id]
+
+      # a thousandth under the floor mints instead
+      {_minted, [tagged], events} =
+        track(t, [det("person", @brick_399)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(11_000)
+        )
+
+      assert [{:started, %Track{object_id: other}}] = events
+      assert tagged.object_id == other
+      refute other == id
+    end
+
+    test "the stationary tier's floor is @stationary_match_iou exactly" do
+      assert Tracker.iou(@brick, @brick_70) === 0.7
+      assert Tracker.iou(@brick, @brick_699) === 0.699
+
+      {t, id} = parked(@brick)
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      # past the mover tier, so 0.7 is being asked of the stationary tier's own
+      # floor rather than of the one above
+      {_adopted, [tagged], events} =
+        track(t, [det("person", @brick_70)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(13_001)
+        )
+
+      assert tagged.object_id == id
+      assert ids(events, :adopted) == [id]
+
+      {_minted, [tagged], events} =
+        track(t, [det("person", @brick_699)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(13_001)
+        )
+
+      assert [{:started, %Track{object_id: other}}] = events
+      assert tagged.object_id == other
+      refute other == id
+    end
+
+    test "a small box is adopted on the mover tier, displaced in both axes" do
+      assert_in_delta Tracker.iou(@small_car, @small_car_drift), 3 / 7, 0.001
+
+      {t, id} = parked(@small_car, "car")
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      {_t, [tagged], events} =
+        track(t, [det("car", @small_car_drift)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(11_000)
+        )
+
+      assert tagged.object_id == id
+      assert ids(events, :adopted) == [id]
+      assert ids(events, :started) == []
+    end
+
+    test "a tall box is adopted on the stationary tier, displaced in y" do
+      assert_in_delta Tracker.iou(@walker, @walker_nudge), 13 / 17, 0.001
+      assert_in_delta Tracker.iou(@walker, @walker_stride), 1 / 3, 0.001
+
+      {t, id} = parked(@walker)
+      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+
+      # past the mover tier, so 0.765 is asked of the stationary floor
+      {_t, [tagged], events} =
+        track(t, [det("person", @walker_nudge)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(13_001)
+        )
+
+      assert tagged.object_id == id
+      assert ids(events, :adopted) == [id]
+
+      # the same box a stride further down the frame is somebody else, on the
+      # tier that would have taken it most easily: an overlap that dropped the
+      # y axis would read this as 1.0 and hand over the identity
+      {_t, [tagged], events} =
+        track(t, [det("person", @walker_stride)],
+          epoch: "epoch_two",
+          media_ms: 12_000,
+          observed_at: at(11_000)
+        )
+
+      assert [{:started, %Track{object_id: other}}] = events
+      assert tagged.object_id == other
+      refute other == id
     end
   end
 

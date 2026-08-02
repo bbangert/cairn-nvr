@@ -23,13 +23,32 @@ defmodule Cairn.Track do
       observation time it flipped (`nil` while moving) and `stationary_ms`
       the total media time it has spent stationary over the track's whole
       life, which only ever grows — a track that moves and settles again
-      carries the sum of both stretches.
+      carries the sum of both stretches. The flag is hysteretic in both
+      directions: it clears only after the box has *kept* failing the
+      stillness test for `Cairn.Tracker`'s exit window, so a stationary track
+      whose detector jitters stays flagged and a real departure is reported a
+      couple of seconds after it starts. Nothing intermediate is published —
+      a track waiting out that window is `stationary: true` like any other.
+    * `epoch` is the stream the track was last observed under, not the one it
+      was minted in: a host track can survive a stream reset by being adopted
+      on the far side of it (`Cairn.Tracker`), keeping its `object_id` and its
+      `started_at` while its `epoch` moves on.
     * `end_reason` is `nil` until the track ends: `:unseen` (expired),
-      `:plugin_ended` (named in `ended_tracks`), `:stream_reset` (new stream
-      epoch), `:evicted` (the camera hit its live-track cap and this was the
-      least recently seen track), `:detection_disabled` (detection was turned
-      off at runtime), `:host_restart` (restored from a checkpoint after a
-      crash).
+      `:plugin_ended` (named in `ended_tracks`), `:stream_reset` (a new stream
+      epoch severed it and nothing adopted it), `:evicted` (the camera hit its
+      live-track cap and this was the least recently seen track),
+      `:detection_disabled` (detection was turned off at runtime),
+      `:host_restart` (restored from a checkpoint after a crash).
+
+  A `:stream_reset` final can arrive long after the times it carries. A host
+  track cut by a stream reset is suspended rather than ended, and only when its
+  adoption window runs out with nothing having adopted it is the final emitted
+  — timestamped at the last observation before the cut, because that is when
+  the object was last actually seen. The window is a minute from the *cut*, and
+  the cut can itself be well after that last observation: a stream that goes
+  quiet is not cut until ffmpeg gives up on it. Nothing is broadcast in
+  between: a consumer either sees the track resume (as `track_updated`, on the
+  new epoch) or sees it end once, and never sees it end twice.
 
   ## How far the final-summary guarantee reaches
 

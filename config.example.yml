@@ -46,7 +46,9 @@ events:
 # that mints a fresh track id every frame cannot grow the host's state without
 # bound.
 # stationary_after_ms is how long an object's box must hold still, in stream
-# time, before the track is reported as stationary.
+# time, before the track is reported as stationary. Leaving that state is
+# sustained too, over a fixed couple of seconds that is not configurable: it is
+# sized against detector jitter rather than against the scene.
 tracking:
   max_unseen_ms: 3000
   max_live_tracks: 128

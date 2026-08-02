@@ -42,10 +42,11 @@ defmodule Cairn.DetectionAggregator do
   `%Cairn.Track{}` summaries: `track_started` and `track_ended` always,
   `track_updated` only when the track's best score improves or a second of
   wall clock has passed since its last update — a 5 fps stream with a dozen
-  objects must not become a firehose of identical frames. A stationary
-  transition is published immediately whatever the throttle says: the flag
-  decides whether the object is evidence, so a consumer must not learn of the
-  flip up to a second after this module has already acted on it.
+  objects must not become a firehose of identical frames. Two `track_updated`
+  frames ignore the throttle: a stationary transition, because the flag decides
+  whether the object is evidence and a consumer must not learn of the flip up
+  to a second after this module has already acted on it; and a track resuming
+  after a stream reset, which is the frame carrying its new `epoch`.
 
   The same lifecycle feeds the track index through `Cairn.TrackRecorder`:
   `:appeared` and the stationary flips are buffered as timeline moments, and
@@ -71,18 +72,28 @@ defmodule Cairn.DetectionAggregator do
   included — and their delivery order relative to the finalize cast is what
   keeps the last batch of an event; see `forward_boxes/3`.
 
-  Subscribes to `Cairn.StreamEpochs`: a new epoch for a camera ends every
-  live track (`:stream_reset`) and starts a fresh tracker, so no identity is
-  ever inherited across an outage. Turning detection off at runtime ends them
-  too (`:detection_disabled`) — nothing would advance them while it is off.
+  Subscribes to `Cairn.StreamEpochs`: a new epoch for a camera **suspends**
+  its live host-mode tracks rather than ending them (`Cairn.Tracker.suspend/3`),
+  so a detection in the new stream can adopt an identity the outage
+  interrupted instead of minting a second one for the same parked car. What
+  adoption demands of it, and what it resumes, is the tracker's moduledoc. A
+  suspension nothing adopts inside the window ends `:stream_reset` — on a
+  later batch, or on this process's own timer for a camera whose stream never
+  returns — with the timestamps it had at the cut. Plugin-owned tracks still
+  end at the boundary, and so does everything on a camera that stops. Turning
+  detection off at runtime ends both sets (`:detection_disabled` for the live
+  ones, `:stream_reset` for anything still suspended) — nothing would advance
+  them while it is off.
 
   Active events are checkpointed to `Cairn.EventCheckpoint` (ETS owned
-  elsewhere) together with the tracks live at that moment: on restart the
-  aggregator re-attaches to live extractors, finalizes orphans, and ends every
-  restored track (`:host_restart`) — broadcasting it and recording it against
-  the checkpointed event, the open-event rule above. Writes are throttled to
-  one a second per camera apart from the event's first and last. How far that
-  reaches, and what it does not cover, is `Cairn.Track`'s moduledoc.
+  elsewhere) together with the tracks live *and* suspended at that moment: on
+  restart the aggregator re-attaches to live extractors, finalizes orphans, and
+  ends every restored track (`:host_restart`) — broadcasting it and recording
+  it against the checkpointed event, the open-event rule above. A suspension
+  cannot outlive the tracker that would have adopted it, so it dies there with
+  the rest. Writes are throttled to one a second per camera apart from the
+  event's first and last. How far that reaches, and what it does not cover, is
+  `Cairn.Track`'s moduledoc.
   """
 
   use GenServer
@@ -145,7 +156,19 @@ defmodule Cairn.DetectionAggregator do
       # the database — see `Cairn.TrackRecorder`.
       recorder: Keyword.get(opts, :recorder, TrackRecorder),
       # injectable so the update throttle can be tested without sleeping
-      monotonic_ms: Keyword.get(opts, :monotonic_ms, &default_monotonic_ms/0)
+      monotonic_ms: Keyword.get(opts, :monotonic_ms, &default_monotonic_ms/0),
+      # How long after a stream reset this process sweeps the suspensions the
+      # tracker is holding. Injectable for the same reason: the real delay is
+      # the adoption window plus slack, and no test should sit through a
+      # minute of it to prove the backstop is armed.
+      window_ms: Keyword.get(opts, :window_ms, Tracker.adoption_window_ms() + 1_000),
+      # The wall instant a stream cut is stamped with, which is what the
+      # tracker measures the adoption window from. Injectable alongside
+      # `window_ms` and for the same reason: the window is a wall-clock minute,
+      # so a test proving a suspension lapses has to be able to put the cut a
+      # minute in the past. The sweep itself always reads the real clock — the
+      # two are what an elapsed time is taken between.
+      cut_clock: Keyword.get(opts, :cut_clock, &now/0)
     }
 
     {:ok, restore_from_checkpoint(state)}
@@ -246,6 +269,7 @@ defmodule Cairn.DetectionAggregator do
           policy: policy,
           camera: camera
       }
+      |> report_link(camera.id, observation, track_events)
       |> publish_tracks(track_events, state)
 
     # A predicted ("tracked") object, a track the plugin keeps predicting long
@@ -286,7 +310,16 @@ defmodule Cairn.DetectionAggregator do
   # from what is drawn over video already recorded, and a path with holes in it
   # reads as a second object rather than as a gap.
   #
-  # The one gap left is upstream: a box `Cairn.Tracker` refused and suppressed
+  # One path may now span a stream reset: an identity adopted out of suspension
+  # keeps its ULID, so its samples continue across the splice in the clip. They
+  # stay ordered and drawable — `t_ms` is wall-clock offset from the event's
+  # start, not media time, so nothing here reads the pts that restarted — but
+  # the clip's own media timeline is non-monotonic past the splice, and any
+  # pts-anchored alignment of boxes to frames degrades after it. That is a
+  # property of the spliced clip and not of this list; it predates adoption,
+  # which only means a single track id can now be on both sides of it.
+  #
+  # The other gap is upstream: a box `Cairn.Tracker` refused and suppressed
   # as a duplicate never reaches `tagged` at all, and cannot, because it has no
   # `object_id` to draw it under. That is the trade the tracker makes on
   # purpose — a gap in one path, rather than a second path over the same
@@ -412,11 +445,16 @@ defmodule Cairn.DetectionAggregator do
     end
   end
 
-  # A new epoch is a new continuous decode: the camera may have moved during
-  # the outage, so no track may span the boundary — otherwise a box that
-  # happens to overlap the last one inherits its identity. Every live track is
-  # ended (`:stream_reset`) with a final summary before the fresh tracker takes
-  # over. An in-flight event keeps running and finalizes on its own timers.
+  # A new epoch is a new continuous decode. Nothing observed the gap, so no
+  # track may go on matching *ordinarily* across it — but most of the time the
+  # objects either side are the same objects, and ending them all was itself a
+  # defect: a parked car severed by a 300 ms reconnect re-minted, spent its
+  # settle window looking like a new arrival, and that is evidence, and
+  # evidence is a clip. The live host tracks are therefore suspended (see the
+  # moduledoc and `Cairn.Tracker.suspend/3`) and only what cannot be adopted —
+  # plugin-owned tracks, a generation of ghosts the cap pushed out, a
+  # suspension whose window already lapsed — gets a final summary here. An
+  # in-flight event keeps running and finalizes on its own timers.
   #
   # Detection casts already in flight when this arrives are processed *after*
   # the reset: they come from the plugin ports, not from `Cairn.StreamEpochs`,
@@ -434,6 +472,52 @@ defmodule Cairn.DetectionAggregator do
       {:noreply, state}
     else
       {:noreply, apply_epoch(state, camera_id, epoch, reason)}
+    end
+  end
+
+  # A suspension is collected by whatever comes first — a batch, another reset,
+  # or this. It exists for the case where nothing comes first: a camera whose
+  # stream never returns produces no observations to notice the window running
+  # out on, and its consumers would wait forever for a final summary the
+  # tracker is still holding.
+  #
+  # Deliberately unguarded by a token, unlike the event timers. A token there
+  # keeps a stale message from finalizing the *current* event, which is a
+  # different event from the one the message named; this message names no
+  # suspension, and the sweep ends whatever has actually lapsed and nothing
+  # else, so running it early or twice is a map walk with no result. What it
+  # is guarded by is `window_ref`: `window_timer/3` cancels the pending sweep
+  # before arming the next, so a camera holds one *armed* timer rather than one
+  # per reset however fast it flaps. A message already in the mailbox when the
+  # cancel lands is still delivered — which is the harmless case above.
+  #
+  # It re-arms while anything is still suspended, and that is the only thing
+  # standing between a missed sweep and a suspension that never ends. The slack
+  # past the window (`window_timer/3`) makes the first sweep land after the
+  # window in ordinary time — this timer runs on the monotonic clock and the
+  # window is measured on the wall clock — but a wall clock stepped backwards
+  # in between leaves the sweep finding nothing, and for the camera this timer
+  # exists for there is no next batch and no next reset to try again. Without
+  # the re-arm that suspension is stranded, against `Cairn.Track`'s promise
+  # that a consumer sees a track end once. With it the cost is one extra hop in
+  # the normal case (find nothing, arm nothing, because the sweep that lapses
+  # the last suspension leaves none behind) and one map walk per window until
+  # the clock catches up in the abnormal one.
+  def handle_info({:adoption_window, camera_id}, state) do
+    case state.cameras do
+      %{^camera_id => cam} ->
+        {tracker, lapsed} = Tracker.expire_suspended(cam.tracker, now())
+
+        cam =
+          %{cam | tracker: tracker, window_ref: nil}
+          |> publish_tracks(lapsed, state)
+          |> rearm_window(camera_id, state)
+
+        report_expired(camera_id, lapsed)
+        {:noreply, put_cam(state, camera_id, cam)}
+
+      _ ->
+        {:noreply, state}
     end
   end
 
@@ -462,9 +546,10 @@ defmodule Cairn.DetectionAggregator do
   def handle_info(_msg, state), do: {:noreply, state}
 
   # `:camera_stopped` names the end of a stream, not the start of one: nothing
-  # will ever decode under that epoch. It ends the live tracks (the stream they
-  # belong to is over) but must never become `current_epoch` — the stop and the
-  # start of one camera are announced by different processes, and on the
+  # will ever decode under that epoch. It ends the live tracks and any
+  # suspended ones (the stream they belong to is over, so nothing is coming
+  # that could adopt them) but must never become `current_epoch` — the stop
+  # and the start of one camera are announced by different processes, and on the
   # degraded caller-side broadcast path they have no ordering relation, so a
   # stop epoch minted after a live `:started` could otherwise be adopted as
   # current and `stale?/3` would then drop every observation of a *healthy*
@@ -475,7 +560,12 @@ defmodule Cairn.DetectionAggregator do
     case state.cameras do
       %{^camera_id => cam} ->
         {tracker, ended} = Tracker.end_all(cam.tracker, :stream_reset)
-        put_cam(state, camera_id, publish_tracks(%{cam | tracker: tracker}, ended, state))
+
+        put_cam(
+          state,
+          camera_id,
+          publish_tracks(%{cam | tracker: tracker, gap_from: nil}, ended, state)
+        )
 
       _ ->
         state
@@ -498,10 +588,23 @@ defmodule Cairn.DetectionAggregator do
         state
 
       %{^camera_id => cam} ->
-        {tracker, ended} = Tracker.end_all(cam.tracker, :stream_reset)
+        {tracker, ended, suspension} =
+          Tracker.suspend(cam.tracker, max_suspended(cam), state.cut_clock.())
+
+        Logger.info(
+          "camera #{camera_id}: stream reset (#{reason}) — #{suspension.suspended} track(s) " <>
+            "suspended for adoption, #{suspension.ended} ended"
+        )
+
+        :telemetry.execute(
+          [:cairn, :tracker, :stream_reset],
+          %{suspended: suspension.suspended, ended: suspension.ended},
+          %{camera_id: camera_id, reason: reason}
+        )
 
         cam =
-          %{cam | tracker: tracker, current_epoch: epoch}
+          %{cam | tracker: tracker, current_epoch: epoch, gap_from: suspension.at}
+          |> rearm_window(camera_id, state)
           |> publish_tracks(ended, state)
 
         put_cam(state, camera_id, cam)
@@ -514,13 +617,96 @@ defmodule Cairn.DetectionAggregator do
     end
   end
 
+  # -- link health ------------------------------------------------------------
+
+  # The cap the suspended set is trimmed to. The same number as the live one on
+  # purpose — a camera cannot suspend more tracks than it was allowed to hold —
+  # and read from the cached policy for the reason `qualifies?/2` reads it
+  # there: this runs on an epoch broadcast, which is handed no camera and no
+  # policy, and the config server has no business on a path a flapping stream
+  # drives.
+  defp max_suspended(cam), do: tracking_policy(cam.policy || %{}).max_live_tracks
+
+  # Armed only while this camera has something to sweep: a reset that suspends
+  # nothing arms nothing, and the sweep that collects the last suspension does
+  # not come back.
+  defp rearm_window(cam, camera_id, state) do
+    if Tracker.suspended_count(cam.tracker) > 0,
+      do: window_timer(camera_id, cam, state),
+      else: cam
+  end
+
+  # Past the window rather than at it: see the `:adoption_window` handler. The
+  # pending sweep is cancelled first, so a camera resetting several times a
+  # second holds one timer rather than one per reset — and so the re-arm in
+  # that handler cannot compound with the arms the resets do.
+  defp window_timer(camera_id, cam, state) do
+    if cam.window_ref, do: Process.cancel_timer(cam.window_ref)
+    ref = Process.send_after(self(), {:adoption_window, camera_id}, state.window_ms)
+    %{cam | window_ref: ref}
+  end
+
+  # How the stream reset actually went, reported from the first batch that
+  # follows it: the outage gap can only be measured once the far side produces
+  # an observation to measure to. `gap_from` is the last observation before the
+  # cut, and it is cleared here so the report is one line per reset and not one
+  # per batch.
+  #
+  # Adoptions and lapses are counted off the same batch's events, which is
+  # where the tracker reports them: an adoption is a track resuming its
+  # identity, and a `:stream_reset` end arriving on a *batch* is a suspension
+  # whose window ran out (the ones the reset itself severs are emitted by
+  # `apply_epoch/4`, not here).
+  defp report_link(cam, camera_id, observation, events) do
+    report_adopted(camera_id, events)
+    report_expired(camera_id, events)
+    report_gap(cam, camera_id, observation)
+  end
+
+  defp report_gap(%{gap_from: nil} = cam, _camera_id, _observation), do: cam
+
+  defp report_gap(cam, camera_id, observation) do
+    gap = max(DateTime.diff(observation.observed_at, cam.gap_from, :millisecond), 0)
+
+    Logger.info("camera #{camera_id}: stream back after a #{gap} ms gap")
+    :telemetry.execute([:cairn, :tracker, :stream_gap], %{gap_ms: gap}, %{camera_id: camera_id})
+
+    %{cam | gap_from: nil}
+  end
+
+  defp report_adopted(camera_id, events) do
+    case Enum.count(events, &match?({:adopted, _track}, &1)) do
+      0 ->
+        :ok
+
+      count ->
+        Logger.info("camera #{camera_id}: #{count} track(s) adopted across the stream reset")
+        :telemetry.execute([:cairn, :tracker, :adopted], %{count: count}, %{camera_id: camera_id})
+    end
+  end
+
+  defp report_expired(camera_id, events) do
+    case Enum.count(events, &match?({:ended, %Track{end_reason: :stream_reset}}, &1)) do
+      0 ->
+        :ok
+
+      count ->
+        Logger.info("camera #{camera_id}: #{count} suspended track(s) went unadopted")
+
+        :telemetry.execute([:cairn, :tracker, :suspension_expired], %{count: count}, %{
+          camera_id: camera_id
+        })
+    end
+  end
+
   # -- track lifecycle --------------------------------------------------------
 
-  # `track_started`, `track_ended` and the stationary transitions always go
-  # out: a subscriber that only ever sees the final summary still learns what
-  # the track was, and the flag this module gates evidence on must not arrive
-  # late. Plain updates are throttled per track — best-score improvement or a
-  # second of wall clock.
+  # `track_started`, `track_ended`, the stationary transitions and an adoption
+  # always go out: a subscriber that only ever sees the final summary still
+  # learns what the track was, the flag this module gates evidence on must not
+  # arrive late, and an identity resuming on a new epoch is not a frame a
+  # throttle may swallow. Plain updates are throttled per track — best-score
+  # improvement or a second of wall clock.
   defp publish_tracks(cam, events, state) do
     Enum.reduce(events, cam, fn
       {:started, track}, cam ->
@@ -545,6 +731,18 @@ defmodule Cairn.DetectionAggregator do
         Track.broadcast(:track_ended, track)
         record_final(cam, track, state)
         %{cam | track_updates: Map.delete(cam.track_updates, track.object_id)}
+
+      # An identity resumed across a stream reset, which downstream never
+      # learned had been interrupted: no `track_started` (it started when it
+      # started) and nothing to un-say. It is published as a `track_updated`
+      # and noted, taking the same throttle bypass as the stationary flips for
+      # a reason of its own — this is the one frame carrying the track's new
+      # `epoch`, and a row still naming the stream that died reads as stale.
+      # No timeline moment: `Cairn.Tracks.TrackEvent`'s kinds are what a viewer
+      # draws over a clip, and this happened between two clips' worth of media.
+      {:adopted, track}, cam ->
+        Track.broadcast(:track_updated, track)
+        note_update(cam, track, state)
 
       # Broadcast as a `track_updated` — the transition carries no fields of
       # its own, it is the `%Track{}` the flip is about — and noted, the same
@@ -617,6 +815,13 @@ defmodule Cairn.DetectionAggregator do
   # ordering — a track expiring in this batch was by definition not detected in
   # it, so it contributed no evidence to the event those detections opened, and
   # the event it did belong to (if any) had already closed.
+  #
+  # One end is deliberately later than the death it reports: a suspension that
+  # goes unadopted ends when its window runs out, up to a minute after the
+  # reset its summary is timestamped at. So its `event_id` can name an event
+  # that opened *after* the track was last seen — which changes nothing, since
+  # the column was never how a clip's contents are read back (above), and the
+  # timestamps in the row are the honest ones.
   defp record_final(%{event: %Event{id: event_id}}, track, state) do
     TrackRecorder.record_final(state.recorder, track, event_id)
   end
@@ -746,7 +951,7 @@ defmodule Cairn.DetectionAggregator do
     case state.start_extractor.(camera, event) do
       {:ok, pid} ->
         Process.monitor(pid)
-        EventCheckpoint.put(camera.id, event, Tracker.live_tracks(cam.tracker))
+        EventCheckpoint.put(camera.id, event, Tracker.checkpoint_tracks(cam.tracker))
         Event.broadcast(:event_started, event)
 
         {post_ref, post_token} = schedule(:post_window, camera.id, event.id, policy.post)
@@ -798,7 +1003,7 @@ defmodule Cairn.DetectionAggregator do
     now = state.monotonic_ms.()
 
     if cam.checkpointed_at == nil or now - cam.checkpointed_at >= @checkpoint_throttle_ms do
-      EventCheckpoint.put(event.camera_id, event, Tracker.live_tracks(cam.tracker))
+      EventCheckpoint.put(event.camera_id, event, Tracker.checkpoint_tracks(cam.tracker))
       %{cam | checkpointed_at: now}
     else
       cam
@@ -833,7 +1038,9 @@ defmodule Cairn.DetectionAggregator do
   # -- restore ----------------------------------------------------------------
 
   # Every restored track is dead: the tracker that owned it died with the
-  # aggregator and a fresh one has no state to continue it. They are ended
+  # aggregator and a fresh one has no state to continue it. That covers the
+  # suspended ones too — a suspension is a bet that this process will still be
+  # here to adopt it, and this is the branch where it was not. They are ended
   # (`:host_restart`) with their last known summary. New objects can never be
   # confused with them — a ULID is minted once, so a restored event's label
   # ids are never handed out again.
@@ -1017,6 +1224,14 @@ defmodule Cairn.DetectionAggregator do
       tracker: Tracker.new(),
       track_updates: %{},
       current_epoch: current_epoch,
+      # the wall instant the last stream reset cut this camera off at, held
+      # only until the first observation of the new epoch measures the gap to
+      # it (`report_gap/3`)
+      gap_from: nil,
+      # the pending `:adoption_window` sweep, so arming the next one cancels
+      # it. Not event state: `clear_event/1` leaves it alone, because a
+      # suspension outlives the event that happened to be open at the cut.
+      window_ref: nil,
       # last seen in `process_detections/5`; see the comment there
       policy: nil,
       camera: nil,

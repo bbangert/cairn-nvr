@@ -22,6 +22,12 @@ defmodule Cairn.DetectionAggregatorTest do
   }
 
   @policy %{pre: 5, post: 10, max: 300, max_unseen_ms: 3_000, max_live_tracks: 128}
+  # The box every `detect/4` uses by default, and two the tracker cannot
+  # confuse with it across a stream reset: `@drift_box` overlaps it at 1/3,
+  # under the adoption floor, and `@far_box` not at all.
+  @box [0.1, 0.1, 0.2, 0.4]
+  @drift_box [0.2, 0.1, 0.2, 0.4]
+  @far_box [0.6, 0.1, 0.2, 0.4]
 
   setup do
     camera_id = "agg_#{System.unique_integer([:positive])}"
@@ -48,7 +54,7 @@ defmodule Cairn.DetectionAggregatorTest do
     %{agg: agg, camera: camera, camera_id: camera_id}
   end
 
-  defp detect(agg, camera, score \\ 0.9, bbox \\ [0.1, 0.1, 0.2, 0.4]) do
+  defp detect(agg, camera, score \\ 0.9, bbox \\ @box) do
     observe(agg, camera, [object("person", score, bbox)])
   end
 
@@ -84,9 +90,40 @@ defmodule Cairn.DetectionAggregatorTest do
   defp live_tracks(agg, camera_id),
     do: Cairn.Tracker.live_tracks(:sys.get_state(agg).cameras[camera_id].tracker)
 
+  defp suspended_tracks(agg, camera_id),
+    do: Cairn.Tracker.suspended_tracks(:sys.get_state(agg).cameras[camera_id].tracker)
+
   defp fire(agg, kind, camera_id, event_id) do
     tk = token(agg, camera_id, if(kind == :post_window, do: :post_token, else: :max_token))
     send(agg, {kind, camera_id, event_id, tk})
+  end
+
+  defp window_ref(agg, camera_id), do: :sys.get_state(agg).cameras[camera_id].window_ref
+
+  # An aggregator that stamps every stream cut `ago` seconds in the past. The
+  # adoption window is a wall-clock minute measured from the cut, so this is
+  # what lets a test drive a suspension past it without sitting through one —
+  # the sweep itself still reads the real clock. `opts` reaches the aggregator
+  # verbatim.
+  defp aggregator_cut_seconds_ago(ago, opts \\ []) do
+    test_pid = self()
+
+    start_supervised!(
+      {DetectionAggregator,
+       Keyword.merge(
+         [
+           name: nil,
+           cut_clock: fn -> DateTime.add(DateTime.utc_now(), -ago, :second) end,
+           start_extractor: fn _camera, event ->
+             pid = spawn(fn -> Process.sleep(:infinity) end)
+             send(test_pid, {:extractor_started, event, pid})
+             {:ok, pid}
+           end
+         ],
+         opts
+       )},
+      id: :agg_past_cut
+    )
   end
 
   # -- stationary helpers -------------------------------------------------------
@@ -99,6 +136,16 @@ defmodule Cairn.DetectionAggregatorTest do
   # reads as movement, and well over the match threshold, so it is the same
   # track that moved rather than a second one.
   @moved_box [0.16, 0.1, 0.2, 0.4]
+  # The live failure's geometry: a car 0.17 by 0.09 of the frame with about
+  # 0.02 of detector drift in *y*, which is IoU 0.636 against the anchor —
+  # under `@stationary_iou` and nothing like motion. Small and drifting on its
+  # short axis on purpose; @parked_box above is four times the area and
+  # @moved_box displaces it in x. `@small_moved_box` is where the same car goes
+  # when it really leaves: 0.385, low enough to fail stillness for as long as
+  # it holds and high enough to stay the same track rather than mint a second.
+  @small_parked_box [0.40, 0.50, 0.17, 0.09]
+  @small_jitter_box [0.40, 0.52, 0.17, 0.09]
+  @small_moved_box [0.40, 0.54, 0.17, 0.09]
 
   defp detect_at(agg, camera, media_ms, bbox \\ @parked_box) do
     DetectionAggregator.detections(
@@ -111,8 +158,8 @@ defmodule Cairn.DetectionAggregatorTest do
 
   # Object arrives, holds still past the threshold, event finalizes: the state
   # the parked-car loop used to restart from. Returns `{event_id, object_id}`.
-  defp park_and_finalize(agg, camera, camera_id) do
-    detect_at(agg, camera, 1_000)
+  defp park_and_finalize(agg, camera, camera_id, bbox \\ @parked_box) do
+    detect_at(agg, camera, 1_000, bbox)
     # the event-lifecycle messages are consumed here so a caller refuting a
     # *second* event is refuting one, not tripping over this one; the track
     # broadcasts (`track_started`, the flip's `track_updated`) are NOT drained
@@ -121,12 +168,12 @@ defmodule Cairn.DetectionAggregatorTest do
     assert_receive {:extractor_started, %Event{id: eid}, _pid}
     assert_receive {:event_started, %Event{id: ^eid}}
 
-    detect_at(agg, camera, 2_000)
+    detect_at(agg, camera, 2_000, bbox)
     assert_receive {:event_updated, %Event{id: ^eid}}
 
     # read off the tracker rather than off the broadcast: what this asserts is
     # the evidence rule, not how the flip reaches a subscriber (below)
-    detect_at(agg, camera, 3_000)
+    detect_at(agg, camera, 3_000, bbox)
     assert [%Track{object_id: oid, stationary: true}] = live_tracks(agg, camera_id)
 
     fire(agg, :post_window, camera_id, eid)
@@ -195,7 +242,43 @@ defmodule Cairn.DetectionAggregatorTest do
     assert [%{object_id: oid}, %{object_id: oid}] = event.labels
   end
 
-  test "a new stream epoch ends tracks: object ids are not inherited", %{
+  test "a new stream epoch suspends tracks: the object that comes back is itself", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    epoch_a = StreamEpochs.new_epoch(id, :started)
+    _ = :sys.get_state(agg)
+
+    observe(agg, camera, [object("person", 0.9, @box)], epoch: epoch_a)
+    assert_receive {:event_started, %Event{labels: [%{object_id: first}]}}
+    assert_receive {:track_started, %Track{object_id: ^first, epoch: ^epoch_a}}
+
+    # minted through the real server, so dropping StreamEpochs.subscribe/0 from
+    # the aggregator fails here. new_epoch/2 returns only once the broadcast has
+    # been delivered, and the barrier keeps the next batch behind it — the two
+    # senders differ, so nothing else orders them.
+    epoch_b = StreamEpochs.new_epoch(id, :source_lost)
+    _ = :sys.get_state(agg)
+
+    # nothing is owed a final yet: the track is suspended, and whether it died
+    # is not yet known
+    refute_received {:track_ended, _}
+    assert live_tracks(agg, id) == []
+    assert [%Track{object_id: ^first, end_reason: nil}] = suspended_tracks(agg, id)
+
+    # the same box on the far side of a reconnect that took no time at all
+    observe(agg, camera, [object("person", 0.9, @box)], epoch: epoch_b)
+
+    # the identity resumes, on the epoch that is now being decoded
+    assert_receive {:track_updated, %Track{object_id: ^first, epoch: ^epoch_b}}
+    assert_receive {:event_updated, %Event{labels: [_, %{object_id: ^first}]}}
+    refute_received {:track_started, _}
+    assert [%Track{object_id: ^first}] = live_tracks(agg, id)
+    assert suspended_tracks(agg, id) == []
+  end
+
+  test "a box the adoption floor refuses gets an identity of its own", %{
     agg: agg,
     camera: camera,
     camera_id: id
@@ -204,29 +287,221 @@ defmodule Cairn.DetectionAggregatorTest do
     assert_receive {:event_started, %Event{labels: [%{object_id: first}]}}
     assert_receive {:track_started, %Track{object_id: ^first}}
 
-    # minted through the real server, so dropping StreamEpochs.subscribe/0 from
-    # the aggregator fails here. new_epoch/2 returns only once the broadcast has
-    # been delivered, and the barrier keeps the next batch behind it — the two
-    # senders differ, so nothing else orders them.
     StreamEpochs.new_epoch(id, :source_lost)
     _ = :sys.get_state(agg)
 
-    # the outage owes every live track a final, self-contained summary
-    assert_receive {:track_ended, %Track{object_id: ^first} = final}
-    assert_self_contained(final)
-    assert final.end_reason == :stream_reset
-    assert final.camera_id == id
-    assert final.label == "person"
-    assert final.best_score == 0.9
-
-    # identical bbox: only the epoch reset stops the tracker from matching it
-    # onto the object from before the outage
-    detect(agg, camera)
+    # 1/3 overlap with the suspended track's last box — two objects side by
+    # side, not one object seen slightly off — so nothing is adopted
+    detect(agg, camera, 0.9, @drift_box)
     assert_receive {:event_updated, %Event{labels: [_, %{object_id: second}]}}
     # A ULID is minted once and never handed out again, so "not inherited" is
     # the whole property: object ids no longer come from a counter, and two
     # minted in the same millisecond sort by their random halves (Cairn.ULID).
     refute second == first
+    assert_receive {:track_started, %Track{object_id: ^second}}
+    # and the one that was cut is still waiting rather than ended or spent
+    refute_received {:track_ended, _}
+    assert [%Track{object_id: ^first}] = suspended_tracks(agg, id)
+  end
+
+  test "a suspension nothing adopts ends once, timestamped at the cut", %{
+    camera: camera,
+    camera_id: id
+  } do
+    # The adoption window runs from the cut, so it is the *cut* that has to be
+    # far enough back for the sweep below to find anything — which is what the
+    # aggregator's own timer would have waited for. The last observation is
+    # ten seconds further back still: a stream is not cut the instant it goes
+    # quiet, and the final is timestamped at the sighting, not at the cut.
+    agg = aggregator_cut_seconds_ago(90)
+    seen_at = DateTime.add(DateTime.utc_now(), -100, :second)
+
+    observe(agg, camera, [object("person", 0.9, @box)], observed_at: seen_at)
+    assert_receive {:event_started, %Event{camera_id: ^id}}
+    assert_receive {:track_started, %Track{object_id: oid}}
+
+    StreamEpochs.new_epoch(id, :source_lost)
+    _ = :sys.get_state(agg)
+    refute_received {:track_ended, _}
+
+    send(agg, {:adoption_window, id})
+    _ = :sys.get_state(agg)
+
+    assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :stream_reset} = final}
+    assert_self_contained(final)
+    assert final.camera_id == id
+    assert final.best_score == 0.9
+    # the instant it was last actually seen, not the instant this process
+    # stopped waiting for it
+    assert DateTime.compare(final.last_seen_at, seen_at) == :eq
+
+    # and once: the second sweep has nothing left to end
+    assert suspended_tracks(agg, id) == []
+    send(agg, {:adoption_window, id})
+    _ = :sys.get_state(agg)
+    refute_received {:track_ended, _}
+  end
+
+  test "a reset and the recovery after it are reported for the link-health log", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    test_pid = self()
+    handler = "link-health-#{id}"
+
+    :telemetry.attach_many(
+      handler,
+      [
+        [:cairn, :tracker, :stream_reset],
+        [:cairn, :tracker, :stream_gap],
+        [:cairn, :tracker, :adopted]
+      ],
+      fn event, measurements, meta, _ ->
+        send(test_pid, {:telemetry, event, measurements, meta})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    seen_at = DateTime.add(DateTime.utc_now(), -2, :second)
+    observe(agg, camera, [object("person", 0.9, @box)], observed_at: seen_at)
+    assert_receive {:track_started, %Track{object_id: oid}}
+
+    # Telemetry rather than the log lines emitted beside it: those are
+    # `Logger.info` and this env runs the logger at `:warning`, so they are
+    # dropped before any capture can see them. Every site here emits both.
+    StreamEpochs.new_epoch(id, :source_lost)
+    _ = :sys.get_state(agg)
+
+    assert_receive {:telemetry, [:cairn, :tracker, :stream_reset], %{suspended: 1, ended: 0},
+                    %{camera_id: ^id, reason: :source_lost}}
+
+    # the gap can only be measured once the far side produces an observation,
+    # and it is measured to the last one before the cut
+    observe(agg, camera, [object("person", 0.9, @box)], observed_at: DateTime.utc_now())
+    _ = :sys.get_state(agg)
+
+    assert_receive {:telemetry, [:cairn, :tracker, :stream_gap], %{gap_ms: gap},
+                    %{camera_id: ^id}}
+
+    assert gap >= 2_000 and gap < 10_000
+    assert_receive {:telemetry, [:cairn, :tracker, :adopted], %{count: 1}, %{camera_id: ^id}}
+    assert_receive {:track_updated, %Track{object_id: ^oid}}
+
+    # one report per reset, not one per batch
+    observe(agg, camera, [object("person", 0.9, @box)], observed_at: DateTime.utc_now())
+    _ = :sys.get_state(agg)
+
+    refute_received {:telemetry, [:cairn, :tracker, :stream_gap], _, _}
+    refute_received {:telemetry, [:cairn, :tracker, :adopted], _, _}
+  end
+
+  test "the sweep is armed by the reset itself, for a camera that never comes back", %{
+    camera: camera,
+    camera_id: id
+  } do
+    # the real delay is the adoption window plus slack; the window itself is
+    # still the wall-clock one, which is why the cut is a minute and a half old
+    agg = aggregator_cut_seconds_ago(90, window_ms: 20)
+
+    observe(agg, camera, [object("person", 0.9, @box)],
+      observed_at: DateTime.add(DateTime.utc_now(), -90, :second)
+    )
+
+    assert_receive {:track_started, %Track{object_id: oid}}
+
+    # nothing is sent to this process by hand: the reset arms the timer, and
+    # no observation ever arrives on the far side of it
+    send(agg, {:stream_epoch, id, Cairn.ULID.generate(), :source_lost})
+
+    assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :stream_reset}}, 1_000
+
+    # the sweep that collected the last suspension arms nothing further: there
+    # is no camera left to sweep for, and a timer per reset that never drains
+    # is a leak on exactly the flapping camera this path is for
+    assert suspended_tracks(agg, id) == []
+    assert window_ref(agg, id) == nil
+  end
+
+  test "a sweep that leaves suspensions behind re-arms itself", %{
+    camera: camera,
+    camera_id: id
+  } do
+    # The cut is recent, so the suspension it makes is nowhere near lapsing and
+    # every sweep below finds nothing to end. That is the shape of the failure
+    # this covers: a wall clock stepped backwards, or any sweep that misses,
+    # on a camera whose stream never returns — nothing else is ever coming to
+    # collect the suspension, so the sweep has to come back on its own.
+    agg = aggregator_cut_seconds_ago(0)
+
+    observe(agg, camera, [object("person", 0.9, @box)])
+    assert_receive {:track_started, %Track{object_id: oid}}
+
+    send(agg, {:stream_epoch, id, Cairn.ULID.generate(), :source_lost})
+    _ = :sys.get_state(agg)
+    armed = window_ref(agg, id)
+    assert armed != nil
+
+    send(agg, {:adoption_window, id})
+    _ = :sys.get_state(agg)
+
+    # nothing ended, and the sweep left a *new* timer rather than the one the
+    # reset armed: a suspension that outlives one sweep still has a next one
+    refute_received {:track_ended, _}
+    assert [%Track{object_id: ^oid}] = suspended_tracks(agg, id)
+    assert window_ref(agg, id) != nil
+    assert window_ref(agg, id) != armed
+  end
+
+  test "a stale sweep after the tracker was emptied ends nothing and arms nothing", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    observe(agg, camera, [object("person", 0.9, @box)])
+    assert_receive {:track_started, %Track{object_id: oid}}
+
+    StreamEpochs.new_epoch(id, :source_lost)
+    _ = :sys.get_state(agg)
+    assert [%Track{object_id: ^oid}] = suspended_tracks(agg, id)
+
+    # detection off gives up on every suspension at once, so the sweep the
+    # reset armed is left with nothing — and must not double-end or re-arm
+    Cairn.CameraControl.set(id, %{detection_enabled: false})
+    observe(agg, camera, [object("person", 0.9, @box)])
+    assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :stream_reset}}
+
+    send(agg, {:adoption_window, id})
+    _ = :sys.get_state(agg)
+
+    refute_received {:track_ended, _}
+    assert window_ref(agg, id) == nil
+  end
+
+  test "an adopted stationary track opens no event when it is detected again", %{
+    agg: agg,
+    camera: camera,
+    camera_id: id
+  } do
+    {_eid, oid} = park_and_finalize(agg, camera, id)
+
+    StreamEpochs.new_epoch(id, :source_lost)
+    _ = :sys.get_state(agg)
+
+    # the parked car is detected again on the new stream. Adopted, it is still
+    # parked — still not evidence — so nothing opens.
+    detect_at(agg, camera, 4_000)
+    assert_receive {:track_updated, %Track{object_id: ^oid, stationary: true}}
+    refute_receive {:event_started, %Event{camera_id: ^id}}, 100
+
+    # the control for that refutation: the same detection under an identity the
+    # reset really did sever is a new object, which is exactly what a
+    # re-minted parked car looks like — and it opens an event on the spot
+    detect_at(agg, camera, 5_000, @far_box)
+    assert_receive {:event_started, %Event{camera_id: ^id, labels: [%{object_id: other}]}}
+    refute other == oid
   end
 
   test "a repeat of the current epoch does not end tracks", %{
@@ -240,11 +515,15 @@ defmodule Cairn.DetectionAggregatorTest do
     epoch = StreamEpochs.new_epoch(id, :source_lost)
     _ = :sys.get_state(agg)
 
-    # positive control for the refute below: a real boundary *does* end the
-    # track it cut, so an aggregator that never ended anything cannot pass
-    assert_receive {:track_ended, %Track{object_id: ^first, end_reason: :stream_reset}}
+    # positive control for the refute below: a real boundary *does* take the
+    # track it cut out of the live set, so an aggregator that ignored the
+    # broadcast entirely cannot pass
+    assert live_tracks(agg, id) == []
+    assert [%Track{object_id: ^first}] = suspended_tracks(agg, id)
 
-    detect(agg, camera)
+    # somewhere else in the frame, so this is a new object and not the
+    # suspended one resuming
+    detect(agg, camera, 0.9, @far_box)
     assert_receive {:event_updated, %Event{labels: [_, %{object_id: second}]}}
     assert_receive {:track_started, %Track{object_id: ^second}}
     refute second == first
@@ -261,7 +540,7 @@ defmodule Cairn.DetectionAggregatorTest do
     refute_received {:track_ended, _}
     assert [%Track{object_id: ^second}] = live_tracks(agg, id)
 
-    detect(agg, camera)
+    detect(agg, camera, 0.9, @far_box)
     assert_receive {:event_updated, %Event{labels: [_, _, %{object_id: ^second}]}}
   end
 
@@ -306,7 +585,8 @@ defmodule Cairn.DetectionAggregatorTest do
     StreamEpochs.new_epoch(id, :source_lost)
     _ = :sys.get_state(agg)
 
-    detect(agg, camera)
+    # elsewhere in the frame: a new object, not the cut one coming back
+    detect(agg, camera, 0.9, @far_box)
     assert_receive {:event_updated, %Event{labels: [_, %{object_id: second}]}}
     refute second == first
   end
@@ -322,10 +602,10 @@ defmodule Cairn.DetectionAggregatorTest do
     current = StreamEpochs.new_epoch(id, :source_lost)
     _ = :sys.get_state(agg)
 
-    # positive control, and it clears the mailbox for the refute below
-    assert_receive {:track_ended, %Track{object_id: ^first, end_reason: :stream_reset}}
+    # positive control: the boundary that was crossed suspended the track it cut
+    assert [%Track{object_id: ^first}] = suspended_tracks(agg, id)
 
-    detect(agg, camera)
+    detect(agg, camera, 0.9, @far_box)
     assert_receive {:event_updated, %Event{labels: [_, %{object_id: second}]}}
     assert_receive {:track_started, %Track{object_id: ^second}}
     refute second == first
@@ -346,7 +626,7 @@ defmodule Cairn.DetectionAggregatorTest do
     refute_received {:track_ended, _}
     assert [%Track{object_id: ^second}] = live_tracks(agg, id)
 
-    detect(agg, camera)
+    detect(agg, camera, 0.9, @far_box)
     assert_receive {:event_updated, %Event{labels: [_, _, %{object_id: ^second}]}}
   end
 
@@ -512,6 +792,65 @@ defmodule Cairn.DetectionAggregatorTest do
     assert_receive {:event_ended, %Event{id: ^eid}}
     _ = :sys.get_state(agg)
     assert checkpoint(id) == []
+  end
+
+  test "a suspended track is checkpointed, and a restore ends it", %{
+    camera: camera,
+    camera_id: id
+  } do
+    {:ok, clock} = start_supervised({Agent, fn -> 0 end})
+    test_pid = self()
+
+    agg =
+      start_supervised!(
+        {DetectionAggregator,
+         name: nil,
+         monotonic_ms: fn -> Agent.get(clock, & &1) end,
+         start_extractor: fn _camera, ev ->
+           pid = spawn(fn -> Process.sleep(:infinity) end)
+           send(test_pid, {:extractor_started, ev, pid})
+           {:ok, pid}
+         end},
+        id: :agg_suspended_checkpoint
+      )
+
+    detect(agg, camera)
+    assert_receive {:event_started, %Event{camera_id: ^id}}
+    assert [{^id, _event, [%Track{object_id: first}]}] = checkpoint(id)
+
+    send(agg, {:stream_epoch, id, Cairn.ULID.generate(), :source_lost})
+    _ = :sys.get_state(agg)
+
+    # past the checkpoint throttle, so this batch rewrites the row
+    Agent.update(clock, &(&1 + 1_000))
+    detect(agg, camera, 0.9, @far_box)
+    assert_receive {:event_updated, %Event{camera_id: ^id}}
+
+    # a suspension is a track this process still owes a final summary for, so
+    # a checkpoint that left it out would strand it on a crash — the restore
+    # ends what the checkpoint holds and nothing else
+    assert [{^id, _event, tracks}] = checkpoint(id)
+    ids = Enum.map(tracks, & &1.object_id)
+    assert first in ids
+    assert length(ids) == 2
+    assert ids == Enum.sort(ids)
+
+    stop_supervised!(:agg_suspended_checkpoint)
+
+    start_supervised!(
+      {DetectionAggregator,
+       name: nil,
+       start_extractor: fn _camera, ev ->
+         pid = spawn(fn -> Process.sleep(:infinity) end)
+         send(test_pid, {:extractor_started, ev, pid})
+         {:ok, pid}
+       end},
+      id: :agg_suspended_restore
+    )
+
+    # the tracker that could have adopted it died with the process, so the
+    # suspension dies here rather than waiting out a window nothing can end
+    assert_receive {:track_ended, %Track{object_id: ^first, end_reason: :host_restart}}
   end
 
   test "event times come from the observation, not from the clock", %{agg: agg, camera: camera} do
@@ -1047,7 +1386,60 @@ defmodule Cairn.DetectionAggregatorTest do
       :sys.get_state(agg)
       refute_received {:event_started, %Event{camera_id: ^id}}
 
+      # and the tracker then wants the move *sustained*: the smoothed box
+      # fails from 6_000, and the flag holds until that failure has run for
+      # `Cairn.Tracker`'s exit window (2_500 ms of media time)
       detect_at(agg, camera, 6_000, @moved_box)
+      detect_at(agg, camera, 7_000, @moved_box)
+      detect_at(agg, camera, 8_000, @moved_box)
+      :sys.get_state(agg)
+      assert [%Track{object_id: ^oid, stationary: true}] = live_tracks(agg, id)
+      refute_received {:event_started, %Event{camera_id: ^id}}
+
+      detect_at(agg, camera, 9_000, @moved_box)
+      assert [%Track{object_id: ^oid, stationary: false}] = live_tracks(agg, id)
+      assert_receive {:event_started, %Event{camera_id: ^id, labels: [%{object_id: ^oid}]}}
+    end
+
+    test "detector jitter on a parked car opens nothing; leaving still does", %{
+      agg: agg,
+      camera: camera,
+      camera_id: id
+    } do
+      {_eid, oid} = park_and_finalize(agg, camera, id, @small_parked_box)
+
+      # The live failure, reproduced end to end. Three jittered frames put the
+      # jitter in the median from 6_000 and the car back under it at 9_000 —
+      # three failing evaluations, two seconds of them, on a car that has not
+      # moved at all. Every one of them used to clear the flag, and clearing it
+      # is what made the car evidence again and opened a clip; about ten of
+      # them came out of one parked car in a 25-minute quiet window.
+      detect_at(agg, camera, 4_000, @small_jitter_box)
+      detect_at(agg, camera, 5_000, @small_jitter_box)
+      detect_at(agg, camera, 6_000, @small_jitter_box)
+      detect_at(agg, camera, 7_000, @small_parked_box)
+      detect_at(agg, camera, 8_000, @small_parked_box)
+      detect_at(agg, camera, 9_000, @small_parked_box)
+      :sys.get_state(agg)
+
+      # the clip is the failure; the flag is the mechanism, asserted second
+      refute_received {:event_started, %Event{camera_id: ^id}}
+      refute_received {:extractor_started, _event, _pid}
+      assert [%Track{object_id: ^oid, stationary: true}] = live_tracks(agg, id)
+
+      # and the quiet is not deafness: the same car actually leaving fails the
+      # test from 12_000 and never passes again, so the flag goes at 15_000 and
+      # the departure gets its clip — under the same identity, 2.5 s of media
+      # later than it would have before, which is well inside the 5 s pre-roll
+      # the clip opens with
+      for media_ms <- [10_000, 11_000, 12_000, 13_000, 14_000],
+          do: detect_at(agg, camera, media_ms, @small_moved_box)
+
+      :sys.get_state(agg)
+      assert [%Track{object_id: ^oid, stationary: true}] = live_tracks(agg, id)
+      refute_received {:event_started, %Event{camera_id: ^id}}
+
+      detect_at(agg, camera, 15_000, @small_moved_box)
       assert [%Track{object_id: ^oid, stationary: false}] = live_tracks(agg, id)
       assert_receive {:event_started, %Event{camera_id: ^id, labels: [%{object_id: ^oid}]}}
     end
