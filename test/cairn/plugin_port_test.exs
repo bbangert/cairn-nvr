@@ -650,10 +650,11 @@ defmodule Cairn.PluginPortTest do
     assert %{"type" => "stream.started", "stream_epoch" => ^third} = restarted
   end
 
-  # The capability is the plugin's promise that its track ids are stable, and
-  # the observation is where `Cairn.Tracker` reads that promise.
-  test "the object_tracking capability marks the observations it produces" do
-    for {capabilities, tracking} <- [{%{"object_tracking" => true}, true}, {%{}, false}] do
+  # The capability buys a plugin nothing — the host tracks every object itself —
+  # so declaring it is warned about once and changes nothing about the
+  # observations, whose `track_id`s still arrive and are still ignored.
+  test "an object_tracking declaration is warned about and changes no observation" do
+    for {capabilities, declared} <- [{%{"object_tracking" => true}, true}, {%{}, false}] do
       id = "plug_cap_#{System.unique_integer([:positive])}"
       epoch = StreamEpochs.new_epoch(id, :started)
 
@@ -672,18 +673,28 @@ defmodule Cairn.PluginPortTest do
       objects = [Map.put(object("person", 0.9), "track_id", "t1")]
       command = printf([hello, v1_line(id, epoch, 1, objects)]) <> "; sleep 30"
 
-      start_supervised!(
-        {PluginPort,
-         camera: camera(id), config: config(), index: 0, command: command, aggregator: self()},
-        id: {:cap, tracking}
-      )
+      log =
+        capture_log(fn ->
+          start_supervised!(
+            {PluginPort,
+             camera: camera(id), config: config(), index: 0, command: command, aggregator: self()},
+            id: {:cap, declared}
+          )
 
-      assert_receive {:"$gen_cast",
-                      {:detections, %Camera{id: ^id}, _policy, %Observation{sequence: 1} = obs}},
-                     5_000
+          assert_receive {:"$gen_cast",
+                          {:detections, %Camera{id: ^id}, _policy,
+                           %Observation{sequence: 1} = obs}},
+                         5_000
 
-      assert obs.tracking == tracking
-      assert [%{track_id: "t1"}] = obs.objects
+          # the id is on the wire and reaches the observation; nothing acts on it
+          assert [%{track_id: "t1"}] = obs.objects
+        end)
+
+      assert log =~ "declares object_tracking" == declared
+
+      if declared do
+        assert log =~ "host-side tracking is used and plugin track ids are ignored"
+      end
     end
   end
 

@@ -306,10 +306,12 @@ defmodule Cairn.PluginProtocolTest do
                PluginProtocol.decode_line(line, :group)
     end
 
-    # A `track_id` reaches `Cairn.Track.plugin_track_id` and the SSE frames
-    # built from it: a value `Jason.encode/1` refuses drops the *whole* frame,
-    # which is selective suppression of a chosen track's lifecycle, and control
-    # bytes would reach an operator's terminal through any log line.
+    # Nothing reads a `track_id` today — the host tracks every object itself —
+    # but the codec validates it as if something did, because whatever reads it
+    # next would carry it into JSON frames and log lines: a value
+    # `Jason.encode/1` refuses drops the *whole* frame, which is selective
+    # suppression of a chosen track's lifecycle, and control bytes would reach
+    # an operator's terminal.
     test "unprintable track ids are refused, like labels" do
       for {name, id} <- [
             {"NUL byte", "t\0" <> "1"},

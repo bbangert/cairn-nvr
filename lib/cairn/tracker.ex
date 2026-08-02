@@ -3,21 +3,12 @@ defmodule Cairn.Tracker do
   Pure per-camera object tracker: turns a stream of observations into tracks
   with public `Cairn.ULID` identities and a started/updated/ended lifecycle.
 
-  Identity is assigned in one of two modes, decided per object:
-
-    * **host mode** — greedy-IoU matching against the live host tracks of the
-      same label. This is the only mode for a plugin that does not track.
-    * **plugin mode** — the observation comes from a plugin that declared the
-      `object_tracking` capability (`observation.tracking`) *and* the object
-      carries a `track_id`. The plugin's id maps 1:1 onto a ULID for the life
-      of `(plugin_instance, epoch, track_id)`; no IoU runs, and
-      `observation.ended_tracks` ends those tracks. A `track_id` reused after
-      it appeared in `ended_tracks` is a contract violation: it is logged and
-      treated as a new track (new ULID).
-
-  A `track_id` from a plugin that did **not** declare `object_tracking` is
-  ignored — the object is tracked host-side. Capability is the plugin's
-  promise that its ids are stable; without it they are decoration.
+  Identity is assigned one way, for every object: greedy-IoU matching against
+  the live tracks of the same label. There is no plugin-driven mode. A plugin's
+  `track_id`s and `ended_tracks` are still parsed off the wire, and so is its
+  `object_tracking` capability, but nothing here reads any of them — they are
+  accepted and reserved, and a plugin that declares the capability is tracked
+  host-side like every other.
 
   Expiry is media time, not batches: a track is ended (`:unseen`) once
   `media_ms - last_seen_ms > max_unseen_ms`. `last_seen_ms` moves on *any*
@@ -36,11 +27,11 @@ defmodule Cairn.Tracker do
   the grace holds no lesser overlap inherits its identity. Outside the grace a
   stationary track matches at the same `@iou_threshold` as everything else.
 
-  Pickiness governs *geometry*, not *presence*. A host-mode detection that no
-  track took — refused on threshold, or left over because the track it belongs
-  to already has this batch's box for it — but that still overlaps a live
-  **same-label** host track by at least `@duplicate_suppression_iou`, is
-  **dropped** rather than minted, whether or not that track matched this batch.
+  Pickiness governs *geometry*, not *presence*. A detection that no track took
+  — refused on threshold, or left over because the track it belongs to already
+  has this batch's box for it — but that still overlaps a live **same-label**
+  track by at least `@duplicate_suppression_iou`, is **dropped** rather than
+  minted, whether or not that track matched this batch.
   The second case is why the state of the track cannot be the guard: a batch
   can carry two boxes for one object, because a detector without NMS emits
   them, so "what is left over is somebody else" is not something the tracker
@@ -115,11 +106,10 @@ defmodule Cairn.Tracker do
   ## Surviving a stream reset: suspension and adoption
 
   An ffmpeg respawn or reconnect mints a new epoch, and the object in frame is
-  usually the same object. `suspend/3` therefore does not end the live
-  host-mode tracks at the boundary: it moves them aside, keeping their
-  identity, `started_at`, `best_score`, stationary flag and anchor, and
-  excluding them from ordinary matching. Nothing downstream is told they
-  ended, because they may not have.
+  usually the same object. `suspend/3` therefore does not end the live tracks
+  at the boundary: it moves them aside, keeping their identity, `started_at`,
+  `best_score`, stationary flag and anchor, and excluding them from ordinary
+  matching. Nothing downstream is told they ended, because they may not have.
 
   A detection in the new epoch may then **adopt** a suspended track — same
   ULID, no `:started`, no `:ended`. Adoption is geometry across a blind gap,
@@ -193,14 +183,11 @@ defmodule Cairn.Tracker do
 
   A suspended track that nothing adopts is ended `:stream_reset`.
   `expire_suspended/2` is what waits out the window; two paths do not wait —
-  `end_all/3` gives up on every suspension at once (detection off, camera
+  `end_all/2` gives up on every suspension at once (detection off, camera
   stopped), and `suspend/3` drops the oldest generation when a reconnect loop
   pushes the set past its cap. Whichever gets there, the summary carries the
   timestamps the track already had, so it reports the instant it was last
-  actually seen; the waiting is bookkeeping, not observation. Plugin-owned tracks do not suspend at all:
-  their identity is the plugin's, keyed on `(plugin_instance, epoch,
-  track_id)`, so the plugin has already severed them at the cut and a host-side
-  IoU revival would be contradicted by the plugin's own next line.
+  actually seen; the waiting is bookkeeping, not observation.
 
   ## Host policy: the live set is bounded, on both counts
 
@@ -462,13 +449,10 @@ defmodule Cairn.Tracker do
   # window can be even and average two); short, so a real move reaches the
   # smoothed box within a handful of detections at any frame rate.
   @recent_boxes 5
-  # Plugin track ids that have been ended, kept so their reuse can be caught.
-  # Only live tracks bound the rest of the state; this set is bounded here.
-  @max_ended_keys 4_096
   # How much slower than media time the host clock is allowed to be before a
   # track is expired regardless. See the moduledoc: a backstop, not the rule.
   @host_clock_factor 10
-  # Every warning here is driven by plugin output, and plugin output is a
+  # Warnings here fire from the per-observation path, and an observation is a
   # per-line primitive: unrate-limited they are a log-flood of their own.
   @warn_interval_ms 5_000
 
@@ -481,9 +465,6 @@ defmodule Cairn.Tracker do
   # differ by however long the stream had already been quiet.
   defstruct objects: %{},
             suspended: %{},
-            index: %{},
-            ended: %{},
-            ended_seq: 0,
             warned_at: %{},
             last_observed_at: nil
 
@@ -493,9 +474,9 @@ defmodule Cairn.Tracker do
   @typedoc """
   What one `suspend/3` did, for the caller's link-health report: how many
   tracks are waiting for adoption, how many were ended instead — which is
-  exactly the length of the event list returned beside it: plugin-owned tracks,
-  any older suspension the cap pushed out, and any whose window had already run
-  out — and `at`, the last observation before the cut, which is the instant an
+  exactly the length of the event list returned beside it: any older suspension
+  the cap pushed out, and any whose window had already run out — and `at`, the
+  last observation before the cut, which is the instant an
   outage gap is measured from. `at` is `nil` when this camera has never been
   observed (in which case nothing was suspended). It is not the cut: see
   `suspend/3`.
@@ -510,11 +491,8 @@ defmodule Cairn.Tracker do
   @type context :: %{
           camera_id: String.t() | nil,
           epoch: String.t() | nil,
-          plugin_instance: String.t() | nil,
           media_ms: number(),
           observed_at: DateTime.t() | nil,
-          tracking: boolean(),
-          ended_tracks: [String.t()],
           max_unseen_ms: pos_integer(),
           max_live_tracks: pos_integer(),
           stationary_after_ms: pos_integer(),
@@ -551,11 +529,8 @@ defmodule Cairn.Tracker do
     %{
       camera_id: camera_id,
       epoch: observation.epoch,
-      plugin_instance: observation.plugin_instance,
       media_ms: observation.media_ms,
       observed_at: observation.observed_at,
-      tracking: observation.tracking,
-      ended_tracks: observation.ended_tracks,
       max_unseen_ms: policy.max_unseen_ms,
       max_live_tracks: policy.max_live_tracks,
       stationary_after_ms: policy.stationary_after_ms,
@@ -570,11 +545,10 @@ defmodule Cairn.Tracker do
   `object_id` (ULID) and its track's `stale_predicted` and `stationary` flags,
   in the order given, and the lifecycle events this observation caused.
 
-  An object the tracker refuses — a `track_id` repeated inside this batch, a
-  new identity at the live-track cap with nothing evictable, or a host-mode
-  detection dropped as a duplicate of a live same-label track it overlaps
-  (`@duplicate_suppression_iou`) — is absent from the tagged list, so `tagged`
-  may be shorter than `objects`.
+  An object the tracker refuses — a new identity at the live-track cap with
+  nothing evictable, or a detection dropped as a duplicate of a live same-label
+  track it overlaps (`@duplicate_suppression_iou`) — is absent from the tagged
+  list, so `tagged` may be shorter than `objects`.
 
   Staleness is refreshed *before* expiry so that an expiring track's final
   summary reports this batch's `stale_predicted`, not the previous batch's.
@@ -585,7 +559,6 @@ defmodule Cairn.Tracker do
   @spec track(t(), [map()], context()) :: {t(), [map()], [event()]}
   def track(%__MODULE__{} = tracker, objects, context) do
     {tracker, lapsed} = expire_suspended(tracker, context.observed_at)
-    {tracker, ended} = end_plugin_tracks(tracker, context)
     {tracker, assignments, adopted} = assign(tracker, objects, context)
 
     {tracker, tagged, lifecycle} =
@@ -593,7 +566,7 @@ defmodule Cairn.Tracker do
 
     {tracker, expired} = tracker |> refresh_stale(context) |> expire(context)
 
-    {observed(tracker, context), tagged, lapsed ++ ended ++ lifecycle ++ expired}
+    {observed(tracker, context), tagged, lapsed ++ lifecycle ++ expired}
   end
 
   # The wall instant a later `suspend/3` reports its outage gap from. Moved on
@@ -613,38 +586,27 @@ defmodule Cairn.Tracker do
   `reason` is — the reset is what it was last seen by, and a path that gives up
   on the wait early does not change what happened to it.
 
-  `keep_ended: true` carries the plugin ids already declared ended over to the
-  new tracker, so their reuse is still reported as the contract violation it
-  is. Which of the two is right follows from the identity key: an epoch cut
-  changes `epoch`, so a stale ended entry can never match again and is dropped
-  with the rest of the state. A cut *inside* an epoch (detection toggled off
-  and back on) leaves the key untouched — drop the memory there and a plugin
-  reusing an id it ended is silently given a fresh identity instead.
+  `last_observed_at` is the one thing the emptied tracker keeps: it dates the
+  stream's last sign of life, which a later `suspend/3` reports its outage gap
+  from, and no track of this camera's has to still exist for that to be the
+  right answer.
   """
-  @spec end_all(t(), Track.end_reason(), keyword()) :: {t(), [event()]}
-  def end_all(%__MODULE__{} = tracker, reason, opts \\ []) do
-    emptied =
-      if Keyword.get(opts, :keep_ended, false),
-        do: %__MODULE__{
-          ended: tracker.ended,
-          ended_seq: tracker.ended_seq,
-          last_observed_at: tracker.last_observed_at
-        },
-        else: %__MODULE__{last_observed_at: tracker.last_observed_at}
+  @spec end_all(t(), Track.end_reason()) :: {t(), [event()]}
+  def end_all(%__MODULE__{} = tracker, reason) do
+    emptied = %__MODULE__{last_observed_at: tracker.last_observed_at}
 
     live = for {_id, object} <- tracker.objects, do: {:ended, to_track(object, reason)}
     {emptied, live ++ suspension_ends(tracker.suspended)}
   end
 
   @doc """
-  Moves the live host tracks aside at a stream-epoch boundary.
+  Moves the live tracks aside at a stream-epoch boundary.
 
-  The new epoch decodes a stream whose media clock and identities have nothing
-  to do with the old one's, so the tracker is emptied of live tracks and of the
-  plugin identity map — but the host tracks are *kept*, suspended, so a
-  detection in the new epoch can adopt one instead of minting a duplicate of
-  the object that was already there. See the moduledoc for what adoption
-  demands and what it resumes.
+  The new epoch decodes a stream whose media clock has nothing to do with the
+  old one's, so the tracker is emptied of live tracks — but they are *kept*,
+  suspended, so a detection in the new epoch can adopt one instead of minting a
+  duplicate of the object that was already there. See the moduledoc for what
+  adoption demands and what it resumes.
 
   `cut_at` is the wall instant of the boundary itself, and it is what the
   adoption window is measured from — not `last_observed_at`, which is the last
@@ -654,12 +616,11 @@ defmodule Cairn.Tracker do
   waiting starts when the stream is cut. `suspension.at` still reports
   `last_observed_at`, because that is what an outage gap is measured to.
 
-  Three kinds of track do not survive this: plugin-owned ones (the plugin's own
-  identity key already ended them at the cut), everything at all if this camera
-  has never been observed, and the oldest suspensions beyond `max_suspended` —
-  a camera reconnecting in a loop must not accumulate a generation of ghosts
-  per attempt. All of them are returned as `:stream_reset` finals, and so is
-  any suspension whose window has run out by `cut_at`.
+  Two kinds of track do not survive this: everything at all if this camera has
+  never been observed, and the oldest suspensions beyond `max_suspended` — a
+  camera reconnecting in a loop must not accumulate a generation of ghosts per
+  attempt. Both are returned as `:stream_reset` finals, and so is any
+  suspension whose window has run out by `cut_at`.
 
   Returns `{tracker, events, suspension}`; the counts in `suspension` are the
   caller's link-health report.
@@ -680,16 +641,13 @@ defmodule Cairn.Tracker do
     at = tracker.last_observed_at
     {tracker, lapsed} = expire_suspended(tracker, cut_at)
 
-    {host, plugin} = Enum.split_with(tracker.objects, fn {_id, o} -> o.source == :host end)
-
-    entering = Map.new(host, fn {id, o} -> {id, %{tracked: o, suspended_at: cut_at}} end)
+    entering =
+      Map.new(tracker.objects, fn {id, o} -> {id, %{tracked: o, suspended_at: cut_at}} end)
 
     {suspended, evicted} =
       trim_suspended(Map.merge(tracker.suspended, entering), max_suspended, cut_at)
 
-    severed =
-      for({_id, object} <- plugin, do: {:ended, to_track(object, :stream_reset)}) ++
-        suspension_ends(evicted)
+    severed = suspension_ends(evicted)
 
     tracker = %__MODULE__{
       # `warned_at` rides across the cut: it rate-limits log lines against the
@@ -791,30 +749,6 @@ defmodule Cairn.Tracker do
     if union <= 0, do: 0.0, else: inter / union
   end
 
-  # -- plugin-declared ends ---------------------------------------------------
-
-  defp end_plugin_tracks(tracker, %{tracking: true, ended_tracks: [_ | _] = ids} = context) do
-    Enum.reduce(ids, {tracker, []}, fn id, {tracker, events} ->
-      key = plugin_key(id, context)
-      tracker = remember_ended(tracker, key)
-
-      case Map.fetch(tracker.index, key) do
-        {:ok, object_id} ->
-          {object, objects} = Map.pop(tracker.objects, object_id)
-          tracker = %{tracker | objects: objects, index: Map.delete(tracker.index, key)}
-          {tracker, events ++ ended_event(object, :plugin_ended)}
-
-        :error ->
-          {tracker, events}
-      end
-    end)
-  end
-
-  defp end_plugin_tracks(tracker, _context), do: {tracker, []}
-
-  defp ended_event(nil, _reason), do: []
-  defp ended_event(object, reason), do: [{:ended, to_track(object, reason)}]
-
   # -- suspension -------------------------------------------------------------
 
   # A suspended track ends as what it was last seen by. Sorted by id so a
@@ -866,80 +800,11 @@ defmodule Cairn.Tracker do
   # track, `:drop` an object the tracker refuses. The third element is the ids
   # this batch adopted out of suspension, which the assignment map alone does
   # not distinguish from an ordinary match.
-  defp assign(tracker, objects, context) do
-    {plugin, host} =
-      objects
-      |> Enum.with_index()
-      |> Enum.split_with(fn {object, _index} -> plugin_tracked?(object, context) end)
-
-    {tracker, plugin_assignments} = assign_plugin(tracker, plugin, context)
-    {tracker, host_assignments, adopted} = assign_host(tracker, host, context)
-    {tracker, Map.merge(plugin_assignments, host_assignments), adopted}
-  end
-
-  # One `track_id` names one object. Two objects in the same batch claiming the
-  # same id would otherwise share a ULID — one `:started` and one `:updated`
-  # for the same identity, with the second box overwriting the first — so the
-  # first occurrence wins and the rest are refused. Same class of contract
-  # violation as reuse-after-`ended_tracks`, treated the same way.
-  defp assign_plugin(tracker, indexed, context) do
-    {tracker, assignments, _seen} =
-      Enum.reduce(indexed, {tracker, %{}, MapSet.new()}, fn {object, index},
-                                                            {tracker, assignments, seen} ->
-        key = plugin_key(object.track_id, context)
-
-        if MapSet.member?(seen, key) do
-          {warn_duplicate(tracker, object, context), Map.put(assignments, index, :drop), seen}
-        else
-          {tracker, object_id} = plugin_identity(tracker, key, object, context)
-          {tracker, Map.put(assignments, index, object_id), MapSet.put(seen, key)}
-        end
-      end)
-
-    {tracker, assignments}
-  end
-
-  defp warn_duplicate(tracker, object, context) do
-    warn_once(
-      tracker,
-      context,
-      :duplicate_track_id,
-      "camera #{context.camera_id}: plugin #{inspect(context.plugin_instance)} sent track id " <>
-        "#{inspect(object.track_id)} twice in one batch — dropping the duplicate object"
-    )
-  end
-
-  defp warn_reuse(tracker, object, context) do
-    warn_once(
-      tracker,
-      context,
-      :reused_track_id,
-      "camera #{context.camera_id}: plugin #{inspect(context.plugin_instance)} reused " <>
-        "track id #{inspect(object.track_id)} after ending it — tracking it as a new object"
-    )
-  end
-
-  defp plugin_identity(tracker, key, object, context) do
-    if Map.has_key?(tracker.ended, key) do
-      tracker = warn_reuse(tracker, object, context)
-      object_id = ULID.generate()
-      {tracker |> forget_ended(key) |> bind(key, object_id), object_id}
-    else
-      case Map.fetch(tracker.index, key) do
-        {:ok, object_id} ->
-          {tracker, object_id}
-
-        :error ->
-          object_id = ULID.generate()
-          {bind(tracker, key, object_id), object_id}
-      end
-    end
-  end
-
-  # Greedy IoU, best overlap first, each object and each track used once. Only
-  # host-owned tracks are candidates: a plugin's identities are its own. The
-  # threshold is per candidate track (`match_threshold/2`), so it decides which
-  # pairs exist and never how the ones that exist are ordered.
+  #
+  # Greedy IoU, best overlap first, each object and each track used once. Every
+  # live track is a candidate — there is one kind of track and one way to earn
+  # an identity. The threshold is per candidate track (`match_threshold/2`), so
+  # it decides which pairs exist and never how the ones that exist are ordered.
   #
   # What is left over then goes through `adopt/4` and `suppress_duplicates/4`,
   # so the result can also carry `:drop`s, revived suspensions and a tracker
@@ -956,8 +821,9 @@ defmodule Cairn.Tracker do
   # the live set in time to suppress a *second* box of the same object in the
   # same batch, which is why suppression re-reads its candidates off the tracker
   # instead of taking `candidates` below.
-  defp assign_host(tracker, indexed, context) do
-    candidates = for {id, object} <- tracker.objects, object.source == :host, do: {id, object}
+  defp assign(tracker, objects, context) do
+    indexed = Enum.with_index(objects)
+    candidates = Map.to_list(tracker.objects)
 
     pairs =
       for {object, index} <- indexed,
@@ -1136,13 +1002,13 @@ defmodule Cairn.Tracker do
   end
 
   # Every object still unmatched after the greedy pass and `adopt/4`, against
-  # every live host track there is: an overlap of `@duplicate_suppression_iou`
+  # every live track there is: an overlap of `@duplicate_suppression_iou`
   # or more with a same-label track is read as that track's object again, and
   # minting for it is how one object ends up with several live tracks. It is
   # dropped instead.
   #
   # Candidates are read off the tracker here rather than reusing the list
-  # `assign_host/3` built, because `adopt/4` has run in between: a track this
+  # `assign/3` built, because `adopt/4` has run in between: a track this
   # batch revived out of suspension is live by now, and a second box of its
   # object has to be suppressed against it like any other.
   #
@@ -1171,7 +1037,7 @@ defmodule Cairn.Tracker do
   # batch, so a box it refused is not the only sign of life it has. See `seen/3`
   # for how little the mark means and why that asymmetry costs nothing.
   defp suppress_duplicates(tracker, indexed, {assignments, objects, tracks}, context) do
-    candidates = for {id, tracked} <- tracker.objects, tracked.source == :host, do: {id, tracked}
+    candidates = Map.to_list(tracker.objects)
 
     unmatched =
       for {object, index} <- indexed, not MapSet.member?(objects, index), do: {object, index}
@@ -1201,7 +1067,7 @@ defmodule Cairn.Tracker do
 
   # The track the box is read as belonging to: most overlapping first, ties
   # broken by id so that map iteration order never decides it (the same job the
-  # sort key in `assign_host/3` does).
+  # sort key in `assign/3` does).
   #
   # At most one track is marked seen off one box, and only this one. A second
   # track overlapping the same box is a duplicate from an earlier batch, and
@@ -1314,6 +1180,13 @@ defmodule Cairn.Tracker do
     end
   end
 
+  # The binary clause is unreachable today: every id `assign/3` emits names a
+  # track that is in `objects` — a live match's, or one `adopt/4` just revived
+  # — and eviction spares everything this batch assigned (`protected`), so
+  # `fetch_assigned/2` cannot miss on a binary. Only the removed plugin path
+  # could mint under a caller-chosen id. Kept deliberately: it preserves the
+  # shape `apply_object/6` is written against rather than asserting that
+  # unreachability in code.
   defp new_object_id(:new), do: ULID.generate()
   defp new_object_id(object_id), do: object_id
 
@@ -1392,10 +1265,8 @@ defmodule Cairn.Tracker do
     )
   end
 
-  defp remove_object(tracker, object_id) do
-    index = for {key, id} <- tracker.index, id != object_id, into: %{}, do: {key, id}
-    %{tracker | objects: Map.delete(tracker.objects, object_id), index: index}
-  end
+  defp remove_object(tracker, object_id),
+    do: %{tracker | objects: Map.delete(tracker.objects, object_id)}
 
   defp warn_once(tracker, context, class, message) do
     last = Map.get(tracker.warned_at, class)
@@ -1419,8 +1290,11 @@ defmodule Cairn.Tracker do
         bbox: object.bbox,
         score: object.score,
         best_score: object.score,
-        source: if(plugin_tracked?(object, context), do: :plugin, else: :host),
-        plugin_track_id: if(plugin_tracked?(object, context), do: object.track_id),
+        # Every track the host mints is its own. `plugin_track_id` is carried
+        # for wire and schema compatibility only — nothing sets it any more
+        # (see `Cairn.Track`), and an object's own `track_id` is not read here.
+        source: :host,
+        plugin_track_id: nil,
         epoch: context.epoch,
         started_at: context.observed_at,
         last_seen_at: context.observed_at,
@@ -1617,15 +1491,7 @@ defmodule Cairn.Tracker do
         {tracker, []}
 
       _ ->
-        dropped = MapSet.new(expired, fn {id, _object} -> id end)
-
-        index =
-          for {key, id} <- tracker.index,
-              not MapSet.member?(dropped, id),
-              into: %{},
-              do: {key, id}
-
-        {%{tracker | objects: Map.new(live), index: index},
+        {%{tracker | objects: Map.new(live)},
          for({_id, object} <- expired, do: {:ended, to_track(object, :unseen)})}
     end
   end
@@ -1659,44 +1525,6 @@ defmodule Cairn.Tracker do
 
   defp stale?(tracked, context),
     do: context.media_ms - tracked.last_detected_ms > context.max_unseen_ms
-
-  # -- plugin identity map ----------------------------------------------------
-
-  # Identity is scoped to `(plugin_instance, epoch, track_id)`. `plugin_instance`
-  # separates concurrent plugins (camera id inline, group name for a group) and
-  # `epoch` cuts identity at every ffmpeg respawn, so no track id crosses a
-  # stream restart. It does *not* cover a plugin process restarting within an
-  # epoch: the instance is static across respawns, so a restarted plugin that
-  # reuses its old track ids resumes the ULIDs they were bound to.
-  defp plugin_key(track_id, context),
-    do: {context.plugin_instance, context.epoch, track_id}
-
-  defp plugin_tracked?(object, %{tracking: true}), do: is_binary(object[:track_id])
-  defp plugin_tracked?(_object, _context), do: false
-
-  defp bind(tracker, key, object_id),
-    do: %{tracker | index: Map.put(tracker.index, key, object_id)}
-
-  defp forget_ended(tracker, key), do: %{tracker | ended: Map.delete(tracker.ended, key)}
-
-  # Insertion-ordered by sequence so the set can be halved when it grows past
-  # the cap — an epoch that runs for days must not accumulate ids forever.
-  defp remember_ended(tracker, key) do
-    ended = Map.put(tracker.ended, key, tracker.ended_seq)
-    tracker = %{tracker | ended: ended, ended_seq: tracker.ended_seq + 1}
-
-    if map_size(ended) > @max_ended_keys, do: halve_ended(tracker), else: tracker
-  end
-
-  defp halve_ended(tracker) do
-    kept =
-      tracker.ended
-      |> Enum.sort_by(fn {_key, seq} -> -seq end)
-      |> Enum.take(div(@max_ended_keys, 2))
-      |> Map.new()
-
-    %{tracker | ended: kept}
-  end
 
   # -- summaries --------------------------------------------------------------
 

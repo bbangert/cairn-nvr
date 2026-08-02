@@ -39,8 +39,9 @@
 # Protocol v1 is emitted by default: `plugin.hello`, `plugin.status`, then
 # `frame.objects` lines stamped with the `stream_epoch` this plugin was told
 # on stdin. `--v0` emits the original `{"pts", "dets"}` shape instead.
-# `--object-tracking` declares the `object_tracking` capability, which is what
-# makes the host honour per-object "track_id".
+# `--object-tracking` declares the `object_tracking` capability. The host no
+# longer acts on it — it tracks every object itself and ignores "track_id" —
+# so the flag exists to drive the host's "unsupported capability" warning.
 {opts, _rest, _invalid} =
   OptionParser.parse(System.argv(),
     strict: [

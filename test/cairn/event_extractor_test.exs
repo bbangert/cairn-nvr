@@ -318,7 +318,6 @@ defmodule Cairn.EventExtractorTest do
         }
       ],
       ended_tracks: [],
-      tracking: false,
       protocol: :v0
     }
   end

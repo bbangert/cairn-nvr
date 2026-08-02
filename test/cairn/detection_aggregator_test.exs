@@ -71,8 +71,6 @@ defmodule Cairn.DetectionAggregatorTest do
       observed_at: Keyword.get(opts, :observed_at, DateTime.utc_now()),
       time_quality: :arrival,
       objects: objects,
-      ended_tracks: Keyword.get(opts, :ended_tracks, []),
-      tracking: Keyword.get(opts, :tracking, false),
       protocol: :v0
     }
   end
@@ -713,41 +711,6 @@ defmodule Cairn.DetectionAggregatorTest do
     refute_received {:track_ended, _}
   end
 
-  test "an id the plugin ended is still known after a detection toggle", %{
-    agg: agg,
-    camera: camera,
-    camera_id: id
-  } do
-    live = object("person", 0.9, [0.0, 0.0, 0.1, 0.1], "detected", "t1")
-    other = object("person", 0.9, [0.8, 0.8, 0.1, 0.1], "detected", "t2")
-
-    observe(agg, camera, [live, other], tracking: true)
-    assert_receive {:track_started, %Track{object_id: ended_oid, plugin_track_id: "t1"}}
-    assert_receive {:track_started, %Track{plugin_track_id: "t2"}}
-
-    # "t1" is ended by the plugin; "t2" stays live so the toggle below has
-    # something to end
-    observe(agg, camera, [other], tracking: true, media_ms: 1_200.0, ended_tracks: ["t1"])
-    assert_receive {:track_ended, %Track{object_id: ^ended_oid, end_reason: :plugin_ended}}
-
-    Cairn.CameraControl.set(id, %{detection_enabled: false})
-    observe(agg, camera, [other], tracking: true, media_ms: 1_400.0)
-    assert_receive {:track_ended, %Track{plugin_track_id: "t2", end_reason: :detection_disabled}}
-    Cairn.CameraControl.set(id, %{detection_enabled: true})
-
-    # the toggle did not change the epoch, so reusing "t1" is the same contract
-    # violation it was before it — reported, and given a fresh identity
-    log =
-      capture_log(fn ->
-        observe(agg, camera, [live], tracking: true, media_ms: 1_600.0)
-        _ = :sys.get_state(agg)
-      end)
-
-    assert log =~ ~s(reused track id "t1" after ending it)
-    assert_receive {:track_started, %Track{object_id: new_oid, plugin_track_id: "t1"}}
-    refute new_oid == ended_oid
-  end
-
   test "checkpoint writes are throttled between an event's first and last", %{
     camera: camera,
     camera_id: id
@@ -1273,30 +1236,6 @@ defmodule Cairn.DetectionAggregatorTest do
       # expiry is media time: 3.1s after the last sighting the track ends
       observe(agg, camera, [], media_ms: 4_200.0)
       assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :unseen}}
-    end
-
-    test "a plugin's own track ids are honoured when it declared the capability", %{
-      agg: agg,
-      camera: camera
-    } do
-      observe(agg, camera, [object("person", 0.9, [0.0, 0.0, 0.1, 0.1], "detected", "t1")],
-        tracking: true
-      )
-
-      assert_receive {:track_started,
-                      %Track{object_id: oid, source: :plugin, plugin_track_id: "t1"}}
-
-      # nowhere near the previous box: only the plugin's id keeps it the same
-      # object
-      observe(agg, camera, [object("person", 0.95, [0.8, 0.8, 0.1, 0.1], "detected", "t1")],
-        tracking: true,
-        media_ms: 1_200.0
-      )
-
-      assert_receive {:track_updated, %Track{object_id: ^oid, best_score: 0.95}}
-
-      observe(agg, camera, [], tracking: true, media_ms: 1_400.0, ended_tracks: ["t1"])
-      assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :plugin_ended}}
     end
 
     test "predictions alone can neither open nor extend an event", %{

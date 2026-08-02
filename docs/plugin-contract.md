@@ -143,7 +143,7 @@ What you saw in one frame. This is the message that matters.
 | `frame.time_base` | `[num, den]` | optional; two integers in 1..1 000 000 000, default `[1, 90000]` (the RTP clock). Present but malformed drops the line |
 | `frame.observed_at` | ISO8601 string | **required.** When the frame was observed — capture it *before* inference, not after. Event times derive from it. See [Time](#time) |
 | `objects` | list | **required**, may be empty, at most **64** entries. 65 or more drops the whole line |
-| `ended_tracks` | list of strings | optional, default `[]`, at most 64, each a printable `track_id` of 1..64 bytes. Only honoured from a plugin that declared `object_tracking` |
+| `ended_tracks` | list of strings | optional, default `[]`, at most 64, each a printable `track_id` of 1..64 bytes. **Accepted, currently unused — reserved:** the host performs its own tracking (see [Track identity](#track-identity)) |
 
 An empty `objects` list is a perfectly valid observation, and the normal
 thing to send for a quiet frame. It is not a liveness protocol: Cairn draws
@@ -162,7 +162,7 @@ An object is a detection plus optional identity:
 | `label` | string 1..64 **bytes** | **required.** Printable text only: no control characters, no ANSI escapes, valid UTF-8 |
 | `score` | number 0..1 | **required** |
 | `bbox` | `[x, y, w, h]` | **required.** Exactly four numbers; `x`, `y`, `w`, `h` all in 0..1, and `w`, `h` strictly greater than zero. See [Geometry](#geometry) |
-| `track_id` | string 1..64 bytes | optional; your own identity for this object, stable within an epoch. Same charset rule as `label` |
+| `track_id` | string 1..64 bytes | optional; your own identity for this object. Same charset rule as `label`. **Accepted, currently unused — reserved:** the host performs its own tracking and ignores plugin track ids (see [Track identity](#track-identity)) |
 | `observation_kind` | `"detected"` or `"tracked"` | optional, default `"detected"`. Any other value refuses the object |
 
 An object that breaks these rules is dropped **on its own** — the rest of
@@ -221,16 +221,16 @@ Anything else — or a field of the wrong shape — is dropped silently. The
 *message* is not: a plugin that mis-declares itself still runs, still
 detects, and is simply logged as it described itself.
 
-`capabilities.object_tracking` is the one capability Cairn acts on today. It
-is the promise that your `track_id`s are stable within a stream epoch, and
-the only thing that makes Cairn use them instead of its own box matching (see
-[Track identity](#track-identity)). Declare it `false`, or omit it, if you
-only detect. Because it is read as a boolean, the string `"true"` is dropped
-by the bounds above and reads as no promise at all.
+`capabilities.object_tracking` is **accepted, currently unused — reserved:**
+Cairn performs its own tracking and ignores plugin track ids, so no capability
+changes how identity is decided (see [Track identity](#track-identity)).
+Declaring it `true` is not an error and does not stop the plugin, but Cairn
+logs a warning for each `plugin.hello` that declares it — once per process
+for a plugin that sends hello once, again if you re-send it — saying the
+declaration is unsupported. Declare it `false`, or omit it.
 
 Sending `plugin.hello` again later replaces the recorded hello. There is no
-reason to; the capability is read per line from whatever was last recorded,
-so flipping it mid-run flips tracking behavior mid-stream.
+reason to.
 
 ### `plugin.status`
 
@@ -523,16 +523,18 @@ string that appears in an event's `labels[].object_id` and `trigger.object_id`
 and on every `track_started` / `track_updated` / `track_ended` frame (see
 [`docs/ha-api.md`](ha-api.md#track-frames)).
 
-Who decides identity depends on one capability:
+**Cairn decides identity, always.** `track_id`, `ended_tracks` and the
+`object_tracking` capability are accepted and validated on the wire but
+**currently unused — reserved**: the host performs its own tracking and
+ignores plugin track ids. Nothing breaks if you send ids; they are decoration.
 
-**Without `capabilities.object_tracking: true`,** `track_id` is ignored
-entirely. Cairn matches boxes host-side by greedy IoU (threshold 0.1, raised
-to 0.7 for a stationary track riding out the extended grace below) among the
-live tracks *Cairn itself owns* of the same label. Nothing breaks if you
-send ids anyway — they are simply decoration. Tracks a plugin owns are never
-IoU candidates, which matters only if you turn the capability off mid-run:
-the tracks you owned until then are unmatchable afterwards and expire on
-`max_unseen_ms` rather than being adopted.
+Cairn matches boxes host-side by greedy IoU (threshold 0.1, raised to 0.7 for
+a stationary track riding out the extended grace below) among the live tracks
+of the same label. Cairn expires a track you stop mentioning after
+`max_unseen_ms` of *media* time (default 3 s, per-camera configurable) — you
+never have to declare an object gone. A track Cairn has judged **stationary**
+(its box held still for `tracking.stationary_after_ms`) gets five times that
+bound instead, so a parked object outlasts whatever parks in front of it.
 
 A host-side identity can **survive a stream reset**. At an epoch boundary
 these tracks are suspended rather than ended, and a detection on the far side
@@ -545,34 +547,6 @@ only one Cairn had judged stationary will, and only at 0.7. A minute after the
 timestamped at the last observation before the cut, which on a stream that had
 already gone quiet can be well over a minute earlier. None of this needs
 anything from you: it is geometry over the boxes you send.
-
-**With it,** Cairn honours your ids and runs no box matching:
-
-- `(your plugin instance, stream epoch, track_id)` maps 1:1 onto a ULID for
-  the life of that triple. Reuse a `track_id` for the same object and it
-  keeps its identity. The plugin instance is your camera id (per-camera) or
-  your group name (group).
-- **Ids are scoped to the epoch.** At an epoch boundary Cairn ends every track
-  it holds for you with a final summary (`stream_reset`) and starts fresh —
-  reusing an id across the boundary gets you a new object, not the old one.
-  (Only *host*-owned tracks survive a boundary, by geometry; an identity you
-  own is yours, and Cairn will not revive one behind your back.)
-- List an id in `ended_tracks` when the object is gone. Cairn ends the track
-  and sends its final summary (`plugin_ended`). `ended_tracks` is honoured
-  only under the capability, same as `track_id`.
-- **Never reuse an id you have ended.** Cairn logs a contract violation and
-  treats it as a brand-new object (new ULID). It remembers up to 4 096 ended
-  ids per camera tracker, halving the memory when that fills — reuse after a
-  very long run may therefore go unreported, but never rebinds the old
-  identity.
-- **One `track_id` per object per line.** The same id twice in one
-  `objects` list is a violation: the first occurrence wins and the duplicate
-  object is dropped.
-- Cairn expires a track you stop mentioning after `max_unseen_ms` of *media*
-  time (default 3 s, per-camera configurable) — `ended_tracks` is a courtesy,
-  not a requirement. A track Cairn has judged **stationary** (its box held
-  still for `tracking.stationary_after_ms`) gets five times that bound
-  instead, so a parked object outlasts whatever parks in front of it.
 
 ### Host policy: the live set is bounded
 
@@ -588,24 +562,8 @@ should ever be reachable by a plugin that behaves:
   live tracks (default 128, per-camera configurable). At the cap, minting a
   new identity retires the least recently seen one with a final summary
   (`evicted`); if every live track was already claimed by the current line,
-  the *new* object is dropped instead. Minting a fresh `track_id` per frame
-  is what this exists for.
-
-### Known limitation: identity survives your restart
-
-Identity is scoped to `(plugin instance, epoch, track_id)`, and the plugin
-instance is the camera id or group name — **it does not change when your
-process restarts**. If your plugin crashes and respawns *within* one stream
-epoch and resumes emitting the same `track_id` values from zero, those ids
-resume the ULIDs they were previously bound to, and a new physical object can
-inherit an old track's public identity.
-
-This is accepted and documented rather than fixed. Two things make it
-tolerable: an epoch boundary (the common cause of a plugin restart being
-worth noticing) does cut identity, and a plugin whose ids are counters
-starting at 1 will collide only with tracks still live from before the crash.
-If it matters to you, make your `track_id`s unique per process run — a
-per-spawn prefix is enough, and Cairn imposes no structure on the string.
+  the *new* object is dropped instead. A detector that reports one box per
+  object per frame never approaches it.
 
 ## Limits
 
@@ -642,7 +600,6 @@ only that much.
 | host-clock backstop | 10 × the applicable media-time bound | track ended (`unseen`) |
 | `tracking.max_live_tracks` | default 128 per camera | least recently seen track evicted |
 | `tracking.stationary_after_ms` | default 10 000 ms of media time | track flagged `stationary`, and no longer event evidence |
-| ended-`track_id` memory | 4 096 per camera tracker | halved; older reuse goes unreported |
 | host IoU match threshold | 0.1 (0.7 for a stationary track in extended grace) | below it, a new track is minted |
 | `track_updated` throttle | best-score improvement, or 1 000 ms | update not published |
 | respawn backoff | 1 s → 30 s base, ×0.5–1.5 jitter (≈0.5 s → ≈45 s) | — |
@@ -899,8 +856,8 @@ What v0 costs you, and what v1 fixes:
   nothing to check.
 - **No sequence.** Gaps between your process and Cairn are invisible.
 - **No track ids and no `ended_tracks`.** Every object is `"detected"` with
-  no identity, so tracking is always host-side IoU. `capabilities` cannot be
-  declared without a hello, so this is consistent rather than a limitation.
+  no identity. Costs nothing: tracking is host-side IoU on v1 too, and both
+  fields are reserved there.
 - **No status.** Nothing surfaces on the dashboard for the plugin.
 
 `time_base` is fixed at `[1, 90000]` for v0 — the RTP clock. Everything else

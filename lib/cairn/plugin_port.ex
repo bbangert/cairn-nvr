@@ -13,8 +13,9 @@ defmodule Cairn.PluginPort do
   `Cairn.Observation` forwarded to `Cairn.DetectionAggregator` together with
   the camera's config and effective policy (event windows, tracking bounds and
   the `track:` / `record:` tiers), so the aggregator never has to look up
-  config; `plugin.hello` is recorded here —
-  its `object_tracking` capability is what marks an observation `tracking` —
+  config; `plugin.hello` is recorded here — a plugin declaring the
+  `object_tracking` capability is warned about, since the host tracks every
+  object itself and ignores plugin track ids —
   and `plugin.status` lands in `Cairn.CameraStatus`. Lines that do not match the contract are dropped,
   as are observations from a stream epoch that is no longer current —
   counted always, logged periodically. Exit -> jittered backoff respawn,
@@ -255,7 +256,7 @@ defmodule Cairn.PluginPort do
   defp observe(state, observation) do
     {observation, skew} =
       observation
-      |> attribute(state.camera.id, tracking?(state.plugin))
+      |> attribute(state.camera.id)
       |> clamp_observed_at()
 
     state = note_drops(state, skew, :clock_skew)
@@ -289,7 +290,7 @@ defmodule Cairn.PluginPort do
 
   # v0 lines carry neither epoch nor time: the epoch is whatever is current
   # right now, and arrival is the only timestamp available.
-  defp attribute(%Observation{protocol: :v0} = observation, camera_id, tracking) do
+  defp attribute(%Observation{protocol: :v0} = observation, camera_id) do
     epoch =
       case StreamEpochs.current(camera_id) do
         {:ok, epoch} -> epoch
@@ -302,23 +303,12 @@ defmodule Cairn.PluginPort do
         plugin_instance: camera_id,
         epoch: epoch,
         observed_at: DateTime.utc_now(),
-        time_quality: :arrival,
-        tracking: tracking
+        time_quality: :arrival
     }
   end
 
-  defp attribute(observation, camera_id, tracking),
-    do: %{
-      observation
-      | camera_id: camera_id,
-        plugin_instance: camera_id,
-        tracking: tracking
-    }
-
-  # Track ids are only honoured from a plugin that promised, in its hello,
-  # that they are stable (see `Cairn.Tracker`).
-  defp tracking?(%{"capabilities" => %{"object_tracking" => true}}), do: true
-  defp tracking?(_hello), do: false
+  defp attribute(observation, camera_id),
+    do: %{observation | camera_id: camera_id, plugin_instance: camera_id}
 
   # v0 observations were stamped with the current epoch a line ago, so only a
   # plugin-supplied (v1) epoch can be stale here.
@@ -385,8 +375,26 @@ defmodule Cairn.PluginPort do
         :ok
     end
 
+    warn_object_tracking(state, hello["capabilities"])
+
     %{state | plugin: hello}
   end
+
+  # The capability is still accepted on the wire and still parsed, but the host
+  # tracks every object itself and reads no plugin track id, so declaring it
+  # buys the plugin nothing and its ids will not be honoured. Said once per
+  # hello *line* — a plugin normally sends one per process, but `note_hello/2`
+  # does not dedup, so a plugin that re-sends its hello is re-warned — and it
+  # is never a reason to refuse the plugin, whose detections are what Cairn
+  # wants.
+  defp warn_object_tracking(state, %{"object_tracking" => true}) do
+    Logger.warning(
+      "camera #{state.camera.id}: plugin declares object_tracking — unsupported; " <>
+        "host-side tracking is used and plugin track ids are ignored"
+    )
+  end
+
+  defp warn_object_tracking(_state, _capabilities), do: :ok
 
   # An unchanged status is an ETS write plus a broadcast to every dashboard
   # and SSE client per line, so it is re-sent only as a slow heartbeat.

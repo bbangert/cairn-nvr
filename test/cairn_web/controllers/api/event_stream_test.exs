@@ -158,6 +158,10 @@ defmodule CairnWeb.Api.EventStreamTest do
   end
 
   describe "track lifecycle frames" do
+    # `source: :plugin` with a `plugin_track_id` on purpose: nothing mints that
+    # shape any more (plugin-owned tracking was removed), but rows recorded
+    # before the removal still carry it and the frame has to serialize them —
+    # which is a stricter test of the shape than two nulls would be.
     defp track do
       %Cairn.Track{
         object_id: "01J8ZQ0P8B7X0N2R4C6D8E0F2G",

@@ -73,11 +73,8 @@ defmodule Cairn.TrackerTest do
     %{
       camera_id: Keyword.get(opts, :camera_id, "cam_a"),
       epoch: Keyword.get(opts, :epoch, "epoch_one"),
-      plugin_instance: Keyword.get(opts, :plugin_instance, "cam_a"),
       media_ms: Keyword.get(opts, :media_ms, 0),
       observed_at: Keyword.get(opts, :observed_at, ~U[2026-07-26 12:00:00Z]),
-      tracking: Keyword.get(opts, :tracking, false),
-      ended_tracks: Keyword.get(opts, :ended_tracks, []),
       max_unseen_ms: Keyword.get(opts, :max_unseen_ms, @max_unseen),
       max_live_tracks: Keyword.get(opts, :max_live_tracks, 128),
       stationary_after_ms: Keyword.get(opts, :stationary_after_ms, @stationary_after),
@@ -91,16 +88,15 @@ defmodule Cairn.TrackerTest do
     for {^kind, %Track{object_id: id}} <- events, do: id
   end
 
-  defp plugin_ctx(opts), do: Keyword.merge([tracking: true, plugin_instance: "grp"], opts)
-
   # Observation time derived from media time, so a `stationary_since` can be
   # checked against the step that set it.
   defp at(ms), do: DateTime.add(~U[2026-07-26 12:00:00Z], trunc(ms), :millisecond)
 
-  # One plugin-tracked object over `{media_ms, bbox}` (or `{media_ms, bbox,
-  # kind}`) steps, returning the last step's `track/3` result. Plugin mode on
-  # purpose: identity is pinned by the track id, so what these tests exercise
-  # is the stillness rule and not IoU matching.
+  # One object over `{media_ms, bbox}` (or `{media_ms, bbox, kind}`) steps,
+  # returning the last step's `track/3` result. Every step's box overlaps the
+  # one before it far above `@iou_threshold` — the stillness fixtures move by
+  # jitter and creep, never by a jump — so identity is held by IoU throughout
+  # and what these tests exercise is the stillness rule.
   defp feed(tracker, steps) do
     Enum.reduce(steps, {tracker, [], []}, fn step, {tracker, _tagged, _events} ->
       {ms, bbox, kind} =
@@ -109,20 +105,14 @@ defmodule Cairn.TrackerTest do
           {ms, bbox, kind} -> {ms, bbox, kind}
         end
 
-      track(
-        tracker,
-        [det("person", bbox, track_id: "t1", kind: kind)],
-        plugin_ctx(media_ms: ms, observed_at: at(ms))
-      )
+      track(tracker, [det("person", bbox, kind: kind)], media_ms: ms, observed_at: at(ms))
     end)
   end
 
-  # One host-mode object of `label` detected every second at `box`, from media
-  # time 0 through @stationary_after (10_000): stationary as of the last step,
-  # with `last_seen_ms` 10_000, `last_seen_at` at(10_000) and
-  # `last_seen_host_ms` 0 (the ctx default). Host
-  # mode on purpose — what the grace tests are about is IoU identity, which a
-  # plugin track id would pin regardless.
+  # One object of `label` detected every second at `box`, from media time 0
+  # through @stationary_after (10_000): stationary as of the last step, with
+  # `last_seen_ms` 10_000, `last_seen_at` at(10_000) and `last_seen_host_ms` 0
+  # (the ctx default).
   defp parked(box, label \\ "person") do
     {tracker, id} =
       Enum.reduce(0..10, {Tracker.new(), nil}, fn n, {tracker, id} ->
@@ -136,7 +126,7 @@ defmodule Cairn.TrackerTest do
     {tracker, id}
   end
 
-  # One host-mode object detected once per second of media time along `boxes`,
+  # One object detected once per second of media time along `boxes`,
   # from media time 0. It has moved on every step, so it is not stationary and
   # its anchor is the last box in the list, anchored at `(length - 1) * 1_000`.
   defp moving(boxes, label \\ "person") do
@@ -159,9 +149,8 @@ defmodule Cairn.TrackerTest do
   # evaluations rather than one.
   @batch_ms 500
 
-  # The small parked car of the hysteresis tests: plugin-tracked, so identity
-  # is pinned and the stillness rule is the only thing under test, detected
-  # every @batch_ms from media 0 through @stationary_after (10_000). It is
+  # The small parked car of the hysteresis tests, detected every @batch_ms from
+  # media 0 through @stationary_after (10_000). It is
   # stationary as of the last step, anchored on @small_car, with a median
   # window holding nothing but @small_car.
   defp parked_small do
@@ -384,137 +373,59 @@ defmodule Cairn.TrackerTest do
     end
   end
 
-  describe "plugin mode" do
-    test "the same track id is the same ULID within an epoch, whatever the boxes do" do
-      {t, [a], [{:started, _}]} =
-        track(
-          Tracker.new(),
-          [det("person", [0.0, 0.0, 0.1, 0.1], track_id: "t1")],
-          plugin_ctx([])
-        )
-
-      # no overlap at all: host IoU would have called this a new object
-      {_t, [b], events} =
-        track(
-          t,
-          [det("person", [0.9, 0.9, 0.05, 0.05], track_id: "t1")],
-          plugin_ctx(media_ms: 200)
-        )
-
-      assert b.object_id == a.object_id
-      assert ids(events, :updated) == [a.object_id]
-      assert [{:updated, %Track{source: :plugin, plugin_track_id: "t1"}}] = events
-    end
-
-    test "the same track id in a different epoch is a different ULID" do
-      {t, [a], _} =
-        track(
-          Tracker.new(),
-          [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1")],
-          plugin_ctx([])
-        )
-
-      {_t, [b], _} =
-        track(
-          t,
-          [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1")],
-          plugin_ctx(epoch: "epoch_two", media_ms: 200)
-        )
-
-      refute b.object_id == a.object_id
-    end
-
-    test "ended_tracks ends the track with a self-contained final summary" do
-      {t, [a], _} =
-        track(
-          Tracker.new(),
-          [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1", score: 0.95)],
-          plugin_ctx([])
-        )
-
-      {_t, [], [{:ended, final}]} =
-        track(t, [], plugin_ctx(media_ms: 200, ended_tracks: ["t1"]))
-
-      assert_self_contained(final)
-      assert final.object_id == a.object_id
-      assert final.end_reason == :plugin_ended
-      assert final.camera_id == "cam_a"
-      assert final.label == "person"
-      assert final.best_score == 0.95
-      assert final.source == :plugin
-      assert final.plugin_track_id == "t1"
-      assert final.started_at == ~U[2026-07-26 12:00:00Z]
-      assert final.last_seen_at == ~U[2026-07-26 12:00:00Z]
-    end
-
-    test "reusing an ended track id is a contract violation: warn and mint a new ULID" do
-      {t, [a], _} =
-        track(
-          Tracker.new(),
-          [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1")],
-          plugin_ctx([])
-        )
-
-      {t, [], _} = track(t, [], plugin_ctx(media_ms: 200, ended_tracks: ["t1"]))
-
-      {{t, [b], events}, log} =
-        with_log(fn ->
-          track(
-            t,
-            [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1")],
-            plugin_ctx(media_ms: 400)
-          )
-        end)
-
-      assert log =~ "reused track id \"t1\" after ending it"
-      refute b.object_id == a.object_id
-      assert ids(events, :started) == [b.object_id]
-
-      # and the new identity is stable from there on
-      {_t, [c], _} =
-        track(
-          t,
-          [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1")],
-          plugin_ctx(media_ms: 600)
-        )
-
-      assert c.object_id == b.object_id
-    end
-
-    test "track ids from a plugin without the capability are ignored" do
+  describe "plugin track ids are ignored" do
+    # The wire still carries `track_id` per object and the protocol still
+    # decodes it (see `Cairn.PluginProtocol`), so objects reaching the tracker
+    # can have one. Nothing here may read it: identity is IoU and the summaries
+    # say so.
+    test "objects carrying track ids are tracked host-side, and the ids are not identity" do
       objects = [det("person", [0.0, 0.0, 0.1, 0.1], track_id: "t1")]
-      {t, [a], [{:started, track}]} = track(Tracker.new(), objects)
+      {t, [a], [{:started, started}]} = track(Tracker.new(), objects)
 
-      assert track.source == :host
-      assert track.plugin_track_id == nil
+      assert started.source == :host
+      assert started.plugin_track_id == nil
 
-      # same id, no overlap, no capability: host IoU decides, so it is new
-      {_t, [b], _} =
+      # the same id, on a box that does not overlap at all: IoU decides, so this
+      # is a second object with a ULID of its own
+      {_t, [b], events} =
         track(t, [det("person", [0.9, 0.9, 0.05, 0.05], track_id: "t1")], media_ms: 200)
 
       refute b.object_id == a.object_id
+      assert [{:started, minted}] = events
+      assert minted.object_id == b.object_id
+      assert minted.source == :host
+      assert minted.plugin_track_id == nil
     end
 
-    test "plugin tracks expire on media time like any other" do
-      {t, [a], _} =
-        track(
-          Tracker.new(),
-          [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1")],
-          plugin_ctx([])
-        )
+    test "an observation's ended_tracks reaches no context key and ends nothing" do
+      observation = %Cairn.Observation{
+        camera_id: "cam_a",
+        epoch: "epoch_one",
+        plugin_instance: "grp",
+        media_ms: 0,
+        observed_at: ~U[2026-07-26 12:00:00Z],
+        objects: [%{label: "person", bbox: [0.1, 0.1, 0.2, 0.4], score: 0.9, track_id: "t1"}],
+        ended_tracks: ["t1"]
+      }
 
-      {t, [], ended} = track(t, [], plugin_ctx(media_ms: 3_100))
-      assert [{:ended, %Track{end_reason: :unseen}}] = ended
+      policy = %{
+        max_unseen_ms: @max_unseen,
+        max_live_tracks: 128,
+        stationary_after_ms: @stationary_after
+      }
 
-      # the id mapping went with it: the same track id is a new object
-      {_t, [b], _} =
-        track(
-          t,
-          [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1")],
-          plugin_ctx(media_ms: 3_200)
-        )
+      context = Tracker.context(observation, "cam_a", policy, 0)
 
-      refute b.object_id == a.object_id
+      refute Map.has_key?(context, :ended_tracks)
+      refute Map.has_key?(context, :tracking)
+
+      {t, [tagged], events} = Tracker.track(Tracker.new(), observation.objects, context)
+
+      # "t1" is named in `ended_tracks` and carried on the object, and the track
+      # it would have ended is started and live instead
+      assert [{:started, %Track{object_id: id, source: :host, plugin_track_id: nil}}] = events
+      assert tagged.object_id == id
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
     end
   end
 
@@ -587,7 +498,11 @@ defmodule Cairn.TrackerTest do
 
     test "predicted observations neither advance nor reset stillness" do
       box = [0.0, 0.0, 1.0, 1.0]
-      elsewhere = [0.9, 0.0, 1.0, 1.0]
+      # off the anchor by half its width: IoU 1/3, so an *evaluated* box this
+      # far out fails @stationary_iou (0.8) outright, while still clearing
+      # @iou_threshold (0.1) so the track matches it and the test is about the
+      # stillness rule rather than about identity
+      elsewhere = [0.5, 0.0, 1.0, 1.0]
 
       {t, [tagged], _} = feed(Tracker.new(), for(n <- 0..10, do: {n * 1_000, box}))
       assert tagged.stationary
@@ -1076,26 +991,6 @@ defmodule Cairn.TrackerTest do
       assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
     end
 
-    # The bound is on the track, not on how it got its identity. A plugin track
-    # has no duplicate-identity risk to weigh — its id is pinned by `track_id`,
-    # not by IoU — so nothing here has to hold it to the plain bound.
-    test "a stationary plugin-mode track gets the same extended bound" do
-      box = [0.0, 0.0, 0.4, 0.4]
-
-      {t, [tagged], _} = feed(Tracker.new(), for(n <- 0..10, do: {n * 1_000, box}))
-      assert tagged.stationary
-      id = tagged.object_id
-
-      # 10_000 unseen: past max_unseen_ms, inside 5 x 3_000
-      {t, [], []} = track(t, [], plugin_ctx(media_ms: 20_000))
-      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
-
-      # past 10_000 + 15_000
-      {t, [], ended} = track(t, [], plugin_ctx(media_ms: 25_100))
-      assert [{:ended, %Track{object_id: ^id, end_reason: :unseen}}] = ended
-      assert Tracker.live_tracks(t) == []
-    end
-
     test "the grace has an end: extended bound for a stationary track, plain for a moving one" do
       box = [0.0, 0.0, 0.4, 0.4]
       {t, id} = parked(box)
@@ -1510,21 +1405,6 @@ defmodule Cairn.TrackerTest do
       assert seen_at[Enum.max(ids)] == at(10_000)
     end
 
-    test "a plugin-owned track is not a suppression candidate" do
-      {t, [plugin_object], _} =
-        track(Tracker.new(), [det("car", @parked_car, track_id: "c1")], plugin_ctx([]))
-
-      # host mode (no track_id) against a plugin-owned track it overlaps at
-      # 0.5: `assign_host/3` only ever considers host-owned tracks, so this
-      # neither matches nor is suppressed by it
-      {_t, [host_object], events} =
-        track(t, [det("car", @car_drift)], plugin_ctx(media_ms: 200))
-
-      assert [{:started, %Track{object_id: other, source: :host}}] = events
-      refute other == plugin_object.object_id
-      assert host_object.object_id == other
-    end
-
     # `seen/3` deliberately leaves `last_seen_host_ms` alone, so the backstop
     # keeps counting from the last *adopted* observation. Without that, a
     # detection the tracker refuses every batch would hold a track alive for
@@ -1596,34 +1476,23 @@ defmodule Cairn.TrackerTest do
     end
 
     test "at the live-track cap the least recently seen track is evicted with a final" do
-      capped = fn opts -> plugin_ctx(Keyword.put(opts, :max_live_tracks, 2)) end
+      capped = fn opts -> Keyword.put(opts, :max_live_tracks, 2) end
 
-      {t, [a], _} =
-        track(Tracker.new(), [det("person", [0.0, 0.0, 0.05, 0.05], track_id: "t1")], capped.([]))
+      # three boxes far enough apart that none of them matches or suppresses
+      # another: what is under test is the cap, not the geometry
+      first = [0.0, 0.0, 0.05, 0.05]
+      second = [0.5, 0.5, 0.05, 0.05]
+      third = [0.9, 0.9, 0.05, 0.05]
 
-      {t, [b], _} =
-        track(
-          t,
-          [det("person", [0.5, 0.5, 0.05, 0.05], track_id: "t2")],
-          capped.(media_ms: 100)
-        )
+      {t, [a], _} = track(Tracker.new(), [det("person", first)], capped.([]))
+      {t, [b], _} = track(t, [det("person", second)], capped.(media_ms: 100))
 
-      # only t2 is refreshed, so t1 is the least recently seen of the two
-      {t, _, _} =
-        track(
-          t,
-          [det("person", [0.5, 0.5, 0.05, 0.05], track_id: "t2")],
-          capped.(media_ms: 200)
-        )
+      # only the second box is re-detected, so the first is the least recently
+      # seen of the two
+      {t, _, _} = track(t, [det("person", second)], capped.(media_ms: 200))
 
       {{t, [c], events}, log} =
-        with_log(fn ->
-          track(
-            t,
-            [det("person", [0.9, 0.9, 0.05, 0.05], track_id: "t3")],
-            capped.(media_ms: 300)
-          )
-        end)
+        with_log(fn -> track(t, [det("person", third)], capped.(media_ms: 300)) end)
 
       assert log =~ "live-track cap"
 
@@ -1634,39 +1503,6 @@ defmodule Cairn.TrackerTest do
       # the cap holds, and it retired the right one
       assert Enum.map(Tracker.live_tracks(t), & &1.object_id) ==
                Enum.sort([b.object_id, c.object_id])
-    end
-
-    test "the ended set is bounded and evicts the oldest ids first" do
-      # nothing is ever live here: `ended_tracks` remembers an id whether or
-      # not it named a live track, which is the growth this bound exists for
-      t =
-        1..4_200
-        |> Enum.map(&"t#{&1}")
-        |> Enum.chunk_every(64)
-        |> Enum.reduce(Tracker.new(), fn chunk, t ->
-          {t, [], []} = track(t, [], plugin_ctx(ended_tracks: chunk))
-          t
-        end)
-
-      # halved at 4_097 (to 2_048), then the remaining 103 ids appended
-      assert map_size(t.ended) == 2_151
-
-      # the newest id survived: reusing it is still caught as a violation
-      {{_t, _, _}, log} =
-        with_log(fn ->
-          track(t, [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t4200")], plugin_ctx([]))
-        end)
-
-      assert log =~ "reused track id"
-
-      # the oldest was evicted, so its reuse is (only) no longer reported —
-      # the identity outcome is a fresh ULID either way
-      {{_t, _, _}, log} =
-        with_log(fn ->
-          track(t, [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1")], plugin_ctx([]))
-        end)
-
-      refute log =~ "reused track id"
     end
   end
 
@@ -1680,23 +1516,7 @@ defmodule Cairn.TrackerTest do
     assert c.object_id == Enum.min([a.object_id, b.object_id])
   end
 
-  test "a track id repeated inside one batch binds once; the duplicate is dropped" do
-    objects = [
-      det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1"),
-      det("person", [0.7, 0.1, 0.2, 0.4], track_id: "t1")
-    ]
-
-    {{t, tagged, events}, log} = with_log(fn -> track(Tracker.new(), objects, plugin_ctx([])) end)
-
-    assert log =~ ~s(track id "t1" twice in one batch)
-
-    # the first occurrence wins: one identity, one object, one lifecycle event
-    assert [%{bbox: [0.1, 0.1, 0.2, 0.4], object_id: id}] = tagged
-    assert [{:started, %Track{object_id: ^id}}] = events
-    assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
-  end
-
-  describe "end_all/3" do
+  describe "end_all/2" do
     test "ends every live track with the given reason and returns a fresh tracker" do
       dets = [det("person", [0.1, 0.1, 0.2, 0.4]), det("cat", [0.7, 0.1, 0.2, 0.4])]
       {t, tagged, _} = track(Tracker.new(), dets)
@@ -1711,38 +1531,6 @@ defmodule Cairn.TrackerTest do
       # nothing matches across the cut
       {_t, [a], _} = track(fresh, [det("person", [0.1, 0.1, 0.2, 0.4])], media_ms: 200)
       refute a.object_id in Enum.map(tagged, & &1.object_id)
-    end
-
-    test "keep_ended: true carries the ended plugin ids over the cut" do
-      {t, [a], _} =
-        track(
-          Tracker.new(),
-          [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1")],
-          plugin_ctx([])
-        )
-
-      {t, _, _} = track(t, [], plugin_ctx(media_ms: 200, ended_tracks: ["t1"]))
-
-      # the cut keeps the epoch, so "t1" is still an id the plugin ended
-      {kept, _} = Tracker.end_all(t, :detection_disabled, keep_ended: true)
-
-      {{_t, [reused], _}, log} =
-        with_log(fn ->
-          track(kept, [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1")], plugin_ctx([]))
-        end)
-
-      assert log =~ "reused track id \"t1\" after ending it"
-      refute reused.object_id == a.object_id
-
-      # the default drops it: correct only where the epoch changes too
-      {dropped, _} = Tracker.end_all(t, :stream_reset)
-
-      {_result, log} =
-        with_log(fn ->
-          track(dropped, [det("person", [0.1, 0.1, 0.2, 0.4], track_id: "t1")], plugin_ctx([]))
-        end)
-
-      refute log =~ "reused track id"
     end
   end
 
@@ -2116,7 +1904,7 @@ defmodule Cairn.TrackerTest do
       assert {^ended, []} = Tracker.expire_suspended(ended, at(999_999))
     end
 
-    test "end_all/3 ends a suspension as the reset that made it, whatever reason it is given" do
+    test "end_all/2 ends a suspension as the reset that made it, whatever reason it is given" do
       {t, suspended_id} = parked(@box)
       {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
 
@@ -2142,21 +1930,6 @@ defmodule Cairn.TrackerTest do
 
       assert Tracker.live_tracks(emptied) == []
       assert Tracker.suspended_tracks(emptied) == []
-    end
-
-    test "a plugin-owned track is severed by the cut rather than suspended" do
-      {t, [a], _events} =
-        track(Tracker.new(), [det("person", @box, track_id: "t1")], plugin_ctx([]))
-
-      {t, events, info} = Tracker.suspend(t, 128, at(0))
-
-      assert [{:ended, final}] = events
-      assert final.object_id == a.object_id
-      assert final.source == :plugin
-      assert final.end_reason == :stream_reset
-      assert %{suspended: 0, ended: 1} = info
-      assert DateTime.compare(info.at, at(0)) == :eq
-      assert Tracker.suspended_tracks(t) == []
     end
 
     test "the suspended set is trimmed to the cap, oldest generation first" do
