@@ -73,6 +73,10 @@ defmodule Cairn.CameraTrackerRestoreTest do
     on_exit(fn -> terminate_tracker(camera_id) end)
 
     capture_log(fn ->
+      # Kills every tracker under the app's pool, not just this camera's. Safe
+      # only while this file and every suite that parks real trackers under the
+      # pool (camera_tracker_test.exs's isolation tests) are `async: false` —
+      # an async suite's tracker dying mid-test would fail it spuriously.
       Process.exit(Process.whereis(Cairn.TrackerSupervisor.Pool), :kill)
 
       assert tracker = await_registered(camera_id)
