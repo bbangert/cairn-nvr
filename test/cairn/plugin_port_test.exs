@@ -579,6 +579,11 @@ defmodule Cairn.PluginPortTest do
         v1_line(id, epoch, 2, [object("person", 0.9)])
       ]) <> "; exec sleep 30"
 
+    # the stamp has to land between these two readings, however slowly a
+    # loaded machine gets through the receives — a fixed tolerance against
+    # a `now` read afterwards would flake exactly there
+    before = System.monotonic_time(:millisecond)
+
     start_supervised!(
       {PluginPort,
        camera: camera(id), config: config(), index: 0, command: command, tracker: self()}
@@ -598,11 +603,11 @@ defmodule Cairn.PluginPortTest do
     # two lines are printf'd back to back, so the pts spacing between them is
     # time the clamp is entitled to refuse — what it may never do is leave the
     # clock standing still
+    assert first.at_ms >= before
     assert first.at_ms <= now
     assert second.at_ms > first.at_ms
     # the pts is carried through untouched beside it
     assert second.media_ms > first.media_ms
-    assert abs(first.at_ms - now) < 5_000
   end
 
   test "an observed_at far from host time is replaced with arrival time and counted" do
