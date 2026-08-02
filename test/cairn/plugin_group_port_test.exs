@@ -429,6 +429,31 @@ defmodule Cairn.PluginGroupPortTest do
     assert :sys.get_state(pid).os_pid == os_pid
   end
 
+  test "refresh prunes a dropped member's clock and bookkeeping" do
+    a = camera("gp_prune_a_#{System.unique_integer([:positive])}")
+    b = camera("gp_prune_b_#{System.unique_integer([:positive])}")
+
+    command = printf([det_line(a.id, 1, 0.9), det_line(b.id, 2, 0.9)]) <> "; exec sleep 30"
+    pid = start_group_port([a, b], command: command, tracker: self())
+
+    a_id = a.id
+    b_id = b.id
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _, _}}, 5_000
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^b_id}, _, _}}, 5_000
+    assert Map.has_key?(:sys.get_state(pid).clocks, b_id)
+
+    # ids churning across refreshes must not accumulate entries for the life
+    # of the port — the maps follow the routes
+    :ok = PluginGroupPort.refresh(pid, group([a]), config([a]))
+
+    state = :sys.get_state(pid)
+    assert Map.has_key?(state.clocks, a_id)
+
+    for map <- [state.clocks, state.last_sequences, state.epochs, state.last_statuses] do
+      refute Map.has_key?(map, b_id)
+    end
+  end
+
   test "unroutable lines are counted but only logged periodically" do
     a = camera("gp_flood_#{System.unique_integer([:positive])}")
     strangers = for pts <- 1..5, do: det_line("stranger", pts, 0.9)
