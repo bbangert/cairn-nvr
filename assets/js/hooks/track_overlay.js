@@ -185,12 +185,17 @@ const TrackOverlay = {
   //
   // This is Cairn.TrackPath.anchor_clip_ms/2 at t_ms = 0, mirrored: the anchor
   // holds two pairings of a media position with a wall clock, and the live one
-  // — the first fragment to reach the extractor after it subscribed — is
-  // preferred over the drain one, which understates the media that existed by
-  // however much of a fragment ffmpeg had not written out yet. That understate
-  // is what makes boxes run ahead of the subject, so preferring the live pair
-  // is not a refinement, it is the fix. The Elixir moduledoc has the full
-  // argument and is the contract this file is answerable to.
+  // — the first fragment written from the live stream — is preferred over the
+  // drain one, which understates the media that existed by however much of a
+  // fragment ffmpeg had not written out yet. That understate makes boxes run
+  // ahead of the subject, and preferring the live pair is what removes it.
+  //
+  // It removes that and only that. Boxes running ahead had a second cause —
+  // a clip whose first fragment fell mid-GOP, losing its head to the remux and
+  // shifting both pairs equally — which no choice between the halves could
+  // have fixed; that one is fixed where the clip is written. The Elixir
+  // moduledoc has the full argument and is the contract this file is
+  // answerable to.
   //
   // Residual, deliberately uncorrected: even the live pair is late by whatever
   // the camera, the transport and the demux cost — roughly 100 ms, roughly
