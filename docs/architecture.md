@@ -21,7 +21,7 @@ flowchart TD
 
   pubsub(["fragment PubSub"])
 
-  aggregator["Detection aggregator<br/><i>events, post-window</i>"]
+  tracker["Camera tracker<br/><i>one per camera; events, post-window</i>"]
   extractor["Event extractor<br/><i>one per active event</i>"]
 
   mse["MSE / HLS server"]
@@ -34,9 +34,9 @@ flowchart TD
   ffmpeg -- "RTP H.264" --> rtphub
 
   ring -- "every fragment" --> pubsub
-  plugin -- "detections JSON" --> aggregator
+  plugin -- "detections JSON" --> tracker
 
-  aggregator -- "start / finalize" --> extractor
+  tracker -- "start / finalize" --> extractor
   ring -- "drain pre-window" --> extractor
   pubsub -- "subscribe" --> extractor
 
@@ -173,11 +173,13 @@ An earlier design wrote fragments to tmpfs and used inotify to notify subscriber
 
 The tradeoff is that BEAM is now in the data path. Throughput math: 8 cameras × 4 Mbps × broadcast-to-N-subscribers is well within BEAM's binary-passing capabilities. The hot path for any subscriber is "receive `{:fragment, bin}` message," which is sub-microsecond.
 
-## The detection aggregator
+## The camera tracker
 
-The aggregator is a single GenServer (or supervised set, partitioned by camera if scaling demands it) that consumes the JSON event stream from all plugin Ports and owns event lifecycle.
+Event lifecycle is owned one camera at a time: a `CameraTracker` GenServer per camera, fed only that camera's observations — by its own plugin Port, or by the group Port that routes each ndjson line on its `camera_id`. One camera's tracking state, crash, and recovery are therefore that camera's alone.
 
-Per camera, it maintains:
+They live under `Cairn.TrackerSupervisor`, a `:rest_for_one` pair: a `DynamicSupervisor` pool holding one `:transient` tracker per camera, started on demand by that camera's first observation, and behind it a sweep that starts trackers for cameras whose ETS checkpoint outlived them. A crashed tracker is restarted by the pool and restores in `init/1`; a pool restart cascades into the sweep, which does the same for every checkpointed camera at once.
+
+Each tracker holds:
 
 - `active_event` — the currently-active `EventExtractor` PID, or `nil`.
 - `last_detection_pts` — the timestamp of the most recent detection.
@@ -191,7 +193,7 @@ active event + detection    → reset post-window timer
 no detection for post_window → send :finalize to EventExtractor, clear active_event
 ```
 
-The aggregator never holds video data — it operates purely on JSON detections, which are small and frequent. Its job is debouncing detection noise into clean event boundaries.
+A tracker never holds video data — it operates purely on JSON detections, which are small and frequent. Its job is debouncing detection noise into clean event boundaries.
 
 ### Configurable thresholds
 
@@ -211,7 +213,7 @@ Lifecycle:
 3. **Streaming.** Receive `{:fragment, frag}` messages from PubSub. Append each to the file, optionally `fsync` at fragment boundaries.
 
    Steps 2 and 3 share one rule: **nothing is written until a fragment whose first sample is a keyframe**, and that fragment is the clip's t=0. On a camera whose GOP is longer than its fragment duration, that discards up to one GOP off the front of the pre-roll. The alternative is worse — the finalizing remux (`ffmpeg -c copy`) silently drops leading samples it has no keyframe for and records the hole as an empty edit, leaving every consumer of the file late by the dropped span with nothing to detect it by.
-4. **Finalize.** On `:finalize` call from the aggregator: unsubscribe, write mp4 trailer (or just close, since fmp4 is independently readable), insert event metadata into the SQLite event index, exit normally.
+4. **Finalize.** On `:finalize` call from the camera's tracker: unsubscribe, write mp4 trailer (or just close, since fmp4 is independently readable), insert event metadata into the SQLite event index, exit normally.
 
 ```elixir
 defmodule NVR.EventExtractor do
@@ -293,7 +295,10 @@ NVR.Supervisor
 │   │   └── NVR.RTPHub             (UDP receiver for WebRTC)
 │   └── ... (more cameras)
 ├── NVR.PluginGroupSupervisor      (one plugin Port per named group, serving N cameras)
-├── NVR.DetectionAggregator        (receives JSON from all plugin ports)
+├── NVR.TrackerSupervisor          (rest_for_one)
+│   ├── NVR.TrackerSupervisor.Pool (DynamicSupervisor)
+│   │   └── NVR.CameraTracker      (one per camera, transient; that camera's observations)
+│   └── checkpoint restore sweep   (Task, transient; re-runs when the pool restarts)
 ├── NVR.EventSupervisor (DynamicSupervisor)
 │   └── NVR.EventExtractor         (one per active event, transient)
 └── NVR.Endpoint                   (Phoenix HTTP/WebSocket)
@@ -304,7 +309,7 @@ Restart strategies:
 - A camera supervisor uses `:rest_for_one`: if ffmpeg dies, restart it (state is recoverable from the camera). If the ring buffer dies, restart ffmpeg too (since the new ring won't have the old fragments anyway).
 - A plugin group sits outside any one camera's supervisor, because it outlives them individually: it is started and restarted only on config change, and members stopping or starting leave it running. That makes the group one failure domain — a crash costs every member detection until the backoff restart — which is the price of sharing the device.
 - Event extractors are `:temporary` — if one crashes, the event is lost (logged as `partial` in the index) but other events continue.
-- The aggregator has a small persistent state (active events) checkpointed to ETS for crash recovery.
+- Camera trackers are `:transient`. Each checkpoints its active event and the tracks live under it to an ETS table owned outside the tracking tree, so a restarted tracker restores in `init/1` instead of waiting for its camera's next observation. `NVR.TrackerSupervisor` is `:rest_for_one` for the case the pool itself restarts: the cascade re-runs the restore sweep, which is the only thing that would otherwise re-adopt checkpoints no surviving tracker owns.
 
 ## Resource budget
 

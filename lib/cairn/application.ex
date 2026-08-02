@@ -24,18 +24,26 @@ defmodule Cairn.Application do
       {CairnWeb.Api.StreamLimiter, []},
       {Cairn.EventCheckpoint, []},
       {Task.Supervisor, name: Cairn.TaskSupervisor},
-      # After the Repo it writes through, before the aggregator that casts to
-      # it: a cast to a not-yet-started name is silently dropped, so starting
-      # it later would lose every track of the boot's first moments.
+      # After the Repo it writes through, before the camera trackers that cast
+      # to it: a cast to a not-yet-started name is silently dropped, so
+      # starting it later would lose every track of the boot's first moments.
       #
       # `manual: true` in the test env, where this singleton would otherwise
-      # buffer finals cast by one test's aggregator and flush them into
+      # buffer finals cast by one test's camera tracker and flush them into
       # whichever sandbox connection is checked out when its timer fires — the
       # same escape as `.claude/solutions/boot-writes-escape-ecto-sandbox.md`,
       # from a process no test owns. Suites that exercise the recorder start
       # their own.
       {Cairn.TrackRecorder, manual: Application.get_env(:cairn, :track_recorder_manual, false)},
-      {Cairn.DetectionAggregator, []},
+      # The whole tracking subtree — the pool of per-camera trackers and, under
+      # the same `:rest_for_one`, the sweep that restores the trackers of
+      # cameras whose checkpoint rows outlived them. The sweep re-runs whenever
+      # the pool restarts (a tracker crash-looping past the pool's restart
+      # intensity), which is the case where rows outlive their trackers: those
+      # cameras get their `:host_restart` finals immediately rather than
+      # waiting for each camera's next observation. Outside the media tree on
+      # purpose — see the module's own doc.
+      {Cairn.TrackerSupervisor, []},
       {Cairn.EventSupervisor, []},
       # Groups before cameras: a group listens on its members' UDP ports
       {Cairn.PluginGroupSupervisor, []},

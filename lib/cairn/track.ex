@@ -54,24 +54,28 @@ defmodule Cairn.Track do
 
   ## How far the final-summary guarantee reaches
 
-  A final is emitted for every lifecycle transition the aggregator observes:
-  expiry, an epoch boundary, an eviction, detection being
-  disabled. It is **not** an unconditional guarantee across a crash, and what
-  a crash costs is different for the two things a final feeds.
+  A final is emitted for every lifecycle transition the camera's
+  `Cairn.CameraTracker` observes: expiry, an epoch boundary, an eviction,
+  detection being disabled. It is **not** an unconditional guarantee across a
+  crash, and what a crash costs is different for the two things a final feeds.
 
   `Cairn.EventCheckpoint` is behind both. It is an ETS table owned outside the
-  aggregator, carrying a row per camera *only while that camera has an open
-  event*, so it survives an aggregator crash but not the node — and even when
+  trackers, carrying a row per camera *only while that camera has an open
+  event*, so it survives a tracker crash but not the node — and even when
   it survives it knows nothing about a camera that had no event running.
 
-    * **The `"events"` broadcast.** After an aggregator crash the tracks
-      restored from a checkpoint are broadcast as `track_ended` with
-      `:host_restart`. Tracks that were live on a camera with no open event
-      are restored from nothing and get no `track_ended` at all, and a whole
-      node restart loses the table, so nothing is restored and nothing gets a
-      final. A consumer that materializes entities from `track_started` must
-      therefore treat an aggregator restart, not only a `track_ended`, as the
-      end of everything it holds.
+    * **The `"events"` broadcast.** After a tracker crash the tracks its
+      replacement restores from the checkpoint are broadcast as `track_ended`
+      with `:host_restart`. Tracks that were live on a camera with no open
+      event are restored from nothing and get no `track_ended` at all, and a
+      whole node restart loses the table, so nothing is restored and nothing
+      gets a final. A consumer that materializes entities from `track_started`
+      must therefore treat a tracker restart, not only a `track_ended`, as the
+      end of everything it holds for that camera. It does not have to wait long
+      for the finals it does get: the tracker is `:transient`, so its
+      supervisor restarts it and the replacement restores in `init/1` rather
+      than on that camera's next observation. What arrives then is still only
+      what the checkpoint held.
     * **The track index** (`Cairn.Tracks`). Here a crash costs much less,
       because the row does not wait for the final: `Cairn.TrackRecorder` opens
       it as soon as the track passes the camera's `track:` tier and refreshes
@@ -84,7 +88,7 @@ defmodule Cairn.Track do
 
       The row is left open by such a crash, since the close is what went
       missing. Two things close it afterwards, neither needing a broadcast:
-      `Cairn.DetectionAggregator`'s restore finalizes every checkpointed track
+      `Cairn.CameraTracker`'s restore finalizes every checkpointed track
       against the event it was live during, and `Cairn.Tracks.close_live/0`
       closes everything still open at the next boot — including the tracks of
       quiet cameras, which no checkpoint ever held.

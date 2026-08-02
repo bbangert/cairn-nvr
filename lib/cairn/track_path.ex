@@ -8,7 +8,7 @@ defmodule Cairn.TrackPath do
   # nothing a viewer could see.
   @keyframe_delta 20
   @max_gap_ms 2_000
-  # Precedent: `@max_label_entries` in `Cairn.DetectionAggregator`. At the
+  # Precedent: `@max_label_entries` in `Cairn.CameraTracker`. At the
   # ~10 obs/s the plugin sustains this is over eight minutes of an unbroken,
   # never-still path — a track that reaches it is a scene artifact, and the
   # earliest samples are the ones a viewer opened the clip for.

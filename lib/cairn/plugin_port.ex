@@ -10,9 +10,9 @@ defmodule Cairn.PluginPort do
 
   Every line goes through `Cairn.PluginProtocol.decode_line/2` (protocol v1
   or the v0 `{"pts", "dets"}` shape). A `frame.objects` line becomes a
-  `Cairn.Observation` forwarded to `Cairn.DetectionAggregator` together with
+  `Cairn.Observation` forwarded to `Cairn.CameraTracker` together with
   the camera's config and effective policy (event windows, tracking bounds and
-  the `track:` / `record:` tiers), so the aggregator never has to look up
+  the `track:` / `record:` tiers), so the tracker never has to look up
   config; `plugin.hello` is recorded here — a plugin declaring the
   `object_tracking` capability is warned about, since the host tracks every
   object itself and ignores plugin track ids —
@@ -87,7 +87,7 @@ defmodule Cairn.PluginPort do
 
   Camera fields the launch argv does not carry — the `post` and `max` event
   windows, the tracking bounds, the `track:` / `record:` tiers, the camera
-  struct handed to the aggregator — change on reload without changing the
+  struct handed to the tracker — change on reload without changing the
   subprocess, so `state.policy` has to be recomputed in place. Restarting an
   accelerator-holding process over Elixir-side state is exactly what the
   restart-only-on-config-change policy exists to avoid, and it would cut
@@ -347,9 +347,18 @@ defmodule Cairn.PluginPort do
   defp note_sequence(state, %Observation{epoch: epoch, sequence: sequence}),
     do: %{state | last_sequence: {epoch, sequence}}
 
+  # `:tracker` is a test seam: a process that receives the same
+  # `{:detections, …}` cast in place of the camera's own
+  # `Cairn.CameraTracker`. Absent (production) the batch is routed to that
+  # tracker, started on the first batch if it is not running yet.
   defp forward(state, observation) do
-    aggregator = Keyword.get(state.opts, :aggregator, Cairn.DetectionAggregator)
-    Cairn.DetectionAggregator.detections(aggregator, state.camera, state.policy, observation)
+    Cairn.CameraTracker.detections(
+      Keyword.get(state.opts, :tracker),
+      state.camera,
+      state.policy,
+      observation
+    )
+
     state
   end
 

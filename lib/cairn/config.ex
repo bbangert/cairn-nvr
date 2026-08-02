@@ -34,9 +34,11 @@ defmodule Cairn.Config do
   # that was parked there and to nothing else. Both constants live in
   # `Cairn.Tracker`; they are a pair, and neither is config.
   @default_max_unseen_ms 3_000
-  # How many tracks one camera may hold live at once. The tracker lives in the
-  # singleton aggregator and a plugin picks its own track ids, so this is what
-  # stops one camera's plugin from growing every camera's blast radius. Large
+  # How many tracks one camera may hold live at once. The tracker lives in that
+  # camera's own `Cairn.CameraTracker` and a plugin picks its own track ids, so
+  # this is what stops one camera's plugin from growing that process without
+  # bound — the per-camera split keeps the memory off its neighbours, and this
+  # keeps it off the node. Large
   # enough for a crowded scene at 64 objects per frame; small enough that a
   # hostile plugin cannot mint its way out of memory.
   @default_max_live_tracks 128
@@ -214,12 +216,12 @@ defmodule Cairn.Config do
   windows, the tracking settings, and the two host-side threshold tiers.
 
   The plugin ports resolve it off the per-frame path — at init and again on
-  each `refresh/3` — and hand the result to `Cairn.DetectionAggregator` with
-  every observation, so the aggregator never calls the config server per
+  each `refresh/3` — and hand the result to `Cairn.CameraTracker` with
+  every observation, so no camera tracker calls the config server per
   frame. `Cairn.PluginPort` and `Cairn.PluginGroupPort` both take their whole
   policy from this function and forward it unmodified, so every key added
-  here reaches the aggregator through that same plumbing — and reaches a
-  *running* camera only through those two refreshes.
+  here reaches `Cairn.CameraTracker` through that same plumbing — and reaches
+  a *running* camera only through those two refreshes.
 
   `:track` and `:record` are the camera's parsed tiers verbatim, `nil` when
   the block is absent. Resolve a label against one with `tier_threshold/3`
@@ -266,7 +268,7 @@ defmodule Cairn.Config do
   load time, because the plugin never emits that band and the rule could only
   ever fire zero times. A runtime override (`Cairn.CameraControl`'s
   `min_score`) goes through no such validation and can sit above a tier —
-  `Cairn.DetectionAggregator` resolves the clash by demanding both, so an
+  `Cairn.CameraTracker` resolves the clash by demanding both, so an
   override raises the bar without ever lowering a tier's.
 
   Between the two tiers, validation leaves one invariant worth relying on: for

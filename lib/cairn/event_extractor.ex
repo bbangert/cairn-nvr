@@ -38,7 +38,7 @@ defmodule Cairn.EventExtractor do
 
   The media path holds nothing: a fragment is written as it arrives and let
   go, with a datasync roughly every 2s of media, so the clip's own length
-  costs no memory. The box buffer is the exception — `Cairn.DetectionAggregator`
+  costs no memory. The box buffer is the exception — `Cairn.CameraTracker`
   casts every tagged box of the open event here, and that list grows with the
   event until `@max_path_entries` stops it. It is transient heap in a process
   that exists only for this event.
@@ -94,7 +94,7 @@ defmodule Cairn.EventExtractor do
     )
   end
 
-  @doc "Starts an extractor under `Cairn.EventSupervisor` (aggregator API)."
+  @doc "Starts an extractor under `Cairn.EventSupervisor` (camera tracker API)."
   @spec start(Cairn.Config.Camera.t(), Cairn.Event.t()) :: DynamicSupervisor.on_start_child()
   def start(camera, event) do
     DynamicSupervisor.start_child(
@@ -131,7 +131,7 @@ defmodule Cairn.EventExtractor do
       skipped_fragments: 0,
       skipped_ms: 0,
       started_ms: System.monotonic_time(:millisecond),
-      # The dense box buffer the aggregator feeds, newest batch first: a cast
+      # The dense box buffer the camera tracker feeds, newest batch first: a cast
       # prepends and the flush reverses. `track_entries` counts boxes, not
       # batches, so the cap can be checked without walking the list.
       track_boxes: [],
@@ -478,7 +478,7 @@ defmodule Cairn.EventExtractor do
 
   # Reached exactly once per event: the batch that trips the cap sets the flag,
   # and the clause above drops every later batch without coming back here. At
-  # the ~10 batches a second the aggregator forwards, a per-batch line would be
+  # the ~10 batches a second the camera tracker forwards, a per-batch line would be
   # a log file.
   defp warn_capped(state) do
     Logger.warning(

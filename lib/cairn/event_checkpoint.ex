@@ -1,11 +1,12 @@
 defmodule Cairn.EventCheckpoint do
   @moduledoc """
   Public named ETS table holding a snapshot of each camera's active event and
-  the tracks live at that moment, owned by a process outside the aggregator
-  so the data survives an aggregator crash. On restart the aggregator
-  restores from here — re-attaching to still-running extractors or dropping
-  orphaned entries, and ending every restored track (`:host_restart`), since
-  a fresh tracker knows nothing about them.
+  the tracks live at that moment, owned by a process outside the trackers so
+  the data survives a `Cairn.CameraTracker` crash. A replacement tracker
+  restores its own camera's row from here (`get/1`) — re-attaching to a
+  still-running extractor or dropping an orphaned entry, and ending every
+  restored track (`:host_restart`), since a fresh `Cairn.Tracker` knows
+  nothing about them.
   """
 
   use GenServer
@@ -20,6 +21,21 @@ defmodule Cairn.EventCheckpoint do
 
   @spec delete(String.t()) :: true
   def delete(camera_id), do: :ets.delete(@table, camera_id)
+
+  @doc """
+  One camera's checkpoint, or `nil`.
+
+  A read and not a take: re-attaching to a live extractor leaves the row in
+  place, because the event is still open and the *next* restore must find it.
+  Whoever ends the event deletes it (`delete/1`).
+  """
+  @spec get(String.t()) :: {Cairn.Event.t(), [Cairn.Track.t()]} | nil
+  def get(camera_id) do
+    case :ets.lookup(@table, camera_id) do
+      [{^camera_id, event, tracks}] -> {event, tracks}
+      [] -> nil
+    end
+  end
 
   @spec all() :: [{String.t(), Cairn.Event.t(), [Cairn.Track.t()]}]
   def all, do: :ets.tab2list(@table)

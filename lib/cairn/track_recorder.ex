@@ -6,18 +6,19 @@ defmodule Cairn.TrackRecorder do
 
   A row is opened while its track is still running and closed when the track
   ends, so a track has three kinds of write here — `record_open/3` once,
-  `record_update/3` on the aggregator's throttle, `record_final/3` to close —
+  `record_update/3` on the camera tracker's throttle, `record_final/3` to close —
   and all three are the same upsert on the same id. This process owns the one
   piece of state that decides between them: which ids have a row. The caller
   does not know and is not asked to; an update for an id with no row is
   ignored, and a re-sent open is the update it looks like.
 
-  Every entry point is a cast. `Cairn.DetectionAggregator` is a singleton that
-  serves every camera's detections, so it must never wait on SQLite — the
-  database is a single file with `busy_timeout: 5_000` and `pool_size: 2`, and
-  one contended write would stall detection for every camera at once. The
-  aggregator therefore does no `Cairn.Repo` work on the detection path at all;
-  it casts here and this process pays the write.
+  Every entry point is a cast. A `Cairn.CameraTracker` runs one camera's
+  detection path and must never wait on SQLite — the database is a single file
+  with `busy_timeout: 5_000` and `pool_size: 2`, so a contended write stalls
+  that camera's detections for as long as it takes, and every camera's tracker
+  is queueing behind the same two connections. A tracker therefore does no
+  `Cairn.Repo` work on the detection path at all; it casts here and this
+  process pays the write.
 
   Two things trigger a flush: the number of tracks with a queued write reaching
   the batch size, and the interval timer. A flush with nothing queued makes no
@@ -111,7 +112,7 @@ defmodule Cairn.TrackRecorder do
   Opens a row for a track that is still running, linked to `event_id`.
 
   The caller's gate, not this module's: a track only reaches here once it has
-  earned a row (`Cairn.DetectionAggregator`'s `track:` tier), and one that
+  earned a row (`Cairn.CameraTracker`'s `track:` tier), and one that
   never earns one is never mentioned. Sending it twice is harmless — the second
   is treated as `record_update/3`, so nothing duplicates and nothing resets.
 
@@ -120,7 +121,7 @@ defmodule Cairn.TrackRecorder do
   before it qualified.
 
   `track` is the runtime `%Cairn.Track{}` summary — the same struct the
-  aggregator broadcasts as `track_started`.
+  camera tracker broadcasts as `track_started`.
   """
   @spec record_open(GenServer.server(), Track.t(), String.t() | nil) :: :ok
   def record_open(server \\ __MODULE__, %Track{} = track, event_id) do
@@ -136,7 +137,7 @@ defmodule Cairn.TrackRecorder do
   close, where creating one would invent a row for a track the caller's gate
   refused.
 
-  Called on the aggregator's update throttle rather than per batch: the row
+  Called on the camera tracker's update throttle rather than per batch: the row
   follows the same rhythm as the `track_updated` broadcast.
   """
   @spec record_update(GenServer.server(), Track.t(), String.t() | nil) :: :ok
@@ -158,7 +159,7 @@ defmodule Cairn.TrackRecorder do
   restore knows nothing of one), still has to end up closed.
 
   `track` is the runtime `%Cairn.Track{}` final summary — the same struct the
-  aggregator broadcasts as `track_ended`.
+  camera tracker broadcasts as `track_ended`.
   """
   @spec record_final(GenServer.server(), Track.t(), String.t() | nil) :: :ok
   def record_final(server \\ __MODULE__, %Track{} = track, event_id) do
@@ -191,7 +192,7 @@ defmodule Cairn.TrackRecorder do
   Only for a track that never earned a row. The caller decides that, and one
   that sends this for a track it did open leaves the row live until
   `Cairn.Tracks.close_live/0` collects it at the next boot; that is why
-  `Cairn.DetectionAggregator` tracks what it has opened rather than re-deciding
+  `Cairn.CameraTracker` tracks what it has opened rather than re-deciding
   at the end.
   """
   @spec discard(GenServer.server(), String.t()) :: :ok
@@ -458,7 +459,7 @@ defmodule Cairn.TrackRecorder do
     # cover, and it is what every Repo call from this process looks like in a
     # test that did not arrange a sandbox for it. Surviving it costs a batch
     # that was already declared droppable — the same judgement
-    # `Cairn.DetectionAggregator.indexed_status/1` makes about its own Repo
+    # `Cairn.CameraTracker.indexed_status/1` makes about its own Repo
     # call.
     #
     # A row Ecto refuses to *dump* also raises out of the insert

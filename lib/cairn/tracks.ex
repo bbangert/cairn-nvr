@@ -488,7 +488,7 @@ defmodule Cairn.Tracks do
   left alone: it is the evidence `ended_at` is derived from, and re-stamping it
   with the boot's clock would erase it.
 
-  `:host_restart` is the same reason `Cairn.DetectionAggregator`'s checkpoint
+  `:host_restart` is the same reason `Cairn.CameraTracker`'s checkpoint
   restore gives the tracks it ends, and for the same event — the two cover
   different sets (a checkpoint holds only the tracks of cameras with an open
   event, and only until the node dies) and overlap without conflict: both write

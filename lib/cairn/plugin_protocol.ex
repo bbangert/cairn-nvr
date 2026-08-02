@@ -3,8 +3,8 @@ defmodule Cairn.PluginProtocol do
   Pure codec for the plugin wire protocol (see `docs/plugin-contract.md`).
 
   Plugin output is untrusted: a plugin is an arbitrary OS process and every
-  decoded line reaches the singleton `Cairn.DetectionAggregator`, so a line
-  that does not match the contract exactly must never leave this module.
+  decoded line reaches a camera's `Cairn.CameraTracker`, so a line that does
+  not match the contract exactly must never leave this module.
   `Cairn.PluginPort` and `Cairn.PluginGroupPort` hand raw lines to
   `decode_line/2` and act on the result.
 
@@ -467,9 +467,11 @@ defmodule Cairn.PluginProtocol do
 
   A list longer than #{@max_dets} entries is a contract violation rather than
   a crowded frame: it is rejected whole (every entry counts as a drop). The
-  cost of one batch in `Cairn.Tracker.track/2` is `O(dets × objects)` inside
-  the singleton `Cairn.DetectionAggregator`, so an unbounded list wedges
-  every camera's event tracking, not just this plugin's.
+  cost of one batch in `Cairn.Tracker.track/3` is `O(dets × objects)`, paid in
+  that camera's `Cairn.CameraTracker`, so an unbounded list wedges that
+  camera's event tracking. Decoding it is paid earlier and elsewhere — in the
+  port, which for a plugin group is shared by every member — so the cap is
+  also what keeps one member's plugin off its neighbours' lines.
 
   Total on any term: a non-list counts as a single drop.
   """

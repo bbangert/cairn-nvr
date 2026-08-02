@@ -2,7 +2,7 @@ defmodule Cairn.FullPipelineTest do
   @moduledoc """
   The regression net for the whole pipeline: a real ffmpeg reading a committed
   fixture in a realtime loop (`file://` camera), the mock plugin replaying a
-  detection timeline over a real Port, the global aggregator, a real extractor
+  detection timeline over a real Port, the camera's own tracker, a real extractor
   writing to a tmp data dir, and the events index.
 
   Twice, over two fixtures that differ in one thing: whether a fragment can
