@@ -37,6 +37,28 @@ defmodule Cairn.TrackerTest do
   # IoU 0.5 with @walker, the same overlap @car_drift has with @parked_car
   @walker_step [0.30, 0.30, 0.10, 0.30]
 
+  # The stationary-hysteresis fixtures, and the measured ones: the car of the
+  # live failure was about 0.17 by 0.09 of the frame, and the detector put
+  # roughly 0.02 of drift on it in *y*. That is under a quarter of the box's
+  # short axis and nothing like motion, but on a box that short it takes the
+  # IoU against the anchor to 0.636 — well under @stationary_iou (0.8), which
+  # is what made the flag flap.
+  #
+  # A wide box drifting on its *short* axis, deliberately. Every other box in
+  # this file that moves at all moves along its own long axis (@car_drift in x
+  # on a wide box, @walker_step in y on a tall one), and the stillness tests
+  # above all park a 1.0 x 1.0 or 0.4 x 0.4 square — so "small", "wide" and
+  # "displaced across the short side" are three dimensions this corpus
+  # otherwise holds constant, and the live failure needed all three.
+  @small_car [0.40, 0.50, 0.17, 0.09]
+  @small_car_jitter [0.40, 0.52, 0.17, 0.09]
+  # A creep of 0.004 per batch on the same box. Against the box before it that
+  # is IoU 0.915 — a rule comparing consecutive boxes calls it motionless — and
+  # against a fixed anchor it crosses 0.8 once the drift passes 0.01, which the
+  # median reaches two batches later. This is the slow walk the anchor exists
+  # to catch, at the scale the parked car actually lives at.
+  @small_car_creep 0.004
+
   defp det(label, bbox, opts \\ []) do
     %{
       label: label,
@@ -131,6 +153,39 @@ defmodule Cairn.TrackerTest do
     assert [%Track{object_id: ^id, stationary: false}] = Tracker.live_tracks(tracker)
     {tracker, id}
   end
+
+  # Two detections a second, which is a plausible inference rate and — the part
+  # that matters — short enough that the excursions below are several
+  # evaluations rather than one.
+  @batch_ms 500
+
+  # The small parked car of the hysteresis tests: plugin-tracked, so identity
+  # is pinned and the stillness rule is the only thing under test, detected
+  # every @batch_ms from media 0 through @stationary_after (10_000). It is
+  # stationary as of the last step, anchored on @small_car, with a median
+  # window holding nothing but @small_car.
+  defp parked_small do
+    {tracker, [tagged], _events} =
+      feed(
+        Tracker.new(),
+        for(n <- 0..div(@stationary_after, @batch_ms), do: {n * @batch_ms, @small_car})
+      )
+
+    assert tagged.stationary
+    tracker
+  end
+
+  # `boxes` fed one per @batch_ms starting at `from_ms`, with every event of
+  # the run — the excursions are about what never happened.
+  defp excursion(tracker, from_ms, boxes) do
+    feed_all(
+      tracker,
+      for({bbox, n} <- Enum.with_index(boxes), do: {from_ms + n * @batch_ms, bbox})
+    )
+  end
+
+  # The same car creeping `@small_car_creep` down the frame per batch.
+  defp creep(n), do: [0.40, 0.50 + n * @small_car_creep, 0.17, 0.09]
 
   # Every event of the whole run, for the tests that are about what never
   # happened.
@@ -550,7 +605,7 @@ defmodule Cairn.TrackerTest do
       assert [{:updated, %Track{stationary: true, stationary_ms: 4_000}}] = events
     end
 
-    test "motion after a stationary stretch flips back and emits started_moving" do
+    test "motion after a stationary stretch flips back once the failure sustains" do
       box = [0.0, 0.0, 1.0, 1.0]
       moved = [0.5, 0.0, 1.0, 1.0]
 
@@ -560,13 +615,24 @@ defmodule Cairn.TrackerTest do
       {t, [held], _} = feed(t, [{11_000, moved}, {12_000, moved}])
       assert held.stationary
 
-      {t, [tagged], events} = feed(t, [{13_000, moved}])
+      # 13_000 is the first evaluation the median fails, and it opens the exit
+      # window rather than closing the flag: @stationary_exit_ms (2_500) of
+      # unbroken failure is what closes it, so 14_000 and 15_000 are still
+      # inside it and the flag is still set on all three.
+      {t, held_events} = feed_all(t, for(n <- 13..15, do: {n * 1_000, moved}))
+
+      assert for({:started_moving, _} = e <- held_events, do: e) == []
+      assert [%Track{stationary: true}] = Tracker.live_tracks(t)
+
+      {t, [tagged], events} = feed(t, [{16_000, moved}])
 
       refute tagged.stationary
       assert [{:updated, _}, {:started_moving, %Track{} = flipped}] = events
       refute flipped.stationary
       assert flipped.stationary_since == nil
-      assert flipped.stationary_ms == 2_000
+      # the window accrues: the flag was set for every one of those batches, and
+      # `stationary_ms` counts the media time the flag was set
+      assert flipped.stationary_ms == 5_000
       assert [%Track{stationary: false}] = Tracker.live_tracks(t)
     end
 
@@ -577,17 +643,20 @@ defmodule Cairn.TrackerTest do
       {t, _, _} =
         feed(Tracker.new(), for(n <- 0..12, do: {n * 1_000, if(n > 10, do: moved, else: box)}))
 
-      {t, [tagged], events} = feed(t, [{13_000, moved}])
+      # the median first fails at 13_000; the flag goes at 16_000, the first
+      # evaluation @stationary_exit_ms (2_500) past it
+      {t, _, _} = feed(t, for(n <- 13..15, do: {n * 1_000, moved}))
+      {t, [tagged], events} = feed(t, [{16_000, moved}])
       refute tagged.stationary
-      assert [_updated, {:started_moving, %Track{stationary_ms: 2_000}}] = events
+      assert [_updated, {:started_moving, %Track{stationary_ms: 5_000}}] = events
 
       # the second stretch is measured from the move, and adds to the first
-      {t, [tagged], events} = feed(t, for(n <- 14..23, do: {n * 1_000, moved}))
+      {t, [tagged], events} = feed(t, for(n <- 17..26, do: {n * 1_000, moved}))
       assert tagged.stationary
-      assert [_updated, {:became_stationary, %Track{stationary_ms: 2_000}}] = events
+      assert [_updated, {:became_stationary, %Track{stationary_ms: 5_000}}] = events
 
-      {_t, _tagged, events} = feed(t, [{24_000, moved}, {25_000, moved}])
-      assert [{:updated, %Track{stationary: true, stationary_ms: 4_000}}] = events
+      {_t, _tagged, events} = feed(t, [{27_000, moved}, {28_000, moved}])
+      assert [{:updated, %Track{stationary: true, stationary_ms: 7_000}}] = events
     end
 
     test "a backwards media-time jump while stationary accrues nothing" do
@@ -626,13 +695,17 @@ defmodule Cairn.TrackerTest do
       assert [{:updated, _}, {:became_stationary, %Track{stationary_since: since}}] = events
       assert since == at(10_000)
 
-      # a real move in y, which the median carries once it holds the window
-      {t, events} = feed_all(t, for(n <- 11..13, do: {n * 1_000, moved}))
+      # A real move in y, which the median carries once it holds the window: it
+      # fails from 12_000, and the flag goes at 15_000 — the first evaluation
+      # @stationary_exit_ms (2_500) past the first failure, not the first
+      # failure itself.
+      {t, events} = feed_all(t, for(n <- 11..15, do: {n * 1_000, moved}))
 
-      assert [{:started_moving, %Track{stationary: false}}] =
+      assert [{:started_moving, %Track{stationary: false, last_seen_at: flipped_at}}] =
                for({:started_moving, _} = e <- events, do: e)
 
-      assert [%Track{stationary: false, stationary_ms: 1_000}] = Tracker.live_tracks(t)
+      assert flipped_at == at(15_000)
+      assert [%Track{stationary: false, stationary_ms: 4_000}] = Tracker.live_tracks(t)
     end
 
     test "a host-matched track goes stationary on the same stillness path" do
@@ -670,6 +743,205 @@ defmodule Cairn.TrackerTest do
       {_t, [tagged], _} = track(Tracker.new(), [det("person", [0.1, 0.1, 0.2, 0.4])])
 
       assert Map.fetch!(tagged, :stationary) == false
+    end
+  end
+
+  describe "stationary exit hysteresis" do
+    test "the fixtures straddle @stationary_iou the way the live failure did" do
+      # Asserted by literal, because every test below writes the boxes and
+      # never the numbers: a fixture nudged to something that no longer
+      # straddles 0.8 would leave the whole block green and testing nothing.
+      assert_in_delta Tracker.iou(@small_car, @small_car_jitter), 0.636, 0.001
+      # one creep step is well *above* the threshold against the box before it,
+      # which is what makes it a slow walk rather than a jitter spike
+      assert_in_delta Tracker.iou(creep(3), creep(4)), 0.915, 0.001
+      # and three of them are below it against a fixed anchor
+      assert Tracker.iou(@small_car, creep(3)) < 0.8
+    end
+
+    test "a jitter excursion the median cannot absorb flips nothing" do
+      t = parked_small()
+
+      # Three jittered batches, which is the shortest excursion this rule can
+      # even see: the median needs three of its five boxes to move before it
+      # moves at all, and once three are in it they hold it for three
+      # evaluations. So the failure runs 11_500 through 12_500 — a full second,
+      # and still nowhere near @stationary_exit_ms (2_500).
+      {t, events} =
+        excursion(t, 10_500, [
+          @small_car_jitter,
+          @small_car_jitter,
+          @small_car_jitter,
+          @small_car,
+          @small_car,
+          @small_car,
+          @small_car
+        ])
+
+      assert ids(events, :started_moving) == []
+      # not merely un-emitted: the flag itself never wavered, batch by batch,
+      # which is what the aggregator reads to decide the car is not evidence
+      assert for({:updated, tr} <- events, do: tr.stationary) == List.duplicate(true, 7)
+      assert [%Track{stationary: true, stationary_since: since}] = Tracker.live_tracks(t)
+      assert since == at(10_000)
+    end
+
+    test "a two-second excursion flips nothing either, and the window accrues" do
+      t = parked_small()
+
+      # Five jittered batches: the median fails from 11_500 through 13_500,
+      # two full seconds of continuous failure, and 13_500 is the last of them
+      # because the window has turned back over by 14_000.
+      {t, events} =
+        excursion(
+          t,
+          10_500,
+          List.duplicate(@small_car_jitter, 5) ++ List.duplicate(@small_car, 3)
+        )
+
+      assert ids(events, :started_moving) == []
+      assert [%Track{stationary: true, stationary_since: since}] = Tracker.live_tracks(t)
+      assert since == at(10_000)
+
+      # `stationary_ms` counts the media time the flag was set, and it was set
+      # throughout: 10_000 to 14_000 with nothing skipped over the excursion.
+      assert [%Track{stationary_ms: 4_000}] = Tracker.live_tracks(t)
+    end
+
+    test "two excursions separated by a passing batch are not one long excursion" do
+      t = parked_small()
+
+      # Two of the two-second excursions above, with the median passing in
+      # between. Four seconds of failure in total, more than
+      # @stationary_exit_ms — and no flip, because the window measures an
+      # unbroken run and not a total. This is the load-bearing difference from
+      # a counter: a counter would have flipped somewhere in the second one.
+      {t, first} =
+        excursion(
+          t,
+          10_500,
+          List.duplicate(@small_car_jitter, 5) ++ List.duplicate(@small_car, 3)
+        )
+
+      {t, second} =
+        excursion(
+          t,
+          14_500,
+          List.duplicate(@small_car_jitter, 5) ++ List.duplicate(@small_car, 3)
+        )
+
+      assert ids(first ++ second, :started_moving) == []
+      assert [%Track{stationary: true, stationary_since: since}] = Tracker.live_tracks(t)
+      assert since == at(10_000)
+    end
+
+    test "an excursion leaves nothing behind: the flag, its instant, the whole settle" do
+      t = parked_small()
+
+      # The excursion ends and the car is back where it was parked, for ten
+      # seconds — long enough that a window left half-open, or a pending state
+      # that decayed into anything other than "no failure is running", would
+      # have had time to show.
+      #
+      # What this does *not* pin is the anchor, and no test shaped like it can:
+      # a car that returns to its own spot cannot tell a stable anchor from one
+      # that re-baselined onto the jitter, because the median walks the anchor
+      # back to the same place either way. The slow departure below is where
+      # anchor stability is observable, and it is the test that dies for it.
+      {t, events} =
+        excursion(
+          t,
+          10_500,
+          List.duplicate(@small_car_jitter, 3) ++ List.duplicate(@small_car, 20)
+        )
+
+      assert ids(events, :started_moving) == []
+      assert [%Track{stationary: true, stationary_since: since}] = Tracker.live_tracks(t)
+      assert since == at(10_000)
+    end
+
+    test "a slow departure still leaves the flag: the anchor holds through the window" do
+      t = parked_small()
+
+      # The slow walk, on a parked car: 0.004 of drift per batch, every step of
+      # it inside @stationary_iou of the step before it. The median crosses the
+      # anchor's threshold at 12_500 and never comes back, because the anchor
+      # does not follow — so this is a genuine departure and it flips
+      # @stationary_exit_ms later, at 15_000.
+      #
+      # This is where anchor stability is load-bearing and where it is
+      # observable. An anchor that re-baselined while the window was open —
+      # on every failure, or once when the window opened — would compare the
+      # car against where it was a batch or two ago, pass the very next
+      # evaluation, clear the window, and let it creep out of frame still
+      # flagged as parked. Neither variant flips this track at all.
+      {t, events} = excursion(t, 10_500, for(n <- 1..8, do: creep(n)))
+
+      assert ids(events, :started_moving) == []
+
+      {t, events} = excursion(t, 14_500, [creep(9), creep(10)])
+
+      assert [{:started_moving, %Track{last_seen_at: flipped_at}}] =
+               for({:started_moving, _} = e <- events, do: e)
+
+      assert flipped_at == at(15_000)
+      assert [%Track{stationary: false, stationary_since: nil}] = Tracker.live_tracks(t)
+    end
+
+    test "the window closes at @stationary_exit_ms exactly, and closes once" do
+      t = parked_small()
+
+      # The jitter that does not end: three batches to move the median, so the
+      # failure runs unbroken from 11_500.
+      {t, events} = excursion(t, 10_500, List.duplicate(@small_car_jitter, 3))
+      assert ids(events, :started_moving) == []
+
+      # One millisecond short of the window, from the same tracker state
+      {_short, [tagged], events} = feed(t, [{11_500 + 2_499, @small_car_jitter}])
+      assert ids(events, :started_moving) == []
+      assert tagged.stationary
+
+      # and exactly on it
+      {flipped, [tagged], events} = feed(t, [{11_500 + 2_500, @small_car_jitter}])
+
+      assert [{:started_moving, %Track{} = moved}] =
+               for({:started_moving, _} = e <- events, do: e)
+
+      refute tagged.stationary
+      refute moved.stationary
+      assert moved.stationary_since == nil
+      # the moment `Cairn.DetectionAggregator` records is timed by this, and it
+      # is the batch that closed the window rather than the one that opened it
+      assert moved.last_seen_at == at(14_000)
+
+      # once, not per failing evaluation: the flag is already clear, and the
+      # flip re-anchored onto the jittered box, so the jitter that follows is
+      # an ordinary settle
+      {_t, more} = excursion(flipped, 14_500, List.duplicate(@small_car_jitter, 4))
+      assert ids(more, :started_moving) == []
+    end
+
+    test "a detection gap neither closes a pending window nor clears it" do
+      t = parked_small()
+
+      {t, events} = excursion(t, 10_500, List.duplicate(@small_car_jitter, 3))
+      assert ids(events, :started_moving) == []
+
+      # Predicted boxes across a stretch far longer than @stationary_exit_ms.
+      # They do not evaluate stillness, so they neither complete the window nor
+      # clear it: media time passing with nothing to judge is not evidence the
+      # car left, and a gap that goes on is ended by the unseen bound.
+      {t, events} =
+        feed_all(t, for(n <- 1..5, do: {11_500 + n * 500, @small_car_jitter, "tracked"}))
+
+      assert ids(events, :started_moving) == []
+      assert [%Track{stationary: true}] = Tracker.live_tracks(t)
+
+      # the run is still open, and the next *detection* past the window closes
+      # it — the two failures bracket a stretch nothing contradicted
+      {_t, [tagged], events} = feed(t, [{14_000, @small_car_jitter}])
+      assert ids(events, :started_moving) != []
+      refute tagged.stationary
     end
   end
 
@@ -2093,17 +2365,24 @@ defmodule Cairn.TrackerTest do
       assert ids(adopting, :adopted) == [id]
     end
 
-    test "an adopted track whose box has shifted off its anchor reads as moving at once" do
+    test "an adopted track whose box has shifted off its anchor fails stillness at once, and flips a window later" do
       {t, id} = parked(@box)
       {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
 
       # 0.778 overlap: adoptable on either tier, and under `@stationary_iou`
-      # (0.8), so it is a shift the stillness rule calls movement. It is called
-      # that on the adopting batch, because `revive/3` empties the median
-      # window — the four boxes that used to outvote this one belong to a
-      # stream that is gone, and while they held the majority a car that drove
-      # off during the outage went on reading as parked, which is to say as
-      # something the aggregator refuses as evidence.
+      # (0.8), so it is a shift the stillness rule calls a failure. It is
+      # called that on the adopting batch, because `revive/3` empties the
+      # median window — the four boxes that used to outvote this one belong to
+      # a stream that is gone, and while they held the majority a car that
+      # drove off during the outage went on reading as parked, which is to say
+      # as something the aggregator refuses as evidence.
+      #
+      # The flag itself does not go on that batch. A shifted adoption is a real
+      # sustained departure — the object is not where it was and, unlike
+      # jitter, will not be back — so it takes the ordinary exit window rather
+      # than an exemption, and reports 2.5 s later than it used to. Against a
+      # departure that is fine: it costs the trigger @stationary_exit_ms, which
+      # is well inside an event's pre-roll.
       {t, [tagged], events} =
         track(t, [det("person", @shift_05)],
           epoch: "epoch_two",
@@ -2113,6 +2392,29 @@ defmodule Cairn.TrackerTest do
 
       assert tagged.object_id == id
       assert ids(events, :adopted) == [id]
+      assert ids(events, :started_moving) == []
+      assert tagged.stationary
+      assert [%Track{object_id: ^id, stationary: true}] = Tracker.live_tracks(t)
+
+      # still inside the window
+      {t, [tagged], events} =
+        track(t, [det("person", @shift_05)],
+          epoch: "epoch_two",
+          media_ms: 14_499,
+          observed_at: at(12_799)
+        )
+
+      assert ids(events, :started_moving) == []
+      assert tagged.stationary
+
+      # @stationary_exit_ms (2_500) of unbroken failure from the adopting batch
+      {t, [tagged], events} =
+        track(t, [det("person", @shift_05)],
+          epoch: "epoch_two",
+          media_ms: 14_500,
+          observed_at: at(12_800)
+        )
+
       assert ids(events, :started_moving) == [id]
       refute tagged.stationary
       assert [%Track{object_id: ^id, stationary: false}] = Tracker.live_tracks(t)
@@ -2121,8 +2423,8 @@ defmodule Cairn.TrackerTest do
       {t, [_], events} =
         track(t, [det("person", @shift_05)],
           epoch: "epoch_two",
-          media_ms: 13_000,
-          observed_at: at(11_300)
+          media_ms: 15_500,
+          observed_at: at(13_800)
         )
 
       assert ids(events, :became_stationary) == []
@@ -2130,11 +2432,11 @@ defmodule Cairn.TrackerTest do
       {_t, [_], events} =
         track(t, [det("person", @shift_05)],
           epoch: "epoch_two",
-          media_ms: 22_000,
-          observed_at: at(20_300)
+          media_ms: 24_500,
+          observed_at: at(22_800)
         )
 
-      # `stationary_after_ms` (10_000) after the adopting batch re-anchored it
+      # `stationary_after_ms` (10_000) after the flip re-anchored it
       assert ids(events, :became_stationary) == [id]
     end
 

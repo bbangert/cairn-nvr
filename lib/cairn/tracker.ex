@@ -172,16 +172,18 @@ defmodule Cairn.Tracker do
   can honestly say about a gap it did not watch.
 
   So `stationary` crosses the cut but is **not** guaranteed to survive the
-  batch that adopts: it is re-derived from the adopting box by the ordinary
-  rule, exactly as it would be for a track that never left. A car back in its
-  own space stays stationary; one whose box has drifted off the anchor by more
-  than `@stationary_iou` reads as moving, and reads so immediately rather than
-  once a median has caught up. Note that the long tier's
-  `@stationary_match_iou` is *below* `@stationary_iou`, so a box adopted
-  between the two resumes the identity and is called movement in the same
-  batch — the same answer the ordinary rule gives for a box that far off its
-  anchor. What the adoption does buy unconditionally is that the settle window
-  does not re-arm: a resumed track that is still where it was is stationary
+  adoption: it is re-derived from the adopting box by the ordinary rule,
+  exactly as it would be for a track that never left. A car back in its own
+  space stays stationary; one whose box has drifted off the anchor by more than
+  `@stationary_iou` fails the stillness test on the adopting batch itself
+  rather than once a median has caught up, and — by the same rule as any other
+  failure, which the adoption gets no exemption from — leaves the flag
+  `@stationary_exit_ms` later, once that failure has sustained. Note that the
+  long tier's `@stationary_match_iou` is *below* `@stationary_iou`, so a box
+  adopted between the two resumes the identity and starts its exit window in
+  the same batch — the same answer the ordinary rule gives for a box that far
+  off its anchor. What the adoption does buy unconditionally is that the settle
+  window does not re-arm: a resumed track that is still where it was is stationary
   from its first detection instead of spending `stationary_after_ms` looking
   like a new arrival.
 
@@ -235,12 +237,31 @@ defmodule Cairn.Tracker do
   **anchor** — the box the object was last seen to move to — not against the
   previous box: comparing consecutive boxes calls a slow walk motionless,
   because every step is within jitter of the one before it. The anchor is
-  reset only when the object moves, so it answers "has it moved since it last
-  moved" however long the track lives.
+  reset only when the object is judged to have moved — which, leaving the flag,
+  is when the exit window below closes and not when the failures start — so it
+  answers "has it moved since it last moved" however long the track lives.
 
   The current box is the per-coordinate median of the last few **detected**
   boxes rather than the newest one, so a single mis-sized box cannot flip a
   motionless object into motion, nor a moving one out of it.
+
+  Leaving the flag takes as much sustaining as earning it. A stationary track
+  whose smoothed box fails the anchor test does not flip on that evaluation: it
+  goes *pending*, still stationary in every way anything downstream can see,
+  and only once the failure has been unbroken for `@stationary_exit_ms` of
+  media time does the flag clear and `started_moving` go out — once,
+  timestamped at the evaluation that closed the window. A single passing
+  evaluation ends the pending state outright, so the next excursion starts a
+  fresh clock: the rule is continuity and not a total, and two short excursions
+  never add up to one departure. Without this, a couple of hundredths of
+  detector drift on a small box — under `@stationary_iou` for the batch or two
+  the median takes to absorb it — cleared the flag on a parked car every minute
+  or so, and each clearing made it evidence again.
+
+  A pending exit is advanced by failed **evaluations** and by nothing else.
+  Predicted observations do not evaluate stillness at all (below), so a
+  detection gap neither closes a window nor clears it however long it runs; a
+  gap is ended by the unseen bound or by suspension, not by this.
 
   Every stationary update is gated on `Cairn.Observation.detected?/1`, for the
   same reason as `stale_predicted`: a predicted box repeats the plugin's own
@@ -400,6 +421,42 @@ defmodule Cairn.Tracker do
   # the knob that answers the question they actually have — "how long before
   # you call it parked" — is `stationary_after_ms`.
   @stationary_iou 0.8
+  # How long the smoothed box must keep failing that test, in media time,
+  # before a stationary track is called moving. Entry and exit are otherwise
+  # asymmetric in a way that only ever fails one direction: earning the flag
+  # takes `stationary_after_ms` of sustained stillness, and losing it took a
+  # single failed evaluation.
+  #
+  # What that asymmetry cost is measured, not hypothetical. A parked car far
+  # enough from the camera is a small box — 0.17 by 0.09 of the frame in the
+  # case this comes from — and on a box that short, 0.02 of detector drift in y
+  # already puts the median at 0.64 against the anchor, under `@stationary_iou`
+  # with room to spare. The dip lasted a batch or two and the median could not
+  # absorb it; the flag cleared, `started_moving` went out, and the car became
+  # evidence again (`Cairn.DetectionAggregator` refuses only a stationary
+  # track), which opened a clip. One car in an otherwise empty scene produced
+  # about ten of them in 25 minutes.
+  #
+  # 2_500 sits clear of those excursions at any usable frame rate — a couple of
+  # batches, plus the couple more the median takes to turn back over — and well
+  # under any departure, which fails the test continuously for as long as the
+  # object is leaving, because the anchor stays put while the window is open
+  # and every step of the exit is therefore measured against where the object
+  # was parked rather than against where it was a batch ago. What the delay
+  # costs is 2.5 s of trigger latency on a real departure, and no footage: an
+  # event opens with `pre_window_seconds` of pre-roll ahead of its trigger,
+  # which at its 5 s default reaches back past the whole window.
+  #
+  # Not config, on the same rule as `@stationary_iou` and for a sharper reason
+  # than that one. The two are a pair — this window is sized against exactly
+  # the jitter that threshold cannot absorb — and the pairing is what the
+  # `@stationary_match_iou` block calls a silent bug: set too short it does
+  # nothing and the flapping returns, set too long it holds a departed object
+  # flagged as parked, and neither shows up as anything an operator looking at
+  # a camera view could attribute. The knob for the question they do have —
+  # "how long before you call it parked" — is `stationary_after_ms`, and this
+  # is the other edge of the same hysteresis rather than a second knob.
+  @stationary_exit_ms 2_500
   # Detected boxes kept for the per-coordinate median. Odd, so a full window's
   # median is a value the detector actually reported on each axis (a warming-up
   # window can be even and average two); short, so a real move reaches the
@@ -1008,13 +1065,14 @@ defmodule Cairn.Tracker do
     end
   end
 
-  # Back into the live set, on the new epoch's clocks. Every media-time field
-  # is re-based here, because the only thing the old epoch's numbers can do in
-  # a subtraction against the new epoch's `media_ms` is lie — in either
-  # direction, depending on which stream had been running longer. The nil-ness
-  # of each is preserved: a track that has never been detected still has no
-  # anchor and no `last_detected_ms`, and inventing one here would manufacture
-  # the detection the object never had.
+  # Back into the live set, on the new epoch's clocks. No media-time field
+  # survives this untouched — four are re-based and `pending_exit_ms` is
+  # cleared outright (below) — because the only thing the old epoch's numbers
+  # can do in a subtraction against the new epoch's `media_ms` is lie, in
+  # either direction, depending on which stream had been running longer. The
+  # nil-ness of each re-based field is preserved: a track that has never been
+  # detected still has no anchor and no `last_detected_ms`, and inventing one
+  # here would manufacture the detection the object never had.
   #
   # Two of the four are also overwritten by the update this batch applies
   # immediately afterwards (`last_seen_ms` and `last_seen_host_ms`, which every
@@ -1045,6 +1103,16 @@ defmodule Cairn.Tracker do
   # `new_track/3` leaves for a track's first detection. `stationary` is then
   # re-derived from the adopting box against the anchor, and from nothing else.
   #
+  # `pending_exit_ms` is cleared for the same reason and is the one media-time
+  # field not re-based: an exit window is a claim about an *unbroken run of
+  # observations*, and the cut is a gap nothing observed, so a run that was
+  # open when the stream died cannot be continued across it. An adoption whose
+  # box has drifted off the anchor therefore opens its window on the adopting
+  # batch and leaves the flag `@stationary_exit_ms` later — the sustain rule
+  # has no exemption for an adoption, and an object that really did move during
+  # the gap is a real departure, which is exactly the case the rule is happy to
+  # take that long over.
+  #
   # That the window is never *observed* empty is `adopt/4`'s doing: it revives
   # a track only for a detected object it has just assigned to it, so
   # `update_track/3` refills it in the same `track/3` call. (`median_box/1`
@@ -1060,7 +1128,8 @@ defmodule Cairn.Tracker do
         last_seen_host_ms: context.now_ms,
         last_detected_ms: if(entry.tracked.last_detected_ms, do: context.media_ms),
         anchor_ms: if(entry.tracked.anchor_bbox, do: context.media_ms),
-        recent_boxes: []
+        recent_boxes: [],
+        pending_exit_ms: nil
     }
 
     %{tracker | suspended: suspended, objects: Map.put(tracker.objects, id, tracked)}
@@ -1367,7 +1436,14 @@ defmodule Cairn.Tracker do
         recent_boxes: if(detected?, do: [object.bbox], else: []),
         stationary: false,
         stationary_since: nil,
-        stationary_ms: 0
+        stationary_ms: 0,
+        # The media instant an unbroken run of failed stillness evaluations
+        # began, or `nil` when none is open. Internal to the stillness rule and
+        # not in `Cairn.Track`: a pending exit is a track that is still
+        # stationary, and publishing "stationary, but" would give every
+        # consumer a third state to handle for something none of them may act
+        # on.
+        pending_exit_ms: nil
       },
       context
     )
@@ -1398,7 +1474,8 @@ defmodule Cairn.Tracker do
   # -- stillness --------------------------------------------------------------
 
   # A predicted box is the plugin repeating itself, so it neither advances nor
-  # resets stillness — see the moduledoc.
+  # resets stillness — a pending exit included, which is what makes a detection
+  # gap unable to complete one. See the moduledoc, and `failed/4`.
   defp stillness(tracked, _object, false, _previous_detected_ms, _context), do: tracked
 
   defp stillness(tracked, object, true, previous_detected_ms, context) do
@@ -1413,18 +1490,27 @@ defmodule Cairn.Tracker do
         still(tracked, previous_detected_ms, context)
 
       true ->
-        moved(tracked, object.bbox, context)
+        failed(tracked, object.bbox, previous_detected_ms, context)
     end
   end
 
   # The anchor stays where it is for as long as the object does not move, so
   # the comparison spans the whole still stretch rather than one frame of it.
-  defp still(%{stationary: true} = tracked, previous_detected_ms, context) do
-    elapsed = max(context.media_ms - previous_detected_ms, 0)
-    %{tracked | stationary_ms: tracked.stationary_ms + elapsed}
+  #
+  # One passing evaluation is enough to end a pending exit, and ends it
+  # outright rather than crediting the failures back: the excursion is over,
+  # and whatever fails next starts its own window. That is the whole difference
+  # between this and a counter — two two-second excursions with a good batch
+  # between them are two excursions, not a four-second departure.
+  defp still(tracked, previous_detected_ms, context) do
+    settled(%{tracked | pending_exit_ms: nil}, previous_detected_ms, context)
   end
 
-  defp still(tracked, _previous_detected_ms, context) do
+  defp settled(%{stationary: true} = tracked, previous_detected_ms, context) do
+    %{tracked | stationary_ms: tracked.stationary_ms + accrued(previous_detected_ms, context)}
+  end
+
+  defp settled(tracked, _previous_detected_ms, context) do
     if context.media_ms - tracked.anchor_ms >= context.stationary_after_ms do
       %{tracked | stationary: true, stationary_since: context.observed_at}
     else
@@ -1432,9 +1518,73 @@ defmodule Cairn.Tracker do
     end
   end
 
-  defp moved(tracked, bbox, context) do
-    %{anchor(tracked, bbox, context) | stationary: false, stationary_since: nil}
+  # A failed evaluation against a *stationary* track opens the exit window
+  # rather than clearing the flag: see `@stationary_exit_ms` for the flapping
+  # this exists to stop. Until the window closes the track is stationary in
+  # every way that matters downstream — not evidence, on the extended unseen
+  # bound, matching at `@stationary_match_iou` in grace — and no transition is
+  # emitted, because none has happened.
+  #
+  # `pending_exit_ms` is the media instant the *unbroken* run of failures
+  # began, not a running total, and it is left where it is by every failure
+  # after the first. So is the anchor: while the window is open every
+  # evaluation is still measured against where the object was parked, which is
+  # what makes the window a test of sustained motion. Re-anchoring here would
+  # ask instead whether the object moved since the previous *evaluation* — the
+  # slow-walk mistake the anchor exists to avoid — and a departure taken a step
+  # at a time would pass every one of them and never leave the flag.
+  #
+  # Only failed evaluations reach this, so only failed evaluations can close
+  # the window. A predicted stretch does not evaluate stillness at all
+  # (`stillness/5`'s first clause), so a detection gap neither completes a
+  # pending exit nor clears it however long it runs: media time passing with
+  # nothing to judge is not evidence that the object left, and a gap that goes
+  # on is ended by the unseen bound or by suspension, not from here. The first
+  # failure after such a gap does close a window it lands past — two failures
+  # that far apart with nothing between them saying otherwise is the same
+  # reading as two adjacent ones.
+  #
+  # `stationary_ms` accrues across the window, on the rule it accrues on
+  # everywhere else: it counts the media time the flag was set, and the flag is
+  # set here. A real departure is over-credited by at most one window; not
+  # accruing would under-credit a parked car by one excursion every time it
+  # jitters, which on an object that sits there for hours is the larger error
+  # and the one that grows.
+  defp failed(%{stationary: true} = tracked, bbox, previous_detected_ms, context) do
+    pending_since = tracked.pending_exit_ms || context.media_ms
+
+    if context.media_ms - pending_since >= @stationary_exit_ms do
+      moved(tracked, bbox, context)
+    else
+      %{
+        tracked
+        | pending_exit_ms: pending_since,
+          stationary_ms: tracked.stationary_ms + accrued(previous_detected_ms, context)
+      }
+    end
   end
+
+  # A track that is not stationary has no flag to sustain and no window open:
+  # it re-anchors on every failure, which is how the anchor follows a moving
+  # object and how a settle is measured from where it stopped.
+  defp failed(tracked, bbox, _previous_detected_ms, context), do: moved(tracked, bbox, context)
+
+  # Leaving the flag and closing the window are one write, so nothing can
+  # produce a moving track that still carries a pending exit.
+  defp moved(tracked, bbox, context) do
+    %{
+      anchor(tracked, bbox, context)
+      | stationary: false,
+        stationary_since: nil,
+        pending_exit_ms: nil
+    }
+  end
+
+  # Media time since the previous detection, floored at zero: a backwards pts
+  # jump inside an epoch must credit nothing rather than un-credit what the
+  # track already earned.
+  defp accrued(previous_detected_ms, context),
+    do: max(context.media_ms - previous_detected_ms, 0)
 
   defp anchor(tracked, bbox, context),
     do: %{tracked | anchor_bbox: bbox, anchor_ms: context.media_ms}

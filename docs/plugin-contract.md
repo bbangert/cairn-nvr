@@ -180,9 +180,12 @@ again.
 A track is also out of event evidence while Cairn has it flagged
 **stationary** — its box has held still for `tracking.stationary_after_ms` of
 media time. Detections keep coming and the track stays alive; they simply stop
-opening or extending events until the object moves again. Stillness is
-measured from *detected* boxes only, so predictions neither create it nor
-break it.
+opening or extending events until the object has been moving for a couple of
+seconds: the flag is sustained on the way out as well as on the way in, so a
+detector jittering on a small box does not flick a parked object back into
+evidence. Stillness is measured from *detected* boxes only, so predictions
+neither create it nor break it — nor do they end that couple of seconds, which
+counts detections and not elapsed time.
 
 ### `plugin.hello`
 

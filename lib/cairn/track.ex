@@ -23,7 +23,12 @@ defmodule Cairn.Track do
       observation time it flipped (`nil` while moving) and `stationary_ms`
       the total media time it has spent stationary over the track's whole
       life, which only ever grows — a track that moves and settles again
-      carries the sum of both stretches.
+      carries the sum of both stretches. The flag is hysteretic in both
+      directions: it clears only after the box has *kept* failing the
+      stillness test for `Cairn.Tracker`'s exit window, so a stationary track
+      whose detector jitters stays flagged and a real departure is reported a
+      couple of seconds after it starts. Nothing intermediate is published —
+      a track waiting out that window is `stationary: true` like any other.
     * `epoch` is the stream the track was last observed under, not the one it
       was minted in: a host track can survive a stream reset by being adopted
       on the far side of it (`Cairn.Tracker`), keeping its `object_id` and its

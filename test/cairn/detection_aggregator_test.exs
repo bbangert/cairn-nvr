@@ -136,6 +136,16 @@ defmodule Cairn.DetectionAggregatorTest do
   # reads as movement, and well over the match threshold, so it is the same
   # track that moved rather than a second one.
   @moved_box [0.16, 0.1, 0.2, 0.4]
+  # The live failure's geometry: a car 0.17 by 0.09 of the frame with about
+  # 0.02 of detector drift in *y*, which is IoU 0.636 against the anchor —
+  # under `@stationary_iou` and nothing like motion. Small and drifting on its
+  # short axis on purpose; @parked_box above is four times the area and
+  # @moved_box displaces it in x. `@small_moved_box` is where the same car goes
+  # when it really leaves: 0.385, low enough to fail stillness for as long as
+  # it holds and high enough to stay the same track rather than mint a second.
+  @small_parked_box [0.40, 0.50, 0.17, 0.09]
+  @small_jitter_box [0.40, 0.52, 0.17, 0.09]
+  @small_moved_box [0.40, 0.54, 0.17, 0.09]
 
   defp detect_at(agg, camera, media_ms, bbox \\ @parked_box) do
     DetectionAggregator.detections(
@@ -148,8 +158,8 @@ defmodule Cairn.DetectionAggregatorTest do
 
   # Object arrives, holds still past the threshold, event finalizes: the state
   # the parked-car loop used to restart from. Returns `{event_id, object_id}`.
-  defp park_and_finalize(agg, camera, camera_id) do
-    detect_at(agg, camera, 1_000)
+  defp park_and_finalize(agg, camera, camera_id, bbox \\ @parked_box) do
+    detect_at(agg, camera, 1_000, bbox)
     # the event-lifecycle messages are consumed here so a caller refuting a
     # *second* event is refuting one, not tripping over this one; the track
     # broadcasts (`track_started`, the flip's `track_updated`) are NOT drained
@@ -158,12 +168,12 @@ defmodule Cairn.DetectionAggregatorTest do
     assert_receive {:extractor_started, %Event{id: eid}, _pid}
     assert_receive {:event_started, %Event{id: ^eid}}
 
-    detect_at(agg, camera, 2_000)
+    detect_at(agg, camera, 2_000, bbox)
     assert_receive {:event_updated, %Event{id: ^eid}}
 
     # read off the tracker rather than off the broadcast: what this asserts is
     # the evidence rule, not how the flip reaches a subscriber (below)
-    detect_at(agg, camera, 3_000)
+    detect_at(agg, camera, 3_000, bbox)
     assert [%Track{object_id: oid, stationary: true}] = live_tracks(agg, camera_id)
 
     fire(agg, :post_window, camera_id, eid)
@@ -1376,7 +1386,60 @@ defmodule Cairn.DetectionAggregatorTest do
       :sys.get_state(agg)
       refute_received {:event_started, %Event{camera_id: ^id}}
 
+      # and the tracker then wants the move *sustained*: the smoothed box
+      # fails from 6_000, and the flag holds until that failure has run for
+      # `Cairn.Tracker`'s exit window (2_500 ms of media time)
       detect_at(agg, camera, 6_000, @moved_box)
+      detect_at(agg, camera, 7_000, @moved_box)
+      detect_at(agg, camera, 8_000, @moved_box)
+      :sys.get_state(agg)
+      assert [%Track{object_id: ^oid, stationary: true}] = live_tracks(agg, id)
+      refute_received {:event_started, %Event{camera_id: ^id}}
+
+      detect_at(agg, camera, 9_000, @moved_box)
+      assert [%Track{object_id: ^oid, stationary: false}] = live_tracks(agg, id)
+      assert_receive {:event_started, %Event{camera_id: ^id, labels: [%{object_id: ^oid}]}}
+    end
+
+    test "detector jitter on a parked car opens nothing; leaving still does", %{
+      agg: agg,
+      camera: camera,
+      camera_id: id
+    } do
+      {_eid, oid} = park_and_finalize(agg, camera, id, @small_parked_box)
+
+      # The live failure, reproduced end to end. Three jittered frames put the
+      # jitter in the median from 6_000 and the car back under it at 9_000 —
+      # three failing evaluations, two seconds of them, on a car that has not
+      # moved at all. Every one of them used to clear the flag, and clearing it
+      # is what made the car evidence again and opened a clip; about ten of
+      # them came out of one parked car in a 25-minute quiet window.
+      detect_at(agg, camera, 4_000, @small_jitter_box)
+      detect_at(agg, camera, 5_000, @small_jitter_box)
+      detect_at(agg, camera, 6_000, @small_jitter_box)
+      detect_at(agg, camera, 7_000, @small_parked_box)
+      detect_at(agg, camera, 8_000, @small_parked_box)
+      detect_at(agg, camera, 9_000, @small_parked_box)
+      :sys.get_state(agg)
+
+      # the clip is the failure; the flag is the mechanism, asserted second
+      refute_received {:event_started, %Event{camera_id: ^id}}
+      refute_received {:extractor_started, _event, _pid}
+      assert [%Track{object_id: ^oid, stationary: true}] = live_tracks(agg, id)
+
+      # and the quiet is not deafness: the same car actually leaving fails the
+      # test from 12_000 and never passes again, so the flag goes at 15_000 and
+      # the departure gets its clip — under the same identity, 2.5 s of media
+      # later than it would have before, which is well inside the 5 s pre-roll
+      # the clip opens with
+      for media_ms <- [10_000, 11_000, 12_000, 13_000, 14_000],
+          do: detect_at(agg, camera, media_ms, @small_moved_box)
+
+      :sys.get_state(agg)
+      assert [%Track{object_id: ^oid, stationary: true}] = live_tracks(agg, id)
+      refute_received {:event_started, %Event{camera_id: ^id}}
+
+      detect_at(agg, camera, 15_000, @small_moved_box)
       assert [%Track{object_id: ^oid, stationary: false}] = live_tracks(agg, id)
       assert_receive {:event_started, %Event{camera_id: ^id, labels: [%{object_id: ^oid}]}}
     end

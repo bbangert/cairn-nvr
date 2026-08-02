@@ -261,9 +261,17 @@ spent stationary over the whole track, which only grows. The measure is the
 box, so a camera that pans moves every track at once, and someone standing in
 place is stationary whatever they are doing.
 
+Leaving the flag is deliberately slower than one frame: the box has to keep
+reading as moved for a couple of seconds of stream time before `stationary`
+goes false. A detector that jitters on a small distant box would otherwise
+flick a parked car in and out of the flag every minute or two, and each flick
+is a clip. Nothing intermediate is published — a track in that couple of
+seconds is still `stationary: true`.
+
 A stationary object is **not event evidence**: a car that parks in view stops
 holding its event open, so that event ends on the post window and nothing it
-does while parked opens another. It counts again the moment it moves.
+does while parked opens another. It counts again once it has been moving long
+enough for the flag to clear.
 
 Same schema for all three kinds:
 
