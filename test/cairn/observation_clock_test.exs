@@ -55,4 +55,51 @@ defmodule Cairn.ObservationClockTest do
       assert first.at_ms == 1_000
     end
   end
+
+  # The clamp in isolation, one property a test, so a regression that never
+  # moves a `Cairn.Tracker` outcome — the entangled coverage in
+  # tracker_test.exs's "a stalled pts" block — still fails something.
+  describe "the clamp" do
+    test "the first observation of a clock's life stamps the host instant" do
+      {first, _clock} = stamp(ObservationClock.new(), 7_000.0, 500)
+      assert first.at_ms == 500
+    end
+
+    test "within an epoch, at_ms advances exactly as media time does" do
+      {_first, clock} = stamp(ObservationClock.new(), 1_000.0, 500)
+      {second, _clock} = stamp(clock, 1_250.0, 10_000)
+
+      assert second.at_ms == 750
+    end
+
+    test "an equal pts advances by the floor, never freezes" do
+      {_first, clock} = stamp(ObservationClock.new(), 1_000.0, 500)
+      {stalled, clock} = stamp(clock, 1_000.0, 5_000)
+      {stalled_again, _clock} = stamp(clock, 1_000.0, 9_000)
+
+      assert stalled.at_ms == 501
+      assert stalled_again.at_ms == 502
+    end
+
+    test "a rewound pts continues from where tracking time was, at media rate" do
+      {_first, clock} = stamp(ObservationClock.new(), 1_000.0, 500)
+      {second, clock} = stamp(clock, 2_000.0, 10_000)
+      assert second.at_ms == 1_500
+
+      # the restart itself: one floor step, not a jump to the 60s host instant
+      {restarted, clock} = stamp(clock, 0.0, 60_000)
+      assert restarted.at_ms == 1_501
+
+      # and full media rate from the new anchor, not the floor's creep
+      {resumed, _clock} = stamp(clock, 400.0, 60_000)
+      assert resumed.at_ms == 1_901
+    end
+
+    test "media time ahead of the host is capped at the host" do
+      {_first, clock} = stamp(ObservationClock.new(), 1_000.0, 500)
+      {jumped, _clock} = stamp(clock, 500_000.0, 2_000)
+
+      assert jumped.at_ms == 2_000
+    end
+  end
 end

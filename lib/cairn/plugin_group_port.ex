@@ -139,6 +139,10 @@ defmodule Cairn.PluginGroupPort do
   end
 
   @impl true
+  # The per-member maps (`clocks`, epoch/sequence/status bookkeeping) are not
+  # pruned for a member the new group drops: bounded by group size, and a
+  # stale entry is inert — routing consults `routes`, so a dropped member's
+  # lines stop being attributed before its clock could stamp anything.
   def handle_cast({:refresh, group, config}, state) do
     {:noreply, %{state | group: group, config: config, routes: build_routes(group, config)}}
   end

@@ -1310,7 +1310,7 @@ defmodule Cairn.CameraTrackerTest do
       detect(tracker, camera, 0.7, [0.12, 0.1, 0.2, 0.4])
       assert_receive {:track_updated, %Track{object_id: ^oid, score: 0.7, best_score: 0.8}}
 
-      # expiry is on the observation clock: 3.1s after the last sighting the
+      # expiry is on the observation clock: 3.2s after the last sighting the
       # track ends
       observe(tracker, camera, [], at_ms: 4_200.0)
       assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :unseen}}

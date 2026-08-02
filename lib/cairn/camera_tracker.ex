@@ -369,7 +369,8 @@ defmodule Cairn.CameraTracker do
   # reaching `detections/3` directly must not put a `nil` into the tracker's
   # arithmetic. Falling back to the host clock is honest but coarse — it dates
   # the batch's *arrival* and carries none of the spacing between frames that
-  # the ports' clock takes from the pts.
+  # the ports' clock takes from the pts, nor its non-decreasing clamp; the
+  # test seams that are this fallback's only callers accept both.
   defp with_at_ms(%Observation{at_ms: at_ms} = observation, _state) when is_number(at_ms),
     do: observation
 

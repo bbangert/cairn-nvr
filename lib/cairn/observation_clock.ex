@@ -69,7 +69,9 @@ defmodule Cairn.ObservationClock do
       suspension and adoption windows it then waits out are elapsed times on
       this clock, so a real outage has to age them. Continuity there would make
       a 30 s dropout read as one millisecond and hold every adoption window
-      open for as long as the stream stayed down.
+      open for as long as the stream stayed down. (The floor still applies: in
+      the narrow case where creep left the previous stamp at or past `now_ms`,
+      the first stamp of the new epoch is `prev + @floor_ms`, not `now_ms`.)
 
   `at_ms` is derived from the host's monotonic clock, and nothing but the
   floor's creep can put it ahead of one, which is what makes stamps comparable
