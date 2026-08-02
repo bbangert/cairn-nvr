@@ -20,9 +20,10 @@ defmodule Cairn.Track do
     * `stale_predicted` — the track is alive but has not been *detected*
       recently (the plugin keeps predicting it). Never event evidence.
     * `stationary` — the object's box has held still for the camera's
-      `stationary_after_ms` of media time; `stationary_since` is the
+      `stationary_after_ms` of the tracking clock (`Cairn.ObservationClock`);
+      `stationary_since` is the
       observation time it flipped (`nil` while moving) and `stationary_ms`
-      the total media time it has spent stationary over the track's whole
+      the total time on that clock it has spent stationary over the track's whole
       life, which only ever grows — a track that moves and settles again
       carries the sum of both stretches. The flag is hysteretic in both
       directions: it clears only after the box has *kept* failing the

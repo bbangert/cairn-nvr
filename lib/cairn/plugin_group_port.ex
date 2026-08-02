@@ -15,7 +15,9 @@ defmodule Cairn.PluginGroupPort do
   `{"camera_id", "pts", "dets"}` shape) it is routed as a
   `Cairn.Observation` to `Cairn.CameraTracker` with that camera's
   config and effective policy (event windows, tracking bounds and the
-  `track:` / `record:` tiers). Lines for an unknown
+  `track:` / `record:` tiers) and with the `at_ms` the tracker decides on,
+  derived from that member's own `Cairn.ObservationClock` — one per member,
+  since each is a separate stream with its own pts. Lines for an unknown
   or missing camera are dropped, as are malformed ones, observations from a
   stale stream epoch and
   individual detections `Cairn.PluginProtocol` rejects — counted always,
@@ -44,6 +46,7 @@ defmodule Cairn.PluginGroupPort do
 
   alias Cairn.Config
   alias Cairn.Observation
+  alias Cairn.ObservationClock
   alias Cairn.PluginProtocol
   alias Cairn.StreamEpochs
 
@@ -80,6 +83,7 @@ defmodule Cairn.PluginGroupPort do
             last_sequences: %{},
             last_statuses: %{},
             epochs: %{},
+            clocks: %{},
             opts: []
 
   def start_link(opts) do
@@ -261,7 +265,19 @@ defmodule Cairn.PluginGroupPort do
     state = note_drops(state, skew, :clock_skew, preview(cam.id))
 
     if current_epoch?(observation, cam.id) do
-      state
+      # One clock per member: they are separate streams with separate pts, and
+      # a group serves whichever of them is still delivering. Stamped here and
+      # not above the epoch test — a line from a retired epoch carries a pts
+      # from a timeline nothing tracks any more, and anchoring on it would
+      # re-anchor that member's clock a second time on the next accepted line.
+      {observation, clock} =
+        ObservationClock.stamp(
+          Map.get_lazy(state.clocks, cam.id, &ObservationClock.new/0),
+          observation,
+          System.monotonic_time(:millisecond)
+        )
+
+      put_in(state.clocks[cam.id], clock)
       |> note_sequence(observation)
       |> forward(cam, policy, observation)
       |> note_drops(observation.invalid_objects, :invalid_det)
@@ -506,7 +522,12 @@ defmodule Cairn.PluginGroupPort do
       end
 
     # A fresh plugin process has been told nothing and continues nobody's
-    # sequence: both reset with the OS process, as do the drop counters.
+    # sequence — nor any member's pts, which is why their observation clocks
+    # re-anchor with it. They are `reset/1` and not dropped: each anchor
+    # described a timeline this process will not continue, but tracking time is
+    # the host's and the tracks it stamps are the same tracks, so every member
+    # carries its `at_ms` over and resumes from it. The sequences and the drop
+    # counters reset outright with the OS process.
     announce_current_epochs(%{
       state
       | port: port,
@@ -517,6 +538,7 @@ defmodule Cairn.PluginGroupPort do
         last_sequences: %{},
         last_statuses: %{},
         epochs: %{},
+        clocks: Map.new(state.clocks, fn {id, clock} -> {id, ObservationClock.reset(clock)} end),
         plugin: nil
     })
   end

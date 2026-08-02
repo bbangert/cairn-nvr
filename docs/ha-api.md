@@ -294,8 +294,9 @@ Same schema for all three kinds:
   `end_reason` is one of `unseen` (not seen for the configured
   `tracking.max_unseen_ms` of stream time — five times that while the track is
   `stationary`, which is what lets a parked object ride out an occlusion — or
-  ten times whichever of those two bounds applies, of *host* time, the
-  backstop for a plugin whose stream clock stops moving),
+  ten times whichever of those two bounds applies since the last observation
+  the track actually took, which bounds one held alive by boxes Cairn refuses
+  on its behalf),
   `stream_reset` (the camera's stream reconnected and
   nothing on the far side turned out to be this object), `evicted` (the camera
   hit its `tracking.max_live_tracks` cap and this was the least recently seen

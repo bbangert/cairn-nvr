@@ -414,7 +414,7 @@ defmodule Cairn.TrackRecorderTest do
 
     test "a float stationary_ms rides every live path without killing the flush",
          %{camera_id: cam} do
-      # The media clock is float arithmetic: a stationary track's live summary
+      # The observation clock is float arithmetic: a stationary track's live summary
       # carries stationary_ms like 4366.666666666666, and the :integer column
       # dumps strictly. The fixtures here were uniform in exactly this
       # dimension (integers throughout) while the crash-loop ate every close

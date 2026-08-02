@@ -597,7 +597,8 @@ defmodule Cairn.Tracks do
   defp usec(other), do: other
 
   # Same invariant, second dimension: `stationary_ms` is an `:integer` column,
-  # and the tracker's media clock is float arithmetic — a live summary carries
+  # and the observation clock it accrues on is float arithmetic — a live
+  # summary carries
   # `4366.666...`, which `insert_all` dumps strictly (`Ecto.ChangeError`, no
   # cast to save it). The finished-track path never showed this because a
   # track that ended while moving carries the integer 0. Round — the value is

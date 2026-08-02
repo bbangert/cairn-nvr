@@ -4,6 +4,8 @@ defmodule Cairn.TrackerTest do
   import Cairn.TrackAssertions
   import ExUnit.CaptureLog, only: [with_log: 1]
 
+  alias Cairn.Observation
+  alias Cairn.ObservationClock
   alias Cairn.PluginProtocol
   alias Cairn.Track
   alias Cairn.Tracker
@@ -69,16 +71,20 @@ defmodule Cairn.TrackerTest do
     }
   end
 
+  # `observed_at` defaults to the wall instant `at_ms` names, which is what the
+  # ports produce: one clock advances the tracking decisions and the other dates
+  # the same observation for a human. A test that needs them apart passes both.
   defp ctx(opts) do
+    at_ms = Keyword.get(opts, :at_ms, 0)
+
     %{
       camera_id: Keyword.get(opts, :camera_id, "cam_a"),
       epoch: Keyword.get(opts, :epoch, "epoch_one"),
-      media_ms: Keyword.get(opts, :media_ms, 0),
-      observed_at: Keyword.get(opts, :observed_at, ~U[2026-07-26 12:00:00Z]),
+      at_ms: at_ms,
+      observed_at: Keyword.get(opts, :observed_at, at(at_ms)),
       max_unseen_ms: Keyword.get(opts, :max_unseen_ms, @max_unseen),
       max_live_tracks: Keyword.get(opts, :max_live_tracks, 128),
-      stationary_after_ms: Keyword.get(opts, :stationary_after_ms, @stationary_after),
-      now_ms: Keyword.get(opts, :now_ms, 0)
+      stationary_after_ms: Keyword.get(opts, :stationary_after_ms, @stationary_after)
     }
   end
 
@@ -88,11 +94,12 @@ defmodule Cairn.TrackerTest do
     for {^kind, %Track{object_id: id}} <- events, do: id
   end
 
-  # Observation time derived from media time, so a `stationary_since` can be
-  # checked against the step that set it.
+  # The wall instant an `at_ms` names, so a `stationary_since` — which is
+  # `observed_at` data, not a clock the tracker reads — can be checked against
+  # the step that set it.
   defp at(ms), do: DateTime.add(~U[2026-07-26 12:00:00Z], trunc(ms), :millisecond)
 
-  # One object over `{media_ms, bbox}` (or `{media_ms, bbox, kind}`) steps,
+  # One object over `{at_ms, bbox}` (or `{at_ms, bbox, kind}`) steps,
   # returning the last step's `track/3` result. Every step's box overlaps the
   # one before it far above `@iou_threshold` — the stillness fixtures move by
   # jitter and creep, never by a jump — so identity is held by IoU throughout
@@ -105,19 +112,19 @@ defmodule Cairn.TrackerTest do
           {ms, bbox, kind} -> {ms, bbox, kind}
         end
 
-      track(tracker, [det("person", bbox, kind: kind)], media_ms: ms, observed_at: at(ms))
+      track(tracker, [det("person", bbox, kind: kind)], at_ms: ms, observed_at: at(ms))
     end)
   end
 
-  # One object of `label` detected every second at `box`, from media time 0
-  # through @stationary_after (10_000): stationary as of the last step, with
-  # `last_seen_ms` 10_000, `last_seen_at` at(10_000) and `last_seen_host_ms` 0
-  # (the ctx default).
+  # One object of `label` detected every second at `box`, from 0 through
+  # @stationary_after (10_000) on the observation clock: stationary as of the
+  # last step, with `last_seen_ms` and `last_matched_ms` 10_000 and
+  # `last_seen_at` at(10_000).
   defp parked(box, label \\ "person") do
     {tracker, id} =
       Enum.reduce(0..10, {Tracker.new(), nil}, fn n, {tracker, id} ->
         {tracker, [tagged], _events} =
-          track(tracker, [det(label, box)], media_ms: n * 1_000, observed_at: at(n * 1_000))
+          track(tracker, [det(label, box)], at_ms: n * 1_000, observed_at: at(n * 1_000))
 
         {tracker, id || tagged.object_id}
       end)
@@ -126,8 +133,8 @@ defmodule Cairn.TrackerTest do
     {tracker, id}
   end
 
-  # One object detected once per second of media time along `boxes`,
-  # from media time 0. It has moved on every step, so it is not stationary and
+  # One object detected once per second of the observation clock along
+  # `boxes`, from 0. It has moved on every step, so it is not stationary and
   # its anchor is the last box in the list, anchored at `(length - 1) * 1_000`.
   defp moving(boxes, label \\ "person") do
     {tracker, id} =
@@ -135,7 +142,7 @@ defmodule Cairn.TrackerTest do
       |> Enum.with_index()
       |> Enum.reduce({Tracker.new(), nil}, fn {box, n}, {tracker, id} ->
         {tracker, [tagged], _events} =
-          track(tracker, [det(label, box)], media_ms: n * 1_000, observed_at: at(n * 1_000))
+          track(tracker, [det(label, box)], at_ms: n * 1_000, observed_at: at(n * 1_000))
 
         {tracker, id || tagged.object_id}
       end)
@@ -150,7 +157,7 @@ defmodule Cairn.TrackerTest do
   @batch_ms 500
 
   # The small parked car of the hysteresis tests, detected every @batch_ms from
-  # media 0 through @stationary_after (10_000). It is
+  # 0 through @stationary_after (10_000). It is
   # stationary as of the last step, anchored on @small_car, with a median
   # window holding nothing but @small_car.
   defp parked_small do
@@ -245,13 +252,13 @@ defmodule Cairn.TrackerTest do
       assert track.plugin_track_id == nil
       assert track.camera_id == "cam_a"
       assert track.best_score == 0.9
-      assert track.started_at == ~U[2026-07-26 12:00:00Z]
+      assert track.started_at == at(0)
       refute track.stale_predicted
     end
 
     test "same object keeps its id across overlapping frames" do
       {t, [a], _} = track(Tracker.new(), [det("person", [0.1, 0.1, 0.2, 0.4])])
-      {_t, [b], events} = track(t, [det("person", [0.12, 0.1, 0.2, 0.4])], media_ms: 200)
+      {_t, [b], events} = track(t, [det("person", [0.12, 0.1, 0.2, 0.4])], at_ms: 200)
 
       assert a.object_id == b.object_id
       assert ids(events, :started) == []
@@ -260,7 +267,7 @@ defmodule Cairn.TrackerTest do
 
     test "non-overlapping detection of same label gets a new id" do
       {t, [a], _} = track(Tracker.new(), [det("person", [0.0, 0.0, 0.1, 0.1])])
-      {_t, [b], events} = track(t, [det("person", [0.8, 0.8, 0.1, 0.1])], media_ms: 200)
+      {_t, [b], events} = track(t, [det("person", [0.8, 0.8, 0.1, 0.1])], at_ms: 200)
 
       refute a.object_id == b.object_id
       assert ids(events, :started) == [b.object_id]
@@ -268,7 +275,7 @@ defmodule Cairn.TrackerTest do
 
     test "labels never match each other even when overlapping" do
       {t, [a], _} = track(Tracker.new(), [det("person", [0.1, 0.1, 0.2, 0.4])])
-      {_t, [b], _} = track(t, [det("cat", [0.1, 0.1, 0.2, 0.4])], media_ms: 200)
+      {_t, [b], _} = track(t, [det("cat", [0.1, 0.1, 0.2, 0.4])], at_ms: 200)
 
       refute a.object_id == b.object_id
     end
@@ -279,7 +286,7 @@ defmodule Cairn.TrackerTest do
       assert a.object_id != b.object_id
 
       moved = [det("person", [0.72, 0.1, 0.2, 0.4]), det("person", [0.12, 0.1, 0.2, 0.4])]
-      {_t, [b2, a2], _} = track(t, moved, media_ms: 200)
+      {_t, [b2, a2], _} = track(t, moved, at_ms: 200)
 
       assert a2.object_id == a.object_id
       assert b2.object_id == b.object_id
@@ -289,10 +296,10 @@ defmodule Cairn.TrackerTest do
       {t, _, _} = track(Tracker.new(), [det("person", [0.1, 0.1, 0.2, 0.4], score: 0.6)])
 
       {t, _, [{:updated, high}]} =
-        track(t, [det("person", [0.1, 0.1, 0.2, 0.4], score: 0.95)], media_ms: 200)
+        track(t, [det("person", [0.1, 0.1, 0.2, 0.4], score: 0.95)], at_ms: 200)
 
       {_t, _, [{:updated, low}]} =
-        track(t, [det("person", [0.1, 0.1, 0.2, 0.4], score: 0.7)], media_ms: 400)
+        track(t, [det("person", [0.1, 0.1, 0.2, 0.4], score: 0.7)], at_ms: 400)
 
       assert high.best_score == 0.95
       assert low.score == 0.7
@@ -300,35 +307,35 @@ defmodule Cairn.TrackerTest do
     end
   end
 
-  describe "media-time expiry" do
+  describe "expiry" do
     # The batch-count rule this replaced expired after 5 missed batches: 5s at
-    # 1 fps but 333ms at 15 fps. Media time makes both the same 3s.
-    test "expires after max_unseen_ms of media time at 1 fps" do
+    # 1 fps but 333ms at 15 fps. A clock spaced by frames makes both the same 3s.
+    test "expires after max_unseen_ms at 1 fps" do
       {t, [a], _} = track(Tracker.new(), [det("person", [0.1, 0.1, 0.2, 0.4])])
 
-      {t, [], []} = track(t, [], media_ms: 2_000)
-      {t, [], []} = track(t, [], media_ms: 3_000)
-      {t, [], ended} = track(t, [], media_ms: 3_100)
+      {t, [], []} = track(t, [], at_ms: 2_000)
+      {t, [], []} = track(t, [], at_ms: 3_000)
+      {t, [], ended} = track(t, [], at_ms: 3_100)
 
       assert [{:ended, %Track{object_id: id, end_reason: :unseen} = final}] = ended
       assert id == a.object_id
       assert_self_contained(final)
 
-      {_t, [b], _} = track(t, [det("person", [0.1, 0.1, 0.2, 0.4])], media_ms: 3_200)
+      {_t, [b], _} = track(t, [det("person", [0.1, 0.1, 0.2, 0.4])], at_ms: 3_200)
       refute b.object_id == a.object_id
     end
 
     test "survives the same number of missed batches at 15 fps" do
       {t, [a], _} = track(Tracker.new(), [det("person", [0.1, 0.1, 0.2, 0.4])])
 
-      # 30 frames at 15 fps is 2s of media time: still the same object
+      # 30 frames at 15 fps is 2s on the clock: still the same object
       t =
         Enum.reduce(1..30, t, fn n, t ->
-          {t, [], []} = track(t, [], media_ms: n * 66.7)
+          {t, [], []} = track(t, [], at_ms: n * 66.7)
           t
         end)
 
-      {_t, [b], events} = track(t, [det("person", [0.1, 0.1, 0.2, 0.4])], media_ms: 2_100)
+      {_t, [b], events} = track(t, [det("person", [0.1, 0.1, 0.2, 0.4])], at_ms: 2_100)
 
       assert b.object_id == a.object_id
       # positively, not as a refute: `ids/2` silently drops anything that is
@@ -344,32 +351,17 @@ defmodule Cairn.TrackerTest do
       # predicted for longer than max_unseen: alive (last_seen moves) but the
       # last *detection* is old, so it is no longer evidence
       {t, [a], [{:updated, tracked}]} =
-        track(t, [det("person", [0.1, 0.1, 0.2, 0.4], kind: "tracked")], media_ms: 4_000)
+        track(t, [det("person", [0.1, 0.1, 0.2, 0.4], kind: "tracked")], at_ms: 4_000)
 
       assert a.stale_predicted
       assert tracked.stale_predicted
 
       {_t, [b], [{:updated, redetected}]} =
-        track(t, [det("person", [0.1, 0.1, 0.2, 0.4])], media_ms: 4_100)
+        track(t, [det("person", [0.1, 0.1, 0.2, 0.4])], at_ms: 4_100)
 
       assert b.object_id == a.object_id
       refute b.stale_predicted
       refute redetected.stale_predicted
-    end
-
-    test "a backwards media-time jump inside an epoch expires nothing" do
-      dets = [det("person", [0.1, 0.1, 0.2, 0.4]), det("cat", [0.7, 0.1, 0.2, 0.4])]
-      {t, [a, _b], _} = track(Tracker.new(), dets, media_ms: 900_000)
-
-      {t, [c], events} = track(t, [det("person", [0.1, 0.1, 0.2, 0.4])], media_ms: 0)
-
-      # the whole event list, so "no ended" cannot be satisfied by a tracker
-      # that emitted nothing at all, and the cat's survival is checked rather
-      # than inferred from the absence of a final
-      assert [{:updated, %Track{object_id: updated}}] = events
-      assert updated == a.object_id
-      assert c.object_id == a.object_id
-      assert length(Tracker.live_tracks(t)) == 2
     end
   end
 
@@ -388,7 +380,7 @@ defmodule Cairn.TrackerTest do
       # the same id, on a box that does not overlap at all: IoU decides, so this
       # is a second object with a ULID of its own
       {_t, [b], events} =
-        track(t, [det("person", [0.9, 0.9, 0.05, 0.05], track_id: "t1")], media_ms: 200)
+        track(t, [det("person", [0.9, 0.9, 0.05, 0.05], track_id: "t1")], at_ms: 200)
 
       refute b.object_id == a.object_id
       assert [{:started, minted}] = events
@@ -402,7 +394,7 @@ defmodule Cairn.TrackerTest do
         camera_id: "cam_a",
         epoch: "epoch_one",
         plugin_instance: "grp",
-        media_ms: 0,
+        at_ms: 0,
         observed_at: ~U[2026-07-26 12:00:00Z],
         objects: [%{label: "person", bbox: [0.1, 0.1, 0.2, 0.4], score: 0.9, track_id: "t1"}],
         ended_tracks: ["t1"]
@@ -414,7 +406,7 @@ defmodule Cairn.TrackerTest do
         stationary_after_ms: @stationary_after
       }
 
-      context = Tracker.context(observation, "cam_a", policy, 0)
+      context = Tracker.context(observation, "cam_a", policy)
 
       refute Map.has_key?(context, :ended_tracks)
       refute Map.has_key?(context, :tracking)
@@ -546,7 +538,7 @@ defmodule Cairn.TrackerTest do
       refute flipped.stationary
       assert flipped.stationary_since == nil
       # the window accrues: the flag was set for every one of those batches, and
-      # `stationary_ms` counts the media time the flag was set
+      # `stationary_ms` counts the time the flag was set
       assert flipped.stationary_ms == 5_000
       assert [%Track{stationary: false}] = Tracker.live_tracks(t)
     end
@@ -572,16 +564,6 @@ defmodule Cairn.TrackerTest do
 
       {_t, _tagged, events} = feed(t, [{27_000, moved}, {28_000, moved}])
       assert [{:updated, %Track{stationary: true, stationary_ms: 7_000}}] = events
-    end
-
-    test "a backwards media-time jump while stationary accrues nothing" do
-      box = [0.0, 0.0, 1.0, 1.0]
-
-      {t, _, _} = feed(Tracker.new(), for(n <- 0..11, do: {n * 1_000, box}))
-      {t, _, events} = feed(t, [{9_000, box}])
-
-      assert [{:updated, %Track{stationary: true, stationary_ms: 1_000}}] = events
-      assert [%Track{stationary_ms: 1_000}] = Tracker.live_tracks(t)
     end
 
     test "stillness is measured on every axis: y and height jitter, then a move in y" do
@@ -636,7 +618,7 @@ defmodule Cairn.TrackerTest do
           bbox = if rem(n, 2) == 0, do: box, else: jitter
 
           {tracker, [_tagged], events} =
-            track(tracker, [det("person", bbox)], media_ms: n * 1_000, observed_at: at(n * 1_000))
+            track(tracker, [det("person", bbox)], at_ms: n * 1_000, observed_at: at(n * 1_000))
 
           {tracker, seen ++ events}
         end)
@@ -718,7 +700,7 @@ defmodule Cairn.TrackerTest do
       assert [%Track{stationary: true, stationary_since: since}] = Tracker.live_tracks(t)
       assert since == at(10_000)
 
-      # `stationary_ms` counts the media time the flag was set, and it was set
+      # `stationary_ms` counts the time the flag was set, and it was set
       # throughout: 10_000 to 14_000 with nothing skipped over the excursion.
       assert [%Track{stationary_ms: 4_000}] = Tracker.live_tracks(t)
     end
@@ -844,7 +826,7 @@ defmodule Cairn.TrackerTest do
 
       # Predicted boxes across a stretch far longer than @stationary_exit_ms.
       # They do not evaluate stillness, so they neither complete the window nor
-      # clear it: media time passing with nothing to judge is not evidence the
+      # clear it: time passing with nothing to judge is not evidence the
       # car left, and a gap that goes on is ended by the unseen bound.
       {t, events} =
         feed_all(t, for(n <- 1..5, do: {11_500 + n * 500, @small_car_jitter, "tracked"}))
@@ -862,19 +844,19 @@ defmodule Cairn.TrackerTest do
 
   describe "stationary grace" do
     # @max_unseen is 3_000 and the tracker's @stationary_unseen_factor is 5, so
-    # a stationary track's unseen bound is 15_000 of media time. `parked/1`
-    # leaves `last_seen_ms` at 10_000, so the grace runs from 13_000 (past the
-    # plain bound) to 25_000 (the extended one) of media time.
+    # a stationary track's unseen bound is 15_000. `parked/1` leaves
+    # `last_seen_ms` at 10_000, so the grace runs from 13_000 (past the plain
+    # bound) to 25_000 (the extended one).
     test "a stationary track keeps its ULID across an occlusion past max_unseen_ms" do
       box = [0.0, 0.0, 0.4, 0.4]
       {t, id} = parked(box)
 
       # 4_000 unseen: a moving track would already be gone
-      {t, [], events} = track(t, [], media_ms: 14_000)
+      {t, [], events} = track(t, [], at_ms: 14_000)
       assert events == []
 
       {t, [tagged], events} =
-        track(t, [det("person", box)], media_ms: 15_000, observed_at: at(15_000))
+        track(t, [det("person", box)], at_ms: 15_000, observed_at: at(15_000))
 
       assert tagged.object_id == id
       # the whole event list: no second `:started`, no `:ended` before it
@@ -899,7 +881,7 @@ defmodule Cairn.TrackerTest do
       # 4_000 unseen: inside the grace, so the parked track is a candidate and
       # this box is the one thing overlapping it
       {t, [tagged], events} =
-        track(t, [det("person", passer)], media_ms: 14_000, observed_at: at(14_000))
+        track(t, [det("person", passer)], at_ms: 14_000, observed_at: at(14_000))
 
       assert [{:started, %Track{object_id: passer_id}}] = events
       assert tagged.object_id == passer_id
@@ -909,7 +891,7 @@ defmodule Cairn.TrackerTest do
       # and the identity was held, not merely withheld: the parked object is
       # still itself when it is detected again at 5_000 unseen
       {_t, [redetected], events} =
-        track(t, [det("person", box)], media_ms: 15_000, observed_at: at(15_000))
+        track(t, [det("person", box)], at_ms: 15_000, observed_at: at(15_000))
 
       assert redetected.object_id == id
       assert ids(events, :started) == []
@@ -930,7 +912,7 @@ defmodule Cairn.TrackerTest do
 
       # 1_000 unseen, well inside max_unseen_ms: not in grace
       {t, [tagged], events} =
-        track(t, [det("person", jitter)], media_ms: 11_000, observed_at: at(11_000))
+        track(t, [det("person", jitter)], at_ms: 11_000, observed_at: at(11_000))
 
       assert tagged.object_id == id
       assert ids(events, :started) == []
@@ -953,7 +935,7 @@ defmodule Cairn.TrackerTest do
       # 10_000 + 3_000: unseen is exactly max_unseen_ms, so this is still
       # normal tracking and the base threshold matches
       {seen, [tagged], events} =
-        track(t, [det("person", jitter)], media_ms: 13_000, observed_at: at(13_000))
+        track(t, [det("person", jitter)], at_ms: 13_000, observed_at: at(13_000))
 
       assert tagged.object_id == id
       assert [{:updated, %Track{object_id: ^id}}] = events
@@ -962,7 +944,7 @@ defmodule Cairn.TrackerTest do
       # one millisecond later, from the same parked tracker: in grace, so the
       # same box is refused and gets an identity of its own
       {refused, [tagged], events} =
-        track(t, [det("person", jitter)], media_ms: 13_001, observed_at: at(13_001))
+        track(t, [det("person", jitter)], at_ms: 13_001, observed_at: at(13_001))
 
       assert [{:started, %Track{object_id: other}}] = events
       assert tagged.object_id == other
@@ -984,7 +966,7 @@ defmodule Cairn.TrackerTest do
 
       # 10_000 unseen: over three times max_unseen_ms, inside the 15_000 grace
       {t, [tagged], events} =
-        track(t, [det("person", offset)], media_ms: 20_000, observed_at: at(20_000))
+        track(t, [det("person", offset)], at_ms: 20_000, observed_at: at(20_000))
 
       assert tagged.object_id == id
       assert [{:updated, %Track{object_id: ^id}}] = events
@@ -996,51 +978,196 @@ defmodule Cairn.TrackerTest do
       {t, id} = parked(box)
 
       # a second track, elsewhere in the frame and never stationary, last seen
-      # at the same 10_000 of media time
+      # at the same 10_000
       {t, [mover], _} =
-        track(t, [det("person", [0.6, 0.6, 0.2, 0.2])], media_ms: 10_000, observed_at: at(10_000))
+        track(t, [det("person", [0.6, 0.6, 0.2, 0.2])], at_ms: 10_000, observed_at: at(10_000))
 
       refute mover.object_id == id
 
       # 3_100 unseen: past max_unseen_ms (3_000) for the mover, and 3_100 of
       # the parked track's 15_000 (5 x 3_000)
-      {t, [], events} = track(t, [], media_ms: 13_100)
+      {t, [], events} = track(t, [], at_ms: 13_100)
       assert [{:ended, %Track{object_id: gone, end_reason: :unseen}}] = events
       assert gone == mover.object_id
       assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
 
       # exactly at the extended bound (10_000 + 15_000): still live
-      {t, [], []} = track(t, [], media_ms: 25_000)
+      {t, [], []} = track(t, [], at_ms: 25_000)
       assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
 
-      {t, [], events} = track(t, [], media_ms: 25_100)
+      {t, [], events} = track(t, [], at_ms: 25_100)
+      assert [{:ended, %Track{object_id: ^id, end_reason: :unseen} = final}] = events
+      assert_self_contained(final)
+      assert Tracker.live_tracks(t) == []
+    end
+  end
+
+  # The stream the old host-clock backstop existed for, now that there is one
+  # clock and the protection lives in `Cairn.ObservationClock`: `media_ms`
+  # frozen while host time runs on. These drive the real ingestion clock rather
+  # than handing `ctx/1` an `at_ms`, because what is under test is the pair —
+  # a clamp that keeps moving and a tracker that expires on what it moves.
+  describe "a stalled pts" do
+    # Under a stall the anchored value stands still, so the floor is the only
+    # thing left advancing `at_ms`: one millisecond per *observation*, whatever
+    # the host clock says. Every bound below is therefore counted in
+    # observations, which is why this block scales the policy down — at the
+    # file's own @max_unseen a stalled stream needs 150_000 of them to reach the
+    # far side of the extended grace.
+    @stalled_unseen 30
+    @stalled_after 100
+    # Anything: the point is that it never changes.
+    @frozen_pts 5_000.0
+
+    defp stalled_ctx(at_ms, opts) do
+      opts
+      |> Keyword.merge(
+        at_ms: at_ms,
+        max_unseen_ms: @stalled_unseen,
+        stationary_after_ms: @stalled_after
+      )
+      |> ctx()
+    end
+
+    # A second of host time per observation.
+    @host_step_ms 1_000
+
+    # The ingestion state of a stalled stream: the clock, and the host instant
+    # the next observation is stamped at. Host time is *driven* rather than read
+    # — `stamp/3` takes `now_ms` — so "a second of host time after the last" is
+    # a property of the test rather than of how fast the loop happens to run.
+    defp stalled_ingest, do: {ObservationClock.new(), 0}
+
+    # `count` observations of a stream whose pts never advances, each stamped
+    # @host_step_ms of host time after the last, so nothing here is standing
+    # still except the pts. Returns the last batch's `track/3` result beside the
+    # ingestion state, to feed the next stretch.
+    defp stall(tracker, ingest, objects, count, opts \\ []) do
+      Enum.reduce(1..count, {tracker, ingest, [], []}, fn _n,
+                                                          {tracker, {clock, now_ms}, _tagged,
+                                                           _events} ->
+        {observation, clock} =
+          ObservationClock.stamp(
+            clock,
+            %Observation{epoch: "epoch_one", media_ms: @frozen_pts},
+            now_ms
+          )
+
+        {tracker, tagged, events} =
+          Tracker.track(tracker, objects, stalled_ctx(observation.at_ms, opts))
+
+        {tracker, {clock, now_ms + @host_step_ms}, tagged, events}
+      end)
+    end
+
+    test "expires a stationary track at the extended bound, and a moving one at the plain one" do
+      parked_box = [0.0, 0.0, 0.4, 0.4]
+      mover_box = [0.6, 0.6, 0.2, 0.2]
+
+      # @stalled_after + 1 observations of the same box: the last one is
+      # exactly `stationary_after_ms` past the anchor
+      {t, ingest, [tagged], _events} =
+        stall(Tracker.new(), stalled_ingest(), [det("person", parked_box)], 101)
+
+      id = tagged.object_id
+      assert [%Track{object_id: ^id, stationary: true}] = Tracker.live_tracks(t)
+
+      # one batch that also carries a mover, which has moved by definition —
+      # it is seen once and never again, so it never settles
+      {t, ingest, tagged, _events} =
+        stall(t, ingest, [det("person", parked_box), det("person", mover_box)], 1)
+
+      assert [_parked, %{object_id: mover_id}] = tagged
+      refute mover_id == id
+
+      # nothing is detected from here on, so only the clamp is moving the clock.
+      # @stalled_unseen + 1 observations later the mover is unseen past the
+      # plain bound; the parked one is a fifth of the way through its grace
+      {t, ingest, [], events} = stall(t, ingest, [], 31)
+      assert [{:ended, %Track{object_id: ^mover_id, end_reason: :unseen}}] = events
+      assert [%Track{object_id: ^id, stationary: true}] = Tracker.live_tracks(t)
+
+      # 5 x @stalled_unseen from the parked track's last detection, to the
+      # observation: the last one at which it is alive
+      {t, ingest, [], []} = stall(t, ingest, [], 119)
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+
+      {t, _ingest, [], events} = stall(t, ingest, [], 1)
       assert [{:ended, %Track{object_id: ^id, end_reason: :unseen} = final}] = events
       assert_self_contained(final)
       assert Tracker.live_tracks(t) == []
     end
 
-    # The media-time rule and the host-clock backstop are one boolean; a
-    # backstop left on the plain bound would retire this track at 10 x 3_000 of
-    # host time whatever its media-time grace said — and a frozen pts is
-    # precisely when the media-time side never expires anything.
-    test "the host-clock backstop scales with the grace too" do
+    test "a pts that restarts mid-epoch neither rewinds the clock nor expires the scene" do
       box = [0.0, 0.0, 0.4, 0.4]
-      {t, id} = parked(box)
+      clock = ObservationClock.new()
 
-      # pts frozen at 10_000 from here on: only host time moves. 60_001 is past
-      # the 10 x max_unseen_ms that expires a plain track (see "a frozen media
-      # clock cannot pin a track alive")
-      {t, [], []} = track(t, [], media_ms: 10_000, now_ms: 60_001)
+      {first, clock} =
+        ObservationClock.stamp(
+          clock,
+          %Observation{epoch: "epoch_one", media_ms: 900_000.0},
+          System.monotonic_time(:millisecond)
+        )
+
+      # the pts restarts near zero, which is what a plugin's own respawn looks
+      # like from here: fifteen minutes backwards inside one epoch
+      {restarted, _clock} =
+        ObservationClock.stamp(
+          clock,
+          %Observation{epoch: "epoch_one", media_ms: 0.0},
+          System.monotonic_time(:millisecond)
+        )
+
+      assert restarted.at_ms > first.at_ms
+
+      {t, [a], _} =
+        Tracker.track(Tracker.new(), [det("person", box)], stalled_ctx(first.at_ms, []))
+
+      {t, [b], events} =
+        Tracker.track(t, [det("person", box)], stalled_ctx(restarted.at_ms, []))
+
+      # the whole event list, so "nothing ended" cannot be satisfied by a
+      # tracker that emitted nothing at all
+      assert [{:updated, %Track{object_id: updated}}] = events
+      assert updated == a.object_id
+      assert b.object_id == a.object_id
+      assert [%Track{stationary_ms: 0}] = Tracker.live_tracks(t)
+    end
+
+    test "a restart after a long stall resumes tracking time rather than jumping to the host" do
+      box = [0.0, 0.0, 0.4, 0.4]
+
+      # A stretch of frozen pts: the floor moves `at_ms` by one millisecond an
+      # observation while the host moves by a second, so the two are ninety-odd
+      # *seconds* apart by the end. That difference is the lag, and it is what a
+      # re-anchor at `now_ms` would hand the very next observation in one step.
+      # Short of @stalled_after, so the box below is still a moving track and
+      # gets the plain bound rather than the grace.
+      {t, {clock, now_ms}, [tagged], _events} =
+        stall(Tracker.new(), stalled_ingest(), [det("person", box)], 99)
+
+      id = tagged.object_id
+      lag = now_ms - clock.at_ms
+      assert lag > 3_000
+
+      # the pts restarts inside the same epoch — the plugin's own ffmpeg
+      # respawning under an epoch nothing cut
+      {restarted, _clock} =
+        ObservationClock.stamp(clock, %Observation{epoch: "epoch_one", media_ms: 0.0}, now_ms)
+
+      # continuity, not `now_ms`: exactly one floor step past where tracking
+      # time already was
+      assert restarted.at_ms == clock.at_ms + 1
+
+      {t, [b], events} = Tracker.track(t, [det("person", box)], stalled_ctx(restarted.at_ms, []))
+
+      # the whole event list, so "nothing expired" cannot be satisfied by a
+      # tracker that emitted nothing at all. Anchored at `now_ms` this track is
+      # `lag` milliseconds unseen at a bound of @stalled_unseen, so every live
+      # track in the scene would end `:unseen` here and be re-minted below
+      assert [{:updated, %Track{object_id: ^id}}] = events
+      assert b.object_id == id
       assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
-
-      # 10 x (5 x 3_000) of host time: the last moment it is alive
-      {t, [], []} = track(t, [], media_ms: 10_000, now_ms: 150_000)
-      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
-
-      {t, [], ended} = track(t, [], media_ms: 10_000, now_ms: 150_001)
-      assert [{:ended, %Track{object_id: ^id, end_reason: :unseen} = final}] = ended
-      assert_self_contained(final)
-      assert Tracker.live_tracks(t) == []
     end
   end
 
@@ -1060,7 +1187,7 @@ defmodule Cairn.TrackerTest do
 
       {t, tagged, events} =
         track(t, [det("car", @car_drift, score: 0.95)],
-          media_ms: 14_000,
+          at_ms: 14_000,
           observed_at: at(14_000)
         )
 
@@ -1080,13 +1207,13 @@ defmodule Cairn.TrackerTest do
       assert still.best_score == 0.9
       assert still.stale_predicted
 
-      # and the media clock really moved: 25_100 is past the extended bound
+      # and the clock really moved: 25_100 is past the extended bound
       # measured from the parked track's last *match* (10_000 + 15_000) and
       # inside it measured from the refusal (14_000 + 15_000)
-      {t, [], []} = track(t, [], media_ms: 25_100)
+      {t, [], []} = track(t, [], at_ms: 25_100)
       assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
 
-      {t, [], ended} = track(t, [], media_ms: 29_100)
+      {t, [], ended} = track(t, [], at_ms: 29_100)
       assert [{:ended, %Track{object_id: ^id, end_reason: :unseen} = final}] = ended
       assert_self_contained(final)
       assert Tracker.live_tracks(t) == []
@@ -1098,7 +1225,7 @@ defmodule Cairn.TrackerTest do
       {t, id} = parked(@parked_car, "car")
 
       {t, tagged, events} =
-        track(t, [det("car", @car_fragment)], media_ms: 14_000, observed_at: at(14_000))
+        track(t, [det("car", @car_fragment)], at_ms: 14_000, observed_at: at(14_000))
 
       assert tagged == []
       assert events == []
@@ -1111,7 +1238,7 @@ defmodule Cairn.TrackerTest do
       {t, id} = parked(@parked_car, "car")
 
       {t, [tagged], events} =
-        track(t, [det("car", @car_neighbour)], media_ms: 14_000, observed_at: at(14_000))
+        track(t, [det("car", @car_neighbour)], at_ms: 14_000, observed_at: at(14_000))
 
       assert [{:started, %Track{object_id: other}}] = events
       refute other == id
@@ -1132,7 +1259,7 @@ defmodule Cairn.TrackerTest do
       {t, id} = parked(@parked_car, "car")
 
       {t, [tagged], events} =
-        track(t, [det("person", @car_drift)], media_ms: 14_000, observed_at: at(14_000))
+        track(t, [det("person", @car_drift)], at_ms: 14_000, observed_at: at(14_000))
 
       assert [{:started, %Track{object_id: other, label: "person"}}] = events
       refute other == id
@@ -1159,7 +1286,7 @@ defmodule Cairn.TrackerTest do
       # the track takes the first box at the base @iou_threshold
       {t, tagged, events} =
         track(t, [det("car", @parked_car), det("car", @car_double, score: 0.95)],
-          media_ms: 11_000,
+          at_ms: 11_000,
           observed_at: at(11_000)
         )
 
@@ -1177,7 +1304,7 @@ defmodule Cairn.TrackerTest do
 
       {t, _tagged, _events} =
         track(t, [det("car", @parked_car, score: 0.6), det("car", @car_double, score: 0.95)],
-          media_ms: 11_000,
+          at_ms: 11_000,
           observed_at: at(11_000)
         )
 
@@ -1211,7 +1338,7 @@ defmodule Cairn.TrackerTest do
       {t, id} = parked(box, "car")
 
       {_t, tagged, events} =
-        track(t, [det("car", exactly)], media_ms: 14_000, observed_at: at(14_000))
+        track(t, [det("car", exactly)], at_ms: 14_000, observed_at: at(14_000))
 
       assert tagged == []
       assert events == []
@@ -1219,7 +1346,7 @@ defmodule Cairn.TrackerTest do
       # the same tracker, one pixel of width less: below the threshold, so it
       # is a new object again
       {_t, [tagged], events} =
-        track(t, [det("car", under)], media_ms: 14_000, observed_at: at(14_000))
+        track(t, [det("car", under)], at_ms: 14_000, observed_at: at(14_000))
 
       assert [{:started, %Track{object_id: other}}] = events
       refute other == id
@@ -1236,7 +1363,7 @@ defmodule Cairn.TrackerTest do
       # and come back a little off, at a score nothing would filter out
       {t, [], []} =
         track(t, [det("car", @car_drift, score: 0.7)],
-          media_ms: 14_000,
+          at_ms: 14_000,
           observed_at: at(14_000)
         )
 
@@ -1245,7 +1372,7 @@ defmodule Cairn.TrackerTest do
       {t, seen_ids, started} =
         Enum.reduce(15_000..20_000//1_000, {t, [], []}, fn ms, {t, seen_ids, started} ->
           {t, [tagged], events} =
-            track(t, [det("car", @car_drift, score: 0.7)], media_ms: ms, observed_at: at(ms))
+            track(t, [det("car", @car_drift, score: 0.7)], at_ms: ms, observed_at: at(ms))
 
           {t, [tagged.object_id | seen_ids], started ++ ids(events, :started)}
         end)
@@ -1256,14 +1383,14 @@ defmodule Cairn.TrackerTest do
       assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
     end
 
-    # A refusal every 4_000 of media time is refused every time: each mark
-    # leaves the next batch 4_000 unseen, back inside the grace.
+    # A refusal every 4_000 is refused every time: each mark leaves the next
+    # batch 4_000 unseen, back inside the grace.
     test "repeated refusals mint nothing and leave the stillness window untouched" do
       {t, id} = parked(@parked_car, "car")
 
       t =
         Enum.reduce([14_000, 18_000, 22_000, 26_000, 30_000], t, fn ms, t ->
-          {t, [], []} = track(t, [det("car", @car_drift)], media_ms: ms, observed_at: at(ms))
+          {t, [], []} = track(t, [det("car", @car_drift)], at_ms: ms, observed_at: at(ms))
           assert [%Track{object_id: ^id, bbox: @parked_car}] = Tracker.live_tracks(t)
           t
         end)
@@ -1273,7 +1400,7 @@ defmodule Cairn.TrackerTest do
       # is the parked box — which is only true if none of the five refusals
       # went into `recent_boxes`, and if the anchor is still the parked box
       {_t, [tagged], events} =
-        track(t, [det("car", @car_drift)], media_ms: 31_000, observed_at: at(31_000))
+        track(t, [det("car", @car_drift)], at_ms: 31_000, observed_at: at(31_000))
 
       assert tagged.object_id == id
       assert [{:updated, %Track{object_id: ^id, stationary: true, bbox: @car_drift}}] = events
@@ -1291,7 +1418,7 @@ defmodule Cairn.TrackerTest do
 
       {t, [a2, b], events} =
         track(t, [det("car", @walker), det("person", @walker_step)],
-          media_ms: 200,
+          at_ms: 200,
           observed_at: at(200)
         )
 
@@ -1313,7 +1440,7 @@ defmodule Cairn.TrackerTest do
       {t, [a], _} = track(Tracker.new(), [det("person", @walker)])
 
       {t, [b], events} =
-        track(t, [det("person", @walker_step)], media_ms: 200, observed_at: at(200))
+        track(t, [det("person", @walker_step)], at_ms: 200, observed_at: at(200))
 
       id = a.object_id
       assert b.object_id == id
@@ -1346,7 +1473,7 @@ defmodule Cairn.TrackerTest do
         Enum.reduce(0..10, {Tracker.new(), nil}, fn n, {t, ids} ->
           {t, tagged, _} =
             track(t, [det("car", @parked_car), det("car", nearer)],
-              media_ms: n * 1_000,
+              at_ms: n * 1_000,
               observed_at: at(n * 1_000)
             )
 
@@ -1357,7 +1484,7 @@ defmodule Cairn.TrackerTest do
       assert [%Track{stationary: true}, %Track{stationary: true}] = Tracker.live_tracks(t)
 
       {t, tagged, events} =
-        track(t, [det("car", @car_drift)], media_ms: 14_000, observed_at: at(14_000))
+        track(t, [det("car", @car_drift)], at_ms: 14_000, observed_at: at(14_000))
 
       assert tagged == []
       assert events == []
@@ -1367,7 +1494,7 @@ defmodule Cairn.TrackerTest do
       assert seen_at[far_id] == at(10_000)
 
       # so the one the box did not vouch for still expires on its own clock
-      {t, [], ended} = track(t, [], media_ms: 25_100)
+      {t, [], ended} = track(t, [], at_ms: 25_100)
       assert [{:ended, %Track{object_id: ^far_id, end_reason: :unseen}}] = ended
       assert [%Track{object_id: ^near_id}] = Tracker.live_tracks(t)
     end
@@ -1391,48 +1518,52 @@ defmodule Cairn.TrackerTest do
         Enum.reduce(0..10, {Tracker.new(), nil}, fn n, {t, ids} ->
           {t, tagged, _} =
             track(t, [det("car", left), det("car", right)],
-              media_ms: n * 1_000,
+              at_ms: n * 1_000,
               observed_at: at(n * 1_000)
             )
 
           {t, ids || Enum.map(tagged, & &1.object_id)}
         end)
 
-      {t, [], []} = track(t, [det("car", drift)], media_ms: 14_000, observed_at: at(14_000))
+      {t, [], []} = track(t, [det("car", drift)], at_ms: 14_000, observed_at: at(14_000))
 
       seen_at = Map.new(Tracker.live_tracks(t), &{&1.object_id, &1.last_seen_at})
       assert seen_at[Enum.min(ids)] == at(14_000)
       assert seen_at[Enum.max(ids)] == at(10_000)
     end
 
-    # `seen/3` deliberately leaves `last_seen_host_ms` alone, so the backstop
+    # `seen/3` deliberately leaves `last_matched_ms` alone, so the refusal bound
     # keeps counting from the last *adopted* observation. Without that, a
     # detection the tracker refuses every batch would hold a track alive for
-    # ever — the one case where the media clock cannot bound it, because the
-    # refusals themselves keep moving it.
-    test "refusals cannot hold a track alive past the host-clock backstop" do
+    # ever — the one case the unseen rule cannot bound, because the refusals
+    # themselves keep moving the clock it reads.
+    #
+    # The bound is scaled by the same `unseen_bound/2` the unseen rule is, and
+    # this is where that matters: on the plain bound it would end this parked
+    # track at 10 x 3_000 from its last match, thirteen seconds after the first
+    # refusal below rather than well past the second.
+    test "refusals cannot hold a track alive past the refusal bound" do
       {t, id} = parked(@parked_car, "car")
 
-      # 10 x the extended bound (10 x 5 x 3_000) of host time since the parked
-      # track's last match, which `parked/2` leaves at host 0: the last moment
-      # it is alive
-      {t, [], []} =
-        track(t, [det("car", @car_drift)],
-          media_ms: 14_000,
-          observed_at: at(14_000),
-          now_ms: 150_000
-        )
-
+      # Every batch here is more than @max_unseen (3_000) after the one before
+      # it, which is the regime the loop needs and the only one it exists in: a
+      # refusal marks the track seen, so a batch any sooner would find it out of
+      # its grace and match the same box at @iou_threshold. Each of these finds
+      # it back in the grace, refuses, and marks it seen again.
+      {t, [], []} = track(t, [det("car", @car_drift)], at_ms: 14_000)
       assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
 
-      # one host millisecond later, with the media clock refreshed by this
-      # batch's refusal too — so only the backstop can be what ends it
-      {t, tagged, ended} =
-        track(t, [det("car", @car_drift)],
-          media_ms: 18_000,
-          observed_at: at(18_000),
-          now_ms: 150_001
-        )
+      {t, [], []} = track(t, [det("car", @car_drift)], at_ms: 156_999)
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+
+      # 10 x the extended bound (10 x 5 x 3_000) since the parked track's last
+      # match at 10_000: the last moment it is alive
+      {t, [], []} = track(t, [det("car", @car_drift)], at_ms: 160_000)
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+
+      # past it, with this batch's refusal having refreshed `last_seen_ms` too
+      # — so only the refusal bound can be what ends it
+      {t, tagged, ended} = track(t, [det("car", @car_drift)], at_ms: 163_001)
 
       assert tagged == []
       assert [{:ended, %Track{object_id: ^id, end_reason: :unseen} = final}] = ended
@@ -1441,12 +1572,7 @@ defmodule Cairn.TrackerTest do
 
       # and the object is tracked again on the next batch: the identity the
       # refusals were protecting is gone, so nothing refuses this one
-      {_t, [tagged], events} =
-        track(t, [det("car", @car_drift)],
-          media_ms: 19_000,
-          observed_at: at(19_000),
-          now_ms: 150_002
-        )
+      {_t, [tagged], events} = track(t, [det("car", @car_drift)], at_ms: 164_000)
 
       assert [{:started, %Track{object_id: fresh}}] = events
       refute fresh == id
@@ -1455,26 +1581,6 @@ defmodule Cairn.TrackerTest do
   end
 
   describe "bounded live set" do
-    # `media_ms` is the plugin's own pts. A plugin that never advances it holds
-    # the clock that expires its tracks, so the host clock has to be able to
-    # retire one on its own.
-    test "a frozen media clock cannot pin a track alive: the host clock expires it" do
-      {t, [a], _} = track(Tracker.new(), [det("person", [0.1, 0.1, 0.2, 0.4])], now_ms: 0)
-
-      # same pts, 30s of host time later: well inside the backstop, still live
-      {t, [_], events} = track(t, [det("person", [0.1, 0.1, 0.2, 0.4])], now_ms: 30_000)
-      assert [{:updated, %Track{}}] = events
-      assert [%Track{}] = Tracker.live_tracks(t)
-
-      # 10 x max_unseen_ms of host time with media time standing still
-      {t, [], ended} = track(t, [], now_ms: 60_001)
-
-      assert [{:ended, %Track{object_id: id, end_reason: :unseen} = final}] = ended
-      assert id == a.object_id
-      assert_self_contained(final)
-      assert Tracker.live_tracks(t) == []
-    end
-
     test "at the live-track cap the least recently seen track is evicted with a final" do
       capped = fn opts -> Keyword.put(opts, :max_live_tracks, 2) end
 
@@ -1485,14 +1591,14 @@ defmodule Cairn.TrackerTest do
       third = [0.9, 0.9, 0.05, 0.05]
 
       {t, [a], _} = track(Tracker.new(), [det("person", first)], capped.([]))
-      {t, [b], _} = track(t, [det("person", second)], capped.(media_ms: 100))
+      {t, [b], _} = track(t, [det("person", second)], capped.(at_ms: 100))
 
       # only the second box is re-detected, so the first is the least recently
       # seen of the two
-      {t, _, _} = track(t, [det("person", second)], capped.(media_ms: 200))
+      {t, _, _} = track(t, [det("person", second)], capped.(at_ms: 200))
 
       {{t, [c], events}, log} =
-        with_log(fn -> track(t, [det("person", third)], capped.(media_ms: 300)) end)
+        with_log(fn -> track(t, [det("person", third)], capped.(at_ms: 300)) end)
 
       assert log =~ "live-track cap"
 
@@ -1512,7 +1618,7 @@ defmodule Cairn.TrackerTest do
     refute a.object_id == b.object_id
 
     # both candidates overlap perfectly; only the total sort key separates them
-    {_t, [c], _} = track(t, [det("person", same)], media_ms: 200)
+    {_t, [c], _} = track(t, [det("person", same)], at_ms: 200)
     assert c.object_id == Enum.min([a.object_id, b.object_id])
   end
 
@@ -1529,25 +1635,22 @@ defmodule Cairn.TrackerTest do
       assert Tracker.live_tracks(fresh) == []
 
       # nothing matches across the cut
-      {_t, [a], _} = track(fresh, [det("person", [0.1, 0.1, 0.2, 0.4])], media_ms: 200)
+      {_t, [a], _} = track(fresh, [det("person", [0.1, 0.1, 0.2, 0.4])], at_ms: 200)
       refute a.object_id in Enum.map(tagged, & &1.object_id)
     end
   end
 
   describe "suspension and adoption" do
-    # `parked/1` leaves a stationary track last detected at media 10_000 and at
-    # wall `at(10_000)`, which is the instant every gap below is measured from.
+    # `parked/1` leaves a stationary track last seen at 10_000 on the
+    # observation clock, which is the instant every gap below is measured from.
     # Every `suspend/3` here is handed that same instant as the cut — a stream
-    # cut while it was still producing — so the two clocks the module keeps
-    # apart coincide. A test that needs them apart passes a later cut and says
-    # in its name which of the two it is about.
+    # cut while the stream was still producing — so the track's own absence and
+    # the waiting since the cut coincide. A test that needs the two apart
+    # passes a later cut and says in its name which of them it is about.
     #
-    # The new epoch's media clock is deliberately set *ahead* of the old one's
-    # in these tests. Media time is per-stream and the tracker treats it as
-    # opaque, but only that direction exposes a clock the reset failed to
-    # re-base: an old-epoch instant left behind by a pts that restarted near
-    # zero yields a negative elapsed time, which every rule here already floors
-    # at zero, so the bug would pass unseen.
+    # The new epoch's batches carry on from that same clock, because it is the
+    # host's and not either stream's pts: an epoch boundary is a gap nothing
+    # observed, not a discontinuity in the numbers.
     @box [0.0, 0.0, 0.4, 0.4]
     # IoU 1/3 with @box — the two-objects-side-by-side case, under
     # `@adoption_match_iou` (0.4), so it is nobody's identity
@@ -1594,7 +1697,7 @@ defmodule Cairn.TrackerTest do
 
     test "a stream reset suspends the live host tracks instead of ending them" do
       {t, id} = parked(@box)
-      {t, events, info} = Tracker.suspend(t, 128, at(10_000))
+      {t, events, info} = Tracker.suspend(t, 128, 10_000)
 
       # nothing ended, so nothing downstream is told anything
       assert events == []
@@ -1615,13 +1718,12 @@ defmodule Cairn.TrackerTest do
       assert Tracker.iou(@box, @shift_2) > 0.1
 
       {t, id} = parked(@box)
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       {t, [tagged], events} =
         track(t, [det("person", @shift_2)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(10_500)
+          at_ms: 10_500
         )
 
       assert [{:started, %Track{object_id: other}}] = events
@@ -1638,15 +1740,14 @@ defmodule Cairn.TrackerTest do
     # candidate list is read after the adoption rather than before it.
     test "a second box of a just-adopted object in the same batch is suppressed" do
       {t, id} = parked(@parked_car, "car")
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       # 300 ms of outage, so both boxes clear `@adoption_match_iou`; the exact
       # one wins the suspension and the 0.783 one is left with nothing to adopt
       {t, tagged, events} =
         track(t, [det("car", @parked_car), det("car", @car_double)],
           epoch: "epoch_two",
-          media_ms: 22_000,
-          observed_at: at(10_300)
+          at_ms: 10_300
         )
 
       assert [%{object_id: ^id, bbox: @parked_car}] = tagged
@@ -1657,14 +1758,13 @@ defmodule Cairn.TrackerTest do
 
     test "a short gap resumes a parked track's identity, its stillness and its clocks" do
       {t, id} = parked(@box)
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       # 300 ms of outage, and a worse-scoring detection than the track's best
       {t, [tagged], events} =
         track(t, [det("person", @box, score: 0.4)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(10_300)
+          at_ms: 10_300
         )
 
       assert tagged.object_id == id
@@ -1683,50 +1783,46 @@ defmodule Cairn.TrackerTest do
       assert adopted.stationary
       assert adopted.stationary_since == at(10_000)
       # the settle window is not re-armed and the gap is not stillness anyone
-      # saw: `stationary_ms` counts media time this tracker actually watched it
+      # saw: `stationary_ms` counts the time this tracker actually watched it
       # hold still, and it has watched none of the new epoch yet
       assert adopted.stationary_ms == 0
 
-      # a second of the new epoch's media clock accrues a second, which is only
-      # true if the adoption re-based `last_detected_ms`: left on the old
-      # epoch's 10_000 this batch would have booked the 2_000 ms between two
-      # streams' clocks as time spent parked
+      # a second past the adoption accrues a second, which is only true if the
+      # adoption moved `last_detected_ms` to the adopting batch: left at 10_000
+      # this batch would have booked the whole outage as time spent parked
       {t, [_tagged], _events} =
         track(t, [det("person", @box)],
           epoch: "epoch_two",
-          media_ms: 13_000,
-          observed_at: at(11_300)
+          at_ms: 11_300
         )
 
       assert [%Track{object_id: ^id, stationary: true, stationary_ms: 1_000}] =
                Tracker.live_tracks(t)
     end
 
-    test "an adopted track that was not stationary settles on the new epoch's clock" do
+    test "an adopted track that was not stationary settles from the adoption" do
       held = [0.0, 0.0, 0.1, 0.3]
-      # moves once, then holds — anchored at `held` as of media 1_000, and
-      # nowhere near `stationary_after_ms` (10_000) of stillness by media 3_000
+      # moves once, then holds — anchored at `held` as of 1_000, and nowhere
+      # near `stationary_after_ms` (10_000) of stillness by 3_000
       {t, id} = moving([[0.0, 0.2, 0.1, 0.3], held, held, held])
-      {t, [], info} = Tracker.suspend(t, 128, at(3_000))
+      {t, [], info} = Tracker.suspend(t, 128, 3_000)
       assert info.at == at(3_000)
 
       {t, [tagged], _events} =
         track(t, [det("person", held)],
           epoch: "epoch_two",
-          media_ms: 13_000,
-          observed_at: at(4_000)
+          at_ms: 4_000
         )
 
       assert tagged.object_id == id
-      # the anchor's clock came with it: on the old epoch's 1_000 this box
-      # would have read as 12_000 ms of stillness and flipped here
+      # the anchor took the adopting batch's clock: left at 1_000 the outage
+      # itself would have read as 3_000 ms of stillness towards the settle
       assert [%Track{stationary: false}] = Tracker.live_tracks(t)
 
       {t, [_], events} =
         track(t, [det("person", held)],
           epoch: "epoch_two",
-          media_ms: 22_999,
-          observed_at: at(13_999)
+          at_ms: 13_999
         )
 
       assert ids(events, :became_stationary) == []
@@ -1734,8 +1830,7 @@ defmodule Cairn.TrackerTest do
       {_t, [_], events} =
         track(t, [det("person", held)],
           epoch: "epoch_two",
-          media_ms: 23_000,
-          observed_at: at(14_000)
+          at_ms: 14_000
         )
 
       # exactly `stationary_after_ms` after the adoption, on the new clock
@@ -1745,15 +1840,14 @@ defmodule Cairn.TrackerTest do
     test "past the short bound only a stationary track is adoptable" do
       last = [0.0, 0.0, 0.1, 0.3]
       {mover, mover_id} = moving([[0.0, 0.2, 0.1, 0.3], last])
-      {mover, [], _info} = Tracker.suspend(mover, 128, at(1_000))
+      {mover, [], _info} = Tracker.suspend(mover, 128, 1_000)
 
       # 3_001 ms of absence, one past the camera's max_unseen_ms, and a box
       # the track's own — nothing geometric refuses it, only the tier
       {mover, [tagged], events} =
         track(mover, [det("person", last)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(1_000 + 3_001)
+          at_ms: 1_000 + 3_001
         )
 
       assert [{:started, %Track{object_id: fresh}}] = events
@@ -1763,13 +1857,12 @@ defmodule Cairn.TrackerTest do
       assert [%Track{object_id: ^mover_id}] = Tracker.suspended_tracks(mover)
 
       {parked, parked_id} = parked(@box)
-      {parked, [], _info} = Tracker.suspend(parked, 128, at(10_000))
+      {parked, [], _info} = Tracker.suspend(parked, 128, 10_000)
 
       {_parked, [tagged], events} =
         track(parked, [det("person", @box)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(10_000 + 3_001)
+          at_ms: 10_000 + 3_001
         )
 
       assert tagged.object_id == parked_id
@@ -1782,15 +1875,14 @@ defmodule Cairn.TrackerTest do
       assert_in_delta Tracker.iou(@box, @shift_05), 0.778, 0.001
 
       {t, id} = parked(@box)
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       # absence of exactly max_unseen_ms is still the short tier, where 0.6 is
       # over `@adoption_match_iou`
       {_short, [tagged], _events} =
         track(t, [det("person", @shift_1)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(13_000)
+          at_ms: 13_000
         )
 
       assert tagged.object_id == id
@@ -1800,8 +1892,7 @@ defmodule Cairn.TrackerTest do
       {_long, [tagged], events} =
         track(t, [det("person", @shift_1)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(13_001)
+          at_ms: 13_001
         )
 
       assert [{:started, %Track{object_id: other}}] = events
@@ -1812,8 +1903,7 @@ defmodule Cairn.TrackerTest do
       {_long, [tagged], _events} =
         track(t, [det("person", @shift_05)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(13_001)
+          at_ms: 13_001
         )
 
       assert tagged.object_id == id
@@ -1822,8 +1912,8 @@ defmodule Cairn.TrackerTest do
     test "the tier is measured from the track's own last sighting, not from the cut" do
       {t, id} = parked(@box)
       # an empty batch: the camera is still being observed, this track is not
-      {t, [], []} = track(t, [], media_ms: 11_000, observed_at: at(11_000))
-      {t, [], info} = Tracker.suspend(t, 128, at(11_000))
+      {t, [], []} = track(t, [], at_ms: 11_000)
+      {t, [], info} = Tracker.suspend(t, 128, 11_000)
       assert info.at == at(11_000)
 
       # 2_500 ms after the cut — inside max_unseen_ms if the cut were what
@@ -1832,8 +1922,7 @@ defmodule Cairn.TrackerTest do
       {t, [tagged], events} =
         track(t, [det("person", @shift_1)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(13_500)
+          at_ms: 13_500
         )
 
       assert [{:started, %Track{object_id: other}}] = events
@@ -1844,14 +1933,13 @@ defmodule Cairn.TrackerTest do
 
     test "a suspension is adoptable up to the window and ends where it was last seen" do
       {t, id} = parked(@box)
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       # `@adoption_window_ms` (60_000) after the cut, to the millisecond
       {_adopted, [tagged], _events} =
         track(t, [det("person", @box)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(70_000)
+          at_ms: 70_000
         )
 
       assert tagged.object_id == id
@@ -1861,8 +1949,7 @@ defmodule Cairn.TrackerTest do
       {expired, [tagged], events} =
         track(t, [det("person", @box)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(70_001)
+          at_ms: 70_001
         )
 
       assert [{:ended, final}, {:started, %Track{object_id: other}}] = events
@@ -1882,37 +1969,32 @@ defmodule Cairn.TrackerTest do
       assert Tracker.suspended_tracks(expired) == []
     end
 
-    test "expire_suspended/2 ends a lapsed suspension once, and needs a clock" do
+    test "expire_suspended/2 ends a lapsed suspension once" do
       {t, id} = parked(@box)
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       # inside the window, so nothing is owed yet
-      {same, []} = Tracker.expire_suspended(t, at(70_000))
+      {same, []} = Tracker.expire_suspended(t, 70_000)
       assert [%Track{object_id: ^id}] = Tracker.suspended_tracks(same)
 
-      # no clock at all: the caller's timer is what has one
-      {unchanged, []} = Tracker.expire_suspended(t, nil)
-      assert [%Track{object_id: ^id}] = Tracker.suspended_tracks(unchanged)
-
-      {ended, [{:ended, final}]} = Tracker.expire_suspended(t, at(70_001))
+      {ended, [{:ended, final}]} = Tracker.expire_suspended(t, 70_001)
       assert final.object_id == id
       assert final.end_reason == :stream_reset
       assert final.last_seen_at == at(10_000)
 
       # once, whoever asks again and however much later
       assert Tracker.suspended_tracks(ended) == []
-      assert {^ended, []} = Tracker.expire_suspended(ended, at(999_999))
+      assert {^ended, []} = Tracker.expire_suspended(ended, 999_999)
     end
 
     test "end_all/2 ends a suspension as the reset that made it, whatever reason it is given" do
       {t, suspended_id} = parked(@box)
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       {t, [live], _events} =
         track(t, [det("cat", [0.6, 0.6, 0.2, 0.2])],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(10_100)
+          at_ms: 10_100
         )
 
       {emptied, events} = Tracker.end_all(t, :detection_disabled)
@@ -1933,47 +2015,37 @@ defmodule Cairn.TrackerTest do
     end
 
     test "the suspended set is trimmed to the cap, oldest generation first" do
-      # 100 ms apart across a month boundary, deliberately. Erlang term order
-      # over a `%DateTime{}` is its fields in key order — `day` before `month`
-      # before `year` — so on any two instants inside one month, sorting the
-      # structs directly agrees with sorting the instants, and every other
-      # fixture in this file would let that mistake through.
-      older = ~U[2026-07-31 23:59:59.900Z]
-      newer = ~U[2026-08-01 00:00:00.000Z]
+      # Two cuts 100 ms apart, each with its own generation of ghost.
+      {t, [first], _events} = track(Tracker.new(), [det("person", @box)], at_ms: 0)
 
-      {t, [first], _events} =
-        track(Tracker.new(), [det("person", @box)], media_ms: 0, observed_at: older)
-
-      {t, [], _info} = Tracker.suspend(t, 2, older)
+      {t, [], _info} = Tracker.suspend(t, 2, 0)
 
       {t, [second], _events} =
         track(t, [det("cat", [0.6, 0.6, 0.2, 0.2])],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: newer
+          at_ms: 100
         )
 
       # a camera reconnecting in a loop must not stack a generation of ghosts
       # per attempt: at a cap of one, the older suspension is the one that goes
-      {t, events, info} = Tracker.suspend(t, 1, newer)
+      {t, events, info} = Tracker.suspend(t, 1, 100)
 
       assert [{:ended, %Track{object_id: ended_id, end_reason: :stream_reset}}] = events
       assert ended_id == first.object_id
-      assert info == %{suspended: 1, ended: 1, at: newer}
+      assert info == %{suspended: 1, ended: 1, at: at(100)}
       assert [%Track{object_id: id}] = Tracker.suspended_tracks(t)
       assert id == second.object_id
     end
 
     test "a live track outranks a suspended one for the same box" do
       {t, ghost} = parked(@box)
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       # under the adoption floor, so this mints rather than adopting
       {t, [fresh], _events} =
         track(t, [det("person", @shift_2)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(10_100)
+          at_ms: 10_100
         )
 
       refute fresh.object_id == ghost
@@ -1987,8 +2059,7 @@ defmodule Cairn.TrackerTest do
       {t, [tagged], events} =
         track(t, [det("person", @shift_02)],
           epoch: "epoch_two",
-          media_ms: 12_500,
-          observed_at: at(10_600)
+          at_ms: 10_600
         )
 
       assert tagged.object_id == fresh.object_id
@@ -2001,17 +2072,16 @@ defmodule Cairn.TrackerTest do
       # parked car and, from the epoch after it, a walker that minted its own
       # identity because it was under the adoption floor from the car.
       {t, parked_id} = parked(@box)
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       {t, [walker], _events} =
         track(t, [det("person", @shift_2)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(10_100)
+          at_ms: 10_100
         )
 
       refute walker.object_id == parked_id
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_200))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_200)
       assert length(Tracker.suspended_tracks(t)) == 2
 
       # a box between the two, adoptable by *both* on the mover tier
@@ -2021,8 +2091,7 @@ defmodule Cairn.TrackerTest do
       {t, [tagged], events} =
         track(t, [det("person", @shift_05)],
           epoch: "epoch_three",
-          media_ms: 20_000,
-          observed_at: at(10_300)
+          at_ms: 10_300
         )
 
       # the better overlap takes it, and only it: one detection is one object,
@@ -2036,13 +2105,13 @@ defmodule Cairn.TrackerTest do
 
     test "a suspension already past its window is collected by the next cut" do
       {t, id} = parked(@box)
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       # No batch ever arrives, so the camera's last observation is still
       # at(10_000) — but the second cut is a minute and a bit after the first,
       # and the window this suspension is judged against is the one that
       # started at the first cut.
-      {t, events, info} = Tracker.suspend(t, 128, at(70_001))
+      {t, events, info} = Tracker.suspend(t, 128, 70_001)
 
       assert [{:ended, %Track{object_id: ^id, end_reason: :stream_reset}}] = events
       assert info == %{suspended: 0, ended: 1, at: at(10_000)}
@@ -2052,7 +2121,7 @@ defmodule Cairn.TrackerTest do
     test "a box a suspended track will not answer to is minted, not dropped as its duplicate" do
       last = [0.0, 0.0, 0.4, 0.4]
       {t, id} = moving([[0.2, 0.2, 0.4, 0.4], last])
-      {t, [], _info} = Tracker.suspend(t, 128, at(1_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 1_000)
 
       # 0.6 overlap, which is over `@duplicate_suppression_iou` (0.4): an
       # unmatched *live* track this close would have this box dropped and be
@@ -2062,8 +2131,7 @@ defmodule Cairn.TrackerTest do
       {_t, [tagged], events} =
         track(t, [det("person", @shift_1)],
           epoch: "epoch_two",
-          media_ms: 13_000,
-          observed_at: at(1_000 + 5_000)
+          at_ms: 1_000 + 5_000
         )
 
       assert [{:started, %Track{object_id: other}}] = events
@@ -2073,15 +2141,14 @@ defmodule Cairn.TrackerTest do
 
     test "a predicted box may not resume an identity, however well it overlaps" do
       {t, id} = parked(@box)
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       # the plugin's own extrapolation of where the object would be if it were
       # still there — which, across a gap nothing observed, is the question
       {predicted, [tagged], events} =
         track(t, [det("person", @box, kind: "tracked")],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(10_300)
+          at_ms: 10_300
         )
 
       assert [{:started, %Track{object_id: other}}] = events
@@ -2094,8 +2161,7 @@ defmodule Cairn.TrackerTest do
       {detected, [tagged], events} =
         track(t, [det("person", @box)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(10_300)
+          at_ms: 10_300
         )
 
       assert tagged.object_id == id
@@ -2105,7 +2171,7 @@ defmodule Cairn.TrackerTest do
 
     test "an adopted track that came back where it was stays stationary, batch after batch" do
       {t, id} = parked(@box)
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       # 0.905 overlap with the space it was parked in: the same car, seen a
       # couple of pixels off. It resumes already stationary — which is the
@@ -2118,7 +2184,7 @@ defmodule Cairn.TrackerTest do
           {t, [tagged], events} =
             track(t, [det("person", @shift_02)],
               epoch: "epoch_two",
-              media_ms: 12_000 + n * 1_000,
+              at_ms: 12_000 + n * 1_000,
               observed_at: at(10_300 + n * 1_000)
             )
 
@@ -2140,7 +2206,7 @@ defmodule Cairn.TrackerTest do
 
     test "an adopted track whose box has shifted off its anchor fails stillness at once, and flips a window later" do
       {t, id} = parked(@box)
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       # 0.778 overlap: adoptable on either tier, and under `@stationary_iou`
       # (0.8), so it is a shift the stillness rule calls a failure. It is
@@ -2159,8 +2225,7 @@ defmodule Cairn.TrackerTest do
       {t, [tagged], events} =
         track(t, [det("person", @shift_05)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(10_300)
+          at_ms: 10_300
         )
 
       assert tagged.object_id == id
@@ -2173,8 +2238,7 @@ defmodule Cairn.TrackerTest do
       {t, [tagged], events} =
         track(t, [det("person", @shift_05)],
           epoch: "epoch_two",
-          media_ms: 14_499,
-          observed_at: at(12_799)
+          at_ms: 12_799
         )
 
       assert ids(events, :started_moving) == []
@@ -2184,20 +2248,18 @@ defmodule Cairn.TrackerTest do
       {t, [tagged], events} =
         track(t, [det("person", @shift_05)],
           epoch: "epoch_two",
-          media_ms: 14_500,
-          observed_at: at(12_800)
+          at_ms: 12_800
         )
 
       assert ids(events, :started_moving) == [id]
       refute tagged.stationary
       assert [%Track{object_id: ^id, stationary: false}] = Tracker.live_tracks(t)
 
-      # and it settles again on the new epoch's clock, from the box it moved to
+      # and it settles again from the flip, on the box it moved to
       {t, [_], events} =
         track(t, [det("person", @shift_05)],
           epoch: "epoch_two",
-          media_ms: 15_500,
-          observed_at: at(13_800)
+          at_ms: 13_800
         )
 
       assert ids(events, :became_stationary) == []
@@ -2205,8 +2267,7 @@ defmodule Cairn.TrackerTest do
       {_t, [_], events} =
         track(t, [det("person", @shift_05)],
           epoch: "epoch_two",
-          media_ms: 24_500,
-          observed_at: at(22_800)
+          at_ms: 22_800
         )
 
       # `stationary_after_ms` (10_000) after the flip re-anchored it
@@ -2218,7 +2279,7 @@ defmodule Cairn.TrackerTest do
 
       # the stream goes quiet at at(10_000) and ffmpeg only gives up on it
       # forty seconds later, so the cut and the last sighting are far apart
-      {t, [], info} = Tracker.suspend(t, 128, at(50_000))
+      {t, [], info} = Tracker.suspend(t, 128, 50_000)
       # the outage *gap* is still reported to the last sighting — that is what
       # a gap is — and it is not what bounds the waiting
       assert info.at == at(10_000)
@@ -2230,8 +2291,7 @@ defmodule Cairn.TrackerTest do
       {adopted, [tagged], events} =
         track(t, [det("person", @box)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(100_000)
+          at_ms: 100_000
         )
 
       assert tagged.object_id == id
@@ -2243,8 +2303,7 @@ defmodule Cairn.TrackerTest do
       {_last_chance, [tagged], _events} =
         track(t, [det("person", @box)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(110_000)
+          at_ms: 110_000
         )
 
       assert tagged.object_id == id
@@ -2253,8 +2312,7 @@ defmodule Cairn.TrackerTest do
       {_expired, [tagged], events} =
         track(t, [det("person", @box)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(110_001)
+          at_ms: 110_001
         )
 
       assert [{:ended, final}, {:started, %Track{object_id: other}}] = events
@@ -2270,7 +2328,7 @@ defmodule Cairn.TrackerTest do
     test "the mover tier is capped short of an operator's max_unseen_ms" do
       last = [0.0, 0.0, 0.1, 0.3]
       {mover, mover_id} = moving([[0.0, 0.2, 0.1, 0.3], last])
-      {mover, [], _info} = Tracker.suspend(mover, 128, at(1_000))
+      {mover, [], _info} = Tracker.suspend(mover, 128, 1_000)
 
       # A deployment that has raised `max_unseen_ms` to 15 s to ride out slow
       # inference. That is patience with the plugin, not a claim about how far
@@ -2280,9 +2338,8 @@ defmodule Cairn.TrackerTest do
       {_t, [tagged], events} =
         track(mover, [det("person", last)],
           epoch: "epoch_two",
-          media_ms: 12_000,
           max_unseen_ms: 15_000,
-          observed_at: at(1_000 + 3_001)
+          at_ms: 1_000 + 3_001
         )
 
       assert [{:started, %Track{object_id: other}}] = events
@@ -2293,9 +2350,8 @@ defmodule Cairn.TrackerTest do
       {_t, [tagged], events} =
         track(mover, [det("person", last)],
           epoch: "epoch_two",
-          media_ms: 12_000,
           max_unseen_ms: 15_000,
-          observed_at: at(1_000 + 3_000)
+          at_ms: 1_000 + 3_000
         )
 
       assert tagged.object_id == mover_id
@@ -2306,9 +2362,8 @@ defmodule Cairn.TrackerTest do
       {_t, [tagged], events} =
         track(mover, [det("person", last)],
           epoch: "epoch_two",
-          media_ms: 12_000,
           max_unseen_ms: 1_000,
-          observed_at: at(1_000 + 1_001)
+          at_ms: 1_000 + 1_001
         )
 
       assert [{:started, %Track{object_id: fresh}}] = events
@@ -2318,9 +2373,8 @@ defmodule Cairn.TrackerTest do
       {_t, [tagged], events} =
         track(mover, [det("person", last)],
           epoch: "epoch_two",
-          media_ms: 12_000,
           max_unseen_ms: 1_000,
-          observed_at: at(1_000 + 1_000)
+          at_ms: 1_000 + 1_000
         )
 
       assert tagged.object_id == mover_id
@@ -2332,14 +2386,13 @@ defmodule Cairn.TrackerTest do
       assert Tracker.iou(@brick, @brick_399) === 0.399
 
       {t, id} = parked(@brick)
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       # one second of absence, so this is the mover tier and 0.4 is its floor
       {_adopted, [tagged], events} =
         track(t, [det("person", @brick_40)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(11_000)
+          at_ms: 11_000
         )
 
       assert tagged.object_id == id
@@ -2349,8 +2402,7 @@ defmodule Cairn.TrackerTest do
       {_minted, [tagged], events} =
         track(t, [det("person", @brick_399)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(11_000)
+          at_ms: 11_000
         )
 
       assert [{:started, %Track{object_id: other}}] = events
@@ -2363,15 +2415,14 @@ defmodule Cairn.TrackerTest do
       assert Tracker.iou(@brick, @brick_699) === 0.699
 
       {t, id} = parked(@brick)
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       # past the mover tier, so 0.7 is being asked of the stationary tier's own
       # floor rather than of the one above
       {_adopted, [tagged], events} =
         track(t, [det("person", @brick_70)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(13_001)
+          at_ms: 13_001
         )
 
       assert tagged.object_id == id
@@ -2380,8 +2431,7 @@ defmodule Cairn.TrackerTest do
       {_minted, [tagged], events} =
         track(t, [det("person", @brick_699)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(13_001)
+          at_ms: 13_001
         )
 
       assert [{:started, %Track{object_id: other}}] = events
@@ -2393,13 +2443,12 @@ defmodule Cairn.TrackerTest do
       assert_in_delta Tracker.iou(@small_car, @small_car_drift), 3 / 7, 0.001
 
       {t, id} = parked(@small_car, "car")
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       {_t, [tagged], events} =
         track(t, [det("car", @small_car_drift)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(11_000)
+          at_ms: 11_000
         )
 
       assert tagged.object_id == id
@@ -2412,14 +2461,13 @@ defmodule Cairn.TrackerTest do
       assert_in_delta Tracker.iou(@walker, @walker_stride), 1 / 3, 0.001
 
       {t, id} = parked(@walker)
-      {t, [], _info} = Tracker.suspend(t, 128, at(10_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       # past the mover tier, so 0.765 is asked of the stationary floor
       {_t, [tagged], events} =
         track(t, [det("person", @walker_nudge)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(13_001)
+          at_ms: 13_001
         )
 
       assert tagged.object_id == id
@@ -2431,8 +2479,7 @@ defmodule Cairn.TrackerTest do
       {_t, [tagged], events} =
         track(t, [det("person", @walker_stride)],
           epoch: "epoch_two",
-          media_ms: 12_000,
-          observed_at: at(11_000)
+          at_ms: 11_000
         )
 
       assert [{:started, %Track{object_id: other}}] = events

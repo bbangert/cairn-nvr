@@ -190,6 +190,38 @@ defmodule Cairn.PluginGroupPortTest do
            }
   end
 
+  # One `Cairn.ObservationClock` per member, not one per group: the members are
+  # separate streams with separate pts, and a group serves whichever of them is
+  # still delivering.
+  test "each member's observations carry their own at_ms, on the host's clock" do
+    a = camera("gp_clock_a_#{System.unique_integer([:positive])}")
+    b = camera("gp_clock_b_#{System.unique_integer([:positive])}")
+
+    command =
+      printf([
+        det_line(a.id, 1, 0.9),
+        det_line(b.id, 900_000, 0.9),
+        det_line(a.id, 2, 0.9)
+      ]) <> "; exec sleep 30"
+
+    start_group_port([a, b], command: command, tracker: self())
+
+    a_id = a.id
+    b_id = b.id
+
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _p, first}}, 5_000
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^b_id}, _p, other}}, 5_000
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _p, second}}, 5_000
+
+    now = System.monotonic_time(:millisecond)
+
+    # b's pts is ten seconds ahead of a's and buys it nothing: each member is
+    # anchored on its own, and no member's clock may run ahead of the host's
+    assert other.at_ms <= now
+    assert first.at_ms <= now
+    assert second.at_ms > first.at_ms
+  end
+
   test "each camera's own min_score applies through its camera tracker" do
     a = camera("gp_low_#{System.unique_integer([:positive])}")
     b = camera("gp_high_#{System.unique_integer([:positive])}", min_score: %{"default" => 0.95})

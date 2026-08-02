@@ -64,16 +64,43 @@ defmodule Cairn.CameraTrackerTest do
   end
 
   defp observation(objects, opts) do
+    # On a healthy stream the port's `at_ms` tracks `media_ms` one for one
+    # (`Cairn.ObservationClock`), so these fixtures move the two together and
+    # name the number after the clock the tracker actually decides on.
+    at_ms = at_ms(Keyword.get(opts, :at_ms, 1_000))
+
     %Observation{
       camera_id: Keyword.get(opts, :camera_id),
       epoch: Keyword.get(opts, :epoch),
       pts: 90_000,
-      media_ms: Keyword.get(opts, :media_ms, 1_000.0),
+      media_ms: at_ms,
+      at_ms: at_ms,
       observed_at: Keyword.get(opts, :observed_at, DateTime.utc_now()),
       time_quality: :arrival,
       objects: objects,
       protocol: :v0
     }
+  end
+
+  # The tracker decides on `at_ms`, which production derives from the host's
+  # monotonic clock (`Cairn.ObservationClock`) — the same clock a stream cut is
+  # stamped with (`:cut_clock`) and the adoption sweep measures its window
+  # from. These fixtures are therefore offsets from one base captured per test
+  # process rather than absolutes: batches can be spaced to the millisecond,
+  # because nothing between them re-reads a clock, while still landing on the
+  # scale the tracker's own defaults read.
+  defp at_ms(offset), do: clock_base() + offset
+
+  defp clock_base do
+    case Process.get(:clock_base) do
+      nil ->
+        base = System.monotonic_time(:millisecond)
+        Process.put(:clock_base, base)
+        base
+
+      base ->
+        base
+    end
   end
 
   defp object(label, score, bbox, kind \\ "detected", track_id \\ nil) do
@@ -100,10 +127,10 @@ defmodule Cairn.CameraTrackerTest do
   defp window_ref(tracker), do: :sys.get_state(tracker).window_ref
 
   # A tracker that stamps every stream cut `ago` seconds in the past. The
-  # adoption window is a wall-clock minute measured from the cut, so this is
-  # what lets a test drive a suspension past it without sitting through one —
-  # the sweep itself still reads the real clock. `opts` reaches the tracker
-  # verbatim.
+  # adoption window is a minute of the observation clock measured from the cut,
+  # so this is what lets a test drive a suspension past it without sitting
+  # through one — the sweep itself still reads the real clock, which is the
+  # same clock and therefore comparable. `opts` reaches the tracker verbatim.
   defp tracker_cut_seconds_ago(camera_id, ago, opts \\ []) do
     test_pid = self()
 
@@ -113,7 +140,7 @@ defmodule Cairn.CameraTrackerTest do
          [
            camera_id: camera_id,
            name: nil,
-           cut_clock: fn -> DateTime.add(DateTime.utc_now(), -ago, :second) end,
+           cut_clock: fn -> System.monotonic_time(:millisecond) - ago * 1_000 end,
            start_extractor: fn _camera, event ->
              pid = spawn(fn -> Process.sleep(:infinity) end)
              send(test_pid, {:extractor_started, event, pid})
@@ -128,7 +155,7 @@ defmodule Cairn.CameraTrackerTest do
 
   # -- stationary helpers -------------------------------------------------------
 
-  # The default `stationary_after_ms` is 10s of media time; at one hand-fed
+  # The default `stationary_after_ms` is 10s of the observation clock; at one hand-fed
   # frame per simulated second that is ten frames before the edge under test.
   @stationary_policy Map.put(@policy, :stationary_after_ms, 2_000)
   @parked_box [0.1, 0.1, 0.2, 0.4]
@@ -147,12 +174,12 @@ defmodule Cairn.CameraTrackerTest do
   @small_jitter_box [0.40, 0.52, 0.17, 0.09]
   @small_moved_box [0.40, 0.54, 0.17, 0.09]
 
-  defp detect_at(tracker, camera, media_ms, bbox \\ @parked_box) do
+  defp detect_at(tracker, camera, at_ms, bbox \\ @parked_box) do
     CameraTracker.detections(
       tracker,
       camera,
       @stationary_policy,
-      observation([object("person", 0.9, bbox)], media_ms: media_ms)
+      observation([object("person", 0.9, bbox)], at_ms: at_ms)
     )
   end
 
@@ -407,7 +434,9 @@ defmodule Cairn.CameraTrackerTest do
     camera_id: id
   } do
     # the real delay is the adoption window plus slack; the window itself is
-    # still the wall-clock one, which is why the cut is a minute and a half old
+    # measured on the observation clock the cut is stamped on, which is why the
+    # cut is put a minute and a half in the past rather than the timer shortened
+    # alone
     tracker = tracker_cut_seconds_ago(id, 90, window_ms: 20)
 
     observe(tracker, camera, [object("person", 0.9, @box)],
@@ -435,9 +464,13 @@ defmodule Cairn.CameraTrackerTest do
   } do
     # The cut is recent, so the suspension it makes is nowhere near lapsing and
     # every sweep below finds nothing to end. That is the shape of the failure
-    # this covers: a wall clock stepped backwards, or any sweep that misses,
-    # on a camera whose stream never returns — nothing else is ever coming to
-    # collect the suspension, so the sweep has to come back on its own.
+    # this covers, and the re-arm is not dead code: a sweep already in the
+    # mailbox when `window_timer/1` cancels its timer still arrives, and the
+    # handler clears `window_ref` as it runs — orphaning the timer the reset had
+    # just armed (`Cairn.CameraTracker`'s `:adoption_window` handler). On a
+    # camera whose stream never returns nothing else is ever coming to collect
+    # the suspension, and a stranded one is a track whose consumers never see it
+    # end.
     tracker = tracker_cut_seconds_ago(id, 0)
 
     observe(tracker, camera, [object("person", 0.9, @box)])
@@ -1258,7 +1291,8 @@ defmodule Cairn.CameraTrackerTest do
       detect(tracker, camera, 0.6)
       assert_receive {:track_started, %Track{object_id: oid, camera_id: ^id}}
 
-      # same score, no wall clock elapsed: nothing goes out
+      # same score, and the injected monotonic clock has not moved: nothing
+      # goes out
       detect(tracker, camera, 0.6, [0.12, 0.1, 0.2, 0.4])
       :sys.get_state(tracker)
       refute_received {:track_updated, %Track{object_id: ^oid}}
@@ -1267,7 +1301,7 @@ defmodule Cairn.CameraTrackerTest do
       detect(tracker, camera, 0.8, [0.12, 0.1, 0.2, 0.4])
       assert_receive {:track_updated, %Track{object_id: ^oid, best_score: 0.8}}
 
-      # ...and so is a second of wall clock, however dull the frame
+      # ...and so is a second on that clock, however dull the frame
       detect(tracker, camera, 0.7, [0.12, 0.1, 0.2, 0.4])
       :sys.get_state(tracker)
       refute_received {:track_updated, %Track{object_id: ^oid}}
@@ -1276,8 +1310,9 @@ defmodule Cairn.CameraTrackerTest do
       detect(tracker, camera, 0.7, [0.12, 0.1, 0.2, 0.4])
       assert_receive {:track_updated, %Track{object_id: ^oid, score: 0.7, best_score: 0.8}}
 
-      # expiry is media time: 3.1s after the last sighting the track ends
-      observe(tracker, camera, [], media_ms: 4_200.0)
+      # expiry is on the observation clock: 3.1s after the last sighting the
+      # track ends
+      observe(tracker, camera, [], at_ms: 4_200.0)
       assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :unseen}}
     end
 
@@ -1288,8 +1323,8 @@ defmodule Cairn.CameraTrackerTest do
     } do
       predicted = [object("person", 0.99, [0.1, 0.1, 0.2, 0.4], "tracked")]
 
-      observe(tracker, camera, predicted, media_ms: 1_000.0)
-      observe(tracker, camera, predicted, media_ms: 2_000.0)
+      observe(tracker, camera, predicted, at_ms: 1_000.0)
+      observe(tracker, camera, predicted, at_ms: 2_000.0)
       :sys.get_state(tracker)
       refute_received {:event_started, %Event{camera_id: ^id}}
 
@@ -1298,8 +1333,8 @@ defmodule Cairn.CameraTrackerTest do
       detect(tracker, camera)
       assert_receive {:event_started, %Event{camera_id: ^id}}
 
-      observe(tracker, camera, predicted, media_ms: 3_000.0)
-      observe(tracker, camera, predicted, media_ms: 4_500.0)
+      observe(tracker, camera, predicted, at_ms: 3_000.0)
+      observe(tracker, camera, predicted, at_ms: 4_500.0)
       :sys.get_state(tracker)
       refute_received {:event_updated, %Event{camera_id: ^id}}
     end
@@ -1346,7 +1381,7 @@ defmodule Cairn.CameraTrackerTest do
       # the car is still there and still detected every frame. Before the
       # stationary rule this is where the loop was: evidence -> new event ->
       # post window -> finalize -> evidence, for as long as it stayed parked.
-      for media_ms <- [4_000, 5_000, 6_000], do: detect_at(tracker, camera, media_ms)
+      for at_ms <- [4_000, 5_000, 6_000], do: detect_at(tracker, camera, at_ms)
       :sys.get_state(tracker)
 
       refute_received {:event_started, %Event{camera_id: ^id}}
@@ -1370,7 +1405,7 @@ defmodule Cairn.CameraTrackerTest do
 
       # and the tracker then wants the move *sustained*: the smoothed box
       # fails from 6_000, and the flag holds until that failure has run for
-      # `Cairn.Tracker`'s exit window (2_500 ms of media time)
+      # `Cairn.Tracker`'s exit window (2_500 ms on the observation clock)
       detect_at(tracker, camera, 6_000, @moved_box)
       detect_at(tracker, camera, 7_000, @moved_box)
       detect_at(tracker, camera, 8_000, @moved_box)
@@ -1411,11 +1446,11 @@ defmodule Cairn.CameraTrackerTest do
 
       # and the quiet is not deafness: the same car actually leaving fails the
       # test from 12_000 and never passes again, so the flag goes at 15_000 and
-      # the departure gets its clip — under the same identity, 2.5 s of media
-      # later than it would have before, which is well inside the 5 s pre-roll
+      # the departure gets its clip — under the same identity, 2.5 s of the
+      # observation clock later than it would have before, which is well inside the 5 s pre-roll
       # the clip opens with
-      for media_ms <- [10_000, 11_000, 12_000, 13_000, 14_000],
-          do: detect_at(tracker, camera, media_ms, @small_moved_box)
+      for at_ms <- [10_000, 11_000, 12_000, 13_000, 14_000],
+          do: detect_at(tracker, camera, at_ms, @small_moved_box)
 
       :sys.get_state(tracker)
       assert [%Track{object_id: ^oid, stationary: true}] = live_tracks(tracker)
@@ -1450,7 +1485,8 @@ defmodule Cairn.CameraTrackerTest do
       detect_at(tracker, camera, 1_000)
       assert_receive {:track_started, %Track{object_id: oid, camera_id: ^id}}
 
-      # same score, no wall clock elapsed: the throttle is armed and swallows
+      # same score, and the injected monotonic clock has not moved: the
+      # throttle is armed and swallows
       # this update
       detect_at(tracker, camera, 2_000)
       :sys.get_state(tracker)
@@ -1665,7 +1701,8 @@ defmodule Cairn.CameraTrackerTest do
     test "a track the tracker judges stationary is forwarded with the flag set",
          %{camera: camera, camera_id: id} do
       tracker = relay_tracker(id, :tracker_boxes_stationary)
-      # media time, not wall clock, is what the stillness rule measures
+      # the observation clock, not the wall clock, is what the stillness rule
+      # measures
       policy = Map.put(@policy, :stationary_after_ms, 1_000)
       t0 = DateTime.utc_now()
       still = [0.1, 0.1, 0.2, 0.4]
@@ -1674,7 +1711,7 @@ defmodule Cairn.CameraTrackerTest do
         tracker,
         camera,
         policy,
-        observation([object("person", 0.9, still)], observed_at: t0, media_ms: 1_000.0)
+        observation([object("person", 0.9, still)], observed_at: t0, at_ms: 1_000.0)
       )
 
       assert_receive {:extractor_started, %Event{camera_id: ^id}, _pid}
@@ -1682,7 +1719,8 @@ defmodule Cairn.CameraTrackerTest do
       assert_receive {:extractor_got,
                       {:"$gen_cast", {:track_boxes, %{boxes: [{oid, "person", ^still, false}]}}}}
 
-      # the same box one `stationary_after_ms` of media time later: the tracker
+      # the same box one `stationary_after_ms` of the observation clock later:
+      # the tracker
       # flips the track, and the flip reaches the extractor
       CameraTracker.detections(
         tracker,
@@ -1690,7 +1728,7 @@ defmodule Cairn.CameraTrackerTest do
         policy,
         observation([object("person", 0.9, still)],
           observed_at: DateTime.add(t0, 1, :second),
-          media_ms: 2_000.0
+          at_ms: 2_000.0
         )
       )
 
