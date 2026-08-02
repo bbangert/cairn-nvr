@@ -114,7 +114,7 @@ defmodule CairnWeb.EventLiveTest do
     {:ok, view, html} = live(conn, "/events/#{id}")
     assert html =~ "Recording"
 
-    # the aggregator broadcasts :event_ended before the extractor's async
+    # the camera tracker broadcasts :event_ended before the extractor's async
     # finalize writes the DB — the immediate re-fetch still sees an active row
     Event.broadcast(:event_ended, %Event{
       id: id,

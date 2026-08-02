@@ -187,8 +187,8 @@ defmodule Cairn.TrackerTest do
 
   # `iou/2` only matches `[x, y, w, h]`, and a stored object's bbox comes
   # straight from the detection that created it — so a bbox of any other arity
-  # reaching `track/3` crashes the (singleton) aggregator on the next
-  # same-label batch. Everything the ports feed it passes validate_det/1
+  # reaching `track/3` crashes that camera's `Cairn.CameraTracker` on the
+  # next same-label batch. Everything the ports feed it passes validate_det/1
   # first; this pins that the validator can only ever emit 4-number bboxes.
   test "every det the plugin protocol admits has a 4-number bbox track/3 can match" do
     arities = [
@@ -695,7 +695,7 @@ defmodule Cairn.TrackerTest do
 
       assert ids(events, :started_moving) == []
       # not merely un-emitted: the flag itself never wavered, batch by batch,
-      # which is what the aggregator reads to decide the car is not evidence
+      # which is what the camera tracker reads to decide the car is not evidence
       assert for({:updated, tr} <- events, do: tr.stationary) == List.duplicate(true, 7)
       assert [%Track{stationary: true, stationary_since: since}] = Tracker.live_tracks(t)
       assert since == at(10_000)
@@ -2148,7 +2148,7 @@ defmodule Cairn.TrackerTest do
       # median window — the four boxes that used to outvote this one belong to
       # a stream that is gone, and while they held the majority a car that
       # drove off during the outage went on reading as parked, which is to say
-      # as something the aggregator refuses as evidence.
+      # as something the camera tracker refuses as evidence.
       #
       # The flag itself does not go on that batch. A shifted adoption is a real
       # sustained departure — the object is not where it was and, unlike

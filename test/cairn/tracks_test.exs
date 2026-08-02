@@ -720,7 +720,7 @@ defmodule Cairn.TracksTest do
       assert Tracks.close_live() == 1
       assert Tracks.close_live() == 0
 
-      # The aggregator's checkpoint restore, arriving after the boot-time close:
+      # A camera tracker's checkpoint restore, arriving after the boot-time close:
       # both say `:host_restart`, and the restore's own `last_seen_at` replaces
       # the derived one.
       last_seen = DateTime.add(DateTime.utc_now(), -5)

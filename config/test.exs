@@ -18,7 +18,7 @@ config :cairn,
   start_cameras: false,
   skip_boot_migrations: true,
   # The application's own `Cairn.TrackRecorder` buffers whatever any test's
-  # aggregator casts at it; without this its timer would flush those tracks
+  # camera tracker casts at it; without this its timer would flush those tracks
   # into whichever sandbox connection happens to be checked out at the time.
   track_recorder_manual: true
 

@@ -18,8 +18,14 @@ defmodule Cairn.CameraTracker do
   :camera_tracker)` and started on demand by `ensure/1` under
   `Cairn.TrackerSupervisor` — deliberately *outside* the per-camera media tree,
   so restarting a camera's ffmpeg or plugin does not take its tracking state
-  with it. The process is `:temporary`: nothing restarts it, and the next
-  observation starts a fresh one that restores from `Cairn.EventCheckpoint`.
+  with it. The process is `:transient`: a crash restarts it and the fresh
+  process restores from `Cairn.EventCheckpoint` in `init/1` — so the
+  `:host_restart` finals a checkpoint owes go out immediately, not when the
+  camera's next observation happens to arrive (a camera whose stream died with
+  its tracker would otherwise strand them indefinitely). The clean stop that is
+  not restarted is the app shutting down; removing a camera does not stop this
+  process — the `:camera_stopped` epoch ends its tracks and the idle tracker
+  lingers until shutdown.
 
   Not every detection is evidence (`evidence?/3`, the one gate both of the
   first two bullets pass through): a predicted ("tracked") object is refused,
@@ -104,7 +110,7 @@ defmodule Cairn.CameraTracker do
   moduledoc.
   """
 
-  use GenServer, restart: :temporary
+  use GenServer, restart: :transient
 
   require Logger
 
@@ -151,8 +157,11 @@ defmodule Cairn.CameraTracker do
   `.claude/solutions/registry-stale-read-at-decision-sites-20260728.md`), and
   it errs toward inaction on purpose: an entry the registry has not reaped yet
   hands back a dead pid, the cast that follows is a no-op, and one batch of
-  detections is lost. The next batch finds the entry gone and starts a fresh
-  tracker. Nothing here polls for that, because a detection dropped during a
+  detections is lost. What replaces the corpse is usually the supervisor: the
+  child is `:transient`, so by the next batch the registry answers with the
+  restarted tracker. Starting one from here is the fallback for the deaths the
+  supervisor does not undo — a clean stop, or a pool that spent its restart
+  intensity. Nothing here polls for that, because a detection dropped during a
   tracker's death is indistinguishable from one dropped by its crash.
 
   `DynamicSupervisor.start_child/2` is a `call`, so it *exits* when the
@@ -171,9 +180,10 @@ defmodule Cairn.CameraTracker do
   defp start_tracker(camera_id) do
     spec = {__MODULE__, camera_id: camera_id}
 
-    case DynamicSupervisor.start_child(Cairn.TrackerSupervisor, spec) do
+    case DynamicSupervisor.start_child(Cairn.TrackerSupervisor.Pool, spec) do
       {:ok, pid} -> {:ok, pid}
-      # two ports (or a port and the boot sweep) raced to start it
+      # something got there first: the supervisor's own restart of a
+      # `:transient` child, another port, or the checkpoint restore sweep
       {:error, {:already_started, pid}} -> {:ok, pid}
       {:error, reason} -> {:error, reason}
     end
@@ -218,10 +228,12 @@ defmodule Cairn.CameraTracker do
   Starts a tracker for every camera holding a checkpointed event, so a restore
   does not wait for that camera's next observation.
 
-  Run once from the application tree, right after `Cairn.TrackerSupervisor`.
-  On a cold boot the checkpoint table has just been created empty, so this
-  finds nothing; what it covers is a table that outlived the processes which
-  wrote it.
+  Runs as the second child of `Cairn.TrackerSupervisor`, after the tracker
+  pool. At boot it is always a no-op: `Cairn.EventCheckpoint`'s table is ETS,
+  so it dies with the VM and is created empty a few children earlier in the
+  same start sequence. It earns its keep on a pool restart, where the rows
+  outlive every tracker that wrote them and the subtree's `:rest_for_one`
+  cascade re-runs this.
   """
   @spec restore_checkpointed() :: :ok
   def restore_checkpointed do
@@ -951,8 +963,11 @@ defmodule Cairn.CameraTracker do
   # for a track that never opened one, on writing it at the end.
   #
   # Belt and braces on the cached pair: every path that can produce a live
-  # track today has been through `process_detections/5`, which caches both —
-  # a tracker only exists on a camera that has had a detection. An end path
+  # track today has been through `process_detections/5`, which caches both. A
+  # tracker that has never seen a detection does exist — `ensure/1` is public
+  # and `restore_checkpointed/0` starts one per checkpointed camera — but it
+  # holds an empty `Cairn.Tracker`, so no track reaches here and the nil caches
+  # are never read. An end path
   # that ever skips it must not silently exclude the track, so an absent
   # policy is read as an absent `track:` block, i.e. the label's wire floor
   # off a default camera.

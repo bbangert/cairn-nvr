@@ -797,7 +797,7 @@ defmodule Cairn.ConfigTest do
       assert Config.max_unseen_ms(config, cam_a) == 800
       assert Config.max_unseen_ms(config, cam_b) == 5_000
 
-      # the ports hand the aggregator windows and tracking as one map
+      # the ports hand the camera tracker windows and tracking as one map
       assert Config.policy(config, cam_a) == %{
                pre: 5,
                post: 10,

@@ -71,10 +71,11 @@ defmodule Cairn.Track do
       whole node restart loses the table, so nothing is restored and nothing
       gets a final. A consumer that materializes entities from `track_started`
       must therefore treat a tracker restart, not only a `track_ended`, as the
-      end of everything it holds for that camera. Nothing restarts a tracker on
-      its own — the replacement is started by that camera's next observation
-      (or by the boot sweep), so the finals can trail the crash by as long as
-      the camera stays quiet.
+      end of everything it holds for that camera. It does not have to wait long
+      for the finals it does get: the tracker is `:transient`, so its
+      supervisor restarts it and the replacement restores in `init/1` rather
+      than on that camera's next observation. What arrives then is still only
+      what the checkpoint held.
     * **The track index** (`Cairn.Tracks`). Here a crash costs much less,
       because the row does not wait for the final: `Cairn.TrackRecorder` opens
       it as soon as the track passes the camera's `track:` tier and refreshes

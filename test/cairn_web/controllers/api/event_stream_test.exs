@@ -199,7 +199,7 @@ defmodule CairnWeb.Api.EventStreamTest do
       assert updated =~ "event: track_updated\n"
     end
 
-    # The frame a parked object's transition rides out on: the aggregator gates
+    # The frame a parked object's transition rides out on: the camera tracker gates
     # event evidence on this flag, so a client has to be able to see it.
     test "a stationary track carries the flip and the time it has accrued" do
       parked = %{

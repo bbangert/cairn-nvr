@@ -1,30 +1,31 @@
-defmodule Cairn.DetectionAggregatorRecorderTest do
-  # The aggregator's half of the track index: which finished tracks earn a row,
-  # with which event id, and what lands on their timeline.
+defmodule Cairn.CameraTrackerRecorderTest do
+  # A camera tracker's half of the track index: which finished tracks earn a
+  # row, with which event id, and what lands on their timeline.
   #
   # DataCase, not ExUnit.Case: the rows are read back out of SQLite, and
-  # starting an aggregator runs checkpoint restore, which consults the event
+  # starting a tracker runs checkpoint restore, which consults the event
   # index.
   use Cairn.DataCase, async: false
 
   import ExUnit.CaptureLog, only: [capture_log: 1]
 
   alias Cairn.Config.Camera
-  alias Cairn.{CameraControl, DetectionAggregator, Event, EventCheckpoint, Observation}
+  alias Cairn.{CameraControl, CameraTracker, Event, EventCheckpoint, Observation}
   alias Cairn.{Track, TrackRecorder, Tracks}
 
   @policy %{pre: 5, post: 10, max: 300, max_unseen_ms: 3_000, max_live_tracks: 128}
 
   setup do
-    camera_id = "aggr_#{System.unique_integer([:positive])}"
+    camera_id = "trkr_#{System.unique_integer([:positive])}"
     camera = %Camera{id: camera_id, rtsp_url: "rtsp://h/1", min_score: %{"default" => 0.5}}
     test_pid = self()
 
     rec = start_supervised!({TrackRecorder, name: nil, manual: true})
 
-    agg =
+    tracker =
       start_supervised!(
-        {DetectionAggregator,
+        {CameraTracker,
+         camera_id: camera_id,
          name: nil,
          recorder: rec,
          start_extractor: fn _camera, event ->
@@ -40,12 +41,12 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
     Event.subscribe()
     on_exit(fn -> EventCheckpoint.delete(camera_id) end)
 
-    %{agg: agg, rec: rec, camera: camera, camera_id: camera_id}
+    %{tracker: tracker, rec: rec, camera: camera, camera_id: camera_id}
   end
 
   # -- helpers ----------------------------------------------------------------
 
-  defp observe(agg, camera, objects, opts) do
+  defp observe(tracker, camera, objects, opts) do
     policy = Keyword.get(opts, :policy, @policy)
 
     observation = %Observation{
@@ -58,7 +59,7 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
       protocol: :v0
     }
 
-    DetectionAggregator.detections(agg, camera, policy, observation)
+    CameraTracker.detections(tracker, camera, policy, observation)
   end
 
   defp object(label, score, bbox) do
@@ -79,8 +80,8 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
 
   # Drains both mailboxes, then drives the recorder's flush by hand: every
   # assertion below is on rows in SQLite rather than on either process's state.
-  defp flush(agg, rec) do
-    _ = :sys.get_state(agg)
+  defp flush(tracker, rec) do
+    _ = :sys.get_state(tracker)
     send(rec, {:flush, :sys.get_state(rec).flush_token})
     _ = :sys.get_state(rec)
     :ok
@@ -95,11 +96,11 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
     score = Keyword.get(opts, :score, 0.9)
     label = Keyword.get(opts, :label, "person")
 
-    observe(ctx.agg, ctx.camera, [object(label, score, [0.1, 0.1, 0.2, 0.4])], policy: policy)
+    observe(ctx.tracker, ctx.camera, [object(label, score, [0.1, 0.1, 0.2, 0.4])], policy: policy)
 
     assert_receive {:track_started, %Track{object_id: oid}}
 
-    observe(ctx.agg, ctx.camera, [], media_ms: 5_000.0, policy: policy)
+    observe(ctx.tracker, ctx.camera, [], media_ms: 5_000.0, policy: policy)
 
     assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :unseen}}
     oid
@@ -123,7 +124,7 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
       oid = start_and_end_track(ctx, policy: tier(%{"car" => %{min_score: 0.5}}))
       assert_receive {:extractor_started, %Event{id: eid}, _pid}
 
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
 
       row = Tracks.get(oid)
       assert row.event_id == eid
@@ -139,7 +140,7 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
       oid = start_and_end_track(ctx, policy: tier(%{"person" => %{min_score: 0.95}}))
       assert_receive {:extractor_started, %Event{id: eid}, _pid}
 
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
 
       assert Tracks.get(oid).event_id == eid
     end
@@ -151,7 +152,7 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
       # with no event ever having opened for it — and it scores well over the
       # wire floor, so the tier passes it. The assertion is therefore about the
       # linkage and nothing else.
-      observe(ctx.agg, ctx.camera, [predicted("person", 0.9, [0.0, 0.0, 0.1, 0.1])],
+      observe(ctx.tracker, ctx.camera, [predicted("person", 0.9, [0.0, 0.0, 0.1, 0.1])],
         media_ms: 1_000.0
       )
 
@@ -161,17 +162,17 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
       # One observation, two things at once: media time has jumped past
       # `max_unseen_ms` so the old track expires inside `Tracker.track/3`, and
       # the object it carries is fresh evidence that opens an event.
-      observe(ctx.agg, ctx.camera, [object("person", 0.9, [0.8, 0.8, 0.1, 0.1])],
+      observe(ctx.tracker, ctx.camera, [object("person", 0.9, [0.8, 0.8, 0.1, 0.1])],
         media_ms: 9_000.0
       )
 
       assert_receive {:track_ended, %Track{object_id: ^expiring, end_reason: :unseen}}
       assert_receive {:event_started, %Event{id: eid}}
 
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
 
       row = Tracks.get(expiring)
-      # `publish_tracks/3` sees the pre-batch cam state, and that is the right
+      # `publish_tracks/2` sees the pre-batch state, and that is the right
       # answer: a track that expired in this batch was not detected in it, so
       # it is no part of the event this batch's detections opened.
       assert row.event_id == nil
@@ -190,7 +191,7 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
     test "passing the tier gets a row with no event id", ctx do
       oid = start_and_end_track(ctx)
 
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
       refute_received {:event_started, _}
 
       row = Tracks.get(oid)
@@ -208,7 +209,7 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
 
       oid = start_and_end_track(ctx, policy: tier(%{"car" => %{min_score: 0.5}}))
 
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
 
       assert Tracks.get(oid) == nil
       assert Tracks.list(camera: ctx.camera_id).total == 0
@@ -220,24 +221,24 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
 
       oid = start_and_end_track(ctx, score: 0.9, policy: tier(%{"person" => %{min_score: 0.95}}))
 
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
 
       assert Tracks.get(oid) == nil
     end
 
     test "a track retired by turning detection off is recorded like any other", ctx do
-      observe(ctx.agg, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], [])
+      observe(ctx.tracker, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], [])
       assert_receive {:track_started, %Track{object_id: oid}}
 
       CameraControl.set(ctx.camera_id, %{detection_enabled: false})
 
-      observe(ctx.agg, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])],
+      observe(ctx.tracker, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])],
         media_ms: 2_000.0
       )
 
       assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :detection_disabled}}
 
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
 
       assert Tracks.get(oid).end_reason == :detection_disabled
     end
@@ -247,13 +248,13 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
 
       log =
         capture_log(fn ->
-          observe(ctx.agg, ctx.camera, [object("person", 0.9, [0.0, 0.0, 0.1, 0.1])],
+          observe(ctx.tracker, ctx.camera, [object("person", 0.9, [0.0, 0.0, 0.1, 0.1])],
             policy: policy
           )
 
           assert_receive {:track_started, %Track{object_id: first}}
 
-          observe(ctx.agg, ctx.camera, [object("person", 0.9, [0.8, 0.8, 0.1, 0.1])],
+          observe(ctx.tracker, ctx.camera, [object("person", 0.9, [0.8, 0.8, 0.1, 0.1])],
             media_ms: 2_000.0,
             policy: policy
           )
@@ -265,7 +266,7 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
       assert log =~ "live-track cap"
       assert_received {:evicted, first}
 
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
 
       assert Tracks.get(first).end_reason == :evicted
     end
@@ -303,7 +304,7 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
           policy: tiers(@example_track, @example_record)
         )
 
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
       refute_received {:event_started, _}
 
       row = Tracks.get(oid)
@@ -324,7 +325,7 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
 
       assert_receive {:extractor_started, %Event{id: eid}, _pid}
 
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
 
       assert Tracks.get(oid).event_id == eid
     end
@@ -341,10 +342,10 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
     end
 
     test "has a row while it is still running, closed in place when it ends", ctx do
-      observe(ctx.agg, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], [])
+      observe(ctx.tracker, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], [])
 
       assert_receive {:track_started, %Track{object_id: oid}}
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
 
       row = Tracks.get(oid)
       assert row
@@ -356,9 +357,9 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
       assert [%{kind: :appeared}] = Tracks.moments(oid)
       assert row.entry_bbox == [0.1, 0.1, 0.2, 0.4]
 
-      observe(ctx.agg, ctx.camera, [], media_ms: 5_000.0)
+      observe(ctx.tracker, ctx.camera, [], media_ms: 5_000.0)
       assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :unseen}}
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
 
       closed = Tracks.get(oid)
       assert closed.ended_at != nil
@@ -369,21 +370,21 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
     end
 
     test "picks up a better score on the update the throttle releases", ctx do
-      observe(ctx.agg, ctx.camera, [object("person", 0.6, [0.1, 0.1, 0.2, 0.4])], [])
+      observe(ctx.tracker, ctx.camera, [object("person", 0.6, [0.1, 0.1, 0.2, 0.4])], [])
 
       assert_receive {:track_started, %Track{object_id: oid}}
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
       assert Tracks.get(oid).best_score == 0.6
 
-      # an improving `best_score` is exactly what `maybe_publish_update/3` lets
+      # an improving `best_score` is exactly what `maybe_publish_update/2` lets
       # through, so the row moves with the broadcast. The second box overlaps
       # the first, so IoU keeps the identity and the update is an update.
-      observe(ctx.agg, ctx.camera, [object("person", 0.85, [0.14, 0.14, 0.2, 0.4])],
+      observe(ctx.tracker, ctx.camera, [object("person", 0.85, [0.14, 0.14, 0.2, 0.4])],
         media_ms: 1_500.0
       )
 
       assert_receive {:track_updated, %Track{object_id: ^oid, best_score: 0.85}}
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
 
       row = Tracks.get(oid)
       assert row.best_score == 0.85
@@ -403,21 +404,23 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
     test "gets its row when its score first crosses, not before", ctx do
       policy = tier(%{"person" => %{min_score: 0.8}})
 
-      observe(ctx.agg, ctx.camera, [object("person", 0.6, [0.1, 0.1, 0.2, 0.4])], policy: policy)
+      observe(ctx.tracker, ctx.camera, [object("person", 0.6, [0.1, 0.1, 0.2, 0.4])],
+        policy: policy
+      )
 
       assert_receive {:track_started, %Track{object_id: oid}}
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
 
       # over the wire floor, under the tier: tracked, broadcast, not indexed
       assert Tracks.get(oid) == nil
 
-      observe(ctx.agg, ctx.camera, [object("person", 0.85, [0.14, 0.14, 0.2, 0.4])],
+      observe(ctx.tracker, ctx.camera, [object("person", 0.85, [0.14, 0.14, 0.2, 0.4])],
         media_ms: 1_500.0,
         policy: policy
       )
 
       assert_receive {:track_updated, %Track{object_id: ^oid, best_score: 0.85}}
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
 
       row = Tracks.get(oid)
       assert row
@@ -432,10 +435,12 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
     test "gets one at exactly the threshold — the tier is a floor, not a bar to beat", ctx do
       policy = tier(%{"person" => %{min_score: 0.8}})
 
-      observe(ctx.agg, ctx.camera, [object("person", 0.8, [0.1, 0.1, 0.2, 0.4])], policy: policy)
+      observe(ctx.tracker, ctx.camera, [object("person", 0.8, [0.1, 0.1, 0.2, 0.4])],
+        policy: policy
+      )
 
       assert_receive {:track_started, %Track{object_id: oid, best_score: 0.8}}
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
 
       assert Tracks.get(oid)
     end
@@ -445,21 +450,21 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
       # "person". The row exists, so it must be closed rather than abandoned —
       # nothing else would ever close it, and a live row outlives the host that
       # forgot it.
-      observe(ctx.agg, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])],
+      observe(ctx.tracker, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])],
         policy: tier(nil)
       )
 
       assert_receive {:track_started, %Track{object_id: oid}}
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
       assert Tracks.get(oid).ended_at == nil
 
       excluding = %{"car" => %{min_score: 0.5}}
       ctx = %{ctx | camera: %{ctx.camera | track: excluding}}
 
-      observe(ctx.agg, ctx.camera, [], media_ms: 5_000.0, policy: tier(excluding))
+      observe(ctx.tracker, ctx.camera, [], media_ms: 5_000.0, policy: tier(excluding))
 
       assert_receive {:track_ended, %Track{object_id: ^oid}}
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
 
       row = Tracks.get(oid)
       assert row.ended_at != nil
@@ -470,20 +475,20 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
       policy = tier(%{"person" => %{min_score: 0.8}})
 
       for media_ms <- [1_000.0, 1_500.0] do
-        observe(ctx.agg, ctx.camera, [object("person", 0.6, [0.1, 0.1, 0.2, 0.4])],
+        observe(ctx.tracker, ctx.camera, [object("person", 0.6, [0.1, 0.1, 0.2, 0.4])],
           media_ms: media_ms,
           policy: policy
         )
       end
 
       assert_receive {:track_started, %Track{object_id: oid}}
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
       assert Tracks.get(oid) == nil
 
-      observe(ctx.agg, ctx.camera, [], media_ms: 5_000.0, policy: policy)
+      observe(ctx.tracker, ctx.camera, [], media_ms: 5_000.0, policy: policy)
 
       assert_receive {:track_ended, %Track{object_id: ^oid}}
-      flush(ctx.agg, ctx.rec)
+      flush(ctx.tracker, ctx.rec)
 
       assert Tracks.get(oid) == nil
       assert Tracks.moments(oid) == []
@@ -503,9 +508,10 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
       # owed the close this test reads the row back through. The window runs
       # from the cut, so it is the cut that is put in the past; the
       # observations sit ten seconds behind it, where the stream went quiet.
-      agg =
+      tracker =
         start_supervised!(
-          {DetectionAggregator,
+          {CameraTracker,
+           camera_id: ctx.camera_id,
            name: nil,
            recorder: ctx.rec,
            cut_clock: fn -> DateTime.add(DateTime.utc_now(), -90, :second) end,
@@ -513,7 +519,7 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
              {:ok, spawn(fn -> Process.sleep(:infinity) end)}
            end,
            finalize_extractor: fn _pid, _event -> :ok end},
-          id: :agg_moments
+          id: :tracker_moments
         )
 
       on_exit(fn -> EventCheckpoint.delete(ctx.camera_id) end)
@@ -523,7 +529,7 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
       third = DateTime.add(first, 2)
 
       for {at, media_ms} <- [{first, 1_000.0}, {second, 2_000.0}, {third, 3_000.0}] do
-        observe(agg, ctx.camera, [object("person", 0.9, @parked_box)],
+        observe(tracker, ctx.camera, [object("person", 0.9, @parked_box)],
           observed_at: at,
           media_ms: media_ms,
           policy: @stationary_policy
@@ -535,11 +541,11 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
 
       # a fresh epoch suspends the live track, and the window sweep is what
       # ends it; the event is still open, so the row carries its id
-      send(agg, {:stream_epoch, ctx.camera_id, Cairn.ULID.generate(), :source_lost})
-      send(agg, {:adoption_window, ctx.camera_id})
+      send(tracker, {:stream_epoch, ctx.camera_id, Cairn.ULID.generate(), :source_lost})
+      send(tracker, :adoption_window)
       assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :stream_reset}}
 
-      flush(agg, ctx.rec)
+      flush(tracker, ctx.rec)
 
       assert [appeared, flip] = Tracks.moments(oid)
       assert appeared.kind == :appeared
@@ -565,11 +571,12 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
     # `Cairn.TrackRecorder` is a cast, so a plain pid in its place receives
     # them verbatim — which is the only way to tell one close from two, since
     # both write the same upsert and leave the same row.
-    defp aggregator_casting_to_self(ctx, id, opts \\ []) do
+    defp tracker_casting_to_self(ctx, id, opts \\ []) do
       start_supervised!(
-        {DetectionAggregator,
+        {CameraTracker,
          Keyword.merge(
            [
+             camera_id: ctx.camera_id,
              name: nil,
              recorder: self(),
              start_extractor: fn _camera, _event ->
@@ -581,29 +588,29 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
          )},
         id: id
       )
-      |> tap(fn _agg -> on_exit(fn -> EventCheckpoint.delete(ctx.camera_id) end) end)
+      |> tap(fn _tracker -> on_exit(fn -> EventCheckpoint.delete(ctx.camera_id) end) end)
     end
 
     test "a suspension nothing adopts closes its row exactly once, at the cut", ctx do
       # the adoption window runs from the cut, so it is the cut that has to be
       # far enough back for the sweep to find anything
-      agg =
-        aggregator_casting_to_self(ctx, :agg_close_once,
+      tracker =
+        tracker_casting_to_self(ctx, :tracker_close_once,
           cut_clock: fn -> DateTime.add(DateTime.utc_now(), -90, :second) end
         )
 
       seen_at = DateTime.add(DateTime.utc_now(), -100, :second)
-      observe(agg, ctx.camera, [object("person", 0.9, @reset_box)], observed_at: seen_at)
+      observe(tracker, ctx.camera, [object("person", 0.9, @reset_box)], observed_at: seen_at)
 
       assert_receive {:"$gen_cast", {:open, %Track{object_id: oid}, _event_id}}
 
-      send(agg, {:stream_epoch, ctx.camera_id, Cairn.ULID.generate(), :source_lost})
-      _ = :sys.get_state(agg)
+      send(tracker, {:stream_epoch, ctx.camera_id, Cairn.ULID.generate(), :source_lost})
+      _ = :sys.get_state(tracker)
       # the cut itself closes nothing: the track may yet come back
       refute_received {:"$gen_cast", {:final, _track, _event}}
 
-      send(agg, {:adoption_window, ctx.camera_id})
-      _ = :sys.get_state(agg)
+      send(tracker, :adoption_window)
+      _ = :sys.get_state(tracker)
 
       assert_receive {:"$gen_cast", {:final, %Track{object_id: ^oid} = final, _event}}
       assert final.end_reason == :stream_reset
@@ -611,24 +618,24 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
       # minute of waiting that followed it
       assert DateTime.compare(final.last_seen_at, seen_at) == :eq
 
-      send(agg, {:adoption_window, ctx.camera_id})
-      _ = :sys.get_state(agg)
+      send(tracker, :adoption_window)
+      _ = :sys.get_state(tracker)
       refute_received {:"$gen_cast", {:final, _track, _event}}
     end
 
     test "an adopted track's row is refreshed onto the new epoch, never closed", ctx do
-      agg = aggregator_casting_to_self(ctx, :agg_adopted_row)
+      tracker = tracker_casting_to_self(ctx, :tracker_adopted_row)
       epoch_a = Cairn.ULID.generate()
       epoch_b = Cairn.ULID.generate()
 
-      observe(agg, ctx.camera, [object("person", 0.9, @reset_box)], epoch: epoch_a)
+      observe(tracker, ctx.camera, [object("person", 0.9, @reset_box)], epoch: epoch_a)
       assert_receive {:"$gen_cast", {:open, %Track{object_id: oid, epoch: ^epoch_a}, _event}}
 
-      send(agg, {:stream_epoch, ctx.camera_id, epoch_b, :source_lost})
-      _ = :sys.get_state(agg)
+      send(tracker, {:stream_epoch, ctx.camera_id, epoch_b, :source_lost})
+      _ = :sys.get_state(tracker)
 
-      observe(agg, ctx.camera, [object("person", 0.9, @reset_box)], epoch: epoch_b)
-      _ = :sys.get_state(agg)
+      observe(tracker, ctx.camera, [object("person", 0.9, @reset_box)], epoch: epoch_b)
+      _ = :sys.get_state(tracker)
 
       # the same row, moved to the stream it is now being seen in
       assert_receive {:"$gen_cast", {:update, %Track{object_id: ^oid, epoch: ^epoch_b}, _event}}
@@ -661,11 +668,12 @@ defmodule Cairn.DetectionAggregatorRecorderTest do
 
       EventCheckpoint.put(ctx.camera_id, event, [track])
 
-      # a second aggregator: this one runs restore over the checkpoint above
+      # a second tracker for the same camera: this one runs restore over the
+      # checkpoint above
       restored =
         start_supervised!(
-          {DetectionAggregator, name: nil, recorder: ctx.rec},
-          id: :agg_restore_recorder
+          {CameraTracker, camera_id: ctx.camera_id, name: nil, recorder: ctx.rec},
+          id: :tracker_restore_recorder
         )
 
       oid = track.object_id

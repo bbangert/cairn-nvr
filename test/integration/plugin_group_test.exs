@@ -3,7 +3,7 @@ defmodule Cairn.PluginGroupIntegrationTest do
   The multiplexed plugin contract end to end: one mock plugin process in
   `--cameras-json` mode serving two cameras, launched from a parsed config
   through `Cairn.PluginGroupSupervisor`, routing by `camera_id` into the
-  global aggregator while real camera trees stream the fixture.
+  per-camera trackers while real camera trees stream the fixture.
 
   Excluded by default (`test_helper.exs`); run with
   `mix test --include integration`.

@@ -1,23 +1,24 @@
-defmodule Cairn.DetectionAggregatorControlTest do
-  # verifies runtime CameraControl toggles change aggregator behavior
+defmodule Cairn.CameraTrackerControlTest do
+  # verifies runtime CameraControl toggles change a camera tracker's behavior
   #
-  # DataCase, not ExUnit.Case: starting an aggregator runs checkpoint restore,
+  # DataCase, not ExUnit.Case: starting a tracker runs checkpoint restore,
   # which consults the event index — that Repo call needs a sandbox owner.
   use Cairn.DataCase, async: false
 
-  alias Cairn.{CameraControl, DetectionAggregator, Event, EventCheckpoint, Observation}
+  alias Cairn.{CameraControl, CameraTracker, Event, EventCheckpoint, Observation}
   alias Cairn.Config.Camera
 
   @policy %{pre: 5, post: 10, max: 300, max_unseen_ms: 3_000}
 
   setup do
-    camera_id = "aggc_#{System.unique_integer([:positive])}"
+    camera_id = "trkc_#{System.unique_integer([:positive])}"
     camera = %Camera{id: camera_id, rtsp_url: "rtsp://h/1", min_score: %{"default" => 0.5}}
     test_pid = self()
 
-    agg =
+    tracker =
       start_supervised!(
-        {DetectionAggregator,
+        {CameraTracker,
+         camera_id: camera_id,
          name: nil,
          start_extractor: fn _camera, event ->
            pid = spawn(fn -> Process.sleep(:infinity) end)
@@ -32,12 +33,13 @@ defmodule Cairn.DetectionAggregatorControlTest do
     Event.subscribe()
     on_exit(fn -> EventCheckpoint.delete(camera_id) end)
 
-    %{agg: agg, camera: camera, camera_id: camera_id}
+    %{tracker: tracker, camera: camera, camera_id: camera_id}
   end
 
-  defp detect(agg, camera, score \\ 0.9), do: detect(agg, camera, "person", score, @policy)
+  defp detect(tracker, camera, score \\ 0.9),
+    do: detect(tracker, camera, "person", score, @policy)
 
-  defp detect(agg, camera, label, score, policy) do
+  defp detect(tracker, camera, label, score, policy) do
     observation = %Observation{
       pts: 90_000,
       observed_at: DateTime.utc_now(),
@@ -52,48 +54,48 @@ defmodule Cairn.DetectionAggregatorControlTest do
       ]
     }
 
-    DetectionAggregator.detections(agg, camera, policy, observation)
+    CameraTracker.detections(tracker, camera, policy, observation)
   end
 
-  # `detections/4` is an async cast; flushing the aggregator's mailbox with
+  # `detections/4` is an async cast; flushing the tracker's mailbox with
   # :sys.get_state guarantees it (and its synchronous PubSub broadcast) is done,
   # so we can assert "no event" with no timing window.
-  defp refute_event_started(agg) do
-    :sys.get_state(agg)
+  defp refute_event_started(tracker) do
+    :sys.get_state(tracker)
     refute_received {:event_started, _}
   end
 
   test "detection_enabled=false drops batches — no event starts", ctx do
     CameraControl.set(ctx.camera_id, %{detection_enabled: false})
 
-    detect(ctx.agg, ctx.camera)
+    detect(ctx.tracker, ctx.camera)
 
-    refute_event_started(ctx.agg)
+    refute_event_started(ctx.tracker)
   end
 
   test "recording_enabled=false suppresses event start", ctx do
     CameraControl.set(ctx.camera_id, %{recording_enabled: false})
 
-    detect(ctx.agg, ctx.camera)
+    detect(ctx.tracker, ctx.camera)
 
-    refute_event_started(ctx.agg)
+    refute_event_started(ctx.tracker)
   end
 
   test "min_score override raises the threshold", ctx do
     CameraControl.set(ctx.camera_id, %{min_score: 0.95})
 
     # 0.9 is above the configured 0.5 but below the 0.95 override → filtered out
-    detect(ctx.agg, ctx.camera, 0.9)
-    refute_event_started(ctx.agg)
+    detect(ctx.tracker, ctx.camera, 0.9)
+    refute_event_started(ctx.tracker)
 
     # above the override → passes
-    detect(ctx.agg, ctx.camera, 0.99)
+    detect(ctx.tracker, ctx.camera, 0.99)
     assert_receive {:event_started, %Event{camera_id: cid}}
     assert cid == ctx.camera_id
   end
 
   test "defaults (no control set) behave exactly as configured", ctx do
-    detect(ctx.agg, ctx.camera, 0.9)
+    detect(ctx.tracker, ctx.camera, 0.9)
     assert_receive {:event_started, %Event{camera_id: cid}}
     assert cid == ctx.camera_id
   end
@@ -114,10 +116,10 @@ defmodule Cairn.DetectionAggregatorControlTest do
       CameraControl.set(ctx.camera_id, %{min_score: 0.8})
 
       # clears record.person (0.6) but not the override
-      detect(ctx.agg, ctx.camera, "person", 0.7, @record_policy)
-      refute_event_started(ctx.agg)
+      detect(ctx.tracker, ctx.camera, "person", 0.7, @record_policy)
+      refute_event_started(ctx.tracker)
 
-      detect(ctx.agg, ctx.camera, "person", 0.85, @record_policy)
+      detect(ctx.tracker, ctx.camera, "person", 0.85, @record_policy)
       assert_receive {:event_started, %Event{camera_id: _}}
     end
 
@@ -125,10 +127,10 @@ defmodule Cairn.DetectionAggregatorControlTest do
       CameraControl.set(ctx.camera_id, %{min_score: 0.3})
 
       # clears the lowered floor, still under record.person
-      detect(ctx.agg, ctx.camera, "person", 0.5, @record_policy)
-      refute_event_started(ctx.agg)
+      detect(ctx.tracker, ctx.camera, "person", 0.5, @record_policy)
+      refute_event_started(ctx.tracker)
 
-      detect(ctx.agg, ctx.camera, "person", 0.65, @record_policy)
+      detect(ctx.tracker, ctx.camera, "person", 0.65, @record_policy)
       assert_receive {:event_started, %Event{camera_id: _}}
     end
 
@@ -136,8 +138,8 @@ defmodule Cairn.DetectionAggregatorControlTest do
       for override <- [nil, 0.1, 0.99] do
         CameraControl.set(ctx.camera_id, %{min_score: override})
 
-        detect(ctx.agg, ctx.camera, "cat", 0.99, @record_policy)
-        refute_event_started(ctx.agg)
+        detect(ctx.tracker, ctx.camera, "cat", 0.99, @record_policy)
+        refute_event_started(ctx.tracker)
       end
     end
   end

@@ -4,8 +4,8 @@ defmodule Cairn.PluginProtocolIntegrationTest do
 
   A real mock plugin process speaks protocol v1 (and, in the last test, v0)
   over a real `Port` — stdout ndjson in, control lines out on stdin — into
-  `Cairn.PluginPort` / `Cairn.PluginGroupPort`, the global
-  `Cairn.DetectionAggregator`, and out as the SSE frames
+  `Cairn.PluginPort` / `Cairn.PluginGroupPort`, on into each camera's
+  `Cairn.CameraTracker`, and out as the SSE frames
   `CairnWeb.Api.EventStreamController` builds. Both plugin shapes are covered:
   one process per camera and one process per group.
 
@@ -146,9 +146,9 @@ defmodule Cairn.PluginProtocolIntegrationTest do
 
       # What the refused line did *not* do. It carried the suspended track's own
       # box and the timeline's best score, so accepting it would have adopted
-      # that track and published an update for it. This message and the started
-      # above come from the same aggregator process, so nothing is merely
-      # in flight by now.
+      # that track and published an update for it. Both tracks are this
+      # camera's, so both frames come from its one `Cairn.CameraTracker` —
+      # nothing is merely in flight by now.
       refute_received {:track_updated, %Track{object_id: ^object_a}}
       refute_received {:track_ended, %Track{object_id: ^object_a}}
 
@@ -259,9 +259,11 @@ defmodule Cairn.PluginProtocolIntegrationTest do
       refute_received {:track_ended, %Track{object_id: ^object_a1}}
 
       # The other member kept its identity across its neighbour's boundary.
-      # This message and cam_a's `track_started` come from the same aggregator
-      # process, so receiving it makes the refute below "nothing arrived up to
-      # this point" rather than "nothing has arrived yet".
+      # cam_b has a `Cairn.CameraTracker` of its own — cam_a's frames say
+      # nothing about when cam_b's arrive — so the barrier for the refute below
+      # is this message: it and any `track_ended` for cam_b come from that one
+      # process, which makes the refute "nothing arrived up to this point"
+      # rather than "nothing has arrived yet".
       assert_receive {:track_updated,
                       %Track{camera_id: ^cam_b, object_id: ^object_b1, epoch: ^epoch_b1}},
                      30_000

@@ -6,8 +6,8 @@ defmodule Cairn.PluginPortTest do
 
   import ExUnit.CaptureLog
 
-  alias Cairn.Config.Camera
   alias Cairn.{CameraTracker, Event, Observation, PluginPort, StreamEpochs, ULID}
+  alias Cairn.Config.Camera
 
   @mock Path.absname("priv/plugins/mock/mock_plugin.exs")
   @timeline Path.absname("test/support/fixtures/timelines/person_walkthrough.json")

@@ -4,8 +4,8 @@ defmodule Cairn.EventExtractorTest do
   import ExUnit.CaptureLog, only: [capture_log: 1]
 
   alias Cairn.{
+    CameraTracker,
     Config,
-    DetectionAggregator,
     Event,
     EventArtifact,
     EventCheckpoint,
@@ -205,8 +205,8 @@ defmodule Cairn.EventExtractorTest do
 
   # What this measures: the clip is never announced before the extractor is
   # told to finalize, it carries its post-remux size, and the snapshot is only
-  # kicked off afterwards. The *aggregator's* ordering is pinned by the two
-  # tests below and by the stub test in `DetectionAggregatorTest`.
+  # kicked off afterwards. The *camera tracker's* ordering is pinned by the
+  # two tests below and by the stub test in `CameraTrackerTest`.
   test "the clip is announced only once finalized, carrying its post-remux size",
        %{camera: camera, config: config, frags: frags} do
     config = %{config | remux_clips: true}
@@ -258,20 +258,21 @@ defmodule Cairn.EventExtractorTest do
     assert Events.get(event_id).bytes == clip.bytes
   end
 
-  # B2: the guarantee end to end. The aggregator's own `maybe_finalize/4`
+  # B2: the guarantee end to end. The camera tracker's own `maybe_finalize/3`
   # supplies the interleaving here — no stub extractor funs, a real extractor
   # doing a real close/remux/index/broadcast on the other side of the cast.
-  test "a real aggregator finalizing a real extractor announces event_ended first",
+  test "a real camera tracker finalizing a real extractor announces event_ended first",
        %{camera: camera, config: config, frags: frags} do
     test_pid = self()
     on_exit(fn -> EventCheckpoint.delete(camera.id) end)
 
-    agg =
+    tracker =
       start_supervised!({
-        DetectionAggregator,
+        CameraTracker,
         # the real extractor; only its data_dir is pinned to this test's, and
         # the snapshot is stubbed so no ffmpeg runs. `finalize_extractor` is
         # left at its default — the real cast.
+        camera_id: camera.id,
         name: nil,
         start_extractor: fn cam, event ->
           DynamicSupervisor.start_child(
@@ -286,14 +287,13 @@ defmodule Cairn.EventExtractorTest do
       })
 
     Enum.each(frags, &RingBuffer.put_fragment(camera.id, &1))
-    DetectionAggregator.detections(agg, camera, @policy, observation(camera.id))
+    CameraTracker.detections(tracker, camera, @policy, observation(camera.id))
 
     assert {:event_started, %Event{id: event_id}} = next_lifecycle(camera.id)
     assert %{status: :active} = wait_row(event_id)
 
-    # fire the post-window timer the aggregator armed, with its own token
-    cam = :sys.get_state(agg).cameras[camera.id]
-    send(agg, {:post_window, camera.id, event_id, cam.post_token})
+    # fire the post-window timer the tracker armed, with its own token
+    send(tracker, {:post_window, event_id, :sys.get_state(tracker).post_token})
 
     assert {:event_ended, %Event{id: ^event_id, status: :finalized}} = next_lifecycle(camera.id)
 
@@ -583,7 +583,7 @@ defmodule Cairn.EventExtractorTest do
 
     defp pre_roll(frags), do: Enum.slice(frags, 1, 2)
 
-    # Drives one event to finalized with `batches` cast in as the aggregator
+    # Drives one event to finalized with `batches` cast in as a camera tracker
     # would, returning `%{path:, event:, opened_ms:, live_ms:}`.
     #
     # `opts` may carry `pre_roll: false` (start with an empty ring),
@@ -638,7 +638,7 @@ defmodule Cairn.EventExtractorTest do
 
       # Same sender, same receiver as the batches: the finalize cast cannot
       # overtake them. That is the whole reason the flush needs no draining
-      # handshake — see `Cairn.DetectionAggregator.forward_boxes/3`.
+      # handshake — see `Cairn.CameraTracker.forward_boxes/3`.
       EventExtractor.finalize(pid, %{event | ended_at: DateTime.utc_now(), status: :finalized})
 
       if fun = Keyword.get(opts, :on_clip_ready) do
@@ -1479,7 +1479,7 @@ defmodule Cairn.EventExtractorTest do
   end
 
   # Scoped to one camera: the `"events"` topic is global and a leftover timer
-  # in another test's aggregator can drop a foreign `event_ended` into this
+  # in another test's camera tracker can drop a foreign `event_ended` into this
   # mailbox between the two messages an ordering assertion is comparing.
   defp next_lifecycle(camera_id, timeout \\ 2_000) do
     receive do

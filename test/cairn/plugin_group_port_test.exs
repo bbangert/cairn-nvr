@@ -6,9 +6,9 @@ defmodule Cairn.PluginGroupPortTest do
 
   import ExUnit.CaptureLog
 
+  alias Cairn.{CameraTracker, Event, Observation, PluginGroupPort, StreamEpochs}
   alias Cairn.Config.Camera
   alias Cairn.Config.PluginGroup
-  alias Cairn.{CameraTracker, Event, Observation, PluginGroupPort, StreamEpochs}
 
   defp camera(id, opts \\ []) do
     %Camera{
