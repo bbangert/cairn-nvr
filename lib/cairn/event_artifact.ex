@@ -57,12 +57,15 @@ defmodule Cairn.EventArtifact do
       (deleted by retention, or never inserted).
     * `:index_write_failed` — the row exists but the update was rejected.
     * `:no_output` — ffmpeg wrote no usable file.
+    * `:no_keyframe` — clips only: no keyframe reached the recorder before the
+      event closed, so nothing decodable was ever written. The event row is
+      `partial`, and the file behind it holds an init segment and no samples.
     * `:exception` — the snapshot task raised; see the log for the message.
   """
-  @type reason :: :not_found | :index_write_failed | :no_output | :exception
+  @type reason :: :not_found | :index_write_failed | :no_output | :no_keyframe | :exception
 
   # the same closed set as `t:reason/0`, as a guard-usable list
-  @reasons [:not_found, :index_write_failed, :no_output, :exception]
+  @reasons [:not_found, :index_write_failed, :no_output, :no_keyframe, :exception]
 
   @type kind ::
           :event_clip_ready | :event_clip_failed | :event_snapshot_ready | :event_snapshot_failed

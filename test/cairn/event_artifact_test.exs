@@ -21,7 +21,7 @@ defmodule Cairn.EventArtifactTest do
   end
 
   test "a failed kind carries a reason from the closed set", %{artifact: artifact} do
-    for reason <- [:not_found, :index_write_failed, :no_output, :exception] do
+    for reason <- [:not_found, :index_write_failed, :no_output, :no_keyframe, :exception] do
       EventArtifact.broadcast(:event_clip_failed, %{artifact | reason: reason})
       assert_receive {:event_clip_failed, %EventArtifact{reason: ^reason}}
 

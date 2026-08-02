@@ -36,8 +36,7 @@ defmodule Cairn.Probe do
     port =
       Port.open({:spawn_executable, "/bin/sh"}, [:binary, :exit_status, args: ["-c", cmd]])
 
-    {:os_pid, os_pid} = Port.info(port, :os_pid)
-    collect(port, os_pid, <<>>, timeout_ms)
+    collect(port, os_pid(port), <<>>, timeout_ms)
   end
 
   @doc "Parses ffprobe JSON output into the probe map. Pure."
@@ -62,6 +61,21 @@ defmodule Cairn.Probe do
 
   # -- internals --------------------------------------------------------------
 
+  # `nil` when the port is already gone by the time we ask — a port opened with
+  # `:exit_status` is torn down as the status is *queued*, not as it is read, so
+  # ffprobe giving up on the first read (a missing or truncated file, exit in
+  # low single-digit milliseconds) leaves nothing to inspect. That is not a
+  # failure: the status is already in the mailbox for `collect/4`, and there is
+  # no surviving process for the timeout branch to kill. Matching `{:os_pid, _}`
+  # here instead would raise a MatchError out of `run/2` for a probe that had
+  # already answered. Same shape as `Cairn.ClipRemux.os_pid/1`.
+  defp os_pid(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, os_pid} -> os_pid
+      nil -> nil
+    end
+  end
+
   defp collect(port, os_pid, acc, timeout_ms) do
     started = System.monotonic_time(:millisecond)
 
@@ -77,7 +91,7 @@ defmodule Cairn.Probe do
         {:error, {:ffprobe_exit, status}}
     after
       timeout_ms ->
-        System.cmd("kill", ["-KILL", "#{os_pid}"], stderr_to_stdout: true)
+        if os_pid, do: System.cmd("kill", ["-KILL", "#{os_pid}"], stderr_to_stdout: true)
         safe_close(port)
         {:error, :timeout}
     end

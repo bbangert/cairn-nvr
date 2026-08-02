@@ -38,8 +38,12 @@ defmodule Cairn.EventExtractorTest do
 
     camera_id = "ex_#{System.unique_integer([:positive])}"
     camera = %Camera{id: camera_id, rtsp_url: "rtsp://h/1"}
-    # remux off by default here so the fragment-level assertions below test the
-    # writer itself; the remux behaviour has its own tests.
+    # Remux off by default here so the fragment-level assertions below can
+    # read the file back with `Demuxer` — a remuxed clip has no `moof` left to
+    # parse. The tests that need the real thing turn it back on per test
+    # (`remux_clips: true`), and what the remux does to a clip's *front* — the
+    # leading empty edit it writes for samples it could not decode — is
+    # `Cairn.ClipRemuxTest`.
     config = %Config{
       data_dir: dir,
       udp_base_port: 17_000,
@@ -826,37 +830,43 @@ defmodule Cairn.EventExtractorTest do
       )
     end
 
-    test "an empty pre-roll and no live fragment leaves both media positions nil",
+    test "an empty pre-roll and no live fragment leaves no sidecar to place",
          %{camera: camera, config: config, frags: frags} do
       # Nothing put into the ring and nothing arriving after: a camera whose
       # pre-window has not filled yet, on an event too short to see a fragment.
-      # The browser's documented fallback (`duration − event_seconds`) exists
-      # for exactly this file, so the nils have to be real.
+      # No fragment was written, so there is no clip and no anchor half at all —
+      # this used to leave a sidecar whose two media positions were both nil, a
+      # file that existed only to say nothing beside a clip announced ready. The
+      # reader's side of that shape (an anchor that can place nothing answers
+      # `:error` rather than guessing) is covered in `Cairn.TrackPathTest`.
       %{path: path, event: event} =
-        run_with_boxes(
-          camera,
-          config,
-          frags,
-          [%{t_ms: 0, boxes: [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], false}]}],
-          pre_roll: false
-        )
+        capture_and_run(fn ->
+          run_with_boxes(
+            camera,
+            config,
+            frags,
+            [%{t_ms: 0, boxes: [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], false}]}],
+            pre_roll: false
+          )
+        end)
 
-      assert %{
-               "first_pts" => nil,
-               "timescale" => nil,
-               "drained_span_ms" => nil,
-               "drain_wall_ms" => drain_wall_ms,
-               "live_media_ms" => nil,
-               "live_wall_ms" => nil,
-               "event_started_ms" => event_started_ms
-             } = sidecar!(path)["anchor"]
+      refute File.exists?(Cairn.DataDir.trackpath_for_clip(path))
 
-      assert is_integer(drain_wall_ms)
-      assert event_started_ms == DateTime.to_unix(event.started_at, :millisecond)
+      event_id = event.id
 
-      # Two wall clocks and not one media position between them: nothing here
-      # can place a path, and a reader has to say so rather than guess.
-      assert Cairn.TrackPath.anchor_clip_ms(sidecar!(path)["anchor"], 0) == :error
+      assert_receive {:event_clip_failed,
+                      %EventArtifact{event_id: ^event_id, reason: :no_keyframe}}
+
+      assert %{status: :partial} = Events.get(event_id)
+    end
+
+    # `capture_log/1` answers the log, not the block's value; the no-media path
+    # logs a warning that would otherwise print through the suite.
+    defp capture_and_run(fun) do
+      test_pid = self()
+      capture_log(fn -> send(test_pid, {:ran, fun.()}) end)
+      assert_received {:ran, result}
+      result
     end
 
     test "an event that saw no boxes writes no file at all",
@@ -1068,6 +1078,404 @@ defmodule Cairn.EventExtractorTest do
       refute File.exists?(sidecar)
       refute File.exists?(path)
       assert Events.get(event.id) == nil
+    end
+  end
+
+  # The whole of this block runs on `@mid_gop_fixture`, whose fragments are
+  # NOT all keyframe-headed — the dimension `testsrc.fmp4` holds constant, and
+  # the one every assertion here turns on.
+  describe "the clip starts on a keyframe" do
+    # 8 one-second fragments at timescale 10_240; fragments 0, 3 and 6 open a
+    # GOP and the rest sit inside one. Written out because the fragment
+    # indexes below are meaningless without it.
+    @gop_timescale 10_240
+
+    test "a pre-roll that starts mid-GOP is cut back to the first keyframe",
+         %{camera: camera, config: config} do
+      frags = mid_gop_frags(camera.id)
+
+      # Fragments 1 and 2 are inside fragment 0's GOP; 3 opens the next one.
+      # Handed to the remux as-is, 1 and 2 are samples `-c copy` cannot carry
+      # and it drops them, recording a 2_000 ms empty edit in their place.
+      %{path: path, pid: pid, event: event} =
+        run_keyframe_case(camera, %{config | remux_clips: true},
+          drained: take(frags, [1, 2, 3, 4])
+        )
+
+      written = :sys.get_state(pid).fragments
+
+      finalize!(pid, event)
+
+      out = File.read!(path)
+      refute Cairn.MP4Boxes.leading_empty_edit?(out)
+      refute Enum.any?(Cairn.MP4Boxes.edit_list(out), &match?({_, -1}, &1))
+
+      [start_time, duration] = probe(path, "format=start_time,duration")
+      assert_in_delta start_time, 0.0, 0.001
+
+      anchor = sidecar!(path)["anchor"]
+
+      # Measured from the KEPT head: fragment 3's pts, and the 2_000 ms that
+      # fragments 3 and 4 span. Reading them off the drained list instead
+      # would leave 10_240 and 4_000 here — the dropped fragments counted as
+      # media the file does not hold.
+      assert anchor["first_pts"] == 3 * @gop_timescale
+      assert anchor["timescale"] == @gop_timescale
+      assert anchor["drained_span_ms"] == 2_000
+
+      # And the property all of it exists for: where the anchor puts the
+      # event's t=0 is where the file's playable media ends. `start_time` is
+      # 0.0 above, so `duration` is entirely media — no empty edit inflating
+      # it — and the anchor agrees with it to within the sub-second gap
+      # between the event's start and the drain's clock.
+      assert {:ok, clip_ms} = Cairn.TrackPath.anchor_clip_ms(anchor, 0)
+      assert_in_delta clip_ms / 1000, duration - start_time, 0.25
+
+      assert written == 2
+    end
+
+    test "only the leading run is dropped, not every fragment inside a GOP",
+         %{camera: camera, config: config} do
+      # Fragment 3 opens a GOP and 4 and 5 are inside it — the clip needs all
+      # three. A rule that dropped every non-keyframe fragment rather than the
+      # leading run would keep one fragment here and throw away two seconds of
+      # perfectly decodable video.
+      frags = mid_gop_frags(camera.id)
+
+      %{path: path, pid: pid, event: event} =
+        run_keyframe_case(camera, config, drained: take(frags, [3, 4, 5]))
+
+      assert :sys.get_state(pid).fragments == 3
+
+      finalize!(pid, event)
+
+      anchor = sidecar!(path)["anchor"]
+      assert anchor["first_pts"] == 3 * @gop_timescale
+      assert anchor["drained_span_ms"] == 3_000
+
+      {_d, events} = Demuxer.push(Demuxer.new("check"), File.read!(path))
+      out_frags = for {:fragment, f} <- events, do: f.pts
+      assert out_frags == Enum.map(3..5, &(&1 * @gop_timescale))
+    end
+
+    test "a pre-roll with no keyframe in it leaves nothing, and a live keyframe opens the clip",
+         %{camera: camera, config: config} do
+      # Both drained fragments are mid-GOP, so the drain contributes nothing
+      # and the file holds only its init segment until fragment 3 arrives.
+      frags = mid_gop_frags(camera.id)
+
+      %{path: path, pid: pid, event: event} =
+        run_keyframe_case(camera, config,
+          drained: take(frags, [1, 2]),
+          live: take(frags, [3, 4])
+        )
+
+      assert :sys.get_state(pid).fragments == 2
+
+      finalize!(pid, event)
+
+      anchor = sidecar!(path)["anchor"]
+
+      # An empty kept pre-roll is the same shape as an empty ring: no media
+      # position in the drain half at all.
+      assert anchor["first_pts"] == nil
+      assert anchor["drained_span_ms"] == nil
+      # Fragment 3 is the first thing the file holds, so it starts at the
+      # clip's t=0 and its own 1_000 ms is where it ends.
+      assert anchor["live_media_ms"] == 1_000
+
+      {_d, events} = Demuxer.push(Demuxer.new("check"), File.read!(path))
+      assert [{:init, _} | out] = events
+
+      assert Enum.map(out, fn {:fragment, f} -> f.pts end) == [
+               3 * @gop_timescale,
+               4 * @gop_timescale
+             ]
+    end
+
+    test "live fragments before the first keyframe are skipped like drained ones",
+         %{camera: camera, config: config} do
+      # Nothing drained, and the ring then streams the middle of a GOP — a
+      # camera whose ring was just cleared by an ffmpeg respawn. Without the
+      # live path applying the same rule, the empty edit comes straight back
+      # through here.
+      frags = mid_gop_frags(camera.id)
+
+      %{path: path, pid: pid, event: event} =
+        run_keyframe_case(camera, %{config | remux_clips: true},
+          drained: [],
+          live: take(frags, [1, 2, 3, 4])
+        )
+
+      assert %{fragments: 2, skipped_fragments: 2, skipped_ms: 2_000} = :sys.get_state(pid)
+
+      finalize!(pid, event)
+
+      refute Cairn.MP4Boxes.leading_empty_edit?(File.read!(path))
+      [start_time, _duration] = probe(path, "format=start_time,duration")
+      assert_in_delta start_time, 0.0, 0.001
+
+      anchor = sidecar!(path)["anchor"]
+      assert anchor["first_pts"] == nil
+      assert anchor["live_media_ms"] == 1_000
+    end
+
+    test "a keyframe-aligned camera loses no pre-roll at all",
+         %{camera: camera, config: config, frags: frags} do
+      # `testsrc.fmp4`, where every fragment opens a GOP — a reolink-class
+      # camera. Nothing may be dropped here, and the anchor must be exactly
+      # what it was before any of this existed.
+      %{path: path, pid: pid, event: event} =
+        run_keyframe_case(camera, config, drained: pre_roll(frags))
+
+      assert :sys.get_state(pid).fragments == 2
+      assert :sys.get_state(pid).skipped_fragments == 0
+
+      finalize!(pid, event)
+
+      anchor = sidecar!(path)["anchor"]
+      assert anchor["first_pts"] == 10_240
+      assert anchor["drained_span_ms"] == 2_000
+    end
+
+    test "a shortened drained pre-roll is reported once, at debug, and in the drain telemetry",
+         %{camera: camera, config: config} do
+      ref = :telemetry_test.attach_event_handlers(self(), [[:cairn, :extractor, :drained]])
+      on_exit(fn -> :telemetry.detach(ref) end)
+
+      frags = mid_gop_frags(camera.id)
+
+      log =
+        at_debug_level(fn ->
+          %{pid: pid, event: event} =
+            run_keyframe_case(camera, config, drained: take(frags, [1, 2, 3]))
+
+          finalize!(pid, event)
+        end)
+
+      assert log =~ "dropped 2 leading fragment(s) (2000ms)"
+      # one line per clip, not one per dropped fragment
+      assert log |> String.split("dropped 2 leading") |> length() == 2
+
+      # And the same split, as numbers: one fragment kept of the three drained.
+      assert_received {[:cairn, :extractor, :drained], ^ref, %{fragments: 1, skipped: 2}, _meta}
+    end
+
+    test "fragments skipped on the live path are reported the same way",
+         %{camera: camera, config: config} do
+      # The drain telemetry cannot carry these — it fired before they arrived —
+      # so the debug line is the only report of a live-path skip, and it is
+      # written when the keyframe finally opens the clip.
+      frags = mid_gop_frags(camera.id)
+
+      log =
+        at_debug_level(fn ->
+          %{pid: pid, event: event} =
+            run_keyframe_case(camera, config, drained: [], live: take(frags, [1, 2, 3]))
+
+          finalize!(pid, event)
+        end)
+
+      assert log =~ "dropped 2 leading fragment(s) (2000ms)"
+      assert log |> String.split("dropped 2 leading") |> length() == 2
+    end
+
+    test "an event that never sees a keyframe says so once, at finalize",
+         %{camera: camera, config: config} do
+      # No keyframe ever arrives, so `open_media/1` never runs and the clip
+      # holds its init segment alone. The other end of the report.
+      frags = mid_gop_frags(camera.id)
+
+      log =
+        at_debug_level(fn ->
+          %{pid: pid, event: event} =
+            run_keyframe_case(camera, config, drained: take(frags, [1, 2]))
+
+          assert %{fragments: 0, started?: false} = :sys.get_state(pid)
+          finalize!(pid, event)
+        end)
+
+      assert log =~ "dropped 2 leading fragment(s) (2000ms)"
+      assert log |> String.split("dropped 2 leading") |> length() == 2
+    end
+
+    # The shape this guards is the shipped default's, not a contrivance: a 5 s
+    # ring against a 10 s GOP drops the whole drained pre-roll, and an event
+    # that closes before the next keyframe leaves a file holding its init
+    # segment alone. Announcing that `:event_clip_ready` put a `<video>` in
+    # front of a file with no frames in it, and sent a snapshot after a frame
+    # that does not exist.
+    test "an event that never sees a keyframe is announced failed, not ready",
+         %{camera: camera, config: config} do
+      frags = mid_gop_frags(camera.id)
+      test_pid = self()
+
+      %{path: path, pid: pid, event: event} =
+        run_keyframe_case(camera, %{config | remux_clips: true},
+          drained: take(frags, [1, 2]),
+          snapshot_fun: fn row, _cfg -> send(test_pid, {:snapshot_requested, row.id}) end,
+          # Nothing may reach ffmpeg: there is nothing to rebase, and a remux of
+          # an init segment either fails or writes a 0-duration mp4 over it.
+          remux_fun: fn _path ->
+            send(test_pid, :remux_ran)
+            :error
+          end
+        )
+
+      assert %{fragments: 0, started?: false} = :sys.get_state(pid)
+
+      log = capture_log(fn -> finalize!(pid, event) end)
+      assert log =~ "no keyframe arrived before the event closed"
+
+      event_id = event.id
+      camera_id = camera.id
+
+      assert_receive {:event_clip_failed,
+                      %EventArtifact{
+                        event_id: ^event_id,
+                        camera_id: ^camera_id,
+                        path: nil,
+                        bytes: nil,
+                        reason: :no_keyframe
+                      }}
+
+      refute_received {:event_clip_ready, %EventArtifact{event_id: ^event_id}}
+      refute_received :remux_ran
+      # `:event_clip_failed` is terminal: no frame to cut a snapshot from
+      refute_received {:snapshot_requested, ^event_id}
+
+      # A box was cast in, so a sidecar would have been written had this gone
+      # down the ready path — and it would have been a file whose anchor can
+      # place nothing, both halves being empty.
+      refute File.exists?(Cairn.DataDir.trackpath_for_clip(path))
+
+      # The row is closed `partial` over the file that is really there: not
+      # `finalized`, which claims a clip, and not deleted, which would leave the
+      # row naming a file boot reconciliation then deletes the row for.
+      row = Events.get(event_id)
+      assert row.status == :partial
+      assert row.ended_at != nil
+      assert row.bytes == File.stat!(path).size
+      assert row.bytes > 0
+
+      # what those bytes are: the init segment, no fragment behind it
+      assert {_d, [{:init, _}]} = Demuxer.push(Demuxer.new("check"), File.read!(path))
+    end
+
+    test "a keyframe that lands just before finalize leaves the ready path intact",
+         %{camera: camera, config: config} do
+      # The near miss: the same all-dropped drain, and fragment 3 arriving with
+      # the event still open. One fragment is a clip.
+      frags = mid_gop_frags(camera.id)
+      test_pid = self()
+
+      %{path: path, pid: pid, event: event} =
+        run_keyframe_case(camera, config,
+          drained: take(frags, [1, 2]),
+          live: take(frags, [3]),
+          snapshot_fun: fn row, _cfg -> send(test_pid, {:snapshot_requested, row.id}) end
+        )
+
+      assert %{fragments: 1, started?: true} = :sys.get_state(pid)
+
+      finalize!(pid, event)
+
+      event_id = event.id
+      assert_receive {:event_clip_ready, %EventArtifact{event_id: ^event_id, reason: nil}}
+      refute_received {:event_clip_failed, %EventArtifact{event_id: ^event_id}}
+      assert_received {:snapshot_requested, ^event_id}
+
+      assert %{status: :finalized} = Events.get(event_id)
+      assert File.exists?(Cairn.DataDir.trackpath_for_clip(path))
+      assert sidecar!(path)["anchor"]["live_media_ms"] == 1_000
+    end
+
+    # The suite runs at `:warning`, and `capture_log`'s own `:level` cannot go
+    # under the primary level — it filters what a handler keeps, not what
+    # `Logger` emits. This module is `async: false`, so it has the sync phase
+    # to itself and nothing else can see the raised level.
+    defp at_debug_level(fun) do
+      previous = Logger.level()
+      Logger.configure(level: :debug)
+
+      try do
+        capture_log(fun)
+      after
+        Logger.configure(level: previous)
+      end
+    end
+
+    @mid_gop_fixture "test/support/fixtures/media/testsrc_gop3.fmp4"
+
+    # Re-inits the camera's ring from the mid-GOP fixture and answers its
+    # fragments. `put_init/5` clears the ring, so this also drops whatever the
+    # outer setup put there; both are casts to the same GenServer, so the
+    # fragments a caller puts next cannot overtake it.
+    defp mid_gop_frags(camera_id) do
+      {_d, events} = Demuxer.push(Demuxer.new(camera_id), File.read!(@mid_gop_fixture))
+      [{:init, init} | rest] = events
+
+      RingBuffer.put_init(camera_id, init.data, init.codec, init.timescale, Cairn.ULID.generate())
+
+      for {:fragment, f} <- rest, do: f
+    end
+
+    defp take(frags, indexes), do: Enum.map(indexes, &Enum.at(frags, &1))
+
+    # Fills the ring with `:drained`, starts an extractor over it, then feeds
+    # `:live` and waits for the writer to settle. Returns the live pid so a
+    # caller can read `fragments`/`skipped_fragments` before finalizing —
+    # which is the assertion in most of these.
+    defp run_keyframe_case(camera, config, opts) do
+      drained = Keyword.fetch!(opts, :drained)
+      live = Keyword.get(opts, :live, [])
+      Enum.each(drained, &RingBuffer.put_fragment(camera.id, &1))
+
+      event = new_event(camera)
+
+      pid =
+        start_supervised!(
+          {EventExtractor,
+           [
+             camera: camera,
+             event: event,
+             config: config,
+             snapshot_fun: Keyword.get(opts, :snapshot_fun, fn _row, _cfg -> :ok end)
+           ] ++ Keyword.take(opts, [:remux_fun])},
+          id: {:extractor, event.id}
+        )
+
+      assert %{status: :active, path: path} = wait_row(event.id)
+
+      # A system message only comes back once the continue has returned, so
+      # the drained fragments are all written (or all skipped) by here and the
+      # live ones below cannot be confused with them.
+      opened = :sys.get_state(pid).fragments
+      Enum.each(live, &RingBuffer.put_fragment(camera.id, &1))
+      wait_until(fn -> :sys.get_state(pid).fragments >= opened end)
+      if live != [], do: wait_until(fn -> :sys.get_state(pid).started? end)
+
+      # One box, so the sidecar is written at all: the anchor is what these
+      # tests read, and an event with no boxes deliberately writes no file.
+      GenServer.cast(
+        pid,
+        {:track_boxes, %{t_ms: 0, boxes: [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], false}]}}
+      )
+
+      %{path: path, pid: pid, event: event}
+    end
+
+    defp finalize!(pid, event) do
+      ref = Process.monitor(pid)
+      EventExtractor.finalize(pid, %{event | ended_at: DateTime.utc_now(), status: :finalized})
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 10_000
+    end
+
+    defp probe(path, entries) do
+      {out, 0} =
+        System.cmd("ffprobe", ~w(-v error -show_entries #{entries} -of csv=p=0) ++ [path])
+
+      out |> String.trim() |> String.split(",") |> Enum.map(&elem(Float.parse(&1), 0))
     end
   end
 

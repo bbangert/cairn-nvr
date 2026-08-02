@@ -16,8 +16,20 @@ defmodule Cairn.ExtractorTelemetry do
   @doc false
   def handle_event([:cairn, :extractor, :drained], measurements, metadata, _config) do
     Logger.debug(
-      "event #{metadata.event_id} (#{metadata.camera_id}): drained " <>
-        "#{measurements.fragments} pre-window fragments (#{measurements.bytes} bytes)"
+      "event #{metadata.event_id} (#{metadata.camera_id}): kept " <>
+        "#{measurements.fragments} pre-window fragments (#{measurements.bytes} bytes), " <>
+        "skipped #{measurements.skipped} before the first keyframe"
+    )
+  end
+
+  # Zero fragments is the event no keyframe ever reached: the bytes are an init
+  # segment and nothing else, and `Cairn.EventExtractor` announced it as a
+  # failed clip. A line saying "clip written" is the same false success the
+  # broadcast is careful not to be.
+  def handle_event([:cairn, :extractor, :finalized], %{fragments: 0} = measurements, metadata, _c) do
+    Logger.info(
+      "event #{metadata.event_id} (#{metadata.camera_id}): no clip written — " <>
+        "no keyframe arrived in #{measurements.write_duration_ms}ms"
     )
   end
 
