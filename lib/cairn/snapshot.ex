@@ -7,7 +7,7 @@ defmodule Cairn.Snapshot do
   (`Cairn.EventArtifact`), so a consumer knows whether to fetch or to give up.
 
   When the event carries a `trigger` (the highest-scoring detection, captured
-  by `Cairn.DetectionAggregator`), the frame is cut from that detection's
+  by `Cairn.CameraTracker`), the frame is cut from that detection's
   moment in the clip and its bounding box + label are drawn on top — a
   Frigate-style "why did this record" thumbnail. The seek lands on the nearest
   keyframe (fast `-ss`), so on a long GOP the box can be a beat off the exact

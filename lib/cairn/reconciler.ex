@@ -65,11 +65,12 @@ defmodule Cairn.Reconciler do
     known_ids = MapSet.new(rows, & &1.id)
     adopted = adopt_orphans(config, known_ids)
 
-    # Deliberately not coordinated with the aggregator's checkpoint restore,
-    # which closes the tracks of cameras that had an open event. That restore
-    # has already run (the aggregator starts before `Cairn.Boot`), but it hands
-    # its closes to `Cairn.TrackRecorder`, which writes them a flush interval
-    # later — so either write can reach the table first. Both say
+    # Deliberately not coordinated with the camera trackers' checkpoint restore,
+    # which closes the tracks of cameras that had an open event. That restore is
+    # kicked off before `Cairn.Boot` (`Cairn.TrackerSupervisor` and its sweep are
+    # earlier children) but runs in a task of its own, and it hands its closes to
+    # `Cairn.TrackRecorder`, which writes them a flush interval later — so either
+    # write can reach the table first. Both say
     # `:host_restart` and track rows upsert, so whichever lands second wins and
     # the only thing at stake is `ended_at`: the restore's `last_seen_at` (the
     # track's own last observation) against the `updated_at` this derives from,

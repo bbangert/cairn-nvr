@@ -9,12 +9,12 @@ defmodule Cairn.StreamEpochs do
   Consumers subscribe to `"stream_epochs"` for `{:stream_epoch, camera_id,
   epoch, reason}` and/or read `current/1` straight from ETS.
 
-  Written by `Cairn.FFmpegPort`; read by `Cairn.DetectionAggregator` and
+  Written by `Cairn.FFmpegPort`; read by `Cairn.CameraTracker` and
   the ring buffer's init-segment metadata.
 
   The table is owned by this GenServer and dies with it: after a crash every
   camera reads back `:unknown` until its next spawn re-mints. That is
-  accepted — the aggregator ends tracks on epoch *change*, and a re-mint is
+  accepted — a camera's tracker ends tracks on epoch *change*, and a re-mint is
   a change, which is exactly the conservative outcome.
   """
 
@@ -47,7 +47,7 @@ defmodule Cairn.StreamEpochs do
   The cost of the contract is that one mint may be *announced twice* (the
   degraded path below broadcasts, and a call that timed out may still be
   served). Consumers must treat a repeat of the epoch they already hold as a
-  no-op — see `Cairn.DetectionAggregator`.
+  no-op — see `Cairn.CameraTracker`.
 
   `:camera_stopped` mints an epoch nobody streams under — it is how the end
   of a stream is announced to subscribers.

@@ -1,13 +1,13 @@
 defmodule Cairn.PluginPortTest do
   # async: false — these tests share the "events" PubSub topic and capture_log.
-  # DataCase because they start a real aggregator, whose checkpoint restore
+  # DataCase because they start real camera trackers, whose checkpoint restore
   # consults the event index.
   use Cairn.DataCase, async: false
 
   import ExUnit.CaptureLog
 
   alias Cairn.Config.Camera
-  alias Cairn.{DetectionAggregator, Event, Observation, PluginPort, StreamEpochs, ULID}
+  alias Cairn.{CameraTracker, Event, Observation, PluginPort, StreamEpochs, ULID}
 
   @mock Path.absname("priv/plugins/mock/mock_plugin.exs")
   @timeline Path.absname("test/support/fixtures/timelines/person_walkthrough.json")
@@ -102,7 +102,7 @@ defmodule Cairn.PluginPortTest do
     assert Jason.decode!(json) == %{"default" => 0.5}
   end
 
-  test "mock plugin timeline drives the aggregator through a full Port" do
+  test "mock plugin timeline drives the camera tracker through a full Port" do
     id = "plug_#{System.unique_integer([:positive])}"
     test_pid = self()
 
@@ -110,15 +110,14 @@ defmodule Cairn.PluginPortTest do
     # on stdin, and the port drops anything from another epoch
     StreamEpochs.new_epoch(id, :started)
 
-    agg =
-      start_supervised!(
-        {DetectionAggregator,
-         name: nil,
-         start_extractor: fn _camera, _event ->
-           {:ok, spawn(fn -> Process.sleep(:infinity) end)}
-         end,
-         finalize_extractor: fn _pid, event -> send(test_pid, {:finalized, event}) end}
-      )
+    start_supervised!(
+      {CameraTracker,
+       camera_id: id,
+       start_extractor: fn _camera, _event ->
+         {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+       end,
+       finalize_extractor: fn _pid, event -> send(test_pid, {:finalized, event}) end}
+    )
 
     Event.subscribe()
 
@@ -127,8 +126,7 @@ defmodule Cairn.PluginPortTest do
         "--min-score-json '{}' --timeline #{@timeline}; exec sleep 30"
 
     start_supervised!(
-      {PluginPort,
-       camera: camera(id), config: config(), index: 0, command: command, aggregator: agg}
+      {PluginPort, camera: camera(id), config: config(), index: 0, command: command}
     )
 
     assert_receive {:event_started, %Event{camera_id: ^id} = event}, 5_000
@@ -143,12 +141,11 @@ defmodule Cairn.PluginPortTest do
   test "malformed lines are dropped without crashing" do
     id = "plug_#{System.unique_integer([:positive])}"
 
-    agg =
-      start_supervised!(
-        {DetectionAggregator,
-         name: nil,
-         start_extractor: fn _c, _e -> {:ok, spawn(fn -> Process.sleep(:infinity) end)} end}
-      )
+    start_supervised!(
+      {CameraTracker,
+       camera_id: id,
+       start_extractor: fn _c, _e -> {:ok, spawn(fn -> Process.sleep(:infinity) end)} end}
+    )
 
     Event.subscribe()
 
@@ -161,8 +158,7 @@ defmodule Cairn.PluginPortTest do
 
     pid =
       start_supervised!(
-        {PluginPort,
-         camera: camera(id), config: config(), index: 0, command: command, aggregator: agg}
+        {PluginPort, camera: camera(id), config: config(), index: 0, command: command}
       )
 
     assert_receive {:event_started, %Cairn.Event{camera_id: ^id}}, 5_000
@@ -190,7 +186,7 @@ defmodule Cairn.PluginPortTest do
     pid =
       start_supervised!(
         {PluginPort,
-         camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
+         camera: camera(id), config: config(), index: 0, command: command, tracker: self()}
       )
 
     assert_receive {:"$gen_cast",
@@ -198,7 +194,7 @@ defmodule Cairn.PluginPortTest do
                    5_000
 
     # resolved once at spawn and carried on every cast — the per-frame path
-    # must never reach the config server, and the aggregator reads
+    # must never reach the config server, and the camera tracker reads
     # `max_unseen_ms` from here to expire tracks
     assert policy == Cairn.Config.policy(config(), camera(id))
     assert policy == :sys.get_state(pid).policy
@@ -215,13 +211,13 @@ defmodule Cairn.PluginPortTest do
     assert %PluginPort{} = :sys.get_state(pid)
   end
 
-  test "a malformed bbox never reaches the tracker through the aggregator" do
+  test "a malformed bbox never reaches `Cairn.Tracker`" do
     id = "plug_#{System.unique_integer([:positive])}"
 
-    agg =
+    tracker =
       start_supervised!(
-        {DetectionAggregator,
-         name: nil,
+        {CameraTracker,
+         camera_id: id,
          start_extractor: fn _c, _e -> {:ok, spawn(fn -> Process.sleep(:infinity) end)} end}
       )
 
@@ -238,8 +234,7 @@ defmodule Cairn.PluginPortTest do
 
     pid =
       start_supervised!(
-        {PluginPort,
-         camera: camera(id), config: config(), index: 0, command: command, aggregator: agg}
+        {PluginPort, camera: camera(id), config: config(), index: 0, command: command}
       )
 
     assert_receive {:event_started, %Event{camera_id: ^id} = event}, 5_000
@@ -248,9 +243,9 @@ defmodule Cairn.PluginPortTest do
     # only reachable if the batch *after* the poisoned one was tracked: pre-fix
     # :event_started fired on line 1 and the crash landed on line 2
     assert_receive {:event_updated, %Event{camera_id: ^id}}, 5_000
-    # a round-trip through each: the aggregator survived the poisoned batch and
+    # a round-trip through each: the camera tracker survived the poisoned batch and
     # the port survived forwarding it
-    assert %{} = :sys.get_state(agg)
+    assert %{} = :sys.get_state(tracker)
     assert %PluginPort{} = :sys.get_state(pid)
   end
 
@@ -264,7 +259,7 @@ defmodule Cairn.PluginPortTest do
     pid =
       start_supervised!(
         {PluginPort,
-         camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
+         camera: camera(id), config: config(), index: 0, command: command, tracker: self()}
       )
 
     assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, _policy, %Observation{pts: 7}}},
@@ -285,7 +280,7 @@ defmodule Cairn.PluginPortTest do
       capture_log(fn ->
         start_supervised!(
           {PluginPort,
-           camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
+           camera: camera(id), config: config(), index: 0, command: command, tracker: self()}
         )
 
         # ordered after the flood: the port handles lines in order
@@ -305,7 +300,7 @@ defmodule Cairn.PluginPortTest do
 
     start_supervised!(
       {PluginPort,
-       camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
+       camera: camera(id), config: config(), index: 0, command: command, tracker: self()}
     )
 
     # pulled from ETS at spawn: no broadcast is involved, so nothing is lost
@@ -357,11 +352,7 @@ defmodule Cairn.PluginPortTest do
         # `exec` so the port's SIGTERM reaches the sleep itself: a plain
         # `sleep` is a child of the sh the port kills, and would outlive the
         # test holding its inherited stdout open
-        camera: camera(id),
-        config: config(),
-        index: 0,
-        command: "exec sleep 60",
-        aggregator: self()
+        camera: camera(id), config: config(), index: 0, command: "exec sleep 60", tracker: self()
       })
 
     # far more than the pipe buffer plus the port's busy watermark, so the
@@ -414,14 +405,14 @@ defmodule Cairn.PluginPortTest do
     pid =
       start_supervised!(
         {PluginPort,
-         camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
+         camera: camera(id), config: config(), index: 0, command: command, tracker: self()}
       )
 
     assert_receive {:"$gen_cast",
                     {:detections, %Camera{id: ^id}, _policy, %Observation{sequence: 1}}},
                    5_000
 
-    # the stale line never reaches the aggregator; the next good one does
+    # the stale line never reaches the camera tracker; the next good one does
     assert_receive {:"$gen_cast",
                     {:detections, %Camera{id: ^id}, _policy, %Observation{sequence: 5}}},
                    5_000
@@ -441,11 +432,7 @@ defmodule Cairn.PluginPortTest do
         # a plugin that emits nothing: every line below is fed by hand, so
         # the epoch changes land at an exact point in the stream rather than
         # wherever the shell's output happens to be
-        camera: camera(id),
-        config: config(),
-        index: 0,
-        command: "exec sleep 30",
-        aggregator: self()
+        camera: camera(id), config: config(), index: 0, command: "exec sleep 30", tracker: self()
       })
 
     port = :sys.get_state(pid).port
@@ -528,7 +515,7 @@ defmodule Cairn.PluginPortTest do
              config: config(),
              index: 0,
              command: printf([hello, status]) <> "; exec sleep 30",
-             aggregator: self()}
+             tracker: self()}
           )
 
         assert_receive {:camera_status, ^id, info}, 5_000
@@ -564,7 +551,7 @@ defmodule Cairn.PluginPortTest do
     pid =
       start_supervised!(
         {PluginPort,
-         camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
+         camera: camera(id), config: config(), index: 0, command: command, tracker: self()}
       )
 
     # ordered after all three: the port handles lines in order, so the last
@@ -597,7 +584,7 @@ defmodule Cairn.PluginPortTest do
     pid =
       start_supervised!(
         {PluginPort,
-         camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
+         camera: camera(id), config: config(), index: 0, command: command, tracker: self()}
       )
 
     # an hour-ahead plugin clock would future-date the event past every
@@ -627,7 +614,7 @@ defmodule Cairn.PluginPortTest do
     pid =
       start_supervised!(
         {PluginPort,
-         camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
+         camera: camera(id), config: config(), index: 0, command: command, tracker: self()}
       )
 
     assert [_started] = await_control(path, 1)
@@ -677,7 +664,7 @@ defmodule Cairn.PluginPortTest do
         capture_log(fn ->
           start_supervised!(
             {PluginPort,
-             camera: camera(id), config: config(), index: 0, command: command, aggregator: self()},
+             camera: camera(id), config: config(), index: 0, command: command, tracker: self()},
             id: {:cap, declared}
           )
 
@@ -711,7 +698,7 @@ defmodule Cairn.PluginPortTest do
     pid =
       start_supervised!(
         {PluginPort,
-         camera: camera(id), config: config(), index: 0, command: command, aggregator: self()}
+         camera: camera(id), config: config(), index: 0, command: command, tracker: self()}
       )
 
     assert_receive {:"$gen_cast", {:detections, %Camera{id: ^id}, policy, %Observation{pts: 1}}},
@@ -749,7 +736,7 @@ defmodule Cairn.PluginPortTest do
          config: config(),
          index: 0,
          command: "exit 0",
-         aggregator: self(),
+         tracker: self(),
          backoff_min_ms: 60_000,
          backoff_max_ms: 60_000}
       )
@@ -787,12 +774,11 @@ defmodule Cairn.PluginPortTest do
   test "plugin exit triggers backoff respawn" do
     id = "plug_#{System.unique_integer([:positive])}"
 
-    agg =
-      start_supervised!(
-        {DetectionAggregator,
-         name: nil,
-         start_extractor: fn _c, _e -> {:ok, spawn(fn -> Process.sleep(:infinity) end)} end}
-      )
+    start_supervised!(
+      {CameraTracker,
+       camera_id: id,
+       start_extractor: fn _c, _e -> {:ok, spawn(fn -> Process.sleep(:infinity) end)} end}
+    )
 
     Event.subscribe()
 
@@ -805,7 +791,6 @@ defmodule Cairn.PluginPortTest do
        config: config(),
        index: 0,
        command: command,
-       aggregator: agg,
        backoff_min_ms: 50,
        backoff_max_ms: 100}
     )

@@ -15,7 +15,7 @@ defmodule Cairn.Tracker do
   observation of the track, predicted ones included — slow inference must not
   kill a track — and, as below, on a box the track refuses. Evidence policy is
   separate: a track whose last **detection** is older than `max_unseen_ms` is
-  flagged `stale_predicted`, and the aggregator refuses it as event evidence
+  flagged `stale_predicted`, and `Cairn.CameraTracker` refuses it as event evidence
   however long the plugin keeps predicting it.
 
   A track the tracker has judged **stationary** (see below) expires at
@@ -148,7 +148,7 @@ defmodule Cairn.Tracker do
   `stationary` flag itself: a car that matches its own parking space was
   parked for the whole gap, so it resumes **already** stationary and its
   settle window does not re-arm — which is the point of all of this, since
-  `Cairn.DetectionAggregator` refuses a stationary track as evidence and a
+  `Cairn.CameraTracker` refuses a stationary track as evidence and a
   re-minted one would spend `stationary_after_ms` looking like a new arrival,
   i.e. like a clip. Resuming the flag is not the same as freezing it: what
   happens to it on the adopting batch is below.
@@ -270,7 +270,7 @@ defmodule Cairn.Tracker do
   The flag is not only reported: expiry keys off it, so anything that reads as
   stationary — either blind spot included — also gets the longer unseen bound
   and the strict re-match threshold that comes with it, and
-  `Cairn.DetectionAggregator` refuses it as event evidence for as long as it
+  `Cairn.CameraTracker` refuses it as event evidence for as long as it
   is set.
 
   Bboxes are `[x, y, w, h]` in any consistent unit (normalized or pixels).
@@ -420,7 +420,7 @@ defmodule Cairn.Tracker do
   # already puts the median at 0.64 against the anchor, under `@stationary_iou`
   # with room to spare. The dip lasted a batch or two and the median could not
   # absorb it; the flag cleared, `started_moving` went out, and the car became
-  # evidence again (`Cairn.DetectionAggregator` refuses only a stationary
+  # evidence again (`Cairn.CameraTracker` refuses only a stationary
   # track), which opened a clip. One car in an otherwise empty scene produced
   # about ten of them in 25 minutes.
   #
@@ -516,7 +516,7 @@ defmodule Cairn.Tracker do
   @doc """
   Builds the tracking context for one observation.
 
-  `camera_id` is the caller's — the aggregator keys its state by the
+  `camera_id` is the caller's — there is one `Cairn.CameraTracker` per
   *configured* camera, and that is what a track summary must name, whatever
   the plugin put on the wire.
 
@@ -627,7 +627,7 @@ defmodule Cairn.Tracker do
   """
   @spec suspend(t(), pos_integer(), DateTime.t()) :: {t(), [event()], suspension()}
   # A camera no observation has ever reached. In production that is a tracker
-  # with nothing in it — `Cairn.DetectionAggregator` stamps every observation
+  # with nothing in it — `Cairn.CameraTracker` stamps every observation
   # with a wall clock before the tracker sees one — so this ends nothing. Where
   # it is not, the tracks it holds could not be adopted anyway: `adopt/4`
   # refuses a batch that carries no wall clock, so suspending them would only

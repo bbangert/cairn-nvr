@@ -13,7 +13,7 @@ defmodule Cairn.PluginGroupPort do
   Every detection line must carry `camera_id`; decoded by
   `Cairn.PluginProtocol.decode_line/2` (protocol v1 or the v0
   `{"camera_id", "pts", "dets"}` shape) it is routed as a
-  `Cairn.Observation` to `Cairn.DetectionAggregator` with that camera's
+  `Cairn.Observation` to `Cairn.CameraTracker` with that camera's
   config and effective policy (event windows, tracking bounds and the
   `track:` / `record:` tiers). Lines for an unknown
   or missing camera are dropped, as are malformed ones, observations from a
@@ -98,7 +98,7 @@ defmodule Cairn.PluginGroupPort do
 
   Camera fields the launch argv does not carry — the `post` and `max` event
   windows, the tracking bounds, the `track:` / `record:` tiers, retention, the
-  camera struct handed to the aggregator — change on reload without changing
+  camera struct handed to the tracker — change on reload without changing
   the group, so the routing map (each member's camera paired with its
   `Cairn.Config.policy/2`) has to be rebuilt in place. (`pre` rides along in
   that policy map, but a `pre` change never arrives here alone: it restarts
@@ -473,9 +473,18 @@ defmodule Cairn.PluginGroupPort do
   # since one grapheme cluster can be arbitrarily long.
   defp preview(value), do: inspect(value, limit: 3, printable_limit: @id_preview)
 
+  # `:tracker` is a test seam: a process that receives the same
+  # `{:detections, …}` cast in place of the camera's own
+  # `Cairn.CameraTracker`. Absent (production) each member camera's batch goes
+  # to that camera's own tracker — one process per camera, not one per group.
   defp forward(state, cam, policy, observation) do
-    aggregator = Keyword.get(state.opts, :aggregator, Cairn.DetectionAggregator)
-    Cairn.DetectionAggregator.detections(aggregator, cam, policy, observation)
+    Cairn.CameraTracker.detections(
+      Keyword.get(state.opts, :tracker),
+      cam,
+      policy,
+      observation
+    )
+
     state
   end
 

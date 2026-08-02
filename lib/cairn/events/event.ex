@@ -1,7 +1,7 @@
 defmodule Cairn.Events.Event do
   @moduledoc """
   Event index row (SQLite). `labels` holds `%{"entries" => [...],
-  "max_scores" => %{label => score}}` as written by the aggregator's
+  "max_scores" => %{label => score}}` as written by `Cairn.CameraTracker`'s
   runtime `Cairn.Event` at finalize time.
   """
 

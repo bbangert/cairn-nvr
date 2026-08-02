@@ -1,7 +1,7 @@
 defmodule Cairn.Events do
   @moduledoc """
   Event index context — the only module that touches the `events` table.
-  The aggregator/extractor/reconciler/retention all go through here.
+  The camera trackers/extractor/reconciler/retention all go through here.
   """
 
   import Ecto.Query

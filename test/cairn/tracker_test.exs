@@ -825,7 +825,7 @@ defmodule Cairn.TrackerTest do
       refute tagged.stationary
       refute moved.stationary
       assert moved.stationary_since == nil
-      # the moment `Cairn.DetectionAggregator` records is timed by this, and it
+      # the moment `Cairn.CameraTracker` records is timed by this, and it
       # is the batch that closed the window rather than the one that opened it
       assert moved.last_seen_at == at(14_000)
 
@@ -2110,7 +2110,7 @@ defmodule Cairn.TrackerTest do
       # 0.905 overlap with the space it was parked in: the same car, seen a
       # couple of pixels off. It resumes already stationary — which is the
       # whole point of suspending rather than ending it, since
-      # `Cairn.DetectionAggregator` refuses a stationary track as evidence —
+      # `Cairn.CameraTracker` refuses a stationary track as evidence —
       # and it stays that way. Four batches, because the failure this guards
       # against is a stillness window that only turns over after a few of them.
       {_t, adopting} =

@@ -5,13 +5,13 @@ defmodule Cairn.Event do
   Broadcast on the internal PubSub topic `"events"` as
   `{:event_started | :event_updated | :event_ended, %Cairn.Event{}}` with a
   stable, JSON-serializable shape. The dashboard consumes it today;
-  MQTT/webhook publishers can bolt on later without touching the
-  aggregator. `Cairn.Track` publishes the object lifecycle on the same topic,
+  MQTT/webhook publishers can bolt on later without touching
+  `Cairn.CameraTracker`. `Cairn.Track` publishes the object lifecycle on the same topic,
   and `Cairn.EventArtifact` the readiness of an event's clip and snapshot —
   `:event_ended` means the detection window closed, nothing more, so the
   media it names is not yet fetchable.
 
-  `:event_ended` is **at-least-once**: an aggregator crash between the
+  `:event_ended` is **at-least-once**: a camera tracker crash between the
   broadcast and the checkpoint delete replays it on restart (the replay may
   carry `status: :partial`). Consumers dedupe on `id`.
 

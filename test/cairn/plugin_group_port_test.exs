@@ -1,6 +1,6 @@
 defmodule Cairn.PluginGroupPortTest do
   # async: false — these tests share the "events" PubSub topic and capture_log.
-  # DataCase because they start a real aggregator, whose checkpoint restore
+  # DataCase because they start real camera trackers, whose checkpoint restore
   # consults the event index.
   use Cairn.DataCase, async: false
 
@@ -8,7 +8,7 @@ defmodule Cairn.PluginGroupPortTest do
 
   alias Cairn.Config.Camera
   alias Cairn.Config.PluginGroup
-  alias Cairn.{DetectionAggregator, Event, Observation, PluginGroupPort, StreamEpochs}
+  alias Cairn.{CameraTracker, Event, Observation, PluginGroupPort, StreamEpochs}
 
   defp camera(id, opts \\ []) do
     %Camera{
@@ -152,7 +152,7 @@ defmodule Cairn.PluginGroupPortTest do
     b = camera("gp_b_#{System.unique_integer([:positive])}", post_window_seconds: 42)
 
     command = printf([det_line(a.id, 1, 0.9), det_line(b.id, 2, 0.8)]) <> "; exec sleep 30"
-    start_group_port([a, b], command: command, aggregator: self())
+    start_group_port([a, b], command: command, tracker: self())
 
     a_id = a.id
     b_id = b.id
@@ -190,22 +190,24 @@ defmodule Cairn.PluginGroupPortTest do
            }
   end
 
-  test "each camera's own min_score applies through the aggregator" do
+  test "each camera's own min_score applies through its camera tracker" do
     a = camera("gp_low_#{System.unique_integer([:positive])}")
     b = camera("gp_high_#{System.unique_integer([:positive])}", min_score: %{"default" => 0.95})
 
-    agg =
+    for cam <- [a, b] do
       start_supervised!(
-        {DetectionAggregator,
-         name: nil,
-         start_extractor: fn _c, _e -> {:ok, spawn(fn -> Process.sleep(:infinity) end)} end}
+        {CameraTracker,
+         camera_id: cam.id,
+         start_extractor: fn _c, _e -> {:ok, spawn(fn -> Process.sleep(:infinity) end)} end},
+        id: {:tracker, cam.id}
       )
+    end
 
     Event.subscribe()
 
     # 0.7 clears cam a's 0.5 floor and is filtered out for cam b's 0.95
     command = printf([det_line(b.id, 1, 0.7), det_line(a.id, 2, 0.7)]) <> "; exec sleep 30"
-    start_group_port([a, b], command: command, aggregator: agg)
+    start_group_port([a, b], command: command)
 
     a_id = a.id
     b_id = b.id
@@ -225,7 +227,7 @@ defmodule Cairn.PluginGroupPortTest do
         det_line(a.id, 3, 0.9)
       ]) <> "; exec sleep 30"
 
-    pid = start_group_port([a], command: command, aggregator: self())
+    pid = start_group_port([a], command: command, tracker: self())
 
     a_id = a.id
 
@@ -241,7 +243,7 @@ defmodule Cairn.PluginGroupPortTest do
     long = String.duplicate("x", 70_000)
 
     command = printf([long, det_line(a.id, 7, 0.9)]) <> "; exec sleep 30"
-    pid = start_group_port([a], command: command, aggregator: self())
+    pid = start_group_port([a], command: command, tracker: self())
 
     a_id = a.id
 
@@ -260,7 +262,7 @@ defmodule Cairn.PluginGroupPortTest do
     # {:line, 65_536} delivers up to 65_536 bytes of line data as {:eol, _}
     # and only splits above that, so the limit itself is accepted
     command = printf([line]) <> "; exec sleep 30"
-    pid = start_group_port([a], command: command, aggregator: self())
+    pid = start_group_port([a], command: command, tracker: self())
 
     a_id = a.id
 
@@ -280,7 +282,7 @@ defmodule Cairn.PluginGroupPortTest do
     # delivered as {:noeol, 65_536} + {:eol, 1}: the one-byte remainder is what
     # has to clear skipping_long_line before line 13 arrives
     command = printf([over, det_line(a.id, 13, 0.9)]) <> "; exec sleep 30"
-    pid = start_group_port([a], command: command, aggregator: self())
+    pid = start_group_port([a], command: command, tracker: self())
 
     a_id = a.id
 
@@ -308,7 +310,7 @@ defmodule Cairn.PluginGroupPortTest do
     good = line(a.id, 3, [det("person", "0.9", "[0, 0, 1, 1]")])
 
     command = printf([malformed, bad_pts, good]) <> "; exec sleep 30"
-    pid = start_group_port([a], command: command, aggregator: self())
+    pid = start_group_port([a], command: command, tracker: self())
 
     a_id = a.id
 
@@ -327,13 +329,13 @@ defmodule Cairn.PluginGroupPortTest do
     assert %PluginGroupPort{} = :sys.get_state(pid)
   end
 
-  test "a malformed bbox never reaches the tracker through the aggregator" do
+  test "a malformed bbox never reaches `Cairn.Tracker`" do
     a = camera("gp_bbox_#{System.unique_integer([:positive])}")
 
-    agg =
+    tracker =
       start_supervised!(
-        {DetectionAggregator,
-         name: nil,
+        {CameraTracker,
+         camera_id: a.id,
          start_extractor: fn _c, _e -> {:ok, spawn(fn -> Process.sleep(:infinity) end)} end}
       )
 
@@ -348,7 +350,7 @@ defmodule Cairn.PluginGroupPortTest do
         line(a.id, 3, [det("person", "0.9", "[0.01, 0, 0.99, 1]")])
       ]) <> "; exec sleep 30"
 
-    pid = start_group_port([a], command: command, aggregator: agg)
+    pid = start_group_port([a], command: command)
 
     a_id = a.id
     assert_receive {:event_started, %Event{camera_id: ^a_id}}, 5_000
@@ -356,9 +358,9 @@ defmodule Cairn.PluginGroupPortTest do
     # only reachable if the batch *after* the poisoned one was tracked: pre-fix
     # :event_started fired on line 1 and the crash landed on line 2
     assert_receive {:event_updated, %Event{camera_id: ^a_id}}, 5_000
-    # a round-trip through each: the aggregator survived the poisoned batch and
+    # a round-trip through each: the camera tracker survived the poisoned batch and
     # the port survived forwarding it
-    assert %{} = :sys.get_state(agg)
+    assert %{} = :sys.get_state(tracker)
     assert %PluginGroupPort{} = :sys.get_state(pid)
   end
 
@@ -371,7 +373,7 @@ defmodule Cairn.PluginGroupPortTest do
       printf([det_line(a.id, 1, 0.9)]) <>
         "; sleep 5; " <> printf([det_line(a.id, 2, 0.9)]) <> "; exec sleep 30"
 
-    pid = start_group_port([a], command: command, aggregator: self())
+    pid = start_group_port([a], command: command, tracker: self())
     a_id = a.id
 
     assert_receive {:"$gen_cast",
@@ -402,7 +404,7 @@ defmodule Cairn.PluginGroupPortTest do
 
     log =
       capture_log(fn ->
-        start_group_port([a], command: command, aggregator: self())
+        start_group_port([a], command: command, tracker: self())
         # ordered after all five drops: the port handles lines in order
         assert_receive {:"$gen_cast", {:detections, _cam, _policy, %Observation{pts: 99}}}, 5_000
       end)
@@ -419,7 +421,7 @@ defmodule Cairn.PluginGroupPortTest do
     b_epoch = StreamEpochs.new_epoch(b.id, :started)
     {path, command} = stdin_recorder()
 
-    pid = start_group_port([a, b], command: command, aggregator: self())
+    pid = start_group_port([a, b], command: command, tracker: self())
 
     started = await_control(path, 2)
     assert Enum.all?(started, &(&1["type"] == "stream.started"))
@@ -489,7 +491,7 @@ defmodule Cairn.PluginGroupPortTest do
         v1_line(a.id, a_epoch, 9, [object("person", 0.9)])
       ]) <> "; exec sleep 30"
 
-    pid = start_group_port([a, b], command: command, aggregator: self())
+    pid = start_group_port([a, b], command: command, tracker: self())
 
     a_id = a.id
     b_id = b.id
@@ -506,7 +508,7 @@ defmodule Cairn.PluginGroupPortTest do
                     {:detections, %Camera{id: ^b_id}, _w, %Observation{sequence: 2}}},
                    5_000
 
-    # the stale line never reaches the aggregator; the next good one does
+    # the stale line never reaches the camera tracker; the next good one does
     assert_receive {:"$gen_cast",
                     {:detections, %Camera{id: ^a_id}, _w, %Observation{sequence: 9}}},
                    5_000
@@ -528,7 +530,7 @@ defmodule Cairn.PluginGroupPortTest do
     # a plugin that emits nothing: every line below is fed by hand, so the
     # epoch change lands at an exact point in the stream rather than wherever
     # the shell's output happens to be
-    pid = start_group_port([a, b], command: "exec sleep 30", aggregator: self())
+    pid = start_group_port([a, b], command: "exec sleep 30", tracker: self())
     port = :sys.get_state(pid).port
     feed = fn line -> send(pid, {port, {:data, {:eol, line}}}) end
 
@@ -611,7 +613,7 @@ defmodule Cairn.PluginGroupPortTest do
       Cairn.CameraStatus.prune(Map.keys(Cairn.CameraStatus.all()) -- [a.id, b.id])
     end)
 
-    pid = start_group_port([a, b], command: command, aggregator: self())
+    pid = start_group_port([a, b], command: command, tracker: self())
 
     a_id = a.id
     b_id = b.id
@@ -641,7 +643,7 @@ defmodule Cairn.PluginGroupPortTest do
     b_epoch = StreamEpochs.new_epoch(b.id, :started)
     {path, command} = stdin_recorder()
 
-    pid = start_group_port([a, b], command: command, aggregator: self())
+    pid = start_group_port([a, b], command: command, tracker: self())
     assert [_, _] = await_control(path, 2)
 
     a_second = StreamEpochs.new_epoch(a.id, :source_lost)
@@ -689,7 +691,7 @@ defmodule Cairn.PluginGroupPortTest do
       Cairn.CameraStatus.prune(Map.keys(Cairn.CameraStatus.all()) -- [a.id, b.id])
     end)
 
-    start_group_port([a, b], command: command, aggregator: self())
+    start_group_port([a, b], command: command, tracker: self())
 
     a_id = a.id
     b_id = b.id
@@ -744,7 +746,7 @@ defmodule Cairn.PluginGroupPortTest do
         capture_log(fn ->
           start_group_port([a, b],
             command: command,
-            aggregator: self(),
+            tracker: self(),
             group_name: "detect_cap_#{declared}",
             id: {:cap, declared}
           )
@@ -786,7 +788,7 @@ defmodule Cairn.PluginGroupPortTest do
 
     start_group_port([a],
       command: command,
-      aggregator: self(),
+      tracker: self(),
       backoff_min_ms: 50,
       backoff_max_ms: 100
     )
