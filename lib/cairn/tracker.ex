@@ -151,10 +151,11 @@ defmodule Cairn.Tracker do
   manufactures the second identity it was there to prevent. What keeps the
   loose rule from producing a duplicate of its own — a second box of the object
   it has just resumed — is the duplicate suppression that runs immediately
-  after it, which is retained. `@stitch_iou` is the number
-  `@duplicate_suppression_iou` is, and picked from the same geometry: under it,
-  an overlap is ordinary same-label adjacency (two cars nose to tail sit at
-  1/3) rather than the object again.
+  after it, which is retained. `@stitch_iou` is picked from the same geometry
+  as `@duplicate_suppression_iou` — under it, an overlap is ordinary same-label
+  adjacency (two cars nose to tail sit at 1/3) rather than the object again —
+  and may never be the looser of the two (currently they are equal; the guard
+  at the constant enforces the ordering).
 
   Adoption is refused for a predicted box: an identity nothing confirmed for
   the length of the outage may not be resumed by the plugin's extrapolation of
@@ -1017,8 +1018,9 @@ defmodule Cairn.Tracker do
   #
   # Suspended tracks are not among the candidates and must not be: a suspension
   # is unmatched by definition, so counting one here would drop boxes near a
-  # ghost on the strength of a track nothing can see. Adoption and this rule
-  # ask for the same overlap, so what that catches is what adoption refuses at
+  # ghost on the strength of a track nothing can see. Adoption asks for no
+  # less overlap than this rule does (equal today, `>=` by the guard), so what
+  # that catches is what adoption refuses at
   # it — chiefly a predicted box, which may not resume an identity and must
   # still be free to mint one, since dropping it leaves whatever is really
   # there untracked for a whole minute.

@@ -1656,8 +1656,9 @@ defmodule Cairn.TrackerTest do
     # `@stitch_iou` (0.4), so it is nobody's identity
     @shift_2 [0.2, 0.0, 0.4, 0.4]
     # IoU 0.6: over `@stitch_iou` with room to spare, so it is adopted anywhere
-    # inside the window — and over `@duplicate_suppression_iou`, which is the
-    # same number, so a *live* track this close would suppress it instead
+    # inside the window — and over `@duplicate_suppression_iou` (no looser
+    # than the stitch, equal today), so a *live* track this close would
+    # suppress it instead
     @shift_1 [0.1, 0.0, 0.4, 0.4]
     # IoU 0.778: over `@stitch_iou`, under `@stationary_iou` (0.8), so it is
     # adopted and the stillness rule calls it movement
@@ -2118,7 +2119,7 @@ defmodule Cairn.TrackerTest do
       {t, [], _info} = Tracker.suspend(t, 128, 1_000)
 
       # A *predicted* box — chiefly what adoption refuses now that its
-      # threshold is duplicate suppression's own; the loser of a contended
+      # threshold is no looser than duplicate suppression's; the loser of a contended
       # suspension is refused too, but would then be legitimately suppressed
       # against the revived track — so this is the only way left to ask the
       # question. At 0.6 it is far over
