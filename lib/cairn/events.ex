@@ -40,7 +40,24 @@ defmodule Cairn.Events do
 
   @spec finalize(Cairn.Event.t(), non_neg_integer()) ::
           {:ok, Event.t()} | {:error, term()}
-  def finalize(%Cairn.Event{} = event, bytes) do
+  def finalize(%Cairn.Event{} = event, bytes), do: close(event, bytes, :finalized)
+
+  @doc """
+  Closes an event that produced no playable clip — every field `finalize/2`
+  writes, but `partial` rather than `finalized`.
+
+  `Cairn.EventExtractor` uses it for an event no keyframe ever reached: the
+  file it leaves on disk holds an init segment and no samples, which is the
+  same "there is a file but it is not a whole clip" state a recording
+  interrupted by a crash lands in, and the status the UI, the read API and
+  boot reconciliation already read that way. `finalized` would claim media the
+  file does not hold.
+  """
+  @spec finalize_partial(Cairn.Event.t(), non_neg_integer()) ::
+          {:ok, Event.t()} | {:error, term()}
+  def finalize_partial(%Cairn.Event{} = event, bytes), do: close(event, bytes, :partial)
+
+  defp close(event, bytes, status) do
     case get(event.id) do
       nil ->
         {:error, :not_found}
@@ -48,7 +65,7 @@ defmodule Cairn.Events do
       row ->
         row
         |> Event.changeset(%{
-          status: :finalized,
+          status: status,
           ended_at: event.ended_at,
           bytes: bytes,
           labels: labels_map(event),

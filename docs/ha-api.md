@@ -185,10 +185,12 @@ disk and fetchable:
   is its size, and the frame carries `snapshot_url` in place of `clip_url`.
 - `event_clip_failed` / `event_snapshot_failed` — that artifact is not coming
   for this event. `bytes` and the URL field are `null`, and `reason` is one of
-  `no_output` (ffmpeg wrote nothing usable), `not_found` (the event was gone by
-  the time the artifact landed), `index_write_failed` (the index rejected the
-  update) or `exception`. Nothing retries; a failed snapshot leaves the clip
-  unaffected. `event_clip_failed` is terminal for the whole event: the snapshot
+  `no_output` (ffmpeg wrote nothing usable), `no_keyframe` (clips only: no
+  keyframe reached the recorder before the event closed, so no decodable video
+  was written — the event is left `partial` and its `clip_url` serves a file
+  with no frames in it), `not_found` (the event was gone by the time the
+  artifact landed), `index_write_failed` (the index rejected the update) or
+  `exception`. Nothing retries; a failed snapshot leaves the clip unaffected. `event_clip_failed` is terminal for the whole event: the snapshot
   is cut from the finished clip, so it is not attempted and **no**
   `event_snapshot_*` frame follows — do not wait for one.
 

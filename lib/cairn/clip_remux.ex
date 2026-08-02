@@ -56,8 +56,21 @@ defmodule Cairn.ClipRemux do
   defp run_bounded(argv, timeout_ms) do
     cmd = "exec " <> Enum.map_join(argv, " ", &shell_escape/1) <> " 2>&1"
     port = Port.open({:spawn_executable, "/bin/sh"}, [:binary, :exit_status, args: ["-c", cmd]])
-    {:os_pid, os_pid} = Port.info(port, :os_pid)
-    await_exit(port, os_pid, timeout_ms)
+    await_exit(port, os_pid(port), timeout_ms)
+  end
+
+  # `nil` when the port is already gone by the time we ask — a port opened with
+  # `:exit_status` is torn down as the status is *queued*, not as it is read,
+  # so a command that exits fast enough leaves nothing to inspect. That is not
+  # a failure: the status is already in the mailbox for `await_exit/3`, and
+  # there is no surviving process for the timeout branch to kill. Matching
+  # `{:os_pid, _}` here instead turns it into a MatchError that costs the remux
+  # for a clip ffmpeg had already rewritten correctly.
+  defp os_pid(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, os_pid} -> os_pid
+      nil -> nil
+    end
   end
 
   defp await_exit(port, os_pid, timeout_ms) do
@@ -67,7 +80,7 @@ defmodule Cairn.ClipRemux do
       {^port, {:exit_status, status}} -> {:error, "ffmpeg exited #{status}"}
     after
       timeout_ms ->
-        System.cmd("kill", ["-KILL", "#{os_pid}"], stderr_to_stdout: true)
+        if os_pid, do: System.cmd("kill", ["-KILL", "#{os_pid}"], stderr_to_stdout: true)
         safe_close(port)
         {:error, "ffmpeg timed out after #{timeout_ms}ms"}
     end

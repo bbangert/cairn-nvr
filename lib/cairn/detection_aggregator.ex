@@ -893,6 +893,12 @@ defmodule Cairn.DetectionAggregator do
   # Re-announcing that event as `:partial` here would both invert the artifact
   # ordering and mislabel a clean event — so the index, which the extractor
   # wrote, decides.
+  #
+  # `:finalized` is the only status that means that, and deliberately: an
+  # extractor that closed the row `partial` for want of a keyframe
+  # (`Cairn.EventExtractor`) and one whose row was left `active` for
+  # reconciliation to partial both end where this broadcast is the event's
+  # honest status, and consumers dedupe `event_ended` on the id anyway.
   defp end_orphan(camera_id, event) do
     EventCheckpoint.delete(camera_id)
 

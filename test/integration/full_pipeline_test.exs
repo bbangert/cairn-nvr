@@ -1,9 +1,13 @@
 defmodule Cairn.FullPipelineTest do
   @moduledoc """
-  The regression net for the whole pipeline: a real ffmpeg reading the
-  committed fixture in a realtime loop (`file://` camera), the mock plugin
-  replaying a detection timeline over a real Port, the global aggregator,
-  a real extractor writing to a tmp data dir, and the events index.
+  The regression net for the whole pipeline: a real ffmpeg reading a committed
+  fixture in a realtime loop (`file://` camera), the mock plugin replaying a
+  detection timeline over a real Port, the global aggregator, a real extractor
+  writing to a tmp data dir, and the events index.
+
+  Twice, over two fixtures that differ in one thing: whether a fragment can
+  begin part-way through a GOP. Everything else about the two runs is the same
+  camera, plugin and config.
 
   Excluded by default (`test_helper.exs`); run with
   `mix test --include integration`.
@@ -18,6 +22,13 @@ defmodule Cairn.FullPipelineTest do
   alias Cairn.{Config, Event, Events}
 
   @fixture Path.absname("test/support/fixtures/media/testsrc_long.fmp4")
+  # Same source, GOP three times the muxer's `-frag_duration`: through the
+  # production `+frag_keyframe` output that yields alternating 2000/1000 ms
+  # fragments of which only every other one opens a GOP — the camera2 shape.
+  # `testsrc_long.fmp4`'s GOP is shorter than a fragment, so every fragment of
+  # it is keyframe-headed and the `start_time` assertion below can never fail
+  # on it however the drain lands.
+  @mid_gop_fixture Path.absname("test/support/fixtures/media/testsrc_gop3.fmp4")
   @mock Path.absname("priv/plugins/mock/mock_plugin.exs")
 
   setup do
@@ -108,6 +119,60 @@ defmodule Cairn.FullPipelineTest do
     assert duration > 0.0
 
     # snapshot lands async
+    row =
+      wait_until(
+        fn -> (Events.get(event.id) || %{snapshot_path: nil}).snapshot_path end,
+        event.id
+      )
+
+    assert File.exists?(row.snapshot_path)
+  end
+
+  @tag :integration
+  test "a camera whose GOP outlives its fragments still yields a clip that starts at zero",
+       %{camera: camera, config: config} do
+    # The same pipeline over a stream where the drain can land mid-GOP. What
+    # the extractor now does about that is unit-tested; what this adds is the
+    # real ffmpeg on both ends — the camera's `+frag_keyframe` muxer deciding
+    # where fragments break, and `Cairn.ClipRemux`'s `-c copy` deciding what it
+    # can carry. A clip that started mid-GOP would come out of that with a
+    # leading empty edit, which is exactly what `start_time` reports.
+    Event.subscribe()
+
+    camera = %{camera | id: "e2e_gop3", rtsp_url: "file://" <> @mid_gop_fixture}
+    config = %{config | cameras: [camera]}
+
+    start_supervised!({Cairn.Camera, camera: camera, config: config, index: 1})
+
+    assert_receive {:event_started, %Event{camera_id: "e2e_gop3"} = event}, 30_000
+    assert_receive {:event_ended, %Event{camera_id: "e2e_gop3", status: :finalized}}, 30_000
+
+    row = wait_until(fn -> match?(%{status: :finalized}, Events.get(event.id)) end, event.id)
+    assert row.bytes > 0
+
+    on_exit(fn ->
+      File.rm(row.path)
+      if row.snapshot_path, do: File.rm(row.snapshot_path)
+    end)
+
+    refute Cairn.MP4Boxes.leading_empty_edit?(File.read!(row.path))
+
+    {probe, 0} =
+      System.cmd(
+        "ffprobe",
+        ~w(-v error -show_entries format=duration,start_time -of csv=p=0) ++ [row.path]
+      )
+
+    [start_time, duration] =
+      probe |> String.trim() |> String.split(",") |> Enum.map(&elem(Float.parse(&1), 0))
+
+    assert_in_delta start_time, 0.0, 0.001
+    assert duration > 0.0
+
+    # Not an assertion about snapshots — it is what keeps the async snapshot
+    # task inside the test's sandbox checkout. Returning before it runs rolls
+    # the row back underneath it, and it logs a `:not_found` it cannot do
+    # anything about.
     row =
       wait_until(
         fn -> (Events.get(event.id) || %{snapshot_path: nil}).snapshot_path end,

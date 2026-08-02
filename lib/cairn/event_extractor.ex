@@ -14,6 +14,28 @@ defmodule Cairn.EventExtractor do
   second, tighter pairing (`note_live_fragment/2`) — the one a reader prefers,
   and the reason `Cairn.TrackPath` documents two.
 
+  ## The clip starts on a keyframe
+
+  Nothing reaches the file — drained or live — until a fragment whose
+  `keyframe?` is true, and *that* fragment is the clip's t=0 that both anchor
+  halves are measured from. The pre-roll is therefore "up to `pre_window`
+  seconds, starting at a keyframe", which on a camera whose GOP spans several
+  fragments is up to one GOP shorter than the window asked for.
+
+  This is not a nicety. A clip that starts mid-GOP hands `Cairn.ClipRemux` a
+  run of leading samples with no keyframe to decode them against; `-c copy`
+  drops them and records the hole as a leading empty edit (`elst`) of the same
+  length. The file keeps its duration and loses that much media off the front,
+  which is why nothing about it looks wrong. Every reader — the browser
+  `<video>`, `Cairn.Snapshot`'s input seek, both halves of the sidecar anchor —
+  works in positions from the file's first sample, so every one of them lands
+  late by exactly the dropped span, and the anchor arithmetic that produced
+  those positions was never wrong. It was measured at ~3 s on a camera with a
+  5 s GOP over 2000/2000/1000 ms fragments.
+
+  Dropping the fragments here instead leaves the remux nothing to drop, and
+  turns a silent skew into a shorter pre-roll and one debug line.
+
   The media path holds nothing: a fragment is written as it arrives and let
   go, with a datasync roughly every 2s of media, so the clip's own length
   costs no memory. The box buffer is the exception — `Cairn.DetectionAggregator`
@@ -25,7 +47,17 @@ defmodule Cairn.EventExtractor do
   bytes, labels, max_score), writes the sidecar, broadcasts
   `:event_clip_ready` with the post-remux size (or `:event_clip_failed`),
   kicks off the async snapshot, emits `[:cairn, :extractor, :finalized]`
-  telemetry, exits `:normal`. Only a clip the index accepted gets a sidecar,
+  telemetry, exits `:normal`.
+
+  An event that never saw a keyframe is the one finalize with no clip to
+  announce: the file holds its init segment alone, so the remux, the sidecar
+  and the snapshot are all skipped, the row is closed `partial` over the file
+  rather than `finalized`, and the wire gets `:event_clip_failed` with
+  `:no_keyframe`. Nothing downstream could tell that case from a real clip —
+  `bytes` is not zero and no consumer checks it — which is why the decision is
+  made here.
+
+  Only a clip the index accepted gets a sidecar,
   and failing to write one never changes what the event is announced as. A
   crash *while recording* leaves the row `active` and announces no artifact at
   all; boot reconciliation marks it `partial`. A crash inside finalize is
@@ -90,6 +122,14 @@ defmodule Cairn.EventExtractor do
       bytes: 0,
       fragments: 0,
       unsynced_media_ms: 0,
+      # Whether a keyframe-headed fragment has been written yet. While it is
+      # false the file holds no media — only the init segment, once the open
+      # has run — and every fragment that arrives is measured against
+      # `keyframe?` before it is let in. The two counters below are what was
+      # turned away in the meantime, reported once by `log_skipped/1`.
+      started?: false,
+      skipped_fragments: 0,
+      skipped_ms: 0,
       started_ms: System.monotonic_time(:millisecond),
       # The dense box buffer the aggregator feeds, newest batch first: a cast
       # prepends and the flush reverses. `track_entries` counts boxes, not
@@ -134,8 +174,30 @@ defmodule Cairn.EventExtractor do
       # that surplus; this one is what an event has until a fragment arrives.
       drain_wall_ms = DateTime.to_unix(DateTime.utc_now(), :millisecond)
 
-      state = %{state | io: io, path: path, anchor: anchor(drained, event, drain_wall_ms)}
+      # The pre-roll is what survives from the first keyframe-headed fragment
+      # on, and the anchor is taken from *that* list: `first_pts` and
+      # `drained_span_ms` have to name the media the file will actually hold,
+      # or every position derived from them is early by the dropped span.
+      #
+      # Only the leading run goes, never anything after the first keyframe —
+      # which is also why `drain_wall_ms` above still pairs with the position
+      # this produces. The cut moves the *start* of the drained media, and that
+      # clock was read at its end.
+      {dropped, kept} = Enum.split_while(drained, &(not &1.keyframe?))
 
+      state = %{
+        state
+        | io: io,
+          path: path,
+          anchor: anchor(kept, event, drain_wall_ms),
+          skipped_fragments: length(dropped),
+          skipped_ms: Enum.sum(Enum.map(dropped, & &1.duration_ms))
+      }
+
+      # Unconditionally, and before any fragment: the init segment is the only
+      # thing that makes the rest decodable, and it is written even when the
+      # whole drained pre-roll was dropped and the first fragment worth keeping
+      # is still a GOP away on the live path.
       state =
         if is_binary(init) do
           write!(state, init)
@@ -144,11 +206,13 @@ defmodule Cairn.EventExtractor do
           state
         end
 
-      state = Enum.reduce(drained, state, &write_fragment(&2, &1))
+      state = write_drained(state, kept)
 
+      # `fragments` is what landed in the clip, not what the ring handed over —
+      # the two differ by `dropped`, which is reported beside it.
       :telemetry.execute(
         [:cairn, :extractor, :drained],
-        %{fragments: length(drained), bytes: state.bytes},
+        %{fragments: length(kept), skipped: length(dropped), bytes: state.bytes},
         %{camera_id: camera.id, event_id: event.id}
       )
 
@@ -162,10 +226,7 @@ defmodule Cairn.EventExtractor do
 
   @impl true
   def handle_info({:ring_fragment, frag}, state) do
-    # The anchor before the write: `write_fragment/2` can block on a datasync,
-    # and the wall clock this fragment is paired with has to be the one at its
-    # arrival.
-    {:noreply, state |> note_live_fragment(frag) |> write_fragment(frag)}
+    {:noreply, live_fragment(state, frag)}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -177,6 +238,13 @@ defmodule Cairn.EventExtractor do
 
   def handle_cast({:finalize, event}, state) do
     snapshot_fun = Keyword.get(state.opts, :snapshot_fun, &Cairn.Snapshot.take_async/2)
+
+    # The other end of `open_media/1`'s report: an event that never saw a
+    # keyframe wrote no fragment at all, and this is the only place that says
+    # so. Guarded on `started?`, so a clip that opened has already logged and
+    # cannot log twice.
+    unless state.started?, do: log_skipped(state)
+
     {outcome, bytes} = close_clip(event, state)
 
     case outcome do
@@ -196,6 +264,15 @@ defmodule Cairn.EventExtractor do
         })
 
         snapshot_fun.(row, state.config)
+
+      {:no_media, index} ->
+        log_no_media(event, index)
+
+        EventArtifact.broadcast(:event_clip_failed, %EventArtifact{
+          event_id: event.id,
+          camera_id: state.camera.id,
+          reason: :no_keyframe
+        })
 
       {:error, reason} ->
         Logger.error("event #{event.id}: finalize failed: #{inspect(reason)}")
@@ -222,15 +299,75 @@ defmodule Cairn.EventExtractor do
 
   # -- internals --------------------------------------------------------------
 
-  # The drain half of the anchor: a media position and the wall clock read
-  # beside it, captured while the head of the clip is still in hand. The live
-  # half is `nil` here and stays that way until a fragment arrives.
+  # The kept pre-roll. An empty one is a real outcome and not just an empty
+  # ring: the file is left holding its init segment alone, and the live path
+  # takes over the job of finding the keyframe the clip starts on.
+  defp write_drained(state, []), do: state
+
+  defp write_drained(state, kept) do
+    Enum.reduce(kept, open_media(state), &write_fragment(&2, &1))
+  end
+
+  # A live fragment before the file has opened is held to the same rule as a
+  # drained one — a fresh ring hands over an empty pre-roll and then streams
+  # the *middle* of a GOP, which would put the leading empty edit straight back
+  # into the clip through this path.
   #
-  # An empty pre-window — a camera whose ring has not filled yet — has no media
-  # position to offer, so `drained_span_ms` goes `nil` along with the two pts
-  # fields and this half can place nothing at all. That file is placeable only
-  # once the live half lands (`Cairn.TrackPath` reads every field with
-  # `Map.get/2` and skips a half it cannot use).
+  # `note_live_fragment/2` runs first in both writing clauses, and before
+  # `write_fragment/2` because that can block on a datasync: the wall clock a
+  # fragment is paired with has to be the one at its arrival.
+  defp live_fragment(%{started?: false} = state, %{keyframe?: false} = frag) do
+    skip_fragment(state, frag)
+  end
+
+  defp live_fragment(%{started?: false} = state, frag) do
+    state |> note_live_fragment(frag) |> open_media() |> write_fragment(frag)
+  end
+
+  defp live_fragment(state, frag) do
+    state |> note_live_fragment(frag) |> write_fragment(frag)
+  end
+
+  defp skip_fragment(state, frag) do
+    %{
+      state
+      | skipped_fragments: state.skipped_fragments + 1,
+        skipped_ms: state.skipped_ms + frag.duration_ms
+    }
+  end
+
+  # The transition from "init segment only" to "recording", and the one place
+  # the shortened pre-roll is reported. Once `started?` is true nothing is
+  # skipped again, so a clip that opens logs here exactly once and never
+  # reaches the finalize branch of `log_skipped/1`.
+  defp open_media(state), do: log_skipped(%{state | started?: true})
+
+  defp log_skipped(%{skipped_fragments: 0} = state), do: state
+
+  defp log_skipped(state) do
+    # Debug, not warning: a camera whose GOP outlives its fragment duration
+    # does this on most events, by design. It is a shorter pre-roll, not a
+    # fault.
+    Logger.debug(
+      "event #{state.event.id}: dropped #{state.skipped_fragments} leading fragment(s) " <>
+        "(#{state.skipped_ms}ms) with no keyframe for the clip to start on"
+    )
+
+    state
+  end
+
+  # The drain half of the anchor: a media position and the wall clock read
+  # beside it, captured while the head of the clip is still in hand. The list
+  # handed in is the *kept* pre-roll, so `first` is the fragment the file
+  # actually starts with. The live half is `nil` here and stays that way until
+  # a fragment arrives.
+  #
+  # An empty kept pre-window — a camera whose ring has not filled yet, or one
+  # whose whole pre-roll fell mid-GOP — has no media position to offer, so
+  # `drained_span_ms` goes `nil` along with the two pts fields and this half
+  # can place nothing at all. That file is placeable only once the live half
+  # lands (`Cairn.TrackPath` reads every field with `Map.get/2` and skips a
+  # half it cannot use).
   defp anchor([], event, drain_wall_ms) do
     %{
       first_pts: nil,
@@ -261,10 +398,15 @@ defmodule Cairn.EventExtractor do
   end
 
   # The live half: the wall clock at the arrival of the first fragment to reach
-  # us live, paired with the media position that fragment *ends* at. A fragment
-  # is handed over only once it is complete, so this pair is off by the
-  # transport and the demux and nothing else — where the drain's pair also
-  # carries however much of the in-flight fragment ffmpeg had not written yet.
+  # us live *and be written*, paired with the media position that fragment
+  # *ends* at. A fragment is handed over only once it is complete, so this pair
+  # is off by the transport and the demux and nothing else — where the drain's
+  # pair also carries however much of the in-flight fragment ffmpeg had not
+  # written yet.
+  #
+  # `live_fragment/2` is what enforces the "and be written": it does not call
+  # this for a fragment it is about to skip, so the position here is always one
+  # the file can be seeked to.
   #
   # One-shot, and `live_wall_ms` being nil is the whole of the test: the second
   # clause takes every later fragment, and a nil anchor with it.
@@ -281,15 +423,18 @@ defmodule Cairn.EventExtractor do
   defp note_live_fragment(state, _frag), do: state
 
   # Where a live fragment ends on the clip's own timeline, in ms from the t=0
-  # `Cairn.ClipRemux` rebases the clip to — the first fragment the file holds.
-  # The two clauses are `anchor/3`'s two, in the same order and for the same
-  # reason.
+  # `Cairn.ClipRemux` rebases the clip to — the first fragment the file holds,
+  # which is the first *keyframe-headed* one. The two clauses are `anchor/3`'s
+  # two, in the same order and for the same reason.
   #
-  # A `first_pts` of nil is an empty drain, so the fragment in hand is itself
-  # the first thing written after the init segment: it starts at the clip's t=0
-  # and its own duration is where it ends. Otherwise the clip starts at the head
-  # of the drain and the position is measured from that `pts`. Either way the
-  # fragment's duration is what carries a decode time to the end of its media.
+  # A `first_pts` of nil is an empty kept drain, so the fragment in hand is
+  # itself the first thing written after the init segment: it starts at the
+  # clip's t=0 and its own duration is where it ends. That the caller only
+  # reaches here for a fragment it is about to write is what keeps the two in
+  # step — a skipped fragment must not move this position. Otherwise the clip
+  # starts at the head of the kept drain and the position is measured from that
+  # `pts`. Either way the fragment's duration is what carries a decode time to
+  # the end of its media.
   #
   # An ffmpeg respawn mid-event restarts `pts` near zero while `first_pts` still
   # names the old session, which makes the difference negative. Nothing is done
@@ -394,8 +539,7 @@ defmodule Cairn.EventExtractor do
   defp close_clip(event, state) do
     RingBuffer.unsubscribe(state.camera.id, self())
     File.close(state.io)
-    bytes = maybe_remux(state)
-    {Events.finalize(event, bytes), bytes}
+    finish(event, state)
   rescue
     e ->
       Logger.error("event #{event.id}: finalize crashed: #{Exception.message(e)}")
@@ -404,6 +548,52 @@ defmodule Cairn.EventExtractor do
     :exit, reason ->
       Logger.error("event #{event.id}: finalize exited: #{inspect(reason)}")
       {{:error, :exception}, state.bytes}
+  end
+
+  # `fragments == 0` is the same fact as `started?` never having flipped —
+  # `open_media/1` sets it before the first write and `write_fragment/2` is
+  # reached through nothing else — and it means the file holds at most an init
+  # segment. There is nothing for the remux to rebase (an ffmpeg spawn that
+  # could only fail or write a 0-duration mp4 over the original), nothing for
+  # the sidecar's anchor to place a box against, and no frame for a snapshot to
+  # be cut from, so none of the three runs.
+  #
+  # The file stays where it is and the row is closed `partial` over it. Deleting
+  # it would leave the row naming a file that is gone, which the next boot's
+  # reconciliation resolves by deleting the row — taking the event's labels,
+  # scores and times with it, and with them the only trace that a camera is
+  # doing this at all. `partial` beside a short file is the state a recording
+  # interrupted by a crash already lands in, and every reader of the row —
+  # `Cairn.Reconciler`, the event page's badge, the read API — has that meaning
+  # for it.
+  defp finish(event, %{fragments: 0} = state) do
+    {{:no_media, Events.finalize_partial(event, state.bytes)}, state.bytes}
+  end
+
+  defp finish(event, state) do
+    bytes = maybe_remux(state)
+    {Events.finalize(event, bytes), bytes}
+  end
+
+  # Not an error: a camera whose GOP outlives its pre-window does this to any
+  # event that closes before the next keyframe arrives, and the clip that was
+  # not written is the one a reader would have had to be told to distrust. The
+  # index write is reported on its own line because it is a separate failure —
+  # the reason on the wire stays `:no_keyframe` either way, since that is why no
+  # clip is coming.
+  defp log_no_media(event, index) do
+    Logger.warning(
+      "event #{event.id}: no keyframe arrived before the event closed; " <>
+        "no clip was written"
+    )
+
+    case index do
+      {:ok, _row} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("event #{event.id}: could not mark it partial: #{inspect(reason)}")
+    end
   end
 
   # `Events.finalize` can fail because the row vanished under us (retention
@@ -428,6 +618,9 @@ defmodule Cairn.EventExtractor do
     end
   end
 
+  # Callers only reach here for a fragment the clip keeps: `started?` is
+  # already true, so `fragments` counts what the file holds and
+  # `unsynced_media_ms` measures media that exists in it.
   defp write_fragment(state, frag) do
     state = write!(state, frag.data)
     state = %{state | fragments: state.fragments + 1}

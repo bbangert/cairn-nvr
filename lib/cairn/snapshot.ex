@@ -84,12 +84,21 @@ defmodule Cairn.Snapshot do
   so a poster frame cut this way lands on the frame the overlay draws its boxes
   over.
 
+  Both of them, and the number handed to `-ss` below, are positions on the
+  clip's *media* timeline counted from its first sample. They agree because the
+  clip has no leading empty edit to disagree over — which is a property
+  `Cairn.EventExtractor` maintains by starting every clip on a keyframe, not
+  something any reader here checks.
+
   Failing that, `pre_window(config, camera)` — the *configured* pre-roll, not
-  the retained one. That is an approximation: a ring that had not filled yet
-  yields a shorter head than the config promises, and the clamp is what keeps
-  the error inside the clip. On a camera whose ring was full the two agree to
-  within tens of milliseconds; on one that had just started they disagree by
-  however much pre-roll was missing, which is a second or more.
+  the retained one. That is an approximation, and the retained head falls short
+  of the configured one for two separate reasons: a ring that had not filled
+  yet, and `Cairn.EventExtractor` cutting the pre-roll back to its first
+  keyframe (up to one GOP on a camera whose GOP outlives its fragments). The
+  clamp is what keeps the error inside the clip. On a camera with a full ring
+  and keyframe-aligned fragments the two agree to within tens of milliseconds;
+  otherwise they disagree by however much pre-roll was not retained, which is a
+  second or more.
 
   The sidecar is never *required*: it is allowed to be absent (no boxes, a
   failed write, a clip older than the feature), allowed to be corrupt, and

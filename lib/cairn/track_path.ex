@@ -69,10 +69,18 @@ defmodule Cairn.TrackPath do
   `"anchor"` is the clip's time-zero as the writer knew it, in two halves that
   pair a media position with a wall clock. The **drain half** — `"first_pts"`,
   `"timescale"`, `"drained_span_ms"`, `"drain_wall_ms"` — is what the extractor
-  had in hand when it drained the ring's pre-window. The **live half** —
-  `"live_media_ms"`, `"live_wall_ms"` — is the position the first fragment to
-  arrive *live* ends at, against the wall clock at its arrival.
+  *kept* of the ring's pre-window when it drained it. The **live half** —
+  `"live_media_ms"`, `"live_wall_ms"` — is the position the first fragment
+  written from the live stream ends at, against the wall clock at its arrival.
   `"event_started_ms"` belongs to both.
+
+  Both media positions are measured from the same origin: the first
+  keyframe-headed fragment the clip holds, which is the t=0 `Cairn.ClipRemux`
+  rebases the file to. `Cairn.EventExtractor` writes nothing before that
+  fragment precisely so this origin and the file's own agree — a clip that
+  started mid-GOP would lose its leading samples to the remux and leave every
+  position here late by the span that went missing, with no half able to
+  detect it.
 
   Either half maps an event-relative `"ts"` onto a position in the clip, by the
   same arithmetic:
@@ -91,6 +99,12 @@ defmodule Cairn.TrackPath do
   the boundary happened to fall. That surplus is time the drain half does not
   know about, so it places every observation that much too early, which a
   viewer sees as boxes running ahead of what they are drawn around.
+
+  That preference corrects the drain half's surplus and nothing else. It is
+  worth saying because the same symptom once had a second cause with a
+  different remedy: a clip starting mid-GOP shifted *both* halves by the same
+  span, so preferring one over the other changed nothing. That one is fixed at
+  the writer (see `Cairn.EventExtractor`), not here.
 
   `anchor_clip_ms/2` is that preference order for Elixir readers — it is where
   `Cairn.Snapshot.clip_seek/2` sends its anchor rather than choosing a half

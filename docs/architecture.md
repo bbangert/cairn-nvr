@@ -195,7 +195,7 @@ The aggregator never holds video data — it operates purely on JSON detections,
 
 ### Configurable thresholds
 
-- `pre_window_seconds` (default 10) — how much lead-up to capture before detection.
+- `pre_window_seconds` (default 10) — how much lead-up to ask for before detection. The clip retains *up to* that much: the ring may not have filled yet, and the pre-roll is cut back to its first keyframe (see the extractor below).
 - `post_window_seconds` (default 30) — how long after the last detection before finalizing.
 - `max_event_seconds` (default 600) — hard cap on a single event's duration. Beyond this, the current event is finalized and a new one starts if detection continues.
 - `min_score` per label — score threshold for considering a detection valid.
@@ -209,6 +209,8 @@ Lifecycle:
 1. **Init.** Open output file at `events/{camera_id}/{event_id}.mp4`. Write fmp4 init segment.
 2. **Pre-window drain.** Call `RingBuffer.drain_and_subscribe(camera_id, started_at_pts - pre_window, self())`. Receive the list of pre-window fragments and append each to the file. The atomic drain+subscribe is what prevents the boundary race between "fragments already in the ring" and "fragments arriving from now on."
 3. **Streaming.** Receive `{:fragment, frag}` messages from PubSub. Append each to the file, optionally `fsync` at fragment boundaries.
+
+   Steps 2 and 3 share one rule: **nothing is written until a fragment whose first sample is a keyframe**, and that fragment is the clip's t=0. On a camera whose GOP is longer than its fragment duration, that discards up to one GOP off the front of the pre-roll. The alternative is worse — the finalizing remux (`ffmpeg -c copy`) silently drops leading samples it has no keyframe for and records the hole as an empty edit, leaving every consumer of the file late by the dropped span with nothing to detect it by.
 4. **Finalize.** On `:finalize` call from the aggregator: unsubscribe, write mp4 trailer (or just close, since fmp4 is independently readable), insert event metadata into the SQLite event index, exit normally.
 
 ```elixir

@@ -63,6 +63,19 @@ defmodule Cairn.ProbeTest do
       assert probe.fps == 10.0
     end
 
+    @tag :tmp_dir
+    test "input ffprobe cannot read is an error, not a crash", %{tmp_dir: tmp_dir} do
+      # The fast-exit path, mirroring `Cairn.ClipRemuxTest`'s: ffprobe gives up
+      # on the first read and is gone before `run/2` has looked at the port at
+      # all, so `Port.info(port, :os_pid)` answers `nil`. Reading that as a
+      # `{:os_pid, _}` match raises a MatchError out of here instead.
+      path = Path.join(tmp_dir, "not_really_a_video.mp4")
+      File.write!(path, "this is not video")
+
+      assert {:error, {:ffprobe_exit, status}} = Probe.run(path)
+      assert status != 0
+    end
+
     test "hard timeout kills a hung probe" do
       # a URL ffprobe will hang on: unroutable TEST-NET address
       assert {:error, reason} = Probe.run("rtsp://192.0.2.1:554/x", 500)
