@@ -1754,6 +1754,38 @@ defmodule Cairn.TrackerTest do
       assert Tracker.suspended_tracks(t) == []
     end
 
+    # `revive/3` does not touch `bbox`, so the leftover box is judged against
+    # the ghost's *pre-cut* box, not the box that just adopted it. The two
+    # boxes here straddle that distinction: each clears `@stitch_iou` against
+    # the ghost, but they sit at 0.22 to each other — below suppression's
+    # floor — so this only suppresses if the candidate box is the ghost's own.
+    # (This is also why `@stitch_iou` may not sink below
+    # `@duplicate_suppression_iou`: judged against a box adoption could not
+    # have accepted, the twin would mint beside the resumed identity.)
+    test "the leftover is judged against the ghost's own box, not the adopter's" do
+      adopter = [0.454, 0.50, 0.18, 0.12]
+      twin = [0.34, 0.50, 0.18, 0.12]
+
+      assert_in_delta Tracker.iou(@parked_car, adopter), 0.538, 0.001
+      assert_in_delta Tracker.iou(@parked_car, twin), 0.5, 0.001
+      assert_in_delta Tracker.iou(adopter, twin), 0.224, 0.001
+
+      {t, id} = parked(@parked_car, "car")
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
+
+      {t, tagged, events} =
+        track(t, [det("car", adopter), det("car", twin)],
+          epoch: "epoch_two",
+          at_ms: 10_300
+        )
+
+      # the closer box wins the suspension; the twin is suppressed, not minted
+      assert [%{object_id: ^id, bbox: ^adopter}] = tagged
+      assert [{:updated, %Track{object_id: ^id}}, {:adopted, %Track{object_id: ^id}}] = events
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+      assert Tracker.suspended_tracks(t) == []
+    end
+
     test "a short gap resumes a parked track's identity, its stillness and its clocks" do
       {t, id} = parked(@box)
       {t, [], _info} = Tracker.suspend(t, 128, 10_000)

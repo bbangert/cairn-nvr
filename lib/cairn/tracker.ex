@@ -424,6 +424,8 @@ defmodule Cairn.Tracker do
 
   if @stitch_iou < @duplicate_suppression_iou do
     raise CompileError,
+      file: __ENV__.file,
+      line: __ENV__.line,
       description:
         "@stitch_iou must be >= @duplicate_suppression_iou: a box adopted below " <>
           "suppression's floor leaves its NMS twin unsuppressed beside the identity " <>
