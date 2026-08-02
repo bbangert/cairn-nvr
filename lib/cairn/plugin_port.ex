@@ -13,7 +13,10 @@ defmodule Cairn.PluginPort do
   `Cairn.Observation` forwarded to `Cairn.CameraTracker` together with
   the camera's config and effective policy (event windows, tracking bounds and
   the `track:` / `record:` tiers), so the tracker never has to look up
-  config; `plugin.hello` is recorded here — a plugin declaring the
+  config. Its `at_ms` — the only clock the tracker decides on — is derived
+  here, from this camera's `Cairn.ObservationClock`, because this is where the
+  plugin's pts and the host's monotonic clock are both in hand;
+  `plugin.hello` is recorded here — a plugin declaring the
   `object_tracking` capability is warned about, since the host tracks every
   object itself and ignores plugin track ids —
   and `plugin.status` lands in `Cairn.CameraStatus`. Lines that do not match the contract are dropped,
@@ -41,7 +44,7 @@ defmodule Cairn.PluginPort do
 
   require Logger
 
-  alias Cairn.{Observation, PluginProtocol, StreamEpochs}
+  alias Cairn.{Observation, ObservationClock, PluginProtocol, StreamEpochs}
 
   @backoff_min_ms 1_000
   @backoff_max_ms 30_000
@@ -74,6 +77,7 @@ defmodule Cairn.PluginPort do
             last_sequence: nil,
             last_status: nil,
             epoch: nil,
+            clock: %ObservationClock{},
             opts: []
 
   def start_link(opts) do
@@ -262,7 +266,13 @@ defmodule Cairn.PluginPort do
     state = note_drops(state, skew, :clock_skew)
 
     if current_epoch?(observation, state.camera.id) do
-      state
+      # Stamped here and not above the epoch test: a line from a retired epoch
+      # carries a pts from a timeline nothing tracks any more, and anchoring on
+      # it would re-anchor the clock a second time on the next accepted line.
+      {observation, clock} =
+        ObservationClock.stamp(state.clock, observation, System.monotonic_time(:millisecond))
+
+      %{state | clock: clock}
       |> note_sequence(observation)
       |> forward(observation)
       |> note_drops(observation.invalid_objects, :invalid_det)
@@ -587,7 +597,12 @@ defmodule Cairn.PluginPort do
       end
 
     # A fresh plugin process has been told nothing and continues nobody's
-    # sequence: both reset with the OS process, as do the drop counters.
+    # sequence — nor anybody's pts, which is why the observation clock re-anchors
+    # with it. It is `reset/1` and not `new/0`: the anchor described a timeline
+    # this process will not continue, but tracking time is the host's and the
+    # tracks it stamps are the same tracks, so it carries over and the first
+    # line of the new process resumes from it. The sequence and the drop
+    # counters reset outright with the OS process.
     announce_current_epoch(%{
       state
       | port: port,
@@ -598,6 +613,7 @@ defmodule Cairn.PluginPort do
         last_sequence: nil,
         last_status: nil,
         epoch: nil,
+        clock: ObservationClock.reset(state.clock),
         plugin: nil
     })
   end

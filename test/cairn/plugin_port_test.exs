@@ -566,6 +566,50 @@ defmodule Cairn.PluginPortTest do
     assert state.drops == %{missing_pts_or_dets: 1, invalid_pts: 1, invalid_time_base: 1}
   end
 
+  # The clock the tracker decides on is derived here, once per line
+  # (`Cairn.ObservationClock`), because this is the only place the plugin's pts
+  # and the host's monotonic clock are both in hand.
+  test "every forwarded observation carries an at_ms on the host's monotonic clock" do
+    id = "plug_at_ms_#{System.unique_integer([:positive])}"
+    epoch = StreamEpochs.new_epoch(id, :started)
+
+    command =
+      printf([
+        v1_line(id, epoch, 1, [object("person", 0.9)]),
+        v1_line(id, epoch, 2, [object("person", 0.9)])
+      ]) <> "; exec sleep 30"
+
+    # the stamp has to land between these two readings, however slowly a
+    # loaded machine gets through the receives — a fixed tolerance against
+    # a `now` read afterwards would flake exactly there
+    before = System.monotonic_time(:millisecond)
+
+    start_supervised!(
+      {PluginPort,
+       camera: camera(id), config: config(), index: 0, command: command, tracker: self()}
+    )
+
+    assert_receive {:"$gen_cast",
+                    {:detections, _cam, _policy, %Observation{sequence: 1} = first}},
+                   5_000
+
+    assert_receive {:"$gen_cast",
+                    {:detections, _cam, _policy, %Observation{sequence: 2} = second}},
+                   5_000
+
+    now = System.monotonic_time(:millisecond)
+
+    # on the host's scale, never ahead of it, and strictly increasing. These
+    # two lines are printf'd back to back, so the pts spacing between them is
+    # time the clamp is entitled to refuse — what it may never do is leave the
+    # clock standing still
+    assert first.at_ms >= before
+    assert first.at_ms <= now
+    assert second.at_ms > first.at_ms
+    # the pts is carried through untouched beside it
+    assert second.media_ms > first.media_ms
+  end
+
   test "an observed_at far from host time is replaced with arrival time and counted" do
     id = "plug_skew_#{System.unique_integer([:positive])}"
     epoch = StreamEpochs.new_epoch(id, :started)

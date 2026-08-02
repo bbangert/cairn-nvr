@@ -588,8 +588,8 @@ defmodule Cairn.TracksTest do
     assert [%{kind: :appeared}, %{kind: :started_moving}] = Tracks.moments(attrs.id)
   end
 
-  test "a float stationary_ms from the media clock is rounded at the boundary" do
-    # The tracker's media clock is float arithmetic; the column is :integer
+  test "a float stationary_ms from the observation clock is rounded at the boundary" do
+    # The observation clock is float arithmetic; the column is :integer
     # and insert_all dumps without casting. The crash this pins ate the
     # recorder's buffer live (Ecto.ChangeError on 4366.666666666666).
     attrs = track_attrs(%{stationary_ms: 4366.666666666666})

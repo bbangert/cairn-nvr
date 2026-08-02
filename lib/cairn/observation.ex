@@ -17,6 +17,13 @@ defmodule Cairn.Observation do
   comparable across epochs, and it is *not* an address into the recording:
   the mapping between plugin pts and fMP4 `tfdt` is undefined.
 
+  `at_ms` is what the tracker decides on: `media_ms` anchored to the host's
+  monotonic clock and clamped against a pts that stalls, rewinds or jumps —
+  see `Cairn.ObservationClock`, which the port stamps it with. It *is*
+  comparable across epochs, which `media_ms` is not, and it is not a wall
+  instant: `observed_at` is the only field that dates an observation in terms
+  anything outside this host can read.
+
   An object's `track_id` and the line's `ended_tracks` are decoded and carried
   here for wire compatibility, but nothing consumes them: `Cairn.Tracker`
   assigns every identity itself. They are reserved.
@@ -40,6 +47,7 @@ defmodule Cairn.Observation do
           pts: number(),
           time_base: time_base(),
           media_ms: float(),
+          at_ms: number() | nil,
           observed_at: DateTime.t() | nil,
           time_quality: :source | :arrival,
           objects: [object()],
@@ -55,6 +63,7 @@ defmodule Cairn.Observation do
             pts: 0,
             time_base: {1, 90_000},
             media_ms: 0.0,
+            at_ms: nil,
             observed_at: nil,
             time_quality: :arrival,
             objects: [],

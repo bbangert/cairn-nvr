@@ -10,8 +10,20 @@ defmodule Cairn.Tracker do
   accepted and reserved, and a plugin that declares the capability is tracked
   host-side like every other.
 
-  Expiry is media time, not batches: a track is ended (`:unseen`) once
-  `media_ms - last_seen_ms > max_unseen_ms`. `last_seen_ms` moves on *any*
+  Every decision here is taken on one clock, `at_ms`: the observation's own
+  media time anchored to the host's monotonic clock and clamped against a pts
+  that stalls, rewinds or jumps, computed once at ingestion by
+  `Cairn.ObservationClock`. It behaves as media time within a stream — the
+  bounds below are spaced by frames, not by batches — while being comparable
+  across an epoch boundary and unable to freeze, which is what a plugin's raw
+  pts is neither of. No threshold here is measured on a wall clock:
+  `observed_at` is carried onto the summaries as data (`started_at`,
+  `last_seen_at`, `last_detected_at`, `stationary_since`) and reported as the
+  instant an outage gap is measured to (`suspend/3`), and that is all it is
+  for.
+
+  Expiry is that clock, not batches: a track is ended (`:unseen`) once
+  `at_ms - last_seen_ms > max_unseen_ms`. `last_seen_ms` moves on *any*
   observation of the track, predicted ones included — slow inference must not
   kill a track — and, as below, on a box the track refuses. Evidence policy is
   separate: a track whose last **detection** is older than `max_unseen_ms` is
@@ -53,19 +65,19 @@ defmodule Cairn.Tracker do
   `@iou_threshold` and adopts it normally. Where batches are further apart than
   that — inference slower than the camera's own unseen bound — every batch
   finds the track back in its grace and the refusal repeats, and what ends that
-  is the host-clock backstop below rather than a match.
+  is the refusal bound below rather than a match.
 
   If that track *matched*, nothing is marked. It was just observed for real,
-  every clock it has has already moved, and a box it refused adds nothing to
-  that; the mark exists for a track whose only remaining sign of life is the
-  box being refused.
+  its clock has already moved, and a box it refused adds nothing to that; the
+  mark exists for a track whose only remaining sign of life is the box being
+  refused.
 
   Being marked seen is not being observed. The box was refused, so nothing
   about it is believed — not the anchor, not the stillness window, not
   `last_detected_ms`, so a track kept alive this way still goes
   `stale_predicted` on the evidence policy's own schedule and cannot be
-  dragged off its anchor by what it refused. Nor is `last_seen_host_ms`
-  touched: the host-clock backstop below is the one bound a suppression cannot
+  dragged off its anchor by what it refused. Nor is `last_matched_ms`
+  touched: the refusal bound below is the one bound a suppression cannot
   refresh away, so a track that only ever gets suppressions is still retired
   rather than living forever.
 
@@ -97,11 +109,13 @@ defmodule Cairn.Tracker do
   window the grace makes longer; `stale_predicted` is what keeps it from
   counting as evidence.
 
-  Media time may jump backwards (a new ffmpeg run restarts the RTP timeline).
-  Within an epoch that only makes the elapsed time negative, which never
-  expires anything; across epochs `suspend/3` cuts the live set from the new
-  stream's matching, and the clocks of everything that survives the cut are
-  re-based on the new epoch (see below).
+  A pts that jumps backwards (a new ffmpeg run restarts the RTP timeline) or
+  stops advancing at all never reaches this module: `at_ms` is clamped at
+  ingestion so it can do neither, which is why nothing here floors an elapsed
+  time at zero. What a new ffmpeg run does reach here as is a new epoch, where
+  `suspend/3` cuts the live set from the new stream's matching — not because
+  the clock changed, since it does not, but because nothing observed the gap
+  (see below).
 
   ## Surviving a stream reset: suspension and adoption
 
@@ -113,8 +127,9 @@ defmodule Cairn.Tracker do
 
   A detection in the new epoch may then **adopt** a suspended track — same
   ULID, no `:started`, no `:ended`. Adoption is geometry across a blind gap,
-  so it is scaled by how long the gap was, measured in wall clock (the media
-  clocks either side of a cut are different streams and cannot be compared):
+  so it is scaled by how long the gap was — which `at_ms` answers across a cut
+  as readily as within a stream, being anchored to the host's clock rather than
+  to either side's pts:
 
     * **Absent no longer than `max_unseen_ms` and no longer than
       `@mover_adoption_max_ms`**, whichever is shorter — the camera's own
@@ -127,10 +142,14 @@ defmodule Cairn.Tracker do
       only at `@stationary_match_iou`. Over a gap nothing observed, geometry
       identifies only what provably does not move.
 
-  Those are two different clocks, deliberately. *How much overlap is demanded*
-  scales with the **track's own** absence — measured from its last sighting,
-  which may be well before the cut, because a track already halfway through
-  its unseen bound when the stream dropped has been gone that much longer.
+  Those are two different measurements on the one clock, deliberately. *How
+  much overlap is demanded* scales with the **track's own** absence — measured
+  from its last sighting, which may be well before the cut, because a track
+  already halfway through its unseen bound when the stream dropped has been
+  gone that much longer. A new epoch re-anchors the clock on the host's
+  (`Cairn.ObservationClock`), so that absence also takes in whatever the old
+  stream's pts had fallen behind by before it died, which is time nothing was
+  seen in either.
   *How long the offer stands* is `@adoption_window_ms` from **the cut**
   (`within_window?/2`): it bounds the waiting, not the confidence. A stream
   that had already been quiet for a minute before ffmpeg respawned therefore
@@ -141,10 +160,15 @@ defmodule Cairn.Tracker do
   the length of the outage may not be resumed by the plugin's extrapolation of
   where it would have been.
 
-  What resumes with the identity is deliberately split. Media-clock fields
-  (`last_seen_ms`, `last_detected_ms`, `anchor_ms`) are re-based on the new
-  epoch, because mixing two streams' clocks in one subtraction is garbage.
-  Wall-clock fields (`started_at`, `stationary_since`) are kept, and so is the
+  What resumes with the identity is nearly all of it: `at_ms` spans the cut, so
+  nothing has to be re-based to stay comparable, and `last_seen_ms` still dates
+  the last sighting — which is what the tiers above measure the absence from.
+  The two clock fields the adoption does move (`last_detected_ms`, `anchor_ms`)
+  are moved for a reason that is not about clocks: both are read as *elapsed
+  stillness* — `stationary_ms` accrues over the gap between two detections, the
+  settle window measures from the anchor — and a gap nothing watched is not
+  stillness anybody saw. Everything else is kept, `started_at` and
+  `stationary_since` included, and so is the
   `stationary` flag itself: a car that matches its own parking space was
   parked for the whole gap, so it resumes **already** stationary and its
   settle window does not re-arm — which is the point of all of this, since
@@ -153,13 +177,13 @@ defmodule Cairn.Tracker do
   i.e. like a clip. Resuming the flag is not the same as freezing it: what
   happens to it on the adopting batch is below.
 
-  The anchor keeps its box and takes the new clock, which splits the two
-  questions stillness asks. *Has it moved* is still measured against where the
-  object was before the cut, and it is asked on the adopting batch itself: the
-  median window (`@recent_boxes`) is emptied at the adoption, so the first
-  smoothed box of the new epoch is the adopting box and nothing else. *How
-  long has it held still* restarts at the adoption, which is all the tracker
-  can honestly say about a gap it did not watch.
+  The anchor keeps its box and takes the adopting batch's clock, which splits
+  the two questions stillness asks. *Has it moved* is still measured against
+  where the object was before the cut, and it is asked on the adopting batch
+  itself: the median window (`@recent_boxes`) is emptied at the adoption, so the
+  first smoothed box of the new epoch is the adopting box and nothing else.
+  *How long has it held still* restarts at the adoption, which is all the
+  tracker can honestly say about a gap it did not watch.
 
   So `stationary` crosses the cut but is **not** guaranteed to survive the
   adoption: it is re-derived from the adopting box by the ordinary rule,
@@ -191,10 +215,11 @@ defmodule Cairn.Tracker do
 
   ## Host policy: the live set is bounded, on both counts
 
-  `media_ms` is the plugin's own `pts`, so media-time expiry alone leaves the
-  plugin holding the clock that retires its tracks. Two host-side bounds close
-  that, and both belong here rather than in the codec because they are about
-  accumulated state, not about one line:
+  The unseen rule alone bounds a track that is *not being observed*, which
+  leaves two ways for a live set to grow without one: a scene that keeps
+  minting, and a track something keeps refusing on. Both bounds belong here
+  rather than in the codec because they are about accumulated state, not about
+  one line:
 
     * **A cap on live tracks** (`max_live_tracks`, per camera). At the cap,
       minting a new identity retires the least recently seen live track with a
@@ -206,22 +231,28 @@ defmodule Cairn.Tracker do
       `suspend/3` trims the suspended set to `max_live_tracks`, oldest
       suspension first — so a camera's worst case is twice the cap for at most
       `@adoption_window_ms`.
-    * **A host-clock backstop.** A track whose age on the *host's* monotonic
-      clock (`now_ms`, supplied by the caller) exceeds ten times its effective
-      unseen bound — `max_unseen_ms`, or the grace-extended bound above for a
-      stationary track — is expired (`:unseen`) whatever media time says, so a
-      frozen or rewound `pts` cannot pin tracks alive. It scales off the same
-      bound as the media-time rule on purpose: left at the plain one it would
-      retire a stationary track at exactly the bound the grace exists to
-      extend, cancelling the grace without a trace of why. The factor is
-      deliberately lax: media time is the real rule, and this must never fire
-      for a stream that is merely slow.
+    * **A bound on refusals** (`@refusal_factor`). A suppression marks its
+      track seen, so the unseen rule cannot retire a track whose every batch
+      brings another box it refuses — the mark is the sign of life, and it
+      arrives as fast as the refusals do. `last_matched_ms`, which a mark does
+      *not* move, bounds that: a track is expired (`:unseen`) once ten times
+      its effective unseen bound has passed since it last actually took an
+      observation. Both halves of `live?/2` read one `unseen_bound/2` binding,
+      which is what keeps the ceiling where it has always been: the host-clock
+      backstop this replaced was scaled by the same grace, so a stationary
+      track's refusal ceiling is 10 × 5 × `max_unseen_ms` — 150 s at the 3 s
+      default. Reading the unscaled bound here would put it at 30 s and retire
+      a continuously-refused stationary track five times sooner, which may well
+      be the better rule but is a change of behaviour and deliberately not one
+      made here. The factor is lax either way — the unseen rule is the real
+      one, and this must never fire for a track that is merely being seen
+      slowly.
 
   ## Stationary detection
 
   A track is stationary once its box has held still for the camera's
-  `stationary_after_ms` of media time. "Still" is measured against an
-  **anchor** — the box the object was last seen to move to — not against the
+  `stationary_after_ms` on the observation clock. "Still" is measured against
+  an **anchor** — the box the object was last seen to move to — not against the
   previous box: comparing consecutive boxes calls a slow walk motionless,
   because every step is within jitter of the one before it. The anchor is
   reset only when the object is judged to have moved — which, leaving the flag,
@@ -235,8 +266,8 @@ defmodule Cairn.Tracker do
   Leaving the flag takes as much sustaining as earning it. A stationary track
   whose smoothed box fails the anchor test does not flip on that evaluation: it
   goes *pending*, still stationary in every way anything downstream can see,
-  and only once the failure has been unbroken for `@stationary_exit_ms` of
-  media time does the flag clear and `started_moving` go out — once,
+  and only once the failure has been unbroken for `@stationary_exit_ms` on the
+  observation clock does the flag clear and `started_moving` go out — once,
   timestamped at the evaluation that closed the window. A single passing
   evaluation ends the pending state outright, so the next excursion starts a
   fresh clock: the rule is continuity and not a total, and two short excursions
@@ -336,7 +367,8 @@ defmodule Cairn.Tracker do
   # the second car in a queue would never be tracked at all.
   @duplicate_suppression_iou 0.4
   # How long after a stream reset a suspended track may still be adopted, in
-  # wall-clock milliseconds — the only clock the two sides of a cut share.
+  # milliseconds of the observation clock, which the two sides of a cut share
+  # because it is anchored to the host's and not to either stream's pts.
   #
   # The two mistakes are not symmetric, which is what picks the number. Too
   # short and a parked car re-minted after an ffmpeg reconnect spends its whole
@@ -396,7 +428,7 @@ defmodule Cairn.Tracker do
   # the doorway, and nothing in the config would say so.
   @mover_adoption_max_ms 3_000
   # The unseen bound for a stationary track, as a multiplier of
-  # `max_unseen_ms` (the `@host_clock_factor` precedent: policy the operator
+  # `max_unseen_ms` (the `@refusal_factor` precedent: policy the operator
   # sets the base for, scaled here by a fixed factor). A parked object is
   # occluded for as long as whatever parked in front of it stays, which is not
   # the timescale a moving track needs; the patience is paid for with
@@ -408,11 +440,11 @@ defmodule Cairn.Tracker do
   # the knob that answers the question they actually have — "how long before
   # you call it parked" — is `stationary_after_ms`.
   @stationary_iou 0.8
-  # How long the smoothed box must keep failing that test, in media time,
-  # before a stationary track is called moving. Entry and exit are otherwise
-  # asymmetric in a way that only ever fails one direction: earning the flag
-  # takes `stationary_after_ms` of sustained stillness, and losing it took a
-  # single failed evaluation.
+  # How long the smoothed box must keep failing that test, on the observation
+  # clock, before a stationary track is called moving. Entry and exit are
+  # otherwise asymmetric in a way that only ever fails one direction: earning
+  # the flag takes `stationary_after_ms` of sustained stillness, and losing it
+  # took a single failed evaluation.
   #
   # What that asymmetry cost is measured, not hypothetical. A parked car far
   # enough from the camera is a small box — 0.17 by 0.09 of the frame in the
@@ -449,20 +481,30 @@ defmodule Cairn.Tracker do
   # window can be even and average two); short, so a real move reaches the
   # smoothed box within a handful of detections at any frame rate.
   @recent_boxes 5
-  # How much slower than media time the host clock is allowed to be before a
-  # track is expired regardless. See the moduledoc: a backstop, not the rule.
-  @host_clock_factor 10
+  # How many times its effective unseen bound a track may be held alive by
+  # boxes it refuses. It scales `last_matched_ms`, the one of `live?/2`'s two
+  # clocks a mark does not refresh. See the moduledoc: a bound on a
+  # pathological case and not the
+  # rule, so it is lax enough that nothing observed normally can reach it.
+  @refusal_factor 10
   # Warnings here fire from the per-observation path, and an observation is a
   # per-line primitive: unrate-limited they are a log-flood of their own.
+  # Measured on the observation clock like everything else here, which in
+  # practice can only stretch the interval: on a stalled stream that clock falls
+  # behind the host's, and the only thing that puts it ahead is the ingestion
+  # floor's creep — a millisecond per line that a host millisecond does not
+  # separate, so nothing at all under a thousand lines a second.
   @warn_interval_ms 5_000
 
-  # `suspended` is `%{object_id => %{tracked: object, suspended_at: DateTime}}`
-  # — the live objects a stream reset moved aside, each with the wall instant
-  # of the cut that moved it, which is what `within_window?/2` measures the
-  # adoption window from. `last_observed_at` is a different instant: the wall
-  # time of the most recent observation of any kind, i.e. the last sign of life
-  # before the cut. It is what the outage gap is reported against, and the two
-  # differ by however long the stream had already been quiet.
+  # `suspended` is `%{object_id => %{tracked: object, suspended_at: at_ms}}` —
+  # the live objects a stream reset moved aside, each with the observation-clock
+  # instant of the cut that moved it, which is what `within_window?/2` measures
+  # the adoption window from. `last_observed_at` is a different instant, and the
+  # one wall clock this struct holds: the `observed_at` of the most recent
+  # observation of any kind, i.e. the last sign of life before the cut. Nothing
+  # here decides on it — it is reported to the caller, whose outage gap is a
+  # wall-clock duration a human reads, and the two differ by however long the
+  # stream had already been quiet.
   defstruct objects: %{},
             suspended: %{},
             warned_at: %{},
@@ -477,9 +519,9 @@ defmodule Cairn.Tracker do
   exactly the length of the event list returned beside it: any older suspension
   the cap pushed out, and any whose window had already run out — and `at`, the
   last observation before the cut, which is the instant an
-  outage gap is measured from. `at` is `nil` when this camera has never been
-  observed (in which case nothing was suspended). It is not the cut: see
-  `suspend/3`.
+  outage gap is measured from. `at` is `nil` when no observation has ever
+  reached this camera, which is the one case there is no gap to report. It is
+  not the cut: see `suspend/3`.
   """
   @type suspension :: %{
           suspended: non_neg_integer(),
@@ -491,12 +533,11 @@ defmodule Cairn.Tracker do
   @type context :: %{
           camera_id: String.t() | nil,
           epoch: String.t() | nil,
-          media_ms: number(),
+          at_ms: number(),
           observed_at: DateTime.t() | nil,
           max_unseen_ms: pos_integer(),
           max_live_tracks: pos_integer(),
-          stationary_after_ms: pos_integer(),
-          now_ms: number()
+          stationary_after_ms: pos_integer()
         }
 
   @typedoc "The host-side tracking policy for one camera."
@@ -520,21 +561,20 @@ defmodule Cairn.Tracker do
   *configured* camera, and that is what a track summary must name, whatever
   the plugin put on the wire.
 
-  `now_ms` is the host's monotonic clock, injected rather than read here so
-  the tracker stays pure and the host-clock backstop is testable without
-  sleeping.
+  `at_ms` is the observation's, stamped at ingestion (`Cairn.ObservationClock`)
+  rather than read from a clock here: every bound in this module is a
+  subtraction of two of them, and the tracker stays pure.
   """
-  @spec context(Observation.t(), String.t(), policy(), number()) :: context()
-  def context(%Observation{} = observation, camera_id, policy, now_ms) do
+  @spec context(Observation.t(), String.t(), policy()) :: context()
+  def context(%Observation{} = observation, camera_id, policy) do
     %{
       camera_id: camera_id,
       epoch: observation.epoch,
-      media_ms: observation.media_ms,
+      at_ms: observation.at_ms,
       observed_at: observation.observed_at,
       max_unseen_ms: policy.max_unseen_ms,
       max_live_tracks: policy.max_live_tracks,
-      stationary_after_ms: policy.stationary_after_ms,
-      now_ms: now_ms
+      stationary_after_ms: policy.stationary_after_ms
     }
   end
 
@@ -558,7 +598,7 @@ defmodule Cairn.Tracker do
   """
   @spec track(t(), [map()], context()) :: {t(), [map()], [event()]}
   def track(%__MODULE__{} = tracker, objects, context) do
-    {tracker, lapsed} = expire_suspended(tracker, context.observed_at)
+    {tracker, lapsed} = expire_suspended(tracker, context.at_ms)
     {tracker, assignments, adopted} = assign(tracker, objects, context)
 
     {tracker, tagged, lifecycle} =
@@ -569,11 +609,12 @@ defmodule Cairn.Tracker do
     {observed(tracker, context), tagged, lapsed ++ lifecycle ++ expired}
   end
 
-  # The wall instant a later `suspend/3` reports its outage gap from. Moved on
-  # every batch, predicted and empty ones included: what it dates is the last
-  # sign of life from the stream, not the last detection in it. It is not what
-  # bounds the adoption window — that runs from the cut, which `suspend/3` is
-  # handed.
+  # The wall instant a later `suspend/3` reports its outage gap from — the one
+  # thing here kept in wall time, because it is reported and not decided on.
+  # Moved on every batch, predicted and empty ones included: what it dates is
+  # the last sign of life from the stream, not the last detection in it. It is
+  # not what bounds the adoption window — that runs from the cut, which
+  # `suspend/3` is handed.
   defp observed(tracker, %{observed_at: nil}), do: tracker
   defp observed(tracker, context), do: %{tracker | last_observed_at: context.observed_at}
 
@@ -602,57 +643,47 @@ defmodule Cairn.Tracker do
   @doc """
   Moves the live tracks aside at a stream-epoch boundary.
 
-  The new epoch decodes a stream whose media clock has nothing to do with the
-  old one's, so the tracker is emptied of live tracks — but they are *kept*,
+  Nothing observed the boundary, so no track may go on matching ordinarily
+  across it — the tracker is emptied of live tracks, but they are *kept*,
   suspended, so a detection in the new epoch can adopt one instead of minting a
   duplicate of the object that was already there. See the moduledoc for what
   adoption demands and what it resumes.
 
-  `cut_at` is the wall instant of the boundary itself, and it is what the
-  adoption window is measured from — not `last_observed_at`, which is the last
-  sign of life *before* the cut and can be a long way behind it on a stream
-  that went quiet before ffmpeg noticed. The two are separate on purpose: the
-  window bounds how long the caller waits for a stream to come back, and the
-  waiting starts when the stream is cut. `suspension.at` still reports
-  `last_observed_at`, because that is what an outage gap is measured to.
+  `cut_ms` is the boundary itself on the observation clock — the caller's
+  `cut_clock` (`System.monotonic_time/1` unless a test injects one), since no
+  observation marks a cut — and it is what
+  the adoption window is measured from, not `last_observed_at`, which is the
+  last sign of life *before* the cut and can be a long way behind it on a
+  stream that went quiet before ffmpeg noticed. The two are separate on
+  purpose: the window bounds how long the caller waits for a stream to come
+  back, and the waiting starts when the stream is cut. `suspension.at` reports
+  `last_observed_at` in wall time, because an outage gap is what a human reads.
 
-  Two kinds of track do not survive this: everything at all if this camera has
-  never been observed, and the oldest suspensions beyond `max_suspended` — a
-  camera reconnecting in a loop must not accumulate a generation of ghosts per
-  attempt. Both are returned as `:stream_reset` finals, and so is any
-  suspension whose window has run out by `cut_at`.
+  The oldest suspensions beyond `max_suspended` do not survive this — a camera
+  reconnecting in a loop must not accumulate a generation of ghosts per
+  attempt — and neither does any whose window has run out by `cut_ms`. Both are
+  returned as `:stream_reset` finals.
 
   Returns `{tracker, events, suspension}`; the counts in `suspension` are the
   caller's link-health report.
   """
-  @spec suspend(t(), pos_integer(), DateTime.t()) :: {t(), [event()], suspension()}
-  # A camera no observation has ever reached. In production that is a tracker
-  # with nothing in it — `Cairn.CameraTracker` stamps every observation
-  # with a wall clock before the tracker sees one — so this ends nothing. Where
-  # it is not, the tracks it holds could not be adopted anyway: `adopt/4`
-  # refuses a batch that carries no wall clock, so suspending them would only
-  # postpone the same finals by a minute.
-  def suspend(%__MODULE__{last_observed_at: nil} = tracker, _max_suspended, _cut_at) do
-    {tracker, events} = end_all(tracker, :stream_reset)
-    {tracker, events, %{suspended: 0, ended: length(events), at: nil}}
-  end
-
-  def suspend(%__MODULE__{} = tracker, max_suspended, cut_at) do
+  @spec suspend(t(), pos_integer(), number()) :: {t(), [event()], suspension()}
+  def suspend(%__MODULE__{} = tracker, max_suspended, cut_ms) do
     at = tracker.last_observed_at
-    {tracker, lapsed} = expire_suspended(tracker, cut_at)
+    {tracker, lapsed} = expire_suspended(tracker, cut_ms)
 
     entering =
-      Map.new(tracker.objects, fn {id, o} -> {id, %{tracked: o, suspended_at: cut_at}} end)
+      Map.new(tracker.objects, fn {id, o} -> {id, %{tracked: o, suspended_at: cut_ms}} end)
 
     {suspended, evicted} =
-      trim_suspended(Map.merge(tracker.suspended, entering), max_suspended, cut_at)
+      trim_suspended(Map.merge(tracker.suspended, entering), max_suspended)
 
     severed = suspension_ends(evicted)
 
     tracker = %__MODULE__{
       # `warned_at` rides across the cut: it rate-limits log lines against the
-      # host's own monotonic clock, and a camera flapping between epochs is
-      # exactly when that matters.
+      # observation clock, which is continuous across one, and a camera
+      # flapping between epochs is exactly when that matters.
       warned_at: tracker.warned_at,
       last_observed_at: at,
       suspended: suspended
@@ -663,26 +694,27 @@ defmodule Cairn.Tracker do
   end
 
   @doc """
-  Ends every suspended track whose adoption window has run out at `at`.
+  Ends every suspended track whose adoption window has run out at `at_ms`.
 
   Driven twice over: by `track/3` on every batch, and by the caller's own timer
   for a camera whose stream never comes back — nothing would otherwise collect
   a suspension on a dead link, and the final summary its consumers are owed
-  would never go out.
-
-  A `nil` `at` expires nothing: without a wall clock there is no gap to measure
-  and the caller's timer is the backstop that does have one.
+  would never go out. That timer reads the caller's own monotonic clock — real
+  by default, injectable so a test need not sit through the window — which is
+  the clock `at_ms` is anchored to and therefore comparable with.
   """
-  @spec expire_suspended(t(), DateTime.t() | nil) :: {t(), [event()]}
-  def expire_suspended(%__MODULE__{suspended: suspended} = tracker, at)
+  @spec expire_suspended(t(), number()) :: {t(), [event()]}
+  def expire_suspended(%__MODULE__{suspended: suspended} = tracker, at_ms)
       when map_size(suspended) > 0 do
-    {kept, lapsed} = Enum.split_with(suspended, fn {_id, entry} -> within_window?(entry, at) end)
+    {kept, lapsed} =
+      Enum.split_with(suspended, fn {_id, entry} -> within_window?(entry, at_ms) end)
+
     {%{tracker | suspended: Map.new(kept)}, suspension_ends(lapsed)}
   end
 
-  def expire_suspended(%__MODULE__{} = tracker, _at), do: {tracker, []}
+  def expire_suspended(%__MODULE__{} = tracker, _at_ms), do: {tracker, []}
 
-  @doc "How long a suspended track stays adoptable, in wall-clock milliseconds."
+  @doc "How long a suspended track stays adoptable, in observation-clock milliseconds."
   @spec adoption_window_ms() :: pos_integer()
   def adoption_window_ms, do: @adoption_window_ms
 
@@ -759,22 +791,16 @@ defmodule Cairn.Tracker do
     |> Enum.map(fn {_id, entry} -> {:ended, to_track(entry.tracked, :stream_reset)} end)
   end
 
-  # Oldest suspension first, ties by id: the ghosts of the reset before last
-  # are the ones a reconnect loop should lose, and they are also the ones
-  # closest to their window running out anyway.
-  #
-  # Keyed on elapsed milliseconds and never on the `%DateTime{}` itself.
-  # Erlang term order over a struct is its fields in *key* order — `day`
-  # before `hour` before `month` before `year` — so sorting datetimes directly
-  # is chronological only by luck, and the luck runs out at the end of every
-  # month.
-  defp trim_suspended(suspended, max_suspended, at) do
+  # Newest suspension first, ties by id, keeping the head: the ghosts of the
+  # reset before last are the ones a reconnect loop should lose, and they are
+  # also the ones closest to their window running out anyway.
+  defp trim_suspended(suspended, max_suspended) do
     if map_size(suspended) <= max_suspended do
       {suspended, []}
     else
       {kept, evicted} =
         suspended
-        |> Enum.sort_by(fn {id, entry} -> {elapsed_ms(at, entry.suspended_at), id} end)
+        |> Enum.sort_by(fn {id, entry} -> {-entry.suspended_at, id} end)
         |> Enum.split(max_suspended)
 
       {Map.new(kept), evicted}
@@ -784,15 +810,7 @@ defmodule Cairn.Tracker do
   # The waiting, bounded from the cut that started it: `suspended_at` is the
   # boundary instant, not the track's last sighting. `adoption_threshold/2` is
   # the rule that scales with the track's own absence.
-  defp within_window?(entry, at), do: elapsed_ms(at, entry.suspended_at) <= @adoption_window_ms
-
-  # Wall-clock milliseconds between two observation instants, floored at zero:
-  # `observed_at` comes off the wire for a v1 plugin, so two of them can arrive
-  # out of order or across a host clock adjustment, and a negative gap must read
-  # as "no time has passed" rather than as time running backwards.
-  defp elapsed_ms(nil, _then), do: 0
-  defp elapsed_ms(_now, nil), do: 0
-  defp elapsed_ms(now, then), do: max(DateTime.diff(now, then, :millisecond), 0)
+  defp within_window?(entry, at_ms), do: at_ms - entry.suspended_at <= @adoption_window_ms
 
   # -- assignment -------------------------------------------------------------
 
@@ -866,8 +884,6 @@ defmodule Cairn.Tracker do
   # that is precisely the question — resuming an identity on it would let a
   # plugin talk a departed object back into existence for as long as it keeps
   # guessing.
-  defp adopt(tracker, _indexed, matched, %{observed_at: nil}), do: {tracker, matched, []}
-
   defp adopt(%{suspended: suspended} = tracker, indexed, matched, context)
        when map_size(suspended) > 0 do
     {_assignments, objects, _tracks} = matched
@@ -919,10 +935,14 @@ defmodule Cairn.Tracker do
   # longer. The window in `within_window?/2` is the one measured from the cut —
   # it bounds the waiting, not the confidence.
   #
-  # A track with no last sighting at all — every observation of it carried no
-  # wall clock — falls back to the cut, which is then the only instant there is.
+  # Both are one subtraction on the observation clock, which the suspended
+  # track's `last_seen_ms` and this batch's `at_ms` share across the cut. The
+  # new epoch re-anchored that clock on the host's, so an absence measured over
+  # a cut also carries whatever lag the old stream's pts had accumulated before
+  # it died — time the clock had not been counting, and time nothing saw the
+  # object in either.
   defp adoption_threshold(entry, context) do
-    absent = elapsed_ms(context.observed_at, entry.tracked.last_seen_at || entry.suspended_at)
+    absent = context.at_ms - entry.tracked.last_seen_ms
 
     cond do
       absent <= min(context.max_unseen_ms, @mover_adoption_max_ms) -> @adoption_match_iou
@@ -931,29 +951,29 @@ defmodule Cairn.Tracker do
     end
   end
 
-  # Back into the live set, on the new epoch's clocks. No media-time field
-  # survives this untouched — four are re-based and `pending_exit_ms` is
-  # cleared outright (below) — because the only thing the old epoch's numbers
-  # can do in a subtraction against the new epoch's `media_ms` is lie, in
-  # either direction, depending on which stream had been running longer. The
-  # nil-ness of each re-based field is preserved: a track that has never been
+  # Back into the live set. The clock crosses the cut intact — `at_ms` is
+  # anchored to the host's monotonic clock, not to either stream's pts — so
+  # nothing is re-based to make it comparable, and `last_seen_ms` is left where
+  # it was: it dates the last sighting, which is what `adoption_threshold/2`
+  # has just measured this track's absence from and what the summary reports.
+  # `update_track/3` moves it to this batch immediately afterwards, as it does
+  # for any track it updates.
+  #
+  # The two fields that *are* moved to `context.at_ms` are moved because of what
+  # reads them, not because of which stream they came from. Both are read as an
+  # elapsed stillness — `update_track/3` takes `last_detected_ms` as the start
+  # of the gap `stationary_ms` accrues over, and `anchor_ms` is what the settle
+  # window measures from — and the outage is time nothing watched this object
+  # hold still. Their nil-ness is preserved: a track that has never been
   # detected still has no anchor and no `last_detected_ms`, and inventing one
   # here would manufacture the detection the object never had.
   #
-  # Two of the four are also overwritten by the update this batch applies
-  # immediately afterwards (`last_seen_ms` and `last_seen_host_ms`, which every
-  # observation moves). They are re-based here anyway: the invariant is that a
-  # track in the live set never carries another stream's clock, and it belongs
-  # to this function rather than to what its one caller happens to do next.
-  # `last_detected_ms` is not one of them — `update_track/3` reads it before it
-  # moves it, and that read is the stationary accrual.
-  #
-  # What is deliberately *not* touched is every wall-clock field and every
-  # judgement: `started_at`, `stationary`, `stationary_since`, `stationary_ms`,
+  # What is deliberately *not* touched is every judgement and every wall-clock
+  # field: `started_at`, `stationary`, `stationary_since`, `stationary_ms`,
   # `best_score` and the anchor box all carry over, which is what lets an
   # adopted parked car resume already parked rather than as a new arrival. The
-  # anchor keeps its box but takes the new clock, so movement is still measured
-  # against where the object last was while the *duration* of stillness
+  # anchor keeps its box but takes this batch's clock, so movement is still
+  # measured against where the object last was while the *duration* of stillness
   # restarts here.
   #
   # `recent_boxes` is the one piece of geometry that does not carry over, and
@@ -969,10 +989,10 @@ defmodule Cairn.Tracker do
   # `new_track/3` leaves for a track's first detection. `stationary` is then
   # re-derived from the adopting box against the anchor, and from nothing else.
   #
-  # `pending_exit_ms` is cleared for the same reason and is the one media-time
-  # field not re-based: an exit window is a claim about an *unbroken run of
-  # observations*, and the cut is a gap nothing observed, so a run that was
-  # open when the stream died cannot be continued across it. An adoption whose
+  # `pending_exit_ms` is cleared for the same reason: an exit window is a claim
+  # about an *unbroken run of observations*, and the cut is a gap nothing
+  # observed, so a run that was open when the stream died cannot be continued
+  # across it. An adoption whose
   # box has drifted off the anchor therefore opens its window on the adopting
   # batch and leaves the flag `@stationary_exit_ms` later — the sustain rule
   # has no exemption for an adoption, and an object that really did move during
@@ -990,10 +1010,8 @@ defmodule Cairn.Tracker do
     tracked = %{
       entry.tracked
       | epoch: context.epoch,
-        last_seen_ms: context.media_ms,
-        last_seen_host_ms: context.now_ms,
-        last_detected_ms: if(entry.tracked.last_detected_ms, do: context.media_ms),
-        anchor_ms: if(entry.tracked.anchor_bbox, do: context.media_ms),
+        last_detected_ms: if(entry.tracked.last_detected_ms, do: context.at_ms),
+        anchor_ms: if(entry.tracked.anchor_bbox, do: context.at_ms),
         recent_boxes: [],
         pending_exit_ms: nil
     }
@@ -1089,15 +1107,15 @@ defmodule Cairn.Tracker do
     end
   end
 
-  # Presence without adoption: this moves the media-time clock that expiry and
-  # `match_threshold/2` read, and its `last_seen_at` twin, and no other field.
+  # Presence without adoption: this moves the clock that expiry and
+  # `match_threshold/2` read, and its `last_seen_at` twin, and nothing else.
   # Not `bbox`, `score` or `best_score` — the box was refused, so nothing about
   # it may be believed. Not `last_detected_ms`, so `stale_predicted` still
   # arrives on schedule and a suppression can never manufacture evidence. Not
   # the anchor or `recent_boxes`, which the stillness rule compares against
-  # boxes the track actually adopted. And not `last_seen_host_ms`: leaving the
-  # host-clock backstop counting from the last *adopted* observation is what
-  # bounds a track whose only remaining sign of life is being refused.
+  # boxes the track actually adopted. And not `last_matched_ms`: leaving the
+  # refusal bound counting from the last *adopted* observation is what bounds a
+  # track whose only remaining sign of life is being refused.
   #
   # Reached only through `mark_seen_if_unmatched/4`, which is where the reason a
   # matched track never gets here is written down.
@@ -1106,7 +1124,7 @@ defmodule Cairn.Tracker do
 
     store(tracker, object_id, %{
       tracked
-      | last_seen_ms: context.media_ms,
+      | last_seen_ms: context.at_ms,
         last_seen_at: context.observed_at || tracked.last_seen_at
     })
   end
@@ -1117,7 +1135,7 @@ defmodule Cairn.Tracker do
   # base threshold, and must: see `@stationary_match_iou` for what dropping
   # that distinction costs.
   defp match_threshold(%{stationary: true} = tracked, context) do
-    if context.media_ms - tracked.last_seen_ms > context.max_unseen_ms,
+    if context.at_ms - tracked.last_seen_ms > context.max_unseen_ms,
       do: @stationary_match_iou,
       else: @iou_threshold
   end
@@ -1271,9 +1289,9 @@ defmodule Cairn.Tracker do
   defp warn_once(tracker, context, class, message) do
     last = Map.get(tracker.warned_at, class)
 
-    if is_nil(last) or context.now_ms - last >= @warn_interval_ms do
+    if is_nil(last) or context.at_ms - last >= @warn_interval_ms do
       Logger.warning(message)
-      %{tracker | warned_at: Map.put(tracker.warned_at, class, context.now_ms)}
+      %{tracker | warned_at: Map.put(tracker.warned_at, class, context.at_ms)}
     else
       tracker
     end
@@ -1299,20 +1317,20 @@ defmodule Cairn.Tracker do
         started_at: context.observed_at,
         last_seen_at: context.observed_at,
         last_detected_at: if(detected?, do: context.observed_at),
-        last_seen_ms: context.media_ms,
-        last_detected_ms: if(detected?, do: context.media_ms),
-        last_seen_host_ms: context.now_ms,
+        last_seen_ms: context.at_ms,
+        last_matched_ms: context.at_ms,
+        last_detected_ms: if(detected?, do: context.at_ms),
         stale_predicted: not detected?,
         # A track whose first observation is predicted has no anchor yet: the
         # first *detected* box is what the stillness rule measures against.
         anchor_bbox: if(detected?, do: object.bbox),
-        anchor_ms: if(detected?, do: context.media_ms),
+        anchor_ms: if(detected?, do: context.at_ms),
         recent_boxes: if(detected?, do: [object.bbox], else: []),
         stationary: false,
         stationary_since: nil,
         stationary_ms: 0,
-        # The media instant an unbroken run of failed stillness evaluations
-        # began, or `nil` when none is open. Internal to the stillness rule and
+        # The instant an unbroken run of failed stillness evaluations began,
+        # or `nil` when none is open. Internal to the stillness rule and
         # not in `Cairn.Track`: a pending exit is a track that is still
         # stationary, and publishing "stationary, but" would give every
         # consumer a third state to handle for something none of them may act
@@ -1336,10 +1354,10 @@ defmodule Cairn.Tracker do
         score: object.score,
         best_score: max(tracked.best_score, object.score),
         last_seen_at: context.observed_at || tracked.last_seen_at,
-        last_seen_ms: context.media_ms,
-        last_seen_host_ms: context.now_ms,
+        last_seen_ms: context.at_ms,
+        last_matched_ms: context.at_ms,
         last_detected_at: if(detected?, do: context.observed_at, else: tracked.last_detected_at),
-        last_detected_ms: if(detected?, do: context.media_ms, else: tracked.last_detected_ms)
+        last_detected_ms: if(detected?, do: context.at_ms, else: tracked.last_detected_ms)
     }
     |> stillness(object, detected?, previous_detected_ms, context)
     |> stale(context)
@@ -1381,11 +1399,11 @@ defmodule Cairn.Tracker do
   end
 
   defp settled(%{stationary: true} = tracked, previous_detected_ms, context) do
-    %{tracked | stationary_ms: tracked.stationary_ms + accrued(previous_detected_ms, context)}
+    %{tracked | stationary_ms: tracked.stationary_ms + (context.at_ms - previous_detected_ms)}
   end
 
   defp settled(tracked, _previous_detected_ms, context) do
-    if context.media_ms - tracked.anchor_ms >= context.stationary_after_ms do
+    if context.at_ms - tracked.anchor_ms >= context.stationary_after_ms do
       %{tracked | stationary: true, stationary_since: context.observed_at}
     else
       tracked
@@ -1399,9 +1417,9 @@ defmodule Cairn.Tracker do
   # bound, matching at `@stationary_match_iou` in grace — and no transition is
   # emitted, because none has happened.
   #
-  # `pending_exit_ms` is the media instant the *unbroken* run of failures
-  # began, not a running total, and it is left where it is by every failure
-  # after the first. So is the anchor: while the window is open every
+  # `pending_exit_ms` is the instant the *unbroken* run of failures began, not
+  # a running total, and it is left where it is by every failure after the
+  # first. So is the anchor: while the window is open every
   # evaluation is still measured against where the object was parked, which is
   # what makes the window a test of sustained motion. Re-anchoring here would
   # ask instead whether the object moved since the previous *evaluation* — the
@@ -1411,29 +1429,29 @@ defmodule Cairn.Tracker do
   # Only failed evaluations reach this, so only failed evaluations can close
   # the window. A predicted stretch does not evaluate stillness at all
   # (`stillness/5`'s first clause), so a detection gap neither completes a
-  # pending exit nor clears it however long it runs: media time passing with
-  # nothing to judge is not evidence that the object left, and a gap that goes
-  # on is ended by the unseen bound or by suspension, not from here. The first
+  # pending exit nor clears it however long it runs: time passing with nothing
+  # to judge is not evidence that the object left, and a gap that goes on is
+  # ended by the unseen bound or by suspension, not from here. The first
   # failure after such a gap does close a window it lands past — two failures
   # that far apart with nothing between them saying otherwise is the same
   # reading as two adjacent ones.
   #
   # `stationary_ms` accrues across the window, on the rule it accrues on
-  # everywhere else: it counts the media time the flag was set, and the flag is
-  # set here. A real departure is over-credited by at most one window; not
+  # everywhere else: it counts the time the flag was set, and the flag is set
+  # here. A real departure is over-credited by at most one window; not
   # accruing would under-credit a parked car by one excursion every time it
   # jitters, which on an object that sits there for hours is the larger error
   # and the one that grows.
   defp failed(%{stationary: true} = tracked, bbox, previous_detected_ms, context) do
-    pending_since = tracked.pending_exit_ms || context.media_ms
+    pending_since = tracked.pending_exit_ms || context.at_ms
 
-    if context.media_ms - pending_since >= @stationary_exit_ms do
+    if context.at_ms - pending_since >= @stationary_exit_ms do
       moved(tracked, bbox, context)
     else
       %{
         tracked
         | pending_exit_ms: pending_since,
-          stationary_ms: tracked.stationary_ms + accrued(previous_detected_ms, context)
+          stationary_ms: tracked.stationary_ms + (context.at_ms - previous_detected_ms)
       }
     end
   end
@@ -1454,14 +1472,8 @@ defmodule Cairn.Tracker do
     }
   end
 
-  # Media time since the previous detection, floored at zero: a backwards pts
-  # jump inside an epoch must credit nothing rather than un-credit what the
-  # track already earned.
-  defp accrued(previous_detected_ms, context),
-    do: max(context.media_ms - previous_detected_ms, 0)
-
   defp anchor(tracked, bbox, context),
-    do: %{tracked | anchor_bbox: bbox, anchor_ms: context.media_ms}
+    do: %{tracked | anchor_bbox: bbox, anchor_ms: context.at_ms}
 
   defp median_box(boxes), do: for(axis <- 0..3, do: median(Enum.map(boxes, &Enum.at(&1, axis))))
 
@@ -1478,11 +1490,11 @@ defmodule Cairn.Tracker do
 
   # -- expiry -----------------------------------------------------------------
 
-  # A backwards pts jump inside an epoch makes the elapsed media time negative,
-  # which is always `<= max_unseen_ms`, so it expires nothing — deliberate: the
-  # whole scene must not die at once because a new ffmpeg run restarted the
-  # timeline. The host clock is the backstop for the other direction, where the
-  # elapsed media time never grows at all.
+  # Every elapsed time below is a subtraction of two `at_ms`, which is clamped
+  # at ingestion so it neither rewinds (a restarted pts would otherwise make
+  # every elapsed time negative and expire nothing, so a broken stream's whole
+  # scene would live for ever) nor freezes (a stalled pts would otherwise never
+  # reach a bound at all). Neither case needs a rule here.
   defp expire(tracker, context) do
     {live, expired} = Enum.split_with(tracker.objects, fn {_id, o} -> live?(o, context) end)
 
@@ -1499,15 +1511,17 @@ defmodule Cairn.Tracker do
   defp live?(object, context) do
     bound = unseen_bound(object, context)
 
-    context.media_ms - object.last_seen_ms <= bound and
-      context.now_ms - object.last_seen_host_ms <= @host_clock_factor * bound
+    context.at_ms - object.last_seen_ms <= bound and
+      context.at_ms - object.last_matched_ms <= @refusal_factor * bound
   end
 
-  # Both of `live?/2`'s conditions read this one value. Scale only the
-  # media-time side and the backstop still caps a stationary track at
-  # `@host_clock_factor * max_unseen_ms` of *host* time, which is the shorter
-  # of the two on exactly the streams the grace has to survive — a stalled or
-  # slow pts, where media time never reaches the extended bound at all.
+  # Both of `live?/2`'s conditions read this one value, and the binding is what
+  # holds the refusal ceiling where the host-clock backstop it replaced had it:
+  # 10 × 5 × `max_unseen_ms` for a stationary track, 150 s at the 3 s default.
+  # Scale only the unseen side and that becomes `@refusal_factor *
+  # max_unseen_ms`, 30 s — five times sooner, on exactly the tracks the grace
+  # exists for, since a track nothing is detecting is the one a suppression
+  # refuses boxes on batch after batch.
   defp unseen_bound(%{stationary: true}, context),
     do: context.max_unseen_ms * @stationary_unseen_factor
 
@@ -1524,7 +1538,7 @@ defmodule Cairn.Tracker do
   defp stale?(%{last_detected_ms: nil}, _context), do: true
 
   defp stale?(tracked, context),
-    do: context.media_ms - tracked.last_detected_ms > context.max_unseen_ms
+    do: context.at_ms - tracked.last_detected_ms > context.max_unseen_ms
 
   # -- summaries --------------------------------------------------------------
 

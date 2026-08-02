@@ -49,10 +49,16 @@ defmodule Cairn.CameraTrackerRecorderTest do
   defp observe(tracker, camera, objects, opts) do
     policy = Keyword.get(opts, :policy, @policy)
 
+    # On a healthy stream the port's `at_ms` tracks `media_ms` one for one
+    # (`Cairn.ObservationClock`), so these fixtures move the two together and
+    # name the number after the clock the tracker actually decides on.
+    at_ms = at_ms(Keyword.get(opts, :at_ms, 1_000))
+
     observation = %Observation{
       epoch: Keyword.get(opts, :epoch),
       pts: 90_000,
-      media_ms: Keyword.get(opts, :media_ms, 1_000.0),
+      media_ms: at_ms,
+      at_ms: at_ms,
       observed_at: Keyword.get(opts, :observed_at, DateTime.utc_now()),
       time_quality: :arrival,
       objects: objects,
@@ -60,6 +66,27 @@ defmodule Cairn.CameraTrackerRecorderTest do
     }
 
     CameraTracker.detections(tracker, camera, policy, observation)
+  end
+
+  # The tracker decides on `at_ms`, which production derives from the host's
+  # monotonic clock (`Cairn.ObservationClock`) — the same clock a stream cut is
+  # stamped with (`:cut_clock`) and the adoption sweep measures its window
+  # from. These fixtures are therefore offsets from one base captured per test
+  # process rather than absolutes: batches can be spaced to the millisecond,
+  # because nothing between them re-reads a clock, while still landing on the
+  # scale the tracker's own defaults read.
+  defp at_ms(offset), do: clock_base() + offset
+
+  defp clock_base do
+    case Process.get(:clock_base) do
+      nil ->
+        base = System.monotonic_time(:millisecond)
+        Process.put(:clock_base, base)
+        base
+
+      base ->
+        base
+    end
   end
 
   defp object(label, score, bbox) do
@@ -87,7 +114,8 @@ defmodule Cairn.CameraTrackerRecorderTest do
     :ok
   end
 
-  # Starts a track, then ends it by media-time expiry — the one end path a test
+  # Starts a track, then ends it by unseen expiry on the observation clock —
+  # the one end path a test
   # can drive without touching timers or epochs. The second observation is
   # empty and lands past `max_unseen_ms` (3 000) of the first, which is what
   # retires it.
@@ -100,7 +128,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
 
     assert_receive {:track_started, %Track{object_id: oid}}
 
-    observe(ctx.tracker, ctx.camera, [], media_ms: 5_000.0, policy: policy)
+    observe(ctx.tracker, ctx.camera, [], at_ms: 5_000.0, policy: policy)
 
     assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :unseen}}
     oid
@@ -153,17 +181,17 @@ defmodule Cairn.CameraTrackerRecorderTest do
       # wire floor, so the tier passes it. The assertion is therefore about the
       # linkage and nothing else.
       observe(ctx.tracker, ctx.camera, [predicted("person", 0.9, [0.0, 0.0, 0.1, 0.1])],
-        media_ms: 1_000.0
+        at_ms: 1_000.0
       )
 
       assert_receive {:track_started, %Track{object_id: expiring}}
       refute_received {:event_started, _}
 
-      # One observation, two things at once: media time has jumped past
+      # One observation, two things at once: the observation clock has jumped past
       # `max_unseen_ms` so the old track expires inside `Tracker.track/3`, and
       # the object it carries is fresh evidence that opens an event.
       observe(ctx.tracker, ctx.camera, [object("person", 0.9, [0.8, 0.8, 0.1, 0.1])],
-        media_ms: 9_000.0
+        at_ms: 9_000.0
       )
 
       assert_receive {:track_ended, %Track{object_id: ^expiring, end_reason: :unseen}}
@@ -233,7 +261,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
       CameraControl.set(ctx.camera_id, %{detection_enabled: false})
 
       observe(ctx.tracker, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])],
-        media_ms: 2_000.0
+        at_ms: 2_000.0
       )
 
       assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :detection_disabled}}
@@ -255,7 +283,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
           assert_receive {:track_started, %Track{object_id: first}}
 
           observe(ctx.tracker, ctx.camera, [object("person", 0.9, [0.8, 0.8, 0.1, 0.1])],
-            media_ms: 2_000.0,
+            at_ms: 2_000.0,
             policy: policy
           )
 
@@ -357,7 +385,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
       assert [%{kind: :appeared}] = Tracks.moments(oid)
       assert row.entry_bbox == [0.1, 0.1, 0.2, 0.4]
 
-      observe(ctx.tracker, ctx.camera, [], media_ms: 5_000.0)
+      observe(ctx.tracker, ctx.camera, [], at_ms: 5_000.0)
       assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :unseen}}
       flush(ctx.tracker, ctx.rec)
 
@@ -380,7 +408,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
       # through, so the row moves with the broadcast. The second box overlaps
       # the first, so IoU keeps the identity and the update is an update.
       observe(ctx.tracker, ctx.camera, [object("person", 0.85, [0.14, 0.14, 0.2, 0.4])],
-        media_ms: 1_500.0
+        at_ms: 1_500.0
       )
 
       assert_receive {:track_updated, %Track{object_id: ^oid, best_score: 0.85}}
@@ -415,7 +443,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
       assert Tracks.get(oid) == nil
 
       observe(ctx.tracker, ctx.camera, [object("person", 0.85, [0.14, 0.14, 0.2, 0.4])],
-        media_ms: 1_500.0,
+        at_ms: 1_500.0,
         policy: policy
       )
 
@@ -461,7 +489,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
       excluding = %{"car" => %{min_score: 0.5}}
       ctx = %{ctx | camera: %{ctx.camera | track: excluding}}
 
-      observe(ctx.tracker, ctx.camera, [], media_ms: 5_000.0, policy: tier(excluding))
+      observe(ctx.tracker, ctx.camera, [], at_ms: 5_000.0, policy: tier(excluding))
 
       assert_receive {:track_ended, %Track{object_id: ^oid}}
       flush(ctx.tracker, ctx.rec)
@@ -474,9 +502,9 @@ defmodule Cairn.CameraTrackerRecorderTest do
     test "that never crosses it has no row, live or ended", ctx do
       policy = tier(%{"person" => %{min_score: 0.8}})
 
-      for media_ms <- [1_000.0, 1_500.0] do
+      for at_ms <- [1_000.0, 1_500.0] do
         observe(ctx.tracker, ctx.camera, [object("person", 0.6, [0.1, 0.1, 0.2, 0.4])],
-          media_ms: media_ms,
+          at_ms: at_ms,
           policy: policy
         )
       end
@@ -485,7 +513,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
       flush(ctx.tracker, ctx.rec)
       assert Tracks.get(oid) == nil
 
-      observe(ctx.tracker, ctx.camera, [], media_ms: 5_000.0, policy: policy)
+      observe(ctx.tracker, ctx.camera, [], at_ms: 5_000.0, policy: policy)
 
       assert_receive {:track_ended, %Track{object_id: ^oid}}
       flush(ctx.tracker, ctx.rec)
@@ -514,7 +542,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
            camera_id: ctx.camera_id,
            name: nil,
            recorder: ctx.rec,
-           cut_clock: fn -> DateTime.add(DateTime.utc_now(), -90, :second) end,
+           cut_clock: fn -> System.monotonic_time(:millisecond) - 90_000 end,
            start_extractor: fn _camera, _event ->
              {:ok, spawn(fn -> Process.sleep(:infinity) end)}
            end,
@@ -528,10 +556,10 @@ defmodule Cairn.CameraTrackerRecorderTest do
       second = DateTime.add(first, 1)
       third = DateTime.add(first, 2)
 
-      for {at, media_ms} <- [{first, 1_000.0}, {second, 2_000.0}, {third, 3_000.0}] do
+      for {at, at_ms} <- [{first, 1_000.0}, {second, 2_000.0}, {third, 3_000.0}] do
         observe(tracker, ctx.camera, [object("person", 0.9, @parked_box)],
           observed_at: at,
-          media_ms: media_ms,
+          at_ms: at_ms,
           policy: @stationary_policy
         )
       end
@@ -596,7 +624,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
       # far enough back for the sweep to find anything
       tracker =
         tracker_casting_to_self(ctx, :tracker_close_once,
-          cut_clock: fn -> DateTime.add(DateTime.utc_now(), -90, :second) end
+          cut_clock: fn -> System.monotonic_time(:millisecond) - 90_000 end
         )
 
       seen_at = DateTime.add(DateTime.utc_now(), -100, :second)

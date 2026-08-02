@@ -190,6 +190,38 @@ defmodule Cairn.PluginGroupPortTest do
            }
   end
 
+  # One `Cairn.ObservationClock` per member, not one per group: the members are
+  # separate streams with separate pts, and a group serves whichever of them is
+  # still delivering.
+  test "each member's observations carry their own at_ms, on the host's clock" do
+    a = camera("gp_clock_a_#{System.unique_integer([:positive])}")
+    b = camera("gp_clock_b_#{System.unique_integer([:positive])}")
+
+    command =
+      printf([
+        det_line(a.id, 1, 0.9),
+        det_line(b.id, 900_000, 0.9),
+        det_line(a.id, 2, 0.9)
+      ]) <> "; exec sleep 30"
+
+    start_group_port([a, b], command: command, tracker: self())
+
+    a_id = a.id
+    b_id = b.id
+
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _p, first}}, 5_000
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^b_id}, _p, other}}, 5_000
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _p, second}}, 5_000
+
+    now = System.monotonic_time(:millisecond)
+
+    # b's pts is ten seconds ahead of a's and buys it nothing: each member is
+    # anchored on its own, and no member's clock may run ahead of the host's
+    assert other.at_ms <= now
+    assert first.at_ms <= now
+    assert second.at_ms > first.at_ms
+  end
+
   test "each camera's own min_score applies through its camera tracker" do
     a = camera("gp_low_#{System.unique_integer([:positive])}")
     b = camera("gp_high_#{System.unique_integer([:positive])}", min_score: %{"default" => 0.95})
@@ -395,6 +427,31 @@ defmodule Cairn.PluginGroupPortTest do
                    10_000
 
     assert :sys.get_state(pid).os_pid == os_pid
+  end
+
+  test "refresh prunes a dropped member's clock and bookkeeping" do
+    a = camera("gp_prune_a_#{System.unique_integer([:positive])}")
+    b = camera("gp_prune_b_#{System.unique_integer([:positive])}")
+
+    command = printf([det_line(a.id, 1, 0.9), det_line(b.id, 2, 0.9)]) <> "; exec sleep 30"
+    pid = start_group_port([a, b], command: command, tracker: self())
+
+    a_id = a.id
+    b_id = b.id
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^a_id}, _, _}}, 5_000
+    assert_receive {:"$gen_cast", {:detections, %Camera{id: ^b_id}, _, _}}, 5_000
+    assert Map.has_key?(:sys.get_state(pid).clocks, b_id)
+
+    # ids churning across refreshes must not accumulate entries for the life
+    # of the port — the maps follow the routes
+    :ok = PluginGroupPort.refresh(pid, group([a]), config([a]))
+
+    state = :sys.get_state(pid)
+    assert Map.has_key?(state.clocks, a_id)
+
+    for map <- [state.clocks, state.last_sequences, state.epochs, state.last_statuses] do
+      refute Map.has_key?(map, b_id)
+    end
   end
 
   test "unroutable lines are counted but only logged periodically" do

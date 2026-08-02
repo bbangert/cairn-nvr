@@ -45,16 +45,17 @@ defmodule Cairn.CameraTracker do
   is still being written and the snapshot does not exist. The media itself is
   announced by `Cairn.EventArtifact`.
 
-  Event times come from the observation, not from the clock: `started_at`,
-  `labels[].t` and `trigger.t` derive from `observation.observed_at`, which a
-  v1 plugin captured next to the frame. Wall-clock time is still what closes
-  an event — `ended_at`, the post-window and max-event timers — because
-  quiet produces no observations to measure quiet with.
+  Event times come from the observation rather than from any clock read here:
+  `started_at`, `labels[].t` and `trigger.t` derive from
+  `observation.observed_at`, which a v1 plugin captured next to the frame. The
+  host's own clocks are still what *close* an event — `ended_at` in wall time,
+  the post-window and max-event timers in monotonic — because quiet produces no
+  observations to measure quiet with.
 
   Track lifecycle is published on the same `"events"` topic as
   `%Cairn.Track{}` summaries: `track_started` and `track_ended` always,
-  `track_updated` only when the track's best score improves or a second of
-  wall clock has passed since its last update — a 5 fps stream with a dozen
+  `track_updated` only when the track's best score improves or a second on the
+  host's monotonic clock has passed since its last update — a 5 fps stream with a dozen
   objects must not become a firehose of identical frames. Two `track_updated`
   frames ignore the throttle: a stationary transition, because the flag decides
   whether the object is evidence and a consumer must not learn of the flip up
@@ -118,8 +119,10 @@ defmodule Cairn.CameraTracker do
   alias Cairn.{Track, Tracker, TrackRecorder}
 
   @max_label_entries 5_000
-  # Wall clock, deliberately: it throttles what a subscriber receives, which
-  # has nothing to do with the stream's own clock.
+  # The host's own clock, deliberately: it throttles what a subscriber
+  # receives, which has nothing to do with how fast the stream is arriving.
+  # The observation clock would do — it is anchored to this one — but it lags a
+  # stalled stream, and a subscriber's update rate must not lag with it.
   @update_throttle_ms 1_000
   # The checkpoint row is a deep ETS copy of the whole `%Event{}` (labels grow
   # to @max_label_entries) plus a freshly built, sorted track list, and it was
@@ -287,15 +290,16 @@ defmodule Cairn.CameraTracker do
       # How long after a stream reset this process sweeps the suspensions the
       # tracker is holding. Injectable for the same reason: the real delay is
       # the adoption window plus slack, and no test should sit through a
-      # minute of it to prove the backstop is armed.
+      # minute of it to prove the sweep is armed.
       window_ms: Keyword.get(opts, :window_ms, Tracker.adoption_window_ms() + 1_000),
-      # The wall instant a stream cut is stamped with, which is what the
-      # tracker measures the adoption window from. Injectable alongside
-      # `window_ms` and for the same reason: the window is a wall-clock minute,
-      # so a test proving a suspension lapses has to be able to put the cut a
-      # minute in the past. The sweep itself always reads the real clock — the
-      # two are what an elapsed time is taken between.
-      cut_clock: Keyword.get(opts, :cut_clock, &now/0)
+      # The observation-clock instant a stream cut is stamped with, which is
+      # what the tracker measures the adoption window from. The same clock
+      # `monotonic_ms` reads — both default to the real one — and injectable
+      # separately for the reason `window_ms` is: the window is a minute, so a
+      # test proving a suspension lapses has to be able to put the cut a minute
+      # in the past while leaving the sweep on the real clock, the two being
+      # what an elapsed time is taken between.
+      cut_clock: Keyword.get(opts, :cut_clock, &default_monotonic_ms/0)
     }
 
     {:ok, restore_from_checkpoint(state)}
@@ -318,7 +322,7 @@ defmodule Cairn.CameraTracker do
         %{camera_id: camera_id} = state
       ) do
     control = CameraControl.get(camera_id)
-    observation = with_observed_at(observation)
+    observation = observation |> with_observed_at() |> with_at_ms(state)
 
     cond do
       not control.detection_enabled ->
@@ -360,6 +364,18 @@ defmodule Cairn.CameraTracker do
 
   defp with_observed_at(observation), do: %{observation | observed_at: now()}
 
+  # The same invariant for the clock the tracker decides on: the ports stamp
+  # every observation they forward (`Cairn.ObservationClock`), and a caller
+  # reaching `detections/3` directly must not put a `nil` into the tracker's
+  # arithmetic. Falling back to the host clock is honest but coarse — it dates
+  # the batch's *arrival* and carries none of the spacing between frames that
+  # the ports' clock takes from the pts, nor its non-decreasing clamp; the
+  # test seams that are this fallback's only callers accept both.
+  defp with_at_ms(%Observation{at_ms: at_ms} = observation, _state) when is_number(at_ms),
+    do: observation
+
+  defp with_at_ms(observation, state), do: %{observation | at_ms: state.monotonic_ms.()}
+
   # Belt and braces: the ports already refuse observations from an epoch that
   # is no longer current, and this closes the window where a port's line and
   # the epoch broadcast cross. Compared against the same `current_epoch` the
@@ -390,8 +406,7 @@ defmodule Cairn.CameraTracker do
   end
 
   defp process_detections(state, camera, policy, observation, control) do
-    context =
-      Tracker.context(observation, camera.id, tracking_policy(policy), state.monotonic_ms.())
+    context = Tracker.context(observation, camera.id, tracking_policy(policy))
 
     {tracker, tagged, track_events} = Tracker.track(state.tracker, observation.objects, context)
 
@@ -632,20 +647,20 @@ defmodule Cairn.CameraTracker do
   # one per reset however fast it flaps. A message already in the mailbox when
   # the cancel lands is still delivered — which is the harmless case above.
   #
-  # It re-arms while anything is still suspended, and that is the only thing
-  # standing between a missed sweep and a suspension that never ends. The slack
-  # past the window (`window_timer/1`) makes the first sweep land after the
-  # window in ordinary time — this timer runs on the monotonic clock and the
-  # window is measured on the wall clock — but a wall clock stepped backwards
-  # in between leaves the sweep finding nothing, and for the camera this timer
-  # exists for there is no next batch and no next reset to try again. Without
-  # the re-arm that suspension is stranded, against `Cairn.Track`'s promise
-  # that a consumer sees a track end once. With it the cost is one extra hop in
-  # the normal case (find nothing, arm nothing, because the sweep that lapses
-  # the last suspension leaves none behind) and one map walk per window until
-  # the clock catches up in the abnormal one.
+  # It re-arms while anything is still suspended, and that is what keeps the
+  # harmless case above from stranding one. A sweep already in the mailbox when
+  # `window_timer/1` cancels its timer still arrives, and this handler clears
+  # `window_ref` when it does — losing the reference to the timer the reset had
+  # just armed, which then fires untracked. The re-arm is what puts a tracked
+  # one back. Its cost in the normal case is one extra hop that finds nothing
+  # and arms nothing, because the sweep that lapses the last suspension leaves
+  # none behind. This timer and the cut it sweeps against are both the host's
+  # monotonic clock (`Cairn.Tracker.suspend/3` is handed `cut_clock`), so the
+  # sweep cannot land before the window it is waiting on. A batch measures the
+  # same window on its own `at_ms`, which never runs ahead of that clock — so
+  # of the two, this is never the later to notice a lapse.
   def handle_info(:adoption_window, state) do
-    {tracker, lapsed} = Tracker.expire_suspended(state.tracker, now())
+    {tracker, lapsed} = Tracker.expire_suspended(state.tracker, state.monotonic_ms.())
 
     state =
       %{state | tracker: tracker, window_ref: nil}
@@ -752,8 +767,12 @@ defmodule Cairn.CameraTracker do
 
   # Past the window rather than at it: see the `:adoption_window` handler. The
   # pending sweep is cancelled first, so a camera resetting several times a
-  # second holds one timer rather than one per reset — and so the re-arm in
-  # that handler cannot compound with the arms the resets do.
+  # second holds one *tracked* timer rather than one per reset. Cancelling does
+  # not recall a message already in the mailbox, and the handler that then runs
+  # clears `window_ref` and re-arms — so an interleaving can leave this timer in
+  # flight untracked beside the re-armed one. That is bounded (the handler
+  # re-arms at most one) and harmless: the sweep ends whatever has actually
+  # lapsed and nothing else, so an extra one is a map walk with no result.
   defp window_timer(state) do
     if state.window_ref, do: Process.cancel_timer(state.window_ref)
     ref = Process.send_after(self(), :adoption_window, state.window_ms)

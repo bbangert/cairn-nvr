@@ -179,7 +179,7 @@ again.
 
 A track is also out of event evidence while Cairn has it flagged
 **stationary** — its box has held still for `tracking.stationary_after_ms` of
-media time. Detections keep coming and the track stays alive; they simply stop
+tracking time. Detections keep coming and the track stays alive; they simply stop
 opening or extending events until the object has been moving for a couple of
 seconds: the flag is sustained on the way out as well as on the way in, so a
 detector jittering on a small box does not flick a parked object back into
@@ -346,14 +346,23 @@ offsets and snapshot seeks from it.
 **`frame.pts` / `frame.time_base` — the stream's own clock.** The
 presentation timestamp of the analyzed frame in the RTP timeline you are
 decoding, which Cairn converts to `media_ms = pts / den * num * 1000`. It is
-what expires tracks (`tracking.max_unseen_ms` is media time), so it must
-advance at roughly real speed for a live stream.
+what spaces the tracking bounds (`tracking.max_unseen_ms` and the rest are
+milliseconds of it), so it must advance at roughly real speed for a live
+stream.
 
-Media time is **not comparable across epochs**: every ffmpeg respawn restarts
-the timeline. Cairn handles a backwards jump inside an epoch by expiring
-nothing (negative elapsed time never exceeds a positive threshold), and a
-frozen `pts` is caught by a host-clock backstop at ten times
-`max_unseen_ms` — see [Track identity](#track-identity).
+Cairn does not track on your `pts` directly. On arrival it is anchored to the
+host's monotonic clock — once per epoch, and again wherever `media_ms` goes
+backwards inside one epoch — and clamped: it may not run ahead of the host, and
+it may neither freeze nor rewind. A stalled `pts` advances the tracking clock
+by a millisecond per line instead of standing still; a restarted one resumes at
+full rate from wherever tracking time had got to, and catches back up to the
+host rather than jumping there. So a broken frame clock costs you *precision*
+in the bounds below, not their existence: a stall makes them slower to fire,
+and a restart does not fire them at all. A stream replayed faster than real
+time is tracked at real time. Media time is still **not comparable across
+epochs** (every ffmpeg respawn restarts the timeline); the clock Cairn derives
+from it is.
+See [Track identity](#track-identity).
 
 **Cairn's host clock.** Event `ended_at`, the post-window timers and the
 status/log rate limits are the host's, not yours. This is why the skew clamp
@@ -531,7 +540,7 @@ ignores plugin track ids. Nothing breaks if you send ids; they are decoration.
 Cairn matches boxes host-side by greedy IoU (threshold 0.1, raised to 0.7 for
 a stationary track riding out the extended grace below) among the live tracks
 of the same label. Cairn expires a track you stop mentioning after
-`max_unseen_ms` of *media* time (default 3 s, per-camera configurable) — you
+`max_unseen_ms` of *tracking* time (default 3 s, per-camera configurable) — you
 never have to declare an object gone. A track Cairn has judged **stationary**
 (its box held still for `tracking.stationary_after_ms`) gets five times that
 bound instead, so a parked object outlasts whatever parks in front of it.
@@ -550,14 +559,15 @@ anything from you: it is geometry over the boxes you send.
 
 ### Host policy: the live set is bounded
 
-`media_ms` is your clock, so media-time expiry alone would leave a plugin
-holding the key to Cairn's memory. Two host-side bounds close that. Neither
-should ever be reachable by a plugin that behaves:
+Expiry alone bounds a track nothing is being seen. Two host-side bounds close
+the rest. Neither should ever be reachable by a plugin that behaves:
 
-- **Host-clock backstop.** A track unseen on the *host's* clock for more than
-  **ten times** its media-time bound — `max_unseen_ms`, or five times that
-  for a stationary track — is expired whatever your `pts` says. A frozen
-  or rewound frame clock cannot keep tracks alive.
+- **Refusal bound.** A box Cairn refuses on a track's behalf (see duplicate
+  suppression above) counts as a sign of life for it, so a stream that brings
+  another one every line could otherwise hold a track alive for ever. A track
+  that has not actually *taken* an observation for **ten times** its bound —
+  `max_unseen_ms`, or five times that for a stationary track — is expired
+  whatever keeps overlapping it.
 - **Live-track cap.** Each camera holds at most `tracking.max_live_tracks`
   live tracks (default 128, per-camera configurable). At the cap, minting a
   new identity retires the least recently seen one with a final summary
@@ -596,10 +606,10 @@ only that much.
 | `status.fps` | 0..10 000 | field dropped |
 | identical `plugin.status` resend | at most 1 per 5 000 ms | extras dropped, counted |
 | drop-summary log | at most 1 per 5 000 ms | — |
-| `tracking.max_unseen_ms` | default 3 000 ms of media time (× 5 while stationary) | track ended (`unseen`) |
-| host-clock backstop | 10 × the applicable media-time bound | track ended (`unseen`) |
+| `tracking.max_unseen_ms` | default 3 000 ms of tracking time (× 5 while stationary) | track ended (`unseen`) |
+| refusal bound | 10 × the applicable unseen bound since the last observation the track took | track ended (`unseen`) |
 | `tracking.max_live_tracks` | default 128 per camera | least recently seen track evicted |
-| `tracking.stationary_after_ms` | default 10 000 ms of media time | track flagged `stationary`, and no longer event evidence |
+| `tracking.stationary_after_ms` | default 10 000 ms of tracking time | track flagged `stationary`, and no longer event evidence |
 | host IoU match threshold | 0.1 (0.7 for a stationary track in extended grace) | below it, a new track is minted |
 | `track_updated` throttle | best-score improvement, or 1 000 ms | update not published |
 | respawn backoff | 1 s → 30 s base, ×0.5–1.5 jitter (≈0.5 s → ≈45 s) | — |

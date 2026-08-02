@@ -182,7 +182,7 @@ They live under `Cairn.TrackerSupervisor`, a `:rest_for_one` pair: a `DynamicSup
 Each tracker holds:
 
 - `active_event` — the currently-active `EventExtractor` PID, or `nil`.
-- `last_detection_pts` — the timestamp of the most recent detection.
+- `last_detected_ms` (per track, inside the `Cairn.Tracker`) — the tracking-clock instant of that track's most recent *detected* box, which is what the stale-predicted rule measures from.
 - `objects` — an IoU tracker for assigning detections to persistent object IDs across frames.
 
 State transitions per detection:
