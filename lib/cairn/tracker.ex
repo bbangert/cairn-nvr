@@ -126,35 +126,36 @@ defmodule Cairn.Tracker do
   matching. Nothing downstream is told they ended, because they may not have.
 
   A detection in the new epoch may then **adopt** a suspended track — same
-  ULID, no `:started`, no `:ended`. Adoption is geometry across a blind gap,
-  so it is scaled by how long the gap was — which `at_ms` answers across a cut
-  as readily as within a stream, being anchored to the host's clock rather than
-  to either side's pts:
+  ULID, no `:started`, no `:ended`. One rule decides it: a detected box
+  overlapping a suspended track of the **same label** by `@stitch_iou` or more
+  takes that identity back, best overlap first, each box and each suspension
+  used once. Nothing else is asked — not how long the track had been absent
+  before the cut, not whether it was moving or parked.
 
-    * **Absent no longer than `max_unseen_ms` and no longer than
-      `@mover_adoption_max_ms`**, whichever is shorter — the camera's own
-      definition of how long absence is ordinary, bounded by how far a mover
-      can travel and still overlap its own last box — any suspended track is
-      adoptable at `@adoption_match_iou`. A hiccup of a second or two barely
-      moves anything, so movers are included here.
-    * **Longer than that**, out to `@adoption_window_ms` from the cut, only a
-      track that was **stationary** when it was suspended is adoptable, and
-      only at `@stationary_match_iou`. Over a gap nothing observed, geometry
-      identifies only what provably does not move.
+  The one time bound is on the **waiting**: `@adoption_window_ms` from the cut
+  (`within_window?/2`). `track/3` settles the lapsed suspensions before any of
+  this batch's detections are matched, so every suspension `adopt/4` is offered
+  is one still inside its window and the geometry is the whole of the rest of
+  the decision. A stream that had already been quiet for a minute before ffmpeg
+  respawned still gets a full window to come back in: nothing about that camera
+  was observed for either stretch, so the two are the same blindness.
 
-  Those are two different measurements on the one clock, deliberately. *How
-  much overlap is demanded* scales with the **track's own** absence — measured
-  from its last sighting, which may be well before the cut, because a track
-  already halfway through its unseen bound when the stream dropped has been
-  gone that much longer. A new epoch re-anchors the clock on the host's
-  (`Cairn.ObservationClock`), so that absence also takes in whatever the old
-  stream's pts had fallen behind by before it died, which is time nothing was
-  seen in either.
-  *How long the offer stands* is `@adoption_window_ms` from **the cut**
-  (`within_window?/2`): it bounds the waiting, not the confidence. A stream
-  that had already been quiet for a minute before ffmpeg respawned therefore
-  still gets a full window to come back in — its tracks are simply past the
-  short tier for all of it, so only the stationary ones can be resumed.
+  One loose threshold, rather than a strict one for the longer gaps, is
+  deliberate. The two mistakes are not symmetric: handing a departed object's
+  identity to whatever stands in its box costs one wrong ULID on one track,
+  while refusing a returning object's costs a re-mint — and a re-minted parked
+  car spends `stationary_after_ms` reading as a new arrival, which is evidence,
+  which is a clip, on every reset a flaky camera has. A strict threshold also
+  does not merely refuse: the box it turns down mints beside the ghost it was
+  refused for, and that ghost is then adoptable by nothing, so the strictness
+  manufactures the second identity it was there to prevent. What keeps the
+  loose rule from producing a duplicate of its own — a second box of the object
+  it has just resumed — is the duplicate suppression that runs immediately
+  after it, which is retained. `@stitch_iou` is picked from the same geometry
+  as `@duplicate_suppression_iou` — under it, an overlap is ordinary same-label
+  adjacency (two cars nose to tail sit at 1/3) rather than the object again —
+  and may never be the looser of the two (currently they are equal; the guard
+  at the constant enforces the ordering).
 
   Adoption is refused for a predicted box: an identity nothing confirmed for
   the length of the outage may not be resumed by the plugin's extrapolation of
@@ -162,7 +163,7 @@ defmodule Cairn.Tracker do
 
   What resumes with the identity is nearly all of it: `at_ms` spans the cut, so
   nothing has to be re-based to stay comparable, and `last_seen_ms` still dates
-  the last sighting — which is what the tiers above measure the absence from.
+  the last sighting, which the summary reports and no adoption rule reads.
   The two clock fields the adoption does move (`last_detected_ms`, `anchor_ms`)
   are moved for a reason that is not about clocks: both are read as *elapsed
   stillness* — `stationary_ms` accrues over the gap between two detections, the
@@ -192,10 +193,10 @@ defmodule Cairn.Tracker do
   `@stationary_iou` fails the stillness test on the adopting batch itself
   rather than once a median has caught up, and — by the same rule as any other
   failure, which the adoption gets no exemption from — leaves the flag
-  `@stationary_exit_ms` later, once that failure has sustained. Note that the
-  long tier's `@stationary_match_iou` is *below* `@stationary_iou`, so a box
-  adopted between the two resumes the identity and starts its exit window in
-  the same batch — the same answer the ordinary rule gives for a box that far
+  `@stationary_exit_ms` later, once that failure has sustained. Note that
+  `@stitch_iou` is well *below* `@stationary_iou`, so a box adopted between the
+  two resumes the identity and starts its exit window in the same batch — the
+  same answer the ordinary rule gives for a box that far
   off its anchor. What the adoption does buy unconditionally is that the settle
   window does not re-arm: a resumed track that is still where it was is stationary
   from its first detection instead of spending `stationary_after_ms` looking
@@ -375,58 +376,63 @@ defmodule Cairn.Tracker do
   # `stationary_after_ms` reading as a new arrival, which is evidence, which is
   # a clip — the failure this mechanism exists to remove, and one that repeats
   # on every reset a flaky camera has. Too long and a box landing on a departed
-  # object's spot inherits its identity; at the 0.7 overlap the long tier
-  # demands that means the same parking space, and over a minute "what was
-  # there is still there" holds far more often than not. A minute is also what
-  # bounds the waiting: nothing suspended outlives a minute past the cut.
+  # object's spot inherits its identity — at `@stitch_iou` on well under half
+  # the old box's evidence. The minute is kept from the two-tier design this
+  # replaced, not re-derived against the looser threshold: the asymmetry still
+  # holds (the re-mint failure repeats on every reset; the inheritance needs a
+  # departure *and* a replacement inside one window, and the double-track case
+  # is netted by duplicate suppression), and `@stitch_iou`'s own comment prices
+  # what keeping it costs. A minute is also what bounds the waiting: nothing
+  # suspended outlives a minute past the cut.
   #
   # Past the cut, and not past the last sighting — so this is a bound on the
   # *waiting*, not on how long the object has actually been unobserved. A
   # stream that went quiet ten minutes before ffmpeg gave up on it hands its
   # ghosts to a new epoch ten minutes stale, and they are adoptable for a
-  # minute more. That is deliberate: nothing about that camera was observed
-  # for either stretch, so the two are the same blindness, and the tier the
-  # stale ones land in is the stationary one, which is the tier that holds up
-  # over long silences. What it does mean is that "unobserved for at most a
-  # minute" is not something an adopted track's timestamps guarantee — read
-  # `last_seen_at` for that.
+  # minute more. That is deliberate: nothing about that camera was observed for
+  # either stretch, so the two are the same blindness. What it does mean is
+  # that "unobserved for at most a minute" is not something an adopted track's
+  # timestamps guarantee — read `last_seen_at` for that.
   @adoption_window_ms 60_000
   # What a detection must overlap a suspended track's last box to resume that
-  # identity across a *short* outage. Deliberately more than `@iou_threshold`,
-  # for the same reason `@stationary_match_iou` is more: nothing observed the
-  # gap, so the geometry is the only evidence there is, and the ordinary
-  # threshold is calibrated for a track something is currently confirming.
+  # identity across a stream reset — the whole of the geometry, for every
+  # suspended track and every length of gap inside `@adoption_window_ms`.
+  # Deliberately more than `@iou_threshold`: nothing observed the gap, so the
+  # geometry is the only evidence there is, and the ordinary threshold is
+  # calibrated for a track something is currently confirming.
   #
   # The number comes from the same case as `@duplicate_suppression_iou`: equal
   # boxes offset by half their extent — two cars nose to tail, two people
-  # shoulder to shoulder — sit at 1/3, so a neighbour cannot take the
-  # identity, while a walker over a 300 ms hiccup is still up around 0.5. It is
-  # a separate constant from that one because it answers a different question:
+  # shoulder to shoulder — sit at 1/3, so a neighbour cannot take the identity,
+  # while a walker over a 300 ms hiccup is still up around 0.5. That
+  # calibration speaks to short gaps; over a long one the geometry is
+  # uncorroborated and the window above is the only other bound. It is a
+  # separate constant from that one because it answers a different question —
   # that threshold decides whether to *drop* a box, this one whether to
-  # *resume* an identity, and a tuning pass on either has no business moving
-  # the other.
-  @adoption_match_iou 0.4
-  # The longest absence the mover tier above covers, whatever `max_unseen_ms`
-  # says. `max_unseen_ms` bounds that tier too, and does so first — a camera
-  # calling a shorter absence extraordinary has already answered the question —
-  # but it is operator config, and it answers a different one: how patient to be
-  # with a slow plugin or a flaky link. This bound is about how far a thing can
-  # move, which is not the operator's to set.
+  # *resume* an identity — but a tuning pass may not lower it below
+  # `@duplicate_suppression_iou`: the moduledoc's whole safety argument is
+  # that suppression nets the loose rule's own duplicate, and a box adopted
+  # below suppression's floor would leave its NMS twin unsuppressed beside
+  # the identity it just resumed (the guard below the constant pins this).
   #
-  # What the tier rests on is that the object cannot have left its own last
-  # box: `@adoption_match_iou` still has to be cleared, and equal boxes stop
-  # overlapping that much once they are offset by three sevenths of their
-  # extent. Anything crossing a frame is past that in well under a second, so
-  # for a walker or a car the geometry closes the tier long before any clock
-  # does. Three seconds is the outer edge of the case the clock is for — an
-  # object slow enough to still be inside its old box, a queue shuffling
-  # forward or a car in stop-and-go — and past it an overlapping box is as
-  # easily a *different* object standing where the first one was, which is the
-  # point at which only the stationary tier is honest. Left riding
-  # `max_unseen_ms`, an operator raising that to 15 s to ride out slow
-  # inference would also be handing a walker's ULID to whoever next steps into
-  # the doorway, and nothing in the config would say so.
-  @mover_adoption_max_ms 3_000
+  # It is the only threshold adoption has, and deliberately the looser of the
+  # two this replaced: see the moduledoc for why a strict tier for long gaps
+  # mints the duplicates it is meant to prevent. What that costs is bounded by
+  # the window above rather than by a second number — an object that left
+  # during the outage can lose its ULID to whatever is standing in its box, for
+  # up to a minute after the cut.
+  @stitch_iou 0.4
+
+  if @stitch_iou < @duplicate_suppression_iou do
+    raise CompileError,
+      file: __ENV__.file,
+      line: __ENV__.line,
+      description:
+        "@stitch_iou must be >= @duplicate_suppression_iou: a box adopted below " <>
+          "suppression's floor leaves its NMS twin unsuppressed beside the identity " <>
+          "it just resumed — see the comments on both constants"
+  end
+
   # The unseen bound for a stationary track, as a multiplier of
   # `max_unseen_ms` (the `@refusal_factor` precedent: policy the operator
   # sets the base for, scaled here by a fixed factor). A parked object is
@@ -808,8 +814,9 @@ defmodule Cairn.Tracker do
   end
 
   # The waiting, bounded from the cut that started it: `suspended_at` is the
-  # boundary instant, not the track's last sighting. `adoption_threshold/2` is
-  # the rule that scales with the track's own absence.
+  # boundary instant, not the track's last sighting, which can be a long way
+  # behind it. This is the whole of adoption's dependence on time; `adopt/4`
+  # asks only for geometry.
   defp within_window?(entry, at_ms), do: at_ms - entry.suspended_at <= @adoption_window_ms
 
   # -- assignment -------------------------------------------------------------
@@ -875,9 +882,15 @@ defmodule Cairn.Tracker do
   end
 
   # Every object the live pass left unmatched, against the tracks a stream
-  # reset suspended: the best overlap that clears `adoption_threshold/2` takes
-  # the identity back, each object and each suspension used once, and the
-  # revived track joins the live set as if it had matched there.
+  # reset suspended: the best overlap that clears `@stitch_iou` takes the
+  # identity back, each object and each suspension used once, and the revived
+  # track joins the live set as if it had matched there.
+  #
+  # One threshold and no clock: how long the track had been absent does not
+  # enter into it. The only time bound is the adoption window, and `track/3`
+  # has already applied it — `expire_suspended/2` runs before `assign/3`, on
+  # this same batch's `at_ms`, so everything still in `suspended` here is
+  # inside its window.
   #
   # Only detections. A predicted box is the plugin extrapolating where the
   # object would be if it were still there, and across a gap nothing observed
@@ -901,10 +914,8 @@ defmodule Cairn.Tracker do
           Observation.detected?(object),
           {id, entry} <- suspended,
           entry.tracked.label == object.label,
-          threshold = adoption_threshold(entry, context),
-          is_number(threshold),
           overlap = iou(entry.tracked.bbox, object.bbox),
-          overlap >= threshold do
+          overlap >= @stitch_iou do
         {overlap, index, id}
       end
 
@@ -927,37 +938,12 @@ defmodule Cairn.Tracker do
 
   defp adopt(tracker, _indexed, matched, _context), do: {tracker, matched, []}
 
-  # How much overlap this suspended track demands right now, or `:none` if it
-  # is past adopting. Measured against the track's own last sighting rather
-  # than against the instant of the cut: `max_unseen_ms` is the camera's
-  # statement about how long *absence* is ordinary, and a track already halfway
-  # through its unseen bound when the stream dropped has been absent that much
-  # longer. The window in `within_window?/2` is the one measured from the cut —
-  # it bounds the waiting, not the confidence.
-  #
-  # Both are one subtraction on the observation clock, which the suspended
-  # track's `last_seen_ms` and this batch's `at_ms` share across the cut. The
-  # new epoch re-anchored that clock on the host's, so an absence measured over
-  # a cut also carries whatever lag the old stream's pts had accumulated before
-  # it died — time the clock had not been counting, and time nothing saw the
-  # object in either.
-  defp adoption_threshold(entry, context) do
-    absent = context.at_ms - entry.tracked.last_seen_ms
-
-    cond do
-      absent <= min(context.max_unseen_ms, @mover_adoption_max_ms) -> @adoption_match_iou
-      entry.tracked.stationary -> @stationary_match_iou
-      true -> :none
-    end
-  end
-
   # Back into the live set. The clock crosses the cut intact — `at_ms` is
   # anchored to the host's monotonic clock, not to either stream's pts — so
   # nothing is re-based to make it comparable, and `last_seen_ms` is left where
-  # it was: it dates the last sighting, which is what `adoption_threshold/2`
-  # has just measured this track's absence from and what the summary reports.
-  # `update_track/3` moves it to this batch immediately afterwards, as it does
-  # for any track it updates.
+  # it was: it dates the last sighting, which is what the summary reports and
+  # which no adoption rule reads. `update_track/3` moves it to this batch
+  # immediately afterwards, as it does for any track it updates.
   #
   # The two fields that *are* moved to `context.at_ms` are moved because of what
   # reads them, not because of which stream they came from. Both are read as an
@@ -1031,9 +1017,13 @@ defmodule Cairn.Tracker do
   # object has to be suppressed against it like any other.
   #
   # Suspended tracks are not among the candidates and must not be: a suspension
-  # is unmatched by definition, so counting one here would drop every first
-  # detection near a ghost — including the ones `adopt/4` has just refused,
-  # leaving whatever is really there untracked for a whole minute.
+  # is unmatched by definition, so counting one here would drop boxes near a
+  # ghost on the strength of a track nothing can see. Adoption asks for no
+  # less overlap than this rule does (equal today, `>=` by the guard), so what
+  # that catches is what adoption refuses at
+  # it — chiefly a predicted box, which may not resume an identity and must
+  # still be free to mint one, since dropping it leaves whatever is really
+  # there untracked for a whole minute.
   #
   # Tracks this batch *matched* are candidates, and have to be. "The tracked
   # object's own detection takes its track, so what is left over is somebody

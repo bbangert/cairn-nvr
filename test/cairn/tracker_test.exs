@@ -1653,45 +1653,44 @@ defmodule Cairn.TrackerTest do
     # observed, not a discontinuity in the numbers.
     @box [0.0, 0.0, 0.4, 0.4]
     # IoU 1/3 with @box — the two-objects-side-by-side case, under
-    # `@adoption_match_iou` (0.4), so it is nobody's identity
+    # `@stitch_iou` (0.4), so it is nobody's identity
     @shift_2 [0.2, 0.0, 0.4, 0.4]
-    # IoU 0.6: over the short tier's floor, under the long tier's
+    # IoU 0.6: over `@stitch_iou` with room to spare, so it is adopted anywhere
+    # inside the window — and over `@duplicate_suppression_iou` (no looser
+    # than the stitch, equal today), so a *live* track this close would
+    # suppress it instead
     @shift_1 [0.1, 0.0, 0.4, 0.4]
-    # IoU 0.778: over `@stationary_match_iou` (0.7), under `@stationary_iou`
-    # (0.8), so both tiers adopt it and the stillness rule calls it movement
+    # IoU 0.778: over `@stitch_iou`, under `@stationary_iou` (0.8), so it is
+    # adopted and the stillness rule calls it movement
     @shift_05 [0.05, 0.0, 0.4, 0.4]
     # IoU 0.905 with @box, 0.379 with @shift_2
     @shift_02 [0.02, 0.0, 0.4, 0.4]
 
-    # Pixel units and exact binary ratios, for the two tests that pin the
-    # adoption thresholds to the bit rather than to a band. `@brick` is
+    # Pixel units and exact binary ratios, for the test that pins the stitch
+    # threshold to the bit rather than to a band. `@brick` is
     # 1_000 x 1_000 and every box below sits wholly inside it, so the union is
     # `@brick`'s own area and the overlap is exactly the fraction of it the box
     # covers — the same trick the pixel-unit fixtures elsewhere in this file
     # use, and the only way to write "one thousandth under the constant"
     # without hoping a float lands where the arithmetic says.
     @brick [0, 0, 1000, 1000]
-    # 400_000 / 1_000_000 = `@adoption_match_iou`
+    # 400_000 / 1_000_000 = `@stitch_iou`
     @brick_40 [0, 0, 500, 800]
     # 399_000 / 1_000_000
     @brick_399 [0, 0, 500, 798]
-    # 700_000 / 1_000_000 = `@stationary_match_iou`
-    @brick_70 [0, 0, 1000, 700]
-    # 699_000 / 1_000_000
-    @brick_699 [0, 0, 1000, 699]
 
     # Small and tall, against the one 0.4 x 0.4 square the fixtures above
-    # displace along x. `@adoption_match_iou`'s own reasoning is drawn from a
+    # displace along x. `@stitch_iou`'s own reasoning is drawn from a
     # car-sized box a few pixels of drift wide, and nothing above is either
     # car-sized or displaced in y.
     #
-    # 0.05 x 0.04 nudged along *both* axes: IoU 3/7, over the mover floor
+    # 0.05 x 0.04 nudged along *both* axes: IoU 3/7, over the floor
     @small_car [0.40, 0.50, 0.05, 0.04]
     @small_car_drift [0.41, 0.51, 0.05, 0.04]
-    # `@walker` (0.10 x 0.30) nudged 0.04 down the frame: IoU 13/17, over the
-    # stationary floor
+    # `@walker` (0.10 x 0.30) nudged 0.04 down the frame: IoU 13/17, well over
+    # the floor
     @walker_nudge [0.30, 0.24, 0.10, 0.30]
-    # and stepped 0.15 down it: IoU 1/3, under the mover floor — an overlap
+    # and stepped 0.15 down it: IoU 1/3, under the floor — an overlap
     # that ignored the y axis would read both of these as 1.0
     @walker_stride [0.30, 0.35, 0.10, 0.30]
 
@@ -1742,8 +1741,8 @@ defmodule Cairn.TrackerTest do
       {t, id} = parked(@parked_car, "car")
       {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
-      # 300 ms of outage, so both boxes clear `@adoption_match_iou`; the exact
-      # one wins the suspension and the 0.783 one is left with nothing to adopt
+      # Both boxes clear `@stitch_iou`; the exact one wins the suspension and
+      # the 0.783 one is left with nothing to adopt
       {t, tagged, events} =
         track(t, [det("car", @parked_car), det("car", @car_double)],
           epoch: "epoch_two",
@@ -1751,6 +1750,38 @@ defmodule Cairn.TrackerTest do
         )
 
       assert [%{object_id: ^id, bbox: @parked_car}] = tagged
+      assert [{:updated, %Track{object_id: ^id}}, {:adopted, %Track{object_id: ^id}}] = events
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+      assert Tracker.suspended_tracks(t) == []
+    end
+
+    # `revive/3` does not touch `bbox`, so the leftover box is judged against
+    # the ghost's *pre-cut* box, not the box that just adopted it. The two
+    # boxes here straddle that distinction: each clears `@stitch_iou` against
+    # the ghost, but they sit at 0.22 to each other — below suppression's
+    # floor — so this only suppresses if the candidate box is the ghost's own.
+    # (This is also why `@stitch_iou` may not sink below
+    # `@duplicate_suppression_iou`: judged against a box adoption could not
+    # have accepted, the twin would mint beside the resumed identity.)
+    test "the leftover is judged against the ghost's own box, not the adopter's" do
+      adopter = [0.454, 0.50, 0.18, 0.12]
+      twin = [0.34, 0.50, 0.18, 0.12]
+
+      assert_in_delta Tracker.iou(@parked_car, adopter), 0.538, 0.001
+      assert_in_delta Tracker.iou(@parked_car, twin), 0.5, 0.001
+      assert_in_delta Tracker.iou(adopter, twin), 0.224, 0.001
+
+      {t, id} = parked(@parked_car, "car")
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
+
+      {t, tagged, events} =
+        track(t, [det("car", adopter), det("car", twin)],
+          epoch: "epoch_two",
+          at_ms: 10_300
+        )
+
+      # the closer box wins the suspension; the twin is suppressed, not minted
+      assert [%{object_id: ^id, bbox: ^adopter}] = tagged
       assert [{:updated, %Track{object_id: ^id}}, {:adopted, %Track{object_id: ^id}}] = events
       assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
       assert Tracker.suspended_tracks(t) == []
@@ -1837,98 +1868,62 @@ defmodule Cairn.TrackerTest do
       assert ids(events, :became_stationary) == [id]
     end
 
-    test "past the short bound only a stationary track is adoptable" do
+    # The single-tier contract, in one test: inside the window, adoption asks
+    # for `@stitch_iou` of overlap and for nothing else. The mover at thirty
+    # seconds and the 0.6 boxes at 13_001 and 70_000 ms of absence were
+    # refusals under the two-tier rule this replaced — each minted a second
+    # identity for an object that was already tracked — and they pin the
+    # behaviour change; the 10_001 and 13_000 ms iterations sat inside the
+    # old short tier and pin that the loose rule did not move what already
+    # adopted.
+    test "one threshold and one window: neither the absence nor the flag is asked" do
+      assert_in_delta Tracker.iou(@box, @shift_1), 0.6, 0.001
+
       last = [0.0, 0.0, 0.1, 0.3]
       {mover, mover_id} = moving([[0.0, 0.2, 0.1, 0.3], last])
       {mover, [], _info} = Tracker.suspend(mover, 128, 1_000)
 
-      # 3_001 ms of absence, one past the camera's max_unseen_ms, and a box
-      # the track's own — nothing geometric refuses it, only the tier
+      # A track that was moving when the stream died, gone for thirty seconds —
+      # ten times the camera's `max_unseen_ms` — and back in its own last box.
       {mover, [tagged], events} =
         track(mover, [det("person", last)],
           epoch: "epoch_two",
-          at_ms: 1_000 + 3_001
+          at_ms: 31_000
         )
 
-      assert [{:started, %Track{object_id: fresh}}] = events
-      assert tagged.object_id == fresh
-      refute fresh == mover_id
-      # refused, not spent: it waits out the rest of its window
-      assert [%Track{object_id: ^mover_id}] = Tracker.suspended_tracks(mover)
-
-      {parked, parked_id} = parked(@box)
-      {parked, [], _info} = Tracker.suspend(parked, 128, 10_000)
-
-      {_parked, [tagged], events} =
-        track(parked, [det("person", @box)],
-          epoch: "epoch_two",
-          at_ms: 10_000 + 3_001
-        )
-
-      assert tagged.object_id == parked_id
-      assert ids(events, :adopted) == [parked_id]
+      assert tagged.object_id == mover_id
+      assert ids(events, :adopted) == [mover_id]
       assert ids(events, :started) == []
-    end
-
-    test "the tier boundary is max_unseen_ms exactly, and the tiers demand different overlap" do
-      assert_in_delta Tracker.iou(@box, @shift_1), 0.6, 0.001
-      assert_in_delta Tracker.iou(@box, @shift_05), 0.778, 0.001
+      assert Tracker.suspended_tracks(mover) == []
 
       {t, id} = parked(@box)
       {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
-      # absence of exactly max_unseen_ms is still the short tier, where 0.6 is
-      # over `@adoption_match_iou`
-      {_short, [tagged], _events} =
-        track(t, [det("person", @shift_1)],
-          epoch: "epoch_two",
-          at_ms: 13_000
-        )
+      # A parked track and a box at 0.6: adopted the same at one millisecond of
+      # absence and at a minute of it, the two instants the old boundary sat
+      # between.
+      for at_ms <- [10_001, 13_000, 13_001, 70_000] do
+        {_t, [tagged], events} =
+          track(t, [det("person", @shift_1)], epoch: "epoch_two", at_ms: at_ms)
 
-      assert tagged.object_id == id
+        assert tagged.object_id == id
+        assert ids(events, :adopted) == [id]
+      end
 
-      # one millisecond later, from the same suspension: the long tier, where
-      # 0.6 is under `@stationary_match_iou` and buys nothing
-      {_long, [tagged], events} =
-        track(t, [det("person", @shift_1)],
-          epoch: "epoch_two",
-          at_ms: 13_001
-        )
+      # And the operator's patience with a slow plugin is not consulted either
+      # way: a camera calling one second of absence extraordinary, and one
+      # riding out fifteen, get the same answer to the same geometry.
+      for max_unseen_ms <- [1_000, 15_000] do
+        {_t, [tagged], events} =
+          track(t, [det("person", @shift_1)],
+            epoch: "epoch_two",
+            max_unseen_ms: max_unseen_ms,
+            at_ms: 20_000
+          )
 
-      assert [{:started, %Track{object_id: other}}] = events
-      assert tagged.object_id == other
-      refute other == id
-
-      # ...and 0.78, at the same instant, does
-      {_long, [tagged], _events} =
-        track(t, [det("person", @shift_05)],
-          epoch: "epoch_two",
-          at_ms: 13_001
-        )
-
-      assert tagged.object_id == id
-    end
-
-    test "the tier is measured from the track's own last sighting, not from the cut" do
-      {t, id} = parked(@box)
-      # an empty batch: the camera is still being observed, this track is not
-      {t, [], []} = track(t, [], at_ms: 11_000)
-      {t, [], info} = Tracker.suspend(t, 128, 11_000)
-      assert info.at == at(11_000)
-
-      # 2_500 ms after the cut — inside max_unseen_ms if the cut were what
-      # counted — but 3_500 ms since anything saw this track, which is not.
-      # Same box the short tier adopts at in the test above.
-      {t, [tagged], events} =
-        track(t, [det("person", @shift_1)],
-          epoch: "epoch_two",
-          at_ms: 13_500
-        )
-
-      assert [{:started, %Track{object_id: other}}] = events
-      assert tagged.object_id == other
-      refute other == id
-      assert [%Track{object_id: ^id}] = Tracker.suspended_tracks(t)
+        assert tagged.object_id == id
+        assert ids(events, :adopted) == [id]
+      end
     end
 
     test "a suspension is adoptable up to the window and ends where it was last seen" do
@@ -2084,7 +2079,7 @@ defmodule Cairn.TrackerTest do
       {t, [], _info} = Tracker.suspend(t, 128, 10_200)
       assert length(Tracker.suspended_tracks(t)) == 2
 
-      # a box between the two, adoptable by *both* on the mover tier
+      # a box between the two, adoptable by *both* of them
       assert_in_delta Tracker.iou(@box, @shift_05), 0.778, 0.001
       assert_in_delta Tracker.iou(@shift_2, @shift_05), 0.4545, 0.001
 
@@ -2123,13 +2118,18 @@ defmodule Cairn.TrackerTest do
       {t, id} = moving([[0.2, 0.2, 0.4, 0.4], last])
       {t, [], _info} = Tracker.suspend(t, 128, 1_000)
 
-      # 0.6 overlap, which is over `@duplicate_suppression_iou` (0.4): an
-      # unmatched *live* track this close would have this box dropped and be
-      # marked seen by it. A suspended one is not in that pass either — it is
-      # not a live track, and a drop would leave whatever is really there
-      # untracked while the ghost it was blamed on cannot be seen at all.
+      # A *predicted* box — chiefly what adoption refuses now that its
+      # threshold is no looser than duplicate suppression's; the loser of a contended
+      # suspension is refused too, but would then be legitimately suppressed
+      # against the revived track — so this is the only way left to ask the
+      # question. At 0.6 it is far over
+      # `@duplicate_suppression_iou` (0.4): an unmatched *live* track this
+      # close would have this box dropped and be marked seen by it. A suspended
+      # one is not in that pass either — it is not a live track, and a drop
+      # would leave whatever is really there untracked while the ghost it was
+      # blamed on cannot be seen at all.
       {_t, [tagged], events} =
-        track(t, [det("person", @shift_1)],
+        track(t, [det("person", @shift_1, kind: "tracked")],
           epoch: "epoch_two",
           at_ms: 1_000 + 5_000
         )
@@ -2208,7 +2208,7 @@ defmodule Cairn.TrackerTest do
       {t, id} = parked(@box)
       {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
-      # 0.778 overlap: adoptable on either tier, and under `@stationary_iou`
+      # 0.778 overlap: well over `@stitch_iou`, and under `@stationary_iou`
       # (0.8), so it is a shift the stillness rule calls a failure. It is
       # called that on the adopting batch, because `revive/3` empties the
       # median window — the four boxes that used to outvote this one belong to
@@ -2286,8 +2286,8 @@ defmodule Cairn.TrackerTest do
 
       # 50 s after the cut and 90 s after the last sighting: measured from the
       # sighting this suspension lapsed half a minute ago, measured from the
-      # cut it has ten seconds left. Same box it was parked at, so the
-      # stationary tier — the only one still open this far out — takes it back.
+      # cut it has ten seconds left, and the waiting is the only clock
+      # adoption reads. Same box it was parked at, so it takes it back.
       {adopted, [tagged], events} =
         track(t, [det("person", @box)],
           epoch: "epoch_two",
@@ -2325,121 +2325,34 @@ defmodule Cairn.TrackerTest do
       refute other == id
     end
 
-    test "the mover tier is capped short of an operator's max_unseen_ms" do
-      last = [0.0, 0.0, 0.1, 0.3]
-      {mover, mover_id} = moving([[0.0, 0.2, 0.1, 0.3], last])
-      {mover, [], _info} = Tracker.suspend(mover, 128, 1_000)
-
-      # A deployment that has raised `max_unseen_ms` to 15 s to ride out slow
-      # inference. That is patience with the plugin, not a claim about how far
-      # a walker can get, so the mover tier still closes at
-      # `@mover_adoption_max_ms` (3_000) and a box arriving one millisecond
-      # later is a new object however well it overlaps.
-      {_t, [tagged], events} =
-        track(mover, [det("person", last)],
-          epoch: "epoch_two",
-          max_unseen_ms: 15_000,
-          at_ms: 1_000 + 3_001
-        )
-
-      assert [{:started, %Track{object_id: other}}] = events
-      assert tagged.object_id == other
-      refute other == mover_id
-
-      # a millisecond earlier, the same box under the same config resumes it
-      {_t, [tagged], events} =
-        track(mover, [det("person", last)],
-          epoch: "epoch_two",
-          max_unseen_ms: 15_000,
-          at_ms: 1_000 + 3_000
-        )
-
-      assert tagged.object_id == mover_id
-      assert ids(events, :adopted) == [mover_id]
-
-      # below the cap the config is still what bounds the tier: a camera that
-      # calls one second of absence extraordinary is taken at its word
-      {_t, [tagged], events} =
-        track(mover, [det("person", last)],
-          epoch: "epoch_two",
-          max_unseen_ms: 1_000,
-          at_ms: 1_000 + 1_001
-        )
-
-      assert [{:started, %Track{object_id: fresh}}] = events
-      assert tagged.object_id == fresh
-      refute fresh == mover_id
-
-      {_t, [tagged], events} =
-        track(mover, [det("person", last)],
-          epoch: "epoch_two",
-          max_unseen_ms: 1_000,
-          at_ms: 1_000 + 1_000
-        )
-
-      assert tagged.object_id == mover_id
-      assert ids(events, :adopted) == [mover_id]
-    end
-
-    test "the mover tier's floor is @adoption_match_iou exactly" do
+    test "the adoption floor is @stitch_iou exactly, at any absence" do
       assert Tracker.iou(@brick, @brick_40) === 0.4
       assert Tracker.iou(@brick, @brick_399) === 0.399
 
       {t, id} = parked(@brick)
       {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
-      # one second of absence, so this is the mover tier and 0.4 is its floor
-      {_adopted, [tagged], events} =
-        track(t, [det("person", @brick_40)],
-          epoch: "epoch_two",
-          at_ms: 11_000
-        )
+      # One second of absence, then thirteen: the first is where the old short
+      # tier asked 0.4, the second where the old long tier asked 0.7. One
+      # number now answers both, and the same one refuses a thousandth under.
+      for at_ms <- [11_000, 23_001] do
+        {_adopted, [tagged], events} =
+          track(t, [det("person", @brick_40)], epoch: "epoch_two", at_ms: at_ms)
 
-      assert tagged.object_id == id
-      assert ids(events, :adopted) == [id]
+        assert tagged.object_id == id
+        assert ids(events, :adopted) == [id]
 
-      # a thousandth under the floor mints instead
-      {_minted, [tagged], events} =
-        track(t, [det("person", @brick_399)],
-          epoch: "epoch_two",
-          at_ms: 11_000
-        )
+        # a thousandth under the floor mints instead
+        {_minted, [tagged], events} =
+          track(t, [det("person", @brick_399)], epoch: "epoch_two", at_ms: at_ms)
 
-      assert [{:started, %Track{object_id: other}}] = events
-      assert tagged.object_id == other
-      refute other == id
+        assert [{:started, %Track{object_id: other}}] = events
+        assert tagged.object_id == other
+        refute other == id
+      end
     end
 
-    test "the stationary tier's floor is @stationary_match_iou exactly" do
-      assert Tracker.iou(@brick, @brick_70) === 0.7
-      assert Tracker.iou(@brick, @brick_699) === 0.699
-
-      {t, id} = parked(@brick)
-      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
-
-      # past the mover tier, so 0.7 is being asked of the stationary tier's own
-      # floor rather than of the one above
-      {_adopted, [tagged], events} =
-        track(t, [det("person", @brick_70)],
-          epoch: "epoch_two",
-          at_ms: 13_001
-        )
-
-      assert tagged.object_id == id
-      assert ids(events, :adopted) == [id]
-
-      {_minted, [tagged], events} =
-        track(t, [det("person", @brick_699)],
-          epoch: "epoch_two",
-          at_ms: 13_001
-        )
-
-      assert [{:started, %Track{object_id: other}}] = events
-      assert tagged.object_id == other
-      refute other == id
-    end
-
-    test "a small box is adopted on the mover tier, displaced in both axes" do
+    test "a small box is adopted, displaced in both axes" do
       assert_in_delta Tracker.iou(@small_car, @small_car_drift), 3 / 7, 0.001
 
       {t, id} = parked(@small_car, "car")
@@ -2456,14 +2369,14 @@ defmodule Cairn.TrackerTest do
       assert ids(events, :started) == []
     end
 
-    test "a tall box is adopted on the stationary tier, displaced in y" do
+    test "a tall box is adopted, displaced in y" do
       assert_in_delta Tracker.iou(@walker, @walker_nudge), 13 / 17, 0.001
       assert_in_delta Tracker.iou(@walker, @walker_stride), 1 / 3, 0.001
 
       {t, id} = parked(@walker)
       {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
-      # past the mover tier, so 0.765 is asked of the stationary floor
+      # thirteen seconds of absence, which the threshold does not ask about
       {_t, [tagged], events} =
         track(t, [det("person", @walker_nudge)],
           epoch: "epoch_two",
@@ -2473,8 +2386,8 @@ defmodule Cairn.TrackerTest do
       assert tagged.object_id == id
       assert ids(events, :adopted) == [id]
 
-      # the same box a stride further down the frame is somebody else, on the
-      # tier that would have taken it most easily: an overlap that dropped the
+      # the same box a stride further down the frame is somebody else, at a
+      # second of absence rather than thirteen: an overlap that dropped the
       # y axis would read this as 1.0 and hand over the identity
       {_t, [tagged], events} =
         track(t, [det("person", @walker_stride)],
