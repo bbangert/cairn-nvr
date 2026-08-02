@@ -548,10 +548,10 @@ bound instead, so a parked object outlasts whatever parks in front of it.
 A host-side identity can **survive a stream reset**. At an epoch boundary
 these tracks are suspended rather than ended, and a detection on the far side
 that lands on one of them resumes it — same `object_id`, same `started_at`,
-new `epoch`. How much overlap that takes depends on how long the outage was:
-inside `max_unseen_ms` of absence — and at most three seconds of it, whatever
-`max_unseen_ms` is set to — any suspended track will answer at 0.4, beyond it
-only one Cairn had judged stationary will, and only at 0.7. A minute after the
+new `epoch`. It takes 0.4 of overlap and a real detection: a predicted box may
+not resume an identity nothing confirmed across the outage. The overlap asked
+is the same at any length of outage, and nothing Cairn had judged about the
+track changes it; the one time bound is on the waiting. A minute after the
 **cut** nothing is adoptable any more and the track ends `stream_reset`,
 timestamped at the last observation before the cut, which on a stream that had
 already gone quiet can be well over a minute earlier. None of this needs
@@ -611,6 +611,8 @@ only that much.
 | `tracking.max_live_tracks` | default 128 per camera | least recently seen track evicted |
 | `tracking.stationary_after_ms` | default 10 000 ms of tracking time | track flagged `stationary`, and no longer event evidence |
 | host IoU match threshold | 0.1 (0.7 for a stationary track in extended grace) | below it, a new track is minted |
+| reset-adoption threshold | 0.4 of overlap with the suspended box | below it, a new track is minted |
+| reset-adoption window | 60 000 ms of tracking time past the cut | track ended (`stream_reset`) |
 | `track_updated` throttle | best-score improvement, or 1 000 ms | update not published |
 | respawn backoff | 1 s → 30 s base, ×0.5–1.5 jitter (≈0.5 s → ≈45 s) | — |
 | UDP ports per camera | 4 (`base + 4i` plugin, `+1` its RTCP) | — |
