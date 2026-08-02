@@ -106,14 +106,7 @@ defmodule Cairn.FullPipelineTest do
     # with a real moov, so the finalized file must probe as a valid, seekable
     # clip whose duration is true and start offset is zero — the property the
     # concatenated-fragment output could never report.
-    {probe, 0} =
-      System.cmd(
-        "ffprobe",
-        ~w(-v error -show_entries format=duration,start_time -of csv=p=0) ++ [row.path]
-      )
-
-    [start_time, duration] =
-      probe |> String.trim() |> String.split(",") |> Enum.map(&elem(Float.parse(&1), 0))
+    {start_time, duration} = probe_format(row.path)
 
     assert_in_delta start_time, 0.0, 0.001
     assert duration > 0.0
@@ -157,14 +150,7 @@ defmodule Cairn.FullPipelineTest do
 
     refute Cairn.MP4Boxes.leading_empty_edit?(File.read!(row.path))
 
-    {probe, 0} =
-      System.cmd(
-        "ffprobe",
-        ~w(-v error -show_entries format=duration,start_time -of csv=p=0) ++ [row.path]
-      )
-
-    [start_time, duration] =
-      probe |> String.trim() |> String.split(",") |> Enum.map(&elem(Float.parse(&1), 0))
+    {start_time, duration} = probe_format(row.path)
 
     assert_in_delta start_time, 0.0, 0.001
     assert duration > 0.0
@@ -180,6 +166,26 @@ defmodule Cairn.FullPipelineTest do
       )
 
     assert File.exists?(row.snapshot_path)
+  end
+
+  # key=value output: ffprobe prints csv fields in its own fixed order no
+  # matter how `-show_entries` orders them, so positional parsing would ride
+  # on an ordering nothing here controls.
+  defp probe_format(path) do
+    {probe, 0} =
+      System.cmd(
+        "ffprobe",
+        ~w(-v error -show_entries format=duration,start_time -of default=noprint_wrappers=1) ++
+          [path]
+      )
+
+    fields =
+      for line <- String.split(String.trim(probe), "\n"), into: %{} do
+        [k, v] = String.split(line, "=", parts: 2)
+        {k, elem(Float.parse(v), 0)}
+      end
+
+    {Map.fetch!(fields, "start_time"), Map.fetch!(fields, "duration")}
   end
 
   defp wait_until(fun, event_id, attempts \\ 200) do
