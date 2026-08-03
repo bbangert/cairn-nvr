@@ -226,7 +226,7 @@ fn infer_loop(
         // The epoch gate is per member too, inside the publisher: a camera
         // Cairn has not announced yet (or has stopped) emits nothing while its
         // neighbours keep going.
-        let line = gate::sample_line(
+        let lines = gate::sample_line(
             &mut gates[index],
             &mut publisher,
             camera_id,
@@ -235,7 +235,9 @@ fn infer_loop(
             Instant::now(),
             |input| detector.detect(input.tensor, input.projection, labels, &floors[index]),
         )?;
-        if let Some(line) = line {
+        // The frame first, and a status — which names this member, not the
+        // group — after it, as in single mode.
+        for line in [lines.objects, lines.status].into_iter().flatten() {
             emit::stdout_line(&line).context("writing to stdout")?;
         }
     }

@@ -184,7 +184,12 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
     let streams = start_control(specs.iter().map(|spec| spec.id.as_str()))?;
     // No `camera_id`: this is the process talking, and the group host applies
     // an untargeted status to every member.
-    emit::stdout_line(&emit::status_line(None, "starting", Some("loading model")))?;
+    emit::stdout_line(&emit::status_line(
+        None,
+        "starting",
+        Some("loading model"),
+        None,
+    ))?;
 
     let labels = Labels::load(args.labels.as_deref())?;
     // Before any decoder: every scaler and GPU filter graph is built for the
@@ -207,7 +212,7 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
     );
     // The decoders open per member, and re-open forever after a drop, so the
     // process is as ready as it gets once the model is loaded.
-    emit::stdout_line(&emit::status_line(None, "ready", None))?;
+    emit::stdout_line(&emit::status_line(None, "ready", None, None))?;
 
     multiplex::run(
         &specs,
@@ -241,6 +246,7 @@ fn run_single(args: &Args) -> Result<()> {
         Some(&camera_id),
         "starting",
         Some("loading model"),
+        None,
     ))?;
 
     let floors = ScoreFloors::parse(args.min_score_json.as_deref().unwrap_or("{}"))?;
@@ -298,7 +304,7 @@ fn run_single(args: &Args) -> Result<()> {
         )
     };
 
-    emit::stdout_line(&emit::status_line(Some(&camera_id), "ready", None))?;
+    emit::stdout_line(&emit::status_line(Some(&camera_id), "ready", None, None))?;
 
     let decoded = decode::run(&mut input, stream_index, time_base, decoder.as_mut(), &tx);
     drop(tx);
@@ -340,9 +346,12 @@ fn model_summary(args: &Args, detector: &Detector) -> String {
 ///
 /// `motion` is that camera's resolved gate config, or `None` with the gate off
 /// — in which case [`Gate::decide`] infers on every sample and the loop is what
-/// it was before the gate existed. When it is on, a skipped sample still emits:
-/// the seeded line is the host's evidence that this camera is alive and that
-/// what it last saw is still there.
+/// it was before the gate existed, down to the lines it writes. When it is on,
+/// a skipped sample still emits: the seeded line is the host's evidence that
+/// this camera is alive and that what it last saw is still there. A sample may
+/// also owe a `plugin.status` reporting the gate's effect
+/// ([`gate::Lines::status`]), which is the only line here that is not one
+/// frame's own.
 fn infer_loop(
     rx: &Receiver<Sample>,
     mut detector: Detector,
@@ -354,7 +363,7 @@ fn infer_loop(
 ) -> Result<()> {
     let mut gate = Gate::default();
     while let Ok(sample) = rx.recv() {
-        let line = gate::sample_line(
+        let lines = gate::sample_line(
             &mut gate,
             publisher,
             camera_id,
@@ -363,7 +372,9 @@ fn infer_loop(
             Instant::now(),
             |input| detector.detect(input.tensor, input.projection, labels, floors),
         )?;
-        if let Some(line) = line {
+        // The frame first: a status is this camera's commentary on the samples
+        // up to and including that line.
+        for line in [lines.objects, lines.status].into_iter().flatten() {
             emit::stdout_line(&line).context("writing to stdout")?;
         }
     }

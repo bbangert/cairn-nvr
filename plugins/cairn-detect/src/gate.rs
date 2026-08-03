@@ -11,7 +11,9 @@
 //! Every instant is handed in by the caller. [`Gate::decide`] is a function of
 //! `(config, verdict, epoch, now)` and its own state and nothing else — no
 //! clock, no model, no stream — which is what makes each rule testable on its
-//! own.
+//! own. [`Telemetry`], which reports what those decisions came to, is the same
+//! shape and lives here for the same reason: it is a function of the decisions
+//! and the instants they were made at, and nothing else.
 //!
 //! The state here belongs to the *process*, not to the stream. Group mode
 //! re-opens a member's RTP stream in place (`multiplex::stream_loop`), which
@@ -27,7 +29,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::decode::{ModelInput, Sample};
-use crate::emit::{Det, Publisher};
+use crate::emit::{self, Det, Publisher};
 use crate::motion::{MotionConfig, MotionVerdict};
 
 /// What the inference loop does with one sample.
@@ -43,9 +45,11 @@ pub enum Decision {
 }
 
 /// One camera's gate state: when it last had motion, when the model last ran
-/// on it, and which epoch its lines are being stamped with.
+/// on it, which epoch its lines are being stamped with, and what it has told
+/// the host about all of that.
 #[derive(Debug, Default)]
 pub struct Gate {
+    telemetry: Telemetry,
     last_motion: Option<Instant>,
     last_inference: Option<Instant>,
     /// The epoch seen at the previous decision, and when it last changed.
@@ -152,6 +156,167 @@ impl Gate {
     }
 }
 
+/// How long one telemetry window lasts, and so the bound on how often one
+/// camera can report: a window is closed by the first sample at or past this
+/// age, and at most one `plugin.status` comes out of closing one.
+///
+/// A rate limit like [`emit`]'s on its repeated-suppression diagnostics, and
+/// for the same reason — a per-sample event needs a bound before it is written
+/// anywhere. The shape differs because the bound does: that one counts frames
+/// (`SUPPRESSED_LOG_EVERY`), where this one is a duration, because what it
+/// bounds is a line the host stores and broadcasts and because the number it
+/// carries is a *rate*, which needs an interval to be measured over at all.
+const REPORT_WINDOW: Duration = Duration::from_secs(5);
+
+/// The `state` a gate report is sent under.
+///
+/// Not a new lifecycle state: the process said this when it came up and is
+/// still saying it. The contract attaches no meaning to `state` anyway
+/// (`docs/plugin-contract.md` §`plugin.status`) — what the report carries is
+/// `fps` and `detail`, and changing the state string would only invent a
+/// vocabulary nothing reads.
+const REPORT_STATE: &str = "ready";
+
+/// Whether a camera's samples reached the model over one window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateState {
+    /// Every sample in the window was inferred.
+    Detecting,
+    /// At least one was skipped.
+    Gated,
+}
+
+impl GateState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Detecting => "detecting",
+            Self::Gated => "gated",
+        }
+    }
+}
+
+/// What one camera has told the host about its gate, and the counts behind the
+/// next thing it will.
+///
+/// **A window's state is `Gated` if the gate skipped *any* of its samples.**
+/// That is what keeps the re-verify from flapping the report: a gated camera
+/// runs the model once every `reverify_ms` and would otherwise transition
+/// twice per interval, saying "detecting" for the one sample the model ran on.
+/// Reading the window instead makes the re-verify what it is — a camera that
+/// is gated and checking — at the price of a lag on the way back out: a window
+/// straddling the first real motion still contains the skips before it, so
+/// `Detecting` is reported by the *next* window.
+///
+/// Every window is closed and compared, so what reaches the host is exactly
+/// the changes between *consecutive* windows — the run-length encoding of the
+/// window states. A camera that gates and un-gates inside one window says
+/// nothing about it: the window reads `Gated`, because it skipped a sample.
+#[derive(Debug, Default)]
+pub struct Telemetry {
+    /// Start of the open window: the instant of the previous report, or of the
+    /// first sample this camera produced. The sample that sets it is not
+    /// counted into the window it opens, which is what makes the rate below
+    /// exactly "what happened in the interval since".
+    window: Option<Instant>,
+    samples: u64,
+    inferences: u64,
+    /// The largest `changed_fraction` in the open window. The peak rather than
+    /// the mean because `min_area_fraction` is compared against one sample at a
+    /// time, which makes this the number to tune it with: **a floor above the
+    /// window's peak would have called no frame in it motion.** The converse
+    /// does not follow — a peak can belong to a frame that reported no motion
+    /// whatever the floor was, a scene cut being the loud case.
+    peak_change: Option<f32>,
+    reported: Option<GateState>,
+}
+
+/// One camera's gate report: the two `plugin.status` fields it fills in.
+#[derive(Debug)]
+struct Report {
+    fps: f64,
+    detail: String,
+}
+
+impl Telemetry {
+    /// Fold one sample in, and close the window if this sample is old enough
+    /// to close it — returning a report only when the closed window's state
+    /// differs from the last one reported.
+    fn observe(
+        &mut self,
+        decision: Decision,
+        verdict: Option<MotionVerdict>,
+        now: Instant,
+    ) -> Option<Report> {
+        let Some(start) = self.window else {
+            self.window = Some(now);
+            return None;
+        };
+        self.samples += 1;
+        if decision == Decision::Detect {
+            self.inferences += 1;
+        }
+        if let Some(fraction) = verdict.map(|verdict| verdict.changed_fraction) {
+            self.peak_change = Some(self.peak_change.map_or(fraction, |peak| peak.max(fraction)));
+        }
+
+        let elapsed = now.duration_since(start);
+        if elapsed < REPORT_WINDOW {
+            return None;
+        }
+        let state = if self.inferences < self.samples {
+            GateState::Gated
+        } else {
+            GateState::Detecting
+        };
+        // `elapsed` is at least `REPORT_WINDOW` here, so neither rate can be
+        // infinite or NaN — and both track the decoder's `SAMPLE_FPS` pacing,
+        // which `SAMPLE_FPS` bounds only up to the depth of the channel
+        // feeding this loop (a stall then a drain can land two samples in one
+        // interval). Either way they stay orders of magnitude inside the
+        // host's 0..10 000, so no line loses its `fps` field.
+        let seconds = elapsed.as_secs_f64();
+        let report = (self.reported != Some(state)).then(|| Report {
+            fps: self.inferences as f64 / seconds,
+            detail: format!(
+                "motion gate: {}{}; {:.2} fps inferred of {:.2} sampled over {:.1} s; \
+                 peak change {}",
+                match self.reported {
+                    Some(previous) => format!("{} -> ", previous.as_str()),
+                    None => String::new(),
+                },
+                state.as_str(),
+                self.inferences as f64 / seconds,
+                self.samples as f64 / seconds,
+                seconds,
+                match self.peak_change {
+                    Some(fraction) => format!("{:.2}%", f64::from(fraction) * 100.0),
+                    None => "n/a".to_string(),
+                }
+            ),
+        });
+
+        self.reported = Some(state);
+        self.window = Some(now);
+        self.samples = 0;
+        self.inferences = 0;
+        self.peak_change = None;
+        report
+    }
+}
+
+/// The lines one sample owes stdout.
+pub struct Lines {
+    /// This sample's `frame.objects` line, real or seeded, or `None` when the
+    /// publisher declined it.
+    pub objects: Option<String>,
+    /// A `plugin.status` when this sample closed a telemetry window whose gate
+    /// state differs from the last one reported — see [`Telemetry`]. Always
+    /// `None` for a camera whose gate is off: nothing there can skip a sample,
+    /// so the effective inference rate is the sample rate and every line the
+    /// host already receives says so.
+    pub status: Option<String>,
+}
+
 /// One sample, from verdict to protocol line: the gate's decision, the model
 /// pass it does or does not authorize, and the line either way.
 ///
@@ -160,8 +325,9 @@ impl Gate {
 /// each, group mode holds them by slot — never what is done with the sample,
 /// which is the whole of the duplication the two inference loops carry.
 ///
-/// `Ok(None)` is the publisher declining the line (this camera has no epoch, or
-/// the `pts` is outside the contract's range); it is not the gate skipping one.
+/// A [`Lines::objects`] of `None` is the publisher declining the line (this
+/// camera has no epoch, or the `pts` is outside the contract's range); it is not
+/// the gate skipping one.
 /// **A gated sample always produces a line to write, or a suppression the
 /// publisher counted.** Nothing is silently dropped between the two — an
 /// inference the gate skipped still costs a sequence number and still tells the
@@ -180,7 +346,7 @@ pub fn sample_line(
     sample: Sample,
     now: Instant,
     infer: impl FnOnce(ModelInput) -> Result<Vec<Det>>,
-) -> Result<Option<String>> {
+) -> Result<Lines> {
     // Skipped entirely for an ungated camera: `decide` answers `Detect` on a
     // `None` config without consulting the epoch, so this read would be work a
     // gate that is off has no use for.
@@ -192,17 +358,29 @@ pub fn sample_line(
     // sample this decided to skip under the old epoch is seeded as the empty
     // liveness line under the new one, never as the old one's boxes.
     let epoch = config.and_then(|_| publisher.epoch_of(camera_id));
-    Ok(
-        match gate.decide(config, sample.motion, epoch.as_deref(), now) {
-            Decision::Detect => {
-                let dets = infer(sample.input)?;
-                publisher.line_for(camera_id, sample.pts_90k, sample.observed_at, &dets)
-            }
-            Decision::Skip => {
-                publisher.seeded_line_for(camera_id, sample.pts_90k, sample.observed_at)
-            }
-        },
-    )
+    let decision = gate.decide(config, sample.motion, epoch.as_deref(), now);
+    // The verdict is read here for the same reason `decide` reads it here:
+    // `sample.input` is moved into the model below and the verdict goes with
+    // it. An `infer` that then fails loses this report, which is the right
+    // outcome — both loops turn that error into a process exit.
+    let status = config
+        .and_then(|_| gate.telemetry.observe(decision, sample.motion, now))
+        .map(|report| {
+            emit::status_line(
+                Some(camera_id),
+                REPORT_STATE,
+                Some(&report.detail),
+                Some(report.fps),
+            )
+        });
+    let objects = match decision {
+        Decision::Detect => {
+            let dets = infer(sample.input)?;
+            publisher.line_for(camera_id, sample.pts_90k, sample.observed_at, &dets)
+        }
+        Decision::Skip => publisher.seeded_line_for(camera_id, sample.pts_90k, sample.observed_at),
+    };
+    Ok(Lines { objects, status })
 }
 
 /// Whether `since` happened, and less than `ms` ago.
@@ -603,12 +781,12 @@ mod tests {
         use crate::emit::ObservationKind;
         use crate::infer::{InputSize, Projection};
 
-        fn publisher(camera_ids: &[&str]) -> (Arc<Streams>, Publisher) {
+        pub(super) fn publisher(camera_ids: &[&str]) -> (Arc<Streams>, Publisher) {
             let streams = Arc::new(Streams::new(camera_ids.iter().copied()));
             (Arc::clone(&streams), Publisher::new(streams))
         }
 
-        fn start(streams: &Streams, camera_id: &str, epoch: &str) {
+        pub(super) fn start(streams: &Streams, camera_id: &str, epoch: &str) {
             streams.apply(Control::Started {
                 camera_id: camera_id.to_string(),
                 stream_epoch: epoch.to_string(),
@@ -631,7 +809,7 @@ mod tests {
         /// A sample carrying `verdict`. The tensor is empty: nothing in this
         /// module looks at it, and the stand-in detector below never gets one
         /// it did not ignore.
-        fn sample(verdict: Option<MotionVerdict>) -> Sample {
+        pub(super) fn sample(verdict: Option<MotionVerdict>) -> Sample {
             Sample {
                 pts_90k: 900,
                 observed_at: SystemTime::UNIX_EPOCH,
@@ -716,6 +894,7 @@ mod tests {
                     },
                 )
                 .expect("the stand-in detector never fails")
+                .objects
             }
 
             /// The same, for a camera the host has started: a line is owed.
@@ -958,8 +1137,350 @@ mod tests {
                 |_input| Ok(vec![det("person", 0.9)]),
             )
             .expect("the second pass succeeds")
+            .objects
             .expect("a started camera emits every sample");
             assert_eq!(sequence(&line), 0);
+        }
+    }
+
+    /// The gate's own telemetry: the rate it reports and the bound on how
+    /// often it reports one. Windows are closed by the sample that reaches
+    /// them, so every instant here is the caller's, like the policy's.
+    mod telemetry {
+        use super::*;
+
+        /// `samples` samples at 5 fps from `base`, each one's fate decided by
+        /// `decision`. Returns every report that came back.
+        fn drive(
+            telemetry: &mut Telemetry,
+            base: Instant,
+            samples: std::ops::Range<u64>,
+            mut decision: impl FnMut(u64) -> Decision,
+        ) -> Vec<Report> {
+            samples
+                .filter_map(|step| telemetry.observe(decision(step), still(), at(base, step * 200)))
+                .collect()
+        }
+
+        #[test]
+        fn the_reported_rate_is_model_passes_per_second_of_the_window() {
+            let mut telemetry = Telemetry::default();
+            let base = Instant::now();
+            // 5 fps for 30 s, with the model run on every fourth sample.
+            // The window that closes first holds 25 samples and 6 model
+            // passes, so the effective inference rate is 1.2 against a sample
+            // rate of 5.
+            let reports = drive(&mut telemetry, base, 0..150, |step| {
+                if step.is_multiple_of(4) {
+                    Decision::Detect
+                } else {
+                    Decision::Skip
+                }
+            });
+
+            let report = reports.first().expect("the first window is a transition");
+            assert!(
+                (report.fps - 1.2).abs() < 0.01,
+                "reported {} fps, expected 1.2",
+                report.fps
+            );
+            assert!(
+                report.detail.starts_with("motion gate: gated;"),
+                "{}",
+                report.detail
+            );
+            assert!(
+                report.detail.contains("of 5.00 sampled"),
+                "the sample rate is reported beside the inference rate: {}",
+                report.detail
+            );
+        }
+
+        #[test]
+        fn a_gate_that_skips_nothing_reports_the_sample_rate() {
+            let mut telemetry = Telemetry::default();
+            let base = Instant::now();
+            let reports = drive(&mut telemetry, base, 0..50, |_| Decision::Detect);
+
+            assert_eq!(reports.len(), 1, "one transition, into detecting");
+            assert!(
+                (reports[0].fps - 5.0).abs() < 0.05,
+                "reported {} fps, expected ~5",
+                reports[0].fps
+            );
+            assert!(
+                reports[0].detail.starts_with("motion gate: detecting;"),
+                "{}",
+                reports[0].detail
+            );
+        }
+
+        #[test]
+        fn a_re_verify_inside_a_gated_stretch_reports_nothing() {
+            // The flap this exists to prevent: at the default `reverify_ms` a
+            // gated camera runs the model every 10 s, and a report keyed on
+            // the *sample's* decision would say "detecting" for each of those
+            // and "gated" again right after — a pair of status lines every
+            // 10 s, per camera, describing a camera that never left the gate.
+            let mut telemetry = Telemetry::default();
+            let base = Instant::now();
+            let reports = drive(&mut telemetry, base, 0..600, |step| {
+                if step.is_multiple_of(50) {
+                    Decision::Detect
+                } else {
+                    Decision::Skip
+                }
+            });
+
+            assert_eq!(reports.len(), 1, "{reports:?}");
+            assert!(reports[0].detail.contains("gated"), "{}", reports[0].detail);
+        }
+
+        #[test]
+        fn a_transition_costs_at_most_one_report_per_window() {
+            // The rate limit, driven by the worst case for it: the decision
+            // alternating on every sample, 5 times a second for a minute.
+            let mut telemetry = Telemetry::default();
+            let base = Instant::now();
+            let reports = drive(&mut telemetry, base, 0..300, |step| {
+                if step.is_multiple_of(2) {
+                    Decision::Detect
+                } else {
+                    Decision::Skip
+                }
+            });
+
+            // Every window holds a skip, so every window is gated and the one
+            // report is the first window's transition into it.
+            assert_eq!(reports.len(), 1, "{reports:?}");
+            // …and 60 s of samples is 12 windows, so even a run that did
+            // transition on every one could not have reported more than that.
+            assert!(reports.len() <= 12);
+        }
+
+        #[test]
+        fn the_state_returns_to_detecting_a_window_after_the_gate_opens() {
+            let mut telemetry = Telemetry::default();
+            let base = Instant::now();
+            // 20 s gated (re-verifying every 10 s), then the model on every
+            // sample: the window that straddles the change still holds the
+            // skips before it, so "detecting" is reported by the window after
+            // it — 10 s at worst, which is the lag that reading the window
+            // rather than the sample buys.
+            let reports = drive(&mut telemetry, base, 0..300, |step| {
+                if step >= 100 || step.is_multiple_of(50) {
+                    Decision::Detect
+                } else {
+                    Decision::Skip
+                }
+            });
+
+            let detail: Vec<&str> = reports.iter().map(|r| r.detail.as_str()).collect();
+            assert_eq!(detail.len(), 2, "{detail:?}");
+            assert!(detail[0].starts_with("motion gate: gated;"), "{detail:?}");
+            assert!(
+                detail[1].starts_with("motion gate: gated -> detecting;"),
+                "{detail:?}"
+            );
+            // reported at 25 s: the window closing at 20 s still contains the
+            // gated samples up to it, and the one closing at 25 s does not
+            assert!(
+                detail[1].contains("5.00 fps inferred of 5.00 sampled over 5.0 s"),
+                "{detail:?}"
+            );
+        }
+
+        #[test]
+        fn the_peak_change_of_the_window_is_what_is_reported() {
+            let mut telemetry = Telemetry::default();
+            let base = Instant::now();
+            let fraction = |value: f32| {
+                Some(MotionVerdict {
+                    changed_fraction: value,
+                    motion: false,
+                    calibrating: false,
+                    scene_cut: false,
+                })
+            };
+
+            telemetry.observe(Decision::Detect, fraction(0.01), base);
+            for step in 1..25 {
+                telemetry.observe(Decision::Skip, fraction(0.001), at(base, step * 200));
+            }
+            let report = telemetry
+                .observe(Decision::Skip, fraction(0.004), at(base, 5_000))
+                .expect("the window closed on a transition");
+            // 0.4 % is the largest fraction since the window opened, and the
+            // 1 % on the sample that opened it is not in this window at all
+            assert!(
+                report.detail.ends_with("peak change 0.40%"),
+                "{}",
+                report.detail
+            );
+        }
+
+        #[test]
+        fn a_window_with_no_verdict_reports_no_fraction() {
+            let mut telemetry = Telemetry::default();
+            let base = Instant::now();
+            telemetry.observe(Decision::Detect, None, base);
+            let report = telemetry
+                .observe(Decision::Detect, None, at(base, 5_000))
+                .expect("the first window is a transition");
+            assert!(
+                report.detail.ends_with("peak change n/a"),
+                "{}",
+                report.detail
+            );
+        }
+
+        #[test]
+        fn a_gated_camera_reports_through_the_status_line() {
+            // What the wire actually carries, once: the `fps` field the host
+            // bounds at 0..10 000 and a `detail` inside its 256-byte cap.
+            let (streams, mut publisher) = sample_line::publisher(&["front"]);
+            sample_line::start(&streams, "front", EPOCH);
+            let mut gate = Gate::default();
+            let base = Instant::now();
+
+            let statuses: Vec<String> = (0..150)
+                .filter_map(|step| {
+                    sample_line(
+                        &mut gate,
+                        &mut publisher,
+                        "front",
+                        config(),
+                        sample_line::sample(still()),
+                        at(base, step * 200),
+                        |_input| Ok(vec![]),
+                    )
+                    .expect("the stand-in detector never fails")
+                    .status
+                })
+                .collect();
+
+            // 30 s: the epoch bypass covers the first 15 s and the gate
+            // closes after it, so two transitions reach the wire — into
+            // detecting at 5 s, and into gated at the first window that holds
+            // a skipped sample.
+            assert_eq!(statuses.len(), 2, "{statuses:?}");
+            let value: serde_json::Value = serde_json::from_str(&statuses[1]).unwrap();
+            assert_eq!(value["type"], "plugin.status");
+            assert_eq!(value["camera_id"], "front");
+            assert_eq!(value["status"]["state"], REPORT_STATE);
+            let fps = value["status"]["fps"].as_f64().expect("a rate is reported");
+            assert!(
+                (0.0..=f64::from(crate::decode::SAMPLE_FPS)).contains(&fps),
+                "{fps}"
+            );
+            let detail = value["status"]["detail"].as_str().expect("a detail");
+            assert!(detail.len() <= 256, "{} bytes: {detail}", detail.len());
+        }
+
+        #[test]
+        fn a_camera_with_the_gate_off_reports_nothing() {
+            let (streams, mut publisher) = sample_line::publisher(&["front"]);
+            sample_line::start(&streams, "front", EPOCH);
+            let mut gate = Gate::default();
+            let base = Instant::now();
+
+            for step in 0..150 {
+                assert!(
+                    sample_line(
+                        &mut gate,
+                        &mut publisher,
+                        "front",
+                        None,
+                        sample_line::sample(None),
+                        at(base, step * 200),
+                        |_input| Ok(vec![]),
+                    )
+                    .expect("the stand-in detector never fails")
+                    .status
+                    .is_none(),
+                    "sample {step}"
+                );
+            }
+        }
+
+        #[test]
+        fn the_rate_is_measured_over_the_window_that_actually_elapsed() {
+            // Every other test here closes its windows on an exact 5.000 s
+            // boundary, so dividing by the `REPORT_WINDOW` constant instead of
+            // the elapsed time would pass all of them. No real window closes
+            // nominally — it closes on the first sample *at or past* 5 s, and a
+            // soak run read "over 5.2 s" — so the rate has to be per second of
+            // the window that happened.
+            let mut telemetry = Telemetry::default();
+            let base = Instant::now();
+
+            telemetry.observe(Decision::Detect, still(), base);
+            for step in 1..25 {
+                assert!(
+                    telemetry
+                        .observe(Decision::Detect, still(), at(base, step * 200))
+                        .is_none(),
+                    "sample {step} is inside the window"
+                );
+            }
+            // the sample that closes the window arrives late, at 5.6 s: 25
+            // counted samples, all inferred, over 5.6 s is 4.46 and not 5
+            let report = telemetry
+                .observe(Decision::Detect, still(), at(base, 5_600))
+                .expect("the first window is a transition");
+
+            assert!(
+                (report.fps - 25.0 / 5.6).abs() < 0.01,
+                "reported {} fps, expected 4.46",
+                report.fps
+            );
+            assert!(report.detail.contains("over 5.6 s"), "{}", report.detail);
+        }
+
+        #[test]
+        fn a_window_reports_its_own_peak_not_the_last_windows() {
+            // `peak_change` is the only counter whose reset a window's own
+            // samples cannot mask: `samples` and `inferences` are compared
+            // against each other, but a stale peak simply outlives every
+            // smaller fraction that follows it. Dropping the reset would leave
+            // a camera reporting the loudest frame it ever saw, forever.
+            let mut telemetry = Telemetry::default();
+            let base = Instant::now();
+            let fraction = |value: f32| {
+                Some(MotionVerdict {
+                    changed_fraction: value,
+                    motion: false,
+                    calibrating: false,
+                    scene_cut: false,
+                })
+            };
+
+            // a gated window at 5 % change
+            telemetry.observe(Decision::Skip, fraction(0.05), base);
+            for step in 1..25 {
+                telemetry.observe(Decision::Skip, fraction(0.05), at(base, step * 200));
+            }
+            let gated = telemetry
+                .observe(Decision::Skip, fraction(0.05), at(base, 5_000))
+                .expect("the first window is a transition");
+            assert!(
+                gated.detail.ends_with("peak change 5.00%"),
+                "{}",
+                gated.detail
+            );
+
+            // then a quiet window that infers everything, at 0.4 %
+            for step in 26..50 {
+                telemetry.observe(Decision::Detect, fraction(0.004), at(base, step * 200));
+            }
+            let detecting = telemetry
+                .observe(Decision::Detect, fraction(0.004), at(base, 10_000))
+                .expect("gated -> detecting is a transition");
+            assert!(
+                detecting.detail.ends_with("peak change 0.40%"),
+                "{}",
+                detecting.detail
+            );
         }
     }
 }
