@@ -242,12 +242,9 @@ pub fn resolve(global: &MotionOverrides, per_camera: &MotionOverrides) -> Option
 pub struct MotionVerdict {
     /// Fraction of the thumbnail whose difference from the background exceeded
     /// the threshold, in 0..=1. Reported even when `motion` is false, because
-    /// it is the number an operator tunes `min_area_fraction` against.
-    // The gate decides on `motion`, `calibrating` and `scene_cut`; this is the
-    // number behind all three, and nothing outside this module's own tests
-    // reads it yet. `-D warnings` makes an unread field fatal. Delete this
-    // allow once the status telemetry reports it (plan 3.1).
-    #[allow(dead_code)]
+    /// it is the number an operator tunes `min_area_fraction` against — which
+    /// is why [`crate::gate::Telemetry`] carries its per-window peak out to the
+    /// host, where an operator can read it.
     pub changed_fraction: f32,
     /// Whether that fraction reaches `min_area_fraction` on a calibrated
     /// detector. Always false while calibrating and on a scene cut.

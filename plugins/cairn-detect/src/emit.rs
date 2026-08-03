@@ -151,6 +151,15 @@ struct StatusBody<'a> {
     state: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<&'a str>,
+    /// Model passes per second, which is the sample rate only when nothing is
+    /// skipping them — see [`crate::gate::Telemetry`], the one thing that
+    /// fills this in. The host bounds it at 0..10 000 and drops the field
+    /// outright when it is outside that, so a value is worth sending only if
+    /// it cannot be; the gate's cannot, being model passes counted over a
+    /// window of at least five seconds while the decoder paces samples at
+    /// [`crate::decode::SAMPLE_FPS`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fps: Option<f64>,
 }
 
 /// The startup announcement, sent before anything that can take time.
@@ -170,15 +179,27 @@ pub fn hello_line() -> String {
     })
 }
 
-/// A lifecycle status. The host rate-limits these to change-or-heartbeat, so
-/// they are sent on transitions only, never per frame.
-pub fn status_line(camera_id: Option<&str>, state: &str, detail: Option<&str>) -> String {
+/// A lifecycle status. The host stores one that differs from that camera's
+/// last and pushes it to every subscriber; an identical repeat is forwarded
+/// at most once every 5 s as a liveness heartbeat, and the ones in between are
+/// dropped and counted. So these are sent on transitions only, never per
+/// frame: the process's own lifecycle (main.rs) and, with the motion gate on,
+/// a change in whether that camera's samples are reaching the model
+/// ([`crate::gate::Telemetry`], which reports one line per camera per window
+/// and whose consecutive reports name opposite transitions, so no gate report
+/// is ever the repeat that limit drops).
+pub fn status_line(
+    camera_id: Option<&str>,
+    state: &str,
+    detail: Option<&str>,
+    fps: Option<f64>,
+) -> String {
     serialize(&Status {
         spec: SPEC,
         version: VERSION,
         kind: "plugin.status",
         camera_id,
-        status: StatusBody { state, detail },
+        status: StatusBody { state, detail, fps },
     })
 }
 
@@ -756,11 +777,12 @@ mod tests {
     #[test]
     fn a_status_without_a_camera_omits_the_field() {
         // Group hosts read an absent `camera_id` as "every member".
-        let value = parse(&status_line(None, "ready", None));
+        let value = parse(&status_line(None, "ready", None, None));
         assert_eq!(value["type"], "plugin.status");
         assert!(value.get("camera_id").is_none());
         assert_eq!(value["status"]["state"], "ready");
         assert!(value["status"].get("detail").is_none());
+        assert!(value["status"].get("fps").is_none());
     }
 
     #[test]
@@ -769,10 +791,20 @@ mod tests {
             Some("front_door"),
             "starting",
             Some("loading model"),
+            None,
         ));
         assert_eq!(value["camera_id"], "front_door");
         assert_eq!(value["status"]["state"], "starting");
         assert_eq!(value["status"]["detail"], "loading model");
+    }
+
+    #[test]
+    fn a_status_can_carry_a_rate() {
+        // The motion gate's report. `fps` is a JSON number the host bounds at
+        // 0..10 000 — a rate it refuses is a field that silently vanishes.
+        let value = parse(&status_line(Some("front_door"), "ready", None, Some(0.6)));
+        assert_eq!(value["status"]["fps"], 0.6);
+        assert!(value["status"].get("detail").is_none());
     }
 
     #[test]

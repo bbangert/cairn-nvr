@@ -24,7 +24,12 @@ forward compatibility is one-directional on the host too.
           - "bbox": [x, y, w, h], each 0 <= v <= 1 (small epsilon tolerated),
                     w and h greater than zero, and x + w <= 1.0001,
                     y + h <= 1.0001
-          - "observation_kind": optional, "detected" or "tracked"
+          - "observation_kind": optional, and "tracked" when present. The
+                    contract also allows "detected", but that is the default
+                    the host reads an absent field as, so spelling it out is
+                    bytes on every object of every line that say nothing --
+                    the same reason this gate is stricter than the host about
+                    an over-cap status field.
   "plugin.hello"
       - "hello" (or the envelope itself) with:
           - "name":    str, 1..64 bytes, no control characters
@@ -49,8 +54,29 @@ counts (with up to 5 sample errors), the hello and the last status seen, a
 detection histogram by label, overall score min/mean/max, per-camera
 sequence continuity, a pts monotonicity check (the contract doesn't
 guarantee non-decreasing pts across a stream epoch change -- a *decrease* is
-reported as a "wrap/reset" note, not an error), and an effective sample rate
-estimated from consecutive-pts deltas assuming the 90kHz RTP clock.
+reported as a "wrap/reset" note, not an error), an effective sample rate
+estimated from consecutive-pts deltas assuming the 90kHz RTP clock, and a
+breakdown of what those lines cost in model passes.
+
+That last one is bounded rather than exact, and the summary says so. Three
+kinds of frame.objects line are distinguishable on the wire:
+
+  seeded    every object carries "tracked": the plugin is re-reporting boxes
+            it did not detect in this frame
+  fresh     at least one object does not, so this frame was detected on
+  empty     "objects": [] -- a model pass that found nothing, OR a skipped
+            sample with nothing to re-report. **The wire cannot tell those
+            apart**, and no field says: an empty line is the protocol's
+            "alive, saw nothing" signal either way.
+
+So the effective inference rate is reported as a range: the fresh-line rate
+is its floor and the fresh+empty rate its ceiling. That reads a seeded line
+as a model pass skipped, which is what cairn-detect's motion gate does and
+what any no-change filter would; nothing in the contract stops a plugin from
+predicting a box on a frame it did infer, and such a run would report a
+ceiling below its real rate. On a run with the gate off the two bounds
+collapse (nothing is seeded, every line is a model pass) and the range is
+the emit rate.
 
 Note that a plugin emits no frame.objects at all until it has been told a
 stream epoch on stdin, so a run with no control line is expected to produce
@@ -83,7 +109,10 @@ EPS = 1e-4
 RFC3339 = re.compile(
     r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$"
 )
-KINDS = ("detected", "tracked")
+# The only value worth putting on the wire: "detected" is what the host reads
+# an absent field as, so a plugin that spells it out is paying for every object
+# of every line to say the default. See the module docstring.
+KINDS = ("tracked",)
 # The host's @envelope_keys: routing/versioning, never part of a flat body.
 ENVELOPE_KEYS = frozenset(
     ("spec", "version", "type", "camera_id", "stream_epoch", "sequence")
@@ -144,9 +173,11 @@ def validate_object(obj, idx):
     if "bbox" not in obj:
         fail(f"objects[{idx}].bbox missing")
     validate_bbox(obj["bbox"])
-    kind = obj.get("observation_kind", "detected")
-    if kind not in KINDS:
-        fail(f"objects[{idx}].observation_kind not one of {KINDS}: {kind!r}")
+    if "observation_kind" in obj and obj["observation_kind"] not in KINDS:
+        fail(
+            f"objects[{idx}].observation_kind is "
+            f"{obj['observation_kind']!r}, expected one of {KINDS} or absent"
+        )
 
 
 def validate_frame(frame):
@@ -289,6 +320,11 @@ class Stats:
         self.gaps = {}        # camera_id -> missing count
         self.pts_seen = {}    # camera_id -> [pts, ...]
         self.wraps = 0
+        # frame.objects lines by what they cost in model passes; see the
+        # module docstring for why "empty" is its own bucket
+        self.seeded = 0
+        self.fresh = 0
+        self.empty = 0
 
     def record_error(self, line_no, reason, raw):
         self.invalid += 1
@@ -327,7 +363,15 @@ class Stats:
             self.wraps += 1
         seen.append(pts)
 
-        for det in obj["objects"]:
+        objects = obj["objects"]
+        if not objects:
+            self.empty += 1
+        elif all(det.get("observation_kind") == "tracked" for det in objects):
+            self.seeded += 1
+        else:
+            self.fresh += 1
+
+        for det in objects:
             self.label_counts[det["label"]] = self.label_counts.get(det["label"], 0) + 1
             self.scores.append(det["score"])
 
@@ -381,6 +425,7 @@ class Stats:
         else:
             lines.append("score min/mean/max: n/a (no detections seen)")
 
+        emit_fps = None
         every_pts = [p for seen in self.pts_seen.values() for p in seen]
         if len(every_pts) >= 2:
             deltas = [
@@ -392,19 +437,68 @@ class Stats:
             note = f", {self.wraps} decrease(s)/wrap(s) noted" if self.wraps else ""
             if deltas:
                 mean_delta = sum(deltas) / len(deltas)
-                fps = 90000.0 / mean_delta if mean_delta > 0 else float("inf")
+                emit_fps = 90000.0 / mean_delta if mean_delta > 0 else float("inf")
                 lines.append(
                     f"pts monotonicity: {'non-decreasing' if self.wraps == 0 else 'has decreases'}{note}"
                 )
                 lines.append(
                     f"effective sample rate: mean pts delta={mean_delta:.1f} ticks "
-                    f"(90kHz) ~= {fps:.2f} fps over {len(deltas)} interval(s)"
+                    f"(90kHz) ~= {emit_fps:.2f} fps over {len(deltas)} interval(s)"
                 )
             else:
                 lines.append(f"pts monotonicity: has decreases{note}; no forward deltas to estimate rate from")
         else:
             lines.append("pts monotonicity/sample rate: n/a (need >= 2 frame.objects lines)")
+
+        lines.extend(self.inference_summary(emit_fps))
         return "\n".join(lines)
+
+    def inference_summary(self, emit_fps):
+        """What the run cost in model passes, as far as the wire can say.
+
+        Every rate here is the emit rate scaled by a share of the lines,
+        rather than a second estimate of its own: the emit rate is already
+        measured from the pts deltas above, and one line is one sample.
+        """
+        if not self.frames:
+            return ["line kinds/inference rate: n/a (no frame.objects lines seen)"]
+
+        out = [
+            f"line kinds: seeded={self.seeded} fresh-detection={self.fresh} "
+            f"empty-objects={self.empty} of {self.frames} frame(s)"
+        ]
+        # `inf` is what a run of identical pts leaves behind; scaling it would
+        # print inf/nan rather than say the rate is unknowable from these lines
+        if emit_fps is None or emit_fps == float("inf"):
+            out.append(
+                "inference rate: n/a (no usable emit rate to scale -- need >= 2 "
+                "frames with a forward pts delta)"
+            )
+            return out
+
+        floor = emit_fps * self.fresh / self.frames
+        ceiling = emit_fps * (self.fresh + self.empty) / self.frames
+        out.append(
+            f"emit rate: {emit_fps:.2f} fps (every line, seeded or not)"
+        )
+        out.append(
+            f"effective inference rate: {floor:.2f}..{ceiling:.2f} fps "
+            f"({100.0 * self.fresh / self.frames:.1f}% of lines carry a fresh "
+            f"detection, {100.0 * self.empty / self.frames:.1f}% are empty and "
+            "could be either)"
+        )
+        if self.seeded:
+            out.append(
+                f"gate: on -- {100.0 * self.seeded / self.frames:.1f}% of lines "
+                "re-report an earlier frame's boxes instead of this frame's "
+                "detections"
+            )
+        else:
+            out.append(
+                "gate: no seeded lines seen (a run with the gate off, or one "
+                "that never gated with something to re-report)"
+            )
+        return out
 
     def ok(self) -> bool:
         return self.invalid == 0 and self.frames > 0

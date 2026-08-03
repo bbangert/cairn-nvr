@@ -197,11 +197,99 @@ delivers. On a 2 fps substream the calibration window is 12.5 seconds and the
 10-second memory is 25, so read every second in this section as "at this
 camera's sample rate".
 
-**Frigate's published numbers do not transfer as-is.** The thumbnail here is at
-most 96 px wide and it is compared at 5 fps, so inter-frame differences are
-much larger than in a 15 fps pipeline. Treat the defaults as a starting point
-and tune `min_area_fraction` against the change fractions your own cameras
-produce.
+**Frigate's published numbers do not transfer as-is.** Frigate compares motion
+on a frame around 100 px high; the thumbnail here is at most 96 px *wide*,
+shaped from the content rectangle, and it is compared at up to 5 fps rather
+than at the camera's full rate. A fraction measured on one of those is not the
+same quantity as a fraction measured on the other, so treat the defaults as a
+starting point and tune `min_area_fraction` against the change fractions your
+own cameras produce.
+
+They are not a starting point far from the answer, either. Across the gate-on
+runs of a two-minute clip from a 2560×1920 camera looking at a parked car, the
+peak changed fraction of each 5-second window ran **0.20 % to 0.55 %** — either
+side of the 0.5 % default. The gate's own `plugin.status` reports that peak
+(below), so the number to set the floor against is one the plugin will tell
+you.
+
+What it costs to sit on the floor is that small things decide the outcome. Each
+fraction that crosses it arms `linger_ms`, and each `linger_ms` is 12 seconds of
+inference, so:
+
+- two runs of that clip at the same knobs on the same build gated **67 %** and
+  **57 %** of their samples;
+- the same clip gated **67 %** under yolox and **31.7 %** under rfdetr, between
+  which the only relevant difference is the thumbnail's shape — 96×72 under
+  yolox's letterbox, 96×96 under rfdetr's stretch — which moved the reported
+  window peaks from 0.20–0.35 % to 0.21–0.55 %;
+- with the floor at `0.02`, clear of that camera's noise, it gated **73 %**.
+
+### What the gate keeps true
+
+Five rules, and where each one lives:
+
+1. **A gated sample is never silently swallowed.** Every sample the plugin
+   would have emitted before still emits exactly one line — the remembered
+   boxes as `"tracked"`, or the empty-`objects` liveness line when there is
+   nothing remembered. (A camera Cairn has not started still emits nothing, as
+   above: the gate changes what is in a line, never which samples produce one.)
+   An empty line ages the host's live tracks toward their unseen bound, so a
+   parked object the gate stopped inferring on would retire while it was still
+   standing there; seeding is what keeps it seen, and the empty line stays the
+   "alive, saw nothing" signal it always was. (`gate::sample_line`,
+   `Publisher::seeded_line_for`.)
+2. **A seed never improves on the score the model gave it.** Seeds are held at
+   the score of the detection they were copied from, so they cannot beat the
+   host's `best_score` for that track and cannot bypass its publish throttle —
+   the host would broadcast a track update for a frame nothing looked at.
+   (`emit::CameraState::last_dets`.)
+3. **A stream reset is inferred through, not seeded through.** The host
+   suspends its live tracks at a reset and refuses a `"tracked"` object as
+   proof any of them is back, so a seed cannot re-establish what the reset
+   suspended. `epoch_bypass_ms` (15 s, well inside the host's 60 s adoption
+   window) forces real inference across it, and the remembered boxes are
+   cleared outright at the epoch change so nothing from before the cut can be
+   re-reported after it. (`Gate::decide`, `Publisher::emit`.)
+4. **Inference outlasts the motion it is judging.** The host earns a track's
+   `stationary` flag from detections alone, so `linger_ms` (12 s) keeps the
+   model running past the last motion — longer than the host's ~10 s
+   `stationary_after_ms`. (`Gate::decide`.)
+5. **Seeding is protocol v1 only**, which is what this plugin speaks. v0 has
+   no `observation_kind` and no way to say a box is a re-report.
+
+### Telemetry
+
+With the gate on, a camera emits a `plugin.status` when the answer to "are
+this camera's samples reaching the model" changes — plus one baseline report
+at its first closed window, change or not, so a camera that never gates still
+says so once, about 5 s after its first sample:
+
+```jsonc
+// verbatim from a gate-on run of a recorded clip
+{"spec":"cairn.plugin","version":1,"type":"plugin.status","camera_id":"test",
+ "status":{"state":"ready","fps":2.9067005603144356,
+           "detail":"motion gate: detecting -> gated; 2.91 fps inferred of 4.46 sampled over 5.2 s; peak change 0.22%"}}
+```
+
+`fps` is the **effective inference rate** — model passes per second, not
+samples per second. With the gate off the two are the same number and nothing
+is reported; with it on, the difference between `fps` and the sample rate in
+`detail` is what the gate bought. `peak change` is the largest changed fraction
+in that window, which is the number to tune `min_area_fraction` against.
+
+The state is read over a **5-second window and is `gated` if the gate skipped
+any of its samples**, so the `reverify_ms` pass does not read as the camera
+leaving the gate, and at most one status per camera per window can be sent.
+`state` stays `ready`: this is health, not a new lifecycle state.
+
+Neither limit — the gate's or the host's — costs a report. The host stores and
+broadcasts a status that differs from that camera's last one, and re-sends an
+identical one only once every 5 s as a liveness heartbeat, dropping and
+counting the repeats in between (see the wire protocol below). A gate report
+always differs from the one before it, because reports fire on a state change
+and consecutive details therefore name opposite transitions; and the gate's
+window is the same 5 s as the heartbeat interval, so even a repeat would be
+due.
 
 ## The wire protocol
 
@@ -216,7 +304,11 @@ this plugin:
  "hello":{"name":"cairn-detect","version":"0.1.0","supported_versions":[1],
           "capabilities":{"object_tracking":false}}}
 
-// on transitions only; the host rate-limits these to change-or-heartbeat
+// on transitions only — process lifecycle, and the motion gate's own
+// report (at most one per camera per 5 s). The host rate-limits these:
+// one that differs from the camera's last is stored and broadcast, an
+// identical repeat only once every 5 s as a liveness heartbeat, and the
+// rest are dropped and counted (`:status_rate_limited`).
 {"spec":"cairn.plugin","version":1,"type":"plugin.status",
  "camera_id":"front_door","status":{"state":"ready"}}
 
@@ -1157,8 +1249,9 @@ no library target, so doctests never run.
 - Output lines are capped at the contract's 65 536 bytes — the bound both
   host ports open us with (`{:line, 65_536}`) — by shedding the lowest-scoring
   detections; an oversized line would be dropped by Cairn anyway. At 64
-  shaped objects a line runs to roughly 11 KB, so that shedding is a guard
-  rather than a working part of the path. The object list is cut at 64 first,
+  shaped objects a line runs to about 12.3 KB — 14.2 KB when every object is
+  a seeded re-report carrying `observation_kind` — so that shedding is a
+  guard rather than a working part of the path. The object list is cut at 64 first,
   and for a harsher reason: an over-cap `objects` list is a contract
   violation that costs the *whole* line host-side, not just the surplus.
 - stdout is locked per line, never held. `plugin.status` is written from the

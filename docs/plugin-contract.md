@@ -43,7 +43,8 @@ See [Appendix A](#appendix-a-protocol-v0).
 - [Stream epochs](#stream-epochs), [sequence numbers](#sequence-numbers),
   [what to do before your first
   `stream.started`](#before-your-first-streamstarted)
-- [Track identity](#track-identity)
+- [Track identity](#track-identity) — including [what a re-reported box is
+  worth](#what-a-re-reported-box-is-worth)
 - [Limits](#limits) — every numeric bound in one table
 - [What gets dropped](#what-gets-dropped)
 - [Forward compatibility](#forward-compatibility)
@@ -557,6 +558,40 @@ track changes it; the one time bound is on the waiting. A minute after the
 timestamped at the last observation before the cut, which on a stream that had
 already gone quiet can be well over a minute earlier. None of this needs
 anything from you: it is geometry over the boxes you send.
+
+### What a re-reported box is worth
+
+A plugin that skips work on some frames — the reference plugin's motion gate
+does, and any no-change filter would — can keep an object alive across the
+skipped ones by re-reporting the box it last detected, marked
+`"observation_kind": "tracked"`. **That needs nothing new from this contract.**
+There is no gate message, no mode, no capability: a host sees the
+`frame.objects` lines documented above, some of whose objects carry a field
+already documented above, plus whatever the plugin chooses to say in
+`plugin.status`. Whether a plugin gates and how is entirely its own business.
+
+What Cairn does with such a box is the part worth knowing before you send one:
+
+- **It is presence, not evidence.** `Cairn.Observation.detected?/1` is the one
+  predicate, and everything that could manufacture a fact out of a prediction
+  is behind it: `stale_predicted`, the stationary judgement and its anchor, and
+  the resumption of a suspended track. A `"tracked"` box refreshes
+  `last_seen_ms` — which is what expiry reads — and moves nothing else.
+- **It cannot resume a suspended identity.** Adoption across a stream reset
+  requires `Observation.detected?/1`, so re-reports alone will let a suspended
+  track run out its adoption window and end `stream_reset`. Inferring for real
+  across an epoch change is the plugin's job.
+- **It should not out-score its own detection.** Cairn throttles track updates
+  to 1 Hz *except* on a `best_score` improvement, so a re-report that raised
+  the score would broadcast an update for a frame nothing looked at. Re-report
+  at the score the detection had.
+- **An empty `objects` line is not a substitute.** It is the liveness signal
+  and it ages every live track toward `max_unseen_ms`, so a run of empty lines
+  over a parked object retires it. Send the box or send nothing.
+
+The reference plugin's own knobs, and the measured effect of gating on a
+recorded clip, are in
+[`plugins/cairn-detect/README.md`](../plugins/cairn-detect/README.md#motion-gate).
 
 ### Host policy: the live set is bounded
 
