@@ -86,6 +86,19 @@ def load(path):
     return frames, skipped, dropped_objects
 
 
+def label_of(det):
+    """The detection's label as a table key: its string, else "?".
+
+    "?" covers a missing label and a non-string one (null, a number) alike.
+    `load()` only guarantees each object is a dict, and a `.get` default only
+    covers the missing case — an explicit `"label": null` would otherwise
+    become a None key that crashes the sorted union of two runs' tables,
+    where the sentinel just prints as itself.
+    """
+    label = det.get("label")
+    return label if isinstance(label, str) else "?"
+
+
 def analyze(frames):
     """Per-label: count (det instances), frame_hits (# frames with >=1 det
     of that label), scores (list), buckets (set of 1s pts buckets hit)."""
@@ -95,7 +108,7 @@ def analyze(frames):
         seen_labels_this_frame = set()
         bucket = pts // BUCKET_TICKS
         for det in objects:
-            label = det.get("label", "?")
+            label = label_of(det)
             score = det.get("score")
             entry = by_label.setdefault(
                 label, {"count": 0, "frame_hits": 0, "scores": [], "buckets": set()}
@@ -147,7 +160,7 @@ def duplicate_pairs(frames, threshold):
         for det in objects:
             box = det.get("bbox")
             if isinstance(box, list) and len(box) == 4 and all(map(number, box)):
-                by_label_boxes.setdefault(det.get("label", "?"), []).append(box)
+                by_label_boxes.setdefault(label_of(det), []).append(box)
         for label, boxes in by_label_boxes.items():
             for i in range(len(boxes)):
                 for j in range(i + 1, len(boxes)):
