@@ -1668,9 +1668,16 @@ defmodule Cairn.CameraTrackerTest do
          %{camera: camera, camera_id: id} do
       tracker = relay_tracker(id, :tracker_boxes_open)
 
+      # old→new: the refused box used to be a sub-floor cat. A box under the
+      # camera's `min_score` is now the tracker's stage two — it may match a
+      # live track but never mint one, so an unmatched one is dropped and never
+      # reaches `tagged` to be forwarded at all. A *predicted* cat is the same
+      # refusal this test is about (`evidence?/3` gates on `detected?/1`) and
+      # is still tracked, so the dense-capture rule still has something to
+      # carry.
       observe(tracker, camera, [
         object("person", 0.9, [0.1, 0.1, 0.2, 0.4]),
-        object("cat", 0.2, [0.6, 0.6, 0.1, 0.1])
+        object("cat", 0.9, [0.6, 0.6, 0.1, 0.1], "tracked")
       ])
 
       assert_receive {:extractor_started, %Event{camera_id: ^id}, _pid}
@@ -1688,9 +1695,52 @@ defmodule Cairn.CameraTrackerTest do
       assert is_binary(person_id) and String.length(person_id) == 26
       assert is_binary(cat_id) and cat_id != person_id
 
-      # the cat is under `min_score`, so it is in no way this event's evidence
-      # — the forwarded batch carrying it anyway is the dense-capture rule
+      # the cat is predicted, so it is in no way this event's evidence — the
+      # forwarded batch carrying it anyway is the dense-capture rule
       assert_receive {:event_started, %Event{labels: [%{object_id: ^person_id}]}}
+    end
+
+    # The tracker's stage two, end to end through the process that supplies the
+    # floor. Nothing emits sub-floor boxes today — the plugin's phase-4 flag is
+    # what turns them on — so this is the only place the host's half of that
+    # contract is exercised against a real camera's `min_score`.
+    #
+    # Deliberately not the same refusal as the test above, which the review
+    # found had been conflated with this one: that one carries a *predicted*
+    # box, refused by `detected?/1`, and this one a detected box refused by the
+    # score partition. A detection under the floor may take the track it
+    # overlaps and may not be evidence, and both halves are asserted here.
+    test "a below-floor detection keeps its track's identity without being evidence",
+         %{camera: camera, camera_id: id} do
+      tracker = relay_tracker(id, :tracker_boxes_low_conf)
+
+      observe(tracker, camera, [object("person", 0.9, @box)], at_ms: 1_000)
+
+      assert_receive {:extractor_started, %Event{camera_id: ^id}, _pid}
+      assert_receive {:event_started, %Event{camera_id: ^id}}
+
+      assert_receive {:extractor_got,
+                      {:"$gen_cast", {:track_boxes, %{boxes: [{oid, "person", @box, false}]}}}}
+
+      armed = token(tracker, :post_token)
+
+      # 0.3 against the camera's 0.5 floor, same label, same box: stage two's
+      # one power is to take a live track stage one left unmatched
+      observe(tracker, camera, [object("person", 0.3, @box)], at_ms: 1_500)
+
+      # the identity is retained — the same ULID reaches the extractor, which
+      # is what a low-confidence match is for
+      assert_receive {:extractor_got,
+                      {:"$gen_cast", {:track_boxes, %{boxes: [{^oid, "person", @box, false}]}}}}
+
+      assert [%Track{object_id: ^oid, best_score: 0.9}] = live_tracks(tracker)
+
+      # and it is not evidence: no `:updated` on the event, and the post window
+      # is the one the opening batch armed rather than a fresh one, so a stream
+      # of sub-floor boxes cannot hold an event open
+      :sys.get_state(tracker)
+      refute_received {:event_updated, %Event{camera_id: ^id}}
+      assert token(tracker, :post_token) == armed
     end
 
     # The flag the extractor's sidecar turns into a keyframe: `Cairn.TrackPath`

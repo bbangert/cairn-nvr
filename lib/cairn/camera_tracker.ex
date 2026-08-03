@@ -406,7 +406,19 @@ defmodule Cairn.CameraTracker do
   end
 
   defp process_detections(state, camera, policy, observation, control) do
-    context = Tracker.context(observation, camera.id, tracking_policy(policy))
+    # One binding, read twice: the tracker partitions this batch against the
+    # floor (below it a box may match a live track but never mint one), and
+    # `evidence?/3` below gates what may open an event on the same number. They
+    # have to be the same number — a box that may earn video but may not mint
+    # the track carrying it would be an event with no identity behind it.
+    min_score = effective_min_score(camera, control)
+
+    context =
+      Tracker.context(
+        observation,
+        camera.id,
+        Map.put(tracking_policy(policy), :min_score, min_score)
+      )
 
     {tracker, tagged, track_events} = Tracker.track(state.tracker, observation.objects, context)
 
@@ -436,7 +448,6 @@ defmodule Cairn.CameraTracker do
     # `Map.get/2` for the same reason as `tracking_policy/1`: `detections/3` is
     # a public entry point any caller can hand a bare map, and a missing key
     # has to read as an absent block rather than raise on this path.
-    min_score = effective_min_score(camera, control)
     record_tier = Map.get(policy, :record)
     passing = Enum.filter(tagged, &evidence?(&1, min_score, record_tier))
 

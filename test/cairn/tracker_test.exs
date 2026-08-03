@@ -84,7 +84,11 @@ defmodule Cairn.TrackerTest do
       observed_at: Keyword.get(opts, :observed_at, at(at_ms)),
       max_unseen_ms: Keyword.get(opts, :max_unseen_ms, @max_unseen),
       max_live_tracks: Keyword.get(opts, :max_live_tracks, 128),
-      stationary_after_ms: Keyword.get(opts, :stationary_after_ms, @stationary_after)
+      stationary_after_ms: Keyword.get(opts, :stationary_after_ms, @stationary_after),
+      # Absent by default, which is what every test above this line wants: no
+      # floor means no partition, so every object is stage one and association
+      # behaves as it did before there were stages.
+      min_score: Keyword.get(opts, :min_score)
     }
   end
 
@@ -444,12 +448,19 @@ defmodule Cairn.TrackerTest do
       assert [{:updated, %Track{stationary: true, stationary_ms: 1_000}}] = events
     end
 
+    # old→new: the drift used to be a frame-wide box marching to x = 2.0. Boxes
+    # are frame-normalized now — the motion filter's noise model is scaled by
+    # height as a fraction of the frame and its predicted widths and heights
+    # are capped at 1.0, so pixel-scale boxes stop matching (the origin is
+    # free; it is the dimensions that assume the frame). The same walk is
+    # scaled to stay in those units — every ratio the stillness rule reads is
+    # unchanged, the drift is still a tenth of the box's width per step.
     test "a slow drift never reads stationary, however long it runs" do
       # each box overlaps the one before it well past @stationary_iou, so a
       # rule that compared consecutive boxes would call this motionless
-      assert Tracker.iou([0.0, 0.0, 1.0, 1.0], [0.1, 0.0, 1.0, 1.0]) > 0.8
+      assert Tracker.iou([0.0, 0.35, 0.3, 0.3], [0.03, 0.35, 0.3, 0.3]) > 0.8
 
-      steps = for n <- 0..20, do: {n * 1_000, [n * 0.1, 0.0, 1.0, 1.0]}
+      steps = for n <- 0..20, do: {n * 1_000, [n * 0.03, 0.35, 0.3, 0.3]}
       {t, events} = feed_all(Tracker.new(), steps)
 
       # 20s of drift under a 10s threshold, and the anchor reset every time
@@ -1324,13 +1335,17 @@ defmodule Cairn.TrackerTest do
       refute still.stale_predicted
     end
 
-    # Pixel units and an exact ratio on purpose: 80/200 is 0.4 in binary
-    # floating point with nothing to round, so this is the one place in the
-    # suite where `>=` and `>` on the threshold give different answers.
+    # Exact ratios on purpose, so this is the one place in the suite where `>=`
+    # and `>` on the threshold give different answers. Every coordinate below
+    # is a dyadic rational, so both areas and the intersection are computed
+    # with nothing to round and the single division lands on `0.4` (and `0.35`)
+    # exactly — which is what the pixel-unit boxes this used to be written with
+    # bought, before the frame-normalized motion filter made pixel units
+    # unmatchable.
     test "the suppression threshold includes its own boundary" do
-      box = [640, 360, 20, 10]
-      exactly = [640, 360, 8, 10]
-      under = [640, 360, 7, 10]
+      box = [0.25, 0.25, 0.625, 0.25]
+      exactly = [0.25, 0.25, 0.25, 0.25]
+      under = [0.25, 0.25, 0.21875, 0.25]
 
       assert Tracker.iou(box, exactly) === 0.4
       assert Tracker.iou(box, under) === 0.35
@@ -1343,7 +1358,7 @@ defmodule Cairn.TrackerTest do
       assert tagged == []
       assert events == []
 
-      # the same tracker, one pixel of width less: below the threshold, so it
+      # the same tracker, a sliver of width less: below the threshold, so it
       # is a new object again
       {_t, [tagged], events} =
         track(t, [det("car", under)], at_ms: 14_000, observed_at: at(14_000))
@@ -1503,11 +1518,13 @@ defmodule Cairn.TrackerTest do
     # two tracks refusing the same box by the same margin, which one is marked
     # seen is decided by the sort key and never by map iteration order.
     test "an exact overlap tie between two refusing tracks is broken by id" do
-      # pixel units again: an exact tie has to survive being computed two ways,
-      # and 120/280 is one double however it is reached
-      left = [600, 360, 20, 10]
-      drift = [608, 360, 20, 10]
-      right = [616, 360, 20, 10]
+      # dyadic coordinates again: an exact tie has to survive being computed
+      # two ways, and 3/7 out of these is one double however it is reached
+      # (old→new: the same three boxes scaled out of pixel units into the
+      # frame-normalized ones the motion filter requires)
+      left = [0.125, 0.25, 0.3125, 0.125]
+      drift = [0.25, 0.25, 0.3125, 0.125]
+      right = [0.375, 0.25, 0.3125, 0.125]
 
       assert Tracker.iou(left, drift) === Tracker.iou(right, drift)
       assert_in_delta Tracker.iou(left, drift), 0.4286, 0.001
@@ -1666,26 +1683,33 @@ defmodule Cairn.TrackerTest do
     # IoU 0.905 with @box, 0.379 with @shift_2
     @shift_02 [0.02, 0.0, 0.4, 0.4]
 
-    # Pixel units and exact binary ratios, for the test that pins the stitch
-    # threshold to the bit rather than to a band. `@brick` is
-    # 1_000 x 1_000 and every box below sits wholly inside it, so the union is
-    # `@brick`'s own area and the overlap is exactly the fraction of it the box
-    # covers — the same trick the pixel-unit fixtures elsewhere in this file
-    # use, and the only way to write "one thousandth under the constant"
-    # without hoping a float lands where the arithmetic says.
-    @brick [0, 0, 1000, 1000]
-    # 400_000 / 1_000_000 = `@stitch_iou`
-    @brick_40 [0, 0, 500, 800]
-    # 399_000 / 1_000_000
-    @brick_399 [0, 0, 500, 798]
+    # Exact binary ratios, for the test that pins the stitch threshold to the
+    # bit rather than to a band. `@brick` is 1000/1024 of the frame wide and
+    # every box below sits wholly inside it, so the union is `@brick`'s own
+    # area and the overlap is exactly the fraction of it the box covers. Every
+    # width is a dyadic rational over 1024, so nothing rounds before the single
+    # division — the only way to write "one thousandth under the constant"
+    # without hoping a float lands where the arithmetic says. (old→new: this
+    # used to be a 1_000 x 1_000 pixel brick; boxes are frame-normalized now,
+    # because the motion filter's predicted dimensions are capped at the
+    # frame — a pixel-wide brick would coast at width 1.0 and stop matching
+    # itself. The origin is free; the dimensions are what assume the frame.)
+    @brick [0.0, 0.0, 0.9765625, 1.0]
+    # 400/1024 over 1000/1024 = `@stitch_iou`
+    @brick_40 [0.0, 0.0, 0.390625, 1.0]
+    # 399/1024 over 1000/1024
+    @brick_399 [0.0, 0.0, 0.3896484375, 1.0]
 
     # Small and tall, against the one 0.4 x 0.4 square the fixtures above
     # displace along x. `@stitch_iou`'s own reasoning is drawn from a
     # car-sized box a few pixels of drift wide, and nothing above is either
     # car-sized or displaced in y.
     #
-    # 0.05 x 0.04 nudged along *both* axes: IoU 3/7, over the floor
-    @small_car [0.40, 0.50, 0.05, 0.04]
+    # 0.05 x 0.04 nudged along *both* axes: IoU 3/7, over the floor. Named
+    # apart from the module's own `@small_car` deliberately: that one is a
+    # different box for a different rule, and a module attribute redefined
+    # halfway down a file silently changes meaning for everything after it.
+    @small_car_adopt [0.40, 0.50, 0.05, 0.04]
     @small_car_drift [0.41, 0.51, 0.05, 0.04]
     # `@walker` (0.10 x 0.30) nudged 0.04 down the frame: IoU 13/17, well over
     # the floor
@@ -2353,9 +2377,9 @@ defmodule Cairn.TrackerTest do
     end
 
     test "a small box is adopted, displaced in both axes" do
-      assert_in_delta Tracker.iou(@small_car, @small_car_drift), 3 / 7, 0.001
+      assert_in_delta Tracker.iou(@small_car_adopt, @small_car_drift), 3 / 7, 0.001
 
-      {t, id} = parked(@small_car, "car")
+      {t, id} = parked(@small_car_adopt, "car")
       {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
       {_t, [tagged], events} =
@@ -2420,5 +2444,273 @@ defmodule Cairn.TrackerTest do
     assert length(ids) == 40
     assert ids == Enum.sort(ids)
     assert ids == Enum.sort(Enum.map(tagged, & &1.object_id))
+  end
+
+  # A walker crossing the frame at a twentieth of it per batch, which at the
+  # 500 ms batches the coasting tests use is an ordinary pace. Every box is
+  # 0.1 x 0.1 and in frame throughout, so nothing there is testing the motion
+  # filter's clamps.
+  @mover_step 0.05
+  defp mover(n), do: [0.10 + n * @mover_step, 0.5, 0.1, 0.1]
+
+  # The motion filter of one live track: internal state, reachable nowhere else
+  # — `Cairn.Track` deliberately does not carry it.
+  defp filter(tracker, id), do: tracker.objects[id].kalman
+
+  # Five detected batches, enough for the filter to have a heading: the tracker
+  # at 2_000 with one track on `mover(4)`.
+  defp walked do
+    {tracker, id} =
+      Enum.reduce(0..4, {Tracker.new(), nil}, fn n, {tracker, id} ->
+        {tracker, [tagged], _events} =
+          track(tracker, [det("person", mover(n))], at_ms: n * 500, observed_at: at(n * 500))
+
+        {tracker, id || tagged.object_id}
+      end)
+
+    {tracker, id}
+  end
+
+  describe "coasted predictions" do
+    test "a mover is matched through a gap the frozen box would have lost it in" do
+      {t, id} = walked()
+
+      # two batches nothing detected it in: the track is untouched, so its
+      # filter coasts once each
+      {t, [], []} = track(t, [], at_ms: 2_500, observed_at: at(2_500))
+      {t, [], []} = track(t, [], at_ms: 3_000, observed_at: at(3_000))
+
+      # where the walk had got to by then, and nowhere near where the track's
+      # box was frozen: the pre-Kalman matcher compared this with mover(4) and
+      # had nothing to match, so the walker would have minted a second identity
+      resumed = mover(7)
+      assert Tracker.iou(mover(4), resumed) < 0.1
+
+      {t, [tagged], events} = track(t, [det("person", resumed)], at_ms: 3_500)
+
+      assert tagged.object_id == id
+      assert ids(events, :started) == []
+      assert [%Track{object_id: ^id, bbox: ^resumed}] = Tracker.live_tracks(t)
+    end
+
+    test "a seeded stretch holds the filter exactly, mean and covariance" do
+      {t, id} = walked()
+      held = filter(t, id)
+
+      # four seeded batches, each matched by the track it belongs to: the
+      # plugin re-reporting a sighting it already made is not an observation of
+      # motion, so nothing about the filter may move
+      t =
+        Enum.reduce(1..4, t, fn n, t ->
+          {t, [tagged], _events} =
+            track(t, [det("person", mover(4), kind: "tracked")],
+              at_ms: 2_000 + n * 500,
+              observed_at: at(2_000 + n * 500)
+            )
+
+          assert tagged.object_id == id
+          t
+        end)
+
+      assert filter(t, id) == held
+    end
+
+    test "a suspension is stitched against the last observed box, not the coasted one" do
+      {t, id} = walked()
+
+      {t, [], []} = track(t, [], at_ms: 2_500, observed_at: at(2_500))
+      {t, [], []} = track(t, [], at_ms: 3_000, observed_at: at(3_000))
+      {t, [], _info} = Tracker.suspend(t, 128, 3_000)
+
+      # where the coast had reached — over half a box past the last sighting,
+      # and the box a matcher that stitched against predictions would have
+      # taken the identity for
+      coasted = mover(7)
+      assert Tracker.iou(mover(4), coasted) == 0.0
+
+      {minted, [tagged], events} =
+        track(t, [det("person", coasted)], epoch: "epoch_two", at_ms: 3_500)
+
+      assert ids(events, :adopted) == []
+      assert [{:started, %Track{object_id: other}}] = events
+      assert tagged.object_id == other
+      refute other == id
+      # still waiting out its window, which is what "not adopted" means here
+      assert [%Track{object_id: ^id}] = Tracker.suspended_tracks(minted)
+
+      # the same suspension, offered the box it was last actually seen at
+      {adopted, [tagged], events} =
+        track(t, [det("person", mover(4))], epoch: "epoch_two", at_ms: 3_500)
+
+      assert tagged.object_id == id
+      assert ids(events, :adopted) == [id]
+      assert ids(events, :started) == []
+      assert Tracker.suspended_count(adopted) == 0
+    end
+  end
+
+  describe "the low-confidence stage" do
+    @floor %{"default" => 0.5}
+    @below 0.3
+
+    test "a below-floor detection that matches nothing mints no track" do
+      {t, tagged, events} =
+        track(Tracker.new(), [det("person", [0.1, 0.1, 0.2, 0.4], score: @below)],
+          min_score: @floor
+        )
+
+      assert tagged == []
+      assert events == []
+      assert Tracker.live_tracks(t) == []
+    end
+
+    test "a per-label floor decides the stage, and a label without one falls back" do
+      dets = [
+        det("car", [0.1, 0.1, 0.2, 0.2], score: @below),
+        det("person", [0.6, 0.6, 0.2, 0.2], score: @below)
+      ]
+
+      # the car's own floor admits 0.3, the person falls back to "default"
+      {t, tagged, _events} =
+        track(Tracker.new(), dets, min_score: %{"default" => 0.5, "car" => 0.2})
+
+      assert [%{label: "car"}] = tagged
+      assert [%Track{label: "car"}] = Tracker.live_tracks(t)
+    end
+
+    test "a below-floor detection does not adopt a suspended track" do
+      box = [0.0, 0.0, 0.4, 0.4]
+      {t, id} = parked(box)
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
+
+      {t, tagged, events} =
+        track(t, [det("person", box, score: @below)],
+          epoch: "epoch_two",
+          at_ms: 11_000,
+          min_score: @floor
+        )
+
+      assert tagged == []
+      assert events == []
+      assert Tracker.live_tracks(t) == []
+      assert [%Track{object_id: ^id}] = Tracker.suspended_tracks(t)
+
+      # and the identity is still there to be resumed by a real detection
+      {_t, [tagged], events} =
+        track(t, [det("person", box)], epoch: "epoch_two", at_ms: 11_500, min_score: @floor)
+
+      assert tagged.object_id == id
+      assert ids(events, :adopted) == [id]
+    end
+
+    test "a below-floor detection updates the live track it matches, without moving best_score" do
+      box = [0.3, 0.3, 0.2, 0.2]
+
+      {t, [%{object_id: id}], _started} =
+        track(Tracker.new(), [det("person", box)], min_score: @floor)
+
+      {t, [tagged], events} =
+        track(t, [det("person", box, score: @below)],
+          at_ms: 500,
+          observed_at: at(500),
+          min_score: @floor
+        )
+
+      assert tagged.object_id == id
+      assert ids(events, :started) == []
+
+      # a real match, so liveness is refreshed and the weak score is the
+      # track's current one — but `best_score` is a running maximum, so the
+      # broadcast throttle's improvement bypass cannot be tripped by noise
+      assert [%Track{object_id: ^id, score: @below, best_score: 0.9} = live] =
+               Tracker.live_tracks(t)
+
+      assert live.last_seen_at == at(500)
+    end
+
+    # `@max_unseen` is 3_000 and `@stationary_unseen_factor` is 5, so a
+    # stationary track's grace runs from 13_000 to 25_000 and 14_000 is inside
+    # it — the same timing the "stationary grace" describe uses. Dyadic boxes,
+    # so both overlaps are exact: equal boxes offset by `d` sit at
+    # `(w - d) / (w + d)`, which is 0.6 at an eighth of the frame and 7/9 at a
+    # sixteenth.
+    test "stage two matches a track in grace at @stationary_match_iou, not the base threshold" do
+      parked_box = [0.25, 0.25, 0.5, 0.25]
+      mid = [0.375, 0.25, 0.5, 0.25]
+      near = [0.3125, 0.25, 0.5, 0.25]
+
+      assert Tracker.iou(parked_box, mid) == 0.6
+      assert_in_delta Tracker.iou(parked_box, near), 7 / 9, 0.001
+
+      {parked, id} = parked(parked_box, "car")
+
+      # 0.6 clears the base `@iou_threshold` many times over, so a stage two
+      # that read the base threshold would take this box and refresh the track.
+      # It reads `match_threshold/2` like stage one, so the grace refuses it —
+      # and being below the floor, the refusal is a drop and nothing else: no
+      # mint, and no mark, because suppression never sees it.
+      {refused, tagged, events} =
+        track(parked, [det("car", mid, score: @below)],
+          at_ms: 14_000,
+          observed_at: at(14_000),
+          min_score: @floor
+        )
+
+      assert tagged == []
+      assert events == []
+      assert [%Track{object_id: ^id, last_seen_at: unmoved}] = Tracker.live_tracks(refused)
+      assert unmoved == at(10_000)
+
+      # and the same weak box at an overlap the grace does accept is a real
+      # match: the identity is retained, liveness is refreshed, and the
+      # sub-floor score does not touch `best_score`
+      {matched, [tagged], events} =
+        track(parked, [det("car", near, score: @below)],
+          at_ms: 14_000,
+          observed_at: at(14_000),
+          min_score: @floor
+        )
+
+      assert tagged.object_id == id
+      assert ids(events, :started) == []
+
+      assert [%Track{object_id: ^id, bbox: ^near, best_score: 0.9} = live] =
+               Tracker.live_tracks(matched)
+
+      assert live.last_seen_at == at(14_000)
+    end
+
+    test "a below-floor leftover does not mark a track seen, where an above-floor one does" do
+      # the band the refusal case lives in: over `@duplicate_suppression_iou`
+      # (0.4) and under `@stationary_match_iou` (0.7), so the parked track in
+      # its extended grace refuses the box either way
+      assert_in_delta Tracker.iou(@parked_car, @car_drift), 0.5, 0.001
+
+      {parked, id} = parked(@parked_car, "car")
+
+      {weak, [], []} =
+        track(parked, [det("car", @car_drift, score: @below)],
+          at_ms: 14_000,
+          observed_at: at(14_000),
+          min_score: @floor
+        )
+
+      # dropped before suppression ever weighed it, so nothing about the track
+      # moved: sub-floor noise beside a live track may not hold it alive
+      assert [%Track{object_id: ^id, last_seen_at: last_seen}] = Tracker.live_tracks(weak)
+      assert last_seen == at(10_000)
+
+      # the same box above the floor is suppression's business, and a
+      # suppression is a sign of life
+      {strong, [], []} =
+        track(parked, [det("car", @car_drift)],
+          at_ms: 14_000,
+          observed_at: at(14_000),
+          min_score: @floor
+        )
+
+      assert [%Track{object_id: ^id, last_seen_at: at_14}] = Tracker.live_tracks(strong)
+      assert at_14 == at(14_000)
+    end
   end
 end

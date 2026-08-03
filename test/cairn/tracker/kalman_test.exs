@@ -24,13 +24,19 @@ defmodule Cairn.Tracker.KalmanTest do
 
   defp element(m, i, j), do: m |> Enum.at(i) |> Enum.at(j)
 
-  defp assert_inside_frame([x, y, w, h]) do
+  # What `predicted_bbox/1` promises, and the whole of it: a positive width and
+  # height no larger than the frame, and four finite numbers. The origin is
+  # deliberately unbounded — a prediction has to be able to follow an object
+  # out of shot, and a detection may legally overhang the frame edge — so a
+  # containment assertion here would pin a property the module does not have
+  # and must not acquire.
+  defp assert_positive_area([x, y, w, h]) do
     assert w > 0.0
     assert h > 0.0
-    assert x >= 0.0
-    assert y >= 0.0
-    assert x + w <= 1.0
-    assert y + h <= 1.0
+    assert w <= 1.0
+    assert h <= 1.0
+
+    Enum.each([x, y, w, h], &assert_finite/1)
   end
 
   defp assert_positive_shape(kf) do
@@ -39,7 +45,7 @@ defmodule Cairn.Tracker.KalmanTest do
     assert a > 0.0
     assert h > 0.0
 
-    assert_inside_frame(Kalman.predicted_bbox(kf))
+    assert_positive_area(Kalman.predicted_bbox(kf))
   end
 
   # Three separate ways a float can be garbage and still be a float, so
@@ -247,7 +253,7 @@ defmodule Cairn.Tracker.KalmanTest do
       assert floored == 1.0e-6
     end
 
-    test "a box coasted out of frame is handed back pinned to the far corner" do
+    test "a box coasted out of frame follows the object out, and its overlap decays" do
       # Ten observed steps establishing a heading of 0.03 per step towards the
       # bottom-right, then predict-only for long enough that the state's centre
       # is outside the image altogether.
@@ -256,33 +262,48 @@ defmodule Cairn.Tracker.KalmanTest do
           step(kf, centred(0.60 + 0.03 * k, 0.60 + 0.03 * k, 0.10, 0.20))
         end)
 
-      coasted =
-        Enum.reduce(1..20, established, fn _k, kf ->
-          kf = Kalman.predict(kf)
+      # A box the object was last seen near and that stays put, so the decay
+      # below is the prediction leaving rather than anything moving to meet it.
+      parked = centred(0.90, 0.90, 0.10, 0.20)
 
-          assert_inside_frame(Kalman.predicted_bbox(kf))
-          kf
+      {coasted, overlaps, corners} =
+        Enum.reduce(1..20, {established, [], []}, fn _k, {kf, overlaps, corners} ->
+          kf = Kalman.predict(kf)
+          [x, _y, w, h] = box = Kalman.predicted_bbox(kf)
+
+          # positive, bounded area at every step — what the overlap arithmetic
+          # downstream needs, and the whole of what this box promises
+          assert_positive_area(box)
+
+          {kf, [Cairn.Tracker.iou(box, parked) | overlaps], [{x, w} | corners]}
         end)
 
-      # The precondition that makes the clamp load-bearing rather than
-      # decorative: `clamp_state/1` deliberately leaves the centre free to
-      # leave the frame, and the mean says it did — both coordinates are past
-      # the far edge, so an unclamped corner would be handed out well outside
-      # the image rather than merely near its border.
+      # `clamp_state/1` deliberately leaves the centre free to leave the frame,
+      # and the mean says it did — both coordinates are past the far edge.
       [cx, cy, _a, _h | _velocities] = coasted.mean
 
       assert cx > 1.0
       assert cy > 1.0
 
-      # Slid back inside and pinned flush against the edge it left by, rather
-      # than truncated to nothing.
-      [x, y, w, h] = Kalman.predicted_bbox(coasted)
+      # And the handed-out box goes with it rather than being pinned flush
+      # against the edge: `x` is past the far corner a clamped origin would
+      # have stopped at, and it kept moving after it got there.
+      [{last_x, last_w} | _rest] = corners
+      assert last_x > 1.0 - last_w
 
-      assert x == 1.0 - w
-      assert y == 1.0 - h
+      origins = corners |> Enum.reverse() |> Enum.map(&elem(&1, 0))
+      assert origins == Enum.sort(origins)
+
+      # The point of letting it leave: overlap with an in-frame box decays to
+      # nothing instead of snapping to whatever the border would allow.
+      overlaps = Enum.reverse(overlaps)
+
+      assert List.first(overlaps) > 0.0
+      assert List.last(overlaps) == 0.0
+      assert overlaps == Enum.sort(overlaps, :desc)
     end
 
-    test "a box grown wider than the frame is capped and pinned to the origin" do
+    test "a box grown wider than the frame is capped at the frame's width" do
       # A height ramped to 0.9 at a fixed aspect ratio of 1.5, so the state's
       # own `a * h` ends up wider than the whole frame. The aspect ratio never
       # moves off the 1.5 the filter was seeded with — every measurement
@@ -293,24 +314,24 @@ defmodule Cairn.Tracker.KalmanTest do
           height = min(0.20 + 0.05 * k, 0.90)
           kf = step(kf, centred(0.50, 0.50, 1.5 * height, height))
 
-          assert_inside_frame(Kalman.predicted_bbox(kf))
+          assert_positive_area(Kalman.predicted_bbox(kf))
           kf
         end)
 
-      # The precondition that makes the clamp load-bearing rather than
-      # decorative: the state now believes in a box wider than the frame, so
-      # an uncapped width would put the box's right edge outside the image and
-      # an unpinned corner would put its left edge outside as well.
+      # The precondition that makes the cap load-bearing rather than
+      # decorative: the state now believes in a box wider than the whole frame,
+      # so an uncapped width would hand out a box with more area than the image
+      # has.
       [_cx, _cy, a, height | _velocities] = grown.mean
 
       assert a * height > 1.0
 
-      # Capped at the full frame width, which leaves `clamp_origin/2` no
-      # freedom at all: the only `x` a full-width box can have is zero.
-      [x, _y, w, _h] = Kalman.predicted_bbox(grown)
+      # Capped at the full frame width. The origin is not capped with it — it
+      # is wherever the centre puts a box of that width, which for a box
+      # centred at 0.5 is zero, and the assertion below is about the width.
+      [_x, _y, w, _h] = Kalman.predicted_bbox(grown)
 
       assert w == 1.0
-      assert x == 0.0
     end
   end
 
@@ -345,7 +366,7 @@ defmodule Cairn.Tracker.KalmanTest do
         assert_in_delta element(kf.covariance, i, j), element(kf.covariance, j, i), 1.0e-9
       end
 
-      assert_inside_frame(Kalman.predicted_bbox(kf))
+      assert_positive_area(Kalman.predicted_bbox(kf))
     end
   end
 end

@@ -57,10 +57,21 @@ defmodule Cairn.Tracker.Kalman do
   ## Units
 
   Boxes are `[x, y, w, h]` **normalized to the frame**, `x, y` the top-left
-  corner, every value in `0..1` — the same convention as `Cairn.Tracker.iou/2`
-  and everything else the host passes around. `predicted_bbox/1` returns a box
-  in that convention and clamps it to the frame, so a degenerate state cannot
-  produce a box that is inverted, empty or partly outside the image.
+  corner — the same convention as `Cairn.Tracker.iou/2` and everything else the
+  host passes around. Widths and heights are fractions of the frame and so lie
+  in `0..1`; a corner is not bounded the same way, because a detection may
+  legally overhang the frame edge and an object halfway out of shot does.
+
+  `predicted_bbox/1` keeps to exactly that. It returns a box whose width and
+  height are positive and no larger than the frame, and whose origin is free.
+  The dimensions are bounded because the only thing that consumes a prediction
+  is overlap arithmetic, which needs a box with area. The origin is not,
+  because a prediction's whole job is to follow the object: an object walking
+  out of shot is somewhere the frame does not contain, and sliding its box back
+  inside would make the filter insist it was still at the edge — its overlap
+  with whatever is really there would snap to the border instead of decaying to
+  nothing as it leaves, and a track whose own box overhangs the edge would stop
+  matching itself.
   """
 
   # ByteTrack's shipped weights, unchanged from DeepSORT: position noise at
@@ -225,32 +236,37 @@ defmodule Cairn.Tracker.Kalman do
 
   @doc """
   Where the filter currently believes the box is, as a frame-normalized
-  `[x, y, w, h]` clamped to lie inside the frame.
+  `[x, y, w, h]` with positive, bounded dimensions and a free origin.
 
   Subject to the cardinal rule in the module doc: this is a matching input, not
   a box any caller may store or emit.
 
-  The clamping is not cosmetic. `w` comes out of the state as `a * h`, a
-  product of two estimates either of which a run of bad measurements can drive
-  towards zero, and what consumes this box is overlap arithmetic that assumes
-  a box with area inside the frame — `Cairn.Tracker.iou/2` returns a flat `0.0`
-  for anything with none, so a degenerate prediction would quietly match
-  nothing rather than fail where it could be seen. Width and height
-  are floored first so the box cannot be empty or inverted, then the corner is
-  clamped so a box whose centre has drifted off-screen slides back inside
-  rather than being truncated to nothing.
+  Bounding the dimensions is not cosmetic. `w` comes out of the state as
+  `a * h`, a product of two estimates either of which a run of bad measurements
+  can drive towards zero, and what consumes this box is overlap arithmetic that
+  assumes a box with area — `Cairn.Tracker.iou/2` returns a flat `0.0` for
+  anything with none, so a degenerate prediction would quietly match nothing
+  rather than fail where it could be seen. Width and height are therefore
+  floored away from zero and capped at the frame, and that is the whole of what
+  the arithmetic downstream needs.
+
+  The corner is left exactly where the state puts it, which is the other half
+  of the same decision `clamp_state/1` makes: the centre is deliberately free
+  to leave the frame, and pinning the box back inside at the moment it is
+  handed out would undo that at the one point where anything reads it. A
+  prediction that has followed a departing object out of shot overlaps the
+  in-frame boxes less and less until it overlaps nothing, which is the right
+  end for a track of something that has gone; a pinned one would sit against
+  the border claiming otherwise. It matters for arrivals too — a detection is
+  allowed to overhang the frame edge, so a track holding such a box has to be
+  able to match its own prediction.
   """
   @spec predicted_bbox(t()) :: [float()]
   def predicted_bbox(%__MODULE__{mean: [cx, cy, a, h | _velocities]}) do
     height = clamp_dimension(h)
     width = clamp_dimension(a * height)
 
-    [
-      clamp_origin(cx - width / 2, width),
-      clamp_origin(cy - height / 2, height),
-      width,
-      height
-    ]
+    [cx - width / 2, cy - height / 2, width, height]
   end
 
   # -- state and box conversions ----------------------------------------------
@@ -276,8 +292,10 @@ defmodule Cairn.Tracker.Kalman do
   # Only the two shape states are clamped. The centre is deliberately left free
   # to leave the frame: an object walking out of shot has a centre outside
   # `0..1` and pinning it at the edge would make the filter insist the object
-  # is still there. `predicted_bbox/1` does the clamping the frame needs, at
-  # the point where a box is handed out.
+  # is still there. `predicted_bbox/1` carries that freedom all the way to the
+  # caller — it bounds the two dimensions, which overlap arithmetic needs, and
+  # leaves the corner alone, which is the only reason the freedom here is worth
+  # anything.
   @spec clamp_state([float()]) :: [float()]
   defp clamp_state([cx, cy, a, h, vcx, vcy, va, vh]) do
     [cx, cy, max(a, @min_dim), max(h, @min_dim), vcx, vcy, va, vh]
@@ -285,9 +303,6 @@ defmodule Cairn.Tracker.Kalman do
 
   @spec clamp_dimension(float()) :: float()
   defp clamp_dimension(value), do: value |> max(@min_dim) |> min(1.0)
-
-  @spec clamp_origin(float(), float()) :: float()
-  defp clamp_origin(value, size), do: value |> max(0.0) |> min(1.0 - size)
 
   # -- noise ------------------------------------------------------------------
 
