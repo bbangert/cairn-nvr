@@ -2,7 +2,8 @@
 //!
 //! See `docs/plugin-contract.md`. Cairn appends the arguments of one of the
 //! two contract variants to whatever command it is configured with; the model
-//! flags come from that configured command.
+//! flags and the motion gate's `--motion-json` come from that configured
+//! command, which is why the gate needs no host change to reach either mode.
 //!
 //!   * per-camera: `--camera-id`, `--udp-port`, `--min-score-json` — one
 //!     process per camera, and any stream failure is fatal so Cairn restarts
@@ -41,6 +42,7 @@ mod emit;
 mod glibc_compat;
 mod hwdecode;
 mod infer;
+mod motion;
 mod multiplex;
 mod rtp;
 
@@ -57,6 +59,7 @@ use control::Streams;
 use decode::{DecoderKind, Sample};
 use emit::Publisher;
 use infer::{Detector, InputSize, Labels, ModelProfile, ScoreFloors};
+use motion::MotionOverrides;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -84,10 +87,22 @@ struct Args {
     #[arg(long, conflicts_with = "cameras_json")]
     min_score_json: Option<String>,
 
-    /// JSON array of `{id, udp_port, min_score}` — serve a whole plugin group
-    /// from this one process instead of a single camera.
+    /// JSON array of `{id, udp_port, min_score, motion}` — serve a whole
+    /// plugin group from this one process instead of a single camera.
     #[arg(long)]
     cameras_json: Option<String>,
+
+    /// JSON object of motion-gate knobs: `enabled` (default false),
+    /// `threshold`, `min_area_fraction`, `alpha`, `linger_ms`,
+    /// `epoch_bypass_ms`, `reverify_ms`.
+    ///
+    /// Unlike `--min-score-json` this does *not* conflict with
+    /// `--cameras-json`: the gate is the operator's own setting, written into
+    /// the configured command rather than appended by Cairn, so it has to be
+    /// expressible in both modes. In group mode it is the default for every
+    /// member, and a member's own `motion` key overrides the knobs it names.
+    #[arg(long)]
+    motion_json: Option<String>,
 
     /// ONNX detection model: a yolox, rfdetr, yolov10/yolo26 or
     /// yolov8/yolov9/yolo11 head.
@@ -159,6 +174,10 @@ fn start_control<'a>(camera_ids: impl IntoIterator<Item = &'a str>) -> Result<Ar
 /// One process, a whole plugin group: see [`multiplex`] for the error policy.
 fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
     let specs = multiplex::parse_specs(cameras_json)?;
+    // Both argument checks before the control thread and the model load: a
+    // malformed argument is a start-up failure the operator should see
+    // immediately, not seconds of ONNX later.
+    let motion = motion_overrides(args)?;
     let streams = start_control(specs.iter().map(|spec| spec.id.as_str()))?;
     // No `camera_id`: this is the process talking, and the group host applies
     // an untargeted status to every member.
@@ -190,10 +209,17 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
     multiplex::run(
         &specs,
         args.decoder,
+        &motion,
         detector,
         &labels,
         Publisher::new(streams),
     )
+}
+
+/// The process-wide `--motion-json` knobs, defaulting to "every knob at its
+/// default", which is a gate that is off.
+fn motion_overrides(args: &Args) -> Result<MotionOverrides> {
+    MotionOverrides::parse(args.motion_json.as_deref().unwrap_or("{}"))
 }
 
 /// One process, one camera. Any stream failure is fatal by design: Cairn
@@ -215,6 +241,8 @@ fn run_single(args: &Args) -> Result<()> {
     ))?;
 
     let floors = ScoreFloors::parse(args.min_score_json.as_deref().unwrap_or("{}"))?;
+    // One camera, so there is nothing to override the process-wide knobs with.
+    let motion = motion::resolve(&motion_overrides(args)?, &MotionOverrides::default());
     let labels = Labels::load(args.labels.as_deref())?;
     // Before the stream opens: `decode::open` below needs the resolved size.
     let detector = Detector::open(
@@ -253,7 +281,7 @@ fn run_single(args: &Args) -> Result<()> {
         let stream = &input.streams()[stream_index];
         (
             stream.time_base,
-            decode::open(args.decoder, &stream.codecpar(), input_spec)?,
+            decode::open(args.decoder, &stream.codecpar(), input_spec, motion)?,
         )
     };
 
@@ -358,6 +386,44 @@ mod tests {
         assert!(parse(&["--cameras-json", "[]", "--camera-id", "front"]).is_err());
         assert!(parse(&["--cameras-json", "[]", "--udp-port", "17000"]).is_err());
         assert!(parse(&["--cameras-json", "[]", "--min-score-json", "{}"]).is_err());
+    }
+
+    #[test]
+    fn the_motion_gate_is_configurable_in_both_forms() {
+        // The one flag that belongs to the operator rather than to Cairn's
+        // contract, so unlike --min-score-json it has to survive next to
+        // --cameras-json.
+        let knobs = r#"{"enabled":true,"threshold":30}"#;
+        let group = parse(&["--cameras-json", "[]", "--motion-json", knobs]).unwrap();
+        assert_eq!(group.motion_json.as_deref(), Some(knobs));
+        let single = parse(&[
+            "--camera-id",
+            "front",
+            "--udp-port",
+            "17000",
+            "--motion-json",
+            knobs,
+        ])
+        .unwrap();
+        assert_eq!(single.motion_json.as_deref(), Some(knobs));
+    }
+
+    #[test]
+    fn the_gate_defaults_to_off_and_a_bad_knob_never_reaches_a_decode_thread() {
+        let base = &["--camera-id", "front", "--udp-port", "17000"];
+        let bare = parse(base).unwrap();
+        assert!(bare.motion_json.is_none());
+        let overrides = motion_overrides(&bare).unwrap();
+        assert!(motion::resolve(&overrides, &MotionOverrides::default()).is_none());
+
+        let with = |knobs: &str| {
+            let mut argv = base.to_vec();
+            argv.extend_from_slice(&["--motion-json", knobs]);
+            motion_overrides(&parse(&argv).unwrap())
+        };
+        assert!(with(r#"{"enabled":true}"#).is_ok());
+        assert!(with(r#"{"alpha":0}"#).is_err());
+        assert!(with(r#"{"nonsense":1}"#).is_err());
     }
 
     #[test]

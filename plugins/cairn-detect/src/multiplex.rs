@@ -26,6 +26,7 @@ use serde::Deserialize;
 use crate::decode::{self, DecoderKind, Sample, SampleSink};
 use crate::emit::{self, Publisher};
 use crate::infer::{Detector, InputSpec, Labels, ScoreFloors};
+use crate::motion::{self, MotionConfig, MotionOverrides};
 use crate::rtp;
 
 /// First wait after a stream drops, doubled up to [`REOPEN_MAX`].
@@ -35,7 +36,8 @@ const REOPEN_MAX: Duration = Duration::from_secs(30);
 /// starts over at [`REOPEN_MIN`] rather than inheriting a dark camera's wait.
 const HEALTHY_RUN: Duration = Duration::from_secs(60);
 
-/// One group member, as Cairn writes it into `--cameras-json`.
+/// One group member, as Cairn writes it into `--cameras-json` — plus `motion`,
+/// which Cairn does not write and an operator can add by hand.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CameraSpec {
     pub id: String,
@@ -43,12 +45,17 @@ pub struct CameraSpec {
     /// Same shape as `--min-score-json`; absent means "all defaults".
     #[serde(default)]
     pub min_score: HashMap<String, f64>,
+    /// Motion-gate knobs for this member alone, overriding the process-wide
+    /// `--motion-json`. Absent — which is what Cairn writes today — means the
+    /// member takes the global settings unchanged.
+    #[serde(default)]
+    pub motion: MotionOverrides,
 }
 
 /// Decode the `--cameras-json` argument.
 pub fn parse_specs(json: &str) -> Result<Vec<CameraSpec>> {
     let specs: Vec<CameraSpec> = serde_json::from_str(json)
-        .context("--cameras-json is not a JSON array of {id, udp_port, min_score}")?;
+        .context("--cameras-json is not a JSON array of {id, udp_port, min_score, motion}")?;
     if specs.is_empty() {
         bail!("--cameras-json is empty; a group serves at least one camera");
     }
@@ -57,6 +64,12 @@ pub fn parse_specs(json: &str) -> Result<Vec<CameraSpec>> {
         if !seen.insert(spec.id.as_str()) {
             bail!("--cameras-json repeats camera id {}", spec.id);
         }
+        // Checked here rather than where the gate is built, so an out-of-range
+        // knob fails the whole group at startup instead of one member's decode
+        // thread minutes later.
+        spec.motion
+            .validate()
+            .with_context(|| format!("--cameras-json camera {}", spec.id))?;
     }
     Ok(specs)
 }
@@ -69,28 +82,40 @@ pub fn floors_for(specs: &[CameraSpec]) -> Vec<ScoreFloors> {
         .collect()
 }
 
+/// Resolved motion gate per member, in the same order as `specs`. `None` for a
+/// member whose gate ends up disabled, which is the default.
+pub fn motion_for(specs: &[CameraSpec], global: &MotionOverrides) -> Vec<Option<MotionConfig>> {
+    specs
+        .iter()
+        .map(|spec| motion::resolve(global, &spec.motion))
+        .collect()
+}
+
 /// Run every member's stream through one detector until inference fails.
 pub fn run(
     specs: &[CameraSpec],
     kind: DecoderKind,
+    motion: &MotionOverrides,
     detector: Detector,
     labels: &Labels,
     publisher: Publisher,
 ) -> Result<()> {
     let floors = floors_for(specs);
+    let motion = motion_for(specs, motion);
     // One resolved spec for the whole group: the members share the detector,
     // so they share the geometry, the encoding *and* the resize policy every
     // decoder has to produce.
     let input_spec = detector.input_spec();
     let mut slots = Vec::with_capacity(specs.len());
 
-    for spec in specs {
+    for (index, spec) in specs.iter().enumerate() {
         let (slot, sink) = slot_pair::<Sample>();
         slots.push(slot);
         let owned = spec.clone();
+        let motion = motion[index];
         thread::Builder::new()
             .name(format!("stream-{}", spec.id))
-            .spawn(move || stream_loop(&owned, kind, input_spec, &sink))
+            .spawn(move || stream_loop(&owned, kind, input_spec, motion, &sink))
             .with_context(|| format!("spawning the decode thread for camera {}", spec.id))?;
     }
 
@@ -107,6 +132,7 @@ fn stream_loop(
     spec: &CameraSpec,
     kind: DecoderKind,
     input_spec: InputSpec,
+    motion: Option<MotionConfig>,
     sink: &LatestSink<Sample>,
 ) {
     let mut delay = REOPEN_MIN;
@@ -114,7 +140,7 @@ fn stream_loop(
 
     loop {
         let started = Instant::now();
-        let outcome = open_and_run(spec, kind, input_spec, sink);
+        let outcome = open_and_run(spec, kind, input_spec, motion, sink);
         if started.elapsed() >= HEALTHY_RUN {
             failures = 0;
             delay = REOPEN_MIN;
@@ -143,6 +169,7 @@ fn open_and_run(
     spec: &CameraSpec,
     kind: DecoderKind,
     input_spec: InputSpec,
+    motion: Option<MotionConfig>,
     sink: &LatestSink<Sample>,
 ) -> Result<()> {
     let mut input = rtp::open_stream_once(spec.udp_port)?;
@@ -154,7 +181,7 @@ fn open_and_run(
         let stream = &input.streams()[stream_index];
         (
             stream.time_base,
-            decode::open(kind, &stream.codecpar(), input_spec)
+            decode::open(kind, &stream.codecpar(), input_spec, motion)
                 .with_context(|| format!("opening a decoder for camera {}", spec.id))?,
         )
     };
@@ -351,6 +378,47 @@ mod tests {
         assert!(parse_specs(r#"[{"id":"a","udp_port":170000}]"#).is_err());
         // min_score must stay label -> number
         assert!(parse_specs(r#"[{"id":"a","udp_port":1,"min_score":{"p":"high"}}]"#).is_err());
+    }
+
+    #[test]
+    fn the_motion_key_is_optional_and_overrides_the_group_default() {
+        let specs = parse_specs(
+            r#"[{"id":"front","udp_port":17000,"motion":{"threshold":10}},
+                {"id":"drive","udp_port":17004}]"#,
+        )
+        .unwrap();
+        let global = MotionOverrides::parse(r#"{"enabled":true,"threshold":40}"#).unwrap();
+
+        let motion = motion_for(&specs, &global);
+        assert_eq!(motion[0].unwrap().threshold, 10, "the member's own value");
+        assert_eq!(motion[1].unwrap().threshold, 40, "the group default");
+
+        // ...and with no --motion-json the gate is off for every member, own
+        // knobs or not.
+        assert_eq!(
+            motion_for(&specs, &MotionOverrides::default()),
+            vec![None, None]
+        );
+    }
+
+    #[test]
+    fn a_member_can_switch_its_own_gate_on() {
+        let specs =
+            parse_specs(r#"[{"id":"a","udp_port":17000,"motion":{"enabled":true}}]"#).unwrap();
+        assert!(motion_for(&specs, &MotionOverrides::default())[0].is_some());
+    }
+
+    #[test]
+    fn rejects_out_of_range_member_motion_knobs() {
+        // Refused for the whole group at startup, naming the member: one
+        // camera's typo must not surface as that camera's decode thread
+        // behaving oddly later.
+        let err = parse_specs(r#"[{"id":"driveway","udp_port":1,"motion":{"alpha":2.0}}]"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("camera driveway"), "{err}");
+        assert!(parse_specs(r#"[{"id":"a","udp_port":1,"motion":{"threshold":0}}]"#).is_err());
+        assert!(parse_specs(r#"[{"id":"a","udp_port":1,"motion":{"thresh":10}}]"#).is_err());
     }
 
     #[test]

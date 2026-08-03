@@ -7,6 +7,16 @@
 //! expensive — scale, pixel-format convert, and for the hardware paths the
 //! download out of GPU memory — happens there, so a hardware decoder never
 //! pays for the ~55 fps of frames it is about to discard.
+//!
+//! One thing that happens there is *not* about feeding the model: when the
+//! motion gate is configured, [`RgbScaler::tensor_from`] also downsamples the
+//! scaled frame to a [`crate::motion::GrayThumb`] and compares it against that
+//! camera's background. That is deliberate cheap work at this layer — one pass
+//! over the content rect, into a few-thousand-pixel thumbnail, on a frame
+//! already in system memory, next to the megapixel scale immediately above it —
+//! and it is here because this is the only place in the process holding
+//! pixels. What it measures is carried out on [`Sample`], and
+//! what to *do* about it is decided on the inference thread.
 
 use std::fmt;
 use std::slice;
@@ -25,6 +35,7 @@ use rsmpeg::UnsafeDerefMut;
 
 use crate::hwdecode::{HwBackend, HwDecoder};
 use crate::infer::{Fit, InputSize, InputSpec, Projection};
+use crate::motion::{GrayThumb, MotionConfig, MotionDetector, MotionVerdict};
 
 pub const SAMPLE_FPS: u32 = 5;
 
@@ -63,7 +74,31 @@ pub struct Sample {
     /// because a sample can wait behind a busy model pass, and the host uses
     /// this to place the frame on its timeline, not to measure our latency.
     pub observed_at: SystemTime,
+    /// How much of the picture differs from this camera's rolling-average
+    /// background — not from the previous sample — or `None` when the motion
+    /// gate is not configured for it.
+    ///
+    /// Measured on the decode thread because that is where the pixels are;
+    /// carried here because the inference thread is the only place that knows
+    /// which camera a sample came from.
+    // Wired ahead of its consumer: nothing reads this yet, and `-D warnings`
+    // makes an unread field fatal. Delete this allow once the gate policy
+    // reads the verdict.
+    #[allow(dead_code)]
+    pub motion: Option<MotionVerdict>,
     pub input: ModelInput,
+}
+
+/// Everything one sampled frame produced, on its way to a [`Sample`].
+///
+/// A pair rather than a third field on [`ModelInput`]: that type's two halves
+/// are two halves of a single decision (see its doc), while the motion verdict
+/// is an independent measurement that merely shares the frame they were
+/// derived from.
+pub struct Sampled {
+    pub input: ModelInput,
+    /// `None` when the motion gate is not configured for this camera.
+    pub motion: Option<MotionVerdict>,
 }
 
 /// One frame as the model takes it, plus the way back out.
@@ -113,13 +148,16 @@ pub trait Decoder: Send {
     /// Next decoded frame, or `None` when the decoder wants more input.
     fn receive_frame(&mut self) -> Result<Option<AVFrame>>;
 
-    /// Scale and convert a sampled frame into the model input tensor.
+    /// Scale and convert a sampled frame into the model input tensor, and
+    /// measure its motion on the way when the gate is configured.
     ///
     /// Takes ownership because the hardware path feeds the frame straight
     /// into a filter graph, which consumes it. `Ok(None)` means "no tensor
     /// for this frame, try the next one" — a filter graph that has not
-    /// produced output yet is not an error.
-    fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<ModelInput>>;
+    /// produced output yet is not an error. A skipped frame is skipped by the
+    /// motion detector too: it never reaches the background, which is
+    /// unchanged by it.
+    fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<Sampled>>;
 }
 
 /// A decoded frame's own geometry, which is what a projection is built from.
@@ -158,17 +196,22 @@ const MAX_PIXELS: i64 = 32 * 1024 * 1024;
 /// always the last resort, including when `--decoder <hw>` names a backend
 /// explicitly. Crash-looping on a box without the hardware would be worse
 /// than running slowly on it.
+/// `motion` is one camera's resolved gate config, or `None` when the gate is
+/// off for it — see [`crate::motion::resolve`]. It reaches the decoder rather
+/// than the inference thread because the detector's state is per camera, and
+/// one decoder is what "per camera" means on this side in both modes.
 pub fn open(
     kind: DecoderKind,
     codecpar: &AVCodecParameters,
     spec: InputSpec,
+    motion: Option<MotionConfig>,
 ) -> Result<Box<dyn Decoder>> {
     let order = probe_order(kind);
     if order.is_empty() && kind != DecoderKind::Sw && kind != DecoderKind::Auto {
         eprintln!("decoder {kind} is not available on this platform");
     }
     for backend in order {
-        match HwDecoder::open(backend, codecpar, spec) {
+        match HwDecoder::open(backend, codecpar, spec, motion) {
             Ok(decoder) => return Ok(Box::new(decoder)),
             Err(e) => eprintln!("hardware decoder {backend} unavailable: {e:#}"),
         }
@@ -176,7 +219,7 @@ pub fn open(
     if kind != DecoderKind::Sw {
         eprintln!("no hardware decoder opened; falling back to software decode");
     }
-    Ok(Box::new(SwDecoder::open(codecpar, spec)?))
+    Ok(Box::new(SwDecoder::open(codecpar, spec, motion)?))
 }
 
 /// Backends to try, in order, for a given `--decoder` value.
@@ -219,11 +262,18 @@ const AUTO_ORDER: &[HwBackend] = &[];
 ///
 /// Shared by both paths: the hardware path scales on the GPU and downloads
 /// NV12 already at the model's size, then lands here for the NV12 -> RGB24
-/// conversion.
+/// conversion. Because both paths converge on this one RGB24 frame, it is
+/// also where the motion gate reads from, which is why a scaler owns a
+/// camera's motion state as well as its scaler state.
 pub struct RgbScaler {
     spec: InputSpec,
     /// Rebuilt if the source ever changes geometry or pixel format mid-run.
     target: Option<Target>,
+    /// The motion gate's frame-to-frame state, when it is configured. One
+    /// scaler belongs to one decoder belongs to one camera, so this is
+    /// per-camera by construction rather than by a lookup that could go wrong
+    /// in group mode.
+    motion: Option<MotionDetector>,
 }
 
 /// Everything settled by one (source geometry, pixel format) pair.
@@ -238,8 +288,12 @@ struct Target {
 }
 
 impl RgbScaler {
-    pub fn new(spec: InputSpec) -> Result<Self> {
-        Ok(Self { spec, target: None })
+    pub fn new(spec: InputSpec, motion: Option<MotionConfig>) -> Result<Self> {
+        Ok(Self {
+            spec,
+            target: None,
+            motion: motion.map(MotionDetector::new),
+        })
     }
 
     /// `source` is the geometry of the frame as the *camera* sent it, which is
@@ -283,7 +337,7 @@ impl RgbScaler {
         Ok(())
     }
 
-    pub fn tensor_from(&mut self, frame: &AVFrame, source: InputSize) -> Result<ModelInput> {
+    pub fn tensor_from(&mut self, frame: &AVFrame, source: InputSize) -> Result<Sampled> {
         let height = frame.height;
         self.ensure_target(frame, source)?;
         let target = self.target.as_mut().expect("target was just set");
@@ -300,9 +354,30 @@ impl RgbScaler {
         let plane = unsafe {
             slice::from_raw_parts(target.rgb.data[0] as *const u8, stride * target.fit.inner.h)
         };
-        Ok(ModelInput {
-            tensor: pack_chw(plane, stride, target.fit, self.spec),
-            projection: target.fit.projection(source),
+        // This RGB24 frame is the motion gate's source because it is the one
+        // representation both decode paths converge on: the hardware path has
+        // already scaled on the GPU, downloaded NV12 and converted it here, so
+        // measuring from it gives a camera the same sensitivity whichever
+        // decoder happened to open. It is also `fit.inner` — the *content*
+        // rectangle — so no letterbox padding is ever averaged into a
+        // background as if it were picture.
+        //
+        // The hardware path's NV12 Y plane is strictly cheaper (a ready-made
+        // luma plane, no RGB conversion, no weighting) and is deliberately not
+        // used: it exists on that path only, which would make the gate's
+        // sensitivity depend on the decoder, and this dev container has no GPU
+        // to test that path on. It stays a documented non-goal until it can be
+        // exercised — `hwdecode::HwBackend::filter_spec` is where that plane
+        // is produced.
+        let motion = self.motion.as_mut().map(|detector| {
+            detector.observe(&GrayThumb::from_rgb24(plane, stride, target.fit.inner))
+        });
+        Ok(Sampled {
+            input: ModelInput {
+                tensor: pack_chw(plane, stride, target.fit, self.spec),
+                projection: target.fit.projection(source),
+            },
+            motion,
         })
     }
 }
@@ -313,7 +388,11 @@ struct SwDecoder {
 }
 
 impl SwDecoder {
-    fn open(codecpar: &AVCodecParameters, spec: InputSpec) -> Result<Self> {
+    fn open(
+        codecpar: &AVCodecParameters,
+        spec: InputSpec,
+        motion: Option<MotionConfig>,
+    ) -> Result<Self> {
         let codec = AVCodec::find_decoder(codecpar.codec_id)
             .ok_or_else(|| anyhow!("no decoder for codec id {}", codecpar.codec_id))?;
         let mut ctx = AVCodecContext::new(&codec);
@@ -325,7 +404,7 @@ impl SwDecoder {
         eprintln!("decoder: software ({})", codec.name().to_string_lossy());
         Ok(Self {
             ctx,
-            rgb: RgbScaler::new(spec)?,
+            rgb: RgbScaler::new(spec, motion)?,
         })
     }
 }
@@ -349,7 +428,7 @@ impl Decoder for SwDecoder {
         }
     }
 
-    fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<ModelInput>> {
+    fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<Sampled>> {
         let source = source_size(&frame)?;
         self.rgb.tensor_from(&frame, source).map(Some)
     }
@@ -452,8 +531,8 @@ pub fn run(
             // sws has no path for a mid-stream format change, a filter graph
             // rebuild can fail transiently, and restarting is expensive (model
             // load plus up to a minute of open retries).
-            let input = match decoder.to_tensor(frame) {
-                Ok(Some(input)) => input,
+            let Sampled { input, motion } = match decoder.to_tensor(frame) {
+                Ok(Some(sampled)) => sampled,
                 Ok(None) => continue,
                 Err(e) => {
                     note_error(&mut tensor_errors, "sample conversion", &e);
@@ -463,6 +542,7 @@ pub fn run(
             if !sink.offer(Sample {
                 pts_90k,
                 observed_at,
+                motion,
                 input,
             })? {
                 dropped += 1;
@@ -578,7 +658,7 @@ mod tests {
             raw.width = 1920;
             raw.height = 1080;
         }
-        let decoder = SwDecoder::open(&codecpar, unit_rgb(InputSize::square(640))).unwrap();
+        let decoder = SwDecoder::open(&codecpar, unit_rgb(InputSize::square(640)), None).unwrap();
         assert_eq!(decoder.ctx.max_pixels, MAX_PIXELS);
         // Generous enough for 8K, small enough that a 16384x16384 SPS fails.
         const { assert!(MAX_PIXELS > 7680 * 4320) };

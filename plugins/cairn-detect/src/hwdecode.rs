@@ -19,8 +19,9 @@ use rsmpeg::avutil::{AVFrame, AVHWDeviceContext};
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 
-use crate::decode::{cap_frame_size, source_size, Decoder, ModelInput, RgbScaler};
+use crate::decode::{cap_frame_size, source_size, Decoder, RgbScaler, Sampled};
 use crate::infer::{InputSize, InputSpec};
+use crate::motion::MotionConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HwBackend {
@@ -148,7 +149,12 @@ pub struct HwDecoder {
 }
 
 impl HwDecoder {
-    pub fn open(backend: HwBackend, codecpar: &AVCodecParameters, spec: InputSpec) -> Result<Self> {
+    pub fn open(
+        backend: HwBackend,
+        codecpar: &AVCodecParameters,
+        spec: InputSpec,
+        motion: Option<MotionConfig>,
+    ) -> Result<Self> {
         if let Some(scale) = backend.scale_filter() {
             let name = CString::new(scale).expect("filter names are ascii");
             if AVFilter::get_by_name(&name).is_none() {
@@ -199,7 +205,7 @@ impl HwDecoder {
             backend,
             graph: None,
             spec,
-            rgb: RgbScaler::new(spec)?,
+            rgb: RgbScaler::new(spec, motion)?,
             degraded: false,
         })
     }
@@ -305,7 +311,7 @@ impl Decoder for HwDecoder {
         }
     }
 
-    fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<ModelInput>> {
+    fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<Sampled>> {
         // Read before the graph consumes the frame: this is the geometry the
         // camera sent, and the downloaded frame below is already scaled.
         let source = source_size(&frame)?;
@@ -510,6 +516,7 @@ mod tests {
                     encoding: crate::infer::TensorEncoding::UnitRgb,
                     resize: crate::infer::ResizePolicy::Stretch,
                 },
+                None,
             );
         }
     }
