@@ -4,7 +4,11 @@ defmodule Cairn.Tracker do
   with public `Cairn.ULID` identities and a started/updated/ended lifecycle.
 
   Identity is assigned one way, for every object: greedy-IoU matching against
-  the live tracks of the same label. There is no plugin-driven mode. A plugin's
+  the live tracks of the same label, run in two confidence stages and measured
+  against where each track's motion filter says its box should be by now — see
+  "Matching against a prediction" and "Two stages" below, both of which
+  constrain that one rule rather than adding a second. There is no
+  plugin-driven mode. A plugin's
   `track_id`s and `ended_tracks` are still parsed off the wire, and so is its
   `object_tracking` capability, but nothing here reads any of them — they are
   accepted and reserved, and a plugin that declares the capability is tracked
@@ -40,10 +44,16 @@ defmodule Cairn.Tracker do
   stationary track matches at the same `@iou_threshold` as everything else.
 
   Pickiness governs *geometry*, not *presence*. A detection that no track took
-  — refused on threshold, or left over because the track it belongs to already
-  has this batch's box for it — but that still overlaps a live **same-label**
-  track by at least `@duplicate_suppression_iou`, is **dropped** rather than
-  minted, whether or not that track matched this batch.
+  — refused on threshold, left over because the track it belongs to already has
+  this batch's box for it, or never paired with it because the track's
+  prediction had coasted elsewhere — but that still overlaps a live
+  **same-label** track by at least `@duplicate_suppression_iou`, is **dropped**
+  rather than minted, whether or not that track matched this batch. The overlap
+  is measured against the track's stored box, where the object was last
+  actually seen, and not against its prediction: what this asks is whether a
+  second box of that object arrived, not where the object might have gone.
+  Only a stage-one box is ever weighed here — the low-confidence half of a
+  batch is spent before this rule is offered anything (see "Two stages").
   The second case is why the state of the track cannot be the guard: a batch
   can carry two boxes for one object, because a detector without NMS emits
   them, so "what is left over is somebody else" is not something the tracker
@@ -61,8 +71,10 @@ defmodule Cairn.Tracker do
   the mark, the refusal repeats on every batch for as long as the object sits
   there and nothing ever re-acquires it. Together a refusal usually costs one
   batch: the refreshed clock takes the track out of the grace, so a batch
-  arriving within `max_unseen_ms` of it matches the same box at
-  `@iou_threshold` and adopts it normally. Where batches are further apart than
+  arriving within `max_unseen_ms` of it matches at `@iou_threshold` — against a
+  prediction which, for the parked track this case is about, has barely moved
+  from the stored box — and adopts it normally. Where batches are further
+  apart than
   that — inference slower than the camera's own unseen bound — every batch
   finds the track back in its grace and the refusal repeats, and what ends that
   is the refusal bound below rather than a match.
@@ -73,8 +85,10 @@ defmodule Cairn.Tracker do
   refused.
 
   Being marked seen is not being observed. The box was refused, so nothing
-  about it is believed — not the anchor, not the stillness window, not
-  `last_detected_ms`, so a track kept alive this way still goes
+  about it is believed — not the anchor, not the stillness window, not the
+  motion filter, which coasts on this batch exactly as it would for a track no
+  box mentioned at all, and not `last_detected_ms`, so a track kept alive this
+  way still goes
   `stale_predicted` on the evidence policy's own schedule and cannot be
   dragged off its anchor by what it refused. Nor is `last_matched_ms`
   touched: the refusal bound below is the one bound a suppression cannot
@@ -117,6 +131,68 @@ defmodule Cairn.Tracker do
   the clock changed, since it does not, but because nothing observed the gap
   (see below).
 
+  ## Matching against a prediction
+
+  What a detection is compared with is not a track's stored box but
+  `Cairn.Tracker.Kalman`'s estimate of where that box would be by now. Every
+  live track carries a constant-velocity filter: seeded when the track is
+  minted, updated from every box the track actually took, stepped once for
+  every batch that did not observe it, and asked for a further one-step
+  prediction at match time. A track something detects on every batch predicts
+  within jitter of its own last box, so for a scene the detector keeps up with
+  this changes nothing. What it buys is the other case — an object that keeps
+  moving through the batch or two nothing detected it in is matched against a
+  box that moved with it, where the frozen one it left behind would already
+  have fallen under `@iou_threshold` and its identity would have been lost.
+
+  The filter is internal: it is not in `Cairn.Track`, nothing downstream is
+  told about it, and — the cardinal rule in `Cairn.Tracker.Kalman`'s own doc —
+  a predicted box is never stored as `bbox`, never carried onto a summary and
+  never emitted. `bbox` is the last box the track was *observed* at, always,
+  which is what the two rules that read a stored box need: `adopt/4` stitches a
+  new epoch's detection against where the object was actually last seen, and
+  `duplicate_of/2` judges a leftover box's proximity to the same. An
+  extrapolation is enough to ask "is this the same object" with, and not enough
+  to resume an identity across a gap nothing watched, nor to refuse a detection
+  on.
+
+  A seeded box — the plugin re-reporting an observation it already made — is
+  not an observation of motion, so it neither updates the filter nor steps it.
+  Through a seeded stretch the filter is held exactly as it was, and the
+  prediction the next detection is matched against is the one the last
+  *detection* left. Everything else about a seeded box is unchanged: it
+  refreshes liveness, it moves `bbox`, and it is no more evidence than before.
+
+  ## Two stages: what a low-confidence box may do
+
+  Objects are partitioned against the camera's evidence floor — the same
+  `min_score`, runtime override included, that decides what may open an event —
+  and the two halves get different powers. Stage one is everything at or above
+  the floor, and is the rule described above entire: it matches, and what it
+  leaves over may adopt a suspension, mint a new identity, or be dropped as a
+  duplicate. Stage two is everything below the floor, and may do exactly one
+  thing — take a live track stage one left unmatched. It mints nothing, adopts
+  nothing, and every stage-two box that took no track is dropped outright,
+  never offered to suppression and so never marking any track seen.
+
+  The asymmetry is the point of the split. A box the detector is unsure of is
+  good evidence that a track it lands on is still there, and no evidence at all
+  that something new has arrived: minting on one would put a track on every
+  flicker of detector noise, and letting one mark a track seen would let that
+  noise hold identities alive through the refusal path indefinitely. What it
+  may do — carry an existing identity through the batch where the detector
+  nearly lost the object — is the occlusion case tracking exists for.
+
+  Partitioning on the *evidence* floor rather than on a floor of its own is
+  what keeps the rule from starving anything: a detection good enough to earn
+  video is by construction in stage one, so nothing that could become evidence
+  is ever denied a mint here. Below the floor a refusal costs nothing
+  downstream, because such a box could never have opened an event — which is
+  what makes matching on it safe.
+
+  A context that carries no floor puts every object in stage one, and that is
+  the whole of this rule for a caller which sets none.
+
   ## Surviving a stream reset: suspension and adoption
 
   An ffmpeg respawn or reconnect mints a new epoch, and the object in frame is
@@ -150,8 +226,9 @@ defmodule Cairn.Tracker do
   refused for, and that ghost is then adoptable by nothing, so the strictness
   manufactures the second identity it was there to prevent. What keeps the
   loose rule from producing a duplicate of its own — a second box of the object
-  it has just resumed — is the duplicate suppression that runs immediately
-  after it, which is retained. `@stitch_iou` is picked from the same geometry
+  it has just resumed — is the duplicate suppression that still runs after it,
+  last of all, with nothing between the two but stage two spending its own
+  leftovers. `@stitch_iou` is picked from the same geometry
   as `@duplicate_suppression_iou` — under it, an overlap is ordinary same-label
   adjacency (two cars nose to tail sit at 1/3) rather than the object again —
   and may never be the looser of the two (currently they are equal; the guard
@@ -168,7 +245,11 @@ defmodule Cairn.Tracker do
   are moved for a reason that is not about clocks: both are read as *elapsed
   stillness* — `stationary_ms` accrues over the gap between two detections, the
   settle window measures from the anchor — and a gap nothing watched is not
-  stillness anybody saw. Everything else is kept, `started_at` and
+  stillness anybody saw. The motion filter is the one thing dropped outright:
+  a heading learned before a cut that may be a minute old is not a claim about
+  where the object is now, so the adopting detection re-seeds it from scratch
+  and the resumed track is matched on its stored box until it does. Everything
+  else is kept, `started_at` and
   `stationary_since` included, and so is the
   `stationary` flag itself: a car that matches its own parking space was
   parked for the whole gap, so it resumes **already** stationary and its
@@ -305,13 +386,22 @@ defmodule Cairn.Tracker do
   `Cairn.CameraTracker` refuses it as event evidence for as long as it
   is set.
 
-  Bboxes are `[x, y, w, h]` in any consistent unit (normalized or pixels).
+  Bboxes are `[x, y, w, h]` **normalized to the frame**, which is what the
+  plugin protocol delivers. The IoU arithmetic here is scale-free and would not
+  care, but `Cairn.Tracker.Kalman` is not: it caps the width and height of the
+  boxes it predicts at one frame, so a track fed pixel coordinates is matched
+  against a prediction shrunk to a sliver of its box and will not answer to it.
+  A box that merely overhangs the frame edge is fine, and has to be — the
+  protocol admits one, an object halfway out of shot is one, and the
+  prediction's origin is left free precisely so that such a track goes on
+  matching itself.
   """
 
   require Logger
 
   alias Cairn.Observation
   alias Cairn.Track
+  alias Cairn.Tracker.Kalman
   alias Cairn.ULID
 
   @iou_threshold 0.1
@@ -333,13 +423,16 @@ defmodule Cairn.Tracker do
   # as a new object. Two different ways a batch gets there, and one number
   # serves both.
   #
-  # The track is free: refusal is the only way both sides are left over at once,
-  # since greedy matching pairs anything overlapping a track at
-  # `@iou_threshold`, the threshold for every track not in extended grace. So a
-  # free track and a free detection overlapping this much means some
-  # `match_threshold/2` said no, which makes this the other half of
-  # `@stationary_match_iou`: without it, every box the grace refuses mints the
-  # duplicate identity the grace exists to prevent.
+  # The track is free, on one of two roads. Either some `match_threshold/2`
+  # said no — which makes this the other half of `@stationary_match_iou`,
+  # because without it every box the grace refuses mints the duplicate identity
+  # the grace exists to prevent — or the pair was never offered at all, since
+  # matching weighs a detection against the track's *predicted* box while this
+  # rule weighs it against the stored one. A track whose filter has coasted
+  # away from where its object was last seen can therefore be free and
+  # overlapping at once with nothing having refused anything, and the answer
+  # this rule gives is the same for both roads: two boxes this close within one
+  # label are one object, which is already tracked.
   #
   # The track matched: the batch carried two boxes for one object, which a
   # detector without NMS does. The first took the track and the second has
@@ -535,6 +628,13 @@ defmodule Cairn.Tracker do
           at: DateTime.t() | nil
         }
 
+  @typedoc """
+  A camera's evidence floor, per label with a `"default"` fallback — the same
+  shape `Cairn.CameraTracker` gates evidence on, read here to partition a batch
+  into the two association stages.
+  """
+  @type floors :: %{String.t() => number()}
+
   @typedoc "Everything about the observation the tracker needs, and nothing else."
   @type context :: %{
           camera_id: String.t() | nil,
@@ -543,14 +643,16 @@ defmodule Cairn.Tracker do
           observed_at: DateTime.t() | nil,
           max_unseen_ms: pos_integer(),
           max_live_tracks: pos_integer(),
-          stationary_after_ms: pos_integer()
+          stationary_after_ms: pos_integer(),
+          min_score: floors() | nil
         }
 
   @typedoc "The host-side tracking policy for one camera."
   @type policy :: %{
-          max_unseen_ms: pos_integer(),
-          max_live_tracks: pos_integer(),
-          stationary_after_ms: pos_integer()
+          :max_unseen_ms => pos_integer(),
+          :max_live_tracks => pos_integer(),
+          :stationary_after_ms => pos_integer(),
+          optional(:min_score) => floors() | nil
         }
 
   @type event ::
@@ -570,6 +672,15 @@ defmodule Cairn.Tracker do
   `at_ms` is the observation's, stamped at ingestion (`Cairn.ObservationClock`)
   rather than read from a clock here: every bound in this module is a
   subtraction of two of them, and the tracker stays pure.
+
+  `min_score` is optional, and is the camera's **effective** evidence floor —
+  the runtime override included, not the configured map alone. It partitions
+  the batch into the two association stages (see the moduledoc); absent, every
+  object is stage one and nothing about association changes. It has to be the
+  effective floor rather than the configured one because the two must agree: a
+  floor lowered at runtime admits boxes as evidence, and a box that may open an
+  event but may not mint the track that carries it is an event with no identity
+  behind it.
   """
   @spec context(Observation.t(), String.t(), policy()) :: context()
   def context(%Observation{} = observation, camera_id, policy) do
@@ -580,7 +691,8 @@ defmodule Cairn.Tracker do
       observed_at: observation.observed_at,
       max_unseen_ms: policy.max_unseen_ms,
       max_live_tracks: policy.max_live_tracks,
-      stationary_after_ms: policy.stationary_after_ms
+      stationary_after_ms: policy.stationary_after_ms,
+      min_score: Map.get(policy, :min_score)
     }
   end
 
@@ -592,9 +704,16 @@ defmodule Cairn.Tracker do
   in the order given, and the lifecycle events this observation caused.
 
   An object the tracker refuses — a new identity at the live-track cap with
-  nothing evictable, or a detection dropped as a duplicate of a live same-label
-  track it overlaps (`@duplicate_suppression_iou`) — is absent from the tagged
-  list, so `tagged` may be shorter than `objects`.
+  nothing evictable, a detection dropped as a duplicate of a live same-label
+  track it overlaps (`@duplicate_suppression_iou`), or a below-floor object
+  that took no live track (see the moduledoc's two stages) — is absent from the
+  tagged list, so `tagged` may be shorter than `objects`.
+
+  Every live track this batch neither matched nor minted is **coasted** once
+  after the assignments are applied: one step of its motion filter, so that
+  every track's filter advances exactly once per batch whatever happened to it,
+  and a track nothing observed goes on being predicted forward rather than
+  freezing where it was last seen.
 
   Staleness is refreshed *before* expiry so that an expiring track's final
   summary reports this batch's `stale_predicted`, not the previous batch's.
@@ -607,10 +726,11 @@ defmodule Cairn.Tracker do
     {tracker, lapsed} = expire_suspended(tracker, context.at_ms)
     {tracker, assignments, adopted} = assign(tracker, objects, context)
 
-    {tracker, tagged, lifecycle} =
+    {tracker, tagged, lifecycle, touched} =
       apply_assignments(tracker, objects, assignments, adopted, context)
 
-    {tracker, expired} = tracker |> refresh_stale(context) |> expire(context)
+    {tracker, expired} =
+      tracker |> coast_unmatched(touched) |> refresh_stale(context) |> expire(context)
 
     {observed(tracker, context), tagged, lapsed ++ lifecycle ++ expired}
   end
@@ -830,31 +950,101 @@ defmodule Cairn.Tracker do
   # live track is a candidate — there is one kind of track and one way to earn
   # an identity. The threshold is per candidate track (`match_threshold/2`), so
   # it decides which pairs exist and never how the ones that exist are ordered.
+  # The overlap is taken against each track's *predicted* box, computed once
+  # per track for the whole batch and never stored (`predicted_box/1`).
   #
-  # What is left over then goes through `adopt/4` and `suppress_duplicates/4`,
-  # so the result can also carry `:drop`s, revived suspensions and a tracker
-  # whose refused tracks have been marked seen — which is why this returns a
-  # tracker where the greedy half alone would not have to.
+  # What is left over then goes through `adopt/4`, stage two and
+  # `suppress_duplicates/4`, so the result can also carry `:drop`s, revived
+  # suspensions and a tracker whose refused tracks have been marked seen —
+  # which is why this returns a tracker where the greedy half alone would not
+  # have to.
   #
-  # The three run in that order for two separate reasons. Adoption comes after
-  # the live pass because a track this scene is *currently* seeing outranks a
-  # ghost of it: the incumbent-wins convention, applied across the cut. It
-  # comes before suppression because a suspended track is unmatched by
-  # definition and a box that would have been dropped as somebody's duplicate
-  # may be the very detection that resumes an identity — the drop must be the
-  # last answer, not the first. Running it first also puts what it revived into
-  # the live set in time to suppress a *second* box of the same object in the
-  # same batch, which is why suppression re-reads its candidates off the tracker
-  # instead of taking `candidates` below.
+  # The four run in that order, for reasons that are separate.
+  #
+  # Adoption comes after the stage-one live pass because a track this scene is
+  # *currently* seeing outranks a ghost of it: the incumbent-wins convention,
+  # applied across the cut.
+  #
+  # Stage two comes after adoption because a low-confidence box may not resume
+  # an identity. Nothing observed the gap a suspension spans, so geometry is
+  # the whole of the evidence there is, and a box the detector is unsure of is
+  # not enough of it — so every suspension has already had its pick of the
+  # boxes that could stitch it before stage two runs at all.
+  #
+  # Suppression comes last, as it always has: a box that would have been
+  # dropped as somebody's duplicate may be the very detection that resumes an
+  # identity or carries one through an occlusion — the drop must be the last
+  # answer, not the first. Adoption running before it also puts what it revived
+  # into the live set in time to suppress a *second* box of the same object in
+  # the same batch, which is why suppression re-reads its candidates off the
+  # tracker instead of taking `candidates` below.
+  #
+  # Stage two's own leftovers never reach suppression: `spend_leftovers/2`
+  # gives each one `:drop` and marks its index used as the stage closes, so the
+  # only boxes suppression weighs are stage one's, and a below-floor box can
+  # neither be minted for nor mark a track seen. The partition is on the
+  # evidence floor, which is what makes that safe to do: nothing that could
+  # have earned video is in the half being spent, so no evidence-eligible
+  # detection is ever starved of a mint by stage two.
   defp assign(tracker, objects, context) do
     indexed = Enum.with_index(objects)
-    candidates = Map.to_list(tracker.objects)
+    {above_floor, below_floor} = partition(indexed, context)
 
+    # One prediction per live track for the whole batch. `predicted_box/1`
+    # steps a filter, so computing it inside the comprehension would re-step
+    # every candidate once per object in the batch — same answer, 64 times the
+    # arithmetic at the detection cap.
+    candidates = for {id, tracked} <- tracker.objects, do: {id, tracked, predicted_box(tracked)}
+
+    matched = greedy(new_assignment(), above_floor, candidates, context)
+    {tracker, matched, adopted} = adopt(tracker, above_floor, matched, context)
+    matched = stage_two(matched, below_floor, candidates, context)
+
+    {tracker, assignments} = suppress_duplicates(tracker, indexed, matched, context)
+    {tracker, assignments, adopted}
+  end
+
+  # The accumulator every pass shares: the assignment map, the object indices
+  # spent, and the track ids taken. Threading one through all of them is what
+  # makes "each object and each track used once" hold *across* stages and not
+  # only within one.
+  defp new_assignment, do: {%{}, MapSet.new(), MapSet.new()}
+
+  # This batch's objects split at the camera's evidence floor, per label with
+  # the same `"default"`-then-0.5 fallback `Cairn.CameraTracker` gates evidence
+  # on — the two readings of the floor have to agree, or a box could earn video
+  # without being able to mint the track that carries it.
+  #
+  # A context with no floor is the ordinary case today and puts everything in
+  # stage one, which is why every caller that sets none sees association behave
+  # exactly as it did before there were stages. `Map.get/2` and not a pattern
+  # match: `context` is a plain map a caller may build without the key.
+  defp partition(indexed, context) do
+    case Map.get(context, :min_score) do
+      nil ->
+        {indexed, []}
+
+      floors ->
+        Enum.split_with(indexed, fn {object, _index} ->
+          object.score >= floor_for(floors, object.label)
+        end)
+    end
+  end
+
+  defp floor_for(floors, label), do: Map.get(floors, label) || Map.get(floors, "default", 0.5)
+
+  # One greedy pass over the pairs `indexed` and `candidates` can make, seeded
+  # with what earlier passes already spent. Stage two hands this the same
+  # builder as stage one — same label gate, same predicted boxes, same
+  # `match_threshold/2`, same sort key — because a low-confidence box that does
+  # match is a real detection and gets a real match; the only thing that makes
+  # it a lesser box is what it is *not* allowed to do afterwards.
+  defp greedy(matched, indexed, candidates, context) do
     pairs =
       for {object, index} <- indexed,
-          {id, tracked} <- candidates,
+          {id, tracked, predicted} <- candidates,
           tracked.label == object.label,
-          overlap = iou(tracked.bbox, object.bbox),
+          overlap = iou(predicted, object.bbox),
           overlap >= match_threshold(tracked, context) do
         {overlap, index, id}
       end
@@ -864,27 +1054,89 @@ defmodule Cairn.Tracker do
     # sort would then resolve two identically-overlapping candidates by that
     # incidental order. `index` before `id` keeps "earlier object in the batch
     # wins", matching the incumbent-wins convention elsewhere.
-    matched =
-      pairs
-      |> Enum.sort_by(fn {overlap, index, id} -> {-overlap, index, id} end)
-      |> Enum.reduce({%{}, MapSet.new(), MapSet.new()}, fn {_overlap, index, id},
-                                                           {assignments, objects, tracks} ->
-        if MapSet.member?(objects, index) or MapSet.member?(tracks, id) do
-          {assignments, objects, tracks}
-        else
-          {Map.put(assignments, index, id), MapSet.put(objects, index), MapSet.put(tracks, id)}
-        end
-      end)
-
-    {tracker, matched, adopted} = adopt(tracker, indexed, matched, context)
-    {tracker, assignments} = suppress_duplicates(tracker, indexed, matched, context)
-    {tracker, assignments, adopted}
+    pairs
+    |> Enum.sort_by(fn {overlap, index, id} -> {-overlap, index, id} end)
+    |> Enum.reduce(matched, fn {_overlap, index, id}, {assignments, objects, tracks} = acc ->
+      if MapSet.member?(objects, index) or MapSet.member?(tracks, id) do
+        acc
+      else
+        {Map.put(assignments, index, id), MapSet.put(objects, index), MapSet.put(tracks, id)}
+      end
+    end)
   end
 
-  # Every object the live pass left unmatched, against the tracks a stream
-  # reset suspended: the best overlap that clears `@stitch_iou` takes the
-  # identity back, each object and each suspension used once, and the revived
-  # track joins the live set as if it had matched there.
+  # The low-confidence half: match what is left, then spend the rest. Nothing
+  # here can mint (a spent index never reaches `apply_object/6` as `:new`) or
+  # adopt (`adopt/4` was handed stage one's objects and has already run).
+  defp stage_two(matched, [], _candidates, _context), do: matched
+
+  defp stage_two(matched, below_floor, candidates, context) do
+    matched
+    |> greedy(below_floor, free_candidates(candidates, matched), context)
+    |> spend_leftovers(below_floor)
+  end
+
+  # The live tracks stage one left over. A pre-filter and not the invariant —
+  # `greedy/4`'s own reduce rejects a taken track anyway — but the pair list
+  # stage two sorts is the smaller for it.
+  #
+  # A track this batch revived out of suspension is not in `candidates` at all,
+  # and not because of the test below: `assign/3` builds that list off
+  # `tracker.objects` before `adopt/4` runs, so a revived id was never in it to
+  # be filtered. Nothing is lost by that — an adoption assigns the box that
+  # revived it in the same breath, so the id is taken and stage two could not
+  # have matched it either way.
+  defp free_candidates(candidates, {_assignments, _objects, tracks}) do
+    for {id, _tracked, _predicted} = candidate <- candidates,
+        not MapSet.member?(tracks, id),
+        do: candidate
+  end
+
+  # Every below-floor object stage two did not match, dropped and marked spent
+  # in one step. The marking is what keeps `suppress_duplicates/4` from ever
+  # seeing one: a box this weak may not mint, and it may not mark a track seen
+  # either, or detector noise near a live track would hold that track alive
+  # through `seen/3` for as long as the noise kept arriving.
+  defp spend_leftovers(matched, below_floor) do
+    Enum.reduce(below_floor, matched, fn {_object, index}, {assignments, objects, tracks} = acc ->
+      if MapSet.member?(objects, index) do
+        acc
+      else
+        {drop(assignments, index), MapSet.put(objects, index), tracks}
+      end
+    end)
+  end
+
+  # Where the filter says the track's box would be by now, for matching and for
+  # nothing else: one further step past whatever the stored state has already
+  # been advanced to, taken here and thrown away. Advancing the stored filter
+  # would double-step a track that goes on to match, and would step it twice
+  # per batch for as long as it did not.
+  #
+  # A track with no filter — one revived out of suspension, whose pre-cut
+  # velocity is up to `@adoption_window_ms` stale and was dropped rather than
+  # believed — falls back to its stored box, which is the frozen-box behaviour
+  # this replaced and the right answer for a track with no motion estimate at
+  # all. `update_track/3` re-seeds it from the very next detection.
+  defp predicted_box(%{kalman: nil} = tracked), do: tracked.bbox
+  defp predicted_box(%{kalman: kalman}), do: kalman |> Kalman.predict() |> Kalman.predicted_bbox()
+
+  # Every object the stage-one live pass left unmatched, against the tracks a
+  # stream reset suspended: the best overlap that clears `@stitch_iou` takes
+  # the identity back, each object and each suspension used once, and the
+  # revived track joins the live set as if it had matched there.
+  #
+  # Stage one's leftovers and no others. A below-floor box may not resume an
+  # identity — see `assign/3` for why the stage runs after this one — and the
+  # `indexed` list this is handed is stage one's for that reason and not as an
+  # optimisation.
+  #
+  # The overlap is against the suspension's stored box, the last one anything
+  # actually saw it at, and not against a prediction: a suspended track has no
+  # live filter to predict from, and the moduledoc's rule is that an
+  # extrapolation may not resume an identity in any case. That is the same
+  # refusal the `Observation.detected?/1` gate below makes of the plugin's
+  # extrapolations, applied to the host's own.
   #
   # One threshold and no clock: how long the track had been absent does not
   # enter into it. The only time bound is the adoption window, and `track/3`
@@ -962,8 +1214,9 @@ defmodule Cairn.Tracker do
   # measured against where the object last was while the *duration* of stillness
   # restarts here.
   #
-  # `recent_boxes` is the one piece of geometry that does not carry over, and
-  # emptying it is what makes the sentence above mean something. It is the
+  # `recent_boxes` is one of the two pieces of geometry that do not carry over
+  # (the motion filter, below, is the other), and emptying it is what makes the
+  # sentence above mean something. It is the
   # window the stillness rule takes a median over, and every box in it belongs
   # to the stream that just died: left in place it outvotes the adopting box
   # for as many batches as it has entries, so a track that really did move
@@ -990,6 +1243,17 @@ defmodule Cairn.Tracker do
   # `update_track/3` refills it in the same `track/3` call. (`median_box/1`
   # could not be handed the empty list in any case — `stillness/5` prepends the
   # current box before it takes the median.)
+  #
+  # `kalman` is dropped outright, for the same reason and with the same repair.
+  # A velocity is a claim about the last few seconds, and the last thing this
+  # filter saw can be a whole `@adoption_window_ms` old — a minute of coasting
+  # on a heading nothing has confirmed since, which would put the resumed
+  # track's prediction anywhere. The adopting box is the one thing the new
+  # epoch has actually shown, so the filter is re-seeded from it: `adopt/4`
+  # only ever assigns *detected* boxes, so the `update_track/3` that follows in
+  # this same `track/3` call takes the nil-plus-detection path and inits.
+  # Between the two, `predicted_box/1` falls back to the stored box, which is
+  # all a track with no motion estimate can honestly be matched on.
   defp revive(tracker, id, context) do
     {entry, suspended} = Map.pop(tracker.suspended, id)
 
@@ -999,17 +1263,30 @@ defmodule Cairn.Tracker do
         last_detected_ms: if(entry.tracked.last_detected_ms, do: context.at_ms),
         anchor_ms: if(entry.tracked.anchor_bbox, do: context.at_ms),
         recent_boxes: [],
-        pending_exit_ms: nil
+        pending_exit_ms: nil,
+        kalman: nil
     }
 
     %{tracker | suspended: suspended, objects: Map.put(tracker.objects, id, tracked)}
   end
 
-  # Every object still unmatched after the greedy pass and `adopt/4`, against
-  # every live track there is: an overlap of `@duplicate_suppression_iou`
-  # or more with a same-label track is read as that track's object again, and
-  # minting for it is how one object ends up with several live tracks. It is
-  # dropped instead.
+  # Every object still unmatched after both greedy passes and `adopt/4`,
+  # against every live track there is: an overlap of
+  # `@duplicate_suppression_iou` or more with a same-label track is read as
+  # that track's object again, and minting for it is how one object ends up
+  # with several live tracks. It is dropped instead.
+  #
+  # In practice that is stage one's leftovers alone — stage two spends its own
+  # before this runs (`spend_leftovers/2`), so every index this still finds
+  # free carried a box at or above the camera's evidence floor.
+  #
+  # The overlap is against each track's **stored** box, not the predicted one
+  # `assign/3` matched on. The question here is whether a second box of an
+  # object the tracker already has just arrived, and the answer to that is
+  # where the object was actually last seen; a prediction is a guess about
+  # somewhere it has not been observed, and dropping a real detection on the
+  # strength of one would be the tracker refusing evidence to protect an
+  # extrapolation.
   #
   # Candidates are read off the tracker here rather than reusing the list
   # `assign/3` built, because `adopt/4` has run in between: a track this
@@ -1100,7 +1377,9 @@ defmodule Cairn.Tracker do
   # Presence without adoption: this moves the clock that expiry and
   # `match_threshold/2` read, and its `last_seen_at` twin, and nothing else.
   # Not `bbox`, `score` or `best_score` — the box was refused, so nothing about
-  # it may be believed. Not `last_detected_ms`, so `stale_predicted` still
+  # it may be believed. Not `kalman`: a track marked seen is not a track this
+  # batch touched, so it coasts with the rest of the unobserved ones and the
+  # refused box contributes no motion. Not `last_detected_ms`, so `stale_predicted` still
   # arrives on schedule and a suppression can never manufacture evidence. Not
   # the anchor or `recent_boxes`, which the stillness rule compares against
   # boxes the track actually adopted. And not `last_matched_ms`: leaving the
@@ -1108,7 +1387,9 @@ defmodule Cairn.Tracker do
   # track whose only remaining sign of life is being refused.
   #
   # Reached only through `mark_seen_if_unmatched/4`, which is where the reason a
-  # matched track never gets here is written down.
+  # matched track never gets here is written down — and, since that is reached
+  # only from `suppress_duplicates/4`, only ever off a box at or above the
+  # camera's evidence floor.
   defp seen(tracker, object_id, context) do
     tracked = Map.fetch!(tracker.objects, object_id)
 
@@ -1132,6 +1413,12 @@ defmodule Cairn.Tracker do
 
   defp match_threshold(_tracked, _context), do: @iou_threshold
 
+  # Returns the ids this batch **touched** alongside the rest: every track it
+  # updated (a match of either stage, an adoption) or minted. That set is the
+  # complement of the coast pass — a track not in it saw nothing this batch, so
+  # `coast_unmatched/2` steps its filter — and a track merely marked seen by a
+  # suppression is deliberately not in it, on the same rule as everything else
+  # a refusal does not move.
   defp apply_assignments(tracker, objects, assignments, adopted, context) do
     adopted = MapSet.new(adopted)
     # Tracks this batch assigned a detection to: retiring one to make room for
@@ -1142,19 +1429,26 @@ defmodule Cairn.Tracker do
     # anything in the live set gets.
     protected = for {_index, id} <- assignments, is_binary(id), into: MapSet.new(), do: id
 
-    {tracker, tagged, events} =
+    {tracker, tagged, events, touched} =
       objects
       |> Enum.with_index()
-      |> Enum.reduce({tracker, [], []}, fn {object, index}, acc ->
+      |> Enum.reduce({tracker, [], [], MapSet.new()}, fn {object, index}, acc ->
         apply_object(acc, object, Map.get(assignments, index, :new), adopted, protected, context)
       end)
 
-    {tracker, Enum.reverse(tagged), Enum.reverse(events)}
+    {tracker, Enum.reverse(tagged), Enum.reverse(events), touched}
   end
 
   defp apply_object(acc, _object, :drop, _adopted, _protected, _context), do: acc
 
-  defp apply_object({tracker, tagged, events}, object, assigned, adopted, protected, context) do
+  defp apply_object(
+         {tracker, tagged, events, touched},
+         object,
+         assigned,
+         adopted,
+         protected,
+         context
+       ) do
     case fetch_assigned(tracker, assigned) do
       {:ok, object_id, existing} ->
         tracked = update_track(existing, object, context)
@@ -1162,7 +1456,8 @@ defmodule Cairn.Tracker do
 
         {store(tracker, object_id, tracked), [tag(object, object_id, tracked) | tagged],
          transition(existing, tracked, summary) ++
-           resumed(adopted, object_id, summary) ++ [{:updated, summary} | events]}
+           resumed(adopted, object_id, summary) ++ [{:updated, summary} | events],
+         MapSet.put(touched, object_id)}
 
       :error ->
         case make_room(tracker, protected, context) do
@@ -1171,10 +1466,11 @@ defmodule Cairn.Tracker do
             tracked = new_track(object_id, object, context)
 
             {store(tracker, object_id, tracked), [tag(object, object_id, tracked) | tagged],
-             [{:started, to_track(tracked)} | Enum.reverse(evicted) ++ events]}
+             [{:started, to_track(tracked)} | Enum.reverse(evicted) ++ events],
+             MapSet.put(touched, object_id)}
 
           {:full, tracker} ->
-            {tracker, tagged, events}
+            {tracker, tagged, events, touched}
         end
     end
   end
@@ -1325,7 +1621,17 @@ defmodule Cairn.Tracker do
         # stationary, and publishing "stationary, but" would give every
         # consumer a third state to handle for something none of them may act
         # on.
-        pending_exit_ms: nil
+        pending_exit_ms: nil,
+        # Seeded from the first box, whatever kind it is. A seeded box may not
+        # *move* the filter (see the moduledoc), but a track has to start from
+        # somewhere and the alternative — no filter until the first detection —
+        # would only mean falling back to that same box through
+        # `predicted_box/1`. Velocity starts at zero either way, so the first
+        # prediction is the box itself and a track's first batch is matched
+        # exactly as it was before there was a filter. Also internal, and for a
+        # stronger reason than `pending_exit_ms`: `Cairn.Tracker.Kalman`'s
+        # cardinal rule is that nothing it produces may be stored or emitted.
+        kalman: Kalman.init(object.bbox)
       },
       context
     )
@@ -1347,11 +1653,53 @@ defmodule Cairn.Tracker do
         last_seen_ms: context.at_ms,
         last_matched_ms: context.at_ms,
         last_detected_at: if(detected?, do: context.observed_at, else: tracked.last_detected_at),
-        last_detected_ms: if(detected?, do: context.at_ms, else: tracked.last_detected_ms)
+        last_detected_ms: if(detected?, do: context.at_ms, else: tracked.last_detected_ms),
+        kalman: advance(tracked.kalman, object, detected?)
     }
     |> stillness(object, detected?, previous_detected_ms, context)
     |> stale(context)
   end
+
+  # The filter's one step for a track that was observed: predict, then correct
+  # with the box. `bbox` above is written from the same object on the same
+  # write, which is what keeps "stored box observed, filter predicted" from
+  # being two facts that can drift apart.
+  #
+  # A seeded box advances nothing at all — not the state, not the covariance.
+  # It is the plugin re-reporting a sighting it already made, so treating it as
+  # an observation would let one detection be counted as many, and merely
+  # predicting on it would inflate the filter's uncertainty over a stretch
+  # where by the plugin's own account nothing has happened. Held is the honest
+  # reading, and it is what the moduledoc promises.
+  #
+  # The nil case is a track `revive/3` cleared: the first detection after an
+  # adoption seeds a fresh filter from the box the new epoch actually produced,
+  # rather than resuming a heading a minute of blindness has invalidated.
+  defp advance(kalman, _object, false), do: kalman
+  defp advance(nil, object, true), do: Kalman.init(object.bbox)
+  defp advance(kalman, object, true), do: kalman |> Kalman.predict() |> Kalman.update(object.bbox)
+
+  # One step of every live track's filter that this batch neither observed nor
+  # minted: the coast, and the reason an unmatched track's prediction keeps
+  # moving instead of freezing where it was last seen. Exactly once per batch,
+  # which is what `apply_assignments/5`'s touched set buys — a track this batch
+  # matched has already been stepped by `advance/3`, and stepping it again here
+  # would tell the filter the object had moved twice as far as it did.
+  #
+  # A track with no filter stays without one until a detection re-seeds it.
+  # There is nothing to coast, and inventing a filter from a stored box on a
+  # batch that saw nothing would be minting a motion estimate out of silence.
+  defp coast_unmatched(tracker, touched) do
+    objects =
+      Map.new(tracker.objects, fn {id, tracked} ->
+        if MapSet.member?(touched, id), do: {id, tracked}, else: {id, coast(tracked)}
+      end)
+
+    %{tracker | objects: objects}
+  end
+
+  defp coast(%{kalman: nil} = tracked), do: tracked
+  defp coast(tracked), do: %{tracked | kalman: Kalman.predict(tracked.kalman)}
 
   # -- stillness --------------------------------------------------------------
 
