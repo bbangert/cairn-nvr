@@ -198,10 +198,13 @@ fn open_and_run(
 /// [`gate::sample_line`], the same call single mode makes — the two modes
 /// differ in which camera's state they hand it and in nothing else.
 ///
-/// That the four are indexed by the *same* slot is not checked anywhere: the
-/// vectors are built in `specs` order at startup and nothing re-orders them,
-/// so `motion[0]` written where `motion[index]` belongs would hand every
-/// member the first camera's policy and no test would notice. The gate tests
+/// The length checks below are the checkable slice of that invariant: a
+/// caller handing this loop slices of different lengths has built them from
+/// different rosters, and an index that is valid in one would be a wrong
+/// camera — or a panic — in another. What no local assertion can catch is a
+/// *reordering* (four same-length vectors in different orders), nor
+/// `motion[0]` written where `motion[index]` belongs: the vectors are built
+/// in `specs` order at startup and nothing re-orders them, but the gate tests
 /// drive their own members and cannot see this call; a harness running real
 /// clips through the group loop is what would.
 fn infer_loop(
@@ -213,6 +216,9 @@ fn infer_loop(
     labels: &Labels,
     mut publisher: Publisher,
 ) -> Result<()> {
+    debug_assert_eq!(slots.len(), specs.len());
+    debug_assert_eq!(floors.len(), specs.len());
+    debug_assert_eq!(motion.len(), specs.len());
     let mut gates: Vec<Gate> = specs.iter().map(|_| Gate::default()).collect();
 
     for (index, sample) in Slots::new(slots) {
