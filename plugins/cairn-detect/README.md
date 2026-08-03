@@ -118,6 +118,66 @@ named group under `plugins:` and point cameras at it by name — see
 | `--input-size` | no, except RF-DETR | model input `WxH` (or `N` for a square N×N). Read from the model when omitted; **required** when the model's spatial dims are dynamic, which every RF-DETR export leaves them — `--model-profile` does not substitute for it there (see [Geometry](#geometry)) |
 | `--model-profile` | no | `yolox`, `rfdetr`, `yolov10` or `yolov8` (plus the aliases `rf-detr`, `yolo26`, `yolov9`, `yolo11`, `yolov11`) — the preprocessing and decode steps to run the model under. Sniffed from the model when omitted; required when a shape fits more than one profile or the model's *output* shape is dynamic (see [Model profiles](#model-profiles)) |
 | `--decoder` | no | `auto` (default), `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` |
+| `--motion-json` | no | JSON object of motion-gate knobs. **Off by default** — see [Motion gate](#motion-gate) |
+
+## Motion gate
+
+A Frigate-style no-change filter: each sampled frame is downscaled to a small
+grayscale thumbnail, compared against a rolling-average background of the
+frames before it, and the fraction of the thumbnail that changed is what the
+gate reads. **It is off unless you switch it on**, and this build only
+*measures*: the change fraction is computed per sample and nothing is skipped
+because of it yet.
+
+```yaml
+plugin:
+  - plugins/cairn-detect/target/release/cairn-detect
+  - --model
+  - plugins/cairn-detect/yolox_nano.onnx
+  - --motion-json
+  - '{"enabled": true, "min_area_fraction": 0.005}'
+```
+
+| knob | default | meaning |
+|------|---------|---------|
+| `enabled` | `false` | run the gate at all. With this off no detector is built and no thumbnail is taken. The knobs below are still range-checked either way, so an out-of-range value fails startup even with the gate switched off |
+| `threshold` | `25` | per-pixel 0..255 difference from the background that counts as changed (`1..=254`; the comparison is strict and 255 is the largest difference there is, so 255 would count nothing) |
+| `min_area_fraction` | `0.005` | fraction of the thumbnail that has to change before the frame counts as motion (`(0, 0.8)`; a frame that changes more than 80 % is a scene cut, so a floor at or above that is refused at startup rather than left unreachable) |
+| `alpha` | `0.02` | how fast the background absorbs the picture: `bg = (1 - alpha) * bg + alpha * frame`, per sample (`(0, 1]`). At the 5 fps sample rate this is roughly a 10-second memory, and something that parks in frame keeps reading as motion for at least that long — longer the more it contrasts with what it covers, since the background has to decay to within `threshold` of it |
+| `linger_ms` | `12000` | how long past the last motion to keep inferring anyway |
+| `epoch_bypass_ms` | `15000` | how long after a stream restart to infer regardless of motion |
+| `reverify_ms` | `10000` | how often to infer anyway while gated |
+
+The last three are accepted but not range-checked — any unsigned duration
+parses, and nothing reads them yet: they belong to the gating policy, not to
+the measurement.
+
+An unknown knob *inside* a `motion` object is a startup error rather than a
+setting that silently does nothing, so a typo'd knob fails loudly. The `motion`
+key itself is not checked that way: a `--cameras-json` member carrying `"moton"`
+parses, is ignored, and leaves that camera on the group's settings — the member
+object stays open to keys Cairn may add.
+
+Two behaviours are not knobs. The first 25 samples (5 seconds) after a start or
+a geometry change are a calibration window in which no frame reports motion —
+the background is still the scene that happened to be in front of the camera.
+And a frame in which more than 80 % of the thumbnail changed is treated as a
+scene cut, not as motion: the background is replaced with it outright and the
+frame reports no motion, which is what keeps an IR-cut filter flipping or a
+light switch from reading as the whole frame moving.
+
+The calibration window and `alpha`'s memory are both counted in samples, and
+5 fps is a ceiling on the sample rate rather than the rate itself — the gate
+takes at most one sample every 200 ms and otherwise takes whatever the camera
+delivers. On a 2 fps substream the calibration window is 12.5 seconds and the
+10-second memory is 25, so read every second in this section as "at this
+camera's sample rate".
+
+**Frigate's published numbers do not transfer as-is.** The thumbnail here is at
+most 96 px wide and it is compared at 5 fps, so inter-frame differences are
+much larger than in a 15 fps pipeline. Treat the defaults as a starting point
+and tune `min_area_fraction` against the change fractions your own cameras
+produce.
 
 ## The wire protocol
 
@@ -228,7 +288,12 @@ Cairn then appends one argument instead of the per-camera three:
 | `--cameras-json` | in group mode | JSON array of `{id, udp_port, min_score}`, one entry per member, in config order |
 
 It conflicts with `--camera-id`/`--udp-port`/`--min-score-json`; give one set
-or the other. Each member gets its own decode thread and its own
+or the other. `--motion-json` is the exception: it is your own flag in the
+configured command rather than one Cairn appends, so it applies in both modes
+— in group mode as the default for every member. A member may also carry its
+own `motion` object in `--cameras-json`, overriding only the knobs it names;
+Cairn does not write that key today, so it is reachable from a hand-driven run
+(see below). Each member gets its own decode thread and its own
 newest-wins sample slot, and a single inference thread drains the slots —
 picking at random among the ready ones, so a busy camera cannot starve a quiet
 one. Score floors are applied per member. Startup logs the whole roster
