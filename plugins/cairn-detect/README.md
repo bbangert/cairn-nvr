@@ -148,8 +148,9 @@ plugin:
 | `epoch_bypass_ms` | `15000` | how long after a stream restart to infer regardless of motion |
 | `reverify_ms` | `10000` | how often to infer anyway while gated |
 
-The last three are accepted and range-checked now but nothing reads them yet:
-they belong to the gating policy, not to the measurement.
+The last three are accepted but not range-checked — any unsigned duration
+parses, and nothing reads them yet: they belong to the gating policy, not to
+the measurement.
 
 An unknown knob *inside* a `motion` object is a startup error rather than a
 setting that silently does nothing, so a typo'd knob fails loudly. The `motion`

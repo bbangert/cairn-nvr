@@ -154,16 +154,16 @@ pub struct MotionConfig {
     pub min_area_fraction: f32,
     /// Rolling-average weight: `bg = (1 - alpha) * bg + alpha * frame`.
     pub alpha: f32,
-    // The three policy knobs below are parsed and validated here and consumed
-    // by the gate policy in `infer_loop`, which does not exist yet — the
-    // decode side has no use for a duration. They are accepted now so the
-    // config surface an operator writes does not change under them when it
-    // does.
+    // The three policy knobs below are parsed here and consumed by the gate
+    // policy in `infer_loop`, which does not exist yet — the decode side has
+    // no use for a duration. `validate` bounds nothing about them: any u64
+    // parses, because what a bound would mean is the policy's to define. They
+    // are accepted now so the config surface an operator writes does not
+    // change under them when it does.
     //
     // `-D warnings` treats a field nothing reads as an error, and dropping
-    // them from the struct instead would put a knob's parse, its validation
-    // and its default in three different phases. Delete this allow once the
-    // policy reads them.
+    // them from the struct instead would put a knob's parse and its default
+    // in different phases. Delete this allow once the policy reads them.
     /// How long past the last motion to keep inferring anyway.
     #[allow(dead_code)]
     pub linger_ms: u64,
