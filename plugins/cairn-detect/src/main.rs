@@ -39,6 +39,7 @@
 mod control;
 mod decode;
 mod emit;
+mod gate;
 mod glibc_compat;
 mod hwdecode;
 mod infer;
@@ -49,6 +50,7 @@ mod rtp;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -58,8 +60,9 @@ use rsmpeg::ffi;
 use control::Streams;
 use decode::{DecoderKind, Sample};
 use emit::Publisher;
+use gate::Gate;
 use infer::{Detector, InputSize, Labels, ModelProfile, ScoreFloors};
-use motion::MotionOverrides;
+use motion::{MotionConfig, MotionOverrides};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -268,7 +271,17 @@ fn run_single(args: &Args) -> Result<()> {
         let camera_id = camera_id.clone();
         thread::Builder::new()
             .name("infer".into())
-            .spawn(move || infer_loop(&rx, detector, &labels, &floors, &camera_id, &mut publisher))
+            .spawn(move || {
+                infer_loop(
+                    &rx,
+                    detector,
+                    &labels,
+                    &floors,
+                    &camera_id,
+                    motion,
+                    &mut publisher,
+                )
+            })
             .context("spawning the inference thread")?
     };
 
@@ -323,18 +336,34 @@ fn model_summary(args: &Args, detector: &Detector) -> String {
     )
 }
 
+/// Sample in, protocol line out, for this process's one camera.
+///
+/// `motion` is that camera's resolved gate config, or `None` with the gate off
+/// — in which case [`Gate::decide`] infers on every sample and the loop is what
+/// it was before the gate existed. When it is on, a skipped sample still emits:
+/// the seeded line is the host's evidence that this camera is alive and that
+/// what it last saw is still there.
 fn infer_loop(
     rx: &Receiver<Sample>,
     mut detector: Detector,
     labels: &Labels,
     floors: &ScoreFloors,
     camera_id: &str,
+    motion: Option<MotionConfig>,
     publisher: &mut Publisher,
 ) -> Result<()> {
+    let mut gate = Gate::default();
     while let Ok(sample) = rx.recv() {
-        let dets = detector.detect(sample.input.tensor, sample.input.projection, labels, floors)?;
-        if let Some(line) = publisher.line_for(camera_id, sample.pts_90k, sample.observed_at, &dets)
-        {
+        let line = gate::sample_line(
+            &mut gate,
+            publisher,
+            camera_id,
+            motion,
+            sample,
+            Instant::now(),
+            |input| detector.detect(input.tensor, input.projection, labels, floors),
+        )?;
+        if let Some(line) = line {
             emit::stdout_line(&line).context("writing to stdout")?;
         }
     }

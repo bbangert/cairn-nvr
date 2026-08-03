@@ -25,6 +25,7 @@ use serde::Deserialize;
 
 use crate::decode::{self, DecoderKind, Sample, SampleSink};
 use crate::emit::{self, Publisher};
+use crate::gate::{self, Gate};
 use crate::infer::{Detector, InputSpec, Labels, ScoreFloors};
 use crate::motion::{self, MotionConfig, MotionOverrides};
 use crate::rtp;
@@ -119,7 +120,7 @@ pub fn run(
             .with_context(|| format!("spawning the decode thread for camera {}", spec.id))?;
     }
 
-    infer_loop(&slots, specs, &floors, detector, labels, publisher)
+    infer_loop(&slots, specs, &floors, &motion, detector, labels, publisher)
 }
 
 /// Open -> decode -> log -> re-open, forever. Never returns.
@@ -189,26 +190,52 @@ fn open_and_run(
     decode::run(&mut input, stream_index, time_base, decoder.as_mut(), sink)
 }
 
+/// Drain every member's slot through the one detector.
+///
+/// `motion` and the gates are indexed by slot, like `specs` and `floors`: the
+/// policy is per camera, and one busy member must not spend another's linger
+/// or re-verify window. What happens to a sample once its slot is known is
+/// [`gate::sample_line`], the same call single mode makes — the two modes
+/// differ in which camera's state they hand it and in nothing else.
+///
+/// The length checks below are the checkable slice of that invariant: a
+/// caller handing this loop slices of different lengths has built them from
+/// different rosters, and an index that is valid in one would be a wrong
+/// camera — or a panic — in another. What no local assertion can catch is a
+/// *reordering* (four same-length vectors in different orders), nor
+/// `motion[0]` written where `motion[index]` belongs: the vectors are built
+/// in `specs` order at startup and nothing re-orders them, but the gate tests
+/// drive their own members and cannot see this call; a harness running real
+/// clips through the group loop is what would.
 fn infer_loop(
     slots: &[LatestSlot<Sample>],
     specs: &[CameraSpec],
     floors: &[ScoreFloors],
+    motion: &[Option<MotionConfig>],
     mut detector: Detector,
     labels: &Labels,
     mut publisher: Publisher,
 ) -> Result<()> {
+    debug_assert_eq!(slots.len(), specs.len());
+    debug_assert_eq!(floors.len(), specs.len());
+    debug_assert_eq!(motion.len(), specs.len());
+    let mut gates: Vec<Gate> = specs.iter().map(|_| Gate::default()).collect();
+
     for (index, sample) in Slots::new(slots) {
         let camera_id = &specs[index].id;
-        let dets = detector.detect(
-            sample.input.tensor,
-            sample.input.projection,
-            labels,
-            &floors[index],
+        // The epoch gate is per member too, inside the publisher: a camera
+        // Cairn has not announced yet (or has stopped) emits nothing while its
+        // neighbours keep going.
+        let line = gate::sample_line(
+            &mut gates[index],
+            &mut publisher,
+            camera_id,
+            motion[index],
+            sample,
+            Instant::now(),
+            |input| detector.detect(input.tensor, input.projection, labels, &floors[index]),
         )?;
-        // The epoch gate is per member: a camera Cairn has not announced yet
-        // (or has stopped) emits nothing while its neighbours keep going.
-        if let Some(line) = publisher.line_for(camera_id, sample.pts_90k, sample.observed_at, &dets)
-        {
+        if let Some(line) = line {
             emit::stdout_line(&line).context("writing to stdout")?;
         }
     }

@@ -1,0 +1,205 @@
+[
+  {
+    "at_ms": 0,
+    "pts": 0,
+    "dets": [{ "label": "person", "score": 0.9, "bbox": [0.1, 0.1, 0.2, 0.4] }]
+  },
+  {
+    "at_ms": 300,
+    "pts": 27000,
+    "dets": [{ "label": "person", "score": 0.9, "bbox": [0.1, 0.1, 0.2, 0.4] }]
+  },
+  {
+    "at_ms": 600,
+    "pts": 54000,
+    "dets": [{ "label": "person", "score": 0.9, "bbox": [0.1, 0.1, 0.2, 0.4] }]
+  },
+  {
+    "at_ms": 900,
+    "pts": 81000,
+    "dets": [{ "label": "person", "score": 0.9, "bbox": [0.1, 0.1, 0.2, 0.4] }]
+  },
+  {
+    "at_ms": 1200,
+    "pts": 108000,
+    "dets": [{ "label": "person", "score": 0.9, "bbox": [0.1, 0.1, 0.2, 0.4] }]
+  },
+  {
+    "at_ms": 1500,
+    "pts": 135000,
+    "dets": [{ "label": "person", "score": 0.9, "bbox": [0.1, 0.1, 0.2, 0.4] }]
+  },
+  {
+    "at_ms": 1800,
+    "pts": 162000,
+    "dets": [
+      {
+        "label": "person",
+        "score": 0.9,
+        "bbox": [0.1, 0.1, 0.2, 0.4],
+        "observation_kind": "tracked"
+      }
+    ]
+  },
+  {
+    "at_ms": 2100,
+    "pts": 189000,
+    "dets": [
+      {
+        "label": "person",
+        "score": 0.9,
+        "bbox": [0.1, 0.1, 0.2, 0.4],
+        "observation_kind": "tracked"
+      }
+    ]
+  },
+  {
+    "at_ms": 2400,
+    "pts": 216000,
+    "dets": [
+      {
+        "label": "person",
+        "score": 0.9,
+        "bbox": [0.1, 0.1, 0.2, 0.4],
+        "observation_kind": "tracked"
+      }
+    ]
+  },
+  {
+    "at_ms": 2700,
+    "pts": 243000,
+    "dets": [
+      {
+        "label": "person",
+        "score": 0.9,
+        "bbox": [0.1, 0.1, 0.2, 0.4],
+        "observation_kind": "tracked"
+      }
+    ]
+  },
+  {
+    "at_ms": 3000,
+    "pts": 270000,
+    "dets": [
+      {
+        "label": "person",
+        "score": 0.9,
+        "bbox": [0.1, 0.1, 0.2, 0.4],
+        "observation_kind": "tracked"
+      }
+    ]
+  },
+  {
+    "at_ms": 3300,
+    "pts": 297000,
+    "dets": [
+      {
+        "label": "person",
+        "score": 0.9,
+        "bbox": [0.1, 0.1, 0.2, 0.4],
+        "observation_kind": "tracked"
+      }
+    ]
+  },
+  {
+    "at_ms": 3600,
+    "pts": 324000,
+    "dets": [
+      {
+        "label": "person",
+        "score": 0.9,
+        "bbox": [0.1, 0.1, 0.2, 0.4],
+        "observation_kind": "tracked"
+      }
+    ]
+  },
+  {
+    "at_ms": 3900,
+    "pts": 351000,
+    "dets": [
+      {
+        "label": "person",
+        "score": 0.9,
+        "bbox": [0.1, 0.1, 0.2, 0.4],
+        "observation_kind": "tracked"
+      }
+    ]
+  },
+  {
+    "at_ms": 4200,
+    "pts": 378000,
+    "dets": [
+      {
+        "label": "person",
+        "score": 0.9,
+        "bbox": [0.1, 0.1, 0.2, 0.4],
+        "observation_kind": "tracked"
+      }
+    ]
+  },
+  {
+    "at_ms": 4500,
+    "pts": 405000,
+    "dets": [
+      {
+        "label": "person",
+        "score": 0.9,
+        "bbox": [0.1, 0.1, 0.2, 0.4],
+        "observation_kind": "tracked"
+      }
+    ]
+  },
+  {
+    "at_ms": 4800,
+    "pts": 432000,
+    "dets": [
+      {
+        "label": "person",
+        "score": 0.9,
+        "bbox": [0.1, 0.1, 0.2, 0.4],
+        "observation_kind": "tracked"
+      }
+    ]
+  },
+  {
+    "at_ms": 5100,
+    "pts": 459000,
+    "dets": [
+      {
+        "label": "person",
+        "score": 0.9,
+        "bbox": [0.1, 0.1, 0.2, 0.4],
+        "observation_kind": "tracked"
+      }
+    ]
+  },
+  {
+    "at_ms": 5400,
+    "pts": 486000,
+    "dets": [
+      {
+        "label": "person",
+        "score": 0.9,
+        "bbox": [0.1, 0.1, 0.2, 0.4],
+        "observation_kind": "tracked"
+      }
+    ]
+  },
+  {
+    "at_ms": 5700,
+    "pts": 513000,
+    "dets": [
+      {
+        "label": "person",
+        "score": 0.9,
+        "bbox": [0.1, 0.1, 0.2, 0.4],
+        "observation_kind": "tracked"
+      }
+    ]
+  },
+  {
+    "at_ms": 6000,
+    "pts": 540000,
+    "dets": [{ "label": "person", "score": 0.99, "bbox": [0.1, 0.1, 0.2, 0.4] }]
+  }
+]
