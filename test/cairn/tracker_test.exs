@@ -449,10 +449,12 @@ defmodule Cairn.TrackerTest do
     end
 
     # old→new: the drift used to be a frame-wide box marching to x = 2.0. Boxes
-    # are frame-normalized now (the motion filter clamps its predictions into
-    # the frame), so the same walk is scaled to stay inside it — every ratio
-    # the stillness rule reads is unchanged, the drift is still a tenth of the
-    # box's width per step.
+    # are frame-normalized now — the motion filter's noise model is scaled by
+    # height as a fraction of the frame and its predicted widths and heights
+    # are capped at 1.0, so pixel-scale boxes stop matching (the origin is
+    # free; it is the dimensions that assume the frame). The same walk is
+    # scaled to stay in those units — every ratio the stillness rule reads is
+    # unchanged, the drift is still a tenth of the box's width per step.
     test "a slow drift never reads stationary, however long it runs" do
       # each box overlaps the one before it well past @stationary_iou, so a
       # rule that compared consecutive boxes would call this motionless
@@ -1689,7 +1691,9 @@ defmodule Cairn.TrackerTest do
     # division — the only way to write "one thousandth under the constant"
     # without hoping a float lands where the arithmetic says. (old→new: this
     # used to be a 1_000 x 1_000 pixel brick; boxes are frame-normalized now,
-    # because the motion filter clamps its predictions into the frame.)
+    # because the motion filter's predicted dimensions are capped at the
+    # frame — a pixel-wide brick would coast at width 1.0 and stop matching
+    # itself. The origin is free; the dimensions are what assume the frame.)
     @brick [0.0, 0.0, 0.9765625, 1.0]
     # 400/1024 over 1000/1024 = `@stitch_iou`
     @brick_40 [0.0, 0.0, 0.390625, 1.0]
