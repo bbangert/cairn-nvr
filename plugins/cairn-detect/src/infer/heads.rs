@@ -6,7 +6,7 @@
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::emit::Det;
+use crate::emit::{Det, ObservationKind};
 
 use super::geometry::{Bbox, InputSize, ModelBox, NormBox, Projection};
 use super::labels::{Labels, ScoreFloors};
@@ -638,6 +638,9 @@ fn det_from(bbox: NormBox, score: f64, label: String) -> Option<Det> {
         // already rejected upstream, which is what makes `clamp` total here.
         score: round_to(score.clamp(0.0, 1.0), 3),
         bbox,
+        // A box the model found in the frame in hand. The other kind is minted
+        // in `emit`, from boxes an earlier frame's pass found, and never here.
+        observation_kind: ObservationKind::Detected,
     })
 }
 
@@ -662,7 +665,7 @@ mod tests {
     use super::super::labels::{check_label_count, Labels, ScoreFloors};
     use super::super::profile::*;
     use super::*;
-    use crate::emit::Det;
+    use crate::emit::{Det, ObservationKind};
 
     fn labels() -> Labels {
         Labels(vec!["person".into(), "bicycle".into(), "car".into()])
@@ -761,6 +764,7 @@ mod tests {
                 label: "person".into(),
                 score: 0.877,
                 bbox: [0.1, 0.2, 0.2, 0.3],
+                observation_kind: ObservationKind::Detected,
             }]
         );
     }
@@ -882,6 +886,7 @@ mod tests {
                 label: "person".into(),
                 score: 0.9,
                 bbox: [0.4, 0.35, 0.2, 0.3],
+                observation_kind: ObservationKind::Detected,
             }]
         );
     }
@@ -1042,6 +1047,7 @@ mod tests {
                 label: "person".into(),
                 score: 0.65,
                 bbox: [0.45, 0.45, 0.1, 0.1],
+                observation_kind: ObservationKind::Detected,
             }]
         );
     }
@@ -1294,6 +1300,7 @@ mod tests {
                 label: "person".into(),
                 score: 0.6, // 0.8 objectness * 0.75 class
                 bbox: [0.5, 0.2188, 0.125, 0.125],
+                observation_kind: ObservationKind::Detected,
             }]
         );
     }
@@ -1564,6 +1571,7 @@ mod tests {
                 label: "car".into(),
                 score: 0.982, // sigmoid(4)
                 bbox: [0.375, 0.25, 0.25, 0.5],
+                observation_kind: ObservationKind::Detected,
             }]
         );
     }
@@ -1980,6 +1988,7 @@ mod tests {
             label: label.into(),
             score,
             bbox,
+            observation_kind: ObservationKind::Detected,
         }
     }
 

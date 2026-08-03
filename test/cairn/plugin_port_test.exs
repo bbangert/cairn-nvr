@@ -6,11 +6,15 @@ defmodule Cairn.PluginPortTest do
 
   import ExUnit.CaptureLog
 
-  alias Cairn.{CameraTracker, Event, Observation, PluginPort, StreamEpochs, ULID}
+  alias Cairn.{CameraTracker, Event, Observation, PluginPort, StreamEpochs, Track, ULID}
   alias Cairn.Config.Camera
 
   @mock Path.absname("priv/plugins/mock/mock_plugin.exs")
   @timeline Path.absname("test/support/fixtures/timelines/person_walkthrough.json")
+  # Real detections, a stretch of seeded `"tracked"` re-reports of the same
+  # box, then real detections again — what `plugins/cairn-detect`'s motion gate
+  # emits for a still scene.
+  @gated_timeline Path.absname("test/support/fixtures/timelines/gated_stretch.json")
 
   defp camera(id) do
     %Camera{
@@ -136,6 +140,83 @@ defmodule Cairn.PluginPortTest do
     assert_receive {:event_updated, %Event{camera_id: ^id}}, 5_000
     assert_receive {:event_updated, %Event{camera_id: ^id} = updated}, 5_000
     assert Map.keys(updated.max_scores) == ["person"]
+  end
+
+  # The parse side is already covered — `Cairn.PluginProtocolTest`, "objects
+  # carry track_id and observation_kind" — so what is left to prove is the
+  # tracking consequence: a plugin that stops inferring and re-reports what it
+  # last saw must not cost the object its identity or its stillness. Nothing
+  # host-side changed for this; the gate rides semantics that were already here.
+  test "a gated stretch of seeded lines keeps the track it re-reports" do
+    id = "plug_gated_#{System.unique_integer([:positive])}"
+    StreamEpochs.new_epoch(id, :started)
+
+    # Both bounds are scaled down to the timeline, and the stretch is sized
+    # against the bound the track actually expires on. The object parks 1.2 s
+    # in, so it is `stationary` before the seeds start at 1.8 s — and a
+    # stationary track's unseen bound is `@stationary_unseen_factor` (5) ×
+    # `max_unseen_ms`, i.e. 2 000 ms here, not 400. The seeds run 1.8–5.7 s and
+    # the next real detection lands at 6.0 s, so the stretch the seeds carry the
+    # track across is 4 500 ms of unseen time: past the 2 000 ms bound with
+    # margin to spare, while the 300 ms seed cadence stays inside it. Replace
+    # the seeded lines with the empty-`objects` liveness lines an unmemoried
+    # gate emits and the track expires mid-stretch, taking its identity with it.
+    # The shipped defaults — `stationary_after_ms` 10 s and `max_unseen_ms` 3 s,
+    # so 15 s of stationary grace — would have put this test past 25 seconds.
+    camera = %Camera{camera(id) | stationary_after_ms: 1_000, max_unseen_ms: 400}
+
+    tracker =
+      start_supervised!(
+        {CameraTracker,
+         camera_id: id,
+         start_extractor: fn _camera, _event ->
+           {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+         end}
+      )
+
+    Event.subscribe()
+
+    command =
+      "elixir #{@mock} --camera-id #{id} --udp-port 19100 " <>
+        "--min-score-json '{}' --timeline #{@gated_timeline} --hold"
+
+    start_supervised!({PluginPort, camera: camera, config: config(), index: 0, command: command})
+
+    # the identity minted by the first real detection, before any seed
+    assert_receive {:event_started, %Event{camera_id: ^id} = event}, 5_000
+    assert [%{label: "person", object_id: object_id}] = event.labels
+
+    # Mid-stretch, and receivable only if the seeded batches reached the
+    # tracker: `stale_predicted` is recomputed per batch from
+    # `last_detected_ms`, which a seed does not move, so it flips true once a
+    # batch arrives more than `max_unseen_ms` (400 ms) after the last real
+    # detection at 1.5 s. No batch, no flip — every detection in this timeline
+    # is broadcast with it false.
+    assert_receive {:track_updated,
+                    %Track{
+                      object_id: ^object_id,
+                      stale_predicted: true,
+                      stationary: true
+                    }},
+                   10_000
+
+    # The timeline's last line is a real detection at 0.99, so this broadcast
+    # is the far side of the seeded stretch — and it carries the identity the
+    # first detection minted, not a new one.
+    assert_receive {:track_updated,
+                    %Track{
+                      object_id: ^object_id,
+                      best_score: 0.99,
+                      stationary: true,
+                      stale_predicted: false
+                    }},
+                   10_000
+
+    # one track, the same one, still parked: the seeds sustained it without
+    # minting an identity and without touching the stillness only detections
+    # can earn or lose
+    assert [%Track{object_id: ^object_id, stationary: true}] =
+             Cairn.Tracker.live_tracks(:sys.get_state(tracker).tracker)
   end
 
   test "malformed lines are dropped without crashing" do

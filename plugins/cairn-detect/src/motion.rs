@@ -154,24 +154,19 @@ pub struct MotionConfig {
     pub min_area_fraction: f32,
     /// Rolling-average weight: `bg = (1 - alpha) * bg + alpha * frame`.
     pub alpha: f32,
-    // The three policy knobs below are parsed here and consumed by the gate
-    // policy in `infer_loop`, which does not exist yet — the decode side has
-    // no use for a duration. `validate` bounds nothing about them: any u64
-    // parses, because what a bound would mean is the policy's to define. They
-    // are accepted now so the config surface an operator writes does not
-    // change under them when it does.
-    //
-    // `-D warnings` treats a field nothing reads as an error, and dropping
-    // them from the struct instead would put a knob's parse and its default
-    // in different phases. Delete this allow once the policy reads them.
+    // The three knobs below belong to the gate policy and are read in
+    // [`crate::gate`], not here: this side measures a frame, and a duration is
+    // no use to it. `validate` bounds nothing about them, deliberately — every
+    // u64 is a policy a run can honour, including `0` (that rule never fires)
+    // and a duration longer than the process will live (it never stops
+    // firing), so an out-of-range value is not a thing an operator can write.
+    // What they cost when set wrongly is inference the gate did or did not
+    // skip, which the run's own output shows.
     /// How long past the last motion to keep inferring anyway.
-    #[allow(dead_code)]
     pub linger_ms: u64,
     /// How long after a stream epoch change to infer regardless of motion.
-    #[allow(dead_code)]
     pub epoch_bypass_ms: u64,
     /// How often to infer anyway while gated, to re-verify what is parked.
-    #[allow(dead_code)]
     pub reverify_ms: u64,
 }
 
@@ -243,31 +238,50 @@ pub fn resolve(global: &MotionOverrides, per_camera: &MotionOverrides) -> Option
 }
 
 /// What one frame's comparison against the background says.
-// Measurement is wired ahead of its consumer: the verdict rides `Sample` to
-// the inference thread, and nothing there reads either field yet. `-D warnings`
-// makes an unread field fatal. The allows are on the fields rather than on the
-// type so that anything else here going unused — the type, `still()` — is still
-// reported. Delete them once the gate policy reads the verdict.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MotionVerdict {
     /// Fraction of the thumbnail whose difference from the background exceeded
     /// the threshold, in 0..=1. Reported even when `motion` is false, because
     /// it is the number an operator tunes `min_area_fraction` against.
+    // The gate decides on `motion`, `calibrating` and `scene_cut`; this is the
+    // number behind all three, and nothing outside this module's own tests
+    // reads it yet. `-D warnings` makes an unread field fatal. Delete this
+    // allow once the status telemetry reports it (plan 3.1).
     #[allow(dead_code)]
     pub changed_fraction: f32,
     /// Whether that fraction reaches `min_area_fraction` on a calibrated
     /// detector. Always false while calibrating and on a scene cut.
-    #[allow(dead_code)]
     pub motion: bool,
+    /// Whether this verdict came from a detector that has not finished
+    /// calibrating, and so cannot say a scene is still — see
+    /// [`CALIBRATION_FRAMES`]. `motion` is false throughout that window
+    /// whatever is in front of the camera, which is a statement about the
+    /// background rather than about the picture, and the two are worth telling
+    /// apart by anything deciding whether to skip work.
+    pub calibrating: bool,
+    /// Whether `changed_fraction` cleared [`LIGHTNING_FRACTION`], so this
+    /// frame was read as a scene cut and rebaselined the background. `motion`
+    /// is false on one of these for a reason of its own — what changed is the
+    /// whole picture, which is not a thing moving in the scene — and that
+    /// false is the second one that says nothing about the picture: the
+    /// background it was measured against described a scene that no longer
+    /// exists, and the frames after it are measured against a background one
+    /// frame old. [`crate::gate`] reads this the same way it reads
+    /// `calibrating`.
+    pub scene_cut: bool,
 }
 
 impl MotionVerdict {
     /// The verdict for a frame there is nothing to compare against: the first
-    /// one, or the first after the geometry changed.
+    /// one, or the first after the geometry changed. Calibrating by
+    /// construction — that frame *is* the background — and not a cut, there
+    /// being no comparison behind it to have cleared the threshold.
     fn still() -> Self {
         Self {
             changed_fraction: 0.0,
             motion: false,
+            calibrating: true,
+            scene_cut: false,
         }
     }
 }
@@ -388,11 +402,13 @@ impl MotionDetector {
 
     /// Compare one thumbnail against the background, then fold it in.
     ///
-    /// The three ways this reports no motion are not the same thing: an
-    /// uncomparable frame (the first, or the first at a new geometry), a scene
+    /// The three ways this reports no motion are not the same thing: a frame
+    /// measured against a background still being learned (the calibration
+    /// window, which the first frame and a geometry change restart), a scene
     /// cut, and a genuinely still scene. Only the last is a statement about
-    /// the picture, and the gate's caller is free to treat all three alike —
-    /// it is `changed_fraction` that separates them.
+    /// the picture, and the verdict names the other two: `calibrating` and
+    /// `scene_cut` are each set on their own frame, and [`crate::gate`]
+    /// refuses to skip work on a verdict carrying either.
     pub fn observe(&mut self, thumb: &GrayThumb) -> MotionVerdict {
         if self.size != thumb.size() {
             self.take_background(thumb);
@@ -400,6 +416,10 @@ impl MotionDetector {
             return MotionVerdict::still();
         }
 
+        // Read before the frame is folded in, so the flag describes the
+        // background this frame was compared against rather than the one the
+        // comparison produced.
+        let calibrating = self.frames < CALIBRATION_FRAMES;
         let threshold = f32::from(self.config.threshold);
         let changed = self
             .background
@@ -417,23 +437,29 @@ impl MotionDetector {
             //
             // `frames` deliberately survives and advances. It survives because
             // a calibrated detector stays calibrated: restarting the
-            // calibration here would blind the camera for 5 seconds every time
-            // a light came on, which is a moment that tends to be worth looking
-            // at. It advances because a detector that has just rebaselined onto
-            // the scene in front of it has, if anything, more to go on than a
-            // calibrating one — and because a camera that cuts on most samples
-            // (an IR-cut filter hunting, auto-exposure oscillating) has to
-            // finish calibrating at some point, rather than sitting at "no
-            // motion" for as long as it flickers.
+            // calibration here would report `calibrating` for 5 seconds every
+            // time a light came on, and what the camera is looking at then
+            // tends to be worth measuring. It advances because a detector that
+            // has just rebaselined onto the scene in front of it has, if
+            // anything, more to go on than a calibrating one — and because a
+            // camera that cuts on most samples (an IR-cut filter hunting,
+            // auto-exposure oscillating) has to finish calibrating at some
+            // point, rather than sitting at "no motion" for as long as it
+            // flickers.
+            //
+            // Neither of those is what keeps the gate open on this frame:
+            // `scene_cut` is, and it is set whether or not the detector was
+            // calibrating.
             self.take_background(thumb);
             self.frames = self.frames.saturating_add(1);
             return MotionVerdict {
                 changed_fraction,
                 motion: false,
+                calibrating,
+                scene_cut: true,
             };
         }
 
-        let calibrating = self.frames < CALIBRATION_FRAMES;
         let alpha = if calibrating {
             CALIBRATION_ALPHA
         } else {
@@ -447,6 +473,8 @@ impl MotionDetector {
         MotionVerdict {
             changed_fraction,
             motion: !calibrating && changed_fraction >= self.config.min_area_fraction,
+            calibrating,
+            scene_cut: false,
         }
     }
 
@@ -563,17 +591,44 @@ mod tests {
 
         let mut last_inside = detector();
         observe_still(&mut last_inside, &still, CALIBRATION_FRAMES - 1);
+        let verdict = last_inside.observe(&moved);
         assert!(
-            !last_inside.observe(&moved).motion,
+            !verdict.motion,
             "observation {CALIBRATION_FRAMES} is still inside the window"
         );
+        // The window is what the flag reports, and the gate is what reads it:
+        // a verdict from inside it says nothing about the picture, so it is
+        // never one the gate may skip on.
+        assert!(verdict.calibrating);
 
         let mut first_outside = detector();
         observe_still(&mut first_outside, &still, CALIBRATION_FRAMES);
+        let verdict = first_outside.observe(&moved);
         assert!(
-            first_outside.observe(&moved).motion,
+            verdict.motion,
             "observation {} is the first outside it",
             CALIBRATION_FRAMES + 1
+        );
+        assert!(!verdict.calibrating);
+    }
+
+    #[test]
+    fn every_observation_of_the_calibration_window_is_flagged_as_one() {
+        // The flag the whole reopen guarantee rests on (`crate::gate`: a
+        // camera whose detector is not calibrated is never gated), asserted on
+        // every verdict the window produces rather than only at its edge —
+        // including the first frame, which is the background rather than a
+        // comparison against one.
+        let mut warming = detector();
+        let still = thumb(96, 54, 100);
+
+        assert!(warming.observe(&still).calibrating, "the first frame");
+        for frame in 1..CALIBRATION_FRAMES {
+            assert!(warming.observe(&still).calibrating, "frame {frame}");
+        }
+        assert!(
+            !warming.observe(&still).calibrating,
+            "the first one past it"
         );
     }
 
@@ -588,7 +643,12 @@ mod tests {
         let bright = thumb(96, 54, 200);
         for observation in 0..CALIBRATION_FRAMES {
             let flip = if observation % 2 == 0 { &bright } else { &dark };
-            assert!(!flickering.observe(flip).motion, "{observation}");
+            let verdict = flickering.observe(flip);
+            assert!(!verdict.motion, "{observation}");
+            // The first frame *is* the background; every one after it is a cut
+            // and is flagged as one, so a camera in this state is one the gate
+            // infers on every sample of.
+            assert_eq!(verdict.scene_cut, observation > 0, "{observation}");
         }
 
         // Calibrated, on the scene the last cut left behind.
@@ -727,6 +787,11 @@ mod tests {
         let flash = detector.observe(&bright);
         assert_eq!(flash.changed_fraction, 1.0);
         assert!(!flash.motion, "a scene cut is not motion");
+        // …and says so as its own field, which is what keeps the gate from
+        // reading this frame's `motion: false` as a still scene. The detector
+        // was past its window, so the flag it does *not* set matters as much.
+        assert!(flash.scene_cut);
+        assert!(!flash.calibrating);
 
         // The background is the new scene outright, so the very next frame is
         // judged against it — not averaged toward it over the next 50 frames,
@@ -734,8 +799,29 @@ mod tests {
         let settled = detector.observe(&bright);
         assert_eq!(settled.changed_fraction, 0.0);
         assert!(!settled.motion);
+        // This one is the ordinary still verdict, cut and window both behind
+        // it: the frames after a cut are the gate's to skip on.
+        assert!(!settled.scene_cut);
+        assert!(!settled.calibrating);
         // ...and the detector is still calibrated: it did not go blind.
         assert!(detector.observe(&block(96, 54, 200, 48, 27, 40)).motion);
+    }
+
+    #[test]
+    fn a_scene_cut_inside_the_calibration_window_carries_both_flags() {
+        // The two "this says nothing about the picture" bits are independent:
+        // a detector still learning its background can cut, and the verdict
+        // has to name both, since the window ending is not what stops the cut
+        // from being read as a still scene.
+        let mut warming = detector();
+        let dark = thumb(96, 54, 40);
+        warming.observe(&dark);
+
+        let flash = warming.observe(&thumb(96, 54, 200));
+        assert_eq!(flash.changed_fraction, 1.0);
+        assert!(flash.scene_cut);
+        assert!(flash.calibrating);
+        assert!(!flash.motion);
     }
 
     #[test]
@@ -745,6 +831,12 @@ mod tests {
 
         let verdict = detector.observe(&thumb(96, 72, 200));
         assert_eq!(verdict, MotionVerdict::still());
+        // Spelled out because the compare above is against the same
+        // constructor and so pins nothing about the fields: calibration starts
+        // over at the new geometry, and there was no comparison behind this
+        // frame for a cut to have come out of.
+        assert!(verdict.calibrating);
+        assert!(!verdict.scene_cut);
         // and it re-calibrates at the new geometry
         assert!(!detector.observe(&block(96, 72, 200, 96, 36, 40)).motion);
     }

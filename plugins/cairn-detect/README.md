@@ -125,9 +125,27 @@ named group under `plugins:` and point cameras at it by name — see
 A Frigate-style no-change filter: each sampled frame is downscaled to a small
 grayscale thumbnail, compared against a rolling-average background of the
 frames before it, and the fraction of the thumbnail that changed is what the
-gate reads. **It is off unless you switch it on**, and this build only
-*measures*: the change fraction is computed per sample and nothing is skipped
-because of it yet.
+gate reads. **It is off unless you switch it on.**
+
+With it on, a sample of a scene that is not changing skips the model pass — the
+dominant cost — and is emitted anyway, carrying the last real inference's boxes
+at the scores that inference gave them, marked `"observation_kind": "tracked"`
+so the host can tell a re-report from evidence. A gated camera with nothing
+remembered emits the empty-`objects` liveness line instead. Every sample the
+plugin would have emitted before still produces exactly one line — a camera
+Cairn has not started still emits nothing at all ([The control
+channel](#the-control-channel)) —
+so the gate changes what a run costs and not what the host sees arriving.
+
+Skipping is bounded on all sides: the model runs anyway for `linger_ms` past
+the last motion, for `epoch_bypass_ms` after Cairn restarts the stream, every
+`reverify_ms` while gated, on a camera Cairn has not started, on a frame read
+as a scene cut (an IR-cut flip, a light coming on: the background it was
+measured against is gone, so nothing measured says the scene is still), and
+throughout the calibration window of a motion detector that has just been
+built — the state a plugin-side reconnect leaves a camera in, which arrives
+with no epoch change to bypass with. A scene cut is not treated as motion: it
+buys the one model pass that looks at the new scene, not `linger_ms` of them.
 
 ```yaml
 plugin:
@@ -140,7 +158,7 @@ plugin:
 
 | knob | default | meaning |
 |------|---------|---------|
-| `enabled` | `false` | run the gate at all. With this off no detector is built and no thumbnail is taken. The knobs below are still range-checked either way, so an out-of-range value fails startup even with the gate switched off |
+| `enabled` | `false` | run the gate at all. With this off no detector is built and no thumbnail is taken. The knobs below that have ranges are still checked either way, so an out-of-range value fails startup even with the gate switched off |
 | `threshold` | `25` | per-pixel 0..255 difference from the background that counts as changed (`1..=254`; the comparison is strict and 255 is the largest difference there is, so 255 would count nothing) |
 | `min_area_fraction` | `0.005` | fraction of the thumbnail that has to change before the frame counts as motion (`(0, 0.8)`; a frame that changes more than 80 % is a scene cut, so a floor at or above that is refused at startup rather than left unreachable) |
 | `alpha` | `0.02` | how fast the background absorbs the picture: `bg = (1 - alpha) * bg + alpha * frame`, per sample (`(0, 1]`). At the 5 fps sample rate this is roughly a 10-second memory, and something that parks in frame keeps reading as motion for at least that long — longer the more it contrasts with what it covers, since the background has to decay to within `threshold` of it |
@@ -148,9 +166,12 @@ plugin:
 | `epoch_bypass_ms` | `15000` | how long after a stream restart to infer regardless of motion |
 | `reverify_ms` | `10000` | how often to infer anyway while gated |
 
-The last three are accepted but not range-checked — any unsigned duration
-parses, and nothing reads them yet: they belong to the gating policy, not to
-the measurement.
+The last three are accepted but not range-checked, deliberately: every unsigned
+duration is a policy the gate can honour. `0` switches its rule off (no linger,
+no bypass; `reverify_ms: 0` is a gate that re-verifies every sample and so never
+skips one), and a duration longer than the run leaves that rule always on.
+Setting one wrongly costs inference that was or was not skipped, which a run's
+own output shows.
 
 An unknown knob *inside* a `motion` object is a startup error rather than a
 setting that silently does nothing, so a typo'd knob fails loudly. The `motion`
@@ -164,7 +185,10 @@ the background is still the scene that happened to be in front of the camera.
 And a frame in which more than 80 % of the thumbnail changed is treated as a
 scene cut, not as motion: the background is replaced with it outright and the
 frame reports no motion, which is what keeps an IR-cut filter flipping or a
-light switch from reading as the whole frame moving.
+light switch from reading as the whole frame moving. Neither of the two is a
+reason to skip a model pass — both are in the list of bounds above, because
+"no motion" from a background that is still being learned, or from one that
+has just been thrown away, is not a measurement of the scene.
 
 The calibration window and `alpha`'s memory are both counted in samples, and
 5 fps is a ceiling on the sample rate rather than the rate itself — the gate
@@ -204,11 +228,14 @@ this plugin:
  "objects":[{"label":"person","score":0.87,"bbox":[0.12,0.34,0.2,0.4]}]}
 ```
 
-`capabilities.object_tracking` is `false`: this plugin detects and does not
-track, so every object is a fresh observation and Cairn runs its own tracker
-over them. `observation_kind` is omitted, which the host reads as
-`"detected"` — spelling it out on all 64 objects would cost a quarter of the
-line budget to say the default.
+`capabilities.object_tracking` is `false`: this plugin mints no identities and
+carries none between frames, so Cairn runs its own tracker over what it sends.
+`observation_kind` is omitted above, which the host reads as `"detected"` — on
+a full 64-object line the field would add about 1.9 KB to say the default. The
+[motion gate](#motion-gate) is the one thing that sets it: a seeded line spells
+`"tracked"` on every object, which is how the host tells a box re-reported from
+an earlier frame apart from evidence. It is still Cairn that decides which
+track either belongs to.
 
 `bbox` is `[x, y, w, h]` normalized to 0..1 against the *frame*, origin
 top-left, y down. `sequence` counts from 0 per camera and only advances for

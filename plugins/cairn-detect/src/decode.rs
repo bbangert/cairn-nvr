@@ -80,11 +80,8 @@ pub struct Sample {
     ///
     /// Measured on the decode thread because that is where the pixels are;
     /// carried here because the inference thread is the only place that knows
-    /// which camera a sample came from.
-    // Wired ahead of its consumer: nothing reads this yet, and `-D warnings`
-    // makes an unread field fatal. Delete this allow once the gate policy
-    // reads the verdict.
-    #[allow(dead_code)]
+    /// which camera a sample came from, which is where [`crate::gate`] reads
+    /// it and decides whether this sample is worth a model pass.
     pub motion: Option<MotionVerdict>,
     pub input: ModelInput,
 }
