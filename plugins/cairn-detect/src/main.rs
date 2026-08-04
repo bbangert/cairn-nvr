@@ -61,7 +61,7 @@ use control::Streams;
 use decode::{DecoderKind, Sample};
 use emit::Publisher;
 use gate::Gate;
-use infer::{Detector, InputSize, Labels, ModelProfile, ScoreFloors};
+use infer::{Detector, InputSize, Labels, ModelProfile, ScoreFloors, TrackFloorOverrides};
 use motion::{MotionConfig, MotionOverrides};
 
 #[derive(Parser, Debug)]
@@ -106,6 +106,19 @@ struct Args {
     /// member, and a member's own `motion` key overrides the knobs it names.
     #[arg(long)]
     motion_json: Option<String>,
+
+    /// JSON object with one knob, `floor`: the score down to which detections
+    /// below their class's `min_score` are emitted anyway, at their real
+    /// scores, for the host's low-confidence association stage. Absent — the
+    /// default — emits exactly what the per-class floors admit.
+    ///
+    /// Operator-owned like `--motion-json`, and for the same reason it does
+    /// not conflict with `--cameras-json`: it is written into the configured
+    /// command rather than appended by Cairn, so it has to be expressible in
+    /// both modes. In group mode it is the default for every member, and a
+    /// member's own `track_floor` key replaces it.
+    #[arg(long)]
+    track_floor_json: Option<String>,
 
     /// ONNX detection model: a yolox, rfdetr, yolov10/yolo26 or
     /// yolov8/yolov9/yolo11 head.
@@ -177,10 +190,14 @@ fn start_control<'a>(camera_ids: impl IntoIterator<Item = &'a str>) -> Result<Ar
 /// One process, a whole plugin group: see [`multiplex`] for the error policy.
 fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
     let specs = multiplex::parse_specs(cameras_json)?;
-    // Both argument checks before the control thread and the model load: a
+    // Every argument check before the control thread and the model load: a
     // malformed argument is a start-up failure the operator should see
-    // immediately, not seconds of ONNX later.
+    // immediately, not seconds of ONNX later. The floors are resolved here
+    // rather than inside `multiplex::run` for the same reason — pairing a
+    // track floor with a member's `min_score` map is the check that can fail,
+    // and it has to fail before the model does anything.
     let motion = motion_overrides(args)?;
+    let floors = multiplex::floors_for(&specs, &track_floor_overrides(args)?)?;
     let streams = start_control(specs.iter().map(|spec| spec.id.as_str()))?;
     // No `camera_id`: this is the process talking, and the group host applies
     // an untargeted status to every member.
@@ -218,6 +235,7 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
         &specs,
         args.decoder,
         &motion,
+        floors,
         detector,
         &labels,
         Publisher::new(streams),
@@ -228,6 +246,12 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
 /// default", which is a gate that is off.
 fn motion_overrides(args: &Args) -> Result<MotionOverrides> {
     MotionOverrides::parse(args.motion_json.as_deref().unwrap_or("{}"))
+}
+
+/// The process-wide `--track-floor-json` knob, defaulting to absent — which is
+/// the feature off and emission unchanged.
+fn track_floor_overrides(args: &Args) -> Result<TrackFloorOverrides> {
+    TrackFloorOverrides::parse(args.track_floor_json.as_deref().unwrap_or("{}"))
 }
 
 /// One process, one camera. Any stream failure is fatal by design: Cairn
@@ -249,8 +273,13 @@ fn run_single(args: &Args) -> Result<()> {
         None,
     ))?;
 
-    let floors = ScoreFloors::parse(args.min_score_json.as_deref().unwrap_or("{}"))?;
-    // One camera, so there is nothing to override the process-wide knobs with.
+    // One camera, so there is nothing to override the process-wide knobs with,
+    // here or below.
+    let floors = ScoreFloors::parse(args.min_score_json.as_deref().unwrap_or("{}"))?
+        .with_track_floor(TrackFloorOverrides::resolve(
+            &track_floor_overrides(args)?,
+            &TrackFloorOverrides::default(),
+        ))?;
     let motion = motion::resolve(&motion_overrides(args)?, &MotionOverrides::default());
     let labels = Labels::load(args.labels.as_deref())?;
     // Before the stream opens: `decode::open` below needs the resolved size.
@@ -463,6 +492,45 @@ mod tests {
         };
         assert!(with(r#"{"enabled":true}"#).is_ok());
         assert!(with(r#"{"alpha":0}"#).is_err());
+        assert!(with(r#"{"nonsense":1}"#).is_err());
+    }
+
+    #[test]
+    fn the_track_floor_is_configurable_in_both_forms() {
+        // Cairn's own flags conflict with --cameras-json; this one is the
+        // operator's, written into the configured command, so like
+        // --motion-json it has to survive next to either form.
+        let knobs = r#"{"floor":0.15}"#;
+        let group = parse(&["--cameras-json", "[]", "--track-floor-json", knobs]).unwrap();
+        assert_eq!(group.track_floor_json.as_deref(), Some(knobs));
+        let single = parse(&[
+            "--camera-id",
+            "front",
+            "--udp-port",
+            "17000",
+            "--track-floor-json",
+            knobs,
+        ])
+        .unwrap();
+        assert_eq!(single.track_floor_json.as_deref(), Some(knobs));
+    }
+
+    #[test]
+    fn the_track_floor_defaults_to_absent_and_a_bad_one_never_reaches_a_camera() {
+        let base = &["--camera-id", "front", "--udp-port", "17000"];
+        let bare = parse(base).unwrap();
+        assert!(bare.track_floor_json.is_none());
+        assert!(track_floor_overrides(&bare).unwrap().floor.is_none());
+
+        let with = |knobs: &str| {
+            let mut argv = base.to_vec();
+            argv.extend_from_slice(&["--track-floor-json", knobs]);
+            track_floor_overrides(&parse(&argv).unwrap())
+        };
+        assert_eq!(with(r#"{"floor":0.1}"#).unwrap().floor, Some(0.1));
+        // the two the plan names: a floor of 0 is noise with no matcher, and
+        // a mistyped knob is a setting that silently did nothing
+        assert!(with(r#"{"floor":0}"#).is_err());
         assert!(with(r#"{"nonsense":1}"#).is_err());
     }
 

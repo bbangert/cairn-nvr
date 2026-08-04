@@ -119,6 +119,7 @@ named group under `plugins:` and point cameras at it by name — see
 | `--model-profile` | no | `yolox`, `rfdetr`, `yolov10` or `yolov8` (plus the aliases `rf-detr`, `yolo26`, `yolov9`, `yolo11`, `yolov11`) — the preprocessing and decode steps to run the model under. Sniffed from the model when omitted; required when a shape fits more than one profile or the model's *output* shape is dynamic (see [Model profiles](#model-profiles)) |
 | `--decoder` | no | `auto` (default), `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` |
 | `--motion-json` | no | JSON object of motion-gate knobs. **Off by default** — see [Motion gate](#motion-gate) |
+| `--track-floor-json` | no | JSON object with one knob, `floor`: emit detections below their class's `min_score` down to it, for the host's low-confidence tracking stage. **Off by default** — see [Track floor](#track-floor) |
 
 ## Motion gate
 
@@ -291,6 +292,89 @@ and consecutive details therefore name opposite transitions; and the gate's
 window is the same 5 s as the heartbeat interval, so even a repeat would be
 due.
 
+## Track floor
+
+`min_score` is where a detection stops being worth reporting. That is the
+right cut for *evidence* — what starts an event, what gets recorded — and the
+wrong one for *tracking*: an object walking behind a bush drops to 0.2 for a
+few frames and comes back at 0.8, and a plugin that emits neither of the
+middle frames leaves the host's tracker guessing whether the thing that came
+back is the thing that left.
+
+`--track-floor-json` lowers the emission cutoff and nothing else. With
+`'{"floor":0.1}'` and a `min_score` of 0.5, every detection from 0.1 up is
+emitted, at the score the model gave it, as an ordinary `detected` object.
+**It is off unless you switch it on**, and a run without it emits exactly what
+it emitted before the flag existed — byte for byte.
+
+```yaml
+plugin:
+  - plugins/cairn-detect/target/release/cairn-detect
+  - --model
+  - plugins/cairn-detect/yolox_nano.onnx
+  - --track-floor-json
+  - '{"floor": 0.1}'
+```
+
+| knob | default | meaning |
+|------|---------|---------|
+| `floor` | absent | score down to which detections below their class's `min_score` are emitted anyway. Must be in `(0, 1)` and **strictly below every `min_score` on the camera it applies to**, or startup fails naming the floor it collided with |
+
+Both bounds are refused rather than clamped. At or below 0 every box the model
+proposes goes on the wire, which is noise the host has nothing to match it
+against much under 0.05; at or above the lowest `min_score` the band
+`[floor, min_score)` is empty and the flag is doing nothing the operator can
+see. The pairing is per camera, so in a group the same `--track-floor-json` can
+be legal for one member and refused for its neighbour — the message names the
+member.
+
+Nothing on the wire marks a sub-floor box, and nothing needs to: the host
+applies the same floors to the same scores, and what it does with the ones
+below is [its own two-stage
+association](../../docs/plugin-contract.md#argv) — a low-confidence box may
+take a live track that this frame's confident boxes did not, and it may never
+mint a new one.
+
+### What the flag keeps true
+
+1. **It lowers a cutoff; it does not add a pipeline.** The band goes through
+   the same per-class gate, the same NMS and the same caps as everything else,
+   in one pass — so a sub-floor box is suppressed by a stronger box of its own
+   class exactly as a weak box always was, and a stronger box of *another*
+   class leaves it alone exactly as before.
+2. **The band is shed first, under any floor shape.** Detections are ranked
+   evidence first and score second at every cut — the candidate truncation
+   before NMS, the 32-detection cap, and the 64-object and 65 536-byte cuts
+   where the line is serialized — so the band is always the tail and always
+   the first thing to go. Ranking by score alone would not do it: with
+   `min_score` at 0.4 for `person` and 0.8 for `car`, a band `car` at 0.5
+   outscores an evidence `person` at 0.45, and per-label floors are a
+   configuration Cairn writes.
+3. **A seed never re-reports the band.** With the [motion gate](#motion-gate)
+   on as well, a skipped sample re-reports the last real line's
+   *evidence-grade* boxes only. A sub-floor box is a thing seen in one frame,
+   for the host to match a track against in that frame; re-asserting it for as
+   long as the gate holds is what `reverify_ms` exists to prevent.
+4. **It costs wire, never a detection.** Every box a flag-off run emits is
+   still emitted with the flag on, under the same label and at the same score.
+   That holds even where the flag reopens what an allowlist closed —
+   `min_score: {"default": 1.0, "person": 0.6}`, the documented way to exclude
+   every class but one, stops excluding them once a track floor sits under it,
+   because the band is one number for every class. Those classes come back in
+   the band and spend slots and bytes; the class you asked for still leaves
+   first. Two mechanisms hold it up, not one: rule 2 ranks evidence ahead of
+   the band at every *cut*, and the heads prefer an evidence class ahead of a
+   higher-scoring band one at every *selection* (an rfdetr query offers one
+   box under many labels, so which label wins it decides whether the detection
+   exists at all). Leave the flag off if the wire the band takes is not a
+   trade you want.
+
+`verify/README.md` has the recipe for measuring a track-floor run: the
+validator reports the **sub-floor share** of a capture when it is given the
+floors the run used. It takes one `--min-score-json` for the whole capture, so
+a group whose members carry different `min_score` maps has to be split by
+`camera_id` first for the share to mean anything per member.
+
 ## The wire protocol
 
 stdout carries protocol v1 ndjson and nothing else — one JSON object per
@@ -407,12 +491,16 @@ Cairn then appends one argument instead of the per-camera three:
 | `--cameras-json` | in group mode | JSON array of `{id, udp_port, min_score}`, one entry per member, in config order |
 
 It conflicts with `--camera-id`/`--udp-port`/`--min-score-json`; give one set
-or the other. `--motion-json` is the exception: it is your own flag in the
-configured command rather than one Cairn appends, so it applies in both modes
-— in group mode as the default for every member. A member may also carry its
-own `motion` object in `--cameras-json`, overriding only the knobs it names;
-Cairn does not write that key today, so it is reachable from a hand-driven run
-(see below). Each member gets its own decode thread and its own
+or the other. `--motion-json` and `--track-floor-json` are the exceptions:
+they are your own flags in the configured command rather than ones Cairn
+appends, so they apply in both modes — in group mode as the default for every
+member. A member may also carry its own `motion` object in `--cameras-json`,
+overriding only the knobs it names, or its own `track_floor` object, replacing
+the group's outright (there is one knob, so the two are the same thing).
+Cairn writes neither key today, so both are reachable from a hand-driven run
+(see below); a track floor is checked against *that member's* `min_score` map,
+so one can be legal for one camera in a group and refused for another. Each
+member gets its own decode thread and its own
 newest-wins sample slot, and a single inference thread drains the slots —
 picking at random among the ready ones, so a busy camera cannot starve a quiet
 one. Score floors are applied per member. Startup logs the whole roster
@@ -1227,16 +1315,17 @@ no library target, so doctests never run.
   projection built alongside the scaler, so a letterboxed run cannot report
   boxes against the input rectangle instead of the frame.
 - NMS runs for the raw layout only — an end-to-end export did it inside the
-  model — and over at most the top 300 anchors by score, which bounds an
-  O(k²) pass that would otherwise start from 8400. Every layout that reaches
-  that cut gates each candidate on **its own class's** `min_score` floor
-  first, because the cut is by score alone: under the documented allowlist
-  pattern (`default: 1.0` with one class lower) 300 stronger candidates in
-  excluded classes would otherwise push the one configured class out, and all
-  300 are discarded a step later anyway. The end-to-end layout is the
-  exception — its class id is a number in the output row, not an index into a
-  known class table, so it cuts at the lowest configured floor instead, which
-  is safe because that layout is never truncated.
+  model — and over at most the top 300 anchors, ranked evidence first and
+  score second, which bounds an O(k²) pass that would otherwise start from
+  8400. Every layout that reaches that cut gates each candidate on **its own
+  class's** emission floor first, because the cut cannot see a label: under
+  the documented allowlist pattern (`default: 1.0` with one class lower) 300
+  stronger candidates in excluded classes would otherwise push the one
+  configured class out, and all 300 are discarded a step later anyway. The
+  end-to-end layout is the exception — its class id is a number in the output
+  row, not an index into a known class table, so it cuts at the lowest score
+  anything could be emitted at instead, which is safe because that layout is
+  never truncated.
 - A score is clamped to 0..1 and a box to the frame before either is emitted,
   for the same reason the label is trimmed: the host validates every field and
   drops the whole *detection* on an out-of-contract one. A box more than 4×
@@ -1247,13 +1336,18 @@ no library target, so doctests never run.
   it needs the decoder's frames pool, which does not exist until something has
   been decoded.
 - Output lines are capped at the contract's 65 536 bytes — the bound both
-  host ports open us with (`{:line, 65_536}`) — by shedding the lowest-scoring
-  detections; an oversized line would be dropped by Cairn anyway. At 64
+  host ports open us with (`{:line, 65_536}`) — by shedding from the end of a
+  list ranked evidence first and score second, so the least interesting
+  detections go first; an oversized line would be dropped by Cairn anyway. At 64
   shaped objects a line runs to about 12.3 KB — 14.2 KB when every object is
   a seeded re-report carrying `observation_kind` — so that shedding is a
   guard rather than a working part of the path. The object list is cut at 64 first,
   and for a harsher reason: an over-cap `objects` list is a contract
   violation that costs the *whole* line host-side, not just the surplus.
+  That ranking is what makes both cuts drop the least interesting boxes, and
+  it is also why a [track floor](#track-floor) costs a detection nothing: the
+  band it opens is the tail of the list whatever the per-label floors are,
+  which score alone would not give.
 - stdout is locked per line, never held. `plugin.status` is written from the
   main thread while the inference thread is emitting frames, and a held
   `StdoutLock` would park one of them for the life of the process.

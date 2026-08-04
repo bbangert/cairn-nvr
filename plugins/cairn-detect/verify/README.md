@@ -116,3 +116,65 @@ rate in `fps`.
 runs are fed the same clip but are not frame-aligned — each starts sampling at
 its own phase and the sample gate is a floor, not a metronome — so read the
 per-label rates and bucket overlap, not equality.
+
+## Track-floor runs
+
+`--track-floor-json` emits the detections between the track floor and each
+class's `min_score`, at their real scores, for the host's low-confidence
+association stage. **It is off unless you switch it on**, and a run without it
+is byte-identical to one from before the flag existed — so the way to read one
+is against a capture of the same clip without it.
+
+The validator needs the floors the plugin ran under to say anything about the
+band: they are not on the wire. Give it the same `--min-score-json` and it
+reports the sub-floor share.
+
+```
+# terminal 1 — same control-line brace group as above
+{ echo '{"spec":"cairn.plugin","version":1,"type":"stream.started","camera_id":"test","stream_epoch":"01K0TESTEPOCH00000000000000","rtp":{"clock_rate":90000}}'
+  sleep 40; } \
+  | ../target/release/cairn-detect --model ../yolox_nano.onnx \
+      --labels ../coco.names --camera-id test --udp-port 17000 \
+      --min-score-json '{"default":0.5}' --track-floor-json '{"floor":0.1}' \
+  | tee floor-on.ndjson | ./validate_ndjson.py --min-score-json '{"default":0.5}'
+
+# terminal 2 — once terminal 1 has printed `cairn-detect up:`
+./feed.py --port 17000 --duration 30
+
+# then the same clip with the flag left off, and:
+./compare_runs.py --a floor-off.ndjson --b floor-on.ndjson
+```
+
+Under rfdetr instead, the model needs **both** of the flags the yolox examples
+above do not carry — `--input-size 384` because every RF-DETR export leaves its
+spatial dims dynamic, and `--labels ../coco91.names` because it indexes the
+91-slot COCO *category id* space rather than the 80-entry dense list:
+
+```
+  | ../target/release/cairn-detect --model ../rfdetr_nano.onnx \
+      --labels ../coco91.names --input-size 384 \
+      --camera-id test --udp-port 17000 \
+      --min-score-json '{"default":0.5}' --track-floor-json '{"floor":0.1}' \
+```
+
+What to read:
+
+- **the sub-floor share** in the validator's summary. The flag-off run is the
+  baseline for it — near zero, and exactly zero unless a floor has more than
+  three decimals (the validator compares the rounded score on the wire, the
+  plugin decides on the score before rounding) — so the flag-on number is what
+  the band cost in wire.
+- **`N of them on seeded lines`**, printed on that same line whether or not it
+  is zero. For cairn-detect it is zero: a seed re-reports evidence, never the
+  band (`emit::CameraState::last_dets`). Anything else on a gated track-floor
+  run is a seeding regression.
+- Give the validator the **same floors the plugin ran under**. It applies one
+  `--min-score-json` to every camera in the capture, so a `--cameras-json`
+  group whose members carry different `min_score` maps needs the capture split
+  by `camera_id` before the share means anything per member.
+- **`compare_runs.py` needs no flag of its own.** Its label table and bucket
+  overlap are counts of what each run emitted, and its duplicate-pair table
+  is geometry — none of them read a floor. What moves is the score column:
+  the flag-on run's `min` falls to about the track floor, which is the band
+  arriving and not a divergence. The per-label *rates* will diverge too, for
+  the same reason, so its >3× verdict is not a parity verdict on this pair.

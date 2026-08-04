@@ -827,6 +827,17 @@ mod tests {
                 score,
                 bbox: [0.1, 0.2, 0.3, 0.4],
                 observation_kind: ObservationKind::Detected,
+                evidence: true,
+            }
+        }
+
+        /// A detection `--track-floor-json` admitted: below its label's
+        /// `min_score`, on the wire at its real score, and not a sighting the
+        /// gate may re-report.
+        pub(super) fn sub_floor(label: &str, score: f64) -> Det {
+            Det {
+                evidence: false,
+                ..det(label, score)
             }
         }
 
@@ -1066,6 +1077,45 @@ mod tests {
                 "and the seeds shrank with it"
             );
             assert_eq!(front.passes, 3);
+        }
+
+        #[test]
+        fn a_gated_stretch_re_reports_evidence_and_not_the_track_floors_band() {
+            // The two flags composed. Every real line carries the band a track
+            // floor opened — that is what the host's low-confidence stage
+            // reads — and every *skipped* sample carries the evidence-grade
+            // boxes of the last real line and nothing else. A sub-floor box is
+            // a thing seen in one frame, not a thing to keep asserting for as
+            // long as the gate holds.
+            let (streams, mut publisher) = publisher(&["front"]);
+            start(&streams, "front", EPOCH);
+            let mut front = Member::new(
+                "front",
+                config(),
+                vec![det("person", 0.9), sub_floor("car", 0.3)],
+            );
+            let base = Instant::now();
+
+            // inside the bypass, so this one is inferred and carries both
+            assert_eq!(
+                objects(&front.line(&mut publisher, still(), base)),
+                vec![
+                    ("person".to_string(), 0.9, "<absent>".to_string()),
+                    ("car".to_string(), 0.3, "<absent>".to_string())
+                ],
+            );
+            // the re-verify at 16 s is another real line, band included…
+            assert_eq!(
+                objects(&front.line(&mut publisher, still(), at(base, 16_000))).len(),
+                2
+            );
+            // …and the sample after it is the first the gate skips, which is
+            // where the band stops being re-reported
+            assert_eq!(
+                objects(&front.line(&mut publisher, still(), at(base, 16_200))),
+                vec![("person".to_string(), 0.9, "tracked".to_string())],
+            );
+            assert_eq!(front.passes, 2);
         }
 
         #[test]

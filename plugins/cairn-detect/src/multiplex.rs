@@ -26,7 +26,7 @@ use serde::Deserialize;
 use crate::decode::{self, DecoderKind, Sample, SampleSink};
 use crate::emit::{self, Publisher};
 use crate::gate::{self, Gate};
-use crate::infer::{Detector, InputSpec, Labels, ScoreFloors};
+use crate::infer::{Detector, InputSpec, Labels, ScoreFloors, TrackFloorOverrides};
 use crate::motion::{self, MotionConfig, MotionOverrides};
 use crate::rtp;
 
@@ -37,8 +37,9 @@ const REOPEN_MAX: Duration = Duration::from_secs(30);
 /// starts over at [`REOPEN_MIN`] rather than inheriting a dark camera's wait.
 const HEALTHY_RUN: Duration = Duration::from_secs(60);
 
-/// One group member, as Cairn writes it into `--cameras-json` — plus `motion`,
-/// which Cairn does not write and an operator can add by hand.
+/// One group member, as Cairn writes it into `--cameras-json` — plus `motion`
+/// and `track_floor`, which Cairn does not write and an operator can add by
+/// hand.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CameraSpec {
     pub id: String,
@@ -51,6 +52,11 @@ pub struct CameraSpec {
     /// member takes the global settings unchanged.
     #[serde(default)]
     pub motion: MotionOverrides,
+    /// Track floor for this member alone, replacing the process-wide
+    /// `--track-floor-json`. Absent — which is also what Cairn writes today —
+    /// means the member takes the global setting unchanged.
+    #[serde(default)]
+    pub track_floor: TrackFloorOverrides,
 }
 
 /// Decode the `--cameras-json` argument.
@@ -67,19 +73,37 @@ pub fn parse_specs(json: &str) -> Result<Vec<CameraSpec>> {
         }
         // Checked here rather than where the gate is built, so an out-of-range
         // knob fails the whole group at startup instead of one member's decode
-        // thread minutes later.
+        // thread minutes later. The track floor's *range* is checkable here
+        // too; what it pairs with — this member's `min_score` map — is
+        // [`floors_for`], which the caller runs at startup for the same reason.
         spec.motion
+            .validate()
+            .with_context(|| format!("--cameras-json camera {}", spec.id))?;
+        spec.track_floor
             .validate()
             .with_context(|| format!("--cameras-json camera {}", spec.id))?;
     }
     Ok(specs)
 }
 
-/// Score floors per member, in the same order as `specs`.
-pub fn floors_for(specs: &[CameraSpec]) -> Vec<ScoreFloors> {
+/// Score floors per member, in the same order as `specs`, each carrying the
+/// track floor that member resolved to.
+///
+/// Fallible because that is where the pairing check lives: a track floor has to
+/// sit strictly below every `min_score` on the camera it applies to, and the
+/// two halves only meet here. The error names the member, since a group can
+/// hold one camera the floor is legal for and one it is not.
+pub fn floors_for(
+    specs: &[CameraSpec],
+    track_floor: &TrackFloorOverrides,
+) -> Result<Vec<ScoreFloors>> {
     specs
         .iter()
-        .map(|spec| ScoreFloors::from_map(spec.min_score.clone()))
+        .map(|spec| {
+            ScoreFloors::from_map(spec.min_score.clone())
+                .with_track_floor(TrackFloorOverrides::resolve(track_floor, &spec.track_floor))
+                .with_context(|| format!("--cameras-json camera {}", spec.id))
+        })
         .collect()
 }
 
@@ -93,15 +117,20 @@ pub fn motion_for(specs: &[CameraSpec], global: &MotionOverrides) -> Vec<Option<
 }
 
 /// Run every member's stream through one detector until inference fails.
+///
+/// `floors` comes from the caller rather than from [`floors_for`] here: it can
+/// fail (see there), and a startup argument that cannot be honoured has to say
+/// so before the model load rather than after it. It is indexed by slot like
+/// everything else in this module.
 pub fn run(
     specs: &[CameraSpec],
     kind: DecoderKind,
     motion: &MotionOverrides,
+    floors: Vec<ScoreFloors>,
     detector: Detector,
     labels: &Labels,
     publisher: Publisher,
 ) -> Result<()> {
-    let floors = floors_for(specs);
     let motion = motion_for(specs, motion);
     // One resolved spec for the whole group: the members share the detector,
     // so they share the geometry, the encoding *and* the resize policy every
@@ -368,6 +397,13 @@ mod tests {
     const TWO: &str = r#"[{"id":"front","udp_port":17000,"min_score":{"default":0.4,"person":0.8}},
                           {"id":"drive","udp_port":17004,"min_score":{"default":0.9}}]"#;
 
+    /// `floors_for` with the flag absent, which is every run Cairn launches
+    /// today: no track floor anywhere, so the call cannot fail.
+    fn no_track_floor(specs: &[CameraSpec]) -> Vec<ScoreFloors> {
+        floors_for(specs, &TrackFloorOverrides::default())
+            .expect("a group with no track floor has nothing to pair")
+    }
+
     #[test]
     fn parses_the_member_array() {
         let specs = parse_specs(TWO).unwrap();
@@ -382,12 +418,12 @@ mod tests {
     fn min_score_is_optional() {
         let specs = parse_specs(r#"[{"id":"a","udp_port":17000}]"#).unwrap();
         assert!(specs[0].min_score.is_empty());
-        assert_eq!(floors_for(&specs)[0].floor_for("person"), 0.5);
+        assert_eq!(no_track_floor(&specs)[0].floor_for("person"), 0.5);
     }
 
     #[test]
     fn floors_are_selected_per_camera() {
-        let floors = floors_for(&parse_specs(TWO).unwrap());
+        let floors = no_track_floor(&parse_specs(TWO).unwrap());
         assert_eq!(floors[0].floor_for("person"), 0.8);
         assert_eq!(floors[0].floor_for("car"), 0.4);
         assert_eq!(floors[1].floor_for("person"), 0.9);
@@ -407,6 +443,60 @@ mod tests {
         assert!(parse_specs(r#"[{"id":"a","udp_port":170000}]"#).is_err());
         // min_score must stay label -> number
         assert!(parse_specs(r#"[{"id":"a","udp_port":1,"min_score":{"p":"high"}}]"#).is_err());
+    }
+
+    #[test]
+    fn the_track_floor_key_is_optional_and_replaces_the_group_default() {
+        let specs = parse_specs(
+            r#"[{"id":"front","udp_port":17000,"min_score":{"default":0.5},
+                 "track_floor":{"floor":0.25}},
+                {"id":"drive","udp_port":17004,"min_score":{"default":0.5}}]"#,
+        )
+        .unwrap();
+        let global = TrackFloorOverrides::parse(r#"{"floor":0.1}"#).unwrap();
+
+        let floors = floors_for(&specs, &global).unwrap();
+        assert_eq!(floors[0].emit_floor_for("person"), 0.25, "the member's own");
+        assert_eq!(floors[1].emit_floor_for("person"), 0.1, "the group default");
+
+        // ...and with no --track-floor-json the band is closed for every
+        // member that did not open it itself.
+        let floors = no_track_floor(&specs);
+        assert_eq!(floors[0].emit_floor_for("person"), 0.25);
+        assert_eq!(floors[1].emit_floor_for("person"), 0.5);
+    }
+
+    #[test]
+    fn a_track_floor_a_member_cannot_honour_fails_the_group_by_name() {
+        // A group is one failure domain and the floors are per member, so the
+        // same `--track-floor-json` can be legal for one camera and not for
+        // its neighbour. The message has to say which.
+        let specs = parse_specs(
+            r#"[{"id":"front","udp_port":17000,"min_score":{"default":0.5}},
+                {"id":"drive","udp_port":17004,"min_score":{"default":0.2}}]"#,
+        )
+        .unwrap();
+        let err = floors_for(
+            &specs,
+            &TrackFloorOverrides::parse(r#"{"floor":0.3}"#).unwrap(),
+        )
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("drive"), "{err}");
+        assert!(err.contains("0.2"), "{err}");
+
+        // a member's own floor is checked against that member's floors too
+        let specs = parse_specs(
+            r#"[{"id":"front","udp_port":17000,"min_score":{"default":0.5},
+                 "track_floor":{"floor":0.6}}]"#,
+        )
+        .unwrap();
+        assert!(floors_for(&specs, &TrackFloorOverrides::default()).is_err());
+
+        // and the range check is the earlier one, at parse time, where it
+        // needs no floors to pair with
+        assert!(parse_specs(r#"[{"id":"a","udp_port":1,"track_floor":{"floor":0}}]"#).is_err());
+        assert!(parse_specs(r#"[{"id":"a","udp_port":1,"track_floor":{"flor":0.1}}]"#).is_err());
     }
 
     #[test]

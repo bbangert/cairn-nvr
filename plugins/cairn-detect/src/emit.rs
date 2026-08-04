@@ -83,6 +83,21 @@ pub struct Det {
     /// because that is the whole difference between the two.
     #[serde(skip_serializing_if = "ObservationKind::is_detected")]
     pub observation_kind: ObservationKind,
+    /// Whether this box is at or above its label's `min_score` — evidence, as
+    /// against a box emitted only because `--track-floor-json` lowered the
+    /// emission cutoff under that floor.
+    ///
+    /// **Never on the wire, and it does not need to be**: the host makes the
+    /// same comparison from the score, against the same floors, and that is
+    /// what the contract's low-confidence band is read by. It is carried
+    /// because the label's floor is not, and two things on this side have to
+    /// tell the two apart after the label is gone — the ranking every cut
+    /// sheds by ([`objects_line`]), and [`CameraState::last_dets`].
+    ///
+    /// `true` for every detection of a run without the flag, and for every
+    /// seed: a seed is a copy of a box that was evidence when it was found.
+    #[serde(skip)]
+    pub evidence: bool,
 }
 
 #[derive(Serialize)]
@@ -203,14 +218,26 @@ pub fn status_line(
     })
 }
 
-/// Serialize one `frame.objects` line, shedding the lowest-scoring
-/// detections until it fits the byte budget. Returns the line and how many
-/// objects survived.
+/// Serialize one `frame.objects` line, shedding from the end of the list until
+/// it fits the byte budget. Returns the line and how many objects survived.
 ///
-/// Detections arrive sorted by score, so both the cap and the truncation drop
-/// the least interesting ones. A line with zero objects is emitted even if it
-/// somehow still exceeds the budget: a valid oversized line is dropped by
-/// Cairn, a truncated one would be malformed for every consumer.
+/// Detections arrive least-interesting-last, so both the cap and the
+/// truncation drop the least interesting ones. A line with zero objects is
+/// emitted even if it somehow still exceeds the budget: a valid oversized line
+/// is dropped by Cairn, a truncated one would be malformed for every consumer.
+///
+/// That order is [`Det::evidence`] first and score second — `crate::infer`
+/// ranks by that key at both of its own cuts and this is the same list — so
+/// everything `--track-floor-json` admitted below a class's `min_score` sits
+/// behind every evidence-grade box whatever the per-label floors are. **Both
+/// cuts here therefore shed the band before they touch evidence**, which needs
+/// no rule of its own in this function, only the order it is handed.
+///
+/// It matters because the boundary is *per class*: with `min_score` at 0.4 for
+/// `person` and 0.8 for `car`, a band `car` at 0.5 outscores an evidence
+/// `person` at 0.45, and a cut ranking by score alone would keep the noise and
+/// drop the detection. Cairn writes per-label floors, so that is a real
+/// configuration and not a contrived one.
 ///
 /// At 64 shaped objects a full line runs to about 12.3 KB, and to about
 /// 14.2 KB when every object is a seed carrying `observation_kind` — measured
@@ -295,9 +322,9 @@ struct CameraState {
     sequence: u64,
     ungated: u64,
     unbounded_pts: u64,
-    /// The last real inference's detections *as emitted*, already marked
-    /// [`ObservationKind::Tracked`] because re-emitting them is the only thing
-    /// they are for.
+    /// The last real inference's evidence-grade detections *as emitted*,
+    /// already marked [`ObservationKind::Tracked`] because re-emitting them is
+    /// the only thing they are for.
     ///
     /// Held at the scores the model gave them, which is what keeps a seed at
     /// or below the host's `best_score` for that track: a seed that improved
@@ -305,6 +332,22 @@ struct CameraState {
     /// update for a frame nothing looked at. Shed detections are not
     /// remembered — the host never received them, so seeding one would
     /// introduce a box mid-gate that no model pass had ever put on the wire.
+    ///
+    /// Nor are sub-floor detections ([`Det::evidence`]), which
+    /// `--track-floor-json` puts on a real line and nothing else. A seed is a
+    /// re-report of a sighting the host may act on: below the evidence floor
+    /// there is no sighting to re-report, only a box the host's low-confidence
+    /// stage may match a live track against *in the frame it was found in*.
+    /// Re-reporting one would keep noise alive for as long as the gate holds,
+    /// which is what the whole `reverify_ms` bound exists to prevent. With the
+    /// flag off every emitted detection is evidence and this is every one of
+    /// them, as it was before the flag existed.
+    ///
+    /// The two exclusions compose into a prefix rather than a scatter, because
+    /// the band is the tail of the list a line is built from
+    /// ([`objects_line`]): what is remembered is the evidence-grade head of
+    /// what reached the wire, and a line that shed anything shed the band
+    /// before any of it.
     last_dets: Vec<Det>,
     /// The epoch `last_dets` were emitted under. A new one clears them: the
     /// host suspends its live tracks at a stream reset and refuses a
@@ -361,9 +404,11 @@ impl Publisher {
     }
 
     /// The line to write for one frame the model actually ran on, or `None`
-    /// when [`Publisher::emit`] declines it. Its detections become the ones a
-    /// [`Publisher::seeded_line_for`] will re-report until the next real
-    /// inference replaces them.
+    /// when [`Publisher::emit`] declines it. Its evidence-grade detections
+    /// become the ones a [`Publisher::seeded_line_for`] will re-report until
+    /// the next real inference replaces them — every detection on the line,
+    /// unless `--track-floor-json` put boxes below the evidence floor on it
+    /// (see [`CameraState::last_dets`]).
     pub fn line_for(
         &mut self,
         camera_id: &str,
@@ -486,16 +531,20 @@ impl Publisher {
         }
 
         if let Source::Inferred(dets) = source {
-            // What the wire carried, not what the model found: the shed ones
-            // are boxes the host has no record of. Every real line refreshes
-            // this, re-verifies included, so an object the model stops finding
-            // stops being seeded from that line on.
+            // What the wire carried, and of that what a seed may assert: the
+            // shed ones are boxes the host has no record of, and the sub-floor
+            // ones are boxes that were worth sending for the frame they were
+            // found in and are not worth repeating past it. Every real line
+            // refreshes this, re-verifies included, so an object the model
+            // stops finding stops being seeded from that line on.
             state.last_dets.clear();
-            state.last_dets.extend(dets[..kept].iter().map(|det| {
-                let mut remembered = det.clone();
-                remembered.observation_kind = ObservationKind::Tracked;
-                remembered
-            }));
+            state
+                .last_dets
+                .extend(dets[..kept].iter().filter(|det| det.evidence).map(|det| {
+                    let mut remembered = det.clone();
+                    remembered.observation_kind = ObservationKind::Tracked;
+                    remembered
+                }));
         }
         Some(json)
     }
@@ -594,6 +643,16 @@ mod tests {
             score,
             bbox: [0.1234, 0.5678, 0.25, 0.5],
             observation_kind: ObservationKind::Detected,
+            evidence: true,
+        }
+    }
+
+    /// The same detection as `--track-floor-json` puts one on the wire: a real
+    /// box at its real score, below its label's `min_score`.
+    fn sub_floor(label: &str, score: f64) -> Det {
+        Det {
+            evidence: false,
+            ..det(label, score)
         }
     }
 
@@ -665,6 +724,77 @@ mod tests {
         );
     }
 
+    /// Every label on a line, in wire order.
+    fn labels_of(json: &str) -> Vec<String> {
+        parse(json)["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|object| object["label"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_cap_sheds_the_sub_floor_band_before_any_evidence() {
+        // Detections arrive evidence-first, so the band a track floor opens is
+        // the tail of the list this function is handed and the cap takes it
+        // first. Written with the band *outscoring* the evidence, because that
+        // is the case score order alone gets wrong and Cairn's per-label
+        // floors make reachable: `person` at 0.4 and `car` at 0.8 puts an
+        // evidence person at 0.45 below a band car at 0.5.
+        let mut dets: Vec<Det> = (0..MAX_OBJECTS).map(|_| det("person", 0.45)).collect();
+        dets.extend((0..20).map(|_| sub_floor("car", 0.5)));
+        let (json, kept) = objects(&dets);
+        assert_eq!(kept, MAX_OBJECTS);
+        assert!(
+            labels_of(&json).iter().all(|label| label == "person"),
+            "the higher-scoring band was the thing that went: {json}"
+        );
+    }
+
+    #[test]
+    fn the_byte_budget_sheds_the_sub_floor_band_first_too() {
+        // The other cut, the one the cap never reaches, on the same order and
+        // the same per-label shape. 40 evidence objects at labels this long
+        // already overflow the framing bound, so the 24 band ones behind them
+        // are shed whole and some evidence goes with them.
+        let mut dets: Vec<Det> = worst_case(40, 2_000)
+            .into_iter()
+            .map(|det| Det {
+                label: "p".repeat(2_000),
+                score: 0.45,
+                ..det
+            })
+            .collect();
+        dets.extend(worst_case(24, 2_000).into_iter().map(|det| Det {
+            label: "c".repeat(2_000),
+            score: 0.5,
+            evidence: false,
+            ..det
+        }));
+        let (json, kept) = objects(&dets);
+        assert!(
+            kept > 0 && kept < 40,
+            "shed into the evidence, so the band went first: {kept}"
+        );
+        assert!(json.len() <= MAX_LINE_BYTES);
+        assert!(
+            labels_of(&json).iter().all(|label| label.starts_with('p')),
+            "nothing from the band reached the wire"
+        );
+    }
+
+    #[test]
+    fn a_sub_floor_object_is_an_ordinary_object_on_the_wire() {
+        // `evidence` is this side's bookkeeping and nothing else: the host
+        // makes the same comparison from the score, so a sub-floor box
+        // serializes byte for byte as the same box would above the floor.
+        let (banded, _) = objects(&[sub_floor("person", 0.3)]);
+        let (plain, _) = objects(&[det("person", 0.3)]);
+        assert_eq!(banded, plain);
+        assert!(!banded.contains("evidence"), "{banded}");
+    }
+
     /// The worst line `det_from` can produce, `count` objects long: capped
     /// labels and full-precision f64s.
     fn worst_case(count: usize, label_bytes: usize) -> Vec<Det> {
@@ -674,6 +804,7 @@ mod tests {
                 score: 0.8123456789012345 - f64::from(i as u32) * 1e-16,
                 bbox: [0.1234567890123456; 4],
                 observation_kind: ObservationKind::Detected,
+                evidence: true,
             })
             .collect()
     }
@@ -1255,6 +1386,55 @@ mod tests {
                 re_reported > 0 && re_reported <= on_the_wire,
                 "{re_reported} seeded of {on_the_wire} remembered"
             );
+        }
+
+        #[test]
+        fn a_seed_re_reports_evidence_and_never_the_sub_floor_band() {
+            // What `--track-floor-json` puts on a line is a box for the host's
+            // low-confidence stage to match a live track against *in the frame
+            // it was found in*. There is no sighting there to re-report, so a
+            // seed carries the evidence-grade boxes of that same line and
+            // nothing else — and the sub-floor ones die with the frame that
+            // found them.
+            //
+            // The band box is planted in the *middle* of the list, which is
+            // not the order `crate::infer` hands one over (it ranks evidence
+            // first). Deliberately: what the memory reads is the mark on each
+            // detection, not a prefix length, and a filter written as a
+            // `take_while` would pass every other test in this file.
+            let (streams, mut publisher) = publisher(&["front"]);
+            start(&streams, "front", EPOCH);
+
+            let real = detect(
+                &mut publisher,
+                "front",
+                &[
+                    det("person", 0.9),
+                    sub_floor("car", 0.3),
+                    det("person", 0.25),
+                ],
+            )
+            .unwrap();
+            // all three are on the wire: the flag's whole point
+            assert_eq!(real["objects"].as_array().unwrap().len(), 3);
+
+            assert_eq!(
+                shape(&seed(&mut publisher, "front").unwrap()),
+                vec![
+                    ("person".into(), 0.9, "tracked".into()),
+                    // 0.25 is below the 0.3, and still evidence: the flag is
+                    // per label, and this camera's `person` floor is under it.
+                    // The seed follows the mark, not the number.
+                    ("person".into(), 0.25, "tracked".into()),
+                ]
+            );
+            assert_eq!(state(&publisher, "front").last_dets.len(), 2);
+
+            // A line with nothing but band on it seeds nothing at all, which
+            // is the empty-`objects` liveness line — not the previous line's
+            // boxes held over.
+            detect(&mut publisher, "front", &[sub_floor("car", 0.3)]);
+            assert_eq!(shape(&seed(&mut publisher, "front").unwrap()).len(), 0);
         }
 
         #[test]
