@@ -68,11 +68,18 @@ Cairn appends these arguments to the configured command
 Anything you put in the configured command before these (model paths,
 device selection, `--timeline`, …) is passed through untouched.
 
-Pre-filtering by `--min-score-json` in the plugin is optional. Cairn applies
-the same floors itself, and applies them *after* tracking: a below-floor
-object still gets a track identity and still produces track frames — it just
-never becomes event evidence. Filtering in the plugin saves the line, not the
-semantics.
+Pre-filtering by `--min-score-json` in the plugin is optional, and a
+below-floor object has always been legal on the wire. Cairn applies the same
+floors itself and applies them *after* tracking, so a below-floor object never
+becomes event evidence; what it may do instead is hold an identity together.
+Association runs in two confidence stages, and a below-floor box is offered
+only the second: it may take a live track that this frame's confident boxes
+left unmatched — the frames an object is briefly hard to see, which is the
+whole reason to send one — and it may never mint a track of its own or resume
+a suspended one. Filtering in the plugin saves the line; sending the sub-floor
+boxes buys the tracker those frames. cairn-detect's own switch for it is
+[`--track-floor-json`](../plugins/cairn-detect/README.md#track-floor), off by
+default.
 
 A plugin serving a group is configured with one argument instead — see
 [`--cameras-json`](#--cameras-json).
@@ -574,8 +581,8 @@ What Cairn does with such a box is the part worth knowing before you send one:
 
 - **It is presence, not evidence.** `Cairn.Observation.detected?/1` is the one
   predicate, and everything that could manufacture a fact out of a prediction
-  is behind it: `stale_predicted`, the stationary judgement and its anchor, and
-  the resumption of a suspended track. A `"tracked"` box refreshes
+  is behind it: `stale_predicted`, the stationary judgement, and the
+  resumption of a suspended track. A `"tracked"` box refreshes
   `last_seen_ms` — which is what expiry reads — and moves nothing else.
 - **It cannot resume a suspended identity.** Adoption across a stream reset
   requires `Observation.detected?/1`, so re-reports alone will let a suspended

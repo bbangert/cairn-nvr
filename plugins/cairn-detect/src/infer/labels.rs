@@ -1,14 +1,20 @@
-//! Class names and per-class score floors — the two operator-supplied inputs
-//! that decide what a detection is *called* and whether it is emitted at all.
+//! Class names and score floors — the operator-supplied inputs that decide
+//! what a detection is *called* and whether it is emitted at all.
 //!
-//! Both are indexed by class id, which is why a count mismatch is a startup
-//! failure rather than a degraded output: nothing downstream can tell a
-//! mislabelled detection from a correct one.
+//! Names and per-class floors are both indexed by class id, which is why a
+//! count mismatch is a startup failure rather than a degraded output: nothing
+//! downstream can tell a mislabelled detection from a correct one.
+//!
+//! The third input, `--track-floor-json`, is a floor *under* the per-class
+//! ones: with it set a detection between the two is still emitted, at its real
+//! score, for the host's low-confidence association stage to match against.
+//! Absent — the default — it changes nothing anywhere.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 
 use super::profile::Layout;
 
@@ -51,12 +57,83 @@ pub(super) fn check_label_count(
     )
 }
 
-/// Per-class score floor from `--min-score-json`. Cairn enforces these again
-/// downstream; gating here just keeps the ndjson small.
+/// Track-floor knob as the operator writes it, with its one key optional.
+///
+/// The same shape parses `--track-floor-json` (the whole process's default)
+/// and a `--cameras-json` member's `track_floor` key (that one camera's
+/// override), which is the [`crate::motion::MotionOverrides`] pattern and for
+/// the same reason: this is the operator's own flag, written into the
+/// configured command rather than appended by Cairn, so it has to be
+/// expressible in both modes.
+///
+/// `deny_unknown_fields` for the motion gate's reason too — a mistyped knob
+/// that parses is a setting that silently did nothing.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrackFloorOverrides {
+    /// Score below the per-class `min_score` down to which detections are
+    /// still emitted. Absent is the feature off.
+    pub floor: Option<f64>,
+}
+
+impl TrackFloorOverrides {
+    /// Decode the `--track-floor-json` argument.
+    pub fn parse(json: &str) -> Result<Self> {
+        let parsed: Self = serde_json::from_str(json)
+            .context("--track-floor-json is not a JSON object of track-floor knobs")?;
+        parsed.validate()?;
+        Ok(parsed)
+    }
+
+    /// Reject a floor no run could honour, at the point the operator can still
+    /// read the message. The check that needs a camera's own `min_score` map
+    /// is [`ScoreFloors::with_track_floor`]; this one is the range.
+    pub fn validate(&self) -> Result<()> {
+        match self.floor {
+            Some(floor) => check_track_floor(floor),
+            None => Ok(()),
+        }
+    }
+
+    /// The floor one camera emits under: the process-wide
+    /// `--track-floor-json`, then that camera's own `track_floor` key, which
+    /// replaces it outright rather than merging into it — there is one knob,
+    /// so "override only what you name" and "override" are the same thing.
+    ///
+    /// `None` is the feature off, which is the default and is what makes a run
+    /// with no `--track-floor-json` byte-identical to the build before the flag
+    /// existed: nothing below a per-class `min_score` reaches the wire.
+    pub fn resolve(global: &Self, per_camera: &Self) -> Option<f64> {
+        per_camera.floor.or(global.floor)
+    }
+}
+
+/// Is this a score a track floor could be?
+///
+/// Written as a positive test rather than as `floor <= 0.0`: NaN fails every
+/// comparison, and it has to land on the refusing side.
+fn check_track_floor(floor: f64) -> Result<()> {
+    if !(floor > 0.0 && floor < 1.0) {
+        bail!(
+            "track floor must be in (0, 1), got {floor}: at or below 0 every box the model \
+             proposes is emitted, which is noise the host's low-confidence stage has no use for \
+             below about 0.05, and no score is ever above 1"
+        );
+    }
+    Ok(())
+}
+
+/// Per-class score floor from `--min-score-json`, plus the optional
+/// `--track-floor-json` floor underneath them. Cairn enforces the per-class
+/// floors again downstream; gating here just keeps the ndjson small.
 #[derive(Debug, Clone)]
 pub struct ScoreFloors {
     default: f64,
     by_label: HashMap<String, f64>,
+    /// The resolved track floor, or `None` with the feature off. Strictly
+    /// below every floor in `by_label` and below `default`, which
+    /// [`ScoreFloors::with_track_floor`] is where it is checked.
+    track_floor: Option<f64>,
 }
 
 impl ScoreFloors {
@@ -71,21 +148,74 @@ impl ScoreFloors {
         Self {
             default: raw.get("default").copied().unwrap_or(0.5),
             by_label: raw,
+            track_floor: None,
         }
     }
 
+    /// Attach this camera's resolved track floor, refusing one it cannot sit
+    /// under.
+    ///
+    /// A track floor is only meaningful as a floor *below* the evidence
+    /// floors: what it buys is the band `[track_floor, min_score)`, and a floor
+    /// at or above the lowest configured `min_score` either makes that band
+    /// empty for some class or — worse — reads as an attempt to raise a floor,
+    /// which this flag cannot do. So it is refused rather than clamped, naming
+    /// the floor it collided with.
+    ///
+    /// The range check is repeated here rather than left to
+    /// [`TrackFloorOverrides::validate`], which has already run over both argv
+    /// forms: this is the only place a floor is attached to a camera's floors,
+    /// and what a hole here costs is silent noise emission for the life of the
+    /// process.
+    pub fn with_track_floor(mut self, floor: Option<f64>) -> Result<Self> {
+        let Some(floor) = floor else {
+            return Ok(self);
+        };
+        check_track_floor(floor)?;
+        let lowest = self.lowest_min_score();
+        if floor >= lowest {
+            bail!(
+                "track floor {floor} must be strictly below every min_score it pairs with; the \
+                 lowest on this camera is {lowest}. The flag emits the band \
+                 [track_floor, min_score), so a floor at or above one closes that band instead of \
+                 opening it"
+            );
+        }
+        self.track_floor = Some(floor);
+        Ok(self)
+    }
+
+    /// The `min_score` this label is held to — the evidence floor, as the
+    /// operator wrote it. Unaffected by the track floor: what that lowers is
+    /// what reaches the wire, not what the host will read as evidence.
     pub fn floor_for(&self, label: &str) -> f64 {
         self.by_label.get(label).copied().unwrap_or(self.default)
     }
 
-    /// The lowest floor any label could be held to.
+    /// The score below which a detection of `label` is not emitted at all:
+    /// this camera's track floor when it has one, and the label's own
+    /// `min_score` otherwise.
+    ///
+    /// The two are the same number for every label with the flag off, which is
+    /// what makes the default byte-identical to the build before it.
+    pub fn emit_floor_for(&self, label: &str) -> f64 {
+        self.track_floor.unwrap_or_else(|| self.floor_for(label))
+    }
+
+    /// The lowest score anything could be emitted at.
     ///
     /// Only [`Layout::EndToEnd`] needs it: its class id is a number in the
     /// output row rather than an index into a known `nc`, so there is no
     /// per-class floor table to look one up in. It has to be the floor no
     /// configured label can undercut — anything higher would silently drop
-    /// detections a per-label floor admits.
-    pub fn min_floor(&self) -> f64 {
+    /// detections a per-label floor admits — which with a track floor set is
+    /// the track floor itself, it being strictly below all of them.
+    pub fn min_emit_floor(&self) -> f64 {
+        self.track_floor.unwrap_or_else(|| self.lowest_min_score())
+    }
+
+    /// The lowest `min_score` configured on this camera, `default` included.
+    fn lowest_min_score(&self) -> f64 {
         self.by_label.values().copied().fold(self.default, f64::min)
     }
 }
@@ -194,6 +324,113 @@ mod tests {
     fn floors_reject_non_objects() {
         assert!(ScoreFloors::parse("[]").is_err());
         assert!(ScoreFloors::parse(r#"{"person":"high"}"#).is_err());
+    }
+
+    /// The resolved floor of a `--track-floor-json` that parses.
+    fn track_floor(json: &str) -> Option<f64> {
+        TrackFloorOverrides::resolve(
+            &TrackFloorOverrides::parse(json).unwrap(),
+            &TrackFloorOverrides::default(),
+        )
+    }
+
+    #[test]
+    fn a_track_floor_is_absent_unless_the_operator_writes_one() {
+        // The whole default: no flag, no key, nothing to resolve. What that
+        // buys is the byte-identity below.
+        assert_eq!(track_floor("{}"), None);
+        assert_eq!(TrackFloorOverrides::default().floor, None);
+        assert_eq!(track_floor(r#"{"floor":null}"#), None);
+        assert_eq!(track_floor(r#"{"floor":0.1}"#), Some(0.1));
+    }
+
+    #[test]
+    fn with_no_track_floor_every_emission_floor_is_the_labels_own() {
+        let floors = floors(r#"{"default":0.4,"person":0.8}"#)
+            .with_track_floor(None)
+            .unwrap();
+        assert_eq!(floors.emit_floor_for("person"), 0.8);
+        assert_eq!(floors.emit_floor_for("car"), 0.4);
+        assert_eq!(floors.min_emit_floor(), 0.4);
+    }
+
+    #[test]
+    fn a_track_floor_is_the_emission_floor_for_every_label() {
+        let floors = floors(r#"{"default":0.4,"person":0.8}"#)
+            .with_track_floor(Some(0.1))
+            .unwrap();
+        // what reaches the wire drops to the one floor...
+        assert_eq!(floors.emit_floor_for("person"), 0.1);
+        assert_eq!(floors.emit_floor_for("car"), 0.1);
+        assert_eq!(floors.min_emit_floor(), 0.1);
+        // ...and what counts as evidence does not move at all
+        assert_eq!(floors.floor_for("person"), 0.8);
+        assert_eq!(floors.floor_for("car"), 0.4);
+    }
+
+    #[test]
+    fn a_track_floor_at_or_above_a_min_score_is_refused() {
+        let floors = || floors(r#"{"default":0.4,"person":0.8}"#);
+        // the band it would open is empty for `car` at exactly the floor, and
+        // inverted above it
+        let err = floors()
+            .with_track_floor(Some(0.4))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("0.4"), "{err}");
+        assert!(floors().with_track_floor(Some(0.5)).is_err());
+        // the lowest floor is what it has to clear, not the default and not
+        // the label the operator was thinking of
+        assert!(floors().with_track_floor(Some(0.399)).is_ok());
+        // a bare `--min-score-json '{}'` is the 0.5 default alone
+        assert!(open().with_track_floor(Some(0.5)).is_err());
+        assert!(open().with_track_floor(Some(0.499)).is_ok());
+    }
+
+    #[test]
+    fn a_track_floor_outside_a_score_is_refused_at_both_ends() {
+        // 0 is the one the plan names: emitting every box the model proposes
+        // is a cost with nothing on the host side to match it against.
+        for floor in [0.0, -0.1, 1.0, 2.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                open().with_track_floor(Some(floor)).is_err(),
+                "track floor {floor} was accepted"
+            );
+            assert!(
+                TrackFloorOverrides { floor: Some(floor) }
+                    .validate()
+                    .is_err(),
+                "track floor {floor} validated"
+            );
+        }
+        // and the same check runs at parse time, where the operator is still
+        // reading messages about their argv
+        assert!(TrackFloorOverrides::parse(r#"{"floor":0}"#).is_err());
+        assert!(TrackFloorOverrides::parse(r#"{"floor":-1}"#).is_err());
+        assert!(TrackFloorOverrides::parse(r#"{"floor":1}"#).is_err());
+    }
+
+    #[test]
+    fn a_mistyped_track_floor_knob_is_a_startup_failure_not_a_silent_default() {
+        assert!(TrackFloorOverrides::parse("not json").is_err());
+        assert!(TrackFloorOverrides::parse("[]").is_err());
+        assert!(TrackFloorOverrides::parse("0.1").is_err());
+        // the knob is `floor`; anything else parses to "no track floor at all"
+        // unless it is refused
+        assert!(TrackFloorOverrides::parse(r#"{"flor":0.1}"#).is_err());
+        assert!(TrackFloorOverrides::parse(r#"{"track_floor":0.1}"#).is_err());
+        assert!(TrackFloorOverrides::parse(r#"{"floor":"low"}"#).is_err());
+    }
+
+    #[test]
+    fn a_cameras_own_track_floor_replaces_the_process_wide_one() {
+        let global = TrackFloorOverrides::parse(r#"{"floor":0.1}"#).unwrap();
+        let camera = TrackFloorOverrides::parse(r#"{"floor":0.25}"#).unwrap();
+        let none = TrackFloorOverrides::default();
+        assert_eq!(TrackFloorOverrides::resolve(&global, &camera), Some(0.25));
+        assert_eq!(TrackFloorOverrides::resolve(&global, &none), Some(0.1));
+        assert_eq!(TrackFloorOverrides::resolve(&none, &camera), Some(0.25));
+        assert_eq!(TrackFloorOverrides::resolve(&none, &none), None);
     }
 
     #[test]

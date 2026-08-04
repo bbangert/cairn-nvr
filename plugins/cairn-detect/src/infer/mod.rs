@@ -40,7 +40,7 @@ pub(super) const MAX_DETS: usize = 32;
 // nowhere outside `infer` and are no longer re-exported (T1.4).
 pub use detector::Detector;
 pub use geometry::{Fit, InputSize, Projection};
-pub use labels::{Labels, ScoreFloors};
+pub use labels::{Labels, ScoreFloors, TrackFloorOverrides};
 pub use profile::{InputSpec, ModelProfile};
 
 // decode.rs and hwdecode.rs name these two only from their own test modules,

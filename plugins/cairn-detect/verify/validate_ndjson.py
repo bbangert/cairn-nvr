@@ -82,6 +82,36 @@ Note that a plugin emits no frame.objects at all until it has been told a
 stream epoch on stdin, so a run with no control line is expected to produce
 only hello/status. See README.md for the recipe that feeds one.
 
+Pass --min-score-json (the same JSON the plugin was launched with) and the
+summary also reports the **sub-floor share**: what fraction of the emitted
+detections carry a score below the floor of their own label. That band is
+what cairn-detect's --track-floor-json puts on the wire for the host's
+low-confidence association stage, so a run without the flag should report
+close to nothing and a run with it reports what the flag bought. A label with
+no entry falls back to "default", and a missing "default" to 0.5 -- which is
+cairn-detect's own default, not something the contract says. Sub-floor
+objects have always been legal in the protocol; this is a report, never a
+reason to fail a run.
+
+Read it as exactly what it measures, which is narrower than "the band":
+
+  * the scores compared are the **rounded** ones on the wire, and a plugin
+    decides what to emit from the score it had before rounding. Under a floor
+    with more than three decimals the two can disagree inside a thousandth,
+    so a flag-off run can report a share slightly above zero.
+  * the floors compared against are the ones **handed to this tool**. A
+    multiplexed capture carries several cameras whose min_score maps may
+    differ, and one --min-score-json is applied to all of them; split the
+    capture by camera_id, or read the share as approximate.
+
+It reports separately how many sub-floor detections arrived on a **seeded**
+line -- a count rather than a share, and one worth reading on its own: a seed
+re-reports a sighting the host may act on, and there is no such sighting
+below the evidence floor. For cairn-detect it is 0, and the line prints the
+0 rather than going quiet, because the number is only a regression signal if
+a reader can see it is still zero. The contract does not require it of every
+plugin, so it is printed rather than enforced.
+
 Exit code: 0 iff every line seen was valid AND at least one frame.objects
 line was seen. Anything else is a nonzero exit -- this is meant to gate
 CI/manual runs, not just report.
@@ -303,8 +333,39 @@ def validate_line(raw: bytes):
     return kind, obj
 
 
+DEFAULT_MIN_SCORE = 0.5
+
+
+def parse_min_scores(raw):
+    """`--min-score-json` as a label -> floor table, or None if not given.
+
+    Same shape the plugin is launched with: a JSON object of label to number,
+    with an optional "default". Anything else is an argument error rather
+    than a silently ignored one -- a mistyped floor map would report a
+    sub-floor share measured against floors nothing ran under.
+    """
+    if raw is None:
+        return None
+    try:
+        floors = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"not JSON: {e}") from None
+    if not isinstance(floors, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object of label -> number")
+    for label, floor in floors.items():
+        if not is_number(floor):
+            raise argparse.ArgumentTypeError(f"floor for {label!r} is not a number")
+    return floors
+
+
 class Stats:
-    def __init__(self):
+    def __init__(self, min_scores=None):
+        # label -> min_score, or None when the run was not told the floors and
+        # the sub-floor share is unknowable from the wire alone
+        self.min_scores = min_scores
+        self.dets = 0
+        self.sub_floor = 0
+        self.sub_floor_seeded = 0
         self.total = 0
         self.valid = 0
         self.invalid = 0
@@ -374,6 +435,16 @@ class Stats:
         for det in objects:
             self.label_counts[det["label"]] = self.label_counts.get(det["label"], 0) + 1
             self.scores.append(det["score"])
+            self.dets += 1
+            if self.min_scores is None:
+                continue
+            floor = self.min_scores.get(
+                det["label"], self.min_scores.get("default", DEFAULT_MIN_SCORE)
+            )
+            if det["score"] < floor:
+                self.sub_floor += 1
+                if det.get("observation_kind") == "tracked":
+                    self.sub_floor_seeded += 1
 
     def summary(self) -> str:
         lines = [
@@ -424,6 +495,7 @@ class Stats:
             )
         else:
             lines.append("score min/mean/max: n/a (no detections seen)")
+        lines.append(self.sub_floor_summary())
 
         emit_fps = None
         every_pts = [p for seen in self.pts_seen.values() for p in seen]
@@ -452,6 +524,34 @@ class Stats:
 
         lines.extend(self.inference_summary(emit_fps))
         return "\n".join(lines)
+
+    def sub_floor_summary(self) -> str:
+        """How much of what was emitted is below its label's min_score.
+
+        The one measurement that reads a --track-floor-json run: near nothing
+        without the flag, and with it the share of the wire the low-confidence
+        band is taking. It needs the floors the plugin ran under, which are not
+        on the wire -- hence the argument rather than an estimate. See the
+        module docstring for the two ways it is approximate.
+
+        The seeded count is printed whether or not it is zero. It is a
+        regression signal, and a signal that only appears once it has already
+        fired is one no reader can confirm is quiet.
+        """
+        if self.min_scores is None:
+            return (
+                "sub-floor share: n/a (pass --min-score-json to measure it; "
+                "the floors a run used are not on the wire)"
+            )
+        if not self.dets:
+            return "sub-floor share: n/a (no detections seen)"
+        share = 100.0 * self.sub_floor / self.dets
+        return (
+            f"sub-floor share: {self.sub_floor} of {self.dets} detection(s) "
+            f"({share:.1f}%) below their label's min_score, "
+            f"{self.sub_floor_seeded} of them on seeded lines "
+            "(a seed re-reports evidence: expect 0)"
+        )
 
     def inference_summary(self, emit_fps):
         """What the run cost in model passes, as far as the wire can say.
@@ -507,9 +607,16 @@ class Stats:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--file", default=None, help="ndjson file to read (default: stdin)")
+    ap.add_argument(
+        "--min-score-json",
+        type=parse_min_scores,
+        default=None,
+        help="the label -> min_score map the plugin was launched with; enables "
+             "the sub-floor share report (default: not measured)",
+    )
     args = ap.parse_args()
 
-    stats = Stats()
+    stats = Stats(args.min_score_json)
 
     src = open(args.file, "rb") if args.file else sys.stdin.buffer
 

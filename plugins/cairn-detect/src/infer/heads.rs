@@ -38,8 +38,20 @@ pub(super) fn decode_output(
     Ok(finish(candidates, output.nms, labels, floors, projection))
 }
 
-/// The floor each of a layout's `nc` classes is held to, resolved once per
-/// decode rather than per anchor.
+/// One class's two floors: the score it takes to be emitted at all, and the
+/// score it takes to be read as evidence.
+///
+/// The same number unless `--track-floor-json` lowered `emit` under
+/// `min_score`, and the gap between them is the band that flag exists to put
+/// on the wire.
+#[derive(Clone, Copy)]
+pub(super) struct ClassFloor {
+    emit: f64,
+    min_score: f64,
+}
+
+/// Both floors for each of a layout's `nc` classes, resolved once per decode
+/// rather than per anchor.
 ///
 /// [`ScoreFloors`] is keyed by label and [`Labels::label_for`] allocates, so
 /// looking a floor up inside a `Q x nc` or `A x nc` loop would allocate tens of
@@ -51,9 +63,15 @@ pub(super) fn decode_output(
 /// per *camera*: one multiplexed process serves a group whose members each
 /// carry their own `min_score`, so a table cached beside the session would be
 /// the wrong one for every member but the first.
-fn class_floors(nc: usize, labels: &Labels, floors: &ScoreFloors) -> Vec<f64> {
+fn class_floors(nc: usize, labels: &Labels, floors: &ScoreFloors) -> Vec<ClassFloor> {
     (0..nc)
-        .map(|class_id| floors.floor_for(&labels.label_for(class_id)))
+        .map(|class_id| {
+            let label = labels.label_for(class_id);
+            ClassFloor {
+                emit: floors.emit_floor_for(&label),
+                min_score: floors.floor_for(&label),
+            }
+        })
         .collect()
 }
 
@@ -63,23 +81,71 @@ pub(super) struct Candidate {
     class_id: usize,
     /// Corners in model-input pixels, still to be un-projected.
     corners: ModelBox,
+    /// Whether this candidate is at or above its class's `min_score` —
+    /// evidence, as against the band `--track-floor-json` opens beneath it.
+    ///
+    /// Carried from here rather than worked out later because it is the
+    /// *first* sort key everywhere candidates and detections are ranked
+    /// ([`finish`], [`top_dets`]): the band has to sort behind every
+    /// evidence-grade box so that each cut below sheds it first, and the
+    /// boundary between the two is per class, which score order alone cannot
+    /// express.
+    ///
+    /// With the flag off it is `true` for every candidate a head with a class
+    /// table produces — those gate on the class's own floor, and the emission
+    /// gate is then the very same comparison — so the ranking below is score
+    /// order exactly as it was. [`end_to_end`] is the exception, cutting on a
+    /// common lower bound instead, so a candidate of *its* can be `false` with
+    /// the flag off. Those are dropped by the per-label gate in [`finish`]
+    /// before anything is ranked, and reaching a ranking at all would take a
+    /// profile pairing that layout with NMS. No catalog entry does;
+    /// [`candidates_from`] carries a `debug_assert` saying so at runtime, and
+    /// because that is compiled out of a release build, the test
+    /// `no_profile_pairs_an_end_to_end_layout_with_nms` walks the catalog and
+    /// fails when a future profile breaks it.
+    evidence: bool,
 }
 
 /// Pull every anchor/row the layout offers above its floor into candidates.
 ///
 /// Every layout that knows a candidate's class id at candidate time gates on
-/// that class's *own* floor here, not on a common lower bound. That is what
-/// keeps [`finish`]'s `truncate(max_candidates)` honest: it must only ever see
-/// candidates that could survive, or a flood of high-scoring boxes in classes
-/// the operator excluded (`default: 1.0` as an allowlist is the documented
-/// pattern) crowds out the one class they asked for, silently.
+/// that class's *own* emission floor here, not on a common lower bound. That is
+/// what keeps [`finish`]'s `truncate(max_candidates)` honest: it must only ever
+/// see candidates that could survive, or a flood of high-scoring boxes in
+/// classes the operator excluded (`default: 1.0` as an allowlist is the
+/// documented pattern) crowds out the one class they asked for, silently.
+///
+/// With `--track-floor-json` set those per-class floors are all the same
+/// number — the track floor, which is validated strictly below every one of
+/// them — so the classes an allowlist closed are open again in the band
+/// `[track_floor, min_score)`, and what they cost is `max_candidates` slots
+/// and the wire they take.
+///
+/// **What they do not cost is a detection.** Every box the flag-off run emits
+/// is still emitted with the flag on, at the same score under the same label,
+/// which is three separate properties and not one:
+///
+///   * [`raw_classes`] and [`grid_objectness`] pick their class by an argmax
+///     that reads no floor at all, so the winning class of an anchor does not
+///     move; the floor only decides whether that winner is kept.
+///   * [`detr_queries`] does pick by floor, and so tracks the evidence and
+///     band bests apart and prefers evidence — a single pick against the
+///     shared emission floor would let a band class take the query and lose
+///     the evidence detection outright. See the note there.
+///   * [`finish`] and [`top_dets`] then rank evidence ahead of the band, so
+///     neither cut, nor either of [`crate::emit::objects_line`]'s, can shed an
+///     evidence box while a band one survives.
+///
+/// The first two are what keep the *candidate* set a superset of the flag-off
+/// one; the third is what keeps every cut below spending its room on that
+/// superset's evidence half first. See `ScoreFloors::with_track_floor`.
 ///
 /// [`Layout::EndToEnd`] is the exception and cannot join them: its class id is
 /// a number in the output row rather than an index into a known `nc`, so there
-/// is no floor table to look up. It cuts on the lowest floor any label could
-/// carry instead — sound because that layout is NMS-free by construction, so
-/// nothing truncates its candidates and the real per-label gate in [`finish`]
-/// sees them all.
+/// is no floor table to look up. It cuts on the lowest score anything could be
+/// emitted at instead — sound because that layout is NMS-free by construction,
+/// so nothing truncates its candidates and the real per-label gate in
+/// [`finish`] sees them all.
 pub(super) fn candidates_from(
     output: OutputSpec,
     raw: &Outputs<Raw>,
@@ -90,7 +156,22 @@ pub(super) fn candidates_from(
     // `validate_layout` has already agreed the roles, so a mismatch here is
     // unreachable rather than a case to handle.
     match (output.layout, raw) {
-        (Layout::EndToEnd, Outputs::One(one)) => Ok(end_to_end(one.values, floors.min_floor())),
+        (Layout::EndToEnd, Outputs::One(one)) => {
+            // The one place the "NMS-free by construction" reading above stops
+            // being a catalog convention and becomes checkable: this head's
+            // rows are already final, and its candidates are the only ones
+            // whose `evidence` can be `false` under a per-label floor with the
+            // track floor *off* (it prefilters on a common lower bound, not on
+            // each class's own). Nothing downstream would notice — `finish`'s
+            // per-label gate drops them before anything is ranked — unless a
+            // profile paired this layout with NMS, which would put them
+            // through a sort keyed on that flag. No profile does.
+            debug_assert!(
+                output.nms.is_none(),
+                "an end-to-end head is already final and must not be given NMS"
+            );
+            Ok(end_to_end(one.values, labels, floors))
+        }
         (Layout::RawClasses { nc }, Outputs::One(one)) => {
             let anchors = one.dims[2] as usize;
             require_values(one.values.len(), 4 + nc, anchors, &one.dims)?;
@@ -154,7 +235,16 @@ fn require_values(have: usize, rows: usize, row: usize, dims: &[i64]) -> Result<
 }
 
 /// `[1, N, 6]` rows of `[x1, y1, x2, y2, score, class_id]`, already final.
-fn end_to_end(rows: &[f32], prefilter: f64) -> Vec<Candidate> {
+///
+/// The one head with no `nc` and so no [`class_floors`] table: it prefilters on
+/// [`ScoreFloors::min_emit_floor`], the lowest score anything could be emitted
+/// at, and looks the surviving row's own floors up by label. That is one
+/// allocation per *surviving row* — a few hundred at this layout's row count,
+/// where the table exists to keep a lookup out of an `A x nc` loop of tens of
+/// thousands. `finish` pays the same cost again for the same rows, and both are
+/// a rounding error against the model pass behind them.
+fn end_to_end(rows: &[f32], labels: &Labels, floors: &ScoreFloors) -> Vec<Candidate> {
+    let prefilter = floors.min_emit_floor();
     rows.chunks_exact(6)
         .filter_map(|row| {
             // NaN survives `score < floor` (the comparison is false) and
@@ -168,15 +258,17 @@ fn end_to_end(rows: &[f32], prefilter: f64) -> Vec<Candidate> {
             if score < prefilter {
                 return None;
             }
+            let class_id = row[5].max(0.0).round() as usize;
             Some(Candidate {
                 score,
-                class_id: row[5].max(0.0).round() as usize,
+                class_id,
                 corners: ModelBox(Bbox {
                     x1: f64::from(row[0]),
                     y1: f64::from(row[1]),
                     x2: f64::from(row[2]),
                     y2: f64::from(row[3]),
                 }),
+                evidence: score >= floors.floor_for(&labels.label_for(class_id)),
             })
         })
         .collect()
@@ -186,16 +278,17 @@ fn end_to_end(rows: &[f32], prefilter: f64) -> Vec<Candidate> {
 /// `c * anchors + a`. Rows 0..4 are `cx, cy, w, h` in input pixels; rows 4..
 /// are per-class scores, already sigmoided.
 ///
-/// `floors` is one floor per class id, from [`class_floors`]: the argmax names
-/// the class, so this head can hold each candidate to its own floor rather
-/// than to a common lower bound — see [`candidates_from`].
+/// `floors` is one [`ClassFloor`] per class id, from [`class_floors`]: the
+/// argmax names the class, so this head can hold each candidate to its own
+/// emission floor rather than to a common lower bound — see
+/// [`candidates_from`] — and mark it against its own `min_score`.
 fn raw_classes(
     values: &[f32],
     nc: usize,
     anchors: usize,
     size: InputSize,
     score: ScoreComposition,
-    floors: &[f64],
+    floors: &[ClassFloor],
 ) -> Vec<Candidate> {
     // This layout has no objectness column, so the composition has nothing to
     // fold in either way — see `ScoreComposition::ObjTimesClass`.
@@ -210,7 +303,10 @@ fn raw_classes(
         //
         // `floors` carries one entry per class by construction and `argmax`
         // ranges over the same `nc`, so the lookup is total.
-        if score.is_nan() || floors.get(class_id).is_none_or(|floor| score < *floor) {
+        let Some(floor) = floors.get(class_id) else {
+            continue;
+        };
+        if score.is_nan() || score < floor.emit {
             continue;
         }
         let cx = f64::from(values[a]);
@@ -222,6 +318,7 @@ fn raw_classes(
                 score,
                 class_id,
                 corners,
+                evidence: score >= floor.min_score,
             });
         }
     }
@@ -237,16 +334,17 @@ fn raw_classes(
 /// concatenated it (all of the first stride's cells row-major, then the next).
 /// Entry 4 is objectness and the rest are class scores, both already sigmoided.
 ///
-/// `floors` is one floor per class id, from [`class_floors`]: the argmax names
-/// the class, so this head can hold each candidate to its own floor rather
-/// than to a common lower bound — see [`candidates_from`].
+/// `floors` is one [`ClassFloor`] per class id, from [`class_floors`]: the
+/// argmax names the class, so this head can hold each candidate to its own
+/// emission floor rather than to a common lower bound — see
+/// [`candidates_from`] — and mark it against its own `min_score`.
 fn grid_objectness(
     values: &[f32],
     nc: usize,
     strides: &[usize],
     size: InputSize,
     score: ScoreComposition,
-    floors: &[f64],
+    floors: &[ClassFloor],
 ) -> Vec<Candidate> {
     let row = 5 + nc;
     let mut candidates = Vec::new();
@@ -270,7 +368,10 @@ fn grid_objectness(
                 // `floors` carries one entry per class by construction and
                 // `argmax` ranges over the same `nc`, so the lookup is total.
                 let score = objectness * class_score;
-                if score.is_nan() || floors.get(class_id).is_none_or(|floor| score < *floor) {
+                let Some(floor) = floors.get(class_id) else {
+                    continue;
+                };
+                if score.is_nan() || score < floor.emit {
                     continue;
                 }
                 let cx = (f64::from(values[base]) + gx as f64) * stride;
@@ -284,6 +385,7 @@ fn grid_objectness(
                         score,
                         class_id,
                         corners,
+                        evidence: score >= floor.min_score,
                     });
                 }
             }
@@ -302,7 +404,8 @@ fn grid_objectness(
 /// silently off by the padding.
 ///
 /// One candidate per query: the best-scoring class that clears *its own*
-/// floor, which is not always the query's argmax.
+/// `min_score`, which is not always the query's argmax — and only if no class
+/// clears one, the best that clears its own emission floor.
 ///
 /// RF-DETR's own postprocess takes the top k of the flattened query x class
 /// matrix, so one query can leave under several labels. Plain argmax matches
@@ -315,9 +418,22 @@ fn grid_objectness(
 /// already reads all `nc` logits — and collapses to argmax when the floors are
 /// uniform.
 ///
-/// `floors` is one floor per class id, from [`class_floors`]. The per-label
-/// gate in [`finish`] re-applies it after NMS; picking here only decides which
-/// label the box leaves under.
+/// **The evidence class wins the query even when a band class outscores it**,
+/// which is why the two are tracked apart rather than picked by one `>=`
+/// against [`ClassFloor::emit`]. With `--track-floor-json` set that emission
+/// floor is the *same number for every class*, so a single best-clearing pick
+/// would lose the per-class selectivity this head exists for: the query above
+/// would leave as a band `car` at 0.85 and the evidence `truck` at 0.60 —
+/// which the flag-off run emits — would be gone with the query's one box. The
+/// same shape costs an allowlist the class it admitted. Ranking evidence ahead
+/// of the band later cannot repair it, there being no candidate to rank.
+///
+/// With the flag off, `emit` *is* `min_score` for every class, so nothing can
+/// land in the band set and this is the single pick it has always been.
+///
+/// `floors` is one [`ClassFloor`] per class id, from [`class_floors`]. The
+/// per-label gate in [`finish`] re-applies the emission floor after NMS;
+/// picking here only decides which label the box leaves under.
 fn detr_queries(
     boxes: &[f32],
     logits: &[f32],
@@ -325,11 +441,13 @@ fn detr_queries(
     queries: usize,
     size: InputSize,
     score: ScoreComposition,
-    floors: &[f64],
+    floors: &[ClassFloor],
 ) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     for query in 0..queries {
-        let mut best: Option<(usize, f64)> = None;
+        // The two sets kept apart, and evidence spent first below.
+        let mut best_evidence: Option<(usize, f64)> = None;
+        let mut best_band: Option<(usize, f64)> = None;
         let mut poisoned = false;
         // `zip` rather than indexing: `floors` carries one entry per class by
         // construction, and pairing them is what says so without a panic path.
@@ -348,14 +466,26 @@ fn detr_queries(
                 poisoned = true;
                 break;
             }
-            if value >= *floor && best.is_none_or(|(_, high)| value > high) {
-                best = Some((class_id, value));
+            // Strict `>` in both, so a tie inside either set keeps the lowest
+            // class id — the order the logits were read in, as before.
+            if value >= floor.min_score {
+                if best_evidence.is_none_or(|(_, high)| value > high) {
+                    best_evidence = Some((class_id, value));
+                }
+            } else if value >= floor.emit && best_band.is_none_or(|(_, high)| value > high) {
+                best_band = Some((class_id, value));
             }
         }
         if poisoned {
             continue;
         }
-        let Some((class_id, score)) = best else {
+        // Evidence first whatever it scored: a band class outscoring it is
+        // exactly the case a single pick gets wrong (see above). With the flag
+        // off `best_band` is always `None` and this is `best_evidence` alone.
+        let Some((class_id, score, evidence)) = best_evidence
+            .map(|(class_id, value)| (class_id, value, true))
+            .or_else(|| best_band.map(|(class_id, value)| (class_id, value, false)))
+        else {
             continue;
         };
         let row = &boxes[query * 4..query * 4 + 4];
@@ -371,6 +501,7 @@ fn detr_queries(
                 score,
                 class_id,
                 corners,
+                evidence,
             });
         }
     }
@@ -422,12 +553,29 @@ fn centered(cx: f64, cy: f64, w: f64, h: f64, size: InputSize) -> Option<ModelBo
 }
 
 /// Where every layout converges, in this order: candidates the host would
-/// refuse are dropped; then, on a head that asks for NMS, a descending-score
-/// sort, a `truncate` to `max_candidates`, and [`nms`]; then the per-label
-/// floor, un-projection, and last [`top_dets`]'s own score sort and
-/// [`MAX_DETS`] cap. A head with `nms: None` skips those three middle steps
-/// entirely — no sort and no `max_candidates` cut — so [`top_dets`] is the only
-/// thing that orders its output.
+/// refuse are dropped; then, on a head that asks for NMS, an
+/// evidence-then-score sort, a `truncate` to `max_candidates`, and [`nms`];
+/// then the per-label emission floor, un-projection, and last [`top_dets`]'s
+/// own sort by the same key and its [`MAX_DETS`] cap. A head with `nms: None`
+/// skips those three middle steps entirely — no sort and no `max_candidates`
+/// cut — so [`top_dets`] is the only thing that orders its output.
+///
+/// **Evidence first, score second, at every cut.** `--track-floor-json` puts
+/// boxes below their class's `min_score` on the wire, and the boundary between
+/// those and evidence is *per class* — so under per-label floors a band `car`
+/// at 0.5 outscores an evidence `person` at 0.45, and ranking by score alone
+/// would let the band displace evidence here, at [`top_dets`], and again at
+/// [`crate::emit::objects_line`]'s two cuts. Ranking [`Candidate::evidence`]
+/// first is what makes the band structurally the tail of every list, so each of
+/// those cuts sheds it first with no rule of its own. With the flag off every
+/// *detection* this returns is evidence — it has passed the per-label gate
+/// below, which is then that same comparison — so both keys collapse to the
+/// score sorts they always were.
+///
+/// Ranking is only the half of it that happens here. A candidate that was
+/// never built cannot be ranked, and a head that picks one class per anchor or
+/// query decides that before this function sees anything — see
+/// [`candidates_from`], which sets out both halves together.
 ///
 /// The `retain` below is where a candidate stops being a detection at all: a
 /// box whose clamped extent rounds to zero — see [`wire_bbox`] — is dropped
@@ -466,7 +614,11 @@ pub(super) fn finish(
     candidates.retain(|candidate| wire_bbox(projection.unproject(candidate.corners)).is_some());
     let kept = match spec {
         Some(spec) => {
-            candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+            candidates.sort_by(|a, b| {
+                b.evidence
+                    .cmp(&a.evidence)
+                    .then_with(|| b.score.total_cmp(&a.score))
+            });
             candidates.truncate(spec.max_candidates);
             nms(candidates, spec.iou)
         }
@@ -481,12 +633,13 @@ pub(super) fn finish(
             // one place every layout converges. For the rest it is a no-op:
             // they gated on the same floor already, and NMS only ever drops a
             // box weaker than one of its own class, which shares it.
-            if candidate.score < floors.floor_for(&label) {
+            if candidate.score < floors.emit_floor_for(&label) {
                 return None;
             }
             let det = det_from(
                 projection.unproject(candidate.corners),
                 candidate.score,
+                candidate.evidence,
                 label,
             )?;
             Some((candidate.score, det))
@@ -502,7 +655,13 @@ pub(super) fn finish(
 /// weaker label entirely, and Cairn's per-label floors are what decide
 /// whether it matters.
 ///
-/// `candidates` must already be sorted by descending score.
+/// `candidates` must already be sorted by descending score **within each
+/// class**, which is all a class-aware suppression can read: only same-class
+/// pairs are ever compared, so the relative order of two classes is not
+/// something this function can observe. [`finish`] hands it an
+/// evidence-then-score order, and that is the same order per class — a class's
+/// band is exactly the part of it below that class's own `min_score`, so every
+/// evidence-grade box of a class outscores every band box of it.
 ///
 /// This runs on model-space boxes, where pad pixels count as area like any
 /// other, so a box lying wholly in the letterbox pad is indistinguishable here
@@ -625,7 +784,12 @@ fn wire_bbox(bbox: NormBox) -> Option<[f64; 4]> {
 
 /// A scored, labelled detection from an un-projected box, or `None` when
 /// [`wire_bbox`] declines the box as one the host would refuse.
-fn det_from(bbox: NormBox, score: f64, label: String) -> Option<Det> {
+///
+/// `evidence` is carried through from the candidate rather than re-derived:
+/// it is decided where the class's `min_score` is in hand, and it is the first
+/// key everything downstream ranks by (see [`finish`]). The box is emitted
+/// either way, having already passed the emission floor.
+fn det_from(bbox: NormBox, score: f64, evidence: bool, label: String) -> Option<Det> {
     let bbox = wire_bbox(bbox)?;
     Some(Det {
         // `--labels` is arbitrary user text and the host refuses a label it
@@ -641,14 +805,27 @@ fn det_from(bbox: NormBox, score: f64, label: String) -> Option<Det> {
         // A box the model found in the frame in hand. The other kind is minted
         // in `emit`, from boxes an earlier frame's pass found, and never here.
         observation_kind: ObservationKind::Detected,
+        evidence,
     })
 }
 
-/// Score-order and cap, where every layout converges.
+/// Evidence-then-score order and the [`MAX_DETS`] cap, where every layout
+/// converges.
+///
+/// The same key [`finish`] ranks candidates by, and for the same reason: what
+/// `--track-floor-json` admits has to be the tail of this list, so that this
+/// cut — and [`crate::emit::objects_line`]'s two, which inherit this order —
+/// spend their room on evidence first whatever shape the per-label floors are.
+/// With the flag off every detection is evidence and this is the plain score
+/// sort it has always been.
 fn top_dets(mut dets: Vec<(f64, Det)>) -> Vec<Det> {
     // yolov10 exports are already score-ordered; sorting keeps the MAX_DETS
     // cut meaningful for exports that are not, and NMS output never is.
-    dets.sort_by(|a, b| b.0.total_cmp(&a.0));
+    dets.sort_by(|a, b| {
+        b.1.evidence
+            .cmp(&a.1.evidence)
+            .then_with(|| b.0.total_cmp(&a.0))
+    });
     dets.truncate(MAX_DETS);
     dets.into_iter().map(|(_, det)| det).collect()
 }
@@ -660,7 +837,7 @@ fn round_to(value: f64, places: u32) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::catalog::{RFDETR, YOLOV10, YOLOV8, YOLOX};
+    use super::super::catalog::{PROFILES, RFDETR, YOLOV10, YOLOV8, YOLOX};
     use super::super::geometry::{InputSize, Projection, ResizePolicy};
     use super::super::labels::{check_label_count, Labels, ScoreFloors};
     use super::super::profile::*;
@@ -678,6 +855,12 @@ mod tests {
     fn open() -> ScoreFloors {
         floors("{}")
     }
+
+    /// What the `det_from` tests below hand in for `evidence`. They are about
+    /// geometry and labels, not about the flag, and a box above its floor is
+    /// the ordinary case — spelled once so a reader is not left wondering
+    /// which of the two those tests are exercising.
+    const EVIDENCE: bool = true;
 
     /// A model-space box from corners a test names literally.
     fn model_box(x1: f64, y1: f64, x2: f64, y2: f64) -> ModelBox {
@@ -765,6 +948,7 @@ mod tests {
                 score: 0.877,
                 bbox: [0.1, 0.2, 0.2, 0.3],
                 observation_kind: ObservationKind::Detected,
+                evidence: true,
             }]
         );
     }
@@ -887,6 +1071,7 @@ mod tests {
                 score: 0.9,
                 bbox: [0.4, 0.35, 0.2, 0.3],
                 observation_kind: ObservationKind::Detected,
+                evidence: true,
             }]
         );
     }
@@ -1007,7 +1192,7 @@ mod tests {
     fn the_prefilter_never_cuts_above_a_configured_floor() {
         // the lowest configured floor is what the prefilter may cut at
         let floors = floors(r#"{"default":0.5,"car":0.02}"#);
-        assert_eq!(floors.min_floor(), 0.02);
+        assert_eq!(floors.min_emit_floor(), 0.02);
         let dets = v8(
             3,
             &[
@@ -1020,6 +1205,209 @@ mod tests {
         assert_eq!(dets.len(), 1);
         assert_eq!(dets[0].label, "car");
         assert_eq!(dets[0].score, 0.03);
+    }
+
+    /// `{"default":0.5}` with a track floor at 0.2 — the band the flag opens
+    /// is `[0.2, 0.5)`.
+    fn banded() -> ScoreFloors {
+        floors(r#"{"default":0.5}"#)
+            .with_track_floor(Some(0.2))
+            .expect("0.2 is strictly below the 0.5 default")
+    }
+
+    #[test]
+    fn a_track_floor_emits_the_band_below_min_score_at_its_real_score() {
+        // Three anchors, well apart so NMS has nothing to say about them: one
+        // over the evidence floor, one inside the band, one under the track
+        // floor.
+        let anchors = [
+            (100.0, 100.0, 40.0, 40.0, 0usize, 0.9),
+            (300.0, 300.0, 40.0, 40.0, 0usize, 0.3),
+            (500.0, 500.0, 40.0, 40.0, 0usize, 0.05),
+        ];
+        // Without the flag the band is not on the wire at all — the identity
+        // every run Cairn launches today depends on.
+        let plain = v8(3, &anchors, &floors(r#"{"default":0.5}"#), SQUARE);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].score, 0.9);
+        assert!(plain[0].evidence);
+
+        // With it, the band arrives at the score the model gave it, not at
+        // some marked-down or floored one, and the sub-floor box is still a
+        // `detected` observation — it is a box this frame's model pass found.
+        let banded = v8(3, &anchors, &banded(), SQUARE);
+        assert_eq!(banded.len(), 2);
+        assert_eq!(banded[0].score, 0.9);
+        assert!(banded[0].evidence);
+        assert_eq!(banded[1].score, 0.3);
+        assert!(!banded[1].evidence);
+        assert_eq!(banded[1].observation_kind, ObservationKind::Detected);
+        // the 0.3 anchor and not the 0.05 one: 280..320 of 640 on both axes.
+        // 0.05 is under the track floor, which the flag does not reach past.
+        assert_eq!(banded[1].bbox, [0.4375, 0.4375, 0.0625, 0.0625]);
+    }
+
+    #[test]
+    fn nms_weighs_a_sub_floor_box_against_the_whole_frame_as_it_always_did() {
+        // One pass over the combined set, not a second pass over the band: a
+        // sub-floor box is suppressed by a stronger box of its own class the
+        // way any weaker box is, and survives a stronger box of another class
+        // the way any box of another class does.
+        let stacked = [
+            (100.0, 100.0, 40.0, 40.0, 0usize, 0.9),
+            (100.0, 100.0, 40.0, 40.0, 0usize, 0.3),
+        ];
+        let dets = v8(3, &stacked, &banded(), SQUARE);
+        assert_eq!(dets.len(), 1, "{dets:?}");
+        assert_eq!(dets[0].score, 0.9);
+
+        let mixed = [
+            (100.0, 100.0, 40.0, 40.0, 0usize, 0.9),
+            (100.0, 100.0, 40.0, 40.0, 2usize, 0.3),
+        ];
+        let dets = v8(3, &mixed, &banded(), SQUARE);
+        assert_eq!(dets.len(), 2, "{dets:?}");
+        assert_eq!(dets[1].label, "car");
+        assert!(!dets[1].evidence);
+    }
+
+    #[test]
+    fn the_band_only_spends_cap_slots_the_evidence_left() {
+        // `top_dets` cuts at MAX_DETS on evidence first and score second, so
+        // the band can only ever spend slots the evidence-grade boxes left.
+        // Fill the cap with evidence and add a band that would overflow it
+        // twice over. (The per-label case, where the band *outscores* the
+        // evidence, is the test below — this one would pass on score order
+        // alone.)
+        let mut anchors: Vec<_> = (0..MAX_DETS)
+            .map(|i| (20.0 * i as f32 + 10.0, 20.0, 8.0, 8.0, 0usize, 0.6))
+            .collect();
+        anchors
+            .extend((0..MAX_DETS).map(|i| (20.0 * i as f32 + 10.0, 300.0, 8.0, 8.0, 0usize, 0.4)));
+        let dets = v8(3, &anchors, &banded(), SQUARE);
+        assert_eq!(dets.len(), MAX_DETS);
+        assert!(dets.iter().all(|det| det.evidence && det.score == 0.6));
+
+        // Take four of the evidence boxes away and the band fills exactly
+        // those four slots, strongest first — nothing else changes.
+        anchors.truncate(MAX_DETS - 4);
+        anchors
+            .extend((0..MAX_DETS).map(|i| (20.0 * i as f32 + 10.0, 300.0, 8.0, 8.0, 0usize, 0.4)));
+        let dets = v8(3, &anchors, &banded(), SQUARE);
+        assert_eq!(dets.len(), MAX_DETS);
+        assert_eq!(dets.iter().filter(|det| det.evidence).count(), MAX_DETS - 4);
+        assert!(dets[MAX_DETS - 4..]
+            .iter()
+            .all(|det| !det.evidence && det.score == 0.4));
+    }
+
+    #[test]
+    fn a_band_box_outscoring_an_evidence_box_still_sheds_first() {
+        // The case score order alone gets wrong, and the one Cairn's own
+        // per-label floors make reachable: `person` at 0.4 and `car` at 0.8,
+        // so an evidence person at 0.45 sits *below* a band car at 0.5. Rank
+        // by score and every cut keeps the car and drops the person.
+        let floors = floors(r#"{"default":0.5,"person":0.4,"car":0.8}"#)
+            .with_track_floor(Some(0.2))
+            .unwrap();
+        // A full cap of evidence people just over their floor, then a band of
+        // cars that each outscore all of them.
+        let mut anchors: Vec<_> = (0..MAX_DETS)
+            .map(|i| (20.0 * i as f32 + 10.0, 20.0, 8.0, 8.0, 0usize, 0.45))
+            .collect();
+        anchors
+            .extend((0..MAX_DETS).map(|i| (20.0 * i as f32 + 10.0, 300.0, 8.0, 8.0, 2usize, 0.5)));
+
+        let dets = v8(3, &anchors, &floors, SQUARE);
+        assert_eq!(dets.len(), MAX_DETS);
+        assert!(
+            dets.iter().all(|det| det.label == "person" && det.evidence),
+            "the higher-scoring band was the thing that went: {:?}",
+            dets.iter()
+                .map(|det| (det.label.as_str(), det.score))
+                .collect::<Vec<_>>()
+        );
+        // The order handed to `emit`, which is where the same property is
+        // pinned for the line writer's own two cuts: under the cap, the band
+        // is still the tail even though it outscores the head.
+        let mut few: Vec<_> = (0..4)
+            .map(|i| (20.0 * i as f32 + 10.0, 20.0, 8.0, 8.0, 0usize, 0.45))
+            .collect();
+        few.extend((0..4).map(|i| (20.0 * i as f32 + 10.0, 300.0, 8.0, 8.0, 2usize, 0.5)));
+        assert_eq!(
+            v8(3, &few, &floors, SQUARE)
+                .iter()
+                .map(|det| (det.label.clone(), det.evidence))
+                .collect::<Vec<_>>(),
+            [
+                ("person".to_string(), true),
+                ("person".to_string(), true),
+                ("person".to_string(), true),
+                ("person".to_string(), true),
+                ("car".to_string(), false),
+                ("car".to_string(), false),
+                ("car".to_string(), false),
+                ("car".to_string(), false),
+            ],
+            "evidence first, and the band behind it at a higher score"
+        );
+    }
+
+    #[test]
+    fn the_evidence_mark_is_the_emission_gates_own_comparison() {
+        // `score >= min_score` on the score the model gave, which is the
+        // comparison the emission gate makes and every other floor in this
+        // crate makes. That identity is what makes "with the flag off every
+        // emitted detection is evidence" structural rather than a thing to
+        // re-check: the gate has already applied the same `>=` to the same
+        // number, `emit` being `min_score` there.
+        //
+        // `det_from` then rounds to three places, so a candidate inside
+        // 0.0005 of its floor is marked against the pre-rounding number while
+        // the host reads the rounded one — 0.4996 leaves here as 0.5, which
+        // the host calls evidence and this calls band. The window is a
+        // thousandth wide and the disagreement is one-sided: the plugin
+        // declines to seed a box the host would have accepted, never the
+        // reverse. It is also not new — the plugin already drops a 0.4996
+        // candidate under a 0.5 floor outright, for the same reason.
+        let floors = floors(r#"{"default":0.5}"#)
+            .with_track_floor(Some(0.2))
+            .unwrap();
+        let dets = v8(
+            3,
+            &[
+                (100.0, 100.0, 40.0, 40.0, 0, 0.5),
+                (300.0, 300.0, 40.0, 40.0, 0, 0.4996),
+            ],
+            &floors,
+            SQUARE,
+        );
+        assert_eq!(dets.len(), 2);
+        assert_eq!(dets[0].score, 0.5);
+        assert!(dets[0].evidence, "exactly at the floor is evidence");
+        assert_eq!(dets[1].score, 0.5, "and the wire rounds this one to it");
+        assert!(!dets[1].evidence, "but it was under the floor when marked");
+    }
+
+    #[test]
+    fn an_end_to_end_head_reads_the_track_floor_as_its_prefilter() {
+        // The one layout with no class table: it cuts on the lowest score
+        // anything could be emitted at, which with a track floor set is the
+        // track floor itself. Anything else would drop the band before the
+        // per-label gate in `finish` ever saw it.
+        let floors = floors(r#"{"default":0.5,"car":0.6}"#)
+            .with_track_floor(Some(0.2))
+            .unwrap();
+        assert_eq!(floors.min_emit_floor(), 0.2);
+        let mut rows = row(64.0, 64.0, 128.0, 128.0, 0.9, 0.0).to_vec();
+        rows.extend_from_slice(&row(256.0, 256.0, 320.0, 320.0, 0.3, 0.0));
+        rows.extend_from_slice(&row(448.0, 448.0, 512.0, 512.0, 0.1, 0.0));
+        let dets = e2e(&rows, &floors, SQUARE);
+        assert_eq!(dets.len(), 2);
+        assert_eq!(dets[0].score, 0.9);
+        assert!(dets[0].evidence);
+        assert_eq!(dets[1].score, 0.3);
+        assert!(!dets[1].evidence);
     }
 
     #[test]
@@ -1048,6 +1436,7 @@ mod tests {
                 score: 0.65,
                 bbox: [0.45, 0.45, 0.1, 0.1],
                 observation_kind: ObservationKind::Detected,
+                evidence: true,
             }]
         );
     }
@@ -1106,6 +1495,10 @@ mod tests {
         // purpose: Rust's `sort_unstable_by` detects an input already in order
         // and returns it unchanged, an all-equal input included, so a tie group
         // appended after the strong group is a shape the swap never disturbs.
+        //
+        // Both keys are `(evidence, score)` since `--track-floor-json`; these
+        // floors set no track floor, so every candidate here is evidence and
+        // the key is the score alone. A tie in score is a tie in the key.
 
         // --- `finish`: the cut at `max_candidates`, before NMS ---------------
         //
@@ -1301,6 +1694,7 @@ mod tests {
                 score: 0.6, // 0.8 objectness * 0.75 class
                 bbox: [0.5, 0.2188, 0.125, 0.125],
                 observation_kind: ObservationKind::Detected,
+                evidence: true,
             }]
         );
     }
@@ -1572,6 +1966,7 @@ mod tests {
                 score: 0.982, // sigmoid(4)
                 bbox: [0.375, 0.25, 0.25, 0.5],
                 observation_kind: ObservationKind::Detected,
+                evidence: true,
             }]
         );
     }
@@ -1661,6 +2056,115 @@ mod tests {
         // at 1.0 and neither class listed, nothing clears anything.
         let unlisted = Labels(vec!["kite".into(), "spoon".into(), "vase".into()]);
         assert!(decode(&asymmetric, &unlisted).is_empty());
+    }
+
+    #[test]
+    fn detr_picks_the_evidence_class_over_a_higher_scoring_band_one() {
+        // A track floor makes the emission floor *one number for every class*,
+        // so a query picked by a single "best that clears its floor" loses the
+        // per-class selectivity the test above exists for: the band class wins
+        // the query and the evidence detection is never built at all. Nothing
+        // downstream can rank a candidate that does not exist.
+        let names = Labels(vec!["person".into(), "car".into(), "truck".into()]);
+        let logit = |p: f64| (p / (1.0 - p)).ln() as f32;
+        let decode = |out: &DetrOutput, floors: &ScoreFloors| {
+            decode_output(
+                out.spec(),
+                &raw_detr(&out.boxes, &out.logits, out.queries as i64, 3),
+                &names,
+                floors,
+                SQUARE,
+                &Projection::stretch(SQUARE),
+            )
+            .unwrap()
+        };
+
+        // The same query as above — car 0.85 / truck 0.60, floors car 0.9 and
+        // truck 0.4 — now with a track floor under both. The band car
+        // outscores the evidence truck by 0.25 and must still lose.
+        let mut out = DetrOutput::new(1, 3);
+        out.put(0, [0.5, 0.5, 0.2, 0.2], 1, logit(0.85)).put(
+            0,
+            [0.5, 0.5, 0.2, 0.2],
+            2,
+            logit(0.60),
+        );
+        let asymmetric = floors(r#"{"default":1.0,"person":0.6,"car":0.9,"truck":0.4}"#);
+        let banded = floors(r#"{"default":1.0,"person":0.6,"car":0.9,"truck":0.4}"#)
+            .with_track_floor(Some(0.2))
+            .unwrap();
+        let dets = decode(&out, &banded);
+        assert_eq!(dets.len(), 1, "one box per query, either way: {dets:?}");
+        assert_eq!(dets[0].label, "truck");
+        assert_eq!(dets[0].score, 0.6);
+        assert!(dets[0].evidence);
+        // …which is exactly what the flag-off run emits.
+        assert_eq!(decode(&out, &asymmetric), dets);
+
+        // The allowlist shape: `default: 1.0` excludes car, `person: 0.6`
+        // admits person. A track floor reopens car in the band, and the class
+        // the operator asked for must still be the one that leaves.
+        let mut out = DetrOutput::new(1, 3);
+        out.put(0, [0.5, 0.5, 0.2, 0.2], 0, logit(0.65)).put(
+            0,
+            [0.5, 0.5, 0.2, 0.2],
+            1,
+            logit(0.9),
+        );
+        let allowlist = floors(r#"{"default":1.0,"person":0.6}"#)
+            .with_track_floor(Some(0.3))
+            .unwrap();
+        let dets = decode(&out, &allowlist);
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].label, "person", "the admitted class survives");
+        assert!(dets[0].evidence);
+
+        // And the flag still does its job where there is no evidence to
+        // prefer: a query whose only class over the track floor is band.
+        let mut out = DetrOutput::new(1, 3);
+        out.put(0, [0.5, 0.5, 0.2, 0.2], 1, logit(0.3));
+        let dets = decode(
+            &out,
+            &floors(r#"{"default":0.5}"#)
+                .with_track_floor(Some(0.2))
+                .unwrap(),
+        );
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].label, "car");
+        assert_eq!(dets[0].score, 0.3);
+        assert!(!dets[0].evidence);
+    }
+
+    #[test]
+    fn no_profile_pairs_an_end_to_end_layout_with_nms() {
+        // The convention [`candidates_from`]'s end-to-end arm leans on, held
+        // as a gate rather than as a reading of the catalog. Those rows are
+        // already final, and — the reason it is worth a test of its own —
+        // that head is the one whose candidates can carry `evidence: false`
+        // with the track floor *off*, having prefiltered on a common lower
+        // bound rather than on each class's own floor. `finish`'s per-label
+        // gate drops those before anything is ranked; giving the layout NMS
+        // would send them through a sort keyed on that flag first. The
+        // `debug_assert` there says so at runtime and is compiled out of a
+        // release build, so this is what actually holds a future profile to
+        // it.
+        let mut checked = 0;
+        for profile in PROFILES {
+            if matches!(profile.output.layout, Layout::EndToEnd) {
+                checked += 1;
+                assert!(
+                    profile.output.nms.is_none(),
+                    "profile {} pairs an end-to-end layout with NMS",
+                    profile.name
+                );
+            }
+        }
+        // A loop over a set none of whose members it applies to asserts
+        // nothing while still passing, so what the catalog holds is pinned
+        // too: retiring yolov10 without another end-to-end entry has to be a
+        // failure here rather than a test that quietly stops checking.
+        assert_eq!(checked, 1, "yolov10 is the end-to-end profile");
+        assert!(matches!(YOLOV10.output.layout, Layout::EndToEnd));
     }
 
     #[test]
@@ -1761,11 +2265,13 @@ mod tests {
                 .project(YOLOX_416, WIDE)
                 .unproject(corners),
             0.9,
+            EVIDENCE,
             "car".into(),
         );
         let stretched = det_from(
             Projection::stretch(YOLOX_416).unproject(corners),
             0.9,
+            EVIDENCE,
             "car".into(),
         );
         // Both have area, so neither is dropped as a pad-only ghost.
@@ -1789,6 +2295,7 @@ mod tests {
         let det = det_from(
             Projection::stretch(SQUARE).unproject(model_box(0.0, 0.0, 64.0, 64.0)),
             0.5,
+            EVIDENCE,
             raw.to_string(),
         )
         .expect("a 64x64 box has area");
@@ -1989,6 +2496,7 @@ mod tests {
             score,
             bbox,
             observation_kind: ObservationKind::Detected,
+            evidence: true,
         }
     }
 
@@ -2446,7 +2954,7 @@ mod tests {
         let projection = letterboxed(SQUARE);
         let ghost = model_box(500.0, 500.0, 600.0, 600.0);
         assert!(projection.unproject(ghost).corners().y1 > 1.0);
-        assert!(det_from(projection.unproject(ghost), 0.99, "person".into()).is_none());
+        assert!(det_from(projection.unproject(ghost), 0.99, EVIDENCE, "person".into()).is_none());
 
         // The displacement, in the numbers that make it matter: MAX_DETS real
         // boxes plus one pad-only ghost scoring higher than any of them. The
@@ -2501,9 +3009,9 @@ mod tests {
         let real = model_box(104.0, 180.0, 208.0, 306.0);
         assert!(iou(&ghost, &real) >= DEFAULT_NMS.iou);
         // the ghost is pad-only: it is what `det_from` declines to emit
-        assert!(det_from(projection.unproject(ghost), 0.9, "person".into()).is_none());
+        assert!(det_from(projection.unproject(ghost), 0.9, EVIDENCE, "person".into()).is_none());
         // and the real box is not: it keeps the 54 content rows
-        assert!(det_from(projection.unproject(real), 0.7, "person".into()).is_some());
+        assert!(det_from(projection.unproject(real), 0.7, EVIDENCE, "person".into()).is_some());
 
         let values = v8_output(
             NC,
