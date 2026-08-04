@@ -7,7 +7,10 @@ defmodule Cairn.Tracker do
   the live tracks of the same label, run in two confidence stages and measured
   against where each track's motion filter says its box should be by now — see
   "Matching against a prediction" and "Two stages" below, both of which
-  constrain that one rule rather than adding a second. There is no
+  constrain that one rule rather than adding a second. The one thing that
+  loosens it is `tracking.bbd`, off by default and described under "A second
+  admission" below; with it off — which is every camera that has not asked —
+  overlap is the whole of what a track will answer to. There is no
   plugin-driven mode. A plugin's
   `track_id`s and `ended_tracks` are still parsed off the wire, and so is its
   `object_tracking` capability, but nothing here reads any of them — they are
@@ -162,6 +165,28 @@ defmodule Cairn.Tracker do
   prediction the next detection is matched against is the one the last
   *detection* left. Everything else about a seeded box is unchanged: it
   refreshes liveness, it moves `bbox`, and it is no more evidence than before.
+
+  ## A second admission: `tracking.bbd`
+
+  A prediction fixes where to compare, and leaves untouched what IoU cannot
+  say. Two boxes that do not touch overlap by exactly zero however near they
+  are, so once a coast is long enough that the object has cleared its own
+  width, the right detection and every wrong one look the same to the gate and
+  the identity goes to a mint. `Cairn.Tracker.Bbd` measures the centre
+  distance instead, scaled by the predicted box's own size and by how long the
+  track has gone unpositioned, which separates exactly those cases.
+
+  With the flag on, a pair that fails `match_threshold/2` and passes that
+  distance is admitted as well. Nothing about the IoU half changes: its pairs
+  are built, ordered and greedily spent first, so a distance-admitted pair can
+  only take a track and an object that both came through untaken, and every
+  IoU-calibrated threshold in this module still means what it did. Stationary
+  tracks are left out of the second gate altogether — see `bbd_pairs/3`, and
+  the grace above, whose whole safety is that a parked identity answers to one
+  number and no other.
+
+  With the flag off — the default — none of this runs and association is the
+  rest of this doc entire.
 
   ## Two stages: what a low-confidence box may do
 
@@ -413,6 +438,7 @@ defmodule Cairn.Tracker do
 
   alias Cairn.Observation
   alias Cairn.Track
+  alias Cairn.Tracker.Bbd
   alias Cairn.Tracker.Kalman
   alias Cairn.ULID
 
@@ -679,7 +705,8 @@ defmodule Cairn.Tracker do
           max_unseen_ms: pos_integer(),
           max_live_tracks: pos_integer(),
           stationary_after_ms: pos_integer(),
-          min_score: floors() | nil
+          min_score: floors() | nil,
+          bbd: boolean()
         }
 
   @typedoc "The host-side tracking policy for one camera."
@@ -687,7 +714,8 @@ defmodule Cairn.Tracker do
           :max_unseen_ms => pos_integer(),
           :max_live_tracks => pos_integer(),
           :stationary_after_ms => pos_integer(),
-          optional(:min_score) => floors() | nil
+          optional(:min_score) => floors() | nil,
+          optional(:bbd) => boolean()
         }
 
   @type event ::
@@ -716,6 +744,12 @@ defmodule Cairn.Tracker do
   floor lowered at runtime admits boxes as evidence, and a box that may open an
   event but may not mint the track that carries it is an event with no identity
   behind it.
+
+  `bbd` is optional too, and defaults to off — the whole of what a caller that
+  sets no flag sees is the IoU matching described in the moduledoc. The default
+  is repeated here rather than read from `Cairn.Config` because this module is
+  pure and depends on nothing; `Cairn.Config`'s `@default_bbd` is the one an
+  operator's config is resolved against.
   """
   @spec context(Observation.t(), String.t(), policy()) :: context()
   def context(%Observation{} = observation, camera_id, policy) do
@@ -727,7 +761,8 @@ defmodule Cairn.Tracker do
       max_unseen_ms: policy.max_unseen_ms,
       max_live_tracks: policy.max_live_tracks,
       stationary_after_ms: policy.stationary_after_ms,
-      min_score: Map.get(policy, :min_score)
+      min_score: Map.get(policy, :min_score),
+      bbd: Map.get(policy, :bbd, false)
     }
   end
 
@@ -988,6 +1023,11 @@ defmodule Cairn.Tracker do
   # The overlap is taken against each track's *predicted* box, computed once
   # per track for the whole batch and never stored (`predicted_box/1`).
   #
+  # With `tracking.bbd` on — off by default — a second list of pairs the IoU
+  # gate refused is offered after that one, admitted on centre distance
+  # instead (`bbd_pairs/3`). It only ever adds pairs: the IoU list is built and
+  # ordered exactly as it is without the flag, and is greedily spent first.
+  #
   # What is left over then goes through `adopt/4`, stage two and
   # `suppress_duplicates/4`, so the result can also carry `:drop`s, revived
   # suspensions and a tracker whose refused tracks have been marked seen —
@@ -1071,9 +1111,10 @@ defmodule Cairn.Tracker do
   # One greedy pass over the pairs `indexed` and `candidates` can make, seeded
   # with what earlier passes already spent. Stage two hands this the same
   # builder as stage one — same label gate, same predicted boxes, same
-  # `match_threshold/2`, same sort key — because a low-confidence box that does
-  # match is a real detection and gets a real match; the only thing that makes
-  # it a lesser box is what it is *not* allowed to do afterwards.
+  # `match_threshold/2`, same sort key, and the same BBD admission where the
+  # flag is on — because a low-confidence box that does match is a real
+  # detection and gets a real match; the only thing that makes it a lesser box
+  # is what it is *not* allowed to do afterwards.
   defp greedy(matched, indexed, candidates, context) do
     pairs =
       for {object, index} <- indexed,
@@ -1089,9 +1130,17 @@ defmodule Cairn.Tracker do
     # sort would then resolve two identically-overlapping candidates by that
     # incidental order. `index` before `id` keeps "earlier object in the batch
     # wins", matching the incumbent-wins convention elsewhere.
-    pairs
-    |> Enum.sort_by(fn {overlap, index, id} -> {-overlap, index, id} end)
-    |> Enum.reduce(matched, fn {_overlap, index, id}, {assignments, objects, tracks} = acc ->
+    iou_pairs = Enum.sort_by(pairs, fn {overlap, index, id} -> {-overlap, index, id} end)
+
+    # Plain concatenation, and that is the whole of how the two admissions rank
+    # against each other: every IoU pair is offered before every BBD pair, so a
+    # BBD pair can neither outrank one nor reorder the list it is appended to.
+    # The reduce's own bookkeeping is what dedups across the join — a track or
+    # an object an IoU pair took is already spent by the time the BBD half is
+    # reached, so the second list can only fill in what the first left free.
+    ordered = iou_pairs ++ bbd_pairs(indexed, candidates, context)
+
+    Enum.reduce(ordered, matched, fn {_cost, index, id}, {assignments, objects, tracks} = acc ->
       if MapSet.member?(objects, index) or MapSet.member?(tracks, id) do
         acc
       else
@@ -1099,6 +1148,66 @@ defmodule Cairn.Tracker do
       end
     end)
   end
+
+  # The second admission, `tracking.bbd` only: pairs the IoU gate refused, near
+  # enough by `Cairn.Tracker.Bbd`'s centre distance to be the same object.
+  # Additive and nothing else — no IoU-calibrated constant moves, and a pair
+  # that clears `match_threshold/2` is matched on its overlap exactly as it was
+  # before this existed. What it is for is the case IoU cannot express at all:
+  # two boxes that do not touch have an overlap of exactly zero however near
+  # they are, so after a coast long enough for a walker to clear its own width
+  # the right pair and every wrong one are indistinguishable, and the track
+  # loses its identity to a mint.
+  #
+  # Stationary tracks are excluded, and that exclusion is what keeps
+  # `@stationary_match_iou` meaning what it says. A parked object's
+  # re-detections overlap its own box by definition, so this could only ever
+  # widen a parked track's admission to boxes it is *deliberately* refusing —
+  # the passer-by that the grace exists to keep out is exactly a same-label
+  # detection a short distance from a stationary track, which is to say exactly
+  # what BBD admits.
+  #
+  # Sorted ascending, since a small distance is a good pair where a large
+  # overlap was, and by the same total key as the IoU half for the same reason:
+  # `candidates` comes off a map, and two equal distances must not be resolved
+  # by its iteration order.
+  defp bbd_pairs(indexed, candidates, context) do
+    if Map.get(context, :bbd) do
+      # `candidates` outermost, unlike the IoU comprehension above: the elapsed
+      # time is a property of the track alone, so this computes one per
+      # candidate rather than one per pair. The sort key is total, so nothing
+      # depends on the order the pairs come out in.
+      pairs =
+        for {id, tracked, predicted} <- candidates,
+            not tracked.stationary,
+            delta_tau_s = elapsed_s(tracked, context),
+            {object, index} <- indexed,
+            tracked.label == object.label,
+            iou(predicted, object.bbox) < match_threshold(tracked, context),
+            distance = Bbd.distance(predicted, object.bbox, delta_tau_s),
+            Bbd.admit?(distance) do
+          {distance, index, id}
+        end
+
+      Enum.sort_by(pairs, fn {distance, index, id} -> {distance, index, id} end)
+    else
+      []
+    end
+  end
+
+  # How long since the track last took a box, in seconds because
+  # `Cairn.Tracker.Bbd`'s clip bounds are published in them and this module's
+  # clocks are milliseconds. `last_matched_ms` and not `last_seen_ms`: what the
+  # covariance is built out of is the age of the last position fix, and a track
+  # marked seen by a box it refused was not positioned by it (`seen/3`).
+  #
+  # The pattern match is an assertion and not a guard against real data: every
+  # live track carries this from `new_track/3` on and nothing unsets it, so a
+  # nil here is a broken invariant rather than a gap to default over — and any
+  # default would be an invented elapsed time, which is precisely the quantity
+  # the gate's width is derived from.
+  defp elapsed_s(%{last_matched_ms: last_matched_ms}, context) when is_number(last_matched_ms),
+    do: (context.at_ms - last_matched_ms) / 1_000
 
   # The low-confidence half: match what is left, then spend the rest. Nothing
   # here can mint (a spent index never reaches `apply_object/6` as `:new`) or
@@ -1425,6 +1534,13 @@ defmodule Cairn.Tracker do
   # overlapping box would inherit. A track being seen normally matches at the
   # base threshold, and must: see `@stationary_match_iou` for what dropping
   # that distinction costs.
+  #
+  # For a stationary track this remains the *whole* admission, `tracking.bbd`
+  # or not: `bbd_pairs/3` excludes stationary tracks precisely so that what a
+  # parked identity will answer to stays one number. For a moving track under
+  # the flag it is no longer the only way in — a pair it refuses may still be
+  # admitted on centre distance — which is why it is read there too, to decide
+  # which pairs the second gate is even offered.
   defp match_threshold(%{stationary: true} = tracked, context) do
     if context.at_ms - tracked.last_seen_ms > context.max_unseen_ms,
       do: @stationary_match_iou,

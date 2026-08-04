@@ -21,7 +21,7 @@ defmodule Cairn.Config do
   @known_events_keys ~w(pre_window_seconds post_window_seconds max_event_seconds)
   @known_retention_keys ~w(days per_label tracks_days)
   @known_integrations_keys ~w(token)
-  @known_tracking_keys ~w(max_unseen_ms max_live_tracks stationary_after_ms)
+  @known_tracking_keys ~w(max_unseen_ms max_live_tracks stationary_after_ms bbd)
   @name_regex ~r/\A[a-z0-9][a-z0-9_-]*\z/
 
   # How long a track survives without being seen, in *media* time. Long
@@ -55,6 +55,18 @@ defmodule Cairn.Config do
   # this number makes the system slower to call things parked; it does not make
   # it quicker to notice them leaving.
   @default_stationary_after_ms 10_000
+  # Whether association may admit a pair on `Cairn.Tracker.Bbd`'s centre
+  # distance as well as on IoU. Off by default: it widens what a track will
+  # answer to, and widening admission is how identities get handed to the wrong
+  # object, so it is opt-in until soak measurement says otherwise.
+  #
+  # Global only, with none of the per-camera form the three bounds above have.
+  # Those are scene descriptions an operator sets per camera — how long an
+  # object may vanish, how crowded the frame is, how long "parked" takes here.
+  # This is a rollout switch on the matcher itself, and a fleet where half the
+  # cameras associate one way and half the other is not a thing an operator can
+  # reason about or a soak can read.
+  @default_bbd false
   # How long track rows outlive the clips they describe. Deliberately far
   # longer than `retention_days`: the track log is the instrument for tuning
   # the filters, and a year of "what did the system see and not record?" is the
@@ -78,6 +90,7 @@ defmodule Cairn.Config do
             max_unseen_ms: @default_max_unseen_ms,
             max_live_tracks: @default_max_live_tracks,
             stationary_after_ms: @default_stationary_after_ms,
+            bbd: @default_bbd,
             cameras: [],
             plugin_groups: [],
             ha_token: nil
@@ -170,6 +183,7 @@ defmodule Cairn.Config do
       max_unseen_ms: configured_max_unseen_ms(map),
       max_live_tracks: configured_max_live_tracks(map),
       stationary_after_ms: configured_stationary_after_ms(map),
+      bbd: configured_bbd(map),
       cameras: cameras,
       plugin_groups: plugin_groups,
       ha_token: get_in(map, ["integrations", "token"])
@@ -203,6 +217,10 @@ defmodule Cairn.Config do
   defp configured_stationary_after_ms(map),
     do: get_in(map, ["tracking", "stationary_after_ms"]) || @default_stationary_after_ms
 
+  # `||` reads an explicit `false` as the default, which is the same answer here
+  # and the reason this flag is safe to write the way its three neighbours are.
+  defp configured_bbd(map), do: get_in(map, ["tracking", "bbd"]) || @default_bbd
+
   # Global only: one clock for the whole track log, with none of the
   # per-camera or per-label forms `retention.days` has. Those exist to buy disk
   # back on clips. Splitting the audit record by label instead would make "what
@@ -235,6 +253,7 @@ defmodule Cairn.Config do
           max_unseen_ms: pos_integer(),
           max_live_tracks: pos_integer(),
           stationary_after_ms: pos_integer(),
+          bbd: boolean(),
           track: Camera.tier() | nil,
           record: Camera.tier() | nil
         }
@@ -244,6 +263,9 @@ defmodule Cairn.Config do
     |> Map.put(:max_unseen_ms, max_unseen_ms(config, cam))
     |> Map.put(:max_live_tracks, max_live_tracks(config, cam))
     |> Map.put(:stationary_after_ms, stationary_after_ms(config, cam))
+    # Straight off the config and not through a `cam` reader: there is no
+    # per-camera form of this one (see `@default_bbd`).
+    |> Map.put(:bbd, config.bbd)
     |> Map.put(:track, cam.track)
     |> Map.put(:record, cam.record)
   end
@@ -318,6 +340,10 @@ defmodule Cairn.Config do
   @doc "Stillness threshold used when no config is available (media milliseconds)."
   @spec default_stationary_after_ms() :: pos_integer()
   def default_stationary_after_ms, do: @default_stationary_after_ms
+
+  @doc "Whether BBD admission is on when no config is available."
+  @spec default_bbd() :: boolean()
+  def default_bbd, do: @default_bbd
 
   @doc "Effective retention days for a camera and label."
   @spec retention_days(t(), Camera.t(), String.t()) :: pos_integer()
