@@ -369,6 +369,22 @@ mint a new one.
    exists at all). Leave the flag off if the wire the band takes is not a
    trade you want.
 
+### NMS-free heads emit a redundant band
+
+A head that runs no NMS — rfdetr's query head, yolov10's export — deduplicates
+by *confidence*: redundant proposals for one object score below whatever floor
+the model was trained to be read at, and lowering that floor with a track
+floor lets them through. Measured on rfdetr_nano at floor 0.25, the band
+carried about 0.9 same-label pairs per frame at IoU above 0.5 on a parked
+scene (yolox, whose NMS sees the band per rule 1, measured zero in every
+cell). The host is unaffected — its second stage spends at most one box per
+track and drops the rest outright, and the same soak's live-track duplicate
+count was zero throughout — so what the redundancy costs is exactly the wire
+and slots rule 4 already prices, at a higher rate than an NMS'd head pays.
+Weigh that against the floor you pick on these profiles; an NMS pass over the
+band alone is a candidate follow-up if the cost matters
+(`.claude/plans/tracking-roadmap.md`).
+
 `verify/README.md` has the recipe for measuring a track-floor run: the
 validator reports the **sub-floor share** of a capture when it is given the
 floors the run used. It takes one `--min-score-json` for the whole capture, so
