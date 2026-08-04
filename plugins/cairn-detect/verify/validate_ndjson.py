@@ -118,6 +118,7 @@ CI/manual runs, not just report.
 """
 import argparse
 import json
+import math
 import re
 import signal
 import sys
@@ -154,8 +155,13 @@ def fail(reason: str):
 
 
 def is_number(v):
-    # bool is a subclass of int; the host's is_number/1 does not admit it
-    return not isinstance(v, bool) and isinstance(v, (int, float))
+    # bool is a subclass of int; the host's is_number/1 does not admit it.
+    # Neither can a NaN or an infinity reach the host -- strict JSON has no
+    # literal for them, and Jason refuses the tokens. Python's json.loads
+    # admits them as an extension, so refuse them here: a NaN is false in
+    # every comparison, so it would pass each range check below and, as a
+    # --min-score-json floor, read every detection as at-or-above it.
+    return not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v)
 
 
 def is_int(v):
