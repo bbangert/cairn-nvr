@@ -193,6 +193,15 @@ defmodule Cairn.ConfigTest do
       # unlike the three bounds beside it there is no per-camera form of it
       assert Config.policy(config, cam_a).bbd
       assert Config.policy(config, cam_b).bbd
+
+      # an explicit off is off whatever the default says, and a truthy
+      # non-boolean is a typo rather than an opt-in — only `true` enables
+      for {value, name} <- [{false, "explicit false"}, {"true", "a string"}, {1, "an integer"}] do
+        {:ok, config, _warnings} =
+          base_map() |> Map.put("tracking", %{"bbd" => value}) |> Config.from_map()
+
+        refute config.bbd, name
+      end
     end
 
     test "retention.tracks_days defaults to a year and parses" do

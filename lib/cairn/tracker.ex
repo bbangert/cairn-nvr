@@ -696,17 +696,23 @@ defmodule Cairn.Tracker do
   """
   @type floors :: %{String.t() => number()}
 
-  @typedoc "Everything about the observation the tracker needs, and nothing else."
+  @typedoc """
+  Everything about the observation the tracker needs, and nothing else.
+
+  The two optional keys are the two the code reads with `Map.get/2`: a caller
+  may build a context without them — `context/3` always writes both — and
+  absence means the same as their defaults, no floor and no second admission.
+  """
   @type context :: %{
-          camera_id: String.t() | nil,
-          epoch: String.t() | nil,
-          at_ms: number(),
-          observed_at: DateTime.t() | nil,
-          max_unseen_ms: pos_integer(),
-          max_live_tracks: pos_integer(),
-          stationary_after_ms: pos_integer(),
-          min_score: floors() | nil,
-          bbd: boolean()
+          :camera_id => String.t() | nil,
+          :epoch => String.t() | nil,
+          :at_ms => number(),
+          :observed_at => DateTime.t() | nil,
+          :max_unseen_ms => pos_integer(),
+          :max_live_tracks => pos_integer(),
+          :stationary_after_ms => pos_integer(),
+          optional(:min_score) => floors() | nil,
+          optional(:bbd) => boolean()
         }
 
   @typedoc "The host-side tracking policy for one camera."

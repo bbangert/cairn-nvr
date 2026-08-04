@@ -217,9 +217,16 @@ defmodule Cairn.Config do
   defp configured_stationary_after_ms(map),
     do: get_in(map, ["tracking", "stationary_after_ms"]) || @default_stationary_after_ms
 
-  # `||` reads an explicit `false` as the default, which is the same answer here
-  # and the reason this flag is safe to write the way its three neighbours are.
-  defp configured_bbd(map), do: get_in(map, ["tracking", "bbd"]) || @default_bbd
+  # Not `||` like its three neighbours: this key is a boolean, so an explicit
+  # `false` has to survive being read whatever the default is, and only a
+  # literal `true` may turn the matcher's second admission on — a truthy
+  # non-boolean in the YAML is a typo, not an opt-in.
+  defp configured_bbd(map) do
+    case get_in(map, ["tracking", "bbd"]) do
+      nil -> @default_bbd
+      value -> value === true
+    end
+  end
 
   # Global only: one clock for the whole track log, with none of the
   # per-camera or per-label forms `retention.days` has. Those exist to buy disk
