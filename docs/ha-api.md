@@ -260,14 +260,19 @@ scoped and what bounds it — is
 flipped (`null` while moving) and `stationary_ms` the total stream time it has
 spent stationary over the whole track, which only grows. The measure is the
 box, so a camera that pans moves every track at once, and someone standing in
-place is stationary whatever they are doing.
+place is stationary whatever they are doing. An object that parks after being
+seen in real motion earns the flag a little later than one first noticed
+already parked: its motion estimate has to decay before the still clock can
+start, and that lag errs toward keeping it event evidence, never toward
+excluding it early.
 
 Leaving the flag is deliberately slower than one frame: the box has to keep
 reading as moved for a couple of seconds of stream time before `stationary`
-goes false. A detector that jitters on a small distant box would otherwise
-flick a parked car in and out of the flag every minute or two, and each flick
-is a clip. Nothing intermediate is published — a track in that couple of
-seconds is still `stationary: true`.
+goes false. Detector jitter on a small distant box has no say in this —
+stillness is judged on the object's mean drift, and jitter that alternates
+has no mean — so what the delay covers is a real but brief excursion, a box
+that moves and returns within the window. Nothing intermediate is published —
+a track in that couple of seconds is still `stationary: true`.
 
 A stationary object is **not event evidence**: a car that parks in view stops
 holding its event open, so that event ends on the post window and nothing it

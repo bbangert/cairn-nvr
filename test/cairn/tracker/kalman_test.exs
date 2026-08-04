@@ -269,7 +269,7 @@ defmodule Cairn.Tracker.KalmanTest do
       {coasted, overlaps, corners} =
         Enum.reduce(1..20, {established, [], []}, fn _k, {kf, overlaps, corners} ->
           kf = Kalman.predict(kf)
-          [x, _y, w, h] = box = Kalman.predicted_bbox(kf)
+          [x, _y, w, _h] = box = Kalman.predicted_bbox(kf)
 
           # positive, bounded area at every step — what the overlap arithmetic
           # downstream needs, and the whole of what this box promises

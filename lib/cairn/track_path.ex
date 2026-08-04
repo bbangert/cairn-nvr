@@ -184,7 +184,7 @@ defmodule Cairn.TrackPath do
       always kept — which aligns the stored path with the
       `became_stationary` / `started_moving` moments in the track index for
       free, without sharing a constant with the tracker's own stillness
-      heuristic (`@stationary_iou`, which is a sustained-motion classifier
+      heuristic (`@stationary_velocity_floor`, which is a sustained-motion classifier
       gated on `stationary_after_ms`, not a per-sample jitter filter);
     * otherwise the sample is kept only if some quantized coordinate moved at
       least `@keyframe_delta` (#{@keyframe_delta}, i.e. 0.2 % of the frame
