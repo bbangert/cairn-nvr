@@ -464,7 +464,7 @@ defmodule Cairn.Tracker.KalmanTest do
       assert_positive_area(Kalman.predicted_bbox(kf))
     end
 
-    test "the guard refuses a non-positive steps" do
+    test "the guard refuses a non-positive step count" do
       # A gap of no steps is a caller bug, not a case to invent behavior for.
       assert_raise FunctionClauseError, fn -> Kalman.refit(@anchor, @target, 0) end
       assert_raise FunctionClauseError, fn -> Kalman.refit(@anchor, @target, -1) end

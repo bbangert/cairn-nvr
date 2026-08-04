@@ -44,10 +44,11 @@ defmodule Cairn.Tracker.Kalman do
 
   A *prediction* is the filter's own guess, and per the cardinal rule above is
   a matching input only — it never becomes a track's box. A *seed* is the
-  inverse: the plugin re-reporting a real sighting of an identity it already
-  knows, which feeds liveness and stillness bookkeeping but never touches the
-  filter, because the filter already sees that box through the ordinary
-  detect-and-match path. A **virtual observation** is the inverse of a seed —
+  plugin re-reporting a real sighting of an identity it already knows: it
+  refreshes liveness and moves the track's box, but it never touches the
+  filter — the filter already saw the original detection through the ordinary
+  detect-and-match path — and the stillness rule does not evaluate a
+  re-report at all. A **virtual observation** is the inverse of a seed —
   it feeds the filter and nothing else. It is never stored as a track's
   `bbox`, never touches liveness or stillness bookkeeping, never appears in a
   summary, an event, or on the wire; the only thing that ever sees one is
