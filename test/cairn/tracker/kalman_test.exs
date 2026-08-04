@@ -369,4 +369,105 @@ defmodule Cairn.Tracker.KalmanTest do
       assert_positive_area(Kalman.predicted_bbox(kf))
     end
   end
+
+  describe "refit replays a gap through virtual observations" do
+    # A ten-step gap sliding right at 0.05 per step (centre displacement 0.5
+    # over steps=10), used by several tests below so their measured numbers
+    # stay comparable to each other.
+    @anchor [0.1, 0.1, 0.1, 0.2]
+    @target [0.6, 0.1, 0.1, 0.2]
+
+    test "velocity converges towards the gap's per-step displacement" do
+      kf = Kalman.refit(@anchor, @target, 10)
+      {vx, vy} = Kalman.velocity(kf)
+
+      # Measured 0.04657 against a true per-step displacement of 0.05: the
+      # replay is nine interior updates deep by the time it stops (steps=10
+      # means `1..9`), not fifty, so the estimate is still short of the true
+      # value the way any freshly-initialized filter's is after a handful of
+      # observations. Bounding it within 30% of the true value and requiring
+      # it clear half of that pins "converging" without pinning the exact
+      # float a noise-constant tweak would move.
+      assert_in_delta vx, 0.05, 0.05 * 0.3
+      assert vx > 0.05 / 2
+
+      # No vertical displacement anywhere in the gap, so every virtual box
+      # shares the anchor's y and every innovation in y is exactly zero.
+      assert vy == 0.0
+    end
+
+    test "the replayed covariance is tighter than a same-length predict-only coast" do
+      refit = Kalman.refit(@anchor, @target, 20)
+
+      coasted =
+        Enum.reduce(1..19, Kalman.init(@anchor), fn _k, kf -> Kalman.predict(kf) end)
+
+      # Measured: 6.62e-5 replayed against 0.0620 coasted, over an equal
+      # 20-step gap (19 interior replay updates against 19 bare predicts).
+      # Every virtual update injects a measurement that shrinks what the
+      # coast's predict-only growth spends the same nineteen steps compounding
+      # — this is the entire reason `refit/3` exists rather than a longer coast.
+      assert element(refit.covariance, 0, 0) < element(coasted.covariance, 0, 0)
+    end
+
+    test "a one-step gap is the bare init, contributing nothing of the target" do
+      # The caller's own predict+update against the real re-detection is the
+      # whole of a one-step gap; the replay's interior range `1..0//1` is
+      # empty, so nothing about `@target` can appear here.
+      assert Kalman.refit(@anchor, @target, 1) == Kalman.init(@anchor)
+    end
+
+    test "virtual boxes at the frame's extremes stay legal through the replay" do
+      # Anchor pinned near the origin at a sliver of a box, target near the
+      # far corner at half the frame — every interior virtual box interpolates
+      # between the two, so this exercises both edges of the range at once.
+      anchor = [0.0, 0.0, 0.01, 0.01]
+      target = [0.49, 0.49, 0.5, 0.5]
+
+      for steps <- [2, 5, 10, 50] do
+        kf = Kalman.refit(anchor, target, steps)
+
+        for value <- kf.mean do
+          assert_finite(value)
+        end
+
+        assert_positive_area(Kalman.predicted_bbox(kf))
+      end
+    end
+
+    test "the replay learns the gap's heading, not the anchor's stillness, leftward too" do
+      {vx, _vy} = Kalman.refit(@target, @anchor, 10) |> Kalman.velocity()
+
+      assert vx < 0.0
+    end
+
+    test "steps == 2 pins the interior loop exactly" do
+      midpoint = Enum.zip_with(@anchor, @target, fn a, t -> (a + t) / 2 end)
+
+      # One interior point at 1/2 is the smallest non-degenerate replay —
+      # steps=1 skips the loop entirely, so this is the first case that
+      # exercises it at all. Equality with no tolerance band pins the loop's
+      # arithmetic outright: the range, the interpolation fraction, and the
+      # predict-then-update order, all at once.
+      assert Kalman.refit(@anchor, @target, 2) ==
+               Kalman.init(@anchor) |> Kalman.predict() |> Kalman.update(midpoint)
+    end
+
+    test "degenerate anchor dimensions survive the replay" do
+      kf = Kalman.refit([0.4, 0.4, 0.0, 0.1], @target, 10)
+
+      # `init`/`update` floor dimensions via `to_measurement`, so a
+      # zero-width anchor is legal input here as everywhere else in the
+      # module — every other describe block pins that convention and this
+      # one should too.
+      Enum.each(kf.mean, &assert_finite/1)
+      assert_positive_area(Kalman.predicted_bbox(kf))
+    end
+
+    test "the guard refuses a non-positive step count" do
+      # A gap of no steps is a caller bug, not a case to invent behavior for.
+      assert_raise FunctionClauseError, fn -> Kalman.refit(@anchor, @target, 0) end
+      assert_raise FunctionClauseError, fn -> Kalman.refit(@anchor, @target, -1) end
+    end
+  end
 end

@@ -35,6 +35,30 @@ defmodule Cairn.Tracker.Kalman do
   weaker evidence still: nothing outside this module has even claimed to have
   seen them.
 
+  ## Virtual observations
+
+  `refit/3` replays a filter through a gap by feeding it observations no
+  detector produced: boxes linearly interpolated between the two real
+  sightings that bound the gap. That is a third category, next to a
+  prediction and a seed, and it sits opposite both of them.
+
+  A *prediction* is the filter's own guess, and per the cardinal rule above is
+  a matching input only — it never becomes a track's box. A *seed* is the
+  plugin re-reporting a real sighting of an identity it already knows: it
+  refreshes liveness and moves the track's box, but it never touches the
+  filter — the filter already saw the original detection through the ordinary
+  detect-and-match path — and the stillness rule does not evaluate a
+  re-report at all. A **virtual observation** is the inverse of a seed —
+  it feeds the filter and nothing else. It is never stored as a track's
+  `bbox`, never touches liveness or stillness bookkeeping, never appears in a
+  summary, an event, or on the wire; the only thing that ever sees one is
+  `update/2`, inside the replay that synthesized it. And it exists only
+  between two *real* observations of the same identity — the anchor a gap
+  starts at and the re-detection that ends it — so unlike a prediction, which
+  can run for as long as a track goes undetected, a virtual observation is
+  never minted without both ends of the interval it interpolates already in
+  hand.
+
   ## Why hand-rolled
 
   This is a fixed 8x8 problem with a fixed 4-dimensional measurement, and every
@@ -221,6 +245,52 @@ defmodule Cairn.Tracker.Kalman do
   end
 
   @doc """
+  Rebuilds a filter's state across an unobserved gap by replaying it through
+  virtual observations, rather than trusting whatever the filter learned
+  before the gap opened.
+
+  `anchor_bbox` is the box the last real observation placed the track at;
+  `target_bbox` is the re-detection that closed the gap; `steps` is how many
+  predict-steps the gap spans, in the caller's own step cadence (see the
+  module doc's note on units). The filter is seeded fresh from the anchor —
+  not the coasted filter the caller may have been carrying — and then, for
+  each interior step `i in 1..(steps - 1)`, predicted forward and updated
+  against a virtual observation: the two boxes linearly interpolated at
+  `i / steps`, in `[x, y, w, h]`, the format `update/2` already takes.
+  Interpolating there rather than in the filter's own `[cx, cy, a, h]` state
+  keeps every virtual box a legal box by convexity — each interpolated
+  component lies between two already-legal components — with no separate
+  clamp needed.
+
+  The final step is deliberately not taken here. A caller's ordinary matched
+  path already applies one `predict/1` + `update/2` against the real
+  re-detection, and the replay has to stop one short of that so the real
+  observation is counted exactly once and predicted-over exactly once — not
+  reproduced inside this function and then applied again outside it. That
+  makes `steps == 1` degenerate to a bare `init(anchor_bbox)`: a one-step gap
+  has no interior at all, `1..0//1` is empty, and the target contributes
+  nothing here because the caller's own predict+update is the whole of a
+  one-step gap.
+
+  Re-initializing from the anchor rather than continuing whatever filter the
+  track already had is the same choice for both of this function's eventual
+  callers: a track resuming after a stream reset has no filter to continue at
+  all, so a uniform rebuild is the only version of this that also covers that
+  case. It also needs no extra track state, and the replay's virtual updates
+  teach the rebuilt filter the gap's actual per-step displacement directly —
+  which is the point, since it is exactly the pre-gap momentum that a coast
+  would otherwise keep asserting through a gap ORU exists to be skeptical of.
+  """
+  @spec refit(bbox(), bbox(), pos_integer()) :: t()
+  def refit(anchor_bbox, target_bbox, steps) when is_integer(steps) and steps >= 1 do
+    Enum.reduce(1..(steps - 1)//1, init(anchor_bbox), fn i, filter ->
+      virtual_bbox = lerp_bbox(anchor_bbox, target_bbox, i / steps)
+
+      filter |> predict() |> update(virtual_bbox)
+    end)
+  end
+
+  @doc """
   The filter's current estimate of how fast the box's centre is moving, in
   frame widths and heights per step.
 
@@ -303,6 +373,19 @@ defmodule Cairn.Tracker.Kalman do
 
   @spec clamp_dimension(float()) :: float()
   defp clamp_dimension(value), do: value |> max(@min_dim) |> min(1.0)
+
+  # -- replay -------------------------------------------------------------
+
+  # Element-wise linear interpolation between two boxes at fraction `t`, in
+  # `[x, y, w, h]` — the wire format `update/2` takes, not the `[cx, cy, a, h]`
+  # the filter converts to internally. Interpolating here rather than in state
+  # space is what makes `refit/3`'s convexity argument hold: each of `x`, `y`,
+  # `w`, `h` lies between two already-legal components, so the result is a
+  # legal box too, with no clamp of its own needed.
+  @spec lerp_bbox(bbox(), bbox(), float()) :: bbox()
+  defp lerp_bbox(anchor, target, t) do
+    Enum.zip_with(anchor, target, fn a, b -> a + (b - a) * t end)
+  end
 
   # -- noise ------------------------------------------------------------------
 
