@@ -159,20 +159,26 @@ defmodule Cairn.CameraTrackerTest do
   # frame per simulated second that is ten frames before the edge under test.
   @stationary_policy Map.put(@policy, :stationary_after_ms, 2_000)
   @parked_box [0.1, 0.1, 0.2, 0.4]
-  # Overlaps the parked box at 0.54 — under `@stationary_iou` (0.8), so it
-  # reads as movement, and well over the match threshold, so it is the same
-  # track that moved rather than a second one.
-  @moved_box [0.16, 0.1, 0.2, 0.4]
+  # A departure is *sustained motion*, not a displaced box: stillness is the
+  # object's mean drift rate, so a box that steps once and holds settles back
+  # into the flag, while one that keeps moving accumulates a mean no floor
+  # forgives. `moved_step/1` walks the parked box 0.06 per batch in x —
+  # three times the drift floor at this compressed settle, with consecutive
+  # boxes overlapping at 0.54, well over the match threshold, so it is the
+  # same track leaving rather than a second one minted.
+  #
   # The live failure's geometry: a car 0.17 by 0.09 of the frame with about
-  # 0.02 of detector drift in *y*, which is IoU 0.636 against the anchor —
-  # under `@stationary_iou` and nothing like motion. Small and drifting on its
-  # short axis on purpose; @parked_box above is four times the area and
-  # @moved_box displaces it in x. `@small_moved_box` is where the same car goes
-  # when it really leaves: 0.385, low enough to fail stillness for as long as
-  # it holds and high enough to stay the same track rather than mint a second.
+  # 0.02 of detector drift in *y* — over a fifth of the box's height, and
+  # nothing like motion, which is exactly what made the old geometry rule
+  # flap on it. Small and drifting on its short axis on purpose; @parked_box
+  # above is four times the area and its departure runs in x.
+  # `small_moved_step/1` is the same car really leaving: 0.02 per batch in y
+  # and not stopping, more than four times the drift floor as a rate.
   @small_parked_box [0.40, 0.50, 0.17, 0.09]
   @small_jitter_box [0.40, 0.52, 0.17, 0.09]
-  @small_moved_box [0.40, 0.54, 0.17, 0.09]
+
+  defp moved_step(k), do: [0.1 + k * 0.06, 0.1, 0.2, 0.4]
+  defp small_moved_step(k), do: [0.40, 0.50 + k * 0.02, 0.17, 0.09]
 
   defp detect_at(tracker, camera, at_ms, bbox \\ @parked_box) do
     CameraTracker.detections(
@@ -1395,25 +1401,25 @@ defmodule Cairn.CameraTrackerTest do
     } do
       {_eid, oid} = park_and_finalize(tracker, camera)
 
-      # the smoothed box is the median of the last few detections, so a move
-      # reaches it on the third frame at the new position — before that the
-      # object is still, by the only measure the host has
-      detect_at(tracker, camera, 4_000, @moved_box)
-      detect_at(tracker, camera, 5_000, @moved_box)
+      # the drift is a settle-window mean, so a departure's first batches sit
+      # under the floor while the average catches up — before that the object
+      # is still, by the only measure the host has
+      detect_at(tracker, camera, 4_000, moved_step(1))
+      detect_at(tracker, camera, 5_000, moved_step(2))
       :sys.get_state(tracker)
       refute_received {:event_started, %Event{camera_id: ^id}}
 
-      # and the tracker then wants the move *sustained*: the smoothed box
+      # and the tracker then wants the move *sustained*: the smoothed drift
       # fails from 6_000, and the flag holds until that failure has run for
       # `Cairn.Tracker`'s exit window (2_500 ms on the observation clock)
-      detect_at(tracker, camera, 6_000, @moved_box)
-      detect_at(tracker, camera, 7_000, @moved_box)
-      detect_at(tracker, camera, 8_000, @moved_box)
+      detect_at(tracker, camera, 6_000, moved_step(3))
+      detect_at(tracker, camera, 7_000, moved_step(4))
+      detect_at(tracker, camera, 8_000, moved_step(5))
       :sys.get_state(tracker)
       assert [%Track{object_id: ^oid, stationary: true}] = live_tracks(tracker)
       refute_received {:event_started, %Event{camera_id: ^id}}
 
-      detect_at(tracker, camera, 9_000, @moved_box)
+      detect_at(tracker, camera, 9_000, moved_step(6))
       assert [%Track{object_id: ^oid, stationary: false}] = live_tracks(tracker)
       assert_receive {:event_started, %Event{camera_id: ^id, labels: [%{object_id: ^oid}]}}
     end
@@ -1425,12 +1431,12 @@ defmodule Cairn.CameraTrackerTest do
     } do
       {_eid, oid} = park_and_finalize(tracker, camera, @small_parked_box)
 
-      # The live failure, reproduced end to end. Three jittered frames put the
-      # jitter in the median from 6_000 and the car back under it at 9_000 —
-      # three failing evaluations, two seconds of them, on a car that has not
-      # moved at all. Every one of them used to clear the flag, and clearing it
-      # is what made the car evidence again and opened a clip; about ten of
-      # them came out of one parked car in a 25-minute quiet window.
+      # The live failure, reproduced end to end. Three jittered frames and
+      # the car back where it was — an excursion the old median carried as
+      # three failing evaluations, every one of which used to clear the flag,
+      # and clearing it is what made the car evidence again and opened a
+      # clip; about ten of them came out of one parked car in a 25-minute
+      # quiet window. The drift's mean never fails an evaluation on it.
       detect_at(tracker, camera, 4_000, @small_jitter_box)
       detect_at(tracker, camera, 5_000, @small_jitter_box)
       detect_at(tracker, camera, 6_000, @small_jitter_box)
@@ -1444,19 +1450,20 @@ defmodule Cairn.CameraTrackerTest do
       refute_received {:extractor_started, _event, _pid}
       assert [%Track{object_id: ^oid, stationary: true}] = live_tracks(tracker)
 
-      # and the quiet is not deafness: the same car actually leaving fails the
-      # test from 12_000 and never passes again, so the flag goes at 15_000 and
-      # the departure gets its clip — under the same identity, 2.5 s of the
-      # observation clock later than it would have before, which is well inside the 5 s pre-roll
-      # the clip opens with
-      for at_ms <- [10_000, 11_000, 12_000, 13_000, 14_000],
-          do: detect_at(tracker, camera, at_ms, @small_moved_box)
+      # and the quiet is not deafness: the same car actually leaving — the
+      # same 0.02 steps, now all in one direction and not stopping — fails
+      # the test from 13_000 and never passes again, so the flag goes at
+      # 16_000 and the departure gets its clip, under the same identity,
+      # 2.5 s of the observation clock after the mean carried the move and
+      # well inside the 5 s pre-roll the clip opens with
+      for {at_ms, k} <- Enum.with_index([10_000, 11_000, 12_000, 13_000, 14_000, 15_000], 1),
+          do: detect_at(tracker, camera, at_ms, small_moved_step(k))
 
       :sys.get_state(tracker)
       assert [%Track{object_id: ^oid, stationary: true}] = live_tracks(tracker)
       refute_received {:event_started, %Event{camera_id: ^id}}
 
-      detect_at(tracker, camera, 15_000, @small_moved_box)
+      detect_at(tracker, camera, 16_000, small_moved_step(7))
       assert [%Track{object_id: ^oid, stationary: false}] = live_tracks(tracker)
       assert_receive {:event_started, %Event{camera_id: ^id, labels: [%{object_id: ^oid}]}}
     end

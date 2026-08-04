@@ -85,12 +85,12 @@ defmodule Cairn.Tracker do
   refused.
 
   Being marked seen is not being observed. The box was refused, so nothing
-  about it is believed — not the anchor, not the stillness window, not the
+  about it is believed — not the stillness rule's judgement of it, not the
   motion filter, which coasts on this batch exactly as it would for a track no
   box mentioned at all, and not `last_detected_ms`, so a track kept alive this
   way still goes
-  `stale_predicted` on the evidence policy's own schedule and cannot be
-  dragged off its anchor by what it refused. Nor is `last_matched_ms`
+  `stale_predicted` on the evidence policy's own schedule and cannot be talked
+  out of being parked by what it refused. Nor is `last_matched_ms`
   touched: the refusal bound below is the one bound a suppression cannot
   refresh away, so a track that only ever gets suppressions is still retired
   rather than living forever.
@@ -198,7 +198,7 @@ defmodule Cairn.Tracker do
   An ffmpeg respawn or reconnect mints a new epoch, and the object in frame is
   usually the same object. `suspend/3` therefore does not end the live tracks
   at the boundary: it moves them aside, keeping their identity, `started_at`,
-  `best_score`, stationary flag and anchor, and excluding them from ordinary
+  `best_score` and stationary flag, and excluding them from ordinary
   matching. Nothing downstream is told they ended, because they may not have.
 
   A detection in the new epoch may then **adopt** a suspended track — same
@@ -241,47 +241,39 @@ defmodule Cairn.Tracker do
   What resumes with the identity is nearly all of it: `at_ms` spans the cut, so
   nothing has to be re-based to stay comparable, and `last_seen_ms` still dates
   the last sighting, which the summary reports and no adoption rule reads.
-  The two clock fields the adoption does move (`last_detected_ms`, `anchor_ms`)
-  are moved for a reason that is not about clocks: both are read as *elapsed
-  stillness* — `stationary_ms` accrues over the gap between two detections, the
-  settle window measures from the anchor — and a gap nothing watched is not
-  stillness anybody saw. The motion filter is the one thing dropped outright:
-  a heading learned before a cut that may be a minute old is not a claim about
-  where the object is now, so the adopting detection re-seeds it from scratch
-  and the resumed track is matched on its stored box until it does. Everything
-  else is kept, `started_at` and
+  The two clock fields the adoption does move (`last_detected_ms`,
+  `still_since_ms`) are moved for a reason that is not about clocks: both are
+  read as *elapsed stillness* — `stationary_ms` accrues over the gap between two
+  detections, the settle window measures from the start of the still run — and a
+  gap nothing watched is not stillness anybody saw. The motion filter is dropped
+  outright: a heading learned before a cut that may be a minute old is not a
+  claim about where the object is now, so the adopting detection re-seeds it
+  from scratch and the resumed track is matched on its stored box until it does.
+  Everything else is kept, `started_at` and
   `stationary_since` included, and so is the
   `stationary` flag itself: a car that matches its own parking space was
   parked for the whole gap, so it resumes **already** stationary and its
   settle window does not re-arm — which is the point of all of this, since
   `Cairn.CameraTracker` refuses a stationary track as evidence and a
   re-minted one would spend `stationary_after_ms` looking like a new arrival,
-  i.e. like a clip. Resuming the flag is not the same as freezing it: what
-  happens to it on the adopting batch is below.
+  i.e. like a clip.
 
-  The anchor keeps its box and takes the adopting batch's clock, which splits
-  the two questions stillness asks. *Has it moved* is still measured against
-  where the object was before the cut, and it is asked on the adopting batch
-  itself: the median window (`@recent_boxes`) is emptied at the adoption, so the
-  first smoothed box of the new epoch is the adopting box and nothing else.
-  *How long has it held still* restarts at the adoption, which is all the
-  tracker can honestly say about a gap it did not watch.
+  What the cut costs is the tracker's ability to say the object *did* move
+  during it. Stillness is judged from the motion filter, the filter is re-seeded
+  by the adopting detection, and a re-seeded filter has zero velocity — so a
+  suspended track that comes back stationary comes back stationary wherever in
+  the frame it is adopted — the adopting evaluation reads that just-re-seeded
+  filter and passes trivially — and one that comes back moving is caught by the
+  ordinary rule from the second detection of the new epoch on. Nothing observed the
+  gap and no geometry survives it; a car that drove off and was replaced by
+  another inside `@stitch_iou` of its space keeps the flag until the new
+  occupant moves. Restoring that evidence is what an association that reasons
+  about observation gaps (OC-SORT's re-update) would be for, and it is not in
+  this tracker yet.
 
-  So `stationary` crosses the cut but is **not** guaranteed to survive the
-  adoption: it is re-derived from the adopting box by the ordinary rule,
-  exactly as it would be for a track that never left. A car back in its own
-  space stays stationary; one whose box has drifted off the anchor by more than
-  `@stationary_iou` fails the stillness test on the adopting batch itself
-  rather than once a median has caught up, and — by the same rule as any other
-  failure, which the adoption gets no exemption from — leaves the flag
-  `@stationary_exit_ms` later, once that failure has sustained. Note that
-  `@stitch_iou` is well *below* `@stationary_iou`, so a box adopted between the
-  two resumes the identity and starts its exit window in the same batch — the
-  same answer the ordinary rule gives for a box that far
-  off its anchor. What the adoption does buy unconditionally is that the settle
-  window does not re-arm: a resumed track that is still where it was is stationary
-  from its first detection instead of spending `stationary_after_ms` looking
-  like a new arrival.
+  What the adoption does buy unconditionally is that the settle window does not
+  re-arm: a resumed track is stationary from its first detection instead of
+  spending `stationary_after_ms` looking like a new arrival.
 
   `epoch` follows the track: it names the epoch the track was last observed
   under, not the one it was minted in, so an adopted track's summaries carry
@@ -332,31 +324,49 @@ defmodule Cairn.Tracker do
 
   ## Stationary detection
 
-  A track is stationary once its box has held still for the camera's
-  `stationary_after_ms` on the observation clock. "Still" is measured against
-  an **anchor** — the box the object was last seen to move to — not against the
-  previous box: comparing consecutive boxes calls a slow walk motionless,
-  because every step is within jitter of the one before it. The anchor is
-  reset only when the object is judged to have moved — which, leaving the flag,
-  is when the exit window below closes and not when the failures start — so it
-  answers "has it moved since it last moved" however long the track lives.
+  A track is stationary once it has held still for the camera's
+  `stationary_after_ms` on the observation clock. What "still" means is the
+  motion filter's own answer: the object's **mean drift rate** over the current
+  still run, taken from the same `Cairn.Tracker.Kalman` state that matching is
+  run against, must stay under `@stationary_velocity_floor` of the box's height
+  per settle window — with `@stationary_growth_floor` bounding how fast the box
+  may change size over the same window. A failed evaluation restarts the run —
+  on a stationary track, the one that closes the exit window below; on any
+  other, every one — and the settle window is measured from the run's start, so
+  what the rule asks is whether the object has moved since the last time it was
+  judged to be moving — however long the track lives.
 
-  The current box is the per-coordinate median of the last few **detected**
-  boxes rather than the newest one, so a single mis-sized box cannot flip a
-  motionless object into motion, nor a moving one out of it.
+  Drift is a *rate* rather than a distance between two boxes, which is what
+  keeps a slow walk from reading as motionless: every step of one is within
+  jitter of the step before it, but they agree in direction and the mean adds
+  them up. It is averaged over one settle window, the same duration the floor
+  is expressed over, and it is the *signed* velocity that is averaged: a box
+  the detector shakes about a fixed point produces velocities that alternate in
+  sign and mean nothing, while a departure produces velocities that agree.
+  Neither the filter's instantaneous velocity nor an average of magnitudes can
+  tell those apart at this floor.
+
+  What the average costs is at the other end. A track that really did move
+  carries a velocity estimate that takes several seconds to decay under a floor
+  this tight, and its still run does not begin until it has, so an object that
+  parks after real motion reads stationary appreciably later than one that was
+  never seen moving — a settle window plus however long the filter takes to
+  agree, rather than a settle window from the moment it stopped. That is the
+  deliberate direction to fail in: it delays *excluding* a track from evidence
+  and never delays including one.
 
   Leaving the flag takes as much sustaining as earning it. A stationary track
-  whose smoothed box fails the anchor test does not flip on that evaluation: it
-  goes *pending*, still stationary in every way anything downstream can see,
-  and only once the failure has been unbroken for `@stationary_exit_ms` on the
+  whose drift fails the floor does not flip on that evaluation: it goes
+  *pending*, still stationary in every way anything downstream can see, and
+  only once the failure has been unbroken for `@stationary_exit_ms` on the
   observation clock does the flag clear and `started_moving` go out — once,
   timestamped at the evaluation that closed the window. A single passing
   evaluation ends the pending state outright, so the next excursion starts a
   fresh clock: the rule is continuity and not a total, and two short excursions
-  never add up to one departure. Without this, a couple of hundredths of
-  detector drift on a small box — under `@stationary_iou` for the batch or two
-  the median takes to absorb it — cleared the flag on a parked car every minute
-  or so, and each clearing made it evidence again.
+  never add up to one departure. The window is measured on the same clock as
+  everything else here, so it covers the same stretch of the world at any frame
+  rate; see the constant for the flapping it was built against and for what the
+  drift rate does with that fixture now.
 
   A pending exit is advanced by failed **evaluations** and by nothing else.
   Predicted observations do not evaluate stillness at all (below), so a
@@ -365,17 +375,19 @@ defmodule Cairn.Tracker do
 
   Every stationary update is gated on `Cairn.Observation.detected?/1`, for the
   same reason as `stale_predicted`: a predicted box repeats the plugin's own
-  extrapolation, so counting it would manufacture stillness out of the
-  plugin's guesses. Predicted observations leave the anchor and every
-  stationary field untouched.
+  extrapolation, so counting it would manufacture stillness out of the plugin's
+  guesses. A seeded stretch leaves the still run, the drift and every stationary
+  field exactly as it found them — which is also why a settle window that
+  elapsed during one is credited whole at the next detection: the run's start is
+  an instant, not a stopwatch that seeds can pause.
 
   Two things this cannot see, both because the host has boxes and not pixels:
 
     * **Camera motion.** A PTZ move or a knocked mount shifts every box in the
-      frame, so every stationary track starts moving together as the median
-      follows the new view, and every one of them settles again a threshold
-      after it stops. There is no motion compensation here — the host has no
-      view geometry to compensate with.
+      frame, so every stationary track starts moving together, and every one
+      of them settles again once the view holds and the rule catches up. There
+      is no motion compensation here — the host has no view geometry to
+      compensate with.
     * **Motion inside a still box.** Someone standing in place and gesturing,
       or a car idling, keeps a motionless box and reads as stationary. The
       metric is the box, not what is happening inside it.
@@ -533,53 +545,76 @@ defmodule Cairn.Tracker do
   # the timescale a moving track needs; the patience is paid for with
   # `@stationary_match_iou`.
   @stationary_unseen_factor 5
-  # Overlap between the anchor and the smoothed current box that still counts
-  # as "has not moved". Not config, on the same rule as `@iou_threshold`: an
-  # operator looking at a camera view cannot reason about an IoU number, and
-  # the knob that answers the question they actually have — "how long before
-  # you call it parked" — is `stationary_after_ms`.
-  @stationary_iou 0.8
-  # How long the smoothed box must keep failing that test, on the observation
-  # clock, before a stationary track is called moving. Entry and exit are
-  # otherwise asymmetric in a way that only ever fails one direction: earning
-  # the flag takes `stationary_after_ms` of sustained stillness, and losing it
-  # took a single failed evaluation.
+  # How far the object's smoothed centre may drift and still count as "has not
+  # moved", as a fraction of the box's own height per `stationary_after_ms`.
+  # Not config, on the same rule as `@iou_threshold`: an operator looking at a
+  # camera view cannot reason about a normalized drift rate, and the knob that
+  # answers the question they actually have — "how long before you call it
+  # parked" — is `stationary_after_ms`.
   #
-  # What that asymmetry cost is measured, not hypothetical. A parked car far
-  # enough from the camera is a small box — 0.17 by 0.09 of the frame in the
-  # case this comes from — and on a box that short, 0.02 of detector drift in y
-  # already puts the median at 0.64 against the anchor, under `@stationary_iou`
-  # with room to spare. The dip lasted a batch or two and the median could not
-  # absorb it; the flag cleared, `started_moving` went out, and the car became
-  # evidence again (`Cairn.CameraTracker` refuses only a stationary
-  # track), which opened a clip. One car in an otherwise empty scene produced
-  # about ten of them in 25 minutes.
+  # Derived from the tolerance this replaced rather than tuned fresh. The old
+  # rule passed while the smoothed box overlapped a fixed anchor by 0.8 or
+  # more. For pure translation of a box of height `h` by `d`, that overlap is
+  # `(h - d) / (h + d)`, so 0.8 is `d = h / 9 ≈ 0.111 h` — the displacement a
+  # parked object was allowed before it read as moving. An object drifting
+  # steadily crossed that tolerance, and re-set the anchor, every `0.111 h / r`
+  # for a rate `r`, so the slowest drift the old machine could ever call parked
+  # is the one whose crossings are `stationary_after_ms` apart: about a tenth
+  # of the box's height per settle window, shipped here as the round 0.1.
   #
-  # 2_500 sits clear of those excursions at any usable frame rate — a couple of
-  # batches, plus the couple more the median takes to turn back over — and well
-  # under any departure, which fails the test continuously for as long as the
-  # object is leaving, because the anchor stays put while the window is open
-  # and every step of the exit is therefore measured against where the object
-  # was parked rather than against where it was a batch ago. What the delay
-  # costs is 2.5 s of trigger latency on a real departure, and no footage: an
-  # event opens with `pre_window_seconds` of pre-roll ahead of its trigger,
-  # which at its 5 s default reaches back past the whole window.
+  # The height is the *observed* box's, not the filter's state height: the old
+  # machine measured the geometry the detector reported, and an observed height
+  # is defined on the first evaluation of a track whose filter has seen one box.
+  @stationary_velocity_floor 0.1
+  # The same tolerance for the box's height, on the same derivation. A box that
+  # only changes size overlaps its old self by the ratio of the two heights, so
+  # 0.8 is a fifth of the height lost or a quarter gained; the tighter of the
+  # two is what ships.
+  @stationary_growth_floor 0.2
+  # The drift of a track nothing has measured yet: no motion, no growth. Only
+  # ever written where the filter behind it says the same thing — a box just
+  # seeded is a box with zero velocity — so it is a starting value and not an
+  # assumption. See `began/3`.
+  @at_rest {0.0, 0.0, 0.0}
+  # How long the drift must keep failing that test, on the observation clock,
+  # before a stationary track is called moving. Entry and exit are otherwise
+  # asymmetric in a way that only ever fails one direction: earning the flag
+  # takes `stationary_after_ms` of sustained stillness, and losing it took a
+  # single failed evaluation.
   #
-  # Not config, on the same rule as `@stationary_iou` and for a sharper reason
-  # than that one. The two are a pair — this window is sized against exactly
-  # the jitter that threshold cannot absorb — and the pairing is what the
-  # `@stationary_match_iou` block calls a silent bug: set too short it does
-  # nothing and the flapping returns, set too long it holds a departed object
-  # flagged as parked, and neither shows up as anything an operator looking at
-  # a camera view could attribute. The knob for the question they do have —
-  # "how long before you call it parked" — is `stationary_after_ms`, and this
-  # is the other edge of the same hysteresis rather than a second knob.
+  # What that asymmetry cost is measured, not hypothetical, and it is the
+  # failure the whole hysteresis exists for. A parked car far enough from the
+  # camera is a small box — 0.17 by 0.09 of the frame in the case this comes
+  # from — and on a box that short, 0.02 of detector drift in y took the
+  # geometry the rule then used (a median of the last five boxes, against a
+  # fixed anchor) to an overlap of 0.64, well under the 0.8 it wanted. The dip
+  # lasted a batch or two and the median could not absorb it; the flag cleared,
+  # `started_moving` went out, and the car became evidence again
+  # (`Cairn.CameraTracker` refuses only a stationary track), which opened a
+  # clip. One car in an otherwise empty scene produced about ten of them in 25
+  # minutes.
+  #
+  # That fixture is now in the test suite, and the drift rate the stillness rule
+  # reads today does not flinch at it: 60 batches of alternating 0.02 jitter at
+  # a 300 ms cadence produce no failed evaluation at all, because a smoothed
+  # velocity is a mean and detector jitter has no mean. This window is what
+  # covers the excursions a mean *does* carry — a real box that moves and comes
+  # back — and, being a bound on the observation clock rather than on a count of
+  # batches, it does that at any frame rate. What the delay costs is 2.5 s of
+  # trigger latency on a real departure, and no footage: an event opens with
+  # `pre_window_seconds` of pre-roll ahead of its trigger, which at its 5 s
+  # default reaches back past the whole window.
+  #
+  # Not config, on the same rule as `@stationary_velocity_floor` and for a
+  # sharper reason than that one. The two are a pair — this window is sized
+  # against exactly the excursions that floor cannot absorb — and the pairing is
+  # what the `@stationary_match_iou` block calls a silent bug: set too short it
+  # does nothing and the flapping returns, set too long it holds a departed
+  # object flagged as parked, and neither shows up as anything an operator
+  # looking at a camera view could attribute. The knob for the question they do
+  # have — "how long before you call it parked" — is `stationary_after_ms`, and
+  # this is the other edge of the same hysteresis rather than a second knob.
   @stationary_exit_ms 2_500
-  # Detected boxes kept for the per-coordinate median. Odd, so a full window's
-  # median is a value the detector actually reported on each axis (a warming-up
-  # window can be even and average two); short, so a real move reaches the
-  # smoothed box within a handful of detections at any frame rate.
-  @recent_boxes 5
   # How many times its effective unseen bound a track may be held alive by
   # boxes it refuses. It scales `last_matched_ms`, the one of `live?/2`'s two
   # clocks a mark does not refresh. See the moduledoc: a bound on a
@@ -1200,60 +1235,45 @@ defmodule Cairn.Tracker do
   # The two fields that *are* moved to `context.at_ms` are moved because of what
   # reads them, not because of which stream they came from. Both are read as an
   # elapsed stillness — `update_track/3` takes `last_detected_ms` as the start
-  # of the gap `stationary_ms` accrues over, and `anchor_ms` is what the settle
-  # window measures from — and the outage is time nothing watched this object
-  # hold still. Their nil-ness is preserved: a track that has never been
-  # detected still has no anchor and no `last_detected_ms`, and inventing one
+  # of the gap `stationary_ms` accrues over, and `still_since_ms` is what the
+  # settle window measures from — and the outage is time nothing watched this
+  # object hold still. Their nil-ness is preserved: a track that has never been
+  # detected still has no still run and no `last_detected_ms`, and inventing one
   # here would manufacture the detection the object never had.
   #
   # What is deliberately *not* touched is every judgement and every wall-clock
-  # field: `started_at`, `stationary`, `stationary_since`, `stationary_ms`,
-  # `best_score` and the anchor box all carry over, which is what lets an
-  # adopted parked car resume already parked rather than as a new arrival. The
-  # anchor keeps its box but takes this batch's clock, so movement is still
-  # measured against where the object last was while the *duration* of stillness
-  # restarts here.
+  # field: `started_at`, `stationary`, `stationary_since`, `stationary_ms` and
+  # `best_score` all carry over, which is what lets an adopted parked car resume
+  # already parked rather than as a new arrival. What restarts here is the
+  # *duration* of the stillness, and nothing else about it.
   #
-  # `recent_boxes` is one of the two pieces of geometry that do not carry over
-  # (the motion filter, below, is the other), and emptying it is what makes the
-  # sentence above mean something. It is the
-  # window the stillness rule takes a median over, and every box in it belongs
-  # to the stream that just died: left in place it outvotes the adopting box
-  # for as many batches as it has entries, so a track that really did move
-  # during the gap goes on reading `stationary` — refused as evidence — until
-  # the median catches up, and the number of batches that takes is whatever the
-  # window happened to hold at the cut. Emptied, it is refilled by the update
-  # this batch applies immediately afterwards and ends the batch holding
-  # exactly the one detection the new epoch has produced, which is the shape
-  # `new_track/3` leaves for a track's first detection. `stationary` is then
-  # re-derived from the adopting box against the anchor, and from nothing else.
+  # `still_velocity` goes back to rest, and `kalman` is dropped outright: the
+  # two are one decision, since the average is only ever an average of that
+  # filter's readings. A velocity is a claim about the last few seconds, and the
+  # last thing this filter saw can be a whole `@adoption_window_ms` old — a
+  # minute of coasting on a heading nothing has confirmed since, which would put
+  # the resumed track's prediction anywhere. The adopting box is the one thing
+  # the new epoch has actually shown, so the filter is re-seeded from it:
+  # `adopt/4` only ever assigns *detected* boxes, so the `update_track/3` that
+  # follows in this same `track/3` call takes the nil-plus-detection path and
+  # inits. Between the two, `predicted_box/1` falls back to the stored box,
+  # which is all a track with no motion estimate can honestly be matched on.
   #
-  # `pending_exit_ms` is cleared for the same reason: an exit window is a claim
-  # about an *unbroken run of observations*, and the cut is a gap nothing
-  # observed, so a run that was open when the stream died cannot be continued
-  # across it. An adoption whose
-  # box has drifted off the anchor therefore opens its window on the adopting
-  # batch and leaves the flag `@stationary_exit_ms` later — the sustain rule
-  # has no exemption for an adoption, and an object that really did move during
-  # the gap is a real departure, which is exactly the case the rule is happy to
-  # take that long over.
+  # A re-seeded filter has zero velocity, so the first evaluation of the new
+  # epoch reads *still* whatever the adopting box's geometry is, and a parked
+  # car that was moved during the outage resumes stationary rather than opening
+  # an exit window on the adopting batch. That is a deliberate consequence of
+  # having no geometry memory across the cut, not an oversight: nothing observed
+  # the gap, the tracker has no anchor left to say the object is somewhere else,
+  # and the ordinary rule takes over from the second detection on. It is also
+  # the one place this rule is weaker than the geometry it replaced, and the
+  # place where an observation-gap-aware association (OC-SORT's re-update)
+  # would put the evidence back.
   #
-  # That the window is never *observed* empty is `adopt/4`'s doing: it revives
-  # a track only for a detected object it has just assigned to it, so
-  # `update_track/3` refills it in the same `track/3` call. (`median_box/1`
-  # could not be handed the empty list in any case — `stillness/5` prepends the
-  # current box before it takes the median.)
-  #
-  # `kalman` is dropped outright, for the same reason and with the same repair.
-  # A velocity is a claim about the last few seconds, and the last thing this
-  # filter saw can be a whole `@adoption_window_ms` old — a minute of coasting
-  # on a heading nothing has confirmed since, which would put the resumed
-  # track's prediction anywhere. The adopting box is the one thing the new
-  # epoch has actually shown, so the filter is re-seeded from it: `adopt/4`
-  # only ever assigns *detected* boxes, so the `update_track/3` that follows in
-  # this same `track/3` call takes the nil-plus-detection path and inits.
-  # Between the two, `predicted_box/1` falls back to the stored box, which is
-  # all a track with no motion estimate can honestly be matched on.
+  # `pending_exit_ms` is cleared for the same reason the run restarts: an exit
+  # window is a claim about an *unbroken run of observations*, and the cut is a
+  # gap nothing observed, so a run that was open when the stream died cannot be
+  # continued across it.
   defp revive(tracker, id, context) do
     {entry, suspended} = Map.pop(tracker.suspended, id)
 
@@ -1261,8 +1281,8 @@ defmodule Cairn.Tracker do
       entry.tracked
       | epoch: context.epoch,
         last_detected_ms: if(entry.tracked.last_detected_ms, do: context.at_ms),
-        anchor_ms: if(entry.tracked.anchor_bbox, do: context.at_ms),
-        recent_boxes: [],
+        still_since_ms: if(entry.tracked.still_since_ms, do: context.at_ms),
+        still_velocity: @at_rest,
         pending_exit_ms: nil,
         kalman: nil
     }
@@ -1308,7 +1328,7 @@ defmodule Cairn.Tracker do
   # NMS (YOLOv10) emits two for one object often enough to matter: the first
   # takes the track, the second is left over with nothing left to take, and
   # minting for it gives one parked car two concurrent tracks — the observed
-  # failure had their anchors overlapping at 0.78, twice this threshold.
+  # failure had their two boxes overlapping at 0.78, twice this threshold.
   #
   # What keeps a genuinely new object over a tracked one mintable is therefore
   # the same-label guard in `duplicate_of/2` and not the state of the track: a
@@ -1381,8 +1401,8 @@ defmodule Cairn.Tracker do
   # batch touched, so it coasts with the rest of the unobserved ones and the
   # refused box contributes no motion. Not `last_detected_ms`, so `stale_predicted` still
   # arrives on schedule and a suppression can never manufacture evidence. Not
-  # the anchor or `recent_boxes`, which the stillness rule compares against
-  # boxes the track actually adopted. And not `last_matched_ms`: leaving the
+  # `still_since_ms` or `still_velocity`, which measure a run of boxes the track
+  # actually adopted. And not `last_matched_ms`: leaving the
   # refusal bound counting from the last *adopted* observation is what bounds a
   # track whose only remaining sign of life is being refused.
   #
@@ -1607,11 +1627,13 @@ defmodule Cairn.Tracker do
         last_matched_ms: context.at_ms,
         last_detected_ms: if(detected?, do: context.at_ms),
         stale_predicted: not detected?,
-        # A track whose first observation is predicted has no anchor yet: the
-        # first *detected* box is what the stillness rule measures against.
-        anchor_bbox: if(detected?, do: object.bbox),
-        anchor_ms: if(detected?, do: context.at_ms),
-        recent_boxes: if(detected?, do: [object.bbox], else: []),
+        # A track whose first observation is predicted has no still run yet: the
+        # first *detected* box is where the stillness rule starts measuring.
+        still_since_ms: if(detected?, do: context.at_ms),
+        # The mean drift of the current still run, in frame units per
+        # millisecond of the observation clock. Internal to the stillness rule,
+        # like `pending_exit_ms` below and for the same reason.
+        still_velocity: @at_rest,
         stationary: false,
         stationary_since: nil,
         stationary_ms: 0,
@@ -1708,25 +1730,81 @@ defmodule Cairn.Tracker do
   # gap unable to complete one. See the moduledoc, and `failed/4`.
   defp stillness(tracked, _object, false, _previous_detected_ms, _context), do: tracked
 
+  # The first detection of a track has no run to measure and no motion estimate
+  # worth reading — the filter was seeded from this very box — so it opens the
+  # run and judges nothing. `still_since_ms` and `last_detected_ms` are nil
+  # together on every path that writes either, which is what lets the drift
+  # below divide by an interval it never has to check.
   defp stillness(tracked, object, true, previous_detected_ms, context) do
-    recent = Enum.take([object.bbox | tracked.recent_boxes], @recent_boxes)
-    tracked = %{tracked | recent_boxes: recent}
+    if is_nil(tracked.still_since_ms) do
+      began(tracked, @at_rest, context)
+    else
+      {drift, reading} = drift(tracked, previous_detected_ms, context)
+      tracked = %{tracked | still_velocity: drift}
 
-    cond do
-      is_nil(tracked.anchor_bbox) ->
-        anchor(tracked, object.bbox, context)
-
-      iou(tracked.anchor_bbox, median_box(recent)) >= @stationary_iou ->
+      if still?(drift, object, context) do
         still(tracked, previous_detected_ms, context)
-
-      true ->
-        failed(tracked, object.bbox, previous_detected_ms, context)
+      else
+        failed(tracked, reading, previous_detected_ms, context)
+      end
     end
   end
 
-  # The anchor stays where it is for as long as the object does not move, so
-  # the comparison spans the whole still stretch rather than one frame of it.
+  # The object's mean drift rate over the current still run, in frame units per
+  # millisecond, and the unsmoothed reading behind it.
   #
+  # The filter's velocity is per *step*, and a step is however long it was —
+  # one batch on a healthy stream, the whole gap when a seeded stretch held the
+  # filter and the closing detection's single predict spans it — so it is
+  # divided by the interval since the last detection before anything compares
+  # it to a floor. Batches have no fixed cadence here (inference rate, seeded
+  # stretches, a camera that stalls), and an undivided velocity would make the
+  # same object read as drifting twice as fast for having been detected half as
+  # often. The one case the division over-corrects is a *coasted* stretch —
+  # unmatched batches each stepped the filter, so the last step covered one
+  # batch and not the whole gap it is divided by — and that error reads as
+  # stiller than the truth, the forgiving direction for a rule whose only power
+  # is to exclude a track from evidence.
+  #
+  # Smoothed over one `stationary_after_ms`, which is the window the floor is
+  # expressed over: both sides of the test then speak about the same duration,
+  # and what the comparison asks is whether the object has drifted more than a
+  # tenth of its height in a settle window's worth of motion. Averaging the
+  # *signed* velocity is what makes detector jitter free: a box shaken about a
+  # fixed point produces velocities that alternate in sign and mean nothing,
+  # while a departure produces velocities that agree and accumulate. The raw
+  # magnitude cannot tell those apart at this floor — measured, the production
+  # jitter fixture's jittered batches peak past five times it — and averaging
+  # magnitudes would not either, since a magnitude has no sign to cancel.
+  defp drift(tracked, previous_detected_ms, context) do
+    interval = max(context.at_ms - previous_detected_ms, 1)
+    {vcx, vcy} = Kalman.velocity(tracked.kalman)
+    reading = {vcx / interval, vcy / interval, growth(tracked.kalman) / interval}
+
+    {smooth(tracked.still_velocity, reading, interval / context.stationary_after_ms), reading}
+  end
+
+  defp growth(%Kalman{mean: [_cx, _cy, _a, _h, _vcx, _vcy, _va, vh]}), do: vh
+
+  defp smooth({sx, sy, sh}, {vx, vy, vh}, weight) do
+    weight = min(weight, 1.0)
+
+    {sx + weight * (vx - sx), sy + weight * (vy - sy), sh + weight * (vh - sh)}
+  end
+
+  # Both floors scale with the height of the box that was *observed*, so the
+  # tolerance is a fraction of the object rather than of the frame: the same car
+  # parked at the far end of the drive is a shorter box, moves fewer normalized
+  # units when it does move, and would otherwise need a tighter floor to be
+  # judged by the same standard.
+  defp still?({vx, vy, vh}, object, context) do
+    [_x, _y, _w, h] = object.bbox
+
+    :math.sqrt(vx * vx + vy * vy) <=
+      @stationary_velocity_floor * h / context.stationary_after_ms and
+      abs(vh) <= @stationary_growth_floor * h / context.stationary_after_ms
+  end
+
   # One passing evaluation is enough to end a pending exit, and ends it
   # outright rather than crediting the failures back: the excursion is over,
   # and whatever fails next starts its own window. That is the whole difference
@@ -1741,7 +1819,7 @@ defmodule Cairn.Tracker do
   end
 
   defp settled(tracked, _previous_detected_ms, context) do
-    if context.at_ms - tracked.anchor_ms >= context.stationary_after_ms do
+    if context.at_ms - tracked.still_since_ms >= context.stationary_after_ms do
       %{tracked | stationary: true, stationary_since: context.observed_at}
     else
       tracked
@@ -1757,12 +1835,12 @@ defmodule Cairn.Tracker do
   #
   # `pending_exit_ms` is the instant the *unbroken* run of failures began, not
   # a running total, and it is left where it is by every failure after the
-  # first. So is the anchor: while the window is open every
-  # evaluation is still measured against where the object was parked, which is
-  # what makes the window a test of sustained motion. Re-anchoring here would
-  # ask instead whether the object moved since the previous *evaluation* — the
-  # slow-walk mistake the anchor exists to avoid — and a departure taken a step
-  # at a time would pass every one of them and never leave the flag.
+  # first. So is the still run: while the window is open the drift goes on
+  # being averaged over the run the object was parked in, which is what makes
+  # the window a test of sustained motion. Zeroing the average here instead
+  # would hand the next evaluation one batch's worth of accumulation — under
+  # the floor even mid-departure — and a slow walk would pass evaluation after
+  # evaluation, clearing its own window each time, and never leave the flag.
   #
   # Only failed evaluations reach this, so only failed evaluations can close
   # the window. A predicted stretch does not evaluate stillness at all
@@ -1780,11 +1858,11 @@ defmodule Cairn.Tracker do
   # accruing would under-credit a parked car by one excursion every time it
   # jitters, which on an object that sits there for hours is the larger error
   # and the one that grows.
-  defp failed(%{stationary: true} = tracked, bbox, previous_detected_ms, context) do
+  defp failed(%{stationary: true} = tracked, reading, previous_detected_ms, context) do
     pending_since = tracked.pending_exit_ms || context.at_ms
 
     if context.at_ms - pending_since >= @stationary_exit_ms do
-      moved(tracked, bbox, context)
+      moved(tracked, reading, context)
     else
       %{
         tracked
@@ -1795,36 +1873,33 @@ defmodule Cairn.Tracker do
   end
 
   # A track that is not stationary has no flag to sustain and no window open:
-  # it re-anchors on every failure, which is how the anchor follows a moving
-  # object and how a settle is measured from where it stopped.
-  defp failed(tracked, bbox, _previous_detected_ms, context), do: moved(tracked, bbox, context)
+  # every failure starts its still run over, which is how the run follows a
+  # moving object and how a settle is measured from where it stopped.
+  defp failed(tracked, reading, _previous_detected_ms, context),
+    do: moved(tracked, reading, context)
 
   # Leaving the flag and closing the window are one write, so nothing can
   # produce a moving track that still carries a pending exit.
-  defp moved(tracked, bbox, context) do
+  defp moved(tracked, reading, context) do
     %{
-      anchor(tracked, bbox, context)
+      began(tracked, reading, context)
       | stationary: false,
         stationary_since: nil,
         pending_exit_ms: nil
     }
   end
 
-  defp anchor(tracked, bbox, context),
-    do: %{tracked | anchor_bbox: bbox, anchor_ms: context.at_ms}
-
-  defp median_box(boxes), do: for(axis <- 0..3, do: median(Enum.map(boxes, &Enum.at(&1, axis))))
-
-  defp median(values) do
-    sorted = Enum.sort(values)
-    mid = div(length(values), 2)
-
-    if rem(length(values), 2) == 1 do
-      Enum.at(sorted, mid)
-    else
-      (Enum.at(sorted, mid - 1) + Enum.at(sorted, mid)) / 2
-    end
-  end
+  # A still run starts from the unsmoothed reading, never from rest — the one
+  # exception being a track that has no motion estimate to be honest about yet
+  # (`@at_rest`, for a first detection; `revive/3` writes the same value
+  # directly when an adoption drops the filter, and reaches here only for a
+  # track never detected before the cut). Seeding the average at zero instead
+  # would credit the object with
+  # a stillness the filter has not reported: a departure whose every evaluation
+  # restarts the run here would read as still on the batch after each one, and
+  # a slow enough walk would collect a settle window of them.
+  defp began(tracked, velocity, context),
+    do: %{tracked | still_since_ms: context.at_ms, still_velocity: velocity}
 
   # -- expiry -----------------------------------------------------------------
 

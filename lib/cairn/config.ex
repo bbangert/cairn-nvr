@@ -50,7 +50,7 @@ defmodule Cairn.Config do
   # This is the entry half only. Leaving the flag is sustained too, over
   # `Cairn.Tracker`'s `@stationary_exit_ms` — a fixed window, not derived from
   # this one and not config either, for the reason given there: it is sized
-  # against the detector jitter `@stationary_iou` cannot absorb, which is not
+  # against the excursions `@stationary_velocity_floor` cannot absorb, which is not
   # something a view of the camera tells an operator anything about. Raising
   # this number makes the system slower to call things parked; it does not make
   # it quicker to notice them leaving.

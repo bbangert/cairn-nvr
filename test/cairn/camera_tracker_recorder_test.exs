@@ -588,6 +588,43 @@ defmodule Cairn.CameraTrackerRecorderTest do
       assert row.exit_bbox == @parked_box
       assert row.stationary_since != nil
     end
+
+    # The other edge, through the same pipe: a parked object that departs
+    # writes `started_moving` into the timeline, timed by the evaluation that
+    # closed the exit window on the observation clock — not by the wall clock
+    # of the write. The timings are the drift rule's, measured at this scale:
+    # parked by 3_000 (settle 2_000 from the first detection), the departure
+    # below first fails at 5_000, and the flag goes at 8_000 — the first
+    # evaluation `@stationary_exit_ms` (2_500) past the failure that opened
+    # the window.
+    test "`started_moving` lands in the timeline with its observation time", ctx do
+      base = DateTime.add(DateTime.utc_now(), -100, :second)
+
+      park = for n <- 1..3, do: {n * 1_000.0, @parked_box}
+      # +0.1 in x per batch: a real departure, five times the drift floor as
+      # a rate, each step still overlapping the last far above the base match
+      # threshold so identity is never in question
+      depart = for k <- 1..5, do: {3_000.0 + k * 1_000, [0.1 + k * 0.1, 0.1, 0.2, 0.4]}
+
+      for {at_ms, bbox} <- park ++ depart do
+        observe(ctx.tracker, ctx.camera, [object("person", 0.9, bbox)],
+          observed_at: DateTime.add(base, trunc(at_ms), :millisecond),
+          at_ms: at_ms,
+          policy: @stationary_policy
+        )
+      end
+
+      assert_receive {:track_started, %Track{object_id: oid}}
+
+      flush(ctx.tracker, ctx.rec)
+
+      assert [appeared, flip, moved] = Tracks.moments(oid)
+      assert appeared.kind == :appeared
+      assert flip.kind == :became_stationary
+      assert DateTime.compare(flip.at, DateTime.add(base, 3_000, :millisecond)) == :eq
+      assert moved.kind == :started_moving
+      assert DateTime.compare(moved.at, DateTime.add(base, 8_000, :millisecond)) == :eq
+    end
   end
 
   # -- stream resets ----------------------------------------------------------
