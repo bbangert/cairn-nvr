@@ -69,10 +69,13 @@ defmodule Cairn.Tracker.BbdTest do
     test "the detection's dimensions enter only through its centre" do
       # Two detections with the same centre and wildly different sizes. The
       # scale that decides what counts as a large offset comes from the
-      # predicted box alone, so these have to agree exactly.
+      # predicted box alone, so these have to agree exactly — and the
+      # literals are dyadic (sixteenths and thirty-seconds) so `x + w / 2`
+      # lands on the same float for both by construction, not by lucky
+      # rounding.
       predicted = [0.10, 0.20, 0.05, 0.40]
-      large = [0.20, 0.10, 0.40, 0.60]
-      small = [0.39, 0.395, 0.02, 0.01]
+      large = [0.25, 0.25, 0.5, 0.5]
+      small = [0.4375, 0.46875, 0.125, 0.0625]
 
       assert Bbd.distance(predicted, large, 0.2) == Bbd.distance(predicted, small, 0.2)
     end
