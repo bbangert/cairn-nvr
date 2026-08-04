@@ -382,8 +382,7 @@ track and drops the rest outright, and the same soak's live-track duplicate
 count was zero throughout — so what the redundancy costs is exactly the wire
 and slots rule 4 already prices, at a higher rate than an NMS'd head pays.
 Weigh that against the floor you pick on these profiles; an NMS pass over the
-band alone is a candidate follow-up if the cost matters
-(`.claude/plans/tracking-roadmap.md`).
+band alone is a bounded follow-up if the cost matters.
 
 `verify/README.md` has the recipe for measuring a track-floor run: the
 validator reports the **sub-floor share** of a capture when it is given the
