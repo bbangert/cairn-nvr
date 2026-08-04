@@ -15,6 +15,10 @@ defmodule Cairn.PluginPortTest do
   # box, then real detections again — what `plugins/cairn-detect`'s motion gate
   # emits for a still scene.
   @gated_timeline Path.absname("test/support/fixtures/timelines/gated_stretch.json")
+  # Confident detections, a stretch of the same object emitted *below* the
+  # camera's floor at its real score, then confident again — an occlusion as a
+  # detector reports one, plus a below-floor box that belongs to nothing.
+  @subfloor_timeline Path.absname("test/support/fixtures/timelines/low_conf_occlusion.json")
 
   defp camera(id) do
     %Camera{
@@ -216,6 +220,104 @@ defmodule Cairn.PluginPortTest do
     # minting an identity and without touching the stillness only detections
     # can earn or lose
     assert [%Track{object_id: ^object_id, stationary: true}] =
+             Cairn.Tracker.live_tracks(:sys.get_state(tracker).tracker)
+  end
+
+  # The case the two-stage association exists for, through a real Port: an
+  # object detected confidently, then emitted for nine batches — two and a half
+  # seconds — at a score below the camera's `min_score`, real detections the
+  # detector is unsure of rather than
+  # the plugin's own predictions, and then confident again. Only stage two can
+  # keep that one identity, and only because `Cairn.CameraTracker` puts the
+  # camera's effective floor in the tracking context; without the floor every
+  # box is stage one and the below-floor half would be minting tracks instead.
+  #
+  # The control the stage rides on is in the same timeline, in every batch: a
+  # second below-floor box far from the first, which no live track overlaps and
+  # which must therefore mint nothing, ever.
+  test "a sub-floor stretch carries the track it lands on and mints nothing" do
+    id = "plug_subfloor_#{System.unique_integer([:positive])}"
+    StreamEpochs.new_epoch(id, :started)
+
+    # `max_unseen_ms` is scaled down to the timeline as the gated-stretch test
+    # scales it. The last confident detection lands at 0.3 s and the next at
+    # 3.3 s, so the object goes 3 s with nothing a stage-one pass would take:
+    # seven times the 400 ms bound. Stop matching the below-floor boxes and the
+    # track is gone by 0.9 s — a below-floor box that takes no track is dropped
+    # outright and marks nothing seen — so the 0.95 detection on the far side
+    # arrives to an empty tracker and mints a second identity.
+    #
+    # `stationary_after_ms` is scaled *up* instead, past the whole timeline.
+    # The box never moves, and a stationary track is not evidence whatever its
+    # score, which would give the "a sub-floor box never earns video" assertion
+    # below a second reason to hold and stop it proving the first. It also
+    # keeps the unseen bound a plain `max_unseen_ms` rather than the stationary
+    # multiple of it.
+    camera = %Camera{camera(id) | stationary_after_ms: 30_000, max_unseen_ms: 400}
+
+    tracker =
+      start_supervised!(
+        {CameraTracker,
+         camera_id: id,
+         start_extractor: fn _camera, _event ->
+           {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+         end}
+      )
+
+    Event.subscribe()
+
+    command =
+      "elixir #{@mock} --camera-id #{id} --udp-port 19100 " <>
+        "--min-score-json '{}' --timeline #{@subfloor_timeline} --hold"
+
+    start_supervised!({PluginPort, camera: camera, config: config(), index: 0, command: command})
+
+    # the identity the first confident detection minted, and the only one this
+    # timeline may mint — which the `refute_received` below is what proves
+    assert_receive {:track_started, %Track{object_id: object_id, label: "person"}}, 5_000
+
+    assert_receive {:event_started, %Event{camera_id: ^id} = event}, 5_000
+    assert [%{label: "person", object_id: ^object_id}] = event.labels
+
+    # Mid-stretch, and receivable only if a below-floor box took the track:
+    # `score` is the latest observation's, so 0.3 says the batch behind this
+    # summary was matched by a sub-floor detection, and matched as a real
+    # detection — `stale_predicted` stays false, where the plugin's own
+    # re-reports would have flipped it. What the match may not do is raise
+    # `best_score`, which is still what the confident detections left.
+    assert_receive {:track_updated,
+                    %Track{
+                      object_id: ^object_id,
+                      score: 0.3,
+                      best_score: 0.9,
+                      stale_predicted: false,
+                      stationary: false
+                    }},
+                   10_000
+
+    # The far side of the stretch, carrying the identity the first detection
+    # minted rather than a new one: the whole point of the stage.
+    assert_receive {:track_updated, %Track{object_id: ^object_id, score: 0.95, best_score: 0.95}},
+                   10_000
+
+    # Nothing else was ever minted — not the box that belongs to no track, and
+    # not a replacement for one that expired mid-stretch. Mailbox assertions,
+    # which is sound here because every summary this camera publishes comes
+    # from the one process in batch order: anything the stretch broadcast is
+    # already behind us.
+    refute_received {:track_started, _}
+    refute_received {:track_ended, _}
+
+    # And no sub-floor batch was ever evidence. The only two updates the event
+    # took are the confident batch at 0.3 s and the one on the far side; a
+    # stretch batch that earned video would have published a third between
+    # them, carrying the 0.9 the confident half had already reached, and the
+    # second assertion here would have matched it.
+    assert_receive {:event_updated, %Event{camera_id: ^id, max_score: 0.9}}, 5_000
+    assert_receive {:event_updated, %Event{camera_id: ^id, max_score: 0.95}}, 5_000
+    refute_received {:event_updated, _}
+
+    assert [%Track{object_id: ^object_id, score: 0.95}] =
              Cairn.Tracker.live_tracks(:sys.get_state(tracker).tracker)
   end
 
