@@ -176,6 +176,34 @@ defmodule Cairn.ConfigTest do
       refute Enum.any?(warnings, &(&1 =~ "stationary_after_ms"))
     end
 
+    test "tracking.bbd is a known key, off unless set, and reaches the policy" do
+      {:ok, defaults, []} = Config.from_map(base_map())
+      [cam_a, _cam_b] = defaults.cameras
+      refute defaults.bbd
+      refute Config.default_bbd()
+      refute Config.policy(defaults, cam_a).bbd
+
+      {:ok, config, warnings} =
+        base_map() |> Map.put("tracking", %{"bbd" => true}) |> Config.from_map()
+
+      [cam_a, cam_b] = config.cameras
+      refute Enum.any?(warnings, &(&1 =~ "bbd"))
+
+      # every camera or none: the matcher is one decision for the fleet, so
+      # unlike the three bounds beside it there is no per-camera form of it
+      assert Config.policy(config, cam_a).bbd
+      assert Config.policy(config, cam_b).bbd
+
+      # an explicit off is off whatever the default says, and a truthy
+      # non-boolean is a typo rather than an opt-in — only `true` enables
+      for {value, name} <- [{false, "explicit false"}, {"true", "a string"}, {1, "an integer"}] do
+        {:ok, config, _warnings} =
+          base_map() |> Map.put("tracking", %{"bbd" => value}) |> Config.from_map()
+
+        refute config.bbd, name
+      end
+    end
+
     test "retention.tracks_days defaults to a year and parses" do
       assert {:ok, default, []} = Config.from_map(base_map())
       assert default.retention_tracks_days == 365
@@ -805,6 +833,7 @@ defmodule Cairn.ConfigTest do
                max_unseen_ms: 800,
                max_live_tracks: 128,
                stationary_after_ms: 10_000,
+               bbd: false,
                track: nil,
                record: nil
              }

@@ -547,7 +547,12 @@ ignores plugin track ids. Nothing breaks if you send ids; they are decoration.
 
 Cairn matches boxes host-side by greedy IoU (threshold 0.1, raised to 0.7 for
 a stationary track riding out the extended grace below) among the live tracks
-of the same label. Cairn expires a track you stop mentioning after
+of the same label. An off-by-default `tracking.bbd` setting adds a second
+admission test on the distance between the two centres, for a track coasting
+through a gap wider than its own box — where overlap is zero for the right
+detection and every wrong one alike; it only ever admits pairs overlap
+refused, and a stationary track is excluded from it. Cairn expires a track you
+stop mentioning after
 `max_unseen_ms` of *tracking* time (default 3 s, per-camera configurable) — you
 never have to declare an object gone. A track Cairn has judged **stationary**
 (its box held still for `tracking.stationary_after_ms`) gets five times that
@@ -653,7 +658,7 @@ only that much.
 | refusal bound | 10 × the applicable unseen bound since the last observation the track took | track ended (`unseen`) |
 | `tracking.max_live_tracks` | default 128 per camera | least recently seen track evicted |
 | `tracking.stationary_after_ms` | default 10 000 ms of tracking time | track flagged `stationary`, and no longer event evidence |
-| host IoU match threshold | 0.1 (0.7 for a stationary track in extended grace) | below it, a new track is minted |
+| host IoU match threshold | 0.1 (0.7 for a stationary track in extended grace) | below it, a new track is minted — unless `tracking.bbd` is on and admits the pair on centre distance |
 | reset-adoption threshold | 0.4 of overlap with a same-label suspended box | below it, a new track is minted |
 | reset-adoption window | 60 000 ms of tracking time past the cut | track ended (`stream_reset`) |
 | `track_updated` throttle | best-score improvement, or 1 000 ms | update not published |

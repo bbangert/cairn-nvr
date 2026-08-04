@@ -37,7 +37,8 @@ events:
   post_window_seconds: 10
   max_event_seconds: 300
 
-# Object tracking (every key here is per-camera overridable under the camera).
+# Object tracking (the three bounds here are per-camera overridable under the
+# camera; bbd is not).
 # A track that goes unseen for this much *stream* time is ended — five times
 # that while it is stationary, so a parked object outlasts what parks in front
 # of it; its object_id (a ULID) is never handed to anything else.
@@ -49,10 +50,20 @@ events:
 # time, before the track is reported as stationary. Leaving that state is
 # sustained too, over a fixed couple of seconds that is not configurable: it is
 # sized against detector jitter rather than against the scene.
+# bbd adds a second admission test to matching: a detection that overlaps a
+# track's predicted box not at all may still be matched to it on the distance
+# between their centres, scaled by the box's size and by how long the track has
+# gone unmatched. What it buys is a moving object that vanishes for longer than
+# it takes to clear its own width — beyond that, overlap is zero for the right
+# detection and the wrong one alike. It is off by default because widening what
+# a track will answer to is also how an identity goes to the wrong object; a
+# stationary track is excluded from it outright, so a parked identity behaves
+# the same either way.
 tracking:
   max_unseen_ms: 3000
   max_live_tracks: 128
   stationary_after_ms: 10000
+  bbd: false
 
 # Days to keep event clips; per-label overrides win. Track rows keep their own
 # clock (tracks_days) and are exempt from emergency disk cleanup.

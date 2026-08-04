@@ -198,7 +198,7 @@ defmodule Cairn.CameraTracker do
   Called by the plugin ports with a decoded, config-tagged observation.
 
   `policy` is `Cairn.Config.policy/2` for the camera: the event windows, the
-  tracking bounds and the host-side `track:` / `record:` tiers, resolved at
+  tracking settings and the host-side `track:` / `record:` tiers, resolved at
   the port so this per-frame path never calls the config server.
 
   Routes to the camera's own tracker, starting it if this is the first batch.
@@ -565,7 +565,11 @@ defmodule Cairn.CameraTracker do
       max_unseen_ms: Map.get(policy, :max_unseen_ms) || Config.default_max_unseen_ms(),
       max_live_tracks: Map.get(policy, :max_live_tracks) || Config.default_max_live_tracks(),
       stationary_after_ms:
-        Map.get(policy, :stationary_after_ms) || Config.default_stationary_after_ms()
+        Map.get(policy, :stationary_after_ms) || Config.default_stationary_after_ms(),
+      # `Map.get/3` where its three neighbours use `||`: this one is a boolean,
+      # and `||` would read an explicit `false` as an absent key — the same
+      # answer only for as long as the default is `false`.
+      bbd: Map.get(policy, :bbd, Config.default_bbd())
     }
   end
 

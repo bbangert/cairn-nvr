@@ -9,6 +9,7 @@ defmodule Cairn.TrackerTest do
   alias Cairn.PluginProtocol
   alias Cairn.Track
   alias Cairn.Tracker
+  alias Cairn.Tracker.Bbd
 
   @max_unseen 3_000
   @stationary_after 10_000
@@ -82,7 +83,7 @@ defmodule Cairn.TrackerTest do
   defp ctx(opts) do
     at_ms = Keyword.get(opts, :at_ms, 0)
 
-    %{
+    context = %{
       camera_id: Keyword.get(opts, :camera_id, "cam_a"),
       epoch: Keyword.get(opts, :epoch, "epoch_one"),
       at_ms: at_ms,
@@ -95,6 +96,15 @@ defmodule Cairn.TrackerTest do
       # behaves as it did before there were stages.
       min_score: Keyword.get(opts, :min_score)
     }
+
+    # The key itself is absent unless a test asks for it, so that everything
+    # here bar the BBD block runs against the context a caller which has never
+    # heard of the flag hands the tracker — and so that "off" and "absent" are
+    # two distinguishable things a test can compare.
+    case Keyword.fetch(opts, :bbd) do
+      {:ok, bbd} -> Map.put(context, :bbd, bbd)
+      :error -> context
+    end
   end
 
   defp track(tracker, objects, opts \\ []), do: Tracker.track(tracker, objects, ctx(opts))
@@ -2828,6 +2838,394 @@ defmodule Cairn.TrackerTest do
 
       assert [%Track{object_id: ^id, last_seen_at: at_14}] = Tracker.live_tracks(strong)
       assert at_14 == at(14_000)
+    end
+  end
+
+  # Every batch of `batches` — each a `{context opts, objects}` pair — folded
+  # from a fresh tracker with `opts` on all of them, keeping every event of the
+  # run rather than the last batch's alone.
+  defp replay(batches, opts) do
+    Enum.reduce(batches, {Tracker.new(), [], []}, fn {batch_opts, dets}, {t, _tagged, seen} ->
+      {t, tagged, events} = track(t, dets, batch_opts ++ opts)
+      {t, tagged, seen ++ events}
+    end)
+  end
+
+  # A `track/3` result with every ULID replaced by the order it was started in.
+  # An identity is random by construction, so it is the one thing two runs of
+  # the same scenario differ in whatever the scenario does, and rewriting it is
+  # what makes "identical behaviour" something a test can assert at all. Every
+  # id in a `replay/2` result is covered: the run starts from `Tracker.new/0`,
+  # so nothing in it was minted anywhere else.
+  defp canonical({_tracker, _tagged, events} = result) do
+    minted = events |> ids(:started) |> Enum.with_index() |> Map.new()
+    substitute(result, minted)
+  end
+
+  defp substitute(%module{} = value, mapping),
+    do: value |> Map.from_struct() |> substitute(mapping) |> then(&struct(module, &1))
+
+  defp substitute(map, mapping) when is_map(map),
+    do: Map.new(map, fn {k, v} -> {substitute(k, mapping), substitute(v, mapping)} end)
+
+  defp substitute(list, mapping) when is_list(list), do: Enum.map(list, &substitute(&1, mapping))
+
+  defp substitute(tuple, mapping) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> substitute(mapping) |> List.to_tuple()
+
+  defp substitute(binary, mapping) when is_binary(binary), do: Map.get(mapping, binary, binary)
+
+  defp substitute(other, _mapping), do: other
+
+  # What association does, spread over four runs, each carrying what it is there
+  # to exercise: `started`, the tracks the whole run mints; `dropped`, how many
+  # of the *last* batch's detections never reached `tagged`, which is one
+  # `:drop` each; and `live`, every surviving track's label and box, sorted.
+  # Which box a track ends on is what says which branch took it — a count of
+  # mints alone is satisfied by any run that mints the same number for the wrong
+  # reasons.
+  defp flag_off_scenarios do
+    parked_box = [0.0, 0.0, 0.4, 0.4]
+    passer = [0.2, 0.0, 0.4, 0.4]
+    elsewhere = [0.05, 0.05, 0.18, 0.12]
+
+    [
+      # The last batch is all three at once: @parked_car takes the car track on
+      # its own overlap, @car_double is then left over and sits at 0.78 to that
+      # track's stored box, so suppression drops it, and @car_neighbour is left
+      # over at 1/3 — under @duplicate_suppression_iou — so it mints beside it
+      # instead. No floor is set anywhere in this run, which makes suppression
+      # the only thing in it that can produce a `:drop` at all.
+      {"a mint, a match and a duplicate-suppressed leftover",
+       [
+         started: 3,
+         dropped: 1,
+         live: [{"car", @parked_car}, {"car", @car_neighbour}, {"person", @walker_step}]
+       ],
+       [
+         {[], [det("person", @walker), det("car", @parked_car)]},
+         {[at_ms: 500], [det("person", @walker_step), det("car", @parked_car)]},
+         {[at_ms: 1_000],
+          [
+            det("person", @walker_step),
+            det("car", @parked_car),
+            det("car", @car_double),
+            det("car", @car_neighbour)
+          ]}
+       ]},
+      # 1_500 ms with no batch in it and then a box two and a half of its own
+      # widths on: the track's stored box and the filter's prediction both
+      # overlap it at exactly zero, so the walker mints a second identity and
+      # the first is left frozen where it was last seen. That loss is what the
+      # flag exists to undo; the headline test below is the same loss with it on.
+      {"a coast wider than the box",
+       [started: 2, dropped: 0, live: [{"person", mover(2)}, {"person", mover(7)}]],
+       [
+         {[], [det("person", mover(0))]},
+         {[at_ms: 500], [det("person", mover(1))]},
+         {[at_ms: 1_000], [det("person", mover(2))]},
+         {[at_ms: 2_500], [det("person", mover(7))]}
+       ]},
+      # The parked track is stationary and unseen past `max_unseen_ms`, so it
+      # admits only at @stationary_match_iou. The passer-by overlaps it by 1/3,
+      # which clears neither that nor @duplicate_suppression_iou, so it is
+      # refused a match and refused a drop, and mints beside the track it walked
+      # past rather than inheriting it.
+      {"a passer-by in the grace",
+       [started: 2, dropped: 0, live: [{"person", parked_box}, {"person", passer}]],
+       for(n <- 0..10, do: {[at_ms: n * 1_000], [det("person", parked_box)]}) ++
+         [{[at_ms: 14_000], [det("person", passer)]}]},
+      # Both halves of the stage. @car_double and @car_neighbour are under the
+      # floor and match the car track anyway, which is why it ends on
+      # @car_neighbour — a box no mint could ever have been made for. The
+      # `elsewhere` box is under the floor with no free car track left to take,
+      # so stage two spends it: the last batch's one drop, minting nothing and
+      # marking nothing seen.
+      {"the low-confidence stage",
+       [started: 2, dropped: 1, live: [{"car", @car_neighbour}, {"person", @walker}]],
+       [
+         {[min_score: @floor], [det("car", @parked_car)]},
+         {[at_ms: 500, min_score: @floor], [det("car", @car_double, score: @below)]},
+         {[at_ms: 1_000, min_score: @floor],
+          [
+            det("car", @car_neighbour, score: @below),
+            det("car", elsewhere, score: @below),
+            det("person", @walker)
+          ]}
+       ]}
+    ]
+  end
+
+  describe "BBD admission" do
+    test "with the flag off the tracker does exactly what it does without the key" do
+      for {name, expected, batches} <- flag_off_scenarios() do
+        {tracker, tagged, events} = off = replay(batches, bbd: false)
+        {_opts, last_batch} = List.last(batches)
+
+        # non-vacuity, per scenario: two runs that both did nothing compare
+        # equal, so each scenario states the branches it is here for and the
+        # comparison below only means anything once they have fired
+        assert length(ids(events, :started)) == expected[:started], name
+        assert length(last_batch) - length(tagged) == expected[:dropped], name
+
+        assert tracker |> Tracker.live_tracks() |> Enum.map(&{&1.label, &1.bbox}) |> Enum.sort() ==
+                 expected[:live],
+               name
+
+        assert canonical(off) == canonical(replay(batches, [])), name
+      end
+    end
+
+    # The headline: two boxes that do not touch have an IoU of exactly zero
+    # however near they are, so the gate cannot tell the track's own object
+    # from anything else once the coast is longer than the box is wide.
+    test "a coast the IoU gate loses the identity in is held on centre distance" do
+      # longer than this whole run: the coast below is deliberately longer than
+      # @max_unseen (3_000), and a track that expired mid-coast would never
+      # reach the matcher this test is about
+      opts = [max_unseen_ms: 30_000]
+
+      {t, id} = walked()
+
+      # eight batches nothing detected it in, so the filter coasts eight times
+      # and predicts a ninth at match time — far enough that the prediction has
+      # run clear of the walker below rather than merely drifting off it
+      t =
+        Enum.reduce(2_500..6_000//500, t, fn ms, t ->
+          {t, [], []} = track(t, [], [at_ms: ms] ++ opts)
+          t
+        end)
+
+      # the walker slowed while nothing was watching: it is short of where the
+      # coast went, and a box and a half past where it was last seen, so it
+      # overlaps neither — which is also what keeps suppression out of this
+      resumed = mover(7)
+      assert Tracker.iou(mover(4), resumed) == 0.0
+
+      # the mint is the proof that the coast really did outrun it: the pair is
+      # under the base threshold, so the IoU gate refuses it outright
+      {_off, [tagged], events} =
+        track(t, [det("person", resumed)], [at_ms: 6_500, bbd: false] ++ opts)
+
+      assert [{:started, %Track{object_id: minted}}] = events
+      assert tagged.object_id == minted
+      refute minted == id
+
+      {on, [tagged], events} =
+        track(t, [det("person", resumed)], [at_ms: 6_500, bbd: true] ++ opts)
+
+      assert tagged.object_id == id
+      assert ids(events, :started) == []
+      assert [%Track{object_id: ^id, bbox: ^resumed}] = Tracker.live_tracks(on)
+    end
+
+    # The label gate is the IoU pass's, and `bbd_pairs/3` carries it unchanged:
+    # centre distance is a second way to admit a comparable pair, never a way
+    # around what makes two boxes comparable. It is also where the gate carries
+    # the most weight — a car and a person a few tenths apart overlap at zero
+    # like every other disjoint pair, which is exactly the reading distance is
+    # here to rescue.
+    test "a different label is not admitted on distance, however near it is" do
+      opts = [max_unseen_ms: 30_000, bbd: true]
+
+      {t, id} = walked()
+
+      t =
+        Enum.reduce(2_500..6_000//500, t, fn ms, t ->
+          {t, [], []} = track(t, [], [at_ms: ms] ++ opts)
+          t
+        end)
+
+      # the headline test's box, at the same instant of the same coast — a pair
+      # the IoU gate refuses outright up there, so distance is the only
+      # admission that could match this one either
+      resumed = mover(7)
+      assert Tracker.iou(mover(4), resumed) == 0.0
+
+      {cars, [tagged], events} = track(t, [det("car", resumed)], [at_ms: 6_500] ++ opts)
+
+      assert [{:started, %Track{object_id: minted}}] = events
+      assert tagged.object_id == minted
+      refute minted == id
+      # and the person track was passed over rather than moved onto the car box
+      assert %{bbox: unmoved} = cars.objects[id]
+      assert unmoved == mover(4)
+
+      # non-vacuity: the identical box under the track's own label does match,
+      # so the label is the whole of what stood between that pair and this one
+      {people, [tagged], events} = track(t, [det("person", resumed)], [at_ms: 6_500] ++ opts)
+
+      assert tagged.object_id == id
+      assert ids(events, :started) == []
+      assert [%Track{object_id: ^id, bbox: ^resumed}] = Tracker.live_tracks(people)
+    end
+
+    # Concatenation and not a merge: the two lists are spent in order, so the
+    # only thing a distance-admitted pair can take is what overlap left free.
+    test "a BBD pair never outranks an IoU pair for the same object" do
+      # a small track barely clearing the base threshold, and a large one that
+      # contains the detection outright and still falls under it — a big box
+      # swallowing a small one is a poor overlap and a tiny centre distance,
+      # which is exactly where the two orderings disagree
+      weak = [0.42, 0.50, 0.10, 0.10]
+      near = [0.30, 0.30, 0.40, 0.40]
+      box = [0.50, 0.50, 0.10, 0.10]
+
+      assert_in_delta Tracker.iou(weak, box), 1 / 9, 0.001
+      assert Tracker.iou(weak, box) > 0.1
+      assert Tracker.iou(near, box) < 0.1
+
+      # both tracks are one detection old, so each predicts its own box back
+      # and 0.5 s is the gap this batch is matched over
+      assert Bbd.distance(near, box, 0.5) < Bbd.distance(weak, box, 0.5)
+      assert Bbd.admit?(Bbd.distance(near, box, 0.5))
+
+      {t, [%{object_id: weak_id}, %{object_id: _near_id}], _events} =
+        track(Tracker.new(), [det("person", weak), det("person", near)])
+
+      {_t, [tagged], events} = track(t, [det("person", box)], at_ms: 500, bbd: true)
+
+      assert tagged.object_id == weak_id
+      assert ids(events, :started) == []
+      assert ids(events, :updated) == [weak_id]
+
+      # and the pair the concatenation buried is a real one: with the weakly
+      # overlapping track out of the scene, the nearer one does take the box
+      {alone, [%{object_id: id}], _events} = track(Tracker.new(), [det("person", near)])
+      {_alone, [tagged], events} = track(alone, [det("person", box)], at_ms: 500, bbd: true)
+      assert tagged.object_id == id
+      assert ids(events, :started) == []
+    end
+
+    # A parked object's own re-detections overlap it by definition, so the only
+    # thing centre distance could add here is a way for something else to
+    # inherit the identity the grace exists to protect.
+    test "a parked identity is not taken on distance, in the grace or out of it" do
+      box = [0.0, 0.0, 0.4, 0.4]
+      far = [0.5, 0.5, 0.4, 0.4]
+
+      # non-vacuity: no overlap at all, so nothing but the exclusion is keeping
+      # this box off the parked track — and it is well inside the distance gate
+      assert Tracker.iou(box, far) == 0.0
+      assert Bbd.admit?(Bbd.distance(box, far, 4.0))
+
+      {parked, id} = parked(box)
+
+      # 4_000 unseen, inside the extended grace, and 1_000 unseen, out of it:
+      # what excludes the track is its stationary flag and not the grace, so
+      # the answer is the same either side of it
+      for at_ms <- [14_000, 11_000] do
+        {t, [tagged], events} = track(parked, [det("person", far)], at_ms: at_ms, bbd: true)
+
+        assert [{:started, %Track{object_id: other}}] = events
+        assert tagged.object_id == other
+        refute other == id
+
+        # and the identity was held rather than merely withheld
+        {_t, [redetected], events} =
+          track(t, [det("person", box)], at_ms: at_ms + 1_000, bbd: true)
+
+        assert redetected.object_id == id
+        assert ids(events, :started) == []
+      end
+    end
+
+    test "a passer-by in the grace does not take the parked identity with the flag on" do
+      box = [0.0, 0.0, 0.4, 0.4]
+      passer = [0.2, 0.0, 0.4, 0.4]
+
+      # the same band as the passer-by test above — over the base threshold,
+      # under @stationary_match_iou — and comfortably inside the distance gate,
+      # so with the parked track excluded @stationary_match_iou is still the
+      # sole thing standing between this box and the identity
+      assert Tracker.iou(box, passer) > 0.1
+      assert Tracker.iou(box, passer) < 0.7
+      assert Bbd.admit?(Bbd.distance(box, passer, 4.0))
+
+      {parked, id} = parked(box)
+
+      {t, [tagged], events} = track(parked, [det("person", passer)], at_ms: 14_000, bbd: true)
+
+      assert [{:started, %Track{object_id: passer_id}}] = events
+      assert tagged.object_id == passer_id
+      refute passer_id == id
+
+      {_t, [redetected], events} = track(t, [det("person", box)], at_ms: 15_000, bbd: true)
+
+      assert redetected.object_id == id
+      assert ids(events, :started) == []
+      assert ids(events, :updated) == [id]
+    end
+
+    test "stage two matches on distance too, and its leftover still mints nothing" do
+      opts = [max_unseen_ms: 30_000, min_score: @floor, bbd: true]
+
+      {t, id} = walked()
+
+      t =
+        Enum.reduce(2_500..6_000//500, t, fn ms, t ->
+          {t, [], []} = track(t, [], [at_ms: ms] ++ opts)
+          t
+        end)
+
+      # the same coast as the headline test, and a weak box: stage one has no
+      # object at all, so the track is free when stage two runs
+      resumed = mover(7)
+      elsewhere = [0.05, 0.05, 0.10, 0.10]
+
+      {stage_two, tagged, events} =
+        track(
+          t,
+          [det("person", resumed, score: @below), det("person", elsewhere, score: @below)],
+          [at_ms: 6_500] ++ opts
+        )
+
+      # the second weak box has nothing left to take — one live track, and the
+      # nearer box took it — so stage two spends it, which is the whole of what
+      # a below-floor leftover may do: no mint, and no mark either
+      assert [%{object_id: ^id}] = tagged
+      assert ids(events, :started) == []
+
+      assert [%Track{object_id: ^id, bbox: ^resumed, best_score: 0.9}] =
+               Tracker.live_tracks(stage_two)
+    end
+
+    # A matched object is consumed, and `suppress_duplicates/4` only ever sees
+    # what association left over — so a box that would have been dropped as
+    # somebody's duplicate is not dropped once something takes it.
+    test "a BBD-matched box is consumed and never reaches duplicate suppression" do
+      # a car detected where it is, and the second box a detector without NMS
+      # emits for it — well above @duplicate_suppression_iou, which is what
+      # makes the leftover a drop with the flag off
+      assert Tracker.iou(@parked_car, @car_double) > 0.4
+
+      # a second car, far enough that neither box overlaps its prediction at
+      # all and near enough in centre distance to answer to one
+      other_car = [0.60, 0.505, 0.18, 0.12]
+      assert Tracker.iou(other_car, @car_double) == 0.0
+      assert Tracker.iou(other_car, @parked_car) == 0.0
+      assert Bbd.admit?(Bbd.distance(other_car, @car_double, 0.5))
+
+      {t, [%{object_id: car_id}, %{object_id: other_id}], _events} =
+        track(Tracker.new(), [det("car", @parked_car), det("car", other_car)])
+
+      batch = [det("car", @parked_car), det("car", @car_double)]
+
+      # the first box takes its own track and the second is left over, so
+      # suppression weighs it against that track's stored box and drops it
+      {_off, tagged, events} = track(t, batch, at_ms: 500, bbd: false)
+
+      assert [%{object_id: ^car_id}] = tagged
+      assert ids(events, :started) == []
+      assert ids(events, :updated) == [car_id]
+
+      # with the flag on nothing is left over for suppression to weigh at all
+      {on, tagged, events} = track(t, batch, at_ms: 500, bbd: true)
+
+      assert [%{object_id: ^car_id}, %{object_id: ^other_id}] = tagged
+      assert ids(events, :started) == []
+      assert ids(events, :updated) == [car_id, other_id]
+      assert %{bbox: @car_double} = on.objects[other_id]
     end
   end
 end

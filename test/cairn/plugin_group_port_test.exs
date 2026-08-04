@@ -168,6 +168,7 @@ defmodule Cairn.PluginGroupPortTest do
              max_unseen_ms: 3_000,
              max_live_tracks: 128,
              stationary_after_ms: 10_000,
+             bbd: false,
              track: nil,
              record: nil
            }
@@ -185,6 +186,7 @@ defmodule Cairn.PluginGroupPortTest do
              max_unseen_ms: 3_000,
              max_live_tracks: 128,
              stationary_after_ms: 10_000,
+             bbd: false,
              track: nil,
              record: nil
            }
