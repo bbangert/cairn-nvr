@@ -914,9 +914,9 @@ defmodule Cairn.ConfigTest do
     end
 
     test "a profile with no tracking block leaves the boolean path standing" do
-      # `minimal.yml` is backend-only: it said nothing about tracking, so the
-      # policy carries no stages key and the camera reads the global flags —
-      # the absence-speaks rule's other half.
+      # `minimal.yml` has no `tracking:` block (just the backend and its
+      # artifact), so the policy carries no stages key and the camera reads
+      # the global flags — the absence-speaks rule's other half.
       assert {:ok, config, []} = Config.from_map(profiled_map("minimal"))
       [profiled | _rest] = config.cameras
 
