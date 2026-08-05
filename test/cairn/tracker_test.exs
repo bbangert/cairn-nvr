@@ -36,6 +36,12 @@ defmodule Cairn.TrackerTest do
   # had — far above @duplicate_suppression_iou and above @stationary_match_iou
   # too, so nothing about it looks like a second object
   @car_double [0.415, 0.505, 0.18, 0.12]
+  # the same twin, nudged on both axes to IoU 0.9 — the shape of the live
+  # cold-start failure, where the two boxes of one car arrived before either had
+  # a track and both minted. Separate from @car_double so that the twin-mint
+  # tests and the leftover-suppression tests cannot be made to pass by one
+  # fixture's arithmetic
+  @car_twin [0.4048, 0.5032, 0.18, 0.12]
   # tall where the car boxes are wide, and displaced in y rather than x
   @walker [0.30, 0.20, 0.10, 0.30]
   # IoU 0.5 with @walker, the same overlap @car_drift has with @parked_car
@@ -1451,6 +1457,216 @@ defmodule Cairn.TrackerTest do
       assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
     end
 
+    # The same detector, one batch earlier: before either box has a track, the
+    # rule above has nothing to weigh them against, so both mint and the object
+    # is born with two identities. The score order is the live failure's, and
+    # deliberately the reverse of the batch order — the twin the tracker keeps
+    # is the better-scored one and not the first one.
+    test "an object first detected as two boxes mints once, not twice" do
+      assert_in_delta Tracker.iou(@parked_car, @car_twin), 0.9, 0.001
+
+      {t, tagged, events} =
+        track(Tracker.new(), [
+          det("car", @parked_car, score: 0.53),
+          det("car", @car_twin, score: 0.82)
+        ])
+
+      # the weaker box is absent from `tagged` exactly as a suppressed leftover
+      # is: there is no identity to draw it under
+      assert [%{bbox: @car_twin, object_id: id, score: 0.82}] = tagged
+      assert [{:started, %Track{object_id: ^id, bbox: @car_twin, score: 0.82}}] = events
+      assert [%Track{object_id: ^id, best_score: 0.82}] = Tracker.live_tracks(t)
+    end
+
+    # Why the drop has to land on the first batch: a twinned pair sustains
+    # itself. Greedy would match one box to each of the two tracks, a matched
+    # box is never a leftover, and suppression would never be offered either of
+    # them again. With one track, the design intends the second box to be an
+    # ordinary leftover on every later batch, suppressed against the live
+    # track by the rule above — though from out here the two passes produce
+    # the same observable (one track, one tagged box, no mint), so what this
+    # test pins is the outcome across the run, with the first batch's single
+    # `:started` as the only assertion the twin pass alone can satisfy. That
+    # black-box reach is accepted; a white-box probe of which pass dropped a
+    # given box would couple the test to the pipeline's internals.
+    test "the twinned pair the first-batch drop prevents never re-forms" do
+      {t, [%{object_id: id}], _events} =
+        track(Tracker.new(), [
+          det("car", @parked_car, score: 0.53),
+          det("car", @car_twin, score: 0.82)
+        ])
+
+      {t, started} =
+        Enum.reduce(1..5, {t, []}, fn n, {t, started} ->
+          ms = n * 1_000
+
+          {t, tagged, events} =
+            track(
+              t,
+              [det("car", @parked_car, score: 0.53), det("car", @car_twin, score: 0.82)],
+              at_ms: ms,
+              observed_at: at(ms)
+            )
+
+          # one box tagged per batch, and it is the one the track matched
+          assert [%{object_id: ^id, bbox: @car_twin}] = tagged
+          {t, started ++ ids(events, :started)}
+        end)
+
+      assert started == []
+      assert [%Track{object_id: ^id, bbox: @car_twin}] = Tracker.live_tracks(t)
+    end
+
+    # `suppress_twin_mints/2` runs inside `assign/3`, before `apply_assignments/5`
+    # ever asks `make_room/3` for space, so the dropped twin is a `:drop` in
+    # `assignments` before eviction is even considered — it never competes for a
+    # slot. Correct by reading the two passes side by side, but nothing pinned
+    # it: a regression that let the dropped twin reach `make_room/3` would pay
+    # for two evictions on this scenario instead of one, and nothing here would
+    # have failed.
+    test "a new twin pair at the live-track cap pays for at most one eviction" do
+      capped = fn opts -> Keyword.put(opts, :max_live_tracks, 2) end
+
+      {t, [a], _} = track(Tracker.new(), [det("person", [0.0, 0.0, 0.05, 0.05])], capped.([]))
+      {t, [b], _} = track(t, [det("person", [0.9, 0.9, 0.05, 0.05])], capped.(at_ms: 100))
+
+      {{t, tagged, events}, log} =
+        with_log(fn ->
+          track(
+            t,
+            [det("car", @parked_car, score: 0.53), det("car", @car_twin, score: 0.82)],
+            capped.(at_ms: 200)
+          )
+        end)
+
+      assert log =~ "live-track cap"
+
+      # one mint, one eviction: the dropped twin (@parked_car, the lower
+      # score) is absent from `tagged` as a leftover, not as a second eviction
+      assert [%{bbox: @car_twin, object_id: id, score: 0.82}] = tagged
+
+      assert [
+               {:ended, %Track{object_id: evicted_id, end_reason: :evicted} = final},
+               {:started, %Track{object_id: ^id, bbox: @car_twin}}
+             ] = events
+
+      # the cap's own LRU choice, not the twin drop: `a` is the least
+      # recently seen of the two pre-existing tracks
+      assert evicted_id == a.object_id
+      assert_self_contained(final)
+
+      assert Enum.map(Tracker.live_tracks(t), & &1.object_id) |> Enum.sort() ==
+               Enum.sort([b.object_id, id])
+
+      # non-vacuity: the same cap pressure with the second box moved out of
+      # the twin band (IoU 1/3, under @duplicate_suppression_iou) mints both
+      # and evicts both, so the single eviction above is the twin drop's
+      # doing and not some other reason a second mint came free
+      {t2, [a2], _} = track(Tracker.new(), [det("person", [0.0, 0.0, 0.05, 0.05])], capped.([]))
+      {t2, [b2], _} = track(t2, [det("person", [0.9, 0.9, 0.05, 0.05])], capped.(at_ms: 100))
+
+      {t2, tagged2, events2} =
+        track(
+          t2,
+          [det("car", @parked_car, score: 0.53), det("car", @car_neighbour, score: 0.82)],
+          capped.(at_ms: 200)
+        )
+
+      assert length(tagged2) == 2
+      assert length(ids(events2, :started)) == 2
+
+      evicted_ids2 =
+        for {:ended, %Track{object_id: evicted_id, end_reason: :evicted}} <- events2,
+            do: evicted_id
+
+      assert Enum.sort(evicted_ids2) == Enum.sort([a2.object_id, b2.object_id])
+      assert length(Tracker.live_tracks(t2)) == 2
+    end
+
+    # The mint side of the same threshold the refusal tests pin: two objects
+    # standing next to each other are not a twin, and neither has a track to be
+    # judged against, so nothing may collapse them.
+    test "two same-label boxes below the threshold both mint on the first batch" do
+      assert_in_delta Tracker.iou(@parked_car, @car_neighbour), 1 / 3, 0.001
+
+      {t, tagged, events} =
+        track(Tracker.new(), [
+          det("car", @parked_car, score: 0.53),
+          det("car", @car_neighbour, score: 0.82)
+        ])
+
+      assert [%{bbox: @parked_car, object_id: first}, %{bbox: @car_neighbour, object_id: second}] =
+               tagged
+
+      refute first == second
+      assert Enum.sort(ids(events, :started)) == Enum.sort([first, second])
+      assert length(Tracker.live_tracks(t)) == 2
+    end
+
+    # The label gate, on the mint side: a person standing where a car is is two
+    # objects however much their boxes overlap, and the tracker has no track for
+    # either of them to prefer.
+    test "two overlapping boxes of different labels both mint on the first batch" do
+      assert Tracker.iou(@parked_car, @car_twin) >= 0.4
+
+      {t, tagged, events} =
+        track(Tracker.new(), [det("car", @parked_car), det("person", @car_twin)])
+
+      assert [%{label: "car", object_id: car}, %{label: "person", object_id: person}] = tagged
+      refute car == person
+      assert Enum.sort(ids(events, :started)) == Enum.sort([car, person])
+      assert length(Tracker.live_tracks(t)) == 2
+    end
+
+    # The same branch as the cold-start test — any object's own first batch is
+    # the hole, because what suppression needs is a track for *this* object and
+    # a scene full of other tracks is no help. What this adds over that test is
+    # the bookkeeping: the twin pair sits at non-zero batch indices beside a
+    # box that matches normally, so the pass has to key on track-existence and
+    # carry the right indices, not merely handle an otherwise-empty batch.
+    test "an object arriving mid-stream as two boxes mints once" do
+      {t, walker_id} = parked(@walker, "person")
+
+      {t, tagged, events} =
+        track(
+          t,
+          [
+            det("person", @walker),
+            det("car", @parked_car, score: 0.53),
+            det("car", @car_twin, score: 0.82)
+          ],
+          at_ms: 11_000,
+          observed_at: at(11_000)
+        )
+
+      assert [%{object_id: ^walker_id}, %{bbox: @car_twin, object_id: car_id}] = tagged
+      assert ids(events, :started) == [car_id]
+      assert length(Tracker.live_tracks(t)) == 2
+    end
+
+    # The ordering rationale, from the one side that can be observed: a box that
+    # can still do something other than mint is not a twin candidate at all.
+    # `adopt/4` runs first, so the exact box resumes the identity even though
+    # the twin rule alone would have dropped it for the better-scored one — and
+    # it is that better-scored box which is left over and suppressed.
+    test "a box that can adopt a suspension is not dropped as the weaker twin" do
+      {t, id} = parked(@parked_car, "car")
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
+
+      {t, tagged, events} =
+        track(t, [det("car", @parked_car, score: 0.53), det("car", @car_twin, score: 0.82)],
+          epoch: "epoch_two",
+          at_ms: 10_300
+        )
+
+      # the identity resumed on the weaker box, and no second identity was made
+      assert [%{object_id: ^id, bbox: @parked_car, score: 0.53}] = tagged
+      assert [{:updated, %Track{object_id: ^id}}, {:adopted, %Track{object_id: ^id}}] = events
+      assert ids(events, :started) == []
+      assert [%Track{object_id: ^id}] = Tracker.live_tracks(t)
+      assert Tracker.suspended_tracks(t) == []
+    end
+
     # The asymmetry in `seen/3`: presence is what a refused box is worth to a
     # track *nothing* observed. A track this batch matched was observed for
     # real, so the refusal must not add to it — and there is nothing left for it
@@ -1775,13 +1991,31 @@ defmodule Cairn.TrackerTest do
     end
   end
 
+  # The two candidates straddle the detection rather than sitting on it, which
+  # is the only way a batch gets two same-label tracks this close: two boxes
+  # one object's width apart mint two identities, and two boxes on top of each
+  # other are that object's NMS twin and mint one (see "duplicate suppression").
+  # The dyadic coordinates are the refusing-tracks tie test's, and for the same
+  # reason — an exact tie has to survive being computed two ways. Each track is
+  # detected at its own box twice, so each one's filter has seen nothing but
+  # zero innovation and predicts exactly the box it stores: the two overlaps
+  # greedy sorts are the two this test compares.
   test "an exact IoU tie is broken deterministically, not by map order" do
-    same = [0.1, 0.1, 0.2, 0.4]
-    {t, [a, b], _} = track(Tracker.new(), [det("person", same), det("person", same)])
+    left = [0.125, 0.25, 0.3125, 0.125]
+    drift = [0.25, 0.25, 0.3125, 0.125]
+    right = [0.375, 0.25, 0.3125, 0.125]
+
+    assert Tracker.iou(left, drift) === Tracker.iou(right, drift)
+    # and not with each other, or one would suppress the other's detections
+    assert_in_delta Tracker.iou(left, right), 0.111, 0.001
+
+    {t, [a, b], _} = track(Tracker.new(), [det("person", left), det("person", right)])
     refute a.object_id == b.object_id
 
-    # both candidates overlap perfectly; only the total sort key separates them
-    {_t, [c], _} = track(t, [det("person", same)], at_ms: 200)
+    {t, [_, _], _} = track(t, [det("person", left), det("person", right)], at_ms: 100)
+
+    # both candidates overlap identically; only the total sort key separates them
+    {_t, [c], _} = track(t, [det("person", drift)], at_ms: 200)
     assert c.object_id == Enum.min([a.object_id, b.object_id])
   end
 
