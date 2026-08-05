@@ -43,6 +43,52 @@ defmodule Cairn.GoldenReplayTest do
     end
   end
 
+  describe "profiled-policy equivalence" do
+    test "a stage presence map replays byte-identically to the boolean flags" do
+      # The soak policy's flags, expressed the way a profiled camera's policy
+      # carries them (`Cairn.Config.policy/2`'s `stages` map). If the two
+      # forms ever produce different context stage lists, this diverges from
+      # the committed golden the boolean run is checked against — proving
+      # stage-list path ≡ boolean path on the same fixture, per D-P7.
+      profiled = %{
+        max_unseen_ms: 3_000,
+        max_live_tracks: 128,
+        stationary_after_ms: 10_000,
+        min_score: %{"default" => 0.5},
+        stages: %{bbd: %{}, oru: %{}, twin_mint: %{}}
+      }
+
+      assert GoldenReplay.replay_capture("active", profiled) ==
+               GoldenReplay.replay_capture("active")
+    end
+
+    test "a partial presence map equals its boolean spelling too" do
+      # bbd listed alone: oru and twin_mint delisted by absence. The boolean
+      # spelling of the same choice needs twin_mint written out, since its
+      # boolean default is on — which is exactly the asymmetry this pins.
+      partial = %{
+        max_unseen_ms: 3_000,
+        max_live_tracks: 128,
+        stationary_after_ms: 10_000,
+        min_score: %{"default" => 0.5},
+        stages: %{bbd: %{}}
+      }
+
+      booleans = %{
+        max_unseen_ms: 3_000,
+        max_live_tracks: 128,
+        stationary_after_ms: 10_000,
+        min_score: %{"default" => 0.5},
+        bbd: true,
+        oru: false,
+        twin_mint: false
+      }
+
+      assert GoldenReplay.replay_capture("active", partial) ==
+               GoldenReplay.replay_capture("active", booleans)
+    end
+  end
+
   describe "golden bookkeeping" do
     test "a missing golden names the regen task instead of diffing nothing" do
       # Under `mix cairn.golden.regen` this call would *create* the file, so

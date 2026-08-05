@@ -807,6 +807,138 @@ defmodule Cairn.ConfigTest do
     end
   end
 
+  describe "profiles" do
+    alias Cairn.Config.Profile
+
+    @profiles_dir "test/support/fixtures/profiles/valid"
+    @shadow_dir "test/support/fixtures/profiles/shadow"
+    @bad_dir "test/support/fixtures/profiles/bad"
+
+    defp profiled_map(profile \\ "rk-test") do
+      base_map()
+      |> Map.put("profile_dirs", [@profiles_dir])
+      |> Map.put("plugins", %{"det" => %{"command" => "./p", "profile" => profile}})
+      |> put_plugin(0, "det")
+    end
+
+    test "a profiled group resolves its file into the parsed struct" do
+      assert {:ok, config, []} = Config.from_map(profiled_map())
+
+      assert [%{profile: %Profile{} = profile}] = config.plugin_groups
+      assert profile.name == "rk-test"
+      assert profile.backend == "rknn"
+      assert profile.experimental
+      assert profile.fps_band == [2, 4]
+      assert profile.max_unseen_ms == 6000
+      # Presence map: params keep their YAML string keys, `true` reads as
+      # empty params.
+      assert profile.stages == %{bbd: %{}, oru: %{"step_ms" => 700}, twin_mint: %{}}
+    end
+
+    test "an unknown profile name is a config error naming the search" do
+      assert {:error, errors} = Config.from_map(profiled_map("no-such"))
+      assert Enum.any?(errors, &(&1 =~ "unknown profile \"no-such\""))
+    end
+
+    test "a later dir shadows an earlier one, with a warning" do
+      map = Map.update!(profiled_map(), "profile_dirs", &(&1 ++ [@shadow_dir]))
+
+      assert {:ok, config, warnings} = Config.from_map(map)
+      assert Enum.any?(warnings, &(&1 =~ "shadows a previously loaded profile"))
+
+      # The shadow file wins: ort backend, twin_mint only.
+      assert [%{profile: %Profile{backend: "ort", stages: %{twin_mint: %{}} = stages}}] =
+               config.plugin_groups
+
+      refute Map.has_key?(stages, :bbd)
+    end
+
+    test "a broken profile file fails the whole load with named errors" do
+      map = Map.put(base_map(), "profile_dirs", [@bad_dir])
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "unknown backend \"quantum\""))
+      assert Enum.any?(errors, &(&1 =~ "fps_band must be"))
+      assert Enum.any?(errors, &(&1 =~ "tracking.bbd must be"))
+    end
+
+    test "a name key that contradicts the filename is an error" do
+      map = Map.put(base_map(), "profile_dirs", ["test/support/fixtures/profiles/mismatch"])
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "does not match its filename"))
+    end
+
+    test "a profile with no tracking block leaves the boolean path standing" do
+      # `minimal.yml` is backend-only: it said nothing about tracking, so the
+      # policy carries no stages key and the camera reads the global flags —
+      # the absence-speaks rule's other half.
+      assert {:ok, config, []} = Config.from_map(profiled_map("minimal"))
+      [profiled | _rest] = config.cameras
+
+      policy = Config.policy(config, profiled)
+      refute Map.has_key?(policy, :stages)
+      assert policy.max_unseen_ms == 3_000
+    end
+
+    test "presence purity reaches the policy: only the listed stage is in it" do
+      map = Map.update!(profiled_map(), "profile_dirs", &(&1 ++ [@shadow_dir]))
+
+      assert {:ok, config, _warnings} = Config.from_map(map)
+      [profiled | _rest] = config.cameras
+
+      # The shadow profile lists twin_mint alone: bbd and oru are absent from
+      # the policy's map — delisted, not defaulted — which is what the
+      # tracker's stages path reads.
+      assert Config.policy(config, profiled).stages == %{twin_mint: %{}}
+    end
+
+    test "an out-of-range profile bound fails the load on the shared ranges" do
+      map = Map.put(base_map(), "profile_dirs", ["test/support/fixtures/profiles/lowbound"])
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "tracking.max_unseen_ms must be an integer between"))
+    end
+
+    test "policy/2 gives profiled cameras the stage map and band-tuned bounds" do
+      assert {:ok, config, []} = Config.from_map(profiled_map())
+      [profiled, unprofiled] = config.cameras
+
+      policy = Config.policy(config, profiled)
+      # The profile's stages ride the policy; the booleans stay for the
+      # unprofiled path and are superseded on this one.
+      assert policy.stages == %{bbd: %{}, oru: %{"step_ms" => 700}, twin_mint: %{}}
+      # Profile bound beats the global default; nothing camera-side set.
+      assert policy.max_unseen_ms == 6000
+
+      plain = Config.policy(config, unprofiled)
+      refute Map.has_key?(plain, :stages)
+      assert plain.max_unseen_ms == 3_000
+    end
+
+    test "a camera's own bound outranks its profile's" do
+      map =
+        update_in(profiled_map(), ["cameras"], fn [cam | rest] ->
+          [Map.put(cam, "max_unseen_ms", 9_000) | rest]
+        end)
+
+      assert {:ok, config, []} = Config.from_map(map)
+      [profiled | _rest] = config.cameras
+      assert Config.policy(config, profiled).max_unseen_ms == 9_000
+    end
+
+    test "global booleans under a profiled group warn that the profile wins" do
+      map = Map.put(profiled_map(), "tracking", %{"bbd" => true})
+
+      assert {:ok, _config, warnings} = Config.from_map(map)
+
+      assert Enum.any?(
+               warnings,
+               &(&1 =~ "profile rk-test supersedes the global tracking.bbd/oru")
+             )
+    end
+  end
+
   describe "windows/2 and retention_days/3" do
     test "camera overrides win over globals" do
       {:ok, config, _} =

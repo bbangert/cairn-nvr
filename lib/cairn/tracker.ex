@@ -808,12 +808,21 @@ defmodule Cairn.Tracker do
           :max_live_tracks => pos_integer(),
           :stationary_after_ms => pos_integer(),
           optional(:min_score) => floors() | nil,
-          optional(:bbd) => boolean(),
-          optional(:oru) => boolean(),
-          optional(:twin_mint) => boolean()
+          optional(:bbd) => boolean() | Stage.params(),
+          optional(:oru) => boolean() | Stage.params(),
+          optional(:twin_mint) => boolean() | Stage.params()
         }
 
-  @typedoc "The host-side tracking policy for one camera."
+  @typedoc """
+  The host-side tracking policy for one camera.
+
+  The three stage flags and the `stages` presence map are two forms of one
+  setting, and `context/3` resolves them: a policy carrying `stages` — a
+  profiled camera's, per `Cairn.Config.policy/2` — supersedes the booleans
+  entirely (presence decides listing, `twin_mint` included); a policy
+  without one reads the booleans exactly as before profiles existed. The
+  paired `t:context/0` above carries only the resolved form.
+  """
   @type policy :: %{
           :max_unseen_ms => pos_integer(),
           :max_live_tracks => pos_integer(),
@@ -821,7 +830,8 @@ defmodule Cairn.Tracker do
           optional(:min_score) => floors() | nil,
           optional(:bbd) => boolean(),
           optional(:oru) => boolean(),
-          optional(:twin_mint) => boolean()
+          optional(:twin_mint) => boolean(),
+          optional(:stages) => %{optional(atom()) => Stage.params()}
         }
 
   @type event ::
@@ -879,10 +889,25 @@ defmodule Cairn.Tracker do
       max_live_tracks: policy.max_live_tracks,
       stationary_after_ms: policy.stationary_after_ms,
       min_score: Map.get(policy, :min_score),
-      bbd: Map.get(policy, :bbd, false),
-      oru: Map.get(policy, :oru, false),
-      twin_mint: Map.get(policy, :twin_mint, true)
+      bbd: stage_setting(policy, :bbd, false),
+      oru: stage_setting(policy, :oru, false),
+      twin_mint: stage_setting(policy, :twin_mint, true)
     }
+  end
+
+  # Booleans-or-stage-list, resolved to one representation: `false` (not
+  # listed), or a params map (listed). A policy with a `stages` presence map —
+  # a profiled camera's — supersedes the boolean pair entirely: a stage is
+  # listed exactly when its key is present, `twin_mint` included (a profile
+  # says what runs; the default-on reading belongs to the boolean path alone).
+  # Without one, the booleans read as they always have, `true` becoming the
+  # empty params map at the translation (`stage_list/4`), so an unprofiled
+  # caller's path is byte-identical in shape.
+  defp stage_setting(policy, key, default) do
+    case Map.get(policy, :stages) do
+      nil -> Map.get(policy, key, default)
+      stages -> Map.get(stages, key, false)
+    end
   end
 
   @doc """
@@ -1283,9 +1308,7 @@ defmodule Cairn.Tracker do
   # translates `oru` — the flag is spent here and only here, a listed stage
   # runs unconditionally (see "Gating" in `Cairn.Tracker.Stage.Bbd`), and a
   # configured stage list replaces this translation when profiles land.
-  defp batch_stages(context) do
-    if Map.get(context, :bbd), do: [{Stage.Bbd, %{}}], else: []
-  end
+  defp batch_stages(context), do: stage_list(context, :bbd, Stage.Bbd, false)
 
   # The minting point's list, and the one translation whose default is ON:
   # `Cairn.Tracker.Stage.TwinMint` runs for every caller that has not
@@ -1293,9 +1316,7 @@ defmodule Cairn.Tracker do
   # the post-#68 one — a cold-start double box mints once. `twin_mint: false`
   # is the NMS-free escape hatch (the stage can eat legitimate close pairs
   # there); like the other flags it gates *listing*, never the stage itself.
-  defp minting_stages(context) do
-    if Map.get(context, :twin_mint, true), do: [{Stage.TwinMint, %{}}], else: []
-  end
+  defp minting_stages(context), do: stage_list(context, :twin_mint, Stage.TwinMint, true)
 
   # This batch's objects split at the camera's evidence floor, per label with
   # the same `"default"`-then-0.5 fallback `Cairn.CameraTracker` gates evidence
@@ -2014,17 +2035,25 @@ defmodule Cairn.Tracker do
     end)
   end
 
-  # Transitional: the stage list is translated from the `oru` boolean the
-  # existing plumbing already carries (`Cairn.Config.policy/2` →
-  # `Cairn.CameraTracker`'s `tracking_policy/1` → `context/3` → here), so
-  # config, the camera tracker and every test fixture are untouched by the
-  # extraction. `Map.get/2` rather than a match because `context` is a plain
-  # map a caller may build without the key. The flag is spent here and only
-  # here — a listed stage runs unconditionally (see "Gating" in
-  # `Cairn.Tracker.Stage.Oru`) — and a configured stage list replaces this
-  # translation when profiles land.
-  defp per_object_stages(context) do
-    if Map.get(context, :oru, false), do: [{Stage.Oru, %{}}], else: []
+  # The `oru` setting spent into a list — `false` (or a caller that never
+  # heard of the key) is no stage, `true` is the stage with default params,
+  # and a profiled camera's params map rides through as the stage's params.
+  # The flag is spent here and only here — a listed stage runs
+  # unconditionally (see "Gating" in `Cairn.Tracker.Stage.Oru`).
+  defp per_object_stages(context), do: stage_list(context, :oru, Stage.Oru, false)
+
+  # One translation for all three attachment points: what `context/3` (or a
+  # bare test context) put under the key decides listing; the value's shape
+  # decides params. `nil` reads as unlisted for the same reason `false` does —
+  # a caller that wrote the key as nil meant "off", and the old truthiness
+  # test read it that way too.
+  defp stage_list(context, key, module, default) do
+    case Map.get(context, key, default) do
+      false -> []
+      nil -> []
+      true -> [{module, %{}}]
+      params when is_map(params) -> [{module, params}]
+    end
   end
 
   # The filter's one step for a track that was observed: predict, then correct

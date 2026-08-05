@@ -14,9 +14,10 @@ defmodule Cairn.Config do
 
   alias Cairn.Config.Camera
   alias Cairn.Config.PluginGroup
+  alias Cairn.Config.Profile
 
   @known_keys ~w(data_dir stall_seconds free_space_min_mb remux_clips udp events retention cameras
-                 plugins integrations tracking)
+                 plugins integrations tracking profile_dirs)
   @known_udp_keys ~w(base_port range)
   @known_events_keys ~w(pre_window_seconds post_window_seconds max_event_seconds)
   @known_retention_keys ~w(days per_label tracks_days)
@@ -107,6 +108,7 @@ defmodule Cairn.Config do
             oru: @default_oru,
             cameras: [],
             plugin_groups: [],
+            profiles: %{},
             ha_token: nil
 
   @type t :: %__MODULE__{}
@@ -179,6 +181,7 @@ defmodule Cairn.Config do
     acc = warn_unknown(acc, Map.get(map, "tracking"), @known_tracking_keys, "tracking")
 
     {cameras, acc} = parse_cameras(Map.get(map, "cameras", []), acc)
+    {profiles, acc} = load_profiles(Map.get(map, "profile_dirs"), acc)
     {plugin_groups, acc} = parse_plugins(Map.get(map, "plugins"), acc)
 
     config = %__MODULE__{
@@ -201,10 +204,12 @@ defmodule Cairn.Config do
       oru: configured_oru(map),
       cameras: cameras,
       plugin_groups: plugin_groups,
+      profiles: profiles,
       ha_token: get_in(map, ["integrations", "token"])
     }
 
     {config, acc} = resolve_plugins(config, acc, declared_plugin_names(map))
+    {config, acc} = resolve_profiles(config, acc)
     acc = validate(config, acc)
 
     case acc.errors do
@@ -280,31 +285,65 @@ defmodule Cairn.Config do
   opposite things.
   """
   @spec policy(t(), Camera.t()) :: %{
-          pre: pos_integer(),
-          post: pos_integer(),
-          max: pos_integer(),
-          max_unseen_ms: pos_integer(),
-          max_live_tracks: pos_integer(),
-          stationary_after_ms: pos_integer(),
-          bbd: boolean(),
-          oru: boolean(),
-          track: Camera.tier() | nil,
-          record: Camera.tier() | nil
+          :pre => pos_integer(),
+          :post => pos_integer(),
+          :max => pos_integer(),
+          :max_unseen_ms => pos_integer(),
+          :max_live_tracks => pos_integer(),
+          :stationary_after_ms => pos_integer(),
+          :bbd => boolean(),
+          :oru => boolean(),
+          :track => Camera.tier() | nil,
+          :record => Camera.tier() | nil,
+          optional(:stages) => %{optional(atom()) => map()}
         }
   def policy(%__MODULE__{} = config, %Camera{} = cam) do
+    profile = profile_for(config, cam)
+
     config
     |> windows(cam)
-    |> Map.put(:max_unseen_ms, max_unseen_ms(config, cam))
-    |> Map.put(:max_live_tracks, max_live_tracks(config, cam))
-    |> Map.put(:stationary_after_ms, stationary_after_ms(config, cam))
+    |> Map.put(
+      :max_unseen_ms,
+      bound(cam.max_unseen_ms, profile && profile.max_unseen_ms, config.max_unseen_ms)
+    )
+    |> Map.put(
+      :max_live_tracks,
+      bound(cam.max_live_tracks, profile && profile.max_live_tracks, config.max_live_tracks)
+    )
+    |> Map.put(
+      :stationary_after_ms,
+      bound(
+        cam.stationary_after_ms,
+        profile && profile.stationary_after_ms,
+        config.stationary_after_ms
+      )
+    )
     # Straight off the config and not through a `cam` reader: there is no
-    # per-camera form of this one (see `@default_bbd`).
+    # per-camera form of these two (see `@default_bbd`/`@default_oru`) —
+    # a *profiled* camera ignores them entirely, `stages` below superseding
+    # both (the load-time warning in `validate_tracking/2` says which wins).
     |> Map.put(:bbd, config.bbd)
-    # And no per-camera form of this one either (see `@default_oru`).
     |> Map.put(:oru, config.oru)
     |> Map.put(:track, cam.track)
     |> Map.put(:record, cam.record)
+    |> put_stages(profile)
   end
+
+  # The three bounds resolve camera → profile → global: a camera's own
+  # override outranks its group's profile (the operator spoke about *this*
+  # scene), and the profile's band-tuned defaults outrank the globals.
+  defp bound(camera, profile, global), do: camera || profile || global
+
+  # The whole of what a profile changes about tracking policy: the stage
+  # presence map replaces the boolean pair for every camera on the profiled
+  # group. Unprofiled cameras — and cameras on a profile that had no
+  # `tracking:` block, which said nothing about tracking — get no `stages`
+  # key at all, which is what keeps their path (through
+  # `Cairn.CameraTracker.tracking_policy/1` and `Cairn.Tracker.context/3`)
+  # the pre-profile one bit for bit.
+  defp put_stages(policy, nil), do: policy
+  defp put_stages(policy, %Profile{stages: nil}), do: policy
+  defp put_stages(policy, %Profile{stages: stages}), do: Map.put(policy, :stages, stages)
 
   @doc """
   The score `label` must reach to qualify for one tier, or `:excluded`.
@@ -480,6 +519,77 @@ defmodule Cairn.Config do
 
   defp resolve_camera_plugin(cam, acc, _names, _declared), do: {cam, acc}
 
+  # -- profiles ---------------------------------------------------------------
+
+  # Shipped profiles first, operator dirs after — `Profile.load_dirs/2` gives
+  # later files the name on a collision (with a warning), so an operator file
+  # shadows a shipped one. The shipped dir not existing is the normal state
+  # until built-in profiles land; nothing warns about it.
+  defp load_profiles(dirs, acc) do
+    case dirs do
+      nil ->
+        Profile.load_dirs([shipped_profiles_dir()], acc)
+
+      dirs when is_list(dirs) ->
+        if Enum.all?(dirs, &is_binary/1) do
+          Profile.load_dirs([shipped_profiles_dir() | dirs], acc)
+        else
+          {%{}, add_error(acc, "profile_dirs must be a list of directory paths")}
+        end
+
+      _other ->
+        {%{}, add_error(acc, "profile_dirs must be a list of directory paths")}
+    end
+  end
+
+  defp shipped_profiles_dir, do: Application.app_dir(:cairn, "priv/profiles")
+
+  # The second half of the two-pass shape `resolve_plugins/3` uses for camera
+  # plugin references: a group's `profile:` name becomes the parsed
+  # `Cairn.Config.Profile` struct, or (typo, missing file) a config error
+  # naming what was looked for.
+  defp resolve_profiles(config, acc) do
+    {groups, acc} =
+      Enum.map_reduce(config.plugin_groups, acc, fn
+        %PluginGroup{profile: name} = group, acc when is_binary(name) ->
+          case Map.fetch(config.profiles, name) do
+            {:ok, profile} ->
+              {%{group | profile: profile}, acc}
+
+            :error ->
+              {%{group | profile: nil},
+               add_error(
+                 acc,
+                 "plugin #{group.name}: unknown profile #{inspect(name)} — no such file " <>
+                   "in priv/profiles or any profile_dirs entry"
+               )}
+          end
+
+        group, acc ->
+          {group, acc}
+      end)
+
+    {%{config | plugin_groups: groups}, acc}
+  end
+
+  @doc """
+  The profile resolved for a camera's plugin group, or `nil` for a camera on
+  no group or on an unprofiled one.
+
+  This is the group→camera hop `policy/2` reads: cameras do not know their
+  group's profile, but they do know their group (`cam.plugin` is resolved to
+  `{:group, name}` at load), and the config holds the rest.
+  """
+  @spec profile_for(t(), Camera.t()) :: Profile.t() | nil
+  def profile_for(%__MODULE__{} = config, %Camera{plugin: {:group, name}}) do
+    case Enum.find(config.plugin_groups, &(&1.name == name)) do
+      %PluginGroup{profile: %Profile{} = profile} -> profile
+      _other -> nil
+    end
+  end
+
+  def profile_for(%__MODULE__{}, %Camera{}), do: nil
+
   defp resolve_members(%__MODULE__{udp_base_port: base} = config) when is_integer(base) do
     Enum.map(config.plugin_groups, &%{&1 | members: members_for(config, &1.name)})
   end
@@ -586,6 +696,57 @@ defmodule Cairn.Config do
     |> validate_tracking_key(config, :max_unseen_ms, 100, 3_600_000)
     |> validate_tracking_key(config, :max_live_tracks, 1, 10_000)
     |> validate_tracking_key(config, :stationary_after_ms, 1_000, 3_600_000)
+    |> validate_profile_bounds(config)
+    |> warn_superseded_flags(config)
+  end
+
+  # A profile's band-tuned bounds go through `bound/3` into the same tracker
+  # the global and camera values reach, so they answer to the same ranges —
+  # checked here rather than in `Profile.parse/3` so the numbers live in one
+  # place, beside the global checks they mirror.
+  defp validate_profile_bounds(acc, config) do
+    ranges = [
+      {:max_unseen_ms, 100, 3_600_000},
+      {:max_live_tracks, 1, 10_000},
+      {:stationary_after_ms, 1_000, 3_600_000}
+    ]
+
+    for {_name, profile} <- config.profiles, {key, min, max} <- ranges, reduce: acc do
+      acc ->
+        case Map.fetch!(profile, key) do
+          nil ->
+            acc
+
+          value when is_integer(value) and value >= min and value <= max ->
+            acc
+
+          value ->
+            add_error(
+              acc,
+              "profile #{profile.name}: tracking.#{key} must be an integer between " <>
+                "#{min} and #{max}, got #{inspect(value)}"
+            )
+        end
+    end
+  end
+
+  # D-P7: the global booleans keep working for cameras on unprofiled groups,
+  # a profiled group ignores them, and setting both is legal but ambiguous
+  # enough to name — one warning per profiled group, saying which side wins.
+  defp warn_superseded_flags(acc, config) do
+    if config.bbd or config.oru do
+      config.plugin_groups
+      |> Enum.filter(&match?(%Profile{}, &1.profile))
+      |> Enum.reduce(acc, fn group, acc ->
+        add_warning(
+          acc,
+          "plugin #{group.name}: profile #{group.profile.name} supersedes the global " <>
+            "tracking.bbd/oru flags for its cameras — the profile's stage list wins"
+        )
+      end)
+    else
+      acc
+    end
   end
 
   defp validate_tracking_key(acc, config, key, min, max) do
