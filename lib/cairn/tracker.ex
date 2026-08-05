@@ -165,6 +165,63 @@ defmodule Cairn.Tracker do
   prediction the next detection is matched against is the one the last
   *detection* left. Everything else about a seeded box is unchanged: it
   refreshes liveness, it moves `bbox`, and it is no more evidence than before.
+  It moves `bbox` to the same place, though — a seed re-reports the last
+  detected box byte for byte, the plugin replaying exactly what it emitted —
+  and the `tracking.oru` replay below anchors at `bbox` on the strength of
+  that: a plugin that ever seeded a *moved* box would silently break that
+  anchor, which is why verbatim re-reporting is an invariant here and not a
+  detail of the current plugin.
+
+  ## Rebuilding a filter across a gap: `tracking.oru`
+
+  A coast asserts the pre-gap heading for as long as it runs, and the longer it
+  runs the less that heading is worth. With `tracking.oru` on — off by default,
+  and with it off nothing below happens at all — a detection that closes a long
+  enough unmatched gap does not merely correct that coast: the filter is thrown
+  away and rebuilt from the last box the track was really observed at, replayed
+  across the gap against boxes interpolated towards the closing detection
+  (`Cairn.Tracker.Kalman.refit/3`, and its "Virtual observations" section for
+  what those boxes are). The re-detection's own predict-and-update is the last
+  step of that replay and is the ordinary matched step, unchanged.
+
+  A **virtual observation** is the inverse of a seed, and the inverse in the
+  one direction that matters here: a seed refreshes a track's liveness and
+  moves its box while leaving the filter alone, and a virtual point moves the
+  filter while leaving the track alone. It is never stored as `bbox`, moves no
+  clock (`last_seen_ms`, `last_matched_ms`, `last_detected_ms`), starts and
+  ends no still run, opens and closes no pending exit, produces no event,
+  reaches no summary and never leaves this process — the only thing that ever
+  sees one is the filter being replayed. What the closing detection does to the
+  track's box and clocks it does identically with the flag off; the only
+  difference is which filter its own step lands on.
+
+  Which is not to say nothing downstream can tell, and one thing deliberately
+  can. The stillness rule's drift is *read off the filter*, so the evaluation
+  that same closing detection makes reads the rebuilt filter rather than the
+  coasted one, and can therefore land on the other side of the floor — the
+  still run, and with it the flag, may go somewhere the coasted filter would
+  not have taken them. That is the intended consequence and not a leak: what a
+  coast tells the stillness rule about a gap is the heading the object had
+  before the gap opened, and being skeptical of exactly that is what the
+  rebuild is for.
+
+  The trigger is the **unmatched gap**, `at_ms - last_matched_ms`, and never a
+  seeded stretch — a seed refreshes `last_matched_ms` like any other match, so
+  a stretch the plugin was re-reporting through never opens a gap for this to
+  fire on. That is load-bearing rather than incidental: through a seeded
+  stretch the plugin's own account is that the object did not move and the
+  filter is deliberately held, so replaying synthesized motion across one would
+  manufacture the very velocity the stillness rule reads to decide the object
+  is parked.
+
+  What the replay is anchored on is the track's stored `bbox`, and one
+  invariant makes that the last *detected* box rather than merely the last
+  observed one: a seed re-reports the box it re-reports **byte for byte**
+  (`cairn-detect` remembers each emitted detection by value and changes only
+  its observation kind). A plugin that seeded a box it had *moved* would
+  therefore not only mislead liveness — it would put a box no detector produced
+  at one end of an interpolation, and the replay would learn motion nothing
+  ever saw. It belongs with the other seed invariants above for that reason.
 
   ## A second admission: `tracking.bbd`
 
@@ -293,8 +350,10 @@ defmodule Cairn.Tracker do
   gap and no geometry survives it; a car that drove off and was replaced by
   another inside `@stitch_iou` of its space keeps the flag until the new
   occupant moves. Restoring that evidence is what an association that reasons
-  about observation gaps (OC-SORT's re-update) would be for, and it is not in
-  this tracker yet.
+  about observation gaps (OC-SORT's re-update) is for. `tracking.oru` is that
+  machinery, and today it stops short of here: the replay runs only for a
+  track whose own filter coasted through the gap, so the adopting detection
+  re-seeds, as below.
 
   What the adoption does buy unconditionally is that the settle window does not
   re-arm: a resumed track is stationary from its first detection instead of
@@ -647,6 +706,35 @@ defmodule Cairn.Tracker do
   # pathological case and not the
   # rule, so it is lax enough that nothing observed normally can reach it.
   @refusal_factor 10
+  # `tracking.oru`'s three numbers, all of them conversions between an elapsed
+  # time and a count of filter steps.
+  #
+  # The nominal batch cadence. `Cairn.Tracker.Kalman` has no notion of duration
+  # — one `predict/1` is one step whatever separated the two batches — so a gap
+  # measured in milliseconds can only be re-expressed as the step count a replay
+  # needs against an assumed cadence, and this is it. Two batches a second is
+  # what an inference loop on a live camera runs at and what the test suite's
+  # own `@batch_ms` encodes. A camera slower than this replays more steps than
+  # its gap really had and learns a per-step velocity proportionally short of
+  # the object's real per-batch pace — an under-estimate, which is the direction
+  # to be wrong in for a mechanism whose whole purpose is to stop a stale
+  # heading being asserted with confidence.
+  @oru_step_ms 500
+  # The gap a re-detection must have opened before its track's filter is rebuilt
+  # across it rather than corrected through it. Under a second — two batches at
+  # the cadence above — a coasted filter is still close to what it last
+  # measured, and rebuilding would discard a real velocity history in exchange
+  # for a two-point interpolation of the same motion.
+  @oru_min_gap_ms 1_000
+  # And the gap past which the interpolation is worth no more than the coast it
+  # would replace. About twenty steps at the cadence above: a straight line
+  # drawn between two sightings that far apart is asserting a heading through a
+  # stretch long enough for the object to have turned around in, which is
+  # unpublished territory — OC-SORT's own guidance for its re-update stops
+  # around twenty missed frames. Past this the coasted filter is left exactly as
+  # it is and the ordinary matched step runs on it, which is what happens with
+  # the flag off too.
+  @oru_max_gap_ms 10_000
   # Warnings here fire from the per-observation path, and an observation is a
   # per-line primitive: unrate-limited they are a log-flood of their own.
   # Measured on the observation clock like everything else here, which in
@@ -699,9 +787,10 @@ defmodule Cairn.Tracker do
   @typedoc """
   Everything about the observation the tracker needs, and nothing else.
 
-  The two optional keys are the two the code reads with `Map.get/2`: a caller
-  may build a context without them — `context/3` always writes both — and
-  absence means the same as their defaults, no floor and no second admission.
+  The three optional keys are the three the code reads with `Map.get/2`: a
+  caller may build a context without them — `context/3` always writes all
+  three — and absence means the same as their defaults, no floor, no second
+  admission and no gap replay.
   """
   @type context :: %{
           :camera_id => String.t() | nil,
@@ -712,7 +801,8 @@ defmodule Cairn.Tracker do
           :max_live_tracks => pos_integer(),
           :stationary_after_ms => pos_integer(),
           optional(:min_score) => floors() | nil,
-          optional(:bbd) => boolean()
+          optional(:bbd) => boolean(),
+          optional(:oru) => boolean()
         }
 
   @typedoc "The host-side tracking policy for one camera."
@@ -721,7 +811,8 @@ defmodule Cairn.Tracker do
           :max_live_tracks => pos_integer(),
           :stationary_after_ms => pos_integer(),
           optional(:min_score) => floors() | nil,
-          optional(:bbd) => boolean()
+          optional(:bbd) => boolean(),
+          optional(:oru) => boolean()
         }
 
   @type event ::
@@ -756,6 +847,10 @@ defmodule Cairn.Tracker do
   is repeated here rather than read from `Cairn.Config` because this module is
   pure and depends on nothing; `Cairn.Config`'s `@default_bbd` is the one an
   operator's config is resolved against.
+
+  `oru` is optional on the same terms and defaults to off: with no flag every
+  track's filter is corrected through a gap rather than rebuilt across it, as
+  described under "Rebuilding a filter across a gap" in the moduledoc.
   """
   @spec context(Observation.t(), String.t(), policy()) :: context()
   def context(%Observation{} = observation, camera_id, policy) do
@@ -768,7 +863,8 @@ defmodule Cairn.Tracker do
       max_live_tracks: policy.max_live_tracks,
       stationary_after_ms: policy.stationary_after_ms,
       min_score: Map.get(policy, :min_score),
-      bbd: Map.get(policy, :bbd, false)
+      bbd: Map.get(policy, :bbd, false),
+      oru: Map.get(policy, :oru, false)
     }
   end
 
@@ -1382,8 +1478,11 @@ defmodule Cairn.Tracker do
   # the gap, the tracker has no anchor left to say the object is somewhere else,
   # and the ordinary rule takes over from the second detection on. It is also
   # the one place this rule is weaker than the geometry it replaced, and the
-  # place where an observation-gap-aware association (OC-SORT's re-update)
-  # would put the evidence back.
+  # place an observation-gap-aware association (OC-SORT's re-update) would put
+  # the evidence back. `tracking.oru`'s replay does not run here today —
+  # `replayed/4` passes a filterless track through untouched — so the adopting
+  # detection re-seeds from zero velocity exactly as it did before the flag
+  # existed.
   #
   # `pending_exit_ms` is cleared for the same reason the run restarts: an exit
   # window is a claim about an *unbroken run of observations*, and the cut is a
@@ -1798,7 +1897,7 @@ defmodule Cairn.Tracker do
         last_matched_ms: context.at_ms,
         last_detected_at: if(detected?, do: context.observed_at, else: tracked.last_detected_at),
         last_detected_ms: if(detected?, do: context.at_ms, else: tracked.last_detected_ms),
-        kalman: advance(tracked.kalman, object, detected?)
+        kalman: tracked |> replayed(object, detected?, context) |> advance(object, detected?)
     }
     |> stillness(object, detected?, previous_detected_ms, context)
     |> stale(context)
@@ -1823,12 +1922,66 @@ defmodule Cairn.Tracker do
   defp advance(nil, object, true), do: Kalman.init(object.bbox)
   defp advance(kalman, object, true), do: kalman |> Kalman.predict() |> Kalman.update(object.bbox)
 
+  # The filter `advance/3` then takes its one step on: the track's own, unless
+  # `tracking.oru` is on and this detection closed a gap long enough that what
+  # the coast has been asserting through it is not worth correcting. In that
+  # case the coasted filter is dropped and rebuilt across the gap from the last
+  # box the track was really observed at, against virtual observations
+  # interpolated towards this detection (`Cairn.Tracker.Kalman.refit/3`).
+  #
+  # `refit/3` deliberately stops one step short of the target, and the step it
+  # stops short of is the `advance/3` above — so nothing here predicts, and the
+  # closing detection is counted exactly once. Both ends of every interpolation
+  # are real boxes a detector produced: `bbox` is the last of them (a seed
+  # re-reports its box verbatim, so a seeded stretch cannot have moved it) and
+  # `object.bbox` is this batch's own, which is what `detected?` gates on.
+  #
+  # The gap is measured from `last_matched_ms`, which is what keeps a seeded
+  # stretch out of this altogether — see the moduledoc: a seed refreshes that clock, so no gap
+  # opens across a stretch the plugin was re-reporting through, and the motion
+  # this would otherwise synthesize is motion the plugin's own account says did
+  # not happen.
+  #
+  # A track with no filter is left without one for `advance/3` to seed from
+  # this box. That is `revive/3`'s adoption case, where the gap spans a stream
+  # reset: there is no coast to be skeptical of there, and today the replay
+  # runs only where one is.
+  defp replayed(%{kalman: nil}, _object, _detected?, _context), do: nil
+
+  defp replayed(tracked, object, detected?, context) do
+    gap = context.at_ms - tracked.last_matched_ms
+
+    if detected? and Map.get(context, :oru, false) and gap >= @oru_min_gap_ms and
+         gap <= @oru_max_gap_ms do
+      Kalman.refit(tracked.bbox, object.bbox, gap_steps(gap))
+    else
+      tracked.kalman
+    end
+  end
+
+  # The gap as a count of filter steps, at the nominal cadence.
+  #
+  # The floor of two is what makes the replay a replay: `refit/3` at one step
+  # has no interior to interpolate and degenerates to a bare re-init from the
+  # anchor, which would throw the coasted filter away and put nothing measured
+  # in its place. The ceiling is `@oru_max_gap_ms` restated in steps. At today's
+  # three constants neither bound can bind — the window's own endpoints are
+  # exactly 2 and 20 steps — and they are here so that tuning the window can
+  # never hand `refit/3` a degenerate count.
+  defp gap_steps(gap), do: (gap / @oru_step_ms) |> round() |> max(2) |> min(20)
+
   # One step of every live track's filter that this batch neither observed nor
   # minted: the coast, and the reason an unmatched track's prediction keeps
   # moving instead of freezing where it was last seen. Exactly once per batch,
   # which is what `apply_assignments/5`'s touched set buys — a track this batch
   # matched has already been stepped by `advance/3`, and stepping it again here
   # would tell the filter the object had moved twice as far as it did.
+  #
+  # With `tracking.oru` on, a long coast may not outlive the detection that ends
+  # it: `replayed/4` discards the coasted filter and rebuilds it across the gap.
+  # That takes nothing away from the steps here, which have already done the one
+  # job they are for by then — being the prediction this batch's detections were
+  # matched against.
   #
   # A track with no filter stays without one until a detection re-seeds it.
   # There is nothing to coast, and inventing a filter from a stored box on a

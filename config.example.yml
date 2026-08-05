@@ -38,7 +38,7 @@ events:
   max_event_seconds: 300
 
 # Object tracking (the three bounds here are per-camera overridable under the
-# camera; bbd is not).
+# camera; bbd and oru are not).
 # A track that goes unseen for this much *stream* time is ended — five times
 # that while it is stationary, so a parked object outlasts what parks in front
 # of it; its object_id (a ULID) is never handed to anything else.
@@ -59,11 +59,20 @@ events:
 # a track will answer to is also how an identity goes to the wrong object; a
 # stationary track is excluded from it outright, so a parked identity behaves
 # the same either way.
+# oru changes what a track's motion filter believes after a gap: instead of
+# correcting the heading it was coasting on, the filter is rebuilt from the two
+# real boxes either side of the gap and replayed across it, so what it comes out
+# believing is where the object actually went rather than where it was going
+# before it vanished. Only gaps between one and ten seconds qualify — under
+# that the coast is still close to what it measured, over it a straight line
+# between two sightings is a guess of its own — and a stretch the plugin is
+# re-reporting a still object through is never one of them. Off by default.
 tracking:
   max_unseen_ms: 3000
   max_live_tracks: 128
   stationary_after_ms: 10000
   bbd: false
+  oru: false
 
 # Days to keep event clips; per-label overrides win. Track rows keep their own
 # clock (tracks_days) and are exempt from emergency disk cleanup.

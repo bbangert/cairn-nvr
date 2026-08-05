@@ -66,6 +66,7 @@ See `config.example.yml` — every key is documented inline. Summary:
 | `events.pre/post/max_*_seconds` | clip windows (per-camera overridable) |
 | `tracking.max_unseen_ms` / `tracking.max_live_tracks` / `tracking.stationary_after_ms` | track expiry in stream time (×5 while stationary), per-camera live-track cap, and how long a box must hold still to count as parked (per-camera overridable) |
 | `tracking.bbd` | admit an association pair on the distance between the boxes' centres as well as on overlap, so a track coasting through a gap wider than its own box keeps its identity (default off; global only; stationary tracks excluded) |
+| `tracking.oru` | rebuild a track's motion filter across an unmatched gap of 1–10 s, replaying it between the two real boxes either side, so a re-detection leaves the filter believing where the object went rather than where it was heading before it vanished (default off; global only; never fires across a seeded stretch) |
 | `retention.days` / `retention.per_label` | pruning (camera overrides win; multi-label events keep the longest) |
 | `retention.tracks_days` | how long track rows live (default 365; global only, and exempt from emergency cleanup) |
 | `cameras[]` | `id`, `rtsp_url`, `plugin` (argv or multi-word string ⇒ its own process; single token ⇒ a `plugins:` group name), `min_score` per label (the wire floor), `track` / `record` (the two host-side tiers above it: what earns a track row, what earns video), `extra_ffmpeg_args`, `transcode`, `retention` |

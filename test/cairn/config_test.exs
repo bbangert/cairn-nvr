@@ -204,6 +204,34 @@ defmodule Cairn.ConfigTest do
       end
     end
 
+    test "tracking.oru is a known key, off unless set, and reaches the policy" do
+      {:ok, defaults, []} = Config.from_map(base_map())
+      [cam_a, _cam_b] = defaults.cameras
+      refute defaults.oru
+      refute Config.default_oru()
+      refute Config.policy(defaults, cam_a).oru
+
+      {:ok, config, warnings} =
+        base_map() |> Map.put("tracking", %{"oru" => true}) |> Config.from_map()
+
+      [cam_a, cam_b] = config.cameras
+      refute Enum.any?(warnings, &(&1 =~ "oru"))
+
+      # every camera or none: the motion filter is one decision for the fleet,
+      # so unlike the three bounds beside it there is no per-camera form of it
+      assert Config.policy(config, cam_a).oru
+      assert Config.policy(config, cam_b).oru
+
+      # an explicit off is off whatever the default says, and a truthy
+      # non-boolean is a typo rather than an opt-in — only `true` enables
+      for {value, name} <- [{false, "explicit false"}, {"true", "a string"}, {1, "an integer"}] do
+        {:ok, config, _warnings} =
+          base_map() |> Map.put("tracking", %{"oru" => value}) |> Config.from_map()
+
+        refute config.oru, name
+      end
+    end
+
     test "retention.tracks_days defaults to a year and parses" do
       assert {:ok, default, []} = Config.from_map(base_map())
       assert default.retention_tracks_days == 365
@@ -834,6 +862,7 @@ defmodule Cairn.ConfigTest do
                max_live_tracks: 128,
                stationary_after_ms: 10_000,
                bbd: false,
+               oru: false,
                track: nil,
                record: nil
              }

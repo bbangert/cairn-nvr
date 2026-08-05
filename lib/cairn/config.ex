@@ -21,7 +21,7 @@ defmodule Cairn.Config do
   @known_events_keys ~w(pre_window_seconds post_window_seconds max_event_seconds)
   @known_retention_keys ~w(days per_label tracks_days)
   @known_integrations_keys ~w(token)
-  @known_tracking_keys ~w(max_unseen_ms max_live_tracks stationary_after_ms bbd)
+  @known_tracking_keys ~w(max_unseen_ms max_live_tracks stationary_after_ms bbd oru)
   @name_regex ~r/\A[a-z0-9][a-z0-9_-]*\z/
 
   # How long a track survives without being seen, in *media* time. Long
@@ -67,6 +67,19 @@ defmodule Cairn.Config do
   # cameras associate one way and half the other is not a thing an operator can
   # reason about or a soak can read.
   @default_bbd false
+  # Whether a track's motion filter is rebuilt across an unmatched gap, from
+  # the two real boxes that bound it, instead of being corrected through it
+  # (`Cairn.Tracker`'s "Rebuilding a filter across a gap"). Off by default: it
+  # replaces a velocity history the filter measured with an interpolation
+  # between two sightings, which is the better reading only for as long as the
+  # gap is one the pre-gap heading really has nothing to say about, so it is
+  # opt-in until soak measurement says otherwise.
+  #
+  # Global only, for the reason `@default_bbd` is: this is a rollout switch on
+  # the motion filter itself rather than a description of a scene, and a fleet
+  # where half the cameras rebuild and half coast is not a thing an operator can
+  # reason about or a soak can read.
+  @default_oru false
   # How long track rows outlive the clips they describe. Deliberately far
   # longer than `retention_days`: the track log is the instrument for tuning
   # the filters, and a year of "what did the system see and not record?" is the
@@ -91,6 +104,7 @@ defmodule Cairn.Config do
             max_live_tracks: @default_max_live_tracks,
             stationary_after_ms: @default_stationary_after_ms,
             bbd: @default_bbd,
+            oru: @default_oru,
             cameras: [],
             plugin_groups: [],
             ha_token: nil
@@ -184,6 +198,7 @@ defmodule Cairn.Config do
       max_live_tracks: configured_max_live_tracks(map),
       stationary_after_ms: configured_stationary_after_ms(map),
       bbd: configured_bbd(map),
+      oru: configured_oru(map),
       cameras: cameras,
       plugin_groups: plugin_groups,
       ha_token: get_in(map, ["integrations", "token"])
@@ -228,6 +243,17 @@ defmodule Cairn.Config do
     end
   end
 
+  # Not `||`, on the same rule as `configured_bbd/1`: a boolean key has to read
+  # an explicit `false` as a value rather than as an absence, and only a literal
+  # `true` may rebuild anything — a truthy non-boolean in the YAML is a typo,
+  # not an opt-in.
+  defp configured_oru(map) do
+    case get_in(map, ["tracking", "oru"]) do
+      nil -> @default_oru
+      value -> value === true
+    end
+  end
+
   # Global only: one clock for the whole track log, with none of the
   # per-camera or per-label forms `retention.days` has. Those exist to buy disk
   # back on clips. Splitting the audit record by label instead would make "what
@@ -261,6 +287,7 @@ defmodule Cairn.Config do
           max_live_tracks: pos_integer(),
           stationary_after_ms: pos_integer(),
           bbd: boolean(),
+          oru: boolean(),
           track: Camera.tier() | nil,
           record: Camera.tier() | nil
         }
@@ -273,6 +300,8 @@ defmodule Cairn.Config do
     # Straight off the config and not through a `cam` reader: there is no
     # per-camera form of this one (see `@default_bbd`).
     |> Map.put(:bbd, config.bbd)
+    # And no per-camera form of this one either (see `@default_oru`).
+    |> Map.put(:oru, config.oru)
     |> Map.put(:track, cam.track)
     |> Map.put(:record, cam.record)
   end
@@ -351,6 +380,10 @@ defmodule Cairn.Config do
   @doc "Whether BBD admission is on when no config is available."
   @spec default_bbd() :: boolean()
   def default_bbd, do: @default_bbd
+
+  @doc "Whether gap replay is on when no config is available."
+  @spec default_oru() :: boolean()
+  def default_oru, do: @default_oru
 
   @doc "Effective retention days for a camera and label."
   @spec retention_days(t(), Camera.t(), String.t()) :: pos_integer()
