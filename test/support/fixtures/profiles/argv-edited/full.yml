@@ -1,0 +1,13 @@
+# `argv/full.yml` with one field edited: same profile name, different
+# expansion, which is what the group restart diff has to notice.
+backend: ort
+model:
+  onnx: test/support/fixtures/models/stub.onnx
+model_profile: yolox
+input_size: 640
+decoder: auto
+labels: test/support/fixtures/models/stub.names
+fps_band: [4, 8]
+tracking:
+  bbd: true
+  twin_mint: true

@@ -1,13 +1,14 @@
-# A full profile exercising every schema field (backend stubbed until Phase 6).
+# A full profile exercising every schema field (backend stubbed until Phase 6,
+# so a group running this one has to set allow_experimental: true).
 name: rk-test
 experimental: true
 backend: rknn
 model:
-  rknn: models/yolox.rknn
+  rknn: test/support/fixtures/models/stub.rknn
 model_profile: yolox
 input_size: 416
 decoder: auto
-labels: models/coco.names
+labels: test/support/fixtures/models/stub.names
 fps_band: [2, 4]
 tracking:
   bbd: true

@@ -5,8 +5,9 @@ defmodule Cairn.PluginGroupSupervisor do
   A group is a single process, so it sits directly under this supervisor.
   Only groups with members are started — a group nothing references has
   nothing to serve. `sync/1` reconciles running groups against a config;
-  `apply_diff/2` applies a reload diff, restarting groups whose command or
-  membership (ids, ports, score floors) changed.
+  `apply_diff/2` applies a reload diff, restarting groups whose command (a
+  profile's model flags included, expanded into it at config load), profile
+  or membership (ids, ports, score floors) changed.
   """
 
   use DynamicSupervisor

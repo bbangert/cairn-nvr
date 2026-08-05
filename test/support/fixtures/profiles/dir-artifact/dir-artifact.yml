@@ -1,0 +1,5 @@
+# Names its own directory as the artifact: exists on disk, but is not a
+# regular file.
+backend: ort
+model:
+  onnx: test/support/fixtures/profiles/dir-artifact

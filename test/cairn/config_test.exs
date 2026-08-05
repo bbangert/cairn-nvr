@@ -814,10 +814,14 @@ defmodule Cairn.ConfigTest do
     @shadow_dir "test/support/fixtures/profiles/shadow"
     @bad_dir "test/support/fixtures/profiles/bad"
 
+    # `rk-test` is an experimental rknn profile, so the group acknowledges the
+    # stubbed backend; an ort profile ignores the key.
     defp profiled_map(profile \\ "rk-test") do
       base_map()
       |> Map.put("profile_dirs", [@profiles_dir])
-      |> Map.put("plugins", %{"det" => %{"command" => "./p", "profile" => profile}})
+      |> Map.put("plugins", %{
+        "det" => %{"command" => "./p", "profile" => profile, "allow_experimental" => true}
+      })
       |> put_plugin(0, "det")
     end
 
@@ -867,6 +871,46 @@ defmodule Cairn.ConfigTest do
 
       assert {:error, errors} = Config.from_map(map)
       assert Enum.any?(errors, &(&1 =~ "does not match its filename"))
+    end
+
+    @bad_types_dir "test/support/fixtures/profiles/bad-types"
+
+    test "model: as a scalar fails with 'model must be a mapping'" do
+      map = Map.put(base_map(), "profile_dirs", [@bad_types_dir])
+
+      assert {:error, errors} = Config.from_map(map)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~
+                   "profile model-string: model must be a mapping of per-backend " <>
+                     "artifact paths")
+             )
+    end
+
+    test "a non-string model leaf fails with 'model.<key> must be a path string'" do
+      map = Map.put(base_map(), "profile_dirs", [@bad_types_dir])
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "profile model-leaf: model.onnx must be a path string"))
+    end
+
+    test "a non-string labels: fails with 'labels must be a string'" do
+      map = Map.put(base_map(), "profile_dirs", [@bad_types_dir])
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "profile labels-type: labels must be a string"))
+    end
+
+    test "experimental: as a non-boolean fails with 'must be true or false'" do
+      map = Map.put(base_map(), "profile_dirs", [@bad_types_dir])
+
+      assert {:error, errors} = Config.from_map(map)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "profile experimental-type: experimental must be true or false")
+             )
     end
 
     test "a profile with no tracking block leaves the boolean path standing" do
@@ -936,6 +980,208 @@ defmodule Cairn.ConfigTest do
                warnings,
                &(&1 =~ "profile rk-test supersedes the global tracking.bbd/oru")
              )
+    end
+  end
+
+  describe "profile argv expansion" do
+    @argv_dir "test/support/fixtures/profiles/argv"
+    @no_artifact_dir "test/support/fixtures/profiles/no-artifact"
+    @stub_onnx "test/support/fixtures/models/stub.onnx"
+    @stub_names "test/support/fixtures/models/stub.names"
+
+    defp argv_map(profile, group \\ %{}, dir \\ @argv_dir) do
+      base_map()
+      |> Map.put("profile_dirs", [dir])
+      |> Map.put("plugins", %{
+        "det" => Map.merge(%{"command" => "./p", "profile" => profile}, group)
+      })
+      |> put_plugin(0, "det")
+    end
+
+    defp command!(map) do
+      assert {:ok, config, _warnings} = Config.from_map(map)
+      [%{command: command}] = config.plugin_groups
+      command
+    end
+
+    test "a full profile expands to every model flag, after the operator's argv" do
+      assert command!(argv_map("full")) == [
+               "./p",
+               "--model",
+               @stub_onnx,
+               "--model-profile",
+               "yolox",
+               "--input-size",
+               "416",
+               "--decoder",
+               "auto",
+               "--labels",
+               @stub_names
+             ]
+    end
+
+    test "a partial profile emits only the flags it set" do
+      assert command!(argv_map("partial")) == ["./p", "--model", @stub_onnx]
+    end
+
+    test "the expansion follows the operator's own flags" do
+      map = argv_map("partial", %{"command" => ["./p", "--motion-json", "{}"]})
+
+      assert command!(map) == ["./p", "--motion-json", "{}", "--model", @stub_onnx]
+    end
+
+    test "an unprofiled group's command is left alone, model flags and all" do
+      map =
+        base_map()
+        |> Map.put("plugins", %{"det" => %{"command" => "./p --model m.onnx --input-size 416"}})
+        |> put_plugin(0, "det")
+
+      assert command!(map) == ["./p", "--model", "m.onnx", "--input-size", "416"]
+    end
+
+    test "a profiled group carrying a model flag itself fails the load (D-P4)" do
+      map = argv_map("partial", %{"command" => "./p --input-size 416"})
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "plugin det: command carries --input-size"))
+      assert Enum.any?(errors, &(&1 =~ "which profile partial owns"))
+    end
+
+    test "the D-P4 check sees the --flag=value form too" do
+      map = argv_map("partial", %{"command" => ["./p", "--labels=coco.names"]})
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "command carries --labels"))
+    end
+
+    test "the D-P4 check sees a flag embedded in a shell-wrapped composite token" do
+      map =
+        argv_map("partial", %{
+          "command" => ["/bin/sh", "-c", "exec cairn-detect --model /opt/m.onnx"]
+        })
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "plugin det: command carries --model"))
+    end
+
+    test "a flag string embedded mid-path does not trip D-P4" do
+      map = argv_map("partial", %{"command" => ["./p", "/opt/--model/x"]})
+
+      assert {:ok, _config, _warnings} = Config.from_map(map)
+    end
+
+    test "the D-P4 boundary match does not bleed --model into a --model-profile-only command" do
+      map = argv_map("partial", %{"command" => ["./p", "--model-profile"]})
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.count(errors, &(&1 =~ "command carries")) == 1
+      assert Enum.any?(errors, &(&1 =~ "command carries --model-profile"))
+    end
+
+    test "the operator's own JSON flags are not model flags (D-P6)" do
+      map =
+        argv_map("partial", %{
+          "command" => ["./p", "--motion-json", "{}", "--track-floor-json", "{}"]
+        })
+
+      assert command!(map) == [
+               "./p",
+               "--motion-json",
+               "{}",
+               "--track-floor-json",
+               "{}",
+               "--model",
+               @stub_onnx
+             ]
+    end
+
+    test "a model artifact that is not on disk fails the load, naming both" do
+      map = argv_map("gone", %{}, @no_artifact_dir)
+
+      assert {:error, errors} = Config.from_map(map)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~
+                   "profile gone: model artifact test/support/fixtures/models/not-here.onnx " <>
+                     "does not exist")
+             )
+    end
+
+    test "a profile naming no artifact for its backend fails the load" do
+      map = argv_map("unnamed", %{}, @no_artifact_dir)
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "profile unnamed names no model.onnx artifact"))
+    end
+
+    test "an artifact path that is a directory fails with 'not a regular file'" do
+      dir = "test/support/fixtures/profiles/dir-artifact"
+      map = argv_map("dir-artifact", %{}, dir)
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "does not exist or is not a regular file"))
+    end
+
+    test "an unreferenced profile's artifact is not checked" do
+      # Loaded, parsed, never attached to a group: the shipped dir will hold
+      # board profiles for hardware this node does not have.
+      map = Map.put(base_map(), "profile_dirs", [@no_artifact_dir])
+
+      assert {:ok, config, _warnings} = Config.from_map(map)
+      assert Map.has_key?(config.profiles, "gone")
+    end
+
+    test "a stubbed backend is refused for the group that runs it" do
+      map = argv_map("stable-rknn", %{"allow_experimental" => true})
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "uses backend rknn, which is not yet implemented"))
+      assert Enum.any?(errors, &(&1 =~ "must declare experimental: true"))
+    end
+
+    test "an experimental profile still needs the group's acknowledgement" do
+      map =
+        base_map()
+        |> Map.put("profile_dirs", ["test/support/fixtures/profiles/valid"])
+        |> Map.put("plugins", %{"det" => %{"command" => "./p", "profile" => "rk-test"}})
+        |> put_plugin(0, "det")
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "set allow_experimental: true on this plugin group"))
+    end
+
+    test "both halves of the acknowledgement load, and expand" do
+      map =
+        base_map()
+        |> Map.put("profile_dirs", ["test/support/fixtures/profiles/valid"])
+        |> Map.put("plugins", %{
+          "det" => %{"command" => "./p", "profile" => "rk-test", "allow_experimental" => true}
+        })
+        |> put_plugin(0, "det")
+
+      # `--model` comes from the rknn artifact, not the onnx one: the backend
+      # picks the key.
+      assert command!(map) == [
+               "./p",
+               "--model",
+               "test/support/fixtures/models/stub.rknn",
+               "--model-profile",
+               "yolox",
+               "--input-size",
+               "416",
+               "--decoder",
+               "auto",
+               "--labels",
+               @stub_names
+             ]
+    end
+
+    test "allow_experimental must be a boolean" do
+      map = argv_map("partial", %{"allow_experimental" => "yes"})
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "plugin det: allow_experimental must be true or false"))
     end
   end
 

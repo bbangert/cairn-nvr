@@ -1,1 +1,3 @@
 backend: ort
+model:
+  onnx: test/support/fixtures/models/stub.onnx

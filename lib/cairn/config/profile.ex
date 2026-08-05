@@ -7,11 +7,14 @@ defmodule Cairn.Config.Profile do
   A profile is **data composing curated code**, not free knob tuning: every
   field names something that already exists — a Rust model family, a
   backend, a tracker stage. What config load enforces *today* is the shape
-  of that naming: unknown keys, unknown backends, malformed bands and
-  illegal stage compositions are rejected here; artifact-exists checks,
-  the experimental acknowledgement for stubbed backends, and catalog
-  validation of `model_profile`/`decoder`/`labels` land with the argv
-  expansion (plan phase 5) and the capability table (phase 7).
+  of that naming: unknown keys, unknown backends, malformed bands, illegal
+  stage compositions, and the type of every field the model half reads
+  (`model:` a mapping of path strings, `model_profile:`/`decoder:`/`labels:`
+  strings, `experimental:` a boolean) are rejected here, and `Cairn.Config`
+  rejects a profiled group whose artifact is missing or whose backend is
+  stubbed (see "Rust argv" below); catalog validation of
+  `model_profile`/`decoder`/`labels` against the plugin's own menus lands
+  with the capability table (plan phase 7).
   Profiles are files, never inline config: shipped ones live
   in `priv/profiles/*.yml`, operator ones in the directories the top-level
   `profile_dirs:` key lists, and an operator file wins a name collision with
@@ -22,7 +25,7 @@ defmodule Cairn.Config.Profile do
   ```yaml
   # priv/profiles/generic-ort.yml
   name: generic-ort          # optional; must match the filename when present
-  experimental: false        # will gate stubbed backends at group start (phase 5)
+  experimental: false        # true before any group may run a stubbed backend
   backend: ort               # ort | rknn | qnn — only ort executes today
   model:                     # per-backend artifact paths
     onnx: models/yolox_nano.onnx
@@ -50,6 +53,24 @@ defmodule Cairn.Config.Profile do
   (`Cairn.Tracker.Stage.validate_lists/1`) — an illegal composition fails
   the config load, since the tracker has no error channel.
 
+  ## Rust argv
+
+  The model half of the file is materialised into the group's `command` at
+  config load (`Cairn.Config`), one flag per field the profile actually
+  sets: `--model` (the `model:` entry for this profile's own backend),
+  `--model-profile`, `--input-size`, `--decoder`, `--labels`. An unset field
+  emits no flag, leaving the plugin's own default or its sniffing in force.
+  Because the profile is the **single source** of those five (D-P4), a
+  profiled group whose `command:` already names one fails the load;
+  `--motion-json` and `--track-floor-json` are not on that list and stay
+  operator-owned (D-P6).
+
+  Two things `Cairn.Config` refuses at load rather than at group start,
+  which is where an operator reads diagnostics: a `model:` artifact that is
+  not on disk, and a group running a backend other than `ort` — stubbed
+  until the Rust backend trait lands (D-P10) — unless the profile declares
+  `experimental: true` *and* the group sets `allow_experimental: true`.
+
   Parsed on `Cairn.Config`'s `add_error/2`/`add_warning/2` contract like
   its `Camera`/`PluginGroup` siblings.
   """
@@ -60,8 +81,14 @@ defmodule Cairn.Config.Profile do
   @known_keys ~w(name experimental backend model model_profile input_size decoder labels
                  fps_band tracking)
   @known_tracking_keys ~w(bbd oru twin_mint max_unseen_ms max_live_tracks stationary_after_ms)
-  @backends ~w(ort rknn qnn)
-  @known_model_keys ~w(onnx rknn)
+  # Each backend paired with the `model:` key naming its compiled artifact:
+  # backends consume different formats (prior-art §1), so a profile ships one
+  # artifact per backend and the profile's own backend picks which path
+  # becomes `--model`. Derived rather than repeated so a backend cannot be
+  # added to one list and forgotten in the other.
+  @backend_artifacts %{"ort" => "onnx", "rknn" => "rknn", "qnn" => "qnn"}
+  @backends Map.keys(@backend_artifacts)
+  @known_model_keys Map.values(@backend_artifacts)
   @stage_modules %{
     "bbd" => {:bbd, Stage.Bbd},
     "oru" => {:oru, Stage.Oru},
@@ -87,6 +114,25 @@ defmodule Cairn.Config.Profile do
             stationary_after_ms: nil
 
   @type t :: %__MODULE__{}
+
+  @doc """
+  The `model:` key naming `backend`'s compiled artifact — the one this
+  profile's `--model` is read from.
+  """
+  @spec artifact_key(String.t()) :: String.t()
+  def artifact_key(backend), do: Map.fetch!(@backend_artifacts, backend)
+
+  @doc """
+  The model artifact path this profile names for its own backend, or `nil`
+  when it names none.
+
+  Verbatim, not resolved: the path is handed to the plugin process as
+  `--model` and read there, so anything that rewrote it here would check one
+  file and pass the plugin another.
+  """
+  @spec artifact(t()) :: String.t() | nil
+  def artifact(%__MODULE__{backend: backend, model: model}),
+    do: Map.get(model, artifact_key(backend))
 
   @doc """
   Loads every `*.yml` under the shipped dir and the operator dirs into a
@@ -165,6 +211,11 @@ defmodule Cairn.Config.Profile do
       |> check_pos_int(raw, "input_size", name)
       |> check_fps_band(raw, name)
       |> check_tracking(raw, name)
+      |> check_model(raw, name)
+      |> check_string(raw, "model_profile", name)
+      |> check_string(raw, "decoder", name)
+      |> check_string(raw, "labels", name)
+      |> check_experimental(raw, name)
 
     if length(acc.errors) > errors_before do
       {nil, acc}
@@ -173,7 +224,7 @@ defmodule Cairn.Config.Profile do
 
       profile = %__MODULE__{
         name: name,
-        experimental: Map.get(raw, "experimental") === true,
+        experimental: Map.get(raw, "experimental") || false,
         backend: Map.get(raw, "backend", "ort"),
         model: Map.get(raw, "model") || %{},
         model_profile: Map.get(raw, "model_profile"),
@@ -270,8 +321,17 @@ defmodule Cairn.Config.Profile do
       other ->
         Config.add_error(
           acc,
-          "profile #{name}: unknown backend #{inspect(other)} (ort, rknn or qnn)"
+          "profile #{name}: unknown backend #{inspect(other)} (#{natural_list(@backends)})"
         )
+    end
+  end
+
+  # "a, b or c" — enumerated from `@backends` rather than hand-written so a
+  # backend added to `@backend_artifacts` can't be forgotten in the message.
+  defp natural_list(list) do
+    case Enum.sort(list) do
+      [single] -> single
+      sorted -> "#{sorted |> Enum.drop(-1) |> Enum.join(", ")} or #{List.last(sorted)}"
     end
   end
 
@@ -321,6 +381,68 @@ defmodule Cairn.Config.Profile do
       )
     else
       Config.add_error(acc, "profile #{name}: tracking must be a mapping")
+    end
+  end
+
+  # `model:` is the one field `Cairn.Config` reads as a map rather than a
+  # scalar (`Profile.artifact/1` does `Map.get(model, key)`) — an untyped
+  # value here would raise inside `Config.load/1`, which has no rescue,
+  # instead of surfacing through `add_error/2`. Sorted keys so error order is
+  # stable across runs.
+  defp check_model(acc, raw, name) do
+    case Map.get(raw, "model") do
+      nil ->
+        acc
+
+      model when is_map(model) ->
+        model
+        |> Map.keys()
+        |> Enum.sort()
+        |> Enum.reduce(acc, &check_model_value(&2, &1, Map.fetch!(model, &1), name))
+
+      _other ->
+        Config.add_error(
+          acc,
+          "profile #{name}: model must be a mapping of per-backend artifact paths"
+        )
+    end
+  end
+
+  defp check_model_value(acc, _key, value, _name) when is_binary(value) and value != "", do: acc
+
+  defp check_model_value(acc, key, value, name) do
+    Config.add_error(
+      acc,
+      "profile #{name}: model.#{key} must be a path string, got #{inspect(value)}"
+    )
+  end
+
+  defp check_string(acc, raw, key, name) do
+    case Map.get(raw, key) do
+      nil ->
+        acc
+
+      value when is_binary(value) and value != "" ->
+        acc
+
+      other ->
+        Config.add_error(acc, "profile #{name}: #{key} must be a string, got #{inspect(other)}")
+    end
+  end
+
+  defp check_experimental(acc, raw, name) do
+    case Map.get(raw, "experimental") do
+      nil ->
+        acc
+
+      value when is_boolean(value) ->
+        acc
+
+      other ->
+        Config.add_error(
+          acc,
+          "profile #{name}: experimental must be true or false, got #{inspect(other)}"
+        )
     end
   end
 
