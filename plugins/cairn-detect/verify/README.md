@@ -178,3 +178,47 @@ What to read:
   the flag-on run's `min` falls to about the track floor, which is the band
   arriving and not a divergence. The per-label *rates* will diverge too, for
   the same reason, so its >3× verdict is not a parity verdict on this pair.
+
+## Forensic re-detection: recovering the wire for a stored event
+
+The host stores tracks and events, not the NDJSON that produced them — so
+"why did the tracker do *that* on this clip" questions look unanswerable
+after the fact. They are not: the event's own mp4 is on disk, the model is
+deterministic over frames, and this harness can replay one into a fresh
+capture. Two identity bugs have been root-caused this way (a phantom twin
+track traced to an evidence-grade double box; a "missing" second person
+traced to the detector, which never scored them above 0.28).
+
+```
+# terminal 1 — the usual control-line brace group; sleep past the clip
+{ echo '{"spec":"cairn.plugin","version":1,"type":"stream.started","camera_id":"test","stream_epoch":"01K0TESTEPOCH00000000000000","rtp":{"clock_rate":90000}}'
+  sleep 45; } \
+  | ../target/release/cairn-detect --model <the camera's model> \
+      --labels <its labels> --camera-id test --udp-port 18100 \
+      --min-score-json '<the camera's own min_score map>' \
+  > event-redetect.ndjson 2> event-redetect.stderr
+
+# terminal 2 — once `cairn-detect up:` appears; duration ≥ the clip's
+./feed.py --clip <data/events/.../EVENT.mp4> --port 18100 --duration 26
+```
+
+What to vary, per question:
+
+- **"Was X ever detected?"** — drop the relevant label's floor below the
+  camera's (e.g. `'{"person":0.2}'`) and read the score distribution. A
+  box that never clears the camera's floor never left the plugin on the
+  live run, and no host mechanism — association, replay, re-ID — can act
+  on a detection that did not exist.
+- **"Why two identities for one object?"** — run at the camera's real
+  floors and count same-label pairs per frame at IoU thresholds; an
+  evidence-grade pair on the wire is plugin-side input, its host-side
+  fate a separate question.
+- **"Did the tracker mis-associate?"** — pair this with the event's
+  stored `entries` timeline (bbox per tagged object per t): the wire says
+  what arrived, the entries say what the tracker did with it.
+
+Two honest limits. The re-run is not frame-identical to the live capture
+— RTP sampling picks its own phase, so read distributions and per-frame
+shapes, not exact sequences (an intermittent behaviour may need the clip
+fed more than once to show). And the clip only covers the event's window
+plus its pre/post buffer; what happened outside it is gone.
