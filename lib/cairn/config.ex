@@ -210,6 +210,7 @@ defmodule Cairn.Config do
 
     {config, acc} = resolve_plugins(config, acc, declared_plugin_names(map))
     {config, acc} = resolve_profiles(config, acc)
+    {config, acc} = expand_profiles(config, acc)
     acc = validate(config, acc)
 
     case acc.errors do
@@ -589,6 +590,149 @@ defmodule Cairn.Config do
   end
 
   def profile_for(%__MODULE__{}, %Camera{}), do: nil
+
+  # -- profile argv expansion -------------------------------------------------
+
+  # The five flags a profile owns for its group, and the only argv
+  # `Cairn.Config` ever writes. `--motion-json` and `--track-floor-json` are
+  # deliberately absent: they describe the scene, not the model, and stay the
+  # operator's own (D-P6).
+  @model_flags ~w(--model --model-profile --input-size --decoder --labels)
+
+  # One compiled word-boundary regex per flag, built once rather than per
+  # `flag?/2` call: a flag counts as present at token-start or after
+  # whitespace or a shell quote, followed by `=`, whitespace, a shell quote,
+  # or end-of-token — so `--model` matches inside
+  # `"exec cairn-detect --model x"` and its quoted form
+  # `"exec cairn-detect '--model' x"` (sh strips the quotes before the
+  # plugin sees the flag) but not `--model-profile` or a path like
+  # `/opt/--model/x`.
+  @model_flag_regexes Map.new(@model_flags, fn flag ->
+                        {flag,
+                         Regex.compile!("(^|[\\s\"'])" <> Regex.escape(flag) <> "(=|[\\s\"']|$)")}
+                      end)
+
+  # Where a profile stops being data and becomes the plugin's argv. Expanding
+  # into `group.command` at load — rather than teaching
+  # `Cairn.PluginGroupPort.build_argv/1` to read a profile — is what keeps the
+  # port and the process it owns profile-unaware, and it is what makes a
+  # profile edit reach the plugin at all: the group's restart trigger is a
+  # changed struct (`Cairn.Config.Server.diff_plugin_groups/2`), so the flags
+  # have to be *in* the struct.
+  defp expand_profiles(config, acc) do
+    {groups, acc} = Enum.map_reduce(config.plugin_groups, acc, &expand_group/2)
+
+    {%{config | plugin_groups: groups}, acc}
+  end
+
+  defp expand_group(%PluginGroup{profile: %Profile{} = profile} = group, acc) do
+    acc =
+      acc
+      |> check_single_source(group, profile)
+      |> check_backend_implemented(group, profile)
+      |> check_artifact(group, profile)
+
+    {%{group | command: group.command ++ profile_argv(profile)}, acc}
+  end
+
+  defp expand_group(group, acc), do: {group, acc}
+
+  # Only the fields the profile actually set: an unset one emits no flag at
+  # all rather than a default, leaving the plugin's own fallback in force —
+  # `--model-profile` and `--input-size` are both sniffed from the model when
+  # absent, and a value guessed here would defeat that.
+  defp profile_argv(%Profile{} = profile) do
+    flag("--model", Profile.artifact(profile)) ++
+      flag("--model-profile", profile.model_profile) ++
+      flag("--input-size", profile.input_size) ++
+      flag("--decoder", profile.decoder) ++
+      flag("--labels", profile.labels)
+  end
+
+  defp flag(_name, nil), do: []
+  defp flag(name, value), do: [name, to_string(value)]
+
+  # D-P4: cross-boundary consistency by construction. Elixir expands both the
+  # Rust argv and the tracker's stage list from one file, which is only true
+  # for as long as nothing else writes the model argv — so an operator flag
+  # naming any of the five is an error, not a silent race between two answers
+  # settled by whatever clap does with a repeated flag. `flag?/2` counts an
+  # occurrence anywhere inside a token, not just a whole token, so an operator
+  # shell-wrapping the command (`["/bin/sh", "-c", "exec plugin --model x"]`)
+  # cannot smuggle a model flag past this check and silently drop the
+  # profile's own.
+  defp check_single_source(acc, group, profile) do
+    Enum.reduce(@model_flags, acc, fn flag, acc ->
+      check(
+        acc,
+        not Enum.any?(group.command, &flag?(&1, flag)),
+        "plugin #{group.name}: command carries #{flag}, which profile #{profile.name} owns — " <>
+          "a profiled group's model flags (#{Enum.join(@model_flags, ", ")}) come from its " <>
+          "profile alone; drop #{flag} from command:"
+      )
+    end)
+  end
+
+  defp flag?(token, flag), do: Regex.match?(Map.fetch!(@model_flag_regexes, flag), token)
+
+  # D-P10: `rknn` and `qnn` are legal names in a profile — the schema knows
+  # them so board profiles can ship before their backends do — but a group
+  # actually running one needs both halves of the acknowledgement, the
+  # profile's own `experimental:` and the operator's `allow_experimental:`.
+  # Refused at load rather than at group start because this is where an
+  # operator reads diagnostics; a start-time refusal is a respawn loop in a
+  # log file nobody is tailing.
+  defp check_backend_implemented(acc, _group, %Profile{backend: "ort"}), do: acc
+
+  defp check_backend_implemented(acc, group, %Profile{experimental: false} = profile) do
+    add_error(
+      acc,
+      "plugin #{group.name}: profile #{profile.name} uses backend #{profile.backend}, which is " <>
+        "not yet implemented — only ort executes today, and a profile naming another backend " <>
+        "must declare experimental: true"
+    )
+  end
+
+  defp check_backend_implemented(acc, %PluginGroup{allow_experimental: false} = group, profile) do
+    add_error(
+      acc,
+      "plugin #{group.name}: profile #{profile.name} uses backend #{profile.backend}, which is " <>
+        "not yet implemented — set allow_experimental: true on this plugin group to run it anyway"
+    )
+  end
+
+  defp check_backend_implemented(acc, _group, _profile), do: acc
+
+  # The artifact is checked verbatim, against this node's working directory,
+  # because that is the one the plugin process is spawned from and reads it
+  # in: resolving the path against the config file or the profile file would
+  # check one file and hand the plugin another.
+  #
+  # A profile naming no artifact is refused too, rather than left to expand
+  # into nothing: a profile is a model choice before it is anything else, and
+  # D-P4 has just forbidden the operator from writing `--model` themselves —
+  # so a profiled group with no artifact could only ever run a model nobody
+  # named.
+  defp check_artifact(acc, group, profile) do
+    case Profile.artifact(profile) do
+      nil ->
+        add_error(
+          acc,
+          "plugin #{group.name}: profile #{profile.name} names no " <>
+            "model.#{Profile.artifact_key(profile.backend)} artifact for its #{profile.backend} " <>
+            "backend — a profiled group takes --model from its profile alone"
+        )
+
+      path ->
+        check(
+          acc,
+          File.regular?(path),
+          "profile #{profile.name}: model artifact #{path} does not exist or is not a " <>
+            "regular file (relative paths resolve against the working directory the plugin " <>
+            "is spawned from)"
+        )
+    end
+  end
 
   defp resolve_members(%__MODULE__{udp_base_port: base} = config) when is_integer(base) do
     Enum.map(config.plugin_groups, &%{&1 | members: members_for(config, &1.name)})

@@ -5,7 +5,9 @@ defmodule Cairn.PluginGroupPort do
 
   Contract (see `docs/plugin-contract.md`): configuration via argv
   (`--cameras-json`, a JSON array of `{id, udp_port, min_score}` — one entry
-  per member camera — plus anything already in the configured command), one
+  per member camera — plus anything already in the configured command, which
+  for a group naming a `profile:` includes the model flags `Cairn.Config`
+  expanded into it at load), one
   H.264 RTP input per member on that member's UDP port, ndjson lines on
   stdout, logs on stderr (redirected to `{data_dir}/log/plugin-{group}.log`
   by the sh wrapper).
@@ -32,7 +34,9 @@ defmodule Cairn.PluginGroupPort do
 
   The whole group shares one failure domain: a crash restarts every member's
   stream. Membership and argv are fixed for the process's lifetime — a config
-  change to either restarts the group. Camera fields the argv does not carry
+  change to either restarts the group, an edit to the group's profile
+  included, since that is argv by the time it reaches here. Camera fields
+  the argv does not carry
   (the `post` and `max` windows, the tracking bounds, the `track:` / `record:`
   tiers, retention, the camera struct itself) are refreshed in place by
   `refresh/3` instead (see `Cairn.PluginGroupSupervisor`). `pre` is the one
@@ -91,7 +95,13 @@ defmodule Cairn.PluginGroupPort do
     GenServer.start_link(__MODULE__, opts, name: Cairn.Registry.via(group.name, :plugin_group))
   end
 
-  @doc "Argv for the configured plugin command plus contract arguments."
+  @doc """
+  Argv for the configured plugin command plus contract arguments.
+
+  `group.command` is taken whole and unread: for a profiled group
+  `Cairn.Config` has already expanded the profile's model flags into it, so
+  nothing here needs to know what a profile is.
+  """
   @spec build_argv(Config.PluginGroup.t()) :: [String.t()]
   def build_argv(%Config.PluginGroup{} = group) do
     group.command ++ ["--cameras-json", Jason.encode!(group.members)]

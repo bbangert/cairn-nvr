@@ -1,0 +1,4 @@
+# `labels:` as a mapping instead of a string.
+backend: ort
+labels:
+  a: b

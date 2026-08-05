@@ -1,0 +1,13 @@
+# Every field that expands to a Rust flag, so the argv test pins the whole
+# emission and its order.
+backend: ort
+model:
+  onnx: test/support/fixtures/models/stub.onnx
+model_profile: yolox
+input_size: 416
+decoder: auto
+labels: test/support/fixtures/models/stub.names
+fps_band: [4, 8]
+tracking:
+  bbd: true
+  twin_mint: true

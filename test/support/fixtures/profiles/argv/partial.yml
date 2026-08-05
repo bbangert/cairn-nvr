@@ -1,0 +1,5 @@
+# The model artifact and nothing else: every other flag is left off so the
+# plugin's own sniffing and defaults stand.
+backend: ort
+model:
+  onnx: test/support/fixtures/models/stub.onnx

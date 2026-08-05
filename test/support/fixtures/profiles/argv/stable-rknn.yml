@@ -1,0 +1,5 @@
+# A stubbed backend without the `experimental: true` half of the
+# acknowledgement: parses fine, refused for any group that runs it.
+backend: rknn
+model:
+  rknn: test/support/fixtures/models/stub.rknn

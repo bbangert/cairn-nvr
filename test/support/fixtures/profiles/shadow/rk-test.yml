@@ -1,3 +1,5 @@
 backend: ort
+model:
+  onnx: test/support/fixtures/models/stub.onnx
 tracking:
   twin_mint: true

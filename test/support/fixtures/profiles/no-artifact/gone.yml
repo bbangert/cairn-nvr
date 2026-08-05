@@ -1,0 +1,4 @@
+# Names an artifact that is not on disk.
+backend: ort
+model:
+  onnx: test/support/fixtures/models/not-here.onnx

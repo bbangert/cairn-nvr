@@ -140,6 +140,20 @@ defmodule Cairn.Config.Server do
     diff(old_ids, new_ids, changed, refreshed)
   end
 
+  # Compared whole, where a camera is compared field by field
+  # (`@restart_fields`). `command` carries the model flags `Cairn.Config`
+  # expands from a `profile:`, and the resolved `Cairn.Config.Profile` struct
+  # rides along beside it — so editing the profile *file* under an unchanged
+  # name moves this comparison exactly as pointing the group at a different
+  # profile does, which is what gets new model argv to the plugin.
+  #
+  # Whole-struct is deliberately wider than the argv: a profile edit that
+  # touches only its `tracking:` block restarts the group too, though the
+  # stages are host-side and reach a running camera through the policy
+  # refresh (`camera_refreshed?/4`) on their own. Over-restarting is the safe
+  # direction — the cost is one model reload and the group's live tracks —
+  # and narrowing it means classifying a *profile's* fields by consumption
+  # site, not a group's.
   @doc false
   @spec diff_plugin_groups(Config.t(), Config.t()) :: diff()
   def diff_plugin_groups(old, new) do

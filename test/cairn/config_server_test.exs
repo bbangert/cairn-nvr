@@ -343,6 +343,34 @@ defmodule Cairn.Config.ServerTest do
       assert Config.Server.diff_plugin_groups(old, new) ==
                %{added: [], removed: [], changed: ["detect"], refreshed: []}
     end
+
+    test "an edit to the profile file marks the group changed" do
+      # Same group, same `command:`, same profile *name* — only the file's
+      # content moved (input_size 416 -> 640). The expansion is in the
+      # group's command by the time this diff runs, so the model flags a
+      # running plugin was spawned with cannot go stale.
+      old = profiled_config("test/support/fixtures/profiles/argv")
+      new = profiled_config("test/support/fixtures/profiles/argv-edited")
+
+      assert [%{command: old_command}] = old.plugin_groups
+      assert [%{command: new_command}] = new.plugin_groups
+      assert "416" in old_command
+      assert "640" in new_command
+
+      assert Config.Server.diff_plugin_groups(old, new) ==
+               %{added: [], removed: [], changed: ["detect"], refreshed: []}
+    end
+  end
+
+  # One group on the `full` profile, resolved from `dir`.
+  defp profiled_config(dir) do
+    from_map!(%{
+      "data_dir" => "tmp/cfg_srv_test",
+      "udp" => %{"base_port" => 18_000, "range" => 20},
+      "profile_dirs" => [dir],
+      "plugins" => %{"detect" => %{"command" => "./detect", "profile" => "full"}},
+      "cameras" => [%{"id" => "cam_a", "rtsp_url" => "rtsp://h/1", "plugin" => "detect"}]
+    })
   end
 
   test "invalid reload keeps old config and reports errors", %{server: server, path: path} do

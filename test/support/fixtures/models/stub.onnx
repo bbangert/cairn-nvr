@@ -1,0 +1,3 @@
+Not a model. An empty stand-in whose only property under test is that
+Cairn.Config finds it on disk: profile artifact paths are checked for
+existence at config load and never opened by the host.
