@@ -184,6 +184,18 @@ defmodule Cairn.Tracker do
   what those boxes are). The re-detection's own predict-and-update is the last
   step of that replay and is the ordinary matched step, unchanged.
 
+  Two kinds of gap reach that rebuild, and it is the same rebuild for both
+  because the anchor is the same. One is the live re-match above, where a
+  filter coasted through the gap and is discarded. The other is a **stream
+  reset**: a track suspended at the cut and adopted in the new epoch has no
+  filter at all (`revive/3` drops it), but it does have the two things the
+  replay actually needs — the box the object was last really observed at and
+  the instant it was last matched, both carried across the cut untouched by
+  suspension. So the case with nothing to be skeptical of is served by the same
+  interpolation as the case with a stale heading to throw away, and neither
+  needs any state the tracker was not already keeping. See the suspension
+  section below for what the rebuild puts back there.
+
   A **virtual observation** is the inverse of a seed, and the inverse in the
   one direction that matters here: a seed refreshes a track's liveness and
   moves its box while leaving the filter alone, and a virtual point moves the
@@ -193,7 +205,10 @@ defmodule Cairn.Tracker do
   reaches no summary and never leaves this process — the only thing that ever
   sees one is the filter being replayed. What the closing detection does to the
   track's box and clocks it does identically with the flag off; the only
-  difference is which filter its own step lands on.
+  difference is which filter its own step lands on. The stationary flag an
+  adoption may clear below is no exception to that either: it is judged from
+  the two *real* boxes bounding the gap, never from anything interpolated
+  between them.
 
   Which is not to say nothing downstream can tell, and one thing deliberately
   can. The stillness rule's drift is *read off the filter*, so the evaluation
@@ -204,6 +219,14 @@ defmodule Cairn.Tracker do
   coast tells the stillness rule about a gap is the heading the object had
   before the gap opened, and being skeptical of exactly that is what the
   rebuild is for.
+
+  Across a stream reset that same skepticism is spent through a second route
+  as well, because the first one is unavailable there: an adoption restarts the
+  still run, so its drift average starts from rest and the adopting evaluation
+  reads the rebuilt filter through a weight of nearly nothing. The gap's own
+  displacement is therefore put to the stationary flag directly instead, on the
+  floor the live rule uses — see `resumed_motion/4` and the suspension section
+  below.
 
   The trigger is the **unmatched gap**, `at_ms - last_matched_ms`, and never a
   seeded stretch — a seed refreshes `last_matched_ms` like any other match, so
@@ -329,8 +352,9 @@ defmodule Cairn.Tracker do
   detections, the settle window measures from the start of the still run — and a
   gap nothing watched is not stillness anybody saw. The motion filter is dropped
   outright: a heading learned before a cut that may be a minute old is not a
-  claim about where the object is now, so the adopting detection re-seeds it
-  from scratch and the resumed track is matched on its stored box until it does.
+  claim about where the object is now, so nothing coasts across the cut and the
+  resumed track is matched on its stored box until something positions a filter
+  again. Which one does depends on `tracking.oru`, below.
   Everything else is kept, `started_at` and
   `stationary_since` included, and so is the
   `stationary` flag itself: a car that matches its own parking space was
@@ -340,24 +364,44 @@ defmodule Cairn.Tracker do
   re-minted one would spend `stationary_after_ms` looking like a new arrival,
   i.e. like a clip.
 
-  What the cut costs is the tracker's ability to say the object *did* move
-  during it. Stillness is judged from the motion filter, the filter is re-seeded
-  by the adopting detection, and a re-seeded filter has zero velocity — so a
+  What the cut costs, with `tracking.oru` off — the default — is the tracker's
+  ability to say the object *did* move during it. Stillness is judged from the
+  motion filter, the filter is re-seeded by the adopting detection, and a
+  re-seeded filter has zero velocity — so a
   suspended track that comes back stationary comes back stationary wherever in
   the frame it is adopted — the adopting evaluation reads that just-re-seeded
   filter and passes trivially — and one that comes back moving is caught by the
   ordinary rule from the second detection of the new epoch on. Nothing observed the
   gap and no geometry survives it; a car that drove off and was replaced by
   another inside `@stitch_iou` of its space keeps the flag until the new
-  occupant moves. Restoring that evidence is what an association that reasons
-  about observation gaps (OC-SORT's re-update) is for. `tracking.oru` is that
-  machinery, and today it stops short of here: the replay runs only for a
-  track whose own filter coasted through the gap, so the adopting detection
-  re-seeds, as below.
+  occupant moves.
+
+  With the flag on, some of that evidence survives after all, for the same
+  reason it does on a live re-match: two real sightings bound the outage, and
+  the straight line between them is a measurement even though nothing watched
+  the object travel it. Where the adoption gap is inside the replay window the
+  filter is rebuilt across it rather than re-seeded (`replayed/4`), and the
+  displacement is judged on the *same* floor a live evaluation uses — a tenth
+  of the box's height per settle window, scaled to the gap's own duration
+  (`resumed_motion/4`). A shift the live rule would have called motion clears
+  the flag on the adopting batch, with the `started_moving` that any other
+  clearing emits; a shift under the floor leaves the flag exactly where the
+  flag-off path leaves it. What the clearing is not is a verdict for keeps: the
+  ordinary settle window re-earns the flag from the still run the adoption
+  started, so a car that was pushed a metre and parked again reads as parked
+  again `stationary_after_ms` later.
+
+  Outside the replay window — under `@oru_min_gap_ms` or past
+  `@oru_max_gap_ms`, in an adoption window that runs to a full minute — the
+  flag-off paragraph above is the whole behaviour, flag or no flag. A straight
+  line drawn across a gap that long asserts a heading through a stretch the
+  object could have turned around in twice, and there is no published threshold
+  that makes it worth more than the coast it would replace.
 
   What the adoption does buy unconditionally is that the settle window does not
-  re-arm: a resumed track is stationary from its first detection instead of
-  spending `stationary_after_ms` looking like a new arrival.
+  re-arm on the flag's *own* account: a resumed track that holds still is
+  stationary from its first detection instead of spending
+  `stationary_after_ms` looking like a new arrival.
 
   `epoch` follows the track: it names the epoch the track was last observed
   under, not the one it was minted in, so an adopted track's summaries carry
@@ -724,7 +768,10 @@ defmodule Cairn.Tracker do
   # across it rather than corrected through it. Under a second — two batches at
   # the cadence above — a coasted filter is still close to what it last
   # measured, and rebuilding would discard a real velocity history in exchange
-  # for a two-point interpolation of the same motion.
+  # for a two-point interpolation of the same motion. An adoption reaching this
+  # bound has no history to discard, but it has no gap worth interpolating
+  # either: a stream cut and resumed inside a second leaves an object that has
+  # barely moved, and the adopting box seeds a filter for it as it always did.
   @oru_min_gap_ms 1_000
   # And the gap past which the interpolation is worth no more than the coast it
   # would replace. About twenty steps at the cadence above: a straight line
@@ -732,8 +779,11 @@ defmodule Cairn.Tracker do
   # stretch long enough for the object to have turned around in, which is
   # unpublished territory — OC-SORT's own guidance for its re-update stops
   # around twenty missed frames. Past this the coasted filter is left exactly as
-  # it is and the ordinary matched step runs on it, which is what happens with
-  # the flag off too.
+  # it is and the ordinary matched step runs on it — or, for an adoption, the
+  # absent one stays absent and the adopting box seeds it — which is what
+  # happens with the flag off too. It is `@adoption_window_ms` that decides how
+  # long a suspension stays adoptable, and at six times this bound most of that
+  # window is deliberately outside the replay's.
   @oru_max_gap_ms 10_000
   # Warnings here fire from the per-observation path, and an observation is a
   # per-line primitive: unrate-limited they are a log-flood of their own.
@@ -1363,7 +1413,9 @@ defmodule Cairn.Tracker do
   # velocity is up to `@adoption_window_ms` stale and was dropped rather than
   # believed — falls back to its stored box, which is the frozen-box behaviour
   # this replaced and the right answer for a track with no motion estimate at
-  # all. `update_track/3` re-seeds it from the very next detection.
+  # all. `update_track/3` gives it one back on the very next detection — seeded
+  # from that box, or, where `tracking.oru` is on and the outage falls inside
+  # the replay window, rebuilt across the outage instead.
   defp predicted_box(%{kalman: nil} = tracked), do: tracked.bbox
   defp predicted_box(%{kalman: kalman}), do: kalman |> Kalman.predict() |> Kalman.predicted_bbox()
 
@@ -1458,31 +1510,55 @@ defmodule Cairn.Tracker do
   # already parked rather than as a new arrival. What restarts here is the
   # *duration* of the stillness, and nothing else about it.
   #
-  # `still_velocity` goes back to rest, and `kalman` is dropped outright: the
-  # two are one decision, since the average is only ever an average of that
-  # filter's readings. A velocity is a claim about the last few seconds, and the
-  # last thing this filter saw can be a whole `@adoption_window_ms` old — a
-  # minute of coasting on a heading nothing has confirmed since, which would put
-  # the resumed track's prediction anywhere. The adopting box is the one thing
-  # the new epoch has actually shown, so the filter is re-seeded from it:
-  # `adopt/4` only ever assigns *detected* boxes, so the `update_track/3` that
-  # follows in this same `track/3` call takes the nil-plus-detection path and
-  # inits. Between the two, `predicted_box/1` falls back to the stored box,
-  # which is all a track with no motion estimate can honestly be matched on.
+  # `kalman` is dropped outright, and under either flag: a velocity is a claim
+  # about the last few seconds, and the last thing this filter saw can be a
+  # whole `@adoption_window_ms` old — a minute of coasting on a heading nothing
+  # has confirmed since, which would put the resumed track's prediction
+  # anywhere. Nothing coasts across a cut. Between here and the
+  # `update_track/3` that follows in this same `track/3` call `predicted_box/1`
+  # falls back to the stored box, which is all a track with no motion estimate
+  # can honestly be matched on.
   #
-  # A re-seeded filter has zero velocity, so the first evaluation of the new
-  # epoch reads *still* whatever the adopting box's geometry is, and a parked
-  # car that was moved during the outage resumes stationary rather than opening
-  # an exit window on the adopting batch. That is a deliberate consequence of
-  # having no geometry memory across the cut, not an oversight: nothing observed
-  # the gap, the tracker has no anchor left to say the object is somewhere else,
-  # and the ordinary rule takes over from the second detection on. It is also
-  # the one place this rule is weaker than the geometry it replaced, and the
-  # place an observation-gap-aware association (OC-SORT's re-update) would put
-  # the evidence back. `tracking.oru`'s replay does not run here today —
-  # `replayed/4` passes a filterless track through untouched — so the adopting
-  # detection re-seeds from zero velocity exactly as it did before the flag
-  # existed.
+  # `still_velocity` goes back to rest with it, and stays there under either
+  # flag even where a rebuilt filter arrives a moment later. The average is an
+  # average over a *run*, the run restarts here, and what the outage says about
+  # the object is evidence about the outage rather than the opening reading of a
+  # run that begins now — which is why the flag-on path spends that evidence on
+  # the stationary flag once (`resumed_motion/4`) instead of carrying it into
+  # the average, where it would go on being smoothed against for a settle window
+  # after the object had demonstrably stopped.
+  #
+  # What positions a filter again is `update_track/3`, and which of its two
+  # routes does it is the whole of what `tracking.oru` changes here.
+  #
+  # With the flag off — the default — the adopting box is the one thing the new
+  # epoch has actually shown, so the filter is re-seeded from it: `adopt/4` only
+  # ever assigns *detected* boxes, so `update_track/3` takes the
+  # nil-plus-detection path and inits. A re-seeded filter has zero velocity, so
+  # the first evaluation of the new epoch reads *still* whatever the adopting
+  # box's geometry is, and a parked car that was moved during the outage resumes
+  # stationary rather than opening an exit window on the adopting batch. That is
+  # a deliberate consequence of having no geometry memory across the cut, not an
+  # oversight: nothing observed the gap, the tracker has no anchor left to say
+  # the object is somewhere else, and the ordinary rule takes over from the
+  # second detection on.
+  #
+  # With the flag on and the gap inside the replay window, there is an anchor
+  # after all — the two fields this function most carefully does *not* touch.
+  # `bbox` is still the last box anything really saw the object at and
+  # `last_matched_ms` still dates it, both carried through suspension unchanged,
+  # so `replayed/4` rebuilds the filter across the gap from exactly the pair a
+  # live re-match uses and `resumed_motion/4` reads the same two boxes for what
+  # they say about the stationary flag. What tells those two that they are
+  # looking at an adoption at all is the one field this function does write from
+  # scratch: a `nil` filter is an adoption of this same batch and can be nothing
+  # else, so the case needs no marker of its own and no extra track state.
+  #
+  # Outside that window — and the adoption window is six times the replay's
+  # upper bound — the flag-on path is the flag-off one exactly, `nil` and all.
+  # Constant-velocity interpolation across a minute of blindness is a guess of
+  # its own, and there is no published threshold that makes it worth more than
+  # the re-seed it would displace.
   #
   # `pending_exit_ms` is cleared for the same reason the run restarts: an exit
   # window is a claim about an *unbroken run of observations*, and the cut is a
@@ -1885,6 +1961,9 @@ defmodule Cairn.Tracker do
     # Read before `last_detected_ms` moves below: stationary time accrues over
     # the gap between two *detections*, which is what this value is until then.
     previous_detected_ms = tracked.last_detected_ms
+    # Likewise before the write below: `bbox` and `last_matched_ms` are the two
+    # ends of the gap this reads, and the write moves both to this batch.
+    tracked = resumed_motion(tracked, object, detected?, context)
 
     %{
       tracked
@@ -1915,19 +1994,23 @@ defmodule Cairn.Tracker do
   # where by the plugin's own account nothing has happened. Held is the honest
   # reading, and it is what the moduledoc promises.
   #
-  # The nil case is a track `revive/3` cleared: the first detection after an
-  # adoption seeds a fresh filter from the box the new epoch actually produced,
-  # rather than resuming a heading a minute of blindness has invalidated.
+  # The nil case is a track `revive/3` cleared and `replayed/4` left cleared:
+  # the first detection after an adoption seeds a fresh filter from the box the
+  # new epoch actually produced, rather than resuming a heading a minute of
+  # blindness has invalidated. That is every adoption with `tracking.oru` off —
+  # the default — and, with it on, every adoption whose gap falls outside the
+  # replay window; an in-window one arrives here with the rebuilt filter and
+  # takes the ordinary matched step on it like any other track.
   defp advance(kalman, _object, false), do: kalman
   defp advance(nil, object, true), do: Kalman.init(object.bbox)
   defp advance(kalman, object, true), do: kalman |> Kalman.predict() |> Kalman.update(object.bbox)
 
   # The filter `advance/3` then takes its one step on: the track's own, unless
-  # `tracking.oru` is on and this detection closed a gap long enough that what
-  # the coast has been asserting through it is not worth correcting. In that
-  # case the coasted filter is dropped and rebuilt across the gap from the last
-  # box the track was really observed at, against virtual observations
-  # interpolated towards this detection (`Cairn.Tracker.Kalman.refit/3`).
+  # `tracking.oru` is on and this detection closed a gap the replay is for. In
+  # that case whatever filter the track was carrying is dropped and one is built
+  # across the gap from the last box the track was really observed at, against
+  # virtual observations interpolated towards this detection
+  # (`Cairn.Tracker.Kalman.refit/3`).
   #
   # `refit/3` deliberately stops one step short of the target, and the step it
   # stops short of is the `advance/3` above — so nothing here predicts, and the
@@ -1936,27 +2019,132 @@ defmodule Cairn.Tracker do
   # re-reports its box verbatim, so a seeded stretch cannot have moved it) and
   # `object.bbox` is this batch's own, which is what `detected?` gates on.
   #
+  # Two kinds of track arrive here with a gap, and the rebuild is deliberately
+  # blind to which. One carries a coasted filter, asserting a heading through a
+  # stretch nothing confirmed, and that is what the rebuild is skeptical of. The
+  # other carries none at all: `revive/3` drops the filter of a track adopted
+  # out of suspension, and a nil filter at this point is *exactly* that and
+  # nothing else — `new_track/3` is the only other thing that writes the field
+  # from scratch and it always seeds one, neither `coast/1` nor `advance/3` can
+  # turn a filter into a nil, and an adoption is always assigned its (detected)
+  # adopting box in the same batch, so no nil filter ever survives to a later
+  # one. There is no coast to be skeptical of there, but the two boxes bounding
+  # the gap are the same two, since suspension carries `bbox` and
+  # `last_matched_ms` across the cut untouched. Outside the window a nil falls
+  # through to `advance/3` to seed from this box, which is what the flag-off
+  # path does with every adoption.
+  #
   # The gap is measured from `last_matched_ms`, which is what keeps a seeded
   # stretch out of this altogether — see the moduledoc: a seed refreshes that clock, so no gap
   # opens across a stretch the plugin was re-reporting through, and the motion
   # this would otherwise synthesize is motion the plugin's own account says did
   # not happen.
-  #
-  # A track with no filter is left without one for `advance/3` to seed from
-  # this box. That is `revive/3`'s adoption case, where the gap spans a stream
-  # reset: there is no coast to be skeptical of there, and today the replay
-  # runs only where one is.
-  defp replayed(%{kalman: nil}, _object, _detected?, _context), do: nil
-
   defp replayed(tracked, object, detected?, context) do
+    case replayable_gap(tracked, detected?, context) do
+      nil -> tracked.kalman
+      gap -> Kalman.refit(tracked.bbox, object.bbox, gap_steps(gap))
+    end
+  end
+
+  # The gap this detection closed when `tracking.oru` is on and the gap is one
+  # the replay is for, and `nil` otherwise — which is every batch with the flag
+  # off or absent, and the reason `Map.get/2` rather than a match: `context` is
+  # a plain map a caller may build without the key.
+  #
+  # Two callers, one window, on purpose. `replayed/4` rebuilds the filter across
+  # this gap and `resumed_motion/4` reads the same two boxes for what they say
+  # about a resumed track's stationary flag, so a window either computed for
+  # itself could drift from the other and leave a track judged on a measurement
+  # its own filter never saw.
+  #
+  # `detected?` is the second gate and it is `adopt/4`'s refusal applied to the
+  # filter: an extrapolation may not tell this module where an object went any
+  # more than it may resume an identity.
+  defp replayable_gap(tracked, detected?, context) do
     gap = context.at_ms - tracked.last_matched_ms
 
     if detected? and Map.get(context, :oru, false) and gap >= @oru_min_gap_ms and
-         gap <= @oru_max_gap_ms do
-      Kalman.refit(tracked.bbox, object.bbox, gap_steps(gap))
-    else
-      tracked.kalman
+         gap <= @oru_max_gap_ms,
+       do: gap
+  end
+
+  # What a replayed gap says about a resumed track's stationary flag — the only
+  # thing `tracking.oru` changes about an adoption besides the filter, and the
+  # one place in this module where a *displacement* rather than a filter reading
+  # decides stillness.
+  #
+  # It runs only for a track that has no filter and is currently stationary.
+  # The first, by the invariant in `replayed/4`, means an adoption made by this
+  # same batch and nothing else; the second means there is a flag to clear at
+  # all, since this only ever takes one away.
+  # With `tracking.oru` off — the default — `replayable_gap/3` answers nil and
+  # this is a no-op, so a suspended track resumes with the flag it was suspended
+  # with whatever the outage did to it, exactly as `revive/3` describes.
+  #
+  # With the flag on and the gap inside the replay window, the two boxes the
+  # replay interpolates between are two *real* sightings of the object either
+  # side of a cut nothing observed, so for once there is a measurement to put
+  # against the flag — and where that measurement is a displacement the live
+  # rule would have called motion, "parked" is a claim the evidence contradicts.
+  #
+  # The test is `still?/3`'s own, handed the gap's mean drift in place of the
+  # filter's velocity. That is what makes the scaling honest rather than
+  # notional: `@stationary_velocity_floor` and `@stationary_growth_floor` are
+  # both expressed per `stationary_after_ms`, so both sides of the comparison
+  # are rates and the allowance grows with the gap — an 8 s gap of a 10 s settle
+  # window buys four fifths of the floor's displacement, which is precisely what
+  # a live track drifting that slowly would have been allowed to accumulate over
+  # the same stretch. A per-step floor applied to a many-step gap would have
+  # failed every adoption that moved at all.
+  #
+  # Clearing, and nothing else. The flag is re-earned the ordinary way — a
+  # settle window of stillness measured from the run `revive/3` restarted — so a
+  # car pushed a metre and parked again reads as parked again, late rather than
+  # never. No exit window is opened and none is honoured: `@stationary_exit_ms`
+  # exists to stop a *stationary* track flapping on a couple of batches of
+  # detector jitter, and this is one measurement over seconds of gap, made once
+  # per adoption. `stationary_since` goes with the flag as it does in `moved/3`,
+  # since a track that is not stationary has no instant it became so;
+  # `pending_exit_ms` is already nil, `revive/3` having cleared it, and
+  # `stillness/5` runs after this on a track that is no longer stationary, so
+  # nothing can leave a moving track carrying an open exit window.
+  #
+  # Running here rather than in `revive/3` is what emits the flip. `revive/3`
+  # writes to `tracker.objects`, so a flag it cleared would already be cleared
+  # in the `existing` record `apply_object/6` hands `transition/3`, and the edge
+  # would be invisible — no `started_moving`, and so no timeline moment from
+  # `Cairn.CameraTracker`. That silence is not free downstream:
+  # `CairnWeb.TrackMoments` reads a stationary *run* as a `became_stationary`
+  # closed by the next `started_moving`, and `Cairn.TrackPath`'s keyframe rule
+  # leans on the same pairing, so a clearing with no event would leave the
+  # pre-cut run rendering as still open across a stretch this module has already
+  # decided it was not. Editing the pre-write copy instead means the ordinary
+  # comparison sees true → false and the ordinary event goes out.
+  defp resumed_motion(%{kalman: nil, stationary: true} = tracked, object, detected?, context) do
+    case replayable_gap(tracked, detected?, context) do
+      nil ->
+        tracked
+
+      gap ->
+        if still?(gap_drift(tracked.bbox, object.bbox, gap), object, context),
+          do: tracked,
+          else: %{tracked | stationary: false, stationary_since: nil}
     end
+  end
+
+  defp resumed_motion(tracked, _object, _detected?, _context), do: tracked
+
+  # The gap's mean drift in `still?/3`'s units — frame units per millisecond of
+  # the observation clock — from the centre of the box the track was last
+  # observed at to the centre of the box that resumed it, with the height change
+  # over the same gap for the growth half of the test.
+  #
+  # A straight line between two sightings, saying nothing about the path
+  # between them. That is the whole of what a gap nothing observed can honestly
+  # report, and it is the same assumption `Kalman.refit/3` interpolates its
+  # virtual observations on, so the flag and the filter are reading one story.
+  defp gap_drift([ax, ay, aw, ah], [bx, by, bw, bh], gap) do
+    {(bx + bw / 2 - (ax + aw / 2)) / gap, (by + bh / 2 - (ay + ah / 2)) / gap, (bh - ah) / gap}
   end
 
   # The gap as a count of filter steps, at the nominal cadence.
@@ -1983,7 +2171,7 @@ defmodule Cairn.Tracker do
   # job they are for by then — being the prediction this batch's detections were
   # matched against.
   #
-  # A track with no filter stays without one until a detection re-seeds it.
+  # A track with no filter stays without one until a detection gives it one.
   # There is nothing to coast, and inventing a filter from a stored box on a
   # batch that saw nothing would be minting a motion estimate out of silence.
   defp coast_unmatched(tracker, touched) do
@@ -2051,6 +2239,16 @@ defmodule Cairn.Tracker do
   # magnitude cannot tell those apart at this floor — measured, the production
   # jitter fixture's jittered batches peak past five times it — and averaging
   # magnitudes would not either, since a magnitude has no sign to cancel.
+  # The interval also cancels out of the smoothed value, and one caller leans
+  # on that: the reading is `velocity / interval` and the weight is
+  # `interval / stationary_after_ms`, so with `still_velocity` at rest their
+  # product — the whole of a fresh run's first smoothed reading — is
+  # `velocity / stationary_after_ms` whatever the interval was. That is what
+  # makes the 1 ms floor harmless on the batch right after `revive/3`, where
+  # `previous_detected_ms` is this same instant: the floored interval inflates
+  # the reading and deflates the weight by exactly the same factor. An edit
+  # that changes how one side uses `interval` without the other loses the
+  # cancellation and turns that batch's reading into noise.
   defp drift(tracked, previous_detected_ms, context) do
     interval = max(context.at_ms - previous_detected_ms, 1)
     {vcx, vcy} = Kalman.velocity(tracked.kalman)
@@ -2167,8 +2365,9 @@ defmodule Cairn.Tracker do
   # A still run starts from the unsmoothed reading, never from rest — the one
   # exception being a track that has no motion estimate to be honest about yet
   # (`@at_rest`, for a first detection; `revive/3` writes the same value
-  # directly when an adoption drops the filter, and reaches here only for a
-  # track never detected before the cut). Seeding the average at zero instead
+  # directly when an adoption restarts a resumed track's run, and the nil-run
+  # branch above reaches here only for a track never detected before the cut).
+  # Seeding the average at zero instead
   # would credit the object with
   # a stillness the filter has not reported: a departure whose every evaluation
   # restarts the run here would read as still on the batch after each one, and
