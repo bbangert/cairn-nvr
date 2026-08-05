@@ -10,6 +10,7 @@ defmodule Cairn.TrackerTest do
   alias Cairn.Track
   alias Cairn.Tracker
   alias Cairn.Tracker.Bbd
+  alias Cairn.Tracker.Kalman
 
   @max_unseen 3_000
   @stationary_after 10_000
@@ -97,14 +98,16 @@ defmodule Cairn.TrackerTest do
       min_score: Keyword.get(opts, :min_score)
     }
 
-    # The key itself is absent unless a test asks for it, so that everything
-    # here bar the BBD block runs against the context a caller which has never
-    # heard of the flag hands the tracker — and so that "off" and "absent" are
-    # two distinguishable things a test can compare.
-    case Keyword.fetch(opts, :bbd) do
-      {:ok, bbd} -> Map.put(context, :bbd, bbd)
-      :error -> context
-    end
+    # Each flag key is absent unless a test asks for it, so that everything here
+    # bar the two flag blocks runs against the context a caller which has never
+    # heard of either flag hands the tracker — and so that "off" and "absent"
+    # are two distinguishable things a test can compare.
+    Enum.reduce([:bbd, :oru], context, fn key, context ->
+      case Keyword.fetch(opts, key) do
+        {:ok, value} -> Map.put(context, key, value)
+        :error -> context
+      end
+    end)
   end
 
   defp track(tracker, objects, opts \\ []), do: Tracker.track(tracker, objects, ctx(opts))
@@ -2580,6 +2583,14 @@ defmodule Cairn.TrackerTest do
   @mover_step 0.05
   defp mover(n), do: [0.10 + n * @mover_step, 0.5, 0.1, 0.1]
 
+  # A far slower walker than @mover_step, at a fiftieth of the frame per batch.
+  # Slow is what the gap-replay tests need: an object that turns back during a
+  # gap has to end up somewhere its own coasted prediction still overlaps, or
+  # nothing matches and there is no filter to compare. Every box is 0.1 x 0.1
+  # and in frame throughout.
+  @creep_step 0.01
+  defp creeper(n), do: [0.30 + n * @creep_step, 0.5, 0.1, 0.1]
+
   # The motion filter of one live track: internal state, reachable nowhere else
   # — `Cairn.Track` deliberately does not carry it.
   defp filter(tracker, id), do: tracker.objects[id].kalman
@@ -2877,7 +2888,7 @@ defmodule Cairn.TrackerTest do
 
   defp substitute(other, _mapping), do: other
 
-  # What association does, spread over four runs, each carrying what it is there
+  # What association does, spread over five runs, each carrying what it is there
   # to exercise: `started`, the tracks the whole run mints; `dropped`, how many
   # of the *last* batch's detections never reached `tagged`, which is one
   # `:drop` each; and `live`, every surviving track's label and box, sorted.
@@ -2935,6 +2946,16 @@ defmodule Cairn.TrackerTest do
        [started: 2, dropped: 0, live: [{"person", parked_box}, {"person", passer}]],
        for(n <- 0..10, do: {[at_ms: n * 1_000], [det("person", parked_box)]}) ++
          [{[at_ms: 14_000], [det("person", passer)]}]},
+      # Three batches with nothing in them and then a box the coast is still
+      # near enough to match: the one shape in this list that opens an unmatched
+      # gap a re-detection closes, which is the only thing `tracking.oru` has
+      # anything to say about. The object turned back during the gap, so what
+      # the filter comes out believing is not what it went in believing —
+      # with either flag off, as here, the coasted heading is merely corrected.
+      {"a coast the identity survives", [started: 1, dropped: 0, live: [{"person", creeper(1)}]],
+       for(n <- 0..4, do: {[at_ms: n * @batch_ms], [det("person", creeper(n))]}) ++
+         for(ms <- 2_500..3_500//@batch_ms, do: {[at_ms: ms], []}) ++
+         [{[at_ms: 4_000], [det("person", creeper(1))]}]},
       # Both halves of the stage. @car_double and @car_neighbour are under the
       # floor and match the car track anyway, which is why it ends on
       # @car_neighbour — a box no mint could ever have been made for. The
@@ -3226,6 +3247,264 @@ defmodule Cairn.TrackerTest do
       assert ids(events, :started) == []
       assert ids(events, :updated) == [car_id, other_id]
       assert %{bbox: @car_double} = on.objects[other_id]
+    end
+  end
+
+  # Longer than any run below, so nothing in them expires mid-coast: a track
+  # that ended halfway through a gap never reaches the re-detection these tests
+  # are about.
+  @oru_opts [max_unseen_ms: 30_000]
+
+  # Ten detected batches of the creeper from 0, so the filter has converged on
+  # the creep: the tracker at 4_500 with one track on creeper(9).
+  defp crept(opts) do
+    Enum.reduce(0..9, {Tracker.new(), nil}, fn n, {tracker, id} ->
+      {tracker, [tagged], _events} =
+        track(tracker, [det("person", creeper(n))], [at_ms: n * @batch_ms] ++ opts)
+
+      {tracker, id || tagged.object_id}
+    end)
+  end
+
+  # `from_ms` through `to_ms` exclusive with nothing in any batch, which is what
+  # opens an unmatched gap: every live track coasts once per step.
+  defp coast(tracker, from_ms, to_ms, opts) do
+    Enum.reduce(from_ms..(to_ms - @batch_ms)//@batch_ms, tracker, fn ms, tracker ->
+      {tracker, [], []} = track(tracker, [], [at_ms: ms] ++ opts)
+      tracker
+    end)
+  end
+
+  # A track re-detected at `box`, asserting the box landed on it rather than
+  # minting beside it — which is the premise of every comparison below, and the
+  # one thing none of them would notice if it stopped holding.
+  defp rematched({tracker, id}, box, at_ms, opts) do
+    {tracker, [tagged], events} = track(tracker, [det("person", box)], [at_ms: at_ms] ++ opts)
+
+    assert tagged.object_id == id
+    assert ids(events, :started) == []
+
+    {tracker, id, events}
+  end
+
+  # The creeper coasted from 4_500 to `at_ms`, as one tracker for both flag
+  # states to branch off rather than two runs of the same steps. Nothing before
+  # the closing detection can differ between them — every batch of the run
+  # either matched at a gap of one batch, well under `@oru_min_gap_ms`, or
+  # carried nothing at all — and branching is what makes the two runs share an
+  # identity, so their tracks and their events compare field for field instead
+  # of only through what a ULID rewrite leaves.
+  defp crept_gap(at_ms) do
+    {tracker, id} = crept(@oru_opts)
+
+    {coast(tracker, 4_500 + @batch_ms, at_ms, @oru_opts), id}
+  end
+
+  # An object detected at the same box every batch from 0 to 3_000. Its filter
+  # has converged on no motion at all, so its prediction sits where the box is
+  # however long the stretch that follows — which is what lets one stretch be
+  # tested at four lengths, and seeded against empty, without the coast walking
+  # the prediction off the box that closes it. Short of `stationary_after_ms`
+  # throughout, so nothing here is parked.
+  @waiting [0.30, 0.50, 0.10, 0.10]
+  # Three tenths of a box on: an overlap of 0.538, so what the stretch changes
+  # below is never whether the pair matches.
+  @resumed [0.33, 0.50, 0.10, 0.10]
+
+  defp waited(opts) do
+    Enum.reduce(0..6, {Tracker.new(), nil}, fn n, {tracker, id} ->
+      {tracker, [tagged], _events} =
+        track(tracker, [det("person", @waiting)], [at_ms: n * @batch_ms] ++ opts)
+
+      {tracker, id || tagged.object_id}
+    end)
+  end
+
+  # The waiting object's filter after a gap of `gap_ms` closed by @resumed.
+  defp waited_gap(gap_ms, opts) do
+    opts = opts ++ @oru_opts
+    at_ms = 3_000 + gap_ms
+    {tracker, id} = waited(opts)
+
+    {tracker, id, _events} =
+      rematched({coast(tracker, 3_000 + @batch_ms, at_ms, opts), id}, @resumed, at_ms, opts)
+
+    filter(tracker, id)
+  end
+
+  # The same object over the same stretch of the same clock, with the plugin
+  # re-reporting its box through it rather than saying nothing at all.
+  defp waited_seeded(opts) do
+    opts = opts ++ @oru_opts
+    {tracker, id} = waited(opts)
+
+    tracker =
+      Enum.reduce(3_500..7_000//@batch_ms, tracker, fn ms, tracker ->
+        {tracker, [tagged], _events} =
+          track(tracker, [det("person", @waiting, kind: "tracked")], [at_ms: ms] ++ opts)
+
+        assert tagged.object_id == id
+        tracker
+      end)
+
+    {tracker, id, _events} = rematched({tracker, id}, @resumed, 7_500, opts)
+
+    filter(tracker, id)
+  end
+
+  describe "rebuilding a filter across a gap" do
+    test "with the flag off the tracker does exactly what it does without the key" do
+      for {name, expected, batches} <- flag_off_scenarios() do
+        {tracker, tagged, events} = off = replay(batches, oru: false)
+        {_opts, last_batch} = List.last(batches)
+
+        # non-vacuity, per scenario: two runs that both did nothing compare
+        # equal, so each scenario states the branches it is here for and the
+        # comparison below only means anything once they have fired
+        assert length(ids(events, :started)) == expected[:started], name
+        assert length(last_batch) - length(tagged) == expected[:dropped], name
+
+        assert tracker |> Tracker.live_tracks() |> Enum.map(&{&1.label, &1.bbox}) |> Enum.sort() ==
+                 expected[:live],
+               name
+
+        assert canonical(off) == canonical(replay(batches, [])), name
+      end
+    end
+
+    # The headline: a coast asserts the heading the object had when it vanished,
+    # and the whole of what the replay is for is that the object may not have
+    # kept it.
+    test "the rebuilt filter carries the gap's own motion, not the pre-gap heading" do
+      # the creeper turned back during the gap: three tenths of a box to the
+      # left of where it was last seen, against nine batches of rightward creep
+      turned_back = creeper(6)
+      assert Enum.at(turned_back, 0) < Enum.at(creeper(9), 0)
+
+      gap = crept_gap(6_500)
+      {off, id, _events} = rematched(gap, turned_back, 6_500, [oru: false] ++ @oru_opts)
+      {on, ^id, _events} = rematched(gap, turned_back, 6_500, [oru: true] ++ @oru_opts)
+
+      refute filter(on, id) == filter(off, id)
+
+      {off_vx, _vy} = Kalman.velocity(filter(off, id))
+      {on_vx, _vy} = Kalman.velocity(filter(on, id))
+
+      # the coasted filter comes out of the gap still heading the way it went
+      # in, one correction poorer: it has no account of the gap at all
+      assert off_vx > 0
+
+      # the rebuilt one has the gap's own pace instead — 0.03 to the left over
+      # the four steps a 2_000 ms gap is worth — learned to within a fifth
+      # (-0.0059 measured against -0.0075), since the replay's virtual points
+      # are updates like any other and the filter still smooths towards them
+      assert on_vx < 0
+      assert_in_delta on_vx, -0.03 / 4, 0.002
+    end
+
+    # The mandatory one. A seeded stretch is the plugin saying the object has
+    # not moved, and the filter is held across it for that reason; replaying
+    # synthesized motion over one would manufacture exactly the velocity the
+    # stillness rule reads to decide the object is parked.
+    test "a seeded stretch is never a gap, however long it runs" do
+      # eight seeded batches, 3_500 ms of them — well past `@oru_min_gap_ms`
+      # and well inside the window — each re-reporting the last detected box
+      # verbatim, which is what the plugin actually puts on the wire
+      assert waited_seeded(oru: true) == waited_seeded(oru: false)
+
+      # non-vacuity: the same span of the same clock with those batches absent
+      # rather than seeded is a gap, and the flag does change that filter — so
+      # what the equality above pins is the seeding and not the timing
+      refute waited_gap(4_500, oru: true) == waited_gap(4_500, oru: false)
+    end
+
+    # The test above never lets a gap open at all, so it cannot see this: a
+    # seed the plugin sends *after* a gap is a wire pattern the protocol makes
+    # near-impossible (a seed only re-reports a box the plugin is still
+    # tracking, and a stretch of silence is exactly it having stopped), but
+    # `replayed/4` refuses one for its own reason — `detected?` — and nothing
+    # else in this describe closes an in-window gap on anything but a real
+    # detection to prove that guard does the refusing.
+    test "a seed closing an in-window gap does not replay it, only a detection does" do
+      {gapped, id} =
+        Enum.reduce(0..1, {Tracker.new(), nil}, fn n, {tracker, id} ->
+          {tracker, [tagged], _events} =
+            track(tracker, [det("person", @waiting)], [at_ms: n * @batch_ms] ++ @oru_opts)
+
+          {tracker, id || tagged.object_id}
+        end)
+
+      last_detected_ms = 1 * @batch_ms
+      close_ms = 3_000
+      gapped = coast(gapped, last_detected_ms + @batch_ms, close_ms, @oru_opts)
+
+      # non-vacuity: the gap the closing batch below sees is inside the
+      # window `replayed/4` gates on (its own `@oru_min_gap_ms` and
+      # `@oru_max_gap_ms`), computed from the same clocks the fixture above
+      # used rather than restated as a bare number
+      gap_ms = close_ms - last_detected_ms
+      assert gap_ms >= 1_000 and gap_ms <= 10_000
+
+      # same box, same gap, same flag — only `kind` and `oru` vary per call,
+      # so any difference between the four is theirs alone
+      close = fn kind, opts ->
+        {tracker, [tagged], _events} =
+          track(
+            gapped,
+            [det("person", @waiting, kind: kind)],
+            [at_ms: close_ms] ++ @oru_opts ++ opts
+          )
+
+        assert tagged.object_id == id
+        filter(tracker, id)
+      end
+
+      # the seed: `detected?` is false, so `replayed/4` never reaches the gap
+      # check at all — the flag cannot matter, and the filter it leaves is
+      # whatever the coast above already set
+      assert close.("tracked", oru: true) == close.("tracked", oru: false)
+
+      # the same gap, closed by a real detection instead: now the flag does
+      # change the filter, so `detected?` is the only thing that kept the
+      # seeded run above from a refit
+      refute close.("detected", oru: true) == close.("detected", oru: false)
+    end
+
+    test "gaps outside the window leave the filter exactly as the flag-off run does" do
+      # one batch: under `@oru_min_gap_ms`, where a coasted filter is still
+      # close to what it last measured
+      assert waited_gap(@batch_ms, oru: true) == waited_gap(@batch_ms, oru: false)
+
+      # and past `@oru_max_gap_ms`, where a straight line between two sightings
+      # is a guess of its own
+      assert waited_gap(10_500, oru: true) == waited_gap(10_500, oru: false)
+
+      # non-vacuity, and the window's own edges: both bounds are inclusive, so
+      # the two gaps just inside the pair above do rebuild
+      refute waited_gap(1_000, oru: true) == waited_gap(1_000, oru: false)
+      refute waited_gap(10_000, oru: true) == waited_gap(10_000, oru: false)
+    end
+
+    # A virtual observation feeds the filter and nothing else: it is not a box
+    # the track was seen at, not a sign of life, and not something anything
+    # downstream is told about.
+    test "the replay moves the filter and no other field of the track" do
+      gap = crept_gap(6_500)
+      {off, id, off_events} = rematched(gap, creeper(6), 6_500, [oru: false] ++ @oru_opts)
+      {on, ^id, on_events} = rematched(gap, creeper(6), 6_500, [oru: true] ++ @oru_opts)
+
+      assert off_events == on_events
+
+      # `still_velocity` is the one field left out, and deliberately: it is the
+      # stillness rule's readout *of* the filter — the drift it averages is
+      # `Kalman.velocity/1` — so a rebuilt filter is read by the very next
+      # evaluation. That is the intended consequence and the moduledoc says so;
+      # everything else about the track is bookkeeping the virtual points may
+      # not touch, clocks and stillness run included.
+      dropped = [:kalman, :still_velocity]
+
+      assert Map.drop(on.objects[id], dropped) == Map.drop(off.objects[id], dropped)
+      refute on.objects[id].still_velocity == off.objects[id].still_velocity
     end
   end
 end
