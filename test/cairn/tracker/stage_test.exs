@@ -73,6 +73,18 @@ defmodule Cairn.Tracker.StageTest do
     assert two =~ "per_object/5"
   end
 
+  test "malformed shapes come back as errors, never raises" do
+    # The function's destiny is config-load validation, so config-derived
+    # garbage must surface through {:error, _}, not a KeyError.
+    assert {:error, message} = Stage.validate_lists(%{association_one: []})
+    assert message =~ "must be a map with"
+
+    assert {:error, message} = Stage.validate_lists(lists(per_object: [Stage.Oru]))
+    assert message =~ "not a `{module, params}` tuple"
+
+    assert {:error, _message} = Stage.validate_lists(lists(association_one: [{"bbd", %{}}]))
+  end
+
   test "a module that cannot be loaded names that mistake, not a kind mismatch" do
     assert {:error, message} =
              Stage.validate_lists(lists(association_one: [{Cairn.Tracker.Stage.Typo, %{}}]))

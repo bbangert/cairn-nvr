@@ -157,13 +157,37 @@ defmodule Cairn.Tracker.Stage do
   """
   @spec validate_lists(lists()) :: :ok | {:error, String.t()}
   def validate_lists(lists) do
-    with :ok <- validate_kinds(lists.association_one, :batch, "association one"),
+    with :ok <- validate_shape(lists),
+         :ok <- validate_kinds(lists.association_one, :batch, "association one"),
          :ok <- validate_kinds(lists.association_two, :batch, "association two"),
          :ok <- validate_kinds(lists.per_object, :per_object, "per-object"),
          :ok <- validate_adjacency(lists.association_one, "association one"),
          :ok <- validate_adjacency(lists.association_two, "association two") do
       validate_pairing(lists)
     end
+  end
+
+  # Shape before semantics, so every helper below may assume well-formed
+  # entries and a caller handing this config-derived data gets an `{:error, _}`
+  # it can surface, never a raise. The tracker-side translation always builds
+  # valid shapes; this exists for the config loader this validation moves to.
+  defp validate_shape(%{association_one: one, association_two: two, per_object: per})
+       when is_list(one) and is_list(two) and is_list(per) do
+    Enum.find_value(one ++ two ++ per, :ok, fn
+      {module, params} when is_atom(module) and is_map(params) ->
+        nil
+
+      entry ->
+        {:error,
+         "stage list entry #{inspect(entry)} is not a `{module, params}` tuple " <>
+           "with an atom module and a params map"}
+    end)
+  end
+
+  defp validate_shape(other) do
+    {:error,
+     "stage lists must be a map with association_one, association_two and " <>
+       "per_object lists, got: #{inspect(other)}"}
   end
 
   defp validate_kinds(list, kind, where) do
