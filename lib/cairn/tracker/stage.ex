@@ -170,23 +170,27 @@ defmodule Cairn.Tracker.Stage do
     {callback, arity} = if kind == :batch, do: {:call, 2}, else: {:per_object, 5}
 
     Enum.find_value(list, :ok, fn {module, _params} ->
-      case Code.ensure_loaded(module) do
-        {:module, ^module} ->
-          unless function_exported?(module, callback, arity) do
-            {:error,
-             "#{inspect(module)} is listed at the #{where} point but does not " <>
-               "export #{callback}/#{arity} — it is not a #{kind} stage and would never run there"}
-          end
-
-        {:error, reason} ->
-          # Distinct from the wrong-kind message: a typo'd module name is a
-          # different mistake than a stage in the wrong slot, and the error
-          # should say which one was made.
-          {:error,
-           "#{inspect(module)} is listed at the #{where} point but cannot be " <>
-             "loaded (#{inspect(reason)})"}
-      end
+      kind_error(module, {callback, arity}, kind, where)
     end)
+  end
+
+  defp kind_error(module, {callback, arity}, kind, where) do
+    case Code.ensure_loaded(module) do
+      {:module, ^module} ->
+        unless function_exported?(module, callback, arity) do
+          {:error,
+           "#{inspect(module)} is listed at the #{where} point but does not " <>
+             "export #{callback}/#{arity} — it is not a #{kind} stage and would never run there"}
+        end
+
+      {:error, reason} ->
+        # Distinct from the wrong-kind message: a typo'd module name is a
+        # different mistake than a stage in the wrong slot, and the error
+        # should say which one was made.
+        {:error,
+         "#{inspect(module)} is listed at the #{where} point but cannot be " <>
+           "loaded (#{inspect(reason)})"}
+    end
   end
 
   defp validate_adjacency(list, where) do
