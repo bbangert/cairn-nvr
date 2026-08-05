@@ -193,9 +193,9 @@ traced to the detector, which never scored them above 0.28).
 # terminal 1 — the usual control-line brace group; sleep past the clip
 { echo '{"spec":"cairn.plugin","version":1,"type":"stream.started","camera_id":"test","stream_epoch":"01K0TESTEPOCH00000000000000","rtp":{"clock_rate":90000}}'
   sleep 45; } \
-  | ../target/release/cairn-detect --model <the camera's model> \
+  | ../target/release/cairn-detect --model <the camera model> \
       --labels <its labels> --camera-id test --udp-port 18100 \
-      --min-score-json '<the camera's own min_score map>' \
+      --min-score-json '<the min_score map from the camera config>' \
   > event-redetect.ndjson 2> event-redetect.stderr
 
 # terminal 2 — once `cairn-detect up:` appears; duration ≥ the clip's
