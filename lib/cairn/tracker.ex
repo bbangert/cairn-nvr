@@ -1677,7 +1677,10 @@ defmodule Cairn.Tracker do
   the ordering costs it nothing and it is not worth a second function to
   skip.
   """
-  @spec duplicate_of([{term(), %{label: String.t(), bbox: bbox()}}], map()) :: term() | nil
+  @spec duplicate_of(
+          [{term(), %{:label => String.t(), :bbox => bbox(), optional(any()) => any()}}],
+          %{:label => String.t(), :bbox => bbox(), optional(any()) => any()}
+        ) :: term() | nil
   def duplicate_of(candidates, object) do
     overlaps =
       for {id, tracked} <- candidates,
