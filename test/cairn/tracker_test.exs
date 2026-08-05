@@ -3474,7 +3474,7 @@ defmodule Cairn.TrackerTest do
       assert [%Track{object_id: ^id, bbox: ^resumed}] = Tracker.live_tracks(on)
     end
 
-    # The label gate is the IoU pass's, and `bbd_pairs/3` carries it unchanged:
+    # The label gate is the IoU pass's, and `Stage.Bbd` carries it unchanged:
     # centre distance is a second way to admit a comparable pair, never a way
     # around what makes two boxes comparable. It is also where the gate carries
     # the most weight — a car and a person a few tenths apart overlap at zero

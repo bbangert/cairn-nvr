@@ -235,16 +235,18 @@ defmodule Cairn.Tracker do
   track has gone unpositioned, which separates exactly those cases.
 
   With the flag on, a pair that fails `match_threshold/2` and passes that
-  distance is admitted as well. Nothing about the IoU half changes: its pairs
-  are built, ordered and greedily spent first, so a distance-admitted pair can
-  only take a track and an object that both came through untaken, and every
-  IoU-calibrated threshold in this module still means what it did. Stationary
-  tracks are left out of the second gate altogether — see `bbd_pairs/3`, and
-  the grace above, whose whole safety is that a parked identity answers to one
-  number and no other.
+  distance is admitted as well — by `Cairn.Tracker.Stage.Bbd`, the batch
+  stage `batch_stages/1` lists for the flag, run immediately after each IoU
+  association pass and seeded with its accumulator. Nothing about the IoU
+  half changes: its pairs are built, ordered and greedily spent first, so a
+  distance-admitted pair can only take a track and an object that both came
+  through untaken, and every IoU-calibrated threshold in this module still
+  means what it did. Stationary tracks are left out of the second gate
+  altogether — the stage's doc says why, alongside the grace above, whose
+  whole safety is that a parked identity answers to one number and no other.
 
-  With the flag off — the default — none of this runs and association is the
-  rest of this doc entire.
+  With the flag off — the default — the stage list is empty, none of this
+  runs, and association is the rest of this doc entire.
 
   ## Two stages: what a low-confidence box may do
 
@@ -520,7 +522,7 @@ defmodule Cairn.Tracker do
 
   alias Cairn.Observation
   alias Cairn.Track
-  alias Cairn.Tracker.Bbd
+  alias Cairn.Tracker.Batch
   alias Cairn.Tracker.Kalman
   alias Cairn.Tracker.Stage
   alias Cairn.ULID
@@ -1131,18 +1133,25 @@ defmodule Cairn.Tracker do
   # The overlap is taken against each track's *predicted* box, computed once
   # per track for the whole batch and never stored (`predicted_box/1`).
   #
-  # With `tracking.bbd` on — off by default — a second list of pairs the IoU
-  # gate refused is offered after that one, admitted on centre distance
-  # instead (`bbd_pairs/3`). It only ever adds pairs: the IoU list is built and
-  # ordered exactly as it is without the flag, and is greedily spent first.
+  # With `tracking.bbd` on — off by default — a second admission runs
+  # immediately after each IoU pass: `Cairn.Tracker.Stage.Bbd`, a batch stage
+  # seeded with the pass's accumulator, admitting on centre distance the pairs
+  # the IoU gate refused. It only ever adds pairs: the IoU list is built,
+  # ordered and spent exactly as it is without the stage, and the seeded
+  # reduce is bit-identical to appending (`Cairn.Tracker.Batch.spend/2`'s
+  # doc carries the equivalence and its adjacency condition).
   #
   # What is left over then goes through `adopt/4`, stage two,
   # `suppress_duplicates/4` and `suppress_twin_mints/2`, so the result can also
   # carry `:drop`s, revived suspensions and a tracker whose refused tracks have
-  # been marked seen — which is why this returns a tracker where the greedy half
-  # alone would not have to.
+  # been marked seen — which is why this returns a tracker where the
+  # association passes alone would not have to.
   #
-  # The five run in that order, for reasons that are separate.
+  # The passes run in that order, for reasons that are separate. The substrate
+  # is fixed code — only the admission companions after each association pass
+  # are stages (`batch_stages/1`), because that is where composition is real;
+  # everything else here has zero legal reordering freedom (the C1-C13
+  # constraint extraction in the stage-chain research).
   #
   # Adoption comes after the stage-one live pass because a track this scene is
   # *currently* seeing outranks a ghost of it: the incumbent-wins convention,
@@ -1188,19 +1197,72 @@ defmodule Cairn.Tracker do
     # arithmetic at the detection cap.
     candidates = for {id, tracked} <- tracker.objects, do: {id, tracked, predicted_box(tracked)}
 
-    matched = greedy(new_assignment(), above_floor, candidates, context)
-    {tracker, matched, adopted} = adopt(tracker, above_floor, matched, context)
-    matched = stage_two(matched, below_floor, candidates, context)
+    stages = batch_stages(context)
 
-    {tracker, assignments} = suppress_duplicates(tracker, indexed, matched, context)
-    {tracker, suppress_twin_mints(indexed, assignments), adopted}
+    batch =
+      %Batch{
+        tracker: tracker,
+        context: context,
+        indexed: indexed,
+        above_floor: above_floor,
+        below_floor: below_floor,
+        candidates: candidates
+      }
+      |> association_one()
+      |> run_batch_stages(stages)
+      |> adoption()
+      |> association_two()
+      |> run_batch_stages(stages)
+      |> spend_stage_two_leftovers()
+
+    {tracker, assignments} =
+      suppress_duplicates(batch.tracker, indexed, batch.assignment, context)
+
+    {tracker, suppress_twin_mints(indexed, assignments), batch.adopted}
   end
 
-  # The accumulator every pass shares: the assignment map, the object indices
-  # spent, and the track ids taken. Threading one through all of them is what
-  # makes "each object and each track used once" hold *across* stages and not
-  # only within one.
-  defp new_assignment, do: {%{}, MapSet.new(), MapSet.new()}
+  # Stage one: the live IoU pass over the evidence tier.
+  defp association_one(batch) do
+    pairs = iou_pairs(batch.above_floor, batch.candidates, batch.context)
+    %{batch | association: :one, assignment: Batch.spend(batch.assignment, pairs)}
+  end
+
+  # The low-confidence half: match what stage one and adoption left. Nothing
+  # admitted here can mint (a spent index never reaches `apply_object/6` as
+  # `:new`) or adopt (`adopt/4` was handed stage one's objects and has already
+  # run) — `spend_stage_two_leftovers/1` is what enforces the first half of
+  # that, after this pass's admission companions have run.
+  defp association_two(batch) do
+    free = free_candidates(batch.candidates, batch.assignment)
+    pairs = iou_pairs(batch.below_floor, free, batch.context)
+    %{batch | association: :two, assignment: Batch.spend(batch.assignment, pairs)}
+  end
+
+  defp adoption(batch) do
+    {tracker, assignment, adopted} =
+      adopt(batch.tracker, batch.above_floor, batch.assignment, batch.context)
+
+    %{batch | tracker: tracker, assignment: assignment, adopted: adopted}
+  end
+
+  defp spend_stage_two_leftovers(batch),
+    do: %{batch | assignment: spend_leftovers(batch.assignment, batch.below_floor)}
+
+  # Each insertion point runs the same list, in list order — which is how the
+  # transitional translation satisfies `Cairn.Tracker.Stage.Bbd`'s
+  # both-points-or-neither constraint by construction rather than by check.
+  defp run_batch_stages(batch, stages) do
+    Enum.reduce(stages, batch, fn {stage, params}, batch -> stage.call(batch, params) end)
+  end
+
+  # Transitional: the batch-stage list is translated from the `bbd` boolean
+  # the existing plumbing already carries, exactly as `per_object_stages/1`
+  # translates `oru` — the flag is spent here and only here, a listed stage
+  # runs unconditionally (see "Gating" in `Cairn.Tracker.Stage.Bbd`), and a
+  # configured stage list replaces this translation when profiles land.
+  defp batch_stages(context) do
+    if Map.get(context, :bbd), do: [{Stage.Bbd, %{}}], else: []
+  end
 
   # This batch's objects split at the camera's evidence floor, per label with
   # the same `"default"`-then-0.5 fallback `Cairn.CameraTracker` gates evidence
@@ -1225,14 +1287,14 @@ defmodule Cairn.Tracker do
 
   defp floor_for(floors, label), do: Map.get(floors, label) || Map.get(floors, "default", 0.5)
 
-  # One greedy pass over the pairs `indexed` and `candidates` can make, seeded
-  # with what earlier passes already spent. Stage two hands this the same
-  # builder as stage one — same label gate, same predicted boxes, same
-  # `match_threshold/2`, same sort key, and the same BBD admission where the
-  # flag is on — because a low-confidence box that does match is a real
-  # detection and gets a real match; the only thing that makes it a lesser box
-  # is what it is *not* allowed to do afterwards.
-  defp greedy(matched, indexed, candidates, context) do
+  # The IoU pairs one association pass offers, best first. Stage two uses this
+  # same builder as stage one — same label gate, same predicted boxes, same
+  # `match_threshold/2`, same sort key — because a low-confidence box that
+  # does match is a real detection and gets a real match; the only thing that
+  # makes it a lesser box is what it is *not* allowed to do afterwards. The
+  # same holds for the BBD admission, which is why `Cairn.Tracker.Stage.Bbd`
+  # runs after both passes or neither (its pairing constraint).
+  defp iou_pairs(indexed, candidates, context) do
     pairs =
       for {object, index} <- indexed,
           {id, tracked, predicted} <- candidates,
@@ -1247,99 +1309,12 @@ defmodule Cairn.Tracker do
     # sort would then resolve two identically-overlapping candidates by that
     # incidental order. `index` before `id` keeps "earlier object in the batch
     # wins", matching the incumbent-wins convention elsewhere.
-    iou_pairs = Enum.sort_by(pairs, fn {overlap, index, id} -> {-overlap, index, id} end)
-
-    # Plain concatenation, and that is the whole of how the two admissions rank
-    # against each other: every IoU pair is offered before every BBD pair, so a
-    # BBD pair can neither outrank one nor reorder the list it is appended to.
-    # The reduce's own bookkeeping is what dedups across the join — a track or
-    # an object an IoU pair took is already spent by the time the BBD half is
-    # reached, so the second list can only fill in what the first left free.
-    ordered = iou_pairs ++ bbd_pairs(indexed, candidates, context)
-
-    Enum.reduce(ordered, matched, fn {_cost, index, id}, {assignments, objects, tracks} = acc ->
-      if MapSet.member?(objects, index) or MapSet.member?(tracks, id) do
-        acc
-      else
-        {Map.put(assignments, index, id), MapSet.put(objects, index), MapSet.put(tracks, id)}
-      end
-    end)
-  end
-
-  # The second admission, `tracking.bbd` only: pairs the IoU gate refused, near
-  # enough by `Cairn.Tracker.Bbd`'s centre distance to be the same object.
-  # Additive and nothing else — no IoU-calibrated constant moves, and a pair
-  # that clears `match_threshold/2` is matched on its overlap exactly as it was
-  # before this existed. What it is for is the case IoU cannot express at all:
-  # two boxes that do not touch have an overlap of exactly zero however near
-  # they are, so after a coast long enough for a walker to clear its own width
-  # the right pair and every wrong one are indistinguishable, and the track
-  # loses its identity to a mint.
-  #
-  # Stationary tracks are excluded, and that exclusion is what keeps
-  # `@stationary_match_iou` meaning what it says. A parked object's
-  # re-detections overlap its own box by definition, so this could only ever
-  # widen a parked track's admission to boxes it is *deliberately* refusing —
-  # the passer-by that the grace exists to keep out is exactly a same-label
-  # detection a short distance from a stationary track, which is to say exactly
-  # what BBD admits.
-  #
-  # Sorted ascending, since a small distance is a good pair where a large
-  # overlap was, and by the same total key as the IoU half for the same reason:
-  # `candidates` comes off a map, and two equal distances must not be resolved
-  # by its iteration order.
-  defp bbd_pairs(indexed, candidates, context) do
-    if Map.get(context, :bbd) do
-      # `candidates` outermost, unlike the IoU comprehension above: the elapsed
-      # time is a property of the track alone, so this computes one per
-      # candidate rather than one per pair. The sort key is total, so nothing
-      # depends on the order the pairs come out in.
-      pairs =
-        for {id, tracked, predicted} <- candidates,
-            not tracked.stationary,
-            delta_tau_s = elapsed_s(tracked, context),
-            {object, index} <- indexed,
-            tracked.label == object.label,
-            iou(predicted, object.bbox) < match_threshold(tracked, context),
-            distance = Bbd.distance(predicted, object.bbox, delta_tau_s),
-            Bbd.admit?(distance) do
-          {distance, index, id}
-        end
-
-      Enum.sort_by(pairs, fn {distance, index, id} -> {distance, index, id} end)
-    else
-      []
-    end
-  end
-
-  # How long since the track last took a box, in seconds because
-  # `Cairn.Tracker.Bbd`'s clip bounds are published in them and this module's
-  # clocks are milliseconds. `last_matched_ms` and not `last_seen_ms`: what the
-  # covariance is built out of is the age of the last position fix, and a track
-  # marked seen by a box it refused was not positioned by it (`seen/3`).
-  #
-  # The pattern match is an assertion and not a guard against real data: every
-  # live track carries this from `new_track/3` on and nothing unsets it, so a
-  # nil here is a broken invariant rather than a gap to default over — and any
-  # default would be an invented elapsed time, which is precisely the quantity
-  # the gate's width is derived from.
-  defp elapsed_s(%{last_matched_ms: last_matched_ms}, context) when is_number(last_matched_ms),
-    do: (context.at_ms - last_matched_ms) / 1_000
-
-  # The low-confidence half: match what is left, then spend the rest. Nothing
-  # here can mint (a spent index never reaches `apply_object/6` as `:new`) or
-  # adopt (`adopt/4` was handed stage one's objects and has already run).
-  defp stage_two(matched, [], _candidates, _context), do: matched
-
-  defp stage_two(matched, below_floor, candidates, context) do
-    matched
-    |> greedy(below_floor, free_candidates(candidates, matched), context)
-    |> spend_leftovers(below_floor)
+    Enum.sort_by(pairs, fn {overlap, index, id} -> {-overlap, index, id} end)
   end
 
   # The live tracks stage one left over. A pre-filter and not the invariant —
-  # `greedy/4`'s own reduce rejects a taken track anyway — but the pair list
-  # stage two sorts is the smaller for it.
+  # `Cairn.Tracker.Batch.spend/2` rejects a taken track anyway — but the pair
+  # list stage two sorts is the smaller for it.
   #
   # A track this batch revived out of suspension is not in `candidates` at all,
   # and not because of the test below: `assign/3` builds that list off
@@ -1556,7 +1531,7 @@ defmodule Cairn.Tracker do
     %{tracker | suspended: suspended, objects: Map.put(tracker.objects, id, tracked)}
   end
 
-  # Every object still unmatched after both greedy passes and `adopt/4`,
+  # Every object still unmatched after both association passes and `adopt/4`,
   # against every live track there is: an overlap of
   # `@duplicate_suppression_iou` or more with a same-label track is read as
   # that track's object again, and minting for it is how one object ends up
@@ -1658,7 +1633,7 @@ defmodule Cairn.Tracker do
   # Best score first, ties by batch index, and each box is weighed against the
   # ones already kept: the box kept is the one that goes on to mint and the rest
   # are dropped, marking nothing seen, because there is no track to mark. The
-  # sort key is total on the house rule `greedy/4`'s keys are written to — two
+  # sort key is total on the house rule `iou_pairs/3`'s keys are written to — two
   # equally-scored boxes are separated by the earlier one in the batch and never
   # by which order a sort happened to leave them in. The boxes not yet reached
   # are no part of the test either, which is what keeps a row of overlapping
@@ -1751,25 +1726,33 @@ defmodule Cairn.Tracker do
     })
   end
 
-  # Strict only while a stationary track is in extended grace — already unseen
-  # past `max_unseen_ms`, so nothing is currently confirming the identity an
-  # overlapping box would inherit. A track being seen normally matches at the
-  # base threshold, and must: see `@stationary_match_iou` for what dropping
-  # that distinction costs.
-  #
-  # For a stationary track this remains the *whole* admission, `tracking.bbd`
-  # or not: `bbd_pairs/3` excludes stationary tracks precisely so that what a
-  # parked identity will answer to stays one number. For a moving track under
-  # the flag it is no longer the only way in — a pair it refuses may still be
-  # admitted on centre distance — which is why it is read there too, to decide
-  # which pairs the second gate is even offered.
-  defp match_threshold(%{stationary: true} = tracked, context) do
+  @doc """
+  The IoU a candidate track demands of a pair, per track.
+
+  Strict only while a stationary track is in extended grace — already unseen
+  past `max_unseen_ms`, so nothing is currently confirming the identity an
+  overlapping box would inherit. A track being seen normally matches at the
+  base threshold, and must: see `@stationary_match_iou` for what dropping
+  that distinction costs.
+
+  Two callers on purpose, and public for the second: `iou_pairs/3` reads it
+  to decide which pairs exist at all, and `Cairn.Tracker.Stage.Bbd` reads
+  the same number to decide which pairs the second gate is even offered — a
+  pair is BBD's to weigh exactly when this refused it, so the two admissions
+  partitioning the pair space depends on them reading one threshold.
+
+  For a stationary track this remains the *whole* admission, `tracking.bbd`
+  or not: the BBD stage excludes stationary tracks precisely so that what a
+  parked identity will answer to stays one number.
+  """
+  @spec match_threshold(map(), context()) :: number()
+  def match_threshold(%{stationary: true} = tracked, context) do
     if context.at_ms - tracked.last_seen_ms > context.max_unseen_ms,
       do: @stationary_match_iou,
       else: @iou_threshold
   end
 
-  defp match_threshold(_tracked, _context), do: @iou_threshold
+  def match_threshold(_tracked, _context), do: @iou_threshold
 
   # Returns the ids this batch **touched** alongside the rest: every track it
   # updated (a match of either stage, an adoption) or minted. That set is the
