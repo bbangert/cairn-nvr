@@ -118,6 +118,22 @@ defmodule Cairn.Tracker do
   until it separates. The threshold is chosen so that ordinary adjacency — two
   cars nose to tail, at 1/3 — stays below it and mints.
 
+  All of that needs the track to exist, and the same two boxes arrive before it
+  does: on the batch an object is first detected — the tracker's first, or any
+  later one an object walks into — a detector without NMS emits its pair with
+  no live track for either box to be read against, and both mint. So the rule
+  is asked once more with the last candidate gone. Among the boxes of one batch
+  that are about to mint, taken best score first, one that overlaps a
+  same-label box already kept by `@duplicate_suppression_iou` or more is
+  **dropped** rather than minted — and nothing is marked seen, because there is
+  no track to mark. Only would-be mints compete: a box that could match a
+  track, resume a suspension or be suppressed against a live one has already
+  done it, so the drop stays the last answer here as everywhere else. And it
+  has to happen on that first batch, because nothing later reopens it — once a
+  twinned pair exists, every subsequent double box matches one box to each of
+  the two tracks, a matched box is never a leftover, and the pair sustains
+  itself for as long as the detector goes on emitting it.
+
   What the grace does not require is *detections*: `last_seen_ms` moves on
   predicted observations too and the stillness rule ignores them, so a plugin
   that keeps predicting a box at the parked position holds the identity and
@@ -332,8 +348,9 @@ defmodule Cairn.Tracker do
   manufactures the second identity it was there to prevent. What keeps the
   loose rule from producing a duplicate of its own — a second box of the object
   it has just resumed — is the duplicate suppression that still runs after it,
-  last of all, with nothing between the two but stage two spending its own
-  leftovers. `@stitch_iou` is picked from the same geometry
+  with nothing between the two but stage two spending its own leftovers, and
+  which weighs that second box against the track the adoption has by then put
+  back in the live set. `@stitch_iou` is picked from the same geometry
   as `@duplicate_suppression_iou` — under it, an overlap is ordinary same-label
   adjacency (two cars nose to tail sit at 1/3) rather than the object again —
   and may never be the looser of the two (currently they are equal; the guard
@@ -563,6 +580,14 @@ defmodule Cairn.Tracker do
   # before it reads as that track's object again — and is dropped — instead of
   # as a new object. Two different ways a batch gets there, and one number
   # serves both.
+  #
+  # It answers one question that is not about a track at all, on the same
+  # geometry and the same label gate: two boxes that are both about to mint,
+  # overlapping each other this much, are one object being born twice
+  # (`suppress_twin_mints/2`). Everything below is written about a box and a
+  # track because that is the case the number was picked on, and it transfers
+  # whole — what the paragraphs argue about is a pair of same-label boxes, and
+  # a track is only ever weighed here through the last box it was seen at.
   #
   # The track is free, on one of two roads. Either some `match_threshold/2`
   # said no — which makes this the other half of `@stationary_match_iou`,
@@ -926,10 +951,11 @@ defmodule Cairn.Tracker do
   in the order given, and the lifecycle events this observation caused.
 
   An object the tracker refuses — a new identity at the live-track cap with
-  nothing evictable, a detection dropped as a duplicate of a live same-label
-  track it overlaps (`@duplicate_suppression_iou`), or a below-floor object
-  that took no live track (see the moduledoc's two stages) — is absent from the
-  tagged list, so `tagged` may be shorter than `objects`.
+  nothing evictable, a detection dropped as a duplicate (of a live same-label
+  track it overlaps, or of a better-scored box in this same batch that is about
+  to mint for the same object, both at `@duplicate_suppression_iou`), or a
+  below-floor object that took no live track (see the moduledoc's two stages) —
+  is absent from the tagged list, so `tagged` may be shorter than `objects`.
 
   Every live track this batch neither matched nor minted is **coasted** once
   after the assignments are applied: one step of its motion filter, so that
@@ -1180,13 +1206,13 @@ defmodule Cairn.Tracker do
   # instead (`bbd_pairs/3`). It only ever adds pairs: the IoU list is built and
   # ordered exactly as it is without the flag, and is greedily spent first.
   #
-  # What is left over then goes through `adopt/4`, stage two and
-  # `suppress_duplicates/4`, so the result can also carry `:drop`s, revived
-  # suspensions and a tracker whose refused tracks have been marked seen —
-  # which is why this returns a tracker where the greedy half alone would not
-  # have to.
+  # What is left over then goes through `adopt/4`, stage two,
+  # `suppress_duplicates/4` and `suppress_twin_mints/2`, so the result can also
+  # carry `:drop`s, revived suspensions and a tracker whose refused tracks have
+  # been marked seen — which is why this returns a tracker where the greedy half
+  # alone would not have to.
   #
-  # The four run in that order, for reasons that are separate.
+  # The five run in that order, for reasons that are separate.
   #
   # Adoption comes after the stage-one live pass because a track this scene is
   # *currently* seeing outranks a ghost of it: the incumbent-wins convention,
@@ -1198,7 +1224,7 @@ defmodule Cairn.Tracker do
   # not enough of it — so every suspension has already had its pick of the
   # boxes that could stitch it before stage two runs at all.
   #
-  # Suppression comes last, as it always has: a box that would have been
+  # Suppression comes after all three of those: a box that would have been
   # dropped as somebody's duplicate may be the very detection that resumes an
   # identity or carries one through an occlusion — the drop must be the last
   # answer, not the first. Adoption running before it also puts what it revived
@@ -1206,10 +1232,19 @@ defmodule Cairn.Tracker do
   # the same batch, which is why suppression re-reads its candidates off the
   # tracker instead of taking `candidates` below.
   #
-  # Stage two's own leftovers never reach suppression: `spend_leftovers/2`
-  # gives each one `:drop` and marks its index used as the stage closes, so the
-  # only boxes suppression weighs are stage one's, and a below-floor box can
-  # neither be minted for nor mark a track seen. The partition is on the
+  # The twin pass comes after suppression because it is the same drop rule with
+  # its last candidate removed: it weighs the boxes this batch is about to mint
+  # for against each other, and which boxes those are is only known once every
+  # pass that could have spent one otherwise has run. Suppression is
+  # also the pass that can shrink its input — a box dropped against a live
+  # track never reaches the twin pass at all — which is the order the drop rule
+  # wants, since a box read as an existing object's is not a candidate to be a
+  # new one's twin.
+  #
+  # Stage two's own leftovers never reach either suppression pass:
+  # `spend_leftovers/2` gives each one `:drop` and marks its index used as the
+  # stage closes, so the only boxes weighed are stage one's, and a below-floor
+  # box can neither be minted for nor mark a track seen. The partition is on the
   # evidence floor, which is what makes that safe to do: nothing that could
   # have earned video is in the half being spent, so no evidence-eligible
   # detection is ever starved of a mint by stage two.
@@ -1228,7 +1263,7 @@ defmodule Cairn.Tracker do
     matched = stage_two(matched, below_floor, candidates, context)
 
     {tracker, assignments} = suppress_duplicates(tracker, indexed, matched, context)
-    {tracker, assignments, adopted}
+    {tracker, suppress_twin_mints(indexed, assignments), adopted}
   end
 
   # The accumulator every pass shares: the assignment map, the object indices
@@ -1392,7 +1427,10 @@ defmodule Cairn.Tracker do
   # in one step. The marking is what keeps `suppress_duplicates/4` from ever
   # seeing one: a box this weak may not mint, and it may not mark a track seen
   # either, or detector noise near a live track would hold that track alive
-  # through `seen/3` for as long as the noise kept arriving.
+  # through `seen/3` for as long as the noise kept arriving. The `:drop` is what
+  # keeps `suppress_twin_mints/2` from counting one as a would-be mint, on the
+  # first half of that same rule — the mint set there is exactly the indices
+  # with no entry in the map.
   defp spend_leftovers(matched, below_floor) do
     Enum.reduce(below_floor, matched, fn {_object, index}, {assignments, objects, tracks} = acc ->
       if MapSet.member?(objects, index) do
@@ -1620,6 +1658,13 @@ defmodule Cairn.Tracker do
   # minting for it gives one parked car two concurrent tracks — the observed
   # failure had their two boxes overlapping at 0.78, twice this threshold.
   #
+  # That reading needs the track to *exist*, which is what bounds this rule and
+  # not how it is ordered: an object detected twice in a batch where it has no
+  # live track yet — its first, whether the tracker's or the scene's — has
+  # nothing here for either box to be read as a duplicate of. That case is
+  # `suppress_twin_mints/2`, below, and it is the same threshold and the same
+  # label gate weighed between the two boxes instead.
+  #
   # What keeps a genuinely new object over a tracked one mintable is therefore
   # the same-label guard in `duplicate_of/2` and not the state of the track: a
   # person in front of a tracked car is a different label and mints. Within one
@@ -1648,6 +1693,54 @@ defmodule Cairn.Tracker do
 
   defp drop(assignments, index), do: Map.put(assignments, index, :drop)
 
+  # The same drop rule with its last candidate gone: where `duplicate_of/2` has
+  # no live track to read a leftover box as, the other boxes this batch is
+  # about to mint for are what is left to weigh it against. Two same-label boxes
+  # overlapping by `@duplicate_suppression_iou` or more, neither of which took a
+  # track, are one object arriving for the first time, and minting for both is
+  # how that object is born already twinned.
+  #
+  # No ordering of `suppress_duplicates/4` reaches this: the track it would
+  # weigh against is minted in `apply_assignments/5`, after every pass in
+  # `assign/3` has run, so on the batch an object first appears in there is
+  # nothing live for either of its boxes to be a duplicate of. Nor does a later
+  # batch get the case back — once both boxes have minted, greedy matches one to
+  # each twin, and a matched box is never a leftover, so suppression is never
+  # offered either of them again. The pair is self-sustaining from its first
+  # batch, which is why the drop has to happen on that batch or not at all.
+  #
+  # A would-be mint is an index with no entry in `assignments`, which is
+  # `apply_object/6`'s own reading of the map and the whole definition of the
+  # mint set. Everything else has therefore already been spent under a track id
+  # or a `:drop` — matched in either stage, adopted, suppressed against a live
+  # track, or spent as a stage-two leftover — so a box that could still have
+  # done something other than mint is not in here to compete, and the only
+  # answer this can change is `:new` to `:drop`.
+  #
+  # Best score first, ties by batch index, and each box is weighed against the
+  # ones already kept: the box kept is the one that goes on to mint and the rest
+  # are dropped, marking nothing seen, because there is no track to mark. The
+  # sort key is total on the house rule `greedy/4`'s keys are written to — two
+  # equally-scored boxes are separated by the earlier one in the batch and never
+  # by which order a sort happened to leave them in. The boxes not yet reached
+  # are no part of the test either, which is what keeps a row of overlapping
+  # neighbours from collapsing to one: what a box is weighed against is the ones
+  # already *kept*, so it mints whatever it overlaps that was dropped.
+  defp suppress_twin_mints(indexed, assignments) do
+    minting =
+      for {object, index} <- indexed, not Map.has_key?(assignments, index), do: {index, object}
+
+    minting
+    |> Enum.sort_by(fn {index, object} -> {-object.score, index} end)
+    |> Enum.reduce({[], assignments}, fn {index, object}, {kept, assignments} ->
+      case duplicate_of(kept, object) do
+        nil -> {[{index, object} | kept], assignments}
+        _twin -> {kept, drop(assignments, index)}
+      end
+    end)
+    |> elem(1)
+  end
+
   # A refused box is a sign of life only for a track this batch left unmatched:
   # that is the track for which it is the *only* one. A matched track was
   # genuinely observed, and the two fields `seen/3` moves are two
@@ -1660,16 +1753,26 @@ defmodule Cairn.Tracker do
     if MapSet.member?(tracks, id), do: tracker, else: seen(tracker, id, context)
   end
 
-  # The track the box is read as belonging to: most overlapping first, ties
-  # broken by id so that map iteration order never decides it (the same job the
-  # sort key in `assign/3` does).
+  # What the box is read as being another of, or `nil`: most overlapping first,
+  # ties broken by id so that map iteration order never decides it (the same job
+  # the sort key in `assign/3` does). The label gate and
+  # `@duplicate_suppression_iou` are the whole test, and both callers want
+  # exactly it — `candidates` is a live track per id for `suppress_duplicates/4`
+  # and a kept would-be mint per batch index for `suppress_twin_mints/2`, and
+  # nothing here reads either as more than a `label` and a `bbox`. One rule in
+  # one place is the point: two copies of this geometry could be tuned apart,
+  # and a box the two passes disagreed about is either a duplicate identity or
+  # a detection nobody minted for.
   #
-  # At most one track is marked seen off one box, and only this one. A second
-  # track overlapping the same box is a duplicate from an earlier batch, and
-  # holding every one of them alive off one box would preserve exactly the
-  # pile-up this rule exists to drain. Where the winner is a track this batch
-  # matched, nothing is marked at all — a lesser-overlapping free track does not
-  # inherit the mark, for the same reason.
+  # For the track caller the identity of the winner is load-bearing, because it
+  # is what gets marked seen. At most one track is marked off one box, and only
+  # this one. A second track overlapping the same box is a duplicate from an
+  # earlier batch, and holding every one of them alive off one box would
+  # preserve exactly the pile-up this rule exists to drain. Where the winner is
+  # a track this batch matched, nothing is marked at all — a lesser-overlapping
+  # free track does not inherit the mark, for the same reason. The twin caller
+  # marks nothing and reads the answer as a boolean; the ordering costs it
+  # nothing and it is not worth a second function to skip.
   defp duplicate_of(candidates, object) do
     overlaps =
       for {id, tracked} <- candidates,
