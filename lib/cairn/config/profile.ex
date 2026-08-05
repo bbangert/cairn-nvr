@@ -275,7 +275,7 @@ defmodule Cairn.Config.Profile do
     end
   end
 
-  defp check_pos_int(acc, raw, key, name) do
+  defp check_pos_int(acc, raw, key, name, label \\ nil) do
     case Map.get(raw, key) do
       nil ->
         acc
@@ -286,7 +286,7 @@ defmodule Cairn.Config.Profile do
       other ->
         Config.add_error(
           acc,
-          "profile #{name}: #{key} must be a positive integer, got #{inspect(other)}"
+          "profile #{name}: #{label || key} must be a positive integer, got #{inspect(other)}"
         )
     end
   end
@@ -317,7 +317,7 @@ defmodule Cairn.Config.Profile do
       Enum.reduce(
         ~w(max_unseen_ms max_live_tracks stationary_after_ms),
         acc,
-        &check_pos_int(&2, tracking, &1, name)
+        &check_pos_int(&2, tracking, &1, name, "tracking.#{&1}")
       )
     else
       Config.add_error(acc, "profile #{name}: tracking must be a mapping")
