@@ -1825,11 +1825,26 @@ defmodule Cairn.TrackerTest do
     @shift_1 [0.1, 0.0, 0.4, 0.4]
     # IoU 0.778: over `@stitch_iou`, so it is adopted — displaced an eighth
     # of the box's height, the shift the old geometry rule called movement
-    # and the re-seeded filter deliberately does not (see the shifted
-    # adoption test)
+    # and a re-seeded filter deliberately does not (see the two shifted
+    # adoption tests, one per `tracking.oru` state)
     @shift_05 [0.05, 0.0, 0.4, 0.4]
     # IoU 0.905 with @box, 0.379 with @shift_2
     @shift_02 [0.02, 0.0, 0.4, 0.4]
+
+    # The outage the `tracking.oru` adoptions below are measured across: 8 s
+    # past the last match `parked/1` leaves at 10_000, so the adopting batch
+    # lands at 18_000. Inside the replay window (`@oru_min_gap_ms` 1_000 to
+    # `@oru_max_gap_ms` 10_000) and well inside the minute a suspension stays
+    # adoptable for, which are two different bounds and only one of them is
+    # about the filter.
+    @outage_ms 8_000
+    @adopting_ms 10_000 + @outage_ms
+    # What a replayed displacement is allowed before it reads as motion:
+    # `@stationary_velocity_floor` (a tenth of the box's height) per
+    # `stationary_after_ms`, scaled to the outage's own duration. The two
+    # shifts above straddle it — 0.05 over, 0.02 under — which is the whole of
+    # why one clears the flag and the other does not.
+    @replayed_allowance 0.1 * 0.4 * @outage_ms / @stationary_after
 
     # Exact binary ratios, for the test that pins the stitch threshold to the
     # bit rather than to a band. `@brick` is 1000/1024 of the frame wide and
@@ -2394,9 +2409,9 @@ defmodule Cairn.TrackerTest do
       # that way while it holds still there, judged by the ordinary rule
       # from the second detection of the new epoch on. The moduledoc owns
       # this as the one place the rule is weaker than the geometry it
-      # replaced; an association that reasons about observation gaps
-      # (OC-SORT's re-update, roadmap step 7) is where the lost evidence
-      # would come back.
+      # replaced. `tracking.oru` is where the lost evidence comes back —
+      # this context carries no such key, so what is pinned here is the
+      # default, and the twin below is the same outage with the flag on.
       {t, [tagged], events} =
         track(t, [det("person", @shift_05)],
           epoch: "epoch_two",
@@ -2426,6 +2441,189 @@ defmodule Cairn.TrackerTest do
 
       # the settle window never re-armed: the instant is still the pre-cut one
       assert since == at(10_000)
+    end
+
+    # A suspended track was cut at 10_000 and adopted at `@adopting_ms`, with
+    # `opts` on the adopting batch alone — one fixture for every replayed
+    # adoption below, so the outage they all share is built in one place.
+    defp outage(box, opts) do
+      {t, id} = parked(@box)
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
+
+      {t, [tagged], events} =
+        track(t, [det("person", box)], [epoch: "epoch_two", at_ms: @adopting_ms] ++ opts)
+
+      assert tagged.object_id == id
+      assert ids(events, :adopted) == [id]
+
+      {t, id, tagged, events}
+    end
+
+    test "with the flag on an adoption that shifted during the outage resumes moving" do
+      # the same fixture as the test above with `tracking.oru` on and the
+      # outage stretched into the replay window: the shift is 0.05 against an
+      # allowance of `@replayed_allowance`, so what the replay measures across
+      # the cut is a displacement the live floor would have failed
+      assert Enum.at(@shift_05, 0) - Enum.at(@box, 0) > @replayed_allowance
+
+      {t, id, tagged, events} = outage(@shift_05, oru: true)
+
+      # the flag goes, and goes with its event — a `became_stationary` closed
+      # by no `started_moving` is a run `CairnWeb.TrackMoments` renders as
+      # still open, so a silent clearing would misreport the pre-cut run
+      refute tagged.stationary
+      assert ids(events, :started_moving) == [id]
+
+      assert [%Track{object_id: ^id, stationary: false, stationary_since: nil}] =
+               Tracker.live_tracks(t)
+
+      # and the filter carries the outage's own motion rather than the zero
+      # velocity a re-seed would have left: rightwards, at the pace 0.05 over
+      # the 16 steps `@outage_ms` is worth, held to the assertion's ±0.0002
+      # (0.003047 measured against 0.003125) — short of exact because the
+      # replay's virtual points are updates like any other and the filter
+      # still smooths towards them
+      {vx, vy} = Kalman.velocity(filter(t, id))
+      assert vx > 0
+      assert_in_delta vx, 0.05 / 16, 0.0002
+      assert_in_delta vy, 0.0, 1.0e-9
+
+      # cleared, not condemned: the ordinary settle window re-earns the flag
+      # from the still run the adoption started, exactly one
+      # `stationary_after_ms` on and not a batch sooner
+      {t, seen} =
+        Enum.reduce(1..10, {t, []}, fn n, {t, seen} ->
+          ms = @adopting_ms + n * 1_000
+
+          {t, [tagged], events} =
+            track(t, [det("person", @shift_05)], epoch: "epoch_two", at_ms: ms)
+
+          assert tagged.stationary == ms >= @adopting_ms + @stationary_after
+          {t, seen ++ ids(events, :became_stationary)}
+        end)
+
+      assert seen == [id]
+
+      assert [%Track{object_id: ^id, stationary: true, stationary_since: since}] =
+               Tracker.live_tracks(t)
+
+      # the new run's own instant, and nothing left over from the old one
+      assert since == at(@adopting_ms + @stationary_after)
+    end
+
+    test "with the flag on an adoption that came back where it was stays stationary" do
+      # the control: 0.02 across the same outage is under the same allowance,
+      # which is the live rule's own answer for a box drifting that slowly
+      assert Enum.at(@shift_02, 0) - Enum.at(@box, 0) < @replayed_allowance
+
+      {t, id, tagged, events} = outage(@shift_02, oru: true)
+
+      assert tagged.stationary
+      assert ids(events, :started_moving) == []
+
+      # the filter is rebuilt either way — that is not what the flag decides
+      # here — and it reads a fifth of the shifted case's pace
+      assert_in_delta elem(Kalman.velocity(filter(t, id)), 0), 0.02 / 16, 0.0002
+
+      # no flap on the adopting batch and none after it, and the settle window
+      # never re-armed: the instant is still the pre-cut one
+      {t, seen} =
+        Enum.reduce(1..10, {t, []}, fn n, {t, seen} ->
+          {t, [tagged], events} =
+            track(t, [det("person", @shift_02)],
+              epoch: "epoch_two",
+              at_ms: @adopting_ms + n * 1_000
+            )
+
+          assert tagged.stationary
+          {t, seen ++ events}
+        end)
+
+      assert ids(seen, :started_moving) == []
+      assert ids(seen, :became_stationary) == []
+
+      assert [%Track{object_id: ^id, stationary: true, stationary_since: since}] =
+               Tracker.live_tracks(t)
+
+      assert since == at(10_000)
+    end
+
+    test "an adoption gap past the replay window re-seeds the filter, flag or no flag" do
+      {t, id} = parked(@box)
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
+
+      # 20_500 ms past the last match: outside `@oru_max_gap_ms` (10_000) and
+      # still inside the minute the suspension is adoptable for, which is the
+      # band most of the adoption window sits in
+      adopt = fn opts ->
+        {t, [tagged], events} =
+          track(t, [det("person", @shift_05)], [epoch: "epoch_two", at_ms: 30_500] ++ opts)
+
+        assert tagged.object_id == id
+        {t, tagged, events}
+      end
+
+      {on, on_tagged, on_events} = adopt.(oru: true)
+      {off, off_tagged, off_events} = adopt.(oru: false)
+
+      assert on_tagged == off_tagged
+      assert on_events == off_events
+      assert on.objects == off.objects
+
+      # not merely equal to the flag-off run but equal to a bare seed from the
+      # adopting box: `revive/3`'s nil reaches `advance/3`, which inits, and an
+      # init has no velocity to assert anything with
+      assert filter(on, id) == Kalman.init(@shift_05)
+      assert Kalman.velocity(filter(on, id)) == {0.0, 0.0}
+
+      # and the flag survives the shift the in-window run clears it on, since
+      # nothing measured this gap
+      assert on_tagged.stationary
+      assert ids(on_events, :started_moving) == []
+    end
+
+    test "a predicted box may not resume an identity with the flag on either" do
+      {t, id} = parked(@box)
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
+
+      # the `detected?` gate is upstream of everything `tracking.oru` touches —
+      # `adopt/4` refuses the box before any filter question is asked — so the
+      # flag cannot talk the plugin's extrapolation into an adoption
+      {predicted, [tagged], events} =
+        track(t, [det("person", @box, kind: "tracked")],
+          epoch: "epoch_two",
+          at_ms: @adopting_ms,
+          oru: true
+        )
+
+      assert [{:started, %Track{object_id: other}}] = events
+      assert tagged.object_id == other
+      refute other == id
+      assert [%Track{object_id: ^id}] = Tracker.suspended_tracks(predicted)
+
+      # withheld rather than lost, as with the flag off: the same box detected
+      # resumes the identity
+      {_detected, id, tagged, _events} = outage(@box, oru: true)
+      assert tagged.object_id == id
+    end
+
+    test "with the flag off an adoption is what it is without the key" do
+      {t, _id} = parked(@box)
+      {t, [], _info} = Tracker.suspend(t, 128, 10_000)
+
+      adopt = fn box, opts ->
+        track(t, [det("person", box)], [epoch: "epoch_two", at_ms: @adopting_ms] ++ opts)
+      end
+
+      # both sides of the allowance, since they are two different outcomes with
+      # the flag on and must be the same one without it
+      for box <- [@shift_02, @shift_05] do
+        assert adopt.(box, oru: false) == adopt.(box, [])
+
+        # non-vacuity: the flag on does change this very adoption, so what the
+        # equality above pins is the flag's absence and not an inert fixture
+        refute adopt.(box, oru: true) == adopt.(box, oru: false)
+      end
     end
 
     test "the window runs from the cut, not from the camera's last sighting" do
@@ -3395,9 +3593,10 @@ defmodule Cairn.TrackerTest do
       assert off_vx > 0
 
       # the rebuilt one has the gap's own pace instead — 0.03 to the left over
-      # the four steps a 2_000 ms gap is worth — learned to within a fifth
-      # (-0.0059 measured against -0.0075), since the replay's virtual points
-      # are updates like any other and the filter still smooths towards them
+      # the four steps a 2_000 ms gap is worth, held to the assertion's ±0.002
+      # (-0.0059 measured against -0.0075): a four-step replay leaves more
+      # smoothing shortfall than a sixteen-step one, since the replay's virtual
+      # points are updates like any other and the filter smooths towards them
       assert on_vx < 0
       assert_in_delta on_vx, -0.03 / 4, 0.002
     end
