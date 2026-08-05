@@ -1064,6 +1064,16 @@ defmodule Cairn.ConfigTest do
       assert Enum.any?(errors, &(&1 =~ "plugin det: command carries --model"))
     end
 
+    test "the D-P4 check sees a quoted flag inside a shell-wrapped composite token" do
+      map =
+        argv_map("partial", %{
+          "command" => ["/bin/sh", "-c", "exec cairn-detect '--model' /opt/m.onnx"]
+        })
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "plugin det: command carries --model"))
+    end
+
     test "a flag string embedded mid-path does not trip D-P4" do
       map = argv_map("partial", %{"command" => ["./p", "/opt/--model/x"]})
 

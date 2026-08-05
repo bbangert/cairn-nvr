@@ -601,11 +601,15 @@ defmodule Cairn.Config do
 
   # One compiled word-boundary regex per flag, built once rather than per
   # `flag?/2` call: a flag counts as present at token-start or after
-  # whitespace, followed by `=`, whitespace, or end-of-token — so `--model`
-  # matches inside `"exec cairn-detect --model x"` but not `--model-profile`
-  # or a path like `/opt/--model/x`.
+  # whitespace or a shell quote, followed by `=`, whitespace, a shell quote,
+  # or end-of-token — so `--model` matches inside
+  # `"exec cairn-detect --model x"` and its quoted form
+  # `"exec cairn-detect '--model' x"` (sh strips the quotes before the
+  # plugin sees the flag) but not `--model-profile` or a path like
+  # `/opt/--model/x`.
   @model_flag_regexes Map.new(@model_flags, fn flag ->
-                        {flag, Regex.compile!("(^|\\s)" <> Regex.escape(flag) <> "(=|\\s|$)")}
+                        {flag,
+                         Regex.compile!("(^|[\\s\"'])" <> Regex.escape(flag) <> "(=|[\\s\"']|$)")}
                       end)
 
   # Where a profile stops being data and becomes the plugin's argv. Expanding
