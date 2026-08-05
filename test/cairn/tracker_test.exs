@@ -105,10 +105,11 @@ defmodule Cairn.TrackerTest do
     }
 
     # Each flag key is absent unless a test asks for it, so that everything here
-    # bar the two flag blocks runs against the context a caller which has never
-    # heard of either flag hands the tracker — and so that "off" and "absent"
-    # are two distinguishable things a test can compare.
-    Enum.reduce([:bbd, :oru], context, fn key, context ->
+    # bar the flag blocks runs against the context a caller which has never
+    # heard of any flag hands the tracker — and so that "off" and "absent"
+    # are distinguishable things a test can compare. For `twin_mint` that
+    # distinction is load-bearing in the other direction: absent means ON.
+    Enum.reduce([:bbd, :oru, :twin_mint], context, fn key, context ->
       case Keyword.fetch(opts, key) do
         {:ok, value} -> Map.put(context, key, value)
         :error -> context
@@ -1517,7 +1518,7 @@ defmodule Cairn.TrackerTest do
       assert [%Track{object_id: ^id, bbox: @car_twin}] = Tracker.live_tracks(t)
     end
 
-    # `suppress_twin_mints/2` runs inside `assign/3`, before `apply_assignments/5`
+    # `Stage.TwinMint` runs inside `assign/3`, before `apply_assignments/5`
     # ever asks `make_room/3` for space, so the dropped twin is a `:drop` in
     # `assignments` before eviction is even considered — it never competes for a
     # slot. Correct by reading the two passes side by side, but nothing pinned
@@ -3944,6 +3945,28 @@ defmodule Cairn.TrackerTest do
 
       assert Map.drop(on.objects[id], dropped) == Map.drop(off.objects[id], dropped)
       refute on.objects[id].still_velocity == off.objects[id].still_velocity
+    end
+  end
+
+  describe "the twin-mint default" do
+    # The one inverted default: an absent `twin_mint` key must gate exactly
+    # as `true` — the pre-#68-preserving reading — and only an explicit
+    # `false` delists the stage. Named for that intent so a refactor that
+    # flips `minting_stages/1`'s default fails here by name rather than
+    # incidentally across the golden suite.
+    test "an absent twin_mint key means the gate is on; only false delists it" do
+      twins = [
+        det("car", [0.30, 0.30, 0.20, 0.40]),
+        det("car", [0.32, 0.30, 0.20, 0.40], score: 0.7)
+      ]
+
+      {_t, _tagged, absent} = Tracker.track(Tracker.new(), twins, ctx(at_ms: 0))
+      {_t, _tagged, on} = Tracker.track(Tracker.new(), twins, ctx(at_ms: 0, twin_mint: true))
+      {_t, _tagged, off} = Tracker.track(Tracker.new(), twins, ctx(at_ms: 0, twin_mint: false))
+
+      assert length(ids(absent, :started)) == 1
+      assert length(ids(on, :started)) == 1
+      assert length(ids(off, :started)) == 2
     end
   end
 

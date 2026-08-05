@@ -97,6 +97,7 @@ defmodule Cairn.Tracker.Stage do
   @type lists :: %{
           association_one: [{module(), params()}],
           association_two: [{module(), params()}],
+          minting: [{module(), params()}],
           per_object: [{module(), params()}]
         }
 
@@ -160,9 +161,13 @@ defmodule Cairn.Tracker.Stage do
     with :ok <- validate_shape(lists),
          :ok <- validate_kinds(lists.association_one, :batch, "association one"),
          :ok <- validate_kinds(lists.association_two, :batch, "association two"),
+         :ok <- validate_kinds(lists.minting, :batch, "minting"),
          :ok <- validate_kinds(lists.per_object, :per_object, "per-object"),
          :ok <- validate_adjacency(lists.association_one, "association one"),
-         :ok <- validate_adjacency(lists.association_two, "association two") do
+         :ok <- validate_adjacency(lists.association_two, "association two"),
+         :ok <- validate_terminal(lists.association_one, "association one"),
+         :ok <- validate_terminal(lists.association_two, "association two"),
+         :ok <- validate_terminal(lists.minting, "minting") do
       validate_pairing(lists)
     end
   end
@@ -171,9 +176,14 @@ defmodule Cairn.Tracker.Stage do
   # entries and a caller handing this config-derived data gets an `{:error, _}`
   # it can surface, never a raise. The tracker-side translation always builds
   # valid shapes; this exists for the config loader this validation moves to.
-  defp validate_shape(%{association_one: one, association_two: two, per_object: per})
-       when is_list(one) and is_list(two) and is_list(per) do
-    Enum.find_value(one ++ two ++ per, :ok, fn
+  defp validate_shape(%{
+         association_one: one,
+         association_two: two,
+         minting: minting,
+         per_object: per
+       })
+       when is_list(one) and is_list(two) and is_list(minting) and is_list(per) do
+    Enum.find_value(one ++ two ++ minting ++ per, :ok, fn
       {module, params} when is_atom(module) and is_map(params) ->
         nil
 
@@ -186,8 +196,8 @@ defmodule Cairn.Tracker.Stage do
 
   defp validate_shape(other) do
     {:error,
-     "stage lists must be a map with association_one, association_two and " <>
-       "per_object lists, got: #{inspect(other)}"}
+     "stage lists must be a map with association_one, association_two, " <>
+       "minting and per_object lists, got: #{inspect(other)}"}
   end
 
   defp validate_kinds(list, kind, where) do
@@ -225,6 +235,23 @@ defmodule Cairn.Tracker.Stage do
         {:error,
          "#{inspect(module)} must run immediately after the #{where} IoU pass " <>
            "(adjacent_after: :iou_association), but #{position} stage(s) precede it"}
+      end
+    end)
+  end
+
+  # A `last_at_point` stage judges its point's *final* state — the twin gate
+  # weighs the mint set — so anything listed after it would either act on
+  # state the terminal stage already judged or invalidate that judgement.
+  defp validate_terminal(list, where) do
+    last = length(list) - 1
+
+    list
+    |> Enum.with_index()
+    |> Enum.find_value(:ok, fn {{module, _params}, position} ->
+      if constraint(module, :last_at_point) == true and position != last do
+        {:error,
+         "#{inspect(module)} must be the last stage at the #{where} point " <>
+           "(last_at_point), but #{last - position} stage(s) follow it"}
       end
     end)
   end

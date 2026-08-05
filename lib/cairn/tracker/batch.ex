@@ -20,12 +20,15 @@ defmodule Cairn.Tracker.Batch do
     * `candidates` — `[{id, tracked, predicted_box}]`, one entry per live
       track, predictions computed once for the whole batch. Built before
       adoption runs, so a track revived out of suspension is never in it.
-    * `assignment` — the triple every pass shares: the assignment map
-      (object index → track id | `:drop`), the object indices spent, and
-      the track ids taken. Threading one accumulator through every pass is
-      what makes "each object and each track used once" hold *across*
-      passes and not only within one; `spend/2` below is the one way
-      anything adds to it.
+    * `assignment` — the triple every association-region pass shares: the
+      assignment map (object index → track id | `:drop`), the object
+      indices spent, and the track ids taken. Threading one accumulator
+      through every pass is what makes "each object and each track used
+      once" hold *across* passes and not only within one; `spend/2` below
+      is the one way anything adds to it. The substrate's suppression pass
+      **collapses the triple to the bare map** — from there on the spent
+      sets have no meaning, and what a stage at the minting point (or
+      `apply_assignments/5`) reads is `%{index => id | :drop}` alone.
     * `adopted` — the track ids adoption revived this batch, for the
       `:adopted` events `apply_assignments/5` emits.
     * `association` — which association pass most recently ran (`:one` |
@@ -36,8 +39,10 @@ defmodule Cairn.Tracker.Batch do
 
   alias Cairn.Tracker
 
-  @type assignment ::
-          {%{optional(non_neg_integer()) => String.t() | :drop}, MapSet.t(), MapSet.t()}
+  @typedoc "The assignment map alone, as the minting point and `apply_assignments/5` read it."
+  @type assignments :: %{optional(non_neg_integer()) => String.t() | :drop}
+
+  @type assignment :: {assignments(), MapSet.t(), MapSet.t()}
 
   @type t :: %__MODULE__{
           tracker: Tracker.t(),
@@ -46,7 +51,7 @@ defmodule Cairn.Tracker.Batch do
           above_floor: [{map(), non_neg_integer()}],
           below_floor: [{map(), non_neg_integer()}],
           candidates: [{String.t(), map(), Tracker.bbox()}],
-          assignment: assignment(),
+          assignment: assignment() | assignments(),
           adopted: [String.t()],
           association: :one | :two | nil
         }

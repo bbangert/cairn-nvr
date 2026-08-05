@@ -23,7 +23,8 @@ golden diff. The replay driver is `Cairn.GoldenReplay`
 
 - `steps/*.exs` — hand-authored step scripts for paths recorded clips never
   hit (suspension/adoption across a cut, live-track-cap eviction, epoch
-  change). See "Step scripts" below.
+  change, and the `twin_mint: false` double-mint escape hatch). See "Step
+  scripts" below.
 
 - `goldens/*.golden` — the expected canonicalized output per fixture,
   regenerated only by `mix cairn.golden.regen` and reviewed as a diff.

@@ -32,7 +32,10 @@ defmodule Cairn.Tracker.StageTest do
   end
 
   defp lists(overrides) do
-    Map.merge(%{association_one: [], association_two: [], per_object: []}, Map.new(overrides))
+    Map.merge(
+      %{association_one: [], association_two: [], minting: [], per_object: []},
+      Map.new(overrides)
+    )
   end
 
   test "the real transitional lists validate" do
@@ -43,9 +46,21 @@ defmodule Cairn.Tracker.StageTest do
                lists(
                  association_one: bbd,
                  association_two: bbd,
+                 minting: [{Stage.TwinMint, %{}}],
                  per_object: [{Stage.Oru, %{}}]
                )
              )
+  end
+
+  test "a last_at_point stage anywhere but the end of its point is rejected" do
+    assert :ok =
+             Stage.validate_lists(lists(minting: [{BatchOnly, %{}}, {Stage.TwinMint, %{}}]))
+
+    assert {:error, message} =
+             Stage.validate_lists(lists(minting: [{Stage.TwinMint, %{}}, {BatchOnly, %{}}]))
+
+    assert message =~ "last_at_point"
+    assert message =~ "TwinMint"
   end
 
   test "empty lists validate — the no-flags path" do
