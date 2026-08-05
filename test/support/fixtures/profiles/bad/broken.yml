@@ -1,0 +1,4 @@
+backend: quantum
+fps_band: [8, 2]
+tracking:
+  bbd: "yes"

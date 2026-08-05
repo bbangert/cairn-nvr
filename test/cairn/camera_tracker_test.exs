@@ -55,6 +55,37 @@ defmodule Cairn.CameraTrackerTest do
     %{tracker: tracker, camera: camera, camera_id: camera_id}
   end
 
+  # The `:stages`-forwarding hop in `tracking_policy/1`, proven behaviorally:
+  # an empty presence map is a profile that spoke and listed nothing, so the
+  # twin gate is delisted and a double box mints twice — where the same twins
+  # under the boolean path's default-on gate mint once. The two runs differ
+  # only in the policy's `stages` key, so the difference is the forwarding.
+  test "a policy's stage map rides tracking_policy/1 into the tracker", %{
+    tracker: tracker,
+    camera: camera
+  } do
+    twins = [object("person", 0.9, @box), object("person", 0.7, [0.12, 0.1, 0.2, 0.4])]
+
+    CameraTracker.detections(
+      tracker,
+      camera,
+      Map.put(@policy, :stages, %{}),
+      observation(twins, [])
+    )
+
+    assert_receive {:track_started, %Track{object_id: first}}
+    assert_receive {:track_started, %Track{object_id: second}} when second != first
+  end
+
+  test "the same twins under the boolean path mint once", %{tracker: tracker, camera: camera} do
+    twins = [object("person", 0.9, @box), object("person", 0.7, [0.12, 0.1, 0.2, 0.4])]
+
+    CameraTracker.detections(tracker, camera, @policy, observation(twins, []))
+
+    assert_receive {:track_started, %Track{}}
+    refute_received {:track_started, _}
+  end
+
   defp detect(tracker, camera, score \\ 0.9, bbox \\ @box) do
     observe(tracker, camera, [object("person", score, bbox)])
   end

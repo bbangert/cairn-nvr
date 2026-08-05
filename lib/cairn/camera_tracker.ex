@@ -561,7 +561,7 @@ defmodule Cairn.CameraTracker do
   # Defensive on a public, @spec'd entry point (`detections/3`) that any caller
   # can hand a bare map: the tracker's bounds must not silently become nil.
   defp tracking_policy(policy) do
-    %{
+    base = %{
       max_unseen_ms: Map.get(policy, :max_unseen_ms) || Config.default_max_unseen_ms(),
       max_live_tracks: Map.get(policy, :max_live_tracks) || Config.default_max_live_tracks(),
       stationary_after_ms:
@@ -572,6 +572,15 @@ defmodule Cairn.CameraTracker do
       bbd: Map.get(policy, :bbd, Config.default_bbd()),
       oru: Map.get(policy, :oru, Config.default_oru())
     }
+
+    # A profiled camera's policy carries a stage presence map, and it rides
+    # this hop unmodified — `Cairn.Tracker.context/3` is where it supersedes
+    # the booleans above. Absent for every unprofiled camera, whose map stays
+    # exactly the pre-profile one.
+    case Map.get(policy, :stages) do
+      nil -> base
+      stages -> Map.put(base, :stages, stages)
+    end
   end
 
   # Detection off ends every track outright: nothing will observe this camera

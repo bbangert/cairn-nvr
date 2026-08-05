@@ -1,0 +1,17 @@
+# A full profile exercising every schema field (backend stubbed until Phase 6).
+name: rk-test
+experimental: true
+backend: rknn
+model:
+  rknn: models/yolox.rknn
+model_profile: yolox
+input_size: 416
+decoder: auto
+labels: models/coco.names
+fps_band: [2, 4]
+tracking:
+  bbd: true
+  oru:
+    step_ms: 700
+  twin_mint: true
+  max_unseen_ms: 6000
