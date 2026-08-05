@@ -273,11 +273,11 @@ defmodule Cairn.Tracker.Kalman do
   one-step gap.
 
   Re-initializing from the anchor rather than continuing whatever filter the
-  track already had is the same choice for both of the gaps `Cairn.Tracker`'s
-  `tracking.oru` sends here — the live re-match, whose track carries a coasted
-  filter, and the stream-reset adoption, whose track carries none at all
-  because the reset dropped it: a uniform rebuild is the only version of this
-  that covers a caller with nothing to continue from.
+  track already had is the same choice for both of the gaps
+  `Cairn.Tracker.Stage.Oru` sends here — the live re-match, whose track
+  carries a coasted filter, and the stream-reset adoption, whose track
+  carries none at all because the reset dropped it: a uniform rebuild is the
+  only version of this that covers a caller with nothing to continue from.
   It also needs no extra track state, and the replay's virtual updates
   teach the rebuilt filter the gap's actual per-step displacement directly —
   which is the point, since it is exactly the pre-gap momentum that a coast

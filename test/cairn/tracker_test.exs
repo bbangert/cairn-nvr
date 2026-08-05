@@ -2067,8 +2067,9 @@ defmodule Cairn.TrackerTest do
 
     # The outage the `tracking.oru` adoptions below are measured across: 8 s
     # past the last match `parked/1` leaves at 10_000, so the adopting batch
-    # lands at 18_000. Inside the replay window (`@oru_min_gap_ms` 1_000 to
-    # `@oru_max_gap_ms` 10_000) and well inside the minute a suspension stays
+    # lands at 18_000. Inside `Cairn.Tracker.Stage.Oru`'s replay window
+    # (`@oru_min_gap_ms` 1_000 to `@oru_max_gap_ms` 10_000) and well inside
+    # the minute a suspension stays
     # adoptable for, which are two different bounds and only one of them is
     # about the filter.
     @outage_ms 8_000
@@ -2786,7 +2787,8 @@ defmodule Cairn.TrackerTest do
       {t, id} = parked(@box)
       {t, [], _info} = Tracker.suspend(t, 128, 10_000)
 
-      # 20_500 ms past the last match: outside `@oru_max_gap_ms` (10_000) and
+      # 20_500 ms past the last match: outside `Stage.Oru`'s `@oru_max_gap_ms`
+      # (10_000) and
       # still inside the minute the suspension is adoptable for, which is the
       # band most of the adoption window sits in
       adopt = fn opts ->
@@ -3722,7 +3724,8 @@ defmodule Cairn.TrackerTest do
   # The creeper coasted from 4_500 to `at_ms`, as one tracker for both flag
   # states to branch off rather than two runs of the same steps. Nothing before
   # the closing detection can differ between them — every batch of the run
-  # either matched at a gap of one batch, well under `@oru_min_gap_ms`, or
+  # either matched at a gap of one batch, well under `Stage.Oru`'s
+  # `@oru_min_gap_ms`, or
   # carried nothing at all — and branching is what makes the two runs share an
   # identity, so their tracks and their events compare field for field instead
   # of only through what a ULID rewrite leaves.
@@ -3840,7 +3843,8 @@ defmodule Cairn.TrackerTest do
     # synthesized motion over one would manufacture exactly the velocity the
     # stillness rule reads to decide the object is parked.
     test "a seeded stretch is never a gap, however long it runs" do
-      # eight seeded batches, 3_500 ms of them — well past `@oru_min_gap_ms`
+      # eight seeded batches, 3_500 ms of them — well past `Stage.Oru`'s
+      # `@oru_min_gap_ms`
       # and well inside the window — each re-reporting the last detected box
       # verbatim, which is what the plugin actually puts on the wire
       assert waited_seeded(oru: true) == waited_seeded(oru: false)
@@ -3855,7 +3859,8 @@ defmodule Cairn.TrackerTest do
     # seed the plugin sends *after* a gap is a wire pattern the protocol makes
     # near-impossible (a seed only re-reports a box the plugin is still
     # tracking, and a stretch of silence is exactly it having stopped), but
-    # `replayed/4` refuses one for its own reason — `detected?` — and nothing
+    # `Stage.Oru`'s replay refuses one for its own reason — `detected?` — and
+    # nothing
     # else in this describe closes an in-window gap on anything but a real
     # detection to prove that guard does the refusing.
     test "a seed closing an in-window gap does not replay it, only a detection does" do
@@ -3872,7 +3877,7 @@ defmodule Cairn.TrackerTest do
       gapped = coast(gapped, last_detected_ms + @batch_ms, close_ms, @oru_opts)
 
       # non-vacuity: the gap the closing batch below sees is inside the
-      # window `replayed/4` gates on (its own `@oru_min_gap_ms` and
+      # window `Stage.Oru` gates on (its `@oru_min_gap_ms` and
       # `@oru_max_gap_ms`), computed from the same clocks the fixture above
       # used rather than restated as a bare number
       gap_ms = close_ms - last_detected_ms
@@ -3892,7 +3897,7 @@ defmodule Cairn.TrackerTest do
         filter(tracker, id)
       end
 
-      # the seed: `detected?` is false, so `replayed/4` never reaches the gap
+      # the seed: `detected?` is false, so `Stage.Oru`'s replay never reaches the gap
       # check at all — the flag cannot matter, and the filter it leaves is
       # whatever the coast above already set
       assert close.("tracked", oru: true) == close.("tracked", oru: false)
@@ -3904,7 +3909,8 @@ defmodule Cairn.TrackerTest do
     end
 
     test "gaps outside the window leave the filter exactly as the flag-off run does" do
-      # one batch: under `@oru_min_gap_ms`, where a coasted filter is still
+      # one batch: under `Stage.Oru`'s `@oru_min_gap_ms`, where a coasted filter
+      # is still
       # close to what it last measured
       assert waited_gap(@batch_ms, oru: true) == waited_gap(@batch_ms, oru: false)
 
@@ -3938,6 +3944,43 @@ defmodule Cairn.TrackerTest do
 
       assert Map.drop(on.objects[id], dropped) == Map.drop(off.objects[id], dropped)
       refute on.objects[id].still_velocity == off.objects[id].still_velocity
+    end
+  end
+
+  describe "still?/3" do
+    # The shared stillness test, public for its second caller
+    # (`Cairn.Tracker.Stage.Oru`). What these pin is the doc's guarantee that
+    # the floors are *rates per settle window* — a tenth of the box's height
+    # (velocity) and a fifth (growth) per `stationary_after_ms` — so the same
+    # drift can pass one window and fail a longer one. Bounds below are
+    # computed from those ratios for an h = 0.4 box at the suite's 10_000 ms
+    # settle: velocity floor 4.0e-6/ms, growth floor 8.0e-6/ms.
+    defp still_box, do: det("person", [0.3, 0.3, 0.2, 0.4])
+
+    test "the velocity floor scales with box height per settle window" do
+      assert Tracker.still?({3.9e-6, 0.0, 0.0}, still_box(), ctx([]))
+      refute Tracker.still?({4.1e-6, 0.0, 0.0}, still_box(), ctx([]))
+    end
+
+    test "the same drift fails a longer settle window — the floor is a rate" do
+      drift = {3.9e-6, 0.0, 0.0}
+
+      assert Tracker.still?(drift, still_box(), ctx([]))
+      refute Tracker.still?(drift, still_box(), ctx(stationary_after_ms: 2 * @stationary_after))
+    end
+
+    test "velocity is judged radially, not per axis" do
+      # Each axis alone is under the 4.0e-6 floor; their norm (~4.24e-6)
+      # is not — a diagonal creep may not pass by splitting itself.
+      assert Tracker.still?({3.0e-6, 0.0, 0.0}, still_box(), ctx([]))
+      assert Tracker.still?({0.0, 3.0e-6, 0.0}, still_box(), ctx([]))
+      refute Tracker.still?({3.0e-6, 3.0e-6, 0.0}, still_box(), ctx([]))
+    end
+
+    test "growth has its own floor, symmetric in sign" do
+      assert Tracker.still?({0.0, 0.0, 7.9e-6}, still_box(), ctx([]))
+      refute Tracker.still?({0.0, 0.0, 8.1e-6}, still_box(), ctx([]))
+      refute Tracker.still?({0.0, 0.0, -8.1e-6}, still_box(), ctx([]))
     end
   end
 end
