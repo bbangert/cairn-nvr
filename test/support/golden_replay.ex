@@ -275,9 +275,13 @@ defmodule Cairn.GoldenReplay do
   # `object_id` fields go through this, not `canon_value/2`: other binaries
   # (labels, epochs) are never ids and pass through untranslated, while an
   # object id with no ordinal is a track minted without a `:started` event,
-  # which the harness must not paper over. If a ULID ever reaches rendering
-  # outside an `object_id` field, it differs between the double-run's two
-  # replays and fails the identity assert — loudly, not silently mapped.
+  # which the harness must not paper over. A ULID leaking into any *rendered*
+  # value outside an `object_id` field stays raw, differs between the
+  # double-run's two replays, and fails the identity assert. The state hash
+  # is a separate regime on purpose: `hash_term/2` substitutes *known* ids
+  # wherever they appear — they are map keys in `tracker.objects`/`suspended`,
+  # which is canonicalization, not a leak — while an unknown ULID stays raw
+  # there too and still breaks the double-run via a differing hash.
   defp canon_id(id, canon) when is_binary(id) do
     Map.get(canon.ids, id) ||
       raise "golden replay: id #{id} appeared without a :started event — " <>
@@ -396,7 +400,10 @@ defmodule Cairn.GoldenReplay do
   def check_golden(name, text) do
     path = Path.join([@golden_dir, "goldens", name <> ".golden"])
 
-    if System.get_env("GOLDEN_REGEN") do
+    # Exactly "1" (what `mix cairn.golden.regen` sets), not any non-empty
+    # value: a stray GOLDEN_REGEN=0 or =false in the environment must not
+    # silently flip the whole suite into rewrite mode.
+    if System.get_env("GOLDEN_REGEN") == "1" do
       File.mkdir_p!(Path.dirname(path))
       File.write!(path, text)
       :ok

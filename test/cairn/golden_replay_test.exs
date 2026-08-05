@@ -47,7 +47,7 @@ defmodule Cairn.GoldenReplayTest do
     test "a missing golden names the regen task instead of diffing nothing" do
       # Under `mix cairn.golden.regen` this call would *create* the file, so
       # the assertion only holds in comparison mode; regen runs skip it.
-      unless System.get_env("GOLDEN_REGEN") do
+      unless System.get_env("GOLDEN_REGEN") == "1" do
         assert_raise RuntimeError, ~r/missing golden .*cairn\.golden\.regen/, fn ->
           GoldenReplay.check_golden("no_such_fixture", "x\n")
         end
