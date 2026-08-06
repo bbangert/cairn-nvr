@@ -1,0 +1,6 @@
+# Artifact on disk, labels file not: the second path a profile expands into
+# argv, checked the same way for the same reason.
+backend: ort
+model:
+  onnx: test/support/fixtures/models/stub.onnx
+labels: test/support/fixtures/models/not-here.names

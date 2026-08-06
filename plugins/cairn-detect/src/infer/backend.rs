@@ -70,13 +70,15 @@ impl BackendKind {
     ///
     /// Static because profile validation on the Elixir side has to answer the
     /// same questions at config load, with no plugin running and possibly no
-    /// such hardware attached. Today it mirrors only the artifact column
-    /// (`Cairn.Config.Profile`'s backend→`model:`-key map); the capability
-    /// booleans are consumed by nothing but this crate's own summary line
-    /// until the plan's phase-7 validation table mirrors them too. Both
-    /// copies are claims about the runtime, not observations of it — see the
-    /// per-row notes for which are established and which are conservative
-    /// readings.
+    /// such hardware attached. `Cairn.Config.Profile`'s
+    /// `@backend_capabilities` mirrors all three columns of this table:
+    /// `fused_nms` feeds its `check_capabilities` rule, `artifact` picks the
+    /// `model:` key a profile is read by, and `dynamic_shapes` is mirrored but
+    /// read by no rule on either side (an `input_size:` disagreeing with a
+    /// compiled artifact is a fact about a file the host cannot open — the
+    /// authoring guide carries it instead). Both copies are claims about the
+    /// runtime, not observations of it — see the per-row notes for which are
+    /// established and which are conservative readings.
     pub(super) fn capabilities(self) -> Capabilities {
         match self {
             // Both yes, and both load-bearing in this crate rather than
@@ -94,7 +96,7 @@ impl BackendKind {
             },
             // Dynamic shapes: rknn-toolkit2 compiles to a fixed input geometry,
             // so there is nothing to leave dynamic. Fused NMS is the
-            // conservative reading: `research/npu-backends.md` establishes the
+            // conservative reading: `docs/npu-backends.md` establishes the
             // ban for QNN only, and no source it cites puts an NMS op on the
             // RKNN NPU either. Refusing an export we may not be able to run
             // costs an operator a profile edit; accepting one that silently
@@ -104,7 +106,7 @@ impl BackendKind {
                 supports_dynamic_shapes: false,
                 artifact: ArtifactFormat::Rknn,
             },
-            // Both established in `research/npu-backends.md`: the NMS operator
+            // Both established in `docs/npu-backends.md`: the NMS operator
             // is not in QNN's supported op list, and HTP takes no dynamic
             // shapes. The artifact is still `.onnx` — QNN is an onnxruntime
             // execution provider, and what changes is that the graph must be
@@ -221,7 +223,7 @@ pub(super) struct QnnOptions {
 #[derive(Debug, Default, Clone)]
 pub(super) struct RknnOptions {
     /// Which NPU core(s) the model is bound to, as librknnrt's core mask. The
-    /// runtime is sequential per model (`research/npu-backends.md`), so this
+    /// runtime is sequential per model (`docs/npu-backends.md`), so this
     /// spreads *models* across cores and never one model's frames.
     pub core_mask: Option<u32>,
 }
@@ -300,7 +302,7 @@ mod tests {
         }
     }
 
-    /// The rules `research/npu-backends.md` turns into profile validation, in
+    /// The rules `docs/npu-backends.md` turns into profile validation, in
     /// the form the Elixir table has to mirror. A change here is a change to
     /// what a profile may declare, not a refactor.
     #[test]

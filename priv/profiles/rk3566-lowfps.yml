@@ -1,0 +1,53 @@
+# Rockchip RK3566 (~1 TOPS NPU) — the bottom of the frame rate cairn targets,
+# and the profile the low-fps stage set was assembled for.
+#
+# experimental: true for two reasons, either one enough on its own. The `rknn`
+# backend parses everywhere but executes nowhere yet (only `ort` runs, D-P10),
+# so a group naming this profile must also set `allow_experimental: true`; and
+# nothing in `docs/npu-backends.md` documents converting the yolox family
+# with rknn-toolkit2, so the artifact below is one nobody here has built.
+experimental: true
+backend: rknn
+model:
+  # Placeholder, and a different *file* from the ort profile's rather than the
+  # same one renamed: an `.rknn` is compiled from an `.onnx` by rknn-toolkit2
+  # on an x86 host, at an input geometry fixed at compile time. `input_size:`
+  # below has to be the geometry it was compiled at — the host cannot open the
+  # artifact to check that, which is why it is written here and said out loud.
+  rknn: models/yolox_nano_rk3566.rknn
+model_profile: yolox
+input_size: 416
+labels: models/coco.names
+# Declared, pending on-hardware measurement. The model zoo claims 34 fps for
+# yolov8n@640 on this NPU while Frigate's real-world reports put inference at
+# 95-250 ms; 2-4 is what is left once decode, preprocessing and tracking share
+# the same SoC (`docs/npu-backends.md`).
+fps_band: [2, 4]
+tracking:
+  # The full low-fps set. At 2-4 fps a gap that is brief in time is wide in
+  # frames, which is what these two address: `bbd` admits an association pair
+  # on the distance between box centres once they no longer overlap at all, and
+  # `oru` rebuilds a track's motion filter across the gap from the two real
+  # boxes either side instead of coasting a stale heading through it.
+  #
+  # `bbd`'s measured win is a *composition* with the plugin's own
+  # `--track-floor-json`: at floor 0.25 the soak measured mints 11 -> 8 and a
+  # zeroed 30 s identity-switch proxy on the mover clip (2026-08-05 soak,
+  # 20-cell matrix), and with the floor off it changed nothing at all,
+  # because an expired track has no row left to admit against. That flag
+  # describes the scene rather than the model and stays operator-owned (D-P6) —
+  # set it in the group's own `command:` alongside this profile.
+  #
+  # `twin_mint` is on per D-P8: yolox suppresses host-side, so two same-label
+  # boxes overlapping at cold start really are one object counted twice.
+  bbd: true
+  oru: true
+  twin_mint: true
+  # The global defaults, restated rather than re-tuned. The soak these two
+  # stages were measured on sampled ~4.6 fps — the closest measured point to
+  # this band that exists — and it ran exactly these three numbers. A
+  # board-tuned value here would be invented, and a band is cheap to correct
+  # once someone measures one.
+  max_unseen_ms: 3000
+  max_live_tracks: 128
+  stationary_after_ms: 10000

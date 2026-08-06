@@ -556,7 +556,12 @@ setting, `tracking.oru`, changes what the motion filter believes after a gap
 rather than what matching admits: a detection closing an unmatched gap of one
 to ten seconds rebuilds the filter across it from the two real boxes either
 side, instead of correcting the heading it was coasting on. A stretch you are
-re-reporting as `"tracked"` never counts as such a gap. Cairn expires a track you
+re-reporting as `"tracked"` never counts as such a gap. Both settings are
+global, and both are superseded for the cameras of a plugin group that carries
+a hardware profile: that file lists the host-side stages that go with the model
+it names, so the same plugin can meet a different host-side stage set on
+different hardware ([`docs/profile-authoring.md`](profile-authoring.md)).
+Cairn expires a track you
 stop mentioning after
 `max_unseen_ms` of *tracking* time (default 3 s, per-camera configurable) — you
 never have to declare an object gone. A track Cairn has judged **stationary**

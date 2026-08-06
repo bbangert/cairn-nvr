@@ -195,8 +195,9 @@ defmodule Cairn.Tracker do
   a detection that closes a long enough unmatched gap does not merely correct
   that coast: the filter is rebuilt across the gap. The mechanism is
   `Cairn.Tracker.Stage.Oru`, the first stage behind `update_track/3`'s
-  per-object hook (`Cairn.Tracker.Stage` — with the flag off the stage list is
-  empty and nothing of it runs at all), and its doc carries the full account:
+  per-object hook (`Cairn.Tracker.Stage` — unlisted, whether by the flag or by
+  a hardware profile that omits it, the stage list is empty and nothing of it
+  runs at all), and its doc carries the full account:
   the replay and its window, what a virtual observation is and is not, what a
   stream-reset adoption shares with a live re-match, and the stationary
   reading an adoption gets.
@@ -234,9 +235,10 @@ defmodule Cairn.Tracker do
   distance instead, scaled by the predicted box's own size and by how long the
   track has gone unpositioned, which separates exactly those cases.
 
-  With the flag on, a pair that fails `match_threshold/2` and passes that
-  distance is admitted as well — by `Cairn.Tracker.Stage.Bbd`, the batch
-  stage `batch_stages/1` lists for the flag, run immediately after each IoU
+  With the stage listed, a pair that fails `match_threshold/2` and passes that
+  distance is admitted as well — by `Cairn.Tracker.Stage.Bbd`, which
+  `batch_stages/1` lists for the flag *or* for a hardware profile naming it
+  (the stage's own "Gating" section has both), run immediately after each IoU
   association pass and seeded with its accumulator. Nothing about the IoU
   half changes: its pairs are built, ordered and greedily spent first, so a
   distance-admitted pair can only take a track and an object that both came
@@ -877,6 +879,9 @@ defmodule Cairn.Tracker do
   cold-start twin gate (`Cairn.Tracker.Stage.TwinMint`) is behavior every
   existing deployment already has, so absence preserves it and `false` is the
   deliberate opt-out for NMS-free detectors whose close pairs are legitimate.
+  That default belongs to the boolean form alone — a policy carrying `stages`
+  defaults nothing, and a profile that does not list the gate delists it (see
+  `t:policy/0`).
   """
   @spec context(Observation.t(), String.t(), policy()) :: context()
   def context(%Observation{} = observation, camera_id, policy) do

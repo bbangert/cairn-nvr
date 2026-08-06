@@ -61,12 +61,20 @@ defmodule Cairn.Config do
   # answer to, and widening admission is how identities get handed to the wrong
   # object, so it is opt-in until soak measurement says otherwise.
   #
-  # Global only, with none of the per-camera form the three bounds above have.
-  # Those are scene descriptions an operator sets per camera — how long an
-  # object may vanish, how crowded the frame is, how long "parked" takes here.
-  # This is a rollout switch on the matcher itself, and a fleet where half the
-  # cameras associate one way and half the other is not a thing an operator can
+  # No per-camera form, unlike the three bounds above. Those are scene
+  # descriptions an operator sets per camera — how long an object may vanish,
+  # how crowded the frame is, how long "parked" takes here. This one describes
+  # the matcher, and a fleet where half the cameras associate one way and half
+  # the other on nothing but per-camera taste is not a thing an operator can
   # reason about or a soak can read.
+  #
+  # That argument is against a per-*camera* knob, and hardware profiles do not
+  # reintroduce one: a profile splits the fleet by plugin group, i.e. by the
+  # hardware a group runs on, and names the board it is talking about in a file
+  # (`Cairn.Config.Profile`, D-P7). So this key's remaining job is the
+  # unprofiled path — the whole answer for a homogeneous fleet, and superseded
+  # by the stage list of any group that has a profile, with a load warning
+  # naming which side won (`warn_superseded_flags/2`).
   @default_bbd false
   # Whether a track's motion filter is rebuilt across an unmatched gap, from
   # the two real boxes that bound it, instead of being corrected through it
@@ -76,10 +84,10 @@ defmodule Cairn.Config do
   # gap is one the pre-gap heading really has nothing to say about, so it is
   # opt-in until soak measurement says otherwise.
   #
-  # Global only, for the reason `@default_bbd` is: this is a rollout switch on
-  # the motion filter itself rather than a description of a scene, and a fleet
-  # where half the cameras rebuild and half coast is not a thing an operator can
-  # reason about or a soak can read.
+  # No per-camera form, for `@default_bbd`'s reason and with its footnote: this
+  # describes the motion filter rather than a scene, so it is one answer for
+  # every camera not covered by a profile, and a profiled group's stage list
+  # supersedes it.
   @default_oru false
   # How long track rows outlive the clips they describe. Deliberately far
   # longer than `retention_days`: the track log is the instrument for tuning
@@ -631,6 +639,7 @@ defmodule Cairn.Config do
       |> check_single_source(group, profile)
       |> check_backend_implemented(group, profile)
       |> check_artifact(group, profile)
+      |> check_labels(profile)
 
     {%{group | command: group.command ++ profile_argv(profile)}, acc}
   end
@@ -732,6 +741,24 @@ defmodule Cairn.Config do
             "is spawned from)"
         )
     end
+  end
+
+  # The labels file gets the artifact's treatment for the artifact's reason:
+  # it is a path this config expands into `--labels`, read by the plugin
+  # against the same cwd. Absence is not an error here the way a missing
+  # artifact is: `--labels` is optional to the plugin (class ids stand in for
+  # names without it), where a profiled group with no `--model` could only ever
+  # run a model nobody named.
+  defp check_labels(acc, %Profile{labels: nil}), do: acc
+
+  defp check_labels(acc, %Profile{labels: path} = profile) do
+    check(
+      acc,
+      File.regular?(path),
+      "profile #{profile.name}: labels file #{path} does not exist or is not a regular " <>
+        "file (relative paths resolve against the working directory the plugin is " <>
+        "spawned from)"
+    )
   end
 
   defp resolve_members(%__MODULE__{udp_base_port: base} = config) when is_integer(base) do

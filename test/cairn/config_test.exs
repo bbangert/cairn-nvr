@@ -189,8 +189,10 @@ defmodule Cairn.ConfigTest do
       [cam_a, cam_b] = config.cameras
       refute Enum.any?(warnings, &(&1 =~ "bbd"))
 
-      # every camera or none: the matcher is one decision for the fleet, so
-      # unlike the three bounds beside it there is no per-camera form of it
+      # every camera or none: the matcher is one decision for every camera this
+      # key answers for, so unlike the three bounds beside it there is no
+      # per-camera form of it (the other way to answer it is per plugin group,
+      # in a hardware profile, which these two cameras do not have)
       assert Config.policy(config, cam_a).bbd
       assert Config.policy(config, cam_b).bbd
 
@@ -1192,6 +1194,254 @@ defmodule Cairn.ConfigTest do
 
       assert {:error, errors} = Config.from_map(map)
       assert Enum.any?(errors, &(&1 =~ "plugin det: allow_experimental must be true or false"))
+    end
+
+    test "a labels file that is not on disk fails the load, naming both" do
+      map = argv_map("missing-labels", %{}, "test/support/fixtures/profiles/labels")
+
+      assert {:error, errors} = Config.from_map(map)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~
+                   "profile missing-labels: labels file " <>
+                     "test/support/fixtures/models/not-here.names does not exist")
+             )
+    end
+
+    test "an unreferenced profile's labels file is not checked either" do
+      map = Map.put(base_map(), "profile_dirs", ["test/support/fixtures/profiles/labels"])
+
+      assert {:ok, config, _warnings} = Config.from_map(map)
+      assert Map.has_key?(config.profiles, "missing-labels")
+    end
+  end
+
+  describe "backend capability table" do
+    alias Cairn.Config.Profile
+
+    @caps_dir "test/support/fixtures/profiles/caps"
+    @caps_bad_dir "test/support/fixtures/profiles/caps-bad"
+
+    defp caps_errors(dir) do
+      assert {:error, errors} = Config.from_map(Map.put(base_map(), "profile_dirs", [dir]))
+      errors
+    end
+
+    # The mirror itself. A row that drifts from
+    # `BackendKind::capabilities` in plugins/cairn-detect/src/infer/backend.rs
+    # is a change to what a profile may declare, not a refactor — the Rust side
+    # has the same test over the same values.
+    test "the table carries a row per backend, matching the plugin's own" do
+      assert Profile.capabilities("ort") == %{
+               artifact: "onnx",
+               fused_nms: true,
+               dynamic_shapes: true
+             }
+
+      # The documented near-collision: Rust reports `.onnx` as qnn's artifact
+      # *format* (QNN is an onnxruntime execution provider) while the host keys
+      # the file under `qnn:`, because a QDQ graph is a different file from the
+      # fp32 export.
+      assert Profile.capabilities("qnn") == %{
+               artifact: "qnn",
+               fused_nms: false,
+               dynamic_shapes: false
+             }
+
+      assert Profile.capabilities("rknn") == %{
+               artifact: "rknn",
+               fused_nms: false,
+               dynamic_shapes: false
+             }
+    end
+
+    # The mechanical half of the pairing: read the Rust rows out of the source
+    # and compare, so a coordinated Rust-side edit (table + its own test) still
+    # trips something here. The regex failing to find three rows is itself the
+    # tripwire — it means the Rust shape moved and the mirror needs re-pairing
+    # by hand. `artifact` is deliberately not compared: the two sides disagree
+    # for qnn by design (format vs `model:` key — see the table's comment).
+    test "the capability booleans match the plugin's source, mechanically" do
+      rust = File.read!("plugins/cairn-detect/src/infer/backend.rs")
+
+      rows =
+        Regex.scan(
+          ~r/Self::(\w+) => Capabilities \{\s*supports_fused_nms: (\w+),\s*supports_dynamic_shapes: (\w+),/,
+          rust
+        )
+
+      assert length(rows) == 3,
+             "BackendKind::capabilities rows moved in backend.rs — re-pair the mirror " <>
+               "(this regex and @backend_capabilities)"
+
+      for [_, kind, fused, dynamic] <- rows do
+        caps = kind |> String.downcase() |> Profile.capabilities()
+        assert caps.fused_nms == (fused == "true"), "fused_nms drifted for #{kind}"
+        assert caps.dynamic_shapes == (dynamic == "true"), "dynamic_shapes drifted for #{kind}"
+      end
+    end
+
+    test "the family table resolves the catalog's aliases to their family" do
+      assert {"yolov8", _row} = Profile.family("yolo11")
+      assert {"yolov10", _row} = Profile.family("yolo26")
+      assert {"rfdetr", _row} = Profile.family("RF-DETR ")
+      assert Profile.family("yolov12") == nil
+    end
+
+    # Rule 1, both sides. No shipped family fuses NMS into its export — every
+    # catalog row is NMS-free or host-side — so the reject side cannot be built
+    # from a real profile, and the rule is exercised against the row a future
+    # catalog addition would have. Coverage composes: rule 2's fixture tests
+    # run the public parse path through the same `check_capabilities/5`, so
+    # the wiring is proven there and only this branch needs the direct call —
+    # splitting the two rules into separate functions breaks that composition
+    # and needs a public-path test for each half.
+    test "a fused-NMS family is refused on a backend that cannot run the op" do
+      acc = %{errors: [], warnings: []}
+      fused = {"fusednet", %{aliases: [], nms: :fused, rknn_conversion: :documented}}
+
+      assert %{errors: [error]} = Profile.check_capabilities(acc, "synthetic", "qnn", true, fused)
+      assert error =~ "qnn backend requires an NMS-free family or host-side-NMS decode"
+      assert error =~ "model_profile fusednet fuses the suppression op"
+
+      assert %{errors: [_rknn_error]} =
+               Profile.check_capabilities(acc, "synthetic", "rknn", true, fused)
+    end
+
+    test "the same family is accepted on ort, which implements the op" do
+      acc = %{errors: [], warnings: []}
+      fused = {"fusednet", %{aliases: [], nms: :fused, rknn_conversion: :documented}}
+
+      assert Profile.check_capabilities(acc, "synthetic", "ort", true, fused) == acc
+    end
+
+    test "an NMS-free family and a host-side-NMS one both load on qnn" do
+      assert {:ok, config, []} =
+               Config.from_map(Map.put(base_map(), "profile_dirs", [@caps_dir]))
+
+      assert config.profiles["qnn-nms-free"].model_profile == "yolov10"
+      assert config.profiles["qnn-host-side-nms"].model_profile == "yolox"
+    end
+
+    # Rule 2. The rknn conversions the research does not document are shipped
+    # only with the acknowledgement — both fixtures live in the dir above.
+    test "rknn plus an undocumented conversion demands experimental: true" do
+      errors = caps_errors(@caps_bad_dir)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~
+                   "profile rknn-unverified: rknn conversion is undocumented for " <>
+                     "model_profile rfdetr")
+             )
+
+      assert Enum.any?(errors, &(&1 =~ "declare experimental: true"))
+    end
+
+    # A truthy non-boolean is a type error AND not an acknowledgement: both
+    # messages must surface, or the type error hides the actionable one.
+    test "a non-boolean experimental does not satisfy the rknn rule" do
+      errors = caps_errors(@caps_bad_dir)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "profile rknn-truthy-experimental: experimental must be true or false")
+             )
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~
+                   "profile rknn-truthy-experimental: rknn conversion is undocumented for " <>
+                     "model_profile rfdetr")
+             )
+    end
+
+    test "the acknowledgement, or a documented family, satisfies the rule" do
+      assert {:ok, config, []} =
+               Config.from_map(Map.put(base_map(), "profile_dirs", [@caps_dir]))
+
+      assert config.profiles["rknn-acknowledged"].experimental
+      # yolo11 resolves to yolov8, whose conversion the model zoo documents:
+      # no acknowledgement asked for by *this* rule.
+      refute config.profiles["rknn-documented"].experimental
+    end
+
+    test "an unknown model_profile is refused, naming the menu it must come from" do
+      errors = caps_errors(@caps_bad_dir)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "profile bad-family: unknown model_profile \"yolov12\"")
+             )
+
+      assert Enum.any?(errors, &(&1 =~ "yolov8 (or yolov9, yolo11, yolov11)"))
+    end
+
+    test "an unknown decoder is refused, and says which knob it is" do
+      errors = caps_errors(@caps_bad_dir)
+
+      assert Enum.any?(errors, &(&1 =~ "profile bad-decoder: unknown decoder \"cuda\""))
+      assert Enum.any?(errors, &(&1 =~ "decoder: is the video decode path"))
+    end
+  end
+
+  describe "built-in profiles" do
+    # These four load on *every* config load, this suite's included, so a
+    # broken one is a broken host and not just a broken board.
+    test "the shipped dir parses clean and holds the four board profiles" do
+      assert {:ok, config, []} = Config.from_map(base_map())
+
+      assert Enum.sort(Map.keys(config.profiles)) == [
+               "generic-ort",
+               "qcs6490",
+               "rk3566-lowfps",
+               "rk3576"
+             ]
+
+      # Every band is declared rather than measured, but every profile has one.
+      for {_name, profile} <- config.profiles do
+        assert [min, max] = profile.fps_band
+        assert min > 0 and min <= max
+      end
+    end
+
+    test "generic-ort is the migration target: today's defaults, not experimental" do
+      assert {:ok, config, []} = Config.from_map(base_map())
+      profile = config.profiles["generic-ort"]
+
+      refute profile.experimental
+      assert profile.backend == "ort"
+      assert profile.model_profile == "yolox"
+      # The whole point of this one: adopting it changes nothing. The twin gate
+      # is the no-profile stage list (D-P8); bbd and oru ship off.
+      assert profile.stages == %{twin_mint: %{}}
+      assert profile.max_unseen_ms == Config.default_max_unseen_ms()
+      assert profile.max_live_tracks == Config.default_max_live_tracks()
+      assert profile.stationary_after_ms == Config.default_stationary_after_ms()
+    end
+
+    test "the two rknn boards ship the full low-fps stage set, experimental" do
+      assert {:ok, config, []} = Config.from_map(base_map())
+
+      for name <- ["rk3566-lowfps", "rk3576"] do
+        profile = config.profiles[name]
+        assert profile.experimental, "#{name} runs a stubbed backend"
+        assert profile.backend == "rknn"
+        assert profile.stages == %{bbd: %{}, oru: %{}, twin_mint: %{}}
+      end
+    end
+
+    test "qcs6490 is NMS-free with every stage delisted, twin gate included" do
+      assert {:ok, config, []} = Config.from_map(base_map())
+      profile = config.profiles["qcs6490"]
+
+      assert profile.experimental
+      assert profile.backend == "qnn"
+      assert profile.model_profile == "yolov10"
+      # Present-but-empty is the presence-semantics half that matters here: the
+      # block speaks, and what it says is "nothing runs" (D-P8).
+      assert profile.stages == %{}
     end
   end
 

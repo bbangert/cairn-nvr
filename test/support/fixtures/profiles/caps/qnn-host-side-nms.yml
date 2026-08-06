@@ -1,0 +1,7 @@
+# The rule's other accept side: yolox is suppressed host-side, on the CPU,
+# whatever executed the model.
+experimental: true
+backend: qnn
+model:
+  qnn: test/support/fixtures/models/stub.onnx
+model_profile: yolox

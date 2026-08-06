@@ -30,6 +30,13 @@ defmodule Cairn.Tracker.Stage.TwinMint do
   legitimate close same-label pairs common enough that the gate would eat
   real objects.
 
+  The default belongs to the **boolean** path. A camera whose plugin group
+  carries a hardware profile is listed by presence alone — a profile that
+  does not name `twin_mint:` delists the gate, which is what `qcs6490.yml`
+  does and why that file argues the case in its own comments: this stage
+  exists *because* an NMS-free head slipped a double box (the incident
+  above), so turning it off for one is a trade nothing has measured.
+
   ## Placement
 
   `constraints/0` pins this last at its insertion point: it weighs the
