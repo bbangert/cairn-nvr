@@ -162,6 +162,16 @@ struct Args {
     /// Probed at startup; any failure falls back to software.
     #[arg(long, value_enum, default_value_t = DecoderKind::Auto)]
     decoder: DecoderKind,
+
+    /// Frames per second the decode thread's sample gate lets through to the
+    /// model — the ceiling `--motion-json`'s gate skips *within*, never a
+    /// floor it can push inference under. One rate for the whole process:
+    /// group mode shares it across every member rather than taking a
+    /// per-camera rate. `1..=30`: below 1 there is no rate to sample at, and
+    /// above 30 is almost certainly a mistyped frame count rather than an
+    /// intended sample rate.
+    #[arg(long, default_value_t = decode::DEFAULT_SAMPLE_FPS, value_parser = clap::value_parser!(u32).range(1..=30))]
+    sample_fps: u32,
 }
 
 fn main() {
@@ -244,7 +254,10 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
 
     multiplex::run(
         &specs,
-        args.decoder,
+        multiplex::DecodeSettings {
+            kind: args.decoder,
+            sample_fps: args.sample_fps,
+        },
         &motion,
         floors,
         detector,
@@ -341,13 +354,26 @@ fn run_single(args: &Args) -> Result<()> {
         let stream = &input.streams()[stream_index];
         (
             stream.time_base,
-            decode::open(args.decoder, &stream.codecpar(), input_spec, motion)?,
+            decode::open(
+                args.decoder,
+                &stream.codecpar(),
+                input_spec,
+                motion,
+                args.sample_fps,
+            )?,
         )
     };
 
     emit::stdout_line(&emit::status_line(Some(&camera_id), "ready", None, None))?;
 
-    let decoded = decode::run(&mut input, stream_index, time_base, decoder.as_mut(), &tx);
+    let decoded = decode::run(
+        &mut input,
+        stream_index,
+        time_base,
+        decoder.as_mut(),
+        &tx,
+        args.sample_fps,
+    );
     drop(tx);
 
     // A dead inference thread shows up in the decode loop as a closed
@@ -373,7 +399,7 @@ fn model_summary(args: &Args, detector: &Detector) -> String {
     let spec = detector.input_spec();
     format!(
         "model={} backend={} profile={} input={} input size={} ({}) encoding={} \
-         resize={} layout={} score={} decoder={}",
+         resize={} layout={} score={} decoder={} sample_fps={}",
         args.model.display(),
         detector.backend_summary(),
         detector.profile(),
@@ -387,7 +413,8 @@ fn model_summary(args: &Args, detector: &Detector) -> String {
         // rewrites only `layout` and keeps the rest of the profile's
         // `OutputSpec`, so the composition is settled before any frame arrives.
         detector.profile().output.score,
-        args.decoder
+        args.decoder,
+        args.sample_fps
     )
 }
 
@@ -582,5 +609,39 @@ mod tests {
         // half of the per-camera form is not enough
         assert!(parse(&["--camera-id", "front"]).is_err());
         assert!(parse(&["--udp-port", "17000"]).is_err());
+    }
+
+    #[test]
+    fn sample_fps_defaults_to_the_decoder_constant_and_accepts_both_forms() {
+        let base = &["--camera-id", "front", "--udp-port", "17000"];
+        // absent means the clap default, which is `decode::DEFAULT_SAMPLE_FPS`
+        // by construction — not a coincidence a comment could drift out of.
+        assert_eq!(parse(base).unwrap().sample_fps, decode::DEFAULT_SAMPLE_FPS);
+
+        let with = |value: &str| {
+            let mut argv = base.to_vec();
+            argv.extend_from_slice(&["--sample-fps", value]);
+            parse(&argv)
+        };
+        assert_eq!(with("10").unwrap().sample_fps, 10);
+
+        let group = parse(&["--cameras-json", "[]", "--sample-fps", "12"]).unwrap();
+        assert_eq!(group.sample_fps, 12);
+    }
+
+    #[test]
+    fn sample_fps_rejects_zero_and_anything_over_thirty() {
+        let base = &["--camera-id", "front", "--udp-port", "17000"];
+        let with = |value: &str| {
+            let mut argv = base.to_vec();
+            argv.extend_from_slice(&["--sample-fps", value]);
+            parse(&argv)
+        };
+        assert!(with("0").is_err(), "0 has no interval to sample at");
+        assert!(with("31").is_err(), "just over the ceiling");
+        // the edges of the accepted range are legal
+        assert!(with("1").is_ok());
+        assert!(with("30").is_ok());
+        assert_eq!(with("30").unwrap().sample_fps, 30);
     }
 }

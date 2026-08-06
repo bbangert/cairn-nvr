@@ -1,0 +1,6 @@
+# sample_fps exactly at its fps_band's max edge: inclusive, so it loads.
+backend: ort
+model:
+  onnx: test/support/fixtures/models/stub.onnx
+fps_band: [4, 8]
+sample_fps: 8

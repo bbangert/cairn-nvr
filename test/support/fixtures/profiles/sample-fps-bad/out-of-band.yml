@@ -1,0 +1,4 @@
+# sample_fps outside its own declared fps_band.
+backend: ort
+fps_band: [8, 12]
+sample_fps: 6

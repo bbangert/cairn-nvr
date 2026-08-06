@@ -24,7 +24,6 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use crate::decode::SAMPLE_FPS;
 use crate::infer::InputSize;
 
 /// Widest a thumbnail gets, in pixels.
@@ -43,15 +42,21 @@ const MAX_THUMB_W: usize = 96;
 const LIGHTNING_FRACTION: f32 = 0.8;
 
 /// Rolling-average weight while the background is still being learned, and
-/// the number of frames it is used for.
+/// how many seconds of frames it is used for.
 ///
-/// Counted in frames rather than seconds because this module has no clock; at
-/// [`SAMPLE_FPS`] the two constants are 5 seconds of settling. No verdict
-/// during that window reports motion — the background starts as one frame,
-/// and until it has absorbed a few more, "differs from the background" mostly
-/// means "differs from whatever was in front of the camera at startup".
+/// The count of frames that spans is derived at construction from the
+/// decode thread's actual sample rate — see [`MotionDetector::new`] — because
+/// this module has no clock of its own: elapsed time is counted in frames,
+/// and a frame is only ever "one sample", never "one fifth of a second". The
+/// window is `CALIBRATION_SECONDS * sample_fps` frames, which spans
+/// [`CALIBRATION_SECONDS`] of wall clock only when the camera actually
+/// delivers the configured rate — the rate is a ceiling, so a slower camera
+/// stretches the window (the README's 2 fps example). No verdict during that
+/// window reports motion — the background starts as one frame, and until it
+/// has absorbed a few more, "differs from the background" mostly means
+/// "differs from whatever was in front of the camera at startup".
 const CALIBRATION_ALPHA: f32 = 0.2;
-const CALIBRATION_FRAMES: u32 = 5 * SAMPLE_FPS;
+const CALIBRATION_SECONDS: u32 = 5;
 
 /// Per-pixel 0..255 difference that counts as changed.
 const DEFAULT_THRESHOLD: u8 = 25;
@@ -60,7 +65,9 @@ const DEFAULT_THRESHOLD: u8 = 25;
 /// erring small costs nothing but CPU while erring large loses detections.
 const DEFAULT_MIN_AREA_FRACTION: f32 = 0.005;
 /// Rolling-average weight in steady state — about a 50-frame time constant,
-/// or 10 seconds at [`SAMPLE_FPS`].
+/// or 10 seconds at the default `--sample-fps` of 5. A higher sample rate
+/// packs those 50 frames into fewer wall-clock seconds; this constant is a
+/// frame count, not a duration, so it moves with the rate.
 const DEFAULT_ALPHA: f32 = 0.02;
 const DEFAULT_LINGER_MS: u64 = 12_000;
 const DEFAULT_EPOCH_BYPASS_MS: u64 = 15_000;
@@ -251,10 +258,12 @@ pub struct MotionVerdict {
     pub motion: bool,
     /// Whether this verdict came from a detector that has not finished
     /// calibrating, and so cannot say a scene is still — see
-    /// [`CALIBRATION_FRAMES`]. `motion` is false throughout that window
-    /// whatever is in front of the camera, which is a statement about the
-    /// background rather than about the picture, and the two are worth telling
-    /// apart by anything deciding whether to skip work.
+    /// [`MotionDetector`]'s `calibration_frames`, [`CALIBRATION_SECONDS`]
+    /// converted to a frame count at that detector's sample rate. `motion` is
+    /// false throughout that window whatever is in front of the camera, which
+    /// is a statement about the background rather than about the picture, and
+    /// the two are worth telling apart by anything deciding whether to skip
+    /// work.
     pub calibrating: bool,
     /// Whether `changed_fraction` cleared [`LIGHTNING_FRACTION`], so this
     /// frame was read as a scene cut and rebaselined the background. `motion`
@@ -385,15 +394,25 @@ pub struct MotionDetector {
     /// replaces the background, keeps this count, and advances it like any
     /// other frame.
     frames: u32,
+    /// [`CALIBRATION_SECONDS`] converted to a frame count at this detector's
+    /// sample rate — resolved once, at construction, from `--sample-fps`
+    /// rather than recomputed per frame, since the rate is fixed for the life
+    /// of the process.
+    calibration_frames: u32,
 }
 
 impl MotionDetector {
-    pub fn new(config: MotionConfig) -> Self {
+    /// `sample_fps` is the decode thread's resolved `--sample-fps`, the same
+    /// rate [`crate::decode::run`] paces its gate on — this is what turns
+    /// [`CALIBRATION_SECONDS`] into a frame count, since this module has no
+    /// clock to measure seconds with directly.
+    pub fn new(config: MotionConfig, sample_fps: u32) -> Self {
         Self {
             config,
             background: Vec::new(),
             size: (0, 0),
             frames: 0,
+            calibration_frames: CALIBRATION_SECONDS * sample_fps,
         }
     }
 
@@ -416,7 +435,7 @@ impl MotionDetector {
         // Read before the frame is folded in, so the flag describes the
         // background this frame was compared against rather than the one the
         // comparison produced.
-        let calibrating = self.frames < CALIBRATION_FRAMES;
+        let calibrating = self.frames < self.calibration_frames;
         let threshold = f32::from(self.config.threshold);
         let changed = self
             .background
@@ -434,11 +453,13 @@ impl MotionDetector {
             //
             // `frames` deliberately survives and advances. It survives because
             // a calibrated detector stays calibrated: restarting the
-            // calibration here would report `calibrating` for 5 seconds every
-            // time a light came on, and what the camera is looking at then
-            // tends to be worth measuring. It advances because a detector that
-            // has just rebaselined onto the scene in front of it has, if
-            // anything, more to go on than a calibrating one — and because a
+            // calibration here would report `calibrating` for the whole
+            // calibration window (`CALIBRATION_SECONDS` at the configured
+            // `--sample-fps`) every time a light came on, and what the camera
+            // is looking at then tends to be worth measuring. It advances
+            // because a detector that has just rebaselined onto the scene in
+            // front of it has, if anything, more to go on than a calibrating
+            // one — and because a
             // camera that cuts on most samples (an IR-cut filter hunting,
             // auto-exposure oscillating) has to finish calibrating at some
             // point, rather than sitting at "no motion" for as long as it
@@ -489,12 +510,25 @@ mod tests {
 
     const WIDE: InputSize = InputSize { w: 1920, h: 1080 };
 
-    /// A detector on the defaults, with the gate switched on.
+    /// The sample rate every test below pins itself to, unless it is
+    /// specifically testing that the calibration window moves with the rate.
+    /// `CALIBRATION_FRAMES` and every count derived from it below are only
+    /// valid at this rate — see `--sample-fps`'s clap default,
+    /// [`crate::decode::DEFAULT_SAMPLE_FPS`], which this equals by
+    /// construction rather than by coincidence.
+    const TEST_SAMPLE_FPS: u32 = crate::decode::DEFAULT_SAMPLE_FPS;
+    const CALIBRATION_FRAMES: u32 = CALIBRATION_SECONDS * TEST_SAMPLE_FPS;
+
+    /// A detector on the defaults, with the gate switched on, at
+    /// [`TEST_SAMPLE_FPS`].
     fn detector() -> MotionDetector {
-        MotionDetector::new(MotionConfig {
-            enabled: true,
-            ..MotionConfig::default()
-        })
+        MotionDetector::new(
+            MotionConfig {
+                enabled: true,
+                ..MotionConfig::default()
+            },
+            TEST_SAMPLE_FPS,
+        )
     }
 
     /// A thumbnail built directly, bypassing the RGB24 downsample.
@@ -610,6 +644,44 @@ mod tests {
     }
 
     #[test]
+    fn the_calibration_window_scales_with_the_configured_sample_rate() {
+        // `CALIBRATION_SECONDS` is the invariant, not `CALIBRATION_FRAMES`: a
+        // detector built for a doubled `--sample-fps` has to spend twice as
+        // many frames calibrating to cover the same wall-clock window, since
+        // this module has no clock of its own to measure that window with
+        // directly.
+        let still = thumb(96, 54, 100);
+        let moved = block(96, 54, 100, 48, 27, 200);
+        let fast_frames = CALIBRATION_SECONDS * (TEST_SAMPLE_FPS * 2);
+        assert_eq!(fast_frames, CALIBRATION_FRAMES * 2);
+
+        let mut last_inside = MotionDetector::new(
+            MotionConfig {
+                enabled: true,
+                ..MotionConfig::default()
+            },
+            TEST_SAMPLE_FPS * 2,
+        );
+        observe_still(&mut last_inside, &still, fast_frames - 1);
+        assert!(
+            last_inside.observe(&moved).calibrating,
+            "still inside the doubled-rate window"
+        );
+
+        let mut first_outside = MotionDetector::new(
+            MotionConfig {
+                enabled: true,
+                ..MotionConfig::default()
+            },
+            TEST_SAMPLE_FPS * 2,
+        );
+        observe_still(&mut first_outside, &still, fast_frames);
+        let verdict = first_outside.observe(&moved);
+        assert!(!verdict.calibrating, "first observation outside it");
+        assert!(verdict.motion);
+    }
+
+    #[test]
     fn every_observation_of_the_calibration_window_is_flagged_as_one() {
         // The flag the whole reopen guarantee rests on (`crate::gate`: a
         // camera whose detector is not calibrated is never gated), asserted on
@@ -694,11 +766,14 @@ mod tests {
 
     #[test]
     fn a_change_under_the_area_floor_is_not_motion_but_is_still_measured() {
-        let mut detector = MotionDetector::new(MotionConfig {
-            enabled: true,
-            min_area_fraction: 0.1,
-            ..MotionConfig::default()
-        });
+        let mut detector = MotionDetector::new(
+            MotionConfig {
+                enabled: true,
+                min_area_fraction: 0.1,
+                ..MotionConfig::default()
+            },
+            TEST_SAMPLE_FPS,
+        );
         let still = thumb(100, 10, 100);
         calibrate(&mut detector, &still);
 
@@ -711,11 +786,14 @@ mod tests {
     #[test]
     fn a_change_exactly_at_the_area_floor_counts_as_motion() {
         // The compare is `>=`, so the floor is the first fraction that counts.
-        let mut detector = MotionDetector::new(MotionConfig {
-            enabled: true,
-            min_area_fraction: 0.1,
-            ..MotionConfig::default()
-        });
+        let mut detector = MotionDetector::new(
+            MotionConfig {
+                enabled: true,
+                min_area_fraction: 0.1,
+                ..MotionConfig::default()
+            },
+            TEST_SAMPLE_FPS,
+        );
         let still = thumb(100, 10, 100);
         calibrate(&mut detector, &still);
 
@@ -850,11 +928,14 @@ mod tests {
         }
 
         let fraction_at = |threshold: u8| {
-            let mut detector = MotionDetector::new(MotionConfig {
-                enabled: true,
-                threshold,
-                ..MotionConfig::default()
-            });
+            let mut detector = MotionDetector::new(
+                MotionConfig {
+                    enabled: true,
+                    threshold,
+                    ..MotionConfig::default()
+                },
+                TEST_SAMPLE_FPS,
+            );
             calibrate(&mut detector, &still);
             detector.observe(&banded).changed_fraction
         };
@@ -878,11 +959,14 @@ mod tests {
         let held = block(20, 20, 100, 20, 10, 160);
 
         let frames_to_settle = |alpha: f32| {
-            let mut detector = MotionDetector::new(MotionConfig {
-                enabled: true,
-                alpha,
-                ..MotionConfig::default()
-            });
+            let mut detector = MotionDetector::new(
+                MotionConfig {
+                    enabled: true,
+                    alpha,
+                    ..MotionConfig::default()
+                },
+                TEST_SAMPLE_FPS,
+            );
             calibrate(&mut detector, &still);
             (1..=500)
                 .find(|_| !detector.observe(&held).motion)

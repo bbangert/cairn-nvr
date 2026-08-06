@@ -4,7 +4,8 @@ Cairn's reference detection plugin: a single Rust binary that takes H.264 RTP
 on a UDP port — or on several at once, serving a whole plugin group from one
 process — and speaks the plugin contract's protocol v1 on stdout and stdin
 (see `docs/plugin-contract.md`). It decodes on the video ASIC when one is
-available, samples to ~5 fps, and runs an object-detection model on the CPU
+available, samples to a configurable rate (`--sample-fps`, default 5), and
+runs an object-detection model on the CPU
 through onnxruntime. The two documented defaults are **YOLOX-Nano** and
 **RF-DETR-Nano**, both Apache-2.0 like Cairn itself; end-to-end (YOLOv10,
 YOLO26) and raw Ultralytics (YOLOv8/v9/v11) heads also decode if you bring
@@ -22,7 +23,7 @@ here, in the two modes Cairn can launch one in.
 ```
 udp:127.0.0.1:{port}  ->  sdp demuxer (generated SDP, retried mid-GOP)
    -> decode (hardware if a backend opens, else software)
-      -> wall-clock sample to 5 fps          <- full-rate frames end here
+      -> wall-clock sample to --sample-fps   <- full-rate frames end here
          -> stamp observed_at, resize per profile (stretch | letterbox),
             RGB24 -> CHW f32, and the projection back to frame coordinates
             -> [size-1 channel, try_send: drop when inference is behind]
@@ -33,7 +34,7 @@ stdin  ->  control thread  ->  per-camera stream epoch map
 ```
 
 Everything expensive happens *after* the sample gate: a hardware decoder
-never pays to scale or download the ~55 fps of frames it is about to discard,
+never pays to scale or download the full-rate frames it is about to discard,
 and inference runs on its own thread so a slow model pass can never stall the
 socket read. stdin has a thread of its own for the same reason in reverse —
 Cairn writes epochs without waiting for us, so they have to be read without
@@ -163,7 +164,7 @@ plugin:
 | `enabled` | `false` | run the gate at all. With this off no detector is built and no thumbnail is taken. The knobs below that have ranges are still checked either way, so an out-of-range value fails startup even with the gate switched off |
 | `threshold` | `25` | per-pixel 0..255 difference from the background that counts as changed (`1..=254`; the comparison is strict and 255 is the largest difference there is, so 255 would count nothing) |
 | `min_area_fraction` | `0.005` | fraction of the thumbnail that has to change before the frame counts as motion (`(0, 0.8)`; a frame that changes more than 80 % is a scene cut, so a floor at or above that is refused at startup rather than left unreachable) |
-| `alpha` | `0.02` | how fast the background absorbs the picture: `bg = (1 - alpha) * bg + alpha * frame`, per sample (`(0, 1]`). At the 5 fps sample rate this is roughly a 10-second memory, and something that parks in frame keeps reading as motion for at least that long — longer the more it contrasts with what it covers, since the background has to decay to within `threshold` of it |
+| `alpha` | `0.02` | how fast the background absorbs the picture: `bg = (1 - alpha) * bg + alpha * frame`, per sample (`(0, 1]`). At the default 5 fps sample rate this is roughly a 10-second memory, and something that parks in frame keeps reading as motion for at least that long — longer the more it contrasts with what it covers, since the background has to decay to within `threshold` of it |
 | `linger_ms` | `12000` | how long past the last motion to keep inferring anyway |
 | `epoch_bypass_ms` | `15000` | how long after a stream restart to infer regardless of motion |
 | `reverify_ms` | `10000` | how often to infer anyway while gated |
@@ -193,16 +194,16 @@ reason to skip a model pass — both are in the list of bounds above, because
 has just been thrown away, is not a measurement of the scene.
 
 The calibration window and `alpha`'s memory are both counted in samples, and
-5 fps is a ceiling on the sample rate rather than the rate itself — the gate
-takes at most one sample every 200 ms and otherwise takes whatever the camera
-delivers. On a 2 fps substream the calibration window is 12.5 seconds and the
-10-second memory is 25, so read every second in this section as "at this
-camera's sample rate".
+`--sample-fps` (default 5) is a ceiling on the sample rate rather than the
+rate itself — the gate takes at most one sample every 1/rate seconds (200 ms
+at the default) and otherwise takes whatever the camera delivers. On a 2 fps
+substream the calibration window is 12.5 seconds and the 10-second memory is
+25, so read every second in this section as "at this camera's sample rate".
 
 **Frigate's published numbers do not transfer as-is.** Frigate compares motion
 on a frame around 100 px high; the thumbnail here is at most 96 px *wide*,
-shaped from the content rectangle, and it is compared at up to 5 fps rather
-than at the camera's full rate. A fraction measured on one of those is not the
+shaped from the content rectangle, and it is compared at up to the sample
+rate (default 5 fps) rather than at the camera's full rate. A fraction measured on one of those is not the
 same quantity as a fraction measured on the other, so treat the defaults as a
 starting point and tune `min_area_fraction` against the change fractions your
 own cameras produce.

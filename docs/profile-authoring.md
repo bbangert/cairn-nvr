@@ -56,9 +56,9 @@ cameras:
 The group's `command:` keeps everything that describes *your* deployment — the
 binary's path, `--motion-json`, `--track-floor-json` — and loses everything
 that describes the model. A profiled group whose command already carries
-`--model`, `--model-profile`, `--input-size`, `--decoder` or `--labels` fails
-the load: those five come from the profile alone, so that there is never a
-question of which answer won.
+`--model`, `--model-profile`, `--input-size`, `--decoder`, `--labels` or
+`--sample-fps` fails the load: those six come from the profile alone, so that
+there is never a question of which answer won.
 
 ## The schema
 
@@ -78,6 +78,7 @@ input_size: 416            # square N; the model's own geometry when omitted
 decoder: auto              # the *video* decode path — not the backend
 labels: models/coco.names  # class names, indexed positionally
 fps_band: [2, 4]           # declared, not measured
+sample_fps: 3              # optional; fps_band only validates it, never emits it
 
 tracking:                  # the stage list, plus band-tuned tracker bounds
   bbd: true
@@ -131,6 +132,18 @@ against it; nothing observes the real rate and adapts. Every band cairn ships
 carries a comment saying what it was derived from and that it is pending
 on-hardware measurement — write yours the same way, and treat a band as data
 that is cheap to correct.
+
+`sample_fps` is optional, and **the band validates it, the band never emits
+it** (D-P4): leave `sample_fps:` unset and no `--sample-fps` flag is written
+regardless of what `fps_band:` says, and the plugin keeps its own default of
+5. Set it and it becomes `--sample-fps <value>`, checked at load against the
+same `1..30` bound the plugin's own flag parsing enforces. If the profile also
+declares an `fps_band:`, `sample_fps:` must fall inside it — a value outside
+the band is a config error naming both, since a profile that both bounds a
+rate and then names a value outside that bound is contradicting itself, not
+expressing a choice. A profile with `fps_band:` and no `sample_fps:` is
+unaffected either way: none of the four board profiles cairn ships sets
+`sample_fps:`, and their bands keep emitting nothing.
 
 ## The `tracking:` block
 
@@ -241,6 +254,9 @@ profile my-board: unknown decoder "cuda" (auto, nvdec, qsv, sw, v4l2, vaapi or
 profile my-board: name "other" does not match its filename — the filename is
   the name; drop the key or make them agree
 profile my-board: fps_band must be [min, max] with 0 < min <= max, got [4, 2]
+profile my-board: sample_fps must be an integer between 1 and 30, got "fast"
+profile my-board: sample_fps 6 contradicts fps_band [8, 12] — a declared
+  sample_fps must fall inside its own fps_band
 profile my-board: tracking.bbd must be true, false or a params mapping, got 1
 profile my-board: rknn conversion is undocumented for model_profile rfdetr
   (docs/npu-backends.md covers the model zoo's YOLOv5–v11) — declare
@@ -259,8 +275,8 @@ plugin detect: unknown profile "rk3566" — no such file in priv/profiles or any
   profile_dirs entry
 plugin detect: command carries --input-size, which profile my-board owns — a
   profiled group's model flags (--model, --model-profile, --input-size,
-  --decoder, --labels) come from its profile alone; drop --input-size from
-  command:
+  --decoder, --labels, --sample-fps) come from its profile alone; drop
+  --input-size from command:
 plugin detect: profile my-board uses backend rknn, which is not yet implemented
   — only ort executes today, and a profile naming another backend must declare
   experimental: true

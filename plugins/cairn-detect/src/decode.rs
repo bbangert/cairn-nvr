@@ -3,10 +3,12 @@
 //! [`Decoder`] is the hardware/software seam: `receive_frame` hands back
 //! whatever the decoder produced (a system-memory frame from software or
 //! v4l2m2m, a GPU surface from VAAPI/QSV/NVDEC) and `to_tensor` is only ever
-//! called on the frames that survive the 5 fps sample gate. Everything
-//! expensive — scale, pixel-format convert, and for the hardware paths the
-//! download out of GPU memory — happens there, so a hardware decoder never
-//! pays for the ~55 fps of frames it is about to discard.
+//! called on the frames that survive the sample gate — `--sample-fps` frames
+//! a second, 5 by default. Everything expensive — scale, pixel-format
+//! convert, and for the hardware paths the download out of GPU memory —
+//! happens there, so a hardware decoder never pays for the frames between
+//! samples that it is about to discard, which at the default rate on a
+//! ~60 fps camera is most of them.
 //!
 //! One thing that happens there is *not* about feeding the model: when the
 //! motion gate is configured, [`RgbScaler::tensor_from`] also downsamples the
@@ -37,7 +39,11 @@ use crate::hwdecode::{HwBackend, HwDecoder};
 use crate::infer::{Fit, InputSize, InputSpec, Projection};
 use crate::motion::{GrayThumb, MotionConfig, MotionDetector, MotionVerdict};
 
-pub const SAMPLE_FPS: u32 = 5;
+/// The clap default for `--sample-fps`, and nothing more: the decode
+/// thread's actual sample rate is whatever `--sample-fps` resolved to, which
+/// is this value only when the flag was not given. Nothing in this crate may
+/// treat it as the operative rate — thread the resolved `u32` instead.
+pub const DEFAULT_SAMPLE_FPS: u32 = 5;
 
 /// The RTP clock the contract emits `pts` in.
 const PTS_TIMEBASE: AVRational = AVRational {
@@ -197,18 +203,25 @@ const MAX_PIXELS: i64 = 32 * 1024 * 1024;
 /// off for it — see [`crate::motion::resolve`]. It reaches the decoder rather
 /// than the inference thread because the detector's state is per camera, and
 /// one decoder is what "per camera" means on this side in both modes.
+///
+/// `sample_fps` is the process's resolved `--sample-fps` — one rate for every
+/// camera this process serves, single mode or grouped, since the flag is
+/// per-process by design. It reaches the decoder for the same reason `motion`
+/// does: [`RgbScaler`]'s [`crate::motion::MotionDetector`] derives its
+/// calibration window from it.
 pub fn open(
     kind: DecoderKind,
     codecpar: &AVCodecParameters,
     spec: InputSpec,
     motion: Option<MotionConfig>,
+    sample_fps: u32,
 ) -> Result<Box<dyn Decoder>> {
     let order = probe_order(kind);
     if order.is_empty() && kind != DecoderKind::Sw && kind != DecoderKind::Auto {
         eprintln!("decoder {kind} is not available on this platform");
     }
     for backend in order {
-        match HwDecoder::open(backend, codecpar, spec, motion) {
+        match HwDecoder::open(backend, codecpar, spec, motion, sample_fps) {
             Ok(decoder) => return Ok(Box::new(decoder)),
             Err(e) => eprintln!("hardware decoder {backend} unavailable: {e:#}"),
         }
@@ -216,7 +229,9 @@ pub fn open(
     if kind != DecoderKind::Sw {
         eprintln!("no hardware decoder opened; falling back to software decode");
     }
-    Ok(Box::new(SwDecoder::open(codecpar, spec, motion)?))
+    Ok(Box::new(SwDecoder::open(
+        codecpar, spec, motion, sample_fps,
+    )?))
 }
 
 /// Backends to try, in order, for a given `--decoder` value.
@@ -285,11 +300,14 @@ struct Target {
 }
 
 impl RgbScaler {
-    pub fn new(spec: InputSpec, motion: Option<MotionConfig>) -> Result<Self> {
+    /// `sample_fps` is only ever read here to build the [`MotionDetector`]'s
+    /// calibration window — see [`MotionDetector::new`] — and is otherwise
+    /// unused: nothing else this type does depends on how often it is called.
+    pub fn new(spec: InputSpec, motion: Option<MotionConfig>, sample_fps: u32) -> Result<Self> {
         Ok(Self {
             spec,
             target: None,
-            motion: motion.map(MotionDetector::new),
+            motion: motion.map(|config| MotionDetector::new(config, sample_fps)),
         })
     }
 
@@ -389,6 +407,7 @@ impl SwDecoder {
         codecpar: &AVCodecParameters,
         spec: InputSpec,
         motion: Option<MotionConfig>,
+        sample_fps: u32,
     ) -> Result<Self> {
         let codec = AVCodec::find_decoder(codecpar.codec_id)
             .ok_or_else(|| anyhow!("no decoder for codec id {}", codecpar.codec_id))?;
@@ -401,7 +420,7 @@ impl SwDecoder {
         eprintln!("decoder: software ({})", codec.name().to_string_lossy());
         Ok(Self {
             ctx,
-            rgb: RgbScaler::new(spec, motion)?,
+            rgb: RgbScaler::new(spec, motion, sample_fps)?,
         })
     }
 }
@@ -472,18 +491,32 @@ fn pack_chw(plane: &[u8], stride: usize, fit: Fit, spec: InputSpec) -> Vec<f32> 
     tensor
 }
 
+/// The wall-clock gap between samples that `--sample-fps` asks for.
+///
+/// A free function rather than inlined into [`run`] so the arithmetic is
+/// unit-testable without an `AVFormatContextInput` to drive the loop around
+/// it.
+fn sample_interval(sample_fps: u32) -> Duration {
+    Duration::from_secs_f64(1.0 / f64::from(sample_fps))
+}
+
 /// Read packets forever, handing sampled frames to the inference thread.
 ///
 /// Returns only on error or end of stream — both are fatal for the process,
 /// which is what Cairn's restart-with-backoff expects.
+///
+/// `sample_fps` is the process's resolved `--sample-fps`, validated at parse
+/// time to `1..=30` — this loop just turns it into an interval and never
+/// second-guesses it.
 pub fn run(
     input: &mut AVFormatContextInput,
     stream_index: usize,
     time_base: AVRational,
     decoder: &mut dyn Decoder,
     sink: &dyn SampleSink,
+    sample_fps: u32,
 ) -> Result<()> {
-    let interval = Duration::from_secs_f64(1.0 / f64::from(SAMPLE_FPS));
+    let interval = sample_interval(sample_fps);
     // Wall-clock sampling, not PTS sampling: the point is to cap how often we
     // run the model, and a stream that arrives in bursts would otherwise fire
     // several samples at once.
@@ -655,7 +688,13 @@ mod tests {
             raw.width = 1920;
             raw.height = 1080;
         }
-        let decoder = SwDecoder::open(&codecpar, unit_rgb(InputSize::square(640)), None).unwrap();
+        let decoder = SwDecoder::open(
+            &codecpar,
+            unit_rgb(InputSize::square(640)),
+            None,
+            DEFAULT_SAMPLE_FPS,
+        )
+        .unwrap();
         assert_eq!(decoder.ctx.max_pixels, MAX_PIXELS);
         // Generous enough for 8K, small enough that a 16384x16384 SPS fails.
         const { assert!(MAX_PIXELS > 7680 * 4320) };
@@ -838,5 +877,18 @@ mod tests {
         let mut frame = AVFrame::new();
         frame.set_pts(ffi::AV_NOPTS_VALUE);
         assert_eq!(pts_90k(&frame, PTS_TIMEBASE), 0);
+    }
+
+    #[test]
+    fn the_sample_interval_is_the_reciprocal_of_the_requested_rate() {
+        assert_eq!(
+            sample_interval(DEFAULT_SAMPLE_FPS),
+            Duration::from_millis(200)
+        );
+        // A non-default rate has to move the interval too, not just parse:
+        // this is the arithmetic `run` actually paces its gate on.
+        assert_eq!(sample_interval(10), Duration::from_millis(100));
+        assert_eq!(sample_interval(1), Duration::from_secs(1));
+        assert_eq!(sample_interval(30), Duration::from_secs_f64(1.0 / 30.0));
     }
 }

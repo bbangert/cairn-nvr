@@ -1,0 +1,5 @@
+# sample_fps above its declared fps_band — pins the `<= max` half of the
+# guard, which the below-band fixture alone leaves mutation-invisible.
+backend: ort
+fps_band: [8, 12]
+sample_fps: 13

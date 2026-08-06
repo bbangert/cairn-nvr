@@ -601,11 +601,11 @@ defmodule Cairn.Config do
 
   # -- profile argv expansion -------------------------------------------------
 
-  # The five flags a profile owns for its group, and the only argv
+  # The six flags a profile owns for its group, and the only argv
   # `Cairn.Config` ever writes. `--motion-json` and `--track-floor-json` are
   # deliberately absent: they describe the scene, not the model, and stay the
   # operator's own (D-P6).
-  @model_flags ~w(--model --model-profile --input-size --decoder --labels)
+  @model_flags ~w(--model --model-profile --input-size --decoder --labels --sample-fps)
 
   # One compiled word-boundary regex per flag, built once rather than per
   # `flag?/2` call: a flag counts as present at token-start or after
@@ -649,13 +649,19 @@ defmodule Cairn.Config do
   # Only the fields the profile actually set: an unset one emits no flag at
   # all rather than a default, leaving the plugin's own fallback in force —
   # `--model-profile` and `--input-size` are both sniffed from the model when
-  # absent, and a value guessed here would defeat that.
+  # absent, and a value guessed here would defeat that. `--sample-fps` follows
+  # the same rule for a different reason: `fps_band:` only *validates* a
+  # declared `sample_fps:` (`Profile.check_sample_fps/3`, D-P4) and is never
+  # itself a source for the flag, so a profile with a band and no
+  # `sample_fps:` emits nothing here, bit-identical to before this field
+  # existed.
   defp profile_argv(%Profile{} = profile) do
     flag("--model", Profile.artifact(profile)) ++
       flag("--model-profile", profile.model_profile) ++
       flag("--input-size", profile.input_size) ++
       flag("--decoder", profile.decoder) ++
-      flag("--labels", profile.labels)
+      flag("--labels", profile.labels) ++
+      flag("--sample-fps", profile.sample_fps)
   end
 
   defp flag(_name, nil), do: []
@@ -664,7 +670,7 @@ defmodule Cairn.Config do
   # D-P4: cross-boundary consistency by construction. Elixir expands both the
   # Rust argv and the tracker's stage list from one file, which is only true
   # for as long as nothing else writes the model argv — so an operator flag
-  # naming any of the five is an error, not a silent race between two answers
+  # naming any of the six is an error, not a silent race between two answers
   # settled by whatever clap does with a repeated flag. `flag?/2` counts an
   # occurrence anywhere inside a token, not just a whole token, so an operator
   # shell-wrapping the command (`["/bin/sh", "-c", "exec plugin --model x"]`)

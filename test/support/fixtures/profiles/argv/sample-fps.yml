@@ -1,0 +1,6 @@
+# sample_fps set, no fps_band declared: the flag is emitted from the value
+# alone, with nothing to validate it against.
+backend: ort
+model:
+  onnx: test/support/fixtures/models/stub.onnx
+sample_fps: 6

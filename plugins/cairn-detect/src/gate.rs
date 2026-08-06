@@ -269,11 +269,12 @@ impl Telemetry {
             GateState::Detecting
         };
         // `elapsed` is at least `REPORT_WINDOW` here, so neither rate can be
-        // infinite or NaN — and both track the decoder's `SAMPLE_FPS` pacing,
-        // which `SAMPLE_FPS` bounds only up to the depth of the channel
-        // feeding this loop (a stall then a drain can land two samples in one
-        // interval). Either way they stay orders of magnitude inside the
-        // host's 0..10 000, so no line loses its `fps` field.
+        // infinite or NaN — and both track the decoder's configured
+        // `--sample-fps` pacing, which bounds the sampled rate only up to the
+        // depth of the channel feeding this loop (a stall then a drain can
+        // land two samples in one interval). Either way they stay orders of
+        // magnitude inside the host's 0..10 000, so no line loses its `fps`
+        // field.
         let seconds = elapsed.as_secs_f64();
         let report = (self.reported != Some(state)).then(|| Report {
             fps: self.inferences as f64 / seconds,
@@ -510,8 +511,10 @@ mod tests {
             gate.decide(config(), moving(), Some(EPOCH), at(base, 1_000)),
             Decision::Detect
         );
-        // the whole linger window past that motion, sampled at 5 fps: still
-        // inferring, so nothing here refreshes the re-verify's meaning
+        // the whole linger window past that motion, sampled at this fixture's
+        // 5 fps cadence (200 ms/step — `Gate` itself reads wall-clock
+        // instants, never a sample rate): still inferring, so nothing here
+        // refreshes the re-verify's meaning
         for step in 1..60 {
             assert_eq!(
                 gate.decide(config(), still(), Some(EPOCH), at(base, 1_000 + step * 200)),
@@ -538,8 +541,8 @@ mod tests {
 
         // the host restarted the stream: every sample is inferred until the
         // bypass expires, because a seed cannot re-establish a suspended track.
-        // 75 samples is the whole 15 s window at 5 fps, the last of them at
-        // 16 800 ms.
+        // 75 samples is the whole 15 s window at this fixture's 5 fps cadence,
+        // the last of them at 16 800 ms.
         for step in 0..75 {
             assert_eq!(
                 gate.decide(config(), still(), Some(OTHER), at(base, 2_000 + step * 200)),
@@ -581,10 +584,10 @@ mod tests {
     #[test]
     fn a_gated_camera_re_verifies_on_the_interval() {
         let (mut gate, base) = settled();
-        // A still scene sampled at 5 fps for a minute. Every sample is gated
-        // except the ones the re-verify claims, and those land every
-        // `reverify_ms` — measured from the last inference, so they do not
-        // drift with the sample cadence.
+        // A still scene sampled at this fixture's 5 fps cadence for a minute.
+        // Every sample is gated except the ones the re-verify claims, and
+        // those land every `reverify_ms` — measured from the last inference,
+        // so they do not drift with the sample cadence.
         let mut inferences = Vec::new();
         for step in 1..=300 {
             let ms = step * 200;
@@ -634,8 +637,8 @@ mod tests {
         // The rebaseline installs the lit scene as the background, so every
         // frame after it compares clean and reads still — and they are gated
         // as still frames, the cut having armed no window of its own. Just
-        // under ten seconds of them at 5 fps, the last one a sample short of
-        // the re-verify.
+        // under ten seconds of them at this fixture's 5 fps cadence, the last
+        // one a sample short of the re-verify.
         for step in 1..50 {
             assert_eq!(
                 gate.decide(config(), still(), Some(EPOCH), at(base, 1_000 + step * 200)),
@@ -927,9 +930,9 @@ mod tests {
             let mut front = Member::new("front", config(), vec![det("person", 0.87)]);
             let base = Instant::now();
 
-            // motion, then a still scene sampled at 5 fps for 30 s: every
-            // sample emits a line, and the model runs only while the policy
-            // says it should
+            // motion, then a still scene sampled at this fixture's 5 fps
+            // cadence for 30 s: every sample emits a line, and the model runs
+            // only while the policy says it should
             let lines: Vec<String> = (0..150)
                 .map(|step| {
                     let verdict = if step == 0 { moving() } else { still() };
@@ -1199,8 +1202,12 @@ mod tests {
     mod telemetry {
         use super::*;
 
-        /// `samples` samples at 5 fps from `base`, each one's fate decided by
-        /// `decision`. Returns every report that came back.
+        /// `samples` samples at this fixture's 5 fps cadence (200 ms/step)
+        /// from `base`, each one's fate decided by `decision`. Returns every
+        /// report that came back. `Telemetry` itself never reads a sample
+        /// rate — it derives `fps` from the caller's own instants — so this
+        /// cadence is a fixture choice, matching `--sample-fps`'s clap
+        /// default rather than anything the type enforces.
         fn drive(
             telemetry: &mut Telemetry,
             base: Instant,
@@ -1216,10 +1223,10 @@ mod tests {
         fn the_reported_rate_is_model_passes_per_second_of_the_window() {
             let mut telemetry = Telemetry::default();
             let base = Instant::now();
-            // 5 fps for 30 s, with the model run on every fourth sample.
-            // The window that closes first holds 25 samples and 6 model
-            // passes, so the effective inference rate is 1.2 against a sample
-            // rate of 5.
+            // This fixture's 5 fps cadence for 30 s, with the model run on
+            // every fourth sample. The window that closes first holds 25
+            // samples and 6 model passes, so the effective inference rate is
+            // 1.2 against a sample rate of 5.
             let reports = drive(&mut telemetry, base, 0..150, |step| {
                 if step.is_multiple_of(4) {
                     Decision::Detect
@@ -1419,8 +1426,12 @@ mod tests {
             assert_eq!(value["camera_id"], "front");
             assert_eq!(value["status"]["state"], REPORT_STATE);
             let fps = value["status"]["fps"].as_f64().expect("a rate is reported");
+            // Bounded by this fixture's own 200 ms/step cadence — which
+            // happens to equal `--sample-fps`'s clap default — not by
+            // anything `Telemetry` enforces: the inference rate it reports
+            // can never exceed the rate samples arrived at, whatever that is.
             assert!(
-                (0.0..=f64::from(crate::decode::SAMPLE_FPS)).contains(&fps),
+                (0.0..=f64::from(crate::decode::DEFAULT_SAMPLE_FPS)).contains(&fps),
                 "{fps}"
             );
             let detail = value["status"]["detail"].as_str().expect("a detail");

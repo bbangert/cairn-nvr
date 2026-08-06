@@ -1,0 +1,7 @@
+# sample_fps set inside its own fps_band: both load, the flag is emitted, and
+# the band contributes nothing to the argv (it only validated the value).
+backend: ort
+model:
+  onnx: test/support/fixtures/models/stub.onnx
+fps_band: [4, 8]
+sample_fps: 6

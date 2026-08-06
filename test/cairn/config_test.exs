@@ -1217,6 +1217,138 @@ defmodule Cairn.ConfigTest do
     end
   end
 
+  describe "sample_fps" do
+    @sample_fps_bad_dir "test/support/fixtures/profiles/sample-fps-bad"
+
+    # D-P4: the band validates, it never emits. `full.yml` (used above) already
+    # declares an fps_band with no sample_fps and its expected argv has no
+    # --sample-fps in it; this pins the no-band half of the same rule.
+    test "absent sample_fps emits no --sample-fps, with no fps_band declared" do
+      assert command!(argv_map("partial")) == ["./p", "--model", @stub_onnx]
+    end
+
+    test "absent sample_fps emits no --sample-fps, even with fps_band declared" do
+      command = command!(argv_map("full"))
+      refute "--sample-fps" in command
+    end
+
+    test "present sample_fps with no fps_band emits the flag" do
+      assert command!(argv_map("sample-fps")) == [
+               "./p",
+               "--model",
+               @stub_onnx,
+               "--sample-fps",
+               "6"
+             ]
+    end
+
+    test "present sample_fps inside its own fps_band emits the flag, no error" do
+      assert command!(argv_map("sample-fps-inband")) == [
+               "./p",
+               "--model",
+               @stub_onnx,
+               "--sample-fps",
+               "6"
+             ]
+    end
+
+    test "sample_fps at its band's min edge loads and emits (inclusive bound)" do
+      assert command!(argv_map("sample-fps-band-min")) == [
+               "./p",
+               "--model",
+               @stub_onnx,
+               "--sample-fps",
+               "4"
+             ]
+    end
+
+    test "sample_fps at its band's max edge loads and emits (inclusive bound)" do
+      assert command!(argv_map("sample-fps-band-max")) == [
+               "./p",
+               "--model",
+               @stub_onnx,
+               "--sample-fps",
+               "8"
+             ]
+    end
+
+    test "a singleton fps_band [5, 5] admits sample_fps 5" do
+      assert command!(argv_map("sample-fps-singleton")) == [
+               "./p",
+               "--model",
+               @stub_onnx,
+               "--sample-fps",
+               "5"
+             ]
+    end
+
+    test "sample_fps above its declared fps_band is a config error" do
+      map = Map.put(base_map(), "profile_dirs", [@sample_fps_bad_dir])
+
+      assert {:error, errors} = Config.from_map(map)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "sample_fps 13 contradicts fps_band [8, 12]")
+             )
+    end
+
+    test "sample_fps outside its declared fps_band is a config error naming both" do
+      map = Map.put(base_map(), "profile_dirs", [@sample_fps_bad_dir])
+
+      assert {:error, errors} = Config.from_map(map)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "sample_fps 6 contradicts fps_band [8, 12]")
+             )
+    end
+
+    test "sample_fps of 0 is a config error naming the bounds" do
+      map = Map.put(base_map(), "profile_dirs", [@sample_fps_bad_dir])
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "sample_fps must be an integer between 1 and 30, got 0"))
+    end
+
+    test "sample_fps of 31 is a config error naming the bounds" do
+      map = Map.put(base_map(), "profile_dirs", [@sample_fps_bad_dir])
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "sample_fps must be an integer between 1 and 30, got 31"))
+    end
+
+    test "a non-integer string sample_fps is a config error naming the bounds" do
+      map = Map.put(base_map(), "profile_dirs", [@sample_fps_bad_dir])
+
+      assert {:error, errors} = Config.from_map(map)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ ~s(sample_fps must be an integer between 1 and 30, got "fast"))
+             )
+    end
+
+    test "a fractional sample_fps is a config error naming the bounds" do
+      map = Map.put(base_map(), "profile_dirs", [@sample_fps_bad_dir])
+
+      assert {:error, errors} = Config.from_map(map)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "sample_fps must be an integer between 1 and 30, got 2.5")
+             )
+    end
+
+    test "an operator --sample-fps collides with the profile's own (D-P4)" do
+      map = argv_map("sample-fps", %{"command" => "./p --sample-fps 6"})
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "plugin det: command carries --sample-fps"))
+      assert Enum.any?(errors, &(&1 =~ "which profile sample-fps owns"))
+    end
+  end
+
   describe "backend capability table" do
     alias Cairn.Config.Profile
 
