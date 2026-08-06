@@ -44,7 +44,8 @@ defmodule Cairn.Config.Profile do
   decoder: auto              # the video decode path, not the backend
   labels: models/coco.names
   fps_band: [4, 8]           # declared, not measured (D-P5)
-  sample_fps: 6              # optional; validates against fps_band, never emits from it (D-P4)
+  sample_fps: 6              # optional; emits --sample-fps when set. fps_band
+                             # validates it but a band alone emits nothing (D-P4)
   tracking:                  # stage presence + params, plus band-tuned bounds
     bbd: true                # listed; a params mapping lists it too (and no
                              # shipped stage reads one — see `stages/1`)

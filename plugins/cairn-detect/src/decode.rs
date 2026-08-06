@@ -497,7 +497,9 @@ fn pack_chw(plane: &[u8], stride: usize, fit: Fit, spec: InputSpec) -> Vec<f32> 
 /// unit-testable without an `AVFormatContextInput` to drive the loop around
 /// it.
 fn sample_interval(sample_fps: u32) -> Duration {
-    Duration::from_secs_f64(1.0 / f64::from(sample_fps))
+    // Integer nanos, not a float reciprocal: exact for every legal rate,
+    // and identical to the old `from_secs_f64(1.0 / 5.0)` at the default.
+    Duration::from_nanos(1_000_000_000 / u64::from(sample_fps))
 }
 
 /// Read packets forever, handing sampled frames to the inference thread.
@@ -889,6 +891,8 @@ mod tests {
         // this is the arithmetic `run` actually paces its gate on.
         assert_eq!(sample_interval(10), Duration::from_millis(100));
         assert_eq!(sample_interval(1), Duration::from_secs(1));
-        assert_eq!(sample_interval(30), Duration::from_secs_f64(1.0 / 30.0));
+        // 1e9/30 doesn't divide evenly; the exact truncated-nanos value is
+        // the contract now that the construction is integer.
+        assert_eq!(sample_interval(30), Duration::from_nanos(33_333_333));
     }
 }

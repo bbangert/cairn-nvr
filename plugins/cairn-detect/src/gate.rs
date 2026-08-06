@@ -1202,12 +1202,14 @@ mod tests {
     mod telemetry {
         use super::*;
 
-        /// `samples` samples at this fixture's 5 fps cadence (200 ms/step)
-        /// from `base`, each one's fate decided by `decision`. Returns every
-        /// report that came back. `Telemetry` itself never reads a sample
-        /// rate — it derives `fps` from the caller's own instants — so this
-        /// cadence is a fixture choice, matching `--sample-fps`'s clap
-        /// default rather than anything the type enforces.
+        /// This fixture's cadence: one sample every 200 ms (5 fps). A
+        /// fixture choice matching `--sample-fps`'s clap default, not
+        /// anything `Telemetry` enforces — it derives `fps` from the
+        /// caller's own instants.
+        const STEP_MS: u64 = 200;
+
+        /// `samples` samples at [`STEP_MS`] from `base`, each one's fate
+        /// decided by `decision`. Returns every report that came back.
         fn drive(
             telemetry: &mut Telemetry,
             base: Instant,
@@ -1215,7 +1217,9 @@ mod tests {
             mut decision: impl FnMut(u64) -> Decision,
         ) -> Vec<Report> {
             samples
-                .filter_map(|step| telemetry.observe(decision(step), still(), at(base, step * 200)))
+                .filter_map(|step| {
+                    telemetry.observe(decision(step), still(), at(base, step * STEP_MS))
+                })
                 .collect()
         }
 
@@ -1426,14 +1430,11 @@ mod tests {
             assert_eq!(value["camera_id"], "front");
             assert_eq!(value["status"]["state"], REPORT_STATE);
             let fps = value["status"]["fps"].as_f64().expect("a rate is reported");
-            // Bounded by this fixture's own 200 ms/step cadence — which
-            // happens to equal `--sample-fps`'s clap default — not by
+            // Bounded by this fixture's own 200 ms/step cadence — not by
             // anything `Telemetry` enforces: the inference rate it reports
             // can never exceed the rate samples arrived at, whatever that is.
-            assert!(
-                (0.0..=f64::from(crate::decode::DEFAULT_SAMPLE_FPS)).contains(&fps),
-                "{fps}"
-            );
+            let fixture_fps = 1000.0 / STEP_MS as f64;
+            assert!((0.0..=fixture_fps).contains(&fps), "{fps}");
             let detail = value["status"]["detail"].as_str().expect("a detail");
             assert!(detail.len() <= 256, "{} bytes: {detail}", detail.len());
         }
