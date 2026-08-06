@@ -776,11 +776,12 @@ You normally don't. With no flag the profile is **sniffed** from the model's own
 input and output shapes, and the startup line says which one won:
 
 ```
-cairn-detect up: camera=test udp=17000 model=yolox_nano.onnx profile=yolox \
-    input=images input size=416x416 (from model) encoding=0..255 bgr \
-    resize=letterbox (pad 114) \
+cairn-detect up: camera=test udp=17000 model=yolox_nano.onnx \
+    backend=ort (artifact=.onnx fused-nms=yes dynamic-shapes=yes) \
+    profile=yolox input=images input size=416x416 (from model) \
+    encoding=0..255 bgr resize=letterbox (pad 114) \
     layout=grid-objectness [1, A, 5 + 80] strides 8/16/32 (from model) \
-    decoder=auto
+    score=objectness x class decoder=auto
 ```
 
 Sniffing looks at the model's whole output *set*, not just its first tensor,
@@ -788,10 +789,12 @@ so a two-tensor DETR export and a one-tensor YOLO head can never be confused
 for one another. RF-DETR sniffs cleanly given its geometry:
 
 ```
-cairn-detect up: camera=test udp=17000 model=rfdetr_nano.onnx profile=rfdetr \
-    input=pixel_values input size=384x384 (from --input-size) \
+cairn-detect up: camera=test udp=17000 model=rfdetr_nano.onnx \
+    backend=ort (artifact=.onnx fused-nms=yes dynamic-shapes=yes) \
+    profile=rfdetr input=pixel_values input size=384x384 (from --input-size) \
     encoding=imagenet-normalized rgb resize=stretch \
-    layout=detr-queries [1, Q, 4] + [1, Q, 91] (from model) decoder=auto
+    layout=detr-queries [1, Q, 4] + [1, Q, 91] (from model) \
+    score=sigmoid(class logit) decoder=auto
 ```
 
 `--model-profile <name>` names one explicitly. It wins outright and is then
