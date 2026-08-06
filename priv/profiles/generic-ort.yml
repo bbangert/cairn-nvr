@@ -1,0 +1,41 @@
+# The migration target for an existing config: what cairn already does, named.
+#
+# A group that adopts this profile keeps today's behaviour — yolox at 416 on
+# onnxruntime's CPU provider, the cold-start twin gate on, and neither of the
+# two opt-in association/filter stages — and gains what the global
+# `tracking.bbd`/`oru` booleans never had: one file per hardware class, checked
+# at load, expanding into both halves of the boundary at once. See
+# `docs/profile-authoring.md` for the migration, which is two config lines.
+#
+# The one shipped profile that is not experimental: `ort` is the backend that
+# executes today, and this file names no combination the capability table
+# refuses.
+experimental: false
+backend: ort
+model:
+  # Placeholder paths, and deliberately so: a profile's files are checked
+  # against the disk only for a group that actually runs it, so this file costs
+  # a node nothing until it is named. Point it at your own artifacts, or copy
+  # it into a `profile_dirs:` entry under a name of your own.
+  onnx: models/yolox_nano.onnx
+model_profile: yolox
+input_size: 416
+labels: models/coco.names
+# Declared, pending on-hardware measurement. The plugin's sample gate is fixed
+# at 5 fps (`SAMPLE_FPS`, decode.rs), so that is the rate frames reach the
+# model at; whether a given host's CPU keeps up with it is the unmeasured half,
+# and it is the half a band is supposed to describe.
+fps_band: [5, 5]
+tracking:
+  # Presence, not defaults: this block *is* the stage list. `twin_mint` alone
+  # is the no-profile behaviour every existing deployment already has (D-P8) —
+  # `bbd` and `oru` ship off, and a migration target that listed them would
+  # change what a config does on the day it adopts a profile, which is the one
+  # thing this file must not do. Adding them is a per-profile decision — see
+  # the stage descriptions in rk3566-lowfps.yml — and note that bbd's
+  # measured win needs the plugin's own `--track-floor-json` alongside it.
+  twin_mint: true
+  # The globals, restated so that adopting this profile changes nothing.
+  max_unseen_ms: 3000
+  max_live_tracks: 128
+  stationary_after_ms: 10000

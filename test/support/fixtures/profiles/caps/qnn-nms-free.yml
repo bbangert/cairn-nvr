@@ -1,0 +1,7 @@
+# The accept side of the fused-NMS rule: qnn cannot run the NMS op, and
+# yolov10's head needs none.
+experimental: true
+backend: qnn
+model:
+  qnn: test/support/fixtures/models/stub.onnx
+model_profile: yolov10

@@ -1,0 +1,5 @@
+# Rule 2: an undocumented rknn conversion with no experimental: true.
+backend: rknn
+model:
+  rknn: test/support/fixtures/models/stub.rknn
+model_profile: rfdetr

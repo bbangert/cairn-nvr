@@ -6,36 +6,47 @@ defmodule Cairn.Config.Profile do
 
   A profile is **data composing curated code**, not free knob tuning: every
   field names something that already exists — a Rust model family, a
-  backend, a tracker stage. What config load enforces *today* is the shape
-  of that naming: unknown keys, unknown backends, malformed bands, illegal
-  stage compositions, and the type of every field the model half reads
-  (`model:` a mapping of path strings, `model_profile:`/`decoder:`/`labels:`
-  strings, `experimental:` a boolean) are rejected here, and `Cairn.Config`
-  rejects a profiled group whose artifact is missing or whose backend is
-  stubbed (see "Rust argv" below); catalog validation of
-  `model_profile`/`decoder`/`labels` against the plugin's own menus lands
-  with the capability table (plan phase 7).
+  backend, a tracker stage. Config load enforces the shape of that naming:
+  unknown keys, malformed bands, illegal stage compositions, and the type of
+  every field the model half reads (`model:` a mapping of path strings,
+  `model_profile:`/`decoder:`/`labels:` strings, `experimental:` a boolean)
+  are rejected here. So are names outside the menus the plugin itself
+  accepts — `backend:` against the capability table below, `model_profile:`
+  against the Rust catalog's families and aliases, `decoder:` against the
+  video decode kinds — and the two backend/family combinations
+  `docs/npu-backends.md` calls out, one broken and one unverified (see
+  `check_capabilities/5`).
+  `Cairn.Config` rejects a profiled group whose model artifact or labels file
+  is missing, or whose backend is stubbed (see "Rust argv" below).
   Profiles are files, never inline config: shipped ones live
-  in `priv/profiles/*.yml`, operator ones in the directories the top-level
-  `profile_dirs:` key lists, and an operator file wins a name collision with
-  a shipped one (with a warning saying so).
+  in `priv/profiles/*.yml` — the four board profiles cairn ships — operator
+  ones in the directories the top-level `profile_dirs:` key lists, and an
+  operator file wins a name collision with a shipped one (with a warning
+  saying so).
+
+  `docs/profile-authoring.md` is the operator-facing half of this module: the
+  menus, the errors, and the two rules the schema cannot express.
 
   ## Schema
 
+  Every key. The four profiles cairn ships are worked examples of it, with
+  their reasoning in their own comments:
+
   ```yaml
-  # priv/profiles/generic-ort.yml
-  name: generic-ort          # optional; must match the filename when present
+  # <a profile_dirs entry>/example.yml
+  name: example              # optional; must match the filename when present
   experimental: false        # true before any group may run a stubbed backend
   backend: ort               # ort | rknn | qnn — only ort executes today
   model:                     # per-backend artifact paths
     onnx: models/yolox_nano.onnx
   model_profile: yolox       # Rust catalog family name
   input_size: 416
-  decoder: auto
+  decoder: auto              # the video decode path, not the backend
   labels: models/coco.names
   fps_band: [4, 8]           # declared, not measured (D-P5)
   tracking:                  # stage presence + params, plus band-tuned bounds
-    bbd: true                # true = listed with defaults; a map = params
+    bbd: true                # listed; a params mapping lists it too (and no
+                             # shipped stage reads one — see `stages/1`)
     oru: { }                 # equivalent to true
     twin_mint: true          # presence, not a default — omit to delist
     max_unseen_ms: 3000
@@ -65,11 +76,14 @@ defmodule Cairn.Config.Profile do
   `--motion-json` and `--track-floor-json` are not on that list and stay
   operator-owned (D-P6).
 
-  Two things `Cairn.Config` refuses at load rather than at group start,
+  Three things `Cairn.Config` refuses at load rather than at group start,
   which is where an operator reads diagnostics: a `model:` artifact that is
-  not on disk, and a group running a backend other than `ort` — stubbed
-  until the Rust backend trait lands (D-P10) — unless the profile declares
-  `experimental: true` *and* the group sets `allow_experimental: true`.
+  not on disk, a `labels:` file that is not on disk, and a group running a
+  backend other than `ort` — stubbed until the Rust backend trait lands
+  (D-P10) — unless the profile declares `experimental: true` *and* the group
+  sets `allow_experimental: true`. The two file paths are checked only for a
+  profile some group actually runs, so a board profile for hardware this node
+  does not have costs it nothing.
 
   Parsed on `Cairn.Config`'s `add_error/2`/`add_warning/2` contract like
   its `Camera`/`PluginGroup` siblings.
@@ -81,14 +95,85 @@ defmodule Cairn.Config.Profile do
   @known_keys ~w(name experimental backend model model_profile input_size decoder labels
                  fps_band tracking)
   @known_tracking_keys ~w(bbd oru twin_mint max_unseen_ms max_live_tracks stationary_after_ms)
-  # Each backend paired with the `model:` key naming its compiled artifact:
-  # backends consume different formats (prior-art §1), so a profile ships one
-  # artifact per backend and the profile's own backend picks which path
-  # becomes `--model`. Derived rather than repeated so a backend cannot be
-  # added to one list and forgotten in the other.
-  @backend_artifacts %{"ort" => "onnx", "rknn" => "rknn", "qnn" => "qnn"}
+  # What each backend accepts, as static data — the Elixir half of
+  # `BackendKind::capabilities` in
+  # `plugins/cairn-detect/src/infer/backend.rs`, which names this table as its
+  # host-side mirror. Both sides are *claims* about a runtime rather than
+  # probes of one, and the evidence for each row (established by
+  # `docs/npu-backends.md` against conservative reading) is written out on
+  # the Rust rows; this side carries the same values because config load has to
+  # answer the same questions with no plugin running and, for a board profile
+  # written ahead of its hardware, no such device attached.
+  #
+  # `artifact` is the `model:` **key** naming this backend's compiled file, not
+  # that file's format, and the two deliberately disagree for qnn: Rust reports
+  # `ArtifactFormat::Onnx` there because QNN is an onnxruntime execution
+  # provider, while the key here is `qnn:` because the QDQ graph it loads is a
+  # different *file* from the fp32 export. Neither is a stale copy of the
+  # other. Backends consume different formats (prior-art §1), so a profile
+  # ships one artifact per backend and the profile's own backend picks which
+  # path becomes `--model`.
+  #
+  # `dynamic_shapes` is mirrored and read by no rule: what it would refuse — an
+  # `input_size:` that disagrees with a fixed-geometry artifact — is a fact
+  # about a compiled file the host cannot open, so a check here could only
+  # guess. It is in the authoring guide instead (`docs/profile-authoring.md`),
+  # beside the RKNN-sequential note, which the schema cannot express either.
+  @backend_capabilities %{
+    "ort" => %{artifact: "onnx", fused_nms: true, dynamic_shapes: true},
+    "rknn" => %{artifact: "rknn", fused_nms: false, dynamic_shapes: false},
+    "qnn" => %{artifact: "qnn", fused_nms: false, dynamic_shapes: false}
+  }
+  # Derived rather than repeated so a backend cannot be added to one list and
+  # forgotten in the other.
+  @backend_artifacts Map.new(@backend_capabilities, fn {backend, caps} ->
+                       {backend, caps.artifact}
+                     end)
   @backends Map.keys(@backend_artifacts)
   @known_model_keys Map.values(@backend_artifacts)
+
+  # The Rust catalog's model families, row for row with `PROFILES` in
+  # `plugins/cairn-detect/src/infer/catalog.rs` — aliases included, so
+  # `model_profile:` is checked against the same set the plugin's own
+  # `ModelProfile::parse` accepts — plus the two columns profile validation
+  # reads:
+  #
+  #   * `nms:` — where suppression happens. `:none` is an NMS-free head (Rust's
+  #     `nms: None`: yolov10's end-to-end head, rfdetr's queries); `:host_side`
+  #     is cairn's own suppression in the plugin's `heads` (`DEFAULT_NMS`),
+  #     which runs on the CPU whatever executed the model; `:fused` is a family
+  #     whose export carries the NMS op *inside the graph*. **No shipped family
+  #     is `:fused`** — every catalog row is one of the first two — so the
+  #     fused-NMS rule in `check_capabilities/5` cannot fire from today's menu.
+  #     It is data rather than a comment so that a family added later with a
+  #     fused export is refused on the NPU backends without anyone having to
+  #     remember the rule was here.
+  #   * `rknn_conversion:` — whether anything in `docs/npu-backends.md`
+  #     documents converting this family with rknn-toolkit2. `:documented` is
+  #     the model zoo's stated YOLOv5–v11 coverage; `:undocumented` is
+  #     everything else, which the research names outright for yolov10 and
+  #     DETR-class and which yolox falls into by silence (Megvii's, outside
+  #     that range, placed there by no source read here). Undocumented is not
+  #     "known broken" — it is "nobody in this repo has converted one", which
+  #     is what `experimental: true` acknowledges.
+  @model_families %{
+    "yolox" => %{aliases: [], nms: :host_side, rknn_conversion: :undocumented},
+    "yolov10" => %{aliases: ["yolo26"], nms: :none, rknn_conversion: :undocumented},
+    "yolov8" => %{
+      aliases: ["yolov9", "yolo11", "yolov11"],
+      nms: :host_side,
+      rknn_conversion: :documented
+    },
+    "rfdetr" => %{aliases: ["rf-detr"], nms: :none, rknn_conversion: :undocumented}
+  }
+
+  # `decoder:`'s menu, mirroring `DecoderKind` in
+  # `plugins/cairn-detect/src/decode.rs`. This is the **video** decode path and
+  # not `backend:`'s inference one; the plugin's own flag help draws the same
+  # distinction. Checked here because clap rejects an unknown value as a usage
+  # error, which reaches an operator as a plugin that will not start and a
+  # restart loop rather than as a config error naming the typo.
+  @decoders ~w(auto vaapi qsv nvdec v4l2 videotoolbox sw)
   @stage_modules %{
     "bbd" => {:bbd, Stage.Bbd},
     "oru" => {:oru, Stage.Oru},
@@ -114,6 +199,54 @@ defmodule Cairn.Config.Profile do
             stationary_after_ms: nil
 
   @type t :: %__MODULE__{}
+
+  @typedoc """
+  One backend's row of the capability table: the `model:` key its artifact is
+  named under, whether it runs an export with the NMS op fused into the graph,
+  and whether it accepts a graph that leaves a spatial dim symbolic.
+  """
+  @type capabilities :: %{
+          artifact: String.t(),
+          fused_nms: boolean(),
+          dynamic_shapes: boolean()
+        }
+
+  @typedoc """
+  One model family's row: the `model_profile:` spellings that resolve to it,
+  where its suppression happens, and whether its rknn conversion is documented.
+  """
+  @type family :: %{
+          aliases: [String.t()],
+          nms: :fused | :host_side | :none,
+          rknn_conversion: :documented | :undocumented
+        }
+
+  @doc """
+  What `backend` accepts, from the table mirroring the plugin's own.
+
+  Raises on a backend outside the schema's menu — every caller has already had
+  `check_backend/3` reject one.
+  """
+  @spec capabilities(String.t()) :: capabilities()
+  def capabilities(backend), do: Map.fetch!(@backend_capabilities, backend)
+
+  @doc """
+  The catalog family `name` resolves to (aliases included), or `nil` for a name
+  no family claims.
+
+  Trimmed and downcased exactly as the plugin's `ModelProfile::parse` does, so
+  a name this accepts is one the plugin accepts.
+  """
+  @spec family(term()) :: {String.t(), family()} | nil
+  def family(name) when is_binary(name) do
+    wanted = name |> String.trim() |> String.downcase()
+
+    Enum.find(@model_families, fn {canonical, row} ->
+      wanted == canonical or wanted in row.aliases
+    end)
+  end
+
+  def family(_other), do: nil
 
   @doc """
   The `model:` key naming `backend`'s compiled artifact — the one this
@@ -216,6 +349,9 @@ defmodule Cairn.Config.Profile do
       |> check_string(raw, "decoder", name)
       |> check_string(raw, "labels", name)
       |> check_experimental(raw, name)
+      |> check_model_profile(raw, name)
+      |> check_decoder(raw, name)
+      |> check_capability_rules(raw, name)
 
     if length(acc.errors) > errors_before do
       {nil, acc}
@@ -250,8 +386,12 @@ defmodule Cairn.Config.Profile do
   # listed stage, its params map as the value. `true` is shorthand for
   # "listed with defaults" (an empty params map); `false` and absence both
   # mean not listed — presence, not defaults. Params keep their YAML string
-  # keys: a stage reads its own vocabulary off them, and converting
+  # keys: a stage would read its own vocabulary off them, and converting
   # operator-authored keys to atoms would be manufacturing atoms from input.
+  # None of the three stages reads its params today — each takes its constants
+  # from its own module — so a params mapping parses, reaches the stage and
+  # changes nothing. `docs/profile-authoring.md` says so to an author's face,
+  # where it matters more than here.
   #
   # A profile with no `tracking:` block at all gets `nil`, not an empty map:
   # the block *is* the stage list, so its presence — even empty — speaks
@@ -326,8 +466,105 @@ defmodule Cairn.Config.Profile do
     end
   end
 
-  # "a, b or c" — enumerated from `@backends` rather than hand-written so a
-  # backend added to `@backend_artifacts` can't be forgotten in the message.
+  # A family this side does not know is one the plugin's own parser would
+  # reject at startup; naming the menu here costs the operator a config error
+  # instead of a process that exits before it opens its first stream. Skipped
+  # for a non-string value — `check_string/4` has already spoken about that.
+  defp check_model_profile(acc, raw, name) do
+    case Map.get(raw, "model_profile") do
+      value when is_binary(value) and value != "" ->
+        if family(value) do
+          acc
+        else
+          Config.add_error(
+            acc,
+            "profile #{name}: unknown model_profile #{inspect(value)} " <>
+              "(#{family_menu()})"
+          )
+        end
+
+      _absent_or_already_reported ->
+        acc
+    end
+  end
+
+  # Aliases shown against the family they resolve to, as the plugin's own
+  # `catalog::names` renders them, so an error says what `yolo11` will do.
+  defp family_menu do
+    @model_families
+    |> Enum.sort_by(fn {canonical, _row} -> canonical end)
+    |> Enum.map_join(", ", fn
+      {canonical, %{aliases: []}} -> canonical
+      {canonical, %{aliases: aliases}} -> "#{canonical} (or #{Enum.join(aliases, ", ")})"
+    end)
+  end
+
+  defp check_decoder(acc, raw, name) do
+    case Map.get(raw, "decoder") do
+      value when is_binary(value) and value != "" ->
+        Config.check(
+          acc,
+          value in @decoders,
+          "profile #{name}: unknown decoder #{inspect(value)} " <>
+            "(#{natural_list(@decoders)}) — decoder: is the video decode path; " <>
+            "the inference runtime is backend:"
+        )
+
+      _absent_or_already_reported ->
+        acc
+    end
+  end
+
+  # The two rules `docs/npu-backends.md` §"Known-broken combinations"
+  # turns into validation. Both need a backend *and* a family to read: a
+  # profile that names no `model_profile:` leaves the family to the plugin's
+  # own sniffing, and there is nothing here to check it against — which is
+  # itself a reason to name the family on a non-ort backend (the authoring
+  # guide says so).
+  defp check_capability_rules(acc, raw, name) do
+    backend = Map.get(raw, "backend", "ort")
+
+    case {backend in @backends, family(Map.get(raw, "model_profile"))} do
+      {true, {_canonical, _row} = family} ->
+        check_capabilities(acc, name, backend, Map.get(raw, "experimental") || false, family)
+
+      _unknown_backend_or_no_family ->
+        acc
+    end
+  end
+
+  @doc false
+  # Public only so the fused-NMS rule can be exercised against a family row
+  # today's catalog does not contain — see `@model_families`. `family` is the
+  # `{name, row}` pair `family/1` returns. Test coverage leans on both rules
+  # living in this one function: the rknn rule's fixtures prove the
+  # parse→here wiring on the public path, the synthetic fused row proves the
+  # NMS branch directly — split the rules apart and each half needs its own
+  # public-path test.
+  @spec check_capabilities(map(), String.t(), String.t(), boolean(), {String.t(), family()}) ::
+          map()
+  def check_capabilities(acc, name, backend, experimental, {model_profile, family}) do
+    caps = capabilities(backend)
+
+    acc
+    |> Config.check(
+      family.nms != :fused or caps.fused_nms,
+      "profile #{name}: #{backend} backend requires an NMS-free family or host-side-NMS " <>
+        "decode, and model_profile #{model_profile} fuses the suppression op into its " <>
+        "export — its op is not one this runtime implements, so the graph would be " <>
+        "declined at load"
+    )
+    |> Config.check(
+      backend != "rknn" or family.rknn_conversion == :documented or experimental,
+      "profile #{name}: rknn conversion is undocumented for model_profile " <>
+        "#{model_profile} (docs/npu-backends.md covers the model zoo's YOLOv5–v11) — " <>
+        "declare experimental: true to ship a profile whose artifact nobody here has " <>
+        "converted"
+    )
+  end
+
+  # "a, b or c" — enumerated from the table rather than hand-written so a value
+  # added to one can't be forgotten in the message.
   defp natural_list(list) do
     case Enum.sort(list) do
       [single] -> single

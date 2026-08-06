@@ -38,7 +38,7 @@ events:
   max_event_seconds: 300
 
 # Object tracking (the three bounds here are per-camera overridable under the
-# camera; bbd and oru are not).
+# camera; bbd and oru are not — see the note under them).
 # A track that goes unseen for this much *stream* time is ended — five times
 # that while it is stationary, so a parked object outlasts what parks in front
 # of it; its object_id (a ULID) is never handed to anything else.
@@ -67,6 +67,14 @@ events:
 # that the coast is still close to what it measured, over it a straight line
 # between two sightings is a guess of its own — and a stretch the plugin is
 # re-reporting a still object through is never one of them. Off by default.
+#
+# Neither has a per-camera form: they describe the matcher and the motion
+# filter rather than a scene, so they are one answer for every camera that is
+# not covered by a hardware profile. A profile is the other way to answer them
+# — per plugin group, i.e. per piece of hardware — and for the cameras on a
+# profiled group these two keys are ignored entirely, with a warning at load
+# saying the profile won. See docs/profile-authoring.md; profiles are the
+# migration target for both, and there is no deadline.
 tracking:
   max_unseen_ms: 3000
   max_live_tracks: 128
@@ -92,12 +100,21 @@ retention:
 # integrations:
 #   token: "replace-with-a-long-random-secret"
 
+# Directories holding your own hardware profiles (docs/profile-authoring.md).
+# The profiles cairn ships (priv/profiles/) are always loaded first and these
+# are loaded after, so a file of yours shadows a shipped one of the same name —
+# with a warning naming the file that won. Omit the key entirely to use only
+# the shipped ones.
+# profile_dirs:
+#   - /etc/cairn/profiles
+
 # Named plugin groups: one process serves every camera that names it, launched
 # with a --cameras-json array of its members instead of the per-camera flags.
 # Use this for an accelerator only one process can hold at a time (a Coral Edge
 # TPU is the motivating case); otherwise give each camera its own inline
-# command below. A group is restarted only when its command, membership, or a
-# member's min_score or UDP port changes — never when a member camera stops.
+# command below. A group is restarted when its command, membership, profile (or
+# the contents of the profile's file), or a member's min_score or UDP port
+# changes — never when a member camera stops.
 # plugins:
 #   detect:
 #     # the path to your built binary, resolved from Cairn's own working
@@ -107,6 +124,23 @@ retention:
 #     # cairn-detect refuses to start on a count mismatch rather than emit
 #     # every detection under the wrong class name.
 #     command: plugins/cairn-detect/target/release/cairn-detect --model yolox_nano.onnx --labels coco.names
+#
+#   # The same group, written with a hardware profile instead. The profile
+#   # names the model, the family, the input size, the labels and the
+#   # inference backend — and the tracker stages that go with them, for every
+#   # camera on this group — so `command:` keeps only what describes this
+#   # deployment. A profiled group that also writes --model, --model-profile,
+#   # --input-size, --decoder or --labels itself fails the load: those five
+#   # come from the profile alone. --motion-json and --track-floor-json are
+#   # not on that list and stay yours.
+#   npu:
+#     command: plugins/cairn-detect/target/release/cairn-detect
+#     # A filename under priv/profiles/ or a profile_dirs entry, without .yml.
+#     profile: rk3566-lowfps
+#     # Required to run a profile whose backend is not `ort`: only `ort`
+#     # executes today. Both halves are needed — the profile declares
+#     # `experimental: true`, this key is your consent to it.
+#     allow_experimental: true
 
 cameras: []
 #  - id: front_door

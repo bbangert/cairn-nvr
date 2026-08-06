@@ -1,0 +1,54 @@
+# Qualcomm QCS6490 — the Hexagon HTP through onnxruntime's QNN execution
+# provider.
+#
+# experimental: true because the `qnn` backend does not execute yet (D-P10): a
+# group naming this profile also needs `allow_experimental: true`. The name
+# parses on both sides of the boundary precisely so a board profile can be
+# written and validated before its runtime lands.
+experimental: true
+backend: qnn
+model:
+  # A QDQ-quantized graph (uint16 activations / uint8 weights, produced by the
+  # onnxruntime quantization API or AIMET). Still an `.onnx` by format — QNN is
+  # an onnxruntime execution provider, not a separate runtime — but a different
+  # *file* from the fp32 export, which is why the schema keys it under `qnn:`
+  # of its own. Placeholder path, as in every shipped profile.
+  qnn: models/yolov10n_qdq.onnx
+# NMS-free by requirement rather than by taste: the NMS operator is not in
+# QNN's supported op list, so an export with suppression fused into the graph
+# is declined by the provider. yolov10's end-to-end head needs no suppression
+# at all. A family cairn decodes with host-side NMS (yolox, yolov8) would be
+# legal here too — that suppression runs on the CPU whatever executed the model
+# — which is exactly what the capability table's first rule says.
+model_profile: yolov10
+input_size: 640
+labels: models/coco.names
+# Declared, pending on-hardware measurement. A reported YOLOv5s@480 INT8 raw
+# inference of ~527 us, and full-pipeline claims of 100-300 fps for the small
+# families, put this SoC well above the band; `docs/npu-backends.md` calls
+# those vendor figures optimistic until measured, and 15-30 is where cairn's
+# own decode and tracking sit rather than where the NPU tops out.
+fps_band: [15, 30]
+tracking:
+  # This block *is* the stage list, and it lists nothing: a `tracking:` block
+  # that is present — even holding only bounds, like this one — engages
+  # presence semantics, so every stage is delisted here, `twin_mint` included,
+  # which the other three shipped profiles all turn on. (Omitting the block
+  # entirely would instead say nothing about tracking and leave the camera's
+  # boolean flags standing.)
+  #
+  # That is D-P8's rule for an NMS-free profile, and it is a decision rather
+  # than a measurement. The tension is worth stating in the file it applies to:
+  # the twin gate exists *because* an NMS-free head slipped an IoU-0.985 double
+  # box at cold start (PR #68),
+  # and the same redundant band boxes are also what makes a genuinely close
+  # same-label pair common enough for the gate to eat a real object. Nothing
+  # has measured which way that falls on this hardware. If a deployment here
+  # reports "the same car twice", add `twin_mint: true` — one line, and it is
+  # what every other profile runs.
+  #
+  # `bbd` and `oru` are absent for the ordinary reason: they are opt-in stages,
+  # and nobody has measured either on this board.
+  max_unseen_ms: 3000
+  max_live_tracks: 128
+  stationary_after_ms: 10000

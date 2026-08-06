@@ -73,11 +73,14 @@ defmodule Cairn.Tracker.Stage.Oru do
 
   ## Gating
 
-  A listed stage runs unconditionally — there is no flag test in here. The
-  `tracking.oru` boolean gates whether this stage is *listed*, in
-  `Cairn.Tracker`'s `per_object_stages/1` translation; a config that never
-  set the flag produces an empty stage list and the tracker's no-stage path,
-  which is the pre-stage code bit for bit.
+  A listed stage runs unconditionally — there is no flag test in here. What
+  gates whether this stage is *listed* is `Cairn.Tracker`'s
+  `per_object_stages/1` translation, reading one of two sources: the global
+  `tracking.oru` boolean for a camera whose plugin group has no hardware
+  profile, or that profile's own `tracking: oru:` entry for one that does
+  (`Cairn.Config.Profile`, `docs/profile-authoring.md`). A config that names
+  neither produces an empty stage list and the tracker's no-stage path, which
+  is the pre-stage code bit for bit.
   """
 
   @behaviour Cairn.Tracker.Stage

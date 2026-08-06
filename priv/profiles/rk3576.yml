@@ -1,0 +1,34 @@
+# Rockchip RK3576 (6 TOPS, INT4-capable) — rk3566-lowfps's pipeline with room
+# to run it faster.
+#
+# experimental: true on both of rk3566-lowfps's counts: the `rknn` backend is a
+# stub (a group naming this profile also needs `allow_experimental: true`), and
+# no source read here documents converting the yolox family with rknn-toolkit2.
+experimental: true
+backend: rknn
+model:
+  # Compiled for this board — see rk3566-lowfps.yml on why the artifact is a
+  # different file and why `input_size:` has to match the geometry it was
+  # compiled at.
+  rknn: models/yolox_nano_rk3576.rknn
+model_profile: yolox
+input_size: 416
+labels: models/coco.names
+# Declared, pending on-hardware measurement — and the weakest number cairn
+# ships. `docs/npu-backends.md` found no official benchmark for this NPU at
+# all: 8-16 is the rk3566 figures scaled by roughly the TOPS ratio, and nothing
+# more. **Unmeasured.** Bands are data; correcting this one is a file edit and
+# no code change.
+fps_band: [8, 16]
+tracking:
+  # The same stage set as rk3566-lowfps. 8-16 fps is faster, not fast: the gaps
+  # `bbd` and `oru` address are still wide in frames at this rate, and nothing
+  # measured on this board says otherwise — there is nothing measured on this
+  # board at all. Same operator pairing applies: `bbd` wants the plugin's
+  # `--track-floor-json` set in the group's `command:` (D-P6).
+  bbd: true
+  oru: true
+  twin_mint: true
+  max_unseen_ms: 3000
+  max_live_tracks: 128
+  stationary_after_ms: 10000

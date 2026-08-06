@@ -30,6 +30,13 @@ closes it. Details in `docs/architecture.md`.
   process. The wire protocol is [`docs/plugin-contract.md`](docs/plugin-contract.md);
   `plugins/cairn-detect` (Rust, hardware decode, ONNX) is the reference
   implementation and a mock plugin ships in-tree for tests.
+- **Hardware profiles**: one YAML file per board naming the model, the
+  family, the inference backend, the expected fps band and the tracker
+  stages that go with it. A plugin group names its profile and config load
+  expands it into both the plugin's argv and the host's tracking policy, so
+  the two halves cannot disagree. Four ship in `priv/profiles/`; writing one
+  for a new board needs no code change — see
+  [`docs/profile-authoring.md`](docs/profile-authoring.md).
 - **Retention**: per-label day counts, plus emergency cleanup that
   deletes oldest events when disk runs low.
 
@@ -65,12 +72,13 @@ See `config.example.yml` — every key is documented inline. Summary:
 | `udp.base_port` / `udp.range` | loopback ports for plugins + WebRTC taps (4 per camera — each RTP port reserves the next for RTCP) |
 | `events.pre/post/max_*_seconds` | clip windows (per-camera overridable) |
 | `tracking.max_unseen_ms` / `tracking.max_live_tracks` / `tracking.stationary_after_ms` | track expiry in stream time (×5 while stationary), per-camera live-track cap, and how long a box must hold still to count as parked (per-camera overridable) |
-| `tracking.bbd` | admit an association pair on the distance between the boxes' centres as well as on overlap, so a track coasting through a gap wider than its own box keeps its identity (default off; global only; stationary tracks excluded) |
-| `tracking.oru` | rebuild a track's motion filter across an unmatched gap of 1–10 s, replaying it between the two real boxes either side, so a re-detection leaves the filter believing where the object went rather than where it was heading before it vanished (default off; global only; never fires across a seeded stretch) |
+| `tracking.bbd` | admit an association pair on the distance between the boxes' centres as well as on overlap, so a track coasting through a gap wider than its own box keeps its identity (default off; no per-camera form; superseded per group by a profile; stationary tracks excluded) |
+| `tracking.oru` | rebuild a track's motion filter across an unmatched gap of 1–10 s, replaying it between the two real boxes either side, so a re-detection leaves the filter believing where the object went rather than where it was heading before it vanished (default off; no per-camera form; superseded per group by a profile; never fires across a seeded stretch) |
+| `profile_dirs` | directories of your own hardware profiles, searched after the ones cairn ships (a same-named file of yours wins, with a warning) |
 | `retention.days` / `retention.per_label` | pruning (camera overrides win; multi-label events keep the longest) |
 | `retention.tracks_days` | how long track rows live (default 365; global only, and exempt from emergency cleanup) |
 | `cameras[]` | `id`, `rtsp_url`, `plugin` (argv or multi-word string ⇒ its own process; single token ⇒ a `plugins:` group name), `min_score` per label (the wire floor), `track` / `record` (the two host-side tiers above it: what earns a track row, what earns video), `extra_ffmpeg_args`, `transcode`, `retention` |
-| `plugins` | named plugin groups (`name: {command: ...}`) — one process serving every camera that names it |
+| `plugins` | named plugin groups (`name: {command: ...}`) — one process serving every camera that names it; `profile:` attaches a hardware profile (which then owns the model flags and the tracker's stage list for every camera on the group), `allow_experimental:` consents to a profile whose backend does not execute yet |
 | `integrations.token` | bearer token that enables the Home Assistant API (see below); absent ⇒ `/api` disabled |
 
 Non-H.264 cameras: Cairn probes each stream and warns. Opt-in
@@ -129,6 +137,7 @@ ffmpeg, fixture-loop camera, mock plugin) runs with
 
 Docs: [`docs/architecture.md`](docs/architecture.md) ·
 [`docs/plugin-contract.md`](docs/plugin-contract.md) (plugin wire protocol
-v1) · [`docs/ha-api.md`](docs/ha-api.md) ·
+v1) · [`docs/profile-authoring.md`](docs/profile-authoring.md) (hardware
+profiles) · [`docs/ha-api.md`](docs/ha-api.md) ·
 [`docs/design-handoff.md`](docs/design-handoff.md) ·
 [`docs/frigate_comparison.md`](docs/frigate_comparison.md)
