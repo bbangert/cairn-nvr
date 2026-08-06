@@ -48,6 +48,9 @@ def main() -> None:
     out_dir: Path = args.out
     n: int = args.keep_every
 
+    if n < 1:
+        raise SystemExit(f"--keep-every must be >= 1, got {n}")
+
     if out_dir.exists():
         raise SystemExit(f"Refusing to run: output dir already exists: {out_dir}")
 

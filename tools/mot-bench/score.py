@@ -18,6 +18,7 @@ import argparse
 import csv
 import datetime
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -244,13 +245,23 @@ def main() -> None:
     if not preds_dir.is_dir():
         die(f"--preds is not a directory: {preds_dir}")
 
+    # These become path components under data/work/ (and build_work_dir rmtree's
+    # that dir), so refuse anything that could traverse out of it.
+    for label, value in [
+        ("--tracker-name", args.tracker_name),
+        ("--benchmark", args.benchmark),
+        ("--split", args.split),
+    ]:
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", value) or ".." in value:
+            die(f"{label} must match [A-Za-z0-9._-]+ (got {value!r})")
+
     args.out.mkdir(parents=True, exist_ok=True)
     report_path = args.report if args.report is not None else args.out / "report.md"
 
     seqs = discover_sequences(preds_dir)
     gt_split_dir = verify_gt_present(args.gt_root, args.benchmark, args.split, seqs)
 
-    work_root = Path("data/work") / f"{args.tracker_name}-{args.benchmark}-{args.split}"
+    work_root = ROOT / "data" / "work" / f"{args.tracker_name}-{args.benchmark}-{args.split}"
     build_work_dir(work_root, gt_split_dir, preds_dir, args.benchmark, args.split, args.tracker_name, seqs)
 
     run_trackeval(work_root, args.benchmark, args.split, args.tracker_name, args.out)

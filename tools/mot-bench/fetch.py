@@ -144,14 +144,30 @@ def verify(dest: Path, record: bool) -> None:
     print(f"Checksum OK: {relpath}")
 
 
+def safe_target(out_dir: Path, name: str) -> Path:
+    """Resolve a zip member path, refusing traversal outside out_dir (zip slip)."""
+    target = (out_dir / name).resolve()
+    if not target.is_relative_to(out_dir.resolve()):
+        raise SystemExit(f"Refusing zip member escaping the extract dir: {name!r}")
+    return target
+
+
 def extract_plain(zip_path: Path, out_dir: Path) -> None:
     """Extract a zip as-is (no prefix stripping)."""
     if out_dir.exists():
         print(f"SKIP extract (already exists): {out_dir}")
         return
     out_dir.parent.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(out_dir)
+        for member in zf.infolist():
+            target = safe_target(out_dir, member.filename)
+            if member.is_dir() or member.filename.endswith("/"):
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(member) as src, target.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
     print(f"Extracted {zip_path.name} -> {out_dir}")
 
 
@@ -168,7 +184,7 @@ def extract_stripping_prefix(zip_path: Path, out_dir: Path, prefix: str) -> None
                 name = name[len(prefix):]
             if not name:
                 continue
-            target = out_dir / name
+            target = safe_target(out_dir, name)
             if member.is_dir() or name.endswith("/"):
                 target.mkdir(parents=True, exist_ok=True)
                 continue
