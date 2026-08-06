@@ -1,4 +1,11 @@
-//! ONNX inference and postprocess.
+//! Inference and postprocess.
+//!
+//! Two things vary independently here and are separated on purpose. *Which
+//! runtime executes the model* is [`backend`]: one trait, one implementation
+//! (onnxruntime on CPU — what every deployment runs), and two names that parse
+//! and refuse. *How a family is fed and read* is everything else in this
+//! module, and it is backend-agnostic: sniffing, sizing and decode work from a
+//! model's declared names and shapes, never from an SDK's types.
 //!
 //! Everything that differs between detector families is stated once, as data,
 //! in a [`ModelProfile`]: how frames must be *fed* to the model ([`InputSpec`])
@@ -18,6 +25,7 @@
 //! returns no detection at all above 0.3 on a frame where 0..255 BGR finds a
 //! car and a potted plant.
 
+mod backend;
 mod catalog;
 mod detector;
 mod encoding;
@@ -38,6 +46,7 @@ pub(super) const MAX_DETS: usize = 32;
 // items that were `pub` only because everything shared one module — PROFILES,
 // the four family constants, Layout, Outputs, Declared and the rest — are named
 // nowhere outside `infer` and are no longer re-exported (T1.4).
+pub use backend::BackendKind;
 pub use detector::Detector;
 pub use geometry::{Fit, InputSize, Projection};
 pub use labels::{Labels, ScoreFloors, TrackFloorOverrides};

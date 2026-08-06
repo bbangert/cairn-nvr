@@ -112,7 +112,8 @@ named group under `plugins:` and point cameras at it by name — see
 
 | flag | required | meaning |
 |------|----------|---------|
-| `--model` | yes | ONNX detection model: yolox `[1,A,5+nc]`, detr `[1,Q,4]`+`[1,Q,nc]`, end-to-end `[1,N,6]` or raw `[1,4+nc,A]` (see [Model](#model)) |
+| `--model` | yes | detection model, as the artifact `--backend` loads (an `.onnx` for `ort`, the only backend that runs): yolox `[1,A,5+nc]`, detr `[1,Q,4]`+`[1,Q,nc]`, end-to-end `[1,N,6]` or raw `[1,4+nc,A]` (see [Model](#model)) |
+| `--backend` | no | inference runtime: `ort` (default, and the only one implemented), `rknn`, `qnn`. The latter two parse and then refuse to open the model, naming the artifact they will want — they exist so a hardware profile can be written and validated before its runtime lands. Not the same knob as `--decoder`, which picks the *video* decode path |
 | `--labels` | no | newline-separated class names, **indexed by class id** — line 1 is class 0. Must match the model: a count that disagrees with the model's class count is a startup error, because positional indexing would emit every detection under another class's name. Ids past the end, and blank lines (unnamed slots), fall back to the numeric id |
 | `--allow-label-mismatch` | no | start anyway when `--labels` and the model disagree about the class count. For a deliberately partial label file; the mislabelling it permits is silent |
 | `--input-size` | no, except RF-DETR | model input `WxH` (or `N` for a square N×N). Read from the model when omitted; **required** when the model's spatial dims are dynamic, which every RF-DETR export leaves them — `--model-profile` does not substitute for it there (see [Geometry](#geometry)) |
@@ -775,11 +776,12 @@ You normally don't. With no flag the profile is **sniffed** from the model's own
 input and output shapes, and the startup line says which one won:
 
 ```
-cairn-detect up: camera=test udp=17000 model=yolox_nano.onnx profile=yolox \
-    input=images input size=416x416 (from model) encoding=0..255 bgr \
-    resize=letterbox (pad 114) \
+cairn-detect up: camera=test udp=17000 model=yolox_nano.onnx \
+    backend=ort (artifact=.onnx fused-nms=yes dynamic-shapes=yes) \
+    profile=yolox input=images input size=416x416 (from model) \
+    encoding=0..255 bgr resize=letterbox (pad 114) \
     layout=grid-objectness [1, A, 5 + 80] strides 8/16/32 (from model) \
-    decoder=auto
+    score=objectness x class decoder=auto
 ```
 
 Sniffing looks at the model's whole output *set*, not just its first tensor,
@@ -787,10 +789,12 @@ so a two-tensor DETR export and a one-tensor YOLO head can never be confused
 for one another. RF-DETR sniffs cleanly given its geometry:
 
 ```
-cairn-detect up: camera=test udp=17000 model=rfdetr_nano.onnx profile=rfdetr \
-    input=pixel_values input size=384x384 (from --input-size) \
+cairn-detect up: camera=test udp=17000 model=rfdetr_nano.onnx \
+    backend=ort (artifact=.onnx fused-nms=yes dynamic-shapes=yes) \
+    profile=rfdetr input=pixel_values input size=384x384 (from --input-size) \
     encoding=imagenet-normalized rgb resize=stretch \
-    layout=detr-queries [1, Q, 4] + [1, Q, 91] (from model) decoder=auto
+    layout=detr-queries [1, Q, 4] + [1, Q, 91] (from model) \
+    score=sigmoid(class logit) decoder=auto
 ```
 
 `--model-profile <name>` names one explicitly. It wins outright and is then
