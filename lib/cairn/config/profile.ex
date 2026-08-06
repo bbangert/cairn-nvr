@@ -488,8 +488,10 @@ defmodule Cairn.Config.Profile do
     end
   end
 
-  # Aliases shown against the family they resolve to, as the plugin's own
-  # `catalog::names` renders them, so an error says what `yolo11` will do.
+  # Aliases shown against the family they resolve to, in the plugin's own
+  # `catalog::names` *format*, so an error says what `yolo11` will do. The
+  # ordering differs on purpose: Rust renders `PROFILES` declaration order,
+  # while a map here has none, so this menu sorts for a deterministic message.
   defp family_menu do
     @model_families
     |> Enum.sort_by(fn {canonical, _row} -> canonical end)
@@ -526,7 +528,11 @@ defmodule Cairn.Config.Profile do
 
     case {backend in @backends, family(Map.get(raw, "model_profile"))} do
       {true, {_canonical, _row} = family} ->
-        check_capabilities(acc, name, backend, Map.get(raw, "experimental") || false, family)
+        # `=== true`, not `|| false`: a non-boolean `experimental:` is already
+        # an error (`check_experimental/3`, same pipeline), and treating its
+        # truthiness as acknowledgement would swallow the rknn rule's more
+        # actionable "declare experimental: true" message alongside it.
+        check_capabilities(acc, name, backend, Map.get(raw, "experimental") === true, family)
 
       _unknown_backend_or_no_family ->
         acc

@@ -1339,6 +1339,24 @@ defmodule Cairn.ConfigTest do
       assert Enum.any?(errors, &(&1 =~ "declare experimental: true"))
     end
 
+    # A truthy non-boolean is a type error AND not an acknowledgement: both
+    # messages must surface, or the type error hides the actionable one.
+    test "a non-boolean experimental does not satisfy the rknn rule" do
+      errors = caps_errors(@caps_bad_dir)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "profile rknn-truthy-experimental: experimental must be true or false")
+             )
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~
+                   "profile rknn-truthy-experimental: rknn conversion is undocumented for " <>
+                     "model_profile rfdetr")
+             )
+    end
+
     test "the acknowledgement, or a documented family, satisfies the rule" do
       assert {:ok, config, []} =
                Config.from_map(Map.put(base_map(), "profile_dirs", [@caps_dir]))

@@ -1,0 +1,7 @@
+# Rule 2 with a non-boolean acknowledgement: "yes" is a type error, and it
+# must NOT count as experimental — the rule's own message has to surface too.
+backend: rknn
+model:
+  rknn: test/support/fixtures/models/stub.rknn
+model_profile: rfdetr
+experimental: "yes"
