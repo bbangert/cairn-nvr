@@ -55,7 +55,8 @@ defmodule Cairn.CameraTracker do
   Track lifecycle is published on the same `"events"` topic as
   `%Cairn.Track{}` summaries: `track_started` and `track_ended` always,
   `track_updated` only when the track's best score improves or a second on the
-  host's monotonic clock has passed since its last update — a 5 fps stream with a dozen
+  host's monotonic clock has passed since its last update — a default-rate (5 fps)
+  stream with a dozen
   objects must not become a firehose of identical frames. Two `track_updated`
   frames ignore the throttle: a stationary transition, because the flag decides
   whether the object is evidence and a consumer must not learn of the flip up

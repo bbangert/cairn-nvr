@@ -172,7 +172,8 @@ struct StatusBody<'a> {
     /// outright when it is outside that, so a value is worth sending only if
     /// it cannot be; the gate's cannot, being model passes counted over a
     /// window of at least five seconds while the decoder paces samples at
-    /// [`crate::decode::SAMPLE_FPS`].
+    /// `--sample-fps` — [`crate::decode::DEFAULT_SAMPLE_FPS`] when the
+    /// operator does not set it, and never more than 30 either way.
     #[serde(skip_serializing_if = "Option::is_none")]
     fps: Option<f64>,
 }

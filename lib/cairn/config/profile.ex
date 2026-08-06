@@ -44,6 +44,8 @@ defmodule Cairn.Config.Profile do
   decoder: auto              # the video decode path, not the backend
   labels: models/coco.names
   fps_band: [4, 8]           # declared, not measured (D-P5)
+  sample_fps: 6              # optional; emits --sample-fps when set. fps_band
+                             # validates it but a band alone emits nothing (D-P4)
   tracking:                  # stage presence + params, plus band-tuned bounds
     bbd: true                # listed; a params mapping lists it too (and no
                              # shipped stage reads one — see `stages/1`)
@@ -69,12 +71,15 @@ defmodule Cairn.Config.Profile do
   The model half of the file is materialised into the group's `command` at
   config load (`Cairn.Config`), one flag per field the profile actually
   sets: `--model` (the `model:` entry for this profile's own backend),
-  `--model-profile`, `--input-size`, `--decoder`, `--labels`. An unset field
-  emits no flag, leaving the plugin's own default or its sniffing in force.
-  Because the profile is the **single source** of those five (D-P4), a
-  profiled group whose `command:` already names one fails the load;
-  `--motion-json` and `--track-floor-json` are not on that list and stay
-  operator-owned (D-P6).
+  `--model-profile`, `--input-size`, `--decoder`, `--labels`, `--sample-fps`.
+  An unset field emits no flag, leaving the plugin's own default or its
+  sniffing in force. `--sample-fps` is the one flag `fps_band:` never fills
+  in for: the band only validates a declared `sample_fps:` (D-P4) — it is
+  never the source of the flag, so a profile with a band and no `sample_fps:`
+  still emits nothing. Because the profile is the **single source** of those
+  six (D-P4), a profiled group whose `command:` already names one fails the
+  load; `--motion-json` and `--track-floor-json` are not on that list and
+  stay operator-owned (D-P6).
 
   Three things `Cairn.Config` refuses at load rather than at group start,
   which is where an operator reads diagnostics: a `model:` artifact that is
@@ -93,7 +98,7 @@ defmodule Cairn.Config.Profile do
   alias Cairn.Tracker.Stage
 
   @known_keys ~w(name experimental backend model model_profile input_size decoder labels
-                 fps_band tracking)
+                 fps_band sample_fps tracking)
   @known_tracking_keys ~w(bbd oru twin_mint max_unseen_ms max_live_tracks stationary_after_ms)
   # What each backend accepts, as static data — the Elixir half of
   # `BackendKind::capabilities` in
@@ -189,6 +194,7 @@ defmodule Cairn.Config.Profile do
             decoder: nil,
             labels: nil,
             fps_band: nil,
+            sample_fps: nil,
             # The stage presence map (atom key → params map), nil when the
             # file had no `tracking:` block at all — absence speaks (see the
             # moduledoc) — plus the three band-tuned tracker bounds (nil
@@ -343,6 +349,7 @@ defmodule Cairn.Config.Profile do
       |> check_backend(raw, name)
       |> check_pos_int(raw, "input_size", name)
       |> check_fps_band(raw, name)
+      |> check_sample_fps(raw, name)
       |> check_tracking(raw, name)
       |> check_model(raw, name)
       |> check_string(raw, "model_profile", name)
@@ -368,6 +375,7 @@ defmodule Cairn.Config.Profile do
         decoder: Map.get(raw, "decoder"),
         labels: Map.get(raw, "labels"),
         fps_band: Map.get(raw, "fps_band"),
+        sample_fps: Map.get(raw, "sample_fps"),
         stages: stages(tracking),
         max_unseen_ms: tracking && Map.get(tracking, "max_unseen_ms"),
         max_live_tracks: tracking && Map.get(tracking, "max_live_tracks"),
@@ -607,6 +615,52 @@ defmodule Cairn.Config.Profile do
           acc,
           "profile #{name}: fps_band must be [min, max] with 0 < min <= max, got #{inspect(other)}"
         )
+    end
+  end
+
+  # D-P4, the band-validates-never-emits rule: absent `sample_fps:` is not an
+  # error at any `fps_band`, and mirrors clap's own `1..30` bound on the
+  # plugin's `--sample-fps` (`plugins/cairn-detect`) so a value this side
+  # accepts is one the process would too. A present-but-out-of-range integer
+  # falls straight into the fallback clause below — 0 and 31 fail the guard
+  # the same way a float or a string does — so one message covers all three
+  # shapes of "not a legal sample_fps" rather than three near-duplicates.
+  defp check_sample_fps(acc, raw, name) do
+    case Map.get(raw, "sample_fps") do
+      nil ->
+        acc
+
+      value when is_integer(value) and value >= 1 and value <= 30 ->
+        check_sample_fps_band(acc, raw, name, value)
+
+      other ->
+        Config.add_error(
+          acc,
+          "profile #{name}: sample_fps must be an integer between 1 and 30, got #{inspect(other)}"
+        )
+    end
+  end
+
+  # Only fires against a `fps_band:` that itself parsed — a malformed band
+  # already has its own error from `check_fps_band/3`, and re-reading it here
+  # would either duplicate that message or, worse, misreport a band shape
+  # this function was never meant to validate.
+  defp check_sample_fps_band(acc, raw, name, value) do
+    case Map.get(raw, "fps_band") do
+      [min, max] when is_number(min) and is_number(max) and min > 0 and min <= max ->
+        # Built as a string, not `inspect([min, max])`: small integers with a
+        # named escape (8 is "\b", 12 is "\f", …) make `inspect/1` print the
+        # pair as a charlist instead of a list — correct, but unreadable in an
+        # error an operator has to act on.
+        Config.check(
+          acc,
+          value >= min and value <= max,
+          "profile #{name}: sample_fps #{value} contradicts fps_band [#{min}, #{max}] " <>
+            "— a declared sample_fps must fall inside its own fps_band"
+        )
+
+      _absent_or_already_reported ->
+        acc
     end
   end
 

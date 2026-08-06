@@ -1,0 +1,6 @@
+# A singleton band: [5, 5] admits exactly one sample_fps value, 5.
+backend: ort
+model:
+  onnx: test/support/fixtures/models/stub.onnx
+fps_band: [5, 5]
+sample_fps: 5

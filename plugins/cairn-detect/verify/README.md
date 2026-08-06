@@ -37,7 +37,8 @@ plays into a port nothing is listening on):
 ```
 
 **Two runs are never byte-identical, not even the same binary against the same
-clip.** The sample gate is wall-clock (`decode.rs`: `SAMPLE_FPS` against
+clip.** The sample gate is wall-clock (`decode.rs`: the `--sample-fps` rate,
+default `DEFAULT_SAMPLE_FPS`, against
 `Instant::now()`), so which decoded frames reach the model depends on when
 packets arrived, and a rerun picks a different set. Measured on a 20 s fixture:
 two back-to-back yolox runs of one build emitted 88 and 89 lines with **three**

@@ -1,9 +1,9 @@
 //! Hardware decode: decode on the video ASIC, keep surfaces in GPU memory.
 //!
 //! The whole point is what does *not* happen here: decoded surfaces stay on
-//! the device at full frame rate, and only the ~5 fps that survive the sample
-//! gate are scaled to the model's input size *on the GPU* and then
-//! downloaded. Downloading
+//! the device at full frame rate, and only the samples that survive the
+//! sample gate — `--sample-fps` frames a second, 5 by default — are scaled
+//! to the model's input size *on the GPU* and then downloaded. Downloading
 //! first and scaling on the CPU would move ~34 Mbps of full-resolution frames
 //! through system memory and eat the entire saving, so a backend without a
 //! GPU scaler is treated as unavailable rather than silently taking that
@@ -154,6 +154,7 @@ impl HwDecoder {
         codecpar: &AVCodecParameters,
         spec: InputSpec,
         motion: Option<MotionConfig>,
+        sample_fps: u32,
     ) -> Result<Self> {
         if let Some(scale) = backend.scale_filter() {
             let name = CString::new(scale).expect("filter names are ascii");
@@ -205,7 +206,7 @@ impl HwDecoder {
             backend,
             graph: None,
             spec,
-            rgb: RgbScaler::new(spec, motion)?,
+            rgb: RgbScaler::new(spec, motion, sample_fps)?,
             degraded: false,
         })
     }
@@ -517,6 +518,7 @@ mod tests {
                     resize: crate::infer::ResizePolicy::Stretch,
                 },
                 None,
+                crate::decode::DEFAULT_SAMPLE_FPS,
             );
         }
     }

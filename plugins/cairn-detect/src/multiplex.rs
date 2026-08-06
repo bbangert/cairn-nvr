@@ -116,6 +116,22 @@ pub fn motion_for(specs: &[CameraSpec], global: &MotionOverrides) -> Vec<Option<
         .collect()
 }
 
+/// The two process-wide decode knobs every member's stream thread needs, from
+/// `--decoder` and `--sample-fps`. Bundled only to keep [`run`]'s own
+/// parameter list under clippy's arity limit — the bundle rides intact down
+/// the stream-thread call chain and splits back into its two values only
+/// where they are finally consumed, since `kind` and `sample_fps` mean
+/// nothing to each other.
+///
+/// One value of each for the whole group: both flags are per-process by
+/// design, so there is no per-camera decoder or per-camera rate to carry
+/// here instead.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeSettings {
+    pub kind: DecoderKind,
+    pub sample_fps: u32,
+}
+
 /// Run every member's stream through one detector until inference fails.
 ///
 /// `floors` comes from the caller rather than from [`floors_for`] here: it can
@@ -124,7 +140,7 @@ pub fn motion_for(specs: &[CameraSpec], global: &MotionOverrides) -> Vec<Option<
 /// everything else in this module.
 pub fn run(
     specs: &[CameraSpec],
-    kind: DecoderKind,
+    decode_settings: DecodeSettings,
     motion: &MotionOverrides,
     floors: Vec<ScoreFloors>,
     detector: Detector,
@@ -145,7 +161,7 @@ pub fn run(
         let motion = motion[index];
         thread::Builder::new()
             .name(format!("stream-{}", spec.id))
-            .spawn(move || stream_loop(&owned, kind, input_spec, motion, &sink))
+            .spawn(move || stream_loop(&owned, decode_settings, input_spec, motion, &sink))
             .with_context(|| format!("spawning the decode thread for camera {}", spec.id))?;
     }
 
@@ -160,7 +176,7 @@ pub fn run(
 /// and a member's silence is an expected state rather than a fault.
 fn stream_loop(
     spec: &CameraSpec,
-    kind: DecoderKind,
+    decode_settings: DecodeSettings,
     input_spec: InputSpec,
     motion: Option<MotionConfig>,
     sink: &LatestSink<Sample>,
@@ -170,7 +186,7 @@ fn stream_loop(
 
     loop {
         let started = Instant::now();
-        let outcome = open_and_run(spec, kind, input_spec, motion, sink);
+        let outcome = open_and_run(spec, decode_settings, input_spec, motion, sink);
         if started.elapsed() >= HEALTHY_RUN {
             failures = 0;
             delay = REOPEN_MIN;
@@ -197,11 +213,12 @@ fn stream_loop(
 
 fn open_and_run(
     spec: &CameraSpec,
-    kind: DecoderKind,
+    decode_settings: DecodeSettings,
     input_spec: InputSpec,
     motion: Option<MotionConfig>,
     sink: &LatestSink<Sample>,
 ) -> Result<()> {
+    let DecodeSettings { kind, sample_fps } = decode_settings;
     let mut input = rtp::open_stream_once(spec.udp_port)?;
     let (stream_index, _) = input
         .find_best_stream(ffi::AVMEDIA_TYPE_VIDEO)
@@ -211,12 +228,19 @@ fn open_and_run(
         let stream = &input.streams()[stream_index];
         (
             stream.time_base,
-            decode::open(kind, &stream.codecpar(), input_spec, motion)
+            decode::open(kind, &stream.codecpar(), input_spec, motion, sample_fps)
                 .with_context(|| format!("opening a decoder for camera {}", spec.id))?,
         )
     };
 
-    decode::run(&mut input, stream_index, time_base, decoder.as_mut(), sink)
+    decode::run(
+        &mut input,
+        stream_index,
+        time_base,
+        decoder.as_mut(),
+        sink,
+        sample_fps,
+    )
 }
 
 /// Drain every member's slot through the one detector.
