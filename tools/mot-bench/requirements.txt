@@ -1,0 +1,7 @@
+# numpy==1.26.4 / scipy==1.11.4 were the original pins, but the pinned
+# TrackEval SHA (12c8791b) uses removed numpy aliases (np.float, np.int) in
+# its core MOT scoring path (mot_challenge_2d_box.py, hota.py, identity.py).
+# Those aliases were removed in numpy>=1.24, so 1.26.4 crashes with
+# AttributeError. Verified empirically; see README.md.
+numpy==1.23.5
+scipy==1.10.1
