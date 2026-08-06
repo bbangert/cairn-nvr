@@ -112,7 +112,8 @@ named group under `plugins:` and point cameras at it by name — see
 
 | flag | required | meaning |
 |------|----------|---------|
-| `--model` | yes | ONNX detection model: yolox `[1,A,5+nc]`, detr `[1,Q,4]`+`[1,Q,nc]`, end-to-end `[1,N,6]` or raw `[1,4+nc,A]` (see [Model](#model)) |
+| `--model` | yes | detection model, as the artifact `--backend` loads (an `.onnx` for `ort`, the only backend that runs): yolox `[1,A,5+nc]`, detr `[1,Q,4]`+`[1,Q,nc]`, end-to-end `[1,N,6]` or raw `[1,4+nc,A]` (see [Model](#model)) |
+| `--backend` | no | inference runtime: `ort` (default, and the only one implemented), `rknn`, `qnn`. The latter two parse and then refuse to open the model, naming the artifact they will want — they exist so a hardware profile can be written and validated before its runtime lands. Not the same knob as `--decoder`, which picks the *video* decode path |
 | `--labels` | no | newline-separated class names, **indexed by class id** — line 1 is class 0. Must match the model: a count that disagrees with the model's class count is a startup error, because positional indexing would emit every detection under another class's name. Ids past the end, and blank lines (unnamed slots), fall back to the numeric id |
 | `--allow-label-mismatch` | no | start anyway when `--labels` and the model disagree about the class count. For a deliberately partial label file; the mislabelling it permits is silent |
 | `--input-size` | no, except RF-DETR | model input `WxH` (or `N` for a square N×N). Read from the model when omitted; **required** when the model's spatial dims are dynamic, which every RF-DETR export leaves them — `--model-profile` does not substitute for it there (see [Geometry](#geometry)) |

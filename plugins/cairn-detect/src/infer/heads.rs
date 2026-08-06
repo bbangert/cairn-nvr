@@ -15,6 +15,10 @@ use super::resolve::validate_layout;
 use super::MAX_DETS;
 
 /// One extracted output tensor: the values and the shape they came with.
+///
+/// The borrow is the backend's — this is what
+/// [`Tensors::get`](super::backend::Tensors::get) hands back, borrowed from the
+/// run that produced it rather than copied out of it.
 pub(super) struct Raw<'a> {
     pub(super) dims: Vec<i64>,
     pub(super) values: &'a [f32],
@@ -220,10 +224,13 @@ pub(super) fn candidates_from(
 /// Does this tensor carry the `rows * row` values the layout is about to index?
 ///
 /// The product is `checked_mul` rather than `*` because both factors come off
-/// a *runtime* tensor shape. onnxruntime's extents are consistent with the
-/// buffer it hands back, so a wrap is unreachable today — but this is the one
-/// place the "trust the dims" pattern is not defended, and a wrapped `need`
-/// would pass the length check and let the decode loop walk off the slice.
+/// a *runtime* tensor shape — whatever the backend reported alongside the
+/// buffer. onnxruntime's extents are consistent with the buffer it hands back,
+/// so on the one backend that executes a wrap is unreachable today; a backend
+/// whose SDK reports the two separately has no such guarantee. Either way this
+/// is the one place the "trust the dims" pattern is not defended, and a wrapped
+/// `need` would pass the length check and let the decode loop walk off the
+/// slice.
 fn require_values(have: usize, rows: usize, row: usize, dims: &[i64]) -> Result<()> {
     let need = rows
         .checked_mul(row)

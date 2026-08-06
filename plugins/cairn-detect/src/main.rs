@@ -61,7 +61,9 @@ use control::Streams;
 use decode::{DecoderKind, Sample};
 use emit::Publisher;
 use gate::Gate;
-use infer::{Detector, InputSize, Labels, ModelProfile, ScoreFloors, TrackFloorOverrides};
+use infer::{
+    BackendKind, Detector, InputSize, Labels, ModelProfile, ScoreFloors, TrackFloorOverrides,
+};
 use motion::{MotionConfig, MotionOverrides};
 
 #[derive(Parser, Debug)]
@@ -120,10 +122,17 @@ struct Args {
     #[arg(long)]
     track_floor_json: Option<String>,
 
-    /// ONNX detection model: a yolox, rfdetr, yolov10/yolo26 or
-    /// yolov8/yolov9/yolo11 head.
+    /// Detection model: a yolox, rfdetr, yolov10/yolo26 or yolov8/yolov9/yolo11
+    /// head, as the artifact `--backend` compiles against (`.onnx` for `ort`).
     #[arg(long)]
     model: PathBuf,
+
+    /// Inference runtime. Only `ort` executes; `rknn` and `qnn` are accepted
+    /// here and refused when the model opens, so a profile naming hardware
+    /// whose runtime has not landed fails with a message about the backend
+    /// rather than a usage error about the flag.
+    #[arg(long, value_enum, default_value_t = BackendKind::Ort)]
+    backend: BackendKind,
 
     /// Preprocessing and decode steps to run this model under: `yolox`,
     /// `rfdetr`, `yolov10` (or `yolo26`) or `yolov8` (or `yolov9`, `yolo11`,
@@ -149,7 +158,8 @@ struct Args {
     #[arg(long, value_parser = InputSize::parse)]
     input_size: Option<InputSize>,
 
-    /// Decode backend. Probed at startup; any failure falls back to software.
+    /// H.264 decode backend — the video path, not `--backend`'s inference one.
+    /// Probed at startup; any failure falls back to software.
     #[arg(long, value_enum, default_value_t = DecoderKind::Auto)]
     decoder: DecoderKind,
 }
@@ -213,6 +223,7 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
     // size the model resolves to.
     let detector = Detector::open(
         &args.model,
+        args.backend,
         args.input_size,
         args.model_profile,
         &labels,
@@ -285,6 +296,7 @@ fn run_single(args: &Args) -> Result<()> {
     // Before the stream opens: `decode::open` below needs the resolved size.
     let detector = Detector::open(
         &args.model,
+        args.backend,
         args.input_size,
         args.model_profile,
         &labels,
@@ -348,14 +360,22 @@ fn run_single(args: &Args) -> Result<()> {
 }
 
 /// The one line that says what this process will actually run, so a wrong
-/// model or a wrong profile is visible before any frame arrives rather than
-/// inferred later from bad boxes.
+/// model, a wrong profile or a backend that is not the one a profile asked for
+/// is visible before any frame arrives rather than inferred later from bad
+/// boxes.
+///
+/// The backend and its capabilities come from the opened [`Detector`], not from
+/// `args`: what ran is what this line should report. The capability half reads
+/// from the static table in `infer::backend` — the one the Elixir side's
+/// planned capability validation will mirror (today it mirrors only the
+/// artifact column).
 fn model_summary(args: &Args, detector: &Detector) -> String {
     let spec = detector.input_spec();
     format!(
-        "model={} profile={} input={} input size={} ({}) encoding={} resize={} layout={} \
-         score={} decoder={}",
+        "model={} backend={} profile={} input={} input size={} ({}) encoding={} \
+         resize={} layout={} score={} decoder={}",
         args.model.display(),
+        detector.backend_summary(),
         detector.profile(),
         detector.input_name(),
         spec.size,

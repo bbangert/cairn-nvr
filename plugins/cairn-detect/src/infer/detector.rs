@@ -1,26 +1,27 @@
-//! The ONNX session, and the per-frame path from a packed tensor to detections.
+//! The open model, and the per-frame path from a packed tensor to detections.
 
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Context, Result};
-use ort::session::Session;
-use ort::value::Tensor;
+use anyhow::{bail, Context, Result};
 
 use crate::emit::Det;
 
+use super::backend::onnxruntime::OrtBackend;
+use super::backend::{Backend, BackendKind, InputTensor, SessionOptions};
 use super::geometry::{InputSize, Projection};
 use super::heads::{decode_output, Raw};
 use super::labels::{check_label_count, Labels, ScoreFloors};
 use super::profile::InputSpec;
 use super::profile::{InputSizeSource, ModelProfile, OutputSpec, Outputs};
 use super::resolve::{
-    check_grid_divides_input, declared_input_size, fit_output, resolve_input_size, resolve_profile,
-    static_output_dims, Declared,
+    check_grid_divides_input, fit_output, resolve_input_size, resolve_profile, Declared,
 };
 
 pub struct Detector {
-    session: Session,
-    input_name: String,
+    /// The runtime holding the open model. Boxed rather than an enum over the
+    /// backends: `rknn` and `qnn` have no type to be a variant of yet, and a
+    /// variant nothing constructs is dead code under `-D warnings`.
+    backend: Box<dyn Backend>,
     /// The model's own name for each tensor this profile's layout reads,
     /// settled at startup so a decode never looks one up by index.
     outputs: Outputs<String>,
@@ -36,57 +37,51 @@ pub struct Detector {
 }
 
 impl Detector {
-    /// `requested` is `--input-size`, `profile` is `--model-profile`; absent,
-    /// the profile is sniffed from the model's own I/O. `labels` is read to
-    /// reject a class-count mismatch, which would mislabel every detection.
+    /// `backend` is `--backend`, `requested` is `--input-size`, `profile` is
+    /// `--model-profile`; absent, the profile is sniffed from the model's own
+    /// I/O. `labels` is read to reject a class-count mismatch, which would
+    /// mislabel every detection.
+    ///
+    /// Everything after the backend opens is backend-agnostic: the size and
+    /// profile resolution below read a [`ModelIo`](super::backend::ModelIo),
+    /// which is the model's declared names and shapes with no SDK type in it.
     pub fn open(
         model: &Path,
+        backend: BackendKind,
         requested: Option<InputSize>,
         profile: Option<ModelProfile>,
         labels: &Labels,
         allow_label_mismatch: bool,
     ) -> Result<Self> {
-        // ort's builder errors carry the builder itself for recovery, which
-        // makes them neither Send nor Sync; flatten them to a message.
-        let session = Session::builder()
-            .map_err(|e| anyhow!("creating an onnxruntime session builder: {e}"))?
-            .with_execution_providers([ort::ep::CPU::default().build()])
-            .map_err(|e| anyhow!("registering the CPU execution provider: {e}"))?
-            .commit_from_file(model)
-            .with_context(|| format!("loading model {}", model.display()))?;
-        // Both names are resolved at startup so a model with the wrong shape
-        // fails here with a clear message rather than by index inside the
-        // inference thread on the first frame.
-        let input = session
-            .inputs()
-            .first()
-            .ok_or_else(|| anyhow!("model {} has no inputs", model.display()))?;
-        let input_name = input.name().to_string();
-        let (input_size, input_size_source) = resolve_input_size(
-            declared_input_size(input.dtype()),
-            requested,
-            profile,
-            model,
-        )?;
-        let declared: Vec<Declared> = session
-            .outputs()
-            .iter()
-            .map(|output| Declared {
-                name: output.name().to_string(),
-                dims: static_output_dims(output.dtype()),
-            })
-            .collect();
+        let options = SessionOptions::default();
+        let backend: Box<dyn Backend> = match backend {
+            BackendKind::Ort => Box::new(OrtBackend::open(model, &options)?),
+            // The host refuses this at config load unless the profile and the
+            // group both acknowledge it as experimental; this is the same
+            // refusal one process later, for the argv that got here anyway.
+            // Spelled out rather than a wildcard so that implementing one of
+            // these — or adding a fourth kind — is a compile error here, not a
+            // runtime refusal of a backend that exists.
+            kind @ (BackendKind::Rknn | BackendKind::Qnn) => bail!(
+                "backend {kind} is not yet implemented — only ort executes today. \
+                 Its expected artifact is {} (see --backend).",
+                kind.capabilities().artifact
+            ),
+        };
+        let io = backend.io();
+        let (input_size, input_size_source) =
+            resolve_input_size(io.declared_input_size, requested, profile, model)?;
+        let declared: &[Declared] = &io.outputs;
         if declared.is_empty() {
             bail!("model {} has no outputs", model.display());
         }
-        let (profile, outputs, output) = resolve_profile(profile, &declared, input_size, model)?;
+        let (profile, outputs, output) = resolve_profile(profile, declared, input_size, model)?;
         check_grid_divides_input(profile.output.layout, input_size)?;
         if let Some(output) = output {
             check_label_count(output.layout, labels, allow_label_mismatch)?;
         }
         Ok(Self {
-            session,
-            input_name,
+            backend,
             outputs,
             profile,
             input_size,
@@ -97,7 +92,19 @@ impl Detector {
     }
 
     pub fn input_name(&self) -> &str {
-        &self.input_name
+        &self.backend.io().input_name
+    }
+
+    /// Startup description of the runtime that opened this model and what it
+    /// accepts — rendered here, like [`Detector::layout_summary`], so
+    /// `Capabilities` stays inside `infer` and main.rs prints rather than
+    /// interprets it.
+    pub fn backend_summary(&self) -> String {
+        format!(
+            "{} ({})",
+            self.backend.kind(),
+            self.backend.kind().capabilities()
+        )
     }
 
     pub fn profile(&self) -> ModelProfile {
@@ -133,30 +140,18 @@ impl Detector {
         labels: &Labels,
         floors: &ScoreFloors,
     ) -> Result<Vec<Det>> {
-        let shape = [1i64, 3, self.input_size.h as i64, self.input_size.w as i64];
-        let input = Tensor::from_array((shape, tensor)).context("building the input tensor")?;
-        let outputs = self
-            .session
-            .run(ort::inputs![self.input_name.as_str() => input])
-            .context("running inference")?;
+        let input = InputTensor {
+            shape: [1i64, 3, self.input_size.h as i64, self.input_size.w as i64],
+            values: tensor,
+        };
+        let tensors = self.backend.run(input)?;
         // Extract every role this profile reads, by the name settled at
         // startup, so a two-tensor family never depends on output ordering.
-        let extract = |name: &String| -> Result<Raw> {
-            let (shape, values) = outputs
-                .get(name.as_str())
-                .ok_or_else(|| anyhow!("model produced no output named {name}"))?
-                .try_extract_tensor::<f32>()
-                .with_context(|| format!("model output {name} is not an f32 tensor"))?;
-            Ok(Raw {
-                dims: shape.iter().copied().collect(),
-                values,
-            })
-        };
-        let raw = match &self.outputs {
-            Outputs::One(name) => Outputs::One(extract(name)?),
+        let raw: Outputs<Raw> = match &self.outputs {
+            Outputs::One(name) => Outputs::One(tensors.get(name)?),
             Outputs::BoxesAndLogits { boxes, logits } => Outputs::BoxesAndLogits {
-                boxes: extract(boxes)?,
-                logits: extract(logits)?,
+                boxes: tensors.get(boxes)?,
+                logits: tensors.get(logits)?,
             },
         };
         let shapes = raw.map(|tensor| tensor.dims.clone());
@@ -172,5 +167,37 @@ impl Detector {
             }
         };
         decode_output(output, &raw, labels, floors, self.input_size, &projection)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stub refusal is the whole operator-visible behaviour of the
+    /// `--backend` seam, and it must fire before any model access — proven
+    /// here by a path that does not exist.
+    #[test]
+    fn stub_backends_are_refused_before_any_model_access() {
+        for (kind, artifact) in [(BackendKind::Rknn, ".rknn"), (BackendKind::Qnn, ".onnx")] {
+            // Not `unwrap_err`: `Detector` has no `Debug`, deliberately.
+            let err = match Detector::open(
+                Path::new("does/not/exist"),
+                kind,
+                None,
+                None,
+                &Labels::load(None).unwrap(),
+                false,
+            ) {
+                Ok(_) => panic!("stub backend {kind} opened"),
+                Err(err) => err,
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("backend {kind} is not yet implemented")),
+                "{msg}"
+            );
+            assert!(msg.contains(artifact), "{msg}");
+        }
     }
 }

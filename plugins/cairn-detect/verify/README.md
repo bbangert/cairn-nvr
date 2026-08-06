@@ -32,9 +32,30 @@ plays into a port nothing is listening on):
 # terminal 2 — once terminal 1 has printed `cairn-detect up:` on stderr
 ./feed.py --port 17000 --duration 30
 
-# terminal 2 (rerun for the other model or decoder backend), then:
+# terminal 2 (rerun for the other model, or the other --decoder), then:
 ./compare_runs.py --a fp32.ndjson --b int8.ndjson
 ```
+
+**Two runs are never byte-identical, not even the same binary against the same
+clip.** The sample gate is wall-clock (`decode.rs`: `SAMPLE_FPS` against
+`Instant::now()`), so which decoded frames reach the model depends on when
+packets arrived, and a rerun picks a different set. Measured on a 20 s fixture:
+two back-to-back yolox runs of one build emitted 88 and 89 lines with **three**
+in common. `compare_runs.py` read them as the same detector — the dominant
+label at rate 1.000 in both, its score quartiles agreeing to 0.002, identical
+bucket overlap — and still moved a rare label's rate from 0.024 to 0.035 on two
+sightings against three.
+
+So this harness answers "does the build still detect the same things" and
+cannot answer "is the output identical". For a refactor meant to change
+nothing, run the *unchanged* build twice first: that pair is the noise floor,
+and the post-change comparison is a result only insofar as it sits inside it. A
+rare label moving by one sighting is what this fixture does on its own.
+
+The startup `cairn-detect up:` line is the deterministic half, and worth
+diffing on its own: profile, input name, input size and its source, encoding,
+resize policy, layout and score composition are all resolved from the model
+before a frame arrives, so they must match byte for byte.
 
 `validate_ndjson.py` exits nonzero if it saw no `frame.objects` line at all,
 which is exactly what a forgotten control line looks like: `plugin.hello` and
