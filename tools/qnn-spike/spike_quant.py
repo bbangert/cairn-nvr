@@ -19,6 +19,7 @@ clean (its Focus-layer Slices fall back to CPU harmlessly).
 """
 import os
 import sys
+import tempfile
 
 REPO_MODEL_DIR = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -35,29 +36,34 @@ from quantize_model import FolderCalibrationDataReader, describe, preprocessing
 def build(model_path, out_path, calib_dir, min_opset=13):
     m = onnx.load(model_path)
     opset = next(i.version for i in m.opset_import if i.domain in ("", "ai.onnx"))
-    src = model_path
-    if opset < min_opset:
-        from onnx import version_converter
+    with tempfile.TemporaryDirectory(prefix="spike_quant_") as work:
+        src = model_path
+        if opset < min_opset:
+            from onnx import version_converter
 
-        m = version_converter.convert_version(m, min_opset)
-        src = out_path + ".upgraded.onnx"
-        onnx.save(m, src)
-        print(f"upgraded opset {opset} -> {min_opset}")
+            m = version_converter.convert_version(m, min_opset)
+            src = os.path.join(work, "upgraded.onnx")
+            onnx.save(m, src)
+            print(f"upgraded opset {opset} -> {min_opset}")
 
-    pre = out_path + ".preproc.onnx"
-    try:
-        quant_pre_process(input_model=src, output_model_path=pre)
-    except Exception as e:
-        # yolov10's TopK tail crashes symbolic shape inference (known
-        # op-coverage gap); plain shape inference suffices for QDQ.
-        print(f"symbolic shape inference failed ({e!r}); skipping it")
-        quant_pre_process(
-            input_model=src, output_model_path=pre, skip_symbolic_shape=True
-        )
+        pre = os.path.join(work, "preproc.onnx")
+        try:
+            quant_pre_process(input_model=src, output_model_path=pre)
+        except Exception as e:
+            # yolov10's TopK tail crashes symbolic shape inference (known
+            # op-coverage gap); plain shape inference suffices for QDQ.
+            print(f"symbolic shape inference failed ({e!r}); skipping it")
+            quant_pre_process(
+                input_model=src, output_model_path=pre, skip_symbolic_shape=True
+            )
 
+        _quantize(pre, out_path, calib_dir)
+
+
+def _quantize(pre, out_path, calib_dir):
     info = describe(pre)
     profile = preprocessing(info["layout"])
-    print(f"{model_path}: layout={info['layout']} {info['width']}x{info['height']}")
+    print(f"layout={info['layout']} {info['width']}x{info['height']} -> {out_path}")
     reader = FolderCalibrationDataReader(
         calib_dir, info["input_name"], info["width"], info["height"], profile
     )

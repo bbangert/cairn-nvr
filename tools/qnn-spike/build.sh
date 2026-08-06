@@ -2,7 +2,8 @@
 # Cross-compile qnn_spike and assemble the on-board bundle.
 #
 # Produces work/bundle/ ready to copy to /data/qnn-spike/ on the board.
-# Run from tools/qnn-spike/. Requires: aarch64-linux-gnu-gcc, pip, curl.
+# Run from tools/qnn-spike/. Requires: aarch64-linux-gnu-gcc, pip, curl,
+# unzip.
 #
 # Version triple (see README.md): base ORT 1.26.0 x plugin EP 2.4.0 x
 # QAIRT 2.48.40 (bundled inside the onnxruntime-qnn wheel).

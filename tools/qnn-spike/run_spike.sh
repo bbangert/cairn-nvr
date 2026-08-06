@@ -11,9 +11,10 @@
 B=/data/qnn-spike
 N=${1:-100}
 
-export LD_LIBRARY_PATH="$B/lib"
-export ADSP_LIBRARY_PATH="$B/dsp;"
-export DSP_LIBRARY_PATH="$B/dsp;"
+# Prefix, don't clobber: keep any preconfigured paths after ours.
+export LD_LIBRARY_PATH="$B/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ADSP_LIBRARY_PATH="$B/dsp;${ADSP_LIBRARY_PATH:-}"
+export DSP_LIBRARY_PATH="$B/dsp;${DSP_LIBRARY_PATH:-}"
 
 echo "--- cpu ---"
 "$B/qnn_spike" "$B/model.onnx" cpu "$N"
