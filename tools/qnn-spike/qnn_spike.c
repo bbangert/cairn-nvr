@@ -174,7 +174,18 @@ int main(int argc, char** argv) {
 
   size_t n_elems = 1;
   for (size_t i = 0; i < n_dims; i++) {
-    if (dims[i] <= 0) dims[i] = 1; /* free/dynamic dim -> batch 1 */
+    if (dims[i] <= 0) {
+      if (i != 0) {
+        /* A dynamic non-batch dim silently defaulted to 1 would
+         * benchmark a 1x1 input — wrong numbers, no error. */
+        fprintf(stderr,
+                "input dim %zu is dynamic; use a static-shape model "
+                "(only the batch dim may be dynamic)\n",
+                i);
+        return 1;
+      }
+      dims[i] = 1; /* dynamic batch -> 1 */
+    }
     n_elems *= (size_t)dims[i];
   }
 
