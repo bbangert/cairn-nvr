@@ -51,9 +51,17 @@ defmodule Cairn.Tracker.Reid do
   The rolling per-track embedding: seeded by the first feature, then an
   exponential moving average re-normalized per step. Both inputs are
   unit-norm lists (`dequant/1` output for the detection side).
+
+  A dimension mismatch — an embedder model swap mid-track — reseeds from
+  the fresh side rather than blending: `Enum.zip_with/3` would silently
+  truncate, and a vector half in one model's space and half in another's
+  is not an appearance but corruption. A new feature space starts a new
+  rolling state, exactly as the first feature did.
   """
   @spec roll([float()] | nil, [float()]) :: [float()]
   def roll(nil, fresh), do: fresh
+
+  def roll(rolling, fresh) when length(rolling) != length(fresh), do: fresh
 
   def roll(rolling, fresh) do
     blended =

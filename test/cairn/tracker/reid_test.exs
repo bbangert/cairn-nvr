@@ -46,6 +46,13 @@ defmodule Cairn.Tracker.ReidTest do
       assert Reid.distance(rolled, rolling) < Reid.distance(rolled, fresh)
       assert_in_delta Enum.reduce(rolled, 0.0, &(&2 + &1 * &1)), 1.0, 1.0e-6
     end
+
+    test "a dimension mismatch reseeds instead of silently truncating" do
+      rolling = Reid.dequant(axis(4, 0))
+      fresh = Reid.dequant(axis(8, 1))
+
+      assert Reid.roll(rolling, fresh) == fresh
+    end
   end
 
   describe "distance/2" do
