@@ -53,17 +53,29 @@ pub struct Embedder {
 }
 
 impl Embedder {
-    /// Opens the embedder artifact on the same backend kind the detector
-    /// uses. The model must declare a rank-4, 3-channel input (that is the
-    /// crop geometry) and one statically-shaped output (that is the wire
+    /// Opens the embedder artifact on the backend kind `--backend` named —
+    /// which today means `ort`: the flag is shared with the detector, and a
+    /// kind the embedder can't run on is refused here rather than silently
+    /// downgraded. The model must declare a rank-4, 3-channel input (that is
+    /// the crop geometry) and one statically-shaped output (that is the wire
     /// budget) — an artifact that declares neither can't be checked against
     /// either contract, so it is refused rather than trusted.
     pub fn open(model: &Path, backend: BackendKind) -> Result<Self> {
         let options = SessionOptions::default();
         let backend: Box<dyn Backend> = match backend {
             BackendKind::Ort => Box::new(OrtBackend::open(model, &options)?),
-            kind @ (BackendKind::Rknn | BackendKind::Qnn) => bail!(
-                "backend {kind} is not yet implemented — only ort executes today. \
+            // The detector runs on qnn; the embedder does not, yet — HTP takes
+            // only full-op-coverage QDQ graphs and no QDQ embedder export
+            // exists until the phase-3 quantization pipeline covers osnet.
+            // Refused rather than quietly opened on the CPU EP, because a
+            // backend the operator named and did not get is exactly the
+            // silent fallback this crate refuses everywhere else.
+            BackendKind::Qnn => bail!(
+                "the embedder does not run on qnn yet (no QDQ embedder \
+                 artifact) — drop --embedder-model or use --backend ort"
+            ),
+            kind @ BackendKind::Rknn => bail!(
+                "backend {kind} is not yet implemented — only ort and qnn execute today. \
                  Its expected artifact is {} (see --backend).",
                 kind.capabilities().artifact
             ),

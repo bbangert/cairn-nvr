@@ -1,9 +1,11 @@
 //! The seam between "run this model on this frame" and the SDK that does it.
 //!
-//! One backend is implemented, [`onnxruntime::OrtBackend`], and it is the only
-//! one that executes. The other two names in [`BackendKind`] parse on the
-//! command line and fail at [`Detector::open`](super::Detector::open) — they
-//! exist so a hardware profile can *name* the runtime it targets before that
+//! Two backends execute, and both are onnxruntime sessions:
+//! [`onnxruntime::OrtBackend`] on the CPU execution provider and
+//! [`onnxruntime::QnnBackend`] on Qualcomm's HTP via the QNN plugin execution
+//! provider. The remaining name in [`BackendKind`], `rknn`, parses on the
+//! command line and fails at [`Detector::open`](super::Detector::open) — it
+//! exists so a hardware profile can *name* the runtime it targets before that
 //! runtime lands, and so [`BackendKind::capabilities`] has somewhere to say
 //! what each one will and will not accept.
 //!
@@ -26,7 +28,7 @@
 pub(super) mod onnxruntime;
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::ValueEnum;
@@ -37,21 +39,23 @@ use super::resolve::Declared;
 
 /// Which runtime executes the model.
 ///
-/// `rknn` and `qnn` are accepted by `--backend` and rejected at
-/// [`Detector::open`](super::Detector::open). Parsing them is the point: the
+/// `rknn` is accepted by `--backend` and rejected at
+/// [`Detector::open`](super::Detector::open). Parsing it is the point: the
 /// host already refuses to run a group on a non-`ort` profile unless the
 /// profile declares `experimental: true` *and* the group sets
 /// `allow_experimental: true` (`Cairn.Config.check_backend_implemented/3`), and
 /// this is the belt to that suspender — a name that reached the plugin anyway
 /// stops here with a message about the backend, instead of being a clap usage
-/// error the operator reads as a typo in the flag.
+/// error the operator reads as a typo in the flag. `qnn` executes, but stays
+/// behind the same host-side experimental gate until it has soaked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum BackendKind {
-    /// onnxruntime, CPU execution provider. The only one that runs today.
+    /// onnxruntime, CPU execution provider.
     Ort,
     /// Rockchip NPU (rk3566/rk3576) via librknnrt. Not implemented.
     Rknn,
-    /// Qualcomm HTP via onnxruntime's QNN execution provider. Not implemented.
+    /// Qualcomm HTP via onnxruntime's QNN plugin execution provider. Needs
+    /// `--qnn-library` and a full-op-coverage QDQ model.
     Qnn,
 }
 
@@ -182,30 +186,35 @@ impl fmt::Display for ArtifactFormat {
 /// reads its own group and ignores the rest.
 ///
 /// There is no `ort` group: the only session setting the ort backend makes
-/// today is the CPU execution provider, which is not a profile knob and has
-/// nothing to configure. The other two groups are the knobs a profile will
-/// carry when those backends land.
-///
-/// `#[allow(dead_code)]`: every field below is written by `Default` and read by
-/// nothing, because the code that would read it is the backend that does not
-/// exist yet. `-D warnings` would otherwise make the option surface of an
-/// unimplemented backend inexpressible, which is the opposite of designing it
-/// in. Each backend's `open` reading its own group removes the need for the
-/// attribute on that group.
-#[allow(dead_code)]
+/// is the CPU execution provider, which is not a profile knob and has
+/// nothing to configure. The `qnn` group is read by
+/// [`onnxruntime::QnnBackend`]; `rknn` is the knobs a profile will carry when
+/// that backend lands.
 #[derive(Debug, Default, Clone)]
 pub(super) struct SessionOptions {
     pub qnn: QnnOptions,
+    /// `#[allow(dead_code)]`: read by nothing until the rknn backend lands —
+    /// see [`RknnOptions`] for why the group exists anyway.
+    #[allow(dead_code)]
     pub rknn: RknnOptions,
 }
 
 /// Qualcomm HTP knobs, per onnxruntime's QNN execution-provider options.
 ///
 /// `None` on any of them means "leave the provider's own default", which is
-/// what an unset profile field expands to.
-#[allow(dead_code)]
+/// what an unset profile field expands to — except that the spike found
+/// platform detection fails on the QCS6490 without explicit `soc_model` and
+/// `htp_arch` (`tools/qnn-spike/README.md`), so a working profile sets both.
 #[derive(Debug, Default, Clone)]
-pub(super) struct QnnOptions {
+pub struct QnnOptions {
+    /// `--qnn-library` — path to the QNN plugin execution-provider library
+    /// (`libonnxruntime_providers_qnn.so`, from the `onnxruntime-qnn`
+    /// distribution). Required to open a `qnn` session: the EP is not
+    /// compiled into onnxruntime, it is registered from this file at open.
+    pub library: Option<PathBuf>,
+    /// `soc_model` — Qualcomm's numeric SoC id (35 on QCS6490). Without it,
+    /// QNN's platform detection fails on this board.
+    pub soc_model: Option<u32>,
     /// `htp_arch` — the HTP architecture version of the target SoC (68 on
     /// QCS6490). Wrong here is not slow, it is a provider that declines the
     /// graph.
@@ -219,6 +228,12 @@ pub(super) struct QnnOptions {
 }
 
 /// Rockchip NPU knobs, per librknnrt.
+///
+/// `#[allow(dead_code)]`: written by `Default`, read by nothing, because the
+/// code that would read it is the backend that does not exist yet. `-D
+/// warnings` would otherwise make the option surface of an unimplemented
+/// backend inexpressible, which is the opposite of designing it in. The rknn
+/// backend's `open` reading this group removes the attribute.
 #[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 pub(super) struct RknnOptions {

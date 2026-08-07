@@ -1,13 +1,14 @@
 //! The open model, and the per-frame path from a packed tensor to detections.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
 use crate::emit::Det;
 
-use super::backend::onnxruntime::OrtBackend;
-use super::backend::{Backend, BackendKind, InputTensor, SessionOptions};
+use super::backend::onnxruntime::{OrtBackend, QnnBackend};
+use super::backend::{Backend, BackendKind, InputTensor, QnnOptions, SessionOptions};
 use super::geometry::{InputSize, Projection};
 use super::heads::{decode_output, Raw};
 use super::labels::{check_label_count, Labels, ScoreFloors};
@@ -19,8 +20,8 @@ use super::resolve::{
 
 pub struct Detector {
     /// The runtime holding the open model. Boxed rather than an enum over the
-    /// backends: `rknn` and `qnn` have no type to be a variant of yet, and a
-    /// variant nothing constructs is dead code under `-D warnings`.
+    /// backends: `rknn` has no type to be a variant of yet, and a variant
+    /// nothing constructs is dead code under `-D warnings`.
     backend: Box<dyn Backend>,
     /// The model's own name for each tensor this profile's layout reads,
     /// settled at startup so a decode never looks one up by index.
@@ -34,12 +35,67 @@ pub struct Detector {
     /// `--allow-label-mismatch`, carried because a deferred layout only
     /// settles `nc` on the first real output — see [`check_label_count`].
     allow_label_mismatch: bool,
+    latency: LatencyWindow,
+}
+
+/// Rolling window over raw inference latency, reported to stderr once per
+/// [`LatencyWindow::REPORT_EVERY`] runs.
+///
+/// This is the plugin's only latency surface, and it exists because of D-P5:
+/// on QNN hardware, both known failure modes (whole-session CPU fallback,
+/// degraded DSP memory) produce clean logs and correct detections — the only
+/// observable difference is the per-run latency, so the plugin has to say
+/// what its runs actually cost. On the CPU backend the same line is the
+/// number the QNN delta is measured against.
+struct LatencyWindow {
+    window: Vec<Duration>,
+    total_runs: u64,
+}
+
+impl LatencyWindow {
+    /// Small enough to report within seconds at bench rates, large enough
+    /// that p95 is the 95th of a real distribution rather than of noise.
+    const REPORT_EVERY: usize = 100;
+
+    fn new() -> Self {
+        Self {
+            window: Vec::with_capacity(Self::REPORT_EVERY),
+            total_runs: 0,
+        }
+    }
+
+    /// Records one run; on the report boundary, prints and resets the window.
+    fn record(&mut self, elapsed: Duration, kind: BackendKind) {
+        self.total_runs += 1;
+        self.window.push(elapsed);
+        if self.window.len() < Self::REPORT_EVERY {
+            return;
+        }
+        self.window.sort_unstable();
+        let (p50, p95) = (self.percentile(50), self.percentile(95));
+        eprintln!(
+            "infer latency: backend={kind} n={} p50={:.2}ms p95={:.2}ms (total {})",
+            self.window.len(),
+            p50.as_secs_f64() * 1000.0,
+            p95.as_secs_f64() * 1000.0,
+            self.total_runs,
+        );
+        self.window.clear();
+    }
+
+    /// Nearest-rank percentile of the *sorted* window; only `record` calls
+    /// this, after sorting and before clearing.
+    fn percentile(&self, pct: usize) -> Duration {
+        let rank = (self.window.len() * pct).div_ceil(100);
+        self.window[rank.saturating_sub(1)]
+    }
 }
 
 impl Detector {
     /// `backend` is `--backend`, `requested` is `--input-size`, `profile` is
-    /// `--model-profile`; absent, the profile is sniffed from the model's own
-    /// I/O. `labels` is read to reject a class-count mismatch, which would
+    /// `--model-profile`, `qnn` is the `--qnn-*` flags (read only when
+    /// `backend` is `qnn`); absent, the profile is sniffed from the model's
+    /// own I/O. `labels` is read to reject a class-count mismatch, which would
     /// mislabel every detection.
     ///
     /// Everything after the backend opens is backend-agnostic: the size and
@@ -52,18 +108,23 @@ impl Detector {
         profile: Option<ModelProfile>,
         labels: &Labels,
         allow_label_mismatch: bool,
+        qnn: QnnOptions,
     ) -> Result<Self> {
-        let options = SessionOptions::default();
+        let options = SessionOptions {
+            qnn,
+            ..SessionOptions::default()
+        };
         let backend: Box<dyn Backend> = match backend {
             BackendKind::Ort => Box::new(OrtBackend::open(model, &options)?),
+            BackendKind::Qnn => Box::new(QnnBackend::open(model, &options)?),
             // The host refuses this at config load unless the profile and the
             // group both acknowledge it as experimental; this is the same
             // refusal one process later, for the argv that got here anyway.
-            // Spelled out rather than a wildcard so that implementing one of
-            // these — or adding a fourth kind — is a compile error here, not a
-            // runtime refusal of a backend that exists.
-            kind @ (BackendKind::Rknn | BackendKind::Qnn) => bail!(
-                "backend {kind} is not yet implemented — only ort executes today. \
+            // Spelled out rather than a wildcard so that implementing it — or
+            // adding a fourth kind — is a compile error here, not a runtime
+            // refusal of a backend that exists.
+            kind @ BackendKind::Rknn => bail!(
+                "backend {kind} is not yet implemented — only ort and qnn execute today. \
                  Its expected artifact is {} (see --backend).",
                 kind.capabilities().artifact
             ),
@@ -88,6 +149,7 @@ impl Detector {
             input_size_source,
             output,
             allow_label_mismatch,
+            latency: LatencyWindow::new(),
         })
     }
 
@@ -144,7 +206,13 @@ impl Detector {
             shape: [1i64, 3, self.input_size.h as i64, self.input_size.w as i64],
             values: tensor,
         };
+        // Timed around `run` alone — raw inference, no decode — so the number
+        // is comparable across backends and to the phase-0 spike's. `kind` is
+        // read first: the returned tensors keep `backend` mutably borrowed.
+        let kind = self.backend.kind();
+        let started = Instant::now();
         let tensors = self.backend.run(input)?;
+        self.latency.record(started.elapsed(), kind);
         // Extract every role this profile reads, by the name settled at
         // startup, so a two-tensor family never depends on output ordering.
         let raw: Outputs<Raw> = match &self.outputs {
@@ -175,29 +243,63 @@ mod tests {
     use super::*;
 
     /// The stub refusal is the whole operator-visible behaviour of the
-    /// `--backend` seam, and it must fire before any model access — proven
-    /// here by a path that does not exist.
+    /// `--backend` seam for a backend that has not landed, and it must fire
+    /// before any model access — proven here by a path that does not exist.
     #[test]
-    fn stub_backends_are_refused_before_any_model_access() {
-        for (kind, artifact) in [(BackendKind::Rknn, ".rknn"), (BackendKind::Qnn, ".onnx")] {
-            // Not `unwrap_err`: `Detector` has no `Debug`, deliberately.
-            let err = match Detector::open(
-                Path::new("does/not/exist"),
-                kind,
-                None,
-                None,
-                &Labels::load(None).unwrap(),
-                false,
-            ) {
-                Ok(_) => panic!("stub backend {kind} opened"),
-                Err(err) => err,
-            };
-            let msg = err.to_string();
-            assert!(
-                msg.contains(&format!("backend {kind} is not yet implemented")),
-                "{msg}"
-            );
-            assert!(msg.contains(artifact), "{msg}");
-        }
+    fn stub_backend_is_refused_before_any_model_access() {
+        // Not `unwrap_err`: `Detector` has no `Debug`, deliberately.
+        let err = match Detector::open(
+            Path::new("does/not/exist"),
+            BackendKind::Rknn,
+            None,
+            None,
+            &Labels::load(None).unwrap(),
+            false,
+            QnnOptions::default(),
+        ) {
+            Ok(_) => panic!("stub backend rknn opened"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("backend rknn is not yet implemented"), "{msg}");
+        assert!(msg.contains(".rknn"), "{msg}");
+    }
+
+    /// Nearest-rank on a known distribution: for 1..=100 ms sorted, p50 is
+    /// the 50th value and p95 the 95th — off-by-one here would misreport
+    /// every latency line the D-P5 check reads.
+    #[test]
+    fn latency_percentiles_are_nearest_rank() {
+        let mut window = LatencyWindow::new();
+        window.window = (1..=100).map(Duration::from_millis).collect();
+        assert_eq!(window.percentile(50), Duration::from_millis(50));
+        assert_eq!(window.percentile(95), Duration::from_millis(95));
+        assert_eq!(window.percentile(100), Duration::from_millis(100));
+
+        // A window one short of the report boundary: ranks still in bounds.
+        window.window = (1..=99).map(Duration::from_millis).collect();
+        assert_eq!(window.percentile(50), Duration::from_millis(50));
+        assert_eq!(window.percentile(100), Duration::from_millis(99));
+    }
+
+    /// `qnn` without `--qnn-library` must fail on the missing flag, not on
+    /// the model path: the EP comes from a plugin library, and there is
+    /// nothing to open a session with until one is named.
+    #[test]
+    fn qnn_without_library_is_refused_before_any_model_access() {
+        let err = match Detector::open(
+            Path::new("does/not/exist"),
+            BackendKind::Qnn,
+            None,
+            None,
+            &Labels::load(None).unwrap(),
+            false,
+            QnnOptions::default(),
+        ) {
+            Ok(_) => panic!("qnn opened without a library"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("--qnn-library"), "{msg}");
     }
 }

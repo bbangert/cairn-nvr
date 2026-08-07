@@ -35,8 +35,9 @@ defmodule Cairn.Config.Profile do
   ```yaml
   # <a profile_dirs entry>/example.yml
   name: example              # optional; must match the filename when present
-  experimental: false        # true before any group may run a stubbed backend
-  backend: ort               # ort | rknn | qnn — only ort executes today
+  experimental: false        # true before any group may run a non-ort backend
+  backend: ort               # ort | rknn | qnn — qnn executes behind the
+                             # experimental gate; rknn is still a stub
   model:                     # per-backend artifact paths
     onnx: models/yolox_nano.onnx
   model_profile: yolox       # Rust catalog family name
