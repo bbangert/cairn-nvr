@@ -75,13 +75,20 @@ defmodule Cairn.TrackerTest do
   @small_car_creep 0.004
 
   defp det(label, bbox, opts \\ []) do
-    %{
+    object = %{
       label: label,
       bbox: bbox,
       score: Keyword.get(opts, :score, 0.9),
       track_id: Keyword.get(opts, :track_id),
       observation_kind: Keyword.get(opts, :kind, "detected")
     }
+
+    # Only-when-present, as `Cairn.PluginProtocol.validate_object/1` builds
+    # them: an embedder-less object has no :embedding key at all.
+    case Keyword.get(opts, :embedding) do
+      nil -> object
+      feature -> Map.put(object, :embedding, feature)
+    end
   end
 
   # `observed_at` defaults to the wall instant `at_ms` names, which is what the
@@ -109,7 +116,7 @@ defmodule Cairn.TrackerTest do
     # heard of any flag hands the tracker — and so that "off" and "absent"
     # are distinguishable things a test can compare. For `twin_mint` that
     # distinction is load-bearing in the other direction: absent means ON.
-    Enum.reduce([:bbd, :oru, :ocr, :twin_mint], context, fn key, context ->
+    Enum.reduce([:bbd, :oru, :ocr, :twin_mint, :reid], context, fn key, context ->
       case Keyword.fetch(opts, key) do
         {:ok, value} -> Map.put(context, key, value)
         :error -> context
@@ -4110,6 +4117,160 @@ defmodule Cairn.TrackerTest do
       assert tagged == []
       assert ids(events, :started) == []
       assert ids(events, :updated) == []
+    end
+  end
+
+  describe "appearance fusion (tracking.reid)" do
+    defp int8_axis(index) do
+      for i <- 0..3, into: <<>>, do: <<if(i == index, do: 127, else: 0)::signed-8>>
+    end
+
+    test "state rolls on detected boxes only, and only under the flag" do
+      box = [0.10, 0.40, 0.20, 0.20]
+
+      # Flag off: no key, ever — the byte-stability half of D-A4.
+      {off, _, _} = track(Tracker.new(), [det("person", box, embedding: int8_axis(0))], at_ms: 0)
+      [{_id, plain}] = Map.to_list(off.objects)
+      refute Map.has_key?(plain, :embedding)
+
+      # Flag on: minted with state, rolled by a detected box…
+      {on, tagged, _} =
+        track(Tracker.new(), [det("person", box, embedding: int8_axis(0))],
+          at_ms: 0,
+          reid: true
+        )
+
+      [%{object_id: id}] = tagged
+      assert is_list(on.objects[id][:embedding])
+      seeded_state = on.objects[id][:embedding]
+
+      # …but a seeded (tracked) re-report moves nothing.
+      {after_seed, _, _} =
+        track(
+          on,
+          [det("person", box, kind: "tracked", embedding: int8_axis(1))],
+          at_ms: 500,
+          reid: true
+        )
+
+      assert after_seed.objects[id][:embedding] == seeded_state
+
+      # A detected box does move it.
+      {after_detect, _, _} =
+        track(on, [det("person", box, embedding: int8_axis(1))], at_ms: 500, reid: true)
+
+      refute after_detect.objects[id][:embedding] == seeded_state
+    end
+
+    test "a stationary track's appearance is frozen" do
+      steps = for ms <- 0..24, do: {ms * 500, [0.60, 0.40, 0.20, 0.20]}
+
+      {tracker, tagged, _} =
+        Enum.reduce(steps, {Tracker.new(), [], []}, fn {ms, bbox}, {tracker, _, _} ->
+          track(tracker, [det("person", bbox, embedding: int8_axis(0))],
+            at_ms: ms,
+            reid: true
+          )
+        end)
+
+      [%{object_id: parked, stationary: true}] = tagged
+      frozen = tracker.objects[parked][:embedding]
+      assert is_list(frozen)
+
+      # Something occludes the parked person; its crop arrives on the same
+      # matched box. The rolling state must not absorb the occluder.
+      {tracker, _, _} =
+        track(tracker, [det("person", [0.60, 0.40, 0.20, 0.20], embedding: int8_axis(1))],
+          at_ms: 12_600,
+          reid: true
+        )
+
+      assert tracker.objects[parked][:embedding] == frozen
+    end
+
+    test "the rolling state survives suspension and rolls on after adoption" do
+      box = [0.30, 0.40, 0.10, 0.20]
+
+      {tracker, tagged, _} =
+        track(Tracker.new(), [det("person", box, embedding: int8_axis(0))],
+          at_ms: 0,
+          reid: true
+        )
+
+      [%{object_id: id}] = tagged
+      before_cut = tracker.objects[id][:embedding]
+      assert is_list(before_cut)
+
+      # A stream reset: the track suspends carrying its appearance…
+      {tracker, _events, _info} = Tracker.suspend(tracker, 128, 500)
+      assert tracker.objects == %{}
+
+      # …and adoption in the new epoch revives it, state intact. Adoption
+      # weighs the stitch overlap alone — a stale appearance can never veto
+      # a track's own resumption.
+      {tracker, tagged, events} =
+        track(tracker, [det("person", box, embedding: int8_axis(1))],
+          at_ms: 1_000,
+          epoch: "epoch_two",
+          reid: true
+        )
+
+      assert [%{object_id: ^id}] = tagged
+      assert :adopted in Enum.map(events, fn {kind, _track} -> kind end)
+
+      # The adopting detection was a real one, so the roll resumed from the
+      # preserved state rather than reseeding.
+      after_adopt = tracker.objects[id][:embedding]
+      assert is_list(after_adopt)
+      refute after_adopt == before_cut
+      assert after_adopt != Cairn.Tracker.Reid.dequant(int8_axis(1))
+    end
+
+    test "the veto keeps a coasted identity from taking a stranger" do
+      # The BBD-shaped fixture: a track coasts, and a same-label box appears
+      # a short hop from the prediction — no overlap, inside BBD's distance
+      # gate. With matching appearance the identity resumes; with clashing
+      # appearance the veto refuses the pair and the stranger mints.
+      mint = fn ->
+        {tracker, tagged, _} =
+          track(
+            Tracker.new(),
+            [det("person", [0.10, 0.40, 0.10, 0.20], embedding: int8_axis(0))],
+            at_ms: 0,
+            bbd: true,
+            reid: true
+          )
+
+        [%{object_id: id}] = tagged
+        {tracker, [], _} = track(tracker, [], at_ms: 500, bbd: true, reid: true)
+        {tracker, id}
+      end
+
+      hop = [0.28, 0.40, 0.10, 0.20]
+
+      {tracker, id} = mint.()
+
+      {_tracker, tagged, _} =
+        track(tracker, [det("person", hop, embedding: int8_axis(0))],
+          at_ms: 1_000,
+          bbd: true,
+          reid: true
+        )
+
+      assert [%{object_id: ^id}] = tagged
+
+      {tracker, id} = mint.()
+
+      {_tracker, tagged, events} =
+        track(tracker, [det("person", hop, embedding: int8_axis(1))],
+          at_ms: 1_000,
+          bbd: true,
+          reid: true
+        )
+
+      assert [%{object_id: stranger}] = tagged
+      refute stranger == id
+      assert ids(events, :started) == [stranger]
     end
   end
 end

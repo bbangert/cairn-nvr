@@ -38,7 +38,7 @@ events:
   max_event_seconds: 300
 
 # Object tracking (the three bounds here are per-camera overridable under the
-# camera; bbd, oru and ocr are not — see the note under them).
+# camera; bbd, oru, ocr and reid are not — see the note under them).
 # A track that goes unseen for this much *stream* time is ended — five times
 # that while it is stationary, so a parked object outlasts what parks in front
 # of it; its object_id (a ULID) is never handed to anything else.
@@ -73,14 +73,26 @@ events:
 # recovery a mover that pauses behind an occluder and reappears where it
 # vanished needs, since its prediction has since drifted off that spot. A
 # stationary track is excluded, for bbd's reason. Off by default.
+# reid fuses appearance into matching: with an embedder plugin running, a
+# person detection's embedding (accepted on the wire but only used if this is
+# on) feeds a rolling per-track appearance, and the bbd admission gains an
+# appearance veto and a cost tiebreak from it. Its only seam into the tracker
+# is that admission, so reid: true requires bbd: true — config load refuses
+# the combination of reid: true with bbd: false rather than accept a flag that
+# can never act. Off by default: the fusion is unmeasured until phase-6 E2E
+# and its veto threshold is provisional until then.
 #
-# None of the three has a per-camera form: they describe the matcher and the
+# None of the four has a per-camera form: they describe the matcher and the
 # motion filter rather than a scene, so they are one answer for every camera
 # that is not covered by a hardware profile. A profile is the other way to
-# answer them — per plugin group, i.e. per piece of hardware — and for the
-# cameras on a profiled group these three keys are ignored entirely, with a
-# warning at load saying the profile won. See docs/profile-authoring.md;
-# profiles are the migration target for all three, and there is no deadline.
+# answer bbd, oru and ocr — per plugin group, i.e. per piece of hardware — and
+# for the cameras on a profiled group those three keys are ignored entirely,
+# with a warning at load saying the profile won. reid does not have a profile
+# form yet and is not superseded by one — it keeps applying to a profiled
+# camera too, for whatever bbd the group's own stage list leaves it (a load
+# warning names a profiled group whose stage list leaves bbd out, since reid
+# does nothing there either). See docs/profile-authoring.md; profiles are the
+# migration target for bbd/oru/ocr, and there is no deadline.
 tracking:
   max_unseen_ms: 3000
   max_live_tracks: 128
@@ -88,6 +100,7 @@ tracking:
   bbd: false
   oru: false
   ocr: false
+  reid: false
 
 # Days to keep event clips; per-label overrides win. Track rows keep their own
 # clock (tracks_days) and are exempt from emergency disk cleanup.

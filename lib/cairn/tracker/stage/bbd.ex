@@ -35,6 +35,19 @@ defmodule Cairn.Tracker.Stage.Bbd do
   pass already took is skipped by the seeded reduce, so pre-filtering
   spent tracks changes nothing but the length of the list sorted.
 
+  ## Appearance fusion (`tracking.reid`)
+
+  With `tracking.reid` on, appearance enters this admission exactly here
+  (D-A4): a pair whose track and detection both carry an embedding is
+  refused when their cosine distance exceeds `Cairn.Tracker.Reid`'s veto,
+  and the sort cost becomes `{geometric distance, appearance distance}` —
+  geometry stays primary (the soak measured it), appearance breaks its
+  ties. A pair missing either side's feature is admitted and ranked exactly
+  as the flag-off pair would be at its geometry, with a neutral appearance
+  component: no feature is no evidence, in neither direction. Flag off,
+  costs are the bare geometric distance and this stage is bit-for-bit what
+  the soak measured.
+
   ## Gating
 
   A listed stage runs unconditionally — there is no flag test in here. What
@@ -51,6 +64,7 @@ defmodule Cairn.Tracker.Stage.Bbd do
   alias Cairn.Tracker
   alias Cairn.Tracker.Batch
   alias Cairn.Tracker.Bbd
+  alias Cairn.Tracker.Reid
 
   @impl true
   def call(batch, _params) do
@@ -75,6 +89,7 @@ defmodule Cairn.Tracker.Stage.Bbd do
   defp pairs(batch) do
     indexed = admitting(batch)
     context = batch.context
+    features = det_features(batch, indexed)
 
     # `candidates` outermost, unlike the IoU comprehension in `Cairn.Tracker`:
     # the elapsed time is a property of the track alone, so this computes one
@@ -88,12 +103,53 @@ defmodule Cairn.Tracker.Stage.Bbd do
           tracked.label == object.label,
           Tracker.iou(predicted, object.bbox) < Tracker.match_threshold(tracked, context),
           distance = Bbd.distance(predicted, object.bbox, delta_tau_s),
-          Bbd.admit?(distance) do
-        {distance, index, id}
+          Bbd.admit?(distance),
+          appearance = appearance(tracked, Map.get(features, index)),
+          appearance != :veto do
+        {cost(distance, appearance, batch), index, id}
       end
 
-    Enum.sort_by(pairs, fn {distance, index, id} -> {distance, index, id} end)
+    Enum.sort_by(pairs, fn {cost, index, id} -> {cost, index, id} end)
   end
+
+  # Flag on, every pair's cost is the `{distance, appearance}` tuple,
+  # uniformly, so the sort never compares a tuple against a float. Any other
+  # context — flag off, flag absent — costs the bare geometric distance, the
+  # byte-identical spelling the soak measured.
+  defp cost(distance, appearance, %Batch{context: %{reid: true}}), do: {distance, appearance}
+  defp cost(distance, _appearance, _batch), do: distance
+
+  # The neutral appearance for a pair missing either side's feature: worse
+  # than any plausible same-person distance, better than the veto — absent
+  # evidence outranks nothing and is outranked by real agreement.
+  @neutral_appearance 0.5
+
+  defp appearance(_tracked, nil), do: @neutral_appearance
+
+  defp appearance(tracked, feature) do
+    with rolling when is_list(rolling) <- Map.get(tracked, :embedding),
+         appearance when is_float(appearance) <- Reid.distance(rolling, feature) do
+      if appearance > Reid.veto_distance(), do: :veto, else: appearance
+    else
+      _missing -> @neutral_appearance
+    end
+  end
+
+  # One dequantization per embedded detection per pass, not one per pair.
+  # Empty — costing nothing to build or probe — whenever the flag is off or
+  # nothing on the line carried a feature.
+  defp det_features(%Batch{context: %{reid: true}}, indexed) do
+    for {object, index} <- indexed,
+        feature = Map.get(object, :embedding),
+        is_binary(feature),
+        vector = Reid.dequant(feature),
+        is_list(vector),
+        into: %{} do
+      {index, vector}
+    end
+  end
+
+  defp det_features(_batch, _indexed), do: %{}
 
   defp admitting(%Batch{association: :one} = batch), do: batch.above_floor
   defp admitting(%Batch{association: :two} = batch), do: batch.below_floor

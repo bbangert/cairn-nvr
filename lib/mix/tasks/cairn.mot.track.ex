@@ -25,6 +25,11 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
       matching production defaults)
     * `--oru` / `--no-oru` — observation-reuse stage (default off)
     * `--ocr` / `--no-ocr` — observation-centric recovery stage (default off)
+    * `--reid` / `--no-reid` — Re-ID appearance fusion inside the bbd admission
+      (default off). A tracker-only run carries no embeddings — no plugin runs
+      here to produce them — so this flag only matters once a det file (or a
+      future E2E run) carries the phase-4 embedding field for the fusion to
+      read; until then it is accepted but inert.
     * `--twin-mint` / `--no-twin-mint` — twin-mint guard (default on)
     * `--min-score FLOAT` — tracker admission floor (`min_score`
       `"default"` key; default 0.5). `0.0` floors nothing.
@@ -54,6 +59,7 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
     bbd: :boolean,
     oru: :boolean,
     ocr: :boolean,
+    reid: :boolean,
     twin_mint: :boolean,
     min_score: :float,
     det_min: :float,
@@ -197,6 +203,7 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
       bbd: Keyword.get(opts, :bbd, false),
       oru: Keyword.get(opts, :oru, false),
       ocr: Keyword.get(opts, :ocr, false),
+      reid: Keyword.get(opts, :reid, false),
       twin_mint: Keyword.get(opts, :twin_mint, true)
     }
   end

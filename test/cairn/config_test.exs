@@ -262,6 +262,81 @@ defmodule Cairn.ConfigTest do
       end
     end
 
+    test "tracking.reid is a known key, off unless set, and reaches the policy" do
+      {:ok, defaults, []} = Config.from_map(base_map())
+      [cam_a, _cam_b] = defaults.cameras
+      refute defaults.reid
+      refute Config.default_reid()
+      refute Config.policy(defaults, cam_a).reid
+
+      {:ok, config, warnings} =
+        base_map()
+        |> Map.put("tracking", %{"reid" => true, "bbd" => true})
+        |> Config.from_map()
+
+      [cam_a, cam_b] = config.cameras
+      refute Enum.any?(warnings, &(&1 =~ "reid"))
+
+      # every camera or none: reid is one decision for the fleet, so unlike
+      # the three bounds beside it there is no per-camera form of it
+      assert Config.policy(config, cam_a).reid
+      assert Config.policy(config, cam_b).reid
+
+      # an explicit off is off whatever the default says, and a truthy
+      # non-boolean is a typo rather than an opt-in — only `true` enables
+      for {value, name} <- [{false, "explicit false"}, {"true", "a string"}, {1, "an integer"}] do
+        {:ok, config, _warnings} =
+          base_map()
+          |> Map.put("tracking", %{"reid" => value, "bbd" => true})
+          |> Config.from_map()
+
+        refute config.reid, name
+      end
+    end
+
+    test "tracking.reid requires tracking.bbd where the global flag reaches" do
+      # The refusal is scoped to cameras the global booleans govern: one
+      # camera with an inline plugin command is enough to be refused.
+      plugged =
+        update_in(base_map(), ["cameras"], fn [a, b] ->
+          [Map.put(a, "plugin", "detect --model m.onnx"), b]
+        end)
+
+      assert {:error, errors} =
+               plugged
+               |> Map.put("tracking", %{"reid" => true})
+               |> Config.from_map()
+
+      assert Enum.any?(errors, &(&1 =~ "tracking.reid requires tracking.bbd"))
+
+      assert {:error, errors} =
+               plugged
+               |> Map.put("tracking", %{"reid" => true, "bbd" => false})
+               |> Config.from_map()
+
+      assert Enum.any?(errors, &(&1 =~ "tracking.reid requires tracking.bbd"))
+
+      assert {:ok, config, []} =
+               plugged
+               |> Map.put("tracking", %{"reid" => true, "bbd" => true})
+               |> Config.from_map()
+
+      assert config.reid
+      assert config.bbd
+      [cam_a, _cam_b] = config.cameras
+      assert Config.policy(config, cam_a).reid
+      assert Config.policy(config, cam_a).bbd
+
+      # No plugin-bearing camera reads the global flags, so nothing is
+      # refused over them — a config the flag cannot reach is not an error
+      # (a fully-profiled deployment answers to its profiles' stage lists,
+      # and the per-group warning names any profile that silences reid).
+      assert {:ok, _config, _warnings} =
+               base_map()
+               |> Map.put("tracking", %{"reid" => true})
+               |> Config.from_map()
+    end
+
     test "retention.tracks_days defaults to a year and parses" do
       assert {:ok, default, []} = Config.from_map(base_map())
       assert default.retention_tracks_days == 365
@@ -1662,6 +1737,7 @@ defmodule Cairn.ConfigTest do
                bbd: false,
                oru: false,
                ocr: false,
+               reid: false,
                track: nil,
                record: nil
              }

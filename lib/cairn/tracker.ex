@@ -526,6 +526,7 @@ defmodule Cairn.Tracker do
   alias Cairn.Track
   alias Cairn.Tracker.Batch
   alias Cairn.Tracker.Kalman
+  alias Cairn.Tracker.Reid
   alias Cairn.Tracker.Stage
   alias Cairn.ULID
 
@@ -807,12 +808,13 @@ defmodule Cairn.Tracker do
   @typedoc """
   Everything about the observation the tracker needs, and nothing else.
 
-  The five optional keys are the five the code reads with `Map.get/2`: a
-  caller may build a context without them — `context/3` always writes all
-  five — and absence means the same as their defaults. For the first four
-  that is off: no floor, no second admission, no gap replay, no recovery.
-  For `twin_mint` it is **on** — absence preserves the cold-start twin gate
-  every deployment already has, and only an explicit `false` delists it.
+  The optional keys are exactly the ones the code reads with `Map.get/2`:
+  a caller may build a context without them — `context/3` always writes
+  every one — and absence means the same as each default. That default is
+  off for all of them except `twin_mint`: no floor, no second admission,
+  no gap replay, no recovery, no appearance fusion. For `twin_mint` it is
+  **on** — absence preserves the cold-start twin gate every deployment
+  already has, and only an explicit `false` delists it.
   """
   @type context :: %{
           :camera_id => String.t() | nil,
@@ -826,7 +828,8 @@ defmodule Cairn.Tracker do
           optional(:bbd) => boolean() | Stage.params(),
           optional(:oru) => boolean() | Stage.params(),
           optional(:ocr) => boolean() | Stage.params(),
-          optional(:twin_mint) => boolean() | Stage.params()
+          optional(:twin_mint) => boolean() | Stage.params(),
+          optional(:reid) => boolean()
         }
 
   @typedoc """
@@ -848,6 +851,7 @@ defmodule Cairn.Tracker do
           optional(:oru) => boolean(),
           optional(:ocr) => boolean(),
           optional(:twin_mint) => boolean(),
+          optional(:reid) => boolean(),
           optional(:stages) => %{optional(atom()) => Stage.params()}
         }
 
@@ -912,7 +916,12 @@ defmodule Cairn.Tracker do
       bbd: stage_setting(policy, :bbd, false),
       oru: stage_setting(policy, :oru, false),
       ocr: stage_setting(policy, :ocr, false),
-      twin_mint: stage_setting(policy, :twin_mint, true)
+      twin_mint: stage_setting(policy, :twin_mint, true),
+      # Not a stage flag: `tracking.reid` modifies what the BBD admission
+      # weighs (see "Appearance fusion" in `Cairn.Tracker.Stage.Bbd`) and
+      # gates the per-track rolling-embedding writes, so it resolves as a
+      # plain boolean on both the boolean and the profiled path.
+      reid: Map.get(policy, :reid, false) == true
     }
   end
 
@@ -2022,7 +2031,8 @@ defmodule Cairn.Tracker do
         # stronger reason than `pending_exit_ms`: `Cairn.Tracker.Kalman`'s
         # cardinal rule is that nothing it produces may be stored or emitted.
         kalman: Kalman.init(object.bbox)
-      },
+      }
+      |> reid_state(object, detected?, context),
       context
     )
   end
@@ -2054,6 +2064,30 @@ defmodule Cairn.Tracker do
     }
     |> stillness(object, detected?, previous_detected_ms, context)
     |> stale(context)
+    |> reid_state(object, detected?, context)
+  end
+
+  # The rolling appearance state, D-A4's track half: a unit-norm EMA over
+  # detected observations' features, written only under `tracking.reid` — a
+  # flag-off tracker's maps are byte-identical to one that has never heard
+  # of the key, which is what keeps every existing golden still (the same
+  # only-when-present discipline `Cairn.PluginProtocol` applies to the wire
+  # field). Seeded boxes are excluded like they are from the filter: a
+  # re-report carries no fresh appearance. Stationary tracks are excluded
+  # with more cause — a parked object's crops are whatever occludes it, and
+  # absorbing the occluder's appearance is how a parked identity walks off
+  # with the passer-by on departure (stillness holds the box; this would
+  # hand it the face).
+  defp reid_state(tracked, object, detected?, context) do
+    with true <- Map.get(context, :reid, false),
+         true <- detected?,
+         false <- tracked.stationary,
+         feature when is_binary(feature) <- Map.get(object, :embedding),
+         vector when is_list(vector) <- Reid.dequant(feature) do
+      Map.put(tracked, :embedding, Reid.roll(Map.get(tracked, :embedding), vector))
+    else
+      _absent -> tracked
+    end
   end
 
   # The hook: each listed stage in order, each handed the previous one's

@@ -22,7 +22,7 @@ defmodule Cairn.Config do
   @known_events_keys ~w(pre_window_seconds post_window_seconds max_event_seconds)
   @known_retention_keys ~w(days per_label tracks_days)
   @known_integrations_keys ~w(token)
-  @known_tracking_keys ~w(max_unseen_ms max_live_tracks stationary_after_ms bbd oru ocr)
+  @known_tracking_keys ~w(max_unseen_ms max_live_tracks stationary_after_ms bbd oru ocr reid)
   @name_regex ~r/\A[a-z0-9][a-z0-9_-]*\z/
 
   # How long a track survives without being seen, in *media* time. Long
@@ -92,6 +92,9 @@ defmodule Cairn.Config do
   # Off by default: the soak baseline was measured without OCR recovery, and
   # turning it on is phase-6 E2E's to decide, not this default's.
   @default_ocr false
+  # Off by default: the appearance fusion is unmeasured until phase-6 E2E, and
+  # the veto threshold `Cairn.Tracker.Reid` uses is provisional until then.
+  @default_reid false
   # How long track rows outlive the clips they describe. Deliberately far
   # longer than `retention_days`: the track log is the instrument for tuning
   # the filters, and a year of "what did the system see and not record?" is the
@@ -118,6 +121,7 @@ defmodule Cairn.Config do
             bbd: @default_bbd,
             oru: @default_oru,
             ocr: @default_ocr,
+            reid: @default_reid,
             cameras: [],
             plugin_groups: [],
             profiles: %{},
@@ -215,6 +219,7 @@ defmodule Cairn.Config do
       bbd: configured_bbd(map),
       oru: configured_oru(map),
       ocr: configured_ocr(map),
+      reid: configured_reid(map),
       cameras: cameras,
       plugin_groups: plugin_groups,
       profiles: profiles,
@@ -284,6 +289,17 @@ defmodule Cairn.Config do
     end
   end
 
+  # Not `||`, on the same rule as its three neighbours: a boolean key has to
+  # read an explicit `false` as a value rather than as an absence, and only a
+  # literal `true` may turn appearance fusion on — a truthy non-boolean in the
+  # YAML is a typo, not an opt-in.
+  defp configured_reid(map) do
+    case get_in(map, ["tracking", "reid"]) do
+      nil -> @default_reid
+      value -> value === true
+    end
+  end
+
   # Global only: one clock for the whole track log, with none of the
   # per-camera or per-label forms `retention.days` has. Those exist to buy disk
   # back on clips. Splitting the audit record by label instead would make "what
@@ -319,6 +335,7 @@ defmodule Cairn.Config do
           :bbd => boolean(),
           :oru => boolean(),
           :ocr => boolean(),
+          :reid => boolean(),
           :track => Camera.tier() | nil,
           :record => Camera.tier() | nil,
           optional(:stages) => %{optional(atom()) => map()}
@@ -345,13 +362,18 @@ defmodule Cairn.Config do
       )
     )
     # Straight off the config and not through a `cam` reader: there is no
-    # per-camera form of these three (see `@default_bbd`/`@default_oru`/
-    # `@default_ocr`) — a *profiled* camera ignores them entirely, `stages`
-    # below superseding all three (the load-time warning in
-    # `validate_tracking/2` says which wins).
+    # per-camera form of these four (see `@default_bbd`/`@default_oru`/
+    # `@default_ocr`/`@default_reid`) — a *profiled* camera ignores the first
+    # three entirely, `stages` below superseding them (the load-time warning
+    # in `validate_tracking/2` says which wins). `reid` is not a stage and a
+    # profile cannot supersede it; it keeps applying to a profiled camera too,
+    # for whatever the group's stage list leaves its one seam (`bbd`) able to
+    # do (`warn_reid_without_bbd_stage/2` names the case where that is
+    # nothing).
     |> Map.put(:bbd, config.bbd)
     |> Map.put(:oru, config.oru)
     |> Map.put(:ocr, config.ocr)
+    |> Map.put(:reid, config.reid)
     |> Map.put(:track, cam.track)
     |> Map.put(:record, cam.record)
     |> put_stages(profile)
@@ -455,6 +477,10 @@ defmodule Cairn.Config do
   @doc "Whether observation-centric recovery is on when no config is available."
   @spec default_ocr() :: boolean()
   def default_ocr, do: @default_ocr
+
+  @doc "Whether Re-ID appearance fusion is on when no config is available."
+  @spec default_reid() :: boolean()
+  def default_reid, do: @default_reid
 
   @doc "Effective retention days for a camera and label."
   @spec retention_days(t(), Camera.t(), String.t()) :: pos_integer()
@@ -897,7 +923,39 @@ defmodule Cairn.Config do
     |> validate_tracking_key(config, :max_live_tracks, 1, 10_000)
     |> validate_tracking_key(config, :stationary_after_ms, 1_000, 3_600_000)
     |> validate_profile_bounds(config)
+    |> validate_reid_requires_bbd(config)
     |> warn_superseded_flags(config)
+    |> warn_reid_without_bbd_stage(config)
+  end
+
+  # Reid's fusion has one seam into the tracker: the BBD admission
+  # (`Cairn.Tracker.Reid`, `Cairn.Tracker.Stage.Bbd`). The global bbd flag
+  # governs exactly the cameras on *unprofiled* groups (D-P7), so the refusal
+  # is scoped to them: reid on, global bbd off, and at least one camera the
+  # global flag actually reaches is a configuration that can never act there
+  # — refused rather than accepted and left inert. A fully-profiled config
+  # answers to its profiles' own stage lists instead, where the per-group
+  # warning (`warn_reid_without_bbd_stage/2`) names any profile that
+  # silences reid — legitimately reid-capable profiles must not be refused
+  # over a global flag their cameras never read.
+  defp validate_reid_requires_bbd(acc, config) do
+    # "Unprofiled" spans both shapes the global flag reaches: a camera with
+    # its own inline plugin command, and a member of a group that has no
+    # profile. A camera with no plugin at all runs no tracker and holds no
+    # opinion.
+    unprofiled? =
+      Enum.any?(config.cameras, fn
+        %{plugin: {:inline, _argv}} -> true
+        %{plugin: {:group, _name}} = cam -> profile_for(config, cam) == nil
+        _camera -> false
+      end)
+
+    check(
+      acc,
+      not config.reid or config.bbd or not unprofiled?,
+      "tracking.reid requires tracking.bbd: the appearance fusion lives inside the BBD " <>
+        "admission and can never act without it (unprofiled cameras read the global flag)"
+    )
   end
 
   # A profile's band-tuned bounds go through `bound/3` into the same tracker
@@ -948,6 +1006,39 @@ defmodule Cairn.Config do
       acc
     end
   end
+
+  # `reid` is not a stage — a profile has no key for it and cannot list or
+  # delist it (see the comment on `policy/2`) — so it is never superseded the
+  # way `warn_superseded_flags/2` warns about. But its one seam is the bbd
+  # *stage*, and a profiled group whose stage list replaces the booleans and
+  # leaves bbd out silences it for that group's cameras just as surely as the
+  # global bbd flag being off would — worth naming, since nothing else here
+  # would tell an operator reid is doing nothing on that hardware.
+  defp warn_reid_without_bbd_stage(acc, config) do
+    if config.reid do
+      config.plugin_groups
+      |> Enum.filter(&reid_silenced_by_profile?/1)
+      |> Enum.reduce(acc, fn group, acc ->
+        add_warning(
+          acc,
+          "tracking.reid has no effect for group #{group.name}: its profile " <>
+            "#{group.profile.name} lists no bbd stage"
+        )
+      end)
+    else
+      acc
+    end
+  end
+
+  # A profile with no `tracking:` block at all (`stages: nil`) says nothing
+  # about tracking, so the group's cameras fall back to the global `bbd` flag
+  # like any unprofiled camera — not this function's case. Only a profile that
+  # *does* carry a stage list and leaves bbd off it silences reid.
+  defp reid_silenced_by_profile?(%PluginGroup{profile: %Profile{stages: stages}})
+       when is_map(stages),
+       do: not Map.has_key?(stages, :bbd)
+
+  defp reid_silenced_by_profile?(_group), do: false
 
   defp validate_tracking_key(acc, config, key, min, max) do
     values =
