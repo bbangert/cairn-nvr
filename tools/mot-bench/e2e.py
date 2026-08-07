@@ -184,7 +184,7 @@ def video_duration_s(video):
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "csv=p=0", str(video)],
-            capture_output=True, text=True, timeout=30)
+            capture_output=True, text=True, timeout=30, check=True)
         return float(out.stdout.strip())
     except Exception:
         return None
