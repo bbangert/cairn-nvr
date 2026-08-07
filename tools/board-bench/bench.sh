@@ -32,6 +32,15 @@ CLIP=${CLIP:-$BASE/bench-feed.ts}
 case ${SECS} in
 '' | *[!0-9]* | 0) echo "secs must be a positive integer" >&2; exit 1 ;;
 esac
+case ${NCAMS} in
+'' | *[!0-9]* | 0) echo "ncams must be a positive integer" >&2; exit 1 ;;
+esac
+if [ -n "${CAM_URLS:-}" ] && [ ! -r "$CAM_URLS" ]; then
+  # Refused, not fallen back from: a missing URL file silently becoming
+  # clip feeds would mislabel every number the run produces.
+  echo "CAM_URLS=$CAM_URLS is not readable" >&2
+  exit 1
+fi
 MB=${MODEL##*/}
 MB=${MB%.onnx}
 # Timestamped so a repeat run never overwrites its predecessor's raw

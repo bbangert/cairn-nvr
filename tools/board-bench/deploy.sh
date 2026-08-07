@@ -20,9 +20,15 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 CRATE=$ROOT/plugins/cairn-detect
 FF=$CRATE/target/board/ffmpeg-aarch64
 
-if [ ! -d "$FF/lib/pkgconfig" ]; then
+# Both halves checked: the installed tree (headers/libs for the cross
+# link) AND the ffmpeg program in the build tree — `make install` puts
+# only libs at the prefix as configured, so the binary ships from where
+# make left it.
+FFBIN=$CRATE/target/board/ffmpeg-7.1/ffmpeg
+if [ ! -d "$FF/lib/pkgconfig" ] || [ ! -f "$FFBIN" ]; then
   cat >&2 <<'EOF'
-missing aarch64 FFmpeg tree. One-time build (from plugins/cairn-detect/target/board):
+missing aarch64 FFmpeg tree (or its ffmpeg binary). One-time build
+(from plugins/cairn-detect/target/board):
   curl -LO https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz && tar xf ffmpeg-7.1.tar.xz
   cd ffmpeg-7.1 && ./configure --prefix=../ffmpeg-aarch64 \
     --enable-cross-compile --cross-prefix=aarch64-linux-gnu- \
@@ -43,7 +49,7 @@ ssh "$BOARD" 'File.mkdir_p!("/data/cairn-bench/lib"); File.mkdir_p!("/data/cairn
 scp "$CRATE/target/aarch64-unknown-linux-gnu/release/cairn-detect" \
   "$CRATE/coco.names" "$ROOT/tools/board-bench/bench.sh" \
   "$BOARD:/data/cairn-bench/" || true
-scp "$CRATE/target/board/ffmpeg-7.1/ffmpeg" \
+scp "$FFBIN" \
   "$FF"/lib/libav*.so.* "$FF"/lib/libsw*.so.* \
   "$BOARD:/data/cairn-bench/lib/" || true
 # Models: every QDQ artifact present locally rides along.
