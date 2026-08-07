@@ -31,10 +31,16 @@ Two venvs, deliberately separate:
 Then quantize (any family):
 
 ```bash
-model/quant-venv/bin/python3 tools/qdq-export/qdq_quantize.py \
+plugins/cairn-detect/model/quant-venv/bin/python3 tools/qdq-export/qdq_quantize.py \
   plugins/cairn-detect/yolo26s.onnx plugins/cairn-detect/yolo26s-qdq.onnx \
   --calib-dir plugins/cairn-detect/model/calib_frames_fullres
 ```
+
+Activations default to uint16 (w8a16): full-coverage w8a8 crushed
+yolox_nano's fixture scores from 0.50–0.72 down to 0.20–0.49 — every
+detection under the plugin's default 0.5 floor. `--activation uint8`
+remains for latency-critical use (on the board: a8 ≈ 8–12 ms vs a16
+≈ 15.5 ms p50 for yolox_nano 416 on HTP).
 
 ## Calibration frames
 
@@ -64,10 +70,12 @@ here before any on-board run.
 ## Alternatives considered
 
 Ultralytics ships a first-party `format="qnn"` export (w8a16 QDQ + a
-pre-compiled ORT QNN context binary). Not used: the context binary pins
-a QAIRT version, its calibration is not our cameras', and our w8a8
-per-channel flow is the one the phase-0 spike proved on this exact
-board stack. Revisit if per-model accuracy demands w8a16 activations.
+pre-compiled ORT QNN context binary). Its precision choice agrees with
+ours — w8a16 — but the context binary pins a QAIRT version and its
+calibration is not our cameras', so this pipeline keeps its own
+calibrated flow on the spike-proven stack. Revisit the context binary
+if session-load time (graph prepare is ~1s per model on-device) ever
+matters more than calibration control.
 
 ## On-board reality checks
 

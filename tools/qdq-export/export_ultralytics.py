@@ -31,7 +31,11 @@ import shutil
 def export(name, imgsz, out_dir):
     from ultralytics import YOLO
 
-    model = YOLO(f"{name}.pt")  # downloads to the CWD/ultralytics cache
+    # Weights download relative to the CWD; pin it here so the .pt always
+    # lands next to this script, where this directory's .gitignore covers
+    # it — run from the repo root it would otherwise land unignored.
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    model = YOLO(f"{name}.pt")
     path = model.export(format="onnx", imgsz=imgsz, end2end=False, opset=13)
     dest = os.path.join(out_dir, f"{name}.onnx")
     if os.path.abspath(path) != os.path.abspath(dest):

@@ -32,21 +32,24 @@ fi
 
 OUT=$(mktemp -t verify_artifact_XXXXXX.ndjson)
 ERR="${OUT%.ndjson}.err"
-trap 'rm -f "$OUT" "$ERR"' EXIT
+PLUGIN=""
+trap 'kill "${PLUGIN:-}" 2>/dev/null; rm -f "$OUT" "$ERR"' EXIT
 
 # The brace group is the control channel: the plugin emits nothing
 # without a stream epoch, and exits on stdin EOF — the trailing sleep
-# bounds the run (verify/README.md).
+# bounds the run (verify/README.md). Its margin over SECS must exceed
+# the startup wait below, or a slow model load truncates the feed.
 {
   echo '{"spec":"cairn.plugin","version":1,"type":"stream.started","camera_id":"test","stream_epoch":"01K0QDQVERIFY0000000000000","rtp":{"clock_rate":90000}}'
-  sleep $((SECS + 8))
+  sleep $((SECS + 30))
 } | "$BIN" --model "$MODEL" --labels "$ROOT/plugins/cairn-detect/coco.names" \
     --camera-id test --udp-port "$PORT" --min-score-json "$MIN_SCORE_JSON" \
     --decoder sw "$@" > "$OUT" 2> "$ERR" &
 PLUGIN=$!
 
 # Feed only after the model has loaded: the RTP listener opens after it.
-for _ in $(seq 60); do
+# 25s ceiling, under the control channel's 30s margin above.
+for _ in $(seq 50); do
   grep -q "cairn-detect up:" "$ERR" && break
   sleep 0.5
 done

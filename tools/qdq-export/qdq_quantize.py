@@ -6,13 +6,14 @@ islands — right for CPU-EP accuracy, fatal on HTP: v68 rejects FP32 ops,
 a conv-island model fragments into unclaimable pieces, and an ORT NHWC
 MaxPool layout bug then aborts session creation (phase-0 spike,
 tools/qnn-spike/README.md). This tool is the productionized form of the
-spike's spike_quant.py: quantize every op ORT supports (w8a8,
-per-channel, opset upgraded to >= 13), reusing quantize_model.py's
-calibration reader and per-family preprocessing so calibration tensors
-match what the plugin feeds the model at runtime.
+spike's spike_quant.py: quantize every op ORT supports (weights int8
+per-channel, activations uint16 by default — see `--activation` for the
+measured why), reusing quantize_model.py's calibration reader and
+per-family preprocessing so calibration tensors match what the plugin
+feeds the model at runtime.
 
 Usage:
-  qdq_quantize.py <fp32-model.onnx> <out-qdq.onnx> [--calib-dir DIR]
+  qdq_quantize.py <fp32-model.onnx> <out-qdq.onnx> --calib-dir DIR
 
 Idempotent: same inputs -> same graph (calibration is deterministic over
 a fixed frame set; ORT's quantizer is single-threaded and ordered).
@@ -20,8 +21,8 @@ a fixed frame set; ORT's quantizer is single-threaded and ordered).
 Known traps (measured, see docs/npu-backends.md and the spike README):
 - yolov10/YOLO26-family exports carrying the end-to-end selection tail
   (TopK/Gather) SEGFAULT QNN 2.4.0 at first inference once quantized.
-  Strip the tail first (strip_e2e_tail.py) and let the host decode the
-  raw head.
+  Export with `end2end=False` (export_ultralytics.py) and let the host
+  decode the raw head.
 - Do NOT hand this tool's output to the CPU-tuned int8 flow or vice
   versa: the artifacts are named differently on purpose (`-qdq` vs
   `-int8`), and the profile schema keys them separately (`model.qnn:`
@@ -114,11 +115,12 @@ def main():
     ap.add_argument("out", help="QDQ .onnx output (name it <model>-qdq.onnx)")
     ap.add_argument(
         "--calib-dir",
-        default=os.path.join(REPO_MODEL_DIR, "calib_frames"),
+        required=True,
         help="Calibration frame directory (PNG/JPEG). The profile's own "
         "resize/encoding is applied at load, so full-resolution frames "
-        "work for every family; pre-letterboxed 416 frames are a fixed "
-        "point for yolox only.",
+        "(capture_frames.sh) work for every family. Required, no "
+        "default: the tempting default — the 416 pre-letterboxed yolox "
+        "set — silently miscalibrates every stretch family.",
     )
     ap.add_argument(
         "--activation",
