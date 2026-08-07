@@ -22,7 +22,7 @@ defmodule Cairn.Config do
   @known_events_keys ~w(pre_window_seconds post_window_seconds max_event_seconds)
   @known_retention_keys ~w(days per_label tracks_days)
   @known_integrations_keys ~w(token)
-  @known_tracking_keys ~w(max_unseen_ms max_live_tracks stationary_after_ms bbd oru)
+  @known_tracking_keys ~w(max_unseen_ms max_live_tracks stationary_after_ms bbd oru ocr)
   @name_regex ~r/\A[a-z0-9][a-z0-9_-]*\z/
 
   # How long a track survives without being seen, in *media* time. Long
@@ -89,6 +89,9 @@ defmodule Cairn.Config do
   # every camera not covered by a profile, and a profiled group's stage list
   # supersedes it.
   @default_oru false
+  # Off by default: the soak baseline was measured without OCR recovery, and
+  # turning it on is phase-6 E2E's to decide, not this default's.
+  @default_ocr false
   # How long track rows outlive the clips they describe. Deliberately far
   # longer than `retention_days`: the track log is the instrument for tuning
   # the filters, and a year of "what did the system see and not record?" is the
@@ -114,6 +117,7 @@ defmodule Cairn.Config do
             stationary_after_ms: @default_stationary_after_ms,
             bbd: @default_bbd,
             oru: @default_oru,
+            ocr: @default_ocr,
             cameras: [],
             plugin_groups: [],
             profiles: %{},
@@ -210,6 +214,7 @@ defmodule Cairn.Config do
       stationary_after_ms: configured_stationary_after_ms(map),
       bbd: configured_bbd(map),
       oru: configured_oru(map),
+      ocr: configured_ocr(map),
       cameras: cameras,
       plugin_groups: plugin_groups,
       profiles: profiles,
@@ -268,6 +273,17 @@ defmodule Cairn.Config do
     end
   end
 
+  # Not `||`, on the same rule as its two neighbours: a boolean key has to read
+  # an explicit `false` as a value rather than as an absence, and only a literal
+  # `true` may turn recovery on — a truthy non-boolean in the YAML is a typo,
+  # not an opt-in.
+  defp configured_ocr(map) do
+    case get_in(map, ["tracking", "ocr"]) do
+      nil -> @default_ocr
+      value -> value === true
+    end
+  end
+
   # Global only: one clock for the whole track log, with none of the
   # per-camera or per-label forms `retention.days` has. Those exist to buy disk
   # back on clips. Splitting the audit record by label instead would make "what
@@ -302,6 +318,7 @@ defmodule Cairn.Config do
           :stationary_after_ms => pos_integer(),
           :bbd => boolean(),
           :oru => boolean(),
+          :ocr => boolean(),
           :track => Camera.tier() | nil,
           :record => Camera.tier() | nil,
           optional(:stages) => %{optional(atom()) => map()}
@@ -328,11 +345,13 @@ defmodule Cairn.Config do
       )
     )
     # Straight off the config and not through a `cam` reader: there is no
-    # per-camera form of these two (see `@default_bbd`/`@default_oru`) —
-    # a *profiled* camera ignores them entirely, `stages` below superseding
-    # both (the load-time warning in `validate_tracking/2` says which wins).
+    # per-camera form of these three (see `@default_bbd`/`@default_oru`/
+    # `@default_ocr`) — a *profiled* camera ignores them entirely, `stages`
+    # below superseding all three (the load-time warning in
+    # `validate_tracking/2` says which wins).
     |> Map.put(:bbd, config.bbd)
     |> Map.put(:oru, config.oru)
+    |> Map.put(:ocr, config.ocr)
     |> Map.put(:track, cam.track)
     |> Map.put(:record, cam.record)
     |> put_stages(profile)
@@ -344,7 +363,7 @@ defmodule Cairn.Config do
   defp bound(camera, profile, global), do: camera || profile || global
 
   # The whole of what a profile changes about tracking policy: the stage
-  # presence map replaces the boolean pair for every camera on the profiled
+  # presence map replaces the boolean flags for every camera on the profiled
   # group. Unprofiled cameras — and cameras on a profile that had no
   # `tracking:` block, which said nothing about tracking — get no `stages`
   # key at all, which is what keeps their path (through
@@ -432,6 +451,10 @@ defmodule Cairn.Config do
   @doc "Whether gap replay is on when no config is available."
   @spec default_oru() :: boolean()
   def default_oru, do: @default_oru
+
+  @doc "Whether observation-centric recovery is on when no config is available."
+  @spec default_ocr() :: boolean()
+  def default_ocr, do: @default_ocr
 
   @doc "Effective retention days for a camera and label."
   @spec retention_days(t(), Camera.t(), String.t()) :: pos_integer()
@@ -911,14 +934,14 @@ defmodule Cairn.Config do
   # a profiled group ignores them, and setting both is legal but ambiguous
   # enough to name — one warning per profiled group, saying which side wins.
   defp warn_superseded_flags(acc, config) do
-    if config.bbd or config.oru do
+    if config.bbd or config.oru or config.ocr do
       config.plugin_groups
       |> Enum.filter(&match?(%Profile{}, &1.profile))
       |> Enum.reduce(acc, fn group, acc ->
         add_warning(
           acc,
           "plugin #{group.name}: profile #{group.profile.name} supersedes the global " <>
-            "tracking.bbd/oru flags for its cameras — the profile's stage list wins"
+            "tracking.bbd/oru/ocr flags for its cameras — the profile's stage list wins"
         )
       end)
     else

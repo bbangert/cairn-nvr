@@ -109,7 +109,7 @@ defmodule Cairn.TrackerTest do
     # heard of any flag hands the tracker — and so that "off" and "absent"
     # are distinguishable things a test can compare. For `twin_mint` that
     # distinction is load-bearing in the other direction: absent means ON.
-    Enum.reduce([:bbd, :oru, :twin_mint], context, fn key, context ->
+    Enum.reduce([:bbd, :oru, :ocr, :twin_mint], context, fn key, context ->
       case Keyword.fetch(opts, key) do
         {:ok, value} -> Map.put(context, key, value)
         :error -> context
@@ -4004,6 +4004,112 @@ defmodule Cairn.TrackerTest do
       assert Tracker.still?({0.0, 0.0, 7.9e-6}, still_box(), ctx([]))
       refute Tracker.still?({0.0, 0.0, 8.1e-6}, still_box(), ctx([]))
       refute Tracker.still?({0.0, 0.0, -8.1e-6}, still_box(), ctx([]))
+    end
+  end
+
+  describe "observation-centric recovery (tracking.ocr)" do
+    # The mover that pauses behind an occluder: four steady steps teach the
+    # filter a rightward velocity, two unobserved batches let the prediction
+    # sail on, and the object reappears exactly where it was last seen. The
+    # IoU pass weighs the prediction — which has left — so without recovery
+    # the reappearance is a fresh mint.
+    @walk for step <- 0..6, do: {step * 500, [0.10 + step * 0.08, 0.40, 0.20, 0.20]}
+    @vanished_at [0.58, 0.40, 0.20, 0.20]
+
+    defp paused_mover(opts) do
+      {tracker, tagged, _events} =
+        Enum.reduce(@walk, {Tracker.new(), [], []}, fn {ms, bbox}, {tracker, _, _} ->
+          track(tracker, [det("person", bbox)], Keyword.put(opts, :at_ms, ms))
+        end)
+
+      [%{object_id: id}] = tagged
+
+      # Four empty batches: the track coasts, the prediction keeps walking —
+      # ~0.08 per step by now, so by the reappearance it has left the stored
+      # box entirely. Still inside `max_unseen_ms` of the last match at 3000.
+      tracker =
+        Enum.reduce([3_500, 4_000, 4_500, 5_000], tracker, fn ms, tracker ->
+          {tracker, [], _} = track(tracker, [], Keyword.put(opts, :at_ms, ms))
+          tracker
+        end)
+
+      {tracker, id}
+    end
+
+    test "flag off, the reappearance is swallowed as the coasted track's twin" do
+      # Today's failure mode, pinned: the IoU pass weighs the prediction —
+      # which has left — so the box at the old spot matches nothing, and
+      # duplicate suppression then weighs it against the coasted track's
+      # *stored* box (IoU 1.0) and drops it as an NMS twin, marking the
+      # track seen. The mover that pauses behind an occluder is not merely
+      # re-minted without recovery; it is invisible, while the refusal
+      # keeps the coasted track alive.
+      {tracker, id} = paused_mover([])
+
+      {tracker, tagged, events} =
+        track(tracker, [det("person", @vanished_at)], at_ms: 5_500)
+
+      assert tagged == []
+      assert ids(events, :started) == []
+      assert ids(events, :updated) == []
+
+      # The identity is still live — the swallowed box marked it seen.
+      assert id in Enum.map(Tracker.live_tracks(tracker), & &1.object_id)
+    end
+
+    test "flag on, the last observation resumes the identity" do
+      {tracker, id} = paused_mover(ocr: true)
+
+      {_tracker, tagged, events} =
+        track(tracker, [det("person", @vanished_at)], at_ms: 5_500, ocr: true)
+
+      assert [%{object_id: ^id}] = tagged
+      assert ids(events, :started) == []
+      assert ids(events, :updated) == [id]
+    end
+
+    test "recovery composes with BBD: both listed, the identity still resumes" do
+      # BBD's admission runs at both association points, recovery after; a
+      # pair either has already spent is a no-op in the seeded reduce, so
+      # listing both can only add recoveries, never fight over one. The
+      # reappearance resumes the same identity with both flags on — by
+      # whichever stage reached it first — and nothing double-assigns.
+      {tracker, id} = paused_mover(bbd: true, ocr: true)
+
+      {_tracker, tagged, events} =
+        track(tracker, [det("person", @vanished_at)], at_ms: 5_500, bbd: true, ocr: true)
+
+      assert [%{object_id: ^id}] = tagged
+      assert ids(events, :started) == []
+      assert ids(events, :updated) == [id]
+    end
+
+    test "a stationary identity is not widened by recovery" do
+      # A parked person, stationary long since and unseen past the batch
+      # window — the regime where `@stationary_match_iou` is the *whole*
+      # admission. A same-label passer-by overlaps the parked box above the
+      # recovery threshold but below that strict number. Recovery excludes
+      # stationary tracks, so the box falls through to suppression and the
+      # parked identity stays put.
+      steps = for ms <- 0..24, do: {ms * 500, [0.60, 0.40, 0.20, 0.20]}
+      {tracker, tagged, _} = feed(Tracker.new(), steps)
+      [%{object_id: parked, stationary: true}] = tagged
+
+      # IoU vs the parked box: 0.024 / 0.056 = 0.43 — above recovery's 0.4,
+      # below `@stationary_match_iou`'s 0.7. Recovery excluding the parked
+      # track leaves the box to duplicate suppression, whose floor is the
+      # same number weighed against the same stored box: it drops as the
+      # parked object's NMS twin. Were recovery to include stationary
+      # tracks it would spend the pair *before* suppression weighs it —
+      # the passer-by would resume the parked identity and walk off with it.
+      passer_by = [0.68, 0.40, 0.20, 0.20]
+
+      {_tracker, tagged, events} =
+        track(tracker, [det("person", passer_by)], at_ms: 15_500, ocr: true)
+
+      assert tagged == []
+      assert ids(events, :started) == []
+      assert ids(events, :updated) == []
     end
   end
 end

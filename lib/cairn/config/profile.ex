@@ -50,6 +50,7 @@ defmodule Cairn.Config.Profile do
     bbd: true                # listed; a params mapping lists it too (and no
                              # shipped stage reads one — see `stages/1`)
     oru: { }                 # equivalent to true
+    ocr: true                # observation-centric recovery; listed the same way
     twin_mint: true          # presence, not a default — omit to delist
     max_unseen_ms: 3000
     max_live_tracks: 128
@@ -99,7 +100,7 @@ defmodule Cairn.Config.Profile do
 
   @known_keys ~w(name experimental backend model model_profile input_size decoder labels
                  fps_band sample_fps tracking)
-  @known_tracking_keys ~w(bbd oru twin_mint max_unseen_ms max_live_tracks stationary_after_ms)
+  @known_tracking_keys ~w(bbd oru ocr twin_mint max_unseen_ms max_live_tracks stationary_after_ms)
   # What each backend accepts, as static data — the Elixir half of
   # `BackendKind::capabilities` in
   # `plugins/cairn-detect/src/infer/backend.rs`, which names this table as its
@@ -182,6 +183,7 @@ defmodule Cairn.Config.Profile do
   @stage_modules %{
     "bbd" => {:bbd, Stage.Bbd},
     "oru" => {:oru, Stage.Oru},
+    "ocr" => {:ocr, Stage.Ocr},
     "twin_mint" => {:twin_mint, Stage.TwinMint}
   }
 
@@ -396,7 +398,7 @@ defmodule Cairn.Config.Profile do
   # mean not listed — presence, not defaults. Params keep their YAML string
   # keys: a stage would read its own vocabulary off them, and converting
   # operator-authored keys to atoms would be manufacturing atoms from input.
-  # None of the three stages reads its params today — each takes its constants
+  # None of the four stages reads its params today — each takes its constants
   # from its own module — so a params mapping parses, reaches the stage and
   # changes nothing. `docs/profile-authoring.md` says so to an author's face,
   # where it matters more than here.
@@ -426,7 +428,8 @@ defmodule Cairn.Config.Profile do
       association_one: stage_entry(profile, :bbd),
       association_two: stage_entry(profile, :bbd),
       minting: stage_entry(profile, :twin_mint),
-      per_object: stage_entry(profile, :oru)
+      per_object: stage_entry(profile, :oru),
+      recovery: stage_entry(profile, :ocr)
     }
 
     case Stage.validate_lists(lists) do

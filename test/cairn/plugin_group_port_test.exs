@@ -170,6 +170,7 @@ defmodule Cairn.PluginGroupPortTest do
              stationary_after_ms: 10_000,
              bbd: false,
              oru: false,
+             ocr: false,
              track: nil,
              record: nil
            }
@@ -189,6 +190,7 @@ defmodule Cairn.PluginGroupPortTest do
              stationary_after_ms: 10_000,
              bbd: false,
              oru: false,
+             ocr: false,
              track: nil,
              record: nil
            }

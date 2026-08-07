@@ -567,11 +567,12 @@ defmodule Cairn.CameraTracker do
       max_live_tracks: Map.get(policy, :max_live_tracks) || Config.default_max_live_tracks(),
       stationary_after_ms:
         Map.get(policy, :stationary_after_ms) || Config.default_stationary_after_ms(),
-      # `Map.get/3` where its three neighbours use `||`: these two are booleans,
-      # and `||` would read an explicit `false` as an absent key — the same
-      # answer only for as long as the default is `false`.
+      # `Map.get/3` where its three neighbours use `||`: these three are
+      # booleans, and `||` would read an explicit `false` as an absent key —
+      # the same answer only for as long as the default is `false`.
       bbd: Map.get(policy, :bbd, Config.default_bbd()),
-      oru: Map.get(policy, :oru, Config.default_oru())
+      oru: Map.get(policy, :oru, Config.default_oru()),
+      ocr: Map.get(policy, :ocr, Config.default_ocr())
     }
 
     # A profiled camera's policy carries a stage presence map, and it rides

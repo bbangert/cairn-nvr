@@ -659,6 +659,19 @@ defmodule Cairn.Tracker do
           "it just resumed — see the comments on both constants"
   end
 
+  # Recovery is the same admission for the live-coasted population that
+  # `@stitch_iou` is for the suspended one, so it carries the same floor
+  # relationship for the same reason.
+  if Stage.Ocr.recovery_iou() < @duplicate_suppression_iou do
+    raise CompileError,
+      file: __ENV__.file,
+      line: __ENV__.line,
+      description:
+        "Stage.Ocr.recovery_iou/0 must be >= @duplicate_suppression_iou: a box " <>
+          "recovered below suppression's floor leaves its NMS twin unsuppressed " <>
+          "beside the identity it just resumed — see the comments on both constants"
+  end
+
   # The unseen bound for a stationary track, as a multiplier of
   # `max_unseen_ms` (the `@refusal_factor` precedent: policy the operator
   # sets the base for, scaled here by a fixed factor). A parked object is
@@ -794,12 +807,12 @@ defmodule Cairn.Tracker do
   @typedoc """
   Everything about the observation the tracker needs, and nothing else.
 
-  The four optional keys are the four the code reads with `Map.get/2`: a
+  The five optional keys are the five the code reads with `Map.get/2`: a
   caller may build a context without them — `context/3` always writes all
-  four — and absence means the same as their defaults. For the first three
-  that is off: no floor, no second admission, no gap replay. For `twin_mint`
-  it is **on** — absence preserves the cold-start twin gate every deployment
-  already has, and only an explicit `false` delists it.
+  five — and absence means the same as their defaults. For the first four
+  that is off: no floor, no second admission, no gap replay, no recovery.
+  For `twin_mint` it is **on** — absence preserves the cold-start twin gate
+  every deployment already has, and only an explicit `false` delists it.
   """
   @type context :: %{
           :camera_id => String.t() | nil,
@@ -812,13 +825,14 @@ defmodule Cairn.Tracker do
           optional(:min_score) => floors() | nil,
           optional(:bbd) => boolean() | Stage.params(),
           optional(:oru) => boolean() | Stage.params(),
+          optional(:ocr) => boolean() | Stage.params(),
           optional(:twin_mint) => boolean() | Stage.params()
         }
 
   @typedoc """
   The host-side tracking policy for one camera.
 
-  The three stage flags and the `stages` presence map are two forms of one
+  The four stage flags and the `stages` presence map are two forms of one
   setting, and `context/3` resolves them: a policy carrying `stages` — a
   profiled camera's, per `Cairn.Config.policy/2` — supersedes the booleans
   entirely (presence decides listing, `twin_mint` included); a policy
@@ -832,6 +846,7 @@ defmodule Cairn.Tracker do
           optional(:min_score) => floors() | nil,
           optional(:bbd) => boolean(),
           optional(:oru) => boolean(),
+          optional(:ocr) => boolean(),
           optional(:twin_mint) => boolean(),
           optional(:stages) => %{optional(atom()) => Stage.params()}
         }
@@ -896,6 +911,7 @@ defmodule Cairn.Tracker do
       min_score: Map.get(policy, :min_score),
       bbd: stage_setting(policy, :bbd, false),
       oru: stage_setting(policy, :oru, false),
+      ocr: stage_setting(policy, :ocr, false),
       twin_mint: stage_setting(policy, :twin_mint, true)
     }
   end
@@ -1256,6 +1272,7 @@ defmodule Cairn.Tracker do
       |> adoption()
       |> association_two()
       |> run_batch_stages(stages)
+      |> run_batch_stages(recovery_stages(context))
       |> spend_stage_two_leftovers()
       |> suppression()
       |> run_batch_stages(minting_stages(context))
@@ -1314,6 +1331,14 @@ defmodule Cairn.Tracker do
   # runs unconditionally (see "Gating" in `Cairn.Tracker.Stage.Bbd`), and a
   # configured stage list replaces this translation when profiles land.
   defp batch_stages(context), do: stage_list(context, :bbd, Stage.Bbd, false)
+
+  # The recovery point's list: one slot, after the second association and its
+  # admission companions, before the leftovers are spent as drops — the last
+  # moment an unspent pair can still become an assignment. Running here, not
+  # inside the association lists, keeps `Cairn.Tracker.Stage.Bbd`'s
+  # `adjacent_after` contract intact and makes recovery strictly additive to
+  # the soak-measured behavior in front of it.
+  defp recovery_stages(context), do: stage_list(context, :ocr, Stage.Ocr, false)
 
   # The minting point's list, and the one translation whose default is ON:
   # `Cairn.Tracker.Stage.TwinMint` runs for every caller that has not
@@ -1763,8 +1788,9 @@ defmodule Cairn.Tracker do
   partitioning the pair space depends on them reading one threshold.
 
   For a stationary track this remains the *whole* admission, `tracking.bbd`
-  or not: the BBD stage excludes stationary tracks precisely so that what a
-  parked identity will answer to stays one number.
+  and `tracking.ocr` or not: the BBD and OCR stages both exclude stationary
+  tracks precisely so that what a parked identity will answer to stays one
+  number.
   """
   @spec match_threshold(map(), context()) :: number()
   def match_threshold(%{stationary: true} = tracked, context) do
@@ -2047,7 +2073,7 @@ defmodule Cairn.Tracker do
   # unconditionally (see "Gating" in `Cairn.Tracker.Stage.Oru`).
   defp per_object_stages(context), do: stage_list(context, :oru, Stage.Oru, false)
 
-  # One translation for all three attachment points: what `context/3` (or a
+  # One translation for all four attachment points: what `context/3` (or a
   # bare test context) put under the key decides listing; the value's shape
   # decides params. `nil` reads as unlisted for the same reason `false` does —
   # a caller that wrote the key as nil meant "off", and the old truthiness

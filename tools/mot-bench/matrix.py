@@ -91,7 +91,7 @@ def track_one(seq_dir: Path, pred: Path, flags: list[str]) -> str | None:
     return None
 
 
-def score_cell(ds_name: str, spec: dict, cell: dict, preds_dir: Path, out_dir: Path) -> None:
+def score_cell(ds_name: str, spec: dict, cid: str, preds_dir: Path, out_dir: Path) -> None:
     if (out_dir / "per_sequence.csv").exists():
         print(f"SKIP score (exists): {out_dir.name}", flush=True)
         return
@@ -99,7 +99,7 @@ def score_cell(ds_name: str, spec: dict, cell: dict, preds_dir: Path, out_dir: P
         str(ROOT / ".venv/bin/python"),
         str(ROOT / "score.py"),
         "--preds", str(preds_dir),
-        "--tracker-name", f"cairn-{cell_id(cell)}",
+        "--tracker-name", f"cairn-{cid}",
         "--gt-root", str(spec["gt_root"]),
         "--benchmark", spec["benchmark"],
         "--split", spec["split"],
@@ -108,10 +108,10 @@ def score_cell(ds_name: str, spec: dict, cell: dict, preds_dir: Path, out_dir: P
     result = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     if result.returncode != 0:
         raise SystemExit(
-            f"score.py failed for {ds_name}/{cell_id(cell)}:\n"
+            f"score.py failed for {ds_name}/{cid}:\n"
             f"{result.stdout[-1500:]}\n{result.stderr[-1500:]}"
         )
-    print(f"scored {ds_name}/{cell_id(cell)}", flush=True)
+    print(f"scored {ds_name}/{cid}", flush=True)
 
 
 def combined_row(out_dir: Path) -> dict[str, str]:
@@ -132,6 +132,12 @@ def main() -> None:
         metavar="DATASET:FLOAT",
         help="per-dataset detection prefilter, e.g. pp22:0.5; the dataset's "
         "dirs and matrix rows get a dm suffix so unfiltered runs are kept apart",
+    )
+    parser.add_argument(
+        "--ocr",
+        action="store_true",
+        help="run every cell with the tracking.ocr recovery stage on; cell ids "
+        "gain an _ocr1 suffix so baseline rows are kept apart",
     )
     parser.add_argument("--jobs", type=int, default=8)
     parser.add_argument("--preds", type=Path, default=ROOT / "data/preds/baseline")
@@ -154,8 +160,8 @@ def main() -> None:
     matrix_rows = []
 
     for cell in CELLS:
-        cid = cell_id(cell)
-        flags = cell_flags(cell)
+        cid = cell_id(cell) + ("_ocr1" if args.ocr else "")
+        flags = cell_flags(cell) + (["--ocr"] if args.ocr else [])
         for ds_name, spec in specs.items():
             preds_dir = args.preds / f"{ds_name}-{cid}"
             preds_dir.mkdir(parents=True, exist_ok=True)
@@ -175,7 +181,7 @@ def main() -> None:
             print(f"tracked {ds_name}/{cid} ({len(jobs)} seqs)", flush=True)
 
             out_dir = args.out / f"{ds_name}-{cid}"
-            score_cell(ds_name, spec, cell, preds_dir, out_dir)
+            score_cell(ds_name, spec, cid, preds_dir, out_dir)
 
             row = combined_row(out_dir)
             matrix_rows.append(

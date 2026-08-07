@@ -24,6 +24,7 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
     * `--bbd` / `--no-bbd` — batch boundary-damping stage (default off,
       matching production defaults)
     * `--oru` / `--no-oru` — observation-reuse stage (default off)
+    * `--ocr` / `--no-ocr` — observation-centric recovery stage (default off)
     * `--twin-mint` / `--no-twin-mint` — twin-mint guard (default on)
     * `--min-score FLOAT` — tracker admission floor (`min_score`
       `"default"` key; default 0.5). `0.0` floors nothing.
@@ -52,6 +53,7 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
     out: :string,
     bbd: :boolean,
     oru: :boolean,
+    ocr: :boolean,
     twin_mint: :boolean,
     min_score: :float,
     det_min: :float,
@@ -183,7 +185,7 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
   # -- policy -----------------------------------------------------------------
 
   # Scalar defaults mirror the soak/golden policy; stage flags default to the
-  # production defaults (bbd/oru off, twin_mint on). Hardcoded rather than
+  # production defaults (bbd/oru/ocr off, twin_mint on). Hardcoded rather than
   # read from `Cairn.Config`: a measurement must not move because a config
   # default did.
   defp policy(opts) do
@@ -194,6 +196,7 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
       min_score: %{"default" => Keyword.get(opts, :min_score, 0.5)},
       bbd: Keyword.get(opts, :bbd, false),
       oru: Keyword.get(opts, :oru, false),
+      ocr: Keyword.get(opts, :ocr, false),
       twin_mint: Keyword.get(opts, :twin_mint, true)
     }
   end
