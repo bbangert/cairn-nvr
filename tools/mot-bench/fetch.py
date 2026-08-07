@@ -4,10 +4,12 @@
 Stdlib-only. Downloads land in data/downloads/, get verified against
 CHECKSUMS.sha256, then get extracted into data/<name>/.
 
-Downloading raw images/videos (full MOT17 5.5GB, PersonPath22 raw videos) is
-deliberately out of scope here; those arrive with the phase-6 E2E work via
-upstream tooling. This script only fetches the label/annotation/detection
-zips needed for tracker-only MOT scoring.
+Most datasets here are label/annotation/detection zips for tracker-only MOT
+scoring (no pixels). `mot17-img` is the exception: the phase-6 E2E harness
+(tools/mot-bench/e2e.py) needs real frames to re-encode into video, so that
+one dataset is the full images+labels MOT17.zip (~5.5GB) rather than just
+labels. PersonPath22 raw video remains out of scope — no upstream tooling
+for it here yet.
 """
 from __future__ import annotations
 
@@ -55,6 +57,15 @@ DATASETS = {
             "https://aws-cv-sci-motion-public.s3.us-west-2.amazonaws.com/PersonPath22/public_detection_fcos/mot_format.zip"
         ],
         "pp22_public_det_mot.zip",
+    ),
+    # Full images+labels zip (~5.5GB), for the phase-6 E2E harness. Distinct
+    # from "mot17" above (MOT17Labels.zip, labels only, no img1/ frames).
+    "mot17-img": (
+        [
+            "https://motchallenge.net/data/MOT17.zip",
+            "https://web.archive.org/web/2023id_/https://motchallenge.net/data/MOT17.zip",
+        ],
+        "MOT17.zip",
     ),
 }
 
@@ -210,6 +221,16 @@ def process(dataset: str, record: bool) -> None:
         extract_plain(zip_path, ROOT / "data" / "personpath22" / "annotation")
     elif dataset == "personpath22-det":
         extract_plain(zip_path, ROOT / "data" / "personpath22" / "det_mot")
+    elif dataset == "mot17-img":
+        # Layout unverified: as of writing, no MOT17.zip has finished
+        # downloading here to inspect (a partial download was in progress —
+        # see CHECKSUMS.sha256's placeholder comment for that file). Going
+        # with extract_plain on the assumption its entries are already
+        # rooted at "train/"/"test/" like MOT17Labels.zip's (no wrapping
+        # "MOT17/" directory) rather than MOT20Labels.zip's, which does wrap
+        # and needs extract_stripping_prefix. Re-check against the real zip
+        # before relying on this path.
+        extract_plain(zip_path, ROOT / "data" / "mot17_img")
     else:
         raise AssertionError(dataset)
 
