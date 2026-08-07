@@ -171,6 +171,7 @@ defmodule Cairn.PluginGroupPortTest do
              bbd: false,
              oru: false,
              ocr: false,
+             reid: false,
              track: nil,
              record: nil
            }
@@ -191,6 +192,7 @@ defmodule Cairn.PluginGroupPortTest do
              bbd: false,
              oru: false,
              ocr: false,
+             reid: false,
              track: nil,
              record: nil
            }

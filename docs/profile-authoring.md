@@ -168,6 +168,14 @@ Three states, and the difference between the last two matters:
   as they always did. A backend-only profile does not silently delist
   anything.
 
+`tracking.reid` (Re-ID appearance fusion) is not part of this block and has no
+profile form yet — a profile can neither list nor delist it. It keeps applying
+to a profiled camera the same as an unprofiled one, for whatever the group's
+own stage list leaves its one seam, the bbd admission, able to do: a profiled
+group whose stage list carries no `bbd` silences it just as surely as the
+global `tracking.bbd: false` would, and gets its own load warning saying so
+(below), separate from the bbd/oru/ocr one.
+
 `true` and an empty mapping mean the same thing. A params mapping is carried
 through to the stage, and **no stage cairn ships reads its params today** —
 every one of the four takes its constants from its own module. Write
@@ -295,6 +303,8 @@ profile rk3576: /etc/cairn/profiles/rk3576.yml shadows a previously loaded
   profile of the same name
 plugin detect: profile my-board supersedes the global tracking.bbd/oru/ocr
   flags for its cameras — the profile's stage list wins
+tracking.reid has no effect for group detect: its profile my-board lists no
+  bbd stage
 ```
 
 A profile's *files* are checked only for a profile some group actually runs, so
