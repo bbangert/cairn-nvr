@@ -1,0 +1,4 @@
+# The operator-installed Ultralytics environment (AGPL boundary — see
+# README) and the weights its exports download. Never committed.
+export-venv/
+*.pt
