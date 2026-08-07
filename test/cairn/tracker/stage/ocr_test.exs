@@ -2,7 +2,7 @@ defmodule Cairn.Tracker.Stage.OcrTest do
   @moduledoc """
   Direct unit tests for `Cairn.Tracker.Stage.Ocr`'s `call/2` at its own
   boundary — the stored-box offer, the threshold, the seeded-reduce dedup,
-  the stationary exclusion, and the both-slices reach. The integrated
+  the stationary exclusion, and the whole-batch reach. The integrated
   behavior (through `Tracker.track/3` with the `ocr` flag, the
   mover-pauses-behind-occluder shape) stays pinned by `tracker_test.exs`
   and the golden replay suite.
@@ -40,7 +40,7 @@ defmodule Cairn.Tracker.Stage.OcrTest do
         %{
           context: %{at_ms: 6_000, max_unseen_ms: 3_000},
           candidates: [{"track_a", tracked([]), @predicted}],
-          above_floor: [{object(@reappeared), 0}],
+          indexed: [{object(@reappeared), 0}],
           association: :two
         },
         Map.new(overrides)
@@ -58,7 +58,7 @@ defmodule Cairn.Tracker.Stage.OcrTest do
 
   test "a box below the recovery threshold is not recovered" do
     %Batch{assignment: {assignments, _, _}} =
-      Stage.Ocr.call(batch(above_floor: [{object(@adjacent), 0}]), %{})
+      Stage.Ocr.call(batch(indexed: [{object(@adjacent), 0}]), %{})
 
     assert assignments == %{}
   end
@@ -68,7 +68,7 @@ defmodule Cairn.Tracker.Stage.OcrTest do
     # prediction is the association passes' to weigh, and it already had
     # its two chances at this box.
     %Batch{assignment: {assignments, _, _}} =
-      Stage.Ocr.call(batch(above_floor: [{object(@predicted), 0}]), %{})
+      Stage.Ocr.call(batch(indexed: [{object(@predicted), 0}]), %{})
 
     assert assignments == %{}
   end
@@ -95,30 +95,17 @@ defmodule Cairn.Tracker.Stage.OcrTest do
     assert assignments == %{}
   end
 
-  test "both floor slices are offered, evidence tier first on equal overlap" do
-    # Two boxes at the stored spot, one per tier. Recovery spends the
-    # above-floor one: equal overlap resolves by batch index, and the
-    # evidence tier indexes first.
+  test "the whole batch is offered: equal overlaps resolve by batch index" do
+    # Two boxes at the stored spot. Recovery reads `batch.indexed` — no
+    # tier of its own — and equal overlap resolves by batch index, the
+    # incumbent-wins convention.
     %Batch{assignment: {assignments, _, _}} =
       Stage.Ocr.call(
-        batch(
-          above_floor: [{object(@reappeared), 0}],
-          below_floor: [{object(@reappeared), 1}]
-        ),
+        batch(indexed: [{object(@reappeared), 0}, {object(@reappeared), 1}]),
         %{}
       )
 
     assert assignments == %{0 => "track_a"}
-  end
-
-  test "a below-floor box alone can resume the identity" do
-    %Batch{assignment: {assignments, _, _}} =
-      Stage.Ocr.call(
-        batch(above_floor: [], below_floor: [{object(@reappeared), 1}]),
-        %{}
-      )
-
-    assert assignments == %{1 => "track_a"}
   end
 
   test "a box at exactly the threshold is recovered — the admission is >=" do
@@ -128,7 +115,7 @@ defmodule Cairn.Tracker.Stage.OcrTest do
     nested = [0.10, 0.30, 0.05, 0.16]
 
     %Batch{assignment: {assignments, _, _}} =
-      Stage.Ocr.call(batch(above_floor: [{object(nested), 0}]), %{})
+      Stage.Ocr.call(batch(indexed: [{object(nested), 0}]), %{})
 
     assert assignments == %{0 => "track_a"}
   end

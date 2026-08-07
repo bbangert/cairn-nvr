@@ -21,11 +21,11 @@ defmodule Cairn.Tracker.Stage.Ocr do
 
   Running last keeps it strictly additive: BBD's soak-measured behavior
   stays primary, and a pair either of them already spent is a no-op in the
-  seeded reduce (`Cairn.Tracker.Batch.spend/2`). Both floor slices are
-  offered — an object re-emerging from behind an occluder is exactly when
-  the detector reports it faintly, and below-floor boxes may resume an
-  identity here for the same reason they may match one in the second
-  association: matching is not minting.
+  seeded reduce (`Cairn.Tracker.Batch.spend/2`). The whole batch is
+  offered, both floor tiers — an object re-emerging from behind an
+  occluder is exactly when the detector reports it faintly, and a
+  below-floor box may resume an identity here for the same reason it may
+  match one in the second association: matching is not minting.
 
   There is no minimum coast age. A young coast's prediction still hugs the
   stored box, so recovery degenerates to the offer the IoU pass already
@@ -73,12 +73,12 @@ defmodule Cairn.Tracker.Stage.Ocr do
   # Sorted by the same total key as the IoU pass: `candidates` comes off a
   # map, and two equal overlaps must not be resolved by its iteration order.
   defp pairs(batch) do
-    indexed = batch.above_floor ++ batch.below_floor
-
+    # The whole batch, as `suppress_duplicates` reads it — recovery has no
+    # tier of its own, and a spent index is a no-op in the reduce anyway.
     pairs =
       for {id, tracked, _predicted} <- batch.candidates,
           not tracked.stationary,
-          {object, index} <- indexed,
+          {object, index} <- batch.indexed,
           tracked.label == object.label,
           overlap = Tracker.iou(tracked.bbox, object.bbox),
           overlap >= @recovery_iou do
