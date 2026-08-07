@@ -328,6 +328,21 @@ mod tests {
     use super::*;
     use crate::infer::geometry::ResizePolicy;
 
+    /// The embedder's qnn refusal must fire before any model access — proven
+    /// by a path that does not exist — and name the way out, because a
+    /// regression that fell through to a session open would silently put the
+    /// embedder on whatever EP the fallthrough chose.
+    #[test]
+    fn qnn_is_refused_before_any_model_access() {
+        let err = match Embedder::open(Path::new("does/not/exist"), BackendKind::Qnn) {
+            Ok(_) => panic!("embedder opened on qnn"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("does not run on qnn"), "{msg}");
+        assert!(msg.contains("--embedder-model"), "{msg}");
+    }
+
     // RFC 4648 vectors, driven as bytes.
     #[test]
     fn base64_matches_the_rfc_vectors() {

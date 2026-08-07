@@ -220,6 +220,16 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+    // The embedder's own open refuses qnn too, but it runs after the
+    // detector's — which on qnn is a multi-second HTP graph compile. An
+    // argv combination that is going down either way should say so before
+    // that, not after.
+    if args.embedder_model.is_some() && args.backend == BackendKind::Qnn {
+        anyhow::bail!(
+            "the embedder does not run on qnn yet (no QDQ embedder artifact) \
+             — drop --embedder-model or use --backend ort"
+        );
+    }
     // Before the model load, which is seconds: the host logs the hello and
     // checks that protocol 1 is in `supported_versions`.
     emit::stdout_line(&emit::hello_line())?;

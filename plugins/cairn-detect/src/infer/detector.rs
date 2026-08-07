@@ -206,9 +206,10 @@ impl Detector {
             shape: [1i64, 3, self.input_size.h as i64, self.input_size.w as i64],
             values: tensor,
         };
-        // Timed around `run` alone — raw inference, no decode — so the number
-        // is comparable across backends and to the phase-0 spike's. `kind` is
-        // read first: the returned tensors keep `backend` mutably borrowed.
+        // Timed around `run` alone — the model pass plus the copy of this
+        // frame's values into the session's input, no decode — so the number
+        // compares across backends (both pay the same copy). `kind` is read
+        // first: the returned tensors keep `backend` mutably borrowed.
         let kind = self.backend.kind();
         let started = Instant::now();
         let tensors = self.backend.run(input)?;
@@ -263,6 +264,25 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("backend rknn is not yet implemented"), "{msg}");
         assert!(msg.contains(".rknn"), "{msg}");
+    }
+
+    /// The report/reset boundary, driven through `record` itself rather than
+    /// a hand-built window: exactly `REPORT_EVERY` runs empty the window (a
+    /// broken reset would grow without bound and report stale runs), and the
+    /// lifetime total keeps counting across the reset.
+    #[test]
+    fn latency_window_reports_and_resets_on_the_boundary() {
+        let mut window = LatencyWindow::new();
+        for run in 0..(LatencyWindow::REPORT_EVERY * 2 + 3) {
+            window.record(Duration::from_millis(run as u64), BackendKind::Ort);
+            let filled = (run + 1) % LatencyWindow::REPORT_EVERY;
+            assert_eq!(window.window.len(), filled, "after run {run}");
+        }
+        assert_eq!(
+            window.total_runs,
+            (LatencyWindow::REPORT_EVERY * 2 + 3) as u64
+        );
+        assert_eq!(window.window.len(), 3);
     }
 
     /// Nearest-rank on a known distribution: for 1..=100 ms sorted, p50 is

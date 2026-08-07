@@ -98,11 +98,16 @@ impl Backend for OrtBackend {
             // Checked anyway, because a mismatched copy_from_slice panics.
             Some(tensor) => {
                 let (shape, data) = tensor.extract_tensor_mut();
-                if **shape != input.shape {
+                // Both checked: a same-shape buffer of the wrong length is
+                // impossible for a caller that filled it from the shape, but
+                // copy_from_slice would answer one with a panic, not an Err.
+                if **shape != input.shape || data.len() != input.values.len() {
                     bail!(
-                        "input tensor shape changed between runs: {:?} then {:?}",
+                        "input tensor changed between runs: {:?} ({} values) then {:?} ({} values)",
                         &**shape,
-                        input.shape
+                        data.len(),
+                        input.shape,
+                        input.values.len()
                     );
                 }
                 data.copy_from_slice(&input.values);
@@ -141,7 +146,11 @@ fn register_qnn_library(library: &Path) -> Result<()> {
         Environment::current()
             .and_then(|env| env.register_ep_library(QNN_EP, library))
             .map(|_| library.to_path_buf())
-            .map_err(|e| e.to_string())
+            // The path goes into the message here, at registration time,
+            // because the cached error is repeated verbatim to every later
+            // caller — a later call must not stamp its own path onto the
+            // first call's failure.
+            .map_err(|e| format!("registering the QNN EP library {}: {e}", library.display()))
     });
     match registered {
         Ok(path) if path == library => Ok(()),
@@ -150,7 +159,7 @@ fn register_qnn_library(library: &Path) -> Result<()> {
             path.display(),
             library.display()
         ),
-        Err(e) => bail!("registering the QNN EP library {}: {e}", library.display()),
+        Err(e) => bail!("{e}"),
     }
 }
 
