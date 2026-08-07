@@ -338,8 +338,15 @@ def run_plugin_and_feed(args, seq_name: str, seqinfo: dict, video_path: Path, ca
             f"[{seq_name}] plugin outlived feed-end+30s, killed. stderr tail:\n{''.join(stderr_tail)}"
         )
 
-    t_out.join(timeout=5)
-    t_err.join(timeout=5)
+    # The process is reaped, so its pipes are at EOF and the drain threads
+    # exit on their own; the join must OUTLAST the flush, not race it — a
+    # timed join returning early here would let the rename below consume a
+    # capture still being written. The bound is a hang detector, not a
+    # deadline the flush is allowed to lose.
+    t_out.join(timeout=60)
+    t_err.join(timeout=60)
+    if t_out.is_alive() or t_err.is_alive():
+        raise SystemExit(f"[{seq_name}] capture drain thread hung after plugin exit")
 
     # Closing stdin above is deliberate control-channel EOF, and the plugin
     # exits it with libc::_exit(3) by design (control.rs: "exiting so Cairn
