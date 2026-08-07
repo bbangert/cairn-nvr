@@ -17,7 +17,6 @@ import csv
 import itertools
 import json
 import subprocess
-import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -141,11 +140,16 @@ def main() -> None:
 
     specs = datasets(args.datasets)
     for override in args.det_min:
-        name, _, value = override.partition(":")
+        name, sep, value = override.partition(":")
+        if not sep:
+            raise SystemExit(f"--det-min expects DATASET:FLOAT, got {override!r}")
         if name not in specs:
             raise SystemExit(f"--det-min names {name!r}, which is not in --datasets {args.datasets}")
         spec = specs.pop(name)
-        spec["det_min"] = float(value)
+        try:
+            spec["det_min"] = float(value)
+        except ValueError:
+            raise SystemExit(f"--det-min expects DATASET:FLOAT, got {override!r}") from None
         specs[f"{name}dm{round(float(value) * 100):02d}"] = spec
     matrix_rows = []
 
@@ -184,6 +188,9 @@ def main() -> None:
                     **{k: row[k] for k in ["HOTA", "DetA", "AssA", "LocA", "IDF1", "MOTA", "IDSW"]},
                 }
             )
+
+    if not matrix_rows:
+        raise SystemExit("no dataset-cells were selected; nothing to write")
 
     # Upsert by (dataset, cell): a --datasets subset run must not clobber
     # rows an earlier full run produced.
