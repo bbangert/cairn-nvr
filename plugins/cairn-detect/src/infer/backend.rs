@@ -236,14 +236,20 @@ pub(super) struct ModelIo {
     /// The input's spatial size when the artifact pins it, `None` when the
     /// export left it symbolic and `--input-size` has to supply it.
     pub declared_input_size: Option<InputSize>,
+    /// The input's declared batch when it is a fixed positive rank-4 dim,
+    /// `None` for symbolic/dynamic. The embedder's open refuses a fixed
+    /// batch other than 1; the detector's own N=1 discipline predates the
+    /// field and never reads it.
+    pub declared_input_batch: Option<i64>,
     /// Every output the model declares, in the model's own order.
     pub outputs: Vec<Declared>,
 }
 
-/// One frame, packed for the model this backend opened.
+/// One tensor, packed for the model this backend opened — a frame for the
+/// detector, a person crop for the embedder.
 ///
-/// `shape` is NCHW with N=1: this plugin infers one frame per run, and nothing
-/// in the crate batches.
+/// `shape` is NCHW with N=1: this plugin infers one tensor per run, and
+/// nothing in the crate batches.
 pub(super) struct InputTensor {
     pub shape: [i64; 4],
     pub values: Vec<f32>,

@@ -702,6 +702,20 @@ fn sniff_profile(
 /// tensor before onnxruntime ever sees the mismatch.
 ///
 /// [`RgbScaler`]: crate::decode::RgbScaler
+/// The declared batch dimension of a rank-4 input, `None` when the shape is
+/// not rank-4 or the batch is symbolic/dynamic (negative). The embedder's
+/// N=1 contract checks this at open: a fixed batch of 16 dies mid-run at the
+/// first crop otherwise, with onnxruntime's shape error instead of ours.
+pub(super) fn declared_input_batch(dtype: &ValueType) -> Option<i64> {
+    let ValueType::Tensor { shape, .. } = dtype else {
+        return None;
+    };
+    if shape.len() != 4 || shape[0] <= 0 {
+        return None;
+    }
+    Some(shape[0])
+}
+
 pub(super) fn declared_input_size(dtype: &ValueType) -> Option<InputSize> {
     let ValueType::Tensor { shape, .. } = dtype else {
         return None;

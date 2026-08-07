@@ -62,7 +62,8 @@ use decode::{DecoderKind, Sample};
 use emit::Publisher;
 use gate::Gate;
 use infer::{
-    BackendKind, Detector, InputSize, Labels, ModelProfile, ScoreFloors, TrackFloorOverrides,
+    BackendKind, Detector, Embedder, InputSize, Labels, ModelProfile, ScoreFloors,
+    TrackFloorOverrides,
 };
 use motion::{MotionConfig, MotionOverrides};
 
@@ -133,6 +134,13 @@ struct Args {
     /// rather than a usage error about the flag.
     #[arg(long, value_enum, default_value_t = BackendKind::Ort)]
     backend: BackendKind,
+
+    /// Person Re-ID embedder (osnet-class, NCHW 3-channel with a declared
+    /// input size and one static feature output). When given, every emitted
+    /// `person` detection carries a base64 int8 `embedding`, cropped from the
+    /// detection pass's own input tensor. Shares `--backend`.
+    #[arg(long)]
+    embedder_model: Option<PathBuf>,
 
     /// Preprocessing and decode steps to run this model under: `yolox`,
     /// `rfdetr`, `yolov10` (or `yolo26`) or `yolov8` (or `yolov9`, `yolo11`,
@@ -239,14 +247,16 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
         &labels,
         args.allow_label_mismatch,
     )?;
+    let embedder = open_embedder(args, &labels)?;
     eprintln!(
-        "cairn-detect up: cameras=[{}] {}",
+        "cairn-detect up: cameras=[{}] {} {}",
         specs
             .iter()
             .map(|spec| format!("{}@{}", spec.id, spec.udp_port))
             .collect::<Vec<_>>()
             .join(", "),
-        model_summary(args, &detector)
+        model_summary(args, &detector),
+        embedder_summary(&embedder)
     );
     // The decoders open per member, and re-open forever after a drop, so the
     // process is as ready as it gets once the model is loaded.
@@ -261,6 +271,7 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
         &motion,
         floors,
         detector,
+        embedder,
         &labels,
         Publisher::new(streams),
     )
@@ -316,9 +327,11 @@ fn run_single(args: &Args) -> Result<()> {
         args.allow_label_mismatch,
     )?;
     let input_spec = detector.input_spec();
+    let embedder = open_embedder(args, &labels)?;
     eprintln!(
-        "cairn-detect up: camera={camera_id} udp={udp_port} {}",
-        model_summary(args, &detector)
+        "cairn-detect up: camera={camera_id} udp={udp_port} {} {}",
+        model_summary(args, &detector),
+        embedder_summary(&embedder)
     );
 
     // Inference runs off the decode thread. Held inline, a ~100ms model pass
@@ -335,6 +348,7 @@ fn run_single(args: &Args) -> Result<()> {
                 infer_loop(
                     &rx,
                     detector,
+                    embedder,
                     &labels,
                     &floors,
                     &camera_id,
@@ -428,9 +442,11 @@ fn model_summary(args: &Args, detector: &Detector) -> String {
 /// also owe a `plugin.status` reporting the gate's effect
 /// ([`gate::Lines::status`]), which is the only line here that is not one
 /// frame's own.
+#[allow(clippy::too_many_arguments)]
 fn infer_loop(
     rx: &Receiver<Sample>,
     mut detector: Detector,
+    mut embedder: Option<Embedder>,
     labels: &Labels,
     floors: &ScoreFloors,
     camera_id: &str,
@@ -438,6 +454,7 @@ fn infer_loop(
     publisher: &mut Publisher,
 ) -> Result<()> {
     let mut gate = Gate::default();
+    let spec = detector.input_spec();
     while let Ok(sample) = rx.recv() {
         let lines = gate::sample_line(
             &mut gate,
@@ -446,7 +463,17 @@ fn infer_loop(
             motion,
             sample,
             Instant::now(),
-            |input| detector.detect(input.tensor, input.projection, labels, floors),
+            |input| {
+                // Path A: the one copy the feature pays for, taken only when
+                // an embedder is configured — `detect` consumes the tensor.
+                let crop_source = embedder.as_ref().map(|_| input.tensor.clone());
+                let projection = input.projection;
+                let mut dets = detector.detect(input.tensor, input.projection, labels, floors)?;
+                if let (Some(embedder), Some(tensor)) = (embedder.as_mut(), crop_source) {
+                    infer::embed_persons(embedder, &tensor, &spec, &projection, &mut dets)?;
+                }
+                Ok(dets)
+            },
         )?;
         // The frame first: a status is this camera's commentary on the samples
         // up to and including that line.
@@ -457,6 +484,33 @@ fn infer_loop(
     Ok(())
 }
 
+/// Opens the embedder when `--embedder-model` is given. A labels file with
+/// no `person` entry means every crop filter below will match nothing; that
+/// is a configuration worth flagging once, at startup, not a reason to
+/// refuse a run.
+fn open_embedder(args: &Args, labels: &Labels) -> Result<Option<Embedder>> {
+    let Some(model) = args.embedder_model.as_deref() else {
+        return Ok(None);
+    };
+    let embedder = Embedder::open(model, args.backend)?;
+    if !labels.contains("person") {
+        eprintln!(
+            "cairn-detect: --embedder-model is set but the label set has no \
+             `person` entry; no detection will carry an embedding"
+        );
+    }
+    Ok(Some(embedder))
+}
+
+/// The embedder's half of the `up:` line — `embedder=off` when none is
+/// configured, so the line always says which it was.
+fn embedder_summary(embedder: &Option<Embedder>) -> String {
+    match embedder {
+        Some(embedder) => format!("embedder={}", embedder.summary()),
+        None => "embedder=off".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +519,26 @@ mod tests {
 
     fn parse(extra: &[&str]) -> Result<Args, clap::Error> {
         Args::try_parse_from(MODEL.iter().chain(extra).copied())
+    }
+
+    #[test]
+    fn the_embedder_flag_is_optional_and_parses() {
+        let args = parse(&["--camera-id", "front", "--udp-port", "17000"]).unwrap();
+        assert!(args.embedder_model.is_none());
+
+        let args = parse(&[
+            "--camera-id",
+            "front",
+            "--udp-port",
+            "17000",
+            "--embedder-model",
+            "osnet.onnx",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.embedder_model.as_deref(),
+            Some(std::path::Path::new("osnet.onnx"))
+        );
     }
 
     #[test]

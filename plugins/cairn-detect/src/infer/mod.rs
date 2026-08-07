@@ -28,6 +28,7 @@
 mod backend;
 mod catalog;
 mod detector;
+mod embedder;
 mod encoding;
 mod geometry;
 mod heads;
@@ -48,6 +49,7 @@ pub(super) const MAX_DETS: usize = 32;
 // nowhere outside `infer` and are no longer re-exported (T1.4).
 pub use backend::BackendKind;
 pub use detector::Detector;
+pub use embedder::{embed_persons, Embedder};
 pub use geometry::{Fit, InputSize, Projection};
 pub use labels::{Labels, ScoreFloors, TrackFloorOverrides};
 pub use profile::{InputSpec, ModelProfile};

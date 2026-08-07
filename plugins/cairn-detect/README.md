@@ -662,6 +662,33 @@ curl -s -X POST -H 'Content-Type: application/json' -d '{"paths":["onnx/model.on
   https://huggingface.co/api/models/onnx-community/rfdetr_nano-ONNX/paths-info/eae21cee0687a91bcf9fa071605c48d7705d2d91
 ```
 
+**OSNet-x0.25 (Re-ID embedder)** — 0.9 MB. A person re-identification
+feature extractor for `--embedder-model` (input 1×3×256×128 ImageNet RGB,
+output 512-dim), not a detector. The MIT-licensed MSMT17-trained export on
+the Hub declares a fixed batch of 16, which this plugin's N=1 contract
+refuses, so the batch dimension is rewritten on the way in (graph otherwise
+unchanged; the rewrite is cosine-1.0 identical to the original on the same
+input):
+
+```bash
+cd plugins/cairn-detect
+curl -L -o osnet_x0_25_b16.onnx \
+  https://huggingface.co/anriha/osnet_x0_25_msmt17/resolve/main/osnet_x0_25_msmt17.onnx
+python3 - <<'PY'
+import onnx
+m = onnx.load("osnet_x0_25_b16.onnx")
+m.graph.input[0].type.tensor_type.shape.dim[0].dim_value = 1
+m.graph.output[0].type.tensor_type.shape.dim[0].dim_value = 1
+onnx.save(m, "osnet_x0_25.onnx")
+PY
+echo "ede232aa2ad68a76010861437c707a7b1207075308b666ee6cd8ff7f3cf41941  osnet_x0_25.onnx" \
+  | sha256sum -c
+```
+
+(The upstream file hashes to
+`e78604f4ccda49b8f41cd0f8f7303800ce75d2361895ebb0729513c1bf53d277`; the
+rewrite is deterministic, so the output hash above is stable.)
+
 `rfdetr_small`, `rfdetr_base`, `rfdetr_medium` and `rfdetr_large` exist at the
 same URL shape, in their own repos — resolve each one's own commit and
 checksum the same way, and note the sibling files in these repos

@@ -26,7 +26,7 @@ use serde::Deserialize;
 use crate::decode::{self, DecoderKind, Sample, SampleSink};
 use crate::emit::{self, Publisher};
 use crate::gate::{self, Gate};
-use crate::infer::{Detector, InputSpec, Labels, ScoreFloors, TrackFloorOverrides};
+use crate::infer::{self, Detector, Embedder, InputSpec, Labels, ScoreFloors, TrackFloorOverrides};
 use crate::motion::{self, MotionConfig, MotionOverrides};
 use crate::rtp;
 
@@ -138,12 +138,14 @@ pub struct DecodeSettings {
 /// fail (see there), and a startup argument that cannot be honoured has to say
 /// so before the model load rather than after it. It is indexed by slot like
 /// everything else in this module.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     specs: &[CameraSpec],
     decode_settings: DecodeSettings,
     motion: &MotionOverrides,
     floors: Vec<ScoreFloors>,
     detector: Detector,
+    embedder: Option<Embedder>,
     labels: &Labels,
     publisher: Publisher,
 ) -> Result<()> {
@@ -165,7 +167,9 @@ pub fn run(
             .with_context(|| format!("spawning the decode thread for camera {}", spec.id))?;
     }
 
-    infer_loop(&slots, specs, &floors, &motion, detector, labels, publisher)
+    infer_loop(
+        &slots, specs, &floors, &motion, detector, embedder, labels, publisher,
+    )
 }
 
 /// Open -> decode -> log -> re-open, forever. Never returns.
@@ -260,12 +264,14 @@ fn open_and_run(
 /// in `specs` order at startup and nothing re-orders them, but the gate tests
 /// drive their own members and cannot see this call; a harness running real
 /// clips through the group loop is what would.
+#[allow(clippy::too_many_arguments)]
 fn infer_loop(
     slots: &[LatestSlot<Sample>],
     specs: &[CameraSpec],
     floors: &[ScoreFloors],
     motion: &[Option<MotionConfig>],
     mut detector: Detector,
+    mut embedder: Option<Embedder>,
     labels: &Labels,
     mut publisher: Publisher,
 ) -> Result<()> {
@@ -273,6 +279,7 @@ fn infer_loop(
     debug_assert_eq!(floors.len(), specs.len());
     debug_assert_eq!(motion.len(), specs.len());
     let mut gates: Vec<Gate> = specs.iter().map(|_| Gate::default()).collect();
+    let spec = detector.input_spec();
 
     for (index, sample) in Slots::new(slots) {
         let camera_id = &specs[index].id;
@@ -286,7 +293,19 @@ fn infer_loop(
             motion[index],
             sample,
             Instant::now(),
-            |input| detector.detect(input.tensor, input.projection, labels, &floors[index]),
+            |input| {
+                // Path A, exactly as in single mode: the clone happens only
+                // when an embedder is configured, before `detect` consumes
+                // the tensor.
+                let crop_source = embedder.as_ref().map(|_| input.tensor.clone());
+                let projection = input.projection;
+                let mut dets =
+                    detector.detect(input.tensor, input.projection, labels, &floors[index])?;
+                if let (Some(embedder), Some(tensor)) = (embedder.as_mut(), crop_source) {
+                    infer::embed_persons(embedder, &tensor, &spec, &projection, &mut dets)?;
+                }
+                Ok(dets)
+            },
         )?;
         // The frame first, and a status — which names this member, not the
         // group — after it, as in single mode.
