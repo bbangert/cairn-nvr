@@ -29,10 +29,15 @@ MODEL=${MODEL:-$BASE/model.onnx}
 SAMPLE_FPS=${SAMPLE_FPS:-30}
 CLIP=${CLIP:-$BASE/bench-feed.ts}
 # Param expansion, not basename/awk: this busybox ships neither.
+case ${SECS} in
+'' | *[!0-9]* | 0) echo "secs must be a positive integer" >&2; exit 1 ;;
+esac
 MB=${MODEL##*/}
 MB=${MB%.onnx}
+# Timestamped so a repeat run never overwrites its predecessor's raw
+# evidence — repeatability pairs need both run dirs to survive.
 TAG="$BACKEND-$MB-${NCAMS}cam"
-RUN="$BASE/runs/$TAG"
+RUN="$BASE/runs/$TAG-$(date +%s)"
 mkdir -p "$RUN"
 
 export LD_LIBRARY_PATH=$BASE/lib:/data/qnn-spike/lib
@@ -41,6 +46,21 @@ export ADSP_LIBRARY_PATH="/data/qnn-spike/dsp;"
 export DSP_LIBRARY_PATH="/data/qnn-spike/dsp;"
 
 GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
+FEEDS=""
+PLUGIN=""
+# The trap owns every side effect: an aborted run must not leak feeds
+# or the plugin, and above all must not leave the governor pinned —
+# that would silently distort every later unpinned run on this board.
+cleanup() {
+  for f in $FEEDS; do kill "$f" 2>/dev/null; done
+  [ -n "$PLUGIN" ] && kill "$PLUGIN" 2>/dev/null
+  if [ "${PIN_GOVERNOR:-0}" = "1" ]; then
+    for c in /sys/devices/system/cpu/cpu[0-9]*; do
+      echo "$GOV" > "$c/cpufreq/scaling_governor"
+    done
+  fi
+}
+trap cleanup EXIT INT TERM
 if [ "${PIN_GOVERNOR:-0}" = "1" ]; then
   for c in /sys/devices/system/cpu/cpu[0-9]*; do
     echo performance > "$c/cpufreq/scaling_governor"
@@ -50,13 +70,19 @@ echo "governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor) (wa
 echo "model: $MODEL backend: $BACKEND ncams: $NCAMS secs: $SECS sample_fps: $SAMPLE_FPS" >> "$RUN/meta"
 
 # Feeds + cameras-json. Ports 5600, 5602, ... (RTP; +1 is RTCP's).
-FEEDS=""
 JSON="["
 i=0
 while [ "$i" -lt "$NCAMS" ]; do
   port=$((5600 + i * 2))
+  # Line i+1 of CAM_URLS, pure shell (no sed on this busybox).
   url=""
-  [ -n "${CAM_URLS:-}" ] && url=$(sed -n "$((i + 1))p" "$CAM_URLS")
+  if [ -n "${CAM_URLS:-}" ]; then
+    n=0
+    while read -r cam_line; do
+      n=$((n + 1))
+      [ "$n" -eq $((i + 1)) ] && url=$cam_line && break
+    done < "$CAM_URLS"
+  fi
   if [ -n "$url" ]; then
     "$BASE/lib/ffmpeg" -nostdin -nostats -loglevel error -rtsp_transport tcp \
       -i "$url" -map 0:v -c copy -bsf:v h264_mp4toannexb \
@@ -100,16 +126,15 @@ while kill -0 "$PLUGIN" 2>/dev/null; do
   sleep 5
 done
 wait "$PLUGIN" 2>/dev/null
+PLUGIN=""
 for f in $FEEDS; do kill "$f" 2>/dev/null; done
-
-[ "${PIN_GOVERNOR:-0}" = "1" ] && for c in /sys/devices/system/cpu/cpu[0-9]*; do
-  echo "$GOV" > "$c/cpufreq/scaling_governor"
-done
+FEEDS=""
+# Governor restore is the trap's job, at exit — after the summary.
 
 # Summary: latency lines verbatim; achieved rate from run count over
 # wall time; CPU% from utime+stime delta over the sampled span; RSS
-# peak. Pure-shell parsing throughout: this busybox has grep/tail/cut
-# but no sed, no awk, no basename.
+# peak. Pure-shell parsing throughout: this busybox has grep and tail
+# but no sed, awk, cut, or basename.
 grep "infer latency" "$RUN/err" > "$RUN/latency" || true
 runs=0
 while read -r line; do
