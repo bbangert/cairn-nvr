@@ -178,6 +178,18 @@ def build_video(seq_dir: Path, seqinfo: dict, videos_dir: Path) -> Path:
     return out_path
 
 
+def video_duration_s(video):
+    """The container-reported duration in seconds, or None if ffprobe balks."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(video)],
+            capture_output=True, text=True, timeout=30, check=True)
+        return float(out.stdout.strip())
+    except Exception:
+        return None
+
+
 def run_plugin_and_feed(args, seq_name: str, seqinfo: dict, video_path: Path, capture_path: Path) -> None:
     """Steps 2 + 3: spawn the plugin, hand it the control line, wait for it
     to come up, feed the video as real-time RTP once, then close it down."""
@@ -266,7 +278,13 @@ def run_plugin_and_feed(args, seq_name: str, seqinfo: dict, video_path: Path, ca
         up_event.wait(timeout=0.5)
     print(f"[{seq_name}] plugin: up")
 
-    duration = seqinfo["seq_length"] / seqinfo["frame_rate"] + 5.0
+    # The cap must cover the real media, not the annotated span: a
+    # PersonPath22 video runs past its 5 fps keyframe grid (seqLength there
+    # counts annotation slots, not video frames), and a feed killed at the
+    # shorter number reads as a failure. ffprobe the source; fall back to
+    # the grid-derived duration for image-built videos, where they agree.
+    duration = video_duration_s(video_path) or seqinfo["seq_length"] / seqinfo["frame_rate"]
+    duration += 5.0
     feed_cmd = [
         "ffmpeg", "-nostdin", "-nostats", "-loglevel", "warning",
         "-re", "-stream_loop", "0",
