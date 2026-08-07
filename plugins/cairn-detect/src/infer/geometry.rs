@@ -291,6 +291,32 @@ impl Projection {
     pub fn stretch(input: InputSize) -> Self {
         ResizePolicy::Stretch.project(input, input)
     }
+
+    /// A wire-shaped normalized frame box forward into model-canvas pixels —
+    /// the direction `unproject` inverts, as corner coordinates. Not clamped;
+    /// callers cropping from the canvas intersect with `content_rect` (the
+    /// canvas past the content is letterbox padding that never held pixels).
+    pub(super) fn project_norm(&self, bbox: [f64; 4]) -> (f64, f64, f64, f64) {
+        let x = |v: f64| v * self.source.0 * self.scale.0 + self.offset.0;
+        let y = |v: f64| v * self.source.1 * self.scale.1 + self.offset.1;
+        (
+            x(bbox[0]),
+            y(bbox[1]),
+            x(bbox[0] + bbox[2]),
+            y(bbox[1] + bbox[3]),
+        )
+    }
+
+    /// Where real pixels live on the model canvas, as corner coordinates:
+    /// the content rectangle this projection carried in from the fit.
+    pub(super) fn content_rect(&self) -> (f64, f64, f64, f64) {
+        (
+            self.offset.0,
+            self.offset.1,
+            self.offset.0 + self.scale.0 * self.source.0,
+            self.offset.1 + self.scale.1 * self.source.1,
+        )
+    }
 }
 
 #[cfg(test)]

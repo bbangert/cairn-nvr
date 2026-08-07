@@ -813,6 +813,9 @@ fn det_from(bbox: NormBox, score: f64, evidence: bool, label: String) -> Option<
         // in `emit`, from boxes an earlier frame's pass found, and never here.
         observation_kind: ObservationKind::Detected,
         evidence,
+        // The embedder attaches features after `detect` returns; nothing in
+        // the decode path knows about them.
+        embedding: None,
     })
 }
 
@@ -956,6 +959,7 @@ mod tests {
                 bbox: [0.1, 0.2, 0.2, 0.3],
                 observation_kind: ObservationKind::Detected,
                 evidence: true,
+                embedding: None,
             }]
         );
     }
@@ -1079,6 +1083,7 @@ mod tests {
                 bbox: [0.4, 0.35, 0.2, 0.3],
                 observation_kind: ObservationKind::Detected,
                 evidence: true,
+                embedding: None,
             }]
         );
     }
@@ -1444,6 +1449,7 @@ mod tests {
                 bbox: [0.45, 0.45, 0.1, 0.1],
                 observation_kind: ObservationKind::Detected,
                 evidence: true,
+                embedding: None,
             }]
         );
     }
@@ -1702,6 +1708,7 @@ mod tests {
                 bbox: [0.5, 0.2188, 0.125, 0.125],
                 observation_kind: ObservationKind::Detected,
                 evidence: true,
+                embedding: None,
             }]
         );
     }
@@ -1974,6 +1981,7 @@ mod tests {
                 bbox: [0.375, 0.25, 0.25, 0.5],
                 observation_kind: ObservationKind::Detected,
                 evidence: true,
+                embedding: None,
             }]
         );
     }
@@ -2504,6 +2512,7 @@ mod tests {
             bbox,
             observation_kind: ObservationKind::Detected,
             evidence: true,
+            embedding: None,
         }
     }
 

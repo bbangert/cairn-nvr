@@ -98,6 +98,12 @@ pub struct Det {
     /// seed: a seed is a copy of a box that was evidence when it was found.
     #[serde(skip)]
     pub evidence: bool,
+    /// A person crop's Re-ID feature: unit-norm, symmetric-int8-quantized at
+    /// the fixed scale 127, base64. Absent whenever no embedder is configured
+    /// — and the absent spelling is byte-identical to a build that has never
+    /// heard of the field, which is what keeps the no-embedder wire stable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -544,6 +550,11 @@ impl Publisher {
                 .extend(dets[..kept].iter().filter(|det| det.evidence).map(|det| {
                     let mut remembered = det.clone();
                     remembered.observation_kind = ObservationKind::Tracked;
+                    // A seed re-reports a position, not an appearance: the
+                    // crop the feature came from is stale the moment the gate
+                    // skips a frame, and repeating it would also grow every
+                    // seeded line by the embedding it no longer stands for.
+                    remembered.embedding = None;
                     remembered
                 }));
         }
@@ -645,6 +656,7 @@ mod tests {
             bbox: [0.1234, 0.5678, 0.25, 0.5],
             observation_kind: ObservationKind::Detected,
             evidence: true,
+            embedding: None,
         }
     }
 
@@ -806,8 +818,40 @@ mod tests {
                 bbox: [0.1234567890123456; 4],
                 observation_kind: ObservationKind::Detected,
                 evidence: true,
+                embedding: None,
             })
             .collect()
+    }
+
+    /// The phase-4 wire-budget assertion: 64 worst-case objects EACH
+    /// carrying a 512-dim int8 base64 embedding — the largest the embedder
+    /// will open (`MAX_EMBEDDING_DIM`) — must fit one line with nothing
+    /// shed. The shedding loop drops silently, so this arithmetic is proven
+    /// here rather than hoped about.
+    #[test]
+    fn a_fully_embedded_frame_still_fits_the_line() {
+        // 512 int8 bytes base64 to 684 chars; any 684-char string weighs the
+        // same on the wire, so the arithmetic needs no live embedder here.
+        let embedding = "A".repeat(684);
+        let dets: Vec<Det> = worst_case(MAX_OBJECTS, MAX_LABEL_BYTES)
+            .into_iter()
+            .map(|mut det| {
+                det.embedding = Some(embedding.clone());
+                det
+            })
+            .collect();
+
+        let (json, kept) = objects(&dets);
+        assert_eq!(kept, MAX_OBJECTS);
+        assert!(json.len() <= MAX_LINE_BYTES, "{} bytes", json.len());
+    }
+
+    /// An absent embedding is not a serialized null: the field's spelling is
+    /// byte-identical to a build that has never heard of it.
+    #[test]
+    fn an_absent_embedding_never_reaches_the_wire() {
+        let (json, _) = objects(&[det("person", 0.9)]);
+        assert!(!json.contains("embedding"));
     }
 
     #[test]
@@ -1017,6 +1061,27 @@ mod tests {
             publisher
                 .line_for(camera_id, pts, SystemTime::UNIX_EPOCH, &[])
                 .map(|json| parse(&json))
+        }
+
+        /// A seed re-reports position, not appearance: the remembered clone
+        /// the seeded line re-emits has its embedding stripped.
+        #[test]
+        fn seeds_do_not_repeat_embeddings() {
+            let (streams, mut publisher) = publisher(&["cam"]);
+            start(&streams, "cam", EPOCH);
+
+            let mut with_feature = det("person", 0.9);
+            with_feature.embedding = Some("QUJD".to_string());
+            let line = publisher
+                .line_for("cam", 900, SystemTime::UNIX_EPOCH, &[with_feature])
+                .unwrap();
+            assert!(line.contains("\"embedding\":\"QUJD\""));
+
+            let seeded = publisher
+                .seeded_line_for("cam", 1_800, SystemTime::UNIX_EPOCH)
+                .unwrap();
+            assert!(seeded.contains("person"));
+            assert!(!seeded.contains("embedding"));
         }
 
         /// One real inference's line.

@@ -32,11 +32,15 @@ defmodule Cairn.Observation do
   @type time_base :: {pos_integer(), pos_integer()}
 
   @type object :: %{
-          label: String.t(),
-          score: float(),
-          bbox: [number()],
-          track_id: String.t() | nil,
-          observation_kind: String.t()
+          :label => String.t(),
+          :score => float(),
+          :bbox => [number()],
+          :track_id => String.t() | nil,
+          :observation_kind => String.t(),
+          # Present only when the plugin ran an embedder: 1..512 raw int8
+          # bytes (dequantize as byte/127). Absence, not nil, is the
+          # embedder-less spelling — see `Cairn.PluginProtocol.validate_object`.
+          optional(:embedding) => binary()
         }
 
   @type t :: %__MODULE__{

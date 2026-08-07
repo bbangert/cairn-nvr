@@ -172,10 +172,19 @@ An object is a detection plus optional identity:
 | `bbox` | `[x, y, w, h]` | **required.** Exactly four numbers; `x`, `y`, `w`, `h` all in 0..1, and `w`, `h` strictly greater than zero. See [Geometry](#geometry) |
 | `track_id` | string 1..64 bytes | optional; your own identity for this object. Same charset rule as `label`. **Accepted, currently unused — reserved:** the host performs its own tracking and ignores plugin track ids (see [Track identity](#track-identity)) |
 | `observation_kind` | `"detected"` or `"tracked"` | optional, default `"detected"`. Any other value refuses the object |
+| `embedding` | base64 string, ≤684 chars | optional; a person Re-ID feature. The decoded bytes are a **symmetric int8 quantization of a unit-norm float vector at the fixed scale 127** (component `i` restores as `byte_i / 127`), at most 512 dimensions. Sent only when the plugin runs an embedder (`--embedder-model`), on `"detected"` person objects, never on seeds — a seed re-reports a position, not an appearance. Non-base64, empty, or over-length refuses the object |
 
 An object that breaks these rules is dropped **on its own** — the rest of
 the line still counts, and the drop is tallied under `invalid_det`. (Contrast
 an over-long `objects` list, which drops the line.)
+
+The embedding's crops come from the detector's own model-input tensor
+(the phase-4.1 crop-source spike: separability within 0.016 AUC of
+full-resolution crops at a fifth of the marginal cost), and 512
+dimensions is the wire ceiling by arithmetic: 64 objects × 684 base64
+chars plus the worst-case base line stay inside the 64 KB framing bound,
+where a raw-float spelling would push real lines into detection
+shedding.
 
 `"tracked"` means *you predicted this object without detecting it in this
 frame*. It keeps the object's track alive but is never evidence: it cannot

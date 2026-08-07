@@ -11,7 +11,9 @@ use ort::session::{Session, SessionOutputs};
 use ort::value::Tensor;
 
 use super::super::heads::Raw;
-use super::super::resolve::{declared_input_size, static_output_dims, Declared};
+use super::super::resolve::{
+    declared_input_batch, declared_input_size, static_output_dims, Declared,
+};
 use super::{Backend, BackendKind, InputTensor, ModelIo, SessionOptions, Tensors};
 
 pub(in crate::infer) struct OrtBackend {
@@ -44,6 +46,7 @@ impl Backend for OrtBackend {
         let io = ModelIo {
             input_name: input.name().to_string(),
             declared_input_size: declared_input_size(input.dtype()),
+            declared_input_batch: declared_input_batch(input.dtype()),
             outputs: session
                 .outputs()
                 .iter()

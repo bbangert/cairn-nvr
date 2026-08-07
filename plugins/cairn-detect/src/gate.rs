@@ -831,6 +831,7 @@ mod tests {
                 bbox: [0.1, 0.2, 0.3, 0.4],
                 observation_kind: ObservationKind::Detected,
                 evidence: true,
+                embedding: None,
             }
         }
 

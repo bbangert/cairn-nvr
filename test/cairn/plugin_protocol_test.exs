@@ -200,6 +200,30 @@ defmodule Cairn.PluginProtocolTest do
       assert obs.ended_tracks == ["t-0"]
     end
 
+    test "objects carry a decoded embedding; absent leaves the key off" do
+      encoded = Base.encode64(<<1, 2, 3, 250>>)
+      line = v1(%{"objects" => [Map.put(@base, "embedding", encoded), @base]})
+
+      assert {:objects, obs} = PluginProtocol.decode_line(line, :group)
+      assert [%{embedding: <<1, 2, 3, 250>>}, plain] = obs.objects
+      # An embedder-less object is the same map it was before the field
+      # existed — that absence is what keeps goldens and consumers stable.
+      refute Map.has_key?(plain, :embedding)
+    end
+
+    test "a malformed embedding refuses the object, not the line" do
+      over_contract = Base.encode64(:binary.copy(<<7>>, 513))
+
+      for bad <- ["not base64!!", "", over_contract, 42] do
+        line = v1(%{"objects" => [Map.put(@base, "embedding", bad), @base]})
+
+        assert {:objects, obs} = PluginProtocol.decode_line(line, :group)
+        assert [plain] = obs.objects
+        refute Map.has_key?(plain, :embedding)
+        assert obs.invalid_objects == 1
+      end
+    end
+
     test "an empty objects list is a valid observation" do
       assert {:objects, %{objects: []}} =
                PluginProtocol.decode_line(v1(%{"objects" => []}), :group)

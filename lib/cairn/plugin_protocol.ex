@@ -40,6 +40,10 @@ defmodule Cairn.PluginProtocol do
   # use for them and a log line or a terminal does.
   @label_escapes ["\a", "\b", "\t", "\n", "\v", "\f", "\r", "\e"]
   @max_track_id_bytes 64
+  # A 512-dim int8 feature base64s to 684 characters, and 512 is the largest
+  # the plugin will open (`MAX_EMBEDDING_DIM` in cairn-detect's embedder) —
+  # anything longer is not a bigger embedding, it is a violated contract.
+  @max_embedding_chars 684
   @max_ended_tracks 64
   @max_camera_id_bytes 256
   @default_time_base {1, 90_000}
@@ -365,12 +369,35 @@ defmodule Cairn.PluginProtocol do
   defp validate_object(object) do
     with {:ok, det} <- validate_det(object),
          {:ok, track_id} <- track_id(object),
-         {:ok, kind} <- observation_kind(object) do
-      {:ok, Map.merge(det, %{track_id: track_id, observation_kind: kind})}
+         {:ok, kind} <- observation_kind(object),
+         {:ok, embedding} <- embedding(object) do
+      object = Map.merge(det, %{track_id: track_id, observation_kind: kind})
+      # Merged only when present: an embedder-less line's objects must be
+      # the same maps they were before the field existed — consumers read
+      # `Map.get(object, :embedding)` and absent means what nil would.
+      {:ok, if(embedding, do: Map.put(object, :embedding, embedding), else: object)}
     else
       _other -> :error
     end
   end
+
+  # The optional Re-ID feature: base64 of a symmetric-int8 unit vector at the
+  # fixed scale 127 (the plugin quantizes, we keep the raw bytes — dequantizing
+  # to floats belongs to the consumer that defines the distance). Absent on
+  # most objects and on every line of an embedder-less plugin. Malformed —
+  # non-base64, empty, or over the largest contract dimension — refuses the
+  # object, per the malformed-known-field rule. No printability check, unlike
+  # `track_id/1`: these are opaque bytes that never reach a log or a terminal.
+  defp embedding(%{"embedding" => encoded})
+       when is_binary(encoded) and byte_size(encoded) in 1..@max_embedding_chars do
+    case Base.decode64(encoded) do
+      {:ok, bytes} when byte_size(bytes) in 1..512 -> {:ok, bytes}
+      _other -> :error
+    end
+  end
+
+  defp embedding(%{"embedding" => _other}), do: :error
+  defp embedding(_object), do: {:ok, nil}
 
   # Parsed for wire compatibility; the host currently ignores it (reserved) —
   # `Cairn.Tracker` assigns every identity itself. Validated on the same

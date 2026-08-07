@@ -273,6 +273,11 @@ impl Labels {
         Ok(Self(names))
     }
 
+    /// Whether any class resolves to this label name.
+    pub fn contains(&self, name: &str) -> bool {
+        self.0.iter().any(|label| label == name)
+    }
+
     /// Names loaded; 0 when `--labels` was not given.
     pub fn count(&self) -> usize {
         self.0.len()
