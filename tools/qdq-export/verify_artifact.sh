@@ -30,10 +30,13 @@ fi
 [ -x "$BIN" ] || { echo "no release binary at $BIN — cargo build --release first"; exit 1; }
 [ -n "$CLIP" ] && [ -f "$CLIP" ] || { echo "no fixture clip (set CLIP=)"; exit 1; }
 
-OUT=$(mktemp -t verify_artifact_XXXXXX.ndjson)
-ERR="${OUT%.ndjson}.err"
+# A temp dir rather than templated files: BSD mktemp requires trailing
+# X's in file templates, and the dir gives both outputs one home.
+WORK=$(mktemp -d)
+OUT="$WORK/run.ndjson"
+ERR="$WORK/run.err"
 PLUGIN=""
-trap 'kill "${PLUGIN:-}" 2>/dev/null; rm -f "$OUT" "$ERR"' EXIT
+trap '[ -n "$PLUGIN" ] && kill "$PLUGIN" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 # The brace group is the control channel: the plugin emits nothing
 # without a stream epoch, and exits on stdin EOF — the trailing sleep
@@ -55,8 +58,16 @@ for _ in $(seq 50); do
 done
 grep -q "cairn-detect up:" "$ERR" || { cat "$ERR"; exit 1; }
 
-"$VERIFY/feed.py" --port "$PORT" --duration "$SECS" --clip "$CLIP" --loops 3 || true
+# The feed's exit status is reported but not fatal: feed.py stops its
+# ffmpeg by signal at --duration, and a short feed still leaves frames
+# for validate_ndjson below — which exits nonzero on an empty run and
+# is the check that actually guards against a feed that died at once.
+"$VERIFY/feed.py" --port "$PORT" --duration "$SECS" --clip "$CLIP" --loops 3 \
+  || echo "note: feed exited $? (non-fatal; validation below is the gate)"
+# The plugin's normal end is nonzero by design: stdin EOF is _exit(3)
+# ("control channel gone"), so its status cannot gate this script.
 wait "$PLUGIN" || true
+PLUGIN=""
 
 grep "cairn-detect up:" "$ERR"
 "$VERIFY/validate_ndjson.py" < "$OUT"

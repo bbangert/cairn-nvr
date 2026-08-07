@@ -10,5 +10,9 @@ set -eu
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 SRC=${SRC:-$ROOT/data/events/reolink_main}
 OUT=${OUT:-$ROOT/plugins/cairn-detect/model/calib_frames_fullres}
-clips=$(ls -t "$SRC"/*.mp4 | sed -n 1,20p)
+clips=$(ls -t "$SRC"/*.mp4 2>/dev/null | sed -n 1,20p)
+if [ -z "$clips" ]; then
+  echo "no .mp4 recordings under $SRC — nothing to calibrate from" >&2
+  exit 1
+fi
 sh "$(dirname "$0")/capture_frames.sh" "$OUT" $clips
