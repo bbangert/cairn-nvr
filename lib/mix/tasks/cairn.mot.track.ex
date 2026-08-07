@@ -27,9 +27,9 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
     * `--ocr` / `--no-ocr` — observation-centric recovery stage (default off)
     * `--reid` / `--no-reid` — Re-ID appearance fusion inside the bbd admission
       (default off). A tracker-only run carries no embeddings — no plugin runs
-      here to produce them — so this flag only matters once a det file (or a
-      future E2E run) carries the phase-4 embedding field for the fusion to
-      read; until then it is accepted but inert.
+      here to produce them — so in THIS mode the flag is accepted but inert;
+      the mode that feeds it is `mix cairn.mot.ndjson`, whose captures carry
+      the phase-4 embedding field.
     * `--twin-mint` / `--no-twin-mint` — twin-mint guard (default on)
     * `--min-score FLOAT` — tracker admission floor (`min_score`
       `"default"` key; default 0.5). `0.0` floors nothing.
@@ -50,9 +50,7 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
 
   use Mix.Task
 
-  alias Cairn.{Observation, Tracker}
-
-  @camera_id "mot"
+  alias Cairn.MotBench
 
   @switches [
     out: :string,
@@ -87,26 +85,35 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
     fps = opts[:fps] || seqinfo.frame_rate
 
     if fps <= 0, do: Mix.raise("fps must be > 0, got #{fps}")
-    policy = policy(opts)
+    policy = MotBench.policy(opts)
     det_min = opts[:det_min]
 
     {dets_by_frame, stats} =
       load_detections!(Path.join([seq_dir, "det", "det.txt"]), seqinfo, det_min)
 
-    {lines, emitted, minted} = track_sequence(dets_by_frame, seqinfo, fps, policy)
+    frames =
+      for frame <- 1..seqinfo.seq_length,
+          do: {frame, at_ms(frame, fps), Map.get(dets_by_frame, frame, [])}
 
-    File.mkdir_p!(Path.dirname(out))
-    File.write!(out, lines)
+    {lines, emitted, minted} = MotBench.drive(frames, seqinfo, policy)
 
-    write_sidecar(out, %{
+    MotBench.write_pred!(out, lines)
+
+    MotBench.write_sidecar(out, %{
+      task: "cairn.mot.track",
+      seq: seqinfo.name,
       seq_dir: seq_dir,
-      seqinfo: seqinfo,
       fps: fps,
-      policy: policy,
+      seq_length: seqinfo.seq_length,
+      image_size: [seqinfo.im_width, seqinfo.im_height],
       det_min: det_min,
-      stats: stats,
-      emitted: emitted,
-      minted: minted
+      detections_total: stats.total,
+      detections_below_det_min: stats.below_det_min,
+      detections_clamped_out: stats.clamped_out,
+      detections_kept: stats.kept,
+      lines_emitted: emitted,
+      tracks_minted: minted,
+      policy: policy
     })
 
     Mix.shell().info(
@@ -115,98 +122,9 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
     )
   end
 
-  # -- tracking ---------------------------------------------------------------
-
-  defp track_sequence(dets_by_frame, seqinfo, fps, policy) do
-    initial = {Tracker.new(), %{ids: %{}, next: 1}, [], 0}
-
-    {_tracker, canon, lines, emitted} =
-      Enum.reduce(1..seqinfo.seq_length, initial, fn frame, {tracker, canon, lines, emitted} ->
-        at_ms = at_ms(frame, fps)
-        objects = Map.get(dets_by_frame, frame, [])
-
-        observation = %Observation{
-          camera_id: @camera_id,
-          epoch: @camera_id,
-          at_ms: at_ms,
-          observed_at: wall(at_ms)
-        }
-
-        context = Tracker.context(observation, @camera_id, policy)
-        {tracker, tagged, _events} = Tracker.track(tracker, objects, context)
-
-        {canon, frame_lines} = emit_frame(frame, tagged, seqinfo, canon)
-        {tracker, canon, [lines, frame_lines], emitted + length(tagged)}
-      end)
-
-    {lines, emitted, canon.next - 1}
-  end
-
-  # Ordinals are assigned at first sight in `tagged` order, which is input
-  # order and therefore deterministic even though ULIDs are not.
-  defp emit_frame(frame, tagged, seqinfo, canon) do
-    {frame_lines, canon} =
-      Enum.map_reduce(tagged, canon, fn %{object_id: object_id, bbox: bbox}, canon ->
-        {ordinal, canon} = ordinal(canon, object_id)
-        {mot_line(frame, ordinal, bbox, seqinfo), canon}
-      end)
-
-    {canon, frame_lines}
-  end
-
-  defp ordinal(%{ids: ids, next: next} = canon, object_id) do
-    case ids do
-      %{^object_id => ordinal} -> {ordinal, canon}
-      _missing -> {next, %{canon | ids: Map.put(ids, object_id, next), next: next + 1}}
-    end
-  end
-
-  defp mot_line(frame, id, [x, y, w, h], %{im_width: iw, im_height: ih}) do
-    [
-      Integer.to_string(frame),
-      ",",
-      Integer.to_string(id),
-      ",",
-      px(x * iw),
-      ",",
-      px(y * ih),
-      ",",
-      px(w * iw),
-      ",",
-      px(h * ih),
-      ",1,-1,-1,-1\n"
-    ]
-  end
-
-  defp px(value), do: :erlang.float_to_binary(value / 1, decimals: 2)
-
   # MOT frames are 1-indexed; frame 1 is t=0 and each step advances 1000/fps.
   @doc false
   def at_ms(frame, fps), do: round((frame - 1) * 1000 / fps)
-
-  # `observed_at` is reporting data, not a clock the tracker decides on
-  # (same convention as the golden harness).
-  defp wall(at_ms), do: DateTime.add(~U[2026-07-26 12:00:00Z], at_ms, :millisecond)
-
-  # -- policy -----------------------------------------------------------------
-
-  # Scalar defaults mirror the soak/golden policy; stage flags default to the
-  # production defaults (bbd/oru/ocr off, twin_mint on). Hardcoded rather than
-  # read from `Cairn.Config`: a measurement must not move because a config
-  # default did.
-  defp policy(opts) do
-    %{
-      max_unseen_ms: Keyword.get(opts, :max_unseen_ms, 3_000),
-      max_live_tracks: Keyword.get(opts, :max_live_tracks, 128),
-      stationary_after_ms: Keyword.get(opts, :stationary_after_ms, 10_000),
-      min_score: %{"default" => Keyword.get(opts, :min_score, 0.5)},
-      bbd: Keyword.get(opts, :bbd, false),
-      oru: Keyword.get(opts, :oru, false),
-      ocr: Keyword.get(opts, :ocr, false),
-      reid: Keyword.get(opts, :reid, false),
-      twin_mint: Keyword.get(opts, :twin_mint, true)
-    }
-  end
 
   # -- input parsing ----------------------------------------------------------
 
@@ -323,38 +241,6 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
     case File.read(path) do
       {:ok, content} -> content
       {:error, reason} -> Mix.raise("cannot read #{what} at #{path}: #{inspect(reason)}")
-    end
-  end
-
-  # -- config echo ------------------------------------------------------------
-
-  defp write_sidecar(out, run) do
-    config = %{
-      task: "cairn.mot.track",
-      git_sha: git_sha(),
-      seq: run.seqinfo.name,
-      seq_dir: run.seq_dir,
-      fps: run.fps,
-      seq_length: run.seqinfo.seq_length,
-      image_size: [run.seqinfo.im_width, run.seqinfo.im_height],
-      det_min: run.det_min,
-      detections_total: run.stats.total,
-      detections_below_det_min: run.stats.below_det_min,
-      detections_clamped_out: run.stats.clamped_out,
-      detections_kept: run.stats.kept,
-      lines_emitted: run.emitted,
-      tracks_minted: run.minted,
-      policy: %{run.policy | min_score: run.policy.min_score["default"]}
-    }
-
-    sidecar = Path.rootname(out) <> ".config.json"
-    File.write!(sidecar, Jason.encode_to_iodata!(config, pretty: true))
-  end
-
-  defp git_sha do
-    case System.cmd("git", ["rev-parse", "HEAD"], stderr_to_stdout: true) do
-      {sha, 0} -> String.trim(sha)
-      _other -> "unknown"
     end
   end
 end
