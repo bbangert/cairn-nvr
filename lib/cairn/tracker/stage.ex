@@ -14,8 +14,9 @@ defmodule Cairn.Tracker.Stage do
       `Cairn.Tracker.Stage.Oru` is one.
 
   Which stages run is the host's decision, not the stage's: today the lists
-  are translated from the tracker context's `bbd`/`oru` booleans
-  (`batch_stages/1` and `per_object_stages/1` in `Cairn.Tracker`), and a
+  are translated from the tracker context's `bbd`/`oru`/`ocr` booleans
+  (`batch_stages/1`, `per_object_stages/1` and `recovery_stages/1` in
+  `Cairn.Tracker`), and a
   listed stage runs unconditionally — a stage does not read a feature flag
   to decide whether to act. Profiles later replace that translation with a
   configured list travelling the same plumbing, validated by
@@ -97,6 +98,7 @@ defmodule Cairn.Tracker.Stage do
   @type lists :: %{
           association_one: [{module(), params()}],
           association_two: [{module(), params()}],
+          recovery: [{module(), params()}],
           minting: [{module(), params()}],
           per_object: [{module(), params()}]
         }
@@ -161,12 +163,14 @@ defmodule Cairn.Tracker.Stage do
     with :ok <- validate_shape(lists),
          :ok <- validate_kinds(lists.association_one, :batch, "association one"),
          :ok <- validate_kinds(lists.association_two, :batch, "association two"),
+         :ok <- validate_kinds(lists.recovery, :batch, "recovery"),
          :ok <- validate_kinds(lists.minting, :batch, "minting"),
          :ok <- validate_kinds(lists.per_object, :per_object, "per-object"),
          :ok <- validate_adjacency(lists.association_one, "association one"),
          :ok <- validate_adjacency(lists.association_two, "association two"),
          :ok <- validate_terminal(lists.association_one, "association one"),
          :ok <- validate_terminal(lists.association_two, "association two"),
+         :ok <- validate_terminal(lists.recovery, "recovery"),
          :ok <- validate_terminal(lists.minting, "minting") do
       validate_pairing(lists)
     end
@@ -179,11 +183,13 @@ defmodule Cairn.Tracker.Stage do
   defp validate_shape(%{
          association_one: one,
          association_two: two,
+         recovery: recovery,
          minting: minting,
          per_object: per
        })
-       when is_list(one) and is_list(two) and is_list(minting) and is_list(per) do
-    Enum.find_value(one ++ two ++ minting ++ per, :ok, fn
+       when is_list(one) and is_list(two) and is_list(recovery) and is_list(minting) and
+              is_list(per) do
+    Enum.find_value(one ++ two ++ recovery ++ minting ++ per, :ok, fn
       {module, params} when is_atom(module) and is_map(params) ->
         nil
 
@@ -197,7 +203,7 @@ defmodule Cairn.Tracker.Stage do
   defp validate_shape(other) do
     {:error,
      "stage lists must be a map with association_one, association_two, " <>
-       "minting and per_object lists, got: #{inspect(other)}"}
+       "recovery, minting and per_object lists, got: #{inspect(other)}"}
   end
 
   defp validate_kinds(list, kind, where) do

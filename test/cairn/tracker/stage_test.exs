@@ -33,7 +33,13 @@ defmodule Cairn.Tracker.StageTest do
 
   defp lists(overrides) do
     Map.merge(
-      %{association_one: [], association_two: [], minting: [], per_object: []},
+      %{
+        association_one: [],
+        association_two: [],
+        minting: [],
+        per_object: [],
+        recovery: []
+      },
       Map.new(overrides)
     )
   end
@@ -47,7 +53,8 @@ defmodule Cairn.Tracker.StageTest do
                  association_one: bbd,
                  association_two: bbd,
                  minting: [{Stage.TwinMint, %{}}],
-                 per_object: [{Stage.Oru, %{}}]
+                 per_object: [{Stage.Oru, %{}}],
+                 recovery: [{Stage.Ocr, %{}}]
                )
              )
   end

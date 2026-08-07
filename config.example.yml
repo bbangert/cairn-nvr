@@ -38,7 +38,7 @@ events:
   max_event_seconds: 300
 
 # Object tracking (the three bounds here are per-camera overridable under the
-# camera; bbd and oru are not — see the note under them).
+# camera; bbd, oru and ocr are not — see the note under them).
 # A track that goes unseen for this much *stream* time is ended — five times
 # that while it is stationary, so a parked object outlasts what parks in front
 # of it; its object_id (a ULID) is never handed to anything else.
@@ -67,20 +67,27 @@ events:
 # that the coast is still close to what it measured, over it a straight line
 # between two sightings is a guess of its own — and a stretch the plugin is
 # re-reporting a still object through is never one of them. Off by default.
+# ocr (observation-centric recovery) runs after both association passes and
+# bbd: a live coasted track is offered against whatever detections are still
+# unmatched using its last observed box, not its Kalman prediction — the
+# recovery a mover that pauses behind an occluder and reappears where it
+# vanished needs, since its prediction has since drifted off that spot. A
+# stationary track is excluded, for bbd's reason. Off by default.
 #
-# Neither has a per-camera form: they describe the matcher and the motion
-# filter rather than a scene, so they are one answer for every camera that is
-# not covered by a hardware profile. A profile is the other way to answer them
-# — per plugin group, i.e. per piece of hardware — and for the cameras on a
-# profiled group these two keys are ignored entirely, with a warning at load
-# saying the profile won. See docs/profile-authoring.md; profiles are the
-# migration target for both, and there is no deadline.
+# None of the three has a per-camera form: they describe the matcher and the
+# motion filter rather than a scene, so they are one answer for every camera
+# that is not covered by a hardware profile. A profile is the other way to
+# answer them — per plugin group, i.e. per piece of hardware — and for the
+# cameras on a profiled group these three keys are ignored entirely, with a
+# warning at load saying the profile won. See docs/profile-authoring.md;
+# profiles are the migration target for all three, and there is no deadline.
 tracking:
   max_unseen_ms: 3000
   max_live_tracks: 128
   stationary_after_ms: 10000
   bbd: false
   oru: false
+  ocr: false
 
 # Days to keep event clips; per-label overrides win. Track rows keep their own
 # clock (tracks_days) and are exempt from emergency disk cleanup.

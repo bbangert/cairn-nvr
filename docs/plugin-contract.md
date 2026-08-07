@@ -556,8 +556,14 @@ setting, `tracking.oru`, changes what the motion filter believes after a gap
 rather than what matching admits: a detection closing an unmatched gap of one
 to ten seconds rebuilds the filter across it from the two real boxes either
 side, instead of correcting the heading it was coasting on. A stretch you are
-re-reporting as `"tracked"` never counts as such a gap. Both settings are
-global, and both are superseded for the cameras of a plugin group that carries
+re-reporting as `"tracked"` never counts as such a gap. A third off-by-default
+setting, `tracking.ocr`, runs after both association passes and BBD: it offers
+a live coasted track's *last observed* box, not its Kalman prediction, against
+whatever detections are still unmatched — recovering a mover that pauses
+behind an occluder and reappears where it vanished, since the prediction has
+since drifted off that spot. A stationary track is excluded from it, for the
+same reason BBD excludes one. All three settings are
+global, and all three are superseded for the cameras of a plugin group that carries
 a hardware profile: that file lists the host-side stages that go with the model
 it names, so the same plugin can meet a different host-side stage set on
 different hardware ([`docs/profile-authoring.md`](profile-authoring.md)).
@@ -670,6 +676,7 @@ only that much.
 | `tracking.stationary_after_ms` | default 10 000 ms of tracking time | track flagged `stationary`, and no longer event evidence |
 | host IoU match threshold | 0.1 (0.7 for a stationary track in extended grace) | below it, a new track is minted — unless `tracking.bbd` is on and admits the pair on centre distance |
 | `tracking.oru` gap window | 1 000–10 000 ms since the track last took an observation | inside it, and with the flag on, the track's motion filter is rebuilt across the gap |
+| `tracking.ocr` recovery threshold | 0.4 of overlap with a live coasted track's last observed box | below it, no recovery; at or above it, and with the flag on, the detection resumes the track |
 | reset-adoption threshold | 0.4 of overlap with a same-label suspended box | below it, a new track is minted |
 | reset-adoption window | 60 000 ms of tracking time past the cut | track ended (`stream_reset`) |
 | `track_updated` throttle | best-score improvement, or 1 000 ms | update not published |

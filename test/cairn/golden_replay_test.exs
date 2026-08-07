@@ -32,7 +32,7 @@ defmodule Cairn.GoldenReplayTest do
   end
 
   describe "step-script replays" do
-    for name <- ~w(adoption_across_cut cap_eviction epoch_change twin_mint_off) do
+    for name <- ~w(adoption_across_cut cap_eviction epoch_change ocr_on twin_mint_off) do
       test "#{name} replays to its golden" do
         first = GoldenReplay.replay_steps(unquote(name))
         second = GoldenReplay.replay_steps(unquote(name))
@@ -81,6 +81,7 @@ defmodule Cairn.GoldenReplayTest do
         min_score: %{"default" => 0.5},
         bbd: true,
         oru: false,
+        ocr: false,
         twin_mint: false
       }
 

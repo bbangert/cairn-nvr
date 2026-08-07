@@ -83,6 +83,7 @@ sample_fps: 3              # optional; fps_band only validates it, never emits i
 tracking:                  # the stage list, plus band-tuned tracker bounds
   bbd: true
   oru: true
+  ocr: true
   twin_mint: true
   max_unseen_ms: 3000
   max_live_tracks: 128
@@ -108,7 +109,7 @@ picks which one becomes `--model`.
 | `backend` | `ort`, `rknn`, `qnn` | `BackendKind`, `plugins/cairn-detect/src/infer/backend.rs` — mirrored in `Cairn.Config.Profile`'s capability table |
 | `model_profile` | `yolox`, `yolov10` (or `yolo26`), `yolov8` (or `yolov9`, `yolo11`, `yolov11`), `rfdetr` (or `rf-detr`) | `PROFILES`, `plugins/cairn-detect/src/infer/catalog.rs` |
 | `decoder` | `auto`, `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` | `DecoderKind`, `plugins/cairn-detect/src/decode.rs` |
-| `tracking:` stage keys | `bbd`, `oru`, `twin_mint` | `Cairn.Tracker.Stage.Bbd` / `.Oru` / `.TwinMint` |
+| `tracking:` stage keys | `bbd`, `oru`, `ocr`, `twin_mint` | `Cairn.Tracker.Stage.Bbd` / `.Oru` / `.Ocr` / `.TwinMint` |
 
 Aliases are names, not families: `yolo11` and `yolov8` are the same catalog row
 (several Ultralytics generations export byte-identical tensor layouts), and the
@@ -163,12 +164,13 @@ Three states, and the difference between the last two matters:
   how `qcs6490.yml` turns off the cold-start twin gate that every other
   profile leaves on.
 - **block absent entirely** — the profile says nothing about tracking, and the
-  camera's global `tracking.bbd`/`tracking.oru` booleans stand as they always
-  did. A backend-only profile does not silently delist anything.
+  camera's global `tracking.bbd`/`tracking.oru`/`tracking.ocr` booleans stand
+  as they always did. A backend-only profile does not silently delist
+  anything.
 
 `true` and an empty mapping mean the same thing. A params mapping is carried
 through to the stage, and **no stage cairn ships reads its params today** —
-every one of the three takes its constants from its own module. Write
+every one of the four takes its constants from its own module. Write
 `bbd: true`; a `bbd: {threshold: 0.4}` will parse, reach the stage, and change
 nothing.
 
@@ -291,8 +293,8 @@ Two warnings, which do not fail the load:
 ```
 profile rk3576: /etc/cairn/profiles/rk3576.yml shadows a previously loaded
   profile of the same name
-plugin detect: profile my-board supersedes the global tracking.bbd/oru flags
-  for its cameras — the profile's stage list wins
+plugin detect: profile my-board supersedes the global tracking.bbd/oru/ocr
+  flags for its cameras — the profile's stage list wins
 ```
 
 A profile's *files* are checked only for a profile some group actually runs, so
@@ -333,18 +335,19 @@ Changing a *shipped* profile is a behaviour change for everyone running that
 board. Adding a comment or correcting a band is cheap; changing a stage set
 should carry the measurement that justifies it.
 
-## Migrating from `tracking.bbd` / `tracking.oru`
+## Migrating from `tracking.bbd` / `tracking.oru` / `tracking.ocr`
 
-Nothing breaks and there is no deadline. The two global booleans keep working
+Nothing breaks and there is no deadline. The three global booleans keep working
 exactly as they did for every camera whose group has no profile.
 
 What changes is what they are *for*. They were introduced as fleet-wide rollout
-switches for two matcher/filter behaviours, global-only because a fleet where
-half the cameras associate one way and half the other was not something an
-operator could reason about. A profile is that reasoning: it splits the fleet
-by *hardware*, per plugin group, with a file naming which board it is talking
-about. So the booleans are now the unprofiled path — still the whole answer for
-a homogeneous fleet, and superseded per group by anything that names a profile.
+switches for matcher/filter/recovery behaviours, global-only because a fleet
+where half the cameras associate one way and half the other was not something
+an operator could reason about. A profile is that reasoning: it splits the
+fleet by *hardware*, per plugin group, with a file naming which board it is
+talking about. So the booleans are now the unprofiled path — still the whole
+answer for a homogeneous fleet, and superseded per group by anything that
+names a profile.
 
 For a **profiled** group the booleans are ignored entirely; the profile's
 `tracking:` block is the stage list. Setting both is legal and produces a

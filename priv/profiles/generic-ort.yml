@@ -1,10 +1,10 @@
 # The migration target for an existing config: what cairn already does, named.
 #
 # A group that adopts this profile keeps today's behaviour — yolox at 416 on
-# onnxruntime's CPU provider, the cold-start twin gate on, and neither of the
-# two opt-in association/filter stages — and gains what the global
-# `tracking.bbd`/`oru` booleans never had: one file per hardware class, checked
-# at load, expanding into both halves of the boundary at once. See
+# onnxruntime's CPU provider, the cold-start twin gate on, and none of the
+# opt-in association/filter/recovery stages — and gains what the global
+# `tracking.bbd`/`oru`/`ocr` booleans never had: one file per hardware class,
+# checked at load, expanding into both halves of the boundary at once. See
 # `docs/profile-authoring.md` for the migration, which is two config lines.
 #
 # The one shipped profile that is not experimental: `ort` is the backend that
