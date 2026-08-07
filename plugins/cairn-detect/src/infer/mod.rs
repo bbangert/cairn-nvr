@@ -47,7 +47,7 @@ pub(super) const MAX_DETS: usize = 32;
 // items that were `pub` only because everything shared one module — PROFILES,
 // the four family constants, Layout, Outputs, Declared and the rest — are named
 // nowhere outside `infer` and are no longer re-exported (T1.4).
-pub use backend::BackendKind;
+pub use backend::{BackendKind, QnnOptions};
 pub use detector::Detector;
 pub use embedder::{embed_persons, Embedder};
 pub use geometry::{Fit, InputSize, Projection};

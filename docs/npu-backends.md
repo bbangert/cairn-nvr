@@ -12,6 +12,9 @@ on hardware before being baked into profile fps bands.
 - Path exists through the ort Rust crate: register the QNN EP with
   `backend_path` pointing at the HTP shared library. Per-SoC tuning:
   `htp_arch` (68 for QCS6490), `htp_performance_mode`, `vtcm_mb`.
+  *(Superseded by measurement: the wiring that landed uses the ORT ≥1.22
+  plugin-EP registration instead of `backend_path` — see "QNN wiring as
+  landed" below.)*
 - Models must be quantized to QDQ format (uint16 activations / uint8
   weights) via the onnxruntime quantization API or Qualcomm AIMET. No
   dynamic shapes on HTP. Context binary caching (`ep.context_enable`) cuts
@@ -72,6 +75,55 @@ a second trait impl over rknpu2-rs. The trait's contract should include:
 core mask), (b) a capability report (supports fused NMS? dynamic shapes?)
 that profile validation consumes, (c) model artifact format expected
 (.onnx vs .rknn) — profiles reference backend-specific artifacts.
+
+## QNN wiring as landed (phase 2, 2026-08-07)
+
+What `--backend qnn` actually does, per the phase-0 spike's proven recipe
+(`tools/qnn-spike/README.md` — the version triple, traps, and D-P5
+criterion live there and in
+`.claude/plans/qcs6490-profiles/research/spike-results.md`):
+
+- **Plugin EP, not a custom ORT build.** Stock ONNX Runtime (base 1.26.0
+  on the board) plus the `onnxruntime-qnn` distribution's
+  `libonnxruntime_providers_qnn.so`, registered at open via the ORT ≥1.22
+  plugin-EP API — in ort 2.0.0-rc.12: `Environment::register_ep_library`,
+  then `SessionBuilder::with_devices` over the devices the plugin exposes
+  (`AppendExecutionProvider_V2` underneath). The `qnn` cargo feature /
+  `system` build strategy researched earlier was never needed.
+- **Flags**: `--qnn-library` (the plugin EP .so, required), and
+  `--qnn-soc-model 35 --qnn-htp-arch 68` (required in practice on
+  QCS6490 — platform detection fails without them), plus optional
+  `--qnn-performance-mode`, `--qnn-vtcm-mb`. `backend_type=htp` is always
+  set. The QNN backend libraries must sit beside the plugin EP library;
+  the DSP skel is delivered via `ADSP_LIBRARY_PATH`/`DSP_LIBRARY_PATH`.
+- **Board binary linking**: the aarch64 build uses the crate's
+  `ort-load-dynamic` feature (ort `load-dynamic`), dlopening the exact
+  spike-proven `libonnxruntime.so` at runtime via `ORT_DYLIB_PATH` — no
+  ORT libraries at cross-link time, no version skew against the plugin.
+  Dev/CI x86 builds keep the default static link.
+- **Fallback posture**: open fails loudly when the plugin registers but
+  exposes no device (no NPU / wrong libs), and the embedder refuses
+  `--backend qnn` outright until a QDQ embedder export exists. Per-node
+  CPU fallback after a successful open is still possible and *invisible*
+  in logs — the only accepted proof of HTP execution is a latency delta
+  vs the `ort` backend (D-P5, ≥3×), which the board-bench harness
+  enforces. The plugin's own surface for that check is the
+  `infer latency: backend=… p50=… p95=…` stderr line `Detector::detect`
+  emits every 100 runs.
+- **Measured, phase-2 proof runs (2026-08-07, board .87, yolox_nano
+  full-QDQ 416, real RTP feed + software decode)**: CPU EP p50 44.5 ms;
+  QNN/HTP p50 8–12 ms with the `performance` cpufreq governor → 3.6–5.6×,
+  D-P5 PASS. **Trap: the default `schedutil` governor makes QNN read
+  ~19 ms p50** (2.3×, under the bar) at any real frame cadence — the DSP
+  waits interleave with CPU-side EP work, the core never ramps, and the
+  slowdown is flat and noiseless, so it looks exactly like a plausible
+  HTP latency. It is not decode contention (unchanged at 640×480), not
+  input-buffer churn (unchanged with a reused tensor), and not
+  `htp_performance_mode` (inert — the spike's "Unable to set HTP power
+  configurations" watch-item). The tight-loop spike driver never shows it
+  because its own CPU work keeps the core ramped. Bench protocol (phase
+  4) must pin or record the governor; loaded production boards (several
+  cameras decoding) sit near the ramped number by construction.
 
 ## Sources
 

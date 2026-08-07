@@ -11,9 +11,9 @@ defmodule Cairn.Config.PluginGroup do
   treating the argv as one opaque list that never mentions a profile.
 
   `allow_experimental` is the operator's acknowledgement that a profile
-  naming a backend the Rust plugin has not implemented yet may run anyway
-  (the profile must declare `experimental: true` too — `Cairn.Config`
-  enforces both halves).
+  naming a non-ort backend — stubbed (rknn) or not yet proven in soak
+  (qnn) — may run anyway (the profile must declare `experimental: true`
+  too — `Cairn.Config` enforces both halves).
 
   `members` is resolved by
   `Cairn.Config` once the whole file is parsed — one entry per referencing

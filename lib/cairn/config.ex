@@ -743,16 +743,19 @@ defmodule Cairn.Config do
   # them so board profiles can ship before their backends do — but a group
   # actually running one needs both halves of the acknowledgement, the
   # profile's own `experimental:` and the operator's `allow_experimental:`.
-  # Refused at load rather than at group start because this is where an
-  # operator reads diagnostics; a start-time refusal is a respawn loop in a
-  # log file nobody is tailing.
+  # The gate is the same whether the backend is a plugin-side stub (rknn)
+  # or executes but has not soaked (qnn since the phase-2 wiring): non-ort
+  # means experimental until this comment says otherwise. Refused at load
+  # rather than at group start because this is where an operator reads
+  # diagnostics; a start-time refusal is a respawn loop in a log file
+  # nobody is tailing.
   defp check_backend_implemented(acc, _group, %Profile{backend: "ort"}), do: acc
 
   defp check_backend_implemented(acc, group, %Profile{experimental: false} = profile) do
     add_error(
       acc,
       "plugin #{group.name}: profile #{profile.name} uses backend #{profile.backend}, which is " <>
-        "not yet implemented — only ort executes today, and a profile naming another backend " <>
+        "experimental — only ort is proven in soak, and a profile naming another backend " <>
         "must declare experimental: true"
     )
   end
@@ -761,7 +764,7 @@ defmodule Cairn.Config do
     add_error(
       acc,
       "plugin #{group.name}: profile #{profile.name} uses backend #{profile.backend}, which is " <>
-        "not yet implemented — set allow_experimental: true on this plugin group to run it anyway"
+        "experimental — set allow_experimental: true on this plugin group to run it anyway"
     )
   end
 

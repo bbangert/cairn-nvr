@@ -1247,11 +1247,11 @@ defmodule Cairn.ConfigTest do
       assert Map.has_key?(config.profiles, "gone")
     end
 
-    test "a stubbed backend is refused for the group that runs it" do
+    test "a non-experimental profile on a non-ort backend is refused for the group that runs it" do
       map = argv_map("stable-rknn", %{"allow_experimental" => true})
 
       assert {:error, errors} = Config.from_map(map)
-      assert Enum.any?(errors, &(&1 =~ "uses backend rknn, which is not yet implemented"))
+      assert Enum.any?(errors, &(&1 =~ "uses backend rknn, which is experimental"))
       assert Enum.any?(errors, &(&1 =~ "must declare experimental: true"))
     end
 

@@ -287,10 +287,10 @@ plugin detect: command carries --input-size, which profile my-board owns — a
   profiled group's model flags (--model, --model-profile, --input-size,
   --decoder, --labels, --sample-fps) come from its profile alone; drop
   --input-size from command:
-plugin detect: profile my-board uses backend rknn, which is not yet implemented
-  — only ort executes today, and a profile naming another backend must declare
-  experimental: true
-plugin detect: profile my-board uses backend rknn, which is not yet implemented
+plugin detect: profile my-board uses backend rknn, which is experimental
+  — only ort is proven in soak, and a profile naming another backend must
+  declare experimental: true
+plugin detect: profile my-board uses backend rknn, which is experimental
   — set allow_experimental: true on this plugin group to run it anyway
 plugin detect: profile my-board names no model.rknn artifact for its rknn
   backend — a profiled group takes --model from its profile alone

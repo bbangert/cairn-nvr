@@ -21,6 +21,15 @@ libc = "0.2"
 # Typed errors for `infer::resolve`; `anyhow` still owns everything above it.
 thiserror = "2.0"
 
+[features]
+# Board (aarch64) builds: dlopen libonnxruntime.so at runtime (`ORT_DYLIB_PATH`)
+# instead of statically linking ort's downloaded x86 archive. What ships to the
+# board is then the exact base ORT the QNN spike proved against the plugin EP
+# (`tools/qnn-spike/README.md`'s version triple), and cross-linking needs no
+# ORT libs at all. Dev and CI builds stay on the default static link — the QNN
+# code paths compile either way.
+ort-load-dynamic = ["ort/load-dynamic"]
+
 [profile.release]
 lto = "thin"
 # Most of the binary is the statically linked onnxruntime; its debug info is

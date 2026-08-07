@@ -62,7 +62,7 @@ use decode::{DecoderKind, Sample};
 use emit::Publisher;
 use gate::Gate;
 use infer::{
-    BackendKind, Detector, Embedder, InputSize, Labels, ModelProfile, ScoreFloors,
+    BackendKind, Detector, Embedder, InputSize, Labels, ModelProfile, QnnOptions, ScoreFloors,
     TrackFloorOverrides,
 };
 use motion::{MotionConfig, MotionOverrides};
@@ -128,17 +128,45 @@ struct Args {
     #[arg(long)]
     model: PathBuf,
 
-    /// Inference runtime. Only `ort` executes; `rknn` and `qnn` are accepted
-    /// here and refused when the model opens, so a profile naming hardware
-    /// whose runtime has not landed fails with a message about the backend
-    /// rather than a usage error about the flag.
+    /// Inference runtime. `ort` (CPU) and `qnn` (Qualcomm HTP, needs
+    /// `--qnn-library` and a QDQ model) execute; `rknn` is accepted here and
+    /// refused when the model opens, so a profile naming hardware whose
+    /// runtime has not landed fails with a message about the backend rather
+    /// than a usage error about the flag.
     #[arg(long, value_enum, default_value_t = BackendKind::Ort)]
     backend: BackendKind,
+
+    /// The QNN plugin execution-provider library
+    /// (`libonnxruntime_providers_qnn.so`). Required with `--backend qnn`:
+    /// the EP is not compiled into onnxruntime, it is loaded from this file.
+    /// The QNN backend libraries (`libQnnHtp*.so`, `libQnnSystem.so`) must be
+    /// resolvable from it, and the DSP skel via `ADSP_LIBRARY_PATH`.
+    #[arg(long)]
+    qnn_library: Option<PathBuf>,
+
+    /// Qualcomm SoC id for QNN (35 on QCS6490). QNN's own platform detection
+    /// fails on some boards without it.
+    #[arg(long)]
+    qnn_soc_model: Option<u32>,
+
+    /// HTP architecture version for QNN (68 on QCS6490).
+    #[arg(long)]
+    qnn_htp_arch: Option<u32>,
+
+    /// HTP power/latency point for QNN, e.g. `burst`, `balanced`. The
+    /// accepted set is the provider's own.
+    #[arg(long)]
+    qnn_performance_mode: Option<String>,
+
+    /// Tightly-coupled memory for QNN to reserve, in MB.
+    #[arg(long)]
+    qnn_vtcm_mb: Option<u32>,
 
     /// Person Re-ID embedder (osnet-class, NCHW 3-channel with a declared
     /// input size and one static feature output). When given, every emitted
     /// `person` detection carries a base64 int8 `embedding`, cropped from the
-    /// detection pass's own input tensor. Shares `--backend`.
+    /// detection pass's own input tensor. Shares `--backend` — which means it
+    /// is refused with `qnn` until a QDQ embedder artifact exists.
     #[arg(long)]
     embedder_model: Option<PathBuf>,
 
@@ -192,6 +220,16 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+    // The embedder's own open refuses qnn too, but it runs after the
+    // detector's — which on qnn is a multi-second HTP graph compile. An
+    // argv combination that is going down either way should say so before
+    // that, not after.
+    if args.embedder_model.is_some() && args.backend == BackendKind::Qnn {
+        anyhow::bail!(
+            "the embedder does not run on qnn yet (no QDQ embedder artifact) \
+             — drop --embedder-model or use --backend ort"
+        );
+    }
     // Before the model load, which is seconds: the host logs the hello and
     // checks that protocol 1 is in `supported_versions`.
     emit::stdout_line(&emit::hello_line())?;
@@ -246,6 +284,7 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
         args.model_profile,
         &labels,
         args.allow_label_mismatch,
+        qnn_options(args),
     )?;
     let embedder = open_embedder(args, &labels)?;
     eprintln!(
@@ -275,6 +314,19 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
         &labels,
         Publisher::new(streams),
     )
+}
+
+/// The `--qnn-*` flags as one group. Read by `Detector::open` only when
+/// `--backend qnn` — always built, because collecting five `Option`s costs
+/// nothing and keeps both call sites identical.
+fn qnn_options(args: &Args) -> QnnOptions {
+    QnnOptions {
+        library: args.qnn_library.clone(),
+        soc_model: args.qnn_soc_model,
+        htp_arch: args.qnn_htp_arch,
+        performance_mode: args.qnn_performance_mode.clone(),
+        vtcm_mb: args.qnn_vtcm_mb,
+    }
 }
 
 /// The process-wide `--motion-json` knobs, defaulting to "every knob at its
@@ -325,6 +377,7 @@ fn run_single(args: &Args) -> Result<()> {
         args.model_profile,
         &labels,
         args.allow_label_mismatch,
+        qnn_options(args),
     )?;
     let input_spec = detector.input_spec();
     let embedder = open_embedder(args, &labels)?;

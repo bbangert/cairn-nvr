@@ -35,8 +35,9 @@ defmodule Cairn.Config.Profile do
   ```yaml
   # <a profile_dirs entry>/example.yml
   name: example              # optional; must match the filename when present
-  experimental: false        # true before any group may run a stubbed backend
-  backend: ort               # ort | rknn | qnn — only ort executes today
+  experimental: false        # true before any group may run a non-ort backend
+  backend: ort               # ort | rknn | qnn — qnn executes behind the
+                             # experimental gate; rknn is still a stub
   model:                     # per-backend artifact paths
     onnx: models/yolox_nano.onnx
   model_profile: yolox       # Rust catalog family name
@@ -85,9 +86,10 @@ defmodule Cairn.Config.Profile do
   Three things `Cairn.Config` refuses at load rather than at group start,
   which is where an operator reads diagnostics: a `model:` artifact that is
   not on disk, a `labels:` file that is not on disk, and a group running a
-  backend other than `ort` — stubbed until the Rust backend trait lands
-  (D-P10) — unless the profile declares `experimental: true` *and* the group
-  sets `allow_experimental: true`. The two file paths are checked only for a
+  backend other than `ort` — experimental until proven in soak, whether the
+  plugin executes it (qnn) or stubs it (rknn) (D-P10) — unless the profile
+  declares `experimental: true` *and* the group sets
+  `allow_experimental: true`. The two file paths are checked only for a
   profile some group actually runs, so a board profile for hardware this node
   does not have costs it nothing.
 
