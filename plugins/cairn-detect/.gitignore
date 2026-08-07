@@ -8,6 +8,9 @@ __pycache__/
 # in that document, and the frame sets run to tens of megabytes.
 model/quant-venv/
 model/calib_frames/
+# Full-resolution sibling set (tools/qdq-export/capture_frames.sh) —
+# serves the stretch families the 416 letterboxed set cannot.
+model/calib_frames_fullres/
 model/heldout_frames/
 model/heldout10/
 model/all_videos.txt
