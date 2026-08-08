@@ -60,17 +60,15 @@ defmodule Cairn.Native.ParityTest do
       )
 
     assert report.mismatches == [], Enum.map_join(report.mismatches, "\n", &inspect/1)
-    assert report.verdict == :parity
     assert report.matched >= 25
     assert report.objects > 0
 
-    # The clean diff above means nothing if the two runs were lined up by luck:
-    # a margin of 0 is several offsets fitting the evidence equally well, and
-    # the true one agrees where every neighbour disagrees on everything.
-    assert report.alignment.probes > 0
-
-    assert report.alignment.margin > 0,
-           "the alignment was a coin flip: #{inspect(report.alignment)}"
+    # `:parity` rather than the clean diff above, which on its own means nothing
+    # if the two runs were lined up by luck: the verdict is also where a margin
+    # of 0 — several offsets fitting the evidence equally well — is refused as
+    # `:ambiguous_alignment`.
+    assert report.verdict == :parity,
+           "#{report.verdict}, alignment #{inspect(report.alignment)}"
 
     # Task 2.4's deliberate omissions, asserted as the *only* differences: every
     # other field is compared above and any disagreement would be a mismatch.

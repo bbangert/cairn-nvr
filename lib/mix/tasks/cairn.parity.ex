@@ -17,8 +17,9 @@ defmodule Mix.Tasks.Cairn.Parity do
 
   Needs `cargo build --release` in **both** `plugins/cairn-detect` and
   `plugins/cairn-native`, with the latter's `libcairn_native.so` copied to
-  `priv/native/`; plus ffmpeg, ffprobe and python3 on PATH. Exits nonzero on a
-  divergence, so it is usable as a gate.
+  `priv/native/`; plus ffmpeg, ffprobe and python3 on PATH. Exits nonzero on
+  anything but parity — a divergence, or an alignment too ambiguous to have
+  compared the frames it claims to — so it is usable as a gate.
 
   Options beyond the above: `--plugin` (binary path), `--sample-fps` (30),
   `--min-score` (JSON, `{"default":0.3}`), `--tolerance` (1.0e-9 — read
@@ -65,12 +66,16 @@ defmodule Mix.Tasks.Cairn.Parity do
 
     reports = Parity.run(clips, options(opts))
 
-    if Enum.any?(reports, &(&1.verdict == :divergence)) do
-      Mix.raise("DIVERGENCE — see the mismatches above")
-    else
-      Mix.shell().info("\nPARITY on #{length(reports)} clip(s)")
+    # Anything that is not parity, not just a divergence: a clip whose two runs
+    # could not be lined up (`:ambiguous_alignment`) compared nothing, and a gate
+    # that exits 0 on it is a gate that passed without looking.
+    case Enum.reject(reports, &(&1.verdict == :parity)) do
+      [] -> Mix.shell().info("\nPARITY on #{length(reports)} clip(s)")
+      failed -> Mix.raise("NOT PARITY — " <> Enum.map_join(failed, ", ", &failure/1))
     end
   end
+
+  defp failure(report), do: "#{Path.basename(report.clip)}: #{report.verdict}"
 
   defp options(opts) do
     opts

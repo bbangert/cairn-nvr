@@ -1,70 +1,19 @@
 defmodule Cairn.Native.HostTest do
-  # The stubs below are driven through one global control map, and the epoch
-  # assertions ride the application-wide PubSub.
+  # `Cairn.NativeStub` and `Cairn.CanaryStub` are driven through one global
+  # control map, and the epoch assertions ride the application-wide PubSub.
   use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
 
+  alias Cairn.CanaryStub
   alias Cairn.Native.Host
+  alias Cairn.NativeStub
   alias Cairn.StreamEpochs
 
   # every refusal path here logs at :error on purpose
   @moduletag :capture_log
 
-  @control {:native_stub, :control}
-
-  defmodule StubNative do
-    @moduledoc false
-    # Stands in for `Cairn.Native` — the NIF boundary, which CI has no library
-    # for. Same shape, driven by the control map the test puts in place.
-
-    def available?, do: control(:available?, true)
-    def load_error, do: if(available?(), do: nil, else: {:load_failed, ~c"no such file"})
-
-    def init(config) do
-      notify({:init, config})
-      control(:init, {:ok, {:engine, config.model}})
-    end
-
-    def open_stream(engine, camera_id, params) do
-      notify({:open_stream, engine, camera_id, params})
-      control(:open_stream, {:ok, {:stream, camera_id}})
-    end
-
-    def push_au(stream, au, pts, time_base) do
-      case control(:push_au, nil) do
-        fun when is_function(fun, 4) -> fun.(stream, au, pts, time_base)
-        nil -> {:ok, {[], []}}
-        result -> result
-      end
-    end
-
-    def close_stream(stream) do
-      notify({:close_stream, stream})
-      {:ok, true}
-    end
-
-    defp notify(message) do
-      case control(:test, nil) do
-        nil -> :ok
-        pid -> send(pid, message)
-      end
-    end
-
-    defp control(key, default) do
-      {:native_stub, :control} |> :persistent_term.get(%{}) |> Map.get(key, default)
-    end
-  end
-
-  defmodule StubCanary do
-    @moduledoc false
-
-    def probe(config, opts) do
-      control = :persistent_term.get({:native_stub, :control}, %{})
-      if pid = control[:test], do: send(pid, {:canary, config, opts})
-      Map.get(control, :canary, :ok)
-    end
-  end
+  @control NativeStub.control()
 
   setup do
     :persistent_term.put(@control, %{test: self()})
@@ -81,8 +30,8 @@ defmodule Cairn.Native.HostTest do
 
     defaults = [
       name: name,
-      native_module: StubNative,
-      canary_module: StubCanary,
+      native_module: NativeStub,
+      canary_module: CanaryStub,
       config: %{model: "m.onnx", backend: "qnn"}
     ]
 
@@ -258,6 +207,41 @@ defmodule Cairn.Native.HostTest do
       assert status.engine == :ready
     end
 
+    test "a stream-fatal report from a retired open cannot close its replacement", %{id: id} do
+      caller = self()
+
+      control(%{
+        push_au: fn _stream, _au, _pts, _time_base ->
+          send(caller, {:entered, self()})
+
+          receive do
+            :release -> {:error, {:poisoned, "a previous call panicked"}}
+          end
+        end
+      })
+
+      host = start_host()
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+      pusher = spawn(fn -> Host.push_au(host, id, <<1>>, 0, {1, 90_000}) end)
+      assert_receive {:entered, ^pusher}
+
+      # The reopen races the push it retires: `close_stream` waits on the old
+      # push's mutex, but the new stream can be open before the caller that lost
+      # it is scheduled to report what happened on the old one.
+      control(%{open_stream: {:ok, {:stream, :reopened}}})
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+      assert_receive {:close_stream, {:stream, ^id}}
+      assert_receive {:open_stream, _engine, ^id, _params}
+
+      ref = Process.monitor(pusher)
+      send(pusher, :release)
+      assert_receive {:DOWN, ^ref, :process, ^pusher, :normal}
+
+      # the status call is what proves the host processed the report
+      assert Host.status(host).streams == [id]
+      refute_received {:close_stream, {:stream, :reopened}}
+    end
+
     test "a decode error is neither: it is one frame", %{id: id} do
       control(%{push_au: {:error, {:decode, "no video stream"}}})
       host = start_host()
@@ -413,6 +397,26 @@ defmodule Cairn.Native.HostTest do
 
       assert capture_log(fn -> assert Host.check_health(host) == :healthy end) == ""
       assert Host.status(host).stream_health == %{id => :failing, healthy => :ok}
+    end
+
+    test "a stream too quiet to judge is not evidence for the accelerator", %{id: id} do
+      quiet = id <> "_quiet"
+      # A baseline this small puts accelerator-rate throughput out of reach, so
+      # what the window says is decided by the classifications alone and not by
+      # how fast the test's own pushes happened to run.
+      host = start_host(health(min_samples: 10, cpu_baseline_ms: 0.001))
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+      {:ok, _epoch} = Host.open_stream(host, quiet, %{})
+
+      control(%{push_au: {:error, {:infer, "the model pass failed"}}})
+      push(host, id, 5)
+      control(%{push_au: nil})
+      push(host, quiet, 3)
+
+      # one camera failing and one with too few completions to have a p50 is not
+      # "every stream with traffic is failing"
+      assert capture_log(fn -> assert Host.check_health(host) == :unknown end) == ""
+      assert Host.status(host).stream_health == %{id => :failing, quiet => :unknown}
     end
 
     test "every stream failing at once is the accelerator", %{id: id} do

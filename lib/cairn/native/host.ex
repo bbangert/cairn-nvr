@@ -161,7 +161,7 @@ defmodule Cairn.Native.Host do
         result = stream.module.push_au(stream.ref, au, pts, time_base)
         elapsed = System.monotonic_time(:microsecond) - started
         leave(stream)
-        send(stream.host, {:inference, camera_id, elapsed, outcome(result)})
+        send(stream.host, {:inference, camera_id, stream.token, elapsed, outcome(result)})
         result
 
       :error ->
@@ -256,14 +256,17 @@ defmodule Cairn.Native.Host do
     {:reply, state.health, state}
   end
 
+  # The health window is per camera and counts work the engine really did, so a
+  # completion is taken whichever open it belonged to; only the reports that act
+  # on stream identity are gated on the token (`note_error/5`).
   @impl true
-  def handle_info({:inference, camera_id, micros, :ok}, state) do
+  def handle_info({:inference, camera_id, _token, micros, :ok}, state) do
     {:noreply, record(state, camera_id, &sampled(&1, micros))}
   end
 
-  def handle_info({:inference, camera_id, _micros, {:error, reason, message}}, state) do
+  def handle_info({:inference, camera_id, token, _micros, {:error, reason, message}}, state) do
     state = record(state, camera_id, &%{&1 | errors: &1.errors + 1})
-    {:noreply, note_error(state, camera_id, reason, message)}
+    {:noreply, note_error(state, camera_id, token, reason, message)}
   end
 
   def handle_info(:health_check, state) do
@@ -368,6 +371,29 @@ defmodule Cairn.Native.Host do
     |> Keyword.merge(Application.get_env(:cairn, Canary, []))
   end
 
+  # A stream-fatal reason is the remedy for *the open it happened on* and no
+  # other. `close_stream` waits on the push's own mutex, but the reopen behind it
+  # can complete before the retired caller is scheduled to report, and that
+  # report would then close the replacement — a camera going dark for a fault it
+  # never had. Engine-fatal reasons are not gated: they are about the model
+  # handle rather than the stream, and every stream goes with it anyway.
+  defp note_error(state, camera_id, token, reason, message) when reason in @stream_fatal do
+    case Map.get(state.streams, camera_id) do
+      %{token: ^token} ->
+        note_error(state, camera_id, reason, message)
+
+      _retired ->
+        Logger.debug(
+          "cairn-native: #{reason} on #{camera_id} is from an open that is already closed"
+        )
+
+        state
+    end
+  end
+
+  defp note_error(state, camera_id, _token, reason, message),
+    do: note_error(state, camera_id, reason, message)
+
   # `model_load` and `model_poisoned` say this engine handle can never serve any
   # camera again, so retrying anything against it is the one thing not to do:
   # every stream is closed and the handle dropped, and only `configure/3` —
@@ -402,12 +428,16 @@ defmodule Cairn.Native.Host do
     case state.native.open_stream(state.engine, camera_id, params) do
       {:ok, ref} ->
         announce(camera_id, epoch, origin)
+        # Names this open, so that a report from a push the reopen raced past is
+        # not mistaken for one about the stream the camera has now.
+        token = System.unique_integer([:positive, :monotonic])
 
         :ets.insert(
           state.table,
           {camera_id,
            %{
              ref: ref,
+             token: token,
              module: state.native,
              host: self(),
              counters: state.counters,
@@ -416,7 +446,10 @@ defmodule Cairn.Native.Host do
         )
 
         {:reply, {:ok, epoch},
-         %{state | streams: Map.put(state.streams, camera_id, %{ref: ref, params: params})}}
+         %{
+           state
+           | streams: Map.put(state.streams, camera_id, %{ref: ref, token: token, params: params})
+         }}
 
       {:error, {reason, message}} = error when reason in @engine_fatal ->
         {:reply, error, note_error(state, camera_id, reason, message)}
@@ -514,7 +547,7 @@ defmodule Cairn.Native.Host do
   # cannot: one killed caller inflates it forever, and every later idle window
   # then reads as `:wedged` — a page no restart clears, for nothing.
   defp enter(stream, camera_id) do
-    :ets.insert(stream.inflight, {self(), camera_id})
+    :ets.insert(stream.inflight, {self(), camera_id, stream.token})
     :ok
   rescue
     # the table dies with the host; a caller landing in the restart window still
@@ -573,6 +606,9 @@ defmodule Cairn.Native.Host do
   #     next window.
   #   * at least one stream completing normally -> :healthy. One camera erroring
   #     or crawling is that camera; the accelerator is demonstrably fine.
+  #   * a stream with traffic nobody can judge yet -> :unknown. A cross-stream
+  #     verdict drawn over part of the traffic is drawn on insufficient
+  #     evidence, and the expensive direction is the false page.
   #   * every stream with traffic failing or slow -> the accelerator. Slow is
   #     only a wedge if throughput says so too: a saturated healthy session
   #     still completes at accelerator rate, and a wedged one cannot beat the
@@ -613,10 +649,13 @@ defmodule Cairn.Native.Host do
     {live, dead} =
       state.inflight
       |> :ets.tab2list()
-      |> Enum.split_with(fn {pid, _camera_id} -> Process.alive?(pid) end)
+      |> Enum.split_with(fn {pid, _camera_id, _token} -> Process.alive?(pid) end)
 
-    Enum.each(dead, fn {pid, camera_id} ->
-      Logger.debug("cairn-native: #{camera_id}'s caller #{inspect(pid)} died inside push_au/5")
+    Enum.each(dead, fn {pid, camera_id, token} ->
+      Logger.debug(
+        "cairn-native: #{camera_id}'s caller #{inspect(pid)} died inside push_au/5 (open #{token})"
+      )
+
       :ets.delete(state.inflight, pid)
     end)
 
@@ -636,6 +675,7 @@ defmodule Cairn.Native.Host do
       baseline(state) == nil -> :not_applicable
       Enum.any?(streams, &classified?(&1, :ok)) -> :healthy
       not Enum.any?(streams, &judged?/1) -> :idle
+      Enum.any?(streams, &classified?(&1, :unknown)) -> :unknown
       Enum.all?(streams, &classified?(&1, :failing)) -> :wedged
       accelerator_rate?(state, window) -> :saturated
       true -> :wedged
@@ -650,7 +690,8 @@ defmodule Cairn.Native.Host do
   defp judged?({_camera_id, class}), do: class in [:slow, :failing]
 
   # `:unknown` rather than `:ok` below the sample floor: too few completions to
-  # have a p50 is not evidence that this stream is well.
+  # have a p50 is not evidence that this stream is well — nor, in `verdict/3`,
+  # that it is unwell, which is why one of these suspends the cross-stream call.
   defp classify(_state, %{count: 0, errors: errors}) when errors > 0, do: :failing
 
   defp classify(state, entry) do

@@ -1,6 +1,7 @@
 defmodule Cairn.Native.ParityAlignmentTest do
-  # `align/3` is pure list arithmetic over `Cairn.Observation`s — no NIF, no
-  # plugin, no clip — so unlike the rest of the harness it runs in CI.
+  # `align/3` and the verdict it feeds are pure list arithmetic over
+  # `Cairn.Observation`s — no NIF, no plugin, no clip — so unlike the rest of
+  # the harness they run in CI.
   use ExUnit.Case, async: true
 
   alias Cairn.Native.Parity
@@ -78,6 +79,40 @@ defmodule Cairn.Native.ParityAlignmentTest do
 
       assert {_offset, %{agreed: 0, probes: 1, margin: 0}} =
                Parity.align(one, run(0, marks(7..7)), @tolerance)
+    end
+  end
+
+  describe "report/5's verdict" do
+    test "an alignment several offsets fit equally well is not parity" do
+      # A static scene: every frame is every other frame, so the true offset and
+      # its neighbours agree exactly as well and the pairing is a coin flip. A
+      # temporal divergence pairs around itself here and diffs clean.
+      plugin = run(900_000, List.duplicate(0.5, 30))
+      native = run(0, List.duplicate(0.5, 60))
+      report = Parity.report("static.mp4", plugin, native, 60, [])
+
+      assert report.alignment.margin == 0
+      assert report.mismatches == []
+      assert report.matched >= 25
+      assert report.verdict == :ambiguous_alignment
+    end
+
+    test "the same clean diff on an alignment nothing else fits is parity" do
+      plugin = run(900_000, marks(0..29))
+      report = Parity.report("moving.mp4", plugin, run(0, marks(0..29)), 30, [])
+
+      assert report.alignment.margin == 30
+      assert report.verdict == :parity
+    end
+
+    test "detections that differ are a divergence, which is a different finding" do
+      plugin = run(900_000, marks(0..29))
+      native = run(0, List.replace_at(marks(0..29), 10, 0.999))
+      report = Parity.report("moving.mp4", plugin, native, 30, [])
+
+      assert report.alignment.margin > 0
+      assert [%{kind: :object}] = report.mismatches
+      assert report.verdict == :divergence
     end
   end
 

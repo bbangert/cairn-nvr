@@ -425,6 +425,79 @@ fn a_panic_in_a_streams_own_state_stays_that_streams_problem() {
     assert!(!feed_shared(&drive, &clip).unwrap().is_empty());
 }
 
+/// The recovery the host actually performs after a stream-fatal error, end to
+/// end: `poisoned` tells `Cairn.Native.Host` to drop that stream and reopen the
+/// camera, and a `close` that refused the poisoned lock would leave the id
+/// claimed until the BEAM collected the handle — so the reopen would be refused
+/// as a duplicate and the camera would stay dark until GC.
+#[test]
+fn a_poisoned_stream_closes_and_its_camera_can_be_opened_again() {
+    let Some(artifacts) = artifacts() else {
+        return;
+    };
+    let engine = engine(&artifacts);
+    let clip = read_clip(&artifacts.clip);
+
+    let front = StreamRef::new(Arc::clone(&engine), open(&engine, "front"));
+    front.poison_state();
+    assert_eq!(
+        feed_shared(&front, &clip).unwrap_err().reason(),
+        "poisoned",
+        "the stream is not in the state the rest of this test is about"
+    );
+
+    assert!(front.close(), "a poisoned stream did not close");
+    assert!(
+        !front.close(),
+        "closing an emptied stream is not a second close"
+    );
+
+    let reopened = Stream::open(
+        Arc::clone(&engine),
+        "front".into(),
+        params().resolve().unwrap(),
+    )
+    .expect("the camera id was never handed back, so the camera stays dark");
+    let reopened = StreamRef::new(Arc::clone(&engine), reopened);
+    assert!(!feed_shared(&reopened, &clip).unwrap().is_empty());
+}
+
+/// The other way a stream ends: the host never closed it and the BEAM collected
+/// the handle. A poisoned mutex still drops what it holds, so `Stream`'s `Drop`
+/// hands the camera id back on this path too.
+#[test]
+fn a_collected_poisoned_stream_hands_its_camera_id_back() {
+    let Some(artifacts) = artifacts() else {
+        return;
+    };
+    let engine = engine(&artifacts);
+
+    let front = StreamRef::new(Arc::clone(&engine), open(&engine, "front"));
+    front.poison_state();
+    crate::teardown::defer(front);
+
+    // The teardown thread owns the drop, so the id comes back on its clock
+    // rather than on this one.
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    let reopened = loop {
+        match Stream::open(
+            Arc::clone(&engine),
+            "front".into(),
+            params().resolve().unwrap(),
+        ) {
+            Ok(stream) => break stream,
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the camera id was never handed back: {error:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    };
+    drop(reopened);
+}
+
 /// Two Elixir processes, two streams, one engine: they contend only on the
 /// model pass, so both must finish.
 #[test]
@@ -471,6 +544,8 @@ fn two_pushes_to_one_stream_serialize() {
 
     assert!(frames > 0, "two callers produced no frame between them");
     // Still the same stream afterwards — not a poisoned one, and not one the
-    // second caller closed out from under the first.
-    assert!(front.close().expect("the stream is not poisoned"));
+    // second caller closed out from under the first. `close` recovers a poisoned
+    // guard, so the poisoning half has to be asked separately.
+    assert!(!front.state.is_poisoned(), "a push panicked");
+    assert!(front.close());
 }

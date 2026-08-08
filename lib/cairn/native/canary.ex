@@ -45,6 +45,14 @@ defmodule Cairn.Native.Canary do
 
   @type result :: :ok | {:skipped, atom()} | {:error, String.t()}
 
+  # One callback is all `Cairn.Native.Host`'s `:canary_module` seam is, and it is
+  # enough that a stub which no longer answers what the host asks fails at
+  # compile time — a behaviour warning, which CI's `--warnings-as-errors` makes
+  # fatal — instead of in whatever test reaches for it next. Declared on this
+  # module too, so the same holds if this side is the one that moves.
+  @callback probe(Config.t(), keyword()) :: result()
+  @behaviour __MODULE__
+
   @doc """
   Options:
 

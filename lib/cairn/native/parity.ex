@@ -91,7 +91,7 @@ defmodule Cairn.Native.Parity do
 
   @type report :: %{
           clip: Path.t(),
-          verdict: :parity | :divergence,
+          verdict: :parity | :divergence | :ambiguous_alignment,
           expected_frames: non_neg_integer(),
           plugin_frames: non_neg_integer(),
           native_frames: non_neg_integer(),
@@ -428,7 +428,16 @@ defmodule Cairn.Native.Parity do
 
   # -- the comparison ---------------------------------------------------------
 
-  defp report(clip, plugin, native, expected, opts) do
+  @doc """
+  The comparison itself: two runs' observations in, one report out.
+
+  Public because it is the whole of `compare/2` that needs neither a NIF, a
+  plugin, ffmpeg nor a clip — the verdict is decided here.
+  """
+  @spec report(Path.t(), [Observation.t()], [Observation.t()], non_neg_integer(), keyword()) ::
+          report()
+  def report(clip, plugin, native, expected, opts) do
+    opts = defaults(opts)
     tolerance = Keyword.fetch!(opts, :tolerance)
     {offset, alignment} = align(plugin, native, tolerance)
     {matched, plugin_only, native_only, outside} = join(plugin, native, offset)
@@ -437,7 +446,8 @@ defmodule Cairn.Native.Parity do
 
     %{
       clip: clip,
-      verdict: verdict(mismatches, length(matched), coverage, Keyword.fetch!(opts, :coverage)),
+      verdict:
+        verdict(mismatches, length(matched), coverage, Keyword.fetch!(opts, :coverage), alignment),
       expected_frames: expected,
       plugin_frames: length(plugin),
       native_frames: length(native),
@@ -466,10 +476,20 @@ defmodule Cairn.Native.Parity do
   # window on purpose. What it does catch is the NIF missing a frame the plugin
   # had. The floor on `matched` is so a run that lined up on almost nothing
   # cannot pass by having nothing to disagree about.
-  defp verdict([], matched, coverage, floor) when matched >= 25 and coverage >= floor,
-    do: :parity
+  #
+  # A margin of 0 is several offsets fitting the evidence equally well, so which
+  # frames were paired was a coin flip — on a static or repetitive clip that
+  # pairs around a temporal divergence and diffs clean. Its own verdict, and not
+  # `:divergence`: nothing was found to differ, the run just did not compare the
+  # frames it claims to have. A run that has mismatches *as well* is reported as
+  # the divergence it has something concrete to say about; `alignment` is in the
+  # report either way.
+  defp verdict([], matched, coverage, floor, %{margin: margin})
+       when matched >= 25 and coverage >= floor do
+    if margin > 0, do: :parity, else: :ambiguous_alignment
+  end
 
-  defp verdict(_mismatches, _matched, _coverage, _floor), do: :divergence
+  defp verdict(_mismatches, _matched, _coverage, _floor, _alignment), do: :divergence
 
   @doc """
   The pts offset that carries the plugin's series onto the NIF's, and how sure
@@ -488,9 +508,11 @@ defmodule Cairn.Native.Parity do
   offset pairs each frame with its neighbour, which on a slow scene looks
   nearly right. Agreement does not have that failure: an offset one frame out
   agrees on nothing at all. The `margin` between the winner and the best other
-  offset is reported so a run can be read for whether the alignment was in
-  doubt — nothing here refuses an alignment, and a margin of 0 means several
-  offsets fit the evidence equally and the frame pairing is a coin flip.
+  offset is what says whether the alignment was in doubt: a margin of 0 means
+  several offsets fit the evidence equally and the frame pairing is a coin flip.
+  This function reports that rather than refusing it — always answering with the
+  best offset it has is what lets a caller dump both runs and look — and
+  `report/5`'s verdict is where a coin flip stops being a pass.
   """
   @spec align([Observation.t()], [Observation.t()], float()) ::
           {integer(), %{agreed: non_neg_integer(), probes: non_neg_integer(), margin: integer()}}

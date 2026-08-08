@@ -142,9 +142,17 @@ impl StreamRef {
         stream.push_au(au, pts, time_base, Instant::now())
     }
 
-    fn close(&self) -> Result<bool> {
-        let mut state = self.state.lock().map_err(|_| self.poisoned_by())?;
-        Ok(state.take().is_some())
+    /// Use versus drop: [`Self::push`] refuses a poisoned lock because it would
+    /// have to *run* the stages over half-updated state, and this recovers it
+    /// because all it does is drop that state. Refusing here is what a poisoned
+    /// stream cannot afford — `poisoned` and `panicked` are what make
+    /// `Cairn.Native.Host` close the stream and reopen the camera, and a close
+    /// that took nothing would hold the camera id in the engine's registry until
+    /// the BEAM collected the handle, so the reopen would be refused as a
+    /// duplicate and the camera would stay dark.
+    fn close(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.take().is_some()
     }
 
     /// Which fault a poisoned stream lock is reporting.
@@ -247,7 +255,7 @@ fn push_au(
 /// a decoder, and for the hardware paths that is driver and device teardown.
 #[rustler::nif(schedule = "DirtyIo")]
 fn close_stream(stream: ResourceArc<StreamRef>) -> Result<bool> {
-    guarded("close_stream", || stream.close())
+    guarded("close_stream", || Ok(stream.close()))
 }
 
 /// Run one NIF body, turning a panic into a term.
@@ -264,11 +272,12 @@ fn close_stream(stream: ResourceArc<StreamRef>) -> Result<bool> {
 ///
 /// Whatever lock a panicking body was holding stays poisoned, which is
 /// deliberate: rather than run the stages over state nobody knows the shape of,
-/// the next call refuses. Which refusal it is — [`NativeError::Poisoned`] for
-/// this stream's own state, [`NativeError::ModelPoisoned`] for the shared
-/// session — is decided by [`StreamRef::poisoned_by`], because a panic in a
-/// model pass unwinds through both locks and the stream's own is the less
-/// informative of the two.
+/// the next call that would *use* it refuses. Which refusal it is —
+/// [`NativeError::Poisoned`] for this stream's own state,
+/// [`NativeError::ModelPoisoned`] for the shared session — is decided by
+/// [`StreamRef::poisoned_by`], because a panic in a model pass unwinds through
+/// both locks and the stream's own is the less informative of the two. Tearing
+/// that state down is the exception, and [`StreamRef::close`] says why.
 fn guarded<T>(what: &'static str, body: impl FnOnce() -> Result<T>) -> Result<T> {
     match catch_unwind(AssertUnwindSafe(body)) {
         Ok(result) => result,
