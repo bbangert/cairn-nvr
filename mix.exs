@@ -84,6 +84,18 @@ defmodule Cairn.MixProject do
       {:bandit, "~> 1.5"},
       {:yaml_elixir, "~> 2.11"},
       {:ex_webrtc, "~> 0.17.0"},
+      # Membrane pipeline (all Apache-2.0)
+      {:membrane_core, "~> 1.3.4"},
+      # membrane_core → ratio 4.0.1 caps its *optional* decimal dep at ~> 2.0
+      # (ratio only defines Coerce protocols over Decimal), while ecto_sqlite3
+      # requires ~> 3.0. Override until ratio lifts the cap.
+      {:decimal, "~> 3.0", override: true},
+      {:membrane_mp4_plugin, "~> 0.36.10"},
+      {:membrane_h26x_plugin, "~> 0.11.2"},
+      {:membrane_mpeg_ts_plugin, "~> 2.4.9"},
+      {:membrane_tee_plugin, "~> 0.12.0"},
+      {:membrane_rtp_plugin, "~> 0.31.5"},
+      {:membrane_rtp_h264_plugin, "~> 0.20.6"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:sobelow, "~> 0.14", only: [:dev, :test], runtime: false}

@@ -33,8 +33,8 @@ defmodule Cairn.Config.Camera do
 
   alias Cairn.Config
 
-  @known_keys ~w(id rtsp_url plugin min_score track record extra_ffmpeg_args transcode retention
-                 pre_window_seconds post_window_seconds max_event_seconds max_unseen_ms
+  @known_keys ~w(id rtsp_url plugin pipeline min_score track record extra_ffmpeg_args transcode
+                 retention pre_window_seconds post_window_seconds max_event_seconds max_unseen_ms
                  max_live_tracks stationary_after_ms)
 
   @default_min_score %{"default" => 0.5}
@@ -47,6 +47,7 @@ defmodule Cairn.Config.Camera do
             record: nil,
             extra_ffmpeg_args: [],
             transcode: false,
+            pipeline: :classic,
             retention_days: nil,
             retention_per_label: %{},
             pre_window_seconds: nil,
@@ -93,6 +94,7 @@ defmodule Cairn.Config.Camera do
     {track, acc} = parse_tier(Map.get(raw, "track"), id, "track", acc)
     {record, acc} = parse_tier(Map.get(raw, "record"), id, "record", acc)
     {plugin, acc} = parse_plugin(Map.get(raw, "plugin"), id, acc)
+    {pipeline, acc} = parse_pipeline(Map.get(raw, "pipeline"), id, acc)
     {extra_args, acc} = parse_extra_args(Map.get(raw, "extra_ffmpeg_args"), id, acc)
 
     cam = %__MODULE__{
@@ -104,6 +106,7 @@ defmodule Cairn.Config.Camera do
       record: record,
       extra_ffmpeg_args: extra_args,
       transcode: Map.get(raw, "transcode", false) == true,
+      pipeline: pipeline,
       retention_days: get_in(raw, ["retention", "days"]),
       retention_per_label: get_in(raw, ["retention", "per_label"]) || %{},
       pre_window_seconds: Map.get(raw, "pre_window_seconds"),
@@ -211,6 +214,17 @@ defmodule Cairn.Config.Camera do
   end
 
   defp tier_rule(_other), do: :error
+
+  # The D-M7 migration gate: both stacks stay runnable per camera until the
+  # classic path is deleted in port phase 6. Default :classic so an absent key
+  # changes nothing on upgrade.
+  defp parse_pipeline(nil, _id, acc), do: {:classic, acc}
+  defp parse_pipeline("classic", _id, acc), do: {:classic, acc}
+  defp parse_pipeline("membrane", _id, acc), do: {:membrane, acc}
+
+  defp parse_pipeline(_other, id, acc) do
+    {:classic, add_error(acc, "camera #{id}: pipeline must be \"membrane\" or \"classic\"")}
+  end
 
   defp parse_plugin(nil, _id, acc), do: {nil, acc}
 

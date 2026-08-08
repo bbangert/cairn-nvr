@@ -155,6 +155,40 @@ defmodule Cairn.CameraSupervisorTest do
     refute Cairn.Registry.whereis(a.id, :plugin)
   end
 
+  test "a membrane camera streams through the real tree with a socketless hub" do
+    id = "cs_membrane_#{System.unique_integer([:positive])}"
+    fixture = Path.absname("test/support/fixtures/media/testsrc.ts")
+    cam = %Camera{id: id, rtsp_url: "file://#{fixture}", pipeline: :membrane}
+
+    cfg = config([cam], 19_880)
+    {plugin_port, _rtp_port} = Cairn.UDPPorts.ports_for(cfg, 0)
+
+    # The membrane argv still emits one real RTP output to the plugin port;
+    # nothing consumes it in phase 1, so bind a socket to swallow those datagrams
+    # — an unbound port would draw ICMP unreachable that can trip ffmpeg's muxer.
+    {:ok, sink} = :gen_udp.open(plugin_port, [:binary, active: false, reuseaddr: true])
+    on_exit(fn -> :gen_udp.close(sink) end)
+
+    # subscribe before the tree starts so no init/fragment/packet is missed
+    Phoenix.PubSub.subscribe(Cairn.PubSub, Cairn.RingBuffer.topic(id))
+    Phoenix.PubSub.subscribe(Cairn.PubSub, Cairn.RTPHub.topic(id))
+
+    :ok = CameraSupervisor.sync(cfg)
+    assert Cairn.Registry.whereis(id, :camera)
+
+    # the membrane camera's hub owns no UDP socket — it is fed in-process by the
+    # pipeline's RTP branch (camera.ex routes `pipeline: :membrane` to port: nil)
+    hub = Cairn.Registry.whereis(id, :rtp_hub)
+    assert is_pid(hub)
+    assert :sys.get_state(hub).socket == nil
+
+    # the real pipeline, fed real ffmpeg mpegts over stdout, drives both branches:
+    # CMAF fragments onto the ring and RTP packets onto the hub topic
+    assert_receive {:init_segment, %{camera_id: ^id}}, 10_000
+    assert_receive {:fragment, _frag}, 10_000
+    assert_receive {:rtp, %ExRTP.Packet{}}, 10_000
+  end
+
   test "a camera served by a plugin group gets no plugin port of its own" do
     a = %Camera{camera("cs_grp_#{System.unique_integer([:positive])}") | plugin: {:group, "det"}}
     :ok = CameraSupervisor.sync(config([a], 19_720))
