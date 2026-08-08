@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::control::Streams;
+use crate::note;
 
 /// Cairn drops any line longer than this, so a too-long line is a lost
 /// sample rather than a soft error — we shed detections to stay under it.
@@ -92,7 +93,7 @@ pub struct Det {
     /// what the contract's low-confidence band is read by. It is carried
     /// because the label's floor is not, and two things on this side have to
     /// tell the two apart after the label is gone — the ranking every cut
-    /// sheds by ([`objects_line`]), and [`CameraState::last_dets`].
+    /// sheds by ([`objects_line`]), and the seed rule ([`seeds_from`]).
     ///
     /// `true` for every detection of a run without the flag, and for every
     /// seed: a seed is a copy of a box that was evidence when it was found.
@@ -315,6 +316,46 @@ fn log_suppression(count: u64) -> bool {
     count == 1 || count.is_multiple_of(SUPPRESSED_LOG_EVERY)
 }
 
+/// The seeds `dets` yields: what a sample the model did not run on may
+/// re-report, in the form it has to re-report it.
+///
+/// **Both producers hold their seed memory by calling this** — the ndjson
+/// path's [`CameraState::last_dets`] and `cairn-native`'s `Stream` — so the
+/// rule is one rule rather than two that happen to agree. Each side then
+/// applies what is its own around it, which is only the ndjson path's
+/// "remember the prefix that reached the wire".
+///
+/// Three things separate a seed from the detection it was copied from:
+///
+///   * sub-floor boxes are dropped ([`Det::evidence`]). What
+///     `--track-floor-json` admits below a class's `min_score` is a box for the
+///     host's low-confidence stage to match a live track against *in the frame
+///     it was found in*; there is no sighting there to re-report, and repeating
+///     one would keep noise alive for as long as the gate holds — which is what
+///     the whole `reverify_ms` bound exists to prevent. With the flag off every
+///     detection is evidence and this drops nothing.
+///   * the kind becomes [`ObservationKind::Tracked`], which is the difference
+///     the host acts on: only a `detected` object is evidence to it.
+///   * the embedding goes. A seed re-reports a position, not an appearance: the
+///     crop the feature came from is stale the moment a frame goes unlooked-at,
+///     and carrying it would also grow every seeded line by a feature it no
+///     longer stands for.
+///
+/// Scores are left exactly where the model put them, which is what keeps a seed
+/// at or below the host's `best_score` for that track: a seed that improved on
+/// it would bypass the host's publish throttle and broadcast a track update for
+/// a frame nothing looked at.
+pub fn seeds_from(dets: &[Det]) -> Vec<Det> {
+    dets.iter()
+        .filter(|det| det.evidence)
+        .map(|det| Det {
+            observation_kind: ObservationKind::Tracked,
+            embedding: None,
+            ..det.clone()
+        })
+        .collect()
+}
+
 /// Everything one camera carries between frames: its sequence counter, the
 /// tallies behind the rate-limited "not emitted" diagnostics, and the
 /// detections a seeded line re-reports.
@@ -329,32 +370,18 @@ struct CameraState {
     sequence: u64,
     ungated: u64,
     unbounded_pts: u64,
-    /// The last real inference's evidence-grade detections *as emitted*,
-    /// already marked [`ObservationKind::Tracked`] because re-emitting them is
-    /// the only thing they are for.
+    /// The last real inference's seeds ([`seeds_from`]) — taken from what the
+    /// line actually carried, which is this path's own half of the rule.
     ///
-    /// Held at the scores the model gave them, which is what keeps a seed at
-    /// or below the host's `best_score` for that track: a seed that improved
-    /// on it would bypass the host's publish throttle and broadcast a track
-    /// update for a frame nothing looked at. Shed detections are not
-    /// remembered — the host never received them, so seeding one would
-    /// introduce a box mid-gate that no model pass had ever put on the wire.
+    /// Shed detections are not remembered: the host never received them, so
+    /// seeding one would introduce a box mid-gate that no model pass had ever
+    /// put on the wire.
     ///
-    /// Nor are sub-floor detections ([`Det::evidence`]), which
-    /// `--track-floor-json` puts on a real line and nothing else. A seed is a
-    /// re-report of a sighting the host may act on: below the evidence floor
-    /// there is no sighting to re-report, only a box the host's low-confidence
-    /// stage may match a live track against *in the frame it was found in*.
-    /// Re-reporting one would keep noise alive for as long as the gate holds,
-    /// which is what the whole `reverify_ms` bound exists to prevent. With the
-    /// flag off every emitted detection is evidence and this is every one of
-    /// them, as it was before the flag existed.
-    ///
-    /// The two exclusions compose into a prefix rather than a scatter, because
-    /// the band is the tail of the list a line is built from
-    /// ([`objects_line`]): what is remembered is the evidence-grade head of
-    /// what reached the wire, and a line that shed anything shed the band
-    /// before any of it.
+    /// That exclusion and [`seeds_from`]'s sub-floor one compose into a prefix
+    /// rather than a scatter, because the band is the tail of the list a line
+    /// is built from ([`objects_line`]): what is remembered is the
+    /// evidence-grade head of what reached the wire, and a line that shed
+    /// anything shed the band before any of it.
     last_dets: Vec<Det>,
     /// The epoch `last_dets` were emitted under. A new one clears them: the
     /// host suspends its live tracks at a stream reset and refuses a
@@ -411,11 +438,10 @@ impl Publisher {
     }
 
     /// The line to write for one frame the model actually ran on, or `None`
-    /// when [`Publisher::emit`] declines it. Its evidence-grade detections
-    /// become the ones a [`Publisher::seeded_line_for`] will re-report until
-    /// the next real inference replaces them — every detection on the line,
-    /// unless `--track-floor-json` put boxes below the evidence floor on it
-    /// (see [`CameraState::last_dets`]).
+    /// when [`Publisher::emit`] declines it. The seeds of what the line carried
+    /// become what a [`Publisher::seeded_line_for`] re-reports until the next
+    /// real inference replaces them — [`seeds_from`] for which of them, and
+    /// [`CameraState::last_dets`] for what this path adds to that.
     pub fn line_for(
         &mut self,
         camera_id: &str,
@@ -484,7 +510,7 @@ impl Publisher {
         let Some(epoch) = epoch else {
             state.ungated += 1;
             if log_suppression(state.ungated) {
-                eprintln!(
+                note!(
                     "camera {camera_id}: no stream epoch yet, \
                      {} frame(s) not emitted so far",
                     state.ungated
@@ -498,7 +524,7 @@ impl Publisher {
         if !(-MAX_PTS..=MAX_PTS).contains(&pts) {
             state.unbounded_pts += 1;
             if log_suppression(state.unbounded_pts) {
-                eprintln!(
+                note!(
                     "camera {camera_id}: pts {pts} is outside the contract's +-2^62, \
                      {} frame(s) not emitted so far",
                     state.unbounded_pts
@@ -530,7 +556,7 @@ impl Publisher {
         );
 
         if kept < dets.len() {
-            eprintln!(
+            note!(
                 "camera {camera_id}: line budget dropped {} of {} objects at pts {pts}",
                 dets.len() - kept,
                 dets.len()
@@ -538,25 +564,11 @@ impl Publisher {
         }
 
         if let Source::Inferred(dets) = source {
-            // What the wire carried, and of that what a seed may assert: the
-            // shed ones are boxes the host has no record of, and the sub-floor
-            // ones are boxes that were worth sending for the frame they were
-            // found in and are not worth repeating past it. Every real line
-            // refreshes this, re-verifies included, so an object the model
-            // stops finding stops being seeded from that line on.
-            state.last_dets.clear();
-            state
-                .last_dets
-                .extend(dets[..kept].iter().filter(|det| det.evidence).map(|det| {
-                    let mut remembered = det.clone();
-                    remembered.observation_kind = ObservationKind::Tracked;
-                    // A seed re-reports a position, not an appearance: the
-                    // crop the feature came from is stale the moment the gate
-                    // skips a frame, and repeating it would also grow every
-                    // seeded line by the embedding it no longer stands for.
-                    remembered.embedding = None;
-                    remembered
-                }));
+            // `[..kept]`, so what a seed may assert is bounded by what the wire
+            // carried; the shared rule (`seeds_from`) decides the rest. Every
+            // real line refreshes this, re-verifies included, so an object the
+            // model stops finding stops being seeded from that line on.
+            state.last_dets = seeds_from(&dets[..kept]);
         }
         Some(json)
     }
@@ -927,6 +939,44 @@ mod tests {
                 .all(|object| object["observation_kind"] == "tracked"),
             "every surviving object is still a seed"
         );
+    }
+
+    #[test]
+    fn a_seed_is_the_same_box_marked_tracked_with_no_feature_on_it() {
+        // The rule both producers hold their seed memory by. The band box is
+        // planted in the *middle*, which is not the order `crate::infer` hands
+        // one over (it ranks evidence first): what this reads is the mark on
+        // each detection, not a prefix length, and a filter written as a
+        // `take_while` would pass every other test in this file.
+        let mut with_feature = det("person", 0.87);
+        with_feature.embedding = Some("QUJD".to_string());
+        let dets = [with_feature, sub_floor("car", 0.3), det("person", 0.25)];
+
+        let seeds = seeds_from(&dets);
+        assert_eq!(
+            seeds.iter().map(|det| det.score).collect::<Vec<_>>(),
+            vec![0.87, 0.25],
+            "the band box is gone and the order of the rest is untouched"
+        );
+        assert!(seeds
+            .iter()
+            .all(|det| det.observation_kind == ObservationKind::Tracked));
+        assert!(seeds.iter().all(|det| det.embedding.is_none()));
+        assert!(seeds.iter().all(|det| det.evidence));
+        // and everything else is the detection as the model reported it —
+        // scores included, which is what keeps a seed inside the host's
+        // `best_score` for that track
+        assert_eq!(seeds[0].label, "person");
+        assert_eq!(seeds[0].bbox, dets[0].bbox);
+
+        // a pass that found nothing worth re-reporting seeds nothing, which is
+        // the empty-`objects` liveness line rather than the last pass held over
+        assert!(seeds_from(&[]).is_empty());
+        assert!(seeds_from(&[sub_floor("car", 0.3)]).is_empty());
+
+        // …and a seed of a seed is the same seed: the rule is idempotent, so a
+        // memory refreshed from something already marked cannot drift.
+        assert_eq!(seeds_from(&seeds), seeds);
     }
 
     #[test]

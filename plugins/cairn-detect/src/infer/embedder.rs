@@ -220,8 +220,10 @@ pub fn quantize_base64(feature: &[f32]) -> String {
 }
 
 // Standard-alphabet base64 with padding, hand-rolled over pulling the crate
-// into the dependency list for one direction of one field. The host decodes
-// with `Base.decode64/1`.
+// into the dependency list for one direction of one field. Cairn decodes an
+// ndjson line's copy with `Base.decode64/1`; `cairn-native` decodes it in Rust,
+// because a term can carry the bytes and the host's `embedding` field is the
+// raw int8 vector either way.
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);

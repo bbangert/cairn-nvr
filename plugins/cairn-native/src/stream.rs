@@ -1,0 +1,532 @@
+//! One camera's stream: compressed access units in, observation terms out.
+//!
+//! This is `multiplex.rs`'s member re-hosted. What it keeps is everything that
+//! is per camera and stateful — the decoder and its motion background, the
+//! [`Gate`], the score floors, and what a gated frame re-reports. What it drops
+//! is the transport: there is no socket to re-open and no thread to own,
+//! because the caller is an Elixir process handing over one access unit at a
+//! time and blocking on the answer.
+//!
+//! Frames never cross the NIF boundary (D-M2). A decoded frame lives inside
+//! this struct's decoder, becomes a tensor, is consumed by the model, and the
+//! only thing that leaves is a [`FrameObservations`].
+//!
+//! **Nothing on this path may panic.** In-VM a panic is the node, so every
+//! per-frame failure is a value: the tolerated ones (a decode error mid-GOP, a
+//! frame that will not convert) are counted and skipped exactly as
+//! `cairn_detect::decode::run` counts and skips them, and the fatal ones are
+//! returned. Everything a stream can raise on its own — a packet the decoder
+//! refuses outright, a failed model pass — costs this stream and nothing else;
+//! the one error that does not is [`NativeError::ModelPoisoned`], which is the
+//! shared session and so is every stream's.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use cairn_detect::decode::{self, Decoder, Sampled};
+use cairn_detect::emit::{seeds_from, Det, MAX_PTS};
+use cairn_detect::gate::{Decision, Gate};
+use cairn_detect::infer::ScoreFloors;
+use cairn_detect::motion::MotionConfig;
+use cairn_detect::note;
+use rsmpeg::avcodec::{AVCodecParameters, AVPacket};
+use rsmpeg::avutil::AVRational;
+use rsmpeg::ffi;
+use rsmpeg::UnsafeDerefMut;
+
+use crate::config::StreamParams;
+use crate::engine::Engine;
+use crate::error::{chain, NativeError, Result};
+use crate::observation::FrameObservations;
+
+/// How often a tolerated per-frame error is logged: the first, then every
+/// fiftieth, as in `cairn_detect::decode::run`. Counted rather than returned
+/// because these are normal; surfacing the counters as stream health is task
+/// 3.4's, and stderr is the whole of it until then.
+const LOG_EVERY: u64 = 50;
+
+pub struct Stream {
+    engine: Arc<Engine>,
+    camera_id: String,
+    decoder: Box<dyn Decoder>,
+    gate: Gate,
+    floors: ScoreFloors,
+    /// `None` for a camera whose motion gate is off, which is the default and
+    /// makes [`Gate::decide`] infer on every sample.
+    motion: Option<MotionConfig>,
+    /// Fixed for the life of the stream: an epoch identifies one stream
+    /// session, and here a new session is a new [`Stream`]. That is what makes
+    /// the gate's epoch-bypass window right without an epoch setter — a fresh
+    /// `Gate` opens the window on its own first sample.
+    epoch: Option<String>,
+    interval: Duration,
+    last_sample: Option<Instant>,
+    seeds: Seeds,
+    decode_errors: u64,
+    tensor_errors: u64,
+    unbounded_pts: u64,
+}
+
+impl Stream {
+    pub fn open(engine: Arc<Engine>, camera_id: String, params: StreamParams) -> Result<Self> {
+        engine.register(&camera_id)?;
+        let decoder = match open_decoder(&engine, params.motion) {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                // The id is claimed before the decoder because the claim is
+                // what makes a duplicate open cheap to refuse; a failed open
+                // has to hand it back or the camera can never be opened again.
+                engine.release(&camera_id);
+                return Err(error);
+            }
+        };
+
+        Ok(Self {
+            interval: decode::sample_interval(engine.sample_fps),
+            engine,
+            camera_id,
+            decoder,
+            gate: Gate::default(),
+            floors: params.floors,
+            motion: params.motion,
+            epoch: params.epoch,
+            last_sample: None,
+            seeds: Seeds::default(),
+            decode_errors: 0,
+            tensor_errors: 0,
+            unbounded_pts: 0,
+        })
+    }
+
+    /// Feed one access unit and take whatever frames it completed.
+    ///
+    /// Usually one, but an access unit can complete none (the decoder wants
+    /// more input, or the sample gate is not due) and, with reordering, more
+    /// than one — so the answer is a list and the caller must not assume a
+    /// frame per push.
+    ///
+    /// `now` is the caller's instant, taken once for the whole call rather than
+    /// per decoded frame as `decode::run` does. The two agree because an access
+    /// unit is one picture: the difference would be visible only in a decoder
+    /// emitting a burst, where sharing an instant means the burst yields one
+    /// sample instead of one per frame — which is what the rate limit is for.
+    pub fn push_au(
+        &mut self,
+        au: &[u8],
+        pts: i64,
+        time_base: (i32, i32),
+        now: Instant,
+    ) -> Result<Vec<FrameObservations>> {
+        let time_base = rational(time_base)?;
+        let packet = packet_from(au, pts)?;
+        if let Err(error) = self.decoder.send_packet(&packet) {
+            // Joining mid-GOP means feeding the decoder frames whose
+            // references never arrived; it resyncs on the next keyframe.
+            self.note(Tolerated::Decode, &error);
+            return Ok(Vec::new());
+        }
+
+        let mut frames = Vec::new();
+        loop {
+            let frame = match self.decoder.receive_frame() {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(error) => {
+                    self.note(Tolerated::Decode, &error);
+                    break;
+                }
+            };
+            if self
+                .last_sample
+                .is_some_and(|last| now.duration_since(last) < self.interval)
+            {
+                continue;
+            }
+            self.last_sample = Some(now);
+            let observed_at = SystemTime::now();
+            let pts = decode::pts_90k(&frame, time_base);
+
+            let Sampled { input, motion } = match self.decoder.to_tensor(frame) {
+                Ok(Some(sampled)) => sampled,
+                Ok(None) => continue,
+                Err(error) => {
+                    // A frame we cannot convert costs one sample, not the
+                    // stream: sws has no path for a mid-stream format change
+                    // and a filter graph rebuild can fail transiently.
+                    self.note(Tolerated::Tensor, &error);
+                    continue;
+                }
+            };
+
+            let decision = self
+                .gate
+                .decide(self.motion, motion, self.epoch.as_deref(), now);
+            let (objects, inferred) = match decision {
+                Decision::Detect => {
+                    let dets = self.engine.detect(input, &self.floors)?;
+                    self.seeds.remember(&dets);
+                    (dets, true)
+                }
+                // The gate skipped the model: re-report what the last real
+                // pass found, so a parked object the gate stopped inferring on
+                // does not age out of the host's tracker while it is still
+                // standing there.
+                Decision::Skip => (self.seeds.replay(), false),
+            };
+
+            // The same bound the ndjson path refuses a line for: a `pts` this
+            // far out means the rescale saturated, so it is not a timestamp,
+            // and `Cairn.ObservationClock` has nothing to do with it.
+            if !(-MAX_PTS..=MAX_PTS).contains(&pts) {
+                self.unbounded_pts += 1;
+                if should_log(self.unbounded_pts) {
+                    note!(
+                        "camera {}: pts {pts} is outside +-2^62, {} frame(s) dropped so far",
+                        self.camera_id,
+                        self.unbounded_pts
+                    );
+                }
+                continue;
+            }
+
+            frames.push(FrameObservations {
+                pts,
+                observed_at_ms: unix_ms(observed_at),
+                inferred,
+                objects,
+            });
+        }
+        Ok(frames)
+    }
+
+    /// The tolerated-error counters, `(decode, sample conversion)`. Per stream
+    /// like everything else here, which is what a test comparing a fed-garbage
+    /// stream against its neighbour reads.
+    #[cfg(test)]
+    pub fn tolerated(&self) -> (u64, u64) {
+        (self.decode_errors, self.tensor_errors)
+    }
+
+    fn note(&mut self, what: Tolerated, error: &anyhow::Error) {
+        let count = match what {
+            Tolerated::Decode => &mut self.decode_errors,
+            Tolerated::Tensor => &mut self.tensor_errors,
+        };
+        *count += 1;
+        if should_log(*count) {
+            note!(
+                "camera {}: {} error ({count} so far): {}",
+                self.camera_id,
+                what.name(),
+                chain(error)
+            );
+        }
+    }
+}
+
+impl Drop for Stream {
+    /// Hands the camera id back whether the host called `close_stream` or the
+    /// BEAM simply collected the handle.
+    fn drop(&mut self) {
+        self.engine.release(&self.camera_id);
+    }
+}
+
+/// What this stream's next gated frame will re-report.
+///
+/// The rule for turning a model pass into seeds is
+/// [`cairn_detect::emit::seeds_from`], shared with the ndjson path so the two
+/// cannot drift apart. All this adds is the feed: every seed of the last pass,
+/// handed back by value.
+///
+/// That feed is the one place the two paths differ, and it is deliberate. The
+/// ndjson path remembers only the prefix of the list that reached the wire;
+/// there is no equivalent here because there is no line to shed from, and
+/// `infer`'s own cap (`MAX_DETS`, 32) is under the contract's per-line object
+/// cap ([`cairn_detect::emit::MAX_OBJECTS`], 64), so nothing is ever lost
+/// between the model and this.
+#[derive(Default)]
+struct Seeds(Vec<Det>);
+
+impl Seeds {
+    /// Replace the memory with this pass's seeds. A pass that found nothing
+    /// empties it, which is what stops a departed object from being re-reported
+    /// past the re-verify that lost it.
+    fn remember(&mut self, dets: &[Det]) {
+        self.0 = seeds_from(dets);
+    }
+
+    /// The seeds for one gated frame. Cloned rather than borrowed because the
+    /// caller hands them to a [`FrameObservations`] the stream does not own,
+    /// and because the memory outlives any number of gated frames.
+    fn replay(&self) -> Vec<Det> {
+        self.0.clone()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Tolerated {
+    Decode,
+    Tensor,
+}
+
+impl Tolerated {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Decode => "decode",
+            Self::Tensor => "sample conversion",
+        }
+    }
+}
+
+fn should_log(count: u64) -> bool {
+    count % LOG_EVERY == 1
+}
+
+/// Open this stream's decoder against a bare H.264 stream description.
+///
+/// There is no container here to take stream parameters from — the caller is
+/// Membrane's H.264 parser, which delivers whole access units with SPS and PPS
+/// in band. So the codec parameters carry the codec and nothing else, and the
+/// decoder learns its geometry from the first SPS it sees. Both decode paths
+/// already tolerate that: the software one applies `codecpar` and opens, and
+/// the hardware one builds its filter graph on the first frame when the
+/// declared size is missing.
+fn open_decoder(engine: &Engine, motion: Option<MotionConfig>) -> Result<Box<dyn Decoder>> {
+    let mut codecpar = AVCodecParameters::new();
+    // SAFETY: `codecpar` is our own freshly allocated parameters struct, and
+    // both fields are plain enums with no ownership.
+    unsafe {
+        let raw = codecpar.deref_mut();
+        raw.codec_id = ffi::AV_CODEC_ID_H264;
+        raw.codec_type = ffi::AVMEDIA_TYPE_VIDEO;
+    }
+    decode::open(
+        engine.decoder,
+        &codecpar,
+        engine.input_spec,
+        motion,
+        engine.sample_fps,
+    )
+    .map_err(|e| NativeError::OpenStream(chain(&e)))
+}
+
+/// One access unit as a packet the decoder can take.
+///
+/// The bytes are copied because libavcodec's buffer needs its own padding and
+/// its own lifetime; the binary this came from belongs to the calling Elixir
+/// process and may be gone the moment the NIF returns.
+fn packet_from(au: &[u8], pts: i64) -> Result<AVPacket> {
+    if au.is_empty() {
+        return Err(NativeError::Decode("empty access unit".to_string()));
+    }
+    let size = i32::try_from(au.len())
+        .map_err(|_| NativeError::Decode(format!("access unit of {} bytes", au.len())))?;
+
+    let mut packet = AVPacket::new();
+    // SAFETY: `av_new_packet` allocates `size` bytes plus libavcodec's own
+    // padding and sets `data`/`size`, so the copy below stays inside the
+    // allocation. A negative return means it allocated nothing, which is why
+    // the copy is on the success path only.
+    unsafe {
+        let raw = packet.as_mut_ptr();
+        let allocated = ffi::av_new_packet(raw, size);
+        if allocated < 0 {
+            return Err(NativeError::Decode(format!(
+                "allocating a {size}-byte packet failed ({allocated})"
+            )));
+        }
+        std::ptr::copy_nonoverlapping(au.as_ptr(), (*raw).data, au.len());
+    }
+    packet.set_pts(pts);
+    packet.set_dts(pts);
+    Ok(packet)
+}
+
+/// The caller's time base, refused rather than trusted.
+///
+/// `av_rescale_q` divides by the denominator and reads the sign of both, so a
+/// zero or negative term is not a slightly wrong timestamp — it is an
+/// arithmetic fault inside libavutil on the frame path.
+fn rational((num, den): (i32, i32)) -> Result<AVRational> {
+    if num <= 0 || den <= 0 {
+        return Err(NativeError::Decode(format!(
+            "time base {num}/{den} must be positive"
+        )));
+    }
+    Ok(AVRational { num, den })
+}
+
+/// Milliseconds since the Unix epoch. A clock before the epoch (an unset RTC
+/// on a cold-booted SBC) reads as the epoch rather than failing — the host
+/// wants a timestamp, and a wrong one is visible in the data where a dropped
+/// frame is not. The same choice `emit::rfc3339_utc` makes.
+fn unix_ms(at: SystemTime) -> i64 {
+    i64::try_from(
+        at.duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_time_base_that_would_fault_the_rescale_is_refused() {
+        for bad in [(0, 90_000), (1, 0), (-1, 90_000), (1, -90_000)] {
+            let error = rational(bad).unwrap_err();
+            assert_eq!(error.reason(), "decode", "{bad:?}");
+        }
+        let ok = rational((1, 90_000)).unwrap();
+        assert_eq!((ok.num, ok.den), (1, 90_000));
+    }
+
+    #[test]
+    fn an_empty_access_unit_is_an_error_and_not_a_packet() {
+        assert_eq!(packet_from(&[], 0).unwrap_err().reason(), "decode");
+    }
+
+    #[test]
+    fn a_packet_carries_the_bytes_and_the_pts() {
+        let au = [0u8, 0, 0, 1, 0x67, 0x42];
+        let mut packet = packet_from(&au, 4_500).unwrap();
+        assert_eq!(packet.pts, 4_500);
+        assert_eq!(packet.dts, 4_500);
+        assert_eq!(packet.size as usize, au.len());
+        // SAFETY: `packet_from` returned, so `data` covers `size` bytes.
+        let data = unsafe { std::slice::from_raw_parts(packet.as_mut_ptr().read().data, au.len()) };
+        assert_eq!(data, au);
+    }
+
+    #[test]
+    fn the_error_log_fires_on_the_first_and_every_fiftieth() {
+        assert!(should_log(1));
+        assert!(!should_log(2));
+        assert!(should_log(LOG_EVERY + 1));
+        assert!(!should_log(LOG_EVERY));
+    }
+
+    #[test]
+    fn a_clock_before_the_epoch_reads_as_the_epoch() {
+        assert_eq!(unix_ms(UNIX_EPOCH), 0);
+        assert_eq!(unix_ms(UNIX_EPOCH - Duration::from_secs(60)), 0);
+        assert_eq!(unix_ms(UNIX_EPOCH + Duration::from_millis(1_500)), 1_500);
+    }
+
+    /// What a gated frame re-reports, on this path and against the other one.
+    /// [`Stream`] itself needs a model and a decoder to build, so the seed
+    /// memory is driven directly — it is the whole of what a `Decision::Skip`
+    /// consults.
+    mod seeds {
+        use super::*;
+        use cairn_detect::control::{Control, Streams};
+        use cairn_detect::emit::{ObservationKind, Publisher};
+
+        const EPOCH: &str = "01K1B2C3D4E5F6G7H8J9K0M1N2";
+
+        fn det(label: &str, score: f64) -> Det {
+            Det {
+                label: label.to_string(),
+                score,
+                bbox: [0.1, 0.2, 0.3, 0.4],
+                observation_kind: ObservationKind::Detected,
+                evidence: true,
+                embedding: None,
+            }
+        }
+
+        /// A detection `--track-floor-json` admitted: on the wire at its real
+        /// score, below its label's `min_score`, and not a sighting to repeat.
+        fn sub_floor(label: &str, score: f64) -> Det {
+            Det {
+                evidence: false,
+                ..det(label, score)
+            }
+        }
+
+        /// One model pass as `push_au` hands it over, feature and band both.
+        fn pass() -> Vec<Det> {
+            let mut with_feature = det("person", 0.87);
+            with_feature.embedding = Some("QUJD".to_string());
+            vec![with_feature, sub_floor("car", 0.3), det("person", 0.25)]
+        }
+
+        #[test]
+        fn a_gated_frame_re_reports_the_last_passs_evidence_alone() {
+            let mut seeds = Seeds::default();
+            assert!(seeds.replay().is_empty(), "nothing seeds before a pass");
+
+            seeds.remember(&pass());
+            let replayed = seeds.replay();
+            assert_eq!(
+                replayed.iter().map(|det| det.score).collect::<Vec<_>>(),
+                vec![0.87, 0.25],
+                "the band box is not a sighting to re-report"
+            );
+            assert!(replayed
+                .iter()
+                .all(|det| det.observation_kind == ObservationKind::Tracked));
+            assert!(
+                replayed.iter().all(|det| det.embedding.is_none()),
+                "a seed re-reports a position, not an appearance"
+            );
+            // and replaying is not consuming: the gate skips many frames per
+            // pass, and each one owes the host the same boxes
+            assert_eq!(seeds.replay(), replayed);
+        }
+
+        #[test]
+        fn every_pass_replaces_what_is_seeded() {
+            let mut seeds = Seeds::default();
+            seeds.remember(&pass());
+            assert_eq!(seeds.replay().len(), 2);
+
+            // the re-verify that loses an object shrinks the seeds by itself:
+            // the memory is the last pass, not a high-water mark
+            seeds.remember(&[det("person", 0.5)]);
+            assert_eq!(seeds.replay().len(), 1);
+            assert_eq!(seeds.replay()[0].score, 0.5);
+
+            // …and a pass with nothing but band on it seeds nothing at all
+            seeds.remember(&[sub_floor("car", 0.3)]);
+            assert!(seeds.replay().is_empty());
+        }
+
+        #[test]
+        fn the_two_paths_seed_the_same_boxes_from_the_same_detections() {
+            // The divergence this arrangement exists to make impossible. The
+            // ndjson path is driven through a real publisher — a started
+            // stream, one inferred line, then a seeded one — and what it puts
+            // on the wire has to be what this path holds in hand.
+            let found = pass();
+            let mut seeds = Seeds::default();
+            seeds.remember(&found);
+
+            let streams = Arc::new(Streams::new(["front"]));
+            streams.apply(Control::Started {
+                camera_id: "front".to_string(),
+                stream_epoch: EPOCH.to_string(),
+            });
+            let mut publisher = Publisher::new(Arc::clone(&streams));
+            publisher
+                .line_for("front", 900, SystemTime::UNIX_EPOCH, &found)
+                .expect("a started camera emits its inferred line");
+            let seeded = publisher
+                .seeded_line_for("front", 1_800, SystemTime::UNIX_EPOCH)
+                .expect("…and its gated one");
+
+            let line: serde_json::Value =
+                serde_json::from_str(&seeded).expect("the plugin emits valid json");
+            assert_eq!(
+                line["objects"],
+                serde_json::to_value(seeds.replay()).expect("a seed serializes"),
+                "the two producers disagree about what a gated frame carries"
+            );
+            // …and not by both being empty, which would agree about nothing
+            assert_eq!(line["objects"].as_array().map(Vec::len), Some(2));
+        }
+    }
+}

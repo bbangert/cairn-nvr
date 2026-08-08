@@ -13,5 +13,9 @@ Cairn.Repo.delete_all(Cairn.Tracks.Track)
 
 # The full-pipeline integration test needs ffmpeg + several seconds of
 # realtime streaming; run it explicitly with: mix test --include integration
-ExUnit.start(exclude: [:integration])
+#
+# :native_parity needs more than that — the `cairn-native` NIF in priv/native,
+# the `cairn-detect` release binary, a model and recorded clips, none of which
+# the Elixir CI job builds or carries. Run it with: mix test --only native_parity
+ExUnit.start(exclude: [:integration, :native_parity])
 Ecto.Adapters.SQL.Sandbox.mode(Cairn.Repo, :manual)

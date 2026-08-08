@@ -188,7 +188,7 @@ What to read:
   the band cost in wire.
 - **`N of them on seeded lines`**, printed on that same line whether or not it
   is zero. For cairn-detect it is zero: a seed re-reports evidence, never the
-  band (`emit::CameraState::last_dets`). Anything else on a gated track-floor
+  band (`emit::seeds_from`). Anything else on a gated track-floor
   run is a seeding regression.
 - Give the validator the **same floors the plugin ran under**. It applies one
   `--min-score-json` to every camera in the capture, so a `--cameras-json`

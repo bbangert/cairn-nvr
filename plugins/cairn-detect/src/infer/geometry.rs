@@ -232,8 +232,9 @@ pub(super) struct ModelBox(pub(super) Bbox);
 /// One thing can: `tests/norm_box_invariant.rs` drives a `trybuild` case that
 /// compiles this very file and forges a `NormBox` from a sibling module,
 /// requiring the compiler to refuse. Widen the field and that case compiles,
-/// which fails the test. A `compile_fail` doctest could not have done it — this
-/// crate has no library target, so doctests never run at all.
+/// which fails the test. A `compile_fail` doctest could not have done it:
+/// `geometry` is private inside `infer`, so a doctest — which compiles against
+/// the library's *public* surface — cannot name `NormBox` to forge one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct NormBox(Bbox);
 

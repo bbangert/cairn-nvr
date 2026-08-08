@@ -13,6 +13,8 @@ use anyhow::{anyhow, Context, Result};
 use rsmpeg::avformat::{AVFormatContextInput, AVInputFormat};
 use rsmpeg::avutil::AVDictionary;
 
+use crate::note;
+
 const OPEN_RETRY: Duration = Duration::from_secs(5);
 const MAX_OPEN_ATTEMPTS: u32 = 12;
 
@@ -167,7 +169,7 @@ fn open_stream_within(port: u16, max_attempts: u32) -> Result<AVFormatContextInp
             Ok(input) => return Ok(input),
             Err(e) => {
                 if attempt < max_attempts {
-                    eprintln!(
+                    note!(
                         "stream open attempt {attempt}/{max_attempts} failed ({e}); waiting for a keyframe"
                     );
                     sleep(OPEN_RETRY);

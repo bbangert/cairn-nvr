@@ -302,7 +302,12 @@ fn raw_classes(
     let _ = score;
     let mut candidates = Vec::new();
     for a in 0..anchors {
-        let (class_id, score) = argmax(nc, |c| f64::from(values[(4 + c) * anchors + a]));
+        // `None` is a head that reported no classes at all, which is the export
+        // being wrong rather than this anchor — see [`argmax`].
+        let Some((class_id, score)) = argmax(nc, |c| f64::from(values[(4 + c) * anchors + a]))
+        else {
+            continue;
+        };
         // A NaN score wins `total_cmp`'s argmax, so it is rejected here rather
         // than left to be compared against a floor (where every comparison is
         // false) and serialized as `null`, which would take the whole output
@@ -367,7 +372,13 @@ fn grid_objectness(
                     ScoreComposition::ObjTimesClass => f64::from(values[base + 4]),
                     ScoreComposition::Class | ScoreComposition::SigmoidClass => 1.0,
                 };
-                let (class_id, class_score) = argmax(nc, |c| f64::from(values[base + 5 + c]));
+                // `None` is a head that reported no classes at all, which is
+                // the export being wrong rather than this anchor — see
+                // [`argmax`].
+                let Some((class_id, class_score)) = argmax(nc, |c| f64::from(values[base + 5 + c]))
+                else {
+                    continue;
+                };
                 // NaN wins total_cmp's argmax and survives every comparison
                 // against a floor, then serializes as `null` and takes the
                 // whole output line out of the contract.
@@ -526,11 +537,19 @@ fn sigmoid(logit: f64) -> f64 {
 
 /// Argmax over `n` scores. `total_cmp` orders NaN, so a NaN wins — every
 /// caller rejects the result rather than letting one reach the output.
-fn argmax(n: usize, score: impl Fn(usize) -> f64) -> (usize, f64) {
+///
+/// `None` for `n == 0`, which is a head with no classes to name: an export
+/// whose class dimension settled at zero (a dynamic-shape export, an int8 one
+/// whose class dim collapsed, a profile that does not match the layout). It
+/// used to be an `expect`, asserting an invariant nothing enforces — and
+/// `--allow-label-mismatch` is exactly the flag that stops the load-time check
+/// from refusing such an export. In-VM that panic is under the shared model
+/// lock, which poisons a session nothing recovers; the caller skipping the
+/// anchor costs one frame's detections instead.
+fn argmax(n: usize, score: impl Fn(usize) -> f64) -> Option<(usize, f64)> {
     (0..n)
         .map(|c| (c, score(c)))
         .max_by(|x, y| x.1.total_cmp(&y.1))
-        .expect("a detect head has at least one class")
 }
 
 /// Center/extent -> corners, dropping anything non-finite or absurdly large.
@@ -3057,7 +3076,10 @@ mod tests {
         // untouched anchor of a sparse tensor — comes out as the *highest*
         // class id, not class 0. Which floor then drops it is decided by that
         // last class, and reading it the intuitive way gets the wrong one.
-        assert_eq!(argmax(NC, |_| 0.0), (NC - 1, 0.0));
+        assert_eq!(argmax(NC, |_| 0.0), Some((NC - 1, 0.0)));
+        // …and a head with no classes to choose between names none, rather
+        // than panicking under the model lock
+        assert_eq!(argmax(0, |_| 0.0), None);
 
         let flat = v8_output(3, &[(320.0, 320.0, 64.0, 64.0, 0, 0.0)]);
         // admitted at a floor every class clears, it leaves as `car` — id 2,

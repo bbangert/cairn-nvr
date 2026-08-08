@@ -14,6 +14,8 @@ use ort::environment::Environment;
 use ort::session::{Session, SessionOutputs};
 use ort::value::Tensor;
 
+use crate::note;
+
 use super::super::heads::Raw;
 use super::super::resolve::{
     declared_input_batch, declared_input_size, static_output_dims, Declared,
@@ -203,7 +205,7 @@ impl Backend for QnnBackend {
         }
 
         let ep_options = qnn_ep_options(qnn);
-        eprintln!(
+        note!(
             "qnn: {} device(s) from {}, options [{}]; note: per-node CPU fallback \
              is still possible after open — only a latency delta vs the cpu \
              backend proves HTP execution (D-P5)",

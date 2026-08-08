@@ -1,12 +1,12 @@
 //! The motion gate's policy: what one sample is worth, once it has been
 //! measured.
 //!
-//! Measurement happens on the decode thread ([`crate::motion`]); the decision
-//! happens here, called from the inference loop of either mode. That is the
-//! only place that knows which camera a sample came from and which stream
-//! epoch its lines are being tagged with, so it is the only place the epoch
-//! rule below can be applied at all. One [`Gate`] per camera: single mode holds
-//! one, group mode one per slot.
+//! Measurement happens where the pixels are ([`crate::motion`]); the decision
+//! happens here, in whichever loop is draining samples. That loop is the only
+//! place that knows which camera a sample came from and which stream epoch its
+//! output is being tagged with, so it is the only place the epoch rule below
+//! can be applied at all. One [`Gate`] per camera: single mode holds one, group
+//! mode one per slot, and `cairn-native` one per open stream.
 //!
 //! Every instant is handed in by the caller. [`Gate::decide`] is a function of
 //! `(config, verdict, epoch, now)` and its own state and nothing else — no
@@ -15,14 +15,20 @@
 //! shape and lives here for the same reason: it is a function of the decisions
 //! and the instants they were made at, and nothing else.
 //!
-//! The state here belongs to the *process*, not to the stream. Group mode
+//! In the two plugin modes the state here belongs to the *process*, not to the
+//! stream. Group mode
 //! re-opens a member's RTP stream in place (`multiplex::stream_loop`), which
 //! builds a fresh decoder and with it a fresh
 //! [`crate::motion::MotionDetector`] — a camera whose measurement has started
 //! over while its `Gate` has not. What covers the rebuilt detector's blind
 //! window is [`MotionVerdict::calibrating`]; see [`Gate::decide`]. Single mode
 //! has no such window: a stream failure there is fatal, and the process Cairn
-//! restarts has a fresh `Gate` too.
+//! restarts has a fresh `Gate` too. `cairn-native` is the third case: the
+//! `Gate` belongs to the stream, so a reopen builds a fresh detector and a
+//! fresh `Gate` together and the mismatch cannot arise. That host also calls
+//! [`Gate::decide`] directly rather than [`sample_line`] — it has no publisher
+//! and no ndjson line to build — so the policy is shared and the emission is
+//! not.
 
 use std::time::{Duration, Instant};
 
@@ -1120,6 +1126,45 @@ mod tests {
                 vec![("person".to_string(), 0.9, "tracked".to_string())],
             );
             assert_eq!(front.passes, 2);
+        }
+
+        #[test]
+        fn a_skipped_sample_carries_exactly_the_shared_seed_rule() {
+            // The ndjson path's end of the rule, driven by a real gate skip
+            // rather than by asking the publisher directly: what a skipped
+            // sample puts on the wire is `emit::seeds_from` of the last real
+            // line, which is the same function `cairn-native`'s stream holds
+            // its own seeds by.
+            let (streams, mut publisher) = publisher(&["front"]);
+            start(&streams, "front", EPOCH);
+            let mut with_feature = det("person", 0.9);
+            with_feature.embedding = Some("QUJD".to_string());
+            let found = vec![with_feature, sub_floor("car", 0.3)];
+            let mut front = Member::new("front", config(), found.clone());
+            let base = Instant::now();
+
+            // inside the epoch bypass, so this one is inferred and carries the
+            // feature and the band both
+            let real = front.line(&mut publisher, still(), base);
+            assert!(real.contains(r#""embedding":"QUJD""#), "{real}");
+            // the re-verify at 16 s is the last real line, and the sample after
+            // it is the first the gate skips
+            front.line(&mut publisher, still(), at(base, 16_000));
+            let seeded = front.line(&mut publisher, still(), at(base, 16_200));
+            assert_eq!(front.passes, 2);
+
+            let value: serde_json::Value = serde_json::from_str(&seeded).unwrap();
+            assert_eq!(
+                value["objects"],
+                serde_json::to_value(emit::seeds_from(&found)).unwrap()
+            );
+            // spelled out too, since the line above compares against the rule
+            // rather than against what the rule is supposed to produce
+            assert_eq!(
+                objects(&seeded),
+                vec![("person".to_string(), 0.9, "tracked".to_string())]
+            );
+            assert!(!seeded.contains("embedding"), "{seeded}");
         }
 
         #[test]
