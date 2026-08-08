@@ -189,7 +189,7 @@ defmodule Cairn.Config.Server do
   # The contract for a field added to `Cairn.Config.Camera` later: the
   # default is refresh-only. Nothing lands in this list by being new — it
   # goes here only on the deliberate finding that it reaches a subprocess.
-  @restart_fields [:rtsp_url, :plugin, :min_score, :transcode, :extra_ffmpeg_args]
+  @restart_fields [:rtsp_url, :plugin, :pipeline, :min_score, :transcode, :extra_ffmpeg_args]
 
   # Two things are compared *resolved* rather than read off the camera
   # struct, because both are baked at tree init out of config the struct does

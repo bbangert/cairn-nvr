@@ -241,6 +241,19 @@ defmodule Cairn.Config.ServerTest do
                %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
     end
 
+    test "flipping a camera's pipeline restarts it; an unchanged pipeline does not" do
+      # :pipeline is a @restart_field — the tree is built around it (a membrane
+      # camera's hub is socketless), so it cannot be swapped under a live camera.
+      assert camera_diff(%{"pipeline" => "membrane"}) ==
+               %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+
+      # the same pipeline on both sides is neither a restart nor a refresh
+      base = %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1", "pipeline" => "membrane"}
+
+      assert Config.Server.diff_cameras(camera_config([base], %{}), camera_config([base], %{})) ==
+               %{added: [], removed: [], changed: [], refreshed: []}
+    end
+
     test "a global tracking edit refreshes the cameras that resolve through it" do
       assert camera_diff(%{}, %{"tracking" => %{"stationary_after_ms" => 20_000}}) ==
                %{added: [], removed: [], changed: [], refreshed: ["cam_a"]}

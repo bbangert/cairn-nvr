@@ -37,10 +37,15 @@ defmodule Cairn.Camera do
         {Cairn.FFmpegPort, camera: cam, config: config, index: index}
       ] ++
         plugin_child(cam, config, index) ++
-        [{Cairn.RTPHub, camera_id: cam.id, port: rtp_port}]
+        [{Cairn.RTPHub, camera_id: cam.id, port: rtp_hub_port(cam, rtp_port)}]
 
     Supervisor.init(children, strategy: :rest_for_one)
   end
+
+  # A membrane camera's hub is fed in-process by the pipeline's RTP branch;
+  # only the classic stack still owns a UDP socket for ffmpeg's third output.
+  defp rtp_hub_port(%{pipeline: :membrane}, _rtp_port), do: nil
+  defp rtp_hub_port(_cam, rtp_port), do: rtp_port
 
   # A `{:group, _}` camera's detections come from a shared process owned by
   # `Cairn.PluginGroupSupervisor`, not from this tree.

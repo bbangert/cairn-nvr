@@ -86,6 +86,170 @@ defmodule Cairn.FFmpegPortTest do
     end
   end
 
+  describe "build_membrane_argv/3" do
+    test "two outputs: mpegts on stdout + plugin rtp, hub output gone" do
+      argv = FFmpegPort.build_membrane_argv(camera("c"), 5001, "-timeout")
+
+      assert "-rtsp_transport" in argv
+      assert "mpegts" in argv
+      assert "pipe:1" in argv
+      assert "rtp://127.0.0.1:5001" in argv
+      assert Enum.count(argv, &String.starts_with?(&1, "rtp://")) == 1
+      assert Enum.count(argv, &(&1 == "copy")) == 2
+      # in-band SPS/PPS for the one remaining RTP output
+      assert Enum.count(argv, &(&1 == "h264_mp4toannexb")) == 1
+      refute "mp4" in argv
+    end
+  end
+
+  describe "membrane mode lifecycle" do
+    defmodule StubPipeline do
+      # Stands in for Cairn.Pipeline.Camera: plays both roles of the
+      # handshake (announces itself as the bridge source) and relays what it
+      # receives to the test, so FFmpegPort's session wiring is observable
+      # without media.
+      use Membrane.Pipeline
+
+      @impl true
+      def handle_init(_ctx, opts) do
+        owner = Keyword.fetch!(opts, :owner)
+        test_pid = :persistent_term.get({:membrane_stub, Keyword.fetch!(opts, :camera_id)})
+        send(owner, {:bridge_source_ready, Keyword.fetch!(opts, :epoch), self()})
+        send(test_pid, {:pipeline_started, self(), opts})
+        {[], %{test_pid: test_pid}}
+      end
+
+      @impl true
+      def handle_info({:ts_data, data}, _ctx, state) do
+        send(state.test_pid, {:ts, data})
+        {[], state}
+      end
+
+      def handle_info(msg, _ctx, state) do
+        send(state.test_pid, {:pipeline_msg, msg})
+        {[], state}
+      end
+    end
+
+    defmodule FailingPipeline do
+      # A pipeline_module that never reaches a running state: its handle_init
+      # raises, so FFmpegPort's start-failure path fires (either start/3 returns
+      # {:error, _} or it returns ok and the monitor sees the crash).
+      use Membrane.Pipeline
+
+      @impl true
+      def handle_init(_ctx, _opts), do: raise("pipeline refused to start")
+    end
+
+    defp start_membrane(id, opts, module \\ StubPipeline) do
+      :persistent_term.put({:membrane_stub, id}, self())
+      on_exit(fn -> :persistent_term.erase({:membrane_stub, id}) end)
+
+      start_supervised!({RingBuffer, camera_id: id, pre_window_seconds: 60})
+
+      cam = %Camera{camera(id) | pipeline: :membrane}
+
+      start_supervised!(
+        {FFmpegPort,
+         [
+           camera: cam,
+           config: config(),
+           index: 0,
+           backoff_min_ms: 50,
+           backoff_max_ms: 200,
+           watchdog_interval_ms: 100,
+           pipeline_module: module
+         ] ++ opts}
+      )
+    end
+
+    test "spawns a pipeline per session and forwards stdout bytes to the source" do
+      id = "mm_#{System.unique_integer([:positive])}"
+
+      start_membrane(id, command: "#{@fake} #{@fixture} 0.05 42")
+
+      assert_receive {:pipeline_started, _pid, opts}, 2_000
+      assert opts[:camera_id] == id
+      assert is_binary(opts[:epoch])
+
+      # fake ffmpeg's stdout reaches the announced source
+      assert_receive {:ts, data}, 2_000
+      assert is_binary(data)
+
+      # ffmpeg's exit flushes the session (eos) before teardown, then
+      # backoff brings a fresh pipeline with a fresh epoch
+      assert_receive {:pipeline_msg, :ts_eos}, 2_000
+      assert_receive {:pipeline_started, _pid2, opts2}, 2_000
+      assert opts2[:epoch] != opts[:epoch]
+    end
+
+    test ":running rides ring broadcasts, gated on this session's epoch" do
+      id = "mg_#{System.unique_integer([:positive])}"
+      status_pid = self()
+
+      start_membrane(id, [
+        {:command, "#{@fake} #{@fixture} 600 0"},
+        {:status_fun, fn cam_id, status -> send(status_pid, {:status, cam_id, status}) end}
+      ])
+
+      assert_receive {:status, ^id, :connecting}, 2_000
+      assert_receive {:pipeline_started, _pid, opts}, 2_000
+      epoch = opts[:epoch]
+
+      topic = RingBuffer.topic(id)
+
+      # a stale session's init + fragment must not mark the new one running
+      Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:init_segment, %{epoch: "stale"}})
+      Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:fragment, :whatever})
+      refute_receive {:status, ^id, :running}, 200
+
+      Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:init_segment, %{epoch: epoch}})
+      Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:fragment, :whatever})
+      assert_receive {:status, ^id, :running}, 2_000
+    end
+
+    test "a dying pipeline ends the session with backoff" do
+      id = "md_#{System.unique_integer([:positive])}"
+      status_pid = self()
+
+      start_membrane(id, [
+        {:command, "#{@fake} #{@fixture} 600 0"},
+        {:status_fun, fn cam_id, status -> send(status_pid, {:status, cam_id, status}) end}
+      ])
+
+      assert_receive {:pipeline_started, pid, _opts}, 2_000
+      Process.exit(pid, :kill)
+
+      assert_receive {:status, ^id, :backoff}, 2_000
+      assert_receive {:pipeline_started, pid2, _opts2}, 2_000
+      assert pid2 != pid
+    end
+
+    test "a pipeline that fails to start drops the camera into backoff, then retries" do
+      id = "mf_#{System.unique_integer([:positive])}"
+      status_pid = self()
+
+      # The crash reports from the failing pipeline are expected noise here.
+      ExUnit.CaptureLog.capture_log(fn ->
+        start_membrane(
+          id,
+          [
+            {:command, "#{@fake} #{@fixture} 600 0"},
+            {:status_fun, fn cam_id, status -> send(status_pid, {:status, cam_id, status}) end}
+          ],
+          FailingPipeline
+        )
+
+        # Whichever internal path fires (start/3 {:error, _} or ok-then-DOWN),
+        # the observable is the same: the session ends in backoff and the next
+        # spawn re-enters :connecting.
+        assert_receive {:status, ^id, :connecting}, 2_000
+        assert_receive {:status, ^id, :backoff}, 2_000
+        assert_receive {:status, ^id, :connecting}, 2_000
+      end)
+    end
+  end
+
   describe "lifecycle with fake ffmpeg" do
     test "streams fixture into the ring and respawns after exit" do
       id = "ff_#{System.unique_integer([:positive])}"

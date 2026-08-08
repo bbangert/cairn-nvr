@@ -28,6 +28,18 @@ defmodule Mix.Tasks.Cairn.Gen.Fixtures do
     # The mid-GOP fixture. See `@movflags_mid_gop` below for what it varies and
     # why nothing else in the corpus covers it.
     generate("testsrc_gop3.fmp4", duration: 8, rate: 10, gop: 30, mid_gop: true)
+
+    # A raw Annex-B H.264 elementary stream fed straight to Membrane's parser by
+    # ring_buffer_sink/rtp_out tests. gop == rate keeps keyframes at 1 s, so a
+    # 6 s clip carries 6 of them: enough for both suites' ≥2-keyframe / every-
+    # CMAF-segment-is-keyframe-headed assertions.
+    generate_h264("testsrc.h264", duration: 6, rate: 15, gop: 15, size: "192x108")
+
+    # MPEG-TS re-containers of the fmp4s (`-c copy`), the membrane conformance
+    # inputs — a container the pipeline's TS demuxer can drive, same media bytes.
+    recontainer("testsrc.fmp4", "testsrc.ts")
+    recontainer("testsrc_long.fmp4", "testsrc_long.ts")
+
     Mix.shell().info("fixtures written to #{@out_dir}")
   end
 
@@ -75,6 +87,56 @@ defmodule Mix.Tasks.Cairn.Gen.Fixtures do
         out
       ]
 
+    ffmpeg!(args)
+  end
+
+  # A raw Annex-B elementary stream (`-f h264`), not a container: libx264 writes
+  # in-band SPS/PPS, which is exactly what Membrane's parser consumes here.
+  defp generate_h264(name, opts) do
+    out = Path.join(@out_dir, name)
+
+    ffmpeg!([
+      "-y",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc=duration=#{opts[:duration]}:size=#{opts[:size]}:rate=#{opts[:rate]}",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "ultrafast",
+      "-pix_fmt",
+      "yuv420p",
+      "-g",
+      "#{opts[:gop]}",
+      "-f",
+      "h264",
+      out
+    ])
+  end
+
+  # Re-container an existing fixture into MPEG-TS without re-encoding, so the
+  # media bytes (and thus keyframe cadence) match the source fmp4 exactly.
+  defp recontainer(src, dest) do
+    ffmpeg!([
+      "-y",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      Path.join(@out_dir, src),
+      "-c",
+      "copy",
+      "-f",
+      "mpegts",
+      Path.join(@out_dir, dest)
+    ])
+  end
+
+  defp ffmpeg!(args) do
     {output, status} = System.cmd("ffmpeg", args, stderr_to_stdout: true)
 
     if status != 0 do
