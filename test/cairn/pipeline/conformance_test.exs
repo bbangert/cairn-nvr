@@ -395,7 +395,12 @@ defmodule Cairn.Pipeline.ConformanceTest do
     cond do
       fun.() -> :ok
       attempts == 0 -> flunk("condition never became true")
-      true -> Process.sleep(20) && wait_until(fun, attempts - 1)
+      true -> retry(fun, attempts)
     end
+  end
+
+  defp retry(fun, attempts) do
+    Process.sleep(20)
+    wait_until(fun, attempts - 1)
   end
 end

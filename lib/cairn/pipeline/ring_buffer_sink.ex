@@ -28,7 +28,11 @@ defmodule Cairn.Pipeline.RingBufferSink do
 
   @impl true
   def handle_stream_format(:input, %Membrane.CMAF.Track{} = format, _ctx, state) do
-    timescale = video_timescale(format.header)
+    # nil means our box walker failed on the muxer's init, not that the init
+    # is unusable; falling back to Fragment's default keeps timing math
+    # wrong-but-bounded instead of crashing the ring — whose death restarts
+    # the whole camera tree (:rest_for_one), a far worse outcome.
+    timescale = video_timescale(format.header) || 90_000
 
     # A re-emitted stream format (mid-session encoder change) is treated as a
     # fresh init: the ring drops its buffered fragments and restarts pts at ~0,

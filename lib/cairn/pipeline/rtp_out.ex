@@ -28,7 +28,11 @@ defmodule Cairn.Pipeline.RTPOut.Sink do
     {[], %{camera_id: opts.camera_id, seq: 0, ssrc: ssrc}}
   end
 
+  # No pts means no valid RTP timestamp to stamp: drop the one packet rather
+  # than crash the branch into a backoff loop — viewers resync on the next.
   @impl true
+  def handle_buffer(:input, %Membrane.Buffer{pts: nil}, _ctx, state), do: {[], state}
+
   def handle_buffer(:input, buffer, _ctx, state) do
     timestamp = rem(div(buffer.pts * @rtp_clock_hz, Membrane.Time.second()), @ts_wrap)
     marker = match?(%{rtp: %{marker: true}}, buffer.metadata)

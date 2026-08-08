@@ -3,17 +3,29 @@ defmodule Cairn.FFmpegPort do
   Owns one camera's ffmpeg process as a Port.
 
   Spawns via `/bin/sh -c "exec ffmpeg ... 2>> {data_dir}/log/ffmpeg-{id}.log"`
-  so stdout stays a clean fmp4 byte stream (stderr can neither be merged nor
+  so stdout stays a clean media byte stream (stderr can neither be merged nor
   silently dropped) and Port signals reach the real ffmpeg thanks to `exec`.
 
-  stdout is streamed through `Cairn.MP4.Demuxer`; init segments and
-  fragments are cast to the camera's `Cairn.RingBuffer`.
+  What stdout carries — and who consumes it — depends on the camera's
+  `pipeline:` setting:
 
-  Reconnect policy lives *inside* this GenServer: on `:exit_status` it
-  enters a jittered backoff (1s -> 30s) and respawns itself — a dead camera
-  is a normal long-lived state and must not burn supervisor restart
-  intensity. A periodic watchdog bounces ffmpeg when the ring has seen no
-  fragment for `stall_seconds` (silent stall, e.g. a wedged TCP session).
+    * `:classic` — fmp4, streamed through `Cairn.MP4.Demuxer` in this
+      process; init segments and fragments are cast to the camera's
+      `Cairn.RingBuffer`.
+    * `:membrane` — MPEG-TS, forwarded to a per-session
+      `Cairn.Pipeline.Camera` (started and monitored here, torn down with
+      each ffmpeg session) whose sink feeds the same ring. This process
+      then learns "media is flowing" from the ring's own broadcasts,
+      epoch-gated so a dying session cannot vouch for its successor. On
+      ffmpeg exit an end-of-stream is flushed through the pipeline first,
+      so the CMAF muxer's held tail segment is recorded rather than lost.
+
+  Reconnect policy lives *inside* this GenServer: on `:exit_status` (and,
+  membrane mode, on pipeline death) it enters a jittered backoff (1s -> 30s)
+  and respawns itself — a dead camera is a normal long-lived state and must
+  not burn supervisor restart intensity. A periodic watchdog bounces ffmpeg
+  when the ring has seen no fragment for `stall_seconds` (silent stall,
+  e.g. a wedged TCP session).
 
   Status transitions (`:connecting | :running | :backoff | :stalled`) are
   reported through the `:status_fun` callback (wired to `Cairn.CameraStatus`).
