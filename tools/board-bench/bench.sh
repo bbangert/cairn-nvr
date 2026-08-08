@@ -54,6 +54,14 @@ export ORT_DYLIB_PATH=/data/qnn-spike/lib/libonnxruntime.so.1
 export ADSP_LIBRARY_PATH="/data/qnn-spike/dsp;"
 export DSP_LIBRARY_PATH="/data/qnn-spike/dsp;"
 
+# Stale-run sweep: the cleanup trap below cannot fire when the
+# controlling ssh dies mid-run, and orphaned feeds accumulate (eleven
+# were found spraying RTP after one day of runs — they also wedge
+# :os.cmd captures). A bench board runs no other ffmpeg/cairn-detect;
+# if this board ever hosts production containers, scope this kill.
+killall ffmpeg 2>/dev/null
+killall cairn-detect 2>/dev/null
+
 GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
 FEEDS=""
 PLUGIN=""
@@ -135,9 +143,19 @@ while kill -0 "$PLUGIN" 2>/dev/null; do
   sleep 5
 done
 wait "$PLUGIN" 2>/dev/null
+rc=$?
 PLUGIN=""
 for f in $FEEDS; do kill "$f" 2>/dev/null; done
 FEEDS=""
+# The one legitimate end is the timer-driven stdin EOF, which the
+# plugin answers with _exit(3) ("control channel gone"). Anything else
+# — a startup refusal, a bad model, a mid-run fault — must invalidate
+# the run loudly instead of summarizing whatever partial output exists.
+if [ "$rc" -ne 3 ]; then
+  echo "plugin exited $rc (expected 3, the timer-driven stdin EOF) — run invalid" >&2
+  tail -5 "$RUN/err" >&2
+  exit 1
+fi
 # Governor restore is the trap's job, at exit — after the summary.
 
 # Summary: latency lines verbatim; achieved rate from run count over
