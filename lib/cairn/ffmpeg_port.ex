@@ -576,17 +576,14 @@ defmodule Cairn.FFmpegPort do
   # is the per-frame path.
   defp detect_opts(%{camera: %{plugin: nil}}), do: nil
 
+  # No `sample_fps`: the branch does not thin, and the engine takes the rate from
+  # the profile every membrane camera on this node has to agree on
+  # (`Cairn.Config.native_model_config/1`).
   defp detect_opts(state) do
-    sample_fps =
-      case Cairn.Config.profile_for(state.config, state.camera) do
-        %Cairn.Config.Profile{sample_fps: fps} -> fps
-        nil -> nil
-      end
-
     [
       policy: Cairn.Config.policy(state.config, state.camera),
       stream_params: %{min_score: state.camera.min_score}
-    ] ++ if(sample_fps, do: [sample_fps: sample_fps], else: [])
+    ]
   end
 
   # TS bytes buffered until the BridgeSource announces itself — a window of

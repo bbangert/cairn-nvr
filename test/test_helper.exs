@@ -17,5 +17,9 @@ Cairn.Repo.delete_all(Cairn.Tracks.Track)
 # :native_parity needs more than that — the `cairn-native` NIF in priv/native,
 # the `cairn-detect` release binary, a model and recorded clips, none of which
 # the Elixir CI job builds or carries. Run it with: mix test --only native_parity
-ExUnit.start(exclude: [:integration, :native_parity])
+#
+# :e2e_membrane needs everything :native_parity does *and* everything
+# :integration does — it runs the whole membrane stack on a recorded clip.
+# Run it with: mix test --only e2e_membrane
+ExUnit.start(exclude: [:integration, :native_parity, :e2e_membrane])
 Ecto.Adapters.SQL.Sandbox.mode(Cairn.Repo, :manual)

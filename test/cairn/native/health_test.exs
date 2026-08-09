@@ -99,6 +99,30 @@ defmodule Cairn.Native.HealthTest do
       assert status.stream_health == %{}
     end
 
+    test "a stream sampled well under its frame rate reports the model's rate", %{id: id} do
+      # The membrane branch's real shape: the sink calls once per access unit and
+      # the crate's rate gate admits a fifth of them. `stream_fps` and the
+      # throughput arithmetic must both count the passes and not the calls.
+      control(%{push_au: gated_then_pass(4, 1)})
+      host = start_host(health())
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+
+      Host.check_health(host)
+      started = System.monotonic_time(:millisecond)
+      push(host, id, 100)
+      Process.sleep(100)
+
+      # 20 passes at ~1 ms against a 45 ms baseline: fast work, not queued work
+      assert Host.check_health(host) == :healthy
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      status = Host.status(host)
+      assert status.inferences == 20
+      # …and the published rate is those 20 over the window, nowhere near the 100
+      assert status.stream_fps[id] * elapsed / 1000 <= 25
+      assert status.stream_fps[id] > 0
+    end
+
     test "a gate skipping every frame is idle, and never becomes a wedge", %{id: id} do
       control(%{push_au: {:ok, {[NativeStub.frame(false)], []}}})
       host = start_host(health())

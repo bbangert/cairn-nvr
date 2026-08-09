@@ -131,6 +131,19 @@ defmodule Cairn.Pipeline.InferSinkTest do
       assert actions == [demand: {:input, 1}]
     end
 
+    test "stamps at_ms on the host's monotonic clock, like both plugin producers", ctx do
+      # A wall-clock stamp keeps every intra-stream duration right and still
+      # breaks the tracker: `Cairn.CameraTracker` stamps a stream cut with
+      # `System.monotonic_time/1`, so a wall-clock `at_ms` lapses every
+      # suspension the instant it is offered and no track can ever be adopted
+      # across a reset. Nothing else in the pipeline notices.
+      {_actions, state} = playing(sink(ctx))
+      {_actions, _state} = feed(state)
+
+      assert_received {:"$gen_cast", {:detections, _camera, @policy, observation}}
+      assert_in_delta observation.at_ms, System.monotonic_time(:millisecond), 5_000
+    end
+
     test "carries a refreshed policy without restarting the session", ctx do
       {_actions, state} = playing(sink(ctx))
       assert_receive {:open_stream, _engine, _camera_id, _params}
@@ -256,8 +269,7 @@ defmodule Cairn.Pipeline.InferSinkTest do
       Testing.Pipeline.start_link_supervised!(
         spec: [
           child(:source, %Cairn.PushSource{buffers: buffers, interval_ms: interval_ms})
-          # 30 fps, the picker's fastest setting: 34 ms between AUs
-          |> child(:picker, %Picker{sample_fps: 30})
+          |> child(:picker, Picker)
           |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
           |> child(:infer, %InferSink{
             camera: ctx.camera,
@@ -270,7 +282,7 @@ defmodule Cairn.Pipeline.InferSinkTest do
       )
     end
 
-    test "the branch reaches the model at the rate that was asked for", ctx do
+    test "the branch paces nothing: the model is offered every AU the source sends", ctx do
       test = self()
 
       control(%{
@@ -280,8 +292,8 @@ defmodule Cairn.Pipeline.InferSinkTest do
         end
       })
 
-      # A source an order of magnitude faster than the gate and a push that costs
-      # nothing, so the picker is the only thing pacing this.
+      # A ~1 ms source and a push that costs nothing, so nothing here has a
+      # reason to drop and the rate is the source's own.
       pipeline = branch(ctx, 2_000, 1)
       Process.sleep(1_200)
       Testing.Pipeline.terminate(pipeline)
@@ -291,12 +303,12 @@ defmodule Cairn.Pipeline.InferSinkTest do
         |> Enum.chunk_every(2, 1, :discard)
         |> Enum.map(fn [before, after_it] -> after_it - before end)
 
-      assert length(gaps) >= 20, "too few pushes in 1.2 s to measure a rate: #{inspect(gaps)}"
+      assert length(gaps) >= 200, "too few pushes in 1.2 s to measure a rate: #{length(gaps)}"
 
-      # The smallest gap is the interval itself: `due?` never fires early, so
-      # jitter only ever lengthens one. Anything added to `interval_ms`, or a
-      # second gate at the same nominal rate downstream, shows up here.
-      assert Enum.min(gaps) in 34..37,
+      # A gate in this branch at any plausible `sample_fps` would put a floor of
+      # tens of milliseconds under every gap. The rate belongs to the crate's
+      # `Stream::push_au`, which this stub replaces.
+      assert Enum.min(gaps) < 10,
              "gaps over #{length(gaps)} pushes: min #{Enum.min(gaps)} ms, " <>
                "max #{Enum.max(gaps)} ms"
     end

@@ -5,12 +5,12 @@
 //!
 //! The tolerated per-frame failures (a decode error mid-GOP, a frame that will
 //! not convert) are counted and skipped exactly as `cairn_detect::decode::run`
-//! skips them. The rate is where the two paths differ: `run` paces itself on the
-//! wall clock, while here `Cairn.Pipeline.Picker` decides which access units
-//! arrive at all, and one of them costs at most one model pass.
+//! skips them, and the rate is gated where `run` gates it — after the decoder,
+//! before the tensor. `Cairn.Pipeline.Picker` hands over every access unit it
+//! receives, so most calls decode and return nothing.
 
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cairn_detect::decode::{self, Decoder, Sampled};
 use cairn_detect::emit::{seeds_from, Det, MAX_PTS};
@@ -46,6 +46,12 @@ pub struct Stream {
     /// without an epoch setter — a fresh `Gate` opens the window on its own first
     /// sample.
     epoch: Option<String>,
+    /// The wall-clock gap `--sample-fps` asks for, and the instant the last model
+    /// pass was admitted at. Wall clock rather than pts, as in
+    /// [`cairn_detect::decode::run`]: the point is to cap how often the model
+    /// runs, and a burst of access units would otherwise fire several at once.
+    interval: Duration,
+    last_sample: Option<Instant>,
     seeds: Seeds,
     decode_errors: u64,
     tensor_errors: u64,
@@ -58,6 +64,7 @@ impl Stream {
         let decoder = open_decoder(&engine, params.motion)?;
 
         let stream = Self {
+            interval: decode::sample_interval(engine.sample_fps),
             engine,
             camera_id,
             decoder,
@@ -65,6 +72,7 @@ impl Stream {
             floors: params.floors,
             motion: params.motion,
             epoch: params.epoch,
+            last_sample: None,
             seeds: Seeds::default(),
             decode_errors: 0,
             tensor_errors: 0,
@@ -75,14 +83,15 @@ impl Stream {
     }
 
     /// Feed one access unit and take the one observation it is worth, or none —
-    /// the decoder may want more input, and a frame that will not convert costs
-    /// its access unit.
+    /// most calls are none, because the caller pushes at frame rate and the rate
+    /// gate admits `--sample-fps` of them.
     ///
     /// Never more than one, whatever the decoder completed: see
     /// [`sampled_frame`]. The list is the host's shape, not a count.
     ///
-    /// `now` dates [`Gate::decide`]'s linger, re-verify and epoch-bypass windows;
-    /// nothing here paces on it.
+    /// `now` paces the rate gate and dates [`Gate::decide`]'s linger, re-verify
+    /// and epoch-bypass windows — one instant for the whole call, so a decoder
+    /// emitting a burst still costs one sample.
     pub fn push_au(
         &mut self,
         au: &[u8],
@@ -106,6 +115,16 @@ impl Stream {
         let Some(frame) = frame else {
             return Ok(Vec::new());
         };
+        // Here and not before the decoder: dropping an access unit costs the
+        // decoder its references, while decoding one is ~1 ms against the 27 ms
+        // `to_tensor` and the 12-56 ms pass below.
+        if self
+            .last_sample
+            .is_some_and(|last| now.duration_since(last) < self.interval)
+        {
+            return Ok(Vec::new());
+        }
+        self.last_sample = Some(now);
         let observed_at = SystemTime::now();
         let pts = decode::pts_90k(&frame, time_base);
 
@@ -277,11 +296,11 @@ fn should_log(count: u64) -> bool {
 /// The frame an access unit is sampled at — the first it completed — with the
 /// rest of its frames drained and dropped.
 ///
-/// The rate lives upstream in `Cairn.Pipeline.Picker`, which gates *access
-/// units*; reordering completes several frames for one of them, and inferring on
-/// each would run the model at some multiple of the rate that was asked for. A
-/// dropped frame never reaches [`Decoder::to_tensor`], so the motion background
-/// never absorbs it either — one access unit stays one sample, which is the unit
+/// Reordering completes several frames for one access unit, and [`Stream`]'s rate
+/// gate is one decision per call, so without this the burst would be sampled at
+/// whichever of its frames happened to be first past the interval. A dropped frame
+/// never reaches [`Decoder::to_tensor`], so the motion background never absorbs it
+/// either — one access unit stays at most one sample, which is the unit
 /// [`cairn_detect::motion::MotionDetector`]'s calibration window counts in.
 ///
 /// Drained rather than left queued: `avcodec_send_packet` refuses the next packet

@@ -494,9 +494,9 @@ fn pack_chw(plane: &[u8], stride: usize, fit: Fit, spec: InputSpec) -> Vec<f32> 
 
 /// The wall-clock gap between samples that `--sample-fps` asks for.
 ///
-/// Private because [`run`] is the only loop that paces on it: the NIF path takes
-/// its rate from `Cairn.Pipeline.Picker`, one access unit at a time.
-fn sample_interval(sample_fps: u32) -> Duration {
+/// Public because [`run`] is not the only loop that paces on it: a second spelling
+/// of this arithmetic is a second sample rate.
+pub fn sample_interval(sample_fps: u32) -> Duration {
     // Integer nanos, not a float reciprocal: exact for every legal rate,
     // and identical to the old `from_secs_f64(1.0 / 5.0)` at the default.
     Duration::from_nanos(1_000_000_000 / u64::from(sample_fps))

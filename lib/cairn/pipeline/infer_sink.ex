@@ -171,13 +171,17 @@ defmodule Cairn.Pipeline.InferSink do
   defp infer(state, _buffer), do: {[], state}
 
   defp observe(state, frames) do
+    # Monotonic, as both plugin producers pass: `at_ms` is compared against the
+    # host's monotonic clock elsewhere — `Cairn.CameraTracker`'s `cut_clock`
+    # stamps a stream cut with it, and a wall-clock `at_ms` puts every
+    # suspension a lifetime past its adoption window.
     {observations, clock} =
       Observations.from_frames(
         state.clock,
         frames,
         state.camera.id,
         state.epoch,
-        System.system_time(:millisecond)
+        System.monotonic_time(:millisecond)
       )
 
     # In this process, not the pipeline's: the sink is already the one blocked

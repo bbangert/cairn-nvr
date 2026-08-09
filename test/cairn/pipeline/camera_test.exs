@@ -72,13 +72,13 @@ defmodule Cairn.Pipeline.CameraTest do
       assert props.min_demand_factor == 0.5
     end
 
-    test "carries the configured sample rate into the picker" do
-      spec = spec(detect: detect(sample_fps: 3))
+    test "the picker takes no options — the crate owns the rate" do
+      spec = spec(detect: detect())
 
       {_name, picker, _opts} =
         Enum.find_value(spec, &Enum.find(&1.children, fn {name, _d, _o} -> name == :picker end))
 
-      assert picker.sample_fps == 3
+      assert picker == Cairn.Pipeline.Picker
     end
   end
 
@@ -130,12 +130,12 @@ defmodule Cairn.Pipeline.CameraTest do
       assert opts[:detect] == nil
     end
 
-    test "a profiled group's sample rate and the camera's wire floor" do
+    test "the camera's wire floor, and no rate: the engine's profile carries that" do
       camera = %{camera("cam_group", {:group, "g"}) | min_score: %{"person" => 0.6}}
       start_port(camera, config(camera))
 
       assert_receive {:pipeline_opts, opts}, 5_000
-      assert opts[:detect][:sample_fps] == 3
+      refute Keyword.has_key?(opts[:detect], :sample_fps)
       assert opts[:detect][:stream_params] == %{min_score: %{"person" => 0.6}}
     end
 

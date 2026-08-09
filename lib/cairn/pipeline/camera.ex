@@ -81,7 +81,7 @@ defmodule Cairn.Pipeline.Camera do
   defp detect_spec(camera, epoch, detect) do
     [
       get_child(:tee)
-      |> child(:picker, struct(Picker, Keyword.take(detect, [:sample_fps])))
+      |> child(:picker, Picker)
       # One AU between the two, so the picker learns that the model is free the
       # moment it is, and no more than one is ever in flight.
       |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)

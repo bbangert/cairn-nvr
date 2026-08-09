@@ -13,8 +13,8 @@ defmodule Cairn.Pipeline.PickerTest do
   # AUD then a non-IDR slice.
   @interframe <<0, 0, 1, 0x09, 0x30, 0, 0, 1, 0x41, 0x9A, 0x02>>
 
-  defp init(opts \\ []) do
-    {[], state} = Picker.handle_init(%{}, struct(Picker, opts))
+  defp init do
+    {[], state} = Picker.handle_init(%{}, %{})
     state
   end
 
@@ -37,88 +37,148 @@ defmodule Cairn.Pipeline.PickerTest do
     end
   end
 
-  describe "the depth-1 slot" do
-    test "nothing is emitted without demand" do
-      assert {[], state} = feed(init(), @keyframe)
-      assert state.pending != nil
-      assert state.emitted == 0
-    end
-
-    test "a second eligible AU replaces the one waiting — keep-newest, not oldest" do
-      {[], state} = feed(init(), @keyframe, 1)
-      {[], state} = feed(state, @keyframe, 2)
-
-      assert {[buffer: {:output, %Buffer{pts: 2}}], state} = demand(state)
-      assert state.pending == nil
-      assert state.dropped == 1
-      assert state.emitted == 1
-    end
-
-    test "one demand emits one buffer and no more" do
-      {[], state} = feed(init(), @keyframe, 1)
-      {[buffer: _emitted], state} = demand(state)
-
-      assert {[], _state} = demand(state)
-    end
-
-    test "an ineligible AU costs the slot and the demand nothing" do
-      {[], state} = feed(init(), @keyframe, 1)
-      {[], with_inter} = feed(state, @interframe, 2)
-
-      assert with_inter.pending == state.pending
-      assert with_inter.dropped == state.dropped + 1
-
-      # unmet demand outlives it, so the next eligible AU goes straight out
-      {[], waiting} = demand(%{with_inter | pending: nil})
-      assert {[buffer: {:output, %Buffer{pts: 3}}], _state} = feed(waiting, @keyframe, 3)
-    end
-
-    test "an AU with no pts is not a candidate" do
-      {[], state} = feed(init(), @keyframe, nil)
-
-      assert state.pending == nil
-      assert state.dropped == 1
-    end
+  # The decoder starts empty, so nothing is forwardable until an IDR has been.
+  defp synced(state \\ nil) do
+    {[], state} = feed(state || init(), @keyframe, 0)
+    {[buffer: _idr], state} = demand(state)
+    state
   end
 
-  describe "eligibility" do
-    test "a non-keyframe AU is never emitted, however much demand there is" do
+  describe "what is eligible" do
+    test "a non-keyframe AU is forwarded like any other" do
+      {[], state} = demand(synced())
+      assert {[buffer: {:output, %Buffer{pts: 1}}], state} = feed(state, @interframe, 1)
+      assert state.emitted == 2
+      assert state.dropped == 0
+    end
+
+    test "nothing is dropped while the sink keeps demanding" do
+      state =
+        Enum.reduce(1..20, synced(), fn pts, state ->
+          {[], state} = demand(state)
+          {[buffer: _one], state} = feed(state, @interframe, pts)
+          state
+        end)
+
+      assert state.emitted == 21
+      assert state.dropped == 0
+    end
+
+    test "nothing is forwarded before the first keyframe" do
       {[], state} = demand(init(), 10)
       {actions, state} = feed(state, @interframe, 1)
 
       assert actions == []
       assert state.pending == nil
+      assert state.dropped == 1
     end
 
-    test "only_keyframes has no false setting to configure" do
-      refute Map.has_key?(struct(Picker), :only_keyframes)
+    test "there is nothing to configure — the crate owns the rate" do
+      refute function_exported?(Picker, :__struct__, 0)
     end
 
-    test "the sample gate is measured from the last emit" do
-      {[], state} = feed(init(sample_fps: 1), @keyframe, 1)
-      {[buffer: _emitted], state} = demand(state)
+    test "an AU with no pts is not a candidate, and is a hole like any other" do
+      {[], state} = feed(synced(), @keyframe, nil)
 
-      # the next keyframe is inside the interval, so it is dropped rather than held
-      {[], state} = feed(state, @keyframe, 2)
+      assert state.pending == nil
+      assert state.dropped == 1
+      assert state.expecting_keyframe?
+    end
+  end
+
+  describe "the depth-1 slot" do
+    test "nothing is emitted without demand" do
+      assert {[], state} = feed(synced(), @interframe)
+      assert state.pending != nil
+    end
+
+    test "the AU waiting is kept and the newer one dropped — it is the decodable one" do
+      {[], state} = feed(synced(), @interframe, 1)
+      {[], state} = feed(state, @interframe, 2)
+
+      assert {[buffer: {:output, %Buffer{pts: 1}}], state} = demand(state)
       assert state.pending == nil
       assert state.dropped == 1
     end
 
-    test "the interval is the requested rate and nothing is added to it" do
-      for fps <- [1, 5, 6, 30] do
-        assert init(sample_fps: fps).interval_ms == ceil(1000 / fps)
-      end
+    test "one demand emits one buffer and no more" do
+      {[], state} = feed(synced(), @interframe, 1)
+      {[buffer: _emitted], state} = demand(state)
+
+      assert {[], _state} = demand(state)
     end
 
-    test "an AU exactly one interval after the last emit is due" do
-      for fps <- [1, 5, 6, 30] do
-        interval = ceil(1000 / fps)
-        state = %{init(sample_fps: fps) | last_ms: System.monotonic_time(:millisecond) - interval}
-        {[], fed} = feed(state, @keyframe, 1)
+    test "unmet demand outlives the slot, so the next AU goes straight out" do
+      {[], waiting} = demand(synced())
+      assert {[buffer: {:output, %Buffer{pts: 3}}], _state} = feed(waiting, @interframe, 3)
+    end
+  end
 
-        assert fed.pending != nil,
-               "at #{fps} fps an AU #{interval} ms after the last emit was dropped"
-      end
+  describe "the keyframe rule" do
+    test "a waiting keyframe is never the one dropped" do
+      {[], state} = feed(synced(), @keyframe, 1)
+      {[], state} = feed(state, @interframe, 2)
+      {[], state} = feed(state, @interframe, 3)
+
+      assert state.pending.pts == 1
+      assert state.dropped == 2
+
+      # …and it is still the buffer the demand collects
+      assert {[buffer: {:output, %Buffer{pts: 1}}], _state} = demand(state)
+    end
+
+    test "a keyframe displaces a waiting inter-frame" do
+      {[], state} = feed(synced(), @interframe, 1)
+      {[], state} = feed(state, @keyframe, 2)
+
+      assert state.pending.pts == 2
+      assert state.dropped == 1
+    end
+
+    test "a newer keyframe displaces a waiting one — the decoder resyncs on either" do
+      {[], state} = feed(synced(), @keyframe, 1)
+      {[], state} = feed(state, @keyframe, 2)
+
+      assert state.pending.pts == 2
+      assert state.dropped == 1
+    end
+  end
+
+  describe "after a hole" do
+    test "nothing is forwarded until the next keyframe" do
+      {[], state} = feed(synced(), @interframe, 1)
+      # no demand, so 2 is lost and the stream is holed from here
+      {[], state} = feed(state, @interframe, 2)
+      {[buffer: {:output, %Buffer{pts: 1}}], state} = demand(state)
+
+      # every inter-frame after the hole would decode to concealment
+      state =
+        Enum.reduce(3..8, state, fn pts, state ->
+          {[], state} = demand(state)
+          {actions, state} = feed(state, @interframe, pts)
+          assert actions == []
+          state
+        end)
+
+      assert state.dropped == 7
+
+      # …and the IDR ends it, on the demand still standing
+      assert {[buffer: {:output, %Buffer{pts: 9}}], state} = feed(state, @keyframe, 9)
+      refute state.expecting_keyframe?
+
+      # …after which the stream is contiguous again
+      {[], state} = demand(state)
+      assert {[buffer: {:output, %Buffer{pts: 10}}], _state} = feed(state, @interframe, 10)
+    end
+
+    test "a keyframe dropped for want of pts does not end the wait" do
+      {[], state} = feed(synced(), @interframe, 1)
+      {[], state} = feed(state, @interframe, 2)
+      {[buffer: _one], state} = demand(state)
+      {[], state} = feed(state, @keyframe, nil)
+
+      assert {[], state} = feed(state, @interframe, 3)
+      assert state.expecting_keyframe?
     end
   end
 
@@ -146,26 +206,31 @@ defmodule Cairn.Pipeline.PickerTest do
 
     @tag :capture_log
     test "the picker survives a flood past the toilet capacity and drops the surplus" do
-      buffers = for pts <- 1..500, do: buffer(@keyframe, pts)
+      # A 15-frame GOP, so the flood is a stream and not an unforwardable run of
+      # inter-frames.
+      buffers =
+        for pts <- 1..500,
+            do: buffer(if(rem(pts, 15) == 1, do: @keyframe, else: @interframe), pts)
 
       pipeline =
         Testing.Pipeline.start_link_supervised!(
           spec: [
             child(:source, %Cairn.PushSource{buffers: buffers})
-            |> child(:picker, %Picker{})
+            |> child(:picker, Picker)
             |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
             |> child(:sink, OneShotSink)
           ]
         )
 
-      # The wedged sink took one AU; everything after it had nowhere to go, and
-      # a `:manual` input on the picker would have been killed by the toilet
-      # ~200 buffers in instead of reporting this.
+      # The wedged sink took one AU and its input queue holds the one more it was
+      # sized for; everything after that had nowhere to go, and a `:manual` input
+      # on the picker would have been killed by the toilet ~200 buffers in instead
+      # of reporting this.
       Process.sleep(200)
       Testing.Pipeline.notify_child(pipeline, :picker, :stats)
       assert_pipeline_notified(pipeline, :picker, {:stats, stats}, 5_000)
 
-      assert stats.emitted == 1
+      assert stats.emitted in 1..2
       assert stats.dropped >= 400
       assert stats.dropped + stats.emitted <= 500
 

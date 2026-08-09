@@ -20,15 +20,17 @@
 //! CAIRN_NATIVE_SKIP_CLIP=1 cargo test
 //! ```
 //!
-//! There is no picker here, so nothing thins: every access unit that completes a
-//! frame costs a model pass, which is what makes these the slowest tests in the
-//! crate.
+//! `engine`'s `sample_fps` of 30 is a rate gate of 33 ms against a CPU pass that
+//! takes longer than that, so a tight [`feed`] paces itself and nearly every access
+//! unit costs a model pass — which is what makes these the slowest tests in the
+//! crate. Anything measuring the gate itself uses [`feed_at`] instead, where the
+//! instants are the test's own.
 
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rsmpeg::avformat::AVFormatContextInput;
 use rsmpeg::ffi;
@@ -97,6 +99,10 @@ fn artifacts() -> Option<Artifacts> {
 }
 
 fn engine(artifacts: &Artifacts) -> Arc<Engine> {
+    engine_at(artifacts, 30)
+}
+
+fn engine_at(artifacts: &Artifacts, sample_fps: u32) -> Arc<Engine> {
     let config = RawInitConfig {
         model: artifacts.model.display().to_string(),
         backend: "ort".into(),
@@ -108,7 +114,7 @@ fn engine(artifacts: &Artifacts) -> Arc<Engine> {
         // Software decode: a box without the GPU the hardware paths need has to
         // get the same answer as one with it.
         decoder: "sw".into(),
-        sample_fps: 30,
+        sample_fps,
         qnn: RawQnnOptions {
             library: None,
             soc_model: None,
@@ -176,6 +182,39 @@ fn feed(stream: &mut Stream, clip: &Clip) -> Vec<FrameObservations> {
         .collect()
 }
 
+/// The same, with the arrival instants the test's own rather than the wall clock's:
+/// `spacing` stands in for the camera's frame period, so what the rate gate does
+/// with a feed is a property of the numbers and not of how fast this box infers.
+fn feed_at(stream: &mut Stream, clip: &Clip, spacing: Duration) -> Vec<FrameObservations> {
+    let start = Instant::now();
+    clip.units
+        .iter()
+        .enumerate()
+        .flat_map(|(i, (au, pts))| {
+            stream
+                .push_au(au, *pts, clip.time_base, start + spacing * i as u32)
+                .expect("every access unit is accepted")
+        })
+        .collect()
+}
+
+/// Whether an access unit is keyframe-headed, by the walk `Cairn.Pipeline.Picker`
+/// does: the first VCL NAL's type, 5 for an IDR slice.
+fn is_keyframe(au: &[u8]) -> bool {
+    let mut rest = au;
+    while let Some(at) = rest.windows(3).position(|w| w == [0, 0, 1]) {
+        let Some((header, after)) = rest[at + 3..].split_first() else {
+            return false;
+        };
+        match header & 0x1F {
+            5 => return true,
+            1..=4 => return false,
+            _parameter_or_delimiter => rest = after,
+        }
+    }
+    false
+}
+
 /// The same through the resource handle, which is what serializes two callers on
 /// one stream.
 fn feed_shared(stream: &StreamRef, clip: &Clip) -> Result<Vec<FrameObservations>> {
@@ -240,35 +279,73 @@ fn a_recorded_clip_decodes_and_infers() {
     );
 }
 
-/// One access unit in, one observation out, at whatever rate the caller pushes:
-/// `Cairn.Pipeline.Picker` is the only thing between a camera and the model, and a
-/// second gate here would thin what it already admitted.
+/// The rate is `--sample-fps`, and specifically not the clip's keyframe rate: a
+/// gate upstream of the decoder could only ever admit keyframe-headed access units,
+/// which on the fleet's 2-5 s GOPs is 10-24x under what was asked for.
 #[test]
-fn back_to_back_access_units_are_not_thinned() {
+fn the_rate_gate_admits_sample_fps_and_not_the_gop_rate() {
     let Some(artifacts) = artifacts() else {
         return;
     };
-    let engine = engine(&artifacts);
+    let engine = engine_at(&artifacts, 5);
     let clip = read_clip(&artifacts.clip);
-    let head = Clip {
-        units: clip.units[..20.min(clip.units.len())].to_vec(),
-        time_base: clip.time_base,
-    };
+    let spacing = Duration::from_millis(50);
 
     let mut stream = open(&engine, "front");
-    let frames = feed(&mut stream, &head);
+    let frames = feed_at(&mut stream, &clip, spacing);
 
-    // The pushes are a tight loop, well inside the 1/30 s this engine is
-    // configured for; only the decoder's own start-up latency is allowed to cost
-    // an access unit.
-    assert!(
-        frames.len() + 2 >= head.units.len(),
-        "{} access units yielded {} observation(s)",
-        head.units.len(),
+    // One admitted every 200 ms over a feed of `units - 1` spacings, less the
+    // decoder's start-up latency, which costs whole intervals at the head.
+    let span = spacing * (clip.units.len() - 1) as u32;
+    let expected = span.as_millis() / 200 + 1;
+    let keyframes = clip.units.iter().filter(|(au, _)| is_keyframe(au)).count();
+    println!(
+        "{} access units, {keyframes} keyframe(s) -> {} model pass(es), {expected} asked for",
+        clip.units.len(),
         frames.len()
     );
-    assert!(frames.len() <= head.units.len(), "one pass per access unit");
+
+    assert!(
+        frames.len() as u128 + 3 >= expected && frames.len() as u128 <= expected,
+        "{} model pass(es) against the {expected} that 5 fps over {span:?} asks for",
+        frames.len()
+    );
+    assert!(
+        frames.len() > 2 * keyframes,
+        "the achieved rate is the clip's keyframe rate, which is the defect this pins"
+    );
     assert!(frames.iter().all(|frame| frame.inferred));
+}
+
+/// The property the rate's move past the decoder rests on: an access unit that is
+/// not keyframe-headed is a frame like any other, because its predecessors were fed.
+#[test]
+fn a_mid_gop_access_unit_decodes_and_infers() {
+    let Some(artifacts) = artifacts() else {
+        return;
+    };
+    let engine = engine_at(&artifacts, 5);
+    let clip = read_clip(&artifacts.clip);
+
+    // A spacing past the 200 ms interval, so the gate admits every unit and what
+    // is left is the decoder's own answer.
+    let mut stream = open(&engine, "front");
+    let frames = feed_at(&mut stream, &clip, Duration::from_millis(250));
+    let keyframes = clip.units.iter().filter(|(au, _)| is_keyframe(au)).count();
+
+    assert!(
+        keyframes < clip.units.len(),
+        "a clip of nothing but keyframes cannot test this"
+    );
+    assert!(
+        frames.len() > keyframes,
+        "{} model pass(es) from {} access units, {keyframes} of them keyframes: the \
+         non-keyframe units decoded to nothing",
+        frames.len(),
+        clip.units.len()
+    );
+    assert!(frames.iter().all(|frame| frame.inferred));
+    assert!(frames.windows(2).all(|pair| pair[0].pts <= pair[1].pts));
 }
 
 /// The registry, against a real engine rather than against itself.
