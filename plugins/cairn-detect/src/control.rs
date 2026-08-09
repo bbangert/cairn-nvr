@@ -149,10 +149,8 @@ impl Streams {
             Control::Ignored => return,
         };
 
-        // The map moves first; the line is logged after the guard drops. This
-        // lock is taken once per frame by the inference thread, and nothing that
-        // is not the map itself belongs inside it. ([`crate::note!`] neither
-        // writes nor fails on this thread, so the ordering is belt and braces.)
+        // The map moves first, and the line is logged after the guard drops: this
+        // lock is taken once per frame by the inference thread.
         let announcement = {
             let mut epochs = self.lock();
             match epochs.get_mut(&camera_id) {
@@ -207,9 +205,8 @@ pub fn spawn_reader(streams: Arc<Streams>) -> Result<()> {
             .is_err();
             let cause = if panicked { "panicked" } else { "stdin closed" };
             note!("control: control channel gone ({cause}), exiting so Cairn respawns us");
-            // Before `_exit`, which writes nothing: `note!` queues its line for
-            // the log worker, so this thread has to wait for that one — bounded
-            // — or the reason this process ended dies with it.
+            // Before `_exit`, which writes nothing: `note!` only queued that line,
+            // so the reason this process ended would die with it.
             crate::log::drain();
             // `_exit`, not `process::exit`, because this fires on a thread while
             // the main thread may be anywhere — including inside onnxruntime's

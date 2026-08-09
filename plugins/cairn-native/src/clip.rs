@@ -1,13 +1,10 @@
-//! The one end-to-end path, on a recorded clip.
-//!
-//! A real H.264 file through the real crate — real model load, real decoder, every
-//! access unit handed to `push_au` the way Membrane's H.264 parser will hand them
-//! over. The only thing standing in for the pipeline is the file demuxer.
+//! The one end-to-end path: a real H.264 file, real model load, real decoder,
+//! every access unit handed to `push_au` the way Membrane's H.264 parser will hand
+//! them over. Only the demuxer stands in for the pipeline.
 //!
 //! It needs artifacts this repository does not carry (`*.onnx` is gitignored), and
-//! **a missing artifact fails the run** rather than skipping: a test that returns
-//! without running is indistinguishable in `cargo test`'s output from one that
-//! passed, which is how a harness rots away unnoticed.
+//! a missing one fails the run rather than skipping: a test that returns without
+//! running is indistinguishable in `cargo test`'s output from one that passed.
 //!
 //! ```text
 //! CAIRN_NATIVE_CLIP=data/events/…/clip.mp4 \
@@ -23,8 +20,8 @@
 //! CAIRN_NATIVE_SKIP_CLIP=1 cargo test
 //! ```
 //!
-//! Sampling is wall-clock (`--sample-fps`, as in the plugin), so a clip pushed as
-//! fast as it decodes yields a handful of samples rather than one per frame.
+//! Sampling is wall-clock, so a clip pushed as fast as it decodes yields a handful
+//! of samples rather than one per frame.
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -44,10 +41,9 @@ use crate::StreamRef;
 
 const WAIVER: &str = "CAIRN_NATIVE_SKIP_CLIP";
 
-/// An artifact path from the environment, or the repository default.
-///
-/// `None` means "not here". A named path that does not exist is a failure whatever
-/// the waiver says, because the caller said where to look.
+/// An artifact path from the environment, or the repository default. A *named*
+/// path that does not exist fails whatever the waiver says, because the caller
+/// said where to look.
 fn artifact(variable: &str, default: &str) -> Option<PathBuf> {
     match std::env::var(variable) {
         Ok(named) => {
@@ -72,10 +68,9 @@ struct Artifacts {
     clip: PathBuf,
 }
 
-/// What this harness runs against, or `None` if the run waived it.
-///
-/// Every test opens with `let Some(artifacts) = artifacts() else { return }`, so an
-/// early return has to be a *decision*: missing artifacts panic instead.
+/// What this harness runs against, or `None` if the run waived it. Every test
+/// opens with `let Some(artifacts) = artifacts() else { return }`, so an early
+/// return has to be a *decision*: missing artifacts panic instead.
 fn artifacts() -> Option<Artifacts> {
     let found = || {
         Some(Artifacts {
@@ -133,8 +128,8 @@ fn params() -> RawStreamParams {
     }
 }
 
-/// The clip as the pipeline will hand it over: whole access units with their own
-/// pts, read once so several streams can be fed the same bytes.
+/// Whole access units with their own pts, read once so several streams can be fed
+/// the same bytes.
 struct Clip {
     units: Vec<(Vec<u8>, i64)>,
     time_base: (i32, i32),
@@ -180,8 +175,8 @@ fn feed(stream: &mut Stream, clip: &Clip) -> Vec<FrameObservations> {
         .collect()
 }
 
-/// The same through the resource handle the NIF holds — the only thing that
-/// serializes two callers on one stream.
+/// The same through the resource handle, which is what serializes two callers on
+/// one stream.
 fn feed_shared(stream: &StreamRef, clip: &Clip) -> Result<Vec<FrameObservations>> {
     let mut frames = Vec::new();
     for (au, pts) in &clip.units {
@@ -275,8 +270,7 @@ fn one_camera_holds_one_stream_and_gets_it_back_when_it_closes() {
 }
 
 /// A decoder that panics while being built leaves no [`Stream`] for the unwind to
-/// drop, so the id has to come back on its own — otherwise one panicked open
-/// refuses that camera as a duplicate for the life of the engine.
+/// drop, so the id has to come back on its own.
 #[test]
 fn a_panic_while_the_decoder_opens_hands_the_camera_id_back() {
     let Some(artifacts) = artifacts() else {
@@ -366,12 +360,9 @@ fn a_stream_error_is_a_value_and_the_stream_survives_it() {
     );
 }
 
-/// The panic is armed inside the model pass and reached through `push_au`, so it
-/// unwinds through the stream lock *and* the model lock — the only shape the frame
-/// path can make, and one a model lock poisoned on its own cannot imitate. The
-/// stream it happened on is the whole question: its own lock is poisoned too, and
-/// answering `poisoned` from it would tell the host to reopen one camera against an
-/// engine that will never serve any.
+/// Armed inside the model pass and reached through `push_au`, so the unwind goes
+/// through the stream lock *and* the model lock — the only shape the frame path can
+/// make, and one a model lock poisoned on its own cannot imitate.
 #[test]
 fn a_panic_in_a_model_pass_is_model_poisoned_on_every_stream_including_its_own() {
     let Some(artifacts) = artifacts() else {
@@ -410,8 +401,8 @@ fn a_panic_in_a_model_pass_is_model_poisoned_on_every_stream_including_its_own()
     assert_eq!(refused.unwrap_err().reason(), "decode");
 }
 
-/// The other half: saying `model_poisoned` for a panic in one camera's own state
-/// would have the host stop trusting an engine that is fine.
+/// The other half: `model_poisoned` for a panic in one camera's own state would
+/// have the host stop trusting an engine that is fine.
 #[test]
 fn a_panic_in_a_streams_own_state_stays_that_streams_problem() {
     let Some(artifacts) = artifacts() else {
@@ -433,9 +424,8 @@ fn a_panic_in_a_streams_own_state_stays_that_streams_problem() {
     assert!(!feed_shared(&drive, &clip).unwrap().is_empty());
 }
 
-/// `poisoned` tells `Cairn.Native.Host` to drop the stream and reopen the camera,
-/// and a `close` that refused the poisoned lock would leave the id claimed until GC
-/// — so the reopen would be refused as a duplicate and the camera would stay dark.
+/// A `close` that refused the poisoned lock would leave the id claimed until GC, so
+/// the reopen `poisoned` asks for would be refused as a duplicate.
 #[test]
 fn a_poisoned_stream_closes_and_its_camera_can_be_opened_again() {
     let Some(artifacts) = artifacts() else {
@@ -468,8 +458,7 @@ fn a_poisoned_stream_closes_and_its_camera_can_be_opened_again() {
     assert!(!feed_shared(&reopened, &clip).unwrap().is_empty());
 }
 
-/// The other way a stream ends: the BEAM collected the handle. A poisoned mutex
-/// still drops what it holds, so `Stream`'s `Drop` runs on this path too.
+/// The other way a stream ends: the BEAM collected the handle.
 #[test]
 fn a_collected_poisoned_stream_hands_its_camera_id_back() {
     let Some(artifacts) = artifacts() else {
@@ -502,8 +491,7 @@ fn a_collected_poisoned_stream_hands_its_camera_id_back() {
     drop(reopened);
 }
 
-/// Two Elixir processes, two streams, one engine: they contend only on the
-/// model pass, so both must finish.
+/// Two streams on one engine contend only on the model pass, so both must finish.
 #[test]
 fn two_streams_make_progress_at_once() {
     let Some(artifacts) = artifacts() else {
@@ -524,8 +512,8 @@ fn two_streams_make_progress_at_once() {
     assert!(!b.expect("the second stream failed").is_empty());
 }
 
-/// Two Elixir processes on *one* stream: the resource's mutex serializes them,
-/// so the decoder is never entered twice and both callers are answered.
+/// Two callers on *one* stream: the resource's mutex serializes them, so the
+/// decoder is never entered twice.
 #[test]
 fn two_pushes_to_one_stream_serialize() {
     let Some(artifacts) = artifacts() else {

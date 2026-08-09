@@ -494,9 +494,8 @@ fn pack_chw(plane: &[u8], stride: usize, fit: Fit, spec: InputSpec) -> Vec<f32> 
 
 /// The wall-clock gap between samples that `--sample-fps` asks for.
 ///
-/// Public because [`run`] is not the only loop that paces on it: `cairn-native`
-/// is fed access units one at a time and runs the gate itself, and a second
-/// spelling of this arithmetic is a second sample rate.
+/// Public because [`run`] is not the only loop that paces on it: a second spelling
+/// of this arithmetic is a second sample rate.
 pub fn sample_interval(sample_fps: u32) -> Duration {
     // Integer nanos, not a float reciprocal: exact for every legal rate,
     // and identical to the old `from_secs_f64(1.0 / 5.0)` at the default.
@@ -595,11 +594,8 @@ fn note_error(count: &mut u64, what: &str, e: &impl fmt::Display) {
     }
 }
 
-/// A decoded frame's presentation time on the contract's 90 kHz clock.
-///
-/// Public for the same reason [`sample_interval`] is: `cairn-native` decodes
-/// without this module's read loop, and a frame's `pts` is what the host places
-/// it on its timeline with — one derivation, or the two hosts date the same
+/// A decoded frame's presentation time on the contract's 90 kHz clock. Public for
+/// the same reason [`sample_interval`] is: two derivations would date the same
 /// frame differently.
 pub fn pts_90k(frame: &AVFrame, time_base: AVRational) -> i64 {
     let pts = if frame.pts != ffi::AV_NOPTS_VALUE {

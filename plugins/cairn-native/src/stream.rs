@@ -1,15 +1,11 @@
 //! One camera's stream: compressed access units in, observation terms out.
 //!
-//! `multiplex.rs`'s member re-hosted, keeping everything per camera and stateful
-//! — the decoder and its motion background, the [`Gate`], the score floors, and
-//! what a gated frame re-reports — and dropping the transport, because the caller
-//! is an Elixir process handing over one access unit at a time.
+//! `multiplex.rs`'s member without the transport — everything per camera and
+//! stateful, and nothing that reads a socket.
 //!
-//! **Nothing on this path may panic**, so every per-frame failure is a value: the
-//! tolerated ones (a decode error mid-GOP, a frame that will not convert) are
-//! counted and skipped exactly as `cairn_detect::decode::run` skips them, and the
-//! fatal ones are returned. All of those cost this stream alone except
-//! [`NativeError::ModelPoisoned`], which is the shared session's.
+//! The tolerated per-frame failures (a decode error mid-GOP, a frame that will
+//! not convert) are counted and skipped exactly as `cairn_detect::decode::run`
+//! skips them; the rest are returned.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -40,13 +36,13 @@ pub struct Stream {
     decoder: Box<dyn Decoder>,
     gate: Gate,
     floors: ScoreFloors,
-    /// `None` for a camera whose motion gate is off, which is the default and
-    /// makes [`Gate::decide`] infer on every sample.
+    /// `None` for a camera whose motion gate is off, which makes [`Gate::decide`]
+    /// infer on every sample.
     motion: Option<MotionConfig>,
-    /// Fixed for the life of the stream: an epoch identifies one stream session,
-    /// and here a new session is a new [`Stream`]. That is what makes the gate's
-    /// epoch-bypass window right without an epoch setter — a fresh `Gate` opens
-    /// the window on its own first sample.
+    /// Fixed for the life of the stream, because here a new stream session is a
+    /// new [`Stream`]. That is what makes the gate's epoch-bypass window right
+    /// without an epoch setter — a fresh `Gate` opens the window on its own first
+    /// sample.
     epoch: Option<String>,
     interval: Duration,
     last_sample: Option<Instant>,
@@ -76,22 +72,17 @@ impl Stream {
             tensor_errors: 0,
             unbounded_pts: 0,
         };
-        // Not one line earlier: between the two there is nothing but moves.
         claim.handed_to(&stream);
         Ok(stream)
     }
 
-    /// Feed one access unit and take whatever frames it completed.
-    ///
-    /// Usually one, but an access unit can complete none (the decoder wants more
-    /// input, or the sample gate is not due) and, with reordering, more than one —
-    /// so the caller must not assume a frame per push.
+    /// Feed one access unit and take whatever frames it completed: none (the
+    /// decoder wants more input, or the sample gate is not due) or, with
+    /// reordering, more than one — never assume a frame per push.
     ///
     /// `now` is taken once for the whole call rather than per decoded frame as
-    /// `decode::run` does. The two agree because an access unit is one picture;
-    /// the difference shows only in a decoder emitting a burst, where sharing an
-    /// instant yields one sample instead of one per frame — which is what the rate
-    /// limit is for anyway.
+    /// `decode::run` does, which differs only for a decoder emitting a burst:
+    /// sharing an instant yields one sample instead of one per frame.
     pub fn push_au(
         &mut self,
         au: &[u8],
@@ -203,8 +194,6 @@ impl Stream {
 }
 
 impl Drop for Stream {
-    /// Hands the camera id back whether the host called `close_stream` or the
-    /// BEAM simply collected the handle.
     fn drop(&mut self) {
         self.engine.release(&self.camera_id);
     }
@@ -212,17 +201,12 @@ impl Drop for Stream {
 
 /// A camera id claimed in the engine's registry with no [`Stream`] yet holding it.
 ///
-/// The claim is taken before the decoder, because that is what makes a duplicate
-/// open cheap to refuse — so there is a window where the id is spoken for and
-/// [`Stream`]'s `Drop`, which normally hands it back, does not exist yet. A failed
-/// open has to release it or that camera is refused as a duplicate for the life of
-/// the engine, and *returning* an error is not the only way out of that window:
-/// in-VM, decoder setup can panic, and the NIF's `catch_unwind` then answers
-/// `panicked` with nothing constructed to drop. This releases on either.
-///
-/// It owns its copies of both rather than borrowing the caller's, so the
-/// disarming can come after the `Stream` has consumed them — which is what makes
-/// the guarded window cover the whole construction and not merely most of it.
+/// The claim is taken before the decoder — a duplicate open is then cheap to
+/// refuse — so there is a window where the id is spoken for and [`Stream`]'s
+/// `Drop` does not exist yet. Anything leaving that window without releasing
+/// refuses this camera as a duplicate for the life of the engine, and returning an
+/// error is not the only way out of it: decoder setup can panic, and `guarded`
+/// then answers `panicked` with nothing constructed to drop.
 struct Claim {
     engine: Arc<Engine>,
     camera_id: String,
@@ -230,9 +214,9 @@ struct Claim {
 }
 
 impl Claim {
-    /// Claim `camera_id`, or refuse. Armed after the claim and never before: a
-    /// refusal means *another* stream holds that id, and releasing on the way
-    /// out would hand a live camera's claim back.
+    /// Armed after the claim and never before: a refusal means *another* stream
+    /// holds that id, and releasing on the way out would hand a live camera's
+    /// claim back.
     fn take(engine: &Arc<Engine>, camera_id: &str) -> Result<Self> {
         let mut claim = Self {
             engine: Arc::clone(engine),
@@ -244,10 +228,9 @@ impl Claim {
         Ok(claim)
     }
 
-    /// The claim is now `stream`'s, whose `Drop` releases it.
-    ///
-    /// Takes the stream it was handed to so that disarming is impossible to
-    /// write before there is something to hand it to.
+    /// The claim is now `stream`'s, whose `Drop` releases it. Takes the `&Stream`
+    /// so that an early disarm is unwriteable: there has to be something to hand
+    /// it to.
     fn handed_to(mut self, _stream: &Stream) {
         self.armed = false;
     }
@@ -263,13 +246,11 @@ impl Drop for Claim {
 
 /// What this stream's next gated frame will re-report.
 ///
-/// The rule for turning a model pass into seeds is
-/// [`cairn_detect::emit::seeds_from`], shared with the ndjson path so the two
-/// cannot drift apart. All this adds is the feed, which is the one place the two
-/// deliberately differ: the ndjson path remembers only the prefix of the list that
-/// reached the wire, and there is no equivalent here because there is no line to
-/// shed from — `infer`'s own cap (`MAX_DETS`, 32) is under the contract's per-line
-/// object cap ([`cairn_detect::emit::MAX_OBJECTS`], 64).
+/// The rule is [`cairn_detect::emit::seeds_from`], shared with the ndjson path.
+/// What that path adds and this one does not is remembering only the prefix of
+/// the list that reached the wire: there is no line to shed from here, and
+/// `infer`'s own cap (`MAX_DETS`, 32) is under the contract's per-line object cap
+/// ([`cairn_detect::emit::MAX_OBJECTS`], 64) anyway.
 #[derive(Default)]
 struct Seeds(Vec<Det>);
 
@@ -281,8 +262,6 @@ impl Seeds {
         self.0 = seeds_from(dets);
     }
 
-    /// The seeds for one gated frame, cloned because the memory outlives any
-    /// number of them.
     fn replay(&self) -> Vec<Det> {
         self.0.clone()
     }
@@ -311,9 +290,9 @@ fn should_log(count: u64) -> bool {
 ///
 /// There is no container here to take stream parameters from — the caller is
 /// Membrane's H.264 parser, which delivers whole access units with SPS and PPS in
-/// band. So the codec parameters carry the codec and nothing else, and the decoder
-/// learns its geometry from the first SPS it sees; both decode paths tolerate a
-/// missing declared size already.
+/// band — so these parameters carry the codec and nothing else and the decoder
+/// learns its geometry from the first SPS. Both decode paths already tolerate a
+/// missing declared size.
 fn open_decoder(engine: &Engine, motion: Option<MotionConfig>) -> Result<Box<dyn Decoder>> {
     #[cfg(test)]
     engine.panic_if_armed_for_open();
@@ -335,11 +314,9 @@ fn open_decoder(engine: &Engine, motion: Option<MotionConfig>) -> Result<Box<dyn
     .map_err(|e| NativeError::OpenStream(chain(&e)))
 }
 
-/// One access unit as a packet the decoder can take.
-///
-/// The bytes are copied because libavcodec's buffer needs its own padding and its
-/// own lifetime; the binary this came from belongs to the calling Elixir process
-/// and may be gone the moment the NIF returns.
+/// One access unit as a packet the decoder can take. The bytes are copied because
+/// libavcodec's buffer needs its own padding and its own lifetime; the binary they
+/// came from belongs to the calling Elixir process.
 fn packet_from(au: &[u8], pts: i64) -> Result<AVPacket> {
     if au.is_empty() {
         return Err(NativeError::Decode("empty access unit".to_string()));
@@ -380,9 +357,8 @@ fn rational((num, den): (i32, i32)) -> Result<AVRational> {
 }
 
 /// Milliseconds since the Unix epoch. A clock before the epoch (an unset RTC on a
-/// cold-booted SBC) reads as the epoch rather than failing: a wrong timestamp is
-/// visible in the data where a dropped frame is not. `emit::rfc3339_utc` does the
-/// same.
+/// cold-booted SBC) reads as the epoch rather than failing, as `emit::rfc3339_utc`
+/// does: a wrong timestamp is visible in the data where a dropped frame is not.
 fn unix_ms(at: SystemTime) -> i64 {
     i64::try_from(
         at.duration_since(UNIX_EPOCH)
@@ -438,8 +414,8 @@ mod tests {
         assert_eq!(unix_ms(UNIX_EPOCH + Duration::from_millis(1_500)), 1_500);
     }
 
-    /// [`Stream`] itself needs a model and a decoder to build, so the seed memory
-    /// is driven directly — it is the whole of what a `Decision::Skip` consults.
+    /// [`Stream`] needs a model and a decoder to build, so the seed memory is
+    /// driven directly.
     mod seeds {
         use super::*;
         use cairn_detect::control::{Control, Streams};
@@ -458,8 +434,8 @@ mod tests {
             }
         }
 
-        /// A detection `--track-floor-json` admitted: on the wire at its real score,
-        /// below its label's `min_score`, and not a sighting to repeat.
+        /// A detection `--track-floor-json` admitted below its label's
+        /// `min_score`, and so not a sighting to repeat.
         fn sub_floor(label: &str, score: f64) -> Det {
             Det {
                 evidence: false,
@@ -467,7 +443,7 @@ mod tests {
             }
         }
 
-        /// One model pass as `push_au` hands it over, feature and band both.
+        /// One model pass, feature and band both.
         fn pass() -> Vec<Det> {
             let mut with_feature = det("person", 0.87);
             with_feature.embedding = Some("QUJD".to_string());
@@ -493,8 +469,7 @@ mod tests {
                 replayed.iter().all(|det| det.embedding.is_none()),
                 "a seed re-reports a position, not an appearance"
             );
-            // replaying is not consuming: the gate skips many frames per pass and
-            // each one owes the host the same boxes
+            // replaying is not consuming: the gate skips many frames per pass
             assert_eq!(seeds.replay(), replayed);
         }
 
@@ -517,9 +492,8 @@ mod tests {
 
         #[test]
         fn the_two_paths_seed_the_same_boxes_from_the_same_detections() {
-            // The ndjson path is driven through a real publisher — a started
-            // stream, one inferred line, then a seeded one — and what it puts on
-            // the wire has to be what this path holds in hand.
+            // What the ndjson path puts on the wire has to be what this path
+            // holds in hand.
             let found = pass();
             let mut seeds = Seeds::default();
             seeds.remember(&found);

@@ -1,9 +1,8 @@
 //! The host's config, decoded from terms and resolved into what the stages take.
 //!
-//! Two layers on purpose: the `Raw*` structs are the term shape and nothing else,
-//! and resolving them is where every rule lives — plain Rust with no `Env` in it,
-//! which is the only way any of it is testable, since a `rustler::atoms!` table
-//! (and so any term at all) is built by calling into the BEAM.
+//! Two layers on purpose: the `Raw*` structs are the term shape, and resolving
+//! them is where every rule lives — plain Rust with no `Env` in it, which is what
+//! makes any of it testable.
 //!
 //! The host sends the same vocabulary the operator's flags use (D-P6), parsed by
 //! the same code that parses argv, so a profile cannot mean one thing to the plugin
@@ -24,13 +23,13 @@ use crate::error::{NativeError, Result};
 
 /// The `--sample-fps` range, restated from `main.rs`'s
 /// `value_parser!(u32).range(1..=30)` because clap owns it there and there is no
-/// argv here. Not decoration: `sample_interval` divides by this, so a zero that
-/// reached the stages would be a division by zero on the frame path.
+/// argv here. `sample_interval` divides by this, so a zero that reached the stages
+/// would be a division by zero on the frame path.
 const SAMPLE_FPS: std::ops::RangeInclusive<u32> = 1..=30;
 
 /// Per-VM model config: the term shape. Every key is required — `nil` is how the
-/// host spells an absent value, so a missing key is a host bug and should fail
-/// loudly at the decode rather than take a default here.
+/// host spells an absent value, so a missing key is a host bug and fails at the
+/// decode rather than taking a default here.
 #[derive(Debug, NifMap)]
 pub struct RawInitConfig {
     pub model: String,
@@ -54,7 +53,6 @@ pub struct RawQnnOptions {
     pub vtcm_mb: Option<u32>,
 }
 
-/// The same config, in the types the stages actually take.
 #[derive(Debug)]
 pub struct InitConfig {
     pub model: PathBuf,
@@ -74,9 +72,8 @@ impl RawInitConfig {
         let backend = enum_value::<BackendKind>("backend", &self.backend)?;
         let embedder_model = self.embedder_model.map(PathBuf::from);
         // The embedder's own open refuses qnn too, but only after the detector's
-        // — which on qnn is a multi-second HTP graph compile. The plugin refuses
-        // the combination up front too (`main.rs`'s `run`), so the two hosts
-        // answer the same way to the same profile.
+        // multi-second HTP graph compile. `main.rs`'s `run` refuses it up front as
+        // well, so the two hosts answer the same profile the same way.
         if embedder_model.is_some() && backend == BackendKind::Qnn {
             return Err(NativeError::Config(
                 "the embedder does not run on qnn yet (no QDQ embedder artifact) \
@@ -124,29 +121,25 @@ impl RawInitConfig {
     }
 }
 
-/// One stream's scene config: the term shape.
-///
-/// Everything here is per camera and operator-owned (D-P6) — never model config,
-/// which is [`RawInitConfig`] and is loaded once per VM.
+/// One stream's scene config: the term shape. Everything here is per camera and
+/// operator-owned (D-P6), never model config ([`RawInitConfig`]).
 #[derive(Debug, NifMap)]
 pub struct RawStreamParams {
-    /// Label -> minimum score, with an optional `"default"` key; the
-    /// `--min-score-json` shape, already decoded.
+    /// The `--min-score-json` shape already decoded: label -> minimum score, with
+    /// an optional `"default"` key.
     pub min_score: HashMap<String, f64>,
     /// `--motion-json` verbatim, or `nil` for a gate that is off.
     pub motion_json: Option<String>,
     /// `--track-floor-json` verbatim, or `nil` for the feature off.
     pub track_floor_json: Option<String>,
     /// The stream epoch, or `nil` before the host has announced one. Fixed for the
-    /// life of the stream: a new session is a new `open_stream` — see `Stream`'s
-    /// `epoch` field for what that buys the gate.
+    /// life of the stream — see `Stream`'s `epoch` field.
     pub stream_epoch: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct StreamParams {
     pub floors: ScoreFloors,
-    /// `None` for a camera whose motion gate is off, which is the default.
     pub motion: Option<MotionConfig>,
     pub epoch: Option<String>,
 }
@@ -157,8 +150,8 @@ impl RawStreamParams {
             TrackFloorOverrides::parse(self.track_floor_json.as_deref().unwrap_or("{}"))
                 .map_err(|error| NativeError::Config(crate::error::chain(&error)))?;
         // One camera per stream, so there is nothing to override the knobs with:
-        // the same shape `run_single` resolves, where the "global" and "per
-        // camera" halves are the one set the caller sent.
+        // the shape `run_single` resolves, where the "global" and "per camera"
+        // halves are the one set the caller sent.
         let floors = ScoreFloors::from_map(self.min_score)
             .with_track_floor(TrackFloorOverrides::resolve(
                 &track_floor,
@@ -176,7 +169,6 @@ impl RawStreamParams {
     }
 }
 
-/// One of the plugin's clap enums, by the name the operator's flag takes.
 fn enum_value<T: ValueEnum>(field: &str, value: &str) -> Result<T> {
     T::from_str(value, true).map_err(|message| NativeError::Config(format!("{field}: {message}")))
 }
@@ -270,7 +262,6 @@ mod tests {
         }
     }
 
-    /// `sample_interval` divides by this, so the range is not cosmetic.
     #[test]
     fn sample_fps_is_held_to_the_flags_range() {
         for rate in [0, 31, 10_000] {
@@ -340,8 +331,8 @@ mod tests {
 
     #[test]
     fn a_knob_no_run_could_honour_is_refused_as_config() {
-        // The three the stages themselves reject, each arriving as a config error
-        // rather than as a stream that quietly runs on defaults.
+        // Each arrives as a config error rather than as a stream that quietly
+        // runs on defaults.
         for raw in [
             RawStreamParams {
                 motion_json: Some(r#"{"alpha":0}"#.into()),

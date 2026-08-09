@@ -2,27 +2,22 @@ defmodule Cairn.Native.Canary do
   @moduledoc """
   Probe-load a model in a throwaway OS process, before the in-VM NIF opens it.
 
-  Model load is the known NPU crash/wedge vector (D-M3's risk row; spike 0.5
-  reproduced nothing in 83k steady-state inferences precisely because that vector
-  lives in loading, not inference). In-VM a crash there is the whole node.
-  `cairn-detect` links the same library the NIF does and opens the model through
-  the same `Detector::open`, so running the binary *is* the same load.
+  Model load is the known NPU crash/wedge vector (D-M3's risk row), and in-VM a
+  crash there is the whole node. `cairn-detect` links the same library the NIF
+  does and opens the model through the same `Detector::open`, so running the
+  binary is the same load.
 
-  There is no load-and-exit mode in the binary, so the probe is **group** mode
-  (`--cameras-json` with one synthetic member): `run_multiplexed` writes a
-  `plugin.status` `ready` line on stdout the moment the detector and the embedder
-  are open, *before* it touches a socket, and a member that never receives a
-  packet is normal there rather than fatal. Single-camera mode emits its `ready`
-  only after the RTP stream opens, which never happens here, so it would hang.
-  The member's `udp_port` is required by the argument's own schema and is
-  otherwise meaningless: nothing binds it until after the line this waits for, and
-  the process is killed the moment that line arrives — so it is 0 rather than a
-  port allocated out of `Cairn.UDPPorts`.
+  The binary has no load-and-exit mode, so the probe runs `group` mode
+  (`--cameras-json` with one synthetic member): `run_multiplexed` writes its
+  `ready` line the moment the detector and embedder are open, before it touches a
+  socket, and a member that never receives a packet is normal there. Single-camera
+  mode's `ready` line waits on the RTP stream opening, which never happens here,
+  so it would hang. `udp_port` is `0` because the schema requires the key and
+  nothing binds it.
 
-  A binary that is not there is a failure and not a skip: the rehearsal is what
-  makes an in-VM load survivable, so a packaging or `PATH` mistake must refuse the
-  load rather than quietly perform it unrehearsed. Loading without a probe stays
-  possible, but only as something an operator asked for (`enabled: false`).
+  A missing binary is a failure and not a skip: a packaging or `PATH` mistake must
+  refuse the load rather than quietly perform it unrehearsed. Loading without a
+  probe stays possible, but only when asked for (`enabled: false`).
   """
 
   alias Cairn.Native.Config
@@ -30,18 +25,16 @@ defmodule Cairn.Native.Canary do
   @member "__canary__"
   @max_line 65_536
   @timeout_ms 120_000
-  # How long a probe gets to honour a SIGTERM before it is killed outright. Only a
-  # probe that is ignoring the signal ever waits it out.
+  # How long a probe gets to honour a SIGTERM before it is killed outright.
   @kill_grace_ms 1_000
   # Enough of the tail (stdout and stderr interleaved) to explain a failure.
   @tail_lines 20
 
   @type result :: :ok | {:skipped, :disabled} | {:error, String.t()}
 
-  # `@behaviour` on this module too, so a stub that stops answering what
-  # `Cairn.Native.Host`'s `:canary_module` seam asks fails at compile time — a
-  # behaviour warning, which CI's `--warnings-as-errors` makes fatal — instead of
-  # in whatever test reaches for it next.
+  # `@behaviour` on this module too, so a stub that stops answering the host's
+  # `:canary_module` seam fails at compile time rather than in whatever test
+  # reaches for it next.
   @callback probe(Config.t(), keyword()) :: result()
   @behaviour __MODULE__
 
@@ -87,11 +80,9 @@ defmodule Cairn.Native.Canary do
       "of the whole node if it goes wrong"
   end
 
-  # The port belongs to a linked process that traps exits *before* it opens
-  # anything, so a caller killed outright — the host, mid-canary — reaches the
-  # probe as a signal something can still act on, rather than as a closed pipe and
-  # an OS process left holding the model and the NPU. A port the caller owned would
-  # have that hole until it managed to arrange cleanup.
+  # The port belongs to a linked process that traps exits before it opens anything,
+  # so a caller killed outright — the host, mid-canary — reaches the probe as a
+  # signal, not as a closed pipe and an OS process still holding the NPU.
   defp run(binary, config, opts) do
     member = Jason.encode!([%{id: @member, udp_port: 0}])
     argv = Config.to_argv(config) ++ ["--cameras-json", member]
@@ -140,9 +131,9 @@ defmodule Cairn.Native.Canary do
         collect(probe, monitor, ref)
 
       # Anything else is the caller being shut down. `probe/2` runs inline in the
-      # host GenServer, so that signal queues behind this receive and would
-      # otherwise wait out the whole timeout with a probe holding the NPU. It is put
-      # back rather than consumed — ending the caller is not this function's job.
+      # host GenServer, so that signal would otherwise wait out the whole timeout
+      # with a probe holding the NPU. Put back, not consumed: ending the caller is
+      # not this function's job.
       {:EXIT, _pid, _reason} = signal ->
         send(self(), signal)
         Process.exit(probe, :shutdown)
@@ -151,8 +142,8 @@ defmodule Cairn.Native.Canary do
     end
   end
 
-  # Bounded: the probe's teardown escalates on its own (`stop/1`), and a caller
-  # already shutting down must not be held here for longer than that takes.
+  # Bounded, because `stop/1` escalates on its own and a caller already shutting
+  # down must not be held here for longer than that takes.
   defp stopped(monitor) do
     receive do
       {:DOWN, ^monitor, :process, _pid, _reason} -> :ok
@@ -181,13 +172,12 @@ defmodule Cairn.Native.Canary do
       {^port, {:exit_status, status}} ->
         {:error, "the probe load exited with status #{status}: #{explain(tail)}"}
 
-      # This process owns the port and traps exits, so the port's own close arrives
-      # here as a signal too — not the caller going away.
+      # The port's own close, not the caller going away.
       {:EXIT, ^port, _reason} ->
         await(port, deadline, tail)
 
-      # The caller is gone (this process is linked to it) or is telling this to
-      # stop on its way out. Either way the probe does not outlive it.
+      # The caller is gone, or is telling this to stop on its way out. Either way
+      # the probe does not outlive it.
       {:EXIT, _pid, _reason} ->
         stop(port)
         {:error, "the probe load was cut short: its caller is exiting"}
@@ -209,11 +199,10 @@ defmodule Cairn.Native.Canary do
   defp explain([]), do: "it said nothing"
   defp explain(tail), do: tail |> Enum.reverse() |> Enum.join(" | ")
 
-  # `Port.close/1` closes the pipes and leaves the OS process running — the plugin
-  # only ends its stdin reader thread on EOF — so the pid is signalled first,
-  # exactly as `Cairn.FFmpegPort.kill_port/1` does. It escalates to KILL because a
-  # process stuck in a native model load does not reach a signal handler, and an
-  # escaped probe holds the model and the NPU against the next attempt.
+  # `Port.close/1` closes the pipes and leaves the OS process running, so the pid is
+  # signalled first, as `Cairn.FFmpegPort.kill_port/1` does. It escalates to KILL
+  # because a process stuck in a native model load never reaches a signal handler,
+  # and an escaped probe holds the NPU against the next attempt.
   defp stop(port) do
     case Port.info(port, :os_pid) do
       {:os_pid, os_pid} ->

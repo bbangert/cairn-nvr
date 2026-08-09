@@ -229,14 +229,11 @@ pub(super) fn candidates_from(
 /// A class-reading layout's `nc`, refusing a head that declares none.
 ///
 /// `nc == 0` is the export or the profile being wrong — a dynamic-shape export
-/// whose class dimension settled at zero, an int8 one that collapsed it, either
-/// of them loaded past the class-count check by `--allow-label-mismatch`. No
-/// anchor can be labelled, so the loops below would discard every one of them
-/// and the pass would still *complete*: zero detections for as long as the model
-/// runs, which the host's health check — which can only see that a pass returned
-/// — reads as a quiet scene. Refused here instead, in the fallible half and
-/// ahead of the loops, so an operator is told; the [`NonZeroUsize`] is what
-/// carries the answer into them.
+/// whose class dimension settled at zero, or an int8 one that collapsed it, loaded
+/// past the class-count check by `--allow-label-mismatch`. Nothing can be labelled,
+/// so the loops below would discard every anchor and the pass would still
+/// *complete*: zero detections for as long as the model runs, which the host's
+/// health check reads as a quiet scene. Refused here instead, in the fallible half.
 fn classes(layout: Layout, nc: usize) -> Result<NonZeroUsize> {
     NonZeroUsize::new(nc).ok_or_else(|| {
         anyhow!(
@@ -554,14 +551,12 @@ fn sigmoid(logit: f64) -> f64 {
 /// Argmax over `n` scores. `total_cmp` orders NaN, so a NaN wins — every
 /// caller rejects the result rather than letting one reach the output.
 ///
-/// [`NonZeroUsize`] rather than `usize` so there is no empty range to answer
-/// for: a zero class count is refused once, in [`classes`], instead of arriving
-/// here as either a panic under the shared model lock or a `None` each caller
-/// would turn into "skip this anchor" — which is every anchor of every frame,
-/// silently.
+/// [`NonZeroUsize`] rather than `usize` so there is no empty range to answer for: a
+/// zero class count is refused once, in [`classes`], rather than arriving here as a
+/// panic under the shared model lock.
 ///
-/// Written as a fold rather than `max_by` only to be total without an `expect`;
-/// `>=` keeps that iterator's own rule that a tie takes the *later* class.
+/// A fold rather than `max_by` only to be total without an `expect`; `>=` keeps
+/// that iterator's rule that a tie takes the *later* class.
 fn argmax(n: NonZeroUsize, score: impl Fn(usize) -> f64) -> (usize, f64) {
     (1..n.get()).fold((0, score(0)), |best, c| {
         let value = score(c);
@@ -3126,11 +3121,6 @@ mod tests {
         assert!(dets.is_empty(), "{dets:?}");
     }
 
-    /// A class dimension of zero is the export being broken, and it has to be
-    /// said out loud: nothing can be labelled, so every anchor of every frame
-    /// is discarded and the pass still *completes*. The host infers health from
-    /// passes completing, so swallowing this makes a dead model
-    /// indistinguishable from a quiet scene for as long as it runs.
     #[test]
     fn a_layout_that_declares_no_classes_is_refused_rather_than_decoded_as_empty() {
         let refuse = |output: OutputSpec, raw: &Outputs<Raw>, size: InputSize| -> String {
@@ -3145,8 +3135,8 @@ mod tests {
             .expect_err("a head with no classes decoded");
             format!("{err:#}")
         };
-        // Each shape is one its layout would otherwise index happily: the box
-        // channels or columns are all there, and only the class table is empty.
+        // Each shape is one its layout would otherwise index happily: only the
+        // class table is empty.
         let cases = [
             {
                 let anchors = 4;
@@ -3169,8 +3159,8 @@ mod tests {
         ];
         for message in cases {
             assert!(message.contains("no classes"), "{message}");
-            // and names the layout, which is what says whether the profile or
-            // the export is the thing to look at
+            // and names the layout, which says whether the profile or the export is
+            // the thing to look at
             assert!(
                 ["raw-classes", "grid-objectness", "detr-queries"]
                     .iter()

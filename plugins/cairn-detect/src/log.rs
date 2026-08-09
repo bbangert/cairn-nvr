@@ -1,29 +1,22 @@
 //! Diagnostics that can neither take the host down nor hold it up.
 //!
 //! In production stderr is a pipe or a redirect — `run_erl`, a journal socket,
-//! `> log 2>&1` — and writing to one from the frame path goes wrong two ways.
-//! The reader can be **gone** (a log rotation, a detached console): the BEAM
-//! ignores `SIGPIPE`, so the write returns `EPIPE` and `eprintln!` *panics*. Or
-//! it can be **alive and not draining** (a wedged journal, a log driver that
-//! stopped reading): the pipe fills and the write *blocks*, for as long as the
-//! reader takes.
-//!
-//! In the plugin either costs one child process. In `cairn-native` the per-frame
-//! stages run under the shared model lock, so the panic poisons a session
-//! nothing recovers and the block stalls detection on **every camera** — which
-//! the host's health check, inferring from latency, would report as a wedged
+//! `> log 2>&1` — and writing to one from the frame path goes wrong two ways: a
+//! reader that is gone makes `eprintln!` panic on `EPIPE`, and one that is alive
+//! and not draining fills the pipe and blocks the write. In `cairn-native` the
+//! per-frame stages run under the shared model lock, so the first poisons a
+//! session nothing recovers and the second stalls detection on every camera —
+//! which the host's health check, inferring from latency, reads as a wedged
 //! accelerator.
 //!
 //! So [`crate::note!`] writes nothing on the calling thread: it formats the line,
-//! hands it to a bounded queue and returns. One worker thread does the writing,
-//! where blocking is harmless and a failed write is discarded. A full queue
-//! **drops** the line — never blocks, never grows — and the worker reports the
-//! count the next time it writes, so the loss is visible rather than silent.
+//! hands it to a bounded queue and returns, and one worker does the writing. A
+//! full queue drops the line rather than blocking or growing, and the worker
+//! reports the count with the next line it writes.
 //!
-//! What that costs: a line is no longer ordered against a direct `eprintln!` or
-//! against libav's own writes, and what is still queued when the process exits
-//! is lost unless something calls [`drain`] first. `main` and the control
-//! thread do. Nothing joins the worker; the VM or the process exiting takes it.
+//! What that costs: a line is no longer ordered against libav's own writes, and
+//! whatever is still queued at an exit is lost unless something calls [`drain`]
+//! first — `main` and the control thread do.
 
 use std::fmt::Arguments;
 use std::io::Write;
@@ -32,11 +25,8 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Lines the queue holds before it starts dropping them.
-///
-/// Sized to absorb a burst — every camera reporting a decode error on the same
-/// frame — at a few tens of KB. The steady state is far under it: the per-frame
-/// sites all rate-limit themselves.
+/// Lines the queue holds before it starts dropping them: enough to absorb a burst
+/// — every camera reporting a decode error on the same frame — at a few tens of KB.
 const BOUND: usize = 256;
 
 /// How long [`drain`] waits at an exit: enough for a healthy stderr to take the
@@ -53,10 +43,8 @@ struct Sink {
 }
 
 impl Sink {
-    /// Start the worker, or `None` if the thread would not spawn.
-    ///
-    /// Generic over the writer so a test can stall it: stderr's own reader is
-    /// what cannot be stalled from inside this process.
+    /// Generic over the writer so a test can stall it: stderr's own reader cannot
+    /// be stalled from inside this process.
     fn start<W: Write + Send + 'static>(bound: usize, mut writer: W) -> Option<Self> {
         let (lines, queued) = sync_channel::<String>(bound);
         let pending = Arc::new(AtomicUsize::new(0));
@@ -66,9 +54,8 @@ impl Sink {
             .name("cairn-log".into())
             .spawn(move || {
                 for line in queued {
-                    // Ahead of the line rather than on a timer: the sink is the
-                    // only channel there is to report on, so the report goes
-                    // wherever the next line gets to.
+                    // The sink is the only channel there is to report on, so the
+                    // report rides in front of the next line that gets through.
                     let lost = worker_dropped.swap(0, Ordering::SeqCst);
                     if lost > 0 {
                         write_line(&mut writer, format!("log: dropped {lost} diagnostic lines"));
@@ -88,8 +75,7 @@ impl Sink {
     /// Queue one line, or count it as dropped. Never blocks.
     fn line(&self, args: Arguments<'_>) {
         self.pending.fetch_add(1, Ordering::SeqCst);
-        // `try_send`: a wedged writer costs diagnostics, not the frame path.
-        // A disconnected queue counts too — the worker is gone either way.
+        // A disconnected queue counts as dropped too: the worker is gone either way.
         if self.lines.try_send(std::fmt::format(args)).is_err() {
             self.pending.fetch_sub(1, Ordering::SeqCst);
             self.dropped.fetch_add(1, Ordering::SeqCst);
@@ -111,18 +97,15 @@ impl Sink {
 }
 
 /// One line and its newline in a single `write_all`, discarding a failed write.
-///
-/// One call, not two: in the plugin libav writes this stderr directly, and it
-/// could otherwise land between a line and its newline.
+/// One call and not two because libav writes this stderr directly in the plugin,
+/// and could otherwise land between a line and its newline.
 fn write_line(writer: &mut impl Write, mut line: String) {
     line.push('\n');
     let _ = writer.write_all(line.as_bytes());
 }
 
-/// The process's sink, started on the first line written.
-///
-/// `None` for the rest of the run if the spawn failed: a box that cannot start
-/// one thread will not start the next one either.
+/// The process's sink, started on the first line written and `None` for the rest of
+/// the run if that spawn failed.
 fn sink() -> Option<&'static Sink> {
     static SINK: OnceLock<Option<Sink>> = OnceLock::new();
     SINK.get_or_init(|| Sink::start(BOUND, std::io::stderr()))
@@ -133,19 +116,15 @@ fn sink() -> Option<&'static Sink> {
 pub fn line(args: Arguments<'_>) {
     match sink() {
         Some(sink) => sink.line(args),
-        // Inline, blocking risk and all: it is the startup path that logs first,
-        // and a process that says nothing at all is harder to diagnose than one
-        // that stalls behind a reader nobody is stalling yet.
+        // Inline, blocking risk and all: a process that says nothing at all is
+        // harder to diagnose than one that stalls behind a reader.
         None => write_line(&mut std::io::stderr(), std::fmt::format(args)),
     }
 }
 
-/// Wait, bounded, for the queued lines to reach stderr. Call before exiting.
-///
-/// [`line()`] returns before its line is written, so an exit that does not come
-/// through here loses whatever the process last said — the `fatal:` line, the
-/// control-channel line. Bounded so that a stalled reader costs that tail
-/// instead of turning an exit into a hang.
+/// Wait, bounded, for the queued lines to reach stderr. Call before exiting: an
+/// exit that does not come through here loses whatever the process last said — the
+/// `fatal:` line, the control-channel line.
 pub fn drain() {
     if let Some(sink) = sink() {
         sink.drain(DRAIN_TIMEOUT);
@@ -176,9 +155,8 @@ mod tests {
         written: Written,
     }
 
-    /// A writer that writes nothing until it is given a permit, and forever if
-    /// it never is: the reader that is alive and not draining. Dropping the
-    /// permit sender releases it.
+    /// The reader that is alive and not draining: writes nothing until it is given
+    /// a permit, and forever if it never is. Dropping the sender releases it.
     struct Gated {
         permits: Receiver<()>,
         written: Written,
@@ -230,9 +208,8 @@ mod tests {
         (sink, permits, written)
     }
 
-    /// The line is written on the worker's thread, not the caller's. That is the
-    /// whole point in `cairn-native`: the caller is holding the shared model
-    /// lock, so what it waits for, every camera waits for.
+    /// In `cairn-native` the caller is holding the shared model lock, so what it
+    /// waits for, every camera waits for.
     #[test]
     fn handing_over_a_line_does_not_wait_for_the_writer() {
         let cost = Duration::from_millis(300);
@@ -265,8 +242,7 @@ mod tests {
 
     /// A writer that has stopped is the case a queue alone does not survive:
     /// blocking on it stalls the frame path, and growing to fit is the node's
-    /// memory. So the lines are dropped — and *counted*, or a silent write is
-    /// only replaced by a silent loss.
+    /// memory. So the lines are dropped — and *counted*.
     #[test]
     fn a_full_queue_drops_lines_and_says_how_many() {
         const OFFERED: usize = 64;
@@ -283,8 +259,6 @@ mod tests {
             "offering {OFFERED} lines to a stalled writer took {offered_in:?}"
         );
 
-        // Let it go: the queue is far smaller than what was offered, so most of
-        // those lines were never held anywhere.
         drop(permits);
         assert!(
             sink.drain(Duration::from_secs(10)),
@@ -308,8 +282,7 @@ mod tests {
     }
 
     /// An exit behind a wedged writer gives up on the tail rather than hanging:
-    /// the plugin's exit paths call [`drain`] on the way out, and Cairn is
-    /// waiting to respawn the process.
+    /// Cairn is waiting to respawn the process.
     #[test]
     fn draining_a_wedged_writer_gives_up_instead_of_hanging() {
         let (sink, _permits, _written) = gated(1);
@@ -326,8 +299,7 @@ mod tests {
         assert!(waited < timeout * 20, "draining waited {waited:?}");
     }
 
-    /// The contract of the macro over the real sink: the arguments format and
-    /// nothing panics. Where they land is stderr's business.
+    /// The macro over the real sink: the arguments format and nothing panics.
     #[test]
     fn a_note_formats_its_arguments_and_returns() {
         line(format_args!("{} {:?} {:.2}", 1, "two", 3.0));

@@ -2,20 +2,19 @@ defmodule Mix.Tasks.Cairn.Parity do
   @shortdoc "Compares the external plugin and the in-VM NIF on the same clips"
 
   @moduledoc """
-  Phase 2's proof (membrane-port task 2.5): the same clips through
-  `cairn-detect` over RTP and through `cairn-native` in this VM must yield the
-  same detections.
+  The same clips through `cairn-detect` over RTP and through `cairn-native`
+  in this VM must yield the same detections.
 
       mix cairn.parity --model plugins/cairn-detect/yolox_nano.onnx \\
         --labels plugins/cairn-detect/coco.names \\
         data/events/reolink_main/*.mp4
 
-  rfdetr needs **both** `--input-size 384` and the 91-slot category space:
+  rfdetr needs both `--input-size 384` and the 91-slot category space:
 
       mix cairn.parity --model plugins/cairn-detect/rfdetr_nano.onnx \\
         --labels plugins/cairn-detect/coco91.names --input-size 384 <clip>
 
-  Needs `cargo build --release` in **both** `plugins/cairn-detect` and
+  Needs `cargo build --release` in both `plugins/cairn-detect` and
   `plugins/cairn-native`, with the latter's `libcairn_native.so` copied to
   `priv/native/`; plus ffmpeg, ffprobe and python3 on PATH. Exits nonzero on
   anything but parity — a divergence, or an alignment too ambiguous to have
@@ -25,13 +24,12 @@ defmodule Mix.Tasks.Cairn.Parity do
   `--min-score` (JSON, `{"default":0.3}`), `--tolerance` (1.0e-9 — read
   `Cairn.Native.Parity`'s moduledoc before widening it), `--max-frames`,
   `--out` (dump both sides as ndjson for `verify/compare_runs.py`),
-  `--work-dir`, `--udp-port`, `--model-profile`, `--embedder-model` (which is
-  what puts an `embedding` on every `person` and so compares the Re-ID feature
-  through base64 on one path and raw bytes on the other).
+  `--work-dir`, `--udp-port`, `--model-profile`, `--embedder-model` (which puts an
+  `embedding` on every `person`, and so compares the Re-ID feature through base64
+  on one path and raw bytes on the other).
 
   The app is configured but not started: its supervision tree owns real camera
-  ports, and this task wants the NIF and the protocol codec, neither of which
-  needs a running system.
+  ports, and all this task wants is the NIF and the protocol codec.
   """
 
   use Mix.Task
@@ -66,9 +64,8 @@ defmodule Mix.Tasks.Cairn.Parity do
 
     reports = Parity.run(clips, options(opts))
 
-    # Anything that is not parity, not just a divergence: a clip whose two runs
-    # could not be lined up (`:ambiguous_alignment`) compared nothing, and a gate
-    # that exits 0 on it is a gate that passed without looking.
+    # Anything that is not parity, not just a divergence: an `:ambiguous_alignment`
+    # compared nothing, and a gate that exits 0 on it passed without looking.
     case Enum.reject(reports, &(&1.verdict == :parity)) do
       [] -> Mix.shell().info("\nPARITY on #{length(reports)} clip(s)")
       failed -> Mix.raise("NOT PARITY — " <> Enum.map_join(failed, ", ", &failure/1))

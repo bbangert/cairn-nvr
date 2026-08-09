@@ -5,12 +5,11 @@ defmodule Cairn.Native.Config do
   config becomes for the canary.
 
   Every key has to be present in the term: rustler's `NifMap` decode fails on a
-  missing one rather than defaulting it, deliberately, so that an absent value is
-  spelled `nil` by the host and never guessed by the crate.
+  missing one rather than defaulting it, so an absent value is spelled `nil`.
 
-  Profile expansion still lives in `Cairn.Config`, which produces `@model_flags`
-  as argv for a plugin group's command; until that is rewritten to produce this
-  map, callers hand `normalize/1` the flags' own vocabulary (`backend: "qnn"`,
+  Profile expansion still lives in `Cairn.Config`, which produces argv for a
+  plugin group's command; until that produces this map instead, callers hand
+  `normalize/1` the flags' own vocabulary (`backend: "qnn"`,
   `input_size: "640x352"`) and nothing here knows what a profile is.
   """
 
@@ -41,11 +40,9 @@ defmodule Cairn.Native.Config do
     stream_epoch: nil
   }
 
-  # Rustler raises on a wrong term type *before* the guarded NIF body runs, so it
-  # reaches the caller as a `badarg` rather than as an error value — and
-  # `Cairn.Native.Host` calls `init/1` and `open_stream/3` from its GenServer, which
-  # makes one operator's mistyped config every camera on the node. Checked here so
-  # the answer is a refusal.
+  # Rustler raises on a wrong term type before the guarded NIF body runs, reaching
+  # the caller as `badarg` rather than an error value — and `Cairn.Native.Host`
+  # calls from its GenServer, so a mistyped config would crash every camera.
   @model_types [
     backend: :string,
     model_profile: {:optional, :string},
@@ -54,10 +51,8 @@ defmodule Cairn.Native.Config do
     allow_label_mismatch: :boolean,
     embedder_model: {:optional, :string},
     decoder: :string,
-    # The range is the crate's own (`SAMPLE_FPS` in config.rs), checked twice
-    # because `sample_interval` divides by it: a zero that reached the stages is a
-    # division by zero on the frame path, and the crate's own check is on the far
-    # side of the decode.
+    # The crate's own range (`SAMPLE_FPS` in config.rs), checked twice because its
+    # check is on the far side of a decode that raises.
     sample_fps: {:integer, 1..30}
   ]
 
@@ -81,9 +76,8 @@ defmodule Cairn.Native.Config do
   @doc """
   A model config in the shape `Cairn.Native.init/1` decodes.
 
-  Unknown keys are an error rather than an omission: a misspelled `--backend`
-  equivalent that silently kept the default would run every camera on the CPU and
-  report nothing wrong.
+  An unknown key is an error: a misspelled `--backend` that silently kept the
+  default would run every camera on the CPU and report nothing wrong.
   """
   @spec normalize(map() | keyword()) :: {:ok, t()} | {:error, String.t()}
   def normalize(config) when is_map(config) or is_list(config) do
@@ -115,10 +109,8 @@ defmodule Cairn.Native.Config do
     do: {:error, "params must be a map or keyword list, got #{inspect(other)}"}
 
   @doc """
-  The same model config as `cairn-detect` argv, for the canary's probe load.
-
-  Only the model half: the scene knobs are per stream, and nothing about them can
-  make a model load or fail to load.
+  The same model config as `cairn-detect` argv, for the canary's probe load. The
+  model half only: nothing about a scene knob can make a model load or fail to.
   """
   @spec to_argv(t()) :: [String.t()]
   def to_argv(config) do
@@ -183,14 +175,12 @@ defmodule Cairn.Native.Config do
   defp coerce_field({:optional, type}, value), do: coerce_field(type, value)
 
   # The crate parses these with the same clap value parsers the flags use, so an atom
-  # or a number spelling of a flag value (`backend: :qnn`, `input_size: 384`) is the
-  # same value. Nothing else is: a list or a map either raises in `to_string/1` or
-  # quietly becomes a string the operator never wrote.
+  # or number spelling (`backend: :qnn`, `input_size: 384`) is the same value.
+  # Nothing else is: a list or map would become a string nobody wrote.
   defp coerce_field(:string, value) when is_binary(value), do: {:ok, value}
 
-  # Not `Option<String>` on the crate's side, so `nil` is a decode error there — and
-  # `to_string(nil)` would hide that as the empty string, refused one layer further
-  # from the operator as a backend or decoder nobody asked for.
+  # Not `Option<String>` on the crate's side, so `nil` is a decode error there and
+  # `to_string(nil)` would hide it as the empty string.
   defp coerce_field(:string, nil), do: {:error, "must be a string, got nil"}
 
   defp coerce_field(:string, value) when is_atom(value) or is_number(value),
@@ -216,9 +206,9 @@ defmodule Cairn.Native.Config do
   defp coerce_field({:integer, first..last//_}, other),
     do: {:error, "must be an integer in #{first}..#{last}, got #{inspect(other)}"}
 
-  # `HashMap<String, f64>`. A label has to be a binary — rustler decodes a `String`
-  # from a binary term and from nothing else, so an atom key is a decode error — but
-  # either spelling of a number is fine, its `f64` falling back to integer terms.
+  # `HashMap<String, f64>`: rustler decodes a `String` from a binary term and
+  # nothing else, so an atom key is a decode error, while its `f64` takes either
+  # spelling of a number.
   defp coerce_field(:score_map, value) when is_map(value) do
     if Enum.all?(value, fn {label, floor} -> is_binary(label) and is_number(floor) end) do
       {:ok, value}

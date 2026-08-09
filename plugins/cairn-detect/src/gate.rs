@@ -16,19 +16,16 @@
 //! and the instants they were made at, and nothing else.
 //!
 //! In the two plugin modes the state here belongs to the *process*, not to the
-//! stream. Group mode
-//! re-opens a member's RTP stream in place (`multiplex::stream_loop`), which
-//! builds a fresh decoder and with it a fresh
+//! stream. Group mode re-opens a member's RTP stream in place
+//! (`multiplex::stream_loop`), which builds a fresh decoder and with it a fresh
 //! [`crate::motion::MotionDetector`] — a camera whose measurement has started
 //! over while its `Gate` has not. What covers the rebuilt detector's blind
 //! window is [`MotionVerdict::calibrating`]; see [`Gate::decide`]. Single mode
 //! has no such window: a stream failure there is fatal, and the process Cairn
-//! restarts has a fresh `Gate` too. `cairn-native` is the third case: the
-//! `Gate` belongs to the stream, so a reopen builds a fresh detector and a
-//! fresh `Gate` together and the mismatch cannot arise. That host also calls
-//! [`Gate::decide`] directly rather than [`sample_line`] — it has no publisher
-//! and no ndjson line to build — so the policy is shared and the emission is
-//! not.
+//! restarts has a fresh `Gate` too. In `cairn-native` the `Gate` belongs to the
+//! stream, so a reopen builds a fresh detector and a fresh `Gate` together and the
+//! mismatch cannot arise; that host also calls [`Gate::decide`] directly rather
+//! than [`sample_line`], so the policy is shared and the emission is not.
 
 use std::time::{Duration, Instant};
 
@@ -1130,11 +1127,9 @@ mod tests {
 
         #[test]
         fn a_skipped_sample_carries_exactly_the_shared_seed_rule() {
-            // The ndjson path's end of the rule, driven by a real gate skip
-            // rather than by asking the publisher directly: what a skipped
-            // sample puts on the wire is `emit::seeds_from` of the last real
-            // line, which is the same function `cairn-native`'s stream holds
-            // its own seeds by.
+            // Driven by a real gate skip rather than by asking the publisher: what
+            // a skipped sample puts on the wire is `emit::seeds_from` of the last
+            // real line.
             let (streams, mut publisher) = publisher(&["front"]);
             start(&streams, "front", EPOCH);
             let mut with_feature = det("person", 0.9);

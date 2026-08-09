@@ -1,26 +1,14 @@
-//! Every way this crate can fail, as a term the host can match on.
+//! Every way this crate can fail, as a term the host can match on: the host sees
+//! `{:error, {reason, message}}`, where the reason atoms are stable and are the
+//! dispatch key and the messages are for the operator.
 //!
-//! On the wire each variant is `{reason, message}`, and rustler wraps a failed
-//! NIF return in `{:error, _}`, so the host always sees
-//! `{:error, {atom, binary}}`. The reasons are stable and are the dispatch key;
-//! the messages are for the operator and are not.
-//!
-//! **Two blast radii, and the reason atom is the only thing that separates
-//! them.** `config`, `open_stream`, `decode`, `infer`, `closed` and `poisoned`
-//! cost the stream they were raised on, so the host's answer is to close it and
-//! open another. `model_load` and `model_poisoned` say the shared session is
-//! unusable, so every stream on that engine will answer the same way for as long
-//! as the engine lives: the host escalates — a fresh `init/1` behind its canary,
-//! or an operator alert — rather than restart-looping one camera against a model
-//! that cannot serve it.
-//!
-//! `panicked` says nothing about what the panicking call was holding, and the
-//! next call cannot read that off its own lock either, because `push_au` nests
-//! stream -> model and a panic in a pass poisons both. So the question is asked
-//! of the **model** lock (`StreamRef::poisoned_by`): poisoned there means
-//! `model_poisoned` on every stream *including the one the panic happened on*,
-//! which leaves `poisoned` to mean a panic in this camera's own state that never
-//! took the model lock at all.
+//! Two blast radii, separated by the reason alone. `config`, `open_stream`,
+//! `decode`, `infer`, `closed`, `poisoned` and `panicked` cost the stream they
+//! were raised on, so the host closes it and opens another. `model_load` and
+//! `model_poisoned` say the shared session is unusable for as long as the engine
+//! lives, so the host escalates — a fresh `init/1` behind its canary, or an
+//! operator alert — rather than restart-looping one camera against a model that
+//! cannot serve it.
 
 use rustler::types::atom::Atom;
 use rustler::{Encoder, Env, Term};
@@ -29,24 +17,20 @@ use rustler::{Encoder, Env, Term};
 pub enum NativeError {
     /// Config that would not resolve into what the stages take.
     Config(String),
-    /// The model, embedder or label set would not open. **Never an abort**:
-    /// model load is the known crash vector (D-M3's risk row), and returning it
-    /// is what lets `Cairn.Native.Host`'s canary refuse a model before it
-    /// reaches a running node.
+    /// The model, embedder or label set would not open. Never an abort: model
+    /// load is the known crash vector (D-M3's risk row), and returning it is what
+    /// lets `Cairn.Native.Host`'s canary refuse a model before it reaches a
+    /// running node.
     ModelLoad(String),
     /// A stream could not be opened: no decoder, or this camera already has one.
     OpenStream(String),
-    /// The decoder rejected an access unit outright. Ordinary per-packet decode
-    /// errors are *not* this — joining mid-GOP feeds the decoder frames whose
-    /// references never arrived, which it resyncs from.
+    /// The decoder rejected an access unit outright, which the tolerated
+    /// per-packet errors are not — see [`crate::stream`].
     Decode(String),
-    /// A model pass failed. Fatal to this stream and to nothing else — the
-    /// in-VM equivalent of the process exit the plugin turns this into.
-    ///
-    /// It *can* be a model-wide fault wearing a stream's clothes: a wedged
-    /// accelerator answers every stream this way. Telling that from one camera's
-    /// bad frame takes the failure ratio across streams, which only the host
-    /// sees, so escalating on it is `Cairn.Native.Host`'s and not this crate's.
+    /// A model pass failed. It *can* be a model-wide fault wearing a stream's
+    /// clothes — a wedged accelerator answers every stream this way — but telling
+    /// that from one camera's bad frame takes the failure ratio across streams,
+    /// which only the host sees.
     Infer(String),
     /// `push_au` on a stream `close_stream` already emptied.
     Closed,
@@ -54,21 +38,22 @@ pub enum NativeError {
     /// model's, so its decoder, gate and seeds may be half-updated.
     Poisoned,
     /// A previous call panicked inside a model pass, so the shared session is
-    /// unusable — every stream on the engine, permanently. Distinct from
-    /// [`Self::Poisoned`] because the two call for opposite things: reopen one
-    /// stream, versus stop trusting this engine. Answered to the stream the
-    /// panic happened on as well; see the module doc.
+    /// unusable for every stream on the engine, permanently. The two poisonings
+    /// call for opposite host actions — reopen one stream, versus stop trusting
+    /// this engine — and only the model lock tells them apart, since `push_au`
+    /// nests stream -> model and a pass that panics poisons both. So a poisoned
+    /// model outranks a poisoned stream on every stream *including the one the
+    /// panic happened on*, which is the case a stream reading only its own lock
+    /// gets backwards ([`crate::StreamRef::poisoned_by`]).
     ModelPoisoned,
-    /// A panic caught at the NIF boundary. Reaching the host at all is the
-    /// guarantee — the alternative is `abort()` and a dead node.
+    /// A panic caught at the NIF boundary ([`crate::guarded`]).
     Panicked(String),
 }
 
 impl NativeError {
     /// The atom the host dispatches on. `&'static str` rather than a
-    /// `rustler::atoms!` table because that table is built by calling into the
-    /// BEAM, which would put this mapping — the one thing worth testing about an
-    /// error — out of reach of every test in this crate.
+    /// `rustler::atoms!` table, which is built by calling into the BEAM and would
+    /// put this mapping out of reach of every test in this crate.
     pub fn reason(&self) -> &'static str {
         match self {
             Self::Config(_) => "config",
@@ -103,10 +88,8 @@ impl NativeError {
 
 impl Encoder for NativeError {
     fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
-        // The fallback exists so this cannot panic: `from_str` refuses only
-        // names over 255 bytes, which no `reason` is, and a binary reason is a
-        // worse term but a better outcome than taking the node down to report an
-        // error.
+        // `from_str` refuses only names over 255 bytes, which no `reason` is; the
+        // fallback is here so that reporting an error cannot itself panic.
         let reason = match Atom::from_str(env, self.reason()) {
             Ok(atom) => atom.encode(env),
             Err(_) => self.reason().encode(env),
@@ -117,8 +100,8 @@ impl Encoder for NativeError {
 
 pub type Result<T> = std::result::Result<T, NativeError>;
 
-/// `{:#}` on an [`anyhow::Error`] — the whole context chain, which is where
-/// every stage in `cairn-detect` puts the part naming what it was doing.
+/// The whole `anyhow` context chain, which is where every stage in
+/// `cairn-detect` puts the part naming what it was doing.
 pub fn chain(error: &anyhow::Error) -> String {
     format!("{error:#}")
 }
@@ -172,8 +155,7 @@ mod tests {
         assert_eq!(blast(&NativeError::ModelPoisoned), Blast::Model);
     }
 
-    /// This list is the whole of `Cairn.Native.Host`'s escalate-rather-than-retry
-    /// branch.
+    /// `Cairn.Native.Host`'s escalate-rather-than-retry branch, in full.
     #[test]
     fn only_the_model_reasons_are_engine_wide() {
         let engine_wide: Vec<&str> = one_of_each()
@@ -184,7 +166,6 @@ mod tests {
         assert_eq!(engine_wide, vec!["model_load", "model_poisoned"]);
     }
 
-    /// A shared reason would make two faults indistinguishable to the host.
     #[test]
     fn every_variant_has_its_own_reason() {
         let all = one_of_each();

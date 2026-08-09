@@ -42,11 +42,10 @@ mod resolve;
 /// outside `infer` names it (T1.4).
 pub(super) const MAX_DETS: usize = 32;
 
-// What `infer::X` resolves to for the rest of this library, for main.rs and
-// for `cairn-native`. Deliberately *narrower* than the pre-split surface: fifteen
-// items that were `pub` only because everything shared one module — PROFILES,
-// the four family constants, Layout, Outputs, Declared and the rest — are named
-// nowhere outside `infer` and are no longer re-exported (T1.4).
+// What `infer::X` resolves to for the rest of this library, for main.rs and for
+// `cairn-native`. Deliberately *narrower* than the pre-split surface: fifteen items
+// that were `pub` only because everything shared one module are named nowhere
+// outside `infer` and are no longer re-exported (T1.4).
 pub use backend::{BackendKind, QnnOptions};
 pub use detector::Detector;
 pub use embedder::{embed_persons, quantize_base64, Embedder};
@@ -54,9 +53,8 @@ pub use geometry::{Fit, InputSize, Projection};
 pub use labels::{Labels, ScoreFloors, TrackFloorOverrides};
 pub use profile::{InputSpec, ModelProfile};
 
-// decode.rs and hwdecode.rs name these two only from their own test modules,
-// and no host outside this library names them at all. Gated so the public
-// surface stays what non-test callers actually use — an unconditional
-// re-export would be reachable and so silently permanent.
+// decode.rs and hwdecode.rs name these two only from their own test modules, and no
+// host outside this library names them at all. Gated so the public surface stays
+// what non-test callers use; an unconditional re-export would be permanent.
 #[cfg(test)]
 pub use {encoding::TensorEncoding, geometry::ResizePolicy};
