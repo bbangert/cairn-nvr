@@ -71,9 +71,9 @@ impl StreamRef {
         }
     }
 
-    /// The instant is read after the lock, not before: it is what the sample
-    /// rate is measured against, and a caller that queued behind another push
-    /// must not thin against the time it started waiting.
+    /// The instant is read after the lock, not before: it dates the motion
+    /// gate's windows, and a caller that queued behind another push would
+    /// otherwise age them by however long it waited.
     fn push(&self, au: &[u8], pts: i64, time_base: (i32, i32)) -> Result<Vec<FrameObservations>> {
         let mut state = self.state.lock().map_err(|_| self.poisoned_by())?;
         let stream = state.as_mut().ok_or(NativeError::Closed)?;

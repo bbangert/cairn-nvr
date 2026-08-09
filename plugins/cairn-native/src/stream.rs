@@ -5,10 +5,12 @@
 //!
 //! The tolerated per-frame failures (a decode error mid-GOP, a frame that will
 //! not convert) are counted and skipped exactly as `cairn_detect::decode::run`
-//! skips them; the rest are returned.
+//! skips them. The rate is where the two paths differ: `run` paces itself on the
+//! wall clock, while here `Cairn.Pipeline.Picker` decides which access units
+//! arrive at all, and one of them costs at most one model pass.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use cairn_detect::decode::{self, Decoder, Sampled};
 use cairn_detect::emit::{seeds_from, Det, MAX_PTS};
@@ -17,7 +19,7 @@ use cairn_detect::infer::ScoreFloors;
 use cairn_detect::motion::MotionConfig;
 use cairn_detect::note;
 use rsmpeg::avcodec::{AVCodecParameters, AVPacket};
-use rsmpeg::avutil::AVRational;
+use rsmpeg::avutil::{AVFrame, AVRational};
 use rsmpeg::ffi;
 use rsmpeg::UnsafeDerefMut;
 
@@ -44,8 +46,6 @@ pub struct Stream {
     /// without an epoch setter — a fresh `Gate` opens the window on its own first
     /// sample.
     epoch: Option<String>,
-    interval: Duration,
-    last_sample: Option<Instant>,
     seeds: Seeds,
     decode_errors: u64,
     tensor_errors: u64,
@@ -58,7 +58,6 @@ impl Stream {
         let decoder = open_decoder(&engine, params.motion)?;
 
         let stream = Self {
-            interval: decode::sample_interval(engine.sample_fps),
             engine,
             camera_id,
             decoder,
@@ -66,7 +65,6 @@ impl Stream {
             floors: params.floors,
             motion: params.motion,
             epoch: params.epoch,
-            last_sample: None,
             seeds: Seeds::default(),
             decode_errors: 0,
             tensor_errors: 0,
@@ -76,13 +74,15 @@ impl Stream {
         Ok(stream)
     }
 
-    /// Feed one access unit and take whatever frames it completed: none (the
-    /// decoder wants more input, or the sample gate is not due) or, with
-    /// reordering, more than one — never assume a frame per push.
+    /// Feed one access unit and take the one observation it is worth, or none —
+    /// the decoder may want more input, and a frame that will not convert costs
+    /// its access unit.
     ///
-    /// `now` is taken once for the whole call rather than per decoded frame as
-    /// `decode::run` does, which differs only for a decoder emitting a burst:
-    /// sharing an instant yields one sample instead of one per frame.
+    /// Never more than one, whatever the decoder completed: see
+    /// [`sampled_frame`]. The list is the host's shape, not a count.
+    ///
+    /// `now` dates [`Gate::decide`]'s linger, re-verify and epoch-bypass windows;
+    /// nothing here paces on it.
     pub fn push_au(
         &mut self,
         au: &[u8],
@@ -99,75 +99,63 @@ impl Stream {
             return Ok(Vec::new());
         }
 
-        let mut frames = Vec::new();
-        loop {
-            let frame = match self.decoder.receive_frame() {
-                Ok(Some(frame)) => frame,
-                Ok(None) => break,
-                Err(error) => {
-                    self.note(Tolerated::Decode, &error);
-                    break;
-                }
-            };
-            if self
-                .last_sample
-                .is_some_and(|last| now.duration_since(last) < self.interval)
-            {
-                continue;
-            }
-            self.last_sample = Some(now);
-            let observed_at = SystemTime::now();
-            let pts = decode::pts_90k(&frame, time_base);
-
-            let Sampled { input, motion } = match self.decoder.to_tensor(frame) {
-                Ok(Some(sampled)) => sampled,
-                Ok(None) => continue,
-                Err(error) => {
-                    // One sample, not the stream: sws has no path for a
-                    // mid-stream format change and a filter graph rebuild can
-                    // fail transiently.
-                    self.note(Tolerated::Tensor, &error);
-                    continue;
-                }
-            };
-
-            let decision = self
-                .gate
-                .decide(self.motion, motion, self.epoch.as_deref(), now);
-            let (objects, inferred) = match decision {
-                Decision::Detect => {
-                    let dets = self.engine.detect(input, &self.floors)?;
-                    self.seeds.remember(&dets);
-                    (dets, true)
-                }
-                // Re-report the last real pass, so a parked object the gate
-                // stopped inferring on does not age out of the host's tracker
-                // while it is still standing there.
-                Decision::Skip => (self.seeds.replay(), false),
-            };
-
-            // The same bound the ndjson path refuses a line for: a `pts` this far
-            // out means the rescale saturated, so it is not a timestamp.
-            if !(-MAX_PTS..=MAX_PTS).contains(&pts) {
-                self.unbounded_pts += 1;
-                if should_log(self.unbounded_pts) {
-                    note!(
-                        "camera {}: pts {pts} is outside +-2^62, {} frame(s) dropped so far",
-                        self.camera_id,
-                        self.unbounded_pts
-                    );
-                }
-                continue;
-            }
-
-            frames.push(FrameObservations {
-                pts,
-                observed_at_ms: unix_ms(observed_at),
-                inferred,
-                objects,
-            });
+        let (frame, drained) = sampled_frame(self.decoder.as_mut());
+        if let Some(error) = drained {
+            self.note(Tolerated::Decode, &error);
         }
-        Ok(frames)
+        let Some(frame) = frame else {
+            return Ok(Vec::new());
+        };
+        let observed_at = SystemTime::now();
+        let pts = decode::pts_90k(&frame, time_base);
+
+        let Sampled { input, motion } = match self.decoder.to_tensor(frame) {
+            Ok(Some(sampled)) => sampled,
+            Ok(None) => return Ok(Vec::new()),
+            Err(error) => {
+                // One access unit, not the stream: sws has no path for a
+                // mid-stream format change and a filter graph rebuild can fail
+                // transiently.
+                self.note(Tolerated::Tensor, &error);
+                return Ok(Vec::new());
+            }
+        };
+
+        let decision = self
+            .gate
+            .decide(self.motion, motion, self.epoch.as_deref(), now);
+        let (objects, inferred) = match decision {
+            Decision::Detect => {
+                let dets = self.engine.detect(input, &self.floors)?;
+                self.seeds.remember(&dets);
+                (dets, true)
+            }
+            // Re-report the last real pass, so a parked object the gate
+            // stopped inferring on does not age out of the host's tracker
+            // while it is still standing there.
+            Decision::Skip => (self.seeds.replay(), false),
+        };
+
+        // The same bound the ndjson path refuses a line for: a `pts` this far
+        // out means the rescale saturated, so it is not a timestamp.
+        if !(-MAX_PTS..=MAX_PTS).contains(&pts) {
+            self.unbounded_pts += 1;
+            if should_log(self.unbounded_pts) {
+                note!(
+                    "camera {}: pts {pts} is outside +-2^62, {} frame(s) dropped so far",
+                    self.camera_id,
+                    self.unbounded_pts
+                );
+            }
+            return Ok(Vec::new());
+        }
+
+        Ok(vec![FrameObservations {
+            pts,
+            observed_at_ms: unix_ms(observed_at),
+            inferred,
+            objects,
+        }])
     }
 
     /// The tolerated-error counters, `(decode, sample conversion)`.
@@ -286,6 +274,37 @@ fn should_log(count: u64) -> bool {
     count % LOG_EVERY == 1
 }
 
+/// The frame an access unit is sampled at — the first it completed — with the
+/// rest of its frames drained and dropped.
+///
+/// The rate lives upstream in `Cairn.Pipeline.Picker`, which gates *access
+/// units*; reordering completes several frames for one of them, and inferring on
+/// each would run the model at some multiple of the rate that was asked for. A
+/// dropped frame never reaches [`Decoder::to_tensor`], so the motion background
+/// never absorbs it either — one access unit stays one sample, which is the unit
+/// [`cairn_detect::motion::MotionDetector`]'s calibration window counts in.
+///
+/// Drained rather than left queued: `avcodec_send_packet` refuses the next packet
+/// while output is pending, and both [`Decoder`] implementations swallow that
+/// refusal as a lost access unit rather than reporting it.
+///
+/// The error is returned rather than logged because the count and its rate limit
+/// belong to the [`Stream`].
+fn sampled_frame(decoder: &mut dyn Decoder) -> (Option<AVFrame>, Option<anyhow::Error>) {
+    let mut sampled = None;
+    loop {
+        match decoder.receive_frame() {
+            Ok(Some(frame)) => {
+                if sampled.is_none() {
+                    sampled = Some(frame);
+                }
+            }
+            Ok(None) => return (sampled, None),
+            Err(error) => return (sampled, Some(error)),
+        }
+    }
+}
+
 /// Open this stream's decoder against a bare H.264 stream description.
 ///
 /// There is no container here to take stream parameters from — the caller is
@@ -371,6 +390,108 @@ fn unix_ms(at: SystemTime) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// A decoder that completes a fixed number of frames per packet, which is
+    /// what reordering does and no fixture produces on demand. `to_tensor`
+    /// counts its calls: it is the only way into a model pass and the only thing
+    /// [`cairn_detect::motion::MotionDetector`] updates from, so a frame that
+    /// reaches it is a frame the background absorbed.
+    #[derive(Default)]
+    struct Burst {
+        per_packet: usize,
+        pending: usize,
+        tensors: usize,
+        fail_after: Option<usize>,
+    }
+
+    impl Decoder for Burst {
+        fn send_packet(&mut self, _packet: &AVPacket) -> anyhow::Result<()> {
+            self.pending = self.per_packet;
+            Ok(())
+        }
+
+        fn receive_frame(&mut self) -> anyhow::Result<Option<AVFrame>> {
+            if self.fail_after == Some(self.per_packet - self.pending) {
+                anyhow::bail!("the decoder gave up mid-burst");
+            }
+            if self.pending == 0 {
+                return Ok(None);
+            }
+            self.pending -= 1;
+            let mut frame = AVFrame::new();
+            // Which one came back is the whole question, so they are numbered.
+            frame.set_pts((self.per_packet - self.pending) as i64);
+            Ok(Some(frame))
+        }
+
+        fn to_tensor(&mut self, _frame: AVFrame) -> anyhow::Result<Option<Sampled>> {
+            self.tensors += 1;
+            Ok(None)
+        }
+    }
+
+    fn burst(per_packet: usize) -> Burst {
+        Burst {
+            per_packet,
+            ..Burst::default()
+        }
+    }
+
+    #[test]
+    fn one_access_unit_is_sampled_at_its_first_frame_and_the_rest_are_dropped() {
+        let mut decoder = burst(3);
+        decoder
+            .send_packet(&packet_from(&[1, 2, 3], 0).unwrap())
+            .unwrap();
+
+        let (frame, error) = sampled_frame(&mut decoder);
+        assert_eq!(frame.expect("three frames and none returned").pts, 1);
+        assert!(error.is_none());
+        // …and nothing is left queued, which is what lets the next packet in
+        assert_eq!(decoder.pending, 0);
+
+        // the dropped frames never became tensors, so the motion background
+        // absorbed one frame for this access unit and not three
+        assert_eq!(decoder.tensors, 0, "`sampled_frame` converted nothing");
+    }
+
+    #[test]
+    fn a_burst_that_fails_mid_drain_still_yields_the_frame_it_had() {
+        let mut decoder = Burst {
+            per_packet: 3,
+            fail_after: Some(2),
+            ..Burst::default()
+        };
+        decoder
+            .send_packet(&packet_from(&[1, 2, 3], 0).unwrap())
+            .unwrap();
+
+        let (frame, error) = sampled_frame(&mut decoder);
+        assert_eq!(frame.expect("the first frame was already in hand").pts, 1);
+        assert!(error.is_some(), "the tolerated error was swallowed");
+
+        // …and a failure before any frame is the empty answer, not a lost one
+        let mut decoder = Burst {
+            per_packet: 3,
+            fail_after: Some(0),
+            ..Burst::default()
+        };
+        decoder.send_packet(&packet_from(&[1], 0).unwrap()).unwrap();
+        let (frame, error) = sampled_frame(&mut decoder);
+        assert!(frame.is_none());
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn a_packet_that_completed_nothing_is_the_empty_answer() {
+        let mut decoder = burst(0);
+        decoder.send_packet(&packet_from(&[1], 0).unwrap()).unwrap();
+
+        let (frame, error) = sampled_frame(&mut decoder);
+        assert!(frame.is_none());
+        assert!(error.is_none());
+    }
 
     #[test]
     fn a_time_base_that_would_fault_the_rescale_is_refused() {

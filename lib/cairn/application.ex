@@ -53,6 +53,9 @@ defmodule Cairn.Application do
       # streams on it. One engine for the whole VM, so it is not in a camera's
       # tree: a camera restart must not reload the model.
       {Cairn.Native.Host, []},
+      # After the host, whose ETS tables it reads — and its own process, so that a
+      # host inside a native call cannot stop the check that would report it.
+      {Cairn.Native.Health, []},
       {Cairn.CameraSupervisor, []},
       {Cairn.Retention, []},
       {CairnWeb.WebRTC.Supervisor, []},

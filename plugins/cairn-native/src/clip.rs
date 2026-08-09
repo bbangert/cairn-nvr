@@ -20,8 +20,9 @@
 //! CAIRN_NATIVE_SKIP_CLIP=1 cargo test
 //! ```
 //!
-//! Sampling is wall-clock, so a clip pushed as fast as it decodes yields a handful
-//! of samples rather than one per frame.
+//! There is no picker here, so nothing thins: every access unit that completes a
+//! frame costs a model pass, which is what makes these the slowest tests in the
+//! crate.
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -237,6 +238,37 @@ fn a_recorded_clip_decodes_and_infers() {
             .map(|object| (&object.label, object.score))
             .collect::<Vec<_>>()
     );
+}
+
+/// One access unit in, one observation out, at whatever rate the caller pushes:
+/// `Cairn.Pipeline.Picker` is the only thing between a camera and the model, and a
+/// second gate here would thin what it already admitted.
+#[test]
+fn back_to_back_access_units_are_not_thinned() {
+    let Some(artifacts) = artifacts() else {
+        return;
+    };
+    let engine = engine(&artifacts);
+    let clip = read_clip(&artifacts.clip);
+    let head = Clip {
+        units: clip.units[..20.min(clip.units.len())].to_vec(),
+        time_base: clip.time_base,
+    };
+
+    let mut stream = open(&engine, "front");
+    let frames = feed(&mut stream, &head);
+
+    // The pushes are a tight loop, well inside the 1/30 s this engine is
+    // configured for; only the decoder's own start-up latency is allowed to cost
+    // an access unit.
+    assert!(
+        frames.len() + 2 >= head.units.len(),
+        "{} access units yielded {} observation(s)",
+        head.units.len(),
+        frames.len()
+    );
+    assert!(frames.len() <= head.units.len(), "one pass per access unit");
+    assert!(frames.iter().all(|frame| frame.inferred));
 }
 
 /// The registry, against a real engine rather than against itself.

@@ -481,7 +481,13 @@ defmodule Cairn.FFmpegPort do
   # decouple the two.
   defp start_session(state) do
     if membrane?(state) do
-      opts = [camera_id: state.camera.id, epoch: state.epoch, owner: self()]
+      opts = [
+        camera_id: state.camera.id,
+        epoch: state.epoch,
+        owner: self(),
+        detect: detect_opts(state)
+      ]
+
       module = Keyword.get(state.opts, :pipeline_module, Cairn.Pipeline.Camera)
 
       case Membrane.Pipeline.start(module, opts) do
@@ -524,6 +530,22 @@ defmodule Cairn.FFmpegPort do
   end
 
   defp membrane?(state), do: state.camera.pipeline == :membrane
+
+  # `nil` leaves the pipeline's detect branch unbuilt. `min_score` is the same
+  # wire floor the plugin argv carries on the classic path; the rest of the
+  # profile is still the plugin's own and becomes engine config later.
+  defp detect_opts(%{camera: %{plugin: nil}}), do: nil
+
+  defp detect_opts(state) do
+    sample_fps =
+      case Cairn.Config.profile_for(state.config, state.camera) do
+        %Cairn.Config.Profile{sample_fps: fps} -> fps
+        nil -> nil
+      end
+
+    [stream_params: %{min_score: state.camera.min_score}] ++
+      if(sample_fps, do: [sample_fps: sample_fps], else: [])
+  end
 
   # TS bytes buffered until the BridgeSource announces itself — a window of
   # milliseconds unless the pipeline is failing, in which case its monitor

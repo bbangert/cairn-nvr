@@ -4,9 +4,10 @@ defmodule Cairn.NativeStub do
 
   Driven by the control map a test puts in `:persistent_term` under
   `{:native_stub, :control}`: `:test` is the pid every call reports to, and one
-  key per function is what that function answers (a `push_au` or `close_stream`
-  value may be a function of that arity, so a test can block, sleep or fail
-  inside the call).
+  key per function is what that function answers (an `open_stream`, `push_au` or
+  `close_stream` value may be a function of that arity, so a test can block,
+  sleep or fail inside the call — `open_stream` is how a test blocks the host
+  itself, since that one is called from the host process).
   """
 
   @behaviour Cairn.Native.Engine
@@ -28,7 +29,12 @@ defmodule Cairn.NativeStub do
   @impl true
   def open_stream(engine, camera_id, params) do
     notify({:open_stream, engine, camera_id, params})
-    control(:open_stream, {:ok, {:stream, camera_id}})
+
+    case control(:open_stream, nil) do
+      fun when is_function(fun, 3) -> fun.(engine, camera_id, params)
+      nil -> {:ok, {:stream, camera_id}}
+      result -> result
+    end
   end
 
   @impl true

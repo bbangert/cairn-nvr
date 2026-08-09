@@ -16,14 +16,16 @@ defmodule Cairn.Native.Parity do
 
   ## What makes the two runs comparable at all
 
-  Both paths thin frames on the *wall clock* (`--sample-fps`), so which frames reach
-  the model is a property of the run and not of the clip — the `verify/` README
-  measures two runs of one build sharing 3 lines of ~88. Two things fix that here:
+  The plugin thins frames on the *wall clock* (`--sample-fps`), so which frames
+  reach the model is a property of the run and not of the clip — the `verify/`
+  README measures two runs of one build sharing 3 lines of ~88. Two things fix that
+  here:
 
-    * `sample_fps: 30` against a ~20 fps clip. The gate's interval (33 ms) is then
-      shorter than the frame period (50 ms), so *every* decoded frame clears it on
-      both sides. The native side is paced to the clip's own rate for the same
-      reason.
+    * `sample_fps: 30` against a ~20 fps clip. The plugin's interval (33 ms) is
+      then shorter than the frame period (50 ms), so *every* decoded frame clears
+      it. The NIF has no such gate — `Cairn.Pipeline.Picker` owns that rate in the
+      running system, and nothing stands in for it here — so it infers on every
+      access unit.
     * The join key is `pts`: the plugin dates lines from RTP timestamps and the NIF
       from the container's, so the two differ by a constant the alignment search
       recovers.
@@ -126,7 +128,7 @@ defmodule Cairn.Native.Parity do
 
     plugin = plugin_run(clip, work, opts)
     log.("  plugin: #{length(plugin)} frames")
-    native = native_run(aus, time_base, frame_ms, opts)
+    native = native_run(aus, time_base, opts)
     log.("  native: #{length(native)} frames")
 
     dump(Keyword.get(opts, :out), clip, plugin, native)
@@ -335,7 +337,7 @@ defmodule Cairn.Native.Parity do
 
   # -- the NIF path -----------------------------------------------------------
 
-  defp native_run(aus, time_base, frame_ms, opts) do
+  defp native_run(aus, time_base, opts) do
     unless Native.available?() do
       raise "cairn-native is not loaded (#{inspect(Native.load_error())}) — " <>
               "cargo build --release in plugins/cairn-native and copy " <>
@@ -361,39 +363,21 @@ defmodule Cairn.Native.Parity do
     {:ok, stream} = Native.open_stream(engine, @camera_id, params)
 
     try do
-      push_all(stream, aus, time_base, pace_ms(frame_ms, opts))
+      push_all(stream, aus, time_base)
     after
       Native.close_stream(stream)
     end
   end
 
-  # The gate measures the gap between the instants two pushes are *entered* at, so a
-  # feed faster than the sample interval would thin frames the plugin's real-time feed
-  # keeps. The clip's own rate already is slower.
-  defp pace_ms(frame_ms, opts) do
-    interval = div(1000, Keyword.fetch!(opts, :sample_fps)) + 5
-    max(frame_ms, interval)
-  end
-
-  defp push_all(stream, aus, time_base, pace_ms) do
+  # Unpaced: the NIF infers on every access unit it is handed, so how fast they
+  # arrive decides nothing about which ones reach the model.
+  defp push_all(stream, aus, time_base) do
     aus
-    |> Enum.flat_map_reduce(nil, fn {au, pts}, previous ->
-      sleep_until(previous, pace_ms)
-      started = System.monotonic_time(:millisecond)
+    |> Enum.flat_map(fn {au, pts} ->
       {:ok, {frames, []}} = Native.push_au(stream, au, pts, time_base)
-      {frames, started}
+      frames
     end)
-    |> elem(0)
     |> Enum.map(&Observations.from_frame(&1, @camera_id, @epoch))
-  end
-
-  defp sleep_until(nil, _pace_ms), do: :ok
-
-  defp sleep_until(previous, pace_ms) do
-    case previous + pace_ms - System.monotonic_time(:millisecond) do
-      remaining when remaining > 0 -> Process.sleep(remaining)
-      _elapsed -> :ok
-    end
   end
 
   # -- the comparison ---------------------------------------------------------
