@@ -4,6 +4,8 @@
 //! closed by design — a new family is a catalog entry — and an enum plus plain
 //! functions gives the readability without dynamic dispatch.
 
+use std::num::NonZeroUsize;
+
 use anyhow::{anyhow, bail, Result};
 
 use crate::emit::{Det, ObservationKind};
@@ -67,8 +69,8 @@ pub(super) struct ClassFloor {
 /// per *camera*: one multiplexed process serves a group whose members each
 /// carry their own `min_score`, so a table cached beside the session would be
 /// the wrong one for every member but the first.
-fn class_floors(nc: usize, labels: &Labels, floors: &ScoreFloors) -> Vec<ClassFloor> {
-    (0..nc)
+fn class_floors(nc: NonZeroUsize, labels: &Labels, floors: &ScoreFloors) -> Vec<ClassFloor> {
+    (0..nc.get())
         .map(|class_id| {
             let label = labels.label_for(class_id);
             ClassFloor {
@@ -179,6 +181,7 @@ pub(super) fn candidates_from(
         (Layout::RawClasses { nc }, Outputs::One(one)) => {
             let anchors = one.dims[2] as usize;
             require_values(one.values.len(), 4 + nc, anchors, &one.dims)?;
+            let nc = classes(output.layout, nc)?;
             Ok(raw_classes(
                 one.values,
                 nc,
@@ -191,6 +194,7 @@ pub(super) fn candidates_from(
         (Layout::GridObjectness { nc, strides }, Outputs::One(one)) => {
             let anchors = grid_anchors(size, strides);
             require_values(one.values.len(), anchors, 5 + nc, &one.dims)?;
+            let nc = classes(output.layout, nc)?;
             Ok(grid_objectness(
                 one.values,
                 nc,
@@ -204,6 +208,7 @@ pub(super) fn candidates_from(
             let queries = logits.dims[1] as usize;
             require_values(boxes.values.len(), queries, 4, &boxes.dims)?;
             require_values(logits.values.len(), queries, nc, &logits.dims)?;
+            let nc = classes(output.layout, nc)?;
             Ok(detr_queries(
                 boxes.values,
                 logits.values,
@@ -219,6 +224,28 @@ pub(super) fn candidates_from(
             show(&raw.map(|tensor| tensor.dims.clone()))
         ),
     }
+}
+
+/// A class-reading layout's `nc`, refusing a head that declares none.
+///
+/// `nc == 0` is the export or the profile being wrong — a dynamic-shape export
+/// whose class dimension settled at zero, an int8 one that collapsed it, either
+/// of them loaded past the class-count check by `--allow-label-mismatch`. No
+/// anchor can be labelled, so the loops below would discard every one of them
+/// and the pass would still *complete*: zero detections for as long as the model
+/// runs, which the host's health check — which can only see that a pass returned
+/// — reads as a quiet scene. Refused here instead, in the fallible half and
+/// ahead of the loops, so an operator is told; the [`NonZeroUsize`] is what
+/// carries the answer into them.
+fn classes(layout: Layout, nc: usize) -> Result<NonZeroUsize> {
+    NonZeroUsize::new(nc).ok_or_else(|| {
+        anyhow!(
+            "{layout} declares no classes, so no detection could be labelled and every \
+             frame would decode to nothing. Check --model-profile against the model's \
+             real output shape; --allow-label-mismatch does not make such an export \
+             decodable."
+        )
+    })
 }
 
 /// Does this tensor carry the `rows * row` values the layout is about to index?
@@ -291,7 +318,7 @@ fn end_to_end(rows: &[f32], labels: &Labels, floors: &ScoreFloors) -> Vec<Candid
 /// [`candidates_from`] — and mark it against its own `min_score`.
 fn raw_classes(
     values: &[f32],
-    nc: usize,
+    nc: NonZeroUsize,
     anchors: usize,
     size: InputSize,
     score: ScoreComposition,
@@ -302,12 +329,7 @@ fn raw_classes(
     let _ = score;
     let mut candidates = Vec::new();
     for a in 0..anchors {
-        // `None` is a head that reported no classes at all, which is the export
-        // being wrong rather than this anchor — see [`argmax`].
-        let Some((class_id, score)) = argmax(nc, |c| f64::from(values[(4 + c) * anchors + a]))
-        else {
-            continue;
-        };
+        let (class_id, score) = argmax(nc, |c| f64::from(values[(4 + c) * anchors + a]));
         // A NaN score wins `total_cmp`'s argmax, so it is rejected here rather
         // than left to be compared against a floor (where every comparison is
         // false) and serialized as `null`, which would take the whole output
@@ -352,13 +374,13 @@ fn raw_classes(
 /// [`candidates_from`] — and mark it against its own `min_score`.
 fn grid_objectness(
     values: &[f32],
-    nc: usize,
+    nc: NonZeroUsize,
     strides: &[usize],
     size: InputSize,
     score: ScoreComposition,
     floors: &[ClassFloor],
 ) -> Vec<Candidate> {
-    let row = 5 + nc;
+    let row = 5 + nc.get();
     let mut candidates = Vec::new();
     let mut anchor = 0usize;
     for stride in strides {
@@ -372,13 +394,7 @@ fn grid_objectness(
                     ScoreComposition::ObjTimesClass => f64::from(values[base + 4]),
                     ScoreComposition::Class | ScoreComposition::SigmoidClass => 1.0,
                 };
-                // `None` is a head that reported no classes at all, which is
-                // the export being wrong rather than this anchor — see
-                // [`argmax`].
-                let Some((class_id, class_score)) = argmax(nc, |c| f64::from(values[base + 5 + c]))
-                else {
-                    continue;
-                };
+                let (class_id, class_score) = argmax(nc, |c| f64::from(values[base + 5 + c]));
                 // NaN wins total_cmp's argmax and survives every comparison
                 // against a floor, then serializes as `null` and takes the
                 // whole output line out of the contract.
@@ -455,7 +471,7 @@ fn grid_objectness(
 fn detr_queries(
     boxes: &[f32],
     logits: &[f32],
-    nc: usize,
+    nc: NonZeroUsize,
     queries: usize,
     size: InputSize,
     score: ScoreComposition,
@@ -469,8 +485,8 @@ fn detr_queries(
         let mut poisoned = false;
         // `zip` rather than indexing: `floors` carries one entry per class by
         // construction, and pairing them is what says so without a panic path.
-        for (class_id, floor) in (0..nc).zip(floors) {
-            let logit = f64::from(logits[query * nc + class_id]);
+        for (class_id, floor) in (0..nc.get()).zip(floors) {
+            let logit = f64::from(logits[query * nc.get() + class_id]);
             let value = match score {
                 ScoreComposition::SigmoidClass => sigmoid(logit),
                 // An export that already squashed its logits, read as it stands.
@@ -538,18 +554,23 @@ fn sigmoid(logit: f64) -> f64 {
 /// Argmax over `n` scores. `total_cmp` orders NaN, so a NaN wins — every
 /// caller rejects the result rather than letting one reach the output.
 ///
-/// `None` for `n == 0`, which is a head with no classes to name: an export
-/// whose class dimension settled at zero (a dynamic-shape export, an int8 one
-/// whose class dim collapsed, a profile that does not match the layout). It
-/// used to be an `expect`, asserting an invariant nothing enforces — and
-/// `--allow-label-mismatch` is exactly the flag that stops the load-time check
-/// from refusing such an export. In-VM that panic is under the shared model
-/// lock, which poisons a session nothing recovers; the caller skipping the
-/// anchor costs one frame's detections instead.
-fn argmax(n: usize, score: impl Fn(usize) -> f64) -> Option<(usize, f64)> {
-    (0..n)
-        .map(|c| (c, score(c)))
-        .max_by(|x, y| x.1.total_cmp(&y.1))
+/// [`NonZeroUsize`] rather than `usize` so there is no empty range to answer
+/// for: a zero class count is refused once, in [`classes`], instead of arriving
+/// here as either a panic under the shared model lock or a `None` each caller
+/// would turn into "skip this anchor" — which is every anchor of every frame,
+/// silently.
+///
+/// Written as a fold rather than `max_by` only to be total without an `expect`;
+/// `>=` keeps that iterator's own rule that a tie takes the *later* class.
+fn argmax(n: NonZeroUsize, score: impl Fn(usize) -> f64) -> (usize, f64) {
+    (1..n.get()).fold((0, score(0)), |best, c| {
+        let value = score(c);
+        if value.total_cmp(&best.1).is_ge() {
+            (c, value)
+        } else {
+            best
+        }
+    })
 }
 
 /// Center/extent -> corners, dropping anything non-finite or absurdly large.
@@ -3076,10 +3097,10 @@ mod tests {
         // untouched anchor of a sparse tensor — comes out as the *highest*
         // class id, not class 0. Which floor then drops it is decided by that
         // last class, and reading it the intuitive way gets the wrong one.
-        assert_eq!(argmax(NC, |_| 0.0), Some((NC - 1, 0.0)));
-        // …and a head with no classes to choose between names none, rather
-        // than panicking under the model lock
-        assert_eq!(argmax(0, |_| 0.0), None);
+        assert_eq!(
+            argmax(NonZeroUsize::new(NC).unwrap(), |_| 0.0),
+            (NC - 1, 0.0)
+        );
 
         let flat = v8_output(3, &[(320.0, 320.0, 64.0, 64.0, 0, 0.0)]);
         // admitted at a floor every class clears, it leaves as `car` — id 2,
@@ -3103,5 +3124,59 @@ mod tests {
             SQUARE,
         );
         assert!(dets.is_empty(), "{dets:?}");
+    }
+
+    /// A class dimension of zero is the export being broken, and it has to be
+    /// said out loud: nothing can be labelled, so every anchor of every frame
+    /// is discarded and the pass still *completes*. The host infers health from
+    /// passes completing, so swallowing this makes a dead model
+    /// indistinguishable from a quiet scene for as long as it runs.
+    #[test]
+    fn a_layout_that_declares_no_classes_is_refused_rather_than_decoded_as_empty() {
+        let refuse = |output: OutputSpec, raw: &Outputs<Raw>, size: InputSize| -> String {
+            let err = decode_output(
+                output,
+                raw,
+                &labels(),
+                &open(),
+                size,
+                &Projection::stretch(size),
+            )
+            .expect_err("a head with no classes decoded");
+            format!("{err:#}")
+        };
+        // Each shape is one its layout would otherwise index happily: the box
+        // channels or columns are all there, and only the class table is empty.
+        let cases = [
+            {
+                let anchors = 4;
+                let values = vec![0f32; 4 * anchors];
+                let dims = [1, 4, anchors as i64];
+                refuse(v8_spec(0), &raw_one(&values, &dims), SQUARE)
+            },
+            {
+                let grid = GridOutput::new(TINY, 0);
+                refuse(grid.spec(), &raw_one(&grid.values, &grid.dims()), TINY)
+            },
+            {
+                let detr = DetrOutput::new(2, 0);
+                refuse(
+                    detr.spec(),
+                    &raw_detr(&detr.boxes, &detr.logits, 2, 0),
+                    SQUARE,
+                )
+            },
+        ];
+        for message in cases {
+            assert!(message.contains("no classes"), "{message}");
+            // and names the layout, which is what says whether the profile or
+            // the export is the thing to look at
+            assert!(
+                ["raw-classes", "grid-objectness", "detr-queries"]
+                    .iter()
+                    .any(|kind| message.contains(kind)),
+                "{message}"
+            );
+        }
     }
 }

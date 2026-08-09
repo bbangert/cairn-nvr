@@ -23,8 +23,8 @@
 // Clippy's `exit` lint permits the call inside `fn main`, which is where this
 // crate's one legitimate exit lives, so the deny needs no `allow` anywhere. The
 // exemption goes by enclosing body, so a closure written inside `fn main` would
-// be exempt as well — `main` here is a six-line wrapper around `run` that
-// spawns nothing.
+// be exempt as well — `main` here reports, drains the log and exits, and spawns
+// nothing.
 #![deny(clippy::exit)]
 
 use std::path::PathBuf;
@@ -193,9 +193,15 @@ struct Args {
 }
 
 fn main() {
-    if let Err(e) = run() {
+    let failed = run().inspect_err(|e| {
         // Exit loudly: Cairn restarts us with jittered backoff.
         note!("fatal: {e:#}");
+    });
+    // On both paths, because `note!` only *queues*: a clean run has lines of its
+    // own still in flight, and the `fatal:` line above is the whole reason
+    // anyone reads this process's stderr.
+    cairn_detect::log::drain();
+    if failed.is_err() {
         std::process::exit(1);
     }
 }

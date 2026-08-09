@@ -149,11 +149,10 @@ impl Streams {
             Control::Ignored => return,
         };
 
-        // The map moves first; the log line is written after the guard drops.
-        // Stderr here is the host's append-redirect into a log file, so a write
-        // can block for as long as the disk takes — and this lock is taken once
-        // per frame by the inference thread, which would stall behind it.
-        // ([`crate::note!`] is what keeps a *failed* write from being worse than that.)
+        // The map moves first; the line is logged after the guard drops. This
+        // lock is taken once per frame by the inference thread, and nothing that
+        // is not the map itself belongs inside it. ([`crate::note!`] neither
+        // writes nor fails on this thread, so the ordering is belt and braces.)
         let announcement = {
             let mut epochs = self.lock();
             match epochs.get_mut(&camera_id) {
@@ -208,6 +207,10 @@ pub fn spawn_reader(streams: Arc<Streams>) -> Result<()> {
             .is_err();
             let cause = if panicked { "panicked" } else { "stdin closed" };
             note!("control: control channel gone ({cause}), exiting so Cairn respawns us");
+            // Before `_exit`, which writes nothing: `note!` queues its line for
+            // the log worker, so this thread has to wait for that one — bounded
+            // — or the reason this process ended dies with it.
+            crate::log::drain();
             // `_exit`, not `process::exit`, because this fires on a thread while
             // the main thread may be anywhere — including inside onnxruntime's
             // session constructor. `spawn_reader` is called *before* the model
@@ -220,10 +223,10 @@ pub fn spawn_reader(streams: Arc<Streams>) -> Result<()> {
             //
             // `_exit` ends the process at the kernel and runs no user-space
             // teardown at all, which is what makes it safe from any thread at
-            // any time. Nothing is lost by skipping the flush: `emit::write_line`
+            // any time. Nothing buffered is lost by that: `emit::write_line`
             // flushes every protocol line as it writes it — the host is reading a
-            // pipe and a buffered detection is an undelivered one — and stderr
-            // is unbuffered, which is what [`crate::note!`] writes to.
+            // pipe and a buffered detection is an undelivered one — and the log
+            // queue behind [`crate::note!`] is drained just above.
             //
             // Non-zero: this is an abnormal end, and the host logs the status.
             //

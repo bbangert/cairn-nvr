@@ -24,9 +24,9 @@
 // VAAPI/CUDA device creation after it. So the call is denied across this
 // library rather than left to one comment that nobody is obliged to read.
 //
-// Every thread this crate starts is started from here — `multiplex::run` and
-// `control::spawn_reader` — so this is the deny that matters. `main.rs` repeats
-// it for its own crate, where clippy exempts `fn main` itself.
+// Every thread this crate starts is inside this deny — `multiplex::run`,
+// `control::spawn_reader`, `log`'s writer — so this is the deny that matters.
+// `main.rs` repeats it for its own crate, where clippy exempts `fn main` itself.
 //
 // It is a `restriction`-group lint, hence allow-by-default, so `-D warnings`
 // does not enable it and this line is what turns it on.

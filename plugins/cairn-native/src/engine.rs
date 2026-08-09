@@ -17,10 +17,11 @@
 //! in this crate. `push_au` takes its own stream's lock and then this one, so the
 //! order is always stream -> model and the cycle a deadlock needs does not exist.
 //! The registry is touched only by open and drop, never under this lock. The
-//! stage code called under it does do I/O — [`cairn_detect::note!`] takes
-//! stderr's lock, itself a leaf — but it may not *panic*: an unwind under this
-//! lock poisons a session nothing recovers, which is why `cairn_detect::log`
-//! drops a failed diagnostic write rather than raising it.
+//! stage code called under it logs, and [`cairn_detect::note!`] queues the line
+//! for a worker thread rather than writing it here — a stalled log reader must
+//! not stall detection on every camera. What it may not do is *panic*: an unwind
+//! under this lock poisons a session nothing recovers, which is why
+//! `cairn_detect::log` drops a line it cannot queue and a write it cannot make.
 
 use std::collections::HashSet;
 use std::sync::{Mutex, MutexGuard, Once};
