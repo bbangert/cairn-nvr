@@ -1,31 +1,21 @@
 defmodule Cairn.Native.Parity do
   @moduledoc """
-  The same clip through both detection producers, frame by frame.
+  The same clip through both detection producers, frame by frame: `cairn-detect`
+  over RTP on 127.0.0.1, fed by `plugins/cairn-detect/verify/feed.py` and decoded
+  by `Cairn.PluginProtocol.decode_line/2`, against `Cairn.Native.push_au/4` over
+  the clip's own access units. Both ends are `Cairn.Observation` structs.
 
-  Phase 2's proof, and the last point before phase 3 wires the detect branch to
-  the NIF at which a semantic divergence between them is cheap to find:
-
-    * the **plugin path as it runs today** — `cairn-detect` over RTP on
-      127.0.0.1, fed by `plugins/cairn-detect/verify/feed.py` (the same ffmpeg
-      argv `Cairn.FFmpegPort` builds for a file source), its stdout decoded by
-      `Cairn.PluginProtocol.decode_line/2`;
-    * the **NIF path** — `Cairn.Native.push_au/4` over the clip's own access
-      units, turned into observations by `Cairn.Native.Observations`.
-
-  Both ends are `Cairn.Observation` structs, which is interface #1 and the only
-  thing the rest of the system sees either producer through.
-
-  ## Why the comparison is exact, and what makes it possible
+  ## Why the comparison is exact
 
   Nothing on either path re-derives a number. `cairn_detect::infer::heads`'
-  `det_from` rounds the score to 3 decimals and the bbox to 4 **before** the
-  `Det` exists, and both producers carry that same `Det` — the plugin through
-  serde_json and `Jason`, the NIF through a term. Both of those round-trip an
-  f64 exactly. So the expectation is bit equality, and `tolerance:` defaults to
-  a value six orders of magnitude under the score's own quantum: it is there to
-  absorb a decimal-parse edge, never a real difference. Widening it past 5.0e-4
-  would hide a whole quantum of score movement, which is the divergence this
-  harness exists to find.
+  `det_from` rounds the score to 3 decimals and the bbox to 4 **before** the `Det`
+  exists, both producers carry that same `Det` — the plugin through serde_json and
+  `Jason`, the NIF through a term — and both of those round-trip an f64 exactly.
+  So the expectation is bit equality, and `tolerance:` defaults to a value six
+  orders of magnitude under the score's own quantum: it is there to absorb a
+  decimal-parse edge, never a real difference. Widening it past 5.0e-4 would hide
+  a whole quantum of score movement, which is the divergence this harness exists
+  to find.
 
   ## What makes the two runs comparable at all
 
@@ -38,25 +28,20 @@ defmodule Cairn.Native.Parity do
       then shorter than the frame period (50 ms), so *every* decoded frame
       clears it on both sides, and the sampled set stops being a coin flip.
       The native side is paced to the clip's own rate for the same reason.
-    * The join key is `pts`, which is the frame's identity: the plugin dates
-      lines from RTP timestamps and the NIF from the container's, so the two
-      differ by a constant that the alignment search recovers.
+    * The join key is `pts`: the plugin dates lines from RTP timestamps and the
+      NIF from the container's, so the two differ by a constant that the
+      alignment search recovers.
 
   **The motion gate is off.** A gated frame re-reports the last pass's boxes,
   which makes a frame's output depend on the history of *sampled* frames and on
   wall-clock windows (`linger_ms`, `reverify_ms`, `epoch_bypass_ms`) — not
-  comparable across two processes by construction. See the findings doc for
-  what that leaves uncovered.
-
-  So no run of this harness has ever carried an `observation_kind` of
-  `"tracked"`, and turning the gate on would not fix that: the two producers
-  would have to skip the *same* frames to be comparable, and which frame was the
-  last real pass is decided per process — one frame lost to RTP (which is why
-  `coverage` has a floor below 1.0 at all) moves the boxes every gated frame
-  after it re-reports, on one side only. What covers the seed rule instead is
-  that there is one of it: both producers build their seeds by calling
-  `cairn_detect::emit::seeds_from`, which is tested on both sides and compared
-  across them in `plugins/cairn-native/src/stream.rs`.
+  comparable across two processes by construction, and turning the gate on would
+  not fix it: which frame was the last real pass is decided per process, so one
+  frame lost to RTP moves the boxes for every gated frame after it, on one side
+  only. No run has therefore ever carried an `observation_kind` of `"tracked"`.
+  What covers the seed rule instead is that both producers call the same
+  `cairn_detect::emit::seeds_from`, compared across them in
+  `plugins/cairn-native/src/stream.rs`.
   """
 
   alias Cairn.Native
@@ -127,11 +112,11 @@ defmodule Cairn.Native.Parity do
     clips
     |> Enum.with_index()
     |> Enum.map(fn {clip, index} ->
-      # A fresh port per clip: the previous plugin may still be shutting down
-      # and a bound socket it has not released yet would silently take the feed.
+      # A fresh port per clip: the previous plugin may still be shutting down and a
+      # bound socket it has not released yet would silently take the feed.
       report = compare(clip, Keyword.update!(opts, :udp_port, &(&1 + index * 2)))
-      # Per clip rather than at the end: a run of several clips is minutes long
-      # and an interrupted one should still have said what it found.
+      # Per clip rather than at the end: a run of several clips is minutes long and
+      # an interrupted one should still have said what it found.
       on_report.(report)
       report
     end)
@@ -161,13 +146,13 @@ defmodule Cairn.Native.Parity do
   # -- the clip ---------------------------------------------------------------
 
   @doc """
-  A clip as the detect branch will hand it over: whole Annex-B access units
-  with the container's own pts.
+  A clip as the detect branch will hand it over: whole Annex-B access units with
+  the container's own pts.
 
-  ffmpeg's `image2` muxer writes one file per packet, which for `-c copy` is
-  one file per access unit — so the split is ffmpeg's own demuxer's and this
-  module parses no bitstream. `h264_mp4toannexb` is the same filter the RTP
-  feed applies, and for the same reason: SPS/PPS have to be in band.
+  ffmpeg's `image2` muxer writes one file per packet, which for `-c copy` is one
+  file per access unit — so the split is ffmpeg's own demuxer's and this module
+  parses no bitstream. `h264_mp4toannexb` is the same filter the RTP feed applies,
+  and for the same reason: SPS/PPS have to be in band.
   """
   @spec read_clip(Path.t(), Path.t()) :: %{
           aus: [{binary(), integer()}],
@@ -191,9 +176,9 @@ defmodule Cairn.Native.Parity do
     pts = probe_pts(clip)
     files = dir |> File.ls!() |> Enum.sort()
 
-    # The two lists are the same demuxer's output in the same order, so a
-    # length disagreement means one of them is not what it is taken to be —
-    # which would silently mis-date every access unit.
+    # The two lists are the same demuxer's output in the same order, so a length
+    # disagreement means one of them is not what it is taken to be — which would
+    # silently mis-date every access unit.
     if length(files) != length(pts) do
       raise "#{clip}: ffmpeg wrote #{length(files)} access units for #{length(pts)} packets"
     end
@@ -292,23 +277,23 @@ defmodule Cairn.Native.Parity do
 
     # `exec` so the child is the plugin itself and not a shell holding it: the
     # contract's shutdown is EOF on stdin, which `Port.close/1` delivers only to
-    # whatever the port is directly attached to. stderr goes to a file rather
-    # than into the port because the port carries ndjson and nothing else.
+    # whatever the port is directly attached to. stderr goes to a file rather than
+    # into the port because the port carries ndjson and nothing else.
     command = "exec " <> Enum.map_join(argv, " ", &quote_arg/1) <> " 2> " <> quote_arg(stderr)
 
     port =
       Port.open({:spawn_executable, "/bin/sh"}, [:binary, :exit_status, args: ["-c", command]])
 
     # The plugin emits no `frame.objects` before it is told an epoch, and EOF on
-    # stdin exits it — so this line has to arrive and the port has to stay open
-    # for the run (`plugins/cairn-detect/verify/README.md`).
+    # stdin exits it — so this line has to arrive and the port has to stay open for
+    # the run (`plugins/cairn-detect/verify/README.md`).
     Port.command(port, Jason.encode!(@control) <> "\n")
     port
   end
 
-  # The model loads before the RTP listener opens, so packets sent into that gap
-  # are gone. The `up:` line is the cue rather than a sleep because how long the
-  # load takes is the model's business.
+  # The model loads before the RTP listener opens, so packets sent into that gap are
+  # gone. The `up:` line is the cue rather than a sleep because how long the load
+  # takes is the model's business.
   defp await_up(stderr, port, waited \\ 0) do
     cond do
       File.exists?(stderr) and File.read!(stderr) =~ "cairn-detect up:" ->
@@ -339,9 +324,8 @@ defmodule Cairn.Native.Parity do
       )
   end
 
-  # Line mode is what the host reads the plugin with, at the contract's own
-  # bound; a quiet window ends the run because ffmpeg's exit is not the last
-  # line (the plugin is still draining its inference queue).
+  # A quiet window ends the run because ffmpeg's exit is not the last line: the
+  # plugin is still draining its inference queue.
   defp collect(port, acc, partial \\ "") do
     receive do
       {^port, {:data, chunk}} ->
@@ -431,8 +415,8 @@ defmodule Cairn.Native.Parity do
   @doc """
   The comparison itself: two runs' observations in, one report out.
 
-  Public because it is the whole of `compare/2` that needs neither a NIF, a
-  plugin, ffmpeg nor a clip — the verdict is decided here.
+  Public because it is the whole of `compare/2` that needs neither a NIF, a plugin,
+  ffmpeg nor a clip.
   """
   @spec report(Path.t(), [Observation.t()], [Observation.t()], non_neg_integer(), keyword()) ::
           report()
@@ -468,22 +452,19 @@ defmodule Cairn.Native.Parity do
   defp share(_part, 0), do: 0.0
   defp share(part, whole), do: part / whole
 
-  # `coverage` is the share of the plugin's frames *inside the window the NIF
-  # run covers* that the NIF also produced — not the share of the clip. The RTP
-  # transport loses frames the NIF path cannot (see the findings doc: a
-  # burst-lost keyframe costs the plugin a whole GOP), which is a property of the
-  # transport rather than of either detector, and `max_frames` shortens the
-  # window on purpose. What it does catch is the NIF missing a frame the plugin
-  # had. The floor on `matched` is so a run that lined up on almost nothing
-  # cannot pass by having nothing to disagree about.
+  # `coverage` is the share of the plugin's frames *inside the window the NIF run
+  # covers* that the NIF also produced — not the share of the clip: the RTP
+  # transport loses frames the NIF path cannot (a burst-lost keyframe costs the
+  # plugin a whole GOP), and `max_frames` shortens the window on purpose. What it
+  # catches is the NIF missing a frame the plugin had. The floor on `matched` is so
+  # a run that lined up on almost nothing cannot pass by having nothing to disagree
+  # about.
   #
   # A margin of 0 is several offsets fitting the evidence equally well, so which
-  # frames were paired was a coin flip — on a static or repetitive clip that
-  # pairs around a temporal divergence and diffs clean. Its own verdict, and not
+  # frames were paired was a coin flip — on a static or repetitive clip that pairs
+  # around a temporal divergence and diffs clean. Its own verdict, and not
   # `:divergence`: nothing was found to differ, the run just did not compare the
-  # frames it claims to have. A run that has mismatches *as well* is reported as
-  # the divergence it has something concrete to say about; `alignment` is in the
-  # report either way.
+  # frames it claims to have.
   defp verdict([], matched, coverage, floor, %{margin: margin})
        when matched >= 25 and coverage >= floor do
     if margin > 0, do: :parity, else: :ambiguous_alignment
@@ -492,27 +473,22 @@ defmodule Cairn.Native.Parity do
   defp verdict(_mismatches, _matched, _coverage, _floor, _alignment), do: :divergence
 
   @doc """
-  The pts offset that carries the plugin's series onto the NIF's, and how sure
-  the search is of it.
+  The pts offset that carries the plugin's series onto the NIF's, and how sure the
+  search is of it.
 
-  The plugin dates lines from the RTP timestamps its sender picked a base for,
-  so the two pts series are the same series shifted — recovered rather than
-  assumed. Every native frame is a candidate partner for the plugin's first
-  few, because a feed that lost its opening GOP starts a whole second of frames
-  in.
+  Every native frame is a candidate partner for the plugin's first few, because a
+  feed that lost its opening GOP starts a whole second of frames in.
 
-  **Ranked by agreement and not by how many frames pair up.** How many pair up
-  is a property of the two pts *ranges*, which a `max_frames` trim or a feed
-  that outlasted the clip moves around: sliding the plugin's series into the
-  middle of the NIF's pairs more of it than the true offset does, and a wrong
-  offset pairs each frame with its neighbour, which on a slow scene looks
-  nearly right. Agreement does not have that failure: an offset one frame out
-  agrees on nothing at all. The `margin` between the winner and the best other
-  offset is what says whether the alignment was in doubt: a margin of 0 means
-  several offsets fit the evidence equally and the frame pairing is a coin flip.
-  This function reports that rather than refusing it — always answering with the
-  best offset it has is what lets a caller dump both runs and look — and
-  `report/5`'s verdict is where a coin flip stops being a pass.
+  **Ranked by agreement and not by how many frames pair up.** How many pair up is
+  a property of the two pts *ranges*, which a `max_frames` trim or a feed that
+  outlasted the clip moves around: sliding the plugin's series into the middle of
+  the NIF's pairs more of it than the true offset does, and a wrong offset pairs
+  each frame with its neighbour, which on a slow scene looks nearly right.
+  Agreement does not have that failure: an offset one frame out agrees on nothing
+  at all. A `margin` of 0 means several offsets fit the evidence equally and the
+  frame pairing is a coin flip. This function reports that rather than refusing it
+  — always answering with the best offset it has is what lets a caller dump both
+  runs and look — and `report/5`'s verdict is where a coin flip stops being a pass.
   """
   @spec align([Observation.t()], [Observation.t()], float()) ::
           {integer(), %{agreed: non_neg_integer(), probes: non_neg_integer(), margin: integer()}}
@@ -559,10 +535,10 @@ defmodule Cairn.Native.Parity do
     end)
   end
 
-  # `outside` is the plugin frames the NIF run never covered — the tail of a
-  # clip the feed outlasted, or everything past a `max_frames` trim. They are
-  # not evidence about either producer, so they are counted and set aside rather
-  # than held against the coverage the verdict reads.
+  # `outside` is the plugin frames the NIF run never covered — the tail of a clip
+  # the feed outlasted, or everything past a `max_frames` trim. They are not
+  # evidence about either producer, so they are counted and set aside rather than
+  # held against the coverage the verdict reads.
   defp join(plugin, native, offset) do
     by_pts = Map.new(native, &{&1.pts, &1})
     window = Enum.min_max_by(native, & &1.pts, fn -> {nil, nil} end)
@@ -625,9 +601,9 @@ defmodule Cairn.Native.Parity do
 
   defp close?(x, y, tolerance), do: abs(x - y) <= tolerance
 
-  # Task 2.4's deliberate omissions, counted rather than asserted here so the
-  # caller can insist they are the *only* ones — anything else that differs is
-  # already a mismatch above.
+  # The deliberate omissions, counted rather than asserted here so the caller can
+  # insist they are the *only* ones — anything else that differs is already a
+  # mismatch above.
   defp expected_differences(matched) do
     %{
       plugin_sequence_present: Enum.count(matched, fn {a, _b} -> is_integer(a.sequence) end),

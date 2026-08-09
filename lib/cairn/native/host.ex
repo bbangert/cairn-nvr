@@ -3,18 +3,16 @@ defmodule Cairn.Native.Host do
   Owns the in-VM detection engine: one NIF load, one model, one stream per
   camera.
 
-  D-M3 as amended puts `cairn-native` on this node's dirty schedulers with no
-  peer to contain it, so a panic in the stages is every camera on the box,
-  recordings included. **This process is not that containment** — nothing in the
-  BEAM is, and a supervisor above it buys nothing a panic respects. It is the
-  policy that keeps the node from reaching the fault, and the lifecycle nobody
-  else can own:
+  D-M3 as amended puts `cairn-native` on this node's dirty schedulers with no peer
+  to contain it, so a panic in the stages is every camera on the box, recordings
+  included. **This process is not that containment** — nothing in the BEAM is. It
+  is the policy that keeps the node from reaching the fault:
 
     * a new or changed model is probe-loaded in a throwaway OS process
       (`Cairn.Native.Canary`) before the in-VM NIF is allowed near it, model
       load being the known crash/wedge vector;
     * per-frame work runs in the **caller**, not here: `push_au/5` reads the
-      stream handle out of ETS and calls the NIF itself, so one camera's 12 ms
+      stream handle out of ETS and calls the NIF itself, so one camera's
       inference is not queued behind fifteen others and this process stays
       answerable while every one of them blocks;
     * NPU liveness is the D-P5 ratio and nothing else (spike 0.5): a wedged HTP
@@ -22,55 +20,44 @@ defmodule Cairn.Native.Host do
       above it — so a suspected wedge escalates to an operator alert and never
       to a restart loop.
 
-  ## Where it sits
-
-  A top-level `:one_for_one` child of `Cairn.Application`, after
-  `Cairn.StreamEpochs` (whose epochs it announces under) and before
-  `Cairn.CameraSupervisor` — like `Cairn.PluginGroupSupervisor`, what serves the
-  cameras starts before the cameras do. Not under a camera's tree: the engine is
-  one model for the whole VM, a camera restart must not reload it (seconds, and
-  a multi-second HTP graph compile on QNN), and a camera crash must not cost
-  every other camera its detector.
-
-  Its own restart is cheap only because it holds no per-frame work, and it costs
-  a model reload — which is why nothing here exits. A missing library, an
-  unconfigured model, a refused canary, a failed `init/1` and a dead engine are
-  all *states* this process reports rather than reasons for a supervisor to
-  restart-loop on something no restart fixes.
+  Nothing here exits. A missing library, an unconfigured model, a refused canary,
+  a failed `init/1` and a dead engine are all *states* this process reports rather
+  than reasons for a supervisor to restart-loop on something no restart fixes.
+  Nor does it sit under a camera's tree: the engine is one model for the whole VM,
+  a camera restart must not reload it (seconds, and a multi-second HTP graph
+  compile on QNN), and a camera crash must not cost every other camera its
+  detector.
 
   ## The two error classes
 
-  The crate splits its reasons deliberately, and they are not remedied the same
-  way. `config`, `open_stream`, `decode`, `infer`, `closed`, `poisoned` and
-  `panicked` are **per stream**: the remedy is closing and reopening that one
-  camera, which is the caller's to do (the ones that leave a stream unusable —
-  `closed`, `poisoned`, `panicked` — have their handle dropped here, so the next
-  `push_au/5` says `:no_stream` instead of running against state nobody knows
-  the shape of). `model_load` and `model_poisoned` are **engine-fatal**: that
-  engine handle can never serve any camera again, so it is dropped and only
+  `config`, `open_stream`, `decode`, `infer`, `closed`, `poisoned` and `panicked`
+  are **per stream**: the remedy is closing and reopening that one camera, which
+  is the caller's to do (the ones that leave a stream unusable — `closed`,
+  `poisoned`, `panicked` — have their handle dropped here, so the next
+  `push_au/5` says `:no_stream` instead of running against state nobody knows the
+  shape of). `model_load` and `model_poisoned` are **engine-fatal**: that engine
+  handle can never serve any camera again, so it is dropped and only
   `configure/3` — canary first — brings one back.
 
-  `infer` is the interesting one. From inside the crate it is per stream, and
-  from inside the crate a wedged accelerator is indistinguishable from a stream
-  that failed; the crate does not guess. Discriminating is this process's job
-  and the evidence is **cross-stream**: one camera failing is that camera, every
-  camera with traffic failing at once is the accelerator.
+  `infer` is the interesting one. From inside the crate a wedged accelerator is
+  indistinguishable from a stream that failed, and the crate does not guess.
+  Discriminating is this process's job and the evidence is **cross-stream**: one
+  camera failing is that camera, every camera with traffic failing at once is the
+  accelerator.
 
   ## Healthy, saturated, wedged, idle
 
   The NIF has no admission control. Once cameras × `sample_fps` passes what one
   model session sustains, the surplus is queueing time inside a `push_au/5` the
-  caller is blocked in — so "healthy but slow" is a real state, and the ratio
-  check must not report it as a wedge. What separates them is throughput: a
-  saturated healthy accelerator still completes work at accelerator rate, and a
-  wedged one cannot complete faster than the CPU it has silently fallen back to.
+  caller is blocked in — so "healthy but slow" is a real state, and the ratio check
+  must not report it as a wedge. What separates them is throughput: a saturated
+  healthy accelerator still completes work at accelerator rate, and a wedged one
+  cannot complete faster than the CPU it has silently fallen back to.
 
   Both are measured on **completed** model passes alone. Most `push_au/5` calls
-  return without running the model — the sampler is not due, or the motion gate
-  replayed the last pass — and a call that only decoded costs nothing like one
-  that inferred, while a failed pass had no accelerator in it either. A latency
-  or a throughput taken over every call describes the sampler and the failure
-  rate rather than the accelerator.
+  return without running the model, and a failed pass had no accelerator in it
+  either, so a latency or a throughput taken over every call describes the sampler
+  and the failure rate rather than the accelerator.
   """
 
   use GenServer
@@ -125,11 +112,10 @@ defmodule Cairn.Native.Host do
   @doc """
   Open `camera_id`'s stream, returning the epoch its detections belong to.
 
-  `params` is `Cairn.Native.Config.stream_params/1`'s vocabulary — the
-  operator-owned scene knobs (D-P6) and the media session's `stream_epoch`. The
-  epoch is the *caller's*: it names the ffmpeg session the access units come
-  from, and this process only says which one detections resume under. Reopening
-  a camera that already has a stream closes the old one first.
+  `params` is `Cairn.Native.Config.stream_params/1`'s vocabulary. The epoch is the
+  *caller's*: it names the ffmpeg session the access units come from, and this
+  process only says which one detections resume under. Reopening a camera that
+  already has a stream closes the old one first.
   """
   @spec open_stream(atom(), String.t(), map() | keyword()) ::
           {:ok, Cairn.ULID.t()} | {:error, term()}
@@ -146,13 +132,11 @@ defmodule Cairn.Native.Host do
   Feed one access unit and take what it completed.
 
   Runs in the calling process and blocks it for as long as decode plus a model
-  pass takes — and, under saturation, for as long as the streams ahead of it
-  hold the model session too. That is the design
-  (`plugins/cairn-native/src/lib.rs`), and it is why this call does not go
-  through the GenServer.
+  pass takes — and, under saturation, for as long as the streams ahead of it hold
+  the model session too. That is the design (`plugins/cairn-native/src/lib.rs`),
+  and it is why this call does not go through the GenServer.
 
-  What comes back is one map per frame the access unit completed — none, one, or
-  several — in the crate's own spelling. `Cairn.Native.Observations` is what
+  The frames come back in the crate's own spelling; `Cairn.Native.Observations`
   turns them into `Cairn.Observation`s.
   """
   @spec push_au(atom(), String.t(), binary(), integer(), {integer(), integer()}) ::
@@ -173,17 +157,16 @@ defmodule Cairn.Native.Host do
     end
   end
 
-  @doc "Everything an operator or task 3.4's status surface needs to know."
+  @doc "Everything an operator or a status surface needs to know."
   @spec status(atom()) :: map()
   def status(server \\ __MODULE__), do: GenServer.call(server, :status)
 
   @doc """
   Load a model, or replace the one loaded.
 
-  Canary first, then `init/1`, then every stream that was open is reopened on
-  the epoch its media session is still running under. Blocks for a model load,
-  which on QNN is a graph compile. This is also the only recovery from an
-  engine-fatal error.
+  Canary first, then `init/1`, then every stream that was open is reopened on the
+  epoch its media session is still running under. Blocks for a model load, which
+  on QNN is a graph compile. This is the only recovery from an engine-fatal error.
   """
   @spec configure(atom(), map() | keyword(), timeout()) :: {:ok, map()} | {:error, term()}
   def configure(server \\ __MODULE__, config, timeout \\ 300_000) do
@@ -202,8 +185,8 @@ defmodule Cairn.Native.Host do
     table = Keyword.get(opts, :name, __MODULE__)
     :ets.new(table, [:named_table, :set, :protected, read_concurrency: true])
 
-    # Public because the callers write it themselves, on the frame path, around
-    # a call this process is deliberately not in: see `enter/3`.
+    # Public because the callers write it themselves, on the frame path, around a
+    # call this process is deliberately not in: see `enter/3`.
     inflight = :"#{table}.inflight"
     :ets.new(inflight, [:named_table, :set, :public, write_concurrency: true])
 
@@ -265,11 +248,10 @@ defmodule Cairn.Native.Host do
   end
 
   def handle_info({:inference, camera_id, token, {:error, reason, message}}, state) do
-    # A failed pass has no latency worth a p50 and is not an inference the status
-    # surface should report as one; what it is, is this stream's evidence against
-    # itself (`classify/2`). The window counts it as traffic but never as work
-    # retired (`run_health_check/1`): a stream doing nothing but erroring has to
-    # reach the cross-stream verdict rather than read as silence, and must not be
+    # A failed pass has no latency worth a p50, but it is this stream's evidence
+    # against itself (`classify/2`). The window counts it as traffic and never as
+    # work retired (`run_health_check/1`): a stream doing nothing but erroring has
+    # to reach the cross-stream verdict rather than read as silence, and must not be
     # able to stand in for an accelerator that is completing passes.
     state = record(state, camera_id, 0, &%{&1 | errors: &1.errors + 1})
     {:noreply, note_error(state, camera_id, token, reason, message)}
@@ -280,9 +262,8 @@ defmodule Cairn.Native.Host do
     {:noreply, run_health_check(state)}
   end
 
-  # The canary's probe process is linked to this one while it runs; its exit,
-  # anything it leaves behind, and any other stray, is not worth a restart that
-  # would reload the model.
+  # The canary's probe process is linked to this one while it runs; its exit, and
+  # any other stray, is not worth a restart that would reload the model.
   def handle_info(_message, state), do: {:noreply, state}
 
   @impl true
@@ -296,8 +277,8 @@ defmodule Cairn.Native.Host do
 
   # -- engine lifecycle -------------------------------------------------------
 
-  # SEAM (task 3.3): the model config arrives as a plain map here. When profile
-  # expansion moves off argv, this is the one place that changes.
+  # The seam for profile expansion: when it moves off argv, the model config still
+  # arrives as a plain map here and this is the one place that changes.
   defp configured_model(state) do
     Keyword.get(state.opts, :config) ||
       Application.get_env(:cairn, __MODULE__, [])[:config]
@@ -305,7 +286,7 @@ defmodule Cairn.Native.Host do
 
   defp open_engine(state, nil) do
     # No model configured is the normal state until a camera's profile is routed
-    # here (task 3.3). Nothing to say about it, and nothing to load.
+    # here: nothing to say about it, and nothing to load.
     %{state | engine: nil, engine_state: :not_configured}
   end
 
@@ -377,12 +358,11 @@ defmodule Cairn.Native.Host do
     |> Keyword.merge(Application.get_env(:cairn, Canary, []))
   end
 
-  # A stream-fatal reason is the remedy for *the open it happened on* and no
-  # other. `close_stream` waits on the push's own mutex, but the reopen behind it
-  # can complete before the retired caller is scheduled to report, and that
-  # report would then close the replacement — a camera going dark for a fault it
-  # never had. Engine-fatal reasons are not gated: they are about the model
-  # handle rather than the stream, and every stream goes with it anyway.
+  # A stream-fatal reason is the remedy for *the open it happened on* and no other.
+  # `close_stream` waits on the push's own mutex, but the reopen behind it can
+  # complete before the retired caller is scheduled to report, and that report
+  # would then close the replacement — a camera going dark for a fault it never
+  # had. Engine-fatal reasons are not gated: every stream goes with the handle.
   defp note_error(state, camera_id, token, reason, message) when reason in @stream_fatal do
     case Map.get(state.streams, camera_id) do
       %{token: ^token} ->
@@ -400,10 +380,6 @@ defmodule Cairn.Native.Host do
   defp note_error(state, camera_id, _token, reason, message),
     do: note_error(state, camera_id, reason, message)
 
-  # `model_load` and `model_poisoned` say this engine handle can never serve any
-  # camera again, so retrying anything against it is the one thing not to do:
-  # every stream is closed and the handle dropped, and only `configure/3` —
-  # which re-probes in a throwaway process first — brings an engine back.
   defp note_error(state, camera_id, reason, message) when reason in @engine_fatal do
     Logger.error(
       "cairn-native: #{reason} on #{camera_id}: #{message} — the engine is dead for every " <>
@@ -418,10 +394,9 @@ defmodule Cairn.Native.Host do
     drop_stream(state, camera_id)
   end
 
-  # `decode` and `infer` are per frame as often as they are per stream, and
-  # `infer` is also what a wedged accelerator looks like from inside the crate.
-  # Neither is acted on here: the health check is what has the cross-stream view
-  # to tell one camera's failure from the accelerator's.
+  # `decode` and `infer` are per frame as often as they are per stream, and neither
+  # is acted on here: the health check is what has the cross-stream view to tell
+  # one camera's failure from the accelerator's.
   defp note_error(state, _camera_id, _reason, _message), do: state
 
   # -- streams ----------------------------------------------------------------
@@ -479,12 +454,10 @@ defmodule Cairn.Native.Host do
     Enum.reduce(Map.keys(state.streams), state, &drop_stream(&2, &1))
   end
 
-  # An engine reload leaves every camera's media session running and every one
-  # of its streams dead, so they are reopened under the epoch they were already
-  # on — the detector lost its history, the source did not. The re-announcement
-  # is what tells a consumer which epoch detections resume under, exactly as
-  # `Cairn.PluginGroupPort` re-announces from ETS after a respawn; a fresh ULID
-  # here would retire an epoch the ring buffer's init segments already carry.
+  # An engine reload leaves every camera's media session running and every one of
+  # its streams dead, so they are reopened under the epoch they were already on —
+  # the detector lost its history, the source did not. A fresh ULID here would
+  # retire an epoch the ring buffer's init segments already carry.
   defp reopen_streams(state, open) do
     Enum.reduce(open, state, fn {camera_id, stream}, state ->
       {:reply, _result, state} = do_open_stream(state, camera_id, stream.params)
@@ -492,10 +465,10 @@ defmodule Cairn.Native.Host do
     end)
   end
 
-  # The epoch is minted by whoever owns the media session — `Cairn.FFmpegPort`,
-  # on every spawn. Only a camera nobody has minted for yet gets one from here,
-  # and that is a `:started`: this process establishing the first session of a
-  # camera's life is the one case where it is the authority.
+  # The epoch is minted by whoever owns the media session — `Cairn.FFmpegPort`, on
+  # every spawn. Only a camera nobody has minted for yet gets one from here: this
+  # process establishing the first session of a camera's life is the one case where
+  # it is the authority.
   defp resolve_epoch(camera_id, params) do
     case params.stream_epoch || current_epoch(camera_id) do
       nil -> {StreamEpochs.new_epoch(camera_id, :started), :minted}
@@ -510,11 +483,9 @@ defmodule Cairn.Native.Host do
     end
   end
 
-  # A repeat of the epoch a consumer already holds is a no-op by
-  # `Cairn.StreamEpochs`' own contract, so this is only ever information: it is
-  # not sent for an epoch this process just minted (`new_epoch/3` broadcast that
-  # one itself), and it never announces an epoch the mint side does not hold —
-  # one no `current/1` agrees with is one no consumer should adopt.
+  # Not sent for an epoch this process just minted (`new_epoch/3` broadcast that one
+  # itself), and never for one the mint side does not hold: an epoch no `current/1`
+  # agrees with is one no consumer should adopt.
   defp announce(_camera_id, _epoch, :minted), do: :ok
 
   defp announce(camera_id, epoch, :adopted) do
@@ -540,16 +511,11 @@ defmodule Cairn.Native.Host do
     ArgumentError -> :error
   end
 
-  # What "outstanding" is read off. The caller registers itself before the call
-  # and clears itself after, so a caller killed mid-call leaves a row the health
-  # check can tell from a live one. A submitted-minus-completed count cannot:
-  # one killed caller inflates it forever, and every later idle window then reads
-  # as `:wedged` — a page no restart clears, for nothing.
-  #
-  # The row carries when the call went in, which is what makes a hang evidence on
-  # its own (`stalled/2`) rather than something inferred from a window's counts:
-  # counts cannot say it, now that the calls the model never ran on are not in
-  # them.
+  # What "outstanding" is read off, in place of a submitted-minus-completed count:
+  # one caller killed mid-call would inflate such a count forever, and every later
+  # idle window would then read as `:wedged` — a page no restart clears. A row
+  # instead is one the health check can tell from a live one, and it carries when
+  # the call went in, which is what makes a hang evidence on its own (`stalled/2`).
   defp enter(stream, camera_id, started) do
     :ets.insert(stream.inflight, {self(), camera_id, stream.token, started})
     :ok
@@ -566,16 +532,13 @@ defmodule Cairn.Native.Host do
     ArgumentError -> :ok
   end
 
-  # Only the frames the model really ran on are reported as inferences. A call
-  # the sampler was not due for answers with no frame at all, and a frame the
-  # motion gate skipped answers with `inferred: false` — neither paid for a model
-  # pass, and at any `sample_fps` below the camera's frame rate they outnumber
-  # the calls that did. Counting them would read the D-P5 ratio, and the
-  # throughput it falls back on, off calls the accelerator was never in.
+  # Only the frames the model really ran on are reported as inferences: a frame the
+  # motion gate skipped answers with `inferred: false`, and counting it would read
+  # the D-P5 ratio off a call the accelerator was never in.
   #
-  # A frame with no `inferred` is a crate that changed shape under us, and it
-  # raises here rather than silently reading as a call that ran no model — which
-  # is the health check going blind.
+  # A frame with no `inferred` is a crate that changed shape under us, and it raises
+  # here rather than silently reading as a call that ran no model — which is the
+  # health check going blind.
   defp report(stream, camera_id, elapsed, {:ok, {frames, _ended_tracks}}) do
     case Enum.count(frames, & &1.inferred) do
       0 -> :ok
@@ -616,43 +579,40 @@ defmodule Cairn.Native.Host do
     }
   end
 
-  # Every pass is counted; only their latencies are capped, because the p50 of
-  # the first few hundred of a window is the p50 of the window and the counts are
-  # what the throughput arithmetic runs on.
+  # Every pass is counted; only their latencies are capped, because the p50 of the
+  # first few hundred of a window is the p50 of the window and the counts are what
+  # the throughput arithmetic runs on.
   #
   # Today one call carries at most one pass — `Stream::push_au` shares a single
   # instant across the whole call, so its rate limit sheds every frame after the
-  # first — but the crate answers with a list and says not to assume that.
-  # Dividing keeps the sample a per-frame latency either way, which is the only
-  # thing a per-frame CPU baseline can be compared against.
+  # first — but the crate answers with a list and says not to assume that. Dividing
+  # keeps the sample a per-frame latency either way, which is the only thing a
+  # per-frame CPU baseline can be compared against.
   defp sampled(entry, micros, passes) do
     sample = div(micros, passes)
     samples = if entry.count >= @health_window, do: entry.samples, else: [sample | entry.samples]
     %{entry | samples: samples, count: entry.count + passes}
   end
 
-  # The three-way discrimination the D-M3 risk row asks for, plus the fourth
-  # state saturation makes real. Nothing below counts a call the sampler or the
-  # motion gate answered without a model pass: it says nothing about an
-  # accelerator, so it is neither evidence of health nor of its absence. What is
-  # left is counted twice over, because the two decisions want different things —
-  # `traffic` (passes and failures alike) is whether anything is happening at
-  # all, `retired` (completed passes) is whether the accelerator is executing.
+  # The three-way discrimination the D-M3 risk row asks for, plus the fourth state
+  # saturation makes real. Nothing below counts a call the sampler or the motion
+  # gate answered without a model pass. What is left is counted twice over, because
+  # the two decisions want different things — `traffic` (passes and failures alike)
+  # is whether anything is happening at all, `retired` (completed passes) is whether
+  # the accelerator is executing.
   #
   #   * no pass came back, failed or otherwise -> :idle. No opinion, and it must
-  #     not read as health. A camera whose gate is legitimately skipping
-  #     everything lands here, which is the honest answer: nothing asked the
-  #     accelerator to do anything, so nothing was learned about it.
+  #     not read as health: nothing asked the accelerator to do anything, so
+  #     nothing was learned about it.
   #   * the same, with a call in flight since before this window -> :wedged: a
   #     live caller is blocked inside the NIF (`stalled/2`). The evidence is that
   #     call's own age rather than a count of calls that stopped arriving, so a
   #     neighbour's gated traffic cannot vouch for an engine retiring nothing.
   #   * at least one stream completing passes normally -> :healthy. One camera
-  #     erroring or crawling is that camera; the accelerator is demonstrably
-  #     fine.
+  #     erroring or crawling is that camera.
   #   * a stream with traffic nobody can judge yet -> :unknown. A cross-stream
-  #     verdict drawn over part of the traffic is drawn on insufficient
-  #     evidence, and the expensive direction is the false page.
+  #     verdict drawn over part of the traffic is drawn on insufficient evidence,
+  #     and the expensive direction is the false page.
   #   * every stream with traffic failing or slow -> the accelerator. Slow is
   #     only a wedge if retired throughput says so too: a saturated healthy
   #     session still completes at accelerator rate, and a wedged one cannot
@@ -689,10 +649,10 @@ defmodule Cairn.Native.Host do
     })
   end
 
-  # The calls actually still in flight. A caller that died mid-call left its row
-  # behind, and dropping it here is what keeps one killed camera process from
-  # pinning every later idle window at `:wedged`. Every caller is on this node
-  # (they hold an ETS-resident stream handle), so `Process.alive?/1` answers.
+  # Dropping the rows of callers that died mid-call is what keeps one killed camera
+  # process from pinning every later idle window at `:wedged`. Every caller is on
+  # this node (they hold an ETS-resident stream handle), so `Process.alive?/1`
+  # answers.
   defp inflight(state) do
     {live, dead} =
       state.inflight
@@ -710,13 +670,11 @@ defmodule Cairn.Native.Host do
     live
   end
 
-  # A call that was already in flight when this window opened, and still is. A
-  # call that went in *during* the window has not been slow yet, only unfinished,
-  # which is what keeps a window that merely ended mid-call from reading as a
-  # hang; a real hang is still there for the next one to see. Both clocks are
-  # microseconds because both events are a call away from each other: at
-  # millisecond resolution a call entered in the same tick the window opened in
-  # reads as entered after it, and never becomes stalled at all.
+  # A call that went in *during* the window has not been slow yet, only unfinished,
+  # which is what keeps a window that merely ended mid-call from reading as a hang;
+  # a real hang is still there for the next one to see. Both clocks are microseconds
+  # because at millisecond resolution a call entered in the same tick the window
+  # opened in reads as entered after it, and never becomes stalled at all.
   defp stalled(inflight, window_start) do
     Enum.filter(inflight, fn {_pid, _camera_id, _token, started_at} ->
       started_at < window_start
@@ -767,16 +725,14 @@ defmodule Cairn.Native.Host do
     end
   end
 
-  # Throughput carries the D-P5 ratio when latency cannot: under saturation
-  # every caller waits behind the others, so the p50 is queueing time, but the
-  # session still retires work at accelerator rate. A wedged session cannot —
-  # its ceiling is the CPU's.
+  # Throughput carries the D-P5 ratio when latency cannot: under saturation every
+  # caller waits behind the others, so the p50 is queueing time, but the session
+  # still retires work at accelerator rate. A wedged session cannot.
   #
-  # Retired passes only, never `window.traffic`. A failed pass comes back at
-  # whatever rate the failure is raised at, with no accelerator anywhere in it,
-  # so one stream erroring in a tight loop would otherwise clear this floor on
-  # its own and report a wedge as saturation — suppressing the only alert a
-  # wedge has.
+  # Retired passes only, never `window.traffic`: a failed pass comes back at
+  # whatever rate the failure is raised at, so one stream erroring in a tight loop
+  # would otherwise clear this floor on its own and report a wedge as saturation —
+  # suppressing the only alert a wedge has.
   defp accelerator_rate?(state, window) do
     cpu_rate = 1000 / baseline(state)
     observed = window.retired * 1000 / window.elapsed_ms

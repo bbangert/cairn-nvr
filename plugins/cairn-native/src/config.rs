@@ -1,16 +1,13 @@
-//! The host's config, decoded from terms and resolved into what the stages
-//! take.
+//! The host's config, decoded from terms and resolved into what the stages take.
 //!
-//! Two layers on purpose. The `Raw*` structs are the term shape and nothing
-//! else — rustler decodes them and cannot fail interestingly. Resolving them is
-//! where every rule lives, and it is plain Rust with no `Env` in it, which is
-//! the only way any of it is testable: a `rustler::atoms!` table (and so any
-//! term at all) is built by calling into the BEAM.
+//! Two layers on purpose: the `Raw*` structs are the term shape and nothing else,
+//! and resolving them is where every rule lives — plain Rust with no `Env` in it,
+//! which is the only way any of it is testable, since a `rustler::atoms!` table
+//! (and so any term at all) is built by calling into the BEAM.
 //!
-//! What the host sends is the same vocabulary the operator's flags use — the
-//! six `@model_flags` and the two operator-owned JSON knobs (D-P6) — parsed by
-//! the same code that parses argv. A profile that means one thing to the plugin
-//! and another to the NIF is the failure this arrangement exists to prevent.
+//! The host sends the same vocabulary the operator's flags use (D-P6), parsed by
+//! the same code that parses argv, so a profile cannot mean one thing to the plugin
+//! and another to the NIF.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,15 +23,14 @@ use rustler::NifMap;
 use crate::error::{NativeError, Result};
 
 /// The `--sample-fps` range, restated from `main.rs`'s
-/// `value_parser!(u32).range(1..=30)`. Restated because clap owns it there and
-/// there is no argv here — and it is not decoration: `sample_interval` divides
-/// by this, so a zero that reached the stages would be a division by zero on
-/// the frame path.
+/// `value_parser!(u32).range(1..=30)` because clap owns it there and there is no
+/// argv here. Not decoration: `sample_interval` divides by this, so a zero that
+/// reached the stages would be a division by zero on the frame path.
 const SAMPLE_FPS: std::ops::RangeInclusive<u32> = 1..=30;
 
-/// Per-VM model config: the term shape. Every key is required — `nil` is how
-/// the host spells an absent value, so a missing key is a host bug and should
-/// fail loudly at the decode rather than silently take a default here.
+/// Per-VM model config: the term shape. Every key is required — `nil` is how the
+/// host spells an absent value, so a missing key is a host bug and should fail
+/// loudly at the decode rather than take a default here.
 #[derive(Debug, NifMap)]
 pub struct RawInitConfig {
     pub model: String,
@@ -77,11 +73,10 @@ impl RawInitConfig {
     pub fn resolve(self) -> Result<InitConfig> {
         let backend = enum_value::<BackendKind>("backend", &self.backend)?;
         let embedder_model = self.embedder_model.map(PathBuf::from);
-        // The embedder's own open refuses qnn too, but it runs after the
-        // detector's — which on qnn is a multi-second HTP graph compile. The
-        // plugin refuses this combination before argv is even acted on
-        // (`main.rs`'s `run`), and refusing it here keeps the two hosts
-        // answering the same way to the same profile.
+        // The embedder's own open refuses qnn too, but only after the detector's
+        // — which on qnn is a multi-second HTP graph compile. The plugin refuses
+        // the combination up front too (`main.rs`'s `run`), so the two hosts
+        // answer the same way to the same profile.
         if embedder_model.is_some() && backend == BackendKind::Qnn {
             return Err(NativeError::Config(
                 "the embedder does not run on qnn yet (no QDQ embedder artifact) \
@@ -131,8 +126,8 @@ impl RawInitConfig {
 
 /// One stream's scene config: the term shape.
 ///
-/// Everything here is per camera and operator-owned (D-P6) — never model
-/// config, which is [`RawInitConfig`] and is loaded once per VM.
+/// Everything here is per camera and operator-owned (D-P6) — never model config,
+/// which is [`RawInitConfig`] and is loaded once per VM.
 #[derive(Debug, NifMap)]
 pub struct RawStreamParams {
     /// Label -> minimum score, with an optional `"default"` key; the
@@ -142,14 +137,9 @@ pub struct RawStreamParams {
     pub motion_json: Option<String>,
     /// `--track-floor-json` verbatim, or `nil` for the feature off.
     pub track_floor_json: Option<String>,
-    /// The stream epoch these observations belong to, or `nil` before the host
-    /// has announced one.
-    ///
-    /// It is fixed for the life of the stream by design: an epoch identifies
-    /// one stream session, and in this design a new session is a new
-    /// `open_stream`. That is also what makes the gate's epoch-bypass window
-    /// correct without an epoch setter — a fresh `Gate` opens the window on its
-    /// own first sample.
+    /// The stream epoch, or `nil` before the host has announced one. Fixed for the
+    /// life of the stream: a new session is a new `open_stream` — see `Stream`'s
+    /// `epoch` field for what that buys the gate.
     pub stream_epoch: Option<String>,
 }
 
@@ -166,9 +156,9 @@ impl RawStreamParams {
         let track_floor =
             TrackFloorOverrides::parse(self.track_floor_json.as_deref().unwrap_or("{}"))
                 .map_err(|error| NativeError::Config(crate::error::chain(&error)))?;
-        // One camera per stream, so there is nothing to override the knobs
-        // with — the same shape `run_single` resolves, where the "global" and
-        // the "per camera" halves are the one set the caller sent.
+        // One camera per stream, so there is nothing to override the knobs with:
+        // the same shape `run_single` resolves, where the "global" and "per
+        // camera" halves are the one set the caller sent.
         let floors = ScoreFloors::from_map(self.min_score)
             .with_track_floor(TrackFloorOverrides::resolve(
                 &track_floor,
@@ -350,9 +340,8 @@ mod tests {
 
     #[test]
     fn a_knob_no_run_could_honour_is_refused_as_config() {
-        // The three the stages themselves reject, each reached through this
-        // resolution and each arriving as a config error rather than as a
-        // stream that quietly runs on defaults.
+        // The three the stages themselves reject, each arriving as a config error
+        // rather than as a stream that quietly runs on defaults.
         for raw in [
             RawStreamParams {
                 motion_json: Some(r#"{"alpha":0}"#.into()),

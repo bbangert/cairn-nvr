@@ -1,17 +1,15 @@
 //! Diagnostics that cannot take the host down.
 //!
-//! `eprintln!` panics if the write fails, and in production stderr is a pipe or
-//! a redirect — `run_erl`, a journal socket, `> log 2>&1` — whose reader can go
-//! away under a log rotation or a detached console. The BEAM ignores `SIGPIPE`,
-//! so that write returns `EPIPE` and the macro panics.
+//! `eprintln!` panics if the write fails, and in production stderr is a pipe or a
+//! redirect — `run_erl`, a journal socket, `> log 2>&1` — whose reader can go away
+//! under a log rotation or a detached console. The BEAM ignores `SIGPIPE`, so that
+//! write returns `EPIPE` and the macro panics.
 //!
-//! In the plugin that cost one child process. In `cairn-native` the stages run
-//! in the BEAM, and the per-frame ones run **under the shared model lock**, so
-//! the same panic poisons a session that is deliberately never recovered — one
-//! log rotation would end detection on every camera until the node restarts.
-//!
-//! So a failed diagnostic is dropped rather than raised. Every logging site
-//! that can run per frame, or under a lock, goes through [`crate::note!`].
+//! In the plugin that cost one child process. In `cairn-native` the per-frame
+//! stages run **under the shared model lock**, so the same panic poisons a session
+//! that is deliberately never recovered — one log rotation would end detection on
+//! every camera until the node restarts. So every logging site that can run per
+//! frame, or under a lock, goes through [`crate::note!`] and drops a failed write.
 
 use std::io::Write;
 
@@ -25,10 +23,7 @@ pub fn line(args: std::fmt::Arguments<'_>) {
     let _ = stderr.write_all(b"\n");
 }
 
-/// `eprintln!` that cannot panic on a broken stderr.
-///
-/// Same arguments, same output; the only difference is what a failed write
-/// does, and see this module for why that difference is load-bearing.
+/// `eprintln!` that cannot panic on a broken stderr — same arguments, same output.
 #[macro_export]
 macro_rules! note {
     ($($arg:tt)*) => {
@@ -40,8 +35,8 @@ macro_rules! note {
 mod tests {
     use super::*;
 
-    /// The contract is only that the arguments are formatted and nothing
-    /// panics; where they land is stderr's business and the test harness's.
+    /// The contract is only that the arguments format and nothing panics; where
+    /// they land is stderr's business.
     #[test]
     fn a_note_formats_its_arguments_and_returns() {
         line(format_args!("{} {:?} {:.2}", 1, "two", 3.0));

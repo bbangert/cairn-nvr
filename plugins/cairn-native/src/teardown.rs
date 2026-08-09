@@ -2,49 +2,42 @@
 //!
 //! The BEAM runs a resource destructor on whichever thread released the last
 //! reference, and for a garbage-collected term that is the **normal** scheduler
-//! running the owning process. What these handles own is a libav decoder — on
-//! the hardware paths, driver and device teardown — and, for the last engine
-//! handle, an ORT session release, which on QNN gives back an HTP context.
-//! Both are driver-side and neither is bounded by anything this crate controls,
-//! which is what makes them dirty-scheduler work; the host cannot opt out by
-//! calling `close_stream`, because nothing stops the BEAM from collecting a
-//! term.
+//! running the owning process. These handles own a libav decoder — driver and
+//! device teardown on the hardware paths — and, for the last engine handle, an
+//! ORT session release that on QNN gives back an HTP context: driver-side work
+//! bounded by nothing this crate controls. The host cannot opt out by calling
+//! `close_stream`, because nothing stops the BEAM from collecting a term.
 //!
 //! So a destructor hands the value here and returns. **One thread, not one per
 //! drop**: a supervisor restarting every camera at once queues N teardowns
-//! rather than spawning N threads onto a box that is already busy.
-//!
-//! Nothing joins the thread. It parks on the channel for the life of the VM,
-//! and the VM exiting takes it with the process — which is why it holds no
-//! state of its own, only the values it is about to drop.
+//! rather than spawning N threads onto a box that is already busy. Nothing joins
+//! it; the VM exiting takes it with the process.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{self, SendError, Sender};
 use std::sync::OnceLock;
 
-/// One thing to drop somewhere other than here.
 type Discarded = Box<dyn Send + 'static>;
 
-/// Drop `value` on the teardown thread rather than on this one.
-///
-/// Returns as soon as the value is queued. If the thread could not be started
-/// the value is dropped inline instead: slow on the caller, which is the whole
-/// problem this avoids, but a leak or an unwind into the emulator is worse.
+/// Drop `value` on the teardown thread rather than on this one, returning as soon
+/// as it is queued. If the thread could not be started the value is dropped
+/// inline instead: slow on the caller, which is the whole problem this avoids,
+/// but a leak or an unwind into the emulator is worse.
 ///
 /// **Nothing in here may unwind.** A destructor is called from C, and rustler
-/// does not wrap it in [`catch_unwind`] the way it wraps a NIF body, so an
-/// unwind out of this function reaches the C boundary and aborts the node. The
-/// only thing here that can raise is a `Drop`, which is arbitrary code this
-/// module does not own, so every drop it performs goes through
-/// [`drop_swallowing_panics`] — the two inline fallbacks below as much as the
-/// worker's, since it is the fallbacks that run on the destructor's own thread.
+/// does not wrap it in [`catch_unwind`] the way it wraps a NIF body, so an unwind
+/// out of this function reaches the C boundary and aborts the node. The only
+/// thing here that can raise is a `Drop`, arbitrary code this module does not
+/// own, so every drop goes through [`drop_swallowing_panics`] — the two inline
+/// fallbacks below as much as the worker's, since it is the fallbacks that run on
+/// the destructor's own thread.
 pub fn defer<T: Send + 'static>(value: T) {
     defer_to(queue(), value)
 }
 
 /// [`defer`]'s body over an arbitrary queue, so a test can stage both inline
-/// fallbacks: a worker that is gone (`Some`, but the receiver has hung up) and a
-/// thread that never started (`None`).
+/// fallbacks: a worker that is gone (`Some`, receiver hung up) and a thread that
+/// never started (`None`).
 fn defer_to<T: Send + 'static>(queue: Option<&Sender<Discarded>>, value: T) {
     match queue {
         Some(queue) => {
@@ -58,19 +51,18 @@ fn defer_to<T: Send + 'static>(queue: Option<&Sender<Discarded>>, value: T) {
 
 /// Run one `Drop`, absorbing an unwind out of it.
 ///
-/// Swallowed rather than reported: the alternatives on this path are an abort
-/// (from a destructor) or ending the worker thread, and there is nothing to
-/// report *to* — a payload from a driver-side teardown names nothing the
-/// operator can act on, and the caller is a C frame with no error channel.
+/// Swallowed rather than reported: the alternatives here are an abort (from a
+/// destructor) or ending the worker thread, and there is nothing to report *to* —
+/// the caller is a C frame with no error channel.
 fn drop_swallowing_panics<T>(value: T) {
     let _ = catch_unwind(AssertUnwindSafe(move || drop(value)));
 }
 
 /// The teardown thread's inbox, started on the first handle to be collected.
 ///
-/// `None` for the rest of the run if the thread could not be spawned. Retrying
-/// per drop would be retrying inside a destructor, and a box that cannot start
-/// one thread will not start the next one either.
+/// `None` for the rest of the run if the spawn failed: retrying per drop would be
+/// retrying inside a destructor, and a box that cannot start one thread will not
+/// start the next one either.
 fn queue() -> Option<&'static Sender<Discarded>> {
     static QUEUE: OnceLock<Option<Sender<Discarded>>> = OnceLock::new();
     QUEUE
@@ -81,8 +73,8 @@ fn queue() -> Option<&'static Sender<Discarded>> {
                 .spawn(move || {
                     for value in receiver {
                         // A panicking `Drop` must not end the thread: the next
-                        // handle the BEAM collected would then be dropped on
-                        // its scheduler, which is what this exists to prevent.
+                        // collected handle would then be dropped on its
+                        // scheduler, which is what this exists to prevent.
                         drop_swallowing_panics(value);
                     }
                 })
@@ -111,8 +103,8 @@ mod tests {
         }
     }
 
-    /// The property the blocker is about: the thread that lets go of a handle
-    /// is not the thread that pays for the teardown.
+    /// The thread that lets go of a handle is not the thread that pays for the
+    /// teardown.
     #[test]
     fn deferring_a_slow_drop_does_not_block_the_caller() {
         let (sink, dropped) = sync_channel(1);
@@ -132,8 +124,8 @@ mod tests {
         );
     }
 
-    /// A burst — every camera on the box restarting at once — is queued, not
-    /// fanned out, and every one of them is still dropped.
+    /// A burst — every camera on the box restarting at once — is queued rather
+    /// than fanned out, and all of it is still dropped.
     #[test]
     fn a_burst_is_queued_and_all_of_it_is_dropped() {
         let (sink, dropped) = sync_channel(64);
