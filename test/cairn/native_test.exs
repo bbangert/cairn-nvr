@@ -125,9 +125,17 @@ defmodule Cairn.NativeTest do
       assert message =~ "timeout"
     end
 
-    test "no binary and disabled are skips, not failures", %{config: config} do
+    test "a deliberate bypass is the only skip", %{config: config} do
       assert Canary.probe(config, enabled: false) == {:skipped, :disabled}
-      assert Canary.probe(config, binary: "/nonexistent/cairn-detect") == {:skipped, :no_binary}
+    end
+
+    test "a binary that is not there is an error, not a skip", %{config: config} do
+      assert {:error, message} = Canary.probe(config, binary: "/nonexistent/cairn-detect")
+
+      # what an operator has to act on: the path that was tried, and the one way
+      # to load a model without rehearsing it
+      assert message =~ "/nonexistent/cairn-detect"
+      assert message =~ "enabled: false"
     end
   end
 end
