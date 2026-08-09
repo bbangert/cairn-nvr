@@ -65,11 +65,12 @@ defmodule Cairn.Native.Host do
   saturated healthy accelerator still completes work at accelerator rate, and a
   wedged one cannot complete faster than the CPU it has silently fallen back to.
 
-  Both are measured on model passes alone. Most `push_au/5` calls return without
-  running the model — the sampler is not due, or the motion gate replayed the
-  last pass — and a call that only decoded costs nothing like one that inferred,
-  so a latency or a throughput taken over every call describes the sampler
-  rather than the accelerator.
+  Both are measured on **completed** model passes alone. Most `push_au/5` calls
+  return without running the model — the sampler is not due, or the motion gate
+  replayed the last pass — and a call that only decoded costs nothing like one
+  that inferred, while a failed pass had no accelerator in it either. A latency
+  or a throughput taken over every call describes the sampler and the failure
+  rate rather than the accelerator.
   """
 
   use GenServer
@@ -255,9 +256,9 @@ defmodule Cairn.Native.Host do
     {:reply, state.health, state}
   end
 
-  # The health window is per camera and counts work the engine really did, so a
-  # completion is taken whichever open it belonged to; only the reports that act
-  # on stream identity are gated on the token (`note_error/5`).
+  # A completed pass is the engine's work whichever open it belonged to, so the
+  # window takes it untokened; only the reports that act on stream identity are
+  # gated on the token (`note_error/5`).
   @impl true
   def handle_info({:inference, camera_id, _token, {:passes, passes, micros}}, state) do
     {:noreply, record(state, camera_id, passes, &sampled(&1, micros, passes))}
@@ -266,9 +267,10 @@ defmodule Cairn.Native.Host do
   def handle_info({:inference, camera_id, token, {:error, reason, message}}, state) do
     # A failed pass has no latency worth a p50 and is not an inference the status
     # surface should report as one; what it is, is this stream's evidence against
-    # itself (`classify/2`). The window still counts it as work returned
-    # (`run_health_check/1`), so that a stream doing nothing but erroring reaches
-    # the cross-stream verdict instead of reading as silence.
+    # itself (`classify/2`). The window counts it as traffic but never as work
+    # retired (`run_health_check/1`): a stream doing nothing but erroring has to
+    # reach the cross-stream verdict rather than read as silence, and must not be
+    # able to stand in for an accelerator that is completing passes.
     state = record(state, camera_id, 0, &%{&1 | errors: &1.errors + 1})
     {:noreply, note_error(state, camera_id, token, reason, message)}
   end
@@ -630,9 +632,12 @@ defmodule Cairn.Native.Host do
   end
 
   # The three-way discrimination the D-M3 risk row asks for, plus the fourth
-  # state saturation makes real. Every count below is of **model passes**: a call
-  # the sampler or the motion gate answered without one says nothing about an
-  # accelerator, so it is neither evidence of health nor of its absence.
+  # state saturation makes real. Nothing below counts a call the sampler or the
+  # motion gate answered without a model pass: it says nothing about an
+  # accelerator, so it is neither evidence of health nor of its absence. What is
+  # left is counted twice over, because the two decisions want different things —
+  # `traffic` (passes and failures alike) is whether anything is happening at
+  # all, `retired` (completed passes) is whether the accelerator is executing.
   #
   #   * no pass came back, failed or otherwise -> :idle. No opinion, and it must
   #     not read as health. A camera whose gate is legitimately skipping
@@ -649,14 +654,21 @@ defmodule Cairn.Native.Host do
   #     verdict drawn over part of the traffic is drawn on insufficient
   #     evidence, and the expensive direction is the false page.
   #   * every stream with traffic failing or slow -> the accelerator. Slow is
-  #     only a wedge if throughput says so too: a saturated healthy session
-  #     still completes at accelerator rate, and a wedged one cannot beat the
-  #     CPU it fell back to.
+  #     only a wedge if retired throughput says so too: a saturated healthy
+  #     session still completes at accelerator rate, and a wedged one cannot
+  #     beat the CPU it fell back to. A stream that retires nothing contributes
+  #     nothing to that answer, however fast it is failing.
   defp run_health_check(state) do
     now = System.monotonic_time(:microsecond)
 
+    {retired, errors} =
+      Enum.reduce(state.window, {0, 0}, fn {_id, e}, {retired, errors} ->
+        {retired + e.count, errors + e.errors}
+      end)
+
     window = %{
-      completed: Enum.reduce(state.window, 0, fn {_id, e}, n -> n + e.count + e.errors end),
+      retired: retired,
+      traffic: retired + errors,
       # not a window count: a caller blocked inside the NIF is still registered
       # in every window it is stuck in
       stalled: length(stalled(inflight(state), state.checked_at)),
@@ -711,11 +723,11 @@ defmodule Cairn.Native.Host do
     end)
   end
 
-  defp verdict(%{engine_state: :ready}, %{completed: 0, stalled: stalled}, _streams)
+  defp verdict(%{engine_state: :ready}, %{traffic: 0, stalled: stalled}, _streams)
        when stalled > 0,
        do: :wedged
 
-  defp verdict(%{engine_state: :ready}, %{completed: 0}, _streams), do: :idle
+  defp verdict(%{engine_state: :ready}, %{traffic: 0}, _streams), do: :idle
 
   defp verdict(%{engine_state: :ready} = state, window, streams) do
     cond do
@@ -759,9 +771,15 @@ defmodule Cairn.Native.Host do
   # every caller waits behind the others, so the p50 is queueing time, but the
   # session still retires work at accelerator rate. A wedged session cannot —
   # its ceiling is the CPU's.
+  #
+  # Retired passes only, never `window.traffic`. A failed pass comes back at
+  # whatever rate the failure is raised at, with no accelerator anywhere in it,
+  # so one stream erroring in a tight loop would otherwise clear this floor on
+  # its own and report a wedge as saturation — suppressing the only alert a
+  # wedge has.
   defp accelerator_rate?(state, window) do
     cpu_rate = 1000 / baseline(state)
-    observed = window.completed * 1000 / window.elapsed_ms
+    observed = window.retired * 1000 / window.elapsed_ms
     observed >= min_ratio(state) * cpu_rate * @health_throughput_slack
   end
 

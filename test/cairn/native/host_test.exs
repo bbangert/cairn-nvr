@@ -498,8 +498,46 @@ defmodule Cairn.Native.HostTest do
       |> Enum.map(fn camera -> Task.async(fn -> push(host, camera, 10) end) end)
       |> Task.await_many(10_000)
 
-      assert Host.check_health(host) == :saturated
+      # saturation is a load problem, not a fault: it must not page
+      assert capture_log(fn -> assert Host.check_health(host) == :saturated end) == ""
       assert Host.status(host).stream_health == Map.new(ids, &{&1, :slow})
+    end
+
+    test "a stream's error volume cannot vouch for throughput", %{id: id} do
+      slow = id <> "_slow"
+      erroring = id <> "_err"
+
+      control(%{
+        push_au: fn
+          {:stream, ^slow}, _au, _pts, _time_base ->
+            Process.sleep(8)
+            {:ok, {[NativeStub.frame()], []}}
+
+          _stream, _au, _pts, _time_base ->
+            {:error, {:infer, "the model pass failed"}}
+        end
+      })
+
+      host = start_host(health(cpu_baseline_ms: 10.0))
+      {:ok, _epoch} = Host.open_stream(host, slow, %{})
+      {:ok, _epoch} = Host.open_stream(host, erroring, %{})
+
+      # start the window here, so it measures the burst and not the setup
+      Host.check_health(host)
+
+      # 8 ms a pass against a 10 ms baseline is under the D-P5 floor, and one
+      # serial caller sleeping 8 ms cannot exceed 125 passes a second against a
+      # 270 floor however many it makes. The 500 failures return at no cost at
+      # all, so their volume alone clears it many times over.
+      push(host, slow, 4)
+      push(host, erroring, 500)
+
+      log = capture_log(fn -> assert Host.check_health(host) == :wedged end)
+      assert log =~ "NPU health check FAILED"
+
+      status = Host.status(host)
+      assert status.stream_health == %{slow => :slow, erroring => :failing}
+      assert status.inferences == 4
     end
 
     test "one stream failing is that stream, not the accelerator", %{id: id} do
@@ -547,6 +585,22 @@ defmodule Cairn.Native.HostTest do
       push(host, other, 5)
 
       assert capture_log(fn -> assert Host.check_health(host) == :wedged end) =~ "FAILED"
+    end
+
+    test "an engine retiring nothing but errors is not silence", %{id: id} do
+      control(%{push_au: {:error, {:infer, "the model pass failed"}}})
+      host = start_host(health())
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+
+      push(host, id, 20)
+
+      # Nothing was retired — the count the throughput arithmetic runs on is 0 —
+      # and the window is still not silent, which is the only reason this reaches
+      # a cross-stream verdict at all rather than `:idle`'s no opinion.
+      log = capture_log(fn -> assert Host.check_health(host) == :wedged end)
+      assert log =~ "NPU health check FAILED"
+      assert Host.status(host).inferences == 0
+      assert Host.status(host).stream_health == %{id => :failing}
     end
 
     test "calls that go in and never come back are a wedge, not silence", %{id: id} do
