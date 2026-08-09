@@ -39,5 +39,6 @@ strip = true
 [dev-dependencies]
 # One compile-fail case, `tests/norm_box_invariant.rs`: `NormBox`'s field
 # privacy is a build-time guarantee and a `#[test]` cannot observe it. Not a
-# doctest, because this crate has no library target and doctests never run.
+# doctest, because `NormBox` is not on the library's public surface for a
+# doctest to name.
 trybuild = "1.0.118"

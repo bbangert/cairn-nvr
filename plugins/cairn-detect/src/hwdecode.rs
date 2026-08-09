@@ -22,6 +22,7 @@ use rsmpeg::ffi;
 use crate::decode::{cap_frame_size, source_size, Decoder, RgbScaler, Sampled};
 use crate::infer::{InputSize, InputSpec};
 use crate::motion::MotionConfig;
+use crate::note;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HwBackend {
@@ -186,16 +187,16 @@ impl HwDecoder {
         // that rather than a shape nothing will use.
         match declared_size(codecpar).map(|source| spec.resize.fit(spec.size, source).inner) {
             Some(target) => match backend.filter_spec(target) {
-                Some(filter) => eprintln!(
+                Some(filter) => note!(
                     "decoder: {backend} hardware ({}), sampled frames via \"{filter}\"",
                     codec.name().to_string_lossy()
                 ),
-                None => eprintln!(
+                None => note!(
                     "decoder: {backend} hardware ({}), frames land in system memory",
                     codec.name().to_string_lossy()
                 ),
             },
-            None => eprintln!(
+            None => note!(
                 "decoder: {backend} hardware ({}), graph built on the first frame",
                 codec.name().to_string_lossy()
             ),
@@ -325,11 +326,12 @@ impl Decoder for HwDecoder {
             // and we are scaling a full-resolution frame on the CPU.
             if !self.degraded && self.backend.scale_filter().is_some() {
                 self.degraded = true;
-                eprintln!(
+                note!(
                     "decoder: {} produced software frames; hardware decode degraded to \
                      full-resolution CPU scaling (check the codec profile and that this \
                      FFmpeg build has the {} hwaccel)",
-                    self.backend, self.backend
+                    self.backend,
+                    self.backend
                 );
             }
             return self.rgb.tensor_from(&frame, source).map(Some);

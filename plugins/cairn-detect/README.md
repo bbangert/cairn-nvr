@@ -245,7 +245,7 @@ Five rules, and where each one lives:
    the score of the detection they were copied from, so they cannot beat the
    host's `best_score` for that track and cannot bypass its publish throttle —
    the host would broadcast a track update for a frame nothing looked at.
-   (`emit::CameraState::last_dets`.)
+   (`emit::seeds_from`.)
 3. **A stream reset is inferred through, not seeded through.** The host
    suspends its live tracks at a reset and refuses a `"tracked"` object as
    proof any of them is back, so a seed cannot re-establish what the reset
@@ -1320,8 +1320,9 @@ through `trybuild`. `infer::geometry`'s `NormBox` keeps its inner box private so
 that `Projection::unproject` is the only way to obtain one, which is what makes a
 missed un-projection a type error rather than a box reported against the model's
 input rectangle. The case mounts the real `geometry.rs` and fails if that field
-is ever widened. It is a `trybuild` case and not a doctest because this crate has
-no library target, so doctests never run.
+is ever widened. It is a `trybuild` case and not a doctest because `geometry` is
+private inside `infer`: a doctest compiles against the library's public surface,
+where `NormBox` cannot be named at all.
 
 ## Implementation notes
 

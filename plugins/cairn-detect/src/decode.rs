@@ -38,6 +38,7 @@ use rsmpeg::UnsafeDerefMut;
 use crate::hwdecode::{HwBackend, HwDecoder};
 use crate::infer::{Fit, InputSize, InputSpec, Projection};
 use crate::motion::{GrayThumb, MotionConfig, MotionDetector, MotionVerdict};
+use crate::note;
 
 /// The clap default for `--sample-fps`, and nothing more: the decode
 /// thread's actual sample rate is whatever `--sample-fps` resolved to, which
@@ -218,16 +219,16 @@ pub fn open(
 ) -> Result<Box<dyn Decoder>> {
     let order = probe_order(kind);
     if order.is_empty() && kind != DecoderKind::Sw && kind != DecoderKind::Auto {
-        eprintln!("decoder {kind} is not available on this platform");
+        note!("decoder {kind} is not available on this platform");
     }
     for backend in order {
         match HwDecoder::open(backend, codecpar, spec, motion, sample_fps) {
             Ok(decoder) => return Ok(Box::new(decoder)),
-            Err(e) => eprintln!("hardware decoder {backend} unavailable: {e:#}"),
+            Err(e) => note!("hardware decoder {backend} unavailable: {e:#}"),
         }
     }
     if kind != DecoderKind::Sw {
-        eprintln!("no hardware decoder opened; falling back to software decode");
+        note!("no hardware decoder opened; falling back to software decode");
     }
     Ok(Box::new(SwDecoder::open(
         codecpar, spec, motion, sample_fps,
@@ -417,7 +418,7 @@ impl SwDecoder {
         cap_frame_size(&mut ctx);
         ctx.open(None).context("opening the decoder")?;
 
-        eprintln!("decoder: software ({})", codec.name().to_string_lossy());
+        note!("decoder: software ({})", codec.name().to_string_lossy());
         Ok(Self {
             ctx,
             rgb: RgbScaler::new(spec, motion, sample_fps)?,
@@ -493,10 +494,9 @@ fn pack_chw(plane: &[u8], stride: usize, fit: Fit, spec: InputSpec) -> Vec<f32> 
 
 /// The wall-clock gap between samples that `--sample-fps` asks for.
 ///
-/// A free function rather than inlined into [`run`] so the arithmetic is
-/// unit-testable without an `AVFormatContextInput` to drive the loop around
-/// it.
-fn sample_interval(sample_fps: u32) -> Duration {
+/// Public because [`run`] is not the only loop that paces on it: a second spelling
+/// of this arithmetic is a second sample rate.
+pub fn sample_interval(sample_fps: u32) -> Duration {
     // Integer nanos, not a float reciprocal: exact for every legal rate,
     // and identical to the old `from_secs_f64(1.0 / 5.0)` at the default.
     Duration::from_nanos(1_000_000_000 / u64::from(sample_fps))
@@ -579,7 +579,7 @@ pub fn run(
             })? {
                 dropped += 1;
                 if dropped.is_multiple_of(50) {
-                    eprintln!("inference behind: {dropped} samples skipped so far");
+                    note!("inference behind: {dropped} samples skipped so far");
                 }
             }
         }
@@ -590,11 +590,14 @@ pub fn run(
 fn note_error(count: &mut u64, what: &str, e: &impl fmt::Display) {
     *count += 1;
     if *count % 50 == 1 {
-        eprintln!("{what} error ({count} so far): {e}");
+        note!("{what} error ({count} so far): {e}");
     }
 }
 
-fn pts_90k(frame: &AVFrame, time_base: AVRational) -> i64 {
+/// A decoded frame's presentation time on the contract's 90 kHz clock. Public for
+/// the same reason [`sample_interval`] is: two derivations would date the same
+/// frame differently.
+pub fn pts_90k(frame: &AVFrame, time_base: AVRational) -> i64 {
     let pts = if frame.pts != ffi::AV_NOPTS_VALUE {
         frame.pts
     } else if frame.best_effort_timestamp != ffi::AV_NOPTS_VALUE {

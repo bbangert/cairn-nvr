@@ -1,11 +1,10 @@
 //! Frame-to-frame change measurement, on a grayscale thumbnail of the sampled
 //! frame.
 //!
-//! **This is the first place in the crate where one frame's picture outlives
-//! it.** Every stage above is a function of the frame in hand — a tensor, a
-//! projection, a detection list — and the state that does survive a frame
-//! elsewhere (`emit::CameraState`'s sequence counter and diagnostic tallies)
-//! is bookkeeping that never looked at a pixel. A [`MotionDetector`] remembers
+//! This is the only place in the crate where one frame's *picture* outlives it.
+//! The state that survives a frame elsewhere is model-derived or bookkeeping —
+//! `emit::CameraState`'s counters and its seed memory (`emit::seeds_from`) — and
+//! never looked at a pixel. A [`MotionDetector`] remembers
 //! a rolling average of the frames it has already seen, so it belongs to
 //! exactly one camera: it lives on that camera's decode thread, which is per
 //! camera in both modes by construction (one decode thread per process in

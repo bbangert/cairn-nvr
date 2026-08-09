@@ -1,0 +1,40 @@
+[package]
+name = "cairn-native"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[lib]
+name = "cairn_native"
+# The BEAM dlopens one shared object; nothing links this crate at build time.
+# The clip harness lives inside the crate (`src/clip.rs`) rather than under
+# `tests/` for the same reason — there is no rlib for an integration test to
+# link, and the stages it drives are crate-private on purpose.
+crate-type = ["cdylib"]
+
+[dependencies]
+# The stages themselves — decode, motion, gate, infer, embed. A path
+# dependency on the plugin's library target rather than a copy: the plugin and
+# the NIF disagreeing about what a frame means is the failure this whole crate
+# is shaped to avoid.
+cairn-detect = { path = "../cairn-detect" }
+rustler = { version = "0.38", features = ["derive"] }
+# Must match cairn-detect's feature selection exactly: rusty_ffmpeg's bindings
+# are generated per feature, and two crates asking for different ones do not
+# link.
+rsmpeg = { version = "0.18.0", default-features = false, features = ["ffmpeg7_1"] }
+anyhow = "1.0"
+# For `ValueEnum::from_str` on `BackendKind` and `DecoderKind`, which are the
+# plugin's clap enums: the config the host sends names the same values the
+# operator's `--backend`/`--decoder` flags do, parsed by the same code.
+clap = { version = "4.5", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# Tests only: the ndjson path hands its seeds over as a protocol line, so
+# comparing the two producers' output means parsing one of them.
+serde_json = "1.0"
+
+[profile.release]
+lto = "thin"
+strip = true

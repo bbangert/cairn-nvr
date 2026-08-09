@@ -1,12 +1,18 @@
 defmodule Cairn.Observation do
   @moduledoc """
-  One decoded observation line from a plugin: what was seen in one frame of
-  one camera's stream, with the timing and provenance the rest of the system
-  needs to place it.
+  What was seen in one frame of one camera's stream, with the timing and
+  provenance the rest of the system needs to place it.
 
-  Produced by `Cairn.PluginProtocol.decode_line/2` and completed by the port
-  that owns the plugin process (`camera_id`, `plugin_instance`, and — for v0
-  lines, which carry none of it — `epoch` and `observed_at`).
+  Two producers build these, and the struct is the contract between them:
+
+    * `Cairn.PluginProtocol.decode_line/2` from an external plugin's ndjson,
+      completed by the port that owns the plugin process (`camera_id`,
+      `plugin_instance`, and — for v0 lines, which carry none of it —
+      `epoch` and `observed_at`).
+    * `Cairn.Native.Observations` from the in-VM NIF's typed terms, where
+      there is no line and no plugin process: `sequence` and
+      `plugin_instance` are `nil`, and the byte-level revalidation the
+      ndjson path needs is deliberately absent (see that module).
 
   Timing has two qualities. A v1 line carries `observed_at` from the plugin,
   captured next to the frame it describes (`:source`); a v0 line has no time

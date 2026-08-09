@@ -9,9 +9,9 @@
 //! and no unit test, clippy lint or rustdoc check in this crate would notice,
 //! because the guarantee *is* the privacy.
 //!
-//! A `compile_fail` doctest cannot stand in for this: the crate has no library
-//! target, so `cargo test --doc` fails with "no library targets found" and
-//! doctests never run at all.
+//! A `compile_fail` doctest cannot stand in for this. `geometry` is private
+//! inside `infer`, so a doctest — which compiles against the crate's *public*
+//! surface — cannot name `NormBox` at all, let alone try to forge one.
 //!
 //! `trybuild` compiles the case under `tests/ui` as its own crate and compares
 //! the full compiler output against the recorded `.stderr`. Because the case

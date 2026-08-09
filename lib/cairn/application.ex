@@ -49,6 +49,10 @@ defmodule Cairn.Application do
       {Cairn.PluginGroupSupervisor, []},
       # Before the cameras that mint epochs into it
       {Cairn.StreamEpochs, []},
+      # After the epochs it announces under, before the cameras that open
+      # streams on it. One engine for the whole VM, so it is not in a camera's
+      # tree: a camera restart must not reload the model.
+      {Cairn.Native.Host, []},
       {Cairn.CameraSupervisor, []},
       {Cairn.Retention, []},
       {CairnWeb.WebRTC.Supervisor, []},

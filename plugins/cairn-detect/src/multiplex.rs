@@ -28,6 +28,7 @@ use crate::emit::{self, Publisher};
 use crate::gate::{self, Gate};
 use crate::infer::{self, Detector, Embedder, InputSpec, Labels, ScoreFloors, TrackFloorOverrides};
 use crate::motion::{self, MotionConfig, MotionOverrides};
+use crate::note;
 use crate::rtp;
 
 /// First wait after a stream drops, doubled up to [`REOPEN_MAX`].
@@ -199,11 +200,11 @@ fn stream_loop(
         failures += 1;
         if failures.is_multiple_of(10) || failures == 1 {
             match &outcome {
-                Ok(()) => eprintln!(
+                Ok(()) => note!(
                     "camera {}: stream ended ({failures} so far); reopening",
                     spec.id
                 ),
-                Err(e) => eprintln!(
+                Err(e) => note!(
                     "camera {}: stream down ({failures} so far): {e:#}; reopening",
                     spec.id
                 ),
@@ -424,7 +425,7 @@ impl<T> Iterator for Slots<'_, T> {
                     }
                 }
                 Err(_) => {
-                    eprintln!("camera slot {slot}: decode thread is gone");
+                    note!("camera slot {slot}: decode thread is gone");
                     self.live.remove(position);
                 }
             }

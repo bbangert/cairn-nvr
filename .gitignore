@@ -49,5 +49,9 @@ config.yml
 # Dialyzer PLTs
 /priv/plts/
 
+# The cairn-native cdylib, copied here from plugins/cairn-native/target/release
+# so `Cairn.Native`'s @on_load finds it. A build artifact, not a source file.
+/priv/native/
+
 # Claude Code working files (plans, reviews, solutions) — local only.
 .claude/

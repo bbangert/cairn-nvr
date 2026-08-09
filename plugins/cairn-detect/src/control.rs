@@ -30,6 +30,8 @@ use std::thread;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::note;
+
 /// A control line long enough to be a mistake rather than a message. The
 /// host's own lines are a few hundred bytes; past this the line is skipped
 /// instead of parsed. This bounds the parse, not the read — stdin is the
@@ -147,13 +149,8 @@ impl Streams {
             Control::Ignored => return,
         };
 
-        // The map moves first; the log line is written after the guard drops.
-        // `eprintln!` panics on a failed write, and stderr here is the host's
-        // append-redirect into a log file (ENOSPC, a rotated-away fd), so
-        // logging *before* the assignment would lose the very epoch it was
-        // announcing and freeze this camera on a retired one. A blocking
-        // write under the lock would also stall the inference thread, which
-        // takes the same lock once per frame.
+        // The map moves first, and the line is logged after the guard drops: this
+        // lock is taken once per frame by the inference thread.
         let announcement = {
             let mut epochs = self.lock();
             match epochs.get_mut(&camera_id) {
@@ -174,7 +171,7 @@ impl Streams {
         };
 
         if let Some(message) = announcement {
-            eprintln!("{message}");
+            note!("{message}");
         }
     }
 
@@ -207,7 +204,10 @@ pub fn spawn_reader(streams: Arc<Streams>) -> Result<()> {
             }))
             .is_err();
             let cause = if panicked { "panicked" } else { "stdin closed" };
-            eprintln!("control: control channel gone ({cause}), exiting so Cairn respawns us");
+            note!("control: control channel gone ({cause}), exiting so Cairn respawns us");
+            // Before `_exit`, which writes nothing: `note!` only queued that line,
+            // so the reason this process ended would die with it.
+            crate::log::drain();
             // `_exit`, not `process::exit`, because this fires on a thread while
             // the main thread may be anywhere — including inside onnxruntime's
             // session constructor. `spawn_reader` is called *before* the model
@@ -220,10 +220,10 @@ pub fn spawn_reader(streams: Arc<Streams>) -> Result<()> {
             //
             // `_exit` ends the process at the kernel and runs no user-space
             // teardown at all, which is what makes it safe from any thread at
-            // any time. Nothing is lost by skipping the flush: `emit::write_line`
+            // any time. Nothing buffered is lost by that: `emit::write_line`
             // flushes every protocol line as it writes it — the host is reading a
-            // pipe and a buffered detection is an undelivered one — and
-            // `eprintln!` is unbuffered.
+            // pipe and a buffered detection is an undelivered one — and the log
+            // queue behind [`crate::note!`] is drained just above.
             //
             // Non-zero: this is an abnormal end, and the host logs the status.
             //
@@ -248,7 +248,7 @@ pub fn read_loop(streams: &Streams, input: impl BufRead) {
         let line = match line {
             Ok(line) => line,
             Err(e) => {
-                eprintln!("control: stdin read failed: {e}");
+                note!("control: stdin read failed: {e}");
                 return;
             }
         };
@@ -257,7 +257,7 @@ pub fn read_loop(streams: &Streams, input: impl BufRead) {
             continue;
         }
         if line.len() > MAX_CONTROL_LINE {
-            eprintln!("control: skipping a {}-byte line", line.len());
+            note!("control: skipping a {}-byte line", line.len());
             continue;
         }
 
@@ -266,12 +266,12 @@ pub fn read_loop(streams: &Streams, input: impl BufRead) {
             Err(e) => {
                 malformed += 1;
                 if malformed.is_multiple_of(50) || malformed == 1 {
-                    eprintln!("control: malformed line ({malformed} so far): {e:#}");
+                    note!("control: malformed line ({malformed} so far): {e:#}");
                 }
             }
         }
     }
-    eprintln!("control: stdin closed");
+    note!("control: stdin closed");
 }
 
 #[cfg(test)]

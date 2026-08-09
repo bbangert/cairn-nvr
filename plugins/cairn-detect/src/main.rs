@@ -14,38 +14,13 @@
 //! Both directions of the protocol are live in both modes: detections go out
 //! on stdout, and Cairn's per-camera stream epochs come in on stdin
 //! ([`control`]). stdout carries protocol lines and nothing else — every
-//! diagnostic in this crate goes to stderr, where Cairn logs it.
+//! diagnostic, here and in the stages, goes to stderr where Cairn logs it.
 
-// `process::exit` runs atexit handlers and C++ static destructors, and off the
-// main thread that is a live hazard here: the control thread can fire while the
-// main thread is inside onnxruntime's session constructor, and C++ teardown over
-// a half-built session is the SIGSEGV that made `control::spawn_reader` use
-// `libc::_exit` instead — the reasoning is at that call site. Two later windows
-// have the same shape: `rtp::open_stream` retries for about a minute, and the
-// VAAPI/CUDA device creation after it. So the call is denied crate-wide rather
-// than left to one comment that nobody is obliged to read.
-//
-// Clippy's `exit` lint permits the call inside `fn main`, which is where this
-// crate's one legitimate exit lives, so the deny needs no `allow` anywhere. The
-// exemption goes by enclosing body, so a closure written inside `fn main` would
-// be exempt as well — `main` here is a six-line wrapper around `run` that
-// spawns nothing, and every thread in the crate starts in `run` or deeper,
-// where the lint bites.
-//
-// It is a `restriction`-group lint, hence allow-by-default, so `-D warnings`
-// does not enable it and this line is what turns it on.
+// The library's deny, repeated because this is a separate crate — see `lib.rs` for
+// why. Clippy exempts the call inside `fn main`, which is where this crate's one
+// legitimate exit lives; the exemption goes by enclosing body, so `main` here
+// spawns nothing.
 #![deny(clippy::exit)]
-
-mod control;
-mod decode;
-mod emit;
-mod gate;
-mod glibc_compat;
-mod hwdecode;
-mod infer;
-mod motion;
-mod multiplex;
-mod rtp;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -57,6 +32,8 @@ use clap::Parser;
 use crossbeam_channel::{bounded, Receiver};
 use rsmpeg::ffi;
 
+use cairn_detect::note;
+use cairn_detect::{control, decode, emit, gate, infer, motion, multiplex, rtp};
 use control::Streams;
 use decode::{DecoderKind, Sample};
 use emit::Publisher;
@@ -211,9 +188,14 @@ struct Args {
 }
 
 fn main() {
-    if let Err(e) = run() {
+    let failed = run().inspect_err(|e| {
         // Exit loudly: Cairn restarts us with jittered backoff.
-        eprintln!("fatal: {e:#}");
+        note!("fatal: {e:#}");
+    });
+    // On both paths, because `note!` only queues: a clean run has lines of its own
+    // still in flight.
+    cairn_detect::log::drain();
+    if failed.is_err() {
         std::process::exit(1);
     }
 }
@@ -287,7 +269,7 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
         qnn_options(args),
     )?;
     let embedder = open_embedder(args, &labels)?;
-    eprintln!(
+    note!(
         "cairn-detect up: cameras=[{}] {} {}",
         specs
             .iter()
@@ -381,7 +363,7 @@ fn run_single(args: &Args) -> Result<()> {
     )?;
     let input_spec = detector.input_spec();
     let embedder = open_embedder(args, &labels)?;
-    eprintln!(
+    note!(
         "cairn-detect up: camera={camera_id} udp={udp_port} {} {}",
         model_summary(args, &detector),
         embedder_summary(&embedder)
@@ -547,7 +529,7 @@ fn open_embedder(args: &Args, labels: &Labels) -> Result<Option<Embedder>> {
     };
     let embedder = Embedder::open(model, args.backend)?;
     if !labels.contains("person") {
-        eprintln!(
+        note!(
             "cairn-detect: --embedder-model is set but the label set has no \
              `person` entry; no detection will carry an embedding"
         );

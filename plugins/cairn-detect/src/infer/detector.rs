@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::emit::Det;
+use crate::note;
 
 use super::backend::onnxruntime::{OrtBackend, QnnBackend};
 use super::backend::{Backend, BackendKind, InputTensor, QnnOptions, SessionOptions};
@@ -73,7 +74,7 @@ impl LatencyWindow {
         }
         self.window.sort_unstable();
         let (p50, p95) = (self.percentile(50), self.percentile(95));
-        eprintln!(
+        note!(
             "infer latency: backend={kind} n={} p50={:.2}ms p95={:.2}ms (total {})",
             self.window.len(),
             p50.as_secs_f64() * 1000.0,
@@ -230,7 +231,7 @@ impl Detector {
                 let output = fit_output(self.profile.output, &shapes, self.input_size)
                     .with_context(|| format!("--model-profile {}", self.profile))?;
                 check_label_count(output.layout, labels, self.allow_label_mismatch)?;
-                eprintln!("output layout: {} (from first output)", output.layout);
+                note!("output layout: {} (from first output)", output.layout);
                 self.output = Some(output);
                 output
             }
