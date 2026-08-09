@@ -18,6 +18,9 @@ defmodule Cairn.Pipeline.InferSinkTest do
 
   @control NativeStub.control()
   @keyframe <<0, 0, 1, 0x67, 0x42, 0xC0, 0x1F, 0, 0, 1, 0x68, 0xCE, 0x3C, 0, 0, 1, 0x65, 0x88>>
+  # AUD then a non-IDR slice.
+  @interframe <<0, 0, 1, 0x09, 0x30, 0, 0, 1, 0x41, 0x9A, 0x02>>
+  @gop 15
   # The two tiers are carried, not consulted: what the sink owes the tracker is
   # this map back, unread.
   @policy %{
@@ -211,7 +214,9 @@ defmodule Cairn.Pipeline.InferSinkTest do
       {_actions, state} = playing(sink(ctx))
       {actions, state} = feed(state)
 
-      assert actions == [notify_parent: {:engine_fatal, :model_load}]
+      # No action at all, deliberately: parking is the whole effect, and the
+      # parent has nothing it could do with a notification.
+      assert actions == []
       assert state.engine == :dead
 
       # nothing is demanded any more, so no further AU can reach the dead engine
@@ -264,8 +269,14 @@ defmodule Cairn.Pipeline.InferSinkTest do
     setup ctx, do: Map.put(ctx, :host, start_host())
 
     defp branch(ctx, count, interval_ms \\ 0) do
-      buffers = for pts <- 1..count, do: %Buffer{payload: @keyframe, pts: pts}
+      branch_over(
+        ctx,
+        for(pts <- 1..count, do: %Buffer{payload: @keyframe, pts: pts}),
+        interval_ms
+      )
+    end
 
+    defp branch_over(ctx, buffers, interval_ms) do
       Testing.Pipeline.start_link_supervised!(
         spec: [
           child(:source, %Cairn.PushSource{buffers: buffers, interval_ms: interval_ms})
@@ -318,6 +329,49 @@ defmodule Cairn.Pipeline.InferSinkTest do
         {:pushed, at} -> flush_pushes([at | acc])
       after
         0 -> Enum.reverse(acc)
+      end
+    end
+
+    test "a detection per access unit, and not one per keyframe", ctx do
+      # The rate belongs to the crate, which CI has no library for, so the branch
+      # itself must impose no floor of its own. A gate reintroduced anywhere
+      # between the tee and the model can only admit keyframe-headed AUs — a
+      # stateful decoder needs its references — and shows up here as a fifteenth
+      # of the detections.
+      buffers =
+        for pts <- 1..900 do
+          %Buffer{payload: if(rem(pts, @gop) == 1, do: @keyframe, else: @interframe), pts: pts}
+        end
+
+      pipeline = branch_over(ctx, buffers, 1)
+      Process.sleep(1_000)
+
+      Testing.Pipeline.notify_child(pipeline, :picker, :stats)
+      assert_pipeline_notified(pipeline, :picker, {:stats, picker}, 5_000)
+      Testing.Pipeline.notify_child(pipeline, :infer, :stats)
+      assert_pipeline_notified(pipeline, :infer, {:stats, sink}, 5_000)
+      Testing.Pipeline.terminate(pipeline)
+
+      aus = picker.dropped + picker.emitted
+      keyframes = ceil(aus / @gop)
+      assert aus >= 200, "only #{aus} access units reached the picker: nothing is measured"
+
+      # Nothing here is slow, so nothing here has a reason to shed.
+      assert sink.pushed >= div(aus * 9, 10),
+             "#{sink.pushed} model offers from #{aus} access units " <>
+               "(#{keyframes} of them keyframes): something is thinning the branch"
+
+      # …and every one of them reached the tracker through the dispatch seam,
+      # which is the half a `pushed` counter cannot see.
+      assert detections_dispatched() >= sink.pushed - 1
+    end
+
+    defp detections_dispatched(count \\ 0) do
+      receive do
+        {:"$gen_cast", {:detections, _camera, _policy, _observation}} ->
+          detections_dispatched(count + 1)
+      after
+        0 -> count
       end
     end
 

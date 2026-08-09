@@ -148,13 +148,16 @@ defmodule Cairn.Pipeline.InferSink do
       {:ok, {frames, _ended_tracks}} ->
         observe(%{state | pushed: state.pushed + 1}, frames)
 
+      # The parent is deliberately not told: it could do nothing with it. This
+      # sink stops demanding, `Cairn.Native.Host` owns the engine's recovery,
+      # and the branch comes back with the pipeline that the next ffmpeg
+      # session builds.
       {:error, {reason, message}} when reason in @engine_fatal ->
         Logger.error(
           "camera #{state.camera.id}: detection stopped, engine is #{reason}: #{message}"
         )
 
-        {[notify_parent: {:engine_fatal, reason}],
-         %{state | engine: :dead, errors: state.errors + 1}}
+        {[], %{state | engine: :dead, errors: state.errors + 1}}
 
       {:error, {reason, _message}} when reason in @stream_fatal ->
         # The host has already dropped the handle; the next AU reopens.

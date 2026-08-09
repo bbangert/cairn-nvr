@@ -20,11 +20,12 @@
 //! CAIRN_NATIVE_SKIP_CLIP=1 cargo test
 //! ```
 //!
-//! `engine`'s `sample_fps` of 30 is a rate gate of 33 ms against a CPU pass that
-//! takes longer than that, so a tight [`feed`] paces itself and nearly every access
-//! unit costs a model pass — which is what makes these the slowest tests in the
-//! crate. Anything measuring the gate itself uses [`feed_at`] instead, where the
-//! instants are the test's own.
+//! A real model load and a real decode per access unit is what makes these the
+//! slowest tests in the crate. How many of those access units [`feed`] turns into
+//! model passes is a property of how fast this box infers — the gate's interval
+//! against the loop's own pace — so nothing here asserts a ratio off it. Anything
+//! measuring the gate itself uses [`feed_at`] instead, where the arrival instants
+//! are the test's own.
 
 use std::collections::HashMap;
 use std::ffi::CString;

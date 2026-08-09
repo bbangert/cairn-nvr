@@ -6,8 +6,19 @@
 //! The tolerated per-frame failures (a decode error mid-GOP, a frame that will
 //! not convert) are counted and skipped exactly as `cairn_detect::decode::run`
 //! skips them, and the rate is gated where `run` gates it — after the decoder,
-//! before the tensor. `Cairn.Pipeline.Picker` hands over every access unit it
-//! receives, so most calls decode and return nothing.
+//! before the tensor.
+//!
+//! That placement is only free while the caller keeps handing over access units
+//! at frame rate, and it is a requirement on the caller rather than something
+//! this crate can hold: `Cairn.Pipeline.Picker` holds one slot and
+//! `Cairn.Pipeline.InferSink` demands the next access unit only *after*
+//! [`Stream::push_au`] returns, so a call longer than about two frame periods
+//! sheds one — and a shed access unit costs detection everything to the next IDR.
+//! Measured on x86/ort at 30 fps (1080p, yolox_nano, `sample_fps` 5): a sampled
+//! call is 29 ms p50 and 40 ms at its worst against a 67 ms budget, nothing
+//! dropped. A slower pass, a larger frame or a faster camera is where the budget
+//! stops holding, and the symptom is silent — the achieved rate falls back
+//! toward the GOP rate with no error anywhere.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,6 +43,13 @@ use crate::observation::FrameObservations;
 /// fiftieth, as in `cairn_detect::decode::run`.
 const LOG_EVERY: u64 = 50;
 
+/// How many `receive_frame` calls one drain may make. Reordering completes a
+/// handful of frames per access unit, so the bound is never reached in practice —
+/// it is there because the drain keeps going past an error, and a decoder stuck
+/// answering `Err` would otherwise spin a dirty scheduler thread forever, which in
+/// this VM costs more than a lost access unit.
+const MAX_DRAIN: usize = 64;
+
 pub struct Stream {
     engine: Arc<Engine>,
     camera_id: String,
@@ -46,10 +64,14 @@ pub struct Stream {
     /// without an epoch setter — a fresh `Gate` opens the window on its own first
     /// sample.
     epoch: Option<String>,
-    /// The wall-clock gap `--sample-fps` asks for, and the instant the last model
-    /// pass was admitted at. Wall clock rather than pts, as in
-    /// [`cairn_detect::decode::run`]: the point is to cap how often the model
-    /// runs, and a burst of access units would otherwise fire several at once.
+    /// The wall-clock gap `--sample-fps` asks for, and the instant the last
+    /// sample was admitted at. Set before the tensor and before [`Gate::decide`],
+    /// so a sample the motion gate skips, or one that fails to convert, still
+    /// spends its interval — it is not "the last model pass".
+    ///
+    /// Wall clock rather than pts, as in [`cairn_detect::decode::run`]: the point
+    /// is to cap how often the model runs, and a burst of access units would
+    /// otherwise fire several at once.
     interval: Duration,
     last_sample: Option<Instant>,
     seeds: Seeds,
@@ -90,8 +112,8 @@ impl Stream {
     /// [`sampled_frame`]. The list is the host's shape, not a count.
     ///
     /// `now` paces the rate gate and dates [`Gate::decide`]'s linger, re-verify
-    /// and epoch-bypass windows — one instant for the whole call, so a decoder
-    /// emitting a burst still costs one sample.
+    /// and epoch-bypass windows — one instant for the whole call, so the gate's
+    /// decision and the gate's windows are dated consistently.
     pub fn push_au(
         &mut self,
         au: &[u8],
@@ -297,31 +319,36 @@ fn should_log(count: u64) -> bool {
 /// rest of its frames drained and dropped.
 ///
 /// Reordering completes several frames for one access unit, and [`Stream`]'s rate
-/// gate is one decision per call, so without this the burst would be sampled at
-/// whichever of its frames happened to be first past the interval. A dropped frame
-/// never reaches [`Decoder::to_tensor`], so the motion background never absorbs it
-/// either — one access unit stays at most one sample, which is the unit
+/// gate is one decision per call, so only the first is kept. A dropped frame never
+/// reaches [`Decoder::to_tensor`], so the motion background never absorbs it either
+/// — one access unit stays at most one sample, which is the unit
 /// [`cairn_detect::motion::MotionDetector`]'s calibration window counts in.
 ///
-/// Drained rather than left queued: `avcodec_send_packet` refuses the next packet
-/// while output is pending, and both [`Decoder`] implementations swallow that
-/// refusal as a lost access unit rather than reporting it.
+/// Drained rather than left queued, and the drain continues past a tolerated error:
+/// `avcodec_send_packet` refuses the next packet while output is pending, and
+/// `SwDecoder` and `HwDecoder` both swallow that refusal as a lost access unit
+/// rather than reporting it — a hole in the decoder's input that nobody declares,
+/// which the host's Picker cannot know to wait out an IDR for.
 ///
 /// The error is returned rather than logged because the count and its rate limit
 /// belong to the [`Stream`].
 fn sampled_frame(decoder: &mut dyn Decoder) -> (Option<AVFrame>, Option<anyhow::Error>) {
     let mut sampled = None;
-    loop {
+    let mut first_error = None;
+    for _ in 0..MAX_DRAIN {
         match decoder.receive_frame() {
             Ok(Some(frame)) => {
                 if sampled.is_none() {
                     sampled = Some(frame);
                 }
             }
-            Ok(None) => return (sampled, None),
-            Err(error) => return (sampled, Some(error)),
+            Ok(None) => break,
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
         }
     }
+    (sampled, first_error)
 }
 
 /// Open this stream's decoder against a bare H.264 stream description.
@@ -421,7 +448,12 @@ mod tests {
         per_packet: usize,
         pending: usize,
         tensors: usize,
+        /// Which frame of the burst `receive_frame` fails on, counted from zero.
         fail_after: Option<usize>,
+        /// Whether that failure is transient: a sticky one is what the drain's
+        /// bound exists for, a transient one is what it keeps draining past.
+        fail_once: bool,
+        calls: usize,
     }
 
     impl Decoder for Burst {
@@ -431,7 +463,11 @@ mod tests {
         }
 
         fn receive_frame(&mut self) -> anyhow::Result<Option<AVFrame>> {
-            if self.fail_after == Some(self.per_packet - self.pending) {
+            self.calls += 1;
+            if self.fail_after == Some(self.per_packet.saturating_sub(self.pending)) {
+                if self.fail_once {
+                    self.fail_after = None;
+                }
                 anyhow::bail!("the decoder gave up mid-burst");
             }
             if self.pending == 0 {
@@ -500,6 +536,45 @@ mod tests {
         let (frame, error) = sampled_frame(&mut decoder);
         assert!(frame.is_none());
         assert!(error.is_some());
+    }
+
+    /// The invariant [`sampled_frame`]'s doc rests on: an error must not leave
+    /// frames queued, because `avcodec_send_packet` then refuses the next access
+    /// unit and both production decoders swallow that refusal silently.
+    #[test]
+    fn the_drain_continues_past_a_tolerated_error_and_leaves_nothing_queued() {
+        let mut decoder = Burst {
+            per_packet: 3,
+            fail_after: Some(1),
+            fail_once: true,
+            ..Burst::default()
+        };
+        decoder
+            .send_packet(&packet_from(&[1, 2, 3], 0).unwrap())
+            .unwrap();
+
+        let (frame, error) = sampled_frame(&mut decoder);
+        assert_eq!(frame.expect("the first frame came before the error").pts, 1);
+        assert!(error.is_some(), "the tolerated error was swallowed");
+        assert_eq!(
+            decoder.pending, 0,
+            "frames left queued, so the next access unit is refused and lost"
+        );
+    }
+
+    #[test]
+    fn a_decoder_stuck_on_an_error_bounds_the_drain_instead_of_spinning() {
+        let mut decoder = Burst {
+            per_packet: 1,
+            fail_after: Some(0),
+            ..Burst::default()
+        };
+        decoder.send_packet(&packet_from(&[1], 0).unwrap()).unwrap();
+
+        let (frame, error) = sampled_frame(&mut decoder);
+        assert!(frame.is_none());
+        assert!(error.is_some());
+        assert_eq!(decoder.calls, MAX_DRAIN);
     }
 
     #[test]

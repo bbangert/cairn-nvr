@@ -143,17 +143,21 @@ defmodule CairnWeb.DashboardLive do
   # status whitelist is `state`/`detail`/`fps`, so no plugin line can carry one.
   # A plugin's `state` is a free string the contract forbids branching on, so it
   # is shown verbatim and coloured neutrally.
-  # Ahead of `health`, because the two answer different questions and only one
-  # of them is actionable here: a refused canary or an engine that never loaded
-  # reports `health: :idle` — truthfully, nothing is inferring — and an operator
-  # reading "Idle" would never learn the model was rejected.
-  defp detection_meta(%{"state" => "error"} = status) do
-    %{
-      label: "Detection failed",
-      color: "var(--hs-danger)",
-      icon: "error",
-      detail: status["detail"]
-    }
+  # `Cairn.Native.Status`'s `headline/1` derives most states from health —
+  # ready, idle, saturated, wedged — where either key tells the same story and
+  # health may answer. These are the ones it decides before health is consulted
+  # at all, so health must not answer for them: an engine that is refusing or
+  # still loading reports `health: :idle` truthfully (nothing is inferring), and
+  # an operator reading "Idle" would never learn why. A new headline state has
+  # to be classified here or it silently falls through to health.
+  @state_outranks_health %{
+    "error" => %{label: "Detection failed", color: "var(--hs-danger)", icon: "error"},
+    "starting" => %{label: "Starting", color: "var(--hs-fg-3)", icon: "hourglass_empty"}
+  }
+
+  defp detection_meta(%{"state" => state} = status)
+       when is_map_key(@state_outranks_health, state) do
+    @state_outranks_health |> Map.fetch!(state) |> Map.put(:detail, status["detail"])
   end
 
   defp detection_meta(%{"health" => health} = status) do

@@ -146,6 +146,22 @@ defmodule CairnWeb.DashboardLiveTest do
       refute html =~ "Idle"
     end
 
+    # The sibling of the failed-engine case: health is honestly `:unknown`
+    # while the model loads, and "Unknown" tells an operator nothing.
+    test "a loading engine outranks its health verdict too", %{conn: conn} do
+      html =
+        show(conn, %{
+          "state" => "starting",
+          "health" => "unknown",
+          "detail" => "the engine is still opening its model"
+        })
+
+      # The label is the discriminator — the detail rides both branches, and
+      # health would have labelled this "Unknown".
+      assert html =~ "Starting"
+      assert html =~ "still opening its model"
+    end
+
     # `state` is a free string in the plugin contract, which forbids branching
     # on it: a plugin's status is shown, never interpreted.
     test "a plugin's own status still renders, uncoloured", %{conn: conn} do
