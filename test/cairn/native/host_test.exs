@@ -70,13 +70,32 @@ defmodule Cairn.Native.HostTest do
       assert {:error, {:canary_failed, _message}} = Host.open_stream(host, id, %{})
     end
 
-    test "a skipped canary still loads the model" do
-      control(%{canary: {:skipped, :no_binary}})
+    test "an operator's deliberate bypass still loads the model" do
+      control(%{canary: {:skipped, :disabled}})
       host = start_host()
 
       assert_receive {:init, _config}
-      assert Host.status(host).canary == {:skipped, :no_binary}
+      assert Host.status(host).canary == {:skipped, :disabled}
       assert Host.status(host).engine == :ready
+    end
+
+    test "a missing plugin binary refuses the load rather than skipping the probe", %{id: id} do
+      log =
+        capture_log(fn ->
+          host =
+            start_host(
+              canary_module: Cairn.Native.Canary,
+              canary: [binary: "/nonexistent/cairn-detect"]
+            )
+
+          assert {:canary_failed, message} = Host.status(host).engine
+          assert message =~ "/nonexistent/cairn-detect"
+          assert {:error, {:canary_failed, _message}} = Host.open_stream(host, id, %{})
+        end)
+
+      # the whole point of the probe: nothing was loaded into this VM
+      refute_received {:init, _config}
+      assert log =~ "was NOT loaded in this VM"
     end
 
     test "no model configured leaves the host inert and up", %{id: id} do
@@ -123,7 +142,9 @@ defmodule Cairn.Native.HostTest do
       assert %{min_score: %{}, motion_json: nil, track_floor_json: nil, stream_epoch: ^epoch} =
                params
 
-      assert Host.push_au(host, id, <<1, 2, 3>>, 90, {1, 90_000}) == {:ok, {[], []}}
+      assert Host.push_au(host, id, <<1, 2, 3>>, 90, {1, 90_000}) ==
+               {:ok, {[NativeStub.frame()], []}}
+
       assert Host.status(host).streams == [id]
 
       assert Host.close_stream(host, id) == :ok
@@ -320,8 +341,104 @@ defmodule Cairn.Native.HostTest do
     defp slow_push(millis) do
       fn _stream, _au, _pts, _time_base ->
         Process.sleep(millis)
-        {:ok, {[], []}}
+        {:ok, {[NativeStub.frame()], []}}
       end
+    end
+
+    # One model pass every `gated + 1` calls, the rest replayed by the gate: the
+    # default sampler's shape on a stream whose frame rate is well above it.
+    defp gated_then_pass(gated, millis) do
+      calls = :counters.new(1, [])
+
+      fn _stream, _au, _pts, _time_base ->
+        n = :counters.get(calls, 1)
+        :counters.add(calls, 1, 1)
+
+        if rem(n, gated + 1) == gated do
+          Process.sleep(millis)
+          {:ok, {[NativeStub.frame()], []}}
+        else
+          {:ok, {[NativeStub.frame(false)], []}}
+        end
+      end
+    end
+
+    test "a call the model never ran on is not an inference", %{id: id} do
+      host = start_host(health())
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+
+      # the sampler not due: the call decoded and returned no frame at all
+      control(%{push_au: {:ok, {[], []}}})
+      push(host, id, 10)
+      # the motion gate: a frame, re-reporting the last real pass's objects
+      control(%{push_au: {:ok, {[NativeStub.frame(false)], []}}})
+      push(host, id, 10)
+
+      # 20 fast calls and not one model pass is no evidence about the
+      # accelerator, and must not read as health
+      assert Host.check_health(host) == :idle
+
+      status = Host.status(host)
+      assert status.inferences == 0
+      assert status.p50_ms == nil
+      assert status.stream_health == %{}
+    end
+
+    test "a gate skipping every frame is idle, and never becomes a wedge", %{id: id} do
+      control(%{push_au: {:ok, {[NativeStub.frame(false)], []}}})
+      host = start_host(health())
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+
+      push(host, id, 20)
+      assert Host.check_health(host) == :idle
+
+      # a second window of the same: nothing outstanding, so nothing to escalate
+      push(host, id, 20)
+      log = capture_log(fn -> assert Host.check_health(host) == :idle end)
+      refute log =~ "FAILED"
+    end
+
+    test "no-model calls cannot vouch for a model pass at CPU speed", %{id: id} do
+      # The pass itself is 8 ms against a 15 ms baseline — the D-P5 signature of
+      # an HTP that is not executing — in traffic whose p50 is 0 because nine
+      # calls in ten ran no model at all.
+      control(%{push_au: gated_then_pass(9, 8)})
+      host = start_host(health(cpu_baseline_ms: 15.0))
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+
+      push(host, id, 40)
+
+      log = capture_log(fn -> assert Host.check_health(host) == :wedged end)
+      assert log =~ "NPU health check FAILED"
+      assert Host.status(host).p50_ms >= 8.0
+      assert Host.status(host).inferences == 4
+    end
+
+    test "another camera's no-model traffic does not hide a hung call", %{id: id} do
+      gated = id <> "_gated"
+      caller = self()
+
+      control(%{
+        push_au: fn _stream, _au, _pts, _time_base ->
+          send(caller, :entered)
+          Process.sleep(:infinity)
+        end
+      })
+
+      host = start_host(health())
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+      {:ok, _epoch} = Host.open_stream(host, gated, %{})
+      spawn(fn -> Host.push_au(host, id, <<1>>, 0, {1, 90_000}) end)
+      assert_receive :entered, 1_000
+
+      assert Host.check_health(host) == :idle
+
+      # Calls that ran no model are not the engine retiring work, so they cannot
+      # stand in for the completions this window has none of.
+      control(%{push_au: {:ok, {[NativeStub.frame(false)], []}}})
+      push(host, gated, 10)
+
+      assert capture_log(fn -> assert Host.check_health(host) == :wedged end) =~ "FAILED"
     end
 
     test "no traffic at all is idle, not healthy", %{id: id} do

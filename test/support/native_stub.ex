@@ -34,7 +34,8 @@ defmodule Cairn.NativeStub do
   def push_au(stream, au, pts, time_base) do
     case control(:push_au, nil) do
       fun when is_function(fun, 4) -> fun.(stream, au, pts, time_base)
-      nil -> {:ok, {[], []}}
+      # a call the model ran on, which is the only kind the health check counts
+      nil -> {:ok, {[frame()], []}}
       result -> result
     end
   end
@@ -47,6 +48,15 @@ defmodule Cairn.NativeStub do
 
   @doc "The key every stub here reads its answers out of."
   def control, do: @control
+
+  @doc """
+  One frame of the shape `push_au/4` answers with.
+
+  `inferred: false` is the frame the motion gate replayed without running the
+  model, and no frame at all is the sampler not being due — the two returns
+  `Cairn.Native.Host` must not count as inferences.
+  """
+  def frame(inferred \\ true), do: %{pts: 0, observed_at_ms: 0, inferred: inferred, objects: []}
 
   defp notify(message) do
     case control(:test, nil) do

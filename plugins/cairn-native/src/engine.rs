@@ -69,6 +69,11 @@ pub struct Engine {
     /// the model lock, which is the only shape the frame path can produce.
     #[cfg(test)]
     panic_next: std::sync::atomic::AtomicBool,
+    /// Armed by [`Engine::panic_in_the_next_open`]. The open path's equivalent:
+    /// a panic between the registry claim and the [`crate::stream::Stream`] that
+    /// owns it, which only a decoder that blows up while being built produces.
+    #[cfg(test)]
+    panic_next_open: std::sync::atomic::AtomicBool,
 }
 
 impl Engine {
@@ -136,6 +141,8 @@ impl Engine {
             input_spec,
             #[cfg(test)]
             panic_next: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            panic_next_open: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -199,6 +206,26 @@ impl Engine {
     pub fn panic_in_the_next_pass(&self) {
         self.panic_next
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Panic inside the *next* decoder open, where a driver actually can: after
+    /// the camera id is claimed and before any stream exists to hand it back.
+    #[cfg(test)]
+    pub fn panic_in_the_next_open(&self) {
+        self.panic_next_open
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Consume the arming above. Called from the decoder open itself, because
+    /// what is under test is where the unwind starts.
+    #[cfg(test)]
+    pub fn panic_if_armed_for_open(&self) {
+        if self
+            .panic_next_open
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("the decoder exploded while opening");
+        }
     }
 }
 

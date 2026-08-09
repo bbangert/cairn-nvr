@@ -292,6 +292,40 @@ fn one_camera_holds_one_stream_and_gets_it_back_when_it_closes() {
     .is_ok());
 }
 
+/// The window between the claim and the stream that owns it. A decoder that
+/// panics while it is being built leaves no [`Stream`] for the unwind to drop,
+/// so the id has to come back on its own — otherwise one panicked open refuses
+/// that camera as a duplicate for the life of the engine.
+#[test]
+fn a_panic_while_the_decoder_opens_hands_the_camera_id_back() {
+    let Some(artifacts) = artifacts() else {
+        return;
+    };
+    let engine = engine(&artifacts);
+
+    engine.panic_in_the_next_open();
+    let panicked = crate::guarded("open_stream", || {
+        Stream::open(
+            Arc::clone(&engine),
+            "front".into(),
+            params().resolve().unwrap(),
+        )
+        .map(|_| ())
+    });
+    assert_eq!(
+        panicked.unwrap_err().reason(),
+        "panicked",
+        "the open did not panic, so nothing below is being tested"
+    );
+
+    // …and the camera is openable, which is the whole of it: the host retries
+    // an open that failed, and a claim nothing released makes every retry a
+    // duplicate.
+    let clip = read_clip(&artifacts.clip);
+    let mut reopened = open(&engine, "front");
+    assert!(!feed(&mut reopened, &clip).is_empty());
+}
+
 /// The 2.2 claim, on real streams: a camera that is producing nothing the
 /// decoder can use must cost its neighbours nothing.
 #[test]

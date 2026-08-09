@@ -268,7 +268,8 @@ fn close_stream(stream: ResourceArc<StreamRef>) -> Result<bool> {
 ///
 /// This covers the NIF bodies and nothing else. A resource destructor is called
 /// from C too and is *not* routed through here — rustler does not wrap it — so
-/// [`teardown`] carries the same prohibition on its own.
+/// [`teardown`] carries the same prohibition, and its own guard against the one
+/// thing on that path that can raise: a `Drop` this crate does not own.
 ///
 /// Whatever lock a panicking body was holding stays poisoned, which is
 /// deliberate: rather than run the stages over state nobody knows the shape of,

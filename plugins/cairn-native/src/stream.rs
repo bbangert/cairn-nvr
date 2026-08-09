@@ -69,19 +69,10 @@ pub struct Stream {
 
 impl Stream {
     pub fn open(engine: Arc<Engine>, camera_id: String, params: StreamParams) -> Result<Self> {
-        engine.register(&camera_id)?;
-        let decoder = match open_decoder(&engine, params.motion) {
-            Ok(decoder) => decoder,
-            Err(error) => {
-                // The id is claimed before the decoder because the claim is
-                // what makes a duplicate open cheap to refuse; a failed open
-                // has to hand it back or the camera can never be opened again.
-                engine.release(&camera_id);
-                return Err(error);
-            }
-        };
+        let claim = Claim::take(&engine, &camera_id)?;
+        let decoder = open_decoder(&engine, params.motion)?;
 
-        Ok(Self {
+        let stream = Self {
             interval: decode::sample_interval(engine.sample_fps),
             engine,
             camera_id,
@@ -95,7 +86,11 @@ impl Stream {
             decode_errors: 0,
             tensor_errors: 0,
             unbounded_pts: 0,
-        })
+        };
+        // Not one line earlier: from here the claim is the stream's, and
+        // between the two lines there is nothing but moves.
+        claim.handed_to(&stream);
+        Ok(stream)
     }
 
     /// Feed one access unit and take whatever frames it completed.
@@ -232,6 +227,60 @@ impl Drop for Stream {
     }
 }
 
+/// A camera id claimed in the engine's registry with no [`Stream`] yet holding
+/// it.
+///
+/// The claim is taken before the decoder because it is what makes a duplicate
+/// open cheap to refuse, so there is a window where the id is spoken for and
+/// [`Stream`]'s `Drop` — which is what normally hands it back — does not exist.
+/// A failed open has to release it or that camera is refused as a duplicate for
+/// the life of the engine, and *returning* an error is not the only way out of
+/// that window: in-VM, decoder setup can panic, and the NIF's `catch_unwind`
+/// then answers `panicked` with nothing having been constructed to drop. This
+/// releases on either, and stops only when [`Self::handed_to`] names the stream
+/// that took over.
+///
+/// It owns its copies of both rather than borrowing the caller's, so the
+/// disarming can come after the `Stream` has consumed them — that is what makes
+/// the guarded window cover the whole construction and not merely most of it.
+struct Claim {
+    engine: Arc<Engine>,
+    camera_id: String,
+    armed: bool,
+}
+
+impl Claim {
+    /// Claim `camera_id`, or refuse. Armed after the claim and never before: a
+    /// refusal means *another* stream holds that id, and releasing on the way
+    /// out would hand a live camera's claim back.
+    fn take(engine: &Arc<Engine>, camera_id: &str) -> Result<Self> {
+        let mut claim = Self {
+            engine: Arc::clone(engine),
+            camera_id: camera_id.to_string(),
+            armed: false,
+        };
+        claim.engine.register(&claim.camera_id)?;
+        claim.armed = true;
+        Ok(claim)
+    }
+
+    /// The claim is now `stream`'s, whose `Drop` releases it.
+    ///
+    /// Takes the stream it was handed to so that disarming is impossible to
+    /// write before there is something to hand it to.
+    fn handed_to(mut self, _stream: &Stream) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if self.armed {
+            self.engine.release(&self.camera_id);
+        }
+    }
+}
+
 /// What this stream's next gated frame will re-report.
 ///
 /// The rule for turning a model pass into seeds is
@@ -293,6 +342,8 @@ fn should_log(count: u64) -> bool {
 /// the hardware one builds its filter graph on the first frame when the
 /// declared size is missing.
 fn open_decoder(engine: &Engine, motion: Option<MotionConfig>) -> Result<Box<dyn Decoder>> {
+    #[cfg(test)]
+    engine.panic_if_armed_for_open();
     let mut codecpar = AVCodecParameters::new();
     // SAFETY: `codecpar` is our own freshly allocated parameters struct, and
     // both fields are plain enums with no ownership.

@@ -27,7 +27,12 @@ defmodule Cairn.Native.Canary do
 
   A failure is whatever the process said on the way out: it exits non-zero with
   `fatal: …` on stderr for a model that will not open, which is the message the
-  operator needs and `Cairn.Native.Host` refuses to load anything on.
+  operator needs and `Cairn.Native.Host` refuses to load anything on. A binary
+  that is not there is a failure too, and for the same reason: the rehearsal is
+  what makes an in-VM load survivable, so a packaging or `PATH` mistake must
+  refuse the load rather than quietly perform it unrehearsed. Loading without a
+  probe stays possible, but only as something an operator asked for
+  (`enabled: false`).
   """
 
   alias Cairn.Native.Config
@@ -43,7 +48,7 @@ defmodule Cairn.Native.Canary do
   # stdout interleaved, and the useful part is always the tail.
   @tail_lines 20
 
-  @type result :: :ok | {:skipped, atom()} | {:error, String.t()}
+  @type result :: :ok | {:skipped, :disabled} | {:error, String.t()}
 
   # One callback is all `Cairn.Native.Host`'s `:canary_module` seam is, and it is
   # enough that a stub which no longer answers what the host asks fails at
@@ -56,13 +61,12 @@ defmodule Cairn.Native.Canary do
   @doc """
   Options:
 
-    * `:enabled` — `false` skips the probe outright (tests, and an operator who
-      has other reasons to trust the model).
+    * `:enabled` — `false` skips the probe outright. It is the only way to load
+      a model that was never rehearsed, so it is something to be asked for
+      rather than fallen into.
     * `:binary` — path to `cairn-detect`. Falls back to
       `config :cairn, Cairn.Native.Canary, binary: …` and then to `cairn-detect`
-      on `PATH`. Absent everywhere, the probe is skipped: an installation
-      without the plugin binary is a supported one and refusing to start there
-      would be worse than not rehearsing.
+      on `PATH`. Absent everywhere is an error, not a skip.
     * `:timeout_ms` — a QNN HTP graph compile is multiple seconds and a cold
       one can be tens; the default is #{@timeout_ms} ms.
   """
@@ -71,17 +75,31 @@ defmodule Cairn.Native.Canary do
     cond do
       Keyword.get(opts, :enabled, true) == false -> {:skipped, :disabled}
       binary = binary(opts) -> run(binary, config, opts)
-      true -> {:skipped, :no_binary}
+      true -> {:error, no_binary(opts)}
     end
   end
 
   defp binary(opts) do
-    path =
-      Keyword.get(opts, :binary) ||
-        Application.get_env(:cairn, __MODULE__, [])[:binary] ||
-        System.find_executable("cairn-detect")
-
+    path = configured(opts)
     if is_binary(path) and File.exists?(path), do: path
+  end
+
+  # First path named wins even if it is not there, rather than falling through to
+  # `PATH`: an installation that says where its binary is has said which binary
+  # it means, and probing a different one would rehearse the wrong load.
+  defp configured(opts) do
+    Keyword.get(opts, :binary) ||
+      Application.get_env(:cairn, __MODULE__, [])[:binary] ||
+      System.find_executable("cairn-detect")
+  end
+
+  defp no_binary(opts) do
+    tried = configured(opts) || "cairn-detect (nowhere on PATH)"
+
+    "the probe load cannot run: no cairn-detect binary at #{tried}. Install it, or point " <>
+      "`config :cairn, Cairn.Native.Canary, binary: \"/path/to/cairn-detect\"` at it. Setting " <>
+      "`enabled: false` there loads the model in this VM with no rehearsal, which is a crash " <>
+      "of the whole node if it goes wrong"
   end
 
   # The port belongs to a linked process that traps exits *before* it opens

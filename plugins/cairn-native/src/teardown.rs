@@ -31,18 +31,39 @@ type Discarded = Box<dyn Send + 'static>;
 /// the value is dropped inline instead: slow on the caller, which is the whole
 /// problem this avoids, but a leak or an unwind into the emulator is worse.
 ///
-/// **Nothing in here may panic.** A destructor is called from C, and rustler
+/// **Nothing in here may unwind.** A destructor is called from C, and rustler
 /// does not wrap it in [`catch_unwind`] the way it wraps a NIF body, so an
-/// unwind out of this function reaches the C boundary and aborts the node.
+/// unwind out of this function reaches the C boundary and aborts the node. The
+/// only thing here that can raise is a `Drop`, which is arbitrary code this
+/// module does not own, so every drop it performs goes through
+/// [`drop_swallowing_panics`] — the two inline fallbacks below as much as the
+/// worker's, since it is the fallbacks that run on the destructor's own thread.
 pub fn defer<T: Send + 'static>(value: T) {
-    match queue() {
+    defer_to(queue(), value)
+}
+
+/// [`defer`]'s body over an arbitrary queue, so a test can stage both inline
+/// fallbacks: a worker that is gone (`Some`, but the receiver has hung up) and a
+/// thread that never started (`None`).
+fn defer_to<T: Send + 'static>(queue: Option<&Sender<Discarded>>, value: T) {
+    match queue {
         Some(queue) => {
             if let Err(SendError(orphan)) = queue.send(Box::new(value)) {
-                drop(orphan);
+                drop_swallowing_panics(orphan);
             }
         }
-        None => drop(value),
+        None => drop_swallowing_panics(value),
     }
+}
+
+/// Run one `Drop`, absorbing an unwind out of it.
+///
+/// Swallowed rather than reported: the alternatives on this path are an abort
+/// (from a destructor) or ending the worker thread, and there is nothing to
+/// report *to* — a payload from a driver-side teardown names nothing the
+/// operator can act on, and the caller is a C frame with no error channel.
+fn drop_swallowing_panics<T>(value: T) {
+    let _ = catch_unwind(AssertUnwindSafe(move || drop(value)));
 }
 
 /// The teardown thread's inbox, started on the first handle to be collected.
@@ -62,7 +83,7 @@ fn queue() -> Option<&'static Sender<Discarded>> {
                         // A panicking `Drop` must not end the thread: the next
                         // handle the BEAM collected would then be dropped on
                         // its scheduler, which is what this exists to prevent.
-                        let _ = catch_unwind(AssertUnwindSafe(move || drop(value)));
+                        drop_swallowing_panics(value);
                     }
                 })
                 .ok()
@@ -129,16 +150,33 @@ mod tests {
         assert!(!threads.contains(&std::thread::current().id()));
     }
 
+    struct Explodes;
+
+    impl Drop for Explodes {
+        fn drop(&mut self) {
+            panic!("teardown exploded");
+        }
+    }
+
+    /// Neither inline fallback may unwind. `defer` is called from a resource
+    /// destructor, which C called and rustler did not wrap, so an unwind out of
+    /// either of these does not fail a call — it aborts the node.
+    #[test]
+    fn a_panicking_drop_does_not_unwind_out_of_either_fallback() {
+        // the worker is gone: the send fails and the orphan comes back
+        let (sender, receiver) = mpsc::channel::<Discarded>();
+        drop(receiver);
+        let orphaned = catch_unwind(AssertUnwindSafe(|| defer_to(Some(&sender), Explodes)));
+        assert!(orphaned.is_ok(), "the orphaned value unwound into C");
+
+        // …and the thread never started, so there is nothing to send to
+        let inline = catch_unwind(AssertUnwindSafe(|| defer_to(None, Explodes)));
+        assert!(inline.is_ok(), "the inline drop unwound into C");
+    }
+
     /// A `Drop` that panics costs its own teardown and nothing after it.
     #[test]
     fn a_panicking_drop_does_not_take_the_thread_with_it() {
-        struct Explodes;
-        impl Drop for Explodes {
-            fn drop(&mut self) {
-                panic!("teardown exploded");
-            }
-        }
-
         defer(Explodes);
 
         let (sink, dropped) = sync_channel(1);
