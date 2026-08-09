@@ -46,7 +46,8 @@ defmodule CairnWeb.DashboardLive do
   }
 
   # `Cairn.Native.Health`'s verdicts. Distinct on purpose: a wedge is an operator
-  # alert no restart clears, saturation is load to shed, and idle is idle.
+  # alert a restart is not expected to clear, saturation is load to shed, and
+  # idle is idle.
   @health_meta %{
     "healthy" => %{label: "Detecting", color: "var(--hs-success)", icon: "visibility"},
     "not_applicable" => %{label: "Detecting", color: "var(--hs-fg-3)", icon: "visibility"},
@@ -142,6 +143,19 @@ defmodule CairnWeb.DashboardLive do
   # status whitelist is `state`/`detail`/`fps`, so no plugin line can carry one.
   # A plugin's `state` is a free string the contract forbids branching on, so it
   # is shown verbatim and coloured neutrally.
+  # Ahead of `health`, because the two answer different questions and only one
+  # of them is actionable here: a refused canary or an engine that never loaded
+  # reports `health: :idle` — truthfully, nothing is inferring — and an operator
+  # reading "Idle" would never learn the model was rejected.
+  defp detection_meta(%{"state" => "error"} = status) do
+    %{
+      label: "Detection failed",
+      color: "var(--hs-danger)",
+      icon: "error",
+      detail: status["detail"]
+    }
+  end
+
   defp detection_meta(%{"health" => health} = status) do
     @health_meta
     |> Map.get(health, @health_meta["unknown"])

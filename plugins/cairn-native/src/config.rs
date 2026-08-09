@@ -23,9 +23,10 @@ use crate::error::{NativeError, Result};
 
 /// The `--sample-fps` range, restated from `main.rs`'s
 /// `value_parser!(u32).range(1..=30)` because clap owns it there and there is no
-/// argv here. On this path the value only sizes the motion detector's calibration
+/// argv here. The value sizes [`crate::stream::Stream`]'s rate-gate interval
+/// (`decode::sample_interval`) as well as the motion detector's calibration
 /// window (`CALIBRATION_SECONDS * sample_fps` frames), so a zero that reached the
-/// stages would leave the gate with no calibration at all.
+/// stages would be a division by zero on the frame path.
 const SAMPLE_FPS: std::ops::RangeInclusive<u32> = 1..=30;
 
 /// Per-VM model config: the term shape. Every key is required — `nil` is how the

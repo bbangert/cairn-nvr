@@ -41,7 +41,7 @@ defmodule Cairn.Native.Status do
   # plugin's could not.
   @max_detail_bytes 256
 
-  @wedged_detail "A restart will not clear this — a wedged accelerator survives kill -9 " <>
+  @wedged_detail "A restart is not expected to clear this — NPU state survives kill -9 " <>
                    "(spike 0.5) and every restart above it; the board needs an operator."
 
   @saturated_detail "The accelerator is retiring work at full rate but cannot keep up: " <>

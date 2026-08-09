@@ -129,6 +129,23 @@ defmodule CairnWeb.DashboardLiveTest do
       assert html =~ "the canary refused m.onnx: SIGSEGV"
     end
 
+    # The case that motivated the precedence: nothing is inferring, so `health`
+    # is honestly `idle` — and an operator reading "Idle" would never learn the
+    # canary had refused the model.
+    test "a failed engine outranks its health verdict", %{conn: conn} do
+      html =
+        show(conn, %{
+          "state" => "error",
+          "health" => "idle",
+          "detail" => "the canary refused m.onnx: SIGSEGV — the model was NOT loaded in this VM"
+        })
+
+      assert html =~ "Detection failed"
+      assert html =~ "var(--hs-danger)"
+      assert html =~ "the canary refused m.onnx: SIGSEGV"
+      refute html =~ "Idle"
+    end
+
     # `state` is a free string in the plugin contract, which forbids branching
     # on it: a plugin's status is shown, never interpreted.
     test "a plugin's own status still renders, uncoloured", %{conn: conn} do

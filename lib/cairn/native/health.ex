@@ -36,8 +36,9 @@ defmodule Cairn.Native.Health do
   Both are measured on completed model passes alone — a call the motion gate
   skipped never reached the accelerator, and neither did a failed pass.
 
-  A wedge is one operator alert per transition and never a restart: a wedged HTP
-  survives `kill -9` and every restart above it (spike 0.5).
+  A wedge is one operator alert per transition and never a restart: NPU state
+  survives `kill -9` and every restart above it (spike 0.5), so a wedge is
+  assumed to survive them too — the spike never reproduced one to check.
   """
 
   use GenServer
@@ -61,8 +62,9 @@ defmodule Cairn.Native.Health do
   # How many of one camera's latencies a window keeps; see `sampled/3`.
   @window 512
 
-  @no_restart "Restarting does not clear a wedged accelerator (spike 0.5: it survives kill -9), " <>
-                "so this host will not restart itself — the board needs an operator."
+  @no_restart "Restarting is not expected to clear a wedged accelerator (spike 0.5: NPU state " <>
+                "survives kill -9), so this host will not restart itself — the board needs an " <>
+                "operator."
 
   defstruct [
     :host,

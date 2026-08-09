@@ -50,7 +50,6 @@ defmodule Cairn.Pipeline.Picker do
     {[],
      %{
        pending: nil,
-       pending_keyframe?: false,
        expecting_keyframe?: true,
        demand: 0,
        dropped: 0,
@@ -88,8 +87,8 @@ defmodule Cairn.Pipeline.Picker do
     end
   end
 
-  defp keep(%{pending: nil} = state, buffer, keyframe?),
-    do: %{state | pending: buffer, pending_keyframe?: keyframe?, expecting_keyframe?: false}
+  defp keep(%{pending: nil} = state, buffer, _keyframe?),
+    do: %{state | pending: buffer, expecting_keyframe?: false}
 
   defp keep(state, buffer, keyframe?),
     do: keep(%{drop(state) | pending: nil}, buffer, keyframe?)
@@ -104,7 +103,6 @@ defmodule Cairn.Pipeline.Picker do
     state = %{
       state
       | pending: nil,
-        pending_keyframe?: false,
         demand: demand - 1,
         emitted: state.emitted + 1
     }
