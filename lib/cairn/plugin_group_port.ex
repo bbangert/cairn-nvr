@@ -15,8 +15,9 @@ defmodule Cairn.PluginGroupPort do
   Every detection line must carry `camera_id`; decoded by
   `Cairn.PluginProtocol.decode_line/2` (protocol v1 or the v0
   `{"camera_id", "pts", "dets"}` shape) it is routed as a
-  `Cairn.Observation` to `Cairn.CameraTracker` with that camera's
-  config and effective policy (event windows, tracking bounds and the
+  `Cairn.Observation` through `Cairn.Detect.Dispatch` — the seam it shares with
+  the in-VM detector — with that camera's config and effective policy (event
+  windows, tracking bounds and the
   `track:` / `record:` tiers) and with the `at_ms` the tracker decides on,
   derived from that member's own `Cairn.ObservationClock` — one per member,
   since each is a separate stream with its own pts. Lines for an unknown
@@ -49,6 +50,7 @@ defmodule Cairn.PluginGroupPort do
   require Logger
 
   alias Cairn.Config
+  alias Cairn.Detect.Dispatch
   alias Cairn.Observation
   alias Cairn.ObservationClock
   alias Cairn.PluginProtocol
@@ -517,18 +519,9 @@ defmodule Cairn.PluginGroupPort do
   # since one grapheme cluster can be arbitrarily long.
   defp preview(value), do: inspect(value, limit: 3, printable_limit: @id_preview)
 
-  # `:tracker` is a test seam: a process that receives the same
-  # `{:detections, …}` cast in place of the camera's own
-  # `Cairn.CameraTracker`. Absent (production) each member camera's batch goes
-  # to that camera's own tracker — one process per camera, not one per group.
+  # One tracker per member camera, never one per group.
   defp forward(state, cam, policy, observation) do
-    Cairn.CameraTracker.detections(
-      Keyword.get(state.opts, :tracker),
-      cam,
-      policy,
-      observation
-    )
-
+    Dispatch.forward(cam, policy, observation, state.opts)
     state
   end
 

@@ -56,6 +56,9 @@ defmodule Cairn.Application do
       # After the host, whose ETS tables it reads — and its own process, so that a
       # host inside a native call cannot stop the check that would report it.
       {Cairn.Native.Health, []},
+      # The health surface a plugin's own process provides on the classic path.
+      # Its own process for the same reason: it reads the host under a deadline.
+      {Cairn.Native.Status, []},
       {Cairn.CameraSupervisor, []},
       {Cairn.Retention, []},
       {CairnWeb.WebRTC.Supervisor, []},

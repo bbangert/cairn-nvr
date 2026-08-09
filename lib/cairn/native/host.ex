@@ -15,7 +15,7 @@ defmodule Cairn.Native.Host do
     * it does not judge its own health. `Cairn.Native.Health` does, from its own
       process, because this one can be inside a native call and a check running
       here cannot fire while it is. What is left here is answering that monitor's
-      probe (`probe/1`) and reporting its verdict (`status/1`, `check_health/1`).
+      probe (`probe/1`) and reporting its verdict (`status/2`, `check_health/1`).
 
   Nothing here exits: a missing library, an unconfigured model, a refused canary,
   a failed `init/1` and a dead engine are all states it reports. Nor does it sit
@@ -42,6 +42,7 @@ defmodule Cairn.Native.Host do
 
   require Logger
 
+  alias Cairn.Config.Server, as: ConfigServer
   alias Cairn.Native.Canary
   alias Cairn.Native.Config, as: NativeConfig
   alias Cairn.Native.Health
@@ -130,9 +131,16 @@ defmodule Cairn.Native.Host do
     end
   end
 
-  @doc "Everything an operator or a status surface needs to know."
-  @spec status(atom()) :: map()
-  def status(server \\ __MODULE__), do: GenServer.call(server, :status)
+  @doc """
+  Everything an operator or a status surface needs to know.
+
+  Answered from the same mailbox the synchronous native calls queue in, so a
+  caller that cannot afford to wait out one of those passes its own `timeout`
+  and reads the expiry as `Cairn.Native.Status` does — as the wedge itself.
+  """
+  @spec status(atom(), timeout()) :: map()
+  def status(server \\ __MODULE__, timeout \\ 5_000),
+    do: GenServer.call(server, :status, timeout)
 
   @doc """
   Load a model, or replace the one loaded.
@@ -140,11 +148,27 @@ defmodule Cairn.Native.Host do
   Canary first, then `init/1`, then every stream that was open is reopened on the
   epoch its media session is still running under — each behind its own close, so a
   close still stuck in the crate costs that one camera its reopen. Blocks for a
-  model load. This is the only recovery from an engine-fatal error.
+  model load. This is the only recovery from an engine-fatal error: the other
+  way in, `reconfigure/2`, does nothing for a config whose model has not moved,
+  and a dead engine's has not.
   """
   @spec configure(atom(), map() | keyword(), timeout()) :: {:ok, map()} | {:error, term()}
   def configure(server \\ __MODULE__, config, timeout \\ 300_000) do
     GenServer.call(server, {:configure, config}, timeout)
+  end
+
+  @doc """
+  Point the engine at the model a newly loaded `Cairn.Config` asks for.
+
+  A no-op unless that model actually changed — an engine reload closes every
+  stream and pays for a model load, which a reload that moved something else
+  entirely must not spend. Asynchronous because the caller is
+  `Cairn.Config.Server`, whose own reload must not wait on a model load; the
+  work is `configure/3`'s, canary included.
+  """
+  @spec reconfigure(GenServer.server(), Cairn.Config.t()) :: :ok
+  def reconfigure(server \\ __MODULE__, %Cairn.Config{} = config) do
+    GenServer.cast(server, {:reconfigure, config})
   end
 
   @doc "Run `Cairn.Native.Health`'s check now, returning its verdict."
@@ -205,11 +229,10 @@ defmodule Cairn.Native.Host do
   end
 
   def handle_call({:configure, config}, _from, state) do
-    open = state.streams
-    state = open_engine(close_streams(state), config)
+    state = reload_engine(state, config)
 
     case state.engine_state do
-      :ready -> {:reply, {:ok, status_map(state)}, reopen_streams(state, open)}
+      :ready -> {:reply, {:ok, status_map(state)}, state}
       other -> {:reply, {:error, other}, state}
     end
   end
@@ -219,6 +242,11 @@ defmodule Cairn.Native.Host do
   # Answered from the mailbox on purpose: it is the queue the synchronous native
   # calls above are in, so a reply is evidence that they are coming back.
   def handle_call(:probe, _from, state), do: {:reply, %{engine: state.engine_state}, state}
+
+  @impl true
+  def handle_cast({:reconfigure, config}, state) do
+    {:noreply, swap_model(state, configured_model(state, config))}
+  end
 
   @impl true
   def handle_info({:inference, camera_id, token, {:error, reason, message}}, state) do
@@ -273,11 +301,61 @@ defmodule Cairn.Native.Host do
 
   # -- engine lifecycle -------------------------------------------------------
 
-  # The seam for profile expansion: when it moves off argv, the model config still
-  # arrives as a plain map here and this is the one place that changes.
-  defp configured_model(state) do
-    Keyword.get(state.opts, :config) ||
-      Application.get_env(:cairn, __MODULE__, [])[:config]
+  # In precedence order: a `:config` opt, the application env, then the profile
+  # of whatever membrane camera the loaded config has. Only the third moves on a
+  # reload, so a node whose model is pinned by an opt or the env stays pinned
+  # through one.
+  defp configured_model(state, config \\ nil) do
+    with nil <- Keyword.get(state.opts, :config),
+         nil <- Application.get_env(:cairn, __MODULE__, [])[:config] do
+      profile_model(config || loaded_config(state))
+    end
+  end
+
+  defp profile_model(config) do
+    case Cairn.Config.native_model_config(config) do
+      {:ok, model} ->
+        model
+
+      # Refused at config load too (`Cairn.Config`'s `validate_native_model/2`),
+      # so reaching this is a config that never became the active one.
+      {:error, message} ->
+        Logger.error("cairn-native: " <> message)
+        nil
+    end
+  end
+
+  # Pulled once at startup rather than subscribed to: `Cairn.Config.Server`
+  # starts before this process and pushes every later config through
+  # `reconfigure/2`, which is the only path a *changed* profile takes.
+  defp loaded_config(state) do
+    Keyword.get(state.opts, :config_source, &ConfigServer.get/0).()
+  end
+
+  # `nil` is a config that says nothing about the model — an engine an opt or the
+  # env pinned, or a node whose last membrane camera has gone.
+  defp swap_model(state, nil), do: state
+
+  defp swap_model(state, raw) do
+    case NativeConfig.normalize(raw) do
+      {:ok, config} ->
+        if config == state.config, do: state, else: reload_engine(state, raw)
+
+      {:error, message} ->
+        # The running engine is kept: nothing about this reload reached it.
+        Logger.error("cairn-native: reloaded config is not usable: #{message}")
+        state
+    end
+  end
+
+  # Every stream that was open comes back, on the epoch its media session is
+  # still running under — but only behind a `:ready` engine, so a refused load
+  # leaves them closed rather than reopening them against nothing.
+  defp reload_engine(state, raw) do
+    open = state.streams
+    state = open_engine(close_streams(state), raw)
+
+    if state.engine_state == :ready, do: reopen_streams(state, open), else: state
   end
 
   defp open_engine(state, nil) do
@@ -667,7 +745,7 @@ defmodule Cairn.Native.Host do
         closing: Map.keys(state.closing)
       },
       # Read out of the monitor's table, never called for: this process must not
-      # wait on the one judging it, and `status/1` must answer before there has
+      # wait on the one judging it, and `status/2` must answer before there has
       # been a monitor at all.
       Health.snapshot(state.table)
     )

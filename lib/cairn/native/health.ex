@@ -76,7 +76,8 @@ defmodule Cairn.Native.Health do
     window: %{},
     completed: 0,
     health: :unknown,
-    stream_health: %{}
+    stream_health: %{},
+    stream_fps: %{}
   ]
 
   @type verdict :: :unknown | :not_applicable | :idle | :healthy | :saturated | :wedged
@@ -114,11 +115,12 @@ defmodule Cairn.Native.Health do
       [] -> empty()
     end
   rescue
-    # no monitor started yet, or one restarting: the Host still answers `status/1`
+    # no monitor started yet, or one restarting: the Host still answers `status/2`
     ArgumentError -> empty()
   end
 
-  defp empty, do: %{health: :unknown, stream_health: %{}, p50_ms: nil, inferences: 0}
+  defp empty,
+    do: %{health: :unknown, stream_health: %{}, stream_fps: %{}, p50_ms: nil, inferences: 0}
 
   # -- server -----------------------------------------------------------------
 
@@ -217,8 +219,9 @@ defmodule Cairn.Native.Health do
   defp finish(state, probe) do
     Process.cancel_timer(state.cycle.timer)
     now = System.monotonic_time(:microsecond)
+    window = window(state, now)
     per_stream = Map.new(state.window, fn {id, entry} -> {id, classify(state, entry)} end)
-    verdict = verdict(probe, state, window(state, now), per_stream)
+    verdict = verdict(probe, state, window, per_stream)
 
     state
     |> escalate(verdict, probe, per_stream)
@@ -228,6 +231,7 @@ defmodule Cairn.Native.Health do
       window: %{},
       health: verdict,
       stream_health: per_stream,
+      stream_fps: stream_fps(state.window, window.elapsed_ms),
       p50_ms: window_p50(state)
     })
     |> publish()
@@ -265,6 +269,7 @@ defmodule Cairn.Native.Health do
        %{
          health: state.health,
          stream_health: state.stream_health,
+         stream_fps: state.stream_fps,
          p50_ms: state.p50_ms,
          # model passes, not `push_au/5` calls: at 5 fps sampled off a 20 fps
          # camera the two differ by the frame rate
@@ -431,6 +436,12 @@ defmodule Cairn.Native.Health do
   end
 
   defp escalate(state, _verdict, _probe, _streams), do: state
+
+  # Completed model passes per second, per camera — the `fps` a plugin reports for
+  # itself, measured over the window that has just closed rather than since boot.
+  defp stream_fps(window, elapsed_ms) do
+    Map.new(window, fn {id, entry} -> {id, Float.round(entry.count * 1000 / elapsed_ms, 2)} end)
+  end
 
   defp window_p50(state) do
     case Enum.flat_map(state.window, fn {_id, entry} -> entry.samples end) do

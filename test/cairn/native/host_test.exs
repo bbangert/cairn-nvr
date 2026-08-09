@@ -38,7 +38,7 @@ defmodule Cairn.Native.HostTest do
     ]
 
     start_supervised!({Host, Keyword.merge(defaults, opts)}, id: name)
-    # Its own child, as in the supervisor: the host answers `status/1` with the
+    # Its own child, as in the supervisor: the host answers `status/2` with the
     # verdict, and never reaches one itself.
     start_supervised!({Health, Keyword.put(health, :host, name)}, id: Health.name(name))
 
@@ -444,6 +444,97 @@ defmodule Cairn.Native.HostTest do
       assert_receive {:open_stream, {:engine, "other.onnx"}, ^id, %{stream_epoch: ^minted}}
       assert_receive {:stream_epoch, ^id, ^minted, :started}
       assert StreamEpochs.current(id) == {:ok, minted}
+    end
+  end
+
+  describe "the model a profile asks for" do
+    @stub_onnx "test/support/fixtures/models/stub.onnx"
+
+    defp membrane_config(profile) do
+      {:ok, config, _warnings} =
+        Cairn.Config.from_map(%{
+          "data_dir" => "tmp/host_test",
+          "udp" => %{"base_port" => 17_000, "range" => 20},
+          "profile_dirs" => ["test/support/fixtures/profiles/argv"],
+          "plugins" => %{"det" => %{"command" => "./p", "profile" => profile}},
+          "cameras" => [
+            %{
+              "id" => "cam_a",
+              "rtsp_url" => "rtsp://h/1",
+              "pipeline" => "membrane",
+              "plugin" => "det"
+            }
+          ]
+        })
+
+      config
+    end
+
+    defp start_profiled(profile, opts \\ []) do
+      start_host(
+        Keyword.merge([config: nil, config_source: fn -> membrane_config(profile) end], opts)
+      )
+    end
+
+    test "is loaded when nothing pins one" do
+      host = start_profiled("full")
+
+      assert_receive {:canary, %{model: @stub_onnx, model_profile: "yolox"}, _opts}
+      assert_receive {:init, %{model: @stub_onnx, backend: "ort", input_size: "416"}}
+      assert Host.status(host).model == @stub_onnx
+    end
+
+    test "loses to a model pinned on this node" do
+      host = start_profiled("full", config: %{model: "pinned.onnx"})
+
+      assert_receive {:init, %{model: "pinned.onnx"}}
+      assert Host.status(host).model == "pinned.onnx"
+    end
+
+    test "reaches a running camera on reload, and does not rewrite its scene knobs", %{id: id} do
+      minted = StreamEpochs.new_epoch(id, :started)
+      host = start_profiled("partial")
+      assert_receive {:init, %{model_profile: nil}}
+
+      {:ok, ^minted} =
+        Host.open_stream(host, id, %{min_score: %{"person" => 0.8}, stream_epoch: minted})
+
+      assert_receive {:open_stream, _engine, ^id, _params}
+
+      Host.reconfigure(host, membrane_config("full"))
+
+      assert_receive {:close_stream, {:stream, ^id}}
+      assert_receive {:canary, %{model_profile: "yolox"}, _opts}
+      assert_receive {:init, %{model_profile: "yolox"}}
+
+      # the profile moved the model and nothing else: the reopened stream carries
+      # the operator's own scene config, on the epoch its media session is on
+      assert_receive {:open_stream, _engine, ^id,
+                      %{min_score: %{"person" => 0.8}, stream_epoch: ^minted}}
+    end
+
+    test "is left alone by a reload that did not move it", %{id: id} do
+      host = start_profiled("full")
+      assert_receive {:init, _config}
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+      assert_receive {:open_stream, _engine, ^id, _params}
+
+      Host.reconfigure(host, membrane_config("full"))
+
+      # a model reload costs every stream on this node its history
+      refute_receive {:init, _config}, 50
+      refute_receive {:close_stream, _stream}, 50
+      assert Host.status(host).streams == [id]
+    end
+
+    test "a reload cannot move a model this node pinned" do
+      host = start_profiled("partial", config: %{model: "pinned.onnx"})
+      assert_receive {:init, %{model: "pinned.onnx"}}
+
+      Host.reconfigure(host, membrane_config("full"))
+
+      refute_receive {:init, _config}, 50
+      assert Host.status(host).model == "pinned.onnx"
     end
   end
 end

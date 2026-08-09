@@ -19,6 +19,10 @@ defmodule Cairn.Pipeline.Camera do
   The tee carries AU-aligned Annex-B H.264 as the TS demuxer emits it; each
   branch owns its own format conversion (CMAF needs avc3 + per-AU keyframe
   metadata, which its parser stage adds).
+
+  Detections leave the sink for `Cairn.Detect.Dispatch` directly; this process
+  is on the reload path (a new policy, forwarded to the sink) but not on the
+  per-frame one.
   """
 
   use Membrane.Pipeline
@@ -28,9 +32,11 @@ defmodule Cairn.Pipeline.Camera do
 
   @impl true
   def handle_init(_ctx, opts) do
-    camera_id = Keyword.fetch!(opts, :camera_id)
+    camera = Keyword.fetch!(opts, :camera)
+    camera_id = camera.id
     epoch = Keyword.fetch!(opts, :epoch)
     owner = Keyword.fetch!(opts, :owner)
+    detect = Keyword.get(opts, :detect)
 
     spec = [
       child(:source, %Cairn.Pipeline.BridgeSource{owner: owner, session: epoch})
@@ -53,22 +59,26 @@ defmodule Cairn.Pipeline.Camera do
       |> child(:rtp_out, %Cairn.Pipeline.RTPOut{camera_id: camera_id})
     ]
 
-    {[spec: spec ++ detect_spec(camera_id, epoch, Keyword.get(opts, :detect))],
-     %{camera_id: camera_id}}
+    {[spec: spec ++ detect_spec(camera, epoch, detect)],
+     %{camera_id: camera_id, detecting?: detect != nil}}
   end
 
-  # SEAM (port plan 3.2): the observations go to the tracker fork from here.
   @impl true
-  def handle_child_notification({:observations, _camera_id, _observations}, :infer, _ctx, state) do
-    {[], state}
-  end
-
   def handle_child_notification(_notification, _child, _ctx, state), do: {[], state}
 
-  # No plugin configured is no detection, exactly as on the classic path.
-  defp detect_spec(_camera_id, _epoch, nil), do: []
+  # A reload's new policy, from `Cairn.FFmpegPort`. Only the sink holds one, so
+  # a camera whose detect branch was never built has nothing to tell.
+  @impl true
+  def handle_info({:policy, camera, policy}, _ctx, %{detecting?: true} = state) do
+    {[notify_child: {:infer, {:policy, camera, policy}}], state}
+  end
 
-  defp detect_spec(camera_id, epoch, detect) do
+  def handle_info(_message, _ctx, state), do: {[], state}
+
+  # No plugin configured is no detection, exactly as on the classic path.
+  defp detect_spec(_camera, _epoch, nil), do: []
+
+  defp detect_spec(camera, epoch, detect) do
     [
       get_child(:tee)
       |> child(:picker, struct(Picker, Keyword.take(detect, [:sample_fps])))
@@ -76,7 +86,8 @@ defmodule Cairn.Pipeline.Camera do
       # moment it is, and no more than one is ever in flight.
       |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
       |> child(:infer, %InferSink{
-        camera_id: camera_id,
+        camera: camera,
+        policy: Keyword.fetch!(detect, :policy),
         epoch: epoch,
         stream_params: Keyword.get(detect, :stream_params, %{})
       })

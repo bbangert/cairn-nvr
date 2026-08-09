@@ -18,15 +18,23 @@ defmodule Cairn.Pipeline.CameraTest do
     end
   end
 
-  defp spec(opts) do
-    {[spec: spec], _state} =
-      Pipeline.handle_init(
-        %{},
-        Keyword.merge([camera_id: "cam", epoch: "epoch", owner: self()], opts)
-      )
+  @policy %{pre: 5, post: 10, max: 300, track: nil, record: nil}
 
+  defp init(opts) do
+    Pipeline.handle_init(
+      %{},
+      Keyword.merge([camera: %Camera{id: "cam"}, epoch: "epoch", owner: self()], opts)
+    )
+  end
+
+  defp spec(opts) do
+    {[spec: spec], _state} = init(opts)
     spec
   end
+
+  # The detect branch needs a policy; every test that wants one wants the same
+  # one.
+  defp detect(opts \\ []), do: Keyword.put_new(opts, :policy, @policy)
 
   defp children(spec) do
     for builder <- spec, {name, definition, _opts} <- builder.children, into: %{} do
@@ -55,7 +63,7 @@ defmodule Cairn.Pipeline.CameraTest do
     end
 
     test "hangs off the tee behind the picker, with the sink one hop further" do
-      spec = spec(detect: [])
+      spec = spec(detect: detect())
       links = links(spec)
 
       assert Enum.any?(links, &match?(%{from: :tee, to: :picker}, &1))
@@ -65,7 +73,7 @@ defmodule Cairn.Pipeline.CameraTest do
     end
 
     test "carries the configured sample rate into the picker" do
-      spec = spec(detect: [sample_fps: 3])
+      spec = spec(detect: detect(sample_fps: 3))
 
       {_name, picker, _opts} =
         Enum.find_value(spec, &Enum.find(&1.children, fn {name, _d, _o} -> name == :picker end))
@@ -74,9 +82,27 @@ defmodule Cairn.Pipeline.CameraTest do
     end
   end
 
+  describe "a reload's policy" do
+    test "is forwarded to the sink, which is the only child that holds one" do
+      {_actions, state} = init(detect: detect())
+      camera = %Camera{id: "cam", record: %{"person" => %{min_score: 0.9}}}
+      policy = Map.put(@policy, :record, camera.record)
+
+      assert {[notify_child: {:infer, {:policy, ^camera, ^policy}}], _state} =
+               Pipeline.handle_info({:policy, camera, policy}, %{}, state)
+    end
+
+    test "is dropped for a camera whose detect branch was never built" do
+      {_actions, state} = init([])
+
+      assert {[], ^state} =
+               Pipeline.handle_info({:policy, %Camera{id: "cam"}, @policy}, %{}, state)
+    end
+  end
+
   describe "the tee's consumers" do
     test "none of them takes its input on a manual pad" do
-      spec = spec(detect: [])
+      spec = spec(detect: detect())
       children = children(spec)
       consumers = for %{from: :tee, to: to, to_pad: pad} <- links(spec), do: {to, pad}
 
@@ -111,6 +137,19 @@ defmodule Cairn.Pipeline.CameraTest do
       assert_receive {:pipeline_opts, opts}, 5_000
       assert opts[:detect][:sample_fps] == 3
       assert opts[:detect][:stream_params] == %{min_score: %{"person" => 0.6}}
+    end
+
+    test "the camera and the policy the dispatch seam attaches" do
+      camera = %{camera("cam_policy", {:group, "g"}) | post_window_seconds: 42}
+      config = config(camera)
+      start_port(camera, config)
+
+      assert_receive {:pipeline_opts, opts}, 5_000
+      # resolved here rather than in the sink, and resolved identically to the
+      # plugin ports' — same function, same arguments
+      assert opts[:camera] == camera
+      assert opts[:detect][:policy] == Config.policy(config, camera)
+      assert opts[:detect][:policy].post == 42
     end
 
     defp camera(id, plugin) do

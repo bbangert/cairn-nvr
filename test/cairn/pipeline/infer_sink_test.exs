@@ -6,6 +6,7 @@ defmodule Cairn.Pipeline.InferSinkTest do
   import Membrane.Testing.Assertions
 
   alias Cairn.CanaryStub
+  alias Cairn.Config.Camera
   alias Cairn.Native.Host
   alias Cairn.NativeStub
   alias Cairn.Observation
@@ -17,12 +18,28 @@ defmodule Cairn.Pipeline.InferSinkTest do
 
   @control NativeStub.control()
   @keyframe <<0, 0, 1, 0x67, 0x42, 0xC0, 0x1F, 0, 0, 1, 0x68, 0xCE, 0x3C, 0, 0, 1, 0x65, 0x88>>
+  # The two tiers are carried, not consulted: what the sink owes the tracker is
+  # this map back, unread.
+  @policy %{
+    pre: 5,
+    post: 10,
+    max: 300,
+    track: %{"person" => %{min_score: 0.4}},
+    record: %{"person" => %{min_score: 0.6}}
+  }
 
   setup do
     :persistent_term.put(@control, %{test: self()})
     on_exit(fn -> :persistent_term.erase(@control) end)
 
-    %{camera_id: "infer_#{System.unique_integer([:positive])}", epoch: Cairn.ULID.generate()}
+    camera_id = "infer_#{System.unique_integer([:positive])}"
+
+    %{
+      camera_id: camera_id,
+      camera: %Camera{id: camera_id, rtsp_url: "rtsp://h/1"},
+      policy: @policy,
+      epoch: Cairn.ULID.generate()
+    }
   end
 
   defp control(attrs) do
@@ -49,9 +66,13 @@ defmodule Cairn.Pipeline.InferSinkTest do
         InferSink,
         Keyword.merge(
           [
-            camera_id: ctx.camera_id,
+            camera: ctx.camera,
+            policy: ctx.policy,
             epoch: ctx.epoch,
             host: ctx.host,
+            # the dispatch seam's injection point: this process stands in for
+            # the camera's tracker and sees the casts it would have received
+            tracker: self(),
             reopen_cooldown_ms: 0
           ],
           opts
@@ -92,17 +113,65 @@ defmodule Cairn.Pipeline.InferSinkTest do
   describe "one AU" do
     setup ctx, do: Map.put(ctx, :host, start_host())
 
-    test "becomes observations for the tracker seam, then one more demand", ctx do
+    test "reaches the tracker through the dispatch seam, then one more demand", ctx do
       {_actions, state} = playing(sink(ctx))
       {actions, _state} = feed(state)
 
       camera_id = ctx.camera_id
       epoch = ctx.epoch
+      camera = ctx.camera
 
-      assert [notify_parent: {:observations, ^camera_id, [observation]}, demand: {:input, 1}] =
-               actions
-
+      # the same cast the plugin ports make, carrying the same policy —
+      # `track:` and `record:` included, and neither read on the way
+      assert_received {:"$gen_cast", {:detections, ^camera, @policy, observation}}
       assert %Observation{camera_id: ^camera_id, epoch: ^epoch} = observation
+
+      # nothing goes to the parent any more: the pipeline is off the per-frame
+      # path entirely
+      assert actions == [demand: {:input, 1}]
+    end
+
+    test "carries a refreshed policy without restarting the session", ctx do
+      {_actions, state} = playing(sink(ctx))
+      assert_receive {:open_stream, _engine, _camera_id, _params}
+
+      camera = %{ctx.camera | record: %{"person" => %{min_score: 0.9}}}
+      policy = Map.put(@policy, :record, %{"person" => %{min_score: 0.9}})
+
+      {actions, state} =
+        InferSink.handle_parent_notification({:policy, camera, policy}, %{}, state)
+
+      assert actions == []
+
+      {_actions, _state} = feed(state)
+      assert_received {:"$gen_cast", {:detections, ^camera, ^policy, %Observation{}}}
+      # the stream was not reopened for it
+      refute_received {:open_stream, _engine, _camera_id, _params}
+    end
+
+    test "answering with several frames dispatches them in the crate's order", ctx do
+      # One push, several decoded frames — the crate's normal answer when a
+      # single AU carries more than one picture. The tracker's `at_ms` is
+      # strictly increasing across them, so a reordering here would be a stream
+      # that appears to run backwards.
+      control(%{
+        push_au: fn _stream, _au, _pts, _tb ->
+          {:ok, {for(pts <- [90_000, 93_000, 96_000], do: %{NativeStub.frame() | pts: pts}), []}}
+        end
+      })
+
+      {_actions, state} = playing(sink(ctx))
+      {_actions, _state} = feed(state)
+
+      pts_order =
+        for _ <- 1..3 do
+          assert_received {:"$gen_cast", {:detections, _camera, @policy, observation}}
+          {observation.pts, observation.at_ms}
+        end
+
+      assert [{90_000, _}, {93_000, _}, {96_000, _}] = pts_order
+      assert pts_order |> Enum.map(&elem(&1, 1)) |> then(&(&1 == Enum.sort(&1)))
+      refute_received {:"$gen_cast", {:detections, _camera, _policy, _observation}}
     end
 
     test "is pushed with a membrane-time base the crate can rescale", ctx do
@@ -191,9 +260,11 @@ defmodule Cairn.Pipeline.InferSinkTest do
           |> child(:picker, %Picker{sample_fps: 30})
           |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
           |> child(:infer, %InferSink{
-            camera_id: ctx.camera_id,
+            camera: ctx.camera,
+            policy: ctx.policy,
             epoch: ctx.epoch,
-            host: ctx.host
+            host: ctx.host,
+            tracker: self()
           })
         ]
       )

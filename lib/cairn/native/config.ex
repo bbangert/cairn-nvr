@@ -7,10 +7,10 @@ defmodule Cairn.Native.Config do
   Every key has to be present in the term: rustler's `NifMap` decode fails on a
   missing one rather than defaulting it, so an absent value is spelled `nil`.
 
-  Profile expansion still lives in `Cairn.Config`, which produces argv for a
-  plugin group's command; until that produces this map instead, callers hand
-  `normalize/1` the flags' own vocabulary (`backend: "qnn"`,
-  `input_size: "640x352"`) and nothing here knows what a profile is.
+  Nothing here knows what a profile is: a hardware profile renders itself into
+  this vocabulary (`Cairn.Config.Profile.native_config/1`), the same fields it
+  renders as plugin argv, and callers that have no profile write the vocabulary
+  themselves (`backend: "qnn"`, `input_size: "640x352"`).
   """
 
   @model_defaults %{

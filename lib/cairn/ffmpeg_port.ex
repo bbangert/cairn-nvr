@@ -174,16 +174,17 @@ defmodule Cairn.FFmpegPort do
   end
 
   @doc """
-  The membrane-mode argv: two outputs, not three. MPEG-TS on stdout — a
+  The membrane-mode argv: one output, not three. MPEG-TS on stdout — a
   container with pts, per D-M8: raw Annex-B would lose timestamps the
-  ObservationClock and Fragment pts derivation need — and the plugin RTP
-  output kept until the native block replaces it (port plan phase 3). The
-  WebRTC hub is fed in-process by the pipeline's RTP branch, so ffmpeg's
-  third output and the hub's UDP socket die here.
+  ObservationClock and Fragment pts derivation need.
+
+  Both RTP outputs are gone because both consumers moved in-process: the
+  WebRTC hub is fed by the pipeline's RTP branch and detection by its
+  `Cairn.Pipeline.InferSink`. A membrane camera therefore binds no UDP port —
+  see `Cairn.Camera`, which also keeps it out of any plugin group.
   """
-  @spec build_membrane_argv(Cairn.Config.Camera.t(), pos_integer(), String.t(), keyword()) ::
-          [String.t()]
-  def build_membrane_argv(cam, plugin_port, timeout_flag, opts \\ []) do
+  @spec build_membrane_argv(Cairn.Config.Camera.t(), String.t(), keyword()) :: [String.t()]
+  def build_membrane_argv(cam, timeout_flag, opts \\ []) do
     input_opts = input_opts(cam, timeout_flag)
 
     codec_args =
@@ -194,18 +195,11 @@ defmodule Cairn.FFmpegPort do
         ["-c:v", "copy"]
       end
 
-    rtp_bsf = ["-bsf:v", "h264_mp4toannexb"]
-
     ["ffmpeg", "-nostdin", "-nostats", "-loglevel", "warning"] ++
       input_opts ++
       cam.extra_ffmpeg_args ++
       ["-i", cam.rtsp_url] ++
-      ["-map", "0:v"] ++
-      codec_args ++
-      ~w(-f mpegts pipe:1) ++
-      ["-map", "0:v"] ++
-      codec_args ++
-      rtp_bsf ++ ~w(-f rtp -payload_type 96 rtp://127.0.0.1:#{plugin_port})
+      ["-map", "0:v"] ++ codec_args ++ ~w(-f mpegts pipe:1)
   end
 
   defp input_opts(cam, timeout_flag) do
@@ -234,6 +228,22 @@ defmodule Cairn.FFmpegPort do
 
   defp shell_escape(arg), do: "'" <> String.replace(arg, "'", "'\\''") <> "'"
 
+  @doc """
+  Point a running camera's detect branch at a new config without touching
+  ffmpeg.
+
+  Membrane mode's `Cairn.Detect.Dispatch` policy is resolved here at each
+  session start, so a reload the classic path delivers through
+  `Cairn.PluginPort.refresh/3` has to reach the running pipeline's sink the
+  same way — otherwise a `record:` edit would sit unapplied until the camera's
+  next reconnect. The ffmpeg argv cannot move under a refresh: every field it
+  carries is a `Cairn.Config.Server` restart field.
+  """
+  @spec refresh(GenServer.server(), Cairn.Config.Camera.t(), Cairn.Config.t()) :: :ok
+  def refresh(server, %Cairn.Config.Camera{} = camera, %Cairn.Config{} = config) do
+    GenServer.cast(server, {:refresh, camera, config})
+  end
+
   # -- server -----------------------------------------------------------------
 
   @impl true
@@ -257,6 +267,17 @@ defmodule Cairn.FFmpegPort do
     send(self(), :spawn)
     schedule_watchdog(state)
     {:ok, state}
+  end
+
+  @impl true
+  def handle_cast({:refresh, camera, config}, state) do
+    # Classic mode holds no policy of its own: its detections come from the
+    # plugin port, which `Cairn.CameraSupervisor` refreshes directly.
+    if membrane?(state) do
+      {:noreply, refresh_detect(state, camera, config)}
+    else
+      {:noreply, state}
+    end
   end
 
   @impl true
@@ -443,7 +464,7 @@ defmodule Cairn.FFmpegPort do
     # Mint before the port exists. Nothing between acquiring the port and
     # folding it into state may fail: an unwind there would leave an ffmpeg
     # holding the RTSP session with its pid nowhere in state, so `kill_port/1`
-    # would no-op on it and the next spawn could not bind the same UDP ports.
+    # would no-op on it — and on the classic path its UDP ports with it.
     # (`start_session/1` upholds this: a pipeline start failure is handled as
     # a value, never an unwind.)
     epoch = Cairn.StreamEpochs.new_epoch(state.camera.id, state.spawn_reason)
@@ -482,7 +503,7 @@ defmodule Cairn.FFmpegPort do
   defp start_session(state) do
     if membrane?(state) do
       opts = [
-        camera_id: state.camera.id,
+        camera: state.camera,
         epoch: state.epoch,
         owner: self(),
         detect: detect_opts(state)
@@ -512,13 +533,16 @@ defmodule Cairn.FFmpegPort do
         log =
           Path.join(Cairn.DataDir.log_dir(state.config.data_dir), "ffmpeg-#{state.camera.id}.log")
 
-        {plugin_port, _rtp_port} = ports = Cairn.UDPPorts.ports_for(state.config, state.index)
         gop = gop_from_probe(state.camera.id)
 
+        # The allocation is only reached on the classic path: a membrane
+        # camera's argv carries no port, and its index slot stays reserved
+        # anyway (`Cairn.UDPPorts` is positional).
         argv =
           if membrane?(state) do
-            build_membrane_argv(state.camera, plugin_port, timeout_flag(), gop: gop)
+            build_membrane_argv(state.camera, timeout_flag(), gop: gop)
           else
+            ports = Cairn.UDPPorts.ports_for(state.config, state.index)
             build_argv(state.camera, ports, timeout_flag(), gop: gop)
           end
 
@@ -531,9 +555,25 @@ defmodule Cairn.FFmpegPort do
 
   defp membrane?(state), do: state.camera.pipeline == :membrane
 
+  # `send/2` and not a pipeline call: a refresh must not wait on a pipeline
+  # whose sink is inside a `push_au/5`. Between sessions there is no pipeline to
+  # tell and none is owed — the next spawn resolves the policy from `config`.
+  defp refresh_detect(state, camera, config) do
+    state = %{state | camera: camera, config: config}
+
+    if is_pid(state.pipeline) do
+      send(state.pipeline, {:policy, camera, Cairn.Config.policy(config, camera)})
+    end
+
+    state
+  end
+
   # `nil` leaves the pipeline's detect branch unbuilt. `min_score` is the same
   # wire floor the plugin argv carries on the classic path; the rest of the
   # profile is still the plugin's own and becomes engine config later.
+  # `policy:` is resolved here rather than in the sink for the reason the plugin
+  # ports resolve it at init: it is a config round trip, and the sink's caller
+  # is the per-frame path.
   defp detect_opts(%{camera: %{plugin: nil}}), do: nil
 
   defp detect_opts(state) do
@@ -543,8 +583,10 @@ defmodule Cairn.FFmpegPort do
         nil -> nil
       end
 
-    [stream_params: %{min_score: state.camera.min_score}] ++
-      if(sample_fps, do: [sample_fps: sample_fps], else: [])
+    [
+      policy: Cairn.Config.policy(state.config, state.camera),
+      stream_params: %{min_score: state.camera.min_score}
+    ] ++ if(sample_fps, do: [sample_fps: sample_fps], else: [])
   end
 
   # TS bytes buffered until the BridgeSource announces itself — a window of

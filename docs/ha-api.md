@@ -147,7 +147,7 @@ the connection. Event kinds:
 | `event_clip_ready` / `event_clip_failed` | artifact object (below), with `clip_url` |
 | `event_snapshot_ready` / `event_snapshot_failed` | artifact object (below), with `snapshot_url` |
 | `track_started` / `track_updated` / `track_ended` | track object (below) |
-| `camera_status` | `{camera_id, status, probe, plugin_status}` — `plugin_status` is the plugin's own `{state, detail, fps}` ([`plugin.status`](plugin-contract.md#pluginstatus)), `null` until it reports one |
+| `camera_status` | `{camera_id, status, probe, plugin_status}` — `plugin_status` is the detector's own `{state, detail, fps}` ([`plugin.status`](plugin-contract.md#pluginstatus)), `null` until it reports one. A camera detected on by the in-VM native block reports here too, adding `health` (`healthy` / `saturated` / `wedged` / `idle` / `unknown` / `not_applicable`), `stream_health`, `engine`, `nif`, `canary`, `model`, `backend`, `p50_ms` and `inferences`; those keys never appear on a plugin's status, which is whitelisted to the three above |
 | `camera_control` | `{camera_id, detection_enabled, recording_enabled, min_score}` |
 | `disk_alert` | `{active, free_mb, threshold_mb}` |
 

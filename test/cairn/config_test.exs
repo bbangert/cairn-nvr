@@ -854,6 +854,24 @@ defmodule Cairn.ConfigTest do
              ]
     end
 
+    test "a membrane camera keeps its group but is not a member of it" do
+      map =
+        base_map()
+        |> with_plugins(%{"detect" => %{"command" => ["./detect"]}})
+        |> put_plugin(0, "detect")
+        |> put_plugin(1, "detect")
+        |> update_in(["cameras"], fn [a, b] -> [Map.put(a, "pipeline", "membrane"), b] end)
+
+      assert {:ok, config, []} = Config.from_map(map)
+
+      # cam_a still names the group — that is what selects the profile its
+      # pipeline runs in-VM — but the group must not bind a port for it or
+      # expect lines from it. cam_b keeps 17_004: the member port is derived
+      # from the camera's index in the whole list, not its rank in the group.
+      assert [%{plugin: {:group, "detect"}, pipeline: :membrane}, _] = config.cameras
+      assert [%{members: [%{id: "cam_b", udp_port: 17_004}]}] = config.plugin_groups
+    end
+
     test "a group nobody references parses with empty members" do
       map = with_plugins(base_map(), %{"detect" => %{"command" => ["./detect"]}})
 
@@ -1317,6 +1335,139 @@ defmodule Cairn.ConfigTest do
 
       assert {:ok, config, _warnings} = Config.from_map(map)
       assert Map.has_key?(config.profiles, "missing-labels")
+    end
+  end
+
+  describe "profile expansion for membrane cameras" do
+    alias Cairn.Config.Profile
+    alias Cairn.Native.Config, as: NativeConfig
+
+    defp profile!(name) do
+      assert {:ok, config, _warnings} = Config.from_map(argv_map(name))
+      [%{profile: profile}] = config.plugin_groups
+      profile
+    end
+
+    # `cameras` is `{pipeline, group}` pairs, `plugins` a group name → profile
+    # name map.
+    defp native_map(cameras, plugins) do
+      base_map()
+      |> Map.put("profile_dirs", [@argv_dir])
+      |> Map.put(
+        "plugins",
+        Map.new(plugins, fn {group, profile} ->
+          {group, %{"command" => "./p", "profile" => profile}}
+        end)
+      )
+      |> Map.put(
+        "cameras",
+        Enum.with_index(cameras, fn {pipeline, group}, index ->
+          %{
+            "id" => "cam_#{index}",
+            "rtsp_url" => "rtsp://h/#{index}",
+            "pipeline" => pipeline,
+            "plugin" => group
+          }
+        end)
+      )
+    end
+
+    defp argv_pairs(argv), do: argv |> Enum.chunk_every(2) |> Map.new(fn [f, v] -> {f, v} end)
+
+    defp field_of("--" <> flag), do: flag |> String.replace("-", "_") |> String.to_existing_atom()
+
+    # The anti-drift test: one profile, both renderings, the same decisions. A
+    # field that stopped walking `Profile`'s field table on one side shows up
+    # here as a flag with no field or a field with no flag.
+    test "every decision a profile makes reaches both renderings, with one value" do
+      for name <- ~w(full partial sample-fps) do
+        profile = profile!(name)
+        argv = argv_pairs(Profile.model_argv(profile))
+        # `backend` is the deliberate asymmetry: the plugin takes it from the
+        # operator's own argv, the NIF from the profile.
+        native = Map.delete(Profile.native_config(profile), :backend)
+
+        assert argv |> Map.keys() |> Enum.map(&field_of/1) |> Enum.sort() ==
+                 native |> Map.keys() |> Enum.sort()
+
+        for {flag, value} <- argv do
+          assert to_string(Map.fetch!(native, field_of(flag))) == value
+        end
+      end
+    end
+
+    test "an unset field is dropped, so the init config falls to the crate's own defaults" do
+      assert Profile.native_config(profile!("partial")) == %{model: @stub_onnx, backend: "ort"}
+
+      assert {:ok, config} = NativeConfig.normalize(Profile.native_config(profile!("partial")))
+      assert config.decoder == "auto"
+      assert config.sample_fps == 5
+      assert config.model_profile == nil
+    end
+
+    test "a profile expands into model config only — scene knobs stay the operator's (D-P6)" do
+      native = Profile.native_config(profile!("full"))
+
+      refute Enum.any?([:min_score, :motion_json, :track_floor_json], &Map.has_key?(native, &1))
+
+      # The boundary is enforced on both sides rather than merely observed here:
+      # neither vocabulary accepts the other's keys.
+      assert {:error, message} = NativeConfig.normalize(Map.put(native, :motion_json, "{}"))
+      assert message =~ "unknown config keys: :motion_json"
+      assert {:error, message} = NativeConfig.stream_params(%{model: "m.onnx", min_score: %{}})
+      assert message =~ "unknown config keys: :model"
+    end
+
+    test "the six flags' validation still fires on the way to the engine" do
+      profile = profile!("full")
+
+      assert {:error, message} =
+               NativeConfig.normalize(Map.put(Profile.native_config(profile), :sample_fps, 31))
+
+      assert message =~ "sample_fps must be an integer in 1..30"
+
+      assert {:error, message} =
+               NativeConfig.normalize(Map.delete(Profile.native_config(profile), :model))
+
+      assert message =~ "model is required"
+    end
+
+    test "no membrane camera configures no engine" do
+      assert {:ok, config, _warnings} =
+               Config.from_map(native_map([{"classic", "det"}], %{"det" => "full"}))
+
+      assert Config.native_model_config(config) == {:ok, nil}
+    end
+
+    test "a membrane camera's profile is the engine's model config" do
+      assert {:ok, config, _warnings} =
+               Config.from_map(native_map([{"membrane", "det"}], %{"det" => "full"}))
+
+      assert Config.native_model_config(config) ==
+               {:ok,
+                %{
+                  model: @stub_onnx,
+                  model_profile: "yolox",
+                  input_size: 416,
+                  decoder: "auto",
+                  labels: @stub_names,
+                  backend: "ort"
+                }}
+    end
+
+    test "membrane cameras on one profile agree, however many groups run it" do
+      map = native_map([{"membrane", "a"}, {"membrane", "b"}], %{"a" => "full", "b" => "full"})
+
+      assert {:ok, config, _warnings} = Config.from_map(map)
+      assert {:ok, %{model: @stub_onnx}} = Config.native_model_config(config)
+    end
+
+    test "membrane cameras asking for different models fail the load, naming them" do
+      map = native_map([{"membrane", "a"}, {"membrane", "b"}], %{"a" => "full", "b" => "partial"})
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "different models (full, partial)"))
+      assert Enum.any?(errors, &(&1 =~ "loads one model for every membrane camera"))
     end
   end
 

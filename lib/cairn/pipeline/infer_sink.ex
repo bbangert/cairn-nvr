@@ -12,12 +12,19 @@ defmodule Cairn.Pipeline.InferSink do
 
   The stream is opened for the pipeline's session (one ffmpeg run, one epoch) and
   closed with it.
+
+  Observations leave through `Cairn.Detect.Dispatch`, the seam the plugin ports
+  use. `policy` is `Cairn.Config.policy/2`, resolved by `Cairn.FFmpegPort` at
+  session start and replaced on reload through `Cairn.Pipeline.Camera` — never
+  read per frame, as on the plugin path.
   """
 
   use Membrane.Sink
 
   require Logger
 
+  alias Cairn.Config.Camera
+  alias Cairn.Detect.Dispatch
   alias Cairn.Native.Host
   alias Cairn.Native.Observations
   alias Cairn.ObservationClock
@@ -29,7 +36,8 @@ defmodule Cairn.Pipeline.InferSink do
   )
 
   def_options(
-    camera_id: [spec: String.t()],
+    camera: [spec: Camera.t()],
+    policy: [spec: map()],
     epoch: [spec: Cairn.ULID.t()],
     host: [spec: atom(), default: Cairn.Native.Host],
     stream_params: [
@@ -41,6 +49,11 @@ defmodule Cairn.Pipeline.InferSink do
       spec: non_neg_integer(),
       default: 5_000,
       description: "How long a refused open or a lost stream waits before the next attempt"
+    ],
+    tracker: [
+      spec: GenServer.server() | nil,
+      default: nil,
+      description: "`Cairn.Detect.Dispatch`'s injection seam; the camera's own tracker when nil"
     ]
   )
 
@@ -60,9 +73,11 @@ defmodule Cairn.Pipeline.InferSink do
   def handle_init(_ctx, opts) do
     {[],
      %{
-       camera_id: opts.camera_id,
+       camera: opts.camera,
+       policy: opts.policy,
        epoch: opts.epoch,
        host: opts.host,
+       tracker: opts.tracker,
        cooldown_ms: opts.reopen_cooldown_ms,
        params: Map.put(opts.stream_params, :stream_epoch, opts.epoch),
        clock: ObservationClock.new(),
@@ -76,11 +91,13 @@ defmodule Cairn.Pipeline.InferSink do
 
   @impl true
   def handle_setup(ctx, state) do
+    camera_id = state.camera.id
+
     # Registered before the stream exists, so a crash between open and teardown
     # still hands the camera id back to the crate — until it does, no later
     # session for this camera can open one.
     Membrane.ResourceGuard.register(ctx.resource_guard, fn ->
-      Host.close_stream(state.host, state.camera_id)
+      Host.close_stream(state.host, camera_id)
     end)
 
     {[], state}
@@ -110,6 +127,14 @@ defmodule Cairn.Pipeline.InferSink do
     {[notify_parent: {:stats, stats}], state}
   end
 
+  # A reload cannot change what the argv or the open stream carry — those fields
+  # restart the camera (`Cairn.Config.Server`'s `@restart_fields`) and with it
+  # this session — so the new pair is swapped in place, exactly as the plugin
+  # ports do on `refresh/3`.
+  def handle_parent_notification({:policy, camera, policy}, _ctx, state) do
+    {[], %{state | camera: camera, policy: policy}}
+  end
+
   # A dead engine serves no camera until an operator's `configure/3`, so the sink
   # stops demanding rather than calling into it once per AU. The picker then
   # drops everything, cheaply, for the rest of the session.
@@ -119,13 +144,13 @@ defmodule Cairn.Pipeline.InferSink do
   defp infer(%{engine: :dead} = state, _buffer), do: {[], state}
 
   defp infer(%{stream: :open} = state, buffer) do
-    case Host.push_au(state.host, state.camera_id, buffer.payload, buffer.pts, @time_base) do
+    case Host.push_au(state.host, state.camera.id, buffer.payload, buffer.pts, @time_base) do
       {:ok, {frames, _ended_tracks}} ->
         observe(%{state | pushed: state.pushed + 1}, frames)
 
       {:error, {reason, message}} when reason in @engine_fatal ->
         Logger.error(
-          "camera #{state.camera_id}: detection stopped, engine is #{reason}: #{message}"
+          "camera #{state.camera.id}: detection stopped, engine is #{reason}: #{message}"
         )
 
         {[notify_parent: {:engine_fatal, reason}],
@@ -150,14 +175,17 @@ defmodule Cairn.Pipeline.InferSink do
       Observations.from_frames(
         state.clock,
         frames,
-        state.camera_id,
+        state.camera.id,
         state.epoch,
         System.system_time(:millisecond)
       )
 
-    # SEAM (port plan 3.2): the tracker fork replaces this notification with a
-    # direct `Cairn.Detect.Dispatch` call. Nothing consumes it yet.
-    {[notify_parent: {:observations, state.camera_id, observations}], %{state | clock: clock}}
+    # In this process, not the pipeline's: the sink is already the one blocked
+    # in `push_au/5`, and routing through the parent would put the other
+    # branches' notifications behind a tracker that is slow to start.
+    Dispatch.forward_all(state.camera, state.policy, observations, tracker: state.tracker)
+
+    {[], %{state | clock: clock}}
   end
 
   defp reopen_later(state) do
@@ -176,7 +204,7 @@ defmodule Cairn.Pipeline.InferSink do
   defp ensure_stream(state), do: open(state)
 
   defp open(state) do
-    case Host.open_stream(state.host, state.camera_id, state.params) do
+    case Host.open_stream(state.host, state.camera.id, state.params) do
       {:ok, _epoch} ->
         %{state | stream: :open, retry_at: nil}
 
@@ -184,7 +212,7 @@ defmodule Cairn.Pipeline.InferSink do
         # Not fatal to the session: the engine may still be loading its model, and
         # the next AU past the cooldown tries again.
         Logger.warning(
-          "camera #{state.camera_id}: no native detection stream (#{inspect(reason)})"
+          "camera #{state.camera.id}: no native detection stream (#{inspect(reason)})"
         )
 
         %{state | retry_at: now_ms() + state.cooldown_ms}
