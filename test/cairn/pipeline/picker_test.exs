@@ -199,9 +199,12 @@ defmodule Cairn.Pipeline.PickerTest do
       @impl true
       def handle_playing(_ctx, state), do: {[demand: {:input, 1}], state}
 
-      # Never demands again: the branch is wedged for the rest of the run.
+      # Never demands again: the branch is wedged for the rest of the run. The
+      # notification is what the test waits on — a sleep long enough here on a
+      # quiet machine is not long enough on a loaded runner.
       @impl true
-      def handle_buffer(:input, _buffer, _ctx, state), do: {[], state}
+      def handle_buffer(:input, _buffer, _ctx, state),
+        do: {[notify_parent: :took_one], state}
     end
 
     @tag :capture_log
@@ -226,7 +229,7 @@ defmodule Cairn.Pipeline.PickerTest do
       # sized for; everything after that had nowhere to go, and a `:manual` input
       # on the picker would have been killed by the toilet ~200 buffers in instead
       # of reporting this.
-      Process.sleep(200)
+      assert_pipeline_notified(pipeline, :sink, :took_one, 5_000)
       Testing.Pipeline.notify_child(pipeline, :picker, :stats)
       assert_pipeline_notified(pipeline, :picker, {:stats, stats}, 5_000)
 
