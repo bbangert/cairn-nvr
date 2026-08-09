@@ -188,6 +188,119 @@ defmodule Cairn.Native.HostTest do
     end
   end
 
+  describe "native teardown" do
+    # What a `push_au/5` wedged on the crate's per-stream mutex does to
+    # `close_stream`: it does not return until the push does.
+    defp blocking_close(caller) do
+      fn _stream ->
+        send(caller, {:closing, self()})
+
+        receive do
+          :release -> {:ok, true}
+        end
+      end
+    end
+
+    defp eventually(fun, attempts \\ 200) do
+      cond do
+        fun.() ->
+          :ok
+
+        attempts == 0 ->
+          flunk("the host never got there")
+
+        true ->
+          Process.sleep(10)
+          eventually(fun, attempts - 1)
+      end
+    end
+
+    test "a close that blocks in the crate leaves the host answering", %{id: id} do
+      control(%{close_stream: blocking_close(self())})
+      host = start_host(health: [interval_ms: 25])
+
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+      assert Host.close_stream(host, id) == :ok
+      assert_receive {:closing, closer}
+
+      assert Host.status(host).streams == []
+      # the timer's own run, not `check_health/1`: a host blocked inside the
+      # native close never reaches its own wedge detector
+      eventually(fn -> Host.status(host).health == :idle end)
+
+      send(closer, :release)
+    end
+
+    test "the handle is gone before the native close lands", %{id: id} do
+      control(%{close_stream: blocking_close(self())})
+      host = start_host()
+
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+      assert Host.close_stream(host, id) == :ok
+      assert_receive {:closing, closer}
+
+      assert :ets.lookup(host, id) == []
+      assert Host.status(host).streams == []
+      assert Host.push_au(host, id, <<1>>, 0, {1, 90_000}) == {:error, :no_stream}
+
+      send(closer, :release)
+    end
+
+    test "the close is made by a task under the application's supervisor", %{id: id} do
+      control(%{close_stream: blocking_close(self())})
+      host = start_host()
+
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+      assert Host.close_stream(host, id) == :ok
+
+      # the call was really made, and not by this host
+      assert_receive {:close_stream, {:stream, ^id}}
+      assert_receive {:closing, closer}
+      refute closer == Process.whereis(host)
+      assert closer in Task.Supervisor.children(Cairn.TaskSupervisor)
+
+      send(closer, :release)
+    end
+
+    test "a blocked close does not eat the shutdown budget", %{id: id} do
+      control(%{close_stream: blocking_close(self())})
+      name = start_host()
+
+      {:ok, _epoch} = Host.open_stream(name, id, %{})
+
+      started = System.monotonic_time(:millisecond)
+      stop_supervised!(name)
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      # handed off on the way out, and outliving the process that handed it over
+      assert_receive {:closing, closer}
+      assert elapsed < 1_000, "shutting the host down took #{elapsed} ms"
+
+      send(closer, :release)
+    end
+
+    test "a reopen behind a close that has not landed is refused, legibly", %{id: id} do
+      control(%{close_stream: blocking_close(self())})
+      host = start_host(close_wait_ms: 50)
+
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+      assert Host.close_stream(host, id) == :ok
+      assert_receive {:closing, closer}
+
+      # The crate holds the camera id until the close lands, so this open cannot
+      # succeed — and says why, rather than being refused as a duplicate.
+      assert {:error, {:closing, message}} = Host.open_stream(host, id, %{})
+      assert message =~ id
+      assert Host.status(host).closing == [id]
+
+      # ...and the camera comes back once the wedged close returns
+      control(%{close_stream: nil})
+      send(closer, :release)
+      eventually(fn -> Host.status(host).closing == [] end)
+      assert {:ok, _epoch} = Host.open_stream(host, id, %{})
+    end
+  end
+
   describe "error classes" do
     test "a stream-fatal reason drops that stream and nothing else", %{id: id} do
       other = id <> "_b"

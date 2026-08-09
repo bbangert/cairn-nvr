@@ -15,6 +15,10 @@ defmodule Cairn.Native.Host do
       stream handle out of ETS and calls the NIF itself, so one camera's
       inference is not queued behind fifteen others and this process stays
       answerable while every one of them blocks;
+    * native teardown runs in a supervised task for the same reason:
+      `close_stream` waits on the per-stream mutex a `push_au/5` holds for its
+      whole call, so closing a wedged stream from here would block the health
+      check that exists to find that wedge;
     * NPU liveness is the D-P5 ratio and nothing else (spike 0.5): a wedged HTP
       still answers, at CPU speed, and survives `kill -9` and every restart
       above it — so a suspected wedge escalates to an operator alert and never
@@ -81,6 +85,12 @@ defmodule Cairn.Native.Host do
   # How many of one camera's latencies a window keeps; see `sampled/3`.
   @health_window 512
 
+  # How long an open waits for the same camera's pending native close
+  # (`open_or_park/4`). Under the caller's own `GenServer.call` timeout on
+  # purpose: a close that is not coming back should reach the caller as an error
+  # term, not as its exit.
+  @close_wait_ms 2_000
+
   @engine_fatal [:model_load, :model_poisoned]
   @stream_fatal [:closed, :poisoned, :panicked]
 
@@ -96,6 +106,7 @@ defmodule Cairn.Native.Host do
     engine_state: :starting,
     canary_state: :not_run,
     streams: %{},
+    closing: %{},
     window: %{},
     completed: 0,
     health: :unknown,
@@ -114,8 +125,14 @@ defmodule Cairn.Native.Host do
 
   `params` is `Cairn.Native.Config.stream_params/1`'s vocabulary. The epoch is the
   *caller's*: it names the ffmpeg session the access units come from, and this
-  process only says which one detections resume under. Reopening a camera that
-  already has a stream closes the old one first.
+  process only says which one detections resume under.
+
+  Reopening a camera that already has a stream closes the old one first and waits
+  for that close to reach the crate, which holds the camera id until it does.
+  `{:error, {:closing, message}}` is that wait giving up, and there is nothing the
+  caller can do about it: the old stream's teardown is still outstanding — a
+  `push_au/5` wedged in the NIF holds it off indefinitely — and no second stream
+  for this camera is possible until it lands.
   """
   @spec open_stream(atom(), String.t(), map() | keyword()) ::
           {:ok, Cairn.ULID.t()} | {:error, term()}
@@ -123,6 +140,13 @@ defmodule Cairn.Native.Host do
     GenServer.call(server, {:open_stream, camera_id, params})
   end
 
+  @doc """
+  Drop `camera_id`'s stream.
+
+  The handle is gone when this returns — no later `push_au/5` finds it — but the
+  crate's own teardown is still outstanding, and only when it lands is the camera
+  id free to be opened again.
+  """
   @spec close_stream(atom(), String.t()) :: :ok
   def close_stream(server \\ __MODULE__, camera_id) do
     GenServer.call(server, {:close_stream, camera_id})
@@ -165,8 +189,10 @@ defmodule Cairn.Native.Host do
   Load a model, or replace the one loaded.
 
   Canary first, then `init/1`, then every stream that was open is reopened on the
-  epoch its media session is still running under. Blocks for a model load, which
-  on QNN is a graph compile. This is the only recovery from an engine-fatal error.
+  epoch its media session is still running under — each behind its own close, so a
+  close still stuck in the crate costs that one camera its reopen
+  (`open_stream/3`). Blocks for a model load, which on QNN is a graph compile.
+  This is the only recovery from an engine-fatal error.
   """
   @spec configure(atom(), map() | keyword(), timeout()) :: {:ok, map()} | {:error, term()}
   def configure(server \\ __MODULE__, config, timeout \\ 300_000) do
@@ -211,9 +237,9 @@ defmodule Cairn.Native.Host do
   end
 
   @impl true
-  def handle_call({:open_stream, camera_id, params}, _from, state) do
+  def handle_call({:open_stream, camera_id, params}, from, state) do
     case NativeConfig.stream_params(params) do
-      {:ok, params} -> do_open_stream(state, camera_id, params)
+      {:ok, params} -> {:noreply, open_or_park(state, camera_id, params, from)}
       {:error, message} -> {:reply, {:error, {:config, message}}, state}
     end
   end
@@ -262,15 +288,48 @@ defmodule Cairn.Native.Host do
     {:noreply, run_health_check(state)}
   end
 
+  # A close task's exit, whether it returned or crashed: either way there is
+  # nothing further for an open parked behind it to wait on.
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
+    case Enum.find(state.closing, fn {_camera_id, closing} -> closing.ref == ref end) do
+      nil ->
+        {:noreply, state}
+
+      {camera_id, closing} ->
+        state = %{state | closing: Map.delete(state.closing, camera_id)}
+        {:noreply, resume(state, camera_id, closing.parked)}
+    end
+  end
+
+  # The ref is what makes a timer nobody cancelled harmless: it matches only the
+  # close this one was armed for, and only while that close is still parked on.
+  def handle_info({:close_timeout, camera_id, ref}, state) do
+    case Map.get(state.closing, camera_id) do
+      %{ref: ^ref, parked: {from, _params}} = closing ->
+        # Logged as well as replied: an engine reload's reopen (`reopen_streams/2`)
+        # parks with no caller to tell, and it is a camera left without a detector.
+        Logger.warning("cairn-native: #{still_closing(camera_id)}; it is not being reopened")
+        reply(from, {:error, {:closing, still_closing(camera_id)}})
+
+        {:noreply,
+         %{state | closing: Map.put(state.closing, camera_id, %{closing | parked: nil})}}
+
+      _landed ->
+        {:noreply, state}
+    end
+  end
+
   # The canary's probe process is linked to this one while it runs; its exit, and
   # any other stray, is not worth a restart that would reload the model.
   def handle_info(_message, state), do: {:noreply, state}
 
   @impl true
   def terminate(_reason, state) do
-    # A hardware decoder holds GPU surfaces until its stream closes, and a
-    # shutdown that skipped this would leave them to the resource destructor's
-    # timing rather than to now.
+    # A hardware decoder holds GPU surfaces until its stream closes, so a shutdown
+    # must not leave them to the resource destructor's timing. The closes go to
+    # tasks under `Cairn.TaskSupervisor` — started before this process, so shut
+    # down after it — rather than being spent out of this call's shutdown budget,
+    # which one stream wedged in `push_au/5` would exhaust on its own.
     close_streams(state)
     :ok
   end
@@ -401,8 +460,58 @@ defmodule Cairn.Native.Host do
 
   # -- streams ----------------------------------------------------------------
 
-  defp do_open_stream(%{engine_state: :ready} = state, camera_id, params) do
+  # An open for a camera whose native close has not landed yet waits for that close
+  # rather than racing it: the crate holds the camera id until the close (or the
+  # handle's destructor) hands it back, so an open that overtook one would be
+  # refused as a duplicate — a camera dark for the length of a teardown it never
+  # knew about. The wait is bounded and its expiry is the honest answer rather than
+  # a retry: nothing on this side can hurry a close the crate is still inside.
+  defp open_or_park(state, camera_id, params, from) do
     state = drop_stream(state, camera_id)
+
+    case Map.fetch(state.closing, camera_id) do
+      :error ->
+        {result, state} = do_open_stream(state, camera_id, params)
+        reply(from, result)
+        state
+
+      {:ok, %{parked: nil} = closing} ->
+        park(state, camera_id, closing, from, params)
+
+      # One waiter per camera: a second would be waiting on the same close, and
+      # only one of the two could have the stream it is asking for anyway.
+      {:ok, _taken} ->
+        reply(from, {:error, {:closing, still_closing(camera_id)}})
+        state
+    end
+  end
+
+  defp park(state, camera_id, closing, from, params) do
+    Process.send_after(
+      self(),
+      {:close_timeout, camera_id, closing.ref},
+      Keyword.get(state.opts, :close_wait_ms, @close_wait_ms)
+    )
+
+    %{state | closing: Map.put(state.closing, camera_id, %{closing | parked: {from, params}})}
+  end
+
+  defp resume(state, _camera_id, nil), do: state
+
+  defp resume(state, camera_id, {from, params}),
+    do: open_or_park(state, camera_id, params, from)
+
+  # `nil` is `reopen_streams/2`, which opens on nobody's behalf.
+  defp reply(nil, _result), do: :ok
+  defp reply(from, result), do: GenServer.reply(from, result)
+
+  defp still_closing(camera_id) do
+    "#{camera_id}'s native close has not returned, and the crate holds its camera id until " <>
+      "it does — either a push is wedged inside the NIF or a decoder teardown is still in " <>
+      "the driver"
+  end
+
+  defp do_open_stream(%{engine_state: :ready} = state, camera_id, params) do
     {epoch, origin} = resolve_epoch(camera_id, params)
     params = %{params | stream_epoch: epoch}
 
@@ -419,23 +528,23 @@ defmodule Cairn.Native.Host do
            %{ref: ref, token: token, module: state.native, host: self(), inflight: state.inflight}}
         )
 
-        {:reply, {:ok, epoch},
+        {{:ok, epoch},
          %{
            state
            | streams: Map.put(state.streams, camera_id, %{ref: ref, token: token, params: params})
          }}
 
       {:error, {reason, message}} = error when reason in @engine_fatal ->
-        {:reply, error, note_error(state, camera_id, reason, message)}
+        {error, note_error(state, camera_id, reason, message)}
 
       {:error, _reason} = error ->
         Logger.error("cairn-native: opening #{camera_id}: #{inspect(error)}")
-        {:reply, error, state}
+        {error, state}
     end
   end
 
   defp do_open_stream(state, _camera_id, _params) do
-    {:reply, {:error, state.engine_state}, state}
+    {{:error, state.engine_state}, state}
   end
 
   defp drop_stream(state, camera_id) do
@@ -444,9 +553,45 @@ defmodule Cairn.Native.Host do
         state
 
       {stream, streams} ->
+        # Both before the native close, and both synchronously: a caller must find
+        # the stream gone the moment this returns, however long the close takes.
         :ets.delete(state.table, camera_id)
-        state.native.close_stream(stream.ref)
-        %{state | streams: streams}
+        state = %{state | streams: streams}
+
+        case close_natively(state, camera_id, stream) do
+          {:ok, ref} ->
+            %{state | closing: Map.put(state.closing, camera_id, %{ref: ref, parked: nil})}
+
+          :error ->
+            state
+        end
+    end
+  end
+
+  # The native close waits on the mutex a `push_au/5` on this stream holds for its
+  # whole call, so it is made anywhere but here — under the application's task
+  # supervisor, which outlives this process and so carries a `terminate/2` close
+  # past this process's own shutdown.
+  defp close_natively(state, camera_id, stream) do
+    native = state.native
+
+    case Task.Supervisor.start_child(Cairn.TaskSupervisor, fn ->
+           native.close_stream(stream.ref)
+         end) do
+      {:ok, pid} ->
+        {:ok, Process.monitor(pid)}
+
+      {:error, reason} ->
+        # Not closed inline instead: blocking this process is the whole thing being
+        # avoided. The handle's own destructor frees the decoder when the BEAM
+        # collects it (`plugins/cairn-native/src/teardown.rs`) — later than now, but
+        # not never, and it releases the camera id too.
+        Logger.error(
+          "cairn-native: no task to close #{camera_id} on (#{inspect(reason)}); its decoder " <>
+            "and its camera id wait for the handle to be collected"
+        )
+
+        :error
     end
   end
 
@@ -460,8 +605,7 @@ defmodule Cairn.Native.Host do
   # retire an epoch the ring buffer's init segments already carry.
   defp reopen_streams(state, open) do
     Enum.reduce(open, state, fn {camera_id, stream}, state ->
-      {:reply, _result, state} = do_open_stream(state, camera_id, stream.params)
-      state
+      open_or_park(state, camera_id, stream.params, nil)
     end)
   end
 
@@ -788,6 +932,9 @@ defmodule Cairn.Native.Host do
       model: state.config && state.config.model,
       backend: state.config && state.config.backend,
       streams: Map.keys(state.streams),
+      # cameras whose handle is gone but whose native close has not landed, which
+      # is what a reopen of one of them is waiting on (`open_stream/3`)
+      closing: Map.keys(state.closing),
       health: state.health,
       stream_health: state.stream_health,
       p50_ms: state.p50_ms,
