@@ -99,6 +99,10 @@ defmodule Cairn.MixProject do
       {:membrane_tee_plugin, "~> 0.12.0"},
       {:membrane_rtp_plugin, "~> 0.31.5"},
       {:membrane_rtp_h264_plugin, "~> 0.20.6"},
+      # D-M1 phase 4: RTSP-native ingest. The high-level client (gBillal) —
+      # owns socket/depayload/keepalive and delivers whole H.264 access
+      # units with pts as messages; digest auth fleet-proven in spike 0.2.
+      {:rtsp, "~> 0.8.2"},
       # D-C3: the motion gate's arithmetic — plain BinaryBackend, no EXLA;
       # the gate exists to *skip* heavy work, so it must not need an
       # accelerator (or a native dep) of its own.

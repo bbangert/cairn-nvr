@@ -42,11 +42,10 @@ defmodule Cairn.Pipeline.Camera do
     epoch = Keyword.fetch!(opts, :epoch)
     owner = Keyword.fetch!(opts, :owner)
     detect = Keyword.get(opts, :detect)
+    ingest = Keyword.get(opts, :ingest, :ffmpeg)
 
     spec = [
-      child(:source, %Cairn.Pipeline.BridgeSource{owner: owner, session: epoch})
-      |> child(:demuxer, %Membrane.MPEG.TS.Demuxer{})
-      |> via_out(Pad.ref(:output, 1), options: [stream_category: :video])
+      ingest_spec(ingest, owner, epoch)
       |> child(:tee, Membrane.Tee.Parallel),
       get_child(:tee)
       |> child(:cmaf_parser, %Membrane.H264.Parser{
@@ -79,6 +78,22 @@ defmodule Cairn.Pipeline.Camera do
   end
 
   def handle_info(_message, _ctx, state), do: {[], state}
+
+  # Both ingests deliver the same thing to the tee: AU-aligned Annex-B H.264
+  # with pts. The ffmpeg bridge wraps it in MPEG-TS because raw ES off a pipe
+  # carries no timestamps (D-M8); the RTSP client delivers whole AUs with RTP
+  # pts natively — the exception D-M8 always recorded — so its path is a
+  # parser instead of a demuxer.
+  defp ingest_spec(:ffmpeg, owner, epoch) do
+    child(:source, %Cairn.Pipeline.BridgeSource{owner: owner, session: epoch})
+    |> child(:demuxer, %Membrane.MPEG.TS.Demuxer{})
+    |> via_out(Pad.ref(:output, 1), options: [stream_category: :video])
+  end
+
+  defp ingest_spec(:rtsp, owner, epoch) do
+    child(:source, %Cairn.Pipeline.RtspSource{owner: owner, session: epoch})
+    |> child(:ingest_parser, %Membrane.H264.Parser{output_alignment: :au})
+  end
 
   # No plugin configured is no detection, exactly as on the classic path.
   defp detect_spec(_camera, _epoch, nil), do: []

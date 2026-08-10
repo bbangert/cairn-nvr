@@ -109,6 +109,27 @@ defmodule Cairn.Pipeline.CameraTest do
              } = inference
     end
 
+    test "default ingest is the ffmpeg bridge: BridgeSource into the TS demuxer" do
+      children = children(spec(detect: detect()))
+
+      assert children[:source] == Cairn.Pipeline.BridgeSource
+      assert children[:demuxer] == Membrane.MPEG.TS.Demuxer
+      refute Map.has_key?(children, :ingest_parser)
+    end
+
+    test "rtsp ingest swaps the demuxer for a parser behind RtspSource" do
+      spec = spec(detect: detect(), ingest: :rtsp)
+      children = children(spec)
+
+      assert children[:source] == Cairn.Pipeline.RtspSource
+      assert children[:ingest_parser] == Membrane.H264.Parser
+      refute Map.has_key?(children, :demuxer)
+
+      # Same tee, same three branches — the ingest is the only difference.
+      assert Enum.any?(links(spec), &match?(%{from: :ingest_parser, to: :tee}, &1))
+      assert Enum.any?(links(spec), &match?(%{from: :tee, to: :picker}, &1))
+    end
+
     test "no motion_json, no gate element — today's chain exactly" do
       spec = spec(detect: detect(stream_params: %{min_score: %{}}))
 

@@ -387,4 +387,176 @@ defmodule Cairn.FFmpegPortTest do
         do_wait(id, min_count, deadline)
     end
   end
+
+  describe "rtsp ingest lifecycle" do
+    defmodule RtspStubPipeline do
+      # Stands in for Cairn.Pipeline.Camera on the rtsp path: announces
+      # itself as the RtspSource and relays what it receives to the test.
+      use Membrane.Pipeline
+
+      @impl true
+      def handle_init(_ctx, opts) do
+        owner = Keyword.fetch!(opts, :owner)
+        test_pid = :persistent_term.get({:membrane_stub, Keyword.fetch!(opts, :camera).id})
+        send(owner, {:rtsp_source_ready, Keyword.fetch!(opts, :epoch), self()})
+        send(test_pid, {:pipeline_started, self(), opts})
+        {[], %{test_pid: test_pid}}
+      end
+
+      @impl true
+      def handle_info(msg, _ctx, state) do
+        send(state.test_pid, {:pipeline_msg, msg})
+        {[], state}
+      end
+    end
+
+    defp start_rtsp(id, opts \\ []) do
+      :persistent_term.put({:membrane_stub, id}, self())
+      uri = "rtsp://127.0.0.1:554/#{id}"
+      Cairn.RTSPStub.control(uri, Map.new(Keyword.get(opts, :control, test: self())))
+
+      on_exit(fn ->
+        :persistent_term.erase({:membrane_stub, id})
+        :persistent_term.erase({Cairn.RTSPStub, uri})
+      end)
+
+      start_supervised!({RingBuffer, camera_id: id, pre_window_seconds: 60})
+
+      cam = %Camera{camera(id) | rtsp_url: uri, pipeline: :membrane, ingest: :rtsp}
+
+      # Prepended so a test's override wins: FFmpegPort reads its opts with
+      # Keyword.get, which takes the first occurrence.
+      start_supervised!(
+        {FFmpegPort,
+         Keyword.get(opts, :port_opts, []) ++
+           [
+             camera: cam,
+             config: config(),
+             index: 0,
+             backoff_min_ms: 50,
+             backoff_max_ms: 200,
+             watchdog_interval_ms: 100,
+             pipeline_module: RtspStubPipeline,
+             rtsp_module: Cairn.RTSPStub
+           ]}
+      )
+    end
+
+    test "starts the client and a pipeline; samples reach the source with ns pts" do
+      id = "rt_#{System.unique_integer([:positive])}"
+      port = start_rtsp(id)
+
+      assert_receive {:rtsp_started, client, rtsp_opts}, 2_000
+      assert rtsp_opts[:transport] == :tcp
+      assert_receive {:pipeline_started, _pipeline, opts}, 2_000
+      assert opts[:ingest] == :rtsp
+      assert is_binary(opts[:epoch])
+
+      # One second of RTP clock becomes one second of Membrane time, and only
+      # the negotiated video path's samples cross.
+      send(port, {:rtsp, client, {"video", {<<0, 0, 1, 0x65>>, 90_000, true, 123}}})
+      send(port, {:rtsp, client, {"audio", {<<0xFF>>, 48_000, true, 123}}})
+      assert_receive {:pipeline_msg, {:rtsp_sample, <<0, 0, 1, 0x65>>, 1_000_000_000}}, 2_000
+      refute_receive {:pipeline_msg, {:rtsp_sample, <<0xFF>>, _}}, 100
+
+      # Batched delivery: a list of samples fans out in order.
+      send(
+        port,
+        {:rtsp, client, {"video", [{<<1>>, 0, false, 124}, {<<2>>, 9_000, false, 125}]}}
+      )
+
+      assert_receive {:pipeline_msg, {:rtsp_sample, <<1>>, 0}}, 2_000
+      assert_receive {:pipeline_msg, {:rtsp_sample, <<2>>, 100_000_000}}, 2_000
+    end
+
+    test "session_closed flushes the tail, then respawns under a fresh epoch" do
+      id = "rc_#{System.unique_integer([:positive])}"
+      port = start_rtsp(id)
+
+      assert_receive {:rtsp_started, client, _}, 2_000
+      assert_receive {:pipeline_started, _pipeline, opts}, 2_000
+
+      send(port, {:rtsp, client, :session_closed})
+
+      # The tail-flush contract: eos reaches the source before teardown.
+      assert_receive {:pipeline_msg, :rtsp_eos}, 2_000
+
+      # ...and the respawn is a whole new session: new client, new epoch.
+      assert_receive {:rtsp_started, client2, _}, 2_000
+      assert_receive {:pipeline_started, _pipeline2, opts2}, 2_000
+      assert client2 != client
+      assert opts2[:epoch] != opts[:epoch]
+    end
+
+    test "a crashed client is the same recovery as a closed session" do
+      id = "rk_#{System.unique_integer([:positive])}"
+      _port = start_rtsp(id)
+
+      assert_receive {:rtsp_started, client, _}, 2_000
+      assert_receive {:pipeline_started, _pipeline, opts}, 2_000
+
+      Process.exit(client, :kill)
+
+      assert_receive {:rtsp_started, client2, _}, 2_000
+      assert_receive {:pipeline_started, _pipeline2, opts2}, 2_000
+      assert client2 != client
+      assert opts2[:epoch] != opts[:epoch]
+    end
+
+    test "a refused connect backs off and the retry recovers" do
+      id = "rr_#{System.unique_integer([:positive])}"
+
+      # Backoff floor above the refute window below, so "no pipeline for the
+      # refused client" cannot race the retry's own (legitimate) pipeline.
+      start_rtsp(id,
+        control: [test: self(), connect: {:error, :econnrefused}],
+        port_opts: [backoff_min_ms: 300]
+      )
+
+      # First client is started, refused at connect, and no pipeline exists
+      # for it; the stub consumes the refusal so the retry connects.
+      assert_receive {:rtsp_started, _refused, _}, 2_000
+      refute_receive {:pipeline_started, _, _}, 100
+
+      assert_receive {:rtsp_started, _client, _}, 2_000
+      assert_receive {:pipeline_started, _pipeline, _opts}, 2_000
+    end
+
+    test "a camera advertising no H264 video track is refused, not decoded wrong" do
+      id = "rh_#{System.unique_integer([:positive])}"
+
+      tracks = [
+        %{
+          control_path: "video",
+          type: :video,
+          fmtp: nil,
+          rtpmap: %{encoding: "H265", clock_rate: 90_000}
+        }
+      ]
+
+      start_rtsp(id, control: [test: self(), tracks: tracks])
+
+      assert_receive {:rtsp_started, _client, _}, 2_000
+      # Refused every time: the camera cannot become a session.
+      refute_receive {:pipeline_started, _, _}, 300
+      # ...but the port keeps trying (backoff, not a crash).
+      assert_receive {:rtsp_started, _client2, _}, 2_000
+    end
+
+    test "a stale session's messages are dropped, not misrouted" do
+      id = "rs_#{System.unique_integer([:positive])}"
+      port = start_rtsp(id)
+
+      assert_receive {:rtsp_started, client, _}, 2_000
+      assert_receive {:pipeline_started, _pipeline, _opts}, 2_000
+
+      dead_client = spawn(fn -> :ok end)
+      send(port, {:rtsp, dead_client, {"video", {<<9>>, 0, true, 0}}})
+      refute_receive {:pipeline_msg, {:rtsp_sample, <<9>>, _}}, 100
+
+      # The live session is unaffected.
+      send(port, {:rtsp, client, {"video", {<<7>>, 0, true, 0}}})
+      assert_receive {:pipeline_msg, {:rtsp_sample, <<7>>, 0}}, 2_000
+    end
+  end
 end

@@ -854,6 +854,54 @@ defmodule Cairn.ConfigTest do
              ]
     end
 
+    test "ingest defaults to the ffmpeg bridge and accepts rtsp only where it can work" do
+      # Default: absent key is the bridge.
+      assert {:ok, config, []} = Config.from_map(base_map())
+      assert [%{ingest: :ffmpeg}, %{ingest: :ffmpeg}] = config.cameras
+
+      # Valid: membrane pipeline + rtsp:// url.
+      map =
+        update_in(base_map(), ["cameras"], fn [a, b] ->
+          [Map.merge(a, %{"pipeline" => "membrane", "ingest" => "rtsp"}), b]
+        end)
+
+      assert {:ok, config, []} = Config.from_map(map)
+      assert [%{ingest: :rtsp, pipeline: :membrane}, %{ingest: :ffmpeg}] = config.cameras
+    end
+
+    test "rtsp ingest is refused at load where its preconditions fail" do
+      refused = fn camera_attrs, message ->
+        map =
+          update_in(base_map(), ["cameras"], fn [a, b] -> [Map.merge(a, camera_attrs), b] end)
+
+        assert {:error, errors} = Config.from_map(map)
+        assert Enum.any?(errors, &(&1 =~ message)), inspect(errors)
+      end
+
+      # The classic path has no RTSP client.
+      refused.(%{"ingest" => "rtsp"}, "requires pipeline \"membrane\"")
+
+      # The rtsp library rejects non-rtsp:// schemes outright (the FLV
+      # camera keeps the bridge — D-M7's per-camera escape hatch).
+      refused.(
+        %{
+          "ingest" => "rtsp",
+          "pipeline" => "membrane",
+          "rtsp_url" => "http://h/flv"
+        },
+        "requires an rtsp:// url"
+      )
+
+      # Transcode happens inside ffmpeg, which this ingest removes.
+      refused.(
+        %{"ingest" => "rtsp", "pipeline" => "membrane", "transcode" => true},
+        "cannot transcode"
+      )
+
+      # A typo is an error, never a silent fallback.
+      refused.(%{"ingest" => "rtps"}, "ingest must be")
+    end
+
     test "a membrane camera keeps its group but is not a member of it" do
       map =
         base_map()
