@@ -3,7 +3,7 @@ defmodule Cairn.MembraneE2ETest do
   Plan task 3.6: the whole membrane stack on real video, in one VM.
 
       ffmpeg (MPEG-TS, one output) -> Cairn.Pipeline.Camera -> Picker
-        -> InferSink -> Cairn.Native.Host.push_au/5 (in-VM NIF)
+        -> InferSink -> Cairn.Native.Host.push_frame/5 (in-VM NIF)
         -> Observations -> Dispatch -> CameraTracker -> EventExtractor -> clip
 
   Nothing here is stubbed: the real NIF, the real canary, the real ffmpeg, the
@@ -129,7 +129,8 @@ defmodule Cairn.MembraneE2ETest do
     plugin_status = eventually(fn -> CameraStatus.get(id).plugin_status end)
     assert plugin_status["state"] == "ready"
     assert plugin_status["backend"] == "ort"
-    assert plugin_status["model"] == @model
+    # the operator-facing name: `Cairn.Native.Status` strips the path on purpose
+    assert plugin_status["model"] == Path.basename(@model)
     assert plugin_status["health"] == "not_applicable"
     assert plugin_status["fps"] > 0.0
 

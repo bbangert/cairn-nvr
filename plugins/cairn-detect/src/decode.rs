@@ -105,12 +105,32 @@ pub struct Sampled {
     pub motion: Option<MotionVerdict>,
 }
 
+/// Everything one sampled frame produced on the decode side of the split NIF
+/// boundary: the content-rect RGB24 image, its geometry, and the motion
+/// measured from it. What [`Sampled`] is to the in-process pipeline, this is
+/// to a seam frames cross as terms — the tensor is packed on the far side by
+/// [`model_input_from_rgb`], from these exact bytes, so the split costs no
+/// precision.
+pub struct RgbSampled {
+    /// Tightly packed RGB24 rows (stride is exactly `content.w * 3`).
+    pub rgb: Vec<u8>,
+    /// The content rectangle ([`Fit`]'s `inner`) — what `rgb` is sized as,
+    /// not the model rect: letterbox padding is the consumer's to add.
+    pub content: InputSize,
+    /// The geometry the camera sent, which on the hardware path is not
+    /// `content`'s: the GPU scaled before this value existed.
+    pub source: InputSize,
+    /// `None` when the motion gate is not configured for this camera.
+    pub motion: Option<MotionVerdict>,
+}
+
 /// One frame as the model takes it, plus the way back out.
 ///
 /// The two travel together because they are two halves of the same decision:
 /// how this frame was fitted into the input rectangle is what says where the
 /// model's output boxes were in the original picture. Splitting them is how a
 /// letterboxed run silently reports every box against the wrong geometry.
+#[derive(Debug)]
 pub struct ModelInput {
     /// CHW f32, `3 * w * h` long for the resolved model input, in whichever
     /// `TensorEncoding` the detector asked for.
@@ -162,6 +182,13 @@ pub trait Decoder: Send {
     /// motion detector too: it never reaches the background, which is
     /// unchanged by it.
     fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<Sampled>>;
+
+    /// [`Self::to_tensor`]'s decode-side half: scale and convert a sampled
+    /// frame to the content-rect RGB24 image, measuring motion on the way,
+    /// and leave the tensor packing to the consumer
+    /// ([`model_input_from_rgb`]). Same ownership and `Ok(None)` contract as
+    /// `to_tensor`.
+    fn to_rgb(&mut self, frame: AVFrame) -> Result<Option<RgbSampled>>;
 }
 
 /// A decoded frame's own geometry, which is what a projection is built from.
@@ -300,6 +327,26 @@ struct Target {
     rgb: AVFrame,
 }
 
+impl Target {
+    /// Scale `frame` into the RGB24 content rectangle, returning the plane
+    /// and its stride. The slice is `self.rgb`'s own buffer — read or copied
+    /// out before the next scale overwrites it, which the borrow enforces.
+    fn scale(&mut self, frame: &AVFrame) -> Result<(&[u8], usize)> {
+        self.sws
+            .scale_frame(frame, 0, frame.height, &mut self.rgb)
+            .context("scaling to the model input size")?;
+        let stride = self.rgb.linesize[0] as usize;
+        // SAFETY: `self.rgb` is our own `alloc_buffer`'d RGB24 frame of
+        // `self.fit.inner`, so data[0] is non-null and the allocation covers
+        // linesize[0] * height bytes. Both invariants break if `ensure_target`
+        // ever stops allocating the frame it describes.
+        let plane = unsafe {
+            slice::from_raw_parts(self.rgb.data[0] as *const u8, stride * self.fit.inner.h)
+        };
+        Ok((plane, stride))
+    }
+}
+
 impl RgbScaler {
     /// `sample_fps` is only ever read here to build the [`MotionDetector`]'s
     /// calibration window — see [`MotionDetector::new`] — and is otherwise
@@ -354,48 +401,68 @@ impl RgbScaler {
     }
 
     pub fn tensor_from(&mut self, frame: &AVFrame, source: InputSize) -> Result<Sampled> {
-        let height = frame.height;
+        let spec = self.spec;
         self.ensure_target(frame, source)?;
         let target = self.target.as_mut().expect("target was just set");
-        target
-            .sws
-            .scale_frame(frame, 0, height, &mut target.rgb)
-            .context("scaling to the model input size")?;
-
-        let stride = target.rgb.linesize[0] as usize;
-        // SAFETY: `target.rgb` is our own `alloc_buffer`'d RGB24 frame of
-        // `target.fit.inner`, so data[0] is non-null and the allocation covers
-        // linesize[0] * height bytes. Both invariants break if `ensure_target`
-        // ever stops allocating the frame it describes.
-        let plane = unsafe {
-            slice::from_raw_parts(target.rgb.data[0] as *const u8, stride * target.fit.inner.h)
-        };
-        // This RGB24 frame is the motion gate's source because it is the one
-        // representation both decode paths converge on: the hardware path has
-        // already scaled on the GPU, downloaded NV12 and converted it here, so
-        // measuring from it gives a camera the same sensitivity whichever
-        // decoder happened to open. It is also `fit.inner` — the *content*
-        // rectangle — so no letterbox padding is ever averaged into a
-        // background as if it were picture.
-        //
-        // The hardware path's NV12 Y plane is strictly cheaper (a ready-made
-        // luma plane, no RGB conversion, no weighting) and is deliberately not
-        // used: it exists on that path only, which would make the gate's
-        // sensitivity depend on the decoder, and this dev container has no GPU
-        // to test that path on. It stays a documented non-goal until it can be
-        // exercised — `hwdecode::HwBackend::filter_spec` is where that plane
-        // is produced.
-        let motion = self.motion.as_mut().map(|detector| {
-            detector.observe(&GrayThumb::from_rgb24(plane, stride, target.fit.inner))
-        });
+        let fit = target.fit;
+        let (plane, stride) = target.scale(frame)?;
+        let motion = observe(&mut self.motion, plane, stride, fit.inner);
         Ok(Sampled {
             input: ModelInput {
-                tensor: pack_chw(plane, stride, target.fit, self.spec),
-                projection: target.fit.projection(source),
+                tensor: pack_chw(plane, stride, fit, spec),
+                projection: fit.projection(source),
             },
             motion,
         })
     }
+
+    /// [`Self::tensor_from`]'s decode-side half: the content-rect RGB24 image
+    /// itself, rows packed tight, with the same motion measurement taken on
+    /// the way — the bytes [`model_input_from_rgb`] packs on the far side of
+    /// the seam into the tensor this method would have.
+    pub fn rgb_from(&mut self, frame: &AVFrame, source: InputSize) -> Result<RgbSampled> {
+        self.ensure_target(frame, source)?;
+        let target = self.target.as_mut().expect("target was just set");
+        let fit = target.fit;
+        let (plane, stride) = target.scale(frame)?;
+        let motion = observe(&mut self.motion, plane, stride, fit.inner);
+        let mut rgb = Vec::with_capacity(fit.inner.w * 3 * fit.inner.h);
+        for y in 0..fit.inner.h {
+            rgb.extend_from_slice(&plane[y * stride..y * stride + fit.inner.w * 3]);
+        }
+        Ok(RgbSampled {
+            rgb,
+            content: fit.inner,
+            source,
+            motion,
+        })
+    }
+}
+
+/// One frame into the motion background, when the gate is configured.
+///
+/// This RGB24 frame is the motion gate's source because it is the one
+/// representation both decode paths converge on: the hardware path has
+/// already scaled on the GPU, downloaded NV12 and converted it here, so
+/// measuring from it gives a camera the same sensitivity whichever decoder
+/// happened to open. It is also `fit.inner` — the *content* rectangle — so no
+/// letterbox padding is ever averaged into a background as if it were picture.
+///
+/// The hardware path's NV12 Y plane is strictly cheaper (a ready-made luma
+/// plane, no RGB conversion, no weighting) and is deliberately not used: it
+/// exists on that path only, which would make the gate's sensitivity depend
+/// on the decoder, and this dev container has no GPU to test that path on. It
+/// stays a documented non-goal until it can be exercised —
+/// `hwdecode::HwBackend::filter_spec` is where that plane is produced.
+fn observe(
+    motion: &mut Option<MotionDetector>,
+    plane: &[u8],
+    stride: usize,
+    content: InputSize,
+) -> Option<MotionVerdict> {
+    motion
+        .as_mut()
+        .map(|detector| detector.observe(&GrayThumb::from_rgb24(plane, stride, content)))
 }
 
 struct SwDecoder {
@@ -449,6 +516,11 @@ impl Decoder for SwDecoder {
         let source = source_size(&frame)?;
         self.rgb.tensor_from(&frame, source).map(Some)
     }
+
+    fn to_rgb(&mut self, frame: AVFrame) -> Result<Option<RgbSampled>> {
+        let source = source_size(&frame)?;
+        self.rgb.rgb_from(&frame, source).map(Some)
+    }
 }
 
 /// Bound what a stream's SPS can make libavcodec allocate.
@@ -490,6 +562,55 @@ fn pack_chw(plane: &[u8], stride: usize, fit: Fit, spec: InputSpec) -> Vec<f32> 
         }
     }
     tensor
+}
+
+/// One scaled RGB24 content rectangle -> the model input it packs into.
+///
+/// The seam the NIF decoder/inference split crosses: the decode side produces
+/// the content-rect RGB24 plane ([`RgbScaler`]'s scale target, tightly packed
+/// rows) plus the source geometry, and the inference side calls this to pack
+/// the very tensor [`RgbScaler::tensor_from`] would have — same `pack_chw`,
+/// same projection, so the two paths cannot drift.
+///
+/// `content` is the producer's claim about the plane's geometry, and it is
+/// checked against the fit this spec derives from `source` rather than
+/// trusted: a disagreement means the producer resized for a different spec,
+/// and packing anyway would letterbox the wrong rectangle and project every
+/// box against geometry the pixels never had.
+pub fn model_input_from_rgb(
+    plane: &[u8],
+    content: InputSize,
+    source: InputSize,
+    spec: InputSpec,
+) -> Result<ModelInput> {
+    // The refusal `source_size` made for the unsplit path, restated at the
+    // boundary: a projection built for a zero-sized source divides by zero,
+    // and under `Stretch` nothing downstream would notice — every box would
+    // cross back as inf/NaN.
+    if source.w == 0 || source.h == 0 {
+        bail!("source geometry {source} has no usable dimension");
+    }
+    let fit = spec.resize.fit(spec.size, source);
+    if fit.inner != content {
+        bail!(
+            "a {content} frame from a {source} source does not fit this model's \
+             {} {} input, which takes {} content",
+            spec.size,
+            spec.resize,
+            fit.inner
+        );
+    }
+    let expected = content.w * 3 * content.h;
+    if plane.len() != expected {
+        bail!(
+            "RGB24 payload is {} bytes where {content} needs {expected}",
+            plane.len()
+        );
+    }
+    Ok(ModelInput {
+        tensor: pack_chw(plane, content.w * 3, fit, spec),
+        projection: fit.projection(source),
+    })
 }
 
 /// The wall-clock gap between samples that `--sample-fps` asks for.
@@ -598,15 +719,34 @@ fn note_error(count: &mut u64, what: &str, e: &impl fmt::Display) {
 /// because the NIF path dates its frames here too, and two derivations would date
 /// the same frame differently.
 pub fn pts_90k(frame: &AVFrame, time_base: AVRational) -> i64 {
-    let pts = if frame.pts != ffi::AV_NOPTS_VALUE {
-        frame.pts
+    match frame_pts(frame) {
+        Some(pts) => rescale_90k(pts, time_base),
+        None => 0,
+    }
+}
+
+/// The timestamp a decoded frame is dated by, still in the decoder's own time
+/// base — the frame's pts, or libavcodec's best effort when reordering left
+/// none. `None` is a frame with no date at all, which [`pts_90k`] spells `0`.
+///
+/// Split from [`pts_90k`] for the NIF decoder/inference seam: the selection
+/// needs the [`AVFrame`], which only the decode side holds, while the rescale
+/// happens wherever the 90 kHz value is consumed.
+pub fn frame_pts(frame: &AVFrame) -> Option<i64> {
+    if frame.pts != ffi::AV_NOPTS_VALUE {
+        Some(frame.pts)
     } else if frame.best_effort_timestamp != ffi::AV_NOPTS_VALUE {
-        frame.best_effort_timestamp
+        Some(frame.best_effort_timestamp)
     } else {
-        return 0;
-    };
-    // The RTP demuxer already ticks at 90 kHz, but the rescale keeps this
-    // correct for any other time base (e.g. a file fixture).
+        None
+    }
+}
+
+/// `time_base` ticks onto the contract's 90 kHz clock.
+///
+/// The RTP demuxer already ticks at 90 kHz, but the rescale keeps this correct
+/// for any other time base (e.g. a file fixture, or the host's nanoseconds).
+pub fn rescale_90k(pts: i64, time_base: AVRational) -> i64 {
     av_rescale_q(pts, time_base, PTS_TIMEBASE)
 }
 
@@ -646,6 +786,124 @@ mod tests {
         frame.set_pts(1000);
         assert_eq!(pts_90k(&frame, PTS_TIMEBASE), 1000);
         assert_eq!(pts_90k(&frame, AVRational { num: 1, den: 1000 }), 90_000);
+    }
+
+    #[test]
+    fn a_frame_pts_falls_back_to_best_effort_and_then_to_none() {
+        let mut frame = AVFrame::new();
+        frame.set_pts(1000);
+        assert_eq!(frame_pts(&frame), Some(1000));
+
+        let mut frame = AVFrame::new();
+        frame.set_pts(ffi::AV_NOPTS_VALUE);
+        // SAFETY: plain i64 field on our own freshly allocated frame.
+        unsafe { frame.deref_mut() }.best_effort_timestamp = 700;
+        assert_eq!(frame_pts(&frame), Some(700));
+        assert_eq!(pts_90k(&frame, AVRational { num: 1, den: 1000 }), 63_000);
+
+        let mut frame = AVFrame::new();
+        frame.set_pts(ffi::AV_NOPTS_VALUE);
+        assert_eq!(frame_pts(&frame), None);
+        assert_eq!(pts_90k(&frame, PTS_TIMEBASE), 0);
+    }
+
+    /// The seam invariant everything in the split rests on: packing the
+    /// content-rect RGB bytes on the far side of the boundary yields the very
+    /// tensor and projection the unsplit path builds.
+    #[test]
+    fn the_rgb_seam_reproduces_tensor_from_exactly() {
+        let spec = spec(
+            InputSize::square(64),
+            TensorEncoding::UnitRgb,
+            ResizePolicy::Letterbox { pad: 114 },
+        );
+        let source = InputSize { w: 100, h: 80 };
+        let frame = rgb24_frame(source, |x, y| {
+            [
+                (x * 7 % 256) as u8,
+                (y * 5 % 256) as u8,
+                ((x + y) % 256) as u8,
+            ]
+        });
+
+        // Fresh scalers so neither run's motion state has seen the other's frame.
+        let motion = Some(MotionConfig::default());
+        let mut unsplit = RgbScaler::new(spec, motion, DEFAULT_SAMPLE_FPS).unwrap();
+        let whole = unsplit.tensor_from(&frame, source).unwrap();
+
+        let mut split = RgbScaler::new(spec, motion, DEFAULT_SAMPLE_FPS).unwrap();
+        let sampled = split.rgb_from(&frame, source).unwrap();
+        assert_eq!(sampled.source, source);
+        assert_eq!(sampled.rgb.len(), sampled.content.w * 3 * sampled.content.h);
+
+        let input = model_input_from_rgb(&sampled.rgb, sampled.content, source, spec).unwrap();
+        assert_eq!(
+            input.tensor, whole.input.tensor,
+            "the packed tensors differ"
+        );
+        assert_eq!(input.projection, whole.input.projection);
+        // …and the motion measurement is the same measurement.
+        assert_eq!(sampled.motion, whole.motion);
+    }
+
+    #[test]
+    fn a_content_rect_for_a_different_fit_is_refused_not_packed() {
+        let spec = spec(
+            InputSize::square(64),
+            TensorEncoding::UnitRgb,
+            ResizePolicy::Letterbox { pad: 114 },
+        );
+        let source = InputSize { w: 100, h: 80 };
+        let fit = spec.resize.fit(spec.size, source);
+
+        // A plane sized for the model rect rather than the content rect: the
+        // producer resized for some other spec.
+        let wrong = InputSize::square(64);
+        assert_ne!(fit.inner, wrong);
+        let plane = vec![0u8; wrong.w * 3 * wrong.h];
+        let error = model_input_from_rgb(&plane, wrong, source, spec).unwrap_err();
+        assert!(error.to_string().contains("does not fit"), "{error:#}");
+
+        // A zero-sized source is refused before any fit is derived from it:
+        // under `Stretch` the fit never reads the source, so without this
+        // check a correctly-sized payload would sail through and the
+        // projection would divide by zero — inf/NaN boxes, silently.
+        let stretch = InputSpec {
+            resize: ResizePolicy::Stretch,
+            ..spec
+        };
+        let plane = vec![0u8; stretch.size.tensor_len()];
+        for zeroed in [InputSize { w: 0, h: 80 }, InputSize { w: 100, h: 0 }] {
+            let error = model_input_from_rgb(&plane, stretch.size, zeroed, stretch).unwrap_err();
+            assert!(
+                error.to_string().contains("no usable dimension"),
+                "{error:#}"
+            );
+        }
+
+        // The right geometry with the wrong byte count is refused too.
+        let short = vec![0u8; fit.inner.w * 3 * fit.inner.h - 3];
+        let error = model_input_from_rgb(&short, fit.inner, source, spec).unwrap_err();
+        assert!(error.to_string().contains("bytes"), "{error:#}");
+    }
+
+    /// An RGB24 frame with per-pixel values from `paint`, allocated the way
+    /// libav would hand one over (stride may exceed the row width).
+    fn rgb24_frame(size: InputSize, paint: impl Fn(usize, usize) -> [u8; 3]) -> AVFrame {
+        let mut frame = AVFrame::new();
+        frame.set_width(size.w as i32);
+        frame.set_height(size.h as i32);
+        frame.set_format(ffi::AV_PIX_FMT_RGB24);
+        frame.alloc_buffer().unwrap();
+        let stride = frame.linesize[0] as usize;
+        // SAFETY: `alloc_buffer` sized data[0] as stride * height.
+        let plane = unsafe { slice::from_raw_parts_mut(frame.data[0], stride * size.h) };
+        for y in 0..size.h {
+            for x in 0..size.w {
+                plane[y * stride + x * 3..y * stride + x * 3 + 3].copy_from_slice(&paint(x, y));
+            }
+        }
+        frame
     }
 
     #[test]

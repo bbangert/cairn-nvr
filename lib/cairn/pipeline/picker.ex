@@ -6,17 +6,19 @@ defmodule Cairn.Pipeline.Picker do
   `:input` is `:auto`, `:output` is `:manual`. The asymmetry is the whole
   mechanism: the tee side drains at line rate (auto behind our push source
   resolves to push, so no toilet is armed and this branch can never throttle
-  recording), while the sink side hands out one AU per demand. What does not fit
-  is destroyed rather than queued — one slot — so memory is O(1). The slot keeps
-  the *older* AU of the two, against the usual instinct: a decoder can only use
-  the next one in sequence, and one AU of staleness is a frame period.
+  recording), while the decoder side hands out one AU per demand. What does not
+  fit is destroyed rather than queued — one slot — so memory is O(1). The slot
+  keeps the *older* AU of the two, against the usual instinct: a decoder can
+  only use the next one in sequence, and one AU of staleness is a frame period.
   A keyframe is the exception and displaces whatever is waiting.
 
-  The rate lives in the crate, after `receive_frame` and before `to_tensor`
-  (`cairn-native`'s `Stream::push_au`). Thinning here instead would admit only
-  keyframe-headed AUs, since a stateful decoder needs its references — capping
-  detection at the GOP rate, which on this fleet is 0.21-0.50/s against a
-  `sample_fps` of 5.
+  The rate lives past the decoder, in `Cairn.Pipeline.Decoder`'s
+  `Cairn.Pipeline.SampleGate` — after decode and before the conversion.
+  Thinning here instead would admit only keyframe-headed AUs, since a stateful
+  decoder needs its references — capping detection at the GOP rate, which on
+  this fleet is 0.21-0.50/s against a `sample_fps` of 5. And because
+  `Cairn.Pipeline.Decoder` demands at line rate regardless of what inference
+  is doing, this slot engages only when *decode itself* falls behind.
 
   What is forwarded is always decodable: a keyframe always, and a non-keyframe
   only while nothing has been dropped since the last one forwarded. After a drop

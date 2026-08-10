@@ -110,7 +110,7 @@ defmodule Cairn.Native.HostTest do
       refute_received {:init, _config}
       assert Host.status(host).engine == :not_configured
       assert Host.open_stream(host, id, %{}) == {:error, :not_configured}
-      assert Host.push_au(host, id, <<0>>, 0, {1, 90_000}) == {:error, :no_stream}
+      assert NativeStub.host_push(host, id) == {:error, :no_stream}
     end
 
     test "an absent NIF library is a state, not a crash", %{id: id} do
@@ -150,7 +150,7 @@ defmodule Cairn.Native.HostTest do
       # the crate's frames reach the caller untouched — `infer_us` is the stub's
       # timing of its own call, which only the health report reads
       assert {:ok, {[%{inferred: true, objects: []}], []}} =
-               Host.push_au(host, id, <<1, 2, 3>>, 90, {1, 90_000})
+               NativeStub.host_push(host, id, 90)
 
       assert Host.status(host).streams == [id]
 
@@ -158,7 +158,7 @@ defmodule Cairn.Native.HostTest do
       assert_receive {:close_stream, {:stream, ^id}}
       assert Host.status(host).streams == []
       # the ETS handle goes with it, so the hot path stops finding a dead stream
-      assert Host.push_au(host, id, <<1>>, 0, {1, 90_000}) == {:error, :no_stream}
+      assert NativeStub.host_push(host, id) == {:error, :no_stream}
     end
 
     test "the operator-owned scene knobs reach the crate unchanged", %{id: id} do
@@ -196,7 +196,7 @@ defmodule Cairn.Native.HostTest do
   end
 
   describe "native teardown" do
-    # What a `push_au/5` wedged on the crate's per-stream mutex does to
+    # What a `push_frame/5` wedged on the crate's per-stream mutex does to
     # `close_stream`: it does not return until the push does.
     defp blocking_close(caller) do
       fn _stream ->
@@ -248,7 +248,7 @@ defmodule Cairn.Native.HostTest do
 
       assert :ets.lookup(host, id) == []
       assert Host.status(host).streams == []
-      assert Host.push_au(host, id, <<1>>, 0, {1, 90_000}) == {:error, :no_stream}
+      assert NativeStub.host_push(host, id) == {:error, :no_stream}
 
       send(closer, :release)
     end
@@ -311,12 +311,12 @@ defmodule Cairn.Native.HostTest do
   describe "error classes" do
     test "a stream-fatal reason drops that stream and nothing else", %{id: id} do
       other = id <> "_b"
-      control(%{push_au: {:error, {:poisoned, "a previous call panicked"}}})
+      control(%{push_frame: {:error, {:poisoned, "a previous call panicked"}}})
       host = start_host()
       {:ok, _epoch} = Host.open_stream(host, id, %{})
       {:ok, _epoch} = Host.open_stream(host, other, %{})
 
-      assert {:error, {:poisoned, _}} = Host.push_au(host, id, <<1>>, 0, {1, 90_000})
+      assert {:error, {:poisoned, _}} = NativeStub.host_push(host, id)
 
       assert_receive {:close_stream, {:stream, ^id}}
       assert Host.status(host).streams == [other]
@@ -325,14 +325,14 @@ defmodule Cairn.Native.HostTest do
 
     test "an engine-fatal reason takes the engine, not just the stream", %{id: id} do
       other = id <> "_b"
-      control(%{push_au: {:error, {:model_poisoned, "the shared model lock is poisoned"}}})
+      control(%{push_frame: {:error, {:model_poisoned, "the shared model lock is poisoned"}}})
       host = start_host()
       {:ok, _epoch} = Host.open_stream(host, id, %{})
       {:ok, _epoch} = Host.open_stream(host, other, %{})
 
       log =
         capture_log(fn ->
-          assert {:error, {:model_poisoned, _}} = Host.push_au(host, id, <<1>>, 0, {1, 90_000})
+          assert {:error, {:model_poisoned, _}} = NativeStub.host_push(host, id)
           # the status call is what proves the host processed the report
           assert {:model_poisoned, _message} = Host.status(host).engine
         end)
@@ -343,7 +343,7 @@ defmodule Cairn.Native.HostTest do
       assert {:error, {:model_poisoned, _}} = Host.open_stream(host, other, %{})
 
       # ...and only a fresh init behind the canary brings one back
-      control(%{push_au: nil})
+      control(%{push_frame: nil})
       assert {:ok, status} = Host.configure(host, %{model: "m.onnx"})
       assert status.engine == :ready
     end
@@ -352,7 +352,7 @@ defmodule Cairn.Native.HostTest do
       caller = self()
 
       control(%{
-        push_au: fn _stream, _au, _pts, _time_base ->
+        push_frame: fn _stream, _payload, _meta, _time_base ->
           send(caller, {:entered, self()})
 
           receive do
@@ -363,7 +363,7 @@ defmodule Cairn.Native.HostTest do
 
       host = start_host()
       {:ok, _epoch} = Host.open_stream(host, id, %{})
-      pusher = spawn(fn -> Host.push_au(host, id, <<1>>, 0, {1, 90_000}) end)
+      pusher = spawn(fn -> NativeStub.host_push(host, id) end)
       assert_receive {:entered, ^pusher}
 
       # The reopen races the push it retires: `close_stream` waits on the old
@@ -384,11 +384,11 @@ defmodule Cairn.Native.HostTest do
     end
 
     test "a decode error is neither: it is one frame", %{id: id} do
-      control(%{push_au: {:error, {:decode, "no video stream"}}})
+      control(%{push_frame: {:error, {:decode, "no video stream"}}})
       host = start_host()
       {:ok, _epoch} = Host.open_stream(host, id, %{})
 
-      assert {:error, {:decode, _}} = Host.push_au(host, id, <<1>>, 0, {1, 90_000})
+      assert {:error, {:decode, _}} = NativeStub.host_push(host, id)
 
       assert Host.status(host).streams == [id]
       assert Host.status(host).engine == :ready

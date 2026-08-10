@@ -1,6 +1,6 @@
 defmodule Cairn.Native.Observations do
   @moduledoc """
-  `Cairn.Native.push_au/4`'s frames as `Cairn.Observation`s.
+  `Cairn.Native.push_frame/4`'s frames as `Cairn.Observation`s.
 
   `Cairn.PluginProtocol`'s byte-level revalidation is deliberately absent: there
   is no serialization and no other process here, and `det_from`

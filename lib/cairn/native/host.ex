@@ -8,8 +8,8 @@ defmodule Cairn.Native.Host do
 
     * a new or changed model is probe-loaded in a throwaway OS process
       (`Cairn.Native.Canary`) before the in-VM NIF is allowed near it;
-    * per-frame work runs in the caller, not here: `push_au/5` reads the stream
-      handle out of ETS and calls the NIF itself, so this process stays
+    * per-frame work runs in the caller, not here: `push_frame/5` reads the
+      stream handle out of ETS and calls the NIF itself, so this process stays
       answerable while every camera blocks. Native teardown is in a supervised
       task for the same reason (`close_natively/3`);
     * it does not judge its own health. `Cairn.Native.Health` does, from its own
@@ -27,7 +27,7 @@ defmodule Cairn.Native.Host do
 
   The per-stream reasons are the caller's to remedy by reopening; the three that
   leave a stream unusable (`@stream_fatal`) have their handle dropped here, so the
-  next `push_au/5` says `:no_stream` rather than running against state nobody
+  next `push_frame/5` says `:no_stream` rather than running against state nobody
   knows the shape of. `model_load` and `model_poisoned` are engine-fatal: that
   handle can never serve any camera again, and only `configure/3` — canary first —
   brings one back.
@@ -91,7 +91,7 @@ defmodule Cairn.Native.Host do
   Reopening a camera that already has a stream closes the old one first and waits
   for that close to reach the crate, which holds the camera id until it does.
   `{:error, {:closing, message}}` is that wait giving up, and there is nothing the
-  caller can do about it: a `push_au/5` wedged in the NIF holds the teardown off
+  caller can do about it: a `push_frame/5` wedged in the NIF holds the teardown off
   indefinitely, and no second stream for this camera is possible until it lands.
   """
   @spec open_stream(atom(), String.t(), map() | keyword()) ::
@@ -103,7 +103,7 @@ defmodule Cairn.Native.Host do
   @doc """
   Drop `camera_id`'s stream.
 
-  The handle is gone when this returns — no later `push_au/5` finds it — but the
+  The handle is gone when this returns — no later `push_frame/5` finds it — but the
   crate's own teardown is still outstanding, and only when it lands is the camera
   id free to be opened again.
   """
@@ -113,21 +113,53 @@ defmodule Cairn.Native.Host do
   end
 
   @doc """
-  Feed one access unit and take what it completed.
+  Open `camera_id`'s decoder against the engine, so both halves of the split
+  boundary are built for the same model.
 
-  Blocks the caller for decode plus a model pass — and, under saturation, for as
-  long as the streams ahead of it hold the model session too.
+  Answers with the decoder's handle, the module to drive it through
+  (`Cairn.Native`, or the test stub the host was configured with) and the
+  engine's `sample_fps` — `Cairn.Pipeline.SampleGate`'s rate, handed out here
+  so the rate gate and the motion detector's calibration window read one
+  configured value. The handle is the *caller's*: no registry claim guards it
+  (that belongs to the inference stream), the per-frame `decode_au` calls
+  never come back through this process, and freeing it promptly is the
+  caller's `close_decoder`, with the resource destructor as the backstop.
+  """
+  @spec open_decoder(atom(), String.t(), map() | keyword()) ::
+          {:ok, %{ref: reference(), module: module(), sample_fps: pos_integer()}}
+          | {:error, term()}
+  def open_decoder(server \\ __MODULE__, camera_id, params) do
+    # Above the 5 s default: the open probes hardware backends in turn —
+    # device nodes, drivers, a GPU filter graph — each of which can block on
+    # a driver's answer, and a caller timing out here would crash a camera
+    # whose decoder was still coming up.
+    GenServer.call(server, {:open_decoder, camera_id, params}, 15_000)
+  end
+
+  @doc """
+  Take one of `Cairn.Pipeline.Decoder`'s sampled frames through the detection
+  gate and the model.
+
+  Blocks the caller for the model pass — and, under saturation, for as long as
+  the streams ahead of it hold the model session too. `meta` is
+  `t:Cairn.Native.frame_meta/0`.
 
   The frames come back in the crate's own spelling; `Cairn.Native.Observations`
   turns them into `Cairn.Observation`s.
   """
-  @spec push_au(atom(), String.t(), binary(), integer(), {integer(), integer()}) ::
+  @spec push_frame(
+          atom(),
+          String.t(),
+          binary(),
+          Cairn.Native.frame_meta(),
+          {integer(), integer()}
+        ) ::
           {:ok, {[map()], [String.t()]}} | {:error, term()}
-  def push_au(server \\ __MODULE__, camera_id, au, pts, time_base) do
+  def push_frame(server \\ __MODULE__, camera_id, payload, meta, time_base) do
     case lookup(server, camera_id) do
       {:ok, stream} ->
         enter(stream, camera_id, System.monotonic_time(:microsecond))
-        result = stream.module.push_au(stream.ref, au, pts, time_base)
+        result = stream.module.push_frame(stream.ref, payload, meta, time_base)
         leave(stream)
         report(stream, camera_id, result)
         result
@@ -230,6 +262,16 @@ defmodule Cairn.Native.Host do
     end
   end
 
+  # No parking and no registry bookkeeping: a decoder handle is the caller's,
+  # and a reopen racing the old handle's close costs nothing but memory the
+  # destructor frees — unlike a stream, whose camera-id claim must land first.
+  def handle_call({:open_decoder, camera_id, params}, _from, state) do
+    case NativeConfig.stream_params(params) do
+      {:ok, params} -> {:reply, do_open_decoder(state, camera_id, params), state}
+      {:error, message} -> {:reply, {:error, {:config, message}}, state}
+    end
+  end
+
   def handle_call({:close_stream, camera_id}, _from, state) do
     {:reply, :ok, drop_stream(state, camera_id)}
   end
@@ -304,7 +346,7 @@ defmodule Cairn.Native.Host do
     # must not leave them to the destructor's timing. The closes go to tasks under
     # `Cairn.TaskSupervisor` — started before this process, so shut down after it —
     # rather than out of this call's shutdown budget, which one stream wedged in
-    # `push_au/5` would exhaust on its own.
+    # `push_frame/5` would exhaust on its own.
     close_streams(state)
     :ok
   end
@@ -636,6 +678,19 @@ defmodule Cairn.Native.Host do
     {{:error, state.engine_state}, state}
   end
 
+  defp do_open_decoder(%{engine_state: :ready} = state, camera_id, params) do
+    case state.native.open_decoder(state.engine, camera_id, params) do
+      {:ok, ref} ->
+        {:ok, %{ref: ref, module: state.native, sample_fps: state.config.sample_fps}}
+
+      {:error, _reason} = error ->
+        Logger.error("cairn-native: opening #{camera_id}'s decoder: #{inspect(error)}")
+        error
+    end
+  end
+
+  defp do_open_decoder(state, _camera_id, _params), do: {:error, state.engine_state}
+
   defp drop_stream(state, camera_id) do
     case Map.pop(state.streams, camera_id) do
       {nil, _streams} ->
@@ -657,7 +712,7 @@ defmodule Cairn.Native.Host do
     end
   end
 
-  # The native close waits on the mutex a `push_au/5` holds for its whole call, so it
+  # The native close waits on the mutex a `push_frame/5` holds for its whole call, so it
   # is made anywhere but here — under the application's task supervisor, which
   # outlives this process and so carries a `terminate/2` close past its shutdown.
   defp close_natively(state, camera_id, stream) do
@@ -765,11 +820,11 @@ defmodule Cairn.Native.Host do
   # `inferred` raises rather than reading as a call that ran no model, which would be
   # the health check going blind.
   #
-  # `infer_us` and not the whole call: the call also paid a decode and a tensor
-  # conversion, both backend-independent and together larger than an
-  # accelerator's pass (`Stream::push_au`, `docs/npu-backends.md`). Against a CPU
-  # baseline for the pass alone, that whole-call number reads a healthy
-  # accelerator as under the D-P5 floor.
+  # `infer_us` and not the whole call: the call also paid the tensor packing
+  # (and, before the boundary split, a decode) — backend-independent work that
+  # can outweigh an accelerator's pass (`Stream::push_frame`,
+  # `docs/npu-backends.md`). Against a CPU baseline for the pass alone, that
+  # whole-call number reads a healthy accelerator as under the D-P5 floor.
   #
   # Straight to the monitor: evidence routed through the process that can be
   # wedged is the thing the split undoes.

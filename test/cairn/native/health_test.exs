@@ -50,11 +50,11 @@ defmodule Cairn.Native.HealthTest do
     end
 
     defp push(host, id, count) do
-      Enum.each(1..count, fn n -> Host.push_au(host, id, <<n>>, n, {1, 90_000}) end)
+      Enum.each(1..count, fn n -> NativeStub.host_push(host, id, n) end)
     end
 
     defp slow_push(millis) do
-      fn _stream, _au, _pts, _time_base ->
+      fn _stream, _payload, _meta, _time_base ->
         Process.sleep(millis)
         {:ok, {[NativeStub.frame()], []}}
       end
@@ -65,7 +65,7 @@ defmodule Cairn.Native.HealthTest do
     defp gated_then_pass(gated, millis) do
       calls = :counters.new(1, [])
 
-      fn _stream, _au, _pts, _time_base ->
+      fn _stream, _payload, _meta, _time_base ->
         n = :counters.get(calls, 1)
         :counters.add(calls, 1, 1)
 
@@ -83,10 +83,10 @@ defmodule Cairn.Native.HealthTest do
       {:ok, _epoch} = Host.open_stream(host, id, %{})
 
       # the sampler not due: the call decoded and returned no frame at all
-      control(%{push_au: {:ok, {[], []}}})
+      control(%{push_frame: {:ok, {[], []}}})
       push(host, id, 10)
       # the motion gate: a frame, re-reporting the last real pass's objects
-      control(%{push_au: {:ok, {[NativeStub.frame(false)], []}}})
+      control(%{push_frame: {:ok, {[NativeStub.frame(false)], []}}})
       push(host, id, 10)
 
       # 20 fast calls and not one model pass is no evidence about the
@@ -103,7 +103,7 @@ defmodule Cairn.Native.HealthTest do
       # The membrane branch's real shape: the sink calls once per access unit and
       # the crate's rate gate admits a fifth of them. `stream_fps` and the
       # throughput arithmetic must both count the passes and not the calls.
-      control(%{push_au: gated_then_pass(4, 1)})
+      control(%{push_frame: gated_then_pass(4, 1)})
       host = start_host(health())
       {:ok, _epoch} = Host.open_stream(host, id, %{})
 
@@ -124,7 +124,7 @@ defmodule Cairn.Native.HealthTest do
     end
 
     test "a gate skipping every frame is idle, and never becomes a wedge", %{id: id} do
-      control(%{push_au: {:ok, {[NativeStub.frame(false)], []}}})
+      control(%{push_frame: {:ok, {[NativeStub.frame(false)], []}}})
       host = start_host(health())
       {:ok, _epoch} = Host.open_stream(host, id, %{})
 
@@ -141,7 +141,7 @@ defmodule Cairn.Native.HealthTest do
       # The pass itself is 8 ms against a 15 ms baseline — the D-P5 signature of
       # an HTP that is not executing — in traffic whose p50 is 0 because nine
       # calls in ten ran no model at all.
-      control(%{push_au: gated_then_pass(9, 8)})
+      control(%{push_frame: gated_then_pass(9, 8)})
       host = start_host(health(cpu_baseline_ms: 15.0))
       {:ok, _epoch} = Host.open_stream(host, id, %{})
 
@@ -158,7 +158,7 @@ defmodule Cairn.Native.HealthTest do
       caller = self()
 
       control(%{
-        push_au: fn _stream, _au, _pts, _time_base ->
+        push_frame: fn _stream, _payload, _meta, _time_base ->
           send(caller, :entered)
           Process.sleep(:infinity)
         end
@@ -167,14 +167,14 @@ defmodule Cairn.Native.HealthTest do
       host = start_host(health())
       {:ok, _epoch} = Host.open_stream(host, id, %{})
       {:ok, _epoch} = Host.open_stream(host, gated, %{})
-      spawn(fn -> Host.push_au(host, id, <<1>>, 0, {1, 90_000}) end)
+      spawn(fn -> NativeStub.host_push(host, id) end)
       assert_receive :entered, 1_000
 
       assert Host.check_health(host) == :idle
 
       # Calls that ran no model are not the engine retiring work, so they cannot
       # stand in for the completions this window has none of.
-      control(%{push_au: {:ok, {[NativeStub.frame(false)], []}}})
+      control(%{push_frame: {:ok, {[NativeStub.frame(false)], []}}})
       push(host, gated, 10)
 
       assert capture_log(fn -> assert Host.check_health(host) == :wedged end) =~ "FAILED"
@@ -205,7 +205,7 @@ defmodule Cairn.Native.HealthTest do
       # 8 ms against a 15 ms baseline: the call still answers, it is just not 3×
       # faster than the CPU — the D-P5 signature of an HTP that is not executing.
       # One caller, so throughput cannot vouch for it either.
-      control(%{push_au: slow_push(8)})
+      control(%{push_frame: slow_push(8)})
       host = start_host(health(cpu_baseline_ms: 15.0))
       {:ok, _epoch} = Host.open_stream(host, id, %{})
 
@@ -225,7 +225,7 @@ defmodule Cairn.Native.HealthTest do
       # Four cameras each blocked 8 ms — the same p50 that read as a wedge above
       # — but the session is retiring work far faster than any CPU could, which
       # is what queueing looks like and a wedge cannot fake.
-      control(%{push_au: slow_push(8)})
+      control(%{push_frame: slow_push(8)})
       host = start_host(health(cpu_baseline_ms: 15.0))
       ids = for n <- 1..4, do: "#{id}_#{n}"
       Enum.each(ids, &Host.open_stream(host, &1, %{}))
@@ -247,12 +247,12 @@ defmodule Cairn.Native.HealthTest do
       erroring = id <> "_err"
 
       control(%{
-        push_au: fn
-          {:stream, ^slow}, _au, _pts, _time_base ->
+        push_frame: fn
+          {:stream, ^slow}, _payload, _meta, _time_base ->
             Process.sleep(8)
             {:ok, {[NativeStub.frame()], []}}
 
-          _stream, _au, _pts, _time_base ->
+          _stream, _payload, _meta, _time_base ->
             {:error, {:infer, "the model pass failed"}}
         end
       })
@@ -286,7 +286,7 @@ defmodule Cairn.Native.HealthTest do
       {:ok, _epoch} = Host.open_stream(host, healthy, %{})
 
       push(host, healthy, 5)
-      control(%{push_au: {:error, {:infer, "the model pass failed"}}})
+      control(%{push_frame: {:error, {:infer, "the model pass failed"}}})
       push(host, id, 5)
 
       assert capture_log(fn -> assert Host.check_health(host) == :healthy end) == ""
@@ -302,9 +302,9 @@ defmodule Cairn.Native.HealthTest do
       {:ok, _epoch} = Host.open_stream(host, id, %{})
       {:ok, _epoch} = Host.open_stream(host, quiet, %{})
 
-      control(%{push_au: {:error, {:infer, "the model pass failed"}}})
+      control(%{push_frame: {:error, {:infer, "the model pass failed"}}})
       push(host, id, 5)
-      control(%{push_au: nil})
+      control(%{push_frame: nil})
       push(host, quiet, 3)
 
       # one camera failing and one with too few completions to have a p50 is not
@@ -315,7 +315,7 @@ defmodule Cairn.Native.HealthTest do
 
     test "every stream failing at once is the accelerator", %{id: id} do
       other = id <> "_b"
-      control(%{push_au: {:error, {:infer, "the model pass failed"}}})
+      control(%{push_frame: {:error, {:infer, "the model pass failed"}}})
       host = start_host(health())
       {:ok, _epoch} = Host.open_stream(host, id, %{})
       {:ok, _epoch} = Host.open_stream(host, other, %{})
@@ -327,7 +327,7 @@ defmodule Cairn.Native.HealthTest do
     end
 
     test "an engine retiring nothing but errors is not silence", %{id: id} do
-      control(%{push_au: {:error, {:infer, "the model pass failed"}}})
+      control(%{push_frame: {:error, {:infer, "the model pass failed"}}})
       host = start_host(health())
       {:ok, _epoch} = Host.open_stream(host, id, %{})
 
@@ -346,7 +346,7 @@ defmodule Cairn.Native.HealthTest do
       caller = self()
 
       control(%{
-        push_au: fn _stream, _au, _pts, _time_base ->
+        push_frame: fn _stream, _payload, _meta, _time_base ->
           send(caller, :entered)
           Process.sleep(:infinity)
         end
@@ -354,7 +354,7 @@ defmodule Cairn.Native.HealthTest do
 
       host = start_host(health())
       {:ok, _epoch} = Host.open_stream(host, id, %{})
-      spawn(fn -> Host.push_au(host, id, <<1>>, 0, {1, 90_000}) end)
+      spawn(fn -> NativeStub.host_push(host, id) end)
       assert_receive :entered, 1_000
 
       # the window the call was submitted in cannot tell a hang from a window
@@ -368,7 +368,7 @@ defmodule Cairn.Native.HealthTest do
       caller = self()
 
       control(%{
-        push_au: fn _stream, _au, _pts, _time_base ->
+        push_frame: fn _stream, _payload, _meta, _time_base ->
           send(caller, :entered)
           Process.sleep(:infinity)
         end
@@ -376,7 +376,7 @@ defmodule Cairn.Native.HealthTest do
 
       host = start_host(health())
       {:ok, _epoch} = Host.open_stream(host, id, %{})
-      pusher = spawn(fn -> Host.push_au(host, id, <<1>>, 0, {1, 90_000}) end)
+      pusher = spawn(fn -> NativeStub.host_push(host, id) end)
       assert_receive :entered, 1_000
 
       # the shape the wedge above is read off — submitted, never completed —
@@ -502,13 +502,13 @@ defmodule Cairn.Native.HealthTest do
       assert Host.check_health(host) == :idle
 
       control(%{
-        push_au: fn _stream, _au, _pts, _time_base ->
+        push_frame: fn _stream, _payload, _meta, _time_base ->
           send(caller, :entered)
           Process.sleep(:infinity)
         end
       })
 
-      spawn(fn -> Host.push_au(host, id, <<1>>, 0, {1, 90_000}) end)
+      spawn(fn -> NativeStub.host_push(host, id) end)
       assert_receive :entered, 1_000
 
       # A wedged push is as silent as that: no error, no crash, no counter moving,

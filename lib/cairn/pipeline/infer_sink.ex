@@ -1,13 +1,16 @@
 defmodule Cairn.Pipeline.InferSink do
   @moduledoc """
-  Terminates the detect branch in `Cairn.Native.Host.push_au/5`.
+  Terminates the detect branch in `Cairn.Native.Host.push_frame/5`.
 
-  `:input` is `:manual` and exactly one AU is demanded at a time, so the blocking
-  native call bounds the branch's *rate* rather than its latency: nothing is
-  demanded while a call is in flight, and `Cairn.Pipeline.Picker` sheds whatever
-  arrives meanwhile. This pad is the manual seam and it belongs here, one hop
-  before the expensive call — a manual input pad attached straight to the tee
-  would arm membrane_core's toilet, which kills the receiver past ~200 buffers
+  What arrives is `Cairn.Pipeline.Decoder`'s sampled RGB frames — already
+  rate-gated to `sample_fps`, already carrying the letterbox maths and motion
+  verdict in `buffer.metadata`. `:input` is `:manual` and exactly one frame is
+  demanded at a time, so the blocking native call bounds the branch's *rate*
+  rather than its latency: nothing is demanded while a call is in flight, and
+  the decoder's one-frame slot keeps the newest frame for the demand that
+  follows. This pad is the manual seam and it belongs here, one hop before the
+  expensive call — a manual input pad attached straight to the tee would arm
+  membrane_core's toilet, which kills the receiver past ~200 buffers
   (`Membrane.Core.Element.AtomicDemand`).
 
   The stream is opened for the pipeline's session (one ffmpeg run, one epoch) and
@@ -30,7 +33,7 @@ defmodule Cairn.Pipeline.InferSink do
   alias Cairn.ObservationClock
 
   def_input_pad(:input,
-    accepted_format: %Membrane.H264{alignment: :au},
+    accepted_format: %Membrane.RawVideo{pixel_format: :RGB},
     flow_control: :manual,
     demand_unit: :buffers
   )
@@ -58,7 +61,7 @@ defmodule Cairn.Pipeline.InferSink do
   )
 
   # Membrane buffer timestamps are `Membrane.Time` (nanoseconds); the crate
-  # rescales to 90 kHz itself (`decode::pts_90k`).
+  # rescales to 90 kHz itself (`decode::rescale_90k`).
   @time_base {1, 1_000_000_000}
 
   # `Cairn.Native.Host`'s taxonomy, which it does not export. The engine-fatal
@@ -84,7 +87,9 @@ defmodule Cairn.Pipeline.InferSink do
        stream: :closed,
        engine: :ok,
        retry_at: nil,
+       content: nil,
        pushed: 0,
+       dropped: 0,
        errors: 0
      }}
   end
@@ -109,6 +114,14 @@ defmodule Cairn.Pipeline.InferSink do
     {demand(state), state}
   end
 
+  # The payload's own geometry rides the stream format, not per-buffer
+  # metadata: it is fixed for the life of the scaler that produced it, which
+  # is exactly what a stream format is for.
+  @impl true
+  def handle_stream_format(:input, %Membrane.RawVideo{} = format, _ctx, state) do
+    {[], %{state | content: {format.width, format.height}}}
+  end
+
   @impl true
   def handle_buffer(:input, buffer, _ctx, state) do
     {actions, state} = state |> ensure_stream() |> infer(buffer)
@@ -119,6 +132,7 @@ defmodule Cairn.Pipeline.InferSink do
   def handle_parent_notification(:stats, _ctx, state) do
     stats = %{
       pushed: state.pushed,
+      dropped: state.dropped,
       errors: state.errors,
       stream: state.stream,
       engine: state.engine
@@ -143,8 +157,28 @@ defmodule Cairn.Pipeline.InferSink do
 
   defp infer(%{engine: :dead} = state, _buffer), do: {[], state}
 
-  defp infer(%{stream: :open} = state, buffer) do
-    case Host.push_au(state.host, state.camera.id, buffer.payload, buffer.pts, @time_base) do
+  # The metadata keys are matched, not dot-accessed: a producer that speaks
+  # RGB frames without the decoder's metadata contract falls through to the
+  # counted drop below rather than crashing the sink on a `KeyError`.
+  defp infer(
+         %{stream: :open, content: {width, height}} = state,
+         %{
+           metadata:
+             %{orig_width: orig_width, orig_height: orig_height, observed_at_ms: observed_at_ms} =
+               metadata
+         } = buffer
+       ) do
+    meta = %{
+      width: width,
+      height: height,
+      orig_width: orig_width,
+      orig_height: orig_height,
+      pts: buffer.pts,
+      observed_at_ms: observed_at_ms,
+      motion: Map.get(metadata, :motion)
+    }
+
+    case Host.push_frame(state.host, state.camera.id, buffer.payload, meta, @time_base) do
       {:ok, {frames, _ended_tracks}} ->
         observe(%{state | pushed: state.pushed + 1}, frames)
 
@@ -171,7 +205,11 @@ defmodule Cairn.Pipeline.InferSink do
     end
   end
 
-  defp infer(state, _buffer), do: {[], state}
+  # A buffer while `stream: :closed` waits out its reopen cooldown, or one
+  # that somehow preceded its stream format: dropped, and *counted* — a stuck
+  # reopen loop must not read as healthy in `:stats` while quietly discarding
+  # frames.
+  defp infer(state, _buffer), do: {[], %{state | dropped: state.dropped + 1}}
 
   defp observe(state, frames) do
     # Monotonic, as both plugin producers pass: `at_ms` is compared against the
@@ -188,7 +226,7 @@ defmodule Cairn.Pipeline.InferSink do
       )
 
     # In this process, not the pipeline's: the sink is already the one blocked
-    # in `push_au/5`, and routing through the parent would put the other
+    # in `push_frame/5`, and routing through the parent would put the other
     # branches' notifications behind a tracker that is slow to start.
     Dispatch.forward_all(state.camera, state.policy, observations, tracker: state.tracker)
 

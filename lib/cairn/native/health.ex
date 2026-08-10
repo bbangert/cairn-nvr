@@ -17,7 +17,7 @@ defmodule Cairn.Native.Health do
       nothing cheap in the NIF to call — every entry point is a model load, a
       decoder open/close or inference itself — and ORT/QNN offers no per-call
       deadline of its own, where HailoRT hands ex_nvr a 10 s one free.
-    * **the inflight table**, written by `push_au/5`'s caller and read here
+    * **the inflight table**, written by `push_frame/5`'s caller and read here
       directly. The hot path never reaches the Host, so the probe cannot see it
       wedge — and a wedged one is *silent*: the sink stops re-demanding, and
       there is no traffic, no error, no crash. A row older than the window whose
@@ -28,7 +28,7 @@ defmodule Cairn.Native.Health do
   ## Healthy, saturated, wedged, idle
 
   The NIF has no admission control, so once cameras × `sample_fps` passes what one
-  session sustains the surplus is queueing time inside a `push_au/5` and "healthy
+  session sustains the surplus is queueing time inside a `push_frame/5` and "healthy
   but slow" is a real state the ratio check must not call a wedge. Throughput is
   what separates them: a saturated healthy accelerator still retires work at
   accelerator rate, and a wedged one cannot beat the CPU it fell back to.
@@ -143,7 +143,7 @@ defmodule Cairn.Native.Health do
     state = %__MODULE__{
       host: host,
       table: table,
-      # Written by every `push_au/5` caller and read here: evidence about the hot
+      # Written by every `push_frame/5` caller and read here: evidence about the hot
       # path that does not pass through the process the hot path can wedge.
       inflight: :"#{host}.inflight",
       checked_at: System.monotonic_time(:microsecond),
@@ -292,7 +292,7 @@ defmodule Cairn.Native.Health do
          # what the ratio was actually judged against, and the one number on this
          # surface an operator cannot derive from the others
          cpu_baseline_ms: baseline(state),
-         # model passes, not `push_au/5` calls: at 5 fps sampled off a 20 fps
+         # model passes, not `push_frame/5` calls: at 5 fps sampled off a 20 fps
          # camera the two differ by the frame rate
          inferences: state.completed
        }}
@@ -406,7 +406,7 @@ defmodule Cairn.Native.Health do
 
     Enum.each(dead, fn {pid, camera_id, token, _started_at} ->
       Logger.debug(
-        "cairn-native: #{camera_id}'s caller #{inspect(pid)} died inside push_au/5 (open #{token})"
+        "cairn-native: #{camera_id}'s caller #{inspect(pid)} died inside push_frame/5 (open #{token})"
       )
 
       :ets.delete(state.inflight, pid)

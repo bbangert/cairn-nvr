@@ -556,7 +556,7 @@ defmodule Cairn.FFmpegPort do
   defp membrane?(state), do: state.camera.pipeline == :membrane
 
   # `send/2` and not a pipeline call: a refresh must not wait on a pipeline
-  # whose sink is inside a `push_au/5`. Between sessions there is no pipeline to
+  # whose sink is inside a `push_frame/5`. Between sessions there is no pipeline to
   # tell and none is owed — the next spawn resolves the policy from `config`.
   defp refresh_detect(state, camera, config) do
     state = %{state | camera: camera, config: config}

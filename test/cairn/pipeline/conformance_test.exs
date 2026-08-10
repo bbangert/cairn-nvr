@@ -424,7 +424,7 @@ defmodule Cairn.Pipeline.ConformanceTest do
   defp start_infer_sink(tracker, camera_id) do
     :persistent_term.put(NativeStub.control(), %{
       test: self(),
-      push_au: fn _stream, _au, _pts, _time_base -> {:ok, {[native_frame()], []}} end
+      push_frame: fn _stream, _payload, _meta, _time_base -> {:ok, {[native_frame()], []}} end
     })
 
     on_exit(fn -> :persistent_term.erase(NativeStub.control()) end)
@@ -453,14 +453,39 @@ defmodule Cairn.Pipeline.ConformanceTest do
     {[], state} = InferSink.handle_init(%{}, options)
     {_actions, state} = InferSink.handle_playing(%{}, state)
     assert state.stream == :open
+
+    # the decoder's stream format always precedes its first buffer
+    format = %Membrane.RawVideo{
+      width: 2,
+      height: 2,
+      framerate: nil,
+      pixel_format: :RGB,
+      aligned: true
+    }
+
+    {[], state} = InferSink.handle_stream_format(:input, format, %{}, state)
     state
   end
 
   defp feed_infer_sink(state) do
+    frame = NativeStub.decoded_frame()
+
+    metadata =
+      Map.take(frame, [
+        :orig_width,
+        :orig_height,
+        :scale_x,
+        :scale_y,
+        :pad_w,
+        :pad_h,
+        :observed_at_ms,
+        :motion
+      ])
+
     {_actions, state} =
       InferSink.handle_buffer(
         :input,
-        %Buffer{payload: <<0, 0, 1, 0x65, 0x88>>, pts: Membrane.Time.seconds(1)},
+        %Buffer{payload: frame.payload, pts: Membrane.Time.seconds(1), metadata: metadata},
         %{},
         state
       )

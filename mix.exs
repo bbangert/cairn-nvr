@@ -92,6 +92,9 @@ defmodule Cairn.MixProject do
       {:decimal, "~> 3.0", override: true},
       {:membrane_mp4_plugin, "~> 0.36.10"},
       {:membrane_h26x_plugin, "~> 0.11.2"},
+      # D-C2: the decoder element's stream format is `%Membrane.RawVideo{}`,
+      # the ecosystem's one raw-frame vocabulary — never a custom struct.
+      {:membrane_raw_video_format, "~> 0.4.1"},
       {:membrane_mpeg_ts_plugin, "~> 2.4.9"},
       {:membrane_tee_plugin, "~> 0.12.0"},
       {:membrane_rtp_plugin, "~> 0.31.5"},

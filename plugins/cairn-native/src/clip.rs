@@ -1,6 +1,9 @@
 //! The one end-to-end path: a real H.264 file, real model load, real decoder,
-//! every access unit handed to `push_au` the way Membrane's H.264 parser will hand
-//! them over. Only the demuxer stands in for the pipeline.
+//! every access unit handed over the way Membrane's H.264 parser will hand
+//! them over — through both halves of the split boundary, `decode_au`'s and
+//! `push_frame`'s, with the [`Rig`] standing in for the Elixir orchestration
+//! between them (the rate gate and the frame handoff). Only the demuxer
+//! stands in for the pipeline.
 //!
 //! It needs artifacts this repository does not carry (`*.onnx` is gitignored), and
 //! a missing one fails the run rather than skipping: a test that returns without
@@ -30,18 +33,22 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rsmpeg::avformat::AVFormatContextInput;
 use rsmpeg::ffi;
 
+use cairn_detect::decode::sample_interval;
+use cairn_detect::infer::InputSize;
+
 use crate::config::{RawInitConfig, RawQnnOptions, RawStreamParams};
+use crate::decoder::DecodeStream;
 use crate::engine::Engine;
 use crate::error::Result;
 use crate::observation::FrameObservations;
-use crate::stream::Stream;
-use crate::StreamRef;
+use crate::stream::{frame_from, Frame, Stream};
+use crate::{DecoderRef, StreamRef};
 
 const WAIVER: &str = "CAIRN_NATIVE_SKIP_CLIP";
 
@@ -172,31 +179,91 @@ fn read_clip(path: &Path) -> Clip {
     Clip { units, time_base }
 }
 
-fn feed(stream: &mut Stream, clip: &Clip) -> Vec<FrameObservations> {
-    clip.units
-        .iter()
-        .flat_map(|(au, pts)| {
-            stream
-                .push_au(au, *pts, clip.time_base, Instant::now())
-                .expect("every access unit is accepted")
-        })
-        .collect()
+/// Both halves of the boundary plus the orchestration the Elixir side owns
+/// between them: the wall-clock rate gate (`Cairn.Pipeline.SampleGate`'s
+/// semantics, restated here because the whole point of the split is that the
+/// crate no longer has them) and the frame handoff. Everything goes through
+/// the same resource wrappers the NIFs use, so the locks under test are the
+/// production locks.
+struct Rig {
+    decoder: DecoderRef,
+    stream: StreamRef,
+    time_base: (i32, i32),
+    interval: Duration,
+    last_sample: Mutex<Option<Instant>>,
+}
+
+impl Rig {
+    fn open(engine: &Arc<Engine>, camera_id: &str, time_base: (i32, i32)) -> Self {
+        Self {
+            decoder: DecoderRef::new(
+                DecodeStream::open(
+                    engine,
+                    camera_id.to_string(),
+                    params().resolve().expect("the params resolve"),
+                )
+                .expect("the decoder opens"),
+            ),
+            stream: StreamRef::new(Arc::clone(engine), open(engine, camera_id)),
+            time_base,
+            interval: sample_interval(engine.sample_fps),
+            last_sample: Mutex::new(None),
+        }
+    }
+
+    /// Forget the gate's last sample, so the next completed frame samples for
+    /// certain — for tests that feed one clip several times faster than the
+    /// sample interval and need each feed to reach the inference half.
+    fn rearm(&self) {
+        *self.last_sample.lock().unwrap() = None;
+    }
+
+    /// One access unit through decode, the rate gate and — when a frame was
+    /// sampled — inference. The gate's semantics are the element's: `sample`
+    /// is decided before the decode call, and the interval is spent when a
+    /// frame *completed*, whatever became of its conversion.
+    fn push_au(&self, au: &[u8], pts: i64, now: Instant) -> Result<Vec<FrameObservations>> {
+        let sample = {
+            let last = self.last_sample.lock().unwrap();
+            last.is_none_or(|last| now.duration_since(last) >= self.interval)
+        };
+        let decoded = self.decoder.push(au, pts, sample)?;
+        if sample && decoded.completed {
+            *self.last_sample.lock().unwrap() = Some(now);
+        }
+        match decoded.frame {
+            Some(frame) => self.stream.push(frame_from(&frame, self.time_base)),
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
+fn feed(rig: &Rig, clip: &Clip) -> Vec<FrameObservations> {
+    try_feed(rig, clip).expect("every access unit is accepted")
 }
 
 /// The same, with the arrival instants the test's own rather than the wall clock's:
 /// `spacing` stands in for the camera's frame period, so what the rate gate does
 /// with a feed is a property of the numbers and not of how fast this box infers.
-fn feed_at(stream: &mut Stream, clip: &Clip, spacing: Duration) -> Vec<FrameObservations> {
+fn feed_at(rig: &Rig, clip: &Clip, spacing: Duration) -> Vec<FrameObservations> {
     let start = Instant::now();
     clip.units
         .iter()
         .enumerate()
         .flat_map(|(i, (au, pts))| {
-            stream
-                .push_au(au, *pts, clip.time_base, start + spacing * i as u32)
+            rig.push_au(au, *pts, start + spacing * i as u32)
                 .expect("every access unit is accepted")
         })
         .collect()
+}
+
+/// [`feed`] with the error in hand, for the tests about refusals.
+fn try_feed(rig: &Rig, clip: &Clip) -> Result<Vec<FrameObservations>> {
+    let mut frames = Vec::new();
+    for (au, pts) in &clip.units {
+        frames.extend(rig.push_au(au, *pts, Instant::now())?);
+    }
+    Ok(frames)
 }
 
 /// Whether an access unit is keyframe-headed, by the walk `Cairn.Pipeline.Picker`
@@ -216,16 +283,6 @@ fn is_keyframe(au: &[u8]) -> bool {
     false
 }
 
-/// The same through the resource handle, which is what serializes two callers on
-/// one stream.
-fn feed_shared(stream: &StreamRef, clip: &Clip) -> Result<Vec<FrameObservations>> {
-    let mut frames = Vec::new();
-    for (au, pts) in &clip.units {
-        frames.extend(stream.push(au, *pts, clip.time_base)?);
-    }
-    Ok(frames)
-}
-
 fn open(engine: &Arc<Engine>, camera_id: &str) -> Stream {
     Stream::open(
         Arc::clone(engine),
@@ -242,8 +299,9 @@ fn a_recorded_clip_decodes_and_infers() {
     };
 
     let engine = engine(&artifacts);
-    let mut stream = open(&engine, "front");
-    let frames = feed(&mut stream, &read_clip(&artifacts.clip));
+    let clip = read_clip(&artifacts.clip);
+    let rig = Rig::open(&engine, "front", clip.time_base);
+    let frames = feed(&rig, &clip);
 
     assert!(
         !frames.is_empty(),
@@ -294,8 +352,8 @@ fn the_rate_gate_admits_sample_fps_and_not_the_gop_rate() {
     let clip = read_clip(&artifacts.clip);
     let spacing = Duration::from_millis(50);
 
-    let mut stream = open(&engine, "front");
-    let frames = feed_at(&mut stream, &clip, spacing);
+    let rig = Rig::open(&engine, "front", clip.time_base);
+    let frames = feed_at(&rig, &clip, spacing);
 
     // One admitted every 200 ms over a feed of `units - 1` spacings, less the
     // decoder's start-up latency, which costs whole intervals at the head.
@@ -332,8 +390,8 @@ fn a_mid_gop_access_unit_decodes_and_infers() {
 
     // A spacing past the 200 ms interval, so the gate admits every unit and what
     // is left is the decoder's own answer.
-    let mut stream = open(&engine, "front");
-    let frames = feed_at(&mut stream, &clip, Duration::from_millis(250));
+    let rig = Rig::open(&engine, "front", clip.time_base);
+    let frames = feed_at(&rig, &clip, Duration::from_millis(250));
     let keyframes = clip.units.iter().filter(|(au, _)| is_keyframe(au)).count();
 
     assert!(
@@ -351,7 +409,10 @@ fn a_mid_gop_access_unit_decodes_and_infers() {
     assert!(frames.windows(2).all(|pair| pair[0].pts <= pair[1].pts));
 }
 
-/// The registry, against a real engine rather than against itself.
+/// The registry, against a real engine rather than against itself. The claim
+/// belongs to the *inference* stream — a decoder holds none, because two
+/// decoders for one camera only waste work while two inference streams would
+/// double-report it.
 #[test]
 fn one_camera_holds_one_stream_and_gets_it_back_when_it_closes() {
     let Some(artifacts) = artifacts() else {
@@ -381,23 +442,19 @@ fn one_camera_holds_one_stream_and_gets_it_back_when_it_closes() {
     .is_ok());
 }
 
-/// A decoder that panics while being built leaves no [`Stream`] for the unwind to
-/// drop, so the id has to come back on its own.
+/// A decoder that panics while being built must leave the camera fully openable:
+/// there is no claim on this half to leak, and the inference half's claim is
+/// nothing the decode open ever touched.
 #[test]
-fn a_panic_while_the_decoder_opens_hands_the_camera_id_back() {
+fn a_panic_while_the_decoder_opens_leaves_the_camera_openable() {
     let Some(artifacts) = artifacts() else {
         return;
     };
     let engine = engine(&artifacts);
 
     engine.panic_in_the_next_open();
-    let panicked = crate::guarded("open_stream", || {
-        Stream::open(
-            Arc::clone(&engine),
-            "front".into(),
-            params().resolve().unwrap(),
-        )
-        .map(|_| ())
+    let panicked = crate::guarded("open_decoder", || {
+        DecodeStream::open(&engine, "front".into(), params().resolve().unwrap()).map(|_| ())
     });
     assert_eq!(
         panicked.unwrap_err().reason(),
@@ -405,11 +462,9 @@ fn a_panic_while_the_decoder_opens_hands_the_camera_id_back() {
         "the open did not panic, so nothing below is being tested"
     );
 
-    // …and the camera is openable: the host retries an open that failed, and a
-    // claim nothing released makes every retry a duplicate.
     let clip = read_clip(&artifacts.clip);
-    let mut reopened = open(&engine, "front");
-    assert!(!feed(&mut reopened, &clip).is_empty());
+    let rig = Rig::open(&engine, "front", clip.time_base);
+    assert!(!feed(&rig, &clip).is_empty());
 }
 
 /// A camera producing nothing the decoder can use must cost its neighbours nothing.
@@ -427,22 +482,26 @@ fn a_stream_fed_garbage_leaves_its_neighbours_alone() {
         time_base: clip.time_base,
     };
 
-    let mut front = open(&engine, "front");
-    let mut drive = open(&engine, "drive");
-    let mut gate = open(&engine, "gate");
+    let front = Rig::open(&engine, "front", clip.time_base);
+    let drive = Rig::open(&engine, "drive", clip.time_base);
+    let gate = Rig::open(&engine, "gate", clip.time_base);
 
-    assert!(feed(&mut drive, &garbage).is_empty(), "garbage decoded");
-    let before = feed(&mut front, &clip);
+    assert!(feed(&drive, &garbage).is_empty(), "garbage decoded");
+    let before = feed(&front, &clip);
     // …and interleaving changes nothing: the garbage lands in `drive`'s own
     // decoder, and `gate` is fed after it.
-    assert!(feed(&mut drive, &garbage).is_empty());
-    let after = feed(&mut gate, &clip);
+    assert!(feed(&drive, &garbage).is_empty());
+    let after = feed(&gate, &clip);
 
     assert!(!before.is_empty(), "the healthy stream produced nothing");
     assert!(!after.is_empty(), "the neighbour after it produced nothing");
-    assert_eq!(front.tolerated(), (0, 0), "the healthy stream took damage");
-    assert_eq!(gate.tolerated(), (0, 0), "the neighbour took damage");
-    println!("the garbage stream counted {:?}", drive.tolerated());
+    let counted = |rig: &Rig| {
+        let mut state = rig.decoder.state.lock().unwrap();
+        state.as_mut().expect("the decoder is open").tolerated()
+    };
+    assert_eq!(counted(&front), (0, 0), "the healthy stream took damage");
+    assert_eq!(counted(&gate), (0, 0), "the neighbour took damage");
+    println!("the garbage stream counted {:?}", counted(&drive));
 }
 
 /// A stream's own failures are values, and cost it one call rather than itself.
@@ -453,28 +512,61 @@ fn a_stream_error_is_a_value_and_the_stream_survives_it() {
     };
     let engine = engine(&artifacts);
     let clip = read_clip(&artifacts.clip);
-    let (au, pts) = &clip.units[0];
 
-    let mut front = open(&engine, "front");
-    let mut drive = open(&engine, "drive");
+    let front = Rig::open(&engine, "front", clip.time_base);
+    let drive = Rig::open(&engine, "drive", clip.time_base);
 
-    for bad in [
-        front.push_au(&[], *pts, clip.time_base, Instant::now()),
-        front.push_au(au, *pts, (0, 0), Instant::now()),
-    ] {
-        assert_eq!(bad.unwrap_err().reason(), "decode");
-    }
+    // An empty access unit is refused on the decode half…
+    let bad = front.push_au(&[], 0, Instant::now());
+    assert_eq!(bad.unwrap_err().reason(), "decode");
 
-    assert!(!feed(&mut front, &clip).is_empty(), "the stream is spent");
-    assert!(
-        !feed(&mut drive, &clip).is_empty(),
-        "the neighbour is spent"
-    );
+    // …and a time base that would fault the rescale is refused on the
+    // inference half, before any of it runs.
+    let refused = front.stream.push(Frame {
+        rgb: &[],
+        content: InputSize { w: 1, h: 1 },
+        orig: InputSize { w: 1, h: 1 },
+        pts: Some(0),
+        time_base: (0, 0),
+        observed_at_ms: 0,
+        motion: None,
+    });
+    assert_eq!(refused.unwrap_err().reason(), "decode");
+
+    assert!(!feed(&front, &clip).is_empty(), "the stream is spent");
+    assert!(!feed(&drive, &clip).is_empty(), "the neighbour is spent");
 }
 
-/// Armed inside the model pass and reached through `push_au`, so the unwind goes
-/// through the stream lock *and* the model lock — the only shape the frame path can
-/// make, and one a model lock poisoned on its own cannot imitate.
+/// A frame whose geometry disagrees with the engine's own input spec is a
+/// producer bug, not a tolerated skip: every later frame would be wrong the
+/// same way, so it is refused loudly as an inference error.
+#[test]
+fn a_frame_for_a_different_spec_is_refused_not_projected() {
+    let Some(artifacts) = artifacts() else {
+        return;
+    };
+    let engine = engine(&artifacts);
+    let clip = read_clip(&artifacts.clip);
+    let rig = Rig::open(&engine, "front", clip.time_base);
+
+    let refused = rig.stream.push(Frame {
+        rgb: &[0u8; 12],
+        content: InputSize { w: 2, h: 2 },
+        orig: InputSize { w: 1920, h: 1080 },
+        pts: Some(0),
+        time_base: clip.time_base,
+        observed_at_ms: 0,
+        motion: None,
+    });
+    assert_eq!(refused.unwrap_err().reason(), "infer");
+
+    // …and the refusal cost the stream nothing.
+    assert!(!feed(&rig, &clip).is_empty());
+}
+
+/// Armed inside the model pass and reached through `push_frame`, so the unwind
+/// goes through the stream lock *and* the model lock — the only shape the frame
+/// path can make, and one a model lock poisoned on its own cannot imitate.
 #[test]
 fn a_panic_in_a_model_pass_is_model_poisoned_on_every_stream_including_its_own() {
     let Some(artifacts) = artifacts() else {
@@ -483,11 +575,11 @@ fn a_panic_in_a_model_pass_is_model_poisoned_on_every_stream_including_its_own()
     let engine = engine(&artifacts);
     let clip = read_clip(&artifacts.clip);
 
-    let front = StreamRef::new(Arc::clone(&engine), open(&engine, "front"));
-    let drive = StreamRef::new(Arc::clone(&engine), open(&engine, "drive"));
+    let front = Rig::open(&engine, "front", clip.time_base);
+    let drive = Rig::open(&engine, "drive", clip.time_base);
 
     engine.panic_in_the_next_pass();
-    let panicked = crate::guarded("push_au", || feed_shared(&front, &clip));
+    let panicked = crate::guarded("push_frame", || try_feed(&front, &clip));
     assert_eq!(
         panicked.unwrap_err().reason(),
         "panicked",
@@ -498,18 +590,21 @@ fn a_panic_in_a_model_pass_is_model_poisoned_on_every_stream_including_its_own()
         "the panic did not reach the model lock"
     );
 
-    for (name, stream) in [
+    for (name, rig) in [
         ("the stream it happened on", &front),
         ("its neighbour", &drive),
     ] {
-        let error = feed_shared(stream, &clip).unwrap_err();
+        // Rearmed so this feed reaches the inference half at all: the verdict
+        // under test lives past the rate gate.
+        rig.rearm();
+        let error = try_feed(rig, &clip).unwrap_err();
         assert_eq!(error.reason(), "model_poisoned", "{name}");
     }
 
     // …and what never reached the model still says whose fault it was, so a stream
     // sending nonsense cannot tell the host the engine is gone.
-    let mut fresh = open(&engine, "gate");
-    let refused = fresh.push_au(&[], 0, clip.time_base, Instant::now());
+    let fresh = Rig::open(&engine, "gate", clip.time_base);
+    let refused = fresh.push_au(&[], 0, Instant::now());
     assert_eq!(refused.unwrap_err().reason(), "decode");
 }
 
@@ -523,17 +618,17 @@ fn a_panic_in_a_streams_own_state_stays_that_streams_problem() {
     let engine = engine(&artifacts);
     let clip = read_clip(&artifacts.clip);
 
-    let front = StreamRef::new(Arc::clone(&engine), open(&engine, "front"));
-    let drive = StreamRef::new(Arc::clone(&engine), open(&engine, "drive"));
-    front.poison_state();
+    let front = Rig::open(&engine, "front", clip.time_base);
+    let drive = Rig::open(&engine, "drive", clip.time_base);
+    front.stream.poison_state();
 
     assert_eq!(
-        feed_shared(&front, &clip).unwrap_err().reason(),
+        try_feed(&front, &clip).unwrap_err().reason(),
         "poisoned",
-        "one camera's decoder took the whole engine with it"
+        "one camera's stream took the whole engine with it"
     );
     assert!(!engine.model_is_poisoned());
-    assert!(!feed_shared(&drive, &clip).unwrap().is_empty());
+    assert!(!try_feed(&drive, &clip).unwrap().is_empty());
 }
 
 /// A `close` that refused the poisoned lock would leave the id claimed until GC, so
@@ -546,17 +641,17 @@ fn a_poisoned_stream_closes_and_its_camera_can_be_opened_again() {
     let engine = engine(&artifacts);
     let clip = read_clip(&artifacts.clip);
 
-    let front = StreamRef::new(Arc::clone(&engine), open(&engine, "front"));
-    front.poison_state();
+    let front = Rig::open(&engine, "front", clip.time_base);
+    front.stream.poison_state();
     assert_eq!(
-        feed_shared(&front, &clip).unwrap_err().reason(),
+        try_feed(&front, &clip).unwrap_err().reason(),
         "poisoned",
         "the stream is not in the state the rest of this test is about"
     );
 
-    assert!(front.close(), "a poisoned stream did not close");
+    assert!(front.stream.close(), "a poisoned stream did not close");
     assert!(
-        !front.close(),
+        !front.stream.close(),
         "closing an emptied stream is not a second close"
     );
 
@@ -567,7 +662,17 @@ fn a_poisoned_stream_closes_and_its_camera_can_be_opened_again() {
     )
     .expect("the camera id was never handed back, so the camera stays dark");
     let reopened = StreamRef::new(Arc::clone(&engine), reopened);
-    assert!(!feed_shared(&reopened, &clip).unwrap().is_empty());
+    drop(front);
+    let rig = Rig {
+        decoder: DecoderRef::new(
+            DecodeStream::open(&engine, "front".into(), params().resolve().unwrap()).unwrap(),
+        ),
+        stream: reopened,
+        time_base: clip.time_base,
+        interval: sample_interval(engine.sample_fps),
+        last_sample: Mutex::new(None),
+    };
+    assert!(!try_feed(&rig, &clip).unwrap().is_empty());
 }
 
 /// The other way a stream ends: the BEAM collected the handle.
@@ -611,12 +716,12 @@ fn two_streams_make_progress_at_once() {
     };
     let engine = engine(&artifacts);
     let clip = read_clip(&artifacts.clip);
-    let front = StreamRef::new(Arc::clone(&engine), open(&engine, "front"));
-    let drive = StreamRef::new(Arc::clone(&engine), open(&engine, "drive"));
+    let front = Rig::open(&engine, "front", clip.time_base);
+    let drive = Rig::open(&engine, "drive", clip.time_base);
 
     let (a, b) = std::thread::scope(|scope| {
-        let a = scope.spawn(|| feed_shared(&front, &clip));
-        let b = scope.spawn(|| feed_shared(&drive, &clip));
+        let a = scope.spawn(|| try_feed(&front, &clip));
+        let b = scope.spawn(|| try_feed(&drive, &clip));
         (a.join().unwrap(), b.join().unwrap())
     });
 
@@ -624,8 +729,8 @@ fn two_streams_make_progress_at_once() {
     assert!(!b.expect("the second stream failed").is_empty());
 }
 
-/// Two callers on *one* stream: the resource's mutex serializes them, so the
-/// decoder is never entered twice.
+/// Two callers on *one* camera's pair: the resources' mutexes serialize them, so
+/// neither the decoder nor the stream is ever entered twice.
 #[test]
 fn two_pushes_to_one_stream_serialize() {
     let Some(artifacts) = artifacts() else {
@@ -633,11 +738,11 @@ fn two_pushes_to_one_stream_serialize() {
     };
     let engine = engine(&artifacts);
     let clip = read_clip(&artifacts.clip);
-    let front = StreamRef::new(Arc::clone(&engine), open(&engine, "front"));
+    let front = Rig::open(&engine, "front", clip.time_base);
 
     let frames = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..2)
-            .map(|_| scope.spawn(|| feed_shared(&front, &clip)))
+            .map(|_| scope.spawn(|| try_feed(&front, &clip)))
             .collect();
         handles
             .into_iter()
@@ -649,6 +754,8 @@ fn two_pushes_to_one_stream_serialize() {
     assert!(frames > 0, "two callers produced no frame between them");
     // `close` recovers a poisoned guard, so the poisoning half has to be asked
     // separately.
-    assert!(!front.state.is_poisoned(), "a push panicked");
-    assert!(front.close());
+    assert!(!front.stream.state.is_poisoned(), "a push panicked");
+    assert!(!front.decoder.state.is_poisoned(), "a decode panicked");
+    assert!(front.stream.close());
+    assert!(front.decoder.close());
 }
