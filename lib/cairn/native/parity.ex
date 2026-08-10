@@ -410,7 +410,9 @@ defmodule Cairn.Native.Parity do
   defp infer(_stream, nil, _time_base), do: []
 
   defp infer(stream, frame, time_base) do
-    meta = Map.take(frame, [:width, :height, :orig_width, :orig_height, :pts, :observed_at_ms, :motion])
+    meta =
+      Map.take(frame, [:width, :height, :orig_width, :orig_height, :pts, :observed_at_ms, :motion])
+
     {:ok, {frames, []}} = Native.push_frame(stream, frame.payload, meta, time_base)
     frames
   end
