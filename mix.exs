@@ -99,6 +99,10 @@ defmodule Cairn.MixProject do
       {:membrane_tee_plugin, "~> 0.12.0"},
       {:membrane_rtp_plugin, "~> 0.31.5"},
       {:membrane_rtp_h264_plugin, "~> 0.20.6"},
+      # D-C3: the motion gate's arithmetic — plain BinaryBackend, no EXLA;
+      # the gate exists to *skip* heavy work, so it must not need an
+      # accelerator (or a native dep) of its own.
+      {:nx, "~> 0.13"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:sobelow, "~> 0.14", only: [:dev, :test], runtime: false}

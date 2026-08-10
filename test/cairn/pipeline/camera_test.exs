@@ -108,6 +108,70 @@ defmodule Cairn.Pipeline.CameraTest do
                stream_params: %{min_score: %{"person" => 0.6}, stream_epoch: "epoch"}
              } = inference
     end
+
+    test "no motion_json, no gate element — today's chain exactly" do
+      spec = spec(detect: detect(stream_params: %{min_score: %{}}))
+
+      refute Map.has_key?(children(spec), :motion_gate)
+      assert Enum.any?(links(spec), &match?(%{from: :decoder, to: :infer}, &1))
+    end
+
+    test "an enabled motion_json puts the gate between decoder and inference" do
+      params = %{min_score: %{}, motion_json: ~s({"enabled":true,"threshold":30})}
+      spec = spec(detect: detect(stream_params: params, sample_fps: 5))
+      links = links(spec)
+
+      # The measurement is the element's (D-C3): the decoder is told nothing
+      # about motion, while inference keeps the full params — the gate
+      # *policy* still lives with the model session and reads these knobs.
+      {_name, decoder, _opts} =
+        Enum.find_value(spec, &Enum.find(&1.children, fn {name, _d, _o} -> name == :decoder end))
+
+      assert decoder.stream_params.motion_json == nil
+
+      {_name, inference, _opts} =
+        Enum.find_value(spec, &Enum.find(&1.children, fn {name, _d, _o} -> name == :infer end))
+
+      assert inference.stream_params.motion_json == params.motion_json
+
+      {_name, gate, _opts} =
+        Enum.find_value(
+          spec,
+          &Enum.find(&1.children, fn {name, _d, _o} -> name == :motion_gate end)
+        )
+
+      assert %Cairn.Pipeline.MotionGate{
+               config: %Cairn.Motion.Config{enabled: true, threshold: 30},
+               sample_fps: 5
+             } = gate
+
+      # The same one-frame seam on both sides of the gate.
+      for {from, to} <- [{:decoder, :motion_gate}, {:motion_gate, :infer}] do
+        assert %{to_pad_props: props} = Enum.find(links, &match?(%{from: ^from, to: ^to}, &1)),
+               "no #{from} -> #{to} link"
+
+        assert props.target_queue_size == 1
+        assert props.min_demand_factor == 0.5
+      end
+
+      refute Enum.any?(links, &match?(%{from: :decoder, to: :infer}, &1))
+    end
+
+    test "an enabled gate without a sample rate refuses to guess the calibration window" do
+      params = %{min_score: %{}, motion_json: ~s({"enabled":true})}
+
+      assert_raise KeyError, fn ->
+        spec(detect: detect(stream_params: params))
+      end
+    end
+
+    test "a malformed motion_json is a build error the operator can read" do
+      params = %{min_score: %{}, motion_json: ~s({"treshold":30})}
+
+      assert_raise ArgumentError, ~r/cam: motion_json: unknown motion knob/, fn ->
+        spec(detect: detect(stream_params: params, sample_fps: 5))
+      end
+    end
   end
 
   describe "a reload's policy" do
