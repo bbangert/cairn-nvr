@@ -92,7 +92,13 @@ defmodule Cairn.Pipeline.Camera do
 
   defp ingest_spec(:rtsp, owner, epoch) do
     child(:source, %Cairn.Pipeline.RtspSource{owner: owner, session: epoch})
-    |> child(:ingest_parser, %Membrane.H264.Parser{output_alignment: :au})
+    |> child(:ingest_parser, %Membrane.H264.Parser{
+      output_alignment: :au,
+      # Explicit, matching what the demuxer path carries to the tee: the
+      # cmaf branch re-parses to :avc3 itself, and the RTP branch wants
+      # in-band parameter sets.
+      output_stream_structure: :annexb
+    })
   end
 
   # No plugin configured is no detection, exactly as on the classic path.

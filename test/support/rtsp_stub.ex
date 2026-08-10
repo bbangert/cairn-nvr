@@ -19,6 +19,8 @@ defmodule Cairn.RTSPStub do
     * `connect: {:error, reason}` — refuse the connect instead; consumed
       once (the retry after backoff connects normally), so refusal-then-
       recovery is expressible
+    * `start: {:error, reason}` — refuse `start/1` itself (no process);
+      consumed once, like `connect`
   """
 
   use GenServer
@@ -41,7 +43,18 @@ defmodule Cairn.RTSPStub do
   # -- the surface Cairn.FFmpegPort calls -------------------------------------
 
   def start(opts) do
-    GenServer.start(__MODULE__, opts)
+    uri = Keyword.fetch!(opts, :stream_uri)
+    control = :persistent_term.get({__MODULE__, uri}, %{})
+
+    case control[:start] do
+      {:error, _reason} = refusal ->
+        :persistent_term.put({__MODULE__, uri}, Map.delete(control, :start))
+        if test = control[:test], do: send(test, {:rtsp_start_refused, refusal})
+        refusal
+
+      nil ->
+        GenServer.start(__MODULE__, opts)
+    end
   end
 
   def connect(client), do: GenServer.call(client, :connect)

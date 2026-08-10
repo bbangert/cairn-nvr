@@ -410,6 +410,19 @@ defmodule Cairn.FFmpegPortTest do
       end
     end
 
+    defmodule SilentPipeline do
+      # Starts but never announces a source, so the port's pending buffer is
+      # observable.
+      use Membrane.Pipeline
+
+      @impl true
+      def handle_init(_ctx, opts) do
+        test_pid = :persistent_term.get({:membrane_stub, Keyword.fetch!(opts, :camera).id})
+        send(test_pid, {:pipeline_started, self(), opts})
+        {[], %{}}
+      end
+    end
+
     defp start_rtsp(id, opts \\ []) do
       :persistent_term.put({:membrane_stub, id}, self())
       uri = "rtsp://127.0.0.1:554/#{id}"
@@ -436,7 +449,7 @@ defmodule Cairn.FFmpegPortTest do
              backoff_min_ms: 50,
              backoff_max_ms: 200,
              watchdog_interval_ms: 100,
-             pipeline_module: RtspStubPipeline,
+             pipeline_module: Keyword.get(opts, :pipeline, RtspStubPipeline),
              rtsp_module: Cairn.RTSPStub
            ]}
       )
@@ -503,14 +516,33 @@ defmodule Cairn.FFmpegPortTest do
       assert opts2[:epoch] != opts[:epoch]
     end
 
+    test "a refused start (bad host) is a value and a backoff, not a crash" do
+      id = "rx_#{System.unique_integer([:positive])}"
+
+      start_rtsp(id,
+        control: [test: self(), start: {:error, :nxdomain}],
+        port_opts: [backoff_min_ms: 800]
+      )
+
+      # The refusal happened before any client existed; the port survived it
+      # (a MatchError here would restart the camera process and lose its
+      # backoff state) and the retry recovers.
+      assert_receive {:rtsp_start_refused, {:error, :nxdomain}}, 2_000
+      refute_receive {:pipeline_started, _, _}, 100
+
+      assert_receive {:rtsp_started, _client, _}, 3_000
+      assert_receive {:pipeline_started, _pipeline, _opts}, 2_000
+    end
+
     test "a refused connect backs off and the retry recovers" do
       id = "rr_#{System.unique_integer([:positive])}"
 
-      # Backoff floor above the refute window below, so "no pipeline for the
-      # refused client" cannot race the retry's own (legitimate) pipeline.
+      # Backoff floor with real margin over the refute window: the jittered
+      # delay is backoff_ms * (0.5 + rand), so 800 ms yields at least 400 ms
+      # before the retry's own (legitimate) pipeline can appear.
       start_rtsp(id,
         control: [test: self(), connect: {:error, :econnrefused}],
-        port_opts: [backoff_min_ms: 300]
+        port_opts: [backoff_min_ms: 800]
       )
 
       # First client is started, refused at connect, and no pipeline exists
@@ -518,8 +550,48 @@ defmodule Cairn.FFmpegPortTest do
       assert_receive {:rtsp_started, _refused, _}, 2_000
       refute_receive {:pipeline_started, _, _}, 100
 
-      assert_receive {:rtsp_started, _client, _}, 2_000
+      assert_receive {:rtsp_started, _client, _}, 3_000
       assert_receive {:pipeline_started, _pipeline, _opts}, 2_000
+    end
+
+    test "a stale ready handshake cannot claim the live session's samples" do
+      id = "rf_#{System.unique_integer([:positive])}"
+      port = start_rtsp(id)
+
+      assert_receive {:rtsp_started, client, _}, 2_000
+      assert_receive {:pipeline_started, _pipeline, _opts}, 2_000
+
+      # A source outliving a force-killed predecessor announces itself with
+      # ITS session's epoch — never the live one's — and must be ignored.
+      send(port, {:rtsp_source_ready, "01STALEEPOCH00000000000000", self()})
+      send(port, {:rtsp, client, {"video", {<<5>>, 0, true, 0}}})
+
+      # The live pipeline keeps receiving; the impostor (us) never does.
+      assert_receive {:pipeline_msg, {:rtsp_sample, <<5>>, 0}}, 2_000
+      refute_received {:rtsp_sample, _, _}
+    end
+
+    @tag :capture_log
+    test "samples ahead of the handshake are pended, and the flood is bounded" do
+      id = "rp_#{System.unique_integer([:positive])}"
+      # A pipeline that never announces a source: everything pends.
+      port = start_rtsp(id, pipeline: __MODULE__.SilentPipeline)
+
+      assert_receive {:rtsp_started, client, _}, 2_000
+      assert_receive {:pipeline_started, _pipeline, _opts}, 2_000
+
+      # Three 3 MB samples: the third crosses the 8 MB cap and is dropped —
+      # visible in state rather than unbounded memory.
+      big = :binary.copy(<<0>>, 3 * 1024 * 1024)
+
+      for pts <- [0, 9_000, 18_000] do
+        send(port, {:rtsp, client, {"video", {big, pts, false, 0}}})
+      end
+
+      state = :sys.get_state(port)
+      assert state.pending_bytes <= 8 * 1024 * 1024
+      assert length(state.pending) == 2
+      assert state.dropped_bytes > 0
     end
 
     test "a camera advertising no H264 video track is refused, not decoded wrong" do

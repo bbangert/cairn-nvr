@@ -608,30 +608,39 @@ defmodule Cairn.FFmpegPort do
     end
   end
 
-  # connect → exactly one H.264 video track → play. Any other answer is a
+  # start → connect → exactly one H.264 video track → play, every step a
+  # value: a refused start (bad host, exhausted resources) is the same
+  # backoff a dead ffmpeg gets, never a MatchError that would crash this
+  # process and its backoff/epoch state with it. Any other answer is a
   # camera this ingest cannot serve, refused with the reason in the log —
   # the operator's remedy is `ingest: ffmpeg` (D-M7's escape hatch).
   defp open_rtsp(state) do
     rtsp = rtsp_module(state)
 
-    {:ok, client} =
-      rtsp.start(
-        stream_uri: state.camera.rtsp_url,
-        transport: :tcp,
-        receiver: self()
-      )
+    case rtsp.start(
+           stream_uri: state.camera.rtsp_url,
+           transport: :tcp,
+           receiver: self()
+         ) do
+      {:ok, client} ->
+        ref = Process.monitor(client)
 
-    ref = Process.monitor(client)
+        with {:ok, tracks} <- rtsp.connect(client),
+             {:ok, video_path, clock_rate} <- video_track(tracks),
+             :ok <- rtsp.play(client) do
+          {:ok, client, ref, video_path, clock_rate}
+        else
+          error ->
+            Process.demonitor(ref, [:flush])
+            catch_stop(rtsp, client)
+            normalize_error(error)
+        end
 
-    with {:ok, tracks} <- rtsp.connect(client),
-         {:ok, video_path, clock_rate} <- video_track(tracks),
-         :ok <- rtsp.play(client) do
-      {:ok, client, ref, video_path, clock_rate}
-    else
-      error ->
-        Process.demonitor(ref, [:flush])
-        catch_stop(rtsp, client)
-        normalize_error(error)
+      :ignore ->
+        {:error, :ignore}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -694,14 +703,32 @@ defmodule Cairn.FFmpegPort do
 
   defp kill_rtsp(%{rtsp: nil} = state), do: state
 
+  # Off this process's loop: the library's `stop/1` is a synchronous call
+  # into a client that may be wedged, and the camera's message loop must not
+  # be — `kill_port/1`'s TERM is non-blocking for the same reason. The
+  # monitor is already flushed, so teardown owes us nothing; the backstop
+  # kill bounds a graceful stop that never returns (the client holds only
+  # its socket, which dies with it).
   defp kill_rtsp(state) do
     Process.demonitor(state.rtsp_ref, [:flush])
-    catch_stop(rtsp_module(state), state.rtsp)
+    client = state.rtsp
+    rtsp = rtsp_module(state)
+
+    spawn(fn ->
+      {_stopper, ref} = spawn_monitor(fn -> catch_stop(rtsp, client) end)
+
+      receive do
+        {:DOWN, ^ref, :process, _pid, _reason} -> :ok
+      after
+        3_000 -> Process.exit(client, :kill)
+      end
+    end)
+
     %{state | rtsp: nil, rtsp_ref: nil, video_path: nil}
   end
 
   # `stop/1` on a client that already closed (or crashed) must not take the
-  # camera process with it — the session is being torn down either way.
+  # teardown process with it — the session is ending either way.
   defp catch_stop(rtsp, client) do
     rtsp.stop(client)
   catch
