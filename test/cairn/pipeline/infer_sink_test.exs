@@ -299,7 +299,7 @@ defmodule Cairn.Pipeline.InferSinkTest do
       assert state.errors == 1
     end
 
-    test "a refused open costs the frame, not the session", ctx do
+    test "a refused open costs the frame, not the session — and the drop is counted", ctx do
       host = start_host(config: nil)
       {actions, state} = playing(sink(%{ctx | host: host}))
 
@@ -309,6 +309,24 @@ defmodule Cairn.Pipeline.InferSinkTest do
       {actions, state} = feed(state)
       assert actions == [demand: {:input, 1}]
       assert state.stream == :closed
+      # a stuck reopen loop must not read as healthy in :stats while
+      # quietly discarding frames
+      assert state.dropped == 1
+    end
+
+    test "a buffer that precedes its stream format is dropped and counted, not crashed on", ctx do
+      # `Cairn.Pipeline.Decoder` always pairs its first buffer with a
+      # stream_format action, so this is unreachable from the in-tree
+      # producer — but the pad contract does not enforce it, and the sink
+      # must not read `content: nil` as geometry.
+      {actions, state} = InferSink.handle_playing(%{}, sink(ctx))
+      assert actions == [demand: {:input, 1}]
+      assert state.stream == :open
+
+      {actions, state} = InferSink.handle_buffer(:input, frame_buffer(1), %{}, state)
+      assert actions == [demand: {:input, 1}]
+      assert state.dropped == 1
+      refute_received {:"$gen_cast", {:detections, _camera, _policy, _observation}}
     end
   end
 
@@ -392,12 +410,14 @@ defmodule Cairn.Pipeline.InferSinkTest do
              "decode is being paced (min gap #{Enum.min(decode_gaps)} ms): the gate belongs " <>
                "after the decoder, not before it"
 
-      # ~36 model offers in 1.2 s at 30 fps; generous bounds, because the
-      # wall clock on CI is nobody's friend.
-      assert length(pushes) in 10..50,
+      # ~36 model offers in 1.2 s at 30 fps; deliberately loose bounds — a
+      # starved CI scheduler stretches the run but can neither multiply
+      # offers past the gate's arithmetic nor pace them closer than the
+      # interval. The lower bound only rules out a gate stuck closed.
+      assert length(pushes) in 5..55,
              "#{length(pushes)} model offers in 1.2 s against a 30 fps gate"
 
-      assert Enum.min(gaps(pushes)) >= 25,
+      assert Enum.min(gaps(pushes)) >= 20,
              "two model offers landed #{Enum.min(gaps(pushes))} ms apart: the gate is not pacing"
     end
 

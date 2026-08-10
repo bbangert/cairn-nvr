@@ -230,7 +230,11 @@ impl Tolerated {
     }
 }
 
-fn should_log(count: u64) -> bool {
+/// Whether the `count`-th tolerated anomaly is one of the logged ones: the
+/// first, then every fiftieth. `pub(crate)` so [`crate::stream`] rate-limits
+/// its own per-frame drop the same way — two spellings of this cadence would
+/// drift.
+pub(crate) fn should_log(count: u64) -> bool {
     count % LOG_EVERY == 1
 }
 

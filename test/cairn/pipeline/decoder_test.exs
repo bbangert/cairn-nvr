@@ -130,6 +130,20 @@ defmodule Cairn.Pipeline.DecoderTest do
       assert %{ref: _} = state.decoder
       assert state.errors == 1
     end
+
+    test "an access unit with no pts never reaches the NIF", ctx do
+      # The NIF's contract is an integer pts; the Picker refuses these
+      # upstream, and the element restates the refusal so it stands on its
+      # own under any producer.
+      {_actions, state} = playing(ctx, element(ctx))
+
+      {actions, state} =
+        Decoder.handle_buffer(:input, %Buffer{payload: @keyframe, pts: nil}, ctx.ctx, state)
+
+      assert actions == [demand: {:input, 1}]
+      assert state.errors == 1
+      refute_receive {:decode_au, _ref, _au, _pts, _sample}
+    end
   end
 
   describe "one access unit" do

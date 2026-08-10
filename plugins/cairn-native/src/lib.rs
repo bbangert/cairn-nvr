@@ -9,6 +9,10 @@
 //! unwinds a NIF body into an error term, but not a resource destructor
 //! (`teardown`), and nothing catches an abort or a C++ exception out of ORT.
 //! `error`'s doc is the per-stream/engine-wide partition the host dispatches on.
+//! One class of failure stays an exception: an argument the `NifMap` decoders
+//! refuse (a negative integer where `usize` is promised, a wrong-shaped map)
+//! raises `ArgumentError` in the caller *before* any body runs — a caller bug,
+//! not a stage fault, and so deliberately outside the error-term contract.
 //!
 //! Calls block the caller on a dirty scheduler — ~1 ms for a decode, ~12 ms
 //! per inference. The one shared session is the only admission control and
@@ -226,15 +230,21 @@ struct RawFrameMeta {
     motion: Option<RawMotionVerdict>,
 }
 
-fn encode_frame<'a>(env: Env<'a>, frame: DecodedFrame) -> Result<RawDecodedFrame<'a>> {
-    let mut payload = OwnedBinary::new(frame.rgb.len()).ok_or_else(|| {
-        NativeError::Decode(format!(
-            "allocating a {}-byte frame binary",
+/// `None` when the binary could not be allocated: the frame is lost, the call
+/// is not. Returning an error instead would drop the `completed` bit — the
+/// caller's rate gate would under-spend its interval — and would spell a
+/// VM-wide memory event in the tolerated per-stream `decode` class, telling
+/// the host one camera's bitstream is at fault.
+fn encode_frame<'a>(env: Env<'a>, frame: DecodedFrame) -> Option<RawDecodedFrame<'a>> {
+    let Some(mut payload) = OwnedBinary::new(frame.rgb.len()) else {
+        cairn_detect::note!(
+            "decode_au: allocating a {}-byte frame binary failed; the frame is dropped",
             frame.rgb.len()
-        ))
-    })?;
+        );
+        return None;
+    };
     payload.as_mut_slice().copy_from_slice(&frame.rgb);
-    Ok(RawDecodedFrame {
+    Some(RawDecodedFrame {
         payload: Binary::from_owned(payload, env),
         width: frame.width,
         height: frame.height,
@@ -316,10 +326,7 @@ fn decode_au<'a>(
 ) -> Result<(bool, Option<RawDecodedFrame<'a>>)> {
     guarded("decode_au", || {
         let decoded = decoder.push(au.as_slice(), pts, sample)?;
-        let frame = decoded
-            .frame
-            .map(|frame| encode_frame(env, frame))
-            .transpose()?;
+        let frame = decoded.frame.and_then(|frame| encode_frame(env, frame));
         Ok((decoded.completed, frame))
     })
 }

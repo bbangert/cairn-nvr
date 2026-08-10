@@ -28,10 +28,6 @@ use crate::engine::Engine;
 use crate::error::{chain, NativeError, Result};
 use crate::observation::FrameObservations;
 
-/// How often the out-of-bounds pts drop is logged: the first, then every
-/// fiftieth, as in `cairn_detect::decode::run`.
-const LOG_EVERY: u64 = 50;
-
 /// One sampled frame as the boundary carries it, resolved from the term shape.
 ///
 /// Geometry travels with the pixels because the projection is rebuilt from it:
@@ -139,7 +135,7 @@ impl Stream {
         // out means the rescale saturated, so it is not a timestamp.
         if !(-MAX_PTS..=MAX_PTS).contains(&pts) {
             self.unbounded_pts += 1;
-            if self.unbounded_pts % LOG_EVERY == 1 {
+            if crate::decoder::should_log(self.unbounded_pts) {
                 note!(
                     "camera {}: pts {pts} is outside +-2^62, {} frame(s) dropped so far",
                     self.camera_id,

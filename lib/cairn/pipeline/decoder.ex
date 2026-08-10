@@ -47,7 +47,14 @@ defmodule Cairn.Pipeline.Decoder do
   The native decoder opens against `Cairn.Native.Host`'s engine (same model,
   same resolved input spec as the inference stream) and reopens on a
   cooldown after stream-fatal errors, exactly as `Cairn.Pipeline.InferSink`
-  does for its half.
+  does for its half. Two liveness notes: the `Host.open_decoder/3` call is a
+  plain `GenServer.call` — the host's liveness is application-supervised (it
+  sits outside every camera's tree), so a missing host is a boot-order fault
+  that should crash this element, not a state to retry around. And
+  `Membrane.ResourceGuard.cleanup/2` is asynchronous: a reopen can overlap
+  the previous handle's native close, which is safe here precisely because a
+  decoder handle carries no camera-id claim — two decoders for one camera
+  merely waste work for a moment.
   """
 
   use Membrane.Filter
@@ -124,12 +131,21 @@ defmodule Cairn.Pipeline.Decoder do
   def handle_stream_format(:input, %Membrane.H264{}, _ctx, state), do: {[], state}
 
   @impl true
-  def handle_buffer(:input, %Buffer{} = buffer, ctx, state) do
+  def handle_buffer(:input, %Buffer{pts: pts} = buffer, ctx, state) when is_integer(pts) do
     state = ensure_decoder(state, ctx)
     {actions, state} = decode(state, ctx, buffer)
     # The next access unit is demanded whatever became of this one: decode
     # runs at line rate, and downstream demand only gates the emit.
     {actions ++ [demand: {:input, 1}], state}
+  end
+
+  # No pts is no timestamp to date a detection with, so it never reaches the
+  # NIF (whose contract is an integer) — the same refusal
+  # `Cairn.Pipeline.Picker` makes upstream in this pipeline, restated here
+  # because this element is meant to stand on its own. Counted, so a source
+  # that lost its timestamps is visible in `:stats`.
+  def handle_buffer(:input, _buffer, _ctx, state) do
+    {[demand: {:input, 1}], %{state | errors: state.errors + 1}}
   end
 
   @impl true

@@ -89,6 +89,7 @@ defmodule Cairn.Pipeline.InferSink do
        retry_at: nil,
        content: nil,
        pushed: 0,
+       dropped: 0,
        errors: 0
      }}
   end
@@ -131,6 +132,7 @@ defmodule Cairn.Pipeline.InferSink do
   def handle_parent_notification(:stats, _ctx, state) do
     stats = %{
       pushed: state.pushed,
+      dropped: state.dropped,
       errors: state.errors,
       stream: state.stream,
       engine: state.engine
@@ -193,7 +195,11 @@ defmodule Cairn.Pipeline.InferSink do
     end
   end
 
-  defp infer(state, _buffer), do: {[], state}
+  # A buffer while `stream: :closed` waits out its reopen cooldown, or one
+  # that somehow preceded its stream format: dropped, and *counted* — a stuck
+  # reopen loop must not read as healthy in `:stats` while quietly discarding
+  # frames.
+  defp infer(state, _buffer), do: {[], %{state | dropped: state.dropped + 1}}
 
   defp observe(state, frames) do
     # Monotonic, as both plugin producers pass: `at_ms` is compared against the

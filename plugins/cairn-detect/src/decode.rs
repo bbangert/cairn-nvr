@@ -583,6 +583,13 @@ pub fn model_input_from_rgb(
     source: InputSize,
     spec: InputSpec,
 ) -> Result<ModelInput> {
+    // The refusal `source_size` made for the unsplit path, restated at the
+    // boundary: a projection built for a zero-sized source divides by zero,
+    // and under `Stretch` nothing downstream would notice — every box would
+    // cross back as inf/NaN.
+    if source.w == 0 || source.h == 0 {
+        bail!("source geometry {source} has no usable dimension");
+    }
     let fit = spec.resize.fit(spec.size, source);
     if fit.inner != content {
         bail!(
@@ -856,6 +863,23 @@ mod tests {
         let plane = vec![0u8; wrong.w * 3 * wrong.h];
         let error = model_input_from_rgb(&plane, wrong, source, spec).unwrap_err();
         assert!(error.to_string().contains("does not fit"), "{error:#}");
+
+        // A zero-sized source is refused before any fit is derived from it:
+        // under `Stretch` the fit never reads the source, so without this
+        // check a correctly-sized payload would sail through and the
+        // projection would divide by zero — inf/NaN boxes, silently.
+        let stretch = InputSpec {
+            resize: ResizePolicy::Stretch,
+            ..spec
+        };
+        let plane = vec![0u8; stretch.size.tensor_len()];
+        for zeroed in [InputSize { w: 0, h: 80 }, InputSize { w: 100, h: 0 }] {
+            let error = model_input_from_rgb(&plane, stretch.size, zeroed, stretch).unwrap_err();
+            assert!(
+                error.to_string().contains("no usable dimension"),
+                "{error:#}"
+            );
+        }
 
         // The right geometry with the wrong byte count is refused too.
         let short = vec![0u8; fit.inner.w * 3 * fit.inner.h - 3];
