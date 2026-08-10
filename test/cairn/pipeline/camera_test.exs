@@ -62,23 +62,44 @@ defmodule Cairn.Pipeline.CameraTest do
       assert Map.has_key?(children, :ring_sink)
     end
 
-    test "hangs off the tee behind the picker, with the sink one hop further" do
+    test "hangs off the tee: picker, then decoder, then the sink" do
       spec = spec(detect: detect())
       links = links(spec)
 
       assert Enum.any?(links, &match?(%{from: :tee, to: :picker}, &1))
-      assert %{to_pad_props: props} = Enum.find(links, &match?(%{from: :picker, to: :infer}, &1))
-      assert props.target_queue_size == 1
-      assert props.min_demand_factor == 0.5
+
+      # One AU in flight into the decoder, one sampled frame into the sink.
+      for {from, to} <- [{:picker, :decoder}, {:decoder, :infer}] do
+        assert %{to_pad_props: props} =
+                 Enum.find(links, &match?(%{from: ^from, to: ^to}, &1)),
+               "no #{from} -> #{to} link"
+
+        assert props.target_queue_size == 1
+        assert props.min_demand_factor == 0.5
+      end
     end
 
-    test "the picker takes no options — the crate owns the rate" do
+    test "the picker takes no options — the decoder's gate owns the rate" do
       spec = spec(detect: detect())
 
       {_name, picker, _opts} =
         Enum.find_value(spec, &Enum.find(&1.children, fn {name, _d, _o} -> name == :picker end))
 
       assert picker == Cairn.Pipeline.Picker
+    end
+
+    test "the decoder and the sink share one stream_params, so the two native opens agree" do
+      params = %{min_score: %{"person" => 0.6}}
+      spec = spec(detect: detect(stream_params: params))
+
+      {_name, decoder, _opts} =
+        Enum.find_value(spec, &Enum.find(&1.children, fn {name, _d, _o} -> name == :decoder end))
+
+      {_name, sink, _opts} =
+        Enum.find_value(spec, &Enum.find(&1.children, fn {name, _d, _o} -> name == :infer end))
+
+      assert %Cairn.Pipeline.Decoder{camera_id: "cam", stream_params: ^params} = decoder
+      assert %Cairn.Pipeline.InferSink{stream_params: ^params} = sink
     end
   end
 

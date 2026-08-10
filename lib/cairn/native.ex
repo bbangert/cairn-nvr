@@ -1,7 +1,9 @@
 defmodule Cairn.Native do
   @moduledoc """
-  The `cairn-native` NIF binding: decode → motion gate → infer → Re-ID. Every
-  entry point blocks, on a dirty scheduler.
+  The `cairn-native` NIF binding, split at the frame (D-C2): `decode_au/4`
+  turns compressed access units into content-rect RGB frame maps, and
+  `push_frame/4` takes those frames through the motion gate's verdict, the
+  model and Re-ID. Every entry point blocks, on a dirty scheduler.
 
   `config` and `params` must carry every key of the crate's `RawInitConfig` /
   `RawStreamParams`; build them with `Cairn.Native.Config`, never by hand.
@@ -43,7 +45,56 @@ defmodule Cairn.Native do
   # `Cairn.Native.Host` calls through a module held in its state, which keeps them
   # dynamic. The nowarn covers the specs, which describe the loaded library.
   @dialyzer {:nowarn_function,
-             init: 1, open_stream: 3, push_au: 4, close_stream: 1, cpu_baseline_ms: 2}
+             init: 1,
+             open_stream: 3,
+             open_decoder: 3,
+             decode_au: 4,
+             push_frame: 4,
+             close_stream: 1,
+             close_decoder: 1,
+             cpu_baseline_ms: 2}
+
+  @typedoc """
+  One decoded frame on its way across the boundary: `payload` is tightly
+  packed RGB24 rows of the *content* rectangle (`width`×`height`), scaled from
+  a `orig_width`×`orig_height` source; `pad_w`/`pad_h` are what the model rect
+  adds around it (right and bottom), `scale_x`/`scale_y` the per-axis content
+  pixels per source pixel. `pts` is the frame's own timestamp in the caller's
+  time base, `nil` when the decoder had none to offer.
+  """
+  @type decoded_frame :: %{
+          payload: binary(),
+          width: pos_integer(),
+          height: pos_integer(),
+          orig_width: pos_integer(),
+          orig_height: pos_integer(),
+          pts: integer() | nil,
+          observed_at_ms: integer(),
+          scale_x: float(),
+          scale_y: float(),
+          pad_w: non_neg_integer(),
+          pad_h: non_neg_integer(),
+          motion: motion_verdict() | nil
+        }
+
+  @typedoc "The motion measurement taken on the decode side, when configured."
+  @type motion_verdict :: %{
+          changed_fraction: float(),
+          motion: boolean(),
+          calibrating: boolean(),
+          scene_cut: boolean()
+        }
+
+  @typedoc "`decoded_frame/0` minus what `push_frame/4` takes elsewhere."
+  @type frame_meta :: %{
+          width: pos_integer(),
+          height: pos_integer(),
+          orig_width: pos_integer(),
+          orig_height: pos_integer(),
+          pts: integer() | nil,
+          observed_at_ms: integer(),
+          motion: motion_verdict() | nil
+        }
 
   @spec init(map()) :: {:ok, reference()} | {:error, {atom(), String.t()}}
   def init(_config), do: :erlang.nif_error(:nif_not_loaded)
@@ -61,12 +112,44 @@ defmodule Cairn.Native do
           {:ok, reference()} | {:error, {atom(), String.t()}}
   def open_stream(_engine, _camera_id, _params), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec push_au(reference(), binary(), integer(), {integer(), integer()}) ::
+  @doc """
+  Open one camera's decoder against the engine's resolved input spec.
+
+  No camera-id claim — that guards the inference stream — and no model: the
+  engine is here so both halves of the boundary are built for the same model
+  without the host restating it.
+  """
+  @spec open_decoder(reference(), String.t(), map()) ::
+          {:ok, reference()} | {:error, {atom(), String.t()}}
+  def open_decoder(_engine, _camera_id, _params), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  Feed one access unit; take its frame when `sample` cleared the caller's
+  rate gate (`Cairn.Pipeline.SampleGate`).
+
+  The boolean is whether the decoder *completed* a frame for this access unit —
+  what the rate gate spends its interval on, whatever became of the
+  conversion. Every access unit is decoded regardless of `sample`, because a
+  stateful decoder needs its references.
+  """
+  @spec decode_au(reference(), binary(), integer(), boolean()) ::
+          {:ok, {boolean(), decoded_frame() | nil}} | {:error, {atom(), String.t()}}
+  def decode_au(_decoder, _au, _pts, _sample), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  Take one decoded frame through the detection gate and, when it says so, the
+  model. `meta` is `frame_meta/0` — the frame map `decode_au/4` answered with,
+  as `Cairn.Pipeline.Decoder` carries it.
+  """
+  @spec push_frame(reference(), binary(), frame_meta(), {integer(), integer()}) ::
           {:ok, {[map()], [String.t()]}} | {:error, {atom(), String.t()}}
-  def push_au(_stream, _au, _pts, _time_base), do: :erlang.nif_error(:nif_not_loaded)
+  def push_frame(_stream, _payload, _meta, _time_base), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec close_stream(reference()) :: {:ok, boolean()} | {:error, {atom(), String.t()}}
   def close_stream(_stream), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec close_decoder(reference()) :: {:ok, boolean()} | {:error, {atom(), String.t()}}
+  def close_decoder(_decoder), do: :erlang.nif_error(:nif_not_loaded)
 
   defp load_result, do: :persistent_term.get(@load_result, {:error, :not_loaded})
 

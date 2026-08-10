@@ -19,7 +19,7 @@ use rsmpeg::avutil::{AVFrame, AVHWDeviceContext};
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 
-use crate::decode::{cap_frame_size, source_size, Decoder, RgbScaler, Sampled};
+use crate::decode::{cap_frame_size, source_size, Decoder, RgbSampled, RgbScaler, Sampled};
 use crate::infer::{InputSize, InputSpec};
 use crate::motion::MotionConfig;
 use crate::note;
@@ -314,8 +314,28 @@ impl Decoder for HwDecoder {
     }
 
     fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<Sampled>> {
-        // Read before the graph consumes the frame: this is the geometry the
-        // camera sent, and the downloaded frame below is already scaled.
+        match self.scaled(frame)? {
+            Some((frame, source)) => self.rgb.tensor_from(&frame, source).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn to_rgb(&mut self, frame: AVFrame) -> Result<Option<RgbSampled>> {
+        match self.scaled(frame)? {
+            Some((frame, source)) => self.rgb.rgb_from(&frame, source).map(Some),
+            None => Ok(None),
+        }
+    }
+}
+
+impl HwDecoder {
+    /// The frame [`RgbScaler`] takes, on whichever path this backend is on:
+    /// the system-memory frame itself, or the GPU-scaled download. `None`
+    /// means the filter graph held this frame back (EAGAIN with nothing
+    /// drained) — skip the sample. The [`InputSize`] is the geometry the
+    /// camera sent, read before the graph consumes the frame, because the
+    /// downloaded frame is already scaled.
+    fn scaled(&mut self, frame: AVFrame) -> Result<Option<(AVFrame, InputSize)>> {
         let source = source_size(&frame)?;
         if frame.hw_frames_ctx.is_null() {
             // v4l2m2m decodes on the ASIC but returns system memory, so this
@@ -334,7 +354,7 @@ impl Decoder for HwDecoder {
                     self.backend
                 );
             }
-            return self.rgb.tensor_from(&frame, source).map(Some);
+            return Ok(Some((frame, source)));
         }
 
         let key = graph_key(&frame);
@@ -373,7 +393,7 @@ impl Decoder for HwDecoder {
             return Ok(None);
         };
 
-        self.rgb.tensor_from(&downloaded, source).map(Some)
+        Ok(Some((downloaded, source)))
     }
 }
 

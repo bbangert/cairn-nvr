@@ -78,7 +78,7 @@ defmodule Cairn.Native.StatusTest do
     test "a camera detected on natively carries the native fields", %{id: id} do
       %{host: host, reporter: reporter} = start_stack()
       {:ok, _epoch} = Host.open_stream(host, id, %{})
-      Enum.each(1..5, &Host.push_au(host, id, <<&1>>, &1, {1, 90_000}))
+      Enum.each(1..5, &NativeStub.host_push(host, id, &1))
       assert Host.check_health(host) == :healthy
 
       status = published(reporter, id)

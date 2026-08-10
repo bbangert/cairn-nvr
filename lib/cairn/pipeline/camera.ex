@@ -4,7 +4,7 @@ defmodule Cairn.Pipeline.Camera do
 
       BridgeSource ─ TS demux ─ tee ─┬─ parser(avc3) ─ CMAF ─ RingBufferSink
                                      ├─ RTPOut (in-process WebRTC hub feed)
-                                     └─ Picker ─(manual)─ InferSink
+                                     └─ Picker ─(manual)─ Decoder ─(manual)─ InferSink
 
   Started by `Cairn.FFmpegPort` alongside each ffmpeg spawn and torn down
   with it — the TS demuxer's state is only valid for one continuous ffmpeg
@@ -13,8 +13,10 @@ defmodule Cairn.Pipeline.Camera do
   No tee consumer takes its input on a `:manual` pad. That is the invariant the
   detect branch depends on: a manual input behind our push source arms
   membrane_core's toilet and is killed under exactly the overload it exists to
-  survive, so the only manual pad off the tee is the internal one between
-  `Cairn.Pipeline.Picker` and `Cairn.Pipeline.InferSink`.
+  survive, so the manual pads are internal to the branch — access units between
+  `Cairn.Pipeline.Picker` and `Cairn.Pipeline.Decoder`, sampled RGB frames
+  between the decoder and `Cairn.Pipeline.InferSink` (D-C2's seam: frames as
+  plain buffers, letterbox maths and motion verdict in metadata).
 
   The tee carries AU-aligned Annex-B H.264 as the TS demuxer emits it; each
   branch owns its own format conversion (CMAF needs avc3 + per-AU keyframe
@@ -27,7 +29,7 @@ defmodule Cairn.Pipeline.Camera do
 
   use Membrane.Pipeline
 
-  alias Cairn.Pipeline.{InferSink, Picker}
+  alias Cairn.Pipeline.{Decoder, InferSink, Picker}
   alias Membrane.Pad
 
   @impl true
@@ -79,17 +81,23 @@ defmodule Cairn.Pipeline.Camera do
   defp detect_spec(_camera, _epoch, nil), do: []
 
   defp detect_spec(camera, epoch, detect) do
+    stream_params = Keyword.get(detect, :stream_params, %{})
+
     [
       get_child(:tee)
       |> child(:picker, Picker)
-      # One AU between the two, so the picker learns that the model is free the
-      # moment it is, and no more than one is ever in flight.
+      # One AU between the two, so the picker learns that the decoder is free
+      # the moment it is, and no more than one is ever in flight.
+      |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
+      |> child(:decoder, %Decoder{camera_id: camera.id, stream_params: stream_params})
+      # …and one sampled frame between decoder and sink, for the same reason:
+      # the sink demands only after `push_frame/5` returns.
       |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
       |> child(:infer, %InferSink{
         camera: camera,
         policy: Keyword.fetch!(detect, :policy),
         epoch: epoch,
-        stream_params: Keyword.get(detect, :stream_params, %{})
+        stream_params: stream_params
       })
     ]
   end

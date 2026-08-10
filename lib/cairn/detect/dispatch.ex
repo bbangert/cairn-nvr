@@ -10,7 +10,7 @@ defmodule Cairn.Detect.Dispatch do
   producers deliver the same pair.
 
   Plain functions in the caller's process, deliberately not a process of its
-  own. The sink calls this between blocking `Cairn.Native.Host.push_au/5` calls;
+  own. The sink calls this between blocking `Cairn.Native.Host.push_frame/5` calls;
   a GenServer here would queue every camera's detections behind whichever one is
   in the model.
   """

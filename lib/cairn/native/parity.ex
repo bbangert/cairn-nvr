@@ -2,8 +2,11 @@ defmodule Cairn.Native.Parity do
   @moduledoc """
   The same clip through both detection producers, frame by frame: `cairn-detect`
   over RTP on 127.0.0.1, fed by `plugins/cairn-detect/verify/feed.py` and decoded
-  by `Cairn.PluginProtocol.decode_line/2`, against `Cairn.Native.push_au/4` over
-  the clip's own access units. Both ends are `Cairn.Observation` structs.
+  by `Cairn.PluginProtocol.decode_line/2`, against the split NIF boundary —
+  `Cairn.Native.decode_au/4` through `Cairn.Pipeline.SampleGate` into
+  `Cairn.Native.push_frame/4`, the very sequence `Cairn.Pipeline.Decoder` and
+  `Cairn.Pipeline.InferSink` run — over the clip's own access units. Both ends
+  are `Cairn.Observation` structs.
 
   ## Why the comparison is exact
 
@@ -39,6 +42,7 @@ defmodule Cairn.Native.Parity do
   alias Cairn.Native.Config
   alias Cairn.Native.Observations
   alias Cairn.Observation
+  alias Cairn.Pipeline.SampleGate
   alias Cairn.PluginProtocol
 
   @default_plugin "plugins/cairn-detect/target/release/cairn-detect"
@@ -358,11 +362,20 @@ defmodule Cairn.Native.Parity do
       Config.stream_params(min_score: Keyword.fetch!(opts, :min_score), stream_epoch: @epoch)
 
     {:ok, engine} = Native.init(config)
+    {:ok, decoder} = Native.open_decoder(engine, @camera_id, params)
     {:ok, stream} = Native.open_stream(engine, @camera_id, params)
 
     try do
-      push_all(stream, aus, time_base, pace_ms(frame_ms, opts))
+      push_all(
+        decoder,
+        stream,
+        aus,
+        time_base,
+        pace_ms(frame_ms, opts),
+        SampleGate.new(Keyword.fetch!(opts, :sample_fps))
+      )
     after
+      Native.close_decoder(decoder)
       Native.close_stream(stream)
     end
   end
@@ -375,16 +388,31 @@ defmodule Cairn.Native.Parity do
     max(frame_ms, interval)
   end
 
-  defp push_all(stream, aus, time_base, pace_ms) do
+  # The element sequence, without the elements: rate-gate before the decode
+  # call, spend on a completed frame, hand a sampled frame — payload plus the
+  # very metadata `Cairn.Pipeline.Decoder` would put on the buffer — to the
+  # inference half.
+  defp push_all(decoder, stream, aus, time_base, pace_ms, gate) do
     aus
-    |> Enum.flat_map_reduce(nil, fn {au, pts}, previous ->
+    |> Enum.flat_map_reduce({nil, gate}, fn {au, pts}, {previous, gate} ->
       sleep_until(previous, pace_ms)
       started = System.monotonic_time(:millisecond)
-      {:ok, {frames, []}} = Native.push_au(stream, au, pts, time_base)
-      {frames, started}
+      now = System.monotonic_time(:nanosecond)
+      sample = SampleGate.open?(gate, now)
+      {:ok, {completed, frame}} = Native.decode_au(decoder, au, pts, sample)
+      gate = if sample and completed, do: SampleGate.spend(gate, now), else: gate
+      {infer(stream, frame, time_base), {started, gate}}
     end)
     |> elem(0)
     |> Enum.map(&Observations.from_frame(&1, @camera_id, @epoch))
+  end
+
+  defp infer(_stream, nil, _time_base), do: []
+
+  defp infer(stream, frame, time_base) do
+    meta = Map.take(frame, [:width, :height, :orig_width, :orig_height, :pts, :observed_at_ms, :motion])
+    {:ok, {frames, []}} = Native.push_frame(stream, frame.payload, meta, time_base)
+    frames
   end
 
   defp sleep_until(nil, _pace_ms), do: :ok
