@@ -325,6 +325,13 @@ defmodule Cairn.MotionTest do
 
     fractions = Enum.map([5, 15, 30, 60, 100], fraction_at)
     assert fractions == [1.0, 0.75, 0.5, 0.25, 0.0]
+
+    # The property itself, as the crate asserts it — kept separately so the
+    # exact-list assertion above can never quietly become the only guard on
+    # monotonicity.
+    for [higher, lower] <- Enum.chunk_every(fractions, 2, 1, :discard) do
+      assert lower <= higher, "#{inspect(fractions)}"
+    end
   end
 
   test "a faster alpha absorbs a held change sooner" do

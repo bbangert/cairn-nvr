@@ -117,11 +117,18 @@ defmodule Cairn.Motion.Thumbnail do
         end)
       end)
 
+    # The backend is pinned rather than defaulted: `Cairn.Motion`'s
+    # exactness argument is made for `Nx.BinaryBackend`'s arithmetic, and
+    # every downstream op inherits this tensor's backend — so a dependency
+    # that swaps the global Nx default cannot silently move the measurement.
     %__MODULE__{
       w: plan.tw,
       h: plan.th,
       tensor:
-        rows |> :erlang.list_to_binary() |> Nx.from_binary(:u8) |> Nx.reshape({plan.th, plan.tw})
+        rows
+        |> :erlang.list_to_binary()
+        |> Nx.from_binary(:u8, backend: Nx.BinaryBackend)
+        |> Nx.reshape({plan.th, plan.tw})
     }
   end
 

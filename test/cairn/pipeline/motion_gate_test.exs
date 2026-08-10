@@ -120,7 +120,17 @@ defmodule Cairn.Pipeline.MotionGateTest do
 
   test "stats name what was observed and what the verdicts said" do
     state = formatted(element())
-    state = observe(state, grey(100), @calibration_frames)
+    state = observe(state, grey(100), @calibration_frames - 1)
+
+    # Mid-window the stats say so: an operator reading a dark gate needs to
+    # tell "still calibrating" from "genuinely still".
+    {[notify_parent: {:stats, warming}], state} =
+      MotionGate.handle_parent_notification(:stats, %{}, state)
+
+    assert warming.calibrating
+    assert warming.observed == @calibration_frames - 1
+
+    state = observe(state, grey(100), 1)
     # One scene cut (everything changes), then motion (half changes).
     state = observe(state, grey(230), 1)
     state = observe(state, half(230, 100), 1)
