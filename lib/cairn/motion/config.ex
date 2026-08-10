@@ -205,10 +205,15 @@ defmodule Cairn.Motion.Config do
   defp coerce(knob, value) when knob in [:min_area_fraction, :alpha],
     do: {:error, "#{knob} must be a number, got #{inspect(value)}"}
 
-  defp coerce(_knob, value) when is_integer(value) and value >= 0, do: {:ok, value}
+  # Bounded above as well as below: the same JSON reaches the inference
+  # side's Rust parser, whose u64 fields refuse anything larger — accepting
+  # it here would build a pipeline that only fails at stream open.
+  defp coerce(_knob, value)
+       when is_integer(value) and value >= 0 and value <= 18_446_744_073_709_551_615,
+       do: {:ok, value}
 
   defp coerce(knob, value),
-    do: {:error, "#{knob} must be a non-negative integer, got #{inspect(value)}"}
+    do: {:error, "#{knob} must be a non-negative 64-bit integer, got #{inspect(value)}"}
 
   defp validate_threshold(nil), do: :ok
 
@@ -232,7 +237,8 @@ defmodule Cairn.Motion.Config do
     {:error,
      "motion min_area_fraction must be below #{@lightning_fraction}, got #{fraction}: " <>
        "a frame that changes more than that share of the thumbnail is treated as a " <>
-       "scene cut and reports no motion, so a floor at or above it is unreachable"}
+       "scene cut and reports no motion, so a floor at or above it is reachable at " <>
+       "best by a frame that changes exactly that share"}
   end
 
   defp validate_fraction(_fraction), do: :ok

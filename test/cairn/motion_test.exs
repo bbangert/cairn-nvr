@@ -546,7 +546,11 @@ defmodule Cairn.MotionTest do
           # The switch does not exempt the knobs under it — an experiment
           # parked behind `enabled: false` fails at parse rather than waiting
           # there to be switched on.
-          ~s({"enabled":false,"alpha":0})
+          ~s({"enabled":false,"alpha":0}),
+          # Beyond u64: the inference side's Rust parser reads the same JSON
+          # into u64 fields, so accepting it here would only defer the
+          # failure to stream open.
+          ~s({"linger_ms":18446744073709551616})
         ] do
       assert {:error, _message} = Config.parse(json), "#{json} parsed"
     end
