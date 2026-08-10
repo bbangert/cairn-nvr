@@ -157,15 +157,25 @@ defmodule Cairn.Pipeline.InferSink do
 
   defp infer(%{engine: :dead} = state, _buffer), do: {[], state}
 
-  defp infer(%{stream: :open, content: {width, height}} = state, buffer) do
+  # The metadata keys are matched, not dot-accessed: a producer that speaks
+  # RGB frames without the decoder's metadata contract falls through to the
+  # counted drop below rather than crashing the sink on a `KeyError`.
+  defp infer(
+         %{stream: :open, content: {width, height}} = state,
+         %{
+           metadata:
+             %{orig_width: orig_width, orig_height: orig_height, observed_at_ms: observed_at_ms} =
+               metadata
+         } = buffer
+       ) do
     meta = %{
       width: width,
       height: height,
-      orig_width: buffer.metadata.orig_width,
-      orig_height: buffer.metadata.orig_height,
+      orig_width: orig_width,
+      orig_height: orig_height,
       pts: buffer.pts,
-      observed_at_ms: buffer.metadata.observed_at_ms,
-      motion: buffer.metadata.motion
+      observed_at_ms: observed_at_ms,
+      motion: Map.get(metadata, :motion)
     }
 
     case Host.push_frame(state.host, state.camera.id, buffer.payload, meta, @time_base) do

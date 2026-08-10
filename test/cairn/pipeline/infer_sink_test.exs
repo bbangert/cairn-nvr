@@ -314,6 +314,19 @@ defmodule Cairn.Pipeline.InferSinkTest do
       assert state.dropped == 1
     end
 
+    test "a buffer without the decoder's metadata is dropped and counted, not crashed on", ctx do
+      # A producer that speaks RGB frames without the metadata contract —
+      # the pad's accepted_format cannot enforce buffer metadata.
+      {_actions, state} = playing(sink(ctx))
+
+      buffer = %Buffer{payload: <<0, 0, 0>>, pts: 1, metadata: %{}}
+      {actions, state} = InferSink.handle_buffer(:input, buffer, %{}, state)
+
+      assert actions == [demand: {:input, 1}]
+      assert state.dropped == 1
+      refute_received {:"$gen_cast", {:detections, _camera, _policy, _observation}}
+    end
+
     test "a buffer that precedes its stream format is dropped and counted, not crashed on", ctx do
       # `Cairn.Pipeline.Decoder` always pairs its first buffer with a
       # stream_format action, so this is unreachable from the in-tree

@@ -129,7 +129,11 @@ defmodule Cairn.Native.Host do
           {:ok, %{ref: reference(), module: module(), sample_fps: pos_integer()}}
           | {:error, term()}
   def open_decoder(server \\ __MODULE__, camera_id, params) do
-    GenServer.call(server, {:open_decoder, camera_id, params})
+    # Above the 5 s default: the open probes hardware backends in turn —
+    # device nodes, drivers, a GPU filter graph — each of which can block on
+    # a driver's answer, and a caller timing out here would crash a camera
+    # whose decoder was still coming up.
+    GenServer.call(server, {:open_decoder, camera_id, params}, 15_000)
   end
 
   @doc """
