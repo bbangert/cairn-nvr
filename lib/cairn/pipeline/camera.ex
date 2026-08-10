@@ -31,7 +31,8 @@ defmodule Cairn.Pipeline.Camera do
 
   use Membrane.Pipeline
 
-  alias Cairn.Pipeline.{Decoder, DetectSink, Inference, Picker}
+  alias Cairn.Motion
+  alias Cairn.Pipeline.{Decoder, DetectSink, Inference, MotionGate, Picker}
   alias Membrane.Pad
 
   @impl true
@@ -84,6 +85,7 @@ defmodule Cairn.Pipeline.Camera do
 
   defp detect_spec(camera, epoch, detect) do
     stream_params = Keyword.get(detect, :stream_params, %{})
+    gate = motion_gate(camera.id, detect, stream_params)
 
     [
       get_child(:tee)
@@ -91,7 +93,11 @@ defmodule Cairn.Pipeline.Camera do
       # One AU between the two, so the picker learns that the decoder is free
       # the moment it is, and no more than one is ever in flight.
       |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
-      |> child(:decoder, %Decoder{camera_id: camera.id, stream_params: stream_params})
+      |> child(:decoder, %Decoder{
+        camera_id: camera.id,
+        stream_params: decoder_params(stream_params, gate)
+      })
+      |> maybe_gate(gate)
       # …and one sampled frame between decoder and inference, for the same
       # reason: inference demands only after `push_frame/5` returns.
       |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
@@ -106,5 +112,43 @@ defmodule Cairn.Pipeline.Camera do
         epoch: epoch
       })
     ]
+  end
+
+  # The Nx measurement (D-C3): a configured gate becomes an element between
+  # decoder and inference, and the decoder is told nothing about motion — the
+  # verdict in the buffer metadata comes from `Cairn.Pipeline.MotionGate`
+  # instead of from the decode NIF, behind the same contract. A bad
+  # motion_json raises here, at pipeline build, where the operator reads a
+  # config error rather than a per-frame one.
+  defp motion_gate(camera_id, detect, stream_params) do
+    case Motion.Config.resolve_json(Map.get(stream_params, :motion_json)) do
+      {:ok, nil} ->
+        nil
+
+      {:ok, config} ->
+        # No default: an enabled gate with an unknown sample rate would size
+        # its calibration window silently wrong.
+        %MotionGate{config: config, sample_fps: Keyword.fetch!(detect, :sample_fps)}
+
+      {:error, message} ->
+        raise ArgumentError, "camera #{camera_id}: motion_json: #{message}"
+    end
+  end
+
+  # `Cairn.Pipeline.Inference` keeps the FULL stream params — the gate
+  # *policy* (linger/epoch bypass/re-verify) lives with the model session and
+  # still reads these knobs; only the measurement moved.
+  defp decoder_params(stream_params, nil), do: stream_params
+  defp decoder_params(stream_params, _gate), do: Map.put(stream_params, :motion_json, nil)
+
+  defp maybe_gate(link, nil), do: link
+
+  defp maybe_gate(link, %MotionGate{} = gate) do
+    # The same one-frame seam as either side of it: the gate element passes
+    # demand through one-for-one, so the decoder's latest-wins slot still
+    # sees inference's real pace.
+    link
+    |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
+    |> child(:motion_gate, gate)
   end
 end

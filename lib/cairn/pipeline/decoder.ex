@@ -25,8 +25,11 @@ defmodule Cairn.Pipeline.Decoder do
       captured here because a frame can wait behind a busy model pass
       downstream;
     * `motion` — the motion measurement (`t:Cairn.Native.motion_verdict/0`),
-      when the gate is configured: measured here because this is the only
-      element holding pixels, acted on downstream where the model is.
+      when the *decoder* was asked to measure (`stream_params.motion_json`);
+      absent otherwise. `Cairn.Pipeline.Camera` no longer asks — the
+      measurement is `Cairn.Pipeline.MotionGate`'s now (D-C3), and the NIF
+      path stays as its parity reference — but the contract holds for any
+      producer that does.
 
   `buffer.pts` is the *frame's* timestamp (reordering means it is not always
   the access unit's), `nil` for a frame the decoder could not date.
