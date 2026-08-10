@@ -458,21 +458,15 @@ defmodule Cairn.Native.Host do
         native.cpu_baseline_ms(config, passes)
       end)
 
-    ref = task.ref
+    timeout = Keyword.get(state.opts, :baseline_timeout_ms, @baseline_timeout_ms)
 
-    receive do
-      {^ref, reply} ->
-        Process.demonitor(ref, [:flush])
-        baseline(reply, config)
-
-      {:DOWN, ^ref, :process, _pid, reason} ->
-        no_baseline(config, "the measurement crashed (#{inspect(reason)})")
-    after
-      Keyword.get(state.opts, :baseline_timeout_ms, @baseline_timeout_ms) ->
-        # Left running rather than killed: a task inside a dirty NIF does not
-        # die until the call returns, and waiting for that is what expired.
-        Process.demonitor(ref, [:flush])
-        no_baseline(config, "the measurement did not answer in time")
+    # `ignore` rather than `shutdown` on expiry: a task inside a dirty NIF does
+    # not die until the call returns, so a brutal kill would block on the very
+    # thing that timed out. It stops monitoring and lets the task finish alone.
+    case Task.yield(task, timeout) || Task.ignore(task) do
+      {:ok, reply} -> baseline(reply, config)
+      {:exit, reason} -> no_baseline(config, "the measurement crashed (#{inspect(reason)})")
+      nil -> no_baseline(config, "the measurement did not answer in time")
     end
   end
 
