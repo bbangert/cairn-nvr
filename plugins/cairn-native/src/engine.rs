@@ -14,12 +14,15 @@
 //! `push_au`'s order is always stream -> model, so the cycle a deadlock needs
 //! does not exist. The registry is never touched under it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard, Once};
+use std::time::Instant;
 
 use cairn_detect::decode::{DecoderKind, ModelInput};
 use cairn_detect::emit::Det;
-use cairn_detect::infer::{self, Detector, Embedder, InputSpec, Labels, ScoreFloors};
+use cairn_detect::infer::{
+    self, BackendKind, Detector, Embedder, Fit, InputSpec, Labels, QnnOptions, ScoreFloors,
+};
 use cairn_detect::note;
 use rsmpeg::ffi;
 
@@ -187,6 +190,81 @@ impl Engine {
     }
 }
 
+/// The `passes` range `cpu_baseline_ms` accepts.
+const BASELINE_PASSES: std::ops::RangeInclusive<usize> = 1..=64;
+
+/// Median CPU-side model-pass latency, milliseconds: the number
+/// `Cairn.Native.Health`'s D-P5 ratio compares an accelerator's own pass
+/// latency against. Opens a second [`Detector`] on `BackendKind::Ort` — never
+/// the accelerator's session, so this never contends with a live pass —
+/// against the same model this engine was, or would be, configured with.
+///
+/// Called once, at engine init, only when the configured backend is an
+/// accelerator: a second model load is not free.
+pub fn cpu_baseline_ms(config: &InitConfig, passes: usize) -> Result<f64> {
+    if !BASELINE_PASSES.contains(&passes) {
+        return Err(NativeError::Config(format!(
+            "cpu_baseline_ms passes must be {}..={}, got {passes}",
+            BASELINE_PASSES.start(),
+            BASELINE_PASSES.end()
+        )));
+    }
+
+    let labels =
+        Labels::load(config.labels.as_deref()).map_err(|e| NativeError::ModelLoad(chain(&e)))?;
+    let mut detector = Detector::open(
+        &config.model,
+        BackendKind::Ort,
+        config.input_size,
+        config.model_profile,
+        &labels,
+        config.allow_label_mismatch,
+        QnnOptions::default(),
+    )
+    .map_err(|e| NativeError::ModelLoad(chain(&e)))?;
+
+    let size = detector.input_spec().size;
+    // Deterministic and not all zeros: a constant-zero tensor is exactly what
+    // the letterbox pad is, and it is not this model's typical input.
+    let tensor: Vec<f32> = (0..size.tensor_len())
+        .map(|i| (i % 255) as f32 / 255.0)
+        .collect();
+    // The identity fit: this measures the model pass alone, so the source and
+    // the input rectangle are the same and nothing is scaled or offset.
+    let projection = Fit {
+        inner: size,
+        offset: (0, 0),
+        pad: 0,
+    }
+    .projection(size);
+    let floors = ScoreFloors::from_map(HashMap::new());
+
+    // Untimed: an ORT session's first run pays extra for lazy allocations a
+    // steady-state pass does not, and the ratio has to compare steady state.
+    detector
+        .detect(tensor.clone(), projection, &labels, &floors)
+        .map_err(|e| NativeError::Infer(chain(&e)))?;
+
+    let mut samples = Vec::with_capacity(passes);
+    for _ in 0..passes {
+        let started = Instant::now();
+        detector
+            .detect(tensor.clone(), projection, &labels, &floors)
+            .map_err(|e| NativeError::Infer(chain(&e)))?;
+        samples.push(started.elapsed());
+    }
+    samples.sort_unstable();
+    let median = samples[samples.len() / 2].as_secs_f64() * 1000.0;
+
+    note!(
+        "cairn-native cpu baseline: backend={} model={} median={median:.2}ms over {passes} pass(es)",
+        detector.backend_summary(),
+        config.model.display(),
+    );
+
+    Ok(median)
+}
+
 /// Stop libav writing the BEAM's stderr for us.
 ///
 /// A camera joining mid-GOP or any flaky RTSP source emits two `AV_LOG_ERROR`
@@ -253,6 +331,30 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// The pass-count bound must fire before any model access — proven here by
+    /// a model path that does not exist, the same technique
+    /// `stub_backend_is_refused_before_any_model_access` in `cairn-detect` uses.
+    #[test]
+    fn cpu_baseline_ms_refuses_a_bad_pass_count_before_any_model_access() {
+        let config = InitConfig {
+            model: PathBuf::from("does/not/exist"),
+            backend: BackendKind::Ort,
+            model_profile: None,
+            input_size: None,
+            labels: None,
+            allow_label_mismatch: false,
+            embedder_model: None,
+            decoder: DecoderKind::Sw,
+            sample_fps: 5,
+            qnn: QnnOptions::default(),
+        };
+        for passes in [0, 65, 1_000] {
+            let error = cpu_baseline_ms(&config, passes).unwrap_err();
+            assert_eq!(error.reason(), "config", "{passes}");
+        }
+    }
 
     #[test]
     fn a_camera_can_hold_one_stream_at_a_time() {

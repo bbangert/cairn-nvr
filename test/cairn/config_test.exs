@@ -857,7 +857,10 @@ defmodule Cairn.ConfigTest do
     test "a membrane camera keeps its group but is not a member of it" do
       map =
         base_map()
-        |> with_plugins(%{"detect" => %{"command" => ["./detect"]}})
+        |> Map.put("profile_dirs", ["test/support/fixtures/profiles/argv"])
+        |> with_plugins(%{
+          "detect" => %{"command" => ["./detect"], "profile" => "partial"}
+        })
         |> put_plugin(0, "detect")
         |> put_plugin(1, "detect")
         |> update_in(["cameras"], fn [a, b] -> [Map.put(a, "pipeline", "membrane"), b] end)
@@ -1468,6 +1471,41 @@ defmodule Cairn.ConfigTest do
       assert {:error, errors} = Config.from_map(map)
       assert Enum.any?(errors, &(&1 =~ "different models (full, partial)"))
       assert Enum.any?(errors, &(&1 =~ "loads one model for every membrane camera"))
+    end
+
+    # An unprofiled membrane camera builds a detect branch and contributes no
+    # model, so it detects on whatever model another camera loaded — or, alone
+    # on a node, leaves the engine `:not_configured` with detection configured.
+    test "a membrane camera on an inline command names no profile, and is refused by name" do
+      map =
+        [{"membrane", "det"}]
+        |> native_map(%{"det" => "full"})
+        |> put_in(["cameras", Access.at(0), "plugin"], "./p --model other.onnx")
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "camera cam_0"))
+      assert Enum.any?(errors, &(&1 =~ "profile"))
+    end
+
+    test "a membrane camera on a group with no profile is refused by name" do
+      map =
+        [{"membrane", "det"}]
+        |> native_map(%{"det" => "full"})
+        |> Map.put("plugins", %{"det" => %{"command" => "./p"}})
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "camera cam_0"))
+      assert Enum.any?(errors, &(&1 =~ "plugin det"))
+    end
+
+    test "a membrane camera with no plugin detects on nothing, and needs no profile" do
+      map =
+        [{"membrane", "det"}]
+        |> native_map(%{"det" => "full"})
+        |> update_in(["cameras", Access.at(0)], &Map.delete(&1, "plugin"))
+
+      assert {:ok, config, _warnings} = Config.from_map(map)
+      assert Config.native_model_config(config) == {:ok, nil}
     end
   end
 

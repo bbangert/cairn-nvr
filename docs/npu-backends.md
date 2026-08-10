@@ -109,7 +109,11 @@ criterion live there and in
   vs the `ort` backend (D-P5, ≥3×), which the board-bench harness
   enforces. The plugin's own surface for that check is the
   `infer latency: backend=… p50=… p95=…` stderr line `Detector::detect`
-  emits every 100 runs.
+  emits every 100 runs. The in-VM host runs the same check unattended:
+  `Cairn.Native.Host` measures the CPU pass once at engine init
+  (`cpu_baseline_ms`, a second ORT session on the same model) and
+  `Cairn.Native.Health` reads the live pass latency against it. A backend
+  it cannot measure is left unjudged rather than guessed at.
 - **Measured, phase-2 proof runs (2026-08-07, board .87, yolox_nano
   full-QDQ 416, real RTP feed + software decode)**: CPU EP p50 44.5 ms;
   QNN/HTP p50 8–12 ms with the `performance` cpufreq governor → 3.6–5.6×,

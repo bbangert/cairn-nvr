@@ -390,11 +390,57 @@ defmodule Cairn.Native.HealthTest do
       refute log =~ "FAILED"
     end
 
-    test "a backend with no CPU baseline has no ratio to judge", %{id: id} do
+    # Nothing in `lib/` supplied `cpu_baseline_ms`, so every verdict a running
+    # node could reach was `:not_applicable` and the four-way discrimination
+    # below never ran. The engine measures its own now.
+    test "an accelerator calibrates its CPU baseline at engine init", %{id: id} do
       host = start_host(health: [min_samples: 3])
       {:ok, _epoch} = Host.open_stream(host, id, %{})
 
+      assert_receive {:cpu_baseline_ms, %{model: "m.onnx", backend: "qnn"}, passes}
+      assert passes in 1..64
+
+      push(host, id, 10)
+
+      assert Host.check_health(host) == :healthy
+      assert Host.status(host).cpu_baseline_ms == 45.0
+    end
+
+    test "a CPU backend measures nothing: it is the baseline", %{id: id} do
+      host = start_host(config: %{model: "m.onnx", backend: "ort"}, health: [min_samples: 3])
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+
       push(host, id, 5)
+
+      # no second model load paid, and no ratio to judge by
+      refute_received {:cpu_baseline_ms, _config, _passes}
+      assert Host.check_health(host) == :not_applicable
+      assert Host.status(host).cpu_baseline_ms == nil
+    end
+
+    test "a baseline that cannot be measured costs the ratio, not the engine", %{id: id} do
+      control(%{cpu_baseline_ms: {:error, {:model_load, "the CPU EP would not take the QDQ"}}})
+      host = start_host(health: [min_samples: 3])
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+
+      push(host, id, 10)
+
+      assert Host.status(host).engine == :ready
+      assert Host.status(host).cpu_baseline_ms == nil
+      assert Host.check_health(host) == :not_applicable
+    end
+
+    test "a measurement that does not come back does not hold the boot", %{id: id} do
+      control(%{cpu_baseline_ms: fn _config, _passes -> Process.sleep(:infinity) end})
+
+      host =
+        start_host(baseline_timeout_ms: 50, health: [min_samples: 3])
+
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+      push(host, id, 10)
+
+      assert Host.status(host).engine == :ready
+      assert Host.status(host).cpu_baseline_ms == nil
       assert Host.check_health(host) == :not_applicable
     end
 

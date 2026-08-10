@@ -163,6 +163,17 @@ fn push_au(
     })
 }
 
+/// The CPU-side model-pass baseline `Cairn.Native.Health` compares an
+/// accelerator's own latency against. A second, CPU-side model load — not
+/// the accelerator's session — so it costs one; the host calls it once, at
+/// engine init.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn cpu_baseline_ms(config: RawInitConfig, passes: usize) -> Result<f64> {
+    guarded("cpu_baseline_ms", || {
+        engine::cpu_baseline_ms(&config.resolve()?, passes)
+    })
+}
+
 /// Close a stream, freeing its decoder and releasing its camera id.
 ///
 /// `{:ok, false}` for an already-closed stream: the host closing a stream it has

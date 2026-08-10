@@ -251,6 +251,8 @@ fn a_recorded_clip_decodes_and_infers() {
     );
     // The motion gate is off, so every sample is a model pass.
     assert!(frames.iter().all(|frame| frame.inferred));
+    // …and a real model pass costs real time — the D-P5 ratio's whole input.
+    assert!(frames.iter().all(|frame| frame.infer_us > 0));
     assert!(frames.windows(2).all(|pair| pair[0].pts <= pair[1].pts));
     assert!(frames.iter().all(|frame| frame.observed_at_ms > 0));
 

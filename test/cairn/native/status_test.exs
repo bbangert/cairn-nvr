@@ -34,7 +34,9 @@ defmodule Cairn.Native.StatusTest do
   # them. The reporter's interval is long: every test here publishes on demand.
   defp start_stack(opts \\ []) do
     name = :"host_#{System.unique_integer([:positive])}"
-    {health, opts} = Keyword.pop(opts, :health, cpu_baseline_ms: 45.0, min_samples: 3)
+    # No `cpu_baseline_ms` opt: what the monitor judges by here is what the host
+    # measured at engine init, as on a real node.
+    {health, opts} = Keyword.pop(opts, :health, min_samples: 3)
     {status, opts} = Keyword.pop(opts, :status, [])
 
     defaults = [
@@ -55,6 +57,15 @@ defmodule Cairn.Native.StatusTest do
       )
 
     %{host: name, reporter: reporter}
+  end
+
+  # The reporter reads the config for one thing: which cameras are configured to
+  # detect on this node, stream or no stream.
+  defp detecting(ids) do
+    cameras =
+      Enum.map(ids, &%Cairn.Config.Camera{id: &1, pipeline: :membrane, plugin: {:group, "det"}})
+
+    fn -> %Cairn.Config{cameras: cameras} end
   end
 
   defp published(reporter, camera_id) do
@@ -83,6 +94,8 @@ defmodule Cairn.Native.StatusTest do
       assert status["fps"] > 0.0
       assert status["inferences"] == 5
       assert status["p50_ms"] >= 0.0
+      # the number the verdict was reached against, measured at engine init
+      assert status["cpu_baseline_ms"] == 45.0
     end
 
     test "a camera with no native stream is never written", %{id: id} do
@@ -102,6 +115,27 @@ defmodule Cairn.Native.StatusTest do
 
       :ok = Host.close_stream(host, id)
       refute published(reporter, id)
+    end
+
+    # `docs/ha-api.md`: responses never emit on-disk paths, and this map is
+    # served verbatim by the camera list and the SSE `camera_status` frame.
+    test "the model reaches the surface as a name, never as a path", %{id: id} do
+      %{host: host, reporter: reporter} =
+        start_stack(config: %{model: "/opt/cairn/models/yolox_nano.onnx", backend: "qnn"})
+
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+
+      assert published(reporter, id)["model"] == "yolox_nano.onnx"
+    end
+
+    test "a refused canary names the model in its detail without the path" do
+      control(%{canary: {:error, "the probe process exited with SIGSEGV"}})
+      %{host: host} = start_stack(config: %{model: "/opt/cairn/models/yolox_nano.onnx"})
+
+      detail = Status.payload(Host.status(host), "cam")["detail"]
+
+      assert detail =~ "yolox_nano.onnx"
+      refute detail =~ "/opt/cairn"
     end
 
     test "the whole payload survives JSON encoding", %{id: id} do
@@ -129,6 +163,7 @@ defmodule Cairn.Native.StatusTest do
           stream_health: %{},
           stream_fps: %{},
           p50_ms: 3.0,
+          cpu_baseline_ms: 45.0,
           inferences: 10
         },
         Map.new(attrs)
@@ -168,18 +203,33 @@ defmodule Cairn.Native.StatusTest do
   describe "the engine's own states" do
     test "a refused canary's message is the reason detection is absent", %{id: id} do
       control(%{canary: {:error, "the probe process exited with SIGSEGV"}})
-      %{host: host, reporter: reporter} = start_stack()
+      %{host: host, reporter: reporter} = start_stack(status: [config_source: detecting([id])])
 
-      # the engine never loaded, so no stream exists: the camera the reporter
-      # last knew about is the one that must still be told
+      # The engine never loaded, so no stream exists — and this is exactly when
+      # the surface has something to say: every camera configured to detect is
+      # not detecting, and only this reaches the dashboard and the API.
       {:error, _refused} = Host.open_stream(host, id, %{})
-      status = Status.payload(Host.status(host), id)
+      status = published(reporter, id)
 
       assert status["state"] == "error"
       assert status["canary"] == "failed"
       assert status["detail"] =~ "the probe process exited with SIGSEGV"
       assert status["detail"] =~ "NOT loaded"
-      refute published(reporter, id)
+    end
+
+    test "a node with no NIF tells every camera configured to detect", %{id: id} do
+      control(%{available?: false})
+      other = id <> "_b"
+      classic = id <> "_classic"
+      CameraStatus.set(classic, :running)
+
+      %{reporter: reporter} =
+        start_stack(status: [config_source: detecting([id, other])])
+
+      assert published(reporter, id)["state"] == "error"
+      assert published(reporter, other)["detail"] =~ "cairn-native is not loaded"
+      # a classic camera's own plugin reports for it, and must not be overwritten
+      assert CameraStatus.get(classic).plugin_status == nil
     end
 
     test "a long canary message is cut to whole graphemes, not to bytes", %{id: id} do

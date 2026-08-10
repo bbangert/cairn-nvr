@@ -147,8 +147,10 @@ defmodule Cairn.Native.HostTest do
       assert %{min_score: %{}, motion_json: nil, track_floor_json: nil, stream_epoch: ^epoch} =
                params
 
-      assert Host.push_au(host, id, <<1, 2, 3>>, 90, {1, 90_000}) ==
-               {:ok, {[NativeStub.frame()], []}}
+      # the crate's frames reach the caller untouched — `infer_us` is the stub's
+      # timing of its own call, which only the health report reads
+      assert {:ok, {[%{inferred: true, objects: []}], []}} =
+               Host.push_au(host, id, <<1, 2, 3>>, 90, {1, 90_000})
 
       assert Host.status(host).streams == [id]
 

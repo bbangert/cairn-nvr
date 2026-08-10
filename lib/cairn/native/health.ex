@@ -14,8 +14,8 @@ defmodule Cairn.Native.Health do
     * **the probe** (`Cairn.Native.Host.probe/1`), whose deadline is a verdict:
       the Host is the only process making *synchronous* native calls, so its
       mailbox queues behind them. The deadline has to be ours because there is
-      nothing cheap in the NIF to call — its four entry points are a model load,
-      a decoder open/close and inference itself — and ORT/QNN offers no per-call
+      nothing cheap in the NIF to call — every entry point is a model load, a
+      decoder open/close or inference itself — and ORT/QNN offers no per-call
       deadline of its own, where HailoRT hands ex_nvr a 10 s one free.
     * **the inflight table**, written by `push_au/5`'s caller and read here
       directly. The hot path never reaches the Host, so the probe cannot see it
@@ -74,6 +74,7 @@ defmodule Cairn.Native.Health do
     :checked_at,
     :cycle,
     :p50_ms,
+    :baseline_ms,
     waiting: [],
     window: %{},
     completed: 0,
@@ -122,7 +123,14 @@ defmodule Cairn.Native.Health do
   end
 
   defp empty,
-    do: %{health: :unknown, stream_health: %{}, stream_fps: %{}, p50_ms: nil, inferences: 0}
+    do: %{
+      health: :unknown,
+      stream_health: %{},
+      stream_fps: %{},
+      p50_ms: nil,
+      cpu_baseline_ms: nil,
+      inferences: 0
+    }
 
   # -- server -----------------------------------------------------------------
 
@@ -220,6 +228,7 @@ defmodule Cairn.Native.Health do
 
   defp finish(state, probe) do
     Process.cancel_timer(state.cycle.timer)
+    state = calibrate(state, probe)
     now = System.monotonic_time(:microsecond)
     window = window(state, now)
     per_stream = Map.new(state.window, fn {id, entry} -> {id, classify(state, entry)} end)
@@ -239,6 +248,13 @@ defmodule Cairn.Native.Health do
     |> publish()
     |> answer(verdict)
   end
+
+  # The Host measures the baseline at engine init and carries it on the probe
+  # reply, so a model reload and a restart of either process both land here on
+  # the next cycle. A probe that did not answer leaves the last one standing —
+  # its verdict is the deadline's, which needs no ratio.
+  defp calibrate(state, {:ok, %{cpu_baseline_ms: ms}}), do: %{state | baseline_ms: ms}
+  defp calibrate(state, _no_answer), do: state
 
   # `traffic` (passes and failures alike) is whether anything is happening at all;
   # `retired` (completed passes) is whether the accelerator is executing — an error
@@ -273,6 +289,9 @@ defmodule Cairn.Native.Health do
          stream_health: state.stream_health,
          stream_fps: state.stream_fps,
          p50_ms: state.p50_ms,
+         # what the ratio was actually judged against, and the one number on this
+         # surface an operator cannot derive from the others
+         cpu_baseline_ms: baseline(state),
          # model passes, not `push_au/5` calls: at 5 fps sampled off a 20 fps
          # camera the two differ by the frame rate
          inferences: state.completed
@@ -294,9 +313,9 @@ defmodule Cairn.Native.Health do
 
   # Every pass is counted and only the latencies are capped: the p50 of the first few
   # hundred is the p50 of the window, while the counts are what the throughput
-  # arithmetic runs on. Dividing by `passes` keeps the sample a per-frame latency
-  # even though one call carries at most one pass today, which is the only thing a
-  # per-frame CPU baseline can be compared against.
+  # arithmetic runs on. `micros` is the crate's own model-pass timing summed over the
+  # call's passes (`Cairn.Native.Host.report/3`), so dividing by `passes` gives one
+  # pass — the same thing the CPU baseline measured.
   defp sampled(entry, micros, passes) do
     sample = div(micros, passes)
     samples = if entry.count >= @window, do: entry.samples, else: [sample | entry.samples]
@@ -328,8 +347,9 @@ defmodule Cairn.Native.Health do
 
   defp judge(state, window, streams) do
     cond do
-      # A CPU backend has no accelerator to wedge, and no baseline to be three
-      # times faster than.
+      # A CPU backend has no accelerator to wedge and is never measured; an
+      # accelerator whose measurement failed has nothing to be three times
+      # faster than. Neither is a fault, and neither can be judged.
       baseline(state) == nil -> :not_applicable
       Enum.any?(streams, &classified?(&1, :ok)) -> :healthy
       not Enum.any?(streams, &judged?/1) -> :idle
@@ -458,7 +478,9 @@ defmodule Cairn.Native.Health do
     Enum.at(sorted, index) / 1000
   end
 
-  defp baseline(state), do: opt(state, :cpu_baseline_ms, nil)
+  # An opt pins the baseline for a node that knows better than the measurement;
+  # otherwise it is whatever the Host's last probe reply reported.
+  defp baseline(state), do: opt(state, :cpu_baseline_ms, state.baseline_ms)
   defp min_ratio(state), do: opt(state, :min_ratio, @min_ratio)
 
   defp opt(state, key, default), do: Keyword.get(state.opts, key, default)

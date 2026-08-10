@@ -473,6 +473,7 @@ defmodule Cairn.Pipeline.ConformanceTest do
       pts: @detect_pts,
       observed_at_ms: DateTime.to_unix(@observed_at, :millisecond),
       inferred: true,
+      infer_us: 12_000,
       objects: [
         %{
           label: "person",

@@ -15,8 +15,11 @@ defmodule Cairn.Native.Status do
   the monitor probes by. Everything else on a wedged cycle comes from the
   monitor's ETS snapshot, which no call is needed to read.
 
-  Only cameras with an open native stream are published for, so a classic
-  camera's status is never written here.
+  Published for every camera *configured* to detect on this node, not only for
+  those with an open stream: a canary refusal, an absent NIF or a failed model
+  load leaves no stream open at all, and that is exactly when the surface has
+  something to say. A classic camera has its own plugin reporting for it and is
+  never written here.
 
   `Cairn.Pipeline.Picker`'s drop counts are *not* on this surface, though a drop
   rate is what saturation looks like from the media side: its `:stats`
@@ -30,6 +33,7 @@ defmodule Cairn.Native.Status do
   use GenServer
 
   alias Cairn.CameraStatus
+  alias Cairn.Config.Server, as: ConfigServer
   alias Cairn.Native.Health
   alias Cairn.Native.Host
 
@@ -62,6 +66,7 @@ defmodule Cairn.Native.Status do
       host: Keyword.get(opts, :host, Host),
       interval_ms: Keyword.get(opts, :interval_ms, @interval_ms),
       timeout_ms: Keyword.get(opts, :timeout_ms, @status_timeout_ms),
+      config_source: Keyword.get(opts, :config_source, &ConfigServer.get/0),
       cameras: []
     }
 
@@ -96,21 +101,33 @@ defmodule Cairn.Native.Status do
         state
 
       status ->
-        Enum.each(status.streams, &CameraStatus.set_plugin_status(&1, payload(status, &1)))
+        # Open streams as well as configured cameras: a camera dropped from the
+        # config whose stream has not been closed yet is still being detected on.
+        cameras = Enum.uniq(configured(state) ++ status.streams)
+        Enum.each(cameras, &CameraStatus.set_plugin_status(&1, payload(status, &1)))
 
-        # A camera whose native stream is gone would otherwise keep the last
-        # status it had for the rest of the node's life. `nil` is what a camera
-        # nothing has reported for looks like, which is what this one now is.
-        Enum.each(state.cameras -- status.streams, &CameraStatus.set_plugin_status(&1, nil))
+        # A camera that has left both sets would otherwise keep the last status
+        # it had for the rest of the node's life. `nil` is what a camera nothing
+        # has reported for looks like, which is what this one now is.
+        Enum.each(state.cameras -- cameras, &CameraStatus.set_plugin_status(&1, nil))
 
-        %{state | cameras: status.streams}
+        %{state | cameras: cameras}
     end
+  end
+
+  # `plugin:` is what builds the detect branch (`Cairn.FFmpegPort`'s
+  # `detect_opts/1`), so it is also what makes this node's engine this camera's
+  # detector.
+  defp configured(state) do
+    state.config_source.().cameras
+    |> Enum.filter(&(&1.pipeline == :membrane and &1.plugin != nil))
+    |> Enum.map(& &1.id)
   end
 
   # The verdict is overwritten rather than read from the snapshot on the expiry
   # path: the snapshot is up to a check interval old, and a host that did not
-  # answer a deadline is inside a native call *now*. Which cameras is the last
-  # cycle's answer, because they are exactly the ones gone silent.
+  # answer a deadline is inside a native call *now*. The streams are the last
+  # cycle's set, because a host that cannot answer cannot be asked for its own.
   defp read(state) do
     Host.status(state.host, state.timeout_ms)
   catch
@@ -155,9 +172,10 @@ defmodule Cairn.Native.Status do
       "engine" => term(status.engine),
       "nif" => term(status.nif),
       "canary" => term(status.canary),
-      "model" => status.model,
+      "model" => model_name(status.model),
       "backend" => status.backend,
       "p50_ms" => status.p50_ms,
+      "cpu_baseline_ms" => status.cpu_baseline_ms,
       "inferences" => status.inferences
     }
   end
@@ -172,7 +190,8 @@ defmodule Cairn.Native.Status do
 
   defp headline(%{canary: {:failed, message}} = status) do
     {"error",
-     "the canary refused #{status.model}: #{message} — the model was NOT loaded in this VM"}
+     "the canary refused #{model_name(status.model)}: #{message} — the model was NOT loaded " <>
+       "in this VM"}
   end
 
   defp headline(%{engine: :unanswered}) do
@@ -215,6 +234,12 @@ defmodule Cairn.Native.Status do
   end
 
   defp accelerator(status), do: {"ready", "detecting on #{status.backend}"}
+
+  # The configured model is a path on this box, and everything here is served
+  # through `/api` and the SSE stream, which never emit one (`docs/ha-api.md`).
+  # The file's name is what identifies the model to an operator.
+  defp model_name(nil), do: nil
+  defp model_name(model), do: Path.basename(model)
 
   # Tuples carry a message `headline/1` has already spent; what is left is the
   # class, which is what a surface groups and filters on.

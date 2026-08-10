@@ -108,6 +108,19 @@ defmodule Cairn.Native.Config do
   def stream_params(other),
     do: {:error, "params must be a map or keyword list, got #{inspect(other)}"}
 
+  # `ort` is onnxruntime's own CPU execution provider; every other backend name
+  # is a device the CPU is the fallback for.
+  @cpu_backends ~w(ort)
+
+  @doc """
+  Whether this config runs on something other than the CPU.
+
+  False means there is no accelerator to judge, and nothing a CPU baseline could
+  be three times faster than (`Cairn.Native.Health`).
+  """
+  @spec accelerator?(t()) :: boolean()
+  def accelerator?(config), do: config.backend not in @cpu_backends
+
   @doc """
   The same model config as `cairn-detect` argv, for the canary's probe load. The
   model half only: nothing about a scene knob can make a model load or fail to.

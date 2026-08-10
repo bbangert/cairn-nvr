@@ -53,6 +53,13 @@ defmodule Cairn.Native.Host do
   # back should reach the caller as an error term, not as its exit.
   @close_wait_ms 2_000
 
+  # The CPU baseline: enough passes for a median, and a bound on the whole
+  # measurement — a second model load plus those passes, paid wherever the engine
+  # opens, which is boot and a model reload that has already closed every stream.
+  # Past the bound the node runs without a D-P5 ratio.
+  @baseline_passes 5
+  @baseline_timeout_ms 60_000
+
   @engine_fatal [:model_load, :model_poisoned]
   @stream_fatal [:closed, :poisoned, :panicked]
 
@@ -64,6 +71,7 @@ defmodule Cairn.Native.Host do
     :config,
     :engine,
     :opts,
+    :cpu_baseline_ms,
     engine_state: :starting,
     canary_state: :not_run,
     streams: %{},
@@ -118,12 +126,10 @@ defmodule Cairn.Native.Host do
   def push_au(server \\ __MODULE__, camera_id, au, pts, time_base) do
     case lookup(server, camera_id) do
       {:ok, stream} ->
-        started = System.monotonic_time(:microsecond)
-        enter(stream, camera_id, started)
+        enter(stream, camera_id, System.monotonic_time(:microsecond))
         result = stream.module.push_au(stream.ref, au, pts, time_base)
-        elapsed = System.monotonic_time(:microsecond) - started
         leave(stream)
-        report(stream, camera_id, elapsed, result)
+        report(stream, camera_id, result)
         result
 
       :error ->
@@ -240,8 +246,12 @@ defmodule Cairn.Native.Host do
   def handle_call(:status, _from, state), do: {:reply, status_map(state), state}
 
   # Answered from the mailbox on purpose: it is the queue the synchronous native
-  # calls above are in, so a reply is evidence that they are coming back.
-  def handle_call(:probe, _from, state), do: {:reply, %{engine: state.engine_state}, state}
+  # calls above are in, so a reply is evidence that they are coming back. The
+  # baseline rides along because the monitor cannot judge without it and the two
+  # processes restart independently — every cycle re-reads it.
+  def handle_call(:probe, _from, state) do
+    {:reply, %{engine: state.engine_state, cpu_baseline_ms: state.cpu_baseline_ms}, state}
+  end
 
   @impl true
   def handle_cast({:reconfigure, config}, state) do
@@ -360,7 +370,7 @@ defmodule Cairn.Native.Host do
 
   defp open_engine(state, nil) do
     # The normal state until a camera's profile is routed here.
-    %{state | engine: nil, engine_state: :not_configured}
+    %{state | engine: nil, engine_state: :not_configured, cpu_baseline_ms: nil}
   end
 
   defp open_engine(state, raw) do
@@ -410,7 +420,12 @@ defmodule Cairn.Native.Host do
             "(canary #{inspect(canary)})"
         )
 
-        %{state | engine: engine, engine_state: :ready}
+        %{
+          state
+          | engine: engine,
+            engine_state: :ready,
+            cpu_baseline_ms: measure_baseline(state, config)
+        }
 
       {:error, {reason, message}} ->
         refuse(state, {reason, message}, "init/1 refused #{config.model}: #{reason} #{message}")
@@ -422,7 +437,70 @@ defmodule Cairn.Native.Host do
 
   defp refuse(state, engine_state, message) do
     Logger.error("cairn-native: " <> message)
-    %{state | engine: nil, engine_state: engine_state}
+    %{state | engine: nil, engine_state: engine_state, cpu_baseline_ms: nil}
+  end
+
+  # `Cairn.Native.Health` cannot judge an accelerator without knowing what one
+  # model pass costs without it, and only this board and this model can say. In
+  # a task, so a measurement that does not come back costs a bounded wait rather
+  # than the engine: `nil` is the monitor's `:not_applicable`, which is where a
+  # node with no number to compare against already sits.
+  defp measure_baseline(state, config) do
+    if NativeConfig.accelerator?(config), do: await_baseline(state, config), else: nil
+  end
+
+  defp await_baseline(state, config) do
+    native = state.native
+    passes = Keyword.get(state.opts, :baseline_passes, @baseline_passes)
+
+    task =
+      Task.Supervisor.async_nolink(Cairn.TaskSupervisor, fn ->
+        native.cpu_baseline_ms(config, passes)
+      end)
+
+    ref = task.ref
+
+    receive do
+      {^ref, reply} ->
+        Process.demonitor(ref, [:flush])
+        baseline(reply, config)
+
+      {:DOWN, ^ref, :process, _pid, reason} ->
+        no_baseline(config, "the measurement crashed (#{inspect(reason)})")
+    after
+      Keyword.get(state.opts, :baseline_timeout_ms, @baseline_timeout_ms) ->
+        # Left running rather than killed: a task inside a dirty NIF does not
+        # die until the call returns, and waiting for that is what expired.
+        Process.demonitor(ref, [:flush])
+        no_baseline(config, "the measurement did not answer in time")
+    end
+  end
+
+  defp baseline({:ok, ms}, config) when is_number(ms) and ms > 0 do
+    Logger.info(
+      "cairn-native: CPU baseline #{Float.round(ms / 1, 2)} ms a pass for #{config.model} — " <>
+        "#{config.backend} is judged against it"
+    )
+
+    ms / 1
+  end
+
+  # Zero and negative are not a pass anyone timed, and a baseline of zero would
+  # put every accelerator under the ratio floor at once.
+  defp baseline({:ok, ms}, config), do: no_baseline(config, "the measurement was #{inspect(ms)}")
+
+  defp baseline({:error, {reason, message}}, config),
+    do: no_baseline(config, "#{reason} #{message}")
+
+  defp baseline(other, config), do: no_baseline(config, inspect(other))
+
+  defp no_baseline(config, why) do
+    Logger.warning(
+      "cairn-native: no CPU baseline for #{config.model}: #{why} — #{config.backend} is loaded " <>
+        "and detecting, but its health cannot be judged against the CPU"
+    )
+
+    nil
   end
 
   defp canary_opts(state) do
@@ -693,20 +771,31 @@ defmodule Cairn.Native.Host do
   # `inferred` raises rather than reading as a call that ran no model, which would be
   # the health check going blind.
   #
+  # `infer_us` and not the whole call: the call also paid a decode and a tensor
+  # conversion, both backend-independent and together larger than an
+  # accelerator's pass (`Stream::push_au`, `docs/npu-backends.md`). Against a CPU
+  # baseline for the pass alone, that whole-call number reads a healthy
+  # accelerator as under the D-P5 floor.
+  #
   # Straight to the monitor: evidence routed through the process that can be
   # wedged is the thing the split undoes.
-  defp report(stream, camera_id, elapsed, {:ok, {frames, _ended_tracks}}) do
-    case Enum.count(frames, & &1.inferred) do
-      0 -> :ok
-      passes -> to_health(stream, {:inference, camera_id, {:passes, passes, elapsed}})
-    end
+  defp report(stream, camera_id, {:ok, {frames, _ended_tracks}}) do
+    {passes, micros} =
+      Enum.reduce(frames, {0, 0}, fn
+        %{inferred: true} = frame, {passes, micros} -> {passes + 1, micros + frame.infer_us}
+        %{inferred: false}, counted -> counted
+      end)
+
+    if passes > 0,
+      do: to_health(stream, {:inference, camera_id, {:passes, passes, micros}}),
+      else: :ok
   end
 
-  defp report(stream, camera_id, _elapsed, {:error, {reason, message}}) when is_atom(reason) do
+  defp report(stream, camera_id, {:error, {reason, message}}) when is_atom(reason) do
     failed(stream, camera_id, reason, message)
   end
 
-  defp report(stream, camera_id, _elapsed, other) do
+  defp report(stream, camera_id, other) do
     failed(stream, camera_id, :unknown, inspect(other))
   end
 

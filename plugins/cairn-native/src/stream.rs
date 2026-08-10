@@ -165,16 +165,21 @@ impl Stream {
         let decision = self
             .gate
             .decide(self.motion, motion, self.epoch.as_deref(), now);
-        let (objects, inferred) = match decision {
+        let (objects, inferred, infer_us) = match decision {
             Decision::Detect => {
+                // Started before the call, not after the model lock is taken:
+                // under saturation the wait on the engine's model mutex is
+                // exactly what a caller reading this as latency needs to see.
+                let started = Instant::now();
                 let dets = self.engine.detect(input, &self.floors)?;
+                let infer_us = started.elapsed().as_micros() as i64;
                 self.seeds.remember(&dets);
-                (dets, true)
+                (dets, true, infer_us)
             }
             // Re-report the last real pass, so a parked object the gate
             // stopped inferring on does not age out of the host's tracker
             // while it is still standing there.
-            Decision::Skip => (self.seeds.replay(), false),
+            Decision::Skip => (self.seeds.replay(), false, 0),
         };
 
         // The same bound the ndjson path refuses a line for: a `pts` this far
@@ -195,6 +200,7 @@ impl Stream {
             pts,
             observed_at_ms: unix_ms(observed_at),
             inferred,
+            infer_us,
             objects,
         }])
     }

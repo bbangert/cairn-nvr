@@ -670,6 +670,8 @@ defmodule Cairn.Config do
     config.cameras
     |> Enum.filter(&(&1.pipeline == :membrane))
     |> Enum.map(&profile_for(config, &1))
+    # What a load lets through here is a membrane camera with no plugin at all:
+    # `validate_membrane_profiles/2` refuses every other unprofiled one.
     |> Enum.reject(&is_nil/1)
     |> Enum.uniq_by(&Profile.native_config/1)
     |> case do
@@ -876,6 +878,7 @@ defmodule Cairn.Config do
     |> validate_remux(config)
     |> validate_ha_token(config)
     |> validate_native_model(config)
+    |> validate_membrane_profiles(config)
   end
 
   defp validate_native_model(acc, config) do
@@ -883,6 +886,29 @@ defmodule Cairn.Config do
       {:ok, _model} -> acc
       {:error, message} -> add_error(acc, message)
     end
+  end
+
+  # A membrane camera builds its detect branch from `plugin:` alone, but only a
+  # profile says which model the branch runs on. Unprofiled, it detects on
+  # whatever model another camera loaded, or on none.
+  defp validate_membrane_profiles(acc, config) do
+    config.cameras
+    |> Enum.filter(&(&1.pipeline == :membrane and &1.plugin != nil))
+    |> Enum.reject(&profile_for(config, &1))
+    |> Enum.reduce(acc, &add_error(&2, unprofiled_membrane(&1)))
+  end
+
+  defp unprofiled_membrane(%Camera{plugin: {:group, name}} = cam) do
+    "camera #{cam.id}: membrane detection resolves no profile — its model comes from plugin " <>
+      "#{name}'s profile:, and that group has none in effect. Add a profile: to plugin " <>
+      "#{name}, or set this camera's pipeline: classic"
+  end
+
+  defp unprofiled_membrane(%Camera{} = cam) do
+    "camera #{cam.id}: membrane detection resolves no profile — an inline plugin command is " <>
+      "not run for a membrane camera, which detects in this node's own engine and takes its " <>
+      "model from a plugin group's profile:. Move the command under plugins: with a profile: " <>
+      "and name that group as this camera's plugin:, or set pipeline: classic"
   end
 
   defp validate_ha_token(acc, %{ha_token: nil}), do: acc
