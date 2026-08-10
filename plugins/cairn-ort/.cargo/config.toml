@@ -1,0 +1,22 @@
+# The same two settings `../cairn-detect/.cargo/config.toml` carries, and for
+# the same reasons — cargo reads the config of the directory it is invoked
+# from, so a sibling crate that links the same FFmpeg needs its own copy.
+
+# rusty_ffmpeg (under rsmpeg) resolves libav* through pkg-config at build time.
+# Debian 12's system FFmpeg is 5.1, too old for rsmpeg, so point at the
+# prebuilt FFmpeg 7 tree instead of whatever is on the default search path.
+[env]
+FFMPEG_PKG_CONFIG_PATH = "/opt/ffmpeg7/lib/pkgconfig"
+
+# The FFmpeg 7 shared objects live outside the loader's default search path;
+# baking an rpath keeps `cargo test` working without LD_LIBRARY_PATH, and keeps
+# the BEAM able to dlopen this cdylib. Packaging has to revisit this.
+#
+# --disable-new-dtags emits DT_RPATH rather than DT_RUNPATH on purpose:
+# RUNPATH is not inherited, and libavformat's own dependencies (libswresample)
+# live in the same non-standard directory.
+[build]
+rustflags = [
+    "-C",
+    "link-args=-Wl,-rpath,/opt/ffmpeg7/lib -Wl,--disable-new-dtags",
+]

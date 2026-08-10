@@ -126,7 +126,9 @@ jobs:
             ~/.cargo/git
             ~/.cache/ort.pyke.io
             plugins/cairn-detect/target
-          key: cargo-debian13-${{ hashFiles('plugins/cairn-detect/Cargo.lock') }}
+            plugins/cairn-native/target
+            plugins/cairn-ort/target
+          key: cargo-debian13-${{ hashFiles('plugins/*/Cargo.lock') }}
           restore-keys: |
             cargo-debian13-
 
@@ -165,5 +167,45 @@ jobs:
       # cross-module reference in `infer` points at a private item.
       - run: cargo doc --no-deps --document-private-items
         working-directory: plugins/cairn-detect
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # The two NIF crates, same gates. Their end-to-end clip tests need model
+      # artifacts CI does not carry, and the harness's sanctioned waiver is the
+      # env var — a test that silently skipped would be indistinguishable from
+      # one that passed, so the waiver has to be explicit here.
+      - run: cargo fmt --check
+        working-directory: plugins/cairn-native
+
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: plugins/cairn-native
+
+      - run: cargo test
+        working-directory: plugins/cairn-native
+        env:
+          CAIRN_NATIVE_SKIP_CLIP: "1"
+
+      - run: cargo build --release
+        working-directory: plugins/cairn-native
+
+      - run: cargo doc --no-deps --document-private-items
+        working-directory: plugins/cairn-native
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - run: cargo fmt --check
+        working-directory: plugins/cairn-ort
+
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: plugins/cairn-ort
+
+      - run: cargo test
+        working-directory: plugins/cairn-ort
+
+      - run: cargo build --release
+        working-directory: plugins/cairn-ort
+
+      - run: cargo doc --no-deps --document-private-items
+        working-directory: plugins/cairn-ort
         env:
           RUSTDOCFLAGS: -D warnings

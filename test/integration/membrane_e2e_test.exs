@@ -3,7 +3,7 @@ defmodule Cairn.MembraneE2ETest do
   Plan task 3.6: the whole membrane stack on real video, in one VM.
 
       ffmpeg (MPEG-TS, one output) -> Cairn.Pipeline.Camera -> Picker
-        -> InferSink -> Cairn.Native.Host.push_frame/5 (in-VM NIF)
+        -> Inference -> Cairn.Native.Host.push_frame/5 (in-VM NIF) -> DetectSink
         -> Observations -> Dispatch -> CameraTracker -> EventExtractor -> clip
 
   Nothing here is stubbed: the real NIF, the real canary, the real ffmpeg, the
@@ -46,6 +46,12 @@ defmodule Cairn.MembraneE2ETest do
       raise "cairn-native is not loaded (#{inspect(Native.load_error())}); " <>
               "cargo build --release in plugins/cairn-native, then copy " <>
               "target/release/libcairn_native.so to priv/native/"
+    end
+
+    unless CairnOrt.available?() do
+      raise "cairn-ort is not loaded (#{inspect(CairnOrt.load_error())}); " <>
+              "cargo build --release in plugins/cairn-ort, then copy " <>
+              "target/release/libcairn_ort.so to priv/native/"
     end
 
     for path <- [@model, @labels, @plugin, @clip] do

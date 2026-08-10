@@ -180,7 +180,7 @@ defmodule Cairn.FFmpegPort do
 
   Both RTP outputs are gone because both consumers moved in-process: the
   WebRTC hub is fed by the pipeline's RTP branch and detection by its
-  `Cairn.Pipeline.InferSink`. A membrane camera therefore binds no UDP port —
+  `Cairn.Pipeline.Inference`. A membrane camera therefore binds no UDP port —
   see `Cairn.Camera`, which also keeps it out of any plugin group.
   """
   @spec build_membrane_argv(Cairn.Config.Camera.t(), String.t(), keyword()) :: [String.t()]

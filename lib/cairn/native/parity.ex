@@ -4,8 +4,8 @@ defmodule Cairn.Native.Parity do
   over RTP on 127.0.0.1, fed by `plugins/cairn-detect/verify/feed.py` and decoded
   by `Cairn.PluginProtocol.decode_line/2`, against the split NIF boundary —
   `Cairn.Native.decode_au/4` through `Cairn.Pipeline.SampleGate` into
-  `Cairn.Native.push_frame/4`, the very sequence `Cairn.Pipeline.Decoder` and
-  `Cairn.Pipeline.InferSink` run — over the clip's own access units. Both ends
+  `CairnOrt.push_frame/4`, the very sequence `Cairn.Pipeline.Decoder` and
+  `Cairn.Pipeline.Inference` run — over the clip's own access units. Both ends
   are `Cairn.Observation` structs.
 
   ## Why the comparison is exact
@@ -346,6 +346,12 @@ defmodule Cairn.Native.Parity do
               "libcairn_native.so into priv/native/"
     end
 
+    unless CairnOrt.available?() do
+      raise "cairn-ort is not loaded (#{inspect(CairnOrt.load_error())}) — " <>
+              "cargo build --release in plugins/cairn-ort and copy " <>
+              "libcairn_ort.so into priv/native/"
+    end
+
     {:ok, config} =
       Config.normalize(
         model: Keyword.fetch!(opts, :model),
@@ -361,9 +367,26 @@ defmodule Cairn.Native.Parity do
     {:ok, params} =
       Config.stream_params(min_score: Keyword.fetch!(opts, :min_score), stream_epoch: @epoch)
 
-    {:ok, engine} = Native.init(config)
-    {:ok, decoder} = Native.open_decoder(engine, @camera_id, params)
-    {:ok, stream} = Native.open_stream(engine, @camera_id, params)
+    sample_fps = Keyword.fetch!(opts, :sample_fps)
+    {:ok, engine} = CairnOrt.init(config)
+
+    # The exact seam `Cairn.Native.Host.open_decoder/3` crosses: the engine's
+    # resolved spec, as terms, plus the decode config.
+    spec = CairnOrt.engine_spec(engine)
+
+    decode_params = %{
+      decoder: "sw",
+      width: spec.width,
+      height: spec.height,
+      encoding: spec.encoding,
+      resize: spec.resize,
+      resize_pad: spec.resize_pad,
+      motion_json: params.motion_json,
+      sample_fps: sample_fps
+    }
+
+    {:ok, decoder} = Native.open_decoder(@camera_id, decode_params)
+    {:ok, stream} = CairnOrt.open_stream(engine, @camera_id, params)
 
     try do
       push_all(
@@ -372,11 +395,11 @@ defmodule Cairn.Native.Parity do
         aus,
         time_base,
         pace_ms(frame_ms, opts),
-        SampleGate.new(Keyword.fetch!(opts, :sample_fps))
+        SampleGate.new(sample_fps)
       )
     after
       Native.close_decoder(decoder)
-      Native.close_stream(stream)
+      CairnOrt.close_stream(stream)
     end
   end
 
@@ -413,7 +436,7 @@ defmodule Cairn.Native.Parity do
     meta =
       Map.take(frame, [:width, :height, :orig_width, :orig_height, :pts, :observed_at_ms, :motion])
 
-    {:ok, {frames, []}} = Native.push_frame(stream, frame.payload, meta, time_base)
+    {:ok, {frames, []}} = CairnOrt.push_frame(stream, frame.payload, meta, time_base)
     frames
   end
 

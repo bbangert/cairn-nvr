@@ -53,8 +53,8 @@ pub use geometry::{Fit, InputSize, Projection};
 pub use labels::{Labels, ScoreFloors, TrackFloorOverrides};
 pub use profile::{InputSpec, ModelProfile};
 
-// decode.rs and hwdecode.rs name these two only from their own test modules, and no
-// host outside this library names them at all. Gated so the public surface stays
-// what non-test callers use; an unconditional re-export would be permanent.
-#[cfg(test)]
+// Once test-only, now load-bearing across the split NIF boundary: a resolved
+// spec crosses between the inference library (cairn-ort, the producer via
+// `engine_spec`) and the decode library (cairn-native, the consumer) as the
+// `wire` spellings of exactly these two types.
 pub use {encoding::TensorEncoding, geometry::ResizePolicy};

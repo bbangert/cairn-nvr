@@ -14,20 +14,12 @@ defmodule Cairn.Native.Engine do
 
   @callback available?() :: boolean()
   @callback load_error() :: term() | nil
-  @callback init(map()) :: {:ok, reference()} | {:error, {atom(), String.t()}}
-  @callback open_stream(reference(), String.t(), map()) ::
-              {:ok, reference()} | {:error, {atom(), String.t()}}
-  @callback open_decoder(reference(), String.t(), map()) ::
+  @callback open_decoder(String.t(), map()) ::
               {:ok, reference()} | {:error, {atom(), String.t()}}
   @callback decode_au(reference(), binary(), integer(), boolean()) ::
               {:ok, {boolean(), Cairn.Native.decoded_frame() | nil}}
               | {:error, {atom(), String.t()}}
-  @callback push_frame(reference(), binary(), Cairn.Native.frame_meta(), {integer(), integer()}) ::
-              {:ok, {[map()], [String.t()]}} | {:error, {atom(), String.t()}}
-  @callback close_stream(reference()) :: {:ok, boolean()} | {:error, {atom(), String.t()}}
   @callback close_decoder(reference()) :: {:ok, boolean()} | {:error, {atom(), String.t()}}
-  @callback cpu_baseline_ms(map(), pos_integer()) ::
-              {:ok, float()} | {:error, {atom(), String.t()}}
 
   @after_compile __MODULE__
 

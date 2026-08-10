@@ -46,7 +46,7 @@ defmodule Cairn.Pipeline.Decoder do
 
   The native decoder opens against `Cairn.Native.Host`'s engine (same model,
   same resolved input spec as the inference stream) and reopens on a
-  cooldown after stream-fatal errors, exactly as `Cairn.Pipeline.InferSink`
+  cooldown after stream-fatal errors, exactly as `Cairn.Pipeline.Inference`
   does for its half. Two liveness notes: the `Host.open_decoder/3` call is a
   plain `GenServer.call` — the host's liveness is application-supervised (it
   sits outside every camera's tree), so a missing host is a boot-order fault

@@ -1,0 +1,43 @@
+[package]
+name = "cairn-ort"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+# `cdylib` is the NIF library the BEAM loads; `rlib` is for cairn-native's
+# dev-dependency, whose clip harness drives both halves of the split boundary
+# through one end-to-end test.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The inference stages — model session (ort/qnn backends, our own in-tree
+# `ort` pin, D-C1), heads/NMS, Re-ID embedding, labels. A path dependency on
+# the plugin's library target rather than a copy: the plugin binary, the
+# decode NIF and this library disagreeing about what a detection means is the
+# failure this shape avoids.
+cairn-detect = { path = "../cairn-detect" }
+rustler = { version = "0.38", features = ["derive"] }
+anyhow = "1.0"
+# For `ValueEnum::from_str` on `BackendKind`: the config the host sends names
+# the same values the operator's `--backend` flag does, parsed by the same code.
+clap = { version = "4.5", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+serde_json = "1.0"
+
+[features]
+# Passed through to cairn-detect for the aarch64 cross-build, where ort loads
+# the QAIRT-bundled runtime at startup instead of statically linking the
+# downloaded x86 archive.
+ort-load-dynamic = ["cairn-detect/ort-load-dynamic"]
+# Exposes the panic/poison test hooks to another crate's test build —
+# cairn-native's clip harness drives both halves of the split boundary and
+# needs to arm faults here. Never enabled by a production build: only
+# cairn-native's dev-dependency asks for it.
+test-hooks = []
+
+[profile.release]
+lto = "thin"
+strip = true

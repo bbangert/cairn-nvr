@@ -36,6 +36,28 @@ const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 impl TensorEncoding {
+    /// The stable wire spelling, round-tripped by [`Self::parse_wire`]: how a
+    /// resolved spec crosses a boundary that carries terms rather than types
+    /// (an engine in one NIF library telling a decoder in another what to
+    /// build for). Distinct from `Display`, which is prose for a startup line.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::UnitRgb => "unit_rgb",
+            Self::RawBgr => "raw_bgr",
+            Self::ImageNetRgb => "imagenet_rgb",
+        }
+    }
+
+    /// The inverse of [`Self::wire_name`], refusing anything else by name.
+    pub fn parse_wire(name: &str) -> anyhow::Result<Self> {
+        match name {
+            "unit_rgb" => Ok(Self::UnitRgb),
+            "raw_bgr" => Ok(Self::RawBgr),
+            "imagenet_rgb" => Ok(Self::ImageNetRgb),
+            other => anyhow::bail!("unknown tensor encoding {other:?}"),
+        }
+    }
+
     /// The per-plane affine and channel pick this encoding amounts to.
     pub fn packing(self) -> Packing {
         match self {
@@ -101,6 +123,25 @@ impl fmt::Display for TensorEncoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every variant must round-trip: the wire name is how a resolved spec
+    /// crosses between NIF libraries, and a variant that doesn't come back is
+    /// an engine and a decoder silently built for different models.
+    #[test]
+    fn every_encoding_round_trips_through_its_wire_name() {
+        for encoding in [
+            TensorEncoding::UnitRgb,
+            TensorEncoding::RawBgr,
+            TensorEncoding::ImageNetRgb,
+        ] {
+            assert_eq!(
+                TensorEncoding::parse_wire(encoding.wire_name()).unwrap(),
+                encoding
+            );
+        }
+        assert!(TensorEncoding::parse_wire("bgr").is_err());
+        assert!(TensorEncoding::parse_wire("").is_err());
+    }
 
     #[test]
     fn an_encoding_is_a_per_plane_affine_over_a_channel_pick() {

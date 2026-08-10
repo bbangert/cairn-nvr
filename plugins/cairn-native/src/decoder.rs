@@ -1,6 +1,6 @@
 //! One camera's decode stream: compressed access units in, content-rect RGB
-//! frames out — the decode half of the boundary [`crate::stream`] is the
-//! inference half of.
+//! frames out — the decode half of the split boundary whose inference half
+//! is the `cairn-ort` crate's stream.
 //!
 //! What crosses between them is `cairn_detect::decode::RgbSampled` spelled as
 //! a term: exact u8 pixels plus the geometry to rebuild the fit from, so the
@@ -18,15 +18,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cairn_detect::decode::{self, Decoder, RgbSampled};
 use cairn_detect::infer::InputSpec;
-use cairn_detect::motion::{MotionConfig, MotionVerdict};
+use cairn_detect::motion::MotionVerdict;
 use cairn_detect::note;
 use rsmpeg::avcodec::{AVCodecParameters, AVPacket};
-use rsmpeg::avutil::{AVFrame, AVRational};
+use rsmpeg::avutil::AVFrame;
 use rsmpeg::ffi;
 use rsmpeg::UnsafeDerefMut;
 
-use crate::config::StreamParams;
-use crate::engine::Engine;
+use crate::config::DecoderParams;
 use crate::error::{chain, NativeError, Result};
 
 /// How often a tolerated per-frame error is logged: the first, then every
@@ -95,17 +94,20 @@ pub struct DecodeStream {
 }
 
 impl DecodeStream {
-    /// Open one camera's decoder against this engine's resolved input spec.
+    /// Open one camera's decoder for the input spec an engine resolved.
     ///
-    /// No camera-id claim: the registry guards the *inference* stream
-    /// ([`crate::stream::Stream`]), which is where duplicate detection has to
-    /// be refused. Two decoders for one camera would only waste work.
-    pub fn open(engine: &Engine, camera_id: String, params: StreamParams) -> Result<Self> {
-        let decoder = open_decoder(engine, params.motion)?;
+    /// The spec arrives as terms rather than as the engine itself: the engine
+    /// lives in another NIF library (`cairn-ort`), and no resource can cross
+    /// between two. No camera-id claim either — the registry guards the
+    /// *inference* stream, which is where duplicate detection has to be
+    /// refused; two decoders for one camera would only waste work.
+    pub fn open(camera_id: String, params: DecoderParams) -> Result<Self> {
+        quiet_libav();
+        let decoder = open_decoder(&params)?;
         Ok(Self {
             camera_id,
             decoder,
-            spec: engine.input_spec,
+            spec: params.spec,
             decode_errors: 0,
             convert_errors: 0,
         })
@@ -231,10 +233,8 @@ impl Tolerated {
 }
 
 /// Whether the `count`-th tolerated anomaly is one of the logged ones: the
-/// first, then every fiftieth. `pub(crate)` so [`crate::stream`] rate-limits
-/// its own per-frame drop the same way — two spellings of this cadence would
-/// drift.
-pub(crate) fn should_log(count: u64) -> bool {
+/// first, then every fiftieth, as in `cairn_detect::decode::run`.
+fn should_log(count: u64) -> bool {
     count % LOG_EVERY == 1
 }
 
@@ -281,9 +281,9 @@ fn sampled_frame(decoder: &mut dyn Decoder) -> (Option<AVFrame>, Option<anyhow::
 /// band — so these parameters carry the codec and nothing else and the decoder
 /// learns its geometry from the first SPS. Both decode paths already tolerate a
 /// missing declared size.
-fn open_decoder(engine: &Engine, motion: Option<MotionConfig>) -> Result<Box<dyn Decoder>> {
+fn open_decoder(params: &DecoderParams) -> Result<Box<dyn Decoder>> {
     #[cfg(test)]
-    engine.panic_if_armed_for_open();
+    panic_if_armed_for_open();
     let mut codecpar = AVCodecParameters::new();
     // SAFETY: `codecpar` is our own freshly allocated parameters struct, and
     // both fields are plain enums with no ownership.
@@ -293,13 +293,54 @@ fn open_decoder(engine: &Engine, motion: Option<MotionConfig>) -> Result<Box<dyn
         raw.codec_type = ffi::AVMEDIA_TYPE_VIDEO;
     }
     decode::open(
-        engine.decoder,
+        params.kind,
         &codecpar,
-        engine.input_spec,
-        motion,
-        engine.sample_fps,
+        params.spec,
+        params.motion,
+        params.sample_fps,
     )
     .map_err(|e| NativeError::OpenStream(chain(&e)))
+}
+
+/// Panic inside the *next* decoder open, where a driver actually can. The
+/// hook lives here now that no engine exists on this side to carry it.
+#[cfg(test)]
+pub(crate) fn panic_in_the_next_open() {
+    OPEN_PANIC.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+static OPEN_PANIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn panic_if_armed_for_open() {
+    if OPEN_PANIC.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        panic!("the decoder exploded while opening");
+    }
+}
+
+/// Stop libav writing the BEAM's stderr for us.
+///
+/// A camera joining mid-GOP or any flaky RTSP source emits two `AV_LOG_ERROR`
+/// lines *per malformed access unit* (`No start code is found.` / `Error
+/// splitting the input into NAL units.`), at frame rate, per camera — and in-VM
+/// that is the node's log. Nothing is lost: those are the tolerated errors
+/// [`DecodeStream::note`] already counts and rate-limits. `AV_LOG_FATAL` and
+/// `AV_LOG_PANIC` still print.
+///
+/// A level rather than an `av_log_set_callback`: routing the text through
+/// [`note!`] means reformatting a `va_list`, whose bindgen type differs between
+/// x86_64 and the aarch64 board.
+///
+/// Once per VM, not per decoder: the setting is a libav global.
+fn quiet_libav() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: `av_log_set_level` stores an int in a libav global. Serialized by
+    // `Once` against itself; libav reads it unsynchronized either way, and an
+    // int is what every one of its own callers writes there too.
+    ONCE.call_once(|| unsafe {
+        ffi::av_log_set_level(ffi::AV_LOG_FATAL as i32);
+    });
 }
 
 /// One access unit as a packet the decoder can take. The bytes are copied because
@@ -330,18 +371,6 @@ fn packet_from(au: &[u8], pts: i64) -> Result<AVPacket> {
     packet.set_pts(pts);
     packet.set_dts(pts);
     Ok(packet)
-}
-
-/// The caller's time base, refused rather than trusted: `av_rescale_q` divides by
-/// the denominator and reads the sign of both, so a zero or negative term is not a
-/// slightly wrong timestamp but an arithmetic fault inside libavutil.
-pub(crate) fn rational((num, den): (i32, i32)) -> Result<AVRational> {
-    if num <= 0 || den <= 0 {
-        return Err(NativeError::Decode(format!(
-            "time base {num}/{den} must be positive"
-        )));
-    }
-    Ok(AVRational { num, den })
 }
 
 /// Milliseconds since the Unix epoch. A clock before the epoch (an unset RTC on a
@@ -513,16 +542,6 @@ mod tests {
         let (frame, error) = sampled_frame(&mut decoder);
         assert!(frame.is_none());
         assert!(error.is_none());
-    }
-
-    #[test]
-    fn a_time_base_that_would_fault_the_rescale_is_refused() {
-        for bad in [(0, 90_000), (1, 0), (-1, 90_000), (1, -90_000)] {
-            let error = rational(bad).unwrap_err();
-            assert_eq!(error.reason(), "decode", "{bad:?}");
-        }
-        let ok = rational((1, 90_000)).unwrap();
-        assert_eq!((ok.num, ok.den), (1, 90_000));
     }
 
     #[test]

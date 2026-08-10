@@ -39,7 +39,7 @@ defmodule Cairn.Pipeline.ConformanceTest do
   alias Cairn.Detect.Dispatch
   alias Cairn.MP4.Demuxer
   alias Cairn.Native.Host
-  alias Cairn.Pipeline.InferSink
+  alias Cairn.Pipeline.{DetectSink, Inference}
   alias Cairn.RTP
   alias Membrane.Buffer
 
@@ -271,7 +271,7 @@ defmodule Cairn.Pipeline.ConformanceTest do
     #
     # "Same situation" is one person detection at one pts with one `observed_at`,
     # built by each producer's own code — `PluginProtocol.decode_line/2` plus the
-    # port's `ObservationClock` stamp on one side, the real `InferSink` over a
+    # port's `ObservationClock` stamp on one side, the real `Inference`/`DetectSink` pair over a
     # stubbed NIF on the other — and delivered to a real `CameraTracker` each.
     test "the same detection yields identical event and track broadcasts" do
       classic_id = uid("evclassic")
@@ -419,8 +419,9 @@ defmodule Cairn.Pipeline.ConformanceTest do
     })
   end
 
-  # The membrane path's own construction: the real `InferSink` over a stubbed
-  # NIF, so `Cairn.Native.Observations` and the seam both run for real.
+  # The membrane path's own construction: the real `Inference` element and
+  # `DetectSink` over a stubbed NIF, so `Cairn.Native.Observations` and the
+  # seam both run for real.
   defp start_infer_sink(tracker, camera_id) do
     :persistent_term.put(NativeStub.control(), %{
       test: self(),
@@ -435,24 +436,23 @@ defmodule Cairn.Pipeline.ConformanceTest do
       {Host,
        name: host,
        native_module: NativeStub,
+       ort_module: Cairn.CairnOrtStub,
        canary_module: CanaryStub,
        config: %{model: "m.onnx", backend: "ort"}},
       id: host
     )
 
-    options =
-      struct(InferSink,
-        camera: tracked_camera(camera_id),
-        policy: @detect_policy,
-        epoch: @epoch,
-        host: host,
-        tracker: tracker,
+    inference =
+      struct(Inference,
+        session: {Host, host},
+        stream_id: camera_id,
+        stream_params: %{stream_epoch: @epoch},
         reopen_cooldown_ms: 0
       )
 
-    {[], state} = InferSink.handle_init(%{}, options)
-    {_actions, state} = InferSink.handle_playing(%{}, state)
-    assert state.stream == :open
+    {[], infer_state} = Inference.handle_init(%{}, inference)
+    {_actions, infer_state} = Inference.handle_playing(%{}, infer_state)
+    assert infer_state.stream == :open
 
     # the decoder's stream format always precedes its first buffer
     format = %Membrane.RawVideo{
@@ -463,11 +463,21 @@ defmodule Cairn.Pipeline.ConformanceTest do
       aligned: true
     }
 
-    {[], state} = InferSink.handle_stream_format(:input, format, %{}, state)
-    state
+    {[], infer_state} = Inference.handle_stream_format(:input, format, %{}, infer_state)
+
+    sink =
+      struct(DetectSink,
+        camera: tracked_camera(camera_id),
+        policy: @detect_policy,
+        epoch: @epoch,
+        tracker: tracker
+      )
+
+    {[], sink_state} = DetectSink.handle_init(%{}, sink)
+    %{infer: infer_state, sink: sink_state}
   end
 
-  defp feed_infer_sink(state) do
+  defp feed_infer_sink(%{infer: infer_state, sink: sink_state}) do
     frame = NativeStub.decoded_frame()
 
     metadata =
@@ -482,15 +492,19 @@ defmodule Cairn.Pipeline.ConformanceTest do
         :motion
       ])
 
-    {_actions, state} =
-      InferSink.handle_buffer(
+    {actions, infer_state} =
+      Inference.handle_buffer(
         :input,
         %Buffer{payload: frame.payload, pts: Membrane.Time.seconds(1), metadata: metadata},
         %{},
-        state
+        infer_state
       )
 
-    state
+    # the Detections buffer crosses into the cairn-side sink, as in the pipeline
+    assert [{:buffer, {:output, out}} | _] = actions
+    {_actions, sink_state} = DetectSink.handle_buffer(:input, out, %{}, sink_state)
+
+    %{infer: infer_state, sink: sink_state}
   end
 
   defp native_frame do

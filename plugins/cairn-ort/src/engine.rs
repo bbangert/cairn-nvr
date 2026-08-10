@@ -15,16 +15,15 @@
 //! does not exist. The registry is never touched under it.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, MutexGuard, Once};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
-use cairn_detect::decode::{DecoderKind, ModelInput};
+use cairn_detect::decode::ModelInput;
 use cairn_detect::emit::Det;
 use cairn_detect::infer::{
     self, BackendKind, Detector, Embedder, Fit, InputSpec, Labels, QnnOptions, ScoreFloors,
 };
 use cairn_detect::note;
-use rsmpeg::ffi;
 
 use crate::config::InitConfig;
 use crate::error::{chain, NativeError, Result};
@@ -39,22 +38,18 @@ struct Model {
 pub struct Engine {
     model: Mutex<Model>,
     open: Registry,
-    pub decoder: DecoderKind,
-    pub sample_fps: u32,
-    /// Resolved once here: every decoder this engine's streams open has to
-    /// produce the geometry, encoding and resize policy this one model asked for.
+    /// Resolved once here, and exported to the host (`engine_spec`): every
+    /// decoder built for this engine — in the *other* NIF library — has to
+    /// produce the geometry, encoding and resize policy this one model asked
+    /// for, and terms are the only thing that can cross between the two.
     pub input_spec: InputSpec,
     /// See [`Engine::panic_in_the_next_pass`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     panic_next: std::sync::atomic::AtomicBool,
-    /// See [`Engine::panic_in_the_next_open`].
-    #[cfg(test)]
-    panic_next_open: std::sync::atomic::AtomicBool,
 }
 
 impl Engine {
     pub fn open(config: InitConfig) -> Result<Self> {
-        quiet_libav();
         let labels = Labels::load(config.labels.as_deref())
             .map_err(|e| NativeError::ModelLoad(chain(&e)))?;
         let detector = Detector::open(
@@ -86,16 +81,14 @@ impl Engine {
         // The plugin's `up:` line: a wrong model or profile is visible before any
         // frame arrives rather than inferred later from bad boxes.
         note!(
-            "cairn-native up: model={} backend={} profile={} input size={} encoding={} \
-             resize={} decoder={} sample_fps={} embedder={}",
+            "cairn-ort up: model={} backend={} profile={} input size={} encoding={} \
+             resize={} embedder={}",
             config.model.display(),
             detector.backend_summary(),
             detector.profile(),
             input_spec.size,
             input_spec.encoding,
             input_spec.resize,
-            config.decoder,
-            config.sample_fps,
             match &embedder {
                 Some(embedder) => embedder.summary(),
                 None => "off".to_string(),
@@ -109,13 +102,9 @@ impl Engine {
                 labels,
             }),
             open: Registry::default(),
-            decoder: config.decoder,
-            sample_fps: config.sample_fps,
             input_spec,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             panic_next: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            panic_next_open: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -131,7 +120,7 @@ impl Engine {
     /// same composition both of the plugin's inference loops run.
     pub fn detect(&self, input: ModelInput, floors: &ScoreFloors) -> Result<Vec<Det>> {
         let mut model = self.model.lock().map_err(|_| NativeError::ModelPoisoned)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         if self
             .panic_next
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -163,30 +152,10 @@ impl Engine {
 
     /// Panic inside the *next* model pass, under both locks the way a real one
     /// does — the interleaving no synthetic poisoning can produce.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn panic_in_the_next_pass(&self) {
         self.panic_next
             .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Panic inside the *next* decoder open, where a driver actually can: after
-    /// the camera id is claimed and before any stream exists to hand it back.
-    #[cfg(test)]
-    pub fn panic_in_the_next_open(&self) {
-        self.panic_next_open
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Called from the decoder open itself, because what is under test is where
-    /// the unwind starts.
-    #[cfg(test)]
-    pub fn panic_if_armed_for_open(&self) {
-        if self
-            .panic_next_open
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            panic!("the decoder exploded while opening");
-        }
     }
 }
 
@@ -257,37 +226,12 @@ pub fn cpu_baseline_ms(config: &InitConfig, passes: usize) -> Result<f64> {
     let median = samples[samples.len() / 2].as_secs_f64() * 1000.0;
 
     note!(
-        "cairn-native cpu baseline: backend={} model={} median={median:.2}ms over {passes} pass(es)",
+        "cairn-ort cpu baseline: backend={} model={} median={median:.2}ms over {passes} pass(es)",
         detector.backend_summary(),
         config.model.display(),
     );
 
     Ok(median)
-}
-
-/// Stop libav writing the BEAM's stderr for us.
-///
-/// A camera joining mid-GOP or any flaky RTSP source emits two `AV_LOG_ERROR`
-/// lines *per malformed access unit* (`No start code is found.` / `Error
-/// splitting the input into NAL units.`), at frame rate, per camera — and in-VM
-/// that is the node's log. Nothing is lost: those are the tolerated errors
-/// `Stream::note` already counts and rate-limits. `AV_LOG_FATAL` and
-/// `AV_LOG_PANIC` still print.
-///
-/// A level rather than an `av_log_set_callback`: routing the text through
-/// [`note!`] means reformatting a `va_list`, whose bindgen type differs between
-/// x86_64 and the aarch64 board.
-///
-/// Once per VM, not per engine: the setting is a libav global, and `init/1` can
-/// be called again behind the host's canary.
-fn quiet_libav() {
-    static ONCE: Once = Once::new();
-    // SAFETY: `av_log_set_level` stores an int in a libav global. Serialized by
-    // `Once` against itself; libav reads it unsynchronized either way, and an
-    // int is what every one of its own callers writes there too.
-    ONCE.call_once(|| unsafe {
-        ffi::av_log_set_level(ffi::AV_LOG_FATAL as i32);
-    });
 }
 
 /// The camera ids with a live stream on this engine: not a lookup table, but the
@@ -346,8 +290,6 @@ mod tests {
             labels: None,
             allow_label_mismatch: false,
             embedder_model: None,
-            decoder: DecoderKind::Sw,
-            sample_fps: 5,
             qnn: QnnOptions::default(),
         };
         for passes in [0, 65, 1_000] {

@@ -14,10 +14,12 @@ name = "cairn_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-# The stages themselves — decode, motion, gate, infer, embed. A path
-# dependency on the plugin's library target rather than a copy: the plugin and
-# the NIF disagreeing about what a frame means is the failure this whole crate
-# is shaped to avoid.
+# The decode stages — decode, resize, motion measurement. A path dependency on
+# the plugin's library target rather than a copy: the plugin and the NIF
+# disagreeing about what a frame means is the failure this whole crate is
+# shaped to avoid. The inference stages live behind `cairn-ort`, the other
+# half of the split boundary; the two share no code above cairn-detect and no
+# resource at runtime.
 cairn-detect = { path = "../cairn-detect" }
 rustler = { version = "0.38", features = ["derive"] }
 # Must match cairn-detect's feature selection exactly: rusty_ffmpeg's bindings
@@ -25,15 +27,16 @@ rustler = { version = "0.38", features = ["derive"] }
 # link.
 rsmpeg = { version = "0.18.0", default-features = false, features = ["ffmpeg7_1"] }
 anyhow = "1.0"
-# For `ValueEnum::from_str` on `BackendKind` and `DecoderKind`, which are the
-# plugin's clap enums: the config the host sends names the same values the
-# operator's `--backend`/`--decoder` flags do, parsed by the same code.
+# For `ValueEnum::from_str` on `DecoderKind`, the plugin's clap enum: the
+# params the host sends name the same values the operator's `--decoder` flag
+# does, parsed by the same code.
 clap = { version = "4.5", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-# Tests only: the ndjson path hands its seeds over as a protocol line, so
-# comparing the two producers' output means parsing one of them.
-serde_json = "1.0"
+# The clip harness drives both halves of the split boundary — this decode
+# library and the inference one — through one end-to-end test; `test-hooks`
+# exposes cairn-ort's panic/poison arming to it.
+cairn-ort = { path = "../cairn-ort", features = ["test-hooks"] }
 
 [profile.release]
 lto = "thin"

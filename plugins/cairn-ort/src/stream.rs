@@ -1,6 +1,6 @@
 //! One camera's inference stream: sampled content-rect RGB frames in,
-//! observation terms out — the inference half of the boundary
-//! [`crate::decoder`] is the decode half of.
+//! observation terms out — the inference half of the split boundary whose
+//! decode half is the `cairn-native` crate's decoder.
 //!
 //! The tensor is packed here, from the exact bytes the decode side scaled
 //! (`cairn_detect::decode::model_input_from_rgb`), so the split changes no
@@ -27,6 +27,10 @@ use crate::config::StreamParams;
 use crate::engine::Engine;
 use crate::error::{chain, NativeError, Result};
 use crate::observation::FrameObservations;
+
+/// How often the out-of-bounds pts drop is logged: the first, then every
+/// fiftieth, as in `cairn_detect::decode::run`.
+const LOG_EVERY: u64 = 50;
 
 /// One sampled frame as the boundary carries it, resolved from the term shape.
 ///
@@ -94,7 +98,16 @@ impl Stream {
     /// so a caller that queued behind another push does not age the windows by
     /// however long it waited.
     pub fn push_frame(&mut self, frame: Frame<'_>, now: Instant) -> Result<Vec<FrameObservations>> {
-        let time_base = crate::decoder::rational(frame.time_base)?;
+        // Refused before anything runs, as the unsplit path refused it: a zero
+        // or negative term is an arithmetic fault inside libavutil, not a
+        // slightly wrong timestamp.
+        let (num, den) = frame.time_base;
+        if num <= 0 || den <= 0 {
+            return Err(NativeError::Decode(format!(
+                "time base {num}/{den} must be positive"
+            )));
+        }
+
         let input = decode::model_input_from_rgb(
             frame.rgb,
             frame.content,
@@ -107,7 +120,8 @@ impl Stream {
         .map_err(|e| NativeError::Infer(chain(&e)))?;
 
         let pts = match frame.pts {
-            Some(pts) => decode::rescale_90k(pts, time_base),
+            Some(pts) => decode::rescale_90k_checked(pts, frame.time_base)
+                .map_err(|e| NativeError::Decode(chain(&e)))?,
             None => 0,
         };
 
@@ -135,7 +149,7 @@ impl Stream {
         // out means the rescale saturated, so it is not a timestamp.
         if !(-MAX_PTS..=MAX_PTS).contains(&pts) {
             self.unbounded_pts += 1;
-            if crate::decoder::should_log(self.unbounded_pts) {
+            if self.unbounded_pts % LOG_EVERY == 1 {
                 note!(
                     "camera {}: pts {pts} is outside +-2^62, {} frame(s) dropped so far",
                     self.camera_id,
@@ -158,30 +172,6 @@ impl Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         self.engine.release(&self.camera_id);
-    }
-}
-
-/// A [`Frame`] over what a decode stream just produced — the test path from
-/// one half of the boundary to the other without a term in between.
-#[cfg(test)]
-pub fn frame_from<'a>(
-    sampled: &'a crate::decoder::DecodedFrame,
-    time_base: (i32, i32),
-) -> Frame<'a> {
-    Frame {
-        rgb: &sampled.rgb,
-        content: InputSize {
-            w: sampled.width,
-            h: sampled.height,
-        },
-        orig: InputSize {
-            w: sampled.orig_width,
-            h: sampled.orig_height,
-        },
-        pts: sampled.pts,
-        time_base,
-        observed_at_ms: sampled.observed_at_ms,
-        motion: sampled.motion,
     }
 }
 

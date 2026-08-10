@@ -4,7 +4,7 @@ defmodule Cairn.Pipeline.Camera do
 
       BridgeSource ─ TS demux ─ tee ─┬─ parser(avc3) ─ CMAF ─ RingBufferSink
                                      ├─ RTPOut (in-process WebRTC hub feed)
-                                     └─ Picker ─(manual)─ Decoder ─(manual)─ InferSink
+                                     └─ Picker ─(manual)─ Decoder ─(manual)─ Inference ─ DetectSink
 
   Started by `Cairn.FFmpegPort` alongside each ffmpeg spawn and torn down
   with it — the TS demuxer's state is only valid for one continuous ffmpeg
@@ -15,21 +15,23 @@ defmodule Cairn.Pipeline.Camera do
   membrane_core's toilet and is killed under exactly the overload it exists to
   survive, so the manual pads are internal to the branch — access units between
   `Cairn.Pipeline.Picker` and `Cairn.Pipeline.Decoder`, sampled RGB frames
-  between the decoder and `Cairn.Pipeline.InferSink` (D-C2's seam: frames as
-  plain buffers, letterbox maths and motion verdict in metadata).
+  between the decoder and `Cairn.Pipeline.Inference` (D-C2's seam: frames as
+  plain buffers, letterbox maths and motion verdict in metadata). The
+  observations then flow as `Detections` buffers into
+  `Cairn.Pipeline.DetectSink`, the cairn-side half that dispatches them.
 
   The tee carries AU-aligned Annex-B H.264 as the TS demuxer emits it; each
   branch owns its own format conversion (CMAF needs avc3 + per-AU keyframe
   metadata, which its parser stage adds).
 
-  Detections leave the sink for `Cairn.Detect.Dispatch` directly; this process
-  is on the reload path (a new policy, forwarded to the sink) but not on the
-  per-frame one.
+  Detections leave `Cairn.Pipeline.DetectSink` for `Cairn.Detect.Dispatch`
+  directly; this process is on the reload path (a new policy, forwarded to
+  that sink) but not on the per-frame one.
   """
 
   use Membrane.Pipeline
 
-  alias Cairn.Pipeline.{Decoder, InferSink, Picker}
+  alias Cairn.Pipeline.{Decoder, DetectSink, Inference, Picker}
   alias Membrane.Pad
 
   @impl true
@@ -68,11 +70,11 @@ defmodule Cairn.Pipeline.Camera do
   @impl true
   def handle_child_notification(_notification, _child, _ctx, state), do: {[], state}
 
-  # A reload's new policy, from `Cairn.FFmpegPort`. Only the sink holds one, so
-  # a camera whose detect branch was never built has nothing to tell.
+  # A reload's new policy, from `Cairn.FFmpegPort`. Only the detect sink holds
+  # one, so a camera whose detect branch was never built has nothing to tell.
   @impl true
   def handle_info({:policy, camera, policy}, _ctx, %{detecting?: true} = state) do
-    {[notify_child: {:infer, {:policy, camera, policy}}], state}
+    {[notify_child: {:detect, {:policy, camera, policy}}], state}
   end
 
   def handle_info(_message, _ctx, state), do: {[], state}
@@ -90,14 +92,18 @@ defmodule Cairn.Pipeline.Camera do
       # the moment it is, and no more than one is ever in flight.
       |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
       |> child(:decoder, %Decoder{camera_id: camera.id, stream_params: stream_params})
-      # …and one sampled frame between decoder and sink, for the same reason:
-      # the sink demands only after `push_frame/5` returns.
+      # …and one sampled frame between decoder and inference, for the same
+      # reason: inference demands only after `push_frame/5` returns.
       |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
-      |> child(:infer, %InferSink{
+      |> child(:infer, %Inference{
+        session: {Cairn.Native.Host, Cairn.Native.Host},
+        stream_id: camera.id,
+        stream_params: Map.put(stream_params, :stream_epoch, epoch)
+      })
+      |> child(:detect, %DetectSink{
         camera: camera,
         policy: Keyword.fetch!(detect, :policy),
-        epoch: epoch,
-        stream_params: stream_params
+        epoch: epoch
       })
     ]
   end

@@ -67,6 +67,7 @@ defmodule Cairn.Native.Host do
     :table,
     :inflight,
     :native,
+    :ort,
     :canary,
     :config,
     :engine,
@@ -142,7 +143,7 @@ defmodule Cairn.Native.Host do
 
   Blocks the caller for the model pass — and, under saturation, for as long as
   the streams ahead of it hold the model session too. `meta` is
-  `t:Cairn.Native.frame_meta/0`.
+  `t:CairnOrt.frame_meta/0`.
 
   The frames come back in the crate's own spelling; `Cairn.Native.Observations`
   turns them into `Cairn.Observation`s.
@@ -151,7 +152,7 @@ defmodule Cairn.Native.Host do
           atom(),
           String.t(),
           binary(),
-          Cairn.Native.frame_meta(),
+          CairnOrt.frame_meta(),
           {integer(), integer()}
         ) ::
           {:ok, {[map()], [String.t()]}} | {:error, term()}
@@ -240,6 +241,7 @@ defmodule Cairn.Native.Host do
       table: table,
       inflight: inflight,
       native: Keyword.get(opts, :native_module, Cairn.Native),
+      ort: Keyword.get(opts, :ort_module, CairnOrt),
       canary: Keyword.get(opts, :canary_module, Canary),
       opts: opts
     }
@@ -423,13 +425,13 @@ defmodule Cairn.Native.Host do
   end
 
   defp canary_then_load(state, config) do
-    if state.native.available?() do
+    if state.ort.available?() do
       probe(state, config)
     else
       refuse(
         state,
-        {:nif_unavailable, state.native.load_error()},
-        "cairn-native is not loaded (#{inspect(state.native.load_error())}); " <>
+        {:nif_unavailable, state.ort.load_error()},
+        "cairn-ort is not loaded (#{inspect(state.ort.load_error())}); " <>
           "no camera on this node will be detected on"
       )
     end
@@ -455,10 +457,10 @@ defmodule Cairn.Native.Host do
   defp load_model(state, config, canary) do
     state = %{state | canary_state: canary}
 
-    case state.native.init(config) do
+    case state.ort.init(config) do
       {:ok, engine} ->
         Logger.info(
-          "cairn-native: engine ready — model #{config.model} backend #{config.backend} " <>
+          "cairn-ort: engine ready — model #{config.model} backend #{config.backend} " <>
             "(canary #{inspect(canary)})"
         )
 
@@ -492,12 +494,12 @@ defmodule Cairn.Native.Host do
   end
 
   defp await_baseline(state, config) do
-    native = state.native
+    ort = state.ort
     passes = Keyword.get(state.opts, :baseline_passes, @baseline_passes)
 
     task =
       Task.Supervisor.async_nolink(Cairn.TaskSupervisor, fn ->
-        native.cpu_baseline_ms(config, passes)
+        ort.cpu_baseline_ms(config, passes)
       end)
 
     timeout = Keyword.get(state.opts, :baseline_timeout_ms, @baseline_timeout_ms)
@@ -639,7 +641,7 @@ defmodule Cairn.Native.Host do
     {epoch, origin} = resolve_epoch(camera_id, params)
     params = %{params | stream_epoch: epoch}
 
-    case state.native.open_stream(state.engine, camera_id, params) do
+    case state.ort.open_stream(state.engine, camera_id, params) do
       {:ok, ref} ->
         announce(camera_id, epoch, origin)
         # Names this open, so a report from a push the reopen raced past is not
@@ -652,7 +654,7 @@ defmodule Cairn.Native.Host do
            %{
              ref: ref,
              token: token,
-             module: state.native,
+             module: state.ort,
              host: self(),
              health: Health.name(state.table),
              inflight: state.inflight
@@ -678,8 +680,27 @@ defmodule Cairn.Native.Host do
     {{:error, state.engine_state}, state}
   end
 
+  # The one place the two libraries meet: the engine's resolved input spec is
+  # read out of cairn-ort as plain terms and handed to cairn-native's open,
+  # with the host's own decode config (`decoder`, `sample_fps`) alongside — so
+  # both halves are built for the same model without either naming the other.
   defp do_open_decoder(%{engine_state: :ready} = state, camera_id, params) do
-    case state.native.open_decoder(state.engine, camera_id, params) do
+    # A plain field-read NIF (sub-microsecond, deliberately not
+    # dirty-scheduled), so calling it from this process costs nothing.
+    spec = state.ort.engine_spec(state.engine)
+
+    decode_params = %{
+      decoder: state.config.decoder,
+      width: spec.width,
+      height: spec.height,
+      encoding: spec.encoding,
+      resize: spec.resize,
+      resize_pad: spec.resize_pad,
+      motion_json: params.motion_json,
+      sample_fps: state.config.sample_fps
+    }
+
+    case state.native.open_decoder(camera_id, decode_params) do
       {:ok, ref} ->
         {:ok, %{ref: ref, module: state.native, sample_fps: state.config.sample_fps}}
 
@@ -716,10 +737,10 @@ defmodule Cairn.Native.Host do
   # is made anywhere but here — under the application's task supervisor, which
   # outlives this process and so carries a `terminate/2` close past its shutdown.
   defp close_natively(state, camera_id, stream) do
-    native = state.native
+    ort = state.ort
 
     case Task.Supervisor.start_child(Cairn.TaskSupervisor, fn ->
-           native.close_stream(stream.ref)
+           ort.close_stream(stream.ref)
          end) do
       {:ok, pid} ->
         {:ok, Process.monitor(pid)}
@@ -889,10 +910,15 @@ defmodule Cairn.Native.Host do
     )
   end
 
+  # Two libraries now stand behind one `nif` key: the model side (cairn-ort)
+  # is the one whose absence stops detection wholesale, so it speaks first;
+  # a missing decode library is equally fatal to the branch and is named too.
   defp nif_status(state) do
-    case state.native.load_error() do
-      nil -> :available
-      reason -> {:unavailable, reason}
+    case {state.ort.load_error(), state.native.load_error()} do
+      {nil, nil} -> :available
+      {reason, nil} -> {:unavailable, reason}
+      {nil, reason} -> {:unavailable, reason}
+      {ort, _native} -> {:unavailable, ort}
     end
   end
 end

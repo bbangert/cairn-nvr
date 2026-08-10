@@ -116,6 +116,28 @@ impl fmt::Display for ResizePolicy {
 }
 
 impl ResizePolicy {
+    /// The stable wire spelling as `(policy, pad)`, round-tripped by
+    /// [`Self::from_wire`]: how a resolved spec crosses a boundary that
+    /// carries terms rather than types. `pad` is `0` under `Stretch`, which
+    /// has none to carry.
+    pub fn wire(self) -> (&'static str, u8) {
+        match self {
+            Self::Stretch => ("stretch", 0),
+            Self::Letterbox { pad } => ("letterbox", pad),
+        }
+    }
+
+    /// The inverse of [`Self::wire`], refusing anything the wire never
+    /// produced — a stretch carrying a pad is a mangled term, not a policy.
+    pub fn from_wire(policy: &str, pad: u8) -> Result<Self> {
+        match (policy, pad) {
+            ("stretch", 0) => Ok(Self::Stretch),
+            ("stretch", pad) => bail!("stretch carries no pad, got {pad}"),
+            ("letterbox", pad) => Ok(Self::Letterbox { pad }),
+            (other, _) => bail!("unknown resize policy {other:?}"),
+        }
+    }
+
     /// Where a `source`-sized frame lands inside an `input`-sized tensor.
     pub fn fit(self, input: InputSize, source: InputSize) -> Fit {
         match self {
@@ -668,5 +690,23 @@ mod tests {
             .corners();
         assert!((back.x2 - 1.0).abs() < 1e-9, "{back:?}");
         assert!((back.y2 - 1.0).abs() < 1e-9, "{back:?}");
+    }
+
+    /// Every policy must round-trip: the wire pair is how a resolved spec
+    /// crosses between NIF libraries, pad value included — a letterbox that
+    /// comes back with a different pad letterboxes a different picture.
+    #[test]
+    fn every_resize_policy_round_trips_through_its_wire_pair() {
+        for policy in [
+            ResizePolicy::Stretch,
+            ResizePolicy::Letterbox { pad: 114 },
+            ResizePolicy::Letterbox { pad: 0 },
+        ] {
+            let (name, pad) = policy.wire();
+            assert_eq!(ResizePolicy::from_wire(name, pad).unwrap(), policy);
+        }
+        assert!(ResizePolicy::from_wire("crop", 0).is_err());
+        // …and a stretch smuggling a pad is a mangled term, not a policy
+        assert!(ResizePolicy::from_wire("stretch", 114).is_err());
     }
 }

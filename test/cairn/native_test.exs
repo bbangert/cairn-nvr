@@ -19,7 +19,18 @@ defmodule Cairn.NativeTest do
       if Native.available?() do
         assert Native.load_error() == nil
       else
-        assert_raise ErlangError, fn -> Native.close_stream(make_ref()) end
+        assert_raise ErlangError, fn -> Native.close_decoder(make_ref()) end
+      end
+    end
+
+    # Same arrangement, other library: the inference half loads (or says why
+    # not) independently of the decode half.
+    test "CairnOrt is usable whether or not its library loaded" do
+      assert is_boolean(CairnOrt.available?())
+      assert CairnOrt.available?() == (CairnOrt.load_error() == nil)
+
+      unless CairnOrt.available?() do
+        assert_raise ErlangError, fn -> CairnOrt.close_stream(make_ref()) end
       end
     end
   end
