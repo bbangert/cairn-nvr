@@ -139,6 +139,20 @@ defmodule Cairn.Pipeline.InferenceTest do
 
       assert_receive {:open_stream, _engine, _camera_id, %{min_score: ^floors}}
     end
+
+    test "the resource guard closes the session stream on teardown", ctx do
+      {:ok, guard} = Membrane.ResourceGuard.start_link()
+
+      state = element(ctx)
+      {[], state} = Inference.handle_setup(%{resource_guard: guard}, state)
+      {_actions, _state} = playing(state)
+      assert_receive {:open_stream, _engine, _camera_id, _params}
+
+      # What a crashed element leaves behind: the guard runs the registered
+      # close, which hands the stream id back through the provider.
+      Membrane.ResourceGuard.cleanup(guard)
+      assert_receive {:close_stream, _ref}, 2_000
+    end
   end
 
   describe "one frame" do

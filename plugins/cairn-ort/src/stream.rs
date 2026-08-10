@@ -1,6 +1,6 @@
 //! One camera's inference stream: sampled content-rect RGB frames in,
-//! observation terms out — the inference half of the boundary
-//! [`crate::decoder`] is the decode half of.
+//! observation terms out — the inference half of the split boundary whose
+//! decode half is the `cairn-native` crate's decoder.
 //!
 //! The tensor is packed here, from the exact bytes the decode side scaled
 //! (`cairn_detect::decode::model_input_from_rgb`), so the split changes no
@@ -24,13 +24,13 @@ use cairn_detect::motion::{MotionConfig, MotionVerdict};
 use cairn_detect::note;
 
 use crate::config::StreamParams;
+use crate::engine::Engine;
+use crate::error::{chain, NativeError, Result};
+use crate::observation::FrameObservations;
 
 /// How often the out-of-bounds pts drop is logged: the first, then every
 /// fiftieth, as in `cairn_detect::decode::run`.
 const LOG_EVERY: u64 = 50;
-use crate::engine::Engine;
-use crate::error::{chain, NativeError, Result};
-use crate::observation::FrameObservations;
 
 /// One sampled frame as the boundary carries it, resolved from the term shape.
 ///

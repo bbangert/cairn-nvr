@@ -127,12 +127,14 @@ impl ResizePolicy {
         }
     }
 
-    /// The inverse of [`Self::wire`], refusing anything else by name.
+    /// The inverse of [`Self::wire`], refusing anything the wire never
+    /// produced — a stretch carrying a pad is a mangled term, not a policy.
     pub fn from_wire(policy: &str, pad: u8) -> Result<Self> {
-        match policy {
-            "stretch" => Ok(Self::Stretch),
-            "letterbox" => Ok(Self::Letterbox { pad }),
-            other => bail!("unknown resize policy {other:?}"),
+        match (policy, pad) {
+            ("stretch", 0) => Ok(Self::Stretch),
+            ("stretch", pad) => bail!("stretch carries no pad, got {pad}"),
+            ("letterbox", pad) => Ok(Self::Letterbox { pad }),
+            (other, _) => bail!("unknown resize policy {other:?}"),
         }
     }
 
@@ -704,5 +706,7 @@ mod tests {
             assert_eq!(ResizePolicy::from_wire(name, pad).unwrap(), policy);
         }
         assert!(ResizePolicy::from_wire("crop", 0).is_err());
+        // …and a stretch smuggling a pad is a mangled term, not a policy
+        assert!(ResizePolicy::from_wire("stretch", 114).is_err());
     }
 }

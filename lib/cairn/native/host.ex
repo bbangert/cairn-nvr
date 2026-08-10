@@ -685,6 +685,8 @@ defmodule Cairn.Native.Host do
   # with the host's own decode config (`decoder`, `sample_fps`) alongside — so
   # both halves are built for the same model without either naming the other.
   defp do_open_decoder(%{engine_state: :ready} = state, camera_id, params) do
+    # A plain field-read NIF (sub-microsecond, deliberately not
+    # dirty-scheduled), so calling it from this process costs nothing.
     spec = state.ort.engine_spec(state.engine)
 
     decode_params = %{

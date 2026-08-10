@@ -88,7 +88,15 @@ defmodule Cairn.Pipeline.DecoderTest do
 
       # …alongside the engine's resolved spec, spelled as wire terms.
       assert_receive {:open_decoder, _camera_id,
-                      %{motion_json: ^motion, encoding: "raw_bgr", width: 4, resize: "letterbox"}}
+                      %{
+                        motion_json: ^motion,
+                        encoding: "raw_bgr",
+                        width: 4,
+                        height: 4,
+                        resize: "letterbox",
+                        resize_pad: 114,
+                        sample_fps: 5
+                      }}
     end
 
     test "a refused open costs the AU, not the session", ctx do

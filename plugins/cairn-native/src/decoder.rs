@@ -1,6 +1,6 @@
 //! One camera's decode stream: compressed access units in, content-rect RGB
-//! frames out — the decode half of the boundary [`crate::stream`] is the
-//! inference half of.
+//! frames out — the decode half of the split boundary whose inference half
+//! is the `cairn-ort` crate's stream.
 //!
 //! What crosses between them is `cairn_detect::decode::RgbSampled` spelled as
 //! a term: exact u8 pixels plus the geometry to rebuild the fit from, so the
@@ -233,10 +233,8 @@ impl Tolerated {
 }
 
 /// Whether the `count`-th tolerated anomaly is one of the logged ones: the
-/// first, then every fiftieth. `pub(crate)` so [`crate::stream`] rate-limits
-/// its own per-frame drop the same way — two spellings of this cadence would
-/// drift.
-pub(crate) fn should_log(count: u64) -> bool {
+/// first, then every fiftieth, as in `cairn_detect::decode::run`.
+fn should_log(count: u64) -> bool {
     count % LOG_EVERY == 1
 }
 

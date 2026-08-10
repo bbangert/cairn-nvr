@@ -133,10 +133,11 @@ defmodule Cairn.DetectFailuresE2ETest do
   test "a model that will not load is an engine state, not a crash loop",
        %{camera: camera, config: config, id: id} do
     # The canary is bypassed so the refusal has to come from the in-VM load
-    # itself — the other half of the protection.
+    # itself — the other half of the protection. Restored in this test's
+    # `after`, which must run before `restore_engine/0` reconfigures — an
+    # `on_exit` would run too late and reload the good model unrehearsed.
     previous = Application.get_env(:cairn, Cairn.Native.Canary, [])
     Application.put_env(:cairn, Cairn.Native.Canary, Keyword.put(previous, :enabled, false))
-    on_exit(fn -> Application.put_env(:cairn, Cairn.Native.Canary, previous) end)
 
     {:error, {:model_load, message}} =
       Host.configure(%{
@@ -153,6 +154,8 @@ defmodule Cairn.DetectFailuresE2ETest do
     start_supervised!({Cairn.Camera, camera: camera, config: config, index: 0})
     assert_dark_branch_healthy_recording(id)
   after
+    previous = Application.get_env(:cairn, Cairn.Native.Canary, [])
+    Application.put_env(:cairn, Cairn.Native.Canary, Keyword.delete(previous, :enabled))
     restore_engine()
   end
 

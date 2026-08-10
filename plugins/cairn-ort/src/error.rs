@@ -24,8 +24,8 @@ pub enum NativeError {
     ModelLoad(String),
     /// A stream could not be opened: no decoder, or this camera already has one.
     OpenStream(String),
-    /// The decoder rejected an access unit outright, which the tolerated
-    /// per-packet errors are not — see [`crate::stream`].
+    /// A frame's envelope was rejected outright (a time base that would
+    /// fault the rescale), which the tolerated per-packet errors are not.
     Decode(String),
     /// A model pass failed. It *can* be a model-wide fault wearing a stream's
     /// clothes — a wedged accelerator answers every stream this way — but telling
@@ -44,7 +44,7 @@ pub enum NativeError {
     /// nests stream -> model and a pass that panics poisons both. So a poisoned
     /// model outranks a poisoned stream on every stream *including the one the
     /// panic happened on*, which is the case a stream reading only its own lock
-    /// gets backwards ([`crate::StreamRef::poisoned_by`]).
+    /// gets backwards (`StreamRef::poisoned_by`).
     ModelPoisoned,
     /// A panic caught at the NIF boundary ([`crate::guarded`]).
     Panicked(String),

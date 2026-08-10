@@ -2,6 +2,8 @@
 name = "cairn-ort"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
+publish = false
 
 # `cdylib` is the NIF library the BEAM loads; `rlib` is for cairn-native's
 # dev-dependency, whose clip harness drives both halves of the split boundary
@@ -35,3 +37,7 @@ ort-load-dynamic = ["cairn-detect/ort-load-dynamic"]
 # needs to arm faults here. Never enabled by a production build: only
 # cairn-native's dev-dependency asks for it.
 test-hooks = []
+
+[profile.release]
+lto = "thin"
+strip = true

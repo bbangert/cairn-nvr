@@ -49,12 +49,17 @@ defmodule Cairn.Pipeline.DetectSink do
        epoch: opts.epoch,
        tracker: opts.tracker,
        clock: ObservationClock.new(),
-       dispatched: 0
+       dispatched: 0,
+       dropped: 0
      }}
   end
 
+  # The metadata key is matched, not dot-accessed: `accepted_format` gates the
+  # stream-format struct, never buffer metadata, so a producer speaking
+  # `Detections` without the observations key falls through to the counted
+  # drop below rather than crashing the sink.
   @impl true
-  def handle_buffer(:input, buffer, _ctx, state) do
+  def handle_buffer(:input, %{metadata: %{observations: observations}}, _ctx, state) do
     # Monotonic, as both plugin producers pass: `at_ms` is compared against the
     # host's monotonic clock elsewhere — `Cairn.CameraTracker`'s `cut_clock`
     # stamps a stream cut with it, and a wall-clock `at_ms` puts every
@@ -62,7 +67,7 @@ defmodule Cairn.Pipeline.DetectSink do
     {observations, clock} =
       Observations.from_frames(
         state.clock,
-        buffer.metadata.observations,
+        observations,
         state.camera.id,
         state.epoch,
         System.monotonic_time(:millisecond)
@@ -76,9 +81,13 @@ defmodule Cairn.Pipeline.DetectSink do
     {[], %{state | clock: clock, dispatched: state.dispatched + length(observations)}}
   end
 
+  def handle_buffer(:input, _buffer, _ctx, state) do
+    {[], %{state | dropped: state.dropped + 1}}
+  end
+
   @impl true
   def handle_parent_notification(:stats, _ctx, state) do
-    {[notify_parent: {:stats, %{dispatched: state.dispatched}}], state}
+    {[notify_parent: {:stats, %{dispatched: state.dispatched, dropped: state.dropped}}], state}
   end
 
   # A reload cannot change what the argv or the open stream carry — those fields

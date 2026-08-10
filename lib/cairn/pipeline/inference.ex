@@ -39,7 +39,11 @@ defmodule Cairn.Pipeline.Inference do
   stream for its own lifetime, reopens on a cooldown after stream-fatal
   errors, and parks permanently on an engine-fatal one — the session owner's
   recovery (a fresh model load behind its canary) is not this element's to
-  drive.
+  drive. The provider calls themselves are plain `GenServer.call`s: the
+  provider's liveness is the deployment's to supervise (in this application
+  the Host sits outside every camera's tree), so a missing provider is a
+  boot-order fault that should crash this element, not a state to retry
+  around.
   """
 
   use Membrane.Filter

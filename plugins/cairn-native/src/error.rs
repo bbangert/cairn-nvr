@@ -17,8 +17,8 @@ pub enum NativeError {
     Config(String),
     /// A stream could not be opened: no decoder, or this camera already has one.
     OpenStream(String),
-    /// The decoder rejected an access unit outright, which the tolerated
-    /// per-packet errors are not — see [`crate::stream`].
+    /// The decoder rejected an access unit outright (empty, oversized),
+    /// which the tolerated per-packet errors are not.
     Decode(String),
     /// `decode_au` on a decoder `close_decoder` already emptied.
     Closed,

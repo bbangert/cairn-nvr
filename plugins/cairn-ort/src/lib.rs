@@ -280,7 +280,7 @@ fn close_stream(stream: ResourceArc<StreamRef>) -> Result<bool> {
 /// Run one NIF body, turning a panic into a term rather than into rustler's
 /// Erlang exception: `Cairn.Native.Host` decides whether a stream is closed, and
 /// cannot if it is told a process died instead. Destructors are not covered —
-/// see [`teardown`].
+/// see the `teardown` module.
 pub fn guarded<T>(what: &'static str, body: impl FnOnce() -> Result<T>) -> Result<T> {
     match catch_unwind(AssertUnwindSafe(body)) {
         Ok(result) => result,
