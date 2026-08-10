@@ -3,7 +3,7 @@ defmodule Cairn.Detect.Dispatch do
   The one hop from a detection producer to a camera's tracker.
 
   Two producers reach it: `Cairn.PluginPort` / `Cairn.PluginGroupPort` for an
-  external plugin's ndjson lines, `Cairn.Pipeline.InferSink` for the in-VM NIF's
+  external plugin's ndjson lines, `Cairn.Pipeline.DetectSink` for the in-VM NIF's
   frames. Each resolves `Cairn.Config.policy/2` off the per-frame path — at init
   and on refresh — and hands the result through here unmodified, so
   `Cairn.CameraTracker` never calls the config server per frame and both

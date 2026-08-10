@@ -34,6 +34,7 @@ defmodule Cairn.Native.HealthTest do
     defaults = [
       name: name,
       native_module: NativeStub,
+      ort_module: Cairn.CairnOrtStub,
       canary_module: CanaryStub,
       config: %{model: "m.onnx", backend: "qnn"}
     ]

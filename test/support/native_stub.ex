@@ -1,13 +1,14 @@
 defmodule Cairn.NativeStub do
   @moduledoc """
-  Stands in for `Cairn.Native` — the NIF boundary, which CI has no library for.
+  Stands in for `Cairn.Native` — the decode NIF boundary, which CI has no
+  library for. `Cairn.CairnOrtStub` is the inference half; both read the SAME
+  control map, so one test setup drives the whole split boundary.
 
   Driven by the control map a test puts in `:persistent_term` under
   `{:native_stub, :control}`: `:test` is the pid every call reports to, and one
-  key per function is what that function answers (every key but `available?` and
-  `init` may be a function of that function's arity, so a test can block, sleep
-  or fail inside the call — `open_stream` is how a test blocks the host itself,
-  since that one is called from the host process).
+  key per function is what that function answers (every key but `available?`
+  may be a function of that function's arity, so a test can block, sleep or
+  fail inside the call).
   """
 
   @behaviour Cairn.Native.Engine
@@ -21,28 +22,11 @@ defmodule Cairn.NativeStub do
   def load_error, do: if(available?(), do: nil, else: {:load_failed, ~c"no such file"})
 
   @impl true
-  def init(config) do
-    notify({:init, config})
-    control(:init, {:ok, {:engine, config.model}})
-  end
-
-  @impl true
-  def open_stream(engine, camera_id, params) do
-    notify({:open_stream, engine, camera_id, params})
-
-    case control(:open_stream, nil) do
-      fun when is_function(fun, 3) -> fun.(engine, camera_id, params)
-      nil -> {:ok, {:stream, camera_id}}
-      result -> result
-    end
-  end
-
-  @impl true
-  def open_decoder(engine, camera_id, params) do
-    notify({:open_decoder, engine, camera_id, params})
+  def open_decoder(camera_id, params) do
+    notify({:open_decoder, camera_id, params})
 
     case control(:open_decoder, nil) do
-      fun when is_function(fun, 3) -> fun.(engine, camera_id, params)
+      fun when is_function(fun, 2) -> fun.(camera_id, params)
       nil -> {:ok, {:decoder, camera_id}}
       result -> result
     end
@@ -62,55 +46,6 @@ defmodule Cairn.NativeStub do
   end
 
   @impl true
-  def push_frame(stream, payload, meta, time_base) do
-    started = System.monotonic_time(:microsecond)
-
-    result =
-      case control(:push_frame, nil) do
-        fun when is_function(fun, 4) -> fun.(stream, payload, meta, time_base)
-        # a call the model ran on, which is the only kind the health check counts
-        nil -> {:ok, {[frame()], []}}
-        result -> result
-      end
-
-    timed(result, System.monotonic_time(:microsecond) - started)
-  end
-
-  @impl true
-  def cpu_baseline_ms(config, passes) do
-    notify({:cpu_baseline_ms, config, passes})
-
-    case control(:cpu_baseline_ms, nil) do
-      fun when is_function(fun, 2) -> fun.(config, passes)
-      # a plausible CPU p50 for a nano detector: what a real board measures here
-      nil -> {:ok, 45.0}
-      result -> result
-    end
-  end
-
-  # The crate times the model pass alone; in the stub the whole call is that
-  # pass, so a test sleeping to model a slow accelerator gets the sleep back.
-  defp timed({:ok, {frames, ended_tracks}}, micros) do
-    {:ok,
-     {Enum.map(frames, &if(&1.inferred, do: %{&1 | infer_us: micros}, else: &1)), ended_tracks}}
-  end
-
-  defp timed(other, _micros), do: other
-
-  @impl true
-  def close_stream(stream) do
-    # Before the control value, so that a close a test blocks inside is still
-    # observable as having been called.
-    notify({:close_stream, stream})
-
-    case control(:close_stream, nil) do
-      fun when is_function(fun, 1) -> fun.(stream)
-      nil -> {:ok, true}
-      result -> result
-    end
-  end
-
-  @impl true
   def close_decoder(decoder) do
     notify({:close_decoder, decoder})
 
@@ -125,7 +60,8 @@ defmodule Cairn.NativeStub do
   def control, do: @control
 
   @doc """
-  One frame of the shape `push_frame/4` answers with.
+  One frame of the shape `CairnOrt.push_frame/4` answers with — kept here,
+  beside `decoded_frame/1`, so a test drives both halves from one module.
 
   `inferred: false` is the frame the motion gate replayed without running the
   model, and no frame at all is the sampler not being due — the two returns
@@ -161,7 +97,7 @@ defmodule Cairn.NativeStub do
 
   @doc """
   One decoded frame through `Cairn.Native.Host.push_frame/5`, spelled the way
-  `Cairn.Pipeline.InferSink` spells it — for tests that only care that a push
+  `Cairn.Pipeline.Inference` spells it — for tests that only care that a push
   happened, not what it carried.
   """
   def host_push(host, camera_id, pts \\ 0) do

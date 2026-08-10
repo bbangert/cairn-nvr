@@ -33,6 +33,7 @@ defmodule Cairn.Native.HostTest do
     defaults = [
       name: name,
       native_module: NativeStub,
+      ort_module: Cairn.CairnOrtStub,
       canary_module: CanaryStub,
       config: %{model: "m.onnx", backend: "qnn"}
     ]
@@ -114,7 +115,9 @@ defmodule Cairn.Native.HostTest do
     end
 
     test "an absent NIF library is a state, not a crash", %{id: id} do
-      control(%{available?: false})
+      # The model library (cairn-ort) is what gates the engine; the decode
+      # library's absence surfaces per camera at open_decoder instead.
+      control(%{ort_available?: false})
       host = start_host()
 
       # nothing is probed and nothing is loaded: there is no library to load into

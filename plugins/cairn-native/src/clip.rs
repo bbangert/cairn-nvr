@@ -42,13 +42,13 @@ use rsmpeg::ffi;
 use cairn_detect::decode::sample_interval;
 use cairn_detect::infer::InputSize;
 
-use crate::config::{RawInitConfig, RawQnnOptions, RawStreamParams};
+use crate::config::RawDecoderParams;
 use crate::decoder::DecodeStream;
-use crate::engine::Engine;
-use crate::error::Result;
-use crate::observation::FrameObservations;
-use crate::stream::{frame_from, Frame, Stream};
-use crate::{DecoderRef, StreamRef};
+use crate::DecoderRef;
+use cairn_ort::{
+    Engine, Frame, FrameObservations, RawInitConfig, RawQnnOptions, RawStreamParams, Stream,
+    StreamRef,
+};
 
 const WAIVER: &str = "CAIRN_NATIVE_SKIP_CLIP";
 
@@ -107,10 +107,6 @@ fn artifacts() -> Option<Artifacts> {
 }
 
 fn engine(artifacts: &Artifacts) -> Arc<Engine> {
-    engine_at(artifacts, 30)
-}
-
-fn engine_at(artifacts: &Artifacts, sample_fps: u32) -> Arc<Engine> {
     let config = RawInitConfig {
         model: artifacts.model.display().to_string(),
         backend: "ort".into(),
@@ -119,10 +115,6 @@ fn engine_at(artifacts: &Artifacts, sample_fps: u32) -> Arc<Engine> {
         labels: Some(artifacts.labels.display().to_string()),
         allow_label_mismatch: false,
         embedder_model: None,
-        // Software decode: a box without the GPU the hardware paths need has to
-        // get the same answer as one with it.
-        decoder: "sw".into(),
-        sample_fps,
         qnn: RawQnnOptions {
             library: None,
             soc_model: None,
@@ -132,6 +124,26 @@ fn engine_at(artifacts: &Artifacts, sample_fps: u32) -> Arc<Engine> {
         },
     };
     Arc::new(Engine::open(config.resolve().expect("the config resolves")).expect("the model opens"))
+}
+
+/// The decode half's params, spelled the way the Elixir host spells them:
+/// through the same `wire` names `engine_spec` exports — so this harness
+/// exercises the exact term path a resolved spec takes between the two NIF
+/// libraries. Software decode: a box without the GPU the hardware paths need
+/// has to get the same answer as one with it.
+fn decoder_params(engine: &Engine, sample_fps: u32) -> RawDecoderParams {
+    let spec = engine.input_spec;
+    let (resize, resize_pad) = spec.resize.wire();
+    RawDecoderParams {
+        decoder: "sw".into(),
+        width: spec.size.w,
+        height: spec.size.h,
+        encoding: spec.encoding.wire_name().into(),
+        resize: resize.into(),
+        resize_pad,
+        motion_json: None,
+        sample_fps,
+    }
 }
 
 fn params() -> RawStreamParams {
@@ -179,6 +191,39 @@ fn read_clip(path: &Path) -> Clip {
     Clip { units, time_base }
 }
 
+/// The two halves answer with two error types now — same reason vocabulary,
+/// different crates — and the Rig folds them into one so a test can assert on
+/// `reason()` without caring which half refused.
+#[derive(Debug)]
+struct RigError {
+    reason: &'static str,
+    message: String,
+}
+
+impl RigError {
+    fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
+impl From<crate::error::NativeError> for RigError {
+    fn from(error: crate::error::NativeError) -> Self {
+        Self {
+            reason: error.reason(),
+            message: error.message().to_string(),
+        }
+    }
+}
+
+impl From<cairn_ort::NativeError> for RigError {
+    fn from(error: cairn_ort::NativeError) -> Self {
+        Self {
+            reason: error.reason(),
+            message: error.message().to_string(),
+        }
+    }
+}
+
 /// Both halves of the boundary plus the orchestration the Elixir side owns
 /// between them: the wall-clock rate gate (`Cairn.Pipeline.SampleGate`'s
 /// semantics, restated here because the whole point of the split is that the
@@ -194,19 +239,20 @@ struct Rig {
 }
 
 impl Rig {
-    fn open(engine: &Arc<Engine>, camera_id: &str, time_base: (i32, i32)) -> Self {
+    fn open(engine: &Arc<Engine>, camera_id: &str, time_base: (i32, i32), sample_fps: u32) -> Self {
         Self {
             decoder: DecoderRef::new(
                 DecodeStream::open(
-                    engine,
                     camera_id.to_string(),
-                    params().resolve().expect("the params resolve"),
+                    decoder_params(engine, sample_fps)
+                        .resolve()
+                        .expect("the params resolve"),
                 )
                 .expect("the decoder opens"),
             ),
             stream: StreamRef::new(Arc::clone(engine), open(engine, camera_id)),
             time_base,
-            interval: sample_interval(engine.sample_fps),
+            interval: sample_interval(sample_fps),
             last_sample: Mutex::new(None),
         }
     }
@@ -222,7 +268,12 @@ impl Rig {
     /// sampled — inference. The gate's semantics are the element's: `sample`
     /// is decided before the decode call, and the interval is spent when a
     /// frame *completed*, whatever became of its conversion.
-    fn push_au(&self, au: &[u8], pts: i64, now: Instant) -> Result<Vec<FrameObservations>> {
+    fn push_au(
+        &self,
+        au: &[u8],
+        pts: i64,
+        now: Instant,
+    ) -> std::result::Result<Vec<FrameObservations>, RigError> {
         let sample = {
             let last = self.last_sample.lock().unwrap();
             last.is_none_or(|last| now.duration_since(last) >= self.interval)
@@ -232,7 +283,21 @@ impl Rig {
             *self.last_sample.lock().unwrap() = Some(now);
         }
         match decoded.frame {
-            Some(frame) => self.stream.push(frame_from(&frame, self.time_base)),
+            Some(frame) => Ok(self.stream.push(Frame {
+                rgb: &frame.rgb,
+                content: InputSize {
+                    w: frame.width,
+                    h: frame.height,
+                },
+                orig: InputSize {
+                    w: frame.orig_width,
+                    h: frame.orig_height,
+                },
+                pts: frame.pts,
+                time_base: self.time_base,
+                observed_at_ms: frame.observed_at_ms,
+                motion: frame.motion,
+            })?),
             None => Ok(Vec::new()),
         }
     }
@@ -258,7 +323,7 @@ fn feed_at(rig: &Rig, clip: &Clip, spacing: Duration) -> Vec<FrameObservations> 
 }
 
 /// [`feed`] with the error in hand, for the tests about refusals.
-fn try_feed(rig: &Rig, clip: &Clip) -> Result<Vec<FrameObservations>> {
+fn try_feed(rig: &Rig, clip: &Clip) -> std::result::Result<Vec<FrameObservations>, RigError> {
     let mut frames = Vec::new();
     for (au, pts) in &clip.units {
         frames.extend(rig.push_au(au, *pts, Instant::now())?);
@@ -300,7 +365,7 @@ fn a_recorded_clip_decodes_and_infers() {
 
     let engine = engine(&artifacts);
     let clip = read_clip(&artifacts.clip);
-    let rig = Rig::open(&engine, "front", clip.time_base);
+    let rig = Rig::open(&engine, "front", clip.time_base, 30);
     let frames = feed(&rig, &clip);
 
     assert!(
@@ -348,11 +413,11 @@ fn the_rate_gate_admits_sample_fps_and_not_the_gop_rate() {
     let Some(artifacts) = artifacts() else {
         return;
     };
-    let engine = engine_at(&artifacts, 5);
+    let engine = engine(&artifacts);
     let clip = read_clip(&artifacts.clip);
     let spacing = Duration::from_millis(50);
 
-    let rig = Rig::open(&engine, "front", clip.time_base);
+    let rig = Rig::open(&engine, "front", clip.time_base, 5);
     let frames = feed_at(&rig, &clip, spacing);
 
     // One admitted every 200 ms over a feed of `units - 1` spacings, less the
@@ -385,12 +450,12 @@ fn a_mid_gop_access_unit_decodes_and_infers() {
     let Some(artifacts) = artifacts() else {
         return;
     };
-    let engine = engine_at(&artifacts, 5);
+    let engine = engine(&artifacts);
     let clip = read_clip(&artifacts.clip);
 
     // A spacing past the 200 ms interval, so the gate admits every unit and what
     // is left is the decoder's own answer.
-    let rig = Rig::open(&engine, "front", clip.time_base);
+    let rig = Rig::open(&engine, "front", clip.time_base, 5);
     let frames = feed_at(&rig, &clip, Duration::from_millis(250));
     let keyframes = clip.units.iter().filter(|(au, _)| is_keyframe(au)).count();
 
@@ -452,9 +517,14 @@ fn a_panic_while_the_decoder_opens_leaves_the_camera_openable() {
     };
     let engine = engine(&artifacts);
 
-    engine.panic_in_the_next_open();
+    crate::decoder::panic_in_the_next_open();
     let panicked = crate::guarded("open_decoder", || {
-        DecodeStream::open(&engine, "front".into(), params().resolve().unwrap()).map(|_| ())
+        DecodeStream::open(
+            "front".into(),
+            decoder_params(&engine, 30).resolve().unwrap(),
+        )
+        .map(|_| ())
+        .map_err(|e| crate::error::NativeError::OpenStream(e.message().to_string()))
     });
     assert_eq!(
         panicked.unwrap_err().reason(),
@@ -463,7 +533,7 @@ fn a_panic_while_the_decoder_opens_leaves_the_camera_openable() {
     );
 
     let clip = read_clip(&artifacts.clip);
-    let rig = Rig::open(&engine, "front", clip.time_base);
+    let rig = Rig::open(&engine, "front", clip.time_base, 30);
     assert!(!feed(&rig, &clip).is_empty());
 }
 
@@ -482,9 +552,9 @@ fn a_stream_fed_garbage_leaves_its_neighbours_alone() {
         time_base: clip.time_base,
     };
 
-    let front = Rig::open(&engine, "front", clip.time_base);
-    let drive = Rig::open(&engine, "drive", clip.time_base);
-    let gate = Rig::open(&engine, "gate", clip.time_base);
+    let front = Rig::open(&engine, "front", clip.time_base, 30);
+    let drive = Rig::open(&engine, "drive", clip.time_base, 30);
+    let gate = Rig::open(&engine, "gate", clip.time_base, 30);
 
     assert!(feed(&drive, &garbage).is_empty(), "garbage decoded");
     let before = feed(&front, &clip);
@@ -513,8 +583,8 @@ fn a_stream_error_is_a_value_and_the_stream_survives_it() {
     let engine = engine(&artifacts);
     let clip = read_clip(&artifacts.clip);
 
-    let front = Rig::open(&engine, "front", clip.time_base);
-    let drive = Rig::open(&engine, "drive", clip.time_base);
+    let front = Rig::open(&engine, "front", clip.time_base, 30);
+    let drive = Rig::open(&engine, "drive", clip.time_base, 30);
 
     // An empty access unit is refused on the decode half…
     let bad = front.push_au(&[], 0, Instant::now());
@@ -547,7 +617,7 @@ fn a_frame_for_a_different_spec_is_refused_not_projected() {
     };
     let engine = engine(&artifacts);
     let clip = read_clip(&artifacts.clip);
-    let rig = Rig::open(&engine, "front", clip.time_base);
+    let rig = Rig::open(&engine, "front", clip.time_base, 30);
 
     let refused = rig.stream.push(Frame {
         rgb: &[0u8; 12],
@@ -575,11 +645,14 @@ fn a_panic_in_a_model_pass_is_model_poisoned_on_every_stream_including_its_own()
     let engine = engine(&artifacts);
     let clip = read_clip(&artifacts.clip);
 
-    let front = Rig::open(&engine, "front", clip.time_base);
-    let drive = Rig::open(&engine, "drive", clip.time_base);
+    let front = Rig::open(&engine, "front", clip.time_base, 30);
+    let drive = Rig::open(&engine, "drive", clip.time_base, 30);
 
     engine.panic_in_the_next_pass();
-    let panicked = crate::guarded("push_frame", || try_feed(&front, &clip));
+    let panicked = cairn_ort::guarded("push_frame", || {
+        try_feed(&front, &clip).map_err(|e| cairn_ort::NativeError::Infer(e.message))?;
+        Ok(())
+    });
     assert_eq!(
         panicked.unwrap_err().reason(),
         "panicked",
@@ -603,7 +676,7 @@ fn a_panic_in_a_model_pass_is_model_poisoned_on_every_stream_including_its_own()
 
     // …and what never reached the model still says whose fault it was, so a stream
     // sending nonsense cannot tell the host the engine is gone.
-    let fresh = Rig::open(&engine, "gate", clip.time_base);
+    let fresh = Rig::open(&engine, "gate", clip.time_base, 30);
     let refused = fresh.push_au(&[], 0, Instant::now());
     assert_eq!(refused.unwrap_err().reason(), "decode");
 }
@@ -618,8 +691,8 @@ fn a_panic_in_a_streams_own_state_stays_that_streams_problem() {
     let engine = engine(&artifacts);
     let clip = read_clip(&artifacts.clip);
 
-    let front = Rig::open(&engine, "front", clip.time_base);
-    let drive = Rig::open(&engine, "drive", clip.time_base);
+    let front = Rig::open(&engine, "front", clip.time_base, 30);
+    let drive = Rig::open(&engine, "drive", clip.time_base, 30);
     front.stream.poison_state();
 
     assert_eq!(
@@ -641,7 +714,7 @@ fn a_poisoned_stream_closes_and_its_camera_can_be_opened_again() {
     let engine = engine(&artifacts);
     let clip = read_clip(&artifacts.clip);
 
-    let front = Rig::open(&engine, "front", clip.time_base);
+    let front = Rig::open(&engine, "front", clip.time_base, 30);
     front.stream.poison_state();
     assert_eq!(
         try_feed(&front, &clip).unwrap_err().reason(),
@@ -665,11 +738,15 @@ fn a_poisoned_stream_closes_and_its_camera_can_be_opened_again() {
     drop(front);
     let rig = Rig {
         decoder: DecoderRef::new(
-            DecodeStream::open(&engine, "front".into(), params().resolve().unwrap()).unwrap(),
+            DecodeStream::open(
+                "front".into(),
+                decoder_params(&engine, 30).resolve().unwrap(),
+            )
+            .unwrap(),
         ),
         stream: reopened,
         time_base: clip.time_base,
-        interval: sample_interval(engine.sample_fps),
+        interval: sample_interval(30),
         last_sample: Mutex::new(None),
     };
     assert!(!try_feed(&rig, &clip).unwrap().is_empty());
@@ -716,8 +793,8 @@ fn two_streams_make_progress_at_once() {
     };
     let engine = engine(&artifacts);
     let clip = read_clip(&artifacts.clip);
-    let front = Rig::open(&engine, "front", clip.time_base);
-    let drive = Rig::open(&engine, "drive", clip.time_base);
+    let front = Rig::open(&engine, "front", clip.time_base, 30);
+    let drive = Rig::open(&engine, "drive", clip.time_base, 30);
 
     let (a, b) = std::thread::scope(|scope| {
         let a = scope.spawn(|| try_feed(&front, &clip));
@@ -738,7 +815,7 @@ fn two_pushes_to_one_stream_serialize() {
     };
     let engine = engine(&artifacts);
     let clip = read_clip(&artifacts.clip);
-    let front = Rig::open(&engine, "front", clip.time_base);
+    let front = Rig::open(&engine, "front", clip.time_base, 30);
 
     let frames = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..2)
@@ -754,7 +831,7 @@ fn two_pushes_to_one_stream_serialize() {
     assert!(frames > 0, "two callers produced no frame between them");
     // `close` recovers a poisoned guard, so the poisoning half has to be asked
     // separately.
-    assert!(!front.stream.state.is_poisoned(), "a push panicked");
+    assert!(!front.stream.state_is_poisoned(), "a push panicked");
     assert!(!front.decoder.state.is_poisoned(), "a decode panicked");
     assert!(front.stream.close());
     assert!(front.decoder.close());

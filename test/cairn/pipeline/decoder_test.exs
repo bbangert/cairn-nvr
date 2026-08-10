@@ -35,6 +35,7 @@ defmodule Cairn.Pipeline.DecoderTest do
     defaults = [
       name: name,
       native_module: NativeStub,
+      ort_module: Cairn.CairnOrtStub,
       canary_module: CanaryStub,
       config: %{model: "m.onnx", backend: "ort"}
     ]
@@ -74,7 +75,7 @@ defmodule Cairn.Pipeline.DecoderTest do
       {actions, state} = playing(ctx, element(ctx))
 
       camera_id = ctx.camera_id
-      assert_receive {:open_decoder, _engine, ^camera_id, _params}
+      assert_receive {:open_decoder, ^camera_id, _params}
       assert actions == [demand: {:input, 1}]
       assert %{ref: _, module: NativeStub} = state.decoder
       # the gate's rate is the host's `sample_fps`, not a second config knob
@@ -85,7 +86,9 @@ defmodule Cairn.Pipeline.DecoderTest do
       motion = ~s({"enabled":true})
       playing(ctx, element(ctx, stream_params: %{motion_json: motion}))
 
-      assert_receive {:open_decoder, _engine, _camera_id, %{motion_json: ^motion}}
+      # …alongside the engine's resolved spec, spelled as wire terms.
+      assert_receive {:open_decoder, _camera_id,
+                      %{motion_json: ^motion, encoding: "raw_bgr", width: 4, resize: "letterbox"}}
     end
 
     test "a refused open costs the AU, not the session", ctx do
@@ -103,7 +106,7 @@ defmodule Cairn.Pipeline.DecoderTest do
 
     test "a stream-fatal error closes the handle and reopens on the next AU", ctx do
       {_actions, state} = playing(ctx, element(ctx))
-      assert_receive {:open_decoder, _engine, _camera_id, _params}
+      assert_receive {:open_decoder, _camera_id, _params}
 
       control(%{decode_au: fn _d, _au, _pts, _s -> {:error, {:panicked, "stage panicked"}} end})
       {actions, state} = feed(ctx, state, 1)
@@ -117,7 +120,7 @@ defmodule Cairn.Pipeline.DecoderTest do
       control(%{decode_au: nil})
       {_actions, state} = feed(ctx, state, 2)
       assert %{ref: _} = state.decoder
-      assert_receive {:open_decoder, _engine, _camera_id, _params}
+      assert_receive {:open_decoder, _camera_id, _params}
     end
 
     test "a per-frame error is counted and the session keeps running", ctx do

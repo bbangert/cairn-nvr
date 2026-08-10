@@ -750,6 +750,20 @@ pub fn rescale_90k(pts: i64, time_base: AVRational) -> i64 {
     av_rescale_q(pts, time_base, PTS_TIMEBASE)
 }
 
+/// [`rescale_90k`] over a caller-supplied `(num, den)`, refused rather than
+/// trusted: `av_rescale_q` divides by the denominator and reads the sign of
+/// both, so a zero or negative term is not a slightly wrong timestamp but an
+/// arithmetic fault inside libavutil.
+///
+/// Public so a consumer with no libav of its own (the inference NIF) can
+/// rescale a boundary-crossing pts without naming an [`AVRational`].
+pub fn rescale_90k_checked(pts: i64, (num, den): (i32, i32)) -> Result<i64> {
+    if num <= 0 || den <= 0 {
+        bail!("time base {num}/{den} must be positive");
+    }
+    Ok(rescale_90k(pts, AVRational { num, den }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,6 +800,15 @@ mod tests {
         frame.set_pts(1000);
         assert_eq!(pts_90k(&frame, PTS_TIMEBASE), 1000);
         assert_eq!(pts_90k(&frame, AVRational { num: 1, den: 1000 }), 90_000);
+    }
+
+    #[test]
+    fn the_checked_rescale_refuses_the_time_bases_that_would_fault_libavutil() {
+        for bad in [(0, 90_000), (1, 0), (-1, 90_000), (1, -90_000)] {
+            assert!(rescale_90k_checked(1000, bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(rescale_90k_checked(1000, (1, 1000)).unwrap(), 90_000);
+        assert_eq!(rescale_90k_checked(1000, (1, 90_000)).unwrap(), 1000);
     }
 
     #[test]

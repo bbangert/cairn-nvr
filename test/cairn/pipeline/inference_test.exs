@@ -1,5 +1,5 @@
-defmodule Cairn.Pipeline.InferSinkTest do
-  # One global control map drives `Cairn.NativeStub`, and the host is named.
+defmodule Cairn.Pipeline.InferenceTest do
+  # One global control map drives the stubs, and the host is named.
   use ExUnit.Case, async: false
 
   import Membrane.ChildrenSpec
@@ -9,8 +9,8 @@ defmodule Cairn.Pipeline.InferSinkTest do
   alias Cairn.Config.Camera
   alias Cairn.Native.Host
   alias Cairn.NativeStub
-  alias Cairn.Observation
-  alias Cairn.Pipeline.{Decoder, InferSink, Picker}
+  alias Cairn.Pipeline.{Decoder, DetectSink, Inference, Picker}
+  alias Cairn.Pipeline.Inference.Detections
   alias Membrane.Buffer
   alias Membrane.Testing
 
@@ -29,8 +29,6 @@ defmodule Cairn.Pipeline.InferSinkTest do
     pixel_format: :RGB,
     aligned: true
   }
-  # The two tiers are carried, not consulted: what the sink owes the tracker is
-  # this map back, unread.
   @policy %{
     pre: 5,
     post: 10,
@@ -48,7 +46,6 @@ defmodule Cairn.Pipeline.InferSinkTest do
     %{
       camera_id: camera_id,
       camera: %Camera{id: camera_id, rtsp_url: "rtsp://h/1"},
-      policy: @policy,
       epoch: Cairn.ULID.generate()
     }
   end
@@ -63,6 +60,7 @@ defmodule Cairn.Pipeline.InferSinkTest do
     defaults = [
       name: name,
       native_module: NativeStub,
+      ort_module: Cairn.CairnOrtStub,
       canary_module: CanaryStub,
       config: %{model: "m.onnx", backend: "ort"}
     ]
@@ -71,33 +69,29 @@ defmodule Cairn.Pipeline.InferSinkTest do
     name
   end
 
-  defp sink(ctx, opts \\ []) do
+  defp element(ctx, opts \\ []) do
     options =
       struct(
-        InferSink,
+        Inference,
         Keyword.merge(
           [
-            camera: ctx.camera,
-            policy: ctx.policy,
-            epoch: ctx.epoch,
-            host: ctx.host,
-            # the dispatch seam's injection point: this process stands in for
-            # the camera's tracker and sees the casts it would have received
-            tracker: self(),
+            session: {Host, ctx.host},
+            stream_id: ctx.camera_id,
+            stream_params: %{stream_epoch: ctx.epoch},
             reopen_cooldown_ms: 0
           ],
           opts
         )
       )
 
-    {[], state} = InferSink.handle_init(%{}, options)
+    {[], state} = Inference.handle_init(%{}, options)
     state
   end
 
   defp playing(state) do
-    {actions, state} = InferSink.handle_playing(%{}, state)
+    {actions, state} = Inference.handle_playing(%{}, state)
     # the decoder's stream format always precedes its first buffer
-    {[], state} = InferSink.handle_stream_format(:input, @format, %{}, state)
+    {[], state} = Inference.handle_stream_format(:input, @format, %{}, state)
     {actions, state}
   end
 
@@ -123,25 +117,25 @@ defmodule Cairn.Pipeline.InferSinkTest do
   end
 
   defp feed(state, pts \\ 1) do
-    InferSink.handle_buffer(:input, frame_buffer(pts), %{}, state)
+    Inference.handle_buffer(:input, frame_buffer(pts), %{}, state)
   end
 
   describe "the stream's session" do
     setup ctx, do: Map.put(ctx, :host, start_host())
 
-    test "opens on the pipeline's own epoch and demands one frame", ctx do
-      {actions, state} = playing(sink(ctx))
+    test "opens on the pipeline's own epoch, declares its format, demands one frame", ctx do
+      {actions, state} = playing(element(ctx))
 
       camera_id = ctx.camera_id
       epoch = ctx.epoch
       assert_receive {:open_stream, _engine, ^camera_id, %{stream_epoch: ^epoch}}
-      assert actions == [demand: {:input, 1}]
+      assert actions == [stream_format: {:output, %Detections{}}, demand: {:input, 1}]
       assert state.stream == :open
     end
 
-    test "the scene config reaches the crate", ctx do
+    test "the scene config reaches the library", ctx do
       floors = %{"person" => 0.7}
-      playing(sink(ctx, stream_params: %{min_score: floors}))
+      playing(element(ctx, stream_params: %{min_score: floors}))
 
       assert_receive {:open_stream, _engine, _camera_id, %{min_score: ^floors}}
     end
@@ -150,78 +144,15 @@ defmodule Cairn.Pipeline.InferSinkTest do
   describe "one frame" do
     setup ctx, do: Map.put(ctx, :host, start_host())
 
-    test "reaches the tracker through the dispatch seam, then one more demand", ctx do
-      {_actions, state} = playing(sink(ctx))
-      {actions, _state} = feed(state)
+    test "becomes one Detections buffer carrying the library's observations", ctx do
+      {_actions, state} = playing(element(ctx))
+      {actions, state} = feed(state, 42)
 
-      camera_id = ctx.camera_id
-      epoch = ctx.epoch
-      camera = ctx.camera
-
-      # the same cast the plugin ports make, carrying the same policy —
-      # `track:` and `record:` included, and neither read on the way
-      assert_received {:"$gen_cast", {:detections, ^camera, @policy, observation}}
-      assert %Observation{camera_id: ^camera_id, epoch: ^epoch} = observation
-
-      # nothing goes to the parent any more: the pipeline is off the per-frame
-      # path entirely
-      assert actions == [demand: {:input, 1}]
-    end
-
-    test "stamps at_ms on the host's monotonic clock, like both plugin producers", ctx do
-      # A wall-clock stamp keeps every intra-stream duration right and still
-      # breaks the tracker: `Cairn.CameraTracker` stamps a stream cut with
-      # `System.monotonic_time/1`, so a wall-clock `at_ms` lapses every
-      # suspension the instant it is offered and no track can ever be adopted
-      # across a reset. Nothing else in the pipeline notices.
-      {_actions, state} = playing(sink(ctx))
-      {_actions, _state} = feed(state)
-
-      assert_received {:"$gen_cast", {:detections, _camera, @policy, observation}}
-      assert_in_delta observation.at_ms, System.monotonic_time(:millisecond), 5_000
-    end
-
-    test "carries a refreshed policy without restarting the session", ctx do
-      {_actions, state} = playing(sink(ctx))
-      assert_receive {:open_stream, _engine, _camera_id, _params}
-
-      camera = %{ctx.camera | record: %{"person" => %{min_score: 0.9}}}
-      policy = Map.put(@policy, :record, %{"person" => %{min_score: 0.9}})
-
-      {actions, state} =
-        InferSink.handle_parent_notification({:policy, camera, policy}, %{}, state)
-
-      assert actions == []
-
-      {_actions, _state} = feed(state)
-      assert_received {:"$gen_cast", {:detections, ^camera, ^policy, %Observation{}}}
-      # the stream was not reopened for it
-      refute_received {:open_stream, _engine, _camera_id, _params}
-    end
-
-    test "answering with several frames dispatches them in the crate's order", ctx do
-      # One push, several observations — the crate's answer is a list because
-      # that is the host's shape. The tracker's `at_ms` is strictly increasing
-      # across them, so a reordering here would be a stream that appears to
-      # run backwards.
-      control(%{
-        push_frame: fn _stream, _payload, _meta, _tb ->
-          {:ok, {for(pts <- [90_000, 93_000, 96_000], do: %{NativeStub.frame() | pts: pts}), []}}
-        end
-      })
-
-      {_actions, state} = playing(sink(ctx))
-      {_actions, _state} = feed(state)
-
-      pts_order =
-        for _ <- 1..3 do
-          assert_received {:"$gen_cast", {:detections, _camera, @policy, observation}}
-          {observation.pts, observation.at_ms}
-        end
-
-      assert [{90_000, _}, {93_000, _}, {96_000, _}] = pts_order
-      assert pts_order |> Enum.map(&elem(&1, 1)) |> then(&(&1 == Enum.sort(&1)))
-      refute_received {:"$gen_cast", {:detections, _camera, _policy, _observation}}
+      assert [buffer: {:output, out}, demand: {:input, 1}] = actions
+      assert out.payload == <<>>
+      assert out.pts == 42
+      assert [%{inferred: true, objects: []}] = out.metadata.observations
+      assert state.pushed == 1
     end
 
     test "is pushed with the decoder's metadata and a membrane-time base", ctx do
@@ -232,7 +163,7 @@ defmodule Cairn.Pipeline.InferSinkTest do
         end
       })
 
-      {_actions, state} = playing(sink(ctx))
+      {_actions, state} = playing(element(ctx))
       {_actions, _state} = feed(state, 42)
 
       assert_received {:pushed, payload, meta, {1, 1_000_000_000}}
@@ -255,10 +186,10 @@ defmodule Cairn.Pipeline.InferSinkTest do
   describe "errors" do
     setup ctx, do: Map.put(ctx, :host, start_host())
 
-    test "an engine-fatal one stops the branch instead of calling again", ctx do
+    test "an engine-fatal one stops the element instead of calling again", ctx do
       control(%{push_frame: fn _s, _p, _m, _tb -> {:error, {:model_load, "no such graph"}} end})
 
-      {_actions, state} = playing(sink(ctx))
+      {_actions, state} = playing(element(ctx))
       {actions, state} = feed(state)
 
       # No action at all, deliberately: parking is the whole effect, and the
@@ -274,7 +205,7 @@ defmodule Cairn.Pipeline.InferSinkTest do
     test "a stream-fatal one reopens rather than giving up", ctx do
       control(%{push_frame: fn _s, _p, _m, _tb -> {:error, {:panicked, "stage panicked"}} end})
 
-      {_actions, state} = playing(sink(ctx))
+      {_actions, state} = playing(element(ctx))
       assert_receive {:open_stream, _engine, _camera_id, _params}
 
       {actions, state} = feed(state)
@@ -288,10 +219,10 @@ defmodule Cairn.Pipeline.InferSinkTest do
       assert_receive {:open_stream, _engine, _camera_id, _params}
     end
 
-    test "a per-frame one is counted and the branch keeps running", ctx do
+    test "a per-frame one is counted and the element keeps running", ctx do
       control(%{push_frame: fn _s, _p, _m, _tb -> {:error, {:infer, "one bad pass"}} end})
 
-      {_actions, state} = playing(sink(ctx))
+      {_actions, state} = playing(element(ctx))
       {actions, state} = feed(state)
 
       assert actions == [demand: {:input, 1}]
@@ -301,49 +232,40 @@ defmodule Cairn.Pipeline.InferSinkTest do
 
     test "a refused open costs the frame, not the session — and the drop is counted", ctx do
       host = start_host(config: nil)
-      {actions, state} = playing(sink(%{ctx | host: host}))
+      {actions, state} = playing(element(%{ctx | host: host}))
 
-      assert actions == [demand: {:input, 1}]
+      assert actions == [stream_format: {:output, %Detections{}}, demand: {:input, 1}]
       assert state.stream == :closed
 
       {actions, state} = feed(state)
       assert actions == [demand: {:input, 1}]
       assert state.stream == :closed
-      # a stuck reopen loop must not read as healthy in :stats while
-      # quietly discarding frames
       assert state.dropped == 1
     end
 
     test "a buffer without the decoder's metadata is dropped and counted, not crashed on", ctx do
-      # A producer that speaks RGB frames without the metadata contract —
-      # the pad's accepted_format cannot enforce buffer metadata.
-      {_actions, state} = playing(sink(ctx))
+      {_actions, state} = playing(element(ctx))
 
       buffer = %Buffer{payload: <<0, 0, 0>>, pts: 1, metadata: %{}}
-      {actions, state} = InferSink.handle_buffer(:input, buffer, %{}, state)
+      {actions, state} = Inference.handle_buffer(:input, buffer, %{}, state)
 
       assert actions == [demand: {:input, 1}]
       assert state.dropped == 1
-      refute_received {:"$gen_cast", {:detections, _camera, _policy, _observation}}
     end
 
     test "a buffer that precedes its stream format is dropped and counted, not crashed on", ctx do
-      # `Cairn.Pipeline.Decoder` always pairs its first buffer with a
-      # stream_format action, so this is unreachable from the in-tree
-      # producer — but the pad contract does not enforce it, and the sink
-      # must not read `content: nil` as geometry.
-      {actions, state} = InferSink.handle_playing(%{}, sink(ctx))
-      assert actions == [demand: {:input, 1}]
+      {actions, state} = Inference.handle_playing(%{}, element(ctx))
+      assert [stream_format: _, demand: _] = actions
       assert state.stream == :open
 
-      {actions, state} = InferSink.handle_buffer(:input, frame_buffer(1), %{}, state)
+      {actions, state} = Inference.handle_buffer(:input, frame_buffer(1), %{}, state)
       assert actions == [demand: {:input, 1}]
       assert state.dropped == 1
-      refute_received {:"$gen_cast", {:detections, _camera, _policy, _observation}}
     end
   end
 
   describe "the branch under load" do
+    # The REAL detect branch, all four elements, over the stubbed NIFs.
     # 30 fps: the fastest the gate can be told to run, so the pacing tests
     # collect enough samples to measure inside a second.
     setup ctx do
@@ -370,18 +292,23 @@ defmodule Cairn.Pipeline.InferSinkTest do
           |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
           |> child(:decoder, %Decoder{camera_id: ctx.camera_id, host: ctx.host})
           |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
-          |> child(:infer, %InferSink{
+          |> child(:infer, %Inference{
+            session: {Host, ctx.host},
+            stream_id: ctx.camera_id,
+            stream_params: %{stream_epoch: ctx.epoch}
+          })
+          |> child(:detect, %DetectSink{
             camera: ctx.camera,
-            policy: ctx.policy,
+            policy: @policy,
             epoch: ctx.epoch,
-            host: ctx.host,
             tracker: self()
           })
         ]
       )
     end
 
-    test "decode runs at the source's rate; the model at the gate's", ctx do
+    test "decode runs at the source's rate; the model at the gate's; the tracker hears it all",
+         ctx do
       test = self()
 
       control(%{
@@ -391,7 +318,7 @@ defmodule Cairn.Pipeline.InferSinkTest do
         end,
         push_frame: fn _stream, _payload, _meta, _tb ->
           send(test, {:pushed, System.monotonic_time(:millisecond)})
-          {:ok, {[], []}}
+          {:ok, {[NativeStub.frame()], []}}
         end
       })
 
@@ -432,6 +359,10 @@ defmodule Cairn.Pipeline.InferSinkTest do
 
       assert Enum.min(gaps(pushes)) >= 20,
              "two model offers landed #{Enum.min(gaps(pushes))} ms apart: the gate is not pacing"
+
+      # …and every pass's observations crossed the Detections seam into the
+      # dispatch cast — the half a `pushed` counter cannot see.
+      assert detections_dispatched() >= length(pushes) - 1
     end
 
     defp flush({tag, _}, acc \\ []) do
@@ -448,6 +379,15 @@ defmodule Cairn.Pipeline.InferSinkTest do
       |> Enum.map(fn [before, after_it] -> after_it - before end)
     end
 
+    defp detections_dispatched(count \\ 0) do
+      receive do
+        {:"$gen_cast", {:detections, _camera, _policy, _observation}} ->
+          detections_dispatched(count + 1)
+      after
+        0 -> count
+      end
+    end
+
     test "exactly one call is in flight", ctx do
       test = self()
 
@@ -462,16 +402,16 @@ defmodule Cairn.Pipeline.InferSinkTest do
       # a paced source, so there is still media to pick up after the release
       pipeline = branch(ctx, 200, 10)
 
-      assert_receive {:started, _pts, sink}, 5_000
-      refute_receive {:started, _pts, _sink}, 300
+      assert_receive {:started, _pts, element}, 5_000
+      refute_receive {:started, _pts, _element}, 300
 
-      send(sink, :release)
-      assert_receive {:started, _pts, ^sink}, 5_000
-      refute_receive {:started, _pts, _sink}, 300
+      send(element, :release)
+      assert_receive {:started, _pts, ^element}, 5_000
+      refute_receive {:started, _pts, _element}, 300
 
       # let the branch run free, so the pipeline can be shut down politely
       control(%{push_frame: nil})
-      send(sink, :release)
+      send(element, :release)
       Testing.Pipeline.terminate(pipeline)
     end
 
@@ -492,14 +432,14 @@ defmodule Cairn.Pipeline.InferSinkTest do
       Testing.Pipeline.notify_child(pipeline, :decoder, :stats)
       assert_pipeline_notified(pipeline, :decoder, {:stats, decoder}, 5_000)
       Testing.Pipeline.notify_child(pipeline, :infer, :stats)
-      assert_pipeline_notified(pipeline, :infer, {:stats, sink}, 5_000)
+      assert_pipeline_notified(pipeline, :infer, {:stats, infer}, 5_000)
 
       # 50 ms a call against a 33 ms sample interval: frames sampled while the
-      # sink was busy were replaced in the decoder's slot — newest wins — and
-      # none of them queued anywhere.
-      assert sink.pushed < 15
+      # element was busy were replaced in the decoder's slot — newest wins —
+      # and none of them queued anywhere.
+      assert infer.pushed < 15
       assert decoder.replaced >= 1
-      assert decoder.emitted <= sink.pushed + 1
+      assert decoder.emitted <= infer.pushed + 1
       # every sample is accounted for: emitted, replaced, or (at most one)
       # still in the slot
       assert decoder.sampled >= decoder.emitted + decoder.replaced

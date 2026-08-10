@@ -82,7 +82,7 @@ defmodule Cairn.Detect.DispatchTest do
     end
 
     test "every producer routes through it, and none reaches the tracker itself" do
-      for producer <- [Cairn.PluginPort, Cairn.PluginGroupPort, Cairn.Pipeline.InferSink] do
+      for producer <- [Cairn.PluginPort, Cairn.PluginGroupPort, Cairn.Pipeline.DetectSink] do
         assert Dispatch in calls(producer), "#{inspect(producer)} does not use the seam"
 
         refute Cairn.CameraTracker in calls(producer),

@@ -316,7 +316,7 @@ defmodule Cairn.Config do
   each `refresh/3` — and hand the result to `Cairn.CameraTracker` with
   every observation, so no camera tracker calls the config server per
   frame. Every producer — `Cairn.PluginPort`, `Cairn.PluginGroupPort`, and
-  the membrane branch's `Cairn.Pipeline.InferSink` — takes its whole policy
+  the membrane branch's `Cairn.Pipeline.DetectSink` — takes its whole policy
   from this function and hands it to `Cairn.Detect.Dispatch` unmodified, so
   a key added here reaches `Cairn.CameraTracker` whichever produced it. A
   *running* camera gets a changed policy only through those producers'
