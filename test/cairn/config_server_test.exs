@@ -285,6 +285,20 @@ defmodule Cairn.Config.ServerTest do
                %{added: [], removed: [], changed: [], refreshed: []}
     end
 
+    test "flipping a camera's ingest restarts it — the source process itself changes" do
+      # :ingest is a @restart_field: it selects the session's source (ffmpeg
+      # OS process vs RTSP client) and the pipeline's ingest chain — nothing
+      # a running session can swap in place. Isolated from the pipeline flip
+      # by holding membrane on both sides.
+      base = %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1", "pipeline" => "membrane"}
+      flipped = Map.put(base, "ingest", "rtsp")
+
+      assert Config.Server.diff_cameras(
+               camera_config([base], %{}),
+               camera_config([flipped], %{})
+             ) == %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+    end
+
     test "a neighbour flipping to membrane moves nobody else's ports" do
       cams = [
         %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1"},

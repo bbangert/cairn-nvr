@@ -430,11 +430,21 @@ defmodule Cairn.FFmpegPort do
   def handle_info({:rtsp, _client, _event}, state), do: {:noreply, state}
 
   # The client process itself died — a crash, not a close (a close leaves it
-  # alive and sends :session_closed). Same recovery either way.
+  # alive and sends :session_closed). Same recovery, including the tail
+  # flush: everything the client delivered is ordered ahead of this :DOWN in
+  # our mailbox and already forwarded, so the CMAF muxer's held final
+  # segment is as recoverable here as on a graceful close.
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{rtsp_ref: ref} = state) do
     Logger.warning("camera #{state.camera.id}: rtsp client died: #{inspect(reason)}")
     state = %{state | rtsp: nil, rtsp_ref: nil, video_path: nil}
-    {:noreply, enter_backoff(state, :source_lost)}
+
+    if is_pid(state.source) do
+      send(state.source, :rtsp_eos)
+      Process.send_after(self(), :flush_done, Keyword.get(state.opts, :flush_grace_ms, 500))
+      {:noreply, state}
+    else
+      {:noreply, enter_backoff(state, :source_lost)}
+    end
   end
 
   # Epoch-matched exactly as :bridge_source_ready: a stale element outliving
@@ -620,21 +630,14 @@ defmodule Cairn.FFmpegPort do
     case rtsp.start(
            stream_uri: state.camera.rtsp_url,
            transport: :tcp,
+           # Video only: the default SETUPs and depayloads audio too, which
+           # this handler would discard per sample — and an unusable audio
+           # track must not be able to refuse an otherwise valid session.
+           allowed_media_types: [:video],
            receiver: self()
          ) do
       {:ok, client} ->
-        ref = Process.monitor(client)
-
-        with {:ok, tracks} <- rtsp.connect(client),
-             {:ok, video_path, clock_rate} <- video_track(tracks),
-             :ok <- rtsp.play(client) do
-          {:ok, client, ref, video_path, clock_rate}
-        else
-          error ->
-            Process.demonitor(ref, [:flush])
-            stop_client_async(rtsp, client)
-            normalize_error(error)
-        end
+        open_session(rtsp, client)
 
       :ignore ->
         {:error, :ignore}
@@ -642,6 +645,33 @@ defmodule Cairn.FFmpegPort do
       {:error, _reason} = error ->
         error
     end
+  end
+
+  # `connect/1` and `play/1` are GenServer.calls: a slow camera or a client
+  # race EXITS the caller (timeout, :noproc) rather than returning an error,
+  # and `with` only handles values — so the exit is caught here and refused
+  # through the same cleanup as a returned refusal. Letting it escape would
+  # crash this process and its backoff/epoch state with it.
+  defp open_session(rtsp, client) do
+    ref = Process.monitor(client)
+
+    try do
+      with {:ok, tracks} <- rtsp.connect(client),
+           {:ok, video_path, clock_rate} <- video_track(tracks),
+           :ok <- rtsp.play(client) do
+        {:ok, client, ref, video_path, clock_rate}
+      else
+        error -> refuse_session(rtsp, client, ref, normalize_error(error))
+      end
+    catch
+      :exit, reason -> refuse_session(rtsp, client, ref, {:error, {:exit, reason}})
+    end
+  end
+
+  defp refuse_session(rtsp, client, ref, error) do
+    Process.demonitor(ref, [:flush])
+    stop_client_async(rtsp, client)
+    error
   end
 
   defp normalize_error({:error, _reason} = error), do: error
@@ -655,10 +685,16 @@ defmodule Cairn.FFmpegPort do
       [%{rtpmap: %{encoding: encoding}}] ->
         {:error, {:unsupported_codec, encoding}}
 
+      # An SDP may legally omit the rtpmap; without it there is no encoding
+      # and no clock rate to build a session on — named distinctly so the
+      # operator is not sent hunting for a second video track.
+      [_track] ->
+        {:error, :no_rtp_metadata}
+
       [] ->
         {:error, :no_video_track}
 
-      [_ | _] ->
+      [_, _ | _] ->
         {:error, :multiple_video_tracks}
     end
   end
@@ -715,9 +751,14 @@ defmodule Cairn.FFmpegPort do
   # same reason. The caller has already flushed its monitor, so teardown
   # owes it nothing; the backstop kill bounds a graceful stop that never
   # returns (the client holds only its socket, which dies with it).
+  #
+  # The kill after a *successful* stop is not paranoia: the library's
+  # `stop/1` cleans the session and replies but deliberately leaves its
+  # GenServer alive — without it, every normal teardown would leak one
+  # unmonitored client process.
   defp stop_client_async(rtsp, client) do
     spawn(fn ->
-      {_stopper, ref} = spawn_monitor(fn -> catch_stop(rtsp, client) end)
+      {_stopper, ref} = spawn_monitor(fn -> stop_then_reap(rtsp, client) end)
 
       receive do
         {:DOWN, ^ref, :process, _pid, _reason} -> :ok
@@ -725,6 +766,11 @@ defmodule Cairn.FFmpegPort do
         3_000 -> Process.exit(client, :kill)
       end
     end)
+  end
+
+  defp stop_then_reap(rtsp, client) do
+    catch_stop(rtsp, client)
+    if Process.alive?(client), do: Process.exit(client, :kill)
   end
 
   # `stop/1` on a client that already closed (or crashed) must not take the

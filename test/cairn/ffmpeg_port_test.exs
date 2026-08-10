@@ -461,6 +461,9 @@ defmodule Cairn.FFmpegPortTest do
 
       assert_receive {:rtsp_started, client, rtsp_opts}, 2_000
       assert rtsp_opts[:transport] == :tcp
+      # Video only: audio would be SETUP, received and depayloaded just to
+      # be discarded — and a broken audio track must not refuse the session.
+      assert rtsp_opts[:allowed_media_types] == [:video]
       assert_receive {:pipeline_started, _pipeline, opts}, 2_000
       assert opts[:ingest] == :rtsp
       assert is_binary(opts[:epoch])
@@ -482,12 +485,16 @@ defmodule Cairn.FFmpegPortTest do
       assert_receive {:pipeline_msg, {:rtsp_sample, <<2>>, 100_000_000}}, 2_000
     end
 
-    test "session_closed flushes the tail, then respawns under a fresh epoch" do
+    test "session_closed flushes the tail, respawns fresh, and reaps the old client" do
       id = "rc_#{System.unique_integer([:positive])}"
       port = start_rtsp(id)
 
       assert_receive {:rtsp_started, client, _}, 2_000
       assert_receive {:pipeline_started, _pipeline, opts}, 2_000
+
+      # The library's stop/1 leaves the client process alive by design; the
+      # port must end it or leak one process per session.
+      reaped = Process.monitor(client)
 
       send(port, {:rtsp, client, :session_closed})
 
@@ -499,9 +506,10 @@ defmodule Cairn.FFmpegPortTest do
       assert_receive {:pipeline_started, _pipeline2, opts2}, 2_000
       assert client2 != client
       assert opts2[:epoch] != opts[:epoch]
+      assert_receive {:DOWN, ^reaped, :process, _pid, _reason}, 5_000
     end
 
-    test "a crashed client is the same recovery as a closed session" do
+    test "a crashed client gets the same tail flush and recovery as a closed session" do
       id = "rk_#{System.unique_integer([:positive])}"
       _port = start_rtsp(id)
 
@@ -510,10 +518,42 @@ defmodule Cairn.FFmpegPortTest do
 
       Process.exit(client, :kill)
 
+      # Everything the client delivered is ordered ahead of the :DOWN, so
+      # the CMAF tail is as recoverable here as on a graceful close.
+      assert_receive {:pipeline_msg, :rtsp_eos}, 2_000
+
       assert_receive {:rtsp_started, client2, _}, 2_000
       assert_receive {:pipeline_started, _pipeline2, opts2}, 2_000
       assert client2 != client
       assert opts2[:epoch] != opts[:epoch]
+    end
+
+    test "a connect that exits the caller (slow camera) is a backoff, not a crash" do
+      id = "rt_#{System.unique_integer([:positive])}"
+
+      start_rtsp(id,
+        control: [test: self(), connect: :exit],
+        port_opts: [backoff_min_ms: 800]
+      )
+
+      # The first client's connect exits the calling port (as a real call
+      # timeout would); the port survives it as a refusal.
+      assert_receive {:rtsp_started, _timed_out, _}, 2_000
+      refute_receive {:pipeline_started, _, _}, 100
+
+      assert_receive {:rtsp_started, _client, _}, 3_000
+      assert_receive {:pipeline_started, _pipeline, _opts}, 2_000
+    end
+
+    test "a video track without rtp metadata is refused by its own name" do
+      id = "rm_#{System.unique_integer([:positive])}"
+
+      tracks = [%{control_path: "video", type: :video, fmtp: nil, rtpmap: nil}]
+      start_rtsp(id, control: [test: self(), tracks: tracks])
+
+      assert_receive {:rtsp_started, _client, _}, 2_000
+      refute_receive {:pipeline_started, _, _}, 300
+      assert_receive {:rtsp_started, _client2, _}, 2_000
     end
 
     test "a refused start (bad host) is a value and a backoff, not a crash" do
