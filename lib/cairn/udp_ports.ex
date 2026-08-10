@@ -10,6 +10,10 @@ defmodule Cairn.UDPPorts do
   receiver (ffmpeg's SDP demuxer, GStreamer's udpsrc pair, ...) then fails to
   open the stream at all. Cairn itself sends no RTCP; the odd ports are
   reserved purely so plugins can bind them.
+
+  A membrane camera consumes no ports but still holds its slot: renumbering
+  around it would move every later camera's ports, which on a live reload
+  means unbinding sockets over an unrelated camera's edit.
   """
 
   alias Cairn.Config

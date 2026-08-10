@@ -10,10 +10,11 @@ defmodule Cairn.PluginPort do
 
   Every line goes through `Cairn.PluginProtocol.decode_line/2` (protocol v1
   or the v0 `{"pts", "dets"}` shape). A `frame.objects` line becomes a
-  `Cairn.Observation` forwarded to `Cairn.CameraTracker` together with
-  the camera's config and effective policy (event windows, tracking bounds and
-  the `track:` / `record:` tiers), so the tracker never has to look up
-  config. Its `at_ms` — the only clock the tracker decides on — is derived
+  `Cairn.Observation` handed to `Cairn.Detect.Dispatch` — the seam it shares
+  with the in-VM detector — together with the camera's config and effective
+  policy (event windows, tracking bounds and the `track:` / `record:` tiers),
+  so the tracker never has to look up config. Its `at_ms` — the only clock the
+  tracker decides on — is derived
   here, from this camera's `Cairn.ObservationClock`, because this is where the
   plugin's pts and the host's monotonic clock are both in hand;
   `plugin.hello` is recorded here — a plugin declaring the
@@ -44,6 +45,7 @@ defmodule Cairn.PluginPort do
 
   require Logger
 
+  alias Cairn.Detect.Dispatch
   alias Cairn.{Observation, ObservationClock, PluginProtocol, StreamEpochs}
 
   @backoff_min_ms 1_000
@@ -357,18 +359,8 @@ defmodule Cairn.PluginPort do
   defp note_sequence(state, %Observation{epoch: epoch, sequence: sequence}),
     do: %{state | last_sequence: {epoch, sequence}}
 
-  # `:tracker` is a test seam: a process that receives the same
-  # `{:detections, …}` cast in place of the camera's own
-  # `Cairn.CameraTracker`. Absent (production) the batch is routed to that
-  # tracker, started on the first batch if it is not running yet.
   defp forward(state, observation) do
-    Cairn.CameraTracker.detections(
-      Keyword.get(state.opts, :tracker),
-      state.camera,
-      state.policy,
-      observation
-    )
-
+    Dispatch.forward(state.camera, state.policy, observation, state.opts)
     state
   end
 

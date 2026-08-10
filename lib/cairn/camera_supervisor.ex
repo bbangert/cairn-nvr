@@ -6,7 +6,7 @@ defmodule Cairn.CameraSupervisor do
   start/stop take the camera's index in the config list. `sync/1` reconciles
   running cameras against a config; `apply_diff/2` applies a reload diff,
   restarting the cameras it marks `changed` and handing the new config to the
-  plugin ports of the ones it marks `refreshed` (`Cairn.PluginPort.refresh/3`).
+  detection producers of the ones it marks `refreshed` (`refresh_camera/2`).
   """
 
   use DynamicSupervisor
@@ -70,23 +70,34 @@ defmodule Cairn.CameraSupervisor do
   end
 
   @doc """
-  Hands a still-running camera's plugin port the new camera and config.
+  Hands a still-running camera's detection producers the new camera and config.
 
-  Three ways this is a no-op, all of them ordinary and all of them a `nil`
-  from `whereis`: a `{:group, _}` camera registers no `:plugin` of its own
-  (`Cairn.PluginGroupSupervisor` refreshes the shared group process that
-  serves it), a camera with no `plugin:` at all has nothing to refresh, and a
-  camera that is not running has no process to tell. None is an error. The
-  config lookup guards the fourth, which a diff cannot produce: an id
-  `config` does not carry.
+  Both are told, because a camera can have either: the plugin port owns the
+  external plugin's policy, the ffmpeg port owns the membrane pipeline's. Each
+  hop is a no-op when that producer is absent, which is ordinary — a
+  `{:group, _}` camera registers no `:plugin` of its own
+  (`Cairn.PluginGroupSupervisor` refreshes the shared group process that serves
+  it), a camera with no `plugin:` at all has nothing to refresh, a classic
+  camera's ffmpeg port holds no policy, and a camera that is not running has no
+  process to tell. The config lookup guards the case a diff cannot produce: an
+  id `config` does not carry.
   """
   @spec refresh_camera(Config.t(), String.t()) :: :ok
   def refresh_camera(%Config{} = config, camera_id) do
-    with pid when is_pid(pid) <- Cairn.Registry.whereis(camera_id, :plugin),
-         %Config.Camera{} = cam <- Enum.find(config.cameras, &(&1.id == camera_id)) do
-      Cairn.PluginPort.refresh(pid, cam, config)
-    else
-      _absent -> :ok
+    case Enum.find(config.cameras, &(&1.id == camera_id)) do
+      %Config.Camera{} = cam ->
+        refresh(camera_id, :plugin, &Cairn.PluginPort.refresh(&1, cam, config))
+        refresh(camera_id, :ffmpeg, &Cairn.FFmpegPort.refresh(&1, cam, config))
+
+      nil ->
+        :ok
+    end
+  end
+
+  defp refresh(camera_id, role, refresh_fun) do
+    case Cairn.Registry.whereis(camera_id, role) do
+      pid when is_pid(pid) -> refresh_fun.(pid)
+      nil -> :ok
     end
   end
 

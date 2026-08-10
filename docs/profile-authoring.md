@@ -4,8 +4,11 @@ A **profile** is one YAML file that names, in one place, everything about how
 a piece of hardware runs detection: which model artifact, which family, which
 inference runtime, what frame rate to expect, and which tracker stages to run
 behind it. A plugin group names its profile; config load expands that one file
-into *both* halves of the boundary — the plugin's model argv and the host's
-tracker stage list — so the two cannot disagree with each other.
+into *both* halves of the boundary — the model half and the host's tracker
+stage list — so the two cannot disagree with each other. The model half is
+rendered where that camera's detection runs: as argv for a `cairn-detect`
+process, or as the in-VM engine's config for a `pipeline: membrane` camera,
+from one expansion either way.
 
 A profile is **data composing curated code**. Every field names something that
 already exists: a family the Rust catalog ships, a backend the plugin can

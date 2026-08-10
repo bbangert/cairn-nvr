@@ -20,6 +20,8 @@ defmodule Cairn.Native.Engine do
   @callback push_au(reference(), binary(), integer(), {integer(), integer()}) ::
               {:ok, {[map()], [String.t()]}} | {:error, {atom(), String.t()}}
   @callback close_stream(reference()) :: {:ok, boolean()} | {:error, {atom(), String.t()}}
+  @callback cpu_baseline_ms(map(), pos_integer()) ::
+              {:ok, float()} | {:error, {atom(), String.t()}}
 
   @after_compile __MODULE__
 

@@ -16,6 +16,7 @@ rustler::atoms! {
     pts,
     observed_at_ms,
     inferred,
+    infer_us,
     objects,
     label,
     score,
@@ -38,6 +39,10 @@ pub struct FrameObservations {
     /// frame with nothing remembered and an inferred frame that found nothing are
     /// both an empty list, and they differ to anything counting passes.
     pub inferred: bool,
+    /// The model pass's own duration, microseconds — `0` when `inferred` is
+    /// `false`. `Cairn.Native.Health`'s D-P5 ratio needs the pass alone, not
+    /// `push_au`'s whole call, which also pays decode and `to_tensor`.
+    pub infer_us: i64,
     pub objects: Vec<Det>,
 }
 
@@ -50,6 +55,7 @@ impl Encoder for FrameObservations {
                 (pts(), self.pts.encode(env)),
                 (observed_at_ms(), self.observed_at_ms.encode(env)),
                 (inferred(), self.inferred.encode(env)),
+                (infer_us(), self.infer_us.encode(env)),
                 (objects(), encoded.encode(env)),
             ],
         )

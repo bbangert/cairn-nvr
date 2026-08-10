@@ -26,11 +26,16 @@ defmodule Cairn.Config.ServerTest do
     test_pid = self()
     apply_diff = fn diff, config -> send(test_pid, {:applied, diff, config}) end
     apply_group_diff = fn diff, config -> send(test_pid, {:groups_applied, diff, config}) end
+    apply_native = fn config -> send(test_pid, {:native_applied, config}) end
 
     server =
       start_supervised!(
         {Config.Server,
-         path: path, name: nil, apply_diff: apply_diff, apply_group_diff: apply_group_diff},
+         path: path,
+         name: nil,
+         apply_diff: apply_diff,
+         apply_group_diff: apply_group_diff,
+         apply_native: apply_native},
         id: :config_server_under_test
       )
 
@@ -65,6 +70,29 @@ defmodule Cairn.Config.ServerTest do
 
     assert [%{id: "cam_a", rtsp_url: "rtsp://h/CHANGED"}, %{id: "cam_c"}] =
              Config.Server.get(server).cameras
+  end
+
+  # A membrane camera's detection is the in-VM engine rather than a group
+  # process, so the new config has to reach it as well as the two diffs — it is
+  # where a changed profile becomes a changed model.
+  test "reload hands the new config to the in-VM engine", %{
+    server: server,
+    path: path,
+    dir: dir
+  } do
+    File.write!(path, """
+    data_dir: #{Path.join(dir, "data")}
+    udp:
+      base_port: 18000
+      range: 20
+    cameras:
+      - id: cam_a
+        rtsp_url: rtsp://h/1
+        pipeline: membrane
+    """)
+
+    assert {:ok, _diff, []} = Config.Server.reload(server)
+    assert_received {:native_applied, %Config{cameras: [%{id: "cam_a", pipeline: :membrane}]}}
   end
 
   # The pre window is the one that restarts: the ring is sized from it at tree
@@ -167,12 +195,15 @@ defmodule Cairn.Config.ServerTest do
 
     assert {:ok, %{changed: ["cam_a"]}, []} = Config.Server.reload(server)
 
-    # oldest message first: groups are applied before cameras
+    # oldest message first: groups, then the in-VM engine, then cameras
     assert_received first
     assert {:groups_applied, %{added: ["detect"], removed: [], changed: []}, %Config{}} = first
 
     assert_received second
-    assert {:applied, %{changed: ["cam_a"]}, %Config{}} = second
+    assert {:native_applied, %Config{}} = second
+
+    assert_received third
+    assert {:applied, %{changed: ["cam_a"]}, %Config{}} = third
   end
 
   test "reload applies an empty group diff when no group changed", %{
@@ -252,6 +283,24 @@ defmodule Cairn.Config.ServerTest do
 
       assert Config.Server.diff_cameras(camera_config([base], %{}), camera_config([base], %{})) ==
                %{added: [], removed: [], changed: [], refreshed: []}
+    end
+
+    test "a neighbour flipping to membrane moves nobody else's ports" do
+      cams = [
+        %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1"},
+        %{"id" => "cam_b", "rtsp_url" => "rtsp://h/2"}
+      ]
+
+      [cam_a, cam_b] = cams
+      old = camera_config(cams, %{})
+      new = camera_config([Map.put(cam_a, "pipeline", "membrane"), cam_b], %{})
+
+      # a membrane camera stops consuming its UDP ports but keeps its index
+      # slot, so cam_b is neither restarted nor refreshed by cam_a's flip
+      assert Config.Server.diff_cameras(old, new) ==
+               %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+
+      assert Cairn.UDPPorts.ports_for(new, 1) == Cairn.UDPPorts.ports_for(old, 1)
     end
 
     test "a global tracking edit refreshes the cameras that resolve through it" do

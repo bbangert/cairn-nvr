@@ -9,8 +9,9 @@ defmodule Cairn.CameraTrackerRecorderTest do
 
   import ExUnit.CaptureLog, only: [capture_log: 1]
 
-  alias Cairn.Config.Camera
   alias Cairn.{CameraControl, CameraTracker, Event, EventCheckpoint, Observation}
+  alias Cairn.Config.Camera
+  alias Cairn.Detect.Dispatch
   alias Cairn.{Track, TrackRecorder, Tracks}
 
   @policy %{pre: 5, post: 10, max: 300, max_unseen_ms: 3_000, max_live_tracks: 128}
@@ -65,7 +66,12 @@ defmodule Cairn.CameraTrackerRecorderTest do
       protocol: :v0
     }
 
-    CameraTracker.detections(tracker, camera, policy, observation)
+    # `:via` picks the route: `detections/4` is the tracker's own entry point,
+    # `:dispatch` is the seam both detection producers actually use.
+    case Keyword.get(opts, :via) do
+      :dispatch -> Dispatch.forward(camera, policy, observation, tracker: tracker)
+      nil -> CameraTracker.detections(tracker, camera, policy, observation)
+    end
   end
 
   # The tracker decides on `at_ms`, which production derives from the host's
@@ -349,6 +355,41 @@ defmodule Cairn.CameraTrackerRecorderTest do
           label: "person",
           score: 0.65,
           policy: tiers(@example_track, @example_record)
+        )
+
+      assert_receive {:extractor_started, %Event{id: eid}, _pid}
+
+      flush(ctx.tracker, ctx.rec)
+
+      assert Tracks.get(oid).event_id == eid
+    end
+
+    # The same two answers, over the route both producers take. The seam
+    # forwards one policy carrying both tiers, so anything it read or rewrote
+    # would let one tier answer for the other.
+    test "the dispatch seam keeps the cat's row and its silence", ctx do
+      oid =
+        start_and_end_track(ctx,
+          label: "cat",
+          score: 0.9,
+          policy: tiers(@example_track, @example_record),
+          via: :dispatch
+        )
+
+      flush(ctx.tracker, ctx.rec)
+      refute_received {:event_started, _}
+
+      assert Tracks.get(oid).event_id == nil
+      assert Tracks.list(camera: ctx.camera_id).total == 1
+    end
+
+    test "the dispatch seam keeps the person's event", ctx do
+      oid =
+        start_and_end_track(ctx,
+          label: "person",
+          score: 0.65,
+          policy: tiers(@example_track, @example_record),
+          via: :dispatch
         )
 
       assert_receive {:extractor_started, %Event{id: eid}, _pid}

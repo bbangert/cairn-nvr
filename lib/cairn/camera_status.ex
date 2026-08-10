@@ -2,11 +2,13 @@ defmodule Cairn.CameraStatus do
   @moduledoc """
   ETS-backed per-camera runtime status (`:connecting | :running | :backoff |
   :stalled | :transcode_unavailable`) plus probe results (Phase 8) and the
-  last `plugin.status` the camera's plugin reported, with PubSub change
+  last detector health reported for the camera, with PubSub change
   notifications on `"cameras:status"`.
 
-  Written by `Cairn.FFmpegPort` / the watchdog and by the plugin ports; read
-  by the dashboard and config LiveViews and by the HA API.
+  Written by `Cairn.FFmpegPort` / the watchdog, by the plugin ports, and — for
+  a camera detected on by the in-VM native block, which has no plugin process —
+  by `Cairn.Native.Status`; read by the dashboard and config LiveViews and by
+  the HA API.
   """
 
   use GenServer
@@ -30,8 +32,9 @@ defmodule Cairn.CameraStatus do
   def set_probe(camera_id, probe), do: merge(camera_id, %{probe: probe})
 
   @doc """
-  Stores the plugin's own last reported state (a decoded `plugin.status`
-  payload — string-keyed and JSON-safe, since it arrived as JSON).
+  Stores the detector's own last reported state, in `plugin.status`'s shape:
+  string-keyed and JSON-safe, because it is served as JSON and, on the plugin
+  path, arrived as JSON.
   """
   @spec set_plugin_status(String.t(), map() | nil) :: :ok
   def set_plugin_status(camera_id, status), do: merge(camera_id, %{plugin_status: status})

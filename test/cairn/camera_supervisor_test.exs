@@ -1,6 +1,7 @@
 defmodule Cairn.CameraSupervisorTest do
-  # drives the real DynamicSupervisor + Camera trees (ffmpeg spawns against
-  # an instantly-failing file source; backoff keeps the noise to one spawn)
+  # drives the real DynamicSupervisor + Camera trees (ffmpeg mostly spawns
+  # against an instantly-failing file source; backoff keeps the noise to one
+  # spawn — the membrane tests use a real fixture and run to completion)
   use ExUnit.Case, async: false
 
   alias Cairn.CameraSupervisor
@@ -21,6 +22,9 @@ defmodule Cairn.CameraSupervisorTest do
 
     :ok
   end
+
+  @mock Path.absname("priv/plugins/mock/mock_plugin.exs")
+  @timeline Path.absname("test/support/fixtures/timelines/person_walkthrough.json")
 
   defp camera(id), do: %Camera{id: id, rtsp_url: "file:///dev/null"}
 
@@ -161,13 +165,6 @@ defmodule Cairn.CameraSupervisorTest do
     cam = %Camera{id: id, rtsp_url: "file://#{fixture}", pipeline: :membrane}
 
     cfg = config([cam], 19_880)
-    {plugin_port, _rtp_port} = Cairn.UDPPorts.ports_for(cfg, 0)
-
-    # The membrane argv still emits one real RTP output to the plugin port;
-    # nothing consumes it in phase 1, so bind a socket to swallow those datagrams
-    # — an unbound port would draw ICMP unreachable that can trip ffmpeg's muxer.
-    {:ok, sink} = :gen_udp.open(plugin_port, [:binary, active: false, reuseaddr: true])
-    on_exit(fn -> :gen_udp.close(sink) end)
 
     # subscribe before the tree starts so no init/fragment/packet is missed
     Phoenix.PubSub.subscribe(Cairn.PubSub, Cairn.RingBuffer.topic(id))
@@ -187,6 +184,34 @@ defmodule Cairn.CameraSupervisorTest do
     assert_receive {:init_segment, %{camera_id: ^id}}, 10_000
     assert_receive {:fragment, _frag}, 10_000
     assert_receive {:rtp, %ExRTP.Packet{}}, 10_000
+  end
+
+  # The double-feed regression: while a membrane camera still ran a plugin
+  # port, that port and the pipeline's in-VM detector both reached this
+  # camera's tracker from the same video — duplicate detections, duplicate
+  # tracks. The mock plugin replays its timeline regardless of RTP input, so
+  # every batch arriving here is the second producer; the pipeline's own is
+  # silent under test (no NIF), which is what makes zero the right count.
+  test "a membrane camera's tracker gets nothing from a plugin port" do
+    id = "cs_feed_#{System.unique_integer([:positive])}"
+    fixture = Path.absname("test/support/fixtures/media/testsrc.ts")
+
+    cam = %Camera{
+      id: id,
+      rtsp_url: "file://#{fixture}",
+      pipeline: :membrane,
+      plugin: {:inline, ["elixir", @mock, "--timeline", @timeline, "--loop"]}
+    }
+
+    # stand in for the camera's tracker: `Cairn.Detect.Dispatch` resolves it
+    # through the registry, so any producer's batch lands in this mailbox
+    {:ok, _} = Registry.register(Cairn.Registry, {id, :camera_tracker}, nil)
+
+    :ok = CameraSupervisor.sync(config([cam], 19_920))
+
+    assert Cairn.Registry.whereis(id, :camera)
+    refute Cairn.Registry.whereis(id, :plugin)
+    refute_receive {:"$gen_cast", {:detections, _camera, _policy, _observation}}, 4_000
   end
 
   test "a camera served by a plugin group gets no plugin port of its own" do

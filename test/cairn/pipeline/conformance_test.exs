@@ -18,19 +18,30 @@ defmodule Cairn.Pipeline.ConformanceTest do
   alias Cairn.Config.Camera
 
   alias Cairn.{
+    CameraControl,
     CameraStatus,
+    CameraTracker,
+    CanaryStub,
     Config,
     Event,
-    Events,
     EventExtractor,
+    Events,
     FFmpegPort,
+    NativeStub,
+    ObservationClock,
+    PluginProtocol,
     RingBuffer,
     RTPHub,
-    StreamEpochs
+    StreamEpochs,
+    Track
   }
 
+  alias Cairn.Detect.Dispatch
   alias Cairn.MP4.Demuxer
+  alias Cairn.Native.Host
+  alias Cairn.Pipeline.InferSink
   alias Cairn.RTP
+  alias Membrane.Buffer
 
   @endpoint CairnWeb.Endpoint
 
@@ -49,6 +60,15 @@ defmodule Cairn.Pipeline.ConformanceTest do
   # The CMAF muxer's configured segment floor (`RingBufferSink` pipeline runs it
   # at 2 s); used as the duration-sum bound instead of an observed fragment.
   @segment_ms 2_000
+
+  # The one detection the "events" conformance tests drive both producers with.
+  # `observed_at` is fixed rather than `utc_now/0` because every timestamp the
+  # tracker publishes derives from it, so the two runs can be compared with `==`.
+  @epoch "01J0000000000000000000000"
+  @observed_at ~U[2026-07-26 12:00:00.500000Z]
+  @detect_pts 90_000
+  @detect_bbox [0.1, 0.1, 0.2, 0.4]
+  @detect_policy %{pre: 5, post: 10, max: 300, max_unseen_ms: 3_000, max_live_tracks: 128}
 
   describe "interface #3: golden fragment shape (classic vs membrane, one source)" do
     test "the two segmenters agree on every field a consumer keys on" do
@@ -214,11 +234,11 @@ defmodule Cairn.Pipeline.ConformanceTest do
 
   describe "interface #5: camera-status lifecycle tuples (classic vs membrane)" do
     test "the membrane path publishes the same status tuple shape on cameras:status" do
-      # The plan's interface #5 is "status/lifecycle tuple shapes"; those flow on
-      # `CameraStatus`'s "cameras:status" topic (the dashboard/HA reader), not the
-      # tracker's "events" topic — which the phase-1 membrane path, whose detect
-      # branch is a stub, never touches. `set_status` is path-agnostic, so a
-      # membrane camera must publish an identically-shaped tuple to a classic one.
+      # The plan's interface #5 conflates two topics. *Camera* status/lifecycle
+      # flows on `CameraStatus`'s "cameras:status" topic (the dashboard/HA
+      # reader); tracker/event lifecycle rides "events" and is asserted in the
+      # describe below. `set_status` is path-agnostic, so a membrane camera must
+      # publish an identically-shaped tuple to a classic one.
       classic = uid("cstatus")
       membrane = uid("mstatus")
 
@@ -241,6 +261,80 @@ defmodule Cairn.Pipeline.ConformanceTest do
       assert m_info.status == :running
       assert Map.has_key?(m_info, :probe)
       assert Map.has_key?(m_info, :plugin_status)
+    end
+  end
+
+  describe "interface #5: tracker/event lifecycle tuples on \"events\" (classic vs membrane)" do
+    # Deferred from phase 1, whose detect branch was a stub: nothing on the
+    # membrane path reached a tracker, so there was no second producer to compare.
+    # Phase 3 wired it, and both producers now meet at `Cairn.Detect.Dispatch`.
+    #
+    # "Same situation" is one person detection at one pts with one `observed_at`,
+    # built by each producer's own code — `PluginProtocol.decode_line/2` plus the
+    # port's `ObservationClock` stamp on one side, the real `InferSink` over a
+    # stubbed NIF on the other — and delivered to a real `CameraTracker` each.
+    test "the same detection yields identical event and track broadcasts" do
+      classic_id = uid("evclassic")
+      membrane_id = uid("evmembrane")
+
+      Event.subscribe()
+
+      classic = start_tracker(classic_id)
+      membrane = start_tracker(membrane_id)
+
+      forward_classic(classic, classic_id)
+      membrane |> start_infer_sink(membrane_id) |> feed_infer_sink()
+
+      # both producers open the same two lifecycle frames, in the same order
+      assert_receive {:track_started, %Track{camera_id: ^classic_id} = c_track}, 2_000
+      assert_receive {:event_started, %Event{camera_id: ^classic_id} = c_event}, 2_000
+      assert_receive {:track_started, %Track{camera_id: ^membrane_id} = m_track}, 2_000
+      assert_receive {:event_started, %Event{camera_id: ^membrane_id} = m_event}, 2_000
+
+      # …and every field of them agrees, bar the identities and the camera the
+      # two runs cannot share. Compared whole rather than key by key, so a field
+      # added to either struct has to be classified here before this passes.
+      assert scrub_track(m_track) == scrub_track(c_track)
+      assert scrub_event(m_event) == scrub_event(c_event)
+
+      # `epoch` is what the tracker's suspend/adopt keys off (interface #6), so
+      # it is asserted as a value and not only as "equal on both sides"
+      assert c_track.epoch == @epoch and m_track.epoch == @epoch
+      # every identity is the host's own on both paths — the NIF mints none and
+      # the plugin's `track_id` is reserved, never adopted
+      assert c_track.source == :host and m_track.source == :host
+      assert c_track.plugin_track_id == nil and m_track.plugin_track_id == nil
+    end
+
+    test "an ended track carries the same tuple and end_reason on both paths" do
+      classic_id = uid("endclassic")
+      membrane_id = uid("endmembrane")
+
+      Event.subscribe()
+
+      classic = start_tracker(classic_id)
+      membrane = start_tracker(membrane_id)
+
+      forward_classic(classic, classic_id)
+      sink = membrane |> start_infer_sink(membrane_id) |> feed_infer_sink()
+
+      assert_receive {:track_started, %Track{camera_id: ^classic_id}}, 2_000
+      assert_receive {:track_started, %Track{camera_id: ^membrane_id}}, 2_000
+
+      # `:detection_disabled` is the one end reason reachable without waiting out
+      # a liveness window, and it runs the same close-out path every other does.
+      # The toggle is read on the next batch, so each path feeds one more.
+      CameraControl.set(classic_id, %{detection_enabled: false})
+      CameraControl.set(membrane_id, %{detection_enabled: false})
+
+      forward_classic(classic, classic_id)
+      feed_infer_sink(sink)
+
+      assert_receive {:track_ended, %Track{camera_id: ^classic_id} = c_track}, 2_000
+      assert_receive {:track_ended, %Track{camera_id: ^membrane_id} = m_track}, 2_000
+
+      assert c_track.end_reason == :detection_disabled
+      assert scrub_track(m_track) == scrub_track(c_track)
     end
   end
 
@@ -269,6 +363,142 @@ defmodule Cairn.Pipeline.ConformanceTest do
   # -- helpers ----------------------------------------------------------------
 
   defp uid(prefix), do: "#{prefix}_#{System.unique_integer([:positive])}"
+
+  # -- "events" conformance ---------------------------------------------------
+
+  defp tracked_camera(id),
+    do: %Camera{id: id, rtsp_url: "rtsp://127.0.0.1:554/x", min_score: %{"default" => 0.5}}
+
+  defp start_tracker(camera_id) do
+    on_exit(fn -> Cairn.EventCheckpoint.delete(camera_id) end)
+
+    start_supervised!(
+      {
+        CameraTracker,
+        # The clip pipeline is another interface's business; what is asserted here
+        # is the broadcast, so the extractor is a process that does nothing.
+        camera_id: camera_id,
+        name: nil,
+        start_extractor: fn _camera, _event ->
+          {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+        end,
+        finalize_extractor: fn _pid, _event -> :ok end
+      },
+      id: {:tracker, camera_id}
+    )
+  end
+
+  # The plugin path's own construction: the wire line, decoded and stamped
+  # exactly as `Cairn.PluginGroupPort` does before it calls the seam.
+  defp forward_classic(tracker, camera_id) do
+    {:objects, observation} = PluginProtocol.decode_line(plugin_line(camera_id), :group)
+
+    {observation, _clock} =
+      ObservationClock.stamp(
+        ObservationClock.new(),
+        observation,
+        System.monotonic_time(:millisecond)
+      )
+
+    Dispatch.forward(tracked_camera(camera_id), @detect_policy, observation, tracker: tracker)
+  end
+
+  defp plugin_line(camera_id) do
+    Jason.encode!(%{
+      "spec" => "cairn.plugin",
+      "version" => 1,
+      "type" => "frame.objects",
+      "camera_id" => camera_id,
+      "stream_epoch" => @epoch,
+      "sequence" => 1,
+      "frame" => %{
+        "pts" => @detect_pts,
+        "observed_at" => DateTime.to_iso8601(@observed_at)
+      },
+      "objects" => [%{"label" => "person", "score" => 0.9, "bbox" => @detect_bbox}]
+    })
+  end
+
+  # The membrane path's own construction: the real `InferSink` over a stubbed
+  # NIF, so `Cairn.Native.Observations` and the seam both run for real.
+  defp start_infer_sink(tracker, camera_id) do
+    :persistent_term.put(NativeStub.control(), %{
+      test: self(),
+      push_au: fn _stream, _au, _pts, _time_base -> {:ok, {[native_frame()], []}} end
+    })
+
+    on_exit(fn -> :persistent_term.erase(NativeStub.control()) end)
+
+    host = :"conf_host_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {Host,
+       name: host,
+       native_module: NativeStub,
+       canary_module: CanaryStub,
+       config: %{model: "m.onnx", backend: "ort"}},
+      id: host
+    )
+
+    options =
+      struct(InferSink,
+        camera: tracked_camera(camera_id),
+        policy: @detect_policy,
+        epoch: @epoch,
+        host: host,
+        tracker: tracker,
+        reopen_cooldown_ms: 0
+      )
+
+    {[], state} = InferSink.handle_init(%{}, options)
+    {_actions, state} = InferSink.handle_playing(%{}, state)
+    assert state.stream == :open
+    state
+  end
+
+  defp feed_infer_sink(state) do
+    {_actions, state} =
+      InferSink.handle_buffer(
+        :input,
+        %Buffer{payload: <<0, 0, 1, 0x65, 0x88>>, pts: Membrane.Time.seconds(1)},
+        %{},
+        state
+      )
+
+    state
+  end
+
+  defp native_frame do
+    %{
+      pts: @detect_pts,
+      observed_at_ms: DateTime.to_unix(@observed_at, :millisecond),
+      inferred: true,
+      infer_us: 12_000,
+      objects: [
+        %{
+          label: "person",
+          score: 0.9,
+          bbox: @detect_bbox,
+          track_id: nil,
+          observation_kind: "detected"
+        }
+      ]
+    }
+  end
+
+  # The identities two independent runs cannot share: the camera, and the ULID/
+  # UUID the host mints per track and per event. Everything else must be equal.
+  defp scrub_track(%Track{} = track), do: %{track | camera_id: nil, object_id: nil}
+
+  defp scrub_event(%Event{} = event) do
+    %{
+      event
+      | id: nil,
+        camera_id: nil,
+        labels: Enum.map(event.labels, &Map.put(&1, :object_id, nil)),
+        trigger: event.trigger && Map.put(event.trigger, :object_id, nil)
+    }
+  end
 
   defp classic_camera(id), do: %Camera{id: id, rtsp_url: "rtsp://127.0.0.1:554/x"}
 

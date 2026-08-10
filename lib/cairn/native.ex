@@ -1,7 +1,7 @@
 defmodule Cairn.Native do
   @moduledoc """
-  The `cairn-native` NIF binding: decode → motion gate → infer → Re-ID. All four
-  entry points block, on a dirty scheduler.
+  The `cairn-native` NIF binding: decode → motion gate → infer → Re-ID. Every
+  entry point blocks, on a dirty scheduler.
 
   `config` and `params` must carry every key of the crate's `RawInitConfig` /
   `RawStreamParams`; build them with `Cairn.Native.Config`, never by hand.
@@ -26,7 +26,7 @@ defmodule Cairn.Native do
     :ok
   end
 
-  @doc "True when the four NIFs below are the real ones."
+  @doc "True when the NIFs below are the real ones."
   @spec available?() :: boolean()
   def available?, do: load_result() == :ok
 
@@ -42,10 +42,20 @@ defmodule Cairn.Native do
   # `nif_error/1` has no return, so dialyzer flags every *static* call to a stub;
   # `Cairn.Native.Host` calls through a module held in its state, which keeps them
   # dynamic. The nowarn covers the specs, which describe the loaded library.
-  @dialyzer {:nowarn_function, init: 1, open_stream: 3, push_au: 4, close_stream: 1}
+  @dialyzer {:nowarn_function,
+             init: 1, open_stream: 3, push_au: 4, close_stream: 1, cpu_baseline_ms: 2}
 
   @spec init(map()) :: {:ok, reference()} | {:error, {atom(), String.t()}}
   def init(_config), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  The median cost of `passes` model passes on `config`'s model, on the CPU.
+
+  A second model load on top of `init/1`'s: this opens its own onnxruntime CPU
+  session so that the number is the same model's, on this board.
+  """
+  @spec cpu_baseline_ms(map(), pos_integer()) :: {:ok, float()} | {:error, {atom(), String.t()}}
+  def cpu_baseline_ms(_config, _passes), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec open_stream(reference(), String.t(), map()) ::
           {:ok, reference()} | {:error, {atom(), String.t()}}

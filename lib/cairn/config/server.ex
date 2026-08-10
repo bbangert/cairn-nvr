@@ -8,7 +8,10 @@ defmodule Cairn.Config.Server do
 
   Group children are applied before camera children: a group bakes its
   members' UDP ports into its argv, so it should be listening before the
-  ffmpeg outputs feeding it come back.
+  ffmpeg outputs feeding it come back. Membrane cameras detect in
+  `Cairn.Native.Host` rather than in a group process, so the new config goes
+  there too (`reconfigure/2`) — a model change is the group restart's
+  equivalent for them.
   """
 
   use GenServer
@@ -16,6 +19,7 @@ defmodule Cairn.Config.Server do
   require Logger
 
   alias Cairn.Config
+  alias Cairn.Native.Host
 
   @type diff :: %{
           added: [String.t()],
@@ -62,11 +66,13 @@ defmodule Cairn.Config.Server do
     path = Keyword.get(opts, :path) || Config.default_path()
     apply_diff = Keyword.get(opts, :apply_diff, &Cairn.CameraSupervisor.apply_diff/2)
     apply_group_diff = Keyword.get(opts, :apply_group_diff, &default_apply_group_diff/2)
+    apply_native = Keyword.get(opts, :apply_native, &Host.reconfigure/1)
 
     state = %{
       path: path,
       apply_diff: apply_diff,
       apply_group_diff: apply_group_diff,
+      apply_native: apply_native,
       config: %Config{},
       warnings: [],
       errors: []
@@ -103,6 +109,11 @@ defmodule Cairn.Config.Server do
         Cairn.DataDir.ensure!(new_config.data_dir)
         log_group_diff(group_diff)
         state.apply_group_diff.(group_diff, new_config)
+        # Before the cameras, for the group diff's reason: a membrane camera's
+        # detection is the in-VM engine, so the model it will open a stream on
+        # should already be the new one. The call is asynchronous, so this is an
+        # ordering of sends rather than of loads.
+        state.apply_native.(new_config)
         state.apply_diff.(diff, new_config)
         state = %{state | config: new_config, warnings: warnings, errors: []}
         {:reply, {:ok, diff, warnings}, state}
@@ -207,8 +218,9 @@ defmodule Cairn.Config.Server do
   #     believed the new one.
   #
   # The rest of the effective policy — `post`/`max`, the tracking bounds, the
-  # `track:` / `record:` tiers — is host-side and refreshes
-  # (`Cairn.PluginPort.refresh/3`).
+  # `track:` / `record:` tiers — is host-side and refreshes in place, through
+  # `Cairn.PluginPort.refresh/3` for a plugin camera and
+  # `Cairn.FFmpegPort.refresh/3` for a membrane one.
   defp camera_changed?(old, new, {old_cam, old_index}, {new_cam, new_index}) do
     old_index != new_index or
       udp_ports(old, old_index) != udp_ports(new, new_index) or

@@ -86,18 +86,21 @@ defmodule Cairn.FFmpegPortTest do
     end
   end
 
-  describe "build_membrane_argv/3" do
-    test "two outputs: mpegts on stdout + plugin rtp, hub output gone" do
-      argv = FFmpegPort.build_membrane_argv(camera("c"), 5001, "-timeout")
+  describe "build_membrane_argv/2" do
+    test "one output: mpegts on stdout, both rtp outputs gone" do
+      argv = FFmpegPort.build_membrane_argv(camera("c"), "-timeout")
 
       assert "-rtsp_transport" in argv
       assert "mpegts" in argv
       assert "pipe:1" in argv
-      assert "rtp://127.0.0.1:5001" in argv
-      assert Enum.count(argv, &String.starts_with?(&1, "rtp://")) == 1
-      assert Enum.count(argv, &(&1 == "copy")) == 2
-      # in-band SPS/PPS for the one remaining RTP output
-      assert Enum.count(argv, &(&1 == "h264_mp4toannexb")) == 1
+      # both RTP consumers are in-process now, so ffmpeg emits one output and
+      # the camera binds no UDP port at all
+      assert Enum.count(argv, &(&1 == "-map")) == 1
+      assert Enum.count(argv, &(&1 == "copy")) == 1
+      refute Enum.any?(argv, &String.starts_with?(&1, "rtp://"))
+      refute "rtp" in argv
+      # the in-band SPS/PPS filter existed only for those RTP outputs
+      refute "h264_mp4toannexb" in argv
       refute "mp4" in argv
     end
   end
@@ -113,7 +116,7 @@ defmodule Cairn.FFmpegPortTest do
       @impl true
       def handle_init(_ctx, opts) do
         owner = Keyword.fetch!(opts, :owner)
-        test_pid = :persistent_term.get({:membrane_stub, Keyword.fetch!(opts, :camera_id)})
+        test_pid = :persistent_term.get({:membrane_stub, Keyword.fetch!(opts, :camera).id})
         send(owner, {:bridge_source_ready, Keyword.fetch!(opts, :epoch), self()})
         send(test_pid, {:pipeline_started, self(), opts})
         {[], %{test_pid: test_pid}}
@@ -169,7 +172,7 @@ defmodule Cairn.FFmpegPortTest do
       start_membrane(id, command: "#{@fake} #{@fixture} 0.05 42")
 
       assert_receive {:pipeline_started, _pid, opts}, 2_000
-      assert opts[:camera_id] == id
+      assert opts[:camera].id == id
       assert is_binary(opts[:epoch])
 
       # fake ffmpeg's stdout reaches the announced source
@@ -181,6 +184,33 @@ defmodule Cairn.FFmpegPortTest do
       assert_receive {:pipeline_msg, :ts_eos}, 2_000
       assert_receive {:pipeline_started, _pid2, opts2}, 2_000
       assert opts2[:epoch] != opts[:epoch]
+    end
+
+    test "a refresh reaches the running pipeline's detect branch, not ffmpeg" do
+      id = "mr_#{System.unique_integer([:positive])}"
+      port = start_membrane(id, command: "#{@fake} #{@fixture} 600 0")
+
+      assert_receive {:pipeline_started, pipeline, _opts}, 2_000
+      cam = %Camera{camera(id) | pipeline: :membrane, record: %{"person" => %{min_score: 0.9}}}
+
+      # a tier edit is refresh-only: the detect branch has to be told, and the
+      # session it is part of has to survive being told
+      :ok = FFmpegPort.refresh(port, cam, config())
+
+      assert_receive {:pipeline_msg, {:policy, ^cam, policy}}, 2_000
+      assert policy.record == cam.record
+      assert :sys.get_state(port).pipeline == pipeline
+    end
+
+    test "a classic camera's refresh moves nothing" do
+      id = "mc_#{System.unique_integer([:positive])}"
+      port = start_pipeline(id, "#{@fake} #{@fixture} 600 0", [])
+      before = :sys.get_state(port)
+
+      :ok = FFmpegPort.refresh(port, %Camera{camera(id) | post_window_seconds: 42}, config())
+
+      # its detections come from the plugin port, which is refreshed directly
+      assert :sys.get_state(port).camera == before.camera
     end
 
     test ":running rides ring broadcasts, gated on this session's epoch" do

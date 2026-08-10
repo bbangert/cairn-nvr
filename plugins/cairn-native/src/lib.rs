@@ -71,9 +71,9 @@ impl StreamRef {
         }
     }
 
-    /// The instant is read after the lock, not before: it is what the sample
-    /// rate is measured against, and a caller that queued behind another push
-    /// must not thin against the time it started waiting.
+    /// The instant is read after the lock, not before: it paces the rate gate
+    /// and dates the motion gate's windows, and a caller that queued behind
+    /// another push would otherwise age both by however long it waited.
     fn push(&self, au: &[u8], pts: i64, time_base: (i32, i32)) -> Result<Vec<FrameObservations>> {
         let mut state = self.state.lock().map_err(|_| self.poisoned_by())?;
         let stream = state.as_mut().ok_or(NativeError::Closed)?;
@@ -160,6 +160,17 @@ fn push_au(
     guarded("push_au", || {
         let frames = stream.push(au.as_slice(), pts, time_base)?;
         Ok((frames, Vec::new()))
+    })
+}
+
+/// The CPU-side model-pass baseline `Cairn.Native.Health` compares an
+/// accelerator's own latency against. A second, CPU-side model load — not
+/// the accelerator's session — so it costs one; the host calls it once, at
+/// engine init.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn cpu_baseline_ms(config: RawInitConfig, passes: usize) -> Result<f64> {
+    guarded("cpu_baseline_ms", || {
+        engine::cpu_baseline_ms(&config.resolve()?, passes)
     })
 }
 

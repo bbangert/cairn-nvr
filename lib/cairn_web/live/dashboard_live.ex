@@ -7,8 +7,9 @@ defmodule CairnWeb.DashboardLive do
   Data contract:
 
     * `@cameras` — `[%Cairn.Config.Camera{}]` from the active config
-    * `@statuses` — `%{camera_id => %{status: atom, probe: map | nil}}`,
-      live-updated via `Cairn.CameraStatus.subscribe/0`
+    * `@statuses` — `%{camera_id => %{status: atom, probe: map | nil,
+      plugin_status: map | nil}}`, live-updated via
+      `Cairn.CameraStatus.subscribe/0`
     * `@live_events` — `%{camera_id => true}` from the `"events"` topic
     * `@disk_alert` — from `Cairn.Retention`
   """
@@ -42,6 +43,18 @@ defmodule CairnWeb.DashboardLive do
           "Install it or disable transcode for this camera."
     },
     unknown: %{label: "Unknown", color: "var(--hs-fg-3)"}
+  }
+
+  # `Cairn.Native.Health`'s verdicts. Distinct on purpose: a wedge is an operator
+  # alert a restart is not expected to clear, saturation is load to shed, and
+  # idle is idle.
+  @health_meta %{
+    "healthy" => %{label: "Detecting", color: "var(--hs-success)", icon: "visibility"},
+    "not_applicable" => %{label: "Detecting", color: "var(--hs-fg-3)", icon: "visibility"},
+    "saturated" => %{label: "Saturated", color: "var(--hs-warning)", icon: "speed"},
+    "wedged" => %{label: "Accelerator wedged", color: "var(--hs-danger)", icon: "error"},
+    "idle" => %{label: "Idle", color: "var(--hs-fg-3)", icon: "pause_circle"},
+    "unknown" => %{label: "Unknown", color: "var(--hs-fg-3)", icon: "help"}
   }
 
   @impl true
@@ -121,6 +134,63 @@ defmodule CairnWeb.DashboardLive do
   defp meta(status), do: Map.get(@status_meta, status, @status_meta.unknown)
 
   defp transport(transports, camera_id), do: Map.get(transports, camera_id, :mse)
+
+  defp detection(statuses, camera_id) do
+    statuses |> Map.get(camera_id, %{}) |> Map.get(:plugin_status)
+  end
+
+  # `health` is `Cairn.Native.Status`'s and only ever this node's: the protocol's
+  # status whitelist is `state`/`detail`/`fps`, so no plugin line can carry one.
+  # A plugin's `state` is a free string the contract forbids branching on, so it
+  # is shown verbatim and coloured neutrally.
+  # `Cairn.Native.Status`'s `headline/1` derives most states from health —
+  # ready, idle, saturated, wedged — where either key tells the same story and
+  # health may answer. These are the ones it decides before health is consulted
+  # at all, so health must not answer for them: an engine that is refusing or
+  # still loading reports `health: :idle` truthfully (nothing is inferring), and
+  # an operator reading "Idle" would never learn why. A new headline state has
+  # to be classified here or it silently falls through to health.
+  @state_outranks_health %{
+    "error" => %{label: "Detection failed", color: "var(--hs-danger)", icon: "error"},
+    "starting" => %{label: "Starting", color: "var(--hs-fg-3)", icon: "hourglass_empty"}
+  }
+
+  defp detection_meta(%{"state" => state} = status)
+       when is_map_key(@state_outranks_health, state) do
+    @state_outranks_health |> Map.fetch!(state) |> Map.put(:detail, status["detail"])
+  end
+
+  defp detection_meta(%{"health" => health} = status) do
+    @health_meta
+    |> Map.get(health, @health_meta["unknown"])
+    |> Map.put(:detail, status["detail"])
+  end
+
+  defp detection_meta(%{"state" => state} = status) do
+    %{label: state, color: "var(--hs-fg-3)", icon: "sensors", detail: status["detail"]}
+  end
+
+  defp detection_meta(_none), do: nil
+
+  attr :camera_id, :string, required: true
+  attr :status, :map, default: nil
+
+  defp detection_chip(assigns) do
+    assigns = assign(assigns, :meta, detection_meta(assigns.status))
+
+    ~H"""
+    <div
+      :if={@meta}
+      id={"camera-detection-#{@camera_id}"}
+      data-health={@status["health"]}
+      title={@meta.detail}
+      style={"display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; color: #{@meta.color};"}
+    >
+      <span class="ms" style="font-size: 14px;">{@meta.icon}</span>
+      {@meta.label}
+    </div>
+    """
+  end
 
   defp summary(cameras, statuses, live_events) do
     total = length(cameras)
@@ -265,6 +335,7 @@ defmodule CairnWeb.DashboardLive do
               <h2 style="margin: 0; font-family: var(--hs-font-mono); font-size: 13px; font-weight: 500; color: var(--hs-fg-1);">
                 {cam.id}
               </h2>
+              <.detection_chip camera_id={cam.id} status={detection(@statuses, cam.id)} />
               <div style="flex: 1;"></div>
               <div
                 id={"camera-transport-#{cam.id}"}

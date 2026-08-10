@@ -81,4 +81,95 @@ defmodule CairnWeb.DashboardLiveTest do
     # the REC marker must stay off — the tile alone renders either way
     refute html =~ "camera-live-event-cam_a"
   end
+
+  describe "detector health" do
+    setup do
+      on_exit(fn -> Cairn.CameraStatus.set_plugin_status("cam_a", nil) end)
+      :ok
+    end
+
+    defp show(conn, plugin_status) do
+      Cairn.CameraStatus.set_plugin_status("cam_a", plugin_status)
+      _flushed = :sys.get_state(Cairn.CameraStatus)
+      {:ok, _view, html} = live(conn, "/")
+      html
+    end
+
+    test "a camera nothing has reported for shows no chip", %{conn: conn} do
+      refute show(conn, nil) =~ "camera-detection-cam_a"
+    end
+
+    test "each health verdict is drawn differently", %{conn: conn} do
+      rendered =
+        Map.new(~w(healthy saturated wedged idle unknown), fn health ->
+          {health, show(conn, %{"state" => "x", "detail" => "d", "health" => health})}
+        end)
+
+      assert rendered["healthy"] =~ ~s(data-health="healthy")
+      assert rendered["healthy"] =~ "Detecting"
+      assert rendered["saturated"] =~ "Saturated"
+      assert rendered["wedged"] =~ "Accelerator wedged"
+      assert rendered["idle"] =~ "Idle"
+      assert rendered["unknown"] =~ "Unknown"
+
+      # a wedge is an alert and saturation is load: they must not share a colour
+      assert rendered["wedged"] =~ "var(--hs-danger)"
+      assert rendered["saturated"] =~ "var(--hs-warning)"
+      assert rendered["healthy"] =~ "var(--hs-success)"
+    end
+
+    test "the detail is what the operator is given to act on", %{conn: conn} do
+      html =
+        show(conn, %{
+          "state" => "error",
+          "health" => "unknown",
+          "detail" => "the canary refused m.onnx: SIGSEGV — the model was NOT loaded in this VM"
+        })
+
+      assert html =~ "the canary refused m.onnx: SIGSEGV"
+    end
+
+    # The case that motivated the precedence: nothing is inferring, so `health`
+    # is honestly `idle` — and an operator reading "Idle" would never learn the
+    # canary had refused the model.
+    test "a failed engine outranks its health verdict", %{conn: conn} do
+      html =
+        show(conn, %{
+          "state" => "error",
+          "health" => "idle",
+          "detail" => "the canary refused m.onnx: SIGSEGV — the model was NOT loaded in this VM"
+        })
+
+      assert html =~ "Detection failed"
+      assert html =~ "var(--hs-danger)"
+      assert html =~ "the canary refused m.onnx: SIGSEGV"
+      refute html =~ "Idle"
+    end
+
+    # The sibling of the failed-engine case: health is honestly `:unknown`
+    # while the model loads, and "Unknown" tells an operator nothing.
+    test "a loading engine outranks its health verdict too", %{conn: conn} do
+      html =
+        show(conn, %{
+          "state" => "starting",
+          "health" => "unknown",
+          "detail" => "the engine is still opening its model"
+        })
+
+      # The label is the discriminator — the detail rides both branches, and
+      # health would have labelled this "Unknown".
+      assert html =~ "Starting"
+      assert html =~ "still opening its model"
+    end
+
+    # `state` is a free string in the plugin contract, which forbids branching
+    # on it: a plugin's status is shown, never interpreted.
+    test "a plugin's own status still renders, uncoloured", %{conn: conn} do
+      html = show(conn, %{"state" => "degraded", "detail" => "cpu fallback"})
+
+      assert html =~ "camera-detection-cam_a"
+      assert html =~ "degraded"
+      refute html =~ ~s(data-health=)
+    end
+  end
 end

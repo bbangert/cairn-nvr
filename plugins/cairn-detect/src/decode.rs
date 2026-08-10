@@ -594,9 +594,9 @@ fn note_error(count: &mut u64, what: &str, e: &impl fmt::Display) {
     }
 }
 
-/// A decoded frame's presentation time on the contract's 90 kHz clock. Public for
-/// the same reason [`sample_interval`] is: two derivations would date the same
-/// frame differently.
+/// A decoded frame's presentation time on the contract's 90 kHz clock. Public
+/// because the NIF path dates its frames here too, and two derivations would date
+/// the same frame differently.
 pub fn pts_90k(frame: &AVFrame, time_base: AVRational) -> i64 {
     let pts = if frame.pts != ffi::AV_NOPTS_VALUE {
         frame.pts

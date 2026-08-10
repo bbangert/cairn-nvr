@@ -23,9 +23,10 @@ defmodule Cairn.Native.Observations do
   @doc """
   One push's frames, stamped onto `clock`.
 
-  `now_ms` is read once per push, not per frame. Frames sharing it still take
-  distinct `at_ms`: `Cairn.ObservationClock`'s floor makes the stamp strictly
-  increasing.
+  `now_ms` is the host's monotonic clock — `Cairn.CameraTracker` compares the
+  resulting `at_ms` against its own reading of it — and is read once per push,
+  not per frame. Frames sharing it still take distinct `at_ms`:
+  `Cairn.ObservationClock`'s floor makes the stamp strictly increasing.
   """
   @spec from_frames(ObservationClock.t(), [map()], String.t(), String.t() | nil, number()) ::
           {[Observation.t()], ObservationClock.t()}
