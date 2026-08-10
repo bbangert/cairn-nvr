@@ -679,11 +679,15 @@ defmodule Cairn.FFmpegPort do
 
   defp video_track(tracks) do
     case Enum.filter(tracks, &(&1.type == :video)) do
-      [%{control_path: path, rtpmap: %{encoding: "H264"} = rtpmap}] ->
-        {:ok, path, rtpmap.clock_rate}
-
-      [%{rtpmap: %{encoding: encoding}}] ->
-        {:error, {:unsupported_codec, encoding}}
+      [%{control_path: path, rtpmap: %{encoding: encoding} = rtpmap}] ->
+        # SDP encoding names are case-insensitive and ExSDP preserves the
+        # camera's spelling — `h264/90000` is as valid as `H264/90000`. The
+        # refusal carries the original spelling for the operator.
+        if String.upcase(encoding) == "H264" do
+          {:ok, path, rtpmap.clock_rate}
+        else
+          {:error, {:unsupported_codec, encoding}}
+        end
 
       # An SDP may legally omit the rtpmap; without it there is no encoding
       # and no clock rate to build a session on — named distinctly so the
@@ -700,7 +704,7 @@ defmodule Cairn.FFmpegPort do
   end
 
   defp forward_sample(state, {payload, pts, _keyframe?, _wallclock_ms}) do
-    payload = IO.iodata_to_binary(payload)
+    payload = annexb(payload)
     pts_ns = div(pts * 1_000_000_000, state.clock_rate)
 
     case state.source do
@@ -712,6 +716,16 @@ defmodule Cairn.FFmpegPort do
         pend_sample(state, payload, pts_ns)
     end
   end
+
+  # The library's decoder STRIPS start codes at RTP ingest and hands the
+  # access unit over as a list of bare NAL binaries — concatenating them
+  # as-is would be an invalid byte stream (SPS|PPS|slice with no framing),
+  # which `Membrane.H264.Parser` cannot split. Annex-B framing is restored
+  # here, one 4-byte start code per NAL.
+  defp annexb(nalus) when is_list(nalus),
+    do: IO.iodata_to_binary(Enum.map(nalus, &[<<0, 0, 0, 1>>, &1]))
+
+  defp annexb(nalu) when is_binary(nalu), do: <<0, 0, 0, 1, nalu::binary>>
 
   # The same bounded holding pattern as forward_ts/2, for the window between
   # PLAY and the source element announcing itself.

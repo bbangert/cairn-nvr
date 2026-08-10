@@ -468,21 +468,29 @@ defmodule Cairn.FFmpegPortTest do
       assert opts[:ingest] == :rtsp
       assert is_binary(opts[:epoch])
 
-      # One second of RTP clock becomes one second of Membrane time, and only
-      # the negotiated video path's samples cross.
-      send(port, {:rtsp, client, {"video", {<<0, 0, 1, 0x65>>, 90_000, true, 123}}})
-      send(port, {:rtsp, client, {"audio", {<<0xFF>>, 48_000, true, 123}}})
-      assert_receive {:pipeline_msg, {:rtsp_sample, <<0, 0, 1, 0x65>>, 1_000_000_000}}, 2_000
-      refute_receive {:pipeline_msg, {:rtsp_sample, <<0xFF>>, _}}, 100
+      # One second of RTP clock becomes one second of Membrane time; the
+      # library's bare-NAL list gets its Annex-B framing back (one 4-byte
+      # start code per NAL — the decoder strips them at RTP ingest); and
+      # only the negotiated video path's samples cross.
+      send(
+        port,
+        {:rtsp, client, {"video", {[<<0x67, 1>>, <<0x68>>, <<0x65, 9>>], 90_000, true, 123}}}
+      )
+
+      send(port, {:rtsp, client, {"audio", {[<<0xFF>>], 48_000, true, 123}}})
+
+      framed = <<0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 0, 0, 0, 1, 0x65, 9>>
+      assert_receive {:pipeline_msg, {:rtsp_sample, ^framed, 1_000_000_000}}, 2_000
+      refute_receive {:pipeline_msg, {:rtsp_sample, _, _}}, 100
 
       # Batched delivery: a list of samples fans out in order.
       send(
         port,
-        {:rtsp, client, {"video", [{<<1>>, 0, false, 124}, {<<2>>, 9_000, false, 125}]}}
+        {:rtsp, client, {"video", [{[<<1>>], 0, false, 124}, {[<<2>>], 9_000, false, 125}]}}
       )
 
-      assert_receive {:pipeline_msg, {:rtsp_sample, <<1>>, 0}}, 2_000
-      assert_receive {:pipeline_msg, {:rtsp_sample, <<2>>, 100_000_000}}, 2_000
+      assert_receive {:pipeline_msg, {:rtsp_sample, <<0, 0, 0, 1, 1>>, 0}}, 2_000
+      assert_receive {:pipeline_msg, {:rtsp_sample, <<0, 0, 0, 1, 2>>, 100_000_000}}, 2_000
     end
 
     test "session_closed flushes the tail, respawns fresh, and reaps the old client" do
@@ -604,10 +612,10 @@ defmodule Cairn.FFmpegPortTest do
       # A source outliving a force-killed predecessor announces itself with
       # ITS session's epoch — never the live one's — and must be ignored.
       send(port, {:rtsp_source_ready, "01STALEEPOCH00000000000000", self()})
-      send(port, {:rtsp, client, {"video", {<<5>>, 0, true, 0}}})
+      send(port, {:rtsp, client, {"video", {[<<5>>], 0, true, 0}}})
 
       # The live pipeline keeps receiving; the impostor (us) never does.
-      assert_receive {:pipeline_msg, {:rtsp_sample, <<5>>, 0}}, 2_000
+      assert_receive {:pipeline_msg, {:rtsp_sample, <<0, 0, 0, 1, 5>>, 0}}, 2_000
       refute_received {:rtsp_sample, _, _}
     end
 
@@ -663,12 +671,12 @@ defmodule Cairn.FFmpegPortTest do
       assert_receive {:pipeline_started, _pipeline, _opts}, 2_000
 
       dead_client = spawn(fn -> :ok end)
-      send(port, {:rtsp, dead_client, {"video", {<<9>>, 0, true, 0}}})
-      refute_receive {:pipeline_msg, {:rtsp_sample, <<9>>, _}}, 100
+      send(port, {:rtsp, dead_client, {"video", {[<<9>>], 0, true, 0}}})
+      refute_receive {:pipeline_msg, {:rtsp_sample, _, _}}, 100
 
       # The live session is unaffected.
-      send(port, {:rtsp, client, {"video", {<<7>>, 0, true, 0}}})
-      assert_receive {:pipeline_msg, {:rtsp_sample, <<7>>, 0}}, 2_000
+      send(port, {:rtsp, client, {"video", {[<<7>>], 0, true, 0}}})
+      assert_receive {:pipeline_msg, {:rtsp_sample, <<0, 0, 0, 1, 7>>, 0}}, 2_000
     end
   end
 end
