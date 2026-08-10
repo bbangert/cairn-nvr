@@ -4,7 +4,7 @@ defmodule Cairn.MotionTest do
   `plugins/cairn-detect/src/motion.rs` appears here under the same name,
   asserting the same values — exactly, because the detector's job is to make
   the same gate decision the Rust implementation makes, frame for frame
-  (`test/integration/motion_parity_test.exs` then pins that against the real
+  (`test/cairn/motion_parity_test.exs` then pins that against the real
   NIF on a real clip). The stride variants are the one omission: the element
   payload is tightly packed by contract, so the port takes no stride.
   """
