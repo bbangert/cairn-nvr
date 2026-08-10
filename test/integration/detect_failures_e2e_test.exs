@@ -132,12 +132,18 @@ defmodule Cairn.DetectFailuresE2ETest do
 
   test "a model that will not load is an engine state, not a crash loop",
        %{camera: camera, config: config, id: id} do
+    # `on_exit` callbacks run LIFO, so the engine reload registered here runs
+    # AFTER the env restore registered below — the reload must be rehearsed
+    # by the canary again. (`after` cannot do this: try/after scoping hides
+    # the captured env from the cleanup block.)
+    on_exit(fn -> restore_engine() end)
+
     # The canary is bypassed so the refusal has to come from the in-VM load
-    # itself — the other half of the protection. Restored in this test's
-    # `after`, which must run before `restore_engine/0` reconfigures — an
-    # `on_exit` would run too late and reload the good model unrehearsed.
+    # itself — the other half of the protection. The exact captured value is
+    # restored, `:binary` included, rather than re-read at cleanup time.
     previous = Application.get_env(:cairn, Cairn.Native.Canary, [])
     Application.put_env(:cairn, Cairn.Native.Canary, Keyword.put(previous, :enabled, false))
+    on_exit(fn -> Application.put_env(:cairn, Cairn.Native.Canary, previous) end)
 
     {:error, {:model_load, message}} =
       Host.configure(%{
@@ -153,10 +159,6 @@ defmodule Cairn.DetectFailuresE2ETest do
 
     start_supervised!({Cairn.Camera, camera: camera, config: config, index: 0})
     assert_dark_branch_healthy_recording(id)
-  after
-    previous = Application.get_env(:cairn, Cairn.Native.Canary, [])
-    Application.put_env(:cairn, Cairn.Native.Canary, Keyword.delete(previous, :enabled))
-    restore_engine()
   end
 
   test "an absent inference library is a state the whole pipeline survives",
