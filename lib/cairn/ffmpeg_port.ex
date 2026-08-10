@@ -632,7 +632,7 @@ defmodule Cairn.FFmpegPort do
         else
           error ->
             Process.demonitor(ref, [:flush])
-            catch_stop(rtsp, client)
+            stop_client_async(rtsp, client)
             normalize_error(error)
         end
 
@@ -703,17 +703,19 @@ defmodule Cairn.FFmpegPort do
 
   defp kill_rtsp(%{rtsp: nil} = state), do: state
 
-  # Off this process's loop: the library's `stop/1` is a synchronous call
-  # into a client that may be wedged, and the camera's message loop must not
-  # be — `kill_port/1`'s TERM is non-blocking for the same reason. The
-  # monitor is already flushed, so teardown owes us nothing; the backstop
-  # kill bounds a graceful stop that never returns (the client holds only
-  # its socket, which dies with it).
   defp kill_rtsp(state) do
     Process.demonitor(state.rtsp_ref, [:flush])
-    client = state.rtsp
-    rtsp = rtsp_module(state)
+    stop_client_async(rtsp_module(state), state.rtsp)
+    %{state | rtsp: nil, rtsp_ref: nil, video_path: nil}
+  end
 
+  # Off this process's loop, every time: the library's `stop/1` is a
+  # synchronous call into a client that may be wedged, and the camera's
+  # message loop must not be — `kill_port/1`'s TERM is non-blocking for the
+  # same reason. The caller has already flushed its monitor, so teardown
+  # owes it nothing; the backstop kill bounds a graceful stop that never
+  # returns (the client holds only its socket, which dies with it).
+  defp stop_client_async(rtsp, client) do
     spawn(fn ->
       {_stopper, ref} = spawn_monitor(fn -> catch_stop(rtsp, client) end)
 
@@ -723,8 +725,6 @@ defmodule Cairn.FFmpegPort do
         3_000 -> Process.exit(client, :kill)
       end
     end)
-
-    %{state | rtsp: nil, rtsp_ref: nil, video_path: nil}
   end
 
   # `stop/1` on a client that already closed (or crashed) must not take the
