@@ -57,20 +57,24 @@ defmodule Cairn.BoardSoak do
     announce(opts)
 
     with :ok <- validate_source(opts),
-         :ok <- validate_sample_every(opts),
+         :ok <- validate_positive(opts, :sample_every, "BOARD_SOAK_SAMPLE_EVERY"),
+         :ok <- validate_positive(opts, :streams, "BOARD_SOAK_STREAMS"),
          :ok <- check_available() do
       with_engine(opts)
     end
   end
 
-  defp validate_sample_every(%{sample_every: n}) when is_integer(n) and n >= 1, do: :ok
+  # `streams: 0` is the sneaky one: `1..0` is a *descending* range, so an
+  # off-by-configuration would run two streams rather than none.
+  defp validate_positive(opts, key, env) do
+    case Map.fetch!(opts, key) do
+      n when is_integer(n) and n >= 1 ->
+        :ok
 
-  defp validate_sample_every(%{sample_every: other}) do
-    IO.puts(
-      "board-soak: refusing to run — BOARD_SOAK_SAMPLE_EVERY must be >= 1, got #{inspect(other)}"
-    )
-
-    {:error, :bad_sample_every}
+      other ->
+        IO.puts("board-soak: refusing to run — #{env} must be >= 1, got #{inspect(other)}")
+        {:error, {:bad_option, key}}
+    end
   end
 
   # Same rule (and the same bound) as `Cairn.Native.Host.source_dims/1`: a
@@ -105,7 +109,9 @@ defmodule Cairn.BoardSoak do
 
       results =
         1..opts.streams
-        |> Enum.map(&Task.async(fn -> run_stream(engine, spec, config, opts, &1, clip) end))
+        |> Enum.map(fn index ->
+          Task.async(fn -> run_stream(engine, spec, config, opts, index, clip) end)
+        end)
         |> Task.await_many(:infinity)
 
       summarize(results)
@@ -219,10 +225,8 @@ defmodule Cairn.BoardSoak do
     if now >= deadline do
       stats
     else
-      stats
-      |> feed_one(decoder_ref, stream_ref, au, pts)
-      |> maybe_progress(label, now)
-      |> then(&feed(decoder_ref, stream_ref, rest, clip, deadline, &1, label))
+      stats = stats |> feed_one(decoder_ref, stream_ref, au, pts) |> maybe_progress(label, now)
+      feed(decoder_ref, stream_ref, rest, clip, deadline, stats, label)
     end
   end
 
