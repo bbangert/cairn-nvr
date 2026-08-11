@@ -556,6 +556,15 @@ fn nv12_planes(frame: &AVFrame) -> Option<(&[u8], usize, &[u8], usize)> {
     let w = usize::try_from(frame.width).ok()?;
     let y_stride = usize::try_from(frame.linesize[0]).ok()?;
     let uv_stride = usize::try_from(frame.linesize[1]).ok()?;
+    // Odd dimensions go to swscale: the GL upload takes floor(w/2) chroma
+    // columns and floor-half rows, silently dropping the frame's last chroma
+    // sample where swscale resolves the siting properly. (The slice claims
+    // below stay within bounds either way — stride >= width bounds each claim
+    // by stride * rows, the minimum allocation — so this is a quality gate,
+    // not a safety one.)
+    if h % 2 != 0 || w % 2 != 0 {
+        return None;
+    }
     if frame.data[0].is_null() || frame.data[1].is_null() || y_stride < w || uv_stride < w {
         return None;
     }
