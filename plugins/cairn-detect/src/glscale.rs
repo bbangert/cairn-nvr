@@ -275,6 +275,7 @@ impl GlScaler {
                 glow::UNSIGNED_BYTE,
                 glow::PixelUnpackData::Slice(Some(y)),
             );
+            gl.generate_mipmap(glow::TEXTURE_2D);
             gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D, Some(uv_tex));
             gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, uv_row);
@@ -289,6 +290,7 @@ impl GlScaler {
                 glow::UNSIGNED_BYTE,
                 glow::PixelUnpackData::Slice(Some(uv)),
             );
+            gl.generate_mipmap(glow::TEXTURE_2D);
             gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
 
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
@@ -548,11 +550,18 @@ unsafe fn source_texture(
         .create_texture()
         .map_err(|e| anyhow!("creating a source texture: {e}"))?;
     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-    gl.tex_storage_2d(glow::TEXTURE_2D, 1, format, w, h);
+    // The full mip chain, and trilinear minification below. A single level
+    // with plain LINEAR samples 4 of the ~38 source pixels behind each output
+    // pixel at this pipeline's ~6x downscale — aliasing invisible to the eye
+    // that cost the detector ~27% of its score on the board (a 0.51 car read
+    // 0.37, under the 0.5 default floor). Mip trilinear is the GPU's
+    // approximation of the area filtering swscale applies when minifying.
+    let levels = 32 - i32::max(w, h).leading_zeros() as i32;
+    gl.tex_storage_2d(glow::TEXTURE_2D, levels, format, w, h);
     gl.tex_parameter_i32(
         glow::TEXTURE_2D,
         glow::TEXTURE_MIN_FILTER,
-        glow::LINEAR as i32,
+        glow::LINEAR_MIPMAP_LINEAR as i32,
     );
     gl.tex_parameter_i32(
         glow::TEXTURE_2D,
