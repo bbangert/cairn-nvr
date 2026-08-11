@@ -602,6 +602,32 @@ defmodule Cairn.FFmpegPortTest do
       assert_receive {:pipeline_started, _pipeline, _opts}, 2_000
     end
 
+    test "a ready queued during backoff cannot become the next session's source" do
+      id = "rb_#{System.unique_integer([:positive])}"
+      port = start_rtsp(id, port_opts: [backoff_min_ms: 800])
+
+      assert_receive {:rtsp_started, client, _}, 2_000
+      assert_receive {:pipeline_started, _pipeline, opts}, 2_000
+
+      send(port, {:rtsp, client, :session_closed})
+      assert_receive {:pipeline_msg, :rtsp_eos}, 2_000
+
+      # In the backoff window the epoch is still the dead session's — a ready
+      # the dying pipeline queued matches it and must not survive into the
+      # next spawn as a dead `source`.
+      send(port, {:rtsp_source_ready, opts[:epoch], self()})
+
+      assert_receive {:rtsp_started, client2, _}, 3_000
+      assert_receive {:pipeline_started, _pipeline2, _opts2}, 2_000
+
+      send(port, {:rtsp, client2, {"video", {[<<3>>], 0, true, 0}}})
+
+      # The new session's pipeline gets the sample (pended or direct); the
+      # impostor (us) never does.
+      assert_receive {:pipeline_msg, {:rtsp_sample, <<0, 0, 0, 1, 3>>, 0}}, 2_000
+      refute_received {:rtsp_sample, _, _}
+    end
+
     test "a stale ready handshake cannot claim the live session's samples" do
       id = "rf_#{System.unique_integer([:positive])}"
       port = start_rtsp(id)

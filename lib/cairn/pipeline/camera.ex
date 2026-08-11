@@ -1,14 +1,22 @@
 defmodule Cairn.Pipeline.Camera do
   @moduledoc """
-  Per-session membrane pipeline for one camera:
+  Per-session membrane pipeline for one camera. The ingest stage differs by
+  `ingest:`; everything from the tee on is identical:
 
-      BridgeSource ─ TS demux ─ tee ─┬─ parser(avc3) ─ CMAF ─ RingBufferSink
-                                     ├─ RTPOut (in-process WebRTC hub feed)
-                                     └─ Picker ─(manual)─ Decoder ─(manual)─ Inference ─ DetectSink
+      ingest: ffmpeg   BridgeSource ─ TS demux ──┐
+      ingest: rtsp     RtspSource ─ parser(au) ──┤
+                                                 │
+       tee ─┬─ parser(avc3) ─ CMAF ─ RingBufferSink
+            ├─ RTPOut (in-process WebRTC hub feed)
+            └─ Picker ─(manual)─ Decoder ─(manual)─ Inference ─ DetectSink
 
-  Started by `Cairn.FFmpegPort` alongside each ffmpeg spawn and torn down
-  with it — the TS demuxer's state is only valid for one continuous ffmpeg
-  session, so the pipeline shares the session's lifetime and its epoch.
+  Started by `Cairn.FFmpegPort` alongside each ingest session — an ffmpeg
+  spawn or an RTSP client — and torn down with it: the TS demuxer's state
+  (and equally an RTSP session's sample stream) is only valid for one
+  continuous session, so the pipeline shares the session's lifetime and its
+  epoch. The ffmpeg bridge wraps the stream in MPEG-TS because raw ES off a
+  pipe carries no timestamps (D-M8); the RTSP client delivers access units
+  with RTP pts natively, so its path is a parser instead of a demuxer.
 
   No tee consumer takes its input on a `:manual` pad. That is the invariant the
   detect branch depends on: a manual input behind our push source arms

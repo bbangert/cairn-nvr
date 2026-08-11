@@ -373,7 +373,10 @@ defmodule Cairn.FFmpegPort do
 
     case stalled?(state) do
       true ->
-        Logger.warning("camera #{state.camera.id}: stalled (no fragments), bouncing ffmpeg")
+        Logger.warning(
+          "camera #{state.camera.id}: stalled (no fragments), bouncing the ingest session"
+        )
+
         state = set_status(state, :stalled)
         {:noreply, enter_backoff(kill_port(state), :stall_bounce)}
 
@@ -575,10 +578,16 @@ defmodule Cairn.FFmpegPort do
 
     state = set_status(state, :connecting)
 
+    # `source: nil` here and in spawn_rtsp: a ready handshake queued by the
+    # just-terminated pipeline during backoff still matches the OLD epoch
+    # (it is minted fresh only now) and would otherwise leave `source`
+    # pointing at a dead pid — sending this session's early media into the
+    # void instead of pending it for the real handshake.
     state = %{
       state
       | port: port,
         os_pid: os_pid,
+        source: nil,
         got_fragment: false,
         init_seen: false,
         epoch: epoch
@@ -605,6 +614,7 @@ defmodule Cairn.FFmpegPort do
             rtsp_ref: ref,
             video_path: video_path,
             clock_rate: clock_rate,
+            source: nil,
             got_fragment: false,
             init_seen: false,
             epoch: epoch
