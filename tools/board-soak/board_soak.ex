@@ -57,9 +57,20 @@ defmodule Cairn.BoardSoak do
     announce(opts)
 
     with :ok <- validate_source(opts),
+         :ok <- validate_sample_every(opts),
          :ok <- check_available() do
       with_engine(opts)
     end
+  end
+
+  defp validate_sample_every(%{sample_every: n}) when is_integer(n) and n >= 1, do: :ok
+
+  defp validate_sample_every(%{sample_every: other}) do
+    IO.puts(
+      "board-soak: refusing to run — BOARD_SOAK_SAMPLE_EVERY must be >= 1, got #{inspect(other)}"
+    )
+
+    {:error, :bad_sample_every}
   end
 
   # Same rule (and the same bound) as `Cairn.Native.Host.source_dims/1`: a
@@ -232,7 +243,7 @@ defmodule Cairn.BoardSoak do
         stats |> bump(:aus) |> bump(:frames) |> push(stream_ref, frame)
 
       {:error, reason} ->
-        bump_error(stats, reason)
+        stats |> bump(:aus) |> bump_error(reason)
     end
   end
 
@@ -459,8 +470,22 @@ defmodule Cairn.BoardSoak do
       :error ->
         case System.get_env(env) do
           nil -> Map.fetch!(@defaults, key)
-          value -> String.to_integer(value)
+          value -> parse_integer(env, value, Map.fetch!(@defaults, key))
         end
+    end
+  end
+
+  defp parse_integer(env, value, default) do
+    case Integer.parse(value) do
+      {n, ""} ->
+        n
+
+      _not_an_integer ->
+        IO.puts(
+          "board-soak: ignoring #{env}=#{inspect(value)} — not an integer; using #{inspect(default)}"
+        )
+
+        default
     end
   end
 
