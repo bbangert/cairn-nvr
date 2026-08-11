@@ -397,6 +397,10 @@ impl RgbScaler {
             return None;
         }
         if matches!(self.gl, GlState::Untried) {
+            // Off *before* the probe: if anything below unwinds, the state
+            // must not read as still-untried, or the next frame repeats the
+            // fault at frame rate.
+            self.gl = GlState::Off;
             self.gl = match crate::glscale::GlScaler::new(self.spec.size) {
                 Ok(scaler) => {
                     note!("scaler: GPU (GLES) path active for NV12 frames");
@@ -543,24 +547,30 @@ impl RgbScaler {
 /// `hwdecode::HwBackend::filter_spec` is where that plane is produced.
 /// The two NV12 planes as slices, or `None` for a frame that does not carry
 /// both — handed back to the caller as "use swscale", never an error, because
-/// a frame shape this function does not recognise is exactly what the CPU
-/// path exists to handle.
+/// a frame shape this function does not recognise (negative linesizes
+/// included: ffmpeg spells bottom-up images that way, and `try_from` refuses
+/// them here) is exactly what the CPU path exists to handle.
 #[cfg(feature = "gles")]
 fn nv12_planes(frame: &AVFrame) -> Option<(&[u8], usize, &[u8], usize)> {
     let h = usize::try_from(frame.height).ok()?;
+    let w = usize::try_from(frame.width).ok()?;
     let y_stride = usize::try_from(frame.linesize[0]).ok()?;
     let uv_stride = usize::try_from(frame.linesize[1]).ok()?;
-    if frame.data[0].is_null() || frame.data[1].is_null() || y_stride == 0 || uv_stride == 0 {
+    if frame.data[0].is_null() || frame.data[1].is_null() || y_stride < w || uv_stride < w {
         return None;
     }
-    // SAFETY: libavcodec's NV12 frames allocate plane 0 as `linesize[0] *
-    // height` and plane 1 as `linesize[1] * ceil(height / 2)`; both pointers
-    // were just null-checked, and the frame outlives the returned borrows.
+    // SAFETY: the pointers were just null-checked and the frame outlives the
+    // returned borrows. The last row is claimed at `width`, not `stride`:
+    // libavcodec's `apply_cropping` can shift `data[0]` right, and
+    // `stride * height` would then end past the allocation by exactly the
+    // crop — `stride * (h - 1) + width` is what every row-wise reader
+    // (GL upload included) actually touches.
     unsafe {
+        let uv_rows = h.div_ceil(2);
         Some((
-            slice::from_raw_parts(frame.data[0] as *const u8, y_stride * h),
+            slice::from_raw_parts(frame.data[0] as *const u8, y_stride * (h - 1) + w),
             y_stride,
-            slice::from_raw_parts(frame.data[1] as *const u8, uv_stride * h.div_ceil(2)),
+            slice::from_raw_parts(frame.data[1] as *const u8, uv_stride * (uv_rows - 1) + w),
             uv_stride,
         ))
     }

@@ -4,7 +4,7 @@
 //! memory ([`crate::hwdecode`]'s module doc), and on the QCS6490 that memory
 //! is an uncached capture buffer: swscale's scattered bilinear taps over it
 //! cost ~50 ms a frame, most of the per-camera CPU bill. The same scale as
-//! one GPU pass costs ~0.6 ms on that board's Adreno 643L
+//! the GPU side costs single-digit milliseconds on that board's Adreno 643L (measured ~10.7 ms per sampled frame end to end, upload of the uncached capture buffer included — the upload dominates)
 //! (`.claude/plans/membrane-port/research/spikes/on-device-resize.md`), and
 //! uploading the planes is a single sequential pass over the uncached buffer
 //! instead of swscale's re-reads. This module is that pass: Y and UV planes
@@ -122,7 +122,7 @@ struct SourcePlanes {
 /// channel: either a full-resolution copy of exactly the uncached buffer this
 /// module exists to touch once, or smuggled pointers whose lifetime argument
 /// is the same promise bind-per-call makes, moved somewhere harder to see. A
-/// make-current pair on Mesa is microseconds against the ~0.6 ms scale.
+/// make-current pair on Mesa is microseconds against the milliseconds-scale pass.
 ///
 /// ## The display is never terminated
 ///
@@ -188,16 +188,23 @@ impl GlScaler {
             .context("creating the GLES3 context")?;
 
         // From here the context must be destroyed on any failure; GL objects
-        // need no individual cleanup because the context owns them all.
-        let built = Bound::new(&egl, display, context)
-            .and_then(|bound| {
+        // need no individual cleanup because the context owns them all. The
+        // build is caught because glow's loader really panics on a null
+        // `glGetString(GL_VERSION)` (a broken driver), and an unwind here
+        // would skip the destroy arm below — the one leak this function can
+        // make. `Bound`'s guard releases the context during the unwind, so
+        // catching is safe.
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Bound::new(&egl, display, context).and_then(|bound| {
                 // SAFETY: `bound` holds the context current until the state
                 // is built.
                 let state = unsafe { build_pass(&egl, target_w, target_h) };
                 drop(bound);
                 state
             })
-            .context("building the GL scale pass");
+        }))
+        .unwrap_or_else(|_panic| Err(anyhow!("the GL driver panicked while probing")))
+        .context("building the GL scale pass");
         let (gl, program, fbo, color) = match built {
             Ok(state) => state,
             Err(error) => {
@@ -550,14 +557,7 @@ unsafe fn source_texture(
         .create_texture()
         .map_err(|e| anyhow!("creating a source texture: {e}"))?;
     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-    // The full mip chain, and trilinear minification below. A single level
-    // with plain LINEAR samples 4 of the ~38 source pixels behind each output
-    // pixel at this pipeline's ~6x downscale — aliasing invisible to the eye
-    // that cost the detector ~27% of its score on the board (a 0.51 car read
-    // 0.37, under the 0.5 default floor). Mip trilinear is the GPU's
-    // approximation of the area filtering swscale applies when minifying.
-    let levels = 32 - i32::max(w, h).leading_zeros() as i32;
-    gl.tex_storage_2d(glow::TEXTURE_2D, levels, format, w, h);
+    gl.tex_storage_2d(glow::TEXTURE_2D, mip_levels(w, h), format, w, h);
     gl.tex_parameter_i32(
         glow::TEXTURE_2D,
         glow::TEXTURE_MIN_FILTER,
@@ -579,6 +579,18 @@ unsafe fn source_texture(
         glow::CLAMP_TO_EDGE as i32,
     );
     Ok(texture)
+}
+
+/// The full mip chain for a `w` x `h` texture: `floor(log2(max)) + 1`.
+///
+/// A chain, and trilinear minification with it, because a single level with
+/// plain LINEAR samples 4 of the ~38 source pixels behind each output pixel
+/// at this pipeline's ~6x downscale — aliasing invisible to the eye that cost
+/// the detector ~27% of its score on the board (a 0.51 car read 0.37, under
+/// the 0.5 default floor). Mip trilinear is the GPU's approximation of the
+/// area filtering swscale applies when minifying.
+fn mip_levels(w: i32, h: i32) -> i32 {
+    32 - i32::max(w, h).leading_zeros() as i32
 }
 
 /// One flag is enough: GL keeps error flags until read, so a single check
@@ -754,6 +766,18 @@ mod tests {
     /// container has no libEGL, so this walks the `Err` arm; on a host with
     /// working GL (some CI images ship one) construction succeeding and
     /// dropping cleanly is the same property from the other side.
+    #[test]
+    fn mip_levels_is_the_full_chain_at_every_edge_dimension() {
+        // floor(log2(max)) + 1: the values GLES3's TexStorage2D accepts for
+        // these extents, including non-powers-of-two and the degenerate 1x1.
+        assert_eq!(mip_levels(1, 1), 1);
+        assert_eq!(mip_levels(2, 1), 2);
+        assert_eq!(mip_levels(416, 312), 9);
+        assert_eq!(mip_levels(2560, 1920), 12);
+        assert_eq!(mip_levels(4096, 4096), 13);
+        assert_eq!(mip_levels(4097, 1), 13);
+    }
+
     #[test]
     fn new_reports_a_missing_gpu_as_an_error() {
         match GlScaler::new(TARGET) {

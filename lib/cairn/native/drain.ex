@@ -22,27 +22,50 @@ defmodule Cairn.Native.Drain do
   require Logger
 
   @drain_timeout_ms 5_000
+  # The supervisor's patience must exceed terminate/2's worst case — two
+  # sequential drains — or it kills this process mid-drain and silently skips
+  # the second library, reopening the exact race the module closes. Derived,
+  # not restated, so the numbers cannot drift apart.
+  @shutdown_ms 2 * @drain_timeout_ms + 1_000
+
+  def child_spec(opts) do
+    %{
+      id: __MODULE__,
+      start: {__MODULE__, :start_link, [opts]},
+      shutdown: @shutdown_ms
+    }
+  end
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
     # Without trapping, a supervisor shutdown kills this process before
     # `terminate/2` runs — the flag is the whole mechanism.
     Process.flag(:trap_exit, true)
-    {:ok, %{}}
+    {:ok, %{notify: Keyword.get(opts, :notify)}}
   end
 
   @impl true
-  def terminate(_reason, _state) do
-    drain(CairnOrt)
-    drain(Cairn.Native)
+  def terminate(_reason, state) do
+    drain(CairnOrt, state)
+    drain(Cairn.Native, state)
   end
 
-  defp drain(module) do
-    if module.available?() and not module.drain_teardown(@drain_timeout_ms) do
+  # `:logger` lives outside this application's tree, so the warning below is
+  # still deliverable this late in the shutdown.
+  defp drain(module, state) do
+    drained = not module.available?() or module.drain_teardown(@drain_timeout_ms)
+
+    # A test-only observable: terminate/2 has no return anyone reads, and this
+    # module deliberately calls the concrete NIF modules, so without the
+    # notification a no-op terminate would be indistinguishable from a working
+    # one (the review's W5).
+    if pid = state[:notify], do: send(pid, {:drained, module, drained})
+
+    unless drained do
       # The halt proceeds regardless — this is the one warning that says a
       # crash or hang in the next moments is the teardown race, not a new bug.
       Logger.warning(

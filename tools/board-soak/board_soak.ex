@@ -69,8 +69,11 @@ defmodule Cairn.BoardSoak do
     # that follows this return never races the teardown thread (the observed
     # exit-time abort/hang on the board).
     :erlang.garbage_collect()
-    Cairn.Native.available?() and Cairn.Native.drain_teardown(10_000)
-    CairnOrt.available?() and CairnOrt.drain_teardown(10_000)
+
+    native = not Cairn.Native.available?() or Cairn.Native.drain_teardown(10_000)
+    ort = not CairnOrt.available?() or CairnOrt.drain_teardown(10_000)
+    IO.puts("board-soak: drains native=#{native} ort=#{ort}")
+
     result
   end
 

@@ -443,6 +443,8 @@ defmodule Cairn.BoardPipeline do
     GenServer.stop(host)
     # The host's stream closes run in tasks that outlive it; give them the
     # moment they need before the drains below account for their drops.
+    # Grace for the ResourceGuard's async cleanups and the host's close tasks;
+    # the bounded drains below are the actual backstop if 500 ms was not it.
     Process.sleep(500)
     result
   end
