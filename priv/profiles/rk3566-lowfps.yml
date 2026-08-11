@@ -17,6 +17,14 @@ model:
   rknn: models/yolox_nano_rk3566.rknn
 model_profile: yolox
 input_size: 416
+# No `decoder:` here, for a different reason than rk3576.yml's: this board
+# decodes through Rockchip's MPP (`/dev/mpp_service`), which reaches ffmpeg only
+# in the `ffmpeg-rockchip` fork as `h264_rkmpp`. The menu has no name for it
+# because our builds have no such decoder, so naming one would be a config error
+# rather than a hardware choice. Whether a light tier wants that fork is task
+# 5.4's question, and spike 0.4 warns that the surrounding work there is
+# device-node plumbing (Frigate #18878 allocated a VPU session that consumed 0
+# MiB — the nodes were not exposed, and nothing said so).
 labels: models/coco.names
 # Declared, pending on-hardware measurement. The model zoo claims 34 fps for
 # yolov8n@640 on this NPU while Frigate's real-world reports put inference at

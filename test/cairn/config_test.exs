@@ -1915,6 +1915,19 @@ defmodule Cairn.ConfigTest do
       # block speaks, and what it says is "nothing runs" (D-P8).
       assert profile.stages == %{}
     end
+
+    test "qcs6490 is the only shipped profile that names a decoder" do
+      assert {:ok, config, []} = Config.from_map(base_map())
+
+      # Naming one is a requirement on the membrane path, so it belongs only
+      # where a decode path has been measured — Venus, spike 0.3. The other
+      # three leave it unset and take `auto`'s fallback.
+      assert config.profiles["qcs6490"].decoder == "v4l2"
+
+      for name <- ["generic-ort", "rk3566-lowfps", "rk3576"] do
+        assert config.profiles[name].decoder == nil, "#{name} names a decoder"
+      end
+    end
   end
 
   describe "windows/2 and retention_days/3" do

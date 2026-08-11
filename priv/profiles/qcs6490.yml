@@ -22,6 +22,15 @@ model:
 # — which is exactly what the capability table's first rule says.
 model_profile: yolov10
 input_size: 640
+# Venus, through ffmpeg's `h264_v4l2m2m`. The one decode field cairn ships with a
+# measurement behind it rather than a declaration: spike 0.3 decoded the live
+# fleet concurrently on this ASIC at 59 and 47 fps for about 2% CPU, against
+# roughly 30% of a core per camera in software. Named rather than left at `auto`
+# because on a membrane camera a named decoder is a requirement — if Venus is not
+# there, detection stops and says so, instead of quietly eating the CPU the model
+# needs. `auto` would reach the same decoder on this board (aarch64 Linux probes
+# v4l2 and nothing else); what it would not do is notice its absence.
+decoder: v4l2
 labels: models/coco.names
 # Declared, pending on-hardware measurement. A reported YOLOv5s@480 INT8 raw
 # inference of ~527 us, and full-pipeline claims of 100-300 fps for the small

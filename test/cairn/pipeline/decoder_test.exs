@@ -60,6 +60,15 @@ defmodule Cairn.Pipeline.DecoderTest do
 
   defp playing(ctx, state), do: Decoder.handle_playing(ctx.ctx, state)
 
+  # What the H.264 parser sends ahead of the first access unit, and now what
+  # opens the decoder: a hardware one needs the source geometry at open.
+  defp declare(ctx, state, source \\ {2560, 1920}) do
+    {w, h} = source
+    format = %Membrane.H264{width: w, height: h, alignment: :au}
+    {_actions, state} = Decoder.handle_stream_format(:input, format, ctx.ctx, state)
+    state
+  end
+
   defp feed(ctx, state, pts) do
     Decoder.handle_buffer(:input, %Buffer{payload: @keyframe, pts: pts}, ctx.ctx, state)
   end
@@ -71,12 +80,19 @@ defmodule Cairn.Pipeline.DecoderTest do
   describe "the decoder's session" do
     setup ctx, do: Map.put(ctx, :host, start_host())
 
-    test "opens against the host's engine on playing and demands one AU", ctx do
+    test "demands one AU on playing, and opens when the stream format lands", ctx do
       {actions, state} = playing(ctx, element(ctx))
+
+      assert actions == [demand: {:input, 1}]
+      # Nothing yet: opening here is what handed a V4L2 M2M decoder a 0x0
+      # geometry, which it accepts and then fails every frame on.
+      refute_receive {:open_decoder, _camera_id, _params}
+      assert state.decoder == :closed
+
+      state = declare(ctx, state)
 
       camera_id = ctx.camera_id
       assert_receive {:open_decoder, ^camera_id, _params}
-      assert actions == [demand: {:input, 1}]
       assert %{ref: _, module: NativeStub} = state.decoder
       # the gate's rate is the host's `sample_fps`, not a second config knob
       assert state.gate.interval_ns == div(1_000_000_000, 5)
@@ -84,9 +100,12 @@ defmodule Cairn.Pipeline.DecoderTest do
 
     test "the scene config reaches the crate: the motion knobs live there", ctx do
       motion = ~s({"enabled":true})
-      playing(ctx, element(ctx, stream_params: %{motion_json: motion}))
 
-      # …alongside the engine's resolved spec, spelled as wire terms.
+      {_actions, state} = playing(ctx, element(ctx, stream_params: %{motion_json: motion}))
+      _state = declare(ctx, state)
+
+      # …alongside the engine's resolved spec, spelled as wire terms, and the
+      # source geometry, which is the camera's rather than the model's.
       assert_receive {:open_decoder, _camera_id,
                       %{
                         motion_json: ^motion,
@@ -95,8 +114,56 @@ defmodule Cairn.Pipeline.DecoderTest do
                         height: 4,
                         resize: "letterbox",
                         resize_pad: 114,
-                        sample_fps: 5
+                        sample_fps: 5,
+                        source_width: 2560,
+                        source_height: 1920
                       }}
+    end
+
+    test "a source that changes geometry gets a new decoder, not a new SPS", ctx do
+      {_actions, state} = playing(ctx, element(ctx))
+      state = declare(ctx, state)
+      assert_receive {:open_decoder, _camera_id, %{source_width: 2560}}
+      %{ref: first} = state.decoder
+
+      state = declare(ctx, state, {1280, 720})
+
+      assert_receive {:close_decoder, ^first}
+      assert_receive {:open_decoder, _camera_id, %{source_width: 1280, source_height: 720}}
+      assert %{ref: _} = state.decoder
+      # Immediately, not on the fault cooldown: this is a reconfiguration.
+      assert state.retry_at == nil
+    end
+
+    test "the same geometry restated does not churn the decoder", ctx do
+      {_actions, state} = playing(ctx, element(ctx))
+      state = declare(ctx, state)
+      assert_receive {:open_decoder, _camera_id, _params}
+      # The handler tracked what it opened for — this is what makes the
+      # restatement below a real comparison and not an idle callback, and it
+      # is the assertion that fails against a handler that ignores formats.
+      assert state.source == {2560, 1920}
+      %{ref: first} = state.decoder
+
+      state = declare(ctx, state)
+
+      refute_receive {:close_decoder, _ref}
+      assert %{ref: ^first} = state.decoder
+      assert state.source == {2560, 1920}
+    end
+
+    test "a parser that declares no geometry still opens, as software decode needs none",
+         ctx do
+      {_actions, state} = playing(ctx, element(ctx))
+      format = %Membrane.H264{alignment: :au}
+      {_actions, state} = Decoder.handle_stream_format(:input, format, ctx.ctx, state)
+
+      # Nothing to reopen for, so the open waits for the first access unit —
+      # where it always was for a source whose geometry nobody declared.
+      {_actions, state} = feed(ctx, state, 1)
+
+      assert_receive {:open_decoder, _camera_id, %{source_width: nil, source_height: nil}}
+      assert %{ref: _} = state.decoder
     end
 
     test "a refused open costs the AU, not the session", ctx do
@@ -114,6 +181,7 @@ defmodule Cairn.Pipeline.DecoderTest do
 
     test "a stream-fatal error closes the handle and reopens on the next AU", ctx do
       {_actions, state} = playing(ctx, element(ctx))
+      state = declare(ctx, state)
       assert_receive {:open_decoder, _camera_id, _params}
 
       control(%{decode_au: fn _d, _au, _pts, _s -> {:error, {:panicked, "stage panicked"}} end})
@@ -129,6 +197,108 @@ defmodule Cairn.Pipeline.DecoderTest do
       {_actions, state} = feed(ctx, state, 2)
       assert %{ref: _} = state.decoder
       assert_receive {:open_decoder, _camera_id, _params}
+    end
+
+    test "a decoder that completes nothing at all is called out once", ctx do
+      {_actions, state} = playing(ctx, element(ctx))
+      state = declare(ctx, state)
+      assert_receive {:open_decoder, _camera_id, _params}
+
+      # The shape a V4L2 M2M decoder opened without geometry has: it accepts
+      # every access unit and completes no frame, and every one of those is a
+      # *tolerated* error, so nothing else in the element would ever say so.
+      control(%{decode_au: fn _d, _au, _pts, _s -> {:ok, {false, nil}} end})
+
+      # The send smuggles the final state out of the captured fun; same-process
+      # and synchronous, so it is in the mailbox before capture_log returns.
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          state = Enum.reduce(1..400, state, fn pts, state -> elem(feed(ctx, state, pts), 1) end)
+          send(self(), {:final, state})
+        end)
+
+      assert_receive {:final, state}
+      assert state.blind?
+      assert log =~ "completed no frames in 400 access units"
+
+      # Once per open, not once per access unit.
+      log = ExUnit.CaptureLog.capture_log(fn -> feed(ctx, state, 401) end)
+      refute log =~ "completed no frames"
+    end
+
+    test "a decoder that completes frames is never called blind", ctx do
+      {_actions, state} = playing(ctx, element(ctx))
+      state = declare(ctx, state)
+      assert_receive {:open_decoder, _camera_id, _params}
+
+      state = Enum.reduce(1..400, state, fn pts, state -> elem(feed(ctx, state, pts), 1) end)
+
+      refute state.blind?
+      assert state.completed == 400
+    end
+
+    test "a fatal-error reopen starts the blind count from zero", ctx do
+      {_actions, state} = playing(ctx, element(ctx))
+      state = declare(ctx, state)
+      assert_receive {:open_decoder, _camera_id, _params}
+
+      # March to the edge of the blind threshold without completing a frame...
+      control(%{decode_au: fn _d, _au, _pts, _s -> {:ok, {false, nil}} end})
+      state = Enum.reduce(1..399, state, fn pts, state -> elem(feed(ctx, state, pts), 1) end)
+      assert state.since_open == 399
+      refute state.blind?
+
+      # ...then die and reopen (cooldown 0). A reopen that kept the old count
+      # would call the fresh decoder blind on its first quiet access unit.
+      control(%{decode_au: fn _d, _au, _pts, _s -> {:error, {:panicked, "stage panicked"}} end})
+      {_actions, state} = feed(ctx, state, 400)
+      assert state.decoder == :closed
+
+      control(%{decode_au: nil})
+      {_actions, state} = feed(ctx, state, 401)
+      assert %{ref: _} = state.decoder
+      assert state.since_open <= 1
+      refute state.blind?
+    end
+
+    test "a geometry change bypasses a live cooldown", ctx do
+      control(%{
+        open_decoder: {:error, {:open_stream, "decoder v4l2 was named but did not open"}}
+      })
+
+      {_actions, state} = playing(ctx, element(ctx, reopen_cooldown_ms: 60_000))
+      state = declare(ctx, state)
+
+      # The open was refused, so the camera is waiting out a cooldown no
+      # access unit will beat...
+      assert_receive {:open_decoder, _camera_id, %{source_width: 2560}}
+      assert state.decoder == :closed
+      assert is_integer(state.retry_at)
+      {_actions, state} = feed(ctx, state, 1)
+      refute_receive {:open_decoder, _camera_id, _params}
+
+      # ...but a reconfigured camera must not wait out a verdict on its OLD
+      # geometry.
+      state = declare(ctx, state, {1280, 720})
+
+      assert_receive {:open_decoder, _camera_id, %{source_width: 1280}}
+      assert state.decoder == :closed
+    end
+
+    test "a parser that starts declaring geometry reopens the SPS-taught decoder", ctx do
+      {_actions, state} = playing(ctx, element(ctx))
+      format = %Membrane.H264{alignment: :au}
+      {_actions, state} = Decoder.handle_stream_format(:input, format, ctx.ctx, state)
+      {_actions, state} = feed(ctx, state, 1)
+      assert_receive {:open_decoder, _camera_id, %{source_width: nil}}
+      %{ref: first} = state.decoder
+
+      # One deliberate churn: the running decoder was healthy, but it was
+      # opened for a geometry nobody had confirmed.
+      state = declare(ctx, state)
+
+      assert_receive {:close_decoder, ^first}
+      assert_receive {:open_decoder, _camera_id, %{source_width: 2560}}
     end
 
     test "a per-frame error is counted and the session keeps running", ctx do

@@ -38,7 +38,7 @@ defmodule Cairn.Pipeline.Decoder do
 
   Every access unit is decoded — a stateful decoder needs its references —
   but only frames clearing `Cairn.Pipeline.SampleGate` (`sample_fps`, decided
-  by the `Cairn.Native.Host.open_decoder/3` reply) are converted and emitted:
+  by the `Cairn.Native.Host.open_decoder/4` reply) are converted and emitted:
   sampling decides model passes, not decode. Both pads are `:manual`, and the
   element demands access units at line rate regardless of downstream demand —
   one AU per `decode_au`, one slot for the emitted frame. A frame the sink
@@ -50,7 +50,7 @@ defmodule Cairn.Pipeline.Decoder do
   The native decoder opens against `Cairn.Native.Host`'s engine (same model,
   same resolved input spec as the inference stream) and reopens on a
   cooldown after stream-fatal errors, exactly as `Cairn.Pipeline.Inference`
-  does for its half. Two liveness notes: the `Host.open_decoder/3` call is a
+  does for its half. Two liveness notes: the `Host.open_decoder/4` call is a
   plain `GenServer.call` — the host's liveness is application-supervised (it
   sits outside every camera's tree), so a missing host is a boot-order fault
   that should crash this element, not a state to retry around. And
@@ -100,6 +100,12 @@ defmodule Cairn.Pipeline.Decoder do
   # it never touches the model.
   @fatal [:closed, :poisoned, :panicked]
 
+  # Access units a decoder may complete nothing from before it is called blind.
+  # Comfortably past a fleet GOP (the longest measured is 5 s, ~150 frames) so
+  # that a stream joined mid-GOP, which really does decode nothing until the
+  # next IDR, never trips it.
+  @blind_after 400
+
   @impl true
   def handle_init(_ctx, opts) do
     {[],
@@ -112,26 +118,71 @@ defmodule Cairn.Pipeline.Decoder do
        gate: nil,
        retry_at: nil,
        format: nil,
+       source: nil,
        pending: nil,
        demand: 0,
        sampled: 0,
        emitted: 0,
        replaced: 0,
-       errors: 0
+       errors: 0,
+       since_open: 0,
+       completed: 0,
+       blind?: false
      }}
   end
 
+  # No decoder yet: the H.264 stream format carries the source geometry a
+  # hardware decoder needs at open, and Membrane guarantees it arrives before
+  # the first buffer.
   @impl true
-  def handle_playing(ctx, state) do
-    {[demand: {:input, 1}], ensure_decoder(state, ctx)}
+  def handle_playing(_ctx, state) do
+    {[demand: {:input, 1}], state}
   end
 
   # Swallowed, not forwarded (the filter default would forward it onto the
-  # RawVideo pad): the output format is minted here from the first decoded
-  # frame's geometry, which the decoder learns from the SPS — nothing upstream
-  # declares it.
+  # RawVideo pad): the output format is minted here from the decoded frame's
+  # geometry, which is the model's rect and not the camera's.
+  #
+  # The geometry is kept, though. A decoder built for one source geometry is
+  # wrong for another, so a camera reconfigured mid-stream gets a new decoder
+  # rather than a new SPS through an old one — immediately, not on the fault
+  # cooldown, since this is a reconfiguration and not a failure. That includes
+  # a decoder learning its geometry for the first time (nil -> real): the
+  # SPS-taught decoder it replaces was healthy, and one reopen at the moment a
+  # parser starts declaring is the cost of never running hardware decode
+  # against a geometry nobody confirmed.
   @impl true
-  def handle_stream_format(:input, %Membrane.H264{}, _ctx, state), do: {[], state}
+  def handle_stream_format(:input, %Membrane.H264{} = format, ctx, state) do
+    known = state.source
+
+    case source_of(format) do
+      ^known -> {[], state}
+      source -> {[], state |> reopen_for(source, ctx) |> ensure_decoder(ctx)}
+    end
+  end
+
+  defp source_of(%Membrane.H264{width: w, height: h}) when is_integer(w) and is_integer(h),
+    do: {w, h}
+
+  # A parser that declared no geometry leaves the decoder to learn it from the
+  # SPS, which is what software decode did for three phases and hardware decode
+  # cannot do at all.
+  defp source_of(%Membrane.H264{}), do: nil
+
+  # Nothing is open, but the cooldown still clears: the failed open this
+  # camera is waiting out was made for the OLD geometry, and its verdict says
+  # nothing about the new one — `ensure_decoder` retries on the next callback.
+  defp reopen_for(%{decoder: :closed} = state, source, _ctx),
+    do: %{state | source: source, retry_at: nil}
+
+  defp reopen_for(state, source, ctx) do
+    Logger.info(
+      "camera #{state.camera_id}: source geometry #{inspect(state.source)} -> " <>
+        "#{inspect(source)}; reopening the decoder"
+    )
+
+    state |> drop_decoder(ctx) |> Map.put(:source, source) |> Map.put(:retry_at, nil)
+  end
 
   @impl true
   def handle_buffer(:input, %Buffer{pts: pts} = buffer, ctx, state) when is_integer(pts) do
@@ -178,7 +229,7 @@ defmodule Cairn.Pipeline.Decoder do
     case module.decode_au(ref, buffer.payload, buffer.pts, sample) do
       {:ok, {completed, frame}} ->
         state = if sample and completed, do: spend(state, now), else: state
-        admit(state, frame)
+        admit(count(state, completed), frame)
 
       {:error, {reason, message}} when reason in @fatal ->
         Logger.error(
@@ -188,9 +239,42 @@ defmodule Cairn.Pipeline.Decoder do
         {[], state |> drop_decoder(ctx) |> reopen_later()}
 
       {:error, _transient} ->
-        {[], %{state | errors: state.errors + 1}}
+        {[], count(%{state | errors: state.errors + 1}, false)}
     end
   end
+
+  # A decoder that has never completed a frame is the one failure this element
+  # has no other symptom for. Every per-frame decode error is *tolerated* by
+  # design — joining mid-GOP means feeding references that never arrived — so a
+  # decoder that fails all of them looks exactly like a stream that has not
+  # resynced yet, and says so once per fifty frames in the crate's log and
+  # nowhere else. That is how a QCS6490 board ran 761 access units to zero
+  # frames (`research/board-first-light.md`): the hardware decoder opened, and
+  # nothing above it could tell.
+  #
+  # Said once per open, not per frame, and not a restart: the remedy is an
+  # operator's (a decoder this host cannot really run), and reopening into the
+  # same wrong decoder would only bury the line.
+  defp count(%{completed: 0, blind?: false} = state, false) do
+    state = %{state | since_open: state.since_open + 1}
+
+    if state.since_open >= @blind_after do
+      Logger.error(
+        "camera #{state.camera_id}: the decoder has completed no frames in " <>
+          "#{state.since_open} access units — it opened but is decoding nothing; " <>
+          "detection is off for this camera"
+      )
+
+      %{state | blind?: true}
+    else
+      state
+    end
+  end
+
+  defp count(state, false), do: %{state | since_open: state.since_open + 1}
+
+  defp count(state, true),
+    do: %{state | since_open: state.since_open + 1, completed: state.completed + 1}
 
   defp spend(state, now),
     do: %{state | gate: SampleGate.spend(state.gate, now), sampled: state.sampled + 1}
@@ -254,7 +338,7 @@ defmodule Cairn.Pipeline.Decoder do
   defp ensure_decoder(state, ctx), do: open(state, ctx)
 
   defp open(state, ctx) do
-    case Host.open_decoder(state.host, state.camera_id, state.params) do
+    case Host.open_decoder(state.host, state.camera_id, state.params, state.source) do
       {:ok, %{ref: ref, module: module, sample_fps: sample_fps}} ->
         # Registered per open, so a crash between here and teardown still
         # frees the decoder — a hardware one holds GPU surfaces.
@@ -268,7 +352,10 @@ defmodule Cairn.Pipeline.Decoder do
           state
           | decoder: %{ref: ref, module: module},
             gate: SampleGate.new(sample_fps),
-            retry_at: nil
+            retry_at: nil,
+            since_open: 0,
+            completed: 0,
+            blind?: false
         }
 
       {:error, reason} ->
