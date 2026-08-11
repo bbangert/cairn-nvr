@@ -279,14 +279,16 @@ defmodule Cairn.Native.Host do
   # and a reopen racing the old handle's close costs nothing but memory the
   # destructor frees — unlike a stream, whose camera-id claim must land first.
   def handle_call({:open_decoder, camera_id, params, source}, _from, state) do
-    case NativeConfig.stream_params(params) do
-      {:ok, params} ->
-        result = do_open_decoder(state, camera_id, params, source_dims(source))
-        {:reply, result, record_decoder_outcome(state, camera_id, result)}
+    # Every refusal is recorded, the params-vocabulary one included: a config
+    # error repeats identically on each of the caller's retries, so this
+    # camera's status saying why beats it reading "ready" at 0 fps.
+    result =
+      case NativeConfig.stream_params(params) do
+        {:ok, params} -> do_open_decoder(state, camera_id, params, source_dims(source))
+        {:error, message} -> {:error, {:config, message}}
+      end
 
-      {:error, message} ->
-        {:reply, {:error, {:config, message}}, state}
-    end
+    {:reply, result, record_decoder_outcome(state, camera_id, result)}
   end
 
   def handle_call({:close_stream, camera_id}, _from, state) do
@@ -734,18 +736,29 @@ defmodule Cairn.Native.Host do
 
   defp do_open_decoder(state, _camera_id, _params, _source), do: {:error, state.engine_state}
 
-  # Total over every term: `source` is a positional arg no vocabulary validates,
-  # this runs inside the host's own `handle_call`, and this process's contract
-  # is that nothing here exits — so a malformed source is the caller's bug
-  # reported as a value, not an `elem/2` raise that takes the host down for
-  # every camera.
-  defp source_dims({width, height}) when is_integer(width) and is_integer(height),
-    do: {:ok, {width, height}}
+  # The codecpar fields these land on are i32, and the crate re-refuses at the
+  # same bound; checking here too turns an out-of-range pair into a config
+  # error instead of a `badarg` inside the NIF's own argument decode.
+  @max_source_dim 2_147_483_647
+
+  # Total over every term, bounds included: `source` is a positional arg no
+  # vocabulary validates, this runs inside the host's own `handle_call`, and
+  # this process's contract is that nothing here exits — so a malformed source
+  # is the caller's bug reported as a value, not a raise (`elem/2` on a
+  # non-tuple, or rustler's `badarg` decoding a negative into a `usize`) that
+  # takes the host down for every camera.
+  defp source_dims({width, height})
+       when is_integer(width) and is_integer(height) and width > 0 and height > 0 and
+              width <= @max_source_dim and height <= @max_source_dim,
+       do: {:ok, {width, height}}
 
   defp source_dims(nil), do: {:ok, {nil, nil}}
 
   defp source_dims(other),
-    do: {:error, "source must be {width, height} integers or nil, got #{inspect(other)}"}
+    do:
+      {:error,
+       "source must be positive {width, height} integers within i32 or nil, " <>
+         "got #{inspect(other)}"}
 
   defp record_decoder_outcome(state, camera_id, {:ok, _handle}),
     do: %{state | decoder_failures: Map.delete(state.decoder_failures, camera_id)}

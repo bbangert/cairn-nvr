@@ -167,6 +167,35 @@ defmodule Cairn.Native.HostTest do
       assert Host.status(host).engine == :ready
       assert %{^id => {:config, ^message}} = Host.status(host).decoder_failures
     end
+
+    test "an out-of-range source is refused before the NIF's own decode", %{id: id} do
+      host = start_host()
+      assert_receive {:init, _config}
+
+      # Negative and past-i32 pairs would both pass an is_integer guard and
+      # then raise badarg inside the NIF's argument decode — in the host's own
+      # handle_call.
+      for source <- [{0, 1920}, {-2560, 1920}, {2560, -1}, {2_147_483_648, 1920}] do
+        assert {:error, {:config, message}} = Host.open_decoder(host, id, %{}, source)
+        assert message =~ "positive"
+      end
+
+      # No open attempt ever reached the native module.
+      refute_received {:open_decoder, _camera_id, _params}
+      assert Host.status(host).engine == :ready
+    end
+
+    test "a params-vocabulary refusal is recorded like any other", %{id: id} do
+      host = start_host()
+      assert_receive {:init, _config}
+
+      assert {:error, {:config, message}} =
+               Host.open_decoder(host, id, %{typo: 1}, {2560, 1920})
+
+      # Same argument as the malformed source: this camera retries into the
+      # identical refusal for ever, so the surface must say why.
+      assert %{^id => {:config, ^message}} = Host.status(host).decoder_failures
+    end
   end
 
   describe "streams" do
