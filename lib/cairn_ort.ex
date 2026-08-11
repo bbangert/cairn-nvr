@@ -60,6 +60,7 @@ defmodule CairnOrt do
              open_stream: 3,
              push_frame: 4,
              close_stream: 1,
+             drain_teardown: 1,
              cpu_baseline_ms: 2}
 
   @typedoc """
@@ -135,6 +136,14 @@ defmodule CairnOrt do
 
   @spec close_stream(reference()) :: {:ok, boolean()} | {:error, {atom(), String.t()}}
   def close_stream(_stream), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  Wait (bounded) for every native drop deferred so far to finish — the exit
+  path's call, made before a halt so the VM never races the `cairn-teardown`
+  thread mid-drop (`Cairn.Native.Drain` is the caller in the app tree).
+  """
+  @spec drain_teardown(non_neg_integer()) :: boolean()
+  def drain_teardown(_timeout_ms), do: :erlang.nif_error(:nif_not_loaded)
 
   defp load_result, do: :persistent_term.get(@load_result, {:error, :not_loaded})
 

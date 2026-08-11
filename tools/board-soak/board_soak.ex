@@ -56,12 +56,22 @@ defmodule Cairn.BoardSoak do
     opts = options(opts)
     announce(opts)
 
-    with :ok <- validate_source(opts),
-         :ok <- validate_positive(opts, :sample_every, "BOARD_SOAK_SAMPLE_EVERY"),
-         :ok <- validate_positive(opts, :streams, "BOARD_SOAK_STREAMS"),
-         :ok <- check_available() do
-      with_engine(opts)
-    end
+    result =
+      with :ok <- validate_source(opts),
+           :ok <- validate_positive(opts, :sample_every, "BOARD_SOAK_SAMPLE_EVERY"),
+           :ok <- validate_positive(opts, :streams, "BOARD_SOAK_STREAMS"),
+           :ok <- check_available() do
+        with_engine(opts)
+      end
+
+    # The engine resource died with `with_engine`'s frame; a GC makes its
+    # deferred drop QUEUE now, and the drains make it RUN now — so the halt
+    # that follows this return never races the teardown thread (the observed
+    # exit-time abort/hang on the board).
+    :erlang.garbage_collect()
+    Cairn.Native.available?() and Cairn.Native.drain_teardown(10_000)
+    CairnOrt.available?() and CairnOrt.drain_teardown(10_000)
+    result
   end
 
   # `streams: 0` is the sneaky one: `1..0` is a *descending* range, so an

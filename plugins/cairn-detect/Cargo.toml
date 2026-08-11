@@ -20,6 +20,13 @@ anyhow = "1.0"
 libc = "0.2"
 # Typed errors for `infer::resolve`; `anyhow` still owns everything above it.
 thiserror = "2.0"
+# `glscale` only (the `gles` feature): both load their libraries at runtime —
+# `dynamic` dlopens libEGL, and glow is handed `eglGetProcAddress` — so the
+# board build cross-links with zero native GL inputs and a host without a GPU
+# fails at `GlScaler::new`, not at process start. Pinned exactly: nothing in
+# CI exercises the GL path, so a drift would only ever be caught on the board.
+khronos-egl = { version = "=6.0.0", features = ["dynamic"], optional = true }
+glow = { version = "=0.18.0", optional = true }
 
 [features]
 # Board (aarch64) builds: dlopen libonnxruntime.so at runtime (`ORT_DYLIB_PATH`)
@@ -29,6 +36,11 @@ thiserror = "2.0"
 # ORT libs at all. Dev and CI builds stay on the default static link — the QNN
 # code paths compile either way.
 ort-load-dynamic = ["ort/load-dynamic"]
+# The GPU NV12 scaler (`glscale`), for boards whose decoder hands back system
+# memory (v4l2m2m — see `hwdecode`'s module doc). Off by default: CI and x86
+# dev builds have no GPU to exercise it against, and the module's only
+# consumers are aarch64 board builds.
+gles = ["dep:khronos-egl", "dep:glow"]
 
 [profile.release]
 lto = "thin"

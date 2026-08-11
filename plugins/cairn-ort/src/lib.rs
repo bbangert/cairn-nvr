@@ -301,6 +301,18 @@ fn panic_message(payload: &Box<dyn Any + Send>) -> &str {
     }
 }
 
+/// Wait (bounded) for every native drop deferred so far to finish.
+///
+/// For the exit path only: callers halting the VM run this first, because a
+/// halt racing the teardown thread mid-drop is the observed exit-time abort
+/// and fastrpc hang on QCS6490. `true` means drained; `false` means the
+/// timeout passed with drops still running, and the caller halts into the
+/// race knowingly.
+#[rustler::nif(schedule = "DirtyIo")]
+fn drain_teardown(timeout_ms: u64) -> bool {
+    teardown::drain(std::time::Duration::from_millis(timeout_ms))
+}
+
 rustler::init!("Elixir.CairnOrt");
 
 #[cfg(test)]

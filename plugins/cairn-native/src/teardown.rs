@@ -47,6 +47,39 @@ fn drop_swallowing_panics<T>(value: T) {
     let _ = catch_unwind(AssertUnwindSafe(move || drop(value)));
 }
 
+/// Wait until every drop queued before this call has run, or `timeout` passes.
+///
+/// The exit path is why this exists: the queue's thread is detached, and a VM
+/// halting while it is mid-drop races process teardown against a native
+/// destructor. Observed on QCS6490 at exit, after all work completed, as both
+/// an abort (`double free or corruption`) and a hang inside fastrpc deinit —
+/// same race, different interleavings (`research/board-first-light.md`). The
+/// sentinel rides the same FIFO queue, so its drop proves every drop queued
+/// before it has already run.
+pub fn drain(timeout: std::time::Duration) -> bool {
+    let Some(queue) = queue() else {
+        // The thread never started, so every drop so far ran inline.
+        return true;
+    };
+    let (sink, done) = mpsc::sync_channel::<()>(1);
+    if queue.send(Box::new(Flush { sink })).is_err() {
+        // The worker is gone; sends fall back to inline drops, so nothing is
+        // queued to race.
+        return true;
+    }
+    done.recv_timeout(timeout).is_ok()
+}
+
+struct Flush {
+    sink: mpsc::SyncSender<()>,
+}
+
+impl Drop for Flush {
+    fn drop(&mut self) {
+        let _ = self.sink.send(());
+    }
+}
+
 /// The teardown thread's inbox, started on the first handle to be collected and
 /// `None` for the rest of the run if that spawn failed: retrying per drop would
 /// be retrying inside a destructor.
@@ -146,6 +179,29 @@ mod tests {
         // …and the thread never started, so there is nothing to send to
         let inline = catch_unwind(AssertUnwindSafe(|| defer_to(None, Explodes)));
         assert!(inline.is_ok(), "the inline drop unwound into C");
+    }
+
+    #[test]
+    fn drain_returns_once_everything_queued_before_it_has_dropped() {
+        let (sink, dropped) = sync_channel(1);
+        defer(Slow {
+            sink,
+            cost: Duration::from_millis(200),
+        });
+
+        assert!(drain(Duration::from_secs(10)), "drain timed out");
+        // FIFO means the sentinel's drop PROVES the slow drop already ran.
+        assert!(
+            dropped.try_recv().is_ok(),
+            "drain returned before the queued drop had run"
+        );
+    }
+
+    #[test]
+    fn drain_with_nothing_queued_answers_immediately() {
+        let started = Instant::now();
+        assert!(drain(Duration::from_secs(10)));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
