@@ -122,6 +122,8 @@ defmodule Cairn.MotionParityTest do
         encoding: "raw_bgr",
         resize: "letterbox",
         resize_pad: 114,
+        source_width: nil,
+        source_height: nil,
         motion_json: motion_json,
         sample_fps: sample_fps
       })

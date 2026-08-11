@@ -138,6 +138,66 @@ defmodule Cairn.Native.HostTest do
     end
   end
 
+  describe "the decoder-failure record" do
+    test "a refused open lands on status, and the next success clears it", %{id: id} do
+      host = start_host()
+      assert_receive {:init, _config}
+
+      refusal = {:open_stream, "decoder v4l2 was named but did not open"}
+      control(%{open_decoder: {:error, refusal}})
+      assert {:error, ^refusal} = Host.open_decoder(host, id, %{}, {2560, 1920})
+      assert Host.status(host).decoder_failures == %{id => refusal}
+
+      # The cooldown retry that succeeds is also what clears the surface.
+      control(%{open_decoder: nil})
+      assert {:ok, _handle} = Host.open_decoder(host, id, %{}, {2560, 1920})
+      assert Host.status(host).decoder_failures == %{}
+    end
+
+    test "a malformed source is a config error, not a host crash", %{id: id} do
+      host = start_host()
+      assert_receive {:init, _config}
+
+      assert {:error, {:config, message}} = Host.open_decoder(host, id, %{}, [2560, 1920])
+      assert message =~ "{width, height}"
+      # The host survived to answer — the failure was a value, not an exit —
+      # and the camera it strands is on the surface like any other refusal:
+      # a caller bug repeats identically on every retry, so status saying why
+      # beats a camera that reads healthy at 0 fps.
+      assert Host.status(host).engine == :ready
+      assert %{^id => {:config, ^message}} = Host.status(host).decoder_failures
+    end
+
+    test "an out-of-range source is refused before the NIF's own decode", %{id: id} do
+      host = start_host()
+      assert_receive {:init, _config}
+
+      # Negative and past-i32 pairs would both pass an is_integer guard and
+      # then raise badarg inside the NIF's argument decode — in the host's own
+      # handle_call.
+      for source <- [{0, 1920}, {-2560, 1920}, {2560, -1}, {2_147_483_648, 1920}] do
+        assert {:error, {:config, message}} = Host.open_decoder(host, id, %{}, source)
+        assert message =~ "positive"
+      end
+
+      # No open attempt ever reached the native module.
+      refute_received {:open_decoder, _camera_id, _params}
+      assert Host.status(host).engine == :ready
+    end
+
+    test "a params-vocabulary refusal is recorded like any other", %{id: id} do
+      host = start_host()
+      assert_receive {:init, _config}
+
+      assert {:error, {:config, message}} =
+               Host.open_decoder(host, id, %{typo: 1}, {2560, 1920})
+
+      # Same argument as the malformed source: this camera retries into the
+      # identical refusal for ever, so the surface must say why.
+      assert %{^id => {:config, ^message}} = Host.status(host).decoder_failures
+    end
+  end
+
   describe "streams" do
     test "open, push, close", %{id: id} do
       host = start_host()

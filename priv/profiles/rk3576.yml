@@ -13,6 +13,14 @@ model:
   rknn: models/yolox_nano_rk3576.rknn
 model_profile: yolox
 input_size: 416
+# No `decoder:` here, deliberately, where qcs6490.yml names one. This board's
+# merged mainline decode (`rkvdec` VDPU383, kernel 7.0+) is a V4L2 *stateless*
+# device driven through the request API, and the `v4l2` menu entry selects
+# ffmpeg's `h264_v4l2m2m` — the stateful M2M decoder, a different interface.
+# Which value is right here, and whether the board's ffmpeg build reaches its
+# decoder at all, is spike 0.4's on-board checklist item 3 and cannot be settled
+# from a desk. `auto` probes v4l2 and falls back to software, which is the honest
+# behaviour until someone runs it.
 labels: models/coco.names
 # Declared, pending on-hardware measurement — and the weakest number cairn
 # ships. `docs/npu-backends.md` found no official benchmark for this NPU at

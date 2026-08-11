@@ -8,6 +8,15 @@
 //! through system memory and eat the entire saving, so a backend without a
 //! GPU scaler is treated as unavailable rather than silently taking that
 //! path.
+//!
+//! v4l2m2m is the exception on both counts, by the nature of the interface:
+//! a stateful M2M codec decodes on the ASIC and hands back **system memory**
+//! (`scale_filter()` is `None`, so nothing refuses it), and every sampled
+//! frame is then scaled on the CPU — off an uncached capture buffer, which is
+//! most of the per-camera CPU bill on such boards
+//! (membrane-port `research/board-first-light.md`). It stays available
+//! because ASIC decode is still the cheap half; making the scale cheap on
+//! that path is its own work item (plan task 5.6).
 
 use std::ffi::{CStr, CString};
 use std::fmt;
@@ -325,6 +334,10 @@ impl Decoder for HwDecoder {
             Some((frame, source)) => self.rgb.rgb_from(&frame, source).map(Some),
             None => Ok(None),
         }
+    }
+
+    fn hw_backend(&self) -> Option<HwBackend> {
+        Some(self.backend)
     }
 }
 

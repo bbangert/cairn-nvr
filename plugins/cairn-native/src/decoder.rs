@@ -16,7 +16,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cairn_detect::decode::{self, Decoder, RgbSampled};
+use cairn_detect::decode::{self, Decoder, DecoderKind, RgbSampled};
 use cairn_detect::infer::InputSpec;
 use cairn_detect::motion::MotionVerdict;
 use cairn_detect::note;
@@ -274,32 +274,69 @@ fn sampled_frame(decoder: &mut dyn Decoder) -> (Option<AVFrame>, Option<anyhow::
     (sampled, first_error)
 }
 
-/// Open this stream's decoder against a bare H.264 stream description.
+/// Open this stream's decoder against a near-bare H.264 stream description.
 ///
 /// There is no container here to take stream parameters from — the caller is
 /// Membrane's H.264 parser, which delivers whole access units with SPS and PPS in
-/// band — so these parameters carry the codec and nothing else and the decoder
-/// learns its geometry from the first SPS. Both decode paths already tolerate a
-/// missing declared size.
+/// band — so these parameters carry the codec, and the geometry only when the
+/// caller had it to give.
+///
+/// Software decode never needs the geometry; it learns it from the first SPS,
+/// which is why this was bare for three phases. A V4L2 M2M decoder does: it
+/// configures its OUTPUT format as the codec context opens, and one opened at
+/// 0x0 opens *successfully* and then answers every frame with `AVERROR_BUG` —
+/// hardware decode that delivers nothing, past the fallback and past every
+/// health check ([`crate::config::DecoderParams::source`]).
 fn open_decoder(params: &DecoderParams) -> Result<Box<dyn Decoder>> {
     #[cfg(test)]
     panic_if_armed_for_open();
     let mut codecpar = AVCodecParameters::new();
     // SAFETY: `codecpar` is our own freshly allocated parameters struct, and
-    // both fields are plain enums with no ownership.
+    // every field written is a plain integer with no ownership.
     unsafe {
         let raw = codecpar.deref_mut();
         raw.codec_id = ffi::AV_CODEC_ID_H264;
         raw.codec_type = ffi::AVMEDIA_TYPE_VIDEO;
+        if let Some(source) = params.source {
+            raw.width = source.w as i32;
+            raw.height = source.h as i32;
+        }
     }
-    decode::open(
+    let decoder = decode::open(
         params.kind,
         &codecpar,
         params.spec,
         params.motion,
         params.sample_fps,
     )
-    .map_err(|e| NativeError::OpenStream(chain(&e)))
+    .map_err(|e| NativeError::OpenStream(chain(&e)))?;
+    require_named_hardware(params.kind, decoder.as_ref())?;
+    Ok(decoder)
+}
+
+/// Refuse a software fallback the caller did not ask for.
+///
+/// [`decode::open`] logs and falls back, which is the right answer for a host
+/// that may simply not have the hardware and the wrong one for a board profile:
+/// on QCS6490 the ASIC decodes the fleet for ~2% CPU where software decode is
+/// several times that per camera (spikes 0.3/board-first-light.md — decode is
+/// the term this choice controls; the conversion cost after it is paid on both
+/// paths), and nothing downstream reports which one ran.
+/// So on this path a named decoder is a requirement, as `backend: qnn` already
+/// is on the inference side, and `auto` stays the way to say "whatever works".
+/// The classic plugin keeps the fallback: its refusal would be a process exit
+/// into a restart loop, where here the detect branch goes dark, recording
+/// continues, and the reason reaches `cameras:status`
+/// (`Cairn.Native.Host` records it; `Cairn.Native.Status` headlines it).
+fn require_named_hardware(kind: DecoderKind, decoder: &dyn Decoder) -> Result<()> {
+    if matches!(kind, DecoderKind::Auto | DecoderKind::Sw) || decoder.hw_backend().is_some() {
+        return Ok(());
+    }
+    Err(NativeError::OpenStream(format!(
+        "decoder {kind} was named but did not open, and this path refuses the \
+         software fallback — check that the device and the hwaccel exist on this \
+         host, or name decoder: auto to accept software decode"
+    )))
 }
 
 /// Panic inside the *next* decoder open, where a driver actually can. The
@@ -389,6 +426,7 @@ fn unix_ms(at: SystemTime) -> i64 {
 mod tests {
     use super::*;
     use cairn_detect::decode::Sampled;
+    use cairn_detect::hwdecode::HwBackend;
     use std::time::Duration;
 
     /// A decoder that completes a fixed number of frames per packet, which is
@@ -407,6 +445,10 @@ mod tests {
         /// bound exists for, a transient one is what it keeps draining past.
         fail_once: bool,
         calls: usize,
+        /// What it answers [`Decoder::hw_backend`] with — `None`, a software
+        /// decoder, unless a test is asking what happens when the named
+        /// backend did open.
+        hw: Option<HwBackend>,
     }
 
     impl Decoder for Burst {
@@ -440,6 +482,10 @@ mod tests {
         fn to_rgb(&mut self, _frame: AVFrame) -> anyhow::Result<Option<RgbSampled>> {
             self.conversions += 1;
             Ok(None)
+        }
+
+        fn hw_backend(&self) -> Option<HwBackend> {
+            self.hw
         }
     }
 
@@ -574,5 +620,76 @@ mod tests {
         assert_eq!(unix_ms(UNIX_EPOCH), 0);
         assert_eq!(unix_ms(UNIX_EPOCH - Duration::from_secs(60)), 0);
         assert_eq!(unix_ms(UNIX_EPOCH + Duration::from_millis(1_500)), 1_500);
+    }
+
+    #[test]
+    fn a_named_decoder_that_fell_back_to_software_is_refused() {
+        let software = burst(1);
+
+        let error = require_named_hardware(DecoderKind::V4l2, &software)
+            .expect_err("v4l2 was named and software opened");
+
+        assert_eq!(error.reason(), "open_stream");
+        // The operator has to know which of the seven names went unhonoured,
+        // and that naming auto is the way to accept what happened.
+        assert!(error.message().contains("v4l2"), "{}", error.message());
+        assert!(error.message().contains("auto"), "{}", error.message());
+    }
+
+    #[test]
+    fn asking_for_no_particular_decoder_accepts_the_software_fallback() {
+        let software = burst(1);
+
+        assert!(require_named_hardware(DecoderKind::Auto, &software).is_ok());
+        assert!(require_named_hardware(DecoderKind::Sw, &software).is_ok());
+    }
+
+    #[test]
+    fn a_named_decoder_that_opened_is_accepted() {
+        let hardware = Burst {
+            hw: Some(HwBackend::V4l2),
+            ..burst(1)
+        };
+
+        assert!(require_named_hardware(DecoderKind::V4l2, &hardware).is_ok());
+    }
+
+    /// The refusal above is only worth anything if `open_decoder` performs it,
+    /// which is the half a predicate test cannot reach. `videotoolbox` is the
+    /// name used because its absence here is *compile-time* certain
+    /// ([`decode::probe_order`] answers with an empty list off macOS), where
+    /// vaapi and nvdec would make the test depend on what the box happens to
+    /// have.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn open_decoder_refuses_a_named_backend_this_host_does_not_have() {
+        // Imported here, not at module scope: this is the one test the macOS
+        // cfg strips, and a module-scope import would then be dead under
+        // `-D warnings`.
+        use crate::config::RawDecoderParams;
+
+        let raw = RawDecoderParams {
+            decoder: "videotoolbox".into(),
+            width: 416,
+            height: 416,
+            encoding: "unit_rgb".into(),
+            resize: "letterbox".into(),
+            resize_pad: 114,
+            source_width: Some(2560),
+            source_height: Some(1920),
+            motion_json: None,
+            sample_fps: 5,
+        };
+
+        let error = open_decoder(&raw.resolve().expect("the params resolve"))
+            .map(|_| ())
+            .expect_err("videotoolbox does not exist off macOS");
+
+        assert_eq!(error.reason(), "open_stream");
+        assert!(
+            error.message().contains("videotoolbox"),
+            "{}",
+            error.message()
+        );
     }
 }

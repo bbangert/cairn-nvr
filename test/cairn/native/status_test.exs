@@ -161,6 +161,7 @@ defmodule Cairn.Native.StatusTest do
           backend: "qnn",
           streams: ["cam"],
           health: :healthy,
+          decoder_failures: %{},
           stream_health: %{},
           stream_fps: %{},
           p50_ms: 3.0,
@@ -188,6 +189,44 @@ defmodule Cairn.Native.StatusTest do
         assert Status.payload(status_map(health: verdict), "cam")["health"] ==
                  Atom.to_string(verdict)
       end
+    end
+
+    test "a camera whose decoder open failed is an error, and only that camera" do
+      status =
+        status_map(
+          decoder_failures: %{
+            "cam" => {:open_stream, "decoder v4l2 was named but did not open"}
+          },
+          streams: ["cam", "other"]
+        )
+
+      refused = Status.payload(status, "cam")
+      # The crate's own message is the account: which backend went unhonoured.
+      assert refused["state"] == "error"
+      assert refused["detail"] =~ "decoder did not open (open_stream)"
+      assert refused["detail"] =~ "decoder v4l2 was named"
+      assert refused["detail"] =~ "recording is unaffected"
+
+      # The failure is this camera's, not the node's.
+      assert Status.payload(status, "other")["state"] == "ready"
+    end
+
+    test "an engine-level failure outranks a recorded decoder failure" do
+      status =
+        status_map(
+          engine: :unanswered,
+          decoder_failures: %{"cam" => {:open_stream, "stale"}}
+        )
+
+      # The wedge is the story; a stale per-camera entry must not soften it.
+      assert Status.payload(status, "cam")["state"] == "wedged"
+    end
+
+    test "a status map with no decoder_failures key still answers" do
+      # The degraded map a wedged host produces has no such key; the clause
+      # reads it with a default rather than requiring it.
+      assert Status.payload(status_map([]) |> Map.delete(:decoder_failures), "cam")["state"] ==
+               "ready"
     end
 
     test "a wedge says a restart will not clear it, and saturation says load" do

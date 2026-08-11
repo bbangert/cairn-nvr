@@ -189,6 +189,12 @@ pub trait Decoder: Send {
     /// ([`model_input_from_rgb`]). Same ownership and `Ok(None)` contract as
     /// `to_tensor`.
     fn to_rgb(&mut self, frame: AVFrame) -> Result<Option<RgbSampled>>;
+
+    /// The hardware backend this decoder opened on, `None` for software decode.
+    ///
+    /// [`open`] falls back rather than failing, so a caller that named a
+    /// backend has no other way to learn whether it got the one it named.
+    fn hw_backend(&self) -> Option<HwBackend>;
 }
 
 /// A decoded frame's own geometry, which is what a projection is built from.
@@ -520,6 +526,10 @@ impl Decoder for SwDecoder {
     fn to_rgb(&mut self, frame: AVFrame) -> Result<Option<RgbSampled>> {
         let source = source_size(&frame)?;
         self.rgb.rgb_from(&frame, source).map(Some)
+    }
+
+    fn hw_backend(&self) -> Option<HwBackend> {
+        None
     }
 }
 

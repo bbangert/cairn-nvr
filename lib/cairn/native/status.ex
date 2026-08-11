@@ -161,7 +161,7 @@ defmodule Cairn.Native.Status do
   """
   @spec payload(map(), String.t()) :: map()
   def payload(status, camera_id) do
-    {state, detail} = headline(status)
+    {state, detail} = headline(status, camera_id)
 
     %{
       "state" => state,
@@ -182,37 +182,64 @@ defmodule Cairn.Native.Status do
 
   # In the order an operator has to read them: a missing library, then a model
   # the canary refused (whose message is the only account of why nothing is being
-  # detected), then any other engine state, and only then the accelerator's.
-  defp headline(%{nif: {:unavailable, reason}}) do
+  # detected), then any other engine state, and only then this camera's own
+  # decoder — the one per-camera failure a node-level story can mask: a refused
+  # `decoder:` leaves the engine ready and every other camera detecting, so
+  # without this clause the camera reads as a healthy accelerator at 0 fps.
+  # The accelerator's verdict comes last.
+  defp headline(%{nif: {:unavailable, reason}}, _camera_id) do
     {"error",
      "cairn-native is not loaded (#{inspect(reason)}); no camera on this node is detected on"}
   end
 
-  defp headline(%{canary: {:failed, message}} = status) do
+  defp headline(%{canary: {:failed, message}} = status, _camera_id) do
     {"error",
      "the canary refused #{model_name(status.model)}: #{message} — the model was NOT loaded " <>
        "in this VM"}
   end
 
-  defp headline(%{engine: :unanswered}) do
+  defp headline(%{engine: :unanswered}, _camera_id) do
     {"wedged",
      "the engine did not answer a status call, so it is inside a native call that has not " <>
        "returned. " <> @wedged_detail}
   end
 
-  defp headline(%{engine: :starting}), do: {"starting", "the engine is still opening its model"}
+  defp headline(%{engine: :starting}, _camera_id),
+    do: {"starting", "the engine is still opening its model"}
 
-  defp headline(%{engine: :not_configured}) do
+  defp headline(%{engine: :not_configured}, _camera_id) do
     {"error", "no model is configured for the native engine on this node"}
   end
 
-  defp headline(%{engine: {reason, message}}) do
+  defp headline(%{engine: {reason, message}}, _camera_id) do
     {"error", "the engine is #{reason}: #{message}"}
   end
 
-  defp headline(%{engine: :ready} = status), do: accelerator(status)
+  defp headline(%{engine: :ready} = status, camera_id) do
+    # `Map.get`, not a match: the degraded map `unanswered/1` builds carries no
+    # decoder_failures key, and this clause must not be the reason a wedged
+    # host cannot be reported.
+    case status |> Map.get(:decoder_failures, %{}) |> Map.get(camera_id) do
+      nil -> accelerator(status)
+      reason -> {"error", decoder_failure(reason)}
+    end
+  end
 
-  defp headline(status), do: {"error", "the engine is #{term(status.engine)}"}
+  defp headline(status, _camera_id), do: {"error", "the engine is #{term(status.engine)}"}
+
+  # The message is the crate's own (which decoder was named, and that `auto` is
+  # the escape) — the one account of why this camera detects nothing while the
+  # node's engine is healthy. Recording is `Cairn.Native.Host`'s
+  # `record_decoder_outcome/3`; the next successful open clears it.
+  defp decoder_failure({reason, message}) when is_binary(message) do
+    "this camera's decoder did not open (#{reason}): #{message} — detection is off; " <>
+      "recording is unaffected"
+  end
+
+  defp decoder_failure(reason) do
+    "this camera's decoder did not open: #{inspect(reason)} — detection is off; " <>
+      "recording is unaffected"
+  end
 
   defp accelerator(%{health: :wedged}) do
     {"wedged",

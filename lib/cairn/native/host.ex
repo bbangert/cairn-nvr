@@ -76,7 +76,13 @@ defmodule Cairn.Native.Host do
     engine_state: :starting,
     canary_state: :not_run,
     streams: %{},
-    closing: %{}
+    closing: %{},
+    # camera_id → the reason its last decoder open failed, cleared by the next
+    # success. This is how a refused `decoder:` reaches `cameras:status`: the
+    # element that failed to open retries on a cooldown and logs, but a log
+    # line is not an operator surface, and the engine-level headline reads
+    # "ready" the whole time (`Cairn.Native.Status.headline/2`).
+    decoder_failures: %{}
   ]
 
   def start_link(opts) do
@@ -125,16 +131,21 @@ defmodule Cairn.Native.Host do
   (that belongs to the inference stream), the per-frame `decode_au` calls
   never come back through this process, and freeing it promptly is the
   caller's `close_decoder`, with the resource destructor as the backstop.
+
+  `source` is what the camera is sending, as `{width, height}`, or `nil` from a
+  caller that does not know. Software decode does not need it; a V4L2 M2M
+  decoder does, and one opened without it opens anyway and then fails every
+  frame (`research/board-first-light.md`).
   """
-  @spec open_decoder(atom(), String.t(), map() | keyword()) ::
+  @spec open_decoder(atom(), String.t(), map() | keyword(), {pos_integer(), pos_integer()} | nil) ::
           {:ok, %{ref: reference(), module: module(), sample_fps: pos_integer()}}
           | {:error, term()}
-  def open_decoder(server \\ __MODULE__, camera_id, params) do
+  def open_decoder(server \\ __MODULE__, camera_id, params, source) do
     # Above the 5 s default: the open probes hardware backends in turn —
     # device nodes, drivers, a GPU filter graph — each of which can block on
     # a driver's answer, and a caller timing out here would crash a camera
     # whose decoder was still coming up.
-    GenServer.call(server, {:open_decoder, camera_id, params}, 15_000)
+    GenServer.call(server, {:open_decoder, camera_id, params, source}, 15_000)
   end
 
   @doc """
@@ -267,11 +278,17 @@ defmodule Cairn.Native.Host do
   # No parking and no registry bookkeeping: a decoder handle is the caller's,
   # and a reopen racing the old handle's close costs nothing but memory the
   # destructor frees — unlike a stream, whose camera-id claim must land first.
-  def handle_call({:open_decoder, camera_id, params}, _from, state) do
-    case NativeConfig.stream_params(params) do
-      {:ok, params} -> {:reply, do_open_decoder(state, camera_id, params), state}
-      {:error, message} -> {:reply, {:error, {:config, message}}, state}
-    end
+  def handle_call({:open_decoder, camera_id, params, source}, _from, state) do
+    # Every refusal is recorded, the params-vocabulary one included: a config
+    # error repeats identically on each of the caller's retries, so this
+    # camera's status saying why beats it reading "ready" at 0 fps.
+    result =
+      case NativeConfig.stream_params(params) do
+        {:ok, params} -> do_open_decoder(state, camera_id, params, source_dims(source))
+        {:error, message} -> {:error, {:config, message}}
+      end
+
+    {:reply, result, record_decoder_outcome(state, camera_id, result)}
   end
 
   def handle_call({:close_stream, camera_id}, _from, state) do
@@ -684,10 +701,12 @@ defmodule Cairn.Native.Host do
   # read out of cairn-ort as plain terms and handed to cairn-native's open,
   # with the host's own decode config (`decoder`, `sample_fps`) alongside — so
   # both halves are built for the same model without either naming the other.
-  defp do_open_decoder(%{engine_state: :ready} = state, camera_id, params) do
+  defp do_open_decoder(%{engine_state: :ready} = state, camera_id, params, {:ok, source}) do
     # A plain field-read NIF (sub-microsecond, deliberately not
     # dirty-scheduled), so calling it from this process costs nothing.
     spec = state.ort.engine_spec(state.engine)
+
+    {source_width, source_height} = source
 
     decode_params = %{
       decoder: state.config.decoder,
@@ -696,6 +715,8 @@ defmodule Cairn.Native.Host do
       encoding: spec.encoding,
       resize: spec.resize,
       resize_pad: spec.resize_pad,
+      source_width: source_width,
+      source_height: source_height,
       motion_json: params.motion_json,
       sample_fps: state.config.sample_fps
     }
@@ -710,7 +731,45 @@ defmodule Cairn.Native.Host do
     end
   end
 
-  defp do_open_decoder(state, _camera_id, _params), do: {:error, state.engine_state}
+  defp do_open_decoder(%{engine_state: :ready}, _camera_id, _params, {:error, message}),
+    do: {:error, {:config, message}}
+
+  defp do_open_decoder(state, _camera_id, _params, _source), do: {:error, state.engine_state}
+
+  # The codecpar fields these land on are i32, and the crate re-refuses at the
+  # same bound; checking here too turns an out-of-range pair into a config
+  # error instead of a `badarg` inside the NIF's own argument decode.
+  @max_source_dim 2_147_483_647
+
+  # Total over every term, bounds included: `source` is a positional arg no
+  # vocabulary validates, this runs inside the host's own `handle_call`, and
+  # this process's contract is that nothing here exits — so a malformed source
+  # is the caller's bug reported as a value, not a raise (`elem/2` on a
+  # non-tuple, or rustler's `badarg` decoding a negative into a `usize`) that
+  # takes the host down for every camera.
+  defp source_dims({width, height})
+       when is_integer(width) and is_integer(height) and width > 0 and height > 0 and
+              width <= @max_source_dim and height <= @max_source_dim,
+       do: {:ok, {width, height}}
+
+  defp source_dims(nil), do: {:ok, {nil, nil}}
+
+  defp source_dims(other),
+    do:
+      {:error,
+       "source must be positive {width, height} integers within i32 or nil, " <>
+         "got #{inspect(other)}"}
+
+  defp record_decoder_outcome(state, camera_id, {:ok, _handle}),
+    do: %{state | decoder_failures: Map.delete(state.decoder_failures, camera_id)}
+
+  defp record_decoder_outcome(%{engine_state: :ready} = state, camera_id, {:error, reason}),
+    do: %{state | decoder_failures: Map.put(state.decoder_failures, camera_id, reason)}
+
+  # An engine that is not ready is a node-level story the status headline
+  # already tells; recording it per camera would only leave a stale entry to
+  # mislead with once the engine comes up.
+  defp record_decoder_outcome(state, _camera_id, {:error, _reason}), do: state
 
   defp drop_stream(state, camera_id) do
     case Map.pop(state.streams, camera_id) do
@@ -901,7 +960,8 @@ defmodule Cairn.Native.Host do
         backend: state.config && state.config.backend,
         streams: Map.keys(state.streams),
         # handle gone, native close not landed — what a reopen waits on
-        closing: Map.keys(state.closing)
+        closing: Map.keys(state.closing),
+        decoder_failures: state.decoder_failures
       },
       # Read out of the monitor's table, never called for: this process must not
       # wait on the one judging it, and `status/2` must answer before there has

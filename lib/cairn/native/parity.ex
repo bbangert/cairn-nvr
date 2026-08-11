@@ -370,7 +370,7 @@ defmodule Cairn.Native.Parity do
     sample_fps = Keyword.fetch!(opts, :sample_fps)
     {:ok, engine} = CairnOrt.init(config)
 
-    # The exact seam `Cairn.Native.Host.open_decoder/3` crosses: the engine's
+    # The exact seam `Cairn.Native.Host.open_decoder/4` crosses: the engine's
     # resolved spec, as terms, plus the decode config.
     spec = CairnOrt.engine_spec(engine)
 
@@ -381,6 +381,11 @@ defmodule Cairn.Native.Parity do
       encoding: spec.encoding,
       resize: spec.resize,
       resize_pad: spec.resize_pad,
+      # Absent, as it is for every software decode: the parity harness compares
+      # this path against the plugin's, and the plugin reads its geometry from
+      # a container the same way this decoder reads it from the first SPS.
+      source_width: nil,
+      source_height: nil,
       motion_json: params.motion_json,
       sample_fps: sample_fps
     }

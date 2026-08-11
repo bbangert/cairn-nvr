@@ -9,7 +9,7 @@ defmodule Cairn.Native do
   on a dirty scheduler.
 
   `params` must carry every key of the crate's `RawDecoderParams`;
-  `Cairn.Native.Host.open_decoder/3` builds them, never by hand.
+  `Cairn.Native.Host.open_decoder/4` builds them, never by hand.
 
   A missing library is a normal state, not a boot failure, so `load_nif/0`
   records why the load failed and still returns `:ok`: an `@on_load` returning

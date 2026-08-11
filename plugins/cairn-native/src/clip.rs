@@ -141,6 +141,11 @@ fn decoder_params(engine: &Engine, sample_fps: u32) -> RawDecoderParams {
         encoding: spec.encoding.wire_name().into(),
         resize: resize.into(),
         resize_pad,
+        // Absent on purpose, and the only place that is now exercised: software
+        // decode has to keep working for a caller that never learned the source
+        // geometry, which is what every x86 run of this harness proves.
+        source_width: None,
+        source_height: None,
         motion_json: None,
         sample_fps,
     }

@@ -120,9 +120,20 @@ error messages say which family an alias resolves to.
 
 `decoder:` and `backend:` are different knobs that both sound like "how do I
 run this fast". `decoder:` is the **video** path — how H.264 frames get
-decoded, probed at plugin startup with a software fallback. `backend:` is the
-**inference** path — what executes the model. Naming a hardware video decoder
-says nothing about where the model runs.
+decoded. `backend:` is the **inference** path — what executes the model.
+Naming a hardware video decoder says nothing about where the model runs.
+
+Naming one is a **requirement** on a `pipeline: membrane` camera: if the device
+or the hwaccel is missing, the decoder refuses to open and the camera's detect
+branch goes dark with the reason on `cameras:status`, while recording carries
+on. Write `decoder: auto` — the default — to mean "the best available, software
+if that is all there is". The distinction is worth the refusal on a board: on
+QCS6490 the ASIC decodes the whole fleet for about 2% CPU where software decode
+costs several times that per camera — decode is the term this knob controls;
+the scale/convert after it is paid on both paths — and before this a profile
+naming `v4l2` on a box without it just quietly ran the software decoder. The external plugin still falls back instead of
+refusing, because there its refusal would be a process exit into a restart loop;
+that half goes away with the plugin path itself.
 
 `labels:` is indexed positionally, so the file has to match the family's class
 space: 80 lines for yolox and the Ultralytics families, 91 for rfdetr, which
@@ -136,6 +147,17 @@ against it; nothing observes the real rate and adapts. Every band cairn ships
 carries a comment saying what it was derived from and that it is pending
 on-hardware measurement — write yours the same way, and treat a band as data
 that is cheap to correct.
+
+A band is only ever replaced by measurement **on a deployment target**, which
+means an SBC. The x86 box in this repo's development loop is a test host: it
+runs the gates, the parity harness and the accuracy work, and it never gets a
+measured band, because nothing ships there and a number from it would describe
+hardware no deployment has. That is why `generic-ort.yml` — a migration alias
+rather than a hardware class — keeps a declared `[5, 5]` and is expected to keep
+it. Measured bands come from the QCS6490, RK3576 and RK3566 profiles, each on
+its own board, with the cpufreq governor pinned and recorded (see
+`docs/npu-backends.md` on why an unpinned governor makes a plausible-looking
+wrong number).
 
 `sample_fps` is optional, and **the band validates it, the band never emits
 it** (D-P4): leave `sample_fps:` unset and no `--sample-fps` flag is written
