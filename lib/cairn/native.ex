@@ -47,7 +47,7 @@ defmodule Cairn.Native do
   # `nif_error/1` has no return, so dialyzer flags every *static* call to a stub;
   # `Cairn.Native.Host` calls through a module held in its state, which keeps them
   # dynamic. The nowarn covers the specs, which describe the loaded library.
-  @dialyzer {:nowarn_function, open_decoder: 2, decode_au: 4, close_decoder: 1}
+  @dialyzer {:nowarn_function, open_decoder: 2, decode_au: 4, close_decoder: 1, drain_teardown: 1}
 
   @typedoc """
   One decoded frame on its way across the boundary: `payload` is tightly
@@ -107,6 +107,14 @@ defmodule Cairn.Native do
 
   @spec close_decoder(reference()) :: {:ok, boolean()} | {:error, {atom(), String.t()}}
   def close_decoder(_decoder), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  Wait (bounded) for every native drop deferred so far to finish — the exit
+  path's call, made before a halt so the VM never races the `cairn-teardown`
+  thread mid-drop (`Cairn.Native.Drain` is the caller in the app tree).
+  """
+  @spec drain_teardown(non_neg_integer()) :: boolean()
+  def drain_teardown(_timeout_ms), do: :erlang.nif_error(:nif_not_loaded)
 
   defp load_result, do: :persistent_term.get(@load_result, {:error, :not_loaded})
 

@@ -29,6 +29,8 @@ pub mod decode;
 pub mod emit;
 pub mod gate;
 mod glibc_compat;
+#[cfg(feature = "gles")]
+pub mod glscale;
 pub mod hwdecode;
 pub mod infer;
 pub mod log;

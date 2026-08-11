@@ -320,6 +320,19 @@ pub struct RgbScaler {
     /// per-camera by construction rather than by a lookup that could go wrong
     /// in group mode.
     motion: Option<MotionDetector>,
+    /// The GPU fast path for NV12 frames, where the build carries one.
+    /// Tri-state so the EGL probe runs once per scaler, not per frame, and a
+    /// mid-run GL failure degrades to swscale permanently rather than
+    /// retrying into the same fault at frame rate.
+    #[cfg(feature = "gles")]
+    gl: GlState,
+}
+
+#[cfg(feature = "gles")]
+enum GlState {
+    Untried,
+    Ready(Box<crate::glscale::GlScaler>),
+    Off,
 }
 
 /// Everything settled by one (source geometry, pixel format) pair.
@@ -362,7 +375,57 @@ impl RgbScaler {
             spec,
             target: None,
             motion: motion.map(|config| MotionDetector::new(config, sample_fps)),
+            #[cfg(feature = "gles")]
+            gl: GlState::Untried,
         })
+    }
+
+    /// The GPU path, or `None` for "use swscale" — not-NV12, no usable GL
+    /// stack, or a GL fault mid-run (noted once, then permanently off: the
+    /// remedy for a broken driver is not retrying it thirty times a second).
+    ///
+    /// This is where v4l2m2m's ~27 ms uncached-read floor is what remains of
+    /// the ~50 ms CPU conversion: the upload's single sequential read of the
+    /// capture buffer is unavoidable on this route, and everything after it —
+    /// scale, YUV→RGB — moves to the GPU (`research/board-first-light.md`).
+    /// The output is not bit-identical to swscale's (GPU bilinear, shader
+    /// BT.601), so the x86 parity harness deliberately builds without this
+    /// feature; on-board acceptance is detection sanity plus the perf win.
+    #[cfg(feature = "gles")]
+    fn gl_scale(&mut self, frame: &AVFrame, source: InputSize) -> Option<(Vec<u8>, Fit)> {
+        if frame.format != ffi::AV_PIX_FMT_NV12 {
+            return None;
+        }
+        if matches!(self.gl, GlState::Untried) {
+            // Off *before* the probe: if anything below unwinds, the state
+            // must not read as still-untried, or the next frame repeats the
+            // fault at frame rate.
+            self.gl = GlState::Off;
+            self.gl = match crate::glscale::GlScaler::new(self.spec.size) {
+                Ok(scaler) => {
+                    note!("scaler: GPU (GLES) path active for NV12 frames");
+                    GlState::Ready(Box::new(scaler))
+                }
+                Err(error) => {
+                    note!("scaler: GPU path unavailable ({error:#}); staying on swscale");
+                    GlState::Off
+                }
+            };
+        }
+        let GlState::Ready(scaler) = &mut self.gl else {
+            return None;
+        };
+        let frame_size = source_size(frame).ok()?;
+        let fit = self.spec.resize.fit(self.spec.size, source);
+        let (y, y_stride, uv, uv_stride) = nv12_planes(frame)?;
+        match scaler.scale_nv12(y, y_stride, uv, uv_stride, frame_size, fit.inner) {
+            Ok(rgb) => Some((rgb, fit)),
+            Err(error) => {
+                note!("scaler: GPU scale failed ({error:#}); degrading to swscale");
+                self.gl = GlState::Off;
+                None
+            }
+        }
     }
 
     /// `source` is the geometry of the frame as the *camera* sent it, which is
@@ -408,6 +471,18 @@ impl RgbScaler {
 
     pub fn tensor_from(&mut self, frame: &AVFrame, source: InputSize) -> Result<Sampled> {
         let spec = self.spec;
+        #[cfg(feature = "gles")]
+        if let Some((rgb, fit)) = self.gl_scale(frame, source) {
+            let stride = fit.inner.w * 3;
+            let motion = observe(&mut self.motion, &rgb, stride, fit.inner);
+            return Ok(Sampled {
+                input: ModelInput {
+                    tensor: pack_chw(&rgb, stride, fit, spec),
+                    projection: fit.projection(source),
+                },
+                motion,
+            });
+        }
         self.ensure_target(frame, source)?;
         let target = self.target.as_mut().expect("target was just set");
         let fit = target.fit;
@@ -427,6 +502,16 @@ impl RgbScaler {
     /// the way — the bytes [`model_input_from_rgb`] packs on the far side of
     /// the seam into the tensor this method would have.
     pub fn rgb_from(&mut self, frame: &AVFrame, source: InputSize) -> Result<RgbSampled> {
+        #[cfg(feature = "gles")]
+        if let Some((rgb, fit)) = self.gl_scale(frame, source) {
+            let motion = observe(&mut self.motion, &rgb, fit.inner.w * 3, fit.inner);
+            return Ok(RgbSampled {
+                rgb,
+                content: fit.inner,
+                source,
+                motion,
+            });
+        }
         self.ensure_target(frame, source)?;
         let target = self.target.as_mut().expect("target was just set");
         let fit = target.fit;
@@ -460,6 +545,46 @@ impl RgbScaler {
 /// on the decoder, and this dev container has no GPU to test that path on. It
 /// stays a documented non-goal until it can be exercised —
 /// `hwdecode::HwBackend::filter_spec` is where that plane is produced.
+/// The two NV12 planes as slices, or `None` for a frame that does not carry
+/// both — handed back to the caller as "use swscale", never an error, because
+/// a frame shape this function does not recognise (negative linesizes
+/// included: ffmpeg spells bottom-up images that way, and `try_from` refuses
+/// them here) is exactly what the CPU path exists to handle.
+#[cfg(feature = "gles")]
+fn nv12_planes(frame: &AVFrame) -> Option<(&[u8], usize, &[u8], usize)> {
+    let h = usize::try_from(frame.height).ok()?;
+    let w = usize::try_from(frame.width).ok()?;
+    let y_stride = usize::try_from(frame.linesize[0]).ok()?;
+    let uv_stride = usize::try_from(frame.linesize[1]).ok()?;
+    // Odd dimensions go to swscale: the GL upload takes floor(w/2) chroma
+    // columns and floor-half rows, silently dropping the frame's last chroma
+    // sample where swscale resolves the siting properly. (The slice claims
+    // below stay within bounds either way — stride >= width bounds each claim
+    // by stride * rows, the minimum allocation — so this is a quality gate,
+    // not a safety one.)
+    if h % 2 != 0 || w % 2 != 0 {
+        return None;
+    }
+    if frame.data[0].is_null() || frame.data[1].is_null() || y_stride < w || uv_stride < w {
+        return None;
+    }
+    // SAFETY: the pointers were just null-checked and the frame outlives the
+    // returned borrows. The last row is claimed at `width`, not `stride`:
+    // libavcodec's `apply_cropping` can shift `data[0]` right, and
+    // `stride * height` would then end past the allocation by exactly the
+    // crop — `stride * (h - 1) + width` is what every row-wise reader
+    // (GL upload included) actually touches.
+    unsafe {
+        let uv_rows = h.div_ceil(2);
+        Some((
+            slice::from_raw_parts(frame.data[0] as *const u8, y_stride * (h - 1) + w),
+            y_stride,
+            slice::from_raw_parts(frame.data[1] as *const u8, uv_stride * (uv_rows - 1) + w),
+            uv_stride,
+        ))
+    }
+}
+
 fn observe(
     motion: &mut Option<MotionDetector>,
     plane: &[u8],

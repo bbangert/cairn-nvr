@@ -10,6 +10,10 @@ defmodule Cairn.Application do
     Cairn.ExtractorTelemetry.attach()
 
     children = [
+      # First on purpose: children stop in reverse start order, so this one's
+      # terminate/2 — the bounded native-teardown drain — runs after every
+      # camera and the host have died and queued their drops.
+      Cairn.Native.Drain,
       CairnWeb.Telemetry,
       # Config first: everything else (Repo path, data dirs, cameras) hangs off it
       {Cairn.Config.Server, []},
