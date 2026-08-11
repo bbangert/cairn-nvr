@@ -200,7 +200,18 @@ defmodule Cairn.Config.Server do
   # The contract for a field added to `Cairn.Config.Camera` later: the
   # default is refresh-only. Nothing lands in this list by being new — it
   # goes here only on the deliberate finding that it reaches a subprocess.
-  @restart_fields [:rtsp_url, :plugin, :pipeline, :min_score, :transcode, :extra_ffmpeg_args]
+  # `ingest` is here because it selects the session's source process itself
+  # (the ffmpeg OS process vs the RTSP client) and the pipeline's ingest
+  # chain — nothing a running session can swap in place.
+  @restart_fields [
+    :rtsp_url,
+    :plugin,
+    :pipeline,
+    :ingest,
+    :min_score,
+    :transcode,
+    :extra_ffmpeg_args
+  ]
 
   # Two things are compared *resolved* rather than read off the camera
   # struct, because both are baked at tree init out of config the struct does

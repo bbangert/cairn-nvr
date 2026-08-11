@@ -33,9 +33,9 @@ defmodule Cairn.Config.Camera do
 
   alias Cairn.Config
 
-  @known_keys ~w(id rtsp_url plugin pipeline min_score track record extra_ffmpeg_args transcode
-                 retention pre_window_seconds post_window_seconds max_event_seconds max_unseen_ms
-                 max_live_tracks stationary_after_ms)
+  @known_keys ~w(id rtsp_url plugin pipeline ingest min_score track record extra_ffmpeg_args
+                 transcode retention pre_window_seconds post_window_seconds max_event_seconds
+                 max_unseen_ms max_live_tracks stationary_after_ms)
 
   @default_min_score %{"default" => 0.5}
 
@@ -48,6 +48,7 @@ defmodule Cairn.Config.Camera do
             extra_ffmpeg_args: [],
             transcode: false,
             pipeline: :classic,
+            ingest: :ffmpeg,
             retention_days: nil,
             retention_per_label: %{},
             pre_window_seconds: nil,
@@ -95,6 +96,11 @@ defmodule Cairn.Config.Camera do
     {record, acc} = parse_tier(Map.get(raw, "record"), id, "record", acc)
     {plugin, acc} = parse_plugin(Map.get(raw, "plugin"), id, acc)
     {pipeline, acc} = parse_pipeline(Map.get(raw, "pipeline"), id, acc)
+    transcode = Map.get(raw, "transcode", false) == true
+
+    {ingest, acc} =
+      parse_ingest(Map.get(raw, "ingest"), id, acc, pipeline, rtsp_url, transcode)
+
     {extra_args, acc} = parse_extra_args(Map.get(raw, "extra_ffmpeg_args"), id, acc)
 
     cam = %__MODULE__{
@@ -105,8 +111,9 @@ defmodule Cairn.Config.Camera do
       track: track,
       record: record,
       extra_ffmpeg_args: extra_args,
-      transcode: Map.get(raw, "transcode", false) == true,
+      transcode: transcode,
       pipeline: pipeline,
+      ingest: ingest,
       retention_days: get_in(raw, ["retention", "days"]),
       retention_per_label: get_in(raw, ["retention", "per_label"]) || %{},
       pre_window_seconds: Map.get(raw, "pre_window_seconds"),
@@ -224,6 +231,39 @@ defmodule Cairn.Config.Camera do
 
   defp parse_pipeline(_other, id, acc) do
     {:classic, add_error(acc, "camera #{id}: pipeline must be \"membrane\" or \"classic\"")}
+  end
+
+  # RTSP-native ingest is a membrane-pipeline capability with real
+  # preconditions, each refused at load where the operator reads diagnostics:
+  # the classic path has no RTSP client; the `rtsp` library rejects
+  # non-rtsp:// schemes outright (an FLV camera keeps the ffmpeg bridge —
+  # D-M7's per-camera escape hatch); and transcode happens inside ffmpeg,
+  # which this ingest removes from the chain entirely.
+  defp parse_ingest(nil, _id, acc, _pipeline, _url, _transcode), do: {:ffmpeg, acc}
+  defp parse_ingest("ffmpeg", _id, acc, _pipeline, _url, _transcode), do: {:ffmpeg, acc}
+
+  defp parse_ingest("rtsp", id, acc, pipeline, url, transcode) do
+    cond do
+      pipeline != :membrane ->
+        {:ffmpeg, add_error(acc, "camera #{id}: ingest \"rtsp\" requires pipeline \"membrane\"")}
+
+      not (is_binary(url) and String.starts_with?(url, "rtsp://")) ->
+        {:ffmpeg, add_error(acc, "camera #{id}: ingest \"rtsp\" requires an rtsp:// url")}
+
+      transcode ->
+        {:ffmpeg,
+         add_error(
+           acc,
+           "camera #{id}: ingest \"rtsp\" cannot transcode — transcode rides the ffmpeg bridge"
+         )}
+
+      true ->
+        {:rtsp, acc}
+    end
+  end
+
+  defp parse_ingest(_other, id, acc, _pipeline, _url, _transcode) do
+    {:ffmpeg, add_error(acc, "camera #{id}: ingest must be \"rtsp\" or \"ffmpeg\"")}
   end
 
   defp parse_plugin(nil, _id, acc), do: {nil, acc}
