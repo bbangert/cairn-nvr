@@ -56,10 +56,30 @@ defmodule Cairn.BoardSoak do
     opts = options(opts)
     announce(opts)
 
-    case check_available() do
-      :ok -> with_engine(opts)
-      error -> error
+    with :ok <- validate_source(opts),
+         :ok <- check_available() do
+      with_engine(opts)
     end
+  end
+
+  # Same rule (and the same bound) as `Cairn.Native.Host.source_dims/1`: a
+  # negative or half-set pair from the env would not reach the crate's own
+  # validation — rustler's `Option<usize>` decode raises `badarg` first, and a
+  # soak that crashes on its config measures nothing.
+  defp validate_source(%{source_width: nil, source_height: nil}), do: :ok
+
+  defp validate_source(%{source_width: w, source_height: h})
+       when is_integer(w) and is_integer(h) and w > 0 and h > 0 and
+              w <= 2_147_483_647 and h <= 2_147_483_647,
+       do: :ok
+
+  defp validate_source(%{source_width: w, source_height: h}) do
+    IO.puts(
+      "board-soak: refusing to run — BOARD_SOAK_SOURCE_WIDTH/HEIGHT must be a " <>
+        "positive pair within i32 or absent on both axes, got #{inspect(w)}x#{inspect(h)}"
+    )
+
+    {:error, :bad_source}
   end
 
   defp with_engine(opts) do
@@ -126,7 +146,15 @@ defmodule Cairn.BoardSoak do
       t0 = now_ms()
 
       stats =
-        feed(decoder_ref, stream_ref, clip, clip, t0 + opts.seconds * 1000, init_stats(t0, opts.sample_every), label)
+        feed(
+          decoder_ref,
+          stream_ref,
+          clip,
+          clip,
+          t0 + opts.seconds * 1000,
+          init_stats(t0, opts.sample_every),
+          label
+        )
 
       close(CairnOrt, :close_stream, stream_ref, label)
       close(Cairn.Native, :close_decoder, decoder_ref, label)
@@ -216,7 +244,11 @@ defmodule Cairn.BoardSoak do
     do: %{stats | sampled_us: stats.sampled_us + us, sampled_n: stats.sampled_n + 1}
 
   defp decode_timing(stats, false, us),
-    do: %{stats | decode_only_us: stats.decode_only_us + us, decode_only_n: stats.decode_only_n + 1}
+    do: %{
+      stats
+      | decode_only_us: stats.decode_only_us + us,
+        decode_only_n: stats.decode_only_n + 1
+    }
 
   # Mirrors `Cairn.Pipeline.Inference`'s split of a decoded frame into
   # `push_frame/4`'s payload and `t:CairnOrt.frame_meta/0`.
@@ -257,7 +289,9 @@ defmodule Cairn.BoardSoak do
       passes: 0,
       observations: 0,
       errors: %{},
-      latencies: [],
+      lat_hist: %{},
+      lat_count: 0,
+      lat_max: 0,
       t0: t0,
       last_progress: t0
     }
@@ -265,7 +299,23 @@ defmodule Cairn.BoardSoak do
 
   defp bump(stats, key, n \\ 1), do: Map.update!(stats, key, &(&1 + n))
 
-  defp latency(stats, us), do: %{stats | latencies: [us | stats.latencies]}
+  # A histogram, not a list: a multi-hour soak makes millions of passes, and
+  # an unbounded list re-sorted at every report would turn the harness into
+  # the bottleneck it exists to find. 100 us buckets bound the percentile
+  # error at 0.1 ms — an order of magnitude under anything reported here —
+  # and memory at the spread of observed latencies, not their count.
+  @lat_bucket_us 100
+
+  defp latency(stats, us) do
+    bucket = div(us, @lat_bucket_us)
+
+    %{
+      stats
+      | lat_hist: Map.update(stats.lat_hist, bucket, 1, &(&1 + 1)),
+        lat_count: stats.lat_count + 1,
+        lat_max: max(stats.lat_max, us)
+    }
+  end
 
   defp bump_error(stats, {reason, _message}) when is_atom(reason), do: bump_error(stats, reason)
 
@@ -285,7 +335,7 @@ defmodule Cairn.BoardSoak do
   end
 
   defp report(label, stats) do
-    {p50, p95, max} = percentiles(stats.latencies)
+    {p50, p95, max} = percentiles(stats)
     elapsed_s = div(now_ms() - stats.t0, 1000)
 
     IO.puts(
@@ -304,16 +354,24 @@ defmodule Cairn.BoardSoak do
   defp mean_us(_total, 0), do: 0
   defp mean_us(total, n), do: div(total, n)
 
-  defp percentiles([]), do: {0, 0, 0}
+  defp percentiles(%{lat_count: 0}), do: {0, 0, 0}
 
-  defp percentiles(latencies) do
-    sorted = Enum.sort(latencies)
-    count = length(sorted)
-    {at(sorted, count, 0.50), at(sorted, count, 0.95), List.last(sorted)}
+  defp percentiles(stats) do
+    buckets = Enum.sort(stats.lat_hist)
+    {at(buckets, stats.lat_count, 0.50), at(buckets, stats.lat_count, 0.95), stats.lat_max}
   end
 
-  defp at(sorted, count, fraction) do
-    Enum.at(sorted, max(0, min(count - 1, trunc(fraction * count))))
+  # The bucket's midpoint stands in for every latency inside it; `max` is
+  # exact because it is tracked beside the histogram.
+  defp at(buckets, count, fraction) do
+    wanted = max(1, min(count, trunc(fraction * count) + 1))
+
+    {bucket, _seen} =
+      Enum.reduce_while(buckets, {0, 0}, fn {bucket, n}, {_last, seen} ->
+        if seen + n >= wanted, do: {:halt, {bucket, seen + n}}, else: {:cont, {bucket, seen + n}}
+      end)
+
+    bucket * @lat_bucket_us + div(@lat_bucket_us, 2)
   end
 
   defp summarize(results) do
@@ -326,7 +384,9 @@ defmodule Cairn.BoardSoak do
             passes: acc.passes + stats.passes,
             observations: acc.observations + stats.observations,
             errors: Map.merge(acc.errors, stats.errors, fn _reason, a, b -> a + b end),
-            latencies: acc.latencies ++ stats.latencies
+            lat_hist: Map.merge(acc.lat_hist, stats.lat_hist, fn _bucket, a, b -> a + b end),
+            lat_count: acc.lat_count + stats.lat_count,
+            lat_max: max(acc.lat_max, stats.lat_max)
         }
       end)
 
