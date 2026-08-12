@@ -505,8 +505,8 @@ defmodule Cairn.PluginProtocol do
   A list longer than #{@max_dets} entries is a contract violation rather than
   a crowded frame: it is rejected whole (every entry counts as a drop). The
   cost of one batch in `Cairn.Tracker.track/3` is `O(dets × objects)`, paid in
-  that camera's `Cairn.CameraTracker`, so an unbounded list wedges that
-  camera's event tracking. Decoding it is paid earlier and elsewhere — in the
+  the camera's tracker element, so an unbounded list wedges that camera's
+  detect branch. Decoding it is paid earlier and elsewhere — in the
   port, which for a plugin group is shared by every member — so the cap is
   also what keeps one member's plugin off its neighbours' lines.
 

@@ -9,8 +9,8 @@ defmodule Cairn.Tracker.Stage.Oru do
   and, rather than merely correcting the coast, throws the filter away and
   rebuilds it from the last box the track was really observed at, replayed
   across the gap against boxes interpolated towards the closing detection
-  (`Cairn.Tracker.Kalman.refit/3`, and its "Virtual observations" section for
-  what those boxes are). The re-detection's own predict-and-update stays in
+  (`Membrane.MOTTracker.Kalman.refit/3`, and its "Virtual observations" section
+  for what those boxes are). The re-detection's own predict-and-update stays in
   `Cairn.Tracker` (`advance/3`) as the last step of that replay and is the
   ordinary matched step, unchanged.
 
@@ -86,21 +86,21 @@ defmodule Cairn.Tracker.Stage.Oru do
   @behaviour Cairn.Tracker.Stage
 
   alias Cairn.Tracker
-  alias Cairn.Tracker.Kalman
+  alias Membrane.MOTTracker.Kalman
 
   # `tracking.oru`'s three numbers, all of them conversions between an elapsed
   # time and a count of filter steps.
   #
-  # The nominal batch cadence. `Cairn.Tracker.Kalman` has no notion of duration
-  # — one `predict/1` is one step whatever separated the two batches — so a gap
-  # measured in milliseconds can only be re-expressed as the step count a replay
-  # needs against an assumed cadence, and this is it. Two batches a second is
-  # what an inference loop on a live camera runs at and what the tracker test
-  # suite's own `@batch_ms` encodes. A camera slower than this replays more
-  # steps than its gap really had and learns a per-step velocity proportionally
-  # short of the object's real per-batch pace — an under-estimate, which is the
-  # direction to be wrong in for a mechanism whose whole purpose is to stop a
-  # stale heading being asserted with confidence.
+  # The nominal batch cadence. `Membrane.MOTTracker.Kalman` has no notion of
+  # duration — one `predict/1` is one step whatever separated the two batches —
+  # so a gap measured in milliseconds can only be re-expressed as the step
+  # count a replay needs against an assumed cadence, and this is it. Two
+  # batches a second is what an inference loop on a live camera runs at and
+  # what the tracker test suite's own `@batch_ms` encodes. A camera slower
+  # than this replays more steps than its gap really had and learns a per-step
+  # velocity proportionally short of the object's real per-batch pace — an
+  # under-estimate, which is the direction to be wrong in for a mechanism whose
+  # whole purpose is to stop a stale heading being asserted with confidence.
   @oru_step_ms 500
   # The gap a re-detection must have opened before its track's filter is rebuilt
   # across it rather than corrected through it. Under a second — two batches at
@@ -133,7 +133,7 @@ defmodule Cairn.Tracker.Stage.Oru do
   gap the replay is for. In that case whatever filter the track was carrying
   is dropped and one is built across the gap from the last box the track was
   really observed at, against virtual observations interpolated towards this
-  detection (`Cairn.Tracker.Kalman.refit/3`).
+  detection (`Membrane.MOTTracker.Kalman.refit/3`).
 
   `refit/3` deliberately stops one step short of the target, and the step it
   stops short of is that `advance/3` — so nothing here predicts, and the

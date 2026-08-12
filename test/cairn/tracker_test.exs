@@ -10,7 +10,7 @@ defmodule Cairn.TrackerTest do
   alias Cairn.Track
   alias Cairn.Tracker
   alias Cairn.Tracker.Bbd
-  alias Cairn.Tracker.Kalman
+  alias Membrane.MOTTracker.Kalman
 
   @max_unseen 3_000
   @stationary_after 10_000

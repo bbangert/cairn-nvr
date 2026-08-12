@@ -72,7 +72,7 @@ defmodule Cairn.Tracker.Bbd do
 
   Boxes are `[x, y, w, h]` **normalized to the frame**, `x, y` the top-left
   corner — the same convention as `Cairn.Tracker.iou/2` and
-  `Cairn.Tracker.Kalman`. The elapsed time is in seconds.
+  `Membrane.MOTTracker.Kalman`. The elapsed time is in seconds.
 
   The arithmetic itself is unit-agnostic, which is the whole of the invariance
   point above, and the property test exploits that by feeding it pixel boxes.
@@ -117,12 +117,12 @@ defmodule Cairn.Tracker.Bbd do
   @theta 16
 
   # Floor for the predicted box's dimensions. Deliberately three orders of
-  # magnitude above `Cairn.Tracker.Kalman`'s `1.0e-6` state floor, because the
-  # dimension enters here squared in a denominator: at `1.0e-6` a degenerate
-  # box turns any ordinary offset into a distance in the millions, which does
-  # not fail loudly but silently refuses every pair the box appears in.
-  # Distance blow-up on degenerate boxes is BBD's documented failure mode. At
-  # a thousandth of a frame the same box yields a distance that is large but
+  # magnitude above `Membrane.MOTTracker.Kalman`'s `1.0e-6` state floor,
+  # because the dimension enters here squared in a denominator: at `1.0e-6` a
+  # degenerate box turns any ordinary offset into a distance in the millions,
+  # which does not fail loudly but silently refuses every pair the box appears
+  # in. Distance blow-up on degenerate boxes is BBD's documented failure mode.
+  # At a thousandth of a frame the same box yields a distance that is large but
   # stays in a range a threshold can still reason about.
   @min_dim 1.0e-3
 

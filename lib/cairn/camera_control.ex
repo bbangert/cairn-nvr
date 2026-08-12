@@ -7,8 +7,9 @@ defmodule Cairn.CameraControl do
   identical to config until Home Assistant sets something. Changes broadcast
   `{:camera_control, camera_id, control}` on `"cameras:control"`.
 
-  `get/1` reads the ETS table directly (hot path: `Cairn.CameraTracker` calls it
-  per detection batch); writes go through the GenServer owner.
+  `get/1` reads the ETS table directly (hot path: the detect branch's
+  `Cairn.Pipeline.ObservationStamper` reads it per buffer and
+  `Cairn.CameraTracker` per batch); writes go through the GenServer owner.
   """
 
   use GenServer

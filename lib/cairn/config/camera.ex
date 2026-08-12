@@ -16,9 +16,11 @@ defmodule Cairn.Config.Camera do
   `min_score`, no `"default"` is invented here. `Cairn.Config.tier_threshold/3`
   is where that distinction is spelled out; nothing else should re-derive it.
 
-  The window seconds, `max_unseen_ms`, `max_live_tracks` and
-  `stationary_after_ms` are overrides:
-  `nil` means "use the global value" (`Cairn.Config.policy/2` resolves them).
+  The window seconds, `max_unseen_ms`, `max_live_tracks`,
+  `stationary_after_ms` and `tracker` are overrides: `nil` means "use the
+  profile's, else the global value" (`Cairn.Config.policy/2` resolves the
+  bounds, `Cairn.Config.tracker/2` the core). `tracker` names one of the cores
+  `Membrane.MOTTracker` can host; an unknown name is a load-time error.
 
   `plugin` selects the camera's detection (absent = none) and resolves to
   `nil | {:group, name}`: a reference to a named entry in the top-level
@@ -35,7 +37,7 @@ defmodule Cairn.Config.Camera do
 
   @known_keys ~w(id rtsp_url plugin pipeline ingest min_score track record extra_ffmpeg_args
                  transcode retention pre_window_seconds post_window_seconds max_event_seconds
-                 max_unseen_ms max_live_tracks stationary_after_ms)
+                 max_unseen_ms max_live_tracks stationary_after_ms tracker)
 
   @default_min_score %{"default" => 0.5}
 
@@ -55,7 +57,8 @@ defmodule Cairn.Config.Camera do
             max_event_seconds: nil,
             max_unseen_ms: nil,
             max_live_tracks: nil,
-            stationary_after_ms: nil
+            stationary_after_ms: nil,
+            tracker: nil
 
   @type t :: %__MODULE__{}
 
@@ -119,7 +122,8 @@ defmodule Cairn.Config.Camera do
       max_event_seconds: Map.get(raw, "max_event_seconds"),
       max_unseen_ms: Map.get(raw, "max_unseen_ms"),
       max_live_tracks: Map.get(raw, "max_live_tracks"),
-      stationary_after_ms: Map.get(raw, "stationary_after_ms")
+      stationary_after_ms: Map.get(raw, "stationary_after_ms"),
+      tracker: Map.get(raw, "tracker")
     }
 
     {cam, acc}

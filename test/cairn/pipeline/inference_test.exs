@@ -9,7 +9,7 @@ defmodule Cairn.Pipeline.InferenceTest do
   alias Cairn.Config.Camera
   alias Cairn.Native.Host
   alias Cairn.NativeStub
-  alias Cairn.Pipeline.{Decoder, DetectSink, Inference, Picker}
+  alias Cairn.Pipeline.{Decoder, Inference, ObservationStamper, Picker, TrackSink}
   alias Cairn.Pipeline.Inference.Detections
   alias Membrane.Buffer
   alias Membrane.Testing
@@ -383,7 +383,7 @@ defmodule Cairn.Pipeline.InferenceTest do
   end
 
   describe "the branch under load" do
-    # The REAL detect branch, all four elements, over the stubbed NIFs.
+    # The REAL detect branch, every element of it, over the stubbed NIFs.
     # 30 fps: the fastest the gate can be told to run, so the pacing tests
     # collect enough samples to measure inside a second.
     setup ctx do
@@ -421,7 +421,9 @@ defmodule Cairn.Pipeline.InferenceTest do
             stream_id: ctx.camera_id,
             stream_params: %{}
           })
-          |> child(:detect, %DetectSink{
+          |> child(:stamper, %ObservationStamper{camera: ctx.camera, policy: @policy})
+          |> child(:tracker, %Membrane.MOTTracker{tracker: {Cairn.Tracker, []}})
+          |> child(:track_sink, %TrackSink{
             camera: ctx.camera,
             policy: @policy,
             tracker: self()
@@ -483,8 +485,9 @@ defmodule Cairn.Pipeline.InferenceTest do
       assert Enum.min(gaps(pushes)) >= 20,
              "two model offers landed #{Enum.min(gaps(pushes))} ms apart: the gate is not pacing"
 
-      # …and every pass's observations crossed the Detections seam into the
-      # dispatch cast — the half a `pushed` counter cannot see.
+      # …and every pass's observations crossed the Detections seam, the
+      # tracker element and the dispatch cast — the half a `pushed` counter
+      # cannot see.
       assert detections_dispatched() >= length(pushes) - 1
     end
 
@@ -504,7 +507,7 @@ defmodule Cairn.Pipeline.InferenceTest do
 
     defp detections_dispatched(count \\ 0) do
       receive do
-        {:"$gen_cast", {:detections, _camera, _policy, _observation}} ->
+        {:"$gen_cast", {:tracked, _camera, _policy, _batch}} ->
           detections_dispatched(count + 1)
       after
         0 -> count

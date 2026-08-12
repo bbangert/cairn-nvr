@@ -5,7 +5,7 @@ defmodule Cairn.Detect.DispatchTest do
 
   alias Cairn.Config.Camera
   alias Cairn.Detect.Dispatch
-  alias Cairn.Observation
+  alias Cairn.Track
 
   # The two tiers, both present and disagreeing: `record:` excludes the label
   # `track:` admits. Anything that read or rewrote the policy on the way through
@@ -23,18 +23,28 @@ defmodule Cairn.Detect.DispatchTest do
     %{camera: %Camera{id: id, rtsp_url: "rtsp://h/1"}, camera_id: id}
   end
 
-  defp observation(pts) do
-    %Observation{camera_id: "unset", pts: pts, at_ms: pts / 90.0, objects: [], protocol: :v1}
+  defp batch(camera_id, object_id) do
+    track = %Track{object_id: object_id, camera_id: camera_id, label: "person", score: 0.9}
+
+    %{
+      tagged: [%{object_id: object_id, label: "person", score: 0.9, bbox: [0, 0, 1, 1]}],
+      events: [{:started, track}],
+      snapshot: [track],
+      suspension: nil,
+      epoch: "epoch_one",
+      observed_at: DateTime.utc_now(),
+      min_score: %{"default" => 0.5}
+    }
   end
 
   describe "forward/4" do
-    test "hands the tracker the camera, the policy and the observation, unread", ctx do
+    test "hands the tracker the camera, the policy and the batch, unread", ctx do
       camera = ctx.camera
-      observation = observation(90_000)
+      batch = batch(ctx.camera_id, "o1")
 
-      assert :ok = Dispatch.forward(camera, @policy, observation, tracker: self())
+      assert :ok = Dispatch.forward(camera, @policy, batch, tracker: self())
 
-      assert_received {:"$gen_cast", {:detections, ^camera, policy, ^observation}}
+      assert_received {:"$gen_cast", {:tracked, ^camera, policy, ^batch}}
       assert policy == @policy
       # both tiers arrive whole, and neither moved the other
       assert policy.track == @policy.track
@@ -47,29 +57,10 @@ defmodule Cairn.Detect.DispatchTest do
       # path minus the tracker's body.
       {:ok, _} = Registry.register(Cairn.Registry, {ctx.camera_id, :camera_tracker}, nil)
 
-      assert :ok = Dispatch.forward(ctx.camera, @policy, observation(90_000))
+      assert :ok = Dispatch.forward(ctx.camera, @policy, batch(ctx.camera_id, "o1"))
 
       camera = ctx.camera
-      assert_received {:"$gen_cast", {:detections, ^camera, @policy, %Observation{}}}
-    end
-  end
-
-  describe "forward_all/4" do
-    test "delivers one push's frames in order", ctx do
-      observations = Enum.map([90_000, 93_000, 96_000], &observation/1)
-
-      assert :ok = Dispatch.forward_all(ctx.camera, @policy, observations, tracker: self())
-
-      for %Observation{pts: pts} <- observations do
-        assert_received {:"$gen_cast", {:detections, _camera, _policy, %Observation{pts: ^pts}}}
-      end
-
-      refute_received {:"$gen_cast", {:detections, _camera, _policy, _observation}}
-    end
-
-    test "an empty push casts nothing", ctx do
-      assert :ok = Dispatch.forward_all(ctx.camera, @policy, [], tracker: self())
-      refute_received {:"$gen_cast", _message}
+      assert_received {:"$gen_cast", {:tracked, ^camera, @policy, %{tagged: [_]}}}
     end
   end
 
@@ -82,7 +73,7 @@ defmodule Cairn.Detect.DispatchTest do
     end
 
     test "every producer routes through it, and none reaches the tracker itself" do
-      for producer <- [Cairn.Pipeline.DetectSink] do
+      for producer <- [Cairn.Pipeline.TrackSink] do
         assert Dispatch in calls(producer), "#{inspect(producer)} does not use the seam"
 
         refute Cairn.CameraTracker in calls(producer),

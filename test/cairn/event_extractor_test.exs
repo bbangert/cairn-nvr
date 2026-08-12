@@ -14,7 +14,8 @@ defmodule Cairn.EventExtractorTest do
     MP4.Demuxer,
     Observation,
     Reconciler,
-    RingBuffer
+    RingBuffer,
+    TrackerDriver
   }
 
   alias Cairn.Config.Camera
@@ -285,7 +286,7 @@ defmodule Cairn.EventExtractorTest do
       })
 
     Enum.each(frags, &RingBuffer.put_fragment(camera.id, &1))
-    CameraTracker.detections(tracker, camera, @policy, observation(camera.id))
+    TrackerDriver.detections(tracker, camera, @policy, observation(camera.id))
 
     assert {:event_started, %Event{id: event_id}} = next_lifecycle(camera.id)
     assert %{status: :active} = wait_row(event_id)

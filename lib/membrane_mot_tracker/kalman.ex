@@ -1,4 +1,4 @@
-defmodule Cairn.Tracker.Kalman do
+defmodule Membrane.MOTTracker.Kalman do
   @moduledoc """
   ByteTrack's per-track motion filter: an 8-dimensional constant-velocity
   Kalman filter over a box's centre, aspect ratio and height.
@@ -29,11 +29,10 @@ defmodule Cairn.Tracker.Kalman do
   this module's guess about where an object would be *if it were still there*,
   which is precisely the question a detection answers and an extrapolation
   cannot; letting one become a track's box would let a filter talk a departed
-  object into existence for as long as it kept guessing. `Cairn.Tracker`'s
-  stitching already refuses predicted *observations* for that reason (see the
-  `Observation.detected?/1` gate in `adopt/4`), and predictions minted here are
-  weaker evidence still: nothing outside this module has even claimed to have
-  seen them.
+  object into existence for as long as it kept guessing. A tracker that already
+  refuses a *detector's* predicted observations as evidence is refusing
+  something stronger than this: nothing outside this module has even claimed to
+  have seen a prediction.
 
   ## Virtual observations
 
@@ -43,8 +42,8 @@ defmodule Cairn.Tracker.Kalman do
   prediction and a seed, and it sits opposite both of them.
 
   A *prediction* is the filter's own guess, and per the cardinal rule above is
-  a matching input only — it never becomes a track's box. A *seed* is the
-  plugin re-reporting a real sighting of an identity it already knows: it
+  a matching input only — it never becomes a track's box. A *seed* is a
+  detector re-reporting a real sighting of an identity it already knows: it
   refreshes liveness and moves the track's box, but it never touches the
   filter — the filter already saw the original detection through the ordinary
   detect-and-match path — and the stillness rule does not evaluate a
@@ -81,10 +80,10 @@ defmodule Cairn.Tracker.Kalman do
   ## Units
 
   Boxes are `[x, y, w, h]` **normalized to the frame**, `x, y` the top-left
-  corner — the same convention as `Cairn.Tracker.iou/2` and everything else the
-  host passes around. Widths and heights are fractions of the frame and so lie
-  in `0..1`; a corner is not bounded the same way, because a detection may
-  legally overhang the frame edge and an object halfway out of shot does.
+  corner — the same convention as the overlap arithmetic a prediction is fed
+  to. Widths and heights are fractions of the frame and so lie in `0..1`; a
+  corner is not bounded the same way, because a detection may legally overhang
+  the frame edge and an object halfway out of shot does.
 
   `predicted_bbox/1` keeps to exactly that. It returns a box whose width and
   height are positive and no larger than the frame, and whose origin is free.
@@ -273,13 +272,13 @@ defmodule Cairn.Tracker.Kalman do
   one-step gap.
 
   Re-initializing from the anchor rather than continuing whatever filter the
-  track already had is the same choice for both of the gaps
-  `Cairn.Tracker.Stage.Oru` sends here — the live re-match, whose track
-  carries a coasted filter, and the stream-reset adoption, whose track
-  carries none at all because the reset dropped it: a uniform rebuild is the
-  only version of this that covers a caller with nothing to continue from.
-  It also needs no extra track state, and the replay's virtual updates
-  teach the rebuilt filter the gap's actual per-step displacement directly —
+  track already had is the same choice for both of the gaps a caller replays
+  here — the live re-match, whose track carries a coasted filter, and the
+  stream-reset adoption, whose track carries none at all because the reset
+  dropped it: a uniform rebuild is the only version of this that covers a
+  caller with nothing to continue from. It also needs no extra track state, and
+  the replay's virtual updates teach the rebuilt filter the gap's actual
+  per-step displacement directly —
   which is the point, since it is exactly the pre-gap momentum that a coast
   would otherwise keep asserting through a gap ORU exists to be skeptical of.
   """
@@ -316,11 +315,11 @@ defmodule Cairn.Tracker.Kalman do
   Bounding the dimensions is not cosmetic. `w` comes out of the state as
   `a * h`, a product of two estimates either of which a run of bad measurements
   can drive towards zero, and what consumes this box is overlap arithmetic that
-  assumes a box with area — `Cairn.Tracker.iou/2` returns a flat `0.0` for
-  anything with none, so a degenerate prediction would quietly match nothing
-  rather than fail where it could be seen. Width and height are therefore
-  floored away from zero and capped at the frame, and that is the whole of what
-  the arithmetic downstream needs.
+  assumes a box with area — an IoU returns a flat `0.0` for anything with none,
+  so a degenerate prediction would quietly match nothing rather than fail where
+  it could be seen. Width and height are therefore floored away from zero and
+  capped at the frame, and that is the whole of what the arithmetic downstream
+  needs.
 
   The corner is left exactly where the state puts it, which is the other half
   of the same decision `clamp_state/1` makes: the centre is deliberately free

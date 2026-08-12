@@ -5,8 +5,13 @@ defmodule Cairn.EventCheckpoint do
   the data survives a `Cairn.CameraTracker` crash. A replacement tracker
   restores its own camera's row from here (`get/1`) — re-attaching to a
   still-running extractor or dropping an orphaned entry, and ending every
-  restored track (`:host_restart`), since a fresh `Cairn.Tracker` knows
-  nothing about them.
+  restored track (`:host_restart`), since the tracker element those tracks
+  belonged to knows nothing of the replacement.
+
+  The tracks are the snapshot the batch carried (`checkpoint_tracks/1` on the
+  camera's tracker core), not something the writer derived: the tracking lives
+  in the pipeline now, and this row is the only place it crosses into
+  something that outlives one.
   """
 
   use GenServer

@@ -89,6 +89,11 @@ tracking:
   max_unseen_ms: 3000
   max_live_tracks: 128
   stationary_after_ms: 10000
+  # Which tracker the detect branch hosts. "cairn" is this codebase's own;
+  # "sparsetrack" is the port of the vendored SparseTrack reference, parity-
+  # gated against it on MOT sequences and measured nowhere else yet, which is
+  # why it is selectable but not the default. Camera > profile > global.
+  tracker: cairn
   bbd: false
   oru: false
   ocr: false

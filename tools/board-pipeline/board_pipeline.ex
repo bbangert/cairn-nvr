@@ -10,28 +10,38 @@ defmodule Cairn.Config do
   defstruct []
 end
 
-defmodule Cairn.CameraTracker do
+defmodule Cairn.BoardPipeline.DetectionSink do
   @moduledoc """
-  Stand-in for the application's tracker, shaped exactly like the two
-  `detections` heads `Cairn.Detect.Dispatch` calls — the harness compiles
-  this file instead of `lib/cairn/camera_tracker.ex`, whose real module
-  drags in the tracker pool, Ecto and PubSub. The sink is always given an
-  explicit `tracker:`, so the 3-arity head (the camera's own tracker) is
-  unreachable here and refuses loudly rather than counting nothing.
+  The harness's own terminus, and the one place it stops being the production
+  spec verbatim.
+
+  Production ends the branch in three host-side elements —
+  `Cairn.Pipeline.ObservationStamper`, the generic `Membrane.MOTTracker` and
+  `Cairn.Pipeline.TrackSink` — none of which touch a NIF, and whose closure
+  (the tracker core, its stages, the runtime control overlay) is most of the
+  application. This harness asks what the pipeline *around the NIFs* does, so
+  it ends where the NIF's output does: at `Inference`'s own pad, counting the
+  frames it emits.
   """
 
-  alias Cairn.Observation
+  use Membrane.Sink
 
-  def detections(camera, _policy, %Observation{}) do
-    raise "board-pipeline: dispatch for #{camera.id} lost its tracker override"
+  alias Cairn.Pipeline.Inference.Detections
+
+  def_input_pad(:input, accepted_format: %Detections{}, flow_control: :auto)
+
+  def_options(camera_id: [spec: String.t()], collector: [spec: pid()])
+
+  @impl true
+  def handle_init(_ctx, opts), do: {[], %{camera_id: opts.camera_id, collector: opts.collector}}
+
+  @impl true
+  def handle_buffer(:input, %{metadata: %{observations: observations}}, _ctx, state) do
+    GenServer.cast(state.collector, {:detections, state.camera_id, observations})
+    {[], state}
   end
 
-  def detections(nil, camera, policy, observation), do: detections(camera, policy, observation)
-
-  # The same cast the real tracker receives, so the collector measures the
-  # production dispatch path and not a harness-only shortcut.
-  def detections(server, camera, policy, %Observation{} = observation),
-    do: GenServer.cast(server, {:detections, camera, policy, observation})
+  def handle_buffer(:input, _buffer, _ctx, state), do: {[], state}
 end
 
 defmodule Cairn.BoardPipeline.AuSource do
@@ -197,9 +207,9 @@ defmodule Cairn.BoardPipeline.Collector do
   end
 
   @impl true
-  def handle_cast({:detections, camera, _policy, observation}, state) do
+  def handle_cast({:detections, camera_id, observations}, state) do
     now = System.monotonic_time(:millisecond)
-    cam = Map.get_lazy(state.cams, camera.id, &new_cam/0)
+    cam = Map.get_lazy(state.cams, camera_id, &new_cam/0)
 
     cam =
       case cam.last_at_ms do
@@ -213,12 +223,12 @@ defmodule Cairn.BoardPipeline.Collector do
 
     cam = %{
       cam
-      | observations: cam.observations + 1,
-        objects: cam.objects + length(observation.objects),
+      | observations: cam.observations + length(observations),
+        objects: cam.objects + Enum.sum(Enum.map(observations, &length(&1.objects))),
         last_at_ms: now
     }
 
-    {:noreply, %{state | cams: Map.put(state.cams, camera.id, cam)}}
+    {:noreply, %{state | cams: Map.put(state.cams, camera_id, cam)}}
   end
 
   @impl true
@@ -360,8 +370,8 @@ defmodule Cairn.BoardPipeline.Pipe do
 
   use Membrane.Pipeline
 
-  alias Cairn.BoardPipeline.AuSource
-  alias Cairn.Pipeline.{Decoder, DetectSink, Inference, Picker}
+  alias Cairn.BoardPipeline.{AuSource, DetectionSink}
+  alias Cairn.Pipeline.{Decoder, Inference, Picker}
 
   @impl true
   def handle_init(_ctx, opts) do
@@ -394,15 +404,7 @@ defmodule Cairn.BoardPipeline.Pipe do
         stream_id: camera.id,
         stream_params: %{stream_epoch: epoch}
       })
-      |> child(:detect, %DetectSink{
-        camera: camera,
-        # Carried unread through Dispatch into the collector's cast; the real
-        # resolver (`Cairn.Config.policy/2`) lives in modules this harness
-        # deliberately does not compile.
-        policy: %{},
-        epoch: epoch,
-        tracker: collector
-      })
+      |> child(:detect, %DetectionSink{camera_id: camera.id, collector: collector})
 
     {[spec: spec], %{collector: collector, camera_id: camera.id}}
   end
@@ -429,12 +431,12 @@ end
 defmodule Cairn.BoardPipeline do
   @moduledoc """
   Runs cairn's real membrane detect branch — parser, `Cairn.Pipeline.Picker`,
-  `Cairn.Pipeline.Decoder`, `Cairn.Pipeline.Inference`,
-  `Cairn.Pipeline.DetectSink` — against a real `Cairn.Native.Host` (with its
-  `Cairn.Native.Health` monitor) in a standalone BEAM: plan task 5.2's other
-  half. `Cairn.BoardSoak` asks whether the NIFs survive; this asks whether
-  the *pipeline around them* behaves — the format-driven decoder open, the
-  one-frame manual seams, the dispatch into a tracker.
+  `Cairn.Pipeline.Decoder`, `Cairn.Pipeline.Inference` — against a real
+  `Cairn.Native.Host` (with its `Cairn.Native.Health` monitor) in a standalone
+  BEAM: plan task 5.2's other half. `Cairn.BoardSoak` asks whether the NIFs
+  survive; this asks whether the *pipeline around them* behaves — the
+  format-driven decoder open, the one-frame manual seams, the pacing of the
+  model call.
 
   Compiled with `elixirc`, not `mix`: no release and no cairn application,
   only the module subset `tools/board-pipeline/run-local.sh` lists plus the
@@ -445,8 +447,9 @@ defmodule Cairn.BoardPipeline do
     * `canary: [enabled: false]` — no `cairn-detect` binary is spawned;
     * a `stream_epoch` in the inference params — `Cairn.StreamEpochs` is
       short-circuited (its ETS-missing paths answer `:unknown` harmlessly);
-    * DetectSink's `tracker:` — dispatch casts to the collector instead of a
-      camera tracker pool.
+    * `Cairn.BoardPipeline.DetectionSink` — the branch ends at the inference
+      element's pad, so the host-side tracker closure stays out (see that
+      module).
 
   The undefined-module warnings the standalone compile emits — `Cairn.Config`
   / `Cairn.Config.Server` (host.ex, config/camera.ex, canary.ex) and

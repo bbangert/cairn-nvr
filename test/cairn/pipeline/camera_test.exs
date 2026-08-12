@@ -24,7 +24,9 @@ defmodule Cairn.Pipeline.CameraTest do
     def handle_info(:flush, _ctx, state), do: {[], state}
   end
 
-  @policy %{pre: 5, post: 10, max: 300, track: nil, record: nil}
+  # `Cairn.Config.policy/2`'s shape, not a subset of it: the branch reads
+  # `max_live_tracks` off it to cap what a boundary may keep adoptable.
+  @policy %{pre: 5, post: 10, max: 300, track: nil, record: nil, max_live_tracks: 128}
 
   defp init(opts) do
     Pipeline.handle_init(
@@ -38,9 +40,11 @@ defmodule Cairn.Pipeline.CameraTest do
     spec
   end
 
-  # The detect branch needs a policy; every test that wants one wants the same
-  # one.
-  defp detect(opts \\ []), do: Keyword.put_new(opts, :policy, @policy)
+  # The detect branch needs a policy and a tracker core; every test that wants
+  # one wants the same pair.
+  defp detect(opts \\ []) do
+    opts |> Keyword.put_new(:policy, @policy) |> Keyword.put_new(:tracker, Cairn.Tracker)
+  end
 
   defp children(spec) do
     for builder <- spec, {name, definition, _opts} <- builder.children, into: %{} do
@@ -217,14 +221,26 @@ defmodule Cairn.Pipeline.CameraTest do
       assert log =~ "track identity"
     end
 
-    test "the detect sink's stats reach the owner, which is what the watchdog reads" do
+    test "the track sink's stats reach the owner, which is what the watchdog reads" do
       {_actions, state} = init(detect: detect())
       stats = %{dispatched: 1, dropped: 0, last_buffer_at_ms: -12_345}
 
       assert {[], _state} =
-               Pipeline.handle_child_notification({:stats, stats}, :detect, %{}, state)
+               Pipeline.handle_child_notification({:stats, stats}, :track_sink, %{}, state)
 
       assert_receive {:stats, ^stats}
+    end
+
+    test "the stamper's end_all reaches the tracker, the one hop between them" do
+      {_actions, state} = init(detect: detect())
+
+      assert {[notify_child: {:tracker, {:end_all, :detection_disabled}}], _state} =
+               Pipeline.handle_child_notification(
+                 {:end_all, :detection_disabled},
+                 :stamper,
+                 %{},
+                 state
+               )
     end
   end
 
@@ -237,12 +253,14 @@ defmodule Cairn.Pipeline.CameraTest do
       assert Map.has_key?(children, {:ring_sink, 0})
     end
 
-    test "hangs off the tee: picker, decoder, inference, then the sink" do
+    test "hangs off the tee: picker, decoder, inference, stamper, tracker, sink" do
       spec = spec(detect: detect())
       links = links(spec)
 
       assert Enum.any?(links, &match?(%{from: :tee, to: :picker}, &1))
-      assert Enum.any?(links, &match?(%{from: :infer, to: :detect}, &1))
+      assert Enum.any?(links, &match?(%{from: :infer, to: :stamper}, &1))
+      assert Enum.any?(links, &match?(%{from: :stamper, to: :tracker}, &1))
+      assert Enum.any?(links, &match?(%{from: :tracker, to: :track_sink}, &1))
 
       # One AU in flight into the decoder, one sampled frame into inference.
       for {from, to} <- [{:picker, :decoder}, {:decoder, :infer}] do
@@ -253,6 +271,13 @@ defmodule Cairn.Pipeline.CameraTest do
         assert props.target_queue_size == 1
         assert props.min_demand_factor == 0.5
       end
+    end
+
+    test "the tracker element hosts the core the owner resolved, capped by the policy" do
+      spec = spec(detect: detect(tracker: Cairn.Detect.SparseTrack))
+
+      assert %Membrane.MOTTracker{tracker: {Cairn.Detect.SparseTrack, []}, max_suspended: 128} =
+               child(spec, :tracker)
     end
 
     test "the picker takes no options — the decoder's gate owns the rate" do
@@ -353,13 +378,15 @@ defmodule Cairn.Pipeline.CameraTest do
   end
 
   describe "the owner's messages" do
-    test "a reload's policy is forwarded to the sink, the only child that holds one" do
+    test "a reload's policy is forwarded to both children that hold one" do
       {_actions, state} = init(detect: detect())
       camera = %Camera{id: "cam", record: %{"person" => %{min_score: 0.9}}}
       policy = Map.put(@policy, :record, camera.record)
 
-      assert {[notify_child: {:detect, {:policy, ^camera, ^policy}}], _state} =
-               Pipeline.handle_info({:policy, camera, policy}, %{}, state)
+      assert {[
+                notify_child: {:stamper, {:policy, ^camera, ^policy}},
+                notify_child: {:track_sink, {:policy, ^camera, ^policy}}
+              ], _state} = Pipeline.handle_info({:policy, camera, policy}, %{}, state)
     end
 
     test "a policy is dropped for a camera whose detect branch was never built" do
@@ -373,7 +400,7 @@ defmodule Cairn.Pipeline.CameraTest do
       {_actions, detecting} = init(detect: detect())
       {_actions, plain} = init([])
 
-      assert {[notify_child: {:detect, :stats}], _state} =
+      assert {[notify_child: {:track_sink, :stats}], _state} =
                Pipeline.handle_info(:detect_stats, %{}, detecting)
 
       assert {[], ^plain} = Pipeline.handle_info(:detect_stats, %{}, plain)

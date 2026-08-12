@@ -2,9 +2,10 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
   @moduledoc """
   Phase-1 acceptance, end to end through the real `Cairn.Pipeline.Camera` under
   its real `Cairn.PipelineOwner`: a session boundary costs the pipeline and
-  every long-lived element nothing, reaches `Cairn.CameraTracker` as an epoch
-  change, cannot let an observation of the session that ended reach the next
-  one's tracks, and never announces the stream as stopped.
+  every long-lived element nothing, cuts the tracker element's live set in band
+  (phase 2 moved the tracking there; the epoch announcement no longer does it),
+  cannot let an observation of the session that ended reach the next one's
+  event lifecycle, and never announces the stream as stopped.
 
   The boundary is driven on the bridge ingest, the one whose session lifecycle
   a test owns outright: `Cairn.Pipeline.BridgeSource` registers itself in
@@ -33,7 +34,8 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
     Track
   }
 
-  alias Cairn.Pipeline.DetectSink
+  alias Cairn.Pipeline.ObservationStamper
+  alias Cairn.TrackerDriver
   alias Membrane.Buffer
   alias Membrane.Testing.Pipeline, as: TestingPipeline
 
@@ -47,6 +49,9 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
   @box [0.1, 0.1, 0.2, 0.4]
   # No overlap with @box, so nothing the adoption floor could take for it.
   @far_box [0.6, 0.1, 0.2, 0.4]
+  # …and no overlap with either, for a batch that has to mint rather than adopt
+  # whatever the two above left suspended.
+  @third_box [0.6, 0.55, 0.2, 0.4]
 
   describe "a session boundary" do
     @tag :capture_log
@@ -57,7 +62,8 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
         start_camera(id, plugin: {:group, "g"})
 
       # The whole long-lived half, including the detect branch: the decoder's
-      # and inference's native state is exactly what a reconnect must not cost.
+      # and inference's native state is exactly what a reconnect must not cost,
+      # and so — since phase 2 — are the tracker element's live tracks.
       long_lived = [
         :source,
         :tagger,
@@ -67,7 +73,9 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
         :picker,
         :decoder,
         :infer,
-        :detect
+        :stamper,
+        :tracker,
+        :track_sink
       ]
 
       before = Map.new(long_lived, &{&1, child_pid(pipeline, &1)})
@@ -157,24 +165,31 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
       assert_receive {:stream_epoch, ^id, second, :source_lost}, 10_000
       await_tracker_epoch(tracker, second)
 
-      # The suspend half, driven by the boundary the pipeline signalled in band
-      # and nothing else — no process here announced an epoch.
+      # The announcement alone cuts nothing: the tracker element crosses the
+      # boundary in band, on the first buffer that carries the new epoch, so
+      # until one arrives the track is still live and still this session's.
+      assert [%Track{object_id: ^oid}] = TrackerDriver.live_tracks(id)
+      assert TrackerDriver.suspended_tracks(id) == []
+
+      # That buffer does both halves at once, in one batch, which is the shape
+      # production has: the live set is suspended before this batch's own
+      # objects are tracked, and then the same box — on the far side of a
+      # reconnect that took no time at all — adopts out of it rather than
+      # arriving as something new.
+      _sink = detect(sink, second, @box, 180_000)
+
       assert_receive {:telemetry, [:cairn, :tracker, :stream_reset], %{suspended: 1, ended: 0},
                       %{camera_id: ^id, reason: :source_lost}},
                      2_000
-
-      assert live_tracks(tracker) == []
-      assert [%Track{object_id: ^oid, end_reason: nil}] = suspended_tracks(tracker)
-
-      # …and the adopt half: the same box on the far side of a reconnect that
-      # took no time at all is the same object, not a new arrival.
-      _sink = detect(sink, second, @box, 180_000)
 
       assert_receive {:telemetry, [:cairn, :tracker, :adopted], %{count: 1}, %{camera_id: ^id}},
                      2_000
 
       assert_receive {:track_updated, %Track{object_id: ^oid, epoch: ^second}}, 2_000
       refute_received {:track_started, _}
+
+      assert [%Track{object_id: ^oid}] = TrackerDriver.live_tracks(id)
+      assert TrackerDriver.suspended_tracks(id) == []
     end
 
     @tag :capture_log
@@ -202,17 +217,83 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
       sink = detect(sink, first, @far_box, 180_000)
       _ = :sys.get_state(tracker)
 
+      # Nothing of it reached the event lifecycle: no summary was broadcast and
+      # no event moved. The tracker element did see it — it precedes the
+      # boundary in the branch's own order, which is what makes it the tail of
+      # the old session rather than a stray — and the identity it minted for
+      # that box is one this process was never told about.
       refute_received {:track_started, _}
       refute_received {:track_updated, _}
-      # nothing smeared into the new session: the cut track is still parked
-      # exactly as the boundary left it
-      assert [%Track{object_id: ^oid, end_reason: nil}] = suspended_tracks(tracker)
 
-      # The control: the identical batch under the epoch now being decoded is
-      # taken, so what dropped the first one was its tag and nothing else.
-      _sink = detect(sink, second, @far_box, 270_000)
+      # The control: a box under the epoch now being decoded is taken, so what
+      # dropped the first one was its tag and nothing else. A third box, not
+      # the drained one, because that one now has an identity in the element
+      # that the boundary would let it adopt.
+      _sink = detect(sink, second, @third_box, 270_000)
       assert_receive {:track_started, %Track{object_id: other, epoch: ^second}}, 2_000
       refute other == oid
+    end
+  end
+
+  describe "a pipeline rebuild" do
+    @tag :capture_log
+    test "takes the tracker element's tracks and leaves the event to finalize" do
+      id = uid("rebuild")
+
+      %{camera: camera, owner: owner, pipeline: pipeline, source: source} =
+        start_camera(id, plugin: {:group, "g"})
+
+      tracker = start_tracker(id)
+      Event.subscribe()
+
+      session(source, short_media())
+      assert_receive {:stream_epoch, ^id, epoch, :started}, 10_000
+      await_tracker_epoch(tracker, epoch)
+
+      element = await_child(pipeline, :tracker)
+
+      # A live track behind an open event — the state a rebuild is expensive
+      # for, split across the two processes that hold it.
+      _sink = detect(sink(camera, tracker), epoch, @box, 90_000)
+      assert_receive {:track_started, %Track{object_id: oid, epoch: ^epoch}}, 2_000
+      assert_receive {:event_started, %Event{id: eid}}, 2_000
+      assert [%Track{object_id: ^oid}] = TrackerDriver.live_tracks(id)
+
+      # The watchdog's escalation, driven rather than waited out: the detect
+      # branch last produced a buffer two stall windows ago while the ring is
+      # younger than one, and the tick that reads that is this process's.
+      send(owner, {:stats, %{last_buffer_at_ms: System.monotonic_time(:millisecond) - 60_000}})
+      send(owner, :watchdog)
+
+      rebuilt = await_pipeline(owner, pipeline)
+      assert rebuilt != pipeline
+
+      # The tracks went with the element, because the element is a child of the
+      # pipeline that was torn down. Nothing handed them over and nothing was
+      # meant to: the driver's stand-in is dropped here for the same reason.
+      await_dead(element)
+      TrackerDriver.reset(id)
+
+      # …and the pipeline that replaced it starts from nothing. Read off the
+      # element's own state because neither a pad nor a notification exposes the
+      # core, and a rebuild that ever grew a handoff would pass every other
+      # assertion in this file.
+      fresh = :sys.get_state(await_child(rebuilt, :tracker)).internal_state
+      assert %{epoch: nil, processed: 0} = fresh
+      assert Cairn.Tracker.live_tracks(fresh.core) == []
+      assert Cairn.Tracker.suspended_tracks(fresh.core) == []
+
+      # The finals went with them, which is the documented gap: this process
+      # never crashed, so no checkpoint restore runs and nobody owes `oid` a
+      # summary — its row closes at the next boot (`Cairn.Tracks.close_live/0`).
+      refute_received {:track_ended, _}
+
+      # What the rebuild must not cost is the event. The camera tracker outlives
+      # the pipeline, so the post window it is already holding is what closes
+      # it, with no further evidence and no tracker element to produce any.
+      send(tracker, {:post_window, eid, :sys.get_state(tracker).post_token})
+      assert_receive {:event_ended, %Event{id: ^eid, ended_at: ended_at}}, 2_000
+      assert ended_at != nil
     end
   end
 
@@ -388,6 +469,14 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
     end
   end
 
+  defp await_dead(pid, attempts \\ 300) do
+    cond do
+      not Process.alive?(pid) -> :ok
+      attempts > 0 -> Process.sleep(10) && await_dead(pid, attempts - 1)
+      true -> flunk("#{inspect(pid)} outlived the pipeline that owned it")
+    end
+  end
+
   # -- the ring's broadcasts ----------------------------------------------------
 
   # Fragments and inits in the order the ring published them — a mailbox scan
@@ -423,28 +512,36 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
     )
   end
 
-  # The real sink of the detect branch, driven at its input pad: the epoch it
-  # tags observations with comes from the buffer, which is the whole point of
-  # D8 and what tests (c) turns on.
+  # The real head of the detect branch's cairn-side half, driven at its input
+  # pad: the epoch it tags observations with comes from the buffer, which is
+  # the whole point of D8 and what the staleness test turns on. Its batches go
+  # on through the real tracker element and the real sink
+  # (`Cairn.TrackerDriver`), so the only thing skipped between the NIF and the
+  # camera tracker is the NIF.
   defp sink(camera, tracker) do
     {[], state} =
-      DetectSink.handle_init(
+      ObservationStamper.handle_init(
         %{},
-        struct(DetectSink, camera: camera, policy: @policy, tracker: tracker)
+        struct(ObservationStamper, camera: camera, policy: @policy)
       )
 
-    state
+    %{stamper: state, camera: camera, tracker: tracker}
   end
 
-  defp detect(sink_state, epoch, bbox, pts) do
+  defp detect(%{stamper: stamper} = sink, epoch, bbox, pts) do
     buffer = %Buffer{
       payload: <<>>,
       pts: pts,
       metadata: %{observations: [frame(bbox, pts)], stream_epoch: epoch}
     }
 
-    {[], state} = DetectSink.handle_buffer(:input, buffer, %{}, sink_state)
-    state
+    {actions, stamper} = ObservationStamper.handle_buffer(:input, buffer, %{}, stamper)
+
+    for {:buffer, {:output, batch}} <- actions do
+      TrackerDriver.batch(sink.tracker, sink.camera, @policy, batch)
+    end
+
+    %{sink | stamper: stamper}
   end
 
   # One frame of `Cairn.Pipeline.Inference`'s observation shape, carrying a
@@ -476,11 +573,6 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
         flunk("tracker never applied epoch #{epoch} (holds #{inspect(other)})")
     end
   end
-
-  defp live_tracks(tracker), do: Cairn.Tracker.live_tracks(:sys.get_state(tracker).tracker)
-
-  defp suspended_tracks(tracker),
-    do: Cairn.Tracker.suspended_tracks(:sys.get_state(tracker).tracker)
 
   # The suspend/adopt path's public report. `Logger.info` is emitted beside it
   # and this env runs the logger at :warning, so telemetry is what a test can

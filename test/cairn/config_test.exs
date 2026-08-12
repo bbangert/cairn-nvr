@@ -112,6 +112,38 @@ defmodule Cairn.ConfigTest do
       end
     end
 
+    test "the tracker core resolves camera > profile > global" do
+      # The profile fixture names none, so the global answers for its cameras
+      # until one of the two more specific levels speaks.
+      map = Map.put(base_map(), "tracking", %{"tracker" => "sparsetrack"})
+      assert {:ok, config, []} = Config.from_map(map)
+      assert Config.tracker(config, hd(config.cameras)) == Cairn.Detect.SparseTrack
+
+      map = update_in(map, ["cameras"], fn [a, b] -> [Map.put(a, "tracker", "cairn"), b] end)
+      assert {:ok, config, []} = Config.from_map(map)
+      assert Config.tracker(config, hd(config.cameras)) == Cairn.Tracker
+      assert Config.tracker(config, List.last(config.cameras)) == Cairn.Detect.SparseTrack
+    end
+
+    test "a config that names no tracker gets the cairn core" do
+      assert {:ok, config, []} = Config.from_map(base_map())
+      assert config.tracker == "cairn"
+      assert Config.tracker(config, hd(config.cameras)) == Cairn.Tracker
+    end
+
+    test "an unknown tracker name is refused at load, wherever it was named" do
+      global = Map.put(base_map(), "tracking", %{"tracker" => "bytetrack"})
+      assert {:error, errors} = Config.from_map(global)
+      assert Enum.any?(errors, &(&1 =~ ~s(tracking.tracker: unknown tracker "bytetrack")))
+      assert Enum.any?(errors, &(&1 =~ "cairn, sparsetrack"))
+
+      per_camera =
+        update_in(base_map(), ["cameras"], fn [a, b] -> [Map.put(a, "tracker", "nope"), b] end)
+
+      assert {:error, errors} = Config.from_map(per_camera)
+      assert Enum.any?(errors, &(&1 =~ ~s(camera cam_a: tracker: unknown tracker "nope")))
+    end
+
     test "per-camera max_live_tracks overrides are validated" do
       map =
         update_in(base_map(), ["cameras"], fn [a, b] ->
@@ -970,6 +1002,20 @@ defmodule Cairn.ConfigTest do
         "det" => %{"profile" => profile, "allow_experimental" => true}
       })
       |> put_plugin(0, "det")
+    end
+
+    test "a profile's tracker outranks the global and yields to the camera's" do
+      map = Map.put(profiled_map(), "tracking", %{"tracker" => "cairn"})
+      assert {:ok, config, _warnings} = Config.from_map(map)
+
+      # cam_a is on the profiled group, cam_b on none
+      assert [profiled, unprofiled] = config.cameras
+      assert Config.tracker(config, profiled) == Cairn.Detect.SparseTrack
+      assert Config.tracker(config, unprofiled) == Cairn.Tracker
+
+      map = update_in(map, ["cameras"], fn [a, b] -> [Map.put(a, "tracker", "cairn"), b] end)
+      assert {:ok, config, _warnings} = Config.from_map(map)
+      assert Config.tracker(config, hd(config.cameras)) == Cairn.Tracker
     end
 
     test "a profiled group resolves its file into the parsed struct" do

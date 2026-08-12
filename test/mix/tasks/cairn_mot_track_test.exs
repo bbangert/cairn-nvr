@@ -94,14 +94,14 @@ defmodule Mix.Tasks.Cairn.Mot.TrackTest do
     end
   end
 
-  describe "object/2" do
+  describe "object/3" do
     @seqinfo %{im_width: 100, im_height: 100}
 
     test "normalizes to 0..1 ltwh and clamps overhang to the frame" do
       det = %{frame: 1, x: -5.0, y: -5.0, w: 20.0, h: 20.0, conf: 0.9}
 
       assert %{bbox: [+0.0, +0.0, w, h], label: "person", observation_kind: "detected"} =
-               Track.object(det, @seqinfo)
+               Track.object(det, @seqinfo, :normalized)
 
       assert_in_delta w, 0.15, 1.0e-9
       assert_in_delta h, 0.15, 1.0e-9
@@ -109,13 +109,13 @@ defmodule Mix.Tasks.Cairn.Mot.TrackTest do
 
     test "clamps confidence into 0..1" do
       det = %{frame: 1, x: 10.0, y: 10.0, w: 20.0, h: 20.0, conf: 2.31}
-      assert %{score: 1.0} = Track.object(det, @seqinfo)
+      assert %{score: 1.0} = Track.object(det, @seqinfo, :normalized)
     end
 
     test "clamps high-side overhang back to the frame edge" do
       det = %{frame: 1, x: 90.0, y: 85.0, w: 20.0, h: 20.0, conf: 0.9}
 
-      assert %{bbox: [x, y, w, h]} = Track.object(det, @seqinfo)
+      assert %{bbox: [x, y, w, h]} = Track.object(det, @seqinfo, :normalized)
       assert_in_delta x, 0.9, 1.0e-9
       assert_in_delta y, 0.85, 1.0e-9
       assert_in_delta w, 0.1, 1.0e-9
@@ -124,15 +124,28 @@ defmodule Mix.Tasks.Cairn.Mot.TrackTest do
 
     test "drops a box entirely outside the frame" do
       det = %{frame: 1, x: 150.0, y: 150.0, w: 20.0, h: 20.0, conf: 0.9}
-      assert Track.object(det, @seqinfo) == nil
+      assert Track.object(det, @seqinfo, :normalized) == nil
     end
 
     test "drops a box that clamps to exactly zero width or height" do
       grazing_right = %{frame: 1, x: 100.0, y: 40.0, w: 20.0, h: 20.0, conf: 0.9}
-      assert Track.object(grazing_right, @seqinfo) == nil
+      assert Track.object(grazing_right, @seqinfo, :normalized) == nil
 
       grazing_bottom = %{frame: 1, x: 40.0, y: 100.0, w: 20.0, h: 20.0, conf: 0.9}
-      assert Track.object(grazing_bottom, @seqinfo) == nil
+      assert Track.object(grazing_bottom, @seqinfo, :normalized) == nil
+    end
+
+    test "pixel mode keeps the box where the detector put it, overhang and all" do
+      det = %{frame: 1, x: -5.0, y: 85.0, w: 20.0, h: 40.0, conf: 0.9}
+
+      assert %{bbox: [-5.0, 85.0, 20.0, 40.0], score: 0.9} =
+               Track.object(det, @seqinfo, :pixels)
+    end
+
+    test "pixel mode still clamps confidence into 0..1" do
+      det = %{frame: 1, x: 10.0, y: 10.0, w: 20.0, h: 20.0, conf: 2.31}
+
+      assert %{score: 1.0} = Track.object(det, @seqinfo, :pixels)
     end
   end
 

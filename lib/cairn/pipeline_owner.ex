@@ -31,7 +31,7 @@ defmodule Cairn.PipelineOwner do
 
   Per tick, two liveness signals — the ring's last fragment
   (`Cairn.RingBuffer.last_fragment_at/1`) and, for a detecting camera, the age
-  of the last buffer at `Cairn.Pipeline.DetectSink` — against
+  of the last buffer at `Cairn.Pipeline.TrackSink` — against
   `config.stall_seconds`:
 
     * detect branch stale while the ring is healthy: the wedge is downstream
@@ -77,7 +77,7 @@ defmodule Cairn.PipelineOwner do
             got_fragment: false,
             # what the source last told us about the main stream
             source: :unknown,
-            # DetectSink's last buffer, monotonic ms, from the relayed stats
+            # TrackSink's last buffer, monotonic ms, from the relayed stats
             detect_at_ms: nil,
             bridge_stale_ticks: nil,
             rebuilt_at_ms: nil,
@@ -95,8 +95,11 @@ defmodule Cairn.PipelineOwner do
   the pipeline.
 
   The `Cairn.Detect.Dispatch` policy is resolved here at pipeline birth, so a
-  reload has to reach the running pipeline's sink too — otherwise a `record:`
-  edit would sit unapplied until the camera's next rebuild.
+  reload has to reach the running pipeline's detect branch too — otherwise a
+  `record:` edit would sit unapplied until the camera's next rebuild. The
+  tracker core is the one detect option that does not arrive this way: it
+  wires an element rather than feeding one, so a config that names a different
+  core restarts the camera instead (`Cairn.Config.Server`'s camera diff).
   """
   @spec refresh(GenServer.server(), Config.Camera.t(), Config.t()) :: :ok
   def refresh(server, %Config.Camera{} = camera, %Config{} = config) do
@@ -132,8 +135,8 @@ defmodule Cairn.PipelineOwner do
   def handle_cast({:refresh, camera, config}, state) do
     state = %{state | camera: camera, config: config}
 
-    # `send/2` and not a call: a refresh must not wait on a pipeline whose sink
-    # is inside a `push_frame/5`. A pipeline in its backoff window is owed
+    # `send/2` and not a call: a refresh must not wait on a pipeline whose
+    # detect branch is inside a `push_frame/5`. A pipeline in its backoff window is owed
     # nothing — the next start resolves the policy from `config`.
     if is_pid(state.pipeline) do
       send(state.pipeline, {:policy, camera, Config.policy(config, camera)})
@@ -177,7 +180,7 @@ defmodule Cairn.PipelineOwner do
 
   def handle_info({:stream_lost, :sub}, state), do: {:noreply, state}
 
-  # DetectSink's reply to the watchdog's :detect_stats.
+  # TrackSink's reply to the watchdog's :detect_stats.
   def handle_info({:stats, %{last_buffer_at_ms: at_ms}}, state) do
     {:noreply, %{state | detect_at_ms: at_ms}}
   end
@@ -328,16 +331,22 @@ defmodule Cairn.PipelineOwner do
   # `nil` leaves the pipeline's detect branch unbuilt. `min_score` is the
   # stream's wire floor; the rest of the profile is engine config
   # (`Cairn.Config.native_model_config/1`). `policy:` is resolved here rather
-  # than in the sink because it is a config round trip, and the sink's caller
-  # is the per-frame path.
+  # than in the detect branch because it is a config round trip, and that
+  # branch is the per-frame path.
   defp detect_opts(%{camera: %{plugin: nil}}), do: nil
 
   # No `sample_fps`: the branch does not thin, and the engine takes the rate
   # from the profile every membrane camera on this node has to agree on
   # (`Cairn.Config.native_model_config/1`).
+  #
+  # `tracker:` is resolved here rather than carried in the policy because it
+  # wires an element rather than feeding one: a reload cannot swap a core under
+  # a running branch, which is why a changed core is a camera restart rather
+  # than a refresh (`Cairn.Config.Server`).
   defp detect_opts(state) do
     [
       policy: Config.policy(state.config, state.camera),
+      tracker: Config.tracker(state.config, state.camera),
       stream_params: %{min_score: state.camera.min_score}
     ]
   end

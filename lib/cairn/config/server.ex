@@ -166,12 +166,19 @@ defmodule Cairn.Config.Server do
   # would leave the ring at its old capacity while everything else believed
   # the new one.
   #
+  # The tracker core is compared resolved for the same reason and with the
+  # same reach: it wires an element into the detect branch, which a running
+  # pipeline cannot re-wire, and it can be named at any of three levels
+  # (camera, profile, global) — so comparing the camera's own field would miss
+  # two of them.
+  #
   # The rest of the effective policy — `post`/`max`, the tracking bounds, the
   # `track:` / `record:` tiers — is host-side and refreshes in place through
   # `Cairn.PipelineOwner.refresh/3`.
   defp camera_changed?(old, new, old_cam, new_cam) do
     Map.take(old_cam, @restart_fields) != Map.take(new_cam, @restart_fields) or
-      Config.windows(old, old_cam).pre != Config.windows(new, new_cam).pre
+      Config.windows(old, old_cam).pre != Config.windows(new, new_cam).pre or
+      Config.tracker(old, old_cam) != Config.tracker(new, new_cam)
   end
 
   # Everything else the running camera was handed: the camera struct itself

@@ -16,3 +16,4 @@ tracking:
     step_ms: 700
   twin_mint: true
   max_unseen_ms: 6000
+  tracker: sparsetrack

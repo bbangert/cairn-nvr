@@ -56,6 +56,7 @@ defmodule Cairn.Config.Profile do
     max_unseen_ms: 3000
     max_live_tracks: 128
     stationary_after_ms: 10000
+    tracker: cairn          # which tracker core the group's cameras run
   ```
 
   The `tracking:` block expresses **presence, not order** (D-P2): a stage
@@ -104,7 +105,8 @@ defmodule Cairn.Config.Profile do
 
   @known_keys ~w(name experimental backend model model_profile input_size decoder labels
                  fps_band sample_fps tracking)
-  @known_tracking_keys ~w(bbd oru ocr twin_mint max_unseen_ms max_live_tracks stationary_after_ms)
+  @known_tracking_keys ~w(bbd oru ocr twin_mint max_unseen_ms max_live_tracks stationary_after_ms
+                          tracker)
   # What each backend accepts, as static data — the Elixir half of
   # `BackendKind::capabilities` in
   # `plugins/cairn-detect/src/infer/backend.rs`, which names this table as its
@@ -203,12 +205,13 @@ defmodule Cairn.Config.Profile do
             sample_fps: nil,
             # The stage presence map (atom key → params map), nil when the
             # file had no `tracking:` block at all — absence speaks (see the
-            # moduledoc) — plus the three band-tuned tracker bounds (nil
-            # where the file set none).
+            # moduledoc) — plus the three band-tuned tracker bounds and the
+            # tracker core the group runs (nil where the file set none).
             stages: nil,
             max_unseen_ms: nil,
             max_live_tracks: nil,
-            stationary_after_ms: nil
+            stationary_after_ms: nil,
+            tracker: nil
 
   @type t :: %__MODULE__{}
 
@@ -429,7 +432,8 @@ defmodule Cairn.Config.Profile do
         stages: stages(tracking),
         max_unseen_ms: tracking && Map.get(tracking, "max_unseen_ms"),
         max_live_tracks: tracking && Map.get(tracking, "max_live_tracks"),
-        stationary_after_ms: tracking && Map.get(tracking, "stationary_after_ms")
+        stationary_after_ms: tracking && Map.get(tracking, "stationary_after_ms"),
+        tracker: tracking && Map.get(tracking, "tracker")
       }
 
       validate_stage_lists(profile, acc)

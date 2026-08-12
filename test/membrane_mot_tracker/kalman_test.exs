@@ -1,7 +1,7 @@
-defmodule Cairn.Tracker.KalmanTest do
+defmodule Membrane.MOTTracker.KalmanTest do
   use ExUnit.Case, async: true
 
-  alias Cairn.Tracker.Kalman
+  alias Membrane.MOTTracker.Kalman
 
   # One batch as a caller runs it: coast the state forward, then fold in what
   # was actually observed. Every test here steps through this rather than

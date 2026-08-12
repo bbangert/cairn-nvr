@@ -18,16 +18,32 @@ defmodule Cairn.MotBench do
   @camera_id "mot"
 
   @doc """
-  Drives `Cairn.Tracker` over `frames` — `{frame_index, at_ms, objects}`
+  Drives a tracker core over `frames` — `{frame_index, at_ms, objects}`
   in ascending order — and returns `{lines_iodata, emitted, minted}`.
 
   Empty object lists are real frames: the tracker is called for them, so
   coasting advances exactly as it would live.
+
+  ## Options
+
+    * `:tracker` — the `Membrane.MOTTracker.Core` to drive, as
+      `{module, opts}`. Defaults to `{Cairn.Tracker, []}`.
+    * `:units` — `:normalized` (default) if the objects' boxes are
+      fractions of the frame, `:pixels` if they already are pixels. Only
+      the emitter reads it; the frames are handed to the core as given.
+
+  Every core is handed the same context `Cairn.Tracker` gets. A core in
+  the tracker tree reads the one key the behaviour promises (`:at_ms`)
+  and ignores the host thresholds beside it, so one spelling of the
+  replay loop drives them all — and the ID canonicalization below, which
+  is what makes two runs comparable at all, cannot drift between cores.
   """
-  @spec drive(Enumerable.t(), map(), Tracker.policy()) ::
+  @spec drive(Enumerable.t(), map(), Tracker.policy(), keyword()) ::
           {iodata(), non_neg_integer(), non_neg_integer()}
-  def drive(frames, seqinfo, policy) do
-    initial = {Tracker.new(), %{ids: %{}, next: 1}, [], 0}
+  def drive(frames, seqinfo, policy, opts \\ []) do
+    {module, core_opts} = Keyword.get(opts, :tracker, {Tracker, []})
+    scale = scale(seqinfo, Keyword.get(opts, :units, :normalized))
+    initial = {module.new(core_opts), %{ids: %{}, next: 1}, [], 0}
 
     {_tracker, canon, lines, emitted} =
       Enum.reduce(frames, initial, fn {frame, at_ms, objects}, {tracker, canon, lines, emitted} ->
@@ -39,14 +55,17 @@ defmodule Cairn.MotBench do
         }
 
         context = Tracker.context(observation, @camera_id, policy)
-        {tracker, tagged, _events} = Tracker.track(tracker, objects, context)
+        {tracker, tagged, _events} = module.track(tracker, objects, context)
 
-        {canon, frame_lines} = emit_frame(frame, tagged, seqinfo, canon)
+        {canon, frame_lines} = emit_frame(frame, tagged, scale, canon)
         {tracker, canon, [lines, frame_lines], emitted + length(tagged)}
       end)
 
     {lines, emitted, canon.next - 1}
   end
+
+  defp scale(%{im_width: width, im_height: height}, :normalized), do: {width, height}
+  defp scale(_seqinfo, :pixels), do: {1, 1}
 
   @doc """
   The frame stream for `drive/3` from an already-decoded observation: the
@@ -61,11 +80,11 @@ defmodule Cairn.MotBench do
 
   # Ordinals are assigned at first sight in `tagged` order, which is input
   # order and therefore deterministic even though ULIDs are not.
-  defp emit_frame(frame, tagged, seqinfo, canon) do
+  defp emit_frame(frame, tagged, scale, canon) do
     {frame_lines, canon} =
       Enum.map_reduce(tagged, canon, fn %{object_id: object_id, bbox: bbox}, canon ->
         {ordinal, canon} = ordinal(canon, object_id)
-        {mot_line(frame, ordinal, bbox, seqinfo), canon}
+        {mot_line(frame, ordinal, bbox, scale), canon}
       end)
 
     {canon, frame_lines}
@@ -78,7 +97,7 @@ defmodule Cairn.MotBench do
     end
   end
 
-  defp mot_line(frame, id, [x, y, w, h], %{im_width: iw, im_height: ih}) do
+  defp mot_line(frame, id, [x, y, w, h], {iw, ih}) do
     [
       Integer.to_string(frame),
       ",",

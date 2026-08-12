@@ -198,6 +198,18 @@ defmodule Cairn.Config.ServerTest do
              ) == %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
     end
 
+    test "naming a different tracker core restarts the camera, at any level" do
+      # The core is wired into the detect branch as an element; a running
+      # pipeline cannot re-wire one, so the swap has to be a restart — and it
+      # can be named on the camera or on the global, which is why the
+      # comparison is of the *resolved* answer.
+      assert camera_diff(%{"tracker" => "sparsetrack"}) ==
+               %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+
+      assert camera_diff(%{}, %{"tracking" => %{"tracker" => "sparsetrack"}}) ==
+               %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+    end
+
     test "a camera edited both ways is restarted, not refreshed" do
       assert camera_diff(%{"rtsp_url" => "rtsp://h/2", "stationary_after_ms" => 20_000}) ==
                %{added: [], removed: [], changed: ["cam_a"], refreshed: []}

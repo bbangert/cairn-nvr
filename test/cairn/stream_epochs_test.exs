@@ -89,8 +89,8 @@ defmodule Cairn.StreamEpochsTest do
 
     # Accepted behaviour, deliberately not fought: the ETS table is owned by
     # the GenServer, so a crash loses every epoch. Readers see :unknown until
-    # the camera's next spawn re-mints — and a *changed* epoch ends tracks in
-    # Cairn.CameraTracker, which is the conservative outcome.
+    # the camera's next spawn re-mints — and a *changed* epoch cuts the tracker
+    # element's live set at the next batch, which is the conservative outcome.
     assert StreamEpochs.current(id) == :unknown
 
     restarted = wait_for_restart(pid)
