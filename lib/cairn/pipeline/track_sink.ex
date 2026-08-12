@@ -64,7 +64,7 @@ defmodule Cairn.Pipeline.TrackSink do
         _ctx,
         state
       )
-      when is_list(tagged) and is_list(events) do
+      when is_list(tagged) and is_list(events) and is_list(snapshot) do
     batch = batch(metadata, tagged, events, snapshot, epoch)
 
     # In this process, not the pipeline's: routing through the parent would put

@@ -100,6 +100,15 @@ defmodule Cairn.Pipeline.ObservationStamperTest do
     assert state.dropped == 1
   end
 
+  # The key existing is not the contract holding: a nil where the list should
+  # be must fall to the same counted drop, not into from_frames.
+  test "a buffer whose observations are not a list is dropped, not crashed on", ctx do
+    {actions, state} = feed(stamper(ctx), nil, ctx.epoch)
+
+    assert actions == []
+    assert state.dropped == 1
+  end
+
   test "several observations in one buffer become batches in the library's order", ctx do
     frames = for pts <- [90_000, 93_000, 96_000], do: %{NativeStub.frame() | pts: pts}
     {actions, state} = feed(stamper(ctx), frames, ctx.epoch)

@@ -36,7 +36,8 @@ defmodule Cairn.BoardPipeline.DetectionSink do
   def handle_init(_ctx, opts), do: {[], %{camera_id: opts.camera_id, collector: opts.collector}}
 
   @impl true
-  def handle_buffer(:input, %{metadata: %{observations: observations}}, _ctx, state) do
+  def handle_buffer(:input, %{metadata: %{observations: observations}}, _ctx, state)
+      when is_list(observations) do
     GenServer.cast(state.collector, {:detections, state.camera_id, observations})
     {[], state}
   end

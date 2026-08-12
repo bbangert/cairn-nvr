@@ -102,7 +102,7 @@ defmodule Cairn.Pipeline.ObservationStamper do
         _ctx,
         state
       )
-      when epoch != nil do
+      when is_list(observations) and epoch != nil do
     stamp(state, buffer, observations, epoch, CameraControl.get(state.camera.id))
   end
 

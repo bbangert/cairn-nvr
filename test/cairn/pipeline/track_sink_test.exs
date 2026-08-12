@@ -130,6 +130,24 @@ defmodule Cairn.Pipeline.TrackSinkTest do
     refute_received {:"$gen_cast", {:tracked, _camera, _policy, _batch}}
   end
 
+  # A nil snapshot would otherwise reach EventCheckpoint through CameraTracker
+  # and poison the restore path — the contract violation dies here instead.
+  test "a buffer with a malformed snapshot is dropped and counted", ctx do
+    {[], state} =
+      TrackSink.handle_buffer(
+        :input,
+        %Buffer{
+          payload: <<>>,
+          metadata: %{tagged: [], events: [], snapshot: nil, epoch: "e", context: %{}}
+        },
+        %{},
+        sink(ctx)
+      )
+
+    assert state.dropped == 1
+    refute_received {:"$gen_cast", {:tracked, _camera, _policy, _batch}}
+  end
+
   test "stats count what was dispatched and when the branch was last alive", ctx do
     state = sink(ctx)
 
