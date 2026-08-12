@@ -32,12 +32,19 @@ input_size: 640
 # v4l2 and nothing else); what it would not do is notice its absence.
 decoder: v4l2
 labels: models/coco.names
-# Declared, pending on-hardware measurement. A reported YOLOv5s@480 INT8 raw
-# inference of ~527 us, and full-pipeline claims of 100-300 fps for the small
-# families, put this SoC well above the band; `docs/npu-backends.md` calls
-# those vendor figures optimistic until measured, and 15-30 is where cairn's
-# own decode and tracking sit rather than where the NPU tops out.
-fps_band: [15, 30]
+# Measured on-board (.58, 2026-08-11, task 5.5 — the capacity ladder and fps
+# sweep in membrane-port/research/fps-accuracy-sweep.md), replacing the
+# vendor-optimistic [15, 30] this file shipped with. The floor is the Tier-2
+# requirement: static-camera tracking accuracy is flat from native rates down
+# to 5 fps (MOT20/PP22 tracker-only sweep), so nothing above 5 buys accuracy.
+# The ceiling is NPU arithmetic with the Tier-2 detector class (yolo26s-qdq,
+# ~37 ms/pass on HTP → ~26 passes/s): a half-occupied box (2 cameras)
+# sustains ~10 fps each; at the box's full 4-camera occupancy, 5 fps each is
+# already ~75% of the session. The binding capacity limit is not fps at all —
+# it is Venus: 4 concurrent 5 MP@20fps decode sessions, and the 5th session
+# opens and then decodes NOTHING (whole-session starvation, caught by the
+# decoder's 400-AU tripwire). Count pixel rate before adding cameras.
+fps_band: [5, 10]
 tracking:
   # This block *is* the stage list, and it lists nothing: a `tracking:` block
   # that is present — even holding only bounds, like this one — engages

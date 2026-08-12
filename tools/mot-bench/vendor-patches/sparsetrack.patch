@@ -1,0 +1,55 @@
+--- a/sparse_tracker.py
++++ b/sparse_tracker.py
+@@ -3,9 +3,10 @@
+  
+ import os.path as osp
+ import copy
+-import torch
+-import torch.nn.functional as F
+-from tracker import pbcvt 
++try:  # compiled Boost.Python GMC module; absent here — GMC is only
++    from tracker import pbcvt  # reachable when a caller passes images,
++except ImportError:  # which the detections-only harness never does.
++    pbcvt = None
+ from .kalman_filter import KalmanFilter
+ from .matching import *
+ from .basetrack import BaseTrack, TrackState
+@@ -329,8 +330,10 @@
+         lost_stracks = []
+         removed_stracks = []
+         # current detections
+-        bboxes = output_results.pred_boxes.tensor.cpu().numpy()# x1y1x2y2 
+-        scores = output_results.scores.cpu().numpy()
++        # detections-only interface: a numpy (N, 5) of [x1,y1,x2,y2,score]
++        # replaces the detectron2 Instances the repo's engine passed in.
++        bboxes = output_results[:, :4]
++        scores = output_results[:, 4]
+ 
+         # divide high-score dets and low-scores dets
+         remain_inds = scores > self.args.track_thresh
+@@ -365,7 +368,7 @@
+         STrack.multi_predict(strack_pool)
+         
+         # use GMC: for mot20 dancetrack--unenabled GMC: 368 - 373
+-        if self.pre_img is not None:
++        if self.pre_img is not None and pbcvt is not None:
+             warp = pbcvt.GMC(curr_img, self.pre_img, self.down_scale)
+         else:
+             warp = np.eye(3,3)
+--- a/matching.py
++++ b/matching.py
+@@ -1,12 +1,10 @@
+-import cv2
+ import numpy as np
+ import scipy
+ import lap
+ from scipy.spatial.distance import cdist
+ import math
+-from cython_bbox import bbox_overlaps as bbox_ious
+-from tracker import kalman_filter
+-import time
++from bytetrack.matching import bbox_ious
++from . import kalman_filter
+ 
+ def merge_matches(m1, m2, shape):
+     O,P,Q = shape

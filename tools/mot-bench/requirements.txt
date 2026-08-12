@@ -5,3 +5,10 @@
 # AttributeError. Verified empirically; see README.md.
 numpy==1.23.5
 scipy==1.10.1
+# For the vendored reference trackers (bytetrack_sweep.py). lapx provides
+# `import lap` (lap itself does not build here); filterpy is OC-SORT's
+# Kalman dep. CAUTION: `pip install filterpy` OUTSIDE this requirements
+# file pulls latest numpy and breaks the 1.23.5 pin above — always install
+# via `pip install -r requirements.txt` so the resolver holds the pin.
+lapx==0.9.4
+filterpy==1.4.5

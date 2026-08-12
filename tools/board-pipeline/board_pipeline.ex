@@ -164,44 +164,57 @@ defmodule Cairn.BoardPipeline.Collector do
     {:ok,
      %{
        t0: t0,
-       observations: 0,
-       objects: 0,
-       last_at_ms: nil,
-       # gap ms -> count, as board-soak's latency histogram: a board run of
-       # hours must not accumulate an unbounded list to re-sort per report.
-       gaps: %{},
-       gap_count: 0,
+       # camera id -> its own counters, so an N-stream capacity run can say
+       # which stream fell behind rather than averaging the shortfall away.
+       cams: %{},
        decoder_opens: [],
-       stats: %{}
+       stats: %{},
+       cpu_last: cpu_counters(),
+       cpu_samples: []
      }}
   end
 
-  @impl true
-  def handle_cast({:detections, _camera, _policy, observation}, state) do
-    now = System.monotonic_time(:millisecond)
+  # Gaps land in 10 ms buckets: the histogram's key count is then bounded by
+  # the gap range, not the run length — exact-ms keys under scheduler jitter
+  # would grow ~1:1 with gap_count on an hour run. 10 ms is 5% of the 200 ms
+  # expected gap, well under what the p50 is read for.
+  @gap_bucket_ms 10
 
-    state =
-      case state.last_at_ms do
+  defp new_cam do
+    %{
+      observations: 0,
+      objects: 0,
+      last_at_ms: nil,
+      # bucketed gap ms -> count, as board-soak's latency histogram: a board
+      # run of hours must not accumulate an unbounded list to re-sort.
+      gaps: %{},
+      gap_count: 0
+    }
+  end
+
+  @impl true
+  def handle_cast({:detections, camera, _policy, observation}, state) do
+    now = System.monotonic_time(:millisecond)
+    cam = Map.get(state.cams, camera.id, new_cam())
+
+    cam =
+      case cam.last_at_ms do
         nil ->
-          state
+          cam
 
         last ->
-          gap = now - last
-
-          %{
-            state
-            | gaps: Map.update(state.gaps, gap, 1, &(&1 + 1)),
-              gap_count: state.gap_count + 1
-          }
+          bucket = div(now - last, @gap_bucket_ms) * @gap_bucket_ms
+          %{cam | gaps: Map.update(cam.gaps, bucket, 1, &(&1 + 1)), gap_count: cam.gap_count + 1}
       end
 
-    {:noreply,
-     %{
-       state
-       | observations: state.observations + 1,
-         objects: state.objects + length(observation.objects),
-         last_at_ms: now
-     }}
+    cam = %{
+      cam
+      | observations: cam.observations + 1,
+        objects: cam.objects + length(observation.objects),
+        last_at_ms: now
+    }
+
+    {:noreply, %{state | cams: Map.put(state.cams, camera.id, cam)}}
   end
 
   @impl true
@@ -209,12 +222,14 @@ defmodule Cairn.BoardPipeline.Collector do
     {:noreply, %{state | decoder_opens: state.decoder_opens ++ [{source, at_ms - state.t0}]}}
   end
 
-  def handle_info({:stats, child, stats}, state) do
-    {:noreply, %{state | stats: Map.put(state.stats, child, stats)}}
+  def handle_info({:stats, camera_id, child, stats}, state) do
+    {:noreply, %{state | stats: Map.put(state.stats, {camera_id, child}, stats)}}
   end
 
   def handle_info(:progress, state) do
     Process.send_after(self(), :progress, @progress_interval_ms)
+    {sample, state} = cpu_sample(state)
+    state = %{state | cpu_samples: state.cpu_samples ++ List.wrap(sample)}
     IO.puts("board-pipeline: " <> line(state))
     {:noreply, state}
   end
@@ -223,31 +238,52 @@ defmodule Cairn.BoardPipeline.Collector do
 
   @impl true
   def handle_call(:summary, _from, state) do
+    {sample, state_with_final} = cpu_sample(state)
+
+    state_with_final = %{
+      state_with_final
+      | cpu_samples: state_with_final.cpu_samples ++ List.wrap(sample)
+    }
+
     {:reply,
      %{
-       observations: state.observations,
-       objects: state.objects,
-       gap_p50_ms: gap_p50(state),
+       cams:
+         Map.new(state.cams, fn {id, cam} ->
+           {id,
+            %{
+              observations: cam.observations,
+              objects: cam.objects,
+              gap_p50_ms: gap_p50(cam)
+            }}
+         end),
+       cpu_pct: cpu_avg(state_with_final),
        decoder_opens: state.decoder_opens,
        stats: state.stats,
-       line: line(state)
-     }, state}
+       line: line(state_with_final)
+     }, state_with_final}
   end
 
   defp line(state) do
     elapsed_s = div(System.monotonic_time(:millisecond) - state.t0, 1000)
+    {observations, objects} = totals(state)
 
-    "t=#{elapsed_s}s observations=#{state.observations} objects=#{state.objects} " <>
-      "gap_p50_ms=#{gap_p50(state)}"
+    "t=#{elapsed_s}s streams=#{map_size(state.cams)} observations=#{observations} " <>
+      "objects=#{objects} cpu_pct=#{inspect(cpu_avg(state))}"
+  end
+
+  defp totals(state) do
+    Enum.reduce(state.cams, {0, 0}, fn {_id, cam}, {obs, objs} ->
+      {obs + cam.observations, objs + cam.objects}
+    end)
   end
 
   defp gap_p50(%{gap_count: 0}), do: nil
 
-  defp gap_p50(state) do
-    wanted = max(1, trunc(0.5 * state.gap_count) + 1)
+  defp gap_p50(cam) do
+    wanted = max(1, trunc(0.5 * cam.gap_count) + 1)
 
     {gap, _seen} =
-      state.gaps
+      cam.gaps
       |> Enum.sort()
       |> Enum.reduce_while({0, 0}, fn {gap, n}, {_last, seen} ->
         if seen + n >= wanted, do: {:halt, {gap, seen + n}}, else: {:cont, {gap, seen + n}}
@@ -255,6 +291,51 @@ defmodule Cairn.BoardPipeline.Collector do
 
     gap
   end
+
+  # -- cpu --------------------------------------------------------------------
+
+  # Whole-system busy time from /proc/stat, sampled per progress tick: the
+  # capacity question is "what does N streams cost the box", and the busybox
+  # rootfs has no top/mpstat to ask instead.
+  defp cpu_counters do
+    with {:ok, stat} <- File.read("/proc/stat"),
+         "cpu " <> rest <- stat |> String.split("\n", parts: 2) |> hd() do
+      fields =
+        rest
+        |> String.split(" ", trim: true)
+        |> Enum.map(&String.to_integer/1)
+
+      case fields do
+        [user, nice, system, idle | tail] ->
+          iowait = Enum.at(tail, 0, 0)
+          total = Enum.sum(fields)
+          {total - idle - iowait, total}
+
+        _short ->
+          nil
+      end
+    else
+      _unreadable -> nil
+    end
+  end
+
+  defp cpu_sample(%{cpu_last: nil} = state), do: {nil, %{state | cpu_last: cpu_counters()}}
+
+  defp cpu_sample(%{cpu_last: {busy0, total0}} = state) do
+    case cpu_counters() do
+      {busy1, total1} = counters when total1 > total0 ->
+        pct = Float.round(100.0 * (busy1 - busy0) / (total1 - total0), 1)
+        {pct, %{state | cpu_last: counters}}
+
+      _unreadable ->
+        {nil, state}
+    end
+  end
+
+  defp cpu_avg(%{cpu_samples: []}), do: nil
+
+  defp cpu_avg(%{cpu_samples: samples}),
+    do: Float.round(Enum.sum(samples) / length(samples), 1)
 end
 
 defmodule Cairn.BoardPipeline.Pipe do
@@ -312,7 +393,7 @@ defmodule Cairn.BoardPipeline.Pipe do
         tracker: collector
       })
 
-    {[spec: spec], %{collector: collector}}
+    {[spec: spec], %{collector: collector, camera_id: camera.id}}
   end
 
   @impl true
@@ -327,7 +408,7 @@ defmodule Cairn.BoardPipeline.Pipe do
 
   @impl true
   def handle_child_notification({:stats, stats}, child, _ctx, state) do
-    send(state.collector, {:stats, child, stats})
+    send(state.collector, {:stats, state.camera_id, child, stats})
     {[], state}
   end
 
@@ -388,6 +469,7 @@ defmodule Cairn.BoardPipeline do
     seconds: 300,
     decoder: "auto",
     sample_fps: 5,
+    streams: 1,
     # `.so`-less NIF paths for `Application.put_env`; absent falls back to
     # `:code.priv_dir(:cairn)`, which only resolves when cairn's ebin is on
     # the code path.
@@ -409,7 +491,8 @@ defmodule Cairn.BoardPipeline do
     configure_nif_paths(opts)
 
     result =
-      with :ok <- start_apps(),
+      with :ok <- validate_streams(opts),
+           :ok <- start_apps(),
            :ok <- check_available(),
            {:ok, clip} <- read_clip(opts.clip) do
         with_stack(opts, clip)
@@ -480,24 +563,33 @@ defmodule Cairn.BoardPipeline do
     {:ok, collector} = Collector.start_link()
     install_decoder_probe(collector)
 
-    camera = %Camera{id: @camera_id, rtsp_url: "rtsp://board-pipeline.invalid/clip"}
-    epoch = Cairn.ULID.generate()
+    # One pipeline per stream against the one shared Host — the capacity
+    # question is how many detect branches this box carries at sample_fps.
+    pipelines =
+      for n <- 1..opts.streams do
+        camera = %Camera{
+          id: "#{@camera_id}-#{n}",
+          rtsp_url: "rtsp://board-pipeline.invalid/clip-#{n}"
+        }
 
-    {:ok, _supervisor, pipeline} =
-      Membrane.Pipeline.start_link(Pipe,
-        camera: camera,
-        epoch: epoch,
-        collector: collector,
-        clip: clip,
-        seconds: opts.seconds
-      )
+        {:ok, _supervisor, pipeline} =
+          Membrane.Pipeline.start_link(Pipe,
+            camera: camera,
+            epoch: Cairn.ULID.generate(),
+            collector: collector,
+            clip: clip,
+            seconds: opts.seconds
+          )
+
+        pipeline
+      end
 
     # One extra second so the source's own deadline fires and end_of_stream
     # drains through the sink before teardown starts.
     Process.sleep(opts.seconds * 1000 + 1000)
-    send(pipeline, :stats)
+    Enum.each(pipelines, &send(&1, :stats))
     Process.sleep(300)
-    :ok = Membrane.Pipeline.terminate(pipeline, timeout: 10_000)
+    Enum.each(pipelines, &(:ok = Membrane.Pipeline.terminate(&1, timeout: 10_000)))
 
     summarize(GenServer.call(collector, :summary), opts)
     GenServer.stop(collector)
@@ -550,12 +642,44 @@ defmodule Cairn.BoardPipeline do
 
     IO.puts(
       "board-pipeline: expected observation gap at sample_fps=#{opts.sample_fps} is " <>
-        "#{div(1000, opts.sample_fps)}ms, measured p50 #{inspect(summary.gap_p50_ms)}ms"
+        "#{div(1000, opts.sample_fps)}ms; cpu_pct=#{inspect(summary.cpu_pct)}"
     )
 
-    Enum.each(summary.stats, fn {child, stats} ->
-      IO.puts("board-pipeline: stats #{child}=#{inspect(stats)}")
+    summary.cams
+    |> Enum.sort()
+    |> Enum.each(fn {id, cam} ->
+      per_s = Float.round(cam.observations / opts.seconds, 2)
+
+      IO.puts(
+        "board-pipeline: cam #{id} observations=#{cam.observations} (#{per_s}/s) " <>
+          "objects=#{cam.objects} gap_p50_ms=#{inspect(cam.gap_p50_ms)}"
+      )
     end)
+
+    summary.stats
+    |> Enum.sort()
+    |> Enum.each(fn {{camera_id, child}, stats} ->
+      IO.puts("board-pipeline: stats #{camera_id}/#{child}=#{inspect(stats)}")
+    end)
+
+    # The 300 ms window between :stats and terminate was sized for one
+    # pipeline; with N of them a straggler's report can miss it. Absence
+    # must be a line in the summary, not a silently shorter list.
+    expected =
+      for n <- 1..opts.streams,
+          child <- [:picker, :decoder, :infer, :detect],
+          do: {"#{@camera_id}-#{n}", child}
+
+    case expected -- Map.keys(summary.stats) do
+      [] ->
+        :ok
+
+      missing ->
+        IO.puts(
+          "board-pipeline: stats MISSING for " <>
+            Enum.map_join(missing, ", ", fn {cam, child} -> "#{cam}/#{child}" end)
+        )
+    end
   end
 
   defp start_apps do
@@ -578,6 +702,15 @@ defmodule Cairn.BoardPipeline do
     # `:erlang.load_nif/2` wants the path without the platform suffix; taking
     # the `.so` spelling too keeps the env var copy-pasteable from `ls`.
     Application.put_env(:cairn, module, path: String.trim_trailing(path, ".so"))
+  end
+
+  # `streams: 0` would make `1..opts.streams` a *descending* range and run
+  # two streams — the exact off-by-configuration board-soak documents.
+  defp validate_streams(%{streams: streams}) when is_integer(streams) and streams >= 1, do: :ok
+
+  defp validate_streams(%{streams: streams}) do
+    IO.puts("board-pipeline: refusing to run — streams must be >= 1, got #{inspect(streams)}")
+    {:error, {:streams, streams}}
   end
 
   # A missing library must not read as a clean run.
@@ -639,6 +772,7 @@ defmodule Cairn.BoardPipeline do
       seconds: integer_opt(given, :seconds, "BOARD_PIPELINE_SECONDS"),
       decoder: string_opt(given, :decoder, "BOARD_PIPELINE_DECODER"),
       sample_fps: integer_opt(given, :sample_fps, "BOARD_PIPELINE_SAMPLE_FPS"),
+      streams: integer_opt(given, :streams, "BOARD_PIPELINE_STREAMS"),
       native_lib:
         blank_to_nil(Map.get(given, :native_lib, System.get_env("BOARD_PIPELINE_NATIVE_LIB"))),
       ort_lib: blank_to_nil(Map.get(given, :ort_lib, System.get_env("BOARD_PIPELINE_ORT_LIB")))
@@ -686,7 +820,8 @@ defmodule Cairn.BoardPipeline do
   defp announce(opts) do
     IO.puts(
       "board-pipeline: model=#{opts.model} backend=#{opts.backend} decoder=#{opts.decoder} " <>
-        "sample_fps=#{opts.sample_fps} clip=#{inspect(opts.clip)} seconds=#{opts.seconds}"
+        "sample_fps=#{opts.sample_fps} streams=#{opts.streams} clip=#{inspect(opts.clip)} " <>
+        "seconds=#{opts.seconds}"
     )
   end
 end

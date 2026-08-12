@@ -27,4 +27,48 @@ fi
 echo "Checking out TrackEval @ $TRACKEVAL_SHA"
 git -C vendor/trackeval checkout "$TRACKEVAL_SHA"
 
+# --- reference trackers (bytetrack_sweep.py) --------------------------------
+# Tracker cores vendored at pinned SHAs, with mechanical patches from
+# vendor-patches/ (provenance and patch rationale: vendor-patches/README.md).
+
+vendor_tracker() {
+  local name="$1" url="$2" sha="$3" subdir="$4"
+  shift 4
+  if [ -d "vendor/$name" ]; then
+    echo "vendor/$name present — skipping (rm -rf to re-vendor)"
+    return
+  fi
+  echo "Vendoring $name @ $sha"
+  local tmp
+  tmp="$(mktemp -d)"
+  git clone --quiet "$url" "$tmp/repo"
+  git -C "$tmp/repo" checkout --quiet "$sha"
+  mkdir -p "vendor/$name"
+  local f
+  for f in "$@" LICENSE; do
+    if [ "$f" = LICENSE ]; then
+      cp "$tmp/repo/LICENSE" "vendor/$name/"
+    else
+      cp "$tmp/repo/$subdir/$f" "vendor/$name/"
+    fi
+  done
+  rm -rf "$tmp"
+  if [ -f "vendor-patches/$name.patch" ]; then
+    patch -p1 -d "vendor/$name" < "vendor-patches/$name.patch"
+  fi
+  touch "vendor/$name/__init__.py"
+}
+
+vendor_tracker bytetrack https://github.com/ifzhang/ByteTrack \
+  d1bf0191adff59bc8fcfeaa0b33d3d1642552a99 yolox/tracker \
+  basetrack.py byte_tracker.py kalman_filter.py matching.py
+
+vendor_tracker ocsort https://github.com/noahcao/OC_SORT \
+  8462e7e729a93ccd3bd995c0a79a890336cb3a0b trackers/ocsort_tracker \
+  association.py kalmanfilter.py ocsort.py
+
+vendor_tracker sparsetrack https://github.com/hustvl/SparseTrack \
+  499844f32c5bb2332f9811f26cd70cf4e517d4e7 tracker \
+  basetrack.py kalman_filter.py matching.py sparse_tracker.py
+
 echo "Setup complete."
