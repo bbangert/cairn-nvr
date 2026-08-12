@@ -189,17 +189,25 @@ def upsert_matrix(out: Path, rows: list[dict], key_fields: tuple[str, ...]) -> i
     rows (matrix.py's convention). Returns the total row count written."""
     if not rows:
         raise SystemExit("no dataset-cells were selected; nothing to write")
+    # Fieldnames are the union of the new schema and whatever the existing
+    # file carries, so a schema change between runs widens the CSV (missing
+    # cells become "") instead of DictWriter raising on the old rows.
+    fieldnames = list(rows[0].keys())
     merged: dict[tuple, dict] = {}
     if out.exists():
         with out.open() as f:
-            for row in csv.DictReader(f):
+            reader = csv.DictReader(f)
+            for field in reader.fieldnames or []:
+                if field not in fieldnames:
+                    fieldnames.append(field)
+            for row in reader:
                 merged[tuple(row.get(k, "") for k in key_fields)] = row
     for row in rows:
         merged[tuple(str(row.get(k, "")) for k in key_fields)] = row
     out.parent.mkdir(parents=True, exist_ok=True)
     ordered = sorted(merged.values(), key=lambda r: [str(r.get(k, "")) for k in key_fields])
     with out.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
         writer.writeheader()
         writer.writerows(ordered)
     return len(ordered)

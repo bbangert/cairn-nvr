@@ -160,6 +160,7 @@ defmodule Cairn.BoardPipeline.Collector do
   @impl true
   def init(t0) do
     Process.send_after(self(), :progress, @progress_interval_ms)
+    counters = cpu_counters()
 
     {:ok,
      %{
@@ -169,8 +170,11 @@ defmodule Cairn.BoardPipeline.Collector do
        cams: %{},
        decoder_opens: [],
        stats: %{},
-       cpu_last: cpu_counters(),
-       cpu_samples: []
+       # cpu_first anchors the whole-run average; cpu_last is the rolling
+       # anchor for the per-tick progress figure.
+       cpu_first: counters,
+       cpu_last: counters,
+       cpu_tick: nil
      }}
   end
 
@@ -229,8 +233,8 @@ defmodule Cairn.BoardPipeline.Collector do
   def handle_info(:progress, state) do
     Process.send_after(self(), :progress, @progress_interval_ms)
     {sample, state} = cpu_sample(state)
-    state = %{state | cpu_samples: state.cpu_samples ++ List.wrap(sample)}
-    IO.puts("board-pipeline: " <> line(state))
+    state = %{state | cpu_tick: sample}
+    IO.puts("board-pipeline: " <> line(state, sample))
     {:noreply, state}
   end
 
@@ -238,12 +242,7 @@ defmodule Cairn.BoardPipeline.Collector do
 
   @impl true
   def handle_call(:summary, _from, state) do
-    {sample, state_with_final} = cpu_sample(state)
-
-    state_with_final = %{
-      state_with_final
-      | cpu_samples: state_with_final.cpu_samples ++ List.wrap(sample)
-    }
+    run_avg = cpu_run_avg(state)
 
     {:reply,
      %{
@@ -256,19 +255,21 @@ defmodule Cairn.BoardPipeline.Collector do
               gap_p50_ms: gap_p50(cam)
             }}
          end),
-       cpu_pct: cpu_avg(state_with_final),
+       cpu_pct: run_avg,
        decoder_opens: state.decoder_opens,
        stats: state.stats,
-       line: line(state_with_final)
-     }, state_with_final}
+       line: line(state, run_avg)
+     }, state}
   end
 
-  defp line(state) do
+  # Progress ticks pass their own interval's figure; the summary passes the
+  # whole-run average — never a mean of the two kinds.
+  defp line(state, cpu_pct) do
     elapsed_s = div(System.monotonic_time(:millisecond) - state.t0, 1000)
     {observations, objects} = totals(state)
 
     "t=#{elapsed_s}s streams=#{map_size(state.cams)} observations=#{observations} " <>
-      "objects=#{objects} cpu_pct=#{inspect(cpu_avg(state))}"
+      "objects=#{objects} cpu_pct=#{inspect(cpu_pct)}"
   end
 
   defp totals(state) do
@@ -332,10 +333,20 @@ defmodule Cairn.BoardPipeline.Collector do
     end
   end
 
-  defp cpu_avg(%{cpu_samples: []}), do: nil
+  # Whole-run average from cumulative counters — time-weighted by
+  # construction. A mean of the per-tick samples would weight the summary's
+  # short final window the same as a full 30 s interval (Copilot, PR #99).
+  defp cpu_run_avg(%{cpu_first: {busy0, total0}}) do
+    case cpu_counters() do
+      {busy1, total1} when total1 > total0 ->
+        Float.round(100.0 * (busy1 - busy0) / (total1 - total0), 1)
 
-  defp cpu_avg(%{cpu_samples: samples}),
-    do: Float.round(Enum.sum(samples) / length(samples), 1)
+      _unreadable ->
+        nil
+    end
+  end
+
+  defp cpu_run_avg(_no_first_counters), do: nil
 end
 
 defmodule Cairn.BoardPipeline.Pipe do
