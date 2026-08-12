@@ -49,18 +49,14 @@ defmodule Cairn.Pipeline.BridgeSource do
   def handle_info({:ts_data, data}, ctx, state) when is_binary(data) do
     # Bytes after the stream was ended are a graceful stop overtaking an ffmpeg
     # that has not noticed yet; membrane refuses the buffer with a crash.
-    if ctx.pads[:output].end_of_stream? do
-      {[], state}
-    else
-      {[buffer: {:output, %Membrane.Buffer{payload: data}}], state}
-    end
+    {on_live_pad(ctx, buffer: {:output, %Membrane.Buffer{payload: data}}), state}
   end
 
   # ffmpeg died (or was bounced): everything it delivered is already in our
   # mailbox ahead of this message, so the event cuts the session exactly where
   # its last byte ended.
-  def handle_info({:bridge_session_closed, reason}, _ctx, state) do
-    {[event: {:output, %StreamClosed{reason: reason}}], state}
+  def handle_info({:bridge_session_closed, reason}, ctx, state) do
+    {on_live_pad(ctx, event: {:output, %StreamClosed{reason: reason}}), state}
   end
 
   def handle_info(:ts_eos, ctx, state), do: {eos(ctx), state}
@@ -73,9 +69,14 @@ defmodule Cairn.Pipeline.BridgeSource do
   # An unlinked pad is what a pipeline already tearing down looks like from
   # here, and ending a stream twice is refused: either way there is nothing
   # left to flush.
-  defp eos(ctx) do
+  defp eos(ctx), do: on_live_pad(ctx, end_of_stream: :output)
+
+  # Every emission takes the same gate: a late message from the port (data,
+  # session close, eos) can land while the pipeline is stopping, and membrane
+  # refuses actions on a gone or ended pad with a crash.
+  defp on_live_pad(ctx, actions) do
     case ctx.pads[:output] do
-      %{end_of_stream?: false} -> [end_of_stream: :output]
+      %{end_of_stream?: false} -> actions
       _gone_or_ended -> []
     end
   end

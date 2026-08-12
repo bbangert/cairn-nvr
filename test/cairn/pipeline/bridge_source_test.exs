@@ -69,11 +69,14 @@ defmodule Cairn.Pipeline.BridgeSourceTest do
     send(source, :ts_eos)
     assert_end_of_stream(pipeline, :sink)
 
-    # ffmpeg has not noticed the stop yet; membrane refuses a buffer past EOS
-    # with a crash, so the element has to.
+    # ffmpeg has not noticed the stop yet; membrane refuses a buffer — and an
+    # event — past EOS with a crash, so the element has to drop all three of
+    # the port's late message kinds.
     send(source, {:ts_data, <<2>>})
+    send(source, {:bridge_session_closed, :closed})
     send(source, :ts_eos)
     refute_sink_buffer(pipeline, :sink, %Buffer{}, 200)
+    refute_sink_event(pipeline, :sink, %StreamClosed{}, 0)
     assert Process.alive?(source)
   end
 
