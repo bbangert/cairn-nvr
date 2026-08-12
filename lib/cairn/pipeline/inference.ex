@@ -9,9 +9,9 @@ defmodule Cairn.Pipeline.Inference do
   `Cairn.Pipeline.Decoder`'s contract, or any producer speaking it:
   `%Membrane.RawVideo{pixel_format: :RGB}` buffers whose payload is the
   tightly-packed content rectangle and whose `metadata` carries
-  `orig_width`/`orig_height`, `observed_at_ms` and the optional motion
-  verdict. Buffers without those keys (or arriving before a stream format)
-  are dropped and counted, never crashed on. `:input` is `:manual` with one
+  `orig_width`/`orig_height`, `observed_at_ms`, `stream_epoch` and the
+  optional motion verdict. Buffers without those keys (or arriving before a
+  stream format) are dropped and counted, never crashed on. `:input` is `:manual` with one
   frame demanded at a time, so the blocking model call bounds the branch's
   *rate*: nothing is demanded while a call is in flight, and the decoder's
   one-frame slot keeps the newest frame for the demand that follows.
@@ -20,10 +20,11 @@ defmodule Cairn.Pipeline.Inference do
 
   One buffer per pushed frame under the
   `%Cairn.Pipeline.Inference.Detections{}` stream format: `payload` is empty,
-  `pts` is the input buffer's, and `metadata.observations` is the library's
-  own frame-observation list — boxes already projected back to source
-  coordinates (the letterbox maths crossed with the frame, and the library
-  applied them; nothing downstream re-derives geometry). There is no
+  `pts` is the input buffer's, `metadata.stream_epoch` is the input frame's,
+  and `metadata.observations` is the library's own frame-observation list —
+  boxes already projected back to source coordinates (the letterbox maths
+  crossed with the frame, and the library applied them; nothing downstream
+  re-derives geometry). There is no
   ecosystem convention for a detections pad to defer to — this element is the
   first — so the shape is deliberately minimal.
 
@@ -35,9 +36,15 @@ defmodule Cairn.Pipeline.Inference do
   `close_stream(server, stream_id)` in `CairnOrt`'s error vocabulary. In this
   application that is `Cairn.Native.Host`, which multiplexes one shared
   engine (one model, one HTP graph) across every camera; a standalone user
-  can wrap `CairnOrt` in a GenServer of the same shape. The element opens the
-  stream for its own lifetime, reopens on a cooldown after stream-fatal
-  errors, and parks permanently on an engine-fatal one — the session owner's
+  can wrap `CairnOrt` in a GenServer of the same shape. The stream is opened
+  under one epoch — `stream_params.stream_epoch`, fixed at open, since
+  `push_frame/5` carries none — so the element cannot open before the first
+  frame tells it which session it is serving, and a frame whose
+  `stream_epoch` differs closes the stream and reopens under the new one.
+  That reopen is a reconfiguration, not a failure: it does not wait out the
+  cooldown a refused or lost stream does. Beyond it the element reopens on a
+  cooldown after stream-fatal errors, and parks permanently on an
+  engine-fatal one — the session owner's
   recovery (a fresh model load behind its canary) is not this element's to
   drive. The provider calls themselves are plain `GenServer.call`s: the
   provider's liveness is the deployment's to supervise (in this application
@@ -84,7 +91,9 @@ defmodule Cairn.Pipeline.Inference do
     stream_params: [
       spec: map(),
       default: %{},
-      description: "The provider's stream vocabulary (score floors, motion knobs, epoch)"
+      description:
+        "The provider's stream vocabulary (score floors, motion knobs); " <>
+          "`stream_epoch` is not among them — it comes from the frames"
     ],
     reopen_cooldown_ms: [
       spec: non_neg_integer(),
@@ -136,9 +145,10 @@ defmodule Cairn.Pipeline.Inference do
     {[], state}
   end
 
+  # Nothing is opened here: the epoch a stream is opened under arrives on the
+  # first frame, and this element outlives the sessions it serves.
   @impl true
   def handle_playing(_ctx, state) do
-    state = ensure_stream(state)
     # The output format is constant and carries nothing, so it precedes the
     # first demand rather than the first buffer.
     {[stream_format: {:output, %Detections{}}] ++ demand(state), state}
@@ -154,9 +164,17 @@ defmodule Cairn.Pipeline.Inference do
   end
 
   @impl true
-  def handle_buffer(:input, buffer, _ctx, state) do
-    {actions, state} = state |> ensure_stream() |> infer(buffer)
+  def handle_buffer(:input, %Buffer{metadata: %{stream_epoch: epoch}} = buffer, _ctx, state)
+      when epoch != nil do
+    {actions, state} = state |> for_epoch(epoch) |> ensure_stream() |> infer(buffer)
     {actions ++ demand(state), state}
+  end
+
+  # An untagged frame names no session, so it can neither be pushed nor decide
+  # what the stream should be open under: dropped and counted, stream untouched.
+  def handle_buffer(:input, _buffer, _ctx, state) do
+    state = %{state | dropped: state.dropped + 1}
+    {demand(state), state}
   end
 
   @impl true
@@ -188,8 +206,12 @@ defmodule Cairn.Pipeline.Inference do
          %{stream: :open, content: {width, height}, session: {module, server}} = state,
          %Buffer{
            metadata:
-             %{orig_width: orig_width, orig_height: orig_height, observed_at_ms: observed_at_ms} =
-               metadata
+             %{
+               orig_width: orig_width,
+               orig_height: orig_height,
+               observed_at_ms: observed_at_ms,
+               stream_epoch: stream_epoch
+             } = metadata
          } = buffer
        ) do
     meta = %{
@@ -207,7 +229,10 @@ defmodule Cairn.Pipeline.Inference do
         out = %Buffer{
           payload: <<>>,
           pts: buffer.pts,
-          metadata: %{observations: observations}
+          # Carried, not re-read from `params`: the tag belongs to the frame
+          # these observations came from, which is what a consumer stamping
+          # them at production time needs.
+          metadata: %{observations: observations, stream_epoch: stream_epoch}
         }
 
         {[buffer: {:output, out}], %{state | pushed: state.pushed + 1}}
@@ -241,6 +266,29 @@ defmodule Cairn.Pipeline.Inference do
   defp reopen_later(state) do
     %{state | stream: :closed, errors: state.errors + 1, retry_at: now_ms() + state.cooldown_ms}
   end
+
+  # The epoch is fixed at `open_stream` (`push_frame/5` carries none), so a new
+  # session is a new stream. The cooldown is cleared with it: a refused open
+  # this element is waiting out was made for the OLD session and says nothing
+  # about the new one — the same reasoning `Cairn.Pipeline.Decoder` applies to
+  # a geometry change.
+  # A parked element calls into its provider for nothing, boundary included.
+  defp for_epoch(%{engine: :dead} = state, _epoch), do: state
+
+  defp for_epoch(state, epoch) do
+    if Map.get(state.params, :stream_epoch) == epoch do
+      state
+    else
+      %{close_stream(state) | params: Map.put(state.params, :stream_epoch, epoch), retry_at: nil}
+    end
+  end
+
+  defp close_stream(%{stream: :open, session: {module, server}} = state) do
+    module.close_stream(server, state.stream_id)
+    %{state | stream: :closed}
+  end
+
+  defp close_stream(state), do: state
 
   defp ensure_stream(%{stream: :open} = state), do: state
   defp ensure_stream(%{engine: :dead} = state), do: state

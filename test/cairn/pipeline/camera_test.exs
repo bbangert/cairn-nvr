@@ -1,5 +1,5 @@
 defmodule Cairn.Pipeline.CameraTest do
-  # The FFmpegPort case spawns a real (sleeping) OS process and a pipeline.
+  # The PipelineOwner case starts a real (stubbed) pipeline.
   use ExUnit.Case, async: false
 
   alias Cairn.Config
@@ -10,12 +10,18 @@ defmodule Cairn.Pipeline.CameraTest do
     @moduledoc false
     use Membrane.Pipeline
 
-    # `owner:` is the port, not the test, so the probe is registered by name.
+    # `owner:` is the pipeline owner, not the test, so the probe is registered
+    # by name.
     @impl true
     def handle_init(_ctx, opts) do
       send(Process.whereis(:camera_test_probe), {:pipeline_opts, opts})
       {[], %{}}
     end
+
+    # The owner flushes before it terminates; without this the stub logs an
+    # unhandled-message warning per test.
+    @impl true
+    def handle_info(:flush, _ctx, state), do: {[], state}
   end
 
   @policy %{pre: 5, post: 10, max: 300, track: nil, record: nil}
@@ -23,7 +29,7 @@ defmodule Cairn.Pipeline.CameraTest do
   defp init(opts) do
     Pipeline.handle_init(
       %{},
-      Keyword.merge([camera: %Camera{id: "cam"}, epoch: "epoch", owner: self()], opts)
+      Keyword.merge([camera: %Camera{id: "cam"}, owner: self()], opts)
     )
   end
 
@@ -47,10 +53,179 @@ defmodule Cairn.Pipeline.CameraTest do
 
   defp links(spec), do: Enum.flat_map(spec, & &1.links)
 
+  defp child(spec, name) do
+    Enum.find_value(spec, fn builder ->
+      Enum.find_value(builder.children, fn
+        {^name, definition, _opts} -> definition
+        _other -> nil
+      end)
+    end)
+  end
+
   defp flow_control(module, pad) do
     # A bin's pads carry no flow control at all, which is itself the answer:
     # `:manual` is not expressible there.
     Map.get(module.membrane_pads()[pad], :flow_control, :bin)
+  end
+
+  describe "the long-lived half" do
+    test "the tagger sits between ingest and tee, carrying the owner's reason" do
+      spec = spec(initial_reason: :stall_bounce)
+
+      assert %Cairn.Pipeline.EpochTagger{camera_id: "cam", initial_reason: :stall_bounce} =
+               child(spec, :tagger)
+
+      assert Enum.any?(links(spec), &match?(%{from: :demuxer, to: :tagger}, &1))
+      assert Enum.any?(links(spec), &match?(%{from: :tagger, to: :tee}, &1))
+    end
+
+    test "the first mint is :started unless the owner says otherwise" do
+      assert %Cairn.Pipeline.EpochTagger{initial_reason: :started} = child(spec([]), :tagger)
+    end
+
+    test "both cuts hang off the tee, each with its session-0 branch linked" do
+      spec = spec([])
+      children = children(spec)
+
+      assert children[:record_cut] == Cairn.Pipeline.SessionCut
+      assert children[:rtp_cut] == Cairn.Pipeline.SessionCut
+      assert children[{:cmaf_parser, 0}] == Membrane.H264.Parser
+      assert children[{:cmaf, 0}] == Membrane.MP4.Muxer.CMAF
+      assert children[{:ring_sink, 0}] == Cairn.Pipeline.RingBufferSink
+      assert children[{:rtp_out, 0}] == Cairn.Pipeline.RTPOut
+
+      # …and nothing in either branch carries an epoch: it arrives in band.
+      assert %Cairn.Pipeline.RingBufferSink{camera_id: "cam"} = child(spec, {:ring_sink, 0})
+    end
+  end
+
+  describe "a session boundary" do
+    test "links the next branch at once and drops the drained one after the grace" do
+      {_actions, state} = init(flush_grace_ms: 5)
+
+      assert {[spec: spec], state} =
+               Pipeline.handle_child_notification({:session_ended, 0}, :record_cut, %{}, state)
+
+      # The gate is queueing for this pad already; waiting would be recording
+      # thrown away.
+      assert Map.keys(children(spec)) |> Enum.sort() ==
+               Enum.sort([{:cmaf_parser, 1}, {:cmaf, 1}, {:ring_sink, 1}])
+
+      assert state.sessions.record_cut == 1
+      # the other cut is untouched: each gate counts its own sessions
+      assert state.sessions.rtp_cut == 0
+      # scheduled for drop but not yet dropped
+      assert state.pending_drops == 1
+
+      # EOS is still walking parser -> muxer -> ring sink when the gate speaks,
+      # so removal waits out the flush grace.
+      assert_receive {:drop_branch, :record_cut, 0}, 500
+
+      ctx = %{children: %{{:cmaf_parser, 0} => :_, {:cmaf, 0} => :_, {:ring_sink, 0} => :_}}
+
+      assert {[remove_children: removed], new_state} =
+               Pipeline.handle_info({:drop_branch, :record_cut, 0}, ctx, state)
+
+      assert Enum.sort(removed) == Enum.sort([{:cmaf_parser, 0}, {:cmaf, 0}, {:ring_sink, 0}])
+      assert new_state == %{state | pending_drops: 0}
+    end
+
+    test "the rtp cut rebuilds only its own child" do
+      {_actions, state} = init([])
+
+      assert {[spec: spec], state} =
+               Pipeline.handle_child_notification({:session_ended, 3}, :rtp_cut, %{}, state)
+
+      assert Map.keys(children(spec)) == [{:rtp_out, 4}]
+      assert state.sessions.rtp_cut == 4
+    end
+
+    test "a branch already gone is not removed twice" do
+      {_actions, state} = init([])
+      # mirrors the pairing every real {:drop_branch, ...} has: one prior
+      # {:session_ended, ...} incremented this
+      state = %{state | pending_drops: 1}
+
+      assert {[remove_children: []], new_state} =
+               Pipeline.handle_info({:drop_branch, :rtp_cut, 0}, %{children: %{}}, state)
+
+      assert new_state == %{state | pending_drops: 0}
+    end
+  end
+
+  describe "the source's notifications" do
+    test "reach the owner verbatim — the escalation is the owner's to decide" do
+      {_actions, state} = init([])
+      tracks = [%{type: :video, fmtp: nil, rtpmap: %{encoding: "H264", clock_rate: 90_000}}]
+
+      assert {[], state} =
+               Pipeline.handle_child_notification(
+                 {:stream_connected, :main, tracks},
+                 :source,
+                 %{},
+                 state
+               )
+
+      assert_receive {:stream_connected, :main, ^tracks}
+
+      assert {[], _state} =
+               Pipeline.handle_child_notification({:stream_lost, :main}, :source, %{}, state)
+
+      assert_receive {:stream_lost, :main}
+
+      assert {[], _state} =
+               Pipeline.handle_child_notification(
+                 {:stream_backoff, :main, :refused},
+                 :source,
+                 %{},
+                 state
+               )
+
+      assert_receive {:stream_backoff, :main, :refused}
+    end
+
+    @tag :capture_log
+    test "a reconnect on a different codec is logged; a respelt one is not" do
+      {_actions, state} = init([])
+
+      connect = fn state, encoding ->
+        tracks = [%{type: :video, fmtp: nil, rtpmap: %{encoding: encoding, clock_rate: 90_000}}]
+
+        {[], state} =
+          Pipeline.handle_child_notification(
+            {:stream_connected, :main, tracks},
+            :source,
+            %{},
+            state
+          )
+
+        state
+      end
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          state |> connect.("H264") |> connect.("h264")
+        end)
+
+      refute log =~ "track identity"
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          state |> connect.("H264") |> connect.("H265")
+        end)
+
+      assert log =~ "track identity"
+    end
+
+    test "the detect sink's stats reach the owner, which is what the watchdog reads" do
+      {_actions, state} = init(detect: detect())
+      stats = %{dispatched: 1, dropped: 0, last_buffer_at_ms: -12_345}
+
+      assert {[], _state} =
+               Pipeline.handle_child_notification({:stats, stats}, :detect, %{}, state)
+
+      assert_receive {:stats, ^stats}
+    end
   end
 
   describe "the detect branch" do
@@ -59,7 +234,7 @@ defmodule Cairn.Pipeline.CameraTest do
 
       refute Map.has_key?(children, :picker)
       refute Map.has_key?(children, :infer)
-      assert Map.has_key?(children, :ring_sink)
+      assert Map.has_key?(children, {:ring_sink, 0})
     end
 
     test "hangs off the tee: picker, decoder, inference, then the sink" do
@@ -81,52 +256,47 @@ defmodule Cairn.Pipeline.CameraTest do
     end
 
     test "the picker takes no options — the decoder's gate owns the rate" do
-      spec = spec(detect: detect())
-
-      {_name, picker, _opts} =
-        Enum.find_value(spec, &Enum.find(&1.children, fn {name, _d, _o} -> name == :picker end))
-
-      assert picker == Cairn.Pipeline.Picker
+      assert child(spec(detect: detect()), :picker) == Cairn.Pipeline.Picker
     end
 
-    test "the decoder and inference share one stream_params, so the two native opens agree" do
+    test "the decoder and inference share one stream_params, epoch-free" do
       params = %{min_score: %{"person" => 0.6}}
       spec = spec(detect: detect(stream_params: params))
 
-      {_name, decoder, _opts} =
-        Enum.find_value(spec, &Enum.find(&1.children, fn {name, _d, _o} -> name == :decoder end))
+      assert %Cairn.Pipeline.Decoder{camera_id: "cam", stream_params: ^params} =
+               child(spec, :decoder)
 
-      {_name, inference, _opts} =
-        Enum.find_value(spec, &Enum.find(&1.children, fn {name, _d, _o} -> name == :infer end))
-
-      assert %Cairn.Pipeline.Decoder{camera_id: "cam", stream_params: ^params} = decoder
-      # …inference additionally carries the session epoch, which the decode
-      # side has no use for
+      # The epoch is no longer an option on either: inference reads it off the
+      # frames and reopens its stream when it changes.
       assert %Cairn.Pipeline.Inference{
                session: {Cairn.Native.Host, Cairn.Native.Host},
                stream_id: "cam",
-               stream_params: %{min_score: %{"person" => 0.6}, stream_epoch: "epoch"}
-             } = inference
+               stream_params: ^params
+             } = child(spec, :infer)
     end
 
     test "default ingest is the ffmpeg bridge: BridgeSource into the TS demuxer" do
-      children = children(spec(detect: detect()))
-
-      assert children[:source] == Cairn.Pipeline.BridgeSource
-      assert children[:demuxer] == Membrane.MPEG.TS.Demuxer
-      refute Map.has_key?(children, :ingest_parser)
-    end
-
-    test "rtsp ingest swaps the demuxer for a parser behind RtspSource" do
-      spec = spec(detect: detect(), ingest: :rtsp)
+      spec = spec(detect: detect())
       children = children(spec)
 
-      assert children[:source] == Cairn.Pipeline.RtspSource
-      assert children[:ingest_parser] == Membrane.H264.Parser
-      refute Map.has_key?(children, :demuxer)
+      assert children[:demuxer] == Membrane.MPEG.TS.Demuxer
+      assert %Cairn.Pipeline.BridgeSource{camera_id: "cam"} = child(spec, :source)
+    end
 
-      # Same tee, same three branches — the ingest is the only difference.
-      assert Enum.any?(links(spec), &match?(%{from: :ingest_parser, to: :tee}, &1))
+    test "rtsp ingest is the source element alone — it declares its own format" do
+      camera = %Camera{id: "cam", rtsp_url: "rtsp://cam/main"}
+      spec = spec(camera: camera, detect: detect(), ingest: :rtsp)
+      children = children(spec)
+
+      assert %Membrane.RTSPDualStream.Source{stream_uri: "rtsp://cam/main"} = child(spec, :source)
+      refute Map.has_key?(children, :demuxer)
+      # No shared parser before the tee: `membrane_h26x` holds the last AU
+      # until the next input, which would leak one old-session AU past the
+      # session cut (P1-D13).
+      refute Map.has_key?(children, :ingest_parser)
+
+      # Same tagger, same tee, same branches — the ingest is the only difference.
+      assert Enum.any?(links(spec), &match?(%{from: :source, to: :tagger}, &1))
       assert Enum.any?(links(spec), &match?(%{from: :tee, to: :picker}, &1))
     end
 
@@ -145,26 +315,13 @@ defmodule Cairn.Pipeline.CameraTest do
       # The measurement is the element's (D-C3): the decoder is told nothing
       # about motion, while inference keeps the full params — the gate
       # *policy* still lives with the model session and reads these knobs.
-      {_name, decoder, _opts} =
-        Enum.find_value(spec, &Enum.find(&1.children, fn {name, _d, _o} -> name == :decoder end))
-
-      assert decoder.stream_params.motion_json == nil
-
-      {_name, inference, _opts} =
-        Enum.find_value(spec, &Enum.find(&1.children, fn {name, _d, _o} -> name == :infer end))
-
-      assert inference.stream_params.motion_json == params.motion_json
-
-      {_name, gate, _opts} =
-        Enum.find_value(
-          spec,
-          &Enum.find(&1.children, fn {name, _d, _o} -> name == :motion_gate end)
-        )
+      assert child(spec, :decoder).stream_params.motion_json == nil
+      assert child(spec, :infer).stream_params.motion_json == params.motion_json
 
       assert %Cairn.Pipeline.MotionGate{
                config: %Cairn.Motion.Config{enabled: true, threshold: 30},
                sample_fps: 5
-             } = gate
+             } = child(spec, :motion_gate)
 
       # The same one-frame seam on both sides of the gate.
       for {from, to} <- [{:decoder, :motion_gate}, {:motion_gate, :infer}] do
@@ -195,8 +352,8 @@ defmodule Cairn.Pipeline.CameraTest do
     end
   end
 
-  describe "a reload's policy" do
-    test "is forwarded to the sink, which is the only child that holds one" do
+  describe "the owner's messages" do
+    test "a reload's policy is forwarded to the sink, the only child that holds one" do
       {_actions, state} = init(detect: detect())
       camera = %Camera{id: "cam", record: %{"person" => %{min_score: 0.9}}}
       policy = Map.put(@policy, :record, camera.record)
@@ -205,11 +362,28 @@ defmodule Cairn.Pipeline.CameraTest do
                Pipeline.handle_info({:policy, camera, policy}, %{}, state)
     end
 
-    test "is dropped for a camera whose detect branch was never built" do
+    test "a policy is dropped for a camera whose detect branch was never built" do
       {_actions, state} = init([])
 
       assert {[], ^state} =
                Pipeline.handle_info({:policy, %Camera{id: "cam"}, @policy}, %{}, state)
+    end
+
+    test "a stats request only goes out while there is a branch to ask" do
+      {_actions, detecting} = init(detect: detect())
+      {_actions, plain} = init([])
+
+      assert {[notify_child: {:detect, :stats}], _state} =
+               Pipeline.handle_info(:detect_stats, %{}, detecting)
+
+      assert {[], ^plain} = Pipeline.handle_info(:detect_stats, %{}, plain)
+    end
+
+    test "a flush ends the source's stream, which is what carries the muxer's tail out" do
+      {_actions, state} = init([])
+
+      assert {[notify_child: {:source, :eos}], ^state} =
+               Pipeline.handle_info(:flush, %{}, state)
     end
   end
 
@@ -223,29 +397,30 @@ defmodule Cairn.Pipeline.CameraTest do
 
       for {child, pad} <- consumers do
         # A manual input behind our push source arms membrane_core's toilet,
-        # which kills the receiver ~200 buffers in. The only manual pad in this
-        # graph is the internal picker -> infer seam.
+        # which kills the receiver ~200 buffers in. The only manual pads in
+        # this graph are internal to the detect branch.
         refute flow_control(children[child], pad) == :manual
       end
     end
   end
 
-  describe "what FFmpegPort hands the pipeline" do
+  describe "what PipelineOwner hands the pipeline" do
     setup do
       Process.register(self(), :camera_test_probe)
       :ok
     end
 
     test "no plugin, no detect branch" do
-      start_port(camera("cam_none", nil))
+      start_owner(camera("cam_none", nil))
 
       assert_receive {:pipeline_opts, opts}, 5_000
       assert opts[:detect] == nil
+      assert opts[:initial_reason] == :started
     end
 
     test "the camera's wire floor, and no rate: the engine's profile carries that" do
       camera = %{camera("cam_group", {:group, "g"}) | min_score: %{"person" => 0.6}}
-      start_port(camera, config(camera))
+      start_owner(camera, config(camera))
 
       assert_receive {:pipeline_opts, opts}, 5_000
       refute Keyword.has_key?(opts[:detect], :sample_fps)
@@ -255,7 +430,7 @@ defmodule Cairn.Pipeline.CameraTest do
     test "the camera and the policy the dispatch seam attaches" do
       camera = %{camera("cam_policy", {:group, "g"}) | post_window_seconds: 42}
       config = config(camera)
-      start_port(camera, config)
+      start_owner(camera, config)
 
       assert_receive {:pipeline_opts, opts}, 5_000
       # resolved here rather than in the sink, and resolved identically to the
@@ -286,15 +461,15 @@ defmodule Cairn.Pipeline.CameraTest do
       }
     end
 
-    defp start_port(camera, config \\ %Config{data_dir: "tmp/camera_test"}) do
+    defp start_owner(camera, config \\ %Config{data_dir: "tmp/camera_test"}) do
       start_supervised!(
-        {Cairn.FFmpegPort,
+        {Cairn.PipelineOwner,
          camera: camera,
          config: config,
-         command: "sleep 5",
          pipeline_module: RecordingPipeline,
+         flush_grace_ms: 10,
          status_fun: fn _id, _status -> :ok end},
-        id: {:port, camera.id}
+        id: {:owner, camera.id}
       )
     end
   end

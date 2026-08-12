@@ -12,8 +12,9 @@ defmodule Cairn.RingBuffer do
       through `drain_and_subscribe/3` — the race-free path for event
       extractors (drain + subscribe happen atomically in one call).
 
-  A new init segment (ffmpeg respawn) clears the ring: pts restart at ~0,
-  so pre-window content from the old session is no longer addressable. Each
+  A new init segment (any session boundary — an ffmpeg respawn, an RTSP
+  reconnect, a pipeline rebuild) clears the ring: pts restart at ~0, so
+  pre-window content from the old session is no longer addressable. Each
   init segment is tagged with the stream epoch it opened (`Cairn.StreamEpochs`).
   Fragment `seq` is re-stamped with a per-camera counter that is monotonic
   across sessions (HLS media sequence relies on this).

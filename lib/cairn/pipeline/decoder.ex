@@ -24,6 +24,9 @@ defmodule Cairn.Pipeline.Decoder do
     * `observed_at_ms` — wall clock when the frame cleared the sample gate,
       captured here because a frame can wait behind a busy model pass
       downstream;
+    * `stream_epoch` — the session the frame belongs to, carried over from the
+      access unit it was decoded from (`Cairn.Pipeline.EpochTagger` stamps it
+      at production time); `nil` under a producer that tags nothing;
     * `motion` — the motion measurement (`t:Cairn.Native.motion_verdict/0`),
       when the *decoder* was asked to measure (`stream_params.motion_json`);
       absent otherwise. `Cairn.Pipeline.Camera` no longer asks — the
@@ -119,6 +122,7 @@ defmodule Cairn.Pipeline.Decoder do
        retry_at: nil,
        format: nil,
        source: nil,
+       epoch: nil,
        pending: nil,
        demand: 0,
        sampled: 0,
@@ -186,7 +190,7 @@ defmodule Cairn.Pipeline.Decoder do
 
   @impl true
   def handle_buffer(:input, %Buffer{pts: pts} = buffer, ctx, state) when is_integer(pts) do
-    state = ensure_decoder(state, ctx)
+    state = %{ensure_decoder(state, ctx) | epoch: buffer.metadata[:stream_epoch]}
     {actions, state} = decode(state, ctx, buffer)
     # The next access unit is demanded whatever became of this one: decode
     # runs at line rate, and downstream demand only gates the emit.
@@ -300,20 +304,27 @@ defmodule Cairn.Pipeline.Decoder do
       aligned: true
     }
 
+    metadata =
+      Map.take(frame, [
+        :orig_width,
+        :orig_height,
+        :scale_x,
+        :scale_y,
+        :pad_w,
+        :pad_h,
+        :observed_at_ms,
+        :motion
+      ])
+
     buffer = %Buffer{
       pts: frame.pts,
       payload: frame.payload,
-      metadata:
-        Map.take(frame, [
-          :orig_width,
-          :orig_height,
-          :scale_x,
-          :scale_y,
-          :pad_w,
-          :pad_h,
-          :observed_at_ms,
-          :motion
-        ])
+      # The epoch of the last access unit fed in, not of the picture: decode
+      # reordering can emit a frame belonging to the previous session just
+      # after the boundary. At most one frame is mis-tagged, and the boundary
+      # makes it moot — the new session opens on an IDR, and an old-session
+      # straggler ages out at the staleness gate.
+      metadata: Map.put(metadata, :stream_epoch, state.epoch)
     }
 
     actions =

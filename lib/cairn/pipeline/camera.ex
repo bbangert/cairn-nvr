@@ -1,22 +1,34 @@
 defmodule Cairn.Pipeline.Camera do
   @moduledoc """
-  Per-session membrane pipeline for one camera. The ingest stage differs by
-  `ingest:`; everything from the tee on is identical:
+  One long-lived membrane pipeline per camera. The ingest stage differs by
+  `ingest:`; everything from the tagger on is identical:
 
       ingest: ffmpeg   BridgeSource ─ TS demux ──┐
-      ingest: rtsp     RtspSource ─ parser(au) ──┤
+      ingest: rtsp     RTSPDualStream.Source ────┤
                                                  │
-       tee ─┬─ parser(avc3) ─ CMAF ─ RingBufferSink
-            ├─ RTPOut (in-process WebRTC hub feed)
-            └─ Picker ─(manual)─ Decoder ─(manual)─ Inference ─ DetectSink
+       EpochTagger ─ tee ─┬─ record_cut ─(n)─ parser(avc3) ─ CMAF ─ RingBufferSink
+                          ├─ rtp_cut ────(n)─ RTPOut (in-process WebRTC hub feed)
+                          └─ Picker ─(manual)─ Decoder ─(manual)─ Inference ─ DetectSink
 
-  Started by `Cairn.FFmpegPort` alongside each ingest session — an ffmpeg
-  spawn or an RTSP client — and torn down with it: the TS demuxer's state
-  (and equally an RTSP session's sample stream) is only valid for one
-  continuous session, so the pipeline shares the session's lifetime and its
-  epoch. The ffmpeg bridge wraps the stream in MPEG-TS because raw ES off a
-  pipe carries no timestamps (D-M8); the RTSP client delivers access units
-  with RTP pts natively, so its path is a parser instead of a demuxer.
+  Started once by `Cairn.PipelineOwner` and rebuilt only by it — on a crash or
+  a watchdog escalation, never on a reconnect. Connection lifecycle lives in
+  the sources (the RTSP client sessions inside the element, the ffmpeg Port
+  beside it in `Cairn.FFmpegPort`), and a session boundary reaches the pipeline
+  in-band: `StreamClosed` mints a fresh epoch at `Cairn.Pipeline.EpochTagger`
+  and cuts the per-session branches at the `Cairn.Pipeline.SessionCut` gates.
+
+  The recording and RTP branches are per session because neither survives one:
+  `Membrane.MP4.Muxer.CMAF` computes sample durations as dts deltas, which the
+  per-session pts reset drives negative, and it emits no fresh init for an
+  identical-SPS reconnect — so the ring would never learn the new session
+  (P1-D11). A fresh ssrc per session is the RTP branch's own version of the
+  same. The detect branch is not: the decoder's and inference's native state is
+  the expensive half, and it is exactly what a reconnect must not cost.
+
+  A `{:session_ended, n}` from a gate is the parent's cue to link branch `n+1`
+  at once — the gate is already queueing for it — and to drop branch `n`'s
+  children a flush grace later, once the EOS that cut it has carried the
+  muxer's held tail into the ring.
 
   No tee consumer takes its input on a `:manual` pad. That is the invariant the
   detect branch depends on: a manual input behind our push source arms
@@ -28,7 +40,8 @@ defmodule Cairn.Pipeline.Camera do
   observations then flow as `Detections` buffers into
   `Cairn.Pipeline.DetectSink`, the cairn-side half that dispatches them.
 
-  The tee carries AU-aligned Annex-B H.264 as the TS demuxer emits it; each
+  The tee carries AU-aligned Annex-B H.264 — the TS demuxer's output on one
+  ingest, the source's own SPS-derived format on the other (P1-D13); each
   branch owns its own format conversion (CMAF needs avc3 + per-AU keyframe
   metadata, which its parser stage adds).
 
@@ -39,80 +52,217 @@ defmodule Cairn.Pipeline.Camera do
 
   use Membrane.Pipeline
 
+  require Membrane.Logger
+
   alias Cairn.Motion
-  alias Cairn.Pipeline.{Decoder, DetectSink, Inference, MotionGate, Picker}
+
+  alias Cairn.Pipeline.{
+    BridgeSource,
+    Decoder,
+    DetectSink,
+    EpochTagger,
+    Inference,
+    MotionGate,
+    Picker,
+    RingBufferSink,
+    RTPOut,
+    SessionCut
+  }
+
   alias Membrane.Pad
+
+  @cuts [:record_cut, :rtp_cut]
 
   @impl true
   def handle_init(_ctx, opts) do
     camera = Keyword.fetch!(opts, :camera)
     camera_id = camera.id
-    epoch = Keyword.fetch!(opts, :epoch)
     owner = Keyword.fetch!(opts, :owner)
     detect = Keyword.get(opts, :detect)
     ingest = Keyword.get(opts, :ingest, :ffmpeg)
 
-    spec = [
-      ingest_spec(ingest, owner, epoch)
-      |> child(:tee, Membrane.Tee.Parallel),
-      get_child(:tee)
-      |> child(:cmaf_parser, %Membrane.H264.Parser{
-        output_alignment: :au,
-        output_stream_structure: :avc3
-      })
-      |> via_in(Pad.ref(:input, :video))
-      |> child(:cmaf, %Membrane.MP4.Muxer.CMAF{
-        # matches the classic path's `-frag_duration 2000000`
-        segment_min_duration: Membrane.Time.seconds(2)
-      })
-      |> via_out(Pad.ref(:output, :video))
-      |> child(:ring_sink, %Cairn.Pipeline.RingBufferSink{camera_id: camera_id, epoch: epoch}),
-      get_child(:tee)
-      |> child(:rtp_out, %Cairn.Pipeline.RTPOut{camera_id: camera_id})
-    ]
+    spec =
+      [
+        ingest_spec(ingest, camera)
+        |> child(:tagger, %EpochTagger{
+          camera_id: camera_id,
+          initial_reason: Keyword.get(opts, :initial_reason, :started)
+        })
+        |> child(:tee, Membrane.Tee.Parallel)
+      ] ++
+        Enum.map(@cuts, &(get_child(:tee) |> child(&1, %SessionCut{}))) ++
+        Enum.flat_map(@cuts, &branch_spec(&1, camera_id, 0)) ++
+        detect_spec(camera, detect)
 
-    {[spec: spec ++ detect_spec(camera, epoch, detect)],
-     %{camera_id: camera_id, detecting?: detect != nil}}
+    state = %{
+      camera_id: camera_id,
+      owner: owner,
+      detecting?: detect != nil,
+      sessions: Map.new(@cuts, &{&1, 0}),
+      tracks: %{},
+      # EOS is still propagating parser -> muxer -> ring sink when the gate
+      # says the session ended, so the branch outlives its own cut by this
+      # much or the muxer's held tail is dropped instead of recorded.
+      flush_grace_ms: Keyword.get(opts, :flush_grace_ms, 500),
+      # Branches scheduled for {:drop_branch, ...} but not yet dropped.
+      pending_drops: 0
+    }
+
+    {[spec: spec], state}
   end
 
   @impl true
+  def handle_child_notification({:session_ended, id}, cut, _ctx, state) when cut in @cuts do
+    Process.send_after(self(), {:drop_branch, cut, id}, state.flush_grace_ms)
+    pending = state.pending_drops + 1
+
+    if pending > 2 do
+      Membrane.Logger.warning(
+        "#{state.camera_id}: #{pending} branches pending drop — a flapping camera outpacing flush_grace_ms"
+      )
+    end
+
+    # Eagerly, not on a timer: the gate is queueing media for this pad already,
+    # and every millisecond it waits is a millisecond missing from the ring.
+    {[spec: branch_spec(cut, state.camera_id, id + 1)],
+     %{state | sessions: Map.put(state.sessions, cut, id + 1), pending_drops: pending}}
+  end
+
+  # Ingest liveness the owner's watchdog and status need; it is the owner, not
+  # this pipeline, that decides what a changed camera is worth.
+  def handle_child_notification({:stream_connected, role, tracks}, :source, _ctx, state) do
+    send(state.owner, {:stream_connected, role, tracks})
+    {[], compare_tracks(state, role, tracks)}
+  end
+
+  def handle_child_notification({:stream_lost, _role} = notification, :source, _ctx, state) do
+    send(state.owner, notification)
+    {[], state}
+  end
+
+  def handle_child_notification({:stream_backoff, _role, _why} = note, :source, _ctx, state) do
+    send(state.owner, note)
+    {[], state}
+  end
+
+  def handle_child_notification({:stats, stats}, :detect, _ctx, state) do
+    send(state.owner, {:stats, stats})
+    {[], state}
+  end
+
   def handle_child_notification(_notification, _child, _ctx, state), do: {[], state}
 
-  # A reload's new policy, from `Cairn.FFmpegPort`. Only the detect sink holds
-  # one, so a camera whose detect branch was never built has nothing to tell.
+  # A reload's new policy, from `Cairn.PipelineOwner`. Only the detect sink
+  # holds one, so a camera whose detect branch was never built has nothing to
+  # tell.
   @impl true
   def handle_info({:policy, camera, policy}, _ctx, %{detecting?: true} = state) do
     {[notify_child: {:detect, {:policy, camera, policy}}], state}
   end
 
+  def handle_info(:detect_stats, _ctx, %{detecting?: true} = state) do
+    {[notify_child: {:detect, :stats}], state}
+  end
+
+  # A deliberate stop. The source's EOS travels the same path a session cut
+  # does, so the muxer's tail reaches the ring before the owner terminates us.
+  def handle_info(:flush, _ctx, state) do
+    {[notify_child: {:source, :eos}], state}
+  end
+
+  def handle_info({:drop_branch, cut, id}, ctx, state) do
+    {[remove_children: Enum.filter(branch_children(cut, id), &Map.has_key?(ctx.children, &1))],
+     %{state | pending_drops: state.pending_drops - 1}}
+  end
+
   def handle_info(_message, _ctx, state), do: {[], state}
 
-  # Both ingests deliver the same thing to the tee: AU-aligned Annex-B H.264
-  # with pts. The ffmpeg bridge wraps it in MPEG-TS because raw ES off a pipe
-  # carries no timestamps (D-M8); the RTSP client delivers whole AUs with RTP
-  # pts natively — the exception D-M8 always recorded — so its path is a
-  # parser instead of a demuxer.
-  defp ingest_spec(:ffmpeg, owner, epoch) do
-    child(:source, %Cairn.Pipeline.BridgeSource{owner: owner, session: epoch})
+  # Both ingests deliver the same thing to the tagger: AU-aligned Annex-B
+  # H.264 with pts. The ffmpeg bridge wraps it in MPEG-TS because raw ES off a
+  # pipe carries no timestamps (D-M8); the RTSP source element delivers whole
+  # AUs with RTP pts natively — the exception D-M8 always recorded — and
+  # synthesises the H.264 stream format from each session's own SPS, which is
+  # why no parser stands between it and the tagger (P1-D13).
+  defp ingest_spec(:ffmpeg, camera) do
+    child(:source, %BridgeSource{camera_id: camera.id})
     |> child(:demuxer, %Membrane.MPEG.TS.Demuxer{})
     |> via_out(Pad.ref(:output, 1), options: [stream_category: :video])
   end
 
-  defp ingest_spec(:rtsp, owner, epoch) do
-    child(:source, %Cairn.Pipeline.RtspSource{owner: owner, session: epoch})
-    |> child(:ingest_parser, %Membrane.H264.Parser{
-      output_alignment: :au,
-      # Explicit, matching what the demuxer path carries to the tee: the
-      # cmaf branch re-parses to :avc3 itself, and the RTP branch wants
-      # in-band parameter sets.
-      output_stream_structure: :annexb
-    })
+  defp ingest_spec(:rtsp, camera) do
+    child(:source, %Membrane.RTSPDualStream.Source{stream_uri: camera.rtsp_url})
+    |> via_out(Pad.ref(:output, :main))
   end
 
-  # No plugin configured is no detection, exactly as on the classic path.
-  defp detect_spec(_camera, _epoch, nil), do: []
+  defp branch_spec(:record_cut, camera_id, n) do
+    [
+      get_child(:record_cut)
+      |> via_out(Pad.ref(:output, n))
+      |> child({:cmaf_parser, n}, %Membrane.H264.Parser{
+        output_alignment: :au,
+        output_stream_structure: :avc3
+      })
+      |> via_in(Pad.ref(:input, :video))
+      |> child({:cmaf, n}, %Membrane.MP4.Muxer.CMAF{
+        # matches the classic path's `-frag_duration 2000000`
+        segment_min_duration: Membrane.Time.seconds(2)
+      })
+      |> via_out(Pad.ref(:output, :video))
+      |> child({:ring_sink, n}, %RingBufferSink{camera_id: camera_id})
+    ]
+  end
 
-  defp detect_spec(camera, epoch, detect) do
+  defp branch_spec(:rtp_cut, camera_id, n) do
+    [
+      get_child(:rtp_cut)
+      |> via_out(Pad.ref(:output, n))
+      |> child({:rtp_out, n}, %RTPOut{camera_id: camera_id})
+    ]
+  end
+
+  defp branch_children(:record_cut, n), do: [{:cmaf_parser, n}, {:cmaf, n}, {:ring_sink, n}]
+  defp branch_children(:rtp_cut, n), do: [{:rtp_out, n}]
+
+  # A changed control path or clock rate is absorbed inside the source (it
+  # re-reads both from the SDP it just negotiated), so neither is identity. A
+  # changed codec or track set is: the branches behind the tee are built around
+  # it. Phase 1 only says so — deciding what to do about it is the owner's, and
+  # nothing yet asks.
+  defp compare_tracks(state, role, tracks) do
+    identity = track_identity(tracks)
+
+    case Map.get(state.tracks, role) do
+      nil ->
+        :ok
+
+      ^identity ->
+        :ok
+
+      previous ->
+        Membrane.Logger.warning(
+          "#{state.camera_id}: #{role} stream came back with a different track identity: " <>
+            "#{inspect(previous)} -> #{inspect(identity)}"
+        )
+    end
+
+    %{state | tracks: Map.put(state.tracks, role, identity)}
+  end
+
+  defp track_identity(tracks) do
+    Enum.map(tracks, fn track ->
+      {Map.get(track, :type), Map.get(track, :fmtp), encoding(Map.get(track, :rtpmap))}
+    end)
+  end
+
+  # SDP encoding names are case-insensitive and ExSDP preserves the camera's
+  # spelling, so a camera that respells its own codec is not a change.
+  defp encoding(%{encoding: encoding}), do: String.upcase(encoding)
+  defp encoding(_absent), do: nil
+
+  # No plugin configured is no detection, exactly as on the classic path.
+  defp detect_spec(_camera, nil), do: []
+
+  defp detect_spec(camera, detect) do
     stream_params = Keyword.get(detect, :stream_params, %{})
     gate = motion_gate(camera.id, detect, stream_params)
 
@@ -133,12 +283,11 @@ defmodule Cairn.Pipeline.Camera do
       |> child(:infer, %Inference{
         session: {Cairn.Native.Host, Cairn.Native.Host},
         stream_id: camera.id,
-        stream_params: Map.put(stream_params, :stream_epoch, epoch)
+        stream_params: stream_params
       })
       |> child(:detect, %DetectSink{
         camera: camera,
-        policy: Keyword.fetch!(detect, :policy),
-        epoch: epoch
+        policy: Keyword.fetch!(detect, :policy)
       })
     ]
   end

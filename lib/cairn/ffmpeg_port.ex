@@ -1,33 +1,34 @@
 defmodule Cairn.FFmpegPort do
   @moduledoc """
-  Owns one camera's ingest session — an ffmpeg bridge process as a Port, or
-  (`ingest: rtsp`) the `rtsp` library's client — and the per-session
-  `Cairn.Pipeline.Camera` it feeds.
+  Owns one bridge camera's ffmpeg process as a Port, and nothing else. Cameras
+  on `ingest: rtsp` have no such process and no such owner — their sessions
+  live inside `Membrane.RTSPDualStream.Source`.
 
   ffmpeg spawns via `/bin/sh -c "exec ffmpeg ... 2>> {data_dir}/log/
   ffmpeg-{id}.log"` so stdout stays a clean media byte stream (stderr can
   neither be merged nor silently dropped) and Port signals reach the real
-  ffmpeg thanks to `exec`. stdout carries MPEG-TS — a container with pts,
-  per D-M8 — forwarded to the pipeline (started and monitored here, torn
-  down with each session) whose sink feeds the camera's `Cairn.RingBuffer`.
-  This process learns "media is flowing" from the ring's own broadcasts,
-  epoch-gated so a dying session cannot vouch for its successor. On session
-  end an end-of-stream is flushed through the pipeline first, so the CMAF
-  muxer's held tail segment is recorded rather than lost.
+  ffmpeg thanks to `exec`. stdout carries MPEG-TS — a container with pts, per
+  D-M8 — forwarded to `Cairn.Pipeline.BridgeSource`, which this process
+  resolves through `Cairn.Registry` and monitors. That element outlives every
+  ffmpeg spawned here (D5), so an ffmpeg death is an in-band
+  `{:bridge_session_closed, reason}` and not a teardown: the pipeline cuts its
+  own recording branch on it, flushing the muxer's held tail, and mints the
+  next epoch when media resumes.
 
-  Reconnect policy lives *inside* this GenServer: on `:exit_status` (and on
-  pipeline death) it enters a jittered backoff (1s -> 30s) and respawns
-  itself — a dead camera is a normal long-lived state and must not burn
-  supervisor restart intensity. A periodic watchdog bounces the session
-  when the ring has seen no fragment for `stall_seconds` (silent stall,
-  e.g. a wedged TCP session).
+  Reconnect policy lives *inside* this GenServer: on `:exit_status` it enters a
+  jittered backoff (1s -> 30s) and respawns itself — a dead camera is a normal
+  long-lived state and must not burn supervisor restart intensity.
+  `bounce/1` is the same path driven from outside, by
+  `Cairn.PipelineOwner`'s watchdog, and is the only reason carried across it:
+  a bounced session is `:stall_bounce`, any other end is `:closed`.
 
-  Status transitions (`:connecting | :running | :backoff | :stalled`) are
-  reported through the `:status_fun` callback (wired to `Cairn.CameraStatus`).
+  ## Status
 
-  Every spawn mints a new stream epoch (`Cairn.StreamEpochs`) — one epoch is
-  one continuous decode, so nothing (object ids, pts) carries across a
-  respawn.
+  Reported through `:status_fun` (wired to `Cairn.CameraStatus`), but only for
+  what the pipeline cannot see: this connection's own `:connecting`/`:backoff`
+  and the `:transcode_unavailable` refusal. `:running` is deliberately not
+  reported here — media flowing is the ring's answer and `Cairn.PipelineOwner`
+  gives it, so a bridge that connects and never decodes cannot read as healthy.
   """
 
   use GenServer
@@ -37,10 +38,9 @@ defmodule Cairn.FFmpegPort do
   @backoff_min_ms 1_000
   @backoff_max_ms 30_000
 
-  # Media buffered until the pipeline's source element announces itself
-  # (TS bytes on the ffmpeg bridge, samples on rtsp ingest) — a window of
-  # milliseconds unless the pipeline is failing, in which case its monitor
-  # ends the session; the cap only bounds memory in that interval.
+  # TS bytes held before the pipeline's BridgeSource has ever been resolved —
+  # the startup window, milliseconds unless the pipeline is failing to start at
+  # all. The cap only bounds memory in that interval.
   @pending_max_bytes 8 * 1024 * 1024
 
   defstruct camera: nil,
@@ -51,36 +51,47 @@ defmodule Cairn.FFmpegPort do
             status: :init,
             backoff_ms: nil,
             opts: [],
-            got_fragment: false,
-            epoch: nil,
-            # reason carried into the *next* spawn's epoch
-            spawn_reason: :started,
-            # the per-session pipeline, its monitor, the source element pid
-            # once it announced itself, and media queued until it does.
-            # init_seen gates :running on *this* session's init segment —
-            # ring events carry no session identity except the epoch on
-            # init, so a stale fragment from the dying pipeline must not
-            # reset the backoff of the session that replaced it.
-            pipeline: nil,
-            pipeline_ref: nil,
+            # the camera's BridgeSource, resolved from the registry on the
+            # first byte and monitored; `resolved?` is what turns the startup
+            # buffer below into a plain drop, since after it an unresolvable
+            # send means the pipeline is being rebuilt and its media is a lost
+            # session rather than a backlog
             source: nil,
+            source_ref: nil,
+            resolved?: false,
+            resolving?: false,
             pending: [],
             pending_bytes: 0,
             dropped_bytes: 0,
-            init_seen: false,
-            # ingest: :rtsp — the RTSP client session (the `rtsp` library's
-            # wrapper process, monitored not linked), the video track's
-            # control path and RTP clock rate from its SDP. `port`/`os_pid`
-            # stay nil for these cameras; everything else — epoch minting,
-            # backoff, the fragment watchdog, the flush grace — is shared.
-            rtsp: nil,
-            rtsp_ref: nil,
-            video_path: nil,
-            clock_rate: 90_000
+            logged_drop?: false
 
   def start_link(opts) do
     cam = Keyword.fetch!(opts, :camera)
     GenServer.start_link(__MODULE__, opts, name: Cairn.Registry.via(cam.id, :ffmpeg))
+  end
+
+  @doc """
+  Kills the current ffmpeg and respawns it through the normal backoff path,
+  cutting the session as `:stall_bounce`.
+
+  The watchdog's first rung: a silently wedged TCP session looks exactly like a
+  healthy one from here, and re-dialling the camera is cheaper than rebuilding
+  the pipeline behind it.
+  """
+  @spec bounce(GenServer.server()) :: :ok
+  def bounce(server), do: GenServer.cast(server, :bounce)
+
+  @doc """
+  Is an ffmpeg currently spawned (as opposed to backing off)?
+
+  The watchdog's way of telling an outage from a wedge: a bridge that is not
+  running is already recovering itself.
+  """
+  @spec running?(GenServer.server()) :: boolean()
+  def running?(server) do
+    GenServer.call(server, :running?, 1_000)
+  catch
+    :exit, _dead_or_slow -> false
   end
 
   @doc """
@@ -189,21 +200,6 @@ defmodule Cairn.FFmpegPort do
 
   defp shell_escape(arg), do: "'" <> String.replace(arg, "'", "'\\''") <> "'"
 
-  @doc """
-  Point a running camera's detect branch at a new config without touching
-  ffmpeg.
-
-  The `Cairn.Detect.Dispatch` policy is resolved here at each session
-  start, so a reload has to reach the running pipeline's sink too —
-  otherwise a `record:` edit would sit unapplied until the camera's next
-  reconnect. The ffmpeg argv cannot move under a refresh: every field it
-  carries is a `Cairn.Config.Server` restart field.
-  """
-  @spec refresh(GenServer.server(), Cairn.Config.Camera.t(), Cairn.Config.t()) :: :ok
-  def refresh(server, %Cairn.Config.Camera{} = camera, %Cairn.Config{} = config) do
-    GenServer.cast(server, {:refresh, camera, config})
-  end
-
   # -- server -----------------------------------------------------------------
 
   @impl true
@@ -217,41 +213,38 @@ defmodule Cairn.FFmpegPort do
       opts: opts
     }
 
-    # This process holds no demuxer to observe fragments on, so the
-    # :running transition and backoff reset ride the ring's own broadcasts.
-    Phoenix.PubSub.subscribe(Cairn.PubSub, Cairn.RingBuffer.topic(state.camera.id))
-
     send(self(), :spawn)
-    schedule_watchdog(state)
     {:ok, state}
   end
 
   @impl true
-  def handle_cast({:refresh, camera, config}, state) do
-    {:noreply, refresh_detect(state, camera, config)}
+  def handle_call(:running?, _from, state), do: {:reply, state.port != nil, state}
+
+  # A bounce with no port is already what a bounce produces: backing off with a
+  # respawn scheduled. Entering it twice would put two ffmpegs on the camera.
+  @impl true
+  def handle_cast(:bounce, %{port: nil} = state), do: {:noreply, state}
+
+  def handle_cast(:bounce, state) do
+    {:noreply, enter_backoff(kill_port(state), :stall_bounce)}
   end
 
   @impl true
   def handle_info(:spawn, state) do
-    cond do
-      rtsp_ingest?(state) ->
-        {:noreply, spawn_rtsp(state)}
+    if state.camera.transcode and not transcode_capable?(state) do
+      # settled decision: refuse loudly, never fall back to libx264.
+      # Re-check occasionally so a driver/module fix is picked up without
+      # a full restart.
+      Logger.error(
+        "camera #{state.camera.id}: transcode requested but h264_v4l2m2m is unavailable — " <>
+          "refusing to start (no software fallback)"
+      )
 
-      state.camera.transcode and not transcode_capable?(state) ->
-        # settled decision: refuse loudly, never fall back to libx264.
-        # Re-check occasionally so a driver/module fix is picked up without
-        # a full restart.
-        Logger.error(
-          "camera #{state.camera.id}: transcode requested but h264_v4l2m2m is unavailable — " <>
-            "refusing to start (no software fallback)"
-        )
-
-        :persistent_term.erase({__MODULE__, :v4l2m2m})
-        Process.send_after(self(), :spawn, Keyword.get(state.opts, :recheck_ms, 60_000))
-        {:noreply, set_status(state, :transcode_unavailable)}
-
-      true ->
-        {:noreply, spawn_ffmpeg(state)}
+      :persistent_term.erase({__MODULE__, :v4l2m2m})
+      Process.send_after(self(), :spawn, Keyword.get(state.opts, :recheck_ms, 60_000))
+      {:noreply, set_status(state, :transcode_unavailable)}
+    else
+      {:noreply, spawn_ffmpeg(state)}
     end
   end
 
@@ -261,187 +254,36 @@ defmodule Cairn.FFmpegPort do
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     Logger.warning("camera #{state.camera.id}: ffmpeg exited with status #{status}")
-    state = %{state | port: nil, os_pid: nil}
-
-    # The CMAF muxer is holding a final sub-min-duration segment that only
-    # an end_of_stream flushes. Everything ffmpeg delivered is ordered ahead
-    # of :ts_eos in the source's mailbox, so a short grace before teardown
-    # turns "drop up to 2 s of recording on every session end" into a
-    # flushed tail. Stall bounces skip this: no data was flowing.
-    if is_pid(state.source) do
-      send(state.source, :ts_eos)
-      Process.send_after(self(), :flush_done, Keyword.get(state.opts, :flush_grace_ms, 500))
-      {:noreply, state}
-    else
-      {:noreply, enter_backoff(state, :source_lost)}
-    end
-  end
-
-  def handle_info(:flush_done, %{port: nil, rtsp: nil, pipeline: pipeline} = state)
-      when is_pid(pipeline) do
-    {:noreply, enter_backoff(state, :source_lost)}
-  end
-
-  # The grace period was cut short by another session-ending path (stall
-  # bounce, pipeline death) — backoff is already underway.
-  def handle_info(:flush_done, state), do: {:noreply, state}
-
-  def handle_info(:watchdog, state) do
-    schedule_watchdog(state)
-
-    case stalled?(state) do
-      true ->
-        Logger.warning(
-          "camera #{state.camera.id}: stalled (no fragments), bouncing the ingest session"
-        )
-
-        state = set_status(state, :stalled)
-        {:noreply, enter_backoff(kill_port(state), :stall_bounce)}
-
-      false ->
-        {:noreply, state}
-    end
+    {:noreply, enter_backoff(%{state | port: nil, os_pid: nil}, :closed)}
   end
 
   def handle_info({:EXIT, port, _reason}, %{port: port} = state) do
-    {:noreply, enter_backoff(%{state | port: nil, os_pid: nil}, :source_lost)}
+    {:noreply, enter_backoff(%{state | port: nil, os_pid: nil}, :closed)}
   end
 
-  # -- ingest: :rtsp — the client's three message kinds -------------------------
-
-  # Samples arrive one-or-many per message; only the negotiated video track's
-  # control path is ours (the fleet advertises no other track, but an SDP is
-  # the camera's to write). pts is rescaled from the track's RTP clock to
-  # nanoseconds here, where the clock rate is known, so the source element
-  # stays a dumb relay.
-  def handle_info({:rtsp, client, {path, samples}}, %{rtsp: client} = state) do
-    if path == state.video_path do
-      {:noreply, Enum.reduce(List.wrap(samples), state, &forward_sample(&2, &1))}
-    else
-      {:noreply, state}
-    end
+  # The pipeline was rebuilt (or died) under us: the next byte re-resolves.
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{source_ref: ref} = state) do
+    {:noreply, %{state | source: nil, source_ref: nil}}
   end
 
-  # An RTP sequence gap: frames were lost upstream of us. The decoder side
-  # already survives holes (the picker's hole rules exist for exactly this);
-  # log it so a lossy link is visible in one place.
-  def handle_info({:rtsp, client, :discontinuity}, %{rtsp: client} = state) do
-    Logger.warning("camera #{state.camera.id}: rtsp discontinuity (rtp sequence gap)")
-    {:noreply, state}
-  end
-
-  # The session ended — teardown, socket death, or server-side close; the
-  # client wrapper stays alive and this message is the whole signal. Same
-  # shape as ffmpeg's exit_status: flush the CMAF tail through the source,
-  # then back off and respawn under a fresh epoch.
-  def handle_info({:rtsp, client, :session_closed}, %{rtsp: client} = state) do
-    Logger.warning("camera #{state.camera.id}: rtsp session closed")
-    state = kill_rtsp(state)
-
-    if is_pid(state.source) do
-      send(state.source, :rtsp_eos)
-      Process.send_after(self(), :flush_done, Keyword.get(state.opts, :flush_grace_ms, 500))
-      {:noreply, state}
-    else
-      {:noreply, enter_backoff(state, :source_lost)}
-    end
-  end
-
-  # A stale session's message (bounced client, late delivery) — not ours.
-  def handle_info({:rtsp, _client, _event}, state), do: {:noreply, state}
-
-  # The client process itself died — a crash, not a close (a close leaves it
-  # alive and sends :session_closed). Same recovery, including the tail
-  # flush: everything the client delivered is ordered ahead of this :DOWN in
-  # our mailbox and already forwarded, so the CMAF muxer's held final
-  # segment is as recoverable here as on a graceful close.
-  def handle_info({:DOWN, ref, :process, _pid, reason}, %{rtsp_ref: ref} = state) do
-    Logger.warning("camera #{state.camera.id}: rtsp client died: #{inspect(reason)}")
-    state = %{state | rtsp: nil, rtsp_ref: nil, video_path: nil}
-
-    if is_pid(state.source) do
-      send(state.source, :rtsp_eos)
-      Process.send_after(self(), :flush_done, Keyword.get(state.opts, :flush_grace_ms, 500))
-      {:noreply, state}
-    else
-      {:noreply, enter_backoff(state, :source_lost)}
-    end
-  end
-
-  # Epoch-matched exactly as :bridge_source_ready: a stale element outliving
-  # a force-kill cannot claim the successor session's samples.
-  def handle_info({:rtsp_source_ready, epoch, pid}, %{epoch: epoch} = state) do
-    Enum.each(Enum.reverse(state.pending), fn {payload, pts_ns} ->
-      send(pid, {:rtsp_sample, payload, pts_ns})
-    end)
-
-    {:noreply, %{state | source: pid, pending: [], pending_bytes: 0}}
-  end
-
-  # Epoch-matched so a stale element that outlived a force-kill teardown
-  # cannot claim the successor session's byte stream; a mismatched ready
-  # falls through to the catch-all and is dropped.
-  def handle_info({:bridge_source_ready, epoch, pid}, %{epoch: epoch} = state) do
-    Enum.each(Enum.reverse(state.pending), &send(pid, {:ts_data, &1}))
-    {:noreply, %{state | source: pid, pending: [], pending_bytes: 0}}
-  end
-
-  # A pipeline death is a lost decode session, exactly like ffmpeg dying:
-  # same backoff, same epoch semantics. Our own teardown never lands here —
-  # `stop_pipeline/1` demonitors with flush first — so any reason, even
-  # :normal, is an unexpected end of the session.
-  def handle_info({:DOWN, ref, :process, _pid, reason}, %{pipeline_ref: ref} = state) do
-    Logger.warning("camera #{state.camera.id}: membrane pipeline died: #{inspect(reason)}")
-    state = %{state | pipeline: nil, pipeline_ref: nil, source: nil}
-    {:noreply, enter_backoff(state, :source_lost)}
-  end
-
-  # Ring broadcasts (membrane mode only, see init/1). The init segment carries
-  # the epoch, fragments do not — so the epoch match on init is what ties the
-  # fragment-based :running transition to *this* spawn. A stale session's
-  # fragment cannot slip in after this init: every ring event is emitted by
-  # the one per-camera RingBuffer process, whose mailbox already held any
-  # old-session casts before the new sink existed to cast its init (local
-  # sends enqueue at send time), and PubSub preserves that per-publisher
-  # order — plus init_seen is reset by both stop_pipeline/1 and
-  # spawn_ffmpeg/1, and the flush-grace window is covered by the port guard
-  # below.
-  def handle_info({:init_segment, %{epoch: epoch}}, %{epoch: epoch} = state) do
-    {:noreply, %{state | init_seen: true}}
-  end
-
-  def handle_info({:fragment, _frag}, %{init_seen: true, got_fragment: false} = state)
-      when state.port != nil or state.rtsp != nil do
-    state = set_status(state, :running)
-    {:noreply, %{state | got_fragment: true, backoff_ms: backoff_min(state)}}
+  # The startup race, and the reason resolution cannot ride the byte stream
+  # alone: a camera whose first burst arrives before the pipeline is playing
+  # may then go quiet for its whole GOP, and nothing would go looking for the
+  # source it is waiting on.
+  def handle_info(:resolve, state) do
+    {:noreply, state |> Map.put(:resolving?, false) |> resolve_source() |> schedule_resolve()}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
-  def terminate(reason, state) do
-    # Only a deliberate stop ends the stream: after a crash the restart mints
-    # its own epoch, and announcing :camera_stopped in between would make
-    # consumers see a stopped -> started flap. Minted *before* the blocking
-    # kill so it is not the first casualty of the supervisor's shutdown budget.
-    # Never a guarantee either way — a brutal kill skips terminate/2 entirely,
-    # so consumers must keep their own timeouts as the backstop.
-    # Short timeout: shutdown must not be gated on epoch bookkeeping. A wedged
-    # StreamEpochs would otherwise eat the shutdown budget and get us killed
-    # before kill_port/1, orphaning ffmpeg; the degraded path still
-    # best-effort-broadcasts.
-    if stop_reason?(reason) do
-      Cairn.StreamEpochs.new_epoch(state.camera.id, :camera_stopped, 500)
-    end
-
-    state |> kill_port() |> kill_rtsp() |> stop_pipeline()
+  def terminate(_reason, state) do
+    # The epoch bookkeeping of a deliberate stop belongs to
+    # `Cairn.PipelineOwner`, which outlives the pipeline this session feeds;
+    # all that is owed here is the OS process.
+    kill_port(state)
     :ok
   end
-
-  defp stop_reason?(:normal), do: true
-  defp stop_reason?(:shutdown), do: true
-  defp stop_reason?({:shutdown, _}), do: true
-  defp stop_reason?(_reason), do: false
 
   # -- internals --------------------------------------------------------------
 
@@ -452,13 +294,9 @@ defmodule Cairn.FFmpegPort do
   defp spawn_ffmpeg(state) do
     command = spawn_command(state)
 
-    # Mint before the port exists. Nothing between acquiring the port and
-    # folding it into state may fail: an unwind there would leave an ffmpeg
-    # holding the RTSP session with its pid nowhere in state, so `kill_port/1`
-    # would no-op on it. (`start_session/1` upholds this: a pipeline start
-    # failure is handled as a value, never an unwind.)
-    epoch = Cairn.StreamEpochs.new_epoch(state.camera.id, state.spawn_reason)
-
+    # Nothing between acquiring the port and folding it into state may fail: an
+    # unwind there would leave an ffmpeg holding the RTSP session with its pid
+    # nowhere in state, so `kill_port/1` would no-op on it.
     port =
       Port.open({:spawn_executable, "/bin/sh"}, [
         :binary,
@@ -473,264 +311,7 @@ defmodule Cairn.FFmpegPort do
       end
 
     state = set_status(state, :connecting)
-
-    # `source: nil` here and in spawn_rtsp: a ready handshake queued by the
-    # just-terminated pipeline during backoff still matches the OLD epoch
-    # (it is minted fresh only now) and would otherwise leave `source`
-    # pointing at a dead pid — sending this session's early media into the
-    # void instead of pending it for the real handshake.
-    state = %{
-      state
-      | port: port,
-        os_pid: os_pid,
-        source: nil,
-        got_fragment: false,
-        init_seen: false,
-        epoch: epoch
-    }
-
-    start_session(state)
-  end
-
-  # One decode session = one RTSP client + one pipeline — spawn_ffmpeg's
-  # exact shape with the OS process replaced by the `rtsp` library's client:
-  # epoch minted first, failures handled as values (a refused camera enters
-  # the same backoff a dead ffmpeg does), the client monitored rather than
-  # linked — its normal end is a `:session_closed` message from a process
-  # that stays alive, and its crash is the :DOWN.
-  defp spawn_rtsp(state) do
-    epoch = Cairn.StreamEpochs.new_epoch(state.camera.id, state.spawn_reason)
-    state = set_status(state, :connecting)
-
-    case open_rtsp(state) do
-      {:ok, client, ref, video_path, clock_rate} ->
-        state = %{
-          state
-          | rtsp: client,
-            rtsp_ref: ref,
-            video_path: video_path,
-            clock_rate: clock_rate,
-            source: nil,
-            got_fragment: false,
-            init_seen: false,
-            epoch: epoch
-        }
-
-        start_session(state)
-
-      {:error, reason} ->
-        Logger.warning("camera #{state.camera.id}: rtsp connect failed: #{inspect(reason)}")
-        enter_backoff(state, :source_lost)
-    end
-  end
-
-  # start → connect → exactly one H.264 video track → play, every step a
-  # value: a refused start (bad host, exhausted resources) is the same
-  # backoff a dead ffmpeg gets, never a MatchError that would crash this
-  # process and its backoff/epoch state with it. Any other answer is a
-  # camera this ingest cannot serve, refused with the reason in the log —
-  # the operator's remedy is `ingest: ffmpeg` (D-M7's escape hatch).
-  defp open_rtsp(state) do
-    rtsp = rtsp_module(state)
-
-    case rtsp.start(
-           stream_uri: state.camera.rtsp_url,
-           transport: :tcp,
-           # Video only: the default SETUPs and depayloads audio too, which
-           # this handler would discard per sample — and an unusable audio
-           # track must not be able to refuse an otherwise valid session.
-           allowed_media_types: [:video],
-           receiver: self()
-         ) do
-      {:ok, client} ->
-        open_session(rtsp, client)
-
-      :ignore ->
-        {:error, :ignore}
-
-      {:error, _reason} = error ->
-        error
-    end
-  end
-
-  # `connect/1` and `play/1` are GenServer.calls: a slow camera or a client
-  # race EXITS the caller (timeout, :noproc) rather than returning an error,
-  # and `with` only handles values — so the exit is caught here and refused
-  # through the same cleanup as a returned refusal. Letting it escape would
-  # crash this process and its backoff/epoch state with it.
-  defp open_session(rtsp, client) do
-    ref = Process.monitor(client)
-
-    try do
-      with {:ok, tracks} <- rtsp.connect(client),
-           {:ok, video_path, clock_rate} <- video_track(tracks),
-           :ok <- rtsp.play(client) do
-        {:ok, client, ref, video_path, clock_rate}
-      else
-        error -> refuse_session(rtsp, client, ref, normalize_error(error))
-      end
-    catch
-      :exit, reason -> refuse_session(rtsp, client, ref, {:error, {:exit, reason}})
-    end
-  end
-
-  defp refuse_session(rtsp, client, ref, error) do
-    Process.demonitor(ref, [:flush])
-    stop_client_async(rtsp, client)
-    error
-  end
-
-  defp normalize_error({:error, _reason} = error), do: error
-  defp normalize_error(other), do: {:error, other}
-
-  defp video_track(tracks) do
-    case Enum.filter(tracks, &(&1.type == :video)) do
-      [%{control_path: path, rtpmap: %{encoding: encoding} = rtpmap}] ->
-        # SDP encoding names are case-insensitive and ExSDP preserves the
-        # camera's spelling — `h264/90000` is as valid as `H264/90000`. The
-        # refusal carries the original spelling for the operator.
-        if String.upcase(encoding) == "H264" do
-          {:ok, path, rtpmap.clock_rate}
-        else
-          {:error, {:unsupported_codec, encoding}}
-        end
-
-      # An SDP may legally omit the rtpmap; without it there is no encoding
-      # and no clock rate to build a session on — named distinctly so the
-      # operator is not sent hunting for a second video track.
-      [_track] ->
-        {:error, :no_rtp_metadata}
-
-      [] ->
-        {:error, :no_video_track}
-
-      [_, _ | _] ->
-        {:error, :multiple_video_tracks}
-    end
-  end
-
-  defp forward_sample(state, {payload, pts, _keyframe?, _wallclock_ms}) do
-    payload = annexb(payload)
-    pts_ns = div(pts * 1_000_000_000, state.clock_rate)
-
-    case state.source do
-      pid when is_pid(pid) ->
-        send(pid, {:rtsp_sample, payload, pts_ns})
-        state
-
-      nil ->
-        pend_sample(state, payload, pts_ns)
-    end
-  end
-
-  # The library's decoder STRIPS start codes at RTP ingest and hands the
-  # access unit over as a list of bare NAL binaries — concatenating them
-  # as-is would be an invalid byte stream (SPS|PPS|slice with no framing),
-  # which `Membrane.H264.Parser` cannot split. Annex-B framing is restored
-  # here, one 4-byte start code per NAL.
-  defp annexb(nalus) when is_list(nalus),
-    do: IO.iodata_to_binary(Enum.map(nalus, &[<<0, 0, 0, 1>>, &1]))
-
-  defp annexb(nalu) when is_binary(nalu), do: <<0, 0, 0, 1, nalu::binary>>
-
-  # The same bounded holding pattern as forward_ts/2, for the window between
-  # PLAY and the source element announcing itself.
-  defp pend_sample(state, payload, pts_ns) do
-    cond do
-      state.pending_bytes + byte_size(payload) <= @pending_max_bytes ->
-        %{
-          state
-          | pending: [{payload, pts_ns} | state.pending],
-            pending_bytes: state.pending_bytes + byte_size(payload)
-        }
-
-      state.dropped_bytes == 0 ->
-        Logger.warning(
-          "camera #{state.camera.id}: dropping rtsp samples — pipeline source " <>
-            "not ready after #{@pending_max_bytes} buffered bytes"
-        )
-
-        %{state | dropped_bytes: byte_size(payload)}
-
-      true ->
-        %{state | dropped_bytes: state.dropped_bytes + byte_size(payload)}
-    end
-  end
-
-  defp kill_rtsp(%{rtsp: nil} = state), do: state
-
-  defp kill_rtsp(state) do
-    Process.demonitor(state.rtsp_ref, [:flush])
-    stop_client_async(rtsp_module(state), state.rtsp)
-    %{state | rtsp: nil, rtsp_ref: nil, video_path: nil}
-  end
-
-  # Off this process's loop, every time: the library's `stop/1` is a
-  # synchronous call into a client that may be wedged, and the camera's
-  # message loop must not be — `kill_port/1`'s TERM is non-blocking for the
-  # same reason. The caller has already flushed its monitor, so teardown
-  # owes it nothing; the backstop kill bounds a graceful stop that never
-  # returns (the client holds only its socket, which dies with it).
-  #
-  # The kill after a *successful* stop is not paranoia: the library's
-  # `stop/1` cleans the session and replies but deliberately leaves its
-  # GenServer alive — without it, every normal teardown would leak one
-  # unmonitored client process.
-  defp stop_client_async(rtsp, client) do
-    spawn(fn ->
-      {_stopper, ref} = spawn_monitor(fn -> stop_then_reap(rtsp, client) end)
-
-      receive do
-        {:DOWN, ^ref, :process, _pid, _reason} -> :ok
-      after
-        3_000 -> Process.exit(client, :kill)
-      end
-    end)
-  end
-
-  defp stop_then_reap(rtsp, client) do
-    catch_stop(rtsp, client)
-    if Process.alive?(client), do: Process.exit(client, :kill)
-  end
-
-  # `stop/1` on a client that already closed (or crashed) must not take the
-  # teardown process with it — the session is ending either way.
-  defp catch_stop(rtsp, client) do
-    rtsp.stop(client)
-  catch
-    :exit, _reason -> :ok
-  end
-
-  defp rtsp_ingest?(state), do: state.camera.ingest == :rtsp
-
-  defp rtsp_module(state), do: Keyword.get(state.opts, :rtsp_module, RTSP)
-
-  # One decode session = one ingest + one pipeline: the TS demuxer's state
-  # is per-session, so the pipeline is born and dies with its ffmpeg rather
-  # than living in the supervision tree where a restart would decouple the
-  # two.
-  defp start_session(state) do
-    opts = [
-      camera: state.camera,
-      epoch: state.epoch,
-      owner: self(),
-      ingest: state.camera.ingest,
-      detect: detect_opts(state)
-    ]
-
-    module = Keyword.get(state.opts, :pipeline_module, Cairn.Pipeline.Camera)
-
-    case Membrane.Pipeline.start(module, opts) do
-      {:ok, _supervisor, pipeline} ->
-        %{state | pipeline: pipeline, pipeline_ref: Process.monitor(pipeline)}
-
-      {:error, reason} ->
-        Logger.error(
-          "camera #{state.camera.id}: membrane pipeline failed to start: #{inspect(reason)}"
-        )
-
-        enter_backoff(state, :source_lost)
-    end
+    %{state | port: port, os_pid: os_pid, logged_drop?: false}
   end
 
   defp spawn_command(state) do
@@ -747,89 +328,102 @@ defmodule Cairn.FFmpegPort do
     end
   end
 
-  # `send/2` and not a pipeline call: a refresh must not wait on a pipeline
-  # whose sink is inside a `push_frame/5`. Between sessions there is no pipeline to
-  # tell and none is owed — the next spawn resolves the policy from `config`.
-  defp refresh_detect(state, camera, config) do
-    state = %{state | camera: camera, config: config}
-
-    if is_pid(state.pipeline) do
-      send(state.pipeline, {:policy, camera, Cairn.Config.policy(config, camera)})
-    end
-
-    state
-  end
-
-  # `nil` leaves the pipeline's detect branch unbuilt. `min_score` is the
-  # stream's wire floor; the rest of the profile is engine config
-  # (`Cairn.Config.native_model_config/1`). `policy:` is resolved here
-  # rather than in the sink because it is a config round trip, and the
-  # sink's caller is the per-frame path.
-  defp detect_opts(%{camera: %{plugin: nil}}), do: nil
-
-  # No `sample_fps`: the branch does not thin, and the engine takes the rate from
-  # the profile every membrane camera on this node has to agree on
-  # (`Cairn.Config.native_model_config/1`).
-  defp detect_opts(state) do
-    [
-      policy: Cairn.Config.policy(state.config, state.camera),
-      stream_params: %{min_score: state.camera.min_score}
-    ]
-  end
-
-  defp forward_ts(%{source: pid} = state, data) when is_pid(pid) do
-    send(pid, {:ts_data, data})
-    state
-  end
-
   defp forward_ts(state, data) do
-    cond do
-      state.pending_bytes + byte_size(data) <= @pending_max_bytes ->
-        %{
-          state
-          | pending: [data | state.pending],
-            pending_bytes: state.pending_bytes + byte_size(data)
-        }
+    # Bytes on stdout are this process's only evidence that the camera answered
+    # at all, so they are what resets the backoff ladder — otherwise one long
+    # healthy session ending would still respawn at the 30 s ceiling it climbed
+    # to weeks earlier.
+    state = %{state | backoff_ms: backoff_min(state)}
 
-      state.dropped_bytes == 0 ->
-        Logger.warning(
-          "camera #{state.camera.id}: dropping TS bytes — pipeline source " <>
-            "not ready after #{@pending_max_bytes} buffered bytes"
-        )
+    case resolve_source(state) do
+      %{source: pid} = state when is_pid(pid) ->
+        send(pid, {:ts_data, data})
+        state
 
-        %{state | dropped_bytes: byte_size(data)}
-
-      true ->
-        %{state | dropped_bytes: state.dropped_bytes + byte_size(data)}
+      state ->
+        hold(state, data)
     end
   end
 
-  defp stop_pipeline(%{pipeline: nil} = state), do: state
+  defp resolve_source(%{source: pid} = state) when is_pid(pid), do: state
 
-  defp stop_pipeline(state) do
-    Process.demonitor(state.pipeline_ref, [:flush])
-    # force?: a wedged element must not block the respawn path; the pipeline
-    # holds no OS resources, so a hard kill leaks nothing.
-    Membrane.Pipeline.terminate(state.pipeline, timeout: 5_000, force?: true)
+  defp resolve_source(state) do
+    case Cairn.Registry.whereis(state.camera.id, :bridge_source) do
+      nil -> state
+      pid -> adopt_source(state, pid)
+    end
+  end
+
+  defp adopt_source(state, pid) do
+    Enum.each(Enum.reverse(state.pending), &send(pid, {:ts_data, &1}))
 
     %{
       state
-      | pipeline: nil,
-        pipeline_ref: nil,
-        source: nil,
+      | source: pid,
+        source_ref: Process.monitor(pid),
+        resolved?: true,
         pending: [],
-        pending_bytes: 0,
-        dropped_bytes: 0,
-        init_seen: false
+        pending_bytes: 0
     }
   end
 
+  # Only until the source has ever been resolved. Past that a missing source is
+  # a pipeline being rebuilt, and holding its bytes would splice two sessions
+  # together across the cut the rebuild is.
+  defp hold(%{resolved?: true} = state, data), do: drop(state, data)
+
+  defp hold(state, data) do
+    if state.pending_bytes + byte_size(data) <= @pending_max_bytes do
+      schedule_resolve(%{
+        state
+        | pending: [data | state.pending],
+          pending_bytes: state.pending_bytes + byte_size(data)
+      })
+    else
+      drop(state, data)
+    end
+  end
+
+  defp schedule_resolve(%{source: nil, resolving?: false, pending: [_ | _]} = state) do
+    Process.send_after(self(), :resolve, Keyword.get(state.opts, :resolve_interval_ms, 50))
+    %{state | resolving?: true}
+  end
+
+  defp schedule_resolve(state), do: state
+
+  # One line per session, not per read: an unresolvable source drops at the
+  # camera's full bitrate.
+  defp drop(%{logged_drop?: false} = state, data) do
+    Logger.warning(
+      "camera #{state.camera.id}: dropping TS bytes — no pipeline source " <>
+        "(#{state.pending_bytes} bytes buffered)"
+    )
+
+    drop(%{state | logged_drop?: true}, data)
+  end
+
+  defp drop(state, data), do: %{state | dropped_bytes: state.dropped_bytes + byte_size(data)}
+
+  # The session's end, in band. Everything ffmpeg delivered is ordered ahead of
+  # it in the source's mailbox, so the cut lands exactly where its last byte
+  # did — which is what lets the muxer's held tail be flushed rather than lost.
+  defp close_session(state, reason) do
+    state = resolve_source(state)
+    if is_pid(state.source), do: send(state.source, {:bridge_session_closed, reason})
+    state
+  end
+
   defp enter_backoff(state, reason) do
-    state = state |> kill_port() |> kill_rtsp() |> stop_pipeline() |> set_status(:backoff)
-    jitter = :rand.uniform()
-    delay = trunc(state.backoff_ms * (0.5 + jitter))
+    state = state |> kill_port() |> close_session(reason) |> set_status(:backoff)
+    delay = trunc(state.backoff_ms * (0.5 + :rand.uniform()))
     Process.send_after(self(), :spawn, delay)
-    %{state | backoff_ms: min(state.backoff_ms * 2, backoff_max(state)), spawn_reason: reason}
+
+    %{
+      state
+      | backoff_ms: min(state.backoff_ms * 2, backoff_max(state)),
+        pending: [],
+        pending_bytes: 0
+    }
   end
 
   defp kill_port(%{port: nil} = state), do: state
@@ -845,22 +439,6 @@ defmodule Cairn.FFmpegPort do
     Port.close(port)
   rescue
     ArgumentError -> :ok
-  end
-
-  defp stalled?(%{status: :running} = state) do
-    stall_ms = state.config.stall_seconds * 1_000
-
-    case Cairn.RingBuffer.last_fragment_at(state.camera.id) do
-      nil -> false
-      at -> System.monotonic_time(:millisecond) - at > stall_ms
-    end
-  end
-
-  defp stalled?(_state), do: false
-
-  defp schedule_watchdog(state) do
-    interval = Keyword.get(state.opts, :watchdog_interval_ms, 5_000)
-    Process.send_after(self(), :watchdog, interval)
   end
 
   defp set_status(%{status: status} = state, status), do: state

@@ -48,10 +48,11 @@ defmodule Cairn.TrackRecorder do
   There is deliberately **no `terminate/2`**. It is not a durability mechanism:
   it is skipped on a brutal kill and when the VM dies, which are the cases that
   lose data, so a flush there would cover only the orderly stop while reading
-  as a guarantee that the crash is covered too. The module here that does
-  define one — `Cairn.FFmpegPort` — uses it to reap an OS process, and its
-  own comment says the same thing about how far it reaches. This is a
-  reviewed decision, not an omission.
+  as a guarantee that the crash is covered too. The modules here that do
+  define one use it for something a crash genuinely may skip — an OS process
+  to reap (`Cairn.FFmpegPort`), a stream to announce the end of
+  (`Cairn.PipelineOwner`) — and the latter's own comment says the same thing
+  about how far it reaches. This is a reviewed decision, not an omission.
 
   `init/1` deliberately does no Repo work, not even an empty flush: in
   `mix test` the application boots before the sandbox is put in `:manual` mode,

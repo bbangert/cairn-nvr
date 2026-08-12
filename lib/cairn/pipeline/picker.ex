@@ -114,10 +114,11 @@ defmodule Cairn.Pipeline.Picker do
 
   defp maybe_send(state), do: {[], state}
 
-  # The tee carries the TS demuxer's Annex-B AUs, which have no keyframe
-  # metadata — the parser that adds it sits on the CMAF branch, past the tee. The
-  # first VCL NAL's type is the whole answer and it is a few NALs in, so this
-  # stops there rather than walking the AU.
+  # The bridge ingest's AUs carry no keyframe metadata (the parser that adds
+  # it sits on the CMAF branch, past the tee), so the byte answer is the one
+  # that serves both ingests — the RTSP source's `metadata.keyframe?` is
+  # deliberately not consulted. The first VCL NAL's type is the whole answer
+  # and it is a few NALs in, so this stops there rather than walking the AU.
   defp keyframe?(payload), do: vcl_type(payload) == 5
 
   defp vcl_type(payload) do

@@ -22,9 +22,10 @@ defmodule Cairn.Native.Status do
 
   `Cairn.Pipeline.Picker`'s drop counts are *not* on this surface, though a drop
   rate is what saturation looks like from the media side: its `:stats`
-  notification is reachable only through the per-session pipeline pid, which
-  only `Cairn.FFmpegPort` holds — and that process forwards every chunk of
-  ffmpeg's stdout, so asking it would put a status call on the media path.
+  notification is reachable only through the pipeline pid, which only
+  `Cairn.PipelineOwner` holds — and that process already spends its ticks
+  deciding whether to rebuild, so asking it would put a status call on the
+  watchdog's path.
   `stream_health` and `fps` carry the same evidence from the side that already
   reports without being asked.
   """
@@ -114,7 +115,7 @@ defmodule Cairn.Native.Status do
     end
   end
 
-  # `plugin:` is what builds the detect branch (`Cairn.FFmpegPort`'s
+  # `plugin:` is what builds the detect branch (`Cairn.PipelineOwner`'s
   # `detect_opts/1`), so it is also what makes this node's engine this camera's
   # detector.
   defp configured(state) do

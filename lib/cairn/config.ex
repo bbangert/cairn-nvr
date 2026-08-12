@@ -307,8 +307,8 @@ defmodule Cairn.Config do
   Everything the detection pipeline needs for a camera in one map: the event
   windows, the tracking settings, and the two host-side threshold tiers.
 
-  `Cairn.FFmpegPort` resolves it off the per-frame path — at each session
-  start and again on each `refresh/3` — and the pipeline's
+  `Cairn.PipelineOwner` resolves it off the per-frame path — when it builds
+  the pipeline and again on each `refresh/3` — and the pipeline's
   `Cairn.Pipeline.DetectSink` hands the result to `Cairn.Detect.Dispatch`
   with every observation unmodified, so no camera tracker calls the config
   server per frame and a key added here reaches `Cairn.CameraTracker`. A

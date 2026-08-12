@@ -52,8 +52,8 @@ defmodule Cairn.ULID do
   would call one of them "older" at random — and *rejecting a legitimate
   announcement is the failure this guard exists to prevent*, not a lesser
   version of it. Same-millisecond mints are treated as the same instant and
-  applied; two mints for one camera are separated by an ffmpeg respawn and
-  its backoff, so a genuine rollback is always milliseconds wide.
+  applied; two mints for one camera are separated by at least a session's
+  connect handshake, so a genuine rollback is always milliseconds wide.
 
   Total on any binary: a value shorter than the timestamp prefix compares
   whole (test fixtures and hand-written epochs are not ULIDs).

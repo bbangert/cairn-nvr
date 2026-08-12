@@ -10,8 +10,11 @@ defmodule Cairn.ObservationClock do
   the host clock carries the *bound*.
 
   One of these per camera, held by what ingests that camera's detections —
-  `Cairn.Native.Host`, per stream — and `reset/1` with the producer whose
-  pts continues nothing, though tracking time does.
+  `Cairn.Pipeline.DetectSink`, whose detect branch now outlives session
+  boundaries; the epoch-change re-anchor below is the designed path across
+  them. `reset/1` is for a holder that replaces its producer while tracking
+  time continues; nothing on the live path does that anymore, and it stays
+  for the contract it documents.
 
   ## The clamp
 
@@ -50,8 +53,9 @@ defmodule Cairn.ObservationClock do
   only three things that re-take it. What they anchor *to* differs, and the
   asymmetry is deliberate:
 
-    * **A rewind inside one epoch** (the plugin's own ffmpeg restarting its pts
-      under a still-current epoch) and **a plugin respawn** (`reset/1`) anchor
+    * **A rewind inside one epoch** (the producer's pts restarting under a
+      still-current epoch — a recorded v1 plugin's inner ffmpeg respawn is the
+      archetype) and **a producer swap** (`reset/1`) anchor
       at *continuity*: `at_ms + @floor_ms` against this observation's
       `media_ms`, so tracking time resumes at full media rate from where it
       already was and climbs back towards the host under the clamp above.
@@ -102,8 +106,8 @@ defmodule Cairn.ObservationClock do
   but tracking time has a value to continue from.
 
   `epoch` is `:none` before the first observation, deliberately not `nil`: a v0
-  stream before the first ffmpeg spawn carries a `nil` epoch for real, and must
-  anchor once rather than on every line.
+  recorded stream before its first epoch mint carries a `nil` epoch for real,
+  and must anchor once rather than on every line.
   """
   @type t :: %__MODULE__{
           epoch: String.t() | nil | :none,

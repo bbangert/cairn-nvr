@@ -3,8 +3,8 @@ defmodule Cairn.Pipeline.ConformanceTest do
   End-to-end interface-conformance tests for the camera pipeline: they prove
   that the pipeline-fed `Cairn.RingBuffer`/`Cairn.RTPHub` upholds the
   downstream contracts the deleted ffmpeg-stdout path established, driven
-  through the real `Cairn.FFmpegPort` with a fake ffmpeg streaming a fixture
-  to stdout.
+  through the real `Cairn.FFmpegPort` + `Cairn.PipelineOwner` pair with a
+  fake ffmpeg streaming a fixture to stdout.
 
   The reference is recorded, not run: `testsrc*.fmp4` is the old path's own
   ffmpeg output, replayed through the pure `Cairn.MP4.Demuxer` it consumed
@@ -32,6 +32,7 @@ defmodule Cairn.Pipeline.ConformanceTest do
     FFmpegPort,
     NativeStub,
     ObservationClock,
+    PipelineOwner,
     PluginProtocol,
     RingBuffer,
     RTPHub,
@@ -443,13 +444,14 @@ defmodule Cairn.Pipeline.ConformanceTest do
       struct(Inference,
         session: {Host, host},
         stream_id: camera_id,
-        stream_params: %{stream_epoch: @epoch},
+        stream_params: %{},
         reopen_cooldown_ms: 0
       )
 
     {[], infer_state} = Inference.handle_init(%{}, inference)
     {_actions, infer_state} = Inference.handle_playing(%{}, infer_state)
-    assert infer_state.stream == :open
+    # the first frame's epoch opens the stream; nothing is open before it
+    assert infer_state.stream == :closed
 
     # the decoder's stream format always precedes its first buffer
     format = %Membrane.RawVideo{
@@ -466,7 +468,6 @@ defmodule Cairn.Pipeline.ConformanceTest do
       struct(DetectSink,
         camera: tracked_camera(camera_id),
         policy: @detect_policy,
-        epoch: @epoch,
         tracker: tracker
       )
 
@@ -478,7 +479,8 @@ defmodule Cairn.Pipeline.ConformanceTest do
     frame = NativeStub.decoded_frame()
 
     metadata =
-      Map.take(frame, [
+      frame
+      |> Map.take([
         :orig_width,
         :orig_height,
         :scale_x,
@@ -488,6 +490,9 @@ defmodule Cairn.Pipeline.ConformanceTest do
         :observed_at_ms,
         :motion
       ])
+      # the tag the decoder carries over from the access unit, which is what
+      # both the stream's epoch and the observations' now come from
+      |> Map.put(:stream_epoch, @epoch)
 
     {actions, infer_state} =
       Inference.handle_buffer(
@@ -559,25 +564,23 @@ defmodule Cairn.Pipeline.ConformanceTest do
     start_supervised!({RTPHub, camera_id: id}, id: {:hub, id})
   end
 
+  # The bridge camera's two processes, in tree order: the port owns ffmpeg, the
+  # owner owns the long-lived pipeline the port's BridgeSource lives in. The
+  # lifecycle status is relayed to the test; the owner is its sole author, so
+  # the port's own :status_fun is stubbed out rather than merged in.
   defp start_port(cam, command) do
     test = self()
 
-    start_supervised!(
-      {FFmpegPort,
-       camera: cam,
-       config: config("tmp/conf_ports"),
-       command: command,
-       backoff_min_ms: 50,
-       backoff_max_ms: 200,
-       watchdog_interval_ms: 5_000,
-       status_fun: fn cam_id, status -> send(test, {:status, cam_id, status}) end},
-      id: {:port, cam.id}
+    start_owner(cam, command,
+      status_fun: fn cam_id, status -> send(test, {:status, cam_id, status}) end
     )
   end
 
   # Like start_port/2 but with no status_fun override, so status transitions
   # travel the production CameraStatus path onto the "cameras:status" topic.
-  defp start_status_port(cam, command) do
+  defp start_status_port(cam, command), do: start_owner(cam, command, [])
+
+  defp start_owner(cam, command, owner_opts) do
     start_supervised!(
       {FFmpegPort,
        camera: cam,
@@ -585,8 +588,21 @@ defmodule Cairn.Pipeline.ConformanceTest do
        command: command,
        backoff_min_ms: 50,
        backoff_max_ms: 200,
-       watchdog_interval_ms: 5_000},
-      id: {:status_port, cam.id}
+       status_fun: fn _cam_id, _status -> :ok end},
+      id: {:port, cam.id}
+    )
+
+    start_supervised!(
+      {PipelineOwner,
+       [
+         camera: cam,
+         config: config("tmp/conf_ports"),
+         backoff_min_ms: 50,
+         backoff_max_ms: 200,
+         watchdog_interval_ms: 5_000,
+         flush_grace_ms: 50
+       ] ++ owner_opts},
+      id: {:owner, cam.id}
     )
   end
 

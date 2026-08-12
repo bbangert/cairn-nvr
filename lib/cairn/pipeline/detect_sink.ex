@@ -5,15 +5,20 @@ defmodule Cairn.Pipeline.DetectSink do
   element (`Cairn.Pipeline.Inference`).
 
   What arrives is that element's `Detections` buffers: observation lists the
-  library already projected into source coordinates. This sink turns them
-  into `Cairn.Observation`s (`Cairn.Native.Observations`), stamps `at_ms` on
-  the host's monotonic clock, and casts them through the dispatch seam with
-  the camera's policy — the same cast the plugin ports make, `track:` and
+  library already projected into source coordinates, tagged with the
+  `stream_epoch` of the frame they came from. This sink turns them into
+  `Cairn.Observation`s (`Cairn.Native.Observations`), stamps `at_ms` on the
+  host's monotonic clock, and casts them through the dispatch seam with the
+  camera's policy — the same cast the plugin ports make, `track:` and
   `record:` carried and unread.
 
-  `policy` is `Cairn.Config.policy/2`, resolved by `Cairn.FFmpegPort` at
-  session start and replaced on reload through `Cairn.Pipeline.Camera` —
-  never read per frame, as on the plugin path.
+  The epoch is read per buffer rather than held in state: this element
+  outlives the sessions it serves, so buffers of the session just ended can
+  still be in flight when the next one starts (D8).
+
+  `policy` is `Cairn.Config.policy/2`, resolved by `Cairn.PipelineOwner` when
+  it builds the pipeline and replaced on reload through
+  `Cairn.Pipeline.Camera` — never read per frame, as on the plugin path.
   """
 
   use Membrane.Sink
@@ -32,7 +37,6 @@ defmodule Cairn.Pipeline.DetectSink do
   def_options(
     camera: [spec: Camera.t()],
     policy: [spec: map()],
-    epoch: [spec: Cairn.ULID.t()],
     tracker: [
       spec: GenServer.server() | nil,
       default: nil,
@@ -46,20 +50,27 @@ defmodule Cairn.Pipeline.DetectSink do
      %{
        camera: opts.camera,
        policy: opts.policy,
-       epoch: opts.epoch,
        tracker: opts.tracker,
        clock: ObservationClock.new(),
        dispatched: 0,
-       dropped: 0
+       dropped: 0,
+       last_buffer_at_ms: nil
      }}
   end
 
-  # The metadata key is matched, not dot-accessed: `accepted_format` gates the
-  # stream-format struct, never buffer metadata, so a producer speaking
-  # `Detections` without the observations key falls through to the counted
-  # drop below rather than crashing the sink.
+  # The metadata keys are matched, not dot-accessed: `accepted_format` gates
+  # the stream-format struct, never buffer metadata, so a producer speaking
+  # `Detections` without the observations key — or without the epoch to tag
+  # them with — falls through to the counted drop below rather than crashing
+  # the sink.
   @impl true
-  def handle_buffer(:input, %{metadata: %{observations: observations}}, _ctx, state) do
+  def handle_buffer(
+        :input,
+        %{metadata: %{observations: observations, stream_epoch: epoch}},
+        _ctx,
+        state
+      )
+      when epoch != nil do
     # Monotonic, as both plugin producers pass: `at_ms` is compared against the
     # host's monotonic clock elsewhere — `Cairn.CameraTracker`'s `cut_clock`
     # stamps a stream cut with it, and a wall-clock `at_ms` puts every
@@ -69,7 +80,7 @@ defmodule Cairn.Pipeline.DetectSink do
         state.clock,
         observations,
         state.camera.id,
-        state.epoch,
+        epoch,
         System.monotonic_time(:millisecond)
       )
 
@@ -78,16 +89,33 @@ defmodule Cairn.Pipeline.DetectSink do
     # start.
     Dispatch.forward_all(state.camera, state.policy, observations, tracker: state.tracker)
 
-    {[], %{state | clock: clock, dispatched: state.dispatched + length(observations)}}
+    {[],
+     %{
+       state
+       | clock: clock,
+         dispatched: state.dispatched + length(observations),
+         last_buffer_at_ms: System.monotonic_time(:millisecond)
+     }}
   end
 
   def handle_buffer(:input, _buffer, _ctx, state) do
     {[], %{state | dropped: state.dropped + 1}}
   end
 
+  # `dispatched` counts observations, so a quiet scene and a wedged branch move
+  # it identically — not at all. The age of the last *buffer* is what separates
+  # them, and it is what the watchdog reads. Monotonic milliseconds, which
+  # start negative on the BEAM: only a reader's own `System.monotonic_time/1`
+  # may be subtracted from it.
   @impl true
   def handle_parent_notification(:stats, _ctx, state) do
-    {[notify_parent: {:stats, %{dispatched: state.dispatched, dropped: state.dropped}}], state}
+    stats = %{
+      dispatched: state.dispatched,
+      dropped: state.dropped,
+      last_buffer_at_ms: state.last_buffer_at_ms
+    }
+
+    {[notify_parent: {:stats, stats}], state}
   end
 
   # A reload cannot change what the argv or the open stream carry — those fields

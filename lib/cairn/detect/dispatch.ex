@@ -3,8 +3,8 @@ defmodule Cairn.Detect.Dispatch do
   The one hop from the detection producer to a camera's tracker.
 
   `Cairn.Pipeline.DetectSink` reaches it with the in-VM NIF's frames,
-  resolving `Cairn.Config.policy/2` off the per-frame path — at session
-  start and on refresh — and handing the result through here unmodified, so
+  resolving `Cairn.Config.policy/2` off the per-frame path — at pipeline
+  birth and on refresh — and handing the result through here unmodified, so
   `Cairn.CameraTracker` never calls the config server per frame.
 
   Plain functions in the caller's process, deliberately not a process of its

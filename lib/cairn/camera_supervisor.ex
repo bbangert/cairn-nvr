@@ -67,16 +67,21 @@ defmodule Cairn.CameraSupervisor do
   end
 
   @doc """
-  Hands a still-running camera's ffmpeg port the new camera and config — it
+  Hands a still-running camera's pipeline owner the new camera and config — it
   owns the pipeline whose sink applies the policy. A camera that is not
   running has no process to tell, and the config lookup guards the case a
   diff cannot produce: an id `config` does not carry.
+
+  A bridge camera's `Cairn.FFmpegPort` is deliberately not told: every field
+  its argv reads (`rtsp_url`, `transcode`, `extra_ffmpeg_args`) is a
+  `Cairn.Config.Server` restart field, so a camera whose argv moved is
+  `changed` and restarted whole rather than refreshed.
   """
   @spec refresh_camera(Config.t(), String.t()) :: :ok
   def refresh_camera(%Config{} = config, camera_id) do
     with %Config.Camera{} = cam <- Enum.find(config.cameras, &(&1.id == camera_id)),
-         pid when is_pid(pid) <- Cairn.Registry.whereis(camera_id, :ffmpeg) do
-      Cairn.FFmpegPort.refresh(pid, cam, config)
+         pid when is_pid(pid) <- Cairn.Registry.whereis(camera_id, :pipeline) do
+      Cairn.PipelineOwner.refresh(pid, cam, config)
     else
       _absent -> :ok
     end
