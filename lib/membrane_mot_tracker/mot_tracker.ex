@@ -131,7 +131,7 @@ defmodule Membrane.MOTTracker do
         _ctx,
         state
       )
-      when is_list(objects) and is_map(context) do
+      when is_list(objects) and is_map(context) and is_number(at_ms) and epoch != nil do
     {timers, severed, suspension, state} = cut(state, epoch, at_ms)
     {core, tagged, events} = state.module.track(state.core, objects, context)
 

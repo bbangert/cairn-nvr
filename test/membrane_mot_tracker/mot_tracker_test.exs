@@ -230,6 +230,20 @@ defmodule Membrane.MOTTrackerTest do
     assert_pipeline_notified(pipeline, :tracker, {:stats, %{processed: 1, dropped: 1}})
   end
 
+  # Present keys with broken values are the same violation: a nil epoch would
+  # silently disable cut detection while still advancing the core.
+  test "a buffer whose epoch or at_ms is broken is dropped, not tracked",
+       %{pipeline: pipeline} do
+    batch(pipeline, %{observations(["car"], 1_000, "epoch_one") | epoch: nil})
+    batch(pipeline, %{observations(["car"], 1_500, "epoch_one") | at_ms: nil})
+
+    batch(pipeline, observations(["car"], 2_000, "epoch_one"), 1)
+    assert_sink_buffer(pipeline, :sink, %Buffer{metadata: %{tagged: [%{object_id: "T1"}]}})
+
+    Testing.Pipeline.notify_child(pipeline, :tracker, :stats)
+    assert_pipeline_notified(pipeline, :tracker, {:stats, %{processed: 1, dropped: 2}})
+  end
+
   describe "the session lifecycle" do
     setup do
       %{pipeline: start_pipeline({RecordingCore, owner: self()}, max_suspended: 4)}
