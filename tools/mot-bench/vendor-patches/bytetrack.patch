@@ -1,0 +1,52 @@
+--- a/byte_tracker.py
++++ b/byte_tracker.py
+@@ -3,11 +3,8 @@
+ import os
+ import os.path as osp
+ import copy
+-import torch
+-import torch.nn.functional as F
+-
+ from .kalman_filter import KalmanFilter
+-from yolox.tracker import matching
++from . import matching
+ from .basetrack import BaseTrack, TrackState
+ 
+ class STrack(BaseTrack):
+--- a/matching.py
++++ b/matching.py
+@@ -1,12 +1,30 @@
+-import cv2
+ import numpy as np
+ import scipy
+ import lap
+ from scipy.spatial.distance import cdist
+ 
+-from cython_bbox import bbox_overlaps as bbox_ious
+-from yolox.tracker import kalman_filter
+-import time
++
++def bbox_ious(atlbrs, btlbrs):
++    # numpy replacement for cython_bbox.bbox_overlaps (same semantics: the
++    # +1 pixel convention on widths/heights, IoU over union of areas).
++    atlbrs = np.ascontiguousarray(atlbrs, dtype=np.float64)
++    btlbrs = np.ascontiguousarray(btlbrs, dtype=np.float64)
++    ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float64)
++    if ious.size == 0:
++        return ious
++    bw = btlbrs[:, 2] - btlbrs[:, 0] + 1
++    bh = btlbrs[:, 3] - btlbrs[:, 1] + 1
++    barea = bw * bh
++    for i, a in enumerate(atlbrs):
++        iw = np.minimum(a[2], btlbrs[:, 2]) - np.maximum(a[0], btlbrs[:, 0]) + 1
++        ih = np.minimum(a[3], btlbrs[:, 3]) - np.maximum(a[1], btlbrs[:, 1]) + 1
++        iw = np.maximum(iw, 0)
++        ih = np.maximum(ih, 0)
++        inter = iw * ih
++        aarea = (a[2] - a[0] + 1) * (a[3] - a[1] + 1)
++        ious[i] = inter / (aarea + barea - inter)
++    return ious
++from . import kalman_filter
+ 
+ def merge_matches(m1, m2, shape):
+     O,P,Q = shape
