@@ -1,29 +1,24 @@
 defmodule Cairn.FFmpegPort do
   @moduledoc """
-  Owns one camera's ffmpeg process as a Port.
+  Owns one camera's ingest session — an ffmpeg bridge process as a Port, or
+  (`ingest: rtsp`) the `rtsp` library's client — and the per-session
+  `Cairn.Pipeline.Camera` it feeds.
 
-  Spawns via `/bin/sh -c "exec ffmpeg ... 2>> {data_dir}/log/ffmpeg-{id}.log"`
-  so stdout stays a clean media byte stream (stderr can neither be merged nor
-  silently dropped) and Port signals reach the real ffmpeg thanks to `exec`.
+  ffmpeg spawns via `/bin/sh -c "exec ffmpeg ... 2>> {data_dir}/log/
+  ffmpeg-{id}.log"` so stdout stays a clean media byte stream (stderr can
+  neither be merged nor silently dropped) and Port signals reach the real
+  ffmpeg thanks to `exec`. stdout carries MPEG-TS — a container with pts,
+  per D-M8 — forwarded to the pipeline (started and monitored here, torn
+  down with each session) whose sink feeds the camera's `Cairn.RingBuffer`.
+  This process learns "media is flowing" from the ring's own broadcasts,
+  epoch-gated so a dying session cannot vouch for its successor. On session
+  end an end-of-stream is flushed through the pipeline first, so the CMAF
+  muxer's held tail segment is recorded rather than lost.
 
-  What stdout carries — and who consumes it — depends on the camera's
-  `pipeline:` setting:
-
-    * `:classic` — fmp4, streamed through `Cairn.MP4.Demuxer` in this
-      process; init segments and fragments are cast to the camera's
-      `Cairn.RingBuffer`.
-    * `:membrane` — MPEG-TS, forwarded to a per-session
-      `Cairn.Pipeline.Camera` (started and monitored here, torn down with
-      each ffmpeg session) whose sink feeds the same ring. This process
-      then learns "media is flowing" from the ring's own broadcasts,
-      epoch-gated so a dying session cannot vouch for its successor. On
-      ffmpeg exit an end-of-stream is flushed through the pipeline first,
-      so the CMAF muxer's held tail segment is recorded rather than lost.
-
-  Reconnect policy lives *inside* this GenServer: on `:exit_status` (and,
-  membrane mode, on pipeline death) it enters a jittered backoff (1s -> 30s)
-  and respawns itself — a dead camera is a normal long-lived state and must
-  not burn supervisor restart intensity. A periodic watchdog bounces ffmpeg
+  Reconnect policy lives *inside* this GenServer: on `:exit_status` (and on
+  pipeline death) it enters a jittered backoff (1s -> 30s) and respawns
+  itself — a dead camera is a normal long-lived state and must not burn
+  supervisor restart intensity. A periodic watchdog bounces the session
   when the ring has seen no fragment for `stall_seconds` (silent stall,
   e.g. a wedged TCP session).
 
@@ -39,8 +34,6 @@ defmodule Cairn.FFmpegPort do
 
   require Logger
 
-  alias Cairn.MP4.Demuxer
-
   @backoff_min_ms 1_000
   @backoff_max_ms 30_000
 
@@ -52,10 +45,8 @@ defmodule Cairn.FFmpegPort do
 
   defstruct camera: nil,
             config: nil,
-            index: 0,
             port: nil,
             os_pid: nil,
-            demuxer: nil,
             # :init so the first real transition (:connecting) is always emitted
             status: :init,
             backoff_ms: nil,
@@ -64,12 +55,12 @@ defmodule Cairn.FFmpegPort do
             epoch: nil,
             # reason carried into the *next* spawn's epoch
             spawn_reason: :started,
-            # membrane mode: the per-session pipeline, its monitor, the
-            # BridgeSource pid once it announced itself, and TS bytes queued
-            # until it does. init_seen gates :running on *this* session's
-            # init segment — ring events carry no session identity except the
-            # epoch on init, so a stale fragment from the dying pipeline must
-            # not reset the backoff of the session that replaced it.
+            # the per-session pipeline, its monitor, the source element pid
+            # once it announced itself, and media queued until it does.
+            # init_seen gates :running on *this* session's init segment —
+            # ring events carry no session identity except the epoch on
+            # init, so a stale fragment from the dying pipeline must not
+            # reset the backoff of the session that replaced it.
             pipeline: nil,
             pipeline_ref: nil,
             source: nil,
@@ -143,63 +134,18 @@ defmodule Cairn.FFmpegPort do
   end
 
   @doc """
-  Builds the ffmpeg argv for a camera: three outputs (fmp4 on stdout, RTP
-  to the plugin port, RTP to the WebRTC hub port) — codec-copy by default,
-  or `h264_v4l2m2m` with a probed-fps-derived GOP when the camera opts
-  into transcode. `extra_ffmpeg_args` are spliced immediately before `-i`.
+  The bridge argv: one output, MPEG-TS on stdout — a container with pts,
+  per D-M8: raw Annex-B would lose timestamps the ObservationClock and
+  Fragment pts derivation need. Codec-copy by default, or `h264_v4l2m2m`
+  with a probed-fps-derived GOP when the camera opts into transcode.
+  `extra_ffmpeg_args` are spliced immediately before `-i`.
+
+  No RTP outputs and no UDP ports: the WebRTC hub is fed by the pipeline's
+  RTP branch and detection by its `Cairn.Pipeline.Inference`, both
+  in-process.
   """
-  @spec build_argv(
-          Cairn.Config.Camera.t(),
-          {pos_integer(), pos_integer()},
-          String.t(),
-          keyword()
-        ) :: [String.t()]
-  def build_argv(cam, {plugin_port, rtp_port}, timeout_flag, opts \\ []) do
-    input_opts = input_opts(cam, timeout_flag)
-
-    codec_args =
-      if cam.transcode do
-        gop = Keyword.get(opts, :gop, 40)
-        ["-c:v", "h264_v4l2m2m", "-g", "#{gop}", "-bf", "0"]
-      else
-        ["-c:v", "copy"]
-      end
-
-    # RTP consumers (plugins, WebRTC browsers) need SPS/PPS **in-band**:
-    # container sources like FLV keep them in extradata only, and ffmpeg's
-    # RTP mux would otherwise only advertise them in its own SDP, which
-    # never reaches our consumers. No-op for already-annexb sources (RTSP).
-    rtp_bsf = ["-bsf:v", "h264_mp4toannexb"]
-
-    ["ffmpeg", "-nostdin", "-nostats", "-loglevel", "warning"] ++
-      input_opts ++
-      cam.extra_ffmpeg_args ++
-      ["-i", cam.rtsp_url] ++
-      ["-map", "0:v"] ++
-      codec_args ++
-      ~w(-f mp4 -movflags +frag_keyframe+empty_moov+default_base_moof
-         -frag_duration 2000000 pipe:1) ++
-      ["-map", "0:v"] ++
-      codec_args ++
-      rtp_bsf ++
-      ~w(-f rtp -payload_type 96 rtp://127.0.0.1:#{plugin_port}) ++
-      ["-map", "0:v"] ++
-      codec_args ++
-      rtp_bsf ++ ~w(-f rtp -payload_type 96 rtp://127.0.0.1:#{rtp_port})
-  end
-
-  @doc """
-  The membrane-mode argv: one output, not three. MPEG-TS on stdout — a
-  container with pts, per D-M8: raw Annex-B would lose timestamps the
-  ObservationClock and Fragment pts derivation need.
-
-  Both RTP outputs are gone because both consumers moved in-process: the
-  WebRTC hub is fed by the pipeline's RTP branch and detection by its
-  `Cairn.Pipeline.Inference`. A membrane camera therefore binds no UDP port —
-  see `Cairn.Camera`, which also keeps it out of any plugin group.
-  """
-  @spec build_membrane_argv(Cairn.Config.Camera.t(), String.t(), keyword()) :: [String.t()]
-  def build_membrane_argv(cam, timeout_flag, opts \\ []) do
+  @spec build_argv(Cairn.Config.Camera.t(), String.t(), keyword()) :: [String.t()]
+  def build_argv(cam, timeout_flag, opts \\ []) do
     input_opts = input_opts(cam, timeout_flag)
 
     codec_args =
@@ -247,11 +193,10 @@ defmodule Cairn.FFmpegPort do
   Point a running camera's detect branch at a new config without touching
   ffmpeg.
 
-  Membrane mode's `Cairn.Detect.Dispatch` policy is resolved here at each
-  session start, so a reload the classic path delivers through
-  `Cairn.PluginPort.refresh/3` has to reach the running pipeline's sink the
-  same way — otherwise a `record:` edit would sit unapplied until the camera's
-  next reconnect. The ffmpeg argv cannot move under a refresh: every field it
+  The `Cairn.Detect.Dispatch` policy is resolved here at each session
+  start, so a reload has to reach the running pipeline's sink too —
+  otherwise a `record:` edit would sit unapplied until the camera's next
+  reconnect. The ffmpeg argv cannot move under a refresh: every field it
   carries is a `Cairn.Config.Server` restart field.
   """
   @spec refresh(GenServer.server(), Cairn.Config.Camera.t(), Cairn.Config.t()) :: :ok
@@ -268,16 +213,13 @@ defmodule Cairn.FFmpegPort do
     state = %__MODULE__{
       camera: Keyword.fetch!(opts, :camera),
       config: Keyword.fetch!(opts, :config),
-      index: Keyword.get(opts, :index, 0),
       backoff_ms: Keyword.get(opts, :backoff_min_ms, @backoff_min_ms),
       opts: opts
     }
 
-    # Membrane mode has no inline demuxer to observe fragments on, so the
+    # This process holds no demuxer to observe fragments on, so the
     # :running transition and backoff reset ride the ring's own broadcasts.
-    if membrane?(state) do
-      Phoenix.PubSub.subscribe(Cairn.PubSub, Cairn.RingBuffer.topic(state.camera.id))
-    end
+    Phoenix.PubSub.subscribe(Cairn.PubSub, Cairn.RingBuffer.topic(state.camera.id))
 
     send(self(), :spawn)
     schedule_watchdog(state)
@@ -286,13 +228,7 @@ defmodule Cairn.FFmpegPort do
 
   @impl true
   def handle_cast({:refresh, camera, config}, state) do
-    # Classic mode holds no policy of its own: its detections come from the
-    # plugin port, which `Cairn.CameraSupervisor` refreshes directly.
-    if membrane?(state) do
-      {:noreply, refresh_detect(state, camera, config)}
-    else
-      {:noreply, state}
-    end
+    {:noreply, refresh_detect(state, camera, config)}
   end
 
   @impl true
@@ -319,38 +255,20 @@ defmodule Cairn.FFmpegPort do
     end
   end
 
-  def handle_info({port, {:data, data}}, %{port: port} = state) when state.demuxer == nil do
-    {:noreply, forward_ts(state, data)}
-  end
-
   def handle_info({port, {:data, data}}, %{port: port} = state) do
-    {demuxer, events} = Demuxer.push(state.demuxer, data)
-
-    state =
-      Enum.reduce_while(events, %{state | demuxer: demuxer}, fn event, state ->
-        case handle_event(event, state) do
-          # a desync bounced ffmpeg: the rest of the batch belongs to the dead
-          # session. Folding it on would let a trailing fragment set the status
-          # back to :running with no port, and a trailing init segment be
-          # tagged with the epoch of the session that just ended.
-          %{port: nil} = state -> {:halt, state}
-          state -> {:cont, state}
-        end
-      end)
-
-    {:noreply, state}
+    {:noreply, forward_ts(state, data)}
   end
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     Logger.warning("camera #{state.camera.id}: ffmpeg exited with status #{status}")
     state = %{state | port: nil, os_pid: nil}
 
-    # Membrane mode: the CMAF muxer is holding a final sub-min-duration
-    # segment that only an end_of_stream flushes. Everything ffmpeg delivered
-    # is ordered ahead of :ts_eos in the source's mailbox, so a short grace
-    # before teardown turns "drop up to 2 s of recording on every session
-    # end" into a flushed tail. Stall bounces skip this: no data was flowing.
-    if membrane?(state) and is_pid(state.source) do
+    # The CMAF muxer is holding a final sub-min-duration segment that only
+    # an end_of_stream flushes. Everything ffmpeg delivered is ordered ahead
+    # of :ts_eos in the source's mailbox, so a short grace before teardown
+    # turns "drop up to 2 s of recording on every session end" into a
+    # flushed tail. Stall bounces skip this: no data was flowing.
+    if is_pid(state.source) do
       send(state.source, :ts_eos)
       Process.send_after(self(), :flush_done, Keyword.get(state.opts, :flush_grace_ms, 500))
       {:noreply, state}
@@ -531,36 +449,14 @@ defmodule Cairn.FFmpegPort do
     Keyword.get_lazy(state.opts, :transcode_available, &transcode_available?/0)
   end
 
-  defp handle_event({:init, %{data: data, codec: codec, timescale: timescale}}, state) do
-    Cairn.RingBuffer.put_init(state.camera.id, data, codec, timescale, state.epoch)
-    state
-  end
-
-  defp handle_event({:fragment, frag}, state) do
-    Cairn.RingBuffer.put_fragment(state.camera.id, frag)
-
-    if state.got_fragment do
-      state
-    else
-      state = set_status(state, :running)
-      %{state | got_fragment: true, backoff_ms: backoff_min(state)}
-    end
-  end
-
-  defp handle_event({:error, reason}, state) do
-    Logger.warning("camera #{state.camera.id}: fmp4 desync #{inspect(reason)}, bouncing ffmpeg")
-    enter_backoff(kill_port(state), :source_lost)
-  end
-
   defp spawn_ffmpeg(state) do
     command = spawn_command(state)
 
     # Mint before the port exists. Nothing between acquiring the port and
     # folding it into state may fail: an unwind there would leave an ffmpeg
     # holding the RTSP session with its pid nowhere in state, so `kill_port/1`
-    # would no-op on it — and on the classic path its UDP ports with it.
-    # (`start_session/1` upholds this: a pipeline start failure is handled as
-    # a value, never an unwind.)
+    # would no-op on it. (`start_session/1` upholds this: a pipeline start
+    # failure is handled as a value, never an unwind.)
     epoch = Cairn.StreamEpochs.new_epoch(state.camera.id, state.spawn_reason)
 
     port =
@@ -809,35 +705,31 @@ defmodule Cairn.FFmpegPort do
 
   defp rtsp_module(state), do: Keyword.get(state.opts, :rtsp_module, RTSP)
 
-  # One decode session = one ffmpeg + (membrane mode) one pipeline: the TS
-  # demuxer's state is per-session, so the pipeline is born and dies with its
-  # ffmpeg rather than living in the supervision tree where a restart would
-  # decouple the two.
+  # One decode session = one ingest + one pipeline: the TS demuxer's state
+  # is per-session, so the pipeline is born and dies with its ffmpeg rather
+  # than living in the supervision tree where a restart would decouple the
+  # two.
   defp start_session(state) do
-    if membrane?(state) do
-      opts = [
-        camera: state.camera,
-        epoch: state.epoch,
-        owner: self(),
-        ingest: state.camera.ingest,
-        detect: detect_opts(state)
-      ]
+    opts = [
+      camera: state.camera,
+      epoch: state.epoch,
+      owner: self(),
+      ingest: state.camera.ingest,
+      detect: detect_opts(state)
+    ]
 
-      module = Keyword.get(state.opts, :pipeline_module, Cairn.Pipeline.Camera)
+    module = Keyword.get(state.opts, :pipeline_module, Cairn.Pipeline.Camera)
 
-      case Membrane.Pipeline.start(module, opts) do
-        {:ok, _supervisor, pipeline} ->
-          %{state | pipeline: pipeline, pipeline_ref: Process.monitor(pipeline)}
+    case Membrane.Pipeline.start(module, opts) do
+      {:ok, _supervisor, pipeline} ->
+        %{state | pipeline: pipeline, pipeline_ref: Process.monitor(pipeline)}
 
-        {:error, reason} ->
-          Logger.error(
-            "camera #{state.camera.id}: membrane pipeline failed to start: #{inspect(reason)}"
-          )
+      {:error, reason} ->
+        Logger.error(
+          "camera #{state.camera.id}: membrane pipeline failed to start: #{inspect(reason)}"
+        )
 
-          enter_backoff(state, :source_lost)
-      end
-    else
-      %{state | demuxer: Demuxer.new(state.camera.id)}
+        enter_backoff(state, :source_lost)
     end
   end
 
@@ -848,26 +740,12 @@ defmodule Cairn.FFmpegPort do
           Path.join(Cairn.DataDir.log_dir(state.config.data_dir), "ffmpeg-#{state.camera.id}.log")
 
         gop = gop_from_probe(state.camera.id)
-
-        # The allocation is only reached on the classic path: a membrane
-        # camera's argv carries no port, and its index slot stays reserved
-        # anyway (`Cairn.UDPPorts` is positional).
-        argv =
-          if membrane?(state) do
-            build_membrane_argv(state.camera, timeout_flag(), gop: gop)
-          else
-            ports = Cairn.UDPPorts.ports_for(state.config, state.index)
-            build_argv(state.camera, ports, timeout_flag(), gop: gop)
-          end
-
-        shell_command(argv, log)
+        shell_command(build_argv(state.camera, timeout_flag(), gop: gop), log)
 
       command when is_binary(command) ->
         command
     end
   end
-
-  defp membrane?(state), do: state.camera.pipeline == :membrane
 
   # `send/2` and not a pipeline call: a refresh must not wait on a pipeline
   # whose sink is inside a `push_frame/5`. Between sessions there is no pipeline to
@@ -882,12 +760,11 @@ defmodule Cairn.FFmpegPort do
     state
   end
 
-  # `nil` leaves the pipeline's detect branch unbuilt. `min_score` is the same
-  # wire floor the plugin argv carries on the classic path; the rest of the
-  # profile is still the plugin's own and becomes engine config later.
-  # `policy:` is resolved here rather than in the sink for the reason the plugin
-  # ports resolve it at init: it is a config round trip, and the sink's caller
-  # is the per-frame path.
+  # `nil` leaves the pipeline's detect branch unbuilt. `min_score` is the
+  # stream's wire floor; the rest of the profile is engine config
+  # (`Cairn.Config.native_model_config/1`). `policy:` is resolved here
+  # rather than in the sink because it is a config round trip, and the
+  # sink's caller is the per-frame path.
   defp detect_opts(%{camera: %{plugin: nil}}), do: nil
 
   # No `sample_fps`: the branch does not thin, and the engine takes the rate from

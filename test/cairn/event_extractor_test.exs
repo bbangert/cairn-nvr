@@ -46,8 +46,6 @@ defmodule Cairn.EventExtractorTest do
     # `Cairn.ClipRemuxTest`.
     config = %Config{
       data_dir: dir,
-      udp_base_port: 17_000,
-      udp_port_range: 10,
       remux_clips: false
     }
 

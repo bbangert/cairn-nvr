@@ -1619,7 +1619,6 @@ defmodule Cairn.CameraTrackerTest do
       {:ok, config, []} =
         Config.from_map(%{
           "data_dir" => "tmp/cfg_test",
-          "udp" => %{"base_port" => 17_000, "range" => 20},
           "cameras" => [
             %{
               "id" => id,

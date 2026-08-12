@@ -1,12 +1,17 @@
 defmodule Cairn.PluginProtocol do
   @moduledoc """
-  Pure codec for the plugin wire protocol (see `docs/plugin-contract.md`).
+  Pure codec for the `cairn-detect` ndjson output format (the archived
+  wire contract: `docs/archive/plugin-contract.md`).
 
-  Plugin output is untrusted: a plugin is an arbitrary OS process and every
-  decoded line reaches a camera's `Cairn.CameraTracker`, so a line that does
-  not match the contract exactly must never leave this module.
-  `Cairn.PluginPort` and `Cairn.PluginGroupPort` hand raw lines to
-  `decode_line/2` and act on the result.
+  The external plugin path this was the trust boundary for is gone
+  (membrane port phase 6) — live detection is the in-VM engine, which never
+  produces lines. What keeps this codec load-bearing is everything that
+  reads *recorded* plugin output: `Cairn.Native.Parity` (the x86 parity
+  reference runs the plugin binary and decodes its stdout),
+  `test/support/golden_replay.ex` (captures under `test/support/golden/`),
+  and `mix cairn.mot.ndjson`. Those recordings are still untrusted input,
+  so a line that does not match the contract exactly must never leave this
+  module.
 
   Two wire versions are decoded here:
 
@@ -79,7 +84,11 @@ defmodule Cairn.PluginProtocol do
 
   @type det :: %{label: String.t(), score: float(), bbox: [number()]}
 
-  @typedoc "Per-camera ports know their camera; group ports route by `camera_id`."
+  @typedoc """
+  Which process shape produced the recording: `:camera` output is attributed
+  by the caller, `:group` (multiplexed) output routes by its own
+  `camera_id`. Both shapes exist in recorded captures; no live port remains.
+  """
   @type mode :: :camera | :group
 
   @type decoded ::
@@ -92,9 +101,10 @@ defmodule Cairn.PluginProtocol do
   @doc """
   Decodes one plugin stdout line.
 
-  `mode` is `:group` for a multiplexed plugin — every `frame.objects` line
-  must then name its camera. In `:camera` mode a `camera_id` is accepted and
-  ignored: the port owns exactly one camera and attributes the line itself.
+  `mode` is `:group` for a line recorded from a multiplexed plugin — every
+  `frame.objects` line must then name its camera. In `:camera` mode a
+  `camera_id` is accepted and ignored: the caller owns exactly one camera
+  and attributes the line itself.
 
   `{:ignore, reason}` is a well-formed message this version does not act on
   (forward compatibility); `{:error, reason}` is a contract violation and the

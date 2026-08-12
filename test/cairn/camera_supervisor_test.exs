@@ -1,7 +1,7 @@
 defmodule Cairn.CameraSupervisorTest do
   # drives the real DynamicSupervisor + Camera trees (ffmpeg mostly spawns
   # against an instantly-failing file source; backoff keeps the noise to one
-  # spawn — the membrane tests use a real fixture and run to completion)
+  # spawn — the streaming test uses a real fixture and runs to completion)
   use ExUnit.Case, async: false
 
   alias Cairn.CameraSupervisor
@@ -23,35 +23,27 @@ defmodule Cairn.CameraSupervisorTest do
     :ok
   end
 
-  @mock Path.absname("priv/plugins/mock/mock_plugin.exs")
-  @timeline Path.absname("test/support/fixtures/timelines/person_walkthrough.json")
-
   defp camera(id), do: %Camera{id: id, rtsp_url: "file:///dev/null"}
 
-  defp config(cameras, base) do
-    %Config{
-      data_dir: "tmp/camsup_test",
-      udp_base_port: base,
-      udp_port_range: 20,
-      cameras: cameras
-    }
+  defp config(cameras) do
+    %Config{data_dir: "tmp/camsup_test", cameras: cameras}
   end
 
   test "sync starts missing cameras, is idempotent, and stops removed ones" do
     a = camera("cs_a_#{System.unique_integer([:positive])}")
     b = camera("cs_b_#{System.unique_integer([:positive])}")
 
-    :ok = CameraSupervisor.sync(config([a, b], 19_600))
+    :ok = CameraSupervisor.sync(config([a, b]))
     assert Cairn.Registry.whereis(a.id, :camera)
     assert Cairn.Registry.whereis(b.id, :camera)
     pid_a = Cairn.Registry.whereis(a.id, :camera)
 
     # idempotent: same pid, no crash on already_started
-    :ok = CameraSupervisor.sync(config([a, b], 19_600))
+    :ok = CameraSupervisor.sync(config([a, b]))
     assert Cairn.Registry.whereis(a.id, :camera) == pid_a
 
     # removed from config -> stopped on next sync
-    :ok = CameraSupervisor.sync(config([b], 19_600))
+    :ok = CameraSupervisor.sync(config([b]))
     refute Cairn.Registry.whereis(a.id, :camera)
     assert Cairn.Registry.whereis(b.id, :camera)
   end
@@ -61,11 +53,11 @@ defmodule Cairn.CameraSupervisorTest do
     b = camera("cs_b_#{System.unique_integer([:positive])}")
     c = camera("cs_c_#{System.unique_integer([:positive])}")
 
-    :ok = CameraSupervisor.sync(config([a, b], 19_640))
+    :ok = CameraSupervisor.sync(config([a, b]))
     old_b = Cairn.Registry.whereis(b.id, :camera)
 
     diff = %{added: [c.id], removed: [a.id], changed: [b.id], refreshed: []}
-    new_config = config([%Camera{b | rtsp_url: "file:///dev/zero"}, c], 19_640)
+    new_config = config([%Camera{b | rtsp_url: "file:///dev/zero"}, c])
     :ok = CameraSupervisor.apply_diff(diff, new_config)
 
     refute Cairn.Registry.whereis(a.id, :camera)
@@ -76,20 +68,18 @@ defmodule Cairn.CameraSupervisorTest do
     assert new_b != old_b
   end
 
-  test "apply_diff refreshes an inline-plugin camera instead of restarting it" do
+  test "apply_diff refreshes a camera in place instead of restarting it" do
     id = "cs_refresh_#{System.unique_integer([:positive])}"
-    cam = %Camera{camera(id) | plugin: {:inline, ["sh", "-c", "exec sleep 30"]}}
-    old = config([cam], 19_760)
+    cam = camera(id)
+    old = config([cam])
 
     :ok = CameraSupervisor.sync(old)
     camera_pid = Cairn.Registry.whereis(id, :camera)
-    plugin_pid = Cairn.Registry.whereis(id, :plugin)
-    assert is_pid(plugin_pid)
-    assert :sys.get_state(plugin_pid).policy.post == 10
+    ffmpeg_pid = Cairn.Registry.whereis(id, :ffmpeg)
+    assert is_pid(ffmpeg_pid)
 
-    # the asymmetry this closes: a global window edit reaches no argv, so an
-    # inline-plugin camera now behaves like a group-served one and keeps its
-    # stream — and with it every live track on the camera
+    # a global window edit reaches no argv, so the camera keeps its stream —
+    # and with it every live track on the camera
     new = %Config{old | post_window_seconds: 42}
     diff = Config.Server.diff_cameras(old, new)
     assert diff == %{added: [], removed: [], changed: [], refreshed: [id]}
@@ -97,51 +87,38 @@ defmodule Cairn.CameraSupervisorTest do
     :ok = CameraSupervisor.apply_diff(diff, new)
 
     assert Cairn.Registry.whereis(id, :camera) == camera_pid
-    assert Cairn.Registry.whereis(id, :plugin) == plugin_pid
+    assert Cairn.Registry.whereis(id, :ffmpeg) == ffmpeg_pid
     # the cast is flushed by this call, which is also how it is ordered after
     # the one apply_diff sent (both from this process)
-    assert :sys.get_state(plugin_pid).policy.post == 42
+    assert :sys.get_state(ffmpeg_pid).config.post_window_seconds == 42
   end
 
-  test "refreshing an id the config does not carry leaves the running port alone" do
+  test "refreshing an id the config does not carry leaves the running camera alone" do
     id = "cs_absent_#{System.unique_integer([:positive])}"
-    cam = %Camera{camera(id) | plugin: {:inline, ["sh", "-c", "exec sleep 30"]}}
 
-    :ok = CameraSupervisor.sync(config([cam], 19_840))
-    plugin_pid = Cairn.Registry.whereis(id, :plugin)
-    assert is_pid(plugin_pid)
+    :ok = CameraSupervisor.sync(config([camera(id)]))
+    ffmpeg_pid = Cairn.Registry.whereis(id, :ffmpeg)
+    assert is_pid(ffmpeg_pid)
 
     # `apply_diff/2` cannot produce this — a `refreshed` id is by construction
-    # in both configs — but the port is running and the id is gone, and the
+    # in both configs — but the camera is running and the id is gone, and the
     # `with` has to answer :ok rather than hand the port a `nil` camera
-    assert :ok = CameraSupervisor.refresh_camera(config([], 19_840), id)
-    assert Cairn.Registry.whereis(id, :plugin) == plugin_pid
-    assert %Camera{id: ^id} = :sys.get_state(plugin_pid).camera
+    assert :ok = CameraSupervisor.refresh_camera(config([]), id)
+    assert Cairn.Registry.whereis(id, :ffmpeg) == ffmpeg_pid
+    assert %Camera{id: ^id} = :sys.get_state(ffmpeg_pid).camera
   end
 
-  test "refreshing a camera with no plugin port of its own is a no-op" do
-    grouped = %Camera{
-      camera("cs_gref_#{System.unique_integer([:positive])}")
-      | plugin: {:group, "det"}
-    }
-
+  test "refreshing a camera that is not running is a no-op" do
     plain = camera("cs_pref_#{System.unique_integer([:positive])}")
-    new_config = config([grouped, plain], 19_800)
+    new_config = config([plain])
 
     :ok = CameraSupervisor.sync(new_config)
-    pids = Enum.map([grouped, plain], &Cairn.Registry.whereis(&1.id, :camera))
+    pid = Cairn.Registry.whereis(plain.id, :camera)
 
-    # grouped: its plugin belongs to the shared group process; plain: no
-    # plugin at all; "never_started": not running. None is an error.
-    diff = %{
-      added: [],
-      removed: [],
-      changed: [],
-      refreshed: [grouped.id, plain.id, "never_started"]
-    }
+    diff = %{added: [], removed: [], changed: [], refreshed: [plain.id, "never_started"]}
 
     assert :ok = CameraSupervisor.apply_diff(diff, new_config)
-    assert Enum.map([grouped, plain], &Cairn.Registry.whereis(&1.id, :camera)) == pids
+    assert Cairn.Registry.whereis(plain.id, :camera) == pid
   end
 
   test "stop_camera on an unknown id is a no-op" do
@@ -150,77 +127,39 @@ defmodule Cairn.CameraSupervisorTest do
 
   test "camera tree registers ring buffer, ffmpeg and rtp hub children" do
     a = camera("cs_tree_#{System.unique_integer([:positive])}")
-    :ok = CameraSupervisor.sync(config([a], 19_680))
+    :ok = CameraSupervisor.sync(config([a]))
 
     assert Cairn.Registry.whereis(a.id, :ring_buffer)
     assert Cairn.Registry.whereis(a.id, :ffmpeg)
     assert Cairn.Registry.whereis(a.id, :rtp_hub)
-    # no plugin configured -> no plugin port
-    refute Cairn.Registry.whereis(a.id, :plugin)
   end
 
-  test "a membrane camera streams through the real tree with a socketless hub" do
+  test "a camera streams through the real tree onto the ring and the hub topic" do
     id = "cs_membrane_#{System.unique_integer([:positive])}"
     fixture = Path.absname("test/support/fixtures/media/testsrc.ts")
-    cam = %Camera{id: id, rtsp_url: "file://#{fixture}", pipeline: :membrane}
-
-    cfg = config([cam], 19_880)
+    cam = %Camera{id: id, rtsp_url: "file://#{fixture}"}
 
     # subscribe before the tree starts so no init/fragment/packet is missed
     Phoenix.PubSub.subscribe(Cairn.PubSub, Cairn.RingBuffer.topic(id))
     Phoenix.PubSub.subscribe(Cairn.PubSub, Cairn.RTPHub.topic(id))
 
-    :ok = CameraSupervisor.sync(cfg)
+    :ok = CameraSupervisor.sync(config([cam]))
     assert Cairn.Registry.whereis(id, :camera)
 
-    # the membrane camera's hub owns no UDP socket — it is fed in-process by the
-    # pipeline's RTP branch (camera.ex routes `pipeline: :membrane` to port: nil)
-    hub = Cairn.Registry.whereis(id, :rtp_hub)
-    assert is_pid(hub)
-    assert :sys.get_state(hub).socket == nil
-
     # the real pipeline, fed real ffmpeg mpegts over stdout, drives both branches:
-    # CMAF fragments onto the ring and RTP packets onto the hub topic
+    # CMAF fragments onto the ring and RTP packets onto the hub topic (the hub
+    # owns no socket — it is fed in-process by the pipeline's RTP branch)
     assert_receive {:init_segment, %{camera_id: ^id}}, 10_000
     assert_receive {:fragment, _frag}, 10_000
     assert_receive {:rtp, %ExRTP.Packet{}}, 10_000
   end
 
-  # The double-feed regression: while a membrane camera still ran a plugin
-  # port, that port and the pipeline's in-VM detector both reached this
-  # camera's tracker from the same video — duplicate detections, duplicate
-  # tracks. The mock plugin replays its timeline regardless of RTP input, so
-  # every batch arriving here is the second producer; the pipeline's own is
-  # silent under test (no NIF), which is what makes zero the right count.
-  test "a membrane camera's tracker gets nothing from a plugin port" do
-    id = "cs_feed_#{System.unique_integer([:positive])}"
-    fixture = Path.absname("test/support/fixtures/media/testsrc.ts")
-
-    cam = %Camera{
-      id: id,
-      rtsp_url: "file://#{fixture}",
-      pipeline: :membrane,
-      plugin: {:inline, ["elixir", @mock, "--timeline", @timeline, "--loop"]}
-    }
-
-    # stand in for the camera's tracker: `Cairn.Detect.Dispatch` resolves it
-    # through the registry, so any producer's batch lands in this mailbox
-    {:ok, _} = Registry.register(Cairn.Registry, {id, :camera_tracker}, nil)
-
-    :ok = CameraSupervisor.sync(config([cam], 19_920))
-
-    assert Cairn.Registry.whereis(id, :camera)
-    refute Cairn.Registry.whereis(id, :plugin)
-    refute_receive {:"$gen_cast", {:detections, _camera, _policy, _observation}}, 4_000
-  end
-
-  test "a camera served by a plugin group gets no plugin port of its own" do
+  test "a camera referencing a plugin group starts the same tree" do
     a = %Camera{camera("cs_grp_#{System.unique_integer([:positive])}") | plugin: {:group, "det"}}
-    :ok = CameraSupervisor.sync(config([a], 19_720))
+    :ok = CameraSupervisor.sync(config([a]))
 
     assert Cairn.Registry.whereis(a.id, :ffmpeg)
     assert Cairn.Registry.whereis(a.id, :rtp_hub)
-    refute Cairn.Registry.whereis(a.id, :plugin)
   end
 
   # Flunks rather than returning nil: a "restarted" assertion that compares

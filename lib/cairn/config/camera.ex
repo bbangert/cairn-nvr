@@ -4,8 +4,8 @@ defmodule Cairn.Config.Camera do
 
   `min_score` is a map of label => minimum detection score, with a
   `"default"` key applied to labels not listed. It is the **wire floor**: it
-  reaches the plugin subprocess as argv, the plugin drops everything below it,
-  and changing it restarts the camera.
+  reaches the engine as the stream's params at session start, the engine
+  drops everything below it, and changing it restarts the camera.
 
   `track` and `record` are the two host-side tiers layered on that floor —
   which detections earn a database row, and which earn video. Each is a
@@ -20,12 +20,12 @@ defmodule Cairn.Config.Camera do
   `stationary_after_ms` are overrides:
   `nil` means "use the global value" (`Cairn.Config.policy/2` resolves them).
 
-  `plugin` selects the inference plugin (absent = no detection for this
-  camera) and resolves to `nil | {:inline, argv} | {:group, name}`. A string
-  without whitespace is a reference to a named group in the top-level
-  `plugins:` map — an undefined name is a config error, not a command. A
-  string with whitespace or an argv list is an inline per-camera command; the
-  list form is the escape hatch for an inline command that takes no flags.
+  `plugin` selects the camera's detection (absent = none) and resolves to
+  `nil | {:group, name}`: a reference to a named entry in the top-level
+  `plugins:` map, whose `profile:` is what picks the model the in-VM engine
+  runs. An undefined name is a config error. The inline-command form died
+  with the external plugin path (membrane port phase 6) and is refused with
+  its remedy spelled out.
 
   Group references leave `parse/3` as `{:pending, name}` and are resolved
   against the parsed `plugins:` map by `Cairn.Config`.
@@ -47,7 +47,6 @@ defmodule Cairn.Config.Camera do
             record: nil,
             extra_ffmpeg_args: [],
             transcode: false,
-            pipeline: :classic,
             ingest: :ffmpeg,
             retention_days: nil,
             retention_per_label: %{},
@@ -95,11 +94,11 @@ defmodule Cairn.Config.Camera do
     {track, acc} = parse_tier(Map.get(raw, "track"), id, "track", acc)
     {record, acc} = parse_tier(Map.get(raw, "record"), id, "record", acc)
     {plugin, acc} = parse_plugin(Map.get(raw, "plugin"), id, acc)
-    {pipeline, acc} = parse_pipeline(Map.get(raw, "pipeline"), id, acc)
+    acc = check_pipeline(Map.get(raw, "pipeline"), id, acc)
     transcode = Map.get(raw, "transcode", false) == true
 
     {ingest, acc} =
-      parse_ingest(Map.get(raw, "ingest"), id, acc, pipeline, rtsp_url, transcode)
+      parse_ingest(Map.get(raw, "ingest"), id, acc, rtsp_url, transcode)
 
     {extra_args, acc} = parse_extra_args(Map.get(raw, "extra_ffmpeg_args"), id, acc)
 
@@ -112,7 +111,6 @@ defmodule Cairn.Config.Camera do
       record: record,
       extra_ffmpeg_args: extra_args,
       transcode: transcode,
-      pipeline: pipeline,
       ingest: ingest,
       retention_days: get_in(raw, ["retention", "days"]),
       retention_per_label: get_in(raw, ["retention", "per_label"]) || %{},
@@ -222,31 +220,36 @@ defmodule Cairn.Config.Camera do
 
   defp tier_rule(_other), do: :error
 
-  # The D-M7 migration gate: both stacks stay runnable per camera until the
-  # classic path is deleted in port phase 6. Default :classic so an absent key
-  # changes nothing on upgrade.
-  defp parse_pipeline(nil, _id, acc), do: {:classic, acc}
-  defp parse_pipeline("classic", _id, acc), do: {:classic, acc}
-  defp parse_pipeline("membrane", _id, acc), do: {:membrane, acc}
+  # `pipeline:` stopped selecting anything when the classic path was deleted
+  # (membrane port phase 6). `membrane` is tolerated so a migrated fleet's
+  # config keeps loading; `classic` is refused with the removal spelled out
+  # rather than warned as an unknown key, because a camera that asked for it
+  # would otherwise silently run a different stack than its file says.
+  defp check_pipeline(nil, _id, acc), do: acc
+  defp check_pipeline("membrane", _id, acc), do: acc
 
-  defp parse_pipeline(_other, id, acc) do
-    {:classic, add_error(acc, "camera #{id}: pipeline must be \"membrane\" or \"classic\"")}
+  defp check_pipeline("classic", id, acc) do
+    add_error(
+      acc,
+      "camera #{id}: the classic pipeline was removed (membrane port phase 6) — every " <>
+        "camera runs the membrane pipeline now; delete the pipeline: key"
+    )
   end
 
-  # RTSP-native ingest is a membrane-pipeline capability with real
-  # preconditions, each refused at load where the operator reads diagnostics:
-  # the classic path has no RTSP client; the `rtsp` library rejects
-  # non-rtsp:// schemes outright (an FLV camera keeps the ffmpeg bridge —
-  # D-M7's per-camera escape hatch); and transcode happens inside ffmpeg,
-  # which this ingest removes from the chain entirely.
-  defp parse_ingest(nil, _id, acc, _pipeline, _url, _transcode), do: {:ffmpeg, acc}
-  defp parse_ingest("ffmpeg", _id, acc, _pipeline, _url, _transcode), do: {:ffmpeg, acc}
+  defp check_pipeline(_other, id, acc) do
+    add_error(acc, "camera #{id}: pipeline is \"membrane\" or absent — the key is vestigial")
+  end
 
-  defp parse_ingest("rtsp", id, acc, pipeline, url, transcode) do
+  # RTSP-native ingest has real preconditions, each refused at load where the
+  # operator reads diagnostics: the `rtsp` library rejects non-rtsp://
+  # schemes outright (an FLV camera keeps the ffmpeg bridge — D-M7's
+  # per-camera escape hatch), and transcode happens inside ffmpeg, which
+  # this ingest removes from the chain entirely.
+  defp parse_ingest(nil, _id, acc, _url, _transcode), do: {:ffmpeg, acc}
+  defp parse_ingest("ffmpeg", _id, acc, _url, _transcode), do: {:ffmpeg, acc}
+
+  defp parse_ingest("rtsp", id, acc, url, transcode) do
     cond do
-      pipeline != :membrane ->
-        {:ffmpeg, add_error(acc, "camera #{id}: ingest \"rtsp\" requires pipeline \"membrane\"")}
-
       not (is_binary(url) and String.starts_with?(url, "rtsp://")) ->
         {:ffmpeg, add_error(acc, "camera #{id}: ingest \"rtsp\" requires an rtsp:// url")}
 
@@ -262,7 +265,7 @@ defmodule Cairn.Config.Camera do
     end
   end
 
-  defp parse_ingest(_other, id, acc, _pipeline, _url, _transcode) do
+  defp parse_ingest(_other, id, acc, _url, _transcode) do
     {:ffmpeg, add_error(acc, "camera #{id}: ingest must be \"rtsp\" or \"ffmpeg\"")}
   end
 
@@ -271,23 +274,27 @@ defmodule Cairn.Config.Camera do
   defp parse_plugin(cmd, id, acc) when is_binary(cmd) do
     case String.split(cmd) do
       [name] -> {{:pending, name}, acc}
-      [_ | _] = argv -> {{:inline, argv}, acc}
+      [_ | _] -> {nil, inline_plugin(acc, id)}
       [] -> {nil, invalid_plugin(acc, id)}
     end
   end
 
-  defp parse_plugin(argv, id, acc) when is_list(argv) do
-    if Enum.all?(argv, &is_binary/1) and argv != [] do
-      {{:inline, argv}, acc}
-    else
-      {nil, invalid_plugin(acc, id)}
-    end
-  end
+  defp parse_plugin(argv, id, acc) when is_list(argv) and argv != [],
+    do: {nil, inline_plugin(acc, id)}
 
   defp parse_plugin(_other, id, acc), do: {nil, invalid_plugin(acc, id)}
 
+  defp inline_plugin(acc, id) do
+    add_error(
+      acc,
+      "camera #{id}: inline plugin commands were removed with the external plugin path " <>
+        "(membrane port phase 6) — detection runs in this node's own engine; name a " <>
+        "plugins: group whose profile: picks the model"
+    )
+  end
+
   defp invalid_plugin(acc, id) do
-    add_error(acc, "camera #{id}: plugin must be a plugin name, command string or argv list")
+    add_error(acc, "camera #{id}: plugin must be a plugin group name")
   end
 
   defp parse_extra_args(nil, _id, acc), do: {[], acc}

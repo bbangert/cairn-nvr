@@ -9,7 +9,6 @@ defmodule Cairn.ConfigTest do
   defp base_map do
     %{
       "data_dir" => "tmp/cfg_test",
-      "udp" => %{"base_port" => 17_000, "range" => 20},
       "cameras" => [
         %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1"},
         %{"id" => "cam_b", "rtsp_url" => "rtsp://h/2"}
@@ -21,7 +20,6 @@ defmodule Cairn.ConfigTest do
     test "loads the valid fixture" do
       assert {:ok, %Config{} = config, warnings} = Config.load(@valid_fixture)
       assert config.stall_seconds == 15
-      assert config.udp_base_port == 17_000
       assert [%Config.Camera{id: "cam_a"} = cam_a, %Config.Camera{id: "cam_b"}] = config.cameras
       assert cam_a.min_score == %{"default" => 0.5, "person" => 0.6}
       assert Enum.empty?(warnings)
@@ -60,22 +58,11 @@ defmodule Cairn.ConfigTest do
       assert Enum.any?(errors, &(&1 =~ "remux_clips must be true or false"))
     end
 
-    test "missing udp section is an error" do
-      map = Map.delete(base_map(), "udp")
-      assert {:error, errors} = Config.from_map(map)
-      assert Enum.any?(errors, &(&1 =~ "udp.base_port and udp.range are required"))
-    end
+    test "a leftover udp: block from before phase 6 is a warning, not an error" do
+      map = Map.put(base_map(), "udp", %{"base_port" => 17_000, "range" => 20})
 
-    test "exhausted udp range is an error" do
-      map = put_in(base_map(), ["udp", "range"], 3)
-      assert {:error, errors} = Config.from_map(map)
-      assert Enum.any?(errors, &(&1 =~ "udp range exhausted"))
-    end
-
-    test "udp range overflowing the port space is an error" do
-      map = %{base_map() | "udp" => %{"base_port" => 65_000, "range" => 5_000}}
-      assert {:error, errors} = Config.from_map(map)
-      assert Enum.any?(errors, &(&1 =~ "must fit below 65536"))
+      assert {:ok, _config, warnings} = Config.from_map(map)
+      assert Enum.any?(warnings, &(&1 =~ ~s(unknown key "udp" in config)))
     end
 
     test "bad windows are errors" do
@@ -295,12 +282,14 @@ defmodule Cairn.ConfigTest do
     end
 
     test "tracking.reid requires tracking.bbd where the global flag reaches" do
-      # The refusal is scoped to cameras the global booleans govern: one
-      # camera with an inline plugin command is enough to be refused.
+      # The refusal is scoped to cameras the global booleans govern — those
+      # whose group resolves no profile, which since phase 6 is itself a
+      # load error (every plugin: camera must resolve a profile), so the
+      # reid refusal rides along beside that error rather than replacing it.
       plugged =
-        update_in(base_map(), ["cameras"], fn [a, b] ->
-          [Map.put(a, "plugin", "detect --model m.onnx"), b]
-        end)
+        base_map()
+        |> Map.put("plugins", %{"det" => %{"profile" => "no-such"}})
+        |> update_in(["cameras"], fn [a, b] -> [Map.put(a, "plugin", "det"), b] end)
 
       assert {:error, errors} =
                plugged
@@ -316,8 +305,21 @@ defmodule Cairn.ConfigTest do
 
       assert Enum.any?(errors, &(&1 =~ "tracking.reid requires tracking.bbd"))
 
-      assert {:ok, config, []} =
+      # With bbd on, the reid refusal itself is gone (the unknown-profile
+      # error remains — it is a different defect).
+      assert {:error, errors} =
                plugged
+               |> Map.put("tracking", %{"reid" => true, "bbd" => true})
+               |> Config.from_map()
+
+      refute Enum.any?(errors, &(&1 =~ "tracking.reid requires tracking.bbd"))
+
+      # No plugin-bearing camera reads the global flags, so nothing is
+      # refused over them — a config the flag cannot reach is not an error
+      # (a fully-profiled deployment answers to its profiles' stage lists,
+      # and the per-group warning names any profile that silences reid).
+      assert {:ok, config, _warnings} =
+               base_map()
                |> Map.put("tracking", %{"reid" => true, "bbd" => true})
                |> Config.from_map()
 
@@ -327,10 +329,6 @@ defmodule Cairn.ConfigTest do
       assert Config.policy(config, cam_a).reid
       assert Config.policy(config, cam_a).bbd
 
-      # No plugin-bearing camera reads the global flags, so nothing is
-      # refused over them — a config the flag cannot reach is not an error
-      # (a fully-profiled deployment answers to its profiles' stage lists,
-      # and the per-group warning names any profile that silences reid).
       assert {:ok, _config, _warnings} =
                base_map()
                |> Map.put("tracking", %{"reid" => true})
@@ -413,18 +411,17 @@ defmodule Cairn.ConfigTest do
       assert Enum.any?(warnings, &(&1 =~ ~s(unknown key "typo_key" in camera #0)))
     end
 
-    test "plugin accepts a multi-token command string or an argv list" do
+    test "an inline plugin command is refused with its remedy, in both spellings" do
       map =
         update_in(base_map(), ["cameras"], fn [a, b] ->
           [Map.put(a, "plugin", "python3 plug.py --x"), Map.put(b, "plugin", ["./plug"])]
         end)
 
-      assert {:ok, config, _} = Config.from_map(map)
+      assert {:error, errors} = Config.from_map(map)
 
-      assert [
-               %{plugin: {:inline, ["python3", "plug.py", "--x"]}},
-               %{plugin: {:inline, ["./plug"]}}
-             ] = config.cameras
+      assert Enum.count(errors, &(&1 =~ "inline plugin commands were removed")) == 2
+      assert Enum.any?(errors, &(&1 =~ "camera cam_a"))
+      assert Enum.any?(errors, &(&1 =~ "camera cam_b"))
     end
   end
 
@@ -779,7 +776,13 @@ defmodule Cairn.ConfigTest do
   end
 
   describe "plugin groups" do
-    defp with_plugins(map, plugins), do: Map.put(map, "plugins", plugins)
+    @argv_profiles "test/support/fixtures/profiles/argv"
+
+    defp with_plugins(map, plugins) do
+      map
+      |> Map.put("plugins", plugins)
+      |> Map.put_new("profile_dirs", [@argv_profiles])
+    end
 
     defp put_plugin(map, index, plugin) do
       update_in(map, ["cameras"], fn cams ->
@@ -792,33 +795,25 @@ defmodule Cairn.ConfigTest do
 
       assert [detect, spare] = config.plugin_groups
       assert detect.name == "detect"
-      assert detect.command == ["./cairn-detect", "--model", "m.onnx"]
-      assert spare.command == ["./spare-plugin"]
-      assert spare.members == []
+      assert %Config.Profile{name: "partial"} = detect.profile
+      assert %Config.Profile{name: "partial"} = spare.profile
 
       assert [
                %{id: "cam_a", plugin: {:group, "detect"}},
-               %{id: "cam_b", plugin: {:inline, ["python3", "plug.py", "--x"]}},
+               %{id: "cam_b", plugin: nil},
                %{id: "cam_c", plugin: {:group, "detect"}}
              ] = config.cameras
-
-      assert detect.members == [
-               %{id: "cam_a", udp_port: 17_000, min_score: %{"default" => 0.5, "person" => 0.6}},
-               %{id: "cam_c", udp_port: 17_008, min_score: %{"default" => 0.5}}
-             ]
     end
 
     test "a single-token plugin string references a named group" do
       map =
         base_map()
-        |> with_plugins(%{"detect" => %{"command" => "./detect --model m.onnx"}})
+        |> with_plugins(%{"detect" => %{"profile" => "partial"}})
         |> put_plugin(0, "detect")
 
       assert {:ok, config, []} = Config.from_map(map)
       assert [%{plugin: {:group, "detect"}}, %{plugin: nil}] = config.cameras
-
-      assert [%{name: "detect", command: ["./detect", "--model", "m.onnx"]}] =
-               config.plugin_groups
+      assert [%{name: "detect", profile: %Config.Profile{name: "partial"}}] = config.plugin_groups
     end
 
     test "a single-token plugin string with no matching group is an error" do
@@ -828,45 +823,19 @@ defmodule Cairn.ConfigTest do
       assert Enum.any?(errors, &(&1 =~ ~s(camera cam_a: unknown plugin "detekt")))
     end
 
-    test "a one-element list is the inline escape hatch, not a group reference" do
-      map = put_plugin(base_map(), 0, ["./my-plugin"])
-
-      assert {:ok, config, []} = Config.from_map(map)
-      assert [%{plugin: {:inline, ["./my-plugin"]}}, _] = config.cameras
-    end
-
-    test "members carry each referencing camera's port and min_score in config order" do
-      map =
-        base_map()
-        |> with_plugins(%{"detect" => %{"command" => ["./detect"]}})
-        |> put_plugin(1, "detect")
-        |> put_plugin(0, "detect")
-        |> update_in(["cameras"], fn [a, b] ->
-          [Map.put(a, "min_score", %{"person" => 0.7}), b]
-        end)
-
-      assert {:ok, config, []} = Config.from_map(map)
-      assert [%{members: members}] = config.plugin_groups
-
-      assert members == [
-               %{id: "cam_a", udp_port: 17_000, min_score: %{"default" => 0.5, "person" => 0.7}},
-               %{id: "cam_b", udp_port: 17_004, min_score: %{"default" => 0.5}}
-             ]
-    end
-
     test "ingest defaults to the ffmpeg bridge and accepts rtsp only where it can work" do
       # Default: absent key is the bridge.
       assert {:ok, config, []} = Config.from_map(base_map())
       assert [%{ingest: :ffmpeg}, %{ingest: :ffmpeg}] = config.cameras
 
-      # Valid: membrane pipeline + rtsp:// url.
+      # Valid: an rtsp:// url.
       map =
         update_in(base_map(), ["cameras"], fn [a, b] ->
-          [Map.merge(a, %{"pipeline" => "membrane", "ingest" => "rtsp"}), b]
+          [Map.put(a, "ingest", "rtsp"), b]
         end)
 
       assert {:ok, config, []} = Config.from_map(map)
-      assert [%{ingest: :rtsp, pipeline: :membrane}, %{ingest: :ffmpeg}] = config.cameras
+      assert [%{ingest: :rtsp}, %{ingest: :ffmpeg}] = config.cameras
     end
 
     test "rtsp ingest is refused at load where its preconditions fail" do
@@ -878,88 +847,92 @@ defmodule Cairn.ConfigTest do
         assert Enum.any?(errors, &(&1 =~ message)), inspect(errors)
       end
 
-      # The classic path has no RTSP client.
-      refused.(%{"ingest" => "rtsp"}, "requires pipeline \"membrane\"")
-
       # The rtsp library rejects non-rtsp:// schemes outright (the FLV
       # camera keeps the bridge — D-M7's per-camera escape hatch).
       refused.(
-        %{
-          "ingest" => "rtsp",
-          "pipeline" => "membrane",
-          "rtsp_url" => "http://h/flv"
-        },
+        %{"ingest" => "rtsp", "rtsp_url" => "http://h/flv"},
         "requires an rtsp:// url"
       )
 
       # Transcode happens inside ffmpeg, which this ingest removes.
-      refused.(
-        %{"ingest" => "rtsp", "pipeline" => "membrane", "transcode" => true},
-        "cannot transcode"
-      )
+      refused.(%{"ingest" => "rtsp", "transcode" => true}, "cannot transcode")
 
       # A typo is an error, never a silent fallback.
       refused.(%{"ingest" => "rtps"}, "ingest must be")
     end
 
-    test "a membrane camera keeps its group but is not a member of it" do
-      map =
-        base_map()
-        |> Map.put("profile_dirs", ["test/support/fixtures/profiles/argv"])
-        |> with_plugins(%{
-          "detect" => %{"command" => ["./detect"], "profile" => "partial"}
-        })
-        |> put_plugin(0, "detect")
-        |> put_plugin(1, "detect")
-        |> update_in(["cameras"], fn [a, b] -> [Map.put(a, "pipeline", "membrane"), b] end)
+    test "pipeline: membrane is tolerated; pipeline: classic is refused by name" do
+      tolerated =
+        update_in(base_map(), ["cameras"], fn [a, b] ->
+          [Map.put(a, "pipeline", "membrane"), b]
+        end)
 
-      assert {:ok, config, []} = Config.from_map(map)
+      assert {:ok, _config, []} = Config.from_map(tolerated)
 
-      # cam_a still names the group — that is what selects the profile its
-      # pipeline runs in-VM — but the group must not bind a port for it or
-      # expect lines from it. cam_b keeps 17_004: the member port is derived
-      # from the camera's index in the whole list, not its rank in the group.
-      assert [%{plugin: {:group, "detect"}, pipeline: :membrane}, _] = config.cameras
-      assert [%{members: [%{id: "cam_b", udp_port: 17_004}]}] = config.plugin_groups
+      refused =
+        update_in(base_map(), ["cameras"], fn [a, b] ->
+          [Map.put(a, "pipeline", "classic"), b]
+        end)
+
+      assert {:error, errors} = Config.from_map(refused)
+      assert Enum.any?(errors, &(&1 =~ "camera cam_a: the classic pipeline was removed"))
+
+      typo =
+        update_in(base_map(), ["cameras"], fn [a, b] ->
+          [Map.put(a, "pipeline", "membrane2"), b]
+        end)
+
+      assert {:error, errors} = Config.from_map(typo)
+      assert Enum.any?(errors, &(&1 =~ ~s(pipeline is "membrane" or absent)))
     end
 
-    test "a group nobody references parses with empty members" do
-      map = with_plugins(base_map(), %{"detect" => %{"command" => ["./detect"]}})
+    test "a group nobody references still parses" do
+      map = with_plugins(base_map(), %{"detect" => %{"profile" => "partial"}})
 
       assert {:ok, config, []} = Config.from_map(map)
-      assert [%{name: "detect", members: []}] = config.plugin_groups
+      assert [%{name: "detect"}] = config.plugin_groups
     end
 
-    test "command is required and must be a string or argv list" do
+    test "profile is required and must be a profile name string" do
       assert {:error, errors} = Config.from_map(with_plugins(base_map(), %{"detect" => %{}}))
-      assert Enum.any?(errors, &(&1 =~ "plugin detect: command is required"))
+      assert Enum.any?(errors, &(&1 =~ "plugin detect: profile is required"))
 
       assert {:error, errors} =
-               Config.from_map(with_plugins(base_map(), %{"detect" => %{"command" => 42}}))
+               Config.from_map(with_plugins(base_map(), %{"detect" => %{"profile" => 42}}))
 
-      assert Enum.any?(errors, &(&1 =~ "plugin detect: command must be"))
+      assert Enum.any?(errors, &(&1 =~ "plugin detect: profile must be a profile name string"))
+    end
+
+    test "a leftover command: key from before phase 6 is a warning, not an error" do
+      map =
+        with_plugins(base_map(), %{
+          "detect" => %{"profile" => "partial", "command" => "./cairn-detect"}
+        })
+
+      assert {:ok, _config, warnings} = Config.from_map(map)
+      assert Enum.any?(warnings, &(&1 =~ ~s(unknown key "command" in plugin detect)))
     end
 
     test "a camera referencing a group that failed to parse gets no extra error" do
       map =
         base_map()
-        |> with_plugins(%{"detect" => %{"command" => 42}})
+        |> with_plugins(%{"detect" => %{"profile" => 42}})
         |> put_plugin(0, "detect")
 
       assert {:error, errors} = Config.from_map(map)
-      assert Enum.any?(errors, &(&1 =~ "plugin detect: command must be"))
+      assert Enum.any?(errors, &(&1 =~ "plugin detect: profile must be"))
       refute Enum.any?(errors, &(&1 =~ "unknown plugin"))
     end
 
     test "an invalid group name is an error" do
-      map = with_plugins(base_map(), %{"Detect Group" => %{"command" => ["./detect"]}})
+      map = with_plugins(base_map(), %{"Detect Group" => %{"profile" => "partial"}})
 
       assert {:error, errors} = Config.from_map(map)
       assert Enum.any?(errors, &(&1 =~ "plugin Detect Group: name must be lowercase"))
     end
 
     test "a group name colliding with a camera id is an error" do
-      map = with_plugins(base_map(), %{"cam_a" => %{"command" => ["./detect"]}})
+      map = with_plugins(base_map(), %{"cam_a" => %{"profile" => "partial"}})
 
       assert {:error, errors} = Config.from_map(map)
       assert Enum.any?(errors, &(&1 =~ "plugin cam_a: name collides with a camera id"))
@@ -973,7 +946,7 @@ defmodule Cairn.ConfigTest do
     test "unknown keys inside a plugin produce warnings" do
       map =
         with_plugins(base_map(), %{
-          "detect" => %{"command" => ["./detect"], "typo_key" => true}
+          "detect" => %{"profile" => "partial", "typo_key" => true}
         })
 
       assert {:ok, _config, warnings} = Config.from_map(map)
@@ -994,7 +967,7 @@ defmodule Cairn.ConfigTest do
       base_map()
       |> Map.put("profile_dirs", [@profiles_dir])
       |> Map.put("plugins", %{
-        "det" => %{"command" => "./p", "profile" => profile, "allow_experimental" => true}
+        "det" => %{"profile" => profile, "allow_experimental" => true}
       })
       |> put_plugin(0, "det")
     end
@@ -1157,126 +1130,18 @@ defmodule Cairn.ConfigTest do
     end
   end
 
-  describe "profile argv expansion" do
+  describe "group profile checks" do
     @argv_dir "test/support/fixtures/profiles/argv"
     @no_artifact_dir "test/support/fixtures/profiles/no-artifact"
     @stub_onnx "test/support/fixtures/models/stub.onnx"
-    @stub_names "test/support/fixtures/models/stub.names"
 
     defp argv_map(profile, group \\ %{}, dir \\ @argv_dir) do
       base_map()
       |> Map.put("profile_dirs", [dir])
       |> Map.put("plugins", %{
-        "det" => Map.merge(%{"command" => "./p", "profile" => profile}, group)
+        "det" => Map.merge(%{"profile" => profile}, group)
       })
       |> put_plugin(0, "det")
-    end
-
-    defp command!(map) do
-      assert {:ok, config, _warnings} = Config.from_map(map)
-      [%{command: command}] = config.plugin_groups
-      command
-    end
-
-    test "a full profile expands to every model flag, after the operator's argv" do
-      assert command!(argv_map("full")) == [
-               "./p",
-               "--model",
-               @stub_onnx,
-               "--model-profile",
-               "yolox",
-               "--input-size",
-               "416",
-               "--decoder",
-               "auto",
-               "--labels",
-               @stub_names
-             ]
-    end
-
-    test "a partial profile emits only the flags it set" do
-      assert command!(argv_map("partial")) == ["./p", "--model", @stub_onnx]
-    end
-
-    test "the expansion follows the operator's own flags" do
-      map = argv_map("partial", %{"command" => ["./p", "--motion-json", "{}"]})
-
-      assert command!(map) == ["./p", "--motion-json", "{}", "--model", @stub_onnx]
-    end
-
-    test "an unprofiled group's command is left alone, model flags and all" do
-      map =
-        base_map()
-        |> Map.put("plugins", %{"det" => %{"command" => "./p --model m.onnx --input-size 416"}})
-        |> put_plugin(0, "det")
-
-      assert command!(map) == ["./p", "--model", "m.onnx", "--input-size", "416"]
-    end
-
-    test "a profiled group carrying a model flag itself fails the load (D-P4)" do
-      map = argv_map("partial", %{"command" => "./p --input-size 416"})
-
-      assert {:error, errors} = Config.from_map(map)
-      assert Enum.any?(errors, &(&1 =~ "plugin det: command carries --input-size"))
-      assert Enum.any?(errors, &(&1 =~ "which profile partial owns"))
-    end
-
-    test "the D-P4 check sees the --flag=value form too" do
-      map = argv_map("partial", %{"command" => ["./p", "--labels=coco.names"]})
-
-      assert {:error, errors} = Config.from_map(map)
-      assert Enum.any?(errors, &(&1 =~ "command carries --labels"))
-    end
-
-    test "the D-P4 check sees a flag embedded in a shell-wrapped composite token" do
-      map =
-        argv_map("partial", %{
-          "command" => ["/bin/sh", "-c", "exec cairn-detect --model /opt/m.onnx"]
-        })
-
-      assert {:error, errors} = Config.from_map(map)
-      assert Enum.any?(errors, &(&1 =~ "plugin det: command carries --model"))
-    end
-
-    test "the D-P4 check sees a quoted flag inside a shell-wrapped composite token" do
-      map =
-        argv_map("partial", %{
-          "command" => ["/bin/sh", "-c", "exec cairn-detect '--model' /opt/m.onnx"]
-        })
-
-      assert {:error, errors} = Config.from_map(map)
-      assert Enum.any?(errors, &(&1 =~ "plugin det: command carries --model"))
-    end
-
-    test "a flag string embedded mid-path does not trip D-P4" do
-      map = argv_map("partial", %{"command" => ["./p", "/opt/--model/x"]})
-
-      assert {:ok, _config, _warnings} = Config.from_map(map)
-    end
-
-    test "the D-P4 boundary match does not bleed --model into a --model-profile-only command" do
-      map = argv_map("partial", %{"command" => ["./p", "--model-profile"]})
-
-      assert {:error, errors} = Config.from_map(map)
-      assert Enum.count(errors, &(&1 =~ "command carries")) == 1
-      assert Enum.any?(errors, &(&1 =~ "command carries --model-profile"))
-    end
-
-    test "the operator's own JSON flags are not model flags (D-P6)" do
-      map =
-        argv_map("partial", %{
-          "command" => ["./p", "--motion-json", "{}", "--track-floor-json", "{}"]
-        })
-
-      assert command!(map) == [
-               "./p",
-               "--motion-json",
-               "{}",
-               "--track-floor-json",
-               "{}",
-               "--model",
-               @stub_onnx
-             ]
     end
 
     test "a model artifact that is not on disk fails the load, naming both" do
@@ -1328,37 +1193,28 @@ defmodule Cairn.ConfigTest do
       map =
         base_map()
         |> Map.put("profile_dirs", ["test/support/fixtures/profiles/valid"])
-        |> Map.put("plugins", %{"det" => %{"command" => "./p", "profile" => "rk-test"}})
+        |> Map.put("plugins", %{"det" => %{"profile" => "rk-test"}})
         |> put_plugin(0, "det")
 
       assert {:error, errors} = Config.from_map(map)
       assert Enum.any?(errors, &(&1 =~ "set allow_experimental: true on this plugin group"))
     end
 
-    test "both halves of the acknowledgement load, and expand" do
+    test "both halves of the acknowledgement load, and the backend picks the artifact" do
       map =
         base_map()
         |> Map.put("profile_dirs", ["test/support/fixtures/profiles/valid"])
         |> Map.put("plugins", %{
-          "det" => %{"command" => "./p", "profile" => "rk-test", "allow_experimental" => true}
+          "det" => %{"profile" => "rk-test", "allow_experimental" => true}
         })
         |> put_plugin(0, "det")
 
-      # `--model` comes from the rknn artifact, not the onnx one: the backend
-      # picks the key.
-      assert command!(map) == [
-               "./p",
-               "--model",
-               "test/support/fixtures/models/stub.rknn",
-               "--model-profile",
-               "yolox",
-               "--input-size",
-               "416",
-               "--decoder",
-               "auto",
-               "--labels",
-               @stub_names
-             ]
+      # The model comes from the rknn artifact, not the onnx one: the
+      # backend picks the key.
+      assert {:ok, config, _warnings} = Config.from_map(map)
+
+      assert {:ok, %{model: "test/support/fixtures/models/stub.rknn", backend: "rknn"}} =
+               Config.native_model_config(config)
     end
 
     test "allow_experimental must be a boolean" do
@@ -1389,7 +1245,7 @@ defmodule Cairn.ConfigTest do
     end
   end
 
-  describe "profile expansion for membrane cameras" do
+  describe "profile expansion for the engine" do
     alias Cairn.Config.Profile
     alias Cairn.Native.Config, as: NativeConfig
 
@@ -1399,52 +1255,25 @@ defmodule Cairn.ConfigTest do
       profile
     end
 
-    # `cameras` is `{pipeline, group}` pairs, `plugins` a group name → profile
-    # name map.
+    # `cameras` is a list of group references (nil = no plugin), `plugins` a
+    # group name → profile name map.
     defp native_map(cameras, plugins) do
       base_map()
       |> Map.put("profile_dirs", [@argv_dir])
       |> Map.put(
         "plugins",
-        Map.new(plugins, fn {group, profile} ->
-          {group, %{"command" => "./p", "profile" => profile}}
-        end)
+        Map.new(plugins, fn {group, profile} -> {group, %{"profile" => profile}} end)
       )
       |> Map.put(
         "cameras",
-        Enum.with_index(cameras, fn {pipeline, group}, index ->
+        Enum.with_index(cameras, fn group, index ->
           %{
             "id" => "cam_#{index}",
             "rtsp_url" => "rtsp://h/#{index}",
-            "pipeline" => pipeline,
             "plugin" => group
           }
         end)
       )
-    end
-
-    defp argv_pairs(argv), do: argv |> Enum.chunk_every(2) |> Map.new(fn [f, v] -> {f, v} end)
-
-    defp field_of("--" <> flag), do: flag |> String.replace("-", "_") |> String.to_existing_atom()
-
-    # The anti-drift test: one profile, both renderings, the same decisions. A
-    # field that stopped walking `Profile`'s field table on one side shows up
-    # here as a flag with no field or a field with no flag.
-    test "every decision a profile makes reaches both renderings, with one value" do
-      for name <- ~w(full partial sample-fps) do
-        profile = profile!(name)
-        argv = argv_pairs(Profile.model_argv(profile))
-        # `backend` is the deliberate asymmetry: the plugin takes it from the
-        # operator's own argv, the NIF from the profile.
-        native = Map.delete(Profile.native_config(profile), :backend)
-
-        assert argv |> Map.keys() |> Enum.map(&field_of/1) |> Enum.sort() ==
-                 native |> Map.keys() |> Enum.sort()
-
-        for {flag, value} <- argv do
-          assert to_string(Map.fetch!(native, field_of(flag))) == value
-        end
-      end
     end
 
     test "an unset field is dropped, so the init config falls to the crate's own defaults" do
@@ -1483,16 +1312,9 @@ defmodule Cairn.ConfigTest do
       assert message =~ "model is required"
     end
 
-    test "no membrane camera configures no engine" do
+    test "a camera's profile is the engine's model config" do
       assert {:ok, config, _warnings} =
-               Config.from_map(native_map([{"classic", "det"}], %{"det" => "full"}))
-
-      assert Config.native_model_config(config) == {:ok, nil}
-    end
-
-    test "a membrane camera's profile is the engine's model config" do
-      assert {:ok, config, _warnings} =
-               Config.from_map(native_map([{"membrane", "det"}], %{"det" => "full"}))
+               Config.from_map(native_map(["det"], %{"det" => "full"}))
 
       assert Config.native_model_config(config) ==
                {:ok,
@@ -1501,56 +1323,47 @@ defmodule Cairn.ConfigTest do
                   model_profile: "yolox",
                   input_size: 416,
                   decoder: "auto",
-                  labels: @stub_names,
+                  labels: "test/support/fixtures/models/stub.names",
                   backend: "ort"
                 }}
     end
 
-    test "membrane cameras on one profile agree, however many groups run it" do
-      map = native_map([{"membrane", "a"}, {"membrane", "b"}], %{"a" => "full", "b" => "full"})
+    test "cameras on one profile agree, however many groups run it" do
+      map = native_map(["a", "b"], %{"a" => "full", "b" => "full"})
 
       assert {:ok, config, _warnings} = Config.from_map(map)
       assert {:ok, %{model: @stub_onnx}} = Config.native_model_config(config)
     end
 
-    test "membrane cameras asking for different models fail the load, naming them" do
-      map = native_map([{"membrane", "a"}, {"membrane", "b"}], %{"a" => "full", "b" => "partial"})
+    test "cameras asking for different models fail the load, naming them" do
+      map = native_map(["a", "b"], %{"a" => "full", "b" => "partial"})
 
       assert {:error, errors} = Config.from_map(map)
       assert Enum.any?(errors, &(&1 =~ "different models (full, partial)"))
-      assert Enum.any?(errors, &(&1 =~ "loads one model for every membrane camera"))
+      assert Enum.any?(errors, &(&1 =~ "loads one model for every camera"))
     end
 
-    # An unprofiled membrane camera builds a detect branch and contributes no
-    # model, so it detects on whatever model another camera loaded — or, alone
-    # on a node, leaves the engine `:not_configured` with detection configured.
-    test "a membrane camera on an inline command names no profile, and is refused by name" do
+    test "a camera on a group with no profile is refused at the group" do
       map =
-        [{"membrane", "det"}]
+        ["det"]
         |> native_map(%{"det" => "full"})
-        |> put_in(["cameras", Access.at(0), "plugin"], "./p --model other.onnx")
+        |> Map.put("plugins", %{"det" => %{}})
 
       assert {:error, errors} = Config.from_map(map)
-      assert Enum.any?(errors, &(&1 =~ "camera cam_0"))
-      assert Enum.any?(errors, &(&1 =~ "profile"))
+      assert Enum.any?(errors, &(&1 =~ "plugin det: profile is required"))
     end
 
-    test "a membrane camera on a group with no profile is refused by name" do
-      map =
-        [{"membrane", "det"}]
-        |> native_map(%{"det" => "full"})
-        |> Map.put("plugins", %{"det" => %{"command" => "./p"}})
+    test "a camera with no plugin detects on nothing, and needs no profile" do
+      map = native_map([nil, "det"], %{"det" => "full"})
+      map = update_in(map, ["cameras", Access.at(0)], &Map.delete(&1, "plugin"))
 
-      assert {:error, errors} = Config.from_map(map)
-      assert Enum.any?(errors, &(&1 =~ "camera cam_0"))
-      assert Enum.any?(errors, &(&1 =~ "plugin det"))
+      assert {:ok, config, _warnings} = Config.from_map(map)
+      # cam_1 still configures the engine; cam_0 contributes nothing.
+      assert {:ok, %{model: @stub_onnx}} = Config.native_model_config(config)
     end
 
-    test "a membrane camera with no plugin detects on nothing, and needs no profile" do
-      map =
-        [{"membrane", "det"}]
-        |> native_map(%{"det" => "full"})
-        |> update_in(["cameras", Access.at(0)], &Map.delete(&1, "plugin"))
+    test "no plugin-bearing camera configures no engine" do
+      map = native_map([nil], %{"det" => "full"})
 
       assert {:ok, config, _warnings} = Config.from_map(map)
       assert Config.native_model_config(config) == {:ok, nil}
@@ -1560,66 +1373,43 @@ defmodule Cairn.ConfigTest do
   describe "sample_fps" do
     @sample_fps_bad_dir "test/support/fixtures/profiles/sample-fps-bad"
 
-    # D-P4: the band validates, it never emits. `full.yml` (used above) already
-    # declares an fps_band with no sample_fps and its expected argv has no
-    # --sample-fps in it; this pins the no-band half of the same rule.
-    test "absent sample_fps emits no --sample-fps, with no fps_band declared" do
-      assert command!(argv_map("partial")) == ["./p", "--model", @stub_onnx]
+    alias Cairn.Config.Profile, as: SampleProfile
+
+    defp sample_fps!(profile_name) do
+      assert {:ok, config, _warnings} = Config.from_map(argv_map(profile_name))
+      [%{profile: profile}] = config.plugin_groups
+      Map.get(SampleProfile.native_config(profile), :sample_fps)
     end
 
-    test "absent sample_fps emits no --sample-fps, even with fps_band declared" do
-      command = command!(argv_map("full"))
-      refute "--sample-fps" in command
+    # D-P4: the band validates, it never emits. `full.yml` already declares
+    # an fps_band with no sample_fps; an unset field is dropped from the
+    # engine config so the crate's own default applies.
+    test "absent sample_fps reaches no engine config, with no fps_band declared" do
+      assert sample_fps!("partial") == nil
     end
 
-    test "present sample_fps with no fps_band emits the flag" do
-      assert command!(argv_map("sample-fps")) == [
-               "./p",
-               "--model",
-               @stub_onnx,
-               "--sample-fps",
-               "6"
-             ]
+    test "absent sample_fps reaches no engine config, even with fps_band declared" do
+      assert sample_fps!("full") == nil
     end
 
-    test "present sample_fps inside its own fps_band emits the flag, no error" do
-      assert command!(argv_map("sample-fps-inband")) == [
-               "./p",
-               "--model",
-               @stub_onnx,
-               "--sample-fps",
-               "6"
-             ]
+    test "present sample_fps with no fps_band reaches the engine config" do
+      assert sample_fps!("sample-fps") == 6
     end
 
-    test "sample_fps at its band's min edge loads and emits (inclusive bound)" do
-      assert command!(argv_map("sample-fps-band-min")) == [
-               "./p",
-               "--model",
-               @stub_onnx,
-               "--sample-fps",
-               "4"
-             ]
+    test "present sample_fps inside its own fps_band loads, no error" do
+      assert sample_fps!("sample-fps-inband") == 6
     end
 
-    test "sample_fps at its band's max edge loads and emits (inclusive bound)" do
-      assert command!(argv_map("sample-fps-band-max")) == [
-               "./p",
-               "--model",
-               @stub_onnx,
-               "--sample-fps",
-               "8"
-             ]
+    test "sample_fps at its band's min edge loads (inclusive bound)" do
+      assert sample_fps!("sample-fps-band-min") == 4
+    end
+
+    test "sample_fps at its band's max edge loads (inclusive bound)" do
+      assert sample_fps!("sample-fps-band-max") == 8
     end
 
     test "a singleton fps_band [5, 5] admits sample_fps 5" do
-      assert command!(argv_map("sample-fps-singleton")) == [
-               "./p",
-               "--model",
-               @stub_onnx,
-               "--sample-fps",
-               "5"
-             ]
+      assert sample_fps!("sample-fps-singleton") == 5
     end
 
     test "sample_fps above its declared fps_band is a config error" do
@@ -1678,14 +1468,6 @@ defmodule Cairn.ConfigTest do
                errors,
                &(&1 =~ "sample_fps must be an integer between 1 and 30, got 2.5")
              )
-    end
-
-    test "an operator --sample-fps collides with the profile's own (D-P4)" do
-      map = argv_map("sample-fps", %{"command" => "./p --sample-fps 6"})
-
-      assert {:error, errors} = Config.from_map(map)
-      assert Enum.any?(errors, &(&1 =~ "plugin det: command carries --sample-fps"))
-      assert Enum.any?(errors, &(&1 =~ "which profile sample-fps owns"))
     end
   end
 

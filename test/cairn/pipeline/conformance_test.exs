@@ -1,14 +1,17 @@
 defmodule Cairn.Pipeline.ConformanceTest do
   @moduledoc """
-  End-to-end interface-conformance tests for the membrane camera pipeline: they
-  prove that a membrane-fed `Cairn.RingBuffer`/`Cairn.RTPHub` upholds the same
-  downstream contracts the classic ffmpeg-stdout path does, driven through the
-  real `Cairn.FFmpegPort` with a fake ffmpeg streaming a fixture to stdout.
+  End-to-end interface-conformance tests for the camera pipeline: they prove
+  that the pipeline-fed `Cairn.RingBuffer`/`Cairn.RTPHub` upholds the
+  downstream contracts the deleted ffmpeg-stdout path established, driven
+  through the real `Cairn.FFmpegPort` with a fake ffmpeg streaming a fixture
+  to stdout.
 
-  The classic path streams `testsrc*.fmp4`; the membrane path streams the same
-  source re-containered as MPEG-TS (`testsrc*.ts`, `-c copy`). Equivalence is
-  asserted on the fields consumers key on, never on bytes — the two segmenters
-  differ (classic 1 s fragments at timescale 10240, the CMAF muxer 2 s at 30720).
+  The reference is recorded, not run: `testsrc*.fmp4` is the old path's own
+  ffmpeg output, replayed through the pure `Cairn.MP4.Demuxer` it consumed
+  it with; the live path streams the same source re-containered as MPEG-TS
+  (`testsrc*.ts`, `-c copy`). Equivalence is asserted on the fields
+  consumers key on, never on bytes — the two segmenters differ (reference
+  1 s fragments at timescale 10240, the CMAF muxer 2 s at 30720).
   """
 
   use Cairn.DataCase, async: false
@@ -70,22 +73,23 @@ defmodule Cairn.Pipeline.ConformanceTest do
   @detect_bbox [0.1, 0.1, 0.2, 0.4]
   @detect_policy %{pre: 5, post: 10, max: 300, max_unseen_ms: 3_000, max_live_tracks: 128}
 
-  describe "interface #3: golden fragment shape (classic vs membrane, one source)" do
+  describe "interface #3: golden fragment shape (recorded reference vs pipeline)" do
     test "the two segmenters agree on every field a consumer keys on" do
-      classic = uid("classic")
       membrane = uid("membrane")
 
-      start_ring(classic)
       start_ring(membrane)
       start_hub(membrane)
 
-      start_port(classic_camera(classic), "#{@fake} #{@fmp4_long} 600 0")
-      start_port(membrane_camera(membrane), "#{@fake} #{@ts_long} 600 0")
+      # The reference side is the recorded fmp4 fixture — the deleted path's
+      # own ffmpeg stdout — through the pure demuxer that path consumed it
+      # with. No process needed: any chunking yields the same events.
+      {_demuxer, ref_events} = Demuxer.push(Demuxer.new("reference"), File.read!(@fmp4_long))
+      assert [{:init, %{data: c_init, codec: c_codec}} | ref_rest] = ref_events
+      c_frags = for {:fragment, frag} <- ref_rest, do: frag
 
-      assert_receive {:status, ^classic, :running}, 10_000
+      start_port(camera(membrane), "#{@fake} #{@ts_long} 600 0")
       assert_receive {:status, ^membrane, :running}, 10_000
 
-      %{init: c_init, codec: c_codec, fragments: c_frags} = collect_stable(classic, 3)
       %{init: m_init, codec: m_codec, fragments: m_frags} = collect_stable(membrane, 3)
 
       # both inits are valid ftyp+moov binaries
@@ -133,7 +137,8 @@ defmodule Cairn.Pipeline.ConformanceTest do
       assert hd(c_frags).keyframe?
       assert hd(m_frags).keyframe?
 
-      # ring re-stamps a fresh 0-based contiguous seq in both
+      # a fresh 0-based contiguous seq on both sides: the demuxer's own
+      # stamping on the reference, the ring's re-stamp on the live path
       for frags <- [c_frags, m_frags] do
         assert Enum.map(frags, & &1.seq) == Enum.to_list(0..(length(frags) - 1))
       end
@@ -147,7 +152,7 @@ defmodule Cairn.Pipeline.ConformanceTest do
 
       start_ring(id)
       start_hub(id)
-      start_port(membrane_camera(id), "#{@fake} #{@ts} 600 0")
+      start_port(camera(id), "#{@fake} #{@ts} 600 0")
       assert_receive {:status, ^id, :running}, 10_000
 
       # Everything the membrane ring has buffered before the event opens is the
@@ -156,7 +161,7 @@ defmodule Cairn.Pipeline.ConformanceTest do
       %{fragments: pre} = collect_stable(id, 2)
       pre_pts = Enum.map(pre, & &1.pts)
 
-      cam = membrane_camera(id)
+      cam = camera(id)
       event = new_event(cam)
 
       pid =
@@ -194,7 +199,7 @@ defmodule Cairn.Pipeline.ConformanceTest do
       start_hub(id)
       # subscribe before the port so no packet of the short media window is missed
       Phoenix.PubSub.subscribe(Cairn.PubSub, RTPHub.topic(id))
-      start_port(membrane_camera(id), "#{@fake} #{@ts} 600 0")
+      start_port(camera(id), "#{@fake} #{@ts} 600 0")
 
       assert_receive {:rtp, %ExRTP.Packet{payload_type: 96}}, 10_000
 
@@ -210,7 +215,7 @@ defmodule Cairn.Pipeline.ConformanceTest do
 
       start_ring(id)
       start_hub(id)
-      start_port(membrane_camera(id), "#{@fake} #{@ts} 600 0")
+      start_port(camera(id), "#{@fake} #{@ts} 600 0")
       assert_receive {:status, ^id, :running}, 10_000
 
       %{fragments: frags} = collect_stable(id, 2)
@@ -232,47 +237,39 @@ defmodule Cairn.Pipeline.ConformanceTest do
     end
   end
 
-  describe "interface #5: camera-status lifecycle tuples (classic vs membrane)" do
-    test "the membrane path publishes the same status tuple shape on cameras:status" do
+  describe "interface #5: camera-status lifecycle tuples on cameras:status" do
+    test "the pipeline path publishes the status tuple shape consumers key on" do
       # The plan's interface #5 conflates two topics. *Camera* status/lifecycle
       # flows on `CameraStatus`'s "cameras:status" topic (the dashboard/HA
       # reader); tracker/event lifecycle rides "events" and is asserted in the
-      # describe below. `set_status` is path-agnostic, so a membrane camera must
-      # publish an identically-shaped tuple to a classic one.
-      classic = uid("cstatus")
+      # describe below. The expected key set is the golden here — it was
+      # proven equal to the classic path's before that path was deleted.
       membrane = uid("mstatus")
 
       CameraStatus.subscribe()
 
-      start_ring(classic)
       start_ring(membrane)
       start_hub(membrane)
 
       # no status_fun override, so the real CameraStatus path runs
-      start_status_port(classic_camera(classic), "#{@fake} #{@fmp4_long} 600 0")
-      start_status_port(membrane_camera(membrane), "#{@fake} #{@ts_long} 600 0")
+      start_status_port(camera(membrane), "#{@fake} #{@ts_long} 600 0")
 
-      c_info = assert_status_running(classic)
       m_info = assert_status_running(membrane)
 
-      # same map shape (documented in Cairn.CameraStatus: status + probe +
-      # plugin_status), status the same lifecycle atom
-      assert Enum.sort(Map.keys(m_info)) == Enum.sort(Map.keys(c_info))
+      # the literal map shape (documented in Cairn.CameraStatus: status +
+      # probe + plugin_status), status the lifecycle atom
+      assert Enum.sort(Map.keys(m_info)) == [:plugin_status, :probe, :status]
       assert m_info.status == :running
-      assert Map.has_key?(m_info, :probe)
-      assert Map.has_key?(m_info, :plugin_status)
     end
   end
 
-  describe "interface #5: tracker/event lifecycle tuples on \"events\" (classic vs membrane)" do
-    # Deferred from phase 1, whose detect branch was a stub: nothing on the
-    # membrane path reached a tracker, so there was no second producer to compare.
-    # Phase 3 wired it, and both producers now meet at `Cairn.Detect.Dispatch`.
-    #
+  describe "interface #5: tracker/event lifecycle tuples on \"events\" (wire reference vs pipeline)" do
     # "Same situation" is one person detection at one pts with one `observed_at`,
-    # built by each producer's own code — `PluginProtocol.decode_line/2` plus the
-    # port's `ObservationClock` stamp on one side, the real `Inference`/`DetectSink` pair over a
-    # stubbed NIF on the other — and delivered to a real `CameraTracker` each.
+    # built two ways: `PluginProtocol.decode_line/2` over a literal wire line
+    # plus the `ObservationClock` stamp — the retired plugin ports' own
+    # construction, kept as the recorded-wire reference — and the real
+    # `Inference`/`DetectSink` pair over a stubbed NIF. Each is delivered to a
+    # real `CameraTracker`; both meet at `Cairn.Detect.Dispatch`.
     test "the same detection yields identical event and track broadcasts" do
       classic_id = uid("evclassic")
       membrane_id = uid("evmembrane")
@@ -349,7 +346,7 @@ defmodule Cairn.Pipeline.ConformanceTest do
       start_hub(id)
       # streams, runs ~2 s (long enough for the pipeline to emit its init), then
       # exits non-zero — a lost decode session, same as a dead camera
-      start_port(membrane_camera(id), "#{@fake} #{@ts} 2 42")
+      start_port(camera(id), "#{@fake} #{@ts} 2 42")
 
       assert_receive {:stream_epoch, ^id, first, :started}, 10_000
       assert_receive {:stream_epoch, ^id, second, :source_lost}, 15_000
@@ -388,8 +385,8 @@ defmodule Cairn.Pipeline.ConformanceTest do
     )
   end
 
-  # The plugin path's own construction: the wire line, decoded and stamped
-  # exactly as `Cairn.PluginGroupPort` does before it calls the seam.
+  # The wire reference's construction: the line decoded and stamped exactly
+  # as the retired plugin ports did before they called the seam.
   defp forward_classic(tracker, camera_id) do
     {:objects, observation} = PluginProtocol.decode_line(plugin_line(camera_id), :group)
 
@@ -539,21 +536,12 @@ defmodule Cairn.Pipeline.ConformanceTest do
     }
   end
 
-  defp classic_camera(id), do: %Camera{id: id, rtsp_url: "rtsp://127.0.0.1:554/x"}
-
-  defp membrane_camera(id),
-    do: %Camera{id: id, rtsp_url: "rtsp://127.0.0.1:554/x", pipeline: :membrane}
+  defp camera(id), do: %Camera{id: id, rtsp_url: "rtsp://127.0.0.1:554/x"}
 
   # data_dir only matters to the EventExtractor here; the ports run a fake ffmpeg
-  # via `command:`, so no argv, log path or UDP port is ever derived from it.
+  # via `command:`, so no argv or log path is ever derived from it.
   defp config(dir) do
-    %Config{
-      data_dir: dir,
-      udp_base_port: 19_700,
-      udp_port_range: 10,
-      stall_seconds: 30,
-      remux_clips: false
-    }
+    %Config{data_dir: dir, stall_seconds: 30, remux_clips: false}
   end
 
   defp tmp_dir do
@@ -568,7 +556,7 @@ defmodule Cairn.Pipeline.ConformanceTest do
   end
 
   defp start_hub(id) do
-    start_supervised!({RTPHub, camera_id: id, port: nil}, id: {:hub, id})
+    start_supervised!({RTPHub, camera_id: id}, id: {:hub, id})
   end
 
   defp start_port(cam, command) do
@@ -578,7 +566,6 @@ defmodule Cairn.Pipeline.ConformanceTest do
       {FFmpegPort,
        camera: cam,
        config: config("tmp/conf_ports"),
-       index: 0,
        command: command,
        backoff_min_ms: 50,
        backoff_max_ms: 200,
@@ -595,7 +582,6 @@ defmodule Cairn.Pipeline.ConformanceTest do
       {FFmpegPort,
        camera: cam,
        config: config("tmp/conf_ports"),
-       index: 0,
        command: command,
        backoff_min_ms: 50,
        backoff_max_ms: 200,

@@ -2,41 +2,44 @@
 
 [![CI](https://github.com/bbangert/cairn-nvr/actions/workflows/ci.yml/badge.svg)](https://github.com/bbangert/cairn-nvr/actions/workflows/ci.yml)
 
-An **event-clip NVR**: cameras stream in over RTSP, an inference plugin
-detects objects, and Cairn records **one mp4 clip per event** — with
-pre-roll — indexes it in SQLite, and gives you a LiveView UI to watch
-live and browse events. No continuous recording, no cloud, no accounts.
+An **event-clip NVR**: cameras stream in over RTSP, an in-process
+detection engine finds objects, and Cairn records **one mp4 clip per
+event** — with pre-roll — indexes it in SQLite, and gives you a LiveView
+UI to watch live and browse events. No continuous recording, no cloud,
+no accounts.
 
 Built for the Home Assistant-adjacent homelab niche: small (Elixir/OTP +
-ffmpeg + your plugin), event-first (clips are first-class files on disk,
+ffmpeg + one Rust NIF), event-first (clips are first-class files on disk,
 `{event_id}_{camera}_{timestamp}.mp4` — the index can always be rebuilt
 from the filenames), and honest about scope (if you want 24/7 recording
 or a giant model zoo, use Frigate — see `docs/frigate_comparison.md`).
 
 ## How it works
 
-Per camera, one supervised ffmpeg does RTSP in → three codec-copy
-outputs: fragmented mp4 to Cairn (live view + in-memory pre-roll ring),
-RTP to your inference plugin, RTP to the WebRTC hub. The plugin prints
-ndjson detections; the aggregator opens an event, an extractor streams
-the pre-roll + live fragments to a single mp4, and post-window quiet
-closes it. Details in `docs/architecture.md`.
+Per camera, one supervised ingest session (ffmpeg as a dumb RTSP→MPEG-TS
+bridge, or a native RTSP client with `ingest: rtsp`) feeds a Membrane
+pipeline that fans the compressed video out three ways in-process:
+CMAF fragments to the pre-roll ring (live view + recording), RTP to the
+WebRTC hub, and encoded access units to the detect branch, which decodes
+and infers in the node's own engine (`cairn-native`, a Rust NIF on dirty
+schedulers). The tracker opens an event, an extractor streams the
+pre-roll + live fragments to a single mp4, and post-window quiet closes
+it. Details in `docs/architecture.md`.
 
 - **Live view**: MSE over a Phoenix channel (default), HLS fallback,
   WebRTC for sub-second latency.
-- **Plugins**: any language — H.264 RTP in, ndjson out, stream lifecycle
-  back on stdin. One process per camera, or one shared "group" process
-  serving several cameras when the accelerator can only be held by one
-  process. The wire protocol is [`docs/plugin-contract.md`](docs/plugin-contract.md);
-  `plugins/cairn-detect` (Rust, hardware decode, ONNX) is the reference
-  implementation and a mock plugin ships in-tree for tests.
+- **Detection**: in the VM — `plugins/cairn-detect` (hardware decode,
+  ONNX Runtime, optional QNN on Qualcomm NPUs) linked as a NIF. New
+  models are a hardware-profile edit, not code. The retired external
+  plugin protocol is archived at
+  [`docs/archive/plugin-contract.md`](docs/archive/plugin-contract.md).
 - **Hardware profiles**: one YAML file per board naming the model, the
   family, the inference backend, the expected fps band and the tracker
   stages that go with it. A plugin group names its profile and config load
-  expands it into both the plugin's argv and the host's tracking policy, so
-  the two halves cannot disagree. Four ship in `priv/profiles/`; writing one
-  for a new board needs no code change — see
-  [`docs/profile-authoring.md`](docs/profile-authoring.md).
+  expands it into the engine's model config and the host's tracking
+  policy, so the two halves cannot disagree. Four ship in
+  `priv/profiles/`; writing one for a new board needs no code change —
+  see [`docs/profile-authoring.md`](docs/profile-authoring.md).
 - **Retention**: per-label day counts, plus emergency cleanup that
   deletes oldest events when disk runs low.
 
@@ -53,12 +56,12 @@ mix phx.server                     # http://localhost:4000
 `config.yml` is the source of truth (path via `CAIRN_CONFIG`); the UI
 renders it read-only and can hot-reload it (`/config` → Reload — added and
 removed cameras are started and stopped; a change that reaches a subprocess
-(`rtsp_url`, `plugin`, `min_score`, `transcode`, `extra_ffmpeg_args`, the
-pre-event window, or anything that shifts its UDP ports — its position in the
-list, or a global `udp.base_port`) restarts that camera, and everything else —
-the `track:` / `record:` tiers, the post/max windows, the tracking bounds,
-retention — is applied to the running camera without cutting its stream or its
-live tracks. Invalid files are rejected with the old config kept).
+or the ring (`rtsp_url`, `plugin`, `min_score`, `ingest`, `transcode`,
+`extra_ffmpeg_args`, the pre-event window) restarts that camera, and
+everything else — the `track:` / `record:` tiers, the post/max windows, the
+tracking bounds, retention — is applied to the running camera without
+cutting its stream or its live tracks. Invalid files are rejected with the
+old config kept).
 
 ## Configuration reference
 
@@ -69,7 +72,6 @@ See `config.example.yml` — every key is documented inline. Summary:
 | `data_dir` | all state: `cairn.db`, `events/`, `snapshots/`, `log/` (env `CAIRN_DATA_DIR` wins) |
 | `stall_seconds` | silent-stream watchdog before ffmpeg is bounced |
 | `free_space_min_mb` | emergency-cleanup threshold |
-| `udp.base_port` / `udp.range` | loopback ports for plugins + WebRTC taps (4 per camera — each RTP port reserves the next for RTCP) |
 | `events.pre/post/max_*_seconds` | clip windows (per-camera overridable) |
 | `tracking.max_unseen_ms` / `tracking.max_live_tracks` / `tracking.stationary_after_ms` | track expiry in stream time (×5 while stationary), per-camera live-track cap, and how long a box must hold still to count as parked (per-camera overridable) |
 | `tracking.bbd` | admit an association pair on the distance between the boxes' centres as well as on overlap, so a track coasting through a gap wider than its own box keeps its identity (default off; no per-camera form; superseded per group by a profile; stationary tracks excluded) |
@@ -79,8 +81,8 @@ See `config.example.yml` — every key is documented inline. Summary:
 | `profile_dirs` | directories of your own hardware profiles, searched after the ones cairn ships (a same-named file of yours wins, with a warning) |
 | `retention.days` / `retention.per_label` | pruning (camera overrides win; multi-label events keep the longest) |
 | `retention.tracks_days` | how long track rows live (default 365; global only, and exempt from emergency cleanup) |
-| `cameras[]` | `id`, `rtsp_url`, `plugin` (argv or multi-word string ⇒ its own process; single token ⇒ a `plugins:` group name), `min_score` per label (the wire floor), `track` / `record` (the two host-side tiers above it: what earns a track row, what earns video), `extra_ffmpeg_args`, `transcode`, `retention` |
-| `plugins` | named plugin groups (`name: {command: ...}`) — one process serving every camera that names it; `profile:` attaches a hardware profile (which then owns the model flags and the tracker's stage list for every camera on the group), `allow_experimental:` consents to a profile whose backend does not execute yet |
+| `cameras[]` | `id`, `rtsp_url`, `plugin` (a `plugins:` group name — absent ⇒ no detection), `ingest` (`ffmpeg` bridge default, `rtsp` native), `min_score` per label (the wire floor), `track` / `record` (the two host-side tiers above it: what earns a track row, what earns video), `extra_ffmpeg_args`, `transcode`, `retention` |
+| `plugins` | named plugin groups (`name: {profile: ...}`) — the hardware profile the in-VM engine loads for every camera naming the group (it owns the model config and the tracker's stage list); `allow_experimental:` consents to a profile whose backend is not proven in soak |
 | `integrations.token` | bearer token that enables the Home Assistant API (see below); absent ⇒ `/api` disabled |
 
 Non-H.264 cameras: Cairn probes each stream and warns. Opt-in
@@ -133,13 +135,15 @@ Erlang from source (one-time).
 
 `mix check` = compile with warnings-as-errors, format check, credo,
 tests. CI additionally runs `mix dialyzer` and `mix sobelow --skip
---exit --threshold medium`. The full-pipeline integration test (real
-ffmpeg, fixture-loop camera, mock plugin) runs with
-`mix test --include integration`.
+--exit --threshold medium`. Integration tests (real ffmpeg through the
+pipeline) run with `mix test --include integration`; the end-to-end
+suite needs the built NIFs — `mix test --only e2e_membrane`.
 
 Docs: [`docs/architecture.md`](docs/architecture.md) ·
-[`docs/plugin-contract.md`](docs/plugin-contract.md) (plugin wire protocol
-v1) · [`docs/profile-authoring.md`](docs/profile-authoring.md) (hardware
+[`docs/profile-authoring.md`](docs/profile-authoring.md) (hardware
 profiles) · [`docs/ha-api.md`](docs/ha-api.md) ·
+[`docs/archive/plugin-contract.md`](docs/archive/plugin-contract.md)
+(retired external-plugin wire protocol; still the format of the recorded
+captures the parity/golden harnesses replay) ·
 [`docs/design-handoff.md`](docs/design-handoff.md) ·
 [`docs/frigate_comparison.md`](docs/frigate_comparison.md)

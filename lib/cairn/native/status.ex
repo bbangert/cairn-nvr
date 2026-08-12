@@ -1,14 +1,14 @@
 defmodule Cairn.Native.Status do
   @moduledoc """
-  Publishes the native block's health per camera, on the surface a plugin's own
-  health already uses: `Cairn.CameraStatus.set_plugin_status/2`, in
-  `plugin.status`'s vocabulary (`state`, `detail`, `fps`) plus the native-only
-  fields an accelerator has and an external plugin does not.
+  Publishes the native block's health per camera through
+  `Cairn.CameraStatus.set_plugin_status/2`, in the `plugin.status` vocabulary
+  the retired external contract defined (`state`, `detail`, `fps`) plus the
+  native-only fields an accelerator has.
 
-  A membrane camera has no plugin process reporting for it, so nothing else
-  would. It polls rather than being told because the state that matters most has
-  no event to be told by: a wedged accelerator stops the sink demanding and
-  raises nothing (`Cairn.Native.Health`'s moduledoc).
+  The engine has no process of its own reporting per camera, so nothing else
+  would. It polls rather than being told because the state that matters most
+  has no event to be told by: a wedged accelerator stops the sink demanding
+  and raises nothing (`Cairn.Native.Health`'s moduledoc).
 
   `Cairn.Native.Host.status/2` is a call into the process the wedge is inside,
   so it is made under a deadline whose expiry is itself the verdict — the rule
@@ -18,8 +18,7 @@ defmodule Cairn.Native.Status do
   Published for every camera *configured* to detect on this node, not only for
   those with an open stream: a canary refusal, an absent NIF or a failed model
   load leaves no stream open at all, and that is exactly when the surface has
-  something to say. A classic camera has its own plugin reporting for it and is
-  never written here.
+  something to say.
 
   `Cairn.Pipeline.Picker`'s drop counts are *not* on this surface, though a drop
   rate is what saturation looks like from the media side: its `:stats`
@@ -120,7 +119,7 @@ defmodule Cairn.Native.Status do
   # detector.
   defp configured(state) do
     state.config_source.().cameras
-    |> Enum.filter(&(&1.pipeline == :membrane and &1.plugin != nil))
+    |> Enum.filter(&(&1.plugin != nil))
     |> Enum.map(& &1.id)
   end
 

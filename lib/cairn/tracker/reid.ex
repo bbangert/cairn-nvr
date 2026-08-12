@@ -5,7 +5,7 @@ defmodule Cairn.Tracker.Reid do
 
   The wire carries a person detection's feature as raw bytes — a symmetric
   int8 quantization of a unit-norm vector at the fixed scale 127
-  (`docs/plugin-contract.md`). Everything here works in dequantized,
+  (`docs/archive/plugin-contract.md`). Everything here works in dequantized,
   re-normalized float space: cosine is scale-invariant, but the rolling
   average is not, so vectors are normalized once on the way in and the roll
   re-normalizes its result.

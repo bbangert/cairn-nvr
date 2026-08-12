@@ -147,7 +147,7 @@ the connection. Event kinds:
 | `event_clip_ready` / `event_clip_failed` | artifact object (below), with `clip_url` |
 | `event_snapshot_ready` / `event_snapshot_failed` | artifact object (below), with `snapshot_url` |
 | `track_started` / `track_updated` / `track_ended` | track object (below) |
-| `camera_status` | `{camera_id, status, probe, plugin_status}` — `plugin_status` is the detector's own `{state, detail, fps}` ([`plugin.status`](plugin-contract.md#pluginstatus)), `null` until it reports one. A camera detected on by the in-VM native block reports here too, adding `health` (`healthy` / `saturated` / `wedged` / `idle` / `unknown` / `not_applicable`), `stream_health`, `engine`, `nif`, `canary`, `model` (the model file's **name**, never its path), `backend`, `p50_ms` (one model pass, median over the last check window), `cpu_baseline_ms` (the CPU cost of one pass on the same model, measured once at engine init; `null` on a CPU backend, where there is no accelerator to compare against) and `inferences`; those keys never appear on a plugin's status, which is whitelisted to the three above. A camera configured to detect reports here even with no stream open — that is how a refused canary or a failed model load reaches a client |
+| `camera_status` | `{camera_id, status, probe, plugin_status}` — `plugin_status` is the detector's own `{state, detail, fps}` ([`plugin.status`](archive/plugin-contract.md#pluginstatus)), `null` until it reports one. A camera detected on by the in-VM native block reports here too, adding `health` (`healthy` / `saturated` / `wedged` / `idle` / `unknown` / `not_applicable`), `stream_health`, `engine`, `nif`, `canary`, `model` (the model file's **name**, never its path), `backend`, `p50_ms` (one model pass, median over the last check window), `cpu_baseline_ms` (the CPU cost of one pass on the same model, measured once at engine init; `null` on a CPU backend, where there is no accelerator to compare against) and `inferences`; those keys never appear on a plugin's status, which is whitelisted to the three above. A camera configured to detect reports here even with no stream open — that is how a refused canary or a failed model load reaches a client |
 | `camera_control` | `{camera_id, detection_enabled, recording_enabled, min_score}` |
 | `disk_alert` | `{active, free_mb, threshold_mb}` |
 
@@ -232,7 +232,7 @@ A **track** is one physical object followed through time. Cairn assigns the
 identity itself (IoU on the detections); a plugin's own `track_id`s are
 accepted on the wire but ignored. The producing side of this — how identity is
 scoped and what bounds it — is
-[`docs/plugin-contract.md` → Track identity](plugin-contract.md#track-identity).
+[`docs/archive/plugin-contract.md` → Track identity](archive/plugin-contract.md#track-identity).
 
 ```json
 {
@@ -321,7 +321,7 @@ Same schema for all three kinds:
 - `bbox` is `[x, y, w, h]`, normalized 0..1, origin top-left, y increasing
   **downward** — deliberately not ONVIF's centre-origin, y-up frame. The
   conversion and the reasoning are in
-  [`docs/plugin-contract.md` → Geometry](plugin-contract.md#geometry).
+  [`docs/archive/plugin-contract.md` → Geometry](archive/plugin-contract.md#geometry).
 - `source` is `"host"` on every track Cairn mints today, and `plugin_track_id`
   is `null`. Plugin-owned tracking was removed; both fields are kept in the
   frame shape, and `"plugin"` can still be read back out of the track index

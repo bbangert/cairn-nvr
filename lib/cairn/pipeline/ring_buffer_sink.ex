@@ -1,15 +1,17 @@
 defmodule Cairn.Pipeline.RingBufferSink do
   @moduledoc """
   Terminates a `Membrane.MP4.Muxer.CMAF` output track into a camera's
-  `Cairn.RingBuffer`, shaping each segment into the same `Cairn.Fragment` the
-  classic `Cairn.MP4.Demuxer` path produces.
+  `Cairn.RingBuffer`, shaping each segment into the same `Cairn.Fragment`
+  the deleted ffmpeg-stdout path produced through `Cairn.MP4.Demuxer` (the
+  demuxer survives as the reference decoder for recorded fmp4 in tests and
+  tooling).
 
   The bytes differ (a different segmenter), but the fields a consumer keys on do
   not: `data` is `moof`+`mdat` only (styp/sidx stripped, as the demuxer drops
   them), `pts` is the track-timescale `tfdt` time, `codec` is the demuxer's
   RFC 6381 shape, and `keyframe?` means "first sample is a sync sample".
-  Matching those is what lets the Membrane pipeline stand in for the
-  ffmpeg-stdout one with no viewer- or extractor-visible change.
+  Holding that shape is what keeps every fragment consumer
+  producer-agnostic.
   """
 
   use Membrane.Sink

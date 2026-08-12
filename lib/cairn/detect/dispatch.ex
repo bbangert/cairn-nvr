@@ -1,13 +1,11 @@
 defmodule Cairn.Detect.Dispatch do
   @moduledoc """
-  The one hop from a detection producer to a camera's tracker.
+  The one hop from the detection producer to a camera's tracker.
 
-  Two producers reach it: `Cairn.PluginPort` / `Cairn.PluginGroupPort` for an
-  external plugin's ndjson lines, `Cairn.Pipeline.DetectSink` for the in-VM NIF's
-  frames. Each resolves `Cairn.Config.policy/2` off the per-frame path — at init
-  and on refresh — and hands the result through here unmodified, so
-  `Cairn.CameraTracker` never calls the config server per frame and both
-  producers deliver the same pair.
+  `Cairn.Pipeline.DetectSink` reaches it with the in-VM NIF's frames,
+  resolving `Cairn.Config.policy/2` off the per-frame path — at session
+  start and on refresh — and handing the result through here unmodified, so
+  `Cairn.CameraTracker` never calls the config server per frame.
 
   Plain functions in the caller's process, deliberately not a process of its
   own. The sink calls this between blocking `Cairn.Native.Host.push_frame/5` calls;
@@ -22,10 +20,10 @@ defmodule Cairn.Detect.Dispatch do
   @doc """
   One observation to `camera`'s tracker, carrying `policy`.
 
-  Tier-surface's tier-1/tier-2 fork belongs here: this is the only call both
-  producers make, so the fork stays one site rather than one per producer.
+  Tier-surface's tier-1/tier-2 fork belongs here: this is the one call every
+  producer makes, so the fork stays one site rather than one per producer.
 
-  `opts[:tracker]` is the producers' injection seam — a process that receives
+  `opts[:tracker]` is the producer's injection seam — a process that receives
   the same `{:detections, …}` cast in place of the camera's own tracker. Absent
   (production) the batch goes to that camera's tracker, started on the first
   batch if it is not running yet.

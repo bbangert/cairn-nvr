@@ -4,11 +4,8 @@ A **profile** is one YAML file that names, in one place, everything about how
 a piece of hardware runs detection: which model artifact, which family, which
 inference runtime, what frame rate to expect, and which tracker stages to run
 behind it. A plugin group names its profile; config load expands that one file
-into *both* halves of the boundary — the model half and the host's tracker
-stage list — so the two cannot disagree with each other. The model half is
-rendered where that camera's detection runs: as argv for a `cairn-detect`
-process, or as the in-VM engine's config for a `pipeline: membrane` camera,
-from one expansion either way.
+into *both* halves of the boundary — the in-VM engine's model config and the
+host's tracker stage list — so the two cannot disagree with each other.
 
 A profile is **data composing curated code**. Every field names something that
 already exists: a family the Rust catalog ships, a backend the plugin can
@@ -38,8 +35,9 @@ profile_dirs:
 
 plugins:
   detect:
-    command: plugins/cairn-detect/target/release/cairn-detect
-    # The profile's filename, without .yml.
+    # The profile's filename, without .yml. A group is nothing but this
+    # reference and your consent flags — the external-plugin `command:` form
+    # died with membrane port phase 6.
     profile: rk3566-lowfps
     # Required to run a profile whose backend is not `ort`: only `ort`
     # executes today, and the other two names exist so a board profile can be
@@ -55,13 +53,6 @@ cameras:
     # profile themselves.
     plugin: detect
 ```
-
-The group's `command:` keeps everything that describes *your* deployment — the
-binary's path, `--motion-json`, `--track-floor-json` — and loses everything
-that describes the model. A profiled group whose command already carries
-`--model`, `--model-profile`, `--input-size`, `--decoder`, `--labels` or
-`--sample-fps` fails the load: those six come from the profile alone, so that
-there is never a question of which answer won.
 
 ## The schema
 
@@ -123,10 +114,9 @@ run this fast". `decoder:` is the **video** path — how H.264 frames get
 decoded. `backend:` is the **inference** path — what executes the model.
 Naming a hardware video decoder says nothing about where the model runs.
 
-Naming one is a **requirement** on a `pipeline: membrane` camera: if the device
-or the hwaccel is missing, the decoder refuses to open and the camera's detect
-branch goes dark with the reason on `cameras:status`, while recording carries
-on. Write `decoder: auto` — the default — to mean "the best available, software
+Naming one is a **requirement**: if the device or the hwaccel is missing, the
+decoder refuses to open and the camera's detect branch goes dark with the
+reason on `cameras:status`, while recording carries on. Write `decoder: auto` — the default — to mean "the best available, software
 if that is all there is". The distinction is worth the refusal on a board: on
 QCS6490 the ASIC decodes the whole fleet for about 2% CPU where software decode
 costs several times that per camera — decode is the term this knob controls;
@@ -213,11 +203,12 @@ camera's own override outranks its group's profile, and the profile's
 band-tuned value outranks the global default. They are validated against the
 same ranges the global keys are.
 
-Two flags stay outside profiles on purpose (D-P6): `--motion-json` and
-`--track-floor-json` describe the *scene* rather than the model, so they remain
-your own argv in the group's `command:`. This matters for `bbd`, whose measured
-win is a composition with the track floor — with the floor off it bought
-nothing at all, because an expired track has no row left to admit against.
+Two knobs stay outside profiles on purpose (D-P6): the motion-zone and
+track-floor scene config describe the *scene* rather than the model, so they
+are per-stream operator config, never a profile's. This matters for `bbd`,
+whose measured win is a composition with the track floor — with the floor off
+it bought nothing at all, because an expired track has no row left to admit
+against.
 
 ## The capability table, and what it refuses
 
@@ -308,17 +299,13 @@ And the ones about attaching it, which name the plugin group instead:
 ```
 plugin detect: unknown profile "rk3566" — no such file in priv/profiles or any
   profile_dirs entry
-plugin detect: command carries --input-size, which profile my-board owns — a
-  profiled group's model flags (--model, --model-profile, --input-size,
-  --decoder, --labels, --sample-fps) come from its profile alone; drop
-  --input-size from command:
 plugin detect: profile my-board uses backend rknn, which is experimental
   — only ort is proven in soak, and a profile naming another backend must
   declare experimental: true
 plugin detect: profile my-board uses backend rknn, which is experimental
   — set allow_experimental: true on this plugin group to run it anyway
 plugin detect: profile my-board names no model.rknn artifact for its rknn
-  backend — a profiled group takes --model from its profile alone
+  backend — the engine takes its model from the profile alone
 ```
 
 Two warnings, which do not fail the load:
@@ -396,8 +383,7 @@ To migrate a fleet that runs `tracking.bbd: true` / `oru: true` today:
 2. Add `bbd: true` and `oru: true` to its `tracking:` block — the shipped
    `generic-ort` deliberately lists neither, since it is the profile that
    changes nothing on adoption.
-3. Name it from the group (`profile: my-fleet`) and drop the model flags out
-   of that group's `command:`; keep `--motion-json` / `--track-floor-json`.
+3. Name it from the group (`profile: my-fleet`).
 4. Reload. Check the warnings: if you left the global booleans set you will be
    told, per group, that the profile won.
 

@@ -9,10 +9,9 @@ defmodule Cairn.ObservationClock do
   anchored to the second: media time carries the *spacing* between frames, and
   the host clock carries the *bound*.
 
-  One of these per camera, held by whatever ingests that camera's detections
-  — `Cairn.PluginPort` (or one per member in `Cairn.PluginGroupPort`) for an
-  external plugin, `Cairn.Native.Host` for the in-VM NIF — and `reset/1` with
-  the producer whose pts continues nothing, though tracking time does.
+  One of these per camera, held by what ingests that camera's detections —
+  `Cairn.Native.Host`, per stream — and `reset/1` with the producer whose
+  pts continues nothing, though tracking time does.
 
   ## The clamp
 

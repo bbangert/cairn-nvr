@@ -3,7 +3,7 @@
 Cairn's reference detection plugin: a single Rust binary that takes H.264 RTP
 on a UDP port — or on several at once, serving a whole plugin group from one
 process — and speaks the plugin contract's protocol v1 on stdout and stdin
-(see `docs/plugin-contract.md`). It decodes on the video ASIC when one is
+(see `docs/archive/plugin-contract.md`). It decodes on the video ASIC when one is
 available, samples to a configurable rate (`--sample-fps`, default 5), and
 runs an object-detection model on the CPU
 through onnxruntime. The two documented defaults are **YOLOX-Nano** and
@@ -333,7 +333,7 @@ member.
 Nothing on the wire marks a sub-floor box, and nothing needs to: the host
 applies the same floors to the same scores, and what it does with the ones
 below is [its own two-stage
-association](../../docs/plugin-contract.md#argv) — a low-confidence box may
+association](../../docs/archive/plugin-contract.md#argv) — a low-confidence box may
 take a live track that this frame's confident boxes did not, and it may never
 mint a new one.
 

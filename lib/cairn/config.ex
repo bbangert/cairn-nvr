@@ -4,10 +4,11 @@ defmodule Cairn.Config do
 
   `load/1` parses and validates the file, returning `{:ok, config, warnings}`
   or `{:error, errors}`. Validation is strict on errors (bad values, missing
-  required fields, UDP port exhaustion) and lenient on unknown keys, which
-  only produce warnings. One deliberate exception: an unknown key *inside* a
-  `track:` / `record:` tier rule is an error, because a filter this codebase
-  does not implement yet must not look applied (`Cairn.Config.Camera`).
+  required fields) and lenient on unknown keys, which only produce warnings —
+  which is also how a pre-phase-6 config's `udp:` block ages out. One
+  deliberate exception: an unknown key *inside* a `track:` / `record:` tier
+  rule is an error, because a filter this codebase does not implement yet
+  must not look applied (`Cairn.Config.Camera`).
 
   `CAIRN_DATA_DIR` (env) overrides `data_dir` from the file.
   """
@@ -16,9 +17,8 @@ defmodule Cairn.Config do
   alias Cairn.Config.PluginGroup
   alias Cairn.Config.Profile
 
-  @known_keys ~w(data_dir stall_seconds free_space_min_mb remux_clips udp events retention cameras
+  @known_keys ~w(data_dir stall_seconds free_space_min_mb remux_clips events retention cameras
                  plugins integrations tracking profile_dirs)
-  @known_udp_keys ~w(base_port range)
   @known_events_keys ~w(pre_window_seconds post_window_seconds max_event_seconds)
   @known_retention_keys ~w(days per_label tracks_days)
   @known_integrations_keys ~w(token)
@@ -107,8 +107,6 @@ defmodule Cairn.Config do
             stall_seconds: 15,
             free_space_min_mb: 1024,
             remux_clips: true,
-            udp_base_port: nil,
-            udp_port_range: nil,
             pre_window_seconds: 5,
             post_window_seconds: 10,
             max_event_seconds: 300,
@@ -187,7 +185,6 @@ defmodule Cairn.Config do
   def from_map(map) do
     acc = %{errors: [], warnings: []}
     acc = warn_unknown(acc, map, @known_keys, "config")
-    acc = warn_unknown(acc, Map.get(map, "udp"), @known_udp_keys, "udp")
     acc = warn_unknown(acc, Map.get(map, "events"), @known_events_keys, "events")
     acc = warn_unknown(acc, Map.get(map, "retention"), @known_retention_keys, "retention")
 
@@ -205,8 +202,6 @@ defmodule Cairn.Config do
       stall_seconds: Map.get(map, "stall_seconds", 15),
       free_space_min_mb: Map.get(map, "free_space_min_mb", 1024),
       remux_clips: Map.get(map, "remux_clips", true),
-      udp_base_port: get_in(map, ["udp", "base_port"]),
-      udp_port_range: get_in(map, ["udp", "range"]),
       pre_window_seconds: get_in(map, ["events", "pre_window_seconds"]) || 5,
       post_window_seconds: get_in(map, ["events", "post_window_seconds"]) || 10,
       max_event_seconds: get_in(map, ["events", "max_event_seconds"]) || 300,
@@ -228,7 +223,7 @@ defmodule Cairn.Config do
 
     {config, acc} = resolve_plugins(config, acc, declared_plugin_names(map))
     {config, acc} = resolve_profiles(config, acc)
-    {config, acc} = expand_profiles(config, acc)
+    acc = check_group_profiles(config, acc)
     acc = validate(config, acc)
 
     case acc.errors do
@@ -312,15 +307,12 @@ defmodule Cairn.Config do
   Everything the detection pipeline needs for a camera in one map: the event
   windows, the tracking settings, and the two host-side threshold tiers.
 
-  The plugin ports resolve it off the per-frame path — at init and again on
-  each `refresh/3` — and hand the result to `Cairn.CameraTracker` with
-  every observation, so no camera tracker calls the config server per
-  frame. Every producer — `Cairn.PluginPort`, `Cairn.PluginGroupPort`, and
-  the membrane branch's `Cairn.Pipeline.DetectSink` — takes its whole policy
-  from this function and hands it to `Cairn.Detect.Dispatch` unmodified, so
-  a key added here reaches `Cairn.CameraTracker` whichever produced it. A
-  *running* camera gets a changed policy only through those producers'
-  refreshes.
+  `Cairn.FFmpegPort` resolves it off the per-frame path — at each session
+  start and again on each `refresh/3` — and the pipeline's
+  `Cairn.Pipeline.DetectSink` hands the result to `Cairn.Detect.Dispatch`
+  with every observation unmodified, so no camera tracker calls the config
+  server per frame and a key added here reaches `Cairn.CameraTracker`. A
+  *running* camera gets a changed policy only through that refresh.
 
   `:track` and `:record` are the camera's parsed tiers verbatim, `nil` when
   the block is absent. Resolve a label against one with `tier_threshold/3`
@@ -544,9 +536,7 @@ defmodule Cairn.Config do
     {cameras, acc} =
       Enum.map_reduce(config.cameras, acc, &resolve_camera_plugin(&1, &2, names, declared))
 
-    config = %{config | cameras: cameras}
-
-    {%{config | plugin_groups: resolve_members(config)}, acc}
+    {%{config | cameras: cameras}, acc}
   end
 
   # Names present in the raw plugins: map, including entries whose own parse
@@ -571,8 +561,7 @@ defmodule Cairn.Config do
         {%{cam | plugin: nil},
          add_error(
            acc,
-           "camera #{cam.id}: unknown plugin #{inspect(name)} — define it under plugins: " <>
-             "or write an inline command as a list"
+           "camera #{cam.id}: unknown plugin #{inspect(name)} — define it under plugins:"
          )}
     end
   end
@@ -652,26 +641,25 @@ defmodule Cairn.Config do
 
   @doc """
   The model this node's in-VM engine should load, in
-  `Cairn.Native.Config.normalize/1`'s vocabulary, or `nil` when no membrane
-  camera names a profile.
+  `Cairn.Native.Config.normalize/1`'s vocabulary, or `nil` when no camera
+  names a profile.
 
-  Membrane cameras detect in `Cairn.Native.Host`, one engine and one model for
-  the whole VM, so several membrane cameras asking for different models is a
-  config nothing can satisfy — refused at load, where an operator reads
+  Cameras detect in `Cairn.Native.Host`, one engine and one model for the
+  whole VM, so several cameras asking for different models is a config
+  nothing can satisfy — refused at load, where an operator reads
   diagnostics, rather than at the first camera to lose its detector.
 
-  Scene config is not here: `min_score` and the `--motion-json` /
-  `--track-floor-json` equivalents are the operator's per-stream knobs
+  Scene config is not here: `min_score` and the motion/track-floor scene
+  knobs are the operator's per-stream params
   (`Cairn.Native.Config.stream_params/1`) and a profile never writes them
   (D-P6).
   """
   @spec native_model_config(t()) :: {:ok, map() | nil} | {:error, String.t()}
   def native_model_config(%__MODULE__{} = config) do
     config.cameras
-    |> Enum.filter(&(&1.pipeline == :membrane))
     |> Enum.map(&profile_for(config, &1))
-    # What a load lets through here is a membrane camera with no plugin at all:
-    # `validate_membrane_profiles/2` refuses every other unprofiled one.
+    # What a load lets through here is a camera with no plugin at all:
+    # `validate_camera_profiles/2` refuses every other unprofiled one.
     |> Enum.reject(&is_nil/1)
     |> Enum.uniq_by(&Profile.native_config/1)
     |> case do
@@ -684,80 +672,28 @@ defmodule Cairn.Config do
   defp disagreeing_profiles(profiles) do
     names = profiles |> Enum.map(&(&1.name || "(unnamed)")) |> Enum.sort() |> Enum.join(", ")
 
-    "membrane cameras run on profiles that ask for different models (#{names}) — this node " <>
-      "loads one model for every membrane camera, so their plugin groups must agree"
+    "cameras run on profiles that ask for different models (#{names}) — this node " <>
+      "loads one model for every camera, so their plugin groups must agree"
   end
 
-  # -- profile argv expansion -------------------------------------------------
+  # -- group profile checks -----------------------------------------------
 
-  # The six flags a profile owns for its group, and the only argv
-  # `Cairn.Config` ever writes. Read off `Cairn.Config.Profile`'s own field
-  # table rather than repeated here, so this check and the expansion below
-  # cannot come to disagree about what the profile owns.
-  @model_flags Profile.model_flags()
-
-  # One compiled word-boundary regex per flag, built once rather than per
-  # `flag?/2` call: a flag counts as present at token-start or after
-  # whitespace or a shell quote, followed by `=`, whitespace, a shell quote,
-  # or end-of-token — so `--model` matches inside
-  # `"exec cairn-detect --model x"` and its quoted form
-  # `"exec cairn-detect '--model' x"` (sh strips the quotes before the
-  # plugin sees the flag) but not `--model-profile` or a path like
-  # `/opt/--model/x`.
-  @model_flag_regexes Map.new(@model_flags, fn flag ->
-                        {flag,
-                         Regex.compile!("(^|[\\s\"'])" <> Regex.escape(flag) <> "(=|[\\s\"']|$)")}
-                      end)
-
-  # Where a profile stops being data and becomes the plugin's argv. Expanding
-  # into `group.command` at load — rather than teaching
-  # `Cairn.PluginGroupPort.build_argv/1` to read a profile — is what keeps the
-  # port and the process it owns profile-unaware, and it is what makes a
-  # profile edit reach the plugin at all: the group's restart trigger is a
-  # changed struct (`Cairn.Config.Server.diff_plugin_groups/2`), so the flags
-  # have to be *in* the struct.
-  defp expand_profiles(config, acc) do
-    {groups, acc} = Enum.map_reduce(config.plugin_groups, acc, &expand_group/2)
-
-    {%{config | plugin_groups: groups}, acc}
+  # What survives of the profile→argv expansion the external plugin path
+  # used: the profile a group names is what the in-VM engine will load, so
+  # its backend gate, artifact and labels paths are still checked at load,
+  # where an operator reads diagnostics.
+  defp check_group_profiles(config, acc) do
+    Enum.reduce(config.plugin_groups, acc, &check_group_profile/2)
   end
 
-  defp expand_group(%PluginGroup{profile: %Profile{} = profile} = group, acc) do
-    acc =
-      acc
-      |> check_single_source(group, profile)
-      |> check_backend_implemented(group, profile)
-      |> check_artifact(group, profile)
-      |> check_labels(profile)
-
-    {%{group | command: group.command ++ Profile.model_argv(profile)}, acc}
+  defp check_group_profile(%PluginGroup{profile: %Profile{} = profile} = group, acc) do
+    acc
+    |> check_backend_implemented(group, profile)
+    |> check_artifact(group, profile)
+    |> check_labels(profile)
   end
 
-  defp expand_group(group, acc), do: {group, acc}
-
-  # D-P4: cross-boundary consistency by construction. Elixir expands the model
-  # half (this argv, and the in-VM engine's config for a membrane camera) and
-  # the tracker's stage list from one file, which is only true for as long as
-  # nothing else writes the model argv — so an operator flag
-  # naming any of the six is an error, not a silent race between two answers
-  # settled by whatever clap does with a repeated flag. `flag?/2` counts an
-  # occurrence anywhere inside a token, not just a whole token, so an operator
-  # shell-wrapping the command (`["/bin/sh", "-c", "exec plugin --model x"]`)
-  # cannot smuggle a model flag past this check and silently drop the
-  # profile's own.
-  defp check_single_source(acc, group, profile) do
-    Enum.reduce(@model_flags, acc, fn flag, acc ->
-      check(
-        acc,
-        not Enum.any?(group.command, &flag?(&1, flag)),
-        "plugin #{group.name}: command carries #{flag}, which profile #{profile.name} owns — " <>
-          "a profiled group's model flags (#{Enum.join(@model_flags, ", ")}) come from its " <>
-          "profile alone; drop #{flag} from command:"
-      )
-    end)
-  end
-
-  defp flag?(token, flag), do: Regex.match?(Map.fetch!(@model_flag_regexes, flag), token)
+  defp check_group_profile(_group, acc), do: acc
 
   # D-P10: `rknn` and `qnn` are legal names in a profile — the schema knows
   # them so board profiles can ship before their backends do — but a group
@@ -791,15 +727,13 @@ defmodule Cairn.Config do
   defp check_backend_implemented(acc, _group, _profile), do: acc
 
   # The artifact is checked verbatim, against this node's working directory,
-  # because that is the one the plugin process is spawned from and reads it
-  # in: resolving the path against the config file or the profile file would
-  # check one file and hand the plugin another.
+  # because that is the one the engine resolves it in: resolving the path
+  # against the config file or the profile file would check one file and
+  # hand the engine another.
   #
-  # A profile naming no artifact is refused too, rather than left to expand
-  # into nothing: a profile is a model choice before it is anything else, and
-  # D-P4 has just forbidden the operator from writing `--model` themselves —
-  # so a profiled group with no artifact could only ever run a model nobody
-  # named.
+  # A profile naming no artifact is refused too: a profile is a model choice
+  # before it is anything else, so a group whose profile names none could
+  # only ever run a model nobody named.
   defp check_artifact(acc, group, profile) do
     case Profile.artifact(profile) do
       nil ->
@@ -807,7 +741,7 @@ defmodule Cairn.Config do
           acc,
           "plugin #{group.name}: profile #{profile.name} names no " <>
             "model.#{Profile.artifact_key(profile.backend)} artifact for its #{profile.backend} " <>
-            "backend — a profiled group takes --model from its profile alone"
+            "backend — the engine takes its model from the profile alone"
         )
 
       path ->
@@ -815,18 +749,16 @@ defmodule Cairn.Config do
           acc,
           File.regular?(path),
           "profile #{profile.name}: model artifact #{path} does not exist or is not a " <>
-            "regular file (relative paths resolve against the working directory the plugin " <>
-            "is spawned from)"
+            "regular file (relative paths resolve against this node's working directory)"
         )
     end
   end
 
   # The labels file gets the artifact's treatment for the artifact's reason:
-  # it is a path this config expands into `--labels`, read by the plugin
-  # against the same cwd. Absence is not an error here the way a missing
-  # artifact is: `--labels` is optional to the plugin (class ids stand in for
-  # names without it), where a profiled group with no `--model` could only ever
-  # run a model nobody named.
+  # it is a path the engine reads against the same cwd. Absence is not an
+  # error here the way a missing artifact is: labels are optional (class ids
+  # stand in for names without them), where a profile with no model could
+  # only ever run one nobody named.
   defp check_labels(acc, %Profile{labels: nil}), do: acc
 
   defp check_labels(acc, %Profile{labels: path} = profile) do
@@ -834,34 +766,8 @@ defmodule Cairn.Config do
       acc,
       File.regular?(path),
       "profile #{profile.name}: labels file #{path} does not exist or is not a regular " <>
-        "file (relative paths resolve against the working directory the plugin is " <>
-        "spawned from)"
+        "file (relative paths resolve against this node's working directory)"
     )
-  end
-
-  defp resolve_members(%__MODULE__{udp_base_port: base} = config) when is_integer(base) do
-    Enum.map(config.plugin_groups, &%{&1 | members: members_for(config, &1.name)})
-  end
-
-  defp resolve_members(config), do: config.plugin_groups
-
-  # A membrane camera keeps its `plugin:` — that is what selects the profile
-  # its pipeline runs in-VM — but is not a member: the group would bind a UDP
-  # port ffmpeg no longer writes to, wait for lines that never come, and (if
-  # they did) feed the tracker a second time from the same video.
-  #
-  # The index is still taken over the *whole* camera list, so a camera
-  # flipping to membrane leaves every other member's port exactly where it was.
-  defp members_for(config, name) do
-    config.cameras
-    |> Enum.with_index()
-    |> Enum.filter(fn {cam, _index} ->
-      cam.plugin == {:group, name} and cam.pipeline != :membrane
-    end)
-    |> Enum.map(fn {cam, index} ->
-      {udp_port, _rtp_port} = Cairn.UDPPorts.ports_for(config, index)
-      %{id: cam.id, udp_port: udp_port, min_score: cam.min_score}
-    end)
   end
 
   # -- validation -------------------------------------------------------------
@@ -873,12 +779,11 @@ defmodule Cairn.Config do
     |> validate_windows(config)
     |> validate_tracking(config)
     |> validate_tiers(config)
-    |> validate_udp(config)
     |> validate_numbers(config)
     |> validate_remux(config)
     |> validate_ha_token(config)
     |> validate_native_model(config)
-    |> validate_membrane_profiles(config)
+    |> validate_camera_profiles(config)
   end
 
   defp validate_native_model(acc, config) do
@@ -888,27 +793,25 @@ defmodule Cairn.Config do
     end
   end
 
-  # A membrane camera builds its detect branch from `plugin:` alone, but only a
+  # A camera builds its detect branch from `plugin:` alone, but only a
   # profile says which model the branch runs on. Unprofiled, it detects on
   # whatever model another camera loaded, or on none.
-  defp validate_membrane_profiles(acc, config) do
+  defp validate_camera_profiles(acc, config) do
     config.cameras
-    |> Enum.filter(&(&1.pipeline == :membrane and &1.plugin != nil))
+    |> Enum.filter(&(&1.plugin != nil))
     |> Enum.reject(&profile_for(config, &1))
-    |> Enum.reduce(acc, &add_error(&2, unprofiled_membrane(&1)))
+    |> Enum.reduce(acc, &add_error(&2, unprofiled_camera(&1)))
   end
 
-  defp unprofiled_membrane(%Camera{plugin: {:group, name}} = cam) do
-    "camera #{cam.id}: membrane detection resolves no profile — its model comes from plugin " <>
-      "#{name}'s profile:, and that group has none in effect. Add a profile: to plugin " <>
-      "#{name}, or set this camera's pipeline: classic"
+  defp unprofiled_camera(%Camera{plugin: {:group, name}} = cam) do
+    "camera #{cam.id}: detection resolves no profile — its model comes from plugin " <>
+      "#{name}'s profile:, and that group has none in effect. Add a profile: to plugin #{name}"
   end
 
-  defp unprofiled_membrane(%Camera{} = cam) do
-    "camera #{cam.id}: membrane detection resolves no profile — an inline plugin command is " <>
-      "not run for a membrane camera, which detects in this node's own engine and takes its " <>
-      "model from a plugin group's profile:. Move the command under plugins: with a profile: " <>
-      "and name that group as this camera's plugin:, or set pipeline: classic"
+  defp unprofiled_camera(%Camera{} = cam) do
+    "camera #{cam.id}: detection resolves no profile — the camera detects in this node's " <>
+      "own engine and takes its model from a plugin group's profile:; name such a group " <>
+      "as this camera's plugin:"
   end
 
   defp validate_ha_token(acc, %{ha_token: nil}), do: acc
@@ -1003,13 +906,12 @@ defmodule Cairn.Config do
   # silences reid — legitimately reid-capable profiles must not be refused
   # over a global flag their cameras never read.
   defp validate_reid_requires_bbd(acc, config) do
-    # "Unprofiled" spans both shapes the global flag reaches: a camera with
-    # its own inline plugin command, and a member of a group that has no
-    # profile. A camera with no plugin at all runs no tracker and holds no
-    # opinion.
+    # "Unprofiled" here is a camera on a group whose profile did not resolve
+    # (that is already its own load error; this avoids piling on a
+    # misleading one). A camera with no plugin at all runs no tracker and
+    # holds no opinion.
     unprofiled? =
       Enum.any?(config.cameras, fn
-        %{plugin: {:inline, _argv}} -> true
         %{plugin: {:group, _name}} = cam -> profile_for(config, cam) == nil
         _camera -> false
       end)
@@ -1206,31 +1108,6 @@ defmodule Cairn.Config do
       post_window_seconds: w.post,
       max_event_seconds: w.max
     }
-  end
-
-  defp validate_udp(acc, %{udp_base_port: base, udp_port_range: range} = config) do
-    needed = Cairn.UDPPorts.ports_per_camera() * length(config.cameras)
-
-    cond do
-      is_nil(base) or is_nil(range) ->
-        add_error(acc, "udp.base_port and udp.range are required")
-
-      not int?(base, 1024, 65_535) ->
-        add_error(acc, "udp.base_port must be 1024..65535")
-
-      not int?(range, 2, 65_536 - base) ->
-        add_error(acc, "udp.range must be >= 2 and base_port + range must fit below 65536")
-
-      needed > range ->
-        add_error(
-          acc,
-          "udp range exhausted: #{length(config.cameras)} cameras need #{needed} ports, " <>
-            "range provides #{range}"
-        )
-
-      true ->
-        acc
-    end
   end
 
   defp validate_numbers(acc, config) do

@@ -19,10 +19,12 @@ defmodule Cairn.Fragment do
   It defaults to `true` because the failure directions are not symmetric: a
   fragment wrongly marked keyframe-headed costs a leading empty edit in one
   clip, while one wrongly marked otherwise is video an NVR silently declines to
-  record. `Cairn.MP4.Demuxer` — the only producer in `lib/` — always computes
-  it, and answers `false` only on a positive reading of the
-  `sample_is_non_sync_sample` bit or on a fragment carrying no samples at all;
-  every reading it cannot make comes back `true`.
+  record. Both producers always compute it: `Cairn.Pipeline.RingBufferSink`
+  (the live path) from the CMAF muxer's own "segment starts independent"
+  reading, and `Cairn.MP4.Demuxer` (recorded-fmp4 replay in tests and
+  tooling) answering `false` only on a positive reading of the
+  `sample_is_non_sync_sample` bit or on a fragment carrying no samples at
+  all; every reading it cannot make comes back `true`.
   """
 
   @enforce_keys [:camera_id, :seq, :pts, :data]

@@ -2,10 +2,6 @@ data_dir: tmp/cairn_test_data
 stall_seconds: 15
 free_space_min_mb: 512
 
-udp:
-  base_port: 17000
-  range: 20
-
 events:
   pre_window_seconds: 5
   post_window_seconds: 10

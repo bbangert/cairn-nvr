@@ -1,23 +1,24 @@
 # NVR Architecture
 
-This document describes the architecture of an Elixir-based NVR (Network Video Recorder) designed to run on resource-constrained hardware (e.g. QCS6490) while supporting multiple IP cameras, real-time inference, low-latency live preview, and event-based recording.
+This document describes the architecture of an Elixir-based NVR (Network Video Recorder) designed to run on resource-constrained hardware (e.g. QCS6490, Rockchip SBCs) while supporting multiple IP cameras, real-time inference, low-latency live preview, and event-based recording.
 
 The design optimizes for three goals, in this order:
 
 1. **Predictable resource use.** No unbounded memory growth, no surprise CPU spikes from things the user didn't ask for.
-2. **Plugin simplicity.** The contract for an inference plugin should be narrow enough that authors targeting different accelerators (Hexagon NPU, Hailo, Coral, RKNN) only have to implement the parts unique to their hardware.
-3. **Operational robustness.** Cameras drop, networks blip, processes crash. The system should self-heal without operator intervention.
+2. **One supervision tree.** Media, detection and event lifecycle all live in the BEAM. There is no process-management inventory — no UDP port allocation, no cross-process epoch fencing, no wire protocol between the host and its own detector. (The external-plugin architecture this replaced is archived in `docs/archive/plugin-contract.md`.)
+3. **Operational robustness.** Cameras drop, networks blip, processes crash. The system self-heals without operator intervention, and the failure domain of each piece is explicit.
 
 ## High-level overview
 
 ```mermaid
 flowchart TD
-  cameras["RTSP cameras"]
-  ffmpeg["ffmpeg per camera<br/><i>codec copy, tee fan-out</i>"]
+  cameras["RTSP / FLV cameras"]
+  ingest["Ingest per camera<br/><i>ffmpeg bridge (MPEG-TS) or native RTSP client</i>"]
+  pipeline["Membrane pipeline (per session)<br/><i>demux/parse → tee</i>"]
 
   ring["Ring buffer<br/><i>pre-window only</i>"]
-  plugin["Plugin (Port)<br/><i>decode and infer</i>"]
-  rtphub["Elixir RTP hub<br/><i>PubSub fan-out</i>"]
+  rtphub["RTP hub<br/><i>PubSub fan-out</i>"]
+  native["In-VM engine (Rust NIF)<br/><i>decode · motion gate · infer · Re-ID</i>"]
 
   pubsub(["fragment PubSub"])
 
@@ -28,13 +29,14 @@ flowchart TD
   disk["Disk (event clips)"]
   webrtc["ex_webrtc"]
 
-  cameras --> ffmpeg
-  ffmpeg -- "fmp4 fragments" --> ring
-  ffmpeg -- "RTP H.264" --> plugin
-  ffmpeg -- "RTP H.264" --> rtphub
+  cameras --> ingest
+  ingest -- "compressed H.264" --> pipeline
+  pipeline -- "CMAF fragments" --> ring
+  pipeline -- "RTP packets (in-process)" --> rtphub
+  pipeline -- "encoded access units" --> native
 
   ring -- "every fragment" --> pubsub
-  plugin -- "detections JSON" --> tracker
+  native -- "observations (terms)" --> tracker
 
   tracker -- "start / finalize" --> extractor
   ring -- "drain pre-window" --> extractor
@@ -45,288 +47,112 @@ flowchart TD
   rtphub --> webrtc
 ```
 
-The architecture has three independent data planes that meet only at well-defined boundaries:
+Three planes still meet only at well-defined boundaries, but they now share one VM:
 
-- **Encoded video plane.** RTSP comes in, gets demuxed once by ffmpeg, and fans out three ways. ffmpeg owns this entire plane and BEAM never sees raw network bytes.
-- **Inference plane.** The plugin owns decode and inference end-to-end. Its only inputs are H.264 RTP packets; its only outputs are detection events as JSON. It runs as one process per camera, or — for hardware a single process must hold exclusively — one process per named plugin group serving several cameras.
-- **Event plane.** Detection aggregation, event lifecycle, and clip extraction happen in BEAM. This plane consumes from the encoded plane (via PubSub) and produces files on disk.
+- **Encoded video plane.** One ingest session per camera delivers compressed H.264 into a per-session Membrane pipeline, which fans it out three ways without ever decoding for display: CMAF fragments to the ring, RTP packets to the WebRTC hub, encoded access units to the detect branch. Cairn is codec-copy end to end for everything a human watches.
+- **Inference plane.** The detect branch decodes and infers inside the node's own engine — `plugins/cairn-detect`'s stage library linked as the `cairn-native` NIF, running on dirty schedulers. Frames never leave the crate; what crosses the NIF boundary is compressed access units in and observation terms out.
+- **Event plane.** Detection aggregation, event lifecycle, and clip extraction consume from the other two via PubSub and produce files on disk.
 
-The separation is deliberate: each plane has different latency, throughput, and failure characteristics, and centralizing them in a single process would force the worst case of all three.
+## Ingest
 
-## Why ffmpeg for ingest
+`Cairn.FFmpegPort` owns one camera's ingest session — the OS process or client, the reconnect/backoff policy (1 s → 30 s, jittered), the stall watchdog, and the stream epoch minted per session. Two ingests share all of that machinery:
 
-The encoded plane is owned by `ffmpeg`, one process per camera, supervised by Elixir as a `Port`. ffmpeg handles RTSP, transport negotiation (UDP vs TCP-interleaved vs HTTP-tunneled), authentication (Basic, Digest MD5/SHA-256, vendor-specific quirks), reconnect/backoff, codec demuxing, and the three downstream outputs.
+- **ffmpeg bridge** (default). One supervised ffmpeg per camera as a dumb demuxer: RTSP (or vendor FLV-over-HTTP) in, **MPEG-TS on stdout** out — a container with pts, which the Fragment timing and the ObservationClock need. ffmpeg is kept for its two decades of camera-vendor workarounds; it no longer fans out, transcodes for consumers, or touches UDP.
+- **native RTSP** (`ingest: rtsp`, per camera). The `rtsp` library owns socket/depayload/digest/keepalive and delivers whole access units with pts as messages; the bridge disappears for that camera. Quirky cameras keep the ffmpeg bridge — the flag is per-camera and reversible.
 
-The case for ffmpeg over alternatives (Membrane native, Live555, GStreamer):
+Non-H.264 cameras: Cairn probes and warns. Opt-in `transcode: true` uses hardware `h264_v4l2m2m` inside the bridge only — there is deliberately no software fallback, and RTSP-native ingest refuses transcode (there is no ffmpeg in that chain).
 
-- **Camera compatibility.** ffmpeg's RTSP demuxer has accumulated two decades of vendor-specific workarounds. Every IP camera vendor tests against ffmpeg explicitly. The long tail of "this Reolink model doesn't quite follow the RFC" is handled.
-- **Operational maturity.** Argv-driven, fully predictable, every weird camera has a Stack Overflow answer. Reconnect, timeout, and transport flags are well-documented.
-- **Codec-copy fan-out is essentially free.** ffmpeg's `tee` muxer demuxes the RTSP stream once and writes to N output sinks without copying the payload through userspace buffers. CPU usage is sub-1% per camera at 1080p.
-- **No NIF risk.** Crashes are isolated to a Port process and recovered by the supervisor.
+### The per-session pipeline
 
-Per-camera invocation pattern (H.264 source, no transcoding):
+Each ingest session starts its own `Cairn.Pipeline.Camera` (Membrane), owned and monitored by the FFmpegPort — deliberately **not** a supervisor child, because the TS demuxer's state is only valid for one session and backoff policy must not fight supervisor restarts. Pipeline death is a lost decode session: same backoff, same fresh epoch.
 
-```
-ffmpeg -rtsp_transport tcp \
-       -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 \
-       -stimeout 10000000 \
-       -i rtsp://camera/stream \
-       -map 0:v -c:v copy \
-         -f mp4 -movflags frag_keyframe+empty_moov+default_base_moof \
-         -frag_duration 2000000 pipe:1 \
-       -map 0:v -c:v copy \
-         -f rtp -payload_type 96 rtp://127.0.0.1:5001 \
-       -map 0:v -c:v copy \
-         -f rtp -payload_type 96 rtp://127.0.0.1:5002
-```
+Topology: source (`BridgeSource` or `RtspSource`) → TS demux (bridge only; RTSP carries pts natively) → H.264 parse (access-unit aligned) → tee →
 
-Three outputs, all H.264 codec-copy:
+1. **Recording branch**: CMAF muxer → `RingBufferSink`, shaping each segment into a `Cairn.Fragment` (pts from the segment's own `tfdt`, timescale from the init header, `keyframe?` = first sample is a sync sample). On session end an end-of-stream is flushed through the pipeline with a short grace so the muxer's held tail segment is recorded rather than lost.
+2. **RTP branch**: RFC 6184 payloader → in-process `push_packet/2` into `Cairn.RTPHub`. No sockets anywhere.
+3. **Detect branch**: picker (backpressure, keep-newest depth-1, refuses to emit across a dropped-AU hole until the next IDR) → `Inference` (the NIF call site, one call in flight) → `DetectSink` (observations → `Cairn.Detect.Dispatch` → the camera's tracker). Absent when the camera names no `plugin:`.
 
-1. **Fragmented mp4 to stdout** (`pipe:1`), framed on `moof+mdat` boundaries. The Elixir Port handler reads stdout, parses fragment boundaries, and forwards each complete fragment to the camera's ring buffer.
-2. **RTP to UDP 5001**, consumed by the inference plugin.
-3. **RTP to UDP 5002**, consumed by the Elixir RTP hub for WebRTC fan-out.
+## Detection: the in-VM engine
 
-### Handling non-H.264 cameras
+`cairn-detect`'s stages (decode/hwdecode, motion gate, inference, Re-ID embedder) are one Rust library with two consumers: the standalone binary (used by the canary, the parity harness, and board benches) and the `cairn-native` Rustler NIF the node loads. They cannot diverge — same crate, same code.
 
-When the source codec isn't H.264 (HEVC, MJPEG, etc.), the recommended path is to surface a UI warning at camera-add time and prompt the user to change the camera's encoder setting. Re-encoding at runtime burns SoC budget that should go to inference.
-
-If the user opts in (or for cameras with no H.264 option), the ffmpeg invocation switches to hardware-accelerated transcoding via `h264_v4l2m2m` on the QCS6490. Software fallback (`libx264`) is explicitly *not* enabled — if hardware encode is unavailable, transcoding is refused with a clear error rather than silently saturating the CPU.
-
-## The plugin contract
-
-The plugin is a `Port`-supervised external process. It runs whatever decode and inference pipeline its hardware target needs (typically a GStreamer pipeline using `v4l2h264dec` and a vendor inference element on the QCS6490).
-
-Inputs:
-
-- H.264 RTP packets on a fixed UDP port per camera served, assigned by Elixir at plugin start.
-- Camera ID and configuration provided as CLI arguments or environment variables.
-
-Outputs:
-
-- Newline-delimited JSON detection events on stdout. Each line is a complete event:
-  ```json
-  {"camera_id":"front","pts":3672859023,"dets":[{"label":"person","bbox":[0.42,0.31,0.18,0.36],"score":0.92}]}
-  ```
-- Log messages on stderr.
-
-The plugin does *not* handle RTSP, fragment writing, muxing, ring buffering, event lifecycle, or WebRTC. A new plugin author targeting a different accelerator only needs to implement the decode-to-inference pipeline; everything else is provided by the Elixir host.
-
-### One process per camera, or one per group
-
-Two process shapes share this contract. The default is one plugin process per camera. The alternative is a named **plugin group**: a command declared once under a top-level `plugins:` map, joined by every camera that says `plugin: <name>`, and launched as a single process with a `--cameras-json` array of its members instead of the per-camera flags. Group output is the same ndjson, except `camera_id` is required — it is the only thing routing a line, since one process now speaks for several cameras.
-
-The motivating case is an accelerator that only one process can hold at a time (a Coral Edge TPU), which a process per camera can never share. The mode is a config-shape decision, not a count: a group with one member is still launched as a group.
-
-A group's lifecycle is deliberately decoupled from its members. It is restarted only when its config changes — the command, the membership, a member's score floors, or a member's UDP port — and never by anything a camera does at runtime, so a stopped member simply stops sending packets. Plugins serving a group must therefore treat a silent stream as normal and re-open it forever rather than exit: the group is one failure domain, and exiting over one stream stops detection for every member. `docs/plugin-contract.md` is the authoritative spec.
+- **One engine, one model per node.** Config load refuses groups whose profiles ask for different models. The engine's model config comes from the hardware profile the camera's `plugins:` group names.
+- **Dirty schedulers, errors as values.** Decode and inference entry points run on dirty schedulers; per-stream faults (decode errors, a failed inference) return as values and stay contained to that stream. `catch_unwind` guards the NIF boundary.
+- **Blast radius, and what buys it down.** A NIF panic restarts the whole node — the accepted cost of not running a second BEAM (measured: 0 faults in 83k + 110k soak inferences before acceptance). Model load is the known crash/wedge vector, so `Cairn.Native.Canary` probe-loads any new or changed model in a **throwaway OS process** (the real `cairn-detect` binary, group mode) before the NIF is allowed to load it.
+- **Health is probed, not inferred.** `Cairn.Native.Health` is its own process that calls the host under a deadline it imposes from outside (ORT/QNN offer no per-call deadline); the ratio check distinguishes a wedged NPU (nothing completing) from saturation (slow but faster than CPU). A wedge is an operator alert, never a restart loop — no restart at any level recovers a wedged NPU. `Cairn.Native.Status` maps engine and per-camera verdicts (including refused hardware decoders) onto the same `cameras:status` surface everything else reads.
+- **Per-SoC hardware axis.** Decode candidate + NPU runtime per family (QCS6490: Venus/v4l2 + QNN; Rockchip pending hardware) — the table is `docs/npu-backends.md`. A profile that *names* a hardware decoder is refused if the decoder falls back to software: silent degradation is this system's recurring defect class, and the detect branch going dark (recording intact, reason on status) beats detecting nothing at 15× the CPU.
+- **Teardown discipline.** Native destructors are deferred to a drain thread; `Cairn.Native.Drain` starts first in the app tree (so it terminates last) and drains them bounded at shutdown, keeping VM halt from racing accelerator deinit.
 
 ## The ring buffer
 
-The ring buffer is a per-camera GenServer that holds `pre_window_seconds` worth of fmp4 fragments in memory. Its responsibilities:
+Unchanged in role: a per-camera GenServer holding `pre_window_seconds` of fmp4 fragments in memory, evicting by media time, broadcasting each fragment on PubSub, and serving `drain_and_subscribe/3` atomically (drain + subscribe in one call, which is what makes the pre-window race-free for extractors).
 
-- Receive fragments from the ffmpeg Port handler.
-- Evict fragments older than `pre_window_seconds`.
-- Broadcast each new fragment to a per-camera Phoenix.PubSub topic.
-- Serve `drain_pre_window/1` requests atomically (drain + subscribe in one call to avoid races).
-
-```elixir
-defmodule NVR.RingBuffer do
-  use GenServer
-
-  def init(camera_id) do
-    {:ok, %{
-      camera_id: camera_id,
-      fragments: :queue.new(),
-      pre_window_pts: 10 * 90_000  # 10 seconds at 90kHz PTS clock
-    }}
-  end
-
-  def handle_cast({:fragment, frag}, state) do
-    state = state |> append(frag) |> evict_old()
-    Phoenix.PubSub.broadcast(NVR.PubSub, topic(state.camera_id), {:fragment, frag})
-    {:noreply, state}
-  end
-
-  def handle_call({:drain_and_subscribe, since_pts, subscriber_pid}, _from, state) do
-    fragments = :queue.to_list(state.fragments)
-                |> Enum.drop_while(fn f -> f.pts < since_pts end)
-    Phoenix.PubSub.subscribe(NVR.PubSub, topic(state.camera_id))
-    Process.link(subscriber_pid)
-    {:reply, fragments, state}
-  end
-end
-```
-
-### Memory characteristics
-
-Memory usage is bounded by `pre_window × bitrate × camera_count`, independent of event duration. At 8 cameras, 4K, 12 Mbps, 10-second pre-window: ~120 MB total, fixed.
-
-Fragments are stored as `bytes` (BEAM binaries). Binaries over 64 bytes live off-heap and are reference-counted; sending a fragment to multiple subscribers is a pointer copy, not a memcpy. Live MSE viewers, event extractors, and the WebRTC RTP hub can all hold references to the same underlying memory simultaneously.
-
-### Why not tmpfs
-
-An earlier design wrote fragments to tmpfs and used inotify to notify subscribers. Moving the buffer in-process gains:
-
-- **Per-camera memory budgets.** tmpfs `size=` is per-mount, not per-camera.
-- **Time-based eviction.** "Drop fragments older than N seconds" is awkward with files.
-- **Atomic snapshots.** Drain-and-subscribe in one call eliminates a class of races.
-- **No filesystem semantics.** No inodes, dentries, or stat-storming under load.
-
-The tradeoff is that BEAM is now in the data path. Throughput math: 8 cameras × 4 Mbps × broadcast-to-N-subscribers is well within BEAM's binary-passing capabilities. The hot path for any subscriber is "receive `{:fragment, bin}` message," which is sub-microsecond.
+Memory is bounded by `pre_window × bitrate × camera_count`, independent of event duration. Fragments are refc binaries: every subscriber holds a pointer, not a copy. The init segment carries the session epoch; fragment `seq` is restamped 0-based per ring so consumers survive session resets.
 
 ## The camera tracker
 
-Event lifecycle is owned one camera at a time: a `CameraTracker` GenServer per camera, fed only that camera's observations — by its own plugin Port, or by the group Port that routes each ndjson line on its `camera_id`. One camera's tracking state, crash, and recovery are therefore that camera's alone.
+Event lifecycle is owned one camera at a time: a `Cairn.CameraTracker` per camera under `Cairn.TrackerSupervisor` (a `:rest_for_one` pair of a DynamicSupervisor pool and a checkpoint-restore sweep), fed observations by the detect branch through `Cairn.Detect.Dispatch` — plain functions in the caller's process, so no per-frame GenServer hop and no config-server call on the frame path (policy is resolved at session start and on refresh).
 
-They live under `Cairn.TrackerSupervisor`, a `:rest_for_one` pair: a `DynamicSupervisor` pool holding one `:transient` tracker per camera, started on demand by that camera's first observation, and behind it a sweep that starts trackers for cameras whose ETS checkpoint outlived them. A crashed tracker is restarted by the pool and restores in `init/1`; a pool restart cascades into the sweep, which does the same for every checkpointed camera at once.
-
-Each tracker holds:
-
-- `active_event` — the currently-active `EventExtractor` PID, or `nil`.
-- `last_detected_ms` (per track, inside the `Cairn.Tracker`) — the tracking-clock instant of that track's most recent *detected* box, which is what the stale-predicted rule measures from.
-- `objects` — an IoU tracker for assigning detections to persistent object IDs across frames.
-
-State transitions per detection:
-
-```
-no active event + detection → start new EventExtractor, send :start
-active event + detection    → reset post-window timer
-no detection for post_window → send :finalize to EventExtractor, clear active_event
-```
-
-A tracker never holds video data — it operates purely on JSON detections, which are small and frequent. Its job is debouncing detection noise into clean event boundaries.
-
-### Configurable thresholds
-
-- `pre_window_seconds` (default 10) — how much lead-up to ask for before detection. The clip retains *up to* that much: the ring may not have filled yet, and the pre-roll is cut back to its first keyframe (see the extractor below).
-- `post_window_seconds` (default 30) — how long after the last detection before finalizing.
-- `max_event_seconds` (default 600) — hard cap on a single event's duration. Beyond this, the current event is finalized and a new one starts if detection continues.
-- `min_score` per label — score threshold for considering a detection valid.
+The tracker assigns identities itself (`Cairn.Tracker`: IoU + optional staged admissions — BBD, ORU, OCR, Re-ID fusion — per the profile's stage list), debounces detections into events, and keys suspend/adopt off **stream epoch identity**: one epoch is one continuous decode session, so nothing (pts, object continuity) carries across a respawn except by the tracker's own adopt-across-reset rule. Trackers are `:transient` and checkpoint to ETS, so a crash restores in `init/1`.
 
 ## The event extractor
 
-One `EventExtractor` GenServer is spawned per active event. It is the only component that writes to permanent storage.
+One `Cairn.EventExtractor` per active event; the only component writing permanent storage. It drains the pre-window atomically, then streams live fragments, writing nothing until the first keyframe-headed fragment (which becomes the clip's t=0), and finalizes into the SQLite index on post-window quiet. Fragmented mp4 keeps unfinalized files playable up to the last complete fragment; `remux_clips: true` rewrites the finished clip so it knows its own duration.
 
-Lifecycle:
+## Live view
 
-1. **Init.** Open output file at `events/{camera_id}/{event_id}.mp4`. Write fmp4 init segment.
-2. **Pre-window drain.** Call `RingBuffer.drain_and_subscribe(camera_id, started_at_pts - pre_window, self())`. Receive the list of pre-window fragments and append each to the file. The atomic drain+subscribe is what prevents the boundary race between "fragments already in the ring" and "fragments arriving from now on."
-3. **Streaming.** Receive `{:fragment, frag}` messages from PubSub. Append each to the file, optionally `fsync` at fragment boundaries.
+- **MSE** over a Phoenix channel (default): init segment, then fragment binaries into a `SourceBuffer`. Latency ≈ one fragment duration.
+- **HLS** fallback: a playlist generator over the same ring state.
+- **WebRTC** for sub-second latency: `Cairn.RTPHub` broadcasts the pipeline's RTP packets per camera and replays the last GOP to each new viewer for an instant first frame; `ex_webrtc` peers do SRTP.
 
-   Steps 2 and 3 share one rule: **nothing is written until a fragment whose first sample is a keyframe**, and that fragment is the clip's t=0. On a camera whose GOP is longer than its fragment duration, that discards up to one GOP off the front of the pre-roll. The alternative is worse — the finalizing remux (`ffmpeg -c copy`) silently drops leading samples it has no keyframe for and records the hole as an empty edit, leaving every consumer of the file late by the dropped span with nothing to detect it by.
-4. **Finalize.** On `:finalize` call from the camera's tracker: unsubscribe, write mp4 trailer (or just close, since fmp4 is independently readable), insert event metadata into the SQLite event index, exit normally.
+## Configuration and reload
 
-```elixir
-defmodule NVR.EventExtractor do
-  use GenServer, restart: :temporary
+`config.yml` is the source of truth. A **hardware profile** (one YAML per board class) names the model, input geometry, backend, fps band and tracker stage list; a `plugins:` group is a profile reference, and every camera naming that group detects on it. Config load expands the profile into the engine's model config and the host's tracking policy from one file, so the two halves cannot disagree.
 
-  def init({camera_id, event_id, started_at_pts}) do
-    file = File.open!(event_path(event_id), [:write, :binary, :raw])
-    write_init_segment(file, camera_id)
-
-    pre_pts = started_at_pts - @pre_window_pts
-    pre = NVR.RingBuffer.drain_and_subscribe(camera_id, pre_pts, self())
-    Enum.each(pre, &write_fragment(file, &1))
-
-    {:ok, %{file: file, event_id: event_id, camera_id: camera_id, bytes_written: total_bytes(pre)}}
-  end
-
-  def handle_info({:fragment, frag}, state) do
-    write_fragment(state.file, frag)
-    {:noreply, %{state | bytes_written: state.bytes_written + byte_size(frag.data)}}
-  end
-
-  def handle_call(:finalize, _from, state) do
-    Phoenix.PubSub.unsubscribe(NVR.PubSub, "camera:#{state.camera_id}:fragments")
-    File.close(state.file)
-    NVR.EventIndex.insert(%{
-      id: state.event_id,
-      camera_id: state.camera_id,
-      bytes: state.bytes_written,
-      path: event_path(state.event_id)
-    })
-    {:stop, :normal, :ok, state}
-  end
-end
-```
-
-### Crash resilience
-
-Fragmented mp4 is naturally crash-resilient: each `moof+mdat` pair is independently readable. An unfinalized event file is still a valid playable mp4 up to its last complete fragment. On startup, a cleanup task scans for unfinalized files (no entry in the event index) and either repairs the trailer or marks them as `partial` in the index.
-
-## The MSE/HLS server
-
-The browser dashboard's default live-preview path. A `Phoenix.Channel` (or plain `Plug` upgraded to WebSocket) per viewer:
-
-1. On connect: read the camera's init segment (cached in the ring buffer or its supervisor) and send as a binary frame.
-2. Subscribe to `camera:{id}:fragments` PubSub topic.
-3. For each `{:fragment, frag}` message, send `frag.data` as a binary frame.
-4. On disconnect: unsubscribe.
-
-Browser side uses Media Source Extensions to feed the binary frames into a `<video>` element's `SourceBuffer`. ~30 lines of vanilla JS, no library required.
-
-Latency is approximately one fragment duration plus network — typically ~2 seconds. This is the right tradeoff for a security-camera dashboard where the user is monitoring presence, not driving a PTZ.
-
-HLS is provided as a fallback for clients that don't support MSE (very old Safari, embedded browsers in some video panels), implemented as a thin playlist generator over the same ring buffer state.
-
-## The WebRTC hub
-
-For low-latency viewing (sub-second), a separate path uses `ex_webrtc`. The architecture:
-
-- `Camera.RTPHub` — one GenServer per camera, owns the UDP socket on port 5002+. Parses RTP headers (sequence number, timestamp, payload type, marker bit) and broadcasts each packet to a per-camera RTP topic.
-- `WebRTC.PeerConnection` — one process per browser viewer, spawned when the LiveView WebRTC preview component connects. Subscribes to the camera's RTP topic, encrypts each packet with SRTP, and sends to the peer.
-
-Per-viewer cost is dominated by SRTP encryption, which uses Rust NIFs (AES-GCM with hardware acceleration on aarch64). Sixteen simultaneous WebRTC viewers across all cameras is well under one A78 core.
-
-### Keyframe-on-join
-
-A new WebRTC viewer needs a keyframe immediately. With 2-second GOP cameras, the worst case is a 2-second wait. To make it instant, the RTP hub buffers the most recent GOP (~few hundred KB) and replays those packets to each new subscriber before live packets begin.
+On reload, the new config reaches the engine first (`Cairn.Native.Host.reconfigure/1` — a model change is handled there, not by restarting cameras), then the camera diff: edits that reach a subprocess or the ring (`rtsp_url`, `plugin`, `min_score`, `ingest`, `transcode`, `extra_ffmpeg_args`, the pre-window) restart that camera's tree; everything else refreshes in place through the running session.
 
 ## Process supervision tree
 
 ```
-NVR.Supervisor
-├── NVR.PubSub                     (Phoenix.PubSub)
-├── NVR.EventIndex                 (SQLite event metadata)
-├── NVR.CameraSupervisor (DynamicSupervisor)
-│   ├── NVR.Camera (one per camera, Supervisor)
-│   │   ├── NVR.FFmpegPort         (supervises ffmpeg subprocess)
-│   │   ├── NVR.RingBuffer         (in-memory fragment buffer)
-│   │   ├── NVR.PluginPort         (supervises plugin subprocess; absent for group members)
-│   │   └── NVR.RTPHub             (UDP receiver for WebRTC)
-│   └── ... (more cameras)
-├── NVR.PluginGroupSupervisor      (one plugin Port per named group, serving N cameras)
-├── NVR.TrackerSupervisor          (rest_for_one)
-│   ├── NVR.TrackerSupervisor.Pool (DynamicSupervisor)
-│   │   └── NVR.CameraTracker      (one per camera, transient; that camera's observations)
+Cairn.Supervisor
+├── Cairn.Native.Drain             (first, so its terminate runs last: drains native teardown)
+├── Cairn.Config.Server            (everything hangs off the loaded config)
+├── Cairn.Repo / Ecto.Migrator     (SQLite event + track index)
+├── Phoenix.PubSub / Cairn.Registry / Cairn.CameraStatus ...
+├── Cairn.TrackerSupervisor        (rest_for_one)
+│   ├── pool (DynamicSupervisor)
+│   │   └── Cairn.CameraTracker    (one per camera, transient, ETS-checkpointed)
 │   └── checkpoint restore sweep   (Task, transient; re-runs when the pool restarts)
-├── NVR.EventSupervisor (DynamicSupervisor)
-│   └── NVR.EventExtractor         (one per active event, transient)
-└── NVR.Endpoint                   (Phoenix HTTP/WebSocket)
+├── Cairn.EventSupervisor (DynamicSupervisor)
+│   └── Cairn.EventExtractor       (one per active event, temporary)
+├── Cairn.StreamEpochs             (before the cameras that mint epochs into it)
+├── Cairn.Native.Host              (the one engine; outside camera trees so a camera
+│                                   restart never reloads the model)
+├── Cairn.Native.Health            (its own process: probes the host under a deadline)
+├── Cairn.Native.Status            (maps engine health onto cameras:status)
+├── Cairn.CameraSupervisor (DynamicSupervisor)
+│   └── Cairn.Camera (one per camera, rest_for_one)
+│       ├── probe                  (ffprobe task, temporary)
+│       ├── Cairn.RingBuffer
+│       ├── Cairn.FFmpegPort       (ingest session + per-session Membrane pipeline)
+│       └── Cairn.RTPHub           (socketless; fed by the pipeline's RTP branch)
+├── Cairn.Retention / CairnWeb.WebRTC.Supervisor / Cairn.Boot
+└── CairnWeb.Endpoint
 ```
 
-Restart strategies:
-
-- A camera supervisor uses `:rest_for_one`: if ffmpeg dies, restart it (state is recoverable from the camera). If the ring buffer dies, restart ffmpeg too (since the new ring won't have the old fragments anyway).
-- A plugin group sits outside any one camera's supervisor, because it outlives them individually: it is started and restarted only on config change, and members stopping or starting leave it running. That makes the group one failure domain — a crash costs every member detection until the backoff restart — which is the price of sharing the device.
-- Event extractors are `:temporary` — if one crashes, the event is lost (logged as `partial` in the index) but other events continue.
-- Camera trackers are `:transient`. Each checkpoints its active event and the tracks live under it to an ETS table owned outside the tracking tree, so a restarted tracker restores in `init/1` instead of waiting for its camera's next observation. `NVR.TrackerSupervisor` is `:rest_for_one` for the case the pool itself restarts: the cascade re-runs the restore sweep, which is the only thing that would otherwise re-adopt checkpoints no surviving tracker owns.
+Restart shape worth naming: the per-session pipeline is *not* in this tree — it is born and dies with its ingest session, monitored by the FFmpegPort, whose jittered backoff (not supervisor intensity) owns the "camera is down" state. Ring death restarts the ingest (`:rest_for_one`): a fresh ring is empty anyway.
 
 ## Resource budget
 
-Approximate budget for 8 cameras at 1080p H.264, 30fps, 4 Mbps:
+Approximate budget for 4 cameras at 5 MP H.264, 20 fps (the measured QCS6490 wall — Venus refuses a fifth concurrent 5 MP decode session outright):
 
 | Resource | Usage | Notes |
 |----------|-------|-------|
-| ffmpeg CPU | <8% (1% per camera) | Codec-copy fan-out is nearly free |
-| Plugin CPU | 30–60% | Inference workload, dominates |
-| BEAM CPU | <5% idle, 10–15% with viewers | Mostly SRTP encryption |
-| Ring buffer RAM | ~40 MB | 8 × 4 Mbps × 10s / 8 |
-| Disk write rate | 0–4 MB/s | Only during active events |
-| Disk capacity | ~3 GB/event-hour | Per camera at 4 Mbps |
+| Ingest CPU | ~1% per camera | codec-copy demux only |
+| Decode + scale | ~8% + ~25% of a core per camera at 5 fps sampled | hardware decode via v4l2m2m; GPU-side scale (`gles` feature) cuts convert ~4× where Mesa works |
+| Inference | ~6% of the NPU session per camera at 5 fps | QNN p50 ~12.5 ms/pass; the shared model session serializes |
+| BEAM CPU | <5% idle, more with viewers | mostly SRTP |
+| Ring RAM | pre_window × bitrate × cameras | fixed |
+| Disk | 0–4 MB/s during events | ~3 GB/event-hour/camera at 4 Mbps |
 
-The two scaling dimensions worth watching:
-
-- **Inference budget.** Adding cameras hits this first. With a plugin process per camera, the per-camera cost is fixed and the total scales linearly. A plugin group instead shares one process — and one model, and one accelerator — across its members, so the ceiling is that device's throughput rather than the camera count; for a device only one process can hold (Coral Edge TPU), it is the only shape that works at all.
-- **Disk capacity.** Long retention windows for event clips dominate. Continuous recording, if added, dominates by an order of magnitude.
-
-Memory and BEAM CPU are not the bottleneck and are not expected to become so.
+The scaling dimensions: **decode+scale** is the per-camera cost that caps camera count (inference is not — measured ~80 passes/s available against 5/s per camera), and **disk** dominates long retention. Capacity and fps bands are measured per SBC and recorded in that board's profile; x86 is a test host and never gets a measured band.

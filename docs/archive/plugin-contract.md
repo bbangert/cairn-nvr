@@ -1,4 +1,16 @@
-# Cairn plugin contract — protocol v1
+# Cairn plugin contract — protocol v1 (ARCHIVED)
+
+> **Archived at membrane port phase 6 (2026-08-12).** Cairn no longer runs
+> external inference plugins: detection is the in-VM engine
+> (`plugins/cairn-detect` linked as the `cairn-native` NIF), and the host
+> modules this contract bound (`Cairn.PluginPort`, `Cairn.PluginGroupPort`,
+> the UDP port allocator, the stdin control channel) were deleted. The
+> format is kept because it is still what three things read and write:
+> the `cairn-detect` **binary** (unchanged — the canary probe-load and the
+> board-bench harness run it), `Cairn.Native.Parity` (the x86 parity
+> reference decodes its stdout with `Cairn.PluginProtocol`), and the
+> recorded captures under `test/support/golden/` and the MOT harness.
+> Nothing here governs live detection anymore.
 
 An inference plugin is an external process supervised by Cairn. It receives
 H.264 video as RTP over UDP, runs whatever detection it wants, and prints

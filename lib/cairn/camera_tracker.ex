@@ -2,8 +2,9 @@ defmodule Cairn.CameraTracker do
   @moduledoc """
   Owns one camera's event lifecycle — one process per camera, one active event.
 
-  Receives decoded `Cairn.Observation`s from `Cairn.PluginPort` /
-  `Cairn.PluginGroupPort`, filters by per-label `min_score` and the camera's
+  Receives `Cairn.Observation`s from the pipeline's detect branch
+  (`Cairn.Pipeline.DetectSink` via `Cairn.Detect.Dispatch`), filters by
+  per-label `min_score` and the camera's
   `record:` tier, assigns stable object identities (`Cairn.Tracker`, ULID
   strings), and:
 
@@ -17,7 +18,7 @@ defmodule Cairn.CameraTracker do
   One process per camera, registered as `Cairn.Registry.via(camera_id,
   :camera_tracker)` and started on demand by `ensure/1` under
   `Cairn.TrackerSupervisor` — deliberately *outside* the per-camera media tree,
-  so restarting a camera's ffmpeg or plugin does not take its tracking state
+  so restarting a camera's ingest does not take its tracking state
   with it. The process is `:transient`: a crash restarts it and the fresh
   process restores from `Cairn.EventCheckpoint` in `init/1` — so the
   `:host_restart` finals a checkpoint owes go out immediately, not when the
