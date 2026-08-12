@@ -80,7 +80,10 @@ defmodule Cairn.PipelineOwner do
             # DetectSink's last buffer, monotonic ms, from the relayed stats
             detect_at_ms: nil,
             bridge_stale_ticks: nil,
-            rebuilt_at_ms: nil
+            rebuilt_at_ms: nil,
+            # stands in for the ring's last-fragment time until the first
+            # fragment exists — see ring_stale?/1
+            pipeline_started_at_ms: nil
 
   def start_link(opts) do
     cam = Keyword.fetch!(opts, :camera)
@@ -260,10 +263,19 @@ defmodule Cairn.PipelineOwner do
             got_fragment: false,
             source: :unknown,
             detect_at_ms: nil,
-            bridge_stale_ticks: nil
+            bridge_stale_ticks: nil,
+            pipeline_started_at_ms: now_ms()
         },
         :connecting
       )
+
+    # Here and not (only) on the way down: the registry unregisters the dead
+    # pipeline's BridgeSource on its *own* DOWN, unordered relative to anything
+    # this process waited on — and a crash reaches this point through
+    # `enter_backoff/2`, which never ran a deliberate stop. The fresh
+    # BridgeSource hard-matches its register, so every start waits the stale
+    # entry out. An rtsp camera registers nothing and this resolves instantly.
+    Cairn.Registry.await_unregistered(state.camera.id, :bridge_source)
 
     case Membrane.Pipeline.start(module, opts) do
       {:ok, _supervisor, pipeline} ->
@@ -297,14 +309,9 @@ defmodule Cairn.PipelineOwner do
   defp stop_pipeline(state) do
     Process.demonitor(state.pipeline_ref, [:flush])
     # force?: a wedged element must not block the rebuild path; the pipeline
-    # holds no OS resources, so a hard kill leaks nothing.
+    # holds no OS resources, so a hard kill leaks nothing. The stale-registry
+    # wait lives in `start_pipeline/2`, where it also covers the crash path.
     Membrane.Pipeline.terminate(state.pipeline, timeout: 5_000, force?: true)
-
-    # terminate/2 only awaits the pipeline pid's own DOWN; the registry
-    # unregisters on its *own* DOWN, unordered relative to that return. An
-    # rtsp camera registers nothing here and this resolves instantly, so the
-    # call is unconditional rather than gated on ingest.
-    Cairn.Registry.await_unregistered(state.camera.id, :bridge_source)
     %{state | pipeline: nil, pipeline_ref: nil}
   end
 
@@ -409,8 +416,18 @@ defmodule Cairn.PipelineOwner do
   defp debounced?(%{rebuilt_at_ms: nil}), do: false
   defp debounced?(state), do: now_ms() - state.rebuilt_at_ms < stall_ms(state)
 
+  # `nil` is not automatically healthy: a pipeline that wedges before its
+  # FIRST fragment would otherwise never trip the watchdog — nothing rebuilds
+  # per reconnect anymore, so nothing else would ever clear it. The pipeline's
+  # own start stands in for the missing fragment timestamp; the escalation
+  # rules still require a connected source before any of this becomes a
+  # rebuild, so a camera that is merely down stays exempt. An empty ring
+  # cannot pair with an OLD start: the ring is upstream of this process in
+  # the camera's :rest_for_one, so a ring restart restarts the owner too.
   defp ring_stale?(state) do
-    case last_fragment_at(state.camera.id) do
+    since = last_fragment_at(state.camera.id) || state.pipeline_started_at_ms
+
+    case since do
       nil -> false
       at -> now_ms() - at > stall_ms(state)
     end

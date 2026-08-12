@@ -259,6 +259,28 @@ defmodule Cairn.PipelineOwnerTest do
       assert opts[:initial_reason] == :stall_bounce
     end
 
+    @tag :capture_log
+    test "a pipeline that never produces a first fragment counts as stalled" do
+      cam = camera(uid("pf"), ingest: :rtsp)
+      # An empty ring: `last_fragment_at` stays nil, which must not read as
+      # healthy forever — the pipeline's own start stands in for it.
+      start_supervised!({RingBuffer, camera_id: cam.id, pre_window_seconds: 5},
+        id: {:ring, cam.id}
+      )
+
+      owner = start_owner(cam, watchdog_interval_ms: 50)
+
+      assert_receive {:pipeline_started, first, _opts}, 2_000
+      send(owner, {:stream_connected, :main, []})
+
+      # Not stalled until the pipeline has been up a full stall window.
+      refute_receive {:pipeline_started, _pid, _opts}, 300
+
+      assert_receive {:pipeline_started, second, opts}, 2_000
+      assert second != first
+      assert opts[:initial_reason] == :stall_bounce
+    end
+
     test "leaves a stalled rtsp camera alone while its source is reconnecting" do
       cam = camera(uid("pb"), ingest: :rtsp)
       stale_ring(cam.id)
