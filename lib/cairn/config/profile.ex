@@ -281,71 +281,41 @@ defmodule Cairn.Config.Profile do
   def artifact(%__MODULE__{backend: backend, model: model}),
     do: Map.get(model, artifact_key(backend))
 
-  # The six model decisions a profile owns, each paired with the plugin flag it
-  # becomes. Both renderings below walk this one list, so a field cannot reach
-  # one detection path and miss the other. `--motion-json`/`--track-floor-json`
-  # are absent on purpose: they describe the scene, not the model (D-P6).
+  # The six model decisions a profile owns. `--motion-json`/
+  # `--track-floor-json` equivalents are absent on purpose: they describe
+  # the scene, not the model (D-P6).
   @model_fields [
-    model: "--model",
-    model_profile: "--model-profile",
-    input_size: "--input-size",
-    decoder: "--decoder",
-    labels: "--labels",
-    sample_fps: "--sample-fps"
+    :model,
+    :model_profile,
+    :input_size,
+    :decoder,
+    :labels,
+    :sample_fps
   ]
-
-  @doc "The flags a profiled group's own `command:` may not carry (D-P4)."
-  @spec model_flags() :: [String.t()]
-  def model_flags, do: Keyword.values(@model_fields)
 
   @doc """
   The model half of the file as fields, `nil` for each one the profile left
-  unset. The single expansion `model_argv/1` and `native_config/1` both render.
+  unset — the single source `native_config/1` renders.
   """
   @spec model(t()) :: %{atom() => String.t() | pos_integer() | nil}
   def model(%__MODULE__{} = profile) do
-    Map.new(@model_fields, fn {field, _flag} -> {field, model_field(profile, field)} end)
+    Map.new(@model_fields, fn field -> {field, model_field(profile, field)} end)
   end
 
-  # The file's `model:` is a mapping of per-backend paths; both renderings carry
-  # the one path this profile's own backend loads.
+  # The file's `model:` is a mapping of per-backend paths; the rendering
+  # carries the one path this profile's own backend loads.
   defp model_field(profile, :model), do: artifact(profile)
   defp model_field(profile, field), do: Map.fetch!(profile, field)
 
   @doc """
-  The plugin's argv, for a camera whose detection is an external
-  `cairn-detect` process.
+  The model decisions in `Cairn.Native.Config.normalize/1`'s vocabulary, for
+  the in-VM engine.
 
-  An unset field emits no flag, leaving the plugin's own default or its
-  sniffing in force — `--model-profile` and `--input-size` are both sniffed
-  from the model when absent, and a value guessed here would defeat that.
-  `--sample-fps` follows the same rule for a different reason: `fps_band:`
-  only *validates* a declared `sample_fps:` (D-P4) and is never itself a
-  source for the flag.
-  """
-  @spec model_argv(t()) :: [String.t()]
-  def model_argv(%__MODULE__{} = profile) do
-    model = model(profile)
+  An unset field is dropped rather than passed as `nil`: `normalize/1` then
+  defaults it, and the two of the six with a default (`decoder: "auto"`,
+  `sample_fps: 5`) take the crate's own clap values.
 
-    Enum.flat_map(@model_fields, fn {field, flag} ->
-      case Map.fetch!(model, field) do
-        nil -> []
-        value -> [flag, to_string(value)]
-      end
-    end)
-  end
-
-  @doc """
-  The same decisions in `Cairn.Native.Config.normalize/1`'s vocabulary, for a
-  membrane camera whose detection is the in-VM NIF.
-
-  An unset field is dropped rather than passed as `nil`, which is what makes it
-  the same decision as emitting no flag: `normalize/1` then defaults it, and
-  the two of these six with a default (`decoder: "auto"`, `sample_fps: 5`) take
-  the crate's own clap values.
-
-  `backend:` rides along here and not in `model_argv/1`, where it is the
-  operator's own argv rather than one of the six.
+  `backend:` rides along here; it is not one of the six model fields.
   """
   @spec native_config(t()) :: map()
   def native_config(%__MODULE__{} = profile) do

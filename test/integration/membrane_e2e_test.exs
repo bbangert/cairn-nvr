@@ -90,14 +90,11 @@ defmodule Cairn.MembraneE2ETest do
       # is built without a detect branch.
       plugin: {:group, "native"},
       # Under the clip's own scores: the cars sit at 0.56-0.63.
-      min_score: %{"default" => 0.4},
-      pipeline: :membrane
+      min_score: %{"default" => 0.4}
     }
 
     config = %Config{
       data_dir: Config.Server.get().data_dir,
-      udp_base_port: 19_600,
-      udp_port_range: 10,
       pre_window_seconds: 2,
       post_window_seconds: 3,
       max_event_seconds: 30,

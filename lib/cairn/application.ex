@@ -49,8 +49,6 @@ defmodule Cairn.Application do
       # purpose — see the module's own doc.
       {Cairn.TrackerSupervisor, []},
       {Cairn.EventSupervisor, []},
-      # Groups before cameras: a group listens on its members' UDP ports
-      {Cairn.PluginGroupSupervisor, []},
       # Before the cameras that mint epochs into it
       {Cairn.StreamEpochs, []},
       # After the epochs it announces under, before the cameras that open
@@ -60,8 +58,8 @@ defmodule Cairn.Application do
       # After the host, whose ETS tables it reads — and its own process, so that a
       # host inside a native call cannot stop the check that would report it.
       {Cairn.Native.Health, []},
-      # The health surface a plugin's own process provides on the classic path.
-      # Its own process for the same reason: it reads the host under a deadline.
+      # Maps engine health onto the per-camera status surface. Its own
+      # process for Health's reason: it reads the host under a deadline.
       {Cairn.Native.Status, []},
       {Cairn.CameraSupervisor, []},
       {Cairn.Retention, []},

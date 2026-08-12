@@ -91,7 +91,6 @@ defmodule CairnWeb.ConfigLive do
       {"pre-roll", "#{config.pre_window_seconds}s"},
       {"post-roll", "#{config.post_window_seconds}s"},
       {"max event", "#{config.max_event_seconds}s"},
-      {"udp range", "#{config.udp_base_port || "—"} +#{config.udp_port_range || 0}"},
       {"stall threshold", "#{config.stall_seconds}s"},
       {"free-space floor", "#{config.free_space_min_mb} MB"},
       {"remux clips", if(config.remux_clips, do: "on", else: "off")}
@@ -117,7 +116,6 @@ defmodule CairnWeb.ConfigLive do
     ]
   end
 
-  defp plugin_label({:inline, argv}), do: Enum.join(argv, " ")
   defp plugin_label({:group, name}), do: name
   defp plugin_label(nil), do: "none"
 

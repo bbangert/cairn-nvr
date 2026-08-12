@@ -5,9 +5,6 @@ defmodule Cairn.Config.ServerTest do
 
   @base """
   data_dir: <%= data_dir %>
-  udp:
-    base_port: 18000
-    range: 20
   cameras:
     - id: cam_a
       rtsp_url: rtsp://h/1
@@ -25,17 +22,12 @@ defmodule Cairn.Config.ServerTest do
 
     test_pid = self()
     apply_diff = fn diff, config -> send(test_pid, {:applied, diff, config}) end
-    apply_group_diff = fn diff, config -> send(test_pid, {:groups_applied, diff, config}) end
     apply_native = fn config -> send(test_pid, {:native_applied, config}) end
 
     server =
       start_supervised!(
         {Config.Server,
-         path: path,
-         name: nil,
-         apply_diff: apply_diff,
-         apply_group_diff: apply_group_diff,
-         apply_native: apply_native},
+         path: path, name: nil, apply_diff: apply_diff, apply_native: apply_native},
         id: :config_server_under_test
       )
 
@@ -52,9 +44,6 @@ defmodule Cairn.Config.ServerTest do
   test "reload diffs added/removed/changed cameras", %{server: server, path: path, dir: dir} do
     updated = """
     data_dir: #{Path.join(dir, "data")}
-    udp:
-      base_port: 18000
-      range: 20
     cameras:
       - id: cam_a
         rtsp_url: rtsp://h/CHANGED
@@ -72,27 +61,30 @@ defmodule Cairn.Config.ServerTest do
              Config.Server.get(server).cameras
   end
 
-  # A membrane camera's detection is the in-VM engine rather than a group
-  # process, so the new config has to reach it as well as the two diffs — it is
-  # where a changed profile becomes a changed model.
-  test "reload hands the new config to the in-VM engine", %{
+  # Detection is the in-VM engine, so the new config has to reach it as well
+  # as the camera diff — it is where a changed profile becomes a changed
+  # model — and it has to reach it FIRST: the model a restarted camera opens
+  # a stream on should already be the new one.
+  test "reload hands the new config to the in-VM engine before the cameras", %{
     server: server,
     path: path,
     dir: dir
   } do
     File.write!(path, """
     data_dir: #{Path.join(dir, "data")}
-    udp:
-      base_port: 18000
-      range: 20
     cameras:
       - id: cam_a
-        rtsp_url: rtsp://h/1
-        pipeline: membrane
+        rtsp_url: rtsp://h/CHANGED
     """)
 
     assert {:ok, _diff, []} = Config.Server.reload(server)
-    assert_received {:native_applied, %Config{cameras: [%{id: "cam_a", pipeline: :membrane}]}}
+
+    # oldest message first: the engine, then the cameras
+    assert_received first
+    assert {:native_applied, %Config{cameras: [%{id: "cam_a"}]}} = first
+
+    assert_received second
+    assert {:applied, %{changed: ["cam_a"]}, %Config{}} = second
   end
 
   # The pre window is the one that restarts: the ring is sized from it at tree
@@ -104,9 +96,6 @@ defmodule Cairn.Config.ServerTest do
   } do
     updated = """
     data_dir: #{Path.join(dir, "data")}
-    udp:
-      base_port: 18000
-      range: 20
     events:
       pre_window_seconds: 8
     cameras:
@@ -129,9 +118,6 @@ defmodule Cairn.Config.ServerTest do
   } do
     updated = """
     data_dir: #{Path.join(dir, "data")}
-    udp:
-      base_port: 18000
-      range: 20
     events:
       post_window_seconds: 42
     cameras:
@@ -147,16 +133,13 @@ defmodule Cairn.Config.ServerTest do
              Config.Server.reload(server)
   end
 
-  test "reordering cameras marks both as changed (their udp ports shift)", %{
+  test "reordering cameras moves nothing — nothing positional is left", %{
     server: server,
     path: path,
     dir: dir
   } do
     updated = """
     data_dir: #{Path.join(dir, "data")}
-    udp:
-      base_port: 18000
-      range: 20
     cameras:
       - id: cam_b
         rtsp_url: rtsp://h/2
@@ -166,68 +149,8 @@ defmodule Cairn.Config.ServerTest do
 
     File.write!(path, updated)
 
-    assert {:ok, %{changed: ["cam_a", "cam_b"], added: [], removed: [], refreshed: []}, []} =
+    assert {:ok, %{changed: [], added: [], removed: [], refreshed: []}, []} =
              Config.Server.reload(server)
-  end
-
-  test "reload applies the plugin group diff before the camera diff", %{
-    server: server,
-    path: path,
-    dir: dir
-  } do
-    updated = """
-    data_dir: #{Path.join(dir, "data")}
-    udp:
-      base_port: 18000
-      range: 20
-    plugins:
-      detect:
-        command: ./detect --model m.onnx
-    cameras:
-      - id: cam_a
-        rtsp_url: rtsp://h/1
-        plugin: detect
-      - id: cam_b
-        rtsp_url: rtsp://h/2
-    """
-
-    File.write!(path, updated)
-
-    assert {:ok, %{changed: ["cam_a"]}, []} = Config.Server.reload(server)
-
-    # oldest message first: groups, then the in-VM engine, then cameras
-    assert_received first
-    assert {:groups_applied, %{added: ["detect"], removed: [], changed: []}, %Config{}} = first
-
-    assert_received second
-    assert {:native_applied, %Config{}} = second
-
-    assert_received third
-    assert {:applied, %{changed: ["cam_a"]}, %Config{}} = third
-  end
-
-  test "reload applies an empty group diff when no group changed", %{
-    server: server,
-    path: path,
-    dir: dir
-  } do
-    updated = """
-    data_dir: #{Path.join(dir, "data")}
-    udp:
-      base_port: 18000
-      range: 20
-    cameras:
-      - id: cam_a
-        rtsp_url: rtsp://h/CHANGED
-      - id: cam_b
-        rtsp_url: rtsp://h/2
-    """
-
-    File.write!(path, updated)
-
-    assert {:ok, %{changed: ["cam_a"]}, []} = Config.Server.reload(server)
-    assert_received {:applied, _, _}
-    assert_received {:groups_applied, %{added: [], removed: [], changed: []}, %Config{}}
   end
 
   describe "diff_cameras/2" do
@@ -256,7 +179,6 @@ defmodule Cairn.Config.ServerTest do
       for edit <- [
             %{"rtsp_url" => "rtsp://h/CHANGED"},
             %{"min_score" => 0.7},
-            %{"plugin" => "./detect --model m.onnx"},
             %{"transcode" => true},
             %{"extra_ffmpeg_args" => ["-rtsp_transport", "tcp"]},
             %{"pre_window_seconds" => 8}
@@ -267,30 +189,25 @@ defmodule Cairn.Config.ServerTest do
       end
     end
 
+    test "pointing a camera at a plugin group restarts it — the detect branch is per-session" do
+      base = %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1"}
+
+      assert Config.Server.diff_cameras(
+               profiled_config([base]),
+               profiled_config([Map.put(base, "plugin", "detect")])
+             ) == %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+    end
+
     test "a camera edited both ways is restarted, not refreshed" do
       assert camera_diff(%{"rtsp_url" => "rtsp://h/2", "stationary_after_ms" => 20_000}) ==
                %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
     end
 
-    test "flipping a camera's pipeline restarts it; an unchanged pipeline does not" do
-      # :pipeline is a @restart_field — the tree is built around it (a membrane
-      # camera's hub is socketless), so it cannot be swapped under a live camera.
-      assert camera_diff(%{"pipeline" => "membrane"}) ==
-               %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
-
-      # the same pipeline on both sides is neither a restart nor a refresh
-      base = %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1", "pipeline" => "membrane"}
-
-      assert Config.Server.diff_cameras(camera_config([base], %{}), camera_config([base], %{})) ==
-               %{added: [], removed: [], changed: [], refreshed: []}
-    end
-
     test "flipping a camera's ingest restarts it — the source process itself changes" do
       # :ingest is a @restart_field: it selects the session's source (ffmpeg
       # OS process vs RTSP client) and the pipeline's ingest chain — nothing
-      # a running session can swap in place. Isolated from the pipeline flip
-      # by holding membrane on both sides.
-      base = %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1", "pipeline" => "membrane"}
+      # a running session can swap in place.
+      base = %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1"}
       flipped = Map.put(base, "ingest", "rtsp")
 
       assert Config.Server.diff_cameras(
@@ -299,55 +216,9 @@ defmodule Cairn.Config.ServerTest do
              ) == %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
     end
 
-    test "a neighbour flipping to membrane moves nobody else's ports" do
-      cams = [
-        %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1"},
-        %{"id" => "cam_b", "rtsp_url" => "rtsp://h/2"}
-      ]
-
-      [cam_a, cam_b] = cams
-      old = camera_config(cams, %{})
-      new = camera_config([Map.put(cam_a, "pipeline", "membrane"), cam_b], %{})
-
-      # a membrane camera stops consuming its UDP ports but keeps its index
-      # slot, so cam_b is neither restarted nor refreshed by cam_a's flip
-      assert Config.Server.diff_cameras(old, new) ==
-               %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
-
-      assert Cairn.UDPPorts.ports_for(new, 1) == Cairn.UDPPorts.ports_for(old, 1)
-    end
-
     test "a global tracking edit refreshes the cameras that resolve through it" do
       assert camera_diff(%{}, %{"tracking" => %{"stationary_after_ms" => 20_000}}) ==
                %{added: [], removed: [], changed: [], refreshed: ["cam_a"]}
-    end
-
-    test "a global udp.base_port edit restarts every camera" do
-      cams = [
-        %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1"},
-        %{"id" => "cam_b", "rtsp_url" => "rtsp://h/2"}
-      ]
-
-      old = camera_config(cams, %{})
-      new = camera_config(cams, %{"udp" => %{"base_port" => 19_000, "range" => 20}})
-
-      # Neither the camera structs nor their indices moved, so this used to
-      # fall into no bucket at all and leave every camera bound to its old
-      # ports until a restart. The ports are compared resolved for exactly
-      # this reason.
-      assert Config.Server.diff_cameras(old, new) ==
-               %{added: [], removed: [], changed: ["cam_a", "cam_b"], refreshed: []}
-    end
-
-    test "a global udp.range edit alone changes no camera's ports" do
-      cams = [%{"id" => "cam_a", "rtsp_url" => "rtsp://h/1"}]
-      old = camera_config(cams, %{})
-      new = camera_config(cams, %{"udp" => %{"base_port" => 18_000, "range" => 40}})
-
-      # the range only bounds allocation (`Cairn.Config` rejects exhaustion);
-      # it is not an input to any camera's port block
-      assert Config.Server.diff_cameras(old, new) ==
-               %{added: [], removed: [], changed: [], refreshed: []}
     end
 
     test "a camera overriding the pre window is untouched when the global moves" do
@@ -373,82 +244,6 @@ defmodule Cairn.Config.ServerTest do
     end
   end
 
-  describe "diff_plugin_groups/2" do
-    test "added and removed groups" do
-      old = config(%{"gone" => plugin("./gone"), "detect" => plugin("./detect")}, "detect")
-      new = config(%{"fresh" => plugin("./fresh"), "detect" => plugin("./detect")}, "detect")
-
-      assert Config.Server.diff_plugin_groups(old, new) ==
-               %{added: ["fresh"], removed: ["gone"], changed: [], refreshed: []}
-    end
-
-    test "a changed command marks the group changed" do
-      old = config(%{"detect" => plugin("./detect")}, "detect")
-      new = config(%{"detect" => plugin("./detect --v2")}, "detect")
-
-      assert Config.Server.diff_plugin_groups(old, new) ==
-               %{added: [], removed: [], changed: ["detect"], refreshed: []}
-    end
-
-    test "a changed member set marks the group changed" do
-      old = config(%{"detect" => plugin("./detect")}, "detect")
-      new = config(%{"detect" => plugin("./detect")}, nil)
-
-      assert Config.Server.diff_plugin_groups(old, new) ==
-               %{added: [], removed: [], changed: ["detect"], refreshed: []}
-    end
-
-    test "a member's port shift marks the group changed" do
-      old = config(%{"detect" => plugin("./detect")}, "detect")
-
-      new =
-        %{
-          "data_dir" => "tmp/cfg_srv_test",
-          "udp" => %{"base_port" => 18_000, "range" => 20},
-          "plugins" => %{"detect" => plugin("./detect")},
-          "cameras" => [
-            %{"id" => "cam_b", "rtsp_url" => "rtsp://h/2"},
-            %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1", "plugin" => "detect"}
-          ]
-        }
-        |> from_map!()
-
-      assert [%{members: [%{id: "cam_a", udp_port: 18_000}]}] = old.plugin_groups
-      assert [%{members: [%{id: "cam_a", udp_port: 18_004}]}] = new.plugin_groups
-
-      assert Config.Server.diff_plugin_groups(old, new) ==
-               %{added: [], removed: [], changed: ["detect"], refreshed: []}
-    end
-
-    test "an edit to the profile file marks the group changed" do
-      # Same group, same `command:`, same profile *name* — only the file's
-      # content moved (input_size 416 -> 640). The expansion is in the
-      # group's command by the time this diff runs, so the model flags a
-      # running plugin was spawned with cannot go stale.
-      old = profiled_config("test/support/fixtures/profiles/argv")
-      new = profiled_config("test/support/fixtures/profiles/argv-edited")
-
-      assert [%{command: old_command}] = old.plugin_groups
-      assert [%{command: new_command}] = new.plugin_groups
-      assert "416" in old_command
-      assert "640" in new_command
-
-      assert Config.Server.diff_plugin_groups(old, new) ==
-               %{added: [], removed: [], changed: ["detect"], refreshed: []}
-    end
-  end
-
-  # One group on the `full` profile, resolved from `dir`.
-  defp profiled_config(dir) do
-    from_map!(%{
-      "data_dir" => "tmp/cfg_srv_test",
-      "udp" => %{"base_port" => 18_000, "range" => 20},
-      "profile_dirs" => [dir],
-      "plugins" => %{"detect" => %{"command" => "./detect", "profile" => "full"}},
-      "cameras" => [%{"id" => "cam_a", "rtsp_url" => "rtsp://h/1", "plugin" => "detect"}]
-    })
-  end
-
   test "invalid reload keeps old config and reports errors", %{server: server, path: path} do
     old = Config.Server.get(server)
     File.write!(path, "cameras: [{id: cam_a}]\n")
@@ -472,29 +267,17 @@ defmodule Cairn.Config.ServerTest do
   end
 
   defp camera_config(cameras, global) do
-    from_map!(
-      Map.merge(
-        %{
-          "data_dir" => "tmp/cfg_srv_test",
-          "udp" => %{"base_port" => 18_000, "range" => 20},
-          "cameras" => cameras
-        },
-        global
-      )
-    )
+    from_map!(Map.merge(%{"data_dir" => "tmp/cfg_srv_test", "cameras" => cameras}, global))
   end
 
-  defp plugin(command), do: %{"command" => command}
-
-  defp config(plugins, cam_a_plugin) do
-    cam_a = %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1"}
-    cam_a = if cam_a_plugin, do: Map.put(cam_a, "plugin", cam_a_plugin), else: cam_a
-
+  # A config carrying one profiled group, for camera edits that need a
+  # resolvable `plugin:` reference.
+  defp profiled_config(cameras) do
     from_map!(%{
       "data_dir" => "tmp/cfg_srv_test",
-      "udp" => %{"base_port" => 18_000, "range" => 20},
-      "plugins" => plugins,
-      "cameras" => [cam_a, %{"id" => "cam_b", "rtsp_url" => "rtsp://h/2"}]
+      "profile_dirs" => ["test/support/fixtures/profiles/argv"],
+      "plugins" => %{"detect" => %{"profile" => "partial"}},
+      "cameras" => cameras
     })
   end
 

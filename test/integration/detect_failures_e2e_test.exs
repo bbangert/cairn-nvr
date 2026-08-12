@@ -54,14 +54,11 @@ defmodule Cairn.DetectFailuresE2ETest do
       id: id,
       rtsp_url: "file://" <> Path.absname(@clip),
       plugin: {:group, "native"},
-      min_score: %{"default" => 0.4},
-      pipeline: :membrane
+      min_score: %{"default" => 0.4}
     }
 
     config = %Config{
       data_dir: Config.Server.get().data_dir,
-      udp_base_port: 19_700,
-      udp_port_range: 10,
       pre_window_seconds: 2,
       post_window_seconds: 3,
       max_event_seconds: 30,

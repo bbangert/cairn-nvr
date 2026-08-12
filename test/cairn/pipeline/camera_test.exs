@@ -269,7 +269,6 @@ defmodule Cairn.Pipeline.CameraTest do
       %Camera{
         id: id,
         rtsp_url: "rtsp://127.0.0.1:554/x",
-        pipeline: :membrane,
         plugin: plugin
       }
     end
@@ -280,7 +279,6 @@ defmodule Cairn.Pipeline.CameraTest do
         plugin_groups: [
           %PluginGroup{
             name: "g",
-            command: ["cairn-detect"],
             profile: %Profile{name: "p", sample_fps: 3}
           }
         ],

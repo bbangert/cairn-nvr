@@ -23,14 +23,6 @@ free_space_min_mb: 2048
 # clips knowing how long they are.
 remux_clips: true
 
-# UDP ports handed to inference plugins / WebRTC RTP taps.
-# Each camera consumes 4 ports: plugin RTP at base_port + 4*index and WebRTC
-# RTP at +2, with each odd port left free for the matching RTCP socket that
-# standard RTP receivers bind.
-udp:
-  base_port: 17000
-  range: 100
-
 # Event clip windows (per-camera overridable with the same keys).
 events:
   pre_window_seconds: 5
@@ -43,8 +35,8 @@ events:
 # that while it is stationary, so a parked object outlasts what parks in front
 # of it; its object_id (a ULID) is never handed to anything else.
 # max_live_tracks caps how many tracks one camera may hold at once — at the cap
-# the least recently seen one is retired (end_reason "evicted"), so a plugin
-# that mints a fresh track id every frame cannot grow the host's state without
+# the least recently seen one is retired (end_reason "evicted"), so a scene
+# that mints a fresh identity every frame cannot grow the host's state without
 # bound.
 # stationary_after_ms is how long an object's box must hold still, in stream
 # time, before the track is reported as stationary. Leaving that state is
@@ -65,7 +57,7 @@ events:
 # believing is where the object actually went rather than where it was going
 # before it vanished. Only gaps between one and ten seconds qualify — under
 # that the coast is still close to what it measured, over it a straight line
-# between two sightings is a guess of its own — and a stretch the plugin is
+# between two sightings is a guess of its own — and a stretch the detector is
 # re-reporting a still object through is never one of them. Off by default.
 # ocr (observation-centric recovery) runs after both association passes and
 # bbd: a live coasted track is offered against whatever detections are still
@@ -73,10 +65,10 @@ events:
 # recovery a mover that pauses behind an occluder and reappears where it
 # vanished needs, since its prediction has since drifted off that spot. A
 # stationary track is excluded, for bbd's reason. Off by default.
-# reid fuses appearance into matching: with an embedder plugin running, a
-# person detection's embedding (accepted on the wire but only used if this is
-# on) feeds a rolling per-track appearance, and the bbd admission gains an
-# appearance veto and a cost tiebreak from it. Its only seam into the tracker
+# reid fuses appearance into matching: with the engine's embedder running, a
+# person detection's embedding (carried on the observation but only used if
+# this is on) feeds a rolling per-track appearance, and the bbd admission
+# gains an appearance veto and a cost tiebreak from it. Its only seam into the tracker
 # is that admission, so reid: true requires bbd: true — config load refuses
 # the combination of reid: true with bbd: false rather than accept a flag that
 # can never act. Off by default: the fusion is unmeasured until phase-6 E2E
@@ -128,34 +120,19 @@ retention:
 # profile_dirs:
 #   - /etc/cairn/profiles
 
-# Named plugin groups: one process serves every camera that names it, launched
-# with a --cameras-json array of its members instead of the per-camera flags.
-# Use this for an accelerator only one process can hold at a time (a Coral Edge
-# TPU is the motivating case); otherwise give each camera its own inline
-# command below. A group is restarted when its command, membership, profile (or
-# the contents of the profile's file), or a member's min_score or UDP port
-# changes — never when a member camera stops.
+# Named plugin groups: the profile whose model this node's own engine loads
+# for every camera that names the group. Detection runs in the VM (one engine,
+# one model per node — groups naming different models fail the load), so a
+# group is nothing but that profile reference plus your consent flags.
 # plugins:
 #   detect:
-#     # the path to your built binary, resolved from Cairn's own working
-#     # directory — not from the plugin's. --labels belongs to the --model
-#     # above it: coco.names is the 80-entry list yolox and the Ultralytics
-#     # families emit, an rfdetr model needs the 91-entry coco91.names.
-#     # cairn-detect refuses to start on a count mismatch rather than emit
-#     # every detection under the wrong class name.
-#     command: plugins/cairn-detect/target/release/cairn-detect --model yolox_nano.onnx --labels coco.names
-#
-#   # The same group, written with a hardware profile instead. The profile
-#   # names the model, the family, the input size, the labels and the
-#   # inference backend — and the tracker stages that go with them, for every
-#   # camera on this group — so `command:` keeps only what describes this
-#   # deployment. A profiled group that also writes --model, --model-profile,
-#   # --input-size, --decoder or --labels itself fails the load: those five
-#   # come from the profile alone. --motion-json and --track-floor-json are
-#   # not on that list and stay yours.
-#   npu:
-#     command: plugins/cairn-detect/target/release/cairn-detect
 #     # A filename under priv/profiles/ or a profile_dirs entry, without .yml.
+#     # The profile names the model, the family, the input size, the labels
+#     # and the inference backend — and the tracker stages that go with them,
+#     # for every camera on this group.
+#     profile: generic-ort
+#
+#   npu:
 #     profile: rk3566-lowfps
 #     # Required to run a profile whose backend is not `ort`: only `ort`
 #     # executes today. Both halves are needed — the profile declares
@@ -165,12 +142,11 @@ retention:
 cameras: []
 #  - id: front_door
 #    rtsp_url: rtsp://user:pass@192.168.1.10:554/stream1
-#    # Inference plugin. A list, or a string with whitespace, is an inline
-#    # command run as this camera's own process; a single whitespace-free
-#    # token names a group under `plugins:` above (undefined ⇒ config error).
-#    # An inline command of one token must therefore be a one-element list.
-#    # Receives RTP on an assigned UDP port, prints ndjson detections on stdout.
-#    plugin: ["plugins/cairn-detect/target/release/cairn-detect"]
+#    # Detection: names a group under `plugins:` above (undefined ⇒ config
+#    # error), whose profile picks the model this node's engine runs for the
+#    # camera. Absent ⇒ no detection. The pre-phase-6 inline-command form is
+#    # refused with the migration spelled out.
+#    plugin: detect
 #    # Three levels of threshold, per label. Each answers a different
 #    # question, and they must not fight: effective `record` >= `track` >=
 #    # `min_score` for every label, or the config is rejected. "Effective"
@@ -181,11 +157,12 @@ cameras: []
 #    # `record:` block leaves out is fine; that is rows without video, which
 #    # is what these tiers are for.
 #    #
-#    #   min_score  does the plugin emit the detection at all — the wire
-#    #              floor. It reaches the plugin process as argv, so the host
-#    #              never sees anything below it and changing it restarts the
-#    #              camera. A label under this floor is invisible, which is
-#    #              why a `record` below it could only ever fire zero times.
+#    #   min_score  does the engine emit the detection at all — the wire
+#    #              floor. It reaches the engine as the stream's params at
+#    #              session start, so the tracker never sees anything below
+#    #              it and changing it restarts the camera. A label under
+#    #              this floor is invisible, which is why a `record` below
+#    #              it could only ever fire zero times.
 #    #   track      does the detection earn a row in the track log.
 #    #   record     does the detection trigger video.
 #    #

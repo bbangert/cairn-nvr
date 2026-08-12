@@ -64,7 +64,7 @@ defmodule Cairn.Native.StatusTest do
   # detect on this node, stream or no stream.
   defp detecting(ids) do
     cameras =
-      Enum.map(ids, &%Cairn.Config.Camera{id: &1, pipeline: :membrane, plugin: {:group, "det"}})
+      Enum.map(ids, &%Cairn.Config.Camera{id: &1, plugin: {:group, "det"}})
 
     fn -> %Cairn.Config{cameras: cameras} end
   end

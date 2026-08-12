@@ -120,7 +120,7 @@ defmodule Cairn.Native.Status do
   # detector.
   defp configured(state) do
     state.config_source.().cameras
-    |> Enum.filter(&(&1.pipeline == :membrane and &1.plugin != nil))
+    |> Enum.filter(&(&1.plugin != nil))
     |> Enum.map(& &1.id)
   end
 

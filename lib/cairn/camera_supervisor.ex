@@ -2,11 +2,10 @@ defmodule Cairn.CameraSupervisor do
   @moduledoc """
   DynamicSupervisor over per-camera supervision trees (`Cairn.Camera`).
 
-  Camera UDP port allocation is positional (see `Cairn.UDPPorts`), so
-  start/stop take the camera's index in the config list. `sync/1` reconciles
-  running cameras against a config; `apply_diff/2` applies a reload diff,
-  restarting the cameras it marks `changed` and handing the new config to the
-  detection producers of the ones it marks `refreshed` (`refresh_camera/2`).
+  `sync/1` reconciles running cameras against a config; `apply_diff/2`
+  applies a reload diff, restarting the cameras it marks `changed` and
+  handing the new config to the ones it marks `refreshed`
+  (`refresh_camera/2`).
   """
 
   use DynamicSupervisor
@@ -40,10 +39,8 @@ defmodule Cairn.CameraSupervisor do
 
     Enum.each(MapSet.difference(running, wanted), &stop_camera/1)
 
-    config.cameras
-    |> Enum.with_index()
-    |> Enum.each(fn {cam, index} ->
-      unless MapSet.member?(running, cam.id), do: start_camera(config, cam, index)
+    Enum.each(config.cameras, fn cam ->
+      unless MapSet.member?(running, cam.id), do: start_camera(config, cam)
     end)
   end
 
@@ -51,8 +48,8 @@ defmodule Cairn.CameraSupervisor do
   Applies a `Cairn.Config.Server` reload diff against `new_config`.
 
   A `refreshed` camera is one the stop+sync above deliberately left running:
-  its plugin port is still the pre-reload OS process, still holding the
-  pre-reload policy, so it is handed the new one instead of being restarted.
+  its running session still holds the pre-reload policy, so it is handed
+  the new one instead of being restarted.
   """
   @spec apply_diff(Config.Server.diff(), Config.t()) :: :ok
   # The full diff shape is matched in the head: all four keys are the
@@ -70,41 +67,24 @@ defmodule Cairn.CameraSupervisor do
   end
 
   @doc """
-  Hands a still-running camera's detection producers the new camera and config.
-
-  Both are told, because a camera can have either: the plugin port owns the
-  external plugin's policy, the ffmpeg port owns the membrane pipeline's. Each
-  hop is a no-op when that producer is absent, which is ordinary — a
-  `{:group, _}` camera registers no `:plugin` of its own
-  (`Cairn.PluginGroupSupervisor` refreshes the shared group process that serves
-  it), a camera with no `plugin:` at all has nothing to refresh, a classic
-  camera's ffmpeg port holds no policy, and a camera that is not running has no
-  process to tell. The config lookup guards the case a diff cannot produce: an
-  id `config` does not carry.
+  Hands a still-running camera's ffmpeg port the new camera and config — it
+  owns the pipeline whose sink applies the policy. A camera that is not
+  running has no process to tell, and the config lookup guards the case a
+  diff cannot produce: an id `config` does not carry.
   """
   @spec refresh_camera(Config.t(), String.t()) :: :ok
   def refresh_camera(%Config{} = config, camera_id) do
-    case Enum.find(config.cameras, &(&1.id == camera_id)) do
-      %Config.Camera{} = cam ->
-        refresh(camera_id, :plugin, &Cairn.PluginPort.refresh(&1, cam, config))
-        refresh(camera_id, :ffmpeg, &Cairn.FFmpegPort.refresh(&1, cam, config))
-
-      nil ->
-        :ok
+    with %Config.Camera{} = cam <- Enum.find(config.cameras, &(&1.id == camera_id)),
+         pid when is_pid(pid) <- Cairn.Registry.whereis(camera_id, :ffmpeg) do
+      Cairn.FFmpegPort.refresh(pid, cam, config)
+    else
+      _absent -> :ok
     end
   end
 
-  defp refresh(camera_id, role, refresh_fun) do
-    case Cairn.Registry.whereis(camera_id, role) do
-      pid when is_pid(pid) -> refresh_fun.(pid)
-      nil -> :ok
-    end
-  end
-
-  @spec start_camera(Config.t(), Config.Camera.t(), non_neg_integer()) ::
-          DynamicSupervisor.on_start_child()
-  def start_camera(%Config{} = config, cam, index) do
-    spec = {Cairn.Camera, camera: cam, index: index, config: config}
+  @spec start_camera(Config.t(), Config.Camera.t()) :: DynamicSupervisor.on_start_child()
+  def start_camera(%Config{} = config, cam) do
+    spec = {Cairn.Camera, camera: cam, config: config}
 
     case DynamicSupervisor.start_child(__MODULE__, spec) do
       {:ok, pid} ->

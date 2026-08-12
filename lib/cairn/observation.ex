@@ -5,14 +5,16 @@ defmodule Cairn.Observation do
 
   Two producers build these, and the struct is the contract between them:
 
-    * `Cairn.PluginProtocol.decode_line/2` from an external plugin's ndjson,
-      completed by the port that owns the plugin process (`camera_id`,
-      `plugin_instance`, and — for v0 lines, which carry none of it —
-      `epoch` and `observed_at`).
-    * `Cairn.Native.Observations` from the in-VM NIF's typed terms, where
-      there is no line and no plugin process: `sequence` and
-      `plugin_instance` are `nil`, and the byte-level revalidation the
+    * `Cairn.Native.Observations` from the in-VM NIF's typed terms — the
+      live path, where there is no line and no plugin process: `sequence`
+      and `plugin_instance` are `nil`, and the byte-level revalidation the
       ndjson path needs is deliberately absent (see that module).
+    * `Cairn.PluginProtocol.decode_line/2` from recorded plugin ndjson,
+      completed by the harness replaying it (`camera_id`,
+      `plugin_instance`, and — for v0 lines, which carry none of it —
+      `epoch` and `observed_at`). Since the external plugin path was
+      deleted (membrane port phase 6) this producer feeds only the parity,
+      golden-replay and MOT harnesses.
 
   Timing has two qualities. A v1 line carries `observed_at` from the plugin,
   captured next to the frame it describes (`:source`); a v0 line has no time

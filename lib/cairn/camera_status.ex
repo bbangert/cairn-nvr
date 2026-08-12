@@ -5,8 +5,8 @@ defmodule Cairn.CameraStatus do
   last detector health reported for the camera, with PubSub change
   notifications on `"cameras:status"`.
 
-  Written by `Cairn.FFmpegPort` / the watchdog, by the plugin ports, and — for
-  a camera detected on by the in-VM native block, which has no plugin process —
+  Written by `Cairn.FFmpegPort` / the watchdog and — for the detector's own
+  health, which the in-VM native block reports with no process of its own —
   by `Cairn.Native.Status`; read by the dashboard and config LiveViews and by
   the HA API.
   """
@@ -32,9 +32,9 @@ defmodule Cairn.CameraStatus do
   def set_probe(camera_id, probe), do: merge(camera_id, %{probe: probe})
 
   @doc """
-  Stores the detector's own last reported state, in `plugin.status`'s shape:
-  string-keyed and JSON-safe, because it is served as JSON and, on the plugin
-  path, arrived as JSON.
+  Stores the detector's own last reported state, in the `plugin.status`
+  shape the external contract defined: string-keyed and JSON-safe, because
+  it is served as JSON. The key name outlives the plugin path it came from.
   """
   @spec set_plugin_status(String.t(), map() | nil) :: :ok
   def set_plugin_status(camera_id, status), do: merge(camera_id, %{plugin_status: status})

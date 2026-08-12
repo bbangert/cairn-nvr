@@ -1,12 +1,17 @@
 defmodule Cairn.PluginProtocol do
   @moduledoc """
-  Pure codec for the plugin wire protocol (see `docs/plugin-contract.md`).
+  Pure codec for the `cairn-detect` ndjson output format (the archived
+  wire contract: `docs/archive/plugin-contract.md`).
 
-  Plugin output is untrusted: a plugin is an arbitrary OS process and every
-  decoded line reaches a camera's `Cairn.CameraTracker`, so a line that does
-  not match the contract exactly must never leave this module.
-  `Cairn.PluginPort` and `Cairn.PluginGroupPort` hand raw lines to
-  `decode_line/2` and act on the result.
+  The external plugin path this was the trust boundary for is gone
+  (membrane port phase 6) — live detection is the in-VM engine, which never
+  produces lines. What keeps this codec load-bearing is everything that
+  reads *recorded* plugin output: `Cairn.Native.Parity` (the x86 parity
+  reference runs the plugin binary and decodes its stdout),
+  `test/support/golden_replay.ex` (captures under `test/support/golden/`),
+  and `mix cairn.mot.ndjson`. Those recordings are still untrusted input,
+  so a line that does not match the contract exactly must never leave this
+  module.
 
   Two wire versions are decoded here:
 
