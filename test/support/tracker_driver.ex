@@ -36,7 +36,7 @@ defmodule Cairn.TrackerDriver do
   """
   @spec detections(GenServer.server() | nil, Camera.t(), map(), Observation.t()) :: :ok
   def detections(server, %Camera{} = camera, policy, %Observation{} = observation) do
-    observation = observation |> with_observed_at() |> with_at_ms()
+    observation = observation |> with_observed_at() |> with_at_ms() |> with_epoch(camera)
     {tracker, sink} = state(server, camera, policy)
 
     buffer = %Buffer{
@@ -188,6 +188,20 @@ defmodule Cairn.TrackerDriver do
 
   defp with_at_ms(observation),
     do: %{observation | at_ms: System.monotonic_time(:millisecond)}
+
+  # In production the tagger mints before anything reaches the detect branch,
+  # so the element refuses a nil epoch as a contract violation — a test that
+  # never mentions epochs still has to arrive under one. The camera's current
+  # epoch when a test announced one (what the tagger would carry), else a
+  # per-camera constant so consecutive detections read as one session.
+  defp with_epoch(%Observation{epoch: nil} = observation, camera) do
+    case Cairn.StreamEpochs.current(camera.id) do
+      {:ok, epoch} -> %{observation | epoch: epoch}
+      :unknown -> %{observation | epoch: "driver-" <> camera.id}
+    end
+  end
+
+  defp with_epoch(observation, _camera), do: observation
 
   # What `Cairn.Pipeline.ObservationStamper` resolves per buffer, minus the
   # clock: the policy's bounds defaulted, with the runtime `min_score` override
