@@ -22,8 +22,10 @@ The patches are mechanical, never algorithmic:
   runs when a caller passes images, which the detections-only harness
   never does; the authors' own MOT20 protocol runs GMC disabled); the
   detectron2 `Instances` unpack in `update()` replaced with a plain
-  numpy `(N, 5)` interface; `cython_bbox` IoU reuses bytetrack's numpy
-  replacement; `tracker.*` imports made relative.
+  numpy `(N, 5)` interface; `cython_bbox` IoU replaced with a local copy
+  of the same numpy implementation (deliberately not imported from the
+  bytetrack tree — the vendored trees must not depend on each other);
+  `tracker.*` imports made relative.
 
 Regenerating a patch after editing a vendored file: diff the pristine
 upstream file (clone at the pinned SHA) against `vendor/<name>/<file>`

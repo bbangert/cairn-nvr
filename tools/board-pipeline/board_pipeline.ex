@@ -199,7 +199,7 @@ defmodule Cairn.BoardPipeline.Collector do
   @impl true
   def handle_cast({:detections, camera, _policy, observation}, state) do
     now = System.monotonic_time(:millisecond)
-    cam = Map.get(state.cams, camera.id, new_cam())
+    cam = Map.get_lazy(state.cams, camera.id, &new_cam/0)
 
     cam =
       case cam.last_at_ms do
@@ -307,7 +307,7 @@ defmodule Cairn.BoardPipeline.Collector do
         |> Enum.map(&String.to_integer/1)
 
       case fields do
-        [user, nice, system, idle | tail] ->
+        [_user, _nice, _system, idle | tail] ->
           iowait = Enum.at(tail, 0, 0)
           total = Enum.sum(fields)
           {total - idle - iowait, total}
@@ -502,7 +502,8 @@ defmodule Cairn.BoardPipeline do
     configure_nif_paths(opts)
 
     result =
-      with :ok <- validate_streams(opts),
+      with :ok <- validate_positive(opts, :streams),
+           :ok <- validate_positive(opts, :seconds),
            :ok <- start_apps(),
            :ok <- check_available(),
            {:ok, clip} <- read_clip(opts.clip) do
@@ -717,11 +718,17 @@ defmodule Cairn.BoardPipeline do
 
   # `streams: 0` would make `1..opts.streams` a *descending* range and run
   # two streams — the exact off-by-configuration board-soak documents.
-  defp validate_streams(%{streams: streams}) when is_integer(streams) and streams >= 1, do: :ok
+  # `seconds: 0` survives to the summary's per-second division and raises
+  # there, after the run — refuse both up front.
+  defp validate_positive(opts, key) do
+    case Map.fetch!(opts, key) do
+      value when is_integer(value) and value >= 1 ->
+        :ok
 
-  defp validate_streams(%{streams: streams}) do
-    IO.puts("board-pipeline: refusing to run — streams must be >= 1, got #{inspect(streams)}")
-    {:error, {:streams, streams}}
+      value ->
+        IO.puts("board-pipeline: refusing to run — #{key} must be >= 1, got #{inspect(value)}")
+        {:error, {key, value}}
+    end
   end
 
   # A missing library must not read as a clean run.

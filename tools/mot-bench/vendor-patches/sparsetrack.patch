@@ -38,7 +38,7 @@
              warp = np.eye(3,3)
 --- a/matching.py
 +++ b/matching.py
-@@ -1,12 +1,10 @@
+@@ -1,12 +1,32 @@
 -import cv2
  import numpy as np
  import scipy
@@ -48,7 +48,29 @@
 -from cython_bbox import bbox_overlaps as bbox_ious
 -from tracker import kalman_filter
 -import time
-+from bytetrack.matching import bbox_ious
++
++def bbox_ious(atlbrs, btlbrs):
++    # numpy replacement for cython_bbox.bbox_overlaps (same semantics: the
++    # +1 pixel convention on widths/heights, IoU over union of areas).
++    # Deliberately a local copy of bytetrack/matching.py's replacement, not
++    # an import — the two vendored trees must not depend on each other.
++    atlbrs = np.ascontiguousarray(atlbrs, dtype=np.float64)
++    btlbrs = np.ascontiguousarray(btlbrs, dtype=np.float64)
++    ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float64)
++    if ious.size == 0:
++        return ious
++    bw = btlbrs[:, 2] - btlbrs[:, 0] + 1
++    bh = btlbrs[:, 3] - btlbrs[:, 1] + 1
++    barea = bw * bh
++    for i, a in enumerate(atlbrs):
++        iw = np.minimum(a[2], btlbrs[:, 2]) - np.maximum(a[0], btlbrs[:, 0]) + 1
++        ih = np.minimum(a[3], btlbrs[:, 3]) - np.maximum(a[1], btlbrs[:, 1]) + 1
++        iw = np.maximum(iw, 0)
++        ih = np.maximum(ih, 0)
++        inter = iw * ih
++        aarea = (a[2] - a[0] + 1) * (a[3] - a[1] + 1)
++        ious[i] = inter / (aarea + barea - inter)
++    return ious
 +from . import kalman_filter
  
  def merge_matches(m1, m2, shape):
