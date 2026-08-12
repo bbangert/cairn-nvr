@@ -84,7 +84,11 @@ defmodule Cairn.PluginProtocol do
 
   @type det :: %{label: String.t(), score: float(), bbox: [number()]}
 
-  @typedoc "Per-camera ports know their camera; group ports route by `camera_id`."
+  @typedoc """
+  Which process shape produced the recording: `:camera` output is attributed
+  by the caller, `:group` (multiplexed) output routes by its own
+  `camera_id`. Both shapes exist in recorded captures; no live port remains.
+  """
   @type mode :: :camera | :group
 
   @type decoded ::
@@ -97,9 +101,10 @@ defmodule Cairn.PluginProtocol do
   @doc """
   Decodes one plugin stdout line.
 
-  `mode` is `:group` for a multiplexed plugin — every `frame.objects` line
-  must then name its camera. In `:camera` mode a `camera_id` is accepted and
-  ignored: the port owns exactly one camera and attributes the line itself.
+  `mode` is `:group` for a line recorded from a multiplexed plugin — every
+  `frame.objects` line must then name its camera. In `:camera` mode a
+  `camera_id` is accepted and ignored: the caller owns exactly one camera
+  and attributes the line itself.
 
   `{:ignore, reason}` is a well-formed message this version does not act on
   (forward compatibility); `{:error, reason}` is a contract violation and the

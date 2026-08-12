@@ -2,9 +2,10 @@ defmodule Cairn.Camera do
   @moduledoc """
   Per-camera supervision tree (`:rest_for_one`).
 
-  Child order: `RingBuffer` -> `FFmpegPort` -> `RTPHub`. Ring death restarts
-  the ingest (a fresh ring is empty anyway); ingest death restarts only its
-  downstream consumers.
+  Child order: `RingBuffer` -> `FFmpegPort` -> `RTPHub` (plus a
+  `:temporary` probe task ahead of them, outside the restart chain this
+  order describes). Ring death restarts the ingest (a fresh ring is empty
+  anyway); ingest death restarts only its downstream consumers.
 
   Detection is not in this tree: the camera's pipeline feeds the node's one
   in-VM engine (`Cairn.Native.Host`) at the end of its detect branch, and

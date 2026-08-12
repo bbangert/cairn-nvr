@@ -68,32 +68,30 @@ defmodule Cairn.Config.Profile do
   (`Cairn.Tracker.Stage.validate_lists/1`) — an illegal composition fails
   the config load, since the tracker has no error channel.
 
-  ## The model half, twice
+  ## The model half
 
-  The same six fields reach two detection paths. `model_argv/1` renders them
-  as the plugin's argv, materialised into the group's `command` at config load
-  (`Cairn.Config`): `--model` (the `model:` entry for this profile's own
-  backend), `--model-profile`, `--input-size`, `--decoder`, `--labels`,
-  `--sample-fps`. `native_config/1` renders the same fields as the in-VM
-  engine's init config for a membrane camera. Both walk one table (`model/1`),
-  which is what stops a profile field from reaching one path and not the other.
+  The six model fields render once, through `native_config/1`, into the
+  in-VM engine's init config (`Cairn.Native.Config.normalize/1`'s
+  vocabulary): the `model:` entry for this profile's own backend,
+  `model_profile`, `input_size`, `decoder`, `labels`, `sample_fps`.
+  `model/1` is the shared table `native_config/1` and validation both walk.
+  (Until membrane port phase 6 the same table also rendered a plugin argv;
+  that path is gone.)
 
-  An unset field emits no flag, leaving the plugin's own default or its
-  sniffing in force. `--sample-fps` is the one flag `fps_band:` never fills
-  in for: the band only validates a declared `sample_fps:` (D-P4) — it is
-  never the source of the flag, so a profile with a band and no `sample_fps:`
-  still emits nothing. Because the profile is the **single source** of those
-  six (D-P4), a profiled group whose `command:` already names one fails the
-  load; `--motion-json` and `--track-floor-json` are not on that list and
-  stay operator-owned (D-P6).
+  An unset field is dropped, leaving the crate's own default or its
+  sniffing in force. `sample_fps` is the one field `fps_band:` never fills
+  in: the band only validates a declared `sample_fps:` (D-P4) — it is
+  never the source of the value, so a profile with a band and no
+  `sample_fps:` still passes nothing. The profile is the **single source**
+  of those six (D-P4); the motion and track-floor scene knobs are not among
+  them and stay operator-owned (D-P6).
 
-  Three things `Cairn.Config` refuses at load rather than at group start,
-  which is where an operator reads diagnostics: a `model:` artifact that is
-  not on disk, a `labels:` file that is not on disk, and a group running a
-  backend other than `ort` — experimental until proven in soak, whether the
-  plugin executes it (qnn) or stubs it (rknn) (D-P10) — unless the profile
-  declares `experimental: true` *and* the group sets
-  `allow_experimental: true`. The two file paths are checked only for a
+  Three things `Cairn.Config` refuses at load, which is where an operator
+  reads diagnostics: a `model:` artifact that is not on disk, a `labels:`
+  file that is not on disk, and a group running a backend other than `ort`
+  — experimental until proven in soak, whether the engine executes it (qnn)
+  or stubs it (rknn) (D-P10) — unless the profile declares
+  `experimental: true` *and* the group sets `allow_experimental: true`. The two file paths are checked only for a
   profile some group actually runs, so a board profile for hardware this node
   does not have costs it nothing.
 
