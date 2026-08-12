@@ -436,8 +436,8 @@ defmodule Cairn.EventExtractor do
   # `pts`. Either way the fragment's duration is what carries a decode time to
   # the end of its media.
   #
-  # An ffmpeg respawn mid-event restarts `pts` near zero while `first_pts` still
-  # names the old session, which makes the difference negative. Nothing is done
+  # A session boundary mid-event restarts `pts` near zero while `first_pts`
+  # still names the old session, which makes the difference negative. Nothing is done
   # about it here: a negative media position is what `Cairn.TrackPath` rejects a
   # half on, and the drain half answers instead.
   defp live_media_ms(%{first_pts: nil}, frag), do: frag.duration_ms

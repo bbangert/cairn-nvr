@@ -17,6 +17,16 @@ defmodule Cairn.Registry do
   @spec via(String.t(), role()) :: {:via, Registry, {module(), {String.t(), role()}}}
   def via(camera_id, role), do: {:via, Registry, {__MODULE__, {camera_id, role}}}
 
+  @doc """
+  Registers the calling process under `{camera_id, role}`.
+
+  For processes that cannot be started with a `name:` — a membrane element is
+  one. The registry unregisters on the process's DOWN, so nothing has to be
+  undone on teardown.
+  """
+  @spec register(String.t(), role()) :: {:ok, pid()} | {:error, {:already_registered, pid()}}
+  def register(camera_id, role), do: Registry.register(__MODULE__, {camera_id, role}, nil)
+
   @spec whereis(String.t(), role()) :: pid() | nil
   def whereis(camera_id, role) do
     case Registry.lookup(__MODULE__, {camera_id, role}) do

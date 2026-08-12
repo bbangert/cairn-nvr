@@ -57,7 +57,7 @@ defmodule CairnWeb.StreamChannel do
   end
 
   def handle_info({:init_segment, _meta}, socket) do
-    # ffmpeg respawned: pts restart, client must reset its MediaSource
+    # a new session's init: pts restart, client must reset its MediaSource
     case RingBuffer.fetch_recent_safe(socket.assigns.camera_id, 0) do
       {:ok, %{init: init}} when is_binary(init) -> push(socket, "init", {:binary, init})
       _ -> :noop

@@ -75,8 +75,8 @@ defmodule Cairn.CameraSupervisorTest do
 
     :ok = CameraSupervisor.sync(old)
     camera_pid = Cairn.Registry.whereis(id, :camera)
-    ffmpeg_pid = Cairn.Registry.whereis(id, :ffmpeg)
-    assert is_pid(ffmpeg_pid)
+    owner_pid = Cairn.Registry.whereis(id, :pipeline)
+    assert is_pid(owner_pid)
 
     # a global window edit reaches no argv, so the camera keeps its stream —
     # and with it every live track on the camera
@@ -87,25 +87,25 @@ defmodule Cairn.CameraSupervisorTest do
     :ok = CameraSupervisor.apply_diff(diff, new)
 
     assert Cairn.Registry.whereis(id, :camera) == camera_pid
-    assert Cairn.Registry.whereis(id, :ffmpeg) == ffmpeg_pid
+    assert Cairn.Registry.whereis(id, :pipeline) == owner_pid
     # the cast is flushed by this call, which is also how it is ordered after
     # the one apply_diff sent (both from this process)
-    assert :sys.get_state(ffmpeg_pid).config.post_window_seconds == 42
+    assert :sys.get_state(owner_pid).config.post_window_seconds == 42
   end
 
   test "refreshing an id the config does not carry leaves the running camera alone" do
     id = "cs_absent_#{System.unique_integer([:positive])}"
 
     :ok = CameraSupervisor.sync(config([camera(id)]))
-    ffmpeg_pid = Cairn.Registry.whereis(id, :ffmpeg)
-    assert is_pid(ffmpeg_pid)
+    owner_pid = Cairn.Registry.whereis(id, :pipeline)
+    assert is_pid(owner_pid)
 
     # `apply_diff/2` cannot produce this — a `refreshed` id is by construction
     # in both configs — but the camera is running and the id is gone, and the
-    # `with` has to answer :ok rather than hand the port a `nil` camera
+    # `with` has to answer :ok rather than hand the owner a `nil` camera
     assert :ok = CameraSupervisor.refresh_camera(config([]), id)
-    assert Cairn.Registry.whereis(id, :ffmpeg) == ffmpeg_pid
-    assert %Camera{id: ^id} = :sys.get_state(ffmpeg_pid).camera
+    assert Cairn.Registry.whereis(id, :pipeline) == owner_pid
+    assert %Camera{id: ^id} = :sys.get_state(owner_pid).camera
   end
 
   test "refreshing a camera that is not running is a no-op" do
@@ -125,13 +125,27 @@ defmodule Cairn.CameraSupervisorTest do
     assert :ok = CameraSupervisor.stop_camera("never_started")
   end
 
-  test "camera tree registers ring buffer, ffmpeg and rtp hub children" do
+  test "camera tree registers ring buffer, bridge port, pipeline owner and rtp hub" do
     a = camera("cs_tree_#{System.unique_integer([:positive])}")
     :ok = CameraSupervisor.sync(config([a]))
 
     assert Cairn.Registry.whereis(a.id, :ring_buffer)
     assert Cairn.Registry.whereis(a.id, :ffmpeg)
+    assert Cairn.Registry.whereis(a.id, :pipeline)
     assert Cairn.Registry.whereis(a.id, :rtp_hub)
+  end
+
+  test "an rtsp-ingest camera has no bridge port: its sessions live in the source" do
+    a = %Camera{
+      camera("cs_rtsp_#{System.unique_integer([:positive])}")
+      | rtsp_url: "rtsp://127.0.0.1:1/none",
+        ingest: :rtsp
+    }
+
+    :ok = CameraSupervisor.sync(config([a]))
+
+    assert Cairn.Registry.whereis(a.id, :pipeline)
+    refute Cairn.Registry.whereis(a.id, :ffmpeg)
   end
 
   test "a camera streams through the real tree onto the ring and the hub topic" do
@@ -158,7 +172,7 @@ defmodule Cairn.CameraSupervisorTest do
     a = %Camera{camera("cs_grp_#{System.unique_integer([:positive])}") | plugin: {:group, "det"}}
     :ok = CameraSupervisor.sync(config([a]))
 
-    assert Cairn.Registry.whereis(a.id, :ffmpeg)
+    assert Cairn.Registry.whereis(a.id, :pipeline)
     assert Cairn.Registry.whereis(a.id, :rtp_hub)
   end
 

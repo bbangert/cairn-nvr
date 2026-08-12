@@ -1,7 +1,8 @@
 defmodule Cairn.StreamEpochs do
   @moduledoc """
   ETS-backed per-camera *stream epoch*: a ULID naming one continuous decode
-  of a camera's stream, minted on every ffmpeg (re)spawn.
+  of a camera's stream, minted from the stream itself as each session's first
+  buffer is produced.
 
   Detections, fragments and init segments produced under one epoch are not
   comparable with those of the next: after an outage the camera may have
@@ -9,11 +10,13 @@ defmodule Cairn.StreamEpochs do
   Consumers subscribe to `"stream_epochs"` for `{:stream_epoch, camera_id,
   epoch, reason}` and/or read `current/1` straight from ETS.
 
-  Written by `Cairn.FFmpegPort`; read by `Cairn.CameraTracker` and
-  the ring buffer's init-segment metadata.
+  Written by `Cairn.Pipeline.EpochTagger` (every session) and
+  `Cairn.PipelineOwner` (`:camera_stopped`, on a deliberate stop only); read by
+  `Cairn.CameraTracker`, the ring buffer's init-segment metadata, and the owner
+  itself, which no longer knows an epoch first-hand.
 
   The table is owned by this GenServer and dies with it: after a crash every
-  camera reads back `:unknown` until its next spawn re-mints. That is
+  camera reads back `:unknown` until its next session re-mints. That is
   accepted — a camera's tracker ends tracks on epoch *change*, and a re-mint is
   a change, which is exactly the conservative outcome.
   """

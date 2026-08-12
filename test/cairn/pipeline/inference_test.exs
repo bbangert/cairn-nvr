@@ -77,7 +77,7 @@ defmodule Cairn.Pipeline.InferenceTest do
           [
             session: {Host, ctx.host},
             stream_id: ctx.camera_id,
-            stream_params: %{stream_epoch: ctx.epoch},
+            stream_params: %{},
             reopen_cooldown_ms: 0
           ],
           opts
@@ -95,47 +95,62 @@ defmodule Cairn.Pipeline.InferenceTest do
     {actions, state}
   end
 
-  # One of `Cairn.Pipeline.Decoder`'s buffers, as the stub decoder mints them.
-  defp frame_buffer(pts) do
+  # One of `Cairn.Pipeline.Decoder`'s buffers, as the stub decoder mints them —
+  # the epoch included, which is where this element learns it.
+  defp frame_buffer(pts, epoch) do
     frame = NativeStub.decoded_frame(pts: pts)
+
+    metadata =
+      Map.take(frame, [
+        :orig_width,
+        :orig_height,
+        :scale_x,
+        :scale_y,
+        :pad_w,
+        :pad_h,
+        :observed_at_ms,
+        :motion
+      ])
 
     %Buffer{
       payload: frame.payload,
       pts: pts,
-      metadata:
-        Map.take(frame, [
-          :orig_width,
-          :orig_height,
-          :scale_x,
-          :scale_y,
-          :pad_w,
-          :pad_h,
-          :observed_at_ms,
-          :motion
-        ])
+      metadata: Map.put(metadata, :stream_epoch, epoch)
     }
   end
 
-  defp feed(state, pts \\ 1) do
-    Inference.handle_buffer(:input, frame_buffer(pts), %{}, state)
+  defp feed(state, epoch, pts \\ 1) do
+    Inference.handle_buffer(:input, frame_buffer(pts, epoch), %{}, state)
   end
 
   describe "the stream's session" do
     setup ctx, do: Map.put(ctx, :host, start_host())
 
-    test "opens on the pipeline's own epoch, declares its format, demands one frame", ctx do
+    test "declares its format and demands one frame without opening anything", ctx do
       {actions, state} = playing(element(ctx))
+
+      # No epoch exists yet — this element outlives the sessions it serves, and
+      # the stream is opened under exactly one of them.
+      refute_receive {:open_stream, _engine, _camera_id, _params}
+      assert actions == [stream_format: {:output, %Detections{}}, demand: {:input, 1}]
+      assert state.stream == :closed
+    end
+
+    test "opens on the first frame, under that frame's epoch", ctx do
+      {_actions, state} = playing(element(ctx))
+      {actions, state} = feed(state, ctx.epoch)
 
       camera_id = ctx.camera_id
       epoch = ctx.epoch
       assert_receive {:open_stream, _engine, ^camera_id, %{stream_epoch: ^epoch}}
-      assert actions == [stream_format: {:output, %Detections{}}, demand: {:input, 1}]
+      assert [buffer: {:output, _out}, demand: {:input, 1}] = actions
       assert state.stream == :open
     end
 
     test "the scene config reaches the library", ctx do
       floors = %{"person" => 0.7}
-      playing(element(ctx, stream_params: %{min_score: floors}))
+      {_actions, state} = playing(element(ctx, stream_params: %{min_score: floors}))
+      feed(state, ctx.epoch)
 
       assert_receive {:open_stream, _engine, _camera_id, %{min_score: ^floors}}
     end
@@ -145,7 +160,8 @@ defmodule Cairn.Pipeline.InferenceTest do
 
       state = element(ctx)
       {[], state} = Inference.handle_setup(%{resource_guard: guard}, state)
-      {_actions, _state} = playing(state)
+      {_actions, state} = playing(state)
+      feed(state, ctx.epoch)
       assert_receive {:open_stream, _engine, _camera_id, _params}
 
       # What a crashed element leaves behind: the guard runs the registered
@@ -160,12 +176,15 @@ defmodule Cairn.Pipeline.InferenceTest do
 
     test "becomes one Detections buffer carrying the library's observations", ctx do
       {_actions, state} = playing(element(ctx))
-      {actions, state} = feed(state, 42)
+      {actions, state} = feed(state, ctx.epoch, 42)
 
+      epoch = ctx.epoch
       assert [buffer: {:output, out}, demand: {:input, 1}] = actions
       assert out.payload == <<>>
       assert out.pts == 42
       assert [%{inferred: true, objects: []}] = out.metadata.observations
+      # …and the session the frame belonged to, for the sink that tags them
+      assert out.metadata.stream_epoch == epoch
       assert state.pushed == 1
     end
 
@@ -178,7 +197,7 @@ defmodule Cairn.Pipeline.InferenceTest do
       })
 
       {_actions, state} = playing(element(ctx))
-      {_actions, _state} = feed(state, 42)
+      {_actions, _state} = feed(state, ctx.epoch, 42)
 
       assert_received {:pushed, payload, meta, {1, 1_000_000_000}}
       assert payload == NativeStub.decoded_frame().payload
@@ -204,7 +223,7 @@ defmodule Cairn.Pipeline.InferenceTest do
       control(%{push_frame: fn _s, _p, _m, _tb -> {:error, {:model_load, "no such graph"}} end})
 
       {_actions, state} = playing(element(ctx))
-      {actions, state} = feed(state)
+      {actions, state} = feed(state, ctx.epoch)
 
       # No action at all, deliberately: parking is the whole effect, and the
       # parent has nothing it could do with a notification.
@@ -212,7 +231,7 @@ defmodule Cairn.Pipeline.InferenceTest do
       assert state.engine == :dead
 
       # nothing is demanded any more, so no further frame can reach the dead engine
-      {actions, _state} = feed(state)
+      {actions, _state} = feed(state, ctx.epoch)
       assert actions == []
     end
 
@@ -220,14 +239,14 @@ defmodule Cairn.Pipeline.InferenceTest do
       control(%{push_frame: fn _s, _p, _m, _tb -> {:error, {:panicked, "stage panicked"}} end})
 
       {_actions, state} = playing(element(ctx))
+      {actions, state} = feed(state, ctx.epoch)
       assert_receive {:open_stream, _engine, _camera_id, _params}
 
-      {actions, state} = feed(state)
       assert actions == [demand: {:input, 1}]
       assert state.stream == :closed
 
       control(%{push_frame: nil})
-      {_actions, state} = feed(state)
+      {_actions, state} = feed(state, ctx.epoch)
 
       assert state.stream == :open
       assert_receive {:open_stream, _engine, _camera_id, _params}
@@ -237,7 +256,7 @@ defmodule Cairn.Pipeline.InferenceTest do
       control(%{push_frame: fn _s, _p, _m, _tb -> {:error, {:infer, "one bad pass"}} end})
 
       {_actions, state} = playing(element(ctx))
-      {actions, state} = feed(state)
+      {actions, state} = feed(state, ctx.epoch)
 
       assert actions == [demand: {:input, 1}]
       assert state.stream == :open
@@ -246,12 +265,12 @@ defmodule Cairn.Pipeline.InferenceTest do
 
     test "a refused open costs the frame, not the session — and the drop is counted", ctx do
       host = start_host(config: nil)
-      {actions, state} = playing(element(%{ctx | host: host}))
+      ctx = %{ctx | host: host}
+      {actions, state} = playing(element(ctx))
 
       assert actions == [stream_format: {:output, %Detections{}}, demand: {:input, 1}]
-      assert state.stream == :closed
 
-      {actions, state} = feed(state)
+      {actions, state} = feed(state, ctx.epoch)
       assert actions == [demand: {:input, 1}]
       assert state.stream == :closed
       assert state.dropped == 1
@@ -260,21 +279,106 @@ defmodule Cairn.Pipeline.InferenceTest do
     test "a buffer without the decoder's metadata is dropped and counted, not crashed on", ctx do
       {_actions, state} = playing(element(ctx))
 
-      buffer = %Buffer{payload: <<0, 0, 0>>, pts: 1, metadata: %{}}
+      buffer = %Buffer{payload: <<0, 0, 0>>, pts: 1, metadata: %{stream_epoch: ctx.epoch}}
       {actions, state} = Inference.handle_buffer(:input, buffer, %{}, state)
 
       assert actions == [demand: {:input, 1}]
       assert state.dropped == 1
     end
 
+    test "a frame carrying no epoch is dropped and counted, and the stream untouched", ctx do
+      {_actions, state} = playing(element(ctx))
+      # …opened by a tagged frame first, so "untouched" is a claim about a
+      # stream that exists
+      {_actions, state} = feed(state, ctx.epoch)
+      assert_receive {:open_stream, _engine, _camera_id, _params}
+      params = state.params
+
+      {actions, state} = feed(state, nil)
+
+      assert actions == [demand: {:input, 1}]
+      assert state.dropped == 1
+      assert state.stream == :open
+      assert state.params == params
+      refute_receive {:close_stream, _ref}
+      refute_receive {:open_stream, _engine, _camera_id, _params}
+    end
+
     test "a buffer that precedes its stream format is dropped and counted, not crashed on", ctx do
       {actions, state} = Inference.handle_playing(%{}, element(ctx))
       assert [stream_format: _, demand: _] = actions
-      assert state.stream == :open
 
-      {actions, state} = Inference.handle_buffer(:input, frame_buffer(1), %{}, state)
+      {actions, state} =
+        Inference.handle_buffer(:input, frame_buffer(1, ctx.epoch), %{}, state)
+
       assert actions == [demand: {:input, 1}]
       assert state.dropped == 1
+    end
+  end
+
+  describe "a session boundary" do
+    setup ctx, do: Map.put(ctx, :host, start_host())
+
+    test "closes the stream and reopens it under the frame's new epoch", ctx do
+      {_actions, state} = playing(element(ctx))
+      {_actions, state} = feed(state, ctx.epoch)
+
+      camera_id = ctx.camera_id
+      first = ctx.epoch
+      assert_receive {:open_stream, _engine, ^camera_id, %{stream_epoch: ^first}}
+
+      second = Cairn.ULID.generate()
+      {actions, state} = feed(state, second, 2)
+
+      # Closed and reopened in that order, under the new epoch — and without
+      # waiting out a cooldown, since a boundary is a reconfiguration and not
+      # a failure.
+      assert_receive {:close_stream, _ref}
+      assert_receive {:open_stream, _engine, ^camera_id, %{stream_epoch: ^second}}
+      assert state.stream == :open
+      assert state.retry_at == nil
+      assert state.errors == 0
+
+      # …and the frame that carried the boundary was pushed, not spent on it
+      assert [buffer: {:output, out}, demand: {:input, 1}] = actions
+      assert out.metadata.stream_epoch == second
+      assert state.pushed == 2
+    end
+
+    test "the same epoch restated does not churn the stream", ctx do
+      {_actions, state} = playing(element(ctx))
+      {_actions, state} = feed(state, ctx.epoch)
+      assert_receive {:open_stream, _engine, _camera_id, _params}
+
+      {_actions, state} = feed(state, ctx.epoch, 2)
+
+      refute_receive {:close_stream, _ref}
+      refute_receive {:open_stream, _engine, _camera_id, _params}
+      assert state.pushed == 2
+    end
+
+    test "does not wait out the cooldown a refused open left behind", ctx do
+      control(%{open_stream: {:error, {:open_stream, "engine still loading"}}})
+
+      {_actions, state} = playing(element(ctx, reopen_cooldown_ms: 60_000))
+      {_actions, state} = feed(state, ctx.epoch)
+
+      first = ctx.epoch
+      assert_receive {:open_stream, _engine, _camera_id, %{stream_epoch: ^first}}
+      assert state.stream == :closed
+      assert is_integer(state.retry_at)
+
+      # no frame of this session beats a 60 s cooldown...
+      {_actions, state} = feed(state, ctx.epoch, 2)
+      refute_receive {:open_stream, _engine, _camera_id, _params}
+
+      # ...but the next session must not wait out a verdict on the last one
+      control(%{open_stream: nil})
+      second = Cairn.ULID.generate()
+      {_actions, state} = feed(state, second, 3)
+
+      assert_receive {:open_stream, _engine, _camera_id, %{stream_epoch: ^second}}
+      assert state.stream == :open
     end
   end
 
@@ -293,9 +397,15 @@ defmodule Cairn.Pipeline.InferenceTest do
     defp branch(ctx, count, interval_ms) do
       branch_over(
         ctx,
-        for(pts <- 1..count, do: %Buffer{payload: @keyframe, pts: pts}),
+        for(pts <- 1..count, do: au(ctx, @keyframe, pts)),
         interval_ms
       )
+    end
+
+    # What `Cairn.Pipeline.EpochTagger` hands the tee: every access unit
+    # stamped with the session it was produced under.
+    defp au(ctx, payload, pts) do
+      %Buffer{payload: payload, pts: pts, metadata: %{stream_epoch: ctx.epoch}}
     end
 
     defp branch_over(ctx, buffers, interval_ms) do
@@ -309,12 +419,11 @@ defmodule Cairn.Pipeline.InferenceTest do
           |> child(:infer, %Inference{
             session: {Host, ctx.host},
             stream_id: ctx.camera_id,
-            stream_params: %{stream_epoch: ctx.epoch}
+            stream_params: %{}
           })
           |> child(:detect, %DetectSink{
             camera: ctx.camera,
             policy: @policy,
-            epoch: ctx.epoch,
             tracker: self()
           })
         ]
@@ -342,7 +451,7 @@ defmodule Cairn.Pipeline.InferenceTest do
       # the model is offered `sample_fps`, not the source's rate.
       buffers =
         for pts <- 1..2_000 do
-          %Buffer{payload: if(rem(pts, @gop) == 1, do: @keyframe, else: @interframe), pts: pts}
+          au(ctx, if(rem(pts, @gop) == 1, do: @keyframe, else: @interframe), pts)
         end
 
       pipeline = branch_over(ctx, buffers, 1)

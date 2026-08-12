@@ -5,10 +5,12 @@ defmodule Cairn.CameraStatus do
   last detector health reported for the camera, with PubSub change
   notifications on `"cameras:status"`.
 
-  Written by `Cairn.FFmpegPort` / the watchdog and — for the detector's own
-  health, which the in-VM native block reports with no process of its own —
-  by `Cairn.Native.Status`; read by the dashboard and config LiveViews and by
-  the HA API.
+  Written by `Cairn.PipelineOwner` (the lifecycle, watchdog included) and, for
+  a bridge camera's own connect/backoff, by `Cairn.FFmpegPort` — the split is
+  stated in the owner's moduledoc. The detector's health, which the in-VM
+  native block reports with no process of its own, comes from
+  `Cairn.Native.Status`. Read by the dashboard and config LiveViews and by the
+  HA API.
   """
 
   use GenServer

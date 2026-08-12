@@ -12,20 +12,38 @@ defmodule Cairn.Pipeline.RingBufferSink do
   RFC 6381 shape, and `keyframe?` means "first sample is a sync sample".
   Holding that shape is what keeps every fragment consumer
   producer-agnostic.
+
+  ## The epoch
+
+  In-band, as a `Cairn.Pipeline.EpochChange` event: buffer metadata cannot
+  cross the muxer (a segment aggregates many samples), and the branch this
+  sink terminates is per-session, so exactly one epoch ever reaches an
+  instance of it. Event and stream format are *paired* rather than ordered —
+  the muxer emits its output format only after its first input samples, while
+  the event forwards straight through — so whichever lands first is held and
+  the ring is initialised when the second arrives.
   """
 
   use Membrane.Sink
 
   alias Cairn.{Fragment, RingBuffer}
+  alias Cairn.Pipeline.EpochChange
 
   def_input_pad :input, accepted_format: Membrane.CMAF.Track, flow_control: :auto
 
-  def_options camera_id: [spec: String.t()],
-              epoch: [spec: Cairn.ULID.t()]
+  def_options camera_id: [spec: String.t()]
 
   @impl true
   def handle_init(_ctx, opts) do
-    {[], %{camera_id: opts.camera_id, epoch: opts.epoch, timescale: nil, seq: 0}}
+    {[],
+     %{
+       camera_id: opts.camera_id,
+       epoch: nil,
+       format: nil,
+       timescale: nil,
+       seq: 0,
+       dropped: 0
+     }}
   end
 
   @impl true
@@ -36,22 +54,51 @@ defmodule Cairn.Pipeline.RingBufferSink do
     # the whole camera tree (:rest_for_one), a far worse outcome.
     timescale = video_timescale(format.header) || 90_000
 
-    # A re-emitted stream format (mid-session encoder change) is treated as a
-    # fresh init: the ring drops its buffered fragments and restarts pts at ~0,
-    # so the per-session seq counter restarts with it. The ring re-stamps its
-    # own monotonic seq regardless, so this counter only needs to be 0-based.
+    {[], maybe_put_init(%{state | format: format, timescale: timescale})}
+  end
+
+  @impl true
+  def handle_event(:input, %EpochChange{epoch: epoch}, _ctx, state) do
+    {[], maybe_put_init(%{state | epoch: epoch})}
+  end
+
+  # Overriding the callback replaces the sink's default outright, so everything
+  # else has to be handed back to it.
+  def handle_event(pad, event, ctx, state), do: super(pad, event, ctx, state)
+
+  # A re-emitted stream format (mid-session encoder change) is treated as a
+  # fresh init: the ring drops its buffered fragments and restarts pts at ~0,
+  # so the per-session seq counter restarts with it. The ring re-stamps its
+  # own monotonic seq regardless, so this counter only needs to be 0-based.
+  # The epoch is unchanged by it — the session did not end, the encoder moved.
+  defp maybe_put_init(%{epoch: epoch, format: %Membrane.CMAF.Track{} = format} = state)
+       when epoch != nil do
     RingBuffer.put_init(
       state.camera_id,
       format.header,
       codec_string(format.codecs),
-      timescale,
-      state.epoch
+      state.timescale,
+      epoch
     )
 
-    {[], %{state | timescale: timescale, seq: 0}}
+    %{state | seq: 0}
   end
 
+  defp maybe_put_init(state), do: state
+
+  # A segment can precede neither its stream format (Membrane's guarantee) nor,
+  # on a per-session branch, the epoch event ahead of the session's first
+  # buffer — so this is unreachable by construction, and counted rather than
+  # crashed on precisely because that reasoning is the only thing holding it.
   @impl true
+  def handle_buffer(:input, _buffer, _ctx, %{epoch: nil} = state) do
+    {[], %{state | dropped: state.dropped + 1}}
+  end
+
+  def handle_buffer(:input, _buffer, _ctx, %{format: nil} = state) do
+    {[], %{state | dropped: state.dropped + 1}}
+  end
+
   def handle_buffer(:input, buffer, _ctx, state) do
     frag = %Fragment{
       camera_id: state.camera_id,
@@ -71,6 +118,13 @@ defmodule Cairn.Pipeline.RingBufferSink do
     RingBuffer.put_fragment(state.camera_id, frag)
 
     {[], %{state | seq: state.seq + 1}}
+  end
+
+  @impl true
+  def handle_parent_notification(:stats, _ctx, state) do
+    # `seq` counts this init's fragments, not the sink's — it restarts with the
+    # ring on every re-init, exactly as the fragments' own seq does.
+    {[notify_parent: {:stats, %{seq: state.seq, dropped: state.dropped}}], state}
   end
 
   # RFC 6381 codec string in the exact shape `Cairn.MP4.Demuxer` emits

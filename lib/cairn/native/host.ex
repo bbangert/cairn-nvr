@@ -831,8 +831,9 @@ defmodule Cairn.Native.Host do
     end)
   end
 
-  # The epoch is minted by whoever owns the media session — `Cairn.FFmpegPort`, on
-  # every spawn. Only a camera nobody has minted for yet gets one from here: this
+  # The epoch is minted from the media itself — `Cairn.Pipeline.EpochTagger`, on
+  # each session's first buffer. Only a camera nobody has minted for yet gets one
+  # from here: this
   # process establishing the first session of a camera's life is the one case where
   # it is the authority.
   defp resolve_epoch(camera_id, params) do

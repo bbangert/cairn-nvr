@@ -49,28 +49,30 @@ flowchart TD
 
 Three planes still meet only at well-defined boundaries, but they now share one VM:
 
-- **Encoded video plane.** One ingest session per camera delivers compressed H.264 into a per-session Membrane pipeline, which fans it out three ways without ever decoding for display: CMAF fragments to the ring, RTP packets to the WebRTC hub, encoded access units to the detect branch. Cairn is codec-copy end to end for everything a human watches.
+- **Encoded video plane.** One ingest session per camera delivers compressed H.264 into the camera's long-lived Membrane pipeline, which fans it out three ways without ever decoding for display: CMAF fragments to the ring, RTP packets to the WebRTC hub, encoded access units to the detect branch. Cairn is codec-copy end to end for everything a human watches.
 - **Inference plane.** The detect branch decodes and infers inside the node's own engine — `plugins/cairn-detect`'s stage library linked as the `cairn-native` NIF, running on dirty schedulers. Frames never leave the crate; what crosses the NIF boundary is compressed access units in and observation terms out.
 - **Event plane.** Detection aggregation, event lifecycle, and clip extraction consume from the other two via PubSub and produce files on disk.
 
 ## Ingest
 
-`Cairn.FFmpegPort` owns one camera's ingest session — the OS process or client, the reconnect/backoff policy (1 s → 30 s, jittered), the stall watchdog, and the stream epoch minted per session. Two ingests share all of that machinery:
+A camera's connection lifecycle — connect, loss, reconnect with a jittered 1 s → 30 s backoff — belongs to whatever owns the socket, never to a supervisor: a dead camera is a normal long-lived state. Where that owner sits is the only difference between the two ingests:
 
-- **ffmpeg bridge** (default). One supervised ffmpeg per camera as a dumb demuxer: RTSP (or vendor FLV-over-HTTP) in, **MPEG-TS on stdout** out — a container with pts, which the Fragment timing and the ObservationClock need. ffmpeg is kept for its two decades of camera-vendor workarounds; it no longer fans out, transcodes for consumers, or touches UDP.
-- **native RTSP** (`ingest: rtsp`, per camera). The `rtsp` library owns socket/depayload/digest/keepalive and delivers whole access units with pts as messages; the bridge disappears for that camera. Quirky cameras keep the ffmpeg bridge — the flag is per-camera and reversible.
+- **ffmpeg bridge** (default). `Cairn.FFmpegPort` owns one supervised ffmpeg per camera as a dumb demuxer: RTSP (or vendor FLV-over-HTTP) in, **MPEG-TS on stdout** out — a container with pts, which the Fragment timing and the ObservationClock need. It stays *outside* the pipeline so a pipeline crash cannot take the camera's backoff state with it; the bytes reach `Cairn.Pipeline.BridgeSource`, resolved through `Cairn.Registry`. ffmpeg is kept for its two decades of camera-vendor workarounds; it no longer fans out, transcodes for consumers, or touches UDP.
+- **native RTSP** (`ingest: rtsp`, per camera). `Membrane.RTSPDualStream.Source` owns the client sessions *inside* the element: the `rtsp` library handles socket/depayload/digest/keepalive and delivers whole access units with pts, and the element reconnects on its own. There is no FFmpegPort for that camera at all. Quirky cameras keep the ffmpeg bridge — the flag is per-camera and reversible.
+
+Either way a session's end is in-band (`StreamClosed`), and the stream epoch is minted from the media itself by `Cairn.Pipeline.EpochTagger` as the next session's first buffer is produced — never by the process that owns the connection.
 
 Non-H.264 cameras: Cairn probes and warns. Opt-in `transcode: true` uses hardware `h264_v4l2m2m` inside the bridge only — there is deliberately no software fallback, and RTSP-native ingest refuses transcode (there is no ffmpeg in that chain).
 
-### The per-session pipeline
+### The long-lived pipeline
 
-Each ingest session starts its own `Cairn.Pipeline.Camera` (Membrane), owned and monitored by the FFmpegPort — deliberately **not** a supervisor child, because the TS demuxer's state is only valid for one session and backoff policy must not fight supervisor restarts. Pipeline death is a lost decode session: same backoff, same fresh epoch.
+`Cairn.PipelineOwner` starts one `Cairn.Pipeline.Camera` (Membrane) per camera and monitors it — deliberately **not** a supervisor child, so that a crash-looping pipeline backs off instead of burning supervisor intensity. It is rebuilt for exactly two reasons: it died, or the owner's watchdog found a wedge (detect branch stale behind a healthy ring; ring stale while the source reports itself connected — for a bridge camera only after an `FFmpegPort.bounce/1` fails to clear it). A mere outage rebuilds nothing: the source reconnects underneath.
 
-Topology: source (`BridgeSource` or `RtspSource`) → TS demux (bridge only; RTSP carries pts natively) → H.264 parse (access-unit aligned) → tee →
+Topology: source (`BridgeSource` or `RTSPDualStream.Source`) → TS demux (bridge only; RTSP carries pts natively and the source declares its own format from each session's SPS) → `EpochTagger` → tee →
 
-1. **Recording branch**: CMAF muxer → `RingBufferSink`, shaping each segment into a `Cairn.Fragment` (pts from the segment's own `tfdt`, timescale from the init header, `keyframe?` = first sample is a sync sample). On session end an end-of-stream is flushed through the pipeline with a short grace so the muxer's held tail segment is recorded rather than lost.
-2. **RTP branch**: RFC 6184 payloader → in-process `push_packet/2` into `Cairn.RTPHub`. No sockets anywhere.
-3. **Detect branch**: picker (backpressure, keep-newest depth-1, refuses to emit across a dropped-AU hole until the next IDR) → `Inference` (the NIF call site, one call in flight) → `DetectSink` (observations → `Cairn.Detect.Dispatch` → the camera's tracker). Absent when the camera names no `plugin:`.
+1. **Recording branch**: `SessionCut` → CMAF muxer → `RingBufferSink`, shaping each segment into a `Cairn.Fragment` (pts from the segment's own `tfdt`, timescale from the init header, `keyframe?` = first sample is a sync sample). The muxer survives neither a session's pts reset nor an identical-SPS reconnect, so the gate ends its branch's stream on `StreamClosed` — which is also what flushes the muxer's held tail into the ring — and the owner links a fresh branch immediately.
+2. **RTP branch**: `SessionCut` → RFC 6184 payloader → in-process `push_packet/2` into `Cairn.RTPHub`. No sockets anywhere; per-session too, which is what gives each session its own ssrc.
+3. **Detect branch**: picker (backpressure, keep-newest depth-1, refuses to emit across a dropped-AU hole until the next IDR) → `Inference` (the NIF call site, one call in flight) → `DetectSink` (observations → `Cairn.Detect.Dispatch` → the camera's tracker). Absent when the camera names no `plugin:`. Never per-session: the decoder's and inference's native state is the expensive half, and it is exactly what a reconnect must not cost — the epoch rides buffer metadata instead, and `Inference` reopens its stream when it changes.
 
 ## Detection: the in-VM engine
 
@@ -134,13 +136,14 @@ Cairn.Supervisor
 │   └── Cairn.Camera (one per camera, rest_for_one)
 │       ├── probe                  (ffprobe task, temporary)
 │       ├── Cairn.RingBuffer
-│       ├── Cairn.FFmpegPort       (ingest session + per-session Membrane pipeline)
+│       ├── Cairn.FFmpegPort       (bridge cameras only: the ffmpeg Port)
+│       ├── Cairn.PipelineOwner    (the camera's long-lived Membrane pipeline)
 │       └── Cairn.RTPHub           (socketless; fed by the pipeline's RTP branch)
 ├── Cairn.Retention / CairnWeb.WebRTC.Supervisor / Cairn.Boot
 └── CairnWeb.Endpoint
 ```
 
-Restart shape worth naming: the per-session pipeline is *not* in this tree — it is born and dies with its ingest session, monitored by the FFmpegPort, whose jittered backoff (not supervisor intensity) owns the "camera is down" state. Ring death restarts the ingest (`:rest_for_one`): a fresh ring is empty anyway.
+Restart shape worth naming: the pipeline is *not* in this tree — `Cairn.PipelineOwner` monitors it and its jittered backoff (not supervisor intensity) owns the "camera is down" state, as `Cairn.FFmpegPort`'s does for the bridge. Ring death restarts the ingest (`:rest_for_one`): a fresh ring is empty anyway.
 
 ## Resource budget
 

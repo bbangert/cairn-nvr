@@ -308,8 +308,9 @@ defmodule Cairn.CameraTracker do
   end
 
   # The epoch this camera is streaming under right now, if anything is: it is
-  # minted at ffmpeg spawn, long before the first detection creates this
-  # process, so reading it here is what lets `stale?/2` judge the very first
+  # minted at each session's first buffer, upstream of decode and inference,
+  # so it exists before any detection of that session can create this
+  # process — reading it here is what lets `stale?/2` judge the very first
   # batch and what makes the next announcement of the same epoch a no-op.
   defp seed_epoch(camera_id) do
     case StreamEpochs.current(camera_id) do
@@ -378,23 +379,26 @@ defmodule Cairn.CameraTracker do
 
   defp with_at_ms(observation, state), do: %{observation | at_ms: state.monotonic_ms.()}
 
-  # Belt and braces: the ports already refuse observations from an epoch that
-  # is no longer current, and this closes the window where a port's line and
-  # the epoch broadcast cross. Compared against the same `current_epoch` the
-  # epoch broadcast maintains, seeded in `init/1` from the epoch this camera
-  # was already streaming under.
+  # Load-bearing, not belt and braces: the detect branch outlives session
+  # boundaries and tags observations with the epoch of the buffer they came
+  # from, so an old-epoch frame drained after a reconnect arrives here
+  # truthfully tagged — and this comparison is the only thing that drops it.
+  # Compared against the same `current_epoch` the epoch broadcast maintains,
+  # seeded in `init/1` from the epoch this camera was already streaming under.
   #
-  # An observation with no epoch (v0 before the first ffmpeg spawn) is
-  # accepted, as is one for a camera whose epoch is not known here yet: that
-  # first observation's epoch is adopted in `process_detections/5`.
+  # An observation with no epoch (a v0 recorded-plugin line, or replay tooling
+  # that sets none) is accepted, as is one for a camera whose epoch is not
+  # known here yet: that first observation's epoch is adopted in
+  # `process_detections/5`.
   defp stale?(_state, %Observation{epoch: nil}), do: false
 
   defp stale?(%{current_epoch: nil}, _observation), do: false
   defp stale?(%{current_epoch: epoch}, %Observation{epoch: epoch}), do: false
 
   defp stale?(state, %Observation{epoch: epoch}) do
-    # Rare by construction, so it is counted rather than logged per line:
-    # a steady rate here means a port is forwarding across a boundary.
+    # Rare by construction, so it is counted rather than logged per line: a
+    # boundary drains at most a burst of old-epoch frames, so a steady rate
+    # here means something upstream is mis-tagging.
     #
     # The event name is `:aggregator` for a wire-compatibility reason and not
     # an accidental one: it is what dashboards and alerts already match on,
@@ -733,7 +737,7 @@ defmodule Cairn.CameraTracker do
   # degraded caller-side broadcast path they have no ordering relation, so a
   # stop epoch minted after a live `:started` could otherwise be adopted as
   # current and `stale?/2` would then drop every observation of a *healthy*
-  # camera until its next ffmpeg respawn — which is not coming.
+  # camera until its next session boundary — which is not coming.
   #
   # `current_epoch` is cleared rather than kept: this camera is not streaming
   # under anything, so there is no epoch a straggling observation could be

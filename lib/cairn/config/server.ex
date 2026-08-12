@@ -168,7 +168,7 @@ defmodule Cairn.Config.Server do
   #
   # The rest of the effective policy — `post`/`max`, the tracking bounds, the
   # `track:` / `record:` tiers — is host-side and refreshes in place through
-  # `Cairn.FFmpegPort.refresh/3`.
+  # `Cairn.PipelineOwner.refresh/3`.
   defp camera_changed?(old, new, old_cam, new_cam) do
     Map.take(old_cam, @restart_fields) != Map.take(new_cam, @restart_fields) or
       Config.windows(old, old_cam).pre != Config.windows(new, new_cam).pre

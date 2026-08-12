@@ -69,8 +69,9 @@ defmodule Cairn.Pipeline.DecoderTest do
     state
   end
 
-  defp feed(ctx, state, pts) do
-    Decoder.handle_buffer(:input, %Buffer{payload: @keyframe, pts: pts}, ctx.ctx, state)
+  defp feed(ctx, state, pts, epoch \\ nil) do
+    buffer = %Buffer{payload: @keyframe, pts: pts, metadata: %{stream_epoch: epoch}}
+    Decoder.handle_buffer(:input, buffer, ctx.ctx, state)
   end
 
   defp demand(ctx, state, size \\ 1) do
@@ -367,8 +368,29 @@ defmodule Cairn.Pipeline.DecoderTest do
                pad_w: 2,
                pad_h: 2,
                observed_at_ms: 7,
-               motion: verdict
+               motion: verdict,
+               stream_epoch: nil
              }
+    end
+
+    test "carries the stream epoch of the access units it decoded", ctx do
+      {_actions, state} = playing(ctx, element(ctx))
+      {_actions, state} = demand(ctx, state, 3)
+
+      {actions, state} = feed(ctx, state, 1, "epoch_one")
+      assert [_format, {:buffer, {:output, first}}, _demand] = actions
+      assert first.metadata.stream_epoch == "epoch_one"
+
+      # Past the sample gate by hand: what is under test is the tag on the
+      # emitted frame, not the pacing.
+      control(%{
+        decode_au: fn _d, _au, pts, _s -> {:ok, {true, NativeStub.decoded_frame(pts: pts)}} end
+      })
+
+      # a session boundary among the fed access units flips it for what follows
+      {actions, _state} = feed(ctx, state, 2, "epoch_two")
+      assert [{:buffer, {:output, second}}, _demand] = actions
+      assert second.metadata.stream_epoch == "epoch_two"
     end
 
     test "the stream format is re-sent only when the geometry moves", ctx do

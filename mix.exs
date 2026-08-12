@@ -103,6 +103,9 @@ defmodule Cairn.MixProject do
       # owns socket/depayload/keepalive and delivers whole H.264 access
       # units with pts as messages; digest auth fleet-proven in spike 0.2.
       {:rtsp, "~> 0.8.2"},
+      # Transitive via rtsp, but `Membrane.RTSPDualStream.Source` parses the
+      # SPS out of keyframes with it directly.
+      {:media_codecs, "~> 0.10"},
       # D-C3: the motion gate's arithmetic — plain BinaryBackend, no EXLA;
       # the gate exists to *skip* heavy work, so it must not need an
       # accelerator (or a native dep) of its own.

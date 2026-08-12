@@ -309,7 +309,7 @@ defmodule Cairn.TrackPath do
   moduledoc's anchor section; each half is used only if its three fields are
   numbers, its media position is not negative, and the position it produces is
   not before the start of the clip. A half that fails any of those is skipped,
-  so a live half spoiled by an ffmpeg respawn (`pts` restarts, the difference
+  so a live half spoiled by a session boundary (`pts` restarts, the difference
   goes negative) still leaves the drain half to answer.
 
   `:error` is the caller's cue to use whatever pre-roll estimate it has; it is
