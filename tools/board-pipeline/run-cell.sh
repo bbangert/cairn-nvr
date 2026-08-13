@@ -68,6 +68,11 @@ mkdir -p "$RUN"
 # path instead — busybox has no pgrep, but /proc/*/cmdline is always there.
 for p in /proc/[0-9]*; do
   pid=${p#/proc/}
+  # Never ourselves or our shell: this script's own cmdline carries the
+  # board-pipeline path, so the sweep would otherwise kill the cell it is
+  # starting.
+  [ "$pid" = "$$" ] && continue
+  [ "$pid" = "$PPID" ] && continue
   # cmdline is NUL-separated; grep straight at it is busybox-dependent.
   if [ -r "$p/cmdline" ] && tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -q "board-pipeline"; then
     kill "$pid" 2>/dev/null

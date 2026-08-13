@@ -201,7 +201,7 @@ if [ "$DRY_RUN" = 1 ]; then
   print_plan
   step "df-check would run against: $LADDER_RESULT_DIR (margin ${LADDER_MIN_FREE_MB} MB) before each pull"
   step "ssh $BOARD ':os.cmd(~c\"mkdir -p $REMOTE_DIR/clips $REMOTE_DIR/deps $REMOTE_DIR/harness $REMOTE_DIR/runs\")'"
-  step "scp -r $DEPS_LIB/*/ebin  $BOARD:$REMOTE_DIR/deps/<dep>/ebin   (skipped per-dep if remote sha256 matches)"
+  step "scp -r $DEPS_LIB/*/ebin  $BOARD:$REMOTE_DIR/deps/<dep>/ebin   (unconditional — only single-file pushes checksum-skip)"
   step "scp -r $LOCAL_BUILD/ebin $BOARD:$REMOTE_DIR/harness/ebin"
   step "scp    tools/board-pipeline/run-cell.sh $BOARD:$REMOTE_DIR/run-cell.sh"
   step "scp    $MAIN_CLIP $BOARD:${REMOTE_CLIP[baseline]}  (skipped if remote sha256 matches)"
