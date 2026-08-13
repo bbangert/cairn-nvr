@@ -165,11 +165,21 @@ defmodule CairnWeb.DashboardLiveTest do
     # `state` is a free string in the plugin contract, which forbids branching
     # on it: a plugin's status is shown, never interpreted.
     test "a plugin's own status still renders, uncoloured", %{conn: conn} do
-      html = show(conn, %{"state" => "degraded", "detail" => "cpu fallback"})
+      Cairn.CameraStatus.set_plugin_status("cam_a", %{
+        "state" => "degraded",
+        "detail" => "cpu fallback"
+      })
 
-      assert html =~ "camera-detection-cam_a"
-      assert html =~ "degraded"
-      refute html =~ ~s(data-health=)
+      _flushed = :sys.get_state(Cairn.CameraStatus)
+      {:ok, view, _html} = live(conn, "/")
+
+      # The chip, not the page: `Cairn.Native.Status` writes health-bearing
+      # statuses for every camera it serves, so a concurrent test exercising
+      # the host can legitimately put `data-health` on ANOTHER camera's chip
+      # mid-render — a page-wide refute reads that as this test's failure.
+      chip = view |> element("#camera-detection-cam_a") |> render()
+      assert chip =~ "degraded"
+      refute chip =~ ~s(data-health=)
     end
   end
 end
