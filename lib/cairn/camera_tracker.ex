@@ -370,7 +370,10 @@ defmodule Cairn.CameraTracker do
   defp detect_role(camera_id, held) do
     case Config.Server.camera(camera_id) do
       {:ok, camera} -> Config.Camera.detect_role(camera)
-      :error -> :main
+      # A camera the config no longer names (a removal mid-transition) is a
+      # lookup failure like any other: keep the role already held rather than
+      # silently moving a dual camera's filter onto the recording stream.
+      :error -> held
     end
   catch
     :exit, _ -> held

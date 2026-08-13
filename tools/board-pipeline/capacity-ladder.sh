@@ -187,7 +187,8 @@ print_plan() {
 report_prereq_status() {
   # Informational only in --dry-run: shows Ben what still needs staging
   # without refusing to print the rest of the plan.
-  [ -d "$LOCAL_BUILD/ebin" ] 2>/dev/null && s1=ok || s1="MISSING (LOCAL_BUILD/ebin)"
+  # Guard the emptiness first: an unset LOCAL_BUILD would test "/ebin".
+  [ -n "$LOCAL_BUILD" ] && [ -d "$LOCAL_BUILD/ebin" ] 2>/dev/null && s1=ok || s1="MISSING (LOCAL_BUILD/ebin)"
   [ -r "$MAIN_CLIP" ] 2>/dev/null && s2=ok || s2="MISSING (MAIN_CLIP)"
   [ -r "$SUB_CLIP" ] 2>/dev/null && s3=ok || s3="MISSING (SUB_CLIP)"
   [ -d "$DEPS_LIB" ] 2>/dev/null && s4=ok || s4="MISSING (run mix deps.get/compile)"

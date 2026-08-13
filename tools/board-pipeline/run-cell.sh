@@ -68,7 +68,8 @@ mkdir -p "$RUN"
 # path instead — busybox has no pgrep, but /proc/*/cmdline is always there.
 for p in /proc/[0-9]*; do
   pid=${p#/proc/}
-  if [ -r "$p/cmdline" ] && grep -q "board-pipeline" "$p/cmdline" 2>/dev/null; then
+  # cmdline is NUL-separated; grep straight at it is busybox-dependent.
+  if [ -r "$p/cmdline" ] && tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -q "board-pipeline"; then
     kill "$pid" 2>/dev/null
   fi
 done

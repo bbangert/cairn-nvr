@@ -202,8 +202,7 @@ defmodule Cairn.TrackerDriver do
 
   defp with_epoch(observation, _camera), do: observation
 
-  defp detect_role(%Camera{substream_url: url}) when is_binary(url), do: :sub
-  defp detect_role(_camera), do: :main
+  defp detect_role(%Camera{} = camera), do: Cairn.Config.Camera.detect_role(camera)
 
   # What `Cairn.Pipeline.ObservationStamper` resolves per buffer, minus the
   # clock: the policy's bounds defaulted, with the runtime `min_score` override
