@@ -26,7 +26,6 @@
 #
 # Env (all set by capacity-ladder.sh; defaults let a human run one cell by
 # hand):
-#   ELIXIR        elixir executable (default: elixir)
 #   HARNESS_PA    space-separated -pa dirs: every dep's ebin + the harness's
 #                 own (from run-local.sh's DEPS list, plus this cell script's
 #                 own compiled output)
@@ -43,7 +42,21 @@ STREAMS=${2:?streams required}
 SECS=${3:?seconds required}
 CLIP=${4:?clip path required}
 
-ELIXIR=${ELIXIR:-elixir}
+# Nerves ships no `elixir` CLI — and the `erl` wrapper script needs
+# readlink/dirname/sed this busybox lacks — so the harness boots as its own
+# BEAM through `erlexec` directly, handed the env the wrapper would have
+# derived (how erlinit boots the firmware itself). POSIX glob-loops, not
+# `head` (absent here too).
+ROOTDIR=/srv/erlang
+for b in /srv/erlang/erts-*/bin; do BINDIR=$b; done
+EMU=beam
+PROGNAME=erl
+export ROOTDIR BINDIR EMU PROGNAME
+for d in /srv/erlang/lib/elixir-*/ebin; do ELIXIR_EBIN=$d; done
+for d in /srv/erlang/lib/logger-*/ebin; do LOGGER_EBIN=$d; done
+# The pruned release has no default bootfile; its start_clean needs the
+# $RELEASE_LIB the release manager would have expanded.
+for f in /srv/erlang/releases/*/start_clean.boot; do BOOT=${f%.boot}; done
 RUN_ROOT=${RUN_ROOT:?RUN_ROOT required}
 HARNESS_PA=${HARNESS_PA:?HARNESS_PA required (space-separated -pa dirs)}
 
@@ -118,18 +131,21 @@ BOARD_PIPELINE_MODEL="${MODEL:-}" \
   BOARD_PIPELINE_STREAMS="$STREAMS" \
   BOARD_PIPELINE_NATIVE_LIB="${NATIVE_LIB:-}" \
   BOARD_PIPELINE_ORT_LIB="${ORT_LIB:-}" \
-  "$ELIXIR" $PA_FLAGS \
-  -e 'case Cairn.BoardPipeline.run() do :ok -> System.halt(0); other -> IO.puts("board-pipeline: #{inspect(other)}"); System.halt(1) end' \
+  LD_LIBRARY_PATH=/data/cairn-bench/lib:/data/qnn-spike/lib \
+  ORT_DYLIB_PATH=/data/qnn-spike/lib/libonnxruntime.so.1 \
+  "$BINDIR/erlexec" -boot "$BOOT" -boot_var RELEASE_LIB /srv/erlang/lib \
+  -pa "$ELIXIR_EBIN" -pa "$LOGGER_EBIN" $PA_FLAGS -noshell \
+  -eval '{ok,_} = application:ensure_all_started(elixir), {ok,_} = application:ensure_all_started(logger), case '\''Elixir.Cairn.BoardPipeline'\'':run() of ok -> erlang:halt(0); Other -> io:format("board-pipeline: ~p~n", [Other]), erlang:halt(1) end' \
   > "$RUN/out.log" 2>&1 &
 HARNESS_PID=$!
 
 # /proc sampling while the cell runs, as bench.sh: field extraction via
-# `set --`, not cut/awk (absent on this busybox); comm field "(elixir)" (or
-# whatever the exec chain lands on) is one token, so utime/stime are $14/$15.
-# CAVEAT the ladder README flags: `elixir`'s own launcher script may `exec`
-# through erl/beam.smp — $! survives an `exec` (same pid, replaced image)
-# but NOT a fork, so if this board's elixir wrapper ever forks instead of
-# exec'ing, these samples silently read the wrong (parent) process. The
+# `set --`, not cut/awk (absent on this busybox); comm field ("(erl)" or
+# "(beam.smp)") is one token, so utime/stime are $14/$15.
+# CAVEAT the ladder README flags: `erl` execs through erlexec into beam.smp
+# — $! survives an `exec` (same pid, replaced image) but NOT a fork, so if
+# this ERTS ever forks instead of exec'ing, these samples silently read the
+# wrong (parent) process. The
 # `comm` field recorded per sample makes that failure mode visible in the
 # pulled file rather than silently mislabeling every number. CPU%/RSS-peak
 # arithmetic is deferred to capacity-ladder.sh after the pull (this busybox
