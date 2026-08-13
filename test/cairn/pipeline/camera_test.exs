@@ -230,18 +230,6 @@ defmodule Cairn.Pipeline.CameraTest do
 
       assert_receive {:stats, ^stats}
     end
-
-    test "the stamper's end_all reaches the tracker, the one hop between them" do
-      {_actions, state} = init(detect: detect())
-
-      assert {[notify_child: {:tracker, {:end_all, :detection_disabled}}], _state} =
-               Pipeline.handle_child_notification(
-                 {:end_all, :detection_disabled},
-                 :stamper,
-                 %{},
-                 state
-               )
-    end
   end
 
   describe "the detect branch" do

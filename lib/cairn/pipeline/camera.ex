@@ -157,13 +157,6 @@ defmodule Cairn.Pipeline.Camera do
     {[], state}
   end
 
-  # Detection turned off at runtime: the stamper stops feeding the tracker and
-  # this is the only route from one to the other. Kept here rather than given
-  # to the stamper as a pid so neither element knows the other exists.
-  def handle_child_notification({:end_all, _reason} = notification, :stamper, _ctx, state) do
-    {[notify_child: {:tracker, notification}], state}
-  end
-
   def handle_child_notification(_notification, _child, _ctx, state), do: {[], state}
 
   # A reload's new policy, from `Cairn.PipelineOwner`. Both ends of the tracker

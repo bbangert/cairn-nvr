@@ -5,6 +5,7 @@ defmodule Membrane.MOTTrackerTest do
   import Membrane.Testing.Assertions
 
   alias Membrane.Buffer
+  alias Membrane.MOTTracker.Event.EndAll
   alias Membrane.MOTTracker.Format
   alias Membrane.Testing
 
@@ -159,6 +160,12 @@ defmodule Membrane.MOTTrackerTest do
       assert_receive {:core, call}, timeout
       call
     end)
+  end
+
+  # The stop, in-band on the element's own input pad — where the stamper puts
+  # it in production.
+  defp end_all(pipeline, reason \\ :stream_reset) do
+    Testing.Pipeline.notify_child(pipeline, :source, event: {:output, %EndAll{reason: reason}})
   end
 
   defp batch(pipeline, metadata, pts \\ 0) do
@@ -343,12 +350,12 @@ defmodule Membrane.MOTTrackerTest do
       refute_receive {:core, {:expire_suspended, _at}}, 1_200
     end
 
-    test "the :end_all notification ends everything, on a buffer of its own",
+    test "the EndAll event ends everything, on a buffer of its own",
          %{pipeline: pipeline} do
       batch(pipeline, observations(["car"], 1_000, "epoch_one"))
       assert_sink_buffer(pipeline, :sink, %Buffer{metadata: %{tagged: [%{label: "car"}]}})
 
-      Testing.Pipeline.notify_child(pipeline, :tracker, :end_all)
+      end_all(pipeline)
 
       assert calls(2) == [{:track, [%{label: "car"}], 1_000}, {:end_all, :stream_reset}]
       assert_sink_buffer(pipeline, :sink, %Buffer{metadata: metadata})
@@ -366,10 +373,44 @@ defmodule Membrane.MOTTrackerTest do
       batch(pipeline, observations(["car"], 1_000, "epoch_one"))
       assert_sink_buffer(pipeline, :sink, %Buffer{metadata: %{tagged: [%{label: "car"}]}})
 
-      Testing.Pipeline.notify_child(pipeline, :tracker, {:end_all, :detection_disabled})
+      end_all(pipeline, :detection_disabled)
 
       assert_sink_buffer(pipeline, :sink, %Buffer{metadata: metadata})
       assert %{events: [{:ended, %{reason: :detection_disabled}}], context: nil} = metadata
+    end
+
+    # The reason the stop is an event and not a parent notification: a producer
+    # that ends its tracks and resumes in the same breath — the stamper, when
+    # detection is flipped off and straight back on — has both halves on one
+    # pad, so the ending can only ever be applied before what follows it. Out
+    # of band the ending takes the parent hop and can arrive *after* the
+    # resumed batch, ending the tracks that batch just minted.
+    test "a stop cannot overtake the batches behind it", %{pipeline: pipeline} do
+      batch(pipeline, observations(["car"], 1_000, "epoch_one"))
+      assert_sink_buffer(pipeline, :sink, %Buffer{metadata: %{tagged: [%{label: "car"}]}})
+
+      # One action list, so the two leave the source back to back and only the
+      # pad decides how they arrive.
+      Testing.Pipeline.notify_child(pipeline, :source,
+        event: {:output, %EndAll{reason: :detection_disabled}},
+        buffer:
+          {:output,
+           %Buffer{payload: <<>>, pts: 1, metadata: observations(["person"], 2_000, "epoch_one")}}
+      )
+
+      # The ending is applied first, so what the resumed batch mints is minted
+      # after it and nothing ends that.
+      assert calls(3) == [
+               {:track, [%{label: "car"}], 1_000},
+               {:end_all, :detection_disabled},
+               {:track, [%{label: "person"}], 2_000}
+             ]
+
+      assert_sink_buffer(pipeline, :sink, %Buffer{
+        metadata: %{tagged: [], events: [{:ended, %{reason: :detection_disabled}}]}
+      })
+
+      assert_sink_buffer(pipeline, :sink, %Buffer{metadata: %{tagged: [%{label: "person"}]}})
     end
 
     test "end of stream ends everything and is forwarded", %{pipeline: pipeline} do

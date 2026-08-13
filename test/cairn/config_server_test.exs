@@ -163,7 +163,6 @@ defmodule Cairn.Config.ServerTest do
             %{"post_window_seconds" => 42},
             %{"max_event_seconds" => 120},
             %{"max_unseen_ms" => 5_000},
-            %{"max_live_tracks" => 16},
             %{"stationary_after_ms" => 20_000},
             %{"track" => %{"person" => 0.5}},
             %{"record" => %{"person" => 0.8}},
@@ -208,6 +207,31 @@ defmodule Cairn.Config.ServerTest do
 
       assert camera_diff(%{}, %{"tracking" => %{"tracker" => "sparsetrack"}}) ==
                %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+    end
+
+    test "raising the live-track cap restarts the camera, at any level" do
+      # The cap is construction input to the detect branch — the element's
+      # `max_suspended` and a frame-counting core's `max_live` — so a running
+      # branch keeps the old one however the policy is refreshed, and it can be
+      # raised on the camera or above it.
+      assert camera_diff(%{"max_live_tracks" => 16}) ==
+               %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+
+      assert camera_diff(%{}, %{"tracking" => %{"max_live_tracks" => 16}}) ==
+               %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+    end
+
+    test "a profile's sample_fps restarts the cameras on it" do
+      # The rate is baked into the branch at build time (the decoder opens on
+      # it, the motion gate sizes its calibration window from it, a
+      # frame-counting core its lost-track buffer), and it is a profile field
+      # alone — a camera's own struct does not move when it changes.
+      base = %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1", "plugin" => "detect"}
+
+      assert Config.Server.diff_cameras(
+               profiled_config([base], "partial"),
+               profiled_config([base], "sample-fps")
+             ) == %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
     end
 
     test "a camera edited both ways is restarted, not refreshed" do
@@ -284,11 +308,11 @@ defmodule Cairn.Config.ServerTest do
 
   # A config carrying one profiled group, for camera edits that need a
   # resolvable `plugin:` reference.
-  defp profiled_config(cameras) do
+  defp profiled_config(cameras, profile \\ "partial") do
     from_map!(%{
       "data_dir" => "tmp/cfg_srv_test",
       "profile_dirs" => ["test/support/fixtures/profiles/argv"],
-      "plugins" => %{"detect" => %{"profile" => "partial"}},
+      "plugins" => %{"detect" => %{"profile" => profile}},
       "cameras" => cameras
     })
   end

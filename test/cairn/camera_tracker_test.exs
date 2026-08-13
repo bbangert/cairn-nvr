@@ -841,9 +841,10 @@ defmodule Cairn.CameraTrackerTest do
 
     # detection turning off is gated upstream now (`Cairn.Pipeline.
     # ObservationStamper`, reading `CameraControl` per batch so this process
-    # does not have to), which notifies the element to end everything rather
-    # than CameraTracker noticing on the next batch — `TrackerDriver.end_all/4`
-    # is that notification. Nothing advances a track while detection is off, so
+    # does not have to), which tells the element in-band to end everything
+    # rather than CameraTracker noticing on the next batch —
+    # `TrackerDriver.end_all/4` is that event. Nothing advances a track while
+    # detection is off, so
     # leaving them live would strand every consumer's entities indefinitely.
     TrackerDriver.end_all(tracker, camera, @policy, :detection_disabled)
 

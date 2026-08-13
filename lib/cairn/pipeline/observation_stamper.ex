@@ -33,7 +33,7 @@ defmodule Cairn.Pipeline.ObservationStamper do
       `Cairn.CameraTracker`.
     * `detection_enabled` — off means the batch is dropped here rather than
       tracked and thrown away downstream, and the tracker element is told to
-      end what it holds (`{:end_all, :detection_disabled}`): nothing will
+      end what it holds (`Membrane.MOTTracker.Event.EndAll`): nothing will
       advance those tracks while detection is off, and a tracker left running
       behind a closed gate would resurrect their identities when it reopens.
   """
@@ -46,6 +46,7 @@ defmodule Cairn.Pipeline.ObservationStamper do
   alias Cairn.ObservationClock
   alias Cairn.Pipeline.Inference.Detections
   alias Membrane.Buffer
+  alias Membrane.MOTTracker.Event.EndAll
   alias Membrane.MOTTracker.Format
 
   def_input_pad(:input,
@@ -162,11 +163,14 @@ defmodule Cairn.Pipeline.ObservationStamper do
     }
   end
 
-  # Detection was on and is now off. The parent hop is the only route to a
-  # sibling element; it is safe to be unordered with the media path because
-  # nothing more is being sent down it.
+  # Detection was on and is now off. Down the pad and not through the parent:
+  # the gate can reopen at any moment, and only the pad orders the ending
+  # against the batches that follow it — a parent hop lets the flip's second
+  # half overtake its first and end the tracks the resumed batches minted.
   defp stop_tracking(%{detecting?: false}), do: []
-  defp stop_tracking(_state), do: [notify_parent: {:end_all, :detection_disabled}]
+
+  defp stop_tracking(_state),
+    do: [event: {:output, %EndAll{reason: :detection_disabled}}]
 
   # A reload cannot change what the argv or the open stream carry — those fields
   # restart the camera (`Cairn.Config.Server`'s `@restart_fields`) and with it

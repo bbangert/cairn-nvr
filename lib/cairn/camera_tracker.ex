@@ -153,9 +153,10 @@ defmodule Cairn.CameraTracker do
   # rewritten on every observation batch. It exists only so a replacement
   # process can re-attach to a live extractor and emit finals, and a recovered
   # event is written `:partial` either way — so losing the last second of
-  # labels costs nothing that the recovery does not already cost. The two
-  # transitions that *do* matter for restore are exempt: the first write at
-  # event start, and the delete at event end.
+  # labels, or of the track list's last second of churn, costs nothing that the
+  # recovery does not already cost. The two transitions that *do* matter for
+  # restore are exempt: the first write at event start, and the delete at event
+  # end.
   @checkpoint_throttle_ms 1_000
 
   @doc """
@@ -458,7 +459,11 @@ defmodule Cairn.CameraTracker do
 
     state =
       cond do
-        passing == [] -> state
+        # No evidence, but the batch still moved the tracker: a live track
+        # ended, one below the tier started. An open event's checkpoint has to
+        # follow that too, or a crash inside the post window restores finals
+        # for tracks that already ended and none for the ones still live.
+        passing == [] -> checkpoint(state, batch.snapshot)
         # recording disabled: evaluate detections but don't open a new event
         state.event == nil and not recording_enabled?(state) -> state
         state.event == nil -> start_event(state, camera, policy, batch, passing)
@@ -1094,6 +1099,11 @@ defmodule Cairn.CameraTracker do
   # The snapshot is the batch's, taken by the tracker element after it: this
   # process holds no tracker to derive one from, and the one that came with the
   # batch is what that batch's event was open over.
+  #
+  # Nothing to checkpoint with no event open: the row exists only for the life
+  # of one, and every batch that arrives outside one reaches here.
+  defp checkpoint(%{event: nil} = state, _snapshot), do: state
+
   defp checkpoint(%{event: event} = state, snapshot) do
     now = state.monotonic_ms.()
 

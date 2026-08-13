@@ -8,8 +8,8 @@ defmodule Cairn.TrackerDriver do
   here" therefore has to produce that, and producing it by hand would be a
   second implementation of the pad contract in every test file.
 
-  So this runs the **real** element and the **real** sink — `handle_buffer/4`
-  and `handle_tick/3` called directly, no pipeline around them — over the real
+  So this runs the **real** element and the **real** sink — its callbacks
+  called directly, no pipeline around them — over the real
   core, and dispatches the result through the real seam. What a test skips by
   using it is only the part above the tracker: `Cairn.Pipeline.Inference`, and
   the clock and control read in `Cairn.Pipeline.ObservationStamper` (an
@@ -26,6 +26,7 @@ defmodule Cairn.TrackerDriver do
   alias Cairn.Config.Camera
   alias Cairn.Pipeline.TrackSink
   alias Membrane.Buffer
+  alias Membrane.MOTTracker.Event.EndAll
 
   @doc """
   One observation through the element and the sink, to `server`.
@@ -87,15 +88,15 @@ defmodule Cairn.TrackerDriver do
   end
 
   @doc """
-  Ends every track the element holds, under `reason` — the parent notification
-  `Cairn.Pipeline.ObservationStamper` triggers when detection is turned off.
+  Ends every track the element holds, under `reason` — the in-band event
+  `Cairn.Pipeline.ObservationStamper` emits when detection is turned off.
   """
   @spec end_all(GenServer.server() | nil, Camera.t(), map(), atom()) :: :ok
   def end_all(server, %Camera{} = camera, policy, reason) do
     {tracker, sink} = state(server, camera, policy)
 
     {actions, tracker} =
-      Membrane.MOTTracker.handle_parent_notification({:end_all, reason}, %{}, tracker)
+      Membrane.MOTTracker.handle_event(:input, %EndAll{reason: reason}, %{}, tracker)
 
     put(camera.id, {tracker, drain(actions, sink)})
     :ok

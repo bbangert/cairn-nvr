@@ -6,6 +6,7 @@ defmodule Cairn.Pipeline.ObservationStamperTest do
   alias Cairn.NativeStub
   alias Cairn.Pipeline.ObservationStamper
   alias Membrane.Buffer
+  alias Membrane.MOTTracker.Event.EndAll
 
   @policy %{
     pre: 5,
@@ -159,7 +160,7 @@ defmodule Cairn.Pipeline.ObservationStamperTest do
 
       {actions, state} = feed(stamper(ctx), [NativeStub.frame()], ctx.epoch)
 
-      assert actions == [notify_parent: {:end_all, :detection_disabled}]
+      assert actions == [event: {:output, %EndAll{reason: :detection_disabled}}]
       assert state.dropped == 1
 
       # once per transition, not once per frame: the tracks are already gone
@@ -167,7 +168,7 @@ defmodule Cairn.Pipeline.ObservationStamperTest do
       assert actions == []
     end
 
-    test "detection back on stamps again and re-arms the notification", ctx do
+    test "detection back on stamps again and re-arms the ending", ctx do
       CameraControl.set(ctx.camera_id, %{detection_enabled: false})
       {_actions, state} = feed(stamper(ctx), [NativeStub.frame()], ctx.epoch)
 
@@ -178,7 +179,82 @@ defmodule Cairn.Pipeline.ObservationStamperTest do
       CameraControl.set(ctx.camera_id, %{detection_enabled: false})
       on_exit(fn -> CameraControl.set(ctx.camera_id, %{detection_enabled: true}) end)
       {actions, _state} = feed(state, [NativeStub.frame()], ctx.epoch)
-      assert actions == [notify_parent: {:end_all, :detection_disabled}]
+      assert actions == [event: {:output, %EndAll{reason: :detection_disabled}}]
     end
+
+    # The whole reason the ending is an event: a flip off and straight back on
+    # puts both halves on one pad, in the order the gate closed and reopened,
+    # so the tracks the resumed batch mints are minted after the ending. The
+    # parent hop this replaces had no such order — the ending could arrive
+    # behind the resumed batch and end exactly the tracks it had just minted.
+    test "an off→on flip ends the old tracks and leaves the new ones alone", ctx do
+      on_exit(fn -> CameraControl.set(ctx.camera_id, %{detection_enabled: true}) end)
+
+      {actions, state} = feed(stamper(ctx), [frame_with_person()], ctx.epoch)
+      {tracked, element} = drive(tracker_element(), actions)
+      assert [%{tagged: [%{object_id: old_id}]}] = tracked
+
+      CameraControl.set(ctx.camera_id, %{detection_enabled: false})
+      {off, state} = feed(state, [frame_with_person()], ctx.epoch)
+
+      CameraControl.set(ctx.camera_id, %{detection_enabled: true})
+      {on, _state} = feed(state, [frame_with_person()], ctx.epoch)
+
+      # In the order the pad delivers them, which is the order the stamper
+      # produced them in.
+      {out, _element} = drive(element, off ++ on)
+
+      assert [ended, resumed] = out
+      assert [{:ended, %{object_id: ^old_id, end_reason: :detection_disabled}}] = ended.events
+
+      # A fresh identity, minted after the ending and untouched by it.
+      assert [%{object_id: new_id}] = resumed.tagged
+      assert [{:started, %{object_id: ^new_id}}] = resumed.events
+      assert [%{object_id: ^new_id}] = resumed.snapshot
+    end
+  end
+
+  # The real element over the real core, driven by hand — `Cairn.TrackerDriver`
+  # without the sink, since what is under test here is the element's reaction to
+  # the stamper's own actions and their order.
+  defp tracker_element do
+    {[], element} =
+      Membrane.MOTTracker.handle_init(
+        %{},
+        struct(Membrane.MOTTracker, tracker: {Cairn.Tracker, []}, max_suspended: 128)
+      )
+
+    element
+  end
+
+  # Every buffer the element produced, in order, and the element after them.
+  defp drive(element, actions) do
+    Enum.reduce(actions, {[], element}, fn action, {out, element} ->
+      {actions, element} =
+        case action do
+          {:buffer, {:output, buffer}} ->
+            Membrane.MOTTracker.handle_buffer(:input, buffer, %{}, element)
+
+          {:event, {:output, event}} ->
+            Membrane.MOTTracker.handle_event(:input, event, %{}, element)
+        end
+
+      {out ++ for({:buffer, {:output, buffer}} <- actions, do: buffer.metadata), element}
+    end)
+  end
+
+  defp frame_with_person do
+    %{
+      NativeStub.frame()
+      | objects: [
+          %{
+            label: "person",
+            score: 0.9,
+            bbox: [0.1, 0.1, 0.2, 0.4],
+            track_id: nil,
+            observation_kind: "detected"
+          }
+        ]
+    }
   end
 end

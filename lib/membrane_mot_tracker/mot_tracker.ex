@@ -30,11 +30,13 @@ defmodule Membrane.MOTTracker do
   adoption window; its tick expires the suspensions and emits their finals on a
   buffer of the element's own.
 
-  A deliberate stop — the `:end_all` parent notification, or end of stream on
-  the input — ends everything the core is still holding, under the reason the
-  parent gave (`{:end_all, reason}`) or `:stream_reset` for the ones that name
-  none. A pipeline rebuild is not a stop and needs no handling: the element
-  dies with it, and the tracks die with the element.
+  A deliberate stop — a `Membrane.MOTTracker.Event.EndAll` on the input pad, or
+  end of stream on it — ends everything the core is still holding, under the
+  reason the event named or `:stream_reset` for the ones that name none. The
+  stop travels in-band for the reason that event documents: it is a transition
+  on the stream it stops, and the batches around it are what it has to be
+  ordered against. A pipeline rebuild is not a stop and needs no handling: the
+  element dies with it, and the tracks die with the element.
 
   A buffer that does not carry the metadata contract is dropped and counted,
   never crashed on, and `:stats` reports the two counters to the parent.
@@ -43,7 +45,7 @@ defmodule Membrane.MOTTracker do
   use Membrane.Filter
 
   alias Membrane.Buffer
-  alias Membrane.MOTTracker.{Core, Format}
+  alias Membrane.MOTTracker.{Core, Event, Format}
   alias Membrane.Time
 
   # The one timer id, so a cut can only ever restart the sweep it already has.
@@ -234,15 +236,19 @@ defmodule Membrane.MOTTracker do
 
   # Deliberate stops. The rebuild case is absent on purpose: a pipeline that is
   # torn down takes this element with it, and the tracks with the element.
+  #
+  # The event stops here rather than being forwarded: what a consumer needs of
+  # it is the finals, which go out as a buffer below.
   @impl true
-  def handle_parent_notification({:end_all, reason}, _ctx, state) do
+  def handle_event(:input, %Event.EndAll{reason: reason}, _ctx, state) do
     end_all(state, reason)
   end
 
-  def handle_parent_notification(:end_all, _ctx, state) do
-    end_all(state)
-  end
+  # Overriding the callback replaces the filter's forwarding default outright,
+  # so everything else has to be handed back to it explicitly.
+  def handle_event(pad, event, ctx, state), do: super(pad, event, ctx, state)
 
+  @impl true
   def handle_parent_notification(:stats, _ctx, state) do
     {[notify_parent: {:stats, %{processed: state.processed, dropped: state.dropped}}], state}
   end

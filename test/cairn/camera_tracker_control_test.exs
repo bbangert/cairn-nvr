@@ -80,7 +80,7 @@ defmodule Cairn.CameraTrackerControlTest do
   # `detection_enabled` no longer reaches this process at all: it is gated in
   # `Cairn.Pipeline.ObservationStamper`, which drops the batch before the
   # tracker element ever sees it and tells the element to let go
-  # (`{:end_all, :detection_disabled}`) rather than leave live tracks behind a
+  # (`Membrane.MOTTracker.Event.EndAll`) rather than leave live tracks behind a
   # closed gate. That gate is covered end to end in
   # `test/cairn/pipeline/observation_stamper_test.exs`; this module has
   # nothing left to guarantee about the control being off, only about what it

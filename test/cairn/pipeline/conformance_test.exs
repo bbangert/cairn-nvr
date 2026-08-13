@@ -323,9 +323,9 @@ defmodule Cairn.Pipeline.ConformanceTest do
 
       # `:detection_disabled` is the one end reason reachable without waiting out
       # a liveness window, and it runs the same close-out path every other does.
-      # The gate itself is the stamper's (it drops the batch and notifies the
-      # parent); what is asserted here is the close-out, so both paths take the
-      # notification the parent would have relayed.
+      # The gate itself is the stamper's (it drops the batch and emits the
+      # ending on its pad); what is asserted here is the close-out, so both
+      # paths take that event directly.
       CameraControl.set(classic_id, %{detection_enabled: false})
       CameraControl.set(membrane_id, %{detection_enabled: false})
 

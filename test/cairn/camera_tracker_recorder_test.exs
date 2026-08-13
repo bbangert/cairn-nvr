@@ -287,7 +287,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
 
       # detection_enabled is gated upstream now (`Cairn.Pipeline.ObservationStamper`),
       # which is what tells the tracker element to let go —
-      # `TrackerDriver.end_all/4` is that notification, not a further
+      # `TrackerDriver.end_all/4` is that in-band event, not a further
       # detection under a disabled control this process never sees anyway
       TrackerDriver.end_all(ctx.tracker, ctx.camera, @policy, :detection_disabled)
 
@@ -792,6 +792,59 @@ defmodule Cairn.CameraTrackerRecorderTest do
       # nothing was buffered for a track that predates this recorder
       assert row.entry_bbox == nil
       assert Tracks.moments(oid) == []
+    end
+
+    # A batch carrying no evidence still moves the tracker — here the open
+    # event's only track lapses in it — and the checkpoint is what a
+    # replacement process replays. Left at the last evidence-bearing batch's
+    # snapshot it replays a final for a track that already ended.
+    test "a lifecycle-only batch moves the checkpoint an open event restores from", ctx do
+      # The checkpoint is throttled on this clock; the batches below are
+      # deliberately more than a throttle window apart on it.
+      clock = start_supervised!({Agent, fn -> 0 end}, id: :checkpoint_clock)
+
+      tracker =
+        start_supervised!(
+          {CameraTracker,
+           camera_id: ctx.camera_id,
+           name: nil,
+           recorder: ctx.rec,
+           monotonic_ms: fn -> Agent.get(clock, & &1) end,
+           start_extractor: fn _camera, _event ->
+             {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+           end,
+           finalize_extractor: fn _pid, _event -> :ok end},
+          id: :tracker_lifecycle_checkpoint
+        )
+
+      observe(tracker, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], [])
+      assert_receive {:track_started, %Track{object_id: oid}}
+
+      # The broadcast above leaves this process before the batch that carried
+      # it is finished with, so the checkpoint is read behind a sync call.
+      _ = :sys.get_state(tracker)
+      assert {%Event{}, [%Track{object_id: ^oid}]} = EventCheckpoint.get(ctx.camera_id)
+
+      Agent.update(clock, &(&1 + 2_000))
+
+      # No evidence in it at all, and past `max_unseen_ms` (3 000) of the one
+      # before: the track lapses and the event stays open on its post window.
+      observe(tracker, ctx.camera, [], at_ms: 5_000.0)
+      assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :unseen}}
+
+      _ = :sys.get_state(tracker)
+      assert {%Event{}, []} = EventCheckpoint.get(ctx.camera_id)
+
+      # …which is what the restore then replays: nothing, rather than a second
+      # final for a track this camera already ended.
+      restored =
+        start_supervised!(
+          {CameraTracker, camera_id: ctx.camera_id, name: nil, recorder: ctx.rec},
+          id: :tracker_lifecycle_restore
+        )
+
+      assert Process.alive?(restored)
+      refute_receive {:track_ended, %Track{end_reason: :host_restart}}, 200
     end
   end
 end
