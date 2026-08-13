@@ -111,6 +111,9 @@ defmodule Cairn.PipelineOwnerTest do
     start_supervised!({RingBuffer, camera_id: id, pre_window_seconds: 5}, id: {:ring, id})
     RingBuffer.put_fragment(id, %Fragment{camera_id: id, seq: 0, pts: 0, data: <<1>>})
     wait_until(fn -> RingBuffer.last_fragment_at(id) != nil end)
+    # Real time past `config/0`'s 1 s stall_seconds floor (the thing under test
+    # IS wall-clock staleness); the 100 ms margin is shared with the sleep at
+    # the escalation test below — shrink the floor and both go with it.
     Process.sleep(1_100)
   end
 
@@ -176,7 +179,26 @@ defmodule Cairn.PipelineOwnerTest do
 
       # the flush is what carries the muxer's held tail into the ring
       assert_receive {:pipeline_msg, ^pipeline, :flush}
-      assert_receive {:stream_epoch, ^id, _epoch, :camera_stopped}
+      assert_receive {:stream_epoch, ^id, :main, _epoch, :camera_stopped}
+    end
+
+    test "a dual-stream camera's stop is announced once per role" do
+      cam = camera(uid("pd"), substream_url: "rtsp://127.0.0.1:554/sub")
+      StreamEpochs.subscribe()
+      owner = start_owner(cam)
+      id = cam.id
+
+      assert_receive {:pipeline_started, _pipeline, _opts}, 2_000
+
+      ref = Process.monitor(owner)
+      stop_supervised!({:owner, cam.id})
+      assert_receive {:DOWN, ^ref, :process, ^owner, _reason}, 5_000
+
+      # A stop takes both ingests, and a consumer following one role learns
+      # nothing from the other's announcement — so each stream gets its own.
+      assert_receive {:stream_epoch, ^id, :main, main, :camera_stopped}
+      assert_receive {:stream_epoch, ^id, :sub, sub, :camera_stopped}
+      assert main != sub
     end
 
     @tag :capture_log
@@ -190,7 +212,7 @@ defmodule Cairn.PipelineOwnerTest do
       Process.exit(pipeline, :kill)
 
       assert_receive {:pipeline_started, _second, _opts}, 2_000
-      refute_received {:stream_epoch, ^id, _epoch, :camera_stopped}
+      refute_received {:stream_epoch, ^id, :main, _epoch, :camera_stopped}
     end
   end
 
@@ -374,6 +396,121 @@ defmodule Cairn.PipelineOwnerTest do
       assert_receive :bounced, 2_000
 
       refute_receive {:pipeline_started, _pid, _opts}, 500
+    end
+  end
+
+  # The dual-stream half of the ladder. The detect branch hangs off the sub
+  # stream, so its silence has one more innocent explanation than a
+  # single-stream camera's — and the rebuild it would escalate to is
+  # pipeline-wide (D3), taking a main stream that is recording perfectly well.
+  # Ticks are driven rather than waited out: what these assert is the
+  # decision, and the decision is one `handle_info(:watchdog, …)`.
+  describe "the watchdog on a dual-stream camera" do
+    defp dual(prefix),
+      do:
+        camera(uid(prefix),
+          ingest: :rtsp,
+          plugin: {:group, "g"},
+          substream_url: "rtsp://127.0.0.1:554/sub"
+        )
+
+    defp wedge(owner) do
+      send(owner, {:stats, %{last_buffer_at_ms: System.monotonic_time(:millisecond) - 5_000}})
+      send(owner, :watchdog)
+    end
+
+    # The main stream is recording perfectly well throughout — which is both
+    # the premise of every test here (only the sub is in trouble) and what
+    # keeps the ring signal out of the way of the detect one.
+    defp recording(cam) do
+      start_supervised!({RingBuffer, camera_id: cam.id, pre_window_seconds: 5},
+        id: {:ring, cam.id}
+      )
+
+      fragment(cam)
+    end
+
+    defp fragment(cam) do
+      RingBuffer.put_fragment(cam.id, %Fragment{camera_id: cam.id, seq: 0, pts: 0, data: <<1>>})
+      wait_until(fn -> RingBuffer.last_fragment_at(cam.id) != nil end)
+    end
+
+    test "waits for the substream to connect before believing the detect signal" do
+      cam = dual("dn")
+      recording(cam)
+      owner = start_owner(cam)
+      assert_receive {:pipeline_started, _first, _opts}, 2_000
+
+      # The sub has never answered, so nothing has ever fed the branch and
+      # the age of its last buffer is not evidence of anything.
+      wedge(owner)
+      refute_receive {:pipeline_started, _pid, _opts}, 500
+    end
+
+    test "leaves a sub in backoff to its own reconnect ladder" do
+      cam = dual("db")
+      recording(cam)
+      owner = start_owner(cam)
+      id = cam.id
+      assert_receive {:pipeline_started, _first, _opts}, 2_000
+
+      send(owner, {:stream_connected, :sub, []})
+      send(owner, {:stream_backoff, :sub, :econnrefused})
+
+      wedge(owner)
+      refute_receive {:pipeline_started, _pid, _opts}, 500
+
+      # …and the camera never read as anything but healthy: the sub is not
+      # what the lifecycle status is about, and a rebuild that never
+      # happened is a main stream still recording.
+      refute_received {:status, ^id, :backoff}
+      refute_received {:status, ^id, :stalled}
+    end
+
+    @tag :capture_log
+    test "rebuilds a substream that is connected and feeding nothing" do
+      cam = dual("dw")
+      recording(cam)
+      owner = start_owner(cam)
+      id = cam.id
+      assert_receive {:pipeline_started, first, _opts}, 2_000
+
+      send(owner, {:stream_connected, :sub, []})
+      wedge(owner)
+
+      assert_receive {:status, ^id, :stalled}, 2_000
+      assert_receive {:pipeline_started, second, opts}, 2_000
+      assert second != first
+
+      # Both roles' first epoch is minted under it: the rebuild took both
+      # streams, so `:stall_bounce` is as true of the sub's as of main's.
+      assert opts[:initial_reason] == :stall_bounce
+    end
+
+    @tag :capture_log
+    test "a sub that reconnects gets a full stall window before it is judged" do
+      cam = dual("dr")
+      recording(cam)
+      owner = start_owner(cam)
+      assert_receive {:pipeline_started, first, _opts}, 2_000
+
+      # The outage, then the recovery, then a tick with the stamp the outage
+      # left behind — which is as old as the outage and says nothing about
+      # the session that just started.
+      send(owner, {:stream_backoff, :sub, :econnrefused})
+      wedge(owner)
+      send(owner, {:stream_connected, :sub, []})
+      send(owner, :watchdog)
+
+      refute_receive {:pipeline_started, _pid, _opts}, 500
+
+      # It is still the escalation of last resort, not a waiver: a branch
+      # that stays silent past the window is a wedge either way.
+      Process.sleep(1_100)
+      fragment(cam)
+      wedge(owner)
+      assert_receive {:pipeline_started, second, _opts}, 2_000
+      assert second != first
     end
   end
 

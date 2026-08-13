@@ -22,10 +22,12 @@ defmodule Cairn.PipelineOwner do
   answer, given here, so a bridge that connects and never decodes cannot read
   as healthy.
 
-  `:running` is gated on an init segment carrying the camera's *current*
+  `:running` is gated on an init segment carrying the *main* stream's current
   epoch (`Cairn.StreamEpochs` is the reference; this process no longer mints
   and so no longer knows one first-hand). A superseded session's fragments
-  arriving late therefore cannot vouch for the pipeline that replaced it.
+  arriving late therefore cannot vouch for the pipeline that replaced it. Main
+  and not the detect role, whatever the camera's substream says: recording is
+  cut from the main tee, so a sub epoch would never match an init segment.
 
   ## Watchdog (D3)
 
@@ -35,13 +37,15 @@ defmodule Cairn.PipelineOwner do
   `config.stall_seconds`:
 
     * detect branch stale while the ring is healthy: the wedge is downstream
-      of the tee, where no reconnect reaches it — rebuild. Not while
-      `Cairn.CameraControl` has detection switched off: the branch is then
-      dropping every frame on purpose (`detect_gate/1`).
-    * ring stale on `ingest: rtsp` while the source reports itself connected:
-      the same wedge on the recording side — rebuild. A source in backoff or
-      lost is a mere outage and gets nothing: the in-element reconnect owns
-      it, and a rebuild would only throw away the detect branch's warm state.
+      of the tee (or, for a dual-stream camera, on the sub stream), where no
+      reconnect reaches it — rebuild. Not while `Cairn.CameraControl` has
+      detection switched off, and not while the stream feeding the branch is
+      not connected: both make it quiet on purpose (`detect_gate/1`).
+    * ring stale on `ingest: rtsp` while the *main* source reports itself
+      connected: the same wedge on the recording side — rebuild. A source in
+      backoff or lost is a mere outage and gets nothing: the in-element
+      reconnect owns it, and a rebuild would only throw away the detect
+      branch's warm state.
     * ring stale on `ingest: ffmpeg`: bounce the bridge first
       (`Cairn.FFmpegPort.bounce/1`, which a port already backing off ignores)
       and escalate to a rebuild only if two further ticks pass with the ring
@@ -49,6 +53,12 @@ defmodule Cairn.PipelineOwner do
 
   At most one rebuild per stall window, so a camera that comes back slowly is
   not rebuilt twice over the same outage.
+
+  The two signals are independent but the rebuild is not: it takes the whole
+  pipeline (D3), the main stream's recording included. That is why the sub's
+  own reconnect ladder has to have had its chance first — a sub in backoff,
+  lost, or never connected is an outage, and an outage that bounced a healthy
+  main's recording would cost more than it fixed.
   """
 
   use GenServer
@@ -63,6 +73,8 @@ defmodule Cairn.PipelineOwner do
   # Stale ticks with ffmpeg respawned before the bridge bounce escalates.
   @bridge_escalate_ticks 2
 
+  @roles [:main, :sub]
+
   defstruct camera: nil,
             config: nil,
             opts: [],
@@ -73,16 +85,17 @@ defmodule Cairn.PipelineOwner do
             backoff_ms: nil,
             # reason carried into the *next* pipeline's first epoch
             restart_reason: :started,
-            # init_seen gates :running on an init segment carrying the camera's
-            # current epoch; got_fragment makes the transition once per pipeline
+            # init_seen gates :running on an init segment carrying the main
+            # stream's current epoch; got_fragment makes the transition once
+            # per pipeline
             init_seen: false,
             got_fragment: false,
-            # what the source last told us about the main stream
-            source: :unknown,
+            # what each source last told us about its role's stream
+            sources: %{},
             # TrackSink's last buffer, monotonic ms, from the relayed stats
             detect_at_ms: nil,
-            # the last tick that found detection switched off at runtime,
-            # monotonic ms — the floor under detect_stale?/1
+            # the last tick that found the detect branch quiet for a reason
+            # that is not a wedge, monotonic ms — see detect_gate/1
             detect_gated_at_ms: nil,
             bridge_stale_ticks: nil,
             rebuilt_at_ms: nil,
@@ -163,27 +176,20 @@ defmodule Cairn.PipelineOwner do
     {:noreply, enter_backoff(%{state | pipeline: nil, pipeline_ref: nil}, :source_lost)}
   end
 
-  # Relayed from the pipeline's source element. The camera is reachable again,
-  # but nothing has decoded yet — :running is the ring's to say.
-  def handle_info({:stream_connected, :main, _tracks}, state) do
-    {:noreply, set_status(%{state | source: :connected}, :connecting)}
+  # Relayed from the pipeline's source elements, one report per role. The
+  # camera is reachable again, but nothing has decoded yet — :running is the
+  # ring's to say.
+  def handle_info({:stream_connected, role, _tracks}, state) when role in @roles do
+    {:noreply, state |> put_source(role, :connected) |> lifecycle(role, :connecting)}
   end
 
-  def handle_info({:stream_backoff, :main, _reason}, state) do
-    {:noreply, set_status(%{state | source: :backoff}, :backoff)}
+  def handle_info({:stream_backoff, role, _reason}, state) when role in @roles do
+    {:noreply, state |> put_source(role, :backoff) |> lifecycle(role, :backoff)}
   end
 
-  def handle_info({:stream_lost, :main}, state) do
-    {:noreply, %{state | source: :lost}}
+  def handle_info({:stream_lost, role}, state) when role in @roles do
+    {:noreply, put_source(state, role, :lost)}
   end
-
-  # A sub stream never speaks for the camera's status (phase 3 gives it its own
-  # signals); matched explicitly so it cannot fall through as main's.
-  def handle_info({tag, :sub, _rest}, state) when tag in [:stream_connected, :stream_backoff] do
-    {:noreply, state}
-  end
-
-  def handle_info({:stream_lost, :sub}, state), do: {:noreply, state}
 
   # TrackSink's reply to the watchdog's :detect_stats.
   def handle_info({:stats, %{last_buffer_at_ms: at_ms}}, state) do
@@ -191,10 +197,10 @@ defmodule Cairn.PipelineOwner do
   end
 
   # Ring broadcasts. The init segment carries the epoch, fragments do not — so
-  # matching it against the camera's current epoch is what ties the
+  # matching it against the main stream's current epoch is what ties the
   # fragment-based :running transition to the pipeline that is running *now*.
   def handle_info({:init_segment, %{epoch: epoch}}, state) do
-    if StreamEpochs.current(state.camera.id) == {:ok, epoch} do
+    if StreamEpochs.current({state.camera.id, :main}) == {:ok, epoch} do
       {:noreply, %{state | init_seen: true}}
     else
       {:noreply, state}
@@ -233,17 +239,49 @@ defmodule Cairn.PipelineOwner do
     # StreamEpochs would otherwise eat the shutdown budget and get us killed
     # before the pipeline is stopped; the degraded path still
     # best-effort-broadcasts.
+    #
+    # Once per role, because a stop takes every one of the camera's streams and
+    # each carries its own epoch: a consumer following the sub stream learns
+    # nothing from main's stop. The two mints are independent — neither
+    # supersedes the other, and a consumer that sees only its own role sees
+    # exactly one — so the order below is not load-bearing.
     if stop_reason?(reason) do
-      StreamEpochs.new_epoch(state.camera.id, :camera_stopped, 500)
+      Enum.each(
+        roles(state.camera),
+        &StreamEpochs.new_epoch({state.camera.id, &1}, :camera_stopped, 500)
+      )
     end
 
-    # This 500ms bound and flush/1's 500ms grace are additive on the shutdown
-    # path; their sum must stay well under the supervisor's 5s budget, which
-    # is why neither default is any bigger.
+    # These 500ms bounds (one per role, so up to two) and flush/1's 500ms grace
+    # are additive on the shutdown path; their sum must stay well under the
+    # supervisor's 5s budget, which is why no default is any bigger.
     flush(state)
     stop_pipeline(state)
     :ok
   end
+
+  defp put_source(state, role, report),
+    do: %{state | sources: Map.put(state.sources, role, report)}
+
+  defp source_state(state, role), do: Map.get(state.sources, role, :unknown)
+
+  # A sub stream never speaks for the camera's lifecycle status: it feeds
+  # detection, and a camera whose recording is fine is not in backoff.
+  defp lifecycle(state, :main, status), do: set_status(state, status)
+  defp lifecycle(state, :sub, _status), do: state
+
+  # Main always — a bridge-ingest camera's main stream is ffmpeg's, but it is
+  # still a stream with an epoch — plus sub when the camera is configured for
+  # one. Nothing here asks the pipeline what it actually built: this camera
+  # struct is what it was built from, and `substream_url` is a restart field.
+  defp roles(camera) do
+    case Config.Camera.detect_role(camera) do
+      :sub -> [:main, :sub]
+      :main -> [:main]
+    end
+  end
+
+  defp detect_role(camera), do: Config.Camera.detect_role(camera)
 
   defp stop_reason?(:normal), do: true
   defp stop_reason?(:shutdown), do: true
@@ -253,13 +291,14 @@ defmodule Cairn.PipelineOwner do
   # -- pipeline lifecycle -----------------------------------------------------
 
   defp start_pipeline(state, reason) do
-    opts = [
-      camera: state.camera,
-      owner: self(),
-      ingest: state.camera.ingest,
-      initial_reason: reason,
-      detect: detect_opts(state)
-    ]
+    opts =
+      [
+        camera: state.camera,
+        owner: self(),
+        ingest: state.camera.ingest,
+        initial_reason: reason,
+        detect: detect_opts(state)
+      ] ++ Keyword.take(state.opts, [:rtsp_module])
 
     module = Keyword.get(state.opts, :pipeline_module, Cairn.Pipeline.Camera)
 
@@ -269,7 +308,7 @@ defmodule Cairn.PipelineOwner do
           state
           | init_seen: false,
             got_fragment: false,
-            source: :unknown,
+            sources: %{},
             detect_at_ms: nil,
             bridge_stale_ticks: nil,
             pipeline_started_at_ms: now_ms()
@@ -377,7 +416,7 @@ defmodule Cairn.PipelineOwner do
       bridge?(state) ->
         bounce_bridge(state)
 
-      state.source == :connected ->
+      source_state(state, :main) == :connected ->
         rebuild(state, "no fragments while the source reports itself connected")
 
       true ->
@@ -462,18 +501,37 @@ defmodule Cairn.PipelineOwner do
     :exit, _absent_or_slow -> nil
   end
 
-  # Detection switched off at runtime makes `Cairn.Pipeline.ObservationStamper`
-  # drop every frame, so TrackSink's last buffer ages out with nothing wrong —
-  # and the detect signal, which only knows the camera *has* a detect branch,
-  # would rebuild a healthy camera once per stall window for as long as the
-  # operator leaves it off. Holding the baseline at now while the gate is shut
-  # says nothing instead; it also gives the branch a full window to produce a
-  # real buffer once the gate re-opens, which it needs — the stamp it re-opens
-  # with is as old as the disable, and no wedge made it so. ETS, per tick.
+  # The floor under `detect_stale?/1`: the last tick that found a reason for a
+  # quiet detect branch that is not a wedge. TrackSink's last buffer ages out
+  # under either of them with nothing wrong, and the detect signal — which only
+  # knows the camera *has* a detect branch — would rebuild a healthy camera
+  # once per stall window for as long as the reason lasted. Holding the
+  # baseline at now says nothing instead; it also gives the branch a full
+  # window to produce a real buffer once the reason lifts, which it needs — the
+  # stamp it resumes with is as old as the pause, and no wedge made it so.
+  #
+  #   * detection switched off at runtime makes
+  #     `Cairn.Pipeline.ObservationStamper` drop every frame (ETS, per tick);
+  #   * a substream that is not connected is an outage, and an outage is the
+  #     source's own reconnect ladder to clear. The rebuild is pipeline-wide,
+  #     so bouncing a healthy main's recording over one would be the expensive
+  #     answer to a problem nothing here can fix.
   defp detect_gate(state) do
-    if CameraControl.get(state.camera.id).detection_enabled,
+    if CameraControl.get(state.camera.id).detection_enabled and detect_source_live?(state),
       do: state,
       else: %{state | detect_gated_at_ms: now_ms()}
+  end
+
+  # Only a substream is judged by its source's own report — `:unknown` (never
+  # connected) included, which is where a camera whose sub has never answered
+  # sits. A main-role detect branch needs none: it feeds the ring too, so its
+  # outage is what `ring_stale?/1` already sees, and a bridge main never sends
+  # a report at all.
+  defp detect_source_live?(state) do
+    case detect_role(state.camera) do
+      :main -> true
+      :sub -> source_state(state, :sub) == :connected
+    end
   end
 
   defp detect_stale?(%{detect_at_ms: nil}), do: false

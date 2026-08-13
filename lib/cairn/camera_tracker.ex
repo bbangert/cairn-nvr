@@ -106,7 +106,11 @@ defmodule Cairn.CameraTracker do
   end of a stream: an epoch announcement travels from a different process than
   the batches do, so it can arrive while the old session's last batches are
   still crossing the branch, and this is where they are recognised as stale and
-  dropped. `:camera_stopped` is the one announcement that also ends tracks
+  dropped. Only the **detect stream's** announcements: a camera with a
+  `substream_url` detects on the sub and records on the main, whose sessions
+  boundary independently, and a main-stream reset says nothing about the
+  identities the tracker element holds (`detect_role/2`).
+  `:camera_stopped` is the one announcement that also ends tracks
   here: the pipeline that held them is going away, and what it emits on its way
   out is not something to wait on — a killed one emits nothing at all — so they
   are ended from the last summaries this process saw. A flushed one *does* emit
@@ -283,12 +287,21 @@ defmodule Cairn.CameraTracker do
     # and does nothing with.
     StreamEpochs.subscribe()
 
+    detect_role = detect_role(camera_id, :main)
+
     state = %{
       camera_id: camera_id,
       event: nil,
       extractor: nil,
       track_updates: %{},
-      current_epoch: seed_epoch(camera_id),
+      # Which of this camera's streams the detect branch is fed from, and so
+      # the only role whose epochs are this process's business. Re-resolved on
+      # every `:started` this camera announces rather than frozen here: this
+      # process outlives the camera's pipeline (it sits outside the media
+      # tree), and `substream_url` is a restart field, so the role can move
+      # under it. See `detect_role/2`.
+      detect_role: detect_role,
+      current_epoch: seed_epoch(camera_id, detect_role),
       # The epoch that was current when this camera was stopped, held until the
       # next one is adopted: what a dying pipeline still drains is tagged with
       # it, and `apply_epoch/3` has already ended those tracks. See `stale?/2`.
@@ -325,16 +338,45 @@ defmodule Cairn.CameraTracker do
     {:ok, restore_from_checkpoint(state)}
   end
 
-  # The epoch this camera is streaming under right now, if anything is: it is
-  # minted at each session's first buffer, upstream of decode and inference,
+  # The epoch the detect stream is running under right now, if anything is: it
+  # is minted at each session's first buffer, upstream of decode and inference,
   # so it exists before any detection of that session can create this
   # process — reading it here is what lets `stale?/2` judge the very first
   # batch and what makes the next announcement of the same epoch a no-op.
-  defp seed_epoch(camera_id) do
-    case StreamEpochs.current(camera_id) do
+  defp seed_epoch(camera_id, role) do
+    case StreamEpochs.current({camera_id, role}) do
       {:ok, epoch} -> epoch
       :unknown -> nil
     end
+  end
+
+  # The role the camera's detect branch is built off: `:sub` when it has a
+  # substream, `:main` otherwise. A config round trip, which is why it is asked
+  # only at init and on this camera's `:started` announcements — a session
+  # start is both rare and the one moment the answer can have moved, since a
+  # `substream_url` edit restarts the camera tree (`Cairn.Config.Server`'s
+  # restart fields) and the pipeline that comes back announces `:started`.
+  #
+  # Failure mode: the config server serves the *new* config while the *old*
+  # pipeline is still running. A `:started` in that window resolves the role
+  # the camera is about to have rather than the one it has, and until the
+  # restart lands this process ignores the announcements it should follow —
+  # `stale?/2` then drops the old pipeline's last batches. The window is the
+  # camera restart itself, and a mint needs a fresh RTSP session and its first
+  # buffer, so nothing reaches it in practice. A config server that is down or
+  # too slow (the call exits) keeps the role already held: degrading to `:main`
+  # would silently move a dual-stream camera's tracker onto the recording
+  # stream, which is the failure this whole axis exists to prevent.
+  defp detect_role(camera_id, held) do
+    case Config.Server.camera(camera_id) do
+      {:ok, camera} -> Config.Camera.detect_role(camera)
+      # A camera the config no longer names (a removal mid-transition) is a
+      # lookup failure like any other: keep the role already held rather than
+      # silently moving a dual camera's filter onto the recording stream.
+      :error -> held
+    end
+  catch
+    :exit, _ -> held
   end
 
   @impl true
@@ -615,12 +657,26 @@ defmodule Cairn.CameraTracker do
   # the branch still forwards — a silent, sustained outage for this camera
   # until its next mint.
   #
-  # The topic carries every camera's mints; only this camera's are ours.
-  def handle_info({:stream_epoch, camera_id, epoch, reason}, %{camera_id: camera_id} = state) do
-    if Cairn.ULID.superseded?(state.current_epoch, epoch) do
-      {:noreply, state}
-    else
-      {:noreply, apply_epoch(state, epoch, reason)}
+  # The topic carries every camera's mints, and both roles of each; only this
+  # camera's detect stream is ours. A dual-stream camera's main reset is not a
+  # boundary here — the tracker element's identities came off the sub stream
+  # and nothing about them changed — so it must not become `current_epoch`,
+  # which would have `stale?/2` drop every sub-tagged batch that follows.
+  #
+  # The role is re-resolved before the comparison, not after: a `:started` is
+  # the first word of a pipeline that may have been rebuilt around a
+  # `substream_url` edit, and judging it against the role that edit replaced
+  # would ignore the only announcement that could release the stale gate.
+  def handle_info(
+        {:stream_epoch, camera_id, role, epoch, reason},
+        %{camera_id: camera_id} = state
+      ) do
+    state = resolve_role(state, reason)
+
+    cond do
+      role != state.detect_role -> {:noreply, state}
+      Cairn.ULID.superseded?(state.current_epoch, epoch) -> {:noreply, state}
+      true -> {:noreply, apply_epoch(state, epoch, reason)}
     end
   end
 
@@ -648,6 +704,16 @@ defmodule Cairn.CameraTracker do
     do: {:noreply, clear_event(state)}
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  # Deliberately not on `:camera_stopped`: a stop is minted per role by the
+  # pipeline that is going away, so it has to be judged against the role that
+  # pipeline ran under. Re-reading a config that has already moved would have
+  # this process ignore its own camera's stop and keep tracks nothing will ever
+  # end.
+  defp resolve_role(state, :started),
+    do: %{state | detect_role: detect_role(state.camera_id, state.detect_role)}
+
+  defp resolve_role(state, _reason), do: state
 
   # `:camera_stopped` names the end of a stream, not the start of one: nothing
   # will ever decode under that epoch. It ends every track this process still

@@ -151,7 +151,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
   # broadcast `Cairn.CameraTracker` used to react to on its own.
   defp cut_epoch(tracker, camera, at_ms_offset, reason \\ :source_lost) do
     epoch = Cairn.ULID.generate()
-    send(tracker, {:stream_epoch, camera.id, epoch, reason})
+    send(tracker, {:stream_epoch, camera.id, :main, epoch, reason})
     _ = :sys.get_state(tracker)
     observe(tracker, camera, [], epoch: epoch, at_ms: at_ms_offset)
     epoch
@@ -757,7 +757,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
       observe(tracker, ctx.camera, [object("person", 0.9, @reset_box)], epoch: epoch_a)
       assert_receive {:"$gen_cast", {:open, %Track{object_id: oid, epoch: ^epoch_a}, _event}}
 
-      send(tracker, {:stream_epoch, ctx.camera_id, epoch_b, :source_lost})
+      send(tracker, {:stream_epoch, ctx.camera_id, :main, epoch_b, :source_lost})
       _ = :sys.get_state(tracker)
 
       observe(tracker, ctx.camera, [object("person", 0.9, @reset_box)], epoch: epoch_b)

@@ -27,3 +27,9 @@ cameras:
     extra_ffmpeg_args: []
     retention:
       days: 7
+  # detection runs on the sub stream, recording on main: the two carry
+  # independent stream epochs (Cairn.StreamEpochs)
+  - id: cam_dual
+    rtsp_url: rtsp://127.0.0.1:8554/d
+    substream_url: rtsp://127.0.0.1:8554/d_sub
+    ingest: rtsp

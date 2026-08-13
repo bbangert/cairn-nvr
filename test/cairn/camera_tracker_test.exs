@@ -591,7 +591,7 @@ defmodule Cairn.CameraTrackerTest do
     # the tracks that the first announcement already started. This is a raw
     # send, not a batch: it reaches only CameraTracker's own bookkeeping, never
     # the element, so nothing here could touch tracking state even if it tried.
-    send(tracker, {:stream_epoch, id, epoch, :source_lost})
+    send(tracker, {:stream_epoch, id, :main, epoch, :source_lost})
     _ = :sys.get_state(tracker)
 
     refute_received {:track_ended, _}
@@ -619,7 +619,7 @@ defmodule Cairn.CameraTrackerTest do
     # late server broadcast). No boundary was crossed, so `current_epoch` must
     # not move — this raw send never reaches the element, so what it could get
     # wrong is only CameraTracker's own bookkeeping, not the tracks themselves
-    send(tracker, {:stream_epoch, id, epoch, :started})
+    send(tracker, {:stream_epoch, id, :main, epoch, :started})
     _ = :sys.get_state(tracker)
 
     assert :sys.get_state(tracker).current_epoch == epoch
@@ -682,7 +682,7 @@ defmodule Cairn.CameraTrackerTest do
     # Applying it would roll `current_epoch` back to a stream nothing decodes
     # under, and `stale?/2` would then drop every observation the ports still
     # forward — until the camera's *next* mint, hours away for a healthy one.
-    send(tracker, {:stream_epoch, id, Cairn.ULID.generate(1), :source_lost})
+    send(tracker, {:stream_epoch, id, :main, Cairn.ULID.generate(1), :source_lost})
     _ = :sys.get_state(tracker)
 
     assert :sys.get_state(tracker).current_epoch == current
@@ -867,6 +867,103 @@ defmodule Cairn.CameraTrackerTest do
     assert state.stopped_epoch == nil
   end
 
+  # `cam_dual` is the fixture config's dual-stream camera, and the config
+  # server is where this process learns which of a camera's streams its detect
+  # branch is fed from — so these run against the real resolution, not a seam.
+  describe "a camera with a substream" do
+    setup do
+      camera = %Camera{
+        id: "cam_dual",
+        rtsp_url: "rtsp://127.0.0.1:8554/d",
+        substream_url: "rtsp://127.0.0.1:8554/d_sub",
+        min_score: %{"default" => 0.5}
+      }
+
+      test_pid = self()
+
+      dual =
+        start_supervised!(
+          {CameraTracker,
+           camera_id: camera.id,
+           name: nil,
+           start_extractor: fn _camera, event ->
+             pid = spawn(fn -> Process.sleep(:infinity) end)
+             send(test_pid, {:extractor_started, event, pid})
+             {:ok, pid}
+           end,
+           finalize_extractor: fn pid, event ->
+             send(test_pid, {:extractor_finalized, pid, event})
+           end},
+          id: :dual_tracker
+        )
+
+      on_exit(fn -> EventCheckpoint.delete(camera.id) end)
+
+      %{dual: dual, dual_camera: camera}
+    end
+
+    test "the detect role is the sub stream, and a plain camera's is main", %{
+      dual: dual,
+      tracker: tracker
+    } do
+      sub = StreamEpochs.new_epoch({"cam_dual", :sub}, :started)
+      _ = :sys.get_state(dual)
+
+      assert %{detect_role: :sub, current_epoch: ^sub} = :sys.get_state(dual)
+      # the outer setup's camera is in no config at all, which reads as main —
+      # the shape every single-stream caller keeps
+      assert :sys.get_state(tracker).detect_role == :main
+    end
+
+    test "a main-stream boundary neither ends tracks nor moves the staleness gate", %{
+      dual: dual,
+      dual_camera: camera
+    } do
+      sub = StreamEpochs.new_epoch({"cam_dual", :sub}, :started)
+      _ = :sys.get_state(dual)
+
+      observe(dual, camera, [object("person", 0.9, @box)], epoch: sub)
+      assert_receive {:event_started, %Event{camera_id: "cam_dual"}}
+      assert_receive {:track_started, %Track{object_id: first}}
+
+      # The recording stream reconnecting says nothing about identities that
+      # came off the sub stream — and adopting its epoch would be worse than
+      # useless: `stale?/2` would then drop every sub-tagged batch that follows.
+      StreamEpochs.new_epoch({"cam_dual", :main}, :source_lost)
+      _ = :sys.get_state(dual)
+
+      assert :sys.get_state(dual).current_epoch == sub
+      refute_received {:track_ended, _}
+      assert [%Track{object_id: ^first}] = live_tracks("cam_dual")
+      assert suspended_tracks("cam_dual") == []
+
+      observe(dual, camera, [object("person", 0.9, @box)], epoch: sub)
+      assert_receive {:event_updated, %Event{camera_id: "cam_dual"}}
+    end
+
+    test "only the detect stream's stop ends the tracks", %{dual: dual, dual_camera: camera} do
+      sub = StreamEpochs.new_epoch({"cam_dual", :sub}, :started)
+      _ = :sys.get_state(dual)
+
+      observe(dual, camera, [object("person", 0.9, @box)], epoch: sub)
+      assert_receive {:track_started, %Track{object_id: first}}
+
+      # The owner mints :camera_stopped once per role the camera runs; main's
+      # arrives first here and must pass straight through.
+      StreamEpochs.new_epoch({"cam_dual", :main}, :camera_stopped)
+      _ = :sys.get_state(dual)
+
+      refute_received {:track_ended, _}
+      assert :sys.get_state(dual).current_epoch == sub
+
+      StreamEpochs.new_epoch({"cam_dual", :sub}, :camera_stopped)
+      _ = :sys.get_state(dual)
+
+      assert_receive {:track_ended, %Track{object_id: ^first, end_reason: :stream_reset}}
+      assert :sys.get_state(dual).current_epoch == nil
+    end
+  end
+
   test "disabling detection ends the live tracks, once", %{
     tracker: tracker,
     camera: camera,
@@ -974,7 +1071,7 @@ defmodule Cairn.CameraTrackerTest do
     assert [{^id, _event, [%Track{object_id: first}]}] = checkpoint(id)
 
     epoch = Cairn.ULID.generate()
-    send(tracker, {:stream_epoch, id, epoch, :source_lost})
+    send(tracker, {:stream_epoch, id, :main, epoch, :source_lost})
     _ = :sys.get_state(tracker)
 
     # past the checkpoint throttle, so this batch rewrites the row — it is
@@ -1057,7 +1154,7 @@ defmodule Cairn.CameraTrackerTest do
     camera: camera,
     camera_id: id
   } do
-    send(tracker, {:stream_epoch, id, "epoch_two", :source_lost})
+    send(tracker, {:stream_epoch, id, :main, "epoch_two", :source_lost})
 
     observe(tracker, camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], epoch: "epoch_one")
     :sys.get_state(tracker)

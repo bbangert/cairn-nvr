@@ -8,89 +8,9 @@ defmodule Membrane.RTSPDualStream.SourceTest do
 
   alias Membrane.Buffer
   alias Membrane.RTSPDualStream.Event.StreamClosed
+  alias Membrane.RTSPDualStream.MockRTSP
   alias Membrane.RTSPDualStream.Source
   alias Membrane.Testing
-
-  defmodule MockRTSP do
-    @moduledoc """
-    Stand-in for the `rtsp` library's client. Mirrors the surface the source
-    calls — `start/1`, `connect/1`, `play/1`, `stop/1` — as a real process,
-    so monitors, `:DOWN` and the "stop/1 leaves the GenServer alive"
-    contract all hold. Each started client announces itself to the test as
-    `{:rtsp_started, client, opts}`; the test then *is* the camera and sends
-    `{:rtsp, client, ...}` to `opts[:receiver]` exactly as the library does.
-
-    `connect:` is a `(attempt_index -> :ok | {:error, reason} | :exit)`
-    function, so a whole refusal-then-recovery ladder is one closure.
-    """
-
-    use GenServer
-
-    def default_tracks do
-      [
-        %{
-          control_path: "video",
-          type: :video,
-          fmtp: nil,
-          rtpmap: %{encoding: "H264", clock_rate: 90_000}
-        }
-      ]
-    end
-
-    def setup(uri, opts) do
-      control = %{
-        test: self(),
-        tracks: Keyword.get(opts, :tracks, default_tracks()),
-        connect: Keyword.get(opts, :connect, fn _attempt -> :ok end),
-        attempts: :counters.new(1, [])
-      }
-
-      :persistent_term.put({__MODULE__, uri}, control)
-      ExUnit.Callbacks.on_exit(fn -> :persistent_term.erase({__MODULE__, uri}) end)
-    end
-
-    def start(opts) do
-      control = :persistent_term.get({__MODULE__, Keyword.fetch!(opts, :stream_uri)})
-      GenServer.start(__MODULE__, {control, opts})
-    end
-
-    def connect(client), do: GenServer.call(client, :connect)
-    def play(client), do: GenServer.call(client, :play)
-
-    # Faithful to the library: `stop/1` cleans the session and replies but
-    # deliberately leaves the GenServer alive. A stub that died here would
-    # mask a client-process leak.
-    def stop(client), do: GenServer.call(client, :stop)
-
-    @impl true
-    def init({control, opts}) do
-      send(control.test, {:rtsp_started, self(), opts})
-      {:ok, control}
-    end
-
-    @impl true
-    def handle_call(:connect, _from, control) do
-      attempt = :counters.get(control.attempts, 1)
-      :counters.add(control.attempts, 1, 1)
-
-      case control.connect.(attempt) do
-        :ok ->
-          {:reply, {:ok, control.tracks}, control}
-
-        {:error, _reason} = refusal ->
-          {:reply, refusal, control}
-
-        # The library's connect/play are GenServer.calls, so a slow camera
-        # EXITS the caller rather than returning an error — simulated by
-        # stopping without a reply, no real timeout to wait out.
-        :exit ->
-          {:stop, {:shutdown, :mock_slow_connect}, control}
-      end
-    end
-
-    def handle_call(:play, _from, control), do: {:reply, :ok, control}
-    def handle_call(:stop, _from, control), do: {:reply, :ok, control}
-  end
 
   # 1280x720 baseline SPS, verified against MediaCodecs.H264.NALU.SPS.
   @sps <<0x67, 0x42, 0x00, 0x1E, 0xF4, 0x02, 0x80, 0x2D, 0xC8>>
@@ -100,8 +20,10 @@ defmodule Membrane.RTSPDualStream.SourceTest do
 
   @keyframe_au [@sps, @pps, @idr]
 
+  defp uri, do: "rtsp://127.0.0.1:554/cam#{System.unique_integer([:positive])}"
+
   defp start_source(opts) do
-    uri = "rtsp://127.0.0.1:554/cam#{System.unique_integer([:positive])}"
+    uri = uri()
     MockRTSP.setup(uri, opts)
 
     source = %Source{
@@ -119,11 +41,56 @@ defmodule Membrane.RTSPDualStream.SourceTest do
     )
   end
 
+  # Both roles live, each with its own mock camera (`main:` / `sub:` carry
+  # that role's MockRTSP options) and its own sink, so an assertion on one
+  # role's pad cannot be satisfied by the other's traffic.
+  defp start_dual(opts) do
+    uris = %{main: uri(), sub: uri()}
+    for {role, uri} <- uris, do: MockRTSP.setup(uri, Keyword.get(opts, role, []))
+
+    source = %Source{
+      stream_uri: uris.main,
+      substream_uri: uris.sub,
+      rtsp_module: MockRTSP,
+      backoff_min_ms: Keyword.get(opts, :backoff_min_ms, 50),
+      backoff_max_ms: Keyword.get(opts, :backoff_max_ms, 200)
+    }
+
+    pipeline =
+      Testing.Pipeline.start_link_supervised!(
+        spec: [
+          child(:source, source),
+          get_child(:source) |> via_out(Pad.ref(:output, :main)) |> child(:main, Testing.Sink),
+          get_child(:source) |> via_out(Pad.ref(:output, :sub)) |> child(:sub, Testing.Sink)
+        ]
+      )
+
+    {pipeline, uris}
+  end
+
   # The element's own pid, learned the way the library learns it: from the
   # `receiver:` it was started with.
   defp session(timeout \\ 2_000) do
-    assert_receive {:rtsp_started, client, opts}, timeout
+    assert_receive {:rtsp_started, _uri, client, opts}, timeout
     {client, opts[:receiver], opts}
+  end
+
+  # A selective receive rather than `assert_receive`: the other role's
+  # sessions must stay in the mailbox for its own assertions.
+  defp session_for(uri, timeout \\ 2_000) do
+    receive do
+      {:rtsp_started, ^uri, client, opts} -> {client, opts[:receiver]}
+    after
+      timeout -> flunk("no session started for #{uri} within #{timeout} ms")
+    end
+  end
+
+  defp refute_session(uri, timeout) do
+    receive do
+      {:rtsp_started, ^uri, _client, _opts} -> flunk("unexpected session for #{uri}")
+    after
+      timeout -> :ok
+    end
   end
 
   defp keyframe(source, client, pts) do
@@ -213,7 +180,7 @@ defmodule Membrane.RTSPDualStream.SourceTest do
 
       send(source, {:rtsp, client, {"video", {[@non_idr], 3_000, false, 2}}})
       assert_sink_buffer(pipeline, :sink, %Buffer{pts: 33_333_333})
-      refute_receive {:rtsp_started, _client, _opts}, 100
+      refute_receive {:rtsp_started, _uri, _client, _opts}, 100
     end
   end
 
@@ -327,7 +294,7 @@ defmodule Membrane.RTSPDualStream.SourceTest do
       # …and the element is not reusable: a session death after the stop
       # starts nothing.
       send(source, {:rtsp, client, :session_closed})
-      refute_receive {:rtsp_started, _client2, _opts}, 300
+      refute_receive {:rtsp_started, _uri, _client2, _opts}, 300
     end
 
     test "cancels a pending reconnect instead of stopping a timer that never ran" do
@@ -339,7 +306,7 @@ defmodule Membrane.RTSPDualStream.SourceTest do
       # A source that never emitted has no stream to end; the point is that
       # the pending retry timer is stopped rather than left to fire.
       Testing.Pipeline.notify_child(pipeline, :source, :eos)
-      refute_receive {:rtsp_started, _client, _opts}, 800
+      refute_receive {:rtsp_started, _uri, _client, _opts}, 800
     end
   end
 
@@ -394,6 +361,207 @@ defmodule Membrane.RTSPDualStream.SourceTest do
       # Back at 100 ms the next attempt lands within 150 ms; had the three
       # refusals stood, the ladder would be at 1600 ms.
       assert {_client2, _source, _opts} = session(300)
+    end
+  end
+
+  describe "both roles" do
+    test "connect as two sessions, each pad carrying only its own" do
+      {pipeline, uris} = start_dual([])
+      {main_client, source} = session_for(uris.main)
+      {sub_client, ^source} = session_for(uris.sub)
+
+      assert main_client != sub_client
+      assert_pipeline_notified(pipeline, :source, {:stream_connected, :main, _tracks})
+      assert_pipeline_notified(pipeline, :source, {:stream_connected, :sub, _tracks})
+
+      keyframe(source, main_client, 0)
+      keyframe(source, sub_client, 90_000)
+
+      assert_sink_buffer(pipeline, :main, %Buffer{pts: 0})
+      assert_sink_buffer(pipeline, :sub, %Buffer{pts: 1_000_000_000})
+      refute_sink_buffer(pipeline, :main, %Buffer{}, 200)
+    end
+
+    test "a graceful stop ends both pads and reaps both clients" do
+      {pipeline, uris} = start_dual([])
+      {main_client, source} = session_for(uris.main)
+      {sub_client, ^source} = session_for(uris.sub)
+
+      reaped_main = Process.monitor(main_client)
+      reaped_sub = Process.monitor(sub_client)
+
+      keyframe(source, main_client, 0)
+      keyframe(source, sub_client, 0)
+      assert_sink_buffer(pipeline, :main, %Buffer{pts: 0})
+      assert_sink_buffer(pipeline, :sub, %Buffer{pts: 0})
+
+      Testing.Pipeline.notify_child(pipeline, :source, :eos)
+
+      assert_end_of_stream(pipeline, :main)
+      assert_end_of_stream(pipeline, :sub)
+      assert_receive {:DOWN, ^reaped_main, :process, _pid, _reason}, 5_000
+      assert_receive {:DOWN, ^reaped_sub, :process, _pid, _reason}, 5_000
+    end
+
+    test "a graceful stop cancels the pending retry of each role" do
+      refusing = [connect: fn _attempt -> {:error, :refused} end]
+
+      {pipeline, uris} =
+        start_dual(main: refusing, sub: refusing, backoff_min_ms: 500, backoff_max_ms: 500)
+
+      {_main_client, _source} = session_for(uris.main)
+      {_sub_client, _source} = session_for(uris.sub)
+      assert_pipeline_notified(pipeline, :source, {:stream_backoff, :main, :refused})
+      assert_pipeline_notified(pipeline, :source, {:stream_backoff, :sub, :refused})
+
+      # Both timers are pending here, and `stop_timer` on a role that has none
+      # raises — a stop that forgot one role would crash the element rather
+      # than merely leak a retry.
+      Testing.Pipeline.notify_child(pipeline, :source, :eos)
+
+      refute_session(uris.main, 500)
+      refute_session(uris.sub, 500)
+    end
+  end
+
+  describe "role independence" do
+    test "a sub death closes the sub pad only, and main flows through its backoff" do
+      {pipeline, uris} = start_dual(backoff_min_ms: 400, backoff_max_ms: 400)
+      {main_client, source} = session_for(uris.main)
+      {sub_client, ^source} = session_for(uris.sub)
+
+      keyframe(source, main_client, 0)
+      keyframe(source, sub_client, 0)
+      assert_sink_buffer(pipeline, :main, %Buffer{pts: 0})
+      assert_sink_buffer(pipeline, :sub, %Buffer{pts: 0})
+
+      send(source, {:rtsp, sub_client, :session_closed})
+
+      assert_sink_event(pipeline, :sub, %StreamClosed{})
+      assert_pipeline_notified(pipeline, :source, {:stream_lost, :sub})
+
+      # Main's session is untouched: no closure downstream, no lost/connected
+      # notification, and its buffers keep landing while the sub is down.
+      send(source, {:rtsp, main_client, {"video", {[@non_idr], 90_000, false, 2}}})
+      assert_sink_buffer(pipeline, :main, %Buffer{pts: 1_000_000_000})
+      refute_sink_event(pipeline, :main, %StreamClosed{}, 100)
+      refute_pipeline_notified(pipeline, :source, {:stream_lost, :main}, 0)
+
+      {sub_client2, ^source} = session_for(uris.sub)
+      assert sub_client2 != sub_client
+      refute_session(uris.main, 0)
+    end
+
+    test "a main death closes the main pad only, and the sub flows through its backoff" do
+      {pipeline, uris} = start_dual(backoff_min_ms: 400, backoff_max_ms: 400)
+      {main_client, source} = session_for(uris.main)
+      {sub_client, ^source} = session_for(uris.sub)
+
+      keyframe(source, main_client, 0)
+      keyframe(source, sub_client, 0)
+      assert_sink_buffer(pipeline, :main, %Buffer{pts: 0})
+      assert_sink_buffer(pipeline, :sub, %Buffer{pts: 0})
+
+      send(source, {:rtsp, main_client, :session_closed})
+
+      assert_sink_event(pipeline, :main, %StreamClosed{})
+      assert_pipeline_notified(pipeline, :source, {:stream_lost, :main})
+
+      send(source, {:rtsp, sub_client, {"video", {[@non_idr], 90_000, false, 2}}})
+      assert_sink_buffer(pipeline, :sub, %Buffer{pts: 1_000_000_000})
+      refute_sink_event(pipeline, :sub, %StreamClosed{}, 100)
+      refute_pipeline_notified(pipeline, :source, {:stream_lost, :sub}, 0)
+
+      {main_client2, ^source} = session_for(uris.main)
+      assert main_client2 != main_client
+      refute_session(uris.sub, 0)
+    end
+
+    test "each role climbs — and resets — its own backoff ladder" do
+      {pipeline, uris} =
+        start_dual(
+          sub: [connect: fn _attempt -> {:error, :refused} end],
+          backoff_min_ms: 50,
+          backoff_max_ms: 100_000
+        )
+
+      {main_client, source} = session_for(uris.main)
+      {_refused, ^source} = session_for(uris.sub)
+
+      # Four sub refusals leave the sub's next delay at 400-1200 ms.
+      for _retry <- 1..3, do: session_for(uris.sub)
+
+      send(source, {:rtsp, main_client, :session_closed})
+      lost_at = System.monotonic_time(:millisecond)
+      {main_client2, ^source} = session_for(uris.main, 1_000)
+
+      # Main never failed, so its own ladder is still at the 50 ms minimum —
+      # 75 ms at the top of the jitter, against the sub's 400 ms floor.
+      assert System.monotonic_time(:millisecond) - lost_at < 300
+
+      # Media on main resets main's ladder; the sub's climb must survive it.
+      keyframe(source, main_client2, 0)
+      assert_sink_buffer(pipeline, :main, %Buffer{pts: 0})
+
+      session_for(uris.sub, 3_000)
+      retried_at = System.monotonic_time(:millisecond)
+      session_for(uris.sub, 5_000)
+      assert System.monotonic_time(:millisecond) - retried_at >= 300
+    end
+
+    test "a sub that never comes back retries forever and is never rewired to main" do
+      {pipeline, uris} =
+        start_dual(
+          sub: [connect: fn _attempt -> {:error, :refused} end],
+          backoff_min_ms: 20,
+          backoff_max_ms: 40
+        )
+
+      {main_client, source} = session_for(uris.main)
+      for _retry <- 1..6, do: session_for(uris.sub)
+      assert_pipeline_notified(pipeline, :source, {:stream_backoff, :sub, :refused})
+
+      # Nothing in the element falls back: the sub pad stays silent, and main
+      # is neither re-opened nor duplicated to feed it.
+      keyframe(source, main_client, 0)
+      assert_sink_buffer(pipeline, :main, %Buffer{pts: 0})
+      refute_sink_buffer(pipeline, :sub, %Buffer{}, 200)
+      refute_session(uris.main, 0)
+    end
+  end
+
+  describe "sub-only" do
+    test "connects the sub role alone, leaving the main pad unused" do
+      sub_uri = uri()
+      MockRTSP.setup(sub_uri, [])
+
+      source = %Source{
+        substream_uri: sub_uri,
+        rtsp_module: MockRTSP,
+        backoff_min_ms: 50,
+        backoff_max_ms: 200
+      }
+
+      pipeline =
+        Testing.Pipeline.start_link_supervised!(
+          spec:
+            child(:source, source)
+            |> via_out(Pad.ref(:output, :sub))
+            |> child(:sub, Testing.Sink)
+        )
+
+      {client, element} = session_for(sub_uri)
+      assert_pipeline_notified(pipeline, :source, {:stream_connected, :sub, _tracks})
+      refute_receive {:rtsp_started, _uri, _client, _opts}, 200
+
+      keyframe(element, client, 0)
+      assert_sink_buffer(pipeline, :sub, %Buffer{pts: 0})
+    end
+
+    test "neither uri is refused rather than run as a silent element" do
+      assert_raise ArgumentError, ~r/stream_uri/, fn ->
+        Source.handle_init(%{}, %Source{rtsp_module: MockRTSP})
+      end
     end
   end
 end

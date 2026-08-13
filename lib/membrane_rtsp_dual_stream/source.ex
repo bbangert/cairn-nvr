@@ -1,14 +1,23 @@
 defmodule Membrane.RTSPDualStream.Source do
   @moduledoc """
   A push source that owns its RTSP client session(s) and outlives them: the
-  camera's main and (optionally) sub stream are connected, lost, and
-  reconnected entirely inside this element, so the pipeline around it is
-  built once and never rebuilt.
+  camera's main and sub stream are connected, lost, and reconnected entirely
+  inside this element, so the pipeline around it is built once and never
+  rebuilt.
 
   That placement is the whole point. A dead camera is a normal long-lived
   state, not a fault: absorbing reconnect here keeps it from burning
   supervisor restart intensity, and keeps backoff state from dying with a
   pipeline crash.
+
+  ## Roles
+
+  A role runs iff its URI is configured, so the element covers main-only,
+  sub-only (an ffmpeg bridge owns main elsewhere) and both. Everything a
+  session has — client, backoff ladder, retry timer, drop-until-IDR,
+  format synthesis, in-band events — is per role, and nothing recovers one
+  role onto the other: a sub that never comes back retries forever rather
+  than falling back to main, which is a config-time choice only.
 
   ## Pads
 
@@ -63,8 +72,9 @@ defmodule Membrane.RTSPDualStream.Source do
   alias Membrane.RTSPDualStream.Event.StreamClosed
 
   def_options stream_uri: [
-                spec: String.t(),
-                description: "RTSP URI of the main stream"
+                spec: String.t() | nil,
+                default: nil,
+                description: "RTSP URI of the main stream, or nil to run sub-only"
               ],
               substream_uri: [
                 spec: String.t() | nil,
@@ -98,6 +108,12 @@ defmodule Membrane.RTSPDualStream.Source do
       [main: opts.stream_uri, sub: opts.substream_uri]
       |> Enum.reject(fn {_role, uri} -> is_nil(uri) end)
       |> Map.new(fn {role, uri} -> {role, new_stream(role, uri, opts.backoff_min_ms)} end)
+
+    # Refused rather than tolerated: an element that connects nothing and
+    # emits nothing is indistinguishable downstream from a dead camera.
+    if map_size(streams) == 0 do
+      raise ArgumentError, "#{inspect(__MODULE__)}: set stream_uri, substream_uri, or both"
+    end
 
     state = %{
       rtsp_module: opts.rtsp_module,
@@ -224,6 +240,11 @@ defmodule Membrane.RTSPDualStream.Source do
   # ingest make. Nothing else this element does is more urgent than getting
   # media flowing, and the alternative — a helper process — reintroduces the
   # ownership split this element exists to remove.
+  #
+  # It is also the only thing the two roles share: one role's handshake
+  # delays the other's samples and its retry tick for the duration. Bounded
+  # by the client's own call timeouts (the exit is caught in `open_session`),
+  # and it moves nothing between the roles — no state, no fallback.
   defp connect(_role, _ctx, %{stopped?: true} = state), do: {[], state}
 
   defp connect(role, ctx, state) do

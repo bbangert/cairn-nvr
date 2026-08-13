@@ -174,7 +174,29 @@ defmodule Cairn.Pipeline.EpochTaggerTest do
 
     assert {:event, %EpochChange{epoch: epoch}} = next(pipeline)
 
-    assert_receive {:stream_epoch, ^camera_id, ^epoch, :started}, 2_000
+    assert_receive {:stream_epoch, ^camera_id, :main, ^epoch, :started}, 2_000
     assert Cairn.StreamEpochs.current(camera_id) == {:ok, epoch}
+  end
+
+  test "role: mints under the pad's own stream", %{camera_id: camera_id} do
+    sub =
+      Testing.Pipeline.start_link_supervised!(
+        spec: [
+          child(:source, ScriptSource)
+          |> child(:tagger, %EpochTagger{camera_id: camera_id, role: :sub})
+          |> child(:sink, RecordSink)
+        ]
+      )
+
+    on_exit(fn -> Testing.Pipeline.terminate(sub) end)
+    start_session(sub)
+
+    assert {:event, %EpochChange{epoch: epoch}} = next(sub)
+    assert_receive {:stream_epoch, ^camera_id, :sub, ^epoch, :started}, 2_000
+
+    # the camera's main stream is untouched: this tagger sits behind the other
+    # pad and the two sessions boundary independently
+    assert Cairn.StreamEpochs.current({camera_id, :sub}) == {:ok, epoch}
+    assert Cairn.StreamEpochs.current(camera_id) == :unknown
   end
 end

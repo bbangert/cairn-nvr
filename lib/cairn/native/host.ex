@@ -832,10 +832,14 @@ defmodule Cairn.Native.Host do
   end
 
   # The epoch is minted from the media itself — `Cairn.Pipeline.EpochTagger`, on
-  # each session's first buffer. Only a camera nobody has minted for yet gets one
-  # from here: this
-  # process establishing the first session of a camera's life is the one case where
-  # it is the authority.
+  # each session's first buffer — and reaches here in `params`, which is why the
+  # fallback is dead for every pipeline camera: `Cairn.Pipeline.Inference` cannot
+  # open before a tagged frame tells it which session it is serving. What is left
+  # on it is the callers that have no session at all — replay tooling, parity
+  # harnesses, tests — which drive one stream per camera and so have no role to
+  # name. Hence `:main`, which is what a bare camera id means to `Cairn.StreamEpochs`:
+  # not a guess at a detect role, an assertion that this path never sees a
+  # dual-stream camera.
   defp resolve_epoch(camera_id, params) do
     case params.stream_epoch || current_epoch(camera_id) do
       nil -> {StreamEpochs.new_epoch(camera_id, :started), :minted}
@@ -852,15 +856,24 @@ defmodule Cairn.Native.Host do
 
   # Not sent for an epoch this process just minted (`new_epoch/3` broadcast that
   # one), and never for one `current/1` does not agree with.
+  #
+  # An adopted epoch is its caller's and carries no role — a detect stream opens
+  # under the sub epoch when the camera has one — so the role is recovered from
+  # the table. `:unknown` there is the same "current/1 does not agree" no-op it
+  # has always been, now covering both roles.
   defp announce(_camera_id, _epoch, :minted), do: :ok
 
   defp announce(camera_id, epoch, :adopted) do
-    if current_epoch(camera_id) == epoch do
-      Phoenix.PubSub.local_broadcast(
-        Cairn.PubSub,
-        StreamEpochs.topic(),
-        {:stream_epoch, camera_id, epoch, :started}
-      )
+    case StreamEpochs.role_of(camera_id, epoch) do
+      {:ok, role} ->
+        Phoenix.PubSub.local_broadcast(
+          Cairn.PubSub,
+          StreamEpochs.topic(),
+          {:stream_epoch, camera_id, role, epoch, :started}
+        )
+
+      :unknown ->
+        :ok
     end
 
     :ok
