@@ -119,9 +119,11 @@ defmodule Cairn.CameraTracker do
   suspended alike: a replacement process re-attaches to a live extractor,
   finalizes an orphan, and ends every restored track (`:host_restart`) —
   broadcasting it and recording it against the checkpointed event, the
-  open-event rule above. Writes are throttled to one a second apart from the
-  event's first and last. How far that reaches, and what it does not cover, is
-  `Cairn.Track`'s moduledoc.
+  open-event rule above. Writes are throttled to one a second, apart from the
+  event's first and last and from the empty snapshot a `:camera_stopped`
+  leaves: those finals have gone out already, and a row still naming them
+  would have a restart inside the post window end them a second time. How far
+  that reaches, and what it does not cover, is `Cairn.Track`'s moduledoc.
 
   One gap that moduledoc does not cover, because the tracks and this process
   stopped dying together: a **pipeline rebuild** (a crash or the watchdog, not
@@ -685,7 +687,15 @@ defmodule Cairn.CameraTracker do
         gap_from: nil
     }
 
-    publish_tracks(state, ended)
+    state = publish_tracks(state, ended)
+
+    # The finals above are the last word on those identities, and an open
+    # event's checkpoint has to say so: a restart inside the post window
+    # restores the row, and a row still naming them ends them a second time as
+    # `:host_restart`. No batch is coming to correct it — the pipeline behind
+    # this announcement is being torn down — so the throttle is bypassed: this
+    # is a lifecycle transition, not a frame.
+    if state.event, do: write_checkpoint(state, []), else: state
   end
 
   # One mint can be announced twice by design: `Cairn.StreamEpochs` broadcasts
@@ -1104,15 +1114,19 @@ defmodule Cairn.CameraTracker do
   # of one, and every batch that arrives outside one reaches here.
   defp checkpoint(%{event: nil} = state, _snapshot), do: state
 
-  defp checkpoint(%{event: event} = state, snapshot) do
+  defp checkpoint(state, snapshot) do
     now = state.monotonic_ms.()
 
     if state.checkpointed_at == nil or now - state.checkpointed_at >= @checkpoint_throttle_ms do
-      EventCheckpoint.put(event.camera_id, event, snapshot)
-      %{state | checkpointed_at: now}
+      write_checkpoint(state, snapshot)
     else
       state
     end
+  end
+
+  defp write_checkpoint(%{event: event} = state, snapshot) do
+    EventCheckpoint.put(event.camera_id, event, snapshot)
+    %{state | checkpointed_at: state.monotonic_ms.()}
   end
 
   defp maybe_finalize(%{event: %Event{id: event_id} = event} = state, event_id, cause) do

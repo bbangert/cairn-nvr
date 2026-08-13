@@ -61,9 +61,14 @@ defmodule Membrane.MOTTracker.SparseTrack do
     expiry: `:ended` goes out on the frame the subtraction drops the track, so
     nothing this core can still re-activate has been ended, and nothing that
     was ended can come back.
-  * That removed set is never forgotten, so an identity removed once can never
-    be lost again — it is subtracted out of the lost list the moment it lands
-    there. Only the identities are kept here, not the tracks.
+  * An identity removed once can never be lost again — it is subtracted out of
+    the lost list the moment it lands there. The reference keeps every removed
+    id forever to do that, which an element that runs for weeks cannot; this
+    port keeps only the identities (never the tracks) and only while a tracked,
+    lost or suspended entry still carries the id (`tombstones/5`). The
+    subtraction is the set's one reader and every id it can test comes from
+    those three pools, so the pruning is invisible to it — and ids are minted
+    monotonically, so a pruned one is never handed out again.
 
   ## Frames, not milliseconds
 
@@ -321,7 +326,8 @@ defmodule Membrane.MOTTracker.SparseTrack do
       state
       | tracked: Enum.map(tracked, &remember/1),
         lost: lost,
-        removed_ids: MapSet.union(state.removed_ids, MapSet.new(removed_now ++ expired, & &1.id)),
+        removed_ids:
+          tombstones(state.removed_ids, removed_now ++ expired, tracked, lost, suspended),
         suspended: suspended,
         frame_id: frame_id,
         next_id: next_id,
@@ -331,6 +337,25 @@ defmodule Membrane.MOTTracker.SparseTrack do
     {state, evicted} = trim_live(state)
 
     {state, Enum.map(output, &summary(&1, at_ms)), lapsed ++ events ++ evicted}
+  end
+
+  # The tombstones worth carrying into the next frame. Their one reader is the
+  # subtraction above, which tests the ids of `state.lost` and of the tracks
+  # this frame marked lost — both drawn from the frame's own `tracked` and
+  # `lost` — and an adoption can hand a suspension's id back into `tracked`
+  # frames later, so a suspended id keeps its tombstone too. An id in none of
+  # the three is unreachable: nothing can put it back in a pool the reader
+  # draws from, and `mint/4` never reissues it.
+  #
+  # Without this the set is the reference's: every id ever removed, forever,
+  # which is fine for a finite MOT sequence and unbounded for an element that
+  # runs for weeks.
+  defp tombstones(removed_ids, removed, tracked, lost, suspended) do
+    held = MapSet.new(Enum.concat([tracked, lost, suspended]), & &1.id)
+
+    removed_ids
+    |> MapSet.union(MapSet.new(removed, & &1.id))
+    |> MapSet.intersection(held)
   end
 
   # The live cap. `lost` counts against it beside `tracked`: a lost track is
@@ -353,14 +378,15 @@ defmodule Membrane.MOTTracker.SparseTrack do
       {evicted, _kept} = live |> Enum.sort_by(&{&1.frame_id, &1.id}) |> Enum.split(surplus)
       ids = MapSet.new(evicted, & &1.id)
 
+      # Removed for good, as everything this core drops is, and without a
+      # tombstone to say so: an evicted identity leaves no tracked, lost or
+      # suspended entry behind, and those are the only pools a later frame can
+      # draw an id from (see `tombstones/5`). There is nothing left that could
+      # walk it back into the lost list.
       state = %{
         state
         | tracked: Enum.reject(state.tracked, &(&1.id in ids)),
-          lost: Enum.reject(state.lost, &(&1.id in ids)),
-          # Removed for good, as everything this core drops is: an evicted
-          # identity that walked back into the lost list would be a track the
-          # cap did not remove.
-          removed_ids: MapSet.union(state.removed_ids, ids)
+          lost: Enum.reject(state.lost, &(&1.id in ids))
       }
 
       {state, for(track <- evicted, track.seen?, do: ended(track, :evicted, state.at_ms))}

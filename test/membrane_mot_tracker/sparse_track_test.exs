@@ -188,6 +188,24 @@ defmodule Membrane.MOTTracker.SparseTrackTest do
       assert {_state, [], []} = step(state, [])
     end
 
+    test "a long revival keeps its tombstone, so the second loss still leaves at once", %{
+      state: state,
+      box: box
+    } do
+      # The tombstone is what makes the loss below immediate rather than a
+      # second stay in the lost list, and pruning it is only safe while the
+      # identity is nowhere a frame can read it from. Here it is tracked for
+      # ten frames first, which is the case a prune-by-liveness rule gets
+      # wrong if it forgets what is alive.
+      state =
+        Enum.reduce(1..10, state, fn _frame, state -> elem(step(state, [object(box)]), 0) end)
+
+      {state, _tagged, events} = step(state, [])
+
+      assert [{:ended, %{object_id: 1}}] = ended(events)
+      assert SparseTrack.checkpoint_tracks(state) == []
+    end
+
     test "an expiry nothing revives ends once, one frame later", %{state: state} do
       {state, _tagged, events} = step(state, [])
 
@@ -197,6 +215,30 @@ defmodule Membrane.MOTTracker.SparseTrackTest do
       {_state, _tagged, events} = step(state, [])
       assert ended(events) == []
     end
+  end
+
+  # The reference carries every id it ever removed for the length of a
+  # sequence; this core runs for as long as the camera does. Reaching into the
+  # struct is the point — unbounded growth is invisible from the outside until
+  # the box runs out of memory.
+  test "the removed set is bounded by what is still live, not by what has been minted" do
+    cycles = 40
+
+    state =
+      Enum.reduce(1..cycles, SparseTrack.new(track_buffer: 1), fn cycle, state ->
+        # Mint, confirm, then leave for long enough to expire, depart, and be
+        # forgotten: one identity buried per cycle, each in a corner of the
+        # frame the next one does not reuse immediately.
+        box = [10 + rem(cycle, 3) * 400, 10, 100, 200]
+        {state, _tagged, _events} = step(state, [object(box)])
+        {state, _tagged, _events} = step(state, [object(box)])
+
+        Enum.reduce(1..4, state, fn _blank, state -> elem(step(state, []), 0) end)
+      end)
+
+    assert state.next_id == cycles
+    assert state.tracked == [] and state.lost == [] and state.suspended == []
+    assert MapSet.size(state.removed_ids) == 0
   end
 
   test "identities are handed out in input order, and a replay assigns the same ones" do

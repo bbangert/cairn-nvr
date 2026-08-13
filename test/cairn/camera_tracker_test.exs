@@ -775,6 +775,43 @@ defmodule Cairn.CameraTrackerTest do
     assert :sys.get_state(tracker).current_epoch == fresh
   end
 
+  # The stop's finals are the last word on those identities, and the open
+  # event's checkpoint has to agree: the post window outlives the stream, so a
+  # restart inside it restores the row, and a row still naming them ends them a
+  # second time as `:host_restart`.
+  test "a :camera_stopped epoch empties the open event's checkpoint snapshot", %{
+    tracker: tracker,
+    camera: camera,
+    camera_id: id
+  } do
+    epoch = StreamEpochs.new_epoch(id, :started)
+    _ = :sys.get_state(tracker)
+
+    detect(tracker, camera, 0.9, @box, epoch: epoch)
+    assert_receive {:event_started, %Event{id: eid}}
+    assert_receive {:track_started, %Track{object_id: oid}}
+
+    # What the row holds while the stream is alive, and what a restart would
+    # replay — so the emptying below is a change and not a row that was never
+    # written.
+    assert [{^id, %Event{id: ^eid}, [%Track{object_id: ^oid}]}] = checkpoint(id)
+
+    StreamEpochs.new_epoch(id, :camera_stopped)
+    _ = :sys.get_state(tracker)
+    assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :stream_reset}}
+
+    # Written under the batch throttle's nose: the row above is a fraction of a
+    # second old, and no batch is coming to correct it.
+    assert [{^id, %Event{id: ^eid}, []}] = checkpoint(id)
+
+    # The restart, as `restore_from_checkpoint/1` sees it: a fresh process for
+    # the same camera, reading the row this one left.
+    start_supervised!({CameraTracker, camera_id: id, name: nil}, id: :tracker_after_stop)
+
+    assert_receive {:event_ended, %Event{id: ^eid, status: :partial}}
+    refute_received {:track_ended, %Track{object_id: ^oid}}
+  end
+
   # `Cairn.PipelineOwner` broadcasts the stop and *then* flushes the pipeline,
   # so the EOS reaching `Membrane.MOTTracker` makes it end everything a second
   # time — on a buffer tagged with the epoch the dying session ran under, which
