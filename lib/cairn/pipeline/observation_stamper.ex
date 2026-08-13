@@ -18,9 +18,11 @@ defmodule Cairn.Pipeline.ObservationStamper do
 
   Everything the tracker decides on is resolved here and ships in the buffer's
   `context` (P2-D4), so the tracker element stays policy-agnostic and a reload
-  targets this element rather than it. `policy` is `Cairn.Config.policy/2`,
-  resolved by `Cairn.PipelineOwner` when it builds the pipeline and replaced on
-  reload through `Cairn.Pipeline.Camera` — never read per frame. The runtime
+  targets this element rather than it — the sink's copy included, which rides
+  the same context rather than arriving on a hop of its own. `policy` is
+  `Cairn.Config.policy/2`, resolved by `Cairn.PipelineOwner` when it builds the
+  pipeline and replaced on reload through `Cairn.Pipeline.Camera` — never read
+  per frame, and never resolved twice for one batch. The runtime
   overrides on top of it are read here per buffer,
   from the ETS `Cairn.CameraControl` serves:
 
@@ -147,20 +149,33 @@ defmodule Cairn.Pipeline.ObservationStamper do
 
   # One buffer per observation, not per push: the element tracks one batch per
   # buffer, and a push's frames are separate batches with their own instants.
-  # `at_ms` rides beside the context as well as inside it — the element times
-  # its own work with it and may not read into a map that is the core's to
-  # interpret.
+  # `at_ms` rides beside the context as well as inside it: the element times
+  # its own work with the one and the core measures its bounds against the
+  # other, so both are written from the single reading here — which is what the
+  # element's guard checks, being one clock read and not two.
   defp batch(state, observation, policy, buffer) do
     %Buffer{
       payload: <<>>,
       pts: buffer.pts,
       metadata: %{
         objects: observation.objects,
-        context: Tracker.context(observation, state.camera.id, policy),
+        context: context(state, observation, policy),
         at_ms: observation.at_ms,
         epoch: observation.epoch
       }
     }
+  end
+
+  # The pair `Cairn.Pipeline.TrackSink` dispatches with rides the context, which
+  # the tracker element carries through opaquely. One reload resolves it and the
+  # tracking bounds above together, and only the pad keeps them together: told
+  # to both elements out of band, a batch could be stamped under the new
+  # tracking policy and dispatched under the old `record:` tier — a combination
+  # that never existed in config (D8, a third time).
+  defp context(state, observation, policy) do
+    observation
+    |> Tracker.context(state.camera.id, policy)
+    |> Map.put(:dispatch, %{camera: state.camera, policy: state.policy})
   end
 
   # Detection was on and is now off. Down the pad and not through the parent:

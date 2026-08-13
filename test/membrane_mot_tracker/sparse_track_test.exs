@@ -139,6 +139,58 @@ defmodule Membrane.MOTTracker.SparseTrackTest do
     end
   end
 
+  # The expiry marks a track removed a frame before the subtraction drops it,
+  # and the reference re-activates one that lingers there (the moduledoc's
+  # first faithfulness note). The final is dated by the departure, so these
+  # three say the same thing from three sides: nothing is ended while it can
+  # still come back, and nothing comes back after it ended.
+  describe "the frame an expired track lingers for" do
+    setup do
+      box = [10, 10, 100, 200]
+      {state, _tagged, _events} = step(SparseTrack.new(track_buffer: 1), [object(box)])
+      {state, _tagged, _events} = step(state, [])
+      {state, _tagged, events} = step(state, [])
+
+      # The expiry frame itself: marked removed, and silent about it.
+      assert ended(events) == []
+
+      %{state: state, box: box}
+    end
+
+    test "the snapshot still holds what the pool can still revive", %{state: state} do
+      assert [%{object_id: 1}] = SparseTrack.checkpoint_tracks(state)
+    end
+
+    test "a revival is a plain update on an identity that never ended", %{
+      state: state,
+      box: box
+    } do
+      {state, tagged, events} = step(state, [object(box)])
+
+      assert ids(tagged) == [1]
+      assert [{:updated, %{object_id: 1}}] = events
+
+      # And once it is lost again it leaves for good — an identity this core
+      # removed once may not sit in the lost list a second time — with the one
+      # final it has been owed all along.
+      {state, _tagged, events} = step(state, [])
+
+      assert [{:ended, %{object_id: 1}}] = ended(events)
+      assert SparseTrack.checkpoint_tracks(state) == []
+      assert {_state, [], []} = step(state, [])
+    end
+
+    test "an expiry nothing revives ends once, one frame later", %{state: state} do
+      {state, _tagged, events} = step(state, [])
+
+      assert [{:ended, %{object_id: 1}}] = ended(events)
+      assert SparseTrack.checkpoint_tracks(state) == []
+
+      {_state, _tagged, events} = step(state, [])
+      assert ended(events) == []
+    end
+  end
+
   test "identities are handed out in input order, and a replay assigns the same ones" do
     objects = [object([0, 0, 50, 100]), object([400, 0, 50, 100]), object([800, 0, 50, 100])]
 

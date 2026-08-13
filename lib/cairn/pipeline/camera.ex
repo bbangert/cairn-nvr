@@ -159,16 +159,14 @@ defmodule Cairn.Pipeline.Camera do
 
   def handle_child_notification(_notification, _child, _ctx, state), do: {[], state}
 
-  # A reload's new policy, from `Cairn.PipelineOwner`. Both ends of the tracker
-  # element hold one — the stamper resolves the tracking context from it, the
-  # sink carries it to the camera's tracker — and a camera whose detect branch
-  # was never built has nothing to tell.
+  # A reload's new policy, from `Cairn.PipelineOwner`, to the head of the detect
+  # branch alone: the stamper resolves the tracking context from it and ships
+  # the sink's half in the batch, so both ends change on the same buffer instead
+  # of on two notifications the pad between them cannot order. A camera whose
+  # detect branch was never built has nothing to tell.
   @impl true
   def handle_info({:policy, camera, policy}, _ctx, %{detecting?: true} = state) do
-    {[
-       notify_child: {:stamper, {:policy, camera, policy}},
-       notify_child: {:track_sink, {:policy, camera, policy}}
-     ], state}
+    {[notify_child: {:stamper, {:policy, camera, policy}}], state}
   end
 
   def handle_info(:detect_stats, _ctx, %{detecting?: true} = state) do

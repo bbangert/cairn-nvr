@@ -68,8 +68,9 @@ defmodule Cairn.Detect.SparseTrackTest do
 
   test "a natural expiry maps SparseTrack's :lost onto Cairn's :unseen" do
     # `track_buffer: 1` shrinks the lost-track buffer to one frame, so the
-    # third call (nothing detected twice running) expires the track instead
-    # of leaving it adoptable.
+    # third call (nothing detected twice running) expires the track — and the
+    # fourth is when it leaves the core for good, which is what the final is
+    # dated by (`Membrane.MOTTracker.SparseTrack`'s faithfulness notes).
     state = SparseTrack.new(track_buffer: 1)
     box = [0.1, 0.1, 0.05, 0.1]
 
@@ -77,9 +78,39 @@ defmodule Cairn.Detect.SparseTrackTest do
     {state, _tagged, marked_lost} = SparseTrack.track(state, [], context(1))
     assert marked_lost == []
 
-    {_state, _tagged, events} = SparseTrack.track(state, [], context(2))
+    {state, _tagged, expiring} = SparseTrack.track(state, [], context(2))
+    assert expiring == []
+
+    {_state, _tagged, events} = SparseTrack.track(state, [], context(3))
 
     assert [{:ended, %Track{end_reason: :unseen}}] = events
+  end
+
+  test "every summary dates the track by its last real detection" do
+    # A `%Cairn.Track{}` is self-contained wherever it lands (the DB row, the
+    # PubSub message, the checkpoint), so the field is on every kind and not
+    # only on the ones a live consumer happens to fold.
+    box = [0.1, 0.1, 0.05, 0.1]
+
+    {state, _tagged, [{:started, started}]} =
+      SparseTrack.track(SparseTrack.new(track_buffer: 1), [object(box)], context(0, 100))
+
+    assert started.last_detected_at == 100
+
+    {state, _tagged, [{:updated, updated}]} =
+      SparseTrack.track(state, [object(box)], context(1, 200))
+
+    assert updated.last_detected_at == 200
+
+    # Nothing matches from here on, so the last detection stands still while
+    # the track ages out — on the snapshot and on the final alike.
+    {state, _tagged, []} = SparseTrack.track(state, [], context(2, 300))
+    assert [%Track{last_detected_at: 200}] = SparseTrack.checkpoint_tracks(state)
+
+    {state, _tagged, []} = SparseTrack.track(state, [], context(3, 400))
+    {_state, _tagged, [{:ended, ended}]} = SparseTrack.track(state, [], context(4, 500))
+
+    assert ended.last_detected_at == 200
   end
 
   test "a suspension reports its last sign of life in wall time" do

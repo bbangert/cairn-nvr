@@ -11,9 +11,12 @@ defmodule Cairn.Pipeline.TrackSink do
   business, and a decision taken here would be taken on the branch's own
   thread, between two frames of a camera that is still decoding.
 
-  `policy` is `Cairn.Config.policy/2`, resolved by `Cairn.PipelineOwner` when it
-  builds the pipeline and replaced on reload through `Cairn.Pipeline.Camera` —
-  carried with every cast and unread here.
+  The camera and `Cairn.Config.policy/2` carried with every cast — and unread
+  here — come off the batch itself: `Cairn.Pipeline.ObservationStamper` puts the
+  pair it stamped the batch under in the context, so one reload cannot leave a
+  batch tracked under the new policy and dispatched under the old. The options
+  are the pair `Cairn.PipelineOwner` built the pipeline with, and stand only
+  until the first batch arrives.
   """
 
   use Membrane.Sink
@@ -66,6 +69,7 @@ defmodule Cairn.Pipeline.TrackSink do
       )
       when is_list(tagged) and is_list(events) and is_list(snapshot) do
     batch = batch(metadata, tagged, events, snapshot, epoch)
+    state = host(state, metadata)
 
     # In this process, not the pipeline's: routing through the parent would put
     # the other branches' notifications behind a tracker that is slow to start.
@@ -78,6 +82,19 @@ defmodule Cairn.Pipeline.TrackSink do
 
   def handle_buffer(:input, _buffer, _ctx, state) do
     {[], %{state | dropped: state.dropped + 1}}
+  end
+
+  # The camera and policy this batch was stamped under, taken off the batch
+  # rather than from a notification of its own: only the pad orders a reload
+  # against the batches it applies to, and the two ends of the tracker element
+  # holding one policy each is exactly how they come apart. The element's own
+  # buffers carry no context and keep the last pair — before the first batch,
+  # that is still what the pipeline was built with.
+  defp host(state, metadata) do
+    case Map.get(metadata, :context) do
+      %{dispatch: %{camera: camera, policy: policy}} -> %{state | camera: camera, policy: policy}
+      _none -> state
+    end
   end
 
   # The context is flattened to the two things the event lifecycle reads off it,
@@ -123,7 +140,7 @@ defmodule Cairn.Pipeline.TrackSink do
     {[notify_parent: {:stats, stats}], state}
   end
 
-  def handle_parent_notification({:policy, camera, policy}, _ctx, state) do
-    {[], %{state | camera: camera, policy: policy}}
-  end
+  # A reload reaches this element in band, on the batches it applies to (see
+  # `host/2`), so nothing else is expected here.
+  def handle_parent_notification(_notification, _ctx, state), do: {[], state}
 end

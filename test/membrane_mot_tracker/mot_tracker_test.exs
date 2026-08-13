@@ -251,6 +251,25 @@ defmodule Membrane.MOTTrackerTest do
     assert_pipeline_notified(pipeline, :tracker, {:stats, %{processed: 1, dropped: 2}})
   end
 
+  # The core reads the batch's instant off the context and the element reads it
+  # beside the context; one clock read, written twice. A context missing it
+  # would crash a core on its first bound, and one disagreeing with the element
+  # would put the cut and the association on two clocks.
+  test "a context that does not carry the element's own at_ms is dropped",
+       %{pipeline: pipeline} do
+    good = observations(["car"], 1_000, "epoch_one")
+
+    batch(pipeline, %{good | context: %{max_unseen_ms: 3_000}})
+    batch(pipeline, %{good | context: %{good.context | at_ms: "1000"}})
+    batch(pipeline, %{good | context: %{good.context | at_ms: 999}})
+
+    batch(pipeline, observations(["car"], 2_000, "epoch_one"), 1)
+    assert_sink_buffer(pipeline, :sink, %Buffer{metadata: %{tagged: [%{object_id: "T1"}]}})
+
+    Testing.Pipeline.notify_child(pipeline, :tracker, :stats)
+    assert_pipeline_notified(pipeline, :tracker, {:stats, %{processed: 1, dropped: 3}})
+  end
+
   describe "the session lifecycle" do
     setup do
       %{pipeline: start_pipeline({RecordingCore, owner: self()}, max_suspended: 4)}

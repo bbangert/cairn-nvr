@@ -56,7 +56,11 @@ defmodule Membrane.MOTTracker.SparseTrack do
 
   * A track removed by the lost-buffer expiry stays in the lost list for one
     more frame, so it can be re-activated after it was removed. The subtraction
-    that would drop it runs against the *previous* frame's removed set.
+    that would drop it runs against the *previous* frame's removed set. The
+    revival is kept, and this port dates its own final by it rather than by the
+    expiry: `:ended` goes out on the frame the subtraction drops the track, so
+    nothing this core can still re-activate has been ended, and nothing that
+    was ended can come back.
   * That removed set is never forgotten, so an identity removed once can never
     be lost again — it is subtracted out of the lost list the moment it lands
     there. Only the identities are kept here, not the tracks.
@@ -257,7 +261,9 @@ defmodule Membrane.MOTTracker.SparseTrack do
     # The already-removed are skipped rather than removed twice. The reference
     # does remove them twice — a track it expired last frame is still in the
     # lost list this frame (see the moduledoc) and its second append lands in a
-    # set, where it is invisible. The second `:ended` would not be.
+    # set, where it is invisible. Here a second marking would put the copy the
+    # expiry froze back into `changed` ahead of the pool's predicted one, and
+    # stall the box of a track that is still adoptable.
     expired =
       for track <- state.lost,
           track = resolve(track, settled ++ pool),
@@ -281,15 +287,20 @@ defmodule Membrane.MOTTracker.SparseTrack do
 
     live_ids = MapSet.new(tracked, & &1.id)
 
-    lost =
+    # The subtraction against the *previous* frame's removed set is where an
+    # identity actually leaves this core, one frame after the expiry marked it
+    # (see the moduledoc) — and where a track re-lost after a revival goes,
+    # since a removed id may not sit in the lost list at all. So it is also
+    # where the final belongs: what departs here is what nothing can revive.
+    {lost, departed} =
       state.lost
       |> Enum.map(&resolve(&1, changed))
       |> Enum.reject(&(&1.id in live_ids))
       |> Kernel.++(marked_lost)
-      |> Enum.reject(&(&1.id in state.removed_ids))
+      |> Enum.split_with(&(&1.id not in state.removed_ids))
 
     output = Enum.filter(tracked, & &1.activated?)
-    events = lifecycle(output, removed_now ++ expired, at_ms)
+    events = lifecycle(output, removed_now ++ departed, at_ms)
 
     state = %{
       state

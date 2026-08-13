@@ -4,7 +4,7 @@ defmodule Cairn.Pipeline.ObservationStamperTest do
   alias Cairn.CameraControl
   alias Cairn.Config.Camera
   alias Cairn.NativeStub
-  alias Cairn.Pipeline.ObservationStamper
+  alias Cairn.Pipeline.{ObservationStamper, TrackSink}
   alias Membrane.Buffer
   alias Membrane.MOTTracker.Event.EndAll
 
@@ -135,6 +135,56 @@ defmodule Cairn.Pipeline.ObservationStamperTest do
 
     {actions, _state} = feed(state, [NativeStub.frame()], ctx.epoch)
     assert [%{context: %{max_unseen_ms: 9_000}}] = batches(actions)
+  end
+
+  test "the sink dispatches every batch under the pair that stamped it", ctx do
+    # The reload reaches the two ends of the tracker element on one buffer or
+    # on two notifications; only the first can keep them in step. The element
+    # between them echoes the context untouched (mot_tracker_test), so its
+    # out-buffer is the stamper's own metadata in `Tracks` clothing.
+    {[], sink} =
+      TrackSink.handle_init(
+        %{},
+        struct(TrackSink, camera: ctx.camera, policy: @policy, tracker: self())
+      )
+
+    camera = %{ctx.camera | max_unseen_ms: 9_000}
+    reloaded = Map.put(@policy, :max_unseen_ms, 9_000)
+
+    {stale, state} = feed(stamper(ctx), [NativeStub.frame()], ctx.epoch)
+
+    {[], state} =
+      ObservationStamper.handle_parent_notification({:policy, camera, reloaded}, %{}, state)
+
+    {fresh, _state} = feed(state, [NativeStub.frame()], ctx.epoch)
+
+    assert [%{context: %{max_unseen_ms: 3_000}}] = batches(stale)
+    assert [%{context: %{max_unseen_ms: 9_000}}] = batches(fresh)
+
+    Enum.reduce(batches(stale) ++ batches(fresh), sink, fn metadata, sink ->
+      {[], sink} = TrackSink.handle_buffer(:input, tracks(metadata), %{}, sink)
+      sink
+    end)
+
+    # Each in the order its batch went through: the old bound with the old
+    # `record:` tier, then both halves of the reload together.
+    old = ctx.camera
+    assert_received {:"$gen_cast", {:tracked, ^old, @policy, _batch}}
+    assert_received {:"$gen_cast", {:tracked, ^camera, ^reloaded, _batch}}
+  end
+
+  defp tracks(metadata) do
+    %Buffer{
+      payload: <<>>,
+      metadata: %{
+        tagged: [],
+        events: [],
+        suspension: nil,
+        snapshot: [],
+        epoch: metadata.epoch,
+        context: metadata.context
+      }
+    }
   end
 
   describe "the runtime control overlay" do

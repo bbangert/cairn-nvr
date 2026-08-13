@@ -125,15 +125,30 @@ defmodule Membrane.MOTTracker do
   # instant, beside the context rather than read out of it. It is the only
   # reading of that clock this element gets, so it is what a cut is stamped
   # with and what the sweep's instant is derived from.
+  #
+  # The context has to carry it too — `t:Membrane.MOTTracker.Core.context/0`
+  # requires it, and a core measures its windows against it — and carry the
+  # *same* number: they are one reading of one
+  # clock, written twice by a producer that has it once. Requiring the equality
+  # rather than merely the key is what catches the producer that stamps the two
+  # from separate reads, or from two different clocks, where the cut and the
+  # association would then disagree by the drift between them. A batch that
+  # fails it is a counted drop, like any other contract breach here.
   @impl true
   def handle_buffer(
         :input,
-        %Buffer{metadata: %{objects: objects, context: context, at_ms: at_ms, epoch: epoch}} =
-          buffer,
+        %Buffer{
+          metadata: %{
+            objects: objects,
+            context: %{at_ms: context_at_ms} = context,
+            at_ms: at_ms,
+            epoch: epoch
+          }
+        } = buffer,
         _ctx,
         state
       )
-      when is_list(objects) and is_map(context) and is_number(at_ms) and epoch != nil do
+      when is_list(objects) and is_number(at_ms) and context_at_ms == at_ms and epoch != nil do
     {timers, severed, suspension, state} = cut(state, epoch, at_ms)
     {core, tagged, events} = state.module.track(state.core, objects, context)
 

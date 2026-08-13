@@ -228,7 +228,12 @@ defmodule Cairn.Detect.SparseTrack do
       source: :host,
       epoch: entry.epoch,
       started_at: entry.started_at,
-      last_seen_at: entry.last_seen_at
+      last_seen_at: entry.last_seen_at,
+      # The same instant as `last_seen_at`, and not by accident: this core
+      # reports no track it did not match to a real detection on the frame
+      # (its `track/3` doc), so the last sighting *is* the last detection.
+      # `Cairn.Tracker` splits the two because it also reports predictions.
+      last_detected_at: entry.last_seen_at
     }
   end
 

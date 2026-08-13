@@ -35,7 +35,9 @@ defmodule Cairn.PipelineOwner do
   `config.stall_seconds`:
 
     * detect branch stale while the ring is healthy: the wedge is downstream
-      of the tee, where no reconnect reaches it — rebuild.
+      of the tee, where no reconnect reaches it — rebuild. Not while
+      `Cairn.CameraControl` has detection switched off: the branch is then
+      dropping every frame on purpose (`detect_gate/1`).
     * ring stale on `ingest: rtsp` while the source reports itself connected:
       the same wedge on the recording side — rebuild. A source in backoff or
       lost is a mere outage and gets nothing: the in-element reconnect owns
@@ -53,7 +55,7 @@ defmodule Cairn.PipelineOwner do
 
   require Logger
 
-  alias Cairn.{CameraStatus, Config, FFmpegPort, RingBuffer, StreamEpochs}
+  alias Cairn.{CameraControl, CameraStatus, Config, FFmpegPort, RingBuffer, StreamEpochs}
 
   @backoff_min_ms 1_000
   @backoff_max_ms 30_000
@@ -79,6 +81,9 @@ defmodule Cairn.PipelineOwner do
             source: :unknown,
             # TrackSink's last buffer, monotonic ms, from the relayed stats
             detect_at_ms: nil,
+            # the last tick that found detection switched off at runtime,
+            # monotonic ms — the floor under detect_stale?/1
+            detect_gated_at_ms: nil,
             bridge_stale_ticks: nil,
             rebuilt_at_ms: nil,
             # stands in for the ring's last-fragment time until the first
@@ -360,6 +365,8 @@ defmodule Cairn.PipelineOwner do
   # -- watchdog ---------------------------------------------------------------
 
   defp check_liveness(state) do
+    state = detect_gate(state)
+
     cond do
       detect_stale?(state) and not ring_stale?(state) ->
         rebuild(state, "detect branch stale while the ring is healthy")
@@ -455,11 +462,28 @@ defmodule Cairn.PipelineOwner do
     :exit, _absent_or_slow -> nil
   end
 
+  # Detection switched off at runtime makes `Cairn.Pipeline.ObservationStamper`
+  # drop every frame, so TrackSink's last buffer ages out with nothing wrong —
+  # and the detect signal, which only knows the camera *has* a detect branch,
+  # would rebuild a healthy camera once per stall window for as long as the
+  # operator leaves it off. Holding the baseline at now while the gate is shut
+  # says nothing instead; it also gives the branch a full window to produce a
+  # real buffer once the gate re-opens, which it needs — the stamp it re-opens
+  # with is as old as the disable, and no wedge made it so. ETS, per tick.
+  defp detect_gate(state) do
+    if CameraControl.get(state.camera.id).detection_enabled,
+      do: state,
+      else: %{state | detect_gated_at_ms: now_ms()}
+  end
+
   defp detect_stale?(%{detect_at_ms: nil}), do: false
 
   defp detect_stale?(state) do
-    detecting?(state) and now_ms() - state.detect_at_ms > stall_ms(state)
+    detecting?(state) and now_ms() - detect_since(state) > stall_ms(state)
   end
+
+  defp detect_since(%{detect_gated_at_ms: nil} = state), do: state.detect_at_ms
+  defp detect_since(state), do: max(state.detect_at_ms, state.detect_gated_at_ms)
 
   defp bridge?(state), do: state.camera.ingest == :ffmpeg
 

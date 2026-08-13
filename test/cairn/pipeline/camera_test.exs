@@ -380,15 +380,16 @@ defmodule Cairn.Pipeline.CameraTest do
   end
 
   describe "the owner's messages" do
-    test "a reload's policy is forwarded to both children that hold one" do
+    # The stamper alone: the sink's copy rides the batches it applies to
+    # (`Cairn.Pipeline.TrackSink`), so a second notification here would be the
+    # one that can arrive out of step with the first.
+    test "a reload's policy is forwarded to the head of the detect branch" do
       {_actions, state} = init(detect: detect())
       camera = %Camera{id: "cam", record: %{"person" => %{min_score: 0.9}}}
       policy = Map.put(@policy, :record, camera.record)
 
-      assert {[
-                notify_child: {:stamper, {:policy, ^camera, ^policy}},
-                notify_child: {:track_sink, {:policy, ^camera, ^policy}}
-              ], _state} = Pipeline.handle_info({:policy, camera, policy}, %{}, state)
+      assert {[notify_child: {:stamper, {:policy, ^camera, ^policy}}], _state} =
+               Pipeline.handle_info({:policy, camera, policy}, %{}, state)
     end
 
     test "a policy is dropped for a camera whose detect branch was never built" do

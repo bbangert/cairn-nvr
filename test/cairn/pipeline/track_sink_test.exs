@@ -178,17 +178,29 @@ defmodule Cairn.Pipeline.TrackSinkTest do
              TrackSink.handle_parent_notification(:stats, %{}, state)
   end
 
-  test "carries a refreshed policy without restarting anything", ctx do
-    state = sink(ctx)
+  test "a refreshed policy is taken off the batch it was stamped on", ctx do
     camera = %{ctx.camera | record: %{"person" => %{min_score: 0.9}}}
     policy = Map.put(@policy, :record, camera.record)
+    stale = ctx.camera
 
-    {actions, state} =
-      TrackSink.handle_parent_notification({:policy, camera, policy}, %{}, state)
+    # Before the first batch, the pipeline's own pair stands.
+    state = feed(sink(ctx), ctx, %{})
+    assert_received {:"$gen_cast", {:tracked, ^stale, @policy, _batch}}
 
-    assert actions == []
+    state =
+      feed(state, ctx, %{
+        context: %{
+          observed_at: DateTime.utc_now(),
+          min_score: %{"default" => 0.5},
+          dispatch: %{camera: camera, policy: policy}
+        }
+      })
 
-    _state = feed(state, ctx, %{})
+    assert_received {:"$gen_cast", {:tracked, ^camera, ^policy, _batch}}
+
+    # The element's own buffers answer to no batch and carry no context, so
+    # they go out under the last pair rather than under the option again.
+    _state = feed(state, ctx, %{context: nil, events: [{:ended, track(ctx, "o1")}]})
     assert_received {:"$gen_cast", {:tracked, ^camera, ^policy, _batch}}
   end
 end

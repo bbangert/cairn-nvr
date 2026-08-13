@@ -245,6 +245,25 @@ defmodule Cairn.PipelineOwnerTest do
       assert opts[:initial_reason] == :stall_bounce
     end
 
+    # The same stale stat as the test above, which rebuilds on it: with
+    # detection switched off the branch is dropping every frame on purpose, so
+    # nothing about the age of its last buffer is news.
+    test "a detect branch stale behind a closed detection gate is not a wedge" do
+      cam = camera(uid("pd"), plugin: {:group, "g"})
+      Cairn.CameraControl.set(cam.id, %{detection_enabled: false})
+      owner = start_owner(cam, watchdog_interval_ms: 50)
+
+      assert_receive {:pipeline_started, _first, _opts}, 2_000
+      send(owner, {:stats, %{last_buffer_at_ms: System.monotonic_time(:millisecond) - 5_000}})
+
+      refute_receive {:pipeline_started, _pid, _opts}, 500
+
+      # Re-enabling does not rebuild on the age the disable left behind: the
+      # branch gets a full stall window to produce its first real buffer.
+      Cairn.CameraControl.set(cam.id, %{detection_enabled: true})
+      refute_receive {:pipeline_started, _pid, _opts}, 500
+    end
+
     @tag :capture_log
     test "rebuilds a stalled rtsp camera whose source says it is connected" do
       cam = camera(uid("pn"), ingest: :rtsp)
