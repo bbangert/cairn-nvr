@@ -471,7 +471,9 @@ defmodule Cairn.BoardPipeline do
     * `Host.start_link(config: ...)` — a non-nil `:config` opt means
       `Cairn.Config.Server` is never consulted;
     * `canary: [enabled: false]` — no `cairn-detect` binary is spawned;
-    * a `stream_epoch` in the inference params — `Cairn.StreamEpochs` is
+    * a fixed per-pipe epoch stamped onto every buffer by
+      `Cairn.BoardPipeline.EpochStamp` (the inference element reads it off
+      the frame; params carry none) — `Cairn.StreamEpochs` is
       short-circuited (its ETS-missing paths answer `:unknown` harmlessly);
     * `Cairn.BoardPipeline.DetectionSink` — the branch ends at the inference
       element's pad, so the host-side tracker closure stays out (see that

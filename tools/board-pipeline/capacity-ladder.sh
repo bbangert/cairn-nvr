@@ -238,7 +238,7 @@ remote_elixir() {
 }
 
 # Callers capture stdout, so no step-logging in here; and the parsing is
-# local because the board's busybox has no `cut`. The awk keeps only a
+# local because the board's busybox has no `cut`. The grep keeps only a
 # 64-hex token — the eval also prints its own :ok, which must not leak
 # into a checksum comparison.
 remote_sha256() {
@@ -399,6 +399,9 @@ for rung in "${RUNGS[@]}"; do
           say "WARNING: pull of $run_dir did not verify — cell left on the board, CSV row will be empty"
         fi
         rm -f "$local_cell_dir/cell.tgz"
+        # The remote tarball is re-creatable from the cell dir; a long
+        # ladder must not stack one per cell on the board.
+        ssh "$BOARD" "File.rm(\"$run_dir.tgz\") |> IO.inspect()" >/dev/null 2>&1 || true
         for f in out.log proc.samples meta; do
           if [ -f "$local_cell_dir/$f.sha256" ] && [ -f "$local_cell_dir/$f" ]; then
             # The manifest is relative-name sha256, or the board's prefixed

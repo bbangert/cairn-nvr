@@ -51,12 +51,20 @@ ROOTDIR=/srv/erlang
 for b in /srv/erlang/erts-*/bin; do BINDIR=$b; done
 EMU=beam
 PROGNAME=erl
-export ROOTDIR BINDIR EMU PROGNAME
+export ROOTDIR EMU PROGNAME
 for d in /srv/erlang/lib/elixir-*/ebin; do ELIXIR_EBIN=$d; done
 for d in /srv/erlang/lib/logger-*/ebin; do LOGGER_EBIN=$d; done
 # The pruned release has no default bootfile; its start_clean needs the
 # $RELEASE_LIB the release manager would have expanded.
 for f in /srv/erlang/releases/*/start_clean.boot; do BOOT=${f%.boot}; done
+# Unmatched globs leave these unset and set -u then dies with a terse
+# "unbound variable" — name the missing piece instead, for the next
+# differently-provisioned board.
+: "${BINDIR:?no /srv/erlang/erts-*/bin on this board}"
+: "${ELIXIR_EBIN:?no /srv/erlang/lib/elixir-*/ebin — firmware without elixir?}"
+: "${LOGGER_EBIN:?no /srv/erlang/lib/logger-*/ebin — firmware without elixir logger?}"
+: "${BOOT:?no /srv/erlang/releases/*/start_clean.boot in the release}"
+export BINDIR
 RUN_ROOT=${RUN_ROOT:?RUN_ROOT required}
 HARNESS_PA=${HARNESS_PA:?HARNESS_PA required (space-separated -pa dirs)}
 
