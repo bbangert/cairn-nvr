@@ -221,7 +221,7 @@ defmodule Cairn.MembraneE2ETest do
 
     # `Cairn.FFmpegPort` reads a dead pipeline as a lost decode session: backoff,
     # respawn, and a fresh epoch minted before the new port exists.
-    assert_receive {:stream_epoch, ^id, epoch2, :source_lost}, 60_000
+    assert_receive {:stream_epoch, ^id, :main, epoch2, :source_lost}, 60_000
     refute epoch2 == epoch1
 
     # `Cairn.Tracker`'s rule, read rather than assumed: a detection in the new

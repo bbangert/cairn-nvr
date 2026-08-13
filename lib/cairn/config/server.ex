@@ -150,9 +150,13 @@ defmodule Cairn.Config.Server do
   # goes here only on the deliberate finding that it reaches a subprocess.
   # `ingest` is here because it selects the session's source process itself
   # (the ffmpeg OS process vs the RTSP client) and the pipeline's ingest
-  # chain — nothing a running session can swap in place.
+  # chain — nothing a running session can swap in place. `substream_url` is
+  # the same reach one level up: whether there is a second ingest at all, and
+  # therefore which tee the detect branch is built off, is decided when the
+  # pipeline is constructed.
   @restart_fields [
     :rtsp_url,
+    :substream_url,
     :plugin,
     :ingest,
     :min_score,

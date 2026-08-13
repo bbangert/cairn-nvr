@@ -192,13 +192,18 @@ defmodule Cairn.TrackerDriver do
   # epoch when a test announced one (what the tagger would carry), else a
   # per-camera constant so consecutive detections read as one session.
   defp with_epoch(%Observation{epoch: nil} = observation, camera) do
-    case Cairn.StreamEpochs.current(camera.id) do
+    # The detect stream's, which is the sub when the camera has one: this
+    # stands in for the tagger on the pad the detect branch is built off.
+    case Cairn.StreamEpochs.current({camera.id, detect_role(camera)}) do
       {:ok, epoch} -> %{observation | epoch: epoch}
       :unknown -> %{observation | epoch: "driver-" <> camera.id}
     end
   end
 
   defp with_epoch(observation, _camera), do: observation
+
+  defp detect_role(%Camera{substream_url: url}) when is_binary(url), do: :sub
+  defp detect_role(_camera), do: :main
 
   # What `Cairn.Pipeline.ObservationStamper` resolves per buffer, minus the
   # clock: the policy's bounds defaulted, with the runtime `min_score` override

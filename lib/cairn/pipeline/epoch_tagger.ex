@@ -1,9 +1,12 @@
 defmodule Cairn.Pipeline.EpochTagger do
   @moduledoc """
-  Mints the camera's stream epoch from the stream itself and makes it in-band:
-  the first buffer of each session carries a fresh epoch, announced immediately
+  Mints one stream's epoch from the stream itself and makes it in-band: the
+  first buffer of each session carries a fresh epoch, announced immediately
   ahead of it by a `Cairn.Pipeline.EpochChange` event and stamped into
   `metadata[:stream_epoch]` of every buffer of that session.
+
+  One tagger per source pad, minting under that pad's `role:` — a camera with
+  a substream has two, and their sessions boundary independently.
 
   Minting at production time rather than in the process that owns the pipeline
   is what makes the tag correct by construction (D8): the elements that survive
@@ -18,6 +21,12 @@ defmodule Cairn.Pipeline.EpochTagger do
 
   `:camera_stopped` is not this element's to mint. A deliberate stop belongs to
   whoever owns the pipeline, which is what outlives it.
+
+  Each session's stream format is also reported to the parent as
+  `{:stream_format, role, format}` — this is the only element that sits on
+  every ingest path and knows which of the camera's streams it is on, and a
+  pipeline cannot read its children's pad formats. `Cairn.Pipeline.Camera`
+  compares the two roles' geometry with it.
   """
 
   use Membrane.Filter
@@ -34,6 +43,11 @@ defmodule Cairn.Pipeline.EpochTagger do
 
   def_options(
     camera_id: [spec: String.t()],
+    role: [
+      spec: StreamEpochs.role(),
+      default: :main,
+      description: "Which of the camera's streams this tagger sits behind"
+    ],
     initial_reason: [
       spec: StreamEpochs.reason(),
       default: :started,
@@ -43,7 +57,21 @@ defmodule Cairn.Pipeline.EpochTagger do
 
   @impl true
   def handle_init(_ctx, opts) do
-    {[], %{camera_id: opts.camera_id, epoch: nil, pending_reason: opts.initial_reason}}
+    {[],
+     %{
+       stream: {opts.camera_id, opts.role},
+       role: opts.role,
+       epoch: nil,
+       pending_reason: opts.initial_reason
+     }}
+  end
+
+  # Reported whatever it carries: what counts as usable geometry is the
+  # parent's judgement, and the MPEG-TS demuxer's format has none to offer.
+  @impl true
+  def handle_stream_format(:input, format, ctx, state) do
+    {actions, state} = super(:input, format, ctx, state)
+    {actions ++ [notify_parent: {:stream_format, state.role, format}], state}
   end
 
   @impl true
@@ -54,7 +82,7 @@ defmodule Cairn.Pipeline.EpochTagger do
   def handle_buffer(:input, buffer, _ctx, %{pending_reason: reason} = state) do
     # `new_epoch/2` broadcasts, which is how `Cairn.CameraTracker` learns of the
     # boundary; nothing else here signals it.
-    epoch = StreamEpochs.new_epoch(state.camera_id, reason)
+    epoch = StreamEpochs.new_epoch(state.stream, reason)
 
     # Event before buffer: a consumer that sees the buffer first has already
     # attributed it to the epoch it is leaving.

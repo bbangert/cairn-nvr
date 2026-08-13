@@ -16,11 +16,11 @@ defmodule Cairn.StreamEpochsTest do
     StreamEpochs.subscribe()
 
     epoch = StreamEpochs.new_epoch(id, :started)
-    assert_receive {:stream_epoch, ^id, ^epoch, :started}
+    assert_receive {:stream_epoch, ^id, :main, ^epoch, :started}
     assert StreamEpochs.current(id) == {:ok, epoch}
 
     next = StreamEpochs.new_epoch(id, :source_lost)
-    assert_receive {:stream_epoch, ^id, ^next, :source_lost}
+    assert_receive {:stream_epoch, ^id, :main, ^next, :source_lost}
     assert next != epoch
     assert StreamEpochs.current(id) == {:ok, next}
   end
@@ -30,7 +30,7 @@ defmodule Cairn.StreamEpochsTest do
 
     returned = StreamEpochs.new_epoch(id, :started)
 
-    assert_receive {:stream_epoch, ^id, broadcast, :started}
+    assert_receive {:stream_epoch, ^id, :main, broadcast, :started}
     assert {:ok, stored} = StreamEpochs.current(id)
 
     # single source of truth: the caller mints, so no path can hand the caller
@@ -45,7 +45,7 @@ defmodule Cairn.StreamEpochsTest do
     # what a call that exited with :timeout leaves behind: the request is still
     # queued and gets served afterwards. It carries the epoch the caller
     # already returned, so replaying it must be a no-op on `current/1`.
-    GenServer.call(StreamEpochs, {:new_epoch, id, epoch, :started})
+    GenServer.call(StreamEpochs, {:new_epoch, {id, :main}, epoch, :started})
 
     assert StreamEpochs.current(id) == {:ok, epoch}
   end
@@ -56,17 +56,17 @@ defmodule Cairn.StreamEpochsTest do
     StreamEpochs.subscribe()
 
     current = StreamEpochs.new_epoch(id, :started)
-    assert_receive {:stream_epoch, ^id, ^current, :started}
+    assert_receive {:stream_epoch, ^id, :main, ^current, :started}
 
     # two calls minted close together can be served out of order; the older one
     # would otherwise roll `current/1` back to a stream nothing decodes under,
     # while consumers that already applied the newer one stay on it — every
     # observation dropped as stale until the camera's next mint
     stale = Cairn.ULID.generate(1)
-    GenServer.call(StreamEpochs, {:new_epoch, id, stale, :source_lost})
+    GenServer.call(StreamEpochs, {:new_epoch, {id, :main}, stale, :source_lost})
 
     assert StreamEpochs.current(id) == {:ok, current}
-    refute_receive {:stream_epoch, ^id, ^stale, _reason}, 100
+    refute_receive {:stream_epoch, ^id, :main, ^stale, _reason}, 100
   end
 
   test "epochs are per camera", %{id: id} do
@@ -77,6 +77,56 @@ defmodule Cairn.StreamEpochsTest do
 
     assert StreamEpochs.current(id) == {:ok, epoch}
     assert StreamEpochs.current(other) == {:ok, other_epoch}
+  end
+
+  test "a bare camera id is the :main stream", %{id: id} do
+    epoch = StreamEpochs.new_epoch({id, :main}, :started)
+
+    assert StreamEpochs.current(id) == {:ok, epoch}
+    assert StreamEpochs.new_epoch(id, :source_lost) == elem(StreamEpochs.current({id, :main}), 1)
+  end
+
+  test "the two roles of one camera are independent", %{id: id} do
+    StreamEpochs.subscribe()
+
+    main = StreamEpochs.new_epoch({id, :main}, :started)
+    assert_receive {:stream_epoch, ^id, :main, ^main, :started}
+
+    sub = StreamEpochs.new_epoch({id, :sub}, :started)
+    assert_receive {:stream_epoch, ^id, :sub, ^sub, :started}
+
+    # the sub's own reconnect leaves main exactly where it was: two ingests,
+    # two session lifetimes, and no consumer of one may be moved by the other
+    sub_again = StreamEpochs.new_epoch({id, :sub}, :source_lost)
+    assert_receive {:stream_epoch, ^id, :sub, ^sub_again, :source_lost}
+
+    assert StreamEpochs.current({id, :main}) == {:ok, main}
+    assert StreamEpochs.current({id, :sub}) == {:ok, sub_again}
+  end
+
+  test "an older main epoch does not supersede a newer sub one", %{id: id} do
+    # ULIDs are globally time-ordered, so a shared supersession check would
+    # retire the sub's fresh mint whenever main had reconnected more recently
+    sub = StreamEpochs.new_epoch({id, :sub}, :started)
+    main = StreamEpochs.new_epoch({id, :main}, :started)
+
+    GenServer.call(StreamEpochs, {:new_epoch, {id, :sub}, Cairn.ULID.generate(1), :source_lost})
+
+    assert StreamEpochs.current({id, :sub}) == {:ok, sub}
+    assert StreamEpochs.current({id, :main}) == {:ok, main}
+  end
+
+  test "role_of names the stream an epoch is current on", %{id: id} do
+    main = StreamEpochs.new_epoch({id, :main}, :started)
+    sub = StreamEpochs.new_epoch({id, :sub}, :started)
+
+    assert StreamEpochs.role_of(id, main) == {:ok, :main}
+    assert StreamEpochs.role_of(id, sub) == {:ok, :sub}
+    assert StreamEpochs.role_of(id, Cairn.ULID.generate()) == :unknown
+
+    # superseded is the same answer as never-seen: it names no running stream
+    StreamEpochs.new_epoch({id, :sub}, :source_lost)
+    assert StreamEpochs.role_of(id, sub) == :unknown
   end
 
   test "the table dies with the owner and the next spawn re-mints", %{id: id} do

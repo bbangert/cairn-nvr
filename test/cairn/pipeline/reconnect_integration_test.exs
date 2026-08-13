@@ -12,10 +12,11 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
   `Cairn.Registry`, so a session's media and the `StreamClosed` that ends it
   are two messages this process sends — no OS process, no wall-clock waits, no
   camera. The rtsp ingest reaches the same in-band event from
-  `Membrane.RTSPDualStream.Source`'s own reconnect ladder, which
-  `Membrane.RTSPDualStream.SourceTest` drives against a mock client; the
-  pipeline builds that element with its real client module and exposes no seam
-  to replace it, so nothing here can reach it without a camera on the network.
+  `Membrane.RTSPDualStream.Source`'s own reconnect ladder, driven against
+  `Membrane.RTSPDualStream.MockRTSP` — by that element's own tests, and
+  through the pipeline's `rtsp_module:` seam by
+  `Cairn.Pipeline.DualStreamTest`, which is where the two-role wiring is
+  asserted.
   """
 
   use Cairn.DataCase, async: false
@@ -83,11 +84,11 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
       before = Map.new(long_lived, &{&1, child_pid(pipeline, &1)})
 
       session(source, short_media())
-      assert_receive {:stream_epoch, ^id, first, :started}, 10_000
+      assert_receive {:stream_epoch, ^id, :main, first, :started}, 10_000
 
       send(source, {:bridge_session_closed, :closed})
       session(source, short_media())
-      assert_receive {:stream_epoch, ^id, second, :source_lost}, 10_000
+      assert_receive {:stream_epoch, ^id, :main, second, :source_lost}, 10_000
       assert first != second
 
       assert :sys.get_state(owner).pipeline == pipeline
@@ -110,7 +111,7 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
       Phoenix.PubSub.subscribe(Cairn.PubSub, RingBuffer.topic(id))
 
       session(source, media())
-      assert_receive {:stream_epoch, ^id, first, :started}, 10_000
+      assert_receive {:stream_epoch, ^id, :main, first, :started}, 10_000
       assert {[], %{epoch: ^first}} = ring_until_init()
 
       # The clip's two whole segments, which is everything the ring can hold
@@ -127,7 +128,7 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
       send(source, {:bridge_session_closed, :closed})
       session(source, media())
 
-      assert_receive {:stream_epoch, ^id, second, :source_lost}, 10_000
+      assert_receive {:stream_epoch, ^id, :main, second, :source_lost}, 10_000
       assert {recorded, %{epoch: ^second}} = ring_until_init()
 
       # In ring order: what the EOS flushed out of the muxer reached the ring
@@ -156,7 +157,7 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
       Event.subscribe()
 
       session(source, short_media())
-      assert_receive {:stream_epoch, ^id, first, :started}, 10_000
+      assert_receive {:stream_epoch, ^id, :main, first, :started}, 10_000
       await_tracker_epoch(tracker, first)
 
       sink = detect(sink(camera, tracker), first, @box, 90_000)
@@ -164,7 +165,7 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
 
       send(source, {:bridge_session_closed, :closed})
       session(source, short_media())
-      assert_receive {:stream_epoch, ^id, second, :source_lost}, 10_000
+      assert_receive {:stream_epoch, ^id, :main, second, :source_lost}, 10_000
       await_tracker_epoch(tracker, second)
 
       # The announcement alone cuts nothing: the tracker element crosses the
@@ -202,7 +203,7 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
       Event.subscribe()
 
       session(source, short_media())
-      assert_receive {:stream_epoch, ^id, first, :started}, 10_000
+      assert_receive {:stream_epoch, ^id, :main, first, :started}, 10_000
       await_tracker_epoch(tracker, first)
 
       sink = detect(sink(camera, tracker), first, @box, 90_000)
@@ -210,7 +211,7 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
 
       send(source, {:bridge_session_closed, :closed})
       session(source, short_media())
-      assert_receive {:stream_epoch, ^id, second, :source_lost}, 10_000
+      assert_receive {:stream_epoch, ^id, :main, second, :source_lost}, 10_000
       await_tracker_epoch(tracker, second)
 
       # The drain D8 exists for: a Detections buffer produced under the old
@@ -256,7 +257,7 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
 
       element = await_child(pipeline, :tracker)
       session(source, short_media())
-      assert_receive {:stream_epoch, ^id, epoch, :started}, 10_000
+      assert_receive {:stream_epoch, ^id, :main, epoch, :started}, 10_000
 
       # A live track behind an open event — the state a rebuild is expensive
       # for, split across the two processes that hold it.
@@ -314,13 +315,13 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
       %{source: source} = start_camera(id)
 
       session(source, short_media())
-      assert_receive {:stream_epoch, ^id, _first, :started}, 10_000
+      assert_receive {:stream_epoch, ^id, :main, _first, :started}, 10_000
 
       send(source, {:bridge_session_closed, :closed})
       session(source, short_media())
-      assert_receive {:stream_epoch, ^id, _second, :source_lost}, 10_000
+      assert_receive {:stream_epoch, ^id, :main, _second, :source_lost}, 10_000
 
-      refute_received {:stream_epoch, ^id, _epoch, :camera_stopped}
+      refute_received {:stream_epoch, ^id, :main, _epoch, :camera_stopped}
     end
 
     @tag :capture_log
@@ -329,7 +330,7 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
       %{owner: owner, pipeline: pipeline, source: source} = start_camera(id)
 
       session(source, short_media())
-      assert_receive {:stream_epoch, ^id, first, :started}, 10_000
+      assert_receive {:stream_epoch, ^id, :main, first, :started}, 10_000
 
       Process.exit(pipeline, :kill)
       rebuilt = await_pipeline(owner, pipeline)
@@ -338,10 +339,10 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
       # The rebuilt pipeline's own source: the epoch is minted in band, so it
       # takes media to announce one.
       session(await_source(id, source), short_media())
-      assert_receive {:stream_epoch, ^id, second, :source_lost}, 10_000
+      assert_receive {:stream_epoch, ^id, :main, second, :source_lost}, 10_000
       assert second != first
 
-      refute_received {:stream_epoch, ^id, _epoch, :camera_stopped}
+      refute_received {:stream_epoch, ^id, :main, _epoch, :camera_stopped}
     end
 
     @tag :capture_log
@@ -350,12 +351,12 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
       %{source: source} = start_camera(id)
 
       session(source, short_media())
-      assert_receive {:stream_epoch, ^id, _first, :started}, 10_000
+      assert_receive {:stream_epoch, ^id, :main, _first, :started}, 10_000
 
       stop_supervised!({:owner, id})
 
-      assert_receive {:stream_epoch, ^id, _epoch, :camera_stopped}, 10_000
-      refute_receive {:stream_epoch, ^id, _epoch, :camera_stopped}, 300
+      assert_receive {:stream_epoch, ^id, :main, _epoch, :camera_stopped}, 10_000
+      refute_receive {:stream_epoch, ^id, :main, _epoch, :camera_stopped}, 300
     end
   end
 

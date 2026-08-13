@@ -4,7 +4,7 @@ defmodule CairnWeb.Api.CameraController do
 
   Merges configured cameras (`Cairn.Config.Server`) with live runtime status
   (`Cairn.CameraStatus`). The `id` is stable and used as the HA device
-  identifier. Credentials (`rtsp_url`) are never emitted.
+  identifier. Credentials (`rtsp_url`, `substream_url`) are never emitted.
   """
 
   use CairnWeb, :controller

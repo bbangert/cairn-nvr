@@ -11,6 +11,17 @@ defmodule Cairn.Pipeline.Camera do
                           └─ Picker ─(manual)─ Decoder ─(manual)─ Inference
                              ─ ObservationStamper ─ MOTTracker ─ TrackSink
 
+  A camera with a `substream_url` moves that last branch off the tee and onto
+  the sub stream, so recording keeps its resolution and detection gets a frame
+  it can afford:
+
+      RTSPDualStream.Source ─(:main)─ EpochTagger(:main) ─ tee ─┬─ record_cut …
+                            └(:sub)── EpochTagger(:sub) ─ Picker ─ …
+
+  On the bridge ingest the two halves have no element in common: the ffmpeg
+  bridge owns main, and the sub gets an `RTSPDualStream.Source` of its own
+  (`:sub_source`) running sub-only.
+
   Started once by `Cairn.PipelineOwner` and rebuilt only by it — on a crash or
   a watchdog escalation, never on a reconnect. Connection lifecycle lives in
   the sources (the RTSP client sessions inside the element, the ffmpeg Port
@@ -33,7 +44,8 @@ defmodule Cairn.Pipeline.Camera do
   children a flush grace later, once the EOS that cut it has carried the
   muxer's held tail into the ring.
 
-  No tee consumer takes its input on a `:manual` pad. That is the invariant the
+  Nothing a tagger feeds — the tee and its branches, or the sub tagger's own
+  detect branch — takes its input on a `:manual` pad. That is the invariant the
   detect branch depends on: a manual input behind our push source arms
   membrane_core's toilet and is killed under exactly the overload it exists to
   survive, so the manual pads are internal to the branch — access units between
@@ -80,6 +92,16 @@ defmodule Cairn.Pipeline.Camera do
 
   @cuts [:record_cut, :rtp_cut]
 
+  # Every child that owns an ingest connection and notifies about it. Two only
+  # when a bridge main is paired with an rtsp sub; on the rtsp ingest one
+  # element runs both roles (D4).
+  @sources [:source, :sub_source]
+
+  # Rounding slack on the aspect comparison: 1280x720 against 640x360 is exact,
+  # but a camera that crops or pads its substream by a macroblock is not a
+  # misconfiguration.
+  @aspect_epsilon 1.0e-2
+
   @impl true
   def handle_init(_ctx, opts) do
     camera = Keyword.fetch!(opts, :camera)
@@ -87,19 +109,24 @@ defmodule Cairn.Pipeline.Camera do
     owner = Keyword.fetch!(opts, :owner)
     detect = Keyword.get(opts, :detect)
     ingest = Keyword.get(opts, :ingest, :ffmpeg)
+    reason = Keyword.get(opts, :initial_reason, :started)
+    # The one injection seam on this path: `RTSP` dials a real camera, so a
+    # test that drives the rtsp ingest has to be one.
+    rtsp = Keyword.get(opts, :rtsp_module, RTSP)
 
     spec =
       [
-        ingest_spec(ingest, camera)
+        ingest_spec(ingest, camera, rtsp)
         |> child(:tagger, %EpochTagger{
           camera_id: camera_id,
-          initial_reason: Keyword.get(opts, :initial_reason, :started)
+          role: :main,
+          initial_reason: reason
         })
         |> child(:tee, Membrane.Tee.Parallel)
       ] ++
         Enum.map(@cuts, &(get_child(:tee) |> child(&1, %SessionCut{}))) ++
         Enum.flat_map(@cuts, &branch_spec(&1, camera_id, 0)) ++
-        detect_spec(camera, detect)
+        detect_spec(camera, detect, detect_head(camera, ingest, reason, rtsp))
 
     state = %{
       camera_id: camera_id,
@@ -107,6 +134,10 @@ defmodule Cairn.Pipeline.Camera do
       detecting?: detect != nil,
       sessions: Map.new(@cuts, &{&1, 0}),
       tracks: %{},
+      # per-role frame geometry as each tagger reports it, and the last pair
+      # already judged — see `compare_aspect/1`
+      formats: %{},
+      aspect_pair: nil,
       # EOS is still propagating parser -> muxer -> ring sink when the gate
       # says the session ended, so the branch outlives its own cut by this
       # much or the muxer's held tail is dropped instead of recorded.
@@ -136,20 +167,32 @@ defmodule Cairn.Pipeline.Camera do
   end
 
   # Ingest liveness the owner's watchdog and status need; it is the owner, not
-  # this pipeline, that decides what a changed camera is worth.
-  def handle_child_notification({:stream_connected, role, tracks}, :source, _ctx, state) do
+  # this pipeline, that decides what a changed camera is worth. Every one of
+  # these carries its role, so which of the (at most two) source children sent
+  # it is not information the owner needs.
+  def handle_child_notification({:stream_connected, role, tracks}, src, _ctx, state)
+      when src in @sources do
     send(state.owner, {:stream_connected, role, tracks})
     {[], compare_tracks(state, role, tracks)}
   end
 
-  def handle_child_notification({:stream_lost, _role} = notification, :source, _ctx, state) do
+  def handle_child_notification({:stream_lost, _role} = notification, src, _ctx, state)
+      when src in @sources do
     send(state.owner, notification)
     {[], state}
   end
 
-  def handle_child_notification({:stream_backoff, _role, _why} = note, :source, _ctx, state) do
+  def handle_child_notification({:stream_backoff, _role, _why} = note, src, _ctx, state)
+      when src in @sources do
     send(state.owner, note)
     {[], state}
+  end
+
+  # Sender-guarded like the source notifications above: only the taggers speak
+  # this shape, and geometry from anything else must not feed the aspect check.
+  def handle_child_notification({:stream_format, role, format}, tagger, _ctx, state)
+      when tagger in [:tagger, :sub_tagger] do
+    {[], check_aspect(state, role, format)}
   end
 
   def handle_child_notification({:stats, stats}, :track_sink, _ctx, state) do
@@ -192,15 +235,63 @@ defmodule Cairn.Pipeline.Camera do
   # AUs with RTP pts natively — the exception D-M8 always recorded — and
   # synthesises the H.264 stream format from each session's own SPS, which is
   # why no parser stands between it and the tagger (P1-D13).
-  defp ingest_spec(:ffmpeg, camera) do
+  defp ingest_spec(:ffmpeg, camera, _rtsp) do
     child(:source, %BridgeSource{camera_id: camera.id})
     |> child(:demuxer, %Membrane.MPEG.TS.Demuxer{})
     |> via_out(Pad.ref(:output, 1), options: [stream_category: :video])
   end
 
-  defp ingest_spec(:rtsp, camera) do
-    child(:source, %Membrane.RTSPDualStream.Source{stream_uri: camera.rtsp_url})
+  defp ingest_spec(:rtsp, camera, rtsp) do
+    child(:source, %Membrane.RTSPDualStream.Source{
+      stream_uri: camera.rtsp_url,
+      substream_uri: camera.substream_url,
+      rtsp_module: rtsp
+    })
     |> via_out(Pad.ref(:output, :main))
+  end
+
+  # Where the detect branch starts, resolved through the one derivation
+  # (`Cairn.Config.Camera.detect_role/1`) the owner's watchdog and the camera
+  # tracker's epoch filter also use. On `:main` it taps the main tee, exactly
+  # as every camera has: nothing about this path changes for a camera that has
+  # one stream.
+  defp detect_head(camera, ingest, reason, rtsp) do
+    case Cairn.Config.Camera.detect_role(camera) do
+      :main -> get_child(:tee)
+      :sub -> sub_head(camera, ingest, reason, rtsp)
+    end
+  end
+
+  # The detect branch hangs off the sub pad and the main tee keeps the
+  # recording and RTP branches alone. No parser stands between the pad and the
+  # tagger, for the same reason none stands before main's (P1-D13): the source
+  # synthesises `%Membrane.H264{}` per pad from that session's own SPS, so the
+  # sub's codec, frame rate and resolution are independent of main by
+  # construction rather than by an assumption a shared parser would make.
+  #
+  # Both taggers are given the same `initial_reason`, because a rebuild is
+  # pipeline-wide (D3): both streams are torn down and reconnected, so
+  # `:stall_bounce` is as true of the sub's first epoch as of main's.
+  defp sub_head(camera, ingest, reason, rtsp) do
+    sub_source(camera, ingest, rtsp)
+    |> via_out(Pad.ref(:output, :sub))
+    |> child(:sub_tagger, %EpochTagger{
+      camera_id: camera.id,
+      role: :sub,
+      initial_reason: reason
+    })
+  end
+
+  # One element, two pads, on the rtsp ingest (D4) — its second session is
+  # already running. A bridge main owns no RTSP session for the sub to share,
+  # so it gets an element of its own, running sub-only.
+  defp sub_source(_camera, :rtsp, _rtsp), do: get_child(:source)
+
+  defp sub_source(camera, :ffmpeg, rtsp) do
+    child(:sub_source, %Membrane.RTSPDualStream.Source{
+      substream_uri: camera.substream_url,
+      rtsp_module: rtsp
+    })
   end
 
   defp branch_spec(:record_cut, camera_id, n) do
@@ -268,16 +359,68 @@ defmodule Cairn.Pipeline.Camera do
   defp encoding(%{encoding: encoding}), do: String.upcase(encoding)
   defp encoding(_absent), do: nil
 
-  # No plugin configured is no detection, exactly as on the classic path.
-  defp detect_spec(_camera, nil), do: []
+  # Detections are normalized 0..1 against the frame that produced them and are
+  # drawn on artifacts cut from the main ring, so nothing anywhere rescales one
+  # — which holds only while the two streams frame the same scene the same way.
+  # A mismatch is a camera setting the operator has to fix; the pipeline says
+  # so and carries on, because a substream that is merely framed oddly still
+  # detects.
+  defp check_aspect(state, role, format) do
+    case dimensions(format) do
+      nil -> state
+      dims -> compare_aspect(%{state | formats: Map.put(state.formats, role, dims)})
+    end
+  end
 
-  defp detect_spec(camera, detect) do
+  # The MPEG-TS demuxer's `%Membrane.H264{}` carries no geometry (it never
+  # parses an SPS), so a bridge main simply has no aspect to compare and the
+  # camera goes unjudged rather than wrongly warned about.
+  defp dimensions(%{width: w, height: h})
+       when is_integer(w) and is_integer(h) and w > 0 and h > 0,
+       do: {w, h}
+
+  defp dimensions(_format), do: nil
+
+  # Once per pair and not per session: a session boundary re-emits the format,
+  # and a camera reconnecting every few seconds would otherwise log the same
+  # misconfiguration forever. The pair is stored whether or not it matched, so
+  # a camera that is fixed and then broken again is warned about again.
+  defp compare_aspect(%{formats: %{main: main, sub: sub}} = state) do
+    pair = {main, sub}
+
+    if pair != state.aspect_pair and mismatched?(main, sub), do: warn_aspect(state, main, sub)
+
+    %{state | aspect_pair: pair}
+  end
+
+  defp compare_aspect(state), do: state
+
+  defp mismatched?({mw, mh}, {sw, sh}), do: abs(mw / mh - sw / sh) > @aspect_epsilon
+
+  defp warn_aspect(state, {mw, mh} = main, {sw, sh} = sub) do
+    Membrane.Logger.warning(
+      "#{state.camera_id}: substream #{sw}x#{sh} and main stream #{mw}x#{mh} have different " <>
+        "aspect ratios — every detection will be drawn in the wrong place on this camera's " <>
+        "artifacts, which are cut from main"
+    )
+
+    :telemetry.execute(
+      [:cairn, :pipeline, :aspect_mismatch],
+      %{main_aspect: mw / mh, sub_aspect: sw / sh},
+      %{camera_id: state.camera_id, main: main, sub: sub}
+    )
+  end
+
+  # No plugin configured is no detection, exactly as on the classic path.
+  defp detect_spec(_camera, nil, _head), do: []
+
+  defp detect_spec(camera, detect, head) do
     stream_params = Keyword.get(detect, :stream_params, %{})
     gate = motion_gate(camera.id, detect, stream_params)
     policy = Keyword.fetch!(detect, :policy)
 
     [
-      get_child(:tee)
+      head
       |> child(:picker, Picker)
       # One AU between the two, so the picker learns that the decoder is free
       # the moment it is, and no more than one is ever in flight.

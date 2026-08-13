@@ -177,6 +177,9 @@ defmodule Cairn.Config.ServerTest do
     test "edits that reach a subprocess (or the ring) restart the camera" do
       for edit <- [
             %{"rtsp_url" => "rtsp://h/CHANGED"},
+            # Adding, dropping or repointing the sub stream builds a different
+            # pipeline — a second ingest, and a detect branch off another tee.
+            %{"substream_url" => "rtsp://h/1_sub"},
             %{"min_score" => 0.7},
             %{"transcode" => true},
             %{"extra_ffmpeg_args" => ["-rtsp_transport", "tcp"]},

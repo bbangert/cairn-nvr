@@ -466,7 +466,7 @@ defmodule Cairn.Native.HostTest do
       host = start_host()
 
       assert {:ok, ^minted} = Host.open_stream(host, id, %{stream_epoch: minted})
-      assert_receive {:stream_epoch, ^id, ^minted, :started}
+      assert_receive {:stream_epoch, ^id, :main, ^minted, :started}
       # adopted, never replaced: a fresh ULID here would retire the epoch the
       # ring buffer's init segments already carry
       assert StreamEpochs.current(id) == {:ok, minted}
@@ -477,10 +477,10 @@ defmodule Cairn.Native.HostTest do
       host = start_host()
 
       assert {:ok, epoch} = Host.open_stream(host, id, %{})
-      assert_receive {:stream_epoch, ^id, ^epoch, :started}
+      assert_receive {:stream_epoch, ^id, :main, ^epoch, :started}
       assert StreamEpochs.current(id) == {:ok, epoch}
       # the mint broadcast once; the host does not echo its own
-      refute_receive {:stream_epoch, ^id, ^epoch, :started}, 50
+      refute_receive {:stream_epoch, ^id, :main, ^epoch, :started}, 50
     end
 
     test "closing a stream announces nothing — the camera did not stop", %{id: id} do
@@ -489,7 +489,7 @@ defmodule Cairn.Native.HostTest do
       StreamEpochs.subscribe()
 
       assert Host.close_stream(host, id) == :ok
-      refute_receive {:stream_epoch, ^id, _epoch, _reason}, 50
+      refute_receive {:stream_epoch, ^id, :main, _epoch, _reason}, 50
     end
 
     test "an engine reload reopens every stream under its own epoch", %{id: id} do
@@ -507,7 +507,7 @@ defmodule Cairn.Native.HostTest do
       assert_receive {:canary, %{model: "other.onnx"}, _opts}
       assert_receive {:init, %{model: "other.onnx"}}
       assert_receive {:open_stream, {:engine, "other.onnx"}, ^id, %{stream_epoch: ^minted}}
-      assert_receive {:stream_epoch, ^id, ^minted, :started}
+      assert_receive {:stream_epoch, ^id, :main, ^minted, :started}
       assert StreamEpochs.current(id) == {:ok, minted}
     end
   end

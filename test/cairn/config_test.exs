@@ -20,7 +20,13 @@ defmodule Cairn.ConfigTest do
     test "loads the valid fixture" do
       assert {:ok, %Config{} = config, warnings} = Config.load(@valid_fixture)
       assert config.stall_seconds == 15
-      assert [%Config.Camera{id: "cam_a"} = cam_a, %Config.Camera{id: "cam_b"}] = config.cameras
+
+      assert [
+               %Config.Camera{id: "cam_a"} = cam_a,
+               %Config.Camera{id: "cam_b"},
+               %Config.Camera{id: "cam_dual", substream_url: "rtsp://127.0.0.1:8554/d_sub"}
+             ] = config.cameras
+
       assert cam_a.min_score == %{"default" => 0.5, "person" => 0.6}
       assert Enum.empty?(warnings)
     end
@@ -885,6 +891,36 @@ defmodule Cairn.ConfigTest do
 
       assert {:ok, config, []} = Config.from_map(map)
       assert [%{ingest: :rtsp}, %{ingest: :ffmpeg}] = config.cameras
+    end
+
+    test "substream_url is optional, rtsp:// only, and rides any ingest" do
+      assert {:ok, config, []} = Config.from_map(base_map())
+      assert [%{substream_url: nil}, %{substream_url: nil}] = config.cameras
+
+      # The sub stream is read by the RTSP source element whatever the main
+      # stream's ingest is — with the bridge, that element runs sub-only.
+      with_sub = fn attrs ->
+        update_in(base_map(), ["cameras"], fn [a, b] -> [Map.merge(a, attrs), b] end)
+      end
+
+      assert {:ok, config, []} =
+               Config.from_map(with_sub.(%{"substream_url" => "rtsp://h/1_sub"}))
+
+      assert [%{substream_url: "rtsp://h/1_sub", ingest: :ffmpeg}, _b] = config.cameras
+
+      assert {:ok, config, []} =
+               Config.from_map(
+                 with_sub.(%{"substream_url" => "rtsp://h/1_sub", "ingest" => "rtsp"})
+               )
+
+      assert [%{substream_url: "rtsp://h/1_sub", ingest: :rtsp}, _b] = config.cameras
+
+      for bad <- ["http://h/1_sub", "", 5] do
+        assert {:error, errors} = Config.from_map(with_sub.(%{"substream_url" => bad}))
+
+        assert Enum.any?(errors, &(&1 =~ "camera cam_a: substream_url must be an rtsp:// url")),
+               inspect(errors)
+      end
     end
 
     test "rtsp ingest is refused at load where its preconditions fail" do

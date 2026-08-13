@@ -147,6 +147,19 @@ retention:
 cameras: []
 #  - id: front_door
 #    rtsp_url: rtsp://user:pass@192.168.1.10:554/stream1
+#    # The camera's second, low-resolution stream: detection runs on it while
+#    # recording, snapshots and event clips keep cutting from the main stream
+#    # above — the detector gets frames it does not have to downscale, and the
+#    # main stream is decoded for the ring alone. Optional; absent ⇒ detection
+#    # taps the main stream, exactly as before.
+#    #
+#    # Always rtsp://, whatever `ingest` the main stream uses: cairn reads the
+#    # sub natively even where main rides the ffmpeg bridge. The two streams
+#    # MUST share an aspect ratio (1920x1080 main with a 640x360 sub is fine,
+#    # 640x480 is not): boxes are normalized against the frame that produced
+#    # them and are drawn on artifacts cut from the main stream, so a
+#    # differently framed sub puts every box in the wrong place.
+#    substream_url: rtsp://user:pass@192.168.1.10:554/stream2
 #    # Detection: names a group under `plugins:` above (undefined ⇒ config
 #    # error), whose profile picks the model this node's engine runs for the
 #    # camera. Absent ⇒ no detection. The pre-phase-6 inline-command form is

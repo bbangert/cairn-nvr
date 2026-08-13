@@ -111,7 +111,7 @@ One `Cairn.EventExtractor` per active event; the only component writing permanen
 
 `config.yml` is the source of truth. A **hardware profile** (one YAML per board class) names the model, input geometry, backend, fps band and tracker stage list; a `plugins:` group is a profile reference, and every camera naming that group detects on it. Config load expands the profile into the engine's model config and the host's tracking policy from one file, so the two halves cannot disagree.
 
-On reload, the new config reaches the engine first (`Cairn.Native.Host.reconfigure/1` — a model change is handled there, not by restarting cameras), then the camera diff: edits that reach a subprocess, the ring, or a detect-branch element built from them (`rtsp_url`, `plugin`, `min_score`, `ingest`, `transcode`, `extra_ffmpeg_args`, the pre-window, and the resolved tracker core, sample rate and live-track cap) restart that camera's tree; everything else refreshes in place through the running session.
+On reload, the new config reaches the engine first (`Cairn.Native.Host.reconfigure/1` — a model change is handled there, not by restarting cameras), then the camera diff: edits that reach a subprocess, the ring, or a detect-branch element built from them (`rtsp_url`, `substream_url`, `plugin`, `min_score`, `ingest`, `transcode`, `extra_ffmpeg_args`, the pre-window, and the resolved tracker core, sample rate and live-track cap) restart that camera's tree; everything else refreshes in place through the running session.
 
 ## Process supervision tree
 

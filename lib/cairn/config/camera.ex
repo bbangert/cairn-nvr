@@ -22,6 +22,14 @@ defmodule Cairn.Config.Camera do
   bounds, `Cairn.Config.tracker/2` the core). `tracker` names one of the cores
   `Membrane.MOTTracker` can host; an unknown name is a load-time error.
 
+  `substream_url` is the camera's second, low-resolution stream: detection
+  runs on it while recording keeps cutting from the main stream. It is
+  always RTSP-native whatever `ingest` says — with `ingest: ffmpeg` the
+  bridge owns main and the source element runs sub-only. Both streams must
+  share an **aspect ratio**: detections are normalized against the frame
+  that produced them and are drawn on artifacts cut from the main ring, so a
+  sub framed differently puts every box in the wrong place.
+
   `plugin` selects the camera's detection (absent = none) and resolves to
   `nil | {:group, name}`: a reference to a named entry in the top-level
   `plugins:` map, whose `profile:` is what picks the model the in-VM engine
@@ -35,14 +43,15 @@ defmodule Cairn.Config.Camera do
 
   alias Cairn.Config
 
-  @known_keys ~w(id rtsp_url plugin pipeline ingest min_score track record extra_ffmpeg_args
-                 transcode retention pre_window_seconds post_window_seconds max_event_seconds
-                 max_unseen_ms max_live_tracks stationary_after_ms tracker)
+  @known_keys ~w(id rtsp_url substream_url plugin pipeline ingest min_score track record
+                 extra_ffmpeg_args transcode retention pre_window_seconds post_window_seconds
+                 max_event_seconds max_unseen_ms max_live_tracks stationary_after_ms tracker)
 
   @default_min_score %{"default" => 0.5}
 
   defstruct id: nil,
             rtsp_url: nil,
+            substream_url: nil,
             plugin: nil,
             min_score: @default_min_score,
             track: nil,
@@ -68,6 +77,17 @@ defmodule Cairn.Config.Camera do
   without changing the config shape; `:min_score` is the only key today.
   """
   @type tier :: %{optional(String.t()) => %{min_score: float()}}
+
+  @doc """
+  Which of the camera's streams the detect branch is behind.
+
+  The one derivation of "substream configured means detection moves to the
+  sub" — the pipeline wiring, the owner's watchdog, and the camera tracker's
+  epoch filter all resolve through here, so they cannot drift apart.
+  """
+  @spec detect_role(t()) :: :main | :sub
+  def detect_role(%__MODULE__{substream_url: url}) when is_binary(url), do: :sub
+  def detect_role(%__MODULE__{}), do: :main
 
   @doc false
   @spec parse(term(), non_neg_integer(), map()) :: {t() | nil, map()}
@@ -104,10 +124,12 @@ defmodule Cairn.Config.Camera do
       parse_ingest(Map.get(raw, "ingest"), id, acc, rtsp_url, transcode)
 
     {extra_args, acc} = parse_extra_args(Map.get(raw, "extra_ffmpeg_args"), id, acc)
+    {substream_url, acc} = parse_substream(Map.get(raw, "substream_url"), id, acc)
 
     cam = %__MODULE__{
       id: id,
       rtsp_url: rtsp_url,
+      substream_url: substream_url,
       plugin: plugin,
       min_score: min_score,
       track: track,
@@ -271,6 +293,23 @@ defmodule Cairn.Config.Camera do
 
   defp parse_ingest(_other, id, acc, _url, _transcode) do
     {:ffmpeg, add_error(acc, "camera #{id}: ingest must be \"rtsp\" or \"ffmpeg\"")}
+  end
+
+  # No scheme escape hatch here, unlike `rtsp_url`: the sub stream is read by
+  # the RTSP source element whatever `ingest` the main stream uses, and that
+  # element's library rejects every other scheme outright.
+  defp parse_substream(nil, _id, acc), do: {nil, acc}
+
+  defp parse_substream(url, id, acc) when is_binary(url) do
+    if String.starts_with?(url, "rtsp://"),
+      do: {url, acc},
+      else: {nil, substream_error(acc, id)}
+  end
+
+  defp parse_substream(_other, id, acc), do: {nil, substream_error(acc, id)}
+
+  defp substream_error(acc, id) do
+    add_error(acc, "camera #{id}: substream_url must be an rtsp:// url")
   end
 
   defp parse_plugin(nil, _id, acc), do: {nil, acc}

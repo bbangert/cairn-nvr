@@ -364,8 +364,8 @@ defmodule Cairn.Pipeline.ConformanceTest do
       # exits non-zero — a lost decode session, same as a dead camera
       start_port(camera(id), "#{@fake} #{@ts} 2 42")
 
-      assert_receive {:stream_epoch, ^id, first, :started}, 10_000
-      assert_receive {:stream_epoch, ^id, second, :source_lost}, 15_000
+      assert_receive {:stream_epoch, ^id, :main, first, :started}, 10_000
+      assert_receive {:stream_epoch, ^id, :main, second, :source_lost}, 15_000
       assert first != second
 
       # the respawned session's init segment carries the new epoch

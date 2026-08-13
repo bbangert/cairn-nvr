@@ -15,7 +15,9 @@ defmodule Cairn.RingBuffer do
   A new init segment (any session boundary — an ffmpeg respawn, an RTSP
   reconnect, a pipeline rebuild) clears the ring: pts restart at ~0, so
   pre-window content from the old session is no longer addressable. Each
-  init segment is tagged with the stream epoch it opened (`Cairn.StreamEpochs`).
+  init segment is tagged with the epoch of the session it opened — always the
+  camera's `:main` stream, the only one that feeds the recording branch
+  (`Cairn.StreamEpochs`).
   Fragment `seq` is re-stamped with a per-camera counter that is monotonic
   across sessions (HLS media sequence relies on this).
   """
