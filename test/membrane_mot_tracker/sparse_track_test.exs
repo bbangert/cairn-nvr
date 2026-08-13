@@ -58,6 +58,14 @@ defmodule Membrane.MOTTracker.SparseTrackTest do
       assert ids(tagged) == [3]
     end
 
+    test "a level count that is not a positive integer is refused at construction" do
+      for key <- [:depth_levels, :depth_levels_low], levels <- [0, -1, 1.5] do
+        assert_raise ArgumentError, ~r/#{key} must be a positive integer/, fn ->
+          SparseTrack.new([{key, levels}])
+        end
+      end
+    end
+
     test "a sublevel's leftovers are offered to the next one" do
       # Two tracks and two detections spread over two sublevels, with the
       # detections swapped between the levels: the near detection belongs to

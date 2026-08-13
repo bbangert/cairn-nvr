@@ -23,6 +23,21 @@ defmodule Cairn.Detect.SparseTrack do
   keeps every camera — whatever its sensor resolution — behaving like the
   reference the tree is parity-gated against.
 
+  ## Identities
+
+  The tree counts its identities from 1 per instance, which is a number and not
+  a name: a track row's primary key is a string, so an integer reaches
+  `Cairn.Tracks.insert_batch/1` as a dump error that costs the recorder its
+  whole buffer — and two cameras, or one camera either side of a pipeline
+  rebuild, would both claim `1` anyway.
+
+  So a `Cairn.ULID` is minted per inner id the first time the tree publishes
+  it, exactly as `Cairn.Tracker` mints one for a track it starts, and nothing
+  above this module ever sees the counter. The mapping lives in the same per-id
+  books as the rest of what the summaries don't carry, and ends where the
+  identity does — an adopted one keeps its ULID, which is the whole point of
+  the adoption.
+
   ## The evidence floor
 
   The batch's context carries the camera's **effective** `min_score`
@@ -52,8 +67,9 @@ defmodule Cairn.Detect.SparseTrack do
   @default_width 1920
   @default_height 1080
 
-  # Bookkeeping the tree's summaries don't carry, held per object id.
+  # Bookkeeping the tree's summaries don't carry, held per inner id.
   @typep book_entry :: %{
+           object_id: Cairn.ULID.t(),
            camera_id: term(),
            epoch: term(),
            started_at: term(),
@@ -106,12 +122,15 @@ defmodule Cairn.Detect.SparseTrack do
     {inner, tagged, events} = SparseTrack.track(state.inner, scaled, context)
 
     book = Enum.reduce(tagged, state.book, &observe(&2, &1, context))
-    cairn_events = Enum.map(events, &to_event(&1, book, state))
-    book = drop_ended(book, events)
-
     state = %{state | inner: inner, book: book, last_observed_at: context.observed_at}
 
-    {state, Enum.map(tagged, &tag_out(&1, state)), cairn_events}
+    # Both translations read the books before the finals trim them: an identity
+    # this frame's live cap evicted is in `tagged` and in an `:ended` event at
+    # once, and the two have to name it the same track.
+    cairn_tagged = Enum.map(tagged, &tag_out(&1, book, state))
+    cairn_events = Enum.map(events, &to_event(&1, book, state))
+
+    {%{state | book: drop_ended(book, events)}, cairn_tagged, cairn_events}
   end
 
   @impl true
@@ -193,9 +212,9 @@ defmodule Cairn.Detect.SparseTrack do
 
   # -- vocabulary -----------------------------------------------------------
 
-  defp tag_out(summary, state) do
+  defp tag_out(summary, book, state) do
     %{
-      object_id: summary.object_id,
+      object_id: entry(book, summary, state).object_id,
       label: summary.label,
       score: summary.score,
       bbox: scale_out(summary.bbox, state),
@@ -209,17 +228,11 @@ defmodule Cairn.Detect.SparseTrack do
     {kind, %{to_track(summary, book, state) | end_reason: end_reason(summary)}}
   end
 
-  # An id with no bookkeeping cannot happen through the tree's own paths — a
-  # summary only leaves it for a track that was reported on some frame, and
-  # that frame booked it — but this runs inside the tracker element, where a
-  # `KeyError` would take the camera's pipeline down. The fallback is the
-  # honest one: what this module knows about the track, and nils for what only
-  # a batch could have told it.
   defp to_track(summary, book, state) do
-    entry = Map.get(book, summary.object_id, unbooked(state, summary))
+    entry = entry(book, summary, state)
 
     %Cairn.Track{
-      object_id: summary.object_id,
+      object_id: entry.object_id,
       camera_id: entry.camera_id,
       label: summary.label,
       score: summary.score,
@@ -237,8 +250,18 @@ defmodule Cairn.Detect.SparseTrack do
     }
   end
 
+  # An id with no bookkeeping cannot happen through the tree's own paths — a
+  # summary only leaves it for a track that was reported on some frame, and
+  # that frame booked it — but this runs inside the tracker element, where a
+  # `KeyError` would take the camera's pipeline down. The fallback is the
+  # honest one: what this module knows about the track, and nils for what only
+  # a batch could have told it. Its identity is a ULID like any other, minted
+  # here and remembered nowhere, so it is unique wherever it lands.
+  defp entry(book, summary, state), do: Map.get(book, summary.object_id, unbooked(state, summary))
+
   defp unbooked(state, summary) do
     %{
+      object_id: Cairn.ULID.generate(),
       camera_id: nil,
       epoch: nil,
       started_at: state.last_observed_at,
@@ -267,6 +290,7 @@ defmodule Cairn.Detect.SparseTrack do
       book,
       id,
       %{
+        object_id: Cairn.ULID.generate(),
         camera_id: context.camera_id,
         epoch: context.epoch,
         started_at: context.observed_at,

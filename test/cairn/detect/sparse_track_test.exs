@@ -12,6 +12,12 @@ defmodule Cairn.Detect.SparseTrackTest do
   defp context(at_ms, observed_at \\ nil),
     do: %{camera_id: "cam-1", epoch: 7, at_ms: at_ms, observed_at: observed_at || at_ms}
 
+  defp drop_ids(tagged), do: Enum.map(tagged, &Map.delete(&1, :object_id))
+
+  # Crockford base32, 26 characters: what `Cairn.ULID` mints and what every
+  # consumer of an `object_id` is typed for.
+  defp ulid?(id), do: is_binary(id) and id =~ ~r/^[0-9A-HJKMNP-TV-Z]{26}$/
+
   test "a confirmed track's bbox round-trips through the nominal frame" do
     box = [0.1, 0.2, 0.05, 0.1]
 
@@ -138,7 +144,7 @@ defmodule Cairn.Detect.SparseTrackTest do
   test "an identity adopted across a cut names the session it is seen under" do
     box = [0.1, 0.1, 0.05, 0.1]
 
-    {state, _tagged, _events} =
+    {state, [%{object_id: oid}], _events} =
       SparseTrack.track(SparseTrack.new(), [object(box)], context(0, 100))
 
     {state, _events, _report} = SparseTrack.suspend(state, 8, 1_000)
@@ -152,8 +158,79 @@ defmodule Cairn.Detect.SparseTrackTest do
       SparseTrack.track(state, [object(box)], %{epoch_two | at_ms: 2_100, observed_at: 2_200})
 
     # A summary still naming the dead session reads as stale, and the identity
-    # did not restart — so the epoch moves and `started_at` does not.
-    assert [{:updated, %Track{epoch: 9, started_at: 100}}, {:adopted, %Track{epoch: 9}}] = events
+    # did not restart — so the epoch moves while `started_at` and the minted id
+    # do not. The id is the reason the adoption is worth anything: a consumer
+    # that gets a new one has been told the object is a different object.
+    assert [
+             {:updated, %Track{epoch: 9, started_at: 100, object_id: ^oid}},
+             {:adopted, %Track{epoch: 9, object_id: ^oid}}
+           ] = events
+  end
+
+  describe "identities" do
+    test "every summary kind names the track with a minted ULID, never the core's counter" do
+      box = [0.1, 0.1, 0.05, 0.1]
+
+      {state, [tagged], [{:started, started}]} =
+        SparseTrack.track(SparseTrack.new(track_buffer: 1), [object(box)], context(0, 100))
+
+      oid = tagged.object_id
+      assert ulid?(oid)
+      assert started.object_id == oid
+
+      {state, [%{object_id: ^oid}], [{:updated, %Track{object_id: ^oid}}]} =
+        SparseTrack.track(state, [object(box)], context(1, 200))
+
+      assert [%Track{object_id: ^oid}] = SparseTrack.checkpoint_tracks(state)
+
+      # Nothing matches from here on, so the identity ages out — and the final
+      # is owed to the same name every earlier summary carried.
+      {state, [], []} = SparseTrack.track(state, [], context(2, 300))
+      {state, [], []} = SparseTrack.track(state, [], context(3, 400))
+      {state, [], [{:ended, %Track{object_id: ^oid}}]} = SparseTrack.track(state, [], context(4))
+
+      # …and the mapping ends with the identity, so a camera that runs for a
+      # week does not carry a book entry per track it ever saw.
+      assert state.book == %{}
+    end
+
+    test "two cameras tracking the same box mint identities that cannot collide" do
+      box = [0.1, 0.1, 0.05, 0.1]
+      cam_two = %{context(0) | camera_id: "cam-2"}
+
+      {_state, [one], _events} = SparseTrack.track(SparseTrack.new(), [object(box)], context(0))
+      {_state, [two], _events} = SparseTrack.track(SparseTrack.new(), [object(box)], cam_two)
+
+      # Both are the inner core's id 1, which is exactly the collision the mint
+      # exists to prevent — in the track index they are two rows, not one.
+      refute one.object_id == two.object_id
+    end
+
+    test "a suspended identity's final still names it" do
+      box = [0.1, 0.1, 0.05, 0.1]
+
+      {state, [tagged], _events} =
+        SparseTrack.track(SparseTrack.new(), [object(box)], context(0, 100))
+
+      {state, [], _report} = SparseTrack.suspend(state, 8, 1_000)
+      assert map_size(state.book) == 1
+
+      {state, [{:ended, %Track{object_id: object_id}}]} =
+        SparseTrack.expire_suspended(state, 1_000 + SparseTrack.adoption_window_ms() + 1)
+
+      assert object_id == tagged.object_id
+      assert state.book == %{}
+    end
+
+    test "end_all forgets every mapping it ends" do
+      {state, [_tagged], _events} =
+        SparseTrack.track(SparseTrack.new(), [object([0.1, 0.1, 0.05, 0.1])], context(0, 100))
+
+      {state, [{:ended, %Track{end_reason: :detection_disabled}}]} =
+        SparseTrack.end_all(state, :detection_disabled)
+
+      assert state.book == %{}
+    end
   end
 
   describe "the live cap" do
@@ -163,10 +240,15 @@ defmodule Cairn.Detect.SparseTrackTest do
       # One box over the cap, all minted on one frame: the tree's own default
       # is no cap at all, so anything but the host's leaves every one of them.
       objects = for i <- 0..cap, do: object([i / 4000, 0.1, 0.01, 0.02])
-      {state, _tagged, events} = SparseTrack.track(SparseTrack.new(), objects, context(0))
+      {state, tagged, events} = SparseTrack.track(SparseTrack.new(), objects, context(0))
 
-      assert [{:ended, %Track{object_id: 1, end_reason: :evicted}}] =
+      assert [{:ended, %Track{object_id: evicted, end_reason: :evicted}}] =
                Enum.filter(events, &match?({:ended, _}, &1))
+
+      # The eviction is of a track this same frame also tagged, so the two name
+      # it identically or a consumer folding the pair ends a track it never
+      # started.
+      assert evicted in Enum.map(tagged, & &1.object_id)
 
       assert length(SparseTrack.checkpoint_tracks(state)) == cap
     end
@@ -177,10 +259,11 @@ defmodule Cairn.Detect.SparseTrackTest do
 
       {state, _tagged, events} = SparseTrack.track(state, objects, context(0, 100))
 
-      assert [{:ended, %Track{object_id: 1, end_reason: :evicted, camera_id: "cam-1"}}] =
+      assert [{:ended, %Track{object_id: evicted, end_reason: :evicted, camera_id: "cam-1"}}] =
                Enum.filter(events, &match?({:ended, _}, &1))
 
-      assert [%Track{object_id: 2}] = SparseTrack.checkpoint_tracks(state)
+      assert [%Track{object_id: kept}] = SparseTrack.checkpoint_tracks(state)
+      refute kept == evicted
     end
   end
 
@@ -237,8 +320,10 @@ defmodule Cairn.Detect.SparseTrackTest do
       {_state, floorless, _events} = SparseTrack.track(SparseTrack.new(), objects, context(0))
       {_state, unset, _events} = SparseTrack.track(SparseTrack.new(), objects, floored(0, nil))
 
-      assert [%{object_id: 1}] = floorless
-      assert floorless == unset
+      # The identities are two independent mints; everything else about the
+      # batch is what has to match.
+      assert [%{label: "person"}] = floorless
+      assert drop_ids(floorless) == drop_ids(unset)
     end
   end
 

@@ -34,11 +34,15 @@ defmodule Cairn.TrackerDriver do
   `server` is the sink's `tracker:` seam — the camera tracker under test, or a
   process standing in for it. `nil` routes to the camera's own tracker, as the
   seam does in production.
+
+  `opts[:core]` is the element's `tracker:` — `Cairn.Tracker` unless a test
+  names the other core a camera may select. It is read on this camera's first
+  call here and never again, because that is when the element is built.
   """
-  @spec detections(GenServer.server() | nil, Camera.t(), map(), Observation.t()) :: :ok
-  def detections(server, %Camera{} = camera, policy, %Observation{} = observation) do
+  @spec detections(GenServer.server() | nil, Camera.t(), map(), Observation.t(), keyword()) :: :ok
+  def detections(server, %Camera{} = camera, policy, %Observation{} = observation, opts \\ []) do
     observation = observation |> with_observed_at() |> with_at_ms() |> with_epoch(camera)
-    {tracker, sink} = state(server, camera, policy)
+    {tracker, sink} = state(server, camera, policy, opts)
 
     buffer = %Buffer{
       payload: <<>>,
@@ -104,7 +108,8 @@ defmodule Cairn.TrackerDriver do
 
   @doc """
   The core's live tracks — what a test used to read out of the camera
-  tracker's own state, now one process removed.
+  tracker's own state, now one process removed. `Cairn.Tracker`'s own reader,
+  so it answers only for an element built with that core.
   """
   @spec live_tracks(String.t()) :: [Cairn.Track.t()]
   def live_tracks(camera_id), do: core(camera_id, &Tracker.live_tracks/1)
@@ -120,15 +125,6 @@ defmodule Cairn.TrackerDriver do
     end
   end
 
-  @doc """
-  Forgets this camera's element — a fresh pipeline, which is what a rebuild is.
-  """
-  @spec reset(String.t()) :: :ok
-  def reset(camera_id) do
-    Process.delete({__MODULE__, camera_id})
-    :ok
-  end
-
   # Every buffer the element produced, through the sink that casts it. Timer
   # actions are dropped: this driver is the clock.
   defp drain(actions, sink) do
@@ -142,14 +138,14 @@ defmodule Cairn.TrackerDriver do
     end)
   end
 
-  defp state(server, camera, policy) do
+  defp state(server, camera, policy, opts \\ []) do
     case Process.get({__MODULE__, camera.id}) do
       nil ->
         {[], tracker} =
           Membrane.MOTTracker.handle_init(
             %{},
             struct(Membrane.MOTTracker,
-              tracker: {Tracker, []},
+              tracker: Keyword.get(opts, :core, {Tracker, []}),
               max_suspended: Map.get(policy, :max_live_tracks) || 128
             )
           )

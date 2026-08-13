@@ -170,6 +170,8 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
         {{Cairn.Tracker, []}, :normalized}
 
       "sparsetrack" ->
+        levels!(opts)
+
         # The lost-track buffer is a frame count scaled by the sequence's rate,
         # so the rate is the sequence's property and not a knob: the reference
         # is constructed with `frame_rate=int(fps)` and a mismatch here changes
@@ -180,6 +182,21 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
       other ->
         Mix.raise("unknown --tracker #{inspect(other)}; expected cairn or sparsetrack")
     end
+  end
+
+  # The core raises an `ArgumentError` on either of these, which reaches an
+  # operator as a stack trace; every other bad number this task is handed is a
+  # `Mix.raise`.
+  defp levels!(opts) do
+    Enum.each([:depth_levels, :depth_levels_low], fn key ->
+      case Keyword.get(opts, key) do
+        levels when is_nil(levels) or levels > 0 ->
+          :ok
+
+        levels ->
+          Mix.raise("--#{String.replace(to_string(key), "_", "-")} must be > 0, got #{levels}")
+      end
+    end)
   end
 
   # -- input parsing ----------------------------------------------------------

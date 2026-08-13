@@ -69,7 +69,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
     # `Cairn.Pipeline.TrackSink` over this observation and dispatches through
     # `Cairn.Detect.Dispatch` itself, so there is no second route left to pick
     # between — every call here already goes through it.
-    TrackerDriver.detections(tracker, camera, policy, observation)
+    TrackerDriver.detections(tracker, camera, policy, observation, Keyword.take(opts, [:core]))
   end
 
   # The tracker decides on `at_ms`, which production derives from the host's
@@ -296,6 +296,30 @@ defmodule Cairn.CameraTrackerRecorderTest do
       flush(ctx.tracker, ctx.rec)
 
       assert Tracks.get(oid).end_reason == :detection_disabled
+    end
+
+    test "a sparsetrack identity survives the whole way into a row", ctx do
+      # The other core a camera may select, through the same seam: its inner
+      # ids are per-instance integers, and `Cairn.Tracks.Track`'s primary key is
+      # a string — an integer reaches `insert_all` as an `Ecto.ChangeError` that
+      # takes the recorder's whole buffer with it, so the adapter's mint is what
+      # this asserts, at the only place that can tell.
+      observe(ctx.tracker, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])],
+        core: {Cairn.Detect.SparseTrack, []}
+      )
+
+      assert_receive {:track_started, %Track{object_id: oid}}
+      assert oid =~ ~r/^[0-9A-HJKMNP-TV-Z]{26}$/
+
+      TrackerDriver.end_all(ctx.tracker, ctx.camera, @policy, :detection_disabled)
+      assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :detection_disabled}}
+
+      flush(ctx.tracker, ctx.rec)
+
+      row = Tracks.get(oid)
+      assert row.camera_id == ctx.camera_id
+      assert row.end_reason == :detection_disabled
+      assert row.label == "person"
     end
 
     test "an evicted track is recorded like any other", ctx do

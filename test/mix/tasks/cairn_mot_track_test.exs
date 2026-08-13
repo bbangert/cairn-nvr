@@ -240,6 +240,17 @@ defmodule Mix.Tasks.Cairn.Mot.TrackTest do
       end
     end
 
+    test "reports a non-positive sparsetrack level count instead of raising through the core",
+         %{seq_dir: seq_dir, tmp_dir: tmp_dir} do
+      out = Path.join(tmp_dir, "levels.txt")
+
+      for {flag, value} <- [{"--depth-levels", "0"}, {"--depth-levels-low", "-2"}] do
+        assert_raise Mix.Error, ~r/#{flag} must be > 0/, fn ->
+          Track.run([seq_dir, "--out", out, "--tracker", "sparsetrack", flag, value])
+        end
+      end
+    end
+
     test "policy scalar and stage flags reach the sidecar echo",
          %{seq_dir: seq_dir, tmp_dir: tmp_dir} do
       out = Path.join(tmp_dir, "flags.txt")

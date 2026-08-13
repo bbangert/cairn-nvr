@@ -34,6 +34,8 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
     Track
   }
 
+  alias Cairn.Native.Host
+  alias Cairn.NativeStub
   alias Cairn.Pipeline.ObservationStamper
   alias Cairn.TrackerDriver
   alias Membrane.Buffer
@@ -240,24 +242,32 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
     test "takes the tracker element's tracks and leaves the event to finalize" do
       id = uid("rebuild")
 
-      %{camera: camera, owner: owner, pipeline: pipeline, source: source} =
+      # The one test here whose tracks have to be in the pipeline's own tracker
+      # child rather than in a stand-in beside it — so the branch is driven from
+      # the source down, and the camera tracker is the registered one the real
+      # sink dispatches to.
+      stub_detection(@box)
+
+      %{owner: owner, pipeline: pipeline, source: source} =
         start_camera(id, plugin: {:group, "g"})
 
-      tracker = start_tracker(id)
+      tracker = start_tracker(id, name: Cairn.Registry.via(id, :camera_tracker))
       Event.subscribe()
 
+      element = await_child(pipeline, :tracker)
       session(source, short_media())
       assert_receive {:stream_epoch, ^id, epoch, :started}, 10_000
-      await_tracker_epoch(tracker, epoch)
-
-      element = await_child(pipeline, :tracker)
 
       # A live track behind an open event — the state a rebuild is expensive
       # for, split across the two processes that hold it.
-      _sink = detect(sink(camera, tracker), epoch, @box, 90_000)
-      assert_receive {:track_started, %Track{object_id: oid, epoch: ^epoch}}, 2_000
+      assert_receive {:track_started, %Track{object_id: oid, epoch: ^epoch}}, 10_000
       assert_receive {:event_started, %Event{id: eid}}, 2_000
-      assert [%Track{object_id: ^oid}] = TrackerDriver.live_tracks(id)
+
+      # …and the element is where the track half of it lives, which is what
+      # makes the emptiness asserted after the rebuild mean anything.
+      populated = :sys.get_state(element).internal_state
+      assert populated.processed > 0
+      assert [%Track{object_id: ^oid}] = Cairn.Tracker.live_tracks(populated.core)
 
       # The watchdog's escalation, driven rather than waited out: the detect
       # branch last produced a buffer two stall windows ago while the ring is
@@ -270,11 +280,11 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
 
       # The tracks went with the element, because the element is a child of the
       # pipeline that was torn down. Nothing handed them over and nothing was
-      # meant to: the driver's stand-in is dropped here for the same reason.
+      # meant to.
       await_dead(element)
-      TrackerDriver.reset(id)
 
-      # …and the pipeline that replaced it starts from nothing. Read off the
+      # …and the pipeline that replaced it starts from nothing — it is fed no
+      # media of its own, so anything in it came from a handoff. Read off the
       # element's own state because neither a pad nor a notification exposes the
       # core, and a rebuild that ever grew a handoff would pass every other
       # assertion in this file.
@@ -469,12 +479,11 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
     end
   end
 
-  defp await_dead(pid, attempts \\ 300) do
-    cond do
-      not Process.alive?(pid) -> :ok
-      attempts > 0 -> Process.sleep(10) && await_dead(pid, attempts - 1)
-      true -> flunk("#{inspect(pid)} outlived the pipeline that owned it")
-    end
+  # A monitor and not a liveness poll: a pid that is already dead when this runs
+  # still gets its `:DOWN`, with `:noproc`.
+  defp await_dead(pid) do
+    ref = Process.monitor(pid)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 3_000
   end
 
   # -- the ring's broadcasts ----------------------------------------------------
@@ -493,22 +502,64 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
 
   # -- the tracker and the detect branch's sink ---------------------------------
 
-  defp start_tracker(camera_id) do
+  # Unregistered by default: the sink is handed this pid, so nothing depends on
+  # the pool's naming. A test driving the pipeline's own sink passes `name:`
+  # this camera's via-tuple instead — that sink resolves the camera's registered
+  # tracker (`Cairn.Detect.Dispatch`) and knows no pid. The clip pipeline is
+  # another test's business either way.
+  defp start_tracker(camera_id, opts \\ []) do
     on_exit(fn -> Cairn.EventCheckpoint.delete(camera_id) end)
 
+    defaults = [
+      camera_id: camera_id,
+      name: nil,
+      start_extractor: fn _camera, _event ->
+        {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+      end,
+      finalize_extractor: fn _pid, _event -> :ok end
+    ]
+
+    start_supervised!({CameraTracker, Keyword.merge(defaults, opts)}, id: {:tracker, camera_id})
+  end
+
+  # The detect branch's two native halves, stubbed under the name the pipeline
+  # builds them with. `Cairn.Pipeline.Camera` hands its decoder and its
+  # inference the application's own `Cairn.Native.Host` and exposes no seam for
+  # either, so a test that needs the real branch to produce a detection has to
+  # *be* that host for the duration — which is also the only way the pipeline's
+  # own tracker child ever sees a buffer here: CI has neither NIF library nor a
+  # model.
+  defp stub_detection(bbox) do
+    :persistent_term.put(NativeStub.control(), %{
+      test: self(),
+      push_frame: fn _stream, _payload, _meta, _time_base -> {:ok, {[frame(bbox, 0)], []}} end
+    })
+
+    on_exit(fn -> :persistent_term.erase(NativeStub.control()) end)
+
+    :ok = Supervisor.terminate_child(Cairn.Supervisor, Host)
+
+    on_exit(fn ->
+      # Whatever still holds the name goes first: the application's host
+      # cannot be restarted under a name the stub is registered as, and the
+      # stub is `start_supervised`'s `:temporary` child, so stopping it is
+      # final.
+      case Process.whereis(Host) do
+        nil -> :ok
+        stub -> GenServer.stop(stub)
+      end
+
+      {:ok, _restored} = Supervisor.restart_child(Cairn.Supervisor, Host)
+    end)
+
     start_supervised!(
-      {
-        CameraTracker,
-        # Unregistered: the sink is handed this pid, so nothing here depends on
-        # the pool's naming. The clip pipeline is another test's business.
-        camera_id: camera_id,
-        name: nil,
-        start_extractor: fn _camera, _event ->
-          {:ok, spawn(fn -> Process.sleep(:infinity) end)}
-        end,
-        finalize_extractor: fn _pid, _event -> :ok end
-      },
-      id: {:tracker, camera_id}
+      {Host,
+       name: Host,
+       native_module: NativeStub,
+       ort_module: Cairn.CairnOrtStub,
+       canary_module: Cairn.CanaryStub,
+       config: %{model: "m.onnx", backend: "ort"}},
+      id: :stub_host
     )
   end
 

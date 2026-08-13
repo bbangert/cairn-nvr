@@ -179,13 +179,28 @@ defmodule Membrane.MOTTracker.SparseTrack do
       match_thresh: Keyword.get(opts, :match_thresh, @match_thresh),
       second_thresh: Keyword.get(opts, :second_thresh, @second_thresh),
       confirm_thresh: Keyword.get(opts, :confirm_thresh, @confirm_thresh),
-      depth_levels: Keyword.get(opts, :depth_levels, @depth_levels),
-      depth_levels_low: Keyword.get(opts, :depth_levels_low, @depth_levels_low),
+      depth_levels: levels!(opts, :depth_levels, @depth_levels),
+      depth_levels_low: levels!(opts, :depth_levels_low, @depth_levels_low),
       max_time_lost: trunc(frame_rate / 30.0 * track_buffer),
       mot20: Keyword.get(opts, :mot20, false),
       adoption_iou: Keyword.get(opts, :adoption_iou, @adoption_iou),
       max_live: Keyword.get(opts, :max_live, :infinity)
     }
+  end
+
+  # `depth_masks/2` divides the depth span by the level count and sweeps the
+  # bounds forward from the near edge, so anything but a positive integer is
+  # arithmetic rather than a configuration: zero divides by zero, and a
+  # negative step yields an empty range the mask builder takes the head of.
+  defp levels!(opts, key, default) do
+    case Keyword.get(opts, key, default) do
+      levels when is_integer(levels) and levels > 0 ->
+        levels
+
+      other ->
+        raise ArgumentError,
+              "#{inspect(key)} must be a positive integer, got #{inspect(other)}"
+    end
   end
 
   @doc """
