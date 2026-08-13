@@ -310,8 +310,16 @@ defmodule Cairn.Config do
   end
 
   # A name, not a module: `validate_trackers/2` refuses one no core answers to,
-  # and `tracker/2` resolves what survives that.
-  defp configured_tracker(map), do: get_in(map, ["tracking", "tracker"]) || @default_tracker
+  # and `tracker/2` resolves what survives that. Not `||`, on the rule its
+  # boolean neighbours above follow for their own reason: only an absent key is
+  # a default, so a `false` in the YAML reaches the validator as the name it is
+  # not, rather than being read as an absence and silently defaulted.
+  defp configured_tracker(map) do
+    case get_in(map, ["tracking", "tracker"]) do
+      nil -> @default_tracker
+      name -> name
+    end
+  end
 
   # Global only: one clock for the whole track log, with none of the
   # per-camera or per-label forms `retention.days` has. Those exist to buy disk
@@ -400,7 +408,7 @@ defmodule Cairn.Config do
 
   @doc """
   The tracker core `Membrane.MOTTracker` hosts for a camera, resolved
-  camera → profile → global on `bound/3`'s rule.
+  camera → profile → global on `bound/3`'s precedence.
 
   A module, not a name: the names are the config vocabulary and `validate/2`
   has already refused any that no core answers to, so nothing downstream has to
@@ -413,8 +421,16 @@ defmodule Cairn.Config do
   def tracker(%__MODULE__{} = config, %Camera{} = cam) do
     profile = profile_for(config, cam)
 
-    Map.fetch!(@trackers, bound(cam.tracker, profile && profile.tracker, config.tracker))
+    Map.fetch!(@trackers, named_tracker(cam.tracker, profile && profile.tracker, config.tracker))
   end
+
+  # `bound/3`'s precedence, but coalescing on `nil` alone: an override is
+  # absent or it is a name, and a `false` that fell through `||` here would be
+  # resolved to the default the load-time validator had already refused it in
+  # favour of — turning a rejected config into a silently running one.
+  defp named_tracker(nil, nil, global), do: global
+  defp named_tracker(nil, profile, _global), do: profile
+  defp named_tracker(camera, _profile, _global), do: camera
 
   @doc "The tracker-core names a config may choose between, for error messages."
   @spec tracker_names() :: [String.t()]

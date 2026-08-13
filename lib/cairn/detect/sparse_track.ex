@@ -209,6 +209,11 @@ defmodule Cairn.Detect.SparseTrack do
 
   # -- bookkeeping ------------------------------------------------------------
 
+  # The epoch moves with every observation, as `Cairn.Tracker.revive/3` moves
+  # an adopted track's: it names the session the track is being seen under, not
+  # the one it was minted in, so an identity adopted across a cut stops naming
+  # the stream that died. `started_at` is what does not move — the identity did
+  # not restart, which is the whole point of having adopted it.
   defp observe(book, %{object_id: id, score: score}, context) do
     Map.update(
       book,
@@ -220,7 +225,12 @@ defmodule Cairn.Detect.SparseTrack do
         last_seen_at: context.observed_at,
         best_score: score
       },
-      &%{&1 | last_seen_at: context.observed_at, best_score: max(&1.best_score, score)}
+      &%{
+        &1
+        | epoch: context.epoch,
+          last_seen_at: context.observed_at,
+          best_score: max(&1.best_score, score)
+      }
     )
   end
 

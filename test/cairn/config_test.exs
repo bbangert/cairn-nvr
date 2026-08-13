@@ -144,6 +144,23 @@ defmodule Cairn.ConfigTest do
       assert Enum.any?(errors, &(&1 =~ ~s(camera cam_a: tracker: unknown tracker "nope")))
     end
 
+    # `false` is a name no core answers to, and the truthiness a `||` chain
+    # resolves it with would read it as "said nothing" and hand the camera the
+    # default the operator was refusing.
+    test "a tracker of false is refused at load, wherever it was named" do
+      global = Map.put(base_map(), "tracking", %{"tracker" => false})
+      assert {:error, errors} = Config.from_map(global)
+      assert Enum.any?(errors, &(&1 =~ "tracking.tracker: unknown tracker false"))
+      assert Enum.any?(errors, &(&1 =~ "cairn, sparsetrack"))
+
+      per_camera =
+        update_in(base_map(), ["cameras"], fn [a, b] -> [Map.put(a, "tracker", false), b] end)
+
+      assert {:error, errors} = Config.from_map(per_camera)
+      assert Enum.any?(errors, &(&1 =~ "camera cam_a: tracker: unknown tracker false"))
+      assert Enum.any?(errors, &(&1 =~ "cairn, sparsetrack"))
+    end
+
     test "per-camera max_live_tracks overrides are validated" do
       map =
         update_in(base_map(), ["cameras"], fn [a, b] ->
@@ -1018,6 +1035,27 @@ defmodule Cairn.ConfigTest do
       assert Config.tracker(config, hd(config.cameras)) == Cairn.Tracker
     end
 
+    test "a profile's tracker of false is refused at load like any other non-name" do
+      dir =
+        tmp_profile_dir("falsy", """
+        backend: ort
+        model:
+          onnx: test/support/fixtures/models/stub.onnx
+        tracking:
+          tracker: false
+        """)
+
+      map =
+        base_map()
+        |> Map.put("profile_dirs", [dir])
+        |> Map.put("plugins", %{"det" => %{"profile" => "falsy"}})
+        |> put_plugin(0, "det")
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "profile falsy: tracking.tracker: unknown tracker false"))
+      assert Enum.any?(errors, &(&1 =~ "cairn, sparsetrack"))
+    end
+
     test "a profiled group resolves its file into the parsed struct" do
       assert {:ok, config, []} = Config.from_map(profiled_map())
 
@@ -1857,6 +1895,14 @@ defmodule Cairn.ConfigTest do
       assert Config.retention_days(config, cam_b, "person") == 30
       assert Config.retention_days(config, cam_b, "car") == 10
     end
+  end
+
+  defp tmp_profile_dir(name, yaml) do
+    dir = Path.join(System.tmp_dir!(), "cairn_profiles_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    File.write!(Path.join(dir, "#{name}.yml"), yaml)
+    on_exit(fn -> File.rm_rf(dir) end)
+    dir
   end
 
   defp tmp_yaml(content) do

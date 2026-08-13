@@ -183,6 +183,70 @@ defmodule Membrane.MOTTracker.SparseTrackTest do
       assert ids(tagged) == [1]
     end
 
+    test "an adopted identity resumes rather than starting over", %{state: state} do
+      {state, _events, _report} = SparseTrack.suspend(state, 8, 2_000)
+
+      # The adopting frame publishes nothing: one box across a boundary
+      # nothing observed corroborates no more than the first sighting of any
+      # other minted track does.
+      {state, tagged, events} = step(state, [object([110, 100, 100, 200])], 3_000)
+      assert tagged == []
+      assert events == []
+
+      {_state, tagged, events} = step(state, [object([110, 100, 100, 200])], 3_100)
+
+      assert ids(tagged) == [1]
+      assert [{:updated, %{object_id: 1}}, {:adopted, %{object_id: 1}}] = events
+    end
+
+    test "an adopted identity that vanishes again is ended exactly once", %{state: state} do
+      {state, _events, _report} = SparseTrack.suspend(state, 8, 2_000)
+      {state, _tagged, _events} = step(state, [object([110, 100, 100, 200])], 3_000)
+
+      # The confirmation never comes. The identity was published before the
+      # cut, so it is owed the final an ordinary discarded mint is not.
+      {state, _tagged, events} = step(state, [], 3_100)
+      assert [{:ended, %{object_id: 1}}] = events
+
+      {state, _tagged, later} = step(state, [], 3_200)
+      assert later == []
+
+      # …and the tracker no longer counts it among what it owes.
+      assert Enum.map(SparseTrack.checkpoint_tracks(state), & &1.object_id) == [2]
+    end
+
+    test "a lapsed suspension is settled by the next batch, with no timer", %{state: state} do
+      {state, _events, _report} = SparseTrack.suspend(state, 8, 2_000)
+
+      # No `expire_suspended/2` call and no element timer: the batch that
+      # arrives after the window closed is what closes it.
+      {state, _tagged, events} =
+        step(state, [], 2_000 + SparseTrack.adoption_window_ms() + 1)
+
+      assert [{:ended, %{object_id: 1}}, {:ended, %{object_id: 2}}] = events
+      assert SparseTrack.checkpoint_tracks(state) == []
+    end
+
+    test "the cap is over every suspension, not over each cut's arrivals", %{state: state} do
+      {state, events, report} = SparseTrack.suspend(state, 2, 2_000)
+      assert events == []
+      assert report.suspended == 2
+
+      # A new epoch mints and confirms two more identities, so the second cut
+      # has four candidates for two slots.
+      next = [object([1000, 100, 100, 200]), object([1400, 100, 100, 200])]
+      {state, _tagged, _events} = step(state, next, 3_000)
+      {state, _tagged, _events} = step(state, next, 3_100)
+
+      {state, events, report} = SparseTrack.suspend(state, 2, 4_000)
+
+      # The newest survive; the ghosts of the reset before last do not, and
+      # they leave with the finals they are owed.
+      assert report == %{suspended: 2, ended: 2, at: 3_100}
+      assert [{:ended, %{object_id: 1}}, {:ended, %{object_id: 2}}] = events
+      assert Enum.map(SparseTrack.checkpoint_tracks(state), & &1.object_id) == [3, 4]
+    end
+
     test "the window running out ends what nothing adopted", %{state: state} do
       {state, _events, _report} = SparseTrack.suspend(state, 8, 2_000)
 

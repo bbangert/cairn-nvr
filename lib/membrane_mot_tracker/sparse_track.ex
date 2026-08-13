@@ -41,8 +41,9 @@ defmodule Membrane.MOTTracker.SparseTrack do
   `expire_suspended/2`, `end_all/2` and the adoption of a suspended identity
   are this port's own, shaped after the host tracker they sit beside, and they
   are **parity-exempt** — the reference never reaches them, so the fixture
-  cannot judge them. They are unreachable from a run that never cuts, which is
-  what keeps the gate meaningful.
+  cannot judge them. A run that never cuts suspends nothing, so every one of
+  them is a no-op there — `track/3` settles lapsed suspensions on its way in
+  and finds none — which is what keeps the gate meaningful.
 
   ## Faithfulness notes
 
@@ -88,8 +89,11 @@ defmodule Membrane.MOTTracker.SparseTrack do
   # `ceil` pass through. It is 2000 because the reference says 2000.
   @depth_horizon 2000
 
-  # Suspension defaults, from the host tracker this core sits beside: the same
-  # window and the same overlap an adoption is granted on.
+  # Suspension bounds, from the host tracker this core sits beside: the same
+  # window and the same overlap an adoption is granted on. The window is a
+  # constant and not an option, because the element arms its sweep timer from
+  # `adoption_window_ms/0` — a per-instance window would be one the timer never
+  # hears about.
   @adoption_window_ms 60_000
   @adoption_iou 0.4
 
@@ -113,8 +117,7 @@ defmodule Membrane.MOTTracker.SparseTrack do
             depth_levels_low: @depth_levels_low,
             max_time_lost: @track_buffer,
             mot20: false,
-            adoption_iou: @adoption_iou,
-            adoption_window_ms: @adoption_window_ms
+            adoption_iou: @adoption_iou
 
   @doc """
   A tracker configured by the reference's own knobs, at its published MOT17
@@ -143,8 +146,10 @@ defmodule Membrane.MOTTracker.SparseTrack do
     * `:mot20` (false) — the dense-crowd switch: it turns *off* the
       score-weighted overlap cost, because in a crowd a confident box is not a
       better match, just a bigger one.
-    * `:adoption_window_ms` / `:adoption_iou` — the suspension knobs, which are
-      this port's and not the reference's (see the moduledoc).
+    * `:adoption_iou` (#{@adoption_iou}) — how much a new detection must
+      overlap a suspended identity to take it back. This port's, not the
+      reference's (see the moduledoc). How long it stays adoptable is not an
+      option beside it: see `adoption_window_ms/0`.
   """
   @impl true
   @spec new(keyword()) :: t()
@@ -164,8 +169,7 @@ defmodule Membrane.MOTTracker.SparseTrack do
       depth_levels_low: Keyword.get(opts, :depth_levels_low, @depth_levels_low),
       max_time_lost: trunc(frame_rate / 30.0 * track_buffer),
       mot20: Keyword.get(opts, :mot20, false),
-      adoption_iou: Keyword.get(opts, :adoption_iou, @adoption_iou),
-      adoption_window_ms: Keyword.get(opts, :adoption_window_ms, @adoption_window_ms)
+      adoption_iou: Keyword.get(opts, :adoption_iou, @adoption_iou)
     }
   end
 
@@ -182,11 +186,18 @@ defmodule Membrane.MOTTracker.SparseTrack do
   posterior rather than the detection that produced it — which is what the
   reference emits and what the parity fixture compares. Every one of them was
   matched to a real detection on this frame, so no box here is an extrapolation.
+
+  A suspension whose adoption window has run out by this batch's `at_ms` is
+  settled first, and its final leads the returned events: the batch that
+  arrives after a window closed is what closes it, rather than a stream that
+  keeps flapping restarting the element's sweep timer and postponing the final
+  indefinitely.
   """
   @impl true
   @spec track(t(), [map()], Membrane.MOTTracker.Core.context()) :: {t(), [map()], [tuple()]}
   def track(%__MODULE__{} = state, objects, context) do
     at_ms = Map.get(context, :at_ms)
+    {state, lapsed} = expire_lapsed(state, at_ms)
     frame_id = state.frame_id + 1
 
     {high, low} = split_by_score(objects, state)
@@ -266,7 +277,7 @@ defmodule Membrane.MOTTracker.SparseTrack do
 
     state = %{
       state
-      | tracked: Enum.map(tracked, &%{&1 | seen?: &1.seen? or &1.activated?}),
+      | tracked: Enum.map(tracked, &remember/1),
         lost: lost,
         removed_ids: MapSet.union(state.removed_ids, MapSet.new(removed_now ++ expired, & &1.id)),
         suspended: suspended,
@@ -275,39 +286,78 @@ defmodule Membrane.MOTTracker.SparseTrack do
         at_ms: at_ms
     }
 
-    {state, Enum.map(output, &summary(&1, at_ms)), events}
+    {state, Enum.map(output, &summary(&1, at_ms)), lapsed ++ events}
   end
+
+  # What this frame published is what the next one reasons from: `seen?` is
+  # what keeps an identity's `:started` and its `:ended` to exactly one each,
+  # and an adoption is spent the moment it has been announced.
+  defp remember(track) do
+    %{
+      track
+      | seen?: track.seen? or track.activated?,
+        adopted?: track.adopted? and not track.activated?
+    }
+  end
+
+  # Nothing to expire without a clock — a host that ships no `at_ms` has
+  # nothing to measure a window against, and could not have cut on one either
+  # — and nothing to expire with an empty suspension list, which is every
+  # frame of a run that never cuts.
+  defp expire_lapsed(state, nil), do: {state, []}
+  defp expire_lapsed(%__MODULE__{suspended: []} = state, _at_ms), do: {state, []}
+  defp expire_lapsed(state, at_ms), do: expire_suspended(state, at_ms)
 
   @impl true
   @spec suspend(t(), pos_integer(), number()) ::
           {t(), [tuple()], Membrane.MOTTracker.Core.suspension()}
   def suspend(%__MODULE__{} = state, max_suspended, cut_ms) do
-    keepable = Enum.filter(state.tracked, & &1.activated?)
-    {kept, capped} = Enum.split(keepable, max_suspended)
-
-    dropped = capped ++ Enum.reject(state.tracked, & &1.activated?) ++ state.lost
-    events = for track <- dropped, track.seen?, do: ended(track, :stream_reset, cut_ms)
-
-    suspended =
-      for track <- kept,
+    entering =
+      for track <- state.tracked,
+          track.activated?,
           do: %{
             id: track.id,
             bbox: tlwh(track),
             score: track.score,
             label: track.label,
+            seen?: track.seen?,
             cut_ms: cut_ms
           }
 
-    state = %{state | tracked: [], lost: [], suspended: state.suspended ++ suspended}
+    {kept, evicted} = trim_suspended(state.suspended ++ entering, max_suspended)
 
-    {state, events, %{suspended: length(suspended), ended: length(events), at: state.at_ms}}
+    dropped = Enum.reject(state.tracked, & &1.activated?) ++ state.lost
+
+    events =
+      for(track <- dropped, track.seen?, do: ended(track, :stream_reset, cut_ms)) ++
+        Enum.map(evicted, &ended(&1, :stream_reset, cut_ms))
+
+    state = %{state | tracked: [], lost: [], suspended: kept}
+
+    {state, events, %{suspended: length(kept), ended: length(events), at: state.at_ms}}
+  end
+
+  # The cap is over the whole suspension list and not over the arrivals alone:
+  # a stream flapping between epochs would otherwise keep a generation of
+  # ghosts per attempt, and the cap exists precisely because it flaps.
+  #
+  # Newest first, ties by id, keeping the head — the host tracker's own
+  # eviction order: the ghosts of the reset before last are the ones a
+  # reconnect loop should lose, and they are also the ones closest to their
+  # window running out anyway. Sorting unconditionally is what makes the
+  # checkpoint order a function of the set rather than of the order the cuts
+  # happened to arrive in.
+  defp trim_suspended(suspended, max_suspended) do
+    suspended
+    |> Enum.sort_by(&{-&1.cut_ms, &1.id})
+    |> Enum.split(max_suspended)
   end
 
   @impl true
   @spec expire_suspended(t(), number()) :: {t(), [tuple()]}
   def expire_suspended(%__MODULE__{} = state, at_ms) do
     {lapsed, held} =
-      Enum.split_with(state.suspended, &(at_ms - &1.cut_ms > state.adoption_window_ms))
+      Enum.split_with(state.suspended, &(at_ms - &1.cut_ms > @adoption_window_ms))
 
     {%{state | suspended: held}, Enum.map(lapsed, &ended(&1, :stream_reset, at_ms))}
   end
@@ -356,6 +406,7 @@ defmodule Membrane.MOTTracker.SparseTrack do
       state: :new,
       activated?: false,
       seen?: false,
+      adopted?: false,
       score: object.score,
       label: Map.get(object, :label),
       tracklet_len: 0,
@@ -465,7 +516,7 @@ defmodule Membrane.MOTTracker.SparseTrack do
           {minted, next_id, suspended}
 
         candidate = adoptable(suspended, detection, at_ms, state) ->
-          {minted ++ [activate(detection, candidate.id, frame_id)], next_id,
+          {minted ++ [adopt(detection, candidate, frame_id)], next_id,
            List.delete(suspended, candidate)}
 
         true ->
@@ -474,10 +525,22 @@ defmodule Membrane.MOTTracker.SparseTrack do
     end)
   end
 
+  # An adopted identity resumes the lifecycle it was suspended with. Minting it
+  # afresh would lose that: an identity downstream has already been told about
+  # would either vanish without the one final it is owed (a miss before the
+  # confirmation, which discards an unseen track silently) or be announced a
+  # second time as `:started`. What it does *not* skip is the confirmation —
+  # nothing observed the cut, so one box across it is one box, exactly as for
+  # any other minted track — so `:adopted` goes out when the identity is next
+  # published, which is what `adopted?` holds until.
+  defp adopt(detection, candidate, frame_id) do
+    %{activate(detection, candidate.id, frame_id) | seen?: candidate.seen?, adopted?: true}
+  end
+
   defp adoptable(suspended, detection, at_ms, state) do
     suspended
     |> Enum.filter(fn candidate ->
-      (at_ms == nil or at_ms - candidate.cut_ms <= state.adoption_window_ms) and
+      (at_ms == nil or at_ms - candidate.cut_ms <= @adoption_window_ms) and
         iou(tlbr(candidate.bbox), tlbr(detection.seed)) >= state.adoption_iou
     end)
     |> Enum.max_by(&iou(tlbr(&1.bbox), tlbr(detection.seed)), fn -> nil end)
@@ -674,12 +737,18 @@ defmodule Membrane.MOTTracker.SparseTrack do
     first ++ Enum.reject(second, &(&1.id in known))
   end
 
+  # `:adopted` follows the identity's own `:updated`, as the host tracker emits
+  # the pair: a consumer folding the events in order has the resumed summary
+  # before it is told the resumption happened. It is only ever emitted for an
+  # identity that has been published before, so no consumer meets one it has
+  # not already been told about.
   defp lifecycle(output, gone, at_ms) do
     started = for track <- output, not track.seen?, do: {:started, summary(track, at_ms)}
     updated = for track <- output, track.seen?, do: {:updated, summary(track, at_ms)}
+    adopted = for track <- output, track.adopted?, do: {:adopted, summary(track, at_ms)}
     ended = for track <- gone, track.seen?, do: ended(track, :lost, at_ms)
 
-    started ++ updated ++ ended
+    started ++ updated ++ adopted ++ ended
   end
 
   defp ended(track, reason, at_ms) do

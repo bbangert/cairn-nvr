@@ -104,6 +104,27 @@ defmodule Cairn.Detect.SparseTrackTest do
     assert final.camera_id == "cam-1"
   end
 
+  test "an identity adopted across a cut names the session it is seen under" do
+    box = [0.1, 0.1, 0.05, 0.1]
+
+    {state, _tagged, _events} =
+      SparseTrack.track(SparseTrack.new(), [object(box)], context(0, 100))
+
+    {state, _events, _report} = SparseTrack.suspend(state, 8, 1_000)
+
+    # Same object, new epoch: the adopting batch takes the identity back, and
+    # the one after it is where the resumed identity is published again.
+    epoch_two = %{context(2_000, 2_100) | epoch: 9}
+    {state, _tagged, _events} = SparseTrack.track(state, [object(box)], epoch_two)
+
+    {_state, _tagged, events} =
+      SparseTrack.track(state, [object(box)], %{epoch_two | at_ms: 2_100, observed_at: 2_200})
+
+    # A summary still naming the dead session reads as stale, and the identity
+    # did not restart — so the epoch moves and `started_at` does not.
+    assert [{:updated, %Track{epoch: 9, started_at: 100}}, {:adopted, %Track{epoch: 9}}] = events
+  end
+
   test "checkpoint_tracks returns Cairn.Track structs" do
     {state, _tagged, _events} =
       SparseTrack.track(SparseTrack.new(), [object([0.1, 0.1, 0.05, 0.1])], context(0))
