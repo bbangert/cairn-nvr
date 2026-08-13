@@ -335,9 +335,12 @@ defmodule Cairn.PipelineOwner do
   # branch is the per-frame path.
   defp detect_opts(%{camera: %{plugin: nil}}), do: nil
 
-  # No `sample_fps`: the branch does not thin, and the engine takes the rate
-  # from the profile every membrane camera on this node has to agree on
-  # (`Cairn.Config.native_model_config/1`).
+  # `sample_fps:` is told to the branch, not asked of it: the engine takes the
+  # rate from the profile every membrane camera on this node has to agree on
+  # (`Cairn.Config.native_model_config/1`) and the decoder sheds to it, so what
+  # this carries is a reading, for the two elements whose arithmetic counts
+  # frames — the motion gate's calibration window and a frame-counting tracker
+  # core's lost-track buffer.
   #
   # `tracker:` is resolved here rather than carried in the policy because it
   # wires an element rather than feeding one: a reload cannot swap a core under
@@ -347,6 +350,7 @@ defmodule Cairn.PipelineOwner do
     [
       policy: Config.policy(state.config, state.camera),
       tracker: Config.tracker(state.config, state.camera),
+      sample_fps: Config.sample_fps(state.config, state.camera),
       stream_params: %{min_score: state.camera.min_score}
     ]
   end

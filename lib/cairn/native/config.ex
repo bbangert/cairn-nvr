@@ -94,6 +94,10 @@ defmodule Cairn.Native.Config do
   def normalize(other),
     do: {:error, "config must be a map or keyword list, got #{inspect(other)}"}
 
+  @doc "The rate a config that names none samples at — the crate's own clap value."
+  @spec default_sample_fps() :: pos_integer()
+  def default_sample_fps, do: @model_defaults.sample_fps
+
   @doc "One stream's scene config, in the shape `Cairn.Native.open_stream/3` decodes."
   @spec stream_params(map() | keyword()) :: {:ok, t()} | {:error, String.t()}
   def stream_params(params) when is_map(params) or is_list(params) do

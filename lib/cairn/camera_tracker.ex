@@ -107,8 +107,11 @@ defmodule Cairn.CameraTracker do
   the batches do, so it can arrive while the old session's last batches are
   still crossing the branch, and this is where they are recognised as stale and
   dropped. `:camera_stopped` is the one announcement that also ends tracks
-  here: the pipeline that held them is going away and cannot emit their finals,
-  so they are ended from the last summaries this process saw.
+  here: the pipeline that held them is going away, and what it emits on its way
+  out is not something to wait on — a killed one emits nothing at all — so they
+  are ended from the last summaries this process saw. A flushed one *does* emit
+  them, afterwards, and `stale?/2` recognises that drain by the epoch the stop
+  latched rather than ending everything twice.
 
   The active event is checkpointed to `Cairn.EventCheckpoint` (ETS owned
   elsewhere, so it survives this process) together with the snapshot the batch
@@ -283,6 +286,10 @@ defmodule Cairn.CameraTracker do
       extractor: nil,
       track_updates: %{},
       current_epoch: seed_epoch(camera_id),
+      # The epoch that was current when this camera was stopped, held until the
+      # next one is adopted: what a dying pipeline still drains is tagged with
+      # it, and `apply_epoch/3` has already ended those tracks. See `stale?/2`.
+      stopped_epoch: nil,
       # why the current epoch was minted, for the boundary's own report. It
       # comes from the announcement and the counts come from the batch that
       # crossed the boundary, and the announcement is a direct PubSub send
@@ -368,13 +375,29 @@ defmodule Cairn.CameraTracker do
   #
   # A batch with no epoch (replay tooling that sets none) is accepted, as is
   # one for a camera whose epoch is not known here yet: that first batch's
-  # epoch is adopted in `process_batch/4`.
+  # epoch is adopted in `process_batch/4`. The one epoch judged against no
+  # current one is the stopped camera's, below.
   defp stale?(_state, %{epoch: nil}), do: false
+
+  # The stopped camera's drain, and the other half of `apply_epoch/3`'s
+  # `:camera_stopped` clause: the stop is announced *before* the pipeline is
+  # flushed, so the EOS that follows reaches the tracker element and its
+  # `end_all` emits a second final for every track the announcement already
+  # ended — arriving here tagged with the epoch the dying session ran under.
+  # Clearing `current_epoch` is what would let them in (a nil epoch judges
+  # nothing stale), so the latch is what keeps them out.
+  #
+  # A batch under a genuinely new epoch is not this: the stream came back, and
+  # adopting its epoch in `process_batch/4` releases the latch.
+  defp stale?(%{stopped_epoch: epoch} = state, %{epoch: epoch}),
+    do: drop(state, epoch, "the stopped camera's drain")
 
   defp stale?(%{current_epoch: nil}, _batch), do: false
   defp stale?(%{current_epoch: epoch}, %{epoch: epoch}), do: false
 
-  defp stale?(state, %{epoch: epoch}) do
+  defp stale?(state, %{epoch: epoch}), do: drop(state, epoch, "a stale epoch")
+
+  defp drop(state, epoch, why) do
     # Rare by construction, so it is counted rather than logged per line: a
     # boundary drains at most a burst of old-epoch frames, so a steady rate
     # here means something upstream is mis-tagging.
@@ -386,7 +409,7 @@ defmodule Cairn.CameraTracker do
       camera_id: state.camera_id
     })
 
-    Logger.debug("camera #{state.camera_id}: dropped batch from stale epoch #{epoch}")
+    Logger.debug("camera #{state.camera_id}: dropped batch from #{why} (#{epoch})")
     true
   end
 
@@ -395,6 +418,10 @@ defmodule Cairn.CameraTracker do
       %{
         state
         | current_epoch: state.current_epoch || batch.epoch,
+          # This batch is not the drain of whatever was stopped — `stale?/2`
+          # dropped that — so the camera is streaming again and the latch has
+          # nothing left to recognise.
+          stopped_epoch: nil,
           # Cached for the track rows, and set before the events of this batch
           # are published so a track ending in it is gated on this batch's
           # policy. The ended-track paths that need them — `apply_epoch/3` and
@@ -632,12 +659,28 @@ defmodule Cairn.CameraTracker do
   # judged against, and holding the dead one would drop the first batch of a
   # stream that came back before its mint was announced. The next mint seeds it
   # again.
+  #
+  # What it is moved to rather than dropped is the other half of that: the
+  # tracks ended here are ended again by the pipeline being torn down behind
+  # this announcement (`Cairn.PipelineOwner` broadcasts, then flushes; the EOS
+  # reaches `Membrane.MOTTracker` and its `end_all` finals arrive as an
+  # ordinary batch), and with `current_epoch` nil there is nothing left to
+  # recognise them by. `stale?/2` reads the latch; a fresh epoch releases it.
+  # The old value survives a repeated announcement, which would otherwise
+  # overwrite the latch with the `current_epoch` the first one emptied.
   defp apply_epoch(state, _epoch, :camera_stopped) do
     ended =
       for {_id, %{track: %Track{} = track}} <- state.track_updates,
           do: {:ended, %{track | end_reason: :stream_reset}}
 
-    publish_tracks(%{state | current_epoch: nil, gap_from: nil}, ended)
+    state = %{
+      state
+      | current_epoch: nil,
+        stopped_epoch: state.current_epoch || state.stopped_epoch,
+        gap_from: nil
+    }
+
+    publish_tracks(state, ended)
   end
 
   # One mint can be announced twice by design: `Cairn.StreamEpochs` broadcasts
@@ -649,7 +692,7 @@ defmodule Cairn.CameraTracker do
   defp apply_epoch(%{current_epoch: epoch} = state, epoch, _reason), do: state
 
   defp apply_epoch(state, epoch, reason),
-    do: %{state | current_epoch: epoch, epoch_reason: reason}
+    do: %{state | current_epoch: epoch, epoch_reason: reason, stopped_epoch: nil}
 
   # -- link health ------------------------------------------------------------
 

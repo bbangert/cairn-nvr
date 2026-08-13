@@ -45,6 +45,10 @@ defmodule Membrane.MOTTracker.SparseTrack do
   them is a no-op there — `track/3` settles lapsed suspensions on its way in
   and finds none — which is what keeps the gate meaningful.
 
+  `:max_live` is this port's own on the same terms, and inside `track/3`: the
+  reference has no ceiling on how many identities a frame may leave behind, so
+  the option defaults to `:infinity` and a parity run trims nothing.
+
   ## Faithfulness notes
 
   Two of the reference's behaviours look like defects and are ported anyway,
@@ -117,7 +121,8 @@ defmodule Membrane.MOTTracker.SparseTrack do
             depth_levels_low: @depth_levels_low,
             max_time_lost: @track_buffer,
             mot20: false,
-            adoption_iou: @adoption_iou
+            adoption_iou: @adoption_iou,
+            max_live: :infinity
 
   @doc """
   A tracker configured by the reference's own knobs, at its published MOT17
@@ -150,6 +155,11 @@ defmodule Membrane.MOTTracker.SparseTrack do
       overlap a suspended identity to take it back. This port's, not the
       reference's (see the moduledoc). How long it stays adoptable is not an
       option beside it: see `adoption_window_ms/0`.
+    * `:max_live` (`:infinity`) — a ceiling on the identities one frame may
+      leave behind, tracked and lost together (see `track/3`). The reference
+      has none, and neither does a run at this default, which is what keeps
+      the parity gate judging the reference's own arithmetic; a host that
+      caps its trackers passes its own cap.
   """
   @impl true
   @spec new(keyword()) :: t()
@@ -169,7 +179,8 @@ defmodule Membrane.MOTTracker.SparseTrack do
       depth_levels_low: Keyword.get(opts, :depth_levels_low, @depth_levels_low),
       max_time_lost: trunc(frame_rate / 30.0 * track_buffer),
       mot20: Keyword.get(opts, :mot20, false),
-      adoption_iou: Keyword.get(opts, :adoption_iou, @adoption_iou)
+      adoption_iou: Keyword.get(opts, :adoption_iou, @adoption_iou),
+      max_live: Keyword.get(opts, :max_live, :infinity)
     }
   end
 
@@ -192,6 +203,11 @@ defmodule Membrane.MOTTracker.SparseTrack do
   arrives after a window closed is what closes it, rather than a stream that
   keeps flapping restarting the element's sweep timer and postponing the final
   indefinitely.
+
+  What the frame leaves behind is trimmed to `:max_live` last of all, and the
+  evictions' finals trail the events: a frame that mints more identities than
+  the host allows has still tracked them, and the trim is what the host is owed
+  afterwards rather than something the association was told about.
   """
   @impl true
   @spec track(t(), [map()], Membrane.MOTTracker.Core.context()) :: {t(), [map()], [tuple()]}
@@ -286,7 +302,43 @@ defmodule Membrane.MOTTracker.SparseTrack do
         at_ms: at_ms
     }
 
-    {state, Enum.map(output, &summary(&1, at_ms)), lapsed ++ events}
+    {state, evicted} = trim_live(state)
+
+    {state, Enum.map(output, &summary(&1, at_ms)), lapsed ++ events ++ evicted}
+  end
+
+  # The live cap. `lost` counts against it beside `tracked`: a lost track is
+  # still an identity this core may re-emerge, and one frame's detections times
+  # the lost buffer is exactly the growth the cap exists to bound.
+  #
+  # Least recently seen first, ties by id — the host tracker's own eviction
+  # order (`{last_seen_ms, id}`), on the frame counter that is this core's
+  # clock. What this frame matched has the highest `frame_id` there is, so a
+  # cap wide enough for the scene never touches it.
+  defp trim_live(%__MODULE__{max_live: :infinity} = state), do: {state, []}
+
+  defp trim_live(state) do
+    live = state.tracked ++ state.lost
+    surplus = length(live) - state.max_live
+
+    if surplus <= 0 do
+      {state, []}
+    else
+      {evicted, _kept} = live |> Enum.sort_by(&{&1.frame_id, &1.id}) |> Enum.split(surplus)
+      ids = MapSet.new(evicted, & &1.id)
+
+      state = %{
+        state
+        | tracked: Enum.reject(state.tracked, &(&1.id in ids)),
+          lost: Enum.reject(state.lost, &(&1.id in ids)),
+          # Removed for good, as everything this core drops is: an evicted
+          # identity that walked back into the lost list would be a track the
+          # cap did not remove.
+          removed_ids: MapSet.union(state.removed_ids, ids)
+      }
+
+      {state, for(track <- evicted, track.seen?, do: ended(track, :evicted, state.at_ms))}
+    end
   end
 
   # What this frame published is what the next one reasons from: `seen?` is

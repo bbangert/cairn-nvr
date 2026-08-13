@@ -13,6 +13,8 @@ defmodule Membrane.MOTTracker.SparseTrackTest do
 
   defp ids(tagged), do: Enum.map(tagged, & &1.object_id)
 
+  defp ended(events), do: Enum.filter(events, &match?({:ended, _}, &1))
+
   describe "the depth cascade" do
     # Three tracks share a bottom edge, so they are one sublevel however many
     # are asked for. Their detections do not: the heights differ enough to
@@ -145,6 +147,67 @@ defmodule Membrane.MOTTracker.SparseTrackTest do
 
     assert ids(tagged) == [1, 2, 3]
     assert tagged == replayed
+  end
+
+  describe "the live cap (parity-exempt)" do
+    test "no cap is the default, and it is what a parity run gets" do
+      objects = for x <- 0..9, do: object([x * 150, 100, 100, 200])
+      {state, tagged, events} = step(SparseTrack.new([]), objects)
+
+      assert length(tagged) == 10
+      assert ended(events) == []
+      assert length(SparseTrack.checkpoint_tracks(state)) == 10
+    end
+
+    test "a lost track counts against the cap, and the least recent goes first" do
+      near = object([0, 100, 100, 200])
+      far = object([600, 100, 100, 200])
+
+      # Two identities, then only the far one for a frame: the near one is lost
+      # but still adoptable, so it is what the cap is measured against.
+      {state, _tagged, _events} = step(SparseTrack.new(max_live: 2), [near, far], 0)
+      {state, tagged, events} = step(state, [far], 1)
+      assert ids(tagged) == [2]
+      assert ended(events) == []
+
+      # A third identity takes the frame to three, and the lost one is the
+      # least recently seen of them.
+      {state, _tagged, events} = step(state, [far, object([1200, 100, 100, 200])], 2)
+
+      assert [{:ended, %{object_id: 1, reason: :evicted, at_ms: 2}}] = ended(events)
+      assert Enum.map(SparseTrack.checkpoint_tracks(state), & &1.object_id) == [2]
+
+      # Removed for good: the near box returns to an empty seat and mints a new
+      # identity rather than resuming the evicted one.
+      {state, _tagged, _events} = step(state, [near, far], 3)
+      {_state, tagged, _events} = step(state, [near, far], 4)
+      assert ids(tagged) == [2, 4]
+    end
+
+    test "ties are broken by id, not by iteration order" do
+      objects = [object([0, 100, 100, 200]), object([600, 100, 100, 200])]
+
+      # Both were seen on the same frame, so the frame counter cannot separate
+      # them and the smaller id is the one that goes.
+      {state, _tagged, events} = step(SparseTrack.new(max_live: 1), objects, 0)
+
+      assert [{:ended, %{object_id: 1, reason: :evicted}}] = ended(events)
+      assert Enum.map(SparseTrack.checkpoint_tracks(state), & &1.object_id) == [2]
+    end
+
+    test "an identity nothing was told about is evicted without a final" do
+      far = object([600, 100, 100, 200])
+      {state, _tagged, _events} = step(SparseTrack.new(max_live: 1), [far], 0)
+
+      # Two mints on one frame, neither confirmed by a second sighting yet, and
+      # a cap of one: the survivor is the newest, and the two evictions that
+      # owe a final are exactly the one identity that had been published.
+      {state, _tagged, events} =
+        step(state, [far, object([1200, 100, 100, 200]), object([1500, 100, 100, 200])], 1)
+
+      assert [{:ended, %{object_id: 1, reason: :evicted}}] = ended(events)
+      assert SparseTrack.checkpoint_tracks(state) == []
+    end
   end
 
   describe "suspension (parity-exempt)" do

@@ -274,10 +274,24 @@ defmodule Cairn.Pipeline.CameraTest do
     end
 
     test "the tracker element hosts the core the owner resolved, capped by the policy" do
-      spec = spec(detect: detect(tracker: Cairn.Detect.SparseTrack))
+      spec = spec(detect: detect())
 
-      assert %Membrane.MOTTracker{tracker: {Cairn.Detect.SparseTrack, []}, max_suspended: 128} =
+      assert %Membrane.MOTTracker{tracker: {Cairn.Tracker, []}, max_suspended: 128} =
                child(spec, :tracker)
+    end
+
+    test "a frame-counting core is told the rate and the cap it cannot read per batch" do
+      # `Cairn.Tracker` takes neither — it is milliseconds-native and reads the
+      # cap off every batch's context — while SparseTrack sizes its lost-track
+      # buffer as `frame_rate / 30 * track_buffer`, so a branch sampling at 5
+      # fps that said nothing would hold lost tracks six times as long.
+      spec = spec(detect: detect(tracker: Cairn.Detect.SparseTrack, sample_fps: 5))
+
+      assert %Membrane.MOTTracker{tracker: {Cairn.Detect.SparseTrack, opts}} =
+               child(spec, :tracker)
+
+      assert opts[:frame_rate] == 5
+      assert opts[:max_live] == @policy.max_live_tracks
     end
 
     test "the picker takes no options — the decoder's gate owns the rate" do
@@ -445,13 +459,17 @@ defmodule Cairn.Pipeline.CameraTest do
       assert opts[:initial_reason] == :started
     end
 
-    test "the camera's wire floor, and no rate: the engine's profile carries that" do
+    test "the camera's wire floor, and the profile's rate as a reading" do
       camera = %{camera("cam_group", {:group, "g"}) | min_score: %{"person" => 0.6}}
       start_owner(camera, config(camera))
 
       assert_receive {:pipeline_opts, opts}, 5_000
-      refute Keyword.has_key?(opts[:detect], :sample_fps)
       assert opts[:detect][:stream_params] == %{min_score: %{"person" => 0.6}}
+
+      # Not a rate the branch enforces — the decode NIF sheds to it from what
+      # the engine's profile said — but the number the elements counting frames
+      # have to agree with it on.
+      assert opts[:detect][:sample_fps] == 3
     end
 
     test "the camera and the policy the dispatch seam attaches" do

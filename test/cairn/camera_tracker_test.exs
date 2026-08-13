@@ -765,13 +765,69 @@ defmodule Cairn.CameraTrackerTest do
     # adopting it would make `stale?/2` drop every observation still in flight.
     assert :sys.get_state(tracker).current_epoch == nil
 
-    # ...and observations tagged with the epoch that is actually being decoded
-    # are still accepted, which they would not be had the stop epoch been
-    # adopted: nothing would then match until an ffmpeg respawn that a healthy
-    # camera never has. That batch re-seeds `current_epoch` with it.
-    observe(tracker, camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], epoch: epoch)
+    # ...and a stream that came back is still accepted, which it would not be
+    # had the stop epoch been adopted: nothing would then match until an ffmpeg
+    # respawn that a healthy camera never has. That batch re-seeds
+    # `current_epoch`, whether or not its mint has been announced yet.
+    fresh = Cairn.ULID.generate()
+    observe(tracker, camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], epoch: fresh)
     assert_receive {:event_updated, %Event{camera_id: ^id}}
-    assert :sys.get_state(tracker).current_epoch == epoch
+    assert :sys.get_state(tracker).current_epoch == fresh
+  end
+
+  # `Cairn.PipelineOwner` broadcasts the stop and *then* flushes the pipeline,
+  # so the EOS reaching `Membrane.MOTTracker` makes it end everything a second
+  # time — on a buffer tagged with the epoch the dying session ran under, which
+  # the cleared `current_epoch` would otherwise wave through.
+  test "the stopped pipeline's drain does not end the same tracks twice", %{
+    tracker: tracker,
+    camera: camera,
+    camera_id: id
+  } do
+    test_pid = self()
+    handler = "stopped-drain-#{id}"
+
+    :telemetry.attach(
+      handler,
+      [:cairn, :aggregator, :stale_observation],
+      fn event, measurements, meta, _ ->
+        send(test_pid, {:telemetry, event, measurements, meta})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    epoch = StreamEpochs.new_epoch(id, :started)
+    _ = :sys.get_state(tracker)
+
+    detect(tracker, camera, 0.9, @box, epoch: epoch)
+    assert_receive {:track_started, %Track{object_id: oid}}
+
+    StreamEpochs.new_epoch(id, :camera_stopped)
+    _ = :sys.get_state(tracker)
+    assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :stream_reset}}
+
+    # The flush, in the element's own terms: end of stream ends what the core
+    # still holds, under `:stream_reset`, and the sink casts those finals here.
+    TrackerDriver.end_all(tracker, camera, @policy, :stream_reset)
+    _ = :sys.get_state(tracker)
+
+    refute_received {:track_ended, %Track{object_id: ^oid}}
+
+    assert_received {:telemetry, [:cairn, :aggregator, :stale_observation], %{count: 1},
+                     %{camera_id: ^id}}
+
+    # The latch is the stopped stream's alone: a stream that came back is
+    # tracked, and adopting its epoch releases it.
+    fresh = Cairn.ULID.generate()
+    detect(tracker, camera, 0.9, @far_box, epoch: fresh)
+    assert_receive {:track_started, %Track{object_id: second}}
+    refute second == oid
+
+    state = :sys.get_state(tracker)
+    assert state.current_epoch == fresh
+    assert state.stopped_epoch == nil
   end
 
   test "disabling detection ends the live tracks, once", %{

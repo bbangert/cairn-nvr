@@ -23,6 +23,19 @@ defmodule Cairn.Detect.SparseTrack do
   keeps every camera — whatever its sensor resolution — behaving like the
   reference the tree is parity-gated against.
 
+  ## The evidence floor
+
+  The batch's context carries the camera's **effective** `min_score`
+  (`Cairn.Pipeline.ObservationStamper` resolves the runtime override into it),
+  and objects below their label's floor are dropped here rather than passed on.
+  That is not what `Cairn.Tracker` does with the same number — it puts them in
+  ByteTrack's second association stage, where they may extend a track but not
+  mint one — and it is not what the inner core does either, which partitions on
+  thresholds of its own. It is what an operator raising the floor at runtime
+  asked for: stop reacting to detections below it. The trade is the stage-two
+  rescue through an occlusion, given up for one number meaning one thing across
+  both cores.
+
   ## What SparseTrack does not have
 
   No stationary notion, and no track that was not matched to a real
@@ -58,12 +71,21 @@ defmodule Cairn.Detect.SparseTrack do
 
   defstruct [:inner, :width, :height, :last_observed_at, book: %{}]
 
+  # The core's own `:max_live` default is no cap at all — the reference has
+  # none — and a cairn camera has had one since long before this core was
+  # selectable (`Cairn.Tracker` enforces it internally, from the same config
+  # key). So the host's default stands in for a caller that names none rather
+  # than the tree's, and `Cairn.Pipeline.Camera` passes the camera's own.
   @impl true
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
     width = Keyword.get(opts, :width, @default_width)
     height = Keyword.get(opts, :height, @default_height)
-    inner_opts = Keyword.drop(opts, [:width, :height])
+
+    inner_opts =
+      opts
+      |> Keyword.drop([:width, :height])
+      |> Keyword.put_new(:max_live, Cairn.Config.default_max_live_tracks())
 
     %__MODULE__{inner: SparseTrack.new(inner_opts), width: width, height: height}
   end
@@ -76,7 +98,11 @@ defmodule Cairn.Detect.SparseTrack do
   @spec track(t(), [map()], Membrane.MOTTracker.Core.context()) ::
           {t(), [map()], [{atom(), Cairn.Track.t()}]}
   def track(%__MODULE__{} = state, objects, context) do
-    scaled = Enum.map(objects, &scale_in(&1, state))
+    scaled =
+      objects
+      |> admissible(Map.get(context, :min_score))
+      |> Enum.map(&scale_in(&1, state))
+
     {inner, tagged, events} = SparseTrack.track(state.inner, scaled, context)
 
     book = Enum.reduce(tagged, state.book, &observe(&2, &1, context))
@@ -137,6 +163,23 @@ defmodule Cairn.Detect.SparseTrack do
   @impl true
   @spec adoption_window_ms() :: pos_integer()
   def adoption_window_ms, do: SparseTrack.adoption_window_ms()
+
+  # -- the evidence floor -----------------------------------------------------
+
+  # A context with no floor is every caller that builds one by hand, and leaves
+  # the batch exactly as the core would have seen it. `Map.get/2` and not a
+  # pattern match, for the reason `Cairn.Tracker.partition/2` gives: `context`
+  # is a plain map a caller may build without the key.
+  defp admissible(objects, nil), do: objects
+
+  defp admissible(objects, floors) do
+    Enum.filter(objects, &(&1.score >= floor_for(floors, Map.get(&1, :label))))
+  end
+
+  # `Cairn.Tracker`'s resolution, to the fallback: the label's own floor, else
+  # the map's `"default"`, else 0.5. Two readings of one number that have to
+  # agree, so they are written the same way.
+  defp floor_for(floors, label), do: Map.get(floors, label) || Map.get(floors, "default", 0.5)
 
   # -- units --------------------------------------------------------------
 

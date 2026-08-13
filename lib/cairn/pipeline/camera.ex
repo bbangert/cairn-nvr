@@ -59,6 +59,7 @@ defmodule Cairn.Pipeline.Camera do
 
   require Membrane.Logger
 
+  alias Cairn.Detect.SparseTrack
   alias Cairn.Motion
 
   alias Cairn.Pipeline.{
@@ -305,15 +306,41 @@ defmodule Cairn.Pipeline.Camera do
       })
       |> child(:stamper, %ObservationStamper{camera: camera, policy: policy})
       |> child(:tracker, %Membrane.MOTTracker{
-        tracker: {Keyword.fetch!(detect, :tracker), []},
+        tracker: tracker_core(detect, policy),
         # A camera cannot suspend more tracks than it was allowed to hold. Read
-        # at birth and not per batch, unlike the live cap in the context: this
-        # is an element option, so a reload that raises `max_live_tracks` does
-        # not raise this one until the camera's next pipeline.
+        # at birth: this is an element option, so a reload that raises
+        # `max_live_tracks` does not raise this one until the camera's next
+        # pipeline — as it does not raise a core's own live cap where that is
+        # a construction option too (`tracker_core/2`), and does raise the one
+        # `Cairn.Tracker` reads off every batch's context.
         max_suspended: policy.max_live_tracks
       })
       |> child(:track_sink, %TrackSink{camera: camera, policy: policy})
     ]
+  end
+
+  # The one place a core name resolved by `Cairn.Config.tracker/2` becomes the
+  # `{module, opts}` the element is built with.
+  #
+  # `Cairn.Tracker` takes none: it is milliseconds-native and reads its bounds,
+  # the live cap included, off every batch's context. `Cairn.Detect.SparseTrack`
+  # reads no bound off it. It counts frames — its lost-track buffer is
+  # `frame_rate / 30 * track_buffer` — so a branch delivering `sample_fps`
+  # frames a second has to say so, or lost tracks stay adoptable for the ratio
+  # of the two; and its live cap is a construction option, so the camera's own
+  # is passed here rather than found on a batch.
+  defp tracker_core(detect, policy) do
+    case Keyword.fetch!(detect, :tracker) do
+      SparseTrack ->
+        {SparseTrack,
+         [
+           frame_rate: Keyword.fetch!(detect, :sample_fps),
+           max_live: policy.max_live_tracks
+         ]}
+
+      module ->
+        {module, []}
+    end
   end
 
   # The Nx measurement (D-C3): a configured gate becomes an element between

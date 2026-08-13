@@ -125,6 +125,92 @@ defmodule Cairn.Detect.SparseTrackTest do
     assert [{:updated, %Track{epoch: 9, started_at: 100}}, {:adopted, %Track{epoch: 9}}] = events
   end
 
+  describe "the live cap" do
+    test "the host's cap stands in for a caller that names none" do
+      cap = Cairn.Config.default_max_live_tracks()
+
+      # One box over the cap, all minted on one frame: the tree's own default
+      # is no cap at all, so anything but the host's leaves every one of them.
+      objects = for i <- 0..cap, do: object([i / 4000, 0.1, 0.01, 0.02])
+      {state, _tagged, events} = SparseTrack.track(SparseTrack.new(), objects, context(0))
+
+      assert [{:ended, %Track{object_id: 1, end_reason: :evicted}}] =
+               Enum.filter(events, &match?({:ended, _}, &1))
+
+      assert length(SparseTrack.checkpoint_tracks(state)) == cap
+    end
+
+    test "a cap the caller names is the one that applies" do
+      state = SparseTrack.new(max_live: 1)
+      objects = [object([0.1, 0.1, 0.05, 0.1]), object([0.5, 0.1, 0.05, 0.1])]
+
+      {state, _tagged, events} = SparseTrack.track(state, objects, context(0, 100))
+
+      assert [{:ended, %Track{object_id: 1, end_reason: :evicted, camera_id: "cam-1"}}] =
+               Enum.filter(events, &match?({:ended, _}, &1))
+
+      assert [%Track{object_id: 2}] = SparseTrack.checkpoint_tracks(state)
+    end
+  end
+
+  describe "the runtime evidence floor" do
+    # What `Cairn.Pipeline.ObservationStamper` resolves into the context, with
+    # the runtime override already folded in.
+    defp floored(at_ms, floors), do: Map.put(context(at_ms), :min_score, floors)
+
+    test "a raised floor stops a below-floor detection minting" do
+      {_state, tagged, events} =
+        SparseTrack.track(
+          SparseTrack.new(),
+          [object([0.1, 0.1, 0.05, 0.1], 0.7)],
+          floored(0, %{"default" => 0.8})
+        )
+
+      assert tagged == []
+      assert events == []
+    end
+
+    test "a raised floor stops a below-floor detection updating a live track" do
+      box = [0.1, 0.1, 0.05, 0.1]
+      state = SparseTrack.new()
+
+      {state, _tagged, _events} = SparseTrack.track(state, [object(box, 0.9)], floored(0, nil))
+
+      # Below the raised floor: the cairn core would have offered it to
+      # ByteTrack's second stage, which is exactly what a raised floor says not
+      # to do.
+      {_state, tagged, events} =
+        SparseTrack.track(state, [object(box, 0.7)], floored(1, %{"default" => 0.8}))
+
+      assert tagged == []
+      assert events == []
+    end
+
+    test "the floor is per label, and the same one Cairn.Tracker reads" do
+      floors = %{"default" => 0.8, "car" => 0.2}
+      car = %{bbox: [0.5, 0.1, 0.05, 0.1], score: 0.7, label: "car"}
+
+      {_state, tagged, _events} =
+        SparseTrack.track(
+          SparseTrack.new(),
+          [object([0.1, 0.1, 0.05, 0.1], 0.7), car],
+          floored(0, floors)
+        )
+
+      assert [%{label: "car"}] = tagged
+    end
+
+    test "no floor in the context leaves the batch as the core would have seen it" do
+      objects = [object([0.1, 0.1, 0.05, 0.1], 0.7)]
+
+      {_state, floorless, _events} = SparseTrack.track(SparseTrack.new(), objects, context(0))
+      {_state, unset, _events} = SparseTrack.track(SparseTrack.new(), objects, floored(0, nil))
+
+      assert [%{object_id: 1}] = floorless
+      assert floorless == unset
+    end
+  end
+
   test "checkpoint_tracks returns Cairn.Track structs" do
     {state, _tagged, _events} =
       SparseTrack.track(SparseTrack.new(), [object([0.1, 0.1, 0.05, 0.1])], context(0))
