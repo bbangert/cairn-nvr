@@ -266,19 +266,29 @@ mod tests {
         );
         let written = written.lock().unwrap();
         assert!(written.len() < OFFERED, "{written:?}");
-        let notice = written
+        // The worker flushes its drop counter whenever it next gets a line
+        // out, which under an unlucky interleaving is more than once — the
+        // invariant is over the SUM of the notices, not their count.
+        let (notices, lines): (Vec<_>, Vec<_>) = written
             .iter()
-            .find(|line| line.starts_with("log: dropped "))
-            .unwrap_or_else(|| panic!("no dropped-line count reached the sink: {written:?}"));
-        let lost: usize = notice
-            .trim_start_matches("log: dropped ")
-            .trim_end_matches(" diagnostic lines")
-            .parse()
-            .unwrap_or_else(|e| panic!("{notice:?}: {e}"));
+            .partition(|line| line.starts_with("log: dropped "));
+        assert!(
+            !notices.is_empty(),
+            "no dropped-line count reached the sink: {written:?}"
+        );
+        let lost: usize = notices
+            .iter()
+            .map(|notice| {
+                notice
+                    .trim_start_matches("log: dropped ")
+                    .trim_end_matches(" diagnostic lines")
+                    .parse::<usize>()
+                    .unwrap_or_else(|e| panic!("{notice:?}: {e}"))
+            })
+            .sum();
         // Every offered line is either written or counted, once.
-        let lines = written.len() - 1;
-        assert_eq!(lines + lost, OFFERED, "{written:?}");
-        assert!(lines >= bound, "{written:?}");
+        assert_eq!(lines.len() + lost, OFFERED, "{written:?}");
+        assert!(lines.len() >= bound, "{written:?}");
     }
 
     /// An exit behind a wedged writer gives up on the tail rather than hanging:
