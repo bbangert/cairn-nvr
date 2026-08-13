@@ -156,12 +156,16 @@ rc=$?
 HARNESS_PID=""
 
 # Checksum every artifact the ladder script pulls back — its own df-checked
-# fetch step re-verifies these against the copy that lands locally.
+# fetch step re-verifies these against the copy that lands locally. Relative
+# names, hashed from inside the run dir: an absolute board path in the
+# manifest would make the local `sha256sum -c` follow the board's path
+# instead of the pulled file. The cksum fallback is prefixed so the local
+# verifier knows it is not a sha256 manifest.
 for f in out.log proc.samples meta; do
-  sha256sum "$RUN/$f" > "$RUN/$f.sha256" 2>/dev/null ||
+  (cd "$RUN" && sha256sum "$f" > "$f.sha256") 2>/dev/null ||
     {
-      sum=$(cksum "$RUN/$f" 2>/dev/null) || sum="unavailable"
-      echo "$sum  $RUN/$f" > "$RUN/$f.sha256"
+      sum=$(cd "$RUN" && cksum "$f" 2>/dev/null | cut -d' ' -f1-2) || sum="unavailable"
+      echo "cksum:$sum  $f" > "$RUN/$f.sha256"
     }
 done
 

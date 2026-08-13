@@ -360,8 +360,17 @@ for rung in "${RUNGS[@]}"; do
         scp -r "$BOARD:$run_dir/." "$local_cell_dir/"
         for f in out.log proc.samples meta; do
           if [ -f "$local_cell_dir/$f.sha256" ] && [ -f "$local_cell_dir/$f" ]; then
-            (cd "$local_cell_dir" && sha256sum -c "$f.sha256" >/dev/null 2>&1) ||
-              say "WARNING: checksum mismatch after pull for $local_cell_dir/$f — re-fetch before trusting these numbers"
+            # The manifest is relative-name sha256, or the board's prefixed
+            # cksum fallback — verify with whichever produced it.
+            if grep -q '^cksum:' "$local_cell_dir/$f.sha256"; then
+              want=$(sed 's/^cksum:\([0-9]* [0-9]*\).*/\1/' "$local_cell_dir/$f.sha256")
+              got=$(cd "$local_cell_dir" && cksum "$f" 2>/dev/null | cut -d' ' -f1-2)
+              [ "$want" = "$got" ] ||
+                say "WARNING: checksum mismatch after pull for $local_cell_dir/$f — re-fetch before trusting these numbers"
+            else
+              (cd "$local_cell_dir" && sha256sum -c "$f.sha256" >/dev/null 2>&1) ||
+                say "WARNING: checksum mismatch after pull for $local_cell_dir/$f — re-fetch before trusting these numbers"
+            fi
           fi
         done
         metrics=$(parse_cell_metrics "$local_cell_dir")
