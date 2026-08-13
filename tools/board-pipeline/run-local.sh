@@ -50,8 +50,6 @@ elixirc "${PA[@]}" -o "$OUT" \
   "$ROOT/lib/cairn/pipeline/picker.ex" \
   "$ROOT/lib/cairn/pipeline/decoder.ex" \
   "$ROOT/lib/cairn/pipeline/inference.ex" \
-  "$ROOT/lib/cairn/detect/dispatch.ex" \
-  "$ROOT/lib/cairn/pipeline/detect_sink.ex" \
   "$ROOT/tools/board-pipeline/board_pipeline.ex"
 
 BOARD_PIPELINE_MODEL="${BOARD_PIPELINE_MODEL:-$ROOT/plugins/cairn-detect/yolox_nano.onnx}" \

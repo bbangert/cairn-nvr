@@ -166,12 +166,29 @@ defmodule Cairn.Config.Server do
   # would leave the ring at its old capacity while everything else believed
   # the new one.
   #
-  # The rest of the effective policy — `post`/`max`, the tracking bounds, the
-  # `track:` / `record:` tiers — is host-side and refreshes in place through
+  # The tracker core, the sample rate and the live-track cap are compared
+  # resolved for the same reason and with the same reach: each is baked into a
+  # child of the detect branch at build time, which a running pipeline cannot
+  # re-wire, and each can be named above the camera — the core at any of three
+  # levels, the rate on the profile alone, the cap camera → profile → global —
+  # so comparing the camera's own field would miss the rest.
+  #
+  # `sample_fps` sizes the motion gate's calibration window and a frame-counting
+  # core's lost-track buffer; `max_live_tracks` is the element's `max_suspended`
+  # and `Membrane.MOTTracker.SparseTrack`'s `max_live`. It stays in the policy
+  # as well — `Cairn.Tracker` reads its live cap off every batch's context — so
+  # a camera on that core gets the new cap either way; this is for the two that
+  # only ever read it at birth.
+  #
+  # The rest of the effective policy — `post`/`max`, the other tracking bounds,
+  # the `track:` / `record:` tiers — is host-side and refreshes in place through
   # `Cairn.PipelineOwner.refresh/3`.
   defp camera_changed?(old, new, old_cam, new_cam) do
     Map.take(old_cam, @restart_fields) != Map.take(new_cam, @restart_fields) or
-      Config.windows(old, old_cam).pre != Config.windows(new, new_cam).pre
+      Config.windows(old, old_cam).pre != Config.windows(new, new_cam).pre or
+      Config.tracker(old, old_cam) != Config.tracker(new, new_cam) or
+      Config.sample_fps(old, old_cam) != Config.sample_fps(new, new_cam) or
+      Config.policy(old, old_cam).max_live_tracks != Config.policy(new, new_cam).max_live_tracks
   end
 
   # Everything else the running camera was handed: the camera struct itself

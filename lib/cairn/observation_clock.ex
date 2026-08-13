@@ -10,7 +10,7 @@ defmodule Cairn.ObservationClock do
   the host clock carries the *bound*.
 
   One of these per camera, held by what ingests that camera's detections —
-  `Cairn.Pipeline.DetectSink`, whose detect branch now outlives session
+  `Cairn.Pipeline.ObservationStamper`, whose detect branch now outlives session
   boundaries; the epoch-change re-anchor below is the designed path across
   them. `reset/1` is for a holder that replaces its producer while tracking
   time continues; nothing on the live path does that anymore, and it stays
@@ -68,7 +68,7 @@ defmodule Cairn.ObservationClock do
       `at_ms` for as long as it takes media time to climb back, which is
       minutes of creeping a millisecond a line.
     * **An epoch change** anchors at `now_ms`. Nothing observed that gap:
-      `Cairn.CameraTracker` suspends the live set at the cut, and the
+      `Membrane.MOTTracker` suspends the live set at the cut, and the
       suspension and adoption windows it then waits out are elapsed times on
       this clock, so a real outage has to age them. Continuity there would make
       a 30 s dropout read as one millisecond and hold every adoption window
@@ -81,10 +81,9 @@ defmodule Cairn.ObservationClock do
   across an epoch change, a plugin respawn and a port restart. A respawn carries `at_ms` over
   (`reset/1`), and a clock from `new/0` takes its first stamp at `now_ms` — at
   or past anything a clock that ran before it could have stamped, there being
-  no earlier stamp of its own to continue from. That is what lets a
-  `Cairn.CameraTracker` — which outlives every one of them — subtract two
-  `at_ms` from either side of a stream reset and get an elapsed time rather
-  than garbage.
+  no earlier stamp of its own to continue from. That is what lets a tracker
+  core — which outlives every one of them — subtract two `at_ms` from either
+  side of a stream reset and get an elapsed time rather than garbage.
   """
 
   alias Cairn.Observation

@@ -17,8 +17,8 @@ defmodule Cairn.Tracker.Stage.OruTest do
 
   use ExUnit.Case, async: true
 
-  alias Cairn.Tracker.Kalman
   alias Cairn.Tracker.Stage
+  alias Membrane.MOTTracker.Kalman
 
   @anchor [0.30, 0.30, 0.20, 0.40]
   # Centre displaced 0.10 in x from @anchor, same size: far past what any

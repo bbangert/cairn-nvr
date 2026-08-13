@@ -15,8 +15,8 @@ defmodule Cairn.GoldenReplay do
   `Cairn.PluginProtocol.decode_line/2` → `Cairn.ObservationClock.stamp/3`
   (with the *recorded* arrival `now_ms` — arrival timing shapes `at_ms` and is
   not in the lines) → `Cairn.Tracker.context/3` → `Cairn.Tracker.track/3`, one
-  batch per `frame.objects` line. Step scripts drive the three public entry
-  points a `Cairn.CameraTracker` calls — `track/3`, `suspend/3`,
+  batch per `frame.objects` line. Step scripts drive three of the core
+  callbacks `Membrane.MOTTracker` drives — `track/3`, `suspend/3`,
   `expire_suspended/2` — for the paths recorded clips never hit.
 
   ## Canonicalization
@@ -53,6 +53,11 @@ defmodule Cairn.GoldenReplay do
   tracker struct, kalman internals included, as a tripwire for divergence the
   observable stream missed. All object keys are emitted sorted, so the text
   is deterministic across OTP versions.
+
+  The hash tags every struct with its module name, so **renaming** a struct the
+  tracker holds moves it while every observable line stays byte-identical —
+  which is the one shape of golden diff a pure extraction can legitimately
+  have, and the only one where "hash line only" is the whole review.
   """
 
   alias Cairn.{Observation, ObservationClock, PluginProtocol, Track, Tracker}
@@ -137,8 +142,7 @@ defmodule Cairn.GoldenReplay do
   Runs a step script (`steps/<name>.exs`) and returns golden text.
 
   A script evaluates to `%{policy: policy, steps: [step]}` with the step
-  vocabulary matching the three public entry points a `Cairn.CameraTracker`
-  drives:
+  vocabulary matching the three core callbacks the tracker element drives:
 
       {:observe, %{at_ms: ms, objects: [object]}}     # Tracker.track/3
       {:suspend, %{cut_ms: ms}}                       # Tracker.suspend/3
@@ -419,7 +423,8 @@ defmodule Cairn.GoldenReplay do
           message:
             "golden diff for #{name} (#{first_divergence(golden, text)}).\n" <>
               "If this change is deliberate, run `mix cairn.golden.regen` and review the diff — " <>
-              "an extraction PR's golden diff must be empty."
+              "an extraction PR's golden diff must be empty, or (for a struct rename) " <>
+              "the state_hash line and nothing else."
       end
 
       :ok

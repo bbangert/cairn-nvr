@@ -3,12 +3,13 @@ defmodule Cairn.MembraneE2ETest do
   Plan task 3.6: the whole membrane stack on real video, in one VM.
 
       ffmpeg (MPEG-TS, one output) -> Cairn.Pipeline.Camera -> Picker
-        -> Inference -> Cairn.Native.Host.push_frame/5 (in-VM NIF) -> DetectSink
-        -> Observations -> Dispatch -> CameraTracker -> EventExtractor -> clip
+        -> Inference -> Cairn.Native.Host.push_frame/5 (in-VM NIF)
+        -> ObservationStamper -> Membrane.MOTTracker -> TrackSink
+        -> Dispatch -> CameraTracker -> EventExtractor -> clip
 
   Nothing here is stubbed: the real NIF, the real canary, the real ffmpeg, the
   real ring buffer and extractor. `Cairn.Native.Host` is the application's own
-  singleton because that is the name `Cairn.Pipeline.Camera` wires the sink to.
+  singleton because that is the name `Cairn.Pipeline.Camera` wires inference to.
 
   Excluded by default (`test/test_helper.exs`) — CI's Elixir job builds no Rust.
   Run it with:

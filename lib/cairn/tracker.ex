@@ -153,8 +153,8 @@ defmodule Cairn.Tracker do
   ## Matching against a prediction
 
   What a detection is compared with is not a track's stored box but
-  `Cairn.Tracker.Kalman`'s estimate of where that box would be by now. Every
-  live track carries a constant-velocity filter: seeded when the track is
+  `Membrane.MOTTracker.Kalman`'s estimate of where that box would be by now.
+  Every live track carries a constant-velocity filter: seeded when the track is
   minted, updated from every box the track actually took, stepped once for
   every batch that did not observe it, and asked for a further one-step
   prediction at match time. A track something detects on every batch predicts
@@ -165,9 +165,9 @@ defmodule Cairn.Tracker do
   have fallen under `@iou_threshold` and its identity would have been lost.
 
   The filter is internal: it is not in `Cairn.Track`, nothing downstream is
-  told about it, and — the cardinal rule in `Cairn.Tracker.Kalman`'s own doc —
-  a predicted box is never stored as `bbox`, never carried onto a summary and
-  never emitted. `bbox` is the last box the track was *observed* at, always,
+  told about it, and — the cardinal rule in `Membrane.MOTTracker.Kalman`'s own
+  doc — a predicted box is never stored as `bbox`, never carried onto a summary
+  and never emitted. `bbox` is the last box the track was *observed* at, always,
   which is what the two rules that read a stored box need: `adopt/4` stitches a
   new epoch's detection against where the object was actually last seen, and
   `duplicate_of/2` judges a leftover box's proximity to the same. An
@@ -438,10 +438,10 @@ defmodule Cairn.Tracker do
   A track is stationary once it has held still for the camera's
   `stationary_after_ms` on the observation clock. What "still" means is the
   motion filter's own answer: the object's **mean drift rate** over the current
-  still run, taken from the same `Cairn.Tracker.Kalman` state that matching is
-  run against, must stay under `@stationary_velocity_floor` of the box's height
-  per settle window — with `@stationary_growth_floor` bounding how fast the box
-  may change size over the same window. A failed evaluation restarts the run —
+  still run, taken from the same `Membrane.MOTTracker.Kalman` state that
+  matching is run against, must stay under `@stationary_velocity_floor` of the
+  box's height per settle window — with `@stationary_growth_floor` bounding how
+  fast the box may change size over the same window. A failed evaluation restarts the run —
   on a stationary track, the one that closes the exit window below; on any
   other, every one — and the settle window is measured from the run's start, so
   what the rule asks is whether the object has moved since the last time it was
@@ -511,24 +511,29 @@ defmodule Cairn.Tracker do
 
   Bboxes are `[x, y, w, h]` **normalized to the frame**, which is what the
   plugin protocol delivers. The IoU arithmetic here is scale-free and would not
-  care, but `Cairn.Tracker.Kalman` is not: it caps the width and height of the
-  boxes it predicts at one frame, so a track fed pixel coordinates is matched
-  against a prediction shrunk to a sliver of its box and will not answer to it.
-  A box that merely overhangs the frame edge is fine, and has to be — the
-  protocol admits one, an object halfway out of shot is one, and the
+  care, but `Membrane.MOTTracker.Kalman` is not: it caps the width and height
+  of the boxes it predicts at one frame, so a track fed pixel coordinates is
+  matched against a prediction shrunk to a sliver of its box and will not
+  answer to it. A box that merely overhangs the frame edge is fine, and has to
+  be — the protocol admits one, an object halfway out of shot is one, and the
   prediction's origin is left free precisely so that such a track goes on
   matching itself.
   """
+
+  # This module *is* the core `Membrane.MOTTracker` hosts — the behaviour was
+  # extracted from the public surface below, so nothing here adapts to it
+  # beyond `new/1`, and the annotations are what keep the two from drifting.
+  @behaviour Membrane.MOTTracker.Core
 
   require Logger
 
   alias Cairn.Observation
   alias Cairn.Track
   alias Cairn.Tracker.Batch
-  alias Cairn.Tracker.Kalman
   alias Cairn.Tracker.Reid
   alias Cairn.Tracker.Stage
   alias Cairn.ULID
+  alias Membrane.MOTTracker.Kalman
 
   @iou_threshold 0.1
   # What a stationary track in extended grace demands of a box before it will
@@ -863,11 +868,22 @@ defmodule Cairn.Tracker do
   def new, do: %__MODULE__{}
 
   @doc """
+  The element-hosted form of `new/0`.
+
+  Everything this tracker is configured by arrives per batch in the context
+  (`context/3`), so there is nothing an option could set here and unknown ones
+  are ignored rather than refused: the element passes on whatever the host's
+  config named a core with.
+  """
+  @impl true
+  @spec new(keyword()) :: t()
+  def new(_opts), do: new()
+
+  @doc """
   Builds the tracking context for one observation.
 
-  `camera_id` is the caller's — there is one `Cairn.CameraTracker` per
-  *configured* camera, and that is what a track summary must name, whatever
-  the plugin put on the wire.
+  `camera_id` is the caller's — the camera the detect branch was built for,
+  and what a track summary must name, whatever the engine put on the wire.
 
   `at_ms` is the observation's, stamped at ingestion (`Cairn.ObservationClock`)
   rather than read from a clock here: every bound in this module is a
@@ -966,6 +982,7 @@ defmodule Cairn.Tracker do
   Suspensions are settled *before* anything else: one whose window ran out is
   ended here rather than left to be adopted by this batch's detections.
   """
+  @impl true
   @spec track(t(), [map()], context()) :: {t(), [map()], [event()]}
   def track(%__MODULE__{} = tracker, objects, context) do
     {tracker, lapsed} = expire_suspended(tracker, context.at_ms)
@@ -1003,6 +1020,7 @@ defmodule Cairn.Tracker do
   from, and no track of this camera's has to still exist for that to be the
   right answer.
   """
+  @impl true
   @spec end_all(t(), Track.end_reason()) :: {t(), [event()]}
   def end_all(%__MODULE__{} = tracker, reason) do
     emptied = %__MODULE__{last_observed_at: tracker.last_observed_at}
@@ -1020,9 +1038,9 @@ defmodule Cairn.Tracker do
   duplicate of the object that was already there. See the moduledoc for what
   adoption demands and what it resumes.
 
-  `cut_ms` is the boundary itself on the observation clock — the caller's
-  `cut_clock` (`System.monotonic_time/1` unless a test injects one), since no
-  observation marks a cut — and it is what
+  `cut_ms` is the boundary itself on the observation clock — the `at_ms` of the
+  first batch of the new session, which is where `Membrane.MOTTracker` stamps a
+  cut, since no observation marks one — and it is what
   the adoption window is measured from, not `last_observed_at`, which is the
   last sign of life *before* the cut and can be a long way behind it on a
   stream that went quiet before ffmpeg noticed. The two are separate on
@@ -1038,6 +1056,7 @@ defmodule Cairn.Tracker do
   Returns `{tracker, events, suspension}`; the counts in `suspension` are the
   caller's link-health report.
   """
+  @impl true
   @spec suspend(t(), pos_integer(), number()) :: {t(), [event()], suspension()}
   def suspend(%__MODULE__{} = tracker, max_suspended, cut_ms) do
     at = tracker.last_observed_at
@@ -1074,6 +1093,7 @@ defmodule Cairn.Tracker do
   by default, injectable so a test need not sit through the window — which is
   the clock `at_ms` is anchored to and therefore comparable with.
   """
+  @impl true
   @spec expire_suspended(t(), number()) :: {t(), [event()]}
   def expire_suspended(%__MODULE__{suspended: suspended} = tracker, at_ms)
       when map_size(suspended) > 0 do
@@ -1086,6 +1106,7 @@ defmodule Cairn.Tracker do
   def expire_suspended(%__MODULE__{} = tracker, _at_ms), do: {tracker, []}
 
   @doc "How long a suspended track stays adoptable, in observation-clock milliseconds."
+  @impl true
   @spec adoption_window_ms() :: pos_integer()
   def adoption_window_ms, do: @adoption_window_ms
 
@@ -1133,6 +1154,7 @@ defmodule Cairn.Tracker do
   the tracker that could have adopted a suspension died with the process, and
   the fresh one has nothing to adopt it into.
   """
+  @impl true
   @spec checkpoint_tracks(t()) :: [Track.t()]
   def checkpoint_tracks(%__MODULE__{} = tracker) do
     Enum.sort_by(live_tracks(tracker) ++ suspended_tracks(tracker), & &1.object_id)
@@ -1359,8 +1381,10 @@ defmodule Cairn.Tracker do
 
   # This batch's objects split at the camera's evidence floor, per label with
   # the same `"default"`-then-0.5 fallback `Cairn.CameraTracker` gates evidence
-  # on — the two readings of the floor have to agree, or a box could earn video
-  # without being able to mint the track that carries it.
+  # on. Not two readings that have to agree but one number that reaches both:
+  # `Cairn.Pipeline.ObservationStamper` resolves it into the context and the
+  # camera tracker reads it back off the batch, because a box that could earn
+  # video without minting the track carrying it is an event with no identity.
   #
   # A context with no floor is the ordinary case today and puts everything in
   # stage one, which is why every caller that sets none sees association behave
@@ -2028,7 +2052,7 @@ defmodule Cairn.Tracker do
         # `predicted_box/1`. Velocity starts at zero either way, so the first
         # prediction is the box itself and a track's first batch is matched
         # exactly as it was before there was a filter. Also internal, and for a
-        # stronger reason than `pending_exit_ms`: `Cairn.Tracker.Kalman`'s
+        # stronger reason than `pending_exit_ms`: `Membrane.MOTTracker.Kalman`'s
         # cardinal rule is that nothing it produces may be stored or emitted.
         kalman: Kalman.init(object.bbox)
       }

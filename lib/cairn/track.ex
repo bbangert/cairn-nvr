@@ -55,10 +55,12 @@ defmodule Cairn.Track do
 
   ## How far the final-summary guarantee reaches
 
-  A final is emitted for every lifecycle transition the camera's
-  `Cairn.CameraTracker` observes: expiry, an epoch boundary, an eviction,
-  detection being disabled. It is **not** an unconditional guarantee across a
-  crash, and what a crash costs is different for the two things a final feeds.
+  A final is emitted for every lifecycle transition the camera's tracker
+  element reports: expiry, an epoch boundary, an eviction, detection being
+  disabled. It is **not** an unconditional guarantee across a crash, and what a
+  crash costs is different for the two things a final feeds. A pipeline
+  rebuild is its own gap, and `Cairn.CameraTracker`'s moduledoc has it: the
+  tracks die with the element, and no final is emitted for them at all.
 
   `Cairn.EventCheckpoint` is behind both. It is an ETS table owned outside the
   trackers, carrying a row per camera *only while that camera has an open

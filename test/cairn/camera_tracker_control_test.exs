@@ -5,7 +5,7 @@ defmodule Cairn.CameraTrackerControlTest do
   # which consults the event index — that Repo call needs a sandbox owner.
   use Cairn.DataCase, async: false
 
-  alias Cairn.{CameraControl, CameraTracker, Event, EventCheckpoint, Observation}
+  alias Cairn.{CameraControl, CameraTracker, Event, EventCheckpoint, Observation, TrackerDriver}
   alias Cairn.Config.Camera
 
   @policy %{pre: 5, post: 10, max: 300, max_unseen_ms: 3_000}
@@ -42,6 +42,7 @@ defmodule Cairn.CameraTrackerControlTest do
   defp detect(tracker, camera, label, score, policy) do
     observation = %Observation{
       pts: 90_000,
+      at_ms: next_at_ms(),
       observed_at: DateTime.utc_now(),
       objects: [
         %{
@@ -54,24 +55,36 @@ defmodule Cairn.CameraTrackerControlTest do
       ]
     }
 
-    CameraTracker.detections(tracker, camera, policy, observation)
+    TrackerDriver.detections(tracker, camera, policy, observation)
   end
 
-  # `detections/4` is an async cast; flushing the tracker's mailbox with
-  # :sys.get_state guarantees it (and its synchronous PubSub broadcast) is done,
-  # so we can assert "no event" with no timing window.
+  # A fresh, strictly increasing instant per call: `TrackerDriver` runs the
+  # real tracker element, which associates detections across frames on this
+  # clock, and two calls at the same millisecond would read as simultaneous
+  # rather than as the same object seen twice.
+  defp next_at_ms do
+    base = Process.get(:next_at_ms, System.monotonic_time(:millisecond))
+    Process.put(:next_at_ms, base + 1_000)
+    base
+  end
+
+  # `TrackerDriver.detections/4` runs the tracker element synchronously but
+  # still reaches this process by an async cast; flushing the tracker's
+  # mailbox with :sys.get_state guarantees it (and its synchronous PubSub
+  # broadcast) is done, so we can assert "no event" with no timing window.
   defp refute_event_started(tracker) do
     :sys.get_state(tracker)
     refute_received {:event_started, _}
   end
 
-  test "detection_enabled=false drops batches — no event starts", ctx do
-    CameraControl.set(ctx.camera_id, %{detection_enabled: false})
-
-    detect(ctx.tracker, ctx.camera)
-
-    refute_event_started(ctx.tracker)
-  end
+  # `detection_enabled` no longer reaches this process at all: it is gated in
+  # `Cairn.Pipeline.ObservationStamper`, which drops the batch before the
+  # tracker element ever sees it and tells the element to let go
+  # (`Membrane.MOTTracker.Event.EndAll`) rather than leave live tracks behind a
+  # closed gate. That gate is covered end to end in
+  # `test/cairn/pipeline/observation_stamper_test.exs`; this module has
+  # nothing left to guarantee about the control being off, only about what it
+  # does once a batch has already reached it (below).
 
   test "recording_enabled=false suppresses event start", ctx do
     CameraControl.set(ctx.camera_id, %{recording_enabled: false})

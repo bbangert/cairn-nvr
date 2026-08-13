@@ -31,11 +31,13 @@ defmodule Cairn.PipelineOwner do
 
   Per tick, two liveness signals — the ring's last fragment
   (`Cairn.RingBuffer.last_fragment_at/1`) and, for a detecting camera, the age
-  of the last buffer at `Cairn.Pipeline.DetectSink` — against
+  of the last buffer at `Cairn.Pipeline.TrackSink` — against
   `config.stall_seconds`:
 
     * detect branch stale while the ring is healthy: the wedge is downstream
-      of the tee, where no reconnect reaches it — rebuild.
+      of the tee, where no reconnect reaches it — rebuild. Not while
+      `Cairn.CameraControl` has detection switched off: the branch is then
+      dropping every frame on purpose (`detect_gate/1`).
     * ring stale on `ingest: rtsp` while the source reports itself connected:
       the same wedge on the recording side — rebuild. A source in backoff or
       lost is a mere outage and gets nothing: the in-element reconnect owns
@@ -53,7 +55,7 @@ defmodule Cairn.PipelineOwner do
 
   require Logger
 
-  alias Cairn.{CameraStatus, Config, FFmpegPort, RingBuffer, StreamEpochs}
+  alias Cairn.{CameraControl, CameraStatus, Config, FFmpegPort, RingBuffer, StreamEpochs}
 
   @backoff_min_ms 1_000
   @backoff_max_ms 30_000
@@ -77,8 +79,11 @@ defmodule Cairn.PipelineOwner do
             got_fragment: false,
             # what the source last told us about the main stream
             source: :unknown,
-            # DetectSink's last buffer, monotonic ms, from the relayed stats
+            # TrackSink's last buffer, monotonic ms, from the relayed stats
             detect_at_ms: nil,
+            # the last tick that found detection switched off at runtime,
+            # monotonic ms — the floor under detect_stale?/1
+            detect_gated_at_ms: nil,
             bridge_stale_ticks: nil,
             rebuilt_at_ms: nil,
             # stands in for the ring's last-fragment time until the first
@@ -95,8 +100,11 @@ defmodule Cairn.PipelineOwner do
   the pipeline.
 
   The `Cairn.Detect.Dispatch` policy is resolved here at pipeline birth, so a
-  reload has to reach the running pipeline's sink too — otherwise a `record:`
-  edit would sit unapplied until the camera's next rebuild.
+  reload has to reach the running pipeline's detect branch too — otherwise a
+  `record:` edit would sit unapplied until the camera's next rebuild. The
+  tracker core is the one detect option that does not arrive this way: it
+  wires an element rather than feeding one, so a config that names a different
+  core restarts the camera instead (`Cairn.Config.Server`'s camera diff).
   """
   @spec refresh(GenServer.server(), Config.Camera.t(), Config.t()) :: :ok
   def refresh(server, %Config.Camera{} = camera, %Config{} = config) do
@@ -132,8 +140,8 @@ defmodule Cairn.PipelineOwner do
   def handle_cast({:refresh, camera, config}, state) do
     state = %{state | camera: camera, config: config}
 
-    # `send/2` and not a call: a refresh must not wait on a pipeline whose sink
-    # is inside a `push_frame/5`. A pipeline in its backoff window is owed
+    # `send/2` and not a call: a refresh must not wait on a pipeline whose
+    # detect branch is inside a `push_frame/5`. A pipeline in its backoff window is owed
     # nothing — the next start resolves the policy from `config`.
     if is_pid(state.pipeline) do
       send(state.pipeline, {:policy, camera, Config.policy(config, camera)})
@@ -177,7 +185,7 @@ defmodule Cairn.PipelineOwner do
 
   def handle_info({:stream_lost, :sub}, state), do: {:noreply, state}
 
-  # DetectSink's reply to the watchdog's :detect_stats.
+  # TrackSink's reply to the watchdog's :detect_stats.
   def handle_info({:stats, %{last_buffer_at_ms: at_ms}}, state) do
     {:noreply, %{state | detect_at_ms: at_ms}}
   end
@@ -328,16 +336,26 @@ defmodule Cairn.PipelineOwner do
   # `nil` leaves the pipeline's detect branch unbuilt. `min_score` is the
   # stream's wire floor; the rest of the profile is engine config
   # (`Cairn.Config.native_model_config/1`). `policy:` is resolved here rather
-  # than in the sink because it is a config round trip, and the sink's caller
-  # is the per-frame path.
+  # than in the detect branch because it is a config round trip, and that
+  # branch is the per-frame path.
   defp detect_opts(%{camera: %{plugin: nil}}), do: nil
 
-  # No `sample_fps`: the branch does not thin, and the engine takes the rate
-  # from the profile every membrane camera on this node has to agree on
-  # (`Cairn.Config.native_model_config/1`).
+  # `sample_fps:` is told to the branch, not asked of it: the engine takes the
+  # rate from the profile every membrane camera on this node has to agree on
+  # (`Cairn.Config.native_model_config/1`) and the decoder sheds to it, so what
+  # this carries is a reading, for the two elements whose arithmetic counts
+  # frames — the motion gate's calibration window and a frame-counting tracker
+  # core's lost-track buffer.
+  #
+  # `tracker:` is resolved here rather than carried in the policy because it
+  # wires an element rather than feeding one: a reload cannot swap a core under
+  # a running branch, which is why a changed core is a camera restart rather
+  # than a refresh (`Cairn.Config.Server`).
   defp detect_opts(state) do
     [
       policy: Config.policy(state.config, state.camera),
+      tracker: Config.tracker(state.config, state.camera),
+      sample_fps: Config.sample_fps(state.config, state.camera),
       stream_params: %{min_score: state.camera.min_score}
     ]
   end
@@ -347,6 +365,8 @@ defmodule Cairn.PipelineOwner do
   # -- watchdog ---------------------------------------------------------------
 
   defp check_liveness(state) do
+    state = detect_gate(state)
+
     cond do
       detect_stale?(state) and not ring_stale?(state) ->
         rebuild(state, "detect branch stale while the ring is healthy")
@@ -442,11 +462,28 @@ defmodule Cairn.PipelineOwner do
     :exit, _absent_or_slow -> nil
   end
 
+  # Detection switched off at runtime makes `Cairn.Pipeline.ObservationStamper`
+  # drop every frame, so TrackSink's last buffer ages out with nothing wrong —
+  # and the detect signal, which only knows the camera *has* a detect branch,
+  # would rebuild a healthy camera once per stall window for as long as the
+  # operator leaves it off. Holding the baseline at now while the gate is shut
+  # says nothing instead; it also gives the branch a full window to produce a
+  # real buffer once the gate re-opens, which it needs — the stamp it re-opens
+  # with is as old as the disable, and no wedge made it so. ETS, per tick.
+  defp detect_gate(state) do
+    if CameraControl.get(state.camera.id).detection_enabled,
+      do: state,
+      else: %{state | detect_gated_at_ms: now_ms()}
+  end
+
   defp detect_stale?(%{detect_at_ms: nil}), do: false
 
   defp detect_stale?(state) do
-    detecting?(state) and now_ms() - state.detect_at_ms > stall_ms(state)
+    detecting?(state) and now_ms() - detect_since(state) > stall_ms(state)
   end
+
+  defp detect_since(%{detect_gated_at_ms: nil} = state), do: state.detect_at_ms
+  defp detect_since(state), do: max(state.detect_at_ms, state.detect_gated_at_ms)
 
   defp bridge?(state), do: state.camera.ingest == :ffmpeg
 

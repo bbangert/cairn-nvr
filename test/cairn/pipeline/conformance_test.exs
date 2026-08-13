@@ -37,13 +37,13 @@ defmodule Cairn.Pipeline.ConformanceTest do
     RingBuffer,
     RTPHub,
     StreamEpochs,
-    Track
+    Track,
+    TrackerDriver
   }
 
-  alias Cairn.Detect.Dispatch
   alias Cairn.MP4.Demuxer
   alias Cairn.Native.Host
-  alias Cairn.Pipeline.{DetectSink, Inference}
+  alias Cairn.Pipeline.{Inference, ObservationStamper}
   alias Cairn.RTP
   alias Membrane.Buffer
 
@@ -269,8 +269,10 @@ defmodule Cairn.Pipeline.ConformanceTest do
     # built two ways: `PluginProtocol.decode_line/2` over a literal wire line
     # plus the `ObservationClock` stamp — the retired plugin ports' own
     # construction, kept as the recorded-wire reference — and the real
-    # `Inference`/`DetectSink` pair over a stubbed NIF. Each is delivered to a
-    # real `CameraTracker`; both meet at `Cairn.Detect.Dispatch`.
+    # `Inference`/`ObservationStamper` pair over a stubbed NIF. Both then run
+    # the same tracker element and the same sink into a real `CameraTracker`,
+    # so what is compared is how the observation and its context were built,
+    # not what tracked them.
     test "the same detection yields identical event and track broadcasts" do
       classic_id = uid("evclassic")
       membrane_id = uid("evmembrane")
@@ -321,12 +323,25 @@ defmodule Cairn.Pipeline.ConformanceTest do
 
       # `:detection_disabled` is the one end reason reachable without waiting out
       # a liveness window, and it runs the same close-out path every other does.
-      # The toggle is read on the next batch, so each path feeds one more.
+      # The gate itself is the stamper's (it drops the batch and emits the
+      # ending on its pad); what is asserted here is the close-out, so both
+      # paths take that event directly.
       CameraControl.set(classic_id, %{detection_enabled: false})
       CameraControl.set(membrane_id, %{detection_enabled: false})
 
-      forward_classic(classic, classic_id)
-      feed_infer_sink(sink)
+      TrackerDriver.end_all(
+        classic,
+        tracked_camera(classic_id),
+        @detect_policy,
+        :detection_disabled
+      )
+
+      TrackerDriver.end_all(
+        sink.tracker,
+        tracked_camera(membrane_id),
+        @detect_policy,
+        :detection_disabled
+      )
 
       assert_receive {:track_ended, %Track{camera_id: ^classic_id} = c_track}, 2_000
       assert_receive {:track_ended, %Track{camera_id: ^membrane_id} = m_track}, 2_000
@@ -398,7 +413,7 @@ defmodule Cairn.Pipeline.ConformanceTest do
         System.monotonic_time(:millisecond)
       )
 
-    Dispatch.forward(tracked_camera(camera_id), @detect_policy, observation, tracker: tracker)
+    TrackerDriver.detections(tracker, tracked_camera(camera_id), @detect_policy, observation)
   end
 
   defp plugin_line(camera_id) do
@@ -417,9 +432,9 @@ defmodule Cairn.Pipeline.ConformanceTest do
     })
   end
 
-  # The membrane path's own construction: the real `Inference` element and
-  # `DetectSink` over a stubbed NIF, so `Cairn.Native.Observations` and the
-  # seam both run for real.
+  # The membrane path's own construction: the real `Inference` element and the
+  # real `ObservationStamper` over a stubbed NIF, so `Cairn.Native.Observations`,
+  # the observation clock and the context resolution all run for real.
   defp start_infer_sink(tracker, camera_id) do
     :persistent_term.put(NativeStub.control(), %{
       test: self(),
@@ -464,18 +479,20 @@ defmodule Cairn.Pipeline.ConformanceTest do
 
     {[], infer_state} = Inference.handle_stream_format(:input, format, %{}, infer_state)
 
-    sink =
-      struct(DetectSink,
-        camera: tracked_camera(camera_id),
-        policy: @detect_policy,
-        tracker: tracker
-      )
+    stamper =
+      struct(ObservationStamper, camera: tracked_camera(camera_id), policy: @detect_policy)
 
-    {[], sink_state} = DetectSink.handle_init(%{}, sink)
-    %{infer: infer_state, sink: sink_state}
+    {[], stamper_state} = ObservationStamper.handle_init(%{}, stamper)
+
+    %{
+      infer: infer_state,
+      stamper: stamper_state,
+      camera: tracked_camera(camera_id),
+      tracker: tracker
+    }
   end
 
-  defp feed_infer_sink(%{infer: infer_state, sink: sink_state}) do
+  defp feed_infer_sink(%{infer: infer_state, stamper: stamper_state} = pipe) do
     frame = NativeStub.decoded_frame()
 
     metadata =
@@ -502,11 +519,16 @@ defmodule Cairn.Pipeline.ConformanceTest do
         infer_state
       )
 
-    # the Detections buffer crosses into the cairn-side sink, as in the pipeline
+    # the Detections buffer crosses into the cairn-side stamper, as in the
+    # pipeline, and its batches into the tracker element and the sink
     assert [{:buffer, {:output, out}} | _] = actions
-    {_actions, sink_state} = DetectSink.handle_buffer(:input, out, %{}, sink_state)
+    {actions, stamper_state} = ObservationStamper.handle_buffer(:input, out, %{}, stamper_state)
 
-    %{infer: infer_state, sink: sink_state}
+    for {:buffer, {:output, batch}} <- actions do
+      TrackerDriver.batch(pipe.tracker, pipe.camera, @detect_policy, batch)
+    end
+
+    %{pipe | infer: infer_state, stamper: stamper_state}
   end
 
   defp native_frame do

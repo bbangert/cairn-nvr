@@ -12,13 +12,13 @@ defmodule Cairn.StreamEpochs do
 
   Written by `Cairn.Pipeline.EpochTagger` (every session) and
   `Cairn.PipelineOwner` (`:camera_stopped`, on a deliberate stop only); read by
-  `Cairn.CameraTracker`, the ring buffer's init-segment metadata, and the owner
-  itself, which no longer knows an epoch first-hand.
+  `Cairn.CameraTracker`'s staleness gate, the ring buffer's init-segment
+  metadata, and the owner itself, which no longer knows an epoch first-hand.
 
   The table is owned by this GenServer and dies with it: after a crash every
   camera reads back `:unknown` until its next session re-mints. That is
-  accepted — a camera's tracker ends tracks on epoch *change*, and a re-mint is
-  a change, which is exactly the conservative outcome.
+  accepted — the tracker element cuts its live set on epoch *change*, and a
+  re-mint is a change, which is exactly the conservative outcome.
   """
 
   use GenServer

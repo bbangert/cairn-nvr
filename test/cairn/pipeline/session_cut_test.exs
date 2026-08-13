@@ -24,9 +24,21 @@ defmodule Cairn.Pipeline.SessionCutTest do
     def_output_pad(:output, accepted_format: _any, flow_control: :push)
 
     @impl true
-    def handle_init(_ctx, _opts), do: {[], %{}}
+    def handle_init(_ctx, _opts), do: {[], %{playing?: false, queued: []}}
+
+    # A script pushed before the element reaches :playing raced startup (seen
+    # once under full-suite load): actions are refused while stopped, so they
+    # queue here and replay in order the moment they are legal.
+    @impl true
+    def handle_playing(_ctx, state) do
+      {Enum.concat(Enum.reverse(state.queued)), %{state | playing?: true, queued: []}}
+    end
 
     @impl true
+    def handle_parent_notification(actions, _ctx, %{playing?: false} = state)
+        when is_list(actions),
+        do: {[], %{state | queued: [actions | state.queued]}}
+
     def handle_parent_notification(actions, _ctx, state) when is_list(actions),
       do: {actions, state}
   end

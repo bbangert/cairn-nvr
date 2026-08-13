@@ -8,7 +8,8 @@ defmodule Cairn.Pipeline.Camera do
                                                  │
        EpochTagger ─ tee ─┬─ record_cut ─(n)─ parser(avc3) ─ CMAF ─ RingBufferSink
                           ├─ rtp_cut ────(n)─ RTPOut (in-process WebRTC hub feed)
-                          └─ Picker ─(manual)─ Decoder ─(manual)─ Inference ─ DetectSink
+                          └─ Picker ─(manual)─ Decoder ─(manual)─ Inference
+                             ─ ObservationStamper ─ MOTTracker ─ TrackSink
 
   Started once by `Cairn.PipelineOwner` and rebuilt only by it — on a crash or
   a watchdog escalation, never on a reconnect. Connection lifecycle lives in
@@ -23,7 +24,9 @@ defmodule Cairn.Pipeline.Camera do
   identical-SPS reconnect — so the ring would never learn the new session
   (P1-D11). A fresh ssrc per session is the RTP branch's own version of the
   same. The detect branch is not: the decoder's and inference's native state is
-  the expensive half, and it is exactly what a reconnect must not cost.
+  the expensive half, and it is exactly what a reconnect must not cost — and
+  since the tracker moved into the branch, so are the live tracks, which a
+  boundary suspends rather than ends.
 
   A `{:session_ended, n}` from a gate is the parent's cue to link branch `n+1`
   at once — the gate is already queueing for it — and to drop branch `n`'s
@@ -38,35 +41,39 @@ defmodule Cairn.Pipeline.Camera do
   between the decoder and `Cairn.Pipeline.Inference` (D-C2's seam: frames as
   plain buffers, letterbox maths and motion verdict in metadata). The
   observations then flow as `Detections` buffers into
-  `Cairn.Pipeline.DetectSink`, the cairn-side half that dispatches them.
+  `Cairn.Pipeline.ObservationStamper`, which clocks them and resolves the
+  tracking context, through the generic `Membrane.MOTTracker` hosting the
+  config-named core, and out at `Cairn.Pipeline.TrackSink`.
 
   The tee carries AU-aligned Annex-B H.264 — the TS demuxer's output on one
   ingest, the source's own SPS-derived format on the other (P1-D13); each
   branch owns its own format conversion (CMAF needs avc3 + per-AU keyframe
   metadata, which its parser stage adds).
 
-  Detections leave `Cairn.Pipeline.DetectSink` for `Cairn.Detect.Dispatch`
-  directly; this process is on the reload path (a new policy, forwarded to
-  that sink) but not on the per-frame one.
+  Tracked batches leave `Cairn.Pipeline.TrackSink` for `Cairn.Detect.Dispatch`
+  directly; this process is on the reload path (a new policy, forwarded to both
+  ends of the tracker) but not on the per-frame one.
   """
 
   use Membrane.Pipeline
 
   require Membrane.Logger
 
+  alias Cairn.Detect.SparseTrack
   alias Cairn.Motion
 
   alias Cairn.Pipeline.{
     BridgeSource,
     Decoder,
-    DetectSink,
     EpochTagger,
     Inference,
     MotionGate,
+    ObservationStamper,
     Picker,
     RingBufferSink,
     RTPOut,
-    SessionCut
+    SessionCut,
+    TrackSink
   }
 
   alias Membrane.Pad
@@ -145,23 +152,25 @@ defmodule Cairn.Pipeline.Camera do
     {[], state}
   end
 
-  def handle_child_notification({:stats, stats}, :detect, _ctx, state) do
+  def handle_child_notification({:stats, stats}, :track_sink, _ctx, state) do
     send(state.owner, {:stats, stats})
     {[], state}
   end
 
   def handle_child_notification(_notification, _child, _ctx, state), do: {[], state}
 
-  # A reload's new policy, from `Cairn.PipelineOwner`. Only the detect sink
-  # holds one, so a camera whose detect branch was never built has nothing to
-  # tell.
+  # A reload's new policy, from `Cairn.PipelineOwner`, to the head of the detect
+  # branch alone: the stamper resolves the tracking context from it and ships
+  # the sink's half in the batch, so both ends change on the same buffer instead
+  # of on two notifications the pad between them cannot order. A camera whose
+  # detect branch was never built has nothing to tell.
   @impl true
   def handle_info({:policy, camera, policy}, _ctx, %{detecting?: true} = state) do
-    {[notify_child: {:detect, {:policy, camera, policy}}], state}
+    {[notify_child: {:stamper, {:policy, camera, policy}}], state}
   end
 
   def handle_info(:detect_stats, _ctx, %{detecting?: true} = state) do
-    {[notify_child: {:detect, :stats}], state}
+    {[notify_child: {:track_sink, :stats}], state}
   end
 
   # A deliberate stop. The source's EOS travels the same path a session cut
@@ -265,6 +274,7 @@ defmodule Cairn.Pipeline.Camera do
   defp detect_spec(camera, detect) do
     stream_params = Keyword.get(detect, :stream_params, %{})
     gate = motion_gate(camera.id, detect, stream_params)
+    policy = Keyword.fetch!(detect, :policy)
 
     [
       get_child(:tee)
@@ -285,11 +295,43 @@ defmodule Cairn.Pipeline.Camera do
         stream_id: camera.id,
         stream_params: stream_params
       })
-      |> child(:detect, %DetectSink{
-        camera: camera,
-        policy: Keyword.fetch!(detect, :policy)
+      |> child(:stamper, %ObservationStamper{camera: camera, policy: policy})
+      |> child(:tracker, %Membrane.MOTTracker{
+        tracker: tracker_core(detect, policy),
+        # A camera cannot suspend more tracks than it was allowed to hold. Read
+        # at birth: this is an element option, so a reload that raises
+        # `max_live_tracks` does not raise this one until the camera's next
+        # pipeline — as it does not raise a core's own live cap where that is
+        # a construction option too (`tracker_core/2`), and does raise the one
+        # `Cairn.Tracker` reads off every batch's context.
+        max_suspended: policy.max_live_tracks
       })
+      |> child(:track_sink, %TrackSink{camera: camera, policy: policy})
     ]
+  end
+
+  # The one place a core name resolved by `Cairn.Config.tracker/2` becomes the
+  # `{module, opts}` the element is built with.
+  #
+  # `Cairn.Tracker` takes none: it is milliseconds-native and reads its bounds,
+  # the live cap included, off every batch's context. `Cairn.Detect.SparseTrack`
+  # reads no bound off it. It counts frames — its lost-track buffer is
+  # `frame_rate / 30 * track_buffer` — so a branch delivering `sample_fps`
+  # frames a second has to say so, or lost tracks stay adoptable for the ratio
+  # of the two; and its live cap is a construction option, so the camera's own
+  # is passed here rather than found on a batch.
+  defp tracker_core(detect, policy) do
+    case Keyword.fetch!(detect, :tracker) do
+      SparseTrack ->
+        {SparseTrack,
+         [
+           frame_rate: Keyword.fetch!(detect, :sample_fps),
+           max_live: policy.max_live_tracks
+         ]}
+
+      module ->
+        {module, []}
+    end
   end
 
   # The Nx measurement (D-C3): a configured gate becomes an element between

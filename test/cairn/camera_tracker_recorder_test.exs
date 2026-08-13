@@ -9,9 +9,8 @@ defmodule Cairn.CameraTrackerRecorderTest do
 
   import ExUnit.CaptureLog, only: [capture_log: 1]
 
-  alias Cairn.{CameraControl, CameraTracker, Event, EventCheckpoint, Observation}
+  alias Cairn.{CameraControl, CameraTracker, Event, EventCheckpoint, Observation, TrackerDriver}
   alias Cairn.Config.Camera
-  alias Cairn.Detect.Dispatch
   alias Cairn.{Track, TrackRecorder, Tracks}
 
   @policy %{pre: 5, post: 10, max: 300, max_unseen_ms: 3_000, max_live_tracks: 128}
@@ -66,21 +65,20 @@ defmodule Cairn.CameraTrackerRecorderTest do
       protocol: :v0
     }
 
-    # `:via` picks the route: `detections/4` is the tracker's own entry point,
-    # `:dispatch` is the seam both detection producers actually use.
-    case Keyword.get(opts, :via) do
-      :dispatch -> Dispatch.forward(camera, policy, observation, tracker: tracker)
-      nil -> CameraTracker.detections(tracker, camera, policy, observation)
-    end
+    # The real seam, end to end: `TrackerDriver` runs `Membrane.MOTTracker` and
+    # `Cairn.Pipeline.TrackSink` over this observation and dispatches through
+    # `Cairn.Detect.Dispatch` itself, so there is no second route left to pick
+    # between — every call here already goes through it.
+    TrackerDriver.detections(tracker, camera, policy, observation, Keyword.take(opts, [:core]))
   end
 
   # The tracker decides on `at_ms`, which production derives from the host's
   # monotonic clock (`Cairn.ObservationClock`) — the same clock a stream cut is
-  # stamped with (`:cut_clock`) and the adoption sweep measures its window
-  # from. These fixtures are therefore offsets from one base captured per test
-  # process rather than absolutes: batches can be spaced to the millisecond,
-  # because nothing between them re-reads a clock, while still landing on the
-  # scale the tracker's own defaults read.
+  # stamped with and the adoption sweep measures its window from. These
+  # fixtures are therefore offsets from one base captured per test process
+  # rather than absolutes: batches can be spaced to the millisecond, because
+  # nothing between them re-reads a clock, while still landing on the scale
+  # the tracker's own defaults read.
   defp at_ms(offset), do: clock_base() + offset
 
   defp clock_base do
@@ -144,6 +142,29 @@ defmodule Cairn.CameraTrackerRecorderTest do
 
   defp tiers(track, record),
     do: @policy |> Map.put(:track, track) |> Map.put(:record, record)
+
+  # A stream boundary through the real seam, for a test that needs one. The
+  # direct broadcast keeps the tracker's own `current_epoch` in step
+  # (`stale?/2` reads it, and would otherwise drop what follows as stale), and
+  # the empty buffer under the new epoch is what makes the tracker element
+  # itself suspend what it was holding — the cut is buffer-driven now, not a
+  # broadcast `Cairn.CameraTracker` used to react to on its own.
+  defp cut_epoch(tracker, camera, at_ms_offset, reason \\ :source_lost) do
+    epoch = Cairn.ULID.generate()
+    send(tracker, {:stream_epoch, camera.id, epoch, reason})
+    _ = :sys.get_state(tracker)
+    observe(tracker, camera, [], epoch: epoch, at_ms: at_ms_offset)
+    epoch
+  end
+
+  # The element's adoption sweep, forced past its window regardless of when
+  # the cut actually landed: `TrackerDriver.sweep/4` overwrites the cut it is
+  # waiting on, so a distant `at_ms` is what used to take a `cut_clock`
+  # stamped in the past to fake.
+  defp sweep(tracker, camera, at_ms_offset) do
+    TrackerDriver.sweep(tracker, camera, @policy, at_ms(at_ms_offset))
+    _ = :sys.get_state(tracker)
+  end
 
   # -- the gate ---------------------------------------------------------------
 
@@ -264,17 +285,41 @@ defmodule Cairn.CameraTrackerRecorderTest do
       observe(ctx.tracker, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], [])
       assert_receive {:track_started, %Track{object_id: oid}}
 
-      CameraControl.set(ctx.camera_id, %{detection_enabled: false})
-
-      observe(ctx.tracker, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])],
-        at_ms: 2_000.0
-      )
+      # detection_enabled is gated upstream now (`Cairn.Pipeline.ObservationStamper`),
+      # which is what tells the tracker element to let go —
+      # `TrackerDriver.end_all/4` is that in-band event, not a further
+      # detection under a disabled control this process never sees anyway
+      TrackerDriver.end_all(ctx.tracker, ctx.camera, @policy, :detection_disabled)
 
       assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :detection_disabled}}
 
       flush(ctx.tracker, ctx.rec)
 
       assert Tracks.get(oid).end_reason == :detection_disabled
+    end
+
+    test "a sparsetrack identity survives the whole way into a row", ctx do
+      # The other core a camera may select, through the same seam: its inner
+      # ids are per-instance integers, and `Cairn.Tracks.Track`'s primary key is
+      # a string — an integer reaches `insert_all` as an `Ecto.ChangeError` that
+      # takes the recorder's whole buffer with it, so the adapter's mint is what
+      # this asserts, at the only place that can tell.
+      observe(ctx.tracker, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])],
+        core: {Cairn.Detect.SparseTrack, []}
+      )
+
+      assert_receive {:track_started, %Track{object_id: oid}}
+      assert oid =~ ~r/^[0-9A-HJKMNP-TV-Z]{26}$/
+
+      TrackerDriver.end_all(ctx.tracker, ctx.camera, @policy, :detection_disabled)
+      assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :detection_disabled}}
+
+      flush(ctx.tracker, ctx.rec)
+
+      row = Tracks.get(oid)
+      assert row.camera_id == ctx.camera_id
+      assert row.end_reason == :detection_disabled
+      assert row.label == "person"
     end
 
     test "an evicted track is recorded like any other", ctx do
@@ -364,40 +409,13 @@ defmodule Cairn.CameraTrackerRecorderTest do
       assert Tracks.get(oid).event_id == eid
     end
 
-    # The same two answers, over the route both producers take. The seam
-    # forwards one policy carrying both tiers, so anything it read or rewrote
-    # would let one tier answer for the other.
-    test "the dispatch seam keeps the cat's row and its silence", ctx do
-      oid =
-        start_and_end_track(ctx,
-          label: "cat",
-          score: 0.9,
-          policy: tiers(@example_track, @example_record),
-          via: :dispatch
-        )
-
-      flush(ctx.tracker, ctx.rec)
-      refute_received {:event_started, _}
-
-      assert Tracks.get(oid).event_id == nil
-      assert Tracks.list(camera: ctx.camera_id).total == 1
-    end
-
-    test "the dispatch seam keeps the person's event", ctx do
-      oid =
-        start_and_end_track(ctx,
-          label: "person",
-          score: 0.65,
-          policy: tiers(@example_track, @example_record),
-          via: :dispatch
-        )
-
-      assert_receive {:extractor_started, %Event{id: eid}, _pid}
-
-      flush(ctx.tracker, ctx.rec)
-
-      assert Tracks.get(oid).event_id == eid
-    end
+    # There used to be a second route here — `detections/4` straight to the
+    # tracker versus `Dispatch.forward/4` — proving neither read nor rewrote
+    # either tier in transit. That distinction is gone: `observe/4` now always
+    # runs the real element and the real `Cairn.Pipeline.TrackSink`, which
+    # itself calls `Dispatch.forward/4` to reach this process, so every test
+    # above already exercises that one hop end to end. Nothing is left to
+    # compare a second route against.
   end
 
   # -- live rows ----------------------------------------------------------------
@@ -572,18 +590,12 @@ defmodule Cairn.CameraTrackerRecorderTest do
     @parked_box [0.1, 0.1, 0.2, 0.4]
 
     test "`:appeared` and the stationary flip carry observation times", ctx do
-      # The stream reset below has to be a cut whose adoption window has
-      # already run out by the time the sweep runs, or the track is not yet
-      # owed the close this test reads the row back through. The window runs
-      # from the cut, so it is the cut that is put in the past; the
-      # observations sit ten seconds behind it, where the stream went quiet.
       tracker =
         start_supervised!(
           {CameraTracker,
            camera_id: ctx.camera_id,
            name: nil,
            recorder: ctx.rec,
-           cut_clock: fn -> System.monotonic_time(:millisecond) - 90_000 end,
            start_extractor: fn _camera, _event ->
              {:ok, spawn(fn -> Process.sleep(:infinity) end)}
            end,
@@ -593,6 +605,10 @@ defmodule Cairn.CameraTrackerRecorderTest do
 
       on_exit(fn -> EventCheckpoint.delete(ctx.camera_id) end)
 
+      # A real first epoch, not the driver's `nil` default: the cut below has
+      # to be a boundary the element actually crossed, and a transition away
+      # from no-epoch-yet is the element's own first buffer, not a cut.
+      epoch = Cairn.ULID.generate()
       first = DateTime.add(DateTime.utc_now(), -100, :second)
       second = DateTime.add(first, 1)
       third = DateTime.add(first, 2)
@@ -601,17 +617,20 @@ defmodule Cairn.CameraTrackerRecorderTest do
         observe(tracker, ctx.camera, [object("person", 0.9, @parked_box)],
           observed_at: at,
           at_ms: at_ms,
-          policy: @stationary_policy
+          policy: @stationary_policy,
+          epoch: epoch
         )
       end
 
       assert_receive {:track_started, %Track{object_id: oid}}
       assert_receive {:track_updated, %Track{object_id: ^oid, stationary: true}}
 
-      # a fresh epoch suspends the live track, and the window sweep is what
-      # ends it; the event is still open, so the row carries its id
-      send(tracker, {:stream_epoch, ctx.camera_id, Cairn.ULID.generate(), :source_lost})
-      send(tracker, :adoption_window)
+      # a fresh epoch suspends the live track (in the element, on the first
+      # buffer that carries it) and the sweep — forced straight past its
+      # window — is what ends it; the event is still open, so the row carries
+      # its id
+      cut_epoch(tracker, ctx.camera, 4_000.0)
+      sweep(tracker, ctx.camera, 90_000)
       assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :stream_reset}}
 
       flush(tracker, ctx.rec)
@@ -698,25 +717,26 @@ defmodule Cairn.CameraTrackerRecorderTest do
     end
 
     test "a suspension nothing adopts closes its row exactly once, at the cut", ctx do
-      # the adoption window runs from the cut, so it is the cut that has to be
-      # far enough back for the sweep to find anything
-      tracker =
-        tracker_casting_to_self(ctx, :tracker_close_once,
-          cut_clock: fn -> System.monotonic_time(:millisecond) - 90_000 end
-        )
-
+      tracker = tracker_casting_to_self(ctx, :tracker_close_once)
+      # a real first epoch, so the cut below is a boundary rather than the
+      # element's own first buffer
+      epoch_a = Cairn.ULID.generate()
       seen_at = DateTime.add(DateTime.utc_now(), -100, :second)
-      observe(tracker, ctx.camera, [object("person", 0.9, @reset_box)], observed_at: seen_at)
+
+      observe(tracker, ctx.camera, [object("person", 0.9, @reset_box)],
+        observed_at: seen_at,
+        epoch: epoch_a
+      )
 
       assert_receive {:"$gen_cast", {:open, %Track{object_id: oid}, _event_id}}
 
-      send(tracker, {:stream_epoch, ctx.camera_id, Cairn.ULID.generate(), :source_lost})
-      _ = :sys.get_state(tracker)
       # the cut itself closes nothing: the track may yet come back
+      cut_epoch(tracker, ctx.camera, 2_000.0)
       refute_received {:"$gen_cast", {:final, _track, _event}}
 
-      send(tracker, :adoption_window)
-      _ = :sys.get_state(tracker)
+      # the sweep, forced straight past its window: nothing has adopted the
+      # suspension in the meantime, so it lapses
+      sweep(tracker, ctx.camera, 90_000)
 
       assert_receive {:"$gen_cast", {:final, %Track{object_id: ^oid} = final, _event}}
       assert final.end_reason == :stream_reset
@@ -724,8 +744,8 @@ defmodule Cairn.CameraTrackerRecorderTest do
       # minute of waiting that followed it
       assert DateTime.compare(final.last_seen_at, seen_at) == :eq
 
-      send(tracker, :adoption_window)
-      _ = :sys.get_state(tracker)
+      # and once: the second sweep has nothing left to end
+      sweep(tracker, ctx.camera, 90_000)
       refute_received {:"$gen_cast", {:final, _track, _event}}
     end
 
@@ -796,6 +816,59 @@ defmodule Cairn.CameraTrackerRecorderTest do
       # nothing was buffered for a track that predates this recorder
       assert row.entry_bbox == nil
       assert Tracks.moments(oid) == []
+    end
+
+    # A batch carrying no evidence still moves the tracker — here the open
+    # event's only track lapses in it — and the checkpoint is what a
+    # replacement process replays. Left at the last evidence-bearing batch's
+    # snapshot it replays a final for a track that already ended.
+    test "a lifecycle-only batch moves the checkpoint an open event restores from", ctx do
+      # The checkpoint is throttled on this clock; the batches below are
+      # deliberately more than a throttle window apart on it.
+      clock = start_supervised!({Agent, fn -> 0 end}, id: :checkpoint_clock)
+
+      tracker =
+        start_supervised!(
+          {CameraTracker,
+           camera_id: ctx.camera_id,
+           name: nil,
+           recorder: ctx.rec,
+           monotonic_ms: fn -> Agent.get(clock, & &1) end,
+           start_extractor: fn _camera, _event ->
+             {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+           end,
+           finalize_extractor: fn _pid, _event -> :ok end},
+          id: :tracker_lifecycle_checkpoint
+        )
+
+      observe(tracker, ctx.camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])], [])
+      assert_receive {:track_started, %Track{object_id: oid}}
+
+      # The broadcast above leaves this process before the batch that carried
+      # it is finished with, so the checkpoint is read behind a sync call.
+      _ = :sys.get_state(tracker)
+      assert {%Event{}, [%Track{object_id: ^oid}]} = EventCheckpoint.get(ctx.camera_id)
+
+      Agent.update(clock, &(&1 + 2_000))
+
+      # No evidence in it at all, and past `max_unseen_ms` (3 000) of the one
+      # before: the track lapses and the event stays open on its post window.
+      observe(tracker, ctx.camera, [], at_ms: 5_000.0)
+      assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :unseen}}
+
+      _ = :sys.get_state(tracker)
+      assert {%Event{}, []} = EventCheckpoint.get(ctx.camera_id)
+
+      # …which is what the restore then replays: nothing, rather than a second
+      # final for a track this camera already ended.
+      restored =
+        start_supervised!(
+          {CameraTracker, camera_id: ctx.camera_id, name: nil, recorder: ctx.rec},
+          id: :tracker_lifecycle_restore
+        )
+
+      assert Process.alive?(restored)
+      refute_receive {:track_ended, %Track{end_reason: :host_restart}}, 200
     end
   end
 end

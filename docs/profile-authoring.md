@@ -198,10 +198,12 @@ every one of the four takes its constants from its own module. Write
 nothing.
 
 The three bounds beside the stage keys — `max_unseen_ms`, `max_live_tracks`,
-`stationary_after_ms` — *are* read. They resolve camera → profile → global: a
-camera's own override outranks its group's profile, and the profile's
-band-tuned value outranks the global default. They are validated against the
-same ranges the global keys are.
+`stationary_after_ms` — *are* read, and so is `tracker`, which names the
+tracker core the group's cameras run. They resolve camera → profile → global:
+a camera's own override outranks its group's profile, and the profile's
+band-tuned value outranks the global default. The bounds are validated against
+the same ranges the global keys are; an unknown `tracker` name is a config
+error.
 
 Two knobs stay outside profiles on purpose (D-P6): the motion-zone and
 track-floor scene config describe the *scene* rather than the model, so they

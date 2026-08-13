@@ -16,13 +16,17 @@ defmodule Cairn.Config do
   alias Cairn.Config.Camera
   alias Cairn.Config.PluginGroup
   alias Cairn.Config.Profile
+  # `as:` because this module is a `Config` of its own — the engine's
+  # vocabulary and the operator's file are two different things.
+  alias Cairn.Native.Config, as: NativeConfig
 
   @known_keys ~w(data_dir stall_seconds free_space_min_mb remux_clips events retention cameras
                  plugins integrations tracking profile_dirs)
   @known_events_keys ~w(pre_window_seconds post_window_seconds max_event_seconds)
   @known_retention_keys ~w(days per_label tracks_days)
   @known_integrations_keys ~w(token)
-  @known_tracking_keys ~w(max_unseen_ms max_live_tracks stationary_after_ms bbd oru ocr reid)
+  @known_tracking_keys ~w(max_unseen_ms max_live_tracks stationary_after_ms bbd oru ocr reid
+                          tracker)
   @name_regex ~r/\A[a-z0-9][a-z0-9_-]*\z/
 
   # How long a track survives without being seen, in *media* time. Long
@@ -95,6 +99,17 @@ defmodule Cairn.Config do
   # Off by default: the appearance fusion is unmeasured until phase-6 E2E, and
   # the veto threshold `Cairn.Tracker.Reid` uses is provisional until then.
   @default_reid false
+  # Which tracker core `Membrane.MOTTracker` hosts. The menu is names rather
+  # than module atoms so a config file cannot name an arbitrary module, and it
+  # is validated at load: a typo is a config error, not a pipeline that raises
+  # when the camera it belongs to starts streaming.
+  #
+  # `sparsetrack` is the vendored-reference port behind its cairn-side units
+  # and vocabulary adapter (`Cairn.Detect.SparseTrack`); it is selectable and
+  # deliberately not the default — flipping that is a decision for after it has
+  # been measured on real cameras rather than on MOT sequences.
+  @trackers %{"cairn" => Cairn.Tracker, "sparsetrack" => Cairn.Detect.SparseTrack}
+  @default_tracker "cairn"
   # How long track rows outlive the clips they describe. Deliberately far
   # longer than `retention_days`: the track log is the instrument for tuning
   # the filters, and a year of "what did the system see and not record?" is the
@@ -120,6 +135,7 @@ defmodule Cairn.Config do
             oru: @default_oru,
             ocr: @default_ocr,
             reid: @default_reid,
+            tracker: @default_tracker,
             cameras: [],
             plugin_groups: [],
             profiles: %{},
@@ -215,6 +231,7 @@ defmodule Cairn.Config do
       oru: configured_oru(map),
       ocr: configured_ocr(map),
       reid: configured_reid(map),
+      tracker: configured_tracker(map),
       cameras: cameras,
       plugin_groups: plugin_groups,
       profiles: profiles,
@@ -295,6 +312,18 @@ defmodule Cairn.Config do
     end
   end
 
+  # A name, not a module: `validate_trackers/2` refuses one no core answers to,
+  # and `tracker/2` resolves what survives that. Not `||`, on the rule its
+  # boolean neighbours above follow for their own reason: only an absent key is
+  # a default, so a `false` in the YAML reaches the validator as the name it is
+  # not, rather than being read as an absence and silently defaulted.
+  defp configured_tracker(map) do
+    case get_in(map, ["tracking", "tracker"]) do
+      nil -> @default_tracker
+      name -> name
+    end
+  end
+
   # Global only: one clock for the whole track log, with none of the
   # per-camera or per-label forms `retention.days` has. Those exist to buy disk
   # back on clips. Splitting the audit record by label instead would make "what
@@ -308,11 +337,13 @@ defmodule Cairn.Config do
   windows, the tracking settings, and the two host-side threshold tiers.
 
   `Cairn.PipelineOwner` resolves it off the per-frame path — when it builds
-  the pipeline and again on each `refresh/3` — and the pipeline's
-  `Cairn.Pipeline.DetectSink` hands the result to `Cairn.Detect.Dispatch`
-  with every observation unmodified, so no camera tracker calls the config
-  server per frame and a key added here reaches `Cairn.CameraTracker`. A
-  *running* camera gets a changed policy only through that refresh.
+  the pipeline and again on each `refresh/3` — and the pipeline's detect branch
+  reads it at both ends: `Cairn.Pipeline.ObservationStamper` resolves the
+  tracking context from it, and `Cairn.Pipeline.TrackSink` hands it to
+  `Cairn.Detect.Dispatch` with every batch unmodified. So no camera tracker
+  calls the config server per frame, and a key added here reaches
+  `Cairn.CameraTracker`. A *running* camera gets a changed policy only through
+  that refresh.
 
   `:track` and `:record` are the camera's parsed tiers verbatim, `nil` when
   the block is absent. Resolve a label against one with `tier_threshold/3`
@@ -378,13 +409,59 @@ defmodule Cairn.Config do
   # scene), and the profile's band-tuned defaults outrank the globals.
   defp bound(camera, profile, global), do: camera || profile || global
 
+  @doc """
+  The tracker core `Membrane.MOTTracker` hosts for a camera, resolved
+  camera → profile → global on `bound/3`'s precedence.
+
+  A module, not a name: the names are the config vocabulary and `validate/2`
+  has already refused any that no core answers to, so nothing downstream has to
+  handle one that does not resolve.
+
+  Read where the pipeline is built rather than carried in `policy/2`: the core
+  is wired into the branch at birth, and a reload cannot re-wire an element.
+  """
+  @spec tracker(t(), Camera.t()) :: module()
+  def tracker(%__MODULE__{} = config, %Camera{} = cam) do
+    profile = profile_for(config, cam)
+
+    Map.fetch!(@trackers, named_tracker(cam.tracker, profile && profile.tracker, config.tracker))
+  end
+
+  # `bound/3`'s precedence, but coalescing on `nil` alone: an override is
+  # absent or it is a name, and a `false` that fell through `||` here would be
+  # resolved to the default the load-time validator had already refused it in
+  # favour of — turning a rejected config into a silently running one.
+  defp named_tracker(nil, nil, global), do: global
+  defp named_tracker(nil, profile, _global), do: profile
+  defp named_tracker(camera, _profile, _global), do: camera
+
+  @doc """
+  The rate a camera's detect branch delivers frames at: its profile's
+  `sample_fps`, or the engine default a profile that names none leaves it to.
+
+  Nothing is told to thin by reading this — `Cairn.Pipeline.Decoder` already
+  gates on the rate `Cairn.Native.Host` opened its decoder with, which is this
+  same profile field — so it is a reading, for the elements whose own
+  arithmetic counts frames.
+  """
+  @spec sample_fps(t(), Camera.t()) :: pos_integer()
+  def sample_fps(%__MODULE__{} = config, %Camera{} = cam) do
+    profile = profile_for(config, cam)
+
+    (profile && profile.sample_fps) || NativeConfig.default_sample_fps()
+  end
+
+  @doc "The tracker-core names a config may choose between, for error messages."
+  @spec tracker_names() :: [String.t()]
+  def tracker_names, do: @trackers |> Map.keys() |> Enum.sort()
+
   # The whole of what a profile changes about tracking policy: the stage
   # presence map replaces the boolean flags for every camera on the profiled
   # group. Unprofiled cameras — and cameras on a profile that had no
   # `tracking:` block, which said nothing about tracking — get no `stages`
   # key at all, which is what keeps their path (through
-  # `Cairn.CameraTracker.tracking_policy/1` and `Cairn.Tracker.context/3`)
-  # the pre-profile one bit for bit.
+  # `Cairn.Pipeline.ObservationStamper`'s `tracking_policy/2` and
+  # `Cairn.Tracker.context/3`) the pre-profile one bit for bit.
   defp put_stages(policy, nil), do: policy
   defp put_stages(policy, %Profile{stages: nil}), do: policy
   defp put_stages(policy, %Profile{stages: stages}), do: Map.put(policy, :stages, stages)
@@ -890,9 +967,36 @@ defmodule Cairn.Config do
     |> validate_tracking_key(config, :max_live_tracks, 1, 10_000)
     |> validate_tracking_key(config, :stationary_after_ms, 1_000, 3_600_000)
     |> validate_profile_bounds(config)
+    |> validate_trackers(config)
     |> validate_reid_requires_bbd(config)
     |> warn_superseded_flags(config)
     |> warn_reid_without_bbd_stage(config)
+  end
+
+  # Every place a core can be named, refused at load: `Config.tracker/2`
+  # fetches from the menu, so an unknown name would otherwise surface as a
+  # pipeline that raises when the camera it belongs to starts streaming — long
+  # after the operator who typed it stopped looking.
+  defp validate_trackers(acc, config) do
+    named =
+      [{"tracking.tracker", config.tracker}] ++
+        for(cam <- config.cameras, do: {"camera #{cam.id}: tracker", cam.tracker}) ++
+        for(
+          {name, profile} <- config.profiles,
+          do: {"profile #{name}: tracking.tracker", profile.tracker}
+        )
+
+    Enum.reduce(named, acc, fn
+      {_where, nil}, acc ->
+        acc
+
+      {where, name}, acc ->
+        check(
+          acc,
+          Map.has_key?(@trackers, name),
+          "#{where}: unknown tracker #{inspect(name)} (#{Enum.join(tracker_names(), ", ")})"
+        )
+    end)
   end
 
   # Reid's fusion has one seam into the tracker: the BBD admission

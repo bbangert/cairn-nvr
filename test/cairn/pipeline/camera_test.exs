@@ -24,7 +24,9 @@ defmodule Cairn.Pipeline.CameraTest do
     def handle_info(:flush, _ctx, state), do: {[], state}
   end
 
-  @policy %{pre: 5, post: 10, max: 300, track: nil, record: nil}
+  # `Cairn.Config.policy/2`'s shape, not a subset of it: the branch reads
+  # `max_live_tracks` off it to cap what a boundary may keep adoptable.
+  @policy %{pre: 5, post: 10, max: 300, track: nil, record: nil, max_live_tracks: 128}
 
   defp init(opts) do
     Pipeline.handle_init(
@@ -38,9 +40,11 @@ defmodule Cairn.Pipeline.CameraTest do
     spec
   end
 
-  # The detect branch needs a policy; every test that wants one wants the same
-  # one.
-  defp detect(opts \\ []), do: Keyword.put_new(opts, :policy, @policy)
+  # The detect branch needs a policy and a tracker core; every test that wants
+  # one wants the same pair.
+  defp detect(opts \\ []) do
+    opts |> Keyword.put_new(:policy, @policy) |> Keyword.put_new(:tracker, Cairn.Tracker)
+  end
 
   defp children(spec) do
     for builder <- spec, {name, definition, _opts} <- builder.children, into: %{} do
@@ -217,12 +221,12 @@ defmodule Cairn.Pipeline.CameraTest do
       assert log =~ "track identity"
     end
 
-    test "the detect sink's stats reach the owner, which is what the watchdog reads" do
+    test "the track sink's stats reach the owner, which is what the watchdog reads" do
       {_actions, state} = init(detect: detect())
       stats = %{dispatched: 1, dropped: 0, last_buffer_at_ms: -12_345}
 
       assert {[], _state} =
-               Pipeline.handle_child_notification({:stats, stats}, :detect, %{}, state)
+               Pipeline.handle_child_notification({:stats, stats}, :track_sink, %{}, state)
 
       assert_receive {:stats, ^stats}
     end
@@ -237,12 +241,14 @@ defmodule Cairn.Pipeline.CameraTest do
       assert Map.has_key?(children, {:ring_sink, 0})
     end
 
-    test "hangs off the tee: picker, decoder, inference, then the sink" do
+    test "hangs off the tee: picker, decoder, inference, stamper, tracker, sink" do
       spec = spec(detect: detect())
       links = links(spec)
 
       assert Enum.any?(links, &match?(%{from: :tee, to: :picker}, &1))
-      assert Enum.any?(links, &match?(%{from: :infer, to: :detect}, &1))
+      assert Enum.any?(links, &match?(%{from: :infer, to: :stamper}, &1))
+      assert Enum.any?(links, &match?(%{from: :stamper, to: :tracker}, &1))
+      assert Enum.any?(links, &match?(%{from: :tracker, to: :track_sink}, &1))
 
       # One AU in flight into the decoder, one sampled frame into inference.
       for {from, to} <- [{:picker, :decoder}, {:decoder, :infer}] do
@@ -253,6 +259,27 @@ defmodule Cairn.Pipeline.CameraTest do
         assert props.target_queue_size == 1
         assert props.min_demand_factor == 0.5
       end
+    end
+
+    test "the tracker element hosts the core the owner resolved, capped by the policy" do
+      spec = spec(detect: detect())
+
+      assert %Membrane.MOTTracker{tracker: {Cairn.Tracker, []}, max_suspended: 128} =
+               child(spec, :tracker)
+    end
+
+    test "a frame-counting core is told the rate and the cap it cannot read per batch" do
+      # `Cairn.Tracker` takes neither — it is milliseconds-native and reads the
+      # cap off every batch's context — while SparseTrack sizes its lost-track
+      # buffer as `frame_rate / 30 * track_buffer`, so a branch sampling at 5
+      # fps that said nothing would hold lost tracks six times as long.
+      spec = spec(detect: detect(tracker: Cairn.Detect.SparseTrack, sample_fps: 5))
+
+      assert %Membrane.MOTTracker{tracker: {Cairn.Detect.SparseTrack, opts}} =
+               child(spec, :tracker)
+
+      assert opts[:frame_rate] == 5
+      assert opts[:max_live] == @policy.max_live_tracks
     end
 
     test "the picker takes no options — the decoder's gate owns the rate" do
@@ -353,12 +380,15 @@ defmodule Cairn.Pipeline.CameraTest do
   end
 
   describe "the owner's messages" do
-    test "a reload's policy is forwarded to the sink, the only child that holds one" do
+    # The stamper alone: the sink's copy rides the batches it applies to
+    # (`Cairn.Pipeline.TrackSink`), so a second notification here would be the
+    # one that can arrive out of step with the first.
+    test "a reload's policy is forwarded to the head of the detect branch" do
       {_actions, state} = init(detect: detect())
       camera = %Camera{id: "cam", record: %{"person" => %{min_score: 0.9}}}
       policy = Map.put(@policy, :record, camera.record)
 
-      assert {[notify_child: {:detect, {:policy, ^camera, ^policy}}], _state} =
+      assert {[notify_child: {:stamper, {:policy, ^camera, ^policy}}], _state} =
                Pipeline.handle_info({:policy, camera, policy}, %{}, state)
     end
 
@@ -373,7 +403,7 @@ defmodule Cairn.Pipeline.CameraTest do
       {_actions, detecting} = init(detect: detect())
       {_actions, plain} = init([])
 
-      assert {[notify_child: {:detect, :stats}], _state} =
+      assert {[notify_child: {:track_sink, :stats}], _state} =
                Pipeline.handle_info(:detect_stats, %{}, detecting)
 
       assert {[], ^plain} = Pipeline.handle_info(:detect_stats, %{}, plain)
@@ -418,13 +448,17 @@ defmodule Cairn.Pipeline.CameraTest do
       assert opts[:initial_reason] == :started
     end
 
-    test "the camera's wire floor, and no rate: the engine's profile carries that" do
+    test "the camera's wire floor, and the profile's rate as a reading" do
       camera = %{camera("cam_group", {:group, "g"}) | min_score: %{"person" => 0.6}}
       start_owner(camera, config(camera))
 
       assert_receive {:pipeline_opts, opts}, 5_000
-      refute Keyword.has_key?(opts[:detect], :sample_fps)
       assert opts[:detect][:stream_params] == %{min_score: %{"person" => 0.6}}
+
+      # Not a rate the branch enforces — the decode NIF sheds to it from what
+      # the engine's profile said — but the number the elements counting frames
+      # have to agree with it on.
+      assert opts[:detect][:sample_fps] == 3
     end
 
     test "the camera and the policy the dispatch seam attaches" do

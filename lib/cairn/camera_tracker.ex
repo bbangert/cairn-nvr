@@ -2,11 +2,12 @@ defmodule Cairn.CameraTracker do
   @moduledoc """
   Owns one camera's event lifecycle — one process per camera, one active event.
 
-  Receives `Cairn.Observation`s from the pipeline's detect branch
-  (`Cairn.Pipeline.DetectSink` via `Cairn.Detect.Dispatch`), filters by
-  per-label `min_score` and the camera's
-  `record:` tier, assigns stable object identities (`Cairn.Tracker`, ULID
-  strings), and:
+  Receives tracked batches from the pipeline's detect branch
+  (`Cairn.Pipeline.TrackSink` via `Cairn.Detect.Dispatch`): the identities
+  `Membrane.MOTTracker` assigned one frame's detections, the lifecycle
+  transitions that batch caused, and the checkpoint snapshot taken after them.
+  The tracking is the element's; what a batch *means* is this process's. It
+  filters by per-label `min_score` and the camera's `record:` tier, and:
 
     * no active event + evidence -> starts a `Cairn.EventExtractor` and
       broadcasts `{:event_started, event}` on `"events"`
@@ -18,8 +19,10 @@ defmodule Cairn.CameraTracker do
   One process per camera, registered as `Cairn.Registry.via(camera_id,
   :camera_tracker)` and started on demand by `ensure/1` under
   `Cairn.TrackerSupervisor` — deliberately *outside* the per-camera media tree,
-  so restarting a camera's ingest does not take its tracking state
-  with it. The process is `:transient`: a crash restarts it and the fresh
+  so restarting a camera's ingest does not take its open event with it. The
+  tracks themselves do die with a pipeline rebuild, which is where the
+  checkpoint below earns its keep: the event finalizes from it either way.
+  The process is `:transient`: a crash restarts it and the fresh
   process restores from `Cairn.EventCheckpoint` in `init/1` — so the
   `:host_restart` finals a checkpoint owes go out immediately, not when the
   camera's next observation happens to arrive (a camera whose stream died with
@@ -30,9 +33,9 @@ defmodule Cairn.CameraTracker do
 
   Not every detection is evidence (`evidence?/3`, the one gate both of the
   first two bullets pass through): a predicted ("tracked") object is refused,
-  and so is one whose track the tracker has judged **stationary**. A parked car
-  therefore stops resetting the post-window, the event closes on schedule and
-  stays closed — nothing reopens it while the car sits there — and the car is
+  and so is one whose track the tracker element flagged **stationary**. A
+  parked car therefore stops resetting the post-window, the event closes on
+  schedule and stays closed — nothing reopens it while the car sits there — and the car is
   evidence again the moment it moves.
 
   The camera's `record:` tier refuses on the detection itself rather than on
@@ -46,9 +49,10 @@ defmodule Cairn.CameraTracker do
   is still being written and the snapshot does not exist. The media itself is
   announced by `Cairn.EventArtifact`.
 
-  Event times come from the observation rather than from any clock read here:
-  `started_at`, `labels[].t` and `trigger.t` derive from
-  `observation.observed_at`, which a v1 plugin captured next to the frame. The
+  Event times come from the batch rather than from any clock read here:
+  `started_at`, `labels[].t` and `trigger.t` derive from its `observed_at`,
+  which the engine captured next to the frame and the stamper put in the
+  tracking context (`Cairn.Pipeline.ObservationStamper`). The
   host's own clocks are still what *close* an event — `ended_at` in wall time,
   the post-window and max-event timers in monotonic — because quiet produces no
   observations to measure quiet with.
@@ -86,31 +90,50 @@ defmodule Cairn.CameraTracker do
   Those casts are unfiltered where everything above is filtered — a path is
   drawn for objects that never earned video, predicted and stationary ones
   included — and their delivery order relative to the finalize cast is what
-  keeps the last batch of an event; see `forward_boxes/3`.
+  keeps the last batch of an event; see `forward_boxes/2`.
 
-  Subscribes to `Cairn.StreamEpochs` and keeps only its own camera's
-  announcements: a new epoch **suspends** the live tracks rather than ending
-  them (`Cairn.Tracker.suspend/3`), so a detection in the new stream can adopt
-  an identity the outage interrupted instead of minting a second one for the
-  same parked car. What adoption demands of it, and what it resumes, is the
-  tracker's moduledoc. A suspension nothing adopts inside the window ends
-  `:stream_reset` — on a later batch, or on this process's own timer when the
-  stream never returns — with the timestamps it had at the cut. A camera that
-  *stops* ends everything at the boundary instead: nothing is coming that could
-  adopt it. Turning detection off at runtime ends both sets
-  (`:detection_disabled` for the live ones, `:stream_reset` for anything still
-  suspended) — nothing would advance them while it is off.
+  A stream boundary suspends the live tracks rather than ending them, so a
+  detection in the new stream can adopt an identity the outage interrupted
+  instead of minting a second one for the same parked car — but that is the
+  tracker element's doing now, and what reaches this process is the finals of
+  whatever did not survive it, on the batch that crossed the boundary or on one
+  of the element's own when the stream never came back. Turning detection off
+  at runtime ends the live set the same way, `:detection_disabled` (the gate is
+  `Cairn.Pipeline.ObservationStamper`, which stops feeding the element and tells
+  it to let go).
+
+  What the `Cairn.StreamEpochs` subscription is still for is `stale?/2` and the
+  end of a stream: an epoch announcement travels from a different process than
+  the batches do, so it can arrive while the old session's last batches are
+  still crossing the branch, and this is where they are recognised as stale and
+  dropped. `:camera_stopped` is the one announcement that also ends tracks
+  here: the pipeline that held them is going away, and what it emits on its way
+  out is not something to wait on — a killed one emits nothing at all — so they
+  are ended from the last summaries this process saw. A flushed one *does* emit
+  them, afterwards, and `stale?/2` recognises that drain by the epoch the stop
+  latched rather than ending everything twice.
 
   The active event is checkpointed to `Cairn.EventCheckpoint` (ETS owned
-  elsewhere, so it survives this process) together with the tracks live *and*
-  suspended at that moment: a replacement process re-attaches to a live
-  extractor, finalizes an orphan, and ends every restored track
-  (`:host_restart`) — broadcasting it and recording it against the
-  checkpointed event, the open-event rule above. A suspension cannot outlive
-  the tracker that would have adopted it, so it dies there with the rest.
-  Writes are throttled to one a second apart from the event's first and last.
-  How far that reaches, and what it does not cover, is `Cairn.Track`'s
-  moduledoc.
+  elsewhere, so it survives this process) together with the snapshot the batch
+  carried — every track the element still owes a final summary for, live and
+  suspended alike: a replacement process re-attaches to a live extractor,
+  finalizes an orphan, and ends every restored track (`:host_restart`) —
+  broadcasting it and recording it against the checkpointed event, the
+  open-event rule above. Writes are throttled to one a second, apart from the
+  event's first and last and from the empty snapshot a `:camera_stopped`
+  leaves: those finals have gone out already, and a row still naming them
+  would have a restart inside the post window end them a second time. How far
+  that reaches, and what it does not cover, is `Cairn.Track`'s moduledoc.
+
+  One gap that moduledoc does not cover, because the tracks and this process
+  stopped dying together: a **pipeline rebuild** (a crash or the watchdog, not
+  a reconnect) takes the tracker element's tracks with it while this process
+  lives on, so nobody emits their finals — the checkpoint restore that covers
+  this process's own crash does not run, since it did not crash. Their rows are
+  closed by `Cairn.Tracks.close_live/0` at the next boot and their event still
+  finalizes on its own timers. Bounded by how rare a rebuild is (nothing
+  rebuilds per reconnect anymore) and accepted as the price of the tracks
+  living in the pipeline.
   """
 
   use GenServer, restart: :transient
@@ -118,7 +141,8 @@ defmodule Cairn.CameraTracker do
   require Logger
 
   alias Cairn.{CameraControl, Config, Event, EventCheckpoint, Events, Observation, StreamEpochs}
-  alias Cairn.{Track, Tracker, TrackRecorder}
+  alias Cairn.Detect.Dispatch
+  alias Cairn.{Track, TrackRecorder}
 
   @max_label_entries 5_000
   # The host's own clock, deliberately: it throttles what a subscriber
@@ -131,9 +155,10 @@ defmodule Cairn.CameraTracker do
   # rewritten on every observation batch. It exists only so a replacement
   # process can re-attach to a live extractor and emit finals, and a recovered
   # event is written `:partial` either way — so losing the last second of
-  # labels costs nothing that the recovery does not already cost. The two
-  # transitions that *do* matter for restore are exempt: the first write at
-  # event start, and the delete at event end.
+  # labels, or of the track list's last second of churn, costs nothing that the
+  # recovery does not already cost. The two transitions that *do* matter for
+  # restore are exempt: the first write at event start, and the delete at event
+  # end.
   @checkpoint_throttle_ms 1_000
 
   @doc """
@@ -142,8 +167,8 @@ defmodule Cairn.CameraTracker do
   `:camera_id` is required. `:name` defaults to this camera's registered
   via-tuple; `nil` starts it unregistered, which is how a test drives one
   directly. The remaining options (`:start_extractor`, `:finalize_extractor`,
-  `:recorder`, `:monotonic_ms`, `:window_ms`, `:cut_clock`) are injection
-  seams documented at their defaults in `init/1`.
+  `:recorder`, `:monotonic_ms`) are injection seams documented at their
+  defaults in `init/1`.
   """
   def start_link(opts) do
     camera_id = Keyword.fetch!(opts, :camera_id)
@@ -170,9 +195,10 @@ defmodule Cairn.CameraTracker do
   tracker's death is indistinguishable from one dropped by its crash.
 
   `DynamicSupervisor.start_child/2` is a `call`, so it *exits* when the
-  supervisor is down (its own restart window). This runs in a plugin port, and
-  a port must not die because the tracker tree is briefly absent — the exit is
-  caught and reported as an error instead.
+  supervisor is down (its own restart window). This runs in the camera's
+  pipeline, in `Cairn.Pipeline.TrackSink`, and a detect branch must not die
+  because the tracker tree is briefly absent — the exit is caught and reported
+  as an error instead.
   """
   @spec ensure(String.t()) :: {:ok, pid()} | {:error, term()}
   def ensure(camera_id) do
@@ -197,19 +223,20 @@ defmodule Cairn.CameraTracker do
   end
 
   @doc """
-  Called by the plugin ports with a decoded, config-tagged observation.
+  Called by `Cairn.Detect.Dispatch` with one tracked batch
+  (`t:Cairn.Detect.Dispatch.batch/0`).
 
   `policy` is `Cairn.Config.policy/2` for the camera: the event windows, the
   tracking settings and the host-side `track:` / `record:` tiers, resolved at
-  the port so this per-frame path never calls the config server.
+  pipeline birth so this per-frame path never calls the config server.
 
   Routes to the camera's own tracker, starting it if this is the first batch.
   """
-  @spec detections(Cairn.Config.Camera.t(), map(), Observation.t()) :: :ok
-  def detections(camera, policy, %Observation{} = observation) do
+  @spec tracked(Cairn.Config.Camera.t(), map(), Dispatch.batch()) :: :ok
+  def tracked(camera, policy, batch) when is_map(batch) do
     case ensure(camera.id) do
       {:ok, pid} ->
-        GenServer.cast(pid, {:detections, camera, policy, observation})
+        GenServer.cast(pid, {:tracked, camera, policy, batch})
 
       {:error, reason} ->
         Logger.debug("camera #{camera.id}: no tracker for this batch (#{inspect(reason)})")
@@ -218,16 +245,15 @@ defmodule Cairn.CameraTracker do
   end
 
   @doc """
-  `detections/3` addressed to an explicit process — the ports' injection seam,
+  `tracked/3` addressed to an explicit process — the producer's injection seam,
   where a test substitutes itself for the camera's tracker and inspects the
-  cast. `nil` means "the camera's own tracker", i.e. `detections/3`.
+  cast. `nil` means "the camera's own tracker", i.e. `tracked/3`.
   """
-  @spec detections(GenServer.server() | nil, Cairn.Config.Camera.t(), map(), Observation.t()) ::
-          :ok
-  def detections(nil, camera, policy, observation), do: detections(camera, policy, observation)
+  @spec tracked(GenServer.server() | nil, Cairn.Config.Camera.t(), map(), Dispatch.batch()) :: :ok
+  def tracked(nil, camera, policy, batch), do: tracked(camera, policy, batch)
 
-  def detections(server, camera, policy, %Observation{} = observation),
-    do: GenServer.cast(server, {:detections, camera, policy, observation})
+  def tracked(server, camera, policy, batch) when is_map(batch),
+    do: GenServer.cast(server, {:tracked, camera, policy, batch})
 
   @doc """
   Starts a tracker for every camera holding a checkpointed event, so a restore
@@ -261,18 +287,23 @@ defmodule Cairn.CameraTracker do
       camera_id: camera_id,
       event: nil,
       extractor: nil,
-      tracker: Tracker.new(),
       track_updates: %{},
       current_epoch: seed_epoch(camera_id),
+      # The epoch that was current when this camera was stopped, held until the
+      # next one is adopted: what a dying pipeline still drains is tagged with
+      # it, and `apply_epoch/3` has already ended those tracks. See `stale?/2`.
+      stopped_epoch: nil,
+      # why the current epoch was minted, for the boundary's own report. It
+      # comes from the announcement and the counts come from the batch that
+      # crossed the boundary, and the announcement is a direct PubSub send
+      # while the batch has a decode and an inference call ahead of it — so
+      # this is the older of the two by construction, never the newer.
+      epoch_reason: nil,
       # the wall instant the last stream reset cut this camera off at, held
-      # only until the first observation of the new epoch measures the gap to
-      # it (`report_gap/2`)
+      # only until the first batch of the new epoch measures the gap to it
+      # (`report_gap/2`)
       gap_from: nil,
-      # the pending `:adoption_window` sweep, so arming the next one cancels
-      # it. Not event state: `clear_event/1` leaves it alone, because a
-      # suspension outlives the event that happened to be open at the cut.
-      window_ref: nil,
-      # last seen in `process_detections/5`; see the comment there
+      # last seen in `process_batch/4`; see the comment there
       policy: nil,
       camera: nil,
       checkpointed_at: nil,
@@ -288,20 +319,7 @@ defmodule Cairn.CameraTracker do
       # the database — see `Cairn.TrackRecorder`.
       recorder: Keyword.get(opts, :recorder, TrackRecorder),
       # injectable so the update throttle can be tested without sleeping
-      monotonic_ms: Keyword.get(opts, :monotonic_ms, &default_monotonic_ms/0),
-      # How long after a stream reset this process sweeps the suspensions the
-      # tracker is holding. Injectable for the same reason: the real delay is
-      # the adoption window plus slack, and no test should sit through a
-      # minute of it to prove the sweep is armed.
-      window_ms: Keyword.get(opts, :window_ms, Tracker.adoption_window_ms() + 1_000),
-      # The observation-clock instant a stream cut is stamped with, which is
-      # what the tracker measures the adoption window from. The same clock
-      # `monotonic_ms` reads — both default to the real one — and injectable
-      # separately for the reason `window_ms` is: the window is a minute, so a
-      # test proving a suspension lapses has to be able to put the cut a minute
-      # in the past while leaving the sweep on the real clock, the two being
-      # what an elapsed time is taken between.
-      cut_clock: Keyword.get(opts, :cut_clock, &default_monotonic_ms/0)
+      monotonic_ms: Keyword.get(opts, :monotonic_ms, &default_monotonic_ms/0)
     }
 
     {:ok, restore_from_checkpoint(state)}
@@ -321,33 +339,20 @@ defmodule Cairn.CameraTracker do
 
   @impl true
   def handle_cast(
-        {:detections, %{id: camera_id} = camera, policy, observation},
+        {:tracked, %{id: camera_id} = camera, policy, batch},
         %{camera_id: camera_id} = state
       ) do
-    control = CameraControl.get(camera_id)
-    observation = observation |> with_observed_at() |> with_at_ms(state)
-
-    cond do
-      not control.detection_enabled ->
-        # detection disabled at runtime: drop the batch, and retire whatever
-        # was live — nothing will advance those tracks while detection is off,
-        # so leaving them "live" would strand every consumer's entities and
-        # keep their throttle state resident. An in-flight event is left to
-        # finalize naturally on its post-window timer.
-        {:noreply, end_tracks_disabled(state)}
-
-      stale?(state, observation) ->
-        {:noreply, state}
-
-      true ->
-        {:noreply, process_detections(state, camera, policy, observation, control)}
+    if stale?(state, batch) do
+      {:noreply, state}
+    else
+      {:noreply, process_batch(state, camera, policy, batch)}
     end
   end
 
-  # A batch addressed to another camera. The ports route through `ensure/1` on
-  # the observation's own camera, so this is a misroute rather than a race —
-  # dropped and said out loud, never folded into this camera's tracker.
-  def handle_cast({:detections, camera, _policy, _observation}, state) do
+  # A batch addressed to another camera. The producer routes through `ensure/1`
+  # on its own camera, so this is a misroute rather than a race — dropped and
+  # said out loud, never folded into this camera's event.
+  def handle_cast({:tracked, camera, _policy, _batch}, state) do
     Logger.warning(
       "camera #{state.camera_id}: dropped a batch addressed to " <>
         "#{inspect(Map.get(camera, :id))}"
@@ -356,46 +361,46 @@ defmodule Cairn.CameraTracker do
     {:noreply, state}
   end
 
-  # Invariant: every observation leaving a port carries a `%DateTime{}` — the
-  # codec parses one for v1 and the port stamps arrival for v0 — and every
-  # time in an event derives from it. `detections/3` is a public entry point
-  # any caller can reach, so a `nil` slipping through must not be a
-  # `FunctionClauseError` in `DateTime.diff/3` here.
-  defp with_observed_at(%Observation{observed_at: at} = observation)
-       when is_struct(at, DateTime),
-       do: observation
-
-  defp with_observed_at(observation), do: %{observation | observed_at: now()}
-
-  # The same invariant for the clock the tracker decides on: the ports stamp
-  # every observation they forward (`Cairn.ObservationClock`), and a caller
-  # reaching `detections/3` directly must not put a `nil` into the tracker's
-  # arithmetic. Falling back to the host clock is honest but coarse — it dates
-  # the batch's *arrival* and carries none of the spacing between frames that
-  # the ports' clock takes from the pts, nor its non-decreasing clamp; the
-  # test seams that are this fallback's only callers accept both.
-  defp with_at_ms(%Observation{at_ms: at_ms} = observation, _state) when is_number(at_ms),
-    do: observation
-
-  defp with_at_ms(observation, state), do: %{observation | at_ms: state.monotonic_ms.()}
-
   # Load-bearing, not belt and braces: the detect branch outlives session
-  # boundaries and tags observations with the epoch of the buffer they came
-  # from, so an old-epoch frame drained after a reconnect arrives here
-  # truthfully tagged — and this comparison is the only thing that drops it.
-  # Compared against the same `current_epoch` the epoch broadcast maintains,
-  # seeded in `init/1` from the epoch this camera was already streaming under.
+  # boundaries and tags its buffers with the epoch of the frame they came from,
+  # so an old-epoch batch drained after a reconnect arrives here truthfully
+  # tagged — and this comparison is the only thing that drops it. The
+  # announcement it is compared against travels by PubSub while the batch
+  # travels down the branch, which is why the two can cross at all.
   #
-  # An observation with no epoch (a v0 recorded-plugin line, or replay tooling
-  # that sets none) is accepted, as is one for a camera whose epoch is not
-  # known here yet: that first observation's epoch is adopted in
-  # `process_detections/5`.
-  defp stale?(_state, %Observation{epoch: nil}), do: false
+  # Dropping the batch drops its lifecycle events with it, as it always has —
+  # but the tracker element does *not* drop it, and cannot: in the branch's own
+  # order it precedes the boundary, so it is the tail of the old session rather
+  # than a stray. So an identity minted in the drain window is one this process
+  # is never told about, and reaches it later as an `:updated` with no
+  # `:started` before it (published as a bare `track_updated`). Bounded by the
+  # window — the few batches in flight when the announcement overtook them.
+  #
+  # A batch with no epoch (replay tooling that sets none) is accepted, as is
+  # one for a camera whose epoch is not known here yet: that first batch's
+  # epoch is adopted in `process_batch/4`. The one epoch judged against no
+  # current one is the stopped camera's, below.
+  defp stale?(_state, %{epoch: nil}), do: false
 
-  defp stale?(%{current_epoch: nil}, _observation), do: false
-  defp stale?(%{current_epoch: epoch}, %Observation{epoch: epoch}), do: false
+  # The stopped camera's drain, and the other half of `apply_epoch/3`'s
+  # `:camera_stopped` clause: the stop is announced *before* the pipeline is
+  # flushed, so the EOS that follows reaches the tracker element and its
+  # `end_all` emits a second final for every track the announcement already
+  # ended — arriving here tagged with the epoch the dying session ran under.
+  # Clearing `current_epoch` is what would let them in (a nil epoch judges
+  # nothing stale), so the latch is what keeps them out.
+  #
+  # A batch under a genuinely new epoch is not this: the stream came back, and
+  # adopting its epoch in `process_batch/4` releases the latch.
+  defp stale?(%{stopped_epoch: epoch} = state, %{epoch: epoch}),
+    do: drop(state, epoch, "the stopped camera's drain")
 
-  defp stale?(state, %Observation{epoch: epoch}) do
+  defp stale?(%{current_epoch: nil}, _batch), do: false
+  defp stale?(%{current_epoch: epoch}, %{epoch: epoch}), do: false
+
+  defp stale?(state, %{epoch: epoch}), do: drop(state, epoch, "a stale epoch")
+
+  defp drop(state, epoch, why) do
     # Rare by construction, so it is counted rather than logged per line: a
     # boundary drains at most a burst of old-epoch frames, so a steady rate
     # here means something upstream is mis-tagging.
@@ -407,72 +412,78 @@ defmodule Cairn.CameraTracker do
       camera_id: state.camera_id
     })
 
-    Logger.debug("camera #{state.camera_id}: dropped observation from stale epoch #{epoch}")
+    Logger.debug("camera #{state.camera_id}: dropped batch from #{why} (#{epoch})")
     true
   end
 
-  defp process_detections(state, camera, policy, observation, control) do
-    # One binding, read twice: the tracker partitions this batch against the
-    # floor (below it a box may match a live track but never mint one), and
-    # `evidence?/3` below gates what may open an event on the same number. They
-    # have to be the same number — a box that may earn video but may not mint
-    # the track carrying it would be an event with no identity behind it.
-    min_score = effective_min_score(camera, control)
-
-    context =
-      Tracker.context(
-        observation,
-        camera.id,
-        Map.put(tracking_policy(policy), :min_score, min_score)
-      )
-
-    {tracker, tagged, track_events} = Tracker.track(state.tracker, observation.objects, context)
-
+  defp process_batch(state, camera, policy, batch) do
     state =
       %{
         state
-        | tracker: tracker,
-          current_epoch: state.current_epoch || observation.epoch,
+        | current_epoch: state.current_epoch || batch.epoch,
+          # This batch is not the drain of whatever was stopped — `stale?/2`
+          # dropped that — so the camera is streaming again and the latch has
+          # nothing left to recognise.
+          stopped_epoch: nil,
           # Cached for the track rows, and set before the events of this batch
           # are published so a track ending in it is gated on this batch's
-          # policy. The ended-track paths that need them — `apply_epoch/3`,
-          # `end_tracks_disabled/1`, checkpoint restore — are handed neither a
-          # camera nor a policy, and reaching for the config server there would
-          # put a call on a path an epoch broadcast drives.
+          # policy. The ended-track paths that need them — `apply_epoch/3` and
+          # checkpoint restore — are handed neither a camera nor a policy, and
+          # reaching for the config server there would put a call on a path an
+          # epoch broadcast drives.
           policy: policy,
           camera: camera
       }
-      |> report_link(observation, track_events)
-      |> publish_tracks(track_events)
+      |> report_link(batch)
+      |> publish_tracks(batch.events)
 
-    # A predicted ("tracked") object, a track the plugin keeps predicting long
+    # A predicted ("tracked") object, a track the tracker keeps predicting long
     # after anything last detected it, and a track that has held still past the
     # camera's `stationary_after_ms` are all not evidence: they keep the
     # tracker warm but can neither open an event nor hold one open. Nor is a
     # detection the camera's `record:` tier does not admit.
     #
-    # `Map.get/2` for the same reason as `tracking_policy/1`: `detections/3` is
-    # a public entry point any caller can hand a bare map, and a missing key
-    # has to read as an absent block rather than raise on this path.
-    record_tier = Map.get(policy, :record)
-    passing = Enum.filter(tagged, &evidence?(&1, min_score, record_tier))
+    # The floor is the batch's own — the effective one the tracker partitioned
+    # it against, runtime override included (see
+    # `Cairn.Pipeline.ObservationStamper`). Reading the override again here
+    # would be a second read of a mutable table, and a box that may earn video
+    # but may not mint the track carrying it is an event with no identity
+    # behind it.
+    #
+    # `Map.get/2` for the record tier: `tracked/3` is a public entry point any
+    # caller can hand a bare map, and a missing key has to read as an absent
+    # block rather than raise on this path.
+    # The `||` is for the batches that carry no context — the element's own,
+    # which have no tagged objects either, so it decides nothing and exists so
+    # that a caller handing one by hand cannot put a nil in the comparison.
+    min_score = batch.min_score || camera.min_score
+    passing = Enum.filter(batch.tagged, &evidence?(&1, min_score, Map.get(policy, :record)))
 
     state =
       cond do
-        passing == [] -> state
+        # No evidence, but the batch still moved the tracker: a live track
+        # ended, one below the tier started. An open event's checkpoint has to
+        # follow that too, or a crash inside the post window restores finals
+        # for tracks that already ended and none for the ones still live.
+        passing == [] -> checkpoint(state, batch.snapshot)
         # recording disabled: evaluate detections but don't open a new event
-        state.event == nil and not control.recording_enabled -> state
-        state.event == nil -> start_event(state, camera, policy, observation, passing)
-        true -> update_event(state, policy, observation, passing)
+        state.event == nil and not recording_enabled?(state) -> state
+        state.event == nil -> start_event(state, camera, policy, batch, passing)
+        true -> update_event(state, policy, batch, passing)
       end
 
     # After the lifecycle `cond` and on its result, deliberately: the batch
     # that opens an event is part of that event's path (at `t_ms` 0), and
     # before the `cond` `state.event` would still be nil for it.
-    forward_boxes(state, observation, tagged)
+    forward_boxes(state, batch)
 
     state
   end
+
+  # The one runtime control left on this path: detection being off is the
+  # stamper's gate, upstream, so a batch that got here was produced under a
+  # camera whose detection is on.
+  defp recording_enabled?(state), do: CameraControl.get(state.camera_id).recording_enabled
 
   # The dense half of the track viewer: every tagged box of an open event, in
   # the compact shape `Cairn.TrackPath` reads (`box_entry`).
@@ -491,9 +502,9 @@ defmodule Cairn.CameraTracker do
   # property of the spliced clip and not of this list; it predates adoption,
   # which only means a single track id can now be on both sides of it.
   #
-  # The other gap is upstream: a box `Cairn.Tracker` refused and suppressed
-  # as a duplicate never reaches `tagged` at all, and cannot, because it has no
-  # `object_id` to draw it under. That is the trade the tracker makes on
+  # The other gap is upstream: a box the tracker refused and suppressed as a
+  # duplicate never reaches `tagged` at all, and cannot, because it has no
+  # `object_id` to draw it under. That is the trade `Cairn.Tracker` makes on
   # purpose — a gap in one path, rather than a second path over the same
   # object for as long as the duplicate identity lives.
   #
@@ -507,19 +518,26 @@ defmodule Cairn.CameraTracker do
   #
   # A cast to an extractor that has already exited is a no-op, so nothing here
   # checks whether the pid is alive.
-  defp forward_boxes(%{event: %Event{} = event, extractor: pid}, observation, tagged)
+  #
+  # The element's own buffers carry no `observed_at` and no boxes, so there is
+  # nothing to draw and nothing to date it by; they fall through the clause
+  # below.
+  defp forward_boxes(
+         %{event: %Event{} = event, extractor: pid},
+         %{observed_at: %DateTime{} = observed_at, tagged: tagged}
+       )
        when is_pid(pid) do
     GenServer.cast(
       pid,
       {:track_boxes,
        %{
-         t_ms: DateTime.diff(observation.observed_at, event.started_at, :millisecond),
+         t_ms: DateTime.diff(observed_at, event.started_at, :millisecond),
          boxes: Enum.map(tagged, &{&1.object_id, &1.label, &1.bbox, &1.stationary})
        }}
     )
   end
 
-  defp forward_boxes(_state, _observation, _tagged), do: :ok
+  defp forward_boxes(_state, _batch), do: :ok
 
   # The single gate: the objects this accepts are `passing`, which is what both
   # `start_event/5` and `update_event/4` are handed, so what is refused here
@@ -529,8 +547,9 @@ defmodule Cairn.CameraTracker do
   # by every frame of a car that is going nowhere.
   #
   # `object.stationary` is read directly rather than defaulted: every object
-  # this is called with came out of `Tracker.track/3`, which tags `object_id`,
-  # `stale_predicted` and `stationary` onto every object it returns.
+  # this is called with came out of a tracker core's `track/3`, whose contract
+  # with this host is that it tags `object_id`, `stale_predicted` and
+  # `stationary` onto every object it returns.
   #
   # `stale_predicted` is not checked here and must not be: the tracker sets it
   # from the last *detection*, so an object that is detected in this batch
@@ -564,55 +583,6 @@ defmodule Cairn.CameraTracker do
     end
   end
 
-  # Defensive on a public, @spec'd entry point (`detections/3`) that any caller
-  # can hand a bare map: the tracker's bounds must not silently become nil.
-  defp tracking_policy(policy) do
-    base = %{
-      max_unseen_ms: Map.get(policy, :max_unseen_ms) || Config.default_max_unseen_ms(),
-      max_live_tracks: Map.get(policy, :max_live_tracks) || Config.default_max_live_tracks(),
-      stationary_after_ms:
-        Map.get(policy, :stationary_after_ms) || Config.default_stationary_after_ms(),
-      # `Map.get/3` where its three neighbours use `||`: these four are
-      # booleans, and `||` would read an explicit `false` as an absent key —
-      # the same answer only for as long as the default is `false`.
-      bbd: Map.get(policy, :bbd, Config.default_bbd()),
-      oru: Map.get(policy, :oru, Config.default_oru()),
-      ocr: Map.get(policy, :ocr, Config.default_ocr()),
-      reid: Map.get(policy, :reid, Config.default_reid())
-    }
-
-    # A profiled camera's policy carries a stage presence map, and it rides
-    # this hop unmodified — `Cairn.Tracker.context/3` is where it supersedes
-    # the booleans above. Absent for every unprofiled camera, whose map stays
-    # exactly the pre-profile one.
-    case Map.get(policy, :stages) do
-      nil -> base
-      stages -> Map.put(base, :stages, stages)
-    end
-  end
-
-  # Detection off ends every track outright: nothing will observe this camera
-  # again until it is turned back on, so there is nothing left to wait for and
-  # no suspension to offer (that is the epoch cuts' business, below).
-  defp end_tracks_disabled(state) do
-    case Tracker.end_all(state.tracker, :detection_disabled) do
-      {tracker, [_ | _] = ended} ->
-        publish_tracks(%{state | tracker: tracker}, ended)
-
-      # nothing live: the second disabled batch onwards is a no-op, and the
-      # tracker is left alone rather than replaced.
-      _ ->
-        state
-    end
-  end
-
-  # A runtime min_score override replaces the camera's configured thresholds
-  # (applied as the default for every label); nil means "use config". It moves
-  # the floor and only the floor — the `record:` tier applies on top of
-  # whatever comes out of here (see `earns_video?/3`).
-  defp effective_min_score(camera, %{min_score: nil}), do: camera.min_score
-  defp effective_min_score(_camera, %{min_score: override}), do: %{"default" => override}
-
   @impl true
   def handle_info({:post_window, event_id, token}, state) do
     # the token guards against a stale timer message that was already in
@@ -632,28 +602,18 @@ defmodule Cairn.CameraTracker do
     end
   end
 
-  # A new epoch is a new continuous decode. Nothing observed the gap, so no
-  # track may go on matching *ordinarily* across it — but most of the time the
-  # objects either side are the same objects, and ending them all was itself a
-  # defect: a parked car severed by a 300 ms reconnect re-minted, spent its
-  # settle window looking like a new arrival, and that is evidence, and
-  # evidence is a clip. The live tracks are therefore suspended (see the
-  # moduledoc and `Cairn.Tracker.suspend/3`) and only what cannot be adopted —
-  # a generation of ghosts the cap pushed out, a suspension whose window
-  # already lapsed — gets a final summary here. An in-flight event keeps
-  # running and finalizes on its own timers.
+  # What a new epoch does to the tracks is the tracker element's business now
+  # (it suspends them in-band, on the buffer that crossed the boundary). What
+  # is left here is the bookkeeping `stale?/2` reads: an announcement travels
+  # by PubSub while the batches travel down the branch, so one can arrive with
+  # the old session's last batches still in flight, and holding the current
+  # epoch here is what lets those be recognised and dropped.
   #
-  # Detection casts already in flight when this arrives are processed *after*
-  # the reset: they come from the plugin ports, not from `Cairn.StreamEpochs`,
-  # and the BEAM only orders messages per sender pair, so a batch from before
-  # the boundary would otherwise seed the fresh tracker. The epoch now travels
-  # with the batch — tagged at the producer, compared in `stale?/2` against the
-  # `current_epoch` stored here — so such a batch is dropped instead.
   # An epoch older than the one already held is ignored (see
-  # `Cairn.ULID.superseded?/2`): applying it would roll `current_epoch` back
-  # to a stream nothing decodes under, and `stale?/2` would then drop every
-  # observation the ports still forward — a silent, sustained outage for this
-  # camera until its next mint.
+  # `Cairn.ULID.superseded?/2`): applying it would roll `current_epoch` back to
+  # a stream nothing decodes under, and `stale?/2` would then drop every batch
+  # the branch still forwards — a silent, sustained outage for this camera
+  # until its next mint.
   #
   # The topic carries every camera's mints; only this camera's are ours.
   def handle_info({:stream_epoch, camera_id, epoch, reason}, %{camera_id: camera_id} = state) do
@@ -662,46 +622,6 @@ defmodule Cairn.CameraTracker do
     else
       {:noreply, apply_epoch(state, epoch, reason)}
     end
-  end
-
-  # A suspension is collected by whatever comes first — a batch, another reset,
-  # or this. It exists for the case where nothing comes first: a camera whose
-  # stream never returns produces no observations to notice the window running
-  # out on, and its consumers would wait forever for a final summary the
-  # tracker is still holding.
-  #
-  # Deliberately unguarded by a token, unlike the event timers. A token there
-  # keeps a stale message from finalizing the *current* event, which is a
-  # different event from the one the message named; this message names no
-  # suspension, and the sweep ends whatever has actually lapsed and nothing
-  # else, so running it early or twice is a map walk with no result. What it
-  # is guarded by is `window_ref`: `window_timer/1` cancels the pending sweep
-  # before arming the next, so this camera holds one *armed* timer rather than
-  # one per reset however fast it flaps. A message already in the mailbox when
-  # the cancel lands is still delivered — which is the harmless case above.
-  #
-  # It re-arms while anything is still suspended, and that is what keeps the
-  # harmless case above from stranding one. A sweep already in the mailbox when
-  # `window_timer/1` cancels its timer still arrives, and this handler clears
-  # `window_ref` when it does — losing the reference to the timer the reset had
-  # just armed, which then fires untracked. The re-arm is what puts a tracked
-  # one back. Its cost in the normal case is one extra hop that finds nothing
-  # and arms nothing, because the sweep that lapses the last suspension leaves
-  # none behind. This timer and the cut it sweeps against are both the host's
-  # monotonic clock (`Cairn.Tracker.suspend/3` is handed `cut_clock`), so the
-  # sweep cannot land before the window it is waiting on. A batch measures the
-  # same window on its own `at_ms`, which never runs ahead of that clock — so
-  # of the two, this is never the later to notice a lapse.
-  def handle_info(:adoption_window, state) do
-    {tracker, lapsed} = Tracker.expire_suspended(state.tracker, state.monotonic_ms.())
-
-    state =
-      %{state | tracker: tracker, window_ref: nil}
-      |> publish_tracks(lapsed)
-      |> rearm_window()
-
-    report_expired(state.camera_id, lapsed)
-    {:noreply, state}
   end
 
   # `:noproc` is a clean finish, not a crash. `restore_from_checkpoint/1` can
@@ -730,9 +650,11 @@ defmodule Cairn.CameraTracker do
   def handle_info(_msg, state), do: {:noreply, state}
 
   # `:camera_stopped` names the end of a stream, not the start of one: nothing
-  # will ever decode under that epoch. It ends the live tracks and any
-  # suspended ones (the stream they belong to is over, so nothing is coming
-  # that could adopt them) but must never become `current_epoch` — the stop
+  # will ever decode under that epoch. It ends every track this process still
+  # has a summary for — the pipeline that held them is being torn down, so no
+  # batch is coming that could carry their finals, and nothing is coming that
+  # could adopt them either — but the epoch must never become `current_epoch`.
+  # The stop
   # and the start of one camera are announced by different processes, and on the
   # degraded caller-side broadcast path they have no ordering relation, so a
   # stop epoch minted after a live `:started` could otherwise be adopted as
@@ -744,95 +666,96 @@ defmodule Cairn.CameraTracker do
   # judged against, and holding the dead one would drop the first batch of a
   # stream that came back before its mint was announced. The next mint seeds it
   # again.
+  #
+  # What it is moved to rather than dropped is the other half of that: the
+  # tracks ended here are ended again by the pipeline being torn down behind
+  # this announcement (`Cairn.PipelineOwner` broadcasts, then flushes; the EOS
+  # reaches `Membrane.MOTTracker` and its `end_all` finals arrive as an
+  # ordinary batch), and with `current_epoch` nil there is nothing left to
+  # recognise them by. `stale?/2` reads the latch; a fresh epoch releases it.
+  # The old value survives a repeated announcement, which would otherwise
+  # overwrite the latch with the `current_epoch` the first one emptied.
   defp apply_epoch(state, _epoch, :camera_stopped) do
-    {tracker, ended} = Tracker.end_all(state.tracker, :stream_reset)
+    ended =
+      for {_id, %{track: %Track{} = track}} <- state.track_updates,
+          do: {:ended, %{track | end_reason: :stream_reset}}
 
-    publish_tracks(
-      %{state | tracker: tracker, current_epoch: nil, gap_from: nil},
-      ended
-    )
+    state = %{
+      state
+      | current_epoch: nil,
+        stopped_epoch: state.current_epoch || state.stopped_epoch,
+        gap_from: nil
+    }
+
+    state = publish_tracks(state, ended)
+
+    # The finals above are the last word on those identities, and an open
+    # event's checkpoint has to say so: a restart inside the post window
+    # restores the row, and a row still naming them ends them a second time as
+    # `:host_restart`. No batch is coming to correct it — the pipeline behind
+    # this announcement is being torn down — so the throttle is bypassed: this
+    # is a lifecycle transition, not a frame.
+    if state.event, do: write_checkpoint(state, []), else: state
   end
 
   # One mint can be announced twice by design: `Cairn.StreamEpochs` broadcasts
   # from the caller when its server is unreachable, and a call that exited with
   # :timeout may still be served afterwards. The epoch is the same either way,
-  # so a repeat means no boundary was crossed — ending every live track again
-  # would cut them mid-stream. The repeat is caught even for the mint that
-  # predates this process: `init/1` seeds `current_epoch` from the epoch table.
+  # so a repeat means no boundary was crossed. The repeat is caught even for the
+  # mint that predates this process: `init/1` seeds `current_epoch` from the
+  # epoch table.
   defp apply_epoch(%{current_epoch: epoch} = state, epoch, _reason), do: state
 
-  defp apply_epoch(state, epoch, reason) do
-    {tracker, ended, suspension} =
-      Tracker.suspend(state.tracker, max_suspended(state), state.cut_clock.())
+  defp apply_epoch(state, epoch, reason),
+    do: %{state | current_epoch: epoch, epoch_reason: reason, stopped_epoch: nil}
 
+  # -- link health ------------------------------------------------------------
+
+  # What the boundary did, reported from the batch that carried it across:
+  # the tracker element suspends in-band, so the counts arrive with the first
+  # batch of the new session rather than with the announcement of it.
+  defp report_suspension(state, %{suspension: nil}), do: state
+
+  defp report_suspension(state, %{suspension: suspension}) do
     Logger.info(
-      "camera #{state.camera_id}: stream reset (#{reason}) — #{suspension.suspended} track(s) " <>
-        "suspended for adoption, #{suspension.ended} ended"
+      "camera #{state.camera_id}: stream reset (#{state.epoch_reason}) — " <>
+        "#{suspension.suspended} track(s) suspended for adoption, #{suspension.ended} ended"
     )
 
     :telemetry.execute(
       [:cairn, :tracker, :stream_reset],
       %{suspended: suspension.suspended, ended: suspension.ended},
-      %{camera_id: state.camera_id, reason: reason}
+      %{camera_id: state.camera_id, reason: state.epoch_reason}
     )
 
-    %{state | tracker: tracker, current_epoch: epoch, gap_from: suspension.at}
-    |> rearm_window()
-    |> publish_tracks(ended)
-  end
-
-  # -- link health ------------------------------------------------------------
-
-  # The cap the suspended set is trimmed to. The same number as the live one on
-  # purpose — a camera cannot suspend more tracks than it was allowed to hold —
-  # and read from the cached policy for the reason `qualifies?/2` reads it
-  # there: this runs on an epoch broadcast, which is handed no camera and no
-  # policy, and the config server has no business on a path a flapping stream
-  # drives.
-  defp max_suspended(state), do: tracking_policy(state.policy || %{}).max_live_tracks
-
-  # Armed only while this camera has something to sweep: a reset that suspends
-  # nothing arms nothing, and the sweep that collects the last suspension does
-  # not come back.
-  defp rearm_window(state) do
-    if Tracker.suspended_count(state.tracker) > 0, do: window_timer(state), else: state
-  end
-
-  # Past the window rather than at it: see the `:adoption_window` handler. The
-  # pending sweep is cancelled first, so a camera resetting several times a
-  # second holds one *tracked* timer rather than one per reset. Cancelling does
-  # not recall a message already in the mailbox, and the handler that then runs
-  # clears `window_ref` and re-arms — so an interleaving can leave this timer in
-  # flight untracked beside the re-armed one. That is bounded (the handler
-  # re-arms at most one) and harmless: the sweep ends whatever has actually
-  # lapsed and nothing else, so an extra one is a map walk with no result.
-  defp window_timer(state) do
-    if state.window_ref, do: Process.cancel_timer(state.window_ref)
-    ref = Process.send_after(self(), :adoption_window, state.window_ms)
-    %{state | window_ref: ref}
+    %{state | gap_from: suspension.at}
   end
 
   # How the stream reset actually went, reported from the first batch that
   # follows it: the outage gap can only be measured once the far side produces
   # an observation to measure to. `gap_from` is the last observation before the
   # cut, and it is cleared here so the report is one line per reset and not one
-  # per batch.
+  # per batch. The batch that crosses the boundary carries both — the
+  # suspension that sets `gap_from` and the observation that measures to it —
+  # so the order below is what makes that batch report a gap of its own outage
+  # rather than of the previous one.
   #
   # Adoptions and lapses are counted off the same batch's events, which is
   # where the tracker reports them: an adoption is a track resuming its
-  # identity, and a `:stream_reset` end arriving on a *batch* is a suspension
-  # whose window ran out (the ones the reset itself severs are emitted by
-  # `apply_epoch/3`, not here).
-  defp report_link(state, observation, events) do
-    report_adopted(state.camera_id, events)
-    report_expired(state.camera_id, events)
-    report_gap(state, observation)
+  # identity, and a `:stream_reset` end is a suspension whose window ran out
+  # (on this batch, or on one of the element's own).
+  defp report_link(state, batch) do
+    report_adopted(state.camera_id, batch.events)
+    report_expired(state.camera_id, batch.events)
+
+    state |> report_suspension(batch) |> report_gap(batch)
   end
 
-  defp report_gap(%{gap_from: nil} = state, _observation), do: state
+  defp report_gap(%{gap_from: nil} = state, _batch), do: state
+  defp report_gap(state, %{observed_at: nil}), do: state
 
-  defp report_gap(state, observation) do
-    gap = max(DateTime.diff(observation.observed_at, state.gap_from, :millisecond), 0)
+  defp report_gap(state, %{observed_at: observed_at}) do
+    gap = max(DateTime.diff(observed_at, state.gap_from, :millisecond), 0)
 
     Logger.info("camera #{state.camera_id}: stream back after a #{gap} ms gap")
 
@@ -1015,14 +938,13 @@ defmodule Cairn.CameraTracker do
   # for a track that never opened one, on writing it at the end.
   #
   # Belt and braces on the cached pair: every path that can produce a live
-  # track today has been through `process_detections/5`, which caches both. A
-  # tracker that has never seen a detection does exist — `ensure/1` is public
+  # track today has been through `process_batch/4`, which caches both. A
+  # tracker that has never received a batch does exist — `ensure/1` is public
   # and `restore_checkpointed/0` starts one per checkpointed camera — but it
-  # holds an empty `Cairn.Tracker`, so no track reaches here and the nil caches
-  # are never read. An end path
-  # that ever skips it must not silently exclude the track, so an absent
-  # policy is read as an absent `track:` block, i.e. the label's wire floor
-  # off a default camera.
+  # knows no tracks, so none reaches here and the nil caches are never read. An
+  # end path that ever skips it must not silently exclude the track, so an
+  # absent policy is read as an absent `track:` block, i.e. the label's wire
+  # floor off a default camera.
   defp qualifies?(state, track) do
     camera = state.camera || %Config.Camera{id: track.camera_id}
     tier = state.policy && Map.get(state.policy, :track)
@@ -1062,9 +984,21 @@ defmodule Cairn.CameraTracker do
   # does not know — but it is what keeps the tier from being re-asked per
   # update, and what tells `record_final/2` that a row is out there needing to
   # be closed.
+  #
+  # `track` is the last summary that went out for it, which is what a final has
+  # to be built from on the one path that gets no event of its own: a camera
+  # stopping (`apply_epoch/3`). The tracks are the tracker element's, and it is
+  # going away with the pipeline.
   defp note_update(state, track) do
     rowed? = record_live(state, track)
-    entry = %{at: state.monotonic_ms.(), best_score: track.best_score, rowed?: rowed?}
+
+    entry = %{
+      at: state.monotonic_ms.(),
+      best_score: track.best_score,
+      rowed?: rowed?,
+      track: track
+    }
+
     %{state | track_updates: Map.put(state.track_updates, track.object_id, entry)}
   end
 
@@ -1106,8 +1040,8 @@ defmodule Cairn.CameraTracker do
 
   # -- lifecycle --------------------------------------------------------------
 
-  defp start_event(state, camera, policy, observation, dets) do
-    observed_at = observation.observed_at
+  defp start_event(state, camera, policy, batch, dets) do
+    observed_at = batch.observed_at
 
     event = %Event{
       id: Ecto.UUID.generate(),
@@ -1124,7 +1058,7 @@ defmodule Cairn.CameraTracker do
     case state.start_extractor.(camera, event) do
       {:ok, pid} ->
         Process.monitor(pid)
-        EventCheckpoint.put(camera.id, event, Tracker.checkpoint_tracks(state.tracker))
+        EventCheckpoint.put(camera.id, event, batch.snapshot)
         Event.broadcast(:event_started, event)
 
         {post_ref, post_token} = schedule(:post_window, event.id, policy.post)
@@ -1147,9 +1081,9 @@ defmodule Cairn.CameraTracker do
     end
   end
 
-  defp update_event(%{event: event} = state, policy, observation, dets) do
+  defp update_event(%{event: event} = state, policy, batch, dets) do
     max_scores = max_scores(event.max_scores, dets)
-    observed_at = observation.observed_at
+    observed_at = batch.observed_at
 
     event = %{
       event
@@ -1165,22 +1099,34 @@ defmodule Cairn.CameraTracker do
     }
 
     if state.post_ref, do: Process.cancel_timer(state.post_ref)
-    state = checkpoint(%{state | event: event})
+    state = checkpoint(%{state | event: event}, batch.snapshot)
     Event.broadcast(:event_updated, event)
 
     {post_ref, post_token} = schedule(:post_window, event.id, policy.post)
     %{state | post_ref: post_ref, post_token: post_token}
   end
 
-  defp checkpoint(%{event: event} = state) do
+  # The snapshot is the batch's, taken by the tracker element after it: this
+  # process holds no tracker to derive one from, and the one that came with the
+  # batch is what that batch's event was open over.
+  #
+  # Nothing to checkpoint with no event open: the row exists only for the life
+  # of one, and every batch that arrives outside one reaches here.
+  defp checkpoint(%{event: nil} = state, _snapshot), do: state
+
+  defp checkpoint(state, snapshot) do
     now = state.monotonic_ms.()
 
     if state.checkpointed_at == nil or now - state.checkpointed_at >= @checkpoint_throttle_ms do
-      EventCheckpoint.put(event.camera_id, event, Tracker.checkpoint_tracks(state.tracker))
-      %{state | checkpointed_at: now}
+      write_checkpoint(state, snapshot)
     else
       state
     end
+  end
+
+  defp write_checkpoint(%{event: event} = state, snapshot) do
+    EventCheckpoint.put(event.camera_id, event, snapshot)
+    %{state | checkpointed_at: state.monotonic_ms.()}
   end
 
   defp maybe_finalize(%{event: %Event{id: event_id} = event} = state, event_id, cause) do
@@ -1193,7 +1139,7 @@ defmodule Cairn.CameraTracker do
     #
     # That this is a *cast from this process* is load-bearing beyond the
     # ordering above: it is what puts every `{:track_boxes, _}` this
-    # process already sent (`forward_boxes/3`) ahead of it in the same
+    # process already sent (`forward_boxes/2`) ahead of it in the same
     # mailbox. A `call` here, or a finalize routed through anything else,
     # truncates the event's track path silently.
     Event.broadcast(:event_ended, event)

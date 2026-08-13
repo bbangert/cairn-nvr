@@ -43,6 +43,19 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
       instead of this flag.
     * `--max-unseen-ms` / `--max-live-tracks` / `--stationary-after-ms` —
       policy scalars (defaults 3000 / 128 / 10000, the soak policy).
+    * `--tracker cairn|sparsetrack` — which tracker core to drive (default
+      `cairn`). `sparsetrack` is `Membrane.MOTTracker.SparseTrack`, whose
+      boxes are **pixels**, so that mode neither normalizes nor clamps to
+      the frame; the policy flags above belong to the cairn tracker and do
+      not reach it, and the knobs below do not reach cairn.
+    * `--track-thresh` / `--track-buffer` / `--match-thresh` /
+      `--confirm-thresh` / `--depth-levels` / `--depth-levels-low` /
+      `--mot20` — SparseTrack's own knobs; each omitted one takes the
+      reference's published MOT17 value.
+
+  The SparseTrack mode is the harness half of the parity gate: the same
+  sequence through `tools/mot-bench/sparsetrack_parity.py` produces the
+  reference lines this run must match byte for byte.
 
   Track IDs are ULIDs internally (nondeterministic); output IDs are
   first-seen ordinals, so two runs over the same input are byte-identical.
@@ -64,7 +77,25 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
     fps: :float,
     max_unseen_ms: :integer,
     max_live_tracks: :integer,
-    stationary_after_ms: :integer
+    stationary_after_ms: :integer,
+    tracker: :string,
+    track_thresh: :float,
+    track_buffer: :integer,
+    match_thresh: :float,
+    confirm_thresh: :float,
+    depth_levels: :integer,
+    depth_levels_low: :integer,
+    mot20: :boolean
+  ]
+
+  @core_switches [
+    :track_thresh,
+    :track_buffer,
+    :match_thresh,
+    :confirm_thresh,
+    :depth_levels,
+    :depth_levels_low,
+    :mot20
   ]
 
   @impl true
@@ -87,15 +118,17 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
     if fps <= 0, do: Mix.raise("fps must be > 0, got #{fps}")
     policy = MotBench.policy(opts)
     det_min = opts[:det_min]
+    {core, units} = core!(opts, fps)
 
     {dets_by_frame, stats} =
-      load_detections!(Path.join([seq_dir, "det", "det.txt"]), seqinfo, det_min)
+      load_detections!(Path.join([seq_dir, "det", "det.txt"]), seqinfo, det_min, units)
 
     frames =
       for frame <- 1..seqinfo.seq_length,
           do: {frame, at_ms(frame, fps), Map.get(dets_by_frame, frame, [])}
 
-    {lines, emitted, minted} = MotBench.drive(frames, seqinfo, policy)
+    {lines, emitted, minted} =
+      MotBench.drive(frames, seqinfo, policy, tracker: core, units: units)
 
     MotBench.write_pred!(out, lines)
 
@@ -113,6 +146,8 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
       detections_kept: stats.kept,
       lines_emitted: emitted,
       tracks_minted: minted,
+      tracker: inspect(elem(core, 0)),
+      tracker_opts: Map.new(elem(core, 1)),
       policy: policy
     })
 
@@ -125,6 +160,44 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
   # MOT frames are 1-indexed; frame 1 is t=0 and each step advances 1000/fps.
   @doc false
   def at_ms(frame, fps), do: round((frame - 1) * 1000 / fps)
+
+  # The core, and the box units it reads. They are not independent: SparseTrack
+  # is pixel-only arithmetic (see its moduledoc), and the cairn tracker's is
+  # frame-normalized, so naming one names the other.
+  defp core!(opts, fps) do
+    case Keyword.get(opts, :tracker, "cairn") do
+      "cairn" ->
+        {{Cairn.Tracker, []}, :normalized}
+
+      "sparsetrack" ->
+        levels!(opts)
+
+        # The lost-track buffer is a frame count scaled by the sequence's rate,
+        # so the rate is the sequence's property and not a knob: the reference
+        # is constructed with `frame_rate=int(fps)` and a mismatch here changes
+        # how long an identity stays adoptable on anything but 30 fps.
+        core_opts = Keyword.put(Keyword.take(opts, @core_switches), :frame_rate, trunc(fps))
+        {{Membrane.MOTTracker.SparseTrack, core_opts}, :pixels}
+
+      other ->
+        Mix.raise("unknown --tracker #{inspect(other)}; expected cairn or sparsetrack")
+    end
+  end
+
+  # The core raises an `ArgumentError` on either of these, which reaches an
+  # operator as a stack trace; every other bad number this task is handed is a
+  # `Mix.raise`.
+  defp levels!(opts) do
+    Enum.each([:depth_levels, :depth_levels_low], fn key ->
+      case Keyword.get(opts, key) do
+        levels when is_nil(levels) or levels > 0 ->
+          :ok
+
+        levels ->
+          Mix.raise("--#{String.replace(to_string(key), "_", "-")} must be > 0, got #{levels}")
+      end
+    end)
+  end
 
   # -- input parsing ----------------------------------------------------------
 
@@ -158,7 +231,7 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
     end
   end
 
-  defp load_detections!(path, seqinfo, det_min) do
+  defp load_detections!(path, seqinfo, det_min, units) do
     parsed =
       path
       |> read!("det/det.txt")
@@ -169,7 +242,7 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
 
     kept =
       Enum.flat_map(above_min, fn det ->
-        case object(det, seqinfo) do
+        case object(det, seqinfo, units) do
           nil -> []
           object -> [{det.frame, object}]
         end
@@ -206,10 +279,26 @@ defmodule Mix.Tasks.Cairn.Mot.Track do
     end
   end
 
-  # MOT boxes routinely poke outside the frame; the tracker requires
-  # normalized 0..1 ltwh, so clamp to the frame and drop what vanishes.
+  # SparseTrack matches in pixels and clamps nothing, so a box that pokes
+  # outside the frame stays exactly where the detector put it. The corner and
+  # size go through the reference's own round trip — it is handed `x2 = x + w`
+  # and recovers the width as `x2 - x`, which is not `w` for every pair of
+  # doubles, and a parity gate at two decimals would still see the difference
+  # through the filter.
   @doc false
-  def object(det, %{im_width: iw, im_height: ih}) do
+  def object(det, _seqinfo, :pixels) do
+    %{
+      label: "person",
+      score: clamp01(det.conf),
+      bbox: [det.x, det.y, det.x + det.w - det.x, det.y + det.h - det.y],
+      track_id: nil,
+      observation_kind: "detected"
+    }
+  end
+
+  # MOT boxes routinely poke outside the frame; the cairn tracker requires
+  # normalized 0..1 ltwh, so clamp to the frame and drop what vanishes.
+  def object(det, %{im_width: iw, im_height: ih}, :normalized) do
     x0 = clamp01(det.x / iw)
     y0 = clamp01(det.y / ih)
     x1 = clamp01((det.x + det.w) / iw)
