@@ -360,6 +360,30 @@ defmodule Cairn.BoardPipeline.Collector do
   defp cpu_run_avg(_no_first_counters), do: nil
 end
 
+defmodule Cairn.BoardPipeline.EpochStamp do
+  @moduledoc false
+  # The production pipeline's EpochTagger mints via Cairn.StreamEpochs, which
+  # this standalone harness deliberately does not run (see the moduledoc's
+  # remote-call note) — each pipe's epoch is fixed for its lifetime, so the
+  # tag is a constant stamp. Phase 2's Inference reads it off every frame and
+  # drops untagged ones, which is how an unstamped harness measures zero.
+  # Sits after the parser: the parser does not carry input metadata through.
+  use Membrane.Filter
+
+  def_input_pad(:input, accepted_format: _any, flow_control: :auto)
+  def_output_pad(:output, accepted_format: _any, flow_control: :auto)
+  def_options(epoch: [spec: String.t()])
+
+  @impl true
+  def handle_init(_ctx, opts), do: {[], %{epoch: opts.epoch}}
+
+  @impl true
+  def handle_buffer(:input, buffer, _ctx, state) do
+    stamped = %{buffer | metadata: Map.put(buffer.metadata, :stream_epoch, state.epoch)}
+    {[buffer: {:output, stamped}], state}
+  end
+end
+
 defmodule Cairn.BoardPipeline.Pipe do
   @moduledoc """
   The detect branch of `Cairn.Pipeline.Camera`, minus the tee and the other
@@ -392,6 +416,7 @@ defmodule Cairn.BoardPipeline.Pipe do
         output_alignment: :au,
         output_stream_structure: :annexb
       })
+      |> child(:epoch_stamp, %Cairn.BoardPipeline.EpochStamp{epoch: epoch})
       |> child(:picker, Picker)
       # One AU between the two, so the picker learns that the decoder is free
       # the moment it is, and no more than one is ever in flight.
@@ -403,7 +428,7 @@ defmodule Cairn.BoardPipeline.Pipe do
       |> child(:infer, %Inference{
         session: {Cairn.Native.Host, Cairn.Native.Host},
         stream_id: camera.id,
-        stream_params: %{stream_epoch: epoch}
+        stream_params: %{}
       })
       |> child(:detect, %DetectionSink{camera_id: camera.id, collector: collector})
 
@@ -446,7 +471,9 @@ defmodule Cairn.BoardPipeline do
     * `Host.start_link(config: ...)` — a non-nil `:config` opt means
       `Cairn.Config.Server` is never consulted;
     * `canary: [enabled: false]` — no `cairn-detect` binary is spawned;
-    * a `stream_epoch` in the inference params — `Cairn.StreamEpochs` is
+    * a fixed per-pipe epoch stamped onto every buffer by
+      `Cairn.BoardPipeline.EpochStamp` (the inference element reads it off
+      the frame; params carry none) — `Cairn.StreamEpochs` is
       short-circuited (its ETS-missing paths answer `:unknown` harmlessly);
     * `Cairn.BoardPipeline.DetectionSink` — the branch ends at the inference
       element's pad, so the host-side tracker closure stays out (see that

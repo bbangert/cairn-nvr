@@ -201,8 +201,7 @@ if [ "$DRY_RUN" = 1 ]; then
   print_plan
   step "df-check would run against: $LADDER_RESULT_DIR (margin ${LADDER_MIN_FREE_MB} MB) before each pull"
   step "ssh $BOARD ':os.cmd(~c\"mkdir -p $REMOTE_DIR/clips $REMOTE_DIR/deps $REMOTE_DIR/harness $REMOTE_DIR/runs\")'"
-  step "scp -r $DEPS_LIB/*/ebin  $BOARD:$REMOTE_DIR/deps/<dep>/ebin   (unconditional — only single-file pushes checksum-skip)"
-  step "scp -r $LOCAL_BUILD/ebin $BOARD:$REMOTE_DIR/harness/ebin"
+  step "scp push.tgz (harness ebin + every dep ebin, one tarball — the board's sftpd cannot take directory pushes) -> $BOARD:$REMOTE_DIR/push.tgz, then :erl_tar.extract on the board"
   step "scp    tools/board-pipeline/run-cell.sh $BOARD:$REMOTE_DIR/run-cell.sh"
   step "scp    $MAIN_CLIP $BOARD:${REMOTE_CLIP[baseline]}  (skipped if remote sha256 matches)"
   step "scp    $SUB_CLIP  $BOARD:${REMOTE_CLIP[dual]}      (skipped if remote sha256 matches)"
@@ -214,7 +213,7 @@ if [ "$DRY_RUN" = 1 ]; then
       done
     done
   done
-  step "df-check $LOCAL_RESULT_ROOT (margin ${LADDER_MIN_FREE_MB} MB), then scp -r $BOARD:$REMOTE_DIR/runs/ $LOCAL_RESULT_ROOT/"
+  step "df-check $LOCAL_RESULT_ROOT (margin ${LADDER_MIN_FREE_MB} MB), then per cell: :erl_tar.create on the board, pull one tgz, extract locally"
   step "verify every pulled *.sha256 against a fresh local sha256sum"
   step "write $SUMMARY_CSV (rung,mode,repeat,rc,run_dir,observations,starved_cams,cpu_pct_avg,rss_peak_mb)"
   say "dry run complete — nothing touched the network"
@@ -238,11 +237,35 @@ remote_elixir() {
   ssh "$BOARD" ":os.cmd(~c\"$cmd\") |> IO.puts()"
 }
 
+# Callers capture stdout, so no step-logging in here; and the parsing is
+# local because the board's busybox has no `cut`. The grep keeps only a
+# 64-hex token — the eval also prints its own :ok, which must not leak
+# into a checksum comparison.
 remote_sha256() {
   local remote_path=$1
-  step "ssh $BOARD ':os.cmd(~c\"sha256sum $remote_path\")' (checksum probe before push)"
-  ssh "$BOARD" ":os.cmd(~c\"sha256sum $remote_path 2>/dev/null | cut -d' ' -f1\") |> IO.puts()" \
-    2>/dev/null | tr -d '\r\n'
+  # The eval's RETURN VALUE is the reliable channel: IO.puts output races
+  # the ssh channel teardown and is sometimes lost, but the inspected
+  # result (a ~c"<sha>  <path>" charlist) always prints. Both streams are
+  # captured (this ssh emits on stderr) and the 64-hex token is extracted
+  # from whichever representation arrived.
+  ssh "$BOARD" ":os.cmd(~c\"sha256sum $remote_path 2>/dev/null\")" 2>&1 |
+    tr -d '\r' | grep -oE '[0-9a-f]{64}' | head -1 || true
+}
+
+# The board's Erlang sftpd makes scp exit 1 even when the transfer
+# succeeded (board-bench's deploy.sh header records the same) — so the exit
+# code is discarded and the transfer is judged by the checksum instead.
+push_verified() {
+  local local_path=$1 remote_path=$2
+  local local_sum remote_sum
+  local_sum=$(sha256sum "$local_path" | cut -d' ' -f1)
+  step "scp $local_path $BOARD:$remote_path"
+  scp "$local_path" "$BOARD:$remote_path" || true
+  remote_sum=$(remote_sha256 "$remote_path" || true)
+  if [ "$local_sum" != "$remote_sum" ]; then
+    say "REFUSING: push of $local_path did not verify ($local_sum != ${remote_sum:-absent})"
+    exit 1
+  fi
 }
 
 push_if_changed() {
@@ -254,25 +277,32 @@ push_if_changed() {
     say "skip push (checksum match): $local_path -> $BOARD:$remote_path"
     return 0
   fi
-  step "scp $local_path $BOARD:$remote_path"
-  scp "$local_path" "$BOARD:$remote_path"
+  push_verified "$local_path" "$remote_path"
 }
 
 remote_elixir "mkdir -p $REMOTE_DIR/clips $REMOTE_DIR/deps $REMOTE_DIR/harness $REMOTE_DIR/runs"
 
+# One tarball, one scp, one :erl_tar on the board. Directory pushes
+# (`scp -r`) die against the board's Erlang sftpd — it cannot realpath a
+# path that does not exist yet ("path canonicalization failed"), which is
+# why the board-bench precedent only ever pushed single files.
+PUSH_STAGE=$(mktemp -d)
+mkdir -p "$PUSH_STAGE/harness"
+cp -r "$LOCAL_BUILD/ebin" "$PUSH_STAGE/harness/ebin"
 for dep_dir in "$DEPS_LIB"/*/ebin; do
   [ -d "$dep_dir" ] || continue
   dep=$(basename "$(dirname "$dep_dir")")
-  remote_elixir "mkdir -p $REMOTE_DIR/deps/$dep"
-  step "scp -r $dep_dir $BOARD:$REMOTE_DIR/deps/$dep/"
-  scp -r "$dep_dir" "$BOARD:$REMOTE_DIR/deps/$dep/"
+  mkdir -p "$PUSH_STAGE/deps/$dep"
+  cp -r "$dep_dir" "$PUSH_STAGE/deps/$dep/ebin"
 done
+tar czf "$PUSH_STAGE/push.tgz" -C "$PUSH_STAGE" harness deps
+say "push.tgz carries the harness ebin + $(ls "$PUSH_STAGE/deps" | wc -l) dep ebins"
+push_verified "$PUSH_STAGE/push.tgz" "$REMOTE_DIR/push.tgz"
+step "ssh $BOARD ':erl_tar.extract(push.tgz, cwd: $REMOTE_DIR)'"
+ssh "$BOARD" ":ok = :erl_tar.extract(~c\"$REMOTE_DIR/push.tgz\", [:compressed, {:cwd, ~c\"$REMOTE_DIR\"}]); IO.puts(\"extracted\")"
+rm -rf "$PUSH_STAGE"
 
-step "scp -r $LOCAL_BUILD/ebin $BOARD:$REMOTE_DIR/harness/"
-scp -r "$LOCAL_BUILD/ebin" "$BOARD:$REMOTE_DIR/harness/"
-
-step "scp tools/board-pipeline/run-cell.sh $BOARD:$REMOTE_DIR/run-cell.sh"
-scp "$ROOT/tools/board-pipeline/run-cell.sh" "$BOARD:$REMOTE_DIR/run-cell.sh"
+push_verified "$ROOT/tools/board-pipeline/run-cell.sh" "$REMOTE_DIR/run-cell.sh"
 remote_elixir "chmod 755 $REMOTE_DIR/run-cell.sh"
 
 # The two clips are the only genuinely multi-GB pushes here (a 5 MP clip
@@ -344,7 +374,9 @@ for rung in "${RUNGS[@]}"; do
       cell_cmd="HARNESS_PA='$HARNESS_PA_REMOTE' MODEL=$MODEL LABELS=$LABELS BACKEND=$BACKEND QNN_LIBRARY=$QNN_LIBRARY DECODER=$DECODER SAMPLE_FPS=$SAMPLE_FPS NATIVE_LIB=$NATIVE_LIB ORT_LIB=$ORT_LIB RUN_ROOT=$REMOTE_DIR/runs PIN_GOVERNOR=$LADDER_PIN_GOVERNOR sh $REMOTE_DIR/run-cell.sh $tag $rung $LADDER_SECONDS ${REMOTE_CLIP[$mode]}"
       step "ssh $BOARD ':os.cmd(~c\"$cell_cmd\")' (blocks ~${LADDER_SECONDS}s)"
       set +e
-      output=$(ssh "$BOARD" ":os.cmd(~c\"$cell_cmd\") |> IO.puts()")
+      # Both streams, CRs stripped: this ssh emits on stderr and with CRLF —
+      # a \r smuggled into run_dir breaks every later eval built from it.
+      output=$(ssh "$BOARD" ":os.cmd(~c\"$cell_cmd\") |> IO.puts()" 2>&1 | tr -d '\r')
       rc_line=$(echo "$output" | grep '^cell ' | tail -1)
       set -e
       say "$rc_line"
@@ -355,9 +387,21 @@ for rung in "${RUNGS[@]}"; do
       if [ -n "$run_dir" ] && [ "$run_dir" != "unknown" ]; then
         require_free_mb "$LOCAL_RESULT_ROOT" "$LADDER_MIN_FREE_MB"
         local_cell_dir="$LOCAL_RESULT_ROOT/$(basename "$run_dir")"
-        step "scp -r $BOARD:$run_dir $local_cell_dir"
+        # Tar on the board, pull one file: directory pulls share the sftpd
+        # limitation the push side documents.
+        step "pull $BOARD:$run_dir as one tarball -> $local_cell_dir"
         mkdir -p "$local_cell_dir"
-        scp -r "$BOARD:$run_dir/." "$local_cell_dir/"
+        ssh "$BOARD" ":ok = :erl_tar.create(~c\"$run_dir.tgz\", [{~c\".\", ~c\"$run_dir\"}], [:compressed]); IO.puts(\"packed\")"
+        # scp's exit lies on this board (see push_verified); a pull is judged
+        # by the tarball actually extracting.
+        scp "$BOARD:$run_dir.tgz" "$local_cell_dir/cell.tgz" || true
+        if ! tar xzf "$local_cell_dir/cell.tgz" -C "$local_cell_dir" 2>/dev/null; then
+          say "WARNING: pull of $run_dir did not verify — cell left on the board, CSV row will be empty"
+        fi
+        rm -f "$local_cell_dir/cell.tgz"
+        # The remote tarball is re-creatable from the cell dir; a long
+        # ladder must not stack one per cell on the board.
+        ssh "$BOARD" "File.rm(\"$run_dir.tgz\") |> IO.inspect()" >/dev/null 2>&1 || true
         for f in out.log proc.samples meta; do
           if [ -f "$local_cell_dir/$f.sha256" ] && [ -f "$local_cell_dir/$f" ]; then
             # The manifest is relative-name sha256, or the board's prefixed
