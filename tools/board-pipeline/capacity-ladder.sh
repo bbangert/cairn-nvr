@@ -303,14 +303,20 @@ parse_cell_metrics() {
   local observations="" cpu_pct_avg="" rss_peak_mb="" starved=""
 
   if [ -f "$out" ]; then
-    observations=$(grep -o 'observations=[0-9]*' "$out" | tail -1 | cut -d= -f2)
+    # The summary line's total, not the last per-camera line — and every
+    # stage `|| true`d: a crashed cell that never printed a summary must
+    # yield an empty column, not abort the whole ladder under pipefail.
+    observations=$(grep 'board-pipeline: summary' "$out" 2>/dev/null |
+      grep -o 'observations=[0-9]*' | tail -1 | cut -d= -f2 || true)
     # A camera's expected count (sample_fps * seconds) is per-camera and
     # rung-independent; flag anything under half of it — the 5.5 wall wasn't
     # a slope, starved sessions kept a handful of AUs total, not a fraction
     # off the healthy count.
     local expected=$((SAMPLE_FPS * LADDER_SECONDS / 2))
-    starved=$(grep 'board-pipeline: cam ' "$out" | awk -F'observations=' -v exp="$expected" \
-      '{split($2,a," "); if (a[1]+0 < exp) print $0}' | grep -o 'cam [^ ]*' | cut -d' ' -f2 | paste -sd';' -)
+    starved=$( (grep 'board-pipeline: cam ' "$out" 2>/dev/null || true) |
+      awk -F'observations=' -v exp="$expected" \
+        '{split($2,a," "); if (a[1]+0 < exp) print $0}' |
+      (grep -o 'cam [^ ]*' || true) | cut -d' ' -f2 | paste -sd';' - || true)
   fi
 
   if [ -f "$proc" ] && [ -f "$meta" ]; then

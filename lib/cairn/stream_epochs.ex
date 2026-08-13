@@ -197,4 +197,13 @@ defmodule Cairn.StreamEpochs do
 
   defp key(camera_id) when is_binary(camera_id), do: {camera_id, :main}
   defp key({camera_id, role} = key) when is_binary(camera_id) and role in @roles, do: key
+
+  # ArgumentError, not a FunctionClauseError: `current/1` already rescues it
+  # into `:unknown`, and a caller minting under a role that does not exist
+  # deserves the message over a clause dump.
+  defp key(other) do
+    raise ArgumentError,
+          "stream epoch key must be a camera id or {camera_id, role} with " <>
+            "role in #{inspect(@roles)}, got: #{inspect(other)}"
+  end
 end
