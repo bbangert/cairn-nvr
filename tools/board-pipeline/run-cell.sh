@@ -133,6 +133,8 @@ BOARD_PIPELINE_MODEL="${MODEL:-}" \
   BOARD_PIPELINE_ORT_LIB="${ORT_LIB:-}" \
   LD_LIBRARY_PATH=/data/cairn-bench/lib:/data/qnn-spike/lib \
   ORT_DYLIB_PATH=/data/qnn-spike/lib/libonnxruntime.so.1 \
+  ADSP_LIBRARY_PATH="/data/qnn-spike/dsp;" \
+  DSP_LIBRARY_PATH="/data/qnn-spike/dsp;" \
   "$BINDIR/erlexec" -boot "$BOOT" -boot_var RELEASE_LIB /srv/erlang/lib \
   -pa "$ELIXIR_EBIN" -pa "$LOGGER_EBIN" $PA_FLAGS -noshell \
   -eval '{ok,_} = application:ensure_all_started(elixir), {ok,_} = application:ensure_all_started(logger), case '\''Elixir.Cairn.BoardPipeline'\'':run() of ok -> erlang:halt(0); Other -> io:format("board-pipeline: ~p~n", [Other]), erlang:halt(1) end' \
