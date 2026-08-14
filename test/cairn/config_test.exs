@@ -1352,6 +1352,58 @@ defmodule Cairn.ConfigTest do
     end
   end
 
+  describe "motion gate ownership (D-S4)" do
+    @motion ~s({"threshold": 30})
+
+    # `tiered_map/1`'s shape with the operator's knob on the profiled camera.
+    defp gated_map(profile_yaml, motion \\ @motion) do
+      profile_yaml
+      |> tiered_map()
+      |> update_in(["cameras"], fn [a, b] -> [Map.put(a, "motion_json", motion), b] end)
+    end
+
+    test "a tier-2 group refuses the camera's motion_json, naming both sides" do
+      assert {:error, errors} = Config.from_map(gated_map(ort_yaml("tier: 2")))
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "camera cam_a: motion_json contradicts its group's tier: 2 profile")
+             )
+
+      assert Enum.any?(errors, &(&1 =~ "claim tier: 1"))
+    end
+
+    test "tier 1 gates freely — that tier runs gated by design" do
+      assert {:ok, config, []} = Config.from_map(gated_map(ort_yaml("tier: 1")))
+      assert hd(config.cameras).motion_json == @motion
+    end
+
+    test "a tier-less profile keeps today's behavior: the knob passes through" do
+      assert {:ok, config, []} = Config.from_map(gated_map(ort_yaml("")))
+      assert hd(config.cameras).motion_json == @motion
+    end
+
+    test "an unprofiled camera's motion_json is not config's business" do
+      map =
+        update_in(base_map(), ["cameras"], fn [a, b] ->
+          [a, Map.put(b, "motion_json", @motion)]
+        end)
+
+      assert {:ok, config, []} = Config.from_map(map)
+      assert Enum.at(config.cameras, 1).motion_json == @motion
+    end
+
+    test "malformed motion_json is a load error naming the camera, not a build crash" do
+      assert {:error, errors} = Config.from_map(gated_map(ort_yaml("tier: 1"), "not json"))
+      assert Enum.any?(errors, &(&1 =~ "camera cam_a: motion_json:"))
+    end
+
+    test "a non-string motion_json is refused" do
+      assert {:error, errors} = Config.from_map(gated_map(ort_yaml("tier: 1"), 42))
+      assert Enum.any?(errors, &(&1 =~ "camera cam_a: motion_json must be a JSON string"))
+    end
+  end
+
   describe "group profile checks" do
     @argv_dir "test/support/fixtures/profiles/argv"
     @no_artifact_dir "test/support/fixtures/profiles/no-artifact"

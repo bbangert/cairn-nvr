@@ -748,7 +748,9 @@ defmodule Cairn.Config do
   Scene config is not here: `min_score` and the motion/track-floor scene
   knobs are the operator's per-stream params
   (`Cairn.Native.Config.stream_params/1`) and a profile never writes them
-  (D-P6).
+  (D-P6). The one profile-shaped word on the subject is a refusal: a
+  tier-2 group rejects a camera's `motion_json` outright
+  (`validate_gate_ownership/2`, D-S4).
   """
   @spec native_model_config(t()) :: {:ok, map() | nil} | {:error, String.t()}
   def native_model_config(%__MODULE__{} = config) do
@@ -880,6 +882,35 @@ defmodule Cairn.Config do
     |> validate_ha_token(config)
     |> validate_native_model(config)
     |> validate_camera_profiles(config)
+    |> validate_gate_ownership(config)
+  end
+
+  # D-S4, the one contradiction config polices between the tiers and the
+  # operator's scene knobs: a tier-2 profile claims accuracy the motion
+  # gate would silently starve (frames the gate skips are frames the
+  # tracker never sees), so a camera carrying `motion_json:` on a tier-2
+  # group is an error naming both sides. Tier 1 runs the gate by design
+  # and tier-less keeps today's behavior — both pass untouched, and config
+  # never WRITES a motion flag on anyone's behalf (D-P6 survives for the
+  # thresholds).
+  defp validate_gate_ownership(acc, config) do
+    config.cameras
+    |> Enum.filter(&(&1.motion_json != nil))
+    |> Enum.filter(fn cam ->
+      case profile_for(config, cam) do
+        %Profile{tier: 2} -> true
+        _tierless_tier1_or_none -> false
+      end
+    end)
+    |> Enum.reduce(acc, fn cam, acc ->
+      add_error(
+        acc,
+        "camera #{cam.id}: motion_json contradicts its group's tier: 2 profile — " <>
+          "tier 2 claims accurate MOT, and a motion gate starves the tracker of exactly " <>
+          "the frames it skips. Remove the camera's motion_json, or claim tier: 1 " <>
+          "(presence) on the profile, which runs gated by design"
+      )
+    end)
   end
 
   defp validate_native_model(acc, config) do

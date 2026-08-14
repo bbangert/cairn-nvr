@@ -506,12 +506,21 @@ defmodule Cairn.Pipeline.CameraTest do
       start_owner(camera, config(camera))
 
       assert_receive {:pipeline_opts, opts}, 5_000
-      assert opts[:detect][:stream_params] == %{min_score: %{"person" => 0.6}}
+      assert opts[:detect][:stream_params] == %{min_score: %{"person" => 0.6}, motion_json: nil}
 
       # Not a rate the branch enforces — the decode NIF sheds to it from what
       # the engine's profile said — but the number the elements counting frames
       # have to agree with it on.
       assert opts[:detect][:sample_fps] == 3
+    end
+
+    test "the operator's motion_json rides stream_params verbatim to the gate" do
+      json = ~s({"threshold": 30})
+      camera = %{camera("cam_gate", {:group, "g"}) | motion_json: json}
+      start_owner(camera, config(camera))
+
+      assert_receive {:pipeline_opts, opts}, 5_000
+      assert opts[:detect][:stream_params].motion_json == json
     end
 
     test "the camera and the policy the dispatch seam attaches" do

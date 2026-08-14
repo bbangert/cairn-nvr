@@ -183,7 +183,9 @@ defmodule Cairn.Config.ServerTest do
             %{"min_score" => 0.7},
             %{"transcode" => true},
             %{"extra_ffmpeg_args" => ["-rtsp_transport", "tcp"]},
-            %{"pre_window_seconds" => 8}
+            %{"pre_window_seconds" => 8},
+            # The gate element is built into the branch at birth.
+            %{"motion_json" => ~s({"threshold": 30})}
           ] do
         assert camera_diff(edit) ==
                  %{added: [], removed: [], changed: ["cam_a"], refreshed: []},

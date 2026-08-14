@@ -120,7 +120,8 @@ build the presence pipeline — detections feed per-class present/cleared
 events (`presence_started`/`presence_cleared` on the event stream) and no
 tracker of any kind runs, which is why changing a profile's tier restarts
 its cameras rather than refreshing them. `tier: 2` selects today's
-tracked pipeline; its motion-gate rule lands in a later phase.
+tracked pipeline and refuses cameras carrying `motion_json:` (the gate
+starves the tracker of the frames it skips — see the D-P6 section below).
 
 The word "tier" also appears on cameras (`track:`/`record:` score
 thresholds); that is a different, older axis. This ladder is per-profile
@@ -237,7 +238,12 @@ error.
 
 Two knobs stay outside profiles on purpose (D-P6): the motion-zone and
 track-floor scene config describe the *scene* rather than the model, so they
-are per-stream operator config, never a profile's. This matters for `bbd`,
+are per-stream operator config — a camera's `motion_json:` key — never a
+profile's. The one thing a profile says about them is a refusal: a tier-2
+group rejects a camera carrying `motion_json:` at load (D-S4), because a
+motion gate starves the tracker of exactly the frames it skips and tier 2's
+claim is accuracy. Tier-1 and tier-less cameras gate freely; config never
+writes a motion flag on anyone's behalf. This matters for `bbd`,
 whose measured win is a composition with the track floor — with the floor off
 it bought nothing at all, because an expired track has no row left to admit
 against.

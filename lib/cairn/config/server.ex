@@ -161,7 +161,11 @@ defmodule Cairn.Config.Server do
     :ingest,
     :min_score,
     :transcode,
-    :extra_ffmpeg_args
+    :extra_ffmpeg_args,
+    # The gate element is built into the detect branch at birth
+    # (`Cairn.Pipeline.Camera.motion_gate/3`) — a changed scene config is a
+    # different branch, not a refreshable knob.
+    :motion_json
   ]
 
   # `pre_window_seconds` is compared *resolved* rather than read off the
