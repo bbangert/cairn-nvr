@@ -7,7 +7,10 @@ defmodule Cairn.TrackRecorder do
   A row is opened while its track is still running and closed when the track
   ends, so a track has three kinds of write here — `record_open/3` once,
   `record_update/3` on the camera tracker's throttle, `record_final/3` to close —
-  and all three are the same upsert on the same id. This process owns the one
+  and all three are the same upsert on the same id. Tracks only:
+  `Cairn.PresenceEvent`s are deliberately not persisted here (this writer is
+  clip/track-anchored and presence has neither); a presence history store is
+  future work. This process owns the one
   piece of state that decides between them: which ids have a row. The caller
   does not know and is not asked to; an update for an id with no row is
   ignored, and a re-sent open is the update it looks like.

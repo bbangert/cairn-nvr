@@ -117,6 +117,11 @@ defmodule CairnWeb.Api.EventStreamController do
     encode_frame(track_name(kind), EventJSON.shape_track(track))
   end
 
+  def frame_for({kind, %Cairn.PresenceEvent{} = presence})
+      when kind in [:presence_started, :presence_cleared] do
+    encode_frame(Atom.to_string(kind), EventJSON.shape_presence(kind, presence))
+  end
+
   def frame_for({:camera_status, camera_id, info}) do
     encode_frame("camera_status", %{
       camera_id: camera_id,

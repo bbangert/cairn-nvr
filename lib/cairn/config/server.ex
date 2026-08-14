@@ -187,12 +187,18 @@ defmodule Cairn.Config.Server do
   # The rest of the effective policy — `post`/`max`, the other tracking bounds,
   # the `track:` / `record:` tiers — is host-side and refreshes in place through
   # `Cairn.PipelineOwner.refresh/3`.
+  # The capability tier joins them for the same reason at a larger grain:
+  # it picks the whole TAIL of the detect branch (`Cairn.Pipeline.Camera`'s
+  # `detect_tail/4` — presence sink vs stamper/tracker/track sink), and a
+  # refresh routed by the old tail would feed the new policy to a shape the
+  # tier no longer means.
   defp camera_changed?(old, new, old_cam, new_cam) do
     Map.take(old_cam, @restart_fields) != Map.take(new_cam, @restart_fields) or
       Config.windows(old, old_cam).pre != Config.windows(new, new_cam).pre or
       Config.tracker(old, old_cam) != Config.tracker(new, new_cam) or
       Config.sample_fps(old, old_cam) != Config.sample_fps(new, new_cam) or
-      Config.policy(old, old_cam).max_live_tracks != Config.policy(new, new_cam).max_live_tracks
+      Config.policy(old, old_cam).max_live_tracks != Config.policy(new, new_cam).max_live_tracks or
+      Map.get(Config.policy(old, old_cam), :tier) != Map.get(Config.policy(new, new_cam), :tier)
   end
 
   # Everything else the running camera was handed: the camera struct itself

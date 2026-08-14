@@ -37,8 +37,10 @@ defmodule Cairn.Detect.Dispatch do
   @doc """
   One tracked batch to `camera`'s tracker, carrying `policy`.
 
-  Tier-surface's tier-1/tier-2 fork belongs here: this is the one call every
-  producer makes, so the fork stays one site rather than one per producer.
+  The tier fork is NOT here: it happens where the branch is built
+  (`Cairn.Pipeline.Camera.detect_tail/4`), because a tier-1 camera's
+  pipeline contains no tracker element and so nothing that could ever call
+  this — a batch that reaches here is tracked by construction.
 
   `opts[:tracker]` is the producer's injection seam — a process that receives
   the same `{:tracked, …}` cast in place of the camera's own tracker. Absent

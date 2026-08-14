@@ -48,6 +48,7 @@ defmodule Cairn.Application do
       # waiting for each camera's next observation. Outside the media tree on
       # purpose — see the module's own doc.
       {Cairn.TrackerSupervisor, []},
+      {Cairn.PresenceSupervisor, []},
       {Cairn.EventSupervisor, []},
       # Before the cameras that mint epochs into it
       {Cairn.StreamEpochs, []},

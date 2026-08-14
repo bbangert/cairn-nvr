@@ -212,6 +212,38 @@ defmodule Cairn.Config.ServerTest do
                %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
     end
 
+    test "claiming a different tier restarts the camera — the tail is built, not refreshed" do
+      # The tier picks the detect branch's whole tail (presence sink vs the
+      # tracking chain) at build; a refresh routed by the old tail would
+      # feed the new policy to a shape the tier no longer means.
+      dir = Path.join(System.tmp_dir!(), "cairn_srv_tier_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      base_yaml = """
+      backend: ort
+      model:
+        onnx: test/support/fixtures/models/stub.onnx
+      """
+
+      config = fn yaml ->
+        File.write!(Path.join(dir, "tiered.yml"), yaml)
+
+        from_map!(%{
+          "data_dir" => "tmp/cfg_srv_test",
+          "profile_dirs" => [dir],
+          "plugins" => %{"det" => %{"profile" => "tiered"}},
+          "cameras" => [%{"id" => "cam_a", "rtsp_url" => "rtsp://h/1", "plugin" => "det"}]
+        })
+      end
+
+      old = config.(base_yaml)
+      new = config.(base_yaml <> "tier: 2\n")
+
+      assert Config.Server.diff_cameras(old, new) ==
+               %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+    end
+
     test "raising the live-track cap restarts the camera, at any level" do
       # The cap is construction input to the detect branch — the element's
       # `max_suspended` and a frame-counting core's `max_live` — so a running

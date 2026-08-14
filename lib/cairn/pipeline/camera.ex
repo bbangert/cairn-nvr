@@ -10,6 +10,7 @@ defmodule Cairn.Pipeline.Camera do
                           ├─ rtp_cut ────(n)─ RTPOut (in-process WebRTC hub feed)
                           └─ Picker ─(manual)─ Decoder ─(manual)─ Inference
                              ─ ObservationStamper ─ MOTTracker ─ TrackSink
+                             (tier 1: ─ PresenceSink, nothing tracker-shaped)
 
   A camera with a `substream_url` moves that last branch off the tee and onto
   the sub stream, so recording keeps its resolution and detection gets a frame
@@ -55,7 +56,10 @@ defmodule Cairn.Pipeline.Camera do
   observations then flow as `Detections` buffers into
   `Cairn.Pipeline.ObservationStamper`, which clocks them and resolves the
   tracking context, through the generic `Membrane.MOTTracker` hosting the
-  config-named core, and out at `Cairn.Pipeline.TrackSink`.
+  config-named core, and out at `Cairn.Pipeline.TrackSink` — unless the
+  camera's policy claims tier 1, whose branch ends at
+  `Cairn.Pipeline.PresenceSink` instead and builds none of those three
+  (`detect_tail/4`, D-S2).
 
   The tee carries AU-aligned Annex-B H.264 — the TS demuxer's output on one
   ingest, the source's own SPS-derived format on the other (P1-D13); each
@@ -64,7 +68,8 @@ defmodule Cairn.Pipeline.Camera do
 
   Tracked batches leave `Cairn.Pipeline.TrackSink` for `Cairn.Detect.Dispatch`
   directly; this process is on the reload path (a new policy, forwarded to both
-  ends of the tracker) but not on the per-frame one.
+  ends of the tracker — or to the presence sink, the tier-1 branch's one end)
+  but not on the per-frame one.
   """
 
   use Membrane.Pipeline
@@ -82,6 +87,7 @@ defmodule Cairn.Pipeline.Camera do
     MotionGate,
     ObservationStamper,
     Picker,
+    PresenceSink,
     RingBufferSink,
     RTPOut,
     SessionCut,
@@ -108,6 +114,7 @@ defmodule Cairn.Pipeline.Camera do
     camera_id = camera.id
     owner = Keyword.fetch!(opts, :owner)
     detect = Keyword.get(opts, :detect)
+    detect_style = detect_style(detect)
     ingest = Keyword.get(opts, :ingest, :ffmpeg)
     reason = Keyword.get(opts, :initial_reason, :started)
     # The one injection seam on this path: `RTSP` dials a real camera, so a
@@ -131,7 +138,9 @@ defmodule Cairn.Pipeline.Camera do
     state = %{
       camera_id: camera_id,
       owner: owner,
-      detecting?: detect != nil,
+      # Which tail `detect_tail/4` built (nil without a detect branch), so
+      # the reload/stats messages below address a child that exists.
+      detect_style: detect_style,
       sessions: Map.new(@cuts, &{&1, 0}),
       tracks: %{},
       # per-role frame geometry as each tagger reports it, and the last pair
@@ -195,7 +204,8 @@ defmodule Cairn.Pipeline.Camera do
     {[], check_aspect(state, role, format)}
   end
 
-  def handle_child_notification({:stats, stats}, :track_sink, _ctx, state) do
+  def handle_child_notification({:stats, stats}, sink, _ctx, state)
+      when sink in [:track_sink, :presence_sink] do
     send(state.owner, {:stats, stats})
     {[], state}
   end
@@ -206,14 +216,26 @@ defmodule Cairn.Pipeline.Camera do
   # branch alone: the stamper resolves the tracking context from it and ships
   # the sink's half in the batch, so both ends change on the same buffer instead
   # of on two notifications the pad between them cannot order. A camera whose
-  # detect branch was never built has nothing to tell.
+  # detect branch was never built has nothing to tell. On a tier-1 branch the
+  # presence sink is both ends, so the same message lands there.
   @impl true
-  def handle_info({:policy, camera, policy}, _ctx, %{detecting?: true} = state) do
+  def handle_info({:policy, camera, policy}, _ctx, %{detect_style: :tracked} = state) do
     {[notify_child: {:stamper, {:policy, camera, policy}}], state}
   end
 
-  def handle_info(:detect_stats, _ctx, %{detecting?: true} = state) do
+  def handle_info({:policy, camera, policy}, _ctx, %{detect_style: :presence} = state) do
+    {[notify_child: {:presence_sink, {:policy, camera, policy}}], state}
+  end
+
+  # Either tail answers the liveness ask — the owner's watchdog reads
+  # `last_buffer_at_ms` off the reply, and a tier-1 branch that stayed
+  # silent here would leave `detect_stale?/1` blind to a wedged branch.
+  def handle_info(:detect_stats, _ctx, %{detect_style: :tracked} = state) do
     {[notify_child: {:track_sink, :stats}], state}
+  end
+
+  def handle_info(:detect_stats, _ctx, %{detect_style: :presence} = state) do
+    {[notify_child: {:presence_sink, :stats}], state}
   end
 
   # A deliberate stop. The source's EOS travels the same path a session cut
@@ -419,7 +441,7 @@ defmodule Cairn.Pipeline.Camera do
     gate = motion_gate(camera.id, detect, stream_params)
     policy = Keyword.fetch!(detect, :policy)
 
-    [
+    inferred =
       head
       |> child(:picker, Picker)
       # One AU between the two, so the picker learns that the decoder is free
@@ -438,19 +460,42 @@ defmodule Cairn.Pipeline.Camera do
         stream_id: camera.id,
         stream_params: stream_params
       })
-      |> child(:stamper, %ObservationStamper{camera: camera, policy: policy})
-      |> child(:tracker, %Membrane.MOTTracker{
-        tracker: tracker_core(detect, policy),
-        # A camera cannot suspend more tracks than it was allowed to hold. Read
-        # at birth: this is an element option, so a reload that raises
-        # `max_live_tracks` does not raise this one until the camera's next
-        # pipeline — as it does not raise a core's own live cap where that is
-        # a construction option too (`tracker_core/2`), and does raise the one
-        # `Cairn.Tracker` reads off every batch's context.
-        max_suspended: policy.max_live_tracks
-      })
-      |> child(:track_sink, %TrackSink{camera: camera, policy: policy})
-    ]
+
+    [detect_tail(inferred, camera, detect, policy)]
+  end
+
+  # Evaluated BEFORE `detect_spec/3` in `handle_init` on purpose: past that
+  # call, dialyzer refines `detect` through the spec-builder's success typing
+  # down to `nil` and reports this function's second clause unreachable.
+  defp detect_style(nil), do: nil
+  defp detect_style(detect), do: detect |> Keyword.fetch!(:policy) |> style()
+
+  defp style(%{tier: 1}), do: :presence
+  defp style(_policy), do: :tracked
+
+  # The tier fork, at build (D-S2): a tier-1 camera detects presence and
+  # runs no tracker, so the branch simply never contains one — by the time a
+  # batch could choose a route downstream, the tracking machinery would
+  # already exist and be running. `Cairn.Detect.Dispatch` therefore only
+  # ever hears from tracked branches.
+  defp detect_tail(inferred, camera, _detect, %{tier: 1}) do
+    child(inferred, :presence_sink, %PresenceSink{camera: camera})
+  end
+
+  defp detect_tail(inferred, camera, detect, policy) do
+    inferred
+    |> child(:stamper, %ObservationStamper{camera: camera, policy: policy})
+    |> child(:tracker, %Membrane.MOTTracker{
+      tracker: tracker_core(detect, policy),
+      # A camera cannot suspend more tracks than it was allowed to hold. Read
+      # at birth: this is an element option, so a reload that raises
+      # `max_live_tracks` does not raise this one until the camera's next
+      # pipeline — as it does not raise a core's own live cap where that is
+      # a construction option too (`tracker_core/2`), and does raise the one
+      # `Cairn.Tracker` reads off every batch's context.
+      max_suspended: policy.max_live_tracks
+    })
+    |> child(:track_sink, %TrackSink{camera: camera, policy: policy})
   end
 
   # The one place a core name resolved by `Cairn.Config.tracker/2` becomes the
