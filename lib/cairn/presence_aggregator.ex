@@ -157,14 +157,25 @@ defmodule Cairn.PresenceAggregator do
      }}
   end
 
+  # The disable re-check is at CONSUME time on purpose: the sink's own
+  # control read happens a message earlier in another process, so a batch
+  # already in flight when the disable broadcast cleared this state would
+  # otherwise re-mint presence that nothing then clears until the backstop.
+  # Reading the ETS overlay here sees whatever the broadcast announced.
   @impl true
   def handle_cast({:observed, at_ms, seen}, state) do
-    labels =
-      state.labels
-      |> sightings(seen, at_ms, state.camera_id)
-      |> absences(seen, at_ms, state.camera_id)
+    case Cairn.CameraControl.get(state.camera_id) do
+      %{detection_enabled: false} ->
+        {:noreply, state}
 
-    {:noreply, %{state | labels: labels, last_batch_ms: at_ms}}
+      _enabled ->
+        labels =
+          state.labels
+          |> sightings(seen, at_ms, state.camera_id)
+          |> absences(seen, at_ms, state.camera_id)
+
+        {:noreply, %{state | labels: labels, last_batch_ms: at_ms}}
+    end
   end
 
   def handle_cast(:detection_disabled, state) do

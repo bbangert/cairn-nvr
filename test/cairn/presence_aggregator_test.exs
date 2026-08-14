@@ -166,6 +166,19 @@ defmodule Cairn.PresenceAggregatorTest do
     assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, label: "person"}}
   end
 
+  test "an observed batch in flight past a disable is dropped at consume time", %{camera_id: id} do
+    # The race the sink cannot close: its control read happens a message
+    # before the disable broadcast; the aggregator's own read at consume
+    # time is the authoritative one.
+    Cairn.CameraControl.set(id, %{detection_enabled: false})
+    on_exit(fn -> Cairn.CameraControl.set(id, %{detection_enabled: true}) end)
+
+    PresenceAggregator.observed(id, @base, %{"person" => 0.9})
+    PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})
+
+    refute_receive {:presence_started, %PresenceEvent{camera_id: ^id}}, 50
+  end
+
   test "retire/1 clears, stops, and stays gone until the next batch", %{camera_id: id} do
     PresenceAggregator.observed(id, @base, %{"person" => 0.6})
     PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})

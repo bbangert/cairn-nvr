@@ -106,17 +106,6 @@ defmodule Cairn.CameraSupervisor do
 
   @spec stop_camera(String.t()) :: :ok
   def stop_camera(camera_id) do
-    # The camera's presence aggregator goes with it — this function runs for
-    # removed and changed (restarting) cameras, never for a crash/watchdog
-    # rebuild, which is exactly the split presence wants: survive
-    # reconnects, but never outlive the config that meant tier 1
-    # (`Cairn.PresenceAggregator.retire/1` clears before stopping). Awaited
-    # like the camera registration below: retire is a cast, and a
-    # replacement camera started before the old process unregisters would
-    # resolve the dying pid and lose its first observations behind the stop.
-    Cairn.PresenceAggregator.retire(camera_id)
-    Cairn.Registry.await_unregistered(camera_id, :presence)
-
     case Cairn.Registry.whereis(camera_id, :camera) do
       nil ->
         :ok
@@ -125,5 +114,17 @@ defmodule Cairn.CameraSupervisor do
         DynamicSupervisor.terminate_child(__MODULE__, pid)
         Cairn.Registry.await_unregistered(camera_id, :camera)
     end
+
+    # The camera's presence aggregator goes with it — this function runs for
+    # removed and changed (restarting) cameras, never for a crash/watchdog
+    # rebuild, which is exactly the split presence wants: survive
+    # reconnects, but never outlive the config that meant tier 1
+    # (`Cairn.PresenceAggregator.retire/1` clears before stopping). AFTER
+    # the camera tree above, and awaited: with the producer dead nothing can
+    # recreate an aggregator mid-await, and a replacement camera started
+    # once this returns finds the registration gone rather than a dying pid
+    # that would swallow its first observations.
+    Cairn.PresenceAggregator.retire(camera_id)
+    Cairn.Registry.await_unregistered(camera_id, :presence)
   end
 end
