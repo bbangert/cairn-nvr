@@ -110,8 +110,12 @@ defmodule Cairn.CameraSupervisor do
     # removed and changed (restarting) cameras, never for a crash/watchdog
     # rebuild, which is exactly the split presence wants: survive
     # reconnects, but never outlive the config that meant tier 1
-    # (`Cairn.PresenceAggregator.retire/1` clears before stopping).
+    # (`Cairn.PresenceAggregator.retire/1` clears before stopping). Awaited
+    # like the camera registration below: retire is a cast, and a
+    # replacement camera started before the old process unregisters would
+    # resolve the dying pid and lose its first observations behind the stop.
     Cairn.PresenceAggregator.retire(camera_id)
+    Cairn.Registry.await_unregistered(camera_id, :presence)
 
     case Cairn.Registry.whereis(camera_id, :camera) do
       nil ->
