@@ -62,6 +62,7 @@ actually runs must name an artifact for its own backend.
 ```yaml
 # <profile_dirs entry>/my-board.yml
 name: my-board             # optional; when present it must equal the filename
+tier: 2                    # optional; the capability rung this profile claims
 experimental: true         # this profile is unproven — see below
 backend: rknn              # which runtime executes the model
 model:                     # one artifact path per backend, not one model
@@ -95,6 +96,30 @@ toolchain; a QNN profile loads a QDQ-quantized graph which is still an `.onnx`
 by format but is not the same file as the fp32 export. One profile can
 therefore carry the artifacts for several backends, and its own `backend:`
 picks which one becomes `--model`.
+
+## `tier:` — the ascending capability ladder
+
+`tier:` names the capability a profile claims, on a ladder that ascends:
+
+* **1 — presence detection.** Per-class present/cleared events. No object
+  identity, no tracks, no track persistence: a tier-1 pipeline runs no
+  tracker at all, which is why a tier-1 profile with a `tracking:` block is
+  a config error — the block describes machinery the tier turns off.
+* **2 — accurate MOT.** Tracked objects with identity and persistence,
+  measured against the accuracy bar its board's tier file documents.
+* **Higher rungs are reserved** for capabilities that do not exist yet
+  (ALPR, facial identification, …). Validation names the rungs that ship
+  today — `1` and `2` — and widens as new ones do; the schema shape never
+  changes.
+
+Omitting `tier:` means the profile makes no capability claim and nothing
+changes: every tier-less profile behaves exactly as it did before the key
+existed. Tier semantics — pipeline selection, presence events, the
+tier-2 motion-gate rule — activate only when a tier is declared.
+
+The word "tier" also appears on cameras (`track:`/`record:` score
+thresholds); that is a different, older axis. This ladder is per-profile
+and therefore per-group.
 
 ## The menus, and where each lives in code
 

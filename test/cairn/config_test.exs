@@ -1250,6 +1250,86 @@ defmodule Cairn.ConfigTest do
     end
   end
 
+  describe "capability tier (profile tier:)" do
+    # The ascending-ladder `tier:` on profiles — not the `track:`/`record:`
+    # score tiers the describes above cover.
+    defp tiered_map(yaml) do
+      dir = tmp_profile_dir("tiered", yaml)
+
+      base_map()
+      |> Map.put("profile_dirs", [dir])
+      |> Map.put("plugins", %{"det" => %{"profile" => "tiered"}})
+      |> put_plugin(0, "det")
+    end
+
+    defp ort_yaml(extra) do
+      """
+      backend: ort
+      model:
+        onnx: test/support/fixtures/models/stub.onnx
+      #{extra}
+      """
+    end
+
+    test "a declared tier parses and reaches the profiled camera's policy" do
+      assert {:ok, config, []} = Config.from_map(tiered_map(ort_yaml("tier: 2")))
+
+      assert [%{profile: %Cairn.Config.Profile{tier: 2}}] = config.plugin_groups
+
+      # cam_a is on the profiled group; cam_b is on no group and must not
+      # grow the key from someone else's profile.
+      assert [profiled, unprofiled] = config.cameras
+      assert Config.policy(config, profiled)[:tier] == 2
+      refute Map.has_key?(Config.policy(config, unprofiled), :tier)
+    end
+
+    test "tier 1 without a tracking block is legal and reaches the policy" do
+      assert {:ok, config, []} = Config.from_map(tiered_map(ort_yaml("tier: 1")))
+      assert Config.policy(config, hd(config.cameras))[:tier] == 1
+    end
+
+    test "a rung outside the shipped ladder is refused naming the menu" do
+      assert {:error, errors} = Config.from_map(tiered_map(ort_yaml("tier: 3")))
+      assert Enum.any?(errors, &(&1 =~ "profile tiered: unknown tier 3"))
+      assert Enum.any?(errors, &(&1 =~ "1 or 2"))
+      assert Enum.any?(errors, &(&1 =~ "higher rungs are reserved"))
+    end
+
+    test "a non-integer tier is refused by the same rule" do
+      assert {:error, errors} = Config.from_map(tiered_map(ort_yaml(~s(tier: "1"))))
+      assert Enum.any?(errors, &(&1 =~ ~s(profile tiered: unknown tier "1")))
+    end
+
+    test "tier 1 with a tracking block is a contradiction, failed loud" do
+      yaml = ort_yaml("tier: 1\ntracking:\n  twin_mint: true")
+      assert {:error, errors} = Config.from_map(tiered_map(yaml))
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "profile tiered: tier 1 is presence detection and runs no tracker")
+             )
+    end
+
+    test "tier 1 with an empty tracking block is refused the same way" do
+      # Present-but-empty is still the stage list saying "run nothing"
+      # (`Profile.stages/1`) — machinery the tier turns off either way.
+      assert {:error, errors} = Config.from_map(tiered_map(ort_yaml("tier: 1\ntracking: {}")))
+      assert Enum.any?(errors, &(&1 =~ "tier 1 is presence detection"))
+    end
+
+    test "an absent tier leaves every policy map without the key" do
+      # The D-S5 bit-identity spelling at the policy level: a tier-less
+      # profile's policy — and an unprofiled camera's — must be
+      # indistinguishable from before the key existed. The golden replay
+      # suite holds the behavioral half.
+      assert {:ok, config, []} = Config.from_map(profiled_map())
+
+      for cam <- config.cameras do
+        refute Map.has_key?(Config.policy(config, cam), :tier)
+      end
+    end
+  end
+
   describe "group profile checks" do
     @argv_dir "test/support/fixtures/profiles/argv"
     @no_artifact_dir "test/support/fixtures/profiles/no-artifact"
