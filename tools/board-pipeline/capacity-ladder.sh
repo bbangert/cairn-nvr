@@ -29,8 +29,11 @@
 #
 #   For each rung in LADDER_RUNGS (default the 5.5 ladder: 2 4 6 8 streams),
 #   runs LADDER_REPEATS (default 2 — board-bench's "repeatability before
-#   conclusions" rule) cells at BOTH clips (baseline main-res, dual-stream
-#   sub-res) for LADDER_SECONDS (default 300, matching 5.5's cells). Every
+#   conclusions" rule) cells at the clips LADDER_MODES selects (default
+#   "baseline dual" — both the main-res single-stream baseline and the
+#   sub-res dual-stream clip; a per-tier capacity run narrows to its
+#   tier's production plane, e.g. LADDER_MODES=dual) for LADDER_SECONDS
+#   (default 300, matching 5.5's cells). Every
 #   cell's raw evidence — the harness's own `board-pipeline:` lines
 #   (observations/objects/gap_p50_ms per camera, decoder opens, cpu_pct,
 #   element :stats) plus a /proc resource-sample series — is pulled back
@@ -83,6 +86,7 @@ SAMPLE_FPS=${SAMPLE_FPS:-5}
 NATIVE_LIB=${NATIVE_LIB:-/data/board-pipeline/native/libcairn_native.so}
 ORT_LIB=${ORT_LIB:-/data/board-pipeline/native/libcairn_ort.so}
 LADDER_RUNGS=${LADDER_RUNGS:-"2 4 6 8"}
+LADDER_MODES=${LADDER_MODES:-"baseline dual"}
 LADDER_REPEATS=${LADDER_REPEATS:-2}
 LADDER_SECONDS=${LADDER_SECONDS:-300}
 LADDER_PIN_GOVERNOR=${LADDER_PIN_GOVERNOR:-1}
@@ -164,13 +168,24 @@ SUMMARY_CSV="$LADDER_RESULT_DIR/summary-$RUN_ID.csv"
 # -- plan (built once, used by both --dry-run and the real run) --------------
 
 RUNGS=($LADDER_RUNGS)
-MODES=(baseline dual)
+# LADDER_MODES narrows the sweep to one ingest mode — a per-tier capacity
+# run only measures that tier's production detect plane (tier 1 = dual).
+MODES=($LADDER_MODES)
+for m in "${MODES[@]}"; do
+  case "$m" in
+  baseline | dual) ;;
+  *)
+    say "REFUSING: LADDER_MODES entries must be baseline/dual, got: $m"
+    exit 1
+    ;;
+  esac
+done
 declare -A CLIP_FOR=( [baseline]="$MAIN_CLIP" [dual]="$SUB_CLIP" )
 declare -A REMOTE_CLIP=( [baseline]="$REMOTE_DIR/clips/main.aus" [dual]="$REMOTE_DIR/clips/sub.aus" )
 
 print_plan() {
   say "board=$BOARD remote_dir=$REMOTE_DIR"
-  say "rungs=${RUNGS[*]} repeats=$LADDER_REPEATS seconds=$LADDER_SECONDS pin_governor=$LADDER_PIN_GOVERNOR"
+  say "rungs=${RUNGS[*]} modes=${MODES[*]} repeats=$LADDER_REPEATS seconds=$LADDER_SECONDS pin_governor=$LADDER_PIN_GOVERNOR"
   say "model=$MODEL backend=$BACKEND decoder=$DECODER sample_fps=$SAMPLE_FPS"
   say "local build=$LOCAL_BUILD main_clip=$MAIN_CLIP sub_clip=$SUB_CLIP"
   say "results -> $LOCAL_RESULT_ROOT ; summary -> $SUMMARY_CSV"
