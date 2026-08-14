@@ -308,10 +308,10 @@ defmodule Cairn.Pipeline.CameraTest do
       assert [notify_child: {:presence_sink, {:policy, ^camera, ^tier1}}] = actions
       assert Map.has_key?(children(spec(detect: detect(policy: tier1))), :presence_sink)
 
-      # …and the stats ask is tracked-only: a tier-1 branch has no sink that
-      # answers it, so the message must fall through, not crash.
+      # …and the liveness ask lands on the same end: the owner's watchdog
+      # reads `last_buffer_at_ms` off whichever sink answers.
       {actions, _} = Pipeline.handle_info(:detect_stats, %{}, presence)
-      assert actions == []
+      assert actions == [notify_child: {:presence_sink, :stats}]
     end
 
     test "the tracker element hosts the core the owner resolved, capped by the policy" do

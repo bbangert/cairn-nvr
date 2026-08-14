@@ -43,7 +43,12 @@ defmodule Cairn.Pipeline.PresenceSink do
        # Once per transition, like the stamper's `detecting?`.
        detecting?: true,
        forwarded: 0,
-       dropped: 0
+       dropped: 0,
+       # Monotonic, for the owner's watchdog — the tier-1 spelling of
+       # `Cairn.Pipeline.TrackSink`'s liveness field: without it a tier-1
+       # camera's `detect_at_ms` stays nil and `detect_stale?/1` can never
+       # notice a wedged inference branch.
+       last_buffer_at_ms: nil
      }}
   end
 
@@ -79,7 +84,13 @@ defmodule Cairn.Pipeline.PresenceSink do
       PresenceAggregator.observed(state.camera.id, now_ms, seen(frame, floors))
     end
 
-    {[], %{state | detecting?: true, forwarded: state.forwarded + length(observations)}}
+    {[],
+     %{
+       state
+       | detecting?: true,
+         forwarded: state.forwarded + length(observations),
+         last_buffer_at_ms: now_ms
+     }}
   end
 
   defp seen(frame, floors) do
@@ -108,5 +119,17 @@ defmodule Cairn.Pipeline.PresenceSink do
   @impl true
   def handle_parent_notification({:policy, camera, _policy}, _ctx, state) do
     {[], %{state | camera: camera}}
+  end
+
+  # The owner's liveness read, `TrackSink`'s shape — it matches on
+  # `last_buffer_at_ms` alone.
+  def handle_parent_notification(:stats, _ctx, state) do
+    stats = %{
+      forwarded: state.forwarded,
+      dropped: state.dropped,
+      last_buffer_at_ms: state.last_buffer_at_ms
+    }
+
+    {[notify_parent: {:stats, stats}], state}
   end
 end

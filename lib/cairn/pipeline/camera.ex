@@ -204,7 +204,8 @@ defmodule Cairn.Pipeline.Camera do
     {[], check_aspect(state, role, format)}
   end
 
-  def handle_child_notification({:stats, stats}, :track_sink, _ctx, state) do
+  def handle_child_notification({:stats, stats}, sink, _ctx, state)
+      when sink in [:track_sink, :presence_sink] do
     send(state.owner, {:stats, stats})
     {[], state}
   end
@@ -226,9 +227,15 @@ defmodule Cairn.Pipeline.Camera do
     {[notify_child: {:presence_sink, {:policy, camera, policy}}], state}
   end
 
-  # Presence has no stats consumer, so the ask is tracked-only.
+  # Either tail answers the liveness ask — the owner's watchdog reads
+  # `last_buffer_at_ms` off the reply, and a tier-1 branch that stayed
+  # silent here would leave `detect_stale?/1` blind to a wedged branch.
   def handle_info(:detect_stats, _ctx, %{detect_style: :tracked} = state) do
     {[notify_child: {:track_sink, :stats}], state}
+  end
+
+  def handle_info(:detect_stats, _ctx, %{detect_style: :presence} = state) do
+    {[notify_child: {:presence_sink, :stats}], state}
   end
 
   # A deliberate stop. The source's EOS travels the same path a session cut

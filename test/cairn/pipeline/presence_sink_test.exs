@@ -115,4 +115,21 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
     {_actions, _state} = two_beats(state, [frame([object("person", 0.9)])])
     assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
   end
+
+  test "the stats reply carries the liveness stamp the owner's watchdog reads", ctx do
+    state = sink(ctx)
+
+    # Before any buffer the stamp is honestly nil — the owner treats nil as
+    # "nothing to judge yet", not as staleness.
+    assert {[notify_parent: {:stats, %{last_buffer_at_ms: nil}}], state} =
+             PresenceSink.handle_parent_notification(:stats, %{}, state)
+
+    {[], state} = feed(state, [frame([object("person", 0.6)])])
+
+    assert {[notify_parent: {:stats, stats}], _state} =
+             PresenceSink.handle_parent_notification(:stats, %{}, state)
+
+    assert is_integer(stats.last_buffer_at_ms)
+    assert stats.forwarded == 1
+  end
 end

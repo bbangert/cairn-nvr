@@ -119,6 +119,12 @@ defmodule Cairn.PresenceAggregator do
 
   @impl true
   def init(camera_id) do
+    # The out-of-band half of `detection_disabled/1`: the sink's own call
+    # only fires when a buffer arrives, and a closed motion gate delivers
+    # none — an operator disabling detection behind a still scene would
+    # otherwise wait on motion or the silence backstop for the clear the
+    # API promises is immediate.
+    Cairn.CameraControl.subscribe()
     Process.send_after(self(), :silence_check, @silence_check_ms)
 
     {:ok,
@@ -147,9 +153,17 @@ defmodule Cairn.PresenceAggregator do
     {:noreply, clear_all(state)}
   end
 
+  # The control topic carries every camera; only this one's disable acts.
+  @impl true
+  def handle_info({:camera_control, camera_id, %{detection_enabled: false}}, state)
+      when camera_id == state.camera_id do
+    {:noreply, clear_all(state)}
+  end
+
+  def handle_info({:camera_control, _camera_id, _control}, state), do: {:noreply, state}
+
   # Wall-clock silence: only the dead-stream backstop, per the moduledoc.
   # Monotonic here too — `last_batch_ms` is the sink's monotonic stamp.
-  @impl true
   def handle_info(:silence_check, state) do
     Process.send_after(self(), :silence_check, @silence_check_ms)
     now = System.monotonic_time(:millisecond)

@@ -151,6 +151,21 @@ defmodule Cairn.PresenceAggregatorTest do
     refute_receive {:presence_cleared, %PresenceEvent{camera_id: ^other_id}}, 50
   end
 
+  test "a detection-disable broadcast clears with the gate closed — no batch needed", %{
+    camera_id: id
+  } do
+    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
+    PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+
+    # The out-of-band path: no buffer arrives (still scene, closed gate) —
+    # the aggregator hears the control broadcast itself.
+    Cairn.CameraControl.set(id, %{detection_enabled: false})
+    on_exit(fn -> Cairn.CameraControl.set(id, %{detection_enabled: true}) end)
+
+    assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, label: "person"}}
+  end
+
   test "silence alone (no batches at all) never clears presence", %{camera_id: id} do
     PresenceAggregator.observed(id, @base, %{"person" => 0.6})
     PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})
