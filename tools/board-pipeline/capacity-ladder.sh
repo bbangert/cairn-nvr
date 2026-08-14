@@ -170,7 +170,13 @@ SUMMARY_CSV="$LADDER_RESULT_DIR/summary-$RUN_ID.csv"
 RUNGS=($LADDER_RUNGS)
 # LADDER_MODES narrows the sweep to one ingest mode — a per-tier capacity
 # run only measures that tier's production detect plane (tier 1 = dual).
-MODES=($LADDER_MODES)
+# read -a, not bare expansion: no pathname expansion, and an empty value
+# is refused rather than silently sweeping zero cells under a CSV header.
+read -r -a MODES <<< "$LADDER_MODES"
+if [ "${#MODES[@]}" -eq 0 ]; then
+  say "REFUSING: LADDER_MODES is empty — nothing to sweep"
+  exit 1
+fi
 for m in "${MODES[@]}"; do
   case "$m" in
   baseline | dual) ;;
