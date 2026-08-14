@@ -170,25 +170,24 @@ defmodule Cairn.PresenceAggregator do
 
   # The second sighting inside the window confirms; one outside it means the
   # first was a lone flicker — the candidacy restarts rather than confirming
-  # off two sightings a minute apart.
+  # off two sightings a minute apart. A sighting is a CALL, not an instant:
+  # two frames of one multi-frame buffer reach here as two calls sharing the
+  # sink's per-buffer clock read, and they are two model passes on two source
+  # frames — exactly the two consecutive detections the confirm asks for —
+  # so an equal `at_ms` must not be collapsed into one.
   defp sighted(%{phase: :pending} = entry, label, score, at_ms, camera_id) do
-    cond do
-      at_ms == entry.first_seen_ms ->
-        %{entry | best_score: max(entry.best_score, score), last_seen_ms: at_ms}
-
-      at_ms - entry.first_seen_ms <= @confirm_window_ms ->
-        entry = %{
-          entry
-          | phase: :present,
-            best_score: max(entry.best_score, score),
-            last_seen_ms: at_ms
-        }
-
-        broadcast(:presence_started, camera_id, label, entry)
+    if at_ms - entry.first_seen_ms <= @confirm_window_ms do
+      entry = %{
         entry
+        | phase: :present,
+          best_score: max(entry.best_score, score),
+          last_seen_ms: at_ms
+      }
 
-      true ->
-        sighted(nil, label, score, at_ms, camera_id)
+      broadcast(:presence_started, camera_id, label, entry)
+      entry
+    else
+      sighted(nil, label, score, at_ms, camera_id)
     end
   end
 

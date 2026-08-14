@@ -298,10 +298,15 @@ defmodule Cairn.Pipeline.CameraTest do
       {_actions, tracked} = init(detect: detect())
       {actions, _} = Pipeline.handle_info({:policy, camera, @policy}, %{}, tracked)
       assert [notify_child: {:stamper, {:policy, ^camera, @policy}}] = actions
+      # Routed-to child and built child must come from the same tier read:
+      # `detect_style/1` and `detect_tail/4` consult the policy independently,
+      # and a divergence would notify a child that does not exist.
+      assert Map.has_key?(children(spec(detect: detect())), :stamper)
 
       {_actions, presence} = init(detect: detect(policy: tier1))
       {actions, _} = Pipeline.handle_info({:policy, camera, tier1}, %{}, presence)
       assert [notify_child: {:presence_sink, {:policy, ^camera, ^tier1}}] = actions
+      assert Map.has_key?(children(spec(detect: detect(policy: tier1))), :presence_sink)
 
       # …and the stats ask is tracked-only: a tier-1 branch has no sink that
       # answers it, so the message must fall through, not crash.

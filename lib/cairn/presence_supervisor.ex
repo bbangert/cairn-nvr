@@ -7,6 +7,12 @@ defmodule Cairn.PresenceSupervisor do
   checkpoint-restore sweep presence has no use for (nothing here is
   persisted, so a restarted aggregator correctly starts knowing nothing and
   re-confirms from the next batches).
+
+  The default restart intensity is kept deliberately: one aggregator
+  crash-looping past it takes this pool down and every camera's presence
+  state with it — the same cascade bargain `Cairn.TrackerSupervisor.Pool`
+  makes — and the application root restarts the pool empty, which for
+  state this ephemeral is a correct recovery, not a loss.
   """
 
   use DynamicSupervisor

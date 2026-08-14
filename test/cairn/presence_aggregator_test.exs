@@ -44,6 +44,36 @@ defmodule Cairn.PresenceAggregatorTest do
     assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
   end
 
+  test "two frames of one buffer — two calls, one instant — still confirm", %{camera_id: id} do
+    # A multi-frame `Detections` buffer reaches the aggregator as calls
+    # sharing the sink's one clock read; they are two model passes on two
+    # source frames, which is what the confirm asks for.
+    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
+    PresenceAggregator.observed(id, @base, %{"person" => 0.7})
+
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+  end
+
+  test "a second sighting exactly at the window's edge confirms — the bound is inclusive", %{
+    camera_id: id
+  } do
+    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
+    PresenceAggregator.observed(id, @base + 2_000, %{"person" => 0.7})
+
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+  end
+
+  test "a later, better sighting raises the score the clearing reports", %{camera_id: id} do
+    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
+    PresenceAggregator.observed(id, @base + 500, %{"person" => 0.7})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, score: 0.7}}
+
+    PresenceAggregator.observed(id, @base + 1_000, %{"person" => 0.95})
+    PresenceAggregator.observed(id, @base + 6_000, %{})
+
+    assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, score: 0.95}}
+  end
+
   test "present labels do not clear on absent batches inside the clear window, but every absent batch (even empty) still counts toward it",
        %{camera_id: id} do
     PresenceAggregator.observed(id, @base, %{"person" => 0.6})

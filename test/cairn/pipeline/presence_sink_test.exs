@@ -42,12 +42,10 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
       observation_kind: kind
     }
 
-  # Two buffers, spaced a beat apart so `System.monotonic_time(:millisecond)`
-  # cannot land the same instant for both — the aggregator only confirms
-  # across two genuinely distinct `at_ms` values.
+  # Two buffers back to back — the aggregator counts sightings per call, so
+  # even the same millisecond's clock reading confirms.
   defp two_beats(state, observations) do
     {[], state} = feed(state, observations)
-    Process.sleep(5)
     feed(state, observations)
   end
 
@@ -57,7 +55,6 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
     state = sink(ctx)
 
     {[], state} = feed(state, [frame([object("person", 0.6)])])
-    Process.sleep(5)
     {[], _state} = feed(state, [frame([object("person", 0.9)])])
 
     assert_receive {:presence_started,

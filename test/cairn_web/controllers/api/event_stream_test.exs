@@ -97,11 +97,15 @@ defmodule CairnWeb.Api.EventStreamTest do
       assert String.ends_with?(frame, "\n\n")
     end
 
-    test "presence_cleared names the state cleared" do
+    test "presence_cleared names the state cleared and keeps the stay's fields" do
       assert {:ok, frame} = SSE.frame_for({:presence_cleared, presence([])})
 
       assert frame =~ "event: presence_cleared\n"
       assert frame =~ ~s("state":"cleared")
+      # The struct's contract: `first_seen_at` survives into the clearing so
+      # dwell is readable off this frame alone.
+      assert frame =~ ~s("first_seen_at":"2026-07-24T00:00:00Z")
+      assert frame =~ ~s("score":0.8)
     end
   end
 

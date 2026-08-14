@@ -70,8 +70,11 @@ defmodule Cairn.Pipeline.PresenceSink do
     floors = effective_min_score(state.camera, control)
     now_ms = System.monotonic_time(:millisecond)
 
-    # One aggregator call per frame, not per buffer: a push's frames are
-    # separate instants, same as the stamper's one-batch-per-buffer rule.
+    # One aggregator call per frame, not per buffer — but unlike the
+    # stamper's clock, which derives a distinct `at_ms` per frame, every
+    # frame here shares the buffer's one reading. That is enough because the
+    # aggregator counts sightings per CALL: presence needs to know the class
+    # was seen again, not when to the millisecond.
     for frame <- observations do
       PresenceAggregator.observed(state.camera.id, now_ms, seen(frame, floors))
     end
