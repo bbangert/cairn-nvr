@@ -178,8 +178,8 @@ defmodule Cairn.Config.Camera do
         {json,
          add_warning(
            acc,
-           ~s(camera #{id}: motion_json resolves to no detector — say "enabled": true ) <>
-             "or the gate is never built"
+           ~s(camera #{id}: motion_json resolves to no detector, so the gate is never ) <>
+             ~s(built — add "enabled": true to it)
          )}
 
       {:ok, _resolved} ->
