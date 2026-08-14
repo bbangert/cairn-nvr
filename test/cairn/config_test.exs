@@ -1251,8 +1251,9 @@ defmodule Cairn.ConfigTest do
   end
 
   describe "capability tier (profile tier:)" do
-    # The ascending-ladder `tier:` on profiles — not the `track:`/`record:`
-    # score tiers the describes above cover.
+    # The ascending-ladder `tier:` on profiles. The `track:`/`record:` score
+    # thresholds covered elsewhere in this file share the word "tier" and
+    # nothing else.
     defp tiered_map(yaml) do
       dir = tmp_profile_dir("tiered", yaml)
 
@@ -1315,6 +1316,27 @@ defmodule Cairn.ConfigTest do
       # (`Profile.stages/1`) — machinery the tier turns off either way.
       assert {:error, errors} = Config.from_map(tiered_map(ort_yaml("tier: 1\ntracking: {}")))
       assert Enum.any?(errors, &(&1 =~ "tier 1 is presence detection"))
+    end
+
+    test "tier 1 with a bare tracking: key is legal — nil means absent" do
+      # The value, not the key: a dangling `tracking:` parses to nil, which
+      # the whole module reads as "said nothing about tracking" — the
+      # contradiction needs an actual stage list.
+      assert {:ok, config, []} = Config.from_map(tiered_map(ort_yaml("tier: 1\ntracking:")))
+      assert Config.policy(config, hd(config.cameras))[:tier] == 1
+    end
+
+    test "tier 2 with a tracking block is the ordinary legal shape" do
+      yaml = ort_yaml("tier: 2\ntracking:\n  twin_mint: true")
+      assert {:ok, config, []} = Config.from_map(tiered_map(yaml))
+
+      assert [%{profile: %Cairn.Config.Profile{tier: 2, stages: %{twin_mint: %{}}}}] =
+               config.plugin_groups
+    end
+
+    test "a float rung is refused like any other non-member" do
+      assert {:error, errors} = Config.from_map(tiered_map(ort_yaml("tier: 1.0")))
+      assert Enum.any?(errors, &(&1 =~ "profile tiered: unknown tier 1.0"))
     end
 
     test "an absent tier leaves every policy map without the key" do

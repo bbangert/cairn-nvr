@@ -105,8 +105,9 @@ picks which one becomes `--model`.
   identity, no tracks, no track persistence: a tier-1 pipeline runs no
   tracker at all, which is why a tier-1 profile with a `tracking:` block is
   a config error — the block describes machinery the tier turns off.
-* **2 — accurate MOT.** Tracked objects with identity and persistence,
-  measured against the accuracy bar its board's tier file documents.
+* **2 — accurate MOT.** Tracked objects with identity and persistence.
+  The measured accuracy bar and per-board capacity will live in each
+  board's tier file when those ship.
 * **Higher rungs are reserved** for capabilities that do not exist yet
   (ALPR, facial identification, …). Validation names the rungs that ship
   today — `1` and `2` — and widens as new ones do; the schema shape never
@@ -114,8 +115,11 @@ picks which one becomes `--model`.
 
 Omitting `tier:` means the profile makes no capability claim and nothing
 changes: every tier-less profile behaves exactly as it did before the key
-existed. Tier semantics — pipeline selection, presence events, the
-tier-2 motion-gate rule — activate only when a tier is declared.
+existed. Today the field is schema and validation only — a declared tier
+reaches each camera's policy and nothing reads it back yet. The behaviors
+it will select (presence events for tier 1, the tier-2 motion-gate rule,
+pipeline selection) land in later phases and will activate only when a
+tier is declared.
 
 The word "tier" also appears on cameras (`track:`/`record:` score
 thresholds); that is a different, older axis. This ladder is per-profile

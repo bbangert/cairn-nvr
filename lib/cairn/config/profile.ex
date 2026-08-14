@@ -650,9 +650,12 @@ defmodule Cairn.Config.Profile do
   # Both tier rules in one place: the menu check (the ladder's shipped rungs,
   # see `@tiers`) and the one cross-field contradiction — a tier-1 profile
   # with a `tracking:` block. Tier 1 is presence detection and its pipeline
-  # runs no tracker, so every `tracking.*` key (the block IS the stage list,
-  # even empty — see `stages/1`) describes machinery the tier turns off;
-  # failing loud beats a profile that reads as if it tuned something. Tier 2
+  # runs no tracker, so a stage list (the block IS one, even empty — see
+  # `stages/1`) describes machinery the tier turns off; failing loud beats a
+  # profile that reads as if it tuned something. The value, not the key:
+  # a bare `tracking:` parses to nil, which everything here (`stages/1`,
+  # `check_tracking/3`) reads as "said nothing about tracking" — the
+  # contradiction needs the profile to have actually said something. Tier 2
   # requires nothing extra today — its accuracy claims live in docs until the
   # measured tier files ship.
   defp check_tier(acc, raw, name) do
@@ -663,7 +666,7 @@ defmodule Cairn.Config.Profile do
       tier when tier in @tiers ->
         Config.check(
           acc,
-          tier != 1 or not Map.has_key?(raw, "tracking"),
+          tier != 1 or is_nil(Map.get(raw, "tracking")),
           "profile #{name}: tier 1 is presence detection and runs no tracker — " <>
             "remove the tracking: block or claim tier: 2"
         )
