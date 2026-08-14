@@ -57,7 +57,8 @@ mix phx.server                     # http://localhost:4000
 renders it read-only and can hot-reload it (`/config` → Reload — added and
 removed cameras are started and stopped; a change that reaches a subprocess
 or the ring (`rtsp_url`, `substream_url`, `plugin`, `min_score`, `ingest`,
-`transcode`, `extra_ffmpeg_args`, the pre-event window) restarts that camera, and
+`transcode`, `extra_ffmpeg_args`, `motion_json`, the pre-event window, the
+resolved tier) restarts that camera, and
 everything else — the `track:` / `record:` tiers, the post/max windows, the
 tracking bounds, retention — is applied to the running camera without
 cutting its stream or its live tracks. Invalid files are rejected with the
@@ -82,7 +83,7 @@ See `config.example.yml` — every key is documented inline. Summary:
 | `profile_dirs` | directories of your own hardware profiles, searched after the ones cairn ships (a same-named file of yours wins, with a warning) |
 | `retention.days` / `retention.per_label` | pruning (camera overrides win; multi-label events keep the longest) |
 | `retention.tracks_days` | how long track rows live (default 365; global only, and exempt from emergency cleanup) |
-| `cameras[]` | `id`, `rtsp_url`, `substream_url` (optional second stream detection runs on while recording keeps cutting from the main one — always `rtsp://`, whatever `ingest` says, and it must share the main stream's aspect ratio), `plugin` (a `plugins:` group name — absent ⇒ no detection), `ingest` (`ffmpeg` bridge default, `rtsp` native), `min_score` per label (the wire floor), `track` / `record` (the two host-side tiers above it: what earns a track row, what earns video), `extra_ffmpeg_args`, `transcode`, `retention` |
+| `cameras[]` | `id`, `rtsp_url`, `substream_url` (optional second stream detection runs on while recording keeps cutting from the main one — always `rtsp://`, whatever `ingest` says, and it must share the main stream's aspect ratio), `plugin` (a `plugins:` group name — absent ⇒ no detection), `ingest` (`ffmpeg` bridge default, `rtsp` native), `min_score` per label (the wire floor), `track` / `record` (the two host-side tiers above it: what earns a track row, what earns video), `motion_json` (the motion gate's scene config, verbatim JSON — operator-owned per D-P6; rejected on a tier-2 group, see `docs/profile-authoring.md`), `extra_ffmpeg_args`, `transcode`, `retention` |
 | `plugins` | named plugin groups (`name: {profile: ...}`) — the hardware profile the in-VM engine loads for every camera naming the group (it owns the model config and the tracker's stage list); `allow_experimental:` consents to a profile whose backend is not proven in soak |
 | `integrations.token` | bearer token that enables the Home Assistant API (see below); absent ⇒ `/api` disabled |
 

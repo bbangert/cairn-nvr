@@ -395,7 +395,13 @@ defmodule Cairn.PipelineOwner do
       policy: Config.policy(state.config, state.camera),
       tracker: Config.tracker(state.config, state.camera),
       sample_fps: Config.sample_fps(state.config, state.camera),
-      stream_params: %{min_score: state.camera.min_score}
+      stream_params: %{
+        min_score: state.camera.min_score,
+        # The operator's scene knob (D-P6), verbatim from config — the
+        # branch builds its gate element from it (`motion_gate/3`), nil
+        # meaning no gate, today's chain exactly.
+        motion_json: state.camera.motion_json
+      }
     ]
   end
 

@@ -45,7 +45,8 @@ defmodule Cairn.Config.Camera do
 
   @known_keys ~w(id rtsp_url substream_url plugin pipeline ingest min_score track record
                  extra_ffmpeg_args transcode retention pre_window_seconds post_window_seconds
-                 max_event_seconds max_unseen_ms max_live_tracks stationary_after_ms tracker)
+                 max_event_seconds max_unseen_ms max_live_tracks stationary_after_ms tracker
+                 motion_json)
 
   @default_min_score %{"default" => 0.5}
 
@@ -67,7 +68,13 @@ defmodule Cairn.Config.Camera do
             max_unseen_ms: nil,
             max_live_tracks: nil,
             stationary_after_ms: nil,
-            tracker: nil
+            tracker: nil,
+            # The motion gate's scene config, verbatim JSON — the operator's
+            # knob (D-P6: a profile never writes it) describing THIS scene's
+            # zones and thresholds. Validated at load, carried to the detect
+            # branch's gate element as `stream_params.motion_json`. Tier-2
+            # groups reject it (D-S4, `Cairn.Config.validate/2`).
+            motion_json: nil
 
   @type t :: %__MODULE__{}
 
@@ -125,6 +132,7 @@ defmodule Cairn.Config.Camera do
 
     {extra_args, acc} = parse_extra_args(Map.get(raw, "extra_ffmpeg_args"), id, acc)
     {substream_url, acc} = parse_substream(Map.get(raw, "substream_url"), id, acc)
+    {motion_json, acc} = parse_motion_json(Map.get(raw, "motion_json"), id, acc)
 
     cam = %__MODULE__{
       id: id,
@@ -145,10 +153,45 @@ defmodule Cairn.Config.Camera do
       max_unseen_ms: Map.get(raw, "max_unseen_ms"),
       max_live_tracks: Map.get(raw, "max_live_tracks"),
       stationary_after_ms: Map.get(raw, "stationary_after_ms"),
-      tracker: Map.get(raw, "tracker")
+      tracker: Map.get(raw, "tracker"),
+      motion_json: motion_json
     }
 
     {cam, acc}
+  end
+
+  # Validated here rather than at pipeline build, where the same string
+  # raises inside `Cairn.Pipeline.Camera.motion_gate/3` as a crash-looping
+  # camera instead of a config error naming the problem. The string is
+  # carried VERBATIM on success — the gate resolves it again itself, so
+  # nothing here can drift from what the element actually reads.
+  defp parse_motion_json(nil, _id, acc), do: {nil, acc}
+
+  defp parse_motion_json(json, id, acc) when is_binary(json) do
+    case Cairn.Motion.Config.resolve_json(json) do
+      {:ok, nil} ->
+        # Valid vocabulary, no detector: `"enabled": true` was not said, so
+        # the gate will not be built — indistinguishable at runtime from
+        # omitting the key. Warned, not refused: the string is legal and
+        # carried verbatim, but an operator who wrote zones surely meant
+        # them to gate something (the silent-fallback lesson).
+        {json,
+         add_warning(
+           acc,
+           ~s(camera #{id}: motion_json resolves to no detector, so the gate is never ) <>
+             ~s(built — add "enabled": true to it)
+         )}
+
+      {:ok, _resolved} ->
+        {json, acc}
+
+      {:error, message} ->
+        {nil, add_error(acc, "camera #{id}: motion_json: #{message}")}
+    end
+  end
+
+  defp parse_motion_json(_other, id, acc) do
+    {nil, add_error(acc, "camera #{id}: motion_json must be a JSON string")}
   end
 
   defp parse_min_score(nil, _id, acc), do: {@default_min_score, acc}
