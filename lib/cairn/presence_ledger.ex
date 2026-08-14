@@ -17,8 +17,9 @@ defmodule Cairn.PresenceLedger do
   `Cairn.PresenceAggregator` states the recovery bargain it serves.
 
   Writes come only from aggregators, on the same process that broadcasts,
-  so a row exists iff the started went out (`:ets` is written before the
-  broadcast, making the recovery clear at worst spurious, never missing).
+  ordered for at-least-once recovery: the row is inserted BEFORE the
+  started may go out and deleted only AFTER the cleared has — a crash
+  between either pair costs a duplicate cleared, never a missing one.
   """
 
   use GenServer

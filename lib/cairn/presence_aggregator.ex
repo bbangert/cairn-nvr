@@ -168,8 +168,11 @@ defmodule Cairn.PresenceAggregator do
     # `Cairn.PresenceLedger`). A fresh camera has no leftovers and this is
     # a no-op.
     for {label, first_seen_at, score} <- Cairn.PresenceLedger.leftovers(camera_id) do
-      Cairn.PresenceLedger.cleared(camera_id, label)
-
+      # Emit before delete, here and in `broadcast/4`: a crash between the
+      # two leaves the row for the NEXT restart, whose clear is then a
+      # duplicate — the ledger's stated bargain is at-least-once ("at worst
+      # spurious, never missing"), and deleting first would invert it into
+      # a cleared that can vanish.
       PresenceEvent.broadcast(:presence_cleared, %PresenceEvent{
         camera_id: camera_id,
         label: label,
@@ -177,6 +180,8 @@ defmodule Cairn.PresenceAggregator do
         first_seen_at: first_seen_at,
         at: DateTime.utc_now()
       })
+
+      Cairn.PresenceLedger.cleared(camera_id, label)
     end
 
     # The out-of-band half of `detection_disabled/1`: the sink's own call
@@ -297,7 +302,14 @@ defmodule Cairn.PresenceAggregator do
     end
   end
 
-  defp sighted(%{phase: :present} = entry, _label, score, at_ms, _camera_id) do
+  defp sighted(%{phase: :present} = entry, label, score, at_ms, camera_id) do
+    # The ledger row follows an improving best, so a crash-recovery clear
+    # carries what the cleared contract promises — the best over the whole
+    # stay, not the best as of the confirmation.
+    if score > entry.best_score do
+      Cairn.PresenceLedger.announced(camera_id, label, entry.first_seen_at, score)
+    end
+
     %{
       entry
       | best_score: max(entry.best_score, score),
@@ -347,17 +359,19 @@ defmodule Cairn.PresenceAggregator do
     %{state | labels: %{}, last_batch_ms: nil}
   end
 
-  # Ledger before broadcast, on this same process: a row exists iff the
-  # started went out, so a crash between the two makes the recovery clear
-  # at worst spurious, never missing.
+  # The ledger write sits on whichever side of the emit keeps the recovery
+  # clear AT LEAST once: insert before a started (a row exists once the
+  # started may have gone out), delete after a cleared (the row survives
+  # until the cleared has). A crash between either pair costs a duplicate
+  # cleared, never a missing one.
   defp broadcast(:presence_started = kind, camera_id, label, entry) do
     Cairn.PresenceLedger.announced(camera_id, label, entry.first_seen_at, entry.best_score)
     emit(kind, camera_id, label, entry)
   end
 
   defp broadcast(:presence_cleared = kind, camera_id, label, entry) do
-    Cairn.PresenceLedger.cleared(camera_id, label)
     emit(kind, camera_id, label, entry)
+    Cairn.PresenceLedger.cleared(camera_id, label)
   end
 
   defp emit(kind, camera_id, label, entry) do

@@ -11,6 +11,14 @@ defmodule Cairn.PresenceAggregatorTest do
   setup do
     camera_id = "pres_#{System.unique_integer([:positive])}"
     Event.subscribe()
+
+    # Aggregators live in the application-wide pool; without this every
+    # test leaks a timer-bearing control subscriber for the suite's life.
+    on_exit(fn ->
+      PresenceAggregator.retire(camera_id)
+      Registry.await_unregistered(camera_id, :presence)
+    end)
+
     %{camera_id: camera_id}
   end
 

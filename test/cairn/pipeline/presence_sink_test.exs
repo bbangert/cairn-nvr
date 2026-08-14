@@ -11,6 +11,13 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
     camera_id = "psink_#{System.unique_integer([:positive])}"
     Event.subscribe()
 
+    # The sink's feeds start real aggregators in the application-wide
+    # pool; retire them or every test leaks one for the suite's life.
+    on_exit(fn ->
+      Cairn.PresenceAggregator.retire(camera_id)
+      Cairn.Registry.await_unregistered(camera_id, :presence)
+    end)
+
     %{
       camera_id: camera_id,
       camera: %Camera{id: camera_id, rtsp_url: "rtsp://h/1", min_score: %{"default" => 0.5}}
