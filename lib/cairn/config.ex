@@ -349,6 +349,11 @@ defmodule Cairn.Config do
   the block is absent. Resolve a label against one with `tier_threshold/3`
   rather than reading the map directly — `nil` and an unlisted label mean
   opposite things.
+
+  Two keys appear only when a profile put them there — `:stages` (the
+  group's stage presence map) and `:tier` (the profile's capability rung,
+  no relation to the score tiers above) — so their absence is itself the
+  answer "the profile said nothing".
   """
   @spec policy(t(), Camera.t()) :: %{
           :pre => pos_integer(),
@@ -363,7 +368,8 @@ defmodule Cairn.Config do
           :reid => boolean(),
           :track => Camera.tier() | nil,
           :record => Camera.tier() | nil,
-          optional(:stages) => %{optional(atom()) => map()}
+          optional(:stages) => %{optional(atom()) => map()},
+          optional(:tier) => 1..2
         }
   def policy(%__MODULE__{} = config, %Camera{} = cam) do
     profile = profile_for(config, cam)
@@ -402,6 +408,7 @@ defmodule Cairn.Config do
     |> Map.put(:track, cam.track)
     |> Map.put(:record, cam.record)
     |> put_stages(profile)
+    |> put_tier(profile)
   end
 
   # The three bounds resolve camera → profile → global: a camera's own
@@ -465,6 +472,18 @@ defmodule Cairn.Config do
   defp put_stages(policy, nil), do: policy
   defp put_stages(policy, %Profile{stages: nil}), do: policy
   defp put_stages(policy, %Profile{stages: stages}), do: Map.put(policy, :stages, stages)
+
+  # The capability tier (`Profile` `tier:`, the ascending ladder — not the
+  # `:track`/`:record` score tiers above), on `put_stages/2`'s shape: no key
+  # at all for a tier-less profile, which is what keeps every existing
+  # config's policy map — and everything hashed or asserted off it — bit
+  # identical (D-S5). Nothing reads the key yet: the tier-1 presence fork
+  # and the tier-2 gate rule are later phases, and this is the carrier they
+  # will key off.
+  defp put_tier(policy, %Profile{tier: tier}) when tier != nil,
+    do: Map.put(policy, :tier, tier)
+
+  defp put_tier(policy, _absent_or_tierless), do: policy
 
   @doc """
   The score `label` must reach to qualify for one tier, or `:excluded`.

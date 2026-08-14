@@ -35,6 +35,9 @@ defmodule Cairn.Config.Profile do
   ```yaml
   # <a profile_dirs entry>/example.yml
   name: example              # optional; must match the filename when present
+  tier: 2                    # optional; the capability this profile claims —
+                             # 1 = presence detection, 2 = accurate MOT.
+                             # Absent = no tier semantics (today's behavior).
   experimental: false        # true before any group may run a non-ort backend
   backend: ort               # ort | rknn | qnn — qnn executes behind the
                              # experimental gate; rknn is still a stub
@@ -104,7 +107,7 @@ defmodule Cairn.Config.Profile do
   alias Cairn.Tracker.Stage
 
   @known_keys ~w(name experimental backend model model_profile input_size decoder labels
-                 fps_band sample_fps tracking)
+                 fps_band sample_fps tracking tier)
   @known_tracking_keys ~w(bbd oru ocr twin_mint max_unseen_ms max_live_tracks stationary_after_ms
                           tracker)
   # What each backend accepts, as static data — the Elixir half of
@@ -193,7 +196,17 @@ defmodule Cairn.Config.Profile do
     "twin_mint" => {:twin_mint, Stage.TwinMint}
   }
 
+  # The ascending capability ladder (`tier:`): 1 is presence detection, 2 is
+  # accurate MOT + persistence; higher rungs are reserved for capabilities
+  # that do not exist yet (ALPR, facial identification, …), so validation
+  # names the rungs that ship today and widens as they do — the schema shape
+  # never changes. Distinct from `Camera.tier()`, the per-label score
+  # thresholds `policy/2` carries as `:track`/`:record`: that word predates
+  # this ladder and names a different axis.
+  @tiers [1, 2]
+
   defstruct name: nil,
+            tier: nil,
             experimental: false,
             backend: "ort",
             model: %{},
@@ -412,6 +425,7 @@ defmodule Cairn.Config.Profile do
       |> check_model_profile(raw, name)
       |> check_decoder(raw, name)
       |> check_capability_rules(raw, name)
+      |> check_tier(raw, name)
 
     if length(acc.errors) > errors_before do
       {nil, acc}
@@ -420,6 +434,7 @@ defmodule Cairn.Config.Profile do
 
       profile = %__MODULE__{
         name: name,
+        tier: Map.get(raw, "tier"),
         experimental: Map.get(raw, "experimental") || false,
         backend: Map.get(raw, "backend", "ort"),
         model: Map.get(raw, "model") || %{},
@@ -630,6 +645,40 @@ defmodule Cairn.Config.Profile do
         "declare experimental: true to ship a profile whose artifact nobody here has " <>
         "converted"
     )
+  end
+
+  # Both tier rules in one place: the menu check (the ladder's shipped rungs,
+  # see `@tiers`) and the one cross-field contradiction — a tier-1 profile
+  # with a `tracking:` block. Tier 1 is presence detection and its pipeline
+  # runs no tracker, so a stage list (the block IS one, even empty — see
+  # `stages/1`) describes machinery the tier turns off; failing loud beats a
+  # profile that reads as if it tuned something. The value, not the key:
+  # a bare `tracking:` parses to nil, which everything here (`stages/1`,
+  # `check_tracking/3`) reads as "said nothing about tracking" — the
+  # contradiction needs the profile to have actually said something. Tier 2
+  # requires nothing extra today — its accuracy claims live in docs until the
+  # measured tier files ship.
+  defp check_tier(acc, raw, name) do
+    case Map.get(raw, "tier") do
+      nil ->
+        acc
+
+      tier when tier in @tiers ->
+        Config.check(
+          acc,
+          tier != 1 or is_nil(Map.get(raw, "tracking")),
+          "profile #{name}: tier 1 is presence detection and runs no tracker — " <>
+            "remove the tracking: block or claim tier: 2"
+        )
+
+      other ->
+        Config.add_error(
+          acc,
+          "profile #{name}: unknown tier #{inspect(other)} — the capability ladder " <>
+            "ships #{natural_list(Enum.map(@tiers, &Integer.to_string/1))} today " <>
+            "(1 = presence detection, 2 = accurate MOT); higher rungs are reserved"
+        )
+    end
   end
 
   # "a, b or c" — enumerated from the table rather than hand-written so a value
