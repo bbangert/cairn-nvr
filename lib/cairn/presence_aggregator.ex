@@ -21,10 +21,13 @@ defmodule Cairn.PresenceAggregator do
   still scene, and a closed gate means no batches — silence. Silence is not
   absence: whatever was present when the scene went still is, by the gate's
   own logic, still there (leaving would have moved, and motion reopens the
-  gate). So the clear window advances only on batches that *arrive* without
-  the label — frames flowed, the model ran, the class was gone — and pure
-  silence clears nothing until the long `@silence_timeout_ms` backstop, which
-  exists for streams that die rather than scenes that sleep.
+  gate). So the clear window is a span of absence EVIDENCE — opened by the
+  first batch that arrives without the label and closed by another at least
+  `@clear_after_ms` later; frames flowed, the model ran, the class was gone,
+  twice. Pure silence clears nothing until the long `@silence_timeout_ms`
+  backstop, which exists for streams that die rather than scenes that
+  sleep — and silence *between* the two absent observations does count,
+  since the first already testified to the absence the silence preserved.
   """
 
   use GenServer, restart: :transient
@@ -38,9 +41,13 @@ defmodule Cairn.PresenceAggregator do
   # enough that the 40-camera floor rate (~1.9/s, 530 ms gaps) confirms on
   # its second consecutive sighting.
   @confirm_window_ms 2_000
-  # Evidence-of-absence span: batches kept arriving without the label for
-  # this long. Spans several sampling gaps at the floor rate, so one missed
-  # detection cannot clear a real object.
+  # Evidence-of-absence span: from the FIRST batch without the label to an
+  # absent batch at least this much later — never from `last_seen_ms`, which
+  # would count any gate-closed silence toward the window and let a single
+  # absent batch clear a still-present object the moment the gate reopens.
+  # Clearing therefore always takes two absent observations, and spans
+  # several sampling gaps at the floor rate, so one missed detection cannot
+  # clear a real object.
   @clear_after_ms 5_000
   # The backstop for a dead stream (camera offline, pipeline down): the one
   # clearing that wall-clock silence may perform. Long on purpose — see the
@@ -118,9 +125,9 @@ defmodule Cairn.PresenceAggregator do
      %{
        camera_id: camera_id,
        # label => %{phase: :pending | :present, first_seen_ms, last_seen_ms,
-       # best_score, first_seen_at} — `first_seen_at` is the wall instant the
-       # outward-facing events carry; every bound is measured on the
-       # monotonic *_ms fields.
+       # absent_since_ms, best_score, first_seen_at} — `first_seen_at` is the
+       # wall instant the outward-facing events carry; every bound is
+       # measured on the monotonic *_ms fields.
        labels: %{},
        last_batch_ms: nil
      }}
@@ -165,6 +172,7 @@ defmodule Cairn.PresenceAggregator do
       phase: :pending,
       first_seen_ms: at_ms,
       last_seen_ms: at_ms,
+      absent_since_ms: nil,
       best_score: score,
       first_seen_at: DateTime.utc_now()
     }
@@ -183,7 +191,8 @@ defmodule Cairn.PresenceAggregator do
         entry
         | phase: :present,
           best_score: max(entry.best_score, score),
-          last_seen_ms: at_ms
+          last_seen_ms: at_ms,
+          absent_since_ms: nil
       }
 
       broadcast(:presence_started, camera_id, label, entry)
@@ -194,16 +203,32 @@ defmodule Cairn.PresenceAggregator do
   end
 
   defp sighted(%{phase: :present} = entry, _label, score, at_ms, _camera_id) do
-    %{entry | best_score: max(entry.best_score, score), last_seen_ms: at_ms}
+    %{
+      entry
+      | best_score: max(entry.best_score, score),
+        last_seen_ms: at_ms,
+        absent_since_ms: nil
+    }
   end
 
-  # Runs on the post-`sightings/4` map, so anything this batch carried was
-  # just stamped `last_seen_ms: at_ms` and the age check alone keeps it. A
-  # stale `:pending` vanishes without an event — nothing was ever announced.
-  defp absences(labels, _seen, at_ms, camera_id) do
+  # Only the labels this batch did NOT carry are absence evidence — the
+  # `seen` check is load-bearing, because a label sighted this very batch
+  # has `absent_since_ms: nil` too and the second clause would open a span
+  # on its own sighting. The span is measured absent-batch to absent-batch
+  # (see `@clear_after_ms`) — silence between the two counts, because the
+  # first already testified to the absence the silence then preserved. A
+  # stale `:pending` vanishes by the same rule, without an event — nothing
+  # was ever announced.
+  defp absences(labels, seen, at_ms, camera_id) do
     Enum.reduce(labels, %{}, fn {label, entry}, kept ->
       cond do
-        at_ms - entry.last_seen_ms < @clear_after_ms ->
+        Map.has_key?(seen, label) ->
+          Map.put(kept, label, entry)
+
+        entry.absent_since_ms == nil ->
+          Map.put(kept, label, %{entry | absent_since_ms: at_ms})
+
+        at_ms - entry.absent_since_ms < @clear_after_ms ->
           Map.put(kept, label, entry)
 
         entry.phase == :present ->

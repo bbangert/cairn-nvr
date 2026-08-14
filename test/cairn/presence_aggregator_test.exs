@@ -70,6 +70,7 @@ defmodule Cairn.PresenceAggregatorTest do
 
     PresenceAggregator.observed(id, @base + 1_000, %{"person" => 0.95})
     PresenceAggregator.observed(id, @base + 6_000, %{})
+    PresenceAggregator.observed(id, @base + 11_000, %{})
 
     assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, score: 0.95}}
   end
@@ -80,24 +81,46 @@ defmodule Cairn.PresenceAggregatorTest do
     PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})
     assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
 
-    # 4_000ms since the confirming sighting: under the 5_000ms clear window.
-    # An empty map is still evidence — frames flowed, nothing qualified.
-    PresenceAggregator.observed(id, @base + 500 + 4_000, %{})
+    # The span opens at the FIRST absent batch — an empty map is still
+    # evidence (frames flowed, nothing qualified) — and one absent batch
+    # alone never clears.
+    PresenceAggregator.observed(id, @base + 1_000, %{})
     refute_receive {:presence_cleared, %PresenceEvent{camera_id: ^id}}, 50
 
-    # 5_000ms since the confirming sighting: clears, carrying the best score.
-    PresenceAggregator.observed(id, @base + 500 + 5_000, %{})
+    # 4_500ms of absence span: still under the 5_000ms window.
+    PresenceAggregator.observed(id, @base + 5_500, %{})
+    refute_receive {:presence_cleared, %PresenceEvent{camera_id: ^id}}, 50
+
+    # 5_000ms absent-to-absent: clears, carrying the best score.
+    PresenceAggregator.observed(id, @base + 6_000, %{})
 
     assert_receive {:presence_cleared,
                     %PresenceEvent{camera_id: ^id, label: "person", score: 0.9}}
+  end
+
+  test "silence before the first absent batch counts for nothing — the span is evidence, not elapsed time",
+       %{camera_id: id} do
+    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
+    PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+
+    # Ten minutes of gate-closed silence, then the scene wakes without the
+    # person: the elapsed time must not let this single batch clear.
+    PresenceAggregator.observed(id, @base + 600_000, %{})
+    refute_receive {:presence_cleared, %PresenceEvent{camera_id: ^id}}, 50
+
+    # The second absent observation closes a real 5_000ms evidence span.
+    PresenceAggregator.observed(id, @base + 605_000, %{})
+    assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, label: "person"}}
   end
 
   test "a pending label that never confirmed goes stale without ever broadcasting", %{
     camera_id: id
   } do
     PresenceAggregator.observed(id, @base, %{"person" => 0.5})
-    # Past the 5_000ms clear window, but the label never reached :present —
+    # A full absence span elapses, but the label never reached :present —
     # `absences/4` drops it silently.
+    PresenceAggregator.observed(id, @base + 1_000, %{})
     PresenceAggregator.observed(id, @base + 6_000, %{})
 
     refute_receive {:presence_started, %PresenceEvent{camera_id: ^id}}, 50
