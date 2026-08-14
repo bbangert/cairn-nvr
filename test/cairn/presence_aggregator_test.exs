@@ -154,5 +154,9 @@ defmodule Cairn.PresenceAggregatorTest do
     send(pid, :silence_check)
 
     assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, label: "person"}}
+
+    # One-shot: the clear also drops the batch history, so the next check has
+    # nothing left to age (would otherwise re-run an empty clear per minute).
+    assert :sys.get_state(pid).last_batch_ms == nil
   end
 end

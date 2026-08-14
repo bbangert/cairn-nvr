@@ -214,12 +214,15 @@ defmodule Cairn.PresenceAggregator do
     end)
   end
 
+  # `last_batch_ms` resets too: everything is cleared, so there is no batch
+  # history left to age — without this the silence backstop would re-run an
+  # empty clear every check until the next batch arrives.
   defp clear_all(state) do
     for {label, %{phase: :present} = entry} <- state.labels do
       broadcast(:presence_cleared, state.camera_id, label, entry)
     end
 
-    %{state | labels: %{}}
+    %{state | labels: %{}, last_batch_ms: nil}
   end
 
   defp broadcast(kind, camera_id, label, entry) do
