@@ -3,11 +3,13 @@ defmodule Cairn.PresenceAggregator do
   A tier-1 camera's per-class present/cleared state machine — what that tier
   runs *instead of* a tracker.
 
-  Fed by `Cairn.Pipeline.PresenceSink` with one call per detection batch:
-  the labels seen (already floored by the camera's effective `min_score`)
-  and the batch's monotonic instant. Emits `Cairn.PresenceEvent`s on the
-  transitions and nothing between them — presence is edge-triggered, so
-  there is no update stream to throttle.
+  Fed by `Cairn.Pipeline.PresenceSink` with one call per detected frame —
+  a multi-frame `Detections` buffer is several calls sharing one clock
+  read, which is why a sighting is counted per call, not per instant
+  (`sighted/5`): the labels seen (already floored by the camera's
+  effective `min_score`) and the frame's monotonic instant. Emits
+  `Cairn.PresenceEvent`s on the transitions and nothing between them —
+  presence is edge-triggered, so there is no update stream to throttle.
 
   Every threshold is milliseconds, never a frame count: tier-1 delivery
   floats with fleet load by design (the capacity paradigm — ~7.5/s on a
