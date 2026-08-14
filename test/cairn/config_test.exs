@@ -1353,7 +1353,9 @@ defmodule Cairn.ConfigTest do
   end
 
   describe "motion gate ownership (D-S4)" do
-    @motion ~s({"threshold": 30})
+    # `enabled` said outright: without it the string resolves to no
+    # detector and the load warns (its own test below).
+    @motion ~s({"enabled": true, "threshold": 30})
 
     # `tiered_map/1`'s shape with the operator's knob on the profiled camera.
     defp gated_map(profile_yaml, motion \\ @motion) do
@@ -1393,9 +1395,33 @@ defmodule Cairn.ConfigTest do
       assert Enum.at(config.cameras, 1).motion_json == @motion
     end
 
+    test "a tier-2 group without the knob passes cleanly — the refusal needs both sides" do
+      assert {:ok, _config, []} = Config.from_map(tiered_map(ort_yaml("tier: 2")))
+    end
+
     test "malformed motion_json is a load error naming the camera, not a build crash" do
       assert {:error, errors} = Config.from_map(gated_map(ort_yaml("tier: 1"), "not json"))
       assert Enum.any?(errors, &(&1 =~ "camera cam_a: motion_json:"))
+    end
+
+    test "valid JSON with an unknown knob is the same load error the build would raise" do
+      # The exact string `Cairn.Pipeline.Camera.motion_gate/3` raises on —
+      # load validation exists so that raise is unreachable from config.
+      assert {:error, errors} =
+               Config.from_map(gated_map(ort_yaml("tier: 1"), ~s({"treshold":30})))
+
+      assert Enum.any?(errors, &(&1 =~ "camera cam_a: motion_json: unknown motion knob"))
+    end
+
+    test "a string resolving to no detector is carried but warned about" do
+      # Legal vocabulary, nothing enabled: the gate is never built, which an
+      # operator who wrote zones surely did not mean — the silent-fallback
+      # lesson, at config load instead of on the NPU.
+      assert {:ok, config, warnings} =
+               Config.from_map(gated_map(ort_yaml("tier: 1"), ~s({"threshold": 30})))
+
+      assert hd(config.cameras).motion_json == ~s({"threshold": 30})
+      assert Enum.any?(warnings, &(&1 =~ "camera cam_a: motion_json resolves to no detector"))
     end
 
     test "a non-string motion_json is refused" do

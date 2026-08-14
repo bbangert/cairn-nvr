@@ -165,6 +165,14 @@ cameras: []
 #    # camera. Absent ⇒ no detection. The pre-phase-6 inline-command form is
 #    # refused with the migration spelled out.
 #    plugin: detect
+#    # The motion gate's scene config, verbatim JSON — zones and thresholds
+#    # describe THIS scene, so the knob is the camera's, never a profile's
+#    # (D-P6). It must say "enabled": true or no gate is built (the load
+#    # warns). Rejected on a tier-2 group: that tier claims accurate MOT,
+#    # and a gate starves the tracker of the frames it skips. Absent ⇒ no
+#    # gate, today's chain exactly. Vocabulary: docs/profile-authoring.md
+#    # and plugins/cairn-detect/src/motion.rs.
+#    motion_json: '{"enabled": true, "threshold": 30}'
 #    # Three levels of threshold, per label. Each answers a different
 #    # question, and they must not fight: effective `record` >= `track` >=
 #    # `min_score` for every label, or the config is rejected. "Effective"

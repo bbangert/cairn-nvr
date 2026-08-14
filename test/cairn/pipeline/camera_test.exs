@@ -515,7 +515,7 @@ defmodule Cairn.Pipeline.CameraTest do
     end
 
     test "the operator's motion_json rides stream_params verbatim to the gate" do
-      json = ~s({"threshold": 30})
+      json = ~s({"enabled": true, "threshold": 30})
       camera = %{camera("cam_gate", {:group, "g"}) | motion_json: json}
       start_owner(camera, config(camera))
 

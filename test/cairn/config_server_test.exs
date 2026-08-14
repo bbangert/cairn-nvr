@@ -185,7 +185,7 @@ defmodule Cairn.Config.ServerTest do
             %{"extra_ffmpeg_args" => ["-rtsp_transport", "tcp"]},
             %{"pre_window_seconds" => 8},
             # The gate element is built into the branch at birth.
-            %{"motion_json" => ~s({"threshold": 30})}
+            %{"motion_json" => ~s({"enabled": true, "threshold": 30})}
           ] do
         assert camera_diff(edit) ==
                  %{added: [], removed: [], changed: ["cam_a"], refreshed: []},

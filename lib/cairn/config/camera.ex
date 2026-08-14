@@ -169,8 +169,24 @@ defmodule Cairn.Config.Camera do
 
   defp parse_motion_json(json, id, acc) when is_binary(json) do
     case Cairn.Motion.Config.resolve_json(json) do
-      {:ok, _resolved} -> {json, acc}
-      {:error, message} -> {nil, add_error(acc, "camera #{id}: motion_json: #{message}")}
+      {:ok, nil} ->
+        # Valid vocabulary, no detector: `"enabled": true` was not said, so
+        # the gate will not be built — indistinguishable at runtime from
+        # omitting the key. Warned, not refused: the string is legal and
+        # carried verbatim, but an operator who wrote zones surely meant
+        # them to gate something (the silent-fallback lesson).
+        {json,
+         add_warning(
+           acc,
+           ~s(camera #{id}: motion_json resolves to no detector — say "enabled": true ) <>
+             "or the gate is never built"
+         )}
+
+      {:ok, _resolved} ->
+        {json, acc}
+
+      {:error, message} ->
+        {nil, add_error(acc, "camera #{id}: motion_json: #{message}")}
     end
   end
 

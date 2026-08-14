@@ -895,12 +895,8 @@ defmodule Cairn.Config do
   # thresholds).
   defp validate_gate_ownership(acc, config) do
     config.cameras
-    |> Enum.filter(&(&1.motion_json != nil))
     |> Enum.filter(fn cam ->
-      case profile_for(config, cam) do
-        %Profile{tier: 2} -> true
-        _tierless_tier1_or_none -> false
-      end
+      cam.motion_json != nil and match?(%Profile{tier: 2}, profile_for(config, cam))
     end)
     |> Enum.reduce(acc, fn cam, acc ->
       add_error(
