@@ -261,6 +261,54 @@ defmodule Cairn.Pipeline.CameraTest do
       end
     end
 
+    # The tier fork (D-S2): a policy claiming tier 1 must produce a branch
+    # with NOTHING tracker-shaped in it — no stamper to resolve tracking
+    # context, no tracker element to mint identities, no track sink to call
+    # `Cairn.Detect.Dispatch` — which is also the proof no `CameraTracker`
+    # can ever start for the camera: the sink is its only production caller.
+    test "a tier-1 policy ends the branch at the presence sink" do
+      spec = spec(detect: detect(policy: Map.put(@policy, :tier, 1)))
+      kids = children(spec)
+
+      assert kids[:presence_sink] == Cairn.Pipeline.PresenceSink
+      refute Map.has_key?(kids, :stamper)
+      refute Map.has_key?(kids, :tracker)
+      refute Map.has_key?(kids, :track_sink)
+
+      # The shared head is untouched — presence is a tail swap, not a branch.
+      assert Enum.any?(links(spec), &match?(%{from: :infer, to: :presence_sink}, &1))
+      assert kids[:picker] == Cairn.Pipeline.Picker
+      assert kids[:decoder] == Cairn.Pipeline.Decoder
+      assert kids[:infer] == Cairn.Pipeline.Inference
+    end
+
+    test "tier 2 builds the tracked tail exactly like tier-less" do
+      kids = children(spec(detect: detect(policy: Map.put(@policy, :tier, 2))))
+
+      assert Map.has_key?(kids, :stamper) and Map.has_key?(kids, :tracker) and
+               Map.has_key?(kids, :track_sink)
+
+      refute Map.has_key?(kids, :presence_sink)
+    end
+
+    test "a reload's policy lands on whichever end the branch built" do
+      camera = %Camera{id: "cam"}
+      tier1 = Map.put(@policy, :tier, 1)
+
+      {_actions, tracked} = init(detect: detect())
+      {actions, _} = Pipeline.handle_info({:policy, camera, @policy}, %{}, tracked)
+      assert [notify_child: {:stamper, {:policy, ^camera, @policy}}] = actions
+
+      {_actions, presence} = init(detect: detect(policy: tier1))
+      {actions, _} = Pipeline.handle_info({:policy, camera, tier1}, %{}, presence)
+      assert [notify_child: {:presence_sink, {:policy, ^camera, ^tier1}}] = actions
+
+      # …and the stats ask is tracked-only: a tier-1 branch has no sink that
+      # answers it, so the message must fall through, not crash.
+      {actions, _} = Pipeline.handle_info(:detect_stats, %{}, presence)
+      assert actions == []
+    end
+
     test "the tracker element hosts the core the owner resolved, capped by the policy" do
       spec = spec(detect: detect())
 

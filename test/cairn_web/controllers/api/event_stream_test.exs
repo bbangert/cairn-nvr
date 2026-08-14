@@ -70,6 +70,41 @@ defmodule CairnWeb.Api.EventStreamTest do
     assert SSE.frame_for({:something_else, 1}) == :ignore
   end
 
+  describe "presence frames" do
+    defp presence(fields) do
+      struct!(
+        %Cairn.PresenceEvent{
+          camera_id: "cam_a",
+          label: "person",
+          score: 0.8,
+          first_seen_at: ~U[2026-07-24 00:00:00Z],
+          at: ~U[2026-07-24 00:00:03Z]
+        },
+        fields
+      )
+    end
+
+    test "presence_started names the state present and carries the transition's fields" do
+      assert {:ok, frame} = SSE.frame_for({:presence_started, presence([])})
+
+      assert frame =~ "event: presence_started\n"
+      assert frame =~ ~s("camera_id":"cam_a")
+      assert frame =~ ~s("label":"person")
+      assert frame =~ ~s("state":"present")
+      assert frame =~ ~s("score":0.8)
+      assert frame =~ ~s("first_seen_at":"2026-07-24T00:00:00Z")
+      assert frame =~ ~s("at":"2026-07-24T00:00:03Z")
+      assert String.ends_with?(frame, "\n\n")
+    end
+
+    test "presence_cleared names the state cleared" do
+      assert {:ok, frame} = SSE.frame_for({:presence_cleared, presence([])})
+
+      assert frame =~ "event: presence_cleared\n"
+      assert frame =~ ~s("state":"cleared")
+    end
+  end
+
   describe "artifact frames" do
     defp artifact(fields) do
       struct!(%Cairn.EventArtifact{event_id: "evt-1", camera_id: "cam_a"}, fields)
