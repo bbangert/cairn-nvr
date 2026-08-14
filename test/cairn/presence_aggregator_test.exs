@@ -179,6 +179,41 @@ defmodule Cairn.PresenceAggregatorTest do
     refute_receive {:presence_started, %PresenceEvent{camera_id: ^id}}, 50
   end
 
+  test "a crash's unanswered presence_started gets its cleared from the restart", %{
+    camera_id: id
+  } do
+    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
+    PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+
+    # An abnormal exit: `:transient` restarts it, and the fresh init owes
+    # the world the cleared its predecessor never sent (the
+    # every-started-gets-a-cleared invariant, via the ledger).
+    pid = Registry.whereis(id, :presence)
+    Process.exit(pid, :kill)
+
+    assert_receive {:presence_cleared,
+                    %PresenceEvent{camera_id: ^id, label: "person", score: 0.9}}
+  end
+
+  test "heartbeats keep the silence backstop from clearing a gated-but-live stream", %{
+    camera_id: id
+  } do
+    base = System.monotonic_time(:millisecond) - 700_000
+
+    PresenceAggregator.observed(id, base, %{"person" => 0.6})
+    PresenceAggregator.observed(id, base + 500, %{"person" => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+
+    # The native gate has been skipping for 700s — but the sink's
+    # heartbeats say the stream is alive, so the backstop must hold.
+    PresenceAggregator.heartbeat(id, System.monotonic_time(:millisecond))
+    pid = Registry.whereis(id, :presence)
+    send(pid, :silence_check)
+
+    refute_receive {:presence_cleared, %PresenceEvent{camera_id: ^id}}, 50
+  end
+
   test "retire/1 clears, stops, and stays gone until the next batch", %{camera_id: id} do
     PresenceAggregator.observed(id, @base, %{"person" => 0.6})
     PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})

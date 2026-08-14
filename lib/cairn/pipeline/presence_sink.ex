@@ -88,8 +88,16 @@ defmodule Cairn.Pipeline.PresenceSink do
     # evidence of nothing, exactly like the silence a pipeline-level gate
     # produces. It still proves the branch alive (the liveness stamp below
     # covers every buffer).
-    for %{inferred: true} = frame <- observations do
+    inferred = Enum.filter(observations, &match?(%{inferred: true}, &1))
+
+    for frame <- inferred do
       PresenceAggregator.observed(state.camera.id, now_ms, seen(frame, floors))
+    end
+
+    # All-skip buffers still prove the stream alive to the aggregator's
+    # silence backstop — a gated scene is not a dead camera.
+    if inferred == [] and observations != [] do
+      PresenceAggregator.heartbeat(state.camera.id, now_ms)
     end
 
     {[],

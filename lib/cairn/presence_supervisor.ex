@@ -5,24 +5,35 @@ defmodule Cairn.PresenceSupervisor do
 
   Not a child of `Cairn.TrackerSupervisor` — that tree is tracking's, with a
   checkpoint-restore sweep presence has no use for (nothing here is
-  persisted, so a restarted aggregator correctly starts knowing nothing and
-  re-confirms from the next batches).
+  persisted; what a restarted aggregator owes the world is not its state
+  but the `presence_cleared` events its predecessor's announcements are
+  still waiting on, which is the `Cairn.PresenceLedger`'s job to make
+  possible).
 
-  The default restart intensity is kept deliberately: one aggregator
-  crash-looping past it takes this pool down and every camera's presence
-  state with it — the same cascade bargain `Cairn.TrackerSupervisor.Pool`
-  makes — and the application root restarts the pool empty, which for
-  state this ephemeral is a correct recovery, not a loss.
+  The pool keeps the default restart intensity deliberately: one
+  aggregator crash-looping past it takes the pool down and every camera's
+  presence state with it — the same cascade bargain
+  `Cairn.TrackerSupervisor.Pool` makes — and the restarted, on-demand
+  aggregators clear whatever the ledger says the dead ones had announced.
   """
 
-  use DynamicSupervisor
+  use Supervisor
 
   def start_link(opts) do
-    DynamicSupervisor.start_link(__MODULE__, opts, name: __MODULE__)
+    Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  # `:rest_for_one`, ledger first: aggregators die without taking the
+  # announced set with them (that set is what makes their crash recovery
+  # able to clear what the dead process promised), while a ledger crash
+  # restarts the pool into the empty world the fresh table reflects.
   @impl true
   def init(_opts) do
-    DynamicSupervisor.init(strategy: :one_for_one)
+    children = [
+      Cairn.PresenceLedger,
+      {DynamicSupervisor, name: Cairn.PresenceSupervisor.Pool, strategy: :one_for_one}
+    ]
+
+    Supervisor.init(children, strategy: :rest_for_one)
   end
 end

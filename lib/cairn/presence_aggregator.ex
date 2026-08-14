@@ -28,6 +28,14 @@ defmodule Cairn.PresenceAggregator do
   backstop, which exists for streams that die rather than scenes that
   sleep — and silence *between* the two absent observations does count,
   since the first already testified to the absence the silence preserved.
+  (`heartbeat/2` is how an all-skip buffer — the native gate's spelling of
+  a sleeping scene — tells the backstop the stream is not dead.)
+
+  The invariant every path serves: **every `presence_started` is followed
+  by exactly one `presence_cleared`** — through evidence, disable, retire,
+  the backstop, and a crash. The crash leg is `Cairn.PresenceLedger`'s: a
+  restarted aggregator clears its predecessor's announced labels in
+  `init/1` before doing anything else, then re-confirms from live batches.
   """
 
   use GenServer, restart: :transient
@@ -79,6 +87,22 @@ defmodule Cairn.PresenceAggregator do
   end
 
   @doc """
+  The stream is alive but nothing was model-inferred — a native motion
+  gate skipping passes on a still scene. Refreshes the silence backstop's
+  clock and nothing else: a gated stream is not a dead one, and without
+  this the backstop would clear a standing presence after 600 s of
+  healthy skip frames. `whereis`, not `ensure` — liveness for no state is
+  nothing.
+  """
+  @spec heartbeat(String.t(), integer()) :: :ok
+  def heartbeat(camera_id, at_ms) do
+    case Cairn.Registry.whereis(camera_id, :presence) do
+      nil -> :ok
+      pid -> GenServer.cast(pid, {:heartbeat, at_ms})
+    end
+  end
+
+  @doc """
   Detection was switched off: clear everything now, events and all.
 
   The disabled state is an operator's statement that nothing is watching,
@@ -124,7 +148,7 @@ defmodule Cairn.PresenceAggregator do
 
   defp start_aggregator(camera_id) do
     case DynamicSupervisor.start_child(
-           Cairn.PresenceSupervisor,
+           Cairn.PresenceSupervisor.Pool,
            {__MODULE__, camera_id: camera_id}
          ) do
       {:ok, pid} -> {:ok, pid}
@@ -137,6 +161,24 @@ defmodule Cairn.PresenceAggregator do
 
   @impl true
   def init(camera_id) do
+    # A predecessor's unanswered announcements clear FIRST: presence is
+    # edge-only, so a crash that lost the labels map would otherwise leave
+    # every client that tracked the edges stuck at "present" with no
+    # cleared ever coming (the every-started-gets-a-cleared invariant —
+    # `Cairn.PresenceLedger`). A fresh camera has no leftovers and this is
+    # a no-op.
+    for {label, first_seen_at, score} <- Cairn.PresenceLedger.leftovers(camera_id) do
+      Cairn.PresenceLedger.cleared(camera_id, label)
+
+      PresenceEvent.broadcast(:presence_cleared, %PresenceEvent{
+        camera_id: camera_id,
+        label: label,
+        score: score,
+        first_seen_at: first_seen_at,
+        at: DateTime.utc_now()
+      })
+    end
+
     # The out-of-band half of `detection_disabled/1`: the sink's own call
     # only fires when a buffer arrives, and a closed motion gate delivers
     # none — an operator disabling detection behind a still scene would
@@ -176,6 +218,10 @@ defmodule Cairn.PresenceAggregator do
 
         {:noreply, %{state | labels: labels, last_batch_ms: at_ms}}
     end
+  end
+
+  def handle_cast({:heartbeat, at_ms}, state) do
+    {:noreply, %{state | last_batch_ms: at_ms}}
   end
 
   def handle_cast(:detection_disabled, state) do
@@ -301,7 +347,20 @@ defmodule Cairn.PresenceAggregator do
     %{state | labels: %{}, last_batch_ms: nil}
   end
 
-  defp broadcast(kind, camera_id, label, entry) do
+  # Ledger before broadcast, on this same process: a row exists iff the
+  # started went out, so a crash between the two makes the recovery clear
+  # at worst spurious, never missing.
+  defp broadcast(:presence_started = kind, camera_id, label, entry) do
+    Cairn.PresenceLedger.announced(camera_id, label, entry.first_seen_at, entry.best_score)
+    emit(kind, camera_id, label, entry)
+  end
+
+  defp broadcast(:presence_cleared = kind, camera_id, label, entry) do
+    Cairn.PresenceLedger.cleared(camera_id, label)
+    emit(kind, camera_id, label, entry)
+  end
+
+  defp emit(kind, camera_id, label, entry) do
     PresenceEvent.broadcast(kind, %PresenceEvent{
       camera_id: camera_id,
       label: label,
