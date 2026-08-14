@@ -116,6 +116,28 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
     assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
   end
 
+  test "a native-gate skip frame (inferred: false) is evidence of nothing", ctx do
+    id = ctx.camera_id
+    state = sink(ctx)
+
+    {[], state} = feed(state, [frame([object("person", 0.9)])])
+    {[], state} = feed(state, [frame([object("person", 0.9)])])
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+
+    # The engine's replayed prediction under a closed native gate
+    # (`Decision::Skip`): the model never looked, so no absence span may
+    # open off this frame — the sibling of pipeline-gate silence.
+    skip = %{NativeStub.frame(false) | objects: [object("person", 0.9, "tracked")]}
+    {[], state} = feed(state, [skip])
+
+    pid = Cairn.Registry.whereis(id, :presence)
+    assert :sys.get_state(pid).labels["person"].absent_since_ms == nil
+    refute_receive {:presence_cleared, %PresenceEvent{camera_id: ^id}}, 50
+
+    # …while the buffer still proves the branch alive to the watchdog.
+    assert is_integer(state.last_buffer_at_ms)
+  end
+
   test "the stats reply carries the liveness stamp the owner's watchdog reads", ctx do
     state = sink(ctx)
 

@@ -80,7 +80,15 @@ defmodule Cairn.Pipeline.PresenceSink do
     # frame here shares the buffer's one reading. That is enough because the
     # aggregator counts sightings per CALL: presence needs to know the class
     # was seen again, not when to the millisecond.
-    for frame <- observations do
+    #
+    # Model-inferred frames only, and the filter is in the pattern: on a
+    # native motion-gate skip the engine replays the last pass's objects as
+    # `"tracked"` predictions under `inferred: false` (cairn-ort's
+    # `Decision::Skip`) — the model never looked, so such a frame is
+    # evidence of nothing, exactly like the silence a pipeline-level gate
+    # produces. It still proves the branch alive (the liveness stamp below
+    # covers every buffer).
+    for %{inferred: true} = frame <- observations do
       PresenceAggregator.observed(state.camera.id, now_ms, seen(frame, floors))
     end
 
