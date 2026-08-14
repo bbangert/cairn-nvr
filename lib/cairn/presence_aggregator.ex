@@ -96,6 +96,24 @@ defmodule Cairn.PresenceAggregator do
     end
   end
 
+  @doc """
+  The camera is going away (removed, or restarting under a changed config —
+  a tier flip included): clear everything, then stop.
+
+  `Cairn.CameraSupervisor.stop_camera/1` is the one caller, which is what
+  scopes the lifecycle: an ordinary crash/watchdog rebuild never passes
+  through there, so presence survives reconnects — and a camera that leaves
+  the config or changes shape takes its aggregator with it instead of
+  leaving stale presence standing until the silence backstop.
+  """
+  @spec retire(String.t()) :: :ok
+  def retire(camera_id) do
+    case Cairn.Registry.whereis(camera_id, :presence) do
+      nil -> :ok
+      pid -> GenServer.cast(pid, :retire)
+    end
+  end
+
   @spec ensure(String.t()) :: {:ok, pid()} | {:error, term()}
   defp ensure(camera_id) do
     case Cairn.Registry.whereis(camera_id, :presence) do
@@ -151,6 +169,12 @@ defmodule Cairn.PresenceAggregator do
 
   def handle_cast(:detection_disabled, state) do
     {:noreply, clear_all(state)}
+  end
+
+  # `:transient` restarts abnormal exits only, so this normal stop is final;
+  # the registry unregisters on DOWN and a next batch starts a fresh one.
+  def handle_cast(:retire, state) do
+    {:stop, :normal, clear_all(state)}
   end
 
   # The control topic carries every camera; only this one's disable acts.

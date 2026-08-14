@@ -477,9 +477,9 @@ defmodule Cairn.Config do
   # `:track`/`:record` score tiers above), on `put_stages/2`'s shape: no key
   # at all for a tier-less profile, which is what keeps every existing
   # config's policy map — and everything hashed or asserted off it — bit
-  # identical (D-S5). Nothing reads the key yet: the tier-1 presence fork
-  # and the tier-2 gate rule are later phases, and this is the carrier they
-  # will key off.
+  # identical (D-S5). Read by the tier-1 presence fork
+  # (`Cairn.Pipeline.Camera.detect_tail/4`) and by `Cairn.Config.Server`'s
+  # restart classification; the tier-2 gate rule is still to come.
   defp put_tier(policy, %Profile{tier: tier}) when tier != nil,
     do: Map.put(policy, :tier, tier)
 

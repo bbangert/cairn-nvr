@@ -115,11 +115,12 @@ picks which one becomes `--model`.
 
 Omitting `tier:` means the profile makes no capability claim and nothing
 changes: every tier-less profile behaves exactly as it did before the key
-existed. Today the field is schema and validation only — a declared tier
-reaches each camera's policy and nothing reads it back yet. The behaviors
-it will select (presence events for tier 1, the tier-2 motion-gate rule,
-pipeline selection) land in later phases and will activate only when a
-tier is declared.
+existed. **Declaring `tier: 1` changes the runtime**: the group's cameras
+build the presence pipeline — detections feed per-class present/cleared
+events (`presence_started`/`presence_cleared` on the event stream) and no
+tracker of any kind runs, which is why changing a profile's tier restarts
+its cameras rather than refreshing them. `tier: 2` selects today's
+tracked pipeline; its motion-gate rule lands in a later phase.
 
 The word "tier" also appears on cameras (`track:`/`record:` score
 thresholds); that is a different, older axis. This ladder is per-profile

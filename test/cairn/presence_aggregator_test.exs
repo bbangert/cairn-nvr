@@ -166,6 +166,27 @@ defmodule Cairn.PresenceAggregatorTest do
     assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, label: "person"}}
   end
 
+  test "retire/1 clears, stops, and stays gone until the next batch", %{camera_id: id} do
+    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
+    PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+
+    pid = Registry.whereis(id, :presence)
+    ref = Process.monitor(pid)
+    PresenceAggregator.retire(id)
+
+    assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, label: "person"}}
+    # A normal stop: `:transient` must not restart it, and the registry
+    # entry dies with the process — awaited, since the registry's own DOWN
+    # handling races the test's monitor.
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+    Registry.await_unregistered(id, :presence)
+    assert Registry.whereis(id, :presence) == nil
+
+    # Retiring a camera that has no aggregator is the common (tracked) case.
+    assert PresenceAggregator.retire("no_such_#{System.unique_integer([:positive])}") == :ok
+  end
+
   test "silence alone (no batches at all) never clears presence", %{camera_id: id} do
     PresenceAggregator.observed(id, @base, %{"person" => 0.6})
     PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})

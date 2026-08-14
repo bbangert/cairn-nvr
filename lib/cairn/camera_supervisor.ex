@@ -106,6 +106,13 @@ defmodule Cairn.CameraSupervisor do
 
   @spec stop_camera(String.t()) :: :ok
   def stop_camera(camera_id) do
+    # The camera's presence aggregator goes with it — this function runs for
+    # removed and changed (restarting) cameras, never for a crash/watchdog
+    # rebuild, which is exactly the split presence wants: survive
+    # reconnects, but never outlive the config that meant tier 1
+    # (`Cairn.PresenceAggregator.retire/1` clears before stopping).
+    Cairn.PresenceAggregator.retire(camera_id)
+
     case Cairn.Registry.whereis(camera_id, :camera) do
       nil ->
         :ok
