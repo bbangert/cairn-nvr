@@ -15,9 +15,12 @@
 #      (nano, derived sample_fps 2) — the capacity campaign measured this
 #      pre-ladder; this run re-confirms it through the resolution path.
 #
-# A preflight proves the shipped qcs6490-tier1.yml resolves exactly these
-# cells (tools/board-pipeline/tier1_resolution_check.exs) and aborts on
-# drift, so the board only ever measures what config actually deploys.
+# A preflight (tools/board-pipeline/tier1_resolution_check.exs) asserts
+# the SHIPPED qcs6490-tier1.yml still resolves the historical campaign
+# table (tiny through 36, nano 37–40, 41 refused) and aborts if the FILE
+# drifted from the measured record. It does not bind this script's own
+# env (MODEL/LADDER_RUNGS are set below, independently) — edit those and
+# you are measuring something the checker does not describe.
 #
 # HOW TO INVOKE — one command; the harness build happens here too,
 # validated against the same clip the ladder replays:
@@ -78,15 +81,18 @@ if [ -z "$DRY_RUN_ARG" ]; then
   # /data/board-pipeline/clips/sub.aus). scp's exit lies on this board
   # (Erlang sftpd) — judge the fetch by the file existing and being
   # non-empty; capacity-ladder's checksum pass re-verifies against the
-  # board copy anyway.
-  if [ ! -r "$SUB_CLIP" ]; then
-    say "SUB_CLIP absent locally — fetching the board's clip to $SUB_CLIP"
+  # board copy anyway. `-s`, not `-r`, on both tests: a failed scp can
+  # leave an empty readable file, and a readability test would skip the
+  # re-fetch forever after.
+  if [ ! -s "$SUB_CLIP" ]; then
+    say "SUB_CLIP absent or empty locally — fetching the board's clip to $SUB_CLIP"
     mkdir -p "$(dirname "$SUB_CLIP")"
+    rm -f "$SUB_CLIP"
     scp "$BOARD:/data/board-pipeline/clips/sub.aus" "$SUB_CLIP" || true
   fi
 
   if [ ! -s "$SUB_CLIP" ]; then
-    say "REFUSING: no readable SUB_CLIP locally and the board fetch failed (see --help)"
+    say "REFUSING: no usable SUB_CLIP locally and the board fetch failed (see --help)"
     exit 1
   fi
 

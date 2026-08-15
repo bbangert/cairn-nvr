@@ -32,10 +32,10 @@ File.mkdir_p!(work)
       reraise ArgumentError,
               [
                 message:
-                  "#{Exception.message(e)} — if #{video} is a raw .h264/.h265 " <>
-                    "elementary stream it carries no timestamps; wrap it first, e.g. " <>
-                    "ffmpeg -f h264 -r 15 -i #{video} -c copy out.mp4 " <>
-                    "(-f hevc for .h265)"
+                  "#{Exception.message(e)} — if #{video} is a raw .h264 elementary " <>
+                    "stream it carries no timestamps; wrap it first, e.g. " <>
+                    "ffmpeg -f h264 -r 15 -i #{video} -c copy out.mp4. (The packer " <>
+                    "is H.264-only: read_clip extracts via h264_mp4toannexb)"
               ],
               __STACKTRACE__
   after

@@ -2586,11 +2586,19 @@ defmodule Cairn.ConfigTest do
       assert [m, s, n416, tiny, nano] = profile.model_ladder
       assert Enum.map([m, s, n416], & &1.pack) == ["yolo26m", "yolo26s", "yolo26n-416"]
       assert tiny.pack == nil and nano.pack == nil
-      assert nano.engine_budget == 75
+      # The two measured Apache budgets, pinned so they cannot drift under
+      # green gates (the boundary evidence is tier1-boundary-20260815);
+      # ordering follows from the exact list.
+      assert Enum.map(profile.model_ladder, & &1.engine_budget) == [16.8, 25.8, 52.6, 67.5, 75]
 
-      assert Enum.map(profile.model_ladder, & &1.engine_budget) ==
-               Enum.sort_by(profile.model_ladder, & &1.engine_budget)
-               |> Enum.map(& &1.engine_budget)
+      # The measured tiny→nano crossover, held with the same arithmetic
+      # resolution uses: 36 × 1.875 = 67.5 fits tiny exactly, 37 spills to
+      # nano. Selection logic itself is exercised by the ladder describe;
+      # this pins the shipped numbers to the boundary they were measured at.
+      floor_rate = Cairn.Config.Profile.effective_rate(2)
+      assert 36 * floor_rate == tiny.engine_budget
+      assert 37 * floor_rate > tiny.engine_budget
+      assert 40 * floor_rate <= nano.engine_budget
     end
 
     test "qcs6490-tier1 is the only shipped profile that names a decoder" do
