@@ -42,7 +42,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
-SUB_CLIP=${SUB_CLIP:-}
+BOARD=${BOARD:-192.168.2.87}
+SUB_CLIP=${SUB_CLIP:-"$HERE/clips/tier1-sub.aus"}
 LOCAL_BUILD=${LOCAL_BUILD:-/tmp/board-pipeline-build}
 LADDER_SECONDS=${LADDER_SECONDS:-300}
 RESULTS=${RESULTS:-"$HERE/ladder-results"}
@@ -65,8 +66,20 @@ done
 say() { echo "tier1-boundary: $*"; }
 
 if [ -z "$DRY_RUN_ARG" ]; then
-  if [ -z "$SUB_CLIP" ] || [ ! -r "$SUB_CLIP" ]; then
-    say "REFUSING: SUB_CLIP must be a readable packed .aus clip (see --help)"
+  # No local clip → fetch the board-resident one (the 2026-08-15 sub clip,
+  # 640×480@15 packed from a real reolink event recording, lives at
+  # /data/board-pipeline/clips/sub.aus). scp's exit lies on this board
+  # (Erlang sftpd) — judge the fetch by the file existing and being
+  # non-empty; capacity-ladder's checksum pass re-verifies against the
+  # board copy anyway.
+  if [ ! -r "$SUB_CLIP" ]; then
+    say "SUB_CLIP absent locally — fetching the board's clip to $SUB_CLIP"
+    mkdir -p "$(dirname "$SUB_CLIP")"
+    scp "$BOARD:/data/board-pipeline/clips/sub.aus" "$SUB_CLIP" || true
+  fi
+
+  if [ ! -s "$SUB_CLIP" ]; then
+    say "REFUSING: no readable SUB_CLIP locally and the board fetch failed (see --help)"
     exit 1
   fi
 

@@ -56,3 +56,7 @@ config.yml
 # Claude Code working files (plans, reviews, solutions) — local only.
 .claude/
 /profiles/
+
+# board-pipeline working artifacts (clips are board/scratch staged, results are evidence trees)
+/tools/board-pipeline/clips/
+/tools/board-pipeline/ladder-results/
