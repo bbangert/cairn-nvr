@@ -21,7 +21,24 @@
 work = Path.join(System.tmp_dir!(), "pack-clip-#{System.unique_integer([:positive])}")
 File.mkdir_p!(work)
 
-%{aus: aus, time_base: {num, den}} = Cairn.Native.Parity.read_clip(video, work)
+%{aus: aus, time_base: {num, den}} =
+  try do
+    Cairn.Native.Parity.read_clip(video, work)
+  rescue
+    # ffprobe reports "N/A" pts for a raw Annex-B stream — there is no
+    # container to carry timestamps. Name the remedy instead of crashing
+    # on binary_to_integer("N/A").
+    e in ArgumentError ->
+      reraise ArgumentError,
+              [
+                message:
+                  "#{Exception.message(e)} — if #{video} is a raw .h264/.h265 " <>
+                    "elementary stream it carries no timestamps; wrap it first, e.g. " <>
+                    "ffmpeg -f h264 -r 15 -i #{video} -c copy out.mp4"
+              ],
+              __STACKTRACE__
+  end
+
 File.rm_rf!(work)
 
 packed =
