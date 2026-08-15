@@ -50,7 +50,7 @@ end
 IO.puts("n,resolved_artifact,derived_sample_fps")
 
 table =
-  for n <- [26, 28, 29, 30, 40, 41], into: %{} do
+  for n <- [26, 28, 30, 36, 38, 40, 41], into: %{} do
     result = resolve.(n)
 
     case result do
@@ -63,17 +63,16 @@ table =
 
 File.rm_rf!(tmp)
 
-# The cells the boundary runs execute, asserted against what actually
-# resolves — a mismatch means the run plan and the shipped file drifted
-# apart, and the board time would measure the wrong thing.
-{"yolox_nano_qdq.onnx", 2} = table[40]
-{"yolox_tiny_qdq.onnx", 2} = table[28]
+# Asserted against the MEASURED boundaries (tier1-boundary-20260815): the
+# tiny rung's 67.5 budget puts the tiny→nano crossover at exactly 36
+# (36 × 1.875 = 67.5), and nano carries 37–40; 41 exceeds the claim. A
+# mismatch means the shipped file and the measured record drifted apart.
 {"yolox_tiny_qdq.onnx", 2} = table[26]
-# Draft budgets put the tiny→nano boundary at 54.6/1.875 ≈ 29: rung 30
-# resolves NANO under the draft file. The tiny cells at 30 deliberately
-# FORCE tiny past its predicted boundary — that overload cell is what
-# locates the measured budget.
-{"yolox_nano_qdq.onnx", 2} = table[30]
+{"yolox_tiny_qdq.onnx", 2} = table[28]
+{"yolox_tiny_qdq.onnx", 2} = table[30]
+{"yolox_tiny_qdq.onnx", 2} = table[36]
+{"yolox_nano_qdq.onnx", 2} = table[38]
+{"yolox_nano_qdq.onnx", 2} = table[40]
 {:refused, _past_claim} = table[41]
 
-IO.puts("resolution check: PASS — 40→nano@2 (the 3.2 cell), 26/28→tiny@2, 41 refused")
+IO.puts("resolution check: PASS — tiny through 36, nano 37–40, 41 refused")

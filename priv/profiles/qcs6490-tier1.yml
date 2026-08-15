@@ -1,9 +1,12 @@
 # Qualcomm QCS6490, tier 1 (presence detection) — the model-ladder profile.
 #
-# DRAFT: the pack-rung and yolox_tiny budgets below are provisional
-# (menu-doc arithmetic, not boundary ladder runs). D-L6 says a rung owes its
-# boundary a capacity-ladder run before this file stops being a draft; the
-# tier1-ladder phase-3 runs retire this marker.
+# Both Apache rungs are boundary-measured (nano: tier1-capacity
+# 2026-08-14, re-confirmed 08-15; tiny: tier1-boundary 2026-08-15). The
+# three pack rungs keep provisional menu-arithmetic budgets: their
+# artifacts do not ship until model-packs does, so their boundary runs
+# cannot exist yet — and the Apache-complete invariant keeps them off the
+# claim path regardless. Each owes a boundary ladder run when its pack
+# lands (D-L6).
 #
 # The ladder replaces a fixed model choice: config resolves, per load, the
 # most accurate rung whose measured engine budget covers the configured
@@ -60,17 +63,24 @@ model_ladder:
   # two alone must cover supported_cameras — the Apache-complete invariant
   # config enforces at load.
   #
-  # provisional budget: menu bench p50 17.0 ms + serialization (2026-08-14)
-  # — the phase-3 boundary ladder run at ~28–29 cameras is owed. Best
-  # Apache accuracy above nano (32.8 paper mAP), healthy verify scores.
+  # measured budget: boundary ladder 2026-08-15 — 36 cameras at the
+  # 1.875/s effective floor (67.5 passes/s) delivered 100% uniform ×2;
+  # ceiling onset at 38 (98.8%, CPU dropping — engine-bound). The menu
+  # arithmetic (17.0 ms p50 → 54.6/s) ran 24% low: sustained HTP
+  # throughput beats single-camera bench p50 by a model-dependent margin
+  # (nano's gap was only ~4%), which is why budgets are ladder-measured,
+  # never bench-derived. Best Apache accuracy above nano (32.8 paper
+  # mAP), healthy verify scores. Evidence: tier1-boundary-20260815.
   - model:
       qnn: models/yolox_tiny_qdq.onnx
     model_profile: yolox
     input_size: 416
-    engine_budget: 54.6
+    engine_budget: 67.5
   # measured budget: tier1-capacity ladder 2026-08-14 — 40 cameras at the
   # 1.875/s effective floor (= 75.0 passes/s) delivered 100% in three runs;
   # 44 showed ceiling onset. The engine path, not decode or RSS, binds.
+  # Re-confirmed 2026-08-15 through the shipped ladder's own resolution
+  # (tier1-boundary findings, task 3.2).
   - model:
       qnn: models/yolox_nano_qdq.onnx
     model_profile: yolox

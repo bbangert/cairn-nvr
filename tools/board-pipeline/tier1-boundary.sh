@@ -3,11 +3,13 @@
 # standing long-runs rule). Two boundary campaigns against the QCS6490,
 # both thin delegations to capacity-ladder.sh (the proven #113 harness):
 #
-#   A. yolox_tiny boundary (task 3.1): rungs 26/28/30 cameras ×2, dual
-#      plane, SAMPLE_FPS=2 — brackets the draft budget's predicted
-#      boundary (54.6 passes/s ÷ 1.875/s ≈ 29). Rung 30 deliberately
-#      forces tiny past it; where delivery breaks locates the measured
-#      engine_budget.
+#   A. yolox_tiny bracket (task 3.1): rungs 26/28/30 cameras ×2, dual
+#      plane, SAMPLE_FPS=2. Historical note: these rungs bracketed the
+#      DRAFT budget's predicted ~29 boundary; the campaign then extended
+#      to 32/34 and 36/38 by direct capacity-ladder.sh invocation, and
+#      the measured boundary landed at 36 clean / 38 onset →
+#      engine_budget 67.5 (tier1-boundary-20260815 findings). A re-run
+#      of this script reproduces the bracket, not the extensions.
 #   B. yolox_nano 40-camera re-confirmation (task 3.2): one cell at the
 #      exact parameters the SHIPPED ladder resolves for a 40-camera fleet
 #      (nano, derived sample_fps 2) — the capacity campaign measured this
@@ -17,13 +19,15 @@
 # cells (tools/board-pipeline/tier1_resolution_check.exs) and aborts on
 # drift, so the board only ever measures what config actually deploys.
 #
-# HOW TO INVOKE (Ben) — one command; the harness build happens here too,
+# HOW TO INVOKE — one command; the harness build happens here too,
 # validated against the same clip the ladder replays:
 #
-#     SUB_CLIP=/path/to/sub.aus tools/board-pipeline/tier1-boundary.sh
+#     tools/board-pipeline/tier1-boundary.sh
 #
-#   SUB_CLIP is the tier1-capacity campaign's sub-res packed clip
-#   (213c0177…_reolink_sub, 640×480@15). Regenerate from any H.264
+#   With no SUB_CLIP given, the board-resident campaign clip is fetched
+#   (640×480@15, packed 2026-08-15 from a real reolink event recording —
+#   see tier1-boundary-20260815 findings for provenance). To use another
+#   clip, pass SUB_CLIP=/path/to/sub.aus; make one from any H.264
 #   *container* (raw Annex-B has no pts — mp4/mkv it first):
 #     mix run --no-start tools/board-pipeline/pack_clip.exs <video> <out.aus>
 #
@@ -34,9 +38,9 @@
 #
 # WHAT TO SEND BACK: both summary CSV paths this prints at the end, plus
 # the result trees they point into (same contract as capacity-ladder.sh).
-# Cells with nonzero rc or nonempty starved_cams first. Findings land in
-# .claude/plans/tier-surface/research/ per ladder-protocol conventions and
-# retire the tier file's DRAFT marker (task 3.3).
+# Cells with nonzero rc or nonempty starved_cams first. The 2026-08-15
+# findings from these campaigns live in
+# .claude/plans/tier-surface/research/tier1-boundary-20260815.md.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
