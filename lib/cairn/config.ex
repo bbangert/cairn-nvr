@@ -697,8 +697,11 @@ defmodule Cairn.Config do
   # detection toggle, which must not re-resolve anything (capacity sizes for
   # the configured fleet; no flapping). Runs before `resolve_profiles/2` so
   # the structs it lowers are the ones the groups get, and only for profiles
-  # some group actually names — an unused ladder file costs no disk probes
-  # and no warnings, like the artifact checks below.
+  # some CAMERA detects on — not merely ones a group names: a spare group
+  # defined but used by no camera runs nothing, and resolving its ladder
+  # against a fleet it does not serve could fail the load over cameras that
+  # never touch it. An unused ladder file costs no disk probes and no
+  # warnings, like the artifact checks below.
   #
   # "Lowers": the selected rung's model fields and the derived sample_fps are
   # written into the profile's own single-model fields, so everything
@@ -708,9 +711,20 @@ defmodule Cairn.Config do
   # resolved to. `resolved_rung` keeps the selection itself for the
   # restart-class comparison (D-L5).
   defp resolve_ladders(config, acc) do
+    # Group name → profile name; groups still hold name strings here
+    # (`resolve_profiles/2` runs after this pass).
+    by_group =
+      Map.new(config.plugin_groups, fn
+        %PluginGroup{name: group, profile: profile} when is_binary(profile) -> {group, profile}
+        %PluginGroup{name: group} -> {group, nil}
+      end)
+
     used =
       MapSet.new(
-        for %PluginGroup{profile: name} <- config.plugin_groups, is_binary(name), do: name
+        for %Camera{plugin: {:group, group}} <- config.cameras,
+            profile = Map.get(by_group, group),
+            is_binary(profile),
+            do: profile
       )
 
     n = Enum.count(config.cameras, &(&1.plugin != nil))

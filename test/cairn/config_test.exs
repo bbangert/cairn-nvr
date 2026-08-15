@@ -1980,6 +1980,44 @@ defmodule Cairn.ConfigTest do
       assert Enum.any?(errors, &(&1 =~ "different models (ladder, solo)"))
     end
 
+    test "a spare group's ladder is not resolved against a fleet it does not serve" do
+      # Three cameras detect on a single-model group; a spare group names a
+      # 2-camera ladder no camera uses. Used-ness is a camera fact, not a
+      # group fact: resolving the spare against N=3 would fail the load over
+      # cameras that never touch it.
+      dir =
+        tmp_profile_dir("mini", """
+        tier: 1
+        model_profile: yolox
+        labels: #{@stub_names}
+        model_ladder:
+          - model:
+              onnx: #{@stub_onnx}
+            input_size: 416
+            engine_budget: 4
+        supported_cameras:
+          min: 1
+          max: 2
+        """)
+
+      File.write!(Path.join(dir, "solo.yml"), """
+      model:
+        onnx: #{@stub_onnx}
+      model_profile: yolox
+      labels: #{@stub_names}
+      """)
+
+      map =
+        ladder_map(3, dir)
+        |> Map.put("plugins", %{
+          "det" => %{"profile" => "solo"},
+          "spare" => %{"profile" => "mini"}
+        })
+
+      assert {:ok, config, []} = Config.from_map(map)
+      assert config.profiles["mini"].resolved_rung == nil
+    end
+
     test "an unused ladder profile costs no probes, no warnings, no resolution" do
       # The pack artifact is absent and rung 3 exists only on disk checks a
       # used profile would run — no group names it, so nothing fires.
