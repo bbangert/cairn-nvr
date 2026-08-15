@@ -803,7 +803,7 @@ defmodule Cairn.Config do
 
     "profile #{profile.name}: no ladder rung covers #{n} cameras at tier " <>
       "#{profile.tier}'s #{floor.floor_fps} fps floor (#{floor_rate}/s effective) — " <>
-      "the largest installed rung (#{rung_artifact(largest, profile.backend)}) budgets " <>
+      "the largest eligible rung (#{rung_artifact(largest, profile.backend)}) budgets " <>
       "#{largest.engine_budget} passes/s, about #{trunc(largest.engine_budget / floor_rate)} " <>
       "cameras. Remove cameras from this node's detecting groups or split the node"
   end
