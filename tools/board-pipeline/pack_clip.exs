@@ -34,12 +34,15 @@ File.mkdir_p!(work)
                 message:
                   "#{Exception.message(e)} — if #{video} is a raw .h264/.h265 " <>
                     "elementary stream it carries no timestamps; wrap it first, e.g. " <>
-                    "ffmpeg -f h264 -r 15 -i #{video} -c copy out.mp4"
+                    "ffmpeg -f h264 -r 15 -i #{video} -c copy out.mp4 " <>
+                    "(-f hevc for .h265)"
               ],
               __STACKTRACE__
+  after
+    # Both paths: the AUs are already in memory, and the raise path must
+    # not leak a scratch tree per attempt.
+    File.rm_rf(work)
   end
-
-File.rm_rf!(work)
 
 packed =
   for {au, pts} <- aus, into: <<>> do

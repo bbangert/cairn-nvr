@@ -6,7 +6,7 @@
 # The clip is BOARD_PIPELINE_CLIP, a board-soak packed AU file
 # (<<pts90::signed-64, size::unsigned-32, au::binary>>). Regenerate one from
 # any H.264 video:
-#   mix run tools/board-pipeline/pack_clip.exs <video> <out.aus>
+#   mix run --no-start tools/board-pipeline/pack_clip.exs <video> <out.aus>
 # (Wraps Cairn.Native.Parity.read_clip and rescales pts to 90 kHz. It lived
 # in a session scratchpad once and got lost with it — it is a repo file now.)
 set -euo pipefail
