@@ -62,6 +62,39 @@ defmodule Cairn.Config.Profile do
     tracker: cairn          # which tracker core the group's cameras run
   ```
 
+  A LADDER profile is the other shape, and the two never mix in one file:
+  `model_ladder:` is mutually exclusive with `model:`/`input_size:`/
+  `sample_fps:`/`fps_band:`, because the resolved rung is the model and the
+  rate is derived from its budget (D-L4). It requires `tier: 1` and
+  `supported_cameras:`:
+
+  ```yaml
+  # <a profile_dirs entry>/ladder-example.yml
+  tier: 1
+  backend: qnn
+  experimental: true
+  labels: models/coco.names   # shared by every rung, like decoder:
+  model_ladder:               # ordered most accurate first — the AUTHOR's
+    - model:                  # claim, unchecked; engine_budget is measured
+        qnn: packs/26m.onnx   # passes/s, strictly increasing down the list
+      model_profile: yolo26   # a rung's own family; absent = the top-level one
+      input_size: 640
+      engine_budget: 17
+      pack: yolo26m           # skipped (warned) while its artifact is absent
+    - model:
+        qnn: models/nano.onnx
+      model_profile: yolox
+      input_size: 416
+      engine_budget: 75
+  supported_cameras:          # the declared range; the non-pack rungs alone
+    min: 1                    # must cover max (the Apache-complete invariant)
+    max: 40                   # = the last non-pack rung's measured reach
+  ```
+
+  Resolution is static, at config load: `Cairn.Config.resolve_ladders/2`
+  picks the first rung whose budget covers the configured fleet and derives
+  each camera's `sample_fps` from it.
+
   The `tracking:` block expresses **presence, not order** (D-P2): a stage
   key present means listed, absent means not, and the tracker's fixed
   insertion points decide where each runs. The block itself is the stage
@@ -107,7 +140,9 @@ defmodule Cairn.Config.Profile do
   alias Cairn.Tracker.Stage
 
   @known_keys ~w(name experimental backend model model_profile input_size decoder labels
-                 fps_band sample_fps tracking tier)
+                 fps_band sample_fps tracking tier model_ladder supported_cameras)
+  @known_rung_keys ~w(model model_profile input_size engine_budget pack)
+  @known_supported_keys ~w(min max)
   @known_tracking_keys ~w(bbd oru ocr twin_mint max_unseen_ms max_live_tracks stationary_after_ms
                           tracker)
   # What each backend accepts, as static data — the Elixir half of
@@ -205,6 +240,22 @@ defmodule Cairn.Config.Profile do
   # this ladder and names a different axis.
   @tiers [1, 2]
 
+  # The model ladder's rate bounds, tier by tier. Both numbers are nominal
+  # SampleGate rates; resolution divides budgets against the EFFECTIVE rate
+  # (`effective_rate/1`) because the gate quantizes to the frame grid —
+  # "2 fps" delivers 1.875/s, and 40 × 1.875 = 75.0 is exactly the measured
+  # nano budget, where the nominal 2 would refuse the measured fleet
+  # (tier1-capacity-20260814). Tier 2 has no row on purpose: its floor waits
+  # on bar-verified rungs (tier2-accuracy), so `model_ladder` is refused
+  # there rather than resolved against a floor nobody measured.
+  @ladder_floors %{1 => %{floor_fps: 2, cap_fps: 10}}
+
+  # The substream frame grid the capacity campaign measured on (true 15 fps,
+  # pts deltas uniformly 6000/90kHz). `effective_rate/1` is a claim about
+  # this grid; a fleet on a different substream rate shifts the effective
+  # rates, which the authoring guide says to an author's face.
+  @substream_grid_fps 15
+
   defstruct name: nil,
             tier: nil,
             experimental: false,
@@ -216,6 +267,15 @@ defmodule Cairn.Config.Profile do
             labels: nil,
             fps_band: nil,
             sample_fps: nil,
+            # The ordered rung list (`model_ladder:`), nil for a single-model
+            # profile, and the range the ladder declares. `resolved_rung` is
+            # written by `Cairn.Config`'s load-time resolution, never parsed:
+            # the selected rung's map, whose model fields are also lowered
+            # into the five above so everything downstream reads a ladder
+            # profile as the single-model profile it resolved to.
+            model_ladder: nil,
+            supported_cameras: nil,
+            resolved_rung: nil,
             # The stage presence map (atom key → params map), nil when the
             # file had no `tracking:` block at all — absence speaks (see the
             # moduledoc) — plus the three band-tuned tracker bounds and the
@@ -282,6 +342,23 @@ defmodule Cairn.Config.Profile do
   """
   @spec artifact_key(String.t()) :: String.t()
   def artifact_key(backend), do: Map.fetch!(@backend_artifacts, backend)
+
+  @doc "The ladder rate bounds for `tier`, or `nil` for a tier no ladder ships on."
+  @spec ladder_floor(term()) :: %{floor_fps: pos_integer(), cap_fps: pos_integer()} | nil
+  def ladder_floor(tier), do: Map.get(@ladder_floors, tier)
+
+  @doc """
+  The rate `Cairn.Pipeline.SampleGate` actually delivers for a nominal `fps`
+  on the measured substream grid: admissions land on frame slots, so the gate
+  opens every `ceil(grid / fps)` frames — "2 fps" is 1.875/s. An exact
+  divisor (5 → every 3rd frame) is returned undamped although jitter
+  measurably degrades it (4.17/s for "5 fps"); overstating demand is the
+  conservative side for budget arithmetic. Ladder resolution divides every
+  budget against this, never against the nominal rate.
+  """
+  @spec effective_rate(pos_integer()) :: float()
+  def effective_rate(fps) when is_integer(fps) and fps > 0,
+    do: @substream_grid_fps / ceil(@substream_grid_fps / fps)
 
   @doc """
   The model artifact path this profile names for its own backend, or `nil`
@@ -426,6 +503,9 @@ defmodule Cairn.Config.Profile do
       |> check_decoder(raw, name)
       |> check_capability_rules(raw, name)
       |> check_tier(raw, name)
+      |> check_model_ladder(raw, name)
+      |> check_supported_cameras(raw, name)
+      |> check_ladder_coverage(raw, name)
 
     if length(acc.errors) > errors_before do
       {nil, acc}
@@ -444,6 +524,8 @@ defmodule Cairn.Config.Profile do
         labels: Map.get(raw, "labels"),
         fps_band: Map.get(raw, "fps_band"),
         sample_fps: Map.get(raw, "sample_fps"),
+        model_ladder: rungs(Map.get(raw, "model_ladder")),
+        supported_cameras: supported(Map.get(raw, "supported_cameras")),
         stages: stages(tracking),
         max_unseen_ms: tracking && Map.get(tracking, "max_unseen_ms"),
         max_live_tracks: tracking && Map.get(tracking, "max_live_tracks"),
@@ -679,6 +761,412 @@ defmodule Cairn.Config.Profile do
             "(1 = presence detection, 2 = accurate MOT); higher rungs are reserved"
         )
     end
+  end
+
+  # The struct's rung shape: atom keys, only built once every check passed, so
+  # construction may assume the raw shapes are valid. `model_profile` stays
+  # nil where a rung leans on the profile-level family; resolution coalesces.
+  defp rungs(nil), do: nil
+
+  defp rungs(list) do
+    Enum.map(list, fn rung ->
+      %{
+        model: Map.get(rung, "model"),
+        model_profile: Map.get(rung, "model_profile"),
+        input_size: Map.get(rung, "input_size"),
+        engine_budget: Map.get(rung, "engine_budget"),
+        pack: Map.get(rung, "pack")
+      }
+    end)
+  end
+
+  defp supported(nil), do: nil
+  defp supported(map), do: %{min: Map.get(map, "min"), max: Map.get(map, "max")}
+
+  # The ladder schema (D-L4, tier1-ladder plan). List order is the AUTHOR's
+  # accuracy claim, most accurate first — nothing here can check mAP — so the
+  # one ordering validation is the budgets: strictly increasing down the
+  # list, because a later rung exists to buy more capacity and a rung that
+  # buys none is dead weight or a misordering.
+  defp check_model_ladder(acc, raw, name) do
+    case Map.get(raw, "model_ladder") do
+      nil ->
+        acc
+
+      list when is_list(list) and list != [] ->
+        acc
+        |> check_ladder_exclusions(raw, name)
+        |> check_ladder_tier(raw, name)
+        |> check_rungs(list, raw, name)
+        |> check_budget_order(list, name)
+
+      other ->
+        Config.add_error(
+          acc,
+          "profile #{name}: model_ladder must be a non-empty list of rungs, " <>
+            "got #{inspect(other)}"
+        )
+    end
+  end
+
+  # D-L4: the ladder is the model AND rate authority — a profile declaring
+  # any of the four alongside it is contradicting its own resolution, refused
+  # in one error naming every offender. `input_size` rides the rule because
+  # it is per-rung (640 vs 416 rungs are the normal case), so a top-level
+  # value could only ever be shadowed — the inert-key trap.
+  @ladder_exclusive ~w(model sample_fps fps_band input_size)
+  defp check_ladder_exclusions(acc, raw, name) do
+    case Enum.filter(@ladder_exclusive, &Map.has_key?(raw, &1)) do
+      [] ->
+        acc
+
+      keys ->
+        Config.add_error(
+          acc,
+          "profile #{name}: model_ladder is mutually exclusive with " <>
+            "#{Enum.join(keys, ", ")} — the resolved rung is the model, and " <>
+            "sample_fps is derived from its budget (the ladder is the rate authority)"
+        )
+    end
+  end
+
+  # Resolution needs a floor rate, and only the tiers in `@ladder_floors`
+  # have a measured one. Skipped for a tier `check_tier/3` already refused —
+  # one unknown value, one error.
+  defp check_ladder_tier(acc, raw, name) do
+    case Map.get(raw, "tier") do
+      nil ->
+        Config.add_error(
+          acc,
+          "profile #{name}: model_ladder requires tier: — resolution divides rung " <>
+            "budgets against the tier's floor rate; declare tier: 1"
+        )
+
+      tier when tier in @tiers ->
+        Config.check(
+          acc,
+          ladder_floor(tier) != nil,
+          "profile #{name}: model_ladder is not available at tier #{tier} yet — a " <>
+            "tier-#{tier} ladder needs every rung bar-verified and a measured floor " <>
+            "rate, and neither exists today; tier 1 is the ladder tier that ships"
+        )
+
+      _already_refused ->
+        acc
+    end
+  end
+
+  defp check_rungs(acc, list, raw, name) do
+    backend = Map.get(raw, "backend", "ort")
+
+    list
+    |> Enum.with_index(1)
+    |> Enum.reduce(acc, fn {rung, index}, acc ->
+      check_rung(acc, rung, index, backend, raw, name)
+    end)
+  end
+
+  defp check_rung(acc, rung, index, backend, raw, name) when is_map(rung) do
+    where = "profile #{name} model_ladder rung #{index}"
+
+    acc
+    |> Config.warn_unknown(rung, @known_rung_keys, where)
+    |> Config.warn_unknown(Map.get(rung, "model"), @known_model_keys, "#{where} model")
+    |> check_rung_model(rung, index, backend, name)
+    |> check_pos_int(rung, "input_size", name, "model_ladder rung #{index} input_size")
+    |> check_rung_required(rung, "input_size", index, name)
+    |> check_rung_budget(rung, index, name)
+    |> check_rung_pack(rung, index, name)
+    |> check_rung_model_profile(rung, index, backend, raw, name)
+  end
+
+  defp check_rung(acc, rung, index, _backend, _raw, name) do
+    Config.add_error(
+      acc,
+      "profile #{name}: model_ladder rung #{index} must be a mapping, got #{inspect(rung)}"
+    )
+  end
+
+  # Each rung is a model choice for THIS profile's backend, so beyond the
+  # top-level `model:` shape rules it must actually carry the backend's
+  # artifact key — a rung without one could never be resolved into anything
+  # the engine loads.
+  defp check_rung_model(acc, rung, index, backend, name) do
+    case Map.get(rung, "model") do
+      model when is_map(model) and model != %{} ->
+        acc
+        |> check_rung_model_leaves(model, index, name)
+        |> check_rung_backend_key(model, index, backend, name)
+
+      _absent_or_not_a_map ->
+        Config.add_error(
+          acc,
+          "profile #{name}: model_ladder rung #{index} model must be a mapping of " <>
+            "per-backend artifact paths"
+        )
+    end
+  end
+
+  defp check_rung_model_leaves(acc, model, index, name) do
+    model
+    |> Map.keys()
+    |> Enum.sort()
+    |> Enum.reduce(acc, fn key, acc ->
+      case Map.fetch!(model, key) do
+        value when is_binary(value) and value != "" ->
+          acc
+
+        value ->
+          Config.add_error(
+            acc,
+            "profile #{name}: model_ladder rung #{index} model.#{key} must be a path " <>
+              "string, got #{inspect(value)}"
+          )
+      end
+    end)
+  end
+
+  # Skipped for a backend outside the menu — `check_backend/3` already spoke,
+  # and there is no artifact key to hold the rung against.
+  defp check_rung_backend_key(acc, model, index, backend, name) when backend in @backends do
+    Config.check(
+      acc,
+      is_binary(Map.get(model, artifact_key(backend))),
+      "profile #{name}: model_ladder rung #{index} names no model.#{artifact_key(backend)} " <>
+        "artifact for this profile's #{backend} backend — every rung must carry one"
+    )
+  end
+
+  defp check_rung_backend_key(acc, _model, _index, _backend, _name), do: acc
+
+  # `check_pos_int/5` says nothing about an absent key (top-level fields are
+  # optional); a rung's `input_size` is not. Tested by value, not key
+  # presence: a bare `input_size:` parses to nil, which check_pos_int also
+  # reads as absent — key presence here would let it through undeclared.
+  defp check_rung_required(acc, rung, key, index, name) do
+    Config.check(
+      acc,
+      Map.get(rung, key) != nil,
+      "profile #{name}: model_ladder rung #{index} must declare #{key}"
+    )
+  end
+
+  defp check_rung_budget(acc, rung, index, name) do
+    case Map.get(rung, "engine_budget") do
+      budget when is_number(budget) and budget > 0 ->
+        acc
+
+      other ->
+        Config.add_error(
+          acc,
+          "profile #{name}: model_ladder rung #{index} engine_budget must be a positive " <>
+            "number of measured passes/s, got #{inspect(other)}"
+        )
+    end
+  end
+
+  defp check_rung_pack(acc, rung, index, name) do
+    case Map.get(rung, "pack") do
+      nil ->
+        acc
+
+      pack when is_binary(pack) and pack != "" ->
+        acc
+
+      other ->
+        Config.add_error(
+          acc,
+          "profile #{name}: model_ladder rung #{index} pack must be a pack name string, " <>
+            "got #{inspect(other)}"
+        )
+    end
+  end
+
+  # A rung's own family gets `check_model_profile/3`'s menu treatment and
+  # `check_capabilities/5`'s backend rules. Only a rung that DECLARES a
+  # family is checked here — one inheriting the profile-level
+  # `model_profile:` was already checked by the top-level chain, and
+  # re-running it per rung would report one mistake once per rung.
+  defp check_rung_model_profile(acc, rung, index, backend, raw, name) do
+    case Map.get(rung, "model_profile") do
+      nil ->
+        acc
+
+      value when is_binary(value) and value != "" ->
+        case family(value) do
+          nil ->
+            Config.add_error(
+              acc,
+              "profile #{name}: model_ladder rung #{index} unknown model_profile " <>
+                "#{inspect(value)} (#{family_menu()})"
+            )
+
+          family when backend in @backends ->
+            check_capabilities(acc, name, backend, Map.get(raw, "experimental") === true, family)
+
+          _family_but_unknown_backend ->
+            acc
+        end
+
+      other ->
+        Config.add_error(
+          acc,
+          "profile #{name}: model_ladder rung #{index} model_profile must be a string, " <>
+            "got #{inspect(other)}"
+        )
+    end
+  end
+
+  # Only over budgets that individually parsed — with any rung already
+  # errored, an ordering verdict would be noise about a list the author is
+  # about to rewrite.
+  defp check_budget_order(acc, list, name) do
+    budgets = Enum.map(list, &(is_map(&1) && Map.get(&1, "engine_budget")))
+
+    if Enum.all?(budgets, &(is_number(&1) and &1 > 0)) do
+      budgets
+      |> Enum.with_index(1)
+      |> Enum.chunk_every(2, 1, :discard)
+      |> Enum.reduce(acc, fn [{prev, _i}, {budget, index}], acc ->
+        Config.check(
+          acc,
+          budget > prev,
+          "profile #{name}: model_ladder budgets must be strictly increasing down the " <>
+            "list (rung #{index} budgets #{budget} after #{prev}) — order is most " <>
+            "accurate first, and a later rung exists to buy more capacity"
+        )
+      end)
+    else
+      acc
+    end
+  end
+
+  # `supported_cameras:` is the ladder's declared range, so a ladder without
+  # one has nothing for the Apache-complete invariant to hold against —
+  # required together. On a single-model profile the key parses but nothing
+  # reads it, and an operator who wrote it meant it to do something, so the
+  # inert case warns rather than passing silently.
+  defp check_supported_cameras(acc, raw, name) do
+    # `!= nil`, not `has_key?`: a bare `model_ladder:` parses to nil, which
+    # this whole module reads as "said nothing" (the `tracking:` rule) — a
+    # key-presence test here would make the one check disagree with every
+    # other reader of the key.
+    ladder? = Map.get(raw, "model_ladder") != nil
+
+    case Map.get(raw, "supported_cameras") do
+      nil ->
+        Config.check(
+          acc,
+          not ladder?,
+          "profile #{name}: model_ladder requires supported_cameras — the declared " <>
+            "{min, max} range is what the Apache-complete invariant is checked against"
+        )
+
+      map when is_map(map) ->
+        acc =
+          if ladder? do
+            acc
+          else
+            Config.add_warning(
+              acc,
+              "profile #{name}: supported_cameras has no effect without model_ladder — " <>
+                "nothing reads it on a single-model profile"
+            )
+          end
+
+        acc =
+          Config.warn_unknown(
+            acc,
+            map,
+            @known_supported_keys,
+            "profile #{name} supported_cameras"
+          )
+
+        acc =
+          Enum.reduce(["min", "max"], acc, fn key, acc ->
+            Config.check(
+              acc,
+              match?(v when is_integer(v) and v > 0, Map.get(map, key)),
+              "profile #{name}: supported_cameras.#{key} must be a positive integer, " <>
+                "got #{inspect(Map.get(map, key))}"
+            )
+          end)
+
+        with min when is_integer(min) <- Map.get(map, "min"),
+             max when is_integer(max) <- Map.get(map, "max") do
+          Config.check(
+            acc,
+            min <= max,
+            "profile #{name}: supported_cameras min #{min} exceeds max #{max}"
+          )
+        else
+          _already_reported -> acc
+        end
+
+      other ->
+        Config.add_error(
+          acc,
+          "profile #{name}: supported_cameras must be a {min, max} mapping, " <>
+            "got #{inspect(other)}"
+        )
+    end
+  end
+
+  # The Apache-complete invariant (D-L2, Ben 2026-08-14): the shipped
+  # container is complete on its non-pack rungs alone. Packs raise accuracy
+  # at a given fleet size; they never extend nominal support or become
+  # load-bearing for any camera count — so the non-pack rungs by themselves
+  # must cover the ladder's own declared max at the tier's floor rate, and a
+  # ladder that leans on packs for any count is an authoring error. Pure
+  # arithmetic over the file, so it runs at parse rather than waiting for a
+  # group to use the profile; guarded on every input having parsed, since a
+  # coverage verdict about a malformed ladder is noise.
+  defp check_ladder_coverage(acc, raw, name) do
+    with rungs when is_list(rungs) and rungs != [] <- Map.get(raw, "model_ladder"),
+         true <- Enum.all?(rungs, &valid_rung_for_coverage?/1),
+         %{"max" => max} when is_integer(max) and max > 0 <- Map.get(raw, "supported_cameras"),
+         %{floor_fps: floor_fps} <- ladder_floor(Map.get(raw, "tier")) do
+      floor_rate = effective_rate(floor_fps)
+
+      # `!= nil`, not `has_key?`: a bare `pack:` parses to nil, and every
+      # other reader (`check_rung_pack/4`, resolution's skip split) reads
+      # that as a non-pack rung — coverage must count it on the same side.
+      case rungs
+           |> Enum.reject(&(Map.get(&1, "pack") != nil))
+           |> Enum.map(&Map.get(&1, "engine_budget")) do
+        [] ->
+          Config.add_error(
+            acc,
+            "profile #{name}: every model_ladder rung is a pack rung — the shipped " <>
+              "container must cover the full supported_cameras range with no pack " <>
+              "installed (Apache-complete invariant)"
+          )
+
+        budgets ->
+          covered = trunc(Enum.max(budgets) / floor_rate)
+
+          Config.check(
+            acc,
+            covered >= max,
+            "profile #{name}: the non-pack rungs alone cover ~#{covered} cameras at " <>
+              "tier #{Map.get(raw, "tier")}'s #{floor_fps} fps floor (largest non-pack " <>
+              "budget #{Enum.max(budgets)} passes/s ÷ #{floor_rate}/s effective), but " <>
+              "supported_cameras.max claims #{max} — packs may raise accuracy, never " <>
+              "coverage (Apache-complete invariant); lower max or add a non-pack rung"
+          )
+      end
+    else
+      _malformed_elsewhere -> acc
+    end
+  end
+
+  # nil-or-binary, never a key-presence test: a bare `pack:` (nil) is a
+  # non-pack rung like everywhere else, and treating it as malformed here
+  # would silently skip the coverage invariant for the whole ladder.
+  defp valid_rung_for_coverage?(rung) do
+    is_map(rung) and is_number(Map.get(rung, "engine_budget")) and
+      Map.get(rung, "engine_budget") > 0 and
+      (is_nil(Map.get(rung, "pack")) or is_binary(Map.get(rung, "pack")))
   end
 
   # "a, b or c" — enumerated from the table rather than hand-written so a value
