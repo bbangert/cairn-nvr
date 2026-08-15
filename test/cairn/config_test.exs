@@ -2580,15 +2580,25 @@ defmodule Cairn.ConfigTest do
       # Three pack rungs (yolo26 family), two Apache rungs (yolox) — the
       # Apache tail carries the claim alone, and the parse-time invariant
       # already refused any file where it could not. Budgets strictly
-      # increase; nano's 75 is the one measured number until phase 3.
+      # increase; both Apache budgets are boundary-measured (nano 75,
+      # tiny 67.5 — tier1-boundary-20260815), the pack budgets stay
+      # provisional until their packs ship.
       assert [m, s, n416, tiny, nano] = profile.model_ladder
       assert Enum.map([m, s, n416], & &1.pack) == ["yolo26m", "yolo26s", "yolo26n-416"]
       assert tiny.pack == nil and nano.pack == nil
-      assert nano.engine_budget == 75
+      # The two measured Apache budgets, pinned so they cannot drift under
+      # green gates (the boundary evidence is tier1-boundary-20260815);
+      # ordering follows from the exact list.
+      assert Enum.map(profile.model_ladder, & &1.engine_budget) == [16.8, 25.8, 52.6, 67.5, 75]
 
-      assert Enum.map(profile.model_ladder, & &1.engine_budget) ==
-               Enum.sort_by(profile.model_ladder, & &1.engine_budget)
-               |> Enum.map(& &1.engine_budget)
+      # The measured tiny→nano crossover, held with the same arithmetic
+      # resolution uses: 36 × 1.875 = 67.5 fits tiny exactly, 37 spills to
+      # nano. Selection logic itself is exercised by the ladder describe;
+      # this pins the shipped numbers to the boundary they were measured at.
+      floor_rate = Cairn.Config.Profile.effective_rate(2)
+      assert 36 * floor_rate == tiny.engine_budget
+      assert 37 * floor_rate > tiny.engine_budget
+      assert 40 * floor_rate <= nano.engine_budget
     end
 
     test "qcs6490-tier1 is the only shipped profile that names a decoder" do
@@ -2606,25 +2616,37 @@ defmodule Cairn.ConfigTest do
 
     # The D-L6 docs-honesty gate, running where `mix check` runs: a shipped
     # rung's budget is a measurement or it is marked provisional, and a file
-    # carrying any provisional budget says DRAFT at the top. YAML comments
-    # never reach the parser, so the gate reads the raw file — crude on
-    # purpose; it enforces that the note exists, not that it is true.
-    test "every shipped ladder budget carries provenance; provisional ⇒ DRAFT" do
+    # whose NON-PACK rungs carry any provisional budget says DRAFT at the
+    # top. Pack rungs are exempt from the DRAFT escalation (never from the
+    # note): their artifacts do not exist until model-packs ships, so their
+    # boundary runs cannot either — and the Apache-complete invariant keeps
+    # them off the claim path. YAML comments never reach the parser, so the
+    # provenance half reads the raw file — crude on purpose; it enforces
+    # that the note exists, not that it is true — while pack-ness comes
+    # from the parsed rungs, paired by order.
+    test "every shipped ladder budget carries provenance; non-pack provisional ⇒ DRAFT" do
       for path <- Path.wildcard("priv/profiles/*.yml"),
           raw = File.read!(path),
           raw =~ "model_ladder:" do
         lines = String.split(raw, "\n")
+        {:ok, parsed} = YamlElixir.read_from_file(path)
+        pack_rung? = Enum.map(Map.fetch!(parsed, "model_ladder"), &(Map.get(&1, "pack") != nil))
 
         budget_indexes =
           for {line, index} <- Enum.with_index(lines),
               line =~ ~r/^\s+engine_budget:/,
               do: index
 
+        assert length(budget_indexes) == length(pack_rung?),
+               "#{path}: raw engine_budget lines and parsed rungs disagree — the gate's " <>
+                 "order pairing is broken"
+
         # Each rung's window runs from just past the PREVIOUS rung's budget
         # line to its own — a neighbor's note can never satisfy it. `\b` so
         # "unmeasured" is not a provenance claim.
-        budget_notes =
-          for {index, prev} <- Enum.zip(budget_indexes, [-1 | budget_indexes]) do
+        provisional_nonpack =
+          for {{index, prev}, pack?} <-
+                Enum.zip(Enum.zip(budget_indexes, [-1 | budget_indexes]), pack_rung?) do
             window = lines |> Enum.slice((prev + 1)..index//1) |> Enum.join("\n")
             marked = window =~ ~r/\b(provisional|measured)\b/i
 
@@ -2632,14 +2654,19 @@ defmodule Cairn.ConfigTest do
                    "#{path}:#{index + 1} engine_budget has no measured/provisional " <>
                      "provenance note in its own rung's comment (D-L6)"
 
-            window =~ ~r/\bprovisional\b/i
+            window =~ ~r/\bprovisional\b/i and not pack?
           end
 
-        assert budget_notes != [], "#{path} declares a ladder with no budgets?"
+        assert provisional_nonpack != [], "#{path} declares a ladder with no budgets?"
 
-        if Enum.any?(budget_notes) do
-          assert raw =~ "DRAFT",
-                 "#{path} carries provisional budgets but no DRAFT marker (D-L6)"
+        if Enum.any?(provisional_nonpack) do
+          # At the top, enforced as stated: the marker is an operator-facing
+          # banner, and a DRAFT buried in a rung comment is not one.
+          top = raw |> String.split("\n") |> Enum.take(10) |> Enum.join("\n")
+
+          assert top =~ "DRAFT",
+                 "#{path} carries a provisional NON-PACK budget but no DRAFT marker in " <>
+                   "the first 10 lines (D-L6 — the marker is a top-of-file banner)"
         end
       end
     end

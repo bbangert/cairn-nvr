@@ -180,9 +180,14 @@ The rules, each refused or warned at load:
   for any camera count is refused at parse.
 * **Budgets are measurements (D-L6).** Every `engine_budget` carries a
   provenance comment — `measured` (a boundary capacity-ladder run) or
-  `provisional` (menu arithmetic) — and a file with any provisional
-  budget says DRAFT at the top. The gate in the test suite reads the raw
-  file and refuses a shipped ladder without the notes.
+  `provisional` (menu arithmetic) — and a file whose NON-pack rungs
+  carry any provisional budget says DRAFT at the top. Pack rungs are
+  exempt from the DRAFT escalation, never from the note: their
+  artifacts do not exist until the pack ships, so their boundary runs
+  cannot either, and the Apache-complete invariant keeps them off the
+  claim path — each owes its run when the pack lands. The gate in the
+  test suite reads the raw file and refuses a shipped ladder without
+  the notes.
 
 Two consequences worth an operator's attention:
 
@@ -473,8 +478,9 @@ it. Follow what the shipped four do:
   than a measurement, say that too;
 - for a ladder file, give every `engine_budget` its provenance (`measured`
   from a boundary capacity-ladder run, or `provisional` with the arithmetic
-  it came from) and mark the file DRAFT while any budget is provisional —
-  the test suite refuses a shipped ladder without the notes (D-L6).
+  it came from) and mark the file DRAFT while any NON-pack budget is
+  provisional — the test suite refuses a shipped ladder without the notes
+  (D-L6; pack rungs keep provisional notes until their packs ship).
   `qcs6490-tier1.yml` is the worked example.
 
 Changing a *shipped* profile is a behaviour change for everyone running that
@@ -523,7 +529,7 @@ Four profiles in `priv/profiles/`, each with its reasoning in the file:
 | `generic-ort` | `ort` | band 5–5 | twin gate only | today's behaviour, named; the migration target and the one non-experimental profile |
 | `rk3566-lowfps` | `rknn` | band 2–4 | bbd, oru, twin gate | the low-fps set; wants `--track-floor-json` alongside it |
 | `rk3576` | `rknn` | band 8–16 | bbd, oru, twin gate | same pipeline, faster board; the band is scaled from rk3566's and **unmeasured** |
-| `qcs6490-tier1` | `qnn` | derived per rung | none (tier 1 — no tracker) | the model-ladder file: five rungs, claim 40 cameras, DRAFT until the boundary runs land |
+| `qcs6490-tier1` | `qnn` | derived per rung | none (tier 1 — no tracker) | the model-ladder file: five rungs, claim 40 cameras; Apache budgets boundary-measured, pack budgets provisional until their packs ship |
 
 Three of the four are `experimental: true` for the same blunt reason: their
 backends have not proven out in soak. Only `ort` runs today; `rknn` (a stub)

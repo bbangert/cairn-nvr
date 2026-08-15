@@ -42,17 +42,21 @@
 #   starved-camera cliff the way 5.5's own writeup warns against.
 #
 # HOW TO INVOKE (Ben)
-#   One-time per checkout — compiles+validates the harness AND leaves the
-#   ebin this script pushes to the board (its default build dir is a
-#   throwaway mktemp, so pin one):
+#   First make the packed clips (same format `Cairn.BoardSoak` and
+#   board_pipeline.ex read: repeated <<pts::signed-64, size::unsigned-32,
+#   au::binary-size(size)>>, 90 kHz pts), one at each resolution:
+#     mix run --no-start tools/board-pipeline/pack_clip.exs <video> <out.aus>
+#
+#   One-time per checkout — compiles the harness, validates it against a
+#   clip (required since the tier1-boundary work; a clipless run refuses
+#   up front), and leaves the ebin this script pushes to the board (its
+#   default build dir is a throwaway mktemp, so pin one):
 #
 #     BOARD_PIPELINE_BUILD=/tmp/board-pipeline-build \
+#     BOARD_PIPELINE_CLIP=/path/to/sub-640p.aus \
 #       tools/board-pipeline/run-local.sh
 #
-#   Then, with two packed clips ready (same format `Cairn.BoardSoak` and
-#   board_pipeline.ex read: repeated <<pts::signed-64, size::unsigned-32,
-#   au::binary-size(size)>>, 90 kHz pts — `mix run <scratchpad>/pack_clip.exs
-#   <video> <out.aus>`), one at each resolution:
+#   Then:
 #
 #     LOCAL_BUILD=/tmp/board-pipeline-build \
 #     MAIN_CLIP=/path/to/main-5mp.aus SUB_CLIP=/path/to/sub-640p.aus \

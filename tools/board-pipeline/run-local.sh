@@ -6,12 +6,22 @@
 # The clip is BOARD_PIPELINE_CLIP, a board-soak packed AU file
 # (<<pts90::signed-64, size::unsigned-32, au::binary>>). Regenerate one from
 # any H.264 video:
-#   mix run tools/board-pipeline/pack_clip.exs <video> <out.aus>
+#   mix run --no-start tools/board-pipeline/pack_clip.exs <video> <out.aus>
 # (Wraps Cairn.Native.Parity.read_clip and rescales pts to 90 kHz. It lived
 # in a session scratchpad once and got lost with it — it is a repo file now.)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
+# Refused up front with the remedy, not after a full compile as the
+# pipeline's opaque {:error, :no_clip_configured} (or :clip_empty — `-s`
+# covers the empty-file case too): the validation run at the bottom is
+# the point of this script, and it cannot run clipless.
+if [ -z "${BOARD_PIPELINE_CLIP:-}" ] || [ ! -s "${BOARD_PIPELINE_CLIP:-}" ]; then
+  echo "run-local.sh: BOARD_PIPELINE_CLIP must point at a non-empty packed .aus clip" >&2
+  echo "  (make one: mix run --no-start tools/board-pipeline/pack_clip.exs <video> <out.aus>)" >&2
+  exit 1
+fi
 BUILD="$ROOT/_build/dev/lib"
 OUT="${BOARD_PIPELINE_BUILD:-$(mktemp -d)}/ebin"
 mkdir -p "$OUT"
