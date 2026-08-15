@@ -57,7 +57,10 @@ for arg in "$@"; do
   case "$arg" in
   --dry-run) DRY_RUN_ARG="--dry-run" ;;
   --help)
-    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+    # Everything up to the first non-comment line, so the help tracks the
+    # header instead of truncating when it grows (a fixed range once cut
+    # the WHAT TO SEND BACK section off).
+    sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   *)

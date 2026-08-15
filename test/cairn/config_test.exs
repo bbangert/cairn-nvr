@@ -2652,8 +2652,13 @@ defmodule Cairn.ConfigTest do
         assert provisional_nonpack != [], "#{path} declares a ladder with no budgets?"
 
         if Enum.any?(provisional_nonpack) do
-          assert raw =~ "DRAFT",
-                 "#{path} carries a provisional NON-PACK budget but no DRAFT marker (D-L6)"
+          # At the top, enforced as stated: the marker is an operator-facing
+          # banner, and a DRAFT buried in a rung comment is not one.
+          top = raw |> String.split("\n") |> Enum.take(10) |> Enum.join("\n")
+
+          assert top =~ "DRAFT",
+                 "#{path} carries a provisional NON-PACK budget but no DRAFT marker in " <>
+                   "the first 10 lines (D-L6 — the marker is a top-of-file banner)"
         end
       end
     end

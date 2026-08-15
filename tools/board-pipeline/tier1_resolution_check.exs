@@ -23,6 +23,7 @@ for stub <- ~w(models/yolox_tiny_qdq.onnx models/yolox_nano_qdq.onnx models/coco
   File.write!(Path.join(tmp, stub), "stub")
 end
 
+original_cwd = File.cwd!()
 File.cd!(tmp)
 
 resolve = fn n ->
@@ -61,6 +62,9 @@ table =
     {n, result}
   end
 
+# Back out before deleting: removing the process's own cwd leaves mix
+# teardown running relative-path operations in a vanished directory.
+File.cd!(original_cwd)
 File.rm_rf!(tmp)
 
 # Asserted against the MEASURED boundaries (tier1-boundary-20260815): the
