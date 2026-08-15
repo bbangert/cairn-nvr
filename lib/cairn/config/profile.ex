@@ -86,9 +86,9 @@ defmodule Cairn.Config.Profile do
       model_profile: yolox
       input_size: 416
       engine_budget: 75
-  supported_cameras:          # the declared range; the non-pack rungs alone
-    min: 1                    # must cover max (the Apache-complete invariant)
-    max: 40                   # = the last non-pack rung's measured reach
+  supported_cameras: 40       # the support CLAIM, enforced as a bound; the
+                              # non-pack rungs alone must cover it (Apache-
+                              # complete) = the last non-pack rung's reach
   ```
 
   Resolution is static, at config load: `Cairn.Config.resolve_ladders/2`
@@ -142,7 +142,6 @@ defmodule Cairn.Config.Profile do
   @known_keys ~w(name experimental backend model model_profile input_size decoder labels
                  fps_band sample_fps tracking tier model_ladder supported_cameras)
   @known_rung_keys ~w(model model_profile input_size engine_budget pack)
-  @known_supported_keys ~w(min max)
   @known_tracking_keys ~w(bbd oru ocr twin_mint max_unseen_ms max_live_tracks stationary_after_ms
                           tracker)
   # What each backend accepts, as static data — the Elixir half of
@@ -268,7 +267,7 @@ defmodule Cairn.Config.Profile do
             fps_band: nil,
             sample_fps: nil,
             # The ordered rung list (`model_ladder:`), nil for a single-model
-            # profile, and the range the ladder declares. `resolved_rung` is
+            # profile, and the camera count it claims. `resolved_rung` is
             # written by `Cairn.Config`'s load-time resolution, never parsed:
             # the selected rung's map, whose model fields are also lowered
             # into the five above so everything downstream reads a ladder
@@ -525,7 +524,7 @@ defmodule Cairn.Config.Profile do
         fps_band: Map.get(raw, "fps_band"),
         sample_fps: Map.get(raw, "sample_fps"),
         model_ladder: rungs(Map.get(raw, "model_ladder")),
-        supported_cameras: supported(Map.get(raw, "supported_cameras")),
+        supported_cameras: Map.get(raw, "supported_cameras"),
         stages: stages(tracking),
         max_unseen_ms: tracking && Map.get(tracking, "max_unseen_ms"),
         max_live_tracks: tracking && Map.get(tracking, "max_live_tracks"),
@@ -779,9 +778,6 @@ defmodule Cairn.Config.Profile do
       }
     end)
   end
-
-  defp supported(nil), do: nil
-  defp supported(map), do: %{min: Map.get(map, "min"), max: Map.get(map, "max")}
 
   # The ladder schema (D-L4, tier1-ladder plan). List order is the AUTHOR's
   # accuracy claim, most accurate first — nothing here can check mAP — so the
@@ -1041,11 +1037,16 @@ defmodule Cairn.Config.Profile do
     end
   end
 
-  # `supported_cameras:` is the ladder's declared range, so a ladder without
-  # one has nothing for the Apache-complete invariant to hold against —
-  # required together. On a single-model profile the key parses but nothing
-  # reads it, and an operator who wrote it meant it to do something, so the
-  # inert case warns rather than passing silently.
+  # `supported_cameras:` is the ladder's support CLAIM — the camera count the
+  # file stands behind — and resolution enforces it as a bound: a fleet past
+  # it is refused even when a rung's budget would cover it (`Cairn.Config`'s
+  # resolve pass). So a ladder without one has nothing to enforce and nothing
+  # for the Apache-complete invariant to hold against — required together. On
+  # a single-model profile the key parses but nothing reads it, and an
+  # operator who wrote it meant it to do something, so the inert case warns
+  # rather than passing silently. A bare integer, not the design sketch's
+  # {min, max} mapping: a minimum fleet size never grew semantics, so it was
+  # dropped rather than enforced (Ben, 2026-08-15).
   defp check_supported_cameras(acc, raw, name) do
     # `!= nil`, not `has_key?`: a bare `model_ladder:` parses to nil, which
     # this whole module reads as "said nothing" (the `tracking:` rule) — a
@@ -1058,56 +1059,27 @@ defmodule Cairn.Config.Profile do
         Config.check(
           acc,
           not ladder?,
-          "profile #{name}: model_ladder requires supported_cameras — the declared " <>
-            "{min, max} range is what the Apache-complete invariant is checked against"
+          "profile #{name}: model_ladder requires supported_cameras — the claimed " <>
+            "camera count is what resolution bounds and the Apache-complete " <>
+            "invariant holds against"
         )
 
-      map when is_map(map) ->
-        acc =
-          if ladder? do
-            acc
-          else
-            Config.add_warning(
-              acc,
-              "profile #{name}: supported_cameras has no effect without model_ladder — " <>
-                "nothing reads it on a single-model profile"
-            )
-          end
-
-        acc =
-          Config.warn_unknown(
-            acc,
-            map,
-            @known_supported_keys,
-            "profile #{name} supported_cameras"
-          )
-
-        acc =
-          Enum.reduce(["min", "max"], acc, fn key, acc ->
-            Config.check(
-              acc,
-              match?(v when is_integer(v) and v > 0, Map.get(map, key)),
-              "profile #{name}: supported_cameras.#{key} must be a positive integer, " <>
-                "got #{inspect(Map.get(map, key))}"
-            )
-          end)
-
-        with min when is_integer(min) <- Map.get(map, "min"),
-             max when is_integer(max) <- Map.get(map, "max") do
-          Config.check(
-            acc,
-            min <= max,
-            "profile #{name}: supported_cameras min #{min} exceeds max #{max}"
-          )
+      max when is_integer(max) and max > 0 ->
+        if ladder? do
+          acc
         else
-          _already_reported -> acc
+          Config.add_warning(
+            acc,
+            "profile #{name}: supported_cameras has no effect without model_ladder — " <>
+              "nothing reads it on a single-model profile"
+          )
         end
 
       other ->
         Config.add_error(
           acc,
-          "profile #{name}: supported_cameras must be a {min, max} mapping, " <>
-            "got #{inspect(other)}"
+          "profile #{name}: supported_cameras must be the maximum camera count this " <>
+            "profile claims support for (a positive integer), got #{inspect(other)}"
         )
     end
   end
@@ -1124,7 +1096,7 @@ defmodule Cairn.Config.Profile do
   defp check_ladder_coverage(acc, raw, name) do
     with rungs when is_list(rungs) and rungs != [] <- Map.get(raw, "model_ladder"),
          true <- Enum.all?(rungs, &valid_rung_for_coverage?/1),
-         %{"max" => max} when is_integer(max) and max > 0 <- Map.get(raw, "supported_cameras"),
+         max when is_integer(max) and max > 0 <- Map.get(raw, "supported_cameras"),
          %{floor_fps: floor_fps} <- ladder_floor(Map.get(raw, "tier")) do
       floor_rate = effective_rate(floor_fps)
 
@@ -1151,8 +1123,8 @@ defmodule Cairn.Config.Profile do
             "profile #{name}: the non-pack rungs alone cover ~#{covered} cameras at " <>
               "tier #{Map.get(raw, "tier")}'s #{floor_fps} fps floor (largest non-pack " <>
               "budget #{Enum.max(budgets)} passes/s ÷ #{floor_rate}/s effective), but " <>
-              "supported_cameras.max claims #{max} — packs may raise accuracy, never " <>
-              "coverage (Apache-complete invariant); lower max or add a non-pack rung"
+              "supported_cameras claims #{max} — packs may raise accuracy, never " <>
+              "coverage (Apache-complete invariant); lower the claim or add a non-pack rung"
           )
       end
     else

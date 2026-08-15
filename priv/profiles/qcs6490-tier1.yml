@@ -1,0 +1,95 @@
+# Qualcomm QCS6490, tier 1 (presence detection) — the model-ladder profile.
+#
+# DRAFT: the pack-rung and yolox_tiny budgets below are provisional
+# (menu-doc arithmetic, not boundary ladder runs). D-L6 says a rung owes its
+# boundary a capacity-ladder run before this file stops being a draft; the
+# tier1-ladder phase-3 runs retire this marker.
+#
+# The ladder replaces a fixed model choice: config resolves, per load, the
+# most accurate rung whose measured engine budget covers the configured
+# fleet at tier 1's 2 fps floor (1.875/s effective on the 15 fps substream
+# grid), and derives every camera's sample_fps from the winning rung. Order
+# is paper-mAP, best first; budgets are passes/s on this board's HTP and
+# must strictly increase down the list.
+#
+# The capacity claim is dual-stream ONLY: detection reads the substream, and
+# single-stream the 5 MP Venus decode wall returns at ~4 cameras. It is also
+# the motion-gate-open worst case — the tier-1 capacity cells ran ungated,
+# so the gate buys power/thermal headroom, never extra cameras.
+#
+# experimental: true because qnn has not soaked (D-P10): a group naming this
+# profile also needs `allow_experimental: true`.
+experimental: true
+tier: 1
+backend: qnn
+model_ladder:
+  # Three pack rungs first: yolo26-family QDQ exports (AGPL — distributed as
+  # cairn-models packs, installed under the data dir, never baked into the
+  # image). Until the pack is installed each rung is skipped with a load
+  # warning; the Apache rungs below carry the full claim alone, so packs
+  # only ever raise accuracy at a fleet size, never capacity.
+  #
+  # provisional budget: menu bench p50 58.2 ms + ~1.3 ms serialization
+  # (model-menu-htp 2026-08-14) — boundary ladder run owed.
+  - model:
+      qnn: data/models/yolo26m-qdq.onnx
+    model_profile: yolo26
+    input_size: 640
+    engine_budget: 16.8
+    pack: yolo26m
+  # provisional budget: menu bench p50 37.4 ms + serialization (2026-08-07
+  # bench, same board) — boundary ladder run owed.
+  - model:
+      qnn: data/models/yolo26s-qdq.onnx
+    model_profile: yolo26
+    input_size: 640
+    engine_budget: 25.8
+    pack: yolo26s
+  # provisional budget: menu bench p50 17.7 ms + serialization (2026-08-14).
+  # Known recall flag: the 416 export's verify scores cluster at 0.506–0.513
+  # against the 0.5 floor — re-verify on real camera frames before leaning
+  # on this rung (model-menu-htp "reads").
+  - model:
+      qnn: data/models/yolo26n-416-qdq.onnx
+    model_profile: yolo26
+    input_size: 416
+    engine_budget: 52.6
+    pack: yolo26n-416
+  # The Apache rungs: baked into the image (tools/qdq-export produces the
+  # QDQ artifacts; placeholder paths, as in every shipped profile). These
+  # two alone must cover supported_cameras — the Apache-complete invariant
+  # config enforces at load.
+  #
+  # provisional budget: menu bench p50 17.0 ms + serialization (2026-08-14)
+  # — the phase-3 boundary ladder run at ~28–29 cameras is owed. Best
+  # Apache accuracy above nano (32.8 paper mAP), healthy verify scores.
+  - model:
+      qnn: models/yolox_tiny_qdq.onnx
+    model_profile: yolox
+    input_size: 416
+    engine_budget: 54.6
+  # measured budget: tier1-capacity ladder 2026-08-14 — 40 cameras at the
+  # 1.875/s effective floor (= 75.0 passes/s) delivered 100% in three runs;
+  # 44 showed ceiling onset. The engine path, not decode or RSS, binds.
+  - model:
+      qnn: models/yolox_nano_qdq.onnx
+    model_profile: yolox
+    input_size: 416
+    engine_budget: 75
+# The support claim, enforced as a bound: 40 is yolox_nano's measured reach
+# at the tier-1 floor (tier1-capacity 2026-08-14, host-side; container
+# parity re-check owed per qcs6490-profiles D-P2/D-P3). A larger fleet is
+# refused at load even though it is also past every budget.
+supported_cameras: 40
+# Venus, through ffmpeg's h264_v4l2m2m — the one decode field cairn ships
+# with a measurement behind it (spike 0.3: the live fleet concurrently at
+# 59 and 47 fps for ~2% CPU, vs ~30% of a core per camera in software).
+# Named rather than left at `auto` because on a membrane camera a named
+# decoder is a requirement: if Venus is not there, detection stops and says
+# so instead of quietly eating the CPU the models need. At substream
+# resolution decode never binds (~6.3%/cam CPU in the capacity cells).
+decoder: v4l2
+labels: models/coco.names
+# No tracking block, and none would be legal: tier 1 is presence detection
+# and its pipeline runs no tracker — config refuses a tier-1 profile that
+# says otherwise.

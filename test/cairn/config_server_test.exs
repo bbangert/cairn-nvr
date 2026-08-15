@@ -429,9 +429,7 @@ defmodule Cairn.Config.ServerTest do
           onnx: test/support/fixtures/models/stub.onnx
         input_size: 416
         engine_budget: 75
-    supported_cameras:
-      min: 1
-      max: 40
+    supported_cameras: 40
     """)
 
     from_map!(%{

@@ -127,6 +127,80 @@ The word "tier" also appears on cameras (`track:`/`record:` score
 thresholds); that is a different, older axis. This ladder is per-profile
 and therefore per-group.
 
+## `model_ladder:` — one file, a range of models
+
+A tier file can describe a MODEL LADDER instead of one model: an ordered
+rung list, most accurate first, each rung a complete model choice with a
+measured engine budget. At every config load, cairn counts the cameras
+with detection configured on the node (N — the count of configured
+cameras, never the runtime detection toggle) and resolves the first rung
+whose budget covers N at the tier's floor rate. A small fleet gets the
+most accurate model the board can afford; a growing one walks down the
+ladder; nobody configures a model, ever. `qcs6490-tier1.yml` is the
+shipped worked example.
+
+```yaml
+tier: 1                        # required — the floor rate is the tier's
+model_ladder:
+  - model:
+      qnn: data/models/yolo26m-qdq.onnx
+    model_profile: yolo26      # per-rung; omitted, the top-level one stands
+    input_size: 640            # per-rung — 640 and 416 rungs are the norm
+    engine_budget: 16.8        # measured passes/s, strictly increasing
+    pack: yolo26m              # skipped (with a warning) until installed
+  - model:
+      qnn: models/yolox_nano_qdq.onnx
+    input_size: 416
+    engine_budget: 75
+supported_cameras: 40          # the support claim, enforced as a bound
+```
+
+The rules, each refused or warned at load:
+
+* **The ladder is the model and rate authority (D-L4).** `model_ladder:`
+  is mutually exclusive with `model:`, `input_size:`, `sample_fps:` and
+  `fps_band:` — the resolved rung is the model, and each camera's
+  `sample_fps` is derived from the rung's budget: the largest nominal
+  rate between the tier floor and 10 whose *effective* demand fits.
+  Effective, because the sample gate quantizes to the frame grid — "2
+  fps" delivers 1.875/s on the 15 fps substreams the capacity numbers
+  were measured on. A fleet on substreams at a different rate shifts the
+  effective rates; the budgets assume 15.
+* **`supported_cameras:` is a claim and a bound.** It is the camera count
+  the file stands behind (measured, soak-checked provenance in the file's
+  comments), and a fleet past it is refused at load even when a rung's
+  budget would cover it — capacity arithmetic does not extend a claim
+  nobody verified.
+* **The Apache-complete invariant (D-L2).** Rungs marked `pack:` name
+  models installed separately (AGPL packs under the data dir); while the
+  artifact is absent the rung is skipped with a warning naming the pack
+  and, when it would have won, what installing it buys. The non-pack
+  rungs alone must cover `supported_cameras` — packs raise accuracy at a
+  fleet size, they never extend support, and a ladder that leans on them
+  for any camera count is refused at parse.
+* **Budgets are measurements (D-L6).** Every `engine_budget` carries a
+  provenance comment — `measured` (a boundary capacity-ladder run) or
+  `provisional` (menu arithmetic) — and a file with any provisional
+  budget says DRAFT at the top. The gate in the test suite reads the raw
+  file and refuses a shipped ladder without the notes.
+
+Two consequences worth an operator's attention:
+
+* **A fleet edit can change the model.** Adding or removing detecting
+  cameras moves N; crossing a rung boundary is a model change, and the
+  detecting cameras restart through the ordinary reload path (engine
+  first, then the cameras). Presence state rides out the restart the way
+  it does any camera restart — but expect the discontinuity when you grow
+  the fleet across a boundary.
+* **Score thresholds apply across every rung (D-L3).** Score
+  distributions shift between models — one rung's export hugs the 0.5
+  floor where another spans 0.51–0.81 — so `min_score`/`track:`/`record:`
+  values tuned on one rung behave differently on another, and the rung
+  follows fleet size. Config warns per camera when a multi-rung ladder
+  serves customized thresholds; verify them against each rung your fleet
+  can resolve. Per-rung threshold overlays are deliberately absent until
+  a measured calibration story exists.
+
 ## The menus, and where each lives in code
 
 | field | menu | where the menu lives |
@@ -175,10 +249,12 @@ runs the gates, the parity harness and the accuracy work, and it never gets a
 measured band, because nothing ships there and a number from it would describe
 hardware no deployment has. That is why `generic-ort.yml` — a migration alias
 rather than a hardware class — keeps a declared `[5, 5]` and is expected to keep
-it. Measured bands come from the QCS6490, RK3576 and RK3566 profiles, each on
-its own board, with the cpufreq governor pinned and recorded (see
+it. Measured bands come from the RK3576 and RK3566 profiles, each on its own
+board, with the cpufreq governor pinned and recorded (see
 `docs/npu-backends.md` on why an unpinned governor makes a plausible-looking
-wrong number).
+wrong number). The QCS6490 has no band to measure any more: its ladder file
+derives the rate per rung, and what it owes measurement instead is each
+rung's `engine_budget` (D-L6).
 
 `sample_fps` is optional, and **the band validates it, the band never emits
 it** (D-P4): leave `sample_fps:` unset and no `--sample-fps` flag is written
@@ -196,8 +272,8 @@ The one profile shape this paragraph does not describe is a `model_ladder:`
 profile, which may declare neither key (both are refused alongside a
 ladder): there, config load itself derives `sample_fps` from the resolved
 rung's measured budget and the fleet size, and the derived value — never a
-crate default — is what reaches the engine. The ladder gets its own section
-when the first ladder profile ships.
+crate default — is what reaches the engine. See "`model_ladder:` — one
+file, a range of models" above.
 
 ## The `tracking:` block
 
@@ -213,9 +289,10 @@ Three states, and the difference between the last two matters:
 - **key absent, block present** — the stage does not run; `bbd: false` says the
   same thing more loudly, and is worth writing where the omission would look
   like an oversight. A `tracking:` block
-  with no stage keys at all means "run nothing", which is a real choice: it is
-  how `qcs6490.yml` turns off the cold-start twin gate that every other
-  profile leaves on.
+  with no stage keys at all means "run nothing", which is a real choice — the
+  way an NMS-free profile would turn off the cold-start twin gate every
+  shipped profile leaves on (the retired `qcs6490.yml` placeholder did
+  exactly this; its tier-1 successor runs no tracker at all).
 - **block absent entirely** — the profile says nothing about tracking, and the
   camera's global `tracking.bbd`/`tracking.oru`/`tracking.ocr` booleans stand
   as they always did. A backend-only profile does not silently delist
@@ -393,10 +470,12 @@ it. Follow what the shipped four do:
 - write placeholder artifact paths (nobody else has your compiled model), and
   say what toolchain produces them;
 - say what a stage choice is grounded in — and, where it is a decision rather
-  than a measurement, say that too. `qcs6490.yml` is the worked example of the
-  awkward case: it delists the twin gate on a rule, states that the gate exists
-  because of the very same detector class, and tells an operator what to add
-  back if the trade falls the other way in their scene.
+  than a measurement, say that too;
+- for a ladder file, give every `engine_budget` its provenance (`measured`
+  from a boundary capacity-ladder run, or `provisional` with the arithmetic
+  it came from) and mark the file DRAFT while any budget is provisional —
+  the test suite refuses a shipped ladder without the notes (D-L6).
+  `qcs6490-tier1.yml` is the worked example.
 
 Changing a *shipped* profile is a behaviour change for everyone running that
 board. Adding a comment or correcting a band is cheap; changing a stage set
@@ -439,14 +518,19 @@ group is not.
 
 Four profiles in `priv/profiles/`, each with its reasoning in the file:
 
-| profile | backend | band (declared) | stages | notes |
+| profile | backend | rate | stages | notes |
 |---|---|---|---|---|
-| `generic-ort` | `ort` | 5–5 | twin gate only | today's behaviour, named; the migration target and the one non-experimental profile |
-| `rk3566-lowfps` | `rknn` | 2–4 | bbd, oru, twin gate | the low-fps set; wants `--track-floor-json` alongside it |
-| `rk3576` | `rknn` | 8–16 | bbd, oru, twin gate | same pipeline, faster board; the band is scaled from rk3566's and **unmeasured** |
-| `qcs6490` | `qnn` | 15–30 | none | NMS-free family by requirement; twin gate delisted (D-P8) |
+| `generic-ort` | `ort` | band 5–5 | twin gate only | today's behaviour, named; the migration target and the one non-experimental profile |
+| `rk3566-lowfps` | `rknn` | band 2–4 | bbd, oru, twin gate | the low-fps set; wants `--track-floor-json` alongside it |
+| `rk3576` | `rknn` | band 8–16 | bbd, oru, twin gate | same pipeline, faster board; the band is scaled from rk3566's and **unmeasured** |
+| `qcs6490-tier1` | `qnn` | derived per rung | none (tier 1 — no tracker) | the model-ladder file: five rungs, claim 40 cameras, DRAFT until the boundary runs land |
 
 Three of the four are `experimental: true` for the same blunt reason: their
-backends do not execute yet. Only `ort` runs today; `rknn` and `qnn` parse
-everywhere, and a group naming one refuses to load without your
-`allow_experimental: true`.
+backends have not proven out in soak. Only `ort` runs today; `rknn` (a stub)
+and `qnn` (executes, unsoaked) parse everywhere, and a group naming one
+refuses to load without your `allow_experimental: true`.
+
+A group that named the retired `qcs6490` placeholder now fails with
+"unknown profile" — point it at `qcs6490-tier1`. The placeholder was a
+fixed-model sketch on a backend that did not yet execute; the ladder file
+is the board's shipping config.

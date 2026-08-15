@@ -31,11 +31,14 @@ defmodule Cairn.Tracker.Stage.TwinMint do
   real objects.
 
   The default belongs to the **boolean** path. A camera whose plugin group
-  carries a hardware profile is listed by presence alone — a profile that
-  does not name `twin_mint:` delists the gate, which is what `qcs6490.yml`
-  does and why that file argues the case in its own comments: this stage
-  exists *because* an NMS-free head slipped a double box (the incident
-  above), so turning it off for one is a trade nothing has measured.
+  carries a hardware profile is listed by presence alone — a profile whose
+  `tracking:` block does not name `twin_mint:` delists the gate. No shipped
+  profile makes that trade today (the one that did, the retired `qcs6490.yml`
+  placeholder, gave way to a tier-1 file that runs no tracker at all), but
+  the tension it argued stands for any NMS-free profile an operator writes:
+  this stage exists *because* an NMS-free head slipped a double box (the
+  incident above), so turning it off for one is a trade nothing has
+  measured.
 
   ## Placement
 
