@@ -239,6 +239,7 @@ defmodule Cairn.Config do
     }
 
     {config, acc} = resolve_plugins(config, acc, declared_plugin_names(map))
+    {config, acc} = resolve_ladders(config, acc)
     {config, acc} = resolve_profiles(config, acc)
     acc = check_group_profiles(config, acc)
     acc = validate(config, acc)
@@ -689,6 +690,136 @@ defmodule Cairn.Config do
 
   defp shipped_profiles_dir, do: Application.app_dir(:cairn, "priv/profiles")
 
+  # -- ladder resolution ------------------------------------------------------
+
+  # Static, at config load/reload (D-L1): N is the count of cameras with
+  # detection *configured* — a camera naming a plugin — never the runtime
+  # detection toggle, which must not re-resolve anything (capacity sizes for
+  # the configured fleet; no flapping). Runs before `resolve_profiles/2` so
+  # the structs it lowers are the ones the groups get, and only for profiles
+  # some group actually names — an unused ladder file costs no disk probes
+  # and no warnings, like the artifact checks below.
+  #
+  # "Lowers": the selected rung's model fields and the derived sample_fps are
+  # written into the profile's own single-model fields, so everything
+  # downstream — `native_model_config/1` and its one-model-per-VM refusal,
+  # `sample_fps/2`, the artifact checks, `Cairn.Config.Server`'s resolved
+  # comparisons — reads a ladder profile as the single-model profile it
+  # resolved to. `resolved_rung` keeps the selection itself for the
+  # restart-class comparison (D-L5).
+  defp resolve_ladders(config, acc) do
+    used =
+      MapSet.new(
+        for %PluginGroup{profile: name} <- config.plugin_groups, is_binary(name), do: name
+      )
+
+    n = Enum.count(config.cameras, &(&1.plugin != nil))
+
+    {profiles, acc} =
+      Enum.map_reduce(config.profiles, acc, fn
+        {name, %Profile{model_ladder: rungs} = profile}, acc when is_list(rungs) ->
+          if MapSet.member?(used, name) do
+            {profile, acc} = resolve_ladder(profile, n, acc)
+            {{name, profile}, acc}
+          else
+            {{name, profile}, acc}
+          end
+
+        entry, acc ->
+          {entry, acc}
+      end)
+
+    {%{config | profiles: Map.new(profiles)}, acc}
+  end
+
+  defp resolve_ladder(profile, n, acc) do
+    # Parse guarantees a ladder profile's tier has a floor row.
+    floor = Profile.ladder_floor(profile.tier)
+    demand = n * Profile.effective_rate(floor.floor_fps)
+    indexed = Enum.with_index(profile.model_ladder, 1)
+
+    # D-L4: a pack rung whose artifact is not on disk is skipped, warned; a
+    # non-pack rung is always a candidate — a missing artifact there is the
+    # load error `check_ladder_artifacts/2` raises, not a silent skip.
+    {candidates, skipped} =
+      Enum.split_with(indexed, fn {rung, _index} ->
+        rung.pack == nil or File.regular?(rung_artifact(rung, profile.backend))
+      end)
+
+    fits = fn {rung, _index} -> rung.engine_budget >= demand end
+    selected = Enum.find(candidates, fits)
+    # What resolution WOULD pick were every pack installed — named in the
+    # skip warning so an operator knows which install buys accuracy now.
+    would_be = Enum.find(indexed, fits)
+
+    acc = Enum.reduce(skipped, acc, &warn_skipped_rung(&2, &1, profile, n, would_be))
+
+    case selected do
+      nil ->
+        {profile, add_error(acc, no_rung_fits(profile, n, floor, candidates))}
+
+      {rung, _index} ->
+        {lower_ladder(profile, rung, n, floor), acc}
+    end
+  end
+
+  defp rung_artifact(rung, backend), do: Map.get(rung.model, Profile.artifact_key(backend))
+
+  defp warn_skipped_rung(acc, {rung, index} = entry, profile, n, would_be) do
+    suffix =
+      if entry == would_be do
+        " — #{n} camera(s) would get this rung's model; installing the pack raises " <>
+          "their accuracy at the same capacity"
+      else
+        ""
+      end
+
+    add_warning(
+      acc,
+      "profile #{profile.name}: ladder rung #{index} (pack #{rung.pack}) skipped — " <>
+        "artifact #{rung_artifact(rung, profile.backend)} is not installed#{suffix}"
+    )
+  end
+
+  defp no_rung_fits(profile, n, floor, candidates) do
+    # Budgets increase down the list, so the last candidate is the largest;
+    # D-L2 guarantees candidates is non-empty (a non-pack rung always is one).
+    {largest, _index} = List.last(candidates)
+    floor_rate = Profile.effective_rate(floor.floor_fps)
+
+    "profile #{profile.name}: no ladder rung covers #{n} cameras at tier " <>
+      "#{profile.tier}'s #{floor.floor_fps} fps floor (#{floor_rate}/s effective) — " <>
+      "the largest installed rung (#{rung_artifact(largest, profile.backend)}) budgets " <>
+      "#{largest.engine_budget} passes/s, about #{trunc(largest.engine_budget / floor_rate)} " <>
+      "cameras. Remove cameras from this node's detecting groups or split the node"
+  end
+
+  # The derived rate (D-L4): the largest nominal fps within the tier's bounds
+  # whose EFFECTIVE demand fits the rung's budget. Chosen over
+  # `trunc(budget / n)` deliberately: the gate quantizes to the frame grid,
+  # so at 10 cameras on a 75/s budget the largest fitting nominal is 10
+  # (7.5/s effective each, exactly the measured-uniform knee), where
+  # truncation would configure 7 — which the grid degrades to 5.0/s each and
+  # a third of the measured budget goes unspent. Rounding up unguarded is the
+  # opposite failure: 20 cameras on 52.6/s would round 2.63 to a nominal 3,
+  # 3.0/s effective, 60/s demand — past the budget into the regime where
+  # throughput measurably regresses.
+  defp lower_ladder(profile, rung, n, floor) do
+    fps =
+      Enum.find(floor.cap_fps..floor.floor_fps//-1, floor.floor_fps, fn fps ->
+        n * Profile.effective_rate(fps) <= rung.engine_budget
+      end)
+
+    %{
+      profile
+      | model: rung.model,
+        model_profile: rung.model_profile || profile.model_profile,
+        input_size: rung.input_size,
+        sample_fps: fps,
+        resolved_rung: rung
+    }
+  end
+
   # The second half of the two-pass shape `resolve_plugins/3` uses for camera
   # plugin references: a group's `profile:` name becomes the parsed
   # `Cairn.Config.Profile` struct, or (typo, missing file) a config error
@@ -734,6 +865,22 @@ defmodule Cairn.Config do
   end
 
   def profile_for(%__MODULE__{}, %Camera{}), do: nil
+
+  @doc """
+  The ladder rung load-time resolution picked for a camera's profile, or
+  `nil` for a camera off the ladder path.
+
+  `Cairn.Config.Server` compares it resolved across a reload (D-L5): adding
+  or removing cameras elsewhere on the node can move N across a rung
+  boundary, which is a model change for THIS camera — restart-class, through
+  the existing engine-first reload ordering — without a single field of its
+  own having moved.
+  """
+  @spec resolved_rung(t(), Camera.t()) :: map() | nil
+  def resolved_rung(%__MODULE__{} = config, %Camera{} = cam) do
+    profile = profile_for(config, cam)
+    profile && profile.resolved_rung
+  end
 
   @doc """
   The model this node's in-VM engine should load, in
@@ -788,6 +935,7 @@ defmodule Cairn.Config do
     acc
     |> check_backend_implemented(group, profile)
     |> check_artifact(group, profile)
+    |> check_ladder_artifacts(profile)
     |> check_labels(profile)
   end
 
@@ -832,6 +980,13 @@ defmodule Cairn.Config do
   # A profile naming no artifact is refused too: a profile is a model choice
   # before it is anything else, so a group whose profile names none could
   # only ever run a model nobody named.
+  # A ladder profile that failed resolution was never lowered, so its model
+  # fields are empty by construction — the resolution error already says why,
+  # and "names no artifact" on top would send the operator at the wrong key.
+  defp check_artifact(acc, _group, %Profile{model_ladder: rungs, resolved_rung: nil})
+       when is_list(rungs),
+       do: acc
+
   defp check_artifact(acc, group, profile) do
     case Profile.artifact(profile) do
       nil ->
@@ -851,6 +1006,33 @@ defmodule Cairn.Config do
         )
     end
   end
+
+  # D-L2's disk half: pack rungs may be absent (resolution skips them, with a
+  # warning), but a non-pack rung is the shipped container's own promise, so
+  # each one gets `check_artifact/3`'s must-exist treatment — not only the
+  # selected rung, because the rung a fleet edit selects tomorrow has to be
+  # loadable then. The selected rung is skipped here: lowering already routed
+  # it through `check_artifact/3`.
+  defp check_ladder_artifacts(acc, %Profile{model_ladder: rungs} = profile)
+       when is_list(rungs) do
+    rungs
+    |> Enum.with_index(1)
+    |> Enum.filter(fn {rung, _index} -> rung.pack == nil and rung != profile.resolved_rung end)
+    |> Enum.reduce(acc, fn {rung, index}, acc ->
+      path = Map.get(rung.model, Profile.artifact_key(profile.backend))
+
+      check(
+        acc,
+        File.regular?(path),
+        "profile #{profile.name}: ladder rung #{index} model artifact #{path} does not " <>
+          "exist or is not a regular file (relative paths resolve against this node's " <>
+          "working directory) — non-pack rungs must always be loadable (Apache-complete " <>
+          "invariant)"
+      )
+    end)
+  end
+
+  defp check_ladder_artifacts(acc, _profile), do: acc
 
   # The labels file gets the artifact's treatment for the artifact's reason:
   # it is a path the engine reads against the same cwd. Absence is not an

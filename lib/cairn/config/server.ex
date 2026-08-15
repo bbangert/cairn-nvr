@@ -196,13 +196,22 @@ defmodule Cairn.Config.Server do
   # `detect_tail/4` — presence sink vs stamper/tracker/track sink), and a
   # refresh routed by the old tail would feed the new policy to a shape the
   # tier no longer means.
+  #
+  # The resolved ladder rung is the newest resolved comparison (D-L5): a
+  # fleet edit elsewhere on the node can move N across a rung boundary,
+  # which is a model change for this camera with none of its own fields
+  # moving — engine first, then the restart, the tested reload ordering.
+  # The rung's derived sample_fps rides the `sample_fps/2` row above; the
+  # rung compares as well because two rungs can derive the same clamped
+  # rate while the model differs.
   defp camera_changed?(old, new, old_cam, new_cam) do
     Map.take(old_cam, @restart_fields) != Map.take(new_cam, @restart_fields) or
       Config.windows(old, old_cam).pre != Config.windows(new, new_cam).pre or
       Config.tracker(old, old_cam) != Config.tracker(new, new_cam) or
       Config.sample_fps(old, old_cam) != Config.sample_fps(new, new_cam) or
       Config.policy(old, old_cam).max_live_tracks != Config.policy(new, new_cam).max_live_tracks or
-      Map.get(Config.policy(old, old_cam), :tier) != Map.get(Config.policy(new, new_cam), :tier)
+      Map.get(Config.policy(old, old_cam), :tier) != Map.get(Config.policy(new, new_cam), :tier) or
+      Config.resolved_rung(old, old_cam) != Config.resolved_rung(new, new_cam)
   end
 
   # Everything else the running camera was handed: the camera struct itself

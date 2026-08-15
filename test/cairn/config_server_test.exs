@@ -271,6 +271,45 @@ defmodule Cairn.Config.ServerTest do
              ) == %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
     end
 
+    test "a fleet edit that crosses a rung boundary restarts the detecting cameras (D-L5)" do
+      # None of the surviving cameras' own fields move; N does — and the rung
+      # resolution moves with it. Both counts here derive the same floor
+      # sample_fps (8 × 1.875 = 15 fits the 17 budget; 26 × 1.875 = 48.75
+      # needs the 75 rung, and 26 × effective(3) = 78 > 75 keeps it at the
+      # floor), so the restart is carried by the resolved-rung comparison
+      # alone — the discriminating case for having it.
+      old = ladder_config(8)
+      new = ladder_config(26)
+
+      assert Config.sample_fps(old, hd(old.cameras)) == 2
+      assert Config.sample_fps(new, hd(new.cameras)) == 2
+
+      diff = Config.Server.diff_cameras(old, new)
+      assert diff.changed == Enum.map(1..8, &"cam_0#{&1}")
+      assert diff.refreshed == []
+      assert length(diff.added) == 18
+    end
+
+    test "a fleet edit that only moves the derived rate restarts through the fps row" do
+      # Same rung (17 budget holds 2 and 8 cameras), different derived
+      # sample_fps (10 at 2 cameras, the floor 2 at 8) — the existing
+      # resolved sample_fps comparison carries it (D-L5's rider).
+      old = ladder_config(2)
+      new = ladder_config(8)
+
+      assert Config.resolved_rung(old, hd(old.cameras)) ==
+               Config.resolved_rung(new, hd(new.cameras))
+
+      diff = Config.Server.diff_cameras(old, new)
+      assert diff.changed == ["cam_01", "cam_02"]
+      assert diff.refreshed == []
+    end
+
+    test "an unchanged ladder fleet reloads as a no-op" do
+      assert Config.Server.diff_cameras(ladder_config(8), ladder_config(8)) ==
+               %{added: [], removed: [], changed: [], refreshed: []}
+    end
+
     test "a camera edited both ways is restarted, not refreshed" do
       assert camera_diff(%{"rtsp_url" => "rtsp://h/2", "stationary_after_ms" => 20_000}) ==
                %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
@@ -357,5 +396,42 @@ defmodule Cairn.Config.ServerTest do
   defp from_map!(map) do
     {:ok, config, _warnings} = Config.from_map(map)
     config
+  end
+
+  # A two-rung tier-1 ladder (budgets 17 and 75) with `n` detecting cameras,
+  # for the D-L5 restart-classification cases. One profile dir per call —
+  # `diff_cameras/2` compares two full configs, not two files.
+  defp ladder_config(n) do
+    dir = Path.join(System.tmp_dir!(), "cairn_srv_ladder_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf(dir) end)
+
+    File.write!(Path.join(dir, "ladder.yml"), """
+    tier: 1
+    model_profile: yolox
+    model_ladder:
+      - model:
+          onnx: test/support/fixtures/models/stub.onnx
+        input_size: 640
+        engine_budget: 17
+      - model:
+          onnx: test/support/fixtures/models/stub.onnx
+        input_size: 416
+        engine_budget: 75
+    supported_cameras:
+      min: 1
+      max: 40
+    """)
+
+    from_map!(%{
+      "data_dir" => "tmp/cfg_srv_test",
+      "profile_dirs" => [dir],
+      "plugins" => %{"det" => %{"profile" => "ladder"}},
+      "cameras" =>
+        Enum.map(1..n//1, fn i ->
+          id = "cam_" <> String.pad_leading(Integer.to_string(i), 2, "0")
+          %{"id" => id, "rtsp_url" => "rtsp://h/#{i}", "plugin" => "det"}
+        end)
+    })
   end
 end

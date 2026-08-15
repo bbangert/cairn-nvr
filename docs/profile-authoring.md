@@ -192,6 +192,13 @@ expressing a choice. A profile with `fps_band:` and no `sample_fps:` is
 unaffected either way: none of the four board profiles cairn ships sets
 `sample_fps:`, and their bands keep emitting nothing.
 
+The one profile shape this paragraph does not describe is a `model_ladder:`
+profile, which may declare neither key (both are refused alongside a
+ladder): there, config load itself derives `sample_fps` from the resolved
+rung's measured budget and the fleet size, and the derived value — never a
+crate default — is what reaches the engine. The ladder gets its own section
+when the first ladder profile ships.
+
 ## The `tracking:` block
 
 The block is the stage list, and it expresses **presence, not order**: a stage

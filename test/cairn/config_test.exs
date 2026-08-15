@@ -1771,6 +1771,423 @@ defmodule Cairn.ConfigTest do
     end
   end
 
+  describe "model ladder" do
+    # An installed pack artifact only has to be a regular file at the path —
+    # config load never opens it — so any fixture file stands in.
+    @installed_pack "test/support/fixtures/models/stub.rknn"
+    @absent_pack "test/support/fixtures/models/no-such-pack.onnx"
+    @stub_names "test/support/fixtures/models/stub.names"
+
+    # Three rungs bracketing the resolution matrix: an accurate 17-budget
+    # Apache rung, a 26-budget pack rung (absent by default), and the
+    # 75-budget capacity rung — coverage 75 / 1.875 = 40 = the declared max.
+    defp ladder_yaml(opts \\ []) do
+      """
+      tier: 1
+      model_profile: yolox
+      labels: #{@stub_names}
+      model_ladder:
+        - model:
+            onnx: #{@stub_onnx}
+          model_profile: yolov8
+          input_size: 640
+          engine_budget: 17
+        - model:
+            onnx: #{Keyword.get(opts, :pack_model, @absent_pack)}
+          input_size: 640
+          engine_budget: 26
+          pack: yolo26s
+        - model:
+            onnx: #{@stub_onnx}
+          input_size: 416
+          engine_budget: 75
+      supported_cameras:
+        min: 1
+        max: 40
+      """
+    end
+
+    defp ladder_map(n, dir) do
+      base_map()
+      |> Map.put("profile_dirs", [dir])
+      |> Map.put("plugins", %{"det" => %{"profile" => "ladder"}})
+      |> Map.put(
+        "cameras",
+        Enum.map(1..n//1, fn i ->
+          %{"id" => "cam_#{i}", "rtsp_url" => "rtsp://h/#{i}", "plugin" => "det"}
+        end)
+      )
+    end
+
+    defp load_ladder(n, opts \\ []) do
+      dir = tmp_profile_dir("ladder", ladder_yaml(opts))
+      Config.from_map(ladder_map(n, dir))
+    end
+
+    defp resolved!(n, opts \\ []) do
+      assert {:ok, config, warnings} = load_ladder(n, opts)
+      [%{profile: profile}] = config.plugin_groups
+      {config, profile, warnings}
+    end
+
+    test "a small fleet resolves the most accurate rung at the nominal cap" do
+      {config, profile, _warnings} = resolved!(2)
+
+      assert profile.resolved_rung.engine_budget == 17
+      # Lowered: the rung's fields are what everything downstream reads —
+      # the rung's own model_profile outranks the profile-level fallback.
+      assert profile.input_size == 640
+      assert profile.model_profile == "yolov8"
+      # 2 × 7.5/s effective = 15 ≤ 17: the cap holds.
+      assert profile.sample_fps == 10
+      assert Config.sample_fps(config, hd(config.cameras)) == 10
+
+      assert Config.native_model_config(config) ==
+               {:ok,
+                %{
+                  model: @stub_onnx,
+                  model_profile: "yolov8",
+                  input_size: 640,
+                  labels: @stub_names,
+                  sample_fps: 10,
+                  backend: "ort"
+                }}
+    end
+
+    test "growing demand derives a lower rate before it leaves the rung" do
+      # 8 × 1.875 = 15 ≤ 17 still fits the accurate rung, but only at the
+      # floor: every intermediate nominal (3..10) quantizes to an effective
+      # demand past 17/s on the 15 fps grid.
+      {_config, profile, _warnings} = resolved!(8)
+
+      assert profile.resolved_rung.engine_budget == 17
+      assert profile.sample_fps == 2
+    end
+
+    test "an absent pack rung is skipped with a warning naming the pack" do
+      # 10 × 1.875 = 18.75: past the 17 rung, and the 26-budget pack rung
+      # would take it — absent, so resolution falls to the 75 rung and the
+      # warning says what installing the pack buys.
+      {_config, profile, warnings} = resolved!(10)
+
+      assert profile.resolved_rung.engine_budget == 75
+      assert profile.input_size == 416
+      # Rung 3 names no model_profile of its own: profile-level fallback.
+      assert profile.model_profile == "yolox"
+
+      assert Enum.any?(
+               warnings,
+               &(&1 =~ "ladder rung 2 (pack yolo26s) skipped" and
+                   &1 =~ "10 camera(s) would get this rung's model")
+             )
+    end
+
+    test "a skipped pack rung that would not be selected is still warned, without the claim" do
+      # At 2 cameras the accurate Apache rung wins outright; the pack could
+      # not change the selection, and the warning must not say it would.
+      {_config, _profile, warnings} = resolved!(2)
+
+      warning = Enum.find(warnings, &(&1 =~ "ladder rung 2 (pack yolo26s) skipped"))
+      assert warning
+      refute warning =~ "would get"
+    end
+
+    test "the knee: ten cameras on the 75 budget derive the nominal cap, not a truncation" do
+      # 10 × effective(10) = 10 × 7.5 = 75.0 — exactly the measured-uniform
+      # ceiling cell. trunc(75/10) = 7 would quantize to 5.0/s effective and
+      # leave a third of the budget unspent.
+      {_config, profile, _warnings} = resolved!(10)
+      assert profile.sample_fps == 10
+    end
+
+    test "an installed pack rung is an ordinary candidate" do
+      {_config, profile, warnings} = resolved!(10, pack_model: @installed_pack)
+
+      assert profile.resolved_rung.pack == "yolo26s"
+      assert profile.resolved_rung.engine_budget == 26
+      assert profile.input_size == 640
+      assert profile.sample_fps == 2
+      refute Enum.any?(warnings, &(&1 =~ "skipped"))
+    end
+
+    test "the declared boundary fits exactly — budgets divide against effective rates" do
+      # 40 × 1.875 = 75.0 ≤ 75: the measured claim. Nominal arithmetic
+      # (40 × 2 = 80) would refuse the fleet the campaign measured clean.
+      {_config, profile, _warnings} = resolved!(40)
+
+      assert profile.resolved_rung.engine_budget == 75
+      assert profile.sample_fps == 2
+    end
+
+    test "past the largest rung the load fails naming N and the rung's reach" do
+      assert {:error, errors} = load_ladder(41)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "no ladder rung covers 41 cameras" and
+                   &1 =~ "75 passes/s" and &1 =~ "about 40 cameras")
+             )
+    end
+
+    test "N counts cameras with detection configured, not the fleet (D-L1)" do
+      # 41 cameras, one of them plugin-less: N = 40 still fits.
+      dir = tmp_profile_dir("ladder", ladder_yaml())
+
+      map =
+        update_in(ladder_map(41, dir), ["cameras", Access.at(0)], &Map.delete(&1, "plugin"))
+
+      assert {:ok, config, _warnings} = Config.from_map(map)
+      [%{profile: profile}] = config.plugin_groups
+      assert profile.resolved_rung.engine_budget == 75
+    end
+
+    test "two groups on one ladder profile agree — one resolution, one model" do
+      dir = tmp_profile_dir("ladder", ladder_yaml())
+
+      map =
+        ladder_map(2, dir)
+        |> Map.put("plugins", %{
+          "a" => %{"profile" => "ladder"},
+          "b" => %{"profile" => "ladder"}
+        })
+        |> put_in(["cameras", Access.at(0), "plugin"], "a")
+        |> put_in(["cameras", Access.at(1), "plugin"], "b")
+
+      assert {:ok, config, _warnings} = Config.from_map(map)
+      assert {:ok, %{model: @stub_onnx, input_size: 640}} = Config.native_model_config(config)
+    end
+
+    test "a ladder group and a disagreeing single-model group refuse as today (risk #1)" do
+      dir = tmp_profile_dir("ladder", ladder_yaml())
+
+      File.write!(Path.join(dir, "solo.yml"), """
+      model:
+        onnx: #{@stub_onnx}
+      model_profile: yolox
+      input_size: 416
+      labels: #{@stub_names}
+      """)
+
+      map =
+        ladder_map(2, dir)
+        |> Map.put("plugins", %{
+          "det" => %{"profile" => "ladder"},
+          "solo" => %{"profile" => "solo"}
+        })
+        |> put_in(["cameras", Access.at(1), "plugin"], "solo")
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "different models (ladder, solo)"))
+    end
+
+    test "an unused ladder profile costs no probes, no warnings, no resolution" do
+      # The pack artifact is absent and rung 3 exists only on disk checks a
+      # used profile would run — no group names it, so nothing fires.
+      dir = tmp_profile_dir("ladder", ladder_yaml())
+      map = Map.put(base_map(), "profile_dirs", [dir])
+
+      assert {:ok, config, []} = Config.from_map(map)
+      assert config.profiles["ladder"].resolved_rung == nil
+    end
+
+    test "a missing non-pack rung artifact fails the load even when unselected (D-L2)" do
+      # Two cameras select rung 1; rung 3's artifact is gone. A fleet edit
+      # could select it tomorrow, so it must be loadable today.
+      yaml =
+        String.replace(
+          ladder_yaml(),
+          "- model:\n      onnx: #{@stub_onnx}\n    input_size: 416",
+          "- model:\n      onnx: models/gone.onnx\n    input_size: 416"
+        )
+
+      dir = tmp_profile_dir("ladder", yaml)
+
+      assert {:error, errors} = Config.from_map(ladder_map(2, dir))
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "ladder rung 3 model artifact models/gone.onnx does not exist")
+             )
+    end
+
+    # -- parse refusals -----------------------------------------------------
+
+    defp ladder_errors(yaml) do
+      dir = tmp_profile_dir("ladder", yaml)
+      assert {:error, errors} = Config.from_map(ladder_map(1, dir))
+      errors
+    end
+
+    test "the ladder is mutually exclusive with the single-model fields, named together" do
+      errors =
+        ladder_errors("""
+        #{ladder_yaml()}
+        model:
+          onnx: #{@stub_onnx}
+        sample_fps: 5
+        input_size: 640
+        """)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "model_ladder is mutually exclusive with model, sample_fps, input_size")
+             )
+    end
+
+    test "a ladder without a tier is refused — resolution needs the floor" do
+      errors = ladder_errors(String.replace(ladder_yaml(), "tier: 1\n", ""))
+      assert Enum.any?(errors, &(&1 =~ "model_ladder requires tier:"))
+    end
+
+    test "a tier-2 ladder is refused until its rungs have a measured bar" do
+      errors = ladder_errors(String.replace(ladder_yaml(), "tier: 1", "tier: 2"))
+      assert Enum.any?(errors, &(&1 =~ "model_ladder is not available at tier 2"))
+    end
+
+    test "budgets that fail to increase are refused naming both rungs" do
+      errors =
+        ladder_errors(String.replace(ladder_yaml(), "engine_budget: 26", "engine_budget: 17"))
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "strictly increasing" and &1 =~ "rung 2 budgets 17 after 17")
+             )
+    end
+
+    test "a rung without this backend's artifact key is refused" do
+      errors =
+        ladder_errors(
+          String.replace(ladder_yaml(), "onnx: #{@absent_pack}", "rknn: #{@absent_pack}")
+        )
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "rung 2 names no model.onnx artifact for this profile's ort backend")
+             )
+    end
+
+    test "a rung without input_size is refused" do
+      errors = ladder_errors(String.replace(ladder_yaml(), "    input_size: 416\n", ""))
+      assert Enum.any?(errors, &(&1 =~ "model_ladder rung 3 must declare input_size"))
+    end
+
+    test "a rung's engine_budget must be a positive measured number" do
+      errors =
+        ladder_errors(String.replace(ladder_yaml(), "engine_budget: 75", ~s(engine_budget: "75")))
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "rung 3 engine_budget must be a positive number of measured passes/s")
+             )
+    end
+
+    test "a non-string pack is refused" do
+      errors = ladder_errors(String.replace(ladder_yaml(), "pack: yolo26s", "pack: 5"))
+      assert Enum.any?(errors, &(&1 =~ "rung 2 pack must be a pack name string, got 5"))
+    end
+
+    test "a rung's unknown model_profile is refused naming the menu" do
+      errors =
+        ladder_errors(
+          String.replace(ladder_yaml(), "model_profile: yolov8", "model_profile: yolo99")
+        )
+
+      assert Enum.any?(errors, &(&1 =~ ~s(rung 1 unknown model_profile "yolo99")))
+    end
+
+    test "an empty ladder is refused" do
+      errors =
+        ladder_errors("""
+        tier: 1
+        model_ladder: []
+        supported_cameras:
+          min: 1
+          max: 40
+        """)
+
+      assert Enum.any?(errors, &(&1 =~ "model_ladder must be a non-empty list of rungs"))
+    end
+
+    test "a ladder without supported_cameras is refused — the invariant needs the range" do
+      errors =
+        ladder_errors(String.replace(ladder_yaml(), ~r/supported_cameras:\n.*\n.*\n/, ""))
+
+      assert Enum.any?(errors, &(&1 =~ "model_ladder requires supported_cameras"))
+    end
+
+    test "supported_cameras with min above max is refused" do
+      errors = ladder_errors(String.replace(ladder_yaml(), "min: 1", "min: 50"))
+      assert Enum.any?(errors, &(&1 =~ "supported_cameras min 50 exceeds max 40"))
+    end
+
+    test "supported_cameras on a single-model profile warns — nothing reads it (inert)" do
+      dir =
+        tmp_profile_dir("solo", """
+        model:
+          onnx: #{@stub_onnx}
+        supported_cameras:
+          min: 1
+          max: 4
+        """)
+
+      map =
+        base_map()
+        |> Map.put("profile_dirs", [dir])
+        |> Map.put("plugins", %{"det" => %{"profile" => "solo"}})
+        |> put_plugin(0, "det")
+
+      assert {:ok, _config, warnings} = Config.from_map(map)
+      assert Enum.any?(warnings, &(&1 =~ "supported_cameras has no effect without model_ladder"))
+    end
+
+    test "a ladder leaning on packs for coverage is refused (Apache-complete, D-L2)" do
+      # Largest non-pack budget 17 covers trunc(17 / 1.875) = 9 cameras;
+      # claiming 40 makes the 75-budget pack rung load-bearing.
+      errors =
+        ladder_errors("""
+        tier: 1
+        model_profile: yolox
+        labels: #{@stub_names}
+        model_ladder:
+          - model:
+              onnx: #{@stub_onnx}
+            input_size: 640
+            engine_budget: 17
+          - model:
+              onnx: #{@stub_onnx}
+            input_size: 416
+            engine_budget: 75
+            pack: nano-pack
+        supported_cameras:
+          min: 1
+          max: 40
+        """)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "non-pack rungs alone cover ~9 cameras" and &1 =~ "Apache-complete")
+             )
+    end
+
+    test "a ladder of only pack rungs is refused outright" do
+      errors =
+        ladder_errors("""
+        tier: 1
+        model_ladder:
+          - model:
+              onnx: #{@stub_onnx}
+            input_size: 416
+            engine_budget: 75
+            pack: nano
+        supported_cameras:
+          min: 1
+          max: 40
+        """)
+
+      assert Enum.any?(errors, &(&1 =~ "every model_ladder rung is a pack rung"))
+    end
+  end
+
   describe "backend capability table" do
     alias Cairn.Config.Profile
 
