@@ -746,6 +746,22 @@ defmodule Cairn.Config do
     {%{config | profiles: Map.new(profiles)}, acc}
   end
 
+  # The claim bound first: `supported_cameras` is what the file stands
+  # behind (soak, measurement provenance), so a fleet past it is refused
+  # even when a rung's budget would cover it — capacity arithmetic does not
+  # extend a claim nobody verified. Refused before the skip/selection pass:
+  # pack warnings about a fleet the profile refuses would be noise.
+  defp resolve_ladder(%Profile{supported_cameras: max} = profile, n, acc)
+       when is_integer(max) and n > max do
+    {profile,
+     add_error(
+       acc,
+       "profile #{profile.name}: #{n} cameras exceed supported_cameras #{max} — the " <>
+         "claim is this file's verified support envelope. Remove cameras from this " <>
+         "node's detecting groups, split the node, or raise the claim with measurements"
+     )}
+  end
+
   defp resolve_ladder(profile, n, acc) do
     # Parse guarantees a ladder profile's tier has a floor row.
     floor = Profile.ladder_floor(profile.tier)
@@ -796,6 +812,10 @@ defmodule Cairn.Config do
   end
 
   defp no_rung_fits(profile, n, floor, candidates) do
+    # Backstop, not the working error: the claim bound above refuses n past
+    # supported_cameras, and the Apache-complete invariant guarantees the
+    # largest non-pack budget covers the claim, so for n inside it a rung
+    # always fits. Kept against arithmetic drift rather than reachability.
     # Budgets increase down the list, so the last candidate is the largest;
     # D-L2 guarantees candidates is non-empty (a non-pack rung always is one).
     {largest, _index} = List.last(candidates)
@@ -1097,6 +1117,42 @@ defmodule Cairn.Config do
     |> validate_native_model(config)
     |> validate_camera_profiles(config)
     |> validate_gate_ownership(config)
+    |> warn_ladder_thresholds(config)
+  end
+
+  # D-L3, the v1 score-semantics stance: score distributions shift across
+  # rungs (26n@416 hugs the 0.5 floor where 26m spans 0.51–0.81), so operator
+  # thresholds tuned on one rung behave differently on another — and a ladder
+  # re-resolves its rung as the fleet grows. No per-rung overlay exists yet
+  # (one invented without a measured calibration story would be numbers
+  # nobody measured), so v1 warns and the authoring guide documents. Only a
+  # ladder of two or more rungs can shift; "custom" is the camera having said
+  # something itself — an explicit value indistinguishable from the default
+  # reads as the default, which is the right side to miss on for an advisory.
+  defp warn_ladder_thresholds(acc, config) do
+    defaults = %Camera{}
+
+    config.cameras
+    |> Enum.map(fn cam ->
+      customs =
+        for key <- [:min_score, :track, :record],
+            Map.fetch!(cam, key) != Map.fetch!(defaults, key),
+            do: key
+
+      {cam, customs}
+    end)
+    |> Enum.filter(fn {cam, customs} ->
+      customs != [] and match?(%Profile{model_ladder: [_, _ | _]}, profile_for(config, cam))
+    end)
+    |> Enum.reduce(acc, fn {cam, customs}, acc ->
+      add_warning(
+        acc,
+        "camera #{cam.id}: #{Enum.join(customs, "/")} thresholds on a model-ladder " <>
+          "profile apply across every rung — score distributions shift between " <>
+          "models, and the resolved model follows fleet size; verify these " <>
+          "thresholds against each rung your fleet can resolve"
+      )
+    end)
   end
 
   # D-S4, the one contradiction config polices between the tiers and the

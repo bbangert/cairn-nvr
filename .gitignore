@@ -55,4 +55,4 @@ config.yml
 
 # Claude Code working files (plans, reviews, solutions) — local only.
 .claude/
-profiles/
+/profiles/

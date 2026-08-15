@@ -33,12 +33,15 @@ it. Details in `docs/architecture.md`.
   models are a hardware-profile edit, not code. The retired external
   plugin protocol is archived at
   [`docs/archive/plugin-contract.md`](docs/archive/plugin-contract.md).
-- **Hardware profiles**: one YAML file per board naming the model, the
-  family, the inference backend, the expected fps band and the tracker
-  stages that go with it. A plugin group names its profile and config load
-  expands it into the engine's model config and the host's tracking
-  policy, so the two halves cannot disagree. Four ship in
-  `priv/profiles/`; writing one for a new board needs no code change —
+- **Hardware profiles**: one YAML file per board naming the model (or a
+  model *ladder* — an ordered rung list config resolves against the fleet
+  size, picking the most accurate model whose measured budget covers the
+  configured cameras and deriving each camera's sample rate from it), the
+  family, the inference backend, the rate (a declared fps band, or derived
+  per rung) and the tracker stages that go with it. A plugin group names
+  its profile and config load expands it into the engine's model config and
+  the host's tracking policy, so the two halves cannot disagree. Four ship
+  in `priv/profiles/`; writing one for a new board needs no code change —
   see [`docs/profile-authoring.md`](docs/profile-authoring.md).
 - **Retention**: per-label day counts, plus emergency cleanup that
   deletes oldest events when disk runs low.
@@ -58,7 +61,8 @@ renders it read-only and can hot-reload it (`/config` → Reload — added and
 removed cameras are started and stopped; a change that reaches a subprocess
 or the ring (`rtsp_url`, `substream_url`, `plugin`, `min_score`, `ingest`,
 `transcode`, `extra_ffmpeg_args`, `motion_json`, the pre-event window, the
-resolved tier) restarts that camera, and
+resolved tier, a ladder profile's resolved rung or derived rate) restarts
+that camera, and
 everything else — the `track:` / `record:` tiers, the post/max windows, the
 tracking bounds, retention — is applied to the running camera without
 cutting its stream or its live tracks. Invalid files are rejected with the

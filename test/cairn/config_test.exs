@@ -1801,9 +1801,7 @@ defmodule Cairn.ConfigTest do
             onnx: #{@stub_onnx}
           input_size: 416
           engine_budget: 75
-      supported_cameras:
-        min: 1
-        max: 40
+      supported_cameras: 40
       """
     end
 
@@ -1919,13 +1917,16 @@ defmodule Cairn.ConfigTest do
       assert profile.sample_fps == 2
     end
 
-    test "past the largest rung the load fails naming N and the rung's reach" do
+    test "past the claim the load fails naming N and the envelope" do
+      # The claim bound speaks, not budget arithmetic: with an honest file
+      # (coverage ≥ claim, enforced at parse) the bound is always the first
+      # wall a growing fleet hits; `no_rung_fits` survives only as the
+      # arithmetic-drift backstop behind it.
       assert {:error, errors} = load_ladder(41)
 
       assert Enum.any?(
                errors,
-               &(&1 =~ "no ladder rung covers 41 cameras" and
-                   &1 =~ "75 passes/s" and &1 =~ "about 40 cameras")
+               &(&1 =~ "41 cameras exceed supported_cameras 40" and &1 =~ "support envelope")
              )
     end
 
@@ -1995,9 +1996,7 @@ defmodule Cairn.ConfigTest do
               onnx: #{@stub_onnx}
             input_size: 416
             engine_budget: 4
-        supported_cameras:
-          min: 1
-          max: 2
+        supported_cameras: 2
         """)
 
       File.write!(Path.join(dir, "solo.yml"), """
@@ -2016,6 +2015,59 @@ defmodule Cairn.ConfigTest do
 
       assert {:ok, config, []} = Config.from_map(map)
       assert config.profiles["mini"].resolved_rung == nil
+    end
+
+    test "custom thresholds on a multi-rung ladder warn per camera (D-L3)" do
+      # Score distributions shift between rungs and the rung follows fleet
+      # size, so thresholds tuned once apply to models the operator never
+      # tuned them on. cam_1 spoke (track tier); cam_2 did not — the warning
+      # is per-camera and names what was customized.
+      dir = tmp_profile_dir("ladder", ladder_yaml())
+
+      map =
+        update_in(ladder_map(2, dir), ["cameras", Access.at(0)], fn cam ->
+          cam
+          |> Map.put("track", %{"person" => %{"min_score" => 0.7}})
+          |> Map.put("record", %{"person" => %{"min_score" => 0.8}})
+        end)
+
+      assert {:ok, _config, warnings} = Config.from_map(map)
+
+      assert Enum.any?(
+               warnings,
+               &(&1 =~ "camera cam_1: track/record thresholds on a model-ladder profile" and
+                   &1 =~ "shift between models")
+             )
+
+      refute Enum.any?(warnings, &(&1 =~ "camera cam_2: " and &1 =~ "model-ladder profile"))
+    end
+
+    test "default thresholds on a ladder stay quiet, as does a single-model profile" do
+      {_config, _profile, warnings} = resolved!(2)
+      refute Enum.any?(warnings, &(&1 =~ "model-ladder profile"))
+
+      # The other quiet half the name claims: custom thresholds on a
+      # SINGLE-MODEL profile are not the ladder's business.
+      dir = tmp_profile_dir("ladder", ladder_yaml())
+
+      File.write!(Path.join(dir, "solo.yml"), """
+      model:
+        onnx: #{@stub_onnx}
+      model_profile: yolox
+      labels: #{@stub_names}
+      """)
+
+      map =
+        ladder_map(1, dir)
+        |> Map.put("plugins", %{"det" => %{"profile" => "solo"}})
+        |> update_in(["cameras", Access.at(0)], fn cam ->
+          cam
+          |> Map.put("track", %{"person" => %{"min_score" => 0.7}})
+          |> Map.put("record", %{"person" => %{"min_score" => 0.8}})
+        end)
+
+      assert {:ok, _config, warnings} = Config.from_map(map)
+      refute Enum.any?(warnings, &(&1 =~ "model-ladder profile"))
     end
 
     test "an unused ladder profile costs no probes, no warnings, no resolution" do
@@ -2143,24 +2195,50 @@ defmodule Cairn.ConfigTest do
         ladder_errors("""
         tier: 1
         model_ladder: []
-        supported_cameras:
-          min: 1
-          max: 40
+        supported_cameras: 40
         """)
 
       assert Enum.any?(errors, &(&1 =~ "model_ladder must be a non-empty list of rungs"))
     end
 
-    test "a ladder without supported_cameras is refused — the invariant needs the range" do
-      errors =
-        ladder_errors(String.replace(ladder_yaml(), ~r/supported_cameras:\n.*\n.*\n/, ""))
+    test "a ladder without supported_cameras is refused — the bound needs the claim" do
+      errors = ladder_errors(String.replace(ladder_yaml(), ~r/supported_cameras: 40\n/, ""))
 
       assert Enum.any?(errors, &(&1 =~ "model_ladder requires supported_cameras"))
     end
 
-    test "supported_cameras with min above max is refused" do
-      errors = ladder_errors(String.replace(ladder_yaml(), "min: 1", "min: 50"))
-      assert Enum.any?(errors, &(&1 =~ "supported_cameras min 50 exceeds max 40"))
+    test "a {min, max} mapping is refused — the claim is a bare count" do
+      # The design sketch's mapping shape; min never grew semantics and was
+      # dropped rather than enforced, so the mapping fails loudly instead of
+      # half-parsing.
+      errors =
+        ladder_errors(
+          String.replace(ladder_yaml(), "supported_cameras: 40", "supported_cameras:\n  max: 40")
+        )
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "supported_cameras must be the maximum camera count")
+             )
+    end
+
+    test "a fleet past the claim is refused even with budget to spare" do
+      # 30 cameras exceed a claim of 20 although the 75 rung covers 40 —
+      # capacity arithmetic does not extend a claim nobody verified. Coverage
+      # would flag 20-vs-40 the other way? No: coverage only demands the
+      # non-pack rungs REACH the claim, and 40 ≥ 20 passes.
+      dir =
+        tmp_profile_dir(
+          "ladder",
+          String.replace(ladder_yaml(), "supported_cameras: 40", "supported_cameras: 20")
+        )
+
+      assert {:error, errors} = Config.from_map(ladder_map(30, dir))
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "30 cameras exceed supported_cameras 20" and &1 =~ "support envelope")
+             )
     end
 
     test "supported_cameras on a single-model profile warns — nothing reads it (inert)" do
@@ -2168,9 +2246,7 @@ defmodule Cairn.ConfigTest do
         tmp_profile_dir("solo", """
         model:
           onnx: #{@stub_onnx}
-        supported_cameras:
-          min: 1
-          max: 4
+        supported_cameras: 4
         """)
 
       map =
@@ -2201,9 +2277,7 @@ defmodule Cairn.ConfigTest do
             input_size: 416
             engine_budget: 75
             pack: nano-pack
-        supported_cameras:
-          min: 1
-          max: 40
+        supported_cameras: 40
         """)
 
       assert Enum.any?(
@@ -2228,9 +2302,7 @@ defmodule Cairn.ConfigTest do
             input_size: 640
             engine_budget: 17
             pack:
-        supported_cameras:
-          min: 1
-          max: 40
+        supported_cameras: 40
         """)
 
       assert Enum.any?(
@@ -2248,9 +2320,7 @@ defmodule Cairn.ConfigTest do
         model:
           onnx: #{@stub_onnx}
         model_ladder:
-        supported_cameras:
-          min: 1
-          max: 4
+        supported_cameras: 4
         """)
 
       assert {:ok, config, warnings} = Config.from_map(ladder_map(1, dir))
@@ -2268,9 +2338,7 @@ defmodule Cairn.ConfigTest do
             input_size: 416
             engine_budget: 75
             pack: nano
-        supported_cameras:
-          min: 1
-          max: 40
+        supported_cameras: 40
         """)
 
       assert Enum.any?(errors, &(&1 =~ "every model_ladder rung is a pack rung"))
@@ -2454,15 +2522,20 @@ defmodule Cairn.ConfigTest do
 
       assert Enum.sort(Map.keys(config.profiles)) == [
                "generic-ort",
-               "qcs6490",
+               "qcs6490-tier1",
                "rk3566-lowfps",
                "rk3576"
              ]
 
-      # Every band is declared rather than measured, but every profile has one.
+      # Every single-model profile declares a band; a ladder profile cannot
+      # (the ladder is the rate authority, D-L4) and derives instead.
       for {_name, profile} <- config.profiles do
-        assert [min, max] = profile.fps_band
-        assert min > 0 and min <= max
+        if profile.model_ladder do
+          assert profile.fps_band == nil
+        else
+          assert [min, max] = profile.fps_band
+          assert min > 0 and min <= max
+        end
       end
     end
 
@@ -2492,28 +2565,82 @@ defmodule Cairn.ConfigTest do
       end
     end
 
-    test "qcs6490 is NMS-free with every stage delisted, twin gate included" do
+    test "qcs6490-tier1 is the shipped ladder: tier 1, Apache-complete, claim 40" do
       assert {:ok, config, []} = Config.from_map(base_map())
-      profile = config.profiles["qcs6490"]
+      profile = config.profiles["qcs6490-tier1"]
 
-      assert profile.experimental
+      assert profile.experimental, "qnn has not soaked"
       assert profile.backend == "qnn"
-      assert profile.model_profile == "yolov10"
-      # Present-but-empty is the presence-semantics half that matters here: the
-      # block speaks, and what it says is "nothing runs" (D-P8).
-      assert profile.stages == %{}
+      assert profile.tier == 1
+      assert profile.supported_cameras == 40
+      # Tier 1 runs no tracker, so the file says nothing about tracking —
+      # the absent-block half of the presence rule.
+      assert profile.stages == nil
+
+      # Three pack rungs (yolo26 family), two Apache rungs (yolox) — the
+      # Apache tail carries the claim alone, and the parse-time invariant
+      # already refused any file where it could not. Budgets strictly
+      # increase; nano's 75 is the one measured number until phase 3.
+      assert [m, s, n416, tiny, nano] = profile.model_ladder
+      assert Enum.map([m, s, n416], & &1.pack) == ["yolo26m", "yolo26s", "yolo26n-416"]
+      assert tiny.pack == nil and nano.pack == nil
+      assert nano.engine_budget == 75
+
+      assert Enum.map(profile.model_ladder, & &1.engine_budget) ==
+               Enum.sort_by(profile.model_ladder, & &1.engine_budget)
+               |> Enum.map(& &1.engine_budget)
     end
 
-    test "qcs6490 is the only shipped profile that names a decoder" do
+    test "qcs6490-tier1 is the only shipped profile that names a decoder" do
       assert {:ok, config, []} = Config.from_map(base_map())
 
       # Naming one is a requirement on the membrane path, so it belongs only
       # where a decode path has been measured — Venus, spike 0.3. The other
       # three leave it unset and take `auto`'s fallback.
-      assert config.profiles["qcs6490"].decoder == "v4l2"
+      assert config.profiles["qcs6490-tier1"].decoder == "v4l2"
 
       for name <- ["generic-ort", "rk3566-lowfps", "rk3576"] do
         assert config.profiles[name].decoder == nil, "#{name} names a decoder"
+      end
+    end
+
+    # The D-L6 docs-honesty gate, running where `mix check` runs: a shipped
+    # rung's budget is a measurement or it is marked provisional, and a file
+    # carrying any provisional budget says DRAFT at the top. YAML comments
+    # never reach the parser, so the gate reads the raw file — crude on
+    # purpose; it enforces that the note exists, not that it is true.
+    test "every shipped ladder budget carries provenance; provisional ⇒ DRAFT" do
+      for path <- Path.wildcard("priv/profiles/*.yml"),
+          raw = File.read!(path),
+          raw =~ "model_ladder:" do
+        lines = String.split(raw, "\n")
+
+        budget_indexes =
+          for {line, index} <- Enum.with_index(lines),
+              line =~ ~r/^\s+engine_budget:/,
+              do: index
+
+        # Each rung's window runs from just past the PREVIOUS rung's budget
+        # line to its own — a neighbor's note can never satisfy it. `\b` so
+        # "unmeasured" is not a provenance claim.
+        budget_notes =
+          for {index, prev} <- Enum.zip(budget_indexes, [-1 | budget_indexes]) do
+            window = lines |> Enum.slice((prev + 1)..index//1) |> Enum.join("\n")
+            marked = window =~ ~r/\b(provisional|measured)\b/i
+
+            assert marked,
+                   "#{path}:#{index + 1} engine_budget has no measured/provisional " <>
+                     "provenance note in its own rung's comment (D-L6)"
+
+            window =~ ~r/\bprovisional\b/i
+          end
+
+        assert budget_notes != [], "#{path} declares a ladder with no budgets?"
+
+        if Enum.any?(budget_notes) do
+          assert raw =~ "DRAFT",
+                 "#{path} carries provisional budgets but no DRAFT marker (D-L6)"
+        end
       end
     end
   end
