@@ -1045,7 +1045,11 @@ defmodule Cairn.Config.Profile do
   # reads it, and an operator who wrote it meant it to do something, so the
   # inert case warns rather than passing silently.
   defp check_supported_cameras(acc, raw, name) do
-    ladder? = Map.has_key?(raw, "model_ladder")
+    # `!= nil`, not `has_key?`: a bare `model_ladder:` parses to nil, which
+    # this whole module reads as "said nothing" (the `tracking:` rule) — a
+    # key-presence test here would make the one check disagree with every
+    # other reader of the key.
+    ladder? = Map.get(raw, "model_ladder") != nil
 
     case Map.get(raw, "supported_cameras") do
       nil ->
@@ -1122,8 +1126,11 @@ defmodule Cairn.Config.Profile do
          %{floor_fps: floor_fps} <- ladder_floor(Map.get(raw, "tier")) do
       floor_rate = effective_rate(floor_fps)
 
+      # `!= nil`, not `has_key?`: a bare `pack:` parses to nil, and every
+      # other reader (`check_rung_pack/4`, resolution's skip split) reads
+      # that as a non-pack rung — coverage must count it on the same side.
       case rungs
-           |> Enum.reject(&Map.has_key?(&1, "pack"))
+           |> Enum.reject(&(Map.get(&1, "pack") != nil))
            |> Enum.map(&Map.get(&1, "engine_budget")) do
         [] ->
           Config.add_error(
@@ -1151,10 +1158,13 @@ defmodule Cairn.Config.Profile do
     end
   end
 
+  # nil-or-binary, never a key-presence test: a bare `pack:` (nil) is a
+  # non-pack rung like everywhere else, and treating it as malformed here
+  # would silently skip the coverage invariant for the whole ladder.
   defp valid_rung_for_coverage?(rung) do
     is_map(rung) and is_number(Map.get(rung, "engine_budget")) and
       Map.get(rung, "engine_budget") > 0 and
-      (not Map.has_key?(rung, "pack") or is_binary(Map.get(rung, "pack")))
+      (is_nil(Map.get(rung, "pack")) or is_binary(Map.get(rung, "pack")))
   end
 
   # "a, b or c" — enumerated from the table rather than hand-written so a value

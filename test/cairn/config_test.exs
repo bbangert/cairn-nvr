@@ -2169,6 +2169,52 @@ defmodule Cairn.ConfigTest do
              )
     end
 
+    test "a bare pack: key is a non-pack rung — coverage still enforced" do
+      # YAML `pack:` with no value parses to nil, which reads as absent (the
+      # bare-`tracking:` rule). The trap this pins: a key-presence test would
+      # either count the rung on the pack side or skip the whole coverage
+      # invariant — 17 covers 9 cameras, so claiming 40 must still refuse.
+      errors =
+        ladder_errors("""
+        tier: 1
+        model_profile: yolox
+        labels: #{@stub_names}
+        model_ladder:
+          - model:
+              onnx: #{@stub_onnx}
+            input_size: 640
+            engine_budget: 17
+            pack:
+        supported_cameras:
+          min: 1
+          max: 40
+        """)
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "non-pack rungs alone cover ~9 cameras" and &1 =~ "Apache-complete")
+             )
+    end
+
+    test "a bare model_ladder: key says nothing — the profile stays single-model" do
+      # Same nil-means-absent rule at the ladder key itself: the profile
+      # loads on its `model:`, and supported_cameras warns inert like on any
+      # single-model profile.
+      dir =
+        tmp_profile_dir("ladder", """
+        model:
+          onnx: #{@stub_onnx}
+        model_ladder:
+        supported_cameras:
+          min: 1
+          max: 4
+        """)
+
+      assert {:ok, config, warnings} = Config.from_map(ladder_map(1, dir))
+      assert config.profiles["ladder"].model_ladder == nil
+      assert Enum.any?(warnings, &(&1 =~ "supported_cameras has no effect without model_ladder"))
+    end
+
     test "a ladder of only pack rungs is refused outright" do
       errors =
         ladder_errors("""
