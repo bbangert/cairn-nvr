@@ -881,19 +881,37 @@ defmodule Cairn.Config do
   def profile_for(%__MODULE__{}, %Camera{}), do: nil
 
   @doc """
-  The ladder rung load-time resolution picked for a camera's profile, or
-  `nil` for a camera off the ladder path.
+  The RUNTIME identity of the ladder rung load-time resolution picked for a
+  camera's profile — the backend's artifact path, the model family and the
+  input size — or `nil` for a camera off the ladder path.
 
   `Cairn.Config.Server` compares it resolved across a reload (D-L5): adding
   or removing cameras elsewhere on the node can move N across a rung
   boundary, which is a model change for THIS camera — restart-class, through
   the existing engine-first reload ordering — without a single field of its
   own having moved.
+
+  The projection, not the whole rung: a rung also carries authoring metadata
+  — its measured `engine_budget`, a `pack:` name, artifact paths for
+  backends this profile does not run — and an edit that moves only those
+  (the budgets going provisional → measured, say) changes nothing any
+  running camera was built on. The derived rate is deliberately absent too:
+  it rides `sample_fps/2`'s own resolved comparison.
   """
   @spec resolved_rung(t(), Camera.t()) :: map() | nil
   def resolved_rung(%__MODULE__{} = config, %Camera{} = cam) do
-    profile = profile_for(config, cam)
-    profile && profile.resolved_rung
+    case profile_for(config, cam) do
+      %Profile{model_ladder: rungs, resolved_rung: rung} = profile
+      when is_list(rungs) and rung != nil ->
+        %{
+          artifact: Profile.artifact(profile),
+          model_profile: profile.model_profile,
+          input_size: profile.input_size
+        }
+
+      _single_model_unresolved_or_none ->
+        nil
+    end
   end
 
   @doc """

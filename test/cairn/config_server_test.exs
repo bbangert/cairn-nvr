@@ -310,6 +310,15 @@ defmodule Cairn.Config.ServerTest do
                %{added: [], removed: [], changed: [], refreshed: []}
     end
 
+    test "a capacity-metadata edit that moves neither model nor rate touches nothing" do
+      # The budgets going provisional → measured (phase 3's whole deliverable)
+      # must not restart a fleet: selection and derived fps are unchanged
+      # (8 × 1.875 = 15 fits 17 and 18 alike), and the rung comparison is of
+      # the rung's RUNTIME identity, not its authoring metadata.
+      assert Config.Server.diff_cameras(ladder_config(8, 17), ladder_config(8, 18)) ==
+               %{added: [], removed: [], changed: [], refreshed: []}
+    end
+
     test "a camera edited both ways is restarted, not refreshed" do
       assert camera_diff(%{"rtsp_url" => "rtsp://h/2", "stationary_after_ms" => 20_000}) ==
                %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
@@ -400,8 +409,10 @@ defmodule Cairn.Config.ServerTest do
 
   # A two-rung tier-1 ladder (budgets 17 and 75) with `n` detecting cameras,
   # for the D-L5 restart-classification cases. One profile dir per call —
-  # `diff_cameras/2` compares two full configs, not two files.
-  defp ladder_config(n) do
+  # `diff_cameras/2` compares two full configs, not two files. The first
+  # rung's budget is a parameter so the metadata-edit case can move it
+  # without moving the selection or the derived rate.
+  defp ladder_config(n, rung1_budget \\ 17) do
     dir = Path.join(System.tmp_dir!(), "cairn_srv_ladder_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf(dir) end)
@@ -413,7 +424,7 @@ defmodule Cairn.Config.ServerTest do
       - model:
           onnx: test/support/fixtures/models/stub.onnx
         input_size: 640
-        engine_budget: 17
+        engine_budget: #{rung1_budget}
       - model:
           onnx: test/support/fixtures/models/stub.onnx
         input_size: 416
