@@ -940,11 +940,13 @@ defmodule Cairn.Config.Profile do
   defp check_rung_backend_key(acc, _model, _index, _backend, _name), do: acc
 
   # `check_pos_int/5` says nothing about an absent key (top-level fields are
-  # optional); a rung's `input_size` is not.
+  # optional); a rung's `input_size` is not. Tested by value, not key
+  # presence: a bare `input_size:` parses to nil, which check_pos_int also
+  # reads as absent — key presence here would let it through undeclared.
   defp check_rung_required(acc, rung, key, index, name) do
     Config.check(
       acc,
-      Map.has_key?(rung, key),
+      Map.get(rung, key) != nil,
       "profile #{name}: model_ladder rung #{index} must declare #{key}"
     )
   end

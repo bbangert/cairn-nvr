@@ -2066,8 +2066,13 @@ defmodule Cairn.ConfigTest do
              )
     end
 
-    test "a rung without input_size is refused" do
+    test "a rung without input_size is refused — bare key included" do
       errors = ladder_errors(String.replace(ladder_yaml(), "    input_size: 416\n", ""))
+      assert Enum.any?(errors, &(&1 =~ "model_ladder rung 3 must declare input_size"))
+
+      # A bare `input_size:` parses to nil — declared in ink only, refused
+      # the same way (the nil-means-absent rule).
+      errors = ladder_errors(String.replace(ladder_yaml(), "input_size: 416", "input_size:"))
       assert Enum.any?(errors, &(&1 =~ "model_ladder rung 3 must declare input_size"))
     end
 
