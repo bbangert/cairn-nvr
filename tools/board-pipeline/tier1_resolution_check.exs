@@ -77,6 +77,10 @@ File.rm_rf!(tmp)
 {"yolox_tiny_qdq.onnx", 2} = table[36]
 {"yolox_nano_qdq.onnx", 2} = table[38]
 {"yolox_nano_qdq.onnx", 2} = table[40]
-{:refused, _past_claim} = table[41]
+# The CLAIM bound specifically, not merely any refusal: no_rung_fits would
+# also refuse 41 with these budgets, and a claim drifted to 41+ must not
+# hide behind it.
+{:refused, errors_41} = table[41]
+true = Enum.any?(errors_41, &(&1 =~ "exceed supported_cameras 40"))
 
-IO.puts("resolution check: PASS — tiny through 36, nano 37–40, 41 refused")
+IO.puts("resolution check: PASS — tiny through 36, nano 37–40, 41 refused by the claim")
