@@ -182,10 +182,11 @@ key itself is not checked that way: a `--cameras-json` member carrying `"moton"`
 parses, is ignored, and leaves that camera on the group's settings — the member
 object stays open to keys Cairn may add.
 
-Two behaviours are not knobs. The first 25 samples (5 seconds) after a start or
-a geometry change are a calibration window in which no frame reports motion —
-the background is still the scene that happened to be in front of the camera.
-And a frame in which more than 80 % of the thumbnail changed is treated as a
+Two behaviours are not knobs. The first 5 seconds of frame time after a start
+or a geometry change (at least 10 frames, for a camera delivering slower than
+that) are a calibration window in which no frame reports motion — the
+background is still the scene that happened to be in front of the camera. And
+a frame in which more than 80 % of the thumbnail changed is treated as a
 scene cut, not as motion: the background is replaced with it outright and the
 frame reports no motion, which is what keeps an IR-cut filter flipping or a
 light switch from reading as the whole frame moving. Neither of the two is a
@@ -193,12 +194,17 @@ reason to skip a model pass — both are in the list of bounds above, because
 "no motion" from a background that is still being learned, or from one that
 has just been thrown away, is not a measurement of the scene.
 
-The calibration window and `alpha`'s memory are both counted in samples, and
-`--sample-fps` (default 5) is a ceiling on the sample rate rather than the
-rate itself — the gate takes at most one sample every 1/rate seconds (200 ms
-at the default) and otherwise takes whatever the camera delivers. On a 2 fps
-substream the calibration window is 12.5 seconds and the 10-second memory is
-25, so read every second in this section as "at this camera's sample rate".
+The calibration window is measured on the frames' own timestamps, so it is 5
+seconds whatever the camera delivers; `alpha`'s memory stays counted in
+samples (the background learns per frame folded in), and `--sample-fps`
+(default 5) is a ceiling on the sample rate rather than the rate itself — the
+gate takes at most one sample every 1/rate seconds (200 ms at the default)
+and otherwise takes whatever the camera delivers. On a 2 fps substream the
+10-second memory is 25 seconds, so read `alpha`'s seconds as "at this
+camera's sample rate". One consequence is deliberate: a stream whose frames
+carry no timestamps at all never finishes calibrating, so its gate never
+skips — detection stays correct, the gate's savings are forfeit, and the
+camera reads as detecting on every sample.
 
 **Frigate's published numbers do not transfer as-is.** Frigate compares motion
 on a frame around 100 px high; the thumbnail here is at most 96 px *wide*,

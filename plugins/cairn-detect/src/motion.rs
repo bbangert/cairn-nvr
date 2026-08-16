@@ -16,9 +16,10 @@
 //! changed. No contours: the changed *area fraction* is the whole verdict
 //! here, because the gate only ever asks "is anything happening", never "where".
 //!
-//! Pure — no clocks and no I/O. Elapsed time is counted in frames, which is
-//! what keeps the calibration independent of how long the process spent
-//! opening a stream and the tests independent of wall-clock timing.
+//! Pure — no clocks and no I/O. Elapsed time is read off each frame's own
+//! timestamp ([`MotionDetector::observe`]), which is what keeps the
+//! calibration independent of how long the process spent opening a stream and
+//! the tests independent of wall-clock timing.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -41,21 +42,29 @@ const MAX_THUMB_W: usize = 96;
 const LIGHTNING_FRACTION: f32 = 0.8;
 
 /// Rolling-average weight while the background is still being learned, and
-/// how many seconds of frames it is used for.
+/// how long that learning window lasts.
 ///
-/// The count of frames that spans is derived at construction from the
-/// decode thread's actual sample rate — see [`MotionDetector::new`] — because
-/// this module has no clock of its own: elapsed time is counted in frames,
-/// and a frame is only ever "one sample", never "one fifth of a second". The
-/// window is `CALIBRATION_SECONDS * sample_fps` frames, which spans
-/// [`CALIBRATION_SECONDS`] of wall clock only when the camera actually
-/// delivers the configured rate — the rate is a ceiling, so a slower camera
-/// stretches the window (the README's 2 fps example). No verdict during that
-/// window reports motion — the background starts as one frame, and until it
-/// has absorbed a few more, "differs from the background" mostly means
-/// "differs from whatever was in front of the camera at startup".
+/// The window is measured on the frames' own timestamps — calibration ends
+/// when a frame's pts says [`CALIBRATION_SECONDS`] have elapsed since the
+/// frame that restarted it — so it spans five seconds of *stream* time at
+/// whatever rate the camera actually delivers. A configured rate is only a
+/// ceiling (grid quantization delivers less), so a frame count derived from
+/// it stretched the window in wall time; the timestamps are ground truth. No
+/// verdict during the window reports motion — the background starts as one
+/// frame, and until it has absorbed a few more, "differs from the background"
+/// mostly means "differs from whatever was in front of the camera at startup".
 const CALIBRATION_ALPHA: f32 = 0.2;
 const CALIBRATION_SECONDS: u32 = 5;
+/// [`CALIBRATION_SECONDS`] on the nanosecond clock `observe` takes its
+/// timestamps in.
+const CALIBRATION_WINDOW_NS: i64 = CALIBRATION_SECONDS as i64 * 1_000_000_000;
+/// The frame floor under the elapsed-time rule: background convergence is
+/// per-frame (each observation folds once at [`CALIBRATION_ALPHA`]), so a
+/// camera delivering absurdly slowly must still fold in this many frames
+/// before the gate arms. Ten is the slowest window the frame-counted rule
+/// ever honestly produced — the tier-1 ladder floor of 2 fps over
+/// [`CALIBRATION_SECONDS`].
+const CALIBRATION_MIN_FRAMES: u32 = 10;
 
 /// Per-pixel 0..255 difference that counts as changed.
 const DEFAULT_THRESHOLD: u8 = 25;
@@ -64,9 +73,10 @@ const DEFAULT_THRESHOLD: u8 = 25;
 /// erring small costs nothing but CPU while erring large loses detections.
 const DEFAULT_MIN_AREA_FRACTION: f32 = 0.005;
 /// Rolling-average weight in steady state — about a 50-frame time constant,
-/// or 10 seconds at the default `--sample-fps` of 5. A higher sample rate
-/// packs those 50 frames into fewer wall-clock seconds; this constant is a
-/// frame count, not a duration, so it moves with the rate.
+/// or 10 seconds at a delivered 5 fps. Deliberately a frame count where the
+/// calibration window above is a duration: folding *is* per-frame, so the
+/// background learns per observation and faster delivery packs the same 50
+/// folds into fewer wall-clock seconds.
 const DEFAULT_ALPHA: f32 = 0.02;
 const DEFAULT_LINGER_MS: u64 = 12_000;
 const DEFAULT_EPOCH_BYPASS_MS: u64 = 15_000;
@@ -256,13 +266,13 @@ pub struct MotionVerdict {
     /// detector. Always false while calibrating and on a scene cut.
     pub motion: bool,
     /// Whether this verdict came from a detector that has not finished
-    /// calibrating, and so cannot say a scene is still — see
-    /// [`MotionDetector`]'s `calibration_frames`, [`CALIBRATION_SECONDS`]
-    /// converted to a frame count at that detector's sample rate. `motion` is
-    /// false throughout that window whatever is in front of the camera, which
-    /// is a statement about the background rather than about the picture, and
-    /// the two are worth telling apart by anything deciding whether to skip
-    /// work.
+    /// calibrating, and so cannot say a scene is still — the window ends when
+    /// a frame's own timestamp puts [`CALIBRATION_SECONDS`] behind the frame
+    /// that restarted it *and* at least [`CALIBRATION_MIN_FRAMES`] have been
+    /// folded in. `motion` is false throughout that window whatever is in
+    /// front of the camera, which is a statement about the background rather
+    /// than about the picture, and the two are worth telling apart by
+    /// anything deciding whether to skip work.
     pub calibrating: bool,
     /// Whether `changed_fraction` cleared [`LIGHTNING_FRACTION`], so this
     /// frame was read as a scene cut and rebaselined the background. `motion`
@@ -393,29 +403,38 @@ pub struct MotionDetector {
     /// replaces the background, keeps this count, and advances it like any
     /// other frame.
     frames: u32,
-    /// [`CALIBRATION_SECONDS`] converted to a frame count at this detector's
-    /// sample rate — resolved once, at construction, from `--sample-fps`
-    /// rather than recomputed per frame, since the rate is fixed for the life
-    /// of the process.
-    calibration_frames: u32,
+    /// The timestamp of the frame that restarted calibration, on `observe`'s
+    /// nanosecond clock — what elapsed stream time is measured from. `None`
+    /// until a dated frame has been seen: undated frames advance `frames` but
+    /// cannot advance time.
+    started_at_ns: Option<i64>,
+    /// Latched once [`CALIBRATION_WINDOW_NS`] and [`CALIBRATION_MIN_FRAMES`]
+    /// are both behind us, so a timestamp anomaly later (a camera resetting
+    /// its clock mid-stream) cannot blind a calibrated detector — only a
+    /// geometry change starts calibration over.
+    calibrated: bool,
 }
 
 impl MotionDetector {
-    /// `sample_fps` is the decode thread's resolved `--sample-fps`, the same
-    /// rate [`crate::decode::run`] paces its gate on — this is what turns
-    /// [`CALIBRATION_SECONDS`] into a frame count, since this module has no
-    /// clock to measure seconds with directly.
-    pub fn new(config: MotionConfig, sample_fps: u32) -> Self {
+    pub fn new(config: MotionConfig) -> Self {
         Self {
             config,
             background: Vec::new(),
             size: (0, 0),
             frames: 0,
-            calibration_frames: CALIBRATION_SECONDS * sample_fps,
+            started_at_ns: None,
+            calibrated: false,
         }
     }
 
     /// Compare one thumbnail against the background, then fold it in.
+    ///
+    /// `pts_ns` is the frame's own presentation time in nanoseconds — stream
+    /// time, not wall clock, so a replayed clip calibrates exactly as the
+    /// live stream did — or `None` for a frame the decoder could not date.
+    /// The epoch is arbitrary: only differences are read, and a backward jump
+    /// while calibrating rebases the window on the new clock rather than
+    /// waiting for it to catch up.
     ///
     /// The three ways this reports no motion are not the same thing: a frame
     /// measured against a background still being learned (the calibration
@@ -424,17 +443,33 @@ impl MotionDetector {
     /// the picture, and the verdict names the other two: `calibrating` and
     /// `scene_cut` are each set on their own frame, and [`crate::gate`]
     /// refuses to skip work on a verdict carrying either.
-    pub fn observe(&mut self, thumb: &GrayThumb) -> MotionVerdict {
+    pub fn observe(&mut self, thumb: &GrayThumb, pts_ns: Option<i64>) -> MotionVerdict {
         if self.size != thumb.size() {
             self.take_background(thumb);
             self.frames = 1;
+            self.started_at_ns = pts_ns;
+            self.calibrated = false;
             return MotionVerdict::still();
         }
 
-        // Read before the frame is folded in, so the flag describes the
+        // Decided before the frame is folded in, so the flag describes the
         // background this frame was compared against rather than the one the
-        // comparison produced.
-        let calibrating = self.frames < self.calibration_frames;
+        // comparison produced: the window ends on the first frame whose
+        // timestamp is CALIBRATION_WINDOW_NS past the restart, with `frames`
+        // (the count folded in *before* this one) at the floor.
+        if !self.calibrated {
+            match (self.started_at_ns, pts_ns) {
+                (None, Some(_)) => self.started_at_ns = pts_ns,
+                (Some(started), Some(at)) if at < started => self.started_at_ns = pts_ns,
+                _ => {}
+            }
+            self.calibrated = self.frames >= CALIBRATION_MIN_FRAMES
+                && matches!(
+                    (self.started_at_ns, pts_ns),
+                    (Some(started), Some(at)) if at.saturating_sub(started) >= CALIBRATION_WINDOW_NS
+                );
+        }
+        let calibrating = !self.calibrated;
         let threshold = f32::from(self.config.threshold);
         let changed = self
             .background
@@ -452,13 +487,12 @@ impl MotionDetector {
             //
             // `frames` deliberately survives and advances. It survives because
             // a calibrated detector stays calibrated: restarting the
-            // calibration here would report `calibrating` for the whole
-            // calibration window (`CALIBRATION_SECONDS` at the configured
-            // `--sample-fps`) every time a light came on, and what the camera
-            // is looking at then tends to be worth measuring. It advances
-            // because a detector that has just rebaselined onto the scene in
-            // front of it has, if anything, more to go on than a calibrating
-            // one — and because a
+            // calibration here would report `calibrating` for a whole
+            // CALIBRATION_SECONDS window every time a light came on, and what
+            // the camera is looking at then tends to be worth measuring. It
+            // advances because a detector that has just rebaselined onto the
+            // scene in front of it has, if anything, more to go on than a
+            // calibrating one — and because a
             // camera that cuts on most samples (an IR-cut filter hunting,
             // auto-exposure oscillating) has to finish calibrating at some
             // point, rather than sitting at "no motion" for as long as it
@@ -509,25 +543,29 @@ mod tests {
 
     const WIDE: InputSize = InputSize { w: 1920, h: 1080 };
 
-    /// The sample rate every test below pins itself to, unless it is
-    /// specifically testing that the calibration window moves with the rate.
-    /// `CALIBRATION_FRAMES` and every count derived from it below are only
-    /// valid at this rate — see `--sample-fps`'s clap default,
-    /// [`crate::decode::DEFAULT_SAMPLE_FPS`], which this equals by
-    /// construction rather than by coincidence.
-    const TEST_SAMPLE_FPS: u32 = crate::decode::DEFAULT_SAMPLE_FPS;
-    const CALIBRATION_FRAMES: u32 = CALIBRATION_SECONDS * TEST_SAMPLE_FPS;
+    /// The fixture clock: one observation every 200 ms, a real delivered
+    /// 5 fps. Real-scale on purpose — compressing the window in fixtures
+    /// changes which stimuli cross a rate threshold (see
+    /// `.claude/solutions/compressed-timescale-fixture-changes-what-crosses-a-rate-floor-20260804.md`),
+    /// so the 5 s window is spanned by real pts deltas, never shrunk.
+    const STEP_NS: i64 = 200_000_000;
+    /// Observations inside the window on this clock: observation `k` carries
+    /// pts `k * STEP_NS`, so `k = 25` is the first with
+    /// [`CALIBRATION_WINDOW_NS`] elapsed (and past the
+    /// [`CALIBRATION_MIN_FRAMES`] floor).
+    const WINDOW: u32 = 25;
 
-    /// A detector on the defaults, with the gate switched on, at
-    /// [`TEST_SAMPLE_FPS`].
+    /// The pts an observation at `step` on the fixture clock carries.
+    fn at(step: u32) -> Option<i64> {
+        Some(i64::from(step) * STEP_NS)
+    }
+
+    /// A detector on the defaults, with the gate switched on.
     fn detector() -> MotionDetector {
-        MotionDetector::new(
-            MotionConfig {
-                enabled: true,
-                ..MotionConfig::default()
-            },
-            TEST_SAMPLE_FPS,
-        )
+        MotionDetector::new(MotionConfig {
+            enabled: true,
+            ..MotionConfig::default()
+        })
     }
 
     /// A thumbnail built directly, bypassing the RGB24 downsample.
@@ -550,18 +588,25 @@ mod tests {
         thumb
     }
 
-    /// Observe one still frame `count` times, which is `count` observations
-    /// toward the calibration window.
-    fn observe_still(detector: &mut MotionDetector, still: &GrayThumb, count: u32) {
-        for _ in 0..count {
-            detector.observe(still);
+    /// Observe one still frame at fixture-clock steps `from..from + count`,
+    /// returning the next free step.
+    fn observe_still(
+        detector: &mut MotionDetector,
+        still: &GrayThumb,
+        from: u32,
+        count: u32,
+    ) -> u32 {
+        for step in from..from + count {
+            detector.observe(still, at(step));
         }
+        from + count
     }
 
     /// Run a detector to the end of its calibration window on one still frame,
-    /// so the next observation is the first that can report motion.
-    fn calibrate(detector: &mut MotionDetector, still: &GrayThumb) {
-        observe_still(detector, still, CALIBRATION_FRAMES);
+    /// so the observation at the returned step is the first that can report
+    /// motion.
+    fn calibrate(detector: &mut MotionDetector, still: &GrayThumb) -> u32 {
+        observe_still(detector, still, 0, WINDOW)
     }
 
     /// A packed RGB24 buffer of `size`, `stride` bytes per row, filled by
@@ -598,86 +643,126 @@ mod tests {
         // The first frame becomes the background; every frame in the window
         // after it differs from that background by a quarter of the picture
         // and still reports no motion.
-        warming.observe(&still);
-        for frame in 1..CALIBRATION_FRAMES {
-            assert!(!warming.observe(&moved).motion, "frame {frame}");
+        warming.observe(&still, at(0));
+        for step in 1..WINDOW {
+            assert!(!warming.observe(&moved, at(step)).motion, "step {step}");
         }
 
         // ...and it is the window that says so, not the picture: a detector
         // past it has an opinion about the very same frame.
         let mut calibrated = detector();
-        calibrate(&mut calibrated, &still);
-        assert!(calibrated.observe(&moved).motion);
+        let next = calibrate(&mut calibrated, &still);
+        assert!(calibrated.observe(&moved, at(next)).motion);
     }
 
     #[test]
-    fn the_calibration_window_is_exactly_the_documented_number_of_observations() {
-        // The window the README publishes as "the first 25 samples", pinned
-        // against the constant from both sides: widening the compare in
-        // `observe` from `<` to `<=` fails the second half, narrowing it to a
-        // count one lower fails the first.
+    fn the_calibration_window_ends_on_the_first_frame_with_five_seconds_elapsed() {
+        // The boundary pinned from both sides: the observation 4.8 s in is
+        // still inside the window, and the one whose pts reads exactly
+        // CALIBRATION_WINDOW_NS is the first outside it — the elapsed compare
+        // is `>=`, so narrowing it to `>` fails the second half and widening
+        // the window by a frame fails the first.
         let still = thumb(96, 54, 100);
         let moved = block(96, 54, 100, 48, 27, 200);
 
         let mut last_inside = detector();
-        observe_still(&mut last_inside, &still, CALIBRATION_FRAMES - 1);
-        let verdict = last_inside.observe(&moved);
-        assert!(
-            !verdict.motion,
-            "observation {CALIBRATION_FRAMES} is still inside the window"
-        );
+        observe_still(&mut last_inside, &still, 0, WINDOW - 1);
+        let verdict = last_inside.observe(&moved, at(WINDOW - 1));
+        assert!(!verdict.motion, "one step short of five seconds");
         // The window is what the flag reports, and the gate is what reads it:
         // a verdict from inside it says nothing about the picture, so it is
         // never one the gate may skip on.
         assert!(verdict.calibrating);
 
         let mut first_outside = detector();
-        observe_still(&mut first_outside, &still, CALIBRATION_FRAMES);
-        let verdict = first_outside.observe(&moved);
-        assert!(
-            verdict.motion,
-            "observation {} is the first outside it",
-            CALIBRATION_FRAMES + 1
-        );
+        observe_still(&mut first_outside, &still, 0, WINDOW);
+        let verdict = first_outside.observe(&moved, at(WINDOW));
+        assert!(verdict.motion, "the first frame with five seconds elapsed");
         assert!(!verdict.calibrating);
     }
 
     #[test]
-    fn the_calibration_window_scales_with_the_configured_sample_rate() {
-        // `CALIBRATION_SECONDS` is the invariant, not `CALIBRATION_FRAMES`: a
-        // detector built for a doubled `--sample-fps` has to spend twice as
-        // many frames calibrating to cover the same wall-clock window, since
-        // this module has no clock of its own to measure that window with
-        // directly.
+    fn the_calibration_window_spans_five_seconds_at_any_delivered_rate() {
+        // The invariant the time basis buys: the window is CALIBRATION_SECONDS
+        // of the stream's own time however fast frames actually arrive — a
+        // frame count derived from the configured rate stretched it in wall
+        // time whenever grid quantization delivered less than nominal.
         let still = thumb(96, 54, 100);
         let moved = block(96, 54, 100, 48, 27, 200);
-        let fast_frames = CALIBRATION_SECONDS * (TEST_SAMPLE_FPS * 2);
-        assert_eq!(fast_frames, CALIBRATION_FRAMES * 2);
 
-        let mut last_inside = MotionDetector::new(
-            MotionConfig {
-                enabled: true,
-                ..MotionConfig::default()
-            },
-            TEST_SAMPLE_FPS * 2,
-        );
-        observe_still(&mut last_inside, &still, fast_frames - 1);
-        assert!(
-            last_inside.observe(&moved).calibrating,
-            "still inside the doubled-rate window"
-        );
+        for (label, step_ns, steps) in [
+            // 10 fps delivered: 50 observations to span the window.
+            ("10 fps", 100_000_000i64, 50u32),
+            // 2 fps delivered (the tier-1 ladder floor): 10 — the frame floor
+            // and the elapsed rule agree here by construction.
+            ("2 fps", 500_000_000, 10),
+        ] {
+            let mut warming = detector();
+            for step in 0..steps {
+                let verdict = warming.observe(&still, Some(i64::from(step) * step_ns));
+                assert!(verdict.calibrating, "{label}: step {step}");
+            }
+            let verdict = warming.observe(&moved, Some(i64::from(steps) * step_ns));
+            assert!(!verdict.calibrating, "{label}: five seconds elapsed");
+            assert!(verdict.motion, "{label}");
+        }
+    }
 
-        let mut first_outside = MotionDetector::new(
-            MotionConfig {
-                enabled: true,
-                ..MotionConfig::default()
-            },
-            TEST_SAMPLE_FPS * 2,
-        );
-        observe_still(&mut first_outside, &still, fast_frames);
-        let verdict = first_outside.observe(&moved);
-        assert!(!verdict.calibrating, "first observation outside it");
-        assert!(verdict.motion);
+    #[test]
+    fn a_camera_below_the_frame_floor_calibrates_on_frames_not_time() {
+        // One frame a second: five seconds elapse after five frames, but five
+        // folds at CALIBRATION_ALPHA are not a learned background — the
+        // CALIBRATION_MIN_FRAMES floor holds the window open until enough
+        // frames have folded in, however much stream time they span.
+        let still = thumb(96, 54, 100);
+        let step_ns = 1_000_000_000i64;
+
+        let mut warming = detector();
+        for step in 0..CALIBRATION_MIN_FRAMES {
+            let verdict = warming.observe(&still, Some(i64::from(step) * step_ns));
+            assert!(verdict.calibrating, "step {step}");
+        }
+        let verdict = warming.observe(&still, Some(i64::from(CALIBRATION_MIN_FRAMES) * step_ns));
+        assert!(!verdict.calibrating, "the floor is met and time long since");
+    }
+
+    #[test]
+    fn undated_frames_advance_the_floor_but_never_the_clock() {
+        // A decoder that cannot date a frame hands `None`: the frame still
+        // folds into the background, but elapsed time is unknowable from it,
+        // so it cannot end the window — and once the window *is* over, the
+        // latch means an undated frame cannot reopen it either.
+        let still = thumb(96, 54, 100);
+        let mut warming = detector();
+
+        warming.observe(&still, at(0));
+        for step in 1..=WINDOW + 5 {
+            assert!(warming.observe(&still, None).calibrating, "step {step}");
+        }
+        // A dated frame past the window ends it...
+        assert!(!warming.observe(&still, at(WINDOW + 5)).calibrating);
+        // ...and undated frames after it stay calibrated.
+        assert!(!warming.observe(&still, None).calibrating);
+    }
+
+    #[test]
+    fn a_backward_pts_jump_rebases_the_window_instead_of_waiting_out_the_gap() {
+        // A camera that resets its clock mid-calibration would otherwise hold
+        // `elapsed` at zero until the new clock caught the old baseline up —
+        // hours, for a reboot to zero. The window rebases on the new clock and
+        // ends CALIBRATION_SECONDS after the jump.
+        let still = thumb(96, 54, 100);
+        let mut warming = detector();
+
+        // Calibration starts on a clock already at 100 s...
+        warming.observe(&still, Some(100_000_000_000));
+        // ...which then resets to the fixture clock: the window rebases onto
+        // step 1's pts, so it ends five seconds after *that* — step 26, not
+        // step 25 and not the year the old clock reads 105 s.
+        for step in 1..=WINDOW {
+            assert!(warming.observe(&still, at(step)).calibrating, "step {step}");
+        }
+        assert!(!warming.observe(&still, at(WINDOW + 1)).calibrating);
     }
 
     #[test]
@@ -690,12 +775,15 @@ mod tests {
         let mut warming = detector();
         let still = thumb(96, 54, 100);
 
-        assert!(warming.observe(&still).calibrating, "the first frame");
-        for frame in 1..CALIBRATION_FRAMES {
-            assert!(warming.observe(&still).calibrating, "frame {frame}");
+        assert!(
+            warming.observe(&still, at(0)).calibrating,
+            "the first frame"
+        );
+        for step in 1..WINDOW {
+            assert!(warming.observe(&still, at(step)).calibrating, "step {step}");
         }
         assert!(
-            !warming.observe(&still).calibrating,
+            !warming.observe(&still, at(WINDOW)).calibrating,
             "the first one past it"
         );
     }
@@ -709,25 +797,25 @@ mod tests {
         let mut flickering = detector();
         let dark = thumb(96, 54, 40);
         let bright = thumb(96, 54, 200);
-        for observation in 0..CALIBRATION_FRAMES {
-            let flip = if observation % 2 == 0 { &bright } else { &dark };
-            let verdict = flickering.observe(flip);
-            assert!(!verdict.motion, "{observation}");
+        for step in 0..WINDOW {
+            let flip = if step % 2 == 0 { &bright } else { &dark };
+            let verdict = flickering.observe(flip, at(step));
+            assert!(!verdict.motion, "{step}");
             // The first frame *is* the background; every one after it is a cut
             // and is flagged as one, so a camera in this state is one the gate
             // infers on every sample of.
-            assert_eq!(verdict.scene_cut, observation > 0, "{observation}");
+            assert_eq!(verdict.scene_cut, step > 0, "{step}");
         }
 
         // Calibrated, on the scene the last cut left behind.
-        let settled = if CALIBRATION_FRAMES.is_multiple_of(2) {
+        let settled = if WINDOW.is_multiple_of(2) {
             &dark
         } else {
             &bright
         };
         assert!(
             flickering
-                .observe(&block(96, 54, settled.pixels[0], 48, 27, 120))
+                .observe(&block(96, 54, settled.pixels[0], 48, 27, 120), at(WINDOW))
                 .motion
         );
     }
@@ -736,10 +824,10 @@ mod tests {
     fn a_static_scene_reports_no_motion_after_calibration() {
         let mut detector = detector();
         let still = thumb(96, 54, 120);
-        calibrate(&mut detector, &still);
+        let next = calibrate(&mut detector, &still);
 
-        for _ in 0..50 {
-            let verdict = detector.observe(&still);
+        for step in next..next + 50 {
+            let verdict = detector.observe(&still, at(step));
             assert_eq!(verdict.changed_fraction, 0.0);
             assert!(!verdict.motion);
         }
@@ -752,9 +840,9 @@ mod tests {
         // operator can reason about.
         let mut detector = detector();
         let still = thumb(96, 54, 100);
-        calibrate(&mut detector, &still);
+        let next = calibrate(&mut detector, &still);
 
-        let verdict = detector.observe(&block(96, 54, 100, 48, 27, 200));
+        let verdict = detector.observe(&block(96, 54, 100, 48, 27, 200), at(next));
         assert!(verdict.motion);
         assert!(
             (verdict.changed_fraction - 0.25).abs() < 1e-6,
@@ -765,19 +853,16 @@ mod tests {
 
     #[test]
     fn a_change_under_the_area_floor_is_not_motion_but_is_still_measured() {
-        let mut detector = MotionDetector::new(
-            MotionConfig {
-                enabled: true,
-                min_area_fraction: 0.1,
-                ..MotionConfig::default()
-            },
-            TEST_SAMPLE_FPS,
-        );
+        let mut detector = MotionDetector::new(MotionConfig {
+            enabled: true,
+            min_area_fraction: 0.1,
+            ..MotionConfig::default()
+        });
         let still = thumb(100, 10, 100);
-        calibrate(&mut detector, &still);
+        let next = calibrate(&mut detector, &still);
 
         // 50 of 1000 pixels: half the floor.
-        let verdict = detector.observe(&block(100, 10, 100, 50, 1, 200));
+        let verdict = detector.observe(&block(100, 10, 100, 50, 1, 200), at(next));
         assert!(!verdict.motion);
         assert!((verdict.changed_fraction - 0.05).abs() < 1e-6);
     }
@@ -785,19 +870,16 @@ mod tests {
     #[test]
     fn a_change_exactly_at_the_area_floor_counts_as_motion() {
         // The compare is `>=`, so the floor is the first fraction that counts.
-        let mut detector = MotionDetector::new(
-            MotionConfig {
-                enabled: true,
-                min_area_fraction: 0.1,
-                ..MotionConfig::default()
-            },
-            TEST_SAMPLE_FPS,
-        );
+        let mut detector = MotionDetector::new(MotionConfig {
+            enabled: true,
+            min_area_fraction: 0.1,
+            ..MotionConfig::default()
+        });
         let still = thumb(100, 10, 100);
-        calibrate(&mut detector, &still);
+        let next = calibrate(&mut detector, &still);
 
         // 100 of 1000 pixels: the floor exactly.
-        let verdict = detector.observe(&block(100, 10, 100, 100, 1, 200));
+        let verdict = detector.observe(&block(100, 10, 100, 100, 1, 200), at(next));
         assert_eq!(verdict.changed_fraction, 0.1);
         assert!(verdict.motion);
     }
@@ -809,16 +891,16 @@ mod tests {
         // README's "more than 80 %" and the code could have drifted apart.
         let mut detector = detector();
         let still = thumb(10, 10, 100);
-        calibrate(&mut detector, &still);
+        let next = calibrate(&mut detector, &still);
 
         // 80 of 100 pixels.
-        let verdict = detector.observe(&block(10, 10, 100, 10, 8, 200));
+        let verdict = detector.observe(&block(10, 10, 100, 10, 8, 200), at(next));
         assert_eq!(verdict.changed_fraction, LIGHTNING_FRACTION);
         assert!(verdict.motion);
 
         // ...and it went through the rolling average, not the rebaseline: a
         // cut would have taken the new scene outright and read 0.0 next.
-        let held = detector.observe(&block(10, 10, 100, 10, 8, 200));
+        let held = detector.observe(&block(10, 10, 100, 10, 8, 200), at(next + 1));
         assert_eq!(held.changed_fraction, LIGHTNING_FRACTION);
     }
 
@@ -843,10 +925,10 @@ mod tests {
         };
 
         let mut detector = detector();
-        calibrate(&mut detector, &noisy(0));
+        let next = calibrate(&mut detector, &noisy(0));
 
         // Every pixel swings the full 20 levels, under the threshold of 25.
-        let verdict = detector.observe(&noisy(1));
+        let verdict = detector.observe(&noisy(1), at(next));
         assert_eq!(verdict.changed_fraction, 0.0);
         assert!(!verdict.motion);
     }
@@ -855,10 +937,10 @@ mod tests {
     fn a_whole_frame_illumination_change_rebaselines_instead_of_reporting_motion() {
         let mut detector = detector();
         let dark = thumb(96, 54, 40);
-        calibrate(&mut detector, &dark);
+        let next = calibrate(&mut detector, &dark);
 
         let bright = thumb(96, 54, 200);
-        let flash = detector.observe(&bright);
+        let flash = detector.observe(&bright, at(next));
         assert_eq!(flash.changed_fraction, 1.0);
         assert!(!flash.motion, "a scene cut is not motion");
         // …and says so as its own field, which is what keeps the gate from
@@ -870,7 +952,7 @@ mod tests {
         // The background is the new scene outright, so the very next frame is
         // judged against it — not averaged toward it over the next 50 frames,
         // every one of which would have read as motion.
-        let settled = detector.observe(&bright);
+        let settled = detector.observe(&bright, at(next + 1));
         assert_eq!(settled.changed_fraction, 0.0);
         assert!(!settled.motion);
         // This one is the ordinary still verdict, cut and window both behind
@@ -878,7 +960,11 @@ mod tests {
         assert!(!settled.scene_cut);
         assert!(!settled.calibrating);
         // ...and the detector is still calibrated: it did not go blind.
-        assert!(detector.observe(&block(96, 54, 200, 48, 27, 40)).motion);
+        assert!(
+            detector
+                .observe(&block(96, 54, 200, 48, 27, 40), at(next + 2))
+                .motion
+        );
     }
 
     #[test]
@@ -889,9 +975,9 @@ mod tests {
         // from being read as a still scene.
         let mut warming = detector();
         let dark = thumb(96, 54, 40);
-        warming.observe(&dark);
+        warming.observe(&dark, at(0));
 
-        let flash = warming.observe(&thumb(96, 54, 200));
+        let flash = warming.observe(&thumb(96, 54, 200), at(1));
         assert_eq!(flash.changed_fraction, 1.0);
         assert!(flash.scene_cut);
         assert!(flash.calibrating);
@@ -901,9 +987,9 @@ mod tests {
     #[test]
     fn a_geometry_change_starts_over_rather_than_comparing_mismatched_frames() {
         let mut detector = detector();
-        calibrate(&mut detector, &thumb(96, 54, 100));
+        let next = calibrate(&mut detector, &thumb(96, 54, 100));
 
-        let verdict = detector.observe(&thumb(96, 72, 200));
+        let verdict = detector.observe(&thumb(96, 72, 200), at(next));
         assert_eq!(verdict, MotionVerdict::still());
         // Spelled out because the compare above is against the same
         // constructor and so pins nothing about the fields: calibration starts
@@ -911,8 +997,13 @@ mod tests {
         // frame for a cut to have come out of.
         assert!(verdict.calibrating);
         assert!(!verdict.scene_cut);
-        // and it re-calibrates at the new geometry
-        assert!(!detector.observe(&block(96, 72, 200, 96, 36, 40)).motion);
+        // and it re-calibrates at the new geometry: a whole fresh window,
+        // rebased on the pts the geometry changed at.
+        assert!(
+            !detector
+                .observe(&block(96, 72, 200, 96, 36, 40), at(next + 1))
+                .motion
+        );
     }
 
     #[test]
@@ -927,16 +1018,13 @@ mod tests {
         }
 
         let fraction_at = |threshold: u8| {
-            let mut detector = MotionDetector::new(
-                MotionConfig {
-                    enabled: true,
-                    threshold,
-                    ..MotionConfig::default()
-                },
-                TEST_SAMPLE_FPS,
-            );
-            calibrate(&mut detector, &still);
-            detector.observe(&banded).changed_fraction
+            let mut detector = MotionDetector::new(MotionConfig {
+                enabled: true,
+                threshold,
+                ..MotionConfig::default()
+            });
+            let next = calibrate(&mut detector, &still);
+            detector.observe(&banded, at(next)).changed_fraction
         };
 
         let fractions: Vec<f32> = [5u8, 15, 30, 60, 100]
@@ -958,17 +1046,14 @@ mod tests {
         let held = block(20, 20, 100, 20, 10, 160);
 
         let frames_to_settle = |alpha: f32| {
-            let mut detector = MotionDetector::new(
-                MotionConfig {
-                    enabled: true,
-                    alpha,
-                    ..MotionConfig::default()
-                },
-                TEST_SAMPLE_FPS,
-            );
-            calibrate(&mut detector, &still);
+            let mut detector = MotionDetector::new(MotionConfig {
+                enabled: true,
+                alpha,
+                ..MotionConfig::default()
+            });
+            let next = calibrate(&mut detector, &still);
             (1..=500)
-                .find(|_| !detector.observe(&held).motion)
+                .find(|step| !detector.observe(&held, at(next + step)).motion)
                 .expect("the background absorbs a held change at any alpha")
         };
 
@@ -1110,8 +1195,8 @@ mod tests {
         );
 
         let mut detector = detector();
-        calibrate(&mut detector, &still);
-        let verdict = detector.observe(&moved);
+        let next = calibrate(&mut detector, &still);
+        let verdict = detector.observe(&moved, at(next));
         assert!(verdict.motion);
         assert!(
             (verdict.changed_fraction - 0.5).abs() < 0.02,

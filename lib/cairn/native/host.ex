@@ -126,8 +126,8 @@ defmodule Cairn.Native.Host do
   Answers with the decoder's handle, the module to drive it through
   (`Cairn.Native`, or the test stub the host was configured with) and the
   engine's `sample_fps` — `Cairn.Pipeline.SampleGate`'s rate, handed out here
-  so the rate gate and the motion detector's calibration window read one
-  configured value. The handle is the *caller's*: no registry claim guards it
+  so every camera's gate reads the one configured value. The handle is the
+  *caller's*: no registry claim guards it
   (that belongs to the inference stream), the per-frame `decode_au` calls
   never come back through this process, and freeing it promptly is the
   caller's `close_decoder`, with the resource destructor as the backstop.
@@ -699,8 +699,10 @@ defmodule Cairn.Native.Host do
 
   # The one place the two libraries meet: the engine's resolved input spec is
   # read out of cairn-ort as plain terms and handed to cairn-native's open,
-  # with the host's own decode config (`decoder`, `sample_fps`) alongside — so
-  # both halves are built for the same model without either naming the other.
+  # with the host's own decode config (`decoder`) alongside — so both halves
+  # are built for the same model without either naming the other. `sample_fps`
+  # stays host-side: it is `Cairn.Pipeline.SampleGate`'s rate, handed out in
+  # the reply below, and the crate no longer consumes it.
   defp do_open_decoder(%{engine_state: :ready} = state, camera_id, params, {:ok, source}) do
     # A plain field-read NIF (sub-microsecond, deliberately not
     # dirty-scheduled), so calling it from this process costs nothing.
@@ -717,8 +719,7 @@ defmodule Cairn.Native.Host do
       resize_pad: spec.resize_pad,
       source_width: source_width,
       source_height: source_height,
-      motion_json: params.motion_json,
-      sample_fps: state.config.sample_fps
+      motion_json: params.motion_json
     }
 
     case state.native.open_decoder(camera_id, decode_params) do

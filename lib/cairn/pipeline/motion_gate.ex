@@ -20,9 +20,10 @@ defmodule Cairn.Pipeline.MotionGate do
   would put a queue of aging frames between the decoder's latest-wins slot
   and the model. One consequence is deliberate and differs from the NIF-side
   measurement, which ran at decode time: a frame the decoder *replaces*
-  under backpressure is never observed here, so the background and the
-  frame-counted calibration window advance only on frames that actually
-  reach the gate — the gate observes exactly what it gates.
+  under backpressure is never observed here, so the background (and the
+  calibration window's frame floor) advances only on frames that actually
+  reach the gate — the gate observes exactly what it gates, and the window's
+  clock is the pts of those same frames.
 
   The detector restarts its calibration on a geometry change by itself; this
   element just rebuilds the downsample plan when a new stream format
@@ -52,12 +53,6 @@ defmodule Cairn.Pipeline.MotionGate do
       description:
         "The resolved knobs (`Cairn.Motion.Config.resolve_json/1`) — an element " <>
           "only exists for an enabled gate; a disabled one is no element at all"
-    ],
-    sample_fps: [
-      spec: pos_integer(),
-      description:
-        "The producer's sample rate, sizing the frame-counted calibration window " <>
-          "exactly as the crate resolves it from `--sample-fps`"
     ]
   )
 
@@ -65,7 +60,7 @@ defmodule Cairn.Pipeline.MotionGate do
   def handle_init(_ctx, opts) do
     {[],
      %{
-       detector: Motion.new(opts.config, opts.sample_fps),
+       detector: Motion.new(opts.config),
        plan: nil,
        observed: 0,
        motion: 0,
@@ -89,7 +84,7 @@ defmodule Cairn.Pipeline.MotionGate do
   @impl true
   def handle_buffer(:input, %Buffer{} = buffer, _ctx, state) do
     thumb = Thumbnail.from_rgb24(buffer.payload, state.plan)
-    {verdict, detector} = Motion.observe(state.detector, thumb)
+    {verdict, detector} = Motion.observe(state.detector, thumb, buffer.pts)
     out = %{buffer | metadata: Map.put(buffer.metadata, :motion, verdict)}
 
     state = %{
@@ -109,7 +104,7 @@ defmodule Cairn.Pipeline.MotionGate do
       observed: state.observed,
       motion: state.motion,
       scene_cuts: state.scene_cuts,
-      calibrating: state.detector.frames < state.detector.calibration_frames
+      calibrating: Motion.calibrating?(state.detector)
     }
 
     {[notify_parent: {:stats, stats}], state}

@@ -115,7 +115,6 @@ defmodule Cairn.Pipeline.DecoderTest do
                         height: 4,
                         resize: "letterbox",
                         resize_pad: 114,
-                        sample_fps: 5,
                         source_width: 2560,
                         source_height: 1920
                       }}

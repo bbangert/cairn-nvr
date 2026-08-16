@@ -148,7 +148,12 @@ defmodule Membrane.MOTTracker.SparseTrack do
     * `:low_thresh` (#{@low_thresh}) — the floor of stage two.
     * `:track_buffer` (#{@track_buffer}) and `:frame_rate` (#{@frame_rate}) —
       how many frames a lost track stays adoptable, as
-      `frame_rate / 30 * track_buffer` truncated.
+      `frame_rate / 30 * track_buffer` truncated. `:frame_rate` is the
+      *nominal* delivery rate: the pipeline's sample gate quantizes to the
+      source grid, so the buffer's wall-clock span runs up to ~7% longer
+      than `track_buffer / 30` seconds. Accepted, not corrected — the
+      constant is heuristic and a correction would need a measured
+      effective rate; revisit only with one.
     * `:match_thresh` (#{@match_thresh}) / `:second_thresh` (#{@second_thresh})
       / `:confirm_thresh` (#{@confirm_thresh}) — the cost limits of the three
       associations: stage one, stage two, and the pass that confirms or

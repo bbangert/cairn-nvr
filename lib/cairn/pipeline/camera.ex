@@ -438,7 +438,7 @@ defmodule Cairn.Pipeline.Camera do
 
   defp detect_spec(camera, detect, head) do
     stream_params = Keyword.get(detect, :stream_params, %{})
-    gate = motion_gate(camera.id, detect, stream_params)
+    gate = motion_gate(camera.id, stream_params)
     policy = Keyword.fetch!(detect, :policy)
 
     inferred =
@@ -507,7 +507,10 @@ defmodule Cairn.Pipeline.Camera do
   # `frame_rate / 30 * track_buffer` — so a branch delivering `sample_fps`
   # frames a second has to say so, or lost tracks stay adoptable for the ratio
   # of the two; and its live cap is a construction option, so the camera's own
-  # is passed here rather than found on a batch.
+  # is passed here rather than found on a batch. `sample_fps` is nominal where
+  # the gate delivers the grid-quantized effective rate, so the buffer runs up
+  # to ~7% long in wall time — accepted (D-R4, sample-rate-fidelity plan): the
+  # knob's own constant is heuristic, and a correction needs a measured rate.
   defp tracker_core(detect, policy) do
     case Keyword.fetch!(detect, :tracker) do
       SparseTrack ->
@@ -528,15 +531,13 @@ defmodule Cairn.Pipeline.Camera do
   # instead of from the decode NIF, behind the same contract. A bad
   # motion_json raises here, at pipeline build, where the operator reads a
   # config error rather than a per-frame one.
-  defp motion_gate(camera_id, detect, stream_params) do
+  defp motion_gate(camera_id, stream_params) do
     case Motion.Config.resolve_json(Map.get(stream_params, :motion_json)) do
       {:ok, nil} ->
         nil
 
       {:ok, config} ->
-        # No default: an enabled gate with an unknown sample rate would size
-        # its calibration window silently wrong.
-        %MotionGate{config: config, sample_fps: Keyword.fetch!(detect, :sample_fps)}
+        %MotionGate{config: config}
 
       {:error, message} ->
         raise ArgumentError, "camera #{camera_id}: motion_json: #{message}"

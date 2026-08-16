@@ -259,10 +259,10 @@ defmodule Cairn.Config.ServerTest do
     end
 
     test "a profile's sample_fps restarts the cameras on it" do
-      # The rate is baked into the branch at build time (the decoder opens on
-      # it, the motion gate sizes its calibration window from it, a
-      # frame-counting core its lost-track buffer), and it is a profile field
-      # alone — a camera's own struct does not move when it changes.
+      # The rate is baked into the branch at build time (the decoder's
+      # SampleGate opens on it, a frame-counting core sizes its lost-track
+      # buffer from it), and it is a profile field alone — a camera's own
+      # struct does not move when it changes.
       base = %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1", "plugin" => "detect"}
 
       assert Config.Server.diff_cameras(

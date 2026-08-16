@@ -164,7 +164,6 @@ impl HwDecoder {
         codecpar: &AVCodecParameters,
         spec: InputSpec,
         motion: Option<MotionConfig>,
-        sample_fps: u32,
     ) -> Result<Self> {
         if let Some(scale) = backend.scale_filter() {
             let name = CString::new(scale).expect("filter names are ascii");
@@ -216,7 +215,7 @@ impl HwDecoder {
             backend,
             graph: None,
             spec,
-            rgb: RgbScaler::new(spec, motion, sample_fps)?,
+            rgb: RgbScaler::new(spec, motion)?,
             degraded: false,
         })
     }
@@ -322,16 +321,16 @@ impl Decoder for HwDecoder {
         }
     }
 
-    fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<Sampled>> {
+    fn to_tensor(&mut self, frame: AVFrame, pts_ns: Option<i64>) -> Result<Option<Sampled>> {
         match self.scaled(frame)? {
-            Some((frame, source)) => self.rgb.tensor_from(&frame, source).map(Some),
+            Some((frame, source)) => self.rgb.tensor_from(&frame, source, pts_ns).map(Some),
             None => Ok(None),
         }
     }
 
-    fn to_rgb(&mut self, frame: AVFrame) -> Result<Option<RgbSampled>> {
+    fn to_rgb(&mut self, frame: AVFrame, pts_ns: Option<i64>) -> Result<Option<RgbSampled>> {
         match self.scaled(frame)? {
-            Some((frame, source)) => self.rgb.rgb_from(&frame, source).map(Some),
+            Some((frame, source)) => self.rgb.rgb_from(&frame, source, pts_ns).map(Some),
             None => Ok(None),
         }
     }
@@ -553,7 +552,6 @@ mod tests {
                     resize: crate::infer::ResizePolicy::Stretch,
                 },
                 None,
-                crate::decode::DEFAULT_SAMPLE_FPS,
             );
         }
     }
