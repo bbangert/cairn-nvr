@@ -957,6 +957,21 @@ mod tests {
     }
 
     #[test]
+    fn rescales_pts_to_nanoseconds() {
+        // The motion detector's clock: a reversed rational or a wrong
+        // NS_TIMEBASE here would stretch or shrink every calibration window
+        // silently, so the conversion is pinned the way the 90 kHz one is.
+        assert_eq!(
+            rescale_ns(1000, AVRational { num: 1, den: 1000 }),
+            1_000_000_000
+        );
+        // 450 000 RTP ticks is exactly the five-second calibration boundary.
+        assert_eq!(rescale_ns(450_000, PTS_TIMEBASE), 5_000_000_000);
+        // A caller already on the nanosecond clock passes through unchanged.
+        assert_eq!(rescale_ns(123_456_789, NS_TIMEBASE), 123_456_789);
+    }
+
+    #[test]
     fn the_checked_rescale_refuses_the_time_bases_that_would_fault_libavutil() {
         for bad in [(0, 90_000), (1, 0), (-1, 90_000), (1, -90_000)] {
             assert!(rescale_90k_checked(1000, bad).is_err(), "{bad:?}");
