@@ -116,6 +116,13 @@ impl DecodeStream {
     /// Feed one access unit; convert and hand over its frame only when
     /// `sample` says this call cleared the caller's rate gate.
     ///
+    /// `pts` is in the caller's time base — carried through to the emitted
+    /// frame untouched — except that a decoder opened with motion measurement
+    /// configured reads it as *nanoseconds* (`Membrane.Time`, what the
+    /// pipeline passes): the detector's calibration window is elapsed frame
+    /// time, and this is the seam where a unit has to be a unit
+    /// ([`crate::config::RawDecoderParams::motion_json`]).
+    ///
     /// Never more than one frame, whatever the decoder completed: see
     /// [`sampled_frame`]. A frame the gate skips is skipped by the motion
     /// detector too — it never reaches the background.
@@ -141,7 +148,7 @@ impl DecodeStream {
         let observed_at = SystemTime::now();
         let pts = decode::frame_pts(&frame);
 
-        let sampled = match self.decoder.to_rgb(frame) {
+        let sampled = match self.decoder.to_rgb(frame, pts) {
             Ok(Some(sampled)) => sampled,
             Ok(None) => return Ok(none(true)),
             Err(error) => {
@@ -244,8 +251,8 @@ fn should_log(count: u64) -> bool {
 /// Reordering completes several frames for one access unit, and the caller's rate
 /// gate is one decision per call, so only the first is kept. A dropped frame never
 /// reaches [`Decoder::to_rgb`], so the motion background never absorbs it either
-/// — one access unit stays at most one sample, which is the unit
-/// [`cairn_detect::motion::MotionDetector`]'s calibration window counts in.
+/// — one access unit stays at most one fold into
+/// [`cairn_detect::motion::MotionDetector`]'s background.
 ///
 /// Drained rather than left queued, and the drain continues past a tolerated error:
 /// `avcodec_send_packet` refuses the next packet while output is pending, and
@@ -302,14 +309,8 @@ fn open_decoder(params: &DecoderParams) -> Result<Box<dyn Decoder>> {
             raw.height = source.h as i32;
         }
     }
-    let decoder = decode::open(
-        params.kind,
-        &codecpar,
-        params.spec,
-        params.motion,
-        params.sample_fps,
-    )
-    .map_err(|e| NativeError::OpenStream(chain(&e)))?;
+    let decoder = decode::open(params.kind, &codecpar, params.spec, params.motion)
+        .map_err(|e| NativeError::OpenStream(chain(&e)))?;
     require_named_hardware(params.kind, decoder.as_ref())?;
     Ok(decoder)
 }
@@ -475,11 +476,19 @@ mod tests {
             Ok(Some(frame))
         }
 
-        fn to_tensor(&mut self, _frame: AVFrame) -> anyhow::Result<Option<Sampled>> {
+        fn to_tensor(
+            &mut self,
+            _frame: AVFrame,
+            _pts_ns: Option<i64>,
+        ) -> anyhow::Result<Option<Sampled>> {
             unreachable!("the decode stream converts through to_rgb");
         }
 
-        fn to_rgb(&mut self, _frame: AVFrame) -> anyhow::Result<Option<RgbSampled>> {
+        fn to_rgb(
+            &mut self,
+            _frame: AVFrame,
+            _pts_ns: Option<i64>,
+        ) -> anyhow::Result<Option<RgbSampled>> {
             self.conversions += 1;
             Ok(None)
         }
@@ -678,7 +687,6 @@ mod tests {
             source_width: Some(2560),
             source_height: Some(1920),
             motion_json: None,
-            sample_fps: 5,
         };
 
         let error = open_decoder(&raw.resolve().expect("the params resolve"))

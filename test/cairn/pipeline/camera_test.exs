@@ -389,7 +389,7 @@ defmodule Cairn.Pipeline.CameraTest do
 
     test "an enabled motion_json puts the gate between decoder and inference" do
       params = %{min_score: %{}, motion_json: ~s({"enabled":true,"threshold":30})}
-      spec = spec(detect: detect(stream_params: params, sample_fps: 5))
+      spec = spec(detect: detect(stream_params: params))
       links = links(spec)
 
       # The measurement is the element's (D-C3): the decoder is told nothing
@@ -399,8 +399,7 @@ defmodule Cairn.Pipeline.CameraTest do
       assert child(spec, :infer).stream_params.motion_json == params.motion_json
 
       assert %Cairn.Pipeline.MotionGate{
-               config: %Cairn.Motion.Config{enabled: true, threshold: 30},
-               sample_fps: 5
+               config: %Cairn.Motion.Config{enabled: true, threshold: 30}
              } = child(spec, :motion_gate)
 
       # The same one-frame seam on both sides of the gate.
@@ -415,19 +414,11 @@ defmodule Cairn.Pipeline.CameraTest do
       refute Enum.any?(links, &match?(%{from: :decoder, to: :infer}, &1))
     end
 
-    test "an enabled gate without a sample rate refuses to guess the calibration window" do
-      params = %{min_score: %{}, motion_json: ~s({"enabled":true})}
-
-      assert_raise KeyError, fn ->
-        spec(detect: detect(stream_params: params))
-      end
-    end
-
     test "a malformed motion_json is a build error the operator can read" do
       params = %{min_score: %{}, motion_json: ~s({"treshold":30})}
 
       assert_raise ArgumentError, ~r/cam: motion_json: unknown motion knob/, fn ->
-        spec(detect: detect(stream_params: params, sample_fps: 5))
+        spec(detect: detect(stream_params: params))
       end
     end
   end

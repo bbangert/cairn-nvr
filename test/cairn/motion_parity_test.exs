@@ -9,9 +9,11 @@ defmodule Cairn.MotionParityTest do
   # The Rust side is the decode NIF asked to measure (`motion_json` in the
   # decoder params — the measurement `Cairn.Pipeline.Camera` no longer
   # requests, kept in the crate as exactly this reference). Every access
-  # unit is fed with `sample: true`, so both sides observe every decoded
-  # frame and the frame-counted calibration window crosses identically —
-  # no model, no plugin binary, no wall clock anywhere.
+  # unit is fed with `sample: true` and pts converted to nanoseconds (the
+  # decode_au contract where motion is measured), so both sides observe
+  # every decoded frame on the same clock and the time-based calibration
+  # window flips on the same frame — no model, no plugin binary, no wall
+  # clock anywhere.
   #
   # `:native_parity` is excluded in `test/test_helper.exs` (CI's Elixir job
   # builds no Rust); this needs the NIF, ffmpeg/ffprobe and one clip:
@@ -27,8 +29,8 @@ defmodule Cairn.MotionParityTest do
   @moduletag timeout: 300_000
 
   @clips "data/events/reolink_main"
-  # Plenty to cross a 5 s calibration window at any sample rate below, and
-  # to accumulate drift if there were any to accumulate.
+  # Plenty to cross the 5 s calibration window, and to accumulate drift if
+  # there were any to accumulate.
   @max_aus 400
 
   setup_all do
@@ -46,7 +48,7 @@ defmodule Cairn.MotionParityTest do
 
   @tag :tmp_dir
   test "default knobs: the same verdict on every frame", ctx do
-    verdicts = compare(ctx, ~s({"enabled":true}), 5)
+    verdicts = compare(ctx, ~s({"enabled":true}))
 
     # On the defaults this scene's changes stay under the area floor (its
     # peak fraction is ~6e-4 against 0.005) — "no motion" is the correct
@@ -63,7 +65,7 @@ defmodule Cairn.MotionParityTest do
     # ~64 motion frames of ~360) — so the parity covers verdicts on both
     # sides of every boundary, not just a gate that never opens.
     json = ~s({"enabled":true,"threshold":10,"min_area_fraction":0.0005,"alpha":0.1})
-    verdicts = compare(ctx, json, 3)
+    verdicts = compare(ctx, json)
 
     assert Enum.any?(verdicts, & &1.motion), "the gate never opened — vacuous parity"
     assert Enum.any?(verdicts, &(not &1.motion and not &1.calibrating)), "never closed again"
@@ -71,11 +73,15 @@ defmodule Cairn.MotionParityTest do
 
   # Both measurements over the same decoded frames; returns the agreed
   # verdicts after asserting they agree.
-  defp compare(%{clip: clip, tmp_dir: tmp_dir}, motion_json, sample_fps) do
-    frames = rust_run(clip, tmp_dir, motion_json, sample_fps)
+  defp compare(%{clip: clip, tmp_dir: tmp_dir}, motion_json) do
+    frames = rust_run(clip, tmp_dir, motion_json)
 
-    calibration_frames = 5 * sample_fps
-    assert length(frames) > calibration_frames + 25, "too few frames to say anything"
+    # The window is 5 s of the frames' own time: the clip has to span it
+    # with room to accumulate drift after it, or the comparison says nothing.
+    span_ns = List.last(frames).pts - hd(frames).pts
+
+    assert span_ns > 10 * 1_000_000_000,
+           "the clip spans #{span_ns} ns — too short to say anything"
 
     {:ok, %Config{} = config} = Config.resolve_json(motion_json)
     [first | _] = frames
@@ -84,10 +90,11 @@ defmodule Cairn.MotionParityTest do
       frames
       |> Enum.with_index()
       |> Enum.reduce(
-        {[], Motion.new(config, sample_fps)},
+        {[], Motion.new(config)},
         fn {frame, index}, {mismatches, detector} ->
           thumb = Thumbnail.from_rgb24(frame.payload, frame.width, frame.height)
-          {verdict, detector} = Motion.observe(detector, thumb)
+          # The same pts the crate's detector read inside `decode_au`.
+          {verdict, detector} = Motion.observe(detector, thumb, frame.pts)
 
           mismatches =
             if verdict == frame.motion,
@@ -109,10 +116,17 @@ defmodule Cairn.MotionParityTest do
   # The reference: the crate's own MotionDetector, measuring inside
   # `decode_au` on every frame the software decoder completes. The input
   # spec is hand-written wire terms — motion is measured on the content
-  # rectangle, which only needs *a* model geometry, not a model.
-  defp rust_run(clip, tmp_dir, motion_json, sample_fps) do
-    %{aus: aus} = Parity.read_clip(clip, tmp_dir)
-    aus = Enum.take(aus, @max_aus)
+  # rectangle, which only needs *a* model geometry, not a model. The clip's
+  # container pts are rescaled to nanoseconds before the seam: that is the
+  # unit `decode_au` documents where motion is measured, and the unit
+  # `Cairn.Motion` reads.
+  defp rust_run(clip, tmp_dir, motion_json) do
+    %{aus: aus, time_base: {num, den}} = Parity.read_clip(clip, tmp_dir)
+
+    aus =
+      aus
+      |> Enum.take(@max_aus)
+      |> Enum.map(fn {au, pts} -> {au, div(pts * num * 1_000_000_000, den)} end)
 
     {:ok, decoder} =
       Native.open_decoder("motion_parity", %{
@@ -124,8 +138,7 @@ defmodule Cairn.MotionParityTest do
         resize_pad: 114,
         source_width: nil,
         source_height: nil,
-        motion_json: motion_json,
-        sample_fps: sample_fps
+        motion_json: motion_json
       })
 
     try do

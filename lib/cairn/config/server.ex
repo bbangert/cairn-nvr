@@ -163,7 +163,7 @@ defmodule Cairn.Config.Server do
     :transcode,
     :extra_ffmpeg_args,
     # The gate element is built into the detect branch at birth
-    # (`Cairn.Pipeline.Camera.motion_gate/3`) — a changed scene config is a
+    # (`Cairn.Pipeline.Camera.motion_gate/2`) — a changed scene config is a
     # different branch, not a refreshable knob.
     :motion_json
   ]
@@ -181,8 +181,9 @@ defmodule Cairn.Config.Server do
   # levels, the rate on the profile alone, the cap camera → profile → global —
   # so comparing the camera's own field would miss the rest.
   #
-  # `sample_fps` sizes the motion gate's calibration window and a frame-counting
-  # core's lost-track buffer; `max_live_tracks` is the element's `max_suspended`
+  # `sample_fps` is the branch's delivery rate (SampleGate) and sizes a
+  # frame-counting core's lost-track buffer — the motion gate's calibration
+  # window no longer reads it; `max_live_tracks` is the element's `max_suspended`
   # and `Membrane.MOTTracker.SparseTrack`'s `max_live`. It stays in the policy
   # as well — `Cairn.Tracker` reads its live cap off every batch's context — so
   # a camera on that core gets the new cap either way; this is for the two that

@@ -121,8 +121,9 @@ pub fn motion_for(specs: &[CameraSpec], global: &MotionOverrides) -> Vec<Option<
 /// `--decoder` and `--sample-fps`. Bundled only to keep [`run`]'s own
 /// parameter list under clippy's arity limit — the bundle rides intact down
 /// the stream-thread call chain and splits back into its two values only
-/// where they are finally consumed, since `kind` and `sample_fps` mean
-/// nothing to each other.
+/// where they are finally consumed (`kind` at [`decode::open`], `sample_fps`
+/// at [`decode::run`]'s pacing gate), since the two mean nothing to each
+/// other.
 ///
 /// One value of each for the whole group: both flags are per-process by
 /// design, so there is no per-camera decoder or per-camera rate to carry
@@ -233,7 +234,7 @@ fn open_and_run(
         let stream = &input.streams()[stream_index];
         (
             stream.time_base,
-            decode::open(kind, &stream.codecpar(), input_spec, motion, sample_fps)
+            decode::open(kind, &stream.codecpar(), input_spec, motion)
                 .with_context(|| format!("opening a decoder for camera {}", spec.id))?,
         )
     };

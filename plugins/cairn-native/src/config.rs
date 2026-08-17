@@ -20,15 +20,6 @@ use rustler::NifMap;
 
 use crate::error::{NativeError, Result};
 
-/// The `--sample-fps` range, restated from `main.rs`'s
-/// `value_parser!(u32).range(1..=30)` because clap owns it there and there is
-/// no argv here. The value sizes the motion detector's calibration window
-/// (`CALIBRATION_SECONDS * sample_fps` frames) — the rate gate itself lives
-/// in the pipeline (`Cairn.Pipeline.SampleGate`), reading the same configured
-/// value — so a zero that reached the stages would be a division by zero on
-/// the frame path.
-const SAMPLE_FPS: std::ops::RangeInclusive<u32> = 1..=30;
-
 /// One decoder's config: the term shape. Every key is required — `nil` is how
 /// the host spells an absent value, so a missing key is a host bug and fails
 /// at the decode rather than taking a default here.
@@ -51,8 +42,12 @@ pub struct RawDecoderParams {
     pub source_width: Option<usize>,
     pub source_height: Option<usize>,
     /// `--motion-json` verbatim, or `nil` for a gate that is off.
+    ///
+    /// A configured detector sizes its calibration window on the frames' own
+    /// timestamps, so the pts handed to `decode_au` must be nanoseconds
+    /// (`Membrane.Time`) for a decoder opened with this set — a caller that
+    /// measures no motion passes pts through opaquely, whatever its unit.
     pub motion_json: Option<String>,
-    pub sample_fps: u32,
 }
 
 #[derive(Debug)]
@@ -69,7 +64,6 @@ pub struct DecoderParams {
     /// (`research/board-first-light.md`).
     pub source: Option<InputSize>,
     pub motion: Option<MotionConfig>,
-    pub sample_fps: u32,
 }
 
 impl RawDecoderParams {
@@ -78,14 +72,6 @@ impl RawDecoderParams {
             return Err(NativeError::Config(format!(
                 "input size {}x{} must be positive",
                 self.width, self.height
-            )));
-        }
-        if !SAMPLE_FPS.contains(&self.sample_fps) {
-            return Err(NativeError::Config(format!(
-                "sample_fps must be {}..={}, got {}",
-                SAMPLE_FPS.start(),
-                SAMPLE_FPS.end(),
-                self.sample_fps
             )));
         }
         let overrides = MotionOverrides::parse(self.motion_json.as_deref().unwrap_or("{}"))
@@ -106,7 +92,6 @@ impl RawDecoderParams {
             },
             source: source_size(self.source_width, self.source_height)?,
             motion: motion::resolve(&overrides, &MotionOverrides::default()),
-            sample_fps: self.sample_fps,
         })
     }
 }
@@ -145,7 +130,6 @@ mod tests {
             source_width: Some(2560),
             source_height: Some(1920),
             motion_json: None,
-            sample_fps: 5,
         }
     }
 
@@ -157,7 +141,6 @@ mod tests {
         assert_eq!(resolved.spec.encoding, TensorEncoding::RawBgr);
         assert_eq!(resolved.spec.resize, ResizePolicy::Letterbox { pad: 114 });
         assert!(resolved.motion.is_none());
-        assert_eq!(resolved.sample_fps, 5);
     }
 
     #[test]
@@ -240,31 +223,6 @@ mod tests {
             .resolve()
             .unwrap_err();
             assert_eq!(error.reason(), "config", "{w}x{h}");
-        }
-    }
-
-    #[test]
-    fn sample_fps_is_held_to_the_flags_range() {
-        for rate in [0, 31, 10_000] {
-            let error = RawDecoderParams {
-                sample_fps: rate,
-                ..params()
-            }
-            .resolve()
-            .unwrap_err();
-            assert_eq!(error.reason(), "config", "{rate}");
-        }
-        for rate in [1, 5, 30] {
-            assert_eq!(
-                RawDecoderParams {
-                    sample_fps: rate,
-                    ..params()
-                }
-                .resolve()
-                .unwrap()
-                .sample_fps,
-                rate
-            );
         }
     }
 

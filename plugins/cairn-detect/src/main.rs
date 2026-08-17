@@ -403,13 +403,7 @@ fn run_single(args: &Args) -> Result<()> {
         let stream = &input.streams()[stream_index];
         (
             stream.time_base,
-            decode::open(
-                args.decoder,
-                &stream.codecpar(),
-                input_spec,
-                motion,
-                args.sample_fps,
-            )?,
+            decode::open(args.decoder, &stream.codecpar(), input_spec, motion)?,
         )
     };
 

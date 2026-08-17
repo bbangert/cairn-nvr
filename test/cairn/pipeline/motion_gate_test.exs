@@ -9,8 +9,11 @@ defmodule Cairn.Pipeline.MotionGateTest do
   # copy and every fraction below is exact by inspection.
   @width 96
   @height 54
-  @sample_fps 5
-  @calibration_frames 5 * @sample_fps
+  # The fixture clock: one buffer every 200 ms of pts, a real delivered
+  # 5 fps — the calibration window is time-based (`Cairn.Motion`), so
+  # buffers carry real-scale pts deltas and step 25 is the first past it.
+  @step_ns 200_000_000
+  @window 25
 
   @format %Membrane.RawVideo{
     width: @width,
@@ -21,11 +24,7 @@ defmodule Cairn.Pipeline.MotionGateTest do
   }
 
   defp element(opts \\ []) do
-    options =
-      struct(
-        MotionGate,
-        Keyword.merge([config: %Config{enabled: true}, sample_fps: @sample_fps], opts)
-      )
+    options = struct(MotionGate, Keyword.merge([config: %Config{enabled: true}], opts))
 
     {[], state} = MotionGate.handle_init(%{}, options)
     state
@@ -49,13 +48,16 @@ defmodule Cairn.Pipeline.MotionGateTest do
     top <> bottom
   end
 
-  defp feed(state, payload, pts \\ 0) do
+  defp at(step), do: step * @step_ns
+
+  defp feed(state, payload, pts) do
     MotionGate.handle_buffer(:input, %Buffer{payload: payload, pts: pts}, %{}, state)
   end
 
-  defp observe(state, payload, count) do
-    Enum.reduce(1..count, state, fn _frame, state ->
-      {[buffer: _], state} = feed(state, payload)
+  # Feed `payload` at fixture-clock steps `from..from + count - 1`.
+  defp observe(state, payload, from, count) do
+    Enum.reduce(from..(from + count - 1)//1, state, fn step, state ->
+      {[buffer: _], state} = feed(state, payload, step * @step_ns)
       state
     end)
   end
@@ -91,36 +93,52 @@ defmodule Cairn.Pipeline.MotionGateTest do
   end
 
   test "reports motion once the calibration window has passed" do
-    state = observe(formatted(element()), grey(100), @calibration_frames)
+    state = observe(formatted(element()), grey(100), 0, @window)
 
-    {[buffer: {:output, out}], _state} = feed(state, half(100, 200))
+    {[buffer: {:output, out}], _state} = feed(state, half(100, 200), at(@window))
     assert out.metadata.motion.motion
     refute out.metadata.motion.calibrating
     assert out.metadata.motion.changed_fraction == 0.5
   end
 
   test "a new stream format restarts the measurement at the new geometry" do
-    state = observe(formatted(element()), grey(100), @calibration_frames + 1)
+    state = observe(formatted(element()), grey(100), 0, @window + 1)
 
     narrow = %{@format | width: 64, height: 32}
     state = formatted(state, narrow)
 
-    {[buffer: {:output, out}], _state} = feed(state, grey(200, 64, 32))
+    {[buffer: {:output, out}], _state} = feed(state, grey(200, 64, 32), at(@window + 1))
     assert out.metadata.motion.calibrating
     refute out.metadata.motion.motion
+  end
+
+  test "a buffer without a pts still folds in but cannot end the window" do
+    # The decoder's contract allows `pts: nil` for a frame it could not date;
+    # the detector's clock simply does not advance on one.
+    state = observe(formatted(element()), grey(100), 0, 1)
+
+    state =
+      Enum.reduce(1..(@window + 5), state, fn _frame, state ->
+        {[buffer: {:output, out}], state} = feed(state, grey(100), nil)
+        assert out.metadata.motion.calibrating
+        state
+      end)
+
+    {[buffer: {:output, out}], _state} = feed(state, grey(100), at(@window + 5))
+    refute out.metadata.motion.calibrating
   end
 
   test "a payload that is not the declared geometry crashes rather than misreads" do
     state = formatted(element())
 
     assert_raise ArgumentError, ~r/packed RGB24/, fn ->
-      feed(state, grey(100, 8, 8))
+      feed(state, grey(100, 8, 8), at(0))
     end
   end
 
   test "stats name what was observed and what the verdicts said" do
     state = formatted(element())
-    state = observe(state, grey(100), @calibration_frames - 1)
+    state = observe(state, grey(100), 0, @window - 1)
 
     # Mid-window the stats say so: an operator reading a dark gate needs to
     # tell "still calibrating" from "genuinely still".
@@ -128,18 +146,18 @@ defmodule Cairn.Pipeline.MotionGateTest do
       MotionGate.handle_parent_notification(:stats, %{}, state)
 
     assert warming.calibrating
-    assert warming.observed == @calibration_frames - 1
+    assert warming.observed == @window - 1
 
-    state = observe(state, grey(100), 1)
+    state = observe(state, grey(100), @window - 1, 1)
     # One scene cut (everything changes), then motion (half changes).
-    state = observe(state, grey(230), 1)
-    state = observe(state, half(230, 100), 1)
+    state = observe(state, grey(230), @window, 1)
+    state = observe(state, half(230, 100), @window + 1, 1)
 
     {[notify_parent: {:stats, stats}], _state} =
       MotionGate.handle_parent_notification(:stats, %{}, state)
 
     assert stats == %{
-             observed: @calibration_frames + 2,
+             observed: @window + 2,
              motion: 1,
              scene_cuts: 1,
              calibrating: false

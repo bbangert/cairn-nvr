@@ -609,9 +609,9 @@ mod tests {
         let (mut gate, base) = settled();
         // The state after a plugin-side RTP reopen: the same `Gate`, a brand
         // new `MotionDetector`. Its calibration window reports no motion for
-        // 25 samples whatever is in front of the camera, and no epoch arrives
-        // to bypass with — Cairn did not cause this reconnect and knows
-        // nothing about it.
+        // five seconds of frame time whatever is in front of the camera, and
+        // no epoch arrives to bypass with — Cairn did not cause this
+        // reconnect and knows nothing about it.
         for step in 0..25 {
             assert_eq!(
                 gate.decide(config(), calibrating(), Some(EPOCH), at(base, step * 200)),

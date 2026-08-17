@@ -386,8 +386,7 @@ defmodule Cairn.Native.Parity do
       # a container the same way this decoder reads it from the first SPS.
       source_width: nil,
       source_height: nil,
-      motion_json: params.motion_json,
-      sample_fps: sample_fps
+      motion_json: params.motion_json
     }
 
     {:ok, decoder} = Native.open_decoder(@camera_id, decode_params)

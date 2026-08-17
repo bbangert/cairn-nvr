@@ -10,11 +10,12 @@ defmodule Cairn.Motion do
   fraction of the thumbnail that changed. No contours: the gate only ever
   asks "is anything happening", never "where".
 
-  Pure — no clocks and no I/O. Elapsed time is counted in frames, which is
-  what keeps the calibration independent of how long a stream took to open
-  and the tests independent of wall-clock timing. `new/2` converts the
-  five-second calibration window to a frame count at the caller's sample
-  rate once, exactly as the crate resolves it from `--sample-fps`.
+  Pure — no clocks and no I/O. Elapsed time is read off each frame's own
+  pts (`observe/3`), which is what keeps the calibration independent of how
+  long a stream took to open and the tests independent of wall-clock timing:
+  the five-second window ends when the frames themselves say five seconds
+  have passed, exactly the crate's rule, at whatever rate the camera
+  actually delivers.
 
   ## Why the verdicts are exact, not close
 
@@ -50,22 +51,31 @@ defmodule Cairn.Motion do
   @backend Nx.BinaryBackend
 
   # Rolling-average weight while the background is still being learned, and
-  # how many seconds of frames it is used for — converted to a frame count at
-  # construction, since this module has no clock of its own. The window spans
-  # five seconds of wall clock only when the camera delivers the configured
-  # rate; the rate is a ceiling, so a slower camera stretches it.
+  # how long that learning window lasts, measured on the frames' own pts —
+  # so it spans five seconds of stream time at whatever rate the camera
+  # actually delivers, where a frame count derived from the configured rate
+  # (a ceiling) stretched it.
   @calibration_alpha Config.f32(0.2)
   @calibration_seconds 5
+  @calibration_window_ns @calibration_seconds * 1_000_000_000
+  # The frame floor under the elapsed-time rule: background convergence is
+  # per-frame (each observation folds once at @calibration_alpha), so a
+  # camera delivering absurdly slowly still folds in this many frames before
+  # the gate arms. Ten is the slowest window the frame-counted rule ever
+  # honestly produced — the tier-1 ladder floor of 2 fps over
+  # @calibration_seconds.
+  @calibration_min_frames 10
 
   defstruct [
     :config,
     :background,
     :size,
     :frames,
-    :calibration_frames,
+    :started_at,
     :threshold,
     :alpha,
-    :calibration_alpha
+    :calibration_alpha,
+    calibrated: false
   ]
 
   @typedoc """
@@ -73,17 +83,21 @@ defmodule Cairn.Motion do
   background lives at the thumbnail's geometry, on its 0..255 scale, as an
   f32 tensor; `frames` counts thumbnails observed since calibration last
   restarted (the first frame, or the first at a new geometry — the only two
-  events that restart it). `threshold`/`alpha`/`calibration_alpha` are the
-  config's values as f32 scalar tensors, built once — the per-frame ops
-  inherit their pinned backend, and the hot path allocates nothing but its
-  results.
+  events that restart it); `started_at` is the pts (nanoseconds) of the
+  frame that restarted it, `nil` until a dated frame has been seen; and
+  `calibrated` latches once the elapsed window and the frame floor are both
+  behind us, so a pts anomaly later cannot blind a calibrated detector.
+  `threshold`/`alpha`/`calibration_alpha` are the config's values as f32
+  scalar tensors, built once — the per-frame ops inherit their pinned
+  backend, and the hot path allocates nothing but its results.
   """
   @type t :: %__MODULE__{
           config: Config.t(),
           background: Nx.Tensor.t() | nil,
           size: {pos_integer(), pos_integer()} | nil,
           frames: non_neg_integer(),
-          calibration_frames: pos_integer(),
+          started_at: integer() | nil,
+          calibrated: boolean(),
           threshold: Nx.Tensor.t(),
           alpha: Nx.Tensor.t(),
           calibration_alpha: Nx.Tensor.t()
@@ -110,17 +124,19 @@ defmodule Cairn.Motion do
         }
 
   @doc """
-  A detector for one camera, its calibration window sized to the caller's
-  sample rate — `#{@calibration_seconds} * sample_fps` frames.
+  A detector for one camera. Its calibration window is
+  #{@calibration_seconds} seconds of the frames' own time (`observe/3`), so
+  it needs no sample rate.
   """
-  @spec new(Config.t(), pos_integer()) :: t()
-  def new(%Config{} = config, sample_fps) when is_integer(sample_fps) and sample_fps >= 1 do
+  @spec new(Config.t()) :: t()
+  def new(%Config{} = config) do
     %__MODULE__{
       config: config,
       background: nil,
       size: nil,
       frames: 0,
-      calibration_frames: @calibration_seconds * sample_fps,
+      started_at: nil,
+      calibrated: false,
       threshold: Nx.tensor(config.threshold, type: :f32, backend: @backend),
       alpha: Nx.tensor(config.alpha, type: :f32, backend: @backend),
       calibration_alpha: Nx.tensor(@calibration_alpha, type: :f32, backend: @backend)
@@ -129,6 +145,14 @@ defmodule Cairn.Motion do
 
   @doc """
   Compare one thumbnail against the background, then fold it in.
+
+  `pts_ns` is the frame's own presentation time in nanoseconds
+  (`Membrane.Time`, what the pipeline's buffers carry) — stream time, not
+  wall clock, so a replayed clip calibrates exactly as the live stream did —
+  or `nil` for a frame the decoder could not date, which folds into the
+  background but cannot advance the window's clock. The epoch is arbitrary:
+  only differences are read, and a backward jump while calibrating rebases
+  the window on the new clock rather than waiting for it to catch up.
 
   The first frame — and the first at a new geometry — *becomes* the
   background and reports the fixed still verdict: calibrating by
@@ -140,20 +164,51 @@ defmodule Cairn.Motion do
   camera that cuts on every sample (an IR-cut filter hunting) still finishes
   calibrating rather than sitting at "no motion" for as long as it flickers.
   """
-  @spec observe(t(), Thumbnail.t()) :: {verdict(), t()}
-  def observe(%__MODULE__{} = detector, %Thumbnail{} = thumb) do
+  @spec observe(t(), Thumbnail.t(), integer() | nil) :: {verdict(), t()}
+  def observe(%__MODULE__{} = detector, %Thumbnail{} = thumb, pts_ns)
+      when is_integer(pts_ns) or is_nil(pts_ns) do
     if detector.size != Thumbnail.size(thumb) do
-      {still(), %{take_background(detector, thumb) | frames: 1}}
+      {still(),
+       %{take_background(detector, thumb) | frames: 1, started_at: pts_ns, calibrated: false}}
     else
-      compare(detector, thumb)
+      detector |> latch(pts_ns) |> compare(thumb)
     end
   end
 
+  @doc """
+  Whether the detector is still inside its calibration window — the crate's
+  `calibrating` flag as a question, for stats surfaces that report between
+  frames.
+  """
+  @spec calibrating?(t()) :: boolean()
+  def calibrating?(%__MODULE__{calibrated: calibrated}), do: not calibrated
+
+  # Decided before the frame is folded in, so the flag describes the
+  # background this frame was compared against rather than the one the
+  # comparison produced: the window ends on the first frame whose pts is
+  # @calibration_window_ns past the restart, with `frames` (the count folded
+  # in *before* this one) at the floor. Latched: once over, a pts anomaly
+  # cannot reopen it — only a geometry change starts calibration over.
+  defp latch(%__MODULE__{calibrated: true} = detector, _pts_ns), do: detector
+
+  defp latch(detector, pts_ns) do
+    started_at =
+      case {detector.started_at, pts_ns} do
+        {nil, at} when is_integer(at) -> at
+        # A backward jump while calibrating rebases on the new clock.
+        {started, at} when is_integer(at) and at < started -> at
+        {started, _at} -> started
+      end
+
+    calibrated =
+      detector.frames >= @calibration_min_frames and is_integer(pts_ns) and
+        is_integer(started_at) and pts_ns - started_at >= @calibration_window_ns
+
+    %{detector | started_at: started_at, calibrated: calibrated}
+  end
+
   defp compare(detector, thumb) do
-    # Read before the frame is folded in, so the flag describes the
-    # background this frame was compared against rather than the one the
-    # comparison produced.
-    calibrating = detector.frames < detector.calibration_frames
+    calibrating = not detector.calibrated
     frame = Nx.as_type(thumb.tensor, :f32)
 
     changed =

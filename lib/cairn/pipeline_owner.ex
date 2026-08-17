@@ -382,9 +382,10 @@ defmodule Cairn.PipelineOwner do
   # `sample_fps:` is told to the branch, not asked of it: the engine takes the
   # rate from the profile every membrane camera on this node has to agree on
   # (`Cairn.Config.native_model_config/1`) and the decoder sheds to it, so what
-  # this carries is a reading, for the two elements whose arithmetic counts
-  # frames — the motion gate's calibration window and a frame-counting tracker
-  # core's lost-track buffer.
+  # this carries is a reading, for the one element whose arithmetic counts
+  # frames — a frame-counting tracker core's lost-track buffer. (The motion
+  # gate's calibration window stopped reading it: it is sized on the frames'
+  # own pts.)
   #
   # `tracker:` is resolved here rather than carried in the policy because it
   # wires an element rather than feeding one: a reload cannot swap a core under
@@ -398,7 +399,7 @@ defmodule Cairn.PipelineOwner do
       stream_params: %{
         min_score: state.camera.min_score,
         # The operator's scene knob (D-P6), verbatim from config — the
-        # branch builds its gate element from it (`motion_gate/3`), nil
+        # branch builds its gate element from it (`motion_gate/2`), nil
         # meaning no gate, today's chain exactly.
         motion_json: state.camera.motion_json
       }

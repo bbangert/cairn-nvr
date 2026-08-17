@@ -14,16 +14,25 @@ defmodule Cairn.MotionTest do
   alias Cairn.Motion
   alias Cairn.Motion.{Config, Thumbnail}
 
-  # The crate's `DEFAULT_SAMPLE_FPS`, which its tests pin themselves to; the
-  # calibration window is five seconds of frames at that rate.
-  @sample_fps 5
-  @calibration_frames 5 * @sample_fps
+  # The fixture clock, the crate's tests' own: one observation every 200 ms,
+  # a real delivered 5 fps. Real-scale on purpose — compressing the window in
+  # fixtures changes which stimuli cross a rate threshold (see
+  # `.claude/solutions/compressed-timescale-fixture-changes-what-crosses-a-rate-floor-20260804.md`),
+  # so the 5 s window is spanned by real pts deltas, never shrunk.
+  @step_ns 200_000_000
+  # Observations inside the window on this clock: observation `k` carries pts
+  # `k * @step_ns`, so `k = 25` is the first with five seconds elapsed (and
+  # past the 10-frame floor).
+  @window 25
 
   defp f32(x), do: Config.f32(x)
 
-  # A detector on the defaults, with the gate switched on, at @sample_fps.
+  # The pts an observation at `step` on the fixture clock carries.
+  defp at(step), do: step * @step_ns
+
+  # A detector on the defaults, with the gate switched on.
   defp detector do
-    Motion.new(%Config{enabled: true}, @sample_fps)
+    Motion.new(%Config{enabled: true})
   end
 
   # A thumbnail built directly, bypassing the RGB24 downsample.
@@ -43,16 +52,17 @@ defmodule Cairn.MotionTest do
     %Thumbnail{w: w, h: h, tensor: filled}
   end
 
-  defp observe_still(detector, still, count) do
-    Enum.reduce(1..count, detector, fn _frame, detector ->
-      {_verdict, detector} = Motion.observe(detector, still)
+  # Observe one still frame at fixture-clock steps `from..from + count - 1`.
+  defp observe_still(detector, still, from, count) do
+    Enum.reduce(from..(from + count - 1)//1, detector, fn step, detector ->
+      {_verdict, detector} = Motion.observe(detector, still, at(step))
       detector
     end)
   end
 
   # Run a detector to the end of its calibration window on one still frame,
-  # so the next observation is the first that can report motion.
-  defp calibrate(detector, still), do: observe_still(detector, still, @calibration_frames)
+  # so the observation at step `@window` is the first that can report motion.
+  defp calibrate(detector, still), do: observe_still(detector, still, 0, @window)
 
   # A packed RGB24 buffer filled by `pixel(x, y) -> {r, g, b}`.
   defp rgb24(w, h, pixel) do
@@ -72,71 +82,131 @@ defmodule Cairn.MotionTest do
     # The first frame becomes the background; every frame in the window after
     # it differs from that background by a quarter of the picture and still
     # reports no motion.
-    {_verdict, warming} = Motion.observe(warming, still)
+    {_verdict, warming} = Motion.observe(warming, still, at(0))
 
-    Enum.reduce(1..(@calibration_frames - 1), warming, fn frame, warming ->
-      {verdict, warming} = Motion.observe(warming, moved)
-      refute verdict.motion, "frame #{frame}"
+    Enum.reduce(1..(@window - 1), warming, fn step, warming ->
+      {verdict, warming} = Motion.observe(warming, moved, at(step))
+      refute verdict.motion, "step #{step}"
       warming
     end)
 
     # ...and it is the window that says so, not the picture: a detector past
     # it has an opinion about the very same frame.
     calibrated = calibrate(detector(), still)
-    {verdict, _} = Motion.observe(calibrated, moved)
+    {verdict, _} = Motion.observe(calibrated, moved, at(@window))
     assert verdict.motion
   end
 
-  test "the calibration window is exactly the documented number of observations" do
+  test "the calibration window ends on the first frame with five seconds elapsed" do
     still = thumb(96, 54, 100)
     moved = block(96, 54, 100, 48, 27, 200)
 
-    last_inside = observe_still(detector(), still, @calibration_frames - 1)
-    {verdict, _} = Motion.observe(last_inside, moved)
-    refute verdict.motion, "observation #{@calibration_frames} is still inside the window"
+    last_inside = observe_still(detector(), still, 0, @window - 1)
+    {verdict, _} = Motion.observe(last_inside, moved, at(@window - 1))
+    refute verdict.motion, "one step short of five seconds"
     assert verdict.calibrating
 
-    first_outside = observe_still(detector(), still, @calibration_frames)
-    {verdict, _} = Motion.observe(first_outside, moved)
-    assert verdict.motion, "observation #{@calibration_frames + 1} is the first outside it"
+    first_outside = observe_still(detector(), still, 0, @window)
+    {verdict, _} = Motion.observe(first_outside, moved, at(@window))
+    assert verdict.motion, "the first frame with five seconds elapsed"
     refute verdict.calibrating
   end
 
-  test "the calibration window scales with the configured sample rate" do
-    # Five seconds is the invariant, not 25 frames: a detector built for a
-    # doubled rate spends twice as many frames calibrating.
+  test "the calibration window spans five seconds at any delivered rate" do
+    # The invariant the time basis buys: the window is five seconds of the
+    # stream's own time however fast frames actually arrive.
     still = thumb(96, 54, 100)
     moved = block(96, 54, 100, 48, 27, 200)
-    fast_frames = 5 * (@sample_fps * 2)
-    assert fast_frames == @calibration_frames * 2
 
-    doubled = fn -> Motion.new(%Config{enabled: true}, @sample_fps * 2) end
+    # 10 fps delivered needs 50 observations; 2 fps (the tier-1 ladder
+    # floor) needs 10 — the frame floor and the elapsed rule agree there.
+    for {label, step_ns, steps} <- [{"10 fps", 100_000_000, 50}, {"2 fps", 500_000_000, 10}] do
+      warming =
+        Enum.reduce(0..(steps - 1), detector(), fn step, warming ->
+          {verdict, warming} = Motion.observe(warming, still, step * step_ns)
+          assert verdict.calibrating, "#{label}: step #{step}"
+          warming
+        end)
 
-    last_inside = observe_still(doubled.(), still, fast_frames - 1)
-    {verdict, _} = Motion.observe(last_inside, moved)
-    assert verdict.calibrating, "still inside the doubled-rate window"
+      {verdict, _} = Motion.observe(warming, moved, steps * step_ns)
+      refute verdict.calibrating, "#{label}: five seconds elapsed"
+      assert verdict.motion, label
+    end
+  end
 
-    first_outside = observe_still(doubled.(), still, fast_frames)
-    {verdict, _} = Motion.observe(first_outside, moved)
-    refute verdict.calibrating, "first observation outside it"
-    assert verdict.motion
+  test "a camera below the frame floor calibrates on frames not time" do
+    # One frame a second: five seconds elapse after five frames, but five
+    # folds are not a learned background — the 10-frame floor holds the
+    # window open until enough frames have folded in.
+    still = thumb(96, 54, 100)
+    step_ns = 1_000_000_000
+
+    warming =
+      Enum.reduce(0..9, detector(), fn step, warming ->
+        {verdict, warming} = Motion.observe(warming, still, step * step_ns)
+        assert verdict.calibrating, "step #{step}"
+        warming
+      end)
+
+    {verdict, _} = Motion.observe(warming, still, 10 * step_ns)
+    refute verdict.calibrating, "the floor is met and time long since"
+  end
+
+  test "undated frames advance the floor but never the clock" do
+    # A decoder that cannot date a frame hands `nil`: the frame still folds
+    # into the background, but it cannot end the window — and once the
+    # window is over, the latch means it cannot reopen it either.
+    still = thumb(96, 54, 100)
+    {_verdict, warming} = Motion.observe(detector(), still, at(0))
+
+    warming =
+      Enum.reduce(1..(@window + 5), warming, fn step, warming ->
+        {verdict, warming} = Motion.observe(warming, still, nil)
+        assert verdict.calibrating, "step #{step}"
+        warming
+      end)
+
+    # A dated frame past the window ends it...
+    {verdict, calibrated} = Motion.observe(warming, still, at(@window + 5))
+    refute verdict.calibrating
+    # ...and undated frames after it stay calibrated.
+    {verdict, _} = Motion.observe(calibrated, still, nil)
+    refute verdict.calibrating
+  end
+
+  test "a backward pts jump rebases the window instead of waiting out the gap" do
+    # A camera that resets its clock mid-calibration would otherwise hold
+    # elapsed at zero until the new clock caught the old baseline up. The
+    # window rebases onto step 1's pts, so it ends five seconds after that.
+    still = thumb(96, 54, 100)
+    {_verdict, warming} = Motion.observe(detector(), still, 100_000_000_000)
+
+    warming =
+      Enum.reduce(1..@window, warming, fn step, warming ->
+        {verdict, warming} = Motion.observe(warming, still, at(step))
+        assert verdict.calibrating, "step #{step}"
+        warming
+      end)
+
+    {verdict, _} = Motion.observe(warming, still, at(@window + 1))
+    refute verdict.calibrating
   end
 
   test "every observation of the calibration window is flagged as one" do
     warming = detector()
     still = thumb(96, 54, 100)
 
-    {verdict, warming} = Motion.observe(warming, still)
+    {verdict, warming} = Motion.observe(warming, still, at(0))
     assert verdict.calibrating, "the first frame"
 
     warming =
-      Enum.reduce(1..(@calibration_frames - 1), warming, fn frame, warming ->
-        {verdict, warming} = Motion.observe(warming, still)
-        assert verdict.calibrating, "frame #{frame}"
+      Enum.reduce(1..(@window - 1), warming, fn step, warming ->
+        {verdict, warming} = Motion.observe(warming, still, at(step))
+        assert verdict.calibrating, "step #{step}"
         warming
       end)
 
-    {verdict, _} = Motion.observe(warming, still)
+    {verdict, _} = Motion.observe(warming, still, at(@window))
     refute verdict.calibrating, "the first one past it"
   end
 
@@ -149,18 +219,18 @@ defmodule Cairn.MotionTest do
     bright = thumb(96, 54, 200)
 
     flickering =
-      Enum.reduce(0..(@calibration_frames - 1), flickering, fn observation, flickering ->
-        flip = if rem(observation, 2) == 0, do: bright, else: dark
-        {verdict, flickering} = Motion.observe(flickering, flip)
-        refute verdict.motion, "#{observation}"
+      Enum.reduce(0..(@window - 1), flickering, fn step, flickering ->
+        flip = if rem(step, 2) == 0, do: bright, else: dark
+        {verdict, flickering} = Motion.observe(flickering, flip, at(step))
+        refute verdict.motion, "#{step}"
         # The first frame *is* the background; every one after it is a cut.
-        assert verdict.scene_cut == observation > 0, "#{observation}"
+        assert verdict.scene_cut == step > 0, "#{step}"
         flickering
       end)
 
     # Calibrated, on the scene the last cut left behind.
-    settled = if rem(@calibration_frames, 2) == 0, do: 40, else: 200
-    {verdict, _} = Motion.observe(flickering, block(96, 54, settled, 48, 27, 120))
+    settled = if rem(@window, 2) == 0, do: 40, else: 200
+    {verdict, _} = Motion.observe(flickering, block(96, 54, settled, 48, 27, 120), at(@window))
     assert verdict.motion
   end
 
@@ -168,8 +238,8 @@ defmodule Cairn.MotionTest do
     still = thumb(96, 54, 120)
     detector = calibrate(detector(), still)
 
-    Enum.reduce(1..50, detector, fn _frame, detector ->
-      {verdict, detector} = Motion.observe(detector, still)
+    Enum.reduce(@window..(@window + 49), detector, fn step, detector ->
+      {verdict, detector} = Motion.observe(detector, still, at(step))
       assert verdict.changed_fraction == 0.0
       refute verdict.motion
       detector
@@ -183,34 +253,32 @@ defmodule Cairn.MotionTest do
     still = thumb(96, 54, 100)
     detector = calibrate(detector(), still)
 
-    {verdict, _} = Motion.observe(detector, block(96, 54, 100, 48, 27, 200))
+    {verdict, _} = Motion.observe(detector, block(96, 54, 100, 48, 27, 200), at(@window))
     assert verdict.motion
     assert verdict.changed_fraction == 0.25
   end
 
   test "a change under the area floor is not motion but is still measured" do
-    detector =
-      Motion.new(%Config{enabled: true, min_area_fraction: f32(0.1)}, @sample_fps)
+    detector = Motion.new(%Config{enabled: true, min_area_fraction: f32(0.1)})
 
     still = thumb(100, 10, 100)
     detector = calibrate(detector, still)
 
     # 50 of 1000 pixels: half the floor.
-    {verdict, _} = Motion.observe(detector, block(100, 10, 100, 50, 1, 200))
+    {verdict, _} = Motion.observe(detector, block(100, 10, 100, 50, 1, 200), at(@window))
     refute verdict.motion
     assert verdict.changed_fraction == f32(0.05)
   end
 
   test "a change exactly at the area floor counts as motion" do
     # The compare is `>=`, so the floor is the first fraction that counts.
-    detector =
-      Motion.new(%Config{enabled: true, min_area_fraction: f32(0.1)}, @sample_fps)
+    detector = Motion.new(%Config{enabled: true, min_area_fraction: f32(0.1)})
 
     still = thumb(100, 10, 100)
     detector = calibrate(detector, still)
 
     # 100 of 1000 pixels: the floor exactly.
-    {verdict, _} = Motion.observe(detector, block(100, 10, 100, 100, 1, 200))
+    {verdict, _} = Motion.observe(detector, block(100, 10, 100, 100, 1, 200), at(@window))
     assert verdict.changed_fraction == f32(0.1)
     assert verdict.motion
   end
@@ -222,13 +290,13 @@ defmodule Cairn.MotionTest do
     detector = calibrate(detector(), still)
 
     # 80 of 100 pixels.
-    {verdict, detector} = Motion.observe(detector, block(10, 10, 100, 10, 8, 200))
+    {verdict, detector} = Motion.observe(detector, block(10, 10, 100, 10, 8, 200), at(@window))
     assert verdict.changed_fraction == Config.lightning_fraction()
     assert verdict.motion
 
     # ...and it went through the rolling average, not the rebaseline: a cut
     # would have taken the new scene outright and read 0.0 next.
-    {held, _} = Motion.observe(detector, block(10, 10, 100, 10, 8, 200))
+    {held, _} = Motion.observe(detector, block(10, 10, 100, 10, 8, 200), at(@window + 1))
     assert held.changed_fraction == Config.lightning_fraction()
   end
 
@@ -251,7 +319,7 @@ defmodule Cairn.MotionTest do
     detector = calibrate(detector(), noisy.(0))
 
     # Every pixel swings the full 20 levels, under the threshold of 25.
-    {verdict, _} = Motion.observe(detector, noisy.(1))
+    {verdict, _} = Motion.observe(detector, noisy.(1), at(@window))
     assert verdict.changed_fraction == 0.0
     refute verdict.motion
   end
@@ -261,7 +329,7 @@ defmodule Cairn.MotionTest do
     detector = calibrate(detector(), dark)
 
     bright = thumb(96, 54, 200)
-    {flash, detector} = Motion.observe(detector, bright)
+    {flash, detector} = Motion.observe(detector, bright, at(@window))
     assert flash.changed_fraction == 1.0
     refute flash.motion, "a scene cut is not motion"
     assert flash.scene_cut
@@ -269,23 +337,23 @@ defmodule Cairn.MotionTest do
 
     # The background is the new scene outright, so the very next frame is
     # judged against it — not averaged toward it over the next 50 frames.
-    {settled, detector} = Motion.observe(detector, bright)
+    {settled, detector} = Motion.observe(detector, bright, at(@window + 1))
     assert settled.changed_fraction == 0.0
     refute settled.motion
     refute settled.scene_cut
     refute settled.calibrating
 
     # ...and the detector is still calibrated: it did not go blind.
-    {verdict, _} = Motion.observe(detector, block(96, 54, 200, 48, 27, 40))
+    {verdict, _} = Motion.observe(detector, block(96, 54, 200, 48, 27, 40), at(@window + 2))
     assert verdict.motion
   end
 
   test "a scene cut inside the calibration window carries both flags" do
     # The two "this says nothing about the picture" bits are independent.
     warming = detector()
-    {_verdict, warming} = Motion.observe(warming, thumb(96, 54, 40))
+    {_verdict, warming} = Motion.observe(warming, thumb(96, 54, 40), at(0))
 
-    {flash, _} = Motion.observe(warming, thumb(96, 54, 200))
+    {flash, _} = Motion.observe(warming, thumb(96, 54, 200), at(1))
     assert flash.changed_fraction == 1.0
     assert flash.scene_cut
     assert flash.calibrating
@@ -295,11 +363,12 @@ defmodule Cairn.MotionTest do
   test "a geometry change starts over rather than comparing mismatched frames" do
     detector = calibrate(detector(), thumb(96, 54, 100))
 
-    {verdict, detector} = Motion.observe(detector, thumb(96, 72, 200))
+    {verdict, detector} = Motion.observe(detector, thumb(96, 72, 200), at(@window))
     assert verdict == %{changed_fraction: 0.0, motion: false, calibrating: true, scene_cut: false}
 
-    # ...and it re-calibrates at the new geometry.
-    {verdict, _} = Motion.observe(detector, block(96, 72, 200, 96, 36, 40))
+    # ...and it re-calibrates at the new geometry: a whole fresh window,
+    # rebased on the pts the geometry changed at.
+    {verdict, _} = Motion.observe(detector, block(96, 72, 200, 96, 36, 40), at(@window + 1))
     refute verdict.motion
     assert verdict.calibrating
   end
@@ -317,9 +386,9 @@ defmodule Cairn.MotionTest do
       |> then(&%Thumbnail{w: 4, h: 4, tensor: &1})
 
     fraction_at = fn threshold ->
-      detector = Motion.new(%Config{enabled: true, threshold: threshold}, @sample_fps)
+      detector = Motion.new(%Config{enabled: true, threshold: threshold})
       detector = calibrate(detector, still)
-      {verdict, _} = Motion.observe(detector, banded)
+      {verdict, _} = Motion.observe(detector, banded, at(@window))
       verdict.changed_fraction
     end
 
@@ -342,11 +411,11 @@ defmodule Cairn.MotionTest do
     held = block(20, 20, 100, 20, 10, 160)
 
     frames_to_settle = fn alpha ->
-      detector = Motion.new(%Config{enabled: true, alpha: f32(alpha)}, @sample_fps)
+      detector = Motion.new(%Config{enabled: true, alpha: f32(alpha)})
       detector = calibrate(detector, still)
 
       Enum.reduce_while(1..500, detector, fn frame, detector ->
-        {verdict, detector} = Motion.observe(detector, held)
+        {verdict, detector} = Motion.observe(detector, held, at(@window + frame))
         if verdict.motion, do: {:cont, detector}, else: {:halt, frame}
       end)
     end
@@ -455,7 +524,7 @@ defmodule Cairn.MotionTest do
       )
 
     detector = calibrate(detector(), still)
-    {verdict, _} = Motion.observe(detector, moved)
+    {verdict, _} = Motion.observe(detector, moved, at(@window))
     assert verdict.motion
     assert_in_delta verdict.changed_fraction, 0.5, 0.02
   end

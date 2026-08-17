@@ -131,7 +131,7 @@ fn engine(artifacts: &Artifacts) -> Arc<Engine> {
 /// exercises the exact term path a resolved spec takes between the two NIF
 /// libraries. Software decode: a box without the GPU the hardware paths need
 /// has to get the same answer as one with it.
-fn decoder_params(engine: &Engine, sample_fps: u32) -> RawDecoderParams {
+fn decoder_params(engine: &Engine) -> RawDecoderParams {
     let spec = engine.input_spec;
     let (resize, resize_pad) = spec.resize.wire();
     RawDecoderParams {
@@ -147,7 +147,6 @@ fn decoder_params(engine: &Engine, sample_fps: u32) -> RawDecoderParams {
         source_width: None,
         source_height: None,
         motion_json: None,
-        sample_fps,
     }
 }
 
@@ -249,7 +248,7 @@ impl Rig {
             decoder: DecoderRef::new(
                 DecodeStream::open(
                     camera_id.to_string(),
-                    decoder_params(engine, sample_fps)
+                    decoder_params(engine)
                         .resolve()
                         .expect("the params resolve"),
                 )
@@ -524,12 +523,9 @@ fn a_panic_while_the_decoder_opens_leaves_the_camera_openable() {
 
     crate::decoder::panic_in_the_next_open();
     let panicked = crate::guarded("open_decoder", || {
-        DecodeStream::open(
-            "front".into(),
-            decoder_params(&engine, 30).resolve().unwrap(),
-        )
-        .map(|_| ())
-        .map_err(|e| crate::error::NativeError::OpenStream(e.message().to_string()))
+        DecodeStream::open("front".into(), decoder_params(&engine).resolve().unwrap())
+            .map(|_| ())
+            .map_err(|e| crate::error::NativeError::OpenStream(e.message().to_string()))
     });
     assert_eq!(
         panicked.unwrap_err().reason(),
@@ -743,11 +739,7 @@ fn a_poisoned_stream_closes_and_its_camera_can_be_opened_again() {
     drop(front);
     let rig = Rig {
         decoder: DecoderRef::new(
-            DecodeStream::open(
-                "front".into(),
-                decoder_params(&engine, 30).resolve().unwrap(),
-            )
-            .unwrap(),
+            DecodeStream::open("front".into(), decoder_params(&engine).resolve().unwrap()).unwrap(),
         ),
         stream: reopened,
         time_base: clip.time_base,

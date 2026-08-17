@@ -175,20 +175,26 @@ pub trait Decoder: Send {
     /// Scale and convert a sampled frame into the model input tensor, and
     /// measure its motion on the way when the gate is configured.
     ///
+    /// `pts_ns` is the frame's presentation time in nanoseconds — the
+    /// caller's, because only the caller knows the stream's time base — and
+    /// exists for the motion detector's elapsed-time calibration window
+    /// ([`crate::motion::MotionDetector::observe`]); `None` for a frame the
+    /// decoder could not date.
+    ///
     /// Takes ownership because the hardware path feeds the frame straight
     /// into a filter graph, which consumes it. `Ok(None)` means "no tensor
     /// for this frame, try the next one" — a filter graph that has not
     /// produced output yet is not an error. A skipped frame is skipped by the
     /// motion detector too: it never reaches the background, which is
     /// unchanged by it.
-    fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<Sampled>>;
+    fn to_tensor(&mut self, frame: AVFrame, pts_ns: Option<i64>) -> Result<Option<Sampled>>;
 
     /// [`Self::to_tensor`]'s decode-side half: scale and convert a sampled
     /// frame to the content-rect RGB24 image, measuring motion on the way,
     /// and leave the tensor packing to the consumer
-    /// ([`model_input_from_rgb`]). Same ownership and `Ok(None)` contract as
-    /// `to_tensor`.
-    fn to_rgb(&mut self, frame: AVFrame) -> Result<Option<RgbSampled>>;
+    /// ([`model_input_from_rgb`]). Same ownership, `pts_ns` and `Ok(None)`
+    /// contract as `to_tensor`.
+    fn to_rgb(&mut self, frame: AVFrame, pts_ns: Option<i64>) -> Result<Option<RgbSampled>>;
 
     /// The hardware backend this decoder opened on, `None` for software decode.
     ///
@@ -237,25 +243,18 @@ const MAX_PIXELS: i64 = 32 * 1024 * 1024;
 /// off for it — see [`crate::motion::resolve`]. It reaches the decoder rather
 /// than the inference thread because the detector's state is per camera, and
 /// one decoder is what "per camera" means on this side in both modes.
-///
-/// `sample_fps` is the process's resolved `--sample-fps` — one rate for every
-/// camera this process serves, single mode or grouped, since the flag is
-/// per-process by design. It reaches the decoder for the same reason `motion`
-/// does: [`RgbScaler`]'s [`crate::motion::MotionDetector`] derives its
-/// calibration window from it.
 pub fn open(
     kind: DecoderKind,
     codecpar: &AVCodecParameters,
     spec: InputSpec,
     motion: Option<MotionConfig>,
-    sample_fps: u32,
 ) -> Result<Box<dyn Decoder>> {
     let order = probe_order(kind);
     if order.is_empty() && kind != DecoderKind::Sw && kind != DecoderKind::Auto {
         note!("decoder {kind} is not available on this platform");
     }
     for backend in order {
-        match HwDecoder::open(backend, codecpar, spec, motion, sample_fps) {
+        match HwDecoder::open(backend, codecpar, spec, motion) {
             Ok(decoder) => return Ok(Box::new(decoder)),
             Err(e) => note!("hardware decoder {backend} unavailable: {e:#}"),
         }
@@ -263,9 +262,7 @@ pub fn open(
     if kind != DecoderKind::Sw {
         note!("no hardware decoder opened; falling back to software decode");
     }
-    Ok(Box::new(SwDecoder::open(
-        codecpar, spec, motion, sample_fps,
-    )?))
+    Ok(Box::new(SwDecoder::open(codecpar, spec, motion)?))
 }
 
 /// Backends to try, in order, for a given `--decoder` value.
@@ -367,14 +364,11 @@ impl Target {
 }
 
 impl RgbScaler {
-    /// `sample_fps` is only ever read here to build the [`MotionDetector`]'s
-    /// calibration window — see [`MotionDetector::new`] — and is otherwise
-    /// unused: nothing else this type does depends on how often it is called.
-    pub fn new(spec: InputSpec, motion: Option<MotionConfig>, sample_fps: u32) -> Result<Self> {
+    pub fn new(spec: InputSpec, motion: Option<MotionConfig>) -> Result<Self> {
         Ok(Self {
             spec,
             target: None,
-            motion: motion.map(|config| MotionDetector::new(config, sample_fps)),
+            motion: motion.map(MotionDetector::new),
             #[cfg(feature = "gles")]
             gl: GlState::Untried,
         })
@@ -469,12 +463,17 @@ impl RgbScaler {
         Ok(())
     }
 
-    pub fn tensor_from(&mut self, frame: &AVFrame, source: InputSize) -> Result<Sampled> {
+    pub fn tensor_from(
+        &mut self,
+        frame: &AVFrame,
+        source: InputSize,
+        pts_ns: Option<i64>,
+    ) -> Result<Sampled> {
         let spec = self.spec;
         #[cfg(feature = "gles")]
         if let Some((rgb, fit)) = self.gl_scale(frame, source) {
             let stride = fit.inner.w * 3;
-            let motion = observe(&mut self.motion, &rgb, stride, fit.inner);
+            let motion = observe(&mut self.motion, &rgb, stride, fit.inner, pts_ns);
             return Ok(Sampled {
                 input: ModelInput {
                     tensor: pack_chw(&rgb, stride, fit, spec),
@@ -487,7 +486,7 @@ impl RgbScaler {
         let target = self.target.as_mut().expect("target was just set");
         let fit = target.fit;
         let (plane, stride) = target.scale(frame)?;
-        let motion = observe(&mut self.motion, plane, stride, fit.inner);
+        let motion = observe(&mut self.motion, plane, stride, fit.inner, pts_ns);
         Ok(Sampled {
             input: ModelInput {
                 tensor: pack_chw(plane, stride, fit, spec),
@@ -501,10 +500,15 @@ impl RgbScaler {
     /// itself, rows packed tight, with the same motion measurement taken on
     /// the way — the bytes [`model_input_from_rgb`] packs on the far side of
     /// the seam into the tensor this method would have.
-    pub fn rgb_from(&mut self, frame: &AVFrame, source: InputSize) -> Result<RgbSampled> {
+    pub fn rgb_from(
+        &mut self,
+        frame: &AVFrame,
+        source: InputSize,
+        pts_ns: Option<i64>,
+    ) -> Result<RgbSampled> {
         #[cfg(feature = "gles")]
         if let Some((rgb, fit)) = self.gl_scale(frame, source) {
-            let motion = observe(&mut self.motion, &rgb, fit.inner.w * 3, fit.inner);
+            let motion = observe(&mut self.motion, &rgb, fit.inner.w * 3, fit.inner, pts_ns);
             return Ok(RgbSampled {
                 rgb,
                 content: fit.inner,
@@ -516,7 +520,7 @@ impl RgbScaler {
         let target = self.target.as_mut().expect("target was just set");
         let fit = target.fit;
         let (plane, stride) = target.scale(frame)?;
-        let motion = observe(&mut self.motion, plane, stride, fit.inner);
+        let motion = observe(&mut self.motion, plane, stride, fit.inner, pts_ns);
         let mut rgb = Vec::with_capacity(fit.inner.w * 3 * fit.inner.h);
         for y in 0..fit.inner.h {
             rgb.extend_from_slice(&plane[y * stride..y * stride + fit.inner.w * 3]);
@@ -590,10 +594,11 @@ fn observe(
     plane: &[u8],
     stride: usize,
     content: InputSize,
+    pts_ns: Option<i64>,
 ) -> Option<MotionVerdict> {
     motion
         .as_mut()
-        .map(|detector| detector.observe(&GrayThumb::from_rgb24(plane, stride, content)))
+        .map(|detector| detector.observe(&GrayThumb::from_rgb24(plane, stride, content), pts_ns))
 }
 
 struct SwDecoder {
@@ -606,7 +611,6 @@ impl SwDecoder {
         codecpar: &AVCodecParameters,
         spec: InputSpec,
         motion: Option<MotionConfig>,
-        sample_fps: u32,
     ) -> Result<Self> {
         let codec = AVCodec::find_decoder(codecpar.codec_id)
             .ok_or_else(|| anyhow!("no decoder for codec id {}", codecpar.codec_id))?;
@@ -619,7 +623,7 @@ impl SwDecoder {
         note!("decoder: software ({})", codec.name().to_string_lossy());
         Ok(Self {
             ctx,
-            rgb: RgbScaler::new(spec, motion, sample_fps)?,
+            rgb: RgbScaler::new(spec, motion)?,
         })
     }
 }
@@ -643,14 +647,14 @@ impl Decoder for SwDecoder {
         }
     }
 
-    fn to_tensor(&mut self, frame: AVFrame) -> Result<Option<Sampled>> {
+    fn to_tensor(&mut self, frame: AVFrame, pts_ns: Option<i64>) -> Result<Option<Sampled>> {
         let source = source_size(&frame)?;
-        self.rgb.tensor_from(&frame, source).map(Some)
+        self.rgb.tensor_from(&frame, source, pts_ns).map(Some)
     }
 
-    fn to_rgb(&mut self, frame: AVFrame) -> Result<Option<RgbSampled>> {
+    fn to_rgb(&mut self, frame: AVFrame, pts_ns: Option<i64>) -> Result<Option<RgbSampled>> {
         let source = source_size(&frame)?;
-        self.rgb.rgb_from(&frame, source).map(Some)
+        self.rgb.rgb_from(&frame, source, pts_ns).map(Some)
     }
 
     fn hw_backend(&self) -> Option<HwBackend> {
@@ -815,11 +819,12 @@ pub fn run(
             let observed_at = SystemTime::now();
 
             let pts_90k = pts_90k(&frame, time_base);
+            let pts_ns = frame_pts(&frame).map(|pts| rescale_ns(pts, time_base));
             // A frame we cannot convert costs one sample, not the process:
             // sws has no path for a mid-stream format change, a filter graph
             // rebuild can fail transiently, and restarting is expensive (model
             // load plus up to a minute of open retries).
-            let Sampled { input, motion } = match decoder.to_tensor(frame) {
+            let Sampled { input, motion } = match decoder.to_tensor(frame, pts_ns) {
                 Ok(Some(sampled)) => sampled,
                 Ok(None) => continue,
                 Err(e) => {
@@ -885,6 +890,20 @@ pub fn rescale_90k(pts: i64, time_base: AVRational) -> i64 {
     av_rescale_q(pts, time_base, PTS_TIMEBASE)
 }
 
+/// `time_base` ticks onto the nanosecond clock the motion detector's
+/// calibration window is measured on ([`crate::motion::MotionDetector`]) —
+/// the NIF path's frames already arrive dated in nanoseconds
+/// (`Membrane.Time`), so nanoseconds are the one clock both producers can
+/// spell a frame's age in.
+pub fn rescale_ns(pts: i64, time_base: AVRational) -> i64 {
+    av_rescale_q(pts, time_base, NS_TIMEBASE)
+}
+
+const NS_TIMEBASE: AVRational = AVRational {
+    num: 1,
+    den: 1_000_000_000,
+};
+
 /// [`rescale_90k`] over a caller-supplied `(num, den)`, refused rather than
 /// trusted: `av_rescale_q` divides by the denominator and reads the sign of
 /// both, so a zero or negative term is not a slightly wrong timestamp but an
@@ -938,6 +957,21 @@ mod tests {
     }
 
     #[test]
+    fn rescales_pts_to_nanoseconds() {
+        // The motion detector's clock: a reversed rational or a wrong
+        // NS_TIMEBASE here would stretch or shrink every calibration window
+        // silently, so the conversion is pinned the way the 90 kHz one is.
+        assert_eq!(
+            rescale_ns(1000, AVRational { num: 1, den: 1000 }),
+            1_000_000_000
+        );
+        // 450 000 RTP ticks is exactly the five-second calibration boundary.
+        assert_eq!(rescale_ns(450_000, PTS_TIMEBASE), 5_000_000_000);
+        // A caller already on the nanosecond clock passes through unchanged.
+        assert_eq!(rescale_ns(123_456_789, NS_TIMEBASE), 123_456_789);
+    }
+
+    #[test]
     fn the_checked_rescale_refuses_the_time_bases_that_would_fault_libavutil() {
         for bad in [(0, 90_000), (1, 0), (-1, 90_000), (1, -90_000)] {
             assert!(rescale_90k_checked(1000, bad).is_err(), "{bad:?}");
@@ -986,11 +1020,11 @@ mod tests {
 
         // Fresh scalers so neither run's motion state has seen the other's frame.
         let motion = Some(MotionConfig::default());
-        let mut unsplit = RgbScaler::new(spec, motion, DEFAULT_SAMPLE_FPS).unwrap();
-        let whole = unsplit.tensor_from(&frame, source).unwrap();
+        let mut unsplit = RgbScaler::new(spec, motion).unwrap();
+        let whole = unsplit.tensor_from(&frame, source, Some(0)).unwrap();
 
-        let mut split = RgbScaler::new(spec, motion, DEFAULT_SAMPLE_FPS).unwrap();
-        let sampled = split.rgb_from(&frame, source).unwrap();
+        let mut split = RgbScaler::new(spec, motion).unwrap();
+        let sampled = split.rgb_from(&frame, source, Some(0)).unwrap();
         assert_eq!(sampled.source, source);
         assert_eq!(sampled.rgb.len(), sampled.content.w * 3 * sampled.content.h);
 
@@ -1109,13 +1143,7 @@ mod tests {
             raw.width = 1920;
             raw.height = 1080;
         }
-        let decoder = SwDecoder::open(
-            &codecpar,
-            unit_rgb(InputSize::square(640)),
-            None,
-            DEFAULT_SAMPLE_FPS,
-        )
-        .unwrap();
+        let decoder = SwDecoder::open(&codecpar, unit_rgb(InputSize::square(640)), None).unwrap();
         assert_eq!(decoder.ctx.max_pixels, MAX_PIXELS);
         // Generous enough for 8K, small enough that a 16384x16384 SPS fails.
         const { assert!(MAX_PIXELS > 7680 * 4320) };

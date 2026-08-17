@@ -84,7 +84,7 @@ defmodule Cairn.Native do
   Open one camera's decoder for the input spec an engine resolved.
 
   `params` carries that spec as plain terms — decoder kind, width/height,
-  encoding, resize policy, `motion_json`, `sample_fps` — exactly as
+  encoding, resize policy, `motion_json` — exactly as
   `CairnOrt.engine_spec/1` spells it plus the host's own decode config. No
   camera-id claim: that guards the inference stream, in the other library.
   """
@@ -100,6 +100,11 @@ defmodule Cairn.Native do
   what the rate gate spends its interval on, whatever became of the
   conversion. Every access unit is decoded regardless of `sample`, because a
   stateful decoder needs its references.
+
+  `pts` is carried through to the emitted frame untouched, except that a
+  decoder opened with `motion_json` reads it as *nanoseconds*
+  (`Membrane.Time`): the motion detector's calibration window is elapsed
+  frame time.
   """
   @spec decode_au(reference(), binary(), integer(), boolean()) ::
           {:ok, {boolean(), decoded_frame() | nil}} | {:error, {atom(), String.t()}}

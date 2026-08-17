@@ -4,9 +4,9 @@ defmodule Cairn.Pipeline.SampleGate do
 
   `sample_fps`'s one home. The crate used to hold this rule (`Stream::push_au`,
   after the decoder and before the tensor); with decode its own element the
-  rule lives in the pipeline, and nothing native second-guesses it — the NIF
-  reads the same configured rate only to size the motion detector's
-  frame-counted calibration window.
+  rule lives in the pipeline, and nothing native second-guesses it — the rate
+  no longer crosses the NIF boundary at all (the motion detector's calibration
+  window is sized on the frames' own pts, `Cairn.Motion`).
 
   The semantics phase 3 of the membrane port measured for, restated:
 
