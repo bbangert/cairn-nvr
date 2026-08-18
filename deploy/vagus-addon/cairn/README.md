@@ -15,7 +15,8 @@ separately into `/data`).
 
   ```
   pip download onnxruntime-qnn==2.4.0 --no-deps -d . \
-    --platform manylinux_2_34_aarch64 --only-binary=:all:
+    --platform manylinux_2_34_aarch64 --only-binary=:all: \
+    --implementation cp --python-version 3.12 --abi cp312
   unzip -j onnxruntime_qnn-2.4.0-*.whl onnxruntime_qnn/libQnnHtpV68Skel.so
   ```
 

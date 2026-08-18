@@ -186,9 +186,13 @@ FROM debian:${DEBIAN_TAG}-slim AS runtime
 
 # Distro FFmpeg 7.1 — the same major.minor the NIFs' rsmpeg feature binds and
 # the same sonames the native-build stage cross-linked against.
+# libyaml-0-2 + libbsd0: fastrpc's libcdsprpc.so links both (YAML_LIBS /
+# BSD_LIBS in its Makefile.am) — without them the QNN stub's dlopen chain
+# fails on arm64 before FastRPC reaches the DSP.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     ffmpeg libstdc++6 openssl libncurses6 locales ca-certificates \
+    libyaml-0-2 libbsd0 \
   && apt-get clean && rm -f /var/lib/apt/lists/*_* \
   && sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 

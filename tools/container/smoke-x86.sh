@@ -55,16 +55,15 @@ echo "$cameras" >>"$LOG"
 echo "$cameras" | grep -q smoke_cam || fail "/api/cameras does not list smoke_cam"
 say "PASS: /api/cameras lists the camera"
 
-# The stated-refusal check: the qnn failure must be *visible* — in the camera
-# status payload or the container logs — and detection must not be reported
-# healthy on this host.
-if echo "$cameras" | grep -qi qnn; then
-  say "PASS: qnn refusal stated in /api/cameras"
-elif docker logs cairn-smoke 2>&1 | grep -qi "qnn"; then
-  say "PASS: qnn refusal stated in logs (not yet in /api/cameras — eyeball it)"
-  say "      $(docker logs cairn-smoke 2>&1 | grep -i qnn | head -3)"
+# The stated-refusal check: failure vocabulary, not the word "qnn" — a
+# healthy payload also says qnn (plugin_status.backend), so matching the
+# name alone would pass on exactly the silent success this exists to catch.
+if docker logs cairn-smoke 2>&1 |
+  grep -Eqi "canary refused|model was NOT loaded|Failed to load library"; then
+  say "PASS: qnn refusal stated in logs"
+  say "      $(docker logs cairn-smoke 2>&1 | grep -Ei "canary refused|Failed to load library" | head -2)"
 else
-  fail "no stated qnn refusal anywhere — silent CPU fallback?"
+  fail "no stated qnn refusal — silent CPU fallback?"
 fi
 
 docker rm -f cairn-smoke >>"$LOG" 2>&1

@@ -123,7 +123,11 @@ defmodule Cairn.SoakMonitor do
       memory_binary: memory[:binary],
       memory_ets: memory[:ets],
       process_count: length(Process.list()),
+      # Both NIFs, separately: the decode and inference halves load
+      # independently, and a report that aggregated them would say "loaded"
+      # while the inference half silently wasn't.
       native_available: Cairn.Native.available?(),
+      ort_available: CairnOrt.available?(),
       host_restarts: state.host_restarts,
       presence_ledger: ets_size(Cairn.PresenceLedger),
       counts: state.counts,
@@ -191,7 +195,8 @@ defmodule Cairn.SoakMonitor do
       binary #{mb(sample.memory_binary)}, ets #{mb(sample.memory_ets)});
       slope #{slope_mb_per_day(state)} MB/day since boot
     - processes: #{sample.process_count}
-    - native NIFs loaded: #{sample.native_available}; Host restarts since boot: #{sample.host_restarts}
+    - NIFs loaded: decode #{sample.native_available}, inference #{sample.ort_available};
+      Host restarts since boot: #{sample.host_restarts}
     - presence: started #{started} / cleared #{cleared} since boot; ledger now
       #{inspect(sample.presence_ledger)} open (invariant: drains to 0 when scenes are empty)
     - event/track/alert counts since boot: #{inspect(sample.counts)}

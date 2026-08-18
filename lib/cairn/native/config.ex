@@ -185,10 +185,16 @@ defmodule Cairn.Native.Config do
     end
   end
 
+  # The full u32 range here, not just integer-ness: the crate decodes these
+  # as u32, and an out-of-range value that parsed would fail later as a
+  # generic qnn.* error instead of a boot crash naming the variable.
   defp parse_env_value(key, var, value) when key in @qnn_env_ints do
     case Integer.parse(value) do
-      {n, ""} -> n
-      _not_an_integer -> raise ArgumentError, "#{var} must be an integer, got #{inspect(value)}"
+      {n, ""} when n >= 0 and n <= 4_294_967_295 ->
+        n
+
+      _not_a_u32 ->
+        raise ArgumentError, "#{var} must be an integer in 0..4294967295, got #{inspect(value)}"
     end
   end
 

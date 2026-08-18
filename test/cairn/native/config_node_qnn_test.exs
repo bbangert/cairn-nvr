@@ -87,5 +87,13 @@ defmodule Cairn.Native.ConfigNodeQnnTest do
         Config.node_qnn_from_env(%{"CAIRN_QNN_SOC_MODEL" => "abc"})
       end
     end
+
+    test "out-of-u32-range integers fail at parse, not later as a generic qnn error" do
+      for bad <- ["-1", "4294967296"] do
+        assert_raise ArgumentError, ~r/CAIRN_QNN_VTCM_MB/, fn ->
+          Config.node_qnn_from_env(%{"CAIRN_QNN_VTCM_MB" => bad})
+        end
+      end
+    end
   end
 end
