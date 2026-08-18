@@ -156,8 +156,11 @@ EOS
 # arm64 — BEAM-only work, the NIFs arrive prebuilt from native-build).
 FROM hexpm/elixir:${ELIXIR_VERSION}-erlang-${OTP_VERSION}-debian-${DEBIAN_TAG} AS release-build
 
+# pkg-config + libssl-dev: ex_dtls's bundlex native resolves openssl through
+# pkg-config. GitHub's ubuntu runners preinstall both, which is why ci.yml
+# compiles the same deps with only ffmpeg — this image starts bare.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-  build-essential git && rm -rf /var/lib/apt/lists/*
+  build-essential git pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 ENV MIX_ENV=prod
