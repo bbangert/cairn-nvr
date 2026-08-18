@@ -55,7 +55,7 @@ defmodule Cairn.SoakMonitor do
         max_bytes: Keyword.get(opts, :max_bytes, @max_bytes),
         booted_at: DateTime.utc_now(),
         counts: %{},
-        host_pid: Process.whereis(Host),
+        host_ref: monitor_host(),
         host_restarts: 0,
         first_sample: nil,
         last_sample: nil
@@ -71,13 +71,20 @@ defmodule Cairn.SoakMonitor do
 
   @impl true
   def handle_info(:sample, state) do
-    state =
-      state
-      |> detect_host_restart(Process.whereis(Host))
-      |> record_sample()
-
+    # Re-arm the monitor if the last DOWN's immediate re-monitor found the
+    # replacement not yet registered.
+    state = %{state | host_ref: state.host_ref || monitor_host()} |> record_sample()
     Process.send_after(self(), :sample, state.interval_ms)
     {:noreply, state}
+  end
+
+  # A monitor per Host instance rather than sampled pid comparison: sampling
+  # once a minute would collapse a crash loop — the failure a soak exists to
+  # expose — into one counted change. Every crash of a monitored instance
+  # counts; only crashes of a replacement that died before we could monitor
+  # it (a sub-sample-interval loop's tail) can be missed.
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{host_ref: ref} = state) do
+    {:noreply, %{state | host_ref: monitor_host(), host_restarts: state.host_restarts + 1}}
   end
 
   # Every broadcast the three topics carry is a tagged tuple; the tag alone is
@@ -93,15 +100,10 @@ defmodule Cairn.SoakMonitor do
 
   def handle_info(_other, state), do: {:noreply, state}
 
-  # Public and pid-injected for the test: restarting the real Host inside the
-  # shared test tree would disturb every other suite.
-  @doc false
-  @spec detect_host_restart(map(), pid() | nil) :: map()
-  def detect_host_restart(state, current_pid) do
-    case current_pid do
-      pid when pid == state.host_pid -> state
-      pid when is_nil(state.host_pid) -> %{state | host_pid: pid}
-      pid -> %{state | host_pid: pid, host_restarts: state.host_restarts + 1}
+  defp monitor_host do
+    case Process.whereis(Host) do
+      nil -> nil
+      pid -> Process.monitor(pid)
     end
   end
 

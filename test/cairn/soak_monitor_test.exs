@@ -49,23 +49,21 @@ defmodule Cairn.SoakMonitorTest do
     assert File.exists?(Path.join(dir, "samples.jsonl"))
   end
 
-  test "host restarts count pid changes, not first sight or stability" do
-    state = %{host_pid: nil, host_restarts: 0}
+  test "every monitored Host crash counts, not one per sample window", %{dir: dir} do
+    pid = start_supervised!({SoakMonitor, dir: dir, interval_ms: @never})
+    %{host_ref: ref} = :sys.get_state(pid)
 
-    pid_a = spawn(fn -> :ok end)
-    pid_b = spawn(fn -> :ok end)
+    # Two DOWNs of the currently monitored ref = two restarts, even with no
+    # sample tick in between — the sampled-pid-comparison design this
+    # replaced would have collapsed them into one.
+    send(pid, {:DOWN, ref, :process, self(), :killed})
+    %{host_ref: ref2, host_restarts: 1} = :sys.get_state(pid)
+    send(pid, {:DOWN, ref2, :process, self(), :killed})
+    assert %{host_restarts: 2} = :sys.get_state(pid)
 
-    # First sight adopts without counting; stability holds; a change counts.
-    adopted = SoakMonitor.detect_host_restart(state, pid_a)
-    assert %{host_pid: ^pid_a, host_restarts: 0} = adopted
-    assert SoakMonitor.detect_host_restart(adopted, pid_a) == adopted
-    assert %{host_pid: ^pid_b, host_restarts: 1} = SoakMonitor.detect_host_restart(adopted, pid_b)
-
-    # A crash observed before the replacement (pid → nil → new pid) is one
-    # restart, counted at the disappearance; the return adopts silently.
-    gone = SoakMonitor.detect_host_restart(adopted, nil)
-    assert gone.host_restarts == 1
-    assert %{host_restarts: 1} = SoakMonitor.detect_host_restart(gone, pid_b)
+    # A stale ref (a monitor superseded by re-arming) is ignored.
+    send(pid, {:DOWN, ref, :process, self(), :killed})
+    assert %{host_restarts: 2} = :sys.get_state(pid)
   end
 
   test "stays out of the tree when disabled" do

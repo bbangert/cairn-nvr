@@ -14,7 +14,10 @@ trap 'rm -rf "$WORK"' EXIT
 git clone --depth 1 "$REPO" "$WORK/repo"
 rsync -a --delete --exclude .git "$SRC"/ "$WORK/repo"/
 cd "$WORK/repo"
-if git diff --quiet && git diff --cached --quiet; then
+# status --porcelain, not diff --quiet: the first publish into an empty
+# repo (and any later new file) is all untracked additions, which diff
+# does not see.
+if [ -z "$(git status --porcelain)" ]; then
   echo "add-on repo already up to date"
   exit 0
 fi
