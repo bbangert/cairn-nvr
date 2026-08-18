@@ -50,7 +50,7 @@ done
 [ "$code" = 200 ] || fail "UI never served 200 (last: $code)"
 say "PASS: UI serves 200"
 
-cameras=$(curl -s http://localhost:4000/api/cameras)
+cameras=$(curl -s -H "Authorization: Bearer smoke-token" http://localhost:4000/api/cameras)
 echo "$cameras" >>"$LOG"
 echo "$cameras" | grep -q smoke_cam || fail "/api/cameras does not list smoke_cam"
 say "PASS: /api/cameras lists the camera"
