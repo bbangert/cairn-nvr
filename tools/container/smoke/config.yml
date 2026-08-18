@@ -1,0 +1,19 @@
+# x86 smoke config (tools/container/smoke-x86.sh): one camera on a dead
+# RTSP address, detection on the shipped tier-1 profile. On a host with no
+# HTP the point is the REFUSAL: qnn must be stated unavailable in
+# cameras:status / alerts, never silently swapped for CPU (the
+# valid-but-inert rule). The QNN library/SoC facts come from the image's
+# CAIRN_QNN_* env, not from this file — they are node facts.
+data_dir: /data
+
+plugins:
+  detect:
+    profile: qcs6490-tier1
+    # The profile is experimental (qnn has not soaked) and says so; the smoke
+    # consents, same as the board config will until D-P10 clears.
+    allow_experimental: true
+
+cameras:
+  - id: smoke_cam
+    rtsp_url: rtsp://10.255.255.1:554/nowhere
+    plugin: detect

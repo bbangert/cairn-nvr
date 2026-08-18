@@ -161,12 +161,45 @@ defmodule Cairn.Native.Config do
     end
   end
 
+  @qnn_env [
+    library: "CAIRN_QNN_LIBRARY",
+    soc_model: "CAIRN_QNN_SOC_MODEL",
+    htp_arch: "CAIRN_QNN_HTP_ARCH",
+    performance_mode: "CAIRN_QNN_PERFORMANCE_MODE",
+    vtcm_mb: "CAIRN_QNN_VTCM_MB"
+  ]
+  @qnn_env_ints ~w(soc_model htp_arch vtcm_mb)a
+
+  @doc """
+  The `CAIRN_QNN_*` environment as the `config :cairn, :qnn` keyword.
+
+  Called from runtime.exs, and a function here rather than inline there so
+  the parse is testable and a malformed value fails boot naming the
+  variable — a bare `String.to_integer` crash names neither, and the vagus
+  add-on log is where an operator would have to diagnose it.
+  """
+  @spec node_qnn_from_env(%{optional(String.t()) => String.t()}) :: keyword()
+  def node_qnn_from_env(env) do
+    for {key, var} <- @qnn_env, value = Map.get(env, var) do
+      {key, parse_env_value(key, var, value)}
+    end
+  end
+
+  defp parse_env_value(key, var, value) when key in @qnn_env_ints do
+    case Integer.parse(value) do
+      {n, ""} -> n
+      _not_an_integer -> raise ArgumentError, "#{var} must be an integer, got #{inspect(value)}"
+    end
+  end
+
+  defp parse_env_value(_key, _var, value), do: value
+
   # The crate's `RawQnnOptions` is not an `Option`, so a bare `nil` would be a
   # decode error rather than a default.
   defp normalize_qnn(nil), do: normalize_qnn(%{})
 
   defp normalize_qnn(qnn) when is_map(qnn) or is_list(qnn) do
-    given = Map.new(qnn)
+    given = Map.merge(node_qnn(), Map.new(qnn))
 
     case reject_unknown(given, Map.keys(@qnn_defaults)) do
       :ok -> coerce(@qnn_types, Map.merge(@qnn_defaults, given), "qnn.")
@@ -176,6 +209,15 @@ defmodule Cairn.Native.Config do
 
   defp normalize_qnn(other),
     do: {:error, "qnn must be a map or keyword list, got #{inspect(other)}"}
+
+  # Node-level qnn facts under the model config's: where the EP library sits
+  # and what SoC this is belong to the node (the container image, the board),
+  # not to a profile, which is a model claim portable across hosts — and the
+  # only other override (`Cairn.Native.Host`'s `:config`) pins the whole model
+  # config, defeating ladder resolution. `config :cairn, :qnn` is set from
+  # CAIRN_QNN_* env in runtime.exs; a typo'd key still errors through
+  # `reject_unknown` in `normalize_qnn/1`.
+  defp node_qnn, do: Map.new(Application.get_env(:cairn, :qnn, []))
 
   # In table order, so the message names the first field that is wrong rather
   # than whichever one a map happened to yield first.

@@ -38,6 +38,13 @@ clap = { version = "4.5", default-features = false, features = ["std"] }
 # exposes cairn-ort's panic/poison arming to it.
 cairn-ort = { path = "../cairn-ort", features = ["test-hooks"] }
 
+[features]
+# Passed through to cairn-detect for the aarch64 cross-build, same as
+# cairn-ort's: this crate never touches ort itself, but without the
+# passthrough its cairn-detect dependency statically links the downloaded
+# ORT archive — a link input the cross build must not need.
+ort-load-dynamic = ["cairn-detect/ort-load-dynamic"]
+
 [profile.release]
 lto = "thin"
 strip = true

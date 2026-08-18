@@ -1,0 +1,8 @@
+# The vagus add-on repository metadata. This directory tree is the CONTENT of
+# the public add-on repo (github.com/bbangert/cairn-addons, branch master —
+# vagus's fetcher defaults to ref "master"); tools/container/publish-addon.sh
+# mirrors it there. It lives here so the add-on contract is versioned next to
+# the image it describes.
+name: Cairn NVR Add-ons
+url: https://github.com/bbangert/cairn-addons
+maintainer: Ben Bangert
