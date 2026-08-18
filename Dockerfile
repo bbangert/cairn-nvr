@@ -174,9 +174,12 @@ RUN mix deps.compile
 COPY priv priv
 COPY lib lib
 COPY assets assets
+# Compile before the asset build: app.css imports the colocated CSS that
+# `mix compile` extracts into the build dir (NODE_PATH points there).
+RUN mix compile
 RUN mix assets.setup && mix assets.deploy
 COPY --from=native-build /dist/libcairn_native.so /dist/libcairn_ort.so priv/native/
-RUN mix compile && mix release
+RUN mix release
 
 # ---------------------------------------------------------------------------
 FROM debian:${DEBIAN_TAG}-slim AS runtime
