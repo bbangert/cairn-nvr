@@ -1,8 +1,9 @@
 defmodule Cairn.Events.Event do
   @moduledoc """
   Event index row (SQLite). `labels` holds `%{"entries" => [...],
-  "max_scores" => %{label => score}}` as written by `Cairn.CameraTracker`'s
-  runtime `Cairn.Event` at finalize time.
+  "max_scores" => %{label => score}}` as written at finalize time by the
+  runtime `Cairn.Event` of whichever lane owned it — `Cairn.CameraTracker` at
+  tier 2, `Cairn.PresenceRecorder` at tier 1. Nothing on the row says which.
   """
 
   use Ecto.Schema

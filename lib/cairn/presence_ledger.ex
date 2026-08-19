@@ -9,7 +9,7 @@ defmodule Cairn.PresenceLedger do
   the edges stuck at "present" forever; instead its `init` reads this table
   and clears what the dead process had announced. The table therefore lives
   beside the pool, not in it: `Cairn.PresenceSupervisor` starts this
-  process first and the pool `:rest_for_one` after it, so a crashing
+  process ahead of the pool, `:rest_for_one`, so a crashing
   aggregator — or the whole pool — never takes the ledger down, while a
   ledger crash restarts the pool into the empty world it now reflects. A
   collapse of the entire supervisor loses the set; so does the VM — that is

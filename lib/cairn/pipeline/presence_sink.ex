@@ -22,11 +22,16 @@ defmodule Cairn.Pipeline.PresenceSink do
   predictor to vouch for one. An empty surviving set is still forwarded:
   frames flowed and nothing qualified, which is exactly the evidence of
   absence the aggregator's gate-aware clearing waits for.
+
+  The aggregator gets that fold; `Cairn.PresenceRecorder` gets the inferred
+  frames unfolded, boxes and all, because a recording wants what presence
+  state has no use for — the trigger box its snapshot is drawn on and the
+  dense sidecar its playback overlay reads.
   """
 
   use Membrane.Sink
 
-  alias Cairn.{CameraControl, PresenceAggregator}
+  alias Cairn.{CameraControl, PresenceAggregator, PresenceRecorder}
   alias Cairn.Config.Camera
   alias Cairn.Pipeline.Inference.Detections
   alias Membrane.Buffer
@@ -92,6 +97,16 @@ defmodule Cairn.Pipeline.PresenceSink do
 
     for frame <- inferred do
       PresenceAggregator.observed(state.camera.id, now_ms, seen(frame, floors))
+    end
+
+    # The same frames again, whole: `seen/2`'s fold to `%{label => score}` is
+    # presence-state economy, not a data limit, and the event lane needs the
+    # boxes it drops (D-E5). The floors ride along because they are the
+    # sink's, override included, and the recorder has no other way to know
+    # what this batch was judged against. Dropped on the floor there unless an
+    # event is open, so an idle camera pays one cast per buffer.
+    if inferred != [] do
+      PresenceRecorder.frames(state.camera.id, floors, inferred)
     end
 
     # All-skip buffers still prove the stream alive to the aggregator's

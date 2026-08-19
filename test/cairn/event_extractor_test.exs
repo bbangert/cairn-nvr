@@ -587,8 +587,8 @@ defmodule Cairn.EventExtractorTest do
     #
     # `opts` may carry `pre_roll: false` (start with an empty ring),
     # `live:` (fragments put into the ring *after* the extractor subscribed,
-    # so they reach it as live ones), `max_path_entries:` (passed to the
-    # extractor), and `on_clip_ready:`, a one-arity fun handed the clip path at
+    # so they reach it as live ones), `max_path_entries:` and `identity:`
+    # (passed to the extractor), and `on_clip_ready:`, a one-arity fun handed the clip path at
     # the moment the artifact frame arrives and *before* `:DOWN` — the only
     # window in which the sidecar write's ordering against the broadcast is
     # observable at all.
@@ -602,7 +602,7 @@ defmodule Cairn.EventExtractorTest do
         start_supervised!(
           {EventExtractor,
            [camera: camera, event: event, config: config, snapshot_fun: fn _row, _cfg -> :ok end] ++
-             Keyword.take(opts, [:max_path_entries])},
+             Keyword.take(opts, [:max_path_entries, :identity])},
           id: {:extractor, event.id}
         )
 
@@ -656,6 +656,23 @@ defmodule Cairn.EventExtractorTest do
       assert File.exists?(path), "no sidecar at #{path}"
       assert {:ok, map} = Cairn.TrackPath.decode(File.read!(path))
       map
+    end
+
+    # The presence lane's boxes are keyed by label, and the header is where a
+    # reader learns that. That the tracked lane's header is unchanged by the
+    # field is `Cairn.TrackPathTest`'s to pin.
+    test "the identity variant travels from the start opts into the sidecar's header",
+         %{camera: camera, config: config, frags: frags} do
+      %{path: path} =
+        run_with_boxes(
+          camera,
+          config,
+          frags,
+          [%{t_ms: 0, boxes: [{"person", "person", [0.1, 0.2, 0.3, 0.4], false}]}],
+          identity: :label
+        )
+
+      assert sidecar!(path)["identity"] == "label"
     end
 
     test "buffered batches become a sidecar beside the clip, anchored to the drain",

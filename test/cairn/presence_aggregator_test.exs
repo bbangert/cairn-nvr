@@ -12,11 +12,18 @@ defmodule Cairn.PresenceAggregatorTest do
     camera_id = "pres_#{System.unique_integer([:positive])}"
     Event.subscribe()
 
+    # A confirm here would otherwise open a real recording:
+    # `Cairn.PresenceRecorder` starts beside every aggregator, and a camera
+    # the config does not name has no `record:` block to refuse anything.
+    # This suite is about the transitions, not the lane they drive.
+    Cairn.CameraControl.set(camera_id, %{recording_enabled: false})
+
     # Aggregators live in the application-wide pool; without this every
     # test leaks a timer-bearing control subscriber for the suite's life.
     on_exit(fn ->
       PresenceAggregator.retire(camera_id)
       Registry.await_unregistered(camera_id, :presence)
+      Registry.await_unregistered(camera_id, :presence_recorder)
     end)
 
     %{camera_id: camera_id}

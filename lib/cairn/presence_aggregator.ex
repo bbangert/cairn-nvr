@@ -42,7 +42,7 @@ defmodule Cairn.PresenceAggregator do
 
   require Logger
 
-  alias Cairn.PresenceEvent
+  alias Cairn.{PresenceEvent, PresenceRecorder}
 
   # Two sightings inside this window confirm presence. Two, not one — a
   # single-frame phantom must not open an event — and the window is wide
@@ -132,6 +132,11 @@ defmodule Cairn.PresenceAggregator do
   """
   @spec retire(String.t()) :: :ok
   def retire(camera_id) do
+    # The lane's sibling goes with it. It outlives this call when an event is
+    # open — the cleareds `clear_all/1` is about to emit are what close that
+    # one — see `Cairn.PresenceRecorder.retire/1`.
+    PresenceRecorder.retire(camera_id)
+
     case Cairn.Registry.whereis(camera_id, :presence) do
       nil -> :ok
       pid -> GenServer.cast(pid, :retire)
@@ -146,7 +151,12 @@ defmodule Cairn.PresenceAggregator do
     end
   end
 
+  # Started with the aggregator rather than on demand from the sink's frame
+  # path: what triggers a recording is a transition cast, and
+  # `PresenceRecorder.presence/3` drops one that finds no recorder.
   defp start_aggregator(camera_id) do
+    PresenceRecorder.ensure(camera_id)
+
     case DynamicSupervisor.start_child(
            Cairn.PresenceSupervisor.Pool,
            {__MODULE__, camera_id: camera_id}
@@ -168,18 +178,24 @@ defmodule Cairn.PresenceAggregator do
     # `Cairn.PresenceLedger`). A fresh camera has no leftovers and this is
     # a no-op.
     for {label, first_seen_at, score} <- Cairn.PresenceLedger.leftovers(camera_id) do
-      # Emit before delete, here and in `broadcast/4`: a crash between the
-      # two leaves the row for the NEXT restart, whose clear is then a
-      # duplicate — the ledger's stated bargain is at-least-once ("at worst
-      # spurious, never missing"), and deleting first would invert it into
-      # a cleared that can vanish.
-      PresenceEvent.broadcast(:presence_cleared, %PresenceEvent{
+      cleared = %PresenceEvent{
         camera_id: camera_id,
         label: label,
         score: score,
         first_seen_at: first_seen_at,
         at: DateTime.utc_now()
-      })
+      }
+
+      # Emit before delete, here and in `broadcast/4`: a crash between the
+      # two leaves the row for the NEXT restart, whose clear is then a
+      # duplicate — the ledger's stated bargain is at-least-once ("at worst
+      # spurious, never missing"), and deleting first would invert it into
+      # a cleared that can vanish.
+      PresenceEvent.broadcast(:presence_cleared, cleared)
+      # The event lane hears every clear this process owes, this one included:
+      # a recorder holding an event open on a label whose aggregator died
+      # would otherwise wait out `max_event` for a scene that already ended.
+      PresenceRecorder.presence(camera_id, :presence_cleared, cleared)
 
       Cairn.PresenceLedger.cleared(camera_id, label)
     end
@@ -374,13 +390,21 @@ defmodule Cairn.PresenceAggregator do
     Cairn.PresenceLedger.cleared(camera_id, label)
   end
 
+  # Both halves of one transition: the cluster-wide broadcast every consumer
+  # already reads, and a direct cast to this camera's event lane. The cast is
+  # not a second subscriber to the topic on purpose — the trigger for a
+  # recording must not race PubSub delivery, and it must reach exactly the one
+  # process that owns this camera's events.
   defp emit(kind, camera_id, label, entry) do
-    PresenceEvent.broadcast(kind, %PresenceEvent{
+    event = %PresenceEvent{
       camera_id: camera_id,
       label: label,
       score: entry.best_score,
       first_seen_at: entry.first_seen_at,
       at: DateTime.utc_now()
-    })
+    }
+
+    PresenceEvent.broadcast(kind, event)
+    PresenceRecorder.presence(camera_id, kind, event)
   end
 end

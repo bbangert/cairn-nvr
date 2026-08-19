@@ -11,11 +11,17 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
     camera_id = "psink_#{System.unique_integer([:positive])}"
     Event.subscribe()
 
+    # A confirm here would otherwise open a real recording through the
+    # `Cairn.PresenceRecorder` that starts beside the aggregator — this suite
+    # feeds the sink, and what it asserts is what reaches presence state.
+    CameraControl.set(camera_id, %{recording_enabled: false})
+
     # The sink's feeds start real aggregators in the application-wide
     # pool; retire them or every test leaks one for the suite's life.
     on_exit(fn ->
       Cairn.PresenceAggregator.retire(camera_id)
       Cairn.Registry.await_unregistered(camera_id, :presence)
+      Cairn.Registry.await_unregistered(camera_id, :presence_recorder)
     end)
 
     %{

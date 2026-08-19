@@ -21,9 +21,12 @@ defmodule Cairn.Event do
   (`%{t, label, score, bbox, object_id}`) — the frame the snapshot is cut
   from, with the box drawn on it.
 
-  `object_id` is a `Cairn.ULID` **string**, the identity of the track the
-  detection belongs to (`%Cairn.Track{}.object_id`) — unique for the life of
-  the installation, never reused across a stream epoch or a restart.
+  `object_id` is a `Cairn.ULID` **string** where the detection came from a
+  tracked object (`%Cairn.Track{}.object_id`) — unique for the life of the
+  installation, never reused across a stream epoch or a restart — and `nil`
+  where nothing assigned one: a tier-1 event is presence-born
+  (`Cairn.PresenceRecorder`) and runs no tracker, so every entry and trigger it
+  carries is identity-less.
   """
 
   @derive Jason.Encoder

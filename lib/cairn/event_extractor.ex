@@ -94,12 +94,20 @@ defmodule Cairn.EventExtractor do
     )
   end
 
-  @doc "Starts an extractor under `Cairn.EventSupervisor` (camera tracker API)."
-  @spec start(Cairn.Config.Camera.t(), Cairn.Event.t()) :: DynamicSupervisor.on_start_child()
-  def start(camera, event) do
+  @doc """
+  Starts an extractor under `Cairn.EventSupervisor` (the event lanes' API).
+
+  `:identity` says what the ids in the boxes this extractor will be fed are,
+  and is written into the sidecar's header for the reader that colours by
+  them: `:object` for `Cairn.CameraTracker`'s tracked identities, `:label` for
+  `Cairn.PresenceRecorder`'s label-keyed ones (`Cairn.TrackPath`).
+  """
+  @spec start(Cairn.Config.Camera.t(), Cairn.Event.t(), keyword()) ::
+          DynamicSupervisor.on_start_child()
+  def start(camera, event, opts \\ []) do
     DynamicSupervisor.start_child(
       Cairn.EventSupervisor,
-      {__MODULE__, camera: camera, event: event}
+      {__MODULE__, Keyword.merge(opts, camera: camera, event: event)}
     )
   end
 
@@ -137,6 +145,9 @@ defmodule Cairn.EventExtractor do
       track_boxes: [],
       track_entries: 0,
       track_truncated: false,
+      # What the ids in those boxes are, for the sidecar's header — this
+      # process never reads them itself. See `start/3`.
+      identity: Keyword.get(opts, :identity, :object),
       max_path_entries: Keyword.get(opts, :max_path_entries, @max_path_entries),
       # Built at the drain in `handle_continue(:open, ...)` — nil until then —
       # and completed with its live half by the first fragment to arrive after.
@@ -505,6 +516,7 @@ defmodule Cairn.EventExtractor do
       event_id: event.id,
       camera_id: state.camera.id,
       truncated: state.track_truncated,
+      identity: state.identity,
       anchor: state.anchor
     }
 
