@@ -594,10 +594,24 @@ defmodule Cairn.PresenceRecorder do
 
   defp floors(%{floors: floors}) when is_map(floors), do: floors
 
-  defp floors(%{camera: %Config.Camera{min_score: min_score}}) when is_map(min_score),
-    do: min_score
+  # Until the first buffer lands, judge with what the sink would have: a
+  # runtime override REPLACES the camera's thresholds as every label's default
+  # (`PresenceSink.effective_min_score/2`). A confirm can reach a recorder
+  # whose floors are still nil — restarted mid-window, transition cast racing
+  # the frames cast — and the configured map alone would refuse a score the
+  # sink admitted under a lowered override, silently recording nothing.
+  defp floors(%{camera_id: camera_id} = state) do
+    case CameraControl.get(camera_id) do
+      %{min_score: override} when is_number(override) -> %{"default" => override}
+      _control -> configured_floors(state)
+    end
+  end
 
-  defp floors(_state), do: %{}
+  defp configured_floors(%{camera: %Config.Camera{min_score: min_score}})
+       when is_map(min_score),
+       do: min_score
+
+  defp configured_floors(_state), do: %{}
 
   # The one runtime control on this path: an operator who switched recording
   # off gets no new events, exactly as at tier 2. An event already open is

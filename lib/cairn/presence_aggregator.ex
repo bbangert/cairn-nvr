@@ -153,9 +153,20 @@ defmodule Cairn.PresenceAggregator do
 
   # Started with the aggregator rather than on demand from the sink's frame
   # path: what triggers a recording is a transition cast, and
-  # `PresenceRecorder.presence/3` drops one that finds no recorder.
+  # `PresenceRecorder.presence/3` drops one that finds no recorder. A start
+  # failure is only logged — presence state must outlive the lane — but it
+  # must be logged: every transition until the next ensure records nothing.
   defp start_aggregator(camera_id) do
-    PresenceRecorder.ensure(camera_id)
+    case PresenceRecorder.ensure(camera_id) do
+      {:ok, _pid} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "camera #{camera_id}: presence recorder did not start (#{inspect(reason)}) — " <>
+            "transitions will not record until it does"
+        )
+    end
 
     case DynamicSupervisor.start_child(
            Cairn.PresenceSupervisor.Pool,

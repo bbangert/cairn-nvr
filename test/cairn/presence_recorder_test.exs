@@ -217,6 +217,22 @@ defmodule Cairn.PresenceRecorderTest do
     assert scores["fox"] == 0.55
   end
 
+  # Before any frames cast has landed, the recorder's floors fall back to what
+  # the sink would compute — override included. Without that, a lowered
+  # runtime min_score confirms presence in the aggregator and then records
+  # nothing here.
+  test "a confirm ahead of the first frames cast honors a lowered min_score override", ctx do
+    id = ctx.camera_id
+    CameraControl.set(id, %{min_score: 0.3})
+    on_exit(fn -> CameraControl.set(id, %{min_score: nil}) end)
+
+    recorder(ctx)
+
+    # 0.4 is under the camera's configured 0.5 default; the override admits it.
+    started(ctx, "person", 0.4)
+    assert_receive {:event_started, %Event{camera_id: ^id, max_scores: %{"person" => 0.4}}}
+  end
+
   test "a label below the record: tier's score does not open an event", ctx do
     id = ctx.camera_id
     rec = recorder(ctx, %{record: %{"person" => %{min_score: 0.8}}})
