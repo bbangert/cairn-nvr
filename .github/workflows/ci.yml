@@ -57,7 +57,11 @@ jobs:
 
       - run: mix credo
 
-      - run: mix sobelow --skip --exit --threshold medium
+      # Config.HTTPS ignored deliberately: cairn's v1 posture is LAN-trusted
+      # plain http with no TLS terminator anywhere in the deployment, and
+      # force_ssl 301'd the vagus panel's webui link into a listener that
+      # doesn't exist (device-proven on the Q6A).
+      - run: mix sobelow --skip --exit --threshold medium --ignore Config.HTTPS
 
       - run: mix dialyzer --format github
 
