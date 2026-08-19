@@ -1352,6 +1352,72 @@ defmodule Cairn.ConfigTest do
     end
   end
 
+  describe "track: inert at tier 1" do
+    defp tiered_track_map(profile_yaml, cam_fields) do
+      update_in(tiered_map(profile_yaml), ["cameras", Access.at(0)], &Map.merge(&1, cam_fields))
+    end
+
+    test "an invalid track: shape at tier 1 still errors — the warning doesn't mask it" do
+      map = tiered_track_map(ort_yaml("tier: 1"), %{"track" => 0.4})
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "camera cam_a: track must be a mapping of label"))
+    end
+
+    test "a tier-2 camera's track: draws no warning at all" do
+      map =
+        tiered_track_map(ort_yaml("tier: 2"), %{
+          "min_score" => 0.3,
+          "track" => %{"person" => 0.4},
+          "record" => %{"default" => 1.0}
+        })
+
+      assert {:ok, _config, []} = Config.from_map(map)
+    end
+
+    test "a tier-1 camera's track: warns; record: alone does not" do
+      map =
+        tiered_track_map(ort_yaml("tier: 1"), %{
+          "min_score" => 0.3,
+          "track" => %{"person" => 0.4},
+          "record" => %{"default" => 1.0}
+        })
+
+      assert {:ok, _config, warnings} = Config.from_map(map)
+
+      assert Enum.any?(
+               warnings,
+               &(&1 =~ "camera cam_a: track: has no effect at tier 1" and
+                   &1 =~ "record: gates presence recordings")
+             )
+
+      record_only = tiered_track_map(ort_yaml("tier: 1"), %{"record" => %{"default" => 1.0}})
+
+      assert {:ok, _config, warnings} = Config.from_map(record_only)
+      refute Enum.any?(warnings, &(&1 =~ "has no effect at tier 1"))
+    end
+
+    test "two tier-1 cameras with track: warn once each" do
+      fields = %{
+        "min_score" => 0.3,
+        "track" => %{"person" => 0.4},
+        "record" => %{"default" => 1.0}
+      }
+
+      map =
+        tiered_track_map(ort_yaml("tier: 1"), fields)
+        |> put_plugin(1, "det")
+        |> update_in(["cameras", Access.at(1)], &Map.merge(&1, fields))
+
+      assert {:ok, _config, warnings} = Config.from_map(map)
+
+      inert = Enum.filter(warnings, &(&1 =~ "has no effect at tier 1"))
+      assert Enum.count(inert, &(&1 =~ "camera cam_a:")) == 1
+      assert Enum.count(inert, &(&1 =~ "camera cam_b:")) == 1
+      assert length(inert) == 2
+    end
+  end
+
   describe "motion gate ownership (D-S4)" do
     # `enabled` said outright: without it the string resolves to no
     # detector and the load warns (its own test below).

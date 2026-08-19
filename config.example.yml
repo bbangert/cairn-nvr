@@ -192,6 +192,11 @@ cameras: []
 #    #   track      does the detection earn a row in the track log.
 #    #   record     does the detection trigger video.
 #    #
+#    # A tier-1 (presence) group runs no tracker, so `track:` has nothing to
+#    # gate there — set on a tier-1 camera it is inert and the load warns.
+#    # `record:` keeps its meaning: it gates which presence detections earn
+#    # a recording. See docs/profile-authoring.md.
+#    #
 #    # Unlike `min_score`, the two host-side tiers are applied to a running
 #    # camera on Reload: tuning them costs neither the stream nor the live
 #    # tracks you are tuning against.
