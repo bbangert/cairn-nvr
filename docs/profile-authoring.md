@@ -411,8 +411,8 @@ the running config kept. Message shapes as they are emitted:
 
 ```
 profile my-board: unknown backend "hailo" (ort, qnn or rknn)
-profile my-board: unknown model_profile "yolov12" (rfdetr (or rf-detr), yolov10
-  (or yolo26), yolov8 (or yolov9, yolo11, yolov11), yolox)
+profile my-board: unknown model_profile "yolov12" (rfdetr (or rf-detr),
+  yolov10, yolov8 (or yolov9, yolo11, yolov11, yolo26), yolox)
 profile my-board: unknown decoder "cuda" (auto, nvdec, qsv, sw, v4l2, vaapi or
   videotoolbox) — decoder: is the video decode path; the inference runtime is
   backend:

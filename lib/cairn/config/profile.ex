@@ -327,13 +327,25 @@ defmodule Cairn.Config.Profile do
   Trimmed and downcased exactly as the plugin's `ModelProfile::parse` does, so
   a name this accepts is one the plugin accepts.
   """
+  # rknn conversion coverage is a per-FAMILY fact (Rockchip's model zoo,
+  # documented through YOLOv11 — docs/npu-backends.md), while the table rows
+  # are per decode contract: yolo26 shares yolov8's row for its wire format
+  # but must not inherit the row's conversion claim.
+  @rknn_undocumented_families ~w(yolo26)
+
   @spec family(term()) :: {String.t(), family()} | nil
   def family(name) when is_binary(name) do
     wanted = name |> String.trim() |> String.downcase()
 
-    Enum.find(@model_families, fn {canonical, row} ->
-      wanted == canonical or wanted in row.aliases
-    end)
+    case Enum.find(@model_families, fn {canonical, row} ->
+           wanted == canonical or wanted in row.aliases
+         end) do
+      {canonical, row} when wanted in @rknn_undocumented_families ->
+        {canonical, %{row | rknn_conversion: :undocumented}}
+
+      found ->
+        found
+    end
   end
 
   def family(_other), do: nil

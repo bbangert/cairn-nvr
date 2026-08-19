@@ -2532,6 +2532,13 @@ defmodule Cairn.ConfigTest do
       assert Enum.any?(errors, &(&1 =~ "declare experimental: true"))
     end
 
+    test "yolo26 does not inherit its contract row's documented rknn conversion" do
+      # Conversion coverage is per FAMILY (the zoo documents through
+      # YOLOv11); yolo26 shares yolov8's decode contract, not its claim.
+      assert {"yolov8", %{rknn_conversion: :undocumented}} = Profile.family("yolo26")
+      assert {"yolov8", %{rknn_conversion: :documented}} = Profile.family("yolov11")
+    end
+
     # A truthy non-boolean is a type error AND not an acknowledgement: both
     # messages must surface, or the type error hides the actionable one.
     test "a non-boolean experimental does not satisfy the rknn rule" do
