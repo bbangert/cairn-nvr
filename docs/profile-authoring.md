@@ -227,9 +227,10 @@ Two consequences worth an operator's attention:
 | `decoder` | `auto`, `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` | `DecoderKind`, `plugins/cairn-detect/src/decode.rs` |
 | `tracking:` stage keys | `bbd`, `oru`, `ocr`, `twin_mint` | `Cairn.Tracker.Stage.Bbd` / `.Oru` / `.Ocr` / `.TwinMint` |
 
-Aliases are names, not families: `yolo11` and `yolov8` are the same catalog row
-(several Ultralytics generations export byte-identical tensor layouts), and the
-error messages say which family an alias resolves to.
+Each catalog row is a decode contract listing the model families it applies
+to: `yolo11` and `yolov8` share one row because several Ultralytics
+generations export byte-identical tensor layouts, and the error messages say
+which decode contract a family resolves to.
 
 `decoder:` and `backend:` are different knobs that both sound like "how do I
 run this fast". `decoder:` is the **video** path — how H.264 frames get

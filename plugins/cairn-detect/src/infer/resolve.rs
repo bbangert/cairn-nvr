@@ -126,7 +126,7 @@ pub(super) enum ResolveError {
     /// sentence above, so `anyhow` renders the two as two lines.
     ///
     /// `profile` is the profile's *name* rather than the whole
-    /// [`ModelProfile`]: the name is its canonical identity — an alias resolves
+    /// [`ModelProfile`]: the name is its canonical identity — a family name resolves
     /// to it and [`ModelProfile`]'s own `Display` writes nothing else — and a
     /// profile by value rides the `Err` side of every function in this module,
     /// which `clippy::result_large_err` objects to once it crosses 128 bytes.
@@ -894,13 +894,13 @@ mod tests {
         for expected in ["yolox", "yolov10", "yolov8", "rfdetr"] {
             assert!(err.contains(expected), "{err}");
         }
-        // and the error names the aliases too, because `yolo11` resolving to
+        // and the error names the families too, because `yolo11` resolving to
         // the yolov8 profile is exactly the thing a reader needs told
         assert!(err.contains("yolo11"), "{err}");
     }
 
     #[test]
-    fn the_ultralytics_generations_are_aliases_of_one_profile_not_profiles() {
+    fn the_ultralytics_generations_are_families_of_one_contract_not_profiles() {
         // Every one of these exports the same tensor, so each is a *name* for
         // the yolov8 profile. Were they separate entries in `PROFILES`, an
         // ordinary `[1, 84, 8400]` head would sniff as four candidates and
@@ -912,8 +912,8 @@ mod tests {
         // only runnable YOLO26 exports are raw-head (see the catalog doc).
         assert_ne!(ModelProfile::parse("yolo26").unwrap(), YOLOV10);
         assert_eq!(ModelProfile::parse("rf-detr").unwrap(), RFDETR);
-        // an alias resolves to the profile's canonical identity, so the
-        // startup line and every error say `yolov8`, not the alias
+        // a family resolves to the contract's canonical identity, so the
+        // startup line and every error say `yolov8`, not the family name
         assert_eq!(ModelProfile::parse("yolo11").unwrap().to_string(), "yolov8");
         // ...and one profile per distinct decode keeps sniffing unambiguous
         assert_eq!(PROFILES.len(), 4);

@@ -2473,7 +2473,7 @@ defmodule Cairn.ConfigTest do
       end
     end
 
-    test "the family table resolves the catalog's aliases to their family" do
+    test "the family table resolves each family to its decode contract" do
       assert {"yolov8", _row} = Profile.family("yolo11")
       # Under yolov8, not yolov10: the runnable yolo26 exports are raw-head
       # (device-proven 2026-08-19; the catalog moved with the evidence).
@@ -2492,7 +2492,7 @@ defmodule Cairn.ConfigTest do
     # and needs a public-path test for each half.
     test "a fused-NMS family is refused on a backend that cannot run the op" do
       acc = %{errors: [], warnings: []}
-      fused = {"fusednet", %{aliases: [], nms: :fused, rknn_conversion: :documented}}
+      fused = {"fusednet", %{families: [], nms: :fused, rknn_conversion: :documented}}
 
       assert %{errors: [error]} = Profile.check_capabilities(acc, "synthetic", "qnn", true, fused)
       assert error =~ "qnn backend requires an NMS-free family or host-side-NMS decode"
@@ -2504,7 +2504,7 @@ defmodule Cairn.ConfigTest do
 
     test "the same family is accepted on ort, which implements the op" do
       acc = %{errors: [], warnings: []}
-      fused = {"fusednet", %{aliases: [], nms: :fused, rknn_conversion: :documented}}
+      fused = {"fusednet", %{families: [], nms: :fused, rknn_conversion: :documented}}
 
       assert Profile.check_capabilities(acc, "synthetic", "ort", true, fused) == acc
     end

@@ -259,20 +259,21 @@ pub struct OutputSpec {
     pub nms: Option<NmsSpec>,
 }
 
-/// One detector family, start to finish.
+/// One decode contract, start to finish, named for its first-verified family.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelProfile {
     pub name: &'static str,
-    /// Other names `--model-profile` accepts for this exact profile.
+    /// The other model families this decode contract applies to — each a
+    /// name `--model-profile` accepts for this exact profile.
     ///
-    /// An alias is a *name*, never a second entry in [`super::catalog::PROFILES`]:
-    /// several
-    /// Ultralytics generations export byte-identical tensor layouts, and
-    /// listing each as its own profile would make every ordinary detect head
-    /// sniff as three candidates and hard-error on an ambiguity that does not
-    /// exist. Naming them here keeps `--model-profile yolo11` working while
-    /// sniffing still sees one profile per distinct decode.
-    pub aliases: &'static [&'static str],
+    /// A family here is a *name*, never a second entry in
+    /// [`super::catalog::PROFILES`]: several Ultralytics generations export
+    /// byte-identical tensor layouts, and listing each as its own profile
+    /// would make every ordinary detect head sniff as three candidates and
+    /// hard-error on an ambiguity that does not exist. Naming them here keeps
+    /// `--model-profile yolo11` working while sniffing still sees one profile
+    /// per distinct decode.
+    pub families: &'static [&'static str],
     pub input: InputSpec,
     pub output: OutputSpec,
     /// The resolutions this family's variants are trained at, for a family
