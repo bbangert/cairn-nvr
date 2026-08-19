@@ -105,6 +105,9 @@ picks which one becomes `--model`.
   identity, no tracks, no track persistence: a tier-1 pipeline runs no
   tracker at all, which is why a tier-1 profile with a `tracking:` block is
   a config error — the block describes machinery the tier turns off.
+  `record:` keeps its meaning here — its labels gate which presence
+  detections earn a recording. `track:` has nothing to gate without a
+  tracker; config warns per camera when it is set on a tier-1 profile.
 * **2 — accurate MOT.** Tracked objects with identity and persistence.
   The measured accuracy bar and per-board capacity will live in each
   board's tier file when those ship.
@@ -448,7 +451,7 @@ plugin detect: profile my-board names no model.rknn artifact for its rknn
   backend — the engine takes its model from the profile alone
 ```
 
-Two warnings, which do not fail the load:
+And warnings, which do not fail the load:
 
 ```
 profile rk3576: /etc/cairn/profiles/rk3576.yml shadows a previously loaded
@@ -457,6 +460,8 @@ plugin detect: profile my-board supersedes the global tracking.bbd/oru/ocr
   flags for its cameras — the profile's stage list wins
 tracking.reid has no effect for group detect: its profile my-board lists no
   bbd stage
+camera front: track: has no effect at tier 1 — tier 1 runs no tracker and
+  persists no track rows; record: gates presence recordings
 ```
 
 A profile's *files* are checked only for a profile some group actually runs, so

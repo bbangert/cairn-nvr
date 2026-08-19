@@ -1111,6 +1111,7 @@ defmodule Cairn.Config do
     |> validate_windows(config)
     |> validate_tracking(config)
     |> validate_tiers(config)
+    |> warn_track_inert_on_tier1(config)
     |> validate_numbers(config)
     |> validate_remux(config)
     |> validate_ha_token(config)
@@ -1456,6 +1457,23 @@ defmodule Cairn.Config do
   # opposite case and imposes nothing: rows without video is the tier working.
   defp validate_tiers(acc, config) do
     Enum.reduce(config.cameras, acc, &validate_camera_tiers(&2, &1))
+  end
+
+  # Only `track:` warns: its thresholds feed the tracker's per-label
+  # admission, and tier 1 runs no tracker. `record:` is the presence lane's
+  # recording gate, so it keeps its meaning at tier 1.
+  defp warn_track_inert_on_tier1(acc, config) do
+    config.cameras
+    |> Enum.filter(fn cam ->
+      cam.track != nil and match?(%Profile{tier: 1}, profile_for(config, cam))
+    end)
+    |> Enum.reduce(acc, fn cam, acc ->
+      add_warning(
+        acc,
+        "camera #{cam.id}: track: has no effect at tier 1 — tier 1 runs no tracker and " <>
+          "persists no track rows; record: gates presence recordings"
+      )
+    end)
   end
 
   defp validate_camera_tiers(acc, cam) do
