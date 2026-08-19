@@ -188,11 +188,15 @@ FROM debian:${DEBIAN_TAG}-slim AS runtime
 # the same sonames the native-build stage cross-linked against.
 # libyaml-0-2 + libbsd0: fastrpc's libcdsprpc.so links both (YAML_LIBS /
 # BSD_LIBS in its Makefile.am) — without them the QNN stub's dlopen chain
-# fails on arm64 before FastRPC reaches the DSP.
+# fails on arm64 before FastRPC reaches the DSP. procps: four modules
+# (FFmpegPort stall-kill, canary teardown, probe, clip_remux) signal OS
+# processes via `System.cmd("kill", …)`, and slim ships no kill binary —
+# device-proven: the canary LOADED the model on the HTP, then its teardown
+# raised :enoent.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     ffmpeg libstdc++6 openssl libncurses6 locales ca-certificates \
-    libyaml-0-2 libbsd0 \
+    libyaml-0-2 libbsd0 procps \
   && apt-get clean && rm -f /var/lib/apt/lists/*_* \
   && sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 
