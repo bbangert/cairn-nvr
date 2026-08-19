@@ -50,6 +50,13 @@ done
 [ "$code" = 200 ] || fail "UI never served 200 (last: $code)"
 say "PASS: UI serves 200"
 
+# Through a LAN-looking Host header too: prod once shipped force_ssl with a
+# localhost-only exclusion, so every non-localhost request 301'd at an https
+# listener that doesn't exist — invisible to a localhost-only smoke.
+lan_code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: 192.0.2.10:4000" http://localhost:4000/ || true)
+[ "$lan_code" = 200 ] || fail "UI answered $lan_code for a LAN host header (force_ssl regression?)"
+say "PASS: UI serves 200 for a non-localhost host"
+
 cameras=$(curl -s -H "Authorization: Bearer smoke-token" http://localhost:4000/api/cameras)
 echo "$cameras" >>"$LOG"
 echo "$cameras" | grep -q smoke_cam || fail "/api/cameras does not list smoke_cam"
