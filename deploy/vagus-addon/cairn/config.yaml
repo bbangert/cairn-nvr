@@ -1,6 +1,6 @@
 # Cairn NVR as a vagus add-on (tier1-container plan, phase 2).
 name: Cairn NVR
-version: "0.1.2"
+version: "0.1.3"
 slug: cairn
 description: >-
   Presence-detection NVR with in-VM inference on the Hexagon HTP.
@@ -26,6 +26,13 @@ host_network: true
 # operator-uploaded skel store bound read-only. The image carries the QNN
 # host libs; the skel is uploaded once via the admin panel — see README.
 dsp: true
+# Venus (the hardware h264 decoder the tier-1 profile names): dsp: true
+# grants no video nodes, and the profile refuses software fallback by
+# design — without these rules detection stops, stated, on every camera.
+# Device-proven on the Q6A: visible via the /dev bind, EPERM until granted.
+devices:
+  - /dev/video0
+  - /dev/video1
 map:
   # /config read-only: cairn reads CAIRN_CONFIG=/config/config.yml and never
   # writes it; the operator edits it host-side. /data is always mounted rw by

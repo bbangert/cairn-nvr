@@ -146,7 +146,7 @@ model_ladder:
       qnn: data/models/yolo26m-qdq.onnx
     model_profile: yolo26      # per-rung; omitted, the top-level one stands
     input_size: 640            # per-rung — 640 and 416 rungs are the norm
-    engine_budget: 16.8        # measured passes/s, strictly increasing
+    engine_budget: 16.8        # measured passes/s (ordering: reachability)
     pack: yolo26m              # skipped (with a warning) until installed
   - model:
       qnn: models/yolox_nano_qdq.onnx
@@ -178,6 +178,18 @@ The rules, each refused or warned at load:
   rungs alone must cover `supported_cameras` — packs raise accuracy at a
   fleet size, they never extend support, and a ladder that leans on them
   for any camera count is refused at parse.
+* **Ordering is reachability, not blanket monotonicity.** The list is the
+  author's accuracy claim, most accurate first, and resolution takes the
+  first installed rung that fits — so a rung is refused exactly when a
+  rung above it that can never be absent while this one is available
+  budgets at least as much: no installation state could ever reach it.
+  That shadow is every non-`pack:` rung (always present) plus any `pack:`
+  rung naming the same active-backend artifact path (same path = installed
+  and absent together). A rung under a bigger-budget *independent* `pack:`
+  rung is legitimate by design — it wins exactly when that pack is absent,
+  which is how one ladder serves both installation states (the shipped
+  file's yolox_m under yolo26s: dominated when the pack is installed,
+  the small-fleet rung when only the baked Apache models exist).
 * **Budgets are measurements (D-L6).** Every `engine_budget` carries a
   provenance comment — `measured` (a boundary capacity-ladder run) or
   `provisional` (menu arithmetic) — and a file whose NON-pack rungs
@@ -529,7 +541,7 @@ Four profiles in `priv/profiles/`, each with its reasoning in the file:
 | `generic-ort` | `ort` | band 5–5 | twin gate only | today's behaviour, named; the migration target and the one non-experimental profile |
 | `rk3566-lowfps` | `rknn` | band 2–4 | bbd, oru, twin gate | the low-fps set; wants `--track-floor-json` alongside it |
 | `rk3576` | `rknn` | band 8–16 | bbd, oru, twin gate | same pipeline, faster board; the band is scaled from rk3566's and **unmeasured** |
-| `qcs6490-tier1` | `qnn` | derived per rung | none (tier 1 — no tracker) | the model-ladder file: five rungs, claim 40 cameras; Apache budgets boundary-measured, pack budgets provisional until their packs ship |
+| `qcs6490-tier1` | `qnn` | derived per rung | none (tier 1 — no tracker) | the model-ladder file: six rungs serving both installation states (yolo26 packs installed, or only the baked Apache models — yolox_m carries small fleets there), claim 40 cameras; tiny/nano boundary-measured, the rest provisional |
 
 Three of the four are `experimental: true` for the same blunt reason: their
 backends have not proven out in soak. Only `ort` runs today; `rknn` (a stub)

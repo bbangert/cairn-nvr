@@ -2,8 +2,8 @@
 
 Presence-detection NVR for QCS6490 vagus boards: RTSP cameras in, events
 and a live UI out, detection on the Hexagon HTP through the tier-1 model
-ladder (YOLOX nano/tiny baked in, Apache-2.0; yolo26 packs install
-separately into `/data`).
+ladder (YOLOX m/tiny/nano baked in, Apache-2.0; yolo26 packs install
+separately into `/data` and take over the top rungs when present).
 
 ## Prerequisites
 

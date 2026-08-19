@@ -227,6 +227,10 @@ COPY --from=native-build /dist/cairn-detect /usr/local/bin/cairn-detect
 # /app. The pack rungs stay skip-with-warning until a cairn-models pack is
 # installed under /data.
 COPY models models
+# Pack rungs name `data/models/…`, resolved against this workdir — host-side
+# that coincided with the data dir; here it must reach the /data mount or an
+# installed pack would land on ephemeral container filesystem.
+RUN ln -s /data /app/data
 
 VOLUME ["/data", "/config"]
 EXPOSE 4000
