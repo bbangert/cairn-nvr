@@ -1,6 +1,6 @@
 # Cairn NVR as a vagus add-on (tier1-container plan, phase 2).
 name: Cairn NVR
-version: "0.1.0"
+version: "0.1.1"
 slug: cairn
 description: >-
   Presence-detection NVR with in-VM inference on the Hexagon HTP.
@@ -11,6 +11,11 @@ arch:
 image: ghcr.io/bbangert/cairn-nvr-{arch}
 startup: application
 boot: auto
+# Not the schema default (true): the engine's start then execs
+# balena-engine-init, which nerves_system_vagus does not ship — the add-on
+# 500s at start. The release's BEAM runs as PID 1; its ffmpeg/port
+# processes are direct children, so reaping needs no init shim.
+init: false
 # host_network per D-C5: NAT-free LAN realism for RTSP cameras, WebRTC and
 # mDNS, and the UI directly on host:4000 (host_network add-ons get no port
 # mapping). Decision defaulted at planning; verify on-board before the

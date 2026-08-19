@@ -7,17 +7,11 @@ import Config
 # before starting your production server.
 config :cairn, CairnWeb.Endpoint, cache_static_manifest: "priv/static/cache_manifest.json"
 
-# Force using SSL in production. This also sets the "strict-security-transport" header,
-# known as HSTS. If you have a health check endpoint, you may want to exclude it below.
-# Note `:force_ssl` is required to be set at compile-time.
-config :cairn, CairnWeb.Endpoint,
-  force_ssl: [
-    rewrite_on: [:x_forwarded_proto],
-    exclude: [
-      # paths: ["/health"],
-      hosts: ["localhost", "127.0.0.1"]
-    ]
-  ]
+# No force_ssl: cairn's v1 posture is LAN-trusted plain http (no TLS
+# terminator anywhere in the deployment), and the generator's hardened
+# default 301'd every non-localhost request — including the vagus panel's
+# webui link to host:4000 — at an https listener that doesn't exist.
+# Device-proven on the Q6A.
 
 # Do not print debug messages in production
 config :logger, level: :info
