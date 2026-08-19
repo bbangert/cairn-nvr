@@ -57,6 +57,15 @@ lan_code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: 192.0.2.10:4000" htt
 [ "$lan_code" = 200 ] || fail "UI answered $lan_code for a LAN host header (force_ssl regression?)"
 say "PASS: UI serves 200 for a non-localhost host"
 
+# And the LiveView transport from that same LAN identity: check_origin
+# once compared against the configured host (localhost), so the page
+# rendered and then its socket retried the mount forever.
+lp_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "Host: 192.0.2.10:4000" -H "Origin: http://192.0.2.10:4000" \
+  "http://localhost:4000/live/longpoll?vsn=2.0.0" || true)
+[ "$lp_code" = 200 ] || fail "LiveView longpoll answered $lp_code for a LAN origin (check_origin regression?)"
+say "PASS: LiveView transport accepts the LAN origin"
+
 cameras=$(curl -s -H "Authorization: Bearer smoke-token" http://localhost:4000/api/cameras)
 echo "$cameras" >>"$LOG"
 echo "$cameras" | grep -q smoke_cam || fail "/api/cameras does not list smoke_cam"
