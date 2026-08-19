@@ -148,8 +148,9 @@ struct Args {
     embedder_model: Option<PathBuf>,
 
     /// Preprocessing and decode steps to run this model under: `yolox`,
-    /// `rfdetr`, `yolov10` or `yolov8` (or `yolov9`, `yolo11`, `yolov11`,
-    /// `yolo26` — its runnable exports are raw-head). Sniffed from the model's own input and output when
+    /// `rfdetr` (hyphenated spellings accepted), `yolov10` or `yolov8` (or
+    /// `yolov9`, `yolo11`, `yolov11`, `yolo26` — its runnable exports are
+    /// raw-head). Sniffed from the model's own input and output when
     /// omitted; required when a shape fits more than one profile, and for
     /// rfdetr, whose exports leave their input geometry dynamic.
     #[arg(long, value_parser = ModelProfile::parse)]

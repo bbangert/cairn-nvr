@@ -118,7 +118,7 @@ named group under `plugins:` and point cameras at it by name — see
 | `--labels` | no | newline-separated class names, **indexed by class id** — line 1 is class 0. Must match the model: a count that disagrees with the model's class count is a startup error, because positional indexing would emit every detection under another class's name. Ids past the end, and blank lines (unnamed slots), fall back to the numeric id |
 | `--allow-label-mismatch` | no | start anyway when `--labels` and the model disagree about the class count. For a deliberately partial label file; the mislabelling it permits is silent |
 | `--input-size` | no, except RF-DETR | model input `WxH` (or `N` for a square N×N). Read from the model when omitted; **required** when the model's spatial dims are dynamic, which every RF-DETR export leaves them — `--model-profile` does not substitute for it there (see [Geometry](#geometry)) |
-| `--model-profile` | no | `yolox`, `rfdetr`, `yolov10` or `yolov8` (plus the aliases `rf-detr`, `yolo26`, `yolov9`, `yolo11`, `yolov11`) — the preprocessing and decode steps to run the model under. Sniffed from the model when omitted; required when a shape fits more than one profile or the model's *output* shape is dynamic (see [Model profiles](#model-profiles)) |
+| `--model-profile` | no | `yolox`, `rfdetr`, `yolov10` or `yolov8` (plus the families each contract also applies to: `yolo26`, `yolov9`, `yolo11`, `yolov11`; hyphenated spellings like `rf-detr` normalize) — the preprocessing and decode steps to run the model under. Sniffed from the model when omitted; required when a shape fits more than one profile or the model's *output* shape is dynamic (see [Model profiles](#model-profiles)) |
 | `--decoder` | no | `auto` (default), `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` |
 | `--motion-json` | no | JSON object of motion-gate knobs. **Off by default** — see [Motion gate](#motion-gate) |
 | `--track-floor-json` | no | JSON object with one knob, `floor`: emit detections below their class's `min_score` down to it, for the host's low-confidence tracking stage. **Off by default** — see [Track floor](#track-floor) |
@@ -746,20 +746,21 @@ This README will not walk you through obtaining them.
 
 Everything that differs between detector families lives in one **profile**: how
 frames are fed to the model, and how its output is read. Four ship built in,
-covering five families — the Ultralytics generations are *aliases*, not
+covering the model families — the Ultralytics generations are *family names
+on one contract*, not
 separate profiles, because their exports are byte-for-byte the same tensor
 contract:
 
 | profile (and the names it answers to) | default size | input encoding | resize | output layout | score | NMS | weights license |
 |---|---|---|---|---|---|---|---|
 | **`yolox`** — nano, tiny, s | 416 | `0..255` **BGR** | **letterbox**, pad 114 | `[1, A, 5 + nc]` grid-objectness, strides 8/16/32 | `objectness × class` | IoU 0.45, top 300 | Apache-2.0 |
-| **`rfdetr`** (`rf-detr`) — nano … large | none — `--input-size` required | **ImageNet-normalized** RGB | stretch | `[1, Q, 4]` + `[1, Q, nc]` detr-queries (**two tensors**) | `sigmoid(class logit)` | none (set prediction) | Apache-2.0 |
+| **`rfdetr`** — nano … large | none — `--input-size` required | **ImageNet-normalized** RGB | stretch | `[1, Q, 4]` + `[1, Q, nc]` detr-queries (**two tensors**) | `sigmoid(class logit)` | none (set prediction) | Apache-2.0 |
 | **`yolov10`** | 640 | `0..1` **RGB** | stretch | `[1, N, 6]` end-to-end | class | none (the model did it) | AGPL-3.0 |
 | **`yolov8`** (`yolov9`, `yolo11`, `yolov11`, `yolo26`) — what Frigate commonly ships | 640 | `0..1` **RGB** | stretch | `[1, 4 + nc, A]` raw-classes | class | IoU 0.45, top 300 | AGPL-3.0 (GPL-3.0 for YOLOv9) |
 
-An alias resolves to the profile's canonical identity, so `--model-profile
-yolo11` runs and reports `profile=yolov8`. Two of the aliases are worth
-calling out:
+A family name resolves to its contract's canonical identity, so
+`--model-profile yolo11` runs and reports `profile=yolov8`. Two of the
+families are worth calling out:
 
   * **`yolov9`** and **`yolov11`/`yolo11`** are *verified by construction*, not
     against a downloaded export — their detect heads emit the same

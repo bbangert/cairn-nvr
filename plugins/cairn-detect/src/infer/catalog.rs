@@ -1,10 +1,12 @@
 //! The detector families this plugin ships, and the names the command line
 //! accepts for them.
 //!
-//! An alias is a *name*, never a second [`PROFILES`] entry: several Ultralytics
-//! generations export byte-identical tensor layouts, and listing each as its
-//! own profile would make every ordinary detect head sniff as three candidates
-//! and hard-error on an ambiguity that does not exist.
+//! Each entry is a decode contract; its `families` list the model families
+//! the contract applies to. A family is a *name*, never a second [`PROFILES`]
+//! entry: several Ultralytics generations export byte-identical tensor
+//! layouts, and listing each as its own profile would make every ordinary
+//! detect head sniff as three candidates and hard-error on an ambiguity that
+//! does not exist.
 
 use anyhow::{anyhow, Result};
 
@@ -15,7 +17,7 @@ use super::profile::{InputSpec, Layout, ModelProfile, OutputSpec, ScoreCompositi
 /// Megvii YOLOX (nano / tiny / s). Apache-2.0, the documented default.
 pub const YOLOX: ModelProfile = ModelProfile {
     name: "yolox",
-    aliases: &[],
+    families: &[],
     input: InputSpec {
         size: InputSize::square(416),
         encoding: TensorEncoding::RawBgr,
@@ -34,16 +36,16 @@ pub const YOLOX: ModelProfile = ModelProfile {
 
 /// Ultralytics end-to-end / NMS-free head (yolov10).
 ///
-/// `yolo26` used to alias here on the documented claim that YOLO26 is
+/// `yolo26` used to sit in this contract's families on the claim that YOLO26 is
 /// end-to-end like yolov10 — disproven by the first real export run against
 /// this decode (yolo26m QDQ on-device, 2026-08-19): the only YOLO26 exports
 /// this stack can run are `end2end=False` (the NMS-free tail segfaults
 /// quantized QNN — tools/qdq-export/README.md), and their raw `[1, 4+nc, A]`
-/// head is the yolov8 contract, where the alias now lives. A true end-to-end
+/// head is the yolov8 contract, whose families list now carries it. A true end-to-end
 /// export, should one ever work, names `yolov10` explicitly.
 pub const YOLOV10: ModelProfile = ModelProfile {
     name: "yolov10",
-    aliases: &[],
+    families: &[],
     input: InputSpec {
         size: InputSize::square(640),
         encoding: TensorEncoding::UnitRgb,
@@ -70,7 +72,7 @@ pub const YOLOV10: ModelProfile = ModelProfile {
 /// rejected by `fit_output` rather than decoded wrong.
 pub const YOLOV8: ModelProfile = ModelProfile {
     name: "yolov8",
-    aliases: &["yolov9", "yolo11", "yolov11", "yolo26"],
+    families: &["yolov9", "yolo11", "yolov11", "yolo26"],
     input: InputSpec {
         size: InputSize::square(640),
         encoding: TensorEncoding::UnitRgb,
@@ -93,7 +95,7 @@ pub const YOLOV8: ModelProfile = ModelProfile {
 /// `--input-size`.
 pub const RFDETR: ModelProfile = ModelProfile {
     name: "rfdetr",
-    aliases: &["rf-detr"],
+    families: &[],
     input: InputSpec {
         size: InputSize::square(384),
         encoding: TensorEncoding::ImageNetRgb,
@@ -117,11 +119,15 @@ pub const PROFILES: &[ModelProfile] = &[YOLOX, YOLOV10, YOLOV8, RFDETR];
 
 impl ModelProfile {
     /// `--model-profile` value parser, so a typo's error names the real set.
+    ///
+    /// Hyphens are spelling, not identity — `rf-detr` is the same family as
+    /// `rfdetr`, so normalization handles it rather than a `families` entry,
+    /// which is reserved for genuinely different families sharing a contract.
     pub fn parse(name: &str) -> Result<Self> {
-        let wanted = name.trim().to_ascii_lowercase();
+        let wanted = name.trim().to_ascii_lowercase().replace('-', "");
         PROFILES
             .iter()
-            .find(|profile| profile.name == wanted || profile.aliases.contains(&wanted.as_str()))
+            .find(|profile| profile.name == wanted || profile.families.contains(&wanted.as_str()))
             .copied()
             .ok_or_else(|| {
                 anyhow!(
@@ -132,14 +138,14 @@ impl ModelProfile {
     }
 }
 
-/// Every accepted `--model-profile` value, aliases shown against the profile
-/// they resolve to so the error says what `yolo11` will actually do.
+/// Every accepted `--model-profile` value, families shown against the
+/// contract they resolve to so the error says what `yolo11` will actually do.
 pub(super) fn names() -> String {
     PROFILES
         .iter()
-        .map(|profile| match profile.aliases {
+        .map(|profile| match profile.families {
             [] => profile.name.to_string(),
-            aliases => format!("{} (or {})", profile.name, aliases.join(", ")),
+            families => format!("{} (or {})", profile.name, families.join(", ")),
         })
         .collect::<Vec<_>>()
         .join(", ")

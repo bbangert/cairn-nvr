@@ -12,7 +12,7 @@ defmodule Cairn.Config.Profile do
   `model_profile:`/`decoder:`/`labels:` strings, `experimental:` a boolean)
   are rejected here. So are names outside the menus the plugin itself
   accepts — `backend:` against the capability table below, `model_profile:`
-  against the Rust catalog's families and aliases, `decoder:` against the
+  against the Rust catalog's decode contracts and their families, `decoder:` against the
   video decode kinds — and the two backend/family combinations
   `docs/npu-backends.md` calls out, one broken and one unverified (see
   `check_capabilities/5`).
@@ -182,7 +182,7 @@ defmodule Cairn.Config.Profile do
   @known_model_keys Map.values(@backend_artifacts)
 
   # The Rust catalog's model families, row for row with `PROFILES` in
-  # `plugins/cairn-detect/src/infer/catalog.rs` — aliases included, so
+  # `plugins/cairn-detect/src/infer/catalog.rs` — family names included, so
   # `model_profile:` is checked against the same set the plugin's own
   # `ModelProfile::parse` accepts — plus the two columns profile validation
   # reads:
@@ -206,17 +206,17 @@ defmodule Cairn.Config.Profile do
   #     "known broken" — it is "nobody in this repo has converted one", which
   #     is what `experimental: true` acknowledges.
   @model_families %{
-    "yolox" => %{aliases: [], nms: :host_side, rknn_conversion: :undocumented},
-    "yolov10" => %{aliases: [], nms: :none, rknn_conversion: :undocumented},
-    # yolo26 aliases here, not yolov10: the only exports this stack can run
+    "yolox" => %{families: [], nms: :host_side, rknn_conversion: :undocumented},
+    "yolov10" => %{families: [], nms: :none, rknn_conversion: :undocumented},
+    # yolo26 belongs to this contract, not yolov10's: the only exports this stack can run
     # are end2end=False (the NMS-free tail segfaults quantized QNN), whose
     # raw head is the yolov8 contract — device-proven on yolo26m 2026-08-19.
     "yolov8" => %{
-      aliases: ["yolov9", "yolo11", "yolov11", "yolo26"],
+      families: ["yolov9", "yolo11", "yolov11", "yolo26"],
       nms: :host_side,
       rknn_conversion: :documented
     },
-    "rfdetr" => %{aliases: ["rf-detr"], nms: :none, rknn_conversion: :undocumented}
+    "rfdetr" => %{families: [], nms: :none, rknn_conversion: :undocumented}
   }
 
   # `decoder:`'s menu, mirroring `DecoderKind` in
@@ -306,7 +306,7 @@ defmodule Cairn.Config.Profile do
   where its suppression happens, and whether its rknn conversion is documented.
   """
   @type family :: %{
-          aliases: [String.t()],
+          families: [String.t()],
           nms: :fused | :host_side | :none,
           rknn_conversion: :documented | :undocumented
         }
@@ -321,7 +321,7 @@ defmodule Cairn.Config.Profile do
   def capabilities(backend), do: Map.fetch!(@backend_capabilities, backend)
 
   @doc """
-  The catalog family `name` resolves to (aliases included), or `nil` for a name
+  The catalog family `name` resolves to (family names included), or `nil` for a name
   no family claims.
 
   Trimmed and downcased exactly as the plugin's `ModelProfile::parse` does, so
@@ -335,10 +335,13 @@ defmodule Cairn.Config.Profile do
 
   @spec family(term()) :: {String.t(), family()} | nil
   def family(name) when is_binary(name) do
-    wanted = name |> String.trim() |> String.downcase()
+    # Hyphens are spelling, not identity (rf-detr == rfdetr) — normalized
+    # here, mirroring the Rust parser, so `families` holds only genuinely
+    # different families sharing a contract.
+    wanted = name |> String.trim() |> String.downcase() |> String.replace("-", "")
 
     case Enum.find(@model_families, fn {canonical, row} ->
-           wanted == canonical or wanted in row.aliases
+           wanted == canonical or wanted in row.families
          end) do
       {canonical, row} when wanted in @rknn_undocumented_families ->
         {canonical, %{row | rknn_conversion: :undocumented}}
@@ -670,8 +673,8 @@ defmodule Cairn.Config.Profile do
     @model_families
     |> Enum.sort_by(fn {canonical, _row} -> canonical end)
     |> Enum.map_join(", ", fn
-      {canonical, %{aliases: []}} -> canonical
-      {canonical, %{aliases: aliases}} -> "#{canonical} (or #{Enum.join(aliases, ", ")})"
+      {canonical, %{families: []}} -> canonical
+      {canonical, %{families: families}} -> "#{canonical} (or #{Enum.join(families, ", ")})"
     end)
   end
 
