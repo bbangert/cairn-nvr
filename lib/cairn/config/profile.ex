@@ -699,14 +699,21 @@ defmodule Cairn.Config.Profile do
   # guide says so).
   defp check_capability_rules(acc, raw, name) do
     backend = Map.get(raw, "backend", "ort")
+    requested = Map.get(raw, "model_profile")
 
-    case {backend in @backends, family(Map.get(raw, "model_profile"))} do
-      {true, {_canonical, _row} = family} ->
+    case {backend in @backends, family(requested)} do
+      {true, {_canonical, row}} ->
         # `=== true`, not `|| false`: a non-boolean `experimental:` is already
         # an error (`check_experimental/3`, same pipeline), and treating its
         # truthiness as acknowledgement would swallow the rknn rule's more
         # actionable "declare experimental: true" message alongside it.
-        check_capabilities(acc, name, backend, Map.get(raw, "experimental") === true, family)
+        # Diagnostics carry the name the OPERATOR wrote: the canonical would
+        # say "undocumented for yolov8" about a per-family override (yolo26)
+        # while the same table documents yolov8 — a self-contradiction.
+        check_capabilities(acc, name, backend, Map.get(raw, "experimental") === true, {
+          requested,
+          row
+        })
 
       _unknown_backend_or_no_family ->
         acc

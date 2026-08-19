@@ -2539,6 +2539,18 @@ defmodule Cairn.ConfigTest do
       assert {"yolov8", %{rknn_conversion: :documented}} = Profile.family("yolov11")
     end
 
+    test "the rknn refusal names the family the operator wrote, not the canonical" do
+      errors = caps_errors(@caps_bad_dir)
+
+      # "undocumented for yolov8" would contradict the table's own yolov8 row.
+      assert Enum.any?(
+               errors,
+               &(&1 =~
+                   "profile rknn-yolo26: rknn conversion is undocumented for " <>
+                     "model_profile yolo26")
+             )
+    end
+
     # A truthy non-boolean is a type error AND not an acknowledgement: both
     # messages must surface, or the type error hides the actionable one.
     test "a non-boolean experimental does not satisfy the rknn rule" do
