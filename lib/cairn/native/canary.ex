@@ -97,11 +97,11 @@ defmodule Cairn.Native.Canary do
   defp probe_port(caller, ref, binary, argv, timeout_ms) do
     Process.flag(:trap_exit, true)
 
-    # The rescue covers Port.open alone: "could not run" must mean exactly
-    # that. Wrapping await/stop too once relabeled a teardown failure (no
-    # `kill` binary in the image) as a failed run — of a probe whose model
-    # load had SUCCEEDED on the HTP. A raise past open crashes this process
-    # and reaches the caller as "ended without answering: <reason>".
+    # Two rescues with two labels: "could not run" means Port.open alone.
+    # One rescue over both once relabeled a teardown failure (no `kill`
+    # binary in the image) as a failed run — of a probe whose model load had
+    # SUCCEEDED on the HTP. The await/stop half still rescues, distinctly:
+    # `probe/2`'s result() must not depend on the caller trapping exits.
     result =
       try do
         {:ok,
@@ -118,8 +118,15 @@ defmodule Cairn.Native.Canary do
 
     result =
       case result do
-        {:ok, port} -> await(port, System.monotonic_time(:millisecond) + timeout_ms, [])
-        {:error, _message} = error -> error
+        {:ok, port} ->
+          try do
+            await(port, System.monotonic_time(:millisecond) + timeout_ms, [])
+          rescue
+            error -> {:error, "the probe failed after starting: #{Exception.message(error)}"}
+          end
+
+        {:error, _message} = error ->
+          error
       end
 
     send(caller, {ref, result})
