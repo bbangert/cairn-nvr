@@ -207,9 +207,12 @@ defmodule Cairn.Config.Profile do
   #     is what `experimental: true` acknowledges.
   @model_families %{
     "yolox" => %{aliases: [], nms: :host_side, rknn_conversion: :undocumented},
-    "yolov10" => %{aliases: ["yolo26"], nms: :none, rknn_conversion: :undocumented},
+    "yolov10" => %{aliases: [], nms: :none, rknn_conversion: :undocumented},
+    # yolo26 aliases here, not yolov10: the only exports this stack can run
+    # are end2end=False (the NMS-free tail segfaults quantized QNN), whose
+    # raw head is the yolov8 contract — device-proven on yolo26m 2026-08-19.
     "yolov8" => %{
-      aliases: ["yolov9", "yolo11", "yolov11"],
+      aliases: ["yolov9", "yolo11", "yolov11", "yolo26"],
       nms: :host_side,
       rknn_conversion: :documented
     },

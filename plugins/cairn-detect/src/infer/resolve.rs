@@ -905,12 +905,12 @@ mod tests {
         // the yolov8 profile. Were they separate entries in `PROFILES`, an
         // ordinary `[1, 84, 8400]` head would sniff as four candidates and
         // hard-error on an ambiguity that does not exist.
-        for name in ["yolov8", "yolov9", "yolo11", "yolov11"] {
+        for name in ["yolov8", "yolov9", "yolo11", "yolov11", "yolo26"] {
             assert_eq!(ModelProfile::parse(name).unwrap(), YOLOV8, "{name}");
         }
-        // yolo26 is end-to-end like yolov10 — UNVERIFIED against a real
-        // export, which is why it is an alias rather than its own decode.
-        assert_eq!(ModelProfile::parse("yolo26").unwrap(), YOLOV10);
+        // yolo26 sat under yolov10 until a real export disproved it: the
+        // only runnable YOLO26 exports are raw-head (see the catalog doc).
+        assert_ne!(ModelProfile::parse("yolo26").unwrap(), YOLOV10);
         assert_eq!(ModelProfile::parse("rf-detr").unwrap(), RFDETR);
         // an alias resolves to the profile's canonical identity, so the
         // startup line and every error say `yolov8`, not the alias
@@ -2200,8 +2200,8 @@ mod tests {
             .to_string(),
             "model m.onnx leaves its output shape dynamic, so there is nothing to sniff a profile \
              from — and the encoding and resize policy have to be settled before the first frame \
-             is converted. Pass --model-profile <yolox, yolov10 (or yolo26), yolov8 (or yolov9, \
-             yolo11, yolov11), rfdetr (or rf-detr)>."
+             is converted. Pass --model-profile <yolox, yolov10, yolov8 (or yolov9, yolo11, yolov11, \
+             yolo26), rfdetr (or rf-detr)>."
         );
     }
 

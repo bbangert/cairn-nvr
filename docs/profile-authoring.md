@@ -223,7 +223,7 @@ Two consequences worth an operator's attention:
 | field | menu | where the menu lives |
 |---|---|---|
 | `backend` | `ort`, `rknn`, `qnn` | `BackendKind`, `plugins/cairn-detect/src/infer/backend.rs` — mirrored in `Cairn.Config.Profile`'s capability table |
-| `model_profile` | `yolox`, `yolov10` (or `yolo26`), `yolov8` (or `yolov9`, `yolo11`, `yolov11`), `rfdetr` (or `rf-detr`) | `PROFILES`, `plugins/cairn-detect/src/infer/catalog.rs` |
+| `model_profile` | `yolox`, `yolov10`, `yolov8` (or `yolov9`, `yolo11`, `yolov11`, `yolo26`), `rfdetr` (or `rf-detr`) | `PROFILES`, `plugins/cairn-detect/src/infer/catalog.rs` |
 | `decoder` | `auto`, `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` | `DecoderKind`, `plugins/cairn-detect/src/decode.rs` |
 | `tracking:` stage keys | `bbd`, `oru`, `ocr`, `twin_mint` | `Cairn.Tracker.Stage.Bbd` / `.Oru` / `.Ocr` / `.TwinMint` |
 
