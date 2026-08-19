@@ -63,9 +63,20 @@ for d in lib/*/; do
     exit 1
   fi
 done
+# By existing dir, not by version — like the app loop above: a local
+# version bump must not silently skip the config files while still
+# stamping PUSH_OK.
 for r in releases/*/; do
-  ver=$(basename "$r")
-  [ -d "/app/releases/$ver" ] && cp "$r"* "/app/releases/$ver/"
+  installed=""
+  for target in /app/releases/*/; do
+    [ -d "$target" ] || continue
+    cp "$r"* "$target"
+    installed=1
+  done
+  if [ -z "$installed" ]; then
+    echo "push: the image has no release dir to receive runtime config" >&2
+    exit 1
+  fi
 done
 EOS
 
