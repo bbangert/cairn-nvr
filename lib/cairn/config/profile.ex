@@ -207,9 +207,12 @@ defmodule Cairn.Config.Profile do
   #     is what `experimental: true` acknowledges.
   @model_families %{
     "yolox" => %{aliases: [], nms: :host_side, rknn_conversion: :undocumented},
-    "yolov10" => %{aliases: ["yolo26"], nms: :none, rknn_conversion: :undocumented},
+    "yolov10" => %{aliases: [], nms: :none, rknn_conversion: :undocumented},
+    # yolo26 aliases here, not yolov10: the only exports this stack can run
+    # are end2end=False (the NMS-free tail segfaults quantized QNN), whose
+    # raw head is the yolov8 contract — device-proven on yolo26m 2026-08-19.
     "yolov8" => %{
-      aliases: ["yolov9", "yolo11", "yolov11"],
+      aliases: ["yolov9", "yolo11", "yolov11", "yolo26"],
       nms: :host_side,
       rknn_conversion: :documented
     },
@@ -324,13 +327,25 @@ defmodule Cairn.Config.Profile do
   Trimmed and downcased exactly as the plugin's `ModelProfile::parse` does, so
   a name this accepts is one the plugin accepts.
   """
+  # rknn conversion coverage is a per-FAMILY fact (Rockchip's model zoo,
+  # documented through YOLOv11 — docs/npu-backends.md), while the table rows
+  # are per decode contract: yolo26 shares yolov8's row for its wire format
+  # but must not inherit the row's conversion claim.
+  @rknn_undocumented_families ~w(yolo26)
+
   @spec family(term()) :: {String.t(), family()} | nil
   def family(name) when is_binary(name) do
     wanted = name |> String.trim() |> String.downcase()
 
-    Enum.find(@model_families, fn {canonical, row} ->
-      wanted == canonical or wanted in row.aliases
-    end)
+    case Enum.find(@model_families, fn {canonical, row} ->
+           wanted == canonical or wanted in row.aliases
+         end) do
+      {canonical, row} when wanted in @rknn_undocumented_families ->
+        {canonical, %{row | rknn_conversion: :undocumented}}
+
+      found ->
+        found
+    end
   end
 
   def family(_other), do: nil
@@ -684,14 +699,21 @@ defmodule Cairn.Config.Profile do
   # guide says so).
   defp check_capability_rules(acc, raw, name) do
     backend = Map.get(raw, "backend", "ort")
+    requested = Map.get(raw, "model_profile")
 
-    case {backend in @backends, family(Map.get(raw, "model_profile"))} do
-      {true, {_canonical, _row} = family} ->
+    case {backend in @backends, family(requested)} do
+      {true, {_canonical, row}} ->
         # `=== true`, not `|| false`: a non-boolean `experimental:` is already
         # an error (`check_experimental/3`, same pipeline), and treating its
         # truthiness as acknowledgement would swallow the rknn rule's more
         # actionable "declare experimental: true" message alongside it.
-        check_capabilities(acc, name, backend, Map.get(raw, "experimental") === true, family)
+        # Diagnostics carry the name the OPERATOR wrote: the canonical would
+        # say "undocumented for yolov8" about a per-family override (yolo26)
+        # while the same table documents yolov8 — a self-contradiction.
+        check_capabilities(acc, name, backend, Map.get(raw, "experimental") === true, {
+          requested,
+          row
+        })
 
       _unknown_backend_or_no_family ->
         acc

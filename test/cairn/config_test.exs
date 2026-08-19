@@ -2475,7 +2475,9 @@ defmodule Cairn.ConfigTest do
 
     test "the family table resolves the catalog's aliases to their family" do
       assert {"yolov8", _row} = Profile.family("yolo11")
-      assert {"yolov10", _row} = Profile.family("yolo26")
+      # Under yolov8, not yolov10: the runnable yolo26 exports are raw-head
+      # (device-proven 2026-08-19; the catalog moved with the evidence).
+      assert {"yolov8", _row} = Profile.family("yolo26")
       assert {"rfdetr", _row} = Profile.family("RF-DETR ")
       assert Profile.family("yolov12") == nil
     end
@@ -2530,6 +2532,25 @@ defmodule Cairn.ConfigTest do
       assert Enum.any?(errors, &(&1 =~ "declare experimental: true"))
     end
 
+    test "yolo26 does not inherit its contract row's documented rknn conversion" do
+      # Conversion coverage is per FAMILY (the zoo documents through
+      # YOLOv11); yolo26 shares yolov8's decode contract, not its claim.
+      assert {"yolov8", %{rknn_conversion: :undocumented}} = Profile.family("yolo26")
+      assert {"yolov8", %{rknn_conversion: :documented}} = Profile.family("yolov11")
+    end
+
+    test "the rknn refusal names the family the operator wrote, not the canonical" do
+      errors = caps_errors(@caps_bad_dir)
+
+      # "undocumented for yolov8" would contradict the table's own yolov8 row.
+      assert Enum.any?(
+               errors,
+               &(&1 =~
+                   "profile rknn-yolo26: rknn conversion is undocumented for " <>
+                     "model_profile yolo26")
+             )
+    end
+
     # A truthy non-boolean is a type error AND not an acknowledgement: both
     # messages must surface, or the type error hides the actionable one.
     test "a non-boolean experimental does not satisfy the rknn rule" do
@@ -2566,7 +2587,7 @@ defmodule Cairn.ConfigTest do
                &(&1 =~ "profile bad-family: unknown model_profile \"yolov12\"")
              )
 
-      assert Enum.any?(errors, &(&1 =~ "yolov8 (or yolov9, yolo11, yolov11)"))
+      assert Enum.any?(errors, &(&1 =~ "yolov8 (or yolov9, yolo11, yolov11, yolo26)"))
     end
 
     test "an unknown decoder is refused, and says which knob it is" do

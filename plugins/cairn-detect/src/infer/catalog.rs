@@ -32,17 +32,18 @@ pub const YOLOX: ModelProfile = ModelProfile {
     variant_sizes: None,
 };
 
-/// Ultralytics end-to-end / NMS-free heads (yolov10, YOLO26).
+/// Ultralytics end-to-end / NMS-free head (yolov10).
 ///
-/// `yolo26` is an **unverified** alias: YOLO26 is documented as end-to-end and
-/// NMS-free like yolov10, but no YOLO26 export has been run against this
-/// decode — its weights are AGPL-3.0 and none is distributed here. If a real
-/// one turns out to emit a different row width, sniffing rejects it outright
-/// rather than decoding it wrong, and `--model-profile yolo26` fails the same
-/// `fit_output` check.
+/// `yolo26` used to alias here on the documented claim that YOLO26 is
+/// end-to-end like yolov10 — disproven by the first real export run against
+/// this decode (yolo26m QDQ on-device, 2026-08-19): the only YOLO26 exports
+/// this stack can run are `end2end=False` (the NMS-free tail segfaults
+/// quantized QNN — tools/qdq-export/README.md), and their raw `[1, 4+nc, A]`
+/// head is the yolov8 contract, where the alias now lives. A true end-to-end
+/// export, should one ever work, names `yolov10` explicitly.
 pub const YOLOV10: ModelProfile = ModelProfile {
     name: "yolov10",
-    aliases: &["yolo26"],
+    aliases: &[],
     input: InputSpec {
         size: InputSize::square(640),
         encoding: TensorEncoding::UnitRgb,
@@ -58,7 +59,9 @@ pub const YOLOV10: ModelProfile = ModelProfile {
 
 /// Stock Ultralytics detect exports.
 ///
-/// yolov8, yolov9, yolo11 and yolov11 are all this one profile: every
+/// yolov8, yolov9, yolo11, yolov11 — and yolo26 in the only exportable form
+/// this stack runs (`end2end=False`; see the yolov10 doc) — are all this one
+/// profile: every
 /// generation's detect head exports the same `[1, 4 + nc, A]` channels-first
 /// tensor with no objectness, fed 0..1 RGB stretched to a square, and needs
 /// the same NMS afterwards. They differ in weights and backbone, which is not
@@ -67,7 +70,7 @@ pub const YOLOV10: ModelProfile = ModelProfile {
 /// rejected by `fit_output` rather than decoded wrong.
 pub const YOLOV8: ModelProfile = ModelProfile {
     name: "yolov8",
-    aliases: &["yolov9", "yolo11", "yolov11"],
+    aliases: &["yolov9", "yolo11", "yolov11", "yolo26"],
     input: InputSpec {
         size: InputSize::square(640),
         encoding: TensorEncoding::UnitRgb,

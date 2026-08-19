@@ -754,8 +754,8 @@ contract:
 |---|---|---|---|---|---|---|---|
 | **`yolox`** — nano, tiny, s | 416 | `0..255` **BGR** | **letterbox**, pad 114 | `[1, A, 5 + nc]` grid-objectness, strides 8/16/32 | `objectness × class` | IoU 0.45, top 300 | Apache-2.0 |
 | **`rfdetr`** (`rf-detr`) — nano … large | none — `--input-size` required | **ImageNet-normalized** RGB | stretch | `[1, Q, 4]` + `[1, Q, nc]` detr-queries (**two tensors**) | `sigmoid(class logit)` | none (set prediction) | Apache-2.0 |
-| **`yolov10`** (`yolo26`) | 640 | `0..1` **RGB** | stretch | `[1, N, 6]` end-to-end | class | none (the model did it) | AGPL-3.0 |
-| **`yolov8`** (`yolov9`, `yolo11`, `yolov11`) — what Frigate commonly ships | 640 | `0..1` **RGB** | stretch | `[1, 4 + nc, A]` raw-classes | class | IoU 0.45, top 300 | AGPL-3.0 (GPL-3.0 for YOLOv9) |
+| **`yolov10`** | 640 | `0..1` **RGB** | stretch | `[1, N, 6]` end-to-end | class | none (the model did it) | AGPL-3.0 |
+| **`yolov8`** (`yolov9`, `yolo11`, `yolov11`, `yolo26`) — what Frigate commonly ships | 640 | `0..1` **RGB** | stretch | `[1, 4 + nc, A]` raw-classes | class | IoU 0.45, top 300 | AGPL-3.0 (GPL-3.0 for YOLOv9) |
 
 An alias resolves to the profile's canonical identity, so `--model-profile
 yolo11` runs and reports `profile=yolov8`. Two of the aliases are worth
@@ -766,10 +766,12 @@ calling out:
     `[1, 4 + nc, A]` tensor as YOLOv8 and no AGPL/GPL weights are fetched by
     anything in this repo. An export that turns out not to match is rejected
     by the shape check rather than decoded wrong.
-  * **`yolo26` is UNVERIFIED.** YOLO26 is documented as end-to-end and NMS-free
-    like YOLOv10, so it is an alias of that profile, but no YOLO26 export has
-    ever been run against this decode. The same shape check applies: a
-    mismatch fails loudly instead of emitting plausible garbage.
+  * **`yolo26` is verified on-device** (yolo26m QDQ, QCS6490, 2026-08-19) —
+    under the *yolov8* profile, not yolov10: the only exports this stack can
+    run are `end2end=False` (the NMS-free tail segfaults quantized QNN; see
+    tools/qdq-export), and their raw head is the yolov8 tensor. The original
+    end-to-end guess placed it under yolov10, and the shape check rejected
+    that mis-fit exactly as promised.
 
 `yolox` and `rfdetr` are verified against real downloaded models —
 `yolox_nano.onnx` from the Megvii 0.1.1rc0 release and

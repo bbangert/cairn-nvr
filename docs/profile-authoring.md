@@ -223,7 +223,7 @@ Two consequences worth an operator's attention:
 | field | menu | where the menu lives |
 |---|---|---|
 | `backend` | `ort`, `rknn`, `qnn` | `BackendKind`, `plugins/cairn-detect/src/infer/backend.rs` — mirrored in `Cairn.Config.Profile`'s capability table |
-| `model_profile` | `yolox`, `yolov10` (or `yolo26`), `yolov8` (or `yolov9`, `yolo11`, `yolov11`), `rfdetr` (or `rf-detr`) | `PROFILES`, `plugins/cairn-detect/src/infer/catalog.rs` |
+| `model_profile` | `yolox`, `yolov10`, `yolov8` (or `yolov9`, `yolo11`, `yolov11`, `yolo26`), `rfdetr` (or `rf-detr`) | `PROFILES`, `plugins/cairn-detect/src/infer/catalog.rs` |
 | `decoder` | `auto`, `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` | `DecoderKind`, `plugins/cairn-detect/src/decode.rs` |
 | `tracking:` stage keys | `bbd`, `oru`, `ocr`, `twin_mint` | `Cairn.Tracker.Stage.Bbd` / `.Oru` / `.Ocr` / `.TwinMint` |
 
@@ -411,8 +411,8 @@ the running config kept. Message shapes as they are emitted:
 
 ```
 profile my-board: unknown backend "hailo" (ort, qnn or rknn)
-profile my-board: unknown model_profile "yolov12" (rfdetr (or rf-detr), yolov10
-  (or yolo26), yolov8 (or yolov9, yolo11, yolov11), yolox)
+profile my-board: unknown model_profile "yolov12" (rfdetr (or rf-detr),
+  yolov10, yolov8 (or yolov9, yolo11, yolov11, yolo26), yolox)
 profile my-board: unknown decoder "cuda" (auto, nvdec, qsv, sw, v4l2, vaapi or
   videotoolbox) — decoder: is the video decode path; the inference runtime is
   backend:

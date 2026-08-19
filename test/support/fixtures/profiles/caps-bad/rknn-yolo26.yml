@@ -1,0 +1,7 @@
+# The per-family override: yolo26 shares yolov8's contract row but not its
+# documented rknn conversion — and the refusal must name yolo26, not the
+# canonical, which the same table documents.
+backend: rknn
+model:
+  rknn: test/support/fixtures/models/stub.rknn
+model_profile: yolo26
