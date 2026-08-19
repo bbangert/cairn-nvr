@@ -69,6 +69,12 @@ if config_env() == :prod do
       # LAN deployment: bind all interfaces (dual-stack)
       ip: {0, 0, 0, 0, 0, 0, 0, 0}
     ],
+    # :conn, not a host list: the deployment is reached by whatever LAN
+    # address DHCP handed the board, so the only correct origin is "the same
+    # host this request came in on". The default (configured url host,
+    # "localhost") rejected every LiveView socket from the LAN — the page
+    # rendered and then retried its mount forever.
+    check_origin: :conn,
     secret_key_base: secret_key_base
 
   # ## SSL Support
