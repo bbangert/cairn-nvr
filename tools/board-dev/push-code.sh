@@ -56,7 +56,12 @@ for d in lib/*/; do
     cp -r "$d". "$target"/
     installed=1
   done
-  [ -n "$installed" ] || echo "push: no installed dir for $name (new dep needs a real image)" >&2
+  # Fatal, not a warning: the release boot script cannot load an app the
+  # image never shipped, so restarting would report success on a broken node.
+  if [ -z "$installed" ]; then
+    echo "push: no installed dir for $name — a new dep needs a real image" >&2
+    exit 1
+  fi
 done
 for r in releases/*/; do
   ver=$(basename "$r")
@@ -73,6 +78,15 @@ put $STAGE/install.sh /data/cairn-push-install.sh
 EOF
 
 echo "[push] installing into $CONTAINER"
-ssh "$BOARD" ":os.cmd(~c\"balena-engine cp /data/cairn-push.tgz $CONTAINER:/tmp/push.tgz && balena-engine cp /data/cairn-push-install.sh $CONTAINER:/tmp/install.sh && balena-engine exec $CONTAINER /bin/sh /tmp/install.sh && balena-engine restart $CONTAINER 2>&1\") |> List.to_string() |> String.slice(0, 400)" | head -4
-
-echo "[push] done — container restarted with the new code"
+# :os.cmd returns output with no exit status and nerves_ssh exits 0 either
+# way — the marker after the && chain is the success signal, checked here.
+result=$(ssh "$BOARD" ":os.cmd(~c\"balena-engine cp /data/cairn-push.tgz $CONTAINER:/tmp/push.tgz && balena-engine cp /data/cairn-push-install.sh $CONTAINER:/tmp/install.sh && balena-engine exec $CONTAINER /bin/sh /tmp/install.sh && balena-engine restart $CONTAINER && echo PUSH_OK 2>&1\") |> List.to_string()")
+echo "$result" | head -4
+case "$result" in
+*PUSH_OK*) echo "[push] done — container restarted with the new code" ;;
+*)
+  echo "[push] FAILED — the install chain did not complete:" >&2
+  echo "$result" | tail -8 >&2
+  exit 1
+  ;;
+esac

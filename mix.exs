@@ -104,8 +104,9 @@ defmodule Cairn.MixProject do
       # units with pts as messages; digest auth fleet-proven in spike 0.2.
       # Fork ref: 0.8.2 crash-loops on an h264 track without an fmtp line
       # (in-band SPS/PPS — the Reolink substream), and on a key frame seen
-      # before its in-band parameter sets. Upstream gBillal/rtsp#33; drop
-      # back to hex on the release that carries it.
+      # before its in-band parameter sets. An upstream PR is owed once the
+      # fix is reshaped (the first, gBillal/rtsp#33, was withdrawn for
+      # cleanup); drop back to hex on the release that carries it.
       {:rtsp,
        github: "bbangert/rtsp", ref: "0a3a4b69664925a7fd14127c4a5b3e81c58e1907", override: true},
       # Transitive via rtsp, but `Membrane.RTSPDualStream.Source` parses the
