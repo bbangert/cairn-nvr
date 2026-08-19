@@ -76,7 +76,7 @@ defmodule Cairn.Config.Profile do
   labels: models/coco.names   # shared by every rung, like decoder:
   model_ladder:               # ordered most accurate first — the AUTHOR's
     - model:                  # claim, unchecked; engine_budget is measured
-        qnn: packs/26m.onnx   # passes/s, strictly increasing down the list
+        qnn: packs/26m.onnx   # passes/s; ordering rule: reachability
       model_profile: yolo26   # a rung's own family; absent = the top-level one
       input_size: 640
       engine_budget: 17
@@ -781,9 +781,10 @@ defmodule Cairn.Config.Profile do
 
   # The ladder schema (D-L4, tier1-ladder plan). List order is the AUTHOR's
   # accuracy claim, most accurate first — nothing here can check mAP — so the
-  # one ordering validation is the budgets: strictly increasing down the
-  # list, because a later rung exists to buy more capacity and a rung that
-  # buys none is dead weight or a misordering.
+  # one ordering validation is budget reachability (`check_budget_order`): a
+  # rung no installation state can reach is dead weight or a misordering,
+  # while a rung shadowed only by pack rungs wins exactly when those packs
+  # are absent.
   defp check_model_ladder(acc, raw, name) do
     case Map.get(raw, "model_ladder") do
       nil ->
@@ -1028,14 +1029,15 @@ defmodule Cairn.Config.Profile do
   defp check_budget_order(acc, list, name) do
     rungs =
       Enum.map(list, fn rung ->
-        {is_map(rung) && Map.get(rung, "engine_budget"), is_map(rung) && Map.get(rung, "pack")}
+        {is_map(rung) && Map.get(rung, "engine_budget"), is_map(rung) && Map.get(rung, "pack"),
+         is_map(rung) && Map.get(rung, "model")}
       end)
 
-    if Enum.all?(rungs, fn {budget, _pack} -> is_number(budget) and budget > 0 end) do
+    if Enum.all?(rungs, fn {budget, _pack, _model} -> is_number(budget) and budget > 0 end) do
       rungs
       |> Enum.with_index(1)
-      |> Enum.reduce({acc, 0}, fn {{budget, pack}, index}, {acc, fixed_max} ->
-        check_rung_reachable(acc, budget, pack, index, fixed_max, name)
+      |> Enum.reduce({acc, 0, %{}}, fn {{budget, pack, model}, index}, {acc, fixed_max, shared} ->
+        check_rung_reachable(acc, budget, pack, model, index, fixed_max, shared, name)
       end)
       |> elem(0)
     else
@@ -1043,23 +1045,36 @@ defmodule Cairn.Config.Profile do
     end
   end
 
-  # The guard restates what `check_budget_order` proved collectively —
-  # inference cannot carry the Enum.all? into the reduce, and unguarded
-  # comparisons there read as possible struct comparison.
-  defp check_rung_reachable(acc, budget, pack, index, fixed_max, name)
+  # A rung's shadow is every earlier rung that can never be absent while this
+  # one is available: the always-present (non-pack) rungs, plus pack rungs
+  # naming this rung's exact model map — installation checks the artifact
+  # path, so same-artifact rungs are installed and absent together and "the
+  # pack is absent" can never free the later one. The guards restate what
+  # `check_budget_order` proved collectively — inference cannot carry the
+  # Enum.all? into the reduce, and unguarded comparisons there read as
+  # possible struct comparison.
+  defp check_rung_reachable(acc, budget, pack, model, index, fixed_max, shared, name)
        when is_number(budget) and is_number(fixed_max) do
+    shadow = bigger(fixed_max, Map.get(shared, model, 0))
+
     acc =
       Config.check(
         acc,
-        budget > fixed_max,
-        "profile #{name}: model_ladder rung #{index} budgets #{budget}, but an " <>
-          "always-present rung above it already budgets #{fixed_max} — order is " <>
-          "most accurate first and resolution takes the first fit, so no " <>
-          "installation state can ever reach this rung"
+        budget > shadow,
+        "profile #{name}: model_ladder rung #{index} budgets #{budget}, but a rung " <>
+          "above it that is never absent while this one is available already " <>
+          "budgets #{shadow} — order is most accurate first and resolution takes " <>
+          "the first fit, so no installation state can ever reach this rung"
       )
 
-    {acc, if(pack == nil and budget > fixed_max, do: budget, else: fixed_max)}
+    if pack == nil do
+      {acc, bigger(fixed_max, budget), shared}
+    else
+      {acc, fixed_max, Map.update(shared, model, budget, &bigger(&1, budget))}
+    end
   end
+
+  defp bigger(a, b) when is_number(a) and is_number(b), do: if(a >= b, do: a, else: b)
 
   # `supported_cameras:` is the ladder's support CLAIM — the camera count the
   # file stands behind — and resolution enforces it as a bound: a fleet past

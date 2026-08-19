@@ -2170,6 +2170,21 @@ defmodule Cairn.ConfigTest do
       """
     end
 
+    test "pack rungs sharing an artifact share availability — the shadow holds" do
+      # Same artifact path = installed and absent together, so "the pack is
+      # absent" can never free the second rung from the first: refused.
+      yaml =
+        String.replace(
+          shadowed_ladder_yaml(@absent_pack),
+          "engine_budget: 20\n",
+          "engine_budget: 20\n    pack: yolo26s-twin\n"
+        )
+        |> String.replace("onnx: #{@stub_onnx}", "onnx: #{@absent_pack}", global: false)
+
+      errors = ladder_errors(yaml)
+      assert Enum.any?(errors, &(&1 =~ "no installation state" and &1 =~ "rung 2 budgets 20"))
+    end
+
     test "a pack-shadowed rung is legal and wins exactly when the pack is absent" do
       # Pack absent: 10 cameras (demand 18.75) pass the pack skip and land
       # on the 20-budget rung — the accuracy the image itself carries.
