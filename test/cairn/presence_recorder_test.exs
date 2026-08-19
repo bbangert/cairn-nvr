@@ -66,18 +66,27 @@ defmodule Cairn.PresenceRecorderTest do
 
   # Stands in for `Cairn.EventExtractor`: stays alive and hands every cast it
   # is sent to the test, which is how the `{:track_boxes, _}` stream is
-  # observed. Unlinked, so a test that kills it does not take itself down.
+  # observed. Unlinked, so a test that kills it does not take itself down —
+  # a monitor on the test process is what reaps it instead.
   defp relay(test_pid) do
-    spawn(fn -> relay_loop(test_pid) end)
+    spawn(fn ->
+      Process.monitor(test_pid)
+      relay_loop(test_pid)
+    end)
   end
 
   defp relay_loop(test_pid) do
     receive do
-      {:"$gen_cast", message} -> send(test_pid, {:extractor_cast, message})
-      _other -> :ok
-    end
+      {:"$gen_cast", message} ->
+        send(test_pid, {:extractor_cast, message})
+        relay_loop(test_pid)
 
-    relay_loop(test_pid)
+      {:DOWN, _ref, :process, ^test_pid, _reason} ->
+        :ok
+
+      _other ->
+        relay_loop(test_pid)
+    end
   end
 
   defp started(ctx, label \\ "person", score \\ 0.9) do
