@@ -216,7 +216,7 @@ defmodule Cairn.Config.Profile do
       nms: :host_side,
       rknn_conversion: :documented
     },
-    "rfdetr" => %{families: ["rf-detr"], nms: :none, rknn_conversion: :undocumented}
+    "rfdetr" => %{families: [], nms: :none, rknn_conversion: :undocumented}
   }
 
   # `decoder:`'s menu, mirroring `DecoderKind` in
@@ -335,7 +335,10 @@ defmodule Cairn.Config.Profile do
 
   @spec family(term()) :: {String.t(), family()} | nil
   def family(name) when is_binary(name) do
-    wanted = name |> String.trim() |> String.downcase()
+    # Hyphens are spelling, not identity (rf-detr == rfdetr) — normalized
+    # here, mirroring the Rust parser, so `families` holds only genuinely
+    # different families sharing a contract.
+    wanted = name |> String.trim() |> String.downcase() |> String.replace("-", "")
 
     case Enum.find(@model_families, fn {canonical, row} ->
            wanted == canonical or wanted in row.families

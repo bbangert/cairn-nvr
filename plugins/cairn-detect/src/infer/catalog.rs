@@ -95,7 +95,7 @@ pub const YOLOV8: ModelProfile = ModelProfile {
 /// `--input-size`.
 pub const RFDETR: ModelProfile = ModelProfile {
     name: "rfdetr",
-    families: &["rf-detr"],
+    families: &[],
     input: InputSpec {
         size: InputSize::square(384),
         encoding: TensorEncoding::ImageNetRgb,
@@ -119,8 +119,12 @@ pub const PROFILES: &[ModelProfile] = &[YOLOX, YOLOV10, YOLOV8, RFDETR];
 
 impl ModelProfile {
     /// `--model-profile` value parser, so a typo's error names the real set.
+    ///
+    /// Hyphens are spelling, not identity — `rf-detr` is the same family as
+    /// `rfdetr`, so normalization handles it rather than a `families` entry,
+    /// which is reserved for genuinely different families sharing a contract.
     pub fn parse(name: &str) -> Result<Self> {
-        let wanted = name.trim().to_ascii_lowercase();
+        let wanted = name.trim().to_ascii_lowercase().replace('-', "");
         PROFILES
             .iter()
             .find(|profile| profile.name == wanted || profile.families.contains(&wanted.as_str()))

@@ -911,6 +911,7 @@ mod tests {
         // yolo26 sat under yolov10 until a real export disproved it: the
         // only runnable YOLO26 exports are raw-head (see the catalog doc).
         assert_ne!(ModelProfile::parse("yolo26").unwrap(), YOLOV10);
+        // hyphens are spelling, not identity — normalized at parse
         assert_eq!(ModelProfile::parse("rf-detr").unwrap(), RFDETR);
         // a family resolves to the contract's canonical identity, so the
         // startup line and every error say `yolov8`, not the family name
@@ -2201,7 +2202,7 @@ mod tests {
             "model m.onnx leaves its output shape dynamic, so there is nothing to sniff a profile \
              from — and the encoding and resize policy have to be settled before the first frame \
              is converted. Pass --model-profile <yolox, yolov10, yolov8 (or yolov9, yolo11, yolov11, \
-             yolo26), rfdetr (or rf-detr)>."
+             yolo26), rfdetr>."
         );
     }
 
