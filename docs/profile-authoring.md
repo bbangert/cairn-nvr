@@ -180,9 +180,12 @@ The rules, each refused or warned at load:
   for any camera count is refused at parse.
 * **Ordering is reachability, not blanket monotonicity.** The list is the
   author's accuracy claim, most accurate first, and resolution takes the
-  first installed rung that fits — so a rung is refused only when an
-  ALWAYS-PRESENT rung above it budgets at least as much: no installation
-  state could ever reach it. A rung sitting under a bigger-budget `pack:`
+  first installed rung that fits — so a rung is refused exactly when a
+  rung above it that can never be absent while this one is available
+  budgets at least as much: no installation state could ever reach it.
+  That shadow is every non-`pack:` rung (always present) plus any `pack:`
+  rung naming the same active-backend artifact path (same path = installed
+  and absent together). A rung under a bigger-budget *independent* `pack:`
   rung is legitimate by design — it wins exactly when that pack is absent,
   which is how one ladder serves both installation states (the shipped
   file's yolox_m under yolo26s: dominated when the pack is installed,

@@ -795,7 +795,7 @@ defmodule Cairn.Config.Profile do
         |> check_ladder_exclusions(raw, name)
         |> check_ladder_tier(raw, name)
         |> check_rungs(list, raw, name)
-        |> check_budget_order(list, name)
+        |> check_budget_order(list, raw, name)
 
       other ->
         Config.add_error(
@@ -1026,18 +1026,20 @@ defmodule Cairn.Config.Profile do
   # dominating pack is absent is the design (one ladder for both worlds —
   # yolox_m under yolo26s in qcs6490-tier1). Between two pack rungs the same
   # logic applies: each install state is legitimate.
-  defp check_budget_order(acc, list, name) do
+  defp check_budget_order(acc, list, raw, name) do
+    backend = Map.get(raw, "backend", "ort")
+
     rungs =
       Enum.map(list, fn rung ->
         {is_map(rung) && Map.get(rung, "engine_budget"), is_map(rung) && Map.get(rung, "pack"),
-         is_map(rung) && Map.get(rung, "model")}
+         rung_availability_key(rung, backend)}
       end)
 
-    if Enum.all?(rungs, fn {budget, _pack, _model} -> is_number(budget) and budget > 0 end) do
+    if Enum.all?(rungs, fn {budget, _pack, _key} -> is_number(budget) and budget > 0 end) do
       rungs
       |> Enum.with_index(1)
-      |> Enum.reduce({acc, 0, %{}}, fn {{budget, pack, model}, index}, {acc, fixed_max, shared} ->
-        check_rung_reachable(acc, budget, pack, model, index, fixed_max, shared, name)
+      |> Enum.reduce({acc, 0, %{}}, fn {{budget, pack, key}, index}, {acc, fixed_max, shared} ->
+        check_rung_reachable(acc, budget, pack, key, index, fixed_max, shared, name)
       end)
       |> elem(0)
     else
@@ -1045,17 +1047,29 @@ defmodule Cairn.Config.Profile do
     end
   end
 
+  # What installation actually checks (`Cairn.Config.resolve_ladder/3` stats
+  # the ACTIVE backend's artifact), so two rungs naming the same path there
+  # share availability even when their model maps differ in entries nothing
+  # reads. Outside the backend menu there is no artifact key — the whole
+  # model map stands in, and `check_backend/3` already errored.
+  defp rung_availability_key(rung, backend) when backend in @backends do
+    is_map(rung) &&
+      rung |> Map.get("model", %{}) |> then(&(is_map(&1) && Map.get(&1, artifact_key(backend))))
+  end
+
+  defp rung_availability_key(rung, _backend), do: is_map(rung) && Map.get(rung, "model")
+
   # A rung's shadow is every earlier rung that can never be absent while this
   # one is available: the always-present (non-pack) rungs, plus pack rungs
-  # naming this rung's exact model map — installation checks the artifact
-  # path, so same-artifact rungs are installed and absent together and "the
+  # sharing its availability key (the active backend's artifact path) —
+  # same-artifact rungs are installed and absent together and "the
   # pack is absent" can never free the later one. The guards restate what
   # `check_budget_order` proved collectively — inference cannot carry the
   # Enum.all? into the reduce, and unguarded comparisons there read as
   # possible struct comparison.
-  defp check_rung_reachable(acc, budget, pack, model, index, fixed_max, shared, name)
+  defp check_rung_reachable(acc, budget, pack, key, index, fixed_max, shared, name)
        when is_number(budget) and is_number(fixed_max) do
-    shadow = bigger(fixed_max, Map.get(shared, model, 0))
+    shadow = bigger(fixed_max, Map.get(shared, key, 0))
 
     acc =
       Config.check(
@@ -1070,7 +1084,7 @@ defmodule Cairn.Config.Profile do
     if pack == nil do
       {acc, bigger(fixed_max, budget), shared}
     else
-      {acc, fixed_max, Map.update(shared, model, budget, &bigger(&1, budget))}
+      {acc, fixed_max, Map.update(shared, key, budget, &bigger(&1, budget))}
     end
   end
 

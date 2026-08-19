@@ -2171,15 +2171,21 @@ defmodule Cairn.ConfigTest do
     end
 
     test "pack rungs sharing an artifact share availability — the shadow holds" do
-      # Same artifact path = installed and absent together, so "the pack is
-      # absent" can never free the second rung from the first: refused.
+      # Same active-backend artifact path = installed and absent together, so
+      # "the pack is absent" can never free the second rung from the first:
+      # refused. The extra rknn entry on rung 2 must not fool the check —
+      # availability is the ACTIVE backend's path, not the whole model map.
       yaml =
         String.replace(
           shadowed_ladder_yaml(@absent_pack),
           "engine_budget: 20\n",
           "engine_budget: 20\n    pack: yolo26s-twin\n"
         )
-        |> String.replace("onnx: #{@stub_onnx}", "onnx: #{@absent_pack}", global: false)
+        |> String.replace(
+          "onnx: #{@stub_onnx}",
+          "onnx: #{@absent_pack}\n      rknn: #{@stub_onnx}",
+          global: false
+        )
 
       errors = ladder_errors(yaml)
       assert Enum.any?(errors, &(&1 =~ "no installation state" and &1 =~ "rung 2 budgets 20"))
