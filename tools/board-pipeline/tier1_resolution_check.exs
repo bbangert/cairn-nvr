@@ -19,7 +19,8 @@
 tmp = Path.join(System.tmp_dir!(), "tier1-resolution-check-#{System.unique_integer([:positive])}")
 File.mkdir_p!(Path.join(tmp, "models"))
 
-for stub <- ~w(models/yolox_tiny_qdq.onnx models/yolox_nano_qdq.onnx models/coco.names) do
+for stub <-
+      ~w(models/yolox_m_qdq.onnx models/yolox_tiny_qdq.onnx models/yolox_nano_qdq.onnx models/coco.names) do
   File.write!(Path.join(tmp, stub), "stub")
 end
 
@@ -51,7 +52,7 @@ end
 IO.puts("n,resolved_artifact,derived_sample_fps")
 
 table =
-  for n <- [26, 28, 30, 36, 38, 40, 41], into: %{} do
+  for n <- [2, 10, 11, 26, 28, 30, 36, 38, 40, 41], into: %{} do
     result = resolve.(n)
 
     case result do
@@ -66,6 +67,16 @@ table =
 # teardown running relative-path operations in a vanished directory.
 File.cd!(original_cwd)
 File.rm_rf!(tmp)
+
+# The yolox_m head of the ladder (packs absent, as deploys today): its
+# PROVISIONAL 20 budget carries fleets through 10 and hands 11 to tiny —
+# arithmetic pinned so the file cannot drift silently, not a measured
+# boundary (its ladder run is owed, D-L6; the file says DRAFT). The
+# derived rate rises with headroom (D-L4): 2 cameras split the 20 budget
+# at 10 fps each, 10 cameras ride the floor.
+{"yolox_m_qdq.onnx", 10} = table[2]
+{"yolox_m_qdq.onnx", 2} = table[10]
+{"yolox_tiny_qdq.onnx", 7} = table[11]
 
 # Asserted against the MEASURED boundaries (tier1-boundary-20260815): the
 # tiny rung's 67.5 budget puts the tiny→nano crossover at exactly 36
@@ -83,4 +94,7 @@ File.rm_rf!(tmp)
 {:refused, errors_41} = table[41]
 true = Enum.any?(errors_41, &(&1 =~ "exceed supported_cameras 40"))
 
-IO.puts("resolution check: PASS — tiny through 36, nano 37–40, 41 refused by the claim")
+IO.puts(
+  "resolution check: PASS — yolox_m through 10 (provisional), tiny 11–36, nano 37–40, " <>
+    "41 refused by the claim"
+)

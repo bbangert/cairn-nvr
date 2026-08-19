@@ -2134,14 +2134,56 @@ defmodule Cairn.ConfigTest do
       assert Enum.any?(errors, &(&1 =~ "model_ladder is not available at tier 2"))
     end
 
-    test "budgets that fail to increase are refused naming both rungs" do
+    test "a rung an always-present rung shadows is refused naming both budgets" do
       errors =
         ladder_errors(String.replace(ladder_yaml(), "engine_budget: 26", "engine_budget: 17"))
 
       assert Enum.any?(
                errors,
-               &(&1 =~ "strictly increasing" and &1 =~ "rung 2 budgets 17 after 17")
+               &(&1 =~ "no installation state" and &1 =~ "rung 2 budgets 17" and &1 =~ "17")
              )
+    end
+
+    # The yolox_m shape (qcs6490-tier1): a non-pack rung whose budget sits
+    # below an earlier PACK rung's is reachable — it wins exactly when that
+    # pack is absent — so one ladder serves both installation states.
+    defp shadowed_ladder_yaml(pack_model) do
+      """
+      tier: 1
+      model_profile: yolox
+      labels: #{@stub_names}
+      model_ladder:
+        - model:
+            onnx: #{pack_model}
+          input_size: 640
+          engine_budget: 26
+          pack: yolo26s
+        - model:
+            onnx: #{@stub_onnx}
+          input_size: 640
+          engine_budget: 20
+        - model:
+            onnx: #{@stub_onnx}
+          input_size: 416
+          engine_budget: 75
+      supported_cameras: 40
+      """
+    end
+
+    test "a pack-shadowed rung is legal and wins exactly when the pack is absent" do
+      # Pack absent: 10 cameras (demand 18.75) pass the pack skip and land
+      # on the 20-budget rung — the accuracy the image itself carries.
+      dir = tmp_profile_dir("ladder", shadowed_ladder_yaml(@absent_pack))
+      assert {:ok, config, _warnings} = Config.from_map(ladder_map(10, dir))
+      [%{profile: profile}] = config.plugin_groups
+      assert profile.resolved_rung.engine_budget == 20
+
+      # Pack installed: the 26-budget pack rung dominates and the shadowed
+      # rung is never reached.
+      dir = tmp_profile_dir("ladder", shadowed_ladder_yaml(@installed_pack))
+      assert {:ok, config, _warnings} = Config.from_map(ladder_map(10, dir))
+      [%{profile: profile}] = config.plugin_groups
+      assert profile.resolved_rung.engine_budget == 26
     end
 
     test "a rung without this backend's artifact key is refused" do
@@ -2565,7 +2607,7 @@ defmodule Cairn.ConfigTest do
       end
     end
 
-    test "qcs6490-tier1 is the shipped ladder: tier 1, Apache-complete, claim 40" do
+    test "qcs6490-tier1 is the shipped ladder: one list for every installation state" do
       assert {:ok, config, []} = Config.from_map(base_map())
       profile = config.profiles["qcs6490-tier1"]
 
@@ -2577,25 +2619,30 @@ defmodule Cairn.ConfigTest do
       # the absent-block half of the presence rule.
       assert profile.stages == nil
 
-      # Three pack rungs (yolo26 family), two Apache rungs (yolox) — the
-      # Apache tail carries the claim alone, and the parse-time invariant
-      # already refused any file where it could not. Budgets strictly
-      # increase; both Apache budgets are boundary-measured (nano 75,
-      # tiny 67.5 — tier1-boundary-20260815), the pack budgets stay
-      # provisional until their packs ship.
-      assert [m, s, n416, tiny, nano] = profile.model_ladder
-      assert Enum.map([m, s, n416], & &1.pack) == ["yolo26m", "yolo26s", "yolo26n-416"]
-      assert tiny.pack == nil and nano.pack == nil
-      # The two measured Apache budgets, pinned so they cannot drift under
-      # green gates (the boundary evidence is tier1-boundary-20260815);
-      # ordering follows from the exact list.
-      assert Enum.map(profile.model_ladder, & &1.engine_budget) == [16.8, 25.8, 52.6, 67.5, 75]
+      # Three yolo26 pack rungs interleaved with three baked Apache rungs:
+      # yolox_m sits under yolo26s with a LOWER budget on purpose — the
+      # pack dominates it when installed, and it carries small fleets at
+      # 46.9 mAP when only the image's own models exist (the reachability
+      # rule; see check_budget_order). tiny and nano budgets are
+      # boundary-measured (tier1-boundary-20260815), the rest provisional
+      # until their ladder runs (D-L6).
+      assert [_m26, _s26, xm, _n416, tiny, nano] = profile.model_ladder
 
-      # The measured tiny→nano crossover, held with the same arithmetic
-      # resolution uses: 36 × 1.875 = 67.5 fits tiny exactly, 37 spills to
-      # nano. Selection logic itself is exercised by the ladder describe;
-      # this pins the shipped numbers to the boundary they were measured at.
+      assert Enum.map(profile.model_ladder, & &1.pack) ==
+               ["yolo26m", "yolo26s", nil, "yolo26n-416", nil, nil]
+
+      assert xm.model == %{"qnn" => "models/yolox_m_qdq.onnx"}
+
+      assert Enum.map(profile.model_ladder, & &1.engine_budget) ==
+               [16.8, 25.8, 20, 52.6, 67.5, 75]
+
+      # The crossovers, held with the same arithmetic resolution uses:
+      # yolox_m's provisional 20 carries fleets through 10 when the packs
+      # are absent; 36 × 1.875 = 67.5 fits tiny exactly, 37 spills to
+      # nano. This pins the shipped numbers to the record they came from.
       floor_rate = Cairn.Config.Profile.effective_rate(2)
+      assert 10 * floor_rate < xm.engine_budget
+      assert 11 * floor_rate > xm.engine_budget
       assert 36 * floor_rate == tiny.engine_budget
       assert 37 * floor_rate > tiny.engine_budget
       assert 40 * floor_rate <= nano.engine_budget

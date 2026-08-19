@@ -1016,25 +1016,49 @@ defmodule Cairn.Config.Profile do
   # Only over budgets that individually parsed — with any rung already
   # errored, an ordering verdict would be noise about a list the author is
   # about to rewrite.
+  #
+  # The reachability rule, not blanket monotonicity: order is most accurate
+  # first, and resolution takes the first rung that fits, so a rung is dead
+  # weight only if some ALWAYS-PRESENT earlier rung has at least its budget —
+  # then no installation state can ever reach it. A pack rung above it does
+  # not condemn it: packs come and go, and a rung that wins exactly when the
+  # dominating pack is absent is the design (one ladder for both worlds —
+  # yolox_m under yolo26s in qcs6490-tier1). Between two pack rungs the same
+  # logic applies: each install state is legitimate.
   defp check_budget_order(acc, list, name) do
-    budgets = Enum.map(list, &(is_map(&1) && Map.get(&1, "engine_budget")))
-
-    if Enum.all?(budgets, &(is_number(&1) and &1 > 0)) do
-      budgets
-      |> Enum.with_index(1)
-      |> Enum.chunk_every(2, 1, :discard)
-      |> Enum.reduce(acc, fn [{prev, _i}, {budget, index}], acc ->
-        Config.check(
-          acc,
-          budget > prev,
-          "profile #{name}: model_ladder budgets must be strictly increasing down the " <>
-            "list (rung #{index} budgets #{budget} after #{prev}) — order is most " <>
-            "accurate first, and a later rung exists to buy more capacity"
-        )
+    rungs =
+      Enum.map(list, fn rung ->
+        {is_map(rung) && Map.get(rung, "engine_budget"), is_map(rung) && Map.get(rung, "pack")}
       end)
+
+    if Enum.all?(rungs, fn {budget, _pack} -> is_number(budget) and budget > 0 end) do
+      rungs
+      |> Enum.with_index(1)
+      |> Enum.reduce({acc, 0}, fn {{budget, pack}, index}, {acc, fixed_max} ->
+        check_rung_reachable(acc, budget, pack, index, fixed_max, name)
+      end)
+      |> elem(0)
     else
       acc
     end
+  end
+
+  # The guard restates what `check_budget_order` proved collectively —
+  # inference cannot carry the Enum.all? into the reduce, and unguarded
+  # comparisons there read as possible struct comparison.
+  defp check_rung_reachable(acc, budget, pack, index, fixed_max, name)
+       when is_number(budget) and is_number(fixed_max) do
+    acc =
+      Config.check(
+        acc,
+        budget > fixed_max,
+        "profile #{name}: model_ladder rung #{index} budgets #{budget}, but an " <>
+          "always-present rung above it already budgets #{fixed_max} — order is " <>
+          "most accurate first and resolution takes the first fit, so no " <>
+          "installation state can ever reach this rung"
+      )
+
+    {acc, if(pack == nil and budget > fixed_max, do: budget, else: fixed_max)}
   end
 
   # `supported_cameras:` is the ladder's support CLAIM — the camera count the
