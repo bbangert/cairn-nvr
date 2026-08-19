@@ -62,6 +62,9 @@ defmodule Cairn.Application do
       # Maps engine health onto the per-camera status surface. Its own
       # process for Health's reason: it reads the host under a deadline.
       {Cairn.Native.Status, []},
+      # Observation-only evidence trail for the steady-state soak; off in test
+      # (boot writes escape the sandbox), harmless and bounded elsewhere.
+      {Cairn.SoakMonitor, []},
       {Cairn.CameraSupervisor, []},
       {Cairn.Retention, []},
       {CairnWeb.WebRTC.Supervisor, []},

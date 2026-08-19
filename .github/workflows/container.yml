@@ -1,0 +1,95 @@
+name: Container
+
+# The add-on image (tier1-container plan). Two jobs:
+#  - smoke: the amd64 build + boot assertions (tools/container/smoke-x86.sh)
+#    on every PR touching anything the image ships — the devcontainer has no
+#    docker, so CI is where the x86 smoke actually runs.
+#  - publish: the linux/arm64 image to ghcr on a version tag or manual
+#    dispatch. VAGUS-2 pulls anonymously, so the ghcr package must be
+#    flipped to PUBLIC once after the first push (repo settings → packages).
+#
+# Actions are pinned to commit SHAs: the publish job holds the registry
+# token, and a mutable tag there would be the one unpinned link in an
+# otherwise sha256-pinned supply chain (Dockerfile artifacts, fastrpc
+# commit).
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - plugins/**
+      - tools/container/**
+      - models/**
+      - lib/**
+      - config/**
+      - priv/**
+      - assets/**
+      - mix.exs
+      - mix.lock
+      - .github/workflows/container.yml
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Baseline for every job; publish alone raises itself to packages: write —
+# the smoke job builds and runs PR-authored code and must not hold a token
+# that can push the image vagus pulls anonymously.
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - run: tools/container/smoke-x86.sh
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: smoke-log
+          path: tools/container/smoke-x86.log
+
+  publish:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # qemu for the arm64 BEAM release stage; the Rust stages cross-compile
+      # natively (D-C3) and never emulate.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # vagus pulls the tag named by config.yaml's `version:`, so a git tag
+      # that disagrees with it would publish an image nothing ever pulls —
+      # refused here rather than deployed stale.
+      - id: version
+        run: |
+          config_version=$(sed -n 's/^version: "\(.*\)"/\1/p' deploy/vagus-addon/cairn/config.yaml)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            v="$config_version"
+          else
+            v="${GITHUB_REF_NAME#v}"
+            if [ "$v" != "$config_version" ]; then
+              echo "tag $GITHUB_REF_NAME != config.yaml version $config_version" >&2
+              exit 1
+            fi
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/cairn-nvr-aarch64:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/cairn-nvr-aarch64:latest

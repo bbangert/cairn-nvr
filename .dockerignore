@@ -1,0 +1,27 @@
+# Keep the build context to what the Dockerfile stages actually COPY:
+# mix.exs/mix.lock, config/, lib/, priv/, assets/, models/, plugins/ (sources
+# only), tools/container/. Everything heavy or host-specific stays out.
+_build/
+deps/
+.git/
+.elixir_ls/
+.claude/
+data/
+doc/
+docs/
+test/
+verify/
+tools/board-bench/
+tools/board-pipeline/
+tools/board-soak/
+tools/mot-bench/
+tools/qdq-export/
+tools/qnn-spike/
+plugins/*/target/
+plugins/cairn-detect/*.onnx
+plugins/cairn-detect/model/
+priv/plts/
+# Dev-built host-arch NIFs; the image gets its own from the native-build stage.
+priv/native/
+*.jsonl
+*.pdf

@@ -32,6 +32,10 @@ config :cairn, CairnWeb.Endpoint,
 # Print only warnings and errors during test
 config :logger, level: :warning
 
+# The soak monitor writes under the configured data dir on a timer — test
+# runs get no background writer (see boot-writes-escape-ecto-sandbox).
+config :cairn, Cairn.SoakMonitor, enabled: false
+
 # Initialize plugs at runtime for faster test compilation
 config :phoenix, :plug_init_mode, :runtime
 

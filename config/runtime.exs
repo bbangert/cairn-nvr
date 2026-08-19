@@ -22,6 +22,15 @@ end
 
 config :cairn, CairnWeb.Endpoint, http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
+# Node-level QNN facts (`Cairn.Native.Config`'s node_qnn/0): where this
+# node's EP plugin library sits and what SoC it is. The container image sets
+# these; a profile never can, because a profile is a model claim portable
+# across hosts. Only keys that are actually set reach the merge, so a bare
+# environment changes nothing; a malformed value fails boot naming the
+# variable.
+qnn_node = Cairn.Native.Config.node_qnn_from_env(System.get_env())
+if qnn_node != [], do: config(:cairn, :qnn, qnn_node)
+
 if config_env() == :dev do
   # Reload browser tabs when matching files change.
   config :cairn, CairnWeb.Endpoint,

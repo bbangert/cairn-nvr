@@ -1,0 +1,29 @@
+# Cairn NVR as a vagus add-on (tier1-container plan, phase 2).
+name: Cairn NVR
+version: "0.1.0"
+slug: cairn
+description: >-
+  Presence-detection NVR with in-VM inference on the Hexagon HTP.
+# aarch64 only: the shipped NIFs, canary and QNN stack are arm64, and the
+# tier-1 claim is measured on QCS6490. Pulls are platform-pinned by vagus.
+arch:
+  - aarch64
+image: ghcr.io/bbangert/cairn-nvr-{arch}
+startup: application
+boot: auto
+# host_network per D-C5: NAT-free LAN realism for RTSP cameras, WebRTC and
+# mDNS, and the UI directly on host:4000 (host_network add-ons get no port
+# mapping). Decision defaulted at planning; verify on-board before the
+# public repo goes live, and flip to bridge + ports: if it disappoints.
+host_network: true
+# dsp: true is the whole DSP story (vagus 0.7.x): fastrpc-cdsp/-secure +
+# dma_heap cgroup rules (fail-closed), /usr/lib/dsp (shells) and the
+# operator-uploaded skel store bound read-only. The image carries the QNN
+# host libs; the skel is uploaded once via the admin panel — see README.
+dsp: true
+map:
+  # /config read-only: cairn reads CAIRN_CONFIG=/config/config.yml and never
+  # writes it; the operator edits it host-side. /data is always mounted rw by
+  # vagus — no map entry needed.
+  - addon_config
+webui: http://[HOST]:[PORT:4000]
