@@ -537,8 +537,17 @@ defmodule Cairn.PresenceRecorder do
   #
   # The state a refusal leaves is a consistent one — labels present, no event —
   # and the next qualifying transition opens from it.
+  # Normalized to two shapes because the seam's default is
+  # `DynamicSupervisor.start_child/2`, whose contract also allows
+  # `{:ok, pid, info}` and `:ignore` — either would otherwise crash the one
+  # caller's case, inside `init/1` on the adoption path.
   defp launch_extractor(state, event) do
-    state.start_extractor.(state.camera, event)
+    case state.start_extractor.(state.camera, event) do
+      {:ok, pid} -> {:ok, pid}
+      {:ok, pid, _info} -> {:ok, pid}
+      :ignore -> {:error, :ignore}
+      {:error, reason} -> {:error, reason}
+    end
   catch
     :exit, reason -> {:error, {:exit, reason}}
   end
