@@ -26,6 +26,10 @@ import {decode as decodeMsgpack} from "../vendor_msgpack.js"
 // doesn't fight the scrubber. A heuristic, not a measurement: there is no API
 // for the controls' geometry, and it differs per browser.
 const CONTROLS_HEIGHT = 44
+// See sampleAt. A second of absent detection is a real gap, not a sample
+// period, at every tier-1 rate (periods run ~130-530ms).
+const MAX_LERP_GAP_MS = 1000
+const BOX_HOLD_MS = 300
 
 const BOX_RADIUS = 3
 const HALO = "rgba(4, 8, 12, 0.55)"
@@ -270,6 +274,16 @@ const TrackOverlay = {
   // The sample at `tMs`, interpolated between the two keyframes around it, or
   // null outside the path. A monotonic cursor makes playback O(1) per frame;
   // a seek backwards falls back to a binary search, once.
+  //
+  // Interpolation stops at MAX_LERP_GAP_MS: consecutive samples sit a sample
+  // period apart (~130-530ms across the tier-1 rate range), so a wider gap is
+  // detection genuinely absent — the model lost the object, or on a
+  // label-keyed sidecar the one path per label teleported between bodies —
+  // and lerping across it invents a box floating through space nothing was
+  // detected in (Ben's clip b516cd29, 2026-08-20; limit his call at ~1s).
+  // The endpoint sample still shows for BOX_HOLD_MS: a detection that
+  // precedes a gap is a real detection, and without the hold it would render
+  // for a single frame.
   sampleAt(track, tMs) {
     const times = track.times
     const n = times.length
@@ -292,6 +306,12 @@ const TrackOverlay = {
     const i = track.cursor
     const t0 = times[i]
     const t1 = times[i + 1]
+    if (t1 - t0 > MAX_LERP_GAP_MS) {
+      if (tMs - t0 <= BOX_HOLD_MS) return [track.x[i], track.y[i], track.w[i], track.h[i]]
+      if (t1 - tMs <= BOX_HOLD_MS)
+        return [track.x[i + 1], track.y[i + 1], track.w[i + 1], track.h[i + 1]]
+      return null
+    }
     const f = t1 > t0 ? Math.min(Math.max((tMs - t0) / (t1 - t0), 0), 1) : 0
     return [
       track.x[i] + (track.x[i + 1] - track.x[i]) * f,
