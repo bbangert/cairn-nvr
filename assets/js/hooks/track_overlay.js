@@ -53,6 +53,15 @@ function dequantize(column) {
   return out
 }
 
+function parseJson(raw, fallback) {
+  try {
+    const value = JSON.parse(raw)
+    return value === null ? fallback : value
+  } catch (_e) {
+    return fallback
+  }
+}
+
 function roundedRect(ctx, x, y, w, h, r) {
   const rr = Math.min(r, w / 2, h / 2)
   ctx.beginPath()
@@ -112,14 +121,13 @@ const TrackOverlay = {
     this.video.removeEventListener("loadedmetadata", this.onLoaded)
   },
 
+  // Both attributes are JSON. The selection is a list of whatever the sidecar
+  // keys its tracks by — ULIDs on the tracked lane, labels on the presence one —
+  // and a label is model-supplied text that may contain a comma, so it cannot be
+  // a delimited string. CairnWeb.EventLive writes both.
   readSelection() {
-    const raw = this.el.dataset.selected || ""
-    this.selected = new Set(raw.split(",").filter(id => id !== ""))
-    try {
-      this.objects = JSON.parse(this.el.dataset.objects || "{}")
-    } catch (_e) {
-      this.objects = {}
-    }
+    this.selected = new Set(parseJson(this.el.dataset.selected, []))
+    this.objects = parseJson(this.el.dataset.objects, {})
   },
 
   load() {

@@ -91,11 +91,11 @@ defmodule CairnWeb.EventsLive do
   end
 
   def handle_info({:event_updated, %Event{} = ev}, socket) do
-    {:noreply, live_update(socket, ev)}
+    {:noreply, live_upsert(socket, ev)}
   end
 
   def handle_info({:event_ended, %Event{} = ev}, socket) do
-    socket = live_update(socket, ev)
+    socket = live_upsert(socket, ev)
     # the snapshot is written async just after finalize with no broadcast of
     # its own; pull the row once more shortly so the thumbnail fills in
     if ev.id in socket.assigns.visible do
@@ -135,7 +135,23 @@ defmodule CairnWeb.EventsLive do
     end
   end
 
+  # A later broadcast is also the page's second chance at the insert. Both lanes
+  # broadcast `:event_started` from the process that started the extractor, while
+  # the row itself is written by the extractor's own `Events.create_active` —
+  # so `live_insert/2` routinely looks the id up before it exists and finds
+  # nothing. Left at that, the event would stay off the page until a reload,
+  # because every later broadcast is gated on `visible`, which the missed insert
+  # never added it to.
+  defp live_upsert(socket, ev) do
+    if ev.id in socket.assigns.visible,
+      do: live_update(socket, ev),
+      else: live_insert(socket, ev)
+  end
+
   # Status/snapshot change on an already-visible row: update in place by dom id.
+  # `{:refresh_row, _}` stays on this path deliberately — its synthetic struct
+  # carries no camera or labels to match filters against, and a row the cap has
+  # since evicted must not come back at the top of the list.
   defp live_update(socket, ev) do
     if ev.id in socket.assigns.visible do
       case Events.get(ev.id) do

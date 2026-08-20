@@ -106,8 +106,12 @@ picks which one becomes `--model`.
   tracker at all, which is why a tier-1 profile with a `tracking:` block is
   a config error — the block describes machinery the tier turns off.
   `record:` keeps its meaning here — its labels gate which presence
-  detections earn a recording. `track:` has nothing to gate without a
-  tracker; config warns per camera when it is set on a tier-1 profile.
+  detections earn a recording, and a recording is an ordinary event: a row,
+  a clip, a snapshot with the trigger box drawn on it. `max_event_seconds`
+  segments such a recording rather than ending it, so a presence that
+  outlives the cap yields consecutive clips for as long as it lasts.
+  `track:` has nothing to gate without a tracker; config warns per camera
+  when it is set on a tier-1 profile.
 * **2 — accurate MOT.** Tracked objects with identity and persistence.
   The measured accuracy bar and per-board capacity will live in each
   board's tier file when those ship.
