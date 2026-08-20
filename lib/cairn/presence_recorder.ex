@@ -649,7 +649,7 @@ defmodule Cairn.PresenceRecorder do
   # -- policy -----------------------------------------------------------------
 
   defp qualifies?(state, %PresenceEvent{label: label, score: score}) when is_number(score),
-    do: Config.earns_video?(record_tier(state), label, score, floors(state))
+    do: Config.earns_video?(record_tier(state), label, score, transition_floors(state))
 
   # `Cairn.PresenceEvent`'s score is nil-able, and a nil must never reach the
   # comparison: Elixir's term order answers `nil >= 0.5` with `true`, which
@@ -664,18 +664,31 @@ defmodule Cairn.PresenceRecorder do
 
   defp record_tier(%{policy: policy}), do: Map.get(policy, :record)
 
+  # The one gate that must not trust the floors that rode in with the last
+  # batch. The transition and the frames are cast by different processes, so a
+  # confirm can arrive ahead of the batch that produced it — and after an
+  # operator LOWERS the runtime `min_score`, the floors still in hand are the
+  # ones from before the change. Refusing a score the aggregator has already
+  # admitted loses the whole event, not one frame: the label is `:present` from
+  # then on, and a present label never confirms again until it has cleared.
+  #
+  # Per-frame gating deliberately keeps the ride-along floors — those are the
+  # ones their own frames were judged against.
+  defp transition_floors(state), do: override_floors(state.camera_id) || floors(state)
+
   defp floors(%{floors: floors}) when is_map(floors), do: floors
 
-  # Until the first buffer lands, judge with what the sink would have: a
-  # runtime override REPLACES the camera's thresholds as every label's default
-  # (`PresenceSink.effective_min_score/2`). A confirm can reach a recorder
-  # whose floors are still nil — restarted mid-window, transition cast racing
-  # the frames cast — and the configured map alone would refuse a score the
-  # sink admitted under a lowered override, silently recording nothing.
-  defp floors(%{camera_id: camera_id} = state) do
+  # Until the first buffer lands there are no floors to inherit, so judge with
+  # what the sink would have: a runtime override REPLACES the camera's
+  # thresholds as every label's default (`PresenceSink.effective_min_score/2`),
+  # and the configured map answers when there is none.
+  defp floors(%{camera_id: camera_id} = state),
+    do: override_floors(camera_id) || configured_floors(state)
+
+  defp override_floors(camera_id) do
     case CameraControl.get(camera_id) do
       %{min_score: override} when is_number(override) -> %{"default" => override}
-      _control -> configured_floors(state)
+      _no_override -> nil
     end
   end
 

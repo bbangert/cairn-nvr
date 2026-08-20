@@ -8,6 +8,8 @@ defmodule Cairn.PresenceRecorderTest do
   # `assert_receive`'s default window — which a loaded scheduler can miss.
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog, only: [capture_log: 1]
+
   alias Cairn.Config.Camera
   alias Cairn.Pipeline.PresenceSink
 
@@ -655,7 +657,66 @@ defmodule Cairn.PresenceRecorderTest do
     refute :sys.get_state(pid).retiring?
   end
 
+  # The floors ride in with the frames, from a different sender than the
+  # transitions: a confirm can land ahead of the batch that produced it. An
+  # operator LOWERING the runtime floor mid-scene would otherwise have the
+  # confirm judged against the floor that was in force one batch ago — and a
+  # refusal there loses the event, not a frame, because a label already
+  # `:present` never confirms again until it clears.
+  test "a transition is judged against the live override, not the last batch's floors", ctx do
+    id = ctx.camera_id
+    rec = recorder(ctx)
+
+    frames(ctx, [object("person", 0.9)])
+    assert :sys.get_state(rec).floors == %{"default" => 0.5}
+
+    CameraControl.set(id, %{min_score: 0.3})
+    on_exit(fn -> CameraControl.set(id, %{min_score: nil}) end)
+
+    started(ctx, "person", 0.4)
+
+    assert_receive {:event_started, %Event{camera_id: ^id, max_scores: %{"person" => 0.4}}}
+  end
+
   # -- wiring -----------------------------------------------------------------
+
+  # `start_aggregator/1` ensures the recorder once, at the aggregator's birth;
+  # every observation after that finds the aggregator registered and never
+  # reaches it again. Without a retry on the transition itself, a lane that
+  # failed to start — or that stopped and was not replaced — would record
+  # nothing for the life of the aggregator.
+  #
+  # The healed recorder is a real one, so its extractor dies on the sandbox it
+  # has no ownership of; the event opening is what this test is about, and the
+  # crash it logs is the price of not stubbing the process under test.
+  test "a transition heals a lane whose recorder is gone", ctx do
+    id = ctx.camera_id
+    recorder(ctx)
+
+    on_exit(fn ->
+      PresenceAggregator.retire(id)
+      Registry.await_unregistered(id, :presence)
+      Registry.await_unregistered(id, :presence_recorder)
+    end)
+
+    # The aggregator starts here, while the lane is up — so nothing later can
+    # heal it by that path.
+    base = System.monotonic_time(:millisecond)
+    PresenceAggregator.observed(id, base, %{"person" => 0.6})
+    assert Registry.whereis(id, :presence) != nil
+
+    PresenceRecorder.retire(id)
+    Registry.await_unregistered(id, :presence_recorder)
+    refute Registry.whereis(id, :presence_recorder)
+
+    capture_log(fn ->
+      PresenceAggregator.observed(id, base + 500, %{"person" => 0.9})
+
+      assert_receive {:event_started, %Event{camera_id: ^id}}, 2_000
+    end)
+
+    assert Registry.whereis(id, :presence_recorder) != nil
+  end
 
   test "the aggregator's confirm and clear reach the recorder", ctx do
     id = ctx.camera_id
