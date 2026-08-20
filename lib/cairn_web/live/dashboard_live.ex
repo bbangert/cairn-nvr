@@ -12,11 +12,18 @@ defmodule CairnWeb.DashboardLive do
       `Cairn.CameraStatus.subscribe/0`
     * `@live_events` — `%{camera_id => true}` from the `"events"` topic
     * `@disk_alert` — from `Cairn.Retention`
+    * `@detections` — `%{camera_id => [Cairn.LiveDetections.detection()]}`,
+      each broadcast REPLACING that camera's whole list
+    * `@active` — the cameras whose player has reported a first frame; the
+      overlay draws for those only
   """
 
   use CairnWeb, :live_view
 
   alias Cairn.Config
+  alias Cairn.LiveDetections
+  alias CairnWeb.Components.Vision.Bbox
+  alias CairnWeb.EventsLive
 
   @status_meta %{
     connecting: %{label: "Connecting", color: "var(--hs-warning)", pulse: true},
@@ -59,19 +66,28 @@ defmodule CairnWeb.DashboardLive do
 
   @impl true
   def mount(_params, _session, socket) do
+    cameras = Config.Server.get().cameras
+
     if connected?(socket) do
       Cairn.CameraStatus.subscribe()
       Cairn.Event.subscribe()
       Cairn.Retention.subscribe()
+      # One topic per camera, so a busy camera's frames never wake a socket
+      # that is not showing it. The set is fixed for the socket's life: this
+      # page reads the camera list once at mount and a config reload does not
+      # reach it either.
+      Enum.each(cameras, &LiveDetections.subscribe(&1.id))
     end
 
     {:ok,
      assign(socket,
        page_title: "Dashboard",
-       cameras: Config.Server.get().cameras,
+       cameras: cameras,
        statuses: Cairn.CameraStatus.all(),
        live_events: %{},
        transports: %{},
+       detections: %{},
+       active: MapSet.new(),
        disk_alert: disk_alert()
      )}
   end
@@ -93,13 +109,60 @@ defmodule CairnWeb.DashboardLive do
          "webrtc" ->
            Map.put(transports, camera_id, :webrtc)
 
+         # No transport named: flip. The `Map.update/4` default has to be the
+         # opposite of `transport/2`'s, or the first bare toggle on an
+         # untouched camera is a no-op.
          _ ->
-           Map.update(transports, camera_id, :webrtc, fn
+           Map.update(transports, camera_id, :mse, fn
              :mse -> :webrtc
              :webrtc -> :mse
            end)
        end
      end)}
+  end
+
+  # The player hooks' three reports, all keyed by a camera this socket is
+  # actually showing — an id from anywhere else is ignored rather than allowed
+  # to grow the assigns of a page that would never render it.
+  #
+  # `webrtc_active`/`webrtc_inactive` gate the overlay: a box drawn over a
+  # black rectangle is worse than no box, so nothing draws until the player
+  # says it has a frame, and a player that loses one takes its boxes down.
+  # Both spellings are lawik's, and both cairn players fire them — the names
+  # outlived the WebRTC-only original.
+  #
+  # `transport_failed` is the WebRTC-to-MSE fallback: signalling or the peer
+  # connection failed, and the camera's transport assign flips so the toggle
+  # shows what the operator is actually watching. Flipping the assign is also
+  # what swaps the hook — the `<video>`'s id carries the transport, so
+  # LiveView replaces the element rather than patching it.
+  def handle_event(event, %{"camera_id" => camera_id}, socket)
+      when event in ~w(webrtc_active webrtc_inactive transport_failed) do
+    if known_camera?(socket, camera_id) do
+      {:noreply, apply_player_report(socket, event, camera_id)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  defp apply_player_report(socket, "webrtc_active", camera_id) do
+    update(socket, :active, &MapSet.put(&1, camera_id))
+  end
+
+  defp apply_player_report(socket, "webrtc_inactive", camera_id) do
+    socket
+    |> update(:active, &MapSet.delete(&1, camera_id))
+    # The boxes go with the frame they described: a player that comes back
+    # would otherwise re-reveal whatever was on screen when it died.
+    |> update(:detections, &Map.delete(&1, camera_id))
+  end
+
+  defp apply_player_report(socket, "transport_failed", camera_id) do
+    update(socket, :transports, &Map.put(&1, camera_id, :mse))
+  end
+
+  defp known_camera?(socket, camera_id) do
+    Enum.any?(socket.assigns.cameras, &(&1.id == camera_id))
   end
 
   @impl true
@@ -120,6 +183,15 @@ defmodule CairnWeb.DashboardLive do
     {:noreply, assign(socket, disk_alert: alert)}
   end
 
+  # Replace, never merge: the list is one frame's whole truth, so an empty
+  # one is how boxes go away (`Cairn.LiveDetections`). Kept for cameras whose
+  # player has not reported in too — gating the write on `active` would make
+  # the render that follows `webrtc_active` an empty one, and at a low sample
+  # rate that gap is visible.
+  def handle_info({:detections, camera_id, detections}, socket) do
+    {:noreply, update(socket, :detections, &Map.put(&1, camera_id, detections))}
+  end
+
   # The `"events"` topic also carries the per-object track lifecycle, and
   # gains kinds over time; the grid only cares about whether a camera has a
   # live event.
@@ -133,7 +205,59 @@ defmodule CairnWeb.DashboardLive do
 
   defp meta(status), do: Map.get(@status_meta, status, @status_meta.unknown)
 
-  defp transport(transports, camera_id), do: Map.get(transports, camera_id, :mse)
+  # WebRTC is the default live view: sub-second latency is what an operator
+  # watching a door wants, and the overlay's boxes are only as timely as the
+  # frame under them. MSE remains one click away, and a WebRTC player that
+  # fails falls back to it on its own (`transport_failed`).
+  defp transport(transports, camera_id), do: Map.get(transports, camera_id, :webrtc)
+
+  # Hardwired: `Bbox.styles/0` enumerates all five for the config key that
+  # would render a picker from it, and until that key exists there is no
+  # operator surface to choose with.
+  defp overlay_style, do: :corner_brackets
+
+  # Percent geometry straight off the normalized `[x, y, w, h]`: cairn's
+  # boxes are already 0..1, so unlike lawik's grid there are no frame
+  # dimensions to divide by and none in the payload. The 0.5–99.5 clamps are
+  # his: the overlay is inset to the tile, which clips, so a box on the
+  # boundary loses the bracket drawn on that edge — and the span has to give
+  # back whatever the offset took or the far corners land outside. Rounded
+  # because the excess digits are sub-pixel and every one of them is LiveView
+  # diff bytes at sample rate.
+  defp box_style([x, y, w, h]) do
+    left = clamp(x * 100)
+    top = clamp(y * 100)
+
+    "position: absolute; left: #{left}%; top: #{top}%; " <>
+      "width: #{clamp_span(w * 100, left)}%; height: #{clamp_span(h * 100, top)}%;"
+  end
+
+  defp clamp(percent), do: percent |> min(99.5) |> max(0.5) |> pct()
+
+  defp clamp_span(percent, offset) do
+    percent |> min(99.5 - offset) |> max(0.5 - offset) |> pct()
+  end
+
+  defp pct(number), do: Float.round(number / 1, 2)
+
+  # lawik's `detection_summary/1`: what the model sees right now, in words,
+  # for an operator who cannot tell a small box from none at tile size.
+  defp detection_summary([]), do: "no detections"
+
+  defp detection_summary(detections) do
+    detections
+    |> Enum.frequencies_by(& &1.label)
+    # Busiest label first, ties alphabetical — upstream renders map order,
+    # which is deterministic but says nothing. Ordering by count puts what
+    # matters at the start of a line the tile may be too narrow to finish.
+    |> Enum.sort_by(fn {label, count} -> {-count, label} end)
+    |> Enum.map_join(", ", fn
+      {label, 1} -> label
+      {label, count} -> "#{count} #{label}"
+    end)
+  end
+
+  defp fmt_score(score), do: :erlang.float_to_binary(score / 1, decimals: 2)
 
   defp detection(statuses, camera_id) do
     statuses |> Map.get(camera_id, %{}) |> Map.get(:plugin_status)
@@ -291,6 +415,31 @@ defmodule CairnWeb.DashboardLive do
                 playsinline
                 style="position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;"
               ></video>
+              <%!-- Server-rendered, per lawik: the boxes are LiveView diffs
+              over the video, not a canvas a hook draws into. `TrackOverlay`
+              stays the mechanism for PLAYBACK, where a box has to be found
+              for the frame the operator seeked to. --%>
+              <div
+                :if={MapSet.member?(@active, cam.id)}
+                id={"camera-overlay-#{cam.id}"}
+                style="position: absolute; inset: 0; pointer-events: none;"
+              >
+                <Bbox.bbox
+                  :for={det <- Map.get(@detections, cam.id, [])}
+                  style_name={overlay_style()}
+                  label={det.label}
+                  confidence={fmt_score(det.score)}
+                  color={EventsLive.track_color(det.label, 0)}
+                  style={box_style(det.bbox)}
+                />
+              </div>
+              <div
+                :if={MapSet.member?(@active, cam.id)}
+                id={"camera-detections-#{cam.id}"}
+                class="cairn-detection-summary tnum"
+              >
+                {detection_summary(Map.get(@detections, cam.id, []))}
+              </div>
               <div style="position: absolute; top: 10px; left: 10px; display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px 3px 8px; border-radius: 999px; background: rgba(11, 15, 20, 0.78); font-size: 11px; font-weight: 600; letter-spacing: 0.02em; font-family: var(--hs-font-sans);">
                 <span
                   id={"camera-status-#{cam.id}"}
