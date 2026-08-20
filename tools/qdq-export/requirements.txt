@@ -1,0 +1,25 @@
+# Quantization toolchain, pinned.
+#
+# The idempotency claim ("same inputs -> same graph") is only meaningful
+# against a fixed ORT: the quantizer decides op coverage, opset bump and
+# qparam overrides, and all three moved between minors. Unpinned, the
+# sha256s recorded next to each artifact are unfalsifiable.
+#
+# These are NOT the runtime's versions. The container runs ORT 1.26.0 +
+# onnxruntime-qnn 2.4.0 (Dockerfile), and the quantizer bumps to opset 21
+# to emit standard-domain uint16 QDQ. Whether 1.26's QNN EP recognises
+# those node units — rather than the com.microsoft contrib ops ORT emits
+# below opset 21 — is a board-leg question, not a local one. If the HTP
+# leg rejects these graphs, matching this pin to the runtime minor is the
+# first thing to try.
+#
+#   python3 -m venv quant-venv
+#   quant-venv/bin/pip install -r tools/qdq-export/requirements.txt
+onnx==1.22.0
+onnxruntime==1.28.0
+numpy==2.4.6
+pillow==12.3.0
+# Optional in principle — without it ORT falls back to plain ONNX shape
+# inference — but pinned because which inference ran changes the graph
+# handed to the quantizer.
+sympy==1.14.0

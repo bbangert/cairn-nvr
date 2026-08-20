@@ -2,3 +2,11 @@
 # README) and the weights its exports download. Never committed.
 export-venv/
 *.pt
+__pycache__/
+# Campaign output: fp32 sources, calibration/parity frame sets and the
+# quantized artifacts. Gigabytes, and reproducible from this directory's
+# scripts plus the recorded calibration composition — the export record
+# carries the sha256s, which is what a reader actually needs.
+out/
+out-*/
+
