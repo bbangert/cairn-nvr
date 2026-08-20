@@ -390,6 +390,43 @@ defmodule Cairn.PresenceRecorderTest do
     assert :sys.get_state(rec).event == nil
   end
 
+  # The reason looks clean; the state says otherwise. CameraTracker's
+  # noproc-is-clean rule belongs to its restore re-attach, which this module
+  # does not have yet — an extractor exiting :normal mid-event died before
+  # its work was done, and a silent clear would strand the active row.
+  test "an extractor that exits normally with the event open still ends it partial", ctx do
+    id = ctx.camera_id
+    test_pid = self()
+    camera = ctx.camera
+
+    rec =
+      start_supervised!(
+        {PresenceRecorder,
+         camera_id: id,
+         resolve_policy: fn _camera_id -> {camera, @policy} end,
+         start_extractor: fn _camera, event ->
+           pid = spawn(fn -> receive(do: (:finish -> :ok)) end)
+           send(test_pid, {:extractor_started, event, pid})
+           {:ok, pid}
+         end,
+         finalize_extractor: fn _pid, _event -> :ok end},
+        id: :normal_exit_recorder
+      )
+
+    started(ctx)
+    assert_receive {:extractor_started, %Event{id: eid}, ex_pid}
+
+    # The monitor is set once the recorder has processed the open; only then
+    # is the exit the case under test rather than a pre-monitor :noproc.
+    _ = :sys.get_state(rec)
+    send(ex_pid, :finish)
+
+    assert_receive {:event_ended, %Event{id: ^eid, status: :partial}}, 2_000
+    _ = :sys.get_state(rec)
+    assert PresenceCheckpoint.get(id) == nil
+    assert :sys.get_state(rec).event == nil
+  end
+
   test "recording disabled refuses to open an event", ctx do
     id = ctx.camera_id
     CameraControl.set(id, %{recording_enabled: false})

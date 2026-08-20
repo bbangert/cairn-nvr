@@ -275,15 +275,21 @@ defmodule Cairn.PresenceRecorder do
     end
   end
 
-  # `:noproc` is a clean finish, not a crash — `Cairn.CameraTracker`'s rule:
-  # a monitor set on a pid the registry still lists but whose process is gone
-  # answers immediately, and reporting that as a crash would re-announce a
-  # cleanly finalised event as `:partial`.
-  def handle_info({:DOWN, _ref, :process, pid, reason}, %{extractor: pid} = state)
-      when reason not in [:normal, :noproc] do
+  # ANY exit while the event is open ends it `:partial` — including `:normal`
+  # and `:noproc`. `Cairn.CameraTracker` treats those two as a clean finish,
+  # but its rule serves a restore path re-attaching to an extractor that may
+  # have finalized already; the one monitor this module sets is on an
+  # extractor it just started, so a clean-looking reason here is the extractor
+  # dying before it did its work, and clearing silently would strand the
+  # checkpoint row, the `:active` DB row and every `:event_ended` subscriber.
+  # The genuinely clean post-finalize `:DOWN` never reaches this clause:
+  # `maybe_finalize/3` cleared `extractor` first, so it falls to the
+  # catch-all. When the recovery phase adds re-attach, CameraTracker's
+  # indexed-status check comes with it.
+  def handle_info({:DOWN, _ref, :process, pid, reason}, %{extractor: pid} = state) do
     case state.event do
       %Event{} = event ->
-        Logger.warning("event #{event.id}: extractor crashed (#{inspect(reason)})")
+        Logger.warning("event #{event.id}: extractor exited open (#{inspect(reason)})")
         PresenceCheckpoint.delete(state.camera_id)
         Event.broadcast(:event_ended, %{event | status: :partial, ended_at: now()})
         settle(clear_event(state))
@@ -292,9 +298,6 @@ defmodule Cairn.PresenceRecorder do
         settle(clear_event(state))
     end
   end
-
-  def handle_info({:DOWN, _ref, :process, pid, _reason}, %{extractor: pid} = state),
-    do: settle(clear_event(state))
 
   def handle_info(_msg, state), do: {:noreply, state}
 
