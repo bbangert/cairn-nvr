@@ -1,9 +1,10 @@
 defmodule Cairn.PresenceCheckpoint do
   @moduledoc """
   `Cairn.EventCheckpoint`'s shape for the presence lane: a public named ETS
-  table holding each tier-1 camera's active event and the qualifying labels
-  present at that moment, owned outside the pool so the row survives a
-  `Cairn.PresenceRecorder` crash.
+  table holding each tier-1 camera's active event, the qualifying labels
+  present at that moment and the pid of the extractor writing its clip, owned
+  outside the pool so the row survives a `Cairn.PresenceRecorder` crash and
+  can be restored by its replacement (`Cairn.PresenceRecorder.init/1`).
 
   A separate table rather than a second kind of row in `cairn_active_events`,
   and the separation is load-bearing: `Cairn.CameraTracker.restore_checkpointed/0`
@@ -11,8 +12,14 @@ defmodule Cairn.PresenceCheckpoint do
   a presence event checkpointed there would grow tier-2 machinery on a tier-1
   camera at the next tracker-pool restart.
 
-  Written and deleted by the recorder today; reading it back on restart lands
-  with the recovery phase.
+  The row carries the extractor **pid** where the tracked lane's restore looks
+  its extractor up in `Cairn.Registry` by `{:extractor, event_id}`. Both work
+  for a real extractor; the pid also survives the one place the registry
+  cannot be asked — a `Cairn.PresenceRecorder` whose extractor was injected for
+  a test — and it needs no stale-read tolerance, since a dead pid answers
+  `Process.alive?/1` directly. A pid from a previous VM cannot be read here:
+  the table is created empty by this process, so it is destroyed with the node
+  and with its own owner.
   """
 
   use GenServer
@@ -21,9 +28,9 @@ defmodule Cairn.PresenceCheckpoint do
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
-  @spec put(String.t(), Cairn.Event.t(), [String.t()]) :: true
-  def put(camera_id, %Cairn.Event{} = event, labels \\ []),
-    do: :ets.insert(@table, {camera_id, event, labels})
+  @spec put(String.t(), Cairn.Event.t(), [String.t()], pid() | nil) :: true
+  def put(camera_id, %Cairn.Event{} = event, labels, extractor),
+    do: :ets.insert(@table, {camera_id, event, labels, extractor})
 
   @spec delete(String.t()) :: true
   def delete(camera_id), do: :ets.delete(@table, camera_id)
@@ -34,15 +41,15 @@ defmodule Cairn.PresenceCheckpoint do
   A read and not a take, `Cairn.EventCheckpoint.get/1`'s rule: the row stands
   for as long as the event is open, and whoever ends it deletes it.
   """
-  @spec get(String.t()) :: {Cairn.Event.t(), [String.t()]} | nil
+  @spec get(String.t()) :: {Cairn.Event.t(), [String.t()], pid() | nil} | nil
   def get(camera_id) do
     case :ets.lookup(@table, camera_id) do
-      [{^camera_id, event, labels}] -> {event, labels}
+      [{^camera_id, event, labels, extractor}] -> {event, labels, extractor}
       [] -> nil
     end
   end
 
-  @spec all() :: [{String.t(), Cairn.Event.t(), [String.t()]}]
+  @spec all() :: [{String.t(), Cairn.Event.t(), [String.t()], pid() | nil}]
   def all, do: :ets.tab2list(@table)
 
   @doc "Empties the table in one operation."

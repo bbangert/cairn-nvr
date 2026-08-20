@@ -38,10 +38,22 @@ defmodule Cairn.PresenceLedger do
   @spec cleared(String.t(), String.t()) :: true
   def cleared(camera_id, label), do: :ets.delete(@table, {camera_id, label})
 
-  @doc "Rows a dead aggregator left for `camera_id` — its restart clears them."
+  @doc """
+  One camera's announced labels: the rows a dead aggregator left, and the
+  answer `Cairn.PresenceRecorder` restores and segments against.
+
+  A read, never a take — the aggregator's restart is what clears these.
+
+  `match_object/2` rather than `tab2list/1` and a filter: the key is
+  `{camera, label}`, so a partially bound key is still a scan, but one that
+  happens inside ETS instead of copying every other camera's rows into the
+  caller. It is read per recorder start and per `max_event` boundary, not per
+  frame.
+  """
   @spec leftovers(String.t()) :: [{String.t(), DateTime.t(), float() | nil}]
   def leftovers(camera_id) do
-    for {{^camera_id, label}, first_seen_at, score} <- :ets.tab2list(@table),
+    for {{_camera_id, label}, first_seen_at, score} <-
+          :ets.match_object(@table, {{camera_id, :_}, :_, :_}),
         do: {label, first_seen_at, score}
   end
 

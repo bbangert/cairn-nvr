@@ -1,6 +1,11 @@
 defmodule Cairn.PresenceRecorderTest do
-  # No `Cairn.DataCase`: the extractor is stubbed in every test here, so
-  # nothing on this lane reaches the event index.
+  # No `Cairn.DataCase`: the extractor is stubbed in every test here, so the
+  # only thing on this lane that reaches the event index is restore's orphan
+  # check — and with no sandbox connection checked out, every Repo call from
+  # this module fails. That is this suite's faithful stand-in for "the database
+  # is not answering", the condition restore has to survive because it runs
+  # inside `init/1`. The reachable-index answers are covered where an index
+  # answers, in `Cairn.PresenceRecorderRestoreTest`.
   #
   # Not async, for two reasons that are the same reason: every case here
   # subscribes to the one `"events"` topic every other presence suite
@@ -21,6 +26,7 @@ defmodule Cairn.PresenceRecorderTest do
     PresenceAggregator,
     PresenceCheckpoint,
     PresenceEvent,
+    PresenceLedger,
     PresenceRecorder,
     Registry
   }
@@ -108,6 +114,15 @@ defmodule Cairn.PresenceRecorderTest do
     PresenceRecorder.presence(ctx.camera_id, :presence_cleared, presence(ctx, label, score))
   end
 
+  # The ledger row the aggregator inserts before a `presence_started` goes out.
+  # The segmenting cap asks the ledger whether a label this process believes
+  # present is still announced (`resegment/2`), so a test driving transitions
+  # directly has to leave the trace the aggregator would have.
+  defp announce(ctx, label, score \\ 0.9) do
+    PresenceLedger.announced(ctx.camera_id, label, DateTime.utc_now(), score)
+    on_exit(fn -> PresenceLedger.cleared(ctx.camera_id, label) end)
+  end
+
   defp presence(ctx, label, score) do
     now = DateTime.utc_now()
 
@@ -181,7 +196,9 @@ defmodule Cairn.PresenceRecorderTest do
     # D-E6: the row is in the recorder's own table and nowhere near the one
     # `CameraTracker.restore_checkpointed/0` spawns trackers from.
     _ = :sys.get_state(Registry.whereis(id, :presence_recorder))
-    assert {%Event{id: ^eid}, ["person"]} = PresenceCheckpoint.get(id)
+    assert {%Event{id: ^eid}, ["person"], extractor} = PresenceCheckpoint.get(id)
+    # the row names the extractor writing the clip: what a restore re-attaches to
+    assert is_pid(extractor)
     assert EventCheckpoint.get(id) == nil
   end
 
@@ -286,11 +303,11 @@ defmodule Cairn.PresenceRecorderTest do
 
     # Every clear is a checkpoint edge, past the throttle: which labels are
     # left, and whether the close clock is running, is what a restore reads.
-    assert {%Event{id: ^eid}, ["car"]} = PresenceCheckpoint.get(ctx.camera_id)
+    assert {%Event{id: ^eid}, ["car"], _extractor} = PresenceCheckpoint.get(ctx.camera_id)
 
     cleared(ctx, "car")
     assert :sys.get_state(rec).post_token != nil
-    assert {%Event{id: ^eid}, []} = PresenceCheckpoint.get(ctx.camera_id)
+    assert {%Event{id: ^eid}, [], _extractor} = PresenceCheckpoint.get(ctx.camera_id)
 
     fire(rec, :post_window, eid)
     assert_receive {:event_ended, %Event{id: ^eid, status: :finalized} = ended}
@@ -365,6 +382,8 @@ defmodule Cairn.PresenceRecorderTest do
     assert :sys.get_state(rec).event.id == eid
   end
 
+  # Nothing here is announced, so the cap closes and stops — the segmenting
+  # half is the test below.
   test "max_event closes the event whether or not anything is still present", ctx do
     rec = recorder(ctx)
 
@@ -376,6 +395,214 @@ defmodule Cairn.PresenceRecorderTest do
     assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
     assert_receive {:extractor_finalized, ^ex_pid, %Event{id: ^eid}}
     assert :sys.get_state(rec).present_labels |> MapSet.member?("person")
+  end
+
+  # Ben, 2026-08-20: the cap is segmentation, not a stop. A label that is still
+  # present has nothing more to say — presence confirms once and then simply
+  # is — so a cap that ended the recording would leave a scene still in front
+  # of the camera with one clip and nothing after it.
+  test "the cap segments: a presence that outlives it gets the next clip", ctx do
+    rec = recorder(ctx)
+    announce(ctx, "person")
+
+    started(ctx, "person", 0.9)
+    assert_receive {:extractor_started, %Event{id: first, started_at: first_at}, _pid}
+
+    # the scene got better-looking while the first clip ran: the segment opens
+    # at the best score the label has held, not at the confirm's
+    frames(ctx, [object("person", 0.97)])
+    assert_receive {:extractor_cast, {:track_boxes, _}}
+
+    fire(rec, :max_event, first)
+
+    assert_receive {:event_ended, %Event{id: ^first, status: :finalized}}
+    assert_receive {:extractor_started, %Event{id: second}, _pid}
+    assert_receive {:event_started, %Event{id: ^second, max_scores: %{"person" => 0.97}}}
+    assert second != first
+
+    state = :sys.get_state(rec)
+    assert state.event.id == second
+    # the new clip's zero is the boundary, not the original confirm
+    assert DateTime.compare(state.event.started_at, first_at) == :gt
+    assert [%{label: "person", t: +0.0, score: 0.97}] = state.event.labels
+    # and the next cap is armed, so a presence that never leaves keeps segmenting
+    assert state.max_token != nil
+    assert {%Event{id: ^second}, ["person"], _pid} = PresenceCheckpoint.get(ctx.camera_id)
+  end
+
+  # The mirror this process keeps of the aggregator's present set is maintained
+  # by casts, and a cleared lost in a crash window leaves a label present here
+  # forever. With a cap that reopens, that is a clip every max window for as
+  # long as the camera streams — so the ledger, which is the aggregator's own
+  # announced set, settles the disagreement.
+  test "the cap does not segment on a label the ledger no longer announces", ctx do
+    rec = recorder(ctx)
+
+    started(ctx, "person", 0.9)
+    assert_receive {:extractor_started, %Event{id: eid}, _pid}
+    assert_receive {:event_started, %Event{id: ^eid}}
+
+    fire(rec, :max_event, eid)
+    assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
+
+    state = :sys.get_state(rec)
+    assert state.event == nil
+    refute_received {:event_started, %Event{}}
+  end
+
+  # The seeds are re-judged at the boundary, not taken on the strength of the
+  # confirm that admitted them a whole clip ago: an operator who raised the
+  # floor in between gets no further clip.
+  test "the cap does not segment a label the gate no longer admits", ctx do
+    id = ctx.camera_id
+    rec = recorder(ctx)
+    announce(ctx, "person")
+
+    started(ctx, "person", 0.9)
+    assert_receive {:extractor_started, %Event{id: eid}, _pid}
+    assert_receive {:event_started, %Event{id: ^eid}}
+
+    CameraControl.set(id, %{min_score: 0.95})
+    on_exit(fn -> CameraControl.set(id, %{min_score: nil}) end)
+
+    fire(rec, :max_event, eid)
+    assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
+
+    assert :sys.get_state(rec).event == nil
+    refute_received {:event_started, %Event{camera_id: ^id}}
+  end
+
+  # The moduledoc's named exception to segmentation: a camera on its way out
+  # gets no further clips. Its aggregator's flushed cleareds may still be in
+  # flight, and a segment opened here would be a clip for a camera that is
+  # gone by the time it closes.
+  test "a retiring recorder does not segment at the cap", ctx do
+    id = ctx.camera_id
+    rec = recorder(ctx)
+    announce(ctx, "person")
+
+    started(ctx, "person", 0.9)
+    assert_receive {:extractor_started, %Event{id: eid}, _pid}
+    assert_receive {:event_started, %Event{id: ^eid}}
+
+    ref = Process.monitor(rec)
+    PresenceRecorder.retire(id)
+    assert :sys.get_state(rec).retiring?
+    # the label is still present and still announced — everything a segment
+    # needs except the camera
+    assert MapSet.member?(:sys.get_state(rec).present_labels, "person")
+
+    fire(rec, :max_event, eid)
+
+    assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
+    refute_received {:extractor_started, %Event{}, _pid}
+    refute_received {:event_started, %Event{camera_id: ^id}}
+    # and the latch is paid the moment the event it outranked has closed
+    assert_receive {:DOWN, ^ref, :process, ^rec, :normal}
+  end
+
+  # The other half of the boundary's re-read: an operator who narrowed
+  # `record:` mid-clip. The policy seam answers from a flag the test flips, the
+  # way the config server would answer differently after a reload.
+  test "the cap does not segment a label record: no longer admits", ctx do
+    id = ctx.camera_id
+    test_pid = self()
+    camera = ctx.camera
+    narrowed = :counters.new(1, [])
+
+    rec =
+      start_supervised!(
+        {PresenceRecorder,
+         camera_id: id,
+         resolve_policy: fn _camera_id ->
+           record =
+             if :counters.get(narrowed, 1) == 1, do: %{"car" => %{min_score: 0.5}}, else: nil
+
+           {camera, %{@policy | record: record}}
+         end,
+         start_extractor: fn _camera, event ->
+           pid = relay(test_pid)
+           send(test_pid, {:extractor_started, event, pid})
+           {:ok, pid}
+         end,
+         finalize_extractor: fn _pid, _event -> :ok end},
+        id: :narrowing_recorder
+      )
+
+    started(ctx, "person", 0.9)
+    assert_receive {:extractor_started, %Event{id: eid}, _pid}
+    assert_receive {:event_started, %Event{id: ^eid}}
+
+    # announced only now: a row written before the recorder starts would be
+    # adopted in `init/1`, and the policy that adoption resolves is the one
+    # this test needs to go stale
+    announce(ctx, "person")
+    :counters.put(narrowed, 1, 1)
+
+    fire(rec, :max_event, eid)
+    assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
+
+    assert :sys.get_state(rec).event == nil
+    refute_received {:event_started, %Event{camera_id: ^id}}
+  end
+
+  # The exit that follows a finalize is expected and silent — but an abnormal
+  # one is a clip that failed on its way out, and nothing else reports it. With
+  # the cap segmenting, a camera holding presence hands over an extractor this
+  # way every max window, so a recurring failure would otherwise be invisible.
+  test "an extractor that dies badly after its finalize is reported, not swallowed", ctx do
+    id = ctx.camera_id
+    rec = recorder(ctx)
+
+    started(ctx)
+    assert_receive {:extractor_started, %Event{id: eid}, ex_pid}
+    cleared(ctx)
+    fire(rec, :post_window, eid)
+    assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
+    assert_receive {:extractor_finalized, ^ex_pid, %Event{id: ^eid}}
+
+    log =
+      capture_log(fn ->
+        Process.exit(ex_pid, :kill)
+        assert await_finalizing_empty(rec) == %{}
+      end)
+
+    assert log =~ "extractor exited :killed after finalize"
+    assert Process.alive?(rec)
+    # the event was announced when it closed; its extractor's death is not a
+    # second ending
+    refute_received {:event_ended, %Event{camera_id: ^id}}
+  end
+
+  # The recorder's monitor and the test's are delivered independently, so the
+  # test's own `:DOWN` is no barrier for the recorder having handled its one.
+  defp await_finalizing_empty(rec, attempts \\ 100) do
+    finalizing = :sys.get_state(rec).finalizing
+
+    cond do
+      finalizing == %{} -> finalizing
+      attempts > 0 -> Process.sleep(10) && await_finalizing_empty(rec, attempts - 1)
+      true -> finalizing
+    end
+  end
+
+  test "the cap does not segment while recording is switched off", ctx do
+    id = ctx.camera_id
+    rec = recorder(ctx)
+    announce(ctx, "person")
+
+    started(ctx, "person", 0.9)
+    assert_receive {:extractor_started, %Event{id: eid}, _pid}
+    assert_receive {:event_started, %Event{id: ^eid}}
+
+    CameraControl.set(id, %{recording_enabled: false})
+    on_exit(fn -> CameraControl.set(id, %{recording_enabled: true}) end)
+
+    fire(rec, :max_event, eid)
+    assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
+
+    assert :sys.get_state(rec).event == nil
+    refute_received {:event_started, %Event{camera_id: ^id}}
   end
 
   test "an extractor that crashes ends the event as partial", ctx do
@@ -402,9 +629,10 @@ defmodule Cairn.PresenceRecorderTest do
   end
 
   # The reason looks clean; the state says otherwise. CameraTracker's
-  # noproc-is-clean rule belongs to its restore re-attach, which this module
-  # does not have yet — an extractor exiting :normal mid-event died before
-  # its work was done, and a silent clear would strand the active row.
+  # noproc-is-clean rule belongs to an extractor ADOPTED from a checkpoint,
+  # which this recorder reads that way too (`Cairn.PresenceRecorderRestoreTest`);
+  # one it started itself and that exits :normal mid-event died before its work
+  # was done, and a silent clear would strand the active row.
   test "an extractor that exits normally with the event open still ends it partial", ctx do
     id = ctx.camera_id
     test_pid = self()
@@ -436,6 +664,67 @@ defmodule Cairn.PresenceRecorderTest do
     _ = :sys.get_state(rec)
     assert PresenceCheckpoint.get(id) == nil
     assert :sys.get_state(rec).event == nil
+  end
+
+  # Restore runs inside `init/1`, so an index that will not answer must not
+  # cost a camera its lane — the event is announced `:partial` on the strength
+  # of the checkpoint alone (`event_ended` is at-least-once, and consumers
+  # dedupe on the id). `Cairn.CameraTrackerRestoreTest` proves the same for the
+  # tracked lane, and `await_unreachable_index/1` is its guard against the test
+  # passing vacuously against a working index.
+  test "restore survives an index that will not answer and still ends the orphan", ctx do
+    id = ctx.camera_id
+    await_unreachable_index()
+
+    event = %Event{
+      id: Ecto.UUID.generate(),
+      camera_id: id,
+      started_at: DateTime.utc_now(),
+      status: :active,
+      labels: [],
+      max_scores: %{}
+    }
+
+    eid = event.id
+    PresenceCheckpoint.put(id, event, ["person"], nil)
+
+    log =
+      capture_log(fn ->
+        rec = recorder(ctx)
+        assert Process.alive?(rec)
+        assert_receive {:event_ended, %Event{id: ^eid, status: :partial}}, 2_000
+        assert PresenceCheckpoint.get(id) == nil
+      end)
+
+    assert log =~ "could not consult the event index"
+  end
+
+  # This module inherits the tail of an earlier suite's sandbox teardown: while
+  # a shared owner is exiting, a Repo call *exits* rather than raising
+  # `DBConnection.OwnershipError`. Both are "the index is not answering", but
+  # only the second is stable — once the owner has been reaped every call
+  # raises, and no owner can appear afterwards because this module never checks
+  # one out.
+  defp await_unreachable_index(attempts \\ 100) do
+    case probe_index() do
+      {:raised, %DBConnection.OwnershipError{}} ->
+        :ok
+
+      _other when attempts > 0 ->
+        Process.sleep(10)
+        await_unreachable_index(attempts - 1)
+
+      other ->
+        flunk("the event index is still reachable from this test: #{inspect(other)}")
+    end
+  end
+
+  defp probe_index do
+    {:ok, Cairn.Events.get(Ecto.UUID.generate())}
+  rescue
+    e -> {:raised, e}
+  catch
+    :exit, reason -> {:exited, reason}
   end
 
   test "recording disabled refuses to open an event", ctx do
@@ -744,9 +1033,10 @@ defmodule Cairn.PresenceRecorderTest do
     assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
   end
 
-  # `detection_disabled` flushes presence through the same emit, so the event
-  # closes on its post window rather than being cut short.
-  test "a detection_disabled flush clears the recorder's labels too", ctx do
+  # `detection_disabled` flushes presence through the same emit, so its
+  # cleareds are ordinary ones: the event closes on its post window rather
+  # than being cut short at the flush.
+  test "a detection_disabled flush closes the event through the normal post window", ctx do
     id = ctx.camera_id
     rec = recorder(ctx)
 
@@ -758,7 +1048,7 @@ defmodule Cairn.PresenceRecorderTest do
     base = System.monotonic_time(:millisecond)
     PresenceAggregator.observed(id, base, %{"person" => 0.6})
     PresenceAggregator.observed(id, base + 500, %{"person" => 0.9})
-    assert_receive {:extractor_started, %Event{id: _eid}, _pid}
+    assert_receive {:extractor_started, %Event{id: eid}, ex_pid}
 
     PresenceAggregator.detection_disabled(id)
 
@@ -766,6 +1056,44 @@ defmodule Cairn.PresenceRecorderTest do
     state = drained(id, rec)
     assert state.present_labels == MapSet.new()
     assert state.post_token != nil
+
+    # the clip is still being written: nothing has ended it
+    refute_received {:event_ended, %Event{camera_id: ^id}}
+
+    fire(rec, :post_window, eid)
+    assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
+    assert_receive {:extractor_finalized, ^ex_pid, %Event{id: ^eid}}
+  end
+
+  # A camera stop is `PresenceAggregator.retire/1`, which latches this process
+  # and then flushes the aggregator's labels — so the drain the tracked lane
+  # does on `:camera_stopped` (ending the tracks nothing else will end,
+  # camera_tracker.ex's `apply_epoch/3`) has no analogue here: there are no
+  # tracks, and the cleareds the flush emits are the drain. The recorder
+  # outlives its own retire for exactly as long as the clip takes to close.
+  test "a retire flush closes the open event through the post window, then stops", ctx do
+    id = ctx.camera_id
+    rec = recorder(ctx)
+    ref = Process.monitor(rec)
+
+    base = System.monotonic_time(:millisecond)
+    PresenceAggregator.observed(id, base, %{"person" => 0.6})
+    PresenceAggregator.observed(id, base + 500, %{"person" => 0.9})
+    assert_receive {:extractor_started, %Event{id: eid}, ex_pid}
+
+    PresenceAggregator.retire(id)
+    Registry.await_unregistered(id, :presence)
+
+    state = :sys.get_state(rec)
+    assert state.retiring?
+    assert state.present_labels == MapSet.new()
+    assert state.post_token != nil
+    refute_received {:event_ended, %Event{camera_id: ^id}}
+
+    fire(rec, :post_window, eid)
+    assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
+    assert_receive {:extractor_finalized, ^ex_pid, %Event{id: ^eid}}
+    assert_receive {:DOWN, ^ref, :process, ^rec, :normal}
   end
 
   test "the sink forwards its inferred frames to the recorder", ctx do

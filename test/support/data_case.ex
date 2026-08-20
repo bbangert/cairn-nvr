@@ -34,21 +34,30 @@ defmodule Cairn.DataCase do
   end
 
   @doc """
-  Empties `Cairn.EventCheckpoint`'s table around the test.
+  Empties both active-event checkpoint tables around the test.
 
-  That table is a public named ETS table owned by an application process, so
-  it outlives the test that wrote to it — and `Cairn.CameraTracker.init/1`
-  reads its own camera's row from it and consults the event index for that
-  row. A row one test leaves behind is therefore restored by a tracker some
-  later test starts for the same camera id, in that test's sandbox.
+  They are public named ETS tables owned by application processes, so they
+  outlive the test that wrote to them — and both lanes read their own camera's
+  row in `init/1` and consult the event index for it
+  (`Cairn.CameraTracker.init/1`, `Cairn.PresenceRecorder.init/1`). A row one
+  test leaves behind is therefore restored by a process some later test starts
+  for the same camera id, in that test's sandbox.
 
-  Call it from any test that starts a `Cairn.CameraTracker` or writes a
-  checkpoint, even one that does not `use Cairn.DataCase`.
+  Call it from any test that starts either of those, or writes a checkpoint,
+  even one that does not `use Cairn.DataCase`.
   """
   @spec reset_checkpoints() :: :ok
   def reset_checkpoints do
+    clear_checkpoints()
+    on_exit(&Cairn.DataCase.clear_checkpoints/0)
+  end
+
+  @doc false
+  @spec clear_checkpoints() :: :ok
+  def clear_checkpoints do
     Cairn.EventCheckpoint.clear()
-    on_exit(&Cairn.EventCheckpoint.clear/0)
+    Cairn.PresenceCheckpoint.clear()
+    :ok
   end
 
   @doc """
