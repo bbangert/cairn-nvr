@@ -82,8 +82,21 @@ say "PASS: /api/cameras lists the camera"
 # The stated-refusal check: failure vocabulary, not the word "qnn" — a
 # healthy payload also says qnn (plugin_status.backend), so matching the
 # name alone would pass on exactly the silent success this exists to catch.
-if docker logs cairn-smoke 2>&1 |
-  grep -Eqi "canary refused|model was NOT loaded|Failed to load library"; then
+# Polled like every other check here: a fast boot can reach this before the
+# docker log driver has flushed the canary line the app already emitted —
+# one run failed the single-shot grep while fail()'s own dump, milliseconds
+# later, showed the line.
+refused=""
+for _ in $(seq 1 10); do
+  if docker logs cairn-smoke 2>&1 |
+    grep -Eqi "canary refused|model was NOT loaded|Failed to load library"; then
+    refused=yes
+    break
+  fi
+  sleep 1
+done
+
+if [ "$refused" = yes ]; then
   say "PASS: qnn refusal stated in logs"
   say "      $(docker logs cairn-smoke 2>&1 | grep -Ei "canary refused|Failed to load library" | head -2)"
 else

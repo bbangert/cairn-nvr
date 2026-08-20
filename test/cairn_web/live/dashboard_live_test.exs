@@ -82,6 +82,319 @@ defmodule CairnWeb.DashboardLiveTest do
     refute html =~ "camera-live-event-cam_a"
   end
 
+  describe "live transport" do
+    test "WebRTC is the default, MSE is one click away", %{conn: conn} do
+      {:ok, view, html} = live(conn, "/")
+
+      assert html =~ ~s(data-transport="webrtc")
+      assert html =~ ~s(id="camera-video-cam_a-webrtc")
+      assert html =~ ~s(phx-hook="WebrtcPlayer")
+
+      html =
+        view
+        |> element(~s(#camera-transport-cam_a button[phx-value-transport="mse"]))
+        |> render_click()
+
+      assert html =~ ~s(data-transport="mse")
+      assert html =~ ~s(id="camera-video-cam_a-mse")
+    end
+
+    # The fallback is the player's error path, not a feature check: a browser
+    # that speaks WebRTC can still sit behind a network that drops the media.
+    test "a WebRTC player that fails falls the camera back to MSE", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      html = render_hook(view, "transport_failed", %{"camera_id" => "cam_a"})
+
+      # the toggle must show the transport actually in use, and the <video>'s
+      # id is what makes LiveView swap the hook rather than patch it
+      assert html =~ ~s(data-transport="mse")
+      assert html =~ ~s(id="camera-video-cam_a-mse")
+      assert html =~ ~s(phx-hook="MsePlayer")
+
+      # one camera's failure is not the fleet's
+      assert html =~ ~s(id="camera-video-cam_b-webrtc")
+    end
+
+    # The fallback writes the same assign the buttons do, so it must not be a
+    # one-way door: an operator who fixes the network gets WebRTC back with
+    # one click, and the fresh hook re-arms the overlay gate from scratch.
+    test "a camera that fell back to MSE can be toggled to WebRTC again", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      assert render_hook(view, "transport_failed", %{"camera_id" => "cam_a"}) =~
+               ~s(id="camera-video-cam_a-mse")
+
+      html =
+        view
+        |> element(~s(#camera-transport-cam_a button[phx-value-transport="webrtc"]))
+        |> render_click()
+
+      assert html =~ ~s(data-transport="webrtc")
+      assert html =~ ~s(id="camera-video-cam_a-webrtc")
+      assert html =~ ~s(phx-hook="WebrtcPlayer")
+
+      # the new hook has not reported yet, so the overlay stays down until it
+      # does — the gate is per player instance, not remembered per camera
+      refute html =~ "camera-overlay-cam_a"
+
+      assert render_hook(view, "webrtc_active", %{"camera_id" => "cam_a"}) =~
+               "camera-overlay-cam_a"
+    end
+
+    test "one camera's fallback leaves another's overlay alone", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      render_hook(view, "webrtc_active", %{"camera_id" => "cam_a"})
+
+      Cairn.LiveDetections.broadcast("cam_a", [
+        %{label: "person", score: 0.9, bbox: [0.1, 0.1, 0.2, 0.2]}
+      ])
+
+      html = render_hook(view, "transport_failed", %{"camera_id" => "cam_b"})
+
+      assert html =~ "camera-overlay-cam_a"
+      assert html =~ "person · 0.90"
+      assert html =~ ~s(id="camera-video-cam_b-mse")
+    end
+
+    test "a report for a camera this page does not show is ignored", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      html = render_hook(view, "transport_failed", %{"camera_id" => "not_a_camera"})
+      assert html =~ ~s(data-transport="webrtc")
+
+      html = render_hook(view, "webrtc_active", %{"camera_id" => "not_a_camera"})
+      refute html =~ "camera-overlay-"
+    end
+  end
+
+  describe "live detection overlay" do
+    defp detection(label, score, bbox), do: %{label: label, score: score, bbox: bbox}
+
+    defp activate(view, camera_id) do
+      render_hook(view, "webrtc_active", %{"camera_id" => camera_id})
+      view
+    end
+
+    defp publish(view, camera_id, detections) do
+      Cairn.LiveDetections.broadcast(camera_id, detections)
+      # local_broadcast delivers from this process, so the frame is in the
+      # view's mailbox ahead of the render call's own message. No polling.
+      render(view)
+    end
+
+    test "boxes draw with percent geometry from the normalized box", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      html =
+        view
+        |> activate("cam_a")
+        |> publish("cam_a", [detection("person", 0.9, [0.1, 0.2, 0.3, 0.4])])
+
+      assert html =~ "camera-overlay-cam_a"
+      assert html =~ "bbox-corners"
+      assert html =~ "left: 10.0%"
+      assert html =~ "top: 20.0%"
+      assert html =~ "width: 30.0%"
+      assert html =~ "height: 40.0%"
+      assert html =~ "person · 0.90"
+    end
+
+    test "a box flush against the frame edge is clamped inside it", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      html =
+        view
+        |> activate("cam_a")
+        |> publish("cam_a", [detection("car", 0.5, [0.0, 0.0, 1.0, 1.0])])
+
+      # lawik's 0.5–99.5: a bracket drawn on the boundary is half outside the
+      # video, and the width has to give back what the offset took.
+      assert html =~ "left: 0.5%"
+      assert html =~ "top: 0.5%"
+      assert html =~ "width: 99.0%"
+      assert html =~ "height: 99.0%"
+    end
+
+    # The same helper the playback overlay colours by, so one label looks the
+    # same live and over the recorded clip.
+    test "colour is keyed by label, not by position", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      html =
+        view
+        |> activate("cam_a")
+        |> publish("cam_a", [
+          detection("person", 0.9, [0.1, 0.1, 0.1, 0.1]),
+          detection("car", 0.9, [0.5, 0.5, 0.1, 0.1])
+        ])
+
+      assert html =~ "--c: #{CairnWeb.EventsLive.track_color("person", 0)}"
+      assert html =~ "--c: #{CairnWeb.EventsLive.track_color("car", 0)}"
+    end
+
+    test "each broadcast replaces the camera's whole list", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      view = activate(view, "cam_a")
+
+      html = publish(view, "cam_a", [detection("person", 0.9, [0.1, 0.1, 0.2, 0.2])])
+      assert html =~ "person · 0.90"
+
+      html = publish(view, "cam_a", [detection("car", 0.8, [0.3, 0.3, 0.2, 0.2])])
+      assert html =~ "car · 0.80"
+      refute html =~ "person · 0.90"
+    end
+
+    test "an empty list takes the boxes down without a staleness timer", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      view = activate(view, "cam_a")
+
+      assert publish(view, "cam_a", [detection("person", 0.9, [0.1, 0.1, 0.2, 0.2])]) =~
+               "bbox-corners"
+
+      html = publish(view, "cam_a", [])
+      refute html =~ "bbox-corners"
+      assert html =~ "no detections"
+    end
+
+    test "nothing draws until the player reports a frame", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      # detections arrive first — the assign is held, the overlay is not drawn
+      html = publish(view, "cam_a", [detection("person", 0.9, [0.1, 0.1, 0.2, 0.2])])
+      refute html =~ "camera-overlay-cam_a"
+      refute html =~ "bbox-corners"
+
+      html = render_hook(view, "webrtc_active", %{"camera_id" => "cam_a"})
+      assert html =~ "camera-overlay-cam_a"
+      assert html =~ "bbox-corners"
+    end
+
+    test "a player that loses its picture takes its boxes with it", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      view = activate(view, "cam_a")
+
+      assert publish(view, "cam_a", [detection("person", 0.9, [0.1, 0.1, 0.2, 0.2])]) =~
+               "bbox-corners"
+
+      html = render_hook(view, "webrtc_inactive", %{"camera_id" => "cam_a"})
+      refute html =~ "camera-overlay-cam_a"
+
+      # and it does not come back stale when the player does: the boxes were
+      # dropped with the frame they described
+      html = render_hook(view, "webrtc_active", %{"camera_id" => "cam_a"})
+      assert html =~ "camera-overlay-cam_a"
+      refute html =~ "bbox-corners"
+      assert html =~ "no detections"
+    end
+
+    # v1 attaches no frame time to a box, so it can only be drawn over a
+    # transport at the live edge. MSE sits ~3s back by design and the boxes
+    # would lead the picture.
+    test "boxes do not draw over MSE, whatever the player has reported", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      view = activate(view, "cam_a")
+
+      assert publish(view, "cam_a", [detection("person", 0.9, [0.1, 0.1, 0.2, 0.2])]) =~
+               "bbox-corners"
+
+      # the player is still active and the detections are still assigned —
+      # the transport alone takes the overlay and its summary down
+      html = render_hook(view, "transport_failed", %{"camera_id" => "cam_a"})
+      refute html =~ "camera-overlay-cam_a"
+      refute html =~ "bbox-corners"
+      refute html =~ "camera-detections-cam_a"
+
+      # …and the gate composes with the player one rather than replacing it:
+      # toggling back is a real switch, so the stale activity is cleared and
+      # the overlay waits for the NEW player's report and a fresh frame
+      html =
+        view
+        |> element(~s(#camera-transport-cam_a button[phx-value-transport="webrtc"]))
+        |> render_click()
+
+      refute html =~ "camera-overlay-cam_a"
+
+      view = activate(view, "cam_a")
+      html = publish(view, "cam_a", [detection("person", 0.9, [0.1, 0.1, 0.2, 0.2])])
+      assert html =~ "camera-overlay-cam_a"
+      assert html =~ "person · 0.90"
+    end
+
+    test "a manual switch to MSE takes the overlay down too", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      view = activate(view, "cam_a")
+      publish(view, "cam_a", [detection("car", 0.8, [0.2, 0.2, 0.2, 0.2])])
+
+      html =
+        view
+        |> element(~s(#camera-transport-cam_a button[phx-value-transport="mse"]))
+        |> render_click()
+
+      refute html =~ "camera-overlay-cam_a"
+      # the other camera is untouched — the gate is per camera, not per page
+      assert html =~ "camera-video-cam_b-webrtc"
+    end
+
+    # A REAL switch starts a new player the old activity report must not vouch
+    # for — the fresh <video> would draw the old boxes before its first frame.
+    # Re-clicking the selected transport is not a switch and must not blank a
+    # healthy overlay.
+    test "a transport switch clears activity; a re-click does not", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      view = activate(view, "cam_a")
+      publish(view, "cam_a", [detection("person", 0.9, [0.1, 0.1, 0.2, 0.2])])
+
+      # re-click the already-selected transport: overlay untouched
+      html =
+        view
+        |> element(~s(#camera-transport-cam_a button[phx-value-transport="webrtc"]))
+        |> render_click()
+
+      assert html =~ "camera-overlay-cam_a"
+
+      # a real switch away and back: the stale activity is gone, so nothing
+      # draws until the NEW player reports — then boxes need a fresh publish
+      view
+      |> element(~s(#camera-transport-cam_a button[phx-value-transport="mse"]))
+      |> render_click()
+
+      html =
+        view
+        |> element(~s(#camera-transport-cam_a button[phx-value-transport="webrtc"]))
+        |> render_click()
+
+      refute html =~ "camera-overlay-cam_a"
+      html = view |> activate("cam_a") |> render()
+      refute html =~ "person"
+    end
+
+    test "one camera's detections never land on another's tile", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      view = view |> activate("cam_a") |> activate("cam_b")
+
+      publish(view, "cam_a", [detection("person", 0.9, [0.1, 0.1, 0.2, 0.2])])
+      html = publish(view, "cam_b", [])
+
+      assert view |> element("#camera-detections-cam_a") |> render() =~ "person"
+      assert view |> element("#camera-detections-cam_b") |> render() =~ "no detections"
+      assert html =~ "person · 0.90"
+    end
+
+    test "the summary counts labels, busiest first", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      view = activate(view, "cam_a")
+
+      publish(view, "cam_a", [
+        detection("person", 0.9, [0.1, 0.1, 0.1, 0.1]),
+        detection("car", 0.8, [0.3, 0.3, 0.1, 0.1]),
+        detection("person", 0.7, [0.5, 0.5, 0.1, 0.1])
+      ])
+
+      assert view |> element("#camera-detections-cam_a") |> render() =~ "2 person, car"
+    end
+  end
+
   describe "detector health" do
     setup do
       on_exit(fn -> Cairn.CameraStatus.set_plugin_status("cam_a", nil) end)

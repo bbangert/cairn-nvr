@@ -151,6 +151,98 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
     assert is_integer(state.last_buffer_at_ms)
   end
 
+  describe "the live detections topic" do
+    setup ctx do
+      Cairn.LiveDetections.subscribe(ctx.camera_id)
+      :ok
+    end
+
+    test "each inferred frame publishes its complete detection list", ctx do
+      id = ctx.camera_id
+      state = sink(ctx)
+
+      {[], state} =
+        feed(state, [frame([object("person", 0.9), object("car", 0.8)])])
+
+      assert_receive {:detections, ^id, [%{label: "person"}, %{label: "car"}]}
+
+      # A buffer carrying two frames publishes twice: the overlay's unit is a
+      # frame, and the last one broadcast is what ends up on screen.
+      {[], _state} = feed(state, [frame([object("person", 0.7)]), frame([])])
+
+      assert_receive {:detections, ^id, [%{label: "person", score: 0.7}]}
+      assert_receive {:detections, ^id, []}
+    end
+
+    test "a frame the model found nothing in publishes an empty list", ctx do
+      id = ctx.camera_id
+
+      {[], _state} = feed(sink(ctx), [frame([])])
+
+      assert_receive {:detections, ^id, []}
+    end
+
+    test "a predictor's guess and a boxless detection are not published", ctx do
+      id = ctx.camera_id
+
+      boxless = Map.delete(object("person", 0.9), :bbox)
+      {[], _state} = feed(sink(ctx), [frame([object("dog", 0.9, "tracked"), boxless])])
+
+      assert_receive {:detections, ^id, []}
+    end
+
+    # The deliberate difference from the aggregator's fold: presence state and
+    # the recording lane are gated on floors, the overlay is not. It shows
+    # what the model saw, which is what an operator tuning a floor needs.
+    test "a detection below the camera's floor is published anyway", ctx do
+      id = ctx.camera_id
+
+      {[], _state} = feed(sink(ctx), [frame([object("person", 0.2)])])
+
+      assert_receive {:detections, ^id, [%{label: "person", score: 0.2}]}
+      refute_receive {:presence_started, %PresenceEvent{camera_id: ^id}}, 50
+    end
+
+    # These refutes are immediate, unlike the `presence_*` ones elsewhere in
+    # this file: `feed/2` runs `handle_buffer/4` in the test process and
+    # `local_broadcast` sends from whoever calls it, so a message this buffer
+    # was going to produce is already in the mailbox. The presence ones cross
+    # a real boundary — `PresenceAggregator.observed/3` is a cast — and need
+    # either a timeout or a `:sys.get_state` barrier.
+    test "a native-gate skip frame publishes nothing at all", ctx do
+      id = ctx.camera_id
+
+      skip = %{NativeStub.frame(false) | objects: [object("person", 0.9)]}
+      {[], _state} = feed(sink(ctx), [skip])
+
+      # Not even an empty list: the model never looked, so the boxes already
+      # on screen are the freshest thing anyone knows.
+      refute_received {:detections, ^id, _}
+    end
+
+    # Without this the overlay has nothing to act on: it runs no staleness
+    # timer, the video keeps playing, and the last boxes drawn would assert
+    # themselves over a camera nobody is watching any more.
+    test "switching detection off clears the overlay once, then stays quiet", ctx do
+      id = ctx.camera_id
+      state = sink(ctx)
+
+      {[], state} = feed(state, [frame([object("person", 0.9)])])
+      assert_received {:detections, ^id, [%{label: "person"}]}
+
+      CameraControl.set(id, %{detection_enabled: false})
+      on_exit(fn -> CameraControl.set(id, %{detection_enabled: true}) end)
+
+      {[], state} = feed(state, [frame([object("person", 0.9)])])
+      assert_received {:detections, ^id, []}
+
+      # once per transition, like the aggregator's own notice — a disabled
+      # camera must not pay a broadcast per buffer for the rest of its life
+      {[], _state} = feed(state, [frame([object("person", 0.9)])])
+      refute_received {:detections, ^id, _}
+    end
+  end
+
   test "the stats reply carries the liveness stamp the owner's watchdog reads", ctx do
     state = sink(ctx)
 

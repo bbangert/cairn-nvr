@@ -7,6 +7,12 @@
 // :slow_consumer disconnect — reconnecting lands us back at the live edge).
 // Falls back to native HLS (<video src>) when MediaSource is unavailable.
 import {Socket} from "phoenix"
+import {
+  rearmOnReconnect,
+  reportInactive,
+  unwatchFirstFrame,
+  watchFirstFrame,
+} from "./player_activity"
 
 const BUFFER_KEEP_SECONDS = 30
 // Fragments arrive in ~2s chunks; playing closer to the edge than one
@@ -38,6 +44,7 @@ const MsePlayer = {
     // runs and the rejoin loop below outlives the element.
     this.stopped = false
     this.rejoinTimer = null
+    watchFirstFrame(this, this.el)
 
     if (!("MediaSource" in window)) {
       // Safari/iOS: native HLS playback
@@ -47,8 +54,17 @@ const MsePlayer = {
     this.join()
   },
 
+  // Reached when the LiveView itself crashed and remounted: this hook's own
+  // socket and SourceBuffer are untouched and still filling, so the picture
+  // never went away — only the server's record of it did.
+  reconnected() {
+    rearmOnReconnect(this, this.el)
+  },
+
   destroyed() {
     this.stopped = true
+    unwatchFirstFrame(this, this.el)
+    reportInactive(this)
     this.leave()
   },
 
@@ -84,6 +100,10 @@ const MsePlayer = {
     // both fire for one disconnect. Bail if a rejoin is already pending so we
     // never leak a timer and race two join()s (the churn this hook fixes).
     if (this.stopped || this.rejoinTimer) return
+    // The picture is going away, so the overlay's boxes must too. No
+    // `transport_failed` counterpart here: MSE is where WebRTC falls back
+    // to, and this hook retries rather than giving up.
+    reportInactive(this)
     this.teardownMediaSource()
     const delay = this.rejoinMs
     this.rejoinMs = Math.min(this.rejoinMs * 2, REJOIN_MAX_MS)

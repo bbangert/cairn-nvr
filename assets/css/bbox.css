@@ -1,0 +1,229 @@
+/* ==========================================================================
+   Bounding-box overlay styles
+   ==========================================================================
+   Ported from lawik's ex_nvr, `good-grid` branch (ui/assets/css/app.css),
+   alongside the component that uses them
+   (lib/cairn_web/components/vision/bbox.ex).
+
+   One adaptation: each style's accent is `var(--c, <its original hex>)` so a
+   caller can set `--c` inline to the label's palette colour and keep the live
+   overlay in agreement with the recorded clip's. Unset, every style looks
+   exactly as it does upstream. The glows derive their translucency from the
+   same var with `color-mix` rather than repeating the accent as an rgba().
+   ========================================================================== */
+
+/* --- Style 1: Corner Brackets ------------------------------------------- */
+.bbox-corners {
+  position: absolute;
+  --c: #00e5cc;
+  --len: 14px;
+  --w: 2px;
+}
+.bbox-corners::before,
+.bbox-corners::after,
+.bbox-corners-bl::before,
+.bbox-corners-bl::after {
+  content: '';
+  position: absolute;
+  background: var(--c);
+  border-radius: 1px;
+}
+.bbox-corners::before { top: 0; left: 0; width: var(--len); height: var(--w); }
+.bbox-corners::after  { top: 0; left: 0; width: var(--w); height: var(--len); }
+.bbox-corners-tr { position: absolute; top: 0; right: 0; }
+.bbox-corners-tr::before { content:''; position:absolute; top:0; right:0; width:var(--len); height:var(--w); background:var(--c); border-radius:1px; }
+.bbox-corners-tr::after  { content:''; position:absolute; top:0; right:0; width:var(--w); height:var(--len); background:var(--c); border-radius:1px; }
+.bbox-corners-bl { position: absolute; bottom: 0; left: 0; }
+.bbox-corners-bl::before { bottom: 0; left: 0; width: var(--len); height: var(--w); }
+.bbox-corners-bl::after  { bottom: 0; left: 0; width: var(--w); height: var(--len); }
+.bbox-corners-br { position: absolute; bottom: 0; right: 0; }
+.bbox-corners-br::before { content:''; position:absolute; bottom:0; right:0; width:var(--len); height:var(--w); background:var(--c); border-radius:1px; }
+.bbox-corners-br::after  { content:''; position:absolute; bottom:0; right:0; width:var(--w); height:var(--len); background:var(--c); border-radius:1px; }
+.bbox-corners-fill {
+  position: absolute; inset: 0;
+  background: var(--c);
+  opacity: 0.04;
+}
+/* Tighter than upstream's -28px/3px-8px: cairn's tiles start at 340px wide,
+   and the tile clips its overflow, so a tag that far above the box is cut
+   off for anything near the top edge. */
+.bbox-corners-tag {
+  position: absolute;
+  top: -20px; left: 0;
+  background: var(--c);
+  color: #000;
+  font-family: var(--hs-font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 6px;
+  border-radius: 4px;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+}
+
+/* --- Style 2: Dashed Glow ----------------------------------------------- */
+.bbox-dashed {
+  position: absolute;
+  --c: #ff3d8e;
+  border: 1.5px dashed var(--c);
+  border-radius: 6px;
+  animation: bbox-pulse-glow 2.5s ease-in-out infinite;
+}
+@keyframes bbox-pulse-glow {
+  0%, 100% {
+    box-shadow: 0 0 16px color-mix(in srgb, var(--c) 15%, transparent),
+                inset 0 0 16px color-mix(in srgb, var(--c) 3%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 28px color-mix(in srgb, var(--c) 30%, transparent),
+                inset 0 0 28px color-mix(in srgb, var(--c) 6%, transparent);
+  }
+}
+.bbox-dashed-tag {
+  position: absolute;
+  bottom: -10px; left: 50%; transform: translateX(-50%);
+  background: var(--c);
+  color: #fff;
+  font-family: var(--hs-font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 10px;
+  border-radius: 10px;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+  box-shadow: 0 2px 12px color-mix(in srgb, var(--c) 40%, transparent);
+}
+
+/* --- Style 3: SVG Draw-In ----------------------------------------------- */
+.bbox-svg-wrap { position: absolute; --c: #ffb830; }
+.bbox-svg-inner {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  overflow: visible;
+}
+.bbox-svg-corner {
+  stroke: var(--c);
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  fill: none;
+  stroke-dasharray: 300;
+  stroke-dashoffset: 300;
+  animation: bbox-draw-in 0.8s ease forwards;
+}
+@keyframes bbox-draw-in {
+  to { stroke-dashoffset: 0; }
+}
+.bbox-svg-dot {
+  fill: var(--c);
+  animation: bbox-blink 1.6s ease-in-out infinite;
+}
+@keyframes bbox-blink {
+  0%, 100% { opacity: 1; } 50% { opacity: 0.3; }
+}
+.bbox-svg-tag {
+  position: absolute;
+  top: -1px; right: -1px;
+  background: var(--c);
+  color: #000;
+  font-family: var(--hs-font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 4px 8px;
+  border-radius: 0 0 0 6px;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+}
+.bbox-svg-conf {
+  font-weight: 400;
+  opacity: 0.6;
+  margin-left: 4px;
+}
+
+/* --- Style 4: Gradient Border ------------------------------------------- */
+.bbox-gradient-wrap {
+  position: absolute;
+  --c: #8b5cf6;
+}
+.bbox-gradient {
+  position: absolute;
+  inset: 0;
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background: linear-gradient(135deg, var(--c), #3b82f6, #00e5cc) border-box;
+  background-size: 300% 300%;
+  animation: bbox-gradient-shift 4s ease infinite;
+  -webkit-mask: linear-gradient(#fff 0 0) padding-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#fff 0 0) padding-box, linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+}
+@keyframes bbox-gradient-shift {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+.bbox-gradient-tag {
+  position: absolute;
+  top: 8px; left: 8px;
+  background: linear-gradient(135deg, var(--c), #3b82f6);
+  color: #fff;
+  font-family: var(--hs-font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 3px 8px;
+  border-radius: 4px;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+}
+
+/* --- Style 5: Frosted Glass --------------------------------------------- */
+.bbox-frost-wrap {
+  position: absolute;
+  --c: #00e5cc;
+}
+.bbox-frost {
+  position: absolute;
+  inset: 0;
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,0.15);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  -webkit-mask-image: radial-gradient(ellipse at center, transparent 10%, black 100%);
+  mask-image: radial-gradient(ellipse at center, transparent 10%, black 100%);
+}
+.bbox-frost-tag {
+  position: absolute;
+  top: -14px; left: 12px;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  background: rgba(0,0,0,0.35);
+  border: 1px solid rgba(255,255,255,0.15);
+  color: #fff;
+  font-family: var(--hs-font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 3px 10px;
+  border-radius: 6px;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+  display: flex; align-items: center; gap: 6px;
+}
+.bbox-frost-status {
+  width: 5px; height: 5px;
+  background: var(--c);
+  border-radius: 50%;
+  box-shadow: 0 0 6px var(--c);
+  display: inline-block;
+}
+
+/* --- Detection summary line (lawik's grid status bar) -------------------- */
+.cairn-detection-summary {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 4px 8px;
+  background: rgba(0, 0, 0, 0.5);
+  font-family: var(--hs-font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.6);
+  pointer-events: none;
+}

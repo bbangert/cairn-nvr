@@ -26,8 +26,10 @@ schedulers). The tracker opens an event, an extractor streams the
 pre-roll + live fragments to a single mp4, and post-window quiet closes
 it. Details in `docs/architecture.md`.
 
-- **Live view**: MSE over a Phoenix channel (default), HLS fallback,
-  WebRTC for sub-second latency.
+- **Live view**: WebRTC (default, sub-second), falling back to MSE over a
+  Phoenix channel — also the other half of the dashboard's per-camera
+  toggle — and to HLS where MediaSource is missing. Live detection boxes
+  are drawn over the feed as LiveView renders them.
 - **Detection**: in the VM — `plugins/cairn-detect` (hardware decode,
   ONNX Runtime, optional QNN on Qualcomm NPUs) linked as a NIF. New
   models are a hardware-profile edit, not code. The retired external

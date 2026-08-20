@@ -26,12 +26,15 @@ defmodule Cairn.Pipeline.PresenceSink do
   The aggregator gets that fold; `Cairn.PresenceRecorder` gets the inferred
   frames unfolded, boxes and all, because a recording wants what presence
   state has no use for — the trigger box its snapshot is drawn on and the
-  dense sidecar its playback overlay reads.
+  dense sidecar its playback overlay reads. `Cairn.LiveDetections` gets the
+  boxes too, on their own node-local topic, for the dashboard's live overlay
+  — and unlike either of those it is shown detections the floors reject, for
+  the reason stated there.
   """
 
   use Membrane.Sink
 
-  alias Cairn.{CameraControl, PresenceAggregator, PresenceRecorder}
+  alias Cairn.{CameraControl, LiveDetections, PresenceAggregator, PresenceRecorder}
   alias Cairn.Config.Camera
   alias Cairn.Pipeline.Inference.Detections
   alias Membrane.Buffer
@@ -72,7 +75,16 @@ defmodule Cairn.Pipeline.PresenceSink do
   end
 
   defp forward(state, _observations, %{detection_enabled: false}) do
-    if state.detecting?, do: PresenceAggregator.detection_disabled(state.camera.id)
+    if state.detecting? do
+      PresenceAggregator.detection_disabled(state.camera.id)
+
+      # The overlay has no staleness timer by design, so silence reads as
+      # "the last boxes still hold" — over a video that is still playing.
+      # Switching detection off has to say so once, in the only vocabulary
+      # the topic has: an empty frame.
+      LiveDetections.broadcast(state.camera.id, [])
+    end
+
     {[], %{state | detecting?: false, dropped: state.dropped + 1}}
   end
 
@@ -97,6 +109,19 @@ defmodule Cairn.Pipeline.PresenceSink do
 
     for frame <- inferred do
       PresenceAggregator.observed(state.camera.id, now_ms, seen(frame, floors))
+    end
+
+    # The live grid's overlay, off the same frames and unconditional: the
+    # payload is a handful of floats and the topic is node-local, so a camera
+    # nobody is watching costs one `local_broadcast` into an empty subscriber
+    # list per frame. One message per frame, like the aggregator loop above —
+    # each replaces the subscriber's list, so a multi-frame buffer simply ends
+    # with its last frame on screen.
+    for frame <- inferred do
+      LiveDetections.broadcast(
+        state.camera.id,
+        LiveDetections.from_objects(Map.get(frame, :objects, []))
+      )
     end
 
     # The same frames again, whole: `seen/2`'s fold to `%{label => score}` is
