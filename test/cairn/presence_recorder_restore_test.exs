@@ -216,6 +216,28 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     assert PresenceCheckpoint.get(ctx.camera_id) == nil
   end
 
+  # The cap timer gets the remainder, not a fresh window: a restart must not
+  # stretch a clip past the advertised max_event_seconds. An event already past
+  # it closes on arrival, and segmentation keeps the coverage.
+  test "a restored event past its cap closes now and segments", ctx do
+    extractor = relay(self())
+    event = %{event(ctx) | started_at: DateTime.add(DateTime.utc_now(), -400)}
+    eid = event.id
+    announce(ctx, "person")
+    PresenceCheckpoint.put(ctx.camera_id, event, ["person"], extractor)
+
+    # @policy max is 300; 400 s spent means the remainder is negative and the
+    # timer fires immediately — no fire/3 helper, the real timer does it.
+    recorder(ctx)
+
+    assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}, 2_000
+    assert_receive {:extractor_finalized, ^extractor, %Event{id: ^eid}}
+
+    # the label is still present and announced: the next clip opens by itself
+    assert_receive {:event_started, %Event{camera_id: _, id: new_id}}, 2_000
+    assert new_id != eid
+  end
+
   # `max_scores` is the best over the whole EVENT and the ledger row is the
   # current stay's, improved by everything the aggregator saw while this process
   # was down — including a label that cleared and came back lower.

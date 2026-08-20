@@ -979,14 +979,19 @@ defmodule Cairn.PresenceRecorder do
   # being written and this process adopts it rather than abandoning a live
   # recording.
   #
-  # The windows restart rather than resume: the row does not carry how much of
-  # them had run. `Cairn.CameraTracker` restores off the GLOBAL default policy
-  # because its camera's own is not resolved that early in its `init/1`; this
-  # one uses the camera's, since `resolve_policy/1` has already run — and it
+  # The post window restarts rather than resumes: the row does not carry how
+  # much of it had run. The cap is different — the event's `started_at` says
+  # exactly how much it has spent, so the timer gets the REMAINDER: a full
+  # re-arm would let every restart stretch a clip another `max_event_seconds`
+  # past the advertised cap. Zero or less fires now — the cap closes and
+  # `resegment/2` keeps the coverage. Policy is the camera's own, since
+  # `resolve_policy/1` has already run (`Cairn.CameraTracker` restores off the
+  # global defaults because its camera is not resolved that early) — and it
   # degrades to the defaults by itself when the config server cannot answer.
   defp reattach(state, event, labels, extractor) do
     Logger.info("event #{event.id} (#{state.camera_id}): re-attached to a live extractor")
-    {max_ref, max_token} = schedule(:max_event, event.id, state.policy.max)
+    spent = DateTime.diff(now(), event.started_at, :second)
+    {max_ref, max_token} = schedule(:max_event, event.id, max(state.policy.max - spent, 0))
     announced = announced_scores(state)
     present = still_announced(labels, announced)
 
