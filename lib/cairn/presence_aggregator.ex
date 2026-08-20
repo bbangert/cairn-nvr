@@ -212,8 +212,15 @@ defmodule Cairn.PresenceAggregator do
       # `notify_recorder/3`: this runs in `init/1`, which the pool may be
       # inside its own restart of — and `PresenceRecorder.ensure/1` calls
       # `DynamicSupervisor.start_child/2` on that same pool, which would then
-      # block until the call times out. A recorder that is missing here is one
-      # holding no event either, so there is nothing to tell.
+      # block until the call times out.
+      #
+      # The price is that a recorder which is itself down at this instant loses
+      # this clear for good — the row is deleted below either way, so the
+      # restore that reads the ledger cannot recover it. What that costs is
+      # bounded: the event such a recorder restores from its checkpoint runs to
+      # `max_event` and closes there, and it does not segment past the cap,
+      # because the row this loop deleted is exactly what that decision
+      # consults.
       PresenceRecorder.presence(camera_id, :presence_cleared, cleared)
 
       Cairn.PresenceLedger.cleared(camera_id, label)

@@ -27,10 +27,19 @@ defmodule Cairn.PresenceSupervisor do
   # `:rest_for_one`, tables before the pool: aggregators and recorders die
   # without taking the announced set or the active-event rows with them, while
   # a table's own crash restarts the pool into the empty world the fresh table
-  # reflects. What each survival buys differs today — an aggregator's restart
-  # reads the ledger and clears what its predecessor promised, while a
-  # recorder's checkpoint is only written and deleted, for the recovery phase
-  # to read back.
+  # reflects. Both survivals are read on restart — an aggregator clears what
+  # its predecessor announced, and a recorder re-attaches to the extractor its
+  # predecessor's checkpoint names, adopting from the ledger the labels that
+  # checkpoint could not have known about.
+  #
+  # That empty world is not quite empty, and one thing outside this tree is why:
+  # the extractors live under `Cairn.EventSupervisor` and go on writing their
+  # clips through a crash here. A `Cairn.PresenceCheckpoint` crash therefore
+  # destroys the only record of them at the same moment it kills everyone who
+  # could finalize them. What makes the sentence above safe is the sweep in
+  # `Cairn.PresenceRecorder`'s restore: a recorder that finds no checkpoint row
+  # asks the event index and the registry whether an extractor of its camera is
+  # still writing, and ends what it finds.
   @impl true
   def init(_opts) do
     children = [

@@ -582,6 +582,19 @@ defmodule Cairn.EventExtractor do
     {{:no_media, Events.finalize_partial(event, state.bytes)}, state.bytes}
   end
 
+  # A `:partial` event that DID write media is not a contradiction, and the
+  # status the caller carries is what says so: `Cairn.Reconciler` puts every
+  # crash-interrupted recording in exactly that state — a clip worth keeping
+  # whose event nobody closed — and `Cairn.PresenceRecorder`'s
+  # stranded-extractor sweep ends one the same way, while still wanting the
+  # media it has. Persisting `:finalized` over it would claim a clean close
+  # nobody performed. Every other caller hands over an event bound for
+  # `:finalized`.
+  defp finish(%{status: :partial} = event, state) do
+    bytes = maybe_remux(state)
+    {Events.finalize_partial(event, bytes), bytes}
+  end
+
   defp finish(event, state) do
     bytes = maybe_remux(state)
     {Events.finalize(event, bytes), bytes}
