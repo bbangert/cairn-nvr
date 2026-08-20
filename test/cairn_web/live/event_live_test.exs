@@ -464,6 +464,20 @@ defmodule CairnWeb.EventLiveTest do
     refute html =~ "We couldn&#39;t find this clip&#39;s track file"
   end
 
+  # The presence lane (`Cairn.PresenceRecorder`) writes a label-keyed sidecar
+  # and no track rows at all, so the panel is empty and the overlay has nothing
+  # to look its paths up by. The palette it needs is the event's own labels.
+  test "an event with a sidecar but no tracks hands the overlay a label-keyed palette",
+       %{conn: conn} do
+    %{id: id, clip: clip} = seed(:finalized)
+    write_sidecar(clip)
+
+    {:ok, _view, html} = live(conn, "/events/#{id}")
+
+    assert html =~ ~s(data-selected="person")
+    assert html =~ ~s(person&quot;:{&quot;color&quot;:&quot;#5fc0f5&quot;)
+  end
+
   test "an object's colour varies by its ordinal among same-label tracks", %{conn: conn} do
     %{id: id, clip: clip, started_at: t0} = seed(:finalized)
     write_sidecar(clip)

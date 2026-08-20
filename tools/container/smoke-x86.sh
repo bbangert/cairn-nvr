@@ -31,7 +31,11 @@ docker buildx build --platform linux/amd64 -t cairn:smoke --load ../.. >>"$LOG" 
   fail "image build (see $LOG)"
 
 WORK=$(mktemp -d)
-trap 'docker rm -f cairn-smoke >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+# The container writes into the /data bind mount as root (soak samples, logs)
+# once it lives long enough, and an unprivileged runner's rm then fails —
+# which, inside an EXIT trap, becomes the whole script's exit code and fails a
+# smoke that passed. Best-effort only; CI runners are ephemeral.
+trap 'docker rm -f cairn-smoke >/dev/null 2>&1 || true; rm -rf "$WORK" 2>/dev/null || true' EXIT
 mkdir -p "$WORK/config" "$WORK/data"
 cp smoke/config.yml "$WORK/config/config.yml"
 

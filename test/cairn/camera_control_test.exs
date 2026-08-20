@@ -1,6 +1,9 @@
 defmodule Cairn.CameraControlTest do
-  # uses the globally-supervised Cairn.CameraControl; unique camera ids per test
-  use ExUnit.Case, async: true
+  # Uses the globally-supervised Cairn.CameraControl; unique camera ids per
+  # test. NOT async: the prune test empties the shared table down to its own
+  # rows, deleting control state concurrent suites rely on mid-test — the
+  # presence suites' recording_enabled: false isolation in particular.
+  use ExUnit.Case, async: false
 
   alias Cairn.CameraControl
 

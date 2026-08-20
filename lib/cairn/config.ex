@@ -506,7 +506,7 @@ defmodule Cairn.Config do
   load time, because the plugin never emits that band and the rule could only
   ever fire zero times. A runtime override (`Cairn.CameraControl`'s
   `min_score`) goes through no such validation and can sit above a tier —
-  `Cairn.CameraTracker` resolves the clash by demanding both, so an
+  `earns_video?/4` resolves the clash by demanding both, so an
   override raises the bar without ever lowering a tier's.
 
   Between the two tiers, validation leaves one invariant worth relying on: for
@@ -529,6 +529,53 @@ defmodule Cairn.Config do
   # key, so this resolves to a number for any camera that came from either.
   defp wire_floor(min_score, label),
     do: Map.get(min_score, label) || Map.get(min_score, "default")
+
+  @doc """
+  Whether one detection earns video: the camera's `record:` tier applied on
+  top of the `min_score` floor.
+
+  Both event lanes ask this one question — `Cairn.CameraTracker` of a tagged
+  object, `Cairn.PresenceRecorder` of a presence transition and of the boxes
+  in a frame — so the two cannot drift on what `record:` admits.
+
+  No `record:` block: the (possibly overridden) floor decides alone, and
+  everything it admits earns video.
+
+  With a block, this is where the runtime `control.min_score` override and the
+  config tier meet. They answer different questions — the tier says whether
+  this label at this score deserves video, the override raises or lowers the
+  floor right now — so evidence needs **both**: `score >= max(effective
+  min_score, tier)`, with `:excluded` beating any floor. An override can
+  therefore raise the bar at runtime, but never un-exclude a label or undercut
+  a tier.
+
+  With no override in force the floor half is implied rather than
+  load-bearing: a tier below the camera's *configured* `min_score` is a
+  load-time error, so clearing the tier already clears the floor. The override
+  is what makes the `max` bite — it goes through no such validation and can
+  land either side of a tier.
+  """
+  @spec earns_video?(Camera.tier() | nil, String.t(), number(), %{
+          optional(String.t()) => float()
+        }) :: boolean()
+  def earns_video?(record_tier, label, score, min_score)
+
+  def earns_video?(nil, label, score, min_score), do: passes_floor?(label, score, min_score)
+
+  def earns_video?(rules, label, score, min_score) when is_map(rules) do
+    case tier_threshold(rules, label, min_score) do
+      :excluded -> false
+      threshold -> passes_floor?(label, score, min_score) and score >= threshold
+    end
+  end
+
+  # The `0.5` `wire_floor/2` leaves out, kept from the tracked lane's own
+  # version of this: `Cairn.CameraTracker.tracked/3` is a public entry point
+  # any caller can hand a bare map, and a floor map with no `"default"` would
+  # otherwise compare a score against `nil` — which Elixir's term order answers
+  # `false` to, refusing every detection rather than admitting it.
+  defp passes_floor?(label, score, min_score),
+    do: score >= (Map.get(min_score, label) || Map.get(min_score, "default", 0.5))
 
   @doc "Effective track expiry (media milliseconds) for a camera."
   @spec max_unseen_ms(t(), Camera.t()) :: pos_integer()

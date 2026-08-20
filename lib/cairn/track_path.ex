@@ -66,6 +66,24 @@ defmodule Cairn.TrackPath do
   module's: that track had more kept samples than the per-track cap below.
   Both are plain booleans and neither implies the other.
 
+  `"identity"` says what a track's `"id"` *is*, because the two event lanes
+  key paths differently and a reader colours by the key. It appears only for
+  the second of the two:
+
+    * absent, i.e. `"object"` — a `Cairn.ULID`, the tracked lane's
+      `object_id`. Absence rather than a written `"object"` so that a tracked
+      sidecar's bytes are what they were before the field existed, which is
+      also what every such file already on disk means.
+    * `"label"` — the label itself, the tier-1 presence lane
+      (`Cairn.PresenceRecorder`): there is no tracker and so no identity to
+      key by. One path per label follows from that, not from the format: two
+      objects of one label in a frame share an id, and only one of their boxes
+      survives the one-sample-per-id-per-instant rule below.
+
+  Either way the `"label"` column is still each track's own, so a reader needs
+  `"identity"` only to know whether an id is worth showing a viewer or
+  matching against something outside the file.
+
   `"anchor"` is the clip's time-zero as the writer knew it, in two halves that
   pair a media position with a wall clock. The **drain half** — `"first_pts"`,
   `"timescale"`, `"drained_span_ms"`, `"drain_wall_ms"` — is what the extractor
@@ -218,9 +236,17 @@ defmodule Cairn.TrackPath do
   @typedoc "Normalized `[x, y, w, h]`, each 0..1, as validated on the wire."
   @type bbox :: [number()]
 
-  @typedoc "One tagged observation: `Cairn.Tracker` identity plus its box."
+  @typedoc """
+  One observation's identity, label and box.
+
+  The identity is a `Cairn.Tracker` `object_id` under `:object` and the label
+  itself under `:label` — see the header's `"identity"` field.
+  """
   @type box_entry ::
-          {object_id :: String.t(), label :: String.t(), bbox(), stationary :: boolean()}
+          {id :: String.t(), label :: String.t(), bbox(), stationary :: boolean()}
+
+  @typedoc "What a track's id is: a tracker identity, or the label itself."
+  @type identity :: :object | :label
 
   @typedoc "One observation batch: its time in ms since the event's `started_at`."
   @type entry :: {t_ms :: integer(), [box_entry()]}
@@ -228,14 +254,15 @@ defmodule Cairn.TrackPath do
   @typedoc """
   Everything in the file that is not a path.
 
-  `:event_id` and `:camera_id` are required; `:truncated` defaults to `false`
-  and `:anchor` to `nil`. Anchor fields are passed through as given, `nil`
-  included.
+  `:event_id` and `:camera_id` are required; `:truncated` defaults to `false`,
+  `:identity` to `:object` and `:anchor` to `nil`. Anchor fields are passed
+  through as given, `nil` included.
   """
   @type header :: %{
           required(:event_id) => String.t(),
           required(:camera_id) => String.t(),
           optional(:truncated) => boolean(),
+          optional(:identity) => identity(),
           optional(:anchor) => map() | nil
         }
 
@@ -267,6 +294,7 @@ defmodule Cairn.TrackPath do
       "ts" => deltas(axis),
       "tracks" => Enum.map(tracks, &columns(&1, index))
     }
+    |> put_identity(Map.get(header, :identity, :object))
     |> Msgpax.pack!()
     |> :zlib.gzip()
   end
@@ -487,6 +515,14 @@ defmodule Cairn.TrackPath do
     {tail, _last} = Enum.map_reduce(rest, first, fn v, prev -> {v - prev, v} end)
     [first | tail]
   end
+
+  # Written only for the presence lane's variant, and absent — not `"object"` —
+  # for the tracked one: the default is what every file written before this
+  # field existed means, so leaving it out keeps a tracked sidecar's bytes
+  # exactly what they were. Anything but `:label` is the tracked variant; an
+  # unknown atom in a header must not reach a reader as a third identity.
+  defp put_identity(file, :label), do: Map.put(file, "identity", "label")
+  defp put_identity(file, _object), do: file
 
   # Every field is read with `Map.get/2`: a caller that could only capture some
   # of the anchor writes `nil` for the rest rather than no anchor at all, which

@@ -597,32 +597,14 @@ defmodule Cairn.CameraTracker do
   # from the last *detection*, so an object that is detected in this batch
   # always carries `false`. The staleness rule bites through `detected?/1`
   # instead — a track the plugin keeps predicting arrives as `"tracked"`.
+  #
+  # The `record:` half is `Cairn.Config.earns_video?/4`, shared with the
+  # presence lane so the two cannot disagree on what a tier admits. The two
+  # rules above it are this lane's alone: tier 1 has no predictor to refuse and
+  # no stillness flag to read.
   defp evidence?(object, min_score, record_tier) do
     Observation.detected?(object) and not object.stationary and
-      earns_video?(object, min_score, record_tier)
-  end
-
-  # No `record:` block: the (possibly overridden) `min_score` floor decides
-  # alone, and everything it admits earns video.
-  defp earns_video?(object, min_score, nil), do: passes_min_score?(object, min_score)
-
-  # Where the runtime `control.min_score` override and the config tier meet.
-  # They answer different questions — the tier says whether this label at this
-  # score deserves video, the override raises or lowers the floor right now —
-  # so evidence needs **both**: `score >= max(effective_min_score, tier)`, with
-  # `:excluded` beating any floor. An override can therefore raise the bar at
-  # runtime, but never un-exclude a label or undercut a tier.
-  #
-  # With no override in force the floor half is implied rather than load-
-  # bearing: a tier below the camera's *configured* `min_score` is a load-time
-  # error, so clearing the tier already clears the floor. The override is what
-  # makes the `max` bite — it goes through no such validation and can land
-  # either side of a tier (see `Cairn.Config.tier_threshold/3`).
-  defp earns_video?(object, min_score, rules) do
-    case Config.tier_threshold(rules, object.label, min_score) do
-      :excluded -> false
-      threshold -> passes_min_score?(object, min_score) and object.score >= threshold
-    end
+      Config.earns_video?(record_tier, object.label, object.score, min_score)
   end
 
   @impl true
@@ -1344,11 +1326,6 @@ defmodule Cairn.CameraTracker do
   end
 
   # -- helpers ----------------------------------------------------------------
-
-  defp passes_min_score?(det, min_score) do
-    threshold = Map.get(min_score, det.label) || Map.get(min_score, "default", 0.5)
-    det.score >= threshold
-  end
 
   defp label_entries(entries, dets, started_at, observed_at) do
     t = DateTime.diff(observed_at, started_at, :millisecond) / 1000

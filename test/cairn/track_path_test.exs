@@ -103,6 +103,21 @@ defmodule Cairn.TrackPathTest do
              ] = map["tracks"]
     end
 
+    # The tracked lane's bytes must not move for a field it does not use: a
+    # reader that finds no `"identity"` reads the ids as tracker identities,
+    # which is what every sidecar already on disk means.
+    test "the identity variant is written only for the label-keyed lane" do
+      entries = [{"person", "person", [0.0, 0.0, 0.1, 0.1], false}]
+
+      refute Map.has_key?(roundtrip(header(), [{0, entries}]), "identity")
+      refute Map.has_key?(roundtrip(header(%{identity: :object}), [{0, entries}]), "identity")
+
+      assert roundtrip(header(%{identity: :label}), [{0, entries}])["identity"] == "label"
+
+      assert TrackPath.encode(header(), buffered([{0, entries}])) ==
+               TrackPath.encode(header(%{identity: :object}), buffered([{0, entries}]))
+    end
+
     test "quantization is lossless for the four-decimal values the wire carries" do
       map =
         roundtrip(header(), [

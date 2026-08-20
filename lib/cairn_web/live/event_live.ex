@@ -162,6 +162,7 @@ defmodule CairnWeb.EventLive do
       sidecar?: false,
       truncated?: false,
       overlay_objects: "{}",
+      overlay_labels: [],
       panel_loaded?: false
     )
   end
@@ -234,7 +235,8 @@ defmodule CairnWeb.EventLive do
       sidecar?: sidecar?(event),
       # Encoded once per load, not once per render: `data-objects` changes only
       # when the object set does, while a `toggle-track` re-renders the panel.
-      overlay_objects: overlay_objects(objects),
+      overlay_objects: overlay_objects(objects, event),
+      overlay_labels: overlay_labels(objects, event),
       panel_loaded?: true
     )
   end
@@ -309,11 +311,45 @@ defmodule CairnWeb.EventLive do
   # What the canvas needs that the sidecar does not carry: the colour the panel
   # gave each object, and the label/score for its chip (v1 stores no per-sample
   # score — `best_score` is a track-index column).
-  defp overlay_objects(objects) do
+  #
+  # Keyed by whatever the sidecar keys its tracks by, which is the header's
+  # `"identity"` and is the one thing this page cannot cheaply know: reading it
+  # means decoding the file, which is the browser's job and already its work.
+  # So a label-keyed palette is sent *as well*, one entry per label the event
+  # recorded, and the overlay looks up the keying its file declares.
+  #
+  # Only when the panel found nothing, which is how a label-keyed sidecar
+  # arrives here: `Cairn.PresenceRecorder`'s lane runs no tracker, so its
+  # clips have no track rows to list. A page that did list objects keeps
+  # exactly the map it had.
+  defp overlay_objects([], event), do: event |> label_overlay() |> Jason.encode!()
+
+  defp overlay_objects(objects, _event) do
     objects
     |> Map.new(&{&1.id, %{"color" => &1.color, "label" => &1.label, "score" => &1.score}})
     |> Jason.encode!()
   end
+
+  defp label_overlay(event) do
+    for {label, score} <- max_scores(event), into: %{} do
+      {label,
+       %{
+         "color" => EventsLive.track_color(label, 0),
+         "label" => label,
+         "score" => fmt_score(score)
+       }}
+    end
+  end
+
+  # A label-keyed sidecar has no panel row to toggle it from, so its paths are
+  # drawn whenever the file is: the labels join the selected set on the way to
+  # the overlay without entering `@track_ids`, which is what gates the toggles.
+  defp overlay_labels([], event), do: event |> max_scores() |> Map.keys() |> Enum.sort()
+  defp overlay_labels(_objects, _event), do: []
+
+  defp overlay_selected(selected, labels), do: Enum.join(Enum.concat(selected, labels), ",")
+
+  defp max_scores(event), do: Map.get(event.labels || %{}, "max_scores", %{})
 
   # The panel's standing notices, in the order they matter, and only the ones
   # that apply. A clip that is still recording says so rather than complaining
@@ -480,7 +516,7 @@ defmodule CairnWeb.EventLive do
                   data-video-id="event-clip"
                   data-sidecar-url={~p"/media/events/#{@event.id}/tracks"}
                   data-event-seconds={clip_seconds(@event)}
-                  data-selected={Enum.join(@selected, ",")}
+                  data-selected={overlay_selected(@selected, @overlay_labels)}
                   data-objects={@overlay_objects}
                   style="position: absolute; inset: 0; pointer-events: none;"
                 >

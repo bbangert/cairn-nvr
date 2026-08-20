@@ -160,7 +160,16 @@ const TrackOverlay = {
         cursor: 0,
       }
     })
-    return {anchor: file["anchor"] || null, tracks}
+    // What a track's `id` is, and so what the selected set and the colour map
+    // are keyed by: a tracker identity ("object", and the only thing files
+    // written before this field existed hold) or the label itself ("label",
+    // the tier-1 presence lane, which has no tracker to mint identities).
+    // lib/cairn/track_path.ex's header section is the contract.
+    return {anchor: file["anchor"] || null, identity: file["identity"] || "object", tracks}
+  },
+
+  trackKey(track) {
+    return this.paths.identity === "label" ? track.label : track.id
   },
 
   startLoop() {
@@ -316,11 +325,12 @@ const TrackOverlay = {
     ctx.clip()
 
     for (const track of this.paths.tracks) {
-      if (!this.selected.has(track.id)) continue
+      const key = this.trackKey(track)
+      if (!this.selected.has(key)) continue
       const box = this.sampleAt(track, tMs)
       if (!box) continue
 
-      const meta = this.objects[track.id] || {}
+      const meta = this.objects[key] || {}
       const color = meta.color || "#5fc0f5"
       const x = offX + box[0] * dispW
       const y = offY + box[1] * dispH

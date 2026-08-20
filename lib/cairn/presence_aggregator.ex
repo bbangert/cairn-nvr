@@ -42,7 +42,7 @@ defmodule Cairn.PresenceAggregator do
 
   require Logger
 
-  alias Cairn.PresenceEvent
+  alias Cairn.{PresenceEvent, PresenceRecorder}
 
   # Two sightings inside this window confirm presence. Two, not one — a
   # single-frame phantom must not open an event — and the window is wide
@@ -132,6 +132,11 @@ defmodule Cairn.PresenceAggregator do
   """
   @spec retire(String.t()) :: :ok
   def retire(camera_id) do
+    # The lane's sibling goes with it. It outlives this call when an event is
+    # open — the cleareds `clear_all/1` is about to emit are what close that
+    # one — see `Cairn.PresenceRecorder.retire/1`.
+    PresenceRecorder.retire(camera_id)
+
     case Cairn.Registry.whereis(camera_id, :presence) do
       nil -> :ok
       pid -> GenServer.cast(pid, :retire)
@@ -146,7 +151,24 @@ defmodule Cairn.PresenceAggregator do
     end
   end
 
+  # Started with the aggregator rather than on demand from the sink's frame
+  # path: what triggers a recording is a transition cast, and
+  # `PresenceRecorder.presence/3` drops one that finds no recorder. A start
+  # failure is only logged — presence state must outlive the lane — because
+  # this is not the last chance: `notify_recorder/3` tries again at the next
+  # transition, which is the only moment the lane is needed.
   defp start_aggregator(camera_id) do
+    case PresenceRecorder.ensure(camera_id) do
+      {:ok, _pid} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "camera #{camera_id}: presence recorder did not start (#{inspect(reason)}) — " <>
+            "the next transition retries"
+        )
+    end
+
     case DynamicSupervisor.start_child(
            Cairn.PresenceSupervisor.Pool,
            {__MODULE__, camera_id: camera_id}
@@ -168,18 +190,31 @@ defmodule Cairn.PresenceAggregator do
     # `Cairn.PresenceLedger`). A fresh camera has no leftovers and this is
     # a no-op.
     for {label, first_seen_at, score} <- Cairn.PresenceLedger.leftovers(camera_id) do
-      # Emit before delete, here and in `broadcast/4`: a crash between the
-      # two leaves the row for the NEXT restart, whose clear is then a
-      # duplicate — the ledger's stated bargain is at-least-once ("at worst
-      # spurious, never missing"), and deleting first would invert it into
-      # a cleared that can vanish.
-      PresenceEvent.broadcast(:presence_cleared, %PresenceEvent{
+      cleared = %PresenceEvent{
         camera_id: camera_id,
         label: label,
         score: score,
         first_seen_at: first_seen_at,
         at: DateTime.utc_now()
-      })
+      }
+
+      # Emit before delete, here and in `broadcast/4`: a crash between the
+      # two leaves the row for the NEXT restart, whose clear is then a
+      # duplicate — the ledger's stated bargain is at-least-once ("at worst
+      # spurious, never missing"), and deleting first would invert it into
+      # a cleared that can vanish.
+      PresenceEvent.broadcast(:presence_cleared, cleared)
+      # The event lane hears every clear this process owes, this one included:
+      # a recorder holding an event open on a label whose aggregator died
+      # would otherwise wait out `max_event` for a scene that already ended.
+      #
+      # A bare cast, deliberately, where a transition goes through
+      # `notify_recorder/3`: this runs in `init/1`, which the pool may be
+      # inside its own restart of — and `PresenceRecorder.ensure/1` calls
+      # `DynamicSupervisor.start_child/2` on that same pool, which would then
+      # block until the call times out. A recorder that is missing here is one
+      # holding no event either, so there is nothing to tell.
+      PresenceRecorder.presence(camera_id, :presence_cleared, cleared)
 
       Cairn.PresenceLedger.cleared(camera_id, label)
     end
@@ -374,13 +409,47 @@ defmodule Cairn.PresenceAggregator do
     Cairn.PresenceLedger.cleared(camera_id, label)
   end
 
+  # Both halves of one transition: the cluster-wide broadcast every consumer
+  # already reads, and a direct cast to this camera's event lane. The cast is
+  # not a second subscriber to the topic on purpose — the trigger for a
+  # recording must not race PubSub delivery, and it must reach exactly the one
+  # process that owns this camera's events.
   defp emit(kind, camera_id, label, entry) do
-    PresenceEvent.broadcast(kind, %PresenceEvent{
+    event = %PresenceEvent{
       camera_id: camera_id,
       label: label,
       score: entry.best_score,
       first_seen_at: entry.first_seen_at,
       at: DateTime.utc_now()
-    })
+    }
+
+    PresenceEvent.broadcast(kind, event)
+    notify_recorder(camera_id, kind, event)
+  end
+
+  # The lane's only retry. `start_aggregator/1` runs once, at this process's
+  # birth; every observation after it takes the registered-pid branch of
+  # `ensure/1`, so a recorder that failed to start then — or that stopped and
+  # was not replaced — would never be tried again, and every transition for the
+  # life of this aggregator would record nothing. A transition is rare enough
+  # to pay a registry read for, and it is the one moment the answer matters.
+  #
+  # Never fatal to presence: a lane that cannot start costs recordings, not the
+  # every-started-gets-a-cleared invariant this process owes its subscribers.
+  defp notify_recorder(camera_id, kind, event) do
+    if Cairn.Registry.whereis(camera_id, :presence_recorder) == nil do
+      case PresenceRecorder.ensure(camera_id) do
+        {:ok, _pid} ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning(
+            "camera #{camera_id}: presence recorder unavailable (#{inspect(reason)}) — " <>
+              "this transition will not record"
+          )
+      end
+    end
+
+    PresenceRecorder.presence(camera_id, kind, event)
   end
 end
