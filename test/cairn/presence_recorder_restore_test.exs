@@ -16,6 +16,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
   alias Cairn.{
     CameraControl,
     Event,
+    EventCheckpoint,
     Events,
     PresenceAggregator,
     PresenceCheckpoint,
@@ -215,6 +216,25 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     assert PresenceCheckpoint.get(ctx.camera_id) == nil
   end
 
+  # `max_scores` is the best over the whole EVENT and the ledger row is the
+  # current stay's, improved by everything the aggregator saw while this process
+  # was down — including a label that cleared and came back lower.
+  test "a re-attached label takes its score from the ledger, not from the event", ctx do
+    extractor = relay(self())
+    event = event(ctx, %{"person" => 0.9})
+    announce(ctx, "person", 0.4)
+    PresenceCheckpoint.put(ctx.camera_id, event, ["person"], extractor)
+
+    rec = recorder(ctx)
+
+    state = :sys.get_state(rec)
+    assert state.present_labels == MapSet.new(["person"])
+    assert state.present_scores == %{"person" => 0.4}
+    # the event keeps its own history: only what a next segment would claim
+    # comes from the ledger
+    assert state.event.max_scores == %{"person" => 0.9}
+  end
+
   # `cleared/2` checkpoints that edge past the throttle precisely so this can
   # be read back: a row naming no labels is one whose close clock was already
   # running, and nothing is coming to start it again.
@@ -383,7 +403,8 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     # ended before finalized, `maybe_finalize/3`'s ordering — and the labels the
     # row earned ride back with it, since the extractor writes what it is handed
     assert [
-             {:event_ended, %Event{id: ^eid, status: :partial, max_scores: %{"person" => 0.9}}},
+             {:event_ended,
+              %Event{id: ^eid, status: :partial, max_scores: %{"person" => 0.9}, max_score: 0.9}},
              {:extractor_finalized, ^stranded, %Event{id: ^eid}}
            ] = [next_sweep_message(), next_sweep_message()]
 
@@ -412,6 +433,28 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     refute_received {:extractor_finalized, _pid, _event}
     assert Events.get(eid).status == :active
     assert Registry.whereis(id, {:extractor, eid}) == nil
+  end
+
+  # The index says nothing about which lane wrote a row (D-E7), and a camera
+  # flipping from tier 2 to tier 1 starts a recorder while the tracked event it
+  # had is still being written. `Cairn.EventCheckpoint` is that lane's own
+  # witness to a live event, and what it names is not this lane's to end.
+  test "a row the tracked lane still has open is not swept", ctx do
+    id = ctx.camera_id
+    event = event(ctx)
+    eid = event.id
+    {:ok, _row} = Events.create_active(event, "/tmp/#{eid}.mp4")
+    tracked = registered_relay(id, eid, self())
+    assert await_extractor(id, eid) == tracked
+    EventCheckpoint.put(id, event)
+    on_exit(fn -> EventCheckpoint.delete(id) end)
+
+    rec = recorder(ctx)
+
+    _ = :sys.get_state(rec)
+    refute_received {:event_ended, %Event{id: ^eid}}
+    refute_received {:extractor_finalized, _pid, _event}
+    assert Events.get(eid).status == :active
   end
 
   # -- the ledger read --------------------------------------------------------

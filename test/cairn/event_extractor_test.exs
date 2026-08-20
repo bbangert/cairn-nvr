@@ -202,6 +202,38 @@ defmodule Cairn.EventExtractorTest do
     {path, event.id}
   end
 
+  # `Cairn.Reconciler` puts every crash-interrupted recording in this state — a
+  # real clip whose event nobody closed — and `Cairn.PresenceRecorder`'s
+  # stranded-extractor sweep asks for it deliberately. The media is kept and
+  # announced; only the status says the close was not a clean one.
+  test "a finalize carrying :partial keeps the media and persists partial",
+       %{camera: camera, config: config, frags: frags} do
+    event = new_event(camera)
+
+    pid =
+      start_supervised!(
+        {EventExtractor,
+         camera: camera, event: event, config: config, snapshot_fun: fn _row, _cfg -> :ok end}
+      )
+
+    ref = Process.monitor(pid)
+    assert %{status: :active, path: path} = wait_row(event.id)
+
+    Enum.each(frags, &RingBuffer.put_fragment(camera.id, &1))
+    wait_until(fn -> :sys.get_state(pid).fragments == length(frags) end)
+
+    EventExtractor.finalize(pid, %{event | ended_at: DateTime.utc_now(), status: :partial})
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
+
+    row = Events.get(event.id)
+    assert row.status == :partial
+    assert row.bytes == File.stat!(path).size
+    # the clip is real: still announced, still on disk, labels intact
+    assert_receive {:event_clip_ready, %EventArtifact{event_id: _, bytes: bytes}}
+    assert bytes == row.bytes
+    assert row.labels["max_scores"] == %{"person" => 0.9}
+  end
+
   # What this measures: the clip is never announced before the extractor is
   # told to finalize, it carries its post-remux size, and the snapshot is only
   # kicked off afterwards. The *camera tracker's* ordering is pinned by the

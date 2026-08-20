@@ -419,7 +419,12 @@ defmodule Cairn.PresenceRecorder do
           Event.broadcast(:event_ended, %{event | status: :partial, ended_at: now()})
         end
 
-        settle(clear_event(%{state | extractor_ref: nil}))
+        # The stay is not over just because its clip is: an extractor answers
+        # `{:ok, pid}` from `start_link` and opens its row and its file in a
+        # `handle_continue`, so a failure there — or any death mid-clip —
+        # arrives here, and presence will not trigger again for a label it
+        # already holds. The retry re-checks every gate when it fires.
+        settle(arm_retry(clear_event(%{state | extractor_ref: nil})))
 
       nil ->
         settle(clear_event(%{state | extractor_ref: nil}))
@@ -982,7 +987,8 @@ defmodule Cairn.PresenceRecorder do
   defp reattach(state, event, labels, extractor) do
     Logger.info("event #{event.id} (#{state.camera_id}): re-attached to a live extractor")
     {max_ref, max_token} = schedule(:max_event, event.id, state.policy.max)
-    present = still_announced(state, labels)
+    announced = announced_scores(state)
+    present = still_announced(labels, announced)
 
     state = %{
       state
@@ -992,10 +998,7 @@ defmodule Cairn.PresenceRecorder do
         extractor_ref: Process.monitor(extractor),
         adopted_extractor?: true,
         present_labels: present,
-        # What those labels scored is only recorded on the event; a present
-        # label the event never scored simply starts without one and takes the
-        # score of the next thing that mentions it.
-        present_scores: Map.take(event.max_scores, MapSet.to_list(present)),
+        present_scores: restored_scores(present, announced, event.max_scores),
         checkpointed_at: state.monotonic_ms.(),
         max_ref: max_ref,
         max_token: max_token
@@ -1022,8 +1025,36 @@ defmodule Cairn.PresenceRecorder do
   # the pool, so rows lost with it are lost together with the aggregator that
   # announced them. That aggregator comes back blank and re-confirms whatever is
   # still in front of the camera, which cancels the post window this arms.
-  defp still_announced(state, labels) do
-    MapSet.intersection(MapSet.new(labels), MapSet.new(announced_labels(state)))
+  defp still_announced(labels, announced) do
+    labels |> Enum.filter(&Map.has_key?(announced, &1)) |> MapSet.new()
+  end
+
+  # The ledger's score for a restored label, not the event's. `max_scores` is
+  # the best over the whole EVENT — a label that cleared low and came back, or
+  # came back lower, keeps the old number there — while the ledger row is the
+  # current stay's, improved as the aggregator sees better
+  # (`Cairn.PresenceAggregator.sighted/5`), including everything it saw while
+  # this process was down. It is what a segment opened from these labels should
+  # claim. The event's number stands in for a row that carries none.
+  #
+  # A label with no number anywhere is left out rather than stored as `nil`:
+  # `merge_score/3` improves a score with `max/2`, and Elixir's term order puts
+  # an atom above every number, so a `nil` there would survive every real score
+  # for the rest of the stay.
+  defp restored_scores(present, announced, event_scores) do
+    Enum.reduce(present, %{}, fn label, scores ->
+      case current_score(label, announced, event_scores) do
+        score when is_number(score) -> Map.put(scores, label, score)
+        _unscored -> scores
+      end
+    end)
+  end
+
+  defp current_score(label, announced, event_scores) do
+    case Map.get(announced, label) do
+      score when is_number(score) -> score
+      _unscored -> Map.get(event_scores, label)
+    end
   end
 
   # No checkpoint row is the ordinary case — a camera with nothing open — and
@@ -1043,9 +1074,22 @@ defmodule Cairn.PresenceRecorder do
   # still there opens a fresh one through `adopt_announced/1` two lines later —
   # the coverage that actually matters. Rows whose extractor is gone are left
   # alone: boot reconciliation owns those.
+  #
+  # One residual, accepted rather than engineered around: both lanes delete
+  # their checkpoint row immediately after casting the finalize, so a recorder
+  # starting inside that window finds an extractor mid-finalize and sweeps it.
+  # The cost is bounded to one spurious `:event_ended{status: :partial}` — the
+  # extractor stops `:normal` once it has finalized, so this second cast dies
+  # with the process and never touches the row, and the index keeps what the
+  # extractor wrote. `event_ended` is at-least-once and consumers re-fetch by id
+  # (docs/ha-api.md), so DB truth corrects it. A witness for "finalizing" would
+  # cost every close a write to buy that back.
   defp sweep_stranded(state) do
+    tracked = tracked_event_id(state.camera_id)
+
     state.camera_id
     |> active_rows()
+    |> Enum.reject(&(&1.id == tracked))
     |> Enum.each(fn row ->
       case Cairn.Registry.whereis(state.camera_id, {:extractor, row.id}) do
         nil -> :ok
@@ -1054,6 +1098,18 @@ defmodule Cairn.PresenceRecorder do
     end)
 
     state
+  end
+
+  # The row a `Cairn.CameraTracker` has open for this camera, if any. The index
+  # says nothing about which lane wrote a row (D-E7), and a camera flipping from
+  # tier 2 to tier 1 starts a recorder while the tracked event it had is still
+  # being written — so the tracked lane's own live-event witness is asked, and
+  # what it names is left alone.
+  defp tracked_event_id(camera_id) do
+    case Cairn.EventCheckpoint.get(camera_id) do
+      {%Event{id: id}, _tracks} -> id
+      _none -> nil
+    end
   end
 
   defp end_stranded(state, row, extractor) do
@@ -1066,6 +1122,7 @@ defmodule Cairn.PresenceRecorder do
     # handed back over the row when it finalizes (`Cairn.Events.finalize/2`),
     # so an event with no labels would erase the ones the clip actually earned.
     labels = row.labels || %{}
+    max_scores = Map.get(labels, "max_scores", %{})
 
     event = %Event{
       id: row.id,
@@ -1074,8 +1131,10 @@ defmodule Cairn.PresenceRecorder do
       ended_at: now(),
       status: :partial,
       labels: Map.get(labels, "entries", []),
-      max_scores: Map.get(labels, "max_scores", %{}),
-      max_score: row.max_score,
+      max_scores: max_scores,
+      # `create_active/2` writes no `max_score` column — only the close does —
+      # so an event that never got that far has it only inside the labels map.
+      max_score: row.max_score || best_score(max_scores),
       trigger: Map.get(labels, "trigger"),
       path: row.path
     }
@@ -1204,6 +1263,14 @@ defmodule Cairn.PresenceRecorder do
 
   defp announced_labels(state) do
     for {label, _first_seen_at, _score} <- PresenceLedger.leftovers(state.camera_id), do: label
+  end
+
+  # The same read with the scores kept — what a restore needs and a segment
+  # boundary does not, since by then this process has watched the stay itself.
+  defp announced_scores(state) do
+    for {label, _first_seen_at, score} <- PresenceLedger.leftovers(state.camera_id),
+        into: %{},
+        do: {label, score}
   end
 
   # -- policy -----------------------------------------------------------------

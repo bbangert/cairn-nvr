@@ -483,6 +483,34 @@ defmodule Cairn.PresenceRecorderTest do
     refute_received {:event_started, %Event{camera_id: ^id}}
   end
 
+  # A real extractor answers `{:ok, pid}` from its `start_link` and only then
+  # opens its row and its file, so a failure there — or any death mid-clip —
+  # arrives as a DOWN with the event already open. The label that opened it will
+  # not confirm again, so without a retry the rest of the stay goes unrecorded.
+  test "an extractor that dies mid-event is retried while the presence holds", ctx do
+    rec = recorder(ctx)
+    announce(ctx, "person")
+
+    started(ctx)
+    assert_receive {:extractor_started, %Event{id: first}, ex_pid}
+    assert_receive {:event_started, %Event{id: ^first}}
+    # the monitor is set once the open has been processed; only then is a kill
+    # the case under test
+    _ = :sys.get_state(rec)
+
+    Process.exit(ex_pid, :kill)
+    assert_receive {:event_ended, %Event{id: ^first, status: :partial}}, 2_000
+
+    # the broadcast goes out inside the same handler that arms the retry, so
+    # this read is the barrier for it
+    assert :sys.get_state(rec).retry_token != nil
+    fire_retry(rec)
+
+    assert_receive {:extractor_started, %Event{id: second}, _pid}
+    assert_receive {:event_started, %Event{id: ^second}}
+    assert second != first
+  end
+
   # Presence gives one trigger per stay: a confirmed label never confirms again
   # before it has cleared. So an open that fails takes the whole stay's
   # recording with it unless the lane comes back to it — Ben, 2026-08-20: as
