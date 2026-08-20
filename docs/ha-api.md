@@ -182,6 +182,12 @@ payloads a client already parses:
   label rather than by an object id.
 - `trigger.object_id` and every `labels.entries[].object_id` are `null`. The
   frames are shaped exactly as above; only the identity column is empty.
+- `trigger.t` may be **negative**, which it never is on a tracked event. It is
+  the trigger detection's offset in seconds from the event's start, and
+  presence confirms on the second sighting — so the frame that scored best
+  routinely sits before that instant, in the clip's pre-roll. A client
+  converting `t` to a clip position must add the pre-roll rather than assume
+  the value is at or after zero.
 
 One event per camera, and the labels merge: a further qualifying label while
 an event is open extends it (an `event_updated` announces the label the event

@@ -1046,6 +1046,79 @@ defmodule Cairn.PresenceRecorderTest do
     assert state.pending == nil
   end
 
+  # The walk-through case, and the reason the trigger's `t` is signed. Presence
+  # confirms on the SECOND sighting, so the event's t=0 is the confirm while
+  # the batch that caused it was captured earlier — and that batch is usually
+  # where the best-scoring detection is. Clamping its `t` to zero pointed the
+  # snapshot at a frame up to a confirm-window later, drawing the box where the
+  # person had already left.
+  test "a trigger replayed from before the confirm keeps its negative time", ctx do
+    rec = recorder(ctx)
+
+    t_zero = DateTime.utc_now()
+    captured_ms = DateTime.to_unix(t_zero, :millisecond) - 1_500
+
+    PresenceRecorder.frames(ctx.camera_id, %{"default" => 0.5}, [
+      %{
+        pts: 0,
+        observed_at_ms: captured_ms,
+        inferred: true,
+        infer_us: 0,
+        objects: [object("person", 0.95)]
+      }
+    ])
+
+    # `first_seen_at` is what a confirm dates the event from, so t=0 is exactly
+    # `t_zero` and the replayed frame's offset is exactly -1.5 s.
+    PresenceRecorder.presence(ctx.camera_id, :presence_started, %PresenceEvent{
+      camera_id: ctx.camera_id,
+      label: "person",
+      score: 0.9,
+      first_seen_at: t_zero,
+      at: t_zero
+    })
+
+    assert_receive {:extractor_started, %Event{}, _pid}
+
+    # The sidecar's axis was always signed; the trigger now agrees with it.
+    assert_receive {:extractor_cast, {:track_boxes, %{t_ms: -1_500}}}
+
+    assert %{label: "person", score: 0.95, t: -1.5} = :sys.get_state(rec).event.trigger
+  end
+
+  # The other half of the asymmetry: the panel's timeline is a percentage of
+  # the clip's duration, so an entry before t=0 would render off the left edge.
+  test "the label timeline still clamps where the trigger does not", ctx do
+    rec = recorder(ctx)
+
+    t_zero = DateTime.utc_now()
+    captured_ms = DateTime.to_unix(t_zero, :millisecond) - 1_500
+
+    PresenceRecorder.frames(ctx.camera_id, %{"default" => 0.5}, [
+      %{
+        pts: 0,
+        observed_at_ms: captured_ms,
+        inferred: true,
+        infer_us: 0,
+        objects: [object("person", 0.95)]
+      }
+    ])
+
+    PresenceRecorder.presence(ctx.camera_id, :presence_started, %PresenceEvent{
+      camera_id: ctx.camera_id,
+      label: "person",
+      score: 0.9,
+      first_seen_at: t_zero,
+      at: t_zero
+    })
+
+    assert_receive {:extractor_started, %Event{}, _pid}
+
+    event = :sys.get_state(rec).event
+    assert event.trigger.t == -1.5
+    assert Enum.all?(event.labels, &(&1.t >= 0))
+  end
+
   test "a batch older than the replay bound is dropped, not replayed", ctx do
     {clock, monotonic_ms} = fake_clock()
     rec = recorder(ctx, %{}, :stale_pending_recorder, monotonic_ms: monotonic_ms)

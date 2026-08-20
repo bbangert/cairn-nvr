@@ -171,8 +171,11 @@ defmodule CairnWeb.DashboardLiveTest do
   describe "live detection overlay" do
     defp detection(label, score, bbox), do: %{label: label, score: score, bbox: bbox}
 
-    defp activate(view, camera_id) do
-      render_hook(view, "webrtc_active", %{"camera_id" => camera_id})
+    # No dimensions by default: most of these cases are about the gate or the
+    # list, and a report without them is the identity geometry the rest of
+    # the suite's expected percentages were computed against.
+    defp activate(view, camera_id, params \\ %{}) do
+      render_hook(view, "webrtc_active", Map.put(params, "camera_id", camera_id))
       view
     end
 
@@ -181,6 +184,102 @@ defmodule CairnWeb.DashboardLiveTest do
       # local_broadcast delivers from this process, so the frame is in the
       # view's mailbox ahead of the render call's own message. No polling.
       render(view)
+    end
+
+    # A NormBox describes the WHOLE frame; `object-fit: cover` shows part of
+    # it. 640x480 is 4:3 in a 16:9 tile, so cover matches the widths and crops
+    # top and bottom: visible height fraction f = (4/3) / (16/9) = 0.75.
+    # For y = 0.25, h = 0.5 — y' = (0.25 - 0.125) / 0.75 = 1/6, h' = 2/3.
+    # x and w are on the uncropped axis and pass through untouched.
+    test "a 4:3 camera's boxes are corrected for the crop", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      html =
+        view
+        |> activate("cam_a", %{"width" => 640, "height" => 480})
+        |> publish("cam_a", [detection("person", 0.9, [0.25, 0.25, 0.5, 0.5])])
+
+      assert html =~ "left: 25.0%"
+      assert html =~ "top: 16.67%"
+      assert html =~ "width: 50.0%"
+      assert html =~ "height: 66.67%"
+    end
+
+    test "a 16:9 camera is left exactly alone", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      corrected =
+        view
+        |> activate("cam_a", %{"width" => 1920, "height" => 1080})
+        |> publish("cam_a", [detection("person", 0.9, [0.25, 0.25, 0.5, 0.5])])
+
+      # identical to the no-dimensions render, which is the whole claim:
+      # a matching aspect must not move a single pixel
+      {:ok, plain_view, _html} = live(conn, "/")
+
+      plain =
+        plain_view
+        |> activate("cam_a")
+        |> publish("cam_a", [detection("person", 0.9, [0.25, 0.25, 0.5, 0.5])])
+
+      for percent <- ["left: 25.0%", "top: 25.0%", "width: 50.0%", "height: 50.0%"] do
+        assert corrected =~ percent
+        assert plain =~ percent
+      end
+    end
+
+    # Chosen so the two orders disagree: raw, y = 0.85 / h = 0.1 needs no
+    # clamp at all (85 + 10 < 99.5). Corrected it becomes 96.67% down with a
+    # 13.33% height, which does — and the clamp has to bite on THOSE numbers,
+    # since the tile is what the box can overflow.
+    test "the clamps apply after the correction, not before", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      html =
+        view
+        |> activate("cam_a", %{"width" => 640, "height" => 480})
+        |> publish("cam_a", [detection("person", 0.9, [0.1, 0.85, 0.2, 0.1])])
+
+      assert html =~ "top: 96.67%"
+      assert html =~ "height: 2.83%"
+      refute html =~ "top: 85.0%"
+      refute html =~ "height: 10.0%"
+    end
+
+    test "dimensions are dropped when the player goes away", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      box = [detection("person", 0.9, [0.25, 0.25, 0.5, 0.5])]
+
+      assert view
+             |> activate("cam_a", %{"width" => 640, "height" => 480})
+             |> publish("cam_a", box) =~
+               "top: 16.67%"
+
+      render_hook(view, "webrtc_inactive", %{"camera_id" => "cam_a"})
+
+      # the next player is a different picture: with no dimensions of its own
+      # it must get the identity geometry, not its predecessor's crop
+      assert view |> activate("cam_a") |> publish("cam_a", box) =~ "top: 25.0%"
+    end
+
+    test "a transport switch drops them too", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      box = [detection("person", 0.9, [0.25, 0.25, 0.5, 0.5])]
+
+      assert view
+             |> activate("cam_a", %{"width" => 640, "height" => 480})
+             |> publish("cam_a", box) =~
+               "top: 16.67%"
+
+      view
+      |> element(~s(#camera-transport-cam_a button[phx-value-transport="mse"]))
+      |> render_click()
+
+      view
+      |> element(~s(#camera-transport-cam_a button[phx-value-transport="webrtc"]))
+      |> render_click()
+
+      assert view |> activate("cam_a") |> publish("cam_a", box) =~ "top: 25.0%"
     end
 
     test "boxes draw with percent geometry from the normalized box", %{conn: conn} do

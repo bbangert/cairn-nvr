@@ -661,8 +661,9 @@ defmodule Cairn.PresenceRecorder do
   # and the event by the confirm that followed one, so a frame captured before
   # that confirm and delivered after it lands before the event's t=0 — inside
   # the pre-roll the clip holds, which is where its boxes belong. The sidecar's
-  # axis is signed for it; the label and trigger times clamp at zero, being
-  # offsets into an event rather than into a clip.
+  # axis is signed for it, and so is the trigger's (`best_trigger/3`). Only the
+  # label timeline clamps, being a display offset rather than a position in
+  # media (`label_entry/3` says why).
   defp frame(frame, state) do
     t_ms = frame_unix_ms(frame) - state.started_unix_ms
     objects = Map.get(frame, :objects, [])
@@ -894,8 +895,18 @@ defmodule Cairn.PresenceRecorder do
   # the frame it was cut at (`Cairn.Snapshot` falls back to the clip's first
   # frame when the trigger is unusable). The same shape `forward_boxes/3`
   # admits, for the same reason.
+  #
+  # `t` is SIGNED, and on this lane it is commonly negative: the batch that
+  # confirms presence reaches this process before the transition it causes and
+  # is replayed into the event it opens (`replay_pending/1`), so the frame that
+  # most often holds the best-scoring detection predates event-zero. Its moment
+  # is real and inside the clip — `Cairn.Snapshot` places it from the sidecar's
+  # anchor, where a negative offset lands in the pre-roll. Clamping traded the
+  # frame the box was measured on for whatever frame sat at t=0, up to the
+  # confirm window later: on a walk-through the box draws where the person no
+  # longer is.
   defp best_trigger(current, dets, t_ms) do
-    t = Float.round(max(t_ms / 1000, 0.0), 2)
+    t = Float.round(t_ms / 1000, 2)
 
     dets
     |> Enum.filter(&boxed?/1)
@@ -1542,6 +1553,13 @@ defmodule Cairn.PresenceRecorder do
 
   # -- helpers ----------------------------------------------------------------
 
+  # Clamped, deliberately unlike `best_trigger/3`'s signed `t`, and the two are
+  # not comparable for it. This one is a display offset: `CairnWeb.EventLive`'s
+  # `marker_left/2` turns it into a percentage across the panel's timeline, and
+  # a negative one would place the marker off the left edge. The trigger's is a
+  # position in media, which the snapshot resolves against the clip — pre-roll
+  # included. Nothing reads the two against each other; if something ever does,
+  # this is the seam that would lie to it.
   defp label_entry(label, score, t_ms) do
     %{
       t: Float.round(max(t_ms / 1000, 0.0), 1),

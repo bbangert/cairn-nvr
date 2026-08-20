@@ -356,6 +356,26 @@ defmodule Cairn.SnapshotTest do
       assert Snapshot.clip_seek(row, seek_config(ctx.config)) == 5.8
     end
 
+    # A presence-born trigger whose detection sat in the pre-roll. The estimate
+    # counts from the clip's first sample, so a negative offset is a position
+    # inside the pre-window rather than something to throw away.
+    test "a negative trigger time seeks back into the pre-roll", ctx do
+      row = insert(%{@trig | t: -0.4}, clip(ctx.dir))
+
+      # 1.0 - 0.4
+      assert Snapshot.clip_seek(row, seek_config(ctx.config)) == 0.6
+    end
+
+    # The pre-roll actually retained can be shorter than the configured one —
+    # an unfilled ring, or the extractor cutting back to its first keyframe —
+    # so the estimate can point before the clip even exists.
+    test "a trigger older than the whole pre-window floors at the clip's start", ctx do
+      row = insert(%{@trig | t: -2.5}, clip(ctx.dir))
+
+      # 1.0 - 2.5 is -1.5, which is not a position in any file
+      assert Snapshot.clip_seek(row, seek_config(ctx.config)) == 0.0
+    end
+
     test "no trigger means no seek, sidecar or not", ctx do
       path = clip(ctx.dir)
       sidecar!(path, @anchor)

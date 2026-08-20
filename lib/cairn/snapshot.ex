@@ -7,7 +7,9 @@ defmodule Cairn.Snapshot do
   (`Cairn.EventArtifact`), so a consumer knows whether to fetch or to give up.
 
   When the event carries a `trigger` (the highest-scoring detection, captured
-  by `Cairn.CameraTracker`), the frame is cut from that detection's
+  by `Cairn.CameraTracker` or, on a tier-1 camera, `Cairn.PresenceRecorder` —
+  whose triggers commonly sit in the pre-roll, at a negative `t`), the frame
+  is cut from that detection's
   moment in the clip and its bounding box + label are drawn on top — a
   Frigate-style "why did this record" thumbnail. The seek lands on the nearest
   keyframe (fast `-ss`), so on a long GOP the box can be a beat off the exact
@@ -112,7 +114,22 @@ defmodule Cairn.Snapshot do
         nil
 
       trig ->
-        raw = anchored_seek(row, trig) || pre_window(config, row.camera_id) + trigger_t(trig)
+        # Floored because `trigger_t/1` may be NEGATIVE — a presence-born
+        # trigger whose detection sat in the clip's pre-roll — and the pre-roll
+        # actually RETAINED can be shorter than the configured one the estimate
+        # adds it to (an unfilled ring, or the extractor cutting back to a
+        # keyframe). When |t| exceeds it the estimate goes before the clip's
+        # first sample, and ffmpeg's `-ss` would land nowhere useful.
+        #
+        # It bites only on that estimate: the anchored path never returns a
+        # negative, because a result before the start of the clip is
+        # `anchor_clip_ms/2`'s `:error` and falls through to here (see
+        # `anchored_seek/2` — a miss there is deliberate, not a clamp).
+        raw =
+          max(
+            anchored_seek(row, trig) || pre_window(config, row.camera_id) + trigger_t(trig),
+            0.0
+          )
 
         case probe_duration(row.path) do
           {:ok, dur} when dur > 0 -> min(raw, max(dur - 0.2, 0.0))
