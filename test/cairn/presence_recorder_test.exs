@@ -1,17 +1,24 @@
 defmodule Cairn.PresenceRecorderTest do
   # No `Cairn.DataCase`: the extractor is stubbed in every test here, so the
-  # only thing on this lane that reaches the event index is restore's orphan
-  # check — and with no sandbox connection checked out, every Repo call from
-  # this module fails. That is this suite's faithful stand-in for "the database
-  # is not answering", the condition restore has to survive because it runs
-  # inside `init/1`. The reachable-index answers are covered where an index
-  # answers, in `Cairn.PresenceRecorderRestoreTest`.
+  # only things on this lane that reach the event index are restore's orphan
+  # check and its stranded-extractor sweep — and with no sandbox connection
+  # checked out, every Repo call from this module fails. That is this suite's
+  # faithful stand-in for "the database is not answering", the condition
+  # restore has to survive because it runs inside `init/1`. The
+  # reachable-index answers are covered where an index answers, in
+  # `Cairn.PresenceRecorderRestoreTest`.
   #
   # Not async, for two reasons that are the same reason: every case here
   # subscribes to the one `"events"` topic every other presence suite
   # broadcasts on, and several assert on a lifecycle message arriving inside
   # `assert_receive`'s default window — which a loaded scheduler can miss.
   use ExUnit.Case, async: false
+
+  # Every recorder started here logs the sweep it could not run, once — the
+  # unreachable index above, working as intended. Captured rather than printed,
+  # and still shown for a test that fails; the cases that assert on a log take
+  # `capture_log/1` around their own block regardless.
+  @moduletag capture_log: true
 
   import ExUnit.CaptureLog, only: [capture_log: 1]
 
@@ -151,6 +158,10 @@ defmodule Cairn.PresenceRecorderTest do
 
   defp object(label, score, bbox \\ @box, kind \\ "detected") do
     %{label: label, score: score, bbox: bbox, track_id: nil, observation_kind: kind}
+  end
+
+  defp fire_retry(recorder) do
+    send(recorder, {:retry_open, :sys.get_state(recorder).retry_token})
   end
 
   defp fire(recorder, kind, event_id) do
@@ -470,6 +481,112 @@ defmodule Cairn.PresenceRecorderTest do
 
     assert :sys.get_state(rec).event == nil
     refute_received {:event_started, %Event{camera_id: ^id}}
+  end
+
+  # Presence gives one trigger per stay: a confirmed label never confirms again
+  # before it has cleared. So an open that fails takes the whole stay's
+  # recording with it unless the lane comes back to it — Ben, 2026-08-20: as
+  # long as a presence is there, it should keep recording.
+  test "an open that failed is retried while the presence holds", ctx do
+    id = ctx.camera_id
+    test_pid = self()
+    camera = ctx.camera
+    failing = :counters.new(1, [])
+    :counters.put(failing, 1, 1)
+
+    rec =
+      start_supervised!(
+        {PresenceRecorder,
+         camera_id: id,
+         resolve_policy: fn _camera_id -> {camera, @policy} end,
+         start_extractor: fn _camera, event ->
+           if :counters.get(failing, 1) == 1 do
+             {:error, :no_event_supervisor}
+           else
+             pid = relay(test_pid)
+             send(test_pid, {:extractor_started, event, pid})
+             {:ok, pid}
+           end
+         end,
+         finalize_extractor: fn _pid, _event -> :ok end},
+        id: :retrying_recorder
+      )
+
+    # announced after the start, so the label arrives as a transition rather
+    # than as `init/1`'s adoption
+    announce(ctx, "person")
+    started(ctx, "person", 0.9)
+
+    state = :sys.get_state(rec)
+    assert state.event == nil
+    assert state.retry_token != nil
+    refute_received {:event_started, %Event{camera_id: ^id}}
+
+    :counters.put(failing, 1, 0)
+    fire_retry(rec)
+
+    assert_receive {:extractor_started, %Event{id: eid}, _pid}
+    assert_receive {:event_started, %Event{id: ^eid, max_scores: %{"person" => 0.9}}}
+
+    state = :sys.get_state(rec)
+    assert state.event.id == eid
+    # the loop ends with the open it was owed
+    assert state.retry_token == nil
+  end
+
+  test "the retry loop ends when the presence it was owed to clears", ctx do
+    id = ctx.camera_id
+    camera = ctx.camera
+
+    rec =
+      start_supervised!(
+        {PresenceRecorder,
+         camera_id: id,
+         resolve_policy: fn _camera_id -> {camera, @policy} end,
+         start_extractor: fn _camera, _event -> {:error, :no_event_supervisor} end,
+         finalize_extractor: fn _pid, _event -> :ok end},
+        id: :retry_stop_recorder
+      )
+
+    announce(ctx, "person")
+    started(ctx, "person", 0.9)
+    stale = :sys.get_state(rec).retry_token
+    assert stale != nil
+
+    cleared(ctx, "person")
+    assert :sys.get_state(rec).retry_token == nil
+
+    # the timer message already on its way is judged against the cleared token
+    send(rec, {:retry_open, stale})
+    _ = :sys.get_state(rec)
+    refute_received {:event_started, %Event{camera_id: ^id}}
+    assert :sys.get_state(rec).event == nil
+  end
+
+  # Nothing about a pending retry outranks a camera that is going away — the
+  # latch only defers to an event already being written, and there is none.
+  test "a retire stops a recorder that is holding nothing but a retry", ctx do
+    id = ctx.camera_id
+    camera = ctx.camera
+
+    rec =
+      start_supervised!(
+        {PresenceRecorder,
+         camera_id: id,
+         resolve_policy: fn _camera_id -> {camera, @policy} end,
+         start_extractor: fn _camera, _event -> {:error, :no_event_supervisor} end,
+         finalize_extractor: fn _pid, _event -> :ok end},
+        id: :retry_retire_recorder
+      )
+
+    announce(ctx, "person")
+    started(ctx, "person", 0.9)
+    assert :sys.get_state(rec).retry_token != nil
+
+    ref = Process.monitor(rec)
+    PresenceRecorder.retire(id)
+
+    assert_receive {:DOWN, ^ref, :process, ^rec, :normal}
   end
 
   # The moduledoc's named exception to segmentation: a camera on its way out

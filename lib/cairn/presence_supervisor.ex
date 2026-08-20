@@ -31,6 +31,15 @@ defmodule Cairn.PresenceSupervisor do
   # its predecessor announced, and a recorder re-attaches to the extractor its
   # predecessor's checkpoint names, adopting from the ledger the labels that
   # checkpoint could not have known about.
+  #
+  # That empty world is not quite empty, and one thing outside this tree is why:
+  # the extractors live under `Cairn.EventSupervisor` and go on writing their
+  # clips through a crash here. A `Cairn.PresenceCheckpoint` crash therefore
+  # destroys the only record of them at the same moment it kills everyone who
+  # could finalize them. What makes the sentence above safe is the sweep in
+  # `Cairn.PresenceRecorder`'s restore: a recorder that finds no checkpoint row
+  # asks the event index and the registry whether an extractor of its camera is
+  # still writing, and ends what it finds.
   @impl true
   def init(_opts) do
     children = [

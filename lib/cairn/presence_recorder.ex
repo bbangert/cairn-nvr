@@ -51,14 +51,22 @@ defmodule Cairn.PresenceRecorder do
       (`resegment/2`), and the new clip's pre-window ring drain covers the
       boundary. The post window never reopens: it only fires with the present
       set empty, which is the scene being over.
+    * **A failed open is retried on a timer.** At tier 2 the next batch of
+      evidence opens the event a failed attempt owes; here a confirmed label
+      never confirms twice, so nothing would ever come back to it and the whole
+      stay would go unrecorded. An open that fails arms `arm_retry/1` instead,
+      and the presence clearing is what ends the loop.
 
   The checkpoint is written to `Cairn.PresenceCheckpoint` and never to
   `Cairn.EventCheckpoint` — see that module for why the keyspaces must not
   meet. `init/1` reads it back: an extractor still alive is re-attached to
-  (monitor, timers re-armed), a dead one leaves an orphan to end. The
-  `Cairn.PresenceLedger` is read there too — it is the aggregator's own
-  announced set, and the only witness to a `presence_started` this process
-  never saw because it was down when the cast went out.
+  (monitor, timers re-armed), a dead one leaves an orphan to end, and no row at
+  all is checked against the event index for an extractor still writing without
+  one — the state a `Cairn.PresenceCheckpoint` crash leaves, which nothing else
+  would ever end (`sweep_stranded/1`). The `Cairn.PresenceLedger` is read there
+  too — it is the aggregator's own announced set, and the only witness to a
+  `presence_started` this process never saw because it was down when the cast
+  went out.
   """
 
   use GenServer, restart: :transient
@@ -94,6 +102,14 @@ defmodule Cairn.PresenceRecorder do
   # a second recorder for a camera that still has one.
   @adopt_attempts 3
   @adopt_retry_ms 20
+  # How long a lane waits before trying an open again after one failed
+  # (`arm_retry/1`). Short against every window it competes with — the post
+  # window's 10 s, the cap's 300 s — so a supervisor that was mid-restart is
+  # tried again while the presence that wanted the clip is almost certainly
+  # still there, and long enough not to spin on a supervisor that is down for
+  # good. What bounds the loop is presence: the labels clearing ends it, and the
+  # aggregator guarantees every started gets a cleared.
+  @retry_open_ms 5_000
 
   @doc """
   Starts the recorder for one camera.
@@ -273,6 +289,10 @@ defmodule Cairn.PresenceRecorder do
       post_token: nil,
       max_ref: nil,
       max_token: nil,
+      # The open-retry loop's timer, armed only by a FAILED open — see
+      # `arm_retry/1`. Presence itself is what bounds it.
+      retry_ref: nil,
+      retry_token: nil,
       retiring?: false,
       # The camera's `record:` tier and event windows, re-read at every
       # qualifying transition. Injectable because the config server is the
@@ -330,7 +350,13 @@ defmodule Cairn.PresenceRecorder do
   end
 
   def handle_cast(:retire, %{event: nil} = state), do: {:stop, :normal, state}
-  def handle_cast(:retire, state), do: {:noreply, %{state | retiring?: true}}
+
+  # Latched rather than stopped, because an event is open. The `cancel_retry/1`
+  # is belt and braces: a retry is armed only with no event open, so nothing can
+  # be pending in this clause today, and one nil check keeps that from becoming
+  # a leak if a later path arms one.
+  def handle_cast(:retire, state),
+    do: {:noreply, cancel_retry(%{state | retiring?: true})}
 
   # The camera came back — see `ensure/1`. A recorder that stopped on its latch
   # is replaced there instead; this is only for the one that could not, because
@@ -358,6 +384,15 @@ defmodule Cairn.PresenceRecorder do
       {:noreply, state}
     end
   end
+
+  # The token pattern the windows use, for its reason: a retry already in the
+  # mailbox when a transition opened the event (and cancelled the loop) is
+  # judged against a cleared token and dropped.
+  def handle_info({:retry_open, token}, %{retry_token: token} = state) do
+    {:noreply, retry_open(%{state | retry_ref: nil, retry_token: nil})}
+  end
+
+  def handle_info({:retry_open, _stale}, state), do: {:noreply, state}
 
   # An exit while the event is open ends it `:partial`, whatever the reason —
   # `:normal` and `:noproc` included. `Cairn.CameraTracker` reads those two as
@@ -474,6 +509,10 @@ defmodule Cairn.PresenceRecorder do
         present_scores: Map.delete(state.present_scores, label)
     }
 
+    # The retry loop runs only while a present label is owed a clip, so the
+    # last one leaving is what ends it — the bound `arm_retry/1` relies on.
+    state = if MapSet.size(present) == 0, do: cancel_retry(state), else: state
+
     cond do
       state.event == nil -> state
       # The last qualifying label left: the only thing that starts the close
@@ -508,6 +547,7 @@ defmodule Cairn.PresenceRecorder do
         PresenceCheckpoint.put(state.camera_id, event, MapSet.to_list(state.present_labels), pid)
         Event.broadcast(:event_started, event)
         {max_ref, max_token} = schedule(:max_event, event.id, state.policy.max)
+        state = cancel_retry(state)
 
         replay_pending(%{
           state
@@ -523,7 +563,7 @@ defmodule Cairn.PresenceRecorder do
 
       {:error, reason} ->
         Logger.error("camera #{state.camera_id}: could not start extractor: #{inspect(reason)}")
-        state
+        arm_retry(state)
     end
   end
 
@@ -753,11 +793,7 @@ defmodule Cairn.PresenceRecorder do
     # since narrowed nor a raised floor should be found out about one whole
     # clip late.
     state = resolve_policy(state)
-
-    seeds =
-      state.present_scores
-      |> Map.take(announced_labels(state))
-      |> Enum.filter(fn {label, score} -> earns_video?(state, label, score) end)
+    seeds = open_seeds(state)
 
     if seeds != [] and recording_enabled?(state) do
       Logger.info("camera #{state.camera_id}: presence holds past the cap — segmenting")
@@ -770,6 +806,66 @@ defmodule Cairn.PresenceRecorder do
   end
 
   defp resegment(state, _cause), do: state
+
+  # What an open that is not driven by a transition may open with: the labels
+  # this process holds as present, minus the ones the aggregator no longer
+  # announces, minus the ones the gate no longer admits. Shared by the cap's
+  # segmentation and the retry loop, which owe the same answer.
+  defp open_seeds(state) do
+    state.present_scores
+    |> Map.take(announced_labels(state))
+    |> Enum.filter(fn {label, score} -> earns_video?(state, label, score) end)
+  end
+
+  # An open that failed while the scene is still there. Presence gives no second
+  # trigger — a confirmed label stays confirmed and never confirms again — so
+  # without this a camera whose extractor could not start records nothing for
+  # the whole stay, however long the person stands in front of it.
+  #
+  # Nothing arms this but a failure, and the retry re-runs every gate, so the
+  # loop ends the moment there is an event, no presence, or no permission to
+  # record.
+  defp arm_retry(%{retiring?: true} = state), do: state
+
+  defp arm_retry(state) do
+    if MapSet.size(state.present_labels) == 0 do
+      state
+    else
+      state = cancel_retry(state)
+      token = make_ref()
+      ref = Process.send_after(self(), {:retry_open, token}, @retry_open_ms)
+      %{state | retry_ref: ref, retry_token: token}
+    end
+  end
+
+  defp cancel_retry(%{retry_ref: nil} = state), do: state
+
+  defp cancel_retry(state) do
+    Process.cancel_timer(state.retry_ref)
+    %{state | retry_ref: nil, retry_token: nil}
+  end
+
+  # The retry itself, through the same gates a segmentation boundary passes:
+  # the camera may have been retired, something may have opened an event in the
+  # meantime, recording may have been switched off, the policy may have
+  # narrowed, and the presence that wanted the clip may have ended. A failure
+  # here arms the next one from `start_event/3`; anything else lets the loop
+  # stop.
+  defp retry_open(%{retiring?: true} = state), do: state
+  defp retry_open(%{event: %Event{}} = state), do: state
+
+  defp retry_open(state) do
+    state = resolve_policy(state)
+
+    with true <- recording_enabled?(state),
+         [_ | _] = seeds <- open_seeds(state) do
+      Logger.info("camera #{state.camera_id}: retrying the open a failed one owes")
+      # Dated now, `adopt_announced/1`'s reason: the clip can only begin here.
+      start_event(state, now(), seeds)
+    else
+      _no_reason_to_open -> state
+    end
+  end
 
   defp clear_event(state) do
     if state.post_ref, do: Process.cancel_timer(state.post_ref)
@@ -863,7 +959,7 @@ defmodule Cairn.PresenceRecorder do
   defp restore_checkpoint(state) do
     case PresenceCheckpoint.get(state.camera_id) do
       nil ->
-        state
+        sweep_stranded(state)
 
       {event, labels, extractor} ->
         if is_pid(extractor) and Process.alive?(extractor) do
@@ -928,6 +1024,89 @@ defmodule Cairn.PresenceRecorder do
   # still in front of the camera, which cancels the post window this arms.
   defp still_announced(state, labels) do
     MapSet.intersection(MapSet.new(labels), MapSet.new(announced_labels(state)))
+  end
+
+  # No checkpoint row is the ordinary case — a camera with nothing open — and
+  # one supervision accident makes it a lie. `Cairn.PresenceSupervisor` is
+  # `:rest_for_one` with the tables ahead of the pool, so a
+  # `Cairn.PresenceCheckpoint` crash takes the ledger, the aggregators and the
+  # recorders with it, while the extractors, which live under
+  # `Cairn.EventSupervisor`, keep writing: both witnesses to their events are
+  # gone at once. Nothing else would ever end them — an extractor has no cap of
+  # its own — and the camera's next confirm would open a SECOND one beside each.
+  # What is left to find them by is the `:active` index row the extractor wrote
+  # and its own registration under `{:extractor, event_id}`.
+  #
+  # Ended, not adopted: with no checkpoint there are no labels, no scores and no
+  # trigger to carry on with, so adopting would mean guessing what the clip is
+  # of. `:partial` is what such an event honestly is, and a presence that is
+  # still there opens a fresh one through `adopt_announced/1` two lines later —
+  # the coverage that actually matters. Rows whose extractor is gone are left
+  # alone: boot reconciliation owns those.
+  defp sweep_stranded(state) do
+    state.camera_id
+    |> active_rows()
+    |> Enum.each(fn row ->
+      case Cairn.Registry.whereis(state.camera_id, {:extractor, row.id}) do
+        nil -> :ok
+        extractor -> end_stranded(state, row, extractor)
+      end
+    end)
+
+    state
+  end
+
+  defp end_stranded(state, row, extractor) do
+    Logger.warning(
+      "event #{row.id} (#{state.camera_id}): extractor still writing with no checkpoint " <>
+        "to restore from — ending it partial"
+    )
+
+    # Rebuilt from the row rather than emptied: the extractor writes what it is
+    # handed back over the row when it finalizes (`Cairn.Events.finalize/2`),
+    # so an event with no labels would erase the ones the clip actually earned.
+    labels = row.labels || %{}
+
+    event = %Event{
+      id: row.id,
+      camera_id: row.camera_id,
+      started_at: row.started_at,
+      ended_at: now(),
+      status: :partial,
+      labels: Map.get(labels, "entries", []),
+      max_scores: Map.get(labels, "max_scores", %{}),
+      max_score: row.max_score,
+      trigger: Map.get(labels, "trigger"),
+      path: row.path
+    }
+
+    # `maybe_finalize/3`'s ordering, for its reason: the window is announced
+    # closed before the clip is told to land, and the cast carries every box
+    # already sent ahead of it.
+    Event.broadcast(:event_ended, event)
+    state.finalize_extractor.(extractor, event)
+  end
+
+  # `indexed_status/1`'s guards around the sweep's own read: an index that will
+  # not answer costs the sweep, not the camera's lane, and the stranded clip is
+  # then boot reconciliation's problem — where it was before this existed.
+  defp active_rows(camera_id) do
+    Events.active_for_camera(camera_id)
+  rescue
+    e in [DBConnection.ConnectionError, DBConnection.OwnershipError, Exqlite.Error] ->
+      log_sweep_skipped(camera_id, Exception.message(e))
+      []
+  catch
+    :exit, reason ->
+      log_sweep_skipped(camera_id, inspect(reason))
+      []
+  end
+
+  defp log_sweep_skipped(camera_id, reason) do
+    Logger.warning(
+      "camera #{camera_id}: could not consult the event index for stranded " <>
+        "extractors (#{reason}); skipping the sweep"
+    )
   end
 
   # Extractor gone: `Cairn.CameraTracker.end_orphan/2`'s semantics. The index

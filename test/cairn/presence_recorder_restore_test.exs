@@ -120,6 +120,42 @@ defmodule Cairn.PresenceRecorderRestoreTest do
   # The ledger row the aggregator writes before a `presence_started` goes out.
   # Restore intersects the checkpoint's labels with these, so a test restoring a
   # present label has to leave the trace the aggregator would have.
+  # An extractor that outlived every witness to its event: registered exactly
+  # where `Cairn.EventExtractor` registers itself, which is all the sweep has to
+  # find it by.
+  defp registered_relay(camera_id, event_id, test_pid) do
+    spawn(fn ->
+      {:ok, _} = Cairn.Registry.register(camera_id, {:extractor, event_id})
+      Process.monitor(test_pid)
+      relay_loop(test_pid)
+    end)
+  end
+
+  defp await_extractor(camera_id, event_id, attempts \\ 100) do
+    case Registry.whereis(camera_id, {:extractor, event_id}) do
+      pid when is_pid(pid) ->
+        pid
+
+      _absent when attempts > 0 ->
+        Process.sleep(10) && await_extractor(camera_id, event_id, attempts - 1)
+
+      _absent ->
+        flunk("the stand-in extractor never registered")
+    end
+  end
+
+  # The sweep's two messages arrive by different routes — one over the events
+  # topic, one straight from the finalize seam — so they are taken in mailbox
+  # order to assert the order itself, not merely that both came.
+  defp next_sweep_message(timeout \\ 2_000) do
+    receive do
+      {:event_ended, %Event{}} = message -> message
+      {:extractor_finalized, _pid, _event} = message -> message
+    after
+      timeout -> flunk("the sweep said nothing within #{timeout}ms")
+    end
+  end
+
   defp announce(ctx, label, score \\ 0.9) do
     PresenceLedger.announced(ctx.camera_id, label, DateTime.utc_now(), score)
   end
@@ -325,6 +361,57 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
     assert_receive {:extractor_finalized, ^extractor, %Event{id: ^eid}}
     refute_received {:event_ended, %Event{camera_id: ^id}}
+  end
+
+  # `Cairn.PresenceSupervisor` is `:rest_for_one` with the tables ahead of the
+  # pool, so a checkpoint-table crash takes the ledger, the aggregators and the
+  # recorders with it while the extractors — app-level siblings under
+  # `Cairn.EventSupervisor` — keep writing. Both witnesses to the event are gone
+  # at once, nothing else would ever end it (an extractor has no cap of its
+  # own), and the camera's next confirm would open a second one beside it.
+  test "an extractor still writing with no checkpoint is ended partial, then replaced", ctx do
+    id = ctx.camera_id
+    event = event(ctx)
+    eid = event.id
+    {:ok, _row} = Events.create_active(event, "/tmp/#{eid}.mp4")
+    stranded = registered_relay(id, eid, self())
+    assert await_extractor(id, eid) == stranded
+    assert PresenceCheckpoint.get(id) == nil
+
+    rec = recorder(ctx)
+
+    # ended before finalized, `maybe_finalize/3`'s ordering — and the labels the
+    # row earned ride back with it, since the extractor writes what it is handed
+    assert [
+             {:event_ended, %Event{id: ^eid, status: :partial, max_scores: %{"person" => 0.9}}},
+             {:extractor_finalized, ^stranded, %Event{id: ^eid}}
+           ] = [next_sweep_message(), next_sweep_message()]
+
+    # not adopted: with no checkpoint there is nothing to carry on with
+    assert :sys.get_state(rec).event == nil
+
+    # and the presence that is still there gets its own clip — one, not one
+    # beside an orphan that never ends
+    started(ctx)
+    assert_receive {:extractor_started, %Event{id: fresh}, _pid}
+    assert_receive {:event_started, %Event{id: ^fresh}}
+    assert fresh != eid
+    refute_received {:event_started, %Event{camera_id: ^id}}
+  end
+
+  test "an active row whose extractor is gone is left to boot reconciliation", ctx do
+    id = ctx.camera_id
+    event = event(ctx)
+    eid = event.id
+    {:ok, _row} = Events.create_active(event, "/tmp/#{eid}.mp4")
+
+    rec = recorder(ctx)
+
+    _ = :sys.get_state(rec)
+    refute_received {:event_ended, %Event{id: ^eid}}
+    refute_received {:extractor_finalized, _pid, _event}
+    assert Events.get(eid).status == :active
+    assert Registry.whereis(id, {:extractor, eid}) == nil
   end
 
   # -- the ledger read --------------------------------------------------------

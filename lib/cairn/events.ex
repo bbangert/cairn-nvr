@@ -145,6 +145,21 @@ defmodule Cairn.Events do
   @spec all() :: [Event.t()]
   def all, do: Repo.all(Event)
 
+  @doc """
+  One camera's rows still marked `active`.
+
+  For a lane owner asking, at its own start, what it may have left behind: a
+  row is `active` only between the extractor's `create_active/2` and its
+  finalize, so these are events nothing has closed — the boot-wide version of
+  the question `Cairn.Reconciler` answers for every camera at once.
+  """
+  @spec active_for_camera(String.t()) :: [Event.t()]
+  def active_for_camera(camera_id) do
+    Event
+    |> where([e], e.camera_id == ^camera_id and e.status == :active)
+    |> Repo.all()
+  end
+
   @doc "Finished (non-active) events, oldest first — emergency cleanup order."
   @spec oldest_for_cleanup(pos_integer()) :: [Event.t()]
   def oldest_for_cleanup(count) do
