@@ -163,6 +163,59 @@ defmodule CairnWeb.EventsLiveTest do
     assert html =~ "events-#{List.last(evs).id}"
   end
 
+  test "an event the cap evicted does not come back, or count twice, when it ends",
+       %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/events")
+
+    evicted = insert_active("cam_a", ["person"])
+    Cairn.Event.broadcast(:event_started, evicted)
+    assert render(view) =~ "events-#{evicted.id}"
+
+    # a full page of newer events pushes it off the bottom of the window
+    newer = for _ <- 1..25, do: insert_active("cam_a", ["person"])
+    for ev <- newer, do: Cairn.Event.broadcast(:event_started, ev)
+
+    html = render(view)
+    refute html =~ "events-#{evicted.id}"
+    assert html =~ "26 events"
+
+    # by id alone this close is indistinguishable from an insert that was missed
+    # — prepending it would put a stale row above 25 newer ones and count it again
+    Cairn.Event.broadcast(:event_ended, %{
+      evicted
+      | status: :finalized,
+        ended_at: DateTime.utc_now()
+    })
+
+    html = render(view)
+    refute html =~ "events-#{evicted.id}"
+    assert html =~ "26 events"
+    refute html =~ "27 events"
+  end
+
+  test "a live insert is filtered on the persisted row, not on the broadcast", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/events?label=car")
+
+    # the row `create_active` wrote carries the label the event opened with
+    ev = insert_active("cam_a", ["person"])
+
+    # ... and the broadcast has since grown one the row will not carry until the
+    # close rewrites its labels
+    grown = %{ev | max_scores: %{"person" => 0.8, "car" => 0.7}}
+    Cairn.Event.broadcast(:event_updated, grown)
+
+    refute render(view) =~ "events-#{ev.id}"
+
+    # once the close persists it, the row satisfies the filter it is streamed
+    # under — which is what a reload of this page would show
+    {:ok, _} =
+      Events.finalize(%{grown | status: :finalized, ended_at: DateTime.utc_now()}, 100)
+
+    Cairn.Event.broadcast(:event_ended, grown)
+
+    assert render(view) =~ "events-#{ev.id}"
+  end
+
   test "lists events and filters by camera", %{conn: conn} do
     a = seed("cam_a", 10, ["person"])
     b = seed("cam_b", 5, ["car"])

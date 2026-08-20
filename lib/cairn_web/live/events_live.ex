@@ -61,10 +61,12 @@ defmodule CairnWeb.EventsLive do
        showing_from: (result.page - 1) * @page_size + 1,
        showing_to: (result.page - 1) * @page_size + length(result.events),
        has_next: result.page * @page_size < result.total,
-       # ids currently in the stream, capped like it (@page_size) and ordered
-       # newest-first — mirrors what's actually in the DOM so live updates never
-       # act on a row the :limit already evicted
-       visible: Enum.map(result.events, & &1.id)
+       # `{id, started_at}` for each row currently in the stream, capped like it
+       # (@page_size) and ordered newest-first — mirrors what's actually in the
+       # DOM so live updates never act on a row the :limit already evicted. The
+       # timestamps are what let a live insert tell "this row belongs on page 1"
+       # from "this row fell off the bottom", which look identical by id alone.
+       visible: Enum.map(result.events, &{&1.id, &1.started_at})
      )
      |> stream(:events, result.events, reset: true, limit: @page_size)}
   end
@@ -98,7 +100,7 @@ defmodule CairnWeb.EventsLive do
     socket = live_upsert(socket, ev)
     # the snapshot is written async just after finalize with no broadcast of
     # its own; pull the row once more shortly so the thumbnail fills in
-    if ev.id in socket.assigns.visible do
+    if visible?(socket, ev.id) do
       Process.send_after(self(), {:refresh_row, ev.id}, 1_500)
     end
 
@@ -111,25 +113,28 @@ defmodule CairnWeb.EventsLive do
 
   def handle_info(_msg, socket), do: {:noreply, socket}
 
-  # New event: prepend only on the latest view (page 1, no conflicting filter),
-  # so browsing an older page or a filtered slice stays put.
+  # New event: prepend only on the latest view (page 1), so browsing an older
+  # page stays put. The row is fetched before anything is decided about it —
+  # every later judgement is made on the persisted row, because that is the row
+  # that would be streamed.
   defp live_insert(socket, ev) do
-    if socket.assigns.page == 1 and ev.id not in socket.assigns.visible and
-         matches?(socket.assigns.filters, ev) do
-      case Events.get(ev.id) do
-        nil ->
-          socket
+    if socket.assigns.page == 1 and not visible?(socket, ev.id),
+      do: insert_row(socket, Events.get(ev.id)),
+      else: socket
+  end
 
-        row ->
-          # cap the stream so a busy camera can't grow the DOM without bound;
-          # at: 0 with a positive limit keeps the newest @page_size rows, and
-          # `visible` is pruned the same way so it never goes stale
-          socket
-          |> stream_insert(:events, row, at: 0, limit: @page_size)
-          |> update(:visible, &Enum.take([ev.id | &1], @page_size))
-          |> update(:total, &(&1 + 1))
-          |> update(:showing_to, &min(&1 + 1, @page_size))
-      end
+  defp insert_row(socket, nil), do: socket
+
+  defp insert_row(socket, row) do
+    if matches?(socket.assigns.filters, row) and belongs_on_page?(socket, row) do
+      # cap the stream so a busy camera can't grow the DOM without bound;
+      # at: 0 with a positive limit keeps the newest @page_size rows, and
+      # `visible` is pruned the same way so it never goes stale
+      socket
+      |> stream_insert(:events, row, at: 0, limit: @page_size)
+      |> update(:visible, &Enum.take([{row.id, row.started_at} | &1], @page_size))
+      |> update(:total, &(&1 + 1))
+      |> update(:showing_to, &min(&1 + 1, @page_size))
     else
       socket
     end
@@ -143,17 +148,17 @@ defmodule CairnWeb.EventsLive do
   # because every later broadcast is gated on `visible`, which the missed insert
   # never added it to.
   defp live_upsert(socket, ev) do
-    if ev.id in socket.assigns.visible,
+    if visible?(socket, ev.id),
       do: live_update(socket, ev),
       else: live_insert(socket, ev)
   end
 
   # Status/snapshot change on an already-visible row: update in place by dom id.
-  # `{:refresh_row, _}` stays on this path deliberately — its synthetic struct
-  # carries no camera or labels to match filters against, and a row the cap has
-  # since evicted must not come back at the top of the list.
+  # `{:refresh_row, _}` stays on this path rather than `live_upsert/2` — it is
+  # scheduled for a row that was on the page, so an id the cap has evicted in
+  # the meantime has nothing left here to refresh.
   defp live_update(socket, ev) do
-    if ev.id in socket.assigns.visible do
+    if visible?(socket, ev.id) do
       case Events.get(ev.id) do
         nil -> socket
         row -> stream_insert(socket, :events, row)
@@ -163,10 +168,45 @@ defmodule CairnWeb.EventsLive do
     end
   end
 
-  defp matches?(filters, ev) do
-    camera_ok = blank?(filters.camera) or ev.camera_id == filters.camera
-    label_ok = blank?(filters.label) or Map.has_key?(ev.max_scores || %{}, filters.label)
-    camera_ok and label_ok and within_dates?(filters, ev.started_at)
+  defp visible?(socket, id), do: List.keymember?(socket.assigns.visible, id, 0)
+
+  # Absence from `visible` has two causes that must not be treated alike: a row
+  # this page never inserted (its `:event_started` outran the DB write), and one
+  # it inserted and the cap has since evicted. Inserting the second prepends a
+  # stale row above genuinely newer ones and counts it into `total` a second
+  # time, which is the trap `{:refresh_row, _}` avoids by never taking this path.
+  #
+  # The question that separates them is the one `handle_params` answers with a
+  # query: does this row fall inside the newest-@page_size window the page is
+  # showing? A window with room takes anything; a full one takes only rows at or
+  # newer than its oldest, and an evicted row is by construction older than the
+  # row that displaced it.
+  defp belongs_on_page?(socket, row) do
+    case socket.assigns.visible do
+      window when length(window) < @page_size ->
+        true
+
+      window ->
+        {_id, oldest} = List.last(window)
+        DateTime.compare(row.started_at, oldest) != :lt
+    end
+  end
+
+  # Judged on the persisted row, never on the broadcast: the row is what gets
+  # streamed, and the two disagree while an event is open — `create_active/2`
+  # writes the labels the event opened with and only the close rewrites them, so
+  # a broadcast can carry a label the row does not have yet. Matching the
+  # broadcast streamed rows that a reload then removed. The cost is that a label
+  # an open event grows does not surface it on that label's filter until the
+  # close persists it, which is exactly what a reload shows.
+  defp matches?(filters, %Events.Event{} = row) do
+    camera_ok = blank?(filters.camera) or row.camera_id == filters.camera
+
+    label_ok =
+      blank?(filters.label) or
+        Map.has_key?(Map.get(row.labels || %{}, "max_scores", %{}), filters.label)
+
+    camera_ok and label_ok and within_dates?(filters, row.started_at)
   end
 
   defp within_dates?(filters, %DateTime{} = at) do
