@@ -211,6 +211,19 @@ defmodule CairnWeb.DashboardLive do
   # fails falls back to it on its own (`transport_failed`).
   defp transport(transports, camera_id), do: Map.get(transports, camera_id, :webrtc)
 
+  # Two conditions, and the second is a scope boundary rather than taste.
+  # v1 draws each box the moment it is broadcast, with no frame time attached
+  # to it, so the overlay is only honest over a transport sitting at the live
+  # edge. MSE deliberately plays `TARGET_LATENCY_S` (~3 s) back to avoid
+  # stall-and-burst, and native HLS further still — over either, the boxes
+  # would visibly lead the picture they claim to describe. The player hooks
+  # report activity on both transports anyway: the reports are cheap, and
+  # this gate composes with them rather than replacing them, so the day a box
+  # carries its frame time this condition is all that has to go.
+  defp overlay?(active, transports, camera_id) do
+    MapSet.member?(active, camera_id) and transport(transports, camera_id) == :webrtc
+  end
+
   # Hardwired: `Bbox.styles/0` enumerates all five for the config key that
   # would render a picker from it, and until that key exists there is no
   # operator surface to choose with.
@@ -418,9 +431,17 @@ defmodule CairnWeb.DashboardLive do
               <%!-- Server-rendered, per lawik: the boxes are LiveView diffs
               over the video, not a canvas a hook draws into. `TrackOverlay`
               stays the mechanism for PLAYBACK, where a box has to be found
-              for the frame the operator seeked to. --%>
+              for the frame the operator seeked to.
+
+              Assumes the frame fills this wrapper: percentages are resolved
+              against the 16:9 tile, while the <video> is `object-fit: cover`.
+              A feed that is not 16:9 is therefore cropped and scaled by the
+              browser and its boxes are offset by however much. Fixing it
+              needs the displayed frame's real geometry — a hook reporting
+              videoWidth/videoHeight so this wrapper can be sized to the
+              picture rather than the tile. --%>
               <div
-                :if={MapSet.member?(@active, cam.id)}
+                :if={overlay?(@active, @transports, cam.id)}
                 id={"camera-overlay-#{cam.id}"}
                 style="position: absolute; inset: 0; pointer-events: none;"
               >
@@ -434,7 +455,7 @@ defmodule CairnWeb.DashboardLive do
                 />
               </div>
               <div
-                :if={MapSet.member?(@active, cam.id)}
+                :if={overlay?(@active, @transports, cam.id)}
                 id={"camera-detections-#{cam.id}"}
                 class="cairn-detection-summary tnum"
               >

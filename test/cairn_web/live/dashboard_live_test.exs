@@ -288,6 +288,49 @@ defmodule CairnWeb.DashboardLiveTest do
       assert html =~ "no detections"
     end
 
+    # v1 attaches no frame time to a box, so it can only be drawn over a
+    # transport at the live edge. MSE sits ~3s back by design and the boxes
+    # would lead the picture.
+    test "boxes do not draw over MSE, whatever the player has reported", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      view = activate(view, "cam_a")
+
+      assert publish(view, "cam_a", [detection("person", 0.9, [0.1, 0.1, 0.2, 0.2])]) =~
+               "bbox-corners"
+
+      # the player is still active and the detections are still assigned —
+      # the transport alone takes the overlay and its summary down
+      html = render_hook(view, "transport_failed", %{"camera_id" => "cam_a"})
+      refute html =~ "camera-overlay-cam_a"
+      refute html =~ "bbox-corners"
+      refute html =~ "camera-detections-cam_a"
+
+      # …and the gate composes with the player one rather than replacing it:
+      # back on WebRTC, the still-active player's boxes return
+      html =
+        view
+        |> element(~s(#camera-transport-cam_a button[phx-value-transport="webrtc"]))
+        |> render_click()
+
+      assert html =~ "camera-overlay-cam_a"
+      assert html =~ "person · 0.90"
+    end
+
+    test "a manual switch to MSE takes the overlay down too", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      view = activate(view, "cam_a")
+      publish(view, "cam_a", [detection("car", 0.8, [0.2, 0.2, 0.2, 0.2])])
+
+      html =
+        view
+        |> element(~s(#camera-transport-cam_a button[phx-value-transport="mse"]))
+        |> render_click()
+
+      refute html =~ "camera-overlay-cam_a"
+      # the other camera is untouched — the gate is per camera, not per page
+      assert html =~ "camera-video-cam_b-webrtc"
+    end
+
     test "one camera's detections never land on another's tile", %{conn: conn} do
       {:ok, view, _html} = live(conn, "/")
       view = view |> activate("cam_a") |> activate("cam_b")

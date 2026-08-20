@@ -34,7 +34,14 @@ const WebrtcPlayer = {
   mounted() {
     this.cameraId = this.el.dataset.cameraId
     watchFirstFrame(this, this.el)
-    this.start()
+    // start() is async, so its rejection is the caller's to route — and the
+    // window before its own try/catch is the dangerous one: constructing the
+    // RTCPeerConnection and adding the transceiver happen there, and those
+    // are exactly what a browser with WebRTC absent or disabled by policy
+    // throws on. Unrouted, that is a blank tile on the DEFAULT transport
+    // with no fallback. Third of a family (see setRemoteDescription's
+    // `.catch` below): every async result here has to reach fail().
+    this.start().catch(() => this.fail())
   },
 
   // The media survives a LiveView remount untouched — this is a WebRTC peer
