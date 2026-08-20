@@ -3,7 +3,10 @@
 // `webrtc_active` / `webrtc_inactive` gate the server-rendered detection
 // overlay: it draws only while a player says it has a frame on screen. The
 // names are lawik's ex_nvr (`good-grid`), where only WebRTC reported; here
-// both transports do, so the overlay works over either.
+// both transports report, but activity alone is not permission to draw —
+// DashboardLive.overlay?/3 also requires the :webrtc transport, because
+// timestamp-less boxes lead MSE's deliberately delayed playback. MSE's
+// reports exist so the gates compose the day a box carries its frame time.
 //
 // Reports are edge-triggered: `loadeddata` fires again after every source
 // reset (an MSE rejoin is several a minute on a flaky camera), and a repeat

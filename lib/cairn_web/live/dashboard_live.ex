@@ -100,25 +100,37 @@ defmodule CairnWeb.DashboardLive do
 
   @impl true
   def handle_event("toggle-transport", %{"camera" => camera_id} = params, socket) do
-    {:noreply,
-     update(socket, :transports, fn transports ->
-       case params["transport"] do
-         "mse" ->
-           Map.put(transports, camera_id, :mse)
+    before = transport(socket.assigns.transports, camera_id)
 
-         "webrtc" ->
-           Map.put(transports, camera_id, :webrtc)
+    socket =
+      update(socket, :transports, fn transports ->
+        case params["transport"] do
+          "mse" ->
+            Map.put(transports, camera_id, :mse)
 
-         # No transport named: flip. The `Map.update/4` default has to be the
-         # opposite of `transport/2`'s, or the first bare toggle on an
-         # untouched camera is a no-op.
-         _ ->
-           Map.update(transports, camera_id, :mse, fn
-             :mse -> :webrtc
-             :webrtc -> :mse
-           end)
-       end
-     end)}
+          "webrtc" ->
+            Map.put(transports, camera_id, :webrtc)
+
+          # No transport named: flip. The `Map.update/4` default has to be the
+          # opposite of `transport/2`'s, or the first bare toggle on an
+          # untouched camera is a no-op.
+          _ ->
+            Map.update(transports, camera_id, :mse, fn
+              :mse -> :webrtc
+              :webrtc -> :mse
+            end)
+        end
+      end)
+
+    # A REAL switch starts a new player, but the old one's activity report is
+    # still in `@active` — the fresh <video> would draw the old detections
+    # before its first frame. Only a change clears; re-clicking the selected
+    # transport must not blank a healthy overlay.
+    if transport(socket.assigns.transports, camera_id) != before do
+      {:noreply, deactivate(socket, camera_id)}
+    else
+      {:noreply, socket}
+    end
   end
 
   # The player hooks' three reports, all keyed by a camera this socket is
@@ -150,15 +162,21 @@ defmodule CairnWeb.DashboardLive do
   end
 
   defp apply_player_report(socket, "webrtc_inactive", camera_id) do
-    socket
-    |> update(:active, &MapSet.delete(&1, camera_id))
-    # The boxes go with the frame they described: a player that comes back
-    # would otherwise re-reveal whatever was on screen when it died.
-    |> update(:detections, &Map.delete(&1, camera_id))
+    deactivate(socket, camera_id)
   end
 
   defp apply_player_report(socket, "transport_failed", camera_id) do
     update(socket, :transports, &Map.put(&1, camera_id, :mse))
+  end
+
+  # The boxes go with the frame they described: a player that comes back
+  # would otherwise re-reveal whatever was on screen when it died. Shared by
+  # the player's own inactive report and a transport switch, which starts a
+  # new player the old report must not vouch for.
+  defp deactivate(socket, camera_id) do
+    socket
+    |> update(:active, &MapSet.delete(&1, camera_id))
+    |> update(:detections, &Map.delete(&1, camera_id))
   end
 
   defp known_camera?(socket, camera_id) do

@@ -306,12 +306,17 @@ defmodule CairnWeb.DashboardLiveTest do
       refute html =~ "camera-detections-cam_a"
 
       # …and the gate composes with the player one rather than replacing it:
-      # back on WebRTC, the still-active player's boxes return
+      # toggling back is a real switch, so the stale activity is cleared and
+      # the overlay waits for the NEW player's report and a fresh frame
       html =
         view
         |> element(~s(#camera-transport-cam_a button[phx-value-transport="webrtc"]))
         |> render_click()
 
+      refute html =~ "camera-overlay-cam_a"
+
+      view = activate(view, "cam_a")
+      html = publish(view, "cam_a", [detection("person", 0.9, [0.1, 0.1, 0.2, 0.2])])
       assert html =~ "camera-overlay-cam_a"
       assert html =~ "person · 0.90"
     end
@@ -329,6 +334,39 @@ defmodule CairnWeb.DashboardLiveTest do
       refute html =~ "camera-overlay-cam_a"
       # the other camera is untouched — the gate is per camera, not per page
       assert html =~ "camera-video-cam_b-webrtc"
+    end
+
+    # A REAL switch starts a new player the old activity report must not vouch
+    # for — the fresh <video> would draw the old boxes before its first frame.
+    # Re-clicking the selected transport is not a switch and must not blank a
+    # healthy overlay.
+    test "a transport switch clears activity; a re-click does not", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      view = activate(view, "cam_a")
+      publish(view, "cam_a", [detection("person", 0.9, [0.1, 0.1, 0.2, 0.2])])
+
+      # re-click the already-selected transport: overlay untouched
+      html =
+        view
+        |> element(~s(#camera-transport-cam_a button[phx-value-transport="webrtc"]))
+        |> render_click()
+
+      assert html =~ "camera-overlay-cam_a"
+
+      # a real switch away and back: the stale activity is gone, so nothing
+      # draws until the NEW player reports — then boxes need a fresh publish
+      view
+      |> element(~s(#camera-transport-cam_a button[phx-value-transport="mse"]))
+      |> render_click()
+
+      html =
+        view
+        |> element(~s(#camera-transport-cam_a button[phx-value-transport="webrtc"]))
+        |> render_click()
+
+      refute html =~ "camera-overlay-cam_a"
+      html = view |> activate("cam_a") |> render()
+      refute html =~ "person"
     end
 
     test "one camera's detections never land on another's tile", %{conn: conn} do
