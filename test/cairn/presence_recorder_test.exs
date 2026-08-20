@@ -43,25 +43,34 @@ defmodule Cairn.PresenceRecorderTest do
   # A recorder registered under the camera's real via-tuple — so the public
   # API, the aggregator and the sink all reach *this* one — with the extractor
   # stubbed out. `policy` overrides ride on top of `@policy`.
-  defp recorder(ctx, overrides \\ %{}, id \\ :recorder) do
+  defp recorder(ctx, overrides \\ %{}, id \\ :recorder, extra \\ []) do
     test_pid = self()
     camera = ctx.camera
     policy = Map.merge(@policy, overrides)
 
     start_supervised!(
       {PresenceRecorder,
-       camera_id: ctx.camera_id,
-       resolve_policy: fn _camera_id -> {camera, policy} end,
-       start_extractor: fn _camera, event ->
-         pid = relay(test_pid)
-         send(test_pid, {:extractor_started, event, pid})
-         {:ok, pid}
-       end,
-       finalize_extractor: fn pid, event ->
-         send(test_pid, {:extractor_finalized, pid, event})
-       end},
+       [
+         camera_id: ctx.camera_id,
+         resolve_policy: fn _camera_id -> {camera, policy} end,
+         start_extractor: fn _camera, event ->
+           pid = relay(test_pid)
+           send(test_pid, {:extractor_started, event, pid})
+           {:ok, pid}
+         end,
+         finalize_extractor: fn pid, event ->
+           send(test_pid, {:extractor_finalized, pid, event})
+         end
+       ] ++ extra},
       id: id
     )
+  end
+
+  # A clock the test moves by hand, for the seams that measure an age. Shared
+  # by every reader in the recorder, which is what a monotonic clock is.
+  defp fake_clock do
+    counter = :counters.new(1, [])
+    {counter, fn -> :counters.get(counter, 1) end}
   end
 
   # Stands in for `Cairn.EventExtractor`: stays alive and hands every cast it
@@ -477,6 +486,48 @@ defmodule Cairn.PresenceRecorderTest do
     refute_received {:extractor_cast, _}
   end
 
+  # The batch that confirms presence reaches the recorder BEFORE the transition
+  # it causes: the sink casts the frames here and the same batch's `observed`
+  # to the aggregator, which only then confirms. Discarding it would leave an
+  # event opened behind a closing motion gate with no trigger box and no
+  # sidecar until motion resumed.
+  test "the batch held while idle is replayed into the event it opens", ctx do
+    rec = recorder(ctx)
+
+    frames(ctx, [object("person", 0.95)])
+    refute_received {:extractor_cast, _}
+
+    started(ctx)
+    assert_receive {:extractor_started, %Event{id: _eid}, _pid}
+
+    # No frames call followed the open: these boxes are the retained batch's.
+    assert_receive {:extractor_cast,
+                    {:track_boxes, %{boxes: [{"person", "person", @box, false}]}}}
+
+    state = :sys.get_state(rec)
+    assert %{label: "person", score: 0.95, bbox: @box} = state.event.trigger
+    assert state.pending == nil
+  end
+
+  test "a batch older than the replay bound is dropped, not replayed", ctx do
+    {clock, monotonic_ms} = fake_clock()
+    rec = recorder(ctx, %{}, :stale_pending_recorder, monotonic_ms: monotonic_ms)
+
+    frames(ctx, [object("person", 0.95)])
+    _ = :sys.get_state(rec)
+
+    # Past the bound: whatever that batch saw, this event was not opened for it.
+    :counters.put(clock, 1, 10_000)
+
+    started(ctx)
+    assert_receive {:extractor_started, %Event{id: _eid}, _pid}
+
+    state = :sys.get_state(rec)
+    refute_received {:extractor_cast, _}
+    assert state.event.trigger == nil
+    assert state.pending == nil
+  end
+
   test "while an event is open, frames feed boxes, the trigger and the label timeline", ctx do
     rec = recorder(ctx)
 
@@ -581,6 +632,27 @@ defmodule Cairn.PresenceRecorderTest do
     PresenceRecorder.retire(ctx.camera_id)
 
     assert_receive {:DOWN, ^ref, :process, ^rec, :normal}
+  end
+
+  # The race the adoption is a *call* for: the retire is already in the mailbox
+  # when the camera comes back, and with nothing open the recorder honours it
+  # and stops. Whether `ensure/1` then adopts the dying one or starts a fresh
+  # one is not the assertion — that the caller is handed a recorder that is
+  # alive and answering is.
+  test "ensure after a retire that is already in flight yields a live recorder", ctx do
+    id = ctx.camera_id
+    recorder(ctx)
+
+    on_exit(fn ->
+      PresenceRecorder.retire(id)
+      Registry.await_unregistered(id, :presence_recorder)
+    end)
+
+    PresenceRecorder.retire(id)
+
+    assert {:ok, pid} = PresenceRecorder.ensure(id)
+    assert is_map(:sys.get_state(pid))
+    refute :sys.get_state(pid).retiring?
   end
 
   # -- wiring -----------------------------------------------------------------

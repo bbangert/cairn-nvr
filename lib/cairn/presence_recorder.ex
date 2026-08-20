@@ -17,10 +17,11 @@ defmodule Cairn.PresenceRecorder do
       nor hold one open.
     * **frames**, from `Cairn.Pipeline.PresenceSink` — the full inferred
       frames, objects and boxes intact, which the aggregator never sees
-      because it folds them to `%{label => score}`. They are dropped on the
-      floor unless an event is open, and while one is they are what gives a
-      presence recording its trigger box, its label timeline and its dense
-      bbox sidecar.
+      because it folds them to `%{label => score}`. While an event is open
+      they are what gives a presence recording its trigger box, its label
+      timeline and its dense bbox sidecar; while none is they are dropped,
+      save the latest batch, which is held for the event it may be about to
+      open (`frames/3`).
 
   What comes out is an ordinary `Cairn.Event`: the same
   `:event_started`/`:event_updated`/`:event_ended` broadcasts, the same
@@ -62,6 +63,17 @@ defmodule Cairn.PresenceRecorder do
   # re-attach to a live extractor, and a recovered event is written `:partial`
   # either way. The event's first and last writes are exempt.
   @checkpoint_throttle_ms 1_000
+  # How long a batch held while idle may wait for the event it belongs to. The
+  # aggregator confirms on two sightings inside its 2 s window, so the batch
+  # that confirms is at most that old when the transition lands here; the rest
+  # is mailbox slack. Anything older describes a scene this event was not
+  # opened for.
+  @pending_max_age_ms 3_000
+  # One camera start's worth of patience for an adoptee that is dying — see
+  # `adopt/3`. Small and bounded because the alternative to waiting is starting
+  # a second recorder for a camera that still has one.
+  @adopt_attempts 3
+  @adopt_retry_ms 20
 
   @doc """
   Starts the recorder for one camera.
@@ -95,17 +107,40 @@ defmodule Cairn.PresenceRecorder do
   paid when the event closes, and this is the only call that says the camera
   came back. A camera that really left never reaches here again, so its latch
   still stops it.
+
+  The un-latching is a **call**, and that is the whole point. The registry is a
+  stale-read site and a `:retire` may already be in the mailbox ahead of us: a
+  cast would be accepted by a process that then stops without ever handling it,
+  and this function would hand back a pid the lane is about to lose — with
+  nothing ever calling `ensure/1` again to notice. A reply proves the latch is
+  off. An exit means the adoptee was dying, so the lookup is retried and a
+  vacant registry starts a fresh recorder.
   """
   @spec ensure(String.t()) :: {:ok, pid()} | {:error, term()}
-  def ensure(camera_id) do
-    case Cairn.Registry.whereis(camera_id, :presence_recorder) do
-      pid when is_pid(pid) ->
-        GenServer.cast(pid, :resume)
-        {:ok, pid}
+  def ensure(camera_id), do: ensure(camera_id, @adopt_attempts)
 
-      nil ->
-        start_recorder(camera_id)
+  defp ensure(camera_id, attempts) do
+    case Cairn.Registry.whereis(camera_id, :presence_recorder) do
+      pid when is_pid(pid) -> adopt(camera_id, pid, attempts)
+      nil -> start_recorder(camera_id)
     end
+  end
+
+  # The sleep is affordable exactly here: this runs when a camera's presence
+  # tree is being started, once, and never on the frame path. What it waits out
+  # is the registry's unregistration, which rides the DOWN the partition sends
+  # itself — so a corpse can still answer `whereis` for a moment after the
+  # process that would have replied is gone.
+  defp adopt(camera_id, pid, attempts) do
+    :ok = GenServer.call(pid, :resume)
+    {:ok, pid}
+  catch
+    :exit, _dying when attempts > 0 ->
+      Process.sleep(@adopt_retry_ms)
+      ensure(camera_id, attempts - 1)
+
+    :exit, reason ->
+      {:error, reason}
   end
 
   defp start_recorder(camera_id) do
@@ -139,7 +174,12 @@ defmodule Cairn.PresenceRecorder do
 
   The frames are the sink's own — objects with boxes, before the fold to
   `%{label => score}` — and the recorder discards them unless an event is
-  open.
+  open. All but the latest: that one is held, because the sink casts here
+  before the aggregator has finished with the same batch, so the batch that
+  *confirms* presence always arrives ahead of the transition it causes. It is
+  replayed into the event it opens (`@pending_max_age_ms`); without that, an
+  event opened behind a closing motion gate could wait out its whole clip for
+  a frame that never comes, and finalize with no trigger box and no sidecar.
   """
   @spec frames(String.t(), %{optional(String.t()) => float()}, [map()]) :: :ok
   def frames(camera_id, floors, frames) do
@@ -179,10 +219,13 @@ defmodule Cairn.PresenceRecorder do
       policy: nil,
       # The effective floors the sink judged the last frames against — the
       # runtime `min_score` override included, which the camera struct does
-      # not carry. `nil` until the first buffer arrives, which is why the
-      # idle clause of `{:frames, _, _}` keeps this and nothing else: the
-      # floors are what an open's tier check is measured against too.
+      # not carry. `nil` until the first buffer arrives, and kept by the idle
+      # clause too: an open's own tier check is measured against them.
       floors: nil,
+      # `{floors, frames, monotonic_ms}` — the last batch that arrived with no
+      # event open, kept for `replay_pending/1`. At most one, replaced rather
+      # than accumulated.
+      pending: nil,
       event: nil,
       # `started_at` in unix milliseconds, so a frame's own `observed_at_ms`
       # places its boxes without a DateTime round trip per frame.
@@ -239,10 +282,12 @@ defmodule Cairn.PresenceRecorder do
   end
 
   # D-E5: the frames flow whether or not anything is recording, and are worth
-  # nothing until something is. The floors they were judged against are kept
-  # even so — see the field.
-  def handle_cast({:frames, floors, _frames}, %{event: nil} = state),
-    do: {:noreply, %{state | floors: floors}}
+  # nothing until something is — bar the latest batch, which is held for the
+  # event it may be about to open (see `frames/3` and `replay_pending/1`).
+  # One batch, replaced each time: an idle camera must stay O(1).
+  def handle_cast({:frames, floors, frames}, %{event: nil} = state) do
+    {:noreply, %{state | floors: floors, pending: {floors, frames, state.monotonic_ms.()}}}
+  end
 
   def handle_cast({:frames, floors, frames}, state) do
     {:noreply, Enum.reduce(frames, %{state | floors: floors}, &frame/2)}
@@ -252,9 +297,12 @@ defmodule Cairn.PresenceRecorder do
   def handle_cast(:retire, state), do: {:noreply, %{state | retiring?: true}}
 
   # The camera came back — see `ensure/1`. A recorder that stopped on its latch
-  # is replaced by `ensure/1` instead; this is only for the one that could not,
-  # because its event was still open.
-  def handle_cast(:resume, state), do: {:noreply, %{state | retiring?: false}}
+  # is replaced there instead; this is only for the one that could not, because
+  # its event was still open. The reply is the contract: it is what tells the
+  # caller this process handled the un-latching rather than dying with it
+  # queued.
+  @impl true
+  def handle_call(:resume, _from, state), do: {:reply, :ok, %{state | retiring?: false}}
 
   @impl true
   def handle_info({:post_window, event_id, token}, state) do
@@ -365,7 +413,7 @@ defmodule Cairn.PresenceRecorder do
         Event.broadcast(:event_started, event)
         {max_ref, max_token} = schedule(:max_event, event.id, state.policy.max)
 
-        %{
+        replay_pending(%{
           state
           | event: event,
             started_unix_ms: DateTime.to_unix(started_at, :millisecond),
@@ -373,7 +421,7 @@ defmodule Cairn.PresenceRecorder do
             extractor: pid,
             max_ref: max_ref,
             max_token: max_token
-        }
+        })
 
       {:error, reason} ->
         Logger.error("camera #{state.camera_id}: could not start extractor: #{inspect(reason)}")
@@ -405,6 +453,27 @@ defmodule Cairn.PresenceRecorder do
   end
 
   # -- frames -----------------------------------------------------------------
+
+  # The batch held while idle, given to the event that just opened. It is
+  # almost always the batch that *caused* the open: the sink casts frames here
+  # and the same batch's `observed` to the aggregator, whose confirm then
+  # travels back as the transition — so this process sees the frames first, at
+  # a moment when it has nothing to do with them.
+  #
+  # Dropped either way. A batch too old to replay is one this event was not
+  # opened for; the age is measured, not assumed, because a gated scene can
+  # leave the last batch minutes behind.
+  defp replay_pending(%{pending: nil} = state), do: state
+
+  defp replay_pending(%{pending: {floors, frames, at_ms}} = state) do
+    state = %{state | pending: nil}
+
+    if state.monotonic_ms.() - at_ms <= @pending_max_age_ms do
+      Enum.reduce(frames, %{state | floors: floors}, &frame/2)
+    else
+      state
+    end
+  end
 
   # `t_ms` can be negative: the frame is dated by the engine's capture clock
   # and the event by the confirm that followed one, so a frame captured before

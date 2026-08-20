@@ -103,8 +103,9 @@ defmodule Cairn.Pipeline.PresenceSink do
     # presence-state economy, not a data limit, and the event lane needs the
     # boxes it drops (D-E5). The floors ride along because they are the
     # sink's, override included, and the recorder has no other way to know
-    # what this batch was judged against. Dropped on the floor there unless an
-    # event is open, so an idle camera pays one cast per buffer.
+    # what this batch was judged against. With no event open it holds only the
+    # latest batch and drops the rest, so an idle camera pays one cast per
+    # buffer and no growing state.
     if inferred != [] do
       PresenceRecorder.frames(state.camera.id, floors, inferred)
     end
