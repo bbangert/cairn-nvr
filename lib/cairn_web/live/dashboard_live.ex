@@ -103,24 +103,7 @@ defmodule CairnWeb.DashboardLive do
     before = transport(socket.assigns.transports, camera_id)
 
     socket =
-      update(socket, :transports, fn transports ->
-        case params["transport"] do
-          "mse" ->
-            Map.put(transports, camera_id, :mse)
-
-          "webrtc" ->
-            Map.put(transports, camera_id, :webrtc)
-
-          # No transport named: flip. The `Map.update/4` default has to be the
-          # opposite of `transport/2`'s, or the first bare toggle on an
-          # untouched camera is a no-op.
-          _ ->
-            Map.update(transports, camera_id, :mse, fn
-              :mse -> :webrtc
-              :webrtc -> :mse
-            end)
-        end
-      end)
+      update(socket, :transports, &set_transport(&1, camera_id, params["transport"]))
 
     # A REAL switch starts a new player, but the old one's activity report is
     # still in `@active` — the fresh <video> would draw the old detections
@@ -228,6 +211,21 @@ defmodule CairnWeb.DashboardLive do
   # frame under them. MSE remains one click away, and a WebRTC player that
   # fails falls back to it on its own (`transport_failed`).
   defp transport(transports, camera_id), do: Map.get(transports, camera_id, :webrtc)
+
+  defp set_transport(transports, camera_id, "mse"), do: Map.put(transports, camera_id, :mse)
+
+  defp set_transport(transports, camera_id, "webrtc"),
+    do: Map.put(transports, camera_id, :webrtc)
+
+  # No transport named: flip. The `Map.update/4` default has to be the opposite
+  # of `transport/2`'s, or the first bare toggle on an untouched camera is a
+  # no-op.
+  defp set_transport(transports, camera_id, _bare) do
+    Map.update(transports, camera_id, :mse, fn
+      :mse -> :webrtc
+      :webrtc -> :mse
+    end)
+  end
 
   # Two conditions, and the second is a scope boundary rather than taste.
   # v1 draws each box the moment it is broadcast, with no frame time attached
