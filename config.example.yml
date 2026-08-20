@@ -173,6 +173,23 @@ cameras: []
 #    # gate, today's chain exactly. Vocabulary: docs/profile-authoring.md
 #    # and plugins/cairn-detect/src/motion.rs.
 #    motion_json: '{"enabled": true, "threshold": 30}'
+#    # Signed milliseconds, default 0, range ±30000. Compensates the lag
+#    # between the stream detection runs on and the stream that gets
+#    # recorded — most visible when they are different streams (a bridged
+#    # main plus an RTSP substream), where the two can be a second or more
+#    # apart. Detections are timed against the detect stream, so without
+#    # this the boxes, the snapshot frame and the timeline markers all sit
+#    # at the wrong moment of the recorded clip.
+#    #
+#    # To tune it: play back an event and watch a box against the object it
+#    # is on. If the box appears AHEAD of where the object actually is,
+#    # increase the value; if it trails behind, decrease it. Positive shifts
+#    # annotations later on the clip.
+#    #
+#    # Applied when annotations are RENDERED, never written into the clip,
+#    # the sidecar or the event row — so tuning it re-renders events that
+#    # already exist, and a reload is enough. No camera restart.
+#    annotation_offset_ms: -250
 #    # Three levels of threshold, per label. Each answers a different
 #    # question, and they must not fight: effective `record` >= `track` >=
 #    # `min_score` for every label, or the config is rejected. "Effective"

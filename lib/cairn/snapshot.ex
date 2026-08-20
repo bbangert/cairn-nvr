@@ -125,9 +125,17 @@ defmodule Cairn.Snapshot do
         # negative, because a result before the start of the clip is
         # `anchor_clip_ms/2`'s `:error` and falls through to here (see
         # `anchored_seek/2` — a miss there is deliberate, not a clamp).
+        # The annotation offset lands here, on the seek and not on the box:
+        # the trigger's coordinates are what the detector saw, and what is
+        # wrong on a lagging pair of streams is WHICH FRAME they belong to.
+        # Inside the floor and ahead of the duration clamp, so a large offset
+        # is bounded by the same two rules as everything else.
+        offset = Config.annotation_offset_ms(config, row.camera_id) / 1000
+
         raw =
           max(
-            anchored_seek(row, trig) || pre_window(config, row.camera_id) + trigger_t(trig),
+            (anchored_seek(row, trig) || pre_window(config, row.camera_id) + trigger_t(trig)) +
+              offset,
             0.0
           )
 

@@ -1116,6 +1116,9 @@ defmodule Cairn.PresenceRecorderTest do
 
     event = :sys.get_state(rec).event
     assert event.trigger.t == -1.5
+    # Non-empty first: an empty list satisfies Enum.all?/2 vacuously, and the
+    # replayed batch plus the confirm must have produced entries here.
+    assert [_ | _] = event.labels
     assert Enum.all?(event.labels, &(&1.t >= 0))
   end
 

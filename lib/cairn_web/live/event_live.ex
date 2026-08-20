@@ -31,6 +31,7 @@ defmodule CairnWeb.EventLive do
 
   require Logger
 
+  alias Cairn.Config
   alias Cairn.DataDir
   alias Cairn.Events
   alias Cairn.Tracks
@@ -61,7 +62,11 @@ defmodule CairnWeb.EventLive do
             event: event,
             page_title: "Event #{String.slice(id, 0, 8)}",
             from_tracks?: params["track"] != nil,
-            initial_t: initial_t(params["t"])
+            initial_t: initial_t(params["t"]),
+            # Read per mount, so an operator tuning the number sees it on the
+            # next load of an event that already exists — nothing is stored
+            # with the offset applied (`Cairn.Config.annotation_offset_ms/2`).
+            annotation_offset_s: annotation_offset_s(event.camera_id)
           )
 
         # `Events.get/1` stays in both mounts — it decides the 404 — but the
@@ -408,6 +413,14 @@ defmodule CairnWeb.EventLive do
 
   # -- helpers ----------------------------------------------------------------
 
+  # Seconds, because every consumer of it here is a clip time in seconds. A
+  # camera that has since left the config reads 0 rather than failing: the
+  # event and its clip outlive the camera that made them, and an old event
+  # must still render.
+  defp annotation_offset_s(camera_id) do
+    Config.annotation_offset_ms(Config.Server.get(), camera_id) / 1000
+  end
+
   defp timeline_rows(event) do
     event.labels
     |> Map.get("entries", [])
@@ -418,9 +431,22 @@ defmodule CairnWeb.EventLive do
   defp clip_seconds(%{started_at: s, ended_at: %DateTime{} = e}), do: max(DateTime.diff(e, s), 1)
   defp clip_seconds(_), do: 1
 
-  defp marker_left(entry, duration) do
-    pct = min(entry["t"] / duration * 100, 100.0)
-    "#{Float.round(pct / 1, 2)}%"
+  # One shifted time per marker, feeding its position, its seek and its
+  # tooltip together — `TimelineSeek` rewrites `left` and `data-seek` from
+  # `data-t` once metadata loads, so a shift applied to only some of them
+  # would have the dot and the seek disagree.
+  #
+  # Floored at zero for `label_entry/3`'s reason: this timeline's axis is the
+  # EVENT, and a position before its start is not on it. A negative shift can
+  # push an early detection off the front, where it sticks at 0:00.
+  # Rounded to the precision the entry itself was stored at
+  # (`Cairn.PresenceRecorder.label_entry/3`), so a shift does not hand the DOM
+  # a float's worth of noise the timeline cannot express anyway.
+  defp marker_t(entry, offset_s), do: Float.round(max(entry["t"] + offset_s, 0.0), 1)
+
+  defp marker_left(t, duration) do
+    pct = t / duration * 100
+    "#{Float.round(min(pct, 100.0) / 1, 2)}%"
   end
 
   defp fmt_clock(seconds) do
@@ -527,6 +553,7 @@ defmodule CairnWeb.EventLive do
                   data-video-id="event-clip"
                   data-sidecar-url={~p"/media/events/#{@event.id}/tracks"}
                   data-event-seconds={clip_seconds(@event)}
+                  data-annotation-offset={@annotation_offset_s}
                   data-selected={overlay_selected(@selected, @overlay_labels)}
                   data-objects={@overlay_objects}
                   style="position: absolute; inset: 0; pointer-events: none;"
@@ -566,11 +593,11 @@ defmodule CairnWeb.EventLive do
                   <div style="flex: 1; height: 26px; position: relative; background: var(--hs-bg-sunken); border-radius: 6px;">
                     <button
                       :for={entry <- entries}
-                      data-t={entry["t"]}
-                      data-seek={entry["t"]}
-                      title={"#{label} #{fmt_score(entry["score"])} at #{fmt_clock(entry["t"])}"}
+                      data-t={marker_t(entry, @annotation_offset_s)}
+                      data-seek={marker_t(entry, @annotation_offset_s)}
+                      title={"#{label} #{fmt_score(entry["score"])} at #{fmt_clock(marker_t(entry, @annotation_offset_s))}"}
                       style={
-                        "position: absolute; left: #{marker_left(entry, clip_seconds(@event))}; " <>
+                        "position: absolute; left: #{marker_left(marker_t(entry, @annotation_offset_s), clip_seconds(@event))}; " <>
                           "top: 50%; transform: translate(-50%, -50%); width: 13px; height: 13px; " <>
                           "border-radius: 50%; border: 2px solid var(--hs-bg-surface); cursor: pointer; " <>
                           "padding: 0; background: #{EventsLive.label_color(label)};"

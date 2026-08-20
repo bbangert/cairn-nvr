@@ -1496,6 +1496,67 @@ defmodule Cairn.ConfigTest do
     end
   end
 
+  describe "annotation_offset_ms" do
+    defp offset_map(value) do
+      base_map()
+      |> Map.put("cameras", [
+        Map.merge(%{"id" => "cam_a", "rtsp_url" => "rtsp://h/1"}, value)
+      ])
+    end
+
+    # The three states the standing rule asks for: absent is identity, a set
+    # value is carried, and an unusable one is an error naming itself.
+    test "absent is zero, and zero is what every consumer treats as identity" do
+      assert {:ok, config, _warnings} = Config.from_map(offset_map(%{}))
+      assert [%Config.Camera{annotation_offset_ms: 0}] = config.cameras
+      assert Config.annotation_offset_ms(config, "cam_a") == 0
+    end
+
+    test "a signed value is carried through, both ways" do
+      assert {:ok, late, _} = Config.from_map(offset_map(%{"annotation_offset_ms" => 750}))
+      assert Config.annotation_offset_ms(late, "cam_a") == 750
+
+      assert {:ok, early, _} = Config.from_map(offset_map(%{"annotation_offset_ms" => -750}))
+      assert Config.annotation_offset_ms(early, "cam_a") == -750
+    end
+
+    test "a value past the bound is refused, naming the bound and the value" do
+      assert {:error, errors} = Config.from_map(offset_map(%{"annotation_offset_ms" => 45_000}))
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "camera cam_a: annotation_offset_ms must be within ±30000 ms (got 45000)")
+             )
+
+      # The bound itself is inclusive, both signs; one past it is not.
+      for ok <- [30_000, -30_000] do
+        assert {:ok, _config, _warnings} =
+                 Config.from_map(offset_map(%{"annotation_offset_ms" => ok}))
+      end
+
+      assert {:error, _errors} =
+               Config.from_map(offset_map(%{"annotation_offset_ms" => -30_001}))
+    end
+
+    test "a non-integer is refused rather than rounded" do
+      for bad <- [1.5, "250", %{"ms" => 1}, true] do
+        assert {:error, errors} = Config.from_map(offset_map(%{"annotation_offset_ms" => bad}))
+
+        assert Enum.any?(
+                 errors,
+                 &(&1 =~ "camera cam_a: annotation_offset_ms must be an integer number of ms")
+               ),
+               "expected an error for #{inspect(bad)}"
+      end
+    end
+
+    # The event and its clip outlive the camera that made them.
+    test "a camera the config no longer has reads as zero, not a crash" do
+      assert {:ok, config, _} = Config.from_map(offset_map(%{"annotation_offset_ms" => 500}))
+      assert Config.annotation_offset_ms(config, "cam_gone") == 0
+    end
+  end
+
   describe "group profile checks" do
     @argv_dir "test/support/fixtures/profiles/argv"
     @no_artifact_dir "test/support/fixtures/profiles/no-artifact"

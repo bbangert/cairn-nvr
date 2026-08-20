@@ -226,6 +226,12 @@ const TrackOverlay = {
   // With neither pairing usable we fall back to the estimate the detections
   // timeline already uses — duration − event duration is exactly the retained
   // pre-roll.
+  // Read per draw rather than cached at mount: the attribute is a LiveView
+  // assign, so a re-render can change it under a live page.
+  annotationOffsetSeconds() {
+    return parseFloat(this.el.dataset.annotationOffset) || 0
+  },
+
   clipOffsetSeconds() {
     const a = this.paths && this.paths.anchor
     const d = this.video.duration
@@ -343,7 +349,13 @@ const TrackOverlay = {
     const offY = (rect.height - dispH) / 2
 
     const clipT = mediaTime != null ? mediaTime : this.video.currentTime
-    const tMs = (clipT - this.clipOffsetSeconds()) * 1000
+    // The one place clip time becomes sidecar time, and so the one place the
+    // camera's annotation offset belongs. Subtracted here because we are going
+    // record-clock → detect-clock: a positive offset means the boxes should
+    // appear LATER on the clip, which is the same as reading an EARLIER
+    // sidecar sample at any given moment. Nothing in the file is shifted —
+    // re-rendering with a new offset needs only a reload.
+    const tMs = (clipT - this.clipOffsetSeconds() - this.annotationOffsetSeconds()) * 1000
 
     const controlsVisible = this.video.controls && !document.fullscreenElement
     const bottom = controlsVisible ? Math.max(rect.height - CONTROLS_HEIGHT, 0) : rect.height

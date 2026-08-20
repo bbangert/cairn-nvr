@@ -376,6 +376,58 @@ defmodule Cairn.SnapshotTest do
       assert Snapshot.clip_seek(row, seek_config(ctx.config)) == 0.0
     end
 
+    # The camera's own pre-window stays nil, so `windows/2` still resolves the
+    # 1.0 s global the expectations above are written against — only the
+    # offset changes.
+    defp offset_config(config, ms) do
+      cam = %Config.Camera{
+        id: "snap_cam",
+        rtsp_url: "rtsp://h/1",
+        annotation_offset_ms: ms
+      }
+
+      %{seek_config(config) | cameras: [cam]}
+    end
+
+    # The detect stream ran behind the recorded one, so the frame the box
+    # belongs to is later in the clip than the trigger's own time says.
+    test "a positive annotation offset moves the seek later", ctx do
+      row = insert(@trig, clip(ctx.dir))
+
+      # 1.0 + 0.75 + 0.5
+      assert Snapshot.clip_seek(row, offset_config(ctx.config, 500)) == 2.25
+    end
+
+    test "a negative annotation offset moves it earlier", ctx do
+      row = insert(@trig, clip(ctx.dir))
+
+      # 1.0 + 0.75 - 0.5
+      assert Snapshot.clip_seek(row, offset_config(ctx.config, -500)) == 1.25
+    end
+
+    test "an offset that would seek before the clip still floors at zero", ctx do
+      row = insert(@trig, clip(ctx.dir))
+
+      # 1.75 - 2.0 is not a position in any file
+      assert Snapshot.clip_seek(row, offset_config(ctx.config, -2_000)) == 0.0
+    end
+
+    test "an offset past the end is still clamped inside the clip", ctx do
+      row = insert(@trig, clip(ctx.dir))
+
+      # 1.75 + 30.0 against a 6.0 s fixture
+      assert Snapshot.clip_seek(row, offset_config(ctx.config, 30_000)) == 5.8
+    end
+
+    test "the offset applies to the anchored seek too, not just the estimate", ctx do
+      path = clip(ctx.dir)
+      sidecar!(path, @anchor)
+      row = insert(@trig, path)
+
+      # the anchor's own 1.714, shifted
+      assert Snapshot.clip_seek(row, offset_config(ctx.config, 250)) == 1.964
+    end
+
     test "no trigger means no seek, sidecar or not", ctx do
       path = clip(ctx.dir)
       sidecar!(path, @anchor)

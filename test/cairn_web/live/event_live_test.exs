@@ -34,6 +34,77 @@ defmodule CairnWeb.EventLiveTest do
     %{id: id, clip: clip, snap: snap, started_at: now}
   end
 
+  describe "annotation offset" do
+    # `cam_dual` carries -400 ms in the fixture config; `cam_a` carries none.
+    defp seed_with_entries(camera_id, entries) do
+      id = Ecto.UUID.generate()
+      now = DateTime.utc_now()
+      clip = Path.join(System.tmp_dir!(), "cairn_off_#{id}.mp4")
+      File.write!(clip, "clip")
+
+      base = %Event{
+        id: id,
+        camera_id: camera_id,
+        started_at: now,
+        status: :active,
+        labels: entries,
+        max_scores: %{"person" => 0.9},
+        max_score: 0.9
+      }
+
+      {:ok, _} = Events.create_active(base, clip)
+
+      {:ok, _} =
+        Events.finalize(%{base | status: :finalized, ended_at: DateTime.add(now, 30)}, 100)
+
+      # `@sidecar?` gates the overlay wrapper, and the offset attribute rides
+      # on it — no sidecar, no element to assert against.
+      write_sidecar(clip)
+
+      on_exit(fn ->
+        File.rm(clip)
+        File.rm(DataDir.trackpath_for_clip(clip))
+      end)
+
+      id
+    end
+
+    defp entry(t), do: %{t: t, label: "person", score: 0.9, object_id: nil}
+
+    test "a camera with no offset renders the raw times, and says so", %{conn: conn} do
+      id = seed_with_entries("cam_a", [entry(3.0)])
+      {:ok, _view, html} = live(conn, ~p"/events/#{id}")
+
+      # The attribute is always present: the hook multiplies by it, so its
+      # absence and a zero must not be different code paths.
+      assert html =~ ~s(data-annotation-offset="0.0")
+      assert html =~ ~s(data-t="3.0")
+      assert html =~ ~s(data-seek="3.0")
+    end
+
+    test "a camera with an offset shifts marker, seek and tooltip together", %{conn: conn} do
+      id = seed_with_entries("cam_dual", [entry(3.0)])
+      {:ok, _view, html} = live(conn, ~p"/events/#{id}")
+
+      assert html =~ ~s(data-annotation-offset="-0.4")
+      assert html =~ ~s(data-t="2.6")
+      assert html =~ ~s(data-seek="2.6")
+      # the tooltip is the same time, so the dot and its label cannot disagree
+      assert html =~ "person 0.90 at 0:03"
+      refute html =~ ~s(data-t="3.0")
+    end
+
+    # This timeline's axis is the event, so a shift that would push a marker
+    # before its start parks it at the front rather than off the widget.
+    test "a shift before the event's start floors at zero", %{conn: conn} do
+      id = seed_with_entries("cam_dual", [entry(0.1)])
+      {:ok, _view, html} = live(conn, ~p"/events/#{id}")
+
+      assert html =~ ~s(data-t="0.0")
+      assert html =~ "left: 0.0%"
+    end
+  end
+
   # `data-selected` is a JSON array of the keys the sidecar is keyed by, and
   # HEEx escapes its quotes on the way into the attribute.
   defp selected(keys) do
