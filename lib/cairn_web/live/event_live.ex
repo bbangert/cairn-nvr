@@ -344,10 +344,21 @@ defmodule CairnWeb.EventLive do
   # A label-keyed sidecar has no panel row to toggle it from, so its paths are
   # drawn whenever the file is: the labels join the selected set on the way to
   # the overlay without entering `@track_ids`, which is what gates the toggles.
+  #
+  # `max_scores` and not the sidecar's own labels: the file is unfiltered, so it
+  # also holds labels the event never qualified on — below `record:`, or excluded
+  # by it. Drawing those would show the viewer more than the event is evidence
+  # for, and more than the tracked lane shows, which draws only the objects that
+  # earned a row. Parity is the bar D-E5 sets, so the selection is the event's
+  # own evidence and nothing else.
   defp overlay_labels([], event), do: event |> max_scores() |> Map.keys() |> Enum.sort()
   defp overlay_labels(_objects, _event), do: []
 
-  defp overlay_selected(selected, labels), do: Enum.join(Enum.concat(selected, labels), ",")
+  # JSON, not a joined string: on the presence lane these keys are model labels,
+  # and the protocol permits a comma inside one — a comma-joined list would split
+  # it into two keys that match no path. `assets/js/hooks/track_overlay.js` is the
+  # only reader, and parses both lanes the same way.
+  defp overlay_selected(selected, labels), do: Jason.encode!(Enum.concat(selected, labels))
 
   defp max_scores(event), do: Map.get(event.labels || %{}, "max_scores", %{})
 
@@ -832,7 +843,7 @@ defmodule CairnWeb.EventLive do
                   No tracked objects
                 </div>
                 <div style="font-size: 12px; color: var(--hs-fg-3); line-height: 1.45;">
-                  This clip predates tracking, or its tracks have aged out.
+                  Its camera runs no tracker, this clip predates tracking, or its tracks have aged out.
                 </div>
               </div>
             </section>

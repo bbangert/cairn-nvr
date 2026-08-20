@@ -76,6 +76,36 @@ defmodule Cairn.SnapshotTest do
     refute_received {:event_snapshot_failed, _}
   end
 
+  test "a presence-born trigger draws its box with no object identity",
+       %{dir: dir, config: config} do
+    # `Cairn.PresenceRecorder`'s trigger shape: the lane runs no tracker, so
+    # `object_id` is nil. Nothing on the drawing path reads it — the box, the
+    # label and the seek come from `bbox`, `label`/`score` and `t`.
+    trigger = %{
+      t: 0.0,
+      label: "person",
+      score: 0.82,
+      bbox: [0.3, 0.25, 0.2, 0.3],
+      object_id: nil
+    }
+
+    row = insert(trigger, @fixture)
+    out = Path.join(Cairn.DataDir.snapshots_dir(dir), "#{row.id}.jpg")
+
+    assert Snapshot.clip_seek(row, config) == 0.0
+    args = Snapshot.args(row, out, Snapshot.clip_seek(row, config))
+    vf = Enum.at(args, Enum.find_index(args, &(&1 == "-vf")) + 1)
+    assert vf =~ "drawbox=x=iw*0.3000"
+    assert vf =~ ~s(drawtext=text='person 0.8200')
+
+    assert :ok = Snapshot.take(row, config)
+    assert File.stat!(out).size > 0
+    assert %{snapshot_path: ^out} = Events.get(row.id)
+
+    event_id = row.id
+    assert_receive {:event_snapshot_ready, %EventArtifact{event_id: ^event_id}}
+  end
+
   test "a snapshot that produces no output announces its failure", %{config: config} do
     row = insert(nil, @fixture)
     # a clip ffmpeg cannot decode: it writes nothing and still exits 0

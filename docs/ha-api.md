@@ -147,7 +147,7 @@ the connection. Event kinds:
 | `event_clip_ready` / `event_clip_failed` | artifact object (below), with `clip_url` |
 | `event_snapshot_ready` / `event_snapshot_failed` | artifact object (below), with `snapshot_url` |
 | `track_started` / `track_updated` / `track_ended` | track object (below) |
-| `presence_started` / `presence_cleared` | `{camera_id, label, state, score, first_seen_at, at}` — tier-1 cameras only (see `profile-authoring.md` on the capability ladder). `state` is `"present"` or `"cleared"`; `score` is the best detection score over the stay so far; `first_seen_at` survives into the clearing frame, so dwell is `at - first_seen_at` off that frame alone. Presence is **edge-only and unpersisted**: there is no `/api/events` row behind these frames, and a client connecting mid-presence sees nothing until the next transition — track current state client-side from the transitions. A presence history/snapshot surface is future work |
+| `presence_started` / `presence_cleared` | `{camera_id, label, state, score, first_seen_at, at}` — tier-1 cameras only (see `profile-authoring.md` on the capability ladder). `state` is `"present"` or `"cleared"`; `score` is the best detection score over the stay so far; `first_seen_at` survives into the clearing frame, so dwell is `at - first_seen_at` off that frame alone. **The transitions are edge-only**: a `presence_*` frame carries no event id and has no `/api/events` row of its own, and a client connecting mid-presence sees nothing until the next transition — track current state client-side from the transitions. A presence history/snapshot surface is future work. Recordings are a separate thing and are ordinary events — see below |
 | `camera_status` | `{camera_id, status, probe, plugin_status}` — `plugin_status` is the detector's own `{state, detail, fps}` ([`plugin.status`](archive/plugin-contract.md#pluginstatus)), `null` until it reports one. A camera detected on by the in-VM native block reports here too, adding `health` (`healthy` / `saturated` / `wedged` / `idle` / `unknown` / `not_applicable`), `stream_health`, `engine`, `nif`, `canary`, `model` (the model file's **name**, never its path), `backend`, `p50_ms` (one model pass, median over the last check window), `cpu_baseline_ms` (the CPU cost of one pass on the same model, measured once at engine init; `null` on a CPU backend, where there is no accelerator to compare against) and `inferences`; those keys never appear on a plugin's status, which is whitelisted to the three above. A camera configured to detect reports here even with no stream open — that is how a refused canary or a failed model load reaches a client |
 | `camera_control` | `{camera_id, detection_enabled, recording_enabled, min_score}` |
 | `disk_alert` | `{active, free_mb, threshold_mb}` |
@@ -158,9 +158,43 @@ the connection. Event kinds:
 > Crockford-base32 ULID (`"01J8ZQ0P8B7X0N2R4C6D8E0F2G"`), minted once and never
 > reused — across cameras, stream reconnects or host restarts. It appears in an
 > event's `trigger.object_id`, in the stored `labels.entries[].object_id`, and as
-> `object_id` on every track frame, and it is the key that ties them together.
+> `object_id` on every track frame, and it is the key that ties them together —
+> except on a presence-born event, which has no tracker to mint one and carries
+> `null` there (below).
 > Clients that stored or compared it as a number must treat it as an opaque
 > string. There is no compatibility mode.
+
+#### Presence recordings (tier 1)
+
+A tier-1 camera records. A confirmed presence on a label its camera's `record:`
+block admits opens an **ordinary event**: the same `event_started` /
+`event_updated` / `event_ended` frames, the same `/api/events` row, the same
+clip and the same snapshot, with the trigger's box drawn on it. Nothing on the
+wire marks an event as presence-born — a client that needs to know reads the
+camera's tier from its profile.
+
+Two consequences of there being no tracker behind it, both visible in the
+payloads a client already parses:
+
+- No `track_*` frames accompany the event. Its sidecar is still served at
+  `/api/media/events/:id/tracks`, and the boxes in it are per label: the file's
+  header carries `identity: "label"` and each of its tracks is keyed by the
+  label rather than by an object id.
+- `trigger.object_id` and every `labels.entries[].object_id` are `null`. The
+  frames are shaped exactly as above; only the identity column is empty.
+
+One event per camera, and the labels merge: a further qualifying label while
+an event is open extends it (an `event_updated` announces the label the event
+grew), and the close clock starts only once the **last** qualifying label
+clears. A label the camera's `record:` block does not admit produces
+transitions and nothing else.
+
+`max_event_seconds` **segments rather than stops**. A presence that outlives
+the cap yields consecutive events rather than one long clip or a truncated
+one: an `event_ended` for the closing segment is immediately followed by an
+`event_started` for the next, on the same camera, each segment carrying its
+own id, clip and snapshot. A client stitching a presence back together does it
+off the camera and the timestamps, not off any field on the events.
 
 #### Artifact frames
 

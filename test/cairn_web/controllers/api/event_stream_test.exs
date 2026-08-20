@@ -109,6 +109,62 @@ defmodule CairnWeb.Api.EventStreamTest do
     end
   end
 
+  describe "presence-born event frames" do
+    # The lifecycle of a tier-1 recording (`Cairn.PresenceRecorder`): the same
+    # kinds the tracked lane emits, carrying a trigger nothing assigned an
+    # identity to. D-E7 — a client cannot tell the lanes apart, and must not
+    # choke on the `null`.
+    defp presence_born(fields) do
+      struct!(
+        %Cairn.Event{
+          id: "evt-p1",
+          camera_id: "cam_tier1",
+          started_at: ~U[2026-07-24 00:00:00Z],
+          status: :active,
+          labels: [%{t: 0.0, label: "person", score: 0.82, object_id: nil}],
+          max_scores: %{"person" => 0.82},
+          max_score: 0.82,
+          trigger: %{
+            t: 1.4,
+            label: "person",
+            score: 0.82,
+            bbox: [0.1, 0.2, 0.3, 0.4],
+            object_id: nil
+          },
+          path: "/data/events/cam_tier1/evt-p1.mp4"
+        },
+        fields
+      )
+    end
+
+    test "event_started carries the identity-less trigger and the clip url" do
+      assert {:ok, frame} = SSE.frame_for({:event_started, presence_born([])})
+
+      assert frame =~ "event: event_started\n"
+      assert frame =~ ~s("camera_id":"cam_tier1")
+      assert frame =~ ~s("max_scores":{"person":0.82})
+      assert frame =~ ~s("object_id":null)
+      assert frame =~ ~s("bbox":[0.1,0.2,0.3,0.4])
+      assert frame =~ ~s("clip_url":"/api/media/events/evt-p1")
+      refute frame =~ "/data/events"
+      assert String.ends_with?(frame, "\n\n")
+    end
+
+    test "event_ended is the same frame the tracked lane ends with" do
+      ended = presence_born(status: :finalized, ended_at: ~U[2026-07-24 00:00:30Z])
+
+      assert {:ok, frame} = SSE.frame_for({:event_ended, ended})
+      assert frame =~ "event: event_ended\n"
+      assert frame =~ ~s("status":"finalized")
+      assert frame =~ ~s("ended_at":"2026-07-24T00:00:30Z")
+    end
+
+    test "an event that never saw a box has a null trigger, not a missing one" do
+      assert {:ok, frame} = SSE.frame_for({:event_started, presence_born(trigger: nil)})
+      assert frame =~ ~s("trigger":null)
+    end
+  end
+
   describe "artifact frames" do
     defp artifact(fields) do
       struct!(%Cairn.EventArtifact{event_id: "evt-1", camera_id: "cam_a"}, fields)

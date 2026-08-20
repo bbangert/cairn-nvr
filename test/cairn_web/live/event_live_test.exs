@@ -5,7 +5,7 @@ defmodule CairnWeb.EventLiveTest do
 
   alias Cairn.{DataDir, Event, Events, Tracks}
 
-  defp seed(status) do
+  defp seed(status, max_scores \\ %{"person" => 0.9}) do
     id = Ecto.UUID.generate()
     now = DateTime.utc_now()
     clip = Path.join(System.tmp_dir!(), "cairn_ev_#{id}.mp4")
@@ -19,8 +19,8 @@ defmodule CairnWeb.EventLiveTest do
       started_at: now,
       status: :active,
       labels: [],
-      max_scores: %{"person" => 0.9},
-      max_score: 0.9
+      max_scores: max_scores,
+      max_score: max_scores |> Map.values() |> Enum.max()
     }
 
     {:ok, _} = Events.create_active(base, clip)
@@ -32,6 +32,12 @@ defmodule CairnWeb.EventLiveTest do
     {:ok, _} = Events.set_snapshot(id, snap)
     on_exit(fn -> File.rm(DataDir.trackpath_for_clip(clip)) end)
     %{id: id, clip: clip, snap: snap, started_at: now}
+  end
+
+  # `data-selected` is a JSON array of the keys the sidecar is keyed by, and
+  # HEEx escapes its quotes on the way into the attribute.
+  defp selected(keys) do
+    ~s(data-selected=") <> String.replace(Jason.encode!(keys), ~s("), "&quot;") <> ~s(")
   end
 
   # The sidecar is derived from the clip path, so writing one is all it takes
@@ -201,8 +207,8 @@ defmodule CairnWeb.EventLiveTest do
     refute has_element?(view, ~s(a.cairn-nav--active[href="/events"]))
 
     # only the named object is selected, and only it is expanded
-    assert html =~ ~s(data-selected="#{a.id}")
-    refute html =~ ~s(data-selected="#{b.id}")
+    assert html =~ selected([a.id])
+    refute html =~ selected([b.id])
     assert has_element?(view, ~s(button[phx-value-id="#{a.id}"] span), "expand_less")
     assert has_element?(view, ~s(button[phx-value-id="#{b.id}"] span), "expand_more")
 
@@ -222,21 +228,21 @@ defmodule CairnWeb.EventLiveTest do
 
     {:ok, view, html} = live(conn, "/events/#{id}")
 
-    assert html =~ ~s(data-selected="#{track.id}")
+    assert html =~ selected([track.id])
     refute html =~ "visibility_off"
 
     html = view |> element(~s(button[phx-click="toggle-track"])) |> render_click()
 
-    assert html =~ ~s(data-selected="")
+    assert html =~ selected([])
     assert html =~ "visibility_off"
     assert html =~ "opacity: 0.55"
 
     html = view |> element(~s(button[phx-click="toggle-track"])) |> render_click()
-    assert html =~ ~s(data-selected="#{track.id}")
+    assert html =~ selected([track.id])
 
     # an id this page never loaded is dropped rather than added to the set
     render_click(view, "toggle-track", %{"id" => "01JNOTATRACKONTHISPAGE0000"})
-    assert render(view) =~ ~s(data-selected="#{track.id}")
+    assert render(view) =~ selected([track.id])
   end
 
   test "toggle-moments opens and closes one object's timeline", %{conn: conn} do
@@ -420,7 +426,13 @@ defmodule CairnWeb.EventLiveTest do
     {:ok, _view, html} = live(conn, "/events/#{id}")
 
     assert html =~ "No tracked objects"
-    assert html =~ "This clip predates tracking, or its tracks have aged out."
+
+    # the tier-1 lane is the third reason and the only one that is not a
+    # historical accident — `Cairn.PresenceRecorder`'s clips never have tracks
+    assert html =~
+             "Its camera runs no tracker, this clip predates tracking, " <>
+               "or its tracks have aged out."
+
     refute html =~ ~s(id="track-moments")
   end
 
@@ -474,8 +486,34 @@ defmodule CairnWeb.EventLiveTest do
 
     {:ok, _view, html} = live(conn, "/events/#{id}")
 
-    assert html =~ ~s(data-selected="person")
+    assert html =~ selected(["person"])
     assert html =~ ~s(person&quot;:{&quot;color&quot;:&quot;#5fc0f5&quot;)
+  end
+
+  test "a presence-born clip selects every label the event recorded, and only those",
+       %{conn: conn} do
+    %{id: id, clip: clip} = seed(:finalized, %{"person" => 0.9, "car" => 0.72})
+    write_sidecar(clip)
+
+    {:ok, _view, html} = live(conn, "/events/#{id}")
+
+    assert html =~ selected(["car", "person"])
+    # the palette is keyed the way the sidecar's header says its tracks are, and
+    # carries the score too — the canvas chip has no panel row to read it off
+    assert html =~ ~s(car&quot;:{&quot;color&quot;:&quot;#5ed08a&quot;)
+    assert html =~ ~s(person&quot;:{&quot;color&quot;:&quot;#5fc0f5&quot;)
+    assert html =~ ~s(&quot;score&quot;:&quot;0.72&quot;)
+  end
+
+  test "a label with a comma in it stays one key in the selection", %{conn: conn} do
+    # Nothing in the detection protocol forbids it, and the joined-string
+    # encoding this replaced would have split it into two keys matching no path.
+    %{id: id, clip: clip} = seed(:finalized, %{"person, walking" => 0.9})
+    write_sidecar(clip)
+
+    {:ok, _view, html} = live(conn, "/events/#{id}")
+
+    assert html =~ selected(["person, walking"])
   end
 
   test "an object's colour varies by its ordinal among same-label tracks", %{conn: conn} do
@@ -586,7 +624,7 @@ defmodule CairnWeb.EventLiveTest do
     html = render(view)
 
     assert html =~ ~s(id="track-object-#{track.id}")
-    assert html =~ ~s(data-selected="#{track.id}")
+    assert html =~ selected([track.id])
     refute html =~ "Still recording — objects tracked so far are listed."
   end
 end
