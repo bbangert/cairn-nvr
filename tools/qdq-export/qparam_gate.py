@@ -409,10 +409,13 @@ def check(model_path, min_ceiling=DEFAULT_MIN_CEILING, input_size=None, out=sys.
                 f"{e['node']} ({_stride_label(e['dims'], input_size)}): "
                 f"ceiling {e['ceiling']:.4f} < {min_ceiling}"
             )
-        elif (
-            e["dq_scale"] is not None
-            and abs(e["dq_scale"] - e["scale"]) > 1e-12
-        ):
+        elif e["dq_scale"] is None:
+            # A Q with no located DQ is not "agreement": it is the agreement
+            # check never having run — either a malformed graph or a walker
+            # miss, and both must fail rather than let this gate vouch for
+            # the exact defect class (Q/DQ disagreement) it exists to block.
+            bad.append(f"{e['node']}: Q has no matching DQ — scale agreement unverifiable")
+        elif abs(e["dq_scale"] - e["scale"]) > 1e-12:
             bad.append(
                 f"{e['node']}: Q scale {e['scale']:.6e} != DQ scale "
                 f"{e['dq_scale']:.6e}"
