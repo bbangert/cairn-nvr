@@ -245,30 +245,58 @@ def audit(model_path):
 
 
 def _fp32_islands(graph, consumers, producers):
-    """Nodes outside the quantized domain entirely.
+    """Connected FP32 regions — nodes the EP cannot fuse into quantized
+    kernels.
 
-    A node participates in QDQ if it takes a DequantizeLinear's output or
-    feeds a QuantizeLinear. One that does neither computes in FP32, and on
-    QNN that means a partition boundary with a CPU round trip. Cast is
-    excluded by `get_qnn_qdq_config` on purpose (it moves types, it does
-    not compute), so it is not an island.
+    A node executes quantized only when its whole DQ -> op -> Q bracket
+    is present: every produced input arrives via DequantizeLinear and
+    every consumer is a QuantizeLinear. One-sided adjacency is NOT
+    participation — in DQ -> A -> B -> Q both A and B run FP32, and the
+    lone bracketed node is the only shape that fuses. Cast is excluded
+    by `get_qnn_qdq_config` on purpose (it moves types, it does not
+    compute). Each region is one entry: on QNN it is a partition
+    boundary with a CPU round trip.
     """
+
+    def fused(node):
+        prod = [producers[i] for i in node.input if i and i in producers]
+        cons = [c for o in node.output for c in consumers.get(o, ())]
+        return (
+            bool(prod)
+            and all(p.op_type == "DequantizeLinear" for p in prod)
+            and bool(cons)
+            and all(c.op_type == "QuantizeLinear" for c in cons)
+        )
+
+    skip = ("QuantizeLinear", "DequantizeLinear", "Cast")
+    floats = [n for n in graph.node if n.op_type not in skip and not fused(n)]
+    index = {id(n): k for k, n in enumerate(floats)}
+    parent = list(range(len(floats)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    by_out = {o: n for n in floats for o in n.output}
+    for n in floats:
+        for i in n.input:
+            p = by_out.get(i)
+            if p is not None:
+                a, b = find(index[id(n)]), find(index[id(p)])
+                if a != b:
+                    parent[a] = b
+    regions = {}
+    for n in floats:
+        regions.setdefault(find(index[id(n)]), []).append(n)
     out = []
-    for node in graph.node:
-        if node.op_type in ("QuantizeLinear", "DequantizeLinear", "Cast"):
-            continue
-        fed_by_dq = any(
-            producers.get(i, None) is not None
-            and producers[i].op_type == "DequantizeLinear"
-            for i in node.input
-        )
-        feeds_q = any(
-            c.op_type == "QuantizeLinear"
-            for o in node.output
-            for c in consumers.get(o, ())
-        )
-        if not fed_by_dq and not feeds_q:
-            out.append((node.op_type, node.name or node.output[0]))
+    for nodes in regions.values():
+        ops = {}
+        for n in nodes:
+            ops[n.op_type] = ops.get(n.op_type, 0) + 1
+        label = "+".join(f"{k} x{v}" for k, v in sorted(ops.items()))
+        out.append((label, nodes[0].name or nodes[0].output[0]))
     return out
 
 
@@ -359,12 +387,9 @@ def summarize(report, input_size=None, out=sys.stdout):
         )
     islands = report["islands"]
     if islands:
-        kinds = {}
-        for op, _ in islands:
-            kinds[op] = kinds.get(op, 0) + 1
         print(
-            "  FP32 islands (outside the quantized domain): "
-            + ", ".join(f"{k} x{v}" for k, v in sorted(kinds.items())),
+            "  FP32 regions (outside the quantized domain): "
+            + "; ".join(label for label, _ in sorted(islands)),
             file=out,
         )
     else:

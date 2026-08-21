@@ -153,7 +153,8 @@ model_ladder:
       qnn: data/models/yolo26m-qdq-a16.onnx
     model_profile: yolo26      # per-rung; omitted, the top-level one stands
     input_size: 640            # per-rung — 640 and 416 rungs are the norm
-    engine_budget: 18.5        # measured passes/s (ordering: reachability)
+    engine_budget: 18.5        # passes/s — provisional bench arithmetic
+                               # until the rung's boundary ladder run
     pack: yolo26m              # skipped (with a warning) until installed
   - model:
       qnn: models/yolox_nano-qdq-a16.onnx

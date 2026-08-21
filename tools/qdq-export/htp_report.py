@@ -331,12 +331,30 @@ def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None):
     return result
 
 
-def latency_table(runs_dir):
+def latency_table(runs_dir, start_marker=None, pushed_file=None, art_dir=None):
+    """runs/ accumulates history, and the bench meta records a path, not
+    bytes — so a row is only evidence when (a) the run postdates the
+    current latency stage (.latency-start) and (b) the sha the push stage
+    verified for that board path still matches the local artifact. An
+    older run for the same filename must not report as the rebuilt
+    artifact's latency."""
     rows = {}
+    start = 0
+    if start_marker and os.path.exists(start_marker):
+        start = int(open(start_marker).read().strip() or 0)
+    pushed = {}
+    if pushed_file and os.path.exists(pushed_file):
+        for line in open(pushed_file):
+            parts = line.split()
+            if len(parts) == 2:
+                pushed[os.path.splitext(os.path.basename(parts[1]))[0]] = parts[0]
     line_re = re.compile(
         r"infer latency: backend=(\S+) n=\d+ p50=([\d.]+)ms p95=([\d.]+)ms \(total (\d+)\)"
     )
     for run in sorted(glob.glob(os.path.join(runs_dir, "*"))):
+        m = re.search(r"-(\d+)$", os.path.basename(run))
+        if start and (not m or int(m.group(1)) < start):
+            continue  # a previous latency stage's run
         model, backend = None, None
         meta = os.path.join(run, "meta")
         if os.path.exists(meta):
@@ -352,12 +370,18 @@ def latency_table(runs_dir):
                 m = line_re.search(line)
                 if m:
                     last = m
-        if model and last:
-            rows[(model, backend)] = {
-                "p50_ms": float(last.group(2)),
-                "p95_ms": float(last.group(3)),
-                "runs": int(last.group(4)),
-            }
+        if not (model and last):
+            continue
+        row = {
+            "p50_ms": float(last.group(2)),
+            "p95_ms": float(last.group(3)),
+            "runs": int(last.group(4)),
+        }
+        if art_dir:
+            local = os.path.join(art_dir, f"{model}.onnx")
+            if os.path.exists(local) and pushed.get(model) != file_sha256(local):
+                row["stale"] = "bench ran different bytes than the current artifact"
+        rows[(model, backend)] = row
     return rows
 
 
@@ -496,11 +520,19 @@ def main():
             "not demonstrably see the defect class."
         )
 
-    lat = latency_table(os.path.join(htp_dir, "runs"))
+    lat = latency_table(os.path.join(htp_dir, "runs"),
+                        start_marker=os.path.join(htp_dir, ".latency-start"),
+                        pushed_file=os.path.join(htp_dir, "pushed.sha256"),
+                        art_dir=os.path.join(out_root, "artifacts"))
     if lat:
         report += ["", "## Latency (bench.sh, 1 cam, governor pinned)", "",
                    "| rung | backend | p50 ms | p95 ms | runs/60s |", "|---|---|---|---|---|"]
         for (model, backend), row in sorted(lat.items()):
+            if "stale" in row:
+                report.append(
+                    f"| {model} | {backend} | - | - | **STALE** — {row['stale']} |"
+                )
+                continue
             report.append(
                 f"| {model} | {backend} | {row['p50_ms']} | {row['p95_ms']} | {row['runs']} |"
             )

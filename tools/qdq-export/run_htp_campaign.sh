@@ -296,8 +296,13 @@ pin_governor() {
   # Capture the pre-campaign governor ONCE — never on re-entry, or a
   # second pin would record "performance" and finish would then restore
   # the pin itself. What was actually there is what comes back.
-  remote 30 "test -f /data/campaign-gov.saved || cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > /data/campaign-gov.saved"
-  remote 30 "for c in /sys/devices/system/cpu/cpu[0-9]*; do echo performance > \$c/cpufreq/scaling_governor; done"
+  # Both checked: a failed save leaves do_finish nothing to restore (the
+  # board stays pinned forever), and a failed pin would label unpinned
+  # latency evidence as governor-pinned.
+  remote 30 "test -f /data/campaign-gov.saved || cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > /data/campaign-gov.saved" \
+    || { log "FATAL: cannot capture pre-campaign governor"; exit 1; }
+  remote 30 "for c in /sys/devices/system/cpu/cpu[0-9]*; do echo performance > \$c/cpufreq/scaling_governor; done" \
+    || { log "FATAL: governor pin failed"; exit 1; }
 }
 
 do_latency() {
