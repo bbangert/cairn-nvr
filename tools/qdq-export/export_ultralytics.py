@@ -86,14 +86,10 @@ def main():
     )
     ap.add_argument(
         "--out",
-        default=os.path.normpath(
-            os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "..", "..", "plugins", "cairn-detect",
-            )
-        ),
-        help="Destination dir (default: the plugin root, where --model and "
-        ".gitignore expect artifacts)",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "out", "sources"),
+        help="Destination dir (default: out/sources here, where "
+        "run_quantize_candidates.sh reads its SRC by default; pass the "
+        "plugin root for verify/ workflows)",
     )
     args = ap.parse_args()
     for name in args.models:

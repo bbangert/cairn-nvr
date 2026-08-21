@@ -1,7 +1,7 @@
 #!/bin/sh
 # Local gates for the AI Hub-returned artifacts (plan 5.2) — the exact
 # checks our own exports face, because provenance buys nothing here: a
-# baked ceiling from their calibrater would ship just as silently as
+# baked ceiling from their calibrator would ship just as silently as
 # one from ours. Per artifact: qparam gate, then FP32-vs-QDQ score
 # parity on heldout + board frames. Decode verify (verify_artifact.sh)
 # is separate — it needs the release binary and a fixture clip.

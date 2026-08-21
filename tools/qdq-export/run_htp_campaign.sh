@@ -312,13 +312,22 @@ pin_governor() {
   # Capture the pre-campaign governor ONCE — never on re-entry, or a
   # second pin would record "performance" and finish would then restore
   # the pin itself. What was actually there is what comes back.
-  # Both checked: a failed save leaves do_finish nothing to restore (the
-  # board stays pinned forever), and a failed pin would label unpinned
-  # latency evidence as governor-pinned.
-  remote 30 "test -f /data/campaign-gov.saved || cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > /data/campaign-gov.saved" \
-    || { log "FATAL: cannot capture pre-campaign governor"; exit 1; }
-  remote 30 "for c in /sys/devices/system/cpu/cpu[0-9]*; do echo performance > \$c/cpufreq/scaling_governor; done" \
-    || { log "FATAL: governor pin failed"; exit 1; }
+  # Verified by READBACK, not rc — :os.cmd discards the board command's
+  # exit status, so an `||` on remote() only sees ssh/timeout failures.
+  # A failed save leaves do_finish nothing to restore (the board stays
+  # pinned forever); a failed pin would label unpinned latency evidence
+  # as governor-pinned.
+  remote 30 "test -f /data/campaign-gov.saved || cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > /data/campaign-gov.saved"
+  rm -f "$HTP/.gov-saved"
+  fetch /data/campaign-gov.saved "$HTP/.gov-saved" || { log "FATAL: cannot verify saved governor"; exit 1; }
+  [ -s "$HTP/.gov-saved" ] || { log "FATAL: saved governor file is empty"; exit 1; }
+  remote 30 "for c in /sys/devices/system/cpu/cpu[0-9]*; do echo performance > \$c/cpufreq/scaling_governor; done"
+  rm -f "$HTP/.gov-check"
+  remote 30 "cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor > /data/tmp-gov.txt"
+  fetch /data/tmp-gov.txt "$HTP/.gov-check" || { log "FATAL: cannot read back governors"; exit 1; }
+  [ -s "$HTP/.gov-check" ] || { log "FATAL: governor readback is empty"; exit 1; }
+  grep -qv '^performance$' "$HTP/.gov-check" && { log "FATAL: governor pin did not take"; exit 1; }
+  log "governor pinned (saved: $(cat "$HTP/.gov-saved"))"
 }
 
 do_latency() {
@@ -363,8 +372,21 @@ do_finish() {
   log "== finish: restore governor + restart container"
   # Restore ONLY what pin_governor captured: a finish reached without a
   # pin (standalone envcheck, an early failure) must not write any
-  # governor at all — restore-only means exactly that.
-  remote 30 "if test -f /data/campaign-gov.saved; then gov=\$(cat /data/campaign-gov.saved); for c in /sys/devices/system/cpu/cpu[0-9]*; do echo \$gov > \$c/cpufreq/scaling_governor; done; rm -f /data/campaign-gov.saved; fi"
+  # governor at all — restore-only means exactly that. The saved file is
+  # kept until a READBACK verifies the restore took (:os.cmd discards
+  # the rc), so a failed restore stays restorable on the next finish.
+  rm -f "$HTP/.gov-saved" "$HTP/.gov-check"
+  if fetch /data/campaign-gov.saved "$HTP/.gov-saved" && [ -s "$HTP/.gov-saved" ]; then
+    remote 30 "gov=\$(cat /data/campaign-gov.saved); for c in /sys/devices/system/cpu/cpu[0-9]*; do echo \$gov > \$c/cpufreq/scaling_governor; done"
+    remote 30 "cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor > /data/tmp-gov.txt"
+    if fetch /data/tmp-gov.txt "$HTP/.gov-check" && [ -s "$HTP/.gov-check" ] \
+       && ! grep -qvxF "$(cat "$HTP/.gov-saved")" "$HTP/.gov-check"; then
+      remote 30 "rm -f /data/campaign-gov.saved"
+      log "governor restored to $(cat "$HTP/.gov-saved")"
+    else
+      log "WARN: governor restore NOT verified — /data/campaign-gov.saved kept; rerun finish"
+    fi
+  fi
   remote 120 "balena-engine start $CONTAINER"
   engine_state "$HTP/.ps-check"
   grep -q cairn "$HTP/.ps-check" && log "cairn container back up" || log "WARN: cairn container NOT running — start it: balena-engine start $CONTAINER"

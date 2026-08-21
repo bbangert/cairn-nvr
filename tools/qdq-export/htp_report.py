@@ -397,7 +397,12 @@ def latency_table(runs_dir, start_marker=None, pushed_file=None, art_dir=None):
     artifact's latency."""
     rows = {}
     start = 0
-    if start_marker and os.path.exists(start_marker):
+    if start_marker:
+        # No marker means no current latency stage: report nothing rather
+        # than let a content-only campaign publish historical runs as
+        # current. The caller prints the absence.
+        if not os.path.exists(start_marker):
+            return {}
         start = int(open(start_marker).read().strip() or 0)
     pushed = {}
     if pushed_file and os.path.exists(pushed_file):
@@ -599,6 +604,12 @@ def main():
                         start_marker=os.path.join(htp_dir, ".latency-start"),
                         pushed_file=os.path.join(htp_dir, "pushed.sha256"),
                         art_dir=os.path.join(out_root, "artifacts"))
+    if not lat:
+        report.append(
+            "\n- latency: no evidence from a current latency stage "
+            "(missing/empty .latency-start or no authenticated runs) — "
+            "historical bench runs are not reported as current."
+        )
     if lat:
         report += ["", "## Latency (bench.sh, 1 cam, governor pinned)", "",
                    "| rung | backend | p50 ms | p95 ms | runs/60s |", "|---|---|---|---|---|"]
