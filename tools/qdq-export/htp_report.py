@@ -310,6 +310,13 @@ def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None):
     if len(pairs) < MIN_PAIRED:
         result["verdict"] = "INSUFFICIENT"
         result["why"] = f"only {len(pairs)} paired frames (< {MIN_PAIRED})"
+    elif htp_max <= 0.0:
+        # An all-zero person series has a zero-std top and would satisfy
+        # the plateau test — and CAP is exactly what the sensitivity
+        # control must grade, so a dead detector could otherwise
+        # validate the campaign.
+        result["verdict"] = "COLLAPSE"
+        result["why"] = "no HTP person detection in any paired reference window"
     elif med >= 0.9 and below_half <= len(pairs) // 10 and not plateau:
         result["verdict"] = "PASS"
     elif plateau:

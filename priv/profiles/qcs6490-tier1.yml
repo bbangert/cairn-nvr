@@ -6,7 +6,7 @@
 # CPU-EP run on real clips — a16 person-window medians 0.99-1.001,
 # a8 medians 1.03-1.18 (hot; see the a8 note below), no cap, no
 # depression — and carries a fresh governor-pinned p50
-# (.claude/plans/qdq-reexport/research/htp-verification-20260821.md).
+# (docs/evidence/qdq-reexport-htp-20260821.md).
 # The shipped pre-campaign artifacts are DEFECTIVE (baked score
 # ceilings + an HTP-only score multiplication); file names are
 # width-suffixed precisely so a rung can never resolve to a stale

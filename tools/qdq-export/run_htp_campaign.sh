@@ -121,15 +121,28 @@ QNN_SESSION_BUDGET=18
 QNN_SESSIONS=0
 do_reboot() {
   log "== reboot: clearing CDSP session-leak state"
+  # A reboot that never happened must not be reported as one: the ssh
+  # command can fail before executing `reboot`, the board stays up, and
+  # a liveness probe then "succeeds" immediately. The boot id is the
+  # witness — wait for it to CHANGE, not for the board to answer.
+  remote 30 "cat /proc/sys/kernel/random/boot_id > /data/tmp-bootid.txt"
+  fetch /data/tmp-bootid.txt "$HTP/.bootid-before" || { log "FATAL: cannot read boot id"; exit 1; }
   remote 20 reboot
   sleep 20
   local waited=20
-  until timeout 10 ssh -n -o BatchMode=yes "$BOARD" "1" > /dev/null 2>&1; do
+  while :; do
+    rm -f "$HTP/.bootid-after"
+    if remote 15 "cat /proc/sys/kernel/random/boot_id > /data/tmp-bootid.txt"; then
+      fetch /data/tmp-bootid.txt "$HTP/.bootid-after" || true
+      if [ -f "$HTP/.bootid-after" ] && ! cmp -s "$HTP/.bootid-before" "$HTP/.bootid-after"; then
+        break
+      fi
+    fi
     sleep 10
     waited=$((waited + 10))
-    [ "$waited" -ge 300 ] && { log "FATAL: board not back after ${waited}s"; exit 1; }
+    [ "$waited" -ge 300 ] && { log "FATAL: boot id unchanged after ${waited}s — reboot did not happen"; exit 1; }
   done
-  log "board back after ~${waited}s"
+  log "board back with a new boot id after ~${waited}s"
   # HA's supervisor autostarts the addon on boot; give it a moment so
   # ensure_engine_stopped sees (and stops) the running container rather
   # than racing its startup.

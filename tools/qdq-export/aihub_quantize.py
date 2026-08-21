@@ -243,6 +243,12 @@ def fetch():
     # only requires that SOME artifacts exist, so a failed job that left
     # its slot empty would let the remaining subset grade the whole MATRIX.
     incomplete = []
+    # state["jobs"] is a checkpoint, not the plan: an interrupted submit
+    # leaves a valid-looking subset recorded, so completeness is judged
+    # against the full MATRIX.
+    expected = {f"{stem}-aihub-{width}" for stem, widths in MATRIX for width in widths}
+    for name in sorted(expected - set(state["jobs"])):
+        incomplete.append(f"{name}: never submitted")
     for name, recorded in state["jobs"].items():
         job_id = recorded["job_id"] if isinstance(recorded, dict) else recorded
         target_dir = os.path.join(ART_DIR, name)
