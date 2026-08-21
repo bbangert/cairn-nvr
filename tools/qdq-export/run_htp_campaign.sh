@@ -240,6 +240,11 @@ content_run() { # <backend> <model-path> <rung-label> <profile> <insize>
 
 do_content() {
   log "== content runs: ${CLIPS} x (12 rungs qnn + nano ort control + old-nano defect control)"
+  # Anchor the session counter to a clean CDSP: envcheck (and any prior
+  # manual session this boot) has already leaked graph handles, and the
+  # budget below counts only sessions THIS stage starts — without this
+  # reboot the ~26-session wedge can land before the first budgeted one.
+  do_reboot
   pin_governor
   while IFS=: read -r name profile insize; do
     [ -z "$name" ] && continue

@@ -95,6 +95,8 @@ def run(model_path, frames, layout):
 
 
 def compare(fp32_path, qdq_path, frame_dir, tolerance=0.9, limit=None, out=sys.stdout):
+    if limit is not None and limit < 2:
+        raise SystemExit(f"--limit must be >= 2 (got {limit}): even spacing needs both endpoints")
     info = describe(fp32_path)
     layout = info["layout"]
     if layout not in ("yolox", "yolov8"):
@@ -123,11 +125,16 @@ def compare(fp32_path, qdq_path, frame_dir, tolerance=0.9, limit=None, out=sys.s
     q_best, q_person = run(qdq_path, tensors, layout)
 
     bounds, total = level_bounds(width, height)
-    if f_best.shape[1] != total:
-        raise SystemExit(
-            f"{fp32_path}: {f_best.shape[1]} anchors, expected {total} for "
-            f"{width}x{height} — level split would be wrong"
-        )
+    # Both sides, not just the anchor: a QDQ/vendor artifact with an
+    # altered output contract would otherwise have extra anchors silently
+    # ignored (or a truncated last level partially compared) and still be
+    # graded.
+    for label, arr in ((fp32_path, f_best), (qdq_path, q_best)):
+        if arr.shape[1] != total:
+            raise SystemExit(
+                f"{label}: {arr.shape[1]} anchors, expected {total} for "
+                f"{width}x{height} — level split would be wrong"
+            )
 
     print(f"  parity over {len(paths)} frames from {frame_dir}", file=out)
     rows, failures = [], []

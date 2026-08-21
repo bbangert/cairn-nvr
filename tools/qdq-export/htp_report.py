@@ -460,14 +460,20 @@ def main():
         fp32 = os.path.join(out_root, "sources", "yolox_nano.onnx")
         r = analyze_run(old_ctl, cpu_series(art, frames, args.ref_fps, ref_dir),
                         cpu_series(fp32, frames, args.ref_fps, ref_dir))
-        if r["verdict"] == "PASS":
+        # The control is valid ONLY if it reproduces the known defect's
+        # signature. "Anything but PASS" would let NO-DATA / SUSPECT /
+        # STALE-EVIDENCE / INSUFFICIENT — a broken or truncated control
+        # run — count as the test demonstrably seeing the defect class.
+        if r["verdict"] != "CAP":
             controls_invalid.append(
-                "defective-nano control graded PASS (the test failed to see the defect)"
+                f"defective-nano control graded {r['verdict']} "
+                "(expected CAP — the known defect signature was not reproduced)"
             )
         report.append(
             f"- shipped defective nano (sensitivity control): **{r['verdict']}** "
-            f"{r.get('htp_band', '')} {r.get('why', '')} — must NOT be PASS; a "
-            "clean pass here means the test cannot see the defect class."
+            f"{r.get('htp_band', '')} {r.get('why', '')} — must grade CAP "
+            "(the baked-ceiling signature); anything else means the test did "
+            "not demonstrably see the defect class."
         )
 
     lat = latency_table(os.path.join(htp_dir, "runs"))

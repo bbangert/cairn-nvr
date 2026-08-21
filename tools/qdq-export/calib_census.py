@@ -45,6 +45,8 @@ def source_stem(path):
 
 
 def census(calib_dir, model=None, limit=None, score_floor=0.5, out=sys.stdout):
+    if limit is not None and limit < 2:
+        raise SystemExit(f"--limit must be >= 2 (got {limit}): even spacing needs both endpoints")
     paths = sorted(glob.glob(os.path.join(calib_dir, "*.png")))
     if not paths:
         raise SystemExit(f"no PNG frames in {calib_dir}")

@@ -50,7 +50,7 @@ detection (11%, against the 10% allowance).
 | yolo26n-416-qdq-a16 | 1.001 | 1.0 | 1.0 |
 | yolo26s-qdq-a16 | 1.0 | 1.0 | 1.0 |
 | yolo26m-qdq-a16 | 1.0 | 1.0 | 1.0 |
-| yolov8n-qdq-a16 | 0.995 FAIL | 0.989 | 0.995 | 1.000 |
+| yolov8n-qdq-a16 | 0.995 FAIL | 0.989 | 0.995 |
 
 (Values are the person-window median per-frame ratio, HTP vs the same
 artifact on the CPU EP, misses counted as zeros. a8 rungs read 3–18% hot on the HTP — the EP's
@@ -65,27 +65,21 @@ the test demonstrably sees the defect class it exists to block, and
 
 ## Latency (bench.sh, 1 cam, governor pinned)
 
-| rung | p50 ms | p95 ms |
-|---|---|---|
-| yolox_tiny-qdq-a8 | 8.55 | 12.20 |
-| yolox_nano-qdq-a16 | 1.0 | 0.998 | 1.001 |
-| yolox_tiny-qdq-a16 | 0.999 | 1.0 | 1.001 |
-| yolox_tiny-qdq-a8 | 1.108 | 1.108 | 1.177 |
-| yolox_s-qdq-a16 | 1.0 | 0.998 | 0.999 |
-| yolox_s-qdq-a8 | 1.075 | 1.075 | 1.077 |
-| yolox_m-qdq-a16 | 0.999 | 1.001 | 1.0 |
-| yolox_m-qdq-a8 | 1.023 | 1.025 | 1.0 |
-| yolo26n-qdq-a16 | 0.994 | 1.0 | 0.987 |
-| yolo26n-416-qdq-a16 | 1.001 | 1.0 | 1.0 |
-| yolo26s-qdq-a16 | 1.0 | 1.0 | 1.0 |
-| yolo26m-qdq-a16 | 1.0 | 1.0 | 1.0 |
-| yolov8n-qdq-a16 | 0.995 FAIL | 0.989 | 0.995 |
-| yolo26n-qdq-a16 | 24.39 | 27.06 |
-| yolo26s-qdq-a16 | 35.65 | 36.35 |
-| yolox_m-qdq-a8 | 38.62 | 39.14 |
-| yolox_s-qdq-a16 | 42.70 | 43.18 |
-| yolo26m-qdq-a16 | 52.83 | 55.06 |
-| yolox_m-qdq-a16 | 58.35 | 59.46 |
+| rung | backend | p50 ms | p95 ms |
+|---|---|---|---|
+| yolox_tiny-qdq-a8 | qnn | 8.55 | 12.20 |
+| yolox_nano-qdq-a16 | qnn | 10.38 | 11.08 |
+| yolo26n-416-qdq-a16 | qnn | 12.30 | 12.59 |
+| yolox_tiny-qdq-a16 | qnn | 12.78 | 16.86 |
+| yolox_s-qdq-a8 | qnn | 17.17 | 17.74 |
+| yolov8n-qdq-a16 | qnn | 21.35 | 23.86 |
+| yolo26n-qdq-a16 | qnn | 24.39 | 27.06 |
+| yolo26s-qdq-a16 | qnn | 35.65 | 36.35 |
+| yolox_m-qdq-a8 | qnn | 38.62 | 39.14 |
+| yolox_s-qdq-a16 | qnn | 42.70 | 43.18 |
+| yolo26m-qdq-a16 | qnn | 52.83 | 55.06 |
+| yolox_m-qdq-a16 | qnn | 58.35 | 59.46 |
+| yolox_nano-qdq-a16 | ort | 178.97 | 211.61 |
 
 The w8a8 refund that reshaped the ladder: yolox_s-a8 2.49x its a16,
 tiny and m ~1.5x. yolox_nano's a8 collapses per-frame and the
