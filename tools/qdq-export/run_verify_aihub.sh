@@ -16,7 +16,11 @@ mkdir -p "$R"
 
 : > "$R/qparam-summaries.txt"
 : > "$R/parity.txt"
+rc=0
+checked=0
 for art in "$A"/*/model.onnx; do
+  [ -f "$art" ] || continue
+  checked=$((checked + 1))
   base=$(basename "$(dirname "$art")")
   case "$base" in
   *-416-*) size=416 ;;
@@ -29,19 +33,28 @@ for art in "$A"/*/model.onnx; do
   # own writes) — safe on artifacts we paid job quota for.
   echo "=== $base (input $size) ===" | tee -a "$R/qparam-summaries.txt"
   "$PY" "$HERE/qparam_gate.py" "$art" --input-size "$size" \
-    >> "$R/qparam-summaries.txt" 2>&1 || echo "  GATE FAIL" >> "$R/qparam-summaries.txt"
+    >> "$R/qparam-summaries.txt" 2>&1 || { echo "  GATE FAIL" >> "$R/qparam-summaries.txt"; rc=1; }
 
   echo "=== $base ===" >> "$R/parity.txt"
   echo "--- heldout" >> "$R/parity.txt"
   "$PY" "$HERE/score_parity.py" --fp32 "$O/sources/$stem.onnx" --qdq "$art" \
     --frames "$ROOT/plugins/cairn-detect/model/heldout_frames" --limit 16 \
-    >> "$R/parity.txt" 2>&1 || true
+    >> "$R/parity.txt" 2>&1 || rc=1
   echo "--- board" >> "$R/parity.txt"
   "$PY" "$HERE/score_parity.py" --fp32 "$O/sources/$stem.onnx" --qdq "$art" \
-    --frames "$O/parity-board" --limit 60 >> "$R/parity.txt" 2>&1 || true
+    --frames "$O/parity-board" --limit 60 >> "$R/parity.txt" 2>&1 || rc=1
 done
 
 echo "== gate results =="
 grep -E "^===|ceiling|GATE FAIL|islands" "$R/qparam-summaries.txt" | tail -60
 echo "== parity verdicts =="
 grep -E "^===|parity (PASS|FAIL)" "$R/parity.txt"
+# Same posture as run_verify_all.sh: a run that gated nothing, or one where
+# any advertised gate failed, must not exit green — these are the artifacts
+# a ladder decision reads.
+if [ "$checked" -eq 0 ]; then
+  echo "verify-aihub: no artifacts matched under $A — nothing was verified" >&2
+  exit 1
+fi
+echo "verify-aihub: $checked artifact(s) checked"
+exit $rc

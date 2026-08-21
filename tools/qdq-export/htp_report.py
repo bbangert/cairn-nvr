@@ -76,10 +76,29 @@ def extract_frames(clip_path, out_dir, fps):
     )
 
 
+def model_digest(model_path):
+    """Twelve hex chars of the artifact's bytes — the cache's identity.
+
+    The stem alone is a trap this campaign is specifically about: an
+    artifact REBUILT under the same filename must never inherit the old
+    bytes' scores from a warm cache.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(model_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:12]
+
+
 def cpu_series(model_path, frame_dir, fps, cache_dir):
     """Per-frame (t, person max, best max) on the CPU EP, cached."""
     stem = os.path.splitext(os.path.basename(model_path))[0]
-    cache = os.path.join(cache_dir, f"{stem}-{os.path.basename(frame_dir)}.json")
+    cache = os.path.join(
+        cache_dir,
+        f"{stem}-{model_digest(model_path)}-{os.path.basename(frame_dir)}-{fps:g}.json",
+    )
     if os.path.exists(cache):
         with open(cache) as f:
             return json.load(f)
@@ -297,10 +316,20 @@ def main():
         os.path.splitext(os.path.basename(p))[0].replace("clip-", "")
         for p in sorted(glob.glob(os.path.join(clips_dir, "clip-*.mp4")))
     ]
+    if not clip_names:
+        # Without the reference corpus every loop below runs zero times and
+        # an empty report would exit green — the exact hollow success this
+        # analyzer exists to refuse.
+        raise SystemExit(f"no clip-*.mp4 in {clips_dir} — nothing to analyze against")
+
+    def frames_dir(c):
+        # fps in the name: frames extracted at a previous --ref-fps must
+        # not serve a run that asked for a different timeline density.
+        return os.path.join(ref_dir, f"frames-{c}-{args.ref_fps:g}")
+
     for c in clip_names:
         extract_frames(
-            os.path.join(clips_dir, f"clip-{c}.mp4"),
-            os.path.join(ref_dir, f"frames-{c}"), args.ref_fps,
+            os.path.join(clips_dir, f"clip-{c}.mp4"), frames_dir(c), args.ref_fps,
         )
 
     content = os.path.join(htp_dir, "content")
@@ -327,7 +356,7 @@ def main():
                 verdicts[rung].append("NO-DATA")
                 report.append(f"| {rung} | {c} | - | - | - | - | **NO-DATA** — run not fetched |")
                 continue
-            frames = os.path.join(ref_dir, f"frames-{c}")
+            frames = frames_dir(c)
             r = analyze_run(
                 run_dir,
                 cpu_series(art, frames, args.ref_fps, ref_dir),
@@ -341,9 +370,13 @@ def main():
             )
 
     report += ["", "## Controls", ""]
+    controls_missing = []
     ort_ctl = os.path.join(content, "yolox_nano-qdq-a16-ort-ac86")
+    if not os.path.isdir(ort_ctl):
+        controls_missing.append("board CPU-EP control")
+        report.append("- board CPU-EP control: **NO-DATA** — run missing; nothing ties board decode+sampling to the local reference.")
     if os.path.isdir(ort_ctl):
-        frames = os.path.join(ref_dir, "frames-ac86")
+        frames = frames_dir("ac86")
         art = os.path.join(out_root, "artifacts", "yolox_nano-qdq-a16.onnx")
         fp32 = os.path.join(out_root, "sources", "yolox_nano.onnx")
         r = analyze_run(ort_ctl, cpu_series(art, frames, args.ref_fps, ref_dir),
@@ -355,8 +388,11 @@ def main():
             "PASS is a methodology problem, not a model problem."
         )
     old_ctl = os.path.join(content, "control-old-nano-a16-qnn-ac86")
+    if not os.path.isdir(old_ctl):
+        controls_missing.append("defective-nano sensitivity control")
+        report.append("- defective-nano sensitivity control: **NO-DATA** — run missing; the test's ability to SEE the defect class is unproven.")
     if os.path.isdir(old_ctl):
-        frames = os.path.join(ref_dir, "frames-ac86")
+        frames = frames_dir("ac86")
         art = os.path.join(out_root, "artifacts", "yolox_nano-qdq-a16.onnx")
         fp32 = os.path.join(out_root, "sources", "yolox_nano.onnx")
         r = analyze_run(old_ctl, cpu_series(art, frames, args.ref_fps, ref_dir),
@@ -375,6 +411,12 @@ def main():
             report.append(
                 f"| {model} | {backend} | {row['p50_ms']} | {row['p95_ms']} | {row['runs']} |"
             )
+
+    if controls_missing:
+        report.append(
+            "- **CAMPAIGN NOT CERTIFIABLE**: missing " + ", ".join(controls_missing)
+            + " — rung verdicts above stand on an unvalidated methodology."
+        )
 
     report += ["", "## Per-rung verdicts", ""]
     for rung, vs in verdicts.items():
