@@ -117,7 +117,7 @@ fn decode_base64(text: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for quad in bytes.chunks_exact(4) {
+    for quad in bytes.as_chunks::<4>().0 {
         let padding = quad.iter().rev().take_while(|byte| **byte == b'=').count();
         if padding > 2 {
             return None;

@@ -1200,7 +1200,7 @@ mod tests {
         let stride = size.w * 3;
         // every pixel pure red
         let mut plane = vec![0u8; stride * size.h];
-        for px in plane.chunks_exact_mut(3) {
+        for px in plane.as_chunks_mut::<3>().0 {
             px[0] = 255;
         }
         let tensor = stretched(&plane, stride, size, TensorEncoding::ImageNetRgb);

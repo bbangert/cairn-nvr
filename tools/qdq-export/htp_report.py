@@ -154,11 +154,37 @@ def nearest(t, series):
     return best if abs(best[0] - t) <= PAIR_TOLERANCE_S else None
 
 
+# A PASS below this many paired frames certifies nothing: one lucky match
+# in a truncated run must read as an incomplete run, not a healthy rung.
+MIN_PAIRED = 20
+
+
+def run_suspect(run_dir):
+    """The content test's own verdict on its run, from the fetched meta.
+
+    htp_content_test.sh records a non-EOF plugin exit and the feed's exit
+    there and nowhere else — an analyzer that never reads it would grade
+    truncated runs as if they were complete.
+    """
+    meta = os.path.join(run_dir, "meta")
+    if not os.path.exists(meta):
+        return "no meta fetched"
+    for line in open(meta):
+        if "run suspect" in line:
+            return line.strip()
+        if line.startswith("feed exited") and not line.rstrip().endswith(" 0"):
+            return line.strip()
+    return None
+
+
 def analyze_run(run_dir, ref_cpu, ref_fp32):
     """Verdict for one content run against its two reference series."""
     nd = os.path.join(run_dir, "out.ndjson")
     if not os.path.exists(nd):
         return {"verdict": "NO-DATA", "why": "no ndjson fetched"}
+    suspect = run_suspect(run_dir)
+    if suspect:
+        return {"verdict": "SUSPECT", "why": suspect}
     htp = htp_series(nd)
     if not htp:
         return {"verdict": "NO-DATA", "why": "no frame.objects lines"}
@@ -209,7 +235,10 @@ def analyze_run(run_dir, ref_cpu, ref_fp32):
         "ratio_iqr": round(iqr, 3),
         "below_half": below_half,
     })
-    if med >= 0.9 and below_half <= len(pairs) // 10 and not plateau:
+    if len(pairs) < MIN_PAIRED:
+        result["verdict"] = "INSUFFICIENT"
+        result["why"] = f"only {len(pairs)} paired frames (< {MIN_PAIRED})"
+    elif med >= 0.9 and below_half <= len(pairs) // 10 and not plateau:
         result["verdict"] = "PASS"
     elif plateau:
         result["verdict"] = "CAP"
@@ -292,6 +321,11 @@ def main():
         for c in clip_names:
             run_dir = os.path.join(content, f"{rung}-qnn-{c}")
             if not os.path.isdir(run_dir):
+                # An unfetched run must cost the rung its clean sweep — a
+                # silently skipped clip lets a partial fetch read as PASS,
+                # and a wholly missing rung would vanish from the report.
+                verdicts[rung].append("NO-DATA")
+                report.append(f"| {rung} | {c} | - | - | - | - | **NO-DATA** — run not fetched |")
                 continue
             frames = os.path.join(ref_dir, f"frames-{c}")
             r = analyze_run(

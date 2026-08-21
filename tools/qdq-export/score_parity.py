@@ -193,7 +193,15 @@ def compare(fp32_path, qdq_path, frame_dir, tolerance=0.9, limit=None, out=sys.s
             file=out,
         )
     else:
-        print("    person window: no frame reaches fp32 person >= 0.5", file=out)
+        # A frame set fp32 never finds a person in cannot certify the person
+        # leg, and falling through to PASS here would let an empty or
+        # unsuitable set green-light an artifact. The comparison the caller
+        # asked for did not happen — say so as a failure.
+        failures.append("person window: fp32 never reaches 0.5 — set unsuitable for the person leg")
+        print(
+            "    person window: no frame reaches fp32 person >= 0.5  <-- FAIL",
+            file=out,
+        )
 
     if failures:
         print("  parity FAIL: " + "; ".join(failures), file=out)

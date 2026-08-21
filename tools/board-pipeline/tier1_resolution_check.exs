@@ -20,7 +20,7 @@ tmp = Path.join(System.tmp_dir!(), "tier1-resolution-check-#{System.unique_integ
 File.mkdir_p!(Path.join(tmp, "models"))
 
 for stub <-
-      ~w(models/yolox_m_qdq.onnx models/yolox_tiny_qdq.onnx models/yolox_nano_qdq.onnx models/coco.names) do
+      ~w(models/yolox_m-qdq-a8.onnx models/yolox_s-qdq-a8.onnx models/yolox_tiny-qdq-a8.onnx models/yolox_nano-qdq-a16.onnx models/coco.names) do
   File.write!(Path.join(tmp, stub), "stub")
 end
 
@@ -52,7 +52,7 @@ end
 IO.puts("n,resolved_artifact,derived_sample_fps")
 
 table =
-  for n <- [2, 10, 11, 26, 28, 30, 36, 38, 40, 41], into: %{} do
+  for n <- [2, 10, 13, 14, 28, 29, 39, 40, 41], into: %{} do
     result = resolve.(n)
 
     case result do
@@ -68,26 +68,26 @@ table =
 File.cd!(original_cwd)
 File.rm_rf!(tmp)
 
-# The yolox_m head of the ladder (packs absent, as deploys today): its
-# PROVISIONAL 20 budget carries fleets through 10 and hands 11 to tiny —
-# arithmetic pinned so the file cannot drift silently, not a measured
-# boundary (its ladder run is owed, D-L6; the file says DRAFT). The
-# derived rate rises with headroom (D-L4): 2 cameras split the 20 budget
-# at 10 fps each, 10 cameras ride the floor.
-{"yolox_m_qdq.onnx", 10} = table[2]
-{"yolox_m_qdq.onnx", 2} = table[10]
-{"yolox_tiny_qdq.onnx", 7} = table[11]
+# The fixed-quantization ladder's Apache spine (packs absent, as deploys
+# today; qdq-reexport 2026-08-21). All budgets but nano's are PROVISIONAL
+# bench arithmetic (their ladder runs are owed, D-L6; the file says
+# DRAFT) — pinned so the file cannot drift silently: yolox_m-a8 (25.0)
+# carries fleets through 13, yolox_s-a8 (54.1) through 28, tiny-a8 (74,
+# held strictly under nano for reachability) through 39. The derived
+# rate rises with headroom (D-L4): 2 cameras split m's budget at 10 fps
+# each, boundary fleets ride the floor.
+{"yolox_m-qdq-a8.onnx", 10} = table[2]
+{"yolox_m-qdq-a8.onnx", 2} = table[10]
+{"yolox_m-qdq-a8.onnx", 2} = table[13]
+{"yolox_s-qdq-a8.onnx", 4} = table[14]
+{"yolox_s-qdq-a8.onnx", 2} = table[28]
+{"yolox_tiny-qdq-a8.onnx", 2} = table[29]
+{"yolox_tiny-qdq-a8.onnx", 2} = table[39]
 
-# Asserted against the MEASURED boundaries (tier1-boundary-20260815): the
-# tiny rung's 67.5 budget puts the tiny→nano crossover at exactly 36
-# (36 × 1.875 = 67.5), and nano carries 37–40; 41 exceeds the claim. A
-# mismatch means the shipped file and the measured record drifted apart.
-{"yolox_tiny_qdq.onnx", 2} = table[26]
-{"yolox_tiny_qdq.onnx", 2} = table[28]
-{"yolox_tiny_qdq.onnx", 2} = table[30]
-{"yolox_tiny_qdq.onnx", 2} = table[36]
-{"yolox_nano_qdq.onnx", 2} = table[38]
-{"yolox_nano_qdq.onnx", 2} = table[40]
+# nano's 75 is the one boundary-MEASURED budget (tier1-capacity
+# 2026-08-14, carried over on a matching p50): 40 × 1.875 = 75 exactly,
+# and 41 exceeds the claim.
+{"yolox_nano-qdq-a16.onnx", 2} = table[40]
 # The CLAIM bound specifically, not merely any refusal: no_rung_fits would
 # also refuse 41 with these budgets, and a claim drifted to 41+ must not
 # hide behind it.
@@ -95,6 +95,6 @@ File.rm_rf!(tmp)
 true = Enum.any?(errors_41, &(&1 =~ "exceed supported_cameras 40"))
 
 IO.puts(
-  "resolution check: PASS — yolox_m through 10 (provisional), tiny 11–36, nano 37–40, " <>
-    "41 refused by the claim"
+  "resolution check: PASS — m-a8 through 13, s-a8 through 28, tiny-a8 through 39 " <>
+    "(all provisional), nano-a16 at 40 (measured), 41 refused by the claim"
 )

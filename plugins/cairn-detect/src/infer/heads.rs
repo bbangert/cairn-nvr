@@ -276,7 +276,9 @@ fn require_values(have: usize, rows: usize, row: usize, dims: &[i64]) -> Result<
 /// a rounding error against the model pass behind them.
 fn end_to_end(rows: &[f32], labels: &Labels, floors: &ScoreFloors) -> Vec<Candidate> {
     let prefilter = floors.min_emit_floor();
-    rows.chunks_exact(6)
+    rows.as_chunks::<6>()
+        .0
+        .iter()
         .filter_map(|row| {
             // NaN survives `score < floor` (the comparison is false) and
             // serde_json writes non-finite floats as `null` — one such row

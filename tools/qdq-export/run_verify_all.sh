@@ -28,8 +28,10 @@ BOARD=${BOARD:-}
 LIMIT=${LIMIT:-60}
 TOLERANCE=${TOLERANCE:-0.9}
 rc=0
+verified=0
 for art in "$OUT"/*-qdq-a*.onnx; do
   [ -f "$art" ] || continue
+  verified=$((verified + 1))
   base=$(basename "$art" .onnx)
   stem=${base%-qdq-a16}
   stem=${stem%-qdq-a8}
@@ -45,4 +47,11 @@ for art in "$OUT"/*-qdq-a*.onnx; do
       --frames "$BOARD" --tolerance "$TOLERANCE" --limit "$LIMIT" || rc=1
   fi
 done
+# Rejected exports get deleted, so an empty artifact dir is the most likely
+# face of a broken pipeline — a run that verified nothing must not be green.
+if [ "$verified" -eq 0 ]; then
+  echo "verify-all: no artifacts matched in $OUT — nothing was verified" >&2
+  exit 1
+fi
+echo "verify-all: $verified artifact(s) checked"
 exit $rc
