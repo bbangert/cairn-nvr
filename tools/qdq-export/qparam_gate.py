@@ -27,6 +27,7 @@ Import `check` from the exporter, or run it standalone:
   qparam_gate.py <model-qdq.onnx> [--min-ceiling 0.95]
 """
 import argparse
+import math
 import sys
 
 import numpy as np
@@ -444,6 +445,15 @@ def check(model_path, min_ceiling=DEFAULT_MIN_CEILING, input_size=None, out=sys.
     for e in scores:
         if e["ceiling"] is None:
             bad.append(f"{e['node']}: no Q/DQ qparams on the sigmoid output")
+        elif not all(
+            v is None or math.isfinite(v)
+            for v in (e["scale"], e["dq_scale"], e["ceiling"])
+        ):
+            # NaN fails open through every </>/abs comparison below.
+            bad.append(
+                f"{e['node']}: non-finite qparams (scale {e['scale']}, "
+                f"DQ {e['dq_scale']}, ceiling {e['ceiling']})"
+            )
         elif e.get("scale_elems", 1) != 1 or e.get("dq_scale_elems", 1) != 1:
             # Activation Q/DQ must be per-tensor. Grading element zero of
             # a per-axis parameter would vouch for every class on the

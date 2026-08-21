@@ -33,11 +33,12 @@ plateau, no uniform depression — each failure shape is one defect
 class's signature). Three real clips, including the two whose return
 walks the defective artifacts missed.
 
-All seven shipped ladder rungs and every yolo26 pack rung PASS on all
-three clips. The one exception is `yolov8n-qdq-a16` — a test-only AGPL
-artifact, not a ladder rung — which fails ac86 marginally: median 0.995
-but 4 of 36 reference-confident frames without an adequate HTP
-detection (11%, against the 10% allowance).
+All seven ladder rungs — the four Apache rungs shipped in `models/`
+and the three pack-provided rungs — PASS on all three clips. The one
+exception among the board-worthy artifacts is `yolov8n-qdq-a16` — a
+test-only AGPL artifact, not a ladder rung — which fails ac86
+marginally: median 0.995 but 4 of 36 reference-confident frames
+without an adequate HTP detection (11%, against the 10% allowance).
 
 | rung | ac86 | aeb4 | f58a |
 |---|---|---|---|

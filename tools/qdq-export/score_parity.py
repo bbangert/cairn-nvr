@@ -144,7 +144,12 @@ def compare(fp32_path, qdq_path, frame_dir, tolerance=0.9, limit=None, out=sys.s
         ratio = qmax / fmax if fmax > 0 else float("nan")
         rows.append((stride, fmax, qmax, ratio))
         flag = ""
-        if fmax >= REPORTABLE and ratio < tolerance:
+        # NaN fails open through every comparison below — a non-finite
+        # maximum is a broken level, not a passing one.
+        if not (np.isfinite(fmax) and np.isfinite(qmax)):
+            failures.append(f"s{stride}: non-finite maxima (fp32 {fmax}, qdq {qmax})")
+            flag = "  <-- FAIL"
+        elif fmax >= REPORTABLE and ratio < tolerance:
             # A level FP32 itself never drives past the reporting floor
             # carries nothing to compare: neither number would become a
             # detection, so their ratio grades noise against noise. Such
@@ -188,7 +193,14 @@ def compare(fp32_path, qdq_path, frame_dir, tolerance=0.9, limit=None, out=sys.s
             file=out,
         )
         flag = ""
-        if median_ratio < tolerance:
+        if not np.isfinite(ratios).all():
+            # np.median of anything non-finite is NaN, and NaN < tolerance
+            # is False — the gate would pass a broken window.
+            failures.append(
+                f"person window: {int((~np.isfinite(ratios)).sum())} non-finite ratios"
+            )
+            flag = "  <-- FAIL"
+        elif median_ratio < tolerance:
             failures.append(
                 f"person window: median per-frame ratio {median_ratio:.2f}"
             )

@@ -216,6 +216,9 @@ def fetch():
         import zipfile
         zip_path = job.download_target_model(os.path.join(ART_DIR, f"{name}.onnx"))
         tmp = os.path.join(ART_DIR, f"{name}-tmp")
+        # An interrupted prior fetch can leave this tree; extracting into
+        # it would let a stale model.* be moved under the current job id.
+        shutil.rmtree(tmp, ignore_errors=True)
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(tmp)
         os.makedirs(target_dir, exist_ok=True)

@@ -372,6 +372,9 @@ do_fetch() {
 
 do_finish() {
   log "== finish: restore governor + restart container"
+  # Cleanup failures must propagate: a green campaign that leaves the
+  # board pinned to performance or the production NVR down is not green.
+  local finish_failed=0
   # Restore ONLY what pin_governor captured: a finish reached without a
   # pin (standalone envcheck, an early failure) must not write any
   # governor at all — restore-only means exactly that. The saved file is
@@ -386,12 +389,21 @@ do_finish() {
       remote 30 "rm -f /data/campaign-gov.saved"
       log "governor restored to $(cat "$HTP/.gov-saved")"
     else
-      log "WARN: governor restore NOT verified — /data/campaign-gov.saved kept; rerun finish"
+      log "FATAL: governor restore NOT verified — /data/campaign-gov.saved kept; rerun finish"
+      finish_failed=1
     fi
   fi
   remote 120 "balena-engine start $CONTAINER"
-  engine_state "$HTP/.ps-check"
-  grep -q cairn "$HTP/.ps-check" && log "cairn container back up" || log "WARN: cairn container NOT running — start it: balena-engine start $CONTAINER"
+  if engine_state "$HTP/.ps-check" && grep -qxF "$CONTAINER" "$HTP/.ps-check"; then
+    log "cairn container back up"
+  else
+    log "FATAL: cairn container NOT verified running — start it: balena-engine start $CONTAINER"
+    finish_failed=1
+  fi
+  if [ "$finish_failed" -ne 0 ]; then
+    log "FATAL: cleanup incomplete — the board is not back in its pre-campaign state"
+    exit 1
+  fi
 }
 
 case $STAGE in

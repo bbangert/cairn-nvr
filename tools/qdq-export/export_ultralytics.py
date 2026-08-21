@@ -37,6 +37,7 @@ def export(name, imgsz, out_dir, suffix=""):
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     model = YOLO(f"{name}.pt")
     path = model.export(format="onnx", imgsz=imgsz, end2end=False, opset=13)
+    os.makedirs(out_dir, exist_ok=True)
     dest = os.path.join(out_dir, f"{name}{suffix}.onnx")
     if os.path.abspath(path) != os.path.abspath(dest):
         shutil.move(path, dest)
