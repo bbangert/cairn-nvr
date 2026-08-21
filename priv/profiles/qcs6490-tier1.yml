@@ -1,108 +1,137 @@
-# DRAFT: yolox_m's budget is menu-arithmetic, not boundary-measured — its
-# ladder run is owed (D-L6). tiny and nano remain measured.
+# DRAFT: rebuilt 2026-08-21 on the fixed-quantization artifacts
+# (qdq-reexport campaign); every budget except nano's is provisional
+# bench arithmetic — the per-rung boundary ladder runs are owed (D-L6).
 #
-# Qualcomm QCS6490, tier 1 (presence detection) — the model-ladder profile.
+# Every rung below passed the HTP score leg on board .87 vs its own
+# CPU-EP run on real clips — a16 person-window medians 0.99-1.001,
+# a8 medians 1.03-1.18 (hot; see the a8 note below), no cap, no
+# depression — and carries a fresh governor-pinned p50
+# (.claude/plans/qdq-reexport/research/htp-verification-20260821.md).
+# The shipped pre-campaign artifacts are DEFECTIVE (baked score
+# ceilings + an HTP-only score multiplication); file names are
+# width-suffixed precisely so a rung can never resolve to a stale
+# defective file by path collision. Ships with 4.3 (walk test) —
+# artifacts and this file move together.
 #
-# ONE ladder for every installation state: the yolo26 rungs (AGPL —
-# distributed as cairn-models packs into the data dir, never baked into the
-# image) sit above the Apache rungs the image carries. Resolution takes the
-# most accurate INSTALLED rung whose budget covers the fleet, so with the
-# packs present yolox_m is shadowed by yolo26s (which dominates it — same
-# accuracy, lower latency, model-menu-htp 2026-08-14) and never wins; with
-# only the baked Apache models, yolox_m carries small fleets at 46.9 paper
-# mAP instead of falling to tiny's 32.8. That state-dependence is why its
-# budget may sit below yolo26s's: the reachability rule requires only that
-# no ALWAYS-PRESENT rung above it has at least its budget.
+# Budgets are PROVISIONAL: bench p50 + ~1.3 ms serialization, capped at
+# the ~75 passes/s serialized-engine-path ceiling (tier1-capacity
+# 2026-08-14). Boundary ladder runs are owed per rung — measured
+# sustained throughput beats this arithmetic by a model-dependent
+# margin (tiny's was +24%), so these numbers err conservative, never
+# optimistic. nano's 75 is the one boundary-measured budget: same
+# architecture/geometry as its predecessor and the p50 matches, so the
+# measurement is carried over pending re-confirmation.
 #
-# The ladder replaces a fixed model choice: config resolves, per load, the
-# most accurate rung whose measured engine budget covers the configured
-# fleet at tier 1's 2 fps floor (1.875/s effective on the 15 fps substream
-# grid), and derives every camera's sample_fps from the winning rung. Order
-# is paper-mAP, best first; budgets are passes/s on this board's HTP.
+# w8a8 vs w8a16: the fixed recipe makes a8 hold FP32 parity for
+# yolox_s/m/tiny (phase-2 parity + phase-3 HTP leg), refunding
+# 1.5-2.5x latency, so those rungs ship a8. yolox_nano a8 collapses
+# per-frame and the yolo26/yolov8 family cannot do a8 at all (head
+# Concat leaves the scores 0 codes) — those stay a16. Known a8
+# semantics note: HTP scores read 3-18% HOT vs CPU (the EP's 8-bit
+# sigmoid qparam sits a hair wide of the graph's pinned 1/256), so a
+# floor tuned on an a16 rung is conservative on an a8 rung.
 #
-# The capacity claim is dual-stream ONLY: detection reads the substream, and
-# single-stream the 5 MP Venus decode wall returns at ~4 cameras. It is also
-# the motion-gate-open worst case — the tier-1 capacity cells ran ungated,
-# so the gate buys power/thermal headroom, never extra cameras.
+# Ladder mechanics unchanged: one ladder for every installation state;
+# yolo26 rungs (AGPL, cairn-models packs, never baked) sit above the
+# Apache rungs the image carries; resolution takes the most accurate
+# INSTALLED rung whose budget covers the fleet at tier 1's 2 fps floor
+# (1.875/s effective on the 15 fps substream grid) and derives
+# sample_fps from the winner. Order is paper-mAP, best first.
 #
-# experimental: true because qnn has not soaked (D-P10): a group naming this
-# profile also needs `allow_experimental: true`.
+# The capacity claim is dual-stream ONLY: detection reads the
+# substream; single-stream the 5 MP Venus decode wall returns at ~4
+# cameras. Capacity cells ran gate-open, so the motion gate buys
+# power/thermal headroom, never extra cameras.
+#
+# experimental: true because qnn has not soaked (D-P10): a group naming
+# this profile also needs `allow_experimental: true`.
 experimental: true
 tier: 1
 backend: qnn
 model_ladder:
-  # provisional budget: menu bench p50 58.2 ms + ~1.3 ms serialization
-  # (model-menu-htp 2026-08-14) — boundary ladder run owed (D-L6).
+  # p50 52.83 ms (2026-08-21, fixed artifact) -> 1000/54.1 = 18.5.
   - model:
-      qnn: data/models/yolo26m-qdq.onnx
+      qnn: data/models/yolo26m-qdq-a16.onnx
     model_profile: yolo26
     input_size: 640
-    engine_budget: 16.8
+    engine_budget: 18.5
     pack: yolo26m
-  # provisional budget: menu bench p50 37.4 ms + serialization (2026-08-07
-  # bench, same board) — boundary ladder run owed.
+  # provisional budget: p50 35.65 ms -> 27.1. Dominates yolox_m-a16 as
+  # before; a8 yolox_m narrows the gap (38.6 vs 35.7 ms), stays behind.
   - model:
-      qnn: data/models/yolo26s-qdq.onnx
+      qnn: data/models/yolo26s-qdq-a16.onnx
     model_profile: yolo26
     input_size: 640
-    engine_budget: 25.8
+    engine_budget: 27.1
     pack: yolo26s
-  # The best accuracy the image itself carries (46.9 paper mAP, Apache).
-  # Wins exactly when the yolo26 packs above are absent and the fleet is
-  # small (≤10 at the floor); dominated by an installed yolo26s otherwise.
-  # provisional budget: menu bench p50 48.5 ms + serialization
-  # (model-menu-htp 2026-08-14) — boundary ladder run owed (D-L6).
+  # Best accuracy the image itself carries (46.9 paper mAP, Apache).
+  # Now w8a8. provisional budget: p50 38.62 ms (was 58.35 at a16) ->
+  # 25.0 — the refund moves its budget past the old a16 arithmetic
+  # (20), so it carries mid fleets when the yolo26 packs are absent.
   - model:
-      qnn: models/yolox_m_qdq.onnx
+      qnn: models/yolox_m-qdq-a8.onnx
     model_profile: yolox
     input_size: 640
-    engine_budget: 20
-  # provisional budget: menu bench p50 17.7 ms + serialization (2026-08-14).
-  # Known recall flag: the 416 export's verify scores cluster at 0.506–0.513
-  # against the 0.5 floor — re-verify on real camera frames before leaning
-  # on this rung (model-menu-htp "reads").
+    engine_budget: 25.0
+  # NEW RUNG: yolox_s at w8a8 (40.5 paper mAP, Apache). At a16 its
+  # 42.7 ms bought nothing over yolox_m; at 17.17 ms it owns the band
+  # between m and the 416 rungs with image-baked accuracy.
+  # provisional budget: p50 17.17 ms -> 54.1.
   - model:
-      qnn: data/models/yolo26n-416-qdq.onnx
+      qnn: models/yolox_s-qdq-a8.onnx
+    model_profile: yolox
+    input_size: 640
+    engine_budget: 54.1
+  # provisional budget: p50 12.30 ms (was 17.7 on the defective
+  # export) -> 73.5. The old
+  # "recall flag" (verify scores clustered at 0.506-0.513 against the
+  # 0.5 floor) was THE DEFECT — the fixed rung's HTP person windows sit
+  # 0.5-0.91 with median ratio 1.0. Re-verified on real camera frames
+  # by the phase-3 content leg (clip-ac86/f58a/aeb4).
+  - model:
+      qnn: data/models/yolo26n-416-qdq-a16.onnx
     model_profile: yolo26
     input_size: 416
-    engine_budget: 52.6
+    engine_budget: 73.5
     pack: yolo26n-416
-  # measured budget: boundary ladder 2026-08-15 — 36 cameras at the
-  # 1.875/s effective floor (67.5 passes/s) delivered 100% uniform ×2;
-  # ceiling onset at 38 (98.8%, CPU dropping — engine-bound). The menu
-  # arithmetic (17.0 ms p50 → 54.6/s) ran 24% low: sustained HTP
-  # throughput beats single-camera bench p50 by a model-dependent margin
-  # (nano's gap was only ~4%), which is why budgets are ladder-measured,
-  # never bench-derived. Evidence: tier1-boundary-20260815.
+  # Now w8a8. provisional budget: p50 8.55 ms (was 17.0) — arithmetic
+  # says 101/s, the serialized engine path caps at ~75, and the
+  # reachability rule pins it strictly UNDER nano's measured 75 (an
+  # always-present rung equal to the one below it makes that rung
+  # unreachable). 74 until its own boundary run; if that run confirms
+  # the engine ceiling, tiny dominates nano (32.8 vs 25.8 mAP, same
+  # budget) and the nano rung gets deleted rather than out-budgeted.
   - model:
-      qnn: models/yolox_tiny_qdq.onnx
+      qnn: models/yolox_tiny-qdq-a8.onnx
     model_profile: yolox
     input_size: 416
-    engine_budget: 67.5
-  # measured budget: tier1-capacity ladder 2026-08-14 — 40 cameras at the
-  # 1.875/s effective floor (= 75.0 passes/s) delivered 100% in three runs;
-  # 44 showed ceiling onset. The engine path, not decode or RSS, binds.
-  # Re-confirmed 2026-08-15 through the shipped ladder's own resolution
-  # (tier1-boundary findings, task 3.2).
+    engine_budget: 74
+  # a16 (nano a8 collapses per-frame — phase-2 finding). measured
+  # budget: the 2026-08-14 boundary ladder (40 cams at the floor =
+  # 75 passes/s, three clean runs) on the predecessor artifact, carried
+  # over because the fixed artifact's p50 10.38 ms matches it;
+  # re-confirm on its own ladder run.
   - model:
-      qnn: models/yolox_nano_qdq.onnx
+      qnn: models/yolox_nano-qdq-a16.onnx
     model_profile: yolox
     input_size: 416
     engine_budget: 75
-# The support claim, enforced as a bound: 40 is yolox_nano's measured reach
-# at the tier-1 floor (tier1-capacity 2026-08-14, host-side; container
-# parity re-check owed per qcs6490-profiles D-P2/D-P3). A larger fleet is
-# refused at load even though it is also past every budget.
+# The support claim, enforced as a bound: 40 is yolox_nano's measured
+# reach at the tier-1 floor (tier1-capacity 2026-08-14, host-side;
+# container parity re-check owed per qcs6490-profiles D-P2/D-P3). A
+# larger fleet is refused at load even though it is also past every
+# budget.
 supported_cameras: 40
-# Venus, through ffmpeg's h264_v4l2m2m — the one decode field cairn ships
-# with a measurement behind it (spike 0.3: the live fleet concurrently at
-# 59 and 47 fps for ~2% CPU, vs ~30% of a core per camera in software).
-# Named rather than left at `auto` because on a membrane camera a named
-# decoder is a requirement: if Venus is not there, detection stops and says
-# so instead of quietly eating the CPU the models need. At substream
-# resolution decode never binds (~6.3%/cam CPU in the capacity cells).
+# Venus, through ffmpeg's h264_v4l2m2m — the one decode field cairn
+# ships with a measurement behind it (spike 0.3: the live fleet
+# concurrently at 59 and 47 fps for ~2% CPU, vs ~30% of a core per
+# camera in software). Named rather than left at `auto` because on a
+# membrane camera a named decoder is a requirement: if Venus is not
+# there, detection stops and says so instead of quietly eating the CPU
+# the models need. At substream resolution decode never binds
+# (~6.3%/cam CPU in the capacity cells).
 decoder: v4l2
 labels: models/coco.names
-# No tracking block, and none would be legal: tier 1 is presence detection
-# and its pipeline runs no tracker — config refuses a tier-1 profile that
-# says otherwise.
+# No tracking block, and none would be legal: tier 1 is presence
+# detection and its pipeline runs no tracker — config refuses a tier-1
+# profile that says otherwise.

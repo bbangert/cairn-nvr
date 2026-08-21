@@ -60,3 +60,6 @@ config.yml
 # board-pipeline working artifacts (clips are board/scratch staged, results are evidence trees)
 /tools/board-pipeline/clips/
 /tools/board-pipeline/ladder-results/
+
+# Qualcomm AI Hub credentials (Ben, 2026-08-21) — never commit
+qualcomm.env

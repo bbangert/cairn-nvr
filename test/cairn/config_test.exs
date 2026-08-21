@@ -2727,32 +2727,42 @@ defmodule Cairn.ConfigTest do
       # the absent-block half of the presence rule.
       assert profile.stages == nil
 
-      # Three yolo26 pack rungs interleaved with three baked Apache rungs:
+      # Three yolo26 pack rungs interleaved with four baked Apache rungs
+      # (the fixed-quantization rebuild, htp-verification-20260821):
       # yolox_m sits under yolo26s with a LOWER budget on purpose — the
-      # pack dominates it when installed, and it carries small fleets at
+      # pack dominates it when installed, and it carries mid fleets at
       # 46.9 mAP when only the image's own models exist (the reachability
-      # rule; see check_budget_order). tiny and nano budgets are
-      # boundary-measured (tier1-boundary-20260815), the rest provisional
-      # until their ladder runs (D-L6).
-      assert [_m26, _s26, xm, _n416, tiny, nano] = profile.model_ladder
+      # rule; see check_budget_order). yolox_s/m/tiny now ship w8a8 (the
+      # fixed recipe holds parity there and refunds 1.5-2.5x latency);
+      # nano's budget is boundary-measured, the rest provisional until
+      # their ladder runs (D-L6).
+      assert [_m26, _s26, xm, xs, n416, tiny, nano] = profile.model_ladder
 
       assert Enum.map(profile.model_ladder, & &1.pack) ==
-               ["yolo26m", "yolo26s", nil, "yolo26n-416", nil, nil]
+               ["yolo26m", "yolo26s", nil, nil, "yolo26n-416", nil, nil]
 
-      assert xm.model == %{"qnn" => "models/yolox_m_qdq.onnx"}
+      assert xm.model == %{"qnn" => "models/yolox_m-qdq-a8.onnx"}
+      assert xs.model == %{"qnn" => "models/yolox_s-qdq-a8.onnx"}
 
       assert Enum.map(profile.model_ladder, & &1.engine_budget) ==
-               [16.8, 25.8, 20, 52.6, 67.5, 75]
+               [18.5, 27.1, 25.0, 54.1, 73.5, 74, 75]
 
       # The crossovers, held with the same arithmetic resolution uses:
-      # yolox_m's provisional 20 carries fleets through 10 when the packs
-      # are absent; 36 × 1.875 = 67.5 fits tiny exactly, 37 spills to
-      # nano. This pins the shipped numbers to the record they came from.
+      # packs absent, yolox_m-a8 carries fleets through 13, yolox_s-a8
+      # through 28, tiny through 39; 40 × 1.875 = 75 fits nano exactly
+      # (its measured reach, = supported_cameras). The 26n-416 pack and
+      # tiny share the through-39 boundary, so installing that pack buys
+      # accuracy at 29-39 cameras, never reach. This pins the shipped
+      # numbers to the record they came from.
       floor_rate = Cairn.Config.Profile.effective_rate(2)
-      assert 10 * floor_rate < xm.engine_budget
-      assert 11 * floor_rate > xm.engine_budget
-      assert 36 * floor_rate == tiny.engine_budget
-      assert 37 * floor_rate > tiny.engine_budget
+      assert 13 * floor_rate < xm.engine_budget
+      assert 14 * floor_rate > xm.engine_budget
+      assert 28 * floor_rate < xs.engine_budget
+      assert 29 * floor_rate > xs.engine_budget
+      assert 39 * floor_rate < n416.engine_budget
+      assert 40 * floor_rate > n416.engine_budget
+      assert 39 * floor_rate < tiny.engine_budget
+      assert 40 * floor_rate > tiny.engine_budget
       assert 40 * floor_rate <= nano.engine_budget
     end
 

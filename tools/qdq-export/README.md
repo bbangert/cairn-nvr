@@ -122,6 +122,19 @@ Three checks, and only the third can see everything.
   below ORT's default severity, and a mostly-HTP graph with CPU islands
   passes a latency-ratio check easily.
 
+  The leg is automated: `run_htp_campaign.sh` pushes the artifacts,
+  gates the bench env on a nano-parity check against the phase-0 spike
+  numbers, runs `htp_content_test.sh` per rung × clip (plugin first,
+  feed once — a looped feed wraps pts and the clip-time mapping that
+  window analysis rests on is garbage), re-measures latency with the
+  governor pinned, and fetches the evidence; `htp_report.py` renders
+  verdicts, classifying failures by defect signature (plateau = baked
+  ceiling, uniform depression = EP qparam rewrite). It stops the cairn
+  container for the duration — the app holds the NPU — and restarts it
+  on exit. Two built-in controls: a board CPU-EP run (ties board decode
+  to the local reference) and the shipped defective nano, which must
+  FAIL or the test has lost its sensitivity.
+
 ## Alternatives considered
 
 Qualcomm AI Hub publishes quantized detectors for this SoC. Two things
