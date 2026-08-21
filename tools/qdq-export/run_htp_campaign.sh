@@ -88,12 +88,19 @@ engine_state() { # writes container names to $1 (local file)
 
 ensure_engine_stopped() {
   local f=$HTP/.ps-check
-  engine_state "$f" || { log "WARN: cannot read engine state"; return; }
+  # Fatal, not a warning, both ways: the container holds the NPU, so a
+  # state we cannot read or a stop that did not take means every number
+  # measured afterwards is contention evidence wearing a campaign tag.
+  engine_state "$f" || { log "FATAL: cannot read engine state — refusing to measure blind"; exit 1; }
   if grep -q cairn "$f"; then
     log "cairn container running — stopping (holds the NPU)"
     remote 90 "balena-engine stop $CONTAINER"
-    engine_state "$f"
-    grep -q cairn "$f" && log "WARN: container did not stop" || log "container stopped"
+    engine_state "$f" || { log "FATAL: cannot re-read engine state after stop"; exit 1; }
+    if grep -q cairn "$f"; then
+      log "FATAL: container did not stop — refusing to measure under contention"
+      exit 1
+    fi
+    log "container stopped"
   fi
 }
 
@@ -294,9 +301,10 @@ do_fetch() {
 
 do_finish() {
   log "== finish: restore governor + restart container"
-  # Restore what pin_governor captured, and only then retire the record;
-  # a board that ran another governor gets ITS value back, not schedutil.
-  remote 30 "test -f /data/campaign-gov.saved && gov=\$(cat /data/campaign-gov.saved) || gov=schedutil; for c in /sys/devices/system/cpu/cpu[0-9]*; do echo \$gov > \$c/cpufreq/scaling_governor; done; rm -f /data/campaign-gov.saved"
+  # Restore ONLY what pin_governor captured: a finish reached without a
+  # pin (standalone envcheck, an early failure) must not write any
+  # governor at all — restore-only means exactly that.
+  remote 30 "if test -f /data/campaign-gov.saved; then gov=\$(cat /data/campaign-gov.saved); for c in /sys/devices/system/cpu/cpu[0-9]*; do echo \$gov > \$c/cpufreq/scaling_governor; done; rm -f /data/campaign-gov.saved; fi"
   remote 120 "balena-engine start $CONTAINER"
   engine_state "$HTP/.ps-check"
   grep -q cairn "$HTP/.ps-check" && log "cairn container back up" || log "WARN: cairn container NOT running — start it: balena-engine start $CONTAINER"

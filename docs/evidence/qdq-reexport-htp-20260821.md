@@ -22,31 +22,38 @@ pinned (1/65536 at a16, 1/256 at a8), a post-export qparam gate, CPU
 score parity, and the on-board HTP score leg below — no artifact ships
 without all of them.
 
-## HTP score leg — all 12 board-worthy rungs PASS
+## HTP score leg — every ladder rung PASSes; one test-only artifact is marginal
 
 Acceptance: HTP ≈ the artifact's own CPU-EP distribution on the same
-clips (per-frame person-window median ratio ≥ 0.9, no cap plateau, no
-uniform depression — each failure shape is one defect class's
-signature). Three real clips, including the two whose return walks the
-defective artifacts missed.
+clips, paired from the REFERENCE timeline so a missed detection counts
+as zero (per-frame person-window median ratio ≥ 0.9, ≤10% of frames
+below half, no cap plateau, no uniform depression — each failure shape
+is one defect class's signature). Three real clips, including the two
+whose return walks the defective artifacts missed.
+
+All seven shipped ladder rungs and every yolo26 pack rung PASS on all
+three clips. The one exception is `yolov8n-qdq-a16` — a test-only AGPL
+artifact, not a ladder rung — which fails ac86 marginally: median 0.995
+but 4 of 36 reference-confident frames without an adequate HTP
+detection (11%, against the 10% allowance).
 
 | rung | ac86 | aeb4 | f58a |
 |---|---|---|---|
-| yolox_nano-qdq-a16 | 0.999 | 1.000 | 1.000 |
-| yolox_tiny-qdq-a16 | 1.000 | 0.999 | 1.001 |
-| yolox_tiny-qdq-a8 | 1.108 | 1.108 | 1.179 |
-| yolox_s-qdq-a16 | 0.999 | 0.998 | 0.999 |
+| yolox_nano-qdq-a16 | 1.0 | 0.998 | 1.001 |
+| yolox_tiny-qdq-a16 | 0.999 | 1.0 | 1.001 |
+| yolox_tiny-qdq-a8 | 1.108 | 1.108 | 1.177 |
+| yolox_s-qdq-a16 | 1.0 | 0.998 | 0.999 |
 | yolox_s-qdq-a8 | 1.075 | 1.075 | 1.077 |
-| yolox_m-qdq-a16 | 1.000 | 1.000 | 1.000 |
-| yolox_m-qdq-a8 | 1.025 | 1.025 | 1.000 |
-| yolo26n-qdq-a16 | 1.000 | 1.000 | 1.000 |
-| yolo26n-416-qdq-a16 | 1.000 | 1.000 | 1.000 |
-| yolo26s-qdq-a16 | 1.000 | 1.000 | 1.000 |
-| yolo26m-qdq-a16 | 1.000 | 1.000 | 1.000 |
-| yolov8n-qdq-a16 | 0.999 | 0.989 | 1.000 |
+| yolox_m-qdq-a16 | 0.999 | 1.001 | 1.0 |
+| yolox_m-qdq-a8 | 1.023 | 1.025 | 1.0 |
+| yolo26n-qdq-a16 | 0.994 | 1.0 | 0.987 |
+| yolo26n-416-qdq-a16 | 1.001 | 1.0 | 1.0 |
+| yolo26s-qdq-a16 | 1.0 | 1.0 | 1.0 |
+| yolo26m-qdq-a16 | 1.0 | 1.0 | 1.0 |
+| yolov8n-qdq-a16 | 0.995 FAIL | 0.989 | 0.995 | 1.000 |
 
 (Values are the person-window median per-frame ratio, HTP vs the same
-artifact on the CPU EP. a8 rungs read 3–18% hot on the HTP — the EP's
+artifact on the CPU EP, misses counted as zeros. a8 rungs read 3–18% hot on the HTP — the EP's
 8-bit sigmoid qparam vs the graph's pinned 1/256; floors tuned on a16
 are conservative on a8.)
 
@@ -61,11 +68,18 @@ the test demonstrably sees the defect class it exists to block, and
 | rung | p50 ms | p95 ms |
 |---|---|---|
 | yolox_tiny-qdq-a8 | 8.55 | 12.20 |
-| yolox_nano-qdq-a16 | 10.38 | 11.08 |
-| yolo26n-416-qdq-a16 | 12.30 | 12.59 |
-| yolox_tiny-qdq-a16 | 12.78 | 16.86 |
-| yolox_s-qdq-a8 | 17.17 | 17.74 |
-| yolov8n-qdq-a16 | 21.35 | 23.86 |
+| yolox_nano-qdq-a16 | 1.0 | 0.998 | 1.001 |
+| yolox_tiny-qdq-a16 | 0.999 | 1.0 | 1.001 |
+| yolox_tiny-qdq-a8 | 1.108 | 1.108 | 1.177 |
+| yolox_s-qdq-a16 | 1.0 | 0.998 | 0.999 |
+| yolox_s-qdq-a8 | 1.075 | 1.075 | 1.077 |
+| yolox_m-qdq-a16 | 0.999 | 1.001 | 1.0 |
+| yolox_m-qdq-a8 | 1.023 | 1.025 | 1.0 |
+| yolo26n-qdq-a16 | 0.994 | 1.0 | 0.987 |
+| yolo26n-416-qdq-a16 | 1.001 | 1.0 | 1.0 |
+| yolo26s-qdq-a16 | 1.0 | 1.0 | 1.0 |
+| yolo26m-qdq-a16 | 1.0 | 1.0 | 1.0 |
+| yolov8n-qdq-a16 | 0.995 FAIL | 0.989 | 0.995 |
 | yolo26n-qdq-a16 | 24.39 | 27.06 |
 | yolo26s-qdq-a16 | 35.65 | 36.35 |
 | yolox_m-qdq-a8 | 38.62 | 39.14 |

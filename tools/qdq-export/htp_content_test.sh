@@ -111,7 +111,14 @@ echo "up after ~${waited}s" >> "$RUN/meta"
   rtp://127.0.0.1:5600 2> "$RUN/feed.err"
 feed_rc=$?
 FEED=""
-echo "feed exited $feed_rc" >> "$RUN/meta"
+if [ "$feed_rc" -eq 0 ]; then
+  echo "feed exited 0" >> "$RUN/meta"
+else
+  # In the meta's own suspect vocabulary: the campaign's retry guard and
+  # the analyzer both key on this phrase, and a truncated feed must not
+  # read as a completed run anywhere downstream.
+  echo "feed exited $feed_rc — run suspect" >> "$RUN/meta"
+fi
 
 # Drain, then close fd 3 — the plugin's stdin EOF, and nothing else's.
 sleep 3

@@ -252,14 +252,21 @@ def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None):
     if not spans:
         return {"verdict": "NO-WINDOW", "why": "fp32 never confident on this clip"}
 
+    # Paired from the REFERENCE timeline, not the HTP's: the content
+    # format emits nothing for an empty frame, so an artifact that MISSES
+    # the person outright leaves no HTP row to pair — iterating HTP
+    # emissions would silently drop every miss from the median. A
+    # ref-confident instant with no HTP emission nearby is a zero, which
+    # is what a miss is.
     pairs = []  # (htp person, cpu-ref person, fp32 person)
-    for t, person, _ in htp:
-        if not in_windows(t, spans):
+    for t, f_person, _ in ref_fp32:
+        if f_person < REPORTABLE:
             continue
         c = nearest(t, ref_cpu)
-        f = nearest(t, ref_fp32)
-        if c and f and f[1] >= REPORTABLE:
-            pairs.append((person, c[1], f[1]))
+        if not c:
+            continue
+        h = nearest(t, htp)
+        pairs.append((h[1] if h else 0.0, c[1], f_person))
     window_htp = [p for p, _, _ in pairs]
     result = {
         "windows_s": round(sum(hi - lo for lo, hi in spans), 1),
@@ -363,10 +370,18 @@ def main():
         # analyzer exists to refuse.
         raise SystemExit(f"no clip-*.mp4 in {clips_dir} — nothing to analyze against")
 
+    clip_shas = {
+        c: file_sha256(os.path.join(clips_dir, f"clip-{c}.mp4")) for c in clip_names
+    }
+
     def frames_dir(c):
-        # fps in the name: frames extracted at a previous --ref-fps must
-        # not serve a run that asked for a different timeline density.
-        return os.path.join(ref_dir, f"frames-{c}-{args.ref_fps:g}")
+        # fps AND the clip's content digest in the name: frames from a
+        # previous --ref-fps or from different clip bytes under the same
+        # filename must not serve this run — the CPU caches inherit the
+        # same identity through the dirname.
+        return os.path.join(
+            ref_dir, f"frames-{c}-{clip_shas[c][:12]}-{args.ref_fps:g}"
+        )
 
     for c in clip_names:
         extract_frames(
@@ -385,9 +400,6 @@ def main():
         "|---|---|---|---|---|---|---|",
     ]
     verdicts = collections.defaultdict(list)
-    clip_shas = {
-        c: file_sha256(os.path.join(clips_dir, f"clip-{c}.mp4")) for c in clip_names
-    }
     for rung, src in RUNGS.items():
         art = os.path.join(out_root, "artifacts", f"{rung}.onnx")
         fp32 = os.path.join(out_root, "sources", f"{src}.onnx")

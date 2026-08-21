@@ -43,7 +43,14 @@ for src in "$@"; do
     # correct for a stream that has no end to spread across.
     step=20
   else
-    step=$((total / FRAMES_PER_SOURCE))
+    # Interval between first and last REQUESTED sample, not total/N: with
+    # 19 frames and a budget of 10, total/N truncates to 1 and the second
+    # half of the clip is never calibrated. (N=1 is the total-step case.)
+    if [ "$FRAMES_PER_SOURCE" -gt 1 ]; then
+      step=$(((total - 1) / (FRAMES_PER_SOURCE - 1)))
+    else
+      step=$total
+    fi
     [ "$step" -lt 1 ] && step=1
   fi
   ffmpeg -nostdin -nostats -loglevel error -i "$src" \

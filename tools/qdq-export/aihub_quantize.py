@@ -91,16 +91,35 @@ def calib_frames():
     return [paths[i] for i in sorted(set(indices))]
 
 
+def calib_digest(paths):
+    """Identity of the SELECTED calibration inputs: file names and bytes.
+
+    Without it, adding/removing/replacing a PNG reuses the previously
+    uploaded dataset — and the job fingerprint downstream would then
+    claim the calibration changed when it had not actually been
+    re-uploaded."""
+    import hashlib
+
+    h = hashlib.sha256()
+    for path in paths:
+        h.update(os.path.basename(path).encode())
+        with open(path, "rb") as f:
+            h.update(f.read())
+    return h.hexdigest()[:16]
+
+
 def dataset_for(state, info, input_name):
-    """Upload (once) the calibration dataset for a family x geometry."""
-    key = f"{info['layout']}-{info['width']}"
+    """Upload (once per distinct input set) the calibration dataset for a
+    family x geometry."""
+    frames = calib_frames()
+    key = f"{info['layout']}-{info['width']}-{calib_digest(frames)}"
     if key in state["datasets"]:
         return hub.get_dataset(state["datasets"][key])
     prof = preprocessing(info["layout"])
     tensors = [
         load_image_chw(p, info["width"], info["height"],
                        prof["encoding"], prof["resize"], prof["pad"])
-        for p in calib_frames()
+        for p in frames
     ]
     print(f"uploading dataset {key}: {len(tensors)} x {tensors[0].shape}")
     ds = hub.upload_dataset({input_name: [t.astype(np.float32) for t in tensors]},
@@ -175,9 +194,18 @@ def fetch():
         # Targets download as a zip (model.onnx + external model.data,
         # like the published assets); normalize to artifacts/<name>/.
         target_dir = os.path.join(ART_DIR, name)
+        job_marker = os.path.join(target_dir, ".job")
+        # The artifact is only "already fetched" if it came from THIS job:
+        # a resubmit (changed inputs) records a new job id, and the bytes
+        # downloaded for the superseded job must not satisfy it.
         if os.path.exists(os.path.join(target_dir, "model.onnx")):
-            results[name] = "already fetched"
-            continue
+            fetched_from = open(job_marker).read().strip() if os.path.exists(job_marker) else None
+            if fetched_from == job_id:
+                results[name] = "already fetched"
+                continue
+            results[name] = f"refetching (was {fetched_from or 'unrecorded'})"
+            import shutil as _shutil
+            _shutil.rmtree(target_dir)
         job = hub.get_job(job_id)
         status = job.wait()
         if not status.success:
@@ -195,7 +223,9 @@ def fetch():
             shutil.move(f, os.path.join(target_dir, os.path.basename(f)))
         shutil.rmtree(tmp)
         os.remove(zip_path)
-        results[name] = "fetched"
+        with open(job_marker, "w") as f:
+            f.write(job_id)
+        results[name] = results.get(name) or "fetched"
     for name, r in sorted(results.items()):
         print(f"{name}: {r}")
     import glob as _glob
