@@ -59,6 +59,11 @@ sleep 1
   sha256sum "$MODEL" 2>/dev/null
   echo "clip: $CLIP"
   sha256sum "$CLIP" 2>/dev/null
+  # The methodology digest: the campaign's retry guard and the analyzer
+  # match this script's own sha and the run's extra flags, so a changed
+  # methodology regenerates evidence instead of re-labeling old runs.
+  sha256sum "$0" 2>/dev/null
+  echo "extra_args: $*"
 } > "$RUN/meta"
 
 FEED=""
@@ -132,6 +137,9 @@ fi
 
 frames=$(grep -c '"frame.objects"' "$RUN/out.ndjson" 2>/dev/null)
 frames=${frames:-0}
+# This line doubles as the run's completion marker: it is only reached
+# after the feed exit and plugin shutdown statuses above, so the guard
+# and analyzer require it — a truncated meta must not read as complete.
 echo "frame.objects lines: $frames" >> "$RUN/meta"
 echo "== $TAG: $frames object frames, plugin rc=$rc, feed rc=$feed_rc =="
 grep "infer latency" "$RUN/err" | tail -3

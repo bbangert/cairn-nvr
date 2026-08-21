@@ -86,8 +86,15 @@ yolov8n-qdq-a16:yolov8:640
 "
 
 engine_state() { # writes container names to $1 (local file)
-  remote 30 "balena-engine ps --format {{.Names}} > /data/tmp-ps.txt 2>&1"
-  fetch /data/tmp-ps.txt "$1"
+  # :os.cmd swallows the remote exit status, so success is a sentinel
+  # line, not an rc: a failed ps redirects its error into the file,
+  # which contains no "cairn" and would read as "engine stopped". The
+  # local snapshot is removed first so a fetch failure cannot leave a
+  # stale one to be graded.
+  rm -f "$1"
+  remote 30 "balena-engine ps --format {{.Names}} > /data/tmp-ps.txt 2>&1 && echo PS-OK >> /data/tmp-ps.txt" || return 1
+  fetch /data/tmp-ps.txt "$1" || return 1
+  grep -q "^PS-OK$" "$1"
 }
 
 ensure_engine_stopped() {
@@ -210,11 +217,20 @@ EOF
   [ "${PIPESTATUS[0]}" = 0 ] || { log "FATAL: envcheck failed — bench env untrusted, do not read scores from it"; exit 1; }
 }
 
-fetched_run_current() { # <tag> <rung-label> <clip>
+fetched_run_current() { # <tag> <rung-label> <clip> <extra-flags>
   local dir="$HTP/content/$1" local_art="$ART/$2.onnx" local_clip="$OUT/clips/clip-$3.mp4"
   grep -q '"frame.objects"' "$dir/out.ndjson" 2>/dev/null || return 1
   [ -f "$dir/meta" ] || return 1
   grep -q "run suspect" "$dir/meta" && return 1
+  # The frames count doubles as the completion marker — the board script
+  # writes it only after the feed and plugin exit statuses. Absence of
+  # "run suspect" in a meta truncated by a killed ssh proves nothing.
+  grep -q "frame.objects lines:" "$dir/meta" || return 1
+  # Methodology digest: the run is only current if it was produced by
+  # THIS content-test script with THESE flags — a methodology change
+  # must regenerate evidence, not re-label old runs.
+  grep -q "$(sha256sum "$HERE/htp_content_test.sh" | cut -d' ' -f1)" "$dir/meta" || return 1
+  grep -qxF "extra_args: $4" "$dir/meta" || return 1
   if [ -f "$local_art" ]; then
     grep -q "$(sha256sum "$local_art" | cut -d' ' -f1)" "$dir/meta" || return 1
   fi
@@ -241,7 +257,7 @@ content_run() { # <backend> <model-path> <rung-label> <profile> <insize>
     # locally — the meta's recorded model sha matching today's bytes. A
     # truncated run can emit a frame before dying, and an old run under
     # the same tag can describe different model bytes; both must retry.
-    if fetched_run_current "$tag" "$label" "$clip"; then
+    if fetched_run_current "$tag" "$label" "$clip" "$flags"; then
       log "content $tag: already fetched, skip"
       continue
     fi

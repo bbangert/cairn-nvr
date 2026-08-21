@@ -25,11 +25,13 @@ without all of them.
 ## HTP score leg — every ladder rung PASSes; one test-only artifact is marginal
 
 Acceptance: HTP ≈ the artifact's own CPU-EP distribution on the same
-clips, paired from the REFERENCE timeline so a missed detection counts
-as zero (per-frame person-window median ratio ≥ 0.9, ≤10% of frames
-below half, no cap plateau, no uniform depression — each failure shape
-is one defect class's signature). Three real clips, including the two
-whose return walks the defective artifacts missed.
+clips, paired one-to-one from the REFERENCE timeline — each HTP
+emission certifies at most one reference instant, and a ref-confident
+instant with no emission of its own counts as zero (per-frame
+person-window median ratio ≥ 0.9, ≤10% of frames below half, no cap
+plateau, no uniform depression — each failure shape is one defect
+class's signature). Three real clips, including the two whose return
+walks the defective artifacts missed.
 
 All seven shipped ladder rungs and every yolo26 pack rung PASS on all
 three clips. The one exception is `yolov8n-qdq-a16` — a test-only AGPL
@@ -46,7 +48,7 @@ detection (11%, against the 10% allowance).
 | yolox_s-qdq-a8 | 1.075 | 1.075 | 1.077 |
 | yolox_m-qdq-a16 | 0.999 | 1.001 | 1.0 |
 | yolox_m-qdq-a8 | 1.023 | 1.025 | 1.0 |
-| yolo26n-qdq-a16 | 0.994 | 1.0 | 0.987 |
+| yolo26n-qdq-a16 | 1.0 | 1.0 | 0.987 |
 | yolo26n-416-qdq-a16 | 1.001 | 1.0 | 1.0 |
 | yolo26s-qdq-a16 | 1.0 | 1.0 | 1.0 |
 | yolo26m-qdq-a16 | 1.0 | 1.0 | 1.0 |
@@ -58,10 +60,13 @@ artifact on the CPU EP, misses counted as zeros. a8 rungs read 3–18% hot on th
 are conservative on a8.)
 
 Controls, both behaving: a board CPU-EP run PASSes against the local
-reference (the methodology measures models, not plumbing), and the
-previously shipped defective nano grades CAP with a plateau at 0.578 —
-the test demonstrably sees the defect class it exists to block, and
-0.578 matches the live band measured on the wall before the fix.
+reference on the 42/47 reference instants it covers (score fidelity —
+at ~196 ms a pass the CPU EP cannot cover a 5/s timeline one-to-one,
+so its gaps measure throughput; the methodology measures models, not
+plumbing), and the previously shipped defective nano grades CAP with a
+plateau at 0.578 — the test demonstrably sees the defect class it
+exists to block, and 0.578 matches the live band measured on the wall
+before the fix.
 
 ## Latency (bench.sh, 1 cam, governor pinned)
 

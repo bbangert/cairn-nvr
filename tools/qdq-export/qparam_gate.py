@@ -145,17 +145,21 @@ def _q_of(tensor, consumers):
 
 
 def _qparams(node, inits):
-    """(scale, zero_point, elem_type) of a Q/DQ node, or None if either
-    is a runtime value rather than an initializer."""
+    """(scale, zero_point, elem_type, n_scale_elems) of a Q/DQ node, or
+    None if either is a runtime value rather than an initializer.
+    scale/zero_point are element zero; callers grading correctness must
+    check n_scale_elems — reducing a per-axis parameter to its first
+    element would grade one class and vouch for all of them."""
     if len(node.input) < 2 or node.input[1] not in inits:
         return None
-    scale = float(np.asarray(inits[node.input[1]]).reshape(-1)[0])
+    scale_arr = np.asarray(inits[node.input[1]]).reshape(-1)
+    scale = float(scale_arr[0])
     zp_arr = inits.get(node.input[2]) if len(node.input) > 2 else None
     if zp_arr is None:
-        return scale, 0, onnx.TensorProto.UINT8
+        return scale, 0, onnx.TensorProto.UINT8, scale_arr.size
     zp = int(np.asarray(zp_arr).reshape(-1)[0])
     elem = onnx.helper.np_dtype_to_tensor_dtype(np.asarray(zp_arr).dtype)
-    return scale, zp, elem
+    return scale, zp, elem, scale_arr.size
 
 
 def _index(graph):
@@ -218,11 +222,12 @@ def audit(model_path):
         if q is not None:
             qp = _qparams(q, inits)
             if qp is not None:
-                scale, zp, elem = qp
+                scale, zp, elem, n = qp
                 entry.update(
                     scale=scale,
                     zero_point=zp,
                     elem_type=elem,
+                    scale_elems=n,
                     ceiling=(QMAX.get(elem, 255) - zp) * scale,
                 )
             # The matching DQ reads the same scale initializer in a
@@ -233,6 +238,7 @@ def audit(model_path):
                     dqp = _qparams(dq, inits)
                     if dqp is not None:
                         entry["dq_scale"] = dqp[0]
+                        entry["dq_scale_elems"] = dqp[3]
                     break
         scores.append(entry)
 
@@ -438,6 +444,15 @@ def check(model_path, min_ceiling=DEFAULT_MIN_CEILING, input_size=None, out=sys.
     for e in scores:
         if e["ceiling"] is None:
             bad.append(f"{e['node']}: no Q/DQ qparams on the sigmoid output")
+        elif e.get("scale_elems", 1) != 1 or e.get("dq_scale_elems", 1) != 1:
+            # Activation Q/DQ must be per-tensor. Grading element zero of
+            # a per-axis parameter would vouch for every class on the
+            # strength of the first one.
+            bad.append(
+                f"{e['node']}: non-scalar activation qparams "
+                f"(Q {e.get('scale_elems', 1)} / DQ {e.get('dq_scale_elems', 1)} "
+                "elements) — per-tensor required"
+            )
         elif e["ceiling"] < min_ceiling:
             bad.append(
                 f"{e['node']} ({_stride_label(e['dims'], input_size)}): "

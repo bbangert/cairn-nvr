@@ -200,6 +200,28 @@ def nearest(t, series):
     return best if abs(best[0] - t) <= PAIR_TOLERANCE_S else None
 
 
+def paired_one_to_one(ref_times, series):
+    """{ref time -> series row}, each row consumed by at most one ref.
+
+    `nearest` alone lets one emission certify several reference instants
+    (0.2 s ref spacing, 0.35 s tolerance): an isolated missed frame would
+    borrow its neighbor's detection, and the whole point of pairing from
+    the reference timeline is that a miss is a zero. Greedy in-order
+    matching errs toward MORE zeros, the conservative direction for a
+    certification. Both inputs must be time-sorted."""
+    out = {}
+    j, used = 0, -1
+    for t in ref_times:
+        if not series:
+            break
+        while j + 1 < len(series) and abs(series[j + 1][0] - t) <= abs(series[j][0] - t):
+            j += 1
+        if j > used and abs(series[j][0] - t) <= PAIR_TOLERANCE_S:
+            out[t] = series[j]
+            used = j
+    return out
+
+
 # A PASS below this many paired frames certifies nothing: one lucky match
 # in a truncated run must read as an incomplete run, not a healthy rung.
 MIN_PAIRED = 20
@@ -215,11 +237,18 @@ def run_suspect(run_dir):
     meta = os.path.join(run_dir, "meta")
     if not os.path.exists(meta):
         return "no meta fetched"
-    for line in open(meta):
+    text = open(meta).read()
+    for line in text.splitlines():
         if "run suspect" in line:
             return line.strip()
         if line.startswith("feed exited") and not line.rstrip().endswith(" 0"):
             return line.strip()
+    # The frames count is the run's completion marker: the board script
+    # writes it only after the feed exit and plugin shutdown statuses.
+    # Absence of "run suspect" in a truncated meta proves nothing — the
+    # suspect lines are exactly what a killed run never got to write.
+    if "frame.objects lines:" not in text:
+        return "meta lacks completion marker (run truncated before shutdown states were recorded)"
     return None
 
 
@@ -234,13 +263,35 @@ def stale_evidence(run_dir, expected_shas):
         return "no meta fetched"
     text = open(meta).read()
     for label, sha in expected_shas.items():
-        if sha and sha not in text:
+        if not sha:
+            continue
+        if label == "script" and "htp_content_test.sh" not in text:
+            # Legacy meta from before the methodology digest: identity is
+            # unrecorded, not wrong. Counted and surfaced in the report
+            # (never silently passed); the campaign driver's retry guard
+            # regenerates these runs on the next campaign.
+            continue
+        if sha not in text:
             return f"meta does not record the current {label} sha ({sha[:12]}…)"
     return None
 
 
-def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None):
-    """Verdict for one content run against its two reference series."""
+def records_script(run_dir):
+    meta = os.path.join(run_dir, "meta")
+    return os.path.exists(meta) and "htp_content_test.sh" in open(meta).read()
+
+
+def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None,
+                score_fidelity_only=False):
+    """Verdict for one content run against its two reference series.
+
+    score_fidelity_only is for the board CPU-EP control ONLY: at ~196 ms
+    a pass, the CPU cannot emit densely enough to cover a 5/s reference
+    timeline one-to-one, so its coverage gaps measure throughput, not
+    the decode/sampling fidelity the control exists to check. Gaps are
+    still counted (result["coverage"]) but only covered instants are
+    graded. HTP rungs sample ~2x denser than the reference and get the
+    full miss-as-zero treatment."""
     nd = os.path.join(run_dir, "out.ndjson")
     if not os.path.exists(nd):
         return {"verdict": "NO-DATA", "why": "no ndjson fetched"}
@@ -263,6 +314,8 @@ def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None):
     # emissions would silently drop every miss from the median. A
     # ref-confident instant with no HTP emission nearby is a zero, which
     # is what a miss is.
+    confident = [t for t, f_person, _ in ref_fp32 if f_person >= REPORTABLE]
+    htp_by_ref = paired_one_to_one(confident, htp)
     pairs = []  # (htp person, cpu-ref person, fp32 person)
     for t, f_person, _ in ref_fp32:
         if f_person < REPORTABLE:
@@ -270,7 +323,9 @@ def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None):
         c = nearest(t, ref_cpu)
         if not c:
             continue
-        h = nearest(t, htp)
+        h = htp_by_ref.get(t)
+        if h is None and score_fidelity_only:
+            continue
         pairs.append((h[1] if h else 0.0, c[1], f_person))
     window_htp = [p for p, _, _ in pairs]
     result = {
@@ -278,6 +333,8 @@ def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None):
         "paired": len(pairs),
         "htp_all_max": round(max(p for _, p, _ in htp), 3),
     }
+    if score_fidelity_only:
+        result["coverage"] = f"{len(htp_by_ref)}/{len(confident)}"
     if not pairs:
         # The subject was there (fp32 saw it) and the HTP emitted nothing
         # pairable — that is Ben's return walk, not a tooling gap.
@@ -409,6 +466,11 @@ def main():
     clip_shas = {
         c: file_sha256(os.path.join(clips_dir, f"clip-{c}.mp4")) for c in clip_names
     }
+    # The methodology digest: runs record the content-test script's own
+    # sha (and its extra args) in meta, so a script change regenerates
+    # evidence instead of re-labeling old runs as current.
+    script_sha = file_sha256(os.path.join(HERE, "htp_content_test.sh"))
+    legacy_runs = []
 
     def frames_dir(c):
         # fps AND the clip's content digest in the name: frames from a
@@ -454,8 +516,11 @@ def main():
                 run_dir,
                 cpu_series(art, frames, args.ref_fps, ref_dir),
                 cpu_series(fp32, frames, args.ref_fps, ref_dir),
-                expected_shas={"model": art_sha, "clip": clip_shas[c]},
+                expected_shas={"model": art_sha, "clip": clip_shas[c],
+                               "script": script_sha},
             )
+            if not records_script(run_dir):
+                legacy_runs.append(f"{rung}-qnn-{c}")
             verdicts[rung].append(r["verdict"])
             report.append(
                 f"| {rung} | {c} | {r.get('paired', 0)} | {r.get('htp_band', '-')} "
@@ -477,16 +542,23 @@ def main():
         r = analyze_run(ort_ctl, cpu_series(art, frames, args.ref_fps, ref_dir),
                         cpu_series(fp32, frames, args.ref_fps, ref_dir),
                         expected_shas={"model": file_sha256(art) if os.path.exists(art) else None,
-                                       "clip": clip_shas.get("ac86")})
+                                       "clip": clip_shas.get("ac86"),
+                                       "script": script_sha},
+                        score_fidelity_only=True)
+        if not records_script(ort_ctl):
+            legacy_runs.append("ort-control")
         if r["verdict"] != "PASS":
             controls_invalid.append(
                 f"board CPU-EP control graded {r['verdict']} (must PASS)"
             )
         report.append(
             f"- board CPU-EP control (nano-a16, ac86): **{r['verdict']}** "
-            f"{r.get('htp_band', '')} vs ref {r.get('ref_band', '')} — this run "
-            "ties board decode+sampling to the local reference; anything but "
-            "PASS is a methodology problem, not a model problem."
+            f"{r.get('htp_band', '')} vs ref {r.get('ref_band', '')} "
+            f"(coverage {r.get('coverage', '-')} ref instants — the CPU EP's "
+            "~196 ms pass cannot cover a 5/s timeline; gaps are throughput, "
+            "graded instants are the fidelity check) — this run ties board "
+            "decode+sampling to the local reference; anything but PASS is a "
+            "methodology problem, not a model problem."
         )
     old_ctl = os.path.join(content, "control-old-nano-a16-qnn-ac86")
     if not os.path.isdir(old_ctl):
@@ -503,7 +575,10 @@ def main():
         r = analyze_run(old_ctl, cpu_series(art, frames, args.ref_fps, ref_dir),
                         cpu_series(fp32, frames, args.ref_fps, ref_dir),
                         expected_shas={"model": OLD_NANO_SHA,
-                                       "clip": clip_shas.get("ac86")})
+                                       "clip": clip_shas.get("ac86"),
+                                       "script": script_sha})
+        if not records_script(old_ctl):
+            legacy_runs.append("defective-control")
         # The control is valid ONLY if it reproduces the known defect's
         # signature. "Anything but PASS" would let NO-DATA / SUSPECT /
         # STALE-EVIDENCE / INSUFFICIENT — a broken or truncated control
@@ -536,6 +611,14 @@ def main():
             report.append(
                 f"| {model} | {backend} | {row['p50_ms']} | {row['p95_ms']} | {row['runs']} |"
             )
+
+    if legacy_runs:
+        report.append(
+            f"\n- note: {len(legacy_runs)} runs predate the methodology digest "
+            "(script identity unrecorded in meta); model and clip bytes are "
+            "verified, and the campaign driver regenerates these runs on the "
+            "next campaign."
+        )
 
     if controls_missing or controls_invalid:
         problems = [f"missing {c}" for c in controls_missing] + controls_invalid
