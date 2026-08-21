@@ -198,7 +198,11 @@ def compare(fp32_path, qdq_path, frame_dir, tolerance=0.9, limit=None, out=sys.s
     if failures:
         print("  parity FAIL: " + "; ".join(failures), file=out)
         return False, rows
-    print(f"  parity PASS (every level >= {tolerance:.2f}x fp32)", file=out)
+    print(
+        f"  parity PASS (per-level maxima and person-window median all >= "
+        f"{tolerance:.2f}x fp32)",
+        file=out,
+    )
     return True, rows
 
 

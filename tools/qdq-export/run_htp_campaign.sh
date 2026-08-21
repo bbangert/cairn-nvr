@@ -51,7 +51,16 @@ remote() { # <timeout-secs> <shell command, no pipes>
 }
 fetch() { # <remote path> <local path>  (scp exits 1 on success — check artifact instead)
   timeout 300 scp -q -r -o BatchMode=yes "$BOARD:$1" "$2" < /dev/null 2>/dev/null
-  [ -e "$2" ]
+  # The artifact to check is what scp CREATES: into a directory destination
+  # (trailing slash) that is dest/<remote basename>; a plain destination is
+  # the file itself. Checking "$2" alone was vacuous for the directory
+  # callers — $HTP/content/ always exists, fetched or not. A survivor from
+  # an earlier run can still satisfy this; the campaign log's per-stage
+  # counts are the cross-check.
+  case $2 in
+  */) [ -e "$2$(basename "$1")" ] ;;
+  *) [ -e "$2" ] ;;
+  esac
 }
 
 # The 12 board-worthy rungs (phase 2.3 verdicts): every a16 plus the
