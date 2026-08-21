@@ -6,12 +6,14 @@
 # sha256s recorded next to each artifact are unfalsifiable.
 #
 # These are NOT the runtime's versions. The container runs ORT 1.26.0 +
-# onnxruntime-qnn 2.4.0 (Dockerfile), and the quantizer bumps to opset 21
-# to emit standard-domain uint16 QDQ. Whether 1.26's QNN EP recognises
-# those node units — rather than the com.microsoft contrib ops ORT emits
-# below opset 21 — is a board-leg question, not a local one. If the HTP
-# leg rejects these graphs, matching this pin to the runtime minor is the
-# first thing to try.
+# onnxruntime-qnn 2.4.0 (Dockerfile). What this quantizer actually emits
+# (verified on the shipped artifacts): a16 graphs are bumped to opset 21
+# with every Q/DQ as com.microsoft contrib ops (uint16 QDQ); a8 graphs
+# stay at the source's opset 13 with standard-domain Q/DQ. The
+# 2026-08-21 HTP campaign passed every rung on the 1.26 runtime, so both
+# shapes are known-good on the board; if a future rebuild regresses
+# there, matching this pin to the runtime minor is the first thing to
+# try.
 #
 #   python3 -m venv quant-venv
 #   quant-venv/bin/pip install -r tools/qdq-export/requirements.txt

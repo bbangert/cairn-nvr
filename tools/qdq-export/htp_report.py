@@ -610,6 +610,23 @@ def main():
             "(missing/empty .latency-start or no authenticated runs) — "
             "historical bench runs are not reported as current."
         )
+    # The campaign promises a bench run per rung (plus the nano ORT
+    # anchor) and the ladder budgets stand on these rows — a silently
+    # absent rung must read as a campaign failure, not a shorter table.
+    expected_lat = {(r, "qnn") for r in RUNGS} | {("yolox_nano-qdq-a16", "ort")}
+    lat_missing = sorted(expected_lat - set(lat))
+    lat_stale = sorted(k for k, row in lat.items() if "stale" in row)
+    if lat_missing or lat_stale:
+        parts = []
+        if lat_missing:
+            parts.append("missing " + ", ".join(f"{m}/{b}" for m, b in lat_missing))
+        if lat_stale:
+            parts.append("stale " + ", ".join(f"{m}/{b}" for m, b in lat_stale))
+        report.append(
+            "- **LATENCY INCOMPLETE**: " + "; ".join(parts)
+            + " — the ladder budgets stand on these rows."
+        )
+        controls_invalid.append("latency evidence incomplete")
     if lat:
         report += ["", "## Latency (bench.sh, 1 cam, governor pinned)", "",
                    "| rung | backend | p50 ms | p95 ms | runs/60s |", "|---|---|---|---|---|"]

@@ -5,9 +5,10 @@
 #   1. plugin FIRST — the RTP listener is up before any frame plays, so
 #      the clip's head cannot pour into a dead port during model load
 #      (the feed-first race that invalidated a day of bench analysis);
-#   2. the feed plays ONCE — no -stream_loop, so pts are monotonic and a
-#      p0-normalized pts maps to clip time (looped pts wrap and the
-#      mapping is garbage);
+#   2. the feed plays ONCE — no -stream_loop, so pts stay monotonic and
+#      stream-anchored: pts/90000 IS clip time as-is (looped pts wrap
+#      and the mapping is garbage). The analyzer never p0-normalizes —
+#      an empty clip head emits no line to anchor a p0 on;
 #   3. raw evidence only — the ndjson and stderr are the deliverable;
 #      analysis happens off-board (htp_report.py), because this busybox
 #      has no python and CR-heavy logs render blank over ssh anyway.

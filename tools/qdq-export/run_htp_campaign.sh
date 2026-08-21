@@ -317,7 +317,9 @@ pin_governor() {
   # A failed save leaves do_finish nothing to restore (the board stays
   # pinned forever); a failed pin would label unpinned latency evidence
   # as governor-pinned.
-  remote 30 "test -f /data/campaign-gov.saved || cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > /data/campaign-gov.saved"
+  # if/then, not `||`: remote() interpolates into a ~c|...| sigil, so a
+  # pipe character would terminate the Elixir literal mid-command.
+  remote 30 "if test ! -f /data/campaign-gov.saved; then cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > /data/campaign-gov.saved; fi"
   rm -f "$HTP/.gov-saved"
   fetch /data/campaign-gov.saved "$HTP/.gov-saved" || { log "FATAL: cannot verify saved governor"; exit 1; }
   [ -s "$HTP/.gov-saved" ] || { log "FATAL: saved governor file is empty"; exit 1; }
