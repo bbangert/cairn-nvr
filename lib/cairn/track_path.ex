@@ -1,7 +1,7 @@
 defmodule Cairn.TrackPath do
   # Declared before the moduledoc, which interpolates them: a tuning pass that
   # changes a number here must not leave the prose describing the old one.
-  @format_version 1
+  @format_version 2
 
   # Quantized units, so 20 is 0.002 of the frame extent — about 4 px across a
   # 1920-wide frame. The wire granularity is 1, so this suppresses jitter and
@@ -57,9 +57,15 @@ defmodule Cairn.TrackPath do
         "tracks" => [
           %{"id" => "01J...", "label" => "person", "truncated" => false,
             "ti" => [0, 1, 2, ...],
-            "x" => [1000, 40, -12, ...], "y" => [...], "w" => [...], "h" => [...]}
+            "x" => [1000, 40, -12, ...], "y" => [...], "w" => [...], "h" => [...],
+            "s" => [937, -12, 4, ...]}
         ]
       }
+
+  `"s"` (v2) is the per-sample score, `round(score * 1000)` and
+  delta-encoded like the coordinate columns; `-1` absolute is "no score"
+  (a tracked-lane predicted box). Files written at v1 have no `"s"` and
+  every reader treats its absence exactly like a column of no-scores.
 
   `"truncated"` at the top level is the caller's own flag — the buffer that fed
   `encode/2` hit a global cap and dropped batches. The per-track one is this
@@ -223,14 +229,17 @@ defmodule Cairn.TrackPath do
 
   ## What v#{@format_version} does not carry
 
-  No per-sample score: the track index row's `best_score` is the number the UI
-  shows, and a fifth column per sample would cost every reader for something
-  nothing draws. No per-sample `stationary` either — it decides keyframes here
-  and is then dropped, because a track's stationary transitions are already
-  rows in `Cairn.Tracks.TrackEvent`, at one row per flip instead of one value
-  per sample. Predicted boxes are in the path like any other sample and are not
-  marked: they are what keeps a path continuous through a detection miss, and a
-  reader that could tell them apart would only be tempted to break the line.
+  No per-sample `stationary` — it decides keyframes here and is then
+  dropped, because a track's stationary transitions are already rows in
+  `Cairn.Tracks.TrackEvent`, at one row per flip instead of one value per
+  sample. Predicted boxes are in the path like any other sample and are
+  not marked as such: they are what keeps a path continuous through a
+  detection miss, and a reader that could tell them apart would only be
+  tempted to break the line — but they DO carry `-1` in `"s"`, because a
+  score is a claim about a detection and a prediction made none. (v1
+  carried no scores at all; the playback chip showed the track's single
+  `best_score` for the whole clip, which read as a confidence that never
+  changed.)
   """
 
   @typedoc "Normalized `[x, y, w, h]`, each 0..1, as validated on the wire."
@@ -244,6 +253,8 @@ defmodule Cairn.TrackPath do
   """
   @type box_entry ::
           {id :: String.t(), label :: String.t(), bbox(), stationary :: boolean()}
+          | {id :: String.t(), label :: String.t(), bbox(), stationary :: boolean(),
+             score :: number() | nil}
 
   @typedoc "What a track's id is: a tracker identity, or the label itself."
   @type identity :: :object | :label
@@ -426,8 +437,13 @@ defmodule Cairn.TrackPath do
     end
   end
 
-  defp put_sample({object_id, label, bbox, stationary}, t_ms, {by_id, order}) do
-    sample = {t_ms, quantize(bbox), stationary == true}
+  # The 4-tuple is v1's writer shape, kept callable: a score it never had
+  # encodes as the same -1 a prediction writes.
+  defp put_sample({object_id, label, bbox, stationary}, t_ms, acc),
+    do: put_sample({object_id, label, bbox, stationary, nil}, t_ms, acc)
+
+  defp put_sample({object_id, label, bbox, stationary, score}, t_ms, {by_id, order}) do
+    sample = {t_ms, quantize(bbox), stationary == true, quantize_score(score)}
 
     case by_id do
       %{^object_id => {label0, samples}} ->
@@ -437,6 +453,12 @@ defmodule Cairn.TrackPath do
         {Map.put(by_id, object_id, {label, [sample]}), [object_id | order]}
     end
   end
+
+  # Clamped at zero so the -1 sentinel cannot collide with a quantized value:
+  # detector scores are (0, 1) by construction, so the clamp is a guard on the
+  # encoding's invariant, not a data path anything reaches today.
+  defp quantize_score(score) when is_number(score), do: round(max(score, 0) * 1000)
+  defp quantize_score(_no_score), do: -1
 
   defp quantize([x, y, w, h]) do
     {round(x * 10_000), round(y * 10_000), round(w * 10_000), round(h * 10_000)}
@@ -471,7 +493,10 @@ defmodule Cairn.TrackPath do
     end
   end
 
-  defp keep?({t, coords, stationary}, {t0, coords0, stationary0}) do
+  # Score is deliberately absent here: keyframe selection stays geometric,
+  # so a wobbling score on a parked box cannot inflate the file. Between
+  # kept samples a reader sees the score stepped, bounded by @max_gap_ms.
+  defp keep?({t, coords, stationary, _score}, {t0, coords0, stationary0, _score0}) do
     stationary != stationary0 or t - t0 > @max_gap_ms or moved?(coords, coords0)
   end
 
@@ -500,7 +525,8 @@ defmodule Cairn.TrackPath do
       "x" => coord_column(samples, 0),
       "y" => coord_column(samples, 1),
       "w" => coord_column(samples, 2),
-      "h" => coord_column(samples, 3)
+      "h" => coord_column(samples, 3),
+      "s" => samples |> Enum.map(&elem(&1, 3)) |> deltas()
     }
   end
 

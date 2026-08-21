@@ -725,7 +725,7 @@ defmodule Cairn.EventExtractorTest do
 
       map = sidecar!(path)
 
-      assert map["v"] == 1
+      assert map["v"] == 2
       assert map["event_id"] == event.id
       assert map["camera_id"] == camera.id
       assert map["truncated"] == false

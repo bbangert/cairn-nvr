@@ -35,8 +35,10 @@ defmodule Cairn.PresenceRecorder do
 
     * **No identity.** The sidecar entries are keyed by label rather than by
       `object_id`, and the header declares that variant so the playback
-      overlay colours by label (`Cairn.TrackPath`). Two objects of one label
-      in one frame therefore share a path.
+      overlay colours by label (`Cairn.TrackPath`). Concurrent objects of one
+      label get per-label render slots — separate paths, shared colour — but
+      a slot is frame-to-frame continuity, never an identity claim
+      (`assign_slots/2`).
     * **The post window is armed by a clear, not reset by evidence.** The
       tracked lane re-arms its post timer on every batch of evidence; here a
       label is *present* until the aggregator says otherwise, so the timer is
@@ -84,6 +86,11 @@ defmodule Cairn.PresenceRecorder do
   }
 
   @max_label_entries 5_000
+  # Concurrent boxes the sidecar keeps per label per frame. The lane is
+  # identity-free, so this bounds render slots, not tracks; two people and a
+  # dog is the realistic ceiling for a presence camera, and every extra slot
+  # is a sidecar column set an empty scene never pays for.
+  @max_boxes_per_label 4
   # `Cairn.CameraTracker`'s throttle and for its reason: the row is a deep ETS
   # copy of the whole event, rewritten on every batch that says anything, and
   # what a second-stale copy costs is the last second of label entries on an
@@ -280,6 +287,9 @@ defmodule Cairn.PresenceRecorder do
       # is read; see the handler.
       adopted_extractor?: false,
       present_labels: MapSet.new(),
+      # Per-label render-slot centres from the last forwarded frame — see
+      # assign_slots/2. Continuity state only; nothing decides on it.
+      box_slots: %{},
       # The same set with each label's best score while it has been present,
       # which the event alone cannot answer once it has closed: a segment
       # opened at a `max_event` boundary is seeded from these.
@@ -653,7 +663,7 @@ defmodule Cairn.PresenceRecorder do
     t_ms = frame_unix_ms(frame) - state.started_unix_ms
     objects = Map.get(frame, :objects, [])
 
-    forward_boxes(state, t_ms, objects)
+    state = forward_boxes(state, t_ms, objects)
     fold(state, Enum.filter(objects, &qualifying_object?(state, &1)), t_ms)
   end
 
@@ -662,29 +672,118 @@ defmodule Cairn.PresenceRecorder do
   # tier — for the tracked lane's reason: what earns video is a different
   # question from what is drawn over video already recorded.
   #
-  # Both elements of the entry's identity pair are the label (D-E5b): with no
-  # tracker there is nothing else to key a path by. `Cairn.TrackPath` keeps one
-  # sample per identity per instant, and the highest-scoring box of a label is
-  # sorted to the front so it is the one that survives two people in one frame.
+  # A path's id is the label plus a render slot (D-E5b amended): with no
+  # tracker there is no identity to key by, so concurrent same-label boxes go
+  # to slots matched against the previous frame's centres — up to
+  # @max_boxes_per_label of them, best scores first when the frame offers
+  # more. Slot 0 keeps the bare label, so a single-subject file reads exactly
+  # as v1 did.
   #
   # **Ordering dependency**, `Cairn.CameraTracker.forward_boxes/2`'s: this cast
   # and the finalize cast in `maybe_finalize/3` share a sender and a receiver,
   # so every box sent before finalize is in the extractor's mailbox before it.
   # A `call`, or a finalize routed through another process, silently truncates
   # the sidecar's tail.
-  defp forward_boxes(%{extractor: pid}, t_ms, objects) when is_pid(pid) do
-    boxes =
+  defp forward_boxes(%{extractor: pid} = state, t_ms, objects) when is_pid(pid) do
+    {boxes, slots} =
       objects
       |> Enum.filter(&boxed?/1)
-      |> Enum.sort_by(& &1.score, :desc)
-      |> Enum.map(&{&1.label, &1.label, &1.bbox, false})
+      |> Enum.group_by(& &1.label)
+      |> Enum.reduce({[], %{}}, fn {label, dets}, {boxes, slots} ->
+        {assigned, centers} =
+          dets
+          |> Enum.sort_by(& &1.score, :desc)
+          |> Enum.take(@max_boxes_per_label)
+          |> assign_slots(Map.get(state.box_slots, label, %{}))
+
+        entries =
+          for {slot, det} <- assigned,
+              do: {slot_id(label, slot), label, det.bbox, false, det.score}
+
+        {entries ++ boxes, Map.put(slots, label, centers)}
+      end)
 
     if boxes != [] do
       GenServer.cast(pid, {:track_boxes, %{t_ms: t_ms, boxes: boxes}})
     end
+
+    %{state | box_slots: slots}
   end
 
-  defp forward_boxes(_state, _t_ms, _objects), do: :ok
+  defp forward_boxes(state, _t_ms, _objects), do: state
+
+  # The lane has no tracker, so a slot is not an identity — it is render
+  # continuity: the overlay interpolates between a sidecar track's samples,
+  # and two concurrent people swapping tracks between keyframes would draw
+  # boxes gliding through each other. Greedy nearest-centre matching against
+  # the previous frame's slots keeps each path on its own subject at frame
+  # rate; when it guesses wrong it costs one crossing artifact, never a
+  # detection.
+  defp assign_slots(dets, prev_centers) do
+    {assigned, _remaining} =
+      Enum.map_reduce(dets, prev_centers, fn det, free ->
+        center = box_center(det.bbox)
+
+        case nearest_slot(free, center) do
+          nil -> {{:new, det, center}, free}
+          slot -> {{slot, det, center}, Map.delete(free, slot)}
+        end
+      end)
+
+    # Computed over the FULL matched set before any :new is numbered — plus
+    # every slot the previous frame held: a fresh slot may take neither, or a
+    # subject jumping past the radius would re-mint the slot it just failed
+    # to match and hand the overlay the exact cross-frame glide slots exist
+    # to prevent. (A label absent for a frame drops out of box_slots, so a
+    # RE-ENTRY after absence still reuses slot 0 with a time gap — the same
+    # geometry v1 drew, and time-aware gap breaking is the reader's job if it
+    # ever earns one.)
+    used =
+      for({slot, _det, _c} <- assigned, is_integer(slot), do: slot) ++
+        Map.keys(prev_centers)
+
+    {numbered, _next} =
+      Enum.map_reduce(assigned, 0, fn
+        {:new, det, center}, next ->
+          slot = next_free_slot(next, used)
+          {{slot, det, center}, slot + 1}
+
+        {slot, det, center}, next ->
+          {{slot, det, center}, next}
+      end)
+
+    {Enum.map(numbered, fn {slot, det, _c} -> {slot, det} end),
+     Map.new(numbered, fn {slot, _det, center} -> {slot, center} end)}
+  end
+
+  # A slot only claims a box in its neighbourhood: normalized centre distance
+  # above this reads as "someone else", and the box mints a fresh slot rather
+  # than yanking an existing path across the frame.
+  @slot_match_radius 0.25
+
+  defp nearest_slot(free, {cx, cy}) do
+    free
+    |> Enum.map(fn {slot, {px, py}} -> {slot, abs(cx - px) + abs(cy - py)} end)
+    |> Enum.filter(fn {_slot, d} -> d <= @slot_match_radius end)
+    |> Enum.min_by(fn {_slot, d} -> d end, fn -> nil end)
+    |> case do
+      {slot, _d} -> slot
+      nil -> nil
+    end
+  end
+
+  defp next_free_slot(candidate, used) do
+    if candidate in used, do: next_free_slot(candidate + 1, used), else: candidate
+  end
+
+  defp box_center([x, y, w, h]), do: {x + w / 2, y + h / 2}
+
+  # Slot 0 keeps the bare label as its id — the exact id every v1 presence
+  # sidecar used — so a reader keying on it sees no new world; extra
+  # concurrent boxes suffix their slot. `identity: "label"` readers colour
+  # and select by `label` either way.
+  defp slot_id(label, 0), do: label
+  defp slot_id(label, slot), do: "#{label}/#{slot}"
 
   defp fold(state, [], _t_ms), do: state
 
@@ -888,7 +987,11 @@ defmodule Cairn.PresenceRecorder do
         post_ref: nil,
         post_token: nil,
         max_ref: nil,
-        max_token: nil
+        max_token: nil,
+        # Slot centres are per-event render continuity; carried across a
+        # close, a stale centre could hand the next event's lone subject
+        # slot 1 and write a sidecar with "person/1" and no bare "person".
+        box_slots: %{}
     }
   end
 

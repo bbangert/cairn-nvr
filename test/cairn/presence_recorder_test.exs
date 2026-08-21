@@ -912,6 +912,73 @@ defmodule Cairn.PresenceRecorderTest do
     assert_receive {:extractor_finalized, ^ex_pid, %Event{id: ^eid}}
   end
 
+  test "two concurrent same-label boxes forward as two slots with scores", ctx do
+    recorder(ctx)
+    started(ctx)
+    assert_receive {:extractor_started, %Event{}, _pid}
+
+    left = [0.1, 0.2, 0.1, 0.3]
+    right = [0.7, 0.2, 0.1, 0.3]
+    frames(ctx, [object("person", 0.9, left), object("person", 0.6, right)])
+
+    assert_receive {:extractor_cast, {:track_boxes, %{boxes: boxes}}}
+
+    assert Enum.sort(boxes) ==
+             Enum.sort([
+               {"person", "person", left, false, 0.9},
+               {"person/1", "person", right, false, 0.6}
+             ])
+
+    # The next frame flips which subject scores best; the slots must follow
+    # POSITION, not rank — the sidecar path is render continuity, and a rank
+    # swap would drag each path across the frame.
+    frames(ctx, [object("person", 0.95, right), object("person", 0.5, left)])
+
+    assert_receive {:extractor_cast, {:track_boxes, %{boxes: boxes2}}}
+
+    assert Enum.sort(boxes2) ==
+             Enum.sort([
+               {"person", "person", left, false, 0.5},
+               {"person/1", "person", right, false, 0.95}
+             ])
+  end
+
+  test "a frame over the per-label cap forwards its best four boxes", ctx do
+    recorder(ctx)
+    started(ctx)
+    assert_receive {:extractor_started, %Event{}, _pid}
+
+    dets =
+      for {score, i} <- Enum.with_index([0.9, 0.8, 0.7, 0.6, 0.55]),
+          do: object("person", score, [0.15 * i, 0.2, 0.1, 0.3])
+
+    frames(ctx, dets)
+
+    assert_receive {:extractor_cast, {:track_boxes, %{boxes: boxes}}}
+    assert length(boxes) == 4
+    scores = boxes |> Enum.map(&elem(&1, 4)) |> Enum.sort(:desc)
+    assert scores == [0.9, 0.8, 0.7, 0.6]
+  end
+
+  test "a slot follows a subject inside the match radius and mints past it", ctx do
+    recorder(ctx)
+    started(ctx)
+    assert_receive {:extractor_started, %Event{}, _pid}
+
+    frames(ctx, [object("person", 0.9, [0.1, 0.2, 0.1, 0.3])])
+    assert_receive {:extractor_cast, {:track_boxes, %{boxes: [{"person", _, _, _, _}]}}}
+
+    # Centre moved 0.2 — inside the 0.25 manhattan radius: same slot.
+    frames(ctx, [object("person", 0.9, [0.3, 0.2, 0.1, 0.3])])
+    assert_receive {:extractor_cast, {:track_boxes, %{boxes: [{"person", _, _, _, _}]}}}
+
+    # A jump past the radius is deliberately a NEW path, not a yank: the
+    # subject exits left and re-enters right, and dragging the old path
+    # across the frame would draw motion that never happened.
+    frames(ctx, [object("person", 0.9, [0.8, 0.2, 0.1, 0.3])])
+    assert_receive {:extractor_cast, {:track_boxes, %{boxes: [{"person/1", _, _, _, _}]}}}
+  end
+
   test "frames are dropped on the floor while no event is open", ctx do
     rec = recorder(ctx)
 
@@ -938,7 +1005,7 @@ defmodule Cairn.PresenceRecorderTest do
 
     # No frames call followed the open: these boxes are the retained batch's.
     assert_receive {:extractor_cast,
-                    {:track_boxes, %{boxes: [{"person", "person", @box, false}]}}}
+                    {:track_boxes, %{boxes: [{"person", "person", @box, false, 0.95}]}}}
 
     state = :sys.get_state(rec)
     assert %{label: "person", score: 0.95, bbox: @box} = state.event.trigger
@@ -972,14 +1039,16 @@ defmodule Cairn.PresenceRecorderTest do
 
     frames(ctx, [object("person", 0.95), object("car", 0.6, [0.5, 0.5, 0.1, 0.1])])
 
-    # Boxes are unfiltered and label-keyed (D-E5b), best score first.
+    # Boxes are unfiltered and label-keyed (D-E5b), each carrying its score;
+    # cross-label order is no contract now that slots key concurrent boxes.
     assert_receive {:extractor_cast, {:track_boxes, %{t_ms: t_ms, boxes: boxes}}}
     assert t_ms >= 0
 
-    assert boxes == [
-             {"person", "person", @box, false},
-             {"car", "car", [0.5, 0.5, 0.1, 0.1], false}
-           ]
+    assert Enum.sort(boxes) ==
+             Enum.sort([
+               {"person", "person", @box, false, 0.95},
+               {"car", "car", [0.5, 0.5, 0.1, 0.1], false, 0.6}
+             ])
 
     # A new label rides in on the frame, so the event announces it…
     assert_receive {:event_updated, %Event{id: ^eid, max_scores: %{"car" => 0.6}}}
@@ -1014,7 +1083,7 @@ defmodule Cairn.PresenceRecorderTest do
 
     frames(ctx, [object("car", 0.95, [0.5, 0.5, 0.1, 0.1], "tracked")])
 
-    assert_receive {:extractor_cast, {:track_boxes, %{boxes: [{"car", "car", _, false}]}}}
+    assert_receive {:extractor_cast, {:track_boxes, %{boxes: [{"car", "car", _, false, 0.95}]}}}
 
     event = :sys.get_state(rec).event
     refute Map.has_key?(event.max_scores, "car")
@@ -1268,7 +1337,7 @@ defmodule Cairn.PresenceRecorderTest do
       )
 
     assert_receive {:extractor_cast,
-                    {:track_boxes, %{boxes: [{"person", "person", @box, false}]}}}
+                    {:track_boxes, %{boxes: [{"person", "person", @box, false, 0.9}]}}}
   end
 
   test "a transition for a camera with no recorder is dropped, not raised", ctx do

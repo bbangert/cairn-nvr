@@ -52,7 +52,7 @@ defmodule Cairn.TrackPathTest do
           {500, [{"obj-a", "person", [0.5, 0.25, 0.3, 0.4], false}]}
         ])
 
-      assert map["v"] == 1
+      assert map["v"] == 2
       assert map["event_id"] == "ev-1"
       assert map["camera_id"] == "driveway"
       assert map["truncated"] == false
@@ -79,8 +79,80 @@ defmodule Cairn.TrackPathTest do
                "x" => [1_000, 4_000],
                "y" => [2_000, 500],
                "w" => [3_000, 0],
-               "h" => [4_000, 0]
+               "h" => [4_000, 0],
+               # v1-shaped 4-tuple entries carry no score: -1 absolute,
+               # then deltas of nothing changing.
+               "s" => [-1, 0]
              }
+    end
+
+    test "the score column quantizes to thousandths, deltas, and marks scoreless samples" do
+      map =
+        roundtrip(header(%{}), [
+          {0, [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], false, 0.937}]},
+          {500, [{"obj-a", "person", [0.5, 0.2, 0.3, 0.4], false, 0.925}]},
+          # A predicted sample: position but no claim about a detection.
+          {1_000, [{"obj-a", "person", [0.6, 0.2, 0.3, 0.4], false, nil}]}
+        ])
+
+      assert [track] = map["tracks"]
+      # 937, then 925 (-12), then -1 (-926): the -1 sentinel rides the same
+      # delta stream as real scores.
+      assert track["s"] == [937, -12, -926]
+    end
+
+    test "the sentinel deltas cleanly in every direction" do
+      map =
+        roundtrip(header(%{}), [
+          {0, [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], false, nil}]},
+          {500, [{"obj-a", "person", [0.5, 0.2, 0.3, 0.4], false, 0.8}]},
+          {1_000, [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], false, nil}]}
+        ])
+
+      assert [track] = map["tracks"]
+      # nil -> real -> nil: -1, then +801, then -801.
+      assert track["s"] == [-1, 801, -801]
+    end
+
+    test "keyframe suppression drops a sample's score with its box" do
+      # A stationary run whose middle samples move nothing but whose scores
+      # wobble: the score column holds only the KEPT samples' scores — score
+      # variance alone never forces a keyframe, so between keyframes a reader
+      # sees the score stepped, never the wobble.
+      map =
+        roundtrip(header(%{}), [
+          {0, [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], true, 0.9}]},
+          {200, [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], true, 0.7}]},
+          {400, [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], true, 0.5}]},
+          {600, [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], true, 0.85}]}
+        ])
+
+      assert [track] = map["tracks"]
+      # First and last survive the stationary collapse; 0.7 and 0.5 go with
+      # their suppressed boxes.
+      assert track["s"] == [900, -50]
+    end
+
+    test "two concurrent boxes of one label are two tracks when their ids differ" do
+      map =
+        roundtrip(header(%{identity: :label}), [
+          {0,
+           [
+             {"person", "person", [0.1, 0.2, 0.1, 0.2], false, 0.9},
+             {"person/1", "person", [0.7, 0.2, 0.1, 0.2], false, 0.6}
+           ]},
+          {500,
+           [
+             {"person", "person", [0.15, 0.2, 0.1, 0.2], false, 0.91},
+             {"person/1", "person", [0.65, 0.2, 0.1, 0.2], false, 0.62}
+           ]}
+        ])
+
+      assert [a, b] = map["tracks"]
+      assert {a["id"], a["label"]} == {"person", "person"}
+      assert {b["id"], b["label"]} == {"person/1", "person"}
+      # Both sampled at both times — neither shadowed the other.
+      assert length(a["ti"]) == 2 and length(b["ti"]) == 2
     end
 
     test "a header without :truncated or :anchor writes false and nil" do

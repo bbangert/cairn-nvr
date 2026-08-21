@@ -165,6 +165,9 @@ const TrackOverlay = {
         y: dequantize(t["y"] || []),
         w: dequantize(t["w"] || []),
         h: dequantize(t["h"] || []),
+        // v2's per-sample score column: round(score*1000) delta-encoded,
+        // -1 for "no score" (a predicted box). Absent in v1 files.
+        s: undelta(t["s"] || []).map(v => (v < 0 ? null : v / 1000)),
         cursor: 0,
       }
     })
@@ -266,6 +269,7 @@ const TrackOverlay = {
     const n = times.length
     if (n === 0 || tMs < times[0] || tMs > times[n - 1]) return null
     if (n === 1) return [track.x[0], track.y[0], track.w[0], track.h[0]]
+    // (sampleScoreAt below leans on the cursor this leaves behind.)
 
     if (tMs < times[track.cursor]) {
       let lo = 0
@@ -289,6 +293,20 @@ const TrackOverlay = {
       track.w[i] + (track.w[i + 1] - track.w[i]) * f,
       track.h[i] + (track.h[i + 1] - track.h[i]) * f,
     ]
+  },
+
+  // The score at the sample nearest the cursor sampleAt just positioned —
+  // scores are claims about detections, so they step rather than lerp.
+  // null when the file predates v2's "s" column or the sample is a
+  // scoreless prediction.
+  sampleScoreAt(track, tMs) {
+    if (!track.s || track.s.length === 0) return null
+    const i = track.cursor
+    const t0 = track.times[i]
+    const t1 = track.times[i + 1]
+    const nearer = t1 != null && tMs - t0 > t1 - tMs ? i + 1 : i
+    const s = track.s[Math.min(nearer, track.s.length - 1)]
+    return s == null ? null : s
   },
 
   render(mediaTime) {
@@ -354,16 +372,19 @@ const TrackOverlay = {
       ctx.strokeStyle = color
       ctx.stroke()
 
-      this.drawChip(ctx, x, y, meta.label || track.label, meta.score, color)
+      const sampleScore = this.sampleScoreAt(track, tMs)
+      const score = sampleScore != null ? sampleScore.toFixed(2) : meta.score
+      this.drawChip(ctx, x, y, meta.label || track.label, score, color)
     }
 
     ctx.restore()
   },
 
   // The chip sits above-left of the box and flips inside it when there is no
-  // room above. Label and score come from the panel, not the path: v1 of the
-  // format carries no per-sample score, and `best_score` is a track-index
-  // column the server already rendered into the row's chip.
+  // room above. The score is the sample's own (v2's "s" column) — the number
+  // that varies as the model's confidence does; a v1 file or a scoreless
+  // predicted sample falls back to the panel's static `best_score`, which is
+  // what every chip showed before the column existed.
   drawChip(ctx, x, y, label, score, color) {
     if (!label) return
     const text = score && score !== "—" ? `${label} ${score}` : label
