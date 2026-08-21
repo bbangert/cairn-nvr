@@ -29,16 +29,25 @@ for m in $MODELS; do
   for a in uint16 uint8; do
     case $a in uint16) sfx=a16 ;; *) sfx=a8 ;; esac
     echo "=== $m w8$sfx ==="
+    # The destination is cleared before AND after a failed attempt: an
+    # error ahead of the gate (missing source, ORT failure) deletes
+    # nothing itself, and a stale predecessor left at this path would be
+    # consumed downstream as if this run had produced it.
+    rm -f "$OUT/$m-qdq-$sfx.onnx"
     if "$PY" "$HERE/qdq_quantize.py" "$SRC/$m.onnx" "$OUT/$m-qdq-$sfx.onnx" \
         --calib-dir "$CALIB" --activation "$a"; then
       :
     else
       echo "GATE FAILED: $m-$sfx"
       failed="$failed $m-$sfx"
+      rm -f "$OUT/$m-qdq-$sfx.onnx"
     fi
   done
 done
 echo "=== artifacts ==="
 ls -la "$OUT"
-[ -n "$failed" ] && echo "=== gate failures:$failed ==="
+if [ -n "$failed" ]; then
+  echo "=== gate failures:$failed ==="
+  exit 1
+fi
 exit 0

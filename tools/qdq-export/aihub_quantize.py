@@ -81,8 +81,14 @@ def calib_frames():
     paths = sorted(glob.glob(os.path.join(CALIB, "*.png")))
     if not paths:
         raise SystemExit(f"no calibration frames in {CALIB}")
-    step = max(1, len(paths) // CALIB_SAMPLES)
-    return paths[::step][:CALIB_SAMPLES]
+    if len(paths) <= CALIB_SAMPLES:
+        return paths
+    # Even spacing, not a floor-divided stride: a stride of 1 would upload
+    # the first CALIB_SAMPLES sorted files and calibrate on part of the
+    # clip-grouped corpus.
+    n = CALIB_SAMPLES
+    indices = [round(i * (len(paths) - 1) / (n - 1)) for i in range(n)]
+    return [paths[i] for i in sorted(set(indices))]
 
 
 def dataset_for(state, info, input_name):
@@ -136,16 +142,26 @@ def submit():
         ds = dataset_for(state, info, input_name)
         for width in widths:
             name = f"{stem}-aihub-{width}"
-            if name in state["jobs"]:
-                print(f"{name}: already submitted ({state['jobs'][name]})")
+            # The job's identity is its INPUTS, not its name: a changed
+            # source graph, calibration dataset or width must resubmit
+            # rather than silently reuse a job quantized from old bytes.
+            import hashlib
+            with open(src, "rb") as f:
+                src_sha = hashlib.sha256(f.read()).hexdigest()[:16]
+            fingerprint = f"{src_sha}:{ds.dataset_id}:{width}"
+            recorded = state["jobs"].get(name)
+            if isinstance(recorded, dict) and recorded.get("fingerprint") == fingerprint:
+                print(f"{name}: already submitted ({recorded['job_id']})")
                 continue
+            if recorded is not None:
+                print(f"{name}: inputs changed — resubmitting")
             job = hub.submit_quantize_job(
                 src, ds,
                 weights_dtype=hub.QuantizeDtype.INT8,
                 activations_dtype=DTYPE[width],
                 name=name,
             )
-            state["jobs"][name] = job.job_id
+            state["jobs"][name] = {"job_id": job.job_id, "fingerprint": fingerprint}
             save_state(state)
             print(f"{name}: submitted {job.job_id}")
 
@@ -154,7 +170,8 @@ def fetch():
     state = load_state()
     os.makedirs(ART_DIR, exist_ok=True)
     results = {}
-    for name, job_id in state["jobs"].items():
+    for name, recorded in state["jobs"].items():
+        job_id = recorded["job_id"] if isinstance(recorded, dict) else recorded
         # Targets download as a zip (model.onnx + external model.data,
         # like the published assets); normalize to artifacts/<name>/.
         target_dir = os.path.join(ART_DIR, name)

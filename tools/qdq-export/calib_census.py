@@ -70,7 +70,13 @@ def census(calib_dir, model=None, limit=None, score_floor=0.5, out=sys.stdout):
     profile = preprocessing(info["layout"])
     sess = ort.InferenceSession(model, providers=["CPUExecutionProvider"])
     name = sess.get_inputs()[0].name
-    sample = paths if not limit else paths[:: max(1, len(paths) // limit)][:limit]
+    if not limit or len(paths) <= limit:
+        sample = paths
+    else:
+        # Even spacing, not a floor-divided stride — a stride of 1 would
+        # census only the first `limit` sorted frames of a clip-grouped set.
+        indices = [round(i * (len(paths) - 1) / (limit - 1)) for i in range(limit)]
+        sample = [paths[i] for i in sorted(set(indices))]
 
     labels = _labels(model)
     present = collections.Counter()

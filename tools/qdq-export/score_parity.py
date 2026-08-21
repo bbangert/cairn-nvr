@@ -103,12 +103,13 @@ def compare(fp32_path, qdq_path, frame_dir, tolerance=0.9, limit=None, out=sys.s
     profile = preprocessing(layout)
 
     paths = sorted(glob.glob(os.path.join(frame_dir, "*.png")))
-    if limit:
-        # Stride rather than truncate: the first N files of a set built
-        # clip by clip are all one clip, and a parity number measured on
-        # one scene is not a parity number.
-        step = max(1, len(paths) // limit)
-        paths = paths[::step][:limit]
+    if limit and len(paths) > limit:
+        # Evenly spaced across the WHOLE set, not a floor-divided stride:
+        # with limit < N < 2*limit a stride of 1 selects the first `limit`
+        # files, and a set built clip by clip then measures one scene —
+        # the exact parity-of-nothing this selection exists to avoid.
+        indices = [round(i * (len(paths) - 1) / (limit - 1)) for i in range(limit)]
+        paths = [paths[i] for i in sorted(set(indices))]
     if not paths:
         raise SystemExit(f"no PNG frames in {frame_dir}")
     tensors = [

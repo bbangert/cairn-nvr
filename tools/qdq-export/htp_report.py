@@ -27,6 +27,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -65,8 +66,15 @@ WINDOW_DILATE_S = 0.5
 
 
 def extract_frames(clip_path, out_dir, fps):
-    if glob.glob(os.path.join(out_dir, "*.jpg")):
+    # The marker, not the jpgs, is what says extraction finished: an
+    # interrupted ffmpeg leaves frames a bare glob would accept, and a
+    # truncated reference timeline would then certify runs against part
+    # of a clip. No marker -> wipe and redo.
+    marker = os.path.join(out_dir, ".complete")
+    if os.path.exists(marker):
         return
+    if os.path.isdir(out_dir):
+        shutil.rmtree(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     subprocess.run(
         ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", clip_path,
@@ -74,6 +82,20 @@ def extract_frames(clip_path, out_dir, fps):
          os.path.join(out_dir, "f_%05d.jpg")],
         check=True,
     )
+    with open(marker, "w") as f:
+        f.write(f"{clip_path} @ {fps} fps\n")
+
+
+def file_sha256(path):
+    """Full sha256 of a file's bytes — matched verbatim against the
+    board meta's sha256sum lines."""
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def model_digest(model_path):
@@ -196,7 +218,23 @@ def run_suspect(run_dir):
     return None
 
 
-def analyze_run(run_dir, ref_cpu, ref_fp32):
+def stale_evidence(run_dir, expected_shas):
+    """The board script wrote the model's and clip's sha256 into meta;
+    evidence under the right directory name but from different bytes
+    must not be graded against today's references."""
+    if not expected_shas:
+        return None
+    meta = os.path.join(run_dir, "meta")
+    if not os.path.exists(meta):
+        return "no meta fetched"
+    text = open(meta).read()
+    for label, sha in expected_shas.items():
+        if sha and sha not in text:
+            return f"meta does not record the current {label} sha ({sha[:12]}…)"
+    return None
+
+
+def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None):
     """Verdict for one content run against its two reference series."""
     nd = os.path.join(run_dir, "out.ndjson")
     if not os.path.exists(nd):
@@ -204,6 +242,9 @@ def analyze_run(run_dir, ref_cpu, ref_fp32):
     suspect = run_suspect(run_dir)
     if suspect:
         return {"verdict": "SUSPECT", "why": suspect}
+    stale = stale_evidence(run_dir, expected_shas)
+    if stale:
+        return {"verdict": "STALE-EVIDENCE", "why": stale}
     htp = htp_series(nd)
     if not htp:
         return {"verdict": "NO-DATA", "why": "no frame.objects lines"}
@@ -344,9 +385,13 @@ def main():
         "|---|---|---|---|---|---|---|",
     ]
     verdicts = collections.defaultdict(list)
+    clip_shas = {
+        c: file_sha256(os.path.join(clips_dir, f"clip-{c}.mp4")) for c in clip_names
+    }
     for rung, src in RUNGS.items():
         art = os.path.join(out_root, "artifacts", f"{rung}.onnx")
         fp32 = os.path.join(out_root, "sources", f"{src}.onnx")
+        art_sha = file_sha256(art) if os.path.exists(art) else None
         for c in clip_names:
             run_dir = os.path.join(content, f"{rung}-qnn-{c}")
             if not os.path.isdir(run_dir):
@@ -361,6 +406,7 @@ def main():
                 run_dir,
                 cpu_series(art, frames, args.ref_fps, ref_dir),
                 cpu_series(fp32, frames, args.ref_fps, ref_dir),
+                expected_shas={"model": art_sha, "clip": clip_shas[c]},
             )
             verdicts[rung].append(r["verdict"])
             report.append(
@@ -371,6 +417,7 @@ def main():
 
     report += ["", "## Controls", ""]
     controls_missing = []
+    controls_invalid = []
     ort_ctl = os.path.join(content, "yolox_nano-qdq-a16-ort-ac86")
     if not os.path.isdir(ort_ctl):
         controls_missing.append("board CPU-EP control")
@@ -381,6 +428,10 @@ def main():
         fp32 = os.path.join(out_root, "sources", "yolox_nano.onnx")
         r = analyze_run(ort_ctl, cpu_series(art, frames, args.ref_fps, ref_dir),
                         cpu_series(fp32, frames, args.ref_fps, ref_dir))
+        if r["verdict"] != "PASS":
+            controls_invalid.append(
+                f"board CPU-EP control graded {r['verdict']} (must PASS)"
+            )
         report.append(
             f"- board CPU-EP control (nano-a16, ac86): **{r['verdict']}** "
             f"{r.get('htp_band', '')} vs ref {r.get('ref_band', '')} — this run "
@@ -397,6 +448,10 @@ def main():
         fp32 = os.path.join(out_root, "sources", "yolox_nano.onnx")
         r = analyze_run(old_ctl, cpu_series(art, frames, args.ref_fps, ref_dir),
                         cpu_series(fp32, frames, args.ref_fps, ref_dir))
+        if r["verdict"] == "PASS":
+            controls_invalid.append(
+                "defective-nano control graded PASS (the test failed to see the defect)"
+            )
         report.append(
             f"- shipped defective nano (sensitivity control): **{r['verdict']}** "
             f"{r.get('htp_band', '')} {r.get('why', '')} — must NOT be PASS; a "
@@ -412,9 +467,10 @@ def main():
                 f"| {model} | {backend} | {row['p50_ms']} | {row['p95_ms']} | {row['runs']} |"
             )
 
-    if controls_missing:
+    if controls_missing or controls_invalid:
+        problems = [f"missing {c}" for c in controls_missing] + controls_invalid
         report.append(
-            "- **CAMPAIGN NOT CERTIFIABLE**: missing " + ", ".join(controls_missing)
+            "- **CAMPAIGN NOT CERTIFIABLE**: " + "; ".join(problems)
             + " — rung verdicts above stand on an unvalidated methodology."
         )
 

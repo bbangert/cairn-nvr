@@ -69,19 +69,24 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# The control channel holds stdin open; the 600s sleep is a ceiling,
-# never the clock — after the feed drains we killall sleep, stdin EOFs,
-# and the plugin exits 3 ("control channel gone"), its normal end.
-{
-  echo '{"spec":"cairn.plugin","version":1,"type":"stream.started","camera_id":"content","stream_epoch":"01K0QDQCONTENT000000000000","rtp":{"clock_rate":90000}}'
-  sleep 600
-} | "$BASE/cairn-detect" --camera-id content --udp-port 5600 \
+# The control channel is a fifo this script holds open on fd 3: closing
+# that one descriptor is the stdin EOF that ends the plugin (exit 3,
+# "control channel gone"). Deliberately not a piped `sleep` timer — its
+# shutdown was `killall sleep`, which is a host-wide hammer no bench
+# script gets to swing; the run's ceiling is the campaign driver's ssh
+# timeout instead.
+CTL="$RUN/ctl"
+rm -f "$CTL"
+mkfifo "$CTL"
+"$BASE/cairn-detect" --camera-id content --udp-port 5600 \
   --model "$MODEL" --model-profile "$PROFILE" --input-size "$INSIZE" \
   --labels "$BASE/coco.names" --decoder sw --sample-fps "$SAMPLE_FPS" \
   --min-score-json "{\"default\":$MIN_SCORE}" \
   --backend "$BACKEND" "$@" \
-  > "$RUN/out.ndjson" 2> "$RUN/err" &
+  < "$CTL" > "$RUN/out.ndjson" 2> "$RUN/err" &
 PLUGIN=$!
+exec 3> "$CTL"
+echo '{"spec":"cairn.plugin","version":1,"type":"stream.started","camera_id":"content","stream_epoch":"01K0QDQCONTENT000000000000","rtp":{"clock_rate":90000}}' >&3
 
 # Model load / HTP graph prepare gates the feed. Poll granularity 1s;
 # these sleeps finish before the killall below can ever run.
@@ -108,10 +113,9 @@ feed_rc=$?
 FEED=""
 echo "feed exited $feed_rc" >> "$RUN/meta"
 
-# Drain, then close the control channel. The only sleep alive on a
-# bench board (engine stopped, orphans swept above) is our 600s one.
+# Drain, then close fd 3 — the plugin's stdin EOF, and nothing else's.
 sleep 3
-killall sleep 2>/dev/null
+exec 3>&-
 wait "$PLUGIN" 2>/dev/null
 rc=$?
 PLUGIN=""

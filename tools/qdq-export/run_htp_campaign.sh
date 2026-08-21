@@ -186,15 +186,28 @@ EOF
   [ "${PIPESTATUS[0]}" = 0 ] || { log "FATAL: envcheck failed — bench env untrusted, do not read scores from it"; exit 1; }
 }
 
+fetched_run_current() { # <tag> <rung-label>
+  local dir="$HTP/content/$1" local_art="$ART/$2.onnx"
+  grep -q '"frame.objects"' "$dir/out.ndjson" 2>/dev/null || return 1
+  [ -f "$dir/meta" ] || return 1
+  grep -q "run suspect" "$dir/meta" && return 1
+  if [ -f "$local_art" ]; then
+    grep -q "$(sha256sum "$local_art" | cut -d' ' -f1)" "$dir/meta" || return 1
+  fi
+  return 0
+}
+
 content_run() { # <backend> <model-path> <rung-label> <profile> <insize>
   local backend=$1 model=$2 label=$3 profile=$4 insize=$5 clip flags=""
   [ "$backend" = qnn ] && flags=$QNN_FLAGS
   for clip in $CLIPS; do
     local tag="$label-$backend-$clip"
-    # Skip only on evidence of a SUCCESSFUL fetched run: a failed QNN run
-    # still leaves a non-empty out.ndjson (QAIRT prepare logs print to
-    # the plugin's stdout), so file size alone would skip the retries.
-    if grep -q '"frame.objects"' "$HTP/content/$tag/out.ndjson" 2>/dev/null; then
+    # Skip only on evidence of a SUCCESSFUL CURRENT run: emitted frames,
+    # a meta with no suspect verdict, and — when the artifact exists
+    # locally — the meta's recorded model sha matching today's bytes. A
+    # truncated run can emit a frame before dying, and an old run under
+    # the same tag can describe different model bytes; both must retry.
+    if fetched_run_current "$tag" "$label"; then
       log "content $tag: already fetched, skip"
       continue
     fi
@@ -220,9 +233,7 @@ content_run() { # <backend> <model-path> <rung-label> <profile> <insize>
 
 do_content() {
   log "== content runs: ${CLIPS} x (12 rungs qnn + nano ort control + old-nano defect control)"
-  # Governor pinned for the whole leg so incidental latency lines mean
-  # something; recorded per-run in meta, restored by finish.
-  remote 30 "for c in /sys/devices/system/cpu/cpu[0-9]*; do echo performance > \$c/cpufreq/scaling_governor; done"
+  pin_governor
   while IFS=: read -r name profile insize; do
     [ -z "$name" ] && continue
     content_run qnn "/data/cairn-bench/artifacts-fixed/$name.onnx" "$name" "$profile" "$insize"
@@ -235,8 +246,17 @@ do_content() {
   CLIPS="ac86" content_run qnn /data/cairn-bench/yolox_nano-qdq-a16.onnx control-old-nano-a16 yolox 416
 }
 
+pin_governor() {
+  # Capture the pre-campaign governor ONCE — never on re-entry, or a
+  # second pin would record "performance" and finish would then restore
+  # the pin itself. What was actually there is what comes back.
+  remote 30 "test -f /data/campaign-gov.saved || cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > /data/campaign-gov.saved"
+  remote 30 "for c in /sys/devices/system/cpu/cpu[0-9]*; do echo performance > \$c/cpufreq/scaling_governor; done"
+}
+
 do_latency() {
   log "== latency runs: bench.sh per rung, governor pinned"
+  pin_governor
   echo "$(date +%s)" > "$HTP/.latency-start"
   while IFS=: read -r name profile insize; do
     [ -z "$name" ] && continue
@@ -274,7 +294,9 @@ do_fetch() {
 
 do_finish() {
   log "== finish: restore governor + restart container"
-  remote 30 "for c in /sys/devices/system/cpu/cpu[0-9]*; do echo schedutil > \$c/cpufreq/scaling_governor; done"
+  # Restore what pin_governor captured, and only then retire the record;
+  # a board that ran another governor gets ITS value back, not schedutil.
+  remote 30 "test -f /data/campaign-gov.saved && gov=\$(cat /data/campaign-gov.saved) || gov=schedutil; for c in /sys/devices/system/cpu/cpu[0-9]*; do echo \$gov > \$c/cpufreq/scaling_governor; done; rm -f /data/campaign-gov.saved"
   remote 120 "balena-engine start $CONTAINER"
   engine_state "$HTP/.ps-check"
   grep -q cairn "$HTP/.ps-check" && log "cairn container back up" || log "WARN: cairn container NOT running — start it: balena-engine start $CONTAINER"
@@ -285,7 +307,7 @@ push) do_push ;;
 envcheck) trap do_finish EXIT; do_envcheck ;;
 reboot) do_reboot ;;
 content) trap do_finish EXIT; do_content ;;
-latency) trap do_finish EXIT; do_latency ;;
+latency) trap do_finish EXIT; do_reboot; do_latency ;;
 fetch) do_fetch ;;
 finish) do_finish ;;
 all)

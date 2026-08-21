@@ -10,7 +10,7 @@ These are the fixed-quantization exports (qdq-reexport campaign,
 2026-08-20/21): `get_qnn_qdq_config` + plain MinMax, score sigmoids
 pinned, every artifact through the qparam gate, CPU score parity AND
 the on-board HTP score leg (all rungs at HTP ≈ CPU on real clips —
-`.claude/plans/qdq-reexport/research/htp-verification-20260821.md`).
+the shipped audit record `docs/evidence/qdq-reexport-htp-20260821.md`).
 Their predecessors carried two export defects (baked score ceilings +
 an HTP-only score multiplication, `docs/npu-backends.md`) and must not
 ship again; the width-suffixed names exist so a stale defective file
@@ -29,8 +29,8 @@ YOLOX is Apache-2.0 (Megvii, github.com/Megvii-BaseDetection/YOLOX);
 notice obligation the image honors for the QAIRT libs).
 Quantization is byte-deterministic, so re-running tools/qdq-export on the
 same fp32 export and calibration set reproduces these bytes — the
-sha256s above are the identity check, and they match
-`out-20260820/records/artifacts.sha256` in the campaign records.
+sha256s above are the identity check, and they match the full
+manifest in `docs/evidence/qdq-reexport-htp-20260821.md`.
 
 The a8 rungs read ~3–18% hot on the HTP relative to CPU (the EP's 8-bit
 sigmoid qparam vs the graph's pinned 1/256): a floor tuned on an a16
