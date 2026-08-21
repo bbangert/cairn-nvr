@@ -1083,7 +1083,7 @@ defmodule Cairn.PresenceRecorderTest do
 
     frames(ctx, [object("car", 0.95, [0.5, 0.5, 0.1, 0.1], "tracked")])
 
-    assert_receive {:extractor_cast, {:track_boxes, %{boxes: [{"car", "car", _, false, 0.95}]}}}
+    assert_receive {:extractor_cast, {:track_boxes, %{boxes: [{"car", "car", _, false, nil}]}}}
 
     event = :sys.get_state(rec).event
     refute Map.has_key?(event.max_scores, "car")

@@ -696,9 +696,7 @@ defmodule Cairn.PresenceRecorder do
           |> Enum.take(@max_boxes_per_label)
           |> assign_slots(Map.get(state.box_slots, label, %{}))
 
-        entries =
-          for {slot, det} <- assigned,
-              do: {slot_id(label, slot), label, det.bbox, false, det.score}
+        entries = for {slot, det} <- assigned, do: box_entry(label, slot, det)
 
         {entries ++ boxes, Map.put(slots, label, centers)}
       end)
@@ -782,6 +780,17 @@ defmodule Cairn.PresenceRecorder do
   # sidecar used — so a reader keying on it sees no new world; extra
   # concurrent boxes suffix their slot. `identity: "label"` readers colour
   # and select by `label` either way.
+  # A plugin-predicted box rides the dense-capture rule like any other
+  # (drawn, never evidence), but its score is the last real detection's —
+  # forwarding it would re-stamp a stale claim, so it writes the same
+  # no-score sentinel the tracked lane's coasted boxes do. The numeric
+  # score still ranks it for slot assignment: ranking is render policy,
+  # not a claim.
+  defp box_entry(label, slot, det) do
+    score = if Cairn.Observation.detected?(det), do: det.score
+    {slot_id(label, slot), label, det.bbox, false, score}
+  end
+
   defp slot_id(label, 0), do: label
   defp slot_id(label, slot), do: "#{label}/#{slot}"
 
