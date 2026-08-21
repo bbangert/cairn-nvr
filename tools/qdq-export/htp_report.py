@@ -45,6 +45,11 @@ from quantize_model import describe, load_image_chw, preprocessing  # noqa: E402
 
 import onnxruntime as ort  # noqa: E402
 
+# The shipped defective nano, byte-for-byte (same pin as
+# run_htp_campaign.sh): the sensitivity control demonstrates the defect
+# only if these exact bytes produced the evidence.
+OLD_NANO_SHA = "e4bb2552c6f3c810ae6fc40686f6b4cac5e21eab885b868e6469a2c87098627d"
+
 # rung -> (fp32 source stem, layout). Sources carry the family geometry;
 # describe() reads the real input size from each model.
 RUNGS = {
@@ -439,7 +444,9 @@ def main():
         art = os.path.join(out_root, "artifacts", "yolox_nano-qdq-a16.onnx")
         fp32 = os.path.join(out_root, "sources", "yolox_nano.onnx")
         r = analyze_run(ort_ctl, cpu_series(art, frames, args.ref_fps, ref_dir),
-                        cpu_series(fp32, frames, args.ref_fps, ref_dir))
+                        cpu_series(fp32, frames, args.ref_fps, ref_dir),
+                        expected_shas={"model": file_sha256(art) if os.path.exists(art) else None,
+                                       "clip": clip_shas.get("ac86")})
         if r["verdict"] != "PASS":
             controls_invalid.append(
                 f"board CPU-EP control graded {r['verdict']} (must PASS)"
@@ -458,8 +465,14 @@ def main():
         frames = frames_dir("ac86")
         art = os.path.join(out_root, "artifacts", "yolox_nano-qdq-a16.onnx")
         fp32 = os.path.join(out_root, "sources", "yolox_nano.onnx")
+        # The defective control's bytes are pinned, not derived from a
+        # local file: only the shipped defective nano demonstrates the
+        # defect, and different bytes at the board path (or stale
+        # evidence) must void the CAP, not satisfy it.
         r = analyze_run(old_ctl, cpu_series(art, frames, args.ref_fps, ref_dir),
-                        cpu_series(fp32, frames, args.ref_fps, ref_dir))
+                        cpu_series(fp32, frames, args.ref_fps, ref_dir),
+                        expected_shas={"model": OLD_NANO_SHA,
+                                       "clip": clip_shas.get("ac86")})
         # The control is valid ONLY if it reproduces the known defect's
         # signature. "Anything but PASS" would let NO-DATA / SUSPECT /
         # STALE-EVIDENCE / INSUFFICIENT — a broken or truncated control

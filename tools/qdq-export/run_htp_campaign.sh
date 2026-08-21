@@ -32,6 +32,10 @@ ART=$OUT/artifacts
 CONTAINER=addon_c2da371c_cairn
 QNN_FLAGS="--qnn-library /data/qnn-spike/lib/libonnxruntime_providers_qnn.so --qnn-soc-model 35 --qnn-htp-arch 68"
 CLIPS=${CLIPS:-"ac86 f58a aeb4"}
+# The shipped defective nano, byte-for-byte: the sensitivity control is
+# only a control if THESE bytes ran. Anything else at the board path —
+# including someone "fixing" it — voids the CAP demonstration.
+OLD_NANO_SHA=e4bb2552c6f3c810ae6fc40686f6b4cac5e21eab885b868e6469a2c87098627d
 STAGE=${1:-all}
 mkdir -p "$HTP/runs"
 LOG=$HTP/campaign.log
@@ -193,13 +197,23 @@ EOF
   [ "${PIPESTATUS[0]}" = 0 ] || { log "FATAL: envcheck failed — bench env untrusted, do not read scores from it"; exit 1; }
 }
 
-fetched_run_current() { # <tag> <rung-label>
-  local dir="$HTP/content/$1" local_art="$ART/$2.onnx"
+fetched_run_current() { # <tag> <rung-label> <clip>
+  local dir="$HTP/content/$1" local_art="$ART/$2.onnx" local_clip="$OUT/clips/clip-$3.mp4"
   grep -q '"frame.objects"' "$dir/out.ndjson" 2>/dev/null || return 1
   [ -f "$dir/meta" ] || return 1
   grep -q "run suspect" "$dir/meta" && return 1
   if [ -f "$local_art" ]; then
     grep -q "$(sha256sum "$local_art" | cut -d' ' -f1)" "$dir/meta" || return 1
+  fi
+  # The control has no local artifact under $ART; its bytes are pinned.
+  if [ "$2" = control-old-nano-a16 ]; then
+    grep -q "$OLD_NANO_SHA" "$dir/meta" || return 1
+  fi
+  # A changed clip under the same tag must retry too — otherwise the run
+  # is skipped forever, the analyzer marks it STALE-EVIDENCE, and no
+  # rerun can regenerate it without manual deletion.
+  if [ -f "$local_clip" ]; then
+    grep -q "$(sha256sum "$local_clip" | cut -d' ' -f1)" "$dir/meta" || return 1
   fi
   return 0
 }
@@ -214,7 +228,7 @@ content_run() { # <backend> <model-path> <rung-label> <profile> <insize>
     # locally — the meta's recorded model sha matching today's bytes. A
     # truncated run can emit a frame before dying, and an old run under
     # the same tag can describe different model bytes; both must retry.
-    if fetched_run_current "$tag" "$label"; then
+    if fetched_run_current "$tag" "$label" "$clip"; then
       log "content $tag: already fetched, skip"
       continue
     fi
@@ -254,7 +268,14 @@ do_content() {
   content_run ort /data/cairn-bench/artifacts-fixed/yolox_nano-qdq-a16.onnx yolox_nano-qdq-a16 yolox 416
   # Sensitivity control: the SHIPPED defective nano must show its baked
   # ceiling through this exact methodology, or the test cannot be
-  # trusted to clear the fixed rungs.
+  # trusted to clear the fixed rungs. Authenticate the bytes first —
+  # the label has no $ART artifact, so no other check sees them.
+  remote 60 "sha256sum /data/cairn-bench/yolox_nano-qdq-a16.onnx > /data/tmp-ctl-sha.txt"
+  fetch /data/tmp-ctl-sha.txt "$HTP/.ctl-sha" || { log "FATAL: cannot read control sha"; exit 1; }
+  grep -q "$OLD_NANO_SHA" "$HTP/.ctl-sha" || {
+    log "FATAL: board control bytes are not the shipped defective nano ($OLD_NANO_SHA)"
+    exit 1
+  }
   CLIPS="ac86" content_run qnn /data/cairn-bench/yolox_nano-qdq-a16.onnx control-old-nano-a16 yolox 416
 }
 

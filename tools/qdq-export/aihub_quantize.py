@@ -239,6 +239,23 @@ def fetch():
                              capture_output=True, text=True).stdout
         with open(os.path.join(STATE_DIR, "artifacts.sha256"), "w") as f:
             f.write(sha)
+    # A partial fetch must not read as a completed one: the verify script
+    # only requires that SOME artifacts exist, so a failed job that left
+    # its slot empty would let the remaining subset grade the whole MATRIX.
+    incomplete = []
+    for name, recorded in state["jobs"].items():
+        job_id = recorded["job_id"] if isinstance(recorded, dict) else recorded
+        target_dir = os.path.join(ART_DIR, name)
+        marker = os.path.join(target_dir, ".job")
+        if not os.path.exists(os.path.join(target_dir, "model.onnx")):
+            incomplete.append(f"{name}: no artifact ({results.get(name, 'not attempted')})")
+        elif not (os.path.exists(marker) and open(marker).read().strip() == job_id):
+            incomplete.append(f"{name}: artifact is not from job {job_id}")
+    if incomplete:
+        print("fetch INCOMPLETE — not every recorded job produced its artifact:")
+        for line in incomplete:
+            print(f"  {line}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

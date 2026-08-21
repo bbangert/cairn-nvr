@@ -32,12 +32,16 @@ either ship again.
 
 ## Environments
 
-Two venvs, deliberately separate:
+Three venvs, deliberately separate:
 
 - `model/quant-venv`: `pip install -r tools/qdq-export/requirements.txt`.
-  Runs everything here except the Ultralytics export. Pinned, because
-  the emitted graph depends on the ORT version and the idempotency claim
-  is meaningless without one.
+  Runs everything here except the Ultralytics export and the AI Hub
+  client. Pinned, because the emitted graph depends on the ORT version
+  and the idempotency claim is meaningless without one.
+- `aihub-venv` (operator-created, here, gitignored): `pip install
+  qai-hub==0.55.0`. Runs `aihub_quantize.py` only — the vendor
+  cross-check needs Qualcomm's client and an API token (`qualcomm.env`,
+  also gitignored), neither of which belongs in the pinned quant env.
 - `export-venv` (operator-created, here): `pip install ultralytics
   --extra-index-url https://download.pytorch.org/whl/cpu`. Runs
   `export_ultralytics.py` only. This is the AGPL boundary: nothing in

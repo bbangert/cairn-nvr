@@ -81,6 +81,15 @@ QMAX = {
     onnx.TensorProto.INT16: 32767,
 }
 
+# The QNN EP rewrites Sigmoid output qparams to these canonical values at
+# session build. Internal Q/DQ agreement is not enough: a calibrated
+# (unpinned) scale agrees with itself in the file and still disagrees with
+# the hardware — HTP-only, invisibly. A score sigmoid must carry the pin.
+PINNED_SIGMOID = {
+    onnx.TensorProto.UINT16: 1.0 / 65536,
+    onnx.TensorProto.UINT8: 1.0 / 256,
+}
+
 
 class GateFailure(Exception):
     """The export is unshippable. Raised rather than sys.exit so the
@@ -419,6 +428,21 @@ def check(model_path, min_ceiling=DEFAULT_MIN_CEILING, input_size=None, out=sys.
             bad.append(
                 f"{e['node']}: Q scale {e['scale']:.6e} != DQ scale "
                 f"{e['dq_scale']:.6e}"
+            )
+        elif e["elem_type"] not in PINNED_SIGMOID:
+            bad.append(
+                f"{e['node']}: score sigmoid quantized to elem_type "
+                f"{e['elem_type']} — no known EP pin to check against"
+            )
+        elif (
+            abs(e["scale"] - PINNED_SIGMOID[e["elem_type"]]) > 1e-12
+            or e["zero_point"] != 0
+        ):
+            bad.append(
+                f"{e['node']}: scale {e['scale']:.6e} zp {e['zero_point']} is "
+                f"not the pinned {PINNED_SIGMOID[e['elem_type']]:.6e}/0 the "
+                "QNN EP writes at session build — the file agrees with "
+                "itself but not with the hardware"
             )
     if bad:
         raise GateFailure(
