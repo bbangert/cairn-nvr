@@ -741,7 +741,7 @@ defmodule Cairn.PresenceRecorder do
         {det, center, options}
       end
 
-    {_count, _dist, assigned} = best_assignment(candidates, MapSet.new())
+    {_count, _dist, assigned} = best_assignment(candidates, [])
 
     # Computed over the FULL matched set before any :new is numbered — plus
     # every slot the previous frame held: a fresh slot may take neither, or a
@@ -783,10 +783,10 @@ defmodule Cairn.PresenceRecorder do
   end
 
   defp consider_slot({slot, dist}, {best_c, best_d, _} = best, det, center, rest, used) do
-    if MapSet.member?(used, slot) do
+    if slot in used do
       best
     else
-      {c1, d1, ch1} = best_assignment(rest, MapSet.put(used, slot))
+      {c1, d1, ch1} = best_assignment(rest, [slot | used])
 
       if c1 + 1 > best_c or (c1 + 1 == best_c and d1 + dist < best_d) do
         {c1 + 1, d1 + dist, [{slot, det, center} | ch1]}
