@@ -618,9 +618,12 @@ defmodule Cairn.Native.HostTest do
     end
 
     test "a probe that cannot finish one pass yields no baseline, quickly" do
+      # Just past the 50ms probe deadline; the test itself only waits out
+      # the deadline (Task.ignore orphans the sleeper), so this bounds the
+      # stray background task, not the suite.
       control(%{
         cpu_baseline_ms: fn _config, _passes ->
-          Process.sleep(500)
+          Process.sleep(200)
           {:ok, 41_000.0}
         end
       })

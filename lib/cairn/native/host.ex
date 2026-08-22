@@ -536,10 +536,14 @@ defmodule Cairn.Native.Host do
     end
   end
 
-  defp missing_qnn_library?(config) do
+  # Scoped to the qnn backend: another accelerator with a stale
+  # qnn.library value must not lose its baseline to a file it never loads.
+  defp missing_qnn_library?(%{backend: "qnn"} = config) do
     library = config.qnn.library
     is_binary(library) and not File.exists?(library)
   end
+
+  defp missing_qnn_library?(_config), do: false
 
   # One pass under a short deadline decides whether the median is worth
   # paying for: a model that cannot finish a single CPU pass quickly cannot
