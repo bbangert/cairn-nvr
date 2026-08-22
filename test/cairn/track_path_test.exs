@@ -133,6 +133,26 @@ defmodule Cairn.TrackPathTest do
       assert track["s"] == [900, -50]
     end
 
+    test "a sentinel transition is a keyframe even on a parked box" do
+      # detected -> predicted -> detected with identical geometry: numeric
+      # wobble is suppressible, but the scoreless interval is a claim change
+      # — collapsing it to the numeric endpoints would show confidence
+      # through samples that explicitly made no detection claim. The compare
+      # runs on QUANTIZED samples (-1), which round 2's is_nil check missed.
+      map =
+        roundtrip(header(%{}), [
+          {0, [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], true, 0.9}]},
+          {200, [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], true, nil}]},
+          {400, [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], true, nil}]},
+          {600, [{"obj-a", "person", [0.1, 0.2, 0.3, 0.4], true, 0.85}]}
+        ])
+
+      assert [track] = map["tracks"]
+      # Both sentinel edges survive; the interior scoreless sample at 400
+      # is ordinary suppression (no claim change against 200).
+      assert track["s"] == [900, -901, 851]
+    end
+
     test "two concurrent boxes of one label are two tracks when their ids differ" do
       map =
         roundtrip(header(%{identity: :label}), [

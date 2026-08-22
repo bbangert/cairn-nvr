@@ -720,11 +720,20 @@ defmodule Cairn.PresenceRecorder do
         {entries ++ boxes, Map.put(slots, label, centers), Map.put(next, label, label_next)}
       end)
 
+    # The watermark is persisted BEFORE the first box wearing a new id
+    # reaches the extractor, and unthrottled: once the sidecar holds the
+    # id, a crash restoring a pre-mint checkpoint would re-mint it onto
+    # an unrelated subject. Mints are rare (bounded per label per event);
+    # centre-only movement stays on the throttled path in `frame/2`.
+    minted? = next != state.box_slot_next
+    state = %{state | box_slots: slots, box_slot_next: next}
+    state = if minted?, do: write_checkpoint(state), else: state
+
     if boxes != [] do
       GenServer.cast(pid, {:track_boxes, %{t_ms: t_ms, boxes: boxes}})
     end
 
-    %{state | box_slots: slots, box_slot_next: next}
+    state
   end
 
   defp forward_boxes(state, _t_ms, _objects), do: state

@@ -64,8 +64,11 @@ defmodule Cairn.TrackPath do
 
   `"s"` (v2) is the per-sample score, `round(score * 1000)` and
   delta-encoded like the coordinate columns; `-1` absolute is "no score"
-  (a tracked-lane predicted box). Files written at v1 have no `"s"` and
-  every reader treats its absence exactly like a column of no-scores.
+  (a tracked-lane predicted box). A v1 file's ABSENT column and a v2
+  `-1` sample are different claims, and readers treat them differently:
+  with no column at all the overlay falls back to the track's static
+  `best_score` (the only number a v1 file has), while a `-1` sample
+  renders no score — that sample explicitly made no detection claim.
 
   `"truncated"` at the top level is the caller's own flag — the buffer that fed
   `encode/2` hit a global cap and dropped batches. The per-track one is this
@@ -457,8 +460,9 @@ defmodule Cairn.TrackPath do
   # Clamped at zero so the -1 sentinel cannot collide with a quantized value:
   # detector scores are (0, 1) by construction, so the clamp is a guard on the
   # encoding's invariant, not a data path anything reaches today.
+  @no_score -1
   defp quantize_score(score) when is_number(score), do: round(max(score, 0) * 1000)
-  defp quantize_score(_no_score), do: -1
+  defp quantize_score(_no_score), do: @no_score
 
   defp quantize([x, y, w, h]) do
     {round(x * 10_000), round(y * 10_000), round(w * 10_000), round(h * 10_000)}
@@ -500,10 +504,11 @@ defmodule Cairn.TrackPath do
   # different: that is a claim change, and suppressing it would show
   # confidence across an interval that explicitly made no detection claim
   # (detected -> predicted -> detected on a parked box would collapse to
-  # the numeric endpoints).
+  # the numeric endpoints). Samples are already quantized here, so the
+  # sentinel is the encoded -1, not nil.
   defp keep?({t, coords, stationary, score}, {t0, coords0, stationary0, score0}) do
     stationary != stationary0 or t - t0 > @max_gap_ms or moved?(coords, coords0) or
-      is_nil(score) != is_nil(score0)
+      score == @no_score != (score0 == @no_score)
   end
 
   defp moved?({x, y, w, h}, {x0, y0, w0, h0}) do
