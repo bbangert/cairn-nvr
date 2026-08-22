@@ -474,6 +474,17 @@ defmodule Cairn.Native.Host do
   defp load_model(state, config, canary) do
     state = %{state | canary_state: canary}
 
+    # Measured BEFORE the engine exists, and the order is load-bearing:
+    # engine init registers the QNN plugin EP with the process-wide ORT
+    # environment, and a "CPU" session created after that registration has
+    # been observed executing on the HTP — 60.8 ms for a model whose true
+    # CPU pass exceeds 40 s — collapsing the D-P5 ratio to ~1x and pinning
+    # the health verdict at a false :wedged from 30 s after every boot.
+    # Before any registration, the CPU is the only venue there is. A model
+    # too big to finish the measurement inside the timeout yields nil —
+    # :not_applicable — which is the honest verdict, not a fabricated one.
+    baseline = measure_baseline(state, config)
+
     case state.ort.init(config) do
       {:ok, engine} ->
         Logger.info(
@@ -485,7 +496,7 @@ defmodule Cairn.Native.Host do
           state
           | engine: engine,
             engine_state: :ready,
-            cpu_baseline_ms: measure_baseline(state, config)
+            cpu_baseline_ms: baseline
         }
 
       {:error, {reason, message}} ->
