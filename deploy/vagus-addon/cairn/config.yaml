@@ -1,6 +1,6 @@
 # Cairn NVR as a vagus add-on (tier1-container plan, phase 2).
 name: Cairn NVR
-version: "0.1.4"
+version: "0.1.5"
 slug: cairn
 description: >-
   Presence-detection NVR with in-VM inference on the Hexagon HTP.
