@@ -395,10 +395,17 @@ defmodule Cairn.Native.HealthTest do
     # node could reach was `:not_applicable` and the four-way discrimination
     # below never ran. The engine measures its own now.
     test "an accelerator calibrates its CPU baseline at engine init", %{id: id} do
-      host = start_host(health: [min_samples: 3])
+      host =
+        start_host(
+          config: %{model: "test/support/fixtures/models/stub.onnx", backend: "qnn"},
+          health: [min_samples: 3]
+        )
+
       {:ok, _epoch} = Host.open_stream(host, id, %{})
 
-      assert_receive {:cpu_baseline_ms, %{model: "m.onnx", backend: "qnn"}, passes}
+      assert_receive {:cpu_baseline_ms,
+                      %{model: "test/support/fixtures/models/stub.onnx", backend: "qnn"}, passes}
+
       assert passes in 1..64
 
       push(host, id, 10)

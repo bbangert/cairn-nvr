@@ -218,8 +218,16 @@ impl Backend for QnnBackend {
                 .join(" ")
         );
 
+        // One intra-op thread: the HTP does the compute, and ORT's default
+        // pool (~cores) spin-waits through every pass — measured at ~4 cores
+        // of pure wait on the QCS6490, identically in the standalone bench
+        // and the engine, while the pass itself sat in one fastrpc call.
+        // Any per-node CPU fallback runs single-threaded, which D-P5 then
+        // sees as the latency it costs rather than hiding it in parallelism.
         let session = Session::builder()
             .map_err(|e| anyhow!("creating an onnxruntime session builder: {e}"))?
+            .with_intra_threads(1)
+            .map_err(|e| anyhow!("limiting intra-op threads: {e}"))?
             .with_devices(devices, Some(&ep_options))
             .map_err(|e| anyhow!("appending the QNN execution provider: {e}"))?
             .commit_from_file(model)

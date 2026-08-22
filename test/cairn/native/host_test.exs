@@ -602,4 +602,49 @@ defmodule Cairn.Native.HostTest do
       assert Host.status(host).model == "pinned.onnx"
     end
   end
+
+  describe "the CPU baseline's venue and cost" do
+    # The measurement order is load-bearing: before init/1, so the QNN EP is
+    # not yet registered in the process and the "CPU" session cannot land on
+    # the accelerator (observed on the board: 60.8 ms for a model whose true
+    # CPU pass exceeds 40 s, pinning health at a false :wedged).
+    test "probes with one pass before paying for the median" do
+      host = start_host(config: %{model: @stub_onnx, backend: "qnn"})
+
+      assert_receive {:cpu_baseline_ms, %{model: @stub_onnx}, 1}
+      assert_receive {:cpu_baseline_ms, %{model: @stub_onnx}, 5}
+      assert_receive {:init, %{model: @stub_onnx}}
+      assert GenServer.call(host, :probe).cpu_baseline_ms == 45.0
+    end
+
+    test "a probe that cannot finish one pass yields no baseline, quickly" do
+      control(%{
+        cpu_baseline_ms: fn _config, _passes ->
+          Process.sleep(500)
+          {:ok, 41_000.0}
+        end
+      })
+
+      log =
+        capture_log(fn ->
+          host =
+            start_host(
+              config: %{model: @stub_onnx, backend: "qnn"},
+              baseline_probe_timeout_ms: 50
+            )
+
+          assert GenServer.call(host, :probe).cpu_baseline_ms == nil
+        end)
+
+      assert log =~ "no CPU baseline"
+    end
+
+    test "a model file that does not exist skips the measurement entirely" do
+      host = start_host(config: %{model: "m.onnx", backend: "qnn"})
+
+      assert_receive {:init, %{model: "m.onnx"}}
+      refute_received {:cpu_baseline_ms, _config, _passes}
+      assert GenServer.call(host, :probe).cpu_baseline_ms == nil
+    end
+  end
 end
