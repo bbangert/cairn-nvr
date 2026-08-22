@@ -1916,9 +1916,13 @@ defmodule Cairn.CameraTrackerTest do
       # that opened it — the opening batch is the first sample of the path
       assert batch.t_ms == 0
 
+      # The person's score is the detection's own claim; the cat minted from
+      # a predicted observation, so its track is stale from birth and its
+      # sample writes the no-score sentinel — the stale_predicted -> nil leg
+      # of the sidecar contract, pinned here.
       assert [
-               {person_id, "person", [0.1, 0.1, 0.2, 0.4], false},
-               {cat_id, "cat", [0.6, 0.6, 0.1, 0.1], false}
+               {person_id, "person", [0.1, 0.1, 0.2, 0.4], false, 0.9},
+               {cat_id, "cat", [0.6, 0.6, 0.1, 0.1], false, nil}
              ] = batch.boxes
 
       assert is_binary(person_id) and String.length(person_id) == 26
@@ -1949,7 +1953,8 @@ defmodule Cairn.CameraTrackerTest do
       assert_receive {:event_started, %Event{camera_id: ^id}}
 
       assert_receive {:extractor_got,
-                      {:"$gen_cast", {:track_boxes, %{boxes: [{oid, "person", @box, false}]}}}}
+                      {:"$gen_cast",
+                       {:track_boxes, %{boxes: [{oid, "person", @box, false, 0.9}]}}}}
 
       armed = token(tracker, :post_token)
 
@@ -1960,7 +1965,8 @@ defmodule Cairn.CameraTrackerTest do
       # the identity is retained — the same ULID reaches the extractor, which
       # is what a low-confidence match is for
       assert_receive {:extractor_got,
-                      {:"$gen_cast", {:track_boxes, %{boxes: [{^oid, "person", @box, false}]}}}}
+                      {:"$gen_cast",
+                       {:track_boxes, %{boxes: [{^oid, "person", @box, false, 0.3}]}}}}
 
       assert [%Track{object_id: ^oid, best_score: 0.9}] = live_tracks(id)
 
@@ -1996,7 +2002,8 @@ defmodule Cairn.CameraTrackerTest do
       assert_receive {:extractor_started, %Event{camera_id: ^id}, _pid}
 
       assert_receive {:extractor_got,
-                      {:"$gen_cast", {:track_boxes, %{boxes: [{oid, "person", ^still, false}]}}}}
+                      {:"$gen_cast",
+                       {:track_boxes, %{boxes: [{oid, "person", ^still, false, 0.9}]}}}}
 
       # the same box one `stationary_after_ms` of the observation clock later:
       # the tracker
@@ -2012,7 +2019,8 @@ defmodule Cairn.CameraTrackerTest do
       )
 
       assert_receive {:extractor_got,
-                      {:"$gen_cast", {:track_boxes, %{boxes: [{^oid, "person", ^still, true}]}}}}
+                      {:"$gen_cast",
+                       {:track_boxes, %{boxes: [{^oid, "person", ^still, true, 0.9}]}}}}
 
       # the tracker's own publication of the same flip, so the `true` above is
       # tracker output reaching the extractor and not a shape this test built
@@ -2034,7 +2042,7 @@ defmodule Cairn.CameraTrackerTest do
       observe(tracker, camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])])
       assert_receive {:extractor_started, %Event{camera_id: ^id}, extractor}
       assert_receive {:extractor_got, {:"$gen_cast", {:track_boxes, batch}}}
-      assert [{_id, "person", [0.1, 0.1, 0.2, 0.4], false}] = batch.boxes
+      assert [{_id, "person", [0.1, 0.1, 0.2, 0.4], false, 0.9}] = batch.boxes
 
       probe(extractor)
       refute_received {:extractor_got, {:"$gen_cast", {:track_boxes, _}}}

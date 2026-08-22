@@ -47,6 +47,22 @@ defmodule Cairn.PresenceRecorderRestoreTest do
   # Stands in for an extractor that outlived the process which started it:
   # unlinked, and owned by the TEST rather than by whoever started it, so it
   # survives the recorder's death — which is the whole scenario here.
+  defp frames(ctx, objects) do
+    frame = %{
+      pts: 0,
+      observed_at_ms: DateTime.to_unix(DateTime.utc_now(), :millisecond),
+      inferred: true,
+      infer_us: 0,
+      objects: objects
+    }
+
+    PresenceRecorder.frames(ctx.camera_id, %{"default" => 0.5}, [frame])
+  end
+
+  defp object(label, score, bbox) do
+    %{label: label, score: score, bbox: bbox, track_id: nil, observation_kind: "detected"}
+  end
+
   defp relay(test_pid) do
     spawn(fn ->
       Process.monitor(test_pid)
@@ -214,6 +230,29 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
     assert_receive {:extractor_finalized, ^extractor, %Event{id: ^eid}}
     assert PresenceCheckpoint.get(ctx.camera_id) == nil
+  end
+
+  # The adopted extractor is still buffering the same sidecar, so a
+  # replacement recorder that re-minted slots from zero could connect a new
+  # box to an unrelated pre-crash path and interpolate across the frame. The
+  # centres ride the checkpoint; the first post-restore frame continues its
+  # path.
+  test "restored slot centres keep a sidecar path across the crash", ctx do
+    extractor = relay(self())
+    event = event(ctx)
+    announce(ctx, "person")
+
+    PresenceCheckpoint.put(ctx.camera_id, event, ["person"], extractor, %{
+      centers: %{"person" => %{1 => {0.55, 0.35}}},
+      next: %{"person" => 2}
+    })
+
+    recorder(ctx)
+
+    # Centre 0.55 — inside the restored slot 1's radius: the box continues
+    # its slot-1 path instead of minting "person" from an empty slot table.
+    frames(ctx, [object("person", 0.9, [0.5, 0.2, 0.1, 0.3])])
+    assert_receive {:extractor_cast, {:track_boxes, %{boxes: [{"person\u001F1", _, _, _, _}]}}}
   end
 
   # The cap timer gets the remainder, not a fresh window: a restart must not
@@ -672,7 +711,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     # the pool went with it…
     Registry.await_unregistered(id, :presence_recorder)
     # …and the row it was writing did not
-    assert {%Event{id: ^eid}, ["person"], ^extractor} = PresenceCheckpoint.get(id)
+    assert {%Event{id: ^eid}, ["person"], ^extractor, _slots} = PresenceCheckpoint.get(id)
 
     assert {:ok, replacement} = PresenceRecorder.ensure(id)
     assert replacement != pooled

@@ -35,8 +35,10 @@ defmodule Cairn.PresenceRecorder do
 
     * **No identity.** The sidecar entries are keyed by label rather than by
       `object_id`, and the header declares that variant so the playback
-      overlay colours by label (`Cairn.TrackPath`). Two objects of one label
-      in one frame therefore share a path.
+      overlay colours by label (`Cairn.TrackPath`). Concurrent objects of one
+      label get per-label render slots — separate paths, shared colour — but
+      a slot is frame-to-frame continuity, never an identity claim
+      (`assign_slots/2`).
     * **The post window is armed by a clear, not reset by evidence.** The
       tracked lane re-arms its post timer on every batch of evidence; here a
       label is *present* until the aggregator says otherwise, so the timer is
@@ -84,6 +86,11 @@ defmodule Cairn.PresenceRecorder do
   }
 
   @max_label_entries 5_000
+  # Concurrent boxes the sidecar keeps per label per frame. The lane is
+  # identity-free, so this bounds render slots, not tracks; two people and a
+  # dog is the realistic ceiling for a presence camera, and every extra slot
+  # is a sidecar column set an empty scene never pays for.
+  @max_boxes_per_label 4
   # `Cairn.CameraTracker`'s throttle and for its reason: the row is a deep ETS
   # copy of the whole event, rewritten on every batch that says anything, and
   # what a second-stale copy costs is the last second of label entries on an
@@ -276,10 +283,17 @@ defmodule Cairn.PresenceRecorder do
       # see the second `:DOWN` clause.
       finalizing: %{},
       # True only for an extractor this process did not start — one adopted
-      # from a checkpoint by `reattach/4`. What hangs on it is how its `:DOWN`
+      # from a checkpoint by `reattach/5`. What hangs on it is how its `:DOWN`
       # is read; see the handler.
       adopted_extractor?: false,
       present_labels: MapSet.new(),
+      # Per-label render-slot centres from the last forwarded frame — see
+      # assign_slots/3. Continuity state only; nothing decides on it. Rides
+      # the checkpoint so a replacement recorder keeps the sidecar's paths.
+      box_slots: %{},
+      # Per-label per-event slot watermark: numbers only grow, so no slot id
+      # is ever re-minted onto an unrelated earlier path.
+      box_slot_next: %{},
       # The same set with each label's best score while it has been present,
       # which the event alone cannot answer once it has closed: a segment
       # opened at a `max_event` boundary is seeded from these.
@@ -653,8 +667,20 @@ defmodule Cairn.PresenceRecorder do
     t_ms = frame_unix_ms(frame) - state.started_unix_ms
     objects = Map.get(frame, :objects, [])
 
-    forward_boxes(state, t_ms, objects)
-    fold(state, Enum.filter(objects, &qualifying_object?(state, &1)), t_ms)
+    slots_before = {state.box_slots, state.box_slot_next}
+    state = forward_boxes(state, t_ms, objects)
+    state = fold(state, Enum.filter(objects, &qualifying_object?(state, &1)), t_ms)
+
+    # Slot state must reach the checkpoint even when the frame carried no
+    # qualifying detection: predicted and below-floor boxes still move the
+    # centres and the watermark, and a crash would otherwise restore paths
+    # from wherever the last qualifying frame left them. Throttled by
+    # checkpoint/1 like every other write.
+    if state.event != nil and {state.box_slots, state.box_slot_next} != slots_before do
+      checkpoint(state)
+    else
+      state
+    end
   end
 
   # The dense half of the playback overlay, in the compact shape
@@ -662,29 +688,156 @@ defmodule Cairn.PresenceRecorder do
   # tier — for the tracked lane's reason: what earns video is a different
   # question from what is drawn over video already recorded.
   #
-  # Both elements of the entry's identity pair are the label (D-E5b): with no
-  # tracker there is nothing else to key a path by. `Cairn.TrackPath` keeps one
-  # sample per identity per instant, and the highest-scoring box of a label is
-  # sorted to the front so it is the one that survives two people in one frame.
+  # A path's id is the label plus a render slot (D-E5b amended): with no
+  # tracker there is no identity to key by, so concurrent same-label boxes go
+  # to slots matched against the previous frame's centres — up to
+  # @max_boxes_per_label of them, best scores first when the frame offers
+  # more. Slot 0 keeps the bare label, so a single-subject file reads exactly
+  # as v1 did.
   #
   # **Ordering dependency**, `Cairn.CameraTracker.forward_boxes/2`'s: this cast
   # and the finalize cast in `maybe_finalize/3` share a sender and a receiver,
   # so every box sent before finalize is in the extractor's mailbox before it.
   # A `call`, or a finalize routed through another process, silently truncates
   # the sidecar's tail.
-  defp forward_boxes(%{extractor: pid}, t_ms, objects) when is_pid(pid) do
-    boxes =
+  defp forward_boxes(%{extractor: pid} = state, t_ms, objects) when is_pid(pid) do
+    {boxes, slots, next} =
       objects
       |> Enum.filter(&boxed?/1)
-      |> Enum.sort_by(& &1.score, :desc)
-      |> Enum.map(&{&1.label, &1.label, &1.bbox, false})
+      |> Enum.group_by(& &1.label)
+      |> Enum.reduce({[], %{}, state.box_slot_next}, fn {label, dets}, {boxes, slots, next} ->
+        {assigned, centers, label_next} =
+          dets
+          |> Enum.sort_by(& &1.score, :desc)
+          |> Enum.take(@max_boxes_per_label)
+          |> assign_slots(
+            Map.get(state.box_slots, label, %{}),
+            Map.get(next, label, 0)
+          )
+
+        entries = for {slot, det} <- assigned, do: box_entry(label, slot, det)
+
+        {entries ++ boxes, Map.put(slots, label, centers), Map.put(next, label, label_next)}
+      end)
+
+    # The watermark is persisted BEFORE the first box wearing a new id
+    # reaches the extractor, and unthrottled: once the sidecar holds the
+    # id, a crash restoring a pre-mint checkpoint would re-mint it onto
+    # an unrelated subject. Mints are rare (bounded per label per event);
+    # centre-only movement stays on the throttled path in `frame/2`.
+    minted? = next != state.box_slot_next
+    state = %{state | box_slots: slots, box_slot_next: next}
+    state = if minted?, do: write_checkpoint(state), else: state
 
     if boxes != [] do
       GenServer.cast(pid, {:track_boxes, %{t_ms: t_ms, boxes: boxes}})
     end
+
+    state
   end
 
-  defp forward_boxes(_state, _t_ms, _objects), do: :ok
+  defp forward_boxes(state, _t_ms, _objects), do: state
+
+  # The lane has no tracker, so a slot is not an identity — it is render
+  # continuity: the overlay interpolates between a sidecar track's samples,
+  # and two concurrent people swapping tracks between keyframes would draw
+  # boxes gliding through each other. Matching is maximum-cardinality first
+  # (then minimum total centre distance): greedy in score order could mint a
+  # new path even when a one-to-one match existed for every box — prev
+  # centres 0.20/0.55 with a high-score det at 0.35 and another at 0.00
+  # would greedily take 0.20's slot for 0.35 and mint for 0.00, the exact
+  # discontinuity slots exist to prevent. At most four boxes and four slots,
+  # so exhaustive search costs nothing; a wrong guess costs one crossing
+  # artifact, never a detection.
+  #
+  # A slot only claims a box in its neighbourhood: normalized centre distance
+  # above @slot_match_radius reads as "someone else", and the box mints a
+  # fresh slot rather than yanking an existing path across the frame.
+  @slot_match_radius 0.25
+
+  defp assign_slots(dets, prev_centers, next0) do
+    candidates =
+      for det <- dets do
+        center = box_center(det.bbox)
+
+        options =
+          prev_centers
+          |> Enum.map(fn {slot, prev} -> {slot, center_distance(center, prev)} end)
+          |> Enum.filter(fn {_slot, d} -> d <= @slot_match_radius end)
+
+        {det, center, options}
+      end
+
+    {_count, _dist, assigned} = best_assignment(candidates, [])
+
+    # New slots number from a per-event watermark and a number is NEVER
+    # reused — not the just-vacated slot of a subject that jumped past the
+    # radius, and not a slot retired frames ago: `TrackPath.collect/1`
+    # groups event-wide by id, so a re-minted number would splice this box
+    # onto an unrelated earlier path and the overlay would interpolate
+    # across the frame. A label re-entering after absence starts a fresh
+    # path for the same reason; more sidecar tracks, never a false glide.
+    {numbered, next} =
+      Enum.map_reduce(assigned, next0, fn
+        {:new, det, center}, next -> {{next, det, center}, next + 1}
+        {slot, det, center}, next -> {{slot, det, center}, next}
+      end)
+
+    {Enum.map(numbered, fn {slot, det, _c} -> {slot, det} end),
+     Map.new(numbered, fn {slot, _det, center} -> {slot, center} end), next}
+  end
+
+  defp center_distance({cx, cy}, {px, py}), do: abs(cx - px) + abs(cy - py)
+
+  # Exhaustive over ≤4 dets x ≤4 in-radius slot options each: every det
+  # either takes an unclaimed slot or goes :new, maximizing matches and
+  # breaking ties by total distance.
+  defp best_assignment([], _used), do: {0, 0.0, []}
+
+  defp best_assignment([{det, center, options} | rest], used) do
+    {c, d, ch} = best_assignment(rest, used)
+    start = {c, d, [{:new, det, center} | ch]}
+    Enum.reduce(options, start, &consider_slot(&1, &2, det, center, rest, used))
+  end
+
+  defp consider_slot({slot, dist}, {best_c, best_d, _} = best, det, center, rest, used) do
+    if slot in used do
+      best
+    else
+      {c1, d1, ch1} = best_assignment(rest, [slot | used])
+
+      if c1 + 1 > best_c or (c1 + 1 == best_c and d1 + dist < best_d) do
+        {c1 + 1, d1 + dist, [{slot, det, center} | ch1]}
+      else
+        best
+      end
+    end
+  end
+
+  defp box_center([x, y, w, h]), do: {x + w / 2, y + h / 2}
+
+  # Slot 0 keeps the bare label as its id — the exact id every v1 presence
+  # sidecar used — so a reader keying on it sees no new world; extra
+  # concurrent boxes suffix their slot. `identity: "label"` readers colour
+  # and select by `label` either way.
+  # A plugin-predicted box rides the dense-capture rule like any other
+  # (drawn, never evidence), but its score is the last real detection's —
+  # forwarding it would re-stamp a stale claim, so it writes the same
+  # no-score sentinel the tracked lane's coasted boxes do. The numeric
+  # score still ranks it for slot assignment: ranking is render policy,
+  # not a claim.
+  defp box_entry(label, slot, det) do
+    score = if Cairn.Observation.detected?(det), do: det.score
+    {slot_id(label, slot), label, det.bbox, false, score}
+  end
+
+  # 0x1F (unit separator) because labels are arbitrary PRINTABLE strings:
+  # a label literally named "person/1" is legal and would collide with a
+  # "/"-joined id — `TrackPath.collect/1` groups event-wide by id, and the
+  # collision would merge two subjects' samples into one path. No printable
+  # label can contain 0x1F. Slot 0 keeps the bare label (v1's shape).
+  defp slot_id(label, 0), do: label
+  defp slot_id(label, slot), do: label <> <<0x1F>> <> Integer.to_string(slot)
 
   defp fold(state, [], _t_ms), do: state
 
@@ -888,7 +1041,13 @@ defmodule Cairn.PresenceRecorder do
         post_ref: nil,
         post_token: nil,
         max_ref: nil,
-        max_token: nil
+        max_token: nil,
+        # Slot centres and the watermark are per-event render continuity;
+        # carried across a close, a stale centre or watermark could hand
+        # the next event's lone subject a nonzero slot and write a sidecar
+        # with no bare-label track.
+        box_slots: %{},
+        box_slot_next: %{}
     }
   end
 
@@ -937,7 +1096,8 @@ defmodule Cairn.PresenceRecorder do
       state.camera_id,
       state.event,
       MapSet.to_list(state.present_labels),
-      state.extractor
+      state.extractor,
+      %{centers: state.box_slots, next: state.box_slot_next}
     )
 
     %{state | checkpointed_at: state.monotonic_ms.()}
@@ -966,9 +1126,9 @@ defmodule Cairn.PresenceRecorder do
       nil ->
         sweep_stranded(state)
 
-      {event, labels, extractor} ->
+      {event, labels, extractor, box_slots} ->
         if is_pid(extractor) and Process.alive?(extractor) do
-          reattach(state, event, labels, extractor)
+          reattach(state, event, labels, extractor, box_slots)
         else
           orphan(state, event)
         end
@@ -988,7 +1148,7 @@ defmodule Cairn.PresenceRecorder do
   # `resolve_policy/1` has already run (`Cairn.CameraTracker` restores off the
   # global defaults because its camera is not resolved that early) — and it
   # degrades to the defaults by itself when the config server cannot answer.
-  defp reattach(state, event, labels, extractor) do
+  defp reattach(state, event, labels, extractor, box_slots) do
     Logger.info("event #{event.id} (#{state.camera_id}): re-attached to a live extractor")
     spent = DateTime.diff(now(), event.started_at, :second)
     {max_ref, max_token} = schedule(:max_event, event.id, max(state.policy.max - spent, 0))
@@ -1004,6 +1164,16 @@ defmodule Cairn.PresenceRecorder do
         adopted_extractor?: true,
         present_labels: present,
         present_scores: restored_scores(present, announced, event.max_scores),
+        # Slot continuity survives the crash with the row: the adopted
+        # extractor is still buffering the same sidecar, and a replacement
+        # that re-minted slot ids from zero could connect a new box to an
+        # unrelated pre-crash path and interpolate across the frame. The
+        # centers are at most a checkpoint-throttle stale — inside the
+        # match radius for anything that hasn't genuinely moved on. The
+        # watermark rides too: numbers allocated before the crash stay
+        # retired.
+        box_slots: Map.get(box_slots, :centers, %{}),
+        box_slot_next: Map.get(box_slots, :next, %{}),
         checkpointed_at: state.monotonic_ms.(),
         max_ref: max_ref,
         max_token: max_token
