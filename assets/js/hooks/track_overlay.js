@@ -372,8 +372,15 @@ const TrackOverlay = {
       ctx.strokeStyle = color
       ctx.stroke()
 
+      // Absent column and null sample are different claims: a v1 file
+      // never carried scores, so the panel's static best_score is the only
+      // number there is; a v2 null marks THIS sample as scoreless
+      // (predicted box), and showing best_score would dress a guess up as
+      // a detection. Label-only chip for the latter.
       const sampleScore = this.sampleScoreAt(track, tMs)
-      const score = sampleScore != null ? sampleScore.toFixed(2) : meta.score
+      const hasScoreColumn = track.s && track.s.length > 0
+      const score =
+        sampleScore != null ? sampleScore.toFixed(2) : hasScoreColumn ? null : meta.score
       this.drawChip(ctx, x, y, meta.label || track.label, score, color)
     }
 
@@ -382,9 +389,9 @@ const TrackOverlay = {
 
   // The chip sits above-left of the box and flips inside it when there is no
   // room above. The score is the sample's own (v2's "s" column) — the number
-  // that varies as the model's confidence does; a v1 file or a scoreless
-  // predicted sample falls back to the panel's static `best_score`, which is
-  // what every chip showed before the column existed.
+  // that varies as the model's confidence does. Only a v1 file (no "s"
+  // column at all) falls back to the panel's static `best_score`; a v2
+  // scoreless sample (predicted box) renders the label alone.
   drawChip(ctx, x, y, label, score, color) {
     if (!label) return
     const text = score && score !== "—" ? `${label} ${score}` : label

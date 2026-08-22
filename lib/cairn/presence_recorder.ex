@@ -283,12 +283,13 @@ defmodule Cairn.PresenceRecorder do
       # see the second `:DOWN` clause.
       finalizing: %{},
       # True only for an extractor this process did not start — one adopted
-      # from a checkpoint by `reattach/4`. What hangs on it is how its `:DOWN`
+      # from a checkpoint by `reattach/5`. What hangs on it is how its `:DOWN`
       # is read; see the handler.
       adopted_extractor?: false,
       present_labels: MapSet.new(),
       # Per-label render-slot centres from the last forwarded frame — see
-      # assign_slots/2. Continuity state only; nothing decides on it.
+      # assign_slots/2. Continuity state only; nothing decides on it. Rides
+      # the checkpoint so a replacement recorder keeps the sidecar's paths.
       box_slots: %{},
       # The same set with each label's best score while it has been present,
       # which the event alone cannot answer once it has closed: a segment
@@ -713,20 +714,34 @@ defmodule Cairn.PresenceRecorder do
   # The lane has no tracker, so a slot is not an identity — it is render
   # continuity: the overlay interpolates between a sidecar track's samples,
   # and two concurrent people swapping tracks between keyframes would draw
-  # boxes gliding through each other. Greedy nearest-centre matching against
-  # the previous frame's slots keeps each path on its own subject at frame
-  # rate; when it guesses wrong it costs one crossing artifact, never a
-  # detection.
+  # boxes gliding through each other. Matching is maximum-cardinality first
+  # (then minimum total centre distance): greedy in score order could mint a
+  # new path even when a one-to-one match existed for every box — prev
+  # centres 0.20/0.55 with a high-score det at 0.35 and another at 0.00
+  # would greedily take 0.20's slot for 0.35 and mint for 0.00, the exact
+  # discontinuity slots exist to prevent. At most four boxes and four slots,
+  # so exhaustive search costs nothing; a wrong guess costs one crossing
+  # artifact, never a detection.
+  #
+  # A slot only claims a box in its neighbourhood: normalized centre distance
+  # above @slot_match_radius reads as "someone else", and the box mints a
+  # fresh slot rather than yanking an existing path across the frame.
+  @slot_match_radius 0.25
+
   defp assign_slots(dets, prev_centers) do
-    {assigned, _remaining} =
-      Enum.map_reduce(dets, prev_centers, fn det, free ->
+    candidates =
+      for det <- dets do
         center = box_center(det.bbox)
 
-        case nearest_slot(free, center) do
-          nil -> {{:new, det, center}, free}
-          slot -> {{slot, det, center}, Map.delete(free, slot)}
-        end
-      end)
+        options =
+          prev_centers
+          |> Enum.map(fn {slot, prev} -> {slot, center_distance(center, prev)} end)
+          |> Enum.filter(fn {_slot, d} -> d <= @slot_match_radius end)
+
+        {det, center, options}
+      end
+
+    {_count, _dist, assigned} = best_assignment(candidates, MapSet.new())
 
     # Computed over the FULL matched set before any :new is numbered — plus
     # every slot the previous frame held: a fresh slot may take neither, or a
@@ -754,19 +769,30 @@ defmodule Cairn.PresenceRecorder do
      Map.new(numbered, fn {slot, _det, center} -> {slot, center} end)}
   end
 
-  # A slot only claims a box in its neighbourhood: normalized centre distance
-  # above this reads as "someone else", and the box mints a fresh slot rather
-  # than yanking an existing path across the frame.
-  @slot_match_radius 0.25
+  defp center_distance({cx, cy}, {px, py}), do: abs(cx - px) + abs(cy - py)
 
-  defp nearest_slot(free, {cx, cy}) do
-    free
-    |> Enum.map(fn {slot, {px, py}} -> {slot, abs(cx - px) + abs(cy - py)} end)
-    |> Enum.filter(fn {_slot, d} -> d <= @slot_match_radius end)
-    |> Enum.min_by(fn {_slot, d} -> d end, fn -> nil end)
-    |> case do
-      {slot, _d} -> slot
-      nil -> nil
+  # Exhaustive over ≤4 dets x ≤4 in-radius slot options each: every det
+  # either takes an unclaimed slot or goes :new, maximizing matches and
+  # breaking ties by total distance.
+  defp best_assignment([], _used), do: {0, 0.0, []}
+
+  defp best_assignment([{det, center, options} | rest], used) do
+    {c, d, ch} = best_assignment(rest, used)
+    start = {c, d, [{:new, det, center} | ch]}
+    Enum.reduce(options, start, &consider_slot(&1, &2, det, center, rest, used))
+  end
+
+  defp consider_slot({slot, dist}, {best_c, best_d, _} = best, det, center, rest, used) do
+    if MapSet.member?(used, slot) do
+      best
+    else
+      {c1, d1, ch1} = best_assignment(rest, MapSet.put(used, slot))
+
+      if c1 + 1 > best_c or (c1 + 1 == best_c and d1 + dist < best_d) do
+        {c1 + 1, d1 + dist, [{slot, det, center} | ch1]}
+      else
+        best
+      end
     end
   end
 
@@ -1049,7 +1075,8 @@ defmodule Cairn.PresenceRecorder do
       state.camera_id,
       state.event,
       MapSet.to_list(state.present_labels),
-      state.extractor
+      state.extractor,
+      state.box_slots
     )
 
     %{state | checkpointed_at: state.monotonic_ms.()}
@@ -1078,9 +1105,9 @@ defmodule Cairn.PresenceRecorder do
       nil ->
         sweep_stranded(state)
 
-      {event, labels, extractor} ->
+      {event, labels, extractor, box_slots} ->
         if is_pid(extractor) and Process.alive?(extractor) do
-          reattach(state, event, labels, extractor)
+          reattach(state, event, labels, extractor, box_slots)
         else
           orphan(state, event)
         end
@@ -1100,7 +1127,7 @@ defmodule Cairn.PresenceRecorder do
   # `resolve_policy/1` has already run (`Cairn.CameraTracker` restores off the
   # global defaults because its camera is not resolved that early) — and it
   # degrades to the defaults by itself when the config server cannot answer.
-  defp reattach(state, event, labels, extractor) do
+  defp reattach(state, event, labels, extractor, box_slots) do
     Logger.info("event #{event.id} (#{state.camera_id}): re-attached to a live extractor")
     spent = DateTime.diff(now(), event.started_at, :second)
     {max_ref, max_token} = schedule(:max_event, event.id, max(state.policy.max - spent, 0))
@@ -1116,6 +1143,13 @@ defmodule Cairn.PresenceRecorder do
         adopted_extractor?: true,
         present_labels: present,
         present_scores: restored_scores(present, announced, event.max_scores),
+        # Slot continuity survives the crash with the row: the adopted
+        # extractor is still buffering the same sidecar, and a replacement
+        # that re-minted slot ids from zero could connect a new box to an
+        # unrelated pre-crash path and interpolate across the frame. The
+        # centers are at most a checkpoint-throttle stale — inside the
+        # match radius for anything that hasn't genuinely moved on.
+        box_slots: box_slots,
         checkpointed_at: state.monotonic_ms.(),
         max_ref: max_ref,
         max_token: max_token

@@ -207,7 +207,7 @@ defmodule Cairn.PresenceRecorderTest do
     # D-E6: the row is in the recorder's own table and nowhere near the one
     # `CameraTracker.restore_checkpointed/0` spawns trackers from.
     _ = :sys.get_state(Registry.whereis(id, :presence_recorder))
-    assert {%Event{id: ^eid}, ["person"], extractor} = PresenceCheckpoint.get(id)
+    assert {%Event{id: ^eid}, ["person"], extractor, _slots} = PresenceCheckpoint.get(id)
     # the row names the extractor writing the clip: what a restore re-attaches to
     assert is_pid(extractor)
     assert EventCheckpoint.get(id) == nil
@@ -314,11 +314,11 @@ defmodule Cairn.PresenceRecorderTest do
 
     # Every clear is a checkpoint edge, past the throttle: which labels are
     # left, and whether the close clock is running, is what a restore reads.
-    assert {%Event{id: ^eid}, ["car"], _extractor} = PresenceCheckpoint.get(ctx.camera_id)
+    assert {%Event{id: ^eid}, ["car"], _extractor, _slots} = PresenceCheckpoint.get(ctx.camera_id)
 
     cleared(ctx, "car")
     assert :sys.get_state(rec).post_token != nil
-    assert {%Event{id: ^eid}, [], _extractor} = PresenceCheckpoint.get(ctx.camera_id)
+    assert {%Event{id: ^eid}, [], _extractor, _slots} = PresenceCheckpoint.get(ctx.camera_id)
 
     fire(rec, :post_window, eid)
     assert_receive {:event_ended, %Event{id: ^eid, status: :finalized} = ended}
@@ -438,7 +438,7 @@ defmodule Cairn.PresenceRecorderTest do
     assert [%{label: "person", t: +0.0, score: 0.97}] = state.event.labels
     # and the next cap is armed, so a presence that never leaves keeps segmenting
     assert state.max_token != nil
-    assert {%Event{id: ^second}, ["person"], _pid} = PresenceCheckpoint.get(ctx.camera_id)
+    assert {%Event{id: ^second}, ["person"], _pid, _slots} = PresenceCheckpoint.get(ctx.camera_id)
   end
 
   # The mirror this process keeps of the aggregator's present set is maintained
@@ -977,6 +977,40 @@ defmodule Cairn.PresenceRecorderTest do
     # across the frame would draw motion that never happened.
     frames(ctx, [object("person", 0.9, [0.8, 0.2, 0.1, 0.3])])
     assert_receive {:extractor_cast, {:track_boxes, %{boxes: [{"person/1", _, _, _, _}]}}}
+  end
+
+  # Greedy in score order would hand the high-score box the slot nearest it
+  # and mint a new path for the other box even though a one-to-one match
+  # existed for BOTH — the exact discontinuity slots exist to prevent.
+  # Matching is maximum-cardinality, so both paths continue.
+  test "matching keeps both paths when score order would steal a slot", ctx do
+    recorder(ctx)
+    started(ctx)
+    assert_receive {:extractor_started, %Event{}, _pid}
+
+    a = [0.15, 0.2, 0.1, 0.3]
+    b = [0.5, 0.2, 0.1, 0.3]
+    frames(ctx, [object("person", 0.9, a), object("person", 0.6, b)])
+    assert_receive {:extractor_cast, {:track_boxes, %{boxes: boxes}}}
+
+    assert Enum.sort(boxes) ==
+             Enum.sort([
+               {"person", "person", a, false, 0.9},
+               {"person/1", "person", b, false, 0.6}
+             ])
+
+    # The high scorer at centre 0.35 is in radius of BOTH slots and nearer
+    # slot 0 (0.20); the low scorer at centre 0.05 reaches only slot 0.
+    a2 = [0.0, 0.2, 0.1, 0.3]
+    b2 = [0.3, 0.2, 0.1, 0.3]
+    frames(ctx, [object("person", 0.95, b2), object("person", 0.5, a2)])
+    assert_receive {:extractor_cast, {:track_boxes, %{boxes: boxes2}}}
+
+    assert Enum.sort(boxes2) ==
+             Enum.sort([
+               {"person", "person", a2, false, 0.5},
+               {"person/1", "person", b2, false, 0.95}
+             ])
   end
 
   test "frames are dropped on the floor while no event is open", ctx do
