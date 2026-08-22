@@ -239,6 +239,8 @@ def audit(model_path):
                     dqp = _qparams(dq, inits)
                     if dqp is not None:
                         entry["dq_scale"] = dqp[0]
+                        entry["dq_zero_point"] = dqp[1]
+                        entry["dq_elem_type"] = dqp[2]
                         entry["dq_scale_elems"] = dqp[3]
                     break
         scores.append(entry)
@@ -478,6 +480,18 @@ def check(model_path, min_ceiling=DEFAULT_MIN_CEILING, input_size=None, out=sys.
             bad.append(
                 f"{e['node']}: Q scale {e['scale']:.6e} != DQ scale "
                 f"{e['dq_scale']:.6e}"
+            )
+        elif (
+            e.get("dq_zero_point") != e["zero_point"]
+            or e.get("dq_elem_type") != e["elem_type"]
+        ):
+            # Scale agreement alone is not pair agreement: a DQ with the
+            # same scale but a nonzero zero point (or another dtype)
+            # offsets every dequantized score.
+            bad.append(
+                f"{e['node']}: DQ zp/type ({e.get('dq_zero_point')}/"
+                f"{e.get('dq_elem_type')}) disagree with Q "
+                f"({e['zero_point']}/{e['elem_type']})"
             )
         elif e["elem_type"] not in PINNED_SIGMOID:
             bad.append(

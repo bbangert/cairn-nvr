@@ -132,8 +132,15 @@ do_reboot() {
   # command can fail before executing `reboot`, the board stays up, and
   # a liveness probe then "succeeds" immediately. The boot id is the
   # witness — wait for it to CHANGE, not for the board to answer.
-  remote 30 "cat /proc/sys/kernel/random/boot_id > /data/tmp-bootid.txt"
+  # Stale values on either side would fake a verified reboot: an old
+  # remote tmp file (or old local snapshot) that merely DIFFERS from
+  # post-reboot reality is not a before-value. Clear both, and require
+  # the write itself to reach the board.
+  rm -f "$HTP/.bootid-before"
+  remote 30 "rm -f /data/tmp-bootid.txt; cat /proc/sys/kernel/random/boot_id > /data/tmp-bootid.txt" \
+    || { log "FATAL: cannot write boot id on board"; exit 1; }
   fetch /data/tmp-bootid.txt "$HTP/.bootid-before" || { log "FATAL: cannot read boot id"; exit 1; }
+  [ -s "$HTP/.bootid-before" ] || { log "FATAL: boot id snapshot is empty"; exit 1; }
   remote 20 reboot
   sleep 20
   local waited=20
@@ -329,6 +336,9 @@ pin_governor() {
   fetch /data/tmp-gov.txt "$HTP/.gov-check" || { log "FATAL: cannot read back governors"; exit 1; }
   [ -s "$HTP/.gov-check" ] || { log "FATAL: governor readback is empty"; exit 1; }
   grep -qv '^performance$' "$HTP/.gov-check" && { log "FATAL: governor pin did not take"; exit 1; }
+  # The local marker records that THIS campaign pinned: do_finish uses
+  # it to distinguish "nothing to restore" from "saved value unreadable".
+  cp "$HTP/.gov-saved" "$HTP/.gov-pinned"
   log "governor pinned (saved: $(cat "$HTP/.gov-saved"))"
 }
 
@@ -381,12 +391,20 @@ do_finish() {
   # kept until a READBACK verifies the restore took (:os.cmd discards
   # the rc), so a failed restore stays restorable on the next finish.
   rm -f "$HTP/.gov-saved" "$HTP/.gov-check"
-  if fetch /data/campaign-gov.saved "$HTP/.gov-saved" && [ -s "$HTP/.gov-saved" ]; then
+  if ! fetch /data/campaign-gov.saved "$HTP/.gov-saved" && [ -f "$HTP/.gov-pinned" ]; then
+    # This campaign pinned (local marker), yet the saved value is
+    # unreadable — that is NOT "nothing to restore": the board may
+    # still be pinned. A finish without a pin keeps the no-op path.
+    log "FATAL: governor was pinned this campaign but /data/campaign-gov.saved is unreadable"
+    finish_failed=1
+  fi
+  if [ -s "$HTP/.gov-saved" ]; then
     remote 30 "gov=\$(cat /data/campaign-gov.saved); for c in /sys/devices/system/cpu/cpu[0-9]*; do echo \$gov > \$c/cpufreq/scaling_governor; done"
     remote 30 "cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor > /data/tmp-gov.txt"
     if fetch /data/tmp-gov.txt "$HTP/.gov-check" && [ -s "$HTP/.gov-check" ] \
        && ! grep -qvxF "$(cat "$HTP/.gov-saved")" "$HTP/.gov-check"; then
       remote 30 "rm -f /data/campaign-gov.saved"
+      rm -f "$HTP/.gov-pinned"
       log "governor restored to $(cat "$HTP/.gov-saved")"
     else
       log "FATAL: governor restore NOT verified — /data/campaign-gov.saved kept; rerun finish"

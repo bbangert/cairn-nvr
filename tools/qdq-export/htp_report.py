@@ -282,7 +282,7 @@ def records_script(run_dir):
 
 
 def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None,
-                score_fidelity_only=False):
+                score_fidelity_only=False, expected_backend=None):
     """Verdict for one content run against its two reference series.
 
     score_fidelity_only is for the board CPU-EP control ONLY: at ~196 ms
@@ -301,6 +301,15 @@ def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None,
     stale = stale_evidence(run_dir, expected_shas)
     if stale:
         return {"verdict": "STALE-EVIDENCE", "why": stale}
+    if expected_backend:
+        # Bytes alone don't prove the leg: an ORT run misfiled under a
+        # *-qnn-* directory scores ~1.0 by construction and would serve
+        # as HTP proof.
+        meta = os.path.join(run_dir, "meta")
+        text = open(meta).read() if os.path.exists(meta) else ""
+        if f"backend: {expected_backend} " not in text:
+            return {"verdict": "SUSPECT",
+                    "why": f"meta does not record backend {expected_backend}"}
     htp = htp_series(nd)
     if not htp:
         return {"verdict": "NO-DATA", "why": "no frame.objects lines"}
@@ -523,6 +532,7 @@ def main():
                 cpu_series(fp32, frames, args.ref_fps, ref_dir),
                 expected_shas={"model": art_sha, "clip": clip_shas[c],
                                "script": script_sha},
+                expected_backend="qnn",
             )
             if not records_script(run_dir):
                 legacy_runs.append(f"{rung}-qnn-{c}")
@@ -549,7 +559,7 @@ def main():
                         expected_shas={"model": file_sha256(art) if os.path.exists(art) else None,
                                        "clip": clip_shas.get("ac86"),
                                        "script": script_sha},
-                        score_fidelity_only=True)
+                        score_fidelity_only=True, expected_backend="ort")
         if not records_script(ort_ctl):
             legacy_runs.append("ort-control")
         if r["verdict"] != "PASS":
@@ -581,7 +591,8 @@ def main():
                         cpu_series(fp32, frames, args.ref_fps, ref_dir),
                         expected_shas={"model": OLD_NANO_SHA,
                                        "clip": clip_shas.get("ac86"),
-                                       "script": script_sha})
+                                       "script": script_sha},
+                        expected_backend="qnn")
         if not records_script(old_ctl):
             legacy_runs.append("defective-control")
         # The control is valid ONLY if it reproduces the known defect's
