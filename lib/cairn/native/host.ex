@@ -59,6 +59,9 @@ defmodule Cairn.Native.Host do
   # Past the bound the node runs without a D-P5 ratio.
   @baseline_passes 5
   @baseline_timeout_ms 60_000
+  # The probe's deadline: one CPU pass that cannot beat this is a model with
+  # no CPU baseline, not a slow measurement.
+  @baseline_probe_timeout_ms 10_000
 
   @engine_fatal [:model_load, :model_poisoned]
   @stream_fatal [:closed, :poisoned, :panicked]
@@ -521,25 +524,74 @@ defmodule Cairn.Native.Host do
     if NativeConfig.accelerator?(config), do: await_baseline(state, config), else: nil
   end
 
+  # The baseline runs BEFORE init/1 (venue integrity), so a boot that is
+  # about to fail fast must not first wait out a measurement. Preflight the
+  # two files whose absence is the common fast refusal — init's own error
+  # carries the story, and nil here adds nothing to it.
   defp await_baseline(state, config) do
-    ort = state.ort
+    cond do
+      not File.exists?(config.model) -> nil
+      missing_qnn_library?(config) -> nil
+      true -> probe_then_measure(state, config)
+    end
+  end
+
+  defp missing_qnn_library?(config) do
+    library = config.qnn.library
+    is_binary(library) and not File.exists?(library)
+  end
+
+  # One pass under a short deadline decides whether the median is worth
+  # paying for: a model that cannot finish a single CPU pass quickly cannot
+  # produce a full median inside the timeout either, and the doomed run
+  # would otherwise hold a dirty scheduler for minutes behind a boot whose
+  # answer is already :not_applicable. The probe doubles as warmup, so the
+  # median that follows runs on a warm session.
+  defp probe_then_measure(state, config) do
+    probe_timeout =
+      Keyword.get(state.opts, :baseline_probe_timeout_ms, @baseline_probe_timeout_ms)
+
+    case run_measurement(state, config, 1, probe_timeout) do
+      {:ok, {:ok, _warm_ms}} ->
+        full_measurement(state, config)
+
+      {:ok, reply} ->
+        baseline(reply, config)
+
+      {:exit, reason} ->
+        no_baseline(config, "the measurement crashed (#{inspect(reason)})")
+
+      nil ->
+        no_baseline(
+          config,
+          "one CPU pass outlived #{probe_timeout}ms — this model has no CPU baseline"
+        )
+    end
+  end
+
+  defp full_measurement(state, config) do
     passes = Keyword.get(state.opts, :baseline_passes, @baseline_passes)
+    timeout = Keyword.get(state.opts, :baseline_timeout_ms, @baseline_timeout_ms)
+
+    case run_measurement(state, config, passes, timeout) do
+      {:ok, reply} -> baseline(reply, config)
+      {:exit, reason} -> no_baseline(config, "the measurement crashed (#{inspect(reason)})")
+      nil -> no_baseline(config, "the measurement did not answer in time")
+    end
+  end
+
+  defp run_measurement(state, config, passes, timeout) do
+    ort = state.ort
 
     task =
       Task.Supervisor.async_nolink(Cairn.TaskSupervisor, fn ->
         ort.cpu_baseline_ms(config, passes)
       end)
 
-    timeout = Keyword.get(state.opts, :baseline_timeout_ms, @baseline_timeout_ms)
-
     # `ignore` rather than `shutdown` on expiry: a task inside a dirty NIF does
     # not die until the call returns, so a brutal kill would block on the very
     # thing that timed out. It stops monitoring and lets the task finish alone.
-    case Task.yield(task, timeout) || Task.ignore(task) do
-      {:ok, reply} -> baseline(reply, config)
-      {:exit, reason} -> no_baseline(config, "the measurement crashed (#{inspect(reason)})")
-      nil -> no_baseline(config, "the measurement did not answer in time")
-    end
+    Task.yield(task, timeout) || Task.ignore(task)
   end
 
   defp baseline({:ok, ms}, config) when is_number(ms) and ms > 0 do
