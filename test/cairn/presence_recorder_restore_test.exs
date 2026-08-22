@@ -243,15 +243,16 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     announce(ctx, "person")
 
     PresenceCheckpoint.put(ctx.camera_id, event, ["person"], extractor, %{
-      "person" => %{1 => {0.55, 0.35}}
+      centers: %{"person" => %{1 => {0.55, 0.35}}},
+      next: %{"person" => 2}
     })
 
     recorder(ctx)
 
     # Centre 0.55 — inside the restored slot 1's radius: the box continues
-    # "person/1" instead of minting "person" from an empty slot table.
+    # its slot-1 path instead of minting "person" from an empty slot table.
     frames(ctx, [object("person", 0.9, [0.5, 0.2, 0.1, 0.3])])
-    assert_receive {:extractor_cast, {:track_boxes, %{boxes: [{"person/1", _, _, _, _}]}}}
+    assert_receive {:extractor_cast, {:track_boxes, %{boxes: [{"person\u001F1", _, _, _, _}]}}}
   end
 
   # The cap timer gets the remainder, not a fresh window: a restart must not

@@ -493,11 +493,17 @@ defmodule Cairn.TrackPath do
     end
   end
 
-  # Score is deliberately absent here: keyframe selection stays geometric,
-  # so a wobbling score on a parked box cannot inflate the file. Between
-  # kept samples a reader sees the score stepped, bounded by @max_gap_ms.
-  defp keep?({t, coords, stationary, _score}, {t0, coords0, stationary0, _score0}) do
-    stationary != stationary0 or t - t0 > @max_gap_ms or moved?(coords, coords0)
+  # Numeric score wobble is deliberately not a keyframe: selection stays
+  # geometric, so a wobbling score on a parked box cannot inflate the file
+  # — between kept samples a reader sees the score stepped, bounded by
+  # @max_gap_ms. A transition into or out of the scoreless sentinel is
+  # different: that is a claim change, and suppressing it would show
+  # confidence across an interval that explicitly made no detection claim
+  # (detected -> predicted -> detected on a parked box would collapse to
+  # the numeric endpoints).
+  defp keep?({t, coords, stationary, score}, {t0, coords0, stationary0, score0}) do
+    stationary != stationary0 or t - t0 > @max_gap_ms or moved?(coords, coords0) or
+      is_nil(score) != is_nil(score0)
   end
 
   defp moved?({x, y, w, h}, {x0, y0, w0, h0}) do

@@ -574,12 +574,14 @@ defmodule Cairn.CameraTracker do
       {:track_boxes,
        %{
          t_ms: DateTime.diff(observed_at, event.started_at, :millisecond),
-         # A predicted box writes no score (`"s"` -1): the score in its map
-         # is the last real detection's, and re-stamping it on a coasted
-         # position would claim evidence the frame does not hold.
+         # Only a detected observation writes a score (`"s"` -1 otherwise):
+         # a "tracked" seed carries the last real detection's number for a
+         # frame nothing looked at, and `stale_predicted` only turns true
+         # after max_unseen_ms — re-stamping either on a coasted position
+         # would claim evidence the frame does not hold.
          boxes:
            Enum.map(tagged, fn obj ->
-             score = if Map.get(obj, :stale_predicted), do: nil, else: Map.get(obj, :score)
+             score = if Cairn.Observation.detected?(obj), do: Map.get(obj, :score)
              {obj.object_id, obj.label, obj.bbox, obj.stationary, score}
            end)
        }}

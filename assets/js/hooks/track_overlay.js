@@ -301,11 +301,14 @@ const TrackOverlay = {
   // scoreless prediction.
   sampleScoreAt(track, tMs) {
     if (!track.s || track.s.length === 0) return null
+    // A step function, never "nearest": a score is a detection claim, so it
+    // holds from its own sample until the next one — showing the next
+    // sample's number from the midpoint would display a detection's
+    // confidence before that detection happened.
     const i = track.cursor
-    const t0 = track.times[i]
     const t1 = track.times[i + 1]
-    const nearer = t1 != null && tMs - t0 > t1 - tMs ? i + 1 : i
-    const s = track.s[Math.min(nearer, track.s.length - 1)]
+    const j = t1 != null && tMs >= t1 ? i + 1 : i
+    const s = track.s[Math.min(j, track.s.length - 1)]
     return s == null ? null : s
   },
 

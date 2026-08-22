@@ -3,10 +3,11 @@ defmodule Cairn.PresenceCheckpoint do
   `Cairn.EventCheckpoint`'s shape for the presence lane: a public named ETS
   table holding each tier-1 camera's active event, the qualifying labels
   present at that moment, the pid of the extractor writing its clip and the
-  per-label render-slot centres (`box_slots` — the adopted extractor is still
-  buffering the same sidecar, so path continuity must survive with the row),
-  owned outside the pool so the row survives a `Cairn.PresenceRecorder` crash
-  and can be restored by its replacement (`Cairn.PresenceRecorder.init/1`).
+  render-slot continuity state (`%{centers: ..., next: ...}` — the adopted
+  extractor is still buffering the same sidecar, so slot centres AND the
+  per-event slot watermark must survive with the row), owned outside the pool
+  so the row survives a `Cairn.PresenceRecorder` crash and can be restored by
+  its replacement (`Cairn.PresenceRecorder.init/1`).
 
   A separate table rather than a second kind of row in `cairn_active_events`,
   and the separation is load-bearing: `Cairn.CameraTracker.restore_checkpointed/0`

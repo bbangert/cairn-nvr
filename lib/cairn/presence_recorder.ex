@@ -288,9 +288,12 @@ defmodule Cairn.PresenceRecorder do
       adopted_extractor?: false,
       present_labels: MapSet.new(),
       # Per-label render-slot centres from the last forwarded frame — see
-      # assign_slots/2. Continuity state only; nothing decides on it. Rides
+      # assign_slots/3. Continuity state only; nothing decides on it. Rides
       # the checkpoint so a replacement recorder keeps the sidecar's paths.
       box_slots: %{},
+      # Per-label per-event slot watermark: numbers only grow, so no slot id
+      # is ever re-minted onto an unrelated earlier path.
+      box_slot_next: %{},
       # The same set with each label's best score while it has been present,
       # which the event alone cannot answer once it has closed: a segment
       # opened at a `max_event` boundary is seeded from these.
@@ -664,8 +667,20 @@ defmodule Cairn.PresenceRecorder do
     t_ms = frame_unix_ms(frame) - state.started_unix_ms
     objects = Map.get(frame, :objects, [])
 
+    slots_before = {state.box_slots, state.box_slot_next}
     state = forward_boxes(state, t_ms, objects)
-    fold(state, Enum.filter(objects, &qualifying_object?(state, &1)), t_ms)
+    state = fold(state, Enum.filter(objects, &qualifying_object?(state, &1)), t_ms)
+
+    # Slot state must reach the checkpoint even when the frame carried no
+    # qualifying detection: predicted and below-floor boxes still move the
+    # centres and the watermark, and a crash would otherwise restore paths
+    # from wherever the last qualifying frame left them. Throttled by
+    # checkpoint/1 like every other write.
+    if state.event != nil and {state.box_slots, state.box_slot_next} != slots_before do
+      checkpoint(state)
+    else
+      state
+    end
   end
 
   # The dense half of the playback overlay, in the compact shape
@@ -686,27 +701,30 @@ defmodule Cairn.PresenceRecorder do
   # A `call`, or a finalize routed through another process, silently truncates
   # the sidecar's tail.
   defp forward_boxes(%{extractor: pid} = state, t_ms, objects) when is_pid(pid) do
-    {boxes, slots} =
+    {boxes, slots, next} =
       objects
       |> Enum.filter(&boxed?/1)
       |> Enum.group_by(& &1.label)
-      |> Enum.reduce({[], %{}}, fn {label, dets}, {boxes, slots} ->
-        {assigned, centers} =
+      |> Enum.reduce({[], %{}, state.box_slot_next}, fn {label, dets}, {boxes, slots, next} ->
+        {assigned, centers, label_next} =
           dets
           |> Enum.sort_by(& &1.score, :desc)
           |> Enum.take(@max_boxes_per_label)
-          |> assign_slots(Map.get(state.box_slots, label, %{}))
+          |> assign_slots(
+            Map.get(state.box_slots, label, %{}),
+            Map.get(next, label, 0)
+          )
 
         entries = for {slot, det} <- assigned, do: box_entry(label, slot, det)
 
-        {entries ++ boxes, Map.put(slots, label, centers)}
+        {entries ++ boxes, Map.put(slots, label, centers), Map.put(next, label, label_next)}
       end)
 
     if boxes != [] do
       GenServer.cast(pid, {:track_boxes, %{t_ms: t_ms, boxes: boxes}})
     end
 
-    %{state | box_slots: slots}
+    %{state | box_slots: slots, box_slot_next: next}
   end
 
   defp forward_boxes(state, _t_ms, _objects), do: state
@@ -728,7 +746,7 @@ defmodule Cairn.PresenceRecorder do
   # fresh slot rather than yanking an existing path across the frame.
   @slot_match_radius 0.25
 
-  defp assign_slots(dets, prev_centers) do
+  defp assign_slots(dets, prev_centers, next0) do
     candidates =
       for det <- dets do
         center = box_center(det.bbox)
@@ -743,30 +761,21 @@ defmodule Cairn.PresenceRecorder do
 
     {_count, _dist, assigned} = best_assignment(candidates, [])
 
-    # Computed over the FULL matched set before any :new is numbered — plus
-    # every slot the previous frame held: a fresh slot may take neither, or a
-    # subject jumping past the radius would re-mint the slot it just failed
-    # to match and hand the overlay the exact cross-frame glide slots exist
-    # to prevent. (A label absent for a frame drops out of box_slots, so a
-    # RE-ENTRY after absence still reuses slot 0 with a time gap — the same
-    # geometry v1 drew, and time-aware gap breaking is the reader's job if it
-    # ever earns one.)
-    used =
-      for({slot, _det, _c} <- assigned, is_integer(slot), do: slot) ++
-        Map.keys(prev_centers)
-
-    {numbered, _next} =
-      Enum.map_reduce(assigned, 0, fn
-        {:new, det, center}, next ->
-          slot = next_free_slot(next, used)
-          {{slot, det, center}, slot + 1}
-
-        {slot, det, center}, next ->
-          {{slot, det, center}, next}
+    # New slots number from a per-event watermark and a number is NEVER
+    # reused — not the just-vacated slot of a subject that jumped past the
+    # radius, and not a slot retired frames ago: `TrackPath.collect/1`
+    # groups event-wide by id, so a re-minted number would splice this box
+    # onto an unrelated earlier path and the overlay would interpolate
+    # across the frame. A label re-entering after absence starts a fresh
+    # path for the same reason; more sidecar tracks, never a false glide.
+    {numbered, next} =
+      Enum.map_reduce(assigned, next0, fn
+        {:new, det, center}, next -> {{next, det, center}, next + 1}
+        {slot, det, center}, next -> {{slot, det, center}, next}
       end)
 
     {Enum.map(numbered, fn {slot, det, _c} -> {slot, det} end),
-     Map.new(numbered, fn {slot, _det, center} -> {slot, center} end)}
+     Map.new(numbered, fn {slot, _det, center} -> {slot, center} end), next}
   end
 
   defp center_distance({cx, cy}, {px, py}), do: abs(cx - px) + abs(cy - py)
@@ -796,10 +805,6 @@ defmodule Cairn.PresenceRecorder do
     end
   end
 
-  defp next_free_slot(candidate, used) do
-    if candidate in used, do: next_free_slot(candidate + 1, used), else: candidate
-  end
-
   defp box_center([x, y, w, h]), do: {x + w / 2, y + h / 2}
 
   # Slot 0 keeps the bare label as its id — the exact id every v1 presence
@@ -817,8 +822,13 @@ defmodule Cairn.PresenceRecorder do
     {slot_id(label, slot), label, det.bbox, false, score}
   end
 
+  # 0x1F (unit separator) because labels are arbitrary PRINTABLE strings:
+  # a label literally named "person/1" is legal and would collide with a
+  # "/"-joined id — `TrackPath.collect/1` groups event-wide by id, and the
+  # collision would merge two subjects' samples into one path. No printable
+  # label can contain 0x1F. Slot 0 keeps the bare label (v1's shape).
   defp slot_id(label, 0), do: label
-  defp slot_id(label, slot), do: "#{label}/#{slot}"
+  defp slot_id(label, slot), do: label <> <<0x1F>> <> Integer.to_string(slot)
 
   defp fold(state, [], _t_ms), do: state
 
@@ -1023,10 +1033,12 @@ defmodule Cairn.PresenceRecorder do
         post_token: nil,
         max_ref: nil,
         max_token: nil,
-        # Slot centres are per-event render continuity; carried across a
-        # close, a stale centre could hand the next event's lone subject
-        # slot 1 and write a sidecar with "person/1" and no bare "person".
-        box_slots: %{}
+        # Slot centres and the watermark are per-event render continuity;
+        # carried across a close, a stale centre or watermark could hand
+        # the next event's lone subject a nonzero slot and write a sidecar
+        # with no bare-label track.
+        box_slots: %{},
+        box_slot_next: %{}
     }
   end
 
@@ -1076,7 +1088,7 @@ defmodule Cairn.PresenceRecorder do
       state.event,
       MapSet.to_list(state.present_labels),
       state.extractor,
-      state.box_slots
+      %{centers: state.box_slots, next: state.box_slot_next}
     )
 
     %{state | checkpointed_at: state.monotonic_ms.()}
@@ -1148,8 +1160,11 @@ defmodule Cairn.PresenceRecorder do
         # that re-minted slot ids from zero could connect a new box to an
         # unrelated pre-crash path and interpolate across the frame. The
         # centers are at most a checkpoint-throttle stale — inside the
-        # match radius for anything that hasn't genuinely moved on.
-        box_slots: box_slots,
+        # match radius for anything that hasn't genuinely moved on. The
+        # watermark rides too: numbers allocated before the crash stay
+        # retired.
+        box_slots: Map.get(box_slots, :centers, %{}),
+        box_slot_next: Map.get(box_slots, :next, %{}),
         checkpointed_at: state.monotonic_ms.(),
         max_ref: max_ref,
         max_token: max_token

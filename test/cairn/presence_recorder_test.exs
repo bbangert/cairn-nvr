@@ -926,7 +926,7 @@ defmodule Cairn.PresenceRecorderTest do
     assert Enum.sort(boxes) ==
              Enum.sort([
                {"person", "person", left, false, 0.9},
-               {"person/1", "person", right, false, 0.6}
+               {"person\u001F1", "person", right, false, 0.6}
              ])
 
     # The next frame flips which subject scores best; the slots must follow
@@ -939,7 +939,7 @@ defmodule Cairn.PresenceRecorderTest do
     assert Enum.sort(boxes2) ==
              Enum.sort([
                {"person", "person", left, false, 0.5},
-               {"person/1", "person", right, false, 0.95}
+               {"person\u001F1", "person", right, false, 0.95}
              ])
   end
 
@@ -976,7 +976,7 @@ defmodule Cairn.PresenceRecorderTest do
     # subject exits left and re-enters right, and dragging the old path
     # across the frame would draw motion that never happened.
     frames(ctx, [object("person", 0.9, [0.8, 0.2, 0.1, 0.3])])
-    assert_receive {:extractor_cast, {:track_boxes, %{boxes: [{"person/1", _, _, _, _}]}}}
+    assert_receive {:extractor_cast, {:track_boxes, %{boxes: [{"person\u001F1", _, _, _, _}]}}}
   end
 
   # Greedy in score order would hand the high-score box the slot nearest it
@@ -996,7 +996,7 @@ defmodule Cairn.PresenceRecorderTest do
     assert Enum.sort(boxes) ==
              Enum.sort([
                {"person", "person", a, false, 0.9},
-               {"person/1", "person", b, false, 0.6}
+               {"person\u001F1", "person", b, false, 0.6}
              ])
 
     # The high scorer at centre 0.35 is in radius of BOTH slots and nearer
@@ -1009,7 +1009,7 @@ defmodule Cairn.PresenceRecorderTest do
     assert Enum.sort(boxes2) ==
              Enum.sort([
                {"person", "person", a2, false, 0.5},
-               {"person/1", "person", b2, false, 0.95}
+               {"person\u001F1", "person", b2, false, 0.95}
              ])
   end
 
