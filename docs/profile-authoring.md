@@ -150,13 +150,14 @@ shipped worked example.
 tier: 1                        # required — the floor rate is the tier's
 model_ladder:
   - model:
-      qnn: data/models/yolo26m-qdq.onnx
+      qnn: data/models/yolo26m-qdq-a16.onnx
     model_profile: yolo26      # per-rung; omitted, the top-level one stands
     input_size: 640            # per-rung — 640 and 416 rungs are the norm
-    engine_budget: 16.8        # measured passes/s (ordering: reachability)
+    engine_budget: 18.5        # passes/s — provisional bench arithmetic
+                               # until the rung's boundary ladder run
     pack: yolo26m              # skipped (with a warning) until installed
   - model:
-      qnn: models/yolox_nano_qdq.onnx
+      qnn: models/yolox_nano-qdq-a16.onnx
     input_size: 416
     engine_budget: 75
 supported_cameras: 40          # the support claim, enforced as a bound

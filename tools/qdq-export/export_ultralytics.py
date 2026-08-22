@@ -28,7 +28,7 @@ import os
 import shutil
 
 
-def export(name, imgsz, out_dir):
+def export(name, imgsz, out_dir, suffix=""):
     from ultralytics import YOLO
 
     # Weights download relative to the CWD; pin it here so the .pt always
@@ -37,11 +37,38 @@ def export(name, imgsz, out_dir):
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     model = YOLO(f"{name}.pt")
     path = model.export(format="onnx", imgsz=imgsz, end2end=False, opset=13)
-    dest = os.path.join(out_dir, f"{name}.onnx")
+    os.makedirs(out_dir, exist_ok=True)
+    dest = os.path.join(out_dir, f"{name}{suffix}.onnx")
     if os.path.abspath(path) != os.path.abspath(dest):
         shutil.move(path, dest)
+    strip_export_date(dest)
     print(f"{name}: {dest}")
     return dest
+
+
+def strip_export_date(path):
+    """Drop the wall-clock timestamp Ultralytics stamps into the model.
+
+    Two exports of the same checkpoint produce identical graphs and
+    different files, because `metadata_props["date"]` records when the
+    export ran. ORT's quantizer copies metadata through, so the timestamp
+    reaches the QDQ artifact too — which makes every recorded sha256 a
+    statement about one afternoon rather than about a reproducible build,
+    and quietly voids the identity check models/README.md relies on.
+
+    Only `date` goes. `author`, `license`, `description` and the rest are
+    the model's AGPL provenance and stay exactly as the exporter wrote
+    them.
+    """
+    import onnx
+
+    m = onnx.load(path)
+    keep = [p for p in m.metadata_props if p.key != "date"]
+    if len(keep) == len(m.metadata_props):
+        return
+    del m.metadata_props[:]
+    m.metadata_props.extend(keep)
+    onnx.save(m, path)
 
 
 def main():
@@ -52,19 +79,22 @@ def main():
     ap.add_argument("models", nargs="+", help="e.g. yolo26n yolo26s yolov8n")
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument(
+        "--suffix",
+        default="",
+        help="Appended to the output stem. Needed whenever one checkpoint "
+        "is exported at two geometries — yolo26n at 640 and 416 otherwise "
+        "overwrite each other, silently leaving whichever ran last.",
+    )
+    ap.add_argument(
         "--out",
-        default=os.path.normpath(
-            os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "..", "..", "plugins", "cairn-detect",
-            )
-        ),
-        help="Destination dir (default: the plugin root, where --model and "
-        ".gitignore expect artifacts)",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "out", "sources"),
+        help="Destination dir (default: out/sources here, where "
+        "run_quantize_candidates.sh reads its SRC by default; pass the "
+        "plugin root for verify/ workflows)",
     )
     args = ap.parse_args()
     for name in args.models:
-        export(name, args.imgsz, args.out)
+        export(name, args.imgsz, args.out, args.suffix)
 
 
 if __name__ == "__main__":

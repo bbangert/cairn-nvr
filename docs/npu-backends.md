@@ -155,6 +155,46 @@ criterion live there and in
   4) must pin or record the governor; loaded production boards (several
   cameras decoding) sit near the ramped number by construction.
 
+## Quantized-export defect classes, and why CPU-EP verification cannot see them
+
+Two defect classes shipped in every `*-qdq` artifact before 2026-08-20
+(root-caused in `.claude/plans/presence-events/reviews/qdq-export-review.md`,
+fixed by the qdq-reexport campaign). Both are structural, both survived a
+CPU-EP-only verification pipeline, and each is why the other went unseen:
+
+1. **Baked calibration ceiling.** `CalibMovingAverage` averaged per-frame
+   maxima, so the score sigmoids' Q/DQ scales encoded a ceiling *below*
+   the head's true range — per FPN level, hardest at the coarsest level.
+   Close/large objects became structurally undetectable (a nano level-0
+   ceiling of 0.1334), and every score above the ceiling clipped to it.
+   Visible on any EP, but only if you compare score *distributions*
+   against fp32 — a label histogram passes, and per-level maxima carried
+   by one good frame pass. Killed by `qparam_gate.py`: any class-score
+   sigmoid whose representable maximum `(qmax - zp) × scale` is below
+   0.95 fails the export.
+
+2. **EP qparam rewrite disagreeing with the graph.** The QNN EP pins
+   16-bit sigmoid output scales to `1/65536` at graph-build time while
+   the graph's DQ keeps the calibrated scale — so **on the HTP only**,
+   every score is multiplied by the calibrated ceiling (measured live:
+   CPU 0.799 × ceiling 0.810 = the recorded 0.613–0.685 band). The CPU
+   EP executes the graph as written and *cannot* reproduce this; no
+   local run sees it. The fixed recipe (`get_qnn_qdq_config` + MinMax,
+   score sigmoids pinned to `1/65536` at a16 and `1/256` at a8) makes
+   the file agree with the hardware instead.
+
+Standing consequence: **no QDQ artifact is verified until it has an HTP
+leg** — an on-board score-distribution comparison on real clip content,
+with the CPU-EP numbers as the reference (acceptance: HTP ≈ CPU;
+per-frame person-window median ratio ≥ 0.9, no plateau, no uniform
+depression — each failure shape is one defect class's signature). The
+campaign vehicle is `tools/qdq-export/run_htp_campaign.sh` →
+`htp_content_test.sh` (plugin-first, feed once — looped feeds wrap pts
+and invalidate window analysis) → `htp_report.py`, gated by a
+nano-parity check of the bench env against the phase-0 spike numbers.
+Latency deltas prove *execution* on the HTP (D-P5); they say nothing
+about *scores*, which is exactly where both defect classes live.
+
 ## Sources
 
 - https://onnxruntime.ai/docs/execution-providers/QNN-ExecutionProvider.html
