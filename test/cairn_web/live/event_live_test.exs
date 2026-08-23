@@ -73,25 +73,26 @@ defmodule CairnWeb.EventLiveTest do
 
     test "a camera with no offset renders the raw times, and says so", %{conn: conn} do
       id = seed_with_entries("cam_a", [entry(3.0)])
-      {:ok, _view, html} = live(conn, ~p"/events/#{id}")
+      {:ok, view, _html} = live(conn, ~p"/events/#{id}")
 
       # The attribute is always present: the hook multiplies by it, so its
-      # absence and a zero must not be different code paths.
-      assert html =~ ~s(data-annotation-offset="0.0")
-      assert html =~ ~s(data-t="3.0")
-      assert html =~ ~s(data-seek="3.0")
+      # absence and a zero must not be different code paths. Selector-queried,
+      # not raw HTML, per the LiveView test rules.
+      assert has_element?(view, ~s([data-annotation-offset="0.0"]))
+      assert has_element?(view, ~s(button[data-t="3.0"]))
+      assert has_element?(view, ~s(button[data-seek="3.0"]))
     end
 
     test "a camera with an offset shifts marker, seek and tooltip together", %{conn: conn} do
       id = seed_with_entries("cam_dual", [entry(3.0)])
-      {:ok, _view, html} = live(conn, ~p"/events/#{id}")
+      {:ok, view, _html} = live(conn, ~p"/events/#{id}")
 
-      assert html =~ ~s(data-annotation-offset="-0.4")
-      assert html =~ ~s(data-t="2.6")
-      assert html =~ ~s(data-seek="2.6")
+      assert has_element?(view, ~s([data-annotation-offset="-0.4"]))
+      assert has_element?(view, ~s(button[data-t="2.6"]))
+      assert has_element?(view, ~s(button[data-seek="2.6"]))
       # the tooltip is the same time, so the dot and its label cannot disagree
-      assert html =~ "person 0.90 at 0:03"
-      refute html =~ ~s(data-t="3.0")
+      assert has_element?(view, ~s(button[title*="person 0.90 at 0:03"]))
+      refute has_element?(view, ~s(button[data-t="3.0"]))
     end
 
     # This timeline's axis is the event, so a shift that would push a marker

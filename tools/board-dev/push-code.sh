@@ -92,11 +92,15 @@ for d in lib/*/; do
       echo "push: no installed dir for $name — a new dep needs a real image" >&2
       exit 1
     fi
-    mkdir -p /app/lib/"$name"
-    # A bumped app keeps the image's priv (native .so's never ride the push).
+    # A bumped app would ride only its BEAMs: its priv stays the image's,
+    # and pairing new bytecode with an old priv is exactly how a NIF loader
+    # meets the wrong .so ABI (exqlite-class deps) — and how non-native priv
+    # resources go quietly stale. Refuse rather than guess.
     if [ -d "$exists"/priv ]; then
-      cp -r "$exists"/priv /app/lib/"$name"/
+      echo "push: $name bumps an app whose priv lives in the image — needs a real image" >&2
+      exit 1
     fi
+    mkdir -p /app/lib/"$name"
   fi
   cp -r "$d". /app/lib/"$name"/
 done

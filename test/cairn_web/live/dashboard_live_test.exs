@@ -194,37 +194,36 @@ defmodule CairnWeb.DashboardLiveTest do
     test "a 4:3 camera's boxes are corrected for the crop", %{conn: conn} do
       {:ok, view, _html} = live(conn, "/")
 
-      html =
-        view
-        |> activate("cam_a", %{"width" => 640, "height" => 480})
-        |> publish("cam_a", [detection("person", 0.9, [0.25, 0.25, 0.5, 0.5])])
+      view
+      |> activate("cam_a", %{"width" => 640, "height" => 480})
+      |> publish("cam_a", [detection("person", 0.9, [0.25, 0.25, 0.5, 0.5])])
 
-      assert html =~ "left: 25.0%"
-      assert html =~ "top: 16.67%"
-      assert html =~ "width: 50.0%"
-      assert html =~ "height: 66.67%"
+      # Selector-queried, not raw HTML: the claim is the element's style,
+      # not the serializer's spelling of the page around it.
+      assert has_element?(view, ~s(div[style*="left: 25.0%"]))
+      assert has_element?(view, ~s(div[style*="top: 16.67%"]))
+      assert has_element?(view, ~s(div[style*="width: 50.0%"]))
+      assert has_element?(view, ~s(div[style*="height: 66.67%"]))
     end
 
     test "a 16:9 camera is left exactly alone", %{conn: conn} do
       {:ok, view, _html} = live(conn, "/")
 
-      corrected =
-        view
-        |> activate("cam_a", %{"width" => 1920, "height" => 1080})
-        |> publish("cam_a", [detection("person", 0.9, [0.25, 0.25, 0.5, 0.5])])
+      view
+      |> activate("cam_a", %{"width" => 1920, "height" => 1080})
+      |> publish("cam_a", [detection("person", 0.9, [0.25, 0.25, 0.5, 0.5])])
 
       # identical to the no-dimensions render, which is the whole claim:
       # a matching aspect must not move a single pixel
       {:ok, plain_view, _html} = live(conn, "/")
 
-      plain =
-        plain_view
-        |> activate("cam_a")
-        |> publish("cam_a", [detection("person", 0.9, [0.25, 0.25, 0.5, 0.5])])
+      plain_view
+      |> activate("cam_a")
+      |> publish("cam_a", [detection("person", 0.9, [0.25, 0.25, 0.5, 0.5])])
 
-      for percent <- ["left: 25.0%", "top: 25.0%", "width: 50.0%", "height: 50.0%"] do
-        assert corrected =~ percent
-        assert plain =~ percent
+      for style <- ["left: 25.0%", "top: 25.0%", "width: 50.0%", "height: 50.0%"] do
+        assert has_element?(view, ~s(div[style*="#{style}"]))
+        assert has_element?(plain_view, ~s(div[style*="#{style}"]))
       end
     end
 
@@ -235,41 +234,43 @@ defmodule CairnWeb.DashboardLiveTest do
     test "the clamps apply after the correction, not before", %{conn: conn} do
       {:ok, view, _html} = live(conn, "/")
 
-      html =
-        view
-        |> activate("cam_a", %{"width" => 640, "height" => 480})
-        |> publish("cam_a", [detection("person", 0.9, [0.1, 0.85, 0.2, 0.1])])
+      view
+      |> activate("cam_a", %{"width" => 640, "height" => 480})
+      |> publish("cam_a", [detection("person", 0.9, [0.1, 0.85, 0.2, 0.1])])
 
-      assert html =~ "top: 96.67%"
-      assert html =~ "height: 2.83%"
-      refute html =~ "top: 85.0%"
-      refute html =~ "height: 10.0%"
+      assert has_element?(view, ~s(div[style*="top: 96.67%"]))
+      assert has_element?(view, ~s(div[style*="height: 2.83%"]))
+      refute has_element?(view, ~s(div[style*="top: 85.0%"]))
+      refute has_element?(view, ~s(div[style*="height: 10.0%"]))
     end
 
     test "dimensions are dropped when the player goes away", %{conn: conn} do
       {:ok, view, _html} = live(conn, "/")
       box = [detection("person", 0.9, [0.25, 0.25, 0.5, 0.5])]
 
-      assert view
-             |> activate("cam_a", %{"width" => 640, "height" => 480})
-             |> publish("cam_a", box) =~
-               "top: 16.67%"
+      view
+      |> activate("cam_a", %{"width" => 640, "height" => 480})
+      |> publish("cam_a", box)
+
+      assert has_element?(view, ~s(div[style*="top: 16.67%"]))
 
       render_hook(view, "webrtc_inactive", %{"camera_id" => "cam_a"})
 
       # the next player is a different picture: with no dimensions of its own
       # it must get the identity geometry, not its predecessor's crop
-      assert view |> activate("cam_a") |> publish("cam_a", box) =~ "top: 25.0%"
+      view |> activate("cam_a") |> publish("cam_a", box)
+      assert has_element?(view, ~s(div[style*="top: 25.0%"]))
     end
 
     test "a transport switch drops them too", %{conn: conn} do
       {:ok, view, _html} = live(conn, "/")
       box = [detection("person", 0.9, [0.25, 0.25, 0.5, 0.5])]
 
-      assert view
-             |> activate("cam_a", %{"width" => 640, "height" => 480})
-             |> publish("cam_a", box) =~
-               "top: 16.67%"
+      view
+      |> activate("cam_a", %{"width" => 640, "height" => 480})
+      |> publish("cam_a", box)
+
+      assert has_element?(view, ~s(div[style*="top: 16.67%"]))
 
       view
       |> element(~s(#camera-transport-cam_a button[phx-value-transport="mse"]))
@@ -279,7 +280,8 @@ defmodule CairnWeb.DashboardLiveTest do
       |> element(~s(#camera-transport-cam_a button[phx-value-transport="webrtc"]))
       |> render_click()
 
-      assert view |> activate("cam_a") |> publish("cam_a", box) =~ "top: 25.0%"
+      view |> activate("cam_a") |> publish("cam_a", box)
+      assert has_element?(view, ~s(div[style*="top: 25.0%"]))
     end
 
     test "boxes draw with percent geometry from the normalized box", %{conn: conn} do
