@@ -30,6 +30,22 @@ esac
 ready='{"spec":"cairn.plugin","version":1,"type":"plugin.status","status":{"state":"ready"}}'
 
 case "$args" in
+  *--cpu-baseline*)
+    # The baseline mode: outcome selected by the model name, like the probe's.
+    case "$model" in
+      *bad*)
+        echo "fatal: opening the model: no such file" >&2
+        exit 1
+        ;;
+      *hang*)
+        exec sleep 30
+        ;;
+      *)
+        echo "cpu-baseline-ms: 123.456"
+        exit 0
+        ;;
+    esac
+    ;;
   *bad*)
     echo "fatal: opening the model: no such file" >&2
     exit 1

@@ -516,60 +516,44 @@ defmodule Cairn.Native.Host do
   end
 
   # `Cairn.Native.Health` cannot judge an accelerator without knowing what one
-  # model pass costs without it, and only this board and this model can say. In
-  # a task, so a measurement that does not come back costs a bounded wait rather
-  # than the engine: `nil` is the monitor's `:not_applicable`, which is where a
-  # node with no number to compare against already sits.
+  # model pass costs without it, and only this board and this model can say.
+  # Measured through the canary's binary in a FRESH OS process, never this VM:
+  # the QNN plugin EP registers with the process-wide ORT environment at first
+  # engine init, and a "CPU" session created here after that has been observed
+  # executing on the HTP (60.8 ms for a model whose true CPU pass exceeds
+  # 40 s) — collapsing the D-P5 ratio to ~1x and pinning health at a false
+  # :wedged. A subprocess makes the venue structural on every reload and
+  # restart, and its timeout is a kill rather than an orphaned native call.
+  # `nil` is the monitor's `:not_applicable`, which is where a node with no
+  # number to compare against already sits.
   defp measure_baseline(state, config) do
-    if NativeConfig.accelerator?(config), do: await_baseline(state, config), else: nil
-  end
-
-  # The baseline runs BEFORE init/1 (venue integrity), so a boot that is
-  # about to fail fast must not first wait out a measurement. Preflight the
-  # two files whose absence is the common fast refusal — init's own error
-  # carries the story, and nil here adds nothing to it.
-  defp await_baseline(state, config) do
     cond do
-      not File.exists?(config.model) -> nil
-      missing_qnn_library?(config) -> nil
-      true -> probe_then_measure(state, config)
+      not NativeConfig.accelerator?(config) ->
+        nil
+
+      # init/1 is about to refuse with the real error; a subprocess run
+      # would only put noise ahead of it.
+      not File.exists?(config.model) ->
+        nil
+
+      true ->
+        probe_then_measure(state, config)
     end
   end
 
-  # Scoped to the qnn backend: another accelerator with a stale
-  # qnn.library value must not lose its baseline to a file it never loads.
-  defp missing_qnn_library?(%{backend: "qnn"} = config) do
-    library = config.qnn.library
-    is_binary(library) and not File.exists?(library)
-  end
-
-  defp missing_qnn_library?(_config), do: false
-
   # One pass under a short deadline decides whether the median is worth
   # paying for: a model that cannot finish a single CPU pass quickly cannot
-  # produce a full median inside the timeout either, and the doomed run
-  # would otherwise hold a dirty scheduler for minutes behind a boot whose
-  # answer is already :not_applicable. The probe doubles as warmup, so the
-  # median that follows runs on a warm session.
+  # produce a full median inside the timeout either. Each stage is its own
+  # subprocess, so a stage that misses its deadline is killed outright — a
+  # model too big for a CPU baseline costs the probe deadline once, and nil
+  # is already the honest verdict.
   defp probe_then_measure(state, config) do
     probe_timeout =
       Keyword.get(state.opts, :baseline_probe_timeout_ms, @baseline_probe_timeout_ms)
 
-    case run_measurement(state, config, 1, probe_timeout) do
-      {:ok, {:ok, _warm_ms}} ->
-        full_measurement(state, config)
-
-      {:ok, reply} ->
-        baseline(reply, config)
-
-      {:exit, reason} ->
-        no_baseline(config, "the measurement crashed (#{inspect(reason)})")
-
-      nil ->
-        no_baseline(
-          config,
-          "one CPU pass outlived #{probe_timeout}ms — this model has no CPU baseline"
-        )
+    case state.canary.cpu_baseline(config, 1, baseline_opts(state, probe_timeout)) do
+      {:ok, _one_pass_ms} -> full_measurement(state, config)
+      {:error, why} -> no_baseline(config, why)
     end
   end
 
@@ -577,25 +561,14 @@ defmodule Cairn.Native.Host do
     passes = Keyword.get(state.opts, :baseline_passes, @baseline_passes)
     timeout = Keyword.get(state.opts, :baseline_timeout_ms, @baseline_timeout_ms)
 
-    case run_measurement(state, config, passes, timeout) do
-      {:ok, reply} -> baseline(reply, config)
-      {:exit, reason} -> no_baseline(config, "the measurement crashed (#{inspect(reason)})")
-      nil -> no_baseline(config, "the measurement did not answer in time")
+    case state.canary.cpu_baseline(config, passes, baseline_opts(state, timeout)) do
+      {:ok, ms} -> baseline({:ok, ms}, config)
+      {:error, why} -> no_baseline(config, why)
     end
   end
 
-  defp run_measurement(state, config, passes, timeout) do
-    ort = state.ort
-
-    task =
-      Task.Supervisor.async_nolink(Cairn.TaskSupervisor, fn ->
-        ort.cpu_baseline_ms(config, passes)
-      end)
-
-    # `ignore` rather than `shutdown` on expiry: a task inside a dirty NIF does
-    # not die until the call returns, so a brutal kill would block on the very
-    # thing that timed out. It stops monitoring and lets the task finish alone.
-    Task.yield(task, timeout) || Task.ignore(task)
+  defp baseline_opts(state, timeout_ms) do
+    state |> canary_opts() |> Keyword.put(:timeout_ms, timeout_ms)
   end
 
   defp baseline({:ok, ms}, config) when is_number(ms) and ms > 0 do
@@ -610,11 +583,6 @@ defmodule Cairn.Native.Host do
   # Zero and negative are not a pass anyone timed, and a baseline of zero would
   # put every accelerator under the ratio floor at once.
   defp baseline({:ok, ms}, config), do: no_baseline(config, "the measurement was #{inspect(ms)}")
-
-  defp baseline({:error, {reason, message}}, config),
-    do: no_baseline(config, "#{reason} #{message}")
-
-  defp baseline(other, config), do: no_baseline(config, inspect(other))
 
   defp no_baseline(config, why) do
     Logger.warning(

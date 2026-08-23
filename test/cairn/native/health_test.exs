@@ -403,8 +403,9 @@ defmodule Cairn.Native.HealthTest do
 
       {:ok, _epoch} = Host.open_stream(host, id, %{})
 
-      assert_receive {:cpu_baseline_ms,
-                      %{model: "test/support/fixtures/models/stub.onnx", backend: "qnn"}, passes}
+      assert_receive {:cpu_baseline,
+                      %{model: "test/support/fixtures/models/stub.onnx", backend: "qnn"}, passes,
+                      _opts}
 
       assert passes in 1..64
 

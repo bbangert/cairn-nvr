@@ -53,7 +53,7 @@ struct Args {
     /// Camera id, echoed back on every output line.
     #[arg(
         long,
-        required_unless_present = "cameras_json",
+        required_unless_present_any = ["cameras_json", "cpu_baseline"],
         conflicts_with = "cameras_json"
     )]
     camera_id: Option<String>,
@@ -61,10 +61,20 @@ struct Args {
     /// UDP port on 127.0.0.1 carrying H.264 RTP (port + 1 is reserved for RTCP).
     #[arg(
         long,
-        required_unless_present = "cameras_json",
+        required_unless_present_any = ["cameras_json", "cpu_baseline"],
         conflicts_with = "cameras_json"
     )]
     udp_port: Option<u16>,
+
+    /// Measure the median CPU model-pass latency and exit: one untimed
+    /// warmup, then this many timed passes on a synthetic input, printed as
+    /// `cpu-baseline-ms: <median>`. Always the CPU, whatever `--backend`
+    /// says — and always a fresh process that has never registered an
+    /// accelerator EP, which is the point: `Cairn.Native.Health`'s D-P5
+    /// ratio is only evidence if this number's venue is provable, and the
+    /// engine's own process cannot prove it after its first QNN load.
+    #[arg(long)]
+    cpu_baseline: Option<usize>,
 
     /// JSON object of label -> minimum score, with an optional "default" key.
     #[arg(long, conflicts_with = "cameras_json")]
@@ -203,6 +213,22 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+
+    if let Some(passes) = args.cpu_baseline {
+        let labels = Labels::load(args.labels.as_deref())?;
+        let median = infer::cpu_baseline_ms(
+            &args.model,
+            args.input_size,
+            args.model_profile,
+            &labels,
+            args.allow_label_mismatch,
+            passes,
+        )?;
+        // The line format is a contract: `Cairn.Native.Canary` parses it.
+        println!("cpu-baseline-ms: {median:.3}");
+        return Ok(());
+    }
+
     // The embedder's own open refuses qnn too, but it runs after the
     // detector's — which on qnn is a multi-second HTP graph compile. An
     // argv combination that is going down either way should say so before

@@ -604,41 +604,38 @@ defmodule Cairn.Native.HostTest do
   end
 
   describe "the CPU baseline's venue and cost" do
-    # The measurement order is load-bearing: before init/1, so the QNN EP is
-    # not yet registered in the process and the "CPU" session cannot land on
-    # the accelerator (observed on the board: 60.8 ms for a model whose true
-    # CPU pass exceeds 40 s, pinning health at a false :wedged).
-    test "probes with one pass before paying for the median" do
+    # The measurement goes through the CANARY — a fresh OS process per stage —
+    # never this VM's ort module: the QNN EP registration is process-wide and
+    # permanent, so after the first engine load an in-VM "CPU" session cannot
+    # prove its venue (observed on the board: 60.8 ms for a model whose true
+    # CPU pass exceeds 40 s, pinning health at a false :wedged on every boot,
+    # reload and restart).
+    test "probes with one pass before paying for the median, both via the canary" do
       host = start_host(config: %{model: @stub_onnx, backend: "qnn"})
 
-      assert_receive {:cpu_baseline_ms, %{model: @stub_onnx}, 1}
-      assert_receive {:cpu_baseline_ms, %{model: @stub_onnx}, 5}
+      assert_receive {:cpu_baseline, %{model: @stub_onnx}, 1, probe_opts}
+      assert_receive {:cpu_baseline, %{model: @stub_onnx}, 5, full_opts}
       assert_receive {:init, %{model: @stub_onnx}}
+      # each stage carries its own deadline: the probe's short one is what
+      # bounds a doomed measurement
+      assert probe_opts[:timeout_ms] < full_opts[:timeout_ms]
       assert GenServer.call(host, :probe).cpu_baseline_ms == 45.0
+      # the in-VM measurement NIF is never consulted
+      refute_received {:cpu_baseline_ms, _config, _passes}
     end
 
-    test "a probe that cannot finish one pass yields no baseline, quickly" do
-      # Just past the 50ms probe deadline; the test itself only waits out
-      # the deadline (Task.ignore orphans the sleeper), so this bounds the
-      # stray background task, not the suite.
-      control(%{
-        cpu_baseline_ms: fn _config, _passes ->
-          Process.sleep(200)
-          {:ok, 41_000.0}
-        end
-      })
+    test "a probe the canary cannot finish yields no baseline and no median attempt" do
+      control(%{cpu_baseline: {:error, "no CPU baseline within the timeout: it said nothing"}})
 
       log =
         capture_log(fn ->
-          host =
-            start_host(
-              config: %{model: @stub_onnx, backend: "qnn"},
-              baseline_probe_timeout_ms: 50
-            )
+          host = start_host(config: %{model: @stub_onnx, backend: "qnn"})
 
           assert GenServer.call(host, :probe).cpu_baseline_ms == nil
         end)
 
+      assert_received {:cpu_baseline, _config, 1, _opts}
+      refute_received {:cpu_baseline, _config, 5, _opts}
       assert log =~ "no CPU baseline"
     end
 
@@ -646,7 +643,7 @@ defmodule Cairn.Native.HostTest do
       host = start_host(config: %{model: "m.onnx", backend: "qnn"})
 
       assert_receive {:init, %{model: "m.onnx"}}
-      refute_received {:cpu_baseline_ms, _config, _passes}
+      refute_received {:cpu_baseline, _config, _passes, _opts}
       assert GenServer.call(host, :probe).cpu_baseline_ms == nil
     end
   end
