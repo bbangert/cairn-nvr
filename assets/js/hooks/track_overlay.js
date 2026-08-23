@@ -307,6 +307,11 @@ const TrackOverlay = {
     const t0 = times[i]
     const t1 = times[i + 1]
     if (t1 - t0 > MAX_LERP_GAP_MS) {
+      // At or past t1 the pair's second sample is the CURRENT detection —
+      // only the terminal pair can be here (the cursor advances past every
+      // other), and without this a track whose last pair spans a gap never
+      // renders its final real detection.
+      if (tMs >= t1) return [track.x[i + 1], track.y[i + 1], track.w[i + 1], track.h[i + 1]]
       // Hold only the OBSERVED endpoint: the sample before the gap was a
       // real detection worth a brief hold, but rendering t1's box before t1
       // would invent an annotation inside the gap — and disagree with the

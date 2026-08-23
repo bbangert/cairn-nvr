@@ -187,8 +187,11 @@ cameras: []
 #    # annotations later on the clip.
 #    #
 #    # Applied when annotations are RENDERED, never written into the clip,
-#    # the sidecar or the event row — so tuning it re-renders events that
-#    # already exist, and a reload is enough. No camera restart.
+#    # the sidecar or the event row — so tuning it re-renders the overlays,
+#    # timeline markers and seeks of events that already exist, and a
+#    # reload is enough. No camera restart. The one generated-once artifact
+#    # is the poster snapshot: existing posters keep the frame they were
+#    # generated with; new events use the tuned value.
 #    annotation_offset_ms: -250
 #    # Three levels of threshold, per label. Each answers a different
 #    # question, and they must not fight: effective `record` >= `track` >=

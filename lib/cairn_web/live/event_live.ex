@@ -452,7 +452,10 @@ defmodule CairnWeb.EventLive do
   # Rounded to the precision the entry itself was stored at
   # (`Cairn.PresenceRecorder.label_entry/3`), so a shift does not hand the DOM
   # a float's worth of noise the timeline cannot express anyway.
-  defp marker_t(entry, offset_s), do: Float.round(max(entry["t"] + offset_s, 0.0), 1)
+  # Millisecond precision: one decimal would quietly rewrite a configured
+  # offset (a -250 ms setting shifting a 3.0 s marker to 2.8) and disagree
+  # with the overlay and snapshot, which use the exact value.
+  defp marker_t(entry, offset_s), do: Float.round(max(entry["t"] + offset_s, 0.0), 3)
 
   defp marker_left(t, duration) do
     pct = t / duration * 100
@@ -480,9 +483,10 @@ defmodule CairnWeb.EventLive do
   defp seek_t(nil, _offset_s), do: nil
 
   # Whole results render as integers so a zero-offset camera's seeks keep
-  # their exact pre-offset spelling; only a fractional offset adds a decimal.
+  # their exact pre-offset spelling. Millisecond precision like marker_t/2:
+  # coarser rounding would seek away from the overlay's own correction.
   defp seek_t(seconds, offset_s) do
-    rounded = Float.round(max(seconds + offset_s, 0.0), 1)
+    rounded = Float.round(max(seconds + offset_s, 0.0), 3)
     truncated = trunc(rounded)
     if rounded == truncated, do: truncated, else: rounded
   end
