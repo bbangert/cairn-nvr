@@ -42,6 +42,17 @@ pub fn cpu_baseline_ms(
     allow_label_mismatch: bool,
     passes: usize,
 ) -> Result<f64> {
+    // Before the open: a bad pass count must not pay for a large model load
+    // (or report as a load/timeout error). measure_cpu_baseline keeps its own
+    // check as defense for its public entry point.
+    if !BASELINE_PASSES.contains(&passes) {
+        bail!(
+            "cpu baseline passes must be {}..={}, got {passes}",
+            BASELINE_PASSES.start(),
+            BASELINE_PASSES.end()
+        );
+    }
+
     let mut detector = open_baseline_detector(
         model,
         input_size,

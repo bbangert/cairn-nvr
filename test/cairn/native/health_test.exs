@@ -417,13 +417,35 @@ defmodule Cairn.Native.HealthTest do
       assert Host.status(host).cpu_baseline_ms == 45.0
     end
 
-    defp await_baseline(host, attempts \\ 200) do
-      state = :sys.get_state(host)
+    # Event-driven, never timed: the task's own exit is the signal, and the
+    # `:sys.get_state/1` round-trips after it are real synchronizations with
+    # the host's queue.
+    defp await_baseline(host) do
+      case :sys.get_state(host).baseline_task do
+        nil ->
+          :ok
 
-      unless state.baseline_task == nil or attempts == 0 do
-        Process.sleep(5)
-        await_baseline(host, attempts - 1)
+        %{task: %Task{pid: pid}} ->
+          ref = Process.monitor(pid)
+
+          receive do
+            {:DOWN, ^ref, :process, _pid, _reason} -> :ok
+          after
+            5_000 -> flunk("the baseline task never finished")
+          end
+
+          drain_baseline(host, 100)
       end
+    end
+
+    defp drain_baseline(_host, 0), do: flunk("the host never consumed the baseline result")
+
+    defp drain_baseline(host, attempts) do
+      unless :sys.get_state(host).baseline_task == nil do
+        drain_baseline(host, attempts - 1)
+      end
+
+      :ok
     end
 
     test "a CPU backend measures nothing: it is the baseline", %{id: id} do

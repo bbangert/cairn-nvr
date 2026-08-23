@@ -612,15 +612,36 @@ defmodule Cairn.Native.HostTest do
     # reload and restart). And ASYNCHRONOUSLY: the subprocess freed the
     # measurement from init ordering, so the engine serves immediately and
     # the number lands when it lands.
-    defp settled_baseline(host, attempts \\ 200) do
+    # Event-driven, never timed: monitor the task's own pid for its exit,
+    # then drain the host's queue with `:sys.get_state/1` round-trips until
+    # the result is consumed — each call is a real synchronization, so no
+    # clock is involved anywhere.
+    defp settled_baseline(host) do
+      case :sys.get_state(host).baseline_task do
+        nil ->
+          :sys.get_state(host).cpu_baseline_ms
+
+        %{task: %Task{pid: pid}} ->
+          ref = Process.monitor(pid)
+
+          receive do
+            {:DOWN, ^ref, :process, _pid, _reason} -> :ok
+          after
+            5_000 -> flunk("the baseline task never finished")
+          end
+
+          drain_baseline(host, 100)
+      end
+    end
+
+    defp drain_baseline(_host, 0), do: flunk("the host never consumed the baseline result")
+
+    defp drain_baseline(host, attempts) do
       state = :sys.get_state(host)
 
-      if state.baseline_task == nil or attempts == 0 do
-        state.cpu_baseline_ms
-      else
-        Process.sleep(5)
-        settled_baseline(host, attempts - 1)
-      end
+      if state.baseline_task == nil,
+        do: state.cpu_baseline_ms,
+        else: drain_baseline(host, attempts - 1)
     end
 
     test "measures via the canary, after init, in one deadline" do

@@ -73,9 +73,10 @@ defmodule Cairn.Native.Host do
     :engine,
     :opts,
     :cpu_baseline_ms,
-    # The in-flight measurement, %{ref: task ref, config: resolved config} or
-    # nil. Matching on the ref is the staleness guard: every load replaces it,
-    # so a superseded measurement's late answer matches nothing.
+    # The in-flight measurement, %{task: %Task{}, config: resolved config} or
+    # nil. Matching the task's ref is the staleness guard, and holding the
+    # struct is what lets a superseding load SHUT IT DOWN rather than leave
+    # its subprocess running to the deadline (`stop_baseline/1`).
     :baseline_task,
     engine_state: :starting,
     canary_state: :not_run,
@@ -331,7 +332,10 @@ defmodule Cairn.Native.Host do
   # The baseline measurement landing. Matching the stored ref is the staleness
   # guard: every load replaces `baseline_task`, so a superseded measurement's
   # late answer matches nothing and falls to the catch-all.
-  def handle_info({ref, result}, %{baseline_task: %{ref: ref, config: config}} = state) do
+  def handle_info(
+        {ref, result},
+        %{baseline_task: %{task: %Task{ref: ref}, config: config}} = state
+      ) do
     Process.demonitor(ref, [:flush])
 
     value =
@@ -345,7 +349,7 @@ defmodule Cairn.Native.Host do
 
   def handle_info(
         {:DOWN, ref, :process, _pid, reason},
-        %{baseline_task: %{ref: ref, config: config}} = state
+        %{baseline_task: %{task: %Task{ref: ref}, config: config}} = state
       ) do
     {:noreply,
      %{
@@ -398,6 +402,9 @@ defmodule Cairn.Native.Host do
     # rather than out of this call's shutdown budget, which one stream wedged in
     # `push_frame/5` would exhaust on its own.
     close_streams(state)
+    # The measurement task is nolink: without this, a clean shutdown would
+    # leave its cairn-detect subprocess running out its deadline.
+    stop_baseline(state)
     :ok
   end
 
@@ -462,13 +469,7 @@ defmodule Cairn.Native.Host do
 
   defp open_engine(state, nil) do
     # The normal state until a camera's profile is routed here.
-    %{
-      state
-      | engine: nil,
-        engine_state: :not_configured,
-        cpu_baseline_ms: nil,
-        baseline_task: nil
-    }
+    %{stop_baseline(state) | engine: nil, engine_state: :not_configured, cpu_baseline_ms: nil}
   end
 
   defp open_engine(state, raw) do
@@ -531,7 +532,7 @@ defmodule Cairn.Native.Host do
 
   defp refuse(state, engine_state, message) do
     Logger.error("cairn-native: " <> message)
-    %{state | engine: nil, engine_state: engine_state, cpu_baseline_ms: nil, baseline_task: nil}
+    %{stop_baseline(state) | engine: nil, engine_state: engine_state, cpu_baseline_ms: nil}
   end
 
   # `Cairn.Native.Health` cannot judge an accelerator without knowing what one
@@ -554,14 +555,16 @@ defmodule Cairn.Native.Host do
   # finish inside the deadline costs one killed subprocess in the background
   # and stays at nil — the monitor's honest :not_applicable.
   defp start_baseline(state, config) do
+    state = stop_baseline(state)
+
     cond do
       not NativeConfig.accelerator?(config) ->
-        %{state | baseline_task: nil}
+        state
 
       # The engine has already refused or will serve without a baseline
       # either way; a subprocess run against a missing file is only noise.
       not File.exists?(config.model) ->
-        %{state | baseline_task: nil}
+        state
 
       true ->
         passes = Keyword.get(state.opts, :baseline_passes, @baseline_passes)
@@ -574,9 +577,20 @@ defmodule Cairn.Native.Host do
             canary.cpu_baseline(config, passes, opts)
           end)
 
-        %{state | baseline_task: %{ref: task.ref, config: config}}
+        %{state | baseline_task: %{task: task, config: config}}
     end
   end
+
+  # A superseded measurement is shut down, never abandoned: its canary runner
+  # traps exits and kills the cairn-detect subprocess on the way out, so a
+  # reload cannot stack CPU-heavy measurement processes behind one another
+  # (and starve the replacement into its own timeout).
+  defp stop_baseline(%{baseline_task: %{task: task}} = state) do
+    Task.shutdown(task, :brutal_kill)
+    %{state | baseline_task: nil}
+  end
+
+  defp stop_baseline(state), do: %{state | baseline_task: nil}
 
   defp baseline({:ok, ms}, config) when is_number(ms) and ms > 0 do
     Logger.info(
