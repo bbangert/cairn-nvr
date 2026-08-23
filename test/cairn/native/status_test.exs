@@ -44,7 +44,7 @@ defmodule Cairn.Native.StatusTest do
       native_module: NativeStub,
       ort_module: Cairn.CairnOrtStub,
       canary_module: CanaryStub,
-      config: %{model: "m.onnx", backend: "qnn"}
+      config: %{model: "test/support/fixtures/models/stub.onnx", backend: "qnn"}
     ]
 
     start_supervised!({Host, Keyword.merge(defaults, opts)}, id: name)
@@ -90,7 +90,7 @@ defmodule Cairn.Native.StatusTest do
       assert status["engine"] == "ready"
       assert status["nif"] == "available"
       assert status["canary"] == "passed"
-      assert status["model"] == "m.onnx"
+      assert status["model"] == "stub.onnx"
       assert status["backend"] == "qnn"
       assert status["fps"] > 0.0
       assert status["inferences"] == 5

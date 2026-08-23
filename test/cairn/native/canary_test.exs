@@ -92,6 +92,39 @@ defmodule Cairn.Native.CanaryTest do
     end
   end
 
+  describe "cpu_baseline/3" do
+    test "parses the marker line and reaps the process", %{dir: dir} do
+      config = config(dir, "ready.onnx")
+
+      assert Canary.cpu_baseline(config, 5, binary: @fake_detect, timeout_ms: @patience_ms) ==
+               {:ok, 123.456}
+
+      assert_gone(probe_pid(config))
+    end
+
+    test "a run that outlives the deadline is killed, not orphaned", %{dir: dir} do
+      config = config(dir, "hang.onnx")
+
+      assert {:error, message} =
+               Canary.cpu_baseline(config, 1, binary: @fake_detect, timeout_ms: 200)
+
+      assert message =~ "no CPU baseline within the timeout"
+      # THE point of measuring in a subprocess: the timed-out measurement is
+      # gone, where an ignored in-VM NIF task would grind on for minutes.
+      assert_gone(probe_pid(config))
+    end
+
+    test "a model that will not open reports the binary's own account", %{dir: dir} do
+      config = config(dir, "bad.onnx")
+
+      assert {:error, message} =
+               Canary.cpu_baseline(config, 1, binary: @fake_detect, timeout_ms: @patience_ms)
+
+      assert message =~ "status 1"
+      assert message =~ "no such file"
+    end
+  end
+
   defp config(dir, model) do
     {:ok, config} = Config.normalize(model: Path.join(dir, model))
     config

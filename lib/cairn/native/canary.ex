@@ -36,6 +36,8 @@ defmodule Cairn.Native.Canary do
   # `:canary_module` seam fails at compile time rather than in whatever test
   # reaches for it next.
   @callback probe(Config.t(), keyword()) :: result()
+  @callback cpu_baseline(Config.t(), pos_integer(), keyword()) ::
+              {:ok, float()} | {:error, String.t()}
   @behaviour __MODULE__
 
   @doc """
@@ -55,6 +57,103 @@ defmodule Cairn.Native.Canary do
       Keyword.get(opts, :enabled, true) == false -> {:skipped, :disabled}
       binary = binary(opts) -> run(binary, config, opts)
       true -> {:error, no_binary(opts)}
+    end
+  end
+
+  @doc """
+  Median CPU model-pass latency, measured by `cairn-detect --cpu-baseline` in
+  a fresh OS process — the only venue where "CPU" is structural. The engine's
+  own process cannot prove it after its first QNN load (the plugin EP
+  registration is process-wide and permanent), and a subprocess timeout is a
+  kill rather than an orphaned native call. Options are `probe/2`'s.
+  """
+  @spec cpu_baseline(Config.t(), pos_integer(), keyword()) ::
+          {:ok, float()} | {:error, String.t()}
+  def cpu_baseline(config, passes, opts \\ []) do
+    cond do
+      Keyword.get(opts, :enabled, true) == false -> {:error, "the canary is disabled"}
+      binary = binary(opts) -> run_baseline(binary, config, passes, opts)
+      true -> {:error, no_binary(opts)}
+    end
+  end
+
+  defp run_baseline(binary, config, passes, opts) do
+    argv = Config.to_argv(config) ++ ["--cpu-baseline", Integer.to_string(passes)]
+    timeout_ms = Keyword.get(opts, :timeout_ms, @timeout_ms)
+    caller = self()
+    ref = make_ref()
+
+    runner = spawn_link(fn -> baseline_port(caller, ref, binary, argv, timeout_ms) end)
+    collect(runner, Process.monitor(runner), ref)
+  end
+
+  defp baseline_port(caller, ref, binary, argv, timeout_ms) do
+    Process.flag(:trap_exit, true)
+
+    result =
+      try do
+        {:ok,
+         Port.open({:spawn_executable, binary}, [
+           :binary,
+           :exit_status,
+           :stderr_to_stdout,
+           {:line, @max_line},
+           args: argv
+         ])}
+      rescue
+        error -> {:error, "could not run #{binary}: #{Exception.message(error)}"}
+      end
+
+    result =
+      case result do
+        {:ok, port} ->
+          try do
+            await_baseline(port, System.monotonic_time(:millisecond) + timeout_ms, [])
+          rescue
+            error -> {:error, "the baseline failed after starting: #{Exception.message(error)}"}
+          end
+
+        {:error, _message} = error ->
+          error
+      end
+
+    send(caller, {ref, result})
+  end
+
+  # The marker line is `--cpu-baseline`'s output contract; it arrives just
+  # before a clean exit, so the value is taken on sight and the process
+  # reaped by `stop/1`.
+  defp await_baseline(port, deadline, tail) do
+    wait = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {^port, {:data, {:eol, "cpu-baseline-ms: " <> value}}} ->
+        stop(port)
+
+        case Float.parse(value) do
+          {ms, _rest} when ms > 0 -> {:ok, ms}
+          _other -> {:error, "the baseline printed an unreadable value: #{value}"}
+        end
+
+      {^port, {:data, {:eol, line}}} ->
+        await_baseline(port, deadline, Enum.take([line | tail], @tail_lines))
+
+      {^port, {:data, {:noeol, _partial}}} ->
+        await_baseline(port, deadline, tail)
+
+      {^port, {:exit_status, status}} ->
+        {:error, "the baseline run exited with status #{status}: #{explain(tail)}"}
+
+      {:EXIT, ^port, _reason} ->
+        await_baseline(port, deadline, tail)
+
+      {:EXIT, _pid, _reason} ->
+        stop(port)
+        {:error, "the baseline run was cut short: its caller is exiting"}
+    after
+      wait ->
+        stop(port)
+        {:error, "no CPU baseline within the timeout: #{explain(tail)}"}
     end
   end
 

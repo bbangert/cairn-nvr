@@ -602,4 +602,80 @@ defmodule Cairn.Native.HostTest do
       assert Host.status(host).model == "pinned.onnx"
     end
   end
+
+  describe "the CPU baseline's venue and cost" do
+    # The measurement goes through the CANARY — a fresh, killable OS process —
+    # never this VM's ort module: the QNN EP registration is process-wide and
+    # permanent, so after the first engine load an in-VM "CPU" session cannot
+    # prove its venue (observed on the board: 60.8 ms for a model whose true
+    # CPU pass exceeds 40 s, pinning health at a false :wedged on every boot,
+    # reload and restart). And ASYNCHRONOUSLY: the subprocess freed the
+    # measurement from init ordering, so the engine serves immediately and
+    # the number lands when it lands.
+    # Event-driven, never timed: monitor the task's own pid for its exit,
+    # then drain the host's queue with `:sys.get_state/1` round-trips until
+    # the result is consumed — each call is a real synchronization, so no
+    # clock is involved anywhere.
+    defp settled_baseline(host) do
+      case :sys.get_state(host).baseline_task do
+        nil ->
+          :sys.get_state(host).cpu_baseline_ms
+
+        %{task: %Task{pid: pid}} ->
+          ref = Process.monitor(pid)
+
+          receive do
+            {:DOWN, ^ref, :process, _pid, _reason} -> :ok
+          after
+            5_000 -> flunk("the baseline task never finished")
+          end
+
+          drain_baseline(host, 100)
+      end
+    end
+
+    defp drain_baseline(_host, 0), do: flunk("the host never consumed the baseline result")
+
+    defp drain_baseline(host, attempts) do
+      state = :sys.get_state(host)
+
+      if state.baseline_task == nil,
+        do: state.cpu_baseline_ms,
+        else: drain_baseline(host, attempts - 1)
+    end
+
+    test "measures via the canary, after init, in one deadline" do
+      host = start_host(config: %{model: @stub_onnx, backend: "qnn"})
+
+      # init is not gated on the measurement
+      assert_receive {:init, %{model: @stub_onnx}}
+      assert_receive {:cpu_baseline, %{model: @stub_onnx}, 5, opts}
+      assert is_integer(opts[:timeout_ms])
+      assert settled_baseline(host) == 45.0
+      # the in-VM measurement NIF is never consulted
+      refute_received {:cpu_baseline_ms, _config, _passes}
+    end
+
+    test "a measurement the canary cannot finish yields no baseline" do
+      control(%{cpu_baseline: {:error, "no CPU baseline within the timeout: it said nothing"}})
+
+      log =
+        capture_log(fn ->
+          host = start_host(config: %{model: @stub_onnx, backend: "qnn"})
+
+          assert settled_baseline(host) == nil
+        end)
+
+      assert_received {:cpu_baseline, _config, 5, _opts}
+      assert log =~ "no CPU baseline"
+    end
+
+    test "a model file that does not exist skips the measurement entirely" do
+      host = start_host(config: %{model: "m.onnx", backend: "qnn"})
+
+      assert_receive {:init, %{model: "m.onnx"}}
+      refute_received {:cpu_baseline, _config, _passes, _opts}
+      assert GenServer.call(host, :probe).cpu_baseline_ms == nil
+    end
+  end
 end

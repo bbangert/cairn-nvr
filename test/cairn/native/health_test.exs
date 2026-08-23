@@ -395,16 +395,57 @@ defmodule Cairn.Native.HealthTest do
     # node could reach was `:not_applicable` and the four-way discrimination
     # below never ran. The engine measures its own now.
     test "an accelerator calibrates its CPU baseline at engine init", %{id: id} do
-      host = start_host(health: [min_samples: 3])
+      host =
+        start_host(
+          config: %{model: "test/support/fixtures/models/stub.onnx", backend: "qnn"},
+          health: [min_samples: 3]
+        )
+
       {:ok, _epoch} = Host.open_stream(host, id, %{})
 
-      assert_receive {:cpu_baseline_ms, %{model: "m.onnx", backend: "qnn"}, passes}
+      assert_receive {:cpu_baseline,
+                      %{model: "test/support/fixtures/models/stub.onnx", backend: "qnn"}, passes,
+                      _opts}
+
       assert passes in 1..64
 
+      # the measurement is asynchronous; the verdict below needs it landed
+      await_baseline(host)
       push(host, id, 10)
 
       assert Host.check_health(host) == :healthy
       assert Host.status(host).cpu_baseline_ms == 45.0
+    end
+
+    # Event-driven, never timed: the task's own exit is the signal, and the
+    # `:sys.get_state/1` round-trips after it are real synchronizations with
+    # the host's queue.
+    defp await_baseline(host) do
+      case :sys.get_state(host).baseline_task do
+        nil ->
+          :ok
+
+        %{task: %Task{pid: pid}} ->
+          ref = Process.monitor(pid)
+
+          receive do
+            {:DOWN, ^ref, :process, _pid, _reason} -> :ok
+          after
+            5_000 -> flunk("the baseline task never finished")
+          end
+
+          drain_baseline(host, 100)
+      end
+    end
+
+    defp drain_baseline(_host, 0), do: flunk("the host never consumed the baseline result")
+
+    defp drain_baseline(host, attempts) do
+      unless :sys.get_state(host).baseline_task == nil do
+        drain_baseline(host, attempts - 1)
+      end
+
+      :ok
     end
 
     test "a CPU backend measures nothing: it is the baseline", %{id: id} do
