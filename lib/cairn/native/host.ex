@@ -59,13 +59,6 @@ defmodule Cairn.Native.Host do
   # Past the bound the node runs without a D-P5 ratio.
   @baseline_passes 5
   @baseline_timeout_ms 60_000
-  # The probe runs TWO passes (--cpu-baseline always warms up untimed first),
-  # so its deadline is the median's per-pass budget times two: the median is
-  # warmup + @baseline_passes = 6 passes inside @baseline_timeout_ms, i.e.
-  # 10 s a pass — a model that cannot do two passes in 20 s cannot do six in
-  # 60. Sized tighter, the probe would discard baselines the median deadline
-  # could still afford. Keep this ratio when touching any of the three.
-  @baseline_probe_timeout_ms 20_000
 
   @engine_fatal [:model_load, :model_poisoned]
   @stream_fatal [:closed, :poisoned, :panicked]
@@ -80,6 +73,10 @@ defmodule Cairn.Native.Host do
     :engine,
     :opts,
     :cpu_baseline_ms,
+    # The in-flight measurement, %{ref: task ref, config: resolved config} or
+    # nil. Matching on the ref is the staleness guard: every load replaces it,
+    # so a superseded measurement's late answer matches nothing.
+    :baseline_task,
     engine_state: :starting,
     canary_state: :not_run,
     streams: %{},
@@ -331,6 +328,33 @@ defmodule Cairn.Native.Host do
     {:noreply, note_error(state, camera_id, token, reason, message)}
   end
 
+  # The baseline measurement landing. Matching the stored ref is the staleness
+  # guard: every load replaces `baseline_task`, so a superseded measurement's
+  # late answer matches nothing and falls to the catch-all.
+  def handle_info({ref, result}, %{baseline_task: %{ref: ref, config: config}} = state) do
+    Process.demonitor(ref, [:flush])
+
+    value =
+      case result do
+        {:ok, ms} -> baseline({:ok, ms}, config)
+        {:error, why} -> no_baseline(config, why)
+      end
+
+    {:noreply, %{state | baseline_task: nil, cpu_baseline_ms: value}}
+  end
+
+  def handle_info(
+        {:DOWN, ref, :process, _pid, reason},
+        %{baseline_task: %{ref: ref, config: config}} = state
+      ) do
+    {:noreply,
+     %{
+       state
+       | baseline_task: nil,
+         cpu_baseline_ms: no_baseline(config, "the measurement crashed (#{inspect(reason)})")
+     }}
+  end
+
   # A close task's exit, returned or crashed: either way there is nothing further
   # for an open parked behind it to wait on.
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
@@ -438,7 +462,13 @@ defmodule Cairn.Native.Host do
 
   defp open_engine(state, nil) do
     # The normal state until a camera's profile is routed here.
-    %{state | engine: nil, engine_state: :not_configured, cpu_baseline_ms: nil}
+    %{
+      state
+      | engine: nil,
+        engine_state: :not_configured,
+        cpu_baseline_ms: nil,
+        baseline_task: nil
+    }
   end
 
   defp open_engine(state, raw) do
@@ -481,17 +511,6 @@ defmodule Cairn.Native.Host do
   defp load_model(state, config, canary) do
     state = %{state | canary_state: canary}
 
-    # Measured BEFORE the engine exists, and the order is load-bearing:
-    # engine init registers the QNN plugin EP with the process-wide ORT
-    # environment, and a "CPU" session created after that registration has
-    # been observed executing on the HTP — 60.8 ms for a model whose true
-    # CPU pass exceeds 40 s — collapsing the D-P5 ratio to ~1x and pinning
-    # the health verdict at a false :wedged from 30 s after every boot.
-    # Before any registration, the CPU is the only venue there is. A model
-    # too big to finish the measurement inside the timeout yields nil —
-    # :not_applicable — which is the honest verdict, not a fabricated one.
-    baseline = measure_baseline(state, config)
-
     case state.ort.init(config) do
       {:ok, engine} ->
         Logger.info(
@@ -499,12 +518,8 @@ defmodule Cairn.Native.Host do
             "(canary #{inspect(canary)})"
         )
 
-        %{
-          state
-          | engine: engine,
-            engine_state: :ready,
-            cpu_baseline_ms: baseline
-        }
+        %{state | engine: engine, engine_state: :ready, cpu_baseline_ms: nil}
+        |> start_baseline(config)
 
       {:error, {reason, message}} ->
         refuse(state, {reason, message}, "init/1 refused #{config.model}: #{reason} #{message}")
@@ -516,7 +531,7 @@ defmodule Cairn.Native.Host do
 
   defp refuse(state, engine_state, message) do
     Logger.error("cairn-native: " <> message)
-    %{state | engine: nil, engine_state: engine_state, cpu_baseline_ms: nil}
+    %{state | engine: nil, engine_state: engine_state, cpu_baseline_ms: nil, baseline_task: nil}
   end
 
   # `Cairn.Native.Health` cannot judge an accelerator without knowing what one
@@ -527,52 +542,40 @@ defmodule Cairn.Native.Host do
   # executing on the HTP (60.8 ms for a model whose true CPU pass exceeds
   # 40 s) — collapsing the D-P5 ratio to ~1x and pinning health at a false
   # :wedged. A subprocess makes the venue structural on every reload and
-  # restart, and its timeout is a kill rather than an orphaned native call.
-  # `nil` is the monitor's `:not_applicable`, which is where a node with no
-  # number to compare against already sits.
-  defp measure_baseline(state, config) do
+  # restart, and its deadline is a kill rather than an orphaned native call.
+  #
+  # ASYNCHRONOUS, in one stage under one deadline, because the subprocess made
+  # both earlier shapes obsolete: nothing about the venue requires measuring
+  # before init anymore, so the engine serves cameras immediately and health
+  # reads :not_applicable until the number lands; and every early-abort
+  # staging tried so far could reject a run the full deadline would have
+  # completed (the probe pays the model open AND a warmup, so no short
+  # deadline can be sized from pass arithmetic alone). A model too big to
+  # finish inside the deadline costs one killed subprocess in the background
+  # and stays at nil — the monitor's honest :not_applicable.
+  defp start_baseline(state, config) do
     cond do
       not NativeConfig.accelerator?(config) ->
-        nil
+        %{state | baseline_task: nil}
 
-      # init/1 is about to refuse with the real error; a subprocess run
-      # would only put noise ahead of it.
+      # The engine has already refused or will serve without a baseline
+      # either way; a subprocess run against a missing file is only noise.
       not File.exists?(config.model) ->
-        nil
+        %{state | baseline_task: nil}
 
       true ->
-        probe_then_measure(state, config)
+        passes = Keyword.get(state.opts, :baseline_passes, @baseline_passes)
+        timeout = Keyword.get(state.opts, :baseline_timeout_ms, @baseline_timeout_ms)
+        opts = state |> canary_opts() |> Keyword.put(:timeout_ms, timeout)
+        canary = state.canary
+
+        task =
+          Task.Supervisor.async_nolink(Cairn.TaskSupervisor, fn ->
+            canary.cpu_baseline(config, passes, opts)
+          end)
+
+        %{state | baseline_task: %{ref: task.ref, config: config}}
     end
-  end
-
-  # One pass under a short deadline decides whether the median is worth
-  # paying for: a model that cannot finish a single CPU pass quickly cannot
-  # produce a full median inside the timeout either. Each stage is its own
-  # subprocess, so a stage that misses its deadline is killed outright — a
-  # model too big for a CPU baseline costs the probe deadline once, and nil
-  # is already the honest verdict.
-  defp probe_then_measure(state, config) do
-    probe_timeout =
-      Keyword.get(state.opts, :baseline_probe_timeout_ms, @baseline_probe_timeout_ms)
-
-    case state.canary.cpu_baseline(config, 1, baseline_opts(state, probe_timeout)) do
-      {:ok, _one_pass_ms} -> full_measurement(state, config)
-      {:error, why} -> no_baseline(config, why)
-    end
-  end
-
-  defp full_measurement(state, config) do
-    passes = Keyword.get(state.opts, :baseline_passes, @baseline_passes)
-    timeout = Keyword.get(state.opts, :baseline_timeout_ms, @baseline_timeout_ms)
-
-    case state.canary.cpu_baseline(config, passes, baseline_opts(state, timeout)) do
-      {:ok, ms} -> baseline({:ok, ms}, config)
-      {:error, why} -> no_baseline(config, why)
-    end
-  end
-
-  defp baseline_opts(state, timeout_ms) do
-    state |> canary_opts() |> Keyword.put(:timeout_ms, timeout_ms)
   end
 
   defp baseline({:ok, ms}, config) when is_number(ms) and ms > 0 do

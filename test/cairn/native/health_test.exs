@@ -409,10 +409,21 @@ defmodule Cairn.Native.HealthTest do
 
       assert passes in 1..64
 
+      # the measurement is asynchronous; the verdict below needs it landed
+      await_baseline(host)
       push(host, id, 10)
 
       assert Host.check_health(host) == :healthy
       assert Host.status(host).cpu_baseline_ms == 45.0
+    end
+
+    defp await_baseline(host, attempts \\ 200) do
+      state = :sys.get_state(host)
+
+      unless state.baseline_task == nil or attempts == 0 do
+        Process.sleep(5)
+        await_baseline(host, attempts - 1)
+      end
     end
 
     test "a CPU backend measures nothing: it is the baseline", %{id: id} do

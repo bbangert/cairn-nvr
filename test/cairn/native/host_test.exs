@@ -604,38 +604,48 @@ defmodule Cairn.Native.HostTest do
   end
 
   describe "the CPU baseline's venue and cost" do
-    # The measurement goes through the CANARY — a fresh OS process per stage —
+    # The measurement goes through the CANARY — a fresh, killable OS process —
     # never this VM's ort module: the QNN EP registration is process-wide and
     # permanent, so after the first engine load an in-VM "CPU" session cannot
     # prove its venue (observed on the board: 60.8 ms for a model whose true
     # CPU pass exceeds 40 s, pinning health at a false :wedged on every boot,
-    # reload and restart).
-    test "probes with one pass before paying for the median, both via the canary" do
+    # reload and restart). And ASYNCHRONOUSLY: the subprocess freed the
+    # measurement from init ordering, so the engine serves immediately and
+    # the number lands when it lands.
+    defp settled_baseline(host, attempts \\ 200) do
+      state = :sys.get_state(host)
+
+      if state.baseline_task == nil or attempts == 0 do
+        state.cpu_baseline_ms
+      else
+        Process.sleep(5)
+        settled_baseline(host, attempts - 1)
+      end
+    end
+
+    test "measures via the canary, after init, in one deadline" do
       host = start_host(config: %{model: @stub_onnx, backend: "qnn"})
 
-      assert_receive {:cpu_baseline, %{model: @stub_onnx}, 1, probe_opts}
-      assert_receive {:cpu_baseline, %{model: @stub_onnx}, 5, full_opts}
+      # init is not gated on the measurement
       assert_receive {:init, %{model: @stub_onnx}}
-      # each stage carries its own deadline: the probe's short one is what
-      # bounds a doomed measurement
-      assert probe_opts[:timeout_ms] < full_opts[:timeout_ms]
-      assert GenServer.call(host, :probe).cpu_baseline_ms == 45.0
+      assert_receive {:cpu_baseline, %{model: @stub_onnx}, 5, opts}
+      assert is_integer(opts[:timeout_ms])
+      assert settled_baseline(host) == 45.0
       # the in-VM measurement NIF is never consulted
       refute_received {:cpu_baseline_ms, _config, _passes}
     end
 
-    test "a probe the canary cannot finish yields no baseline and no median attempt" do
+    test "a measurement the canary cannot finish yields no baseline" do
       control(%{cpu_baseline: {:error, "no CPU baseline within the timeout: it said nothing"}})
 
       log =
         capture_log(fn ->
           host = start_host(config: %{model: @stub_onnx, backend: "qnn"})
 
-          assert GenServer.call(host, :probe).cpu_baseline_ms == nil
+          assert settled_baseline(host) == nil
         end)
 
-      assert_received {:cpu_baseline, _config, 1, _opts}
-      refute_received {:cpu_baseline, _config, 5, _opts}
+      assert_received {:cpu_baseline, _config, 5, _opts}
       assert log =~ "no CPU baseline"
     end
 
