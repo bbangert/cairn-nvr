@@ -36,6 +36,8 @@ defmodule Cairn.Native.Canary do
   # `:canary_module` seam fails at compile time rather than in whatever test
   # reaches for it next.
   @callback probe(Config.t(), keyword()) :: result()
+  @callback cpu_baseline(Config.t(), pos_integer(), keyword()) ::
+              {:ok, float()} | {:error, String.t()}
   @behaviour __MODULE__
 
   @doc """

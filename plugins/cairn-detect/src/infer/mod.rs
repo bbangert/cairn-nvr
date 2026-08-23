@@ -48,7 +48,9 @@ pub(super) const MAX_DETS: usize = 32;
 // that were `pub` only because everything shared one module are named nowhere
 // outside `infer` and are no longer re-exported (T1.4).
 pub use backend::{BackendKind, QnnOptions};
-pub use baseline::{cpu_baseline_ms, BASELINE_PASSES};
+pub use baseline::{
+    cpu_baseline_ms, measure_cpu_baseline, open_baseline_detector, BASELINE_PASSES,
+};
 pub use detector::Detector;
 pub use embedder::{embed_persons, quantize_base64, Embedder};
 pub use geometry::{Fit, InputSize, Projection};

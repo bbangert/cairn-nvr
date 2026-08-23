@@ -13,6 +13,7 @@ defmodule Cairn.CanaryStub do
     Map.get(control, :canary, :ok)
   end
 
+  @impl true
   def cpu_baseline(config, passes, opts) do
     control = :persistent_term.get(Cairn.NativeStub.control(), %{})
     if pid = control[:test], do: send(pid, {:cpu_baseline, config, passes, opts})

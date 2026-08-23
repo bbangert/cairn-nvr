@@ -182,16 +182,20 @@ pub fn cpu_baseline_ms(config: &InitConfig, passes: usize) -> Result<f64> {
     // QNN EP library is registered here, the venue is no longer provably the
     // CPU. The host measures through `cairn-detect --cpu-baseline` (a fresh
     // subprocess) for exactly that reason; this NIF entry point remains for
-    // tooling on nodes that never touch QNN.
-    let median = infer::cpu_baseline_ms(
+    // tooling on nodes that never touch QNN. The two phases keep their own
+    // reasons, as Engine::open's callers expect: an unloadable model is
+    // model_load, only a failed pass is infer.
+    let mut detector = infer::open_baseline_detector(
         &config.model,
         config.input_size,
         config.model_profile,
         &labels,
         config.allow_label_mismatch,
-        passes,
     )
-    .map_err(|e| NativeError::Infer(chain(&e)))?;
+    .map_err(|e| NativeError::ModelLoad(chain(&e)))?;
+
+    let median = infer::measure_cpu_baseline(&mut detector, &labels, passes)
+        .map_err(|e| NativeError::Infer(chain(&e)))?;
 
     note!(
         "cairn-ort cpu baseline: model={} median={median:.2}ms over {passes} pass(es)",

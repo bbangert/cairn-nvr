@@ -30,12 +30,53 @@ pub const BASELINE_PASSES: std::ops::RangeInclusive<usize> = 1..=64;
 /// Median CPU model-pass latency, milliseconds: one untimed warmup (an ORT
 /// session's first run pays for lazy allocations a steady-state pass does
 /// not), then `passes` timed passes on a deterministic synthetic input.
+///
+/// Two phases on purpose, so a caller that distinguishes "the model would
+/// not open" from "a pass failed" (the cairn-ort NIF's `model_load` vs
+/// `infer` reasons) can map each half to its own class.
 pub fn cpu_baseline_ms(
     model: &Path,
     input_size: Option<InputSize>,
     model_profile: Option<ModelProfile>,
     labels: &Labels,
     allow_label_mismatch: bool,
+    passes: usize,
+) -> Result<f64> {
+    let mut detector = open_baseline_detector(
+        model,
+        input_size,
+        model_profile,
+        labels,
+        allow_label_mismatch,
+    )?;
+    measure_cpu_baseline(&mut detector, labels, passes)
+}
+
+/// The open phase alone: a failure here is the model or the session, never
+/// a pass.
+pub fn open_baseline_detector(
+    model: &Path,
+    input_size: Option<InputSize>,
+    model_profile: Option<ModelProfile>,
+    labels: &Labels,
+    allow_label_mismatch: bool,
+) -> Result<Detector> {
+    Detector::open(
+        model,
+        BackendKind::Ort,
+        input_size,
+        model_profile,
+        labels,
+        allow_label_mismatch,
+        QnnOptions::default(),
+    )
+    .context("opening the CPU baseline detector")
+}
+
+/// The measurement phase alone, on an already-open detector.
+pub fn measure_cpu_baseline(
+    detector: &mut Detector,
+    labels: &Labels,
     passes: usize,
 ) -> Result<f64> {
     if !BASELINE_PASSES.contains(&passes) {
@@ -45,17 +86,6 @@ pub fn cpu_baseline_ms(
             BASELINE_PASSES.end()
         );
     }
-
-    let mut detector = Detector::open(
-        model,
-        BackendKind::Ort,
-        input_size,
-        model_profile,
-        labels,
-        allow_label_mismatch,
-        QnnOptions::default(),
-    )
-    .context("opening the CPU baseline detector")?;
 
     let size = detector.input_spec().size;
     // Deterministic and not all zeros: a constant-zero tensor is exactly what

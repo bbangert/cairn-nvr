@@ -59,9 +59,13 @@ defmodule Cairn.Native.Host do
   # Past the bound the node runs without a D-P5 ratio.
   @baseline_passes 5
   @baseline_timeout_ms 60_000
-  # The probe's deadline: one CPU pass that cannot beat this is a model with
-  # no CPU baseline, not a slow measurement.
-  @baseline_probe_timeout_ms 10_000
+  # The probe runs TWO passes (--cpu-baseline always warms up untimed first),
+  # so its deadline is the median's per-pass budget times two: the median is
+  # warmup + @baseline_passes = 6 passes inside @baseline_timeout_ms, i.e.
+  # 10 s a pass — a model that cannot do two passes in 20 s cannot do six in
+  # 60. Sized tighter, the probe would discard baselines the median deadline
+  # could still afford. Keep this ratio when touching any of the three.
+  @baseline_probe_timeout_ms 20_000
 
   @engine_fatal [:model_load, :model_poisoned]
   @stream_fatal [:closed, :poisoned, :panicked]
