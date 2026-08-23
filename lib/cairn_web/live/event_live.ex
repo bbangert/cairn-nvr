@@ -57,16 +57,21 @@ defmodule CairnWeb.EventLive do
       event ->
         if connected?(socket), do: Cairn.Event.subscribe()
 
+        # Read per mount, so an operator tuning the number sees it on the
+        # next load of an event that already exists — nothing is stored
+        # with the offset applied (`Cairn.Config.annotation_offset_ms/2`).
+        offset_s = annotation_offset_s(event.camera_id)
+
         socket =
           assign(socket,
             event: event,
             page_title: "Event #{String.slice(id, 0, 8)}",
             from_tracks?: params["track"] != nil,
-            initial_t: initial_t(params["t"]),
-            # Read per mount, so an operator tuning the number sees it on the
-            # next load of an event that already exists — nothing is stored
-            # with the offset applied (`Cairn.Config.annotation_offset_ms/2`).
-            annotation_offset_s: annotation_offset_s(event.camera_id)
+            # `?t=` carries detection-clock seconds like every annotation, so
+            # a linked seek gets this camera's offset exactly as a rendered
+            # marker does — applied at consumption, so links stay portable.
+            initial_t: seek_t(initial_t(params["t"]), offset_s),
+            annotation_offset_s: offset_s
           )
 
         # `Events.get/1` stays in both mounts — it decides the 404 — but the
@@ -228,7 +233,10 @@ defmodule CairnWeb.EventLive do
       |> Enum.flat_map(fn {_track, _nth, rows} -> Enum.map(rows, & &1.at) end)
       |> Tracks.moment_clips(event.camera_id, event.id)
 
-    objects = Enum.map(shaped, fn {t, nth, rows} -> object(t, nth, rows, clips, event) end)
+    offset_s = socket.assigns.annotation_offset_s
+
+    objects =
+      Enum.map(shaped, fn {t, nth, rows} -> object(t, nth, rows, clips, event, offset_s) end)
 
     assign(socket,
       objects: objects,
@@ -267,14 +275,14 @@ defmodule CairnWeb.EventLive do
     pairs
   end
 
-  defp object(track, nth, rows, clips, event) do
+  defp object(track, nth, rows, clips, event, offset_s) do
     %{
       id: track.id,
       label: track.label || "unknown",
       score: fmt_score(track.best_score),
       color: EventsLive.track_color(track.label, nth),
       chip_style: EventsLive.label_chip_style(track.label),
-      moments: Enum.map(rows, &moment(&1, clips, event, track.id))
+      moments: Enum.map(rows, &moment(&1, clips, event, track.id, offset_s))
     }
   end
 
@@ -283,14 +291,16 @@ defmodule CairnWeb.EventLive do
   # seek — the same treatment the detection markers get. A moment inside
   # another surviving clip is a link that carries the object and the offset
   # across. A moment no clip contains is inert.
-  defp moment(row, clips, event, object_id) do
+  defp moment(row, clips, event, object_id, offset_s) do
     base = %{icon: row.icon, text: row.text, suffix: row.suffix, title: row.title}
 
     case Map.fetch!(clips, row.at) do
       :here ->
+        # A moment's time is a detection-clock annotation like every marker,
+        # so its seek carries the same camera offset.
         Map.merge(base, %{
           mode: :seek,
-          t: max(DateTime.diff(row.at, event.started_at), 0),
+          t: seek_t(max(DateTime.diff(row.at, event.started_at), 0), offset_s),
           clock: TrackMoments.fmt_clock(event.started_at, row.at)
         })
 
@@ -465,6 +475,16 @@ defmodule CairnWeb.EventLive do
       {seconds, ""} when seconds >= 0 -> seconds
       _not_a_seek -> nil
     end
+  end
+
+  defp seek_t(nil, _offset_s), do: nil
+
+  # Whole results render as integers so a zero-offset camera's seeks keep
+  # their exact pre-offset spelling; only a fractional offset adds a decimal.
+  defp seek_t(seconds, offset_s) do
+    rounded = Float.round(max(seconds + offset_s, 0.0), 1)
+    truncated = trunc(rounded)
+    if rounded == truncated, do: truncated, else: rounded
   end
 
   defp fmt_bytes(nil), do: "—"

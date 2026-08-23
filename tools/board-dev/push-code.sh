@@ -76,18 +76,29 @@ tar xzf /tmp/push.tgz
 for d in lib/*/; do
   name=$(basename "$d")
   app=${name%-*}
-  installed=""
-  for target in /app/lib/"$app"-*; do
-    [ -d "$target" ] || continue
-    cp -r "$d". "$target"/
-    installed=1
-  done
-  # Fatal, not a warning: the release boot script cannot load an app the
-  # image never shipped, so restarting would report success on a broken node.
-  if [ -z "$installed" ]; then
-    echo "push: no installed dir for $name — a new dep needs a real image" >&2
-    exit 1
+  # The pushed start.boot names each app's VERSIONED ebin dir, so a locally
+  # bumped app must be installed under the PUSH'S name — copying into the
+  # image's old-version dir would leave the new boot pointing at directories
+  # that were never created. A same-version push resolves to the same dir.
+  if [ ! -d /app/lib/"$name" ]; then
+    exists=""
+    for target in /app/lib/"$app"-*; do
+      [ -d "$target" ] && exists="$target"
+    done
+    # Fatal, not a warning: the release boot script cannot load an app the
+    # image never shipped, so restarting would report success on a broken
+    # node.
+    if [ -z "$exists" ]; then
+      echo "push: no installed dir for $name — a new dep needs a real image" >&2
+      exit 1
+    fi
+    mkdir -p /app/lib/"$name"
+    # A bumped app keeps the image's priv (native .so's never ride the push).
+    if [ -d "$exists"/priv ]; then
+      cp -r "$exists"/priv /app/lib/"$name"/
+    fi
   fi
+  cp -r "$d". /app/lib/"$name"/
 done
 # By existing dir, not by version — like the app loop above: a local
 # version bump must not silently skip the config files while still

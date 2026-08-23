@@ -285,11 +285,24 @@ defmodule CairnWeb.DashboardLive do
   # LiveView diff bytes at sample rate.
   defp box_style(bbox, dims) do
     [x, y, w, h] = cover_correct(bbox, dims)
-    left = clamp(x * 100)
-    top = clamp(y * 100)
+    # Intersect with the tile BEFORE the inset clamps: correction can push a
+    # box partly or wholly into the cropped-away region, and the origin-only
+    # clamp would render a cropped-off box as a sliver pinned to the tile
+    # edge instead of removing the cropped span.
+    x2 = min(x + w, 1.0)
+    y2 = min(y + h, 1.0)
+    x = max(x, 0.0)
+    y = max(y, 0.0)
 
-    "position: absolute; left: #{left}%; top: #{top}%; " <>
-      "width: #{clamp_span(w * 100, left)}%; height: #{clamp_span(h * 100, top)}%;"
+    if x2 <= x or y2 <= y do
+      "display: none;"
+    else
+      left = clamp(x * 100)
+      top = clamp(y * 100)
+
+      "position: absolute; left: #{left}%; top: #{top}%; " <>
+        "width: #{clamp_span((x2 - x) * 100, left)}%; height: #{clamp_span((y2 - y) * 100, top)}%;"
+    end
   end
 
   # The tile is a fixed 16:9 box and the video inside it is `object-fit:

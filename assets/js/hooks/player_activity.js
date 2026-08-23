@@ -21,13 +21,16 @@
 // Both callers reach here with a frame decoded, so videoWidth/videoHeight
 // are real rather than the 0 they read before metadata.
 export function reportActive(hook, video) {
-  if (hook._playerActive) return
+  const width = video.videoWidth
+  const height = video.videoHeight
+  // A later loadeddata is only a duplicate while the intrinsic dims are
+  // unchanged: a source reset can change resolution, and the server corrects
+  // box geometry with whatever it was last told.
+  if (hook._playerActive && hook._reportedW === width && hook._reportedH === height) return
   hook._playerActive = true
-  hook.pushEvent("webrtc_active", {
-    camera_id: hook.cameraId,
-    width: video.videoWidth,
-    height: video.videoHeight,
-  })
+  hook._reportedW = width
+  hook._reportedH = height
+  hook.pushEvent("webrtc_active", {camera_id: hook.cameraId, width, height})
 }
 
 export function reportInactive(hook) {

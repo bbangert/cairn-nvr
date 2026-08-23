@@ -307,9 +307,11 @@ const TrackOverlay = {
     const t0 = times[i]
     const t1 = times[i + 1]
     if (t1 - t0 > MAX_LERP_GAP_MS) {
+      // Hold only the OBSERVED endpoint: the sample before the gap was a
+      // real detection worth a brief hold, but rendering t1's box before t1
+      // would invent an annotation inside the gap — and disagree with the
+      // stepped score, which stays t0's until playback reaches t1.
       if (tMs - t0 <= BOX_HOLD_MS) return [track.x[i], track.y[i], track.w[i], track.h[i]]
-      if (t1 - tMs <= BOX_HOLD_MS)
-        return [track.x[i + 1], track.y[i + 1], track.w[i + 1], track.h[i + 1]]
       return null
     }
     const f = t1 > t0 ? Math.min(Math.max((tMs - t0) / (t1 - t0), 0), 1) : 0
