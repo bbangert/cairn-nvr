@@ -2,7 +2,7 @@ import math
 
 import numpy as np
 
-from finite import all_finite, all_finite_or_none, is_finite
+from finite import all_finite, all_finite_in, all_finite_or_none, is_finite
 
 
 def test_is_finite_accepts_real_numbers():
@@ -19,6 +19,15 @@ def test_all_finite():
     assert all_finite(1, 2.0, 0)
     assert not all_finite(1, math.nan)
     assert not all_finite(1, None)
+
+
+def test_all_finite_in_iterables():
+    # The series form: no star-expansion, works on numpy arrays and
+    # generators alike, same fail-closed semantics.
+    assert all_finite_in(np.array([1.0, 2.0]))
+    assert not all_finite_in(np.array([1.0, np.inf]))
+    assert not all_finite_in(v for v in [0.5, math.nan])
+    assert all_finite_in([])
 
 
 def test_numpy_scalars():

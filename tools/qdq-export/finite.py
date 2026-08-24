@@ -21,7 +21,14 @@ def is_finite(v):
 
 
 def all_finite(*values):
+    """For a handful of named scalars. Series and arrays go through
+    all_finite_in — star-expansion would materialize them as one
+    argument tuple."""
     return all(is_finite(v) for v in values)
+
+
+def all_finite_in(iterable):
+    return all(is_finite(v) for v in iterable)
 
 
 def all_finite_or_none(*values):

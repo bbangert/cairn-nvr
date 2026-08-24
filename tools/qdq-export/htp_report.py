@@ -36,7 +36,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from campaign_meta import RunMeta, file_sha256, records_script  # noqa: E402
-from finite import all_finite  # noqa: E402
+from finite import all_finite_in  # noqa: E402
 from score_parity import REPORTABLE, scores  # noqa: E402
 
 REPO_MODEL_DIR = os.path.normpath(
@@ -135,7 +135,7 @@ def _finite_series(series, cache):
     NaN silently, so a poisoned cache would otherwise grade every run of
     the rung SUSPECT (and void the controls) while blaming the board.
     Abort once, at the source, naming the cache to delete."""
-    if not all_finite(*(v for row in series for v in row)):
+    if not all_finite_in(v for row in series for v in row):
         raise SystemExit(
             f"non-finite values in reference series {cache} — local "
             "reference tooling failure, not board evidence; fix the model/"
@@ -257,10 +257,10 @@ def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None,
     # through every threshold below (NaN compares False both ways) into
     # whichever verdict that happens to reach. Data that isn't numbers is
     # not gradable evidence — refuse it before any comparison runs.
-    if not all_finite(*(v for row in htp for v in row)):
+    if not all_finite_in(v for row in htp for v in row):
         return {"verdict": "SUSPECT",
                 "why": "non-finite score values in fetched ndjson"}
-    if not all_finite(*(v for series in (ref_cpu, ref_fp32) for row in series for v in row)):
+    if not all_finite_in(v for series in (ref_cpu, ref_fp32) for row in series for v in row):
         return {"verdict": "SUSPECT",
                 "why": "non-finite values in reference series"}
     spans = person_windows(ref_fp32)

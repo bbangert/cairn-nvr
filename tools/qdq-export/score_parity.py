@@ -41,7 +41,7 @@ import onnxruntime as ort
 from quantize_model import YOLOX_STRIDES, describe, load_image_chw, preprocessing
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from finite import all_finite, is_finite  # noqa: E402
+from finite import all_finite, all_finite_in, is_finite  # noqa: E402
 
 # COCO dense index of "person" in both head orders this tool handles.
 PERSON = 0
@@ -196,7 +196,7 @@ def compare(fp32_path, qdq_path, frame_dir, tolerance=0.9, limit=None, out=sys.s
             file=out,
         )
         flag = ""
-        if not all_finite(*ratios):
+        if not all_finite_in(ratios):
             # np.median of anything non-finite is NaN, and NaN < tolerance
             # is False — the gate would pass a broken window.
             failures.append(
