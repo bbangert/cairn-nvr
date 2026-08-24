@@ -6,14 +6,17 @@ miss-as-zero, non-finite data) is pinned without models or clips."""
 import json
 import math
 
-from campaign_meta import file_sha256
-from htp_report import analyze_run, latency_table, paired_one_to_one
+import pytest
 
-QNN_META = (
-    "backend: qnn profile: yolox insize: 416 sample_fps: 10 min_score: 0.05\n"
-    "feed exited 0\n"
-    "frame.objects lines: 41\n"
-)
+from campaign_meta import file_sha256
+from htp_report import analyze_run, cpu_series, latency_table, model_digest, paired_one_to_one
+from test_campaign_meta import meta_text
+
+# Writer-shaped metas (test_campaign_meta.meta_text mirrors
+# htp_content_test.sh line by line) so the analyzer is never tested
+# against a meta no board could have written.
+QNN_META = meta_text()
+ORT_META = meta_text(backend="ort")
 
 
 def ndjson_line(t, person):
@@ -40,7 +43,9 @@ def ref(values):
     return [(i * 0.2, v, v) for i, v in enumerate(values)]
 
 
-CONFIDENT = [0.95] * 41  # 8 s window, enough pairs to certify
+# 41 instants = 8 s at the 5/s reference cadence — comfortably above
+# MIN_PAIRED=20 so certification-path tests are not INSUFFICIENT.
+CONFIDENT = [0.95] * 41
 
 
 def emissions(values, step=1):
@@ -62,17 +67,55 @@ def test_cap_plateau(tmp_path):
 
 
 def test_offset_uniform_depression(tmp_path):
-    # Defect-2 signature: every score multiplied by the same factor.
+    # Defect-2 signature: every score multiplied by the same factor. The
+    # ramp keeps the top-4 window std at ~0.0078 — above the 0.005
+    # plateau threshold, so this cannot misread as CAP (ratio iqr is 0,
+    # which is what selects OFFSET).
     varying = [0.55 + i * 0.01 for i in range(41)]
     run = write_run(tmp_path, emissions([v * 0.7 for v in varying]))
     r = analyze_run(run, ref(varying), ref(varying))
     assert r["verdict"] == "OFFSET"
 
 
-def test_collapse_no_emissions_in_window(tmp_path):
+def test_collapse_zero_person_in_all_paired_windows(tmp_path):
+    # An emission far outside the person windows still pairs-as-zero at
+    # every reference instant, landing in the htp_max <= 0 branch — the
+    # one that keeps a dead detector from validating via plateau logic.
     run = write_run(tmp_path, [(50.0, 0.9)])
     r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
     assert r["verdict"] == "COLLAPSE"
+    assert r["why"] == "no HTP person detection in any paired reference window"
+
+
+def test_collapse_when_nothing_pairs(tmp_path):
+    # No CPU reference rows near any confident instant -> zero pairs.
+    run = write_run(tmp_path, emissions([0.93] * 41))
+    r = analyze_run(run, [], ref(CONFIDENT))
+    assert r["verdict"] == "COLLAPSE"
+    assert r["why"] == "no HTP detections inside person windows"
+
+
+def test_collapse_cpu_reference_all_zero(tmp_path):
+    # fp32 confident but the artifact's own CPU-EP run reads zero on
+    # every paired frame: the guard that keeps np.median off an empty
+    # array, graded as a CPU-side artifact collapse.
+    run = write_run(tmp_path, emissions([0.93] * 41))
+    r = analyze_run(run, ref([0.0] * 41), ref(CONFIDENT))
+    assert r["verdict"] == "COLLAPSE"
+    assert r["why"].startswith("CPU-EP reference <= 0")
+
+
+def test_no_data_paths(tmp_path):
+    run = tmp_path / "empty-run"
+    run.mkdir()
+    (run / "meta").write_text(QNN_META)
+    r = analyze_run(str(run), ref(CONFIDENT), ref(CONFIDENT))
+    assert r == {"verdict": "NO-DATA", "why": "no ndjson fetched"}
+    # noise-only ndjson: fetched, but zero frame.objects lines
+    run2 = write_run(tmp_path, [])
+    r = analyze_run(run2, ref(CONFIDENT), ref(CONFIDENT))
+    assert r["verdict"] == "NO-DATA"
+    assert r["why"] == "no frame.objects lines"
 
 
 def test_insufficient_pairs(tmp_path):
@@ -85,6 +128,8 @@ def test_insufficient_pairs(tmp_path):
 def test_misses_count_as_zeros(tmp_path):
     # The whole point of pairing from the reference timeline: an
     # emission-anchored comparison would see 21 perfect ratios and PASS.
+    # step=2 emits at even instants only; the 20 odd instants are misses,
+    # each a zero ratio -> below_half == 20.
     run = write_run(tmp_path, emissions([0.95] * 41, step=2))
     r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
     assert r["paired"] == 41
@@ -95,10 +140,7 @@ def test_misses_count_as_zeros(tmp_path):
 def test_score_fidelity_only_grades_covered_instants(tmp_path):
     # The board CPU-EP control cannot emit densely enough; gaps are
     # throughput, graded instants are the fidelity check.
-    run = write_run(
-        tmp_path, emissions([0.95] * 41, step=2),
-        meta=QNN_META.replace("backend: qnn", "backend: ort"),
-    )
+    run = write_run(tmp_path, emissions([0.95] * 41, step=2), meta=ORT_META)
     r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT),
                     score_fidelity_only=True, expected_backend="ort")
     assert r["verdict"] == "PASS"
@@ -115,11 +157,27 @@ def test_nan_scores_are_suspect_not_gradable(tmp_path):
 
 
 def test_nan_reference_is_suspect(tmp_path):
+    # Backstop for series handed to analyze_run directly; the primary
+    # gate is cpu_series aborting at the source (next test).
     run = write_run(tmp_path, emissions([0.93] * 41))
     broken = ref(CONFIDENT[:-1] + [math.nan])
     r = analyze_run(run, broken, ref(CONFIDENT))
     assert r["verdict"] == "SUSPECT"
     assert r["why"] == "non-finite values in reference series"
+
+
+def test_poisoned_reference_cache_aborts_once(tmp_path):
+    # A NaN in the LOCAL reference (model/runner breakage) must abort the
+    # whole report naming the cache — not grade N board runs SUSPECT
+    # while the poisoned cache silently survives regenerations.
+    model = tmp_path / "m.onnx"
+    model.write_bytes(b"model-bytes")
+    frames = tmp_path / "frames-x"
+    frames.mkdir()
+    cache = tmp_path / f"m-{model_digest(str(model))}-frames-x-5.json"
+    cache.write_text("[[0.0, NaN, 0.5]]")
+    with pytest.raises(SystemExit, match="reference tooling failure"):
+        cpu_series(str(model), str(frames), 5, str(tmp_path))
 
 
 def test_stale_evidence_and_backend(tmp_path):
@@ -151,15 +209,23 @@ def test_latency_table_marker_and_staleness(tmp_path):
     runs = tmp_path / "runs"
     run = runs / "bench-100"
     run.mkdir(parents=True)
+    # Verbatim writer formats: bench.sh's meta line carries trailing
+    # fields, and the plugin always prints two decimals.
     (run / "meta").write_text(
-        "model: /data/cairn-bench/artifacts-fixed/foo.onnx backend: qnn\n"
+        "model: /data/cairn-bench/artifacts-fixed/foo.onnx backend: qnn ncams: 1 secs: 60 sample_fps: 30\n"
     )
     (run / "latency").write_text(
-        "infer latency: backend=qnn n=50 p50=10.5ms p95=12.0ms (total 55)\n"
+        "infer latency: backend=qnn n=50 p50=10.50ms p95=12.00ms (total 55)\n"
     )
     marker = tmp_path / ".latency-start"
 
     # no marker file: nothing is current, historical runs are not reported
+    assert latency_table(str(runs), start_marker=str(marker)) == {}
+    # empty and garbage markers must fail CLOSED exactly like a missing
+    # one — start=0 would publish every historical run as current
+    marker.write_text("")
+    assert latency_table(str(runs), start_marker=str(marker)) == {}
+    marker.write_text("not-an-epoch")
     assert latency_table(str(runs), start_marker=str(marker)) == {}
     # marker after the run: still nothing
     marker.write_text("200")

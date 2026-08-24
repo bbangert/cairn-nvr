@@ -17,6 +17,9 @@ import os
 import re
 import sys
 
+# `(\S+)` cannot match a path containing spaces (or busybox's \-escaped
+# names); no board path does today, and a miss fails closed (stale →
+# retry) — but a writer change to spaced paths must revisit this.
 _SHA_LINE = re.compile(r"^([0-9a-f]{64})\s+(\S+)$")
 COMPLETION_MARKER = "frame.objects lines:"
 
@@ -36,18 +39,24 @@ class RunMeta:
     whose meta was never fetched — distinct from an empty file."""
 
     def __init__(self, text):
+        # A meta can be truncated at ANY byte (killed ssh, full disk) —
+        # every parse below must degrade to a missing field, never raise:
+        # one crashing meta would abort the whole report instead of
+        # grading that run SUSPECT.
         self.exists = text is not None
-        self.lines = text.splitlines() if text else []
-        self.shas = {}  # recorded path -> sha, from sha256sum output lines
+        self._text = text or ""
+        self.lines = self._text.splitlines()
+        self.shas = []  # (recorded path, sha) pairs, from sha256sum lines
         self.backend = None
         self.extra_args = None
         self.completion = False
         for line in self.lines:
             m = _SHA_LINE.match(line)
             if m:
-                self.shas[m.group(2)] = m.group(1)
+                self.shas.append((m.group(2), m.group(1)))
             elif line.startswith("backend: "):
-                self.backend = line.split()[1]
+                parts = line.split()
+                self.backend = parts[1] if len(parts) > 1 else None
             elif line.startswith("extra_args:"):
                 rest = line[len("extra_args:"):]
                 self.extra_args = rest[1:] if rest.startswith(" ") else rest
@@ -66,13 +75,16 @@ class RunMeta:
     def records_script(self):
         """False on metas from before the methodology digest: script
         identity is unrecorded, not wrong — callers surface these rather
-        than fail them; the campaign driver regenerates them."""
-        return any(
-            os.path.basename(p) == "htp_content_test.sh" for p in self.shas
-        )
+        than fail them; the campaign driver regenerates them.
+
+        Any mention in the text counts, not just a well-formed sha line:
+        a meta whose script sha line is malformed must stay in the
+        STRICT lane (stale check enforced → STALE-EVIDENCE), because the
+        legacy classification exists for absence, not corruption."""
+        return "htp_content_test.sh" in self._text
 
     def has_sha(self, sha):
-        return sha in self.shas.values()
+        return any(sha == s for _, s in self.shas)
 
     def has_backend(self, backend):
         """Bytes alone don't prove the leg: an ORT run misfiled under a
@@ -132,8 +144,11 @@ def _current(args):
     run can emit a frame before dying, and an old run under the same tag
     can describe different bytes; both must retry."""
     try:
-        with open(os.path.join(args.run_dir, "out.ndjson")) as f:
-            if '"frame.objects"' not in f.read():
+        # errors="replace": a binary-corrupted ndjson is bad EVIDENCE
+        # (rerun, exit 1), not a broken guard — it must not escape as a
+        # UnicodeDecodeError into the rc>=2 lane.
+        with open(os.path.join(args.run_dir, "out.ndjson"), errors="replace") as f:
+            if not any('"frame.objects"' in line for line in f):
                 return False
     except OSError:
         return False
@@ -168,7 +183,15 @@ def main():
     cur.add_argument("--clip", help="local clip whose bytes the run must record")
     cur.add_argument("--require-sha", help="literal sha the meta must record (pinned controls)")
     args = ap.parse_args()
-    sys.exit(0 if _current(args) else 1)
+    # rc contract: 1 = evidence not current (rerun it); >=2 = the GUARD
+    # is broken (argparse 2, this catch-all 3, absent python3 127) — the
+    # bash caller fatals on >=2 rather than silently rerunning an entire
+    # board campaign behind a broken check.
+    try:
+        sys.exit(0 if _current(args) else 1)
+    except Exception as e:  # noqa: BLE001 — anything here is guard breakage
+        print(f"campaign_meta current: {e!r}", file=sys.stderr)
+        sys.exit(3)
 
 
 if __name__ == "__main__":

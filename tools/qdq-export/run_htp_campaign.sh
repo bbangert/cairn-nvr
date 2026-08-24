@@ -70,20 +70,23 @@ fetch() { # <remote path> <local path>  (scp exits 1 on success — check artifa
 # The one shape for "run a board command and read its result": remote()
 # swallows the command's rc (:os.cmd) and forbids pipes (~c|...|), so
 # every caller used to hand-roll write-file/fetch/verify slightly
-# differently — the #138 churn class. Here the command group's output is
-# captured to a tmp file whose truncation makes stale remote content
-# impossible, a sentinel line is appended only if the group exited 0, and
-# success means the fetched copy carries that sentinel — which is then
-# stripped, so callers read exactly the command's output. Commands whose
-# output could itself contain a bare "RV-OK" line have no claim here.
+# differently — the #138 churn class. The command group's output goes to
+# one tmp file and a per-call NONCE goes to a separate .ok file only if
+# the group exited 0; success requires the fetched .ok to carry THIS
+# call's nonce. The nonce is what defeats stale state: /data persists
+# (across reboots too) and tags are shared between call sites, so a
+# leftover .ok from an earlier call verifies nothing — and keeping the
+# sentinel out of the output file means no output shape (missing trailing
+# newline, a sentinel-look-alike line) can defeat or fake it.
 remote_verified() { # <timeout-secs> <tag> <local-dest> <command..., no pipes>
-  local t=$1 tag=$2 dest=$3
+  local t=$1 tag=$2 dest=$3 nonce="RV-$$-$RANDOM-$RANDOM"
   shift 3
-  rm -f "$dest"
-  remote "$t" "{ $*; } > /data/tmp-$tag.txt 2>&1 && echo RV-OK >> /data/tmp-$tag.txt" || return 1
+  rm -f "$dest" "$dest.ok"
+  remote "$t" "rm -f /data/tmp-$tag.ok; { $*; } > /data/tmp-$tag.txt 2>&1 && echo $nonce > /data/tmp-$tag.ok" || return 1
   fetch "/data/tmp-$tag.txt" "$dest" || return 1
-  grep -q "^RV-OK$" "$dest" || return 1
-  sed -i '/^RV-OK$/d' "$dest"
+  fetch "/data/tmp-$tag.ok" "$dest.ok" || return 1
+  grep -qxF "$nonce" "$dest.ok" || return 1
+  rm -f "$dest.ok"
 }
 
 # The 12 board-worthy rungs (phase 2.3 verdicts): every a16 plus the
@@ -147,7 +150,7 @@ do_reboot() {
   # a liveness probe then "succeeds" immediately. The boot id is the
   # witness — wait for it to CHANGE, not for the board to answer. Stale
   # values on either side would fake a verified reboot; remote_verified's
-  # truncate-then-sentinel contract is what rules them out.
+  # per-call nonce is what rules them out (tmp files survive the reboot).
   remote_verified 30 bootid "$HTP/.bootid-before" "cat /proc/sys/kernel/random/boot_id" \
     || { log "FATAL: cannot read boot id"; exit 1; }
   [ -s "$HTP/.bootid-before" ] || { log "FATAL: boot id snapshot is empty"; exit 1; }
@@ -250,6 +253,16 @@ fetched_run_current() { # <tag> <rung-label> <clip> <extra-flags>
   [ "$2" = control-old-nano-a16 ] && args+=(--require-sha "$OLD_NANO_SHA")
   [ -f "$OUT/clips/clip-$3.mp4" ] && args+=(--clip "$OUT/clips/clip-$3.mp4")
   python3 "$HERE/campaign_meta.py" "${args[@]}"
+  local rc=$?
+  # rc 1 = "not current, rerun". rc >= 2 = the GUARD itself is broken
+  # (argparse 2, module catch-all 3, absent python3 127) — fatal, because
+  # a broken guard reads as "rerun everything" and would silently redo an
+  # entire board campaign on every invocation.
+  if [ "$rc" -ge 2 ]; then
+    log "FATAL: retry guard broken (campaign_meta rc $rc) — fix the guard, do not blind-rerun"
+    exit 1
+  fi
+  return "$rc"
 }
 
 content_run() { # <backend> <model-path> <rung-label> <profile> <insize>
@@ -257,11 +270,9 @@ content_run() { # <backend> <model-path> <rung-label> <profile> <insize>
   [ "$backend" = qnn ] && flags=$QNN_FLAGS
   for clip in $CLIPS; do
     local tag="$label-$backend-$clip"
-    # Skip only on evidence of a SUCCESSFUL CURRENT run: emitted frames,
-    # a meta with no suspect verdict, and — when the artifact exists
-    # locally — the meta's recorded model sha matching today's bytes. A
-    # truncated run can emit a frame before dying, and an old run under
-    # the same tag can describe different model bytes; both must retry.
+    # Skip only on evidence of a SUCCESSFUL CURRENT run — the guard's
+    # header above and campaign_meta's `_current` docstring define what
+    # that means; truncated and stale-bytes runs both retry.
     if fetched_run_current "$tag" "$label" "$clip" "$flags"; then
       log "content $tag: already fetched, skip"
       continue
@@ -325,8 +336,12 @@ pin_governor() {
   # as governor-pinned.
   # if/then, not `||`: remote() interpolates into a ~c|...| sigil, so a
   # pipe character would terminate the Elixir literal mid-command.
+  # test ! -s, not -f: a failed save leaves an EMPTY file, and -f would
+  # then refuse to re-save forever while [ -s ] below FATALs every pin —
+  # a wedge only board surgery could clear. A real saved governor is
+  # never empty, so -s preserves the capture-once semantics.
   remote_verified 30 gov-save "$HTP/.gov-saved" \
-    "if test ! -f /data/campaign-gov.saved; then cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > /data/campaign-gov.saved; fi; cat /data/campaign-gov.saved" \
+    "if test ! -s /data/campaign-gov.saved; then cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > /data/campaign-gov.saved; fi; cat /data/campaign-gov.saved" \
     || { log "FATAL: cannot verify saved governor"; exit 1; }
   [ -s "$HTP/.gov-saved" ] || { log "FATAL: saved governor file is empty"; exit 1; }
   remote 30 "for c in /sys/devices/system/cpu/cpu[0-9]*; do echo performance > \$c/cpufreq/scaling_governor; done"
@@ -361,20 +376,26 @@ do_fetch() {
   log "== fetch evidence"
   mkdir -p "$HTP/content"
   fetch /data/cairn-bench/content "$HTP/" || log "WARN: content fetch incomplete"
-  remote_verified 30 runs "$HTP/.runs-list" "ls /data/cairn-bench/runs" \
-    || { log "WARN: cannot list bench runs — skipping bench-run fetch"; return; }
-  # Without a latency-stage marker there are no new bench runs to pull —
-  # and pulling unfiltered would drag in every historical run dir.
-  [ -f "$HTP/.latency-start" ] || { log "no latency marker — skipping bench-run fetch"; return; }
-  local start
-  start=$(cat "$HTP/.latency-start")
-  while read -r d; do
-    local ts=${d##*-}
-    case $ts in *[!0-9]*|'') continue ;; esac
-    if [ "$ts" -ge "$start" ] && [ ! -d "$HTP/runs/$d" ]; then
-      fetch "/data/cairn-bench/runs/$d" "$HTP/runs/" || log "WARN: run $d fetch failed"
-    fi
-  done < "$HTP/.runs-list"
+  # The counts line at the bottom runs on EVERY path — it is the
+  # cross-check fetch()'s survivor caveat promises, and the flaky-board
+  # paths that skip the bench-run pull are exactly where it matters most.
+  if ! remote_verified 30 runs "$HTP/.runs-list" "ls /data/cairn-bench/runs"; then
+    log "WARN: cannot list bench runs — skipping bench-run fetch"
+  elif [ ! -f "$HTP/.latency-start" ]; then
+    # Without a latency-stage marker there are no new bench runs to pull —
+    # and pulling unfiltered would drag in every historical run dir.
+    log "no latency marker — skipping bench-run fetch"
+  else
+    local start
+    start=$(cat "$HTP/.latency-start")
+    while read -r d; do
+      local ts=${d##*-}
+      case $ts in *[!0-9]*|'') continue ;; esac
+      if [ "$ts" -ge "$start" ] && [ ! -d "$HTP/runs/$d" ]; then
+        fetch "/data/cairn-bench/runs/$d" "$HTP/runs/" || log "WARN: run $d fetch failed"
+      fi
+    done < "$HTP/.runs-list"
+  fi
   log "fetched: $(ls "$HTP/content" 2>/dev/null | wc -l) content dirs, $(ls "$HTP/runs" 2>/dev/null | wc -l) bench runs"
 }
 

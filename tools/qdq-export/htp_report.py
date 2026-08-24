@@ -112,7 +112,7 @@ def cpu_series(model_path, frame_dir, fps, cache_dir):
     )
     if os.path.exists(cache):
         with open(cache) as f:
-            return json.load(f)
+            return _finite_series(json.load(f), cache)
     info = describe(model_path)
     layout, w, h = info["layout"], info["width"], info["height"]
     prof = preprocessing(layout)
@@ -126,6 +126,21 @@ def cpu_series(model_path, frame_dir, fps, cache_dir):
         series.append((i / fps, float(person.max()), float(best.max())))
     with open(cache, "w") as f:
         json.dump(series, f)
+    return _finite_series(series, cache)
+
+
+def _finite_series(series, cache):
+    """A reference series is LOCAL tooling — a NaN in it means the model
+    or the runner is broken, not the board evidence, and json round-trips
+    NaN silently, so a poisoned cache would otherwise grade every run of
+    the rung SUSPECT (and void the controls) while blaming the board.
+    Abort once, at the source, naming the cache to delete."""
+    if not all_finite(*(v for row in series for v in row)):
+        raise SystemExit(
+            f"non-finite values in reference series {cache} — local "
+            "reference tooling failure, not board evidence; fix the model/"
+            "runner and delete this cache file"
+        )
     return series
 
 
@@ -347,7 +362,15 @@ def latency_table(runs_dir, start_marker=None, pushed_file=None, art_dir=None):
         # current. The caller prints the absence.
         if not os.path.exists(start_marker):
             return {}
-        start = int(open(start_marker).read().strip() or 0)
+        # A marker that exists but holds no epoch (killed/ENOSPC `echo
+        # $(date +%s) >`) must fail CLOSED like a missing one: start=0
+        # would disable the filter and publish every historical run as
+        # current — the exact opposite of what the report's absence note
+        # promises.
+        raw = open(start_marker).read().strip()
+        if not raw.isdigit():
+            return {}
+        start = int(raw)
     pushed = {}
     if pushed_file and os.path.exists(pushed_file):
         for line in open(pushed_file):

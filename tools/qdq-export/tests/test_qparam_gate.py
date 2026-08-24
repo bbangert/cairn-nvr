@@ -12,8 +12,11 @@ from qparam_gate import GateFailure, check
 
 
 def build(tmp_path, q_scale, zp_dtype=np.uint16, dq_scale=None, dq_zp=None,
-          head_op="Sigmoid"):
-    """<head_op> -> Q -> DQ -> output, the minimal score branch."""
+          head_op="Sigmoid", wire="full"):
+    """<head_op> -> Q -> DQ -> output, the minimal score branch.
+
+    wire="no_dq" stops at Q (output is the quantized tensor);
+    wire="no_q" outputs the head directly with no Q/DQ at all."""
     dq_scale = q_scale if dq_scale is None else dq_scale
     inits = [
         numpy_helper.from_array(np.asarray(q_scale, np.float32), "q_scale"),
@@ -23,15 +26,19 @@ def build(tmp_path, q_scale, zp_dtype=np.uint16, dq_scale=None, dq_zp=None,
             np.asarray(0 if dq_zp is None else dq_zp, zp_dtype), "dq_zp"
         ),
     ]
-    nodes = [
-        helper.make_node(head_op, ["x"], ["s"], name="head"),
-        helper.make_node("QuantizeLinear", ["s", "q_scale", "q_zp"], ["q"]),
-        helper.make_node("DequantizeLinear", ["q", "dq_scale", "dq_zp"], ["y"]),
-    ]
+    nodes = [helper.make_node(head_op, ["x"], ["s"], name="head")]
+    out_name, out_type = "s", TensorProto.FLOAT
+    if wire != "no_q":
+        nodes.append(helper.make_node("QuantizeLinear", ["s", "q_scale", "q_zp"], ["q"]))
+        out_name = "q"
+        out_type = helper.np_dtype_to_tensor_dtype(np.dtype(zp_dtype))
+    if wire == "full":
+        nodes.append(helper.make_node("DequantizeLinear", ["q", "dq_scale", "dq_zp"], ["y"]))
+        out_name, out_type = "y", TensorProto.FLOAT
     graph = helper.make_graph(
         nodes, "g",
         [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 80, 100])],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 80, 100])],
+        [helper.make_tensor_value_info(out_name, out_type, [1, 80, 100])],
         inits,
     )
     model = helper.make_model(
@@ -55,6 +62,36 @@ def test_per_axis_activation_qparams_fail(tmp_path):
     # class on the strength of the first one.
     path = build(tmp_path, np.full(80, PINNED_A16, np.float32))
     with pytest.raises(GateFailure, match="per-tensor required"):
+        check(path, out=io.StringIO())
+
+
+def test_per_axis_dq_side_alone_fails(tmp_path):
+    # The DQ side must be per-tensor INDEPENDENTLY of the Q side — a
+    # regression dropping only the dq_scale_elems check must not survive.
+    path = build(tmp_path, PINNED_A16,
+                 dq_scale=np.full(80, PINNED_A16, np.float32))
+    with pytest.raises(GateFailure, match="per-tensor required"):
+        check(path, out=io.StringIO())
+
+
+def test_q_without_dq_fails(tmp_path):
+    # A Q with no located DQ is the agreement check never having run.
+    path = build(tmp_path, PINNED_A16, wire="no_dq")
+    with pytest.raises(GateFailure, match="no matching DQ"):
+        check(path, out=io.StringIO())
+
+
+def test_unquantized_sigmoid_fails(tmp_path):
+    path = build(tmp_path, PINNED_A16, wire="no_q")
+    with pytest.raises(GateFailure, match="no Q/DQ qparams"):
+        check(path, out=io.StringIO())
+
+
+def test_unpinnable_elem_type_fails(tmp_path):
+    # int16 activations: healthy ceiling, self-consistent Q/DQ — but no
+    # known EP pin to check against, which must fail, not pass by gap.
+    path = build(tmp_path, 3e-5, zp_dtype=np.int16)
+    with pytest.raises(GateFailure, match="no known EP pin"):
         check(path, out=io.StringIO())
 
 
