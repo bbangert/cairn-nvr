@@ -11,7 +11,9 @@ def test_is_finite_accepts_real_numbers():
 
 
 def test_is_finite_closed_by_default():
-    for v in (None, math.nan, math.inf, -math.inf, "0.9", [1.0]):
+    # True/False: bool subclasses int and isfinite(True) is True, but a
+    # JSON `true` where a score belongs is malformed, not the number 1.
+    for v in (None, math.nan, math.inf, -math.inf, "0.9", [1.0], True, False):
         assert not is_finite(v)
 
 

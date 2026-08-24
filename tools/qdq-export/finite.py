@@ -12,7 +12,9 @@ import math
 def is_finite(v):
     """True only for a real, finite number. None, NaN, ±inf, and
     non-numeric values are all non-finite — closed by default."""
-    if v is None:
+    # bool subclasses int and isfinite(True) is True — but a JSON `true`
+    # where a score belongs is malformed evidence, not the number 1.
+    if v is None or isinstance(v, bool):
         return False
     try:
         return math.isfinite(v)

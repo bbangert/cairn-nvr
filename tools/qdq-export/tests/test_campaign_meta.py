@@ -269,6 +269,32 @@ def test_current_cli_requires_parseable_frame_line(tmp_path, interpreter, local_
     assert current_cli(interpreter, run, str(script), "--qnn-library x") == 0
 
 
+def test_current_cli_rejects_partially_poisoned_ndjson(tmp_path, interpreter, local_files):
+    # One valid frame must not vouch for a file whose later frames the
+    # analyzer will refuse — that run needs a rerun, not a permanent skip.
+    script, model, clip = local_files
+    shas = dict(script_sha=file_sha256(str(script)),
+                model_sha=file_sha256(str(model)),
+                clip_sha=file_sha256(str(clip)))
+    good = '{"type":"frame.objects","pts":0,"objects":[{"label":"person","score":0.9}]}\n'
+    cases = {
+        "nanframe": good + '{"type":"frame.objects","pts":90000,"objects":[{"label":"person","score":NaN}]}\n',
+        "boolframe": good + '{"type":"frame.objects","pts":90000,"objects":[{"label":"person","score":true}]}\n',
+        "fieldless": good + '{"type":"frame.objects","pts":90000}\n',
+        "cutline": good + '{"type":"frame.objects","pts":90000,"obj',
+    }
+    for name, ndjson in cases.items():
+        run = write_run(tmp_path, meta_text(**shas), ndjson=ndjson, name=name)
+        assert current_cli(interpreter, run, str(script), "--qnn-library x") == 1, name
+    # a non-frame message merely EMBEDDING the literal is analyzer-ignored
+    # noise, not poison
+    run = write_run(
+        tmp_path, meta_text(**shas),
+        ndjson='{"frame.objects": 1, "type": "log"}\n' + good,
+        name="embedded")
+    assert current_cli(interpreter, run, str(script), "--qnn-library x") == 0
+
+
 def test_binary_corrupted_meta_grades_not_crashes(tmp_path):
     # Invalid UTF-8 in a fetched meta is corrupt EVIDENCE: it must parse
     # (replacement chars -> missing fields -> suspect), never raise into

@@ -18,6 +18,8 @@ import os
 import re
 import sys
 
+from finite import is_finite
+
 # `(\S+)` cannot match a path containing spaces (or busybox's \-escaped
 # names); no board path does today, and a miss fails closed (stale →
 # retry) — but a writer change to spaced paths must revisit this.
@@ -149,17 +151,34 @@ def records_script(run_dir):
     return RunMeta.load(run_dir).records_script
 
 
-def _is_frame_line(line):
-    """The analyzer's acceptance rule (htp_series): a parsed JSON message
-    whose type is frame.objects. A corrupted line that merely CONTAINS
-    the literal would satisfy a substring grep, mark the run current, and
-    let the analyzer grade it NO-DATA forever."""
-    if '"frame.objects"' not in line:
-        return False
-    try:
-        return json.loads(line).get("type") == "frame.objects"
-    except (json.JSONDecodeError, AttributeError):
-        return False
+def _frames_gradable(lines):
+    """True iff the ndjson holds at least one frame.objects message and
+    EVERY one is gradable by the analyzer's rule (htp_series): parseable
+    JSON carrying the exact fields it consumes, with finite pts and
+    scores. Current-but-ungradable is the trap both directions: a
+    corrupted line that merely CONTAINS the literal would read NO-DATA
+    forever, and one valid frame must not vouch for a file whose later
+    frames the analyzer will refuse (SUSPECT) — either way the guard
+    would permanently skip a run that needs rerunning."""
+    saw = False
+    for line in lines:
+        if '"frame.objects"' not in line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(msg, dict) or msg.get("type") != "frame.objects":
+            continue
+        try:
+            pts = msg["frame"]["pts"] if "frame" in msg else msg["pts"]
+            fields = [(o["label"], o["score"]) for o in msg["objects"]]
+        except (KeyError, TypeError):
+            return False
+        if not is_finite(pts) or not all(is_finite(s) for _, s in fields):
+            return False
+        saw = True
+    return saw
 
 
 def _current(args):
@@ -173,7 +192,7 @@ def _current(args):
         # (rerun, exit 1), not a broken guard — it must not escape as a
         # UnicodeDecodeError into the rc>=2 lane.
         with open(os.path.join(args.run_dir, "out.ndjson"), errors="replace") as f:
-            if not any(_is_frame_line(line) for line in f):
+            if not _frames_gradable(f):
                 return False
     except OSError:
         return False

@@ -156,6 +156,15 @@ def test_nan_scores_are_suspect_not_gradable(tmp_path):
     assert r["why"] == "non-finite score values in fetched ndjson"
 
 
+def test_boolean_score_is_suspect(tmp_path):
+    # json `true` where a score belongs: bool subclasses int, so without
+    # the explicit rejection it would grade numerically as 1.
+    run = write_run(tmp_path, emissions([0.93] * 40) + [(8.0, True)])
+    r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
+    assert r["verdict"] == "SUSPECT"
+    assert r["why"] == "non-finite score values in fetched ndjson"
+
+
 def test_overlarge_int_score_is_suspect(tmp_path):
     # json.loads yields a python int too large for float conversion;
     # the guard must grade it, not leak an OverflowError.
