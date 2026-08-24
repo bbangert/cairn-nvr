@@ -95,6 +95,15 @@ defmodule CairnWeb.EventLiveTest do
       refute has_element?(view, ~s(button[data-t="3.0"]))
     end
 
+    test "a ?t= deep link's seek carries the offset too", %{conn: conn} do
+      id = seed_with_entries("cam_dual", [entry(3.0)])
+      {:ok, view, _html} = live(conn, ~p"/events/#{id}?t=3")
+
+      # The linked time is a detection-clock annotation like a marker's, so
+      # returning it to raw seconds while marker tests stay green must fail.
+      assert has_element?(view, ~s([data-initial-t="2.6"]))
+    end
+
     # This timeline's axis is the event, so a shift that would push a marker
     # before its start parks it at the front rather than off the widget.
     test "a shift before the event's start stays signed; only the dot pins to the edge", %{

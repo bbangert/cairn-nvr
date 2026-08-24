@@ -73,6 +73,9 @@ rm -rf push
 mkdir push
 cd push
 tar xzf /tmp/push.tgz
+# EVERY compatibility check runs before the FIRST copy: a refusal
+# mid-install would leave /app a mixture of pushed and image code, which a
+# later container crash would happily boot.
 for d in lib/*/; do
   name=$(basename "$d")
   app=${name%-*}
@@ -100,8 +103,12 @@ for d in lib/*/; do
       echo "push: $name bumps an app whose priv lives in the image — needs a real image" >&2
       exit 1
     fi
-    mkdir -p /app/lib/"$name"
   fi
+done
+# Preflight proved every app installable; nothing below refuses.
+for d in lib/*/; do
+  name=$(basename "$d")
+  mkdir -p /app/lib/"$name"
   cp -r "$d". /app/lib/"$name"/
 done
 # By existing dir, not by version — like the app loop above: a local

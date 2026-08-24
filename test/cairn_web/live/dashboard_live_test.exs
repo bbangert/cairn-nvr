@@ -244,6 +244,20 @@ defmodule CairnWeb.DashboardLiveTest do
       refute has_element?(view, ~s(div[style*="height: 10.0%"]))
     end
 
+    # A 4:3 frame in the 16:9 tile crops the top and bottom 12.5% away. A box
+    # wholly inside that strip corrects to an empty intersection and must
+    # DISAPPEAR — the regression was a sliver pinned to the tile edge.
+    test "a box wholly in the cropped-away strip is not drawn", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      view
+      |> activate("cam_a", %{"width" => 640, "height" => 480})
+      |> publish("cam_a", [detection("person", 0.9, [0.4, 0.02, 0.2, 0.08])])
+
+      assert has_element?(view, ~s(div[style*="display: none"]))
+      refute has_element?(view, ~s(div[style*="top: 0.5%"]))
+    end
+
     test "dimensions are dropped when the player goes away", %{conn: conn} do
       {:ok, view, _html} = live(conn, "/")
       box = [detection("person", 0.9, [0.25, 0.25, 0.5, 0.5])]
