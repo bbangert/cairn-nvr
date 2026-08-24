@@ -153,8 +153,10 @@ defmodule Cairn.Pipeline.Decoder do
   # cooldown, since this is a reconfiguration and not a failure. That includes
   # a decoder learning its geometry for the first time (nil -> real): the
   # SPS-taught decoder it replaces was healthy, and one reopen at the moment a
-  # parser starts declaring is the cost of never running hardware decode
-  # against a geometry nobody confirmed.
+  # parser starts declaring is the cost of a decoder never outliving the
+  # geometry it was built for. (Hardware decode itself no longer rides the
+  # declared numbers alone: the crate defers its open until the stream's own
+  # SPS provides them.)
   @impl true
   def handle_stream_format(:input, %Membrane.H264{} = format, ctx, state) do
     known = state.source
@@ -178,6 +180,13 @@ defmodule Cairn.Pipeline.Decoder do
   # nothing about the new one — `ensure_decoder` retries on the next callback.
   defp reopen_for(%{decoder: :closed} = state, source, _ctx),
     do: %{state | source: source, retry_at: nil}
+
+  # A refused decoder gets one fresh chance from a genuinely different
+  # stream: the refusal was the probe's verdict on the stream it watched,
+  # and a reconfiguration means the operator moved something. Still refused
+  # there, it goes dark again — bounded by reconfigurations, not keyframes.
+  defp reopen_for(%{decoder: :refused} = state, source, _ctx),
+    do: %{state | decoder: :closed, source: source, retry_at: nil}
 
   defp reopen_for(state, source, ctx) do
     Logger.info(
@@ -218,13 +227,19 @@ defmodule Cairn.Pipeline.Decoder do
       emitted: state.emitted,
       replaced: state.replaced,
       errors: state.errors,
-      decoder: if(state.decoder == :closed, do: :closed, else: :open)
+      decoder:
+        case state.decoder do
+          :closed -> :closed
+          :refused -> :refused
+          _open -> :open
+        end
     }
 
     {[notify_parent: {:stats, stats}], state}
   end
 
-  defp decode(%{decoder: :closed} = state, _ctx, _buffer), do: {[], state}
+  defp decode(%{decoder: decoder} = state, _ctx, _buffer) when decoder in [:closed, :refused],
+    do: {[], state}
 
   defp decode(%{decoder: %{ref: ref, module: module}} = state, ctx, buffer) do
     now = System.monotonic_time(:nanosecond)
@@ -234,6 +249,21 @@ defmodule Cairn.Pipeline.Decoder do
       {:ok, {completed, frame}} ->
         state = if sample and completed, do: spend(state, now), else: state
         admit(count(state, completed), frame)
+
+      {:error, {:decoder_refused, message}} ->
+        # Permanent, not a fault to cool down from: reopening would defer and
+        # refuse again, so `:refused` (unlike `:closed`) is a state
+        # `ensure_decoder` never retries out of. The branch goes dark —
+        # recording is unaffected — and the reason reaches `cameras:status`
+        # through the host, because the open that normally records failures
+        # succeeded before the probe could decide.
+        Logger.error(
+          "camera #{state.camera_id}: #{message} — detection is off for this camera; " <>
+            "recording is unaffected"
+        )
+
+        Host.report_decoder_refusal(state.host, state.camera_id, message)
+        {[], state |> drop_decoder(ctx) |> Map.put(:decoder, :refused)}
 
       {:error, {reason, message}} when reason in @fatal ->
         Logger.error(
@@ -341,6 +371,8 @@ defmodule Cairn.Pipeline.Decoder do
   # -- the native decoder's lifecycle ------------------------------------------
 
   defp ensure_decoder(%{decoder: %{}} = state, _ctx), do: state
+
+  defp ensure_decoder(%{decoder: :refused} = state, _ctx), do: state
 
   defp ensure_decoder(%{retry_at: retry_at} = state, ctx) when is_integer(retry_at) do
     if now_ms() >= retry_at, do: open(state, ctx), else: state

@@ -129,6 +129,13 @@ impl DecodeStream {
     pub fn push_au(&mut self, au: &[u8], pts: i64, sample: bool) -> Result<Decoded> {
         let packet = packet_from(au, pts)?;
         if let Err(error) = self.decoder.send_packet(&packet) {
+            // A refusal is the one send error that must NOT be tolerated:
+            // it is permanent, and folding it into the counted skips is how
+            // a named backend's camera would read healthy while decoding
+            // nothing. Its own class so the host records it on status.
+            if let Some(refusal) = error.downcast_ref::<decode::DecoderRefusal>() {
+                return Err(NativeError::DecoderRefused(refusal.0.clone()));
+            }
             // Joining mid-GOP means feeding the decoder frames whose
             // references never arrived; it resyncs on the next keyframe.
             self.note(Tolerated::Decode, &error);
@@ -289,11 +296,19 @@ fn sampled_frame(decoder: &mut dyn Decoder) -> (Option<AVFrame>, Option<anyhow::
 /// caller had it to give.
 ///
 /// Software decode never needs the geometry; it learns it from the first SPS,
-/// which is why this was bare for three phases. A V4L2 M2M decoder does: it
-/// configures its OUTPUT format as the codec context opens, and one opened at
-/// 0x0 opens *successfully* and then answers every frame with `AVERROR_BUG` —
-/// hardware decode that delivers nothing, past the fallback and past every
-/// health check ([`crate::config::DecoderParams::source`]).
+/// which is why this was bare for three phases. A V4L2 M2M decoder
+/// configures its OUTPUT format as the codec context opens, and what it does
+/// without parameter sets depends on what else it was given — opened at 0x0
+/// it succeeded and answered every frame with `AVERROR_BUG`
+/// ([`crate::config::DecoderParams::source`]); opened with real dimensions
+/// but no extradata, QCS6490's venus never returned at all. Both are the
+/// same gap: nothing on this path can hand the open an SPS, because Membrane
+/// delivers parameter sets in band.
+///
+/// So `decode::open` *defers* the hardware probe: this call returns a
+/// software decoder promptly, and the probe re-runs once the stream's own
+/// in-band SPS/PPS provide the extradata — and with it the authoritative
+/// geometry — that the open needs.
 fn open_decoder(params: &DecoderParams) -> Result<Box<dyn Decoder>> {
     #[cfg(test)]
     panic_if_armed_for_open();
@@ -309,8 +324,14 @@ fn open_decoder(params: &DecoderParams) -> Result<Box<dyn Decoder>> {
             raw.height = source.h as i32;
         }
     }
-    let decoder = decode::open(params.kind, &codecpar, params.spec, params.motion)
-        .map_err(|e| NativeError::OpenStream(chain(&e)))?;
+    let decoder = decode::open(
+        params.kind,
+        &codecpar,
+        params.spec,
+        params.motion,
+        decode::NamedFallback::Refused,
+    )
+    .map_err(|e| NativeError::OpenStream(chain(&e)))?;
     require_named_hardware(params.kind, decoder.as_ref())?;
     Ok(decoder)
 }
@@ -329,8 +350,18 @@ fn open_decoder(params: &DecoderParams) -> Result<Box<dyn Decoder>> {
 /// into a restart loop, where here the detect branch goes dark, recording
 /// continues, and the reason reaches `cameras:status`
 /// (`Cairn.Native.Host` records it; `Cairn.Native.Status` headlines it).
+///
+/// A decoder whose hardware probe is deferred passes here on its promise:
+/// at open, `hw_backend()` is `None` because the stream's parameter sets
+/// have not arrived, not because the backend lost. The probe enforces the
+/// named requirement itself when it settles — every packet after a refusal
+/// fails with a `DecoderRefusal`, which [`DecodeStream::push_au`] surfaces
+/// as the `decoder_refused` class for the host to record on status.
 fn require_named_hardware(kind: DecoderKind, decoder: &dyn Decoder) -> Result<()> {
-    if matches!(kind, DecoderKind::Auto | DecoderKind::Sw) || decoder.hw_backend().is_some() {
+    if matches!(kind, DecoderKind::Auto | DecoderKind::Sw)
+        || decoder.hw_backend().is_some()
+        || decoder.hw_pending()
+    {
         return Ok(());
     }
     Err(NativeError::OpenStream(format!(
@@ -450,10 +481,22 @@ mod tests {
         /// decoder, unless a test is asking what happens when the named
         /// backend did open.
         hw: Option<HwBackend>,
+        /// What it answers [`Decoder::hw_pending`] with — a deferred probe
+        /// still waiting for the stream's parameter sets.
+        probing: bool,
+        /// Fail every `send_packet` with a [`decode::DecoderRefusal`] — a
+        /// named backend whose probe settled without opening.
+        refuse: bool,
     }
 
     impl Decoder for Burst {
         fn send_packet(&mut self, _packet: &AVPacket) -> anyhow::Result<()> {
+            if self.refuse {
+                return Err(decode::DecoderRefusal(
+                    "decoder v4l2 was named but did not open".into(),
+                )
+                .into());
+            }
             self.pending = self.per_packet;
             Ok(())
         }
@@ -495,6 +538,10 @@ mod tests {
 
         fn hw_backend(&self) -> Option<HwBackend> {
             self.hw
+        }
+
+        fn hw_pending(&self) -> bool {
+            self.probing
         }
     }
 
@@ -661,6 +708,48 @@ mod tests {
         };
 
         assert!(require_named_hardware(DecoderKind::V4l2, &hardware).is_ok());
+    }
+
+    #[test]
+    fn a_probe_refusal_is_a_hard_error_not_a_tolerated_skip() {
+        use cairn_detect::infer::{InputSize, ResizePolicy, TensorEncoding};
+
+        let mut stream = DecodeStream {
+            camera_id: "cam".into(),
+            decoder: Box::new(Burst {
+                refuse: true,
+                ..burst(1)
+            }),
+            spec: InputSpec {
+                size: InputSize::square(64),
+                encoding: TensorEncoding::UnitRgb,
+                resize: ResizePolicy::Stretch,
+            },
+            decode_errors: 0,
+            convert_errors: 0,
+        };
+
+        let error = match stream.push_au(&[1, 2, 3], 0, false) {
+            Err(error) => error,
+            Ok(_) => panic!("a refusal must be a hard error"),
+        };
+        // Its own class, so the host records it on status; a tolerated skip
+        // here is how a named backend's camera would read healthy while
+        // decoding nothing.
+        assert_eq!(error.reason(), "decoder_refused");
+        assert_eq!(stream.tolerated(), (0, 0));
+    }
+
+    #[test]
+    fn a_named_decoder_still_probing_is_accepted_on_its_promise() {
+        // The deferred probe has not seen the stream's parameter sets yet;
+        // refusal, if it comes, is the probe's own job at settle time.
+        let probing = Burst {
+            probing: true,
+            ..burst(1)
+        };
+
+        assert!(require_named_hardware(DecoderKind::V4l2, &probing).is_ok());
     }
 
     /// The refusal above is only worth anything if `open_decoder` performs it,

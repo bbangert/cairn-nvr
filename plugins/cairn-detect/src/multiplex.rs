@@ -234,8 +234,14 @@ fn open_and_run(
         let stream = &input.streams()[stream_index];
         (
             stream.time_base,
-            decode::open(kind, &stream.codecpar(), input_spec, motion)
-                .with_context(|| format!("opening a decoder for camera {}", spec.id))?,
+            decode::open(
+                kind,
+                &stream.codecpar(),
+                input_spec,
+                motion,
+                decode::NamedFallback::Allowed,
+            )
+            .with_context(|| format!("opening a decoder for camera {}", spec.id))?,
         )
     };
 

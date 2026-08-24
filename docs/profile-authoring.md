@@ -246,8 +246,11 @@ decoded. `backend:` is the **inference** path — what executes the model.
 Naming a hardware video decoder says nothing about where the model runs.
 
 Naming one is a **requirement**: if the device or the hwaccel is missing, the
-decoder refuses to open and the camera's detect branch goes dark with the
-reason on `cameras:status`, while recording carries on. Write `decoder: auto` — the default — to mean "the best available, software
+decoder refuses the software fallback and the camera's detect branch goes dark
+with the reason on `cameras:status`, while recording carries on. (The refusal
+lands when the hardware probe decides, which for a live H.264 stream is at the
+first keyframe: the probe waits for the stream's own SPS/PPS before opening —
+see `decode::open` in `plugins/cairn-detect/src/decode.rs`.) Write `decoder: auto` — the default — to mean "the best available, software
 if that is all there is". The distinction is worth the refusal on a board: on
 QCS6490 the ASIC decodes the whole fleet for about 2% CPU where software decode
 costs several times that per camera — decode is the term this knob controls;

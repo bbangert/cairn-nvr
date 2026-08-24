@@ -22,6 +22,8 @@
 
 use std::fmt;
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -201,6 +203,16 @@ pub trait Decoder: Send {
     /// [`open`] falls back rather than failing, so a caller that named a
     /// backend has no other way to learn whether it got the one it named.
     fn hw_backend(&self) -> Option<HwBackend>;
+
+    /// True while [`open`]'s deferred hardware probe has not decided yet:
+    /// software is decoding, but the stream's first in-band parameter sets
+    /// may still promote it to a hardware backend. A caller enforcing a
+    /// named backend must not read the interim `hw_backend() == None` as
+    /// the final answer — the probe itself refuses the fallback at settle
+    /// time ([`DeferredHwDecoder`]).
+    fn hw_pending(&self) -> bool {
+        false
+    }
 }
 
 /// A decoded frame's own geometry, which is what a projection is built from.
@@ -234,11 +246,30 @@ const MAX_PIXELS: i64 = 32 * 1024 * 1024;
 
 /// Open a decoder for `codecpar`, probing hardware before software.
 ///
-/// Probing happens once at startup. A backend that cannot open — no device,
-/// no driver, no GPU scaler — is logged and skipped; software decode is
-/// always the last resort, including when `--decoder <hw>` names a backend
-/// explicitly. Crash-looping on a box without the hardware would be worse
-/// than running slowly on it.
+/// A backend that cannot open — no device, no driver, no GPU scaler — is
+/// logged and skipped, and software decode is the last resort. What a
+/// *named* backend's failure means is the embedder's to say via `fallback`:
+/// the plugin binary allows the fallback (its refusal would be a process
+/// exit into a restart loop), the NIF path refuses it so the branch goes
+/// dark with the reason surfaced instead of silently decoding at software
+/// cost. At open time both behave alike — the eager path always falls back,
+/// and the NIF's `require_named_hardware` turns that into an open error —
+/// `fallback` decides the *deferred* probe's settle, which happens after
+/// open has already succeeded.
+///
+/// Every hardware open runs under [`HW_OPEN_DEADLINE`] on its own thread: a
+/// wedged driver ioctl otherwise blocks this call indefinitely, and on the
+/// NIF path that is a GenServer timeout and a crash-looping pipeline instead
+/// of a fallback.
+///
+/// For an H.264 stream whose `codecpar` has no extradata — the NIF path,
+/// where Membrane's parser delivers SPS/PPS in band — the hardware probe is
+/// *deferred*: decoding starts in software and the probe runs once the
+/// stream has produced both parameter sets, which become the extradata the
+/// open needs. v4l2m2m in particular negotiates its formats as the context
+/// opens: on QCS6490's venus an open with no extradata never returned,
+/// while the same decoder with parameter sets attached opens immediately.
+///
 /// `motion` is one camera's resolved gate config, or `None` when the gate is
 /// off for it — see [`crate::motion::resolve`]. It reaches the decoder rather
 /// than the inference thread because the detector's state is per camera, and
@@ -248,13 +279,31 @@ pub fn open(
     codecpar: &AVCodecParameters,
     spec: InputSpec,
     motion: Option<MotionConfig>,
+    fallback: NamedFallback,
 ) -> Result<Box<dyn Decoder>> {
     let order = probe_order(kind);
     if order.is_empty() && kind != DecoderKind::Sw && kind != DecoderKind::Auto {
         note!("decoder {kind} is not available on this platform");
     }
+    let bare_h264 = codecpar.codec_id == ffi::AV_CODEC_ID_H264
+        && (codecpar.extradata.is_null() || codecpar.extradata_size <= 0);
+    if !order.is_empty() && bare_h264 {
+        let required = fallback == NamedFallback::Refused && kind != DecoderKind::Auto;
+        let sw = SwDecoder::open(codecpar, spec, motion)?;
+        return Ok(Box::new(DeferredHwDecoder::new(
+            sw,
+            order,
+            spawn_hw_open,
+            clone_codecpar(codecpar)?,
+            spec,
+            motion,
+            required,
+        )));
+    }
     for backend in order {
-        match HwDecoder::open(backend, codecpar, spec, motion) {
+        match clone_codecpar(codecpar)
+            .and_then(|clone| open_hw_bounded(backend, SendCodecpar(clone), spec, motion))
+        {
             Ok(decoder) => return Ok(Box::new(decoder)),
             Err(e) => note!("hardware decoder {backend} unavailable: {e:#}"),
         }
@@ -263,6 +312,18 @@ pub fn open(
         note!("no hardware decoder opened; falling back to software decode");
     }
     Ok(Box::new(SwDecoder::open(codecpar, spec, motion)?))
+}
+
+/// What a named backend's failure to open means for this embedder — see
+/// [`open`]. Only the deferred probe consults it; the eager open falls back
+/// either way and lets the embedder refuse from `hw_backend()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedFallback {
+    /// Settle on software decode with a note.
+    Allowed,
+    /// Refuse: every packet after the settle fails with a [`DecoderRefusal`]
+    /// for the embedder to surface.
+    Refused,
 }
 
 /// Backends to try, in order, for a given `--decoder` value.
@@ -300,6 +361,635 @@ const AUTO_ORDER: &[HwBackend] = &[
 const AUTO_ORDER: &[HwBackend] = &[HwBackend::V4l2];
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const AUTO_ORDER: &[HwBackend] = &[];
+
+/// How long one hardware backend gets to open before it is abandoned.
+///
+/// A healthy open is milliseconds; what this bounds is a driver that never
+/// answers — v4l2m2m blocked in format negotiation is the observed case. An
+/// abandoned open finishes or fails on its own detached thread, where the
+/// decoder it may still produce is dropped and its device fds closed.
+const HW_OPEN_DEADLINE: Duration = Duration::from_secs(3);
+
+/// How many access units without a complete parameter-set pair the deferred
+/// probe tolerates before giving up. 900 is fifteen seconds of 60 fps
+/// access units — three worst-case keyframe intervals at a 5 s GOP — and
+/// software is decoding the whole time, so waiting long costs nothing but a
+/// late note. A stream that never carries SPS/PPS in band left them in
+/// extradata it also did not provide, so hardware was never reachable.
+const DEFER_AU_LIMIT: u32 = 900;
+
+/// A named hardware backend's deferred probe settled without opening.
+///
+/// Its own error type because the embedder must tell this apart from the
+/// tolerated per-packet decode errors: a mid-GOP join heals on the next
+/// keyframe, this never does, and treating it as transient is how a named
+/// backend's camera would read healthy while decoding nothing. cairn-native
+/// downcasts to it in `push_au` and returns its own hard error class.
+#[derive(Debug, Clone)]
+pub struct DecoderRefusal(pub String);
+
+impl fmt::Display for DecoderRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DecoderRefusal {}
+
+/// A full-fidelity copy of stream parameters, extradata included.
+fn clone_codecpar(codecpar: &AVCodecParameters) -> Result<AVCodecParameters> {
+    let mut copy = AVCodecParameters::new();
+    // SAFETY: both structs are valid and owned; avcodec_parameters_copy
+    // resets `copy` and allocates its own extradata, which `copy`'s drop
+    // frees.
+    let ret = unsafe { ffi::avcodec_parameters_copy(copy.deref_mut(), codecpar.as_ptr()) };
+    if ret < 0 {
+        bail!("copying stream parameters failed ({ret})");
+    }
+    Ok(copy)
+}
+
+/// Attach `extradata` to parameters that have none.
+fn set_extradata(codecpar: &mut AVCodecParameters, extradata: &[u8]) -> Result<()> {
+    let size = i32::try_from(extradata.len()).context("extradata larger than an i32")?;
+    // SAFETY: `codecpar` is exclusively owned. The buffer is av_mallocz'd
+    // with the padding libavcodec requires (zeroed by the allocation), and
+    // its ownership transfers to `codecpar`, whose drop frees it; any prior
+    // extradata is freed first so nothing leaks.
+    unsafe {
+        let raw = codecpar.deref_mut();
+        if !raw.extradata.is_null() {
+            ffi::av_freep(std::ptr::addr_of_mut!(raw.extradata).cast());
+            raw.extradata_size = 0;
+        }
+        let padded = extradata.len() + ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
+        let buf = ffi::av_mallocz(padded).cast::<u8>();
+        if buf.is_null() {
+            bail!("out of memory for {padded} bytes of extradata");
+        }
+        std::ptr::copy_nonoverlapping(extradata.as_ptr(), buf, extradata.len());
+        raw.extradata = buf;
+        raw.extradata_size = size;
+    }
+    Ok(())
+}
+
+/// An owned `AVCodecParameters` allowed across the deadline-thread boundary.
+///
+/// The struct is plain heap data with no thread affinity — rsmpeg simply
+/// does not mark its wrappers `Send` — and exclusive ownership moves with
+/// the value.
+struct SendCodecpar(AVCodecParameters);
+
+// SAFETY: see the type's doc — exclusively owned, thread-agnostic data.
+unsafe impl Send for SendCodecpar {}
+
+fn backend_slot(backend: HwBackend) -> usize {
+    match backend {
+        HwBackend::Vaapi => 0,
+        HwBackend::Qsv => 1,
+        HwBackend::Nvdec => 2,
+        HwBackend::V4l2 => 3,
+        #[cfg(target_os = "macos")]
+        HwBackend::Videotoolbox => 4,
+    }
+}
+
+/// A backend whose open timed out is never probed again in this process:
+/// the abandoned thread and its device fd are leaked by the driver's own
+/// refusal to answer, and every reopen would leak another set.
+fn wedged(backend: HwBackend) -> &'static AtomicBool {
+    static WEDGED: [AtomicBool; 5] = [const { AtomicBool::new(false) }; 5];
+    &WEDGED[backend_slot(backend)]
+}
+
+/// The right to be the one probe running against a backend, held RAII-style.
+///
+/// One probe per backend at a time. Without this the wedge latch races: a
+/// fleet's cameras all read not-wedged together and each spawns its own
+/// doomed open before the first can time out and store, leaking one thread
+/// and fd per camera — the exact set the latch bounds. It is a claim rather
+/// than a lock because the deferred probe runs inside `decode_au` on a
+/// dirty-CPU scheduler thread, where blocking on another camera's probe
+/// would hold a scheduler the whole VM shares — a caller whose claim fails
+/// keeps decoding in software and tries again on a later access unit.
+struct ProbeClaim(HwBackend);
+
+impl ProbeClaim {
+    fn take(backend: HwBackend) -> Option<Self> {
+        probe_claim_slot(backend)
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+            .then_some(Self(backend))
+    }
+}
+
+impl Drop for ProbeClaim {
+    fn drop(&mut self) {
+        probe_claim_slot(self.0).store(false, Ordering::Release);
+    }
+}
+
+fn probe_claim_slot(backend: HwBackend) -> &'static AtomicBool {
+    static CLAIMS: [AtomicBool; 5] = [const { AtomicBool::new(false) }; 5];
+    &CLAIMS[backend_slot(backend)]
+}
+
+/// Start one backend open on its own thread; the result arrives on the
+/// channel. The claim must already be held and lives as long as the probe.
+fn spawn_hw_open(
+    backend: HwBackend,
+    codecpar: SendCodecpar,
+    spec: InputSpec,
+    motion: Option<MotionConfig>,
+) -> Result<mpsc::Receiver<Result<HwDecoder>>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name(format!("hw-open-{backend}"))
+        .spawn(move || {
+            let SendCodecpar(codecpar) = codecpar;
+            // A receiver that gave up dropped its end; the decoder drops
+            // here with the failed send.
+            let _ = tx.send(HwDecoder::open(backend, &codecpar, spec, motion));
+        })
+        .context("spawning the hardware open thread")?;
+    Ok(rx)
+}
+
+/// [`HwDecoder::open`] under a deadline, synchronously — the *eager* path
+/// (extradata already in the container/SDP), which runs on the plugin
+/// binary's own per-stream threads or a once-per-open NIF call, where a
+/// bounded wait is affordable. The budget is two deadlines total: at most
+/// one predecessor's in-flight probe waited out, plus this caller's own —
+/// so the wait is inside the bound, not stacked on top of it.
+fn open_hw_bounded(
+    backend: HwBackend,
+    codecpar: SendCodecpar,
+    spec: InputSpec,
+    motion: Option<MotionConfig>,
+) -> Result<HwDecoder> {
+    let started = Instant::now();
+    let budget = HW_OPEN_DEADLINE * 2;
+    let claim = loop {
+        if wedged(backend).load(Ordering::Relaxed) {
+            bail!("timed out earlier in this process; not probing it again");
+        }
+        if let Some(claim) = ProbeClaim::take(backend) {
+            break claim;
+        }
+        if started.elapsed() >= budget {
+            bail!("another probe held {backend} past the deadline; falling back");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let _claim = claim;
+    let rx = spawn_hw_open(backend, codecpar, spec, motion)?;
+    let remaining = budget
+        .saturating_sub(started.elapsed())
+        .max(HW_OPEN_DEADLINE);
+    match rx.recv_timeout(remaining.min(HW_OPEN_DEADLINE)) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            wedged(backend).store(true, Ordering::Relaxed);
+            bail!(
+                "did not open within {}s — abandoned as wedged, and not probed \
+                 again in this process",
+                HW_OPEN_DEADLINE.as_secs()
+            );
+        }
+        // The thread can only drop `tx` without sending by dying first.
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("the open thread panicked before answering")
+        }
+    }
+}
+
+/// The in-band SPS and PPS of one access unit, if it carries them.
+///
+/// Both `None` for a mid-GOP join; cameras that send the sets in separate
+/// access units are why the probe accumulates across calls rather than
+/// demanding both at once.
+fn parameter_sets(au: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let mut sps = None;
+    let mut pps = None;
+    for nal in annexb_nals(au) {
+        match nal.first().map(|byte| byte & 0x1f) {
+            Some(7) => sps = Some(nal.to_vec()),
+            Some(8) => pps = Some(nal.to_vec()),
+            _ => {}
+        }
+    }
+    (sps, pps)
+}
+
+/// H.264 extradata from a parameter-set pair: Annex-B start codes, SPS then
+/// PPS — the form the `h264` and `h264_v4l2m2m` decoders accept.
+fn extradata_from(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(sps.len() + pps.len() + 8);
+    for nal in [sps, pps] {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(nal);
+    }
+    out
+}
+
+/// The NAL payloads of an Annex-B buffer, start codes stripped.
+fn annexb_nals(data: &[u8]) -> Vec<&[u8]> {
+    // Index just past each three-byte start code; a four-byte code is a
+    // three-byte one with a leading zero, found at its second byte.
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 2 < data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            starts.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let mut nals = Vec::with_capacity(starts.len());
+    for (n, &start) in starts.iter().enumerate() {
+        let mut end = starts.get(n + 1).map_or(data.len(), |&next| next - 3);
+        // The byte stream may pad a NAL with trailing zeros (a four-byte
+        // start code contributes one). Trimming them is exact for the
+        // parameter sets this scan feeds — their last byte holds the RBSP
+        // stop bit — and merely cosmetic for slice NALs, whose payloads
+        // (which may legitimately end in cabac_zero_words) nothing reads
+        // past the header byte.
+        while end > start && data[end - 1] == 0 {
+            end -= 1;
+        }
+        nals.push(&data[start..end]);
+    }
+    nals
+}
+
+/// Software decode now, hardware once the stream provides its parameter sets.
+///
+/// Every step of the probe is non-blocking: the NIF path runs `send_packet`
+/// inside `decode_au` on a dirty-CPU scheduler thread, so waiting there —
+/// on a channel, on another camera's probe — would hold a scheduler the
+/// whole VM shares. The open runs on its own thread while software keeps
+/// decoding; its result is polled one `try_recv` per access unit; and the
+/// handover to a successful open waits for the next keyframe, so hardware
+/// starts cleanly and no frame between the two decoders is lost.
+struct DeferredHwDecoder {
+    active: ActiveDecoder,
+    /// `Some` while the probe has not decided.
+    pending: Option<PendingHw>,
+}
+
+enum ActiveDecoder {
+    Sw(SwDecoder),
+    Hw(HwDecoder),
+    /// A named backend that could not open. This path refuses the silent
+    /// software fallback, and the refusal must outlive the access unit that
+    /// triggered it — the caller treats decode errors as tolerated — so the
+    /// state makes every subsequent packet fail with the same
+    /// [`DecoderRefusal`] instead of quietly decoding in software.
+    Refused(String),
+}
+
+/// The deferred probe's spawner — [`spawn_hw_open`] in production, a
+/// preloaded channel in unit tests, which must not probe whatever device
+/// the test host happens to have (nor latch a slow one wedged for the rest
+/// of the process).
+type HwSpawner = fn(
+    HwBackend,
+    SendCodecpar,
+    InputSpec,
+    Option<MotionConfig>,
+) -> Result<mpsc::Receiver<Result<HwDecoder>>>;
+
+/// Where the probe stands; advanced by [`DeferredHwDecoder::consider`], at
+/// most one step of real work per access unit.
+enum Probe {
+    /// Accumulating parameter sets — some cameras send SPS and PPS in
+    /// separate access units, and demanding both from one would settle on
+    /// software for a stream whose hardware was fine.
+    Gathering {
+        sps: Option<Vec<u8>>,
+        pps: Option<Vec<u8>>,
+        aus_left: u32,
+    },
+    /// The pair is complete; waiting for `backends[next]`'s turn (the
+    /// per-backend claim may be another camera's for a moment).
+    Claiming { extradata: Vec<u8>, next: usize },
+    /// One open is running on its thread. The claim rides along so every
+    /// exit — success, failure, timeout, this decoder dropped mid-probe —
+    /// releases the backend.
+    Opening {
+        extradata: Vec<u8>,
+        current: usize,
+        rx: mpsc::Receiver<Result<HwDecoder>>,
+        started: Instant,
+        claim: ProbeClaim,
+    },
+    /// Opened; holding for the next keyframe so the handover is clean.
+    /// Boxed: a decoder is hundreds of bytes, the other states are slim.
+    Ready(Box<HwDecoder>),
+}
+
+struct PendingHw {
+    backends: Vec<HwBackend>,
+    spawner: HwSpawner,
+    codecpar: SendCodecpar,
+    spec: InputSpec,
+    motion: Option<MotionConfig>,
+    /// `--decoder` named a specific backend under [`NamedFallback::Refused`],
+    /// so settling on software is a refusal rather than a fallback. The
+    /// check upstream (`require_named_hardware`) can only see the open,
+    /// which is before this decides — the probe enforces it itself.
+    required: bool,
+    probe: Probe,
+}
+
+/// What one advance of the probe decided.
+enum Advance {
+    /// Nothing to do until a later access unit; the probe stays.
+    Wait,
+    /// The probe is over without a hardware decoder.
+    Settle(&'static str),
+    /// The hardware decoder takes over, starting at this access unit.
+    Switch(Box<HwDecoder>),
+}
+
+impl DeferredHwDecoder {
+    fn new(
+        sw: SwDecoder,
+        backends: Vec<HwBackend>,
+        spawner: HwSpawner,
+        codecpar: AVCodecParameters,
+        spec: InputSpec,
+        motion: Option<MotionConfig>,
+        required: bool,
+    ) -> Self {
+        let names: Vec<&str> = backends.iter().map(|b| b.name()).collect();
+        note!(
+            "hardware decode deferred: waiting for in-band SPS/PPS to try {}",
+            names.join(", ")
+        );
+        Self {
+            active: ActiveDecoder::Sw(sw),
+            pending: Some(PendingHw {
+                backends,
+                spawner,
+                codecpar: SendCodecpar(codecpar),
+                spec,
+                motion,
+                required,
+                probe: Probe::Gathering {
+                    sps: None,
+                    pps: None,
+                    aus_left: DEFER_AU_LIMIT,
+                },
+            }),
+        }
+    }
+
+    /// Advance the probe against one access unit — never blocking. On
+    /// switch the active decoder is the hardware one and the caller's
+    /// packet goes to it; on refusal (named backend, no open) the error is
+    /// permanent.
+    fn consider(&mut self, au: &[u8]) -> Result<()> {
+        let Some(mut pending) = self.pending.take() else {
+            return Ok(());
+        };
+        match pending.advance(au) {
+            Ok(Advance::Wait) => {
+                self.pending = Some(pending);
+                Ok(())
+            }
+            Ok(Advance::Switch(decoder)) => {
+                self.active = ActiveDecoder::Hw(*decoder);
+                Ok(())
+            }
+            Ok(Advance::Settle(why)) => self.settle_on_software(&pending, why),
+            Err(e) => {
+                // A spawn or codecpar-clone failure is a host problem no
+                // later access unit will cure.
+                note!("hardware probe abandoned: {e:#}");
+                self.settle_on_software(&pending, "the probe could not run")
+            }
+        }
+    }
+
+    /// The probe is over without a hardware decoder: keep software under
+    /// `auto`, refuse when the operator named a backend.
+    fn settle_on_software(&mut self, pending: &PendingHw, why: &str) -> Result<()> {
+        if pending.required {
+            let named = pending.backends.first().map_or("hardware", |b| b.name());
+            let reason = format!(
+                "decoder {named} was named but did not open ({why}), and this path \
+                 refuses the software fallback — name decoder: auto to accept \
+                 software decode"
+            );
+            note!("{reason}");
+            self.active = ActiveDecoder::Refused(reason.clone());
+            return Err(DecoderRefusal(reason).into());
+        }
+        note!("no hardware decoder opened ({why}); staying with software decode");
+        Ok(())
+    }
+}
+
+impl PendingHw {
+    /// One step of the probe. Loops only over transitions that are pure
+    /// state (a failed backend advancing to the next, a claim acquired and
+    /// spawned, a preloaded result); every real wait exits with
+    /// [`Advance::Wait`] until the next access unit.
+    fn advance(&mut self, au: &[u8]) -> Result<Advance> {
+        let mut completed = None;
+        if let Probe::Gathering { sps, pps, aus_left } = &mut self.probe {
+            let (in_sps, in_pps) = parameter_sets(au);
+            if let Some(in_sps) = in_sps {
+                *sps = Some(in_sps);
+            }
+            if let Some(in_pps) = in_pps {
+                *pps = Some(in_pps);
+            }
+            if let (Some(sps), Some(pps)) = (sps.as_deref(), pps.as_deref()) {
+                completed = Some(extradata_from(sps, pps));
+            } else {
+                *aus_left -= 1;
+                if *aus_left == 0 {
+                    return Ok(Advance::Settle("no access unit carried SPS/PPS in band"));
+                }
+                return Ok(Advance::Wait);
+            }
+        }
+        if let Some(extradata) = completed {
+            self.probe = Probe::Claiming { extradata, next: 0 };
+        }
+        // Each iteration owns the state outright — transitions are moves,
+        // and a claim is released exactly where its `drop` is written. The
+        // placeholder is only observable if a transition below panics, and
+        // a fresh Gathering is a safe place to be left.
+        loop {
+            let placeholder = Probe::Gathering {
+                sps: None,
+                pps: None,
+                aus_left: DEFER_AU_LIMIT,
+            };
+            match std::mem::replace(&mut self.probe, placeholder) {
+                Probe::Gathering { .. } => unreachable!("handled above"),
+                Probe::Claiming { extradata, next } => {
+                    let Some(&backend) = self.backends.get(next) else {
+                        return Ok(Advance::Settle("every backend refused this stream"));
+                    };
+                    if wedged(backend).load(Ordering::Relaxed) {
+                        note!(
+                            "hardware decoder {backend} unavailable: timed out earlier \
+                             in this process; not probing it again"
+                        );
+                        self.probe = Probe::Claiming {
+                            extradata,
+                            next: next + 1,
+                        };
+                        continue;
+                    }
+                    let Some(claim) = ProbeClaim::take(backend) else {
+                        // Another camera's probe holds the backend; its
+                        // verdict (or the wedge latch) arrives within one
+                        // deadline, and software decode covers the wait.
+                        self.probe = Probe::Claiming { extradata, next };
+                        return Ok(Advance::Wait);
+                    };
+                    // A `?` below drops `claim`, releasing the backend.
+                    let mut clone = clone_codecpar(&self.codecpar.0)?;
+                    set_extradata(&mut clone, &extradata)?;
+                    let rx = (self.spawner)(backend, SendCodecpar(clone), self.spec, self.motion)?;
+                    self.probe = Probe::Opening {
+                        extradata,
+                        current: next,
+                        rx,
+                        started: Instant::now(),
+                        claim,
+                    };
+                }
+                Probe::Opening {
+                    extradata,
+                    current,
+                    rx,
+                    started,
+                    claim,
+                } => {
+                    let backend = self.backends[current];
+                    let failed = match rx.try_recv() {
+                        Ok(Ok(decoder)) => {
+                            drop(claim);
+                            self.probe = Probe::Ready(Box::new(decoder));
+                            continue;
+                        }
+                        Ok(Err(e)) => e,
+                        Err(mpsc::TryRecvError::Empty) => {
+                            if started.elapsed() < HW_OPEN_DEADLINE {
+                                self.probe = Probe::Opening {
+                                    extradata,
+                                    current,
+                                    rx,
+                                    started,
+                                    claim,
+                                };
+                                return Ok(Advance::Wait);
+                            }
+                            // Latched before the claim drops, so a waiter
+                            // that grabs the backend next sees the verdict
+                            // rather than spawning its own doomed open.
+                            wedged(backend).store(true, Ordering::Relaxed);
+                            anyhow!(
+                                "did not open within {}s — abandoned as wedged, and \
+                                 not probed again in this process",
+                                HW_OPEN_DEADLINE.as_secs()
+                            )
+                        }
+                        // The thread can only drop `tx` without sending by
+                        // dying first.
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            anyhow!("the open thread panicked before answering")
+                        }
+                    };
+                    drop(claim);
+                    note!("hardware decoder {backend} unavailable: {failed:#}");
+                    self.probe = Probe::Claiming {
+                        extradata,
+                        next: current + 1,
+                    };
+                }
+                Probe::Ready(decoder) => {
+                    // Hand over at a keyframe so the hardware decoder starts
+                    // where a decoder may; software carries every frame
+                    // until then, so nothing is lost in between.
+                    if contains_idr(au) {
+                        return Ok(Advance::Switch(decoder));
+                    }
+                    self.probe = Probe::Ready(decoder);
+                    return Ok(Advance::Wait);
+                }
+            }
+        }
+    }
+}
+
+/// Whether an access unit carries an IDR slice (NAL type 5) — the clean
+/// start a fresh decoder needs.
+fn contains_idr(au: &[u8]) -> bool {
+    annexb_nals(au)
+        .iter()
+        .any(|nal| nal.first().is_some_and(|byte| byte & 0x1f == 5))
+}
+
+impl Decoder for DeferredHwDecoder {
+    fn send_packet(&mut self, packet: &rsmpeg::avcodec::AVPacket) -> Result<()> {
+        // An empty packet carries nothing to scan and should not run down
+        // the probe's patience.
+        if self.pending.is_some() && !packet.data.is_null() && packet.size > 0 {
+            // SAFETY: libavcodec pairs a non-null data with its size.
+            let au = unsafe { slice::from_raw_parts(packet.data, packet.size as usize) };
+            self.consider(au)?;
+        }
+        match &mut self.active {
+            ActiveDecoder::Sw(decoder) => decoder.send_packet(packet),
+            ActiveDecoder::Hw(decoder) => decoder.send_packet(packet),
+            ActiveDecoder::Refused(reason) => Err(DecoderRefusal(reason.clone()).into()),
+        }
+    }
+
+    fn receive_frame(&mut self) -> Result<Option<AVFrame>> {
+        match &mut self.active {
+            ActiveDecoder::Sw(decoder) => decoder.receive_frame(),
+            ActiveDecoder::Hw(decoder) => decoder.receive_frame(),
+            ActiveDecoder::Refused(_) => Ok(None),
+        }
+    }
+
+    fn to_tensor(&mut self, frame: AVFrame, pts_ns: Option<i64>) -> Result<Option<Sampled>> {
+        match &mut self.active {
+            ActiveDecoder::Sw(decoder) => decoder.to_tensor(frame, pts_ns),
+            ActiveDecoder::Hw(decoder) => decoder.to_tensor(frame, pts_ns),
+            ActiveDecoder::Refused(_) => Ok(None),
+        }
+    }
+
+    fn to_rgb(&mut self, frame: AVFrame, pts_ns: Option<i64>) -> Result<Option<RgbSampled>> {
+        match &mut self.active {
+            ActiveDecoder::Sw(decoder) => decoder.to_rgb(frame, pts_ns),
+            ActiveDecoder::Hw(decoder) => decoder.to_rgb(frame, pts_ns),
+            ActiveDecoder::Refused(_) => Ok(None),
+        }
+    }
+
+    fn hw_backend(&self) -> Option<HwBackend> {
+        match &self.active {
+            ActiveDecoder::Hw(decoder) => decoder.hw_backend(),
+            _ => None,
+        }
+    }
+
+    fn hw_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+}
 
 /// Scale-and-convert into the model's RGB input.
 ///
@@ -1148,6 +1838,259 @@ mod tests {
         // Generous enough for 8K, small enough that a 16384x16384 SPS fails.
         const { assert!(MAX_PIXELS > 7680 * 4320) };
         const { assert!(MAX_PIXELS < 16384 * 16384) };
+    }
+
+    fn h264_codecpar() -> AVCodecParameters {
+        let mut codecpar = AVCodecParameters::new();
+        unsafe {
+            let raw = codecpar.deref_mut();
+            raw.codec_id = ffi::AV_CODEC_ID_H264;
+            raw.codec_type = ffi::AVMEDIA_TYPE_VIDEO;
+        }
+        codecpar
+    }
+
+    const SPS: &[u8] = &[0x67, 0x64, 0x00, 0x1f];
+    const PPS: &[u8] = &[0x68, 0xee];
+    const IDR: &[u8] = &[0x65, 0x88];
+
+    /// Mixed three- and four-byte start codes, the way cameras actually
+    /// interleave them; the four-byte code after the PPS also exercises the
+    /// trailing-zero trim.
+    fn keyframe_au() -> Vec<u8> {
+        [&[0, 0, 0, 1][..], SPS, &[0, 0, 1], PPS, &[0, 0, 0, 1], IDR].concat()
+    }
+
+    #[test]
+    fn parameter_sets_reads_both_kinds_of_start_code() {
+        let (sps, pps) = parameter_sets(&keyframe_au());
+        assert_eq!(sps.as_deref(), Some(SPS));
+        assert_eq!(pps.as_deref(), Some(PPS));
+
+        let idr_only = [&[0, 0, 0, 1][..], IDR].concat();
+        assert_eq!(parameter_sets(&idr_only), (None, None));
+        assert_eq!(parameter_sets(&[]), (None, None));
+
+        let expected = [&[0, 0, 0, 1][..], SPS, &[0, 0, 0, 1], PPS].concat();
+        assert_eq!(extradata_from(SPS, PPS), expected);
+    }
+
+    #[test]
+    fn annexb_nals_survive_malformed_edges() {
+        // A start code at the very end yields an empty NAL; empty NALs have
+        // no header byte for `parameter_sets` to read.
+        assert_eq!(annexb_nals(&[0, 0, 1]), vec![&[] as &[u8]]);
+        assert_eq!(parameter_sets(&[0, 0, 1]), (None, None));
+        // Zeros between codes belong to no payload.
+        let zeros = [0u8, 0, 1, 0, 0, 0, 1, 0x65, 0x88];
+        assert_eq!(annexb_nals(&zeros), vec![&[] as &[u8], &[0x65, 0x88]]);
+        // No start code at all: nothing.
+        assert!(annexb_nals(&[0x65, 0x88, 0x00]).is_empty());
+    }
+
+    #[test]
+    fn cloned_codecpar_keeps_fidelity_and_takes_extradata() {
+        let mut codecpar = h264_codecpar();
+        unsafe {
+            let raw = codecpar.deref_mut();
+            raw.width = 640;
+            raw.height = 360;
+            raw.profile = 100;
+            raw.level = 31;
+        }
+        let mut clone = clone_codecpar(&codecpar).unwrap();
+        let extradata = extradata_from(SPS, PPS);
+        set_extradata(&mut clone, &extradata).unwrap();
+        assert_eq!(clone.width, 640);
+        assert_eq!(clone.height, 360);
+        // The fields the deferred probe never touches ride the copy —
+        // the parity the old field-by-field rebuild silently dropped.
+        assert_eq!(clone.profile, 100);
+        assert_eq!(clone.level, 31);
+        let carried =
+            unsafe { slice::from_raw_parts(clone.extradata, clone.extradata_size as usize) };
+        assert_eq!(carried, extradata);
+        // The original is untouched.
+        assert!(codecpar.extradata.is_null());
+    }
+
+    /// Deterministic failure: a unit test must not probe whatever device
+    /// the host happens to have, and must never reach the process-wide
+    /// wedge latch. The result is preloaded, so one `consider` sees it.
+    fn failing_spawn(
+        _: HwBackend,
+        _: SendCodecpar,
+        _: InputSpec,
+        _: Option<MotionConfig>,
+    ) -> Result<mpsc::Receiver<Result<HwDecoder>>> {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err(anyhow!("unit tests never probe the host's devices")))
+            .unwrap();
+        Ok(rx)
+    }
+
+    /// An open that never answers: the sender leaks, so `try_recv` reads
+    /// Empty forever — the in-flight shape, without a thread or a device.
+    fn stuck_spawn(
+        _: HwBackend,
+        _: SendCodecpar,
+        _: InputSpec,
+        _: Option<MotionConfig>,
+    ) -> Result<mpsc::Receiver<Result<HwDecoder>>> {
+        let (tx, rx) = mpsc::channel();
+        std::mem::forget(tx);
+        Ok(rx)
+    }
+
+    /// Advance until the probe decides. Bounded retries, not one call: the
+    /// claim slots are process-wide, so another test's momentary claim on
+    /// the same backend can legitimately answer an advance with "wait".
+    fn settle(decoder: &mut DeferredHwDecoder, au: &[u8]) {
+        for _ in 0..100 {
+            decoder.consider(au).unwrap();
+            if !decoder.hw_pending() {
+                return;
+            }
+        }
+        panic!("the probe never settled");
+    }
+
+    /// Each test drives its own backend so the process-wide claim slots
+    /// never collide across concurrently running tests.
+    fn deferred(backends: Vec<HwBackend>, spawner: HwSpawner, required: bool) -> DeferredHwDecoder {
+        let codecpar = h264_codecpar();
+        let spec = unit_rgb(InputSize::square(640));
+        let sw = SwDecoder::open(&codecpar, spec, None).unwrap();
+        DeferredHwDecoder::new(
+            sw,
+            backends,
+            spawner,
+            clone_codecpar(&codecpar).unwrap(),
+            spec,
+            None,
+            required,
+        )
+    }
+
+    #[test]
+    fn a_deferred_probe_settles_on_software_when_no_backend_opens() {
+        // The injected spawner fails every backend, so an unnamed probe
+        // keeps the software decoder it was born with.
+        let mut decoder = deferred(vec![HwBackend::Vaapi], failing_spawn, false);
+        assert!(decoder.hw_pending());
+        settle(&mut decoder, &keyframe_au());
+        assert!(decoder.hw_backend().is_none());
+        assert!(matches!(decoder.active, ActiveDecoder::Sw(_)));
+    }
+
+    #[test]
+    fn a_deferred_probe_accumulates_parameter_sets_across_access_units() {
+        let mut decoder = deferred(vec![HwBackend::Qsv], failing_spawn, false);
+        let sps_alone = [&[0, 0, 0, 1][..], SPS].concat();
+        decoder.consider(&sps_alone).unwrap();
+        // Half a pair is not a decision.
+        assert!(decoder.hw_pending());
+        let pps_alone = [&[0, 0, 0, 1][..], PPS].concat();
+        // The PPS completes the pair: the probe runs (and settles on
+        // software, every spawned open failing).
+        settle(&mut decoder, &pps_alone);
+    }
+
+    #[test]
+    fn a_deferred_probe_gives_up_after_enough_bare_access_units() {
+        let mut decoder = deferred(vec![HwBackend::Vaapi], failing_spawn, false);
+        let idr_only = [&[0, 0, 0, 1][..], IDR].concat();
+        for _ in 0..DEFER_AU_LIMIT - 1 {
+            decoder.consider(&idr_only).unwrap();
+            assert!(decoder.hw_pending());
+        }
+        decoder.consider(&idr_only).unwrap();
+        assert!(!decoder.hw_pending());
+        assert!(matches!(decoder.active, ActiveDecoder::Sw(_)));
+    }
+
+    #[test]
+    fn one_probe_per_backend_and_a_dropped_probe_frees_its_claim() {
+        // A holds the V4l2 claim with an open that never answers; B, on the
+        // same backend, must keep software-decoding and wait its turn
+        // rather than spawn a second probe or block.
+        let mut holder = deferred(vec![HwBackend::V4l2], stuck_spawn, false);
+        holder.consider(&keyframe_au()).unwrap();
+        assert!(holder.hw_pending());
+
+        let mut waiter = deferred(vec![HwBackend::V4l2], failing_spawn, false);
+        waiter.consider(&keyframe_au()).unwrap();
+        assert!(waiter.hw_pending(), "the claim is the holder's");
+
+        // The holder's camera closes mid-probe; its Drop releases the
+        // claim, and the waiter's next access unit runs (and settles).
+        drop(holder);
+        waiter.consider(&keyframe_au()).unwrap();
+        assert!(!waiter.hw_pending());
+        assert!(matches!(waiter.active, ActiveDecoder::Sw(_)));
+    }
+
+    /// One tightly packed AVPacket around `data`, as `send_packet` sees them.
+    fn packet(data: &[u8]) -> rsmpeg::avcodec::AVPacket {
+        let mut packet = rsmpeg::avcodec::AVPacket::new();
+        // SAFETY: av_new_packet sizes the buffer (plus libav's padding) and
+        // the copy stays within `data.len()`.
+        unsafe {
+            assert!(ffi::av_new_packet(packet.as_mut_ptr(), data.len() as i32) >= 0);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), (*packet.as_mut_ptr()).data, data.len());
+        }
+        packet
+    }
+
+    #[test]
+    fn a_named_deferred_backend_that_cannot_open_refuses_software() {
+        let mut decoder = deferred(vec![HwBackend::Nvdec], failing_spawn, true);
+        let error = decoder.consider(&keyframe_au()).unwrap_err();
+        assert!(error.to_string().contains("nvdec was named"), "{error:#}");
+        // Permanent, and typed: the embedder tells this refusal apart from
+        // tolerated decode errors by downcast, on every later packet.
+        let later = decoder.send_packet(&packet(IDR)).unwrap_err();
+        assert!(
+            later.downcast_ref::<DecoderRefusal>().is_some(),
+            "{later:#}"
+        );
+        // The drain contract stays honest: no frames, no busy-wait fuel.
+        assert!(decoder.receive_frame().unwrap().is_none());
+        assert!(!decoder.hw_pending());
+        assert!(decoder.hw_backend().is_none());
+    }
+
+    #[test]
+    fn an_unnamed_deferred_settle_stays_quietly_on_software() {
+        let mut decoder = deferred(vec![HwBackend::Vaapi], failing_spawn, false);
+        settle(&mut decoder, &keyframe_au());
+        // Software decode continues through the trait after the settle: the
+        // synthetic parameter sets are garbage to a real parser, but that is
+        // a tolerated decode error, never a refusal.
+        if let Err(error) = decoder.send_packet(&packet(&keyframe_au())) {
+            assert!(
+                error.downcast_ref::<DecoderRefusal>().is_none(),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_with_no_extradata_defers_the_hardware_probe() {
+        let codecpar = h264_codecpar();
+        let decoder = open(
+            DecoderKind::Auto,
+            &codecpar,
+            unit_rgb(InputSize::square(640)),
+            None,
+            NamedFallback::Refused,
+        )
+        .unwrap();
+        assert_eq!(
+            decoder.hw_pending(),
+            !probe_order(DecoderKind::Auto).is_empty()
+        );
+        assert!(decoder.hw_backend().is_none());
     }
 
     #[test]

@@ -20,6 +20,12 @@ pub enum NativeError {
     /// The decoder rejected an access unit outright (empty, oversized),
     /// which the tolerated per-packet errors are not.
     Decode(String),
+    /// A named hardware backend's deferred probe settled without opening
+    /// (`cairn_detect::decode::DecoderRefusal`). Permanent for this decoder:
+    /// unlike the tolerated errors it never heals on a keyframe, and the
+    /// caller's remedy is surfacing the reason, not reopening — a reopen
+    /// defers and refuses again.
+    DecoderRefused(String),
     /// `decode_au` on a decoder `close_decoder` already emptied.
     Closed,
     /// A previous call panicked holding this decoder's lock, so its decoder
@@ -38,6 +44,7 @@ impl NativeError {
             Self::Config(_) => "config",
             Self::OpenStream(_) => "open_stream",
             Self::Decode(_) => "decode",
+            Self::DecoderRefused(_) => "decoder_refused",
             Self::Closed => "closed",
             Self::Poisoned => "poisoned",
             Self::Panicked(_) => "panicked",
@@ -50,6 +57,7 @@ impl NativeError {
             Self::Config(message)
             | Self::OpenStream(message)
             | Self::Decode(message)
+            | Self::DecoderRefused(message)
             | Self::Panicked(message) => message,
             Self::Closed => "the decoder is closed",
             Self::Poisoned => "a previous call panicked while holding this decoder's state",
@@ -86,6 +94,7 @@ mod tests {
             NativeError::Config("c".into()),
             NativeError::OpenStream("o".into()),
             NativeError::Decode("d".into()),
+            NativeError::DecoderRefused("r".into()),
             NativeError::Closed,
             NativeError::Poisoned,
             NativeError::Panicked("p".into()),

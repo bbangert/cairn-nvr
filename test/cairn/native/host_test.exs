@@ -196,6 +196,23 @@ defmodule Cairn.Native.HostTest do
       # identical refusal for ever, so the surface must say why.
       assert %{^id => {:config, ^message}} = Host.status(host).decoder_failures
     end
+
+    test "a settle-time refusal lands on status after the open succeeded", %{id: id} do
+      host = start_host()
+      assert_receive {:init, _config}
+
+      # The deferred probe's shape: the open succeeds (and clears nothing,
+      # there was nothing), the refusal arrives later from the pipeline.
+      assert {:ok, _handle} = Host.open_decoder(host, id, %{}, {2560, 1920})
+      message = "decoder v4l2 was named but did not open"
+      Host.report_decoder_refusal(host, id, message)
+
+      assert %{^id => {:decoder_refused, ^message}} = Host.status(host).decoder_failures
+
+      # The next successful open — a fixed profile, a reload — clears it.
+      assert {:ok, _handle} = Host.open_decoder(host, id, %{}, {2560, 1920})
+      assert Host.status(host).decoder_failures == %{}
+    end
   end
 
   describe "streams" do
