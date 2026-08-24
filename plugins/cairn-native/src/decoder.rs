@@ -294,6 +294,12 @@ fn sampled_frame(decoder: &mut dyn Decoder) -> (Option<AVFrame>, Option<anyhow::
 /// 0x0 opens *successfully* and then answers every frame with `AVERROR_BUG` —
 /// hardware decode that delivers nothing, past the fallback and past every
 /// health check ([`crate::config::DecoderParams::source`]).
+///
+/// What no parameters here can carry is extradata, and a V4L2 M2M open
+/// without it blocks inside the driver's format negotiation. So on this
+/// path `decode::open` *defers* the hardware probe: this call returns a
+/// software decoder promptly, and the probe re-runs at the first access
+/// unit whose in-band SPS/PPS provide the extradata the open needs.
 fn open_decoder(params: &DecoderParams) -> Result<Box<dyn Decoder>> {
     #[cfg(test)]
     panic_if_armed_for_open();
@@ -329,8 +335,17 @@ fn open_decoder(params: &DecoderParams) -> Result<Box<dyn Decoder>> {
 /// into a restart loop, where here the detect branch goes dark, recording
 /// continues, and the reason reaches `cameras:status`
 /// (`Cairn.Native.Host` records it; `Cairn.Native.Status` headlines it).
+///
+/// A decoder whose hardware probe is deferred passes here on its promise:
+/// at open, `hw_backend()` is `None` because the stream's parameter sets
+/// have not arrived, not because the backend lost. The probe enforces the
+/// named requirement itself when it settles — every packet after a refusal
+/// fails with the reason, which lands in the same decode-error accounting.
 fn require_named_hardware(kind: DecoderKind, decoder: &dyn Decoder) -> Result<()> {
-    if matches!(kind, DecoderKind::Auto | DecoderKind::Sw) || decoder.hw_backend().is_some() {
+    if matches!(kind, DecoderKind::Auto | DecoderKind::Sw)
+        || decoder.hw_backend().is_some()
+        || decoder.hw_pending()
+    {
         return Ok(());
     }
     Err(NativeError::OpenStream(format!(
@@ -450,6 +465,9 @@ mod tests {
         /// decoder, unless a test is asking what happens when the named
         /// backend did open.
         hw: Option<HwBackend>,
+        /// What it answers [`Decoder::hw_pending`] with — a deferred probe
+        /// still waiting for the stream's parameter sets.
+        probing: bool,
     }
 
     impl Decoder for Burst {
@@ -495,6 +513,10 @@ mod tests {
 
         fn hw_backend(&self) -> Option<HwBackend> {
             self.hw
+        }
+
+        fn hw_pending(&self) -> bool {
+            self.probing
         }
     }
 
@@ -661,6 +683,18 @@ mod tests {
         };
 
         assert!(require_named_hardware(DecoderKind::V4l2, &hardware).is_ok());
+    }
+
+    #[test]
+    fn a_named_decoder_still_probing_is_accepted_on_its_promise() {
+        // The deferred probe has not seen the stream's parameter sets yet;
+        // refusal, if it comes, is the probe's own job at settle time.
+        let probing = Burst {
+            probing: true,
+            ..burst(1)
+        };
+
+        assert!(require_named_hardware(DecoderKind::V4l2, &probing).is_ok());
     }
 
     /// The refusal above is only worth anything if `open_decoder` performs it,
