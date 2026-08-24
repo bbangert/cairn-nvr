@@ -131,6 +131,15 @@ def test_no_data_paths(tmp_path):
     assert r["why"] == "no frame.objects lines"
 
 
+def test_no_window_when_fp32_never_confident(tmp_path):
+    # A clip fp32 never reaches REPORTABLE on carries nothing to certify
+    # against — there is no person window to pair inside.
+    run = write_run(tmp_path, emissions([0.93] * 41))
+    r = analyze_run(run, ref(CONFIDENT), ref([0.3] * 41))
+    assert r["verdict"] == "NO-WINDOW"
+    assert r["why"] == "fp32 never confident on this clip"
+
+
 def test_insufficient_pairs(tmp_path):
     short = [0.95] * 11
     run = write_run(tmp_path, emissions([0.93] * 11))
