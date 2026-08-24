@@ -17,6 +17,9 @@ TOOL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI = os.path.join(TOOL_DIR, "campaign_meta.py")
 
 
+_AUTO = "auto"
+
+
 def meta_text(
     backend="qnn",
     model_sha=MODEL_SHA,
@@ -25,8 +28,12 @@ def meta_text(
     extra_args="--qnn-library x",
     feed="feed exited 0",
     plugin_line=None,
-    completion="frame.objects lines: 42",
+    frames=1,
+    completion=_AUTO,
 ):
+    if completion is _AUTO:
+        # match the default single-frame ndjson unless a test overrides
+        completion = f"frame.objects lines: {frames}"
     lines = [
         "governor: performance",
         f"backend: {backend} profile: yolox insize: 416 sample_fps: 10 min_score: 0.05",
@@ -110,6 +117,29 @@ def test_meta_truncated_mid_line_never_crashes():
     meta = RunMeta("backend: qnn profile:")
     assert meta.backend == "qnn"
     assert meta.profile is None
+
+
+def test_corruption_in_an_ignored_line_is_still_suspect(tmp_path):
+    # Replace-decoding would hide invalid UTF-8 that lands in a line
+    # nothing parses (the governor line, trailing noise) — every field
+    # would read intact and corrupted evidence would be accepted.
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "meta").write_bytes(meta_text().encode() + b"governor: \xff\xfe\n")
+    meta = RunMeta.load(str(run))
+    assert meta.suspect_reason() == "meta contains undecodable bytes"
+
+
+def test_frame_count_must_match_meta(tmp_path, interpreter, local_files):
+    # An interrupted fetch can truncate out.ndjson beside a complete
+    # meta; the recorded count is the only witness.
+    script, model, clip = local_files
+    shas = dict(script_sha=file_sha256(str(script)),
+                model_sha=file_sha256(str(model)),
+                clip_sha=file_sha256(str(clip)))
+    run = write_run(tmp_path, meta_text(frames=5, **shas))
+    assert current_cli(interpreter, run, str(script), "--qnn-library x",
+                       model=str(model), clip=str(clip)) == 1
 
 
 def test_completion_marker_prefix_is_not_completion(tmp_path):

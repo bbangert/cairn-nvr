@@ -282,6 +282,13 @@ def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None,
                 "why": "malformed frame.objects message in fetched ndjson"}
     if not htp:
         return {"verdict": "NO-DATA", "why": "no frame.objects lines"}
+    if meta.frames is not None and len(htp) != meta.frames:
+        # fetch() cannot read scp's rc: a complete meta beside an ndjson
+        # truncated mid-transfer is a real shape, and grading it would
+        # count the missing tail as real misses.
+        return {"verdict": "SUSPECT",
+                "why": (f"{len(htp)} frame messages in ndjson but meta "
+                        f"recorded {meta.frames} (truncated fetch)")}
     # json.loads accepts NaN/Infinity, and a non-finite score would sail
     # through every threshold below (NaN compares False both ways) into
     # whichever verdict that happens to reach. Data that isn't numbers is

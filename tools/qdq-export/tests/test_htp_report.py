@@ -16,7 +16,6 @@ from test_campaign_meta import meta_text
 # htp_content_test.sh line by line) so the analyzer is never tested
 # against a meta no board could have written.
 QNN_META = meta_text()
-ORT_META = meta_text(backend="ort")
 
 
 def ndjson_line(t, person):
@@ -27,13 +26,17 @@ def ndjson_line(t, person):
     })
 
 
-def write_run(tmp_path, emissions, meta=QNN_META):
+def write_run(tmp_path, emissions, meta=None):
     run = tmp_path / "run"
     run.mkdir()
     noise = "QAIRT graph prepare 50%\n"  # non-JSON stdout noise is expected
     (run / "out.ndjson").write_text(
         noise + "".join(ndjson_line(t, p) + "\n" for t, p in emissions)
     )
+    if meta is None:
+        # the writer's count matches what it wrote; tests probing the
+        # count cross-check pass an explicit meta
+        meta = meta_text(frames=len(emissions))
     (run / "meta").write_text(meta)
     return str(run)
 
@@ -140,7 +143,8 @@ def test_misses_count_as_zeros(tmp_path):
 def test_score_fidelity_only_grades_covered_instants(tmp_path):
     # The board CPU-EP control cannot emit densely enough; gaps are
     # throughput, graded instants are the fidelity check.
-    run = write_run(tmp_path, emissions([0.95] * 41, step=2), meta=ORT_META)
+    run = write_run(tmp_path, emissions([0.95] * 41, step=2),
+                    meta=meta_text(backend="ort", frames=21))
     r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT),
                     score_fidelity_only=True, expected_backend="ort")
     assert r["verdict"] == "PASS"
@@ -197,6 +201,16 @@ def test_out_of_range_score_is_suspect(tmp_path):
         f.write(bad + "\n")
     r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
     assert r["verdict"] == "SUSPECT"
+
+
+def test_frame_count_mismatch_is_suspect(tmp_path):
+    # A complete meta beside an ndjson truncated mid-transfer: grading it
+    # would count the missing tail as real misses (a FAIL verdict on
+    # genuinely good evidence).
+    run = write_run(tmp_path, emissions([0.93] * 41), meta=meta_text(frames=55))
+    r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
+    assert r["verdict"] == "SUSPECT"
+    assert r["why"] == "41 frame messages in ndjson but meta recorded 55 (truncated fetch)"
 
 
 def test_invalid_encoding_is_suspect_not_a_crash(tmp_path):
