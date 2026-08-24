@@ -158,3 +158,13 @@ torch, 8.881 ms on RB3 Gen 2, qnn_dlc). Their recipe is server-side PTQ:
 calibration plus deliberate range selection, no AdaRound, no Seq-MSE, no
 CLE, no QAT. The gap between this pipeline and theirs was never a
 missing algorithm.
+
+## Tests
+
+`export-venv/bin/python -m pytest` (from this directory). The suite pins
+the #138 review-round classes as regressions: meta suspect/stale/legacy
+grading and the `current` retry guard (campaign_meta.py — also run under
+the system python3, whose stdlib is all it may use), analyzer verdict
+paths including miss-as-zero pairing and non-finite refusal
+(htp_report.py), and the qparam gate's failure classes on hand-built QDQ
+graphs (per-axis, NaN, baked ceiling, Q/DQ disagreement, unpinned scale).

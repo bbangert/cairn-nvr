@@ -25,3 +25,4 @@ pillow==12.3.0
 # inference — but pinned because which inference ran changes the graph
 # handed to the quantizer.
 sympy==1.14.0
+pytest

@@ -35,6 +35,8 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+from campaign_meta import RunMeta, file_sha256, records_script  # noqa: E402
+from finite import all_finite  # noqa: E402
 from score_parity import REPORTABLE, scores  # noqa: E402
 
 REPO_MODEL_DIR = os.path.normpath(
@@ -91,18 +93,6 @@ def extract_frames(clip_path, out_dir, fps):
         f.write(f"{clip_path} @ {fps} fps\n")
 
 
-def file_sha256(path):
-    """Full sha256 of a file's bytes — matched verbatim against the
-    board meta's sha256sum lines."""
-    import hashlib
-
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def model_digest(model_path):
     """Twelve hex chars of the artifact's bytes — the cache's identity.
 
@@ -110,13 +100,7 @@ def model_digest(model_path):
     artifact REBUILT under the same filename must never inherit the old
     bytes' scores from a warm cache.
     """
-    import hashlib
-
-    h = hashlib.sha256()
-    with open(model_path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()[:12]
+    return file_sha256(model_path)[:12]
 
 
 def cpu_series(model_path, frame_dir, fps, cache_dir):
@@ -227,60 +211,6 @@ def paired_one_to_one(ref_times, series):
 MIN_PAIRED = 20
 
 
-def run_suspect(run_dir):
-    """The content test's own verdict on its run, from the fetched meta.
-
-    htp_content_test.sh records a non-EOF plugin exit and the feed's exit
-    there and nowhere else — an analyzer that never reads it would grade
-    truncated runs as if they were complete.
-    """
-    meta = os.path.join(run_dir, "meta")
-    if not os.path.exists(meta):
-        return "no meta fetched"
-    text = open(meta).read()
-    for line in text.splitlines():
-        if "run suspect" in line:
-            return line.strip()
-        if line.startswith("feed exited") and not line.rstrip().endswith(" 0"):
-            return line.strip()
-    # The frames count is the run's completion marker: the board script
-    # writes it only after the feed exit and plugin shutdown statuses.
-    # Absence of "run suspect" in a truncated meta proves nothing — the
-    # suspect lines are exactly what a killed run never got to write.
-    if "frame.objects lines:" not in text:
-        return "meta lacks completion marker (run truncated before shutdown states were recorded)"
-    return None
-
-
-def stale_evidence(run_dir, expected_shas):
-    """The board script wrote the model's and clip's sha256 into meta;
-    evidence under the right directory name but from different bytes
-    must not be graded against today's references."""
-    if not expected_shas:
-        return None
-    meta = os.path.join(run_dir, "meta")
-    if not os.path.exists(meta):
-        return "no meta fetched"
-    text = open(meta).read()
-    for label, sha in expected_shas.items():
-        if not sha:
-            continue
-        if label == "script" and "htp_content_test.sh" not in text:
-            # Legacy meta from before the methodology digest: identity is
-            # unrecorded, not wrong. Counted and surfaced in the report
-            # (never silently passed); the campaign driver's retry guard
-            # regenerates these runs on the next campaign.
-            continue
-        if sha not in text:
-            return f"meta does not record the current {label} sha ({sha[:12]}…)"
-    return None
-
-
-def records_script(run_dir):
-    meta = os.path.join(run_dir, "meta")
-    return os.path.exists(meta) and "htp_content_test.sh" in open(meta).read()
-
-
 def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None,
                 score_fidelity_only=False, expected_backend=None):
     """Verdict for one content run against its two reference series.
@@ -295,24 +225,29 @@ def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None,
     nd = os.path.join(run_dir, "out.ndjson")
     if not os.path.exists(nd):
         return {"verdict": "NO-DATA", "why": "no ndjson fetched"}
-    suspect = run_suspect(run_dir)
+    meta = RunMeta.load(run_dir)
+    suspect = meta.suspect_reason()
     if suspect:
         return {"verdict": "SUSPECT", "why": suspect}
-    stale = stale_evidence(run_dir, expected_shas)
+    stale = meta.stale_reason(expected_shas)
     if stale:
         return {"verdict": "STALE-EVIDENCE", "why": stale}
-    if expected_backend:
-        # Bytes alone don't prove the leg: an ORT run misfiled under a
-        # *-qnn-* directory scores ~1.0 by construction and would serve
-        # as HTP proof.
-        meta = os.path.join(run_dir, "meta")
-        text = open(meta).read() if os.path.exists(meta) else ""
-        if f"backend: {expected_backend} " not in text:
-            return {"verdict": "SUSPECT",
-                    "why": f"meta does not record backend {expected_backend}"}
+    if expected_backend and not meta.has_backend(expected_backend):
+        return {"verdict": "SUSPECT",
+                "why": f"meta does not record backend {expected_backend}"}
     htp = htp_series(nd)
     if not htp:
         return {"verdict": "NO-DATA", "why": "no frame.objects lines"}
+    # json.loads accepts NaN/Infinity, and a non-finite score would sail
+    # through every threshold below (NaN compares False both ways) into
+    # whichever verdict that happens to reach. Data that isn't numbers is
+    # not gradable evidence — refuse it before any comparison runs.
+    if not all_finite(*(v for row in htp for v in row)):
+        return {"verdict": "SUSPECT",
+                "why": "non-finite score values in fetched ndjson"}
+    if not all_finite(*(v for series in (ref_cpu, ref_fp32) for row in series for v in row)):
+        return {"verdict": "SUSPECT",
+                "why": "non-finite values in reference series"}
     spans = person_windows(ref_fp32)
     if not spans:
         return {"verdict": "NO-WINDOW", "why": "fp32 never confident on this clip"}

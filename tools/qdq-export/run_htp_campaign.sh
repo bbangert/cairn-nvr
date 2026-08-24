@@ -67,6 +67,25 @@ fetch() { # <remote path> <local path>  (scp exits 1 on success — check artifa
   esac
 }
 
+# The one shape for "run a board command and read its result": remote()
+# swallows the command's rc (:os.cmd) and forbids pipes (~c|...|), so
+# every caller used to hand-roll write-file/fetch/verify slightly
+# differently — the #138 churn class. Here the command group's output is
+# captured to a tmp file whose truncation makes stale remote content
+# impossible, a sentinel line is appended only if the group exited 0, and
+# success means the fetched copy carries that sentinel — which is then
+# stripped, so callers read exactly the command's output. Commands whose
+# output could itself contain a bare "RV-OK" line have no claim here.
+remote_verified() { # <timeout-secs> <tag> <local-dest> <command..., no pipes>
+  local t=$1 tag=$2 dest=$3
+  shift 3
+  rm -f "$dest"
+  remote "$t" "{ $*; } > /data/tmp-$tag.txt 2>&1 && echo RV-OK >> /data/tmp-$tag.txt" || return 1
+  fetch "/data/tmp-$tag.txt" "$dest" || return 1
+  grep -q "^RV-OK$" "$dest" || return 1
+  sed -i '/^RV-OK$/d' "$dest"
+}
+
 # The 12 board-worthy rungs (phase 2.3 verdicts): every a16 plus the
 # three a8 survivors. name:profile:insize; raw yolo26/yolov8 heads
 # decode under the yolov8 profile (the bundled binary's contract).
@@ -86,15 +105,10 @@ yolov8n-qdq-a16:yolov8:640
 "
 
 engine_state() { # writes container names to $1 (local file)
-  # :os.cmd swallows the remote exit status, so success is a sentinel
-  # line, not an rc: a failed ps redirects its error into the file,
-  # which contains no "cairn" and would read as "engine stopped". The
-  # local snapshot is removed first so a fetch failure cannot leave a
-  # stale one to be graded.
-  rm -f "$1"
-  remote 30 "balena-engine ps --format {{.Names}} > /data/tmp-ps.txt 2>&1 && echo PS-OK >> /data/tmp-ps.txt" || return 1
-  fetch /data/tmp-ps.txt "$1" || return 1
-  grep -q "^PS-OK$" "$1"
+  # A failed ps would redirect its error into the file, contain no
+  # "cairn", and read as "engine stopped" — remote_verified's sentinel is
+  # what stands between those two states.
+  remote_verified 30 ps "$1" "balena-engine ps --format {{.Names}}"
 }
 
 ensure_engine_stopped() {
@@ -131,26 +145,20 @@ do_reboot() {
   # A reboot that never happened must not be reported as one: the ssh
   # command can fail before executing `reboot`, the board stays up, and
   # a liveness probe then "succeeds" immediately. The boot id is the
-  # witness — wait for it to CHANGE, not for the board to answer.
-  # Stale values on either side would fake a verified reboot: an old
-  # remote tmp file (or old local snapshot) that merely DIFFERS from
-  # post-reboot reality is not a before-value. Clear both, and require
-  # the write itself to reach the board.
-  rm -f "$HTP/.bootid-before"
-  remote 30 "rm -f /data/tmp-bootid.txt; cat /proc/sys/kernel/random/boot_id > /data/tmp-bootid.txt" \
-    || { log "FATAL: cannot write boot id on board"; exit 1; }
-  fetch /data/tmp-bootid.txt "$HTP/.bootid-before" || { log "FATAL: cannot read boot id"; exit 1; }
+  # witness — wait for it to CHANGE, not for the board to answer. Stale
+  # values on either side would fake a verified reboot; remote_verified's
+  # truncate-then-sentinel contract is what rules them out.
+  remote_verified 30 bootid "$HTP/.bootid-before" "cat /proc/sys/kernel/random/boot_id" \
+    || { log "FATAL: cannot read boot id"; exit 1; }
   [ -s "$HTP/.bootid-before" ] || { log "FATAL: boot id snapshot is empty"; exit 1; }
   remote 20 reboot
   sleep 20
   local waited=20
   while :; do
-    rm -f "$HTP/.bootid-after"
-    if remote 15 "cat /proc/sys/kernel/random/boot_id > /data/tmp-bootid.txt"; then
-      fetch /data/tmp-bootid.txt "$HTP/.bootid-after" || true
-      if [ -f "$HTP/.bootid-after" ] && ! cmp -s "$HTP/.bootid-before" "$HTP/.bootid-after"; then
-        break
-      fi
+    if remote_verified 15 bootid "$HTP/.bootid-after" "cat /proc/sys/kernel/random/boot_id" \
+       && [ -s "$HTP/.bootid-after" ] \
+       && ! cmp -s "$HTP/.bootid-before" "$HTP/.bootid-after"; then
+      break
     fi
     sleep 10
     waited=$((waited + 10))
@@ -170,8 +178,8 @@ do_push() {
   # The board script rides the same sha check as the artifacts below —
   # a silently-failed push here would run a STALE methodology and label
   # its output with today's date.
-  remote 60 "sha256sum /data/cairn-bench/htp_content_test.sh > /data/tmp-script-sha.txt 2>&1"
-  fetch /data/tmp-script-sha.txt "$HTP/.script-sha" || { log "FATAL: cannot verify script push"; exit 1; }
+  remote_verified 60 script-sha "$HTP/.script-sha" "sha256sum /data/cairn-bench/htp_content_test.sh" \
+    || { log "FATAL: cannot verify script push"; exit 1; }
   if [ "$(cut -d' ' -f1 "$HTP/.script-sha")" != "$(sha256sum "$HERE/htp_content_test.sh" | cut -d' ' -f1)" ]; then
     log "FATAL: htp_content_test.sh push mismatch"
     exit 1
@@ -182,8 +190,8 @@ do_push() {
   done <<< "$RUNGS"
   timeout 900 scp -q -o BatchMode=yes "${files[@]}" "$BOARD:/data/cairn-bench/artifacts-fixed/" 2>/dev/null
   # scp over nerves_ssh exits 1 even on success — verify by checksum.
-  remote 300 "sha256sum /data/cairn-bench/artifacts-fixed/*.onnx > /data/tmp-sha.txt 2>&1"
-  fetch /data/tmp-sha.txt "$HTP/pushed.sha256" || { log "FATAL: cannot verify push"; exit 1; }
+  remote_verified 300 push-sha "$HTP/pushed.sha256" "sha256sum /data/cairn-bench/artifacts-fixed/*.onnx" \
+    || { log "FATAL: cannot verify push"; exit 1; }
   local bad=0
   while IFS=: read -r name _ _; do
     [ -z "$name" ] && continue
@@ -201,14 +209,15 @@ do_push() {
 do_envcheck() {
   log "== envcheck: nano-parity spike (N=20)"
   ensure_engine_stopped
-  remote 240 "sh /data/qnn-spike/run_spike.sh 20 > /data/cairn-bench/content/spike-env.txt 2>&1"
-  fetch /data/cairn-bench/content/spike-env.txt "$HTP/spike-env.txt" || { log "FATAL: no spike output"; exit 1; }
+  remote_verified 240 spike "$HTP/spike-env.txt" "sh /data/qnn-spike/run_spike.sh 20" \
+    || { log "FATAL: spike run failed or its output is unverifiable"; exit 1; }
   python3 - "$HTP/spike-env.txt" <<'EOF' | tee -a "$LOG"
-import json, sys
+import json, math, sys
 # Phase-0 recorded: CPU p50 34.98-40.63 ms, QNN p50 6.40-6.66 ms (6.1x).
-# Bands are generous: the gate is "same regime", not "same run". The
-# spike's JSON lines swim in EP/DSP log noise — key off the lines, not
-# their position.
+# Bands are generous: the gate is "same regime", not "same run" — but
+# only over real numbers: NaN answers False to every band check and must
+# read FAIL, never slip through. The spike's JSON lines swim in EP/DSP
+# log noise — key off the lines, not their position.
 p50 = {}
 for line in open(sys.argv[1]):
     line = line.strip()
@@ -216,42 +225,31 @@ for line in open(sys.argv[1]):
         blob = json.loads(line)
         p50[blob["ep"]] = blob["p50_ms"]
 cpu, qnn = p50.get("cpu"), p50.get("qnn")
-ok = cpu and qnn and 25 <= cpu <= 60 and 4 <= qnn <= 13 and cpu / qnn >= 3
-print(f"envcheck: cpu p50={cpu} qnn p50={qnn} ratio={cpu/qnn:.1f}x"
+finite = all(isinstance(v, (int, float)) and math.isfinite(v) for v in (cpu, qnn))
+ok = finite and 25 <= cpu <= 60 and 4 <= qnn <= 13 and cpu / qnn >= 3
+ratio = f"{cpu / qnn:.1f}x" if finite and qnn > 0 else "?"
+print(f"envcheck: cpu p50={cpu} qnn p50={qnn} ratio={ratio}"
       f" -> {'PASS (matches phase-0 spike regime)' if ok else 'FAIL'}")
 sys.exit(0 if ok else 1)
 EOF
   [ "${PIPESTATUS[0]}" = 0 ] || { log "FATAL: envcheck failed — bench env untrusted, do not read scores from it"; exit 1; }
 }
 
+# "Is this fetched run current evidence" has ONE implementation, shared
+# with the analyzer: campaign_meta.py (stdlib-only, so the system python3
+# suffices). Bash keeps only the argument plumbing — emitted frames, a
+# complete non-suspect meta, and shas tying the run to THIS content-test
+# script, THESE flags, and today's model/clip bytes all live there. The
+# control has no local artifact under $ART; its bytes are pinned.
 fetched_run_current() { # <tag> <rung-label> <clip> <extra-flags>
-  local dir="$HTP/content/$1" local_art="$ART/$2.onnx" local_clip="$OUT/clips/clip-$3.mp4"
-  grep -q '"frame.objects"' "$dir/out.ndjson" 2>/dev/null || return 1
-  [ -f "$dir/meta" ] || return 1
-  grep -q "run suspect" "$dir/meta" && return 1
-  # The frames count doubles as the completion marker — the board script
-  # writes it only after the feed and plugin exit statuses. Absence of
-  # "run suspect" in a meta truncated by a killed ssh proves nothing.
-  grep -q "frame.objects lines:" "$dir/meta" || return 1
-  # Methodology digest: the run is only current if it was produced by
-  # THIS content-test script with THESE flags — a methodology change
-  # must regenerate evidence, not re-label old runs.
-  grep -q "$(sha256sum "$HERE/htp_content_test.sh" | cut -d' ' -f1)" "$dir/meta" || return 1
-  grep -qxF "extra_args: $4" "$dir/meta" || return 1
-  if [ -f "$local_art" ]; then
-    grep -q "$(sha256sum "$local_art" | cut -d' ' -f1)" "$dir/meta" || return 1
-  fi
-  # The control has no local artifact under $ART; its bytes are pinned.
-  if [ "$2" = control-old-nano-a16 ]; then
-    grep -q "$OLD_NANO_SHA" "$dir/meta" || return 1
-  fi
-  # A changed clip under the same tag must retry too — otherwise the run
-  # is skipped forever, the analyzer marks it STALE-EVIDENCE, and no
-  # rerun can regenerate it without manual deletion.
-  if [ -f "$local_clip" ]; then
-    grep -q "$(sha256sum "$local_clip" | cut -d' ' -f1)" "$dir/meta" || return 1
-  fi
-  return 0
+  # --extra-args=: the value starts with "--" and argparse would read a
+  # separate token as an option.
+  local args=(current "$HTP/content/$1"
+    --script "$HERE/htp_content_test.sh" "--extra-args=$4")
+  [ -f "$ART/$2.onnx" ] && args+=(--model "$ART/$2.onnx")
+  [ "$2" = control-old-nano-a16 ] && args+=(--require-sha "$OLD_NANO_SHA")
+  [ -f "$OUT/clips/clip-$3.mp4" ] && args+=(--clip "$OUT/clips/clip-$3.mp4")
+  python3 "$HERE/campaign_meta.py" "${args[@]}"
 }
 
 content_run() { # <backend> <model-path> <rung-label> <profile> <insize>
@@ -306,8 +304,8 @@ do_content() {
   # ceiling through this exact methodology, or the test cannot be
   # trusted to clear the fixed rungs. Authenticate the bytes first —
   # the label has no $ART artifact, so no other check sees them.
-  remote 60 "sha256sum /data/cairn-bench/yolox_nano-qdq-a16.onnx > /data/tmp-ctl-sha.txt"
-  fetch /data/tmp-ctl-sha.txt "$HTP/.ctl-sha" || { log "FATAL: cannot read control sha"; exit 1; }
+  remote_verified 60 ctl-sha "$HTP/.ctl-sha" "sha256sum /data/cairn-bench/yolox_nano-qdq-a16.onnx" \
+    || { log "FATAL: cannot read control sha"; exit 1; }
   grep -q "$OLD_NANO_SHA" "$HTP/.ctl-sha" || {
     log "FATAL: board control bytes are not the shipped defective nano ($OLD_NANO_SHA)"
     exit 1
@@ -318,22 +316,22 @@ do_content() {
 pin_governor() {
   # Capture the pre-campaign governor ONCE — never on re-entry, or a
   # second pin would record "performance" and finish would then restore
-  # the pin itself. What was actually there is what comes back.
-  # Verified by READBACK, not rc — :os.cmd discards the board command's
-  # exit status, so an `||` on remote() only sees ssh/timeout failures.
+  # the pin itself. What was actually there is what comes back. The save
+  # and the read of the saved value ride one verified command: the
+  # sentinel proves the chain ran, and the fetched copy is the value
+  # do_finish will restore.
   # A failed save leaves do_finish nothing to restore (the board stays
   # pinned forever); a failed pin would label unpinned latency evidence
   # as governor-pinned.
   # if/then, not `||`: remote() interpolates into a ~c|...| sigil, so a
   # pipe character would terminate the Elixir literal mid-command.
-  remote 30 "if test ! -f /data/campaign-gov.saved; then cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > /data/campaign-gov.saved; fi"
-  rm -f "$HTP/.gov-saved"
-  fetch /data/campaign-gov.saved "$HTP/.gov-saved" || { log "FATAL: cannot verify saved governor"; exit 1; }
+  remote_verified 30 gov-save "$HTP/.gov-saved" \
+    "if test ! -f /data/campaign-gov.saved; then cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > /data/campaign-gov.saved; fi; cat /data/campaign-gov.saved" \
+    || { log "FATAL: cannot verify saved governor"; exit 1; }
   [ -s "$HTP/.gov-saved" ] || { log "FATAL: saved governor file is empty"; exit 1; }
   remote 30 "for c in /sys/devices/system/cpu/cpu[0-9]*; do echo performance > \$c/cpufreq/scaling_governor; done"
-  rm -f "$HTP/.gov-check"
-  remote 30 "cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor > /data/tmp-gov.txt"
-  fetch /data/tmp-gov.txt "$HTP/.gov-check" || { log "FATAL: cannot read back governors"; exit 1; }
+  remote_verified 30 gov "$HTP/.gov-check" "cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor" \
+    || { log "FATAL: cannot read back governors"; exit 1; }
   [ -s "$HTP/.gov-check" ] || { log "FATAL: governor readback is empty"; exit 1; }
   grep -qv '^performance$' "$HTP/.gov-check" && { log "FATAL: governor pin did not take"; exit 1; }
   # The local marker records that THIS campaign pinned: do_finish uses
@@ -363,8 +361,8 @@ do_fetch() {
   log "== fetch evidence"
   mkdir -p "$HTP/content"
   fetch /data/cairn-bench/content "$HTP/" || log "WARN: content fetch incomplete"
-  remote 30 "ls /data/cairn-bench/runs > /data/tmp-runs.txt 2>&1"
-  fetch /data/tmp-runs.txt "$HTP/.runs-list"
+  remote_verified 30 runs "$HTP/.runs-list" "ls /data/cairn-bench/runs" \
+    || { log "WARN: cannot list bench runs — skipping bench-run fetch"; return; }
   # Without a latency-stage marker there are no new bench runs to pull —
   # and pulling unfiltered would drag in every historical run dir.
   [ -f "$HTP/.latency-start" ] || { log "no latency marker — skipping bench-run fetch"; return; }
@@ -390,7 +388,7 @@ do_finish() {
   # governor at all — restore-only means exactly that. The saved file is
   # kept until a READBACK verifies the restore took (:os.cmd discards
   # the rc), so a failed restore stays restorable on the next finish.
-  rm -f "$HTP/.gov-saved" "$HTP/.gov-check"
+  rm -f "$HTP/.gov-saved"
   if ! fetch /data/campaign-gov.saved "$HTP/.gov-saved" && [ -f "$HTP/.gov-pinned" ]; then
     # This campaign pinned (local marker), yet the saved value is
     # unreadable — that is NOT "nothing to restore": the board may
@@ -400,8 +398,8 @@ do_finish() {
   fi
   if [ -s "$HTP/.gov-saved" ]; then
     remote 30 "gov=\$(cat /data/campaign-gov.saved); for c in /sys/devices/system/cpu/cpu[0-9]*; do echo \$gov > \$c/cpufreq/scaling_governor; done"
-    remote 30 "cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor > /data/tmp-gov.txt"
-    if fetch /data/tmp-gov.txt "$HTP/.gov-check" && [ -s "$HTP/.gov-check" ] \
+    if remote_verified 30 gov "$HTP/.gov-check" "cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor" \
+       && [ -s "$HTP/.gov-check" ] \
        && ! grep -qvxF "$(cat "$HTP/.gov-saved")" "$HTP/.gov-check"; then
       remote 30 "rm -f /data/campaign-gov.saved"
       rm -f "$HTP/.gov-pinned"
