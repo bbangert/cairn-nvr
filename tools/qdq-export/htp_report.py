@@ -176,6 +176,15 @@ def htp_series(ndjson_path):
                 # the retry guard already rejects.
                 raise ValueError(f"non-finite pts {pts!r}")
             objs = msg["objects"]
+            for o in objs:
+                s = o["score"]
+                if not is_finite(s) or not 0.0 <= s <= 1.0:
+                    # Validate RAW values: max() with NaN is
+                    # order-dependent (max(0.9, nan) keeps 0.9), so a
+                    # poisoned frame could reduce to a clean number; and
+                    # 0..1 is the plugin contract — outside it is
+                    # corrupted evidence, not a strong detection.
+                    raise ValueError(f"score {s!r} outside the plugin contract")
             person = max((o["score"] for o in objs if o["label"] == "person"), default=0.0)
             best = max((o["score"] for o in objs), default=0.0)
             series.append((pts / 90000.0, person, best))

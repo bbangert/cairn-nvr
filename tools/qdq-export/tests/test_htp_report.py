@@ -153,7 +153,7 @@ def test_nan_scores_are_suspect_not_gradable(tmp_path):
     run = write_run(tmp_path, emissions([0.93] * 40) + [(8.0, math.nan)])
     r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
     assert r["verdict"] == "SUSPECT"
-    assert r["why"] == "non-finite score values in fetched ndjson"
+    assert r["why"] == "malformed frame.objects message in fetched ndjson"
 
 
 def test_malformed_pts_is_suspect_not_a_crash(tmp_path):
@@ -171,6 +171,32 @@ def test_malformed_pts_is_suspect_not_a_crash(tmp_path):
         r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
         assert r["verdict"] == "SUSPECT", name
         assert r["why"] == "malformed frame.objects message in fetched ndjson"
+
+
+def test_nan_hidden_behind_max_is_still_suspect(tmp_path):
+    # max(0.9, nan) keeps 0.9 — a poisoned frame whose NaN sits after a
+    # clean score would reduce to a clean number and grade PASS if raw
+    # values were not validated before reduction.
+    run = write_run(tmp_path, emissions([0.93] * 41))
+    bad = json.dumps({"type": "frame.objects", "frame": {"pts": 720000},
+                      "objects": [{"label": "person", "score": 0.9},
+                                  {"label": "person", "score": math.nan}]})
+    with open(f"{run}/out.ndjson", "a") as f:
+        f.write(bad + "\n")
+    r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
+    assert r["verdict"] == "SUSPECT"
+
+
+def test_out_of_range_score_is_suspect(tmp_path):
+    # 0..1 is the plugin contract; a 1.5 is corrupted evidence, not a
+    # strong detection — unguarded it could even lift a verdict to PASS.
+    run = write_run(tmp_path, emissions([0.93] * 41))
+    bad = json.dumps({"type": "frame.objects", "frame": {"pts": 720000},
+                      "objects": [{"label": "person", "score": 1.5}]})
+    with open(f"{run}/out.ndjson", "a") as f:
+        f.write(bad + "\n")
+    r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
+    assert r["verdict"] == "SUSPECT"
 
 
 def test_bare_scalar_json_line_is_noise(tmp_path):
@@ -203,7 +229,7 @@ def test_boolean_score_is_suspect(tmp_path):
     run = write_run(tmp_path, emissions([0.93] * 40) + [(8.0, True)])
     r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
     assert r["verdict"] == "SUSPECT"
-    assert r["why"] == "non-finite score values in fetched ndjson"
+    assert r["why"] == "malformed frame.objects message in fetched ndjson"
 
 
 def test_overlarge_int_score_is_suspect(tmp_path):
@@ -212,7 +238,7 @@ def test_overlarge_int_score_is_suspect(tmp_path):
     run = write_run(tmp_path, emissions([0.93] * 40) + [(8.0, 10 ** 400)])
     r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
     assert r["verdict"] == "SUSPECT"
-    assert r["why"] == "non-finite score values in fetched ndjson"
+    assert r["why"] == "malformed frame.objects message in fetched ndjson"
 
 
 def test_nan_reference_is_suspect(tmp_path):

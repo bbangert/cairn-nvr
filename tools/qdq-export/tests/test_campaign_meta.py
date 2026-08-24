@@ -112,6 +112,15 @@ def test_meta_truncated_mid_line_never_crashes():
     assert meta.profile is None
 
 
+def test_completion_marker_prefix_is_not_completion(tmp_path):
+    # A meta cut right after the marker's prefix (before the count) is a
+    # truncated run wearing the marker — only the writer's full numeric
+    # line counts.
+    meta = RunMeta.load(write_run(tmp_path, meta_text(completion="frame.objects lines:")))
+    assert not meta.completion
+    assert "completion marker" in meta.suspect_reason()
+
+
 def test_malformed_script_sha_line_is_stale_not_legacy(tmp_path):
     # Legacy = the script sha is ABSENT (pre-digest meta). A meta that
     # mentions the script but whose sha line is corrupt must stay in the
@@ -282,6 +291,7 @@ def test_current_cli_rejects_partially_poisoned_ndjson(tmp_path, interpreter, lo
         "boolframe": good + '{"type":"frame.objects","pts":90000,"objects":[{"label":"person","score":true}]}\n',
         "fieldless": good + '{"type":"frame.objects","pts":90000}\n',
         "cutline": good + '{"type":"frame.objects","pts":90000,"obj',
+        "rangeframe": good + '{"type":"frame.objects","pts":90000,"objects":[{"label":"person","score":1.5}]}\n',
     }
     for name, ndjson in cases.items():
         run = write_run(tmp_path, meta_text(**shas), ndjson=ndjson, name=name)

@@ -24,7 +24,9 @@ from finite import is_finite
 # names); no board path does today, and a miss fails closed (stale →
 # retry) — but a writer change to spaced paths must revisit this.
 _SHA_LINE = re.compile(r"^([0-9a-f]{64})\s+(\S+)$")
-COMPLETION_MARKER = "frame.objects lines:"
+# The FULL line the writer emits, not its prefix: a meta truncated right
+# after "frame.objects lines:" is an incomplete run wearing the marker.
+_COMPLETION_LINE = re.compile(r"^frame\.objects lines: \d+$")
 
 
 def file_sha256(path):
@@ -70,7 +72,7 @@ class RunMeta:
             elif line.startswith("extra_args:"):
                 rest = line[len("extra_args:"):]
                 self.extra_args = rest[1:] if rest.startswith(" ") else rest
-            elif line.startswith(COMPLETION_MARKER):
+            elif _COMPLETION_LINE.match(line):
                 self.completion = True
 
     @classmethod
@@ -175,7 +177,12 @@ def _frames_gradable(lines):
             fields = [(o["label"], o["score"]) for o in msg["objects"]]
         except (KeyError, TypeError):
             return False
-        if not is_finite(pts) or not all(is_finite(s) for _, s in fields):
+        # 0..1 is the plugin contract (sigmoid scores): out-of-range is
+        # corrupted evidence exactly like NaN, and a >1 score could even
+        # grade PASS downstream.
+        if not is_finite(pts) or not all(
+            is_finite(s) and 0.0 <= s <= 1.0 for _, s in fields
+        ):
             return False
         saw = True
     return saw
