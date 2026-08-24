@@ -45,6 +45,13 @@ CONTAINER=${CONTAINER:-addon_c2da371c_cairn}
 
 cd "$(dirname "$0")/../.."
 
+# Compile BEFORE the asset build, the Docker build's own order: both asset
+# entry points import phoenix-colocated/cairn from the Mix build path, so an
+# uncompiled prod build fails to resolve it and a stale one silently bundles
+# old colocated hooks.
+echo "[push] compiling (prod)"
+MIX_ENV=prod mix compile >/dev/null
+
 # Before the release, not as part of it: this project's `releases:` block has
 # no `steps:` hook, so `mix release` assembles whatever is in priv/static and
 # never digests. Release assembly then copies priv (a symlink into the source
