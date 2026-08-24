@@ -224,7 +224,7 @@ def run_is_current(
         return False
     try:
         # Strict decoding, like the analyzer's own read: invalid UTF-8
-        # anywhere is corrupted evidence — rerun (rc 1), never rc>=2, and
+        # anywhere is corrupted evidence — rerun (rc 4), never fatal, and
         # never "current" for a file htp_series will refuse to decode.
         with open(os.path.join(run_dir, "out.ndjson")) as f:
             frames = _gradable_frame_count(f)
