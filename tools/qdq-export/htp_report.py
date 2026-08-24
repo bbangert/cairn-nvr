@@ -250,7 +250,15 @@ def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None,
     if expected_backend and not meta.has_backend(expected_backend):
         return {"verdict": "SUSPECT",
                 "why": f"meta does not record backend {expected_backend}"}
-    htp = htp_series(nd)
+    try:
+        htp = htp_series(nd)
+    except (TypeError, KeyError, ValueError):
+        # A frame.objects message missing the fields this consumes, or
+        # mixing numeric and string scores (max raises before any finite
+        # check can see the values), is malformed evidence — grade it,
+        # never crash the report over it.
+        return {"verdict": "SUSPECT",
+                "why": "malformed frame.objects message in fetched ndjson"}
     if not htp:
         return {"verdict": "NO-DATA", "why": "no frame.objects lines"}
     # json.loads accepts NaN/Infinity, and a non-finite score would sail

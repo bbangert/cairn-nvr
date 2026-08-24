@@ -156,6 +156,20 @@ def test_nan_scores_are_suspect_not_gradable(tmp_path):
     assert r["why"] == "non-finite score values in fetched ndjson"
 
 
+def test_mixed_type_scores_are_suspect_not_a_crash(tmp_path):
+    # A frame mixing numeric and string scores makes max() raise inside
+    # htp_series — before any finite check sees the values.
+    run = write_run(tmp_path, emissions([0.93] * 40))
+    bad = json.dumps({"type": "frame.objects", "frame": {"pts": 720000},
+                      "objects": [{"label": "person", "score": 0.9},
+                                  {"label": "person", "score": "bad"}]})
+    with open(f"{run}/out.ndjson", "a") as f:
+        f.write(bad + "\n")
+    r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
+    assert r["verdict"] == "SUSPECT"
+    assert r["why"] == "malformed frame.objects message in fetched ndjson"
+
+
 def test_boolean_score_is_suspect(tmp_path):
     # json `true` where a score belongs: bool subclasses int, so without
     # the explicit rejection it would grade numerically as 1.

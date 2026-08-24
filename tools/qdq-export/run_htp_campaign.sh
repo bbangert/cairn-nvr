@@ -71,21 +71,25 @@ fetch() { # <remote path> <local path>  (scp exits 1 on success — check artifa
 # swallows the command's rc (:os.cmd) and forbids pipes (~c|...|), so
 # every caller used to hand-roll write-file/fetch/verify slightly
 # differently — the #138 churn class. The command group's output goes to
-# one tmp file and a per-call NONCE goes to a separate .ok file only if
-# the group exited 0; success requires the fetched .ok to carry THIS
-# call's nonce. The nonce is what defeats stale state: /data persists
-# (across reboots too) and tags are shared between call sites, so a
-# leftover .ok from an earlier call verifies nothing — and keeping the
-# sentinel out of the output file means no output shape (missing trailing
-# newline, a sentinel-look-alike line) can defeat or fake it.
+# one tmp file; a separate .ok file, written only if the group exited 0,
+# carries a per-call NONCE plus the output's sha256. Success requires the
+# fetched .ok to carry THIS call's nonce AND the fetched output to match
+# the recorded digest. The nonce defeats stale state (/data persists,
+# across reboots too, and tags are shared between call sites); the digest
+# defeats partial transfer (fetch() cannot read scp's rc — this transport
+# exits 1 even on success — so an interrupted copy leaves a shorter file
+# that exists, and a complete .ok from its own later scp must not vouch
+# for it). Keeping both out of the output file means no output shape can
+# defeat or fake the verification.
 remote_verified() { # <timeout-secs> <tag> <local-dest> <command..., no pipes>
   local t=$1 tag=$2 dest=$3 nonce="RV-$$-$RANDOM-$RANDOM"
   shift 3
   rm -f "$dest" "$dest.ok"
-  remote "$t" "rm -f /data/tmp-$tag.ok; { $*; } > /data/tmp-$tag.txt 2>&1 && echo $nonce > /data/tmp-$tag.ok" || return 1
+  remote "$t" "rm -f /data/tmp-$tag.ok; { $*; } > /data/tmp-$tag.txt 2>&1 && { sha256sum /data/tmp-$tag.txt; echo $nonce; } > /data/tmp-$tag.ok" || return 1
   fetch "/data/tmp-$tag.txt" "$dest" || return 1
   fetch "/data/tmp-$tag.ok" "$dest.ok" || return 1
   grep -qxF "$nonce" "$dest.ok" || return 1
+  [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$(head -1 "$dest.ok" | cut -d' ' -f1)" ] || return 1
   rm -f "$dest.ok"
 }
 
