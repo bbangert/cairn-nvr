@@ -15,6 +15,13 @@ def test_is_finite_closed_by_default():
         assert not is_finite(v)
 
 
+def test_overlarge_int_is_non_finite_not_an_exception():
+    # json.loads produces arbitrary-precision ints from corrupted
+    # evidence; math.isfinite raises OverflowError converting them.
+    assert not is_finite(10 ** 400)
+    assert not is_finite(-(10 ** 400))
+
+
 def test_all_finite():
     assert all_finite(1, 2.0, 0)
     assert not all_finite(1, math.nan)

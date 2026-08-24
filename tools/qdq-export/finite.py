@@ -16,7 +16,10 @@ def is_finite(v):
         return False
     try:
         return math.isfinite(v)
-    except TypeError:
+    except (TypeError, OverflowError):
+        # OverflowError: json.loads turns corrupted evidence into
+        # arbitrary-precision ints that isfinite cannot convert — that is
+        # a non-finite input, not an exception for the gate to leak.
         return False
 
 

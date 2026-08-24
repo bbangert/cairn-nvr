@@ -156,6 +156,15 @@ def test_nan_scores_are_suspect_not_gradable(tmp_path):
     assert r["why"] == "non-finite score values in fetched ndjson"
 
 
+def test_overlarge_int_score_is_suspect(tmp_path):
+    # json.loads yields a python int too large for float conversion;
+    # the guard must grade it, not leak an OverflowError.
+    run = write_run(tmp_path, emissions([0.93] * 40) + [(8.0, 10 ** 400)])
+    r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
+    assert r["verdict"] == "SUSPECT"
+    assert r["why"] == "non-finite score values in fetched ndjson"
+
+
 def test_nan_reference_is_suspect(tmp_path):
     # Backstop for series handed to analyze_run directly; the primary
     # gate is cpu_series aborting at the source (next test).
