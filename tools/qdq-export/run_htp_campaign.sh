@@ -426,10 +426,12 @@ do_finish() {
   # Through remote_verified, not a raw fetch: a partial scp of the saved
   # value would create an empty local file that skips both the error
   # branch AND the [ -s ] restore below — finish would report success
-  # with the board still pinned. The digest authenticates the bytes; a
-  # board with no saved file fails the read, which the .gov-pinned
-  # marker then classifies.
-  if ! remote_verified 30 gov-read "$HTP/.gov-saved" "cat /data/campaign-gov.saved" \
+  # with the board still pinned. The digest authenticates the bytes, and
+  # `test -s` makes an EMPTY board file fail the read too (cat alone
+  # succeeds on empty, skipping the same two branches). A failed read
+  # with no .gov-pinned marker is the no-op path; with the marker it is
+  # fatal.
+  if ! remote_verified 30 gov-read "$HTP/.gov-saved" "test -s /data/campaign-gov.saved && cat /data/campaign-gov.saved" \
      && [ -f "$HTP/.gov-pinned" ]; then
     # This campaign pinned (local marker), yet the saved value is
     # unreadable — that is NOT "nothing to restore": the board may
