@@ -108,6 +108,16 @@ def test_collapse_cpu_reference_all_zero(tmp_path):
     assert r["why"].startswith("CPU-EP reference <= 0")
 
 
+def test_mostly_zero_cpu_reference_is_insufficient(tmp_path):
+    # MIN_PAIRED must bind the ratios the median runs on: 40 zero-
+    # reference rows plus ONE positive would otherwise grade the rung on
+    # a single lucky ratio — one match certifying nothing.
+    run = write_run(tmp_path, emissions([0.93] * 41))
+    r = analyze_run(run, ref([0.0] * 40 + [0.95]), ref(CONFIDENT))
+    assert r["verdict"] == "INSUFFICIENT"
+    assert "positive CPU reference" in r["why"]
+
+
 def test_no_data_paths(tmp_path):
     run = tmp_path / "empty-run"
     run.mkdir()
@@ -350,6 +360,9 @@ def test_latency_table_marker_and_staleness(tmp_path):
     marker.write_text("")
     assert latency_table(str(runs), start_marker=str(marker)) == {}
     marker.write_text("not-an-epoch")
+    assert latency_table(str(runs), start_marker=str(marker)) == {}
+    # undecodable marker bytes: same fail-closed answer, not an abort
+    marker.write_bytes(b"\xff\xfe")
     assert latency_table(str(runs), start_marker=str(marker)) == {}
     # marker after the run: still nothing
     marker.write_text("200")

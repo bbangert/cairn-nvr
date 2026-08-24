@@ -182,8 +182,13 @@ class RunMeta:
         return None
 
 
-def records_script(run_dir: str) -> bool:
-    return RunMeta.load(run_dir).records_script
+def is_legacy(run_dir: str) -> bool:
+    """A LEGACY run has a real, decodable meta that simply predates the
+    methodology digest. Missing or corrupt metas are NOT legacy — they
+    grade suspect elsewhere, and labeling them 'legacy, bytes verified'
+    in the report would vouch for evidence nobody verified."""
+    meta = RunMeta.load(run_dir)
+    return meta.exists and not meta.corrupt and not meta.records_script
 
 
 def _gradable_frame_count(lines: Iterable[str]) -> int | None:
@@ -197,12 +202,18 @@ def _gradable_frame_count(lines: Iterable[str]) -> int | None:
     truncated-transfer check against meta's recorded total."""
     count = 0
     for line in lines:
-        if '"frame.objects"' not in line:
-            continue
+        # Parse every line, exactly as htp_series does — a prefilter on
+        # the literal would skip a frame whose type arrives
+        # escape-encoded ("frame.objects"), making the guard count
+        # disagree with the analyzer's. Unparseable lines are ordinary
+        # stdout noise UNLESS they carry the literal, in which case they
+        # are a corrupted frame line and poison the run.
         try:
             msg = json.loads(line)
         except json.JSONDecodeError:
-            return None
+            if '"frame.objects"' in line:
+                return None
+            continue
         if not isinstance(msg, dict) or msg.get("type") != "frame.objects":
             continue
         # objects must be a LIST of dicts (validate_ndjson's shape rule):

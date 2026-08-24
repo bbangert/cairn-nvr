@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from campaign_meta import RunMeta, file_sha256, records_script
+from campaign_meta import RunMeta, file_sha256, is_legacy
 
 SCRIPT_SHA = "a" * 64
 MODEL_SHA = "b" * 64
@@ -201,10 +201,20 @@ def test_legacy_meta_skips_script_not_model(tmp_path):
     # Pre-digest metas record no script sha: unrecorded, not wrong. The
     # same leniency must never extend to model/clip bytes.
     run = write_run(tmp_path, meta_text(script_sha=None))
-    assert not records_script(run)
+    assert is_legacy(run)
     meta = RunMeta.load(run)
     assert meta.stale_reason({"script": SCRIPT_SHA}) is None
     assert meta.stale_reason({"model": "0" * 64}) is not None
+
+
+def test_legacy_requires_a_real_meta(tmp_path):
+    # Missing or undecodable metas are NOT legacy — the report's legacy
+    # note says "bytes verified", which nobody verified for those.
+    run = tmp_path / "nometa"
+    run.mkdir()
+    assert not is_legacy(str(run))
+    (run / "meta").write_bytes(b"\xff\xfe corrupt")
+    assert not is_legacy(str(run))
 
 
 # The bash retry guard runs the SYSTEM python3 — stdlib-only is part of
@@ -338,6 +348,11 @@ def test_current_cli_rejects_partially_poisoned_ndjson(tmp_path, interpreter, lo
         "rangeframe": good + '{"type":"frame.objects","pts":90000,"objects":[{"label":"person","score":1.5}]}\n',
         "dictobjects": good + '{"type":"frame.objects","pts":90000,"objects":{}}\n',
         "strobjects": good + '{"type":"frame.objects","pts":90000,"objects":""}\n',
+        # escape-encoded type: no literal in the raw line, but it parses
+        # to a real frame — the guard must count it like the analyzer
+        # does (count 2 vs meta's 1 -> not current), never skip it on a
+        # textual prefilter and disagree with the analyzer forever.
+        "escapedtype": good + '{"type":"\\u0066rame.objects","pts":90000,"objects":[{"label":"person","score":0.9}]}\n',
     }
     for name, ndjson in cases.items():
         run = write_run(tmp_path, meta_text(**shas), ndjson=ndjson, name=name)

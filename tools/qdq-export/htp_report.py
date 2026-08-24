@@ -35,7 +35,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from campaign_meta import RunMeta, file_sha256, records_script  # noqa: E402
+from campaign_meta import RunMeta, file_sha256, is_legacy  # noqa: E402
 from finite import all_finite_in, is_finite  # noqa: E402
 from score_parity import REPORTABLE, scores  # noqa: E402
 
@@ -351,6 +351,14 @@ def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None,
         result.update({"verdict": "COLLAPSE",
                        "why": "CPU-EP reference <= 0 on every paired frame (artifact collapse, not an HTP defect)"})
         return result
+    if ratios_cpu.size < MIN_PAIRED:
+        # MIN_PAIRED must bind the ratios the median actually runs on,
+        # not the raw pair count: 40 zero-reference rows plus one lucky
+        # positive ratio is one match certifying nothing.
+        result.update({"verdict": "INSUFFICIENT",
+                       "why": (f"only {int(ratios_cpu.size)} paired frames have a "
+                               f"positive CPU reference (< {MIN_PAIRED})")})
+        return result
     med = float(np.median(ratios_cpu))
     iqr = float(np.subtract(*np.percentile(ratios_cpu, [75, 25])))
     below_half = int((ratios_cpu < 0.5).sum())
@@ -411,10 +419,11 @@ def latency_table(runs_dir, start_marker=None, pushed_file=None, art_dir=None):
         # run as current. try/int, not isdigit — isdigit accepts
         # characters int() refuses (superscripts) and refuses the sign
         # int() accepts.
-        raw = open(start_marker).read().strip()
         try:
-            start = int(raw)
-        except ValueError:
+            start = int(open(start_marker).read().strip())
+        except (OSError, UnicodeDecodeError, ValueError):
+            # unreadable, undecodable, or non-numeric all mean the same
+            # thing: no current latency stage
             return {}
         if start <= 0:
             return {}
@@ -539,7 +548,7 @@ def main():
                                "script": script_sha},
                 expected_backend="qnn",
             )
-            if not records_script(run_dir):
+            if is_legacy(run_dir):
                 legacy_runs.append(f"{rung}-qnn-{c}")
             verdicts[rung].append(r["verdict"])
             report.append(
@@ -565,7 +574,7 @@ def main():
                                        "clip": clip_shas.get("ac86"),
                                        "script": script_sha},
                         score_fidelity_only=True, expected_backend="ort")
-        if not records_script(ort_ctl):
+        if is_legacy(ort_ctl):
             legacy_runs.append("ort-control")
         if r["verdict"] != "PASS":
             controls_invalid.append(
@@ -598,7 +607,7 @@ def main():
                                        "clip": clip_shas.get("ac86"),
                                        "script": script_sha},
                         expected_backend="qnn")
-        if not records_script(old_ctl):
+        if is_legacy(old_ctl):
             legacy_runs.append("defective-control")
         # The control is valid ONLY if it reproduces the known defect's
         # signature. "Anything but PASS" would let NO-DATA / SUSPECT /
