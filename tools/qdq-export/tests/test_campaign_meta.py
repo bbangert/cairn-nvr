@@ -296,6 +296,12 @@ def test_current_cli_rejects_partially_poisoned_ndjson(tmp_path, interpreter, lo
     for name, ndjson in cases.items():
         run = write_run(tmp_path, meta_text(**shas), ndjson=ndjson, name=name)
         assert current_cli(interpreter, run, str(script), "--qnn-library x") == 1, name
+    # invalid UTF-8 in a NOISE line still poisons: the analyzer reads
+    # strictly and could not decode this file at all
+    run = write_run(tmp_path, meta_text(**shas), ndjson=None, name="binnoise")
+    with open(tmp_path / "binnoise" / "out.ndjson", "wb") as f:
+        f.write(good.encode() + b"\xff\xfe binary noise\n")
+    assert current_cli(interpreter, run, str(script), "--qnn-library x") == 1
     # a non-frame message merely EMBEDDING the literal is analyzer-ignored
     # noise, not poison
     run = write_run(

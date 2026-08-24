@@ -268,6 +268,11 @@ def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None,
                 "why": f"meta does not record backend {expected_backend}"}
     try:
         htp = htp_series(nd)
+    except UnicodeDecodeError:
+        # Same strict read as the retry guard, same conclusion: bytes
+        # that don't decode are corrupted evidence, not a report abort.
+        return {"verdict": "SUSPECT",
+                "why": "invalid encoding in fetched ndjson"}
     except (TypeError, KeyError, ValueError, AttributeError, OverflowError):
         # A frame.objects message missing the fields this consumes, or
         # mixing numeric and string scores (max raises before any finite

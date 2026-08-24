@@ -199,6 +199,18 @@ def test_out_of_range_score_is_suspect(tmp_path):
     assert r["verdict"] == "SUSPECT"
 
 
+def test_invalid_encoding_is_suspect_not_a_crash(tmp_path):
+    # Bytes that don't decode are corrupted evidence — the strict read
+    # must land in a verdict, not a UnicodeDecodeError aborting the
+    # report; the retry guard rejects the same file as not-current.
+    run = write_run(tmp_path, emissions([0.93] * 41))
+    with open(f"{run}/out.ndjson", "ab") as f:
+        f.write(b"\xff\xfe binary noise\n")
+    r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
+    assert r["verdict"] == "SUSPECT"
+    assert r["why"] == "invalid encoding in fetched ndjson"
+
+
 def test_bare_scalar_json_line_is_noise(tmp_path):
     # QAIRT noise can be a bare number, which json.loads happily parses;
     # it is stdout noise like any unparseable line, not frame evidence.

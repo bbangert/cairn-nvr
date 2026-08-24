@@ -195,13 +195,13 @@ def _current(args):
     run can emit a frame before dying, and an old run under the same tag
     can describe different bytes; both must retry."""
     try:
-        # errors="replace": a binary-corrupted ndjson is bad EVIDENCE
-        # (rerun, exit 1), not a broken guard — it must not escape as a
-        # UnicodeDecodeError into the rc>=2 lane.
-        with open(os.path.join(args.run_dir, "out.ndjson"), errors="replace") as f:
+        # Strict decoding, like the analyzer's own read: invalid UTF-8
+        # anywhere is corrupted evidence — rerun (rc 1), never rc>=2, and
+        # never "current" for a file htp_series will refuse to decode.
+        with open(os.path.join(args.run_dir, "out.ndjson")) as f:
             if not _frames_gradable(f):
                 return False
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return False
     meta = RunMeta.load(args.run_dir)
     if meta.suspect_reason() is not None:
