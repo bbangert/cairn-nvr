@@ -33,3 +33,6 @@ cameras:
     rtsp_url: rtsp://127.0.0.1:8554/d
     substream_url: rtsp://127.0.0.1:8554/d_sub
     ingest: rtsp
+    # the dual-stream camera is exactly the one that needs it: detections are
+    # timed against the sub, artifacts are cut from main
+    annotation_offset_ms: -400

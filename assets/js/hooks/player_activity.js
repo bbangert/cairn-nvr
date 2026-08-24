@@ -14,10 +14,23 @@
 // knows. Every report carries `camera_id`, which the LiveView checks against
 // its own camera list before acting on it.
 
-export function reportActive(hook) {
-  if (hook._playerActive) return
+// The dimensions ride along because the server draws the boxes and cannot
+// see the picture: a NormBox is relative to the video FRAME, the overlay's
+// percentages resolve against a fixed-aspect TILE, and `object-fit: cover`
+// crops the difference away. Only the element knows what that difference is.
+// Both callers reach here with a frame decoded, so videoWidth/videoHeight
+// are real rather than the 0 they read before metadata.
+export function reportActive(hook, video) {
+  const width = video.videoWidth
+  const height = video.videoHeight
+  // A later loadeddata is only a duplicate while the intrinsic dims are
+  // unchanged: a source reset can change resolution, and the server corrects
+  // box geometry with whatever it was last told.
+  if (hook._playerActive && hook._reportedW === width && hook._reportedH === height) return
   hook._playerActive = true
-  hook.pushEvent("webrtc_active", {camera_id: hook.cameraId})
+  hook._reportedW = width
+  hook._reportedH = height
+  hook.pushEvent("webrtc_active", {camera_id: hook.cameraId, width, height})
 }
 
 export function reportInactive(hook) {
@@ -39,7 +52,7 @@ export function reportTransportFailed(hook) {
 // Wires `loadeddata` — the first decoded frame — to `reportActive`. Fires
 // again after any source reset, which is why `reportActive` dedupes.
 export function watchFirstFrame(hook, video) {
-  hook._onLoadedData = () => reportActive(hook)
+  hook._onLoadedData = () => reportActive(hook, video)
   video.addEventListener("loadeddata", hook._onLoadedData)
 }
 
@@ -57,7 +70,7 @@ export function watchFirstFrame(hook, video) {
 // will report when one arrives.
 export function rearmOnReconnect(hook, video) {
   hook._playerActive = false
-  if (video.readyState >= 2) reportActive(hook)
+  if (video.readyState >= 2) reportActive(hook, video)
 }
 
 export function unwatchFirstFrame(hook, video) {

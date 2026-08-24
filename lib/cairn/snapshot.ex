@@ -7,7 +7,9 @@ defmodule Cairn.Snapshot do
   (`Cairn.EventArtifact`), so a consumer knows whether to fetch or to give up.
 
   When the event carries a `trigger` (the highest-scoring detection, captured
-  by `Cairn.CameraTracker`), the frame is cut from that detection's
+  by `Cairn.CameraTracker` or, on a tier-1 camera, `Cairn.PresenceRecorder` —
+  whose triggers commonly sit in the pre-roll, at a negative `t`), the frame
+  is cut from that detection's
   moment in the clip and its bounding box + label are drawn on top — a
   Frigate-style "why did this record" thumbnail. The seek lands on the nearest
   keyframe (fast `-ss`), so on a long GOP the box can be a beat off the exact
@@ -112,7 +114,35 @@ defmodule Cairn.Snapshot do
         nil
 
       trig ->
-        raw = anchored_seek(row, trig) || pre_window(config, row.camera_id) + trigger_t(trig)
+        # Floored because `trigger_t/1` may be NEGATIVE — a presence-born
+        # trigger whose detection sat in the clip's pre-roll — and the pre-roll
+        # actually RETAINED can be shorter than the configured one the estimate
+        # adds it to (an unfilled ring, or the extractor cutting back to a
+        # keyframe). When |t| exceeds it the estimate goes before the clip's
+        # first sample, and ffmpeg's `-ss` would land nowhere useful.
+        #
+        # It bites only on that estimate: the anchored path never returns a
+        # negative, because a result before the start of the clip is
+        # `anchor_clip_ms/2`'s `:error` and falls through to here (see
+        # `anchored_seek/3` — a miss there is deliberate, not a clamp).
+        # The annotation offset lands here, on the seek and not on the box:
+        # the trigger's coordinates are what the detector saw, and what is
+        # wrong on a lagging pair of streams is WHICH FRAME they belong to.
+        # Applied to the trigger time BEFORE the anchor judges it, so the
+        # anchor validates the CORRECTED seek — an unshifted trigger in the
+        # pre-roll can be invalid while the shifted one is a perfectly good
+        # position, and rejecting it would fall back to the coarser
+        # configured-pre-roll estimate for no reason. Inside the floor and
+        # ahead of the duration clamp, so a large offset is bounded by the
+        # same two rules as everything else.
+        offset = Config.annotation_offset_ms(config, row.camera_id) / 1000
+
+        raw =
+          max(
+            anchored_seek(row, trig, offset) ||
+              pre_window(config, row.camera_id) + trigger_t(trig) + offset,
+            0.0
+          )
 
         case probe_duration(row.path) do
           {:ok, dur} when dur > 0 -> min(raw, max(dur - 0.2, 0.0))
@@ -209,17 +239,18 @@ defmodule Cairn.Snapshot do
   # decided there so this and the browser overlay cannot drift apart on which
   # anchor answers. A negative seek is worse than the estimate it would
   # replace, so it is a miss there rather than something clamped to zero here.
-  defp anchored_seek(%{path: path}, trig) when is_binary(path) do
+  defp anchored_seek(%{path: path}, trig, offset_s) when is_binary(path) do
     with {:ok, bytes} <- File.read(DataDir.trackpath_for_clip(path)),
          {:ok, %{"anchor" => anchor}} <- TrackPath.decode(bytes),
-         {:ok, clip_ms} <- TrackPath.anchor_clip_ms(anchor, trigger_t(trig) * 1000) do
+         {:ok, clip_ms} <-
+           TrackPath.anchor_clip_ms(anchor, (trigger_t(trig) + offset_s) * 1000) do
       clip_ms / 1000
     else
       _miss -> nil
     end
   end
 
-  defp anchored_seek(_row, _trig), do: nil
+  defp anchored_seek(_row, _trig, _offset_s), do: nil
 
   # The trigger's offset into the event, in seconds. A JSON round-trip can put
   # anything in there; anything but a number is read as the event's own start.

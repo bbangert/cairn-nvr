@@ -46,7 +46,12 @@ defmodule Cairn.Config.Camera do
   @known_keys ~w(id rtsp_url substream_url plugin pipeline ingest min_score track record
                  extra_ffmpeg_args transcode retention pre_window_seconds post_window_seconds
                  max_event_seconds max_unseen_ms max_live_tracks stationary_after_ms tracker
-                 motion_json)
+                 motion_json annotation_offset_ms)
+
+  # Wider than any plausible stream lag; the bound exists so a typo (seconds
+  # written as ms, or a stray zero) is an error naming itself rather than
+  # annotations silently landing outside every clip.
+  @max_annotation_offset_ms 30_000
 
   @default_min_score %{"default" => 0.5}
 
@@ -74,7 +79,10 @@ defmodule Cairn.Config.Camera do
             # zones and thresholds. Validated at load, carried to the detect
             # branch's gate element as `stream_params.motion_json`. Tier-2
             # groups reject it (D-S4, `Cairn.Config.validate/2`).
-            motion_json: nil
+            motion_json: nil,
+            # Signed ms, applied where annotations are RENDERED and never baked
+            # into what is stored — see `Cairn.Config.annotation_offset_ms/2`.
+            annotation_offset_ms: 0
 
   @type t :: %__MODULE__{}
 
@@ -134,6 +142,9 @@ defmodule Cairn.Config.Camera do
     {substream_url, acc} = parse_substream(Map.get(raw, "substream_url"), id, acc)
     {motion_json, acc} = parse_motion_json(Map.get(raw, "motion_json"), id, acc)
 
+    {annotation_offset_ms, acc} =
+      parse_annotation_offset(Map.get(raw, "annotation_offset_ms"), id, acc)
+
     cam = %__MODULE__{
       id: id,
       rtsp_url: rtsp_url,
@@ -154,10 +165,33 @@ defmodule Cairn.Config.Camera do
       max_live_tracks: Map.get(raw, "max_live_tracks"),
       stationary_after_ms: Map.get(raw, "stationary_after_ms"),
       tracker: Map.get(raw, "tracker"),
-      motion_json: motion_json
+      motion_json: motion_json,
+      annotation_offset_ms: annotation_offset_ms
     }
 
     {cam, acc}
+  end
+
+  # Integer ms only, and signed: the correction runs either way depending on
+  # which of the two streams is behind. Absent is 0, which every consumer
+  # treats as identity — an unset offset must cost nothing and change nothing.
+  defp parse_annotation_offset(nil, _id, acc), do: {0, acc}
+
+  defp parse_annotation_offset(ms, _id, acc)
+       when is_integer(ms) and abs(ms) <= @max_annotation_offset_ms,
+       do: {ms, acc}
+
+  defp parse_annotation_offset(ms, id, acc) when is_integer(ms) do
+    {0,
+     add_error(
+       acc,
+       "camera #{id}: annotation_offset_ms must be within " <>
+         "±#{@max_annotation_offset_ms} ms (got #{ms})"
+     )}
+  end
+
+  defp parse_annotation_offset(_other, id, acc) do
+    {0, add_error(acc, "camera #{id}: annotation_offset_ms must be an integer number of ms")}
   end
 
   # Validated here rather than at pipeline build, where the same string

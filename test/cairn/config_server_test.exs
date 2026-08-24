@@ -166,7 +166,10 @@ defmodule Cairn.Config.ServerTest do
             %{"stationary_after_ms" => 20_000},
             %{"track" => %{"person" => 0.5}},
             %{"record" => %{"person" => 0.8}},
-            %{"retention" => %{"days" => 3}}
+            %{"retention" => %{"days" => 3}},
+            # Render-time only: nothing in a running pipeline reads it, so
+            # tuning it must never cost a camera its stream.
+            %{"annotation_offset_ms" => -250}
           ] do
         assert camera_diff(edit) ==
                  %{added: [], removed: [], changed: [], refreshed: ["cam_a"]},

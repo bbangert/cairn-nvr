@@ -334,6 +334,33 @@ defmodule Cairn.Config do
     do: get_in(map, ["retention", "tracks_days"]) || @default_retention_tracks_days
 
   @doc """
+  A camera's annotation offset in milliseconds, signed, `0` when it has none
+  or the camera is not in this config.
+
+  Deliberately NOT part of `policy/2` and never written into stored data. The
+  detect stream and the recorded stream can be different streams — a bridged
+  main and an RTSP substream, most sharply — and however far apart they run,
+  the boxes, the trigger and the label times are all recorded against the
+  detect clock. Correcting at WRITE time would bake one guess into every
+  sidecar and snapshot ever produced; correcting where annotations are read
+  lets an operator tune the number and re-render events that already exist.
+
+  Positive shifts annotations LATER on the clip. The consumers agree on that
+  direction while applying it from both ends: `Cairn.Snapshot.clip_seek/2`
+  and `CairnWeb.EventLive`'s label markers ADD it (detect time → clip time),
+  while the playback overlay's math lives in `assets/js/hooks/track_overlay.js`,
+  which SUBTRACTS it going the other way (clip time → sidecar time) —
+  `EventLive` only forwards the value there as a data attribute.
+  """
+  @spec annotation_offset_ms(t(), String.t()) :: integer()
+  def annotation_offset_ms(%__MODULE__{} = config, camera_id) do
+    case Enum.find(config.cameras, &(&1.id == camera_id)) do
+      nil -> 0
+      cam -> cam.annotation_offset_ms || 0
+    end
+  end
+
+  @doc """
   Everything the detection pipeline needs for a camera in one map: the event
   windows, the tracking settings, and the two host-side threshold tiers.
 

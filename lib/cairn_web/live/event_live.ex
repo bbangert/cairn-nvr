@@ -31,6 +31,7 @@ defmodule CairnWeb.EventLive do
 
   require Logger
 
+  alias Cairn.Config
   alias Cairn.DataDir
   alias Cairn.Events
   alias Cairn.Tracks
@@ -56,12 +57,21 @@ defmodule CairnWeb.EventLive do
       event ->
         if connected?(socket), do: Cairn.Event.subscribe()
 
+        # Read per mount, so an operator tuning the number sees it on the
+        # next load of an event that already exists — nothing is stored
+        # with the offset applied (`Cairn.Config.annotation_offset_ms/2`).
+        offset_s = annotation_offset_s(event.camera_id)
+
         socket =
           assign(socket,
             event: event,
             page_title: "Event #{String.slice(id, 0, 8)}",
             from_tracks?: params["track"] != nil,
-            initial_t: initial_t(params["t"])
+            # `?t=` carries detection-clock seconds like every annotation, so
+            # a linked seek gets this camera's offset exactly as a rendered
+            # marker does — applied at consumption, so links stay portable.
+            initial_t: seek_t(initial_t(params["t"]), offset_s),
+            annotation_offset_s: offset_s
           )
 
         # `Events.get/1` stays in both mounts — it decides the 404 — but the
@@ -223,7 +233,10 @@ defmodule CairnWeb.EventLive do
       |> Enum.flat_map(fn {_track, _nth, rows} -> Enum.map(rows, & &1.at) end)
       |> Tracks.moment_clips(event.camera_id, event.id)
 
-    objects = Enum.map(shaped, fn {t, nth, rows} -> object(t, nth, rows, clips, event) end)
+    offset_s = socket.assigns.annotation_offset_s
+
+    objects =
+      Enum.map(shaped, fn {t, nth, rows} -> object(t, nth, rows, clips, event, offset_s) end)
 
     assign(socket,
       objects: objects,
@@ -262,14 +275,14 @@ defmodule CairnWeb.EventLive do
     pairs
   end
 
-  defp object(track, nth, rows, clips, event) do
+  defp object(track, nth, rows, clips, event, offset_s) do
     %{
       id: track.id,
       label: track.label || "unknown",
       score: fmt_score(track.best_score),
       color: EventsLive.track_color(track.label, nth),
       chip_style: EventsLive.label_chip_style(track.label),
-      moments: Enum.map(rows, &moment(&1, clips, event, track.id))
+      moments: Enum.map(rows, &moment(&1, clips, event, track.id, offset_s))
     }
   end
 
@@ -278,14 +291,16 @@ defmodule CairnWeb.EventLive do
   # seek — the same treatment the detection markers get. A moment inside
   # another surviving clip is a link that carries the object and the offset
   # across. A moment no clip contains is inert.
-  defp moment(row, clips, event, object_id) do
+  defp moment(row, clips, event, object_id, offset_s) do
     base = %{icon: row.icon, text: row.text, suffix: row.suffix, title: row.title}
 
     case Map.fetch!(clips, row.at) do
       :here ->
+        # A moment's time is a detection-clock annotation like every marker,
+        # so its seek carries the same camera offset.
         Map.merge(base, %{
           mode: :seek,
-          t: max(DateTime.diff(row.at, event.started_at), 0),
+          t: seek_t(max(DateTime.diff(row.at, event.started_at), 0), offset_s),
           clock: TrackMoments.fmt_clock(event.started_at, row.at)
         })
 
@@ -408,6 +423,14 @@ defmodule CairnWeb.EventLive do
 
   # -- helpers ----------------------------------------------------------------
 
+  # Seconds, because every consumer of it here is a clip time in seconds. A
+  # camera that has since left the config reads 0 rather than failing: the
+  # event and its clip outlive the camera that made them, and an old event
+  # must still render.
+  defp annotation_offset_s(camera_id) do
+    Config.annotation_offset_ms(Config.Server.get(), camera_id) / 1000
+  end
+
   defp timeline_rows(event) do
     event.labels
     |> Map.get("entries", [])
@@ -418,13 +441,31 @@ defmodule CairnWeb.EventLive do
   defp clip_seconds(%{started_at: s, ended_at: %DateTime{} = e}), do: max(DateTime.diff(e, s), 1)
   defp clip_seconds(_), do: 1
 
-  defp marker_left(entry, duration) do
-    pct = min(entry["t"] / duration * 100, 100.0)
-    "#{Float.round(pct / 1, 2)}%"
+  # One shifted time per marker, feeding its position, its seek and its
+  # tooltip together — `TimelineSeek` rewrites `left` and `data-seek` from
+  # `data-t` once metadata loads, so a shift applied to only some of them
+  # would have the dot and the seek disagree.
+  #
+  # Millisecond precision: one decimal would quietly rewrite a configured
+  # offset (a -250 ms setting shifting a 3.0 s marker to 2.8) and disagree
+  # with the overlay and snapshot, which use the exact value. SIGNED: the
+  # clip's retained pre-roll sits before event zero, and the client maps
+  # data-t through `preRoll + t`, so a negative corrected time is a real
+  # clip position — flooring here would discard it. TimelineSeek clamps at
+  # the clip's own bounds, where the retained pre-roll is actually known.
+  defp marker_t(entry, offset_s), do: Float.round(entry["t"] + offset_s, 3)
+
+  # The dot's visual position clamps into the bar; the signed data-t it
+  # carries does not.
+  defp marker_left(t, duration) do
+    pct = t / duration * 100
+    "#{Float.round(pct |> min(100.0) |> max(0.0), 2)}%"
   end
 
   defp fmt_clock(seconds) do
-    s = round(seconds)
+    # Display-only floor: a pre-roll position reads as 0:00 rather than a
+    # negative clock no viewer can interpret.
+    s = seconds |> max(0) |> round()
     "#{div(s, 60)}:#{s |> rem(60) |> Integer.to_string() |> String.pad_leading(2, "0")}"
   end
 
@@ -439,6 +480,18 @@ defmodule CairnWeb.EventLive do
       {seconds, ""} when seconds >= 0 -> seconds
       _not_a_seek -> nil
     end
+  end
+
+  defp seek_t(nil, _offset_s), do: nil
+
+  # Whole results render as integers so a zero-offset camera's seeks keep
+  # their exact pre-offset spelling. Millisecond precision and SIGNED, like
+  # marker_t/2: the client adds the retained pre-roll and clamps at the
+  # clip's bounds, so a negative corrected time is a position, not an error.
+  defp seek_t(seconds, offset_s) do
+    rounded = Float.round(seconds + offset_s, 3)
+    truncated = trunc(rounded)
+    if rounded == truncated, do: truncated, else: rounded
   end
 
   defp fmt_bytes(nil), do: "—"
@@ -527,6 +580,7 @@ defmodule CairnWeb.EventLive do
                   data-video-id="event-clip"
                   data-sidecar-url={~p"/media/events/#{@event.id}/tracks"}
                   data-event-seconds={clip_seconds(@event)}
+                  data-annotation-offset={@annotation_offset_s}
                   data-selected={overlay_selected(@selected, @overlay_labels)}
                   data-objects={@overlay_objects}
                   style="position: absolute; inset: 0; pointer-events: none;"
@@ -566,11 +620,11 @@ defmodule CairnWeb.EventLive do
                   <div style="flex: 1; height: 26px; position: relative; background: var(--hs-bg-sunken); border-radius: 6px;">
                     <button
                       :for={entry <- entries}
-                      data-t={entry["t"]}
-                      data-seek={entry["t"]}
-                      title={"#{label} #{fmt_score(entry["score"])} at #{fmt_clock(entry["t"])}"}
+                      data-t={marker_t(entry, @annotation_offset_s)}
+                      data-seek={marker_t(entry, @annotation_offset_s)}
+                      title={"#{label} #{fmt_score(entry["score"])} at #{fmt_clock(marker_t(entry, @annotation_offset_s))}"}
                       style={
-                        "position: absolute; left: #{marker_left(entry, clip_seconds(@event))}; " <>
+                        "position: absolute; left: #{marker_left(marker_t(entry, @annotation_offset_s), clip_seconds(@event))}; " <>
                           "top: 50%; transform: translate(-50%, -50%); width: 13px; height: 13px; " <>
                           "border-radius: 50%; border: 2px solid var(--hs-bg-surface); cursor: pointer; " <>
                           "padding: 0; background: #{EventsLive.label_color(label)};"

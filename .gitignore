@@ -31,6 +31,14 @@ cairn-*.tar
 # Ignore digested assets cache.
 /priv/static/cache_manifest.json
 
+# phx.digest also digests everything else under priv/static — favicon, robots,
+# images — writing a `<name>-<md5>.<ext>` copy and a .gz beside each original.
+# The generator's two lines above only cover assets/, so without these a
+# `mix assets.deploy` (tools/board-dev/push-code.sh runs one per push) leaves
+# the tree dirty. The originals stay tracked; only the derived copies go.
+/priv/static/**/*.gz
+/priv/static/**/*-????????????????????????????????.*
+
 # In case you use Node.js/npm, you want to ignore these.
 npm-debug.log
 /assets/node_modules/

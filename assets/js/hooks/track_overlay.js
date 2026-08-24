@@ -26,6 +26,12 @@ import {decode as decodeMsgpack} from "../vendor_msgpack.js"
 // doesn't fight the scrubber. A heuristic, not a measurement: there is no API
 // for the controls' geometry, and it differs per browser.
 const CONTROLS_HEIGHT = 44
+// See sampleAt. A FULL second of absent detection is a real gap, not a
+// sample period, at every tier-1 rate (periods run ~130-530ms) — the
+// boundary itself counts as a gap (>=), or exactly one second of synthetic
+// motion would still draw.
+const MAX_LERP_GAP_MS = 1000
+const BOX_HOLD_MS = 300
 
 const BOX_RADIUS = 3
 const HALO = "rgba(4, 8, 12, 0.55)"
@@ -226,6 +232,12 @@ const TrackOverlay = {
   // With neither pairing usable we fall back to the estimate the detections
   // timeline already uses — duration − event duration is exactly the retained
   // pre-roll.
+  // Read per draw rather than cached at mount: the attribute is a LiveView
+  // assign, so a re-render can change it under a live page.
+  annotationOffsetSeconds() {
+    return parseFloat(this.el.dataset.annotationOffset) || 0
+  },
+
   clipOffsetSeconds() {
     const a = this.paths && this.paths.anchor
     const d = this.video.duration
@@ -264,6 +276,16 @@ const TrackOverlay = {
   // The sample at `tMs`, interpolated between the two keyframes around it, or
   // null outside the path. A monotonic cursor makes playback O(1) per frame;
   // a seek backwards falls back to a binary search, once.
+  //
+  // Interpolation stops at MAX_LERP_GAP_MS: consecutive samples sit a sample
+  // period apart (~130-530ms across the tier-1 rate range), so a wider gap is
+  // detection genuinely absent — the model lost the object, or on a
+  // label-keyed sidecar the one path per label teleported between bodies —
+  // and lerping across it invents a box floating through space nothing was
+  // detected in (Ben's clip b516cd29, 2026-08-20; limit his call at ~1s).
+  // The endpoint sample still shows for BOX_HOLD_MS: a detection that
+  // precedes a gap is a real detection, and without the hold it would render
+  // for a single frame.
   sampleAt(track, tMs) {
     const times = track.times
     const n = times.length
@@ -286,6 +308,19 @@ const TrackOverlay = {
     const i = track.cursor
     const t0 = times[i]
     const t1 = times[i + 1]
+    if (t1 - t0 >= MAX_LERP_GAP_MS) {
+      // At or past t1 the pair's second sample is the CURRENT detection —
+      // only the terminal pair can be here (the cursor advances past every
+      // other), and without this a track whose last pair spans a gap never
+      // renders its final real detection.
+      if (tMs >= t1) return [track.x[i + 1], track.y[i + 1], track.w[i + 1], track.h[i + 1]]
+      // Hold only the OBSERVED endpoint: the sample before the gap was a
+      // real detection worth a brief hold, but rendering t1's box before t1
+      // would invent an annotation inside the gap — and disagree with the
+      // stepped score, which stays t0's until playback reaches t1.
+      if (tMs - t0 <= BOX_HOLD_MS) return [track.x[i], track.y[i], track.w[i], track.h[i]]
+      return null
+    }
     const f = t1 > t0 ? Math.min(Math.max((tMs - t0) / (t1 - t0), 0), 1) : 0
     return [
       track.x[i] + (track.x[i + 1] - track.x[i]) * f,
@@ -343,7 +378,13 @@ const TrackOverlay = {
     const offY = (rect.height - dispH) / 2
 
     const clipT = mediaTime != null ? mediaTime : this.video.currentTime
-    const tMs = (clipT - this.clipOffsetSeconds()) * 1000
+    // The one place clip time becomes sidecar time, and so the one place the
+    // camera's annotation offset belongs. Subtracted here because we are going
+    // record-clock → detect-clock: a positive offset means the boxes should
+    // appear LATER on the clip, which is the same as reading an EARLIER
+    // sidecar sample at any given moment. Nothing in the file is shifted —
+    // re-rendering with a new offset needs only a reload.
+    const tMs = (clipT - this.clipOffsetSeconds() - this.annotationOffsetSeconds()) * 1000
 
     const controlsVisible = this.video.controls && !document.fullscreenElement
     const bottom = controlsVisible ? Math.max(rect.height - CONTROLS_HEIGHT, 0) : rect.height
