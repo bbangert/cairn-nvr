@@ -293,6 +293,7 @@ pub fn open(
         return Ok(Box::new(DeferredHwDecoder::new(
             sw,
             order,
+            open_hw_bounded,
             clone_codecpar(codecpar)?,
             spec,
             motion,
@@ -443,20 +444,34 @@ struct SendCodecpar(AVCodecParameters);
 // SAFETY: see the type's doc — exclusively owned, thread-agnostic data.
 unsafe impl Send for SendCodecpar {}
 
-/// A backend whose open timed out is never probed again in this process:
-/// the abandoned thread and its device fd are leaked by the driver's own
-/// refusal to answer, and every reopen would leak another set.
-fn wedged(backend: HwBackend) -> &'static AtomicBool {
-    static WEDGED: [AtomicBool; 5] = [const { AtomicBool::new(false) }; 5];
-    let slot = match backend {
+fn backend_slot(backend: HwBackend) -> usize {
+    match backend {
         HwBackend::Vaapi => 0,
         HwBackend::Qsv => 1,
         HwBackend::Nvdec => 2,
         HwBackend::V4l2 => 3,
         #[cfg(target_os = "macos")]
         HwBackend::Videotoolbox => 4,
-    };
-    &WEDGED[slot]
+    }
+}
+
+/// A backend whose open timed out is never probed again in this process:
+/// the abandoned thread and its device fd are leaked by the driver's own
+/// refusal to answer, and every reopen would leak another set.
+fn wedged(backend: HwBackend) -> &'static AtomicBool {
+    static WEDGED: [AtomicBool; 5] = [const { AtomicBool::new(false) }; 5];
+    &WEDGED[backend_slot(backend)]
+}
+
+/// One probe per backend at a time. Without this the latch races: a fleet's
+/// cameras all read not-wedged together and each spawns its own doomed open
+/// before the first can time out and store, leaking one thread and fd per
+/// camera — the exact set the latch bounds. A healthy backend answers in
+/// milliseconds, so queueing behind an in-flight probe costs a caller at
+/// most one [`HW_OPEN_DEADLINE`].
+fn probe_lock(backend: HwBackend) -> &'static std::sync::Mutex<()> {
+    static LOCKS: [std::sync::Mutex<()>; 5] = [const { std::sync::Mutex::new(()) }; 5];
+    &LOCKS[backend_slot(backend)]
 }
 
 /// [`HwDecoder::open`] under [`HW_OPEN_DEADLINE`], on its own thread.
@@ -466,6 +481,13 @@ fn open_hw_bounded(
     spec: InputSpec,
     motion: Option<MotionConfig>,
 ) -> Result<HwDecoder> {
+    // A poisoned lock only means another probe's thread panicked; the state
+    // it guards is the probe slot itself, which is intact.
+    let _probing = probe_lock(backend)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Checked under the lock: a caller that queued behind the probe that
+    // timed out must see its verdict, not spawn the next doomed open.
     if wedged(backend).load(Ordering::Relaxed) {
         bail!("timed out earlier in this process; not probing it again");
     }
@@ -581,8 +603,15 @@ enum ActiveDecoder {
     Refused(String),
 }
 
+/// The deferred probe's hardware opener — [`open_hw_bounded`] in
+/// production, a deterministic failure in unit tests, which must not probe
+/// whatever device the test host happens to have (nor latch a slow one
+/// wedged for the rest of the process).
+type HwOpener = fn(HwBackend, SendCodecpar, InputSpec, Option<MotionConfig>) -> Result<HwDecoder>;
+
 struct PendingHw {
     backends: Vec<HwBackend>,
+    opener: HwOpener,
     codecpar: SendCodecpar,
     /// Accumulated across access units: some cameras send SPS and PPS in
     /// separate ones, and demanding both from a single unit would settle on
@@ -603,6 +632,7 @@ impl DeferredHwDecoder {
     fn new(
         sw: SwDecoder,
         backends: Vec<HwBackend>,
+        opener: HwOpener,
         codecpar: AVCodecParameters,
         spec: InputSpec,
         motion: Option<MotionConfig>,
@@ -617,6 +647,7 @@ impl DeferredHwDecoder {
             active: ActiveDecoder::Sw(sw),
             pending: Some(PendingHw {
                 backends,
+                opener,
                 codecpar: SendCodecpar(codecpar),
                 sps: None,
                 pps: None,
@@ -659,7 +690,7 @@ impl DeferredHwDecoder {
         for backend in &pending.backends {
             let opened = clone_codecpar(&pending.codecpar.0).and_then(|mut clone| {
                 set_extradata(&mut clone, &extradata)?;
-                open_hw_bounded(*backend, SendCodecpar(clone), pending.spec, pending.motion)
+                (pending.opener)(*backend, SendCodecpar(clone), pending.spec, pending.motion)
             });
             match opened {
                 Ok(decoder) => {
@@ -1666,6 +1697,17 @@ mod tests {
         assert!(codecpar.extradata.is_null());
     }
 
+    /// Deterministic: a unit test must not probe whatever device the host
+    /// happens to have, and must never reach the process-wide wedge latch.
+    fn failing_open(
+        _: HwBackend,
+        _: SendCodecpar,
+        _: InputSpec,
+        _: Option<MotionConfig>,
+    ) -> Result<HwDecoder> {
+        bail!("unit tests never probe the host's devices")
+    }
+
     fn deferred(backends: Vec<HwBackend>, required: bool) -> DeferredHwDecoder {
         let codecpar = h264_codecpar();
         let spec = unit_rgb(InputSize::square(640));
@@ -1673,6 +1715,7 @@ mod tests {
         DeferredHwDecoder::new(
             sw,
             backends,
+            failing_open,
             clone_codecpar(&codecpar).unwrap(),
             spec,
             None,
@@ -1682,8 +1725,8 @@ mod tests {
 
     #[test]
     fn a_deferred_probe_settles_on_software_when_no_backend_opens() {
-        // No test host has a V4L2 M2M device, so the bounded open fails and
-        // an unnamed probe keeps the software decoder it was born with.
+        // The injected opener fails every backend, so an unnamed probe
+        // keeps the software decoder it was born with.
         let mut decoder = deferred(vec![HwBackend::V4l2], false);
         assert!(decoder.hw_pending());
         decoder.consider(&keyframe_au()).unwrap();
