@@ -259,15 +259,16 @@ fetched_run_current() { # <tag> <rung-label> <clip> <extra-flags> <backend> <pro
   [ -f "$OUT/clips/clip-$3.mp4" ] && args+=(--clip "$OUT/clips/clip-$3.mp4")
   python3 "$HERE/campaign_meta.py" "${args[@]}"
   local rc=$?
-  # rc 1 = "not current, rerun". rc >= 2 = the GUARD itself is broken
-  # (argparse 2, module catch-all 3, absent python3 127) — fatal, because
-  # a broken guard reads as "rerun everything" and would silently redo an
-  # entire board campaign on every invocation.
-  if [ "$rc" -ge 2 ]; then
-    log "FATAL: retry guard broken (campaign_meta rc $rc) — fix the guard, do not blind-rerun"
-    exit 1
-  fi
-  return "$rc"
+  # rc 4 = "not current, rerun" — its own code, because 1 belongs to the
+  # interpreter (import/syntax failures exit 1 before the module's
+  # catch-all runs). ANY other nonzero status is a broken guard — fatal,
+  # because a broken guard reads as "rerun everything" and would silently
+  # redo an entire board campaign on every invocation.
+  case $rc in
+  0) return 0 ;;
+  4) return 1 ;;
+  *) log "FATAL: retry guard broken (campaign_meta rc $rc) — fix the guard, do not blind-rerun"; exit 1 ;;
+  esac
 }
 
 content_run() { # <backend> <model-path> <rung-label> <profile> <insize>

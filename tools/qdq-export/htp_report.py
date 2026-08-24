@@ -398,15 +398,19 @@ def latency_table(runs_dir, start_marker=None, pushed_file=None, art_dir=None):
         # current. The caller prints the absence.
         if not os.path.exists(start_marker):
             return {}
-        # A marker that exists but holds no epoch (killed/ENOSPC `echo
-        # $(date +%s) >`) must fail CLOSED like a missing one: start=0
-        # would disable the filter and publish every historical run as
-        # current — the exact opposite of what the report's absence note
-        # promises.
+        # A marker that exists but holds no positive epoch (killed/ENOSPC
+        # `echo $(date +%s) >`) must fail CLOSED like a missing one:
+        # start<=0 would disable the filter and publish every historical
+        # run as current. try/int, not isdigit — isdigit accepts
+        # characters int() refuses (superscripts) and refuses the sign
+        # int() accepts.
         raw = open(start_marker).read().strip()
-        if not raw.isdigit():
+        try:
+            start = int(raw)
+        except ValueError:
             return {}
-        start = int(raw)
+        if start <= 0:
+            return {}
     pushed = {}
     if pushed_file and os.path.exists(pushed_file):
         for line in open(pushed_file):

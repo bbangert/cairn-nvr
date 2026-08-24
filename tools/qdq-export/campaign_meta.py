@@ -269,17 +269,20 @@ def main() -> None:
     cur.add_argument("--profile", help="model profile the run must record")
     cur.add_argument("--insize", help="input size the run must record")
     args = ap.parse_args()
-    # rc contract: 1 = evidence not current (rerun it); >=2 = the GUARD
-    # is broken (argparse 2, this catch-all 3, absent python3 127) — the
-    # bash caller fatals on >=2 rather than silently rerunning an entire
-    # board campaign behind a broken check.
+    # rc contract: 0 = current, 4 = evidence not current (rerun it),
+    # anything else = the GUARD is broken — the bash caller fatals on
+    # every other status rather than silently rerunning an entire board
+    # campaign behind a broken check. "Not current" gets its own code
+    # because 1 is NOT ours to use: the interpreter exits 1 for import
+    # and syntax failures before this try block ever runs (argparse owns
+    # 2, the catch-all here 3, an absent python3 127).
     try:
         current = run_is_current(
             args.run_dir, args.script, args.extra_args,
             model=args.model, clip=args.clip, require_sha=args.require_sha,
             backend=args.backend, profile=args.profile, insize=args.insize,
         )
-        sys.exit(0 if current else 1)
+        sys.exit(0 if current else 4)
     except Exception as e:  # noqa: BLE001 — anything here is guard breakage
         print(f"campaign_meta current: {e!r}", file=sys.stderr)
         sys.exit(3)

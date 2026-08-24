@@ -139,7 +139,7 @@ def test_frame_count_must_match_meta(tmp_path, interpreter, local_files):
                 clip_sha=file_sha256(str(clip)))
     run = write_run(tmp_path, meta_text(frames=5, **shas))
     assert current_cli(interpreter, run, str(script), "--qnn-library x",
-                       model=str(model), clip=str(clip)) == 1
+                       model=str(model), clip=str(clip)) == 4
 
 
 def test_completion_marker_prefix_is_not_completion(tmp_path):
@@ -251,22 +251,22 @@ def test_current_cli_rejects_drift(tmp_path, interpreter, local_files):
 
     # changed flags must retry
     run = write_run(tmp_path, meta_text(**shas), name="r1")
-    assert current_cli(interpreter, run, str(script), "--other-flags", **ok) == 1
+    assert current_cli(interpreter, run, str(script), "--other-flags", **ok) == 4
     # truncated run must retry even though frames were emitted
     run = write_run(tmp_path, meta_text(completion=None, **shas), name="r2")
-    assert current_cli(interpreter, run, str(script), "--qnn-library x", **ok) == 1
+    assert current_cli(interpreter, run, str(script), "--qnn-library x", **ok) == 4
     # rebuilt model bytes under the same name must retry
     model.write_bytes(b"rebuilt-bytes")
     run = write_run(tmp_path, meta_text(**shas), name="r3")
-    assert current_cli(interpreter, run, str(script), "--qnn-library x", **ok) == 1
+    assert current_cli(interpreter, run, str(script), "--qnn-library x", **ok) == 4
     model.write_bytes(b"model-bytes")
     # no emitted frames must retry
     run = write_run(tmp_path, meta_text(**shas), ndjson="noise\n", name="r4")
-    assert current_cli(interpreter, run, str(script), "--qnn-library x", **ok) == 1
+    assert current_cli(interpreter, run, str(script), "--qnn-library x", **ok) == 4
     # pinned control bytes (no local artifact): wrong sha must retry
     run = write_run(tmp_path, meta_text(**shas), name="r5")
     assert current_cli(interpreter, run, str(script), "--qnn-library x",
-                       clip=str(clip), require_sha="0" * 64) == 1
+                       clip=str(clip), require_sha="0" * 64) == 4
     assert current_cli(interpreter, run, str(script), "--qnn-library x",
                        clip=str(clip), require_sha=shas["model_sha"]) == 0
 
@@ -287,7 +287,7 @@ def test_current_cli_checks_invocation_identity(tmp_path, interpreter, local_fil
                   dict(backend="qnn", profile="yolov8", insize="416"),
                   dict(backend="qnn", profile="yolox", insize="640")):
         assert current_cli(interpreter, run, str(script), "--qnn-library x",
-                           **drift, **base) == 1
+                           **drift, **base) == 4
 
 
 def test_current_cli_requires_parseable_frame_line(tmp_path, interpreter, local_files):
@@ -300,7 +300,7 @@ def test_current_cli_requires_parseable_frame_line(tmp_path, interpreter, local_
                 clip_sha=file_sha256(str(clip)))
     run = write_run(tmp_path, meta_text(**shas),
                     ndjson='garbage "frame.objects" garbage\n', name="corrupt")
-    assert current_cli(interpreter, run, str(script), "--qnn-library x") == 1
+    assert current_cli(interpreter, run, str(script), "--qnn-library x") == 4
     run = write_run(
         tmp_path, meta_text(**shas),
         ndjson='QAIRT noise\n{"type":"frame.objects","pts":0,"objects":[]}\n',
@@ -325,13 +325,13 @@ def test_current_cli_rejects_partially_poisoned_ndjson(tmp_path, interpreter, lo
     }
     for name, ndjson in cases.items():
         run = write_run(tmp_path, meta_text(**shas), ndjson=ndjson, name=name)
-        assert current_cli(interpreter, run, str(script), "--qnn-library x") == 1, name
+        assert current_cli(interpreter, run, str(script), "--qnn-library x") == 4, name
     # invalid UTF-8 in a NOISE line still poisons: the analyzer reads
     # strictly and could not decode this file at all
     run = write_run(tmp_path, meta_text(**shas), ndjson=None, name="binnoise")
     with open(tmp_path / "binnoise" / "out.ndjson", "wb") as f:
         f.write(good.encode() + b"\xff\xfe binary noise\n")
-    assert current_cli(interpreter, run, str(script), "--qnn-library x") == 1
+    assert current_cli(interpreter, run, str(script), "--qnn-library x") == 4
     # a non-frame message merely EMBEDDING the literal is analyzer-ignored
     # noise, not poison
     run = write_run(
@@ -364,11 +364,11 @@ def test_current_cli_rc_contract(tmp_path, interpreter, local_files):
     # binary-corrupted ndjson is bad EVIDENCE: rerun (1), not guard breakage
     run = write_run(tmp_path, meta_text(**shas), ndjson=None, name="bin")
     (tmp_path / "bin" / "out.ndjson").write_bytes(b"\xff\xfe\x00garbage")
-    assert current_cli(interpreter, run, str(script), "--qnn-library x") == 1
+    assert current_cli(interpreter, run, str(script), "--qnn-library x") == 4
     # binary-corrupted meta likewise: evidence (1), not breakage
     run = write_run(tmp_path, meta=None, name="binmeta")
     (tmp_path / "binmeta" / "meta").write_bytes(b"\xff\xfegovernor: \xba\xad")
-    assert current_cli(interpreter, run, str(script), "--qnn-library x") == 1
+    assert current_cli(interpreter, run, str(script), "--qnn-library x") == 4
     # a missing local script file is guard breakage: 3, never 1
     run = write_run(tmp_path, meta_text(**shas), name="noscript")
     assert current_cli(interpreter, run, str(tmp_path / "absent.sh"),
