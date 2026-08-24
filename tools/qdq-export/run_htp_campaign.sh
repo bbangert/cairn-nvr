@@ -394,14 +394,13 @@ do_fetch() {
   else
     local start
     start=$(cat "$HTP/.latency-start")
-    case $start in
-    *[!0-9]*|'')
-      # Same fail-closed rule as the analyzer: a marker that exists but
-      # holds no epoch (killed/ENOSPC write) means no current latency
-      # stage — not an unfiltered pull of every historical run dir.
+    # Same fail-closed rule as the analyzer (start must be a POSITIVE
+    # integer): a marker holding garbage, nothing, or zero means no
+    # current latency stage — not an unfiltered pull of every historical
+    # run dir, which is exactly what `ts >= 0` would do.
+    if ! [ "$start" -gt 0 ] 2>/dev/null; then
       log "invalid latency marker — skipping bench-run fetch"
-      ;;
-    *)
+    else
       while read -r d; do
         local ts=${d##*-}
         case $ts in *[!0-9]*|'') continue ;; esac
@@ -409,8 +408,7 @@ do_fetch() {
           fetch "/data/cairn-bench/runs/$d" "$HTP/runs/" || log "WARN: run $d fetch failed"
         fi
       done < "$HTP/.runs-list"
-      ;;
-    esac
+    fi
   fi
   log "fetched: $(ls "$HTP/content" 2>/dev/null | wc -l) content dirs, $(ls "$HTP/runs" 2>/dev/null | wc -l) bench runs"
 }
@@ -425,8 +423,14 @@ do_finish() {
   # governor at all — restore-only means exactly that. The saved file is
   # kept until a READBACK verifies the restore took (:os.cmd discards
   # the rc), so a failed restore stays restorable on the next finish.
-  rm -f "$HTP/.gov-saved"
-  if ! fetch /data/campaign-gov.saved "$HTP/.gov-saved" && [ -f "$HTP/.gov-pinned" ]; then
+  # Through remote_verified, not a raw fetch: a partial scp of the saved
+  # value would create an empty local file that skips both the error
+  # branch AND the [ -s ] restore below — finish would report success
+  # with the board still pinned. The digest authenticates the bytes; a
+  # board with no saved file fails the read, which the .gov-pinned
+  # marker then classifies.
+  if ! remote_verified 30 gov-read "$HTP/.gov-saved" "cat /data/campaign-gov.saved" \
+     && [ -f "$HTP/.gov-pinned" ]; then
     # This campaign pinned (local marker), yet the saved value is
     # unreadable — that is NOT "nothing to restore": the board may
     # still be pinned. A finish without a pin keeps the no-op path.
