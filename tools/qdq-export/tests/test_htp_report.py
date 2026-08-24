@@ -156,6 +156,33 @@ def test_nan_scores_are_suspect_not_gradable(tmp_path):
     assert r["why"] == "non-finite score values in fetched ndjson"
 
 
+def test_malformed_pts_is_suspect_not_a_crash(tmp_path):
+    # A boolean pts would become a finite float through /90000.0 and join
+    # the pairing timeline; an overlarge int raises in the division.
+    # Both must grade, matching the retry guard's rejection.
+    for name, pts in (("boolpts", True), ("hugepts", 10 ** 400)):
+        base = tmp_path / name
+        base.mkdir()
+        run = write_run(base, emissions([0.93] * 40))
+        bad = json.dumps({"type": "frame.objects", "frame": {"pts": pts},
+                          "objects": [{"label": "person", "score": 0.9}]})
+        with open(f"{run}/out.ndjson", "a") as f:
+            f.write(bad + "\n")
+        r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
+        assert r["verdict"] == "SUSPECT", name
+        assert r["why"] == "malformed frame.objects message in fetched ndjson"
+
+
+def test_bare_scalar_json_line_is_noise(tmp_path):
+    # QAIRT noise can be a bare number, which json.loads happily parses;
+    # it is stdout noise like any unparseable line, not frame evidence.
+    run = write_run(tmp_path, emissions([0.93] * 41))
+    with open(f"{run}/out.ndjson", "a") as f:
+        f.write("5\n")
+    r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
+    assert r["verdict"] == "PASS"
+
+
 def test_mixed_type_scores_are_suspect_not_a_crash(tmp_path):
     # A frame mixing numeric and string scores makes max() raise inside
     # htp_series — before any finite check sees the values.

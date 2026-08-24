@@ -57,6 +57,15 @@ def test_pinned_sigmoid_passes(tmp_path):
     assert len(report["scores"]) == 1
 
 
+def test_invalid_min_ceiling_refuses_to_vouch(tmp_path):
+    # A NaN/non-positive threshold turns every ceiling check vacuously
+    # false — a healthy graph must not print PASS under a broken gate.
+    path = build(tmp_path, PINNED_A16)
+    for bad in (float("nan"), 0.0, -1.0):
+        with pytest.raises(GateFailure, match="positive finite threshold"):
+            check(path, min_ceiling=bad, out=io.StringIO())
+
+
 def test_per_axis_activation_qparams_fail(tmp_path):
     # Grading element zero of a per-axis parameter would vouch for every
     # class on the strength of the first one.

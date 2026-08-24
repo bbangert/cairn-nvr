@@ -1,6 +1,18 @@
-import numpy as np
+import math
 
-from score_parity import PERSON, scores
+import numpy as np
+import pytest
+
+from score_parity import PERSON, compare, scores
+
+
+def test_invalid_tolerance_refuses_to_grade():
+    # NaN or non-positive tolerance makes every `< tolerance` check
+    # vacuously false — PASS while checking nothing. Rejected before any
+    # file is touched (paths here don't exist).
+    for bad in (math.nan, 0.0, -0.5, math.inf * -1):
+        with pytest.raises(SystemExit, match="positive finite"):
+            compare("no.onnx", "no.onnx", "nowhere", tolerance=bad)
 
 
 def test_yolox_scores_multiply_objectness():

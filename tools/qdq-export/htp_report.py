@@ -36,7 +36,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from campaign_meta import RunMeta, file_sha256, records_script  # noqa: E402
-from finite import all_finite_in  # noqa: E402
+from finite import all_finite_in, is_finite  # noqa: E402
 from score_parity import REPORTABLE, scores  # noqa: E402
 
 REPO_MODEL_DIR = os.path.normpath(
@@ -165,9 +165,16 @@ def htp_series(ndjson_path):
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if msg.get("type") != "frame.objects":
+            if not isinstance(msg, dict) or msg.get("type") != "frame.objects":
+                # bare JSON scalars parse too; they are stdout noise like
+                # any unparseable line, not frame evidence.
                 continue
             pts = msg["frame"]["pts"] if "frame" in msg else msg["pts"]
+            if not is_finite(pts):
+                # Validate BEFORE the division: a boolean pts would become
+                # a finite float and silently join the pairing timeline
+                # the retry guard already rejects.
+                raise ValueError(f"non-finite pts {pts!r}")
             objs = msg["objects"]
             person = max((o["score"] for o in objs if o["label"] == "person"), default=0.0)
             best = max((o["score"] for o in objs), default=0.0)
@@ -252,7 +259,7 @@ def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None,
                 "why": f"meta does not record backend {expected_backend}"}
     try:
         htp = htp_series(nd)
-    except (TypeError, KeyError, ValueError):
+    except (TypeError, KeyError, ValueError, AttributeError, OverflowError):
         # A frame.objects message missing the fields this consumes, or
         # mixing numeric and string scores (max raises before any finite
         # check can see the values), is malformed evidence — grade it,
