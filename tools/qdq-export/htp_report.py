@@ -35,6 +35,8 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+from campaign_meta import RunMeta, file_sha256, is_legacy  # noqa: E402
+from finite import all_finite_in, is_finite  # noqa: E402
 from score_parity import REPORTABLE, scores  # noqa: E402
 
 REPO_MODEL_DIR = os.path.normpath(
@@ -91,18 +93,6 @@ def extract_frames(clip_path, out_dir, fps):
         f.write(f"{clip_path} @ {fps} fps\n")
 
 
-def file_sha256(path):
-    """Full sha256 of a file's bytes — matched verbatim against the
-    board meta's sha256sum lines."""
-    import hashlib
-
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def model_digest(model_path):
     """Twelve hex chars of the artifact's bytes — the cache's identity.
 
@@ -110,13 +100,7 @@ def model_digest(model_path):
     artifact REBUILT under the same filename must never inherit the old
     bytes' scores from a warm cache.
     """
-    import hashlib
-
-    h = hashlib.sha256()
-    with open(model_path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()[:12]
+    return file_sha256(model_path)[:12]
 
 
 def cpu_series(model_path, frame_dir, fps, cache_dir):
@@ -128,7 +112,7 @@ def cpu_series(model_path, frame_dir, fps, cache_dir):
     )
     if os.path.exists(cache):
         with open(cache) as f:
-            return json.load(f)
+            return _finite_series(json.load(f), cache)
     info = describe(model_path)
     layout, w, h = info["layout"], info["width"], info["height"]
     prof = preprocessing(layout)
@@ -142,6 +126,21 @@ def cpu_series(model_path, frame_dir, fps, cache_dir):
         series.append((i / fps, float(person.max()), float(best.max())))
     with open(cache, "w") as f:
         json.dump(series, f)
+    return _finite_series(series, cache)
+
+
+def _finite_series(series, cache):
+    """A reference series is LOCAL tooling — a NaN in it means the model
+    or the runner is broken, not the board evidence, and json round-trips
+    NaN silently, so a poisoned cache would otherwise grade every run of
+    the rung SUSPECT (and void the controls) while blaming the board.
+    Abort once, at the source, naming the cache to delete."""
+    if not all_finite_in(v for row in series for v in row):
+        raise SystemExit(
+            f"non-finite values in reference series {cache} — local "
+            "reference tooling failure, not board evidence; fix the model/"
+            "runner and delete this cache file"
+        )
     return series
 
 
@@ -166,10 +165,33 @@ def htp_series(ndjson_path):
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if msg.get("type") != "frame.objects":
+            if not isinstance(msg, dict) or msg.get("type") != "frame.objects":
+                # bare JSON scalars parse too; they are stdout noise like
+                # any unparseable line, not frame evidence.
                 continue
             pts = msg["frame"]["pts"] if "frame" in msg else msg["pts"]
+            if not is_finite(pts):
+                # Validate BEFORE the division: a boolean pts would become
+                # a finite float and silently join the pairing timeline
+                # the retry guard already rejects.
+                raise ValueError(f"non-finite pts {pts!r}")
             objs = msg["objects"]
+            if not isinstance(objs, list):
+                # {} or "" iterates zero times and would reduce to a
+                # valid EMPTY frame — corruption graded as a real miss.
+                # Same shape rule as validate_ndjson's protocol check.
+                raise ValueError(f"objects is {type(objs).__name__}, not a list")
+            for o in objs:
+                if not isinstance(o, dict):
+                    raise ValueError(f"object entry is {type(o).__name__}, not a dict")
+                s = o["score"]
+                if not is_finite(s) or not 0.0 <= s <= 1.0:
+                    # Validate RAW values: max() with NaN is
+                    # order-dependent (max(0.9, nan) keeps 0.9), so a
+                    # poisoned frame could reduce to a clean number; and
+                    # 0..1 is the plugin contract — outside it is
+                    # corrupted evidence, not a strong detection.
+                    raise ValueError(f"score {s!r} outside the plugin contract")
             person = max((o["score"] for o in objs if o["label"] == "person"), default=0.0)
             best = max((o["score"] for o in objs), default=0.0)
             series.append((pts / 90000.0, person, best))
@@ -226,59 +248,9 @@ def paired_one_to_one(ref_times, series):
 # in a truncated run must read as an incomplete run, not a healthy rung.
 MIN_PAIRED = 20
 
-
-def run_suspect(run_dir):
-    """The content test's own verdict on its run, from the fetched meta.
-
-    htp_content_test.sh records a non-EOF plugin exit and the feed's exit
-    there and nowhere else — an analyzer that never reads it would grade
-    truncated runs as if they were complete.
-    """
-    meta = os.path.join(run_dir, "meta")
-    if not os.path.exists(meta):
-        return "no meta fetched"
-    text = open(meta).read()
-    for line in text.splitlines():
-        if "run suspect" in line:
-            return line.strip()
-        if line.startswith("feed exited") and not line.rstrip().endswith(" 0"):
-            return line.strip()
-    # The frames count is the run's completion marker: the board script
-    # writes it only after the feed exit and plugin shutdown statuses.
-    # Absence of "run suspect" in a truncated meta proves nothing — the
-    # suspect lines are exactly what a killed run never got to write.
-    if "frame.objects lines:" not in text:
-        return "meta lacks completion marker (run truncated before shutdown states were recorded)"
-    return None
-
-
-def stale_evidence(run_dir, expected_shas):
-    """The board script wrote the model's and clip's sha256 into meta;
-    evidence under the right directory name but from different bytes
-    must not be graded against today's references."""
-    if not expected_shas:
-        return None
-    meta = os.path.join(run_dir, "meta")
-    if not os.path.exists(meta):
-        return "no meta fetched"
-    text = open(meta).read()
-    for label, sha in expected_shas.items():
-        if not sha:
-            continue
-        if label == "script" and "htp_content_test.sh" not in text:
-            # Legacy meta from before the methodology digest: identity is
-            # unrecorded, not wrong. Counted and surfaced in the report
-            # (never silently passed); the campaign driver's retry guard
-            # regenerates these runs on the next campaign.
-            continue
-        if sha not in text:
-            return f"meta does not record the current {label} sha ({sha[:12]}…)"
-    return None
-
-
-def records_script(run_dir):
-    meta = os.path.join(run_dir, "meta")
-    return os.path.exists(meta) and "htp_content_test.sh" in open(meta).read()
+# Verdicts returned BEFORE the stale-sha gate ran: runs wearing one never
+# had their model/clip bytes verified, so the legacy note may not claim it.
+UNVERIFIED_VERDICTS = ("NO-DATA", "SUSPECT", "STALE-EVIDENCE")
 
 
 def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None,
@@ -295,24 +267,49 @@ def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None,
     nd = os.path.join(run_dir, "out.ndjson")
     if not os.path.exists(nd):
         return {"verdict": "NO-DATA", "why": "no ndjson fetched"}
-    suspect = run_suspect(run_dir)
+    meta = RunMeta.load(run_dir)
+    suspect = meta.suspect_reason()
     if suspect:
         return {"verdict": "SUSPECT", "why": suspect}
-    stale = stale_evidence(run_dir, expected_shas)
+    stale = meta.stale_reason(expected_shas)
     if stale:
         return {"verdict": "STALE-EVIDENCE", "why": stale}
-    if expected_backend:
-        # Bytes alone don't prove the leg: an ORT run misfiled under a
-        # *-qnn-* directory scores ~1.0 by construction and would serve
-        # as HTP proof.
-        meta = os.path.join(run_dir, "meta")
-        text = open(meta).read() if os.path.exists(meta) else ""
-        if f"backend: {expected_backend} " not in text:
-            return {"verdict": "SUSPECT",
-                    "why": f"meta does not record backend {expected_backend}"}
-    htp = htp_series(nd)
+    if expected_backend and not meta.has_backend(expected_backend):
+        return {"verdict": "SUSPECT",
+                "why": f"meta does not record backend {expected_backend}"}
+    try:
+        htp = htp_series(nd)
+    except UnicodeDecodeError:
+        # Same strict read as the retry guard, same conclusion: bytes
+        # that don't decode are corrupted evidence, not a report abort.
+        return {"verdict": "SUSPECT",
+                "why": "invalid encoding in fetched ndjson"}
+    except (TypeError, KeyError, ValueError, AttributeError, OverflowError):
+        # A frame.objects message missing the fields this consumes, or
+        # mixing numeric and string scores (max raises before any finite
+        # check can see the values), is malformed evidence — grade it,
+        # never crash the report over it.
+        return {"verdict": "SUSPECT",
+                "why": "malformed frame.objects message in fetched ndjson"}
     if not htp:
         return {"verdict": "NO-DATA", "why": "no frame.objects lines"}
+    if meta.frames is not None and len(htp) != meta.frames:
+        # fetch() cannot read scp's rc: a complete meta beside an ndjson
+        # truncated mid-transfer is a real shape, and grading it would
+        # count the missing tail as real misses.
+        return {"verdict": "SUSPECT",
+                "why": (f"{len(htp)} frame messages in ndjson but meta "
+                        f"recorded {meta.frames} (truncated fetch)")}
+    # json.loads accepts NaN/Infinity, and a non-finite score would sail
+    # through every threshold below (NaN compares False both ways) into
+    # whichever verdict that happens to reach. Data that isn't numbers is
+    # not gradable evidence — refuse it before any comparison runs.
+    if not all_finite_in(v for row in htp for v in row):
+        return {"verdict": "SUSPECT",
+                "why": "non-finite score values in fetched ndjson"}
+    if not all_finite_in(v for series in (ref_cpu, ref_fp32) for row in series for v in row):
+        return {"verdict": "SUSPECT",
+                "why": "non-finite values in reference series"}
     spans = person_windows(ref_fp32)
     if not spans:
         return {"verdict": "NO-WINDOW", "why": "fp32 never confident on this clip"}
@@ -357,6 +354,14 @@ def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None,
         # it as such rather than let np.median run on an empty array.
         result.update({"verdict": "COLLAPSE",
                        "why": "CPU-EP reference <= 0 on every paired frame (artifact collapse, not an HTP defect)"})
+        return result
+    if ratios_cpu.size < MIN_PAIRED:
+        # MIN_PAIRED must bind the ratios the median actually runs on,
+        # not the raw pair count: 40 zero-reference rows plus one lucky
+        # positive ratio is one match certifying nothing.
+        result.update({"verdict": "INSUFFICIENT",
+                       "why": (f"only {int(ratios_cpu.size)} paired frames have a "
+                               f"positive CPU reference (< {MIN_PAIRED})")})
         return result
     med = float(np.median(ratios_cpu))
     iqr = float(np.subtract(*np.percentile(ratios_cpu, [75, 25])))
@@ -412,7 +417,20 @@ def latency_table(runs_dir, start_marker=None, pushed_file=None, art_dir=None):
         # current. The caller prints the absence.
         if not os.path.exists(start_marker):
             return {}
-        start = int(open(start_marker).read().strip() or 0)
+        # A marker that exists but holds no positive epoch (killed/ENOSPC
+        # `echo $(date +%s) >`) must fail CLOSED like a missing one:
+        # start<=0 would disable the filter and publish every historical
+        # run as current. try/int, not isdigit — isdigit accepts
+        # characters int() refuses (superscripts) and refuses the sign
+        # int() accepts.
+        try:
+            start = int(open(start_marker).read().strip())
+        except (OSError, UnicodeDecodeError, ValueError):
+            # unreadable, undecodable, or non-numeric all mean the same
+            # thing: no current latency stage
+            return {}
+        if start <= 0:
+            return {}
     pushed = {}
     if pushed_file and os.path.exists(pushed_file):
         for line in open(pushed_file):
@@ -534,7 +552,9 @@ def main():
                                "script": script_sha},
                 expected_backend="qnn",
             )
-            if not records_script(run_dir):
+            # The legacy note claims model/clip bytes were VERIFIED —
+            # only verdicts that made it past the stale gate earn it.
+            if r["verdict"] not in UNVERIFIED_VERDICTS and is_legacy(run_dir):
                 legacy_runs.append(f"{rung}-qnn-{c}")
             verdicts[rung].append(r["verdict"])
             report.append(
@@ -560,7 +580,7 @@ def main():
                                        "clip": clip_shas.get("ac86"),
                                        "script": script_sha},
                         score_fidelity_only=True, expected_backend="ort")
-        if not records_script(ort_ctl):
+        if r["verdict"] not in UNVERIFIED_VERDICTS and is_legacy(ort_ctl):
             legacy_runs.append("ort-control")
         if r["verdict"] != "PASS":
             controls_invalid.append(
@@ -593,7 +613,7 @@ def main():
                                        "clip": clip_shas.get("ac86"),
                                        "script": script_sha},
                         expected_backend="qnn")
-        if not records_script(old_ctl):
+        if r["verdict"] not in UNVERIFIED_VERDICTS and is_legacy(old_ctl):
             legacy_runs.append("defective-control")
         # The control is valid ONLY if it reproduces the known defect's
         # signature. "Anything but PASS" would let NO-DATA / SUSPECT /

@@ -27,12 +27,15 @@ Import `check` from the exporter, or run it standalone:
   qparam_gate.py <model-qdq.onnx> [--min-ceiling 0.95]
 """
 import argparse
-import math
+import os
 import sys
 
 import numpy as np
 import onnx
 from onnx import numpy_helper
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from finite import all_finite_or_none, is_finite  # noqa: E402
 
 # Ops that move or regroup a tensor without changing its values. A Sigmoid
 # whose output reaches a graph output through only these is a score
@@ -428,6 +431,13 @@ def summarize(report, input_size=None, out=sys.stdout):
 
 def check(model_path, min_ceiling=DEFAULT_MIN_CEILING, input_size=None, out=sys.stdout):
     """Audit, print the operator summary, and raise on an unshippable graph."""
+    if not is_finite(min_ceiling) or min_ceiling <= 0:
+        # A NaN or non-positive threshold makes every `ceiling <
+        # min_ceiling` test false — the gate would vouch while checking
+        # nothing.
+        raise GateFailure(
+            f"min_ceiling {min_ceiling} is not a positive finite threshold"
+        )
     report = audit(model_path)
     summarize(report, input_size=input_size, out=out)
 
@@ -447,10 +457,7 @@ def check(model_path, min_ceiling=DEFAULT_MIN_CEILING, input_size=None, out=sys.
     for e in scores:
         if e["ceiling"] is None:
             bad.append(f"{e['node']}: no Q/DQ qparams on the sigmoid output")
-        elif not all(
-            v is None or math.isfinite(v)
-            for v in (e["scale"], e["dq_scale"], e["ceiling"])
-        ):
+        elif not all_finite_or_none(e["scale"], e["dq_scale"], e["ceiling"]):
             # NaN fails open through every </>/abs comparison below.
             bad.append(
                 f"{e['node']}: non-finite qparams (scale {e['scale']}, "

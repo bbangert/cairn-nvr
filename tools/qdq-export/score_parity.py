@@ -40,6 +40,17 @@ sys.path.insert(0, REPO_MODEL_DIR)
 import onnxruntime as ort
 from quantize_model import YOLOX_STRIDES, describe, load_image_chw, preprocessing
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from finite import all_finite, all_finite_in, is_finite  # noqa: E402
+
+
+def _positive_finite_threshold(name, value):
+    """A NaN or non-positive threshold turns every `< threshold` gate
+    check vacuously false — the gate would report PASS while checking
+    nothing. Refuse before grading."""
+    if not is_finite(value) or value <= 0:
+        raise SystemExit(f"{name} must be a positive finite number (got {value})")
+
 # COCO dense index of "person" in both head orders this tool handles.
 PERSON = 0
 
@@ -95,6 +106,7 @@ def run(model_path, frames, layout):
 
 
 def compare(fp32_path, qdq_path, frame_dir, tolerance=0.9, limit=None, out=sys.stdout):
+    _positive_finite_threshold("--tolerance", tolerance)
     if limit is not None and limit < 2:
         raise SystemExit(f"--limit must be >= 2 (got {limit}): even spacing needs both endpoints")
     info = describe(fp32_path)
@@ -146,7 +158,7 @@ def compare(fp32_path, qdq_path, frame_dir, tolerance=0.9, limit=None, out=sys.s
         flag = ""
         # NaN fails open through every comparison below — a non-finite
         # maximum is a broken level, not a passing one.
-        if not (np.isfinite(fmax) and np.isfinite(qmax)):
+        if not all_finite(fmax, qmax):
             failures.append(f"s{stride}: non-finite maxima (fp32 {fmax}, qdq {qmax})")
             flag = "  <-- FAIL"
         elif fmax >= REPORTABLE and ratio < tolerance:
@@ -193,11 +205,11 @@ def compare(fp32_path, qdq_path, frame_dir, tolerance=0.9, limit=None, out=sys.s
             file=out,
         )
         flag = ""
-        if not np.isfinite(ratios).all():
+        if not all_finite_in(ratios):
             # np.median of anything non-finite is NaN, and NaN < tolerance
             # is False — the gate would pass a broken window.
             failures.append(
-                f"person window: {int((~np.isfinite(ratios)).sum())} non-finite ratios"
+                f"person window: {sum(1 for r in ratios if not is_finite(r))} non-finite ratios"
             )
             flag = "  <-- FAIL"
         elif median_ratio < tolerance:
