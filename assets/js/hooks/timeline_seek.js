@@ -44,7 +44,9 @@ const TimelineSeek = {
       const eventSeconds = parseFloat(this.el.dataset.eventSeconds) || 0
       const preRoll = Math.max(d - eventSeconds, 0)
       for (const m of this.el.querySelectorAll("[data-t]")) {
-        const clipTime = Math.min(preRoll + (parseFloat(m.dataset.t) || 0), d)
+        // data-t is SIGNED: a negative corrected time is a pre-roll
+        // position, clamped only at the clip's own bounds.
+        const clipTime = Math.min(Math.max(preRoll + (parseFloat(m.dataset.t) || 0), 0), d)
         m.style.left = `${(clipTime / d) * 100}%`
         m.dataset.seek = clipTime
       }
@@ -62,7 +64,7 @@ const TimelineSeek = {
       const eventSeconds = parseFloat(this.el.dataset.eventSeconds) || 0
       const preRoll = Math.max(d - eventSeconds, 0)
       this.initialSeeked = true
-      this.video.currentTime = Math.min(preRoll + t, d)
+      this.video.currentTime = Math.min(Math.max(preRoll + t, 0), d)
     }
 
     this.onMetadata = () => {

@@ -454,16 +454,24 @@ defmodule CairnWeb.EventLive do
   # a float's worth of noise the timeline cannot express anyway.
   # Millisecond precision: one decimal would quietly rewrite a configured
   # offset (a -250 ms setting shifting a 3.0 s marker to 2.8) and disagree
-  # with the overlay and snapshot, which use the exact value.
-  defp marker_t(entry, offset_s), do: Float.round(max(entry["t"] + offset_s, 0.0), 3)
+  # with the overlay and snapshot, which use the exact value. SIGNED: the
+  # clip's retained pre-roll sits before event zero, and the client maps
+  # data-t through `preRoll + t`, so a negative corrected time is a real
+  # clip position — flooring here would discard it. TimelineSeek clamps at
+  # the clip's own bounds, where the retained pre-roll is actually known.
+  defp marker_t(entry, offset_s), do: Float.round(entry["t"] + offset_s, 3)
 
+  # The dot's visual position clamps into the bar; the signed data-t it
+  # carries does not.
   defp marker_left(t, duration) do
     pct = t / duration * 100
-    "#{Float.round(min(pct, 100.0) / 1, 2)}%"
+    "#{Float.round(pct |> min(100.0) |> max(0.0), 2)}%"
   end
 
   defp fmt_clock(seconds) do
-    s = round(seconds)
+    # Display-only floor: a pre-roll position reads as 0:00 rather than a
+    # negative clock no viewer can interpret.
+    s = seconds |> max(0) |> round()
     "#{div(s, 60)}:#{s |> rem(60) |> Integer.to_string() |> String.pad_leading(2, "0")}"
   end
 
@@ -483,10 +491,11 @@ defmodule CairnWeb.EventLive do
   defp seek_t(nil, _offset_s), do: nil
 
   # Whole results render as integers so a zero-offset camera's seeks keep
-  # their exact pre-offset spelling. Millisecond precision like marker_t/2:
-  # coarser rounding would seek away from the overlay's own correction.
+  # their exact pre-offset spelling. Millisecond precision and SIGNED, like
+  # marker_t/2: the client adds the retained pre-roll and clamps at the
+  # clip's bounds, so a negative corrected time is a position, not an error.
   defp seek_t(seconds, offset_s) do
-    rounded = Float.round(max(seconds + offset_s, 0.0), 3)
+    rounded = Float.round(seconds + offset_s, 3)
     truncated = trunc(rounded)
     if rounded == truncated, do: truncated, else: rounded
   end

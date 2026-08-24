@@ -297,11 +297,16 @@ defmodule CairnWeb.DashboardLive do
     if x2 <= x or y2 <= y do
       "display: none;"
     else
+      # Spans measure from the CLAMPED origin: the inset can move left/top by
+      # up to 0.5%, and a span still measured from the pre-inset origin would
+      # push the far edge past the intersection by the same amount. Clamped
+      # unrounded and formatted at the end, so the subtraction does not
+      # inherit the display rounding.
       left = clamp(x * 100)
       top = clamp(y * 100)
 
-      "position: absolute; left: #{left}%; top: #{top}%; " <>
-        "width: #{clamp_span((x2 - x) * 100, left)}%; height: #{clamp_span((y2 - y) * 100, top)}%;"
+      "position: absolute; left: #{pct(left)}%; top: #{pct(top)}%; " <>
+        "width: #{clamp_span(x2 * 100 - left, left)}%; height: #{clamp_span(y2 * 100 - top, top)}%;"
     end
   end
 
@@ -336,7 +341,7 @@ defmodule CairnWeb.DashboardLive do
     end
   end
 
-  defp clamp(percent), do: percent |> min(99.5) |> max(0.5) |> pct()
+  defp clamp(percent), do: percent |> min(99.5) |> max(0.5)
 
   defp clamp_span(percent, offset) do
     percent |> min(99.5 - offset) |> max(0.5 - offset) |> pct()

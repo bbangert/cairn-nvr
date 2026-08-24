@@ -97,12 +97,18 @@ defmodule CairnWeb.EventLiveTest do
 
     # This timeline's axis is the event, so a shift that would push a marker
     # before its start parks it at the front rather than off the widget.
-    test "a shift before the event's start floors at zero", %{conn: conn} do
+    test "a shift before the event's start stays signed; only the dot pins to the edge", %{
+      conn: conn
+    } do
       id = seed_with_entries("cam_dual", [entry(0.1)])
-      {:ok, _view, html} = live(conn, ~p"/events/#{id}")
+      {:ok, view, _html} = live(conn, ~p"/events/#{id}")
 
-      assert html =~ ~s(data-t="0.0")
-      assert html =~ "left: 0.0%"
+      # The clip's retained pre-roll sits before event zero, and the client
+      # maps data-t through preRoll + t — flooring the value here would
+      # discard a real position. The dot's visual left does clamp.
+      assert has_element?(view, ~s(button[data-t="-0.3"]))
+      assert has_element?(view, ~s(button[data-seek="-0.3"]))
+      assert has_element?(view, ~s(button[style*="left: 0.0%"]))
     end
   end
 
