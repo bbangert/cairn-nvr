@@ -207,13 +207,21 @@ def test_legacy_meta_skips_script_not_model(tmp_path):
     assert meta.stale_reason({"model": "0" * 64}) is not None
 
 
-def test_legacy_requires_a_real_meta(tmp_path):
-    # Missing or undecodable metas are NOT legacy — the report's legacy
-    # note says "bytes verified", which nobody verified for those.
+def test_legacy_requires_a_real_non_suspect_meta(tmp_path):
+    # Missing, undecodable, or SUSPECT metas are NOT legacy — the
+    # report's legacy note says "bytes verified", which nobody verified
+    # for those.
     run = tmp_path / "nometa"
     run.mkdir()
     assert not is_legacy(str(run))
     (run / "meta").write_bytes(b"\xff\xfe corrupt")
+    assert not is_legacy(str(run))
+    # truncated (no completion marker) pre-digest meta: suspect, not legacy
+    (run / "meta").write_text(meta_text(script_sha=None, completion=None))
+    assert not is_legacy(str(run))
+    # feed-failed pre-digest meta: suspect, not legacy
+    (run / "meta").write_text(
+        meta_text(script_sha=None, feed="feed exited 1 — run suspect"))
     assert not is_legacy(str(run))
 
 
@@ -373,9 +381,9 @@ def test_current_cli_rejects_partially_poisoned_ndjson(tmp_path, interpreter, lo
 
 
 def test_binary_corrupted_meta_grades_not_crashes(tmp_path):
-    # Invalid UTF-8 in a fetched meta is corrupt EVIDENCE: it must parse
-    # (replacement chars -> missing fields -> suspect), never raise into
-    # the analyzer or the CLI's guard-broken lane.
+    # Invalid UTF-8 in a fetched meta is corrupt EVIDENCE: strict decode
+    # flags it (corrupt -> suspect), never raising into the analyzer or
+    # the CLI's guard-broken lane.
     run = tmp_path / "run"
     run.mkdir()
     (run / "meta").write_bytes(b"\xff\xfegovernor: \xba\xad\nbackend: ")

@@ -248,6 +248,10 @@ def paired_one_to_one(ref_times, series):
 # in a truncated run must read as an incomplete run, not a healthy rung.
 MIN_PAIRED = 20
 
+# Verdicts returned BEFORE the stale-sha gate ran: runs wearing one never
+# had their model/clip bytes verified, so the legacy note may not claim it.
+UNVERIFIED_VERDICTS = ("NO-DATA", "SUSPECT", "STALE-EVIDENCE")
+
 
 def analyze_run(run_dir, ref_cpu, ref_fp32, expected_shas=None,
                 score_fidelity_only=False, expected_backend=None):
@@ -548,7 +552,9 @@ def main():
                                "script": script_sha},
                 expected_backend="qnn",
             )
-            if is_legacy(run_dir):
+            # The legacy note claims model/clip bytes were VERIFIED —
+            # only verdicts that made it past the stale gate earn it.
+            if r["verdict"] not in UNVERIFIED_VERDICTS and is_legacy(run_dir):
                 legacy_runs.append(f"{rung}-qnn-{c}")
             verdicts[rung].append(r["verdict"])
             report.append(
@@ -574,7 +580,7 @@ def main():
                                        "clip": clip_shas.get("ac86"),
                                        "script": script_sha},
                         score_fidelity_only=True, expected_backend="ort")
-        if is_legacy(ort_ctl):
+        if r["verdict"] not in UNVERIFIED_VERDICTS and is_legacy(ort_ctl):
             legacy_runs.append("ort-control")
         if r["verdict"] != "PASS":
             controls_invalid.append(
@@ -607,7 +613,7 @@ def main():
                                        "clip": clip_shas.get("ac86"),
                                        "script": script_sha},
                         expected_backend="qnn")
-        if is_legacy(old_ctl):
+        if r["verdict"] not in UNVERIFIED_VERDICTS and is_legacy(old_ctl):
             legacy_runs.append("defective-control")
         # The control is valid ONLY if it reproduces the known defect's
         # signature. "Anything but PASS" would let NO-DATA / SUSPECT /

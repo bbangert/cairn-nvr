@@ -183,12 +183,14 @@ class RunMeta:
 
 
 def is_legacy(run_dir: str) -> bool:
-    """A LEGACY run has a real, decodable meta that simply predates the
-    methodology digest. Missing or corrupt metas are NOT legacy — they
-    grade suspect elsewhere, and labeling them 'legacy, bytes verified'
-    in the report would vouch for evidence nobody verified."""
+    """A LEGACY run has a real, NON-SUSPECT meta that simply predates
+    the methodology digest. Missing, corrupt, truncated, or feed-failed
+    metas are NOT legacy — they grade suspect elsewhere, and the
+    report's 'legacy, bytes verified' note must never vouch for evidence
+    nobody verified. (The caller additionally gates on the run's verdict
+    so a STALE-EVIDENCE run cannot carry the note either.)"""
     meta = RunMeta.load(run_dir)
-    return meta.exists and not meta.corrupt and not meta.records_script
+    return meta.suspect_reason() is None and not meta.records_script
 
 
 def _gradable_frame_count(lines: Iterable[str]) -> int | None:
