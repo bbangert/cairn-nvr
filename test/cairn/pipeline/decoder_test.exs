@@ -199,6 +199,40 @@ defmodule Cairn.Pipeline.DecoderTest do
       assert_receive {:open_decoder, _camera_id, _params}
     end
 
+    test "a settle-time refusal goes dark for good and lands on status", ctx do
+      {_actions, state} = playing(ctx, element(ctx))
+      state = declare(ctx, state)
+      assert_receive {:open_decoder, _camera_id, _params}
+
+      message = "decoder v4l2 was named but did not open"
+      control(%{decode_au: fn _d, _au, _pts, _s -> {:error, {:decoder_refused, message}} end})
+      {actions, state} = feed(ctx, state, 1)
+
+      assert actions == [demand: {:input, 1}]
+      # Closed AND refused: unlike a fatal error there is no cooldown retry —
+      # reopening would defer and refuse again, once per keyframe, forever.
+      assert state.decoder == :refused
+      assert_receive {:close_decoder, _ref}
+
+      control(%{decode_au: nil})
+      {_actions, state} = feed(ctx, state, 2)
+      assert state.decoder == :refused
+      refute_receive {:open_decoder, _camera_id, _params}
+
+      # The reason reached the host's surface (status/1 is a call, so it
+      # orders after the report cast).
+      camera_id = ctx.camera_id
+
+      assert %{^camera_id => {:decoder_refused, ^message}} =
+               Host.status(ctx.host).decoder_failures
+
+      # A reconfigured camera — genuinely different stream — earns one fresh
+      # probe, whose own settle decides again.
+      state = declare(ctx, state, {1280, 720})
+      assert_receive {:open_decoder, _camera_id, %{source_width: 1280}}
+      assert %{ref: _} = state.decoder
+    end
+
     test "a decoder that completes nothing at all is called out once", ctx do
       {_actions, state} = playing(ctx, element(ctx))
       state = declare(ctx, state)

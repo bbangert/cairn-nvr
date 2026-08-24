@@ -22,6 +22,8 @@
 
 use std::fmt;
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -245,9 +247,15 @@ const MAX_PIXELS: i64 = 32 * 1024 * 1024;
 /// Open a decoder for `codecpar`, probing hardware before software.
 ///
 /// A backend that cannot open — no device, no driver, no GPU scaler — is
-/// logged and skipped; software decode is always the last resort, including
-/// when `--decoder <hw>` names a backend explicitly. Crash-looping on a box
-/// without the hardware would be worse than running slowly on it.
+/// logged and skipped, and software decode is the last resort. What a
+/// *named* backend's failure means is the embedder's to say via `fallback`:
+/// the plugin binary allows the fallback (its refusal would be a process
+/// exit into a restart loop), the NIF path refuses it so the branch goes
+/// dark with the reason surfaced instead of silently decoding at software
+/// cost. At open time both behave alike — the eager path always falls back,
+/// and the NIF's `require_named_hardware` turns that into an open error —
+/// `fallback` decides the *deferred* probe's settle, which happens after
+/// open has already succeeded.
 ///
 /// Every hardware open runs under [`HW_OPEN_DEADLINE`] on its own thread: a
 /// wedged driver ioctl otherwise blocks this call indefinitely, and on the
@@ -256,9 +264,9 @@ const MAX_PIXELS: i64 = 32 * 1024 * 1024;
 ///
 /// For an H.264 stream whose `codecpar` has no extradata — the NIF path,
 /// where Membrane's parser delivers SPS/PPS in band — the hardware probe is
-/// *deferred*: decoding starts in software and the probe runs at the first
-/// access unit carrying parameter sets, which become the extradata the open
-/// needs. v4l2m2m in particular negotiates its formats as the context
+/// *deferred*: decoding starts in software and the probe runs once the
+/// stream has produced both parameter sets, which become the extradata the
+/// open needs. v4l2m2m in particular negotiates its formats as the context
 /// opens: on QCS6490's venus an open with no extradata never returned,
 /// while the same decoder with parameter sets attached opens immediately.
 ///
@@ -271,25 +279,30 @@ pub fn open(
     codecpar: &AVCodecParameters,
     spec: InputSpec,
     motion: Option<MotionConfig>,
+    fallback: NamedFallback,
 ) -> Result<Box<dyn Decoder>> {
     let order = probe_order(kind);
     if order.is_empty() && kind != DecoderKind::Sw && kind != DecoderKind::Auto {
         note!("decoder {kind} is not available on this platform");
     }
-    let hw = HwOpenSpec::from(codecpar);
-    if !order.is_empty() && hw.extradata.is_empty() && hw.codec_id == ffi::AV_CODEC_ID_H264 {
+    let bare_h264 = codecpar.codec_id == ffi::AV_CODEC_ID_H264
+        && (codecpar.extradata.is_null() || codecpar.extradata_size <= 0);
+    if !order.is_empty() && bare_h264 {
+        let required = fallback == NamedFallback::Refused && kind != DecoderKind::Auto;
         let sw = SwDecoder::open(codecpar, spec, motion)?;
         return Ok(Box::new(DeferredHwDecoder::new(
             sw,
             order,
-            hw,
+            clone_codecpar(codecpar)?,
             spec,
             motion,
-            kind != DecoderKind::Auto,
+            required,
         )));
     }
     for backend in order {
-        match open_hw_bounded(backend, &hw, spec, motion) {
+        match clone_codecpar(codecpar)
+            .and_then(|clone| open_hw_bounded(backend, SendCodecpar(clone), spec, motion))
+        {
             Ok(decoder) => return Ok(Box::new(decoder)),
             Err(e) => note!("hardware decoder {backend} unavailable: {e:#}"),
         }
@@ -298,6 +311,18 @@ pub fn open(
         note!("no hardware decoder opened; falling back to software decode");
     }
     Ok(Box::new(SwDecoder::open(codecpar, spec, motion)?))
+}
+
+/// What a named backend's failure to open means for this embedder — see
+/// [`open`]. Only the deferred probe consults it; the eager open falls back
+/// either way and lets the embedder refuse from `hw_backend()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedFallback {
+    /// Settle on software decode with a note.
+    Allowed,
+    /// Refuse: every packet after the settle fails with a [`DecoderRefusal`]
+    /// for the embedder to surface.
+    Refused,
 }
 
 /// Backends to try, in order, for a given `--decoder` value.
@@ -344,122 +369,160 @@ const AUTO_ORDER: &[HwBackend] = &[];
 /// decoder it may still produce is dropped and its device fds closed.
 const HW_OPEN_DEADLINE: Duration = Duration::from_secs(3);
 
-/// How many access units the deferred probe inspects for in-band SPS/PPS
-/// before giving up. RTSP cameras repeat parameter sets on every keyframe,
-/// so this is several keyframe intervals at any realistic frame rate; a
-/// stream that never carries them in band left them in extradata it also
-/// did not provide, so hardware was never reachable.
-const DEFER_AU_LIMIT: u32 = 300;
+/// How many access units without a complete parameter-set pair the deferred
+/// probe tolerates before giving up. 900 is fifteen seconds of 60 fps
+/// access units — three worst-case keyframe intervals at a 5 s GOP — and
+/// software is decoding the whole time, so waiting long costs nothing but a
+/// late note. A stream that never carries SPS/PPS in band left them in
+/// extradata it also did not provide, so hardware was never reachable.
+const DEFER_AU_LIMIT: u32 = 900;
 
-/// The slice of an `AVCodecParameters` a hardware open needs, as plain data:
-/// rsmpeg's wrapper types cannot cross into the deadline thread, so the
-/// parameters are rebuilt from these on the other side.
-#[derive(Clone)]
-struct HwOpenSpec {
-    codec_id: ffi::AVCodecID,
-    width: i32,
-    height: i32,
-    extradata: Vec<u8>,
-}
+/// A named hardware backend's deferred probe settled without opening.
+///
+/// Its own error type because the embedder must tell this apart from the
+/// tolerated per-packet decode errors: a mid-GOP join heals on the next
+/// keyframe, this never does, and treating it as transient is how a named
+/// backend's camera would read healthy while decoding nothing. cairn-native
+/// downcasts to it in `push_au` and returns its own hard error class.
+#[derive(Debug, Clone)]
+pub struct DecoderRefusal(pub String);
 
-impl From<&AVCodecParameters> for HwOpenSpec {
-    fn from(codecpar: &AVCodecParameters) -> Self {
-        let extradata = if codecpar.extradata.is_null() || codecpar.extradata_size <= 0 {
-            Vec::new()
-        } else {
-            // SAFETY: libavcodec pairs a non-null extradata with its size.
-            unsafe { slice::from_raw_parts(codecpar.extradata, codecpar.extradata_size as usize) }
-                .to_vec()
-        };
-        Self {
-            codec_id: codecpar.codec_id,
-            width: codecpar.width,
-            height: codecpar.height,
-            extradata,
-        }
+impl fmt::Display for DecoderRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
-impl HwOpenSpec {
-    fn codecpar(&self) -> Result<AVCodecParameters> {
-        let mut codecpar = AVCodecParameters::new();
-        // SAFETY: `codecpar` is our own freshly allocated parameters struct.
-        // The extradata buffer is av_malloc'd with the padding libavcodec
-        // requires, and its ownership transfers to `codecpar`, whose drop
-        // frees it.
-        unsafe {
-            let raw = codecpar.deref_mut();
-            raw.codec_id = self.codec_id;
-            raw.codec_type = ffi::AVMEDIA_TYPE_VIDEO;
-            raw.width = self.width;
-            raw.height = self.height;
-            if !self.extradata.is_empty() {
-                let padded = self.extradata.len() + ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
-                let buf = ffi::av_mallocz(padded).cast::<u8>();
-                if buf.is_null() {
-                    bail!("out of memory for {padded} bytes of extradata");
-                }
-                std::ptr::copy_nonoverlapping(self.extradata.as_ptr(), buf, self.extradata.len());
-                raw.extradata = buf;
-                raw.extradata_size = self.extradata.len() as i32;
-            }
-        }
-        Ok(codecpar)
+impl std::error::Error for DecoderRefusal {}
+
+/// A full-fidelity copy of stream parameters, extradata included.
+fn clone_codecpar(codecpar: &AVCodecParameters) -> Result<AVCodecParameters> {
+    let mut copy = AVCodecParameters::new();
+    // SAFETY: both structs are valid and owned; avcodec_parameters_copy
+    // resets `copy` and allocates its own extradata, which `copy`'s drop
+    // frees.
+    let ret = unsafe { ffi::avcodec_parameters_copy(copy.deref_mut(), codecpar.as_ptr()) };
+    if ret < 0 {
+        bail!("copying stream parameters failed ({ret})");
     }
+    Ok(copy)
+}
+
+/// Attach `extradata` to parameters that have none.
+fn set_extradata(codecpar: &mut AVCodecParameters, extradata: &[u8]) -> Result<()> {
+    let size = i32::try_from(extradata.len()).context("extradata larger than an i32")?;
+    // SAFETY: `codecpar` is exclusively owned. The buffer is av_mallocz'd
+    // with the padding libavcodec requires (zeroed by the allocation), and
+    // its ownership transfers to `codecpar`, whose drop frees it; any prior
+    // extradata is freed first so nothing leaks.
+    unsafe {
+        let raw = codecpar.deref_mut();
+        if !raw.extradata.is_null() {
+            ffi::av_freep(std::ptr::addr_of_mut!(raw.extradata).cast());
+            raw.extradata_size = 0;
+        }
+        let padded = extradata.len() + ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
+        let buf = ffi::av_mallocz(padded).cast::<u8>();
+        if buf.is_null() {
+            bail!("out of memory for {padded} bytes of extradata");
+        }
+        std::ptr::copy_nonoverlapping(extradata.as_ptr(), buf, extradata.len());
+        raw.extradata = buf;
+        raw.extradata_size = size;
+    }
+    Ok(())
+}
+
+/// An owned `AVCodecParameters` allowed across the deadline-thread boundary.
+///
+/// The struct is plain heap data with no thread affinity — rsmpeg simply
+/// does not mark its wrappers `Send` — and exclusive ownership moves with
+/// the value.
+struct SendCodecpar(AVCodecParameters);
+
+// SAFETY: see the type's doc — exclusively owned, thread-agnostic data.
+unsafe impl Send for SendCodecpar {}
+
+/// A backend whose open timed out is never probed again in this process:
+/// the abandoned thread and its device fd are leaked by the driver's own
+/// refusal to answer, and every reopen would leak another set.
+fn wedged(backend: HwBackend) -> &'static AtomicBool {
+    static WEDGED: [AtomicBool; 5] = [const { AtomicBool::new(false) }; 5];
+    let slot = match backend {
+        HwBackend::Vaapi => 0,
+        HwBackend::Qsv => 1,
+        HwBackend::Nvdec => 2,
+        HwBackend::V4l2 => 3,
+        #[cfg(target_os = "macos")]
+        HwBackend::Videotoolbox => 4,
+    };
+    &WEDGED[slot]
 }
 
 /// [`HwDecoder::open`] under [`HW_OPEN_DEADLINE`], on its own thread.
 fn open_hw_bounded(
     backend: HwBackend,
-    hw: &HwOpenSpec,
+    codecpar: SendCodecpar,
     spec: InputSpec,
     motion: Option<MotionConfig>,
 ) -> Result<HwDecoder> {
-    let hw = hw.clone();
+    if wedged(backend).load(Ordering::Relaxed) {
+        bail!("timed out earlier in this process; not probing it again");
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name(format!("hw-open-{backend}"))
         .spawn(move || {
-            let opened = hw
-                .codecpar()
-                .and_then(|codecpar| HwDecoder::open(backend, &codecpar, spec, motion));
+            let SendCodecpar(codecpar) = codecpar;
             // A receiver that gave up dropped its end; the decoder drops
             // here with the failed send.
-            let _ = tx.send(opened);
+            let _ = tx.send(HwDecoder::open(backend, &codecpar, spec, motion));
         })
         .context("spawning the hardware open thread")?;
     match rx.recv_timeout(HW_OPEN_DEADLINE) {
         Ok(result) => result,
-        Err(_) => bail!(
-            "did not open within {}s — abandoned as wedged",
-            HW_OPEN_DEADLINE.as_secs()
-        ),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            wedged(backend).store(true, Ordering::Relaxed);
+            bail!(
+                "did not open within {}s — abandoned as wedged, and not probed \
+                 again in this process",
+                HW_OPEN_DEADLINE.as_secs()
+            );
+        }
+        // The thread can only drop `tx` without sending by dying first.
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("the open thread panicked before answering")
+        }
     }
 }
 
-/// H.264 extradata built from an access unit's in-band parameter sets.
+/// The in-band SPS and PPS of one access unit, if it carries them.
 ///
-/// Annex-B start codes, SPS then PPS — the form the `h264` and
-/// `h264_v4l2m2m` decoders accept as extradata. `None` until an access unit
-/// carries both: a mid-GOP join has neither, and one without the other
-/// cannot configure a decoder.
-fn sps_pps_extradata(au: &[u8]) -> Option<Vec<u8>> {
+/// Both `None` for a mid-GOP join; cameras that send the sets in separate
+/// access units are why the probe accumulates across calls rather than
+/// demanding both at once.
+fn parameter_sets(au: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
     let mut sps = None;
     let mut pps = None;
     for nal in annexb_nals(au) {
         match nal.first().map(|byte| byte & 0x1f) {
-            Some(7) => sps = Some(nal),
-            Some(8) => pps = Some(nal),
+            Some(7) => sps = Some(nal.to_vec()),
+            Some(8) => pps = Some(nal.to_vec()),
             _ => {}
         }
     }
-    let (sps, pps) = (sps?, pps?);
+    (sps, pps)
+}
+
+/// H.264 extradata from a parameter-set pair: Annex-B start codes, SPS then
+/// PPS — the form the `h264` and `h264_v4l2m2m` decoders accept.
+fn extradata_from(sps: &[u8], pps: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(sps.len() + pps.len() + 8);
     for nal in [sps, pps] {
         out.extend_from_slice(&[0, 0, 0, 1]);
         out.extend_from_slice(nal);
     }
-    Some(out)
+    out
 }
 
 /// The NAL payloads of an Annex-B buffer, start codes stripped.
@@ -495,13 +558,12 @@ fn annexb_nals(data: &[u8]) -> Vec<&[u8]> {
 
 /// Software decode now, hardware once the stream provides its parameter sets.
 ///
-/// The switch happens at the access unit whose SPS/PPS fed the successful
-/// open — normally a keyframe head, where a fresh decoder starts cleanly;
-/// a camera that sends parameter sets elsewhere costs the new decoder a
-/// resync, the same one a mid-GOP join already tolerates. The software
-/// decoder is dropped at the switch, and with it the motion gate's
-/// background; the replacement recalibrates from there, the same reset a
-/// reconnect causes.
+/// The switch happens at the access unit that completed the SPS/PPS pair —
+/// normally a keyframe head, where a fresh decoder starts cleanly; a camera
+/// that sends parameter sets elsewhere costs the new decoder a resync, the
+/// same one a mid-GOP join already tolerates. The software decoder is
+/// dropped at the switch, and with it the motion gate's background; the
+/// replacement recalibrates from there, as any decoder reopen does.
 struct DeferredHwDecoder {
     active: ActiveDecoder,
     /// `Some` while the probe is still waiting for parameter sets.
@@ -514,20 +576,25 @@ enum ActiveDecoder {
     /// A named backend that could not open. This path refuses the silent
     /// software fallback, and the refusal must outlive the access unit that
     /// triggered it — the caller treats decode errors as tolerated — so the
-    /// state makes every subsequent packet fail with the same reason
-    /// instead of quietly decoding in software.
+    /// state makes every subsequent packet fail with the same
+    /// [`DecoderRefusal`] instead of quietly decoding in software.
     Refused(String),
 }
 
 struct PendingHw {
     backends: Vec<HwBackend>,
-    hw: HwOpenSpec,
+    codecpar: SendCodecpar,
+    /// Accumulated across access units: some cameras send SPS and PPS in
+    /// separate ones, and demanding both from a single unit would settle on
+    /// software for a stream whose hardware was fine.
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
     spec: InputSpec,
     motion: Option<MotionConfig>,
-    /// `--decoder` named a specific backend, so settling on software is a
-    /// refusal rather than a fallback. The check upstream
-    /// (`require_named_hardware`) can only see the open, which is before
-    /// this decides — the probe enforces it itself.
+    /// `--decoder` named a specific backend under [`NamedFallback::Refused`],
+    /// so settling on software is a refusal rather than a fallback. The
+    /// check upstream (`require_named_hardware`) can only see the open,
+    /// which is before this decides — the probe enforces it itself.
     required: bool,
     aus_left: u32,
 }
@@ -536,7 +603,7 @@ impl DeferredHwDecoder {
     fn new(
         sw: SwDecoder,
         backends: Vec<HwBackend>,
-        hw: HwOpenSpec,
+        codecpar: AVCodecParameters,
         spec: InputSpec,
         motion: Option<MotionConfig>,
         required: bool,
@@ -550,7 +617,9 @@ impl DeferredHwDecoder {
             active: ActiveDecoder::Sw(sw),
             pending: Some(PendingHw {
                 backends,
-                hw,
+                codecpar: SendCodecpar(codecpar),
+                sps: None,
+                pps: None,
                 spec,
                 motion,
                 required,
@@ -563,34 +632,44 @@ impl DeferredHwDecoder {
     /// active decoder is the hardware one and the caller's packet goes to
     /// it; on refusal (named backend, no open) the error is permanent.
     fn consider(&mut self, au: &[u8]) -> Result<()> {
-        let Some(mut pending) = self.pending.take() else {
+        let Some(pending) = self.pending.as_mut() else {
             return Ok(());
         };
-        match sps_pps_extradata(au) {
-            Some(extradata) => {
-                let mut hw = pending.hw.clone();
-                hw.extradata = extradata;
-                for backend in &pending.backends {
-                    match open_hw_bounded(*backend, &hw, pending.spec, pending.motion) {
-                        Ok(decoder) => {
-                            self.active = ActiveDecoder::Hw(decoder);
-                            return Ok(());
-                        }
-                        Err(e) => note!("hardware decoder {backend} unavailable: {e:#}"),
-                    }
-                }
-                self.settle_on_software(&pending, "every backend refused this stream")
+        let (sps, pps) = parameter_sets(au);
+        if let Some(sps) = sps {
+            pending.sps = Some(sps);
+        }
+        if let Some(pps) = pps {
+            pending.pps = Some(pps);
+        }
+        if pending.sps.is_none() || pending.pps.is_none() {
+            pending.aus_left -= 1;
+            if pending.aus_left == 0 {
+                let pending = self.pending.take().expect("borrowed above");
+                return self.settle_on_software(&pending, "no access unit carried SPS/PPS in band");
             }
-            None => {
-                pending.aus_left -= 1;
-                if pending.aus_left == 0 {
-                    self.settle_on_software(&pending, "no access unit carried SPS/PPS in band")
-                } else {
-                    self.pending = Some(pending);
-                    Ok(())
+            return Ok(());
+        }
+        // The pair is complete: the probe decides now, one way or the other.
+        let pending = self.pending.take().expect("borrowed above");
+        let extradata = extradata_from(
+            pending.sps.as_deref().expect("checked above"),
+            pending.pps.as_deref().expect("checked above"),
+        );
+        for backend in &pending.backends {
+            let opened = clone_codecpar(&pending.codecpar.0).and_then(|mut clone| {
+                set_extradata(&mut clone, &extradata)?;
+                open_hw_bounded(*backend, SendCodecpar(clone), pending.spec, pending.motion)
+            });
+            match opened {
+                Ok(decoder) => {
+                    self.active = ActiveDecoder::Hw(decoder);
+                    return Ok(());
                 }
+                Err(e) => note!("hardware decoder {backend} unavailable: {e:#}"),
             }
         }
+        self.settle_on_software(&pending, "every backend refused this stream")
     }
 
     /// The probe is over without a hardware decoder: keep software under
@@ -605,7 +684,7 @@ impl DeferredHwDecoder {
             );
             note!("{reason}");
             self.active = ActiveDecoder::Refused(reason.clone());
-            bail!(reason);
+            return Err(DecoderRefusal(reason).into());
         }
         note!("no hardware decoder opened ({why}); staying with software decode");
         Ok(())
@@ -614,19 +693,17 @@ impl DeferredHwDecoder {
 
 impl Decoder for DeferredHwDecoder {
     fn send_packet(&mut self, packet: &rsmpeg::avcodec::AVPacket) -> Result<()> {
-        if self.pending.is_some() {
-            let au = if packet.data.is_null() || packet.size <= 0 {
-                &[][..]
-            } else {
-                // SAFETY: libavcodec pairs a non-null data with its size.
-                unsafe { slice::from_raw_parts(packet.data, packet.size as usize) }
-            };
+        // An empty packet carries nothing to scan and should not run down
+        // the probe's patience.
+        if self.pending.is_some() && !packet.data.is_null() && packet.size > 0 {
+            // SAFETY: libavcodec pairs a non-null data with its size.
+            let au = unsafe { slice::from_raw_parts(packet.data, packet.size as usize) };
             self.consider(au)?;
         }
         match &mut self.active {
             ActiveDecoder::Sw(decoder) => decoder.send_packet(packet),
             ActiveDecoder::Hw(decoder) => decoder.send_packet(packet),
-            ActiveDecoder::Refused(reason) => bail!("{reason}"),
+            ActiveDecoder::Refused(reason) => Err(DecoderRefusal(reason.clone()).into()),
         }
     }
 
@@ -1537,31 +1614,56 @@ mod tests {
     }
 
     #[test]
-    fn extradata_needs_both_parameter_sets() {
-        let expected = [&[0, 0, 0, 1][..], SPS, &[0, 0, 0, 1], PPS].concat();
-        assert_eq!(sps_pps_extradata(&keyframe_au()).unwrap(), expected);
+    fn parameter_sets_reads_both_kinds_of_start_code() {
+        let (sps, pps) = parameter_sets(&keyframe_au());
+        assert_eq!(sps.as_deref(), Some(SPS));
+        assert_eq!(pps.as_deref(), Some(PPS));
 
         let idr_only = [&[0, 0, 0, 1][..], IDR].concat();
-        assert!(sps_pps_extradata(&idr_only).is_none());
-        let sps_only = [&[0, 0, 0, 1][..], SPS, &[0, 0, 0, 1], IDR].concat();
-        assert!(sps_pps_extradata(&sps_only).is_none());
-        assert!(sps_pps_extradata(&[]).is_none());
+        assert_eq!(parameter_sets(&idr_only), (None, None));
+        assert_eq!(parameter_sets(&[]), (None, None));
+
+        let expected = [&[0, 0, 0, 1][..], SPS, &[0, 0, 0, 1], PPS].concat();
+        assert_eq!(extradata_from(SPS, PPS), expected);
     }
 
     #[test]
-    fn rebuilt_codecpar_carries_the_extradata() {
-        let spec = HwOpenSpec {
-            codec_id: ffi::AV_CODEC_ID_H264,
-            width: 640,
-            height: 360,
-            extradata: sps_pps_extradata(&keyframe_au()).unwrap(),
-        };
-        let codecpar = spec.codecpar().unwrap();
-        assert_eq!(codecpar.width, 640);
-        assert_eq!(codecpar.height, 360);
-        let extradata =
-            unsafe { slice::from_raw_parts(codecpar.extradata, codecpar.extradata_size as usize) };
-        assert_eq!(extradata, spec.extradata);
+    fn annexb_nals_survive_malformed_edges() {
+        // A start code at the very end yields an empty NAL; empty NALs have
+        // no header byte for `parameter_sets` to read.
+        assert_eq!(annexb_nals(&[0, 0, 1]), vec![&[] as &[u8]]);
+        assert_eq!(parameter_sets(&[0, 0, 1]), (None, None));
+        // Zeros between codes belong to no payload.
+        let zeros = [0u8, 0, 1, 0, 0, 0, 1, 0x65, 0x88];
+        assert_eq!(annexb_nals(&zeros), vec![&[] as &[u8], &[0x65, 0x88]]);
+        // No start code at all: nothing.
+        assert!(annexb_nals(&[0x65, 0x88, 0x00]).is_empty());
+    }
+
+    #[test]
+    fn cloned_codecpar_keeps_fidelity_and_takes_extradata() {
+        let mut codecpar = h264_codecpar();
+        unsafe {
+            let raw = codecpar.deref_mut();
+            raw.width = 640;
+            raw.height = 360;
+            raw.profile = 100;
+            raw.level = 31;
+        }
+        let mut clone = clone_codecpar(&codecpar).unwrap();
+        let extradata = extradata_from(SPS, PPS);
+        set_extradata(&mut clone, &extradata).unwrap();
+        assert_eq!(clone.width, 640);
+        assert_eq!(clone.height, 360);
+        // The fields the deferred probe never touches ride the copy —
+        // the parity the old field-by-field rebuild silently dropped.
+        assert_eq!(clone.profile, 100);
+        assert_eq!(clone.level, 31);
+        let carried =
+            unsafe { slice::from_raw_parts(clone.extradata, clone.extradata_size as usize) };
+        assert_eq!(carried, extradata);
+        // The original is untouched.
+        assert!(codecpar.extradata.is_null());
     }
 
     fn deferred(backends: Vec<HwBackend>, required: bool) -> DeferredHwDecoder {
@@ -1571,7 +1673,7 @@ mod tests {
         DeferredHwDecoder::new(
             sw,
             backends,
-            HwOpenSpec::from(&codecpar),
+            clone_codecpar(&codecpar).unwrap(),
             spec,
             None,
             required,
@@ -1591,6 +1693,20 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_probe_accumulates_parameter_sets_across_access_units() {
+        let mut decoder = deferred(vec![HwBackend::V4l2], false);
+        let sps_alone = [&[0, 0, 0, 1][..], SPS].concat();
+        decoder.consider(&sps_alone).unwrap();
+        // Half a pair is not a decision.
+        assert!(decoder.hw_pending());
+        let pps_alone = [&[0, 0, 0, 1][..], PPS].concat();
+        decoder.consider(&pps_alone).unwrap();
+        // The PPS completed the pair: the probe ran (and settled on
+        // software, this host having no hardware).
+        assert!(!decoder.hw_pending());
+    }
+
+    #[test]
     fn a_deferred_probe_gives_up_after_enough_bare_access_units() {
         let mut decoder = deferred(vec![HwBackend::V4l2], false);
         let idr_only = [&[0, 0, 0, 1][..], IDR].concat();
@@ -1603,15 +1719,49 @@ mod tests {
         assert!(matches!(decoder.active, ActiveDecoder::Sw(_)));
     }
 
+    /// One tightly packed AVPacket around `data`, as `send_packet` sees them.
+    fn packet(data: &[u8]) -> rsmpeg::avcodec::AVPacket {
+        let mut packet = rsmpeg::avcodec::AVPacket::new();
+        // SAFETY: av_new_packet sizes the buffer (plus libav's padding) and
+        // the copy stays within `data.len()`.
+        unsafe {
+            assert!(ffi::av_new_packet(packet.as_mut_ptr(), data.len() as i32) >= 0);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), (*packet.as_mut_ptr()).data, data.len());
+        }
+        packet
+    }
+
     #[test]
     fn a_named_deferred_backend_that_cannot_open_refuses_software() {
         let mut decoder = deferred(vec![HwBackend::V4l2], true);
         let error = decoder.consider(&keyframe_au()).unwrap_err();
         assert!(error.to_string().contains("v4l2 was named"), "{error:#}");
-        // Permanent: the refusal outlives the access unit that triggered it.
-        assert!(matches!(decoder.active, ActiveDecoder::Refused(_)));
+        // Permanent, and typed: the embedder tells this refusal apart from
+        // tolerated decode errors by downcast, on every later packet.
+        let later = decoder.send_packet(&packet(IDR)).unwrap_err();
+        assert!(
+            later.downcast_ref::<DecoderRefusal>().is_some(),
+            "{later:#}"
+        );
+        // The drain contract stays honest: no frames, no busy-wait fuel.
+        assert!(decoder.receive_frame().unwrap().is_none());
         assert!(!decoder.hw_pending());
         assert!(decoder.hw_backend().is_none());
+    }
+
+    #[test]
+    fn an_unnamed_deferred_settle_stays_quietly_on_software() {
+        let mut decoder = deferred(vec![HwBackend::V4l2], false);
+        decoder.consider(&keyframe_au()).unwrap();
+        // Software decode continues through the trait after the settle: the
+        // synthetic parameter sets are garbage to a real parser, but that is
+        // a tolerated decode error, never a refusal.
+        if let Err(error) = decoder.send_packet(&packet(&keyframe_au())) {
+            assert!(
+                error.downcast_ref::<DecoderRefusal>().is_none(),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]
@@ -1622,6 +1772,7 @@ mod tests {
             &codecpar,
             unit_rgb(InputSize::square(640)),
             None,
+            NamedFallback::Refused,
         )
         .unwrap();
         assert_eq!(

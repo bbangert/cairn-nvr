@@ -82,11 +82,12 @@ defmodule Cairn.Native.Host do
     canary_state: :not_run,
     streams: %{},
     closing: %{},
-    # camera_id → the reason its last decoder open failed, cleared by the next
-    # success. This is how a refused `decoder:` reaches `cameras:status`: the
-    # element that failed to open retries on a cooldown and logs, but a log
-    # line is not an operator surface, and the engine-level headline reads
-    # "ready" the whole time (`Cairn.Native.Status.headline/2`).
+    # camera_id → the reason its last decoder open failed — or the settle-time
+    # refusal `report_decoder_refusal/3` records, since the crate defers
+    # hardware probing past the open — cleared by the next success. This is
+    # how a refused `decoder:` reaches `cameras:status`: the element logs,
+    # but a log line is not an operator surface, and the engine-level
+    # headline reads "ready" the whole time (`Cairn.Native.Status.headline/2`).
     decoder_failures: %{}
   ]
 
@@ -140,17 +141,38 @@ defmodule Cairn.Native.Host do
   `source` is what the camera is sending, as `{width, height}`, or `nil` from a
   caller that does not know. Software decode does not need it; a V4L2 M2M
   decoder does, and one opened without it opens anyway and then fails every
-  frame (`research/board-first-light.md`).
+  frame (`research/board-first-light.md`). The hardware open itself is
+  *deferred* by the crate until the stream's in-band SPS/PPS arrive, so this
+  call returns promptly with a software decoder that may still promote
+  itself — `decode::open` in `plugins/cairn-detect/src/decode.rs`.
   """
   @spec open_decoder(atom(), String.t(), map() | keyword(), {pos_integer(), pos_integer()} | nil) ::
           {:ok, %{ref: reference(), module: module(), sample_fps: pos_integer()}}
           | {:error, term()}
   def open_decoder(server \\ __MODULE__, camera_id, params, source) do
-    # Above the 5 s default: the open probes hardware backends in turn —
-    # device nodes, drivers, a GPU filter graph — each of which can block on
-    # a driver's answer, and a caller timing out here would crash a camera
-    # whose decoder was still coming up.
+    # Above the 5 s default for headroom, though the crate now defers and
+    # deadline-bounds its hardware probing: a slow open here is engine or
+    # scheduler pressure, and a caller timing out would crash a camera whose
+    # decoder was still coming up.
     GenServer.call(server, {:open_decoder, camera_id, params, source}, 15_000)
+  end
+
+  @doc """
+  Record that a camera's deferred hardware probe refused the software
+  fallback (`{:error, {:decoder_refused, message}}` from `decode_au`).
+
+  The refusal happens *after* a successful open — the probe waits for the
+  stream's parameter sets — so the open-time bookkeeping that normally feeds
+  `cameras:status` has already recorded a success. This is the settle-time
+  correction: it lands in the same `decoder_failures` map, and the next
+  successful open (a profile fixed, a reload) clears it the same way.
+
+  A cast, because the reporter is the camera's own pipeline mid-buffer: the
+  status surface can lag a frame, the decode path must not block on it.
+  """
+  @spec report_decoder_refusal(atom(), String.t(), String.t()) :: :ok
+  def report_decoder_refusal(server \\ __MODULE__, camera_id, message) do
+    GenServer.cast(server, {:decoder_refusal, camera_id, message})
   end
 
   @doc """
@@ -322,6 +344,10 @@ defmodule Cairn.Native.Host do
   @impl true
   def handle_cast({:reconfigure, config}, state) do
     {:noreply, swap_model(state, configured_model(state, config))}
+  end
+
+  def handle_cast({:decoder_refusal, camera_id, message}, state) do
+    {:noreply, record_decoder_outcome(state, camera_id, {:error, {:decoder_refused, message}})}
   end
 
   @impl true
