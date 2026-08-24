@@ -161,7 +161,10 @@ missing algorithm.
 
 ## Tests
 
-`export-venv/bin/python -m pytest` (from this directory). The suite pins
+`plugins/cairn-detect/model/quant-venv/bin/python -m pytest
+tools/qdq-export` (from the repo root — pytest and the ONNX test deps
+install with `requirements.txt` into the quant venv; `export-venv` stays
+the Ultralytics-only AGPL boundary). The suite pins
 the #138 review-round classes as regressions: meta suspect/stale/legacy
 grading and the `current` retry guard (campaign_meta.py — also run under
 the system python3, whose stdlib is all it may use), analyzer verdict

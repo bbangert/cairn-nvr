@@ -13,6 +13,7 @@ Stdlib only: the bash caller runs the system python3, which has no venv.
 """
 import argparse
 import hashlib
+import json
 import os
 import re
 import sys
@@ -48,6 +49,8 @@ class RunMeta:
         self.lines = self._text.splitlines()
         self.shas = []  # (recorded path, sha) pairs, from sha256sum lines
         self.backend = None
+        self.profile = None
+        self.insize = None
         self.extra_args = None
         self.completion = False
         for line in self.lines:
@@ -55,8 +58,13 @@ class RunMeta:
             if m:
                 self.shas.append((m.group(2), m.group(1)))
             elif line.startswith("backend: "):
+                # "backend: X profile: Y insize: Z ..." — key/value token
+                # pairs; zip degrades a truncated line to missing fields.
                 parts = line.split()
-                self.backend = parts[1] if len(parts) > 1 else None
+                fields = dict(zip(parts[0::2], parts[1::2]))
+                self.backend = fields.get("backend:")
+                self.profile = fields.get("profile:")
+                self.insize = fields.get("insize:")
             elif line.startswith("extra_args:"):
                 rest = line[len("extra_args:"):]
                 self.extra_args = rest[1:] if rest.startswith(" ") else rest
@@ -141,6 +149,19 @@ def records_script(run_dir):
     return RunMeta.load(run_dir).records_script
 
 
+def _is_frame_line(line):
+    """The analyzer's acceptance rule (htp_series): a parsed JSON message
+    whose type is frame.objects. A corrupted line that merely CONTAINS
+    the literal would satisfy a substring grep, mark the run current, and
+    let the analyzer grade it NO-DATA forever."""
+    if '"frame.objects"' not in line:
+        return False
+    try:
+        return json.loads(line).get("type") == "frame.objects"
+    except (json.JSONDecodeError, AttributeError):
+        return False
+
+
 def _current(args):
     """The retry guard: skip a rerun only on evidence of a SUCCESSFUL
     CURRENT run — emitted frames, a complete non-suspect meta, and shas
@@ -152,7 +173,7 @@ def _current(args):
         # (rerun, exit 1), not a broken guard — it must not escape as a
         # UnicodeDecodeError into the rc>=2 lane.
         with open(os.path.join(args.run_dir, "out.ndjson"), errors="replace") as f:
-            if not any('"frame.objects"' in line for line in f):
+            if not any(_is_frame_line(line) for line in f):
                 return False
     except OSError:
         return False
@@ -163,6 +184,14 @@ def _current(args):
         return False
     if meta.extra_args != args.extra_args:
         return False
+    # extra_args alone is not the run's identity: backend/profile/insize
+    # arrive via the driver's env and argv, outside the hashed script —
+    # a rung whose geometry changes must regenerate its evidence.
+    for want, have in ((args.backend, meta.backend),
+                       (args.profile, meta.profile),
+                       (args.insize, meta.insize)):
+        if want is not None and want != have:
+            return False
     for path in (args.model, args.clip):
         if path and not meta.has_sha(file_sha256(path)):
             return False
@@ -186,6 +215,9 @@ def main():
     cur.add_argument("--model", help="local artifact whose bytes the run must record")
     cur.add_argument("--clip", help="local clip whose bytes the run must record")
     cur.add_argument("--require-sha", help="literal sha the meta must record (pinned controls)")
+    cur.add_argument("--backend", help="backend the run must record")
+    cur.add_argument("--profile", help="model profile the run must record")
+    cur.add_argument("--insize", help="input size the run must record")
     args = ap.parse_args()
     # rc contract: 1 = evidence not current (rerun it); >=2 = the GUARD
     # is broken (argparse 2, this catch-all 3, absent python3 127) — the

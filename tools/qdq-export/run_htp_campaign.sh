@@ -244,11 +244,12 @@ EOF
 # complete non-suspect meta, and shas tying the run to THIS content-test
 # script, THESE flags, and today's model/clip bytes all live there. The
 # control has no local artifact under $ART; its bytes are pinned.
-fetched_run_current() { # <tag> <rung-label> <clip> <extra-flags>
+fetched_run_current() { # <tag> <rung-label> <clip> <extra-flags> <backend> <profile> <insize>
   # --extra-args=: the value starts with "--" and argparse would read a
   # separate token as an option.
   local args=(current "$HTP/content/$1"
-    --script "$HERE/htp_content_test.sh" "--extra-args=$4")
+    --script "$HERE/htp_content_test.sh" "--extra-args=$4"
+    --backend "$5" --profile "$6" --insize "$7")
   [ -f "$ART/$2.onnx" ] && args+=(--model "$ART/$2.onnx")
   [ "$2" = control-old-nano-a16 ] && args+=(--require-sha "$OLD_NANO_SHA")
   [ -f "$OUT/clips/clip-$3.mp4" ] && args+=(--clip "$OUT/clips/clip-$3.mp4")
@@ -273,7 +274,7 @@ content_run() { # <backend> <model-path> <rung-label> <profile> <insize>
     # Skip only on evidence of a SUCCESSFUL CURRENT run — the guard's
     # header above and campaign_meta's `_current` docstring define what
     # that means; truncated and stale-bytes runs both retry.
-    if fetched_run_current "$tag" "$label" "$clip" "$flags"; then
+    if fetched_run_current "$tag" "$label" "$clip" "$flags" "$backend" "$profile" "$insize"; then
       log "content $tag: already fetched, skip"
       continue
     fi

@@ -65,6 +65,8 @@ def test_complete_meta_is_not_suspect(tmp_path):
     assert meta.suspect_reason() is None
     assert meta.has_backend("qnn")
     assert not meta.has_backend("ort")
+    assert meta.profile == "yolox"
+    assert meta.insize == "416"
     assert meta.extra_args == "--qnn-library x"
     assert meta.records_script
 
@@ -104,6 +106,10 @@ def test_meta_truncated_mid_line_never_crashes():
     assert meta.backend is None
     assert not meta.has_backend("qnn")
     assert "completion marker" in meta.suspect_reason()
+    # a dangling key at the cut point degrades to a missing field
+    meta = RunMeta("backend: qnn profile:")
+    assert meta.backend == "qnn"
+    assert meta.profile is None
 
 
 def test_malformed_script_sha_line_is_stale_not_legacy(tmp_path):
@@ -224,6 +230,43 @@ def test_current_cli_rejects_drift(tmp_path, interpreter, local_files):
                        clip=str(clip), require_sha="0" * 64) == 1
     assert current_cli(interpreter, run, str(script), "--qnn-library x",
                        clip=str(clip), require_sha=shas["model_sha"]) == 0
+
+
+def test_current_cli_checks_invocation_identity(tmp_path, interpreter, local_files):
+    # backend/profile/insize arrive via the driver's env and argv, not
+    # the hashed script: a rung whose geometry changes must regenerate
+    # its evidence, and a wrong backend must not wait for the analyzer.
+    script, model, clip = local_files
+    shas = dict(script_sha=file_sha256(str(script)),
+                model_sha=file_sha256(str(model)),
+                clip_sha=file_sha256(str(clip)))
+    run = write_run(tmp_path, meta_text(**shas))
+    base = dict(model=str(model), clip=str(clip))
+    assert current_cli(interpreter, run, str(script), "--qnn-library x",
+                       backend="qnn", profile="yolox", insize="416", **base) == 0
+    for drift in (dict(backend="ort", profile="yolox", insize="416"),
+                  dict(backend="qnn", profile="yolov8", insize="416"),
+                  dict(backend="qnn", profile="yolox", insize="640")):
+        assert current_cli(interpreter, run, str(script), "--qnn-library x",
+                           **drift, **base) == 1
+
+
+def test_current_cli_requires_parseable_frame_line(tmp_path, interpreter, local_files):
+    # A corrupted line that merely CONTAINS the literal is not an
+    # emitted frame — the analyzer would grade the run NO-DATA while the
+    # guard kept skipping it forever.
+    script, model, clip = local_files
+    shas = dict(script_sha=file_sha256(str(script)),
+                model_sha=file_sha256(str(model)),
+                clip_sha=file_sha256(str(clip)))
+    run = write_run(tmp_path, meta_text(**shas),
+                    ndjson='garbage "frame.objects" garbage\n', name="corrupt")
+    assert current_cli(interpreter, run, str(script), "--qnn-library x") == 1
+    run = write_run(
+        tmp_path, meta_text(**shas),
+        ndjson='QAIRT noise\n{"type":"frame.objects","pts":0,"objects":[]}\n',
+        name="okline")
+    assert current_cli(interpreter, run, str(script), "--qnn-library x") == 0
 
 
 def test_binary_corrupted_meta_grades_not_crashes(tmp_path):
