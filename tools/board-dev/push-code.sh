@@ -105,7 +105,18 @@ for d in lib/*/; do
     fi
   fi
 done
-# Preflight proved every app installable; nothing below refuses.
+# The release dir is part of the same preflight: its absence must refuse
+# BEFORE any app ebin lands, not after all of them have.
+release_target=""
+for target in /app/releases/*/; do
+  [ -d "$target" ] && release_target=1
+done
+if [ -z "$release_target" ]; then
+  echo "push: the image has no release dir to receive runtime config" >&2
+  exit 1
+fi
+# Preflight proved every app and the release dir installable; nothing below
+# refuses.
 for d in lib/*/; do
   name=$(basename "$d")
   mkdir -p /app/lib/"$name"
@@ -118,16 +129,10 @@ done
 # -r is load-bearing: `consolidated` is a directory, and plain cp refuses a
 # directory with a non-zero status, which under `set -e` aborts the install.
 for r in releases/*/; do
-  installed=""
   for target in /app/releases/*/; do
     [ -d "$target" ] || continue
     cp -r "$r"* "$target"
-    installed=1
   done
-  if [ -z "$installed" ]; then
-    echo "push: the image has no release dir to receive runtime config" >&2
-    exit 1
-  fi
 done
 EOS
 

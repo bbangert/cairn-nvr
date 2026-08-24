@@ -26,8 +26,10 @@ import {decode as decodeMsgpack} from "../vendor_msgpack.js"
 // doesn't fight the scrubber. A heuristic, not a measurement: there is no API
 // for the controls' geometry, and it differs per browser.
 const CONTROLS_HEIGHT = 44
-// See sampleAt. A second of absent detection is a real gap, not a sample
-// period, at every tier-1 rate (periods run ~130-530ms).
+// See sampleAt. A FULL second of absent detection is a real gap, not a
+// sample period, at every tier-1 rate (periods run ~130-530ms) — the
+// boundary itself counts as a gap (>=), or exactly one second of synthetic
+// motion would still draw.
 const MAX_LERP_GAP_MS = 1000
 const BOX_HOLD_MS = 300
 
@@ -306,7 +308,7 @@ const TrackOverlay = {
     const i = track.cursor
     const t0 = times[i]
     const t1 = times[i + 1]
-    if (t1 - t0 > MAX_LERP_GAP_MS) {
+    if (t1 - t0 >= MAX_LERP_GAP_MS) {
       // At or past t1 the pair's second sample is the CURRENT detection —
       // only the terminal pair can be here (the cursor advances past every
       // other), and without this a track whose last pair spans a gap never

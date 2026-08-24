@@ -244,6 +244,33 @@ defmodule CairnWeb.DashboardLiveTest do
       refute has_element?(view, ~s(div[style*="height: 10.0%"]))
     end
 
+    # The wider-than-16:9 branch: a 32:9 frame in the tile crops the left and
+    # right quarters away (f = 0.5). x' = (x - 0.25) / 0.5, w' = w / 0.5; the
+    # vertical axis passes through untouched.
+    test "a wider-than-tile camera's boxes are corrected for the side crop", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      view
+      |> activate("cam_a", %{"width" => 3840, "height" => 1080})
+      |> publish("cam_a", [detection("person", 0.9, [0.5, 0.25, 0.2, 0.5])])
+
+      assert has_element?(view, ~s(div[style*="left: 50.0%"]))
+      assert has_element?(view, ~s(div[style*="width: 40.0%"]))
+      assert has_element?(view, ~s(div[style*="top: 25.0%"]))
+      assert has_element?(view, ~s(div[style*="height: 50.0%"]))
+    end
+
+    test "a box wholly in the side-cropped strip is not drawn", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      view
+      |> activate("cam_a", %{"width" => 3840, "height" => 1080})
+      |> publish("cam_a", [detection("person", 0.9, [0.05, 0.4, 0.1, 0.2])])
+
+      assert has_element?(view, ~s(div[style*="display: none"]))
+      refute has_element?(view, ~s(div[style*="left: 0.5%"]))
+    end
+
     # A 4:3 frame in the 16:9 tile crops the top and bottom 12.5% away. A box
     # wholly inside that strip corrects to an empty intersection and must
     # DISAPPEAR — the regression was a sliver pinned to the tile edge.

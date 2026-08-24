@@ -446,12 +446,6 @@ defmodule CairnWeb.EventLive do
   # `data-t` once metadata loads, so a shift applied to only some of them
   # would have the dot and the seek disagree.
   #
-  # Floored at zero for `label_entry/3`'s reason: this timeline's axis is the
-  # EVENT, and a position before its start is not on it. A negative shift can
-  # push an early detection off the front, where it sticks at 0:00.
-  # Rounded to the precision the entry itself was stored at
-  # (`Cairn.PresenceRecorder.label_entry/3`), so a shift does not hand the DOM
-  # a float's worth of noise the timeline cannot express anyway.
   # Millisecond precision: one decimal would quietly rewrite a configured
   # offset (a -250 ms setting shifting a 3.0 s marker to 2.8) and disagree
   # with the overlay and snapshot, which use the exact value. SIGNED: the

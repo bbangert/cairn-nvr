@@ -124,7 +124,7 @@ defmodule Cairn.Snapshot do
         # It bites only on that estimate: the anchored path never returns a
         # negative, because a result before the start of the clip is
         # `anchor_clip_ms/2`'s `:error` and falls through to here (see
-        # `anchored_seek/2` — a miss there is deliberate, not a clamp).
+        # `anchored_seek/3` — a miss there is deliberate, not a clamp).
         # The annotation offset lands here, on the seek and not on the box:
         # the trigger's coordinates are what the detector saw, and what is
         # wrong on a lagging pair of streams is WHICH FRAME they belong to.
