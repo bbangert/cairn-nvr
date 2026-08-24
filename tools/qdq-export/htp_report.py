@@ -176,7 +176,14 @@ def htp_series(ndjson_path):
                 # the retry guard already rejects.
                 raise ValueError(f"non-finite pts {pts!r}")
             objs = msg["objects"]
+            if not isinstance(objs, list):
+                # {} or "" iterates zero times and would reduce to a
+                # valid EMPTY frame — corruption graded as a real miss.
+                # Same shape rule as validate_ndjson's protocol check.
+                raise ValueError(f"objects is {type(objs).__name__}, not a list")
             for o in objs:
+                if not isinstance(o, dict):
+                    raise ValueError(f"object entry is {type(o).__name__}, not a dict")
                 s = o["score"]
                 if not is_finite(s) or not 0.0 <= s <= 1.0:
                     # Validate RAW values: max() with NaN is

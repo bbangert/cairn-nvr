@@ -336,6 +336,8 @@ def test_current_cli_rejects_partially_poisoned_ndjson(tmp_path, interpreter, lo
         "fieldless": good + '{"type":"frame.objects","pts":90000}\n',
         "cutline": good + '{"type":"frame.objects","pts":90000,"obj',
         "rangeframe": good + '{"type":"frame.objects","pts":90000,"objects":[{"label":"person","score":1.5}]}\n',
+        "dictobjects": good + '{"type":"frame.objects","pts":90000,"objects":{}}\n',
+        "strobjects": good + '{"type":"frame.objects","pts":90000,"objects":""}\n',
     }
     for name, ndjson in cases.items():
         run = write_run(tmp_path, meta_text(**shas), ndjson=ndjson, name=name)

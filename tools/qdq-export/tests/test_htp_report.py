@@ -225,6 +225,19 @@ def test_invalid_encoding_is_suspect_not_a_crash(tmp_path):
     assert r["why"] == "invalid encoding in fetched ndjson"
 
 
+def test_non_list_objects_is_suspect_not_an_empty_frame(tmp_path):
+    # {"objects": {}} iterates zero times — unguarded, corruption reduces
+    # to a valid empty frame and grades as a real miss.
+    run = write_run(tmp_path, emissions([0.93] * 40))
+    bad = json.dumps({"type": "frame.objects", "frame": {"pts": 720000},
+                      "objects": {}})
+    with open(f"{run}/out.ndjson", "a") as f:
+        f.write(bad + "\n")
+    r = analyze_run(run, ref(CONFIDENT), ref(CONFIDENT))
+    assert r["verdict"] == "SUSPECT"
+    assert r["why"] == "malformed frame.objects message in fetched ndjson"
+
+
 def test_bare_scalar_json_line_is_noise(tmp_path):
     # QAIRT noise can be a bare number, which json.loads happily parses;
     # it is stdout noise like any unparseable line, not frame evidence.

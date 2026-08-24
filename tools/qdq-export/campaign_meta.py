@@ -205,6 +205,13 @@ def _gradable_frame_count(lines: Iterable[str]) -> int | None:
             return None
         if not isinstance(msg, dict) or msg.get("type") != "frame.objects":
             continue
+        # objects must be a LIST of dicts (validate_ndjson's shape rule):
+        # {} or "" iterates zero times and would count as a valid empty
+        # frame — corruption graded as a real miss downstream.
+        if not isinstance(msg.get("objects"), list) or not all(
+            isinstance(o, dict) for o in msg["objects"]
+        ):
+            return None
         try:
             pts = msg["frame"]["pts"] if "frame" in msg else msg["pts"]
             fields = [(o["label"], o["score"]) for o in msg["objects"]]
