@@ -226,6 +226,18 @@ def test_current_cli_rejects_drift(tmp_path, interpreter, local_files):
                        clip=str(clip), require_sha=shas["model_sha"]) == 0
 
 
+def test_binary_corrupted_meta_grades_not_crashes(tmp_path):
+    # Invalid UTF-8 in a fetched meta is corrupt EVIDENCE: it must parse
+    # (replacement chars -> missing fields -> suspect), never raise into
+    # the analyzer or the CLI's guard-broken lane.
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "meta").write_bytes(b"\xff\xfegovernor: \xba\xad\nbackend: ")
+    meta = RunMeta.load(str(run))
+    assert meta.exists
+    assert meta.suspect_reason() is not None
+
+
 def test_current_cli_rc_contract(tmp_path, interpreter, local_files):
     # rc 1 = evidence not current (rerun that run); rc >= 2 = the guard
     # ITSELF is broken — the bash caller fatals instead of blind-rerunning
@@ -237,6 +249,10 @@ def test_current_cli_rc_contract(tmp_path, interpreter, local_files):
     # binary-corrupted ndjson is bad EVIDENCE: rerun (1), not guard breakage
     run = write_run(tmp_path, meta_text(**shas), ndjson=None, name="bin")
     (tmp_path / "bin" / "out.ndjson").write_bytes(b"\xff\xfe\x00garbage")
+    assert current_cli(interpreter, run, str(script), "--qnn-library x") == 1
+    # binary-corrupted meta likewise: evidence (1), not breakage
+    run = write_run(tmp_path, meta=None, name="binmeta")
+    (tmp_path / "binmeta" / "meta").write_bytes(b"\xff\xfegovernor: \xba\xad")
     assert current_cli(interpreter, run, str(script), "--qnn-library x") == 1
     # a missing local script file is guard breakage: 3, never 1
     run = write_run(tmp_path, meta_text(**shas), name="noscript")

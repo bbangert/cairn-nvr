@@ -388,13 +388,23 @@ do_fetch() {
   else
     local start
     start=$(cat "$HTP/.latency-start")
-    while read -r d; do
-      local ts=${d##*-}
-      case $ts in *[!0-9]*|'') continue ;; esac
-      if [ "$ts" -ge "$start" ] && [ ! -d "$HTP/runs/$d" ]; then
-        fetch "/data/cairn-bench/runs/$d" "$HTP/runs/" || log "WARN: run $d fetch failed"
-      fi
-    done < "$HTP/.runs-list"
+    case $start in
+    *[!0-9]*|'')
+      # Same fail-closed rule as the analyzer: a marker that exists but
+      # holds no epoch (killed/ENOSPC write) means no current latency
+      # stage — not an unfiltered pull of every historical run dir.
+      log "invalid latency marker — skipping bench-run fetch"
+      ;;
+    *)
+      while read -r d; do
+        local ts=${d##*-}
+        case $ts in *[!0-9]*|'') continue ;; esac
+        if [ "$ts" -ge "$start" ] && [ ! -d "$HTP/runs/$d" ]; then
+          fetch "/data/cairn-bench/runs/$d" "$HTP/runs/" || log "WARN: run $d fetch failed"
+        fi
+      done < "$HTP/.runs-list"
+      ;;
+    esac
   fi
   log "fetched: $(ls "$HTP/content" 2>/dev/null | wc -l) content dirs, $(ls "$HTP/runs" 2>/dev/null | wc -l) bench runs"
 }

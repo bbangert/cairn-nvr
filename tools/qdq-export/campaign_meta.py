@@ -68,7 +68,11 @@ class RunMeta:
         path = os.path.join(run_dir, "meta")
         if not os.path.exists(path):
             return cls(None)
-        with open(path) as f:
+        # errors="replace", same reasoning as the ndjson read: corrupt
+        # bytes are bad EVIDENCE — the mangled text parses into missing
+        # fields and grades SUSPECT/stale — never an exception that
+        # aborts the report or reads as a broken guard (rc>=2).
+        with open(path, errors="replace") as f:
             return cls(f.read())
 
     @property
