@@ -161,14 +161,28 @@ def test_malformed_script_sha_line_is_stale_not_legacy(tmp_path):
     assert meta.stale_reason({"script": SCRIPT_SHA}) is not None
 
 
-def test_duplicate_sha_paths_all_match(tmp_path):
-    # Two sha lines for the same path (e.g. a writer rerun appending):
-    # every recorded sha must stay matchable — dropping one would grade
-    # genuinely current evidence stale.
+def test_conflicting_shas_for_one_path_are_suspect(tmp_path):
+    # The writer truncates meta at start and records one sha per file:
+    # two DIFFERENT hashes for one path is ambiguous/corrupt evidence —
+    # any-match would let stale checks validate old AND new bytes.
     text = meta_text() + f"{'d' * 64}  /data/m.onnx\n"
     meta = RunMeta.load(write_run(tmp_path, text))
+    assert meta.suspect_reason() == "meta records conflicting shas for /data/m.onnx"
+    # the SAME hash repeated is benign repetition, not a conflict
+    text = meta_text() + f"{MODEL_SHA}  /data/m.onnx\n"
+    meta = RunMeta.load(write_run(tmp_path, text))
+    assert meta.suspect_reason() is None
     assert meta.has_sha(MODEL_SHA)
-    assert meta.has_sha("d" * 64)
+
+
+def test_overlong_frame_count_is_corrupt_marker_not_a_crash(tmp_path):
+    # py3.11 caps decimal-to-int at ~4300 digits; the regex accepts an
+    # unbounded count. An absurd count must grade as a truncated/corrupt
+    # marker (suspect), never raise into the report or the rc-3 lane.
+    text = meta_text(completion="frame.objects lines: " + "9" * 5000)
+    meta = RunMeta.load(write_run(tmp_path, text))
+    assert not meta.completion
+    assert "completion marker" in meta.suspect_reason()
 
 
 def test_stale_and_current_shas(tmp_path):

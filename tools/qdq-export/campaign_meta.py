@@ -80,8 +80,24 @@ class RunMeta:
                 rest = line[len("extra_args:"):]
                 self.extra_args = rest[1:] if rest.startswith(" ") else rest
             elif m := _COMPLETION_LINE.match(line):
-                self.completion = True
-                self.frames = int(m.group(1))
+                try:
+                    self.frames = int(m.group(1))
+                    self.completion = True
+                except ValueError:
+                    # py3.11 caps decimal-to-int conversion (~4300
+                    # digits) and the regex accepts an unbounded count —
+                    # an absurd count is a corrupt marker, not a crash.
+                    pass
+        # The writer truncates meta at start and records one sha per
+        # file: two DIFFERENT hashes for one path is corrupt/ambiguous
+        # evidence, and any-match would let stale checks validate both
+        # the old and the new bytes.
+        by_path: dict[str, set[str]] = {}
+        for p, s in self.shas:
+            by_path.setdefault(p, set()).add(s)
+        self.conflicting_sha_path = next(
+            (p for p, ss in by_path.items() if len(ss) > 1), None
+        )
 
     @classmethod
     def load(cls, run_dir: str) -> RunMeta:
@@ -133,6 +149,8 @@ class RunMeta:
             return "no meta fetched"
         if self.corrupt:
             return "meta contains undecodable bytes"
+        if self.conflicting_sha_path is not None:
+            return f"meta records conflicting shas for {self.conflicting_sha_path}"
         for line in self.lines:
             if "run suspect" in line:
                 return line.strip()
