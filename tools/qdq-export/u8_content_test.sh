@@ -63,7 +63,10 @@ cleanup() {
   [ -n "$FEED" ] && kill "$FEED" 2>/dev/null
   [ -n "$PLUGIN" ] && kill "$PLUGIN" 2>/dev/null
 }
-trap cleanup EXIT INT TERM
+# Signals must be TERMINAL (see htp_content_test.sh): an interrupted
+# run must not finalize and write its completion marker.
+trap 'cleanup; trap - EXIT; exit 130' INT TERM
+trap cleanup EXIT
 
 # $! after a background pipeline is the pipeline's LAST process — the
 # plugin, which is exactly what the up-wait and the final wait need.

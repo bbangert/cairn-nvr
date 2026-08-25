@@ -193,7 +193,16 @@ do_push() {
   while IFS=: read -r tag stem; do
     [ -z "$tag" ] && continue
     files+=("$ART/$stem.onnx")
-    [ -f "$ART/$stem.onnx.qparams.json" ] && files+=("$ART/$stem.onnx.qparams.json")
+    # Every non-float variant REQUIRES its sidecar: silently omitting a
+    # missing one would let that leg run against a stale board copy —
+    # or another artifact's sidecar surviving the wildcard checksum —
+    # and the spike would "verify" a pair it never pushed.
+    if [ "$tag" = float ]; then
+      continue
+    fi
+    [ -f "$ART/$stem.onnx.qparams.json" ] \
+      || { log "FATAL: $stem.onnx.qparams.json missing — re-run u8_io_surgery.py"; exit 1; }
+    files+=("$ART/$stem.onnx.qparams.json")
   done <<< "$VARIANTS"
   timeout 900 scp -q -o BatchMode=yes "${files[@]}" "$BOARD:$BENCH/artifacts-fixed/" 2>/dev/null
   # The content clip does not live on the board between campaigns.

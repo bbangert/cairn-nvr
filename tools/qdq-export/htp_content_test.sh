@@ -77,7 +77,11 @@ cleanup() {
   [ -n "$FEED" ] && kill "$FEED" 2>/dev/null
   [ -n "$PLUGIN" ] && kill "$PLUGIN" 2>/dev/null
 }
-trap cleanup EXIT INT TERM
+# Signals must be TERMINAL: a trapped INT/TERM otherwise resumes the
+# script, which would drain, finalize, and write the completion marker
+# for a run that was interrupted mid-feed. EXIT keeps cleanup-only.
+trap 'cleanup; trap - EXIT; exit 130' INT TERM
+trap cleanup EXIT
 
 # The control channel is a pipe from a background writer loop: the
 # writer prints the epoch, then polls for $RUN/done; teardown touches

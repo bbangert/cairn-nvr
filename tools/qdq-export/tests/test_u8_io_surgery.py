@@ -11,7 +11,10 @@ from onnx import TensorProto, helper, numpy_helper
 from u8_io_surgery import entry_surgery, exit_surgery, quantize_codes
 
 TOOL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ARTIFACT = os.path.join(TOOL_DIR, "out-20260820", "artifacts", "yolox_s-qdq-a8.onnx")
+# The TRACKED copy of the rung artifact (byte-identical to the export
+# run's out-dir), so the real focus-stem surgery + --verify actually run
+# in CI instead of silently skipping.
+ARTIFACT = os.path.join(TOOL_DIR, "..", "..", "models", "yolox_s-qdq-a8.onnx")
 
 
 def qdq_model(entry_scale=0.5, entry_zp=10, stem=None, entry_paths=None):
