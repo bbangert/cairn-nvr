@@ -137,6 +137,15 @@ def test_entry_surgery_rejects_a_dead_end_branch():
         entry_surgery(m.graph)
 
 
+def test_entry_surgery_rejects_a_q_that_produces_a_graph_output():
+    # Deleting an entry Q whose output is ALSO a graph output would leave
+    # that output with no producer — rewiring only redirects consumers.
+    m = qdq_model()
+    m.graph.output.append(helper.make_tensor_value_info("q0", TensorProto.UINT8, [1, 1, 2, 2]))
+    with pytest.raises(SystemExit):
+        entry_surgery(m.graph)
+
+
 def test_entry_surgery_rejects_the_input_in_a_non_data_slot():
     # The graph input as Reshape's SHAPE operand is not a data path;
     # treating it as one would retype semantics, not dtype.

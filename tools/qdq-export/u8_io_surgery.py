@@ -144,6 +144,17 @@ def entry_surgery(graph):
                     f"non-data input slot — cannot retype the stem to uint8"
                 )
             if n.op_type == "QuantizeLinear":
+                # Deleting this Q must not orphan a graph output: rewiring
+                # only redirects consumers, and graph outputs are not
+                # consumers — the same aliasing the transparent-tensor
+                # guard above refuses, at the leaf itself.
+                aliased = [o for o in n.output if o in graph_outputs]
+                if aliased:
+                    fail(
+                        f"entry QuantizeLinear ({n.name or 'unnamed'}) produces "
+                        f"graph output {aliased[0]} — removing it would leave "
+                        f"that output undefined"
+                    )
                 q_nodes.append(n)
             elif n.op_type in TRANSPARENT_OPS:
                 traversed.extend(n.output)
