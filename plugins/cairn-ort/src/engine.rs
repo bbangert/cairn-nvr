@@ -55,13 +55,25 @@ impl Engine {
         // report it "missing" and send the operator re-exporting a file
         // that is sitting right there; a u8 artifact WITHOUT a sidecar
         // still gets that check's accurate message.
-        if infer::IoQuant::sidecar_path(&config.model).exists() {
-            return Err(NativeError::ModelLoad(format!(
-                "model {} has a qparams sidecar — uint8-IO artifacts run only \
-                 in the cairn-detect binary, not in-VM; configure the float-IO \
-                 artifact here",
-                config.model.display()
-            )));
+        // metadata, not exists(): a permission error must surface, not read
+        // as "no sidecar" — the same NotFound-only-is-absence rule as
+        // IoQuant::load_for.
+        match std::fs::metadata(infer::IoQuant::sidecar_path(&config.model)) {
+            Ok(_) => {
+                return Err(NativeError::ModelLoad(format!(
+                    "model {} has a qparams sidecar — uint8-IO artifacts run only \
+                     in the cairn-detect binary, not in-VM; configure the float-IO \
+                     artifact here",
+                    config.model.display()
+                )))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(NativeError::ModelLoad(format!(
+                    "checking for a qparams sidecar next to {}: {e}",
+                    config.model.display()
+                )))
+            }
         }
         let detector = Detector::open(
             &config.model,
