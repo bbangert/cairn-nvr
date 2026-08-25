@@ -161,11 +161,14 @@ def exit_surgery(graph):
         if dq is None or dq.op_type != "DequantizeLinear":
             fail(f"output {out.name} is not produced by DequantizeLinear (got {dq.op_type if dq else 'nothing'})")
         code_tensor = dq.input[0]
-        others = [n.name for n in consumers.get(code_tensor, []) if n.name != dq.name]
+        # Node identity, not node name: ONNX names are optional and can be
+        # empty or duplicated, and a name compare would let an unnamed extra
+        # consumer slip past into an unsafe rewrite.
+        others = [n for n in consumers.get(code_tensor, []) if n is not dq]
         if others:
             fail(
                 f"quantized tensor {code_tensor} has consumers besides the exit DQ: "
-                + ", ".join(others)
+                + ", ".join(n.name or f"<unnamed {n.op_type}>" for n in others)
             )
         scale, zp = scalar_qparams(graph, dq.input[1], dq.input[2], f"exit DQ {dq.name}")
 

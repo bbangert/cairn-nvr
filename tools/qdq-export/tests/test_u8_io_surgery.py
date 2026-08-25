@@ -152,6 +152,17 @@ def test_exit_surgery_renames_code_tensor_to_output():
     onnx.checker.check_model(m)
 
 
+def test_exit_surgery_catches_an_unnamed_extra_consumer():
+    # ONNX node names are optional: an UNNAMED node consuming the quantized
+    # code tensor must still block the rewrite (identity compare, not name).
+    m = qdq_model()
+    exit_dq = next(n for n in m.graph.node if n.name == "exit_dq")
+    exit_dq.name = ""
+    m.graph.node.append(helper.make_node("Identity", ["q1"], ["leak"]))
+    with pytest.raises(SystemExit):
+        exit_surgery(m.graph)
+
+
 def test_exit_surgery_rejects_non_dq_output():
     m = qdq_model()
     m.graph.node.remove(next(n for n in m.graph.node if n.name == "exit_dq"))
