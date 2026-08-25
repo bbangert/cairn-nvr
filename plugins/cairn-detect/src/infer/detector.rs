@@ -331,10 +331,7 @@ mod tests {
         use super::super::encoding::QuantParams;
 
         let model = Path::new("m.onnx");
-        let qp = QuantParams {
-            scale: 1.0,
-            zero_point: 0,
-        };
+        let qp = QuantParams::new(1.0, 0).unwrap();
         let io = |input_is_u8: bool, u8_outputs: &[&str]| ModelIo {
             input_name: "images".to_string(),
             declared_input_size: None,

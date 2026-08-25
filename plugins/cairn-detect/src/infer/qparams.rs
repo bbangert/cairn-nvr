@@ -78,15 +78,10 @@ fn sha256_of(path: &Path) -> Result<String> {
 }
 
 fn checked(scale: f32, zero_point: u8, where_: &str, path: &Path) -> Result<QuantParams> {
-    // Finite-positive here is what lets QuantParams carry a derived-Eq-style
-    // equality: no NaN scale ever constructs one.
-    if !scale.is_finite() || scale <= 0.0 {
-        bail!(
-            "{}: {where_} scale {scale} is not finite-positive",
-            path.display()
-        );
-    }
-    Ok(QuantParams { scale, zero_point })
+    // The finite-positive rule lives in QuantParams::new — the type's own
+    // invariant; this wrapper only stamps the sidecar's path and edge on
+    // the refusal.
+    QuantParams::new(scale, zero_point).with_context(|| format!("{}: {where_}", path.display()))
 }
 
 impl IoQuant {
@@ -191,15 +186,9 @@ mod tests {
         let quant = IoQuant::load_for(&model).unwrap().unwrap();
         let (name, input) = quant.input.unwrap();
         assert_eq!(name, "images");
-        assert_eq!(
-            input,
-            QuantParams {
-                scale: 1.0,
-                zero_point: 0
-            }
-        );
+        assert_eq!(input, QuantParams::new(1.0, 0).unwrap());
         let out = quant.outputs["output"];
-        assert_eq!(out.zero_point, 102);
+        assert_eq!(out.zero_point(), 102);
         // The removed DequantizeLinear's own arithmetic.
         assert_eq!(out.dequantize(102), 0.0);
         assert!((out.dequantize(255) - 3.7393894).abs() < 1e-4);

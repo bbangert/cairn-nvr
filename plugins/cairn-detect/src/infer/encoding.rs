@@ -123,20 +123,34 @@ impl Packing {
 /// One tensor edge's quantization affine, from the artifact's own stripped
 /// QuantizeLinear/DequantizeLinear (`<model>.qparams.json` — see
 /// [`super::qparams::IoQuant`]).
+///
+/// Fields are private behind [`QuantParams::new`], which refuses any
+/// non-finite-positive scale — that checked construction is what makes the
+/// manual `Eq` sound (no NaN can ever make `value != value`), and
+/// [`InputSpec`](super::InputSpec) derives `Eq` over this type.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QuantParams {
-    pub scale: f32,
-    pub zero_point: u8,
+    scale: f32,
+    zero_point: u8,
 }
 
-/// `Eq` leans on an invariant, not a type guarantee: the sidecar loader —
-/// the only non-test constructor — refuses any non-finite-positive scale,
-/// so no NaN reaches an [`InputSpec`](super::InputSpec) equality in shipped
-/// paths. The fields are `pub`, so a literal with a NaN scale *can* be
-/// built; don't.
 impl Eq for QuantParams {}
 
 impl QuantParams {
+    /// The one constructor: a zero/NaN/inf scale never becomes a
+    /// `QuantParams`, so quantize never divides to garbage and equality
+    /// stays reflexive.
+    pub fn new(scale: f32, zero_point: u8) -> anyhow::Result<Self> {
+        if !scale.is_finite() || scale <= 0.0 {
+            anyhow::bail!("qparams scale {scale} is not finite-positive");
+        }
+        Ok(Self { scale, zero_point })
+    }
+
+    pub fn zero_point(self) -> u8 {
+        self.zero_point
+    }
+
     /// The removed QuantizeLinear's arithmetic, per ONNX spec: round half to
     /// even, then saturate to u8. Must match `u8_io_surgery.quantize_codes`
     /// exactly — the exporter's `--verify` and the campaign's parity leg both
@@ -247,19 +261,13 @@ mod tests {
     /// measures the difference between them instead of the artifact.
     #[test]
     fn quantize_matches_the_exporters_arithmetic() {
-        let identity = QuantParams {
-            scale: 1.0,
-            zero_point: 0,
-        };
+        let identity = QuantParams::new(1.0, 0).unwrap();
         assert_eq!(identity.quantize(0.5), 0); // half to even, down
         assert_eq!(identity.quantize(1.5), 2); // half to even, up
         assert_eq!(identity.quantize(2.5), 2);
         assert_eq!(identity.quantize(-100.0), 0); // saturate low
         assert_eq!(identity.quantize(1000.0), 255); // saturate high
-        let scaled = QuantParams {
-            scale: 0.5,
-            zero_point: 3,
-        };
+        let scaled = QuantParams::new(0.5, 3).unwrap();
         assert_eq!(scaled.quantize(114.0), 231);
         assert_eq!(scaled.dequantize(231), 114.0);
     }
@@ -270,25 +278,13 @@ mod tests {
     #[test]
     fn quantized_lut_is_identity_for_raw_bgr_identity_qparams() {
         let packing = TensorEncoding::RawBgr.packing();
-        let lut = packing.quantized_lut(
-            0,
-            QuantParams {
-                scale: 1.0,
-                zero_point: 0,
-            },
-        );
+        let lut = packing.quantized_lut(0, QuantParams::new(1.0, 0).unwrap());
         for byte in 0..=255u8 {
             assert_eq!(lut[byte as usize], byte);
         }
         // Non-identity qparams must go through the real affine: scale 0.5
         // doubles the code, zero-point shifts it.
-        let lut = packing.quantized_lut(
-            0,
-            QuantParams {
-                scale: 0.5,
-                zero_point: 3,
-            },
-        );
+        let lut = packing.quantized_lut(0, QuantParams::new(0.5, 3).unwrap());
         assert_eq!(lut[114], 231);
         assert_eq!(lut[200], 255); // saturates
     }

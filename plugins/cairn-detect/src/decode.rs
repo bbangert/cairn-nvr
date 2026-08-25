@@ -2317,10 +2317,7 @@ mod tests {
             .flat_map(|_| [10u8, 20, 30])
             .collect();
         let mut spec = spec(input, TensorEncoding::RawBgr, resize);
-        spec.input_quant = Some(QuantParams {
-            scale: 1.0,
-            zero_point: 0,
-        });
+        spec.input_quant = Some(QuantParams::new(1.0, 0).unwrap());
         let tensor = match pack_chw(&plane, stride, fit, spec) {
             TensorValues::U8(codes) => codes,
             TensorValues::F32(_) => panic!("input_quant must pack codes"),
@@ -2346,10 +2343,7 @@ mod tests {
         let stride = fit.inner.w * 3;
         let plane = vec![0u8; stride * fit.inner.h];
         let mut spec = spec(input, TensorEncoding::RawBgr, resize);
-        spec.input_quant = Some(QuantParams {
-            scale: 0.5,
-            zero_point: 3,
-        });
+        spec.input_quant = Some(QuantParams::new(0.5, 3).unwrap());
         let tensor = match pack_chw(&plane, stride, fit, spec) {
             TensorValues::U8(codes) => codes,
             TensorValues::F32(_) => panic!("input_quant must pack codes"),
