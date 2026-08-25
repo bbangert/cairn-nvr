@@ -130,6 +130,21 @@ def test_entry_surgery_rejects_per_axis_qparams():
         entry_surgery(m.graph)
 
 
+def test_surgery_refuses_an_omitted_zero_point_cleanly():
+    # zero_point is optional on Q/DQ; its absence must be a refusal (an
+    # omitted-zp DQ may be int8), never an IndexError.
+    m = qdq_model()
+    entry_q = next(n for n in m.graph.node if n.name == "entry_q")
+    del entry_q.input[2]
+    with pytest.raises(SystemExit):
+        entry_surgery(m.graph)
+    m = qdq_model()
+    exit_dq = next(n for n in m.graph.node if n.name == "exit_dq")
+    del exit_dq.input[2]
+    with pytest.raises(SystemExit):
+        exit_surgery(m.graph)
+
+
 def test_surgery_rejects_non_finite_positive_scale():
     # A zero or NaN edge scale would divide to garbage in quantize and ship
     # a sidecar the Rust loader refuses — same rule, enforced at export.

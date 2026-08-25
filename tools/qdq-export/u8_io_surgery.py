@@ -65,7 +65,17 @@ def fail(msg):
     sys.exit(1)
 
 
-def scalar_qparams(graph, scale_name, zp_name, where):
+def scalar_qparams(graph, node, where):
+    # zero_point is an OPTIONAL input on Q/DQ (an empty name also spells
+    # absence). An edge without an explicit uint8 zp cannot safely become
+    # uint8 graph-IO metadata — an omitted-zp DequantizeLinear may be int8 —
+    # so refuse cleanly instead of IndexError-ing on input[2].
+    if len(node.input) < 3 or not node.input[2]:
+        fail(
+            f"{where}: no explicit zero_point input — only explicit-uint8-zp "
+            f"QDQ edges are supported"
+        )
+    scale_name, zp_name = node.input[1], node.input[2]
     inits = {i.name: i for i in graph.initializer}
     if scale_name not in inits or zp_name not in inits:
         fail(f"{where}: qparams are not initializers (graph-computed qparams unsupported)")
@@ -117,7 +127,7 @@ def entry_surgery(graph):
     if not q_nodes:
         fail("no QuantizeLinear reachable from the graph input")
 
-    qparams = {scalar_qparams(graph, n.input[1], n.input[2], f"entry Q {n.name}") for n in q_nodes}
+    qparams = {scalar_qparams(graph, n, f"entry Q {n.name}") for n in q_nodes}
     if len(qparams) != 1:
         fail(f"entry QuantizeLinear qparams disagree across paths: {sorted(qparams)}")
     scale, zp = qparams.pop()
@@ -170,7 +180,7 @@ def exit_surgery(graph):
                 f"quantized tensor {code_tensor} has consumers besides the exit DQ: "
                 + ", ".join(n.name or f"<unnamed {n.op_type}>" for n in others)
             )
-        scale, zp = scalar_qparams(graph, dq.input[1], dq.input[2], f"exit DQ {dq.name}")
+        scale, zp = scalar_qparams(graph, dq, f"exit DQ {dq.name}")
 
         # The code tensor takes over the output's name so host-side
         # output lookup by name is unchanged.
