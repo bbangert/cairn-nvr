@@ -129,9 +129,11 @@ pub struct QuantParams {
     pub zero_point: u8,
 }
 
-/// `Eq` holds because the sidecar loader refuses any non-finite-positive
-/// scale — no NaN ever constructs one — and [`InputSpec`](super::InputSpec)
-/// derives `Eq` over this type.
+/// `Eq` leans on an invariant, not a type guarantee: the sidecar loader —
+/// the only non-test constructor — refuses any non-finite-positive scale,
+/// so no NaN reaches an [`InputSpec`](super::InputSpec) equality in shipped
+/// paths. The fields are `pub`, so a literal with a NaN scale *can* be
+/// built; don't.
 impl Eq for QuantParams {}
 
 impl QuantParams {

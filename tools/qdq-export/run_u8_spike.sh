@@ -5,18 +5,19 @@
 # output-only, both — in ONE boot session, because cross-session variance
 # on this board is ±20% and only same-session pairs are comparable.
 #
-#   tools/qdq-export/run_u8_spike.sh [all|build|push|run|fetch]
+#   tools/qdq-export/run_u8_spike.sh [all|build|push|run|content|fetch]
 #
 # Stages (all = the lot, in order):
-#   build   cross-build the spike's cairn-detect (aarch64, ort-load-dynamic)
-#   push    binary (previous one backed up) + 4 artifacts + 3 sidecars,
-#           sha-verified
-#   run     reboot (clean CDSP) -> stop container -> pin governor ->
-#           on-board CPU baselines -> 2 interleaved latency rounds x 4
-#           variants (bench.sh, 60s each) -> 4 content runs (clip ac86,
-#           score parity evidence). Governor restore + container restart
-#           ride an EXIT trap.
-#   fetch   pull the new bench run dirs + content evidence
+#   build    cross-build the spike's cairn-detect (aarch64, ort-load-dynamic)
+#   push     binary (previous one backed up) + 4 artifacts + 3 sidecars,
+#            sha-verified
+#   run      reboot (clean CDSP) -> stop container -> pin governor ->
+#            on-board CPU baselines -> 2 interleaved latency rounds x 4
+#            variants (bench.sh, 60s each). Governor restore + container
+#            restart ride an EXIT trap.
+#   content  own boot session: 4 content runs (clip ac86, score parity
+#            evidence) via the spike-local u8_content_test.sh
+#   fetch    pull the new bench run dirs + content evidence
 #
 # Deliberately throwaway (spike-first decision, 2026-08-24): board
 # helpers are copied from run_htp_campaign.sh rather than shared, and no
@@ -163,8 +164,7 @@ do_build() {
 
 do_push() {
   log "== push: spike binary + artifacts + sidecars"
-  # The campaign's binary is backed up once; restore = mv back.
-  remote 30 "test -f $BENCH/cairn-detect.pre-u8spike; test \$? -eq 0; true"
+  # The campaign's binary is backed up once (cp -n); restore = mv back.
   remote 30 "cp -n $BENCH/cairn-detect $BENCH/cairn-detect.pre-u8spike"
   timeout 120 scp -q -o BatchMode=yes \
     "$CRATE/target/aarch64-unknown-linux-gnu/release/cairn-detect" \
@@ -213,7 +213,12 @@ latency_leg() {
 }
 
 do_run() {
-  trap do_finish EXIT INT TERM
+  # INT/TERM must EXIT after restoring: a trapped signal otherwise
+  # resumes the script, which would keep measuring against a restarted
+  # container and a restored governor -- the exact silent invalidation
+  # this teardown exists to prevent.
+  trap 'do_finish; trap - EXIT; exit 130' INT TERM
+  trap do_finish EXIT
   do_reboot
   ensure_engine_stopped
   pin_governor
@@ -237,17 +242,25 @@ do_run() {
     done <<< "$VARIANTS"
   done
 
-  # trap runs do_finish here
+  # Under `all`, do_finish fires once, at script exit — an EXIT trap
+  # does not fire on function return, so a following stage re-pins over
+  # a still-pinned governor (capture-once semantics make that safe).
 }
 
 # Score-parity runs, separated from do_run after the first board day:
-# the shared htp_content_test.sh is fifo-based and the 0.1.8 image's
-# busybox has no mkfifo (its runs die in 2s — see u8_content_test.sh's
-# header), so this stage pushes and uses the spike-local runner. One
-# clean reboot first: the fifo casualties' aborted QNN loads count
+# htp_content_test.sh WAS fifo-based then, and the 0.1.8 image's busybox
+# has no mkfifo, so its runs died in 2s (since converted to the same
+# pipe+done-file mechanics; this stage keeps the spike-local
+# u8_content_test.sh so the spike's methodology digest stays its own).
+# One clean reboot first: the fifo casualties' aborted QNN loads count
 # against the CDSP session budget too.
 do_content() {
-  trap do_finish EXIT INT TERM
+  # INT/TERM must EXIT after restoring: a trapped signal otherwise
+  # resumes the script, which would keep measuring against a restarted
+  # container and a restored governor -- the exact silent invalidation
+  # this teardown exists to prevent.
+  trap 'do_finish; trap - EXIT; exit 130' INT TERM
+  trap do_finish EXIT
   timeout 60 scp -q -o BatchMode=yes "$HERE/u8_content_test.sh" "$BOARD:$BENCH/" 2>/dev/null
   remote_verified 60 u8-content-sha "$SPIKE/.content-sha" "sha256sum $BENCH/u8_content_test.sh" \
     || { log "FATAL: cannot verify content-script push"; exit 1; }
@@ -264,7 +277,7 @@ do_content() {
     remote 400 "PROFILE=yolox INSIZE=640 sh $BENCH/u8_content_test.sh qnn $BENCH/artifacts-fixed/$stem.onnx $BENCH/clip-ac86.mp4 u8spike-$tag $QNN_FLAGS" \
       || log "WARN: content $tag rc nonzero"
   done <<< "$VARIANTS"
-  # trap runs do_finish here
+  # do_finish fires at script exit (see do_run's closing note)
 }
 
 do_fetch() {

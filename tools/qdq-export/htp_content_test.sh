@@ -2,14 +2,14 @@
 # On-board content test: one plugin run = one model x backend x clip,
 # with the corrected methodology the 2026-08-20 board day paid for:
 #
-#   1. plugin FIRST — the RTP listener is up before any frame plays, so
+#   1. plugin FIRST â the RTP listener is up before any frame plays, so
 #      the clip's head cannot pour into a dead port during model load
 #      (the feed-first race that invalidated a day of bench analysis);
-#   2. the feed plays ONCE — no -stream_loop, so pts stay monotonic and
+#   2. the feed plays ONCE â no -stream_loop, so pts stay monotonic and
 #      stream-anchored: pts/90000 IS clip time as-is (looped pts wrap
-#      and the mapping is garbage). The analyzer never p0-normalizes —
+#      and the mapping is garbage). The analyzer never p0-normalizes â
 #      an empty clip head emits no line to anchor a p0 on;
-#   3. raw evidence only — the ndjson and stderr are the deliverable;
+#   3. raw evidence only â the ndjson and stderr are the deliverable;
 #      analysis happens off-board (htp_report.py), because this busybox
 #      has no python and CR-heavy logs render blank over ssh anyway.
 #
@@ -17,13 +17,13 @@
 #
 # Env: PROFILE (default yolox; use yolov8 for yolo26/yolov8 raw heads),
 # INSIZE (default 416), SAMPLE_FPS (default 10), MIN_SCORE (default 0.05
-# — low so the score DISTRIBUTION is visible; a depressed band below a
+# â low so the score DISTRIBUTION is visible; a depressed band below a
 # 0.5 floor is exactly the defect signature this test exists to see),
 # LOAD_SECS (default 120, ceiling on model load / HTP graph prepare).
 #
 # Runs under the standard bench env (/data/cairn-bench + /data/qnn-spike
 # libs). Trust in that env comes from the nano-parity gate the campaign
-# runner performs first — not from this script.
+# runner performs first â not from this script.
 set -u
 BACKEND=$1
 MODEL=$2
@@ -88,15 +88,21 @@ trap cleanup EXIT INT TERM
 # file, and every run died in ~2s reading one line then EOF, looking
 # exactly like a clean host-initiated shutdown
 # (.claude/solutions/board-image-dropped-mkfifo-*.md). Still not a piped
-# `sleep` timer — its shutdown was `killall sleep`, a host-wide hammer
+# `sleep` timer â its shutdown was `killall sleep`, a host-wide hammer
 # no bench script gets to swing; the run's ceiling stays the campaign
 # driver's ssh timeout.
 rm -f "$RUN/done"
-# $! after a background pipeline is the pipeline's LAST process — the
+# $! after a background pipeline is the pipeline's LAST process â the
 # plugin, which is what the up-wait and the final wait need.
 {
   echo '{"spec":"cairn.plugin","version":1,"type":"stream.started","camera_id":"content","stream_epoch":"01K0QDQCONTENT000000000000","rtp":{"clock_rate":90000}}'
-  while [ ! -f "$RUN/done" ]; do sleep 1; done
+  # Bounded: a trap-less death (ssh kill, SIGKILL) never touches the
+  # done-file, and an unbounded loop would then hold the pipe open
+  # forever - the plugin lingering with a live QNN session until the
+  # next run's killall, which is CDSP session-budget pressure. The cap
+  # restores the fifo design's eventual-EOF-on-every-death-mode.
+  n=0
+  while [ ! -f "$RUN/done" ] && [ "$n" -lt 900 ]; do sleep 1; n=$((n + 1)); done
 } | "$BASE/cairn-detect" --camera-id content --udp-port 5600 \
   --model "$MODEL" --model-profile "$PROFILE" --input-size "$INSIZE" \
   --labels "$BASE/coco.names" --decoder sw --sample-fps "$SAMPLE_FPS" \
@@ -115,7 +121,7 @@ while [ "$waited" -lt "$LOAD_SECS" ]; do
   waited=$((waited + 1))
 done
 if ! grep -q "cairn-detect up:" "$RUN/err"; then
-  echo "plugin never came up in ${LOAD_SECS}s — run invalid" >&2
+  echo "plugin never came up in ${LOAD_SECS}s â run invalid" >&2
   tail -10 "$RUN/err" >&2
   exit 1
 fi
@@ -134,10 +140,10 @@ else
   # In the meta's own suspect vocabulary: the campaign's retry guard and
   # the analyzer both key on this phrase, and a truncated feed must not
   # read as a completed run anywhere downstream.
-  echo "feed exited $feed_rc — run suspect" >> "$RUN/meta"
+  echo "feed exited $feed_rc â run suspect" >> "$RUN/meta"
 fi
 
-# Drain, then release the control writer — the plugin's stdin EOF, and
+# Drain, then release the control writer â the plugin's stdin EOF, and
 # nothing else's.
 sleep 3
 : > "$RUN/done"
@@ -145,14 +151,14 @@ wait "$PLUGIN" 2>/dev/null
 rc=$?
 PLUGIN=""
 if [ "$rc" -ne 3 ]; then
-  echo "plugin exited $rc (expected 3, stdin EOF) — run suspect" >> "$RUN/meta"
+  echo "plugin exited $rc (expected 3, stdin EOF) â run suspect" >> "$RUN/meta"
 fi
 
 frames=$(grep -c '"frame.objects"' "$RUN/out.ndjson" 2>/dev/null)
 frames=${frames:-0}
 # This line doubles as the run's completion marker: it is only reached
 # after the feed exit and plugin shutdown statuses above, so the guard
-# and analyzer require it — a truncated meta must not read as complete.
+# and analyzer require it â a truncated meta must not read as complete.
 echo "frame.objects lines: $frames" >> "$RUN/meta"
 echo "== $TAG: $frames object frames, plugin rc=$rc, feed rc=$feed_rc =="
 grep "infer latency" "$RUN/err" | tail -3

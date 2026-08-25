@@ -125,7 +125,12 @@ leg() { # <tag> <sample_fps> [extra flags...]
 }
 
 do_run() {
-  trap do_finish EXIT INT TERM
+  # INT/TERM must EXIT after restoring: a trapped signal otherwise
+  # resumes the script, which would keep measuring against a restarted
+  # container and a restored governor -- the exact silent invalidation
+  # this teardown exists to prevent.
+  trap 'do_finish; trap - EXIT; exit 130' INT TERM
+  trap do_finish EXIT
   do_reboot
   ensure_engine_stopped
   pin_governor

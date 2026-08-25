@@ -110,8 +110,9 @@ impl OrtBackend {
 impl Backend for OrtBackend {
     /// `options` carries no `ort` group: the CPU execution provider registered
     /// below is the only session setting this backend makes, and it is not a
-    /// profile knob. The parameter stays in the signature because it is the
-    /// trait's; [`QnnBackend::open`] is the one that reads its group.
+    /// profile knob. What this open does read is `io_quant` (via
+    /// [`Self::from_session`], to seed the output dequant map); the `qnn`
+    /// group stays [`QnnBackend::open`]'s alone.
     fn open(model: &Path, options: &SessionOptions) -> Result<Self> {
         // ort's builder errors carry the builder itself for recovery, which
         // makes them neither Send nor Sync; flatten them to a message.
@@ -133,10 +134,6 @@ impl Backend for OrtBackend {
     }
 
     fn run(&mut self, input: InputTensor) -> Result<Box<dyn Tensors + '_>> {
-        // Cloned up front (a map of one or two entries): `outputs` below
-        // holds the session borrowed for the rest of this call, so the
-        // dequant loop cannot read it off `self`.
-        let output_quant = self.output_quant.clone();
         // One model, one shape *and one dtype*: every tensor this backend is
         // handed has the geometry the packer settled at open, so the buffer
         // refills in place. Checked anyway, because a mismatched
@@ -214,8 +211,10 @@ impl Backend for OrtBackend {
         // this multiply is the work the artifact's stripped DequantizeLinear
         // did inside the graph, so leaving it out of the pass cost would
         // flatter every uint8-IO latency number.
+        // `outputs` borrows only the `session` field, so `output_quant` is
+        // a free disjoint borrow here.
         let mut dequant = HashMap::new();
-        for (name, quant) in &output_quant {
+        for (name, quant) in &self.output_quant {
             let value = outputs
                 .get(name.as_str())
                 .ok_or_else(|| anyhow!("sidecar names output {name}, which the model lacks"))?;

@@ -1400,8 +1400,8 @@ fn pack_chw(plane: &[u8], stride: usize, fit: Fit, spec: InputSpec) -> TensorVal
         }
         // Same shape of loop over a per-plane byte->code table
         // (`quantized_lut`): the quantizer has 256 inputs per plane, so the
-        // pixel loop is a lookup and the identity-qparams case is a pure
-        // byte shuffle.
+        // pixel loop is a lookup — and for RawBgr with identity qparams
+        // (the 0..255 case) the table degenerates to a pure byte shuffle.
         Some(quant) => {
             let luts: [[u8; 256]; 3] = std::array::from_fn(|p| packing.quantized_lut(p, quant));
             let mut tensor = vec![0u8; size.tensor_len()];

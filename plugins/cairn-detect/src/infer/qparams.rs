@@ -82,11 +82,18 @@ impl IoQuant {
     }
 
     /// Load the sidecar next to `model`, `Ok(None)` when there is none —
-    /// absence is the ordinary float-IO case, not an error.
+    /// absence is the ordinary float-IO case, not an error. Only a real
+    /// NotFound counts as absence: `exists()` would fold a permission error
+    /// into "no sidecar" and silently run a u8 config as float.
     pub fn load_for(model: &Path) -> Result<Option<Self>> {
         let path = Self::sidecar_path(model);
-        if !path.exists() {
-            return Ok(None);
+        match fs::metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("checking qparams sidecar {}", path.display()))
+            }
+            Ok(_) => {}
         }
         let text = fs::read_to_string(&path)
             .with_context(|| format!("reading qparams sidecar {}", path.display()))?;

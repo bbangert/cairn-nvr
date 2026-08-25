@@ -82,6 +82,19 @@ impl Embedder {
         };
         let io = backend.io();
 
+        // Same open-time discipline as the detector's check_io_quant: a
+        // uint8-IO artifact here would open cleanly and then die on the
+        // first person crop, hours in, on a dtype bind error. There is no
+        // u8-IO embedder contract (this open loads no sidecar), so refuse
+        // while the operator is watching.
+        if io.input_is_u8 || !io.u8_outputs.is_empty() {
+            bail!(
+                "embedder {} declares uint8 graph IO — no u8-IO embedder \
+                 contract exists; use the float-IO export",
+                model.display()
+            );
+        }
+
         if let Some(batch) = io.declared_input_batch {
             if batch != 1 {
                 bail!(

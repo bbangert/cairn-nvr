@@ -4,7 +4,7 @@
 # The board image that shipped hardware decode (0.1.8) dropped `mkfifo`
 # from busybox; on it the original script's mkfifo silently fails,
 # `exec 3>` then creates a REGULAR file, and the plugin reads the epoch
-# line, hits EOF, and exits inside two seconds — the campaign's content
+# line, hits EOF, and exits inside two seconds â the campaign's content
 # methodology is broken on that image until it gets the same treatment.
 #
 # The writer subshell prints the epoch, then polls for $RUN/done; the
@@ -65,11 +65,17 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# $! after a background pipeline is the pipeline's LAST process — the
+# $! after a background pipeline is the pipeline's LAST process â the
 # plugin, which is exactly what the up-wait and the final wait need.
 {
   echo '{"spec":"cairn.plugin","version":1,"type":"stream.started","camera_id":"content","stream_epoch":"01K0QDQCONTENT000000000000","rtp":{"clock_rate":90000}}'
-  while [ ! -f "$RUN/done" ]; do sleep 1; done
+  # Bounded: a trap-less death (ssh kill, SIGKILL) never touches the
+  # done-file, and an unbounded loop would then hold the pipe open
+  # forever - the plugin lingering with a live QNN session until the
+  # next run's killall, which is CDSP session-budget pressure. The cap
+  # restores the fifo design's eventual-EOF-on-every-death-mode.
+  n=0
+  while [ ! -f "$RUN/done" ] && [ "$n" -lt 900 ]; do sleep 1; n=$((n + 1)); done
 } | "$BASE/cairn-detect" --camera-id content --udp-port 5600 \
   --model "$MODEL" --model-profile "$PROFILE" --input-size "$INSIZE" \
   --labels "$BASE/coco.names" --decoder sw --sample-fps "$SAMPLE_FPS" \
@@ -86,7 +92,7 @@ while [ "$waited" -lt "$LOAD_SECS" ]; do
   waited=$((waited + 1))
 done
 if ! grep -q "cairn-detect up:" "$RUN/err"; then
-  echo "plugin never came up in ${LOAD_SECS}s — run invalid" >&2
+  echo "plugin never came up in ${LOAD_SECS}s â run invalid" >&2
   tail -10 "$RUN/err" >&2
   exit 1
 fi
@@ -100,17 +106,17 @@ FEED=""
 if [ "$feed_rc" -eq 0 ]; then
   echo "feed exited 0" >> "$RUN/meta"
 else
-  echo "feed exited $feed_rc — run suspect" >> "$RUN/meta"
+  echo "feed exited $feed_rc â run suspect" >> "$RUN/meta"
 fi
 
-# Drain, then release the writer loop — the plugin's stdin EOF.
+# Drain, then release the writer loop â the plugin's stdin EOF.
 sleep 3
 : > "$RUN/done"
 wait "$PLUGIN" 2>/dev/null
 rc=$?
 PLUGIN=""
 if [ "$rc" -ne 3 ]; then
-  echo "plugin exited $rc (expected 3, stdin EOF) — run suspect" >> "$RUN/meta"
+  echo "plugin exited $rc (expected 3, stdin EOF) â run suspect" >> "$RUN/meta"
 fi
 
 frames=$(grep -c '"frame.objects"' "$RUN/out.ndjson" 2>/dev/null)

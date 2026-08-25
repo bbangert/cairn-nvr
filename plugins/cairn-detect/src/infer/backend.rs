@@ -10,7 +10,8 @@
 //! what each one will and will not accept.
 //!
 //! No SDK type appears in a signature here. A backend reports its model as
-//! [`ModelIo`] — a name, a size and a [`Declared`] per output — and answers a
+//! [`ModelIo`] — a name, a size, a batch, the sniffed uint8 edges and a
+//! [`Declared`] per output — and answers a
 //! run with [`Raw`] tensors, dims plus floats. Both of those types predate this
 //! module and neither mentions `ort`, which is what let the seam go in without
 //! touching sniffing, sizing or decode. The one place ort types still reach

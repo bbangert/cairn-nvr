@@ -1,9 +1,9 @@
 //! Inference and postprocess.
 //!
 //! Two things vary independently here and are separated on purpose. *Which
-//! runtime executes the model* is [`backend`]: one trait, one implementation
-//! (onnxruntime on CPU — what every deployment runs), and two names that parse
-//! and refuse. *How a family is fed and read* is everything else in this
+//! runtime executes the model* is [`backend`]: one trait, two implementations
+//! (onnxruntime on the CPU EP, and on Qualcomm's HTP via the QNN plugin EP),
+//! and one name — `rknn` — that parses and refuses. *How a family is fed and read* is everything else in this
 //! module, and it is backend-agnostic: sniffing, sizing and decode work from a
 //! model's declared names and shapes, never from an SDK's types.
 //!
@@ -66,6 +66,6 @@ pub use qparams::IoQuant;
 pub use {encoding::TensorEncoding, geometry::ResizePolicy};
 
 // The uint8-IO spike's payload types: the packer's output enum and the edge
-// qparams it quantizes through — named by main.rs (sidecar load) and
-// cairn-ort (the embedder's crop source refusing a u8 tensor).
+// qparams it quantizes through — named by decode.rs (`pack_chw`'s return and
+// `ModelInput.tensor`'s field type) and by tests that build quantized specs.
 pub use encoding::{QuantParams, TensorValues};

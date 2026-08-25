@@ -323,6 +323,67 @@ fn check_io_quant(io: &ModelIo, quant: Option<&IoQuant>, model: &Path) -> Result
 mod tests {
     use super::*;
 
+    /// The four-way refusal matrix the uint8-IO open-time safety rests on,
+    /// driven directly: it is a pure function over sniffed IO and the
+    /// sidecar, so every arm is pinned without a model file.
+    #[test]
+    fn check_io_quant_covers_the_refusal_matrix() {
+        use super::super::encoding::QuantParams;
+
+        let model = Path::new("m.onnx");
+        let qp = QuantParams {
+            scale: 1.0,
+            zero_point: 0,
+        };
+        let io = |input_is_u8: bool, u8_outputs: &[&str]| ModelIo {
+            input_name: "images".to_string(),
+            declared_input_size: None,
+            declared_input_batch: None,
+            outputs: Vec::new(),
+            input_is_u8,
+            u8_outputs: u8_outputs.iter().map(|s| s.to_string()).collect(),
+        };
+        let quant = |input: Option<&str>, outputs: &[&str]| IoQuant {
+            input: input.map(|name| (name.to_string(), qp)),
+            outputs: outputs.iter().map(|s| (s.to_string(), qp)).collect(),
+        };
+
+        // Float model, no sidecar: the ordinary case.
+        assert!(check_io_quant(&io(false, &[]), None, model).is_ok());
+        // The full u8io shape, sidecar agreeing on name and output set.
+        let full = quant(Some("images"), &["output"]);
+        assert!(check_io_quant(&io(true, &["output"]), Some(&full), model).is_ok());
+        // Output-only conversion: float input plus a u8-output sidecar.
+        let out_only = quant(None, &["output"]);
+        assert!(check_io_quant(&io(false, &["output"]), Some(&out_only), model).is_ok());
+
+        // u8 input with no sidecar at all — the orphan-artifact case.
+        let err = check_io_quant(&io(true, &[]), None, model).unwrap_err();
+        assert!(err.to_string().contains("is missing"), "{err}");
+        // Sidecar quantizing the input of a float artifact — wrong sidecar.
+        let err =
+            check_io_quant(&io(false, &[]), Some(&quant(Some("images"), &[])), model).unwrap_err();
+        assert!(err.to_string().contains("takes float input"), "{err}");
+        // Input-name mismatch — a sidecar for some other model.
+        let err = check_io_quant(
+            &io(true, &["output"]),
+            Some(&quant(Some("input"), &["output"])),
+            model,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("calls its input"), "{err}");
+        // Output-set mismatch, both directions through one sorted compare.
+        let err = check_io_quant(
+            &io(true, &["output"]),
+            Some(&quant(Some("images"), &[])),
+            model,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("uint8 outputs"), "{err}");
+        let err = check_io_quant(&io(false, &[]), Some(&out_only), model).unwrap_err();
+        assert!(err.to_string().contains("uint8 outputs"), "{err}");
+    }
+
     /// The stub refusal is the whole operator-visible behaviour of the
     /// `--backend` seam for a backend that has not landed, and it must fire
     /// before any model access — proven here by a path that does not exist.

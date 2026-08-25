@@ -49,6 +49,20 @@ impl Engine {
     pub fn open(config: InitConfig) -> Result<Self> {
         let labels = Labels::load(config.labels.as_deref())
             .map_err(|e| NativeError::ModelLoad(chain(&e)))?;
+        // Deliberately no sidecar load: the uint8-IO path is the
+        // cairn-detect binary's for now (spike). Refused by name here when
+        // the sidecar exists — Detector::open's dtype check would otherwise
+        // report it "missing" and send the operator re-exporting a file
+        // that is sitting right there; a u8 artifact WITHOUT a sidecar
+        // still gets that check's accurate message.
+        if infer::IoQuant::sidecar_path(&config.model).exists() {
+            return Err(NativeError::ModelLoad(format!(
+                "model {} has a qparams sidecar — uint8-IO artifacts run only \
+                 in the cairn-detect binary, not in-VM; configure the float-IO \
+                 artifact here",
+                config.model.display()
+            )));
+        }
         let detector = Detector::open(
             &config.model,
             config.backend,
@@ -57,10 +71,6 @@ impl Engine {
             &labels,
             config.allow_label_mismatch,
             config.qnn,
-            // Deliberately no sidecar load: the uint8-IO path is the
-            // cairn-detect binary's for now (spike). A u8-IO artifact
-            // configured here fails Detector::open's dtype check with a
-            // message naming the sidecar, instead of failing on frame one.
             None,
         )
         .map_err(|e| NativeError::ModelLoad(chain(&e)))?;
