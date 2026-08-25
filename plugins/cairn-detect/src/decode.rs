@@ -38,7 +38,7 @@ use rsmpeg::swscale::SwsContext;
 use rsmpeg::UnsafeDerefMut;
 
 use crate::hwdecode::{HwBackend, HwDecoder};
-use crate::infer::{Fit, InputSize, InputSpec, Projection};
+use crate::infer::{Fit, InputSize, InputSpec, Projection, TensorValues};
 use crate::motion::{GrayThumb, MotionConfig, MotionDetector, MotionVerdict};
 use crate::note;
 
@@ -134,10 +134,10 @@ pub struct RgbSampled {
 /// letterboxed run silently reports every box against the wrong geometry.
 #[derive(Debug)]
 pub struct ModelInput {
-    /// CHW f32, `3 * w * h` long for the resolved model input, in whichever
-    /// `TensorEncoding` the detector asked for.
-    ///
-    pub tensor: Vec<f32>,
+    /// CHW, `3 * w * h` values for the resolved model input, in whichever
+    /// `TensorEncoding` the detector asked for — f32 for the float graph-IO
+    /// contract, u8 codes when the spec carries `input_quant`.
+    pub tensor: TensorValues,
     /// Model-space boxes back to this frame's own normalized coordinates.
     pub projection: Projection,
 }
@@ -1357,8 +1357,10 @@ pub fn cap_frame_size(ctx: &mut AVCodecContext) {
     unsafe { ctx.deref_mut() }.max_pixels = MAX_PIXELS;
 }
 
-/// Packed RGB24 rows (`stride` may exceed the row width) -> CHW f32, placed
-/// into the model's input rectangle according to `fit`.
+/// Packed RGB24 rows (`stride` may exceed the row width) -> CHW values,
+/// placed into the model's input rectangle according to `fit`: f32 for the
+/// float graph-IO contract, u8 codes when `spec.input_quant` says the
+/// artifact takes its input quantized.
 ///
 /// The scale target is always RGB24 because that is one pixel format for
 /// swscale to reach from anything; the encoding decides only what happens on
@@ -1366,31 +1368,61 @@ pub fn cap_frame_size(ctx: &mut AVCodecContext) {
 /// plane draws from.
 ///
 /// The padding goes through the same encoding as the pixels: the model was
-/// trained on a padded picture, not on an out-of-range constant. Under a
-/// stretch `fit.inner` *is* the input, so there is no padding and the fill is
+/// trained on a padded picture, not on an out-of-range constant. On the u8
+/// path that means encode *then quantize* — with a non-identity input scale,
+/// writing the raw pad byte would poison every border. Under a stretch
+/// `fit.inner` *is* the input, so there is no padding and the fill is
 /// skipped rather than written and immediately overwritten.
-fn pack_chw(plane: &[u8], stride: usize, fit: Fit, spec: InputSpec) -> Vec<f32> {
+fn pack_chw(plane: &[u8], stride: usize, fit: Fit, spec: InputSpec) -> TensorValues {
     let size = spec.size;
     let packing = spec.encoding.packing();
     let plane_len = size.w * size.h;
-    let mut tensor = vec![0f32; size.tensor_len()];
-    if fit.inner != size {
-        for (p, chunk) in tensor.chunks_exact_mut(plane_len).enumerate() {
-            chunk.fill(packing.value(p, fit.pad));
-        }
-    }
     let (ox, oy) = fit.offset;
-    for y in 0..fit.inner.h {
-        let row = &plane[y * stride..y * stride + fit.inner.w * 3];
-        for x in 0..fit.inner.w {
-            let px = &row[x * 3..x * 3 + 3];
-            let at = (oy + y) * size.w + ox + x;
-            for (p, source) in packing.source.iter().enumerate() {
-                tensor[p * plane_len + at] = packing.value(p, px[*source]);
+    match spec.input_quant {
+        None => {
+            let mut tensor = vec![0f32; size.tensor_len()];
+            if fit.inner != size {
+                for (p, chunk) in tensor.chunks_exact_mut(plane_len).enumerate() {
+                    chunk.fill(packing.value(p, fit.pad));
+                }
             }
+            for y in 0..fit.inner.h {
+                let row = &plane[y * stride..y * stride + fit.inner.w * 3];
+                for x in 0..fit.inner.w {
+                    let px = &row[x * 3..x * 3 + 3];
+                    let at = (oy + y) * size.w + ox + x;
+                    for (p, source) in packing.source.iter().enumerate() {
+                        tensor[p * plane_len + at] = packing.value(p, px[*source]);
+                    }
+                }
+            }
+            TensorValues::F32(tensor)
+        }
+        // Same shape of loop over a per-plane byte->code table
+        // (`quantized_lut`): the quantizer has 256 inputs per plane, so the
+        // pixel loop is a lookup — and for RawBgr with identity qparams
+        // (the 0..255 case) the table degenerates to a pure byte shuffle.
+        Some(quant) => {
+            let luts: [[u8; 256]; 3] = std::array::from_fn(|p| packing.quantized_lut(p, quant));
+            let mut tensor = vec![0u8; size.tensor_len()];
+            if fit.inner != size {
+                for (p, chunk) in tensor.chunks_exact_mut(plane_len).enumerate() {
+                    chunk.fill(luts[p][fit.pad as usize]);
+                }
+            }
+            for y in 0..fit.inner.h {
+                let row = &plane[y * stride..y * stride + fit.inner.w * 3];
+                for x in 0..fit.inner.w {
+                    let px = &row[x * 3..x * 3 + 3];
+                    let at = (oy + y) * size.w + ox + x;
+                    for (p, source) in packing.source.iter().enumerate() {
+                        tensor[p * plane_len + at] = luts[p][px[*source] as usize];
+                    }
+                }
+            }
+            TensorValues::U8(tensor)
         }
     }
-    tensor
 }
 
 /// One scaled RGB24 content rectangle -> the model input it packs into.
@@ -1619,11 +1651,21 @@ mod tests {
             size,
             encoding,
             resize,
+            input_quant: None,
         }
     }
 
     fn unit_rgb(size: InputSize) -> InputSpec {
         spec(size, TensorEncoding::UnitRgb, ResizePolicy::Stretch)
+    }
+
+    /// The float arm's payload; a spec without `input_quant` packing codes
+    /// would be the packer picking the wrong contract.
+    fn f32s(tensor: TensorValues) -> Vec<f32> {
+        match tensor {
+            TensorValues::F32(values) => values,
+            TensorValues::U8(_) => panic!("expected an f32 pack"),
+        }
     }
 
     /// Pack a whole `size`-sized RGB24 buffer with no padding, which is what
@@ -1635,7 +1677,12 @@ mod tests {
         encoding: TensorEncoding,
     ) -> Vec<f32> {
         let spec = spec(size, encoding, ResizePolicy::Stretch);
-        pack_chw(plane, stride, ResizePolicy::Stretch.fit(size, size), spec)
+        f32s(pack_chw(
+            plane,
+            stride,
+            ResizePolicy::Stretch.fit(size, size),
+            spec,
+        ))
     }
 
     #[test]
@@ -2200,12 +2247,12 @@ mod tests {
 
         let stride = fit.inner.w * 3 + 8;
         let plane = vec![255u8; stride * fit.inner.h];
-        let tensor = pack_chw(
+        let tensor = f32s(pack_chw(
             &plane,
             stride,
             fit,
             spec(input, TensorEncoding::RawBgr, resize),
-        );
+        ));
 
         assert_eq!(tensor.len(), input.tensor_len());
         let plane_len = input.w * input.h;
@@ -2240,12 +2287,12 @@ mod tests {
         assert_eq!(fit.inner, InputSize { w: 64, h: 32 });
         let stride = fit.inner.w * 3;
         let plane = vec![0u8; stride * fit.inner.h];
-        let tensor = pack_chw(
+        let tensor = f32s(pack_chw(
             &plane,
             stride,
             fit,
             spec(input, TensorEncoding::UnitRgb, resize),
-        );
+        ));
         let first_pad = fit.inner.h * input.w;
         assert!(
             (tensor[first_pad] - 114.0 / 255.0).abs() < 1e-6,
@@ -2253,6 +2300,59 @@ mod tests {
             tensor[first_pad]
         );
         assert!(tensor.iter().all(|v| (0.0..=1.0).contains(v)));
+    }
+
+    /// The u8 arm with identity qparams (the RawBgr 0..255 case every
+    /// converted artifact has today): the pack is the BGR byte shuffle plus
+    /// the raw pad byte, no float math surviving into the tensor.
+    #[test]
+    fn a_u8_pack_with_identity_qparams_is_the_byte_shuffle() {
+        use crate::infer::QuantParams;
+        let input = InputSize::square(64);
+        let resize = ResizePolicy::Letterbox { pad: 114 };
+        let fit = resize.fit(input, InputSize { w: 128, h: 64 });
+        let stride = fit.inner.w * 3;
+        // Solid RGB (10, 20, 30): plane 0 must read B=30, plane 2 R=10.
+        let plane: Vec<u8> = (0..stride * fit.inner.h / 3)
+            .flat_map(|_| [10u8, 20, 30])
+            .collect();
+        let mut spec = spec(input, TensorEncoding::RawBgr, resize);
+        spec.input_quant = Some(QuantParams::new(1.0, 0).unwrap());
+        let tensor = match pack_chw(&plane, stride, fit, spec) {
+            TensorValues::U8(codes) => codes,
+            TensorValues::F32(_) => panic!("input_quant must pack codes"),
+        };
+        assert_eq!(tensor.len(), input.tensor_len());
+        let plane_len = input.w * input.h;
+        assert_eq!(tensor[0], 30, "plane 0 is blue");
+        assert_eq!(tensor[plane_len], 20);
+        assert_eq!(tensor[2 * plane_len], 10, "plane 2 is red");
+        // Pad rows carry the identity-quantized pad code: the byte itself.
+        assert_eq!(tensor[fit.inner.h * input.w], 114);
+    }
+
+    /// A non-identity input scale must quantize the pad through the same
+    /// encode-then-quantize path as the pixels — writing the raw 114 would
+    /// poison every border (research edge case, pinned here).
+    #[test]
+    fn a_u8_pad_goes_through_encode_then_quantize() {
+        use crate::infer::QuantParams;
+        let input = InputSize::square(64);
+        let resize = ResizePolicy::Letterbox { pad: 114 };
+        let fit = resize.fit(input, InputSize { w: 128, h: 64 });
+        let stride = fit.inner.w * 3;
+        let plane = vec![0u8; stride * fit.inner.h];
+        let mut spec = spec(input, TensorEncoding::RawBgr, resize);
+        spec.input_quant = Some(QuantParams::new(0.5, 3).unwrap());
+        let tensor = match pack_chw(&plane, stride, fit, spec) {
+            TensorValues::U8(codes) => codes,
+            TensorValues::F32(_) => panic!("input_quant must pack codes"),
+        };
+        // quantize(encode(114)) = 114/0.5 + 3 = 231, the exporter-pinned
+        // value — not 114.
+        assert_eq!(tensor[fit.inner.h * input.w], 231);
+        // Content zeros quantize to the zero-point, not to 0.
+        assert_eq!(tensor[0], 3);
     }
 
     #[test]

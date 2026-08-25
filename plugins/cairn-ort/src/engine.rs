@@ -49,6 +49,32 @@ impl Engine {
     pub fn open(config: InitConfig) -> Result<Self> {
         let labels = Labels::load(config.labels.as_deref())
             .map_err(|e| NativeError::ModelLoad(chain(&e)))?;
+        // Deliberately no sidecar load: the uint8-IO path is the
+        // cairn-detect binary's for now (spike). Refused by name here when
+        // the sidecar exists — Detector::open's dtype check would otherwise
+        // report it "missing" and send the operator re-exporting a file
+        // that is sitting right there; a u8 artifact WITHOUT a sidecar
+        // still gets that check's accurate message.
+        // metadata, not exists(): a permission error must surface, not read
+        // as "no sidecar" — the same NotFound-only-is-absence rule as
+        // IoQuant::load_for.
+        match std::fs::metadata(infer::IoQuant::sidecar_path(&config.model)) {
+            Ok(_) => {
+                return Err(NativeError::ModelLoad(format!(
+                    "model {} has a qparams sidecar — uint8-IO artifacts run only \
+                     in the cairn-detect binary, not in-VM; configure the float-IO \
+                     artifact here",
+                    config.model.display()
+                )))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(NativeError::ModelLoad(format!(
+                    "checking for a qparams sidecar next to {}: {e}",
+                    config.model.display()
+                )))
+            }
+        }
         let detector = Detector::open(
             &config.model,
             config.backend,
@@ -57,6 +83,7 @@ impl Engine {
             &labels,
             config.allow_label_mismatch,
             config.qnn,
+            None,
         )
         .map_err(|e| NativeError::ModelLoad(chain(&e)))?;
         let embedder = match config.embedder_model.as_deref() {
@@ -131,7 +158,18 @@ impl Engine {
         } = &mut *model;
         let spec = detector.input_spec();
 
-        let crop_source = embedder.as_ref().map(|_| input.tensor.clone());
+        // In-VM packs are always f32 (no sidecar crosses this path — see
+        // `Engine::open`), so the u8 arm is an invariant refusal, not a
+        // reachable contract.
+        let crop_source = match (embedder.as_ref(), input.tensor.as_f32()) {
+            (Some(_), Some(tensor)) => Some(tensor.to_vec()),
+            (Some(_), None) => {
+                return Err(NativeError::Infer(
+                    "embedder cannot crop from a u8-packed tensor".to_string(),
+                ))
+            }
+            (None, _) => None,
+        };
         let projection = input.projection;
         let mut dets = detector
             .detect(input.tensor, input.projection, labels, floors)

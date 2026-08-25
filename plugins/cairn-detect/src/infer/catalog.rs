@@ -22,6 +22,7 @@ pub const YOLOX: ModelProfile = ModelProfile {
         size: InputSize::square(416),
         encoding: TensorEncoding::RawBgr,
         resize: ResizePolicy::Letterbox { pad: 114 },
+        input_quant: None,
     },
     output: OutputSpec {
         layout: Layout::GridObjectness {
@@ -50,6 +51,7 @@ pub const YOLOV10: ModelProfile = ModelProfile {
         size: InputSize::square(640),
         encoding: TensorEncoding::UnitRgb,
         resize: ResizePolicy::Stretch,
+        input_quant: None,
     },
     output: OutputSpec {
         layout: Layout::EndToEnd,
@@ -77,6 +79,7 @@ pub const YOLOV8: ModelProfile = ModelProfile {
         size: InputSize::square(640),
         encoding: TensorEncoding::UnitRgb,
         resize: ResizePolicy::Stretch,
+        input_quant: None,
     },
     output: OutputSpec {
         layout: Layout::RawClasses { nc: 80 },
@@ -100,6 +103,7 @@ pub const RFDETR: ModelProfile = ModelProfile {
         size: InputSize::square(384),
         encoding: TensorEncoding::ImageNetRgb,
         resize: ResizePolicy::Stretch,
+        input_quant: None,
     },
     output: OutputSpec {
         // 91 is COCO's *id* space, not its class count: RF-DETR indexes

@@ -70,29 +70,50 @@ sleep 1
 FEED=""
 PLUGIN=""
 cleanup() {
+  # The done-file first: it releases the control writer's poll loop on
+  # every exit path, so an aborted run cannot leave a sleeping writer
+  # holding the pipe.
+  : > "$RUN/done"
   [ -n "$FEED" ] && kill "$FEED" 2>/dev/null
   [ -n "$PLUGIN" ] && kill "$PLUGIN" 2>/dev/null
 }
-trap cleanup EXIT INT TERM
+# Signals must be TERMINAL: a trapped INT/TERM otherwise resumes the
+# script, which would drain, finalize, and write the completion marker
+# for a run that was interrupted mid-feed. EXIT keeps cleanup-only.
+trap 'cleanup; trap - EXIT; exit 130' INT TERM
+trap cleanup EXIT
 
-# The control channel is a fifo this script holds open on fd 3: closing
-# that one descriptor is the stdin EOF that ends the plugin (exit 3,
-# "control channel gone"). Deliberately not a piped `sleep` timer — its
-# shutdown was `killall sleep`, which is a host-wide hammer no bench
-# script gets to swing; the run's ceiling is the campaign driver's ssh
-# timeout instead.
-CTL="$RUN/ctl"
-rm -f "$CTL"
-mkfifo "$CTL"
-"$BASE/cairn-detect" --camera-id content --udp-port 5600 \
+# The control channel is a pipe from a background writer loop: the
+# writer prints the epoch, then polls for $RUN/done; teardown touches
+# that file, the writer exits, the write end closes, and the plugin gets
+# the stdin EOF that ends it (exit 3, "control channel gone"). This
+# replaced a fifo held on fd 3 after the 0.1.8 board image's busybox
+# dropped `mkfifo`: the failed mkfifo let `exec 3>` create a REGULAR
+# file, and every run died in ~2s reading one line then EOF, looking
+# exactly like a clean host-initiated shutdown
+# (.claude/solutions/board-image-dropped-mkfifo-*.md). Still not a piped
+# `sleep` timer — its shutdown was `killall sleep`, a host-wide hammer
+# no bench script gets to swing; the run's ceiling stays the campaign
+# driver's ssh timeout.
+rm -f "$RUN/done"
+# $! after a background pipeline is the pipeline's LAST process — the
+# plugin, which is what the up-wait and the final wait need.
+{
+  echo '{"spec":"cairn.plugin","version":1,"type":"stream.started","camera_id":"content","stream_epoch":"01K0QDQCONTENT000000000000","rtp":{"clock_rate":90000}}'
+  # Bounded: a trap-less death (ssh kill, SIGKILL) never touches the
+  # done-file, and an unbounded loop would then hold the pipe open
+  # forever - the plugin lingering with a live QNN session until the
+  # next run's killall, which is CDSP session-budget pressure. The cap
+  # restores the fifo design's eventual-EOF-on-every-death-mode.
+  n=0
+  while [ ! -f "$RUN/done" ] && [ "$n" -lt 900 ]; do sleep 1; n=$((n + 1)); done
+} | "$BASE/cairn-detect" --camera-id content --udp-port 5600 \
   --model "$MODEL" --model-profile "$PROFILE" --input-size "$INSIZE" \
   --labels "$BASE/coco.names" --decoder sw --sample-fps "$SAMPLE_FPS" \
   --min-score-json "{\"default\":$MIN_SCORE}" \
   --backend "$BACKEND" "$@" \
-  < "$CTL" > "$RUN/out.ndjson" 2> "$RUN/err" &
+  > "$RUN/out.ndjson" 2> "$RUN/err" &
 PLUGIN=$!
-exec 3> "$CTL"
-echo '{"spec":"cairn.plugin","version":1,"type":"stream.started","camera_id":"content","stream_epoch":"01K0QDQCONTENT000000000000","rtp":{"clock_rate":90000}}' >&3
 
 # Model load / HTP graph prepare gates the feed. Poll granularity 1s;
 # these sleeps finish before the killall below can ever run.
@@ -126,9 +147,10 @@ else
   echo "feed exited $feed_rc — run suspect" >> "$RUN/meta"
 fi
 
-# Drain, then close fd 3 — the plugin's stdin EOF, and nothing else's.
+# Drain, then release the control writer — the plugin's stdin EOF, and
+# nothing else's.
 sleep 3
-exec 3>&-
+: > "$RUN/done"
 wait "$PLUGIN" 2>/dev/null
 rc=$?
 PLUGIN=""

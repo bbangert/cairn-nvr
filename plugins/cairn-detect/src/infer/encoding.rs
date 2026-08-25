@@ -108,6 +108,104 @@ impl Packing {
     pub fn value(&self, plane: usize, byte: u8) -> f32 {
         f32::from(byte) * self.scale[plane] + self.bias[plane]
     }
+
+    /// One plane's byte -> uint8-code table for a quantized-input model:
+    /// `quantize(value(plane, byte))` for all 256 bytes, computed once per
+    /// pack so the pixel loop is a lookup instead of float math. For the
+    /// identity-qparams RawBgr case (scale 1, zero-point 0 — every 0..255
+    /// model the surgery converts today) the table degenerates to the
+    /// identity and u8 packing is a pure byte shuffle.
+    pub fn quantized_lut(&self, plane: usize, quant: QuantParams) -> [u8; 256] {
+        std::array::from_fn(|byte| quant.quantize(self.value(plane, byte as u8)))
+    }
+}
+
+/// One tensor edge's quantization affine, from the artifact's own stripped
+/// QuantizeLinear/DequantizeLinear (`<model>.qparams.json` — see
+/// [`super::qparams::IoQuant`]).
+///
+/// Fields are private behind [`QuantParams::new`], which refuses any
+/// non-finite-positive scale — that checked construction is what makes the
+/// manual `Eq` sound (no NaN can ever make `value != value`), and
+/// [`InputSpec`](super::InputSpec) derives `Eq` over this type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuantParams {
+    scale: f32,
+    zero_point: u8,
+}
+
+impl Eq for QuantParams {}
+
+impl QuantParams {
+    /// The one constructor: a zero/NaN/inf scale never becomes a
+    /// `QuantParams`, so quantize never divides to garbage and equality
+    /// stays reflexive.
+    pub fn new(scale: f32, zero_point: u8) -> anyhow::Result<Self> {
+        if !scale.is_finite() || scale <= 0.0 {
+            anyhow::bail!("qparams scale {scale} is not finite-positive");
+        }
+        Ok(Self { scale, zero_point })
+    }
+
+    pub fn zero_point(self) -> u8 {
+        self.zero_point
+    }
+
+    /// The removed QuantizeLinear's arithmetic, per ONNX spec: round half to
+    /// even, then saturate to u8. Must match `u8_io_surgery.quantize_codes`
+    /// exactly — the exporter's `--verify` and the campaign's parity leg both
+    /// assume one quantizer.
+    pub fn quantize(self, value: f32) -> u8 {
+        ((value / self.scale).round_ties_even() + f32::from(self.zero_point)).clamp(0.0, 255.0)
+            as u8
+    }
+
+    /// The removed DequantizeLinear's arithmetic.
+    pub fn dequantize(self, code: u8) -> f32 {
+        (f32::from(code) - f32::from(self.zero_point)) * self.scale
+    }
+}
+
+/// A packed input tensor's payload: f32 for the float graph-IO contract every
+/// profile has always had, u8 codes for a uint8-IO artifact (the packer
+/// quantized through the input edge's [`QuantParams`] on the way in).
+///
+/// An enum rather than a generic because exactly one place chooses — the
+/// packer, from `InputSpec::input_quant` — and everything between it and the
+/// session boundary just carries the choice.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TensorValues {
+    F32(Vec<f32>),
+    U8(Vec<u8>),
+}
+
+impl TensorValues {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::F32(v) => v.len(),
+            Self::U8(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The float view, `None` for u8 codes — how the embedder's crop source
+    /// refuses a quantized detector tensor instead of inverting it wrong.
+    pub fn as_f32(&self) -> Option<&[f32]> {
+        match self {
+            Self::F32(v) => Some(v),
+            Self::U8(_) => None,
+        }
+    }
+
+    pub fn as_u8(&self) -> Option<&[u8]> {
+        match self {
+            Self::U8(v) => Some(v),
+            Self::F32(_) => None,
+        }
+    }
 }
 
 impl fmt::Display for TensorEncoding {
@@ -155,6 +253,40 @@ mod tests {
         assert_eq!(raw.source, [2, 1, 0]);
         assert_eq!(raw.value(0, 255), 255.0);
         assert_eq!(raw.value(1, 114), 114.0);
+    }
+
+    /// Pinned to the same cases as `test_u8_io_surgery.py`'s
+    /// `test_quantize_codes_round_half_even_and_saturate`: the exporter's
+    /// verify leg and this packer must be one quantizer or CPU-EP parity
+    /// measures the difference between them instead of the artifact.
+    #[test]
+    fn quantize_matches_the_exporters_arithmetic() {
+        let identity = QuantParams::new(1.0, 0).unwrap();
+        assert_eq!(identity.quantize(0.5), 0); // half to even, down
+        assert_eq!(identity.quantize(1.5), 2); // half to even, up
+        assert_eq!(identity.quantize(2.5), 2);
+        assert_eq!(identity.quantize(-100.0), 0); // saturate low
+        assert_eq!(identity.quantize(1000.0), 255); // saturate high
+        let scaled = QuantParams::new(0.5, 3).unwrap();
+        assert_eq!(scaled.quantize(114.0), 231);
+        assert_eq!(scaled.dequantize(231), 114.0);
+    }
+
+    /// The LUT is the quantizer applied to the encoding's affine — and for a
+    /// 0..255 model with identity qparams it must degenerate to the byte
+    /// itself, which is what makes u8 packing a pure shuffle there.
+    #[test]
+    fn quantized_lut_is_identity_for_raw_bgr_identity_qparams() {
+        let packing = TensorEncoding::RawBgr.packing();
+        let lut = packing.quantized_lut(0, QuantParams::new(1.0, 0).unwrap());
+        for byte in 0..=255u8 {
+            assert_eq!(lut[byte as usize], byte);
+        }
+        // Non-identity qparams must go through the real affine: scale 0.5
+        // doubles the code, zero-point shifts it.
+        let lut = packing.quantized_lut(0, QuantParams::new(0.5, 3).unwrap());
+        assert_eq!(lut[114], 231);
+        assert_eq!(lut[200], 255); // saturates
     }
 
     #[test]

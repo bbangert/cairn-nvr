@@ -9,12 +9,14 @@ use crate::emit::Det;
 use crate::note;
 
 use super::backend::onnxruntime::{OrtBackend, QnnBackend};
-use super::backend::{Backend, BackendKind, InputTensor, QnnOptions, SessionOptions};
+use super::backend::{Backend, BackendKind, InputTensor, ModelIo, QnnOptions, SessionOptions};
+use super::encoding::TensorValues;
 use super::geometry::{InputSize, Projection};
 use super::heads::{decode_output, Raw};
 use super::labels::{check_label_count, Labels, ScoreFloors};
 use super::profile::InputSpec;
 use super::profile::{InputSizeSource, ModelProfile, OutputSpec, Outputs};
+use super::qparams::IoQuant;
 use super::resolve::{
     check_grid_divides_input, fit_output, resolve_input_size, resolve_profile, Declared,
 };
@@ -97,11 +99,15 @@ impl Detector {
     /// `--model-profile`, `qnn` is the `--qnn-*` flags (read only when
     /// `backend` is `qnn`); absent, the profile is sniffed from the model's
     /// own I/O. `labels` is read to reject a class-count mismatch, which would
-    /// mislabel every detection.
+    /// mislabel every detection. `io_quant` is the model's qparams sidecar
+    /// when the caller loaded one ([`IoQuant::load_for`]) — required by a
+    /// uint8-IO artifact, refused next to a float one, checked against the
+    /// session's sniffed dtypes either way.
     ///
     /// Everything after the backend opens is backend-agnostic: the size and
-    /// profile resolution below read a [`ModelIo`](super::backend::ModelIo),
+    /// profile resolution below read a [`ModelIo`],
     /// which is the model's declared names and shapes with no SDK type in it.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         model: &Path,
         backend: BackendKind,
@@ -110,9 +116,11 @@ impl Detector {
         labels: &Labels,
         allow_label_mismatch: bool,
         qnn: QnnOptions,
+        io_quant: Option<IoQuant>,
     ) -> Result<Self> {
         let options = SessionOptions {
             qnn,
+            io_quant,
             ..SessionOptions::default()
         };
         let backend: Box<dyn Backend> = match backend {
@@ -131,13 +139,21 @@ impl Detector {
             ),
         };
         let io = backend.io();
+        check_io_quant(io, options.io_quant.as_ref(), model)?;
         let (input_size, input_size_source) =
             resolve_input_size(io.declared_input_size, requested, profile, model)?;
         let declared: &[Declared] = &io.outputs;
         if declared.is_empty() {
             bail!("model {} has no outputs", model.display());
         }
-        let (profile, outputs, output) = resolve_profile(profile, declared, input_size, model)?;
+        let (mut profile, outputs, output) = resolve_profile(profile, declared, input_size, model)?;
+        // The sidecar's input qparams ride the resolved spec so the packer —
+        // on either side of `input_spec()` — quantizes with the artifact's
+        // own scale, never a profile default.
+        profile.input.input_quant = options
+            .io_quant
+            .as_ref()
+            .and_then(|quant| quant.input.as_ref().map(|(_, qp)| *qp));
         check_grid_divides_input(profile.output.layout, input_size)?;
         if let Some(output) = output {
             check_label_count(output.layout, labels, allow_label_mismatch)?;
@@ -198,19 +214,33 @@ impl Detector {
 
     pub fn detect(
         &mut self,
-        tensor: Vec<f32>,
+        tensor: TensorValues,
         projection: Projection,
         labels: &Labels,
         floors: &ScoreFloors,
     ) -> Result<Vec<Det>> {
+        // The packer chooses the dtype from this detector's own resolved
+        // spec, so a mismatch here is a caller that packed for a different
+        // model — refused before the session turns it into a bind error.
+        match (&tensor, self.profile.input.input_quant) {
+            (TensorValues::U8(_), None) => {
+                bail!("u8 input codes packed for a float-input model")
+            }
+            (TensorValues::F32(_), Some(_)) => {
+                bail!("f32 input packed for a uint8-input model")
+            }
+            _ => {}
+        }
         let input = InputTensor {
             shape: [1i64, 3, self.input_size.h as i64, self.input_size.w as i64],
             values: tensor,
         };
         // Timed around `run` alone — the model pass plus the copy of this
-        // frame's values into the session's input, no decode — so the number
-        // compares across backends (both pay the same copy). `kind` is read
-        // first: the returned tensors keep `backend` mutably borrowed.
+        // frame's values into the session's input (plus, for a uint8-IO
+        // artifact, the output dequant the graph's stripped DequantizeLinear
+        // used to do), no decode — so the number compares across backends
+        // and across the float/u8 contracts. `kind` is read first: the
+        // returned tensors keep `backend` mutably borrowed.
         let kind = self.backend.kind();
         let started = Instant::now();
         let tensors = self.backend.run(input)?;
@@ -240,9 +270,116 @@ impl Detector {
     }
 }
 
+/// A uint8-IO artifact and its sidecar must describe each other exactly,
+/// judged against the session's *sniffed* dtypes rather than either one's
+/// claim. Three refusals, all at open: a u8 edge with no qparams (nothing
+/// downstream could quantize or dequantize it), qparams next to a float edge
+/// (a sidecar for some other artifact — quantizing anyway would corrupt
+/// every value), and an input-name mismatch (same failure, caught by name).
+fn check_io_quant(io: &ModelIo, quant: Option<&IoQuant>, model: &Path) -> Result<()> {
+    let input_quant = quant.and_then(|quant| quant.input.as_ref());
+    match (io.input_is_u8, input_quant) {
+        (true, None) => bail!(
+            "model {} declares a uint8 input but its qparams sidecar ({}) {} — \
+             re-export with u8_io_surgery.py, which writes both",
+            model.display(),
+            IoQuant::sidecar_path(model).display(),
+            if quant.is_some() {
+                "carries no input entry"
+            } else {
+                "is missing"
+            }
+        ),
+        (false, Some(_)) => bail!(
+            "qparams sidecar declares input quantization but model {} takes float input — \
+             wrong sidecar, or wrong artifact",
+            model.display()
+        ),
+        (true, Some((name, _))) if *name != io.input_name => bail!(
+            "qparams sidecar quantizes input {name:?} but model {} calls its input {:?}",
+            model.display(),
+            io.input_name
+        ),
+        _ => {}
+    }
+    let mut declared: Vec<&str> = io.u8_outputs.iter().map(String::as_str).collect();
+    let mut sidecar: Vec<&str> = quant
+        .map(|quant| quant.outputs.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    declared.sort_unstable();
+    sidecar.sort_unstable();
+    if declared != sidecar {
+        bail!(
+            "model {} declares uint8 outputs [{}] but the qparams sidecar covers [{}]",
+            model.display(),
+            declared.join(", "),
+            sidecar.join(", ")
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four-way refusal matrix the uint8-IO open-time safety rests on,
+    /// driven directly: it is a pure function over sniffed IO and the
+    /// sidecar, so every arm is pinned without a model file.
+    #[test]
+    fn check_io_quant_covers_the_refusal_matrix() {
+        use super::super::encoding::QuantParams;
+
+        let model = Path::new("m.onnx");
+        let qp = QuantParams::new(1.0, 0).unwrap();
+        let io = |input_is_u8: bool, u8_outputs: &[&str]| ModelIo {
+            input_name: "images".to_string(),
+            declared_input_size: None,
+            declared_input_batch: None,
+            outputs: Vec::new(),
+            input_is_u8,
+            u8_outputs: u8_outputs.iter().map(|s| s.to_string()).collect(),
+        };
+        let quant = |input: Option<&str>, outputs: &[&str]| IoQuant {
+            input: input.map(|name| (name.to_string(), qp)),
+            outputs: outputs.iter().map(|s| (s.to_string(), qp)).collect(),
+        };
+
+        // Float model, no sidecar: the ordinary case.
+        assert!(check_io_quant(&io(false, &[]), None, model).is_ok());
+        // The full u8io shape, sidecar agreeing on name and output set.
+        let full = quant(Some("images"), &["output"]);
+        assert!(check_io_quant(&io(true, &["output"]), Some(&full), model).is_ok());
+        // Output-only conversion: float input plus a u8-output sidecar.
+        let out_only = quant(None, &["output"]);
+        assert!(check_io_quant(&io(false, &["output"]), Some(&out_only), model).is_ok());
+
+        // u8 input with no sidecar at all — the orphan-artifact case.
+        let err = check_io_quant(&io(true, &[]), None, model).unwrap_err();
+        assert!(err.to_string().contains("is missing"), "{err}");
+        // Sidecar quantizing the input of a float artifact — wrong sidecar.
+        let err =
+            check_io_quant(&io(false, &[]), Some(&quant(Some("images"), &[])), model).unwrap_err();
+        assert!(err.to_string().contains("takes float input"), "{err}");
+        // Input-name mismatch — a sidecar for some other model.
+        let err = check_io_quant(
+            &io(true, &["output"]),
+            Some(&quant(Some("input"), &["output"])),
+            model,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("calls its input"), "{err}");
+        // Output-set mismatch, both directions through one sorted compare.
+        let err = check_io_quant(
+            &io(true, &["output"]),
+            Some(&quant(Some("images"), &[])),
+            model,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("uint8 outputs"), "{err}");
+        let err = check_io_quant(&io(false, &[]), Some(&out_only), model).unwrap_err();
+        assert!(err.to_string().contains("uint8 outputs"), "{err}");
+    }
 
     /// The stub refusal is the whole operator-visible behaviour of the
     /// `--backend` seam for a backend that has not landed, and it must fire
@@ -258,6 +395,7 @@ mod tests {
             &Labels::load(None).unwrap(),
             false,
             QnnOptions::default(),
+            None,
         ) {
             Ok(_) => panic!("stub backend rknn opened"),
             Err(err) => err,
@@ -316,6 +454,7 @@ mod tests {
             &Labels::load(None).unwrap(),
             false,
             QnnOptions::default(),
+            None,
         ) {
             Ok(_) => panic!("qnn opened without a library"),
             Err(err) => err,

@@ -10,12 +10,13 @@
 //! what each one will and will not accept.
 //!
 //! No SDK type appears in a signature here. A backend reports its model as
-//! [`ModelIo`] — a name, a size and a [`Declared`] per output — and answers a
+//! [`ModelIo`] — a name, a size, a batch, the sniffed uint8 edges and a
+//! [`Declared`] per output — and answers a
 //! run with [`Raw`] tensors, dims plus floats. Both of those types predate this
 //! module and neither mentions `ort`, which is what let the seam go in without
 //! touching sniffing, sizing or decode. The one place ort types still reach
-//! outside [`onnxruntime`] is `resolve`'s pair of `ort::value::ValueType`
-//! readers, `declared_input_size` and `static_output_dims`: the ort backend
+//! outside [`onnxruntime`] is `resolve`'s trio of `ort::value::ValueType`
+//! readers, `declared_input_size`/`declared_input_batch`/`static_output_dims`: the ort backend
 //! calls them to fill its [`ModelIo`], and a second backend would fill the same
 //! struct from its own metadata without going near them.
 //!
@@ -33,8 +34,10 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use clap::ValueEnum;
 
+use super::encoding::TensorValues;
 use super::geometry::InputSize;
 use super::heads::Raw;
+use super::qparams::IoQuant;
 use super::resolve::Declared;
 
 /// Which runtime executes the model.
@@ -197,6 +200,13 @@ pub(super) struct SessionOptions {
     /// see [`RknnOptions`] for why the group exists anyway.
     #[allow(dead_code)]
     pub rknn: RknnOptions,
+    /// The uint8-IO artifact's edge qparams (`<model>.qparams.json`), `None`
+    /// for the ordinary float-IO contract. At the session level this carries
+    /// two obligations: the backend dequantizes the outputs it names, and a
+    /// QNN session must keep the u8 edges on the HTP
+    /// (`offload_graph_io_quantization=0` — the EP's default offloads them
+    /// to the CPU EP, which silently costs the entire uint8-IO win).
+    pub io_quant: Option<IoQuant>,
 }
 
 /// Qualcomm HTP knobs, per onnxruntime's QNN execution-provider options.
@@ -258,16 +268,25 @@ pub(super) struct ModelIo {
     pub declared_input_batch: Option<i64>,
     /// Every output the model declares, in the model's own order.
     pub outputs: Vec<Declared>,
+    /// Whether the model declares its input tensor as uint8 — a uint8-IO
+    /// artifact. Sniffed at open so a u8 artifact without its qparams
+    /// sidecar (or a sidecar next to a float artifact) fails while the
+    /// operator is watching, not at the first pass.
+    pub input_is_u8: bool,
+    /// The declared outputs whose element type is uint8, by name. Must match
+    /// the sidecar's `outputs` keys exactly — see [`ModelIo::input_is_u8`].
+    pub u8_outputs: Vec<String>,
 }
 
 /// One tensor, packed for the model this backend opened — a frame for the
 /// detector, a person crop for the embedder.
 ///
 /// `shape` is NCHW with N=1: this plugin infers one tensor per run, and
-/// nothing in the crate batches.
+/// nothing in the crate batches. `values` carries the packer's dtype choice
+/// (f32, or u8 codes for a uint8-IO artifact) to the session bind.
 pub(super) struct InputTensor {
     pub shape: [i64; 4],
-    pub values: Vec<f32>,
+    pub values: TensorValues,
 }
 
 /// An inference runtime holding one open model.
