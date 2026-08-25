@@ -237,14 +237,31 @@ do_run() {
     done <<< "$VARIANTS"
   done
 
-  # Content runs: score-parity evidence, one QNN session each (12 total,
-  # budget 18 — see the campaign's QNN_SESSION_BUDGET rationale).
+  # trap runs do_finish here
+}
+
+# Score-parity runs, separated from do_run after the first board day:
+# the shared htp_content_test.sh is fifo-based and the 0.1.8 image's
+# busybox has no mkfifo (its runs die in 2s — see u8_content_test.sh's
+# header), so this stage pushes and uses the spike-local runner. One
+# clean reboot first: the fifo casualties' aborted QNN loads count
+# against the CDSP session budget too.
+do_content() {
+  trap do_finish EXIT INT TERM
+  timeout 60 scp -q -o BatchMode=yes "$HERE/u8_content_test.sh" "$BOARD:$BENCH/" 2>/dev/null
+  remote_verified 60 u8-content-sha "$SPIKE/.content-sha" "sha256sum $BENCH/u8_content_test.sh" \
+    || { log "FATAL: cannot verify content-script push"; exit 1; }
+  [ "$(cut -d' ' -f1 "$SPIKE/.content-sha")" = "$(sha256sum "$HERE/u8_content_test.sh" | cut -d' ' -f1)" ] \
+    || { log "FATAL: u8_content_test.sh push mismatch"; exit 1; }
+  do_reboot
+  ensure_engine_stopped
+  pin_governor
   log "== content runs (clip ac86)"
   while IFS=: read -r tag stem; do
     [ -z "$tag" ] && continue
     ensure_engine_stopped
     log "content $tag"
-    remote 400 "PROFILE=yolox INSIZE=640 sh $BENCH/htp_content_test.sh qnn $BENCH/artifacts-fixed/$stem.onnx $BENCH/clip-ac86.mp4 u8spike-$tag $QNN_FLAGS" \
+    remote 400 "PROFILE=yolox INSIZE=640 sh $BENCH/u8_content_test.sh qnn $BENCH/artifacts-fixed/$stem.onnx $BENCH/clip-ac86.mp4 u8spike-$tag $QNN_FLAGS" \
       || log "WARN: content $tag rc nonzero"
   done <<< "$VARIANTS"
   # trap runs do_finish here
@@ -273,15 +290,17 @@ case $STAGE in
 build) do_build ;;
 push) do_push ;;
 run) do_run ;;
+content) do_content ;;
 fetch) do_fetch ;;
 all)
   do_build
   do_push
   do_run
+  do_content
   do_fetch
   ;;
 *)
-  echo "usage: $0 [all|build|push|run|fetch]" >&2
+  echo "usage: $0 [all|build|push|run|content|fetch]" >&2
   exit 2
   ;;
 esac
