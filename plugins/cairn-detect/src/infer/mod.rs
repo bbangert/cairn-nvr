@@ -35,6 +35,7 @@ mod geometry;
 mod heads;
 mod labels;
 mod profile;
+mod qparams;
 mod resolve;
 
 /// Cap on detections in one frame's output line.
@@ -56,9 +57,15 @@ pub use embedder::{embed_persons, quantize_base64, Embedder};
 pub use geometry::{Fit, InputSize, Projection};
 pub use labels::{Labels, ScoreFloors, TrackFloorOverrides};
 pub use profile::{InputSpec, ModelProfile};
+pub use qparams::IoQuant;
 
 // Once test-only, now load-bearing across the split NIF boundary: a resolved
 // spec crosses between the inference library (cairn-ort, the producer via
 // `engine_spec`) and the decode library (cairn-native, the consumer) as the
 // `wire` spellings of exactly these two types.
 pub use {encoding::TensorEncoding, geometry::ResizePolicy};
+
+// The uint8-IO spike's payload types: the packer's output enum and the edge
+// qparams it quantizes through — named by main.rs (sidecar load) and
+// cairn-ort (the embedder's crop source refusing a u8 tensor).
+pub use encoding::{QuantParams, TensorValues};

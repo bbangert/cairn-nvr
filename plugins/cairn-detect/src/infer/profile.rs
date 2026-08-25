@@ -8,12 +8,12 @@
 
 use std::fmt;
 
-use super::encoding::TensorEncoding;
+use super::encoding::{QuantParams, TensorEncoding};
 use super::geometry::{InputSize, ResizePolicy};
 
 /// Everything a decoder needs to build a tensor this model will accept.
 ///
-/// Carried as one value because the three parts are settled together at
+/// Carried as one value because the parts are settled together at
 /// startup and every scaler and GPU filter graph in the process is built for
 /// all of them at once. In a built-in profile `size` is only a fallback: the
 /// model's own declared geometry and `--input-size` both outrank it.
@@ -22,6 +22,12 @@ pub struct InputSpec {
     pub size: InputSize,
     pub encoding: TensorEncoding,
     pub resize: ResizePolicy,
+    /// `Some` for a uint8-IO artifact: the input edge's qparams, from the
+    /// model's sidecar, never from a profile — no catalog entry sets this.
+    /// The packer then emits u8 codes (`encoding` still decides the affine
+    /// the codes quantize) and the letterbox pad goes through the same
+    /// encode-then-quantize path as every pixel.
+    pub input_quant: Option<QuantParams>,
 }
 
 /// Where the resolved [`InputSize`] came from, for the startup line.

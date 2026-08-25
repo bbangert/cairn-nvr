@@ -166,7 +166,7 @@ impl Embedder {
 
         let input = InputTensor {
             shape: [1, 3, self.input_size.h as i64, self.input_size.w as i64],
-            values: crop,
+            values: super::encoding::TensorValues::F32(crop),
         };
         let tensors = self.backend.run(input).context("running the embedder")?;
         let raw = tensors.get(&self.output_name)?;
@@ -411,6 +411,7 @@ mod tests {
             size: src,
             encoding: TensorEncoding::UnitRgb,
             resize: ResizePolicy::Stretch,
+            input_quant: None,
         };
         let projection = ResizePolicy::Stretch.project(src, src);
         // Solid (255, 128, 0) in UnitRgb: planes hold v/255.
@@ -445,6 +446,7 @@ mod tests {
             size: src,
             encoding: TensorEncoding::RawBgr,
             resize: ResizePolicy::Stretch,
+            input_quant: None,
         };
         let projection = ResizePolicy::Stretch.project(src, src);
         // Solid (255, 128, 0) RGB in RawBgr planes: plane 0 = B = 0,
@@ -481,6 +483,7 @@ mod tests {
             size: input,
             encoding: TensorEncoding::UnitRgb,
             resize: ResizePolicy::Letterbox { pad: 114 },
+            input_quant: None,
         };
         let projection = ResizePolicy::Letterbox { pad: 114 }.project(input, source);
 
@@ -517,6 +520,7 @@ mod tests {
             size: input,
             encoding: TensorEncoding::UnitRgb,
             resize: ResizePolicy::Letterbox { pad: 114 },
+            input_quant: None,
         };
         let projection = ResizePolicy::Letterbox { pad: 114 }.project(input, source);
         let plane = input.w * input.h;
@@ -549,6 +553,7 @@ mod tests {
             size: src,
             encoding: TensorEncoding::UnitRgb,
             resize: ResizePolicy::Stretch,
+            input_quant: None,
         };
         let projection = ResizePolicy::Stretch.project(src, src);
         let tensor = vec![0f32; 3 * src.w * src.h];

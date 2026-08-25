@@ -57,6 +57,11 @@ impl Engine {
             &labels,
             config.allow_label_mismatch,
             config.qnn,
+            // Deliberately no sidecar load: the uint8-IO path is the
+            // cairn-detect binary's for now (spike). A u8-IO artifact
+            // configured here fails Detector::open's dtype check with a
+            // message naming the sidecar, instead of failing on frame one.
+            None,
         )
         .map_err(|e| NativeError::ModelLoad(chain(&e)))?;
         let embedder = match config.embedder_model.as_deref() {
@@ -131,7 +136,18 @@ impl Engine {
         } = &mut *model;
         let spec = detector.input_spec();
 
-        let crop_source = embedder.as_ref().map(|_| input.tensor.clone());
+        // In-VM packs are always f32 (no sidecar crosses this path — see
+        // `Engine::open`), so the u8 arm is an invariant refusal, not a
+        // reachable contract.
+        let crop_source = match (embedder.as_ref(), input.tensor.as_f32()) {
+            (Some(_), Some(tensor)) => Some(tensor.to_vec()),
+            (Some(_), None) => {
+                return Err(NativeError::Infer(
+                    "embedder cannot crop from a u8-packed tensor".to_string(),
+                ))
+            }
+            (None, _) => None,
+        };
         let projection = input.projection;
         let mut dets = detector
             .detect(input.tensor, input.projection, labels, floors)

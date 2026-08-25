@@ -6,21 +6,31 @@
 //! back — [`ModelIo`], [`Raw`] — is SDK-free, so the rest of `infer` reads a
 //! model's shapes and a run's tensors without naming onnxruntime.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ort::environment::Environment;
 use ort::session::{Session, SessionOutputs};
-use ort::value::Tensor;
+use ort::value::{Tensor, TensorElementType, ValueType};
 
 use crate::note;
 
+use super::super::encoding::{QuantParams, TensorValues};
 use super::super::heads::Raw;
 use super::super::resolve::{
     declared_input_batch, declared_input_size, static_output_dims, Declared,
 };
 use super::{Backend, BackendKind, InputTensor, ModelIo, QnnOptions, SessionOptions, Tensors};
+
+/// The reused input buffer, in the dtype the artifact's contract picked at
+/// open. One variant per [`TensorValues`] arm: a session only ever sees one
+/// of them, and a run that switches is refused, not coerced.
+enum InputBuffer {
+    F32(Tensor<f32>),
+    U8(Tensor<u8>),
+}
 
 pub(in crate::infer) struct OrtBackend {
     session: Session,
@@ -32,7 +42,24 @@ pub(in crate::infer) struct OrtBackend {
     /// QCS6490 this measured *neutral* on QNN latency — the sparse-cadence
     /// slowdown investigated there was the CPU frequency governor, not the
     /// allocation — so this stays as hygiene, not as a performance claim.
-    input: Option<Tensor<f32>>,
+    input: Option<InputBuffer>,
+    /// Per-output dequant qparams for a uint8-IO artifact, from the sidecar
+    /// via [`SessionOptions::io_quant`]; empty for the float contract. Every
+    /// run eagerly dequantizes exactly these outputs — the arithmetic the
+    /// artifact's stripped DequantizeLinear used to do inside the graph.
+    output_quant: HashMap<String, QuantParams>,
+}
+
+/// Whether a declared tensor's element type is uint8 — the [`ModelIo`] sniff
+/// that lets a uint8-IO artifact's contract be checked at open.
+fn tensor_is_u8(dtype: &ValueType) -> bool {
+    matches!(
+        dtype,
+        ValueType::Tensor {
+            ty: TensorElementType::Uint8,
+            ..
+        }
+    )
 }
 
 impl OrtBackend {
@@ -42,7 +69,7 @@ impl OrtBackend {
     /// Names and shapes are read once, here, so a model with the wrong shape
     /// fails at startup with a clear message rather than by index inside the
     /// inference thread on the first frame.
-    fn from_session(session: Session, model: &Path) -> Result<Self> {
+    fn from_session(session: Session, model: &Path, options: &SessionOptions) -> Result<Self> {
         let input = session
             .inputs()
             .first()
@@ -51,6 +78,13 @@ impl OrtBackend {
             input_name: input.name().to_string(),
             declared_input_size: declared_input_size(input.dtype()),
             declared_input_batch: declared_input_batch(input.dtype()),
+            input_is_u8: tensor_is_u8(input.dtype()),
+            u8_outputs: session
+                .outputs()
+                .iter()
+                .filter(|output| tensor_is_u8(output.dtype()))
+                .map(|output| output.name().to_string())
+                .collect(),
             outputs: session
                 .outputs()
                 .iter()
@@ -64,6 +98,11 @@ impl OrtBackend {
             session,
             io,
             input: None,
+            output_quant: options
+                .io_quant
+                .as_ref()
+                .map(|quant| quant.outputs.clone())
+                .unwrap_or_default(),
         })
     }
 }
@@ -73,7 +112,7 @@ impl Backend for OrtBackend {
     /// below is the only session setting this backend makes, and it is not a
     /// profile knob. The parameter stays in the signature because it is the
     /// trait's; [`QnnBackend::open`] is the one that reads its group.
-    fn open(model: &Path, _options: &SessionOptions) -> Result<Self> {
+    fn open(model: &Path, options: &SessionOptions) -> Result<Self> {
         // ort's builder errors carry the builder itself for recovery, which
         // makes them neither Send nor Sync; flatten them to a message.
         let session = Session::builder()
@@ -82,7 +121,7 @@ impl Backend for OrtBackend {
             .map_err(|e| anyhow!("registering the CPU execution provider: {e}"))?
             .commit_from_file(model)
             .with_context(|| format!("loading model {}", model.display()))?;
-        Self::from_session(session, model)
+        Self::from_session(session, model, options)
     }
 
     fn kind(&self) -> BackendKind {
@@ -94,37 +133,99 @@ impl Backend for OrtBackend {
     }
 
     fn run(&mut self, input: InputTensor) -> Result<Box<dyn Tensors + '_>> {
-        let tensor = match &mut self.input {
-            // One model, one shape: every tensor this backend is handed has
-            // the geometry settled at open, so the buffer refills in place.
-            // Checked anyway, because a mismatched copy_from_slice panics.
-            Some(tensor) => {
-                let (shape, data) = tensor.extract_tensor_mut();
-                // Both checked: a same-shape buffer of the wrong length is
-                // impossible for a caller that filled it from the shape, but
-                // copy_from_slice would answer one with a panic, not an Err.
-                if **shape != input.shape || data.len() != input.values.len() {
-                    bail!(
-                        "input tensor changed between runs: {:?} ({} values) then {:?} ({} values)",
-                        &**shape,
-                        data.len(),
-                        input.shape,
-                        input.values.len()
-                    );
-                }
-                data.copy_from_slice(&input.values);
-                tensor
+        // Cloned up front (a map of one or two entries): `outputs` below
+        // holds the session borrowed for the rest of this call, so the
+        // dequant loop cannot read it off `self`.
+        let output_quant = self.output_quant.clone();
+        // One model, one shape *and one dtype*: every tensor this backend is
+        // handed has the geometry the packer settled at open, so the buffer
+        // refills in place. Checked anyway, because a mismatched
+        // copy_from_slice panics, and a dtype flip means the caller swapped
+        // contracts mid-session.
+        let outputs = match input.values {
+            TensorValues::F32(values) => {
+                let tensor = match &mut self.input {
+                    Some(InputBuffer::F32(tensor)) => {
+                        let (shape, data) = tensor.extract_tensor_mut();
+                        // Both checked: a same-shape buffer of the wrong
+                        // length is impossible for a caller that filled it
+                        // from the shape, but copy_from_slice would answer
+                        // one with a panic, not an Err.
+                        if **shape != input.shape || data.len() != values.len() {
+                            bail!(
+                                "input tensor changed between runs: {:?} ({} values) then {:?} ({} values)",
+                                &**shape,
+                                data.len(),
+                                input.shape,
+                                values.len()
+                            );
+                        }
+                        data.copy_from_slice(&values);
+                        tensor
+                    }
+                    Some(InputBuffer::U8(_)) => {
+                        bail!("input tensor dtype changed between runs: u8 codes then f32")
+                    }
+                    None => match self.input.insert(InputBuffer::F32(
+                        Tensor::from_array((input.shape, values))
+                            .context("building the input tensor")?,
+                    )) {
+                        InputBuffer::F32(tensor) => tensor,
+                        InputBuffer::U8(_) => unreachable!("just inserted the f32 variant"),
+                    },
+                };
+                self.session
+                    .run(ort::inputs![self.io.input_name.as_str() => tensor.view()])
+                    .context("running inference")?
             }
-            None => self.input.insert(
-                Tensor::from_array((input.shape, input.values))
-                    .context("building the input tensor")?,
-            ),
+            TensorValues::U8(values) => {
+                let tensor = match &mut self.input {
+                    Some(InputBuffer::U8(tensor)) => {
+                        let (shape, data) = tensor.extract_tensor_mut();
+                        if **shape != input.shape || data.len() != values.len() {
+                            bail!(
+                                "input tensor changed between runs: {:?} ({} values) then {:?} ({} values)",
+                                &**shape,
+                                data.len(),
+                                input.shape,
+                                values.len()
+                            );
+                        }
+                        data.copy_from_slice(&values);
+                        tensor
+                    }
+                    Some(InputBuffer::F32(_)) => {
+                        bail!("input tensor dtype changed between runs: f32 then u8 codes")
+                    }
+                    None => match self.input.insert(InputBuffer::U8(
+                        Tensor::from_array((input.shape, values))
+                            .context("building the input tensor")?,
+                    )) {
+                        InputBuffer::U8(tensor) => tensor,
+                        InputBuffer::F32(_) => unreachable!("just inserted the u8 variant"),
+                    },
+                };
+                self.session
+                    .run(ort::inputs![self.io.input_name.as_str() => tensor.view()])
+                    .context("running inference")?
+            }
         };
-        let outputs = self
-            .session
-            .run(ort::inputs![self.io.input_name.as_str() => tensor.view()])
-            .context("running inference")?;
-        Ok(Box::new(OrtTensors { outputs }))
+        // Dequantize the sidecar-named outputs now, inside the timed run —
+        // this multiply is the work the artifact's stripped DequantizeLinear
+        // did inside the graph, so leaving it out of the pass cost would
+        // flatter every uint8-IO latency number.
+        let mut dequant = HashMap::new();
+        for (name, quant) in &output_quant {
+            let value = outputs
+                .get(name.as_str())
+                .ok_or_else(|| anyhow!("sidecar names output {name}, which the model lacks"))?;
+            let (shape, codes) = value.try_extract_tensor::<u8>().with_context(|| {
+                format!("model output {name} is not the u8 tensor its sidecar declares")
+            })?;
+            let values = codes.iter().map(|&code| quant.dequantize(code)).collect();
+            dequant.insert(name.clone(), (shape.iter().copied().collect(), values));
+        }
+        Ok(Box::new(OrtTensors { outputs, dequant }))
     }
 }
 
@@ -204,7 +305,19 @@ impl Backend for QnnBackend {
             );
         }
 
-        let ep_options = qnn_ep_options(qnn);
+        let mut ep_options = qnn_ep_options(qnn);
+        // For a uint8-IO artifact the edge conversion must stay on the HTP:
+        // the EP's default (offload_graph_io_quantization=1) hands the u8
+        // edges to the CPU EP, which re-adds the very convert passes the
+        // surgery removed — a u8-IO artifact under the default measures
+        // ~nothing. Set only when the sidecar is present so float-IO
+        // sessions keep the provider's own default.
+        if options.io_quant.is_some() {
+            ep_options.push((
+                format!("{QNN_EP}.offload_graph_io_quantization"),
+                "0".to_string(),
+            ));
+        }
         note!(
             "qnn: {} device(s) from {}, options [{}]; note: per-node CPU fallback \
              is still possible after open — only a latency delta vs the cpu \
@@ -237,7 +350,7 @@ impl Backend for QnnBackend {
                     model.display()
                 )
             })?;
-        Ok(Self(OrtBackend::from_session(session, model)?))
+        Ok(Self(OrtBackend::from_session(session, model, options)?))
     }
 
     fn kind(&self) -> BackendKind {
@@ -277,16 +390,28 @@ fn qnn_ep_options(qnn: &QnnOptions) -> Vec<(String, String)> {
 /// than owned buffers.
 struct OrtTensors<'s> {
     outputs: SessionOutputs<'s>,
+    /// Outputs the run already dequantized from u8 codes (uint8-IO artifact,
+    /// sidecar-named), as owned buffers this struct lends out exactly the
+    /// way `outputs` lends the session's. Empty for the float contract.
+    dequant: HashMap<String, (Vec<i64>, Vec<f32>)>,
 }
 
 impl Tensors for OrtTensors<'_> {
     fn get(&self, name: &str) -> Result<Raw<'_>> {
+        if let Some((dims, values)) = self.dequant.get(name) {
+            return Ok(Raw {
+                dims: dims.clone(),
+                values,
+            });
+        }
         let (shape, values) = self
             .outputs
             .get(name)
             .ok_or_else(|| anyhow!("model produced no output named {name}"))?
             .try_extract_tensor::<f32>()
-            .with_context(|| format!("model output {name} is not an f32 tensor"))?;
+            .with_context(|| {
+                format!("model output {name} is not an f32 tensor (u8 needs a qparams sidecar)")
+            })?;
         Ok(Raw {
             dims: shape.iter().copied().collect(),
             values,

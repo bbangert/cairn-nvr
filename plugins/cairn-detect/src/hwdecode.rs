@@ -550,6 +550,7 @@ mod tests {
                     size: InputSize::square(640),
                     encoding: crate::infer::TensorEncoding::UnitRgb,
                     resize: crate::infer::ResizePolicy::Stretch,
+                    input_quant: None,
                 },
                 None,
             );

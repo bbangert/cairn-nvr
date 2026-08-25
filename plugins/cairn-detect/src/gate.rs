@@ -821,7 +821,7 @@ mod tests {
                 observed_at: SystemTime::UNIX_EPOCH,
                 motion: verdict,
                 input: ModelInput {
-                    tensor: Vec::new(),
+                    tensor: crate::infer::TensorValues::F32(Vec::new()),
                     projection: Projection::stretch(InputSize::square(64)),
                 },
             }

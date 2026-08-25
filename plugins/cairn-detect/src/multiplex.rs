@@ -302,10 +302,15 @@ fn infer_loop(
             sample,
             Instant::now(),
             |input| {
-                // Path A, exactly as in single mode: the clone happens only
+                // Path A, exactly as in single mode: the copy happens only
                 // when an embedder is configured, before `detect` consumes
-                // the tensor.
-                let crop_source = embedder.as_ref().map(|_| input.tensor.clone());
+                // the tensor. The f32 demand is startup-guaranteed (embedder
+                // + u8 input is refused at open).
+                let crop_source = match (embedder.as_ref(), input.tensor.as_f32()) {
+                    (Some(_), Some(tensor)) => Some(tensor.to_vec()),
+                    (Some(_), None) => bail!("embedder cannot crop from a u8-packed tensor"),
+                    (None, _) => None,
+                };
                 let projection = input.projection;
                 let mut dets =
                     detector.detect(input.tensor, input.projection, labels, &floors[index])?;

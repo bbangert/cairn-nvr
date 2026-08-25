@@ -20,7 +20,9 @@ use super::MAX_DETS;
 ///
 /// The borrow is the backend's — this is what
 /// [`Tensors::get`](super::backend::Tensors::get) hands back, borrowed from the
-/// run that produced it rather than copied out of it.
+/// run that produced it rather than copied out of it. (A uint8-IO artifact's
+/// outputs are the one exception: the run dequantizes those codes into owned
+/// buffers, and this borrows the dequant buffer instead of the session's.)
 pub(super) struct Raw<'a> {
     pub(super) dims: Vec<i64>,
     pub(super) values: &'a [f32],

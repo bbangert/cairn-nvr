@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver};
 use rsmpeg::ffi;
@@ -239,6 +239,20 @@ fn run() -> Result<()> {
              — drop --embedder-model or use --backend ort"
         );
     }
+    // Same early-refusal geometry for a uint8-IO detector: the embedder
+    // crops from the detector's packed tensor, which under a quantized input
+    // holds u8 codes its affine inversion cannot read.
+    if args.embedder_model.is_some() {
+        if let Some(quant) = infer::IoQuant::load_for(&args.model)? {
+            if quant.input.is_some() {
+                anyhow::bail!(
+                    "--embedder-model cannot run with a uint8-input detector artifact \
+                     (the reid crop source is the detector's packed tensor) — \
+                     use the float-IO artifact or drop the embedder"
+                );
+            }
+        }
+    }
     // Before the model load, which is seconds: the host logs the hello and
     // checks that protocol 1 is in `supported_versions`.
     emit::stdout_line(&emit::hello_line())?;
@@ -294,6 +308,7 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
         &labels,
         args.allow_label_mismatch,
         qnn_options(args),
+        infer::IoQuant::load_for(&args.model)?,
     )?;
     let embedder = open_embedder(args, &labels)?;
     note!(
@@ -387,6 +402,7 @@ fn run_single(args: &Args) -> Result<()> {
         &labels,
         args.allow_label_mismatch,
         qnn_options(args),
+        infer::IoQuant::load_for(&args.model)?,
     )?;
     let input_spec = detector.input_spec();
     let embedder = open_embedder(args, &labels)?;
@@ -528,7 +544,14 @@ fn infer_loop(
             |input| {
                 // Path A: the one copy the feature pays for, taken only when
                 // an embedder is configured — `detect` consumes the tensor.
-                let crop_source = embedder.as_ref().map(|_| input.tensor.clone());
+                // The f32 demand is startup-guaranteed (embedder + u8 input
+                // is refused at open); the bail is for the invariant, not a
+                // reachable path.
+                let crop_source = match (embedder.as_ref(), input.tensor.as_f32()) {
+                    (Some(_), Some(tensor)) => Some(tensor.to_vec()),
+                    (Some(_), None) => bail!("embedder cannot crop from a u8-packed tensor"),
+                    (None, _) => None,
+                };
                 let projection = input.projection;
                 let mut dets = detector.detect(input.tensor, input.projection, labels, floors)?;
                 if let (Some(embedder), Some(tensor)) = (embedder.as_mut(), crop_source) {

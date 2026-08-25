@@ -20,6 +20,7 @@ use anyhow::{bail, Context, Result};
 
 use super::backend::{BackendKind, QnnOptions};
 use super::detector::Detector;
+use super::encoding::TensorValues;
 use super::geometry::{Fit, InputSize};
 use super::labels::{Labels, ScoreFloors};
 use super::profile::ModelProfile;
@@ -64,7 +65,10 @@ pub fn cpu_baseline_ms(
 }
 
 /// The open phase alone: a failure here is the model or the session, never
-/// a pass.
+/// a pass. Loads the model's own qparams sidecar the way the serving open
+/// does: a uint8-IO artifact's CPU baseline runs the same u8 contract, so
+/// the D-P5 ratio compares the artifact against itself, not against a
+/// float-IO sibling.
 pub fn open_baseline_detector(
     model: &Path,
     input_size: Option<InputSize>,
@@ -72,6 +76,7 @@ pub fn open_baseline_detector(
     labels: &Labels,
     allow_label_mismatch: bool,
 ) -> Result<Detector> {
+    let io_quant = super::qparams::IoQuant::load_for(model)?;
     Detector::open(
         model,
         BackendKind::Ort,
@@ -80,6 +85,7 @@ pub fn open_baseline_detector(
         labels,
         allow_label_mismatch,
         QnnOptions::default(),
+        io_quant,
     )
     .context("opening the CPU baseline detector")
 }
@@ -98,12 +104,20 @@ pub fn measure_cpu_baseline(
         );
     }
 
-    let size = detector.input_spec().size;
+    let spec = detector.input_spec();
+    let size = spec.size;
     // Deterministic and not all zeros: a constant-zero tensor is exactly what
-    // the letterbox pad is, and it is not this model's typical input.
-    let tensor: Vec<f32> = (0..size.tensor_len())
-        .map(|i| (i % 255) as f32 / 255.0)
-        .collect();
+    // the letterbox pad is, and it is not this model's typical input. The
+    // dtype follows the detector's resolved contract — u8 codes for a
+    // uint8-IO artifact, the same cycling pattern either way.
+    let tensor = match spec.input_quant {
+        None => TensorValues::F32(
+            (0..size.tensor_len())
+                .map(|i| (i % 255) as f32 / 255.0)
+                .collect(),
+        ),
+        Some(_) => TensorValues::U8((0..size.tensor_len()).map(|i| (i % 255) as u8).collect()),
+    };
     // The identity fit: this measures the model pass alone, so the source and
     // the input rectangle are the same and nothing is scaled or offset.
     let projection = Fit {

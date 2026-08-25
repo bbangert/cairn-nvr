@@ -724,6 +724,7 @@ mod tests {
                 size: InputSize::square(64),
                 encoding: TensorEncoding::UnitRgb,
                 resize: ResizePolicy::Stretch,
+                input_quant: None,
             },
             decode_errors: 0,
             convert_errors: 0,

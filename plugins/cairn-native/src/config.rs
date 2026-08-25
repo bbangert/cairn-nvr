@@ -89,6 +89,10 @@ impl RawDecoderParams {
                     .map_err(|error| NativeError::Config(crate::error::chain(&error)))?,
                 resize: ResizePolicy::from_wire(&self.resize, self.resize_pad)
                     .map_err(|error| NativeError::Config(crate::error::chain(&error)))?,
+                // Never set on the decode side: the split path packs no
+                // tensor here, and the uint8-IO spike is binary-only — no
+                // quant spec crosses the NIF wire.
+                input_quant: None,
             },
             source: source_size(self.source_width, self.source_height)?,
             motion: motion::resolve(&overrides, &MotionOverrides::default()),
