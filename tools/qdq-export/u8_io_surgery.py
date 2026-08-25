@@ -75,7 +75,12 @@ def scalar_qparams(graph, scale_name, zp_name, where):
         fail(f"{where}: per-axis qparams (scale n={scale.size}) cannot become graph-IO metadata")
     if zp.dtype != np.uint8:
         fail(f"{where}: zero_point dtype {zp.dtype} is not uint8")
-    return float(scale.reshape(())), int(zp.reshape(()))
+    scale = float(scale.reshape(()))
+    # Same rule as the Rust loader: a zero/NaN/inf scale would divide to
+    # garbage in quantize and ship a sidecar the host refuses anyway.
+    if not np.isfinite(scale) or scale <= 0.0:
+        fail(f"{where}: scale {scale} is not finite-positive")
+    return scale, int(zp.reshape(()))
 
 
 def entry_surgery(graph):
@@ -156,8 +161,12 @@ def exit_surgery(graph):
         if dq is None or dq.op_type != "DequantizeLinear":
             fail(f"output {out.name} is not produced by DequantizeLinear (got {dq.op_type if dq else 'nothing'})")
         code_tensor = dq.input[0]
-        if [n.name for n in consumers.get(code_tensor, [])] != [dq.name]:
-            fail(f"quantized tensor {code_tensor} has consumers besides the exit DQ")
+        others = [n.name for n in consumers.get(code_tensor, []) if n.name != dq.name]
+        if others:
+            fail(
+                f"quantized tensor {code_tensor} has consumers besides the exit DQ: "
+                + ", ".join(others)
+            )
         scale, zp = scalar_qparams(graph, dq.input[1], dq.input[2], f"exit DQ {dq.name}")
 
         # The code tensor takes over the output's name so host-side
@@ -176,6 +185,14 @@ def exit_surgery(graph):
         del graph.value_info[:]
         graph.value_info.extend(keep)
     return outputs
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def quantize_codes(values, scale, zero_point):
@@ -237,7 +254,7 @@ def main():
         "version": 1,
         "mode": args.mode,
         "source": args.model.rsplit("/", 1)[-1],
-        "source_sha256": hashlib.sha256(open(args.model, "rb").read()).hexdigest(),
+        "source_sha256": sha256_file(args.model),
         "input": None,
         "outputs": {},
     }

@@ -130,6 +130,15 @@ def test_entry_surgery_rejects_per_axis_qparams():
         entry_surgery(m.graph)
 
 
+def test_surgery_rejects_non_finite_positive_scale():
+    # A zero or NaN edge scale would divide to garbage in quantize and ship
+    # a sidecar the Rust loader refuses — same rule, enforced at export.
+    for bad in (0.0, float("nan")):
+        m = qdq_model(entry_scale=bad)
+        with pytest.raises(SystemExit):
+            entry_surgery(m.graph)
+
+
 def test_exit_surgery_renames_code_tensor_to_output():
     m = qdq_model()
     qp = exit_surgery(m.graph)
