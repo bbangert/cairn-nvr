@@ -20,6 +20,9 @@ anyhow = "1.0"
 libc = "0.2"
 # Typed errors for `infer::resolve`; `anyhow` still owns everything above it.
 thiserror = "2.0"
+# Verifying a qparams sidecar's model_sha256 against the artifact it sits
+# next to (`infer::qparams`) — names alone cannot bind the two files.
+sha2 = "0.10"
 # `glscale` only (the `gles` feature): both load their libraries at runtime —
 # `dynamic` dlopens libEGL, and glow is handed `eglGetProcAddress` — so the
 # board build cross-links with zero native GL inputs and a host without a GPU

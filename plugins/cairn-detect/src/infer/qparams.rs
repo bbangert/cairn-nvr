@@ -45,6 +45,13 @@ struct RawSidecar {
     input: Option<RawInput>,
     #[serde(default)]
     outputs: HashMap<String, RawQp>,
+    /// sha256 of the converted artifact, written by the exporter next to
+    /// it. Optional for sidecars from before the field existed; when
+    /// present it MUST match the model being opened — IO names like
+    /// `images`/`output` recur across artifacts, so name checks alone
+    /// cannot stop another model's sidecar from applying wrong scales.
+    #[serde(default)]
+    model_sha256: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +65,16 @@ struct RawInput {
 struct RawQp {
     scale: f32,
     zero_point: u8,
+}
+
+/// Streaming sha256 of a file, lowercase hex — the artifact side of the
+/// sidecar's `model_sha256` binding.
+fn sha256_of(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn checked(scale: f32, zero_point: u8, where_: &str, path: &Path) -> Result<QuantParams> {
@@ -106,6 +123,18 @@ impl IoQuant {
                 raw.spec,
                 raw.version
             );
+        }
+        if let Some(expected) = &raw.model_sha256 {
+            let actual = sha256_of(model)
+                .with_context(|| format!("hashing {} for its sidecar", model.display()))?;
+            if !actual.eq_ignore_ascii_case(expected) {
+                bail!(
+                    "{}: model_sha256 {expected} does not match {} ({actual}) — \
+                     this sidecar belongs to a different artifact",
+                    path.display(),
+                    model.display()
+                );
+            }
         }
         let input = raw
             .input
@@ -187,6 +216,30 @@ mod tests {
                 "input":{"name":"x","scale":0.0,"zero_point":0},"outputs":{}}"#,
         );
         assert!(IoQuant::load_for(&model).is_err());
+    }
+
+    #[test]
+    fn model_sha256_binds_the_sidecar_to_its_artifact() {
+        // IO names recur across artifacts (`images`, `output`), so the
+        // digest is what stops another model's sidecar from applying the
+        // wrong scales. Absent field = pre-field sidecar, tolerated.
+        let sha_of_stub = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(b"not a real model"))
+        };
+        let with_sha = |sha: &str| {
+            format!(
+                r#"{{"spec":"cairn.u8io.qparams","version":1,
+                     "input":{{"name":"images","scale":1.0,"zero_point":0}},
+                     "outputs":{{}},"model_sha256":"{sha}"}}"#
+            )
+        };
+        let model = write("sha-match.onnx", &with_sha(&sha_of_stub));
+        assert!(IoQuant::load_for(&model).unwrap().is_some());
+
+        let model = write("sha-mismatch.onnx", &with_sha(&"0".repeat(64)));
+        let err = IoQuant::load_for(&model).unwrap_err();
+        assert!(err.to_string().contains("different artifact"), "{err}");
     }
 
     #[test]

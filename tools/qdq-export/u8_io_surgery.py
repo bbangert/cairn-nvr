@@ -3,14 +3,18 @@
 
 A QDQ export carries float32 graph IO with QuantizeLinear at the entry
 and DequantizeLinear at the exit; the QNN EP then leaves those edge ops
-to the CPU EP (its `offload_graph_io_quantization` default), and the
-float<->uint8 conversion passes are the entire remaining latency gap to
-Qualcomm's published numbers (their 13.4ms yolox_s vs our 21.8ms is
-their `--quantize_io` variant, not a better graph). This tool produces
-that variant from OUR artifact: it removes the edge Q/DQ nodes,
-redeclares the graph IO as uint8, and emits the removed nodes' exact
-scale/zero_point as a sidecar (`<out>.qparams.json`) for the host to
-apply — quantize on pack, dequantize on extract.
+to the CPU EP (its `offload_graph_io_quantization` default). The
+HYPOTHESIS this tool existed to test: that those edge conversion passes
+were the remaining latency gap to Qualcomm's published numbers (their
+13.4ms yolox_s vs our 21.8ms is their `--quantize_io` variant). The
+board FALSIFIED it for our graph — uint8 input made yolox_s-a8 ~20%
+SLOWER on the HTP and uint8 output was latency-neutral
+(.claude/plans/uint8-io/research/u8-spike-board-20260825.md); the tool
+is kept as the reproduction path for that result and for any future
+retry on a stem-free export. Mechanically it removes the edge Q/DQ
+nodes, redeclares the graph IO as uint8, and emits the removed nodes'
+exact scale/zero_point as a sidecar (`<out>.qparams.json`) for the
+host to apply — quantize on pack, dequantize on extract.
 
 No exporter API produces this shape; manual graph editing is the
 standard route. Two structural facts make it safe here:
@@ -107,12 +111,28 @@ def entry_surgery(graph):
             consumers.setdefault(t, []).append(n)
 
     # Walk from the input across transparent ops; leaves must be Q nodes.
+    # "Every path ends at a QuantizeLinear" is enforced, not assumed: a
+    # traversed tensor that is a graph output would keep its float
+    # declaration while its source gets retyped, and a tensor with no
+    # consumers is a path this walk cannot prove anything about — both
+    # refuse instead of slipping past as vacuous truth.
+    graph_outputs = {o.name for o in graph.output}
     traversed, q_nodes, frontier, seen = [], [], [inp.name], set()
     while frontier:
         t = frontier.pop()
         if t in seen:
             continue
         seen.add(t)
+        if t in graph_outputs:
+            fail(
+                f"tensor {t} between the input and QuantizeLinear is a graph "
+                f"output — retyping the stem would break its float declaration"
+            )
+        if not consumers.get(t):
+            fail(
+                f"tensor {t} reachable from the input has no consumers — "
+                f"cannot prove this path ends at a QuantizeLinear"
+            )
         for n in consumers.get(t, []):
             if n.op_type == "QuantizeLinear":
                 q_nodes.append(n)
@@ -288,6 +308,11 @@ def main():
 
     onnx.checker.check_model(model)
     onnx.save(model, args.out)
+    # Hash of the CONVERTED file, as written: names like `images`/`output`
+    # recur across artifacts, so name checks alone cannot stop another u8
+    # model's sidecar from applying the wrong scales — the loader verifies
+    # this digest against the model it is actually opening.
+    sidecar["model_sha256"] = sha256_file(args.out)
     sidecar_path = f"{args.out}.qparams.json"
     with open(sidecar_path, "w") as f:
         json.dump(sidecar, f, indent=2)

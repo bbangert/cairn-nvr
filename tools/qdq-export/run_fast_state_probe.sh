@@ -103,16 +103,31 @@ pin_governor() {
   cp "$SPIKE/.gov-saved" "$SPIKE/.gov-pinned"
   log "governor pinned (saved: $(cat "$SPIKE/.gov-saved"))"
 }
+# Verified restore, same shape as run_u8_spike.sh's do_finish: saved
+# state survives until the readback proves the restore took.
 do_finish() {
   log "== finish"
   if [ -f "$SPIKE/.gov-pinned" ]; then
     local gov
     gov=$(cat "$SPIKE/.gov-pinned")
-    remote 30 "for c in /sys/devices/system/cpu/cpu[0-9]*; do echo $gov > \$c/cpufreq/scaling_governor; done; rm -f /data/faststate-gov.saved"
-    log "governor restored to $gov"
+    remote 30 "for c in /sys/devices/system/cpu/cpu[0-9]*; do echo $gov > \$c/cpufreq/scaling_governor; done"
+    if remote_verified 30 fs-gov-restore "$SPIKE/.gov-restored" \
+         "cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor" \
+       && [ -s "$SPIKE/.gov-restored" ] \
+       && ! grep -qv "^$gov\$" "$SPIKE/.gov-restored"; then
+      remote 30 "rm -f /data/faststate-gov.saved"
+      rm -f "$SPIKE/.gov-pinned"
+      log "governor restored to $gov (verified)"
+    else
+      log "WARN: governor restore UNVERIFIED — board may still be pinned; saved state kept (/data/faststate-gov.saved, $SPIKE/.gov-pinned)"
+    fi
   fi
   remote 90 "balena-engine start $CONTAINER"
-  log "container start requested"
+  if engine_state "$SPIKE/.ps-final" && grep -q cairn "$SPIKE/.ps-final"; then
+    log "container running (verified)"
+  else
+    log "WARN: container start UNVERIFIED — check the board (balena-engine ps)"
+  fi
 }
 
 leg() { # <tag> <sample_fps> [extra flags...]

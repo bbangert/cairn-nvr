@@ -133,16 +133,34 @@ pin_governor() {
   log "governor pinned (saved: $(cat "$SPIKE/.gov-saved"))"
 }
 
+# Restoration is VERIFIED, not assumed: a transient board failure in a
+# raw remote() would otherwise leave the governor pinned or production
+# stopped while this script exits green. Saved state (board file +
+# .gov-pinned) survives until the readback proves the restore took, so a
+# rerun or a human still has the true pre-spike value.
 do_finish() {
   log "== finish: restore governor + restart container"
   if [ -f "$SPIKE/.gov-pinned" ]; then
     local gov
     gov=$(cat "$SPIKE/.gov-pinned")
-    remote 30 "for c in /sys/devices/system/cpu/cpu[0-9]*; do echo $gov > \$c/cpufreq/scaling_governor; done; rm -f /data/u8spike-gov.saved"
-    log "governor restored to $gov"
+    remote 30 "for c in /sys/devices/system/cpu/cpu[0-9]*; do echo $gov > \$c/cpufreq/scaling_governor; done"
+    if remote_verified 30 gov-restore "$SPIKE/.gov-restored" \
+         "cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor" \
+       && [ -s "$SPIKE/.gov-restored" ] \
+       && ! grep -qv "^$gov\$" "$SPIKE/.gov-restored"; then
+      remote 30 "rm -f /data/u8spike-gov.saved"
+      rm -f "$SPIKE/.gov-pinned"
+      log "governor restored to $gov (verified)"
+    else
+      log "WARN: governor restore UNVERIFIED — board may still be pinned; saved state kept (/data/u8spike-gov.saved, $SPIKE/.gov-pinned)"
+    fi
   fi
   remote 90 "balena-engine start $CONTAINER"
-  log "container start requested"
+  if engine_state "$SPIKE/.ps-final" && grep -q cairn "$SPIKE/.ps-final"; then
+    log "container running (verified)"
+  else
+    log "WARN: container start UNVERIFIED — check the board (balena-engine ps)"
+  fi
 }
 
 # ---- stages ----

@@ -113,6 +113,27 @@ def test_entry_surgery_accepts_agreeing_fanout():
     onnx.checker.check_model(m)
 
 
+def test_entry_surgery_rejects_a_stem_tensor_that_is_a_graph_output():
+    # An auxiliary graph output fed from the stem would keep its float
+    # declaration while its source is retyped to uint8 — refuse, never
+    # rewrite around it.
+    m = qdq_model(stem=True)
+    m.graph.output.append(
+        helper.make_tensor_value_info("stem_out", TensorProto.FLOAT, [1, 1, 1, 2])
+    )
+    with pytest.raises(SystemExit):
+        entry_surgery(m.graph)
+
+
+def test_entry_surgery_rejects_a_dead_end_branch():
+    # A transparent op whose output nothing consumes is a path the walk
+    # cannot prove ends at a QuantizeLinear — vacuous truth must refuse.
+    m = qdq_model()
+    m.graph.node.insert(0, helper.make_node("Identity", ["x"], ["dangle"], name="dead"))
+    with pytest.raises(SystemExit):
+        entry_surgery(m.graph)
+
+
 def test_entry_surgery_rejects_opaque_op():
     m = qdq_model()
     # A compute op between input and Q means the stem cannot carry codes.
