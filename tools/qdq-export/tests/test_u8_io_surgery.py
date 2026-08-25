@@ -137,6 +137,24 @@ def test_entry_surgery_rejects_a_dead_end_branch():
         entry_surgery(m.graph)
 
 
+def test_entry_surgery_rejects_the_input_in_a_non_data_slot():
+    # The graph input as Reshape's SHAPE operand is not a data path;
+    # treating it as one would retype semantics, not dtype.
+    m = qdq_model()
+    m.graph.node.insert(0, helper.make_node("Reshape", ["relu_in", "x"], ["aux"], name="aux"))
+    with pytest.raises(SystemExit):
+        entry_surgery(m.graph)
+
+
+def test_exit_surgery_rejects_an_output_with_internal_consumers():
+    # ONNX allows a graph output to also feed later nodes; the rewrite
+    # would hand them uint8 codes where float values used to flow.
+    m = qdq_model()
+    m.graph.node.append(helper.make_node("Identity", ["y"], ["tap"], name="tap"))
+    with pytest.raises(SystemExit):
+        exit_surgery(m.graph)
+
+
 def test_entry_surgery_rejects_opaque_op():
     m = qdq_model()
     # A compute op between input and Q means the stem cannot carry codes.

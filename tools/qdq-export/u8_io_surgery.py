@@ -134,6 +134,15 @@ def entry_surgery(graph):
                 f"cannot prove this path ends at a QuantizeLinear"
             )
         for n in consumers.get(t, []):
+            # Slot 0 is the DATA input on every accepted op; the same
+            # tensor in any other slot (Reshape's shape, Slice's axes, a
+            # Q's scale) is not a data path, and retyping through it —
+            # or deleting that Q — would rewrite semantics, not dtype.
+            if n.input[0] != t or t in list(n.input)[1:]:
+                fail(
+                    f"tensor {t} feeds {n.op_type} ({n.name or 'unnamed'}) in a "
+                    f"non-data input slot — cannot retype the stem to uint8"
+                )
             if n.op_type == "QuantizeLinear":
                 q_nodes.append(n)
             elif n.op_type in TRANSPARENT_OPS:
@@ -190,6 +199,14 @@ def exit_surgery(graph):
         dq = producers.get(out.name)
         if dq is None or dq.op_type != "DequantizeLinear":
             fail(f"output {out.name} is not produced by DequantizeLinear (got {dq.op_type if dq else 'nothing'})")
+        # ONNX permits a graph output to ALSO feed later nodes; after the
+        # rewrite those nodes would keep the name but receive uint8 codes
+        # where float values used to flow.
+        if consumers.get(out.name):
+            fail(
+                f"graph output {out.name} also feeds internal consumers — "
+                f"rewriting would hand them uint8 codes in place of floats"
+            )
         code_tensor = dq.input[0]
         # Node identity, not node name: ONNX names are optional and can be
         # empty or duplicated, and a name compare would let an unnamed extra
