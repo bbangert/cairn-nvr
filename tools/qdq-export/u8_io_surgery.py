@@ -220,7 +220,12 @@ def verify(float_path, u8_path, sidecar):
     f_sess = ort_rt.InferenceSession(float_path, providers=["CPUExecutionProvider"])
     u_sess = ort_rt.InferenceSession(u8_path, providers=["CPUExecutionProvider"])
     f_in = f_sess.get_inputs()[0]
-    frame = synthetic_frame([d if isinstance(d, int) else 1 for d in f_in.shape])
+    # np.integer included: ORT may hand static dims back as numpy ints,
+    # which a bare isinstance(d, int) would coerce to 1 — a silently
+    # wrong-shaped verify. Symbolic dims (str/None) still become 1.
+    frame = synthetic_frame(
+        [int(d) if isinstance(d, (int, np.integer)) else 1 for d in f_in.shape]
+    )
 
     if sidecar["input"] is not None:
         codes = quantize_codes(frame, sidecar["input"]["scale"], sidecar["input"]["zero_point"])
