@@ -196,7 +196,12 @@ def sha256_file(path):
 
 
 def quantize_codes(values, scale, zero_point):
-    return np.clip(np.rint(values / scale) + zero_point, 0, 255).astype(np.uint8)
+    # float32 throughout: a Python-float scale would upcast the division to
+    # float64, whose ties can land differently from the float32 arithmetic
+    # QuantizeLinear and the Rust packer use — --verify must share their
+    # rounding, not out-precision it.
+    codes = np.rint(np.asarray(values, dtype=np.float32) / np.float32(scale))
+    return np.clip(codes + zero_point, 0, 255).astype(np.uint8)
 
 
 def synthetic_frame(shape):
