@@ -155,8 +155,9 @@ do_build() {
     FFMPEG_PKG_CONFIG_PATH="$ff/lib/pkgconfig" PKG_CONFIG_ALLOW_CROSS=1 \
     cargo build --release --target aarch64-unknown-linux-gnu --features ort-load-dynamic) \
     || { log "FATAL: cross-build failed"; exit 1; }
-  file "$CRATE/target/aarch64-unknown-linux-gnu/release/cairn-detect" | grep -q aarch64 \
-    || { log "FATAL: built binary is not aarch64"; exit 1; }
+  # readelf, not file(1): the dev container does not ship file.
+  readelf -h "$CRATE/target/aarch64-unknown-linux-gnu/release/cairn-detect" 2>/dev/null \
+    | grep -q AArch64 || { log "FATAL: built binary is not aarch64"; exit 1; }
   log "build ok"
 }
 
@@ -177,13 +178,16 @@ do_push() {
     [ -f "$ART/$stem.onnx.qparams.json" ] && files+=("$ART/$stem.onnx.qparams.json")
   done <<< "$VARIANTS"
   timeout 900 scp -q -o BatchMode=yes "${files[@]}" "$BOARD:$BENCH/artifacts-fixed/" 2>/dev/null
+  # The content clip does not live on the board between campaigns.
+  timeout 300 scp -q -o BatchMode=yes "$OUT/clips/clip-ac86.mp4" "$BOARD:$BENCH/" 2>/dev/null
   # scp over nerves_ssh exits 1 even on success — verify by checksum,
   # binary included (a stale binary would run the OLD float-only build
   # and fail every u8 leg with a message about f32 tensors).
   remote_verified 300 u8-push "$SPIKE/pushed.sha256" \
-    "sha256sum $BENCH/cairn-detect $BENCH/htp_content_test.sh $BENCH/artifacts-fixed/yolox_s-qdq-a8*.onnx $BENCH/artifacts-fixed/yolox_s-qdq-a8*.qparams.json" \
+    "sha256sum $BENCH/cairn-detect $BENCH/htp_content_test.sh $BENCH/clip-ac86.mp4 $BENCH/artifacts-fixed/yolox_s-qdq-a8*.onnx $BENCH/artifacts-fixed/yolox_s-qdq-a8*.qparams.json" \
     || { log "FATAL: cannot verify push"; exit 1; }
   local bad=0 want have
+  files+=("$OUT/clips/clip-ac86.mp4")
   for f in "${files[@]}" ; do
     want=$(sha256sum "$f" | cut -d' ' -f1)
     have=$(grep "/$(basename "$f")\$" "$SPIKE/pushed.sha256" | cut -d' ' -f1)
