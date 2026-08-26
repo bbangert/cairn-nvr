@@ -26,7 +26,10 @@ defmodule Driver.Campaign.Config do
             bench_dir: "/data/cairn-bench",
             clip_dir: "/data",
             spike_cmd: "sh /data/qnn-spike/run_spike.sh 20",
-            reboot_opts: []
+            reboot_opts: [],
+            # nil = the full table; overridable (RUNGS env, same
+            # name:profile:insize format as bash) for parity slices only.
+            rungs: nil
 
   @type t :: %__MODULE__{}
 
@@ -38,10 +41,23 @@ defmodule Driver.Campaign.Config do
       qdq_dir: qdq_dir,
       host: System.get_env("BOARD", "192.168.2.87"),
       out: System.get_env("OUT", Path.join(qdq_dir, "out-20260820")),
-      clips: System.get_env("CLIPS", "ac86 f58a aeb4") |> String.split()
+      clips: System.get_env("CLIPS", "ac86 f58a aeb4") |> String.split(),
+      rungs: System.get_env("RUNGS") && parse_rungs(System.get_env("RUNGS"))
     ]
 
     struct!(__MODULE__, Keyword.merge(defaults, overrides))
+  end
+
+  @doc "This config's rung table — the full table unless overridden."
+  @spec rungs(t()) :: [{String.t(), String.t(), pos_integer()}]
+  def rungs(%__MODULE__{rungs: nil}), do: rungs()
+  def rungs(%__MODULE__{rungs: rungs}), do: rungs
+
+  defp parse_rungs(spec) do
+    for entry <- String.split(spec),
+        [name, profile, insize] = String.split(entry, ":") do
+      {name, profile, String.to_integer(insize)}
+    end
   end
 
   def htp(%__MODULE__{out: out}), do: Path.join(out, "htp")

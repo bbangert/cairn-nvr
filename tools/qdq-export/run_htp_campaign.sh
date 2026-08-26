@@ -96,7 +96,9 @@ remote_verified() { # <timeout-secs> <tag> <local-dest> <command..., no pipes>
 # The 12 board-worthy rungs (phase 2.3 verdicts): every a16 plus the
 # three a8 survivors. name:profile:insize; raw yolo26/yolov8 heads
 # decode under the yolov8 profile (the bundled binary's contract).
-RUNGS="
+# Env-overridable for parity slices (run_parity_slice.sh) only — a real
+# campaign runs the full table.
+RUNGS=${RUNGS:-"
 yolox_nano-qdq-a16:yolox:416
 yolox_tiny-qdq-a16:yolox:416
 yolox_tiny-qdq-a8:yolox:416
@@ -109,7 +111,7 @@ yolo26n-416-qdq-a16:yolov8:416
 yolo26s-qdq-a16:yolov8:640
 yolo26m-qdq-a16:yolov8:640
 yolov8n-qdq-a16:yolov8:640
-"
+"}
 
 engine_state() { # writes container names to $1 (local file)
   # A failed ps would redirect its error into the file, contain no

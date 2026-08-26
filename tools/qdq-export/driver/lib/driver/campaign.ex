@@ -31,10 +31,12 @@ defmodule Driver.Campaign do
   def run(stage, board, config)
 
   def run(:push, board, cfg) do
-    log(cfg, "== push: content script + #{length(Config.rungs())} artifacts")
+    log(cfg, "== push: content script + #{length(Config.rungs(cfg))} artifacts")
 
     script = Path.join(cfg.qdq_dir, "htp_content_test.sh")
-    artifacts = for {name, _, _} <- Config.rungs(), do: Path.join(Config.art(cfg), "#{name}.onnx")
+
+    artifacts =
+      for {name, _, _} <- Config.rungs(cfg), do: Path.join(Config.art(cfg), "#{name}.onnx")
 
     # Refuse missing files up front — before anything lands on the board.
     case Enum.reject([script | artifacts], &File.exists?/1) do
@@ -87,7 +89,7 @@ defmodule Driver.Campaign do
 
     log(
       cfg,
-      "== content runs: #{clips} x (#{length(Config.rungs())} rungs qnn + nano ort control + old-nano defect control)"
+      "== content runs: #{clips} x (#{length(Config.rungs(cfg))} rungs qnn + nano ort control + old-nano defect control)"
     )
 
     # Anchor the session counter to a clean CDSP: envcheck (and any prior
@@ -95,7 +97,7 @@ defmodule Driver.Campaign do
     with {:ok, board} <- reboot(board, cfg),
          {:ok, board} <- pin_governor(board, cfg),
          {:ok, board} <-
-           reduce_rungs(board, fn {name, profile, insize}, b ->
+           reduce_rungs(cfg, board, fn {name, profile, insize}, b ->
              content_run(
                b,
                cfg,
@@ -147,7 +149,7 @@ defmodule Driver.Campaign do
       File.write!(Path.join(Config.htp(cfg), ".latency-start"), "#{start}\n")
 
       with {:ok, board} <-
-             reduce_rungs(board, fn {name, profile, insize}, b ->
+             reduce_rungs(cfg, board, fn {name, profile, insize}, b ->
                with :ok <- cfg.board.engine_stop(b, cfg.container) do
                  log(cfg, "latency #{name} qnn 60s")
 
@@ -553,8 +555,8 @@ defmodule Driver.Campaign do
     end
   end
 
-  defp reduce_rungs(board, fun) do
-    Enum.reduce_while(Config.rungs(), {:ok, board}, fn rung, {:ok, b} ->
+  defp reduce_rungs(cfg, board, fun) do
+    Enum.reduce_while(Config.rungs(cfg), {:ok, board}, fn rung, {:ok, b} ->
       case fun.(rung, b) do
         {:ok, b} -> {:cont, {:ok, b}}
         {:error, _} = error -> {:halt, error}
