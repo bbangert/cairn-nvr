@@ -24,7 +24,11 @@ defmodule Driver.Board do
         }
 
   @boot_id_path "/proc/sys/kernel/random/boot_id"
+  @gov_saved "/data/campaign-gov.saved"
+  @gov_glob "/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor"
   @erpc_timeout 15_000
+  @cmd_timeout 30_000
+  @chunk_bytes 4 * 1024 * 1024
   # A racing enable() settles in well under a second; three tries covers it.
   @starting_retries 3
 
@@ -101,17 +105,163 @@ defmodule Driver.Board do
     end
   end
 
-  @doc "Run a shell command on the board; returns `{output, exit_status}` for real."
+  @doc """
+  Run a shell command on the board; returns `{output, exit_status}` for
+  real — the property the whole port exists for. Pipes are fine again:
+  this is `System.cmd("sh", ["-c", ...])` on the board, not a `~c|...|`
+  sigil. `:timeout` (ms, default #{@cmd_timeout}) raises on the caller
+  without wedging the node.
+  """
   @spec cmd(t(), String.t(), keyword()) :: {String.t(), non_neg_integer()}
-  def cmd(%__MODULE__{} = _session, _sh, _opts \\ []), do: raise("P1-T3")
+  def cmd(%__MODULE__{node: node}, sh, opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, @cmd_timeout)
+    :erpc.call(node, System, :cmd, ["sh", ["-c", sh], [stderr_to_stdout: true]], timeout)
+  end
 
-  @doc "Read a board file whole-or-error."
-  @spec read!(t(), Path.t()) :: binary()
-  def read!(%__MODULE__{} = _session, _path), do: raise("P1-T3")
+  @doc "Read a board file whole-or-error — no partial fetches by construction."
+  @spec read!(t(), Path.t(), timeout()) :: binary()
+  def read!(%__MODULE__{node: node}, path, timeout \\ @cmd_timeout) do
+    :erpc.call(node, File, :read!, [path], timeout)
+  end
 
-  @doc "Write a local file to the board, chunked, sha-verified board-side."
+  @doc """
+  Write a local file to the board, chunked ≤4MB, sha-verified board-side.
+
+  `async_dist` is set on the local caller for the duration: the pushing
+  sender is THIS process, so the flag belongs here — `Vagus.Dist.run/1`
+  is the board-side equivalent, and a local closure cannot cross `:erpc`
+  to reach it anyway.
+  """
   @spec write!(t(), Path.t(), Path.t()) :: :ok
-  def write!(%__MODULE__{} = _session, _local, _remote), do: raise("P1-T3")
+  def write!(%__MODULE__{node: node} = session, local, remote) do
+    content = File.read!(local)
+    local_sha = :crypto.hash(:sha256, content) |> Base.encode16(case: :lower)
+    :ok = :erpc.call(node, File, :mkdir_p!, [Path.dirname(remote)], @cmd_timeout)
+
+    prev = Process.flag(:async_dist, true)
+
+    try do
+      for {chunk, i} <- content |> chunk_binary(@chunk_bytes) |> Enum.with_index() do
+        modes = if i == 0, do: [], else: [:append]
+        :ok = :erpc.call(node, File, :write!, [remote, chunk, modes], @cmd_timeout)
+      end
+    after
+      Process.flag(:async_dist, prev)
+    end
+
+    case cmd(session, "sha256sum #{remote}") do
+      {out, 0} ->
+        [board_sha | _] = String.split(out)
+
+        if board_sha == local_sha,
+          do: :ok,
+          else: raise("push sha mismatch for #{remote}: #{board_sha} != #{local_sha}")
+
+      {out, rc} ->
+        raise "cannot sha-verify #{remote} (rc #{rc}): #{out}"
+    end
+  end
+
+  @doc """
+  Pin every CPU governor to `performance`, readback-verified; returns the
+  pre-campaign governor. Capture-once semantics live board-side in
+  #{@gov_saved} (`test ! -s`, not `-f`: a failed save leaves an EMPTY
+  file, which must re-save rather than wedge), so re-entry never records
+  the pin as the thing to restore.
+  """
+  @spec pin_governor(t()) :: {:ok, String.t()} | {:error, term()}
+  def pin_governor(%__MODULE__{} = session) do
+    save =
+      "if test ! -s #{@gov_saved}; then " <>
+        "cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > #{@gov_saved}; fi; " <>
+        "cat #{@gov_saved}"
+
+    with {:save, {out, 0}} <- {:save, cmd(session, save)},
+         saved = String.trim(out),
+         {:saved_empty, false} <- {:saved_empty, saved == ""},
+         {:pin, {_, 0}} <- {:pin, cmd(session, set_all_governors("performance"))},
+         :ok <- verify_governors(session, "performance") do
+      {:ok, saved}
+    else
+      {:save, {out, rc}} -> {:error, {:gov_save, rc, out}}
+      {:saved_empty, true} -> {:error, :empty_saved_governor}
+      {:pin, {out, rc}} -> {:error, {:gov_pin, rc, out}}
+      {:error, _} = error -> error
+    end
+  end
+
+  @doc """
+  Restore ONLY what `pin_governor/1` captured — a finish reached without
+  a pin restores nothing. The saved file is removed only after a
+  readback verifies the restore took, so a failed restore stays
+  restorable on the next finish.
+  """
+  @spec restore_governor(t()) ::
+          {:ok, {:restored, String.t()} | :nothing_to_restore} | {:error, term()}
+  def restore_governor(%__MODULE__{} = session) do
+    case cmd(session, "test -e #{@gov_saved}") do
+      {_, rc} when rc != 0 ->
+        {:ok, :nothing_to_restore}
+
+      {_, 0} ->
+        with {:read, {out, 0}} <- {:read, cmd(session, "cat #{@gov_saved}")},
+             saved = String.trim(out),
+             {:saved_empty, false} <- {:saved_empty, saved == ""},
+             {:set, {_, 0}} <- {:set, cmd(session, set_all_governors(saved))},
+             :ok <- verify_governors(session, saved),
+             {:rm, {_, 0}} <- {:rm, cmd(session, "rm -f #{@gov_saved}")} do
+          {:ok, {:restored, saved}}
+        else
+          {:read, {out, rc}} -> {:error, {:gov_read, rc, out}}
+          {:saved_empty, true} -> {:error, :empty_saved_governor}
+          {:set, {out, rc}} -> {:error, {:gov_restore, rc, out}}
+          {:rm, {out, rc}} -> {:error, {:gov_saved_rm, rc, out}}
+          {:error, _} = error -> error
+        end
+    end
+  end
+
+  @doc """
+  Container names from `balena-engine ps` — a failed ps is an error, not
+  an empty list, so it can never read as "engine stopped".
+  """
+  @spec engine_state(t()) :: {:ok, [String.t()]} | {:error, term()}
+  def engine_state(%__MODULE__{} = session) do
+    case cmd(session, "balena-engine ps --format {{.Names}}") do
+      {out, 0} -> {:ok, String.split(out, "\n", trim: true)}
+      {out, rc} -> {:error, {:engine_ps, rc, out}}
+    end
+  end
+
+  @doc """
+  Stop a container and verify by state readback — the stop's own rc is
+  ignored (already-stopped is fine), the readback is not.
+  """
+  @spec engine_stop(t(), String.t()) :: :ok | {:error, term()}
+  def engine_stop(%__MODULE__{} = session, container) do
+    {_out, _rc} = cmd(session, "balena-engine stop #{container}", timeout: 90_000)
+
+    case engine_state(session) do
+      {:ok, names} ->
+        if container in names, do: {:error, {:container_still_running, container}}, else: :ok
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  @doc "Start a container and verify by state readback."
+  @spec engine_start(t(), String.t()) :: :ok | {:error, term()}
+  def engine_start(%__MODULE__{} = session, container) do
+    with {:start, {_, 0}} <-
+           {:start, cmd(session, "balena-engine start #{container}", timeout: 90_000)},
+         {:ok, names} <- engine_state(session) do
+      if container in names, do: :ok, else: {:error, {:container_not_running, container}}
+    else
+      {:start, {out, rc}} -> {:error, {:engine_start, rc, out}}
+      {:error, _} = error -> error
+    end
+  end
 
   @doc "The board's current boot id — the witness that a reboot happened."
   @spec boot_id(t()) :: String.t()
@@ -150,6 +300,31 @@ defmodule Driver.Board do
         {:error, reason} -> {:error, {:local_node, reason}}
       end
     end
+  end
+
+  defp set_all_governors(governor) do
+    "for c in /sys/devices/system/cpu/cpu[0-9]*; do echo #{governor} > $c/cpufreq/scaling_governor; done"
+  end
+
+  defp verify_governors(session, expected) do
+    case cmd(session, "cat #{@gov_glob}") do
+      {out, 0} ->
+        governors = String.split(out, "\n", trim: true)
+
+        if governors != [] and Enum.all?(governors, &(&1 == expected)),
+          do: :ok,
+          else: {:error, {:governor_readback, expected, governors}}
+
+      {out, rc} ->
+        {:error, {:governor_readback_failed, rc, out}}
+    end
+  end
+
+  defp chunk_binary(bin, size) when byte_size(bin) <= size, do: [bin]
+
+  defp chunk_binary(bin, size) do
+    <<chunk::binary-size(^size), rest::binary>> = bin
+    [chunk | chunk_binary(rest, size)]
   end
 
   defp try_connect(_node, 0), do: {:error, :connect_failed}
