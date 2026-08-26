@@ -23,7 +23,6 @@ defmodule Driver.Board do
           qnn_sessions: non_neg_integer()
         }
 
-  @boot_id_path "/proc/sys/kernel/random/boot_id"
   @gov_saved "/data/campaign-gov.saved"
   @gov_glob "/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor"
   @erpc_timeout 15_000
@@ -49,7 +48,7 @@ defmodule Driver.Board do
          :ok <- :net_kernel.monitor_nodes(true),
          :ok <- try_connect(node, 3) do
       boot_id =
-        :erpc.call(node, File, :read!, [@boot_id_path], @erpc_timeout) |> String.trim()
+        :erpc.call(node, File, :read!, [boot_id_path()], @erpc_timeout) |> String.trim()
 
       {:ok, %__MODULE__{host: host, node: node, cookie: cookie, boot_id: boot_id, ssh: ssh}}
     end
@@ -266,7 +265,14 @@ defmodule Driver.Board do
   @doc "The board's current boot id — the witness that a reboot happened."
   @spec boot_id(t()) :: String.t()
   def boot_id(%__MODULE__{node: node}) do
-    :erpc.call(node, File, :read!, [@boot_id_path], @erpc_timeout) |> String.trim()
+    :erpc.call(node, File, :read!, [boot_id_path()], @erpc_timeout) |> String.trim()
+  end
+
+  # Config seam for the :peer suite: boot identity is the one board fact
+  # tests must fabricate (a dev container cannot change its /proc boot
+  # id); every other primitive runs for real against the peer.
+  defp boot_id_path do
+    Application.get_env(:driver, :boot_id_path, "/proc/sys/kernel/random/boot_id")
   end
 
   @doc """
