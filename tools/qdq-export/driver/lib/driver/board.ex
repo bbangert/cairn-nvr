@@ -269,9 +269,35 @@ defmodule Driver.Board do
     :erpc.call(node, File, :read!, [@boot_id_path], @erpc_timeout) |> String.trim()
   end
 
-  @doc "Reboot: observe nodedown, wait for a changed boot id, re-enable, reconnect."
-  @spec reboot(t()) :: {:ok, t()} | {:error, term()}
-  def reboot(%__MODULE__{} = _session), do: raise("P1-T4")
+  @doc """
+  Reboot the board and prove it happened: nodedown observed via the
+  monitor, then a reconnect whose boot id CHANGED — a liveness probe
+  alone would "succeed" immediately if the reboot command never ran and
+  the board stayed up. The fresh session's `qnn_sessions` is 0: a new
+  boot is what clears the CDSP leak, which is why campaigns reboot at
+  all.
+
+  Options (test hooks and pacing): `:reboot_cmd` (default `"reboot"`),
+  `:nodedown_timeout` (60s), `:deadline` (300s), `:interval` (5s).
+  """
+  @spec reboot(t(), keyword()) :: {:ok, t()} | {:error, term()}
+  def reboot(%__MODULE__{node: node} = session, opts \\ []) do
+    nodedown_timeout = Keyword.get(opts, :nodedown_timeout, 60_000)
+    deadline = Keyword.get(opts, :deadline, 300_000)
+    interval = Keyword.get(opts, :interval, 5_000)
+    reboot_cmd = Keyword.get(opts, :reboot_cmd, "reboot")
+
+    :ok = :net_kernel.monitor_nodes(true)
+    # cast, not call: the connection dies mid-command, so no reply comes.
+    :ok = :erpc.cast(node, System, :cmd, ["sh", ["-c", reboot_cmd], []])
+
+    receive do
+      {:nodedown, ^node} ->
+        reconnect_after_reboot(session, monotonic_ms() + deadline, interval)
+    after
+      nodedown_timeout -> {:error, :reboot_not_observed}
+    end
+  end
 
   defp enable(_ssh, _host, 0), do: {:error, :starting}
 
@@ -301,6 +327,31 @@ defmodule Driver.Board do
       end
     end
   end
+
+  defp reconnect_after_reboot(session, deadline_ms, interval) do
+    case connect(session.host, ssh: session.ssh) do
+      {:ok, fresh} when fresh.boot_id != session.boot_id ->
+        {:ok, fresh}
+
+      {:ok, _same_boot} ->
+        # Node down and back with the SAME boot id: distribution bounced
+        # without a reboot. Adopting it would fake a cleared CDSP.
+        {:error, :boot_id_unchanged}
+
+      {:error, :node_gone} ->
+        {:error, :node_gone}
+
+      {:error, _down_or_starting} ->
+        if monotonic_ms() >= deadline_ms do
+          {:error, :reboot_reconnect_deadline}
+        else
+          Process.sleep(interval)
+          reconnect_after_reboot(session, deadline_ms, interval)
+        end
+    end
+  end
+
+  defp monotonic_ms, do: System.monotonic_time(:millisecond)
 
   defp set_all_governors(governor) do
     "for c in /sys/devices/system/cpu/cpu[0-9]*; do echo #{governor} > $c/cpufreq/scaling_governor; done"
