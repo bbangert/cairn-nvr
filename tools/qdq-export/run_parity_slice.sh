@@ -65,23 +65,33 @@ def content_tags(root):
 b_tags, e_tags = content_tags(bash_htp), content_tags(erpc_htp)
 check("content: same run tags", b_tags == e_tags, f"bash={b_tags} erpc={e_tags}")
 
-# "up after ~Ns" is boot-timing; everything else in the marker file —
-# governor, backend/profile/insize, model+clip shas, feed exit, object
-# counts — must be transport-invisible.
-VOLATILE = ("up after ",)
+# "up after ~Ns" is boot-timing and frame counts wobble ±1 run-to-run
+# (live-feed sampling boundary — measured on bash-vs-erpc AND across
+# bash's own campaigns); everything else in the marker file — governor,
+# backend/profile/insize, model+clip shas, feed exit — must be
+# byte-identical. Counts get a small tolerance instead of exactness.
+VOLATILE = ("up after ", "frame.objects lines:")
+FRAME_TOLERANCE = 3
 for tag in [t for t in b_tags if t in e_tags]:
     b_dir, e_dir = (os.path.join(r, "content", tag) for r in (bash_htp, erpc_htp))
     b_files, e_files = (sorted(os.listdir(d)) for d in (b_dir, e_dir))
     check(f"{tag}: file set", b_files == e_files, f"bash={b_files} erpc={e_files}")
 
-    def stable_meta(d):
+    def meta_lines(d):
         with open(os.path.join(d, "meta")) as f:
-            return [l.rstrip("\n") for l in f if not any(l.startswith(v) for v in VOLATILE)]
+            return [l.rstrip("\n") for l in f]
 
     if "meta" in b_files and "meta" in e_files:
-        bm, em = stable_meta(b_dir), stable_meta(e_dir)
-        check(f"{tag}: meta stable lines", bm == em,
-              "" if bm == em else f"\n  bash: {bm}\n  erpc: {em}")
+        bl, el = meta_lines(b_dir), meta_lines(e_dir)
+        stable = [[l for l in ls if not any(l.startswith(v) for v in VOLATILE)] for ls in (bl, el)]
+        check(f"{tag}: meta stable lines", stable[0] == stable[1],
+              "" if stable[0] == stable[1] else f"\n  bash: {stable[0]}\n  erpc: {stable[1]}")
+
+        counts = [next((int(l.split(":")[1]) for l in ls if l.startswith("frame.objects lines:")), None)
+                  for ls in (bl, el)]
+        ok = None not in counts and abs(counts[0] - counts[1]) <= FRAME_TOLERANCE
+        check(f"{tag}: meta frame.objects within ±{FRAME_TOLERANCE}", ok,
+              f"bash={counts[0]} erpc={counts[1]}")
 
     if "out.ndjson" in b_files and "out.ndjson" in e_files:
         counts = []
@@ -89,7 +99,8 @@ for tag in [t for t in b_tags if t in e_tags]:
             with open(os.path.join(d, "out.ndjson")) as f:
                 lines = f.readlines()
             counts.append((len(lines), sum(1 for l in lines if '"frame.objects"' in l or "'frame.objects'" in l)))
-        check(f"{tag}: ndjson counts (total, frame.objects)", counts[0] == counts[1],
+        ok = all(abs(a - b) <= FRAME_TOLERANCE for a, b in zip(counts[0], counts[1]))
+        check(f"{tag}: ndjson counts within ±{FRAME_TOLERANCE} (total, frame.objects)", ok,
               f"bash={counts[0]} erpc={counts[1]}")
 
 for name in ("spike-env.txt", "campaign.log"):

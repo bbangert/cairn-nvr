@@ -52,8 +52,20 @@ defmodule Driver.Campaign do
             )
           end
 
-          log(cfg, "push verified: #{length(artifacts)}/#{length(artifacts)} sha256 match")
-          {:ok, board}
+          # htp_report.py authenticates every latency row against this
+          # file (bench ran THESE bytes); same wildcard listing as bash.
+          case cfg.board.cmd(board, "sha256sum #{cfg.bench_dir}/artifacts-fixed/*.onnx",
+                 timeout: 300_000
+               ) do
+            {out, 0} ->
+              File.mkdir_p!(Config.htp(cfg))
+              File.write!(Path.join(Config.htp(cfg), "pushed.sha256"), out)
+              log(cfg, "push verified: #{length(artifacts)}/#{length(artifacts)} sha256 match")
+              {:ok, board}
+
+            {out, rc} ->
+              {:error, {:pushed_sha_unreadable, rc, out}}
+          end
         end
 
       missing ->
@@ -65,24 +77,29 @@ defmodule Driver.Campaign do
     log(cfg, "== envcheck: nano-parity spike (N=20)")
 
     with :ok <- cfg.board.engine_stop(board, cfg.container),
-         {out, 0} <- cfg.board.cmd(board, cfg.spike_cmd, timeout: @spike_timeout) do
+         {out, rc} <- cfg.board.cmd(board, cfg.spike_cmd, timeout: @spike_timeout) do
+      # Saved on the failure path too — a failing spike's output is
+      # exactly the evidence someone will want (bash fetched it before
+      # FATALing).
       File.mkdir_p!(Config.htp(cfg))
       File.write!(Path.join(Config.htp(cfg), "spike-env.txt"), out)
 
-      case envcheck_verdict(out) do
-        {:pass, line} ->
-          log(cfg, line)
-          {:ok, board}
+      with {:rc, 0} <- {:rc, rc},
+           {:pass, line} <- envcheck_verdict(out) do
+        log(cfg, line)
+        {:ok, board}
+      else
+        {:rc, rc} ->
+          {:error, {:spike_failed, rc, out}}
 
         {:fail, line} ->
           log(cfg, line)
           {:error, :envcheck_failed}
       end
-    else
-      {out, rc} when is_integer(rc) -> {:error, {:spike_failed, rc, out}}
-      {:error, _} = error -> error
     end
   end
+
+  def run(:reboot, board, cfg), do: reboot(board, cfg)
 
   def run(:content, board, cfg) do
     clips = Enum.join(cfg.clips, " ")
@@ -157,9 +174,13 @@ defmodule Driver.Campaign do
                    "MODEL=#{cfg.bench_dir}/artifacts-fixed/#{name}.onnx SAMPLE_FPS=30 PIN_GOVERNOR=1 " <>
                      "sh #{cfg.bench_dir}/bench.sh qnn 60 1 --model-profile #{profile} --input-size #{insize} #{cfg.qnn_flags}"
 
-                 case cfg.board.cmd(b, bench, timeout: @bench_timeout) do
-                   {_, 0} -> {:ok, b}
-                   {_, rc} -> warn_ok(cfg, b, "latency #{name} rc #{rc}")
+                 try do
+                   case cfg.board.cmd(b, bench, timeout: @bench_timeout) do
+                     {_, 0} -> {:ok, b}
+                     {_, rc} -> warn_ok(cfg, b, "latency #{name} rc #{rc}")
+                   end
+                 rescue
+                   e -> warn_ok(cfg, b, "latency #{name} raised #{inspect(e)}")
                  end
                end
              end) do
@@ -171,9 +192,13 @@ defmodule Driver.Campaign do
           "MODEL=#{cfg.bench_dir}/artifacts-fixed/yolox_nano-qdq-a16.onnx SAMPLE_FPS=30 PIN_GOVERNOR=1 " <>
             "sh #{cfg.bench_dir}/bench.sh ort 60 1 --model-profile yolox --input-size 416"
 
-        case cfg.board.cmd(board, anchor, timeout: @bench_timeout) do
-          {_, 0} -> {:ok, board}
-          {_, rc} -> warn_ok(cfg, board, "latency CPU anchor rc #{rc}")
+        try do
+          case cfg.board.cmd(board, anchor, timeout: @bench_timeout) do
+            {_, 0} -> {:ok, board}
+            {_, rc} -> warn_ok(cfg, board, "latency CPU anchor rc #{rc}")
+          end
+        rescue
+          e -> warn_ok(cfg, board, "latency CPU anchor raised #{inspect(e)}")
         end
       end
     end
@@ -325,9 +350,16 @@ defmodule Driver.Campaign do
         "PROFILE=#{profile} INSIZE=#{insize} sh #{cfg.bench_dir}/htp_content_test.sh " <>
           "#{backend} #{model} #{cfg.clip_dir}/clip-#{clip}.mp4 #{tag} #{flags}"
 
-      case cfg.board.cmd(board, run_cmd, timeout: @content_timeout) do
-        {_, 0} -> :ok
-        {_, rc} -> log(cfg, "WARN: #{tag} remote rc #{rc} (checked on fetch)")
+      # WARN-continue on nonzero rc AND on a raise (erpc timeout, node
+      # down mid-call) — bash's `timeout ... || log WARN` treated both
+      # the same way; the run's truth is checked on fetch either way.
+      try do
+        case cfg.board.cmd(board, run_cmd, timeout: @content_timeout) do
+          {_, 0} -> :ok
+          {_, rc} -> log(cfg, "WARN: #{tag} remote rc #{rc} (checked on fetch)")
+        end
+      rescue
+        e -> log(cfg, "WARN: #{tag} run raised #{inspect(e)} (checked on fetch)")
       end
 
       # Fetch each run's evidence immediately: the retry-skip guard reads
@@ -443,7 +475,7 @@ defmodule Driver.Campaign do
 
     with {:list, {out, 0}} <- {:list, cfg.board.cmd(board, "ls #{cfg.bench_dir}/runs")},
          {:marker, {:ok, raw}} <- {:marker, File.read(marker)},
-         {:start, {start, _}} when start > 0 <- {:start, Integer.parse(String.trim(raw))} do
+         {:start, {start, ""}} when start > 0 <- {:start, Integer.parse(String.trim(raw))} do
       runs_dir = Path.join(Config.htp(cfg), "runs")
       File.mkdir_p!(runs_dir)
 

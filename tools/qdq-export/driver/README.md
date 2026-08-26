@@ -1,21 +1,12 @@
-# Driver
+# driver
 
-**TODO: Add description**
+The HTP campaign driver: `Driver.Board` speaks `:erpc` to the board's
+`Vagus.Dist` node, `Driver.Campaign` runs the stages, `Driver.CLI` is
+the entry point. Invocation, stage semantics, and the deprecated bash
+reference are documented in the parent `tools/qdq-export/README.md`
+(board-leg section); the board contract is
+`docs/handoff/vagus-rpc-endpoint.md`.
 
-## Installation
-
-If [available in Hex](https://hex.pm/docs/publish), the package can be installed
-by adding `driver` to your list of dependencies in `mix.exs`:
-
-```elixir
-def deps do
-  [
-    {:driver, "~> 0.1.0"}
-  ]
-end
 ```
-
-Documentation can be generated with [ExDoc](https://github.com/elixir-lang/ex_doc)
-and published on [HexDocs](https://hexdocs.pm). Once published, the docs can
-be found at <https://hexdocs.pm/driver>.
-
+mix test    # :peer-based Board suite + ScriptedBoard stage suite, no board needed
+```

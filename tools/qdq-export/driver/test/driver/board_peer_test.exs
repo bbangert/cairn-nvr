@@ -177,7 +177,7 @@ defmodule Driver.BoardPeerTest do
     :peer.stop(peer2)
   end
 
-  test "reboot refuses a dist bounce that kept the boot id" do
+  test "a dist bounce that kept the boot id is 'not rebooted YET' — polls to the deadline" do
     peer = start_peer()
     session = connect!()
 
@@ -186,7 +186,7 @@ defmodule Driver.BoardPeerTest do
         Board.reboot(session,
           reboot_cmd: "true",
           nodedown_timeout: 10_000,
-          deadline: 30_000,
+          deadline: 3_000,
           interval: 200
         )
       end)
@@ -195,7 +195,44 @@ defmodule Driver.BoardPeerTest do
     :peer.stop(peer)
     peer2 = start_peer()
 
-    assert {:error, :boot_id_unchanged} = Task.await(task, 60_000)
+    assert {:error, :reboot_reconnect_deadline} = Task.await(task, 60_000)
+
+    :peer.stop(peer2)
+  end
+
+  # The defect this pins fired on hardware: campaigns run connect + every
+  # reboot in ONE process, monitor_nodes subscriptions stack, and reboot
+  # N+1 consumed reboot N's duplicate nodedown instantly. So this test
+  # runs both reboots in the test process itself — no fresh-mailbox Task.
+  test "a stale nodedown from an earlier reboot cannot witness the next one",
+       %{boot_path: boot_path} do
+    peer = start_peer()
+    session = connect!()
+
+    bounce =
+      Task.async(fn ->
+        Process.sleep(500)
+        File.write!(boot_path, "boot-B\n")
+        :peer.stop(peer)
+        start_peer()
+      end)
+
+    assert {:ok, fresh} =
+             Board.reboot(session,
+               reboot_cmd: "true",
+               nodedown_timeout: 10_000,
+               deadline: 30_000,
+               interval: 200
+             )
+
+    assert fresh.boot_id == "boot-B"
+    peer2 = Task.await(bounce, 30_000)
+
+    # Board still up; with a drained mailbox the only honest outcome is
+    # "reboot not observed" — a stale duplicate would return instantly
+    # with :reboot_reconnect_deadline instead.
+    assert {:error, :reboot_not_observed} =
+             Board.reboot(fresh, reboot_cmd: "true", nodedown_timeout: 600, deadline: 2_000)
 
     :peer.stop(peer2)
   end
@@ -208,5 +245,43 @@ defmodule Driver.BoardPeerTest do
              Board.reboot(session, reboot_cmd: "true", nodedown_timeout: 500)
 
     :peer.stop(peer)
+  end
+
+  defmodule SeqSsh do
+    @behaviour Driver.Board.Ssh
+
+    # Pops one scripted response per call — the fake for retry-order tests.
+    @impl true
+    def enable(_host), do: Agent.get_and_update(:seq_ssh, fn [h | t] -> {h, t} end)
+  end
+
+  defp start_seq_ssh!(responses) do
+    start_supervised!(%{
+      id: :seq_ssh,
+      start: {Agent, :start_link, [fn -> responses end, [name: :seq_ssh]]}
+    })
+  end
+
+  test "connect retries :starting (bounded) until enable settles" do
+    peer = start_peer()
+
+    start_seq_ssh!([
+      {:ok, "{:error, :starting}\r\n"},
+      {:ok, "{:error, :starting}\r\n"},
+      {:ok, enable_output(@cookie)}
+    ])
+
+    assert {:ok, session} = Board.connect(@host, ssh: SeqSsh)
+    assert session.boot_id == "boot-A"
+    assert Agent.get(:seq_ssh, & &1) == []
+
+    :peer.stop(peer)
+  end
+
+  test "connect never retries or adopts :node_gone" do
+    start_seq_ssh!([{:ok, "{:error, :node_gone}\r\n"}, {:ok, "must never be consumed"}])
+
+    assert {:error, :node_gone} = Board.connect(@host, ssh: SeqSsh)
+    assert length(Agent.get(:seq_ssh, & &1)) == 1
   end
 end

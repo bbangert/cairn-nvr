@@ -173,9 +173,11 @@ defmodule Driver.Board do
   end
 
   @doc """
-  The campaign's final act: reboot and prove the board went DOWN, never
-  reconnect — a reboot is `Vagus.Dist`'s only off switch, so this is
-  what guarantees distribution does not outlive the run.
+  The finish stage's final act: reboot and prove the board went DOWN
+  (mailbox drained first, so the witness is THIS reboot's nodedown),
+  never reconnect — a reboot is `Vagus.Dist`'s only off switch. Only
+  finish-bearing runs call this; a standalone push/fetch leaves
+  distribution enabled until something else reboots (see `Driver.CLI`).
   """
   @spec final_reboot(t(), keyword()) :: :ok | {:error, :reboot_not_observed}
   def final_reboot(%__MODULE__{node: node}, opts \\ []) do
@@ -183,12 +185,24 @@ defmodule Driver.Board do
     reboot_cmd = Keyword.get(opts, :reboot_cmd, "reboot")
 
     :ok = :net_kernel.monitor_nodes(true)
+    # Same stale-message discipline as reboot/2: this witness is what
+    # guarantees distribution died, so it must be THIS reboot's nodedown.
+    flush_node_messages(node)
     :ok = :erpc.cast(node, System, :cmd, ["sh", ["-c", reboot_cmd], []])
 
     receive do
       {:nodedown, ^node} -> :ok
     after
       nodedown_timeout -> {:error, :reboot_not_observed}
+    end
+  end
+
+  defp flush_node_messages(node) do
+    receive do
+      {:nodedown, ^node} -> flush_node_messages(node)
+      {:nodeup, ^node} -> flush_node_messages(node)
+    after
+      0 -> :ok
     end
   end
 
@@ -225,6 +239,11 @@ defmodule Driver.Board do
   a pin restores nothing. The saved file is removed only after a
   readback verifies the restore took, so a failed restore stays
   restorable on the next finish.
+
+  Deliberate divergence from bash: a saved file that EXISTS but is
+  empty errors loudly (bash's finish no-opped it absent a local
+  marker) — an empty save is evidence of a failed capture, and
+  `pin_governor/1`'s `test ! -s` will re-save over it on the next pin.
   """
   @spec restore_governor(t()) ::
           {:ok, {:restored, String.t()} | :nothing_to_restore} | {:error, term()}
@@ -325,6 +344,10 @@ defmodule Driver.Board do
     reboot_cmd = Keyword.get(opts, :reboot_cmd, "reboot")
 
     :ok = :net_kernel.monitor_nodes(true)
+    # Drain stale node messages first (board-measured: an earlier
+    # reboot's duplicate nodedown sat queued and made this receive fire
+    # instantly) — a stale message must never witness THIS reboot.
+    flush_node_messages(node)
     # cast, not call: the connection dies mid-command, so no reply comes.
     :ok = :erpc.cast(node, System, :cmd, ["sh", ["-c", reboot_cmd], []])
 
@@ -371,20 +394,26 @@ defmodule Driver.Board do
         {:ok, fresh}
 
       {:ok, _same_boot} ->
-        # Node down and back with the SAME boot id: distribution bounced
-        # without a reboot. Adopting it would fake a cleared CDSP.
-        {:error, :boot_id_unchanged}
+        # Shutdown grace (board-measured): ssh can still answer and dist
+        # re-enable after nodedown but before the board actually goes
+        # down. Same boot id means "not rebooted YET" — keep polling for
+        # the CHANGE, exactly as bash did; the deadline is the fatal.
+        retry_reconnect(session, deadline_ms, interval)
 
       {:error, :node_gone} ->
         {:error, :node_gone}
 
       {:error, _down_or_starting} ->
-        if monotonic_ms() >= deadline_ms do
-          {:error, :reboot_reconnect_deadline}
-        else
-          Process.sleep(interval)
-          reconnect_after_reboot(session, deadline_ms, interval)
-        end
+        retry_reconnect(session, deadline_ms, interval)
+    end
+  end
+
+  defp retry_reconnect(session, deadline_ms, interval) do
+    if monotonic_ms() >= deadline_ms do
+      {:error, :reboot_reconnect_deadline}
+    else
+      Process.sleep(interval)
+      reconnect_after_reboot(session, deadline_ms, interval)
     end
   end
 

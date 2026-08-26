@@ -65,9 +65,11 @@ defmodule Driver.CampaignStagesTest do
   end
 
   describe "push" do
-    test "pushes script + 12 artifacts when the record agrees", %{cfg: cfg} do
+    test "pushes script + 12 artifacts and records pushed.sha256 for the analyzer",
+         %{cfg: cfg} do
       write_artifacts!(cfg)
-      board = start_board!()
+      pushed_listing = "abc123  #{cfg.bench_dir}/artifacts-fixed/yolox_nano-qdq-a16.onnx\n"
+      board = start_board!(%{cmd: fn _, "sha256sum " <> _, _ -> {pushed_listing, 0} end})
 
       assert {:ok, _} = Campaign.run(:push, board, cfg)
 
@@ -75,6 +77,15 @@ defmodule Driver.CampaignStagesTest do
       assert length(writes) == 13
       assert [{:write!, [_, _, dest]} | _] = writes
       assert dest == Path.join(cfg.bench_dir, "htp_content_test.sh")
+      # htp_report.py authenticates latency rows against this file.
+      assert File.read!(Path.join(Config.htp(cfg), "pushed.sha256")) == pushed_listing
+    end
+
+    test "an unreadable board-side sha listing fails the push", %{cfg: cfg} do
+      write_artifacts!(cfg)
+      board = start_board!(%{cmd: fn _, "sha256sum " <> _, _ -> {"boom", 2} end})
+
+      assert {:error, {:pushed_sha_unreadable, 2, "boom"}} = Campaign.run(:push, board, cfg)
     end
 
     test "refuses up front when a local artifact is missing", %{cfg: cfg} do
@@ -177,6 +188,25 @@ defmodule Driver.CampaignStagesTest do
       board = start_board!()
 
       assert {:error, {:retry_guard_broken, 7, _}} = Campaign.run(:content, board, cfg)
+    end
+
+    test "a run that raises (erpc timeout, node down mid-call) warns and continues",
+         %{cfg: cfg} do
+      System.put_env("FAKE_GUARD_RC", "4")
+      cfg = %{cfg | clips: ["ac86"]}
+
+      board =
+        start_board!(%{
+          cmd: fn
+            _, "sha256sum " <> _, _ -> {"#{cfg.old_nano_sha}  ctl.onnx", 0}
+            _, sh, _ -> if sh =~ "htp_content_test.sh", do: raise("erpc timeout"), else: {"", 0}
+          end
+        })
+
+      # All 14 runs raise; bash's `timeout ... || log WARN` semantics say
+      # the campaign keeps going — the truth is checked on fetch.
+      assert {:ok, _} = Campaign.run(:content, board, cfg)
+      assert length(ScriptedBoard.calls(:engine_stop)) == 14
     end
 
     test "refuses a control that is not the shipped defective nano", %{cfg: cfg} do
@@ -313,11 +343,29 @@ defmodule Driver.CampaignStagesTest do
       assert [{:final_reboot, _}] = ScriptedBoard.calls(:final_reboot)
     end
 
+    test "a stage that RAISES still reaches the finish trap", %{cfg: cfg} do
+      start_board!(%{engine_stop: fn _, _ -> raise "node vanished mid-call" end})
+
+      assert {:error, {{:envcheck, {:raised, %RuntimeError{}}}, _}} =
+               err_with_finish(Driver.CLI.run([:envcheck], cfg))
+
+      assert [{:final_reboot, _}] = ScriptedBoard.calls(:final_reboot)
+    end
+
     test "untrapped stages do not drag finish in", %{cfg: cfg} do
       write_artifacts!(cfg)
       start_board!()
 
       assert :ok = Driver.CLI.run([:push], cfg)
+      assert ScriptedBoard.calls(:final_reboot) == []
+    end
+
+    test "the manual reboot stage runs alone, no trap", %{cfg: cfg} do
+      start_board!()
+
+      assert Driver.CLI.parse(["reboot"]) == {:ok, [:reboot]}
+      assert :ok = Driver.CLI.run([:reboot], cfg)
+      assert length(ScriptedBoard.calls(:reboot)) == 1
       assert ScriptedBoard.calls(:final_reboot) == []
     end
   end
