@@ -162,6 +162,37 @@ defmodule Driver.Board do
   end
 
   @doc """
+  Board-side composition where stdlib M/F/A can't (D2): evaluate a code
+  string on the board with a binding, return the value. Closures cannot
+  cross `:erpc` to a node without the defining module — this can.
+  """
+  @spec eval!(t(), String.t(), keyword(), timeout()) :: term()
+  def eval!(%__MODULE__{node: node}, code, binding \\ [], timeout \\ @cmd_timeout) do
+    {value, _binding} = :erpc.call(node, Code, :eval_string, [code, binding], timeout)
+    value
+  end
+
+  @doc """
+  The campaign's final act: reboot and prove the board went DOWN, never
+  reconnect — a reboot is `Vagus.Dist`'s only off switch, so this is
+  what guarantees distribution does not outlive the run.
+  """
+  @spec final_reboot(t(), keyword()) :: :ok | {:error, :reboot_not_observed}
+  def final_reboot(%__MODULE__{node: node}, opts \\ []) do
+    nodedown_timeout = Keyword.get(opts, :nodedown_timeout, 60_000)
+    reboot_cmd = Keyword.get(opts, :reboot_cmd, "reboot")
+
+    :ok = :net_kernel.monitor_nodes(true)
+    :ok = :erpc.cast(node, System, :cmd, ["sh", ["-c", reboot_cmd], []])
+
+    receive do
+      {:nodedown, ^node} -> :ok
+    after
+      nodedown_timeout -> {:error, :reboot_not_observed}
+    end
+  end
+
+  @doc """
   Pin every CPU governor to `performance`, readback-verified; returns the
   pre-campaign governor. Capture-once semantics live board-side in
   #{@gov_saved} (`test ! -s`, not `-f`: a failed save leaves an EMPTY
