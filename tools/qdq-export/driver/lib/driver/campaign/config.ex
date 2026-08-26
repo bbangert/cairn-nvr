@@ -19,7 +19,14 @@ defmodule Driver.Campaign.Config do
               "--qnn-library /data/qnn-spike/lib/libonnxruntime_providers_qnn.so " <>
                 "--qnn-soc-model 35 --qnn-htp-arch 68",
             old_nano_sha: @old_nano_sha,
-            ssh: Driver.Board.Ssh.Cmd
+            ssh: Driver.Board.Ssh.Cmd,
+            # Test seams: stage logic runs against a scripted board module
+            # and relocated board paths; defaults are the real thing.
+            board: Driver.Board,
+            bench_dir: "/data/cairn-bench",
+            clip_dir: "/data",
+            spike_cmd: "sh /data/qnn-spike/run_spike.sh 20",
+            reboot_opts: []
 
   @type t :: %__MODULE__{}
 

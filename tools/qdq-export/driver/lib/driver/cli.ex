@@ -12,7 +12,6 @@ defmodule Driver.CLI do
 
   require Logger
 
-  alias Driver.Board
   alias Driver.Campaign
   alias Driver.Campaign.Config
 
@@ -54,7 +53,7 @@ defmodule Driver.CLI do
   @doc "Run stages in order on one session; the finish trap when due."
   @spec run([atom()], Config.t()) :: :ok | {:error, term()}
   def run(stages, cfg) do
-    with {:ok, board} <- Board.connect(cfg.host, ssh: cfg.ssh) do
+    with {:ok, board} <- cfg.board.connect(cfg.host, ssh: cfg.ssh) do
       case run_stages(stages, board, cfg) do
         {:ok, _board, _finish_ran = true} ->
           :ok
@@ -77,7 +76,7 @@ defmodule Driver.CLI do
 
   defp run_stages(stages, board, cfg) do
     Enum.reduce_while(stages, {:ok, board, false}, fn stage, {:ok, b, _} ->
-      with {:ok, b} <- Board.ensure_session(b),
+      with {:ok, b} <- cfg.board.ensure_session(b),
            {:ok, b} <- Campaign.run(stage, b, cfg) do
         Campaign.log(cfg, "stage #{stage} done")
         {:cont, {:ok, b, stage == :finish}}
@@ -88,7 +87,7 @@ defmodule Driver.CLI do
   end
 
   defp run_finish(board, cfg) do
-    with {:ok, board} <- Board.ensure_session(board),
+    with {:ok, board} <- cfg.board.ensure_session(board),
          {:ok, _board} <- Campaign.run(:finish, board, cfg) do
       Campaign.log(cfg, "stage finish done")
       :ok

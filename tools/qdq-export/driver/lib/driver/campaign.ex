@@ -40,13 +40,13 @@ defmodule Driver.Campaign do
     case Enum.reject([script | artifacts], &File.exists?/1) do
       [] ->
         with :ok <- verify_against_record(cfg, artifacts) do
-          Board.write!(board, script, "/data/cairn-bench/htp_content_test.sh")
+          cfg.board.write!(board, script, Path.join(cfg.bench_dir, "htp_content_test.sh"))
 
           for artifact <- artifacts do
-            Board.write!(
+            cfg.board.write!(
               board,
               artifact,
-              "/data/cairn-bench/artifacts-fixed/#{Path.basename(artifact)}"
+              Path.join([cfg.bench_dir, "artifacts-fixed", Path.basename(artifact)])
             )
           end
 
@@ -62,9 +62,8 @@ defmodule Driver.Campaign do
   def run(:envcheck, board, cfg) do
     log(cfg, "== envcheck: nano-parity spike (N=20)")
 
-    with :ok <- Board.engine_stop(board, cfg.container),
-         {out, 0} <-
-           Board.cmd(board, "sh /data/qnn-spike/run_spike.sh 20", timeout: @spike_timeout) do
+    with :ok <- cfg.board.engine_stop(board, cfg.container),
+         {out, 0} <- cfg.board.cmd(board, cfg.spike_cmd, timeout: @spike_timeout) do
       File.mkdir_p!(Config.htp(cfg))
       File.write!(Path.join(Config.htp(cfg), "spike-env.txt"), out)
 
@@ -101,7 +100,7 @@ defmodule Driver.Campaign do
                b,
                cfg,
                "qnn",
-               "/data/cairn-bench/artifacts-fixed/#{name}.onnx",
+               "#{cfg.bench_dir}/artifacts-fixed/#{name}.onnx",
                name,
                profile,
                insize,
@@ -114,7 +113,7 @@ defmodule Driver.Campaign do
              board,
              cfg,
              "ort",
-             "/data/cairn-bench/artifacts-fixed/yolox_nano-qdq-a16.onnx",
+             "#{cfg.bench_dir}/artifacts-fixed/yolox_nano-qdq-a16.onnx",
              "yolox_nano-qdq-a16",
              "yolox",
              416,
@@ -127,7 +126,7 @@ defmodule Driver.Campaign do
         board,
         cfg,
         "qnn",
-        "/data/cairn-bench/yolox_nano-qdq-a16.onnx",
+        "#{cfg.bench_dir}/yolox_nano-qdq-a16.onnx",
         "control-old-nano-a16",
         "yolox",
         416,
@@ -141,7 +140,7 @@ defmodule Driver.Campaign do
 
     with {:ok, board} <- reboot(board, cfg),
          {:ok, board} <- pin_governor(board, cfg),
-         {:ok, start} <- board_epoch(board) do
+         {:ok, start} <- board_epoch(cfg, board) do
       # Board-sourced, not local date: run-dir timestamps this filters
       # against are board-generated, and the clocks disagree.
       File.mkdir_p!(Config.htp(cfg))
@@ -149,14 +148,14 @@ defmodule Driver.Campaign do
 
       with {:ok, board} <-
              reduce_rungs(board, fn {name, profile, insize}, b ->
-               with :ok <- Board.engine_stop(b, cfg.container) do
+               with :ok <- cfg.board.engine_stop(b, cfg.container) do
                  log(cfg, "latency #{name} qnn 60s")
 
                  bench =
-                   "MODEL=/data/cairn-bench/artifacts-fixed/#{name}.onnx SAMPLE_FPS=30 PIN_GOVERNOR=1 " <>
-                     "sh /data/cairn-bench/bench.sh qnn 60 1 --model-profile #{profile} --input-size #{insize} #{cfg.qnn_flags}"
+                   "MODEL=#{cfg.bench_dir}/artifacts-fixed/#{name}.onnx SAMPLE_FPS=30 PIN_GOVERNOR=1 " <>
+                     "sh #{cfg.bench_dir}/bench.sh qnn 60 1 --model-profile #{profile} --input-size #{insize} #{cfg.qnn_flags}"
 
-                 case Board.cmd(b, bench, timeout: @bench_timeout) do
+                 case cfg.board.cmd(b, bench, timeout: @bench_timeout) do
                    {_, 0} -> {:ok, b}
                    {_, rc} -> warn_ok(cfg, b, "latency #{name} rc #{rc}")
                  end
@@ -167,10 +166,10 @@ defmodule Driver.Campaign do
         log(cfg, "latency yolox_nano-qdq-a16 ort 60s (CPU anchor)")
 
         anchor =
-          "MODEL=/data/cairn-bench/artifacts-fixed/yolox_nano-qdq-a16.onnx SAMPLE_FPS=30 PIN_GOVERNOR=1 " <>
-            "sh /data/cairn-bench/bench.sh ort 60 1 --model-profile yolox --input-size 416"
+          "MODEL=#{cfg.bench_dir}/artifacts-fixed/yolox_nano-qdq-a16.onnx SAMPLE_FPS=30 PIN_GOVERNOR=1 " <>
+            "sh #{cfg.bench_dir}/bench.sh ort 60 1 --model-profile yolox --input-size 416"
 
-        case Board.cmd(board, anchor, timeout: @bench_timeout) do
+        case cfg.board.cmd(board, anchor, timeout: @bench_timeout) do
           {_, 0} -> {:ok, board}
           {_, rc} -> warn_ok(cfg, board, "latency CPU anchor rc #{rc}")
         end
@@ -183,7 +182,7 @@ defmodule Driver.Campaign do
     content_dir = Path.join(Config.htp(cfg), "content")
     File.mkdir_p!(content_dir)
 
-    case fetch_dir(board, "/data/cairn-bench/content", content_dir) do
+    case fetch_dir(cfg, board, Path.join(cfg.bench_dir, "content"), content_dir) do
       :ok -> :ok
       {:error, reason} -> log(cfg, "WARN: content fetch incomplete: #{inspect(reason)}")
     end
@@ -204,7 +203,7 @@ defmodule Driver.Campaign do
     # Cleanup failures must propagate: a green campaign that leaves the
     # board pinned to performance or the production NVR down is not green.
     gov_result =
-      case Board.restore_governor(board) do
+      case cfg.board.restore_governor(board) do
         {:ok, {:restored, gov}} ->
           File.rm(pinned_marker)
           log(cfg, "governor restored to #{gov}")
@@ -223,7 +222,7 @@ defmodule Driver.Campaign do
       end
 
     engine_result =
-      case Board.engine_start(board, cfg.container) do
+      case cfg.board.engine_start(board, cfg.container) do
         :ok ->
           log(cfg, "cairn container back up")
           :ok
@@ -236,7 +235,7 @@ defmodule Driver.Campaign do
     # Runs even when cleanup failed: distribution must not outlive the
     # campaign either way, and the supervisor restarts the addon on boot.
     reboot_result =
-      case Board.final_reboot(board) do
+      case cfg.board.final_reboot(board, cfg.reboot_opts) do
         :ok ->
           log(cfg, "board rebooting — distribution off, CDSP clean")
           :ok
@@ -317,14 +316,14 @@ defmodule Driver.Campaign do
 
   defp content_run_one(board, cfg, backend, model, tag, profile, insize, flags, clip) do
     with {:ok, board} <- charge_qnn_budget(board, cfg, backend, tag),
-         :ok <- Board.engine_stop(board, cfg.container) do
+         :ok <- cfg.board.engine_stop(board, cfg.container) do
       log(cfg, "content #{tag}: running")
 
       run_cmd =
-        "PROFILE=#{profile} INSIZE=#{insize} sh /data/cairn-bench/htp_content_test.sh " <>
-          "#{backend} #{model} /data/clip-#{clip}.mp4 #{tag} #{flags}"
+        "PROFILE=#{profile} INSIZE=#{insize} sh #{cfg.bench_dir}/htp_content_test.sh " <>
+          "#{backend} #{model} #{cfg.clip_dir}/clip-#{clip}.mp4 #{tag} #{flags}"
 
-      case Board.cmd(board, run_cmd, timeout: @content_timeout) do
+      case cfg.board.cmd(board, run_cmd, timeout: @content_timeout) do
         {_, 0} -> :ok
         {_, rc} -> log(cfg, "WARN: #{tag} remote rc #{rc} (checked on fetch)")
       end
@@ -335,7 +334,7 @@ defmodule Driver.Campaign do
       local = Path.join([Config.htp(cfg), "content", tag])
       File.mkdir_p!(local)
 
-      case fetch_dir(board, "/data/cairn-bench/content/#{tag}", local) do
+      case fetch_dir(cfg, board, "#{cfg.bench_dir}/content/#{tag}", local) do
         :ok -> :ok
         {:error, reason} -> log(cfg, "WARN: #{tag} evidence fetch failed: #{inspect(reason)}")
       end
@@ -393,7 +392,7 @@ defmodule Driver.Campaign do
   end
 
   defp verify_control_bytes(board, cfg) do
-    case Board.cmd(board, "sha256sum /data/cairn-bench/yolox_nano-qdq-a16.onnx") do
+    case cfg.board.cmd(board, "sha256sum #{cfg.bench_dir}/yolox_nano-qdq-a16.onnx") do
       {out, 0} ->
         if String.contains?(out, cfg.old_nano_sha),
           do: :ok,
@@ -440,7 +439,7 @@ defmodule Driver.Campaign do
   defp fetch_bench_runs(board, cfg) do
     marker = Path.join(Config.htp(cfg), ".latency-start")
 
-    with {:list, {out, 0}} <- {:list, Board.cmd(board, "ls /data/cairn-bench/runs")},
+    with {:list, {out, 0}} <- {:list, cfg.board.cmd(board, "ls #{cfg.bench_dir}/runs")},
          {:marker, {:ok, raw}} <- {:marker, File.read(marker)},
          {:start, {start, _}} when start > 0 <- {:start, Integer.parse(String.trim(raw))} do
       runs_dir = Path.join(Config.htp(cfg), "runs")
@@ -453,7 +452,7 @@ defmodule Driver.Campaign do
         local = Path.join(runs_dir, dir)
         File.mkdir_p!(local)
 
-        case fetch_dir(board, "/data/cairn-bench/runs/#{dir}", local) do
+        case fetch_dir(cfg, board, "#{cfg.bench_dir}/runs/#{dir}", local) do
           :ok -> :ok
           {:error, reason} -> log(cfg, "WARN: run #{dir} fetch failed: #{inspect(reason)}")
         end
@@ -479,9 +478,9 @@ defmodule Driver.Campaign do
   # Whole-file reads mirrored into the local tree — never streamed
   # through a term printer. Listing rides eval! (D2): one round trip,
   # no board-side `find` (the busybox applet set shrank once already).
-  defp fetch_dir(board, remote, local) do
+  defp fetch_dir(cfg, board, remote, local) do
     listing =
-      Board.eval!(
+      cfg.board.eval!(
         board,
         ~s[dir |> Path.join("**") |> Path.wildcard() |> Enum.map(fn p -> {p, File.dir?(p)} end)],
         dir: remote
@@ -495,7 +494,7 @@ defmodule Driver.Campaign do
         File.mkdir_p!(dest)
       else
         File.mkdir_p!(Path.dirname(dest))
-        File.write!(dest, Board.read!(board, path, 120_000))
+        File.write!(dest, cfg.board.read!(board, path, 120_000))
       end
     end
 
@@ -516,18 +515,18 @@ defmodule Driver.Campaign do
   defp reboot(board, cfg) do
     log(cfg, "== reboot: clearing CDSP session-leak state")
 
-    with {:ok, fresh} <- Board.reboot(board) do
+    with {:ok, fresh} <- cfg.board.reboot(board, cfg.reboot_opts) do
       # HA's supervisor autostarts the addon on boot; give it a moment so
       # engine_stop sees (and stops) the running container rather than
       # racing its startup.
-      Process.sleep(30_000)
+      Process.sleep(Keyword.get(cfg.reboot_opts, :settle_ms, 30_000))
       log(cfg, "board back with a new boot id")
       {:ok, fresh}
     end
   end
 
   defp pin_governor(board, cfg) do
-    case Board.pin_governor(board) do
+    case cfg.board.pin_governor(board) do
       {:ok, saved} ->
         # The local marker records that THIS campaign pinned: finish uses
         # it to distinguish "nothing to restore" from "saved value gone".
@@ -541,8 +540,8 @@ defmodule Driver.Campaign do
     end
   end
 
-  defp board_epoch(board) do
-    case Board.cmd(board, "date +%s") do
+  defp board_epoch(cfg, board) do
+    case cfg.board.cmd(board, "date +%s") do
       {out, 0} ->
         case Integer.parse(String.trim(out)) do
           {epoch, ""} -> {:ok, epoch}
