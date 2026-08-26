@@ -70,6 +70,29 @@ jobs:
       - name: Full-pipeline integration test (real ffmpeg)
         run: mix test --only integration
 
+  campaign-driver:
+    name: HTP campaign driver (mix test)
+    runs-on: ubuntu-latest
+    # Standalone mix project, no deps: the :peer suite exercises real
+    # distribution locally (test_helper starts epmd + a longnames node
+    # on 127.0.0.1), the stage suite runs against a scripted board.
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20"
+          otp-version: "28"
+
+      - run: mix compile --warnings-as-errors
+        working-directory: tools/qdq-export/driver
+
+      - run: mix format --check-formatted
+        working-directory: tools/qdq-export/driver
+
+      - run: mix test
+        working-directory: tools/qdq-export/driver
+
   cairn-detect:
     name: Rust · Format · Clippy · Test · Release build
     runs-on: ubuntu-latest

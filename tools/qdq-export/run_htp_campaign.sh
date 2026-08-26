@@ -1,4 +1,12 @@
 #!/bin/bash
+# DEPRECATED: the campaign driver is now the Elixir/:erpc one in
+# driver/ (`cd driver && mix run -e 'Driver.CLI.main(System.argv())' -- all`),
+# which deletes this file's transport workarounds (remote_verified's
+# nonce/digest protocol, fetch()'s existence checks, the ~c|...| no-pipes
+# rule) by speaking Erlang distribution via Vagus.Dist. This script is
+# kept as the behavior-parity reference (run_parity_slice.sh diffs the
+# two) until the first FULL campaign has run on :erpc — then it can go.
+#
 # HTP verification campaign driver (phase 3 of the qdq-reexport plan).
 # Runs from the dev container against the board; every on-board step is
 # self-logging and every artifact of evidence is fetched back under
