@@ -314,6 +314,19 @@ defmodule Driver.CampaignStagesTest do
       assert [{:final_reboot, _}] = ScriptedBoard.calls(:final_reboot)
     end
 
+    test "a pin marker that cannot be removed fails the finish", %{cfg: cfg} do
+      # A directory at the marker path defeats File.rm the same way a
+      # permission failure would, without breaking the campaign log.
+      File.mkdir_p!(Path.join(Config.htp(cfg), ".gov-pinned"))
+
+      board = start_board!(%{restore_governor: fn _ -> {:ok, {:restored, "schedutil"}} end})
+
+      assert {:error, {:finish_incomplete, [{:gov_marker_rm, _, reason}]}} =
+               Campaign.run(:finish, board, cfg)
+
+      assert reason in [:eperm, :eisdir]
+    end
+
     test "without a pin marker, nothing-to-restore is the no-op path", %{cfg: cfg} do
       board = start_board!()
       assert {:ok, _} = Campaign.run(:finish, board, cfg)

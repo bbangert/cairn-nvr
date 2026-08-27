@@ -232,15 +232,16 @@ defmodule Driver.Campaign do
     gov_result =
       case cfg.board.restore_governor(board) do
         {:ok, {:restored, gov}} ->
+          log(cfg, "governor restored to #{gov}")
+
           # A surviving marker would make the NEXT finish misreport
-          # "pinned but nothing saved" — surface the rm failure.
+          # "pinned but nothing saved" — a failed rm is a cleanup
+          # failure like any other and joins :finish_incomplete.
           case File.rm(pinned_marker) do
             :ok -> :ok
-            {:error, reason} -> log(cfg, "WARN: could not remove #{pinned_marker}: #{reason}")
+            {:error, :enoent} -> :ok
+            {:error, reason} -> {:error, {:gov_marker_rm, pinned_marker, reason}}
           end
-
-          log(cfg, "governor restored to #{gov}")
-          :ok
 
         {:ok, :nothing_to_restore} ->
           # This campaign pinned (local marker) yet the board has nothing
