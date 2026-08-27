@@ -150,9 +150,11 @@ Three checks, and only the third can see everything.
   off, CDSP clean), on the success and failure paths alike. Two built-in
   controls: a board CPU-EP run (ties board decode to the local
   reference) and the shipped defective nano, which must FAIL or the
-  test has lost its sensitivity. The deprecated `run_htp_campaign.sh`
-  is the behavior-parity reference (`run_parity_slice.sh` diffs the two
-  drivers' evidence) until the first full `:erpc` campaign retires it.
+  test has lost its sensitivity. The bash `run_htp_campaign.sh` this
+  driver replaced was retired after the first full `:erpc` campaign
+  reproduced its behavior (parity verdict on a same-boot slice, then a
+  clean 12-rung × 3-clip campaign — all rungs PASS, both controls
+  correct).
 
 ## Alternatives considered
 
