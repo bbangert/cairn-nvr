@@ -197,6 +197,10 @@ defmodule Driver.Board do
     end
   end
 
+  # Subscriptions stack across connect/reboot calls on this process, so
+  # each node event can deliver duplicates — draining here is what keeps
+  # that harmless. Matching ^node only is deliberate: this is a
+  # single-board topology, no other node's messages can arrive.
   defp flush_node_messages(node) do
     receive do
       {:nodedown, ^node} -> flush_node_messages(node)

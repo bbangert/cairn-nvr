@@ -352,6 +352,39 @@ defmodule Driver.CampaignStagesTest do
       assert [{:final_reboot, _}] = ScriptedBoard.calls(:final_reboot)
     end
 
+    test "a SUCCESSFUL trapped stage also ends in finish (bash trap parity)", %{cfg: cfg} do
+      System.put_env("FAKE_GUARD_RC", "0")
+      cfg = %{cfg | clips: ["ac86"]}
+
+      start_board!(%{
+        cmd: fn _, sh, _ ->
+          if sh =~ "sha256sum", do: {"#{cfg.old_nano_sha}  ctl.onnx", 0}, else: {"", 0}
+        end,
+        # content pins, so finish must actually restore or it (rightly) fails.
+        restore_governor: fn _ -> {:ok, {:restored, "schedutil"}} end
+      })
+
+      assert :ok = Driver.CLI.run([:content], cfg)
+      assert [{:final_reboot, _}] = ScriptedBoard.calls(:final_reboot)
+    end
+
+    test "a failing stage halts the remaining stages", %{cfg: cfg} do
+      write_artifacts!(cfg)
+      # envcheck fails (engine unreadable) — content/latency/fetch must not run.
+      start_board!(%{
+        engine_stop: fn _, _ -> {:error, :engine_unreadable} end,
+        cmd: fn _, "sha256sum " <> _, _ -> {"ok", 0} end
+      })
+
+      assert {:error, _} = Driver.CLI.run(Driver.Campaign.stages(), cfg)
+
+      refute Enum.any?(ScriptedBoard.calls(:cmd), fn {:cmd, [_, sh, _]} ->
+               sh =~ "htp_content_test.sh" or sh =~ "bench.sh"
+             end)
+
+      assert [{:final_reboot, _}] = ScriptedBoard.calls(:final_reboot)
+    end
+
     test "untrapped stages do not drag finish in", %{cfg: cfg} do
       write_artifacts!(cfg)
       start_board!()

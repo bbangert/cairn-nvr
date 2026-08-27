@@ -232,7 +232,13 @@ defmodule Driver.Campaign do
     gov_result =
       case cfg.board.restore_governor(board) do
         {:ok, {:restored, gov}} ->
-          File.rm(pinned_marker)
+          # A surviving marker would make the NEXT finish misreport
+          # "pinned but nothing saved" — surface the rm failure.
+          case File.rm(pinned_marker) do
+            :ok -> :ok
+            {:error, reason} -> log(cfg, "WARN: could not remove #{pinned_marker}: #{reason}")
+          end
+
           log(cfg, "governor restored to #{gov}")
           :ok
 
@@ -380,24 +386,18 @@ defmodule Driver.Campaign do
   defp charge_qnn_budget(board, _cfg, "ort", _tag), do: {:ok, board}
 
   defp charge_qnn_budget(board, cfg, "qnn", tag) do
-    board =
-      if board.qnn_sessions >= cfg.qnn_session_budget do
-        log(
-          cfg,
-          "QNN session budget (#{cfg.qnn_session_budget}) reached — rebooting before #{tag}"
-        )
+    if board.qnn_sessions >= cfg.qnn_session_budget do
+      log(
+        cfg,
+        "QNN session budget (#{cfg.qnn_session_budget}) reached — rebooting before #{tag}"
+      )
 
-        case reboot(board, cfg) do
-          {:ok, fresh} -> fresh
-          {:error, _} = error -> throw(error)
-        end
-      else
-        board
+      with {:ok, fresh} <- reboot(board, cfg) do
+        {:ok, %{fresh | qnn_sessions: fresh.qnn_sessions + 1}}
       end
-
-    {:ok, %{board | qnn_sessions: board.qnn_sessions + 1}}
-  catch
-    {:error, _} = error -> error
+    else
+      {:ok, %{board | qnn_sessions: board.qnn_sessions + 1}}
+    end
   end
 
   # rc 4 = "not current, rerun" — its own code, because 1 belongs to the

@@ -16,7 +16,8 @@ defmodule Driver.BoardTest do
 
   test "parse_enable accepts an atom-inspected cookie" do
     raw = ~s({:ok, %{cookie: :"#{@cookie}", node: :"vagus@192.168.2.87"}}\r\n)
-    assert {:ok, %{cookie: _}} = Driver.Board.parse_enable(raw)
+    assert {:ok, %{cookie: cookie}} = Driver.Board.parse_enable(raw)
+    assert cookie == String.to_existing_atom(@cookie)
   end
 
   test "parse_enable surfaces the module contract's errors" do
