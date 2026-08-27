@@ -36,7 +36,9 @@ defmodule Driver.CLI do
         end
 
       {:error, message} ->
-        raise ArgumentError, message
+        # Usage error, not a crash: stderr + exit 2, no stacktrace.
+        :io.put_chars(:standard_error, message <> "\n")
+        System.halt(2)
     end
   end
 
