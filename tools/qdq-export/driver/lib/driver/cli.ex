@@ -1,6 +1,6 @@
 defmodule Driver.CLI do
   @moduledoc """
-  Entry point; stage arguments identical to the bash driver's:
+  Entry point; stage arguments identical to the retired bash driver's:
 
       mix run -e 'Driver.CLI.main(System.argv())' -- [all|push|envcheck|content|latency|fetch|finish|reboot]
 

@@ -170,9 +170,16 @@ defmodule Driver.Campaign do
                with :ok <- cfg.board.engine_stop(b, cfg.container) do
                  log(cfg, "latency #{name} qnn 60s")
 
+                 # The trailing redirect is load-bearing: bench.sh leaves an
+                 # orphan holding stdout, and System.cmd returns on port EOF,
+                 # not shell exit — without it every bench sits out the full
+                 # 200s timeout (board-measured: 62s real vs 200s waited).
+                 # bench.sh self-logs to runs/, so the output was discarded
+                 # under bash too.
                  bench =
                    "MODEL=#{cfg.bench_dir}/artifacts-fixed/#{name}.onnx SAMPLE_FPS=30 PIN_GOVERNOR=1 " <>
-                     "sh #{cfg.bench_dir}/bench.sh qnn 60 1 --model-profile #{profile} --input-size #{insize} #{cfg.qnn_flags}"
+                     "sh #{cfg.bench_dir}/bench.sh qnn 60 1 --model-profile #{profile} --input-size #{insize} #{cfg.qnn_flags}" <>
+                     " > /dev/null 2>&1"
 
                  try do
                    case cfg.board.cmd(b, bench, timeout: @bench_timeout) do
@@ -188,9 +195,10 @@ defmodule Driver.Campaign do
         # it detects whole-session CPU fallback.
         log(cfg, "latency yolox_nano-qdq-a16 ort 60s (CPU anchor)")
 
+        # Same load-bearing redirect as the rung benches above.
         anchor =
           "MODEL=#{cfg.bench_dir}/artifacts-fixed/yolox_nano-qdq-a16.onnx SAMPLE_FPS=30 PIN_GOVERNOR=1 " <>
-            "sh #{cfg.bench_dir}/bench.sh ort 60 1 --model-profile yolox --input-size 416"
+            "sh #{cfg.bench_dir}/bench.sh ort 60 1 --model-profile yolox --input-size 416 > /dev/null 2>&1"
 
         try do
           case cfg.board.cmd(board, anchor, timeout: @bench_timeout) do

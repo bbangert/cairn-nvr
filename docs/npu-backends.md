@@ -188,7 +188,8 @@ leg** — an on-board score-distribution comparison on real clip content,
 with the CPU-EP numbers as the reference (acceptance: HTP ≈ CPU;
 per-frame person-window median ratio ≥ 0.9, no plateau, no uniform
 depression — each failure shape is one defect class's signature). The
-campaign vehicle is `tools/qdq-export/run_htp_campaign.sh` →
+campaign vehicle is the Elixir driver in `tools/qdq-export/driver/`
+(`Driver.CLI` over `:erpc`; invocation in the qdq-export README) →
 `htp_content_test.sh` (plugin-first, feed once — looped feeds wrap pts
 and invalidate window analysis) → `htp_report.py`, gated by a
 nano-parity check of the bench env against the phase-0 spike numbers.
