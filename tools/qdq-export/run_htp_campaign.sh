@@ -1,4 +1,12 @@
 #!/bin/bash
+# DEPRECATED: the campaign driver is now the Elixir/:erpc one in
+# driver/ (`cd driver && mix run -e 'Driver.CLI.main(System.argv())' -- all`),
+# which deletes this file's transport workarounds (remote_verified's
+# nonce/digest protocol, fetch()'s existence checks, the ~c|...| no-pipes
+# rule) by speaking Erlang distribution via Vagus.Dist. This script is
+# kept as the behavior-parity reference (run_parity_slice.sh diffs the
+# two) until the first FULL campaign has run on :erpc — then it can go.
+#
 # HTP verification campaign driver (phase 3 of the qdq-reexport plan).
 # Runs from the dev container against the board; every on-board step is
 # self-logging and every artifact of evidence is fetched back under
@@ -96,7 +104,9 @@ remote_verified() { # <timeout-secs> <tag> <local-dest> <command..., no pipes>
 # The 12 board-worthy rungs (phase 2.3 verdicts): every a16 plus the
 # three a8 survivors. name:profile:insize; raw yolo26/yolov8 heads
 # decode under the yolov8 profile (the bundled binary's contract).
-RUNGS="
+# Env-overridable for parity slices (run_parity_slice.sh) only — a real
+# campaign runs the full table.
+RUNGS=${RUNGS:-"
 yolox_nano-qdq-a16:yolox:416
 yolox_tiny-qdq-a16:yolox:416
 yolox_tiny-qdq-a8:yolox:416
@@ -109,7 +119,7 @@ yolo26n-416-qdq-a16:yolov8:416
 yolo26s-qdq-a16:yolov8:640
 yolo26m-qdq-a16:yolov8:640
 yolov8n-qdq-a16:yolov8:640
-"
+"}
 
 engine_state() { # writes container names to $1 (local file)
   # A failed ps would redirect its error into the file, contain no
