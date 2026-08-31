@@ -87,7 +87,8 @@ defmodule Cairn.PipelineOwner do
             restart_reason: :started,
             # init_seen gates :running on an init segment carrying the main
             # stream's current epoch; got_fragment makes the transition once
-            # per pipeline
+            # per SESSION — each matching init re-arms it, so a reconnect the
+            # pipeline survives can earn :running back
             init_seen: false,
             got_fragment: false,
             # what each source last told us about its role's stream
@@ -201,7 +202,13 @@ defmodule Cairn.PipelineOwner do
   # fragment-based :running transition to the pipeline that is running *now*.
   def handle_info({:init_segment, %{epoch: epoch}}, state) do
     if StreamEpochs.current({state.camera.id, :main}) == {:ok, epoch} do
-      {:noreply, %{state | init_seen: true}}
+      # `got_fragment` re-arms per SESSION, not once per pipeline: a reconnect
+      # the pipeline survives (a bridge respawn, an rtsp session reconnect)
+      # puts :connecting back on the badge, and this init is how the ring
+      # announces the session that can earn :running again. One-shot per
+      # pipeline, the badge latches "Connecting" over a healthy camera until
+      # the next full rebuild.
+      {:noreply, %{state | init_seen: true, got_fragment: false}}
     else
       {:noreply, state}
     end
@@ -209,7 +216,11 @@ defmodule Cairn.PipelineOwner do
 
   def handle_info({:fragment, _frag}, %{init_seen: true, got_fragment: false} = state)
       when state.pipeline != nil do
-    state = set_status(state, :running)
+    # Past `set_status/2`'s dedupe on purpose: on a bridge camera the
+    # :connecting this corrects was written by `Cairn.FFmpegPort`, which this
+    # process's cache never saw — a deduped write would no-op on a stale
+    # :running of its own and leave the table wrong.
+    state = force_status(state, :running)
     {:noreply, %{state | got_fragment: true, backoff_ms: backoff_min(state)}}
   end
 
@@ -560,8 +571,11 @@ defmodule Cairn.PipelineOwner do
   end
 
   defp set_status(%{status: status} = state, status), do: state
+  defp set_status(state, status), do: force_status(state, status)
 
-  defp set_status(state, status) do
+  # The dedupe-free write, for the one transition whose stale table entry can
+  # be another writer's (the fragment -> :running edge).
+  defp force_status(state, status) do
     status_fun = Keyword.get(state.opts, :status_fun, &CameraStatus.set/2)
     status_fun.(state.camera.id, status)
     %{state | status: status}

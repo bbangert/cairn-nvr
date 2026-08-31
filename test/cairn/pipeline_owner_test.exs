@@ -245,6 +245,61 @@ defmodule Cairn.PipelineOwnerTest do
       Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:fragment, :whatever})
       assert_receive {:status, ^id, :running}, 2_000
     end
+
+    test "a reconnect the pipeline survives re-earns :running from its new session" do
+      cam = camera(uid("pt"), ingest: :rtsp)
+      owner = start_owner(cam)
+      id = cam.id
+
+      assert_receive {:status, ^id, :connecting}, 2_000
+      assert_receive {:pipeline_started, _pipeline, _opts}, 2_000
+
+      topic = RingBuffer.topic(id)
+      epoch = StreamEpochs.new_epoch(id, :started)
+      Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:init_segment, %{epoch: epoch}})
+      Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:fragment, :whatever})
+      assert_receive {:status, ^id, :running}, 2_000
+
+      # The camera blips and the source reconnects with the pipeline intact —
+      # the designed reconnect path. The badge honestly reads :connecting…
+      send(owner, {:stream_backoff, :main, :econnrefused})
+      assert_receive {:status, ^id, :backoff}, 2_000
+      send(owner, {:stream_connected, :main, []})
+      assert_receive {:status, ^id, :connecting}, 2_000
+
+      # …and the reconnected session's own init + first fragment earn it
+      # back. Latched, this is the stuck-Connecting badge: nothing short of a
+      # full rebuild could say :running again.
+      epoch2 = StreamEpochs.new_epoch(id, :reconnected)
+      Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:init_segment, %{epoch: epoch2}})
+      Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:fragment, :whatever})
+      assert_receive {:status, ^id, :running}, 2_000
+    end
+
+    test ":running is re-written even when this process never left it" do
+      # The bridge spelling of the same defect: `Cairn.FFmpegPort` writes
+      # :connecting straight to the table on a respawn, so the owner's own
+      # cached status never changed — a write deduped on that cache would
+      # no-op and leave the table wrong. The harness sees every write, so a
+      # SECOND :running arriving at all is the assertion.
+      cam = camera(uid("pt"), ingest: :rtsp)
+      _owner = start_owner(cam)
+      id = cam.id
+
+      assert_receive {:status, ^id, :connecting}, 2_000
+      assert_receive {:pipeline_started, _pipeline, _opts}, 2_000
+
+      topic = RingBuffer.topic(id)
+      epoch = StreamEpochs.new_epoch(id, :started)
+      Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:init_segment, %{epoch: epoch}})
+      Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:fragment, :whatever})
+      assert_receive {:status, ^id, :running}, 2_000
+
+      epoch2 = StreamEpochs.new_epoch(id, :reconnected)
+      Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:init_segment, %{epoch: epoch2}})
+      Phoenix.PubSub.broadcast(Cairn.PubSub, topic, {:fragment, :whatever})
+      assert_receive {:status, ^id, :running}, 2_000
+    end
   end
 
   describe "the watchdog" do
