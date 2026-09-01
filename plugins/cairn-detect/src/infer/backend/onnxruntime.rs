@@ -348,23 +348,30 @@ impl Backend for QnnBackend {
         // flag: the CPU EP itself always exists, and its `use_arena`
         // defaults false — appending it after the QNN devices changes no
         // node-assignment priority.
-        let session = Session::builder()
-            .map_err(|e| anyhow!("creating an onnxruntime session builder: {e}"))?
-            .with_intra_threads(1)
-            .map_err(|e| anyhow!("limiting intra-op threads: {e}"))?
-            .with_memory_pattern(false)
-            .map_err(|e| anyhow!("disabling memory-pattern preallocation: {e}"))?
-            .with_devices(devices, Some(&ep_options))
-            .map_err(|e| anyhow!("appending the QNN execution provider: {e}"))?
-            .with_execution_providers([ort::ep::CPU::default().build()])
-            .map_err(|e| anyhow!("disabling the CPU memory arena: {e}"))?
-            .commit_from_file(model)
-            .with_context(|| {
-                format!(
-                    "loading model {} on QNN/HTP (is it a full-op-coverage QDQ export?)",
-                    model.display()
-                )
-            })?;
+        // A fresh builder per attempt: `commit_from_file` consumes it, and the
+        // context cache below may need two attempts (cached, then generate).
+        // Devices are re-queried per build because they borrow the env.
+        let build = || -> Result<ort::session::builder::SessionBuilder> {
+            let env = Environment::current()
+                .map_err(|e| anyhow!("getting the onnxruntime environment: {e}"))?;
+            let devices: Vec<_> = env
+                .devices()
+                .filter(|device| device.ep().is_ok_and(|name| name == QNN_EP))
+                .collect();
+
+            Session::builder()
+                .map_err(|e| anyhow!("creating an onnxruntime session builder: {e}"))?
+                .with_intra_threads(1)
+                .map_err(|e| anyhow!("limiting intra-op threads: {e}"))?
+                .with_memory_pattern(false)
+                .map_err(|e| anyhow!("disabling memory-pattern preallocation: {e}"))?
+                .with_devices(devices, Some(&ep_options))
+                .map_err(|e| anyhow!("appending the QNN execution provider: {e}"))?
+                .with_execution_providers([ort::ep::CPU::default().build()])
+                .map_err(|e| anyhow!("disabling the CPU memory arena: {e}"))
+        };
+
+        let session = context_cached_session(model, &ep_options, &build)?;
         Ok(Self(OrtBackend::from_session(session, model, options)?))
     }
 
@@ -398,6 +405,143 @@ fn qnn_ep_options(qnn: &QnnOptions) -> Vec<(String, String)> {
     push("htp_performance_mode", qnn.performance_mode.clone());
     push("vtcm_mb", qnn.vtcm_mb.map(|v| v.to_string()));
     options
+}
+
+/// The session via the EP-context cache: a compiled-HTP-context model beside
+/// the artifact, loaded in place of the ONNX when its fingerprint matches.
+///
+/// Loading the ONNX keeps the protobuf and every initializer resident for
+/// the session's life, duplicating weights the HTP context already holds —
+/// about the model's file size of anonymous memory. The context model skips
+/// both, and skips the graph compile with them (a QNN HTP compile is
+/// multiple seconds at every engine open).
+///
+/// The cache is correct by construction, not by trust: its name carries a
+/// fingerprint of the model bytes and the EP options (a context binary is
+/// specific to both, and to the QAIRT that compiled it — which has no
+/// version surface here, so a QAIRT bump is caught by the load failing).
+/// Every failure degrades: a rejected cache is deleted and regenerated; a
+/// generation that cannot write (read-only model dir) falls back to the
+/// plain ONNX open, which is exactly yesterday's behavior.
+fn context_cached_session(
+    model: &Path,
+    ep_options: &[(String, String)],
+    build: &dyn Fn() -> Result<ort::session::builder::SessionBuilder>,
+) -> Result<Session> {
+    let cache = match context_cache_path(model, ep_options) {
+        Ok(cache) => cache,
+        Err(e) => {
+            note!("qnn: no context cache ({e}); loading the ONNX directly");
+            return plain_open(model, build);
+        }
+    };
+
+    if cache.exists() {
+        match build()?.commit_from_file(&cache) {
+            Ok(session) => {
+                note!("qnn: loaded compiled HTP context {}", cache.display());
+                return Ok(session);
+            }
+            Err(e) => {
+                // Stale for a reason the name cannot see — a QAIRT bump, a
+                // truncated write. Deleted so the next open does not retry it.
+                note!("qnn: cached context rejected ({e}); regenerating");
+                let _ = std::fs::remove_file(&cache);
+            }
+        }
+    }
+
+    prune_stale_contexts(model, &cache);
+
+    let generate = build()?
+        .with_config_entry("ep.context_enable", "1")
+        .map_err(|e| anyhow!("enabling EP-context generation: {e}"))?
+        .with_config_entry("ep.context_file_path", cache.to_string_lossy())
+        .map_err(|e| anyhow!("naming the EP-context file: {e}"))?
+        .with_config_entry("ep.context_embed_mode", "1")
+        .map_err(|e| anyhow!("embedding the EP context: {e}"))?
+        .commit_from_file(model);
+
+    match generate {
+        Ok(session) => {
+            note!("qnn: compiled HTP context cached at {}", cache.display());
+            Ok(session)
+        }
+        Err(e) => {
+            note!("qnn: context generation failed ({e}); loading the ONNX directly");
+            plain_open(model, build)
+        }
+    }
+}
+
+fn plain_open(
+    model: &Path,
+    build: &dyn Fn() -> Result<ort::session::builder::SessionBuilder>,
+) -> Result<Session> {
+    build()?.commit_from_file(model).with_context(|| {
+        format!(
+            "loading model {} on QNN/HTP (is it a full-op-coverage QDQ export?)",
+            model.display()
+        )
+    })
+}
+
+/// `<stem>.<fp>.qnnctx.onnx` beside the model: sixteen hex of
+/// sha256(model bytes ‖ EP options), so a re-exported artifact or a changed
+/// EP configuration names a different cache instead of loading a wrong one.
+fn context_cache_path(model: &Path, ep_options: &[(String, String)]) -> Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+
+    let bytes = std::fs::read(model)
+        .with_context(|| format!("reading {} for the context fingerprint", model.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    for (key, value) in ep_options {
+        hasher.update(key.as_bytes());
+        hasher.update(b"=");
+        hasher.update(value.as_bytes());
+        hasher.update(b";");
+    }
+    let fp: String = hasher
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+
+    let stem = model
+        .file_stem()
+        .ok_or_else(|| anyhow!("model path {} has no file name", model.display()))?
+        .to_string_lossy();
+    Ok(model.with_file_name(format!("{stem}.{fp}.qnnctx.onnx")))
+}
+
+/// Superseded caches for the same model stem — a re-export would otherwise
+/// leave one full-size orphan per fingerprint on a disk-budgeted target.
+fn prune_stale_contexts(model: &Path, keep: &Path) {
+    let Some(dir) = model.parent() else { return };
+    let Some(stem) = model.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // `path != model` matters when the artifact under load IS a context
+        // model someone points --model at: it matches the pattern and must
+        // not be reaped out from under its own open.
+        if path != keep
+            && path != model
+            && name.starts_with(&format!("{stem}."))
+            && name.ends_with(".qnnctx.onnx")
+        {
+            note!("qnn: pruning superseded context {}", path.display());
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// One run's `SessionOutputs`, which borrow the session they came out of —
