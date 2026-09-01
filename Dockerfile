@@ -174,6 +174,10 @@ RUN mix deps.compile
 COPY priv priv
 COPY lib lib
 COPY assets assets
+# rel/ carries env.sh.eex — pre-VM environment (malloc tuning); a release
+# assembled without it silently ships the stock env.sh and the tuning
+# exists only on dev pushes.
+COPY rel rel
 # Compile before the asset build: app.css imports the colocated CSS that
 # `mix compile` extracts into the build dir (NODE_PATH points there).
 RUN mix compile
