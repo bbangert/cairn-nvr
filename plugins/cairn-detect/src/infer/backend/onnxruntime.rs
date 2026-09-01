@@ -1,6 +1,7 @@
 //! The onnxruntime backends: CPU ([`OrtBackend`]) and Qualcomm HTP
 //! ([`QnnBackend`]) — the second is the first with a different execution
-//! provider appended, which is why both live here.
+//! provider appended and the CPU allocator's arena turned off (the compute
+//! is the HTP's; see the builder comment), which is why both live here.
 //!
 //! This module is where `ort` types are allowed to appear. Everything it hands
 //! back — [`ModelIo`], [`Raw`] — is SDK-free, so the rest of `infer` reads a
@@ -336,12 +337,27 @@ impl Backend for QnnBackend {
         // and the engine, while the pass itself sat in one fastrpc call.
         // Any per-node CPU fallback runs single-threaded, which D-P5 then
         // sees as the latency it costs rather than hiding it in parallelism.
+        //
+        // No CPU BFC arena and no memory-pattern preallocation: on this
+        // session the CPU allocator serves pre/post tensors, not the compute,
+        // and the arena grows in power-of-two steps it never returns —
+        // measured as the largest single anonymous mapping in the engine's
+        // footprint. Per-pass malloc for a handful of content-rect tensors is
+        // noise at sample rate; the pattern planner allocates through the
+        // arena, so it goes with it. `ep::CPU` registration is ONLY that
+        // flag: the CPU EP itself always exists, and its `use_arena`
+        // defaults false — appending it after the QNN devices changes no
+        // node-assignment priority.
         let session = Session::builder()
             .map_err(|e| anyhow!("creating an onnxruntime session builder: {e}"))?
             .with_intra_threads(1)
             .map_err(|e| anyhow!("limiting intra-op threads: {e}"))?
+            .with_memory_pattern(false)
+            .map_err(|e| anyhow!("disabling memory-pattern preallocation: {e}"))?
             .with_devices(devices, Some(&ep_options))
             .map_err(|e| anyhow!("appending the QNN execution provider: {e}"))?
+            .with_execution_providers([ort::ep::CPU::default().build()])
+            .map_err(|e| anyhow!("disabling the CPU memory arena: {e}"))?
             .commit_from_file(model)
             .with_context(|| {
                 format!(
