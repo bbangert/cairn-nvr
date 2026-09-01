@@ -24,7 +24,7 @@ use std::fmt;
 use anyhow::{anyhow, bail, Context, Result};
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecParameters, AVCodecRef};
 use rsmpeg::avfilter::{AVFilter, AVFilterGraph, AVFilterInOut};
-use rsmpeg::avutil::{AVFrame, AVHWDeviceContext};
+use rsmpeg::avutil::{AVDictionary, AVFrame, AVHWDeviceContext};
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 
@@ -186,8 +186,18 @@ impl HwDecoder {
             ctx.set_hw_device_ctx(device);
         }
         cap_frame_size(&mut ctx);
-        ctx.open(None)
+        let leftover = ctx
+            .open(buffer_budget(backend))
             .map_err(|e| anyhow!("opening the {backend} decoder: {e}"))?;
+        if let Some(dict) = leftover {
+            // Options the decoder did not consume mean a build whose wrapper
+            // does not know them — the defaults then apply silently, which is
+            // a memory-budget change worth one line, not a failure.
+            note!(
+                "decoder: {backend} ignored buffer-budget option(s) {:?}; running on its defaults",
+                dict.iter().map(|e| e.key().to_owned()).collect::<Vec<_>>()
+            );
+        }
 
         // The real target depends on the source geometry, which is only
         // certain once frames arrive; the stream's declared size is what the
@@ -284,6 +294,31 @@ impl HwDecoder {
             .config()
             .with_context(|| format!("configuring filter graph {spec:?}"))?;
         Ok(graph)
+    }
+}
+
+/// Per-queue buffer counts for the stateful M2M decoder, or `None` where
+/// libavcodec owns its own pools.
+///
+/// v4l2m2m maps every buffer of both queues up front and holds them for the
+/// decoder's life — ffmpeg's defaults (20 capture + 16 output per instance)
+/// measured ~108 MB of `/dev/video1` mappings for two substream decoders,
+/// second only to the model runtime in the engine's footprint. Eight covers
+/// the H.264 reorder window plus the frame the scaler is reading; the
+/// bitstream side is fed one access unit at a time (`decode_au`), so deep
+/// output queuing buys nothing here. FFmpeg floors both options at 2 and the
+/// driver still enforces its own minimum through REQBUFS, so too small
+/// degrades to the driver's answer rather than to corruption — a stall would
+/// surface as the blind-decoder line, which is the board check for this
+/// number.
+fn buffer_budget(backend: HwBackend) -> Option<AVDictionary> {
+    match backend {
+        HwBackend::V4l2 => Some(AVDictionary::new_int(c"num_capture_buffers", 8, 0).set_int(
+            c"num_output_buffers",
+            8,
+            0,
+        )),
+        _ => None,
     }
 }
 
