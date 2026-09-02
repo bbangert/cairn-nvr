@@ -93,10 +93,18 @@ defmodule Cairn.ConfigSource do
   # The whole YAML is validated before an import: a file that cannot load
   # imports nothing and writes no marker, so the operator fixes it and the
   # next boot imports — today's behaviour, not a half-migrated database.
+  #
+  # A present `cameras:` that isn't a list fails the same way, marker or not:
+  # the render below would otherwise overwrite it with the rendered rows and
+  # the bad value would silently disappear instead of degrading like any
+  # other YAML error.
   defp import_once(map, path, marker) do
     cameras = Map.get(map, "cameras")
 
     cond do
+      not is_nil(cameras) and not is_list(cameras) ->
+        {:error, ["cameras must be a list"]}
+
       not is_nil(marker) ->
         {:ok, []}
 

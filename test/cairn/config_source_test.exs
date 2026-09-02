@@ -154,6 +154,45 @@ defmodule Cairn.ConfigSourceTest do
       assert fallback.data_dir == dir
     end
 
+    test "a cameras key that is not a list fails the load and writes no marker", %{dir: dir} do
+      path =
+        write_yaml!(dir, """
+        #{globals(dir)}
+        cameras: foo
+        """)
+
+      assert {:error, [msg], %Config{cameras: []}} = ConfigSource.load(path)
+      assert msg =~ "cameras must be a list"
+      assert ConfigSource.import_marker() == nil
+      assert Cameras.list() == []
+    end
+
+    test "a cameras key that is not a list fails the load even with a marker present", %{
+      dir: dir
+    } do
+      path =
+        write_yaml!(dir, """
+        #{globals(dir)}
+        cameras:
+          - id: cam_a
+            rtsp_url: rtsp://h/1
+        """)
+
+      assert {:ok, _config, _warnings, %{}} = ConfigSource.load(path)
+      marker = ConfigSource.import_marker()
+      rows = Cameras.list()
+
+      File.write!(path, """
+      #{globals(dir)}
+      cameras: foo
+      """)
+
+      assert {:error, [msg], %Config{cameras: []}} = ConfigSource.load(path)
+      assert msg =~ "cameras must be a list"
+      assert ConfigSource.import_marker() == marker
+      assert Cameras.list() == rows
+    end
+
     test "removing the cameras key after the import is quiet", %{dir: dir} do
       body = """
       #{globals(dir)}

@@ -156,7 +156,8 @@ defmodule Cairn.Config.Server do
   these is the row it skipped, and the caller gets that camera's errors.
 
   `{:error, errors}` is the validator's; `{:error, {:write, reason}}` is
-  `write_fun`'s own (a changeset, a DB fault, or a wrong-shaped return).
+  `write_fun`'s own (a changeset, a DB fault, a wrong-shaped return, or an
+  exception the closure raised).
   """
   @spec update(GenServer.server(), (-> :ok | {:error, term()}), keyword()) ::
           {:ok, diff(), [String.t()]} | {:error, [String.t()]} | {:error, {:write, term()}}
@@ -281,6 +282,10 @@ defmodule Cairn.Config.Server do
     # A DB fault is the caller's write error, not a reason to take the config
     # process down and with it every camera the old config is still running.
     e in [Exqlite.Error, DBConnection.ConnectionError] -> {:error, {:write, e}}
+    # `write_fun` is the caller's code running in this process; its bug is the
+    # caller's error, not a reason the config server and every camera it holds
+    # should die for a save that never applied.
+    e -> {:error, {:write, e}}
   end
 
   defp attempt(state, write_fun, reject) do
