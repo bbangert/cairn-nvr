@@ -4,7 +4,8 @@ defmodule Cairn.Config.Server do
   `reload/0` loads again, diffs cameras against the running set and applies
   the diff (start/stop/restart camera trees, and refresh in place the
   cameras whose change reaches no subprocess). An invalid reload keeps the
-  old config and returns the errors.
+  old config and returns the errors. Every applied config is announced on
+  `Cairn.Config.topic/0` as `{:config_changed, diff}` — see `subscribe/0`.
 
   The source is the `source:` opt, else the `:config_loader` app env — a
   1-arity fun of the config path, or `{module, function}` naming one; the
@@ -24,6 +25,16 @@ defmodule Cairn.Config.Server do
   Detection lives in `Cairn.Native.Host`, so the new config goes there
   first (`reconfigure/1`) — the model a camera's next session opens a
   stream on should already be the new one when its tree restarts.
+
+  `update/3` runs the caller's write, the source read and `Cairn.Config.from_map/1`
+  inside one immediate-mode transaction on this process, so the store never
+  holds a fleet the validator rejects and two sessions' saves serialize on the
+  mailbox instead of racing the cross-camera rules — and, with
+  `reject_skipped:`, a save cannot leave its own camera skipped and dark. The
+  cost is that a save holds the server for all of that plus the apply, and
+  `apply_diff` can take seconds on restart-class changes — so `get/1` and
+  `last_load/1` callers, on their 5 s budget, can see a slow answer while a
+  save is in flight.
 
   A named server publishes each config it installs as a `:persistent_term`
   snapshot *before* applying it, for `snapshot_camera/2`: a camera tree
@@ -121,9 +132,11 @@ defmodule Cairn.Config.Server do
   def ha_token(server \\ __MODULE__), do: get(server).ha_token
 
   @doc """
-  Warnings, errors and skipped cameras from the last load or reload attempt
-  (for the UI). A failed reload carries only its errors: the warnings and
-  skips of the config still running describe a file that is gone.
+  Warnings, errors and skipped cameras from the last load, reload or accepted
+  save (for the UI). A failed reload carries only its errors: the warnings and
+  skips of the config still running describe a file that is gone. A rejected
+  `update/3` leaves this alone — its errors are the caller's form, not the
+  health of the config that is still running.
   """
   @spec last_load(GenServer.server()) :: last_load()
   def last_load(server \\ __MODULE__), do: GenServer.call(server, :last_load)
@@ -131,6 +144,35 @@ defmodule Cairn.Config.Server do
   @spec reload(GenServer.server()) ::
           {:ok, diff(), [String.t()]} | {:error, [String.t()]}
   def reload(server \\ __MODULE__), do: GenServer.call(server, :reload, 30_000)
+
+  @doc """
+  Runs `write_fun` against the store, re-reads and re-validates the whole
+  fleet through the source in the same transaction, and applies the result
+  exactly as `reload/1` does. A fleet the validator rejects rolls the write
+  back, so the errors reach the caller and the row never lands.
+
+  `reject_skipped: id | [id]` extends that to the cameras the save is *about*:
+  a source free to skip a faulty row rolls the write back instead when one of
+  these is the row it skipped, and the caller gets that camera's errors.
+
+  `{:error, errors}` is the validator's; `{:error, {:write, reason}}` is
+  `write_fun`'s own (a changeset, a DB fault).
+  """
+  @spec update(GenServer.server(), (-> :ok | {:error, term()}), keyword()) ::
+          {:ok, diff(), [String.t()]} | {:error, [String.t()]} | {:error, {:write, term()}}
+  def update(server \\ __MODULE__, write_fun, opts \\ [])
+      when is_function(write_fun, 0) and is_list(opts) do
+    reject = Keyword.get(opts, :reject_skipped, [])
+    GenServer.call(server, {:update, write_fun, reject}, 30_000)
+  end
+
+  @doc """
+  Subscribes the caller to `Cairn.Config.topic/0`: `{:config_changed, diff}`
+  — the added, removed, changed and refreshed ids — after every config
+  applied past boot.
+  """
+  @spec subscribe() :: :ok | {:error, term()}
+  def subscribe, do: Phoenix.PubSub.subscribe(Cairn.PubSub, Config.topic())
 
   @impl true
   def init(opts) do
@@ -194,26 +236,93 @@ defmodule Cairn.Config.Server do
   def handle_call(:reload, _from, state) do
     case load(state) do
       {:ok, new_config, warnings, skipped} ->
-        diff = diff_cameras(state.config, new_config)
-        # Before the diff: newly spawned ports redirect logs into the (possibly
-        # changed) data_dir, so its log subdir must already exist
-        Cairn.DataDir.ensure!(new_config.data_dir)
-        # Before the apply: a tree the diff restarts may be rebuilt by its
-        # supervisor at any point after, and must find this fleet, not the
-        # last one.
-        publish(state, new_config)
-        # Before the cameras: detection is the in-VM engine, so the model a
-        # restarted camera will open a stream on should already be the new
-        # one. The call is asynchronous, so this is an ordering of sends
-        # rather than of loads.
-        state.apply_native.(new_config)
-        state.apply_diff.(diff, new_config)
-        state = %{state | config: new_config, warnings: warnings, errors: [], skipped: skipped}
+        {diff, state} = apply_config(state, new_config, warnings, skipped)
         {:reply, {:ok, diff, warnings}, state}
 
       {:error, errors, _fallback} ->
         {:reply, {:error, errors}, %{state | errors: errors, warnings: [], skipped: %{}}}
     end
+  end
+
+  def handle_call({:update, write_fun, reject}, _from, state) do
+    if file_source?(state.source) do
+      # A row written under the file source would never be read back — the
+      # render comes from the file — so a caller (or a test) that forgot to
+      # point the server at a store is told, not silently obeyed.
+      {:reply, {:error, ["update needs a DB-backed config source"]}, state}
+    else
+      do_update(state, write_fun, reject)
+    end
+  end
+
+  defp file_source?(source), do: source == Function.capture(Config, :load_file, 1)
+
+  defp do_update(state, write_fun, reject) do
+    case transact(state, write_fun, reject) do
+      {:ok, {new_config, warnings, skipped}} ->
+        {diff, state} = apply_config(state, new_config, warnings, skipped)
+        {:reply, {:ok, diff, warnings}, state}
+
+      {:error, {:invalid, errors}} ->
+        # Form errors, not config health: the running config is untouched and
+        # still valid, so `last_load` must not start claiming otherwise.
+        {:reply, {:error, errors}, state}
+
+      {:error, {:write, reason}} ->
+        {:reply, {:error, {:write, reason}}, state}
+    end
+  end
+
+  # `mode: :immediate` takes the write lock at BEGIN rather than at the first
+  # write, so the render between the two cannot be raced by another writer.
+  defp transact(state, write_fun, reject) do
+    Cairn.Repo.transaction(fn -> attempt(state, write_fun, reject) end, mode: :immediate)
+  rescue
+    # A DB fault is the caller's write error, not a reason to take the config
+    # process down and with it every camera the old config is still running.
+    e in [Exqlite.Error, DBConnection.ConnectionError] -> {:error, {:write, e}}
+  end
+
+  defp attempt(state, write_fun, reject) do
+    with :ok <- write_fun.(),
+         {:ok, config, warnings, skipped} <- load(state),
+         [] <- own_skips(reject, skipped) do
+      {config, warnings, skipped}
+    else
+      {:error, errors, _fallback} -> Cairn.Repo.rollback({:invalid, errors})
+      {:error, reason} -> Cairn.Repo.rollback({:write, reason})
+      own_errors when is_list(own_errors) -> Cairn.Repo.rollback({:invalid, own_errors})
+    end
+  end
+
+  # A per-camera fault skips the row on a *load*, so one drifted camera cannot
+  # take the fleet down with it. On a save that row is the operator's own act:
+  # its faults are form errors, and the store must not accept a row that would
+  # only go dark. Another camera's skip is not this save's doing and does not
+  # reject it.
+  defp own_skips(reject, skipped),
+    do: Enum.flat_map(List.wrap(reject), &Map.get(skipped, &1, []))
+
+  # The ok arm shared by `:reload` and `{:update, _}`, so the three orderings
+  # below cannot drift between the two paths.
+  defp apply_config(state, new_config, warnings, skipped) do
+    diff = diff_cameras(state.config, new_config)
+    # Before the diff: newly spawned ports redirect logs into the (possibly
+    # changed) data_dir, so its log subdir must already exist
+    Cairn.DataDir.ensure!(new_config.data_dir)
+    # Before the apply: a tree the diff restarts may be rebuilt by its
+    # supervisor at any point after, and must find this fleet, not the
+    # last one.
+    publish(state, new_config)
+    # Before the cameras: detection is the in-VM engine, so the model a
+    # restarted camera will open a stream on should already be the new
+    # one. The call is asynchronous, so this is an ordering of sends
+    # rather than of loads.
+    state.apply_native.(new_config)
+    state.apply_diff.(diff, new_config)
+    state = %{state | config: new_config, warnings: warnings, errors: [], skipped: skipped}
+    Phoenix.PubSub.broadcast(Cairn.PubSub, Config.topic(), {:config_changed, diff})
+    {diff, state}
   end
 
   # A source is the seam a later store plugs into, so its answer is checked
@@ -236,9 +345,9 @@ defmodule Cairn.Config.Server do
   end
 
   # Overwriting a persistent term scans every process for references to the
-  # old one — bounded here by boot plus the reload rate, which is operator
-  # paced. An ETS table owned by this server is the alternative if a save
-  # rate ever makes that scan measurable.
+  # old one — bounded here by boot plus the reload and save rate, both
+  # operator paced. An ETS table owned by this server is the alternative if a
+  # save rate ever makes that scan measurable.
   defp publish(%{snapshot: nil}, _config), do: :ok
   defp publish(%{snapshot: name}, config), do: :persistent_term.put(snapshot_key(name), config)
 

@@ -18,3 +18,6 @@ config :logger, level: :info
 
 # Runtime production configuration, including reading
 # of environment variables, is done on config/runtime.exs.
+
+# Cameras live as rows after the first boot imports them; the file keeps the globals.
+config :cairn, config_loader: {Cairn.ConfigSource, :load}

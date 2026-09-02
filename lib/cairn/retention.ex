@@ -8,7 +8,9 @@ defmodule Cairn.Retention do
       present in the event (camera-level overrides win over globals, see
       `Cairn.Config.retention_days/3`). The same pass then expires track rows
       on their own, much longer clock (`retention.tracks_days`), which has no
-      per-camera or per-label form.
+      per-camera or per-label form. A camera resolves out of
+      `cameras ++ dormant`, so a skipped or disabled camera's clips keep
+      their own clock.
     * **Emergency disk cleanup** (every 60s): when free space under
       `data_dir` drops below `free_space_min_mb`, deletes oldest events
       regardless of retention until above the threshold, and broadcasts a
@@ -143,10 +145,16 @@ defmodule Cairn.Retention do
     count
   end
 
+  # A camera the loader skipped, disabled or could not load at all still has
+  # clips on disk, and they are priced by the override its row carries
+  # (`Cairn.Config.dormant`, D-P3) — otherwise disabling a camera would
+  # silently re-clock its history to the global days.
+  defp retention_cameras(config), do: config.cameras ++ config.dormant
+
   # the earliest any event could expire — used to narrow the candidate query
   defp min_retention_days(config) do
     camera_days =
-      for cam <- config.cameras,
+      for cam <- retention_cameras(config),
           days <- [cam.retention_days | Map.values(cam.retention_per_label)],
           is_integer(days),
           do: days
@@ -156,7 +164,8 @@ defmodule Cairn.Retention do
 
   defp effective_retention_days(config, row) do
     camera =
-      Enum.find(config.cameras, &(&1.id == row.camera_id)) || %Config.Camera{id: row.camera_id}
+      Enum.find(retention_cameras(config), &(&1.id == row.camera_id)) ||
+        %Config.Camera{id: row.camera_id}
 
     labels = row.labels |> Map.get("max_scores", %{}) |> Map.keys()
 

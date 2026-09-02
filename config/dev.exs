@@ -72,3 +72,6 @@ config :phoenix_live_view,
   debug_attributes: true,
   # Enable helpful, but potentially expensive runtime checks
   enable_expensive_runtime_checks: true
+
+# Cameras live as rows after the first boot imports them; the file keeps the globals.
+config :cairn, config_loader: {Cairn.ConfigSource, :load}

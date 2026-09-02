@@ -2086,6 +2086,20 @@ defmodule Cairn.ConfigTest do
                 }}
     end
 
+    test "fleet_count: holds the ladder at a larger fleet" do
+      dir = tmp_profile_dir("ladder", ladder_yaml())
+      map = ladder_map(2, dir)
+
+      assert {:ok, plain, _warnings} = Config.from_map(map)
+      assert Config.sample_fps(plain, hd(plain.cameras)) == 10
+
+      # The same two cameras resolved as if a third were still detecting:
+      # 3 × 7.5 > 17, 3 × 5 = 15 ≤ 17. This is the loader holding N across a
+      # skip so the survivors keep the rate they were already running.
+      assert {:ok, held, _warnings} = Config.from_map(map, fleet_count: 3)
+      assert Config.sample_fps(held, hd(held.cameras)) == 7
+    end
+
     test "growing demand derives a lower rate before it leaves the rung" do
       # 8 × 1.875 = 15 ≤ 17 still fits the accurate rung, but only at the
       # floor: every intermediate nominal (3..10) quantizes to an effective

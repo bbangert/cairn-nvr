@@ -137,6 +137,13 @@ defmodule Cairn.Config do
             reid: @default_reid,
             tracker: @default_tracker,
             cameras: [],
+            # Bare `%Camera{}` structs — id plus `retention_days` /
+            # `retention_per_label` and nothing else — for cameras a source
+            # holds but did not render: skipped, disabled, or every row behind
+            # a failed load. `Cairn.Retention` prices their clips off their own
+            # override instead of the global days, so no second reader of the
+            # rows exists. `from_map/2` never fills it; only a source does.
+            dormant: [],
             plugin_groups: [],
             profiles: %{},
             ha_token: nil
@@ -172,14 +179,29 @@ defmodule Cairn.Config do
     end
   end
 
+  # The config a map's globals alone stand behind, or nil when even that
+  # fails: what every source hands back as the fallback of a failed load
+  # (`Cairn.ConfigSource` adds `dormant` to it). Public for that second
+  # caller, not for general use.
+  #
   # A second pass of the impure `from_map/1` (profile and artifact reads
   # again); a failed boot is rare enough to pay it.
-  defp globals_fallback(map) do
+  @doc false
+  @spec globals_fallback(map()) :: t() | nil
+  def globals_fallback(map) do
     case from_map(Map.put(map, "cameras", [])) do
       {:ok, config, _warnings} -> config
       {:error, _errors} -> nil
     end
   end
+
+  @doc """
+  PubSub topic `Cairn.Config.Server` announces every config it applies after
+  boot — reloads and accepted saves — as `{:config_changed, diff}`. The boot
+  install is silent: PubSub starts below the server.
+  """
+  @spec topic() :: String.t()
+  def topic, do: "config"
 
   @doc "The YAML mapping at `path`, parsed and nothing more."
   @spec raw_map(Path.t()) :: {:ok, map()} | {:error, [String.t()]}
@@ -236,9 +258,13 @@ defmodule Cairn.Config do
   whatever produced the map (the file, or rows rendered into its `"cameras"`
   key). Not pure: it reads `CAIRN_DATA_DIR`, the profile files under
   `profile_dirs` and their model artifacts.
+
+  `fleet_count:` replaces the N that ladder resolution sizes for. Only a
+  source re-rendering a reduced fleet passes it, to hold the rung and derived
+  rate the full fleet resolved to (D-P1).
   """
-  @spec from_map(map()) :: {:ok, t(), [String.t()]} | {:error, [String.t()]}
-  def from_map(map) do
+  @spec from_map(map(), keyword()) :: {:ok, t(), [String.t()]} | {:error, [String.t()]}
+  def from_map(map, opts \\ []) do
     acc = %{errors: [], warnings: []}
     acc = warn_unknown(acc, map, @known_keys, "config")
     acc = warn_unknown(acc, Map.get(map, "events"), @known_events_keys, "events")
@@ -279,7 +305,7 @@ defmodule Cairn.Config do
     }
 
     {config, acc} = resolve_plugins(config, acc, declared_plugin_names(map))
-    {config, acc} = resolve_ladders(config, acc)
+    {config, acc} = resolve_ladders(config, acc, opts)
     {config, acc} = resolve_profiles(config, acc)
     acc = check_group_profiles(config, acc)
     acc = validate(config, acc)
@@ -809,13 +835,15 @@ defmodule Cairn.Config do
   # Static, at config load/reload (D-L1): N is the count of cameras with
   # detection *configured* — a camera naming a plugin — never the runtime
   # detection toggle, which must not re-resolve anything (capacity sizes for
-  # the configured fleet; no flapping). Runs before `resolve_profiles/2` so
-  # the structs it lowers are the ones the groups get, and only for profiles
-  # some CAMERA detects on — not merely ones a group names: a spare group
-  # defined but used by no camera runs nothing, and resolving its ladder
-  # against a fleet it does not serve could fail the load over cameras that
-  # never touch it. An unused ladder file costs no disk probes and no
-  # warnings, like the artifact checks below.
+  # the configured fleet; no flapping). A source may pass `fleet_count:` to
+  # hold N above that count; the option can only raise N, never lower it —
+  # see where it is read below. Runs before `resolve_profiles/2` so the
+  # structs it lowers are the ones the groups get, and only for profiles some
+  # CAMERA detects on — not merely ones a group names: a spare group defined
+  # but used by no camera runs nothing, and resolving its ladder against a
+  # fleet it does not serve could fail the load over cameras that never touch
+  # it. An unused ladder file costs no disk probes and no warnings, like the
+  # artifact checks below.
   #
   # "Lowers": the selected rung's model fields and the derived sample_fps are
   # written into the profile's own single-model fields, so everything
@@ -824,7 +852,7 @@ defmodule Cairn.Config do
   # comparisons — reads a ladder profile as the single-model profile it
   # resolved to. `resolved_rung` keeps the selection itself for the
   # restart-class comparison (D-L5).
-  defp resolve_ladders(config, acc) do
+  defp resolve_ladders(config, acc, opts) do
     # Group name → profile name; groups still hold name strings here
     # (`resolve_profiles/2` runs after this pass).
     by_group =
@@ -841,7 +869,16 @@ defmodule Cairn.Config do
             do: profile
       )
 
-    n = Enum.count(config.cameras, &(&1.plugin != nil))
+    # `fleet_count:` is the loader holding N across its skip pass (D-P1): the
+    # survivors of a skip keep the rung and derived rate the previous load
+    # gave them, so a row going bad never restarts the cameras beside it. The
+    # `max/2` is what makes the option raise-only, so the held N is ≥ the real
+    # one and every capacity check lands on the conservative side.
+    n =
+      max(
+        Keyword.get(opts, :fleet_count, 0),
+        Enum.count(config.cameras, &(&1.plugin != nil))
+      )
 
     {profiles, acc} =
       Enum.map_reduce(config.profiles, acc, fn
