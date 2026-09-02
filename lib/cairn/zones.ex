@@ -304,7 +304,10 @@ defmodule Cairn.Zones do
     above_i != above_j and px < (xj - xi) * (py - yi) / (yj - yi) + xi
   end
 
-  # Every edge including the closing one, as {from, to} pairs.
+  # Every edge including the closing one, as {from, to} pairs. An empty
+  # outline has none — `validate/2` reaches here with `[]` on its way to
+  # the count error, and `hd/1` would turn that report into a crash.
+  defp edges([]), do: []
   defp edges(points), do: Enum.zip(points, tl(points) ++ [hd(points)])
 
   defp floats(points), do: Enum.map(points, fn [x, y] -> [x / 1, y / 1] end)

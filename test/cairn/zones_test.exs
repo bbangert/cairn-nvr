@@ -95,6 +95,9 @@ defmodule Cairn.ZonesTest do
 
     test "fewer than three points is refused, counted after the duplicates collapse" do
       assert "a zone needs at least 3 points" in errors(%{"points" => [[0, 0], [1, 0]]})
+      # No points at all is an error, not a crash in the edge walk.
+      assert "a zone needs at least 3 points" in errors(%{"points" => []})
+      assert "a zone needs at least 3 points" in errors(%{"points" => [[0.5, 0.5]]})
 
       # Three vertices, two of them the same point: a line with a spare.
       assert "a zone needs at least 3 points" in errors(%{
