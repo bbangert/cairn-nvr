@@ -1,7 +1,10 @@
 defmodule Cairn.PresenceEvent do
   @moduledoc """
-  A tier-1 camera's per-class presence transition: `label` became present, or
-  cleared after being present.
+  A tier-1 camera's per-class presence transition: `label` became present in
+  `zone`, or cleared after being present there. `zone` is a zone id, or
+  `nil` for whole-frame presence on a camera with no zones — every consumer
+  that keeps state keys it by `{camera_id, zone, label}`, and the SSE frame
+  always carries the field (D-P4), so a client has one key set to parse.
 
   Its own leg of the event surface, not an extension of `Cairn.Track` (D-S3):
   presence carries no identity — no object id, no bbox trail, nothing to
@@ -16,10 +19,11 @@ defmodule Cairn.PresenceEvent do
   """
 
   @enforce_keys [:camera_id, :label, :first_seen_at, :at]
-  defstruct [:camera_id, :label, :score, :first_seen_at, :at]
+  defstruct [:camera_id, :zone, :label, :score, :first_seen_at, :at]
 
   @type t :: %__MODULE__{
           camera_id: String.t(),
+          zone: String.t() | nil,
           label: String.t(),
           # The best score seen so far while present — at confirm time for
           # `:presence_started`, over the whole stay for `:presence_cleared`.

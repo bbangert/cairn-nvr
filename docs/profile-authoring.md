@@ -123,8 +123,9 @@ picks which one becomes `--model`.
 Omitting `tier:` means the profile makes no capability claim and nothing
 changes: every tier-less profile behaves exactly as it did before the key
 existed. **Declaring `tier: 1` changes the runtime**: the group's cameras
-build the presence pipeline — detections feed per-class present/cleared
-events (`presence_started`/`presence_cleared` on the event stream) and no
+build the presence pipeline — detections feed present/cleared events per
+`{zone, class}` (`presence_started`/`presence_cleared` on the event stream;
+zones in `docs/ha-api.md` → Presence zones) and no
 tracker of any kind runs, which is why changing a profile's tier restarts
 its cameras rather than refreshing them. `tier: 2` selects today's
 tracked pipeline and refuses cameras carrying `motion_json:` (the gate

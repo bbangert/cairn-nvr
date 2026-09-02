@@ -29,12 +29,14 @@ defmodule Cairn.CamerasTest do
   end
 
   describe "raw_maps/0" do
-    test "renders enabled rows only, in order, with id and no zones" do
+    test "renders enabled rows only, in order, with id and zones" do
+      yard = %{"id" => "yard", "name" => "Yard", "points" => [[0, 0], [1, 0], [1, 1]]}
+
       insert!(%{
         id: "cam1",
         position: 0,
         settings: %{"rtsp_url" => "rtsp://cam1"},
-        zones: [%{"name" => "yard"}]
+        zones: [yard]
       })
 
       insert!(%{
@@ -50,8 +52,15 @@ defmodule Cairn.CamerasTest do
 
       assert warnings == []
       assert Enum.map(maps, & &1["id"]) == ["cam1", "cam3"]
-      assert maps |> Enum.at(0) |> Map.has_key?("zones") == false
-      assert Enum.at(maps, 0) == %{"id" => "cam1", "rtsp_url" => "rtsp://cam1"}
+
+      assert Enum.at(maps, 0) == %{
+               "id" => "cam1",
+               "rtsp_url" => "rtsp://cam1",
+               "zones" => [yard]
+             }
+
+      # A row with no zones renders the empty list, not a missing key.
+      assert Enum.at(maps, 1)["zones"] == []
     end
 
     test "drops an unknown key with exactly one warning and leaves the row unchanged" do
@@ -60,7 +69,7 @@ defmodule Cairn.CamerasTest do
       {maps, warnings} = Cameras.raw_maps()
 
       assert warnings == [~s(camera cam1: dropped unknown key "udp")]
-      assert Enum.at(maps, 0) == %{"id" => "cam1", "rtsp_url" => "rtsp://cam1"}
+      assert Enum.at(maps, 0) == %{"id" => "cam1", "rtsp_url" => "rtsp://cam1", "zones" => []}
 
       assert Cameras.get("cam1").settings == %{"rtsp_url" => "rtsp://cam1", "udp" => true}
     end

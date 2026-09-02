@@ -1525,6 +1525,98 @@ defmodule Cairn.ConfigTest do
     end
   end
 
+  describe "zones" do
+    @zone %{"id" => "drive", "name" => "Driveway", "points" => [[0, 0], [1, 0], [1, 1]]}
+
+    # cam_a is on no plugin group here, so these also carry the inert case.
+    defp zoned_map(zones) do
+      update_in(base_map(), ["cameras", Access.at(0)], &Map.put(&1, "zones", zones))
+    end
+
+    defp zoned_tier_map(profile_yaml) do
+      update_in(
+        tiered_map(profile_yaml),
+        ["cameras", Access.at(0)],
+        &Map.put(&1, "zones", [@zone])
+      )
+    end
+
+    test "zones reach the camera atom-keyed, with float points" do
+      assert {:ok, config, _warnings} = Config.from_map(zoned_map([@zone]))
+
+      assert [%Config.Camera{id: "cam_a", zones: zones}, %Config.Camera{zones: []}] =
+               config.cameras
+
+      assert zones == [
+               %{id: "drive", name: "Driveway", points: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]}
+             ]
+    end
+
+    test "a broken zone is a load error naming the camera and the zone" do
+      assert {:error, errors} =
+               Config.from_map(zoned_map([Map.put(@zone, "points", [[0, 0], [1, 0]])]))
+
+      assert "camera cam_a: zone drive: a zone needs at least 3 points" in errors
+      assert "camera cam_a: zone drive: the zone has no area" in errors
+    end
+
+    test "a zone with no usable id is named by its position" do
+      assert {:error, errors} = Config.from_map(zoned_map([Map.put(@zone, "id", "Bad Id")]))
+      assert "camera cam_a: zone #0: use lowercase letters, digits, - and _" in errors
+    end
+
+    test "two zones on one camera cannot share an id" do
+      assert {:error, errors} =
+               Config.from_map(zoned_map([@zone, Map.put(@zone, "name", "Second")]))
+
+      assert "camera cam_a: zone drive: already used on this camera" in errors
+    end
+
+    test "a duplicate id is reported even when its twin failed on another rule" do
+      broken_twin = Map.put(@zone, "name", "")
+
+      assert {:error, errors} =
+               Config.from_map(zoned_map([broken_twin, Map.put(@zone, "name", "Second")]))
+
+      assert "camera cam_a: zone drive: give the zone a name" in errors
+      assert "camera cam_a: zone drive: already used on this camera" in errors
+    end
+
+    test "zones that are not a list are refused" do
+      assert {:error, errors} = Config.from_map(zoned_map(%{"drive" => @zone}))
+      assert "camera cam_a: zones must be a list" in errors
+    end
+
+    # The third state of the load-warning rule: invalid errors above, effective
+    # here, and inert warns below.
+    test "zones on a tier-1 camera pass silently — that is where they filter" do
+      assert {:ok, config, []} = Config.from_map(zoned_tier_map(ort_yaml("tier: 1")))
+      assert [%Config.Camera{zones: [%{id: "drive"}]}, _cam_b] = config.cameras
+    end
+
+    test "zones on a camera that runs no presence detection warn" do
+      assert {:ok, _config, warnings} = Config.from_map(zoned_map([@zone]))
+
+      assert Enum.any?(
+               warnings,
+               &(&1 =~ "camera cam_a: zones have no effect" and
+                   &1 =~ "zones filter tier-1 presence")
+             )
+    end
+
+    test "a tier-2 or tier-less profile is inert for zones the same way" do
+      for yaml <- [ort_yaml("tier: 2"), ort_yaml("")] do
+        assert {:ok, _config, warnings} = Config.from_map(zoned_tier_map(yaml))
+        assert Enum.any?(warnings, &(&1 =~ "camera cam_a: zones have no effect"))
+      end
+    end
+
+    test "a camera with no zones is never warned about" do
+      assert {:ok, config, []} = Config.from_map(base_map())
+      assert Enum.all?(config.cameras, &(&1.zones == []))
+    end
+  end
+
   describe "motion gate ownership (D-S4)" do
     # `enabled` said outright: without it the string resolves to no
     # detector and the load warns (its own test below).
@@ -1588,8 +1680,8 @@ defmodule Cairn.ConfigTest do
 
     test "a string resolving to no detector is carried but warned about" do
       # Legal vocabulary, nothing enabled: the gate is never built, which an
-      # operator who wrote zones surely did not mean — the silent-fallback
-      # lesson, at config load instead of on the NPU.
+      # operator who wrote a scene config surely did not mean — the
+      # silent-fallback lesson, at config load instead of on the NPU.
       assert {:ok, config, warnings} =
                Config.from_map(gated_map(ort_yaml("tier: 1"), ~s({"threshold": 30})))
 

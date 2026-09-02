@@ -3,7 +3,17 @@ defmodule Cairn.PipelineOwnerTest do
 
   alias Cairn.Config
   alias Cairn.Config.Camera
-  alias Cairn.{Fragment, PipelineOwner, RegistryHelpers, RingBuffer, StreamEpochs}
+
+  alias Cairn.{
+    Event,
+    Fragment,
+    PipelineOwner,
+    PresenceAggregator,
+    PresenceEvent,
+    RegistryHelpers,
+    RingBuffer,
+    StreamEpochs
+  }
 
   defmodule StubPipeline do
     @moduledoc """
@@ -163,6 +173,71 @@ defmodule Cairn.PipelineOwnerTest do
       assert_receive {:pipeline_msg, ^pipeline, {:policy, ^edited, policy}}, 2_000
       assert policy.record == edited.record
       assert :sys.get_state(owner).pipeline == pipeline
+    end
+  end
+
+  describe "a zone edit" do
+    @drive %{id: "drive", name: "Drive", points: [[0.0, 0.0], [0.4, 0.0], [0.4, 0.4], [0.0, 0.4]]}
+    # Far enough from 0 that the aggregator's confirm window never reaches a
+    # negative clock, as in `Cairn.PresenceAggregatorTest`.
+    @presence_base 1_000_000
+
+    # Two sightings confirm, which is what gives the refresh below a state to
+    # clear. Recording off: a confirm would otherwise open a real clip.
+    defp announce(camera_id, key) do
+      Cairn.CameraControl.set(camera_id, %{recording_enabled: false})
+
+      on_exit(fn ->
+        PresenceAggregator.retire(camera_id)
+        Cairn.Registry.await_unregistered(camera_id, :presence)
+        Cairn.Registry.await_unregistered(camera_id, :presence_recorder)
+      end)
+
+      PresenceAggregator.observed(camera_id, @presence_base, %{key => 0.9})
+      PresenceAggregator.observed(camera_id, @presence_base + 500, %{key => 0.9})
+    end
+
+    @tag :capture_log
+    test "with no pipeline to carry it, the owner clears the removed zone itself" do
+      cam = camera(uid("zoff"), zones: [@drive])
+      id = cam.id
+      Event.subscribe()
+      owner = start_owner(cam, backoff_min_ms: 5_000, backoff_max_ms: 5_000)
+
+      assert_receive {:pipeline_started, pipeline, _opts}, 2_000
+      announce(id, {"drive", "person"})
+      assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: "drive"}}, 2_000
+
+      # The backoff window the long backoff above holds open: `state.pipeline`
+      # is nil, so nothing downstream of this process exists to be told.
+      Process.exit(pipeline, :kill)
+      assert_receive {:status, ^id, :backoff}, 2_000
+
+      :ok = PipelineOwner.refresh(owner, %Camera{cam | zones: []}, config())
+
+      assert_receive {:presence_cleared,
+                      %PresenceEvent{camera_id: ^id, zone: "drive", label: "person"}},
+                     2_000
+    end
+
+    test "with the pipeline up, the clear is left to the sink" do
+      cam = camera(uid("zon"), zones: [@drive])
+      id = cam.id
+      Event.subscribe()
+      owner = start_owner(cam)
+
+      assert_receive {:pipeline_started, pipeline, _opts}, 2_000
+      announce(id, {"drive", "person"})
+      assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: "drive"}}, 2_000
+
+      edited = %Camera{cam | zones: []}
+      :ok = PipelineOwner.refresh(owner, edited, config())
+
+      # The policy carries the edit to the sink, which owns the clear there —
+      # the stub pipeline is not one, so a cleared here would be the owner
+      # sending a second.
+      assert_receive {:pipeline_msg, ^pipeline, {:policy, ^edited, _policy}}, 2_000
+      refute_receive {:presence_cleared, %PresenceEvent{camera_id: ^id}}, 100
     end
   end
 

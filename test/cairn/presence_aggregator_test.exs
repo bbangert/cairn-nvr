@@ -1,7 +1,7 @@
 defmodule Cairn.PresenceAggregatorTest do
   use ExUnit.Case, async: true
 
-  alias Cairn.{Event, PresenceAggregator, PresenceEvent, Registry}
+  alias Cairn.{Event, PresenceAggregator, PresenceEvent, PresenceLedger, Registry}
 
   # A base far enough from 0 that `at_ms - window` never goes negative, and
   # distinct per test via the camera id so async tests can't cross-confirm
@@ -30,18 +30,18 @@ defmodule Cairn.PresenceAggregatorTest do
   end
 
   test "a single sighting alone broadcasts nothing", %{camera_id: id} do
-    PresenceAggregator.observed(id, @base, %{"person" => 0.7})
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.7})
     refute_receive {:presence_started, %PresenceEvent{camera_id: ^id}}, 50
   end
 
   test "a second sighting inside the confirm window confirms with the max of the two scores", %{
     camera_id: id
   } do
-    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
-    PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.6})
+    PresenceAggregator.observed(id, @base + 500, %{{nil, "person"} => 0.9})
 
     assert_receive {:presence_started,
-                    %PresenceEvent{camera_id: ^id, label: "person", score: 0.9} = event}
+                    %PresenceEvent{camera_id: ^id, zone: nil, label: "person", score: 0.9} = event}
 
     assert DateTime.compare(event.first_seen_at, event.at) in [:lt, :eq]
   end
@@ -49,41 +49,41 @@ defmodule Cairn.PresenceAggregatorTest do
   test "a second sighting after the confirm window does not confirm; a close third does", %{
     camera_id: id
   } do
-    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.6})
     # 3_000ms > the 2_000ms window: the first sighting was a lone flicker.
-    PresenceAggregator.observed(id, @base + 3_000, %{"person" => 0.7})
+    PresenceAggregator.observed(id, @base + 3_000, %{{nil, "person"} => 0.7})
     refute_receive {:presence_started, %PresenceEvent{camera_id: ^id}}, 50
 
     # Candidacy restarted at `@base + 3_000`; this one lands inside its window.
-    PresenceAggregator.observed(id, @base + 3_500, %{"person" => 0.8})
-    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+    PresenceAggregator.observed(id, @base + 3_500, %{{nil, "person"} => 0.8})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
   end
 
   test "two frames of one buffer — two calls, one instant — still confirm", %{camera_id: id} do
     # A multi-frame `Detections` buffer reaches the aggregator as calls
     # sharing the sink's one clock read; they are two model passes on two
     # source frames, which is what the confirm asks for.
-    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
-    PresenceAggregator.observed(id, @base, %{"person" => 0.7})
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.6})
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.7})
 
-    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
   end
 
   test "a second sighting exactly at the window's edge confirms — the bound is inclusive", %{
     camera_id: id
   } do
-    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
-    PresenceAggregator.observed(id, @base + 2_000, %{"person" => 0.7})
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.6})
+    PresenceAggregator.observed(id, @base + 2_000, %{{nil, "person"} => 0.7})
 
-    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
   end
 
   test "a later, better sighting raises the score the clearing reports", %{camera_id: id} do
-    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
-    PresenceAggregator.observed(id, @base + 500, %{"person" => 0.7})
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.6})
+    PresenceAggregator.observed(id, @base + 500, %{{nil, "person"} => 0.7})
     assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, score: 0.7}}
 
-    PresenceAggregator.observed(id, @base + 1_000, %{"person" => 0.95})
+    PresenceAggregator.observed(id, @base + 1_000, %{{nil, "person"} => 0.95})
     PresenceAggregator.observed(id, @base + 6_000, %{})
     PresenceAggregator.observed(id, @base + 11_000, %{})
 
@@ -92,9 +92,9 @@ defmodule Cairn.PresenceAggregatorTest do
 
   test "present labels do not clear on absent batches inside the clear window, but every absent batch (even empty) still counts toward it",
        %{camera_id: id} do
-    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
-    PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})
-    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.6})
+    PresenceAggregator.observed(id, @base + 500, %{{nil, "person"} => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
 
     # The span opens at the FIRST absent batch — an empty map is still
     # evidence (frames flowed, nothing qualified) — and one absent batch
@@ -110,14 +110,14 @@ defmodule Cairn.PresenceAggregatorTest do
     PresenceAggregator.observed(id, @base + 6_000, %{})
 
     assert_receive {:presence_cleared,
-                    %PresenceEvent{camera_id: ^id, label: "person", score: 0.9}}
+                    %PresenceEvent{camera_id: ^id, zone: nil, label: "person", score: 0.9}}
   end
 
   test "silence before the first absent batch counts for nothing — the span is evidence, not elapsed time",
        %{camera_id: id} do
-    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
-    PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})
-    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.6})
+    PresenceAggregator.observed(id, @base + 500, %{{nil, "person"} => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
 
     # Ten minutes of gate-closed silence, then the scene wakes without the
     # person: the elapsed time must not let this single batch clear.
@@ -126,13 +126,13 @@ defmodule Cairn.PresenceAggregatorTest do
 
     # The second absent observation closes a real 5_000ms evidence span.
     PresenceAggregator.observed(id, @base + 605_000, %{})
-    assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, label: "person"}}
+    assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
   end
 
   test "a pending label that never confirmed goes stale without ever broadcasting", %{
     camera_id: id
   } do
-    PresenceAggregator.observed(id, @base, %{"person" => 0.5})
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.5})
     # A full absence span elapses, but the label never reached :present —
     # `absences/4` drops it silently.
     PresenceAggregator.observed(id, @base + 1_000, %{})
@@ -142,18 +142,136 @@ defmodule Cairn.PresenceAggregatorTest do
     refute_receive {:presence_cleared, %PresenceEvent{camera_id: ^id}}, 50
   end
 
+  test "a zoned sighting confirms and clears under its zone", %{camera_id: id} do
+    PresenceAggregator.observed(id, @base, %{{"drive", "person"} => 0.9})
+    PresenceAggregator.observed(id, @base + 500, %{{"drive", "person"} => 0.9})
+
+    assert_receive {:presence_started,
+                    %PresenceEvent{camera_id: ^id, zone: "drive", label: "person"}}
+
+    PresenceAggregator.observed(id, @base + 1_000, %{})
+    PresenceAggregator.observed(id, @base + 6_000, %{})
+
+    assert_receive {:presence_cleared,
+                    %PresenceEvent{camera_id: ^id, zone: "drive", label: "person"}}
+  end
+
+  test "the same label in two zones is two keys", %{camera_id: id} do
+    both = %{{"drive", "person"} => 0.6, {"porch", "person"} => 0.7}
+    PresenceAggregator.observed(id, @base, both)
+    PresenceAggregator.observed(id, @base + 500, both)
+
+    zones =
+      for _ <- 1..2 do
+        assert_receive {:presence_started,
+                        %PresenceEvent{camera_id: ^id, zone: zone, label: "person"}}
+
+        zone
+      end
+
+    assert Enum.sort(zones) == ["drive", "porch"]
+
+    # Absence is per key: the drive box is gone, the porch one never moved.
+    porch = %{{"porch", "person"} => 0.7}
+    PresenceAggregator.observed(id, @base + 1_000, porch)
+    PresenceAggregator.observed(id, @base + 6_000, porch)
+
+    assert_receive {:presence_cleared,
+                    %PresenceEvent{camera_id: ^id, zone: "drive", label: "person"}}
+
+    refute_receive {:presence_cleared, %PresenceEvent{camera_id: ^id}}, 50
+  end
+
+  test "zones_removed clears exactly the removed zone's present keys and drops its pending ones, leaving the rest",
+       %{camera_id: id} do
+    PresenceAggregator.observed(id, @base, %{{"drive", "person"} => 0.6, {"porch", "car"} => 0.6})
+
+    PresenceAggregator.observed(id, @base + 500, %{
+      {"drive", "person"} => 0.9,
+      {"porch", "car"} => 0.8,
+      # First sighting of this one: :pending, never announced.
+      {"drive", "dog"} => 0.5
+    })
+
+    assert_receive {:presence_started,
+                    %PresenceEvent{camera_id: ^id, zone: "drive", label: "person"}}
+
+    assert_receive {:presence_started,
+                    %PresenceEvent{camera_id: ^id, zone: "porch", label: "car"}}
+
+    PresenceAggregator.zones_removed(id, ["drive"])
+
+    assert_receive {:presence_cleared,
+                    %PresenceEvent{camera_id: ^id, zone: "drive", label: "person", score: 0.9}}
+
+    # The pending drive key produced no event, and porch is untouched.
+    refute_receive {:presence_cleared, %PresenceEvent{camera_id: ^id}}, 50
+    assert [{"porch", "car", _, _}] = PresenceLedger.leftovers(id)
+
+    # The dropped :pending really is gone: one fresh sighting confirms
+    # nothing, where a surviving one would have confirmed on this call.
+    PresenceAggregator.observed(id, @base + 1_000, %{{"drive", "dog"} => 0.7})
+    refute_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "dog"}}, 50
+
+    PresenceAggregator.observed(id, @base + 1_200, %{{"drive", "dog"} => 0.7})
+
+    assert_receive {:presence_started,
+                    %PresenceEvent{camera_id: ^id, zone: "drive", label: "dog"}}
+  end
+
+  test "zones_removed with [nil] clears whole-frame presence — the whole-frame to zoned flip", %{
+    camera_id: id
+  } do
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.6})
+    PresenceAggregator.observed(id, @base + 500, %{{nil, "person"} => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
+
+    # The camera gained its first zone: the whole-frame key stops being
+    # produced, so nothing would ever observe it absent.
+    PresenceAggregator.zones_removed(id, [nil])
+
+    assert_receive {:presence_cleared,
+                    %PresenceEvent{camera_id: ^id, zone: nil, label: "person", score: 0.9}}
+  end
+
+  test "every started gets one cleared across a removal", %{camera_id: id} do
+    PresenceAggregator.observed(id, @base, %{{"drive", "person"} => 0.6})
+    PresenceAggregator.observed(id, @base + 500, %{{"drive", "person"} => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: "drive"}}
+
+    PresenceAggregator.zones_removed(id, ["drive"])
+    assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, zone: "drive"}}
+
+    # The ledger row was deleted after that cleared went out, so the
+    # restart's recovery loop owes nothing — exactly one cleared, not two.
+    pid = Registry.whereis(id, :presence)
+    Process.exit(pid, :kill)
+
+    refute_receive {:presence_cleared, %PresenceEvent{camera_id: ^id}}, 200
+  end
+
+  test "zones_removed is a no-op with nothing running" do
+    other_id = "pres_#{System.unique_integer([:positive])}"
+
+    assert PresenceAggregator.zones_removed(other_id, ["drive"]) == :ok
+    assert Registry.whereis(other_id, :presence) == nil
+    refute_receive {:presence_cleared, %PresenceEvent{camera_id: ^other_id}}, 50
+  end
+
   test "detection_disabled/1 clears every present label at once, and is a no-op with nothing running",
        %{camera_id: id} do
-    PresenceAggregator.observed(id, @base, %{"person" => 0.6, "car" => 0.5})
-    PresenceAggregator.observed(id, @base + 500, %{"person" => 0.6, "car" => 0.5})
-    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
-    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "car"}}
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.6, {nil, "car"} => 0.5})
+    PresenceAggregator.observed(id, @base + 500, %{{nil, "person"} => 0.6, {nil, "car"} => 0.5})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil, label: "car"}}
 
     PresenceAggregator.detection_disabled(id)
 
     labels =
       for _ <- 1..2 do
-        assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, label: label}}
+        assert_receive {:presence_cleared,
+                        %PresenceEvent{camera_id: ^id, zone: nil, label: label}}
+
         label
       end
 
@@ -169,16 +287,16 @@ defmodule Cairn.PresenceAggregatorTest do
   test "a detection-disable broadcast clears with the gate closed — no batch needed", %{
     camera_id: id
   } do
-    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
-    PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})
-    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.6})
+    PresenceAggregator.observed(id, @base + 500, %{{nil, "person"} => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
 
     # The out-of-band path: no buffer arrives (still scene, closed gate) —
     # the aggregator hears the control broadcast itself.
     Cairn.CameraControl.set(id, %{detection_enabled: false})
     on_exit(fn -> Cairn.CameraControl.set(id, %{detection_enabled: true}) end)
 
-    assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, label: "person"}}
+    assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
   end
 
   test "an observed batch in flight past a disable is dropped at consume time", %{camera_id: id} do
@@ -188,8 +306,8 @@ defmodule Cairn.PresenceAggregatorTest do
     Cairn.CameraControl.set(id, %{detection_enabled: false})
     on_exit(fn -> Cairn.CameraControl.set(id, %{detection_enabled: true}) end)
 
-    PresenceAggregator.observed(id, @base, %{"person" => 0.9})
-    PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.9})
+    PresenceAggregator.observed(id, @base + 500, %{{nil, "person"} => 0.9})
 
     refute_receive {:presence_started, %PresenceEvent{camera_id: ^id}}, 50
   end
@@ -197,9 +315,9 @@ defmodule Cairn.PresenceAggregatorTest do
   test "a crash's unanswered presence_started gets its cleared from the restart", %{
     camera_id: id
   } do
-    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
-    PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})
-    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.6})
+    PresenceAggregator.observed(id, @base + 500, %{{nil, "person"} => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
 
     # An abnormal exit: `:transient` restarts it, and the fresh init owes
     # the world the cleared its predecessor never sent (the
@@ -208,7 +326,24 @@ defmodule Cairn.PresenceAggregatorTest do
     Process.exit(pid, :kill)
 
     assert_receive {:presence_cleared,
-                    %PresenceEvent{camera_id: ^id, label: "person", score: 0.9}}
+                    %PresenceEvent{camera_id: ^id, zone: nil, label: "person", score: 0.9}}
+  end
+
+  test "a crash's unanswered zoned presence_started clears under its zone", %{camera_id: id} do
+    PresenceAggregator.observed(id, @base, %{{"drive", "person"} => 0.6})
+    PresenceAggregator.observed(id, @base + 500, %{{"drive", "person"} => 0.9})
+
+    assert_receive {:presence_started,
+                    %PresenceEvent{camera_id: ^id, zone: "drive", label: "person"}}
+
+    # The ledger row carries the zone, so the recovery clear names the same
+    # key the started did — a client keyed on `{camera, zone, label}` is not
+    # left holding one it never hears about again.
+    pid = Registry.whereis(id, :presence)
+    Process.exit(pid, :kill)
+
+    assert_receive {:presence_cleared,
+                    %PresenceEvent{camera_id: ^id, zone: "drive", label: "person", score: 0.9}}
   end
 
   test "heartbeats keep the silence backstop from clearing a gated-but-live stream", %{
@@ -216,9 +351,9 @@ defmodule Cairn.PresenceAggregatorTest do
   } do
     base = System.monotonic_time(:millisecond) - 700_000
 
-    PresenceAggregator.observed(id, base, %{"person" => 0.6})
-    PresenceAggregator.observed(id, base + 500, %{"person" => 0.9})
-    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+    PresenceAggregator.observed(id, base, %{{nil, "person"} => 0.6})
+    PresenceAggregator.observed(id, base + 500, %{{nil, "person"} => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
 
     # The native gate has been skipping for 700s — but the sink's
     # heartbeats say the stream is alive, so the backstop must hold.
@@ -230,15 +365,15 @@ defmodule Cairn.PresenceAggregatorTest do
   end
 
   test "retire/1 clears, stops, and stays gone until the next batch", %{camera_id: id} do
-    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
-    PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})
-    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.6})
+    PresenceAggregator.observed(id, @base + 500, %{{nil, "person"} => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
 
     pid = Registry.whereis(id, :presence)
     ref = Process.monitor(pid)
     PresenceAggregator.retire(id)
 
-    assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, label: "person"}}
+    assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
     # A normal stop: `:transient` must not restart it, and the registry
     # entry dies with the process — awaited, since the registry's own DOWN
     # handling races the test's monitor.
@@ -251,9 +386,9 @@ defmodule Cairn.PresenceAggregatorTest do
   end
 
   test "silence alone (no batches at all) never clears presence", %{camera_id: id} do
-    PresenceAggregator.observed(id, @base, %{"person" => 0.6})
-    PresenceAggregator.observed(id, @base + 500, %{"person" => 0.9})
-    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.6})
+    PresenceAggregator.observed(id, @base + 500, %{{nil, "person"} => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
 
     # No further batches ever arrive — a closed motion gate, not a dead
     # stream. Clearing only advances on batches that arrive without the
@@ -268,14 +403,14 @@ defmodule Cairn.PresenceAggregatorTest do
     # the 600_000ms backstop by the time `:silence_check` is handled.
     base = System.monotonic_time(:millisecond) - 700_000
 
-    PresenceAggregator.observed(id, base, %{"person" => 0.6})
-    PresenceAggregator.observed(id, base + 500, %{"person" => 0.9})
-    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+    PresenceAggregator.observed(id, base, %{{nil, "person"} => 0.6})
+    PresenceAggregator.observed(id, base + 500, %{{nil, "person"} => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
 
     pid = Registry.whereis(id, :presence)
     send(pid, :silence_check)
 
-    assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, label: "person"}}
+    assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
 
     # One-shot: the clear also drops the batch history, so the next check has
     # nothing left to age (would otherwise re-run an empty clear per minute).

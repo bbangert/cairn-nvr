@@ -46,7 +46,7 @@ defmodule Cairn.Config.Camera do
   @known_keys ~w(id rtsp_url substream_url plugin pipeline ingest min_score track record
                  extra_ffmpeg_args transcode retention pre_window_seconds post_window_seconds
                  max_event_seconds max_unseen_ms max_live_tracks stationary_after_ms tracker
-                 motion_json annotation_offset_ms)
+                 motion_json annotation_offset_ms zones)
 
   # Wider than any plausible stream lag; the bound exists so a typo (seconds
   # written as ms, or a stray zero) is an error naming itself rather than
@@ -75,21 +75,32 @@ defmodule Cairn.Config.Camera do
             stationary_after_ms: nil,
             tracker: nil,
             # The motion gate's scene config, verbatim JSON — the operator's
-            # knob (D-P6: a profile never writes it) describing THIS scene's
-            # zones and thresholds. Validated at load, carried to the detect
-            # branch's gate element as `stream_params.motion_json`. Tier-2
-            # groups reject it (D-S4, `Cairn.Config.validate/2`).
+            # knob (D-P6: a profile never writes it) holding THIS scene's gate
+            # settings: its grid, its thresholds, whether it runs at all. The
+            # gate's own knobs, unrelated to the presence zones in `zones:`.
+            # Validated at load, carried to the detect branch's gate element as
+            # `stream_params.motion_json`. Tier-2 groups reject it (D-S4,
+            # `Cairn.Config.validate/2`).
             motion_json: nil,
             # Signed ms, applied where annotations are RENDERED and never baked
             # into what is stored — see `Cairn.Config.annotation_offset_ms/2`.
-            annotation_offset_ms: 0
+            annotation_offset_ms: 0,
+            # `[Cairn.Zones.zone()]` — the polygons `Cairn.Pipeline.PresenceSink`
+            # filters presence through. A camera field rather than its own store
+            # so a zone edit is refresh-class: it is absent from
+            # `Cairn.Config.Server`'s `@restart_fields`, so it reaches the sink
+            # through the `{:policy, camera, _}` refresh and never restarts the
+            # camera an operator is watching while they draw.
+            zones: []
 
   @type t :: %__MODULE__{}
 
   @typedoc """
   One parsed tier: label => rule. A rule is a map, not a bare number, so that
-  per-label area, aspect and zone filters can join `:min_score` inside it later
+  per-label area and aspect filters can join `:min_score` inside it later
   without changing the config shape; `:min_score` is the only key today.
+  (Zone filtering did not land here: it is the camera-level `zones:` list,
+  applied to every label alike by `Cairn.Pipeline.PresenceSink`.)
   """
   @type tier :: %{optional(String.t()) => %{min_score: float()}}
 
@@ -105,8 +116,9 @@ defmodule Cairn.Config.Camera do
   def detect_role(%__MODULE__{}), do: :main
 
   # Anchored (`\A`/`\z`, not `^`/`$`) so a trailing newline cannot sneak past
-  # the last character class the way `$` allows. The class is exported for
-  # the message attribution in `Cairn.Config`, which must agree with it.
+  # the last character class the way `$` allows. The class is exported because
+  # three things must agree with it: `Cairn.Config`'s message attribution, the
+  # row changeset in `Cairn.Cameras.Camera`, and zone ids in `Cairn.Zones`.
   @id_class "[a-z0-9][a-z0-9_-]*"
   @id_regex Regex.compile!("\\A#{@id_class}\\z")
 
@@ -180,6 +192,8 @@ defmodule Cairn.Config.Camera do
     {annotation_offset_ms, acc} =
       parse_annotation_offset(Map.get(raw, "annotation_offset_ms"), id, acc)
 
+    {zones, acc} = parse_zones(Map.get(raw, "zones"), id, acc)
+
     cam = %__MODULE__{
       id: id,
       rtsp_url: rtsp_url,
@@ -201,11 +215,67 @@ defmodule Cairn.Config.Camera do
       stationary_after_ms: Map.get(raw, "stationary_after_ms"),
       tracker: Map.get(raw, "tracker"),
       motion_json: motion_json,
-      annotation_offset_ms: annotation_offset_ms
+      annotation_offset_ms: annotation_offset_ms,
+      zones: zones
     }
 
     {cam, acc}
   end
+
+  # A zone that fails validation takes the whole camera's list with it: a
+  # partial fleet of polygons would filter presence somewhere the operator
+  # never drew, which is worse than the load error they can read.
+  defp parse_zones(nil, _id, acc), do: {[], acc}
+
+  defp parse_zones(zones, id, acc) when is_list(zones) do
+    # Taken ids come from every EARLIER entry, valid or not, so a duplicate
+    # is reported even when its twin failed on some other rule — otherwise
+    # fixing that rule would surface the duplicate one load later.
+    {parsed, acc, _taken} =
+      zones
+      |> Enum.with_index()
+      |> Enum.reduce({[], acc, []}, fn {raw, index}, {parsed, acc, taken} ->
+        case Cairn.Zones.validate(raw, taken) do
+          {:ok, zone} ->
+            {[zone | parsed], acc, [zone.id | taken]}
+
+          {:error, messages} ->
+            {parsed, zone_errors(acc, id, zone_ref(raw, index), messages),
+             taken ++ raw_zone_id(raw)}
+        end
+      end)
+
+    if length(parsed) == length(zones), do: {Enum.reverse(parsed), acc}, else: {[], acc}
+  end
+
+  defp parse_zones(_other, id, acc),
+    do: {[], add_error(acc, "camera #{id}: zones must be a list")}
+
+  # The camera-id convention one level down: name the zone when it has a
+  # usable id to be named by, and fall back to its position when it does not.
+  defp zone_ref(raw, index) when is_map(raw) do
+    case Map.get(raw, "id") || Map.get(raw, :id) do
+      id when is_binary(id) -> if valid_id?(id), do: id, else: "##{index}"
+      _other -> "##{index}"
+    end
+  end
+
+  defp zone_ref(_raw, index), do: "##{index}"
+
+  defp zone_errors(acc, id, ref, messages) do
+    Enum.reduce(messages, acc, fn message, acc ->
+      add_error(acc, "camera #{id}: zone #{ref}: #{message}")
+    end)
+  end
+
+  defp raw_zone_id(raw) when is_map(raw) do
+    case Map.get(raw, "id") || Map.get(raw, :id) do
+      id when is_binary(id) -> [id]
+      _other -> []
+    end
+  end
+
+  defp raw_zone_id(_raw), do: []
 
   # Integer ms only, and signed: the correction runs either way depending on
   # which of the two streams is behind. Absent is 0, which every consumer
@@ -242,8 +312,8 @@ defmodule Cairn.Config.Camera do
         # Valid vocabulary, no detector: `"enabled": true` was not said, so
         # the gate will not be built — indistinguishable at runtime from
         # omitting the key. Warned, not refused: the string is legal and
-        # carried verbatim, but an operator who wrote zones surely meant
-        # them to gate something (the silent-fallback lesson).
+        # carried verbatim, but an operator who wrote a scene config surely
+        # meant it to gate something (the silent-fallback lesson).
         {json,
          add_warning(
            acc,

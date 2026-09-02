@@ -75,6 +75,7 @@ defmodule CairnWeb.Api.EventStreamTest do
       struct!(
         %Cairn.PresenceEvent{
           camera_id: "cam_a",
+          zone: nil,
           label: "person",
           score: 0.8,
           first_seen_at: ~U[2026-07-24 00:00:00Z],
@@ -89,6 +90,7 @@ defmodule CairnWeb.Api.EventStreamTest do
 
       assert frame =~ "event: presence_started\n"
       assert frame =~ ~s("camera_id":"cam_a")
+      assert frame =~ ~s("zone":null)
       assert frame =~ ~s("label":"person")
       assert frame =~ ~s("state":"present")
       assert frame =~ ~s("score":0.8)
@@ -106,6 +108,28 @@ defmodule CairnWeb.Api.EventStreamTest do
       # dwell is readable off this frame alone.
       assert frame =~ ~s("first_seen_at":"2026-07-24T00:00:00Z")
       assert frame =~ ~s("score":0.8)
+    end
+
+    test "a zoned transition names the zone the client keys on" do
+      assert {:ok, frame} = SSE.frame_for({:presence_started, presence(zone: "drive")})
+
+      assert frame =~ ~s("zone":"drive")
+      assert frame =~ ~s("label":"person")
+    end
+
+    # The same rule as the artifact key set below: substring assertions
+    # cannot catch a stray or a missing key, and D-P4 promises `zone` on
+    # every presence frame — whole-frame ones included, where it is `null`
+    # rather than absent.
+    test "each presence kind emits exactly its own keys, no others" do
+      keys = ~w(at camera_id first_seen_at label score state zone)
+
+      for kind <- [:presence_started, :presence_cleared],
+          zone <- [nil, "drive"] do
+        assert {:ok, frame} = SSE.frame_for({kind, presence(zone: zone)})
+        assert [_, json] = Regex.run(~r/^data: (.*)\n\n$/m, frame)
+        assert json |> Jason.decode!() |> Map.keys() |> Enum.sort() == keys
+      end
     end
   end
 

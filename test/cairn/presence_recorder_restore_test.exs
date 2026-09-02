@@ -13,6 +13,8 @@ defmodule Cairn.PresenceRecorderRestoreTest do
 
   alias Cairn.Config.Camera
 
+  import Cairn.PresenceFixtures, only: [frame: 1, object: 4, relay: 1, relay_loop: 1]
+
   alias Cairn.{
     CameraControl,
     Event,
@@ -37,51 +39,15 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     on_exit(fn ->
       PresenceCheckpoint.delete(camera_id)
 
-      for {label, _at, _score} <- PresenceLedger.leftovers(camera_id),
-          do: PresenceLedger.cleared(camera_id, label)
+      for {zone, label, _at, _score} <- PresenceLedger.leftovers(camera_id),
+          do: PresenceLedger.cleared(camera_id, zone, label)
     end)
 
     %{camera_id: camera_id, camera: camera}
   end
 
-  # Stands in for an extractor that outlived the process which started it:
-  # unlinked, and owned by the TEST rather than by whoever started it, so it
-  # survives the recorder's death — which is the whole scenario here.
   defp frames(ctx, objects) do
-    frame = %{
-      pts: 0,
-      observed_at_ms: DateTime.to_unix(DateTime.utc_now(), :millisecond),
-      inferred: true,
-      infer_us: 0,
-      objects: objects
-    }
-
-    PresenceRecorder.frames(ctx.camera_id, %{"default" => 0.5}, [frame])
-  end
-
-  defp object(label, score, bbox) do
-    %{label: label, score: score, bbox: bbox, track_id: nil, observation_kind: "detected"}
-  end
-
-  defp relay(test_pid) do
-    spawn(fn ->
-      Process.monitor(test_pid)
-      relay_loop(test_pid)
-    end)
-  end
-
-  defp relay_loop(test_pid) do
-    receive do
-      {:"$gen_cast", message} ->
-        send(test_pid, {:extractor_cast, message})
-        relay_loop(test_pid)
-
-      {:DOWN, _ref, :process, ^test_pid, _reason} ->
-        :ok
-
-      _other ->
-        relay_loop(test_pid)
-    end
+    PresenceRecorder.frames(ctx.camera_id, %{"default" => 0.5}, [frame(objects)])
   end
 
   defp recorder(ctx, id \\ :recorder) do
@@ -116,11 +82,12 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     }
   end
 
-  defp presence(ctx, label, score) do
+  defp presence(ctx, label, score, zone) do
     now = DateTime.utc_now()
 
     %PresenceEvent{
       camera_id: ctx.camera_id,
+      zone: zone,
       label: label,
       score: score,
       first_seen_at: now,
@@ -128,15 +95,17 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     }
   end
 
-  defp started(ctx, label \\ "person", score \\ 0.9),
-    do: PresenceRecorder.presence(ctx.camera_id, :presence_started, presence(ctx, label, score))
+  defp started(ctx, label \\ "person", score \\ 0.9, zone \\ nil) do
+    PresenceRecorder.presence(ctx.camera_id, :presence_started, presence(ctx, label, score, zone))
+  end
 
-  defp cleared(ctx, label \\ "person", score \\ 0.9),
-    do: PresenceRecorder.presence(ctx.camera_id, :presence_cleared, presence(ctx, label, score))
+  defp cleared(ctx, label \\ "person", score \\ 0.9, zone \\ nil) do
+    PresenceRecorder.presence(ctx.camera_id, :presence_cleared, presence(ctx, label, score, zone))
+  end
 
   # The ledger row the aggregator writes before a `presence_started` goes out.
-  # Restore intersects the checkpoint's labels with these, so a test restoring a
-  # present label has to leave the trace the aggregator would have.
+  # Restore intersects the checkpoint's keys with these, so a test restoring a
+  # present key has to leave the trace the aggregator would have.
   # An extractor that outlived every witness to its event: registered exactly
   # where `Cairn.EventExtractor` registers itself, which is all the sweep has to
   # find it by.
@@ -173,8 +142,8 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     end
   end
 
-  defp announce(ctx, label, score \\ 0.9) do
-    PresenceLedger.announced(ctx.camera_id, label, DateTime.utc_now(), score)
+  defp announce(ctx, label, score \\ 0.9, zone \\ nil) do
+    PresenceLedger.announced(ctx.camera_id, zone, label, DateTime.utc_now(), score)
   end
 
   defp fire(recorder, kind, event_id) do
@@ -205,15 +174,15 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     # the aggregator still holds the label, which is what makes it a present
     # one rather than a ghost (`still_announced/2`)
     announce(ctx, "person")
-    PresenceCheckpoint.put(ctx.camera_id, event, ["person"], extractor)
+    PresenceCheckpoint.put(ctx.camera_id, event, [{nil, "person"}], extractor)
 
     rec = recorder(ctx)
 
     state = :sys.get_state(rec)
     assert state.event.id == eid
     assert state.extractor == extractor
-    assert state.present_labels == MapSet.new(["person"])
-    assert state.present_scores == %{"person" => 0.9}
+    assert state.present_labels == MapSet.new([{nil, "person"}])
+    assert state.present_scores == %{{nil, "person"} => 0.9}
     # a label is still present, so only the cap runs; the close clock waits for
     # the clear that has not happened
     assert state.max_token != nil
@@ -242,7 +211,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     event = event(ctx)
     announce(ctx, "person")
 
-    PresenceCheckpoint.put(ctx.camera_id, event, ["person"], extractor, %{
+    PresenceCheckpoint.put(ctx.camera_id, event, [{nil, "person"}], extractor, %{
       centers: %{"person" => %{1 => {0.55, 0.35}}},
       next: %{"person" => 2}
     })
@@ -251,7 +220,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
 
     # Centre 0.55 — inside the restored slot 1's radius: the box continues
     # its slot-1 path instead of minting "person" from an empty slot table.
-    frames(ctx, [object("person", 0.9, [0.5, 0.2, 0.1, 0.3])])
+    frames(ctx, [object("person", 0.9, "detected", [0.5, 0.2, 0.1, 0.3])])
     assert_receive {:extractor_cast, {:track_boxes, %{boxes: [{"person\u001F1", _, _, _, _}]}}}
   end
 
@@ -263,7 +232,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     event = %{event(ctx) | started_at: DateTime.add(DateTime.utc_now(), -400)}
     eid = event.id
     announce(ctx, "person")
-    PresenceCheckpoint.put(ctx.camera_id, event, ["person"], extractor)
+    PresenceCheckpoint.put(ctx.camera_id, event, [{nil, "person"}], extractor)
 
     # @policy max is 300; 400 s spent means the remainder is negative and the
     # timer fires immediately — no fire/3 helper, the real timer does it.
@@ -284,13 +253,13 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     extractor = relay(self())
     event = event(ctx, %{"person" => 0.9})
     announce(ctx, "person", 0.4)
-    PresenceCheckpoint.put(ctx.camera_id, event, ["person"], extractor)
+    PresenceCheckpoint.put(ctx.camera_id, event, [{nil, "person"}], extractor)
 
     rec = recorder(ctx)
 
     state = :sys.get_state(rec)
-    assert state.present_labels == MapSet.new(["person"])
-    assert state.present_scores == %{"person" => 0.4}
+    assert state.present_labels == MapSet.new([{nil, "person"}])
+    assert state.present_scores == %{{nil, "person"} => 0.4}
     # the event keeps its own history: only what a next segment would claim
     # comes from the ledger
     assert state.event.max_scores == %{"person" => 0.9}
@@ -324,7 +293,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     extractor = relay(self())
     event = event(ctx)
     eid = event.id
-    PresenceCheckpoint.put(ctx.camera_id, event, ["person"], extractor)
+    PresenceCheckpoint.put(ctx.camera_id, event, [{nil, "person"}], extractor)
 
     rec = recorder(ctx)
 
@@ -350,7 +319,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
 
     event = event(ctx)
     eid = event.id
-    PresenceCheckpoint.put(ctx.camera_id, event, ["person"], dead)
+    PresenceCheckpoint.put(ctx.camera_id, event, [{nil, "person"}], dead)
 
     rec = recorder(ctx)
 
@@ -360,6 +329,30 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     state = :sys.get_state(rec)
     assert state.event == nil
     assert state.extractor == nil
+  end
+
+  # The ledger is keyed by the whole `{zone, label}`, so a checkpoint key whose
+  # zone no longer announces is a ghost even while the same label is announced
+  # from another zone.
+  test "a checkpoint with zoned keys restores them against the zoned ledger rows", ctx do
+    extractor = relay(self())
+    event = event(ctx)
+    announce(ctx, "person", 0.8, "drive")
+
+    PresenceCheckpoint.put(
+      ctx.camera_id,
+      event,
+      [{"drive", "person"}, {"porch", "person"}],
+      extractor
+    )
+
+    rec = recorder(ctx)
+
+    state = :sys.get_state(rec)
+    assert state.present_labels == MapSet.new([{"drive", "person"}])
+    assert state.present_scores == %{{"drive", "person"} => 0.8}
+    # a key is still present, so only the cap runs
+    assert state.post_token == nil
   end
 
   # The crash window includes "the finalize cast was already in the extractor's
@@ -372,7 +365,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     {:ok, _row} = Events.create_active(event, "/tmp/#{eid}.mp4")
     {:ok, _row} = Events.finalize(%{event | ended_at: DateTime.utc_now()}, 1_024)
 
-    PresenceCheckpoint.put(ctx.camera_id, event, ["person"], nil)
+    PresenceCheckpoint.put(ctx.camera_id, event, [{nil, "person"}], nil)
 
     rec = recorder(ctx)
 
@@ -393,7 +386,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     eid = event.id
     {:ok, _row} = Events.create_active(event, "/tmp/#{eid}.mp4")
     {:ok, _row} = Events.finalize(%{event | ended_at: DateTime.utc_now()}, 1_024)
-    PresenceCheckpoint.put(ctx.camera_id, event, ["person"], extractor)
+    PresenceCheckpoint.put(ctx.camera_id, event, [{nil, "person"}], extractor)
 
     rec = recorder(ctx)
     assert :sys.get_state(rec).extractor == extractor
@@ -525,7 +518,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
   # confirm a second time before it has cleared.
   test "an announced label with no checkpoint opens an event on restart", ctx do
     id = ctx.camera_id
-    PresenceLedger.announced(id, "person", DateTime.add(DateTime.utc_now(), -20), 0.9)
+    PresenceLedger.announced(id, nil, "person", DateTime.add(DateTime.utc_now(), -20), 0.9)
 
     rec = recorder(ctx)
 
@@ -533,20 +526,36 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     assert_receive {:event_started, %Event{id: ^eid}}
 
     state = :sys.get_state(rec)
-    assert state.present_labels == MapSet.new(["person"])
+    assert state.present_labels == MapSet.new([{nil, "person"}])
     # dated from the restart, not from when the label was first seen: the clip
     # reaches no further back than the ring's pre-window
     assert DateTime.diff(DateTime.utc_now(), state.event.started_at, :millisecond) < 5_000
 
     # the ledger row is the aggregator's to clear, and is still there for it
-    assert [{"person", _at, 0.9}] = PresenceLedger.leftovers(id)
+    assert [{nil, "person", _at, 0.9}] = PresenceLedger.leftovers(id)
+  end
+
+  # The same started, announced from a zone: the present set keeps the zone, and
+  # the event it opens is keyed by the label alone.
+  test "an announced zoned key opens an event keyed by its label", ctx do
+    id = ctx.camera_id
+    PresenceLedger.announced(id, "drive", "person", DateTime.add(DateTime.utc_now(), -20), 0.9)
+
+    rec = recorder(ctx)
+
+    assert_receive {:extractor_started, %Event{id: eid, max_scores: %{"person" => 0.9}}, _pid}
+    assert_receive {:event_started, %Event{id: ^eid}}
+
+    state = :sys.get_state(rec)
+    assert state.present_labels == MapSet.new([{"drive", "person"}])
+    assert [%{label: "person", score: 0.9}] = state.event.labels
   end
 
   test "an announced label the record: tier refuses is not adopted", ctx do
     id = ctx.camera_id
     test_pid = self()
     camera = ctx.camera
-    PresenceLedger.announced(id, "cat", DateTime.utc_now(), 0.95)
+    PresenceLedger.announced(id, nil, "cat", DateTime.utc_now(), 0.95)
 
     rec =
       start_supervised!(
@@ -575,24 +584,24 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     extractor = relay(self())
     event = event(ctx)
     eid = event.id
-    PresenceCheckpoint.put(id, event, ["person"], extractor)
-    PresenceLedger.announced(id, "person", DateTime.utc_now(), 0.9)
+    PresenceCheckpoint.put(id, event, [{nil, "person"}], extractor)
+    PresenceLedger.announced(id, nil, "person", DateTime.utc_now(), 0.9)
 
     rec = recorder(ctx)
 
     state = :sys.get_state(rec)
     assert state.event.id == eid
-    assert state.present_labels == MapSet.new(["person"])
+    assert state.present_labels == MapSet.new([{nil, "person"}])
     refute_received {:event_started, %Event{camera_id: ^id}}
   end
 
-  # The ledger is keyed `{camera, label}` and read with a partially bound key;
-  # a pattern that let another camera's rows through would adopt its labels
+  # The ledger is keyed `{camera, zone, label}` and read with a partially bound
+  # key; a pattern that let another camera's rows through would adopt its keys
   # here, on a camera that never saw them.
   test "another camera's announced labels are not adopted", ctx do
     other = "prest_other_#{System.unique_integer([:positive])}"
-    PresenceLedger.announced(other, "person", DateTime.utc_now(), 0.9)
-    on_exit(fn -> PresenceLedger.cleared(other, "person") end)
+    PresenceLedger.announced(other, nil, "person", DateTime.utc_now(), 0.9)
+    on_exit(fn -> PresenceLedger.cleared(other, nil, "person") end)
 
     rec = recorder(ctx)
 
@@ -601,7 +610,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     assert state.present_labels == MapSet.new()
     assert PresenceLedger.leftovers(ctx.camera_id) == []
     # …and the other camera's row is still there to be read by its own recorder
-    assert [{"person", _at, 0.9}] = PresenceLedger.leftovers(other)
+    assert [{nil, "person", _at, 0.9}] = PresenceLedger.leftovers(other)
   end
 
   # `Cairn.EventExtractor.start/3` is a call into a DynamicSupervisor, so it
@@ -630,7 +639,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
         assert Process.alive?(rec)
         assert state.event == nil
         # the label is present, so the next transition opens from it
-        assert state.present_labels == MapSet.new(["person"])
+        assert state.present_labels == MapSet.new([{nil, "person"}])
       end)
 
     assert log =~ "could not start extractor"
@@ -652,12 +661,12 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     end)
 
     base = System.monotonic_time(:millisecond)
-    PresenceAggregator.observed(id, base, %{"person" => 0.6})
-    PresenceAggregator.observed(id, base + 500, %{"person" => 0.9})
+    PresenceAggregator.observed(id, base, %{{nil, "person"} => 0.6})
+    PresenceAggregator.observed(id, base + 500, %{{nil, "person"} => 0.9})
 
     assert_receive {:extractor_started, %Event{id: eid}, ex_pid}
     aggregator = Registry.whereis(id, :presence)
-    assert [{"person", _at, _score}] = PresenceLedger.leftovers(id)
+    assert [{nil, "person", _at, _score}] = PresenceLedger.leftovers(id)
 
     Process.exit(aggregator, :kill)
 
@@ -692,7 +701,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     end)
 
     base = System.monotonic_time(:millisecond)
-    PresenceAggregator.observed(id, base, %{"person" => 0.9})
+    PresenceAggregator.observed(id, base, %{{nil, "person"} => 0.9})
     pooled = Registry.whereis(id, :presence_recorder)
     assert is_pid(pooled)
 
@@ -700,7 +709,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     extractor = relay(self())
     event = event(ctx)
     eid = event.id
-    PresenceCheckpoint.put(id, event, ["person"], extractor)
+    PresenceCheckpoint.put(id, event, [{nil, "person"}], extractor)
 
     ledger = Process.whereis(Cairn.PresenceLedger)
     ref = Process.monitor(ledger)
@@ -711,7 +720,8 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     # the pool went with it…
     Registry.await_unregistered(id, :presence_recorder)
     # …and the row it was writing did not
-    assert {%Event{id: ^eid}, ["person"], ^extractor, _slots} = PresenceCheckpoint.get(id)
+    assert {%Event{id: ^eid}, [{nil, "person"}], ^extractor, _slots} =
+             PresenceCheckpoint.get(id)
 
     assert {:ok, replacement} = PresenceRecorder.ensure(id)
     assert replacement != pooled

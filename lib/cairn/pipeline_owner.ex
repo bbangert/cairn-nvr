@@ -65,7 +65,16 @@ defmodule Cairn.PipelineOwner do
 
   require Logger
 
-  alias Cairn.{CameraControl, CameraStatus, Config, FFmpegPort, RingBuffer, StreamEpochs}
+  alias Cairn.{
+    CameraControl,
+    CameraStatus,
+    Config,
+    FFmpegPort,
+    PresenceAggregator,
+    RingBuffer,
+    StreamEpochs,
+    Zones
+  }
 
   @backoff_min_ms 1_000
   @backoff_max_ms 30_000
@@ -180,6 +189,8 @@ defmodule Cairn.PipelineOwner do
 
   @impl true
   def handle_cast({:refresh, camera, config}, state) do
+    # Against the pre-update struct, for the pipeline-absent arm below.
+    removed = Zones.removed(state.camera.zones, camera.zones)
     state = %{state | camera: camera, config: config}
 
     # `send/2` and not a call: a refresh must not wait on a pipeline whose
@@ -187,6 +198,19 @@ defmodule Cairn.PipelineOwner do
     # nothing — the next start resolves the policy from `config`.
     if is_pid(state.pipeline) do
       send(state.pipeline, {:policy, camera, Config.policy(config, camera)})
+    else
+      # Except a zone edit, which the aggregator has to be told outright: it
+      # outlives the pipeline by design (only `Cairn.CameraSupervisor`'s
+      # `stop_camera/1` retires it), so through a backoff it would hold the
+      # gone zone's keys with nothing left producing evidence against them.
+      # Safe from here only because there is no pipeline: with one up, an
+      # `observed` batch already in flight could re-mint what this cleared,
+      # which is why `Cairn.Pipeline.PresenceSink` owns that case — its cast
+      # lands behind its own last one on the aggregator's mailbox.
+      #
+      # A tier-2 camera needs no clause of its own: it has no aggregator, and
+      # `zones_removed/2` looks the registration up rather than starting one.
+      if removed != [], do: PresenceAggregator.zones_removed(camera.id, removed)
     end
 
     {:noreply, state}

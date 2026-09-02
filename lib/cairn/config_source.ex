@@ -159,17 +159,9 @@ defmodule Cairn.ConfigSource do
     known = Config.Camera.known_keys()
     id = Map.get(raw, "id")
 
-    # `zones` is deferred, not unknown: the generic line below would read as a
-    # typo for a key the operator will get back in the editor.
-    zones =
-      if Map.has_key?(raw, "zones"),
-        do: ["camera #{id}: zones are not imported — draw them in the zone editor once it ships"],
-        else: []
-
     dropped =
       for key <- Map.keys(raw),
           key not in known,
-          key != "zones",
           do: "camera #{id}: dropped unknown key #{inspect(key)}"
 
     changeset =
@@ -177,10 +169,13 @@ defmodule Cairn.ConfigSource do
         id: id,
         position: index,
         enabled: true,
-        settings: raw |> Map.take(known) |> Cameras.canonical()
+        settings: raw |> Map.take(known) |> Cameras.canonical(),
+        # The whole file went through `from_map/1` before this import, so the
+        # zones stored here are exactly what it said and already valid.
+        zones: Map.get(raw, "zones", [])
       })
 
-    {changeset, warnings ++ zones ++ dropped}
+    {changeset, warnings ++ dropped}
   end
 
   # The hash covers the `cameras` list, not the file: the drift warning tells
