@@ -1681,15 +1681,17 @@ defmodule Cairn.Config do
   # land on the fleet side on purpose: `#` is outside the id class, and a row
   # that could not even name itself is not a row's fault. The class is
   # `Cairn.Config.Camera`'s own, so a widened id cannot silently demote a
-  # row's messages to fleet level.
-  @camera_prefix Regex.compile!("\\Acamera (#{Camera.id_class()}): ")
-
+  # row's messages to fleet level — read at call time, not into a module
+  # attribute, so this module keeps no compile-time edge onto a module that
+  # calls back into it (that edge made the cycle compile-connected).
   @doc false
   @spec partition_by_camera([String.t()]) :: {%{String.t() => [String.t()]}, [String.t()]}
   def partition_by_camera(messages) do
+    prefix = Regex.compile!("\\Acamera (#{Camera.id_class()}): ")
+
     {per_camera, fleet} =
       Enum.reduce(messages, {%{}, []}, fn msg, {per_camera, fleet} ->
-        case Regex.run(@camera_prefix, msg, capture: :all_but_first) do
+        case Regex.run(prefix, msg, capture: :all_but_first) do
           [id] -> {Map.update(per_camera, id, [msg], &[msg | &1]), fleet}
           nil -> {per_camera, [msg | fleet]}
         end

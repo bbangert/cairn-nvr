@@ -170,7 +170,7 @@ defmodule Cairn.Config.Server do
         config =
           case fallback do
             %Config{} ->
-              Logger.error("config: starting with the file's settings and no cameras")
+              Logger.error("config: starting with the loaded settings and no cameras")
               fallback
 
             nil ->
