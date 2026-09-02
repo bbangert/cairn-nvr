@@ -126,11 +126,17 @@ cameras=$(curl -s -H "Authorization: Bearer smoke-token" http://localhost:4000/a
 echo "$cameras" >>"$LOG"
 echo "$cameras" | grep -q smoke_cam || fail "/api/cameras does not list smoke_cam after the second boot"
 
-imports=$(docker logs cairn-smoke 2>&1 | grep -c "imported 1 camera(s) from" || true)
+# One dump, then grep the file: `grep -q` on a pipe quits at the first
+# match, and under pipefail a `docker logs` killed by that SIGPIPE fails the
+# pipeline on a line it just matched — which is how this step failed once
+# on the first boot's own warning, early in a two-boot log.
+BOOTLOG="$WORK/boot.log"
+docker logs cairn-smoke >"$BOOTLOG" 2>&1 || true
+imports=$(grep -c "imported 1 camera(s) from" "$BOOTLOG" || true)
 [ "$imports" = 1 ] || fail "expected exactly one import across two boots, saw $imports"
-docker logs cairn-smoke 2>&1 | grep -q "cameras changed since they were imported" &&
+grep -q "cameras changed since they were imported" "$BOOTLOG" &&
   fail "the second boot read the unchanged YAML cameras as drift"
-docker logs cairn-smoke 2>&1 | grep -q "still lists cameras:" ||
+grep -q "still lists cameras:" "$BOOTLOG" ||
   fail "the second boot did not warn that config.yml still lists cameras"
 say "PASS: second boot honours the import marker (one import, rows served, remove-the-key warning)"
 
