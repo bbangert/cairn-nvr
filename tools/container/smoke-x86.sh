@@ -8,7 +8,11 @@
 #   3. /api/cameras answers with the configured camera;
 #   4. qnn is a STATED refusal (valid-but-inert rule): the camera status /
 #      alert stream / logs name the qnn failure — a container without HTP
-#      must say so, never silently run CPU.
+#      must say so, never silently run CPU;
+#   5. a second boot on the same /data honours the import marker: the YAML
+#      cameras were imported into the database exactly once, the camera is
+#      still served from the rows, and the file's cameras: key earns the
+#      "remove the key" warning rather than a re-import.
 #
 # Everything is logged to smoke-x86.log next to this script.
 set -uo pipefail
@@ -102,6 +106,39 @@ if [ "$refused" = yes ]; then
 else
   fail "no stated qnn refusal — silent CPU fallback?"
 fi
+
+# Second boot, same /data (so the same cairn.db): the marker written on the
+# first boot must stop a re-import — a loader that imported again would
+# either duplicate the fleet or, on the id collision, refuse the load, and
+# both read as "cameras present" to every check above. `docker logs` spans
+# both boots, so the import line is counted, not just matched.
+say "restarting the container for the second-boot import check"
+docker restart cairn-smoke >>"$LOG" 2>&1 || fail "docker restart"
+
+for _ in $(seq 1 60); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:4000/ || true)
+  [ "$code" = 200 ] && break
+  sleep 2
+done
+[ "$code" = 200 ] || fail "UI never served 200 after the restart (last: $code)"
+
+cameras=$(curl -s -H "Authorization: Bearer smoke-token" http://localhost:4000/api/cameras)
+echo "$cameras" >>"$LOG"
+echo "$cameras" | grep -q smoke_cam || fail "/api/cameras does not list smoke_cam after the second boot"
+
+# One dump, then grep the file: `grep -q` on a pipe quits at the first
+# match, and under pipefail a `docker logs` killed by that SIGPIPE fails the
+# pipeline on a line it just matched — which is how this step failed once
+# on the first boot's own warning, early in a two-boot log.
+BOOTLOG="$WORK/boot.log"
+docker logs cairn-smoke >"$BOOTLOG" 2>&1 || true
+imports=$(grep -c "imported 1 camera(s) from" "$BOOTLOG" || true)
+[ "$imports" = 1 ] || fail "expected exactly one import across two boots, saw $imports"
+grep -q "cameras changed since they were imported" "$BOOTLOG" &&
+  fail "the second boot read the unchanged YAML cameras as drift"
+grep -q "still lists cameras:" "$BOOTLOG" ||
+  fail "the second boot did not warn that config.yml still lists cameras"
+say "PASS: second boot honours the import marker (one import, rows served, remove-the-key warning)"
 
 docker rm -f cairn-smoke >>"$LOG" 2>&1
 say "smoke complete — full log at $LOG"
