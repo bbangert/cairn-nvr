@@ -80,8 +80,10 @@ defmodule Cairn.PipelineOwnerTest do
 
   defp uid(prefix), do: "#{prefix}_#{System.unique_integer([:positive])}"
 
+  # Matched so the type checker knows the struct: `struct!/2` alone types as
+  # `struct()`, and every `%Camera{cam | …}` below would warn.
   defp camera(id, opts \\ []) do
-    struct!(%Camera{id: id, rtsp_url: "rtsp://127.0.0.1:554/x"}, opts)
+    %Camera{} = struct!(%Camera{id: id, rtsp_url: "rtsp://127.0.0.1:554/x"}, opts)
   end
 
   defp start_owner(cam, opts \\ []) do
@@ -161,6 +163,185 @@ defmodule Cairn.PipelineOwnerTest do
       assert_receive {:pipeline_msg, ^pipeline, {:policy, ^edited, policy}}, 2_000
       assert policy.record == edited.record
       assert :sys.get_state(owner).pipeline == pipeline
+    end
+  end
+
+  describe "init re-reads the camera" do
+    test "a restarted owner builds from the snapshot's refresh-class fields, not its child spec" do
+      cam = camera(uid("snap"), plugin: {:group, "g"})
+      edited = %Camera{cam | record: %{"person" => %{min_score: 0.9}}}
+      # the snapshot carries a restart-class change too, which must NOT win:
+      # the siblings above this process were built from the old one
+      snap = %Camera{edited | rtsp_url: "rtsp://127.0.0.1:554/moved"}
+      camera_id = cam.id
+
+      lookup = fn
+        ^camera_id -> {:ok, snap, config()}
+        _other -> :error
+      end
+
+      start_owner(cam, config_lookup: lookup)
+
+      assert_receive {:pipeline_started, _pipeline, opts}, 2_000
+      assert opts[:camera].record == edited.record
+      assert opts[:camera].rtsp_url == cam.rtsp_url
+      assert opts[:detect][:policy].record == edited.record
+    end
+
+    test "an owner with no snapshot builds from its child spec" do
+      cam = camera(uid("nosnap"))
+      start_owner(cam, config_lookup: fn _id -> :error end)
+
+      assert_receive {:pipeline_started, _pipeline, opts}, 2_000
+      assert opts[:camera] == cam
+    end
+
+    @tag :capture_log
+    test "a ring crash rebuilds the owner with the refreshed camera" do
+      # `ingest: :rtsp` keeps the bridge out of the tree; the probe task runs
+      # ffprobe against the fake url and fails, which is what a probe does here.
+      cam = camera(uid("ring"), ingest: :rtsp, plugin: {:group, "g"})
+      key = {__MODULE__, :lookup, cam.id}
+      on_exit(fn -> :persistent_term.erase(key) end)
+
+      :persistent_term.put({StubPipeline, cam.id}, self())
+      on_exit(fn -> :persistent_term.erase({StubPipeline, cam.id}) end)
+
+      start_supervised!(
+        {Cairn.Camera,
+         camera: cam,
+         config: config(),
+         owner_opts: [
+           pipeline_module: StubPipeline,
+           config_lookup: fn _id -> :persistent_term.get(key, :error) end,
+           backoff_min_ms: 50,
+           backoff_max_ms: 200,
+           flush_grace_ms: 20,
+           watchdog_interval_ms: 60_000,
+           status_fun: fn _id, _status -> :ok end
+         ]},
+        id: {:tree, cam.id}
+      )
+
+      assert_receive {:pipeline_started, first, opts}, 5_000
+      assert opts[:camera] == cam
+
+      owner = Cairn.Registry.whereis(cam.id, :pipeline)
+      edited = %Camera{cam | record: %{"person" => %{min_score: 0.9}}}
+      :ok = PipelineOwner.refresh(owner, edited, config())
+      assert_receive {:pipeline_msg, ^first, {:policy, ^edited, _policy}}, 2_000
+
+      # What the server publishes for that same reload. The moved rtsp_url is
+      # restart-class: the ring and bridge above this process were built from
+      # the old one, so opts has to win it back.
+      moved = %Camera{edited | rtsp_url: "rtsp://127.0.0.1:554/moved"}
+      :persistent_term.put(key, {:ok, moved, config()})
+
+      # :rest_for_one rebuilds the owner from the STORED child spec, which
+      # still carries the pre-refresh struct
+      cam.id |> Cairn.Registry.whereis(:ring_buffer) |> Process.exit(:kill)
+
+      assert_receive {:pipeline_started, second, opts2}, 5_000
+      assert second != first
+      assert opts2[:camera].record == edited.record
+      assert opts2[:camera].rtsp_url == cam.rtsp_url
+    end
+
+    # What is pinned: the reload publishes its snapshot BEFORE calling
+    # apply_diff, and an owner born inside that call sees it. The owners are
+    # started the way `Cairn.CameraSupervisor.apply_diff/2` starts them —
+    # supervisor-free, so `init/1` runs inside the server process while the
+    # reload is still in `handle_call`. The deadlock this arrangement would
+    # cause has no time-box here: the default `config_lookup` addresses the
+    # application's own named server, which is idle in test, so a call from
+    # `init/1` would return rather than hang.
+    test "owners started from inside a reload build from the fleet it published" do
+      dir =
+        Path.join(System.tmp_dir!(), "cairn_owner_reload_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      path = Path.join(dir, "config.yml")
+      name = :"reload_test_#{System.unique_integer([:positive])}"
+      on_exit(fn -> :persistent_term.erase(Config.Server.snapshot_key(name)) end)
+
+      ids = Enum.map(1..3, fn _ -> uid("reload") end)
+      test_pid = self()
+
+      Enum.each(ids, fn id ->
+        :persistent_term.put({StubPipeline, id}, test_pid)
+        on_exit(fn -> :persistent_term.erase({StubPipeline, id}) end)
+      end)
+
+      cam_a = "  - id: cam_a\n    rtsp_url: rtsp://h/1\n"
+
+      write_config = fn cameras ->
+        File.write!(path, "data_dir: #{Path.join(dir, "data")}\ncameras:\n" <> cameras)
+      end
+
+      write_config.(cam_a)
+
+      # The camera in opts is BARE: `record` exists only in the YAML, so an
+      # owner that skipped the snapshot could not produce it.
+      apply_diff = fn _diff, _config ->
+        Enum.each(ids, fn id ->
+          {:ok, pid} =
+            PipelineOwner.start_link(
+              camera: camera(id),
+              config: config(),
+              config_lookup: &Config.Server.snapshot_camera(&1, name),
+              pipeline_module: StubPipeline,
+              backoff_min_ms: 50,
+              backoff_max_ms: 200,
+              flush_grace_ms: 20,
+              watchdog_interval_ms: 60_000,
+              status_fun: fn _id, _status -> :ok end
+            )
+
+          send(test_pid, {:owner_started, pid})
+        end)
+      end
+
+      server =
+        start_supervised!(
+          {Config.Server,
+           path: path, name: name, apply_native: fn _config -> :ok end, apply_diff: apply_diff},
+          id: :reload_owner_server
+        )
+
+      write_config.(
+        cam_a <>
+          Enum.map_join(ids, fn id ->
+            "  - id: #{id}\n    rtsp_url: rtsp://h/#{id}\n    record:\n      person: 0.9\n"
+          end)
+      )
+
+      assert {:ok, %{added: added}, _warnings} = Config.Server.reload(server)
+      assert Enum.sort(added) == Enum.sort(ids)
+
+      # Registered from the test process: a failure below must not leak an
+      # owner past the `{StubPipeline, id}` erase above. A stop, so the
+      # owner's terminate takes its stub pipeline with it; caught, because
+      # these are linked to the server the harness tears down in parallel and
+      # stopping an already-dying pid exits the caller.
+      Enum.each(ids, fn _ ->
+        assert_receive {:owner_started, pid}
+
+        on_exit(fn ->
+          try do
+            GenServer.stop(pid)
+          catch
+            :exit, _already_down -> :ok
+          end
+        end)
+      end)
+
+      Enum.each(ids, fn _ ->
+        assert_receive {:pipeline_started, _pipeline, opts}, 2_000
+        assert opts[:camera].record == %{"person" => %{min_score: 0.9}}
+        assert opts[:camera].id in ids
+      end)
     end
   end
 

@@ -146,10 +146,45 @@ defmodule Cairn.Config do
   @doc "Loads and validates the YAML config file at `path`."
   @spec load(Path.t()) :: {:ok, t(), [String.t()]} | {:error, [String.t()]}
   def load(path) do
-    with {:ok, raw} <- read_file(path),
-         {:ok, map} <- parse_yaml(raw) do
-      from_map(map)
+    with {:ok, map} <- raw_map(path), do: from_map(map)
+  end
+
+  @doc """
+  `load/1` in the shape `Cairn.Config.Server` takes a source in: no camera is
+  ever skipped by this source, and a file whose only fault is its cameras
+  still yields its globals as the fallback (`"cameras"` emptied and
+  re-validated), so a failed boot runs retention, the HA token and the
+  reconciler on the operator's `data_dir` rather than on the struct defaults.
+  """
+  @spec load_file(Path.t()) ::
+          {:ok, t(), [String.t()], %{optional(String.t()) => [String.t()]}}
+          | {:error, [String.t()], t() | nil}
+  def load_file(path) do
+    case raw_map(path) do
+      {:ok, map} ->
+        case from_map(map) do
+          {:ok, config, warnings} -> {:ok, config, warnings, %{}}
+          {:error, errors} -> {:error, errors, globals_fallback(map)}
+        end
+
+      {:error, errors} ->
+        {:error, errors, nil}
     end
+  end
+
+  # A second pass of the impure `from_map/1` (profile and artifact reads
+  # again); a failed boot is rare enough to pay it.
+  defp globals_fallback(map) do
+    case from_map(Map.put(map, "cameras", [])) do
+      {:ok, config, _warnings} -> config
+      {:error, _errors} -> nil
+    end
+  end
+
+  @doc "The YAML mapping at `path`, parsed and nothing more."
+  @spec raw_map(Path.t()) :: {:ok, map()} | {:error, [String.t()]}
+  def raw_map(path) do
+    with {:ok, raw} <- read_file(path), do: parse_yaml(raw)
   end
 
   @doc """
@@ -196,7 +231,12 @@ defmodule Cairn.Config do
     end
   end
 
-  @doc false
+  @doc """
+  Builds and validates a config from a YAML-shaped map — the one validator,
+  whatever produced the map (the file, or rows rendered into its `"cameras"`
+  key). Not pure: it reads `CAIRN_DATA_DIR`, the profile files under
+  `profile_dirs` and their model artifacts.
+  """
   @spec from_map(map()) :: {:ok, t(), [String.t()]} | {:error, [String.t()]}
   def from_map(map) do
     acc = %{errors: [], warnings: []}
@@ -1634,6 +1674,31 @@ defmodule Cairn.Config do
   defp int?(v, min, max), do: is_integer(v) and v >= min and v <= max
 
   # -- accumulator helpers ----------------------------------------------------
+
+  # Every message about a named camera is prefixed `camera <id>: `, so this
+  # splits a `from_map/1` error/warning list into per-camera lists (order
+  # kept) and the fleet-level rest. Index-prefixed messages (`camera #3: …`)
+  # land on the fleet side on purpose: `#` is outside the id class, and a row
+  # that could not even name itself is not a row's fault. The class is
+  # `Cairn.Config.Camera`'s own, so a widened id cannot silently demote a
+  # row's messages to fleet level — read at call time, not into a module
+  # attribute, so this module keeps no compile-time edge onto a module that
+  # calls back into it (that edge made the cycle compile-connected).
+  @doc false
+  @spec partition_by_camera([String.t()]) :: {%{String.t() => [String.t()]}, [String.t()]}
+  def partition_by_camera(messages) do
+    prefix = Regex.compile!("\\Acamera (#{Camera.id_class()}): ")
+
+    {per_camera, fleet} =
+      Enum.reduce(messages, {%{}, []}, fn msg, {per_camera, fleet} ->
+        case Regex.run(prefix, msg, capture: :all_but_first) do
+          [id] -> {Map.update(per_camera, id, [msg], &[msg | &1]), fleet}
+          nil -> {per_camera, [msg | fleet]}
+        end
+      end)
+
+    {Map.new(per_camera, fn {id, msgs} -> {id, Enum.reverse(msgs)} end), Enum.reverse(fleet)}
+  end
 
   @doc false
   def add_error(acc, msg), do: %{acc | errors: [msg | acc.errors]}

@@ -15,11 +15,16 @@ defmodule Cairn.Application do
       # camera and the host have died and queued their drops.
       Cairn.Native.Drain,
       CairnWeb.Telemetry,
-      # Config first: everything else (Repo path, data dirs, cameras) hangs off it
-      {Cairn.Config.Server, []},
+      # The Repo needs no config process: with `db_in_data_dir`,
+      # `Cairn.Repo.init/2` resolves `data_dir` from the env override or the
+      # YAML file itself.
       Cairn.Repo,
       {Ecto.Migrator,
        repos: Application.fetch_env!(:cairn, :ecto_repos), skip: skip_migrations?()},
+      # After the migrated Repo, so a config source may read rows; before
+      # everything that reads the config. Its `init/1` must not broadcast —
+      # PubSub starts below it.
+      {Cairn.Config.Server, []},
       {DNSCluster, query: Application.get_env(:cairn, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Cairn.PubSub},
       Cairn.Registry,

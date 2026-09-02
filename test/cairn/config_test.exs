@@ -445,6 +445,13 @@ defmodule Cairn.ConfigTest do
       assert Enum.any?(errors, &(&1 =~ "id is required"))
     end
 
+    test "a camera id cannot end in a newline" do
+      map = update_in(base_map(), ["cameras"], fn [a, b] -> [Map.put(a, "id", "cam_a\n"), b] end)
+
+      assert {:error, errors} = Config.from_map(map)
+      assert Enum.any?(errors, &(&1 =~ "camera #0: id is required"))
+    end
+
     test "min_score out of range is an error" do
       map =
         update_in(base_map(), ["cameras"], fn [a, b] ->
@@ -463,7 +470,13 @@ defmodule Cairn.ConfigTest do
 
       assert {:ok, _config, warnings} = Config.from_map(map)
       assert Enum.any?(warnings, &(&1 =~ ~s(unknown key "shenanigans" in config)))
-      assert Enum.any?(warnings, &(&1 =~ ~s(unknown key "typo_key" in camera #0)))
+      assert Enum.any?(warnings, &(&1 =~ ~s(camera cam_a: unknown key "typo_key")))
+    end
+
+    test "unknown key on a camera with no valid id warns by index, not by id" do
+      raw = %{"id" => "Bad Id!", "rtsp_url" => "rtsp://h/1", "typo_key" => 1}
+      assert {nil, acc} = Config.Camera.parse(raw, 0, %{errors: [], warnings: []})
+      assert Enum.any?(acc.warnings, &(&1 =~ ~s(unknown key "typo_key" in camera #0)))
     end
 
     test "an inline plugin command is refused with its remedy, in both spellings" do
@@ -477,6 +490,100 @@ defmodule Cairn.ConfigTest do
       assert Enum.count(errors, &(&1 =~ "inline plugin commands were removed")) == 2
       assert Enum.any?(errors, &(&1 =~ "camera cam_a"))
       assert Enum.any?(errors, &(&1 =~ "camera cam_b"))
+    end
+  end
+
+  describe "partition_by_camera/1" do
+    test "every error Camera.build emits lands under its camera's id" do
+      map =
+        update_in(base_map(), ["cameras"], fn [a, b] ->
+          faulty =
+            Map.merge(a, %{
+              "min_score" => %{"person" => 1.5},
+              "track" => "nope",
+              "ingest" => "carrier-pigeon",
+              "substream_url" => "http://x",
+              "annotation_offset_ms" => "soon",
+              "pipeline" => "classic",
+              "extra_ffmpeg_args" => [1],
+              "motion_json" => "{not json"
+            })
+
+          [faulty, b]
+        end)
+
+      assert {:error, errors} = Config.from_map(map)
+      {per_camera, fleet} = Config.partition_by_camera(errors)
+
+      assert Map.keys(per_camera) == ["cam_a"]
+      assert fleet == []
+
+      msgs = Map.fetch!(per_camera, "cam_a")
+      # one message per fault above, and no fault silently folded into another
+      assert length(msgs) == 8
+
+      for fragment <- [
+            "min_score values must be 0..1",
+            "track must be a mapping",
+            "ingest must be",
+            "substream_url must be an rtsp:// url",
+            "annotation_offset_ms must be an integer",
+            "classic pipeline was removed",
+            "extra_ffmpeg_args must be a list of strings",
+            "motion_json:"
+          ] do
+        assert Enum.any?(msgs, &(&1 =~ fragment)), "no cam_a message matched #{fragment}"
+      end
+    end
+
+    test "cross-camera and global errors are fleet-level" do
+      map =
+        base_map()
+        |> update_in(["cameras"], fn [a, b] -> [a, Map.put(b, "id", "cam_a")] end)
+        |> Map.put("tracking", %{"max_unseen_ms" => -1})
+
+      assert {:error, errors} = Config.from_map(map)
+      {per_camera, fleet} = Config.partition_by_camera(errors)
+
+      assert fleet != []
+      assert Enum.any?(fleet, &(&1 =~ "duplicate camera id"))
+      assert per_camera == %{}
+    end
+
+    test "an unknown key on a camera with a valid id warns by id, not by position" do
+      map = update_in(base_map(), ["cameras"], fn [a, b] -> [Map.put(a, "typo_key", 1), b] end)
+
+      assert {:ok, _config, warnings} = Config.from_map(map)
+      {per_camera, fleet} = Config.partition_by_camera(warnings)
+
+      assert Map.fetch!(per_camera, "cam_a") == [~s(camera cam_a: unknown key "typo_key")]
+      assert fleet == []
+    end
+
+    test "a camera's messages keep the order from_map returned them" do
+      map =
+        update_in(base_map(), ["cameras"], fn [a, b] ->
+          [Map.merge(a, %{"min_score" => %{"person" => 1.5}, "pipeline" => "classic"}), b]
+        end)
+
+      assert {:error, errors} = Config.from_map(map)
+      {per_camera, []} = Config.partition_by_camera(errors)
+
+      assert Map.fetch!(per_camera, "cam_a") ==
+               Enum.filter(errors, &String.starts_with?(&1, "camera cam_a: "))
+
+      assert length(Map.fetch!(per_camera, "cam_a")) == 2
+    end
+
+    test "index-prefixed messages stay fleet-level" do
+      messages = [
+        "camera #3: id is required ([a-z0-9_-], lowercase)",
+        "camera cam_b: rtsp_url is required"
+      ]
+
+      assert Config.partition_by_camera(messages) ==
+               {%{"cam_b" => ["camera cam_b: rtsp_url is required"]},
+                ["camera #3: id is required ([a-z0-9_-], lowercase)"]}
     end
   end
 

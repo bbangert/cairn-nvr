@@ -15,6 +15,10 @@ config :cairn, Cairn.Repo,
 config :cairn,
   db_in_data_dir: false,
   config_path: "test/support/fixtures/configs/valid.yml",
+  # Pinned to the file: a loader that imports the fixture into the DB at
+  # boot would write rows outside the sandbox from a process no test owns
+  # (boot-writes-escape-ecto-sandbox).
+  config_loader: {Cairn.Config, :load_file},
   start_cameras: false,
   skip_boot_migrations: true,
   # The application's own `Cairn.TrackRecorder` buffers whatever any test's

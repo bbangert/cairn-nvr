@@ -1,14 +1,39 @@
 defmodule Cairn.Config.Server do
   @moduledoc """
-  Holds the active `Cairn.Config`. Loads YAML at boot; `reload/0` re-reads,
-  validates, diffs cameras against the running set and applies the diff
-  (start/stop/restart camera trees, and refresh in place the cameras whose
-  change reaches no subprocess). An invalid reload keeps the old config and
-  returns the errors.
+  Holds the active `Cairn.Config`. Loads it through its `source` at boot;
+  `reload/0` loads again, diffs cameras against the running set and applies
+  the diff (start/stop/restart camera trees, and refresh in place the
+  cameras whose change reaches no subprocess). An invalid reload keeps the
+  old config and returns the errors.
+
+  The source is the `source:` opt, else the `:config_loader` app env — a
+  1-arity fun of the config path, or `{module, function}` naming one; the
+  file source is `Cairn.Config.load_file/1`. A missing or malformed loader
+  is the one failure this module does not degrade around: `init/1` raises
+  and the node does not boot, because a config process with no source has
+  nothing to install.
+
+  A load that fails at boot installs the source's fallback when it offers
+  one — the file's globals with no cameras — so the readers that run
+  regardless (`Cairn.Retention`, `Cairn.Boot`'s reconciler, the HA token
+  behind `/api`) work on the operator's `data_dir`, retention and token, not
+  the struct defaults. One visible consequence: on a failed boot `/api`
+  honours the operator's token and answers with an empty camera list, where
+  it used to refuse every request with 401.
 
   Detection lives in `Cairn.Native.Host`, so the new config goes there
   first (`reconfigure/1`) — the model a camera's next session opens a
   stream on should already be the new one when its tree restarts.
+
+  A named server publishes each config it installs as a `:persistent_term`
+  snapshot *before* applying it, for `snapshot_camera/2`: a camera tree
+  restarted by its own supervisor is rebuilt from the child spec its tree
+  was born with, and the snapshot is how the owner recovers what a refresh
+  since then delivered. A term rather than a call because `apply_diff`
+  runs inside this process — a camera started from a reload that called
+  back here would wait on the very call that is starting it. For the
+  duration of an apply the snapshot therefore leads `get/1`, which answers
+  the previous config until the apply returns.
   """
 
   use GenServer
@@ -25,12 +50,57 @@ defmodule Cairn.Config.Server do
           refreshed: [String.t()]
         }
 
+  @typedoc "Cameras a source left out of the config, and why."
+  @type skipped :: %{String.t() => [String.t()]}
+
+  @typedoc """
+  What a source answers. On error, the fallback is the best config the
+  source can stand behind without its cameras, or `nil`.
+  """
+  @type source_result ::
+          {:ok, Config.t(), [String.t()], skipped()}
+          | {:error, [String.t()], Config.t() | nil}
+
+  @type source :: (Path.t() -> source_result())
+
+  @typedoc "The `source:` opt / `:config_loader` app env: a source, or `{module, function}` naming one."
+  @type loader :: source() | {module(), atom()}
+
+  @type last_load :: %{warnings: [String.t()], errors: [String.t()], skipped: skipped()}
+
+  # Atom names only: the snapshot is keyed by the name, and every reader of
+  # a snapshot has to be able to spell it.
   def start_link(opts) do
     case Keyword.get(opts, :name, __MODULE__) do
-      nil -> GenServer.start_link(__MODULE__, opts)
-      name -> GenServer.start_link(__MODULE__, opts, name: name)
+      nil ->
+        GenServer.start_link(__MODULE__, opts)
+
+      name when is_atom(name) ->
+        GenServer.start_link(__MODULE__, opts, name: name)
+
+      other ->
+        raise ArgumentError, "#{inspect(__MODULE__)} name must be an atom, got: #{inspect(other)}"
     end
   end
+
+  @doc """
+  The camera and config a restarting tree should build from, from the
+  snapshot the server named `server` last published — `:error` when it has
+  published none or the camera has since left the config.
+  """
+  @spec snapshot_camera(String.t(), atom()) :: {:ok, Config.Camera.t(), Config.t()} | :error
+  def snapshot_camera(camera_id, server \\ __MODULE__) when is_atom(server) do
+    with %Config{} = config <- :persistent_term.get(snapshot_key(server), nil),
+         %Config.Camera{} = cam <- Enum.find(config.cameras, &(&1.id == camera_id)) do
+      {:ok, cam, config}
+    else
+      _absent -> :error
+    end
+  end
+
+  @doc false
+  @spec snapshot_key(atom()) :: {module(), :snapshot, atom()}
+  def snapshot_key(server) when is_atom(server), do: {__MODULE__, :snapshot, server}
 
   @spec get(GenServer.server()) :: Config.t()
   def get(server \\ __MODULE__), do: GenServer.call(server, :get)
@@ -50,8 +120,12 @@ defmodule Cairn.Config.Server do
   @spec ha_token(GenServer.server()) :: String.t() | nil
   def ha_token(server \\ __MODULE__), do: get(server).ha_token
 
-  @doc "Warnings and errors from the last load/reload attempt (for the UI)."
-  @spec last_load(GenServer.server()) :: %{warnings: [String.t()], errors: [String.t()]}
+  @doc """
+  Warnings, errors and skipped cameras from the last load or reload attempt
+  (for the UI). A failed reload carries only its errors: the warnings and
+  skips of the config still running describe a file that is gone.
+  """
+  @spec last_load(GenServer.server()) :: last_load()
   def last_load(server \\ __MODULE__), do: GenServer.call(server, :last_load)
 
   @spec reload(GenServer.server()) ::
@@ -64,26 +138,49 @@ defmodule Cairn.Config.Server do
     apply_diff = Keyword.get(opts, :apply_diff, &Cairn.CameraSupervisor.apply_diff/2)
     apply_native = Keyword.get(opts, :apply_native, &Host.reconfigure/1)
 
+    source =
+      opts
+      |> Keyword.get_lazy(:source, fn -> Application.fetch_env!(:cairn, :config_loader) end)
+      |> source_fun()
+
     state = %{
       path: path,
+      source: source,
+      # An unnamed server has no key to publish under; nothing reads a
+      # snapshot of a server it cannot name.
+      snapshot: Keyword.get(opts, :name, __MODULE__),
       apply_diff: apply_diff,
       apply_native: apply_native,
       config: %Config{},
       warnings: [],
-      errors: []
+      errors: [],
+      skipped: %{}
     }
 
-    case Config.load(path) do
-      {:ok, config, warnings} ->
+    case load(state) do
+      {:ok, config, warnings, skipped} ->
         Enum.each(warnings, &Logger.warning("config: #{&1}"))
         Cairn.DataDir.ensure!(config.data_dir)
-        {:ok, %{state | config: config, warnings: warnings}}
+        publish(state, config)
+        {:ok, %{state | config: config, warnings: warnings, skipped: skipped}}
 
-      {:error, errors} ->
+      {:error, errors, fallback} ->
         Enum.each(errors, &Logger.error("config: #{&1}"))
-        Logger.error("config: starting with empty defaults (no cameras)")
-        Cairn.DataDir.ensure!(state.config.data_dir)
-        {:ok, %{state | errors: errors}}
+
+        config =
+          case fallback do
+            %Config{} ->
+              Logger.error("config: starting with the loaded settings and no cameras")
+              fallback
+
+            nil ->
+              Logger.error("config: starting with empty defaults (no cameras)")
+              %Config{}
+          end
+
+        Cairn.DataDir.ensure!(config.data_dir)
+        publish(state, config)
+        {:ok, %{state | config: config, errors: errors}}
     end
   end
 
@@ -91,28 +188,69 @@ defmodule Cairn.Config.Server do
   def handle_call(:get, _from, state), do: {:reply, state.config, state}
 
   def handle_call(:last_load, _from, state) do
-    {:reply, %{warnings: state.warnings, errors: state.errors}, state}
+    {:reply, %{warnings: state.warnings, errors: state.errors, skipped: state.skipped}, state}
   end
 
   def handle_call(:reload, _from, state) do
-    case Config.load(state.path) do
-      {:ok, new_config, warnings} ->
+    case load(state) do
+      {:ok, new_config, warnings, skipped} ->
         diff = diff_cameras(state.config, new_config)
         # Before the diff: newly spawned ports redirect logs into the (possibly
         # changed) data_dir, so its log subdir must already exist
         Cairn.DataDir.ensure!(new_config.data_dir)
+        # Before the apply: a tree the diff restarts may be rebuilt by its
+        # supervisor at any point after, and must find this fleet, not the
+        # last one.
+        publish(state, new_config)
         # Before the cameras: detection is the in-VM engine, so the model a
         # restarted camera will open a stream on should already be the new
         # one. The call is asynchronous, so this is an ordering of sends
         # rather than of loads.
         state.apply_native.(new_config)
         state.apply_diff.(diff, new_config)
-        state = %{state | config: new_config, warnings: warnings, errors: []}
+        state = %{state | config: new_config, warnings: warnings, errors: [], skipped: skipped}
         {:reply, {:ok, diff, warnings}, state}
 
-      {:error, errors} ->
-        {:reply, {:error, errors}, %{state | errors: errors}}
+      {:error, errors, _fallback} ->
+        {:reply, {:error, errors}, %{state | errors: errors, warnings: [], skipped: %{}}}
     end
+  end
+
+  # A source is the seam a later store plugs into, so its answer is checked
+  # at the boundary: a wrong shape names the source here instead of failing
+  # as a bare clause error inside the arm that would have installed it.
+  defp load(state) do
+    case state.source.(state.path) do
+      {:ok, %Config{}, warnings, skipped} = ok when is_list(warnings) and is_map(skipped) ->
+        ok
+
+      {:error, errors, fallback} = error
+      when is_list(errors) and (is_nil(fallback) or is_struct(fallback, Config)) ->
+        error
+
+      other ->
+        raise ArgumentError,
+              "config source #{inspect(state.source)} answered #{inspect(other)}; expected " <>
+                "{:ok, %Cairn.Config{}, warnings, skipped} or {:error, errors, fallback | nil}"
+    end
+  end
+
+  # Overwriting a persistent term scans every process for references to the
+  # old one — bounded here by boot plus the reload rate, which is operator
+  # paced. An ETS table owned by this server is the alternative if a save
+  # rate ever makes that scan measurable.
+  defp publish(%{snapshot: nil}, _config), do: :ok
+  defp publish(%{snapshot: name}, config), do: :persistent_term.put(snapshot_key(name), config)
+
+  defp source_fun(fun) when is_function(fun, 1), do: fun
+  # A named capture, so the boundary error prints `&Mod.fun/1`, not a closure.
+  defp source_fun({mod, fun}) when is_atom(mod) and is_atom(fun),
+    do: Function.capture(mod, fun, 1)
+
+  defp source_fun(other) do
+    raise ArgumentError,
+          "the config loader (`source:` opt or the :cairn, :config_loader app env) must be a " <>
+            "1-arity fun or {module, function}, got: #{inspect(other)}"
   end
 
   @doc false
@@ -167,6 +305,15 @@ defmodule Cairn.Config.Server do
     # different branch, not a refreshable knob.
     :motion_json
   ]
+
+  @doc """
+  The camera fields baked into a subprocess or a child spec at tree birth,
+  so a running camera cannot take them in place. Not the whole restart set:
+  the resolved comparisons in the camera diff (pre-window, tracker core,
+  sample rate, live-track cap, tier, rung) restart a camera too.
+  """
+  @spec restart_fields() :: [atom()]
+  def restart_fields, do: @restart_fields
 
   # `pre_window_seconds` is compared *resolved* rather than read off the
   # camera struct (camera override or global): `Cairn.Camera.init/1` bakes

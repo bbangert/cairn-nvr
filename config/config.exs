@@ -11,7 +11,10 @@ config :cairn,
   ecto_repos: [Cairn.Repo],
   generators: [timestamp_type: :utc_datetime],
   # the SQLite db lives at {data_dir}/cairn.db unless a config env disables it
-  db_in_data_dir: true
+  db_in_data_dir: true,
+  # Where `Cairn.Config.Server` loads from: a 1-arity fun of the config path,
+  # or `{module, function}` naming one
+  config_loader: {Cairn.Config, :load_file}
 
 config :cairn, Cairn.Repo,
   busy_timeout: 5_000,
