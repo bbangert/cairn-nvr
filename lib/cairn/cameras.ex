@@ -202,7 +202,12 @@ defmodule Cairn.Cameras do
   end
 
   defp canonical_settings(nil), do: %{}
-  defp canonical_settings(settings), do: canonical(settings)
+  defp canonical_settings(settings) when is_map(settings), do: canonical(settings)
+
+  # A malformed "settings" param must surface as a changeset error from
+  # Camera.changeset/2's cast, not a FunctionClauseError inside the server's
+  # write transaction.
+  defp canonical_settings(settings), do: settings
 
   @doc """
   Enabled rows, in `list/0` order, rendered to YAML-camera-shaped maps —

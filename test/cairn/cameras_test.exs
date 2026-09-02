@@ -230,6 +230,22 @@ defmodule Cairn.CamerasTest do
       assert Cameras.get("cam1").position == 1
     end
 
+    test "a non-map settings value is a changeset error, not a crash", %{server: server} do
+      assert {:error, {:write, %Ecto.Changeset{valid?: false}}} =
+               Cameras.create(%{"id" => "cam_bad", "settings" => "nope"})
+
+      refute Cameras.get("cam_bad")
+      assert Config.Server.get(server)
+
+      assert {:ok, _diff, []} =
+               Cameras.create(%{"id" => "cam1", "settings" => %{"rtsp_url" => "rtsp://h/1"}})
+
+      assert {:error, {:write, %Ecto.Changeset{valid?: false}}} =
+               Cameras.update("cam1", %{"settings" => 42})
+
+      assert Config.Server.get(server)
+    end
+
     test "delete prunes status, control and checkpoints" do
       assert {:ok, _diff, []} =
                Cameras.create(%{"id" => "cam1", "settings" => %{"rtsp_url" => "rtsp://h/1"}})
