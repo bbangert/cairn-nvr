@@ -163,8 +163,10 @@ defmodule Cairn.Retention do
   end
 
   defp effective_retention_days(config, row) do
+    pred = &(&1.id == row.camera_id)
+
     camera =
-      Enum.find(retention_cameras(config), &(&1.id == row.camera_id)) ||
+      Enum.find(config.cameras, pred) || Enum.find(config.dormant, pred) ||
         %Config.Camera{id: row.camera_id}
 
     labels = row.labels |> Map.get("max_scores", %{}) |> Map.keys()

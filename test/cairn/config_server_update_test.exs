@@ -167,6 +167,19 @@ defmodule Cairn.Config.ServerUpdateTest do
     refute_received {:native_applied, _config}
   end
 
+  test "a write closure with a wrong-shaped return is reported as a write error", %{
+    server: server
+  } do
+    config = Config.Server.get(server)
+
+    assert Config.Server.update(server, fn -> {:ok, :row} end) ==
+             {:error, {:write, {:bad_return, {:ok, :row}}}}
+
+    assert Config.Server.get(server) == config
+    refute_received {:applied, _diff, _config}
+    refute_received {:native_applied, _config}
+  end
+
   test "disabling a camera is validated like any other save", %{dir: dir} do
     # Four detecting cameras put the ladder at 4 fps, where the solo profile
     # is pinned; disabling one raises the ladder to 7 and the two disagree.

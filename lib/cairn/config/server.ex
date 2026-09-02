@@ -156,7 +156,7 @@ defmodule Cairn.Config.Server do
   these is the row it skipped, and the caller gets that camera's errors.
 
   `{:error, errors}` is the validator's; `{:error, {:write, reason}}` is
-  `write_fun`'s own (a changeset, a DB fault).
+  `write_fun`'s own (a changeset, a DB fault, or a wrong-shaped return).
   """
   @spec update(GenServer.server(), (-> :ok | {:error, term()}), keyword()) ::
           {:ok, diff(), [String.t()]} | {:error, [String.t()]} | {:error, {:write, term()}}
@@ -292,6 +292,9 @@ defmodule Cairn.Config.Server do
       {:error, errors, _fallback} -> Cairn.Repo.rollback({:invalid, errors})
       {:error, reason} -> Cairn.Repo.rollback({:write, reason})
       own_errors when is_list(own_errors) -> Cairn.Repo.rollback({:invalid, own_errors})
+      # A closure that forgot to normalize its result must not take the
+      # config server, and with it every camera, down.
+      other -> Cairn.Repo.rollback({:write, {:bad_return, other}})
     end
   end
 
