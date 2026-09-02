@@ -331,7 +331,10 @@ defmodule Cairn.PresenceRecorderTest do
   end
 
   # `nil` — whole-frame presence on a camera with no zones — is a key like any
-  # other, so a camera that gains a zone mid-stay holds both until each clears.
+  # other to this process: the sink clears it the moment a camera gains its
+  # first zone, and that cleared must remove only the `nil` key, never the
+  # zoned one that may already stand beside it (a zoned confirm can land
+  # ahead of the clear on this mailbox).
   test "a zoned key and the whole-frame key for one label are distinct", ctx do
     rec = recorder(ctx)
 
