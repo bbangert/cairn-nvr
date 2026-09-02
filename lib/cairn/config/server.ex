@@ -243,7 +243,9 @@ defmodule Cairn.Config.Server do
   defp publish(%{snapshot: name}, config), do: :persistent_term.put(snapshot_key(name), config)
 
   defp source_fun(fun) when is_function(fun, 1), do: fun
-  defp source_fun({mod, fun}) when is_atom(mod) and is_atom(fun), do: &apply(mod, fun, [&1])
+  # A named capture, so the boundary error prints `&Mod.fun/1`, not a closure.
+  defp source_fun({mod, fun}) when is_atom(mod) and is_atom(fun),
+    do: Function.capture(mod, fun, 1)
 
   defp source_fun(other) do
     raise ArgumentError,
