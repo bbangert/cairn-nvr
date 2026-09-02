@@ -45,7 +45,12 @@ defmodule Cairn.Camera do
       ] ++
         bridge(cam, config) ++
         [
-          {Cairn.PipelineOwner, camera: cam, config: config},
+          # `owner_opts` is the tests' seam into the owner (a stub pipeline, a
+          # config lookup); production passes none. A test that omits the
+          # lookup reads the application server's snapshot, so its camera id
+          # must not be one of the fixture's.
+          {Cairn.PipelineOwner,
+           [camera: cam, config: config] ++ Keyword.get(opts, :owner_opts, [])},
           {Cairn.RTPHub, camera_id: cam.id}
         ]
 

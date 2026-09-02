@@ -180,6 +180,61 @@ defmodule Cairn.RetentionTest do
     _ = test_pid
   end
 
+  @tag :capture_log
+  test "a failed boot does not prune on the defaults", %{dir: dir} do
+    # The only fault is camera-level, so the server installs the file's
+    # globals; on `%Config{}` instead this event is 6 days past the 14-day
+    # default and the sweep measures cwd "data".
+    path = Path.join(dir, "config.yml")
+
+    File.write!(path, """
+    data_dir: #{dir}
+    retention:
+      days: 30
+    cameras:
+      - id: cam_a
+    """)
+
+    server =
+      start_supervised!(
+        {Config.Server,
+         path: path,
+         name: nil,
+         apply_diff: fn _diff, _config -> :ok end,
+         apply_native: fn _config -> :ok end},
+        id: :retention_failed_boot_server
+      )
+
+    test_pid = self()
+
+    ret =
+      start_supervised!(
+        {Retention,
+         name: nil,
+         manual: true,
+         config_fun: fn -> Config.Server.get(server) end,
+         free_space_fun: fn measured ->
+           send(test_pid, {:measured, measured})
+           {:ok, 500 * 1024 * 1024}
+         end}
+      )
+
+    # positive control: the fallback really is the file's globals, so the
+    # survival below is the 30-day clock and not a prune that never ran
+    assert Config.Server.get(server).retention_days == 30
+
+    event = seed_event(dir, "cam_a", 20, ["car"])
+
+    send(ret, :prune)
+    _ = :sys.get_state(ret)
+
+    assert Events.get(event.id)
+    assert File.exists?(event.path)
+
+    send(ret, :emergency)
+    assert_receive {:measured, ^dir}, 2_000
+  end
+
   defp wait_until(fun, attempts \\ 100) do
     cond do
       fun.() ->

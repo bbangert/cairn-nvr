@@ -54,4 +54,32 @@ defmodule CairnWeb.ConfigLiveTest do
     File.write!(@fixture, original)
     render_click(view, "reload", %{})
   end
+
+  # This LiveView reads the application's own `Config.Server` — there is no
+  # injection seam — so the empty fleet has to be reached the way an operator
+  # would: a valid reload that removes every camera, then a broken one the
+  # server refuses, which keeps that empty config while reporting errors.
+  test "an errored load with no cameras left says so", %{conn: conn} do
+    original = File.read!(@fixture)
+
+    on_exit(fn ->
+      File.write!(@fixture, original)
+      Cairn.Config.Server.reload()
+    end)
+
+    {:ok, view, _html} = live(conn, "/config")
+
+    File.write!(@fixture, "data_dir: tmp/cairn_test_data\ncameras: []\n")
+    html = render_click(view, "reload", %{})
+    refute html =~ "config-no-cameras"
+
+    File.write!(@fixture, "cameras: [{id: broken}]\n")
+    html = render_click(view, "reload", %{})
+
+    assert html =~ "config-no-cameras"
+    assert html =~ "No cameras are running."
+
+    File.write!(@fixture, original)
+    render_click(view, "reload", %{})
+  end
 end

@@ -104,15 +104,27 @@ defmodule Cairn.Config.Camera do
   def detect_role(%__MODULE__{substream_url: url}) when is_binary(url), do: :sub
   def detect_role(%__MODULE__{}), do: :main
 
+  # Anchored (`\A`/`\z`, not `^`/`$`) so a trailing newline cannot sneak past
+  # the last character class the way `$` allows. The class is exported for
+  # the message attribution in `Cairn.Config`, which must agree with it.
+  @id_class "[a-z0-9][a-z0-9_-]*"
+  @id_regex Regex.compile!("\\A#{@id_class}\\z")
+
+  @doc false
+  @spec id_class() :: String.t()
+  def id_class, do: @id_class
+
+  defp valid_id?(id), do: is_binary(id) and id =~ @id_regex
+
   @doc false
   @spec parse(term(), non_neg_integer(), map()) :: {t() | nil, map()}
   def parse(raw, idx, acc) when is_map(raw) do
-    acc = warn_unknown(acc, raw, @known_keys, "camera ##{idx}")
     id = Map.get(raw, "id")
+    acc = warn_unknown_keys(acc, raw, id, idx)
     rtsp_url = Map.get(raw, "rtsp_url")
 
     cond do
-      not (is_binary(id) and id =~ ~r/^[a-z0-9][a-z0-9_-]*$/) ->
+      not valid_id?(id) ->
         {nil, add_error(acc, "camera ##{idx}: id is required ([a-z0-9_-], lowercase)")}
 
       not is_binary(rtsp_url) or rtsp_url == "" ->
@@ -125,6 +137,22 @@ defmodule Cairn.Config.Camera do
 
   def parse(_raw, idx, acc) do
     {nil, add_error(acc, "camera ##{idx}: must be a mapping")}
+  end
+
+  # A valid id lets an unknown-key warning be attributed to it directly
+  # (`Cairn.Config.partition_by_camera/1` reads that prefix); without one
+  # there is no id yet to attribute to, so it keeps the index form.
+  defp warn_unknown_keys(acc, raw, id, idx) do
+    if valid_id?(id) do
+      raw
+      |> Map.keys()
+      |> Enum.reject(&(&1 in @known_keys))
+      |> Enum.reduce(acc, fn key, acc ->
+        add_warning(acc, "camera #{id}: unknown key #{inspect(key)}")
+      end)
+    else
+      warn_unknown(acc, raw, @known_keys, "camera ##{idx}")
+    end
   end
 
   defp build(raw, id, rtsp_url, acc) do

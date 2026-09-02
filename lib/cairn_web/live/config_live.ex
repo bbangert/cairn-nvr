@@ -227,6 +227,13 @@ defmodule CairnWeb.ConfigLive do
           </h3>
           <div style="display: flex; flex-direction: column; gap: 5px; font-size: 13px;">
             <div
+              :if={@last_load.errors != [] and @config.cameras == []}
+              id="config-no-cameras"
+              style="display: flex; gap: 7px; color: var(--hs-danger); font-weight: 600;"
+            >
+              <span class="ms" style="font-size: 16px; flex: none; margin-top: 1px;">videocam_off</span>No cameras are running.
+            </div>
+            <div
               :for={e <- @last_load.errors}
               style="display: flex; gap: 7px; color: var(--hs-danger);"
             >

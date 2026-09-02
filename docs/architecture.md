@@ -113,15 +113,15 @@ Detection boxes are drawn over the live feed by LiveView, not by a canvas hook: 
 
 `config.yml` is the source of truth. A **hardware profile** (one YAML per board class) names the model, input geometry, backend, fps band and tracker stage list; a `plugins:` group is a profile reference, and every camera naming that group detects on it. Config load expands the profile into the engine's model config and the host's tracking policy from one file, so the two halves cannot disagree.
 
-On reload, the new config reaches the engine first (`Cairn.Native.Host.reconfigure/1` — a model change is handled there, not by restarting cameras), then the camera diff: edits that reach a subprocess, the ring, or a detect-branch element built from them (`rtsp_url`, `substream_url`, `plugin`, `min_score`, `ingest`, `transcode`, `extra_ffmpeg_args`, the pre-window, and the resolved tracker core, sample rate and live-track cap) restart that camera's tree; everything else refreshes in place through the running session.
+On reload, the new config reaches the engine first (`Cairn.Native.Host.reconfigure/1` — a model change is handled there, not by restarting cameras), then the camera diff: edits that reach a subprocess, the ring, or a detect-branch element built from them (`rtsp_url`, `substream_url`, `plugin`, `min_score`, `ingest`, `transcode`, `extra_ffmpeg_args`, `motion_json`, the pre-window, and the resolved tracker core, sample rate, live-track cap, capability tier and ladder rung) restart that camera's tree; everything else refreshes in place through the running session.
 
 ## Process supervision tree
 
 ```
 Cairn.Supervisor
 ├── Cairn.Native.Drain             (first, so its terminate runs last: drains native teardown)
-├── Cairn.Config.Server            (everything hangs off the loaded config)
-├── Cairn.Repo / Ecto.Migrator     (SQLite event + track index)
+├── Cairn.Repo / Ecto.Migrator     (SQLite event + track index; the Repo reads data_dir off the file itself)
+├── Cairn.Config.Server            (after the migrated Repo, so a source may read rows; everything below hangs off it)
 ├── Phoenix.PubSub / Cairn.Registry / Cairn.CameraStatus ...
 ├── Cairn.TrackerSupervisor        (rest_for_one)
 │   ├── pool (DynamicSupervisor)

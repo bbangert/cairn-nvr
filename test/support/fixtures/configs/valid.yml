@@ -1,3 +1,7 @@
+# The application's Config.Server publishes these three cameras into its
+# snapshot for the whole suite: a test that starts a real camera tree under
+# one of their ids without a `config_lookup:` gets this file's camera
+# merged over its own. Use unique ids for trees.
 data_dir: tmp/cairn_test_data
 stall_seconds: 15
 free_space_min_mb: 512

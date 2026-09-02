@@ -39,6 +39,8 @@ defmodule Cairn.Config.ServerTest do
     assert [%{id: "cam_a"}, %{id: "cam_b"}] = config.cameras
     assert File.dir?(Path.join([dir, "data", "events"]))
     assert File.dir?(Path.join([dir, "data", "log"]))
+    # the file source skips no camera: it errors on the whole file instead
+    assert Config.Server.last_load(server) == %{warnings: [], errors: [], skipped: %{}}
   end
 
   test "reload diffs added/removed/changed cameras", %{server: server, path: path, dir: dir} do
@@ -377,6 +379,247 @@ defmodule Cairn.Config.ServerTest do
     refute_received {:applied, _, _}
     assert Config.Server.get(server) == old
     assert %{errors: [_ | _]} = Config.Server.last_load(server)
+  end
+
+  test "a failed reload carries only its own errors", %{server: server, path: path, dir: dir} do
+    File.write!(path, """
+    data_dir: #{Path.join(dir, "data")}
+    shenanigans: 1
+    cameras:
+      - id: cam_a
+        rtsp_url: rtsp://h/1
+    """)
+
+    assert {:ok, _diff, [_ | _]} = Config.Server.reload(server)
+    assert %{warnings: [warning], errors: [], skipped: %{}} = Config.Server.last_load(server)
+    assert warning =~ ~s(unknown key "shenanigans")
+
+    File.write!(path, "cameras: [{id: cam_a}]\n")
+    assert {:error, _errors} = Config.Server.reload(server)
+
+    # the warning above described a file that is gone; only the errors of the
+    # attempt that failed survive
+    assert %{warnings: [], errors: [_ | _], skipped: %{}} = Config.Server.last_load(server)
+  end
+
+  test "reload loads through the injected source, not the file", %{dir: dir, path: path} do
+    test_pid = self()
+
+    injected =
+      from_map!(%{
+        "data_dir" => Path.join(dir, "data"),
+        "cameras" => [%{"id" => "cam_z", "rtsp_url" => "rtsp://h/z"}]
+      })
+
+    source = fn loaded ->
+      send(test_pid, {:source, loaded})
+      {:ok, injected, [], %{}}
+    end
+
+    server =
+      start_supervised!(
+        {Config.Server,
+         path: path,
+         name: nil,
+         source: source,
+         apply_diff: fn _diff, _config -> :ok end,
+         apply_native: fn _config -> :ok end},
+        id: :injected_source_server
+      )
+
+    assert_received {:source, ^path}
+    # the file at `path` holds cam_a/cam_b; nothing read it
+    assert [%{id: "cam_z"}] = Config.Server.get(server).cameras
+
+    assert {:ok, %{added: [], removed: [], changed: [], refreshed: []}, []} =
+             Config.Server.reload(server)
+
+    assert_received {:source, ^path}
+  end
+
+  @tag :capture_log
+  test "a failed boot keeps data_dir, retention and the HA token from the YAML", %{dir: dir} do
+    path = Path.join(dir, "camera_fault.yml")
+    # A distinct dir from the harness's, so the assertion below discriminates:
+    # nothing else has ensured it.
+    data_dir = Path.join(dir, "fallback")
+
+    File.write!(path, """
+    data_dir: #{data_dir}
+    retention:
+      days: 30
+    integrations:
+      token: yaml-token
+    cameras:
+      - id: cam_a
+    """)
+
+    server =
+      start_supervised!(
+        {Config.Server,
+         path: path,
+         name: nil,
+         apply_diff: fn _diff, _config -> :ok end,
+         apply_native: fn _config -> :ok end},
+        id: :failed_boot_server
+      )
+
+    config = Config.Server.get(server)
+    assert config.data_dir == data_dir
+    assert config.retention_days == 30
+    assert config.ha_token == "yaml-token"
+    assert config.cameras == []
+
+    assert Enum.any?(Config.Server.last_load(server).errors, &(&1 =~ "rtsp_url is required"))
+    # the readers that run regardless got the operator's dir, not the struct
+    # default's cwd "data"
+    assert File.dir?(Path.join(data_dir, "log"))
+  end
+
+  @tag :capture_log
+  test "a file whose globals are invalid installs no half-built fallback", %{dir: dir} do
+    path = Path.join(dir, "bad_globals.yml")
+
+    # Both halves are broken, so `globals_fallback/1` fails its own
+    # re-validation and there is nothing between the file and `%Config{}`.
+    File.write!(path, """
+    data_dir: 42
+    cameras:
+      - id: cam_a
+    """)
+
+    server =
+      start_supervised!(
+        {Config.Server,
+         path: path,
+         name: nil,
+         apply_diff: fn _diff, _config -> :ok end,
+         apply_native: fn _config -> :ok end},
+        id: :bad_globals_server
+      )
+
+    config = Config.Server.get(server)
+    assert config.cameras == []
+    assert config.retention_days == 14
+
+    errors = Config.Server.last_load(server).errors
+    assert Enum.any?(errors, &(&1 =~ "data_dir must be a string"))
+    assert Enum.any?(errors, &(&1 =~ "rtsp_url is required"))
+  end
+
+  @tag :capture_log
+  test "a missing file boots with the defaults and says so", %{dir: dir} do
+    server =
+      start_supervised!(
+        {Config.Server,
+         path: Path.join(dir, "missing.yml"),
+         name: nil,
+         apply_diff: fn _diff, _config -> :ok end,
+         apply_native: fn _config -> :ok end},
+        id: :missing_file_server
+      )
+
+    assert Config.Server.get(server).cameras == []
+    assert Enum.any?(Config.Server.last_load(server).errors, &(&1 =~ "cannot read config"))
+  end
+
+  test "an unnamed server publishes no snapshot", %{path: path} do
+    production = Config.Server.snapshot_key(Config.Server)
+    before = :persistent_term.get(production, :none)
+
+    start_supervised!(
+      {Config.Server,
+       path: path,
+       name: nil,
+       apply_diff: fn _diff, _config -> :ok end,
+       apply_native: fn _config -> :ok end},
+      id: :unnamed_snapshot_server
+    )
+
+    assert :persistent_term.get(Config.Server.snapshot_key(nil), :none) == :none
+    # and the application's own snapshot is untouched by an unnamed boot
+    assert :persistent_term.get(production, :none) == before
+  end
+
+  test "a non-atom name is refused", %{path: path} do
+    assert_raise ArgumentError, fn ->
+      Config.Server.start_link(path: path, name: {:via, Registry, {Cairn.Registry, :y}})
+    end
+  end
+
+  @tag :capture_log
+  test "a malformed loader is refused at boot", %{path: path} do
+    Process.flag(:trap_exit, true)
+
+    assert {:error, {%ArgumentError{message: msg}, _stack}} =
+             Config.Server.start_link(path: path, name: nil, source: "nope")
+
+    assert msg =~ ":config_loader"
+  end
+
+  @tag :capture_log
+  test "a source answering the wrong shape is refused", %{path: path} do
+    Process.flag(:trap_exit, true)
+
+    assert {:error, {%ArgumentError{message: msg}, _stack}} =
+             Config.Server.start_link(path: path, name: nil, source: fn _path -> {:ok, :nope} end)
+
+    assert msg =~ "expected {:ok, %Cairn.Config{}"
+  end
+
+  test "the snapshot is published before apply_diff runs", %{dir: dir, path: path} do
+    test_pid = self()
+    name = :"snap_test_#{System.unique_integer([:positive])}"
+    on_exit(fn -> :persistent_term.erase(Config.Server.snapshot_key(name)) end)
+
+    # apply_diff runs inside the server; a tree started from it must find the
+    # NEW fleet, so the snapshot has to be published by the time it runs
+    apply_diff = fn _diff, _config ->
+      send(test_pid, {:seen, Config.Server.snapshot_camera("cam_c", name)})
+    end
+
+    server =
+      start_supervised!(
+        {Config.Server,
+         path: path, name: name, apply_diff: apply_diff, apply_native: fn _config -> :ok end},
+        id: :snapshot_server
+      )
+
+    assert {:ok, %Config.Camera{id: "cam_a"}, %Config{}} =
+             Config.Server.snapshot_camera("cam_a", name)
+
+    File.write!(path, """
+    data_dir: #{Path.join(dir, "data")}
+    cameras:
+      - id: cam_c
+        rtsp_url: rtsp://h/3
+    """)
+
+    assert {:ok, _diff, []} = Config.Server.reload(server)
+
+    assert_received {:seen, {:ok, %Config.Camera{id: "cam_c"}, %Config{}}}
+    assert Config.Server.snapshot_camera("cam_b", name) == :error
+  end
+
+  test "a failed reload leaves the snapshot on the old fleet", %{path: path} do
+    name = :"snap_stale_#{System.unique_integer([:positive])}"
+    on_exit(fn -> :persistent_term.erase(Config.Server.snapshot_key(name)) end)
+
+    server =
+      start_supervised!(
+        {Config.Server,
+         path: path,
+         name: name,
+         apply_diff: fn _diff, _config -> :ok end,
+         apply_native: fn _config -> :ok end},
+        id: :snapshot_stale_server
+      )
+
+    File.write!(path, "cameras: [{id: cam_a}]\n")
+    assert {:error, _errors} = Config.Server.reload(server)
+
+    assert {:ok, %Config.Camera{id: "cam_a"}, %Config{}} =
+             Config.Server.snapshot_camera("cam_a", name)
   end
 
   # Two configs whose only difference is what `edit` does to cam_a and what

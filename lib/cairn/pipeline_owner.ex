@@ -130,9 +130,11 @@ defmodule Cairn.PipelineOwner do
   def init(opts) do
     Process.flag(:trap_exit, true)
 
+    {camera, config} = latest(Keyword.fetch!(opts, :camera), Keyword.fetch!(opts, :config), opts)
+
     state = %__MODULE__{
-      camera: Keyword.fetch!(opts, :camera),
-      config: Keyword.fetch!(opts, :config),
+      camera: camera,
+      config: config,
       backoff_ms: Keyword.get(opts, :backoff_min_ms, @backoff_min_ms),
       opts: opts
     }
@@ -147,6 +149,33 @@ defmodule Cairn.PipelineOwner do
     send(self(), :start)
     schedule_watchdog(state)
     {:ok, state}
+  end
+
+  # A supervisor restart hands this process the struct its tree was BUILT
+  # from (`Cairn.Camera` is `:rest_for_one`; a ring death restarts the owner
+  # from the stored child spec), while a refresh since then reached only the
+  # process that died. The server's snapshot is authoritative for the
+  # refresh-class fields; the restart-class ones stay with opts because the
+  # siblings above this process (ring, bridge) were built from them and are
+  # still running. The config comes from the snapshot whole: nothing in it
+  # is compared by the camera diff, so a global that moved (`stall_seconds`)
+  # reaches this watchdog here while a bridge sibling keeps the old value
+  # until its tree restarts — newer, and timing only. The pre-window stays
+  # safe only because the diff compares it resolved and restarts the whole
+  # tree when it moves; the ring above was sized from the opts pair.
+  # Never a call to `Cairn.Config.Server`: `apply_diff` runs inside that
+  # server, so a tree started from a reload would deadlock on it until the
+  # call timed out — serially, per camera.
+  defp latest(camera, config, opts) do
+    lookup = Keyword.get(opts, :config_lookup, &Config.Server.snapshot_camera/1)
+
+    case lookup.(camera.id) do
+      {:ok, snap_cam, snap_config} ->
+        {Map.merge(snap_cam, Map.take(camera, Config.Server.restart_fields())), snap_config}
+
+      :error ->
+        {camera, config}
+    end
   end
 
   @impl true
