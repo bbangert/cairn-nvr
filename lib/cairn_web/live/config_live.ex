@@ -39,57 +39,57 @@ defmodule CairnWeb.ConfigLive do
   def handle_event("reload", _params, socket) do
     {:noreply, socket |> assign(reload_result: reload()) |> load()}
   end
-catch
-  :exit, _ ->
-    %{
-      ok: false,
-      diff: nil,
-      warnings: [],
-      errors: ["configuration is being applied — try again in a moment"],
-      kind: :reload
-    }
-end
 
-def handle_event("reimport", _params, socket) do
-  path = socket.assigns.config_path
+  def handle_event("reimport", _params, socket) do
+    path = socket.assigns.config_path
 
-  {:noreply,
-   socket
-   |> assign(reimporting: true)
-   |> start_async(:reimport, fn -> ConfigSource.reimport(path) end)}
-end
+    {:noreply,
+     socket
+     |> assign(reimporting: true)
+     |> start_async(:reimport, fn -> ConfigSource.reimport(path) end)}
+  end
 
-@impl true
-def handle_async(:reimport, {:ok, result}, socket) do
-  {:noreply,
-   socket
-   |> assign(reimporting: false, reload_result: reimport_result(result))
-   |> load()}
-end
+  @impl true
+  def handle_async(:reimport, {:ok, result}, socket) do
+    {:noreply,
+     socket
+     |> assign(reimporting: false, reload_result: reimport_result(result))
+     |> load()}
+  end
 
-# The exit reason can carry the exception that raised — and with it the
-# settings map — so it goes to the log, never the card.
-def handle_async(:reimport, {:exit, reason}, socket) do
-  Logger.error("config: the re-import did not finish: #{inspect(reason)}")
+  # The exit reason can carry the exception that raised — and with it the
+  # settings map — so it goes to the log, never the card.
+  def handle_async(:reimport, {:exit, reason}, socket) do
+    Logger.error("config: the re-import did not finish: #{inspect(reason)}")
 
-  {:noreply,
-   socket
-   |> assign(
-     reimporting: false,
-     reload_result: error_result("the re-import did not finish — see the log")
-   )
-   |> load()}
-end
+    {:noreply,
+     socket
+     |> assign(
+       reimporting: false,
+       reload_result: error_result("the re-import did not finish — see the log")
+     )
+     |> load()}
+  end
 
-# The same `catch :exit` as the mount's overlay: a reload pressed while a
-# save holds the server must not take the socket down with it.
-defp reload do
-  case Config.Server.reload(Cameras.server()) do
-    {:ok, diff, warnings} ->
-      %{ok: true, diff: diff, warnings: warnings, errors: [], kind: :reload}
+  # The same `catch :exit` as the mount's overlay: a reload pressed while a
+  # save holds the server must not take the socket down with it.
+  defp reload do
+    case Config.Server.reload(Cameras.server()) do
+      {:ok, diff, warnings} ->
+        %{ok: true, diff: diff, warnings: warnings, errors: [], kind: :reload}
 
-    {:error, errors} ->
-      %{ok: false, diff: nil, warnings: [], errors: errors, kind: :reload}
+      {:error, errors} ->
+        %{ok: false, diff: nil, warnings: [], errors: errors, kind: :reload}
+    end
+  catch
+    :exit, _ ->
+      %{
+        ok: false,
+        diff: nil,
+        warnings: [],
+        errors: ["configuration is being applied — try again in a moment"],
+        kind: :reload
+      }
   end
 
   # Public (not private) only so a test can drive the `{:write, reason}`
