@@ -1300,9 +1300,18 @@ defmodule CairnWeb.CamerasLive do
             </div>
 
             <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+              <%!-- Indexed, not the chip text: a chip can hold a space
+                    ("15 fps") or repeat ("H264" as both codec and profile),
+                    either of which would make the id invalid HTML or
+                    non-unique. `data-chip` carries the text a test or a
+                    human wants to assert on. --%>
               <span
-                :for={chip <- CameraCards.probe_chips(CameraCards.probe(@statuses, cam.id))}
-                id={"probe-#{cam.id}-#{chip}"}
+                :for={
+                  {chip, index} <-
+                    Enum.with_index(CameraCards.probe_chips(CameraCards.probe(@statuses, cam.id)))
+                }
+                id={"probe-#{cam.id}-#{index}"}
+                data-chip={chip}
                 class="tnum"
                 style="display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 6px; font-size: 12px; background: var(--hs-bg-sunken); color: var(--hs-fg-2); font-family: var(--hs-font-mono);"
               >

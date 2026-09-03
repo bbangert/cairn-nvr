@@ -45,14 +45,22 @@ defmodule Cairn.RepoMigrationTest do
   # Rows written before `Cairn.Cameras.canonical/1` learned to drop these
   # four still hold them: parse-identical to the absent key, but not
   # byte-identical, so an untouched save would diff and restart the camera.
-  # The migration is the last one, so `step: 1` down is exactly it — and its
-  # `down` is a no-op, so this only puts the version back to pending, which
-  # is what lets the fixture rows be written in the old shape.
+  # `to:` names the canonicalize migration's own version, not `step: 1`,
+  # which assumes it is the newest migration on disk — true today, but a
+  # later migration added after it would make `step: 1` down something
+  # else's `down` instead. `:to` on the way down runs every migration whose
+  # version is *at or above* the target (`Ecto.Migrator`'s
+  # `pending_to/4`), so the target has to be the migration's own version —
+  # one version earlier (e.g. the prior migration's version) would also
+  # catch that one and drop the `cameras` table the fixture rows below
+  # need. The canonicalize migration's own `down` is a no-op, so this only
+  # puts the version back to pending, which is what lets the fixture rows
+  # be written in the old shape.
   #
   # One test, not three: each `Ecto.Migrator` call reloads every migration
   # file, and each reload warns about the module it redefines.
   test "the canonicalize migration strips the parse-identical shapes and keeps the rest" do
-    migrate(:down, step: 1)
+    migrate(:down, to: 20_260_903_120_000)
 
     insert_settings!("old_shape", %{
       "rtsp_url" => "rtsp://h/1",

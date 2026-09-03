@@ -163,7 +163,7 @@ glyph (decision 1).
         data-loaded={loaded(cam.id)}                                       <%!-- loaded | skipped | disabled | unloaded --%>
         data-zones={length(cam.zones)}>
       <span>{cam.id}</span>                                                <%!-- mono, the camera's name --%>
-      <span :for={chip <- probe_chips(cam.id)} id={"probe-#{cam.id}-#{chip}"}>{chip}</span>
+      <span :for={{chip, n} <- Enum.with_index(probe_chips(cam.id))} id={"probe-#{cam.id}-#{n}"} data-chip={chip}>{chip}</span>
       <button id={"camera-enabled-#{cam.id}"} class="hs-tog" role="switch" aria-checked={cam.enabled}
               phx-click="toggle-enabled" phx-value-id={cam.id}></button>
       <.link navigate={~p"/cameras/#{cam.id}/edit"}>Edit</.link>

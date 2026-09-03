@@ -40,13 +40,21 @@ defmodule CairnWeb.CameraForm do
 
   @text_fields ~w(rtsp_url substream_url plugin ingest tracker motion_json extra_ffmpeg_args)
 
-  # Every settings key this module can write. A saved key outside it — the
-  # vestigial `pipeline`, or one a future release adds before the form does —
-  # is carried through an edit rather than dropped by it, so a save the
-  # operator did not aim at that key leaves it alone. `id` and `zones` are
-  # excluded because they are columns of their own, not settings.
+  # Every settings key this module can write, plus `pipeline`, which it
+  # deliberately can't: the form has no field for it, and `"membrane"` (the
+  # only accepted value) is already a no-op `Cairn.Cameras.canonical/1`
+  # drops, so a save can only ever *drop* the key, never restore it. Listing
+  # it here rather than leaving it modelled-by-omission is what makes an
+  # edit repair a row stuck on the removed `"classic"` value — omitted, it
+  # would have ridden through `Map.drop` untouched like a real unmodelled
+  # key. A saved key genuinely outside this list — one a future release adds
+  # before the form does — is carried through an edit rather than dropped by
+  # it, so a save the operator did not aim at that key leaves it alone. `id`
+  # and `zones` are excluded because they are columns of their own, not
+  # settings.
   @modelled_keys ~w(rtsp_url substream_url plugin ingest tracker motion_json transcode
-                    extra_ffmpeg_args retention min_score track record id zones) ++ @int_fields
+                    extra_ffmpeg_args retention min_score track record id zones pipeline) ++
+                   @int_fields
 
   # The chip's set. `Cairn.Config.Server.restart_fields/0` is what a running
   # camera cannot take in place; the five added here restart for reasons that
@@ -434,7 +442,11 @@ defmodule CairnWeb.CameraForm do
   # instead of the splice reading "no userinfo yet" and dropping the saved
   # password outright.
   defp credentialed(url, key, params, saved) do
-    user = trimmed(params, "username")
+    # Not trimmed, like the password: `url_user/1` decodes the saved
+    # userinfo verbatim, spaces included, and an untouched edit re-derives
+    # `user` from this same field — trimming here would rewrite a saved
+    # `%20user` credential's URL on a save nobody edited (D-P5).
+    user = Map.get(params, "username") || @blank
     pass = password(params)
     seeded = seed_userinfo(url, saved[key])
 

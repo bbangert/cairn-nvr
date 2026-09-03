@@ -154,6 +154,34 @@ defmodule CairnWeb.CamerasLiveTest do
     assert html =~ "not probed yet"
   end
 
+  # Chip text can hold a space ("15 fps") or repeat across chips ("H264" as
+  # both codec and profile), either of which an id built from the chip text
+  # would turn into invalid HTML or a duplicate id — the fix indexes the
+  # chip instead and carries the text in `data-chip`.
+  test "probe chip ids are index-based, whitespace-free, and unique", %{conn: conn} do
+    create!("cam1")
+    on_exit(fn -> Cairn.CameraStatus.merge("cam1", %{status: :unknown, probe: nil}) end)
+
+    Cairn.CameraStatus.set_probe("cam1", %{
+      codec: "h264",
+      width: 1920,
+      height: 1080,
+      fps: 15,
+      profile: "h264"
+    })
+
+    _ = :sys.get_state(Cairn.CameraStatus)
+
+    {:ok, _view, html} = live(conn, "/cameras")
+
+    ids = Regex.scan(~r/id="(probe-cam1-\d+)"/, html) |> Enum.map(&Enum.at(&1, 1))
+
+    assert length(ids) == 4
+    assert Enum.all?(ids, &(not String.contains?(&1, " ")))
+    assert Enum.uniq(ids) == ids
+    assert html =~ ~s(data-chip="15 fps")
+  end
+
   test "a skipped row shows the loader's errors and no status badge", %{conn: conn, server: srv} do
     create!("cam1")
 

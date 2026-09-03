@@ -486,6 +486,18 @@ defmodule CairnWeb.CameraFormTest do
       assert settings["rtsp_url"] == "rtsp://:pw@h/1"
     end
 
+    # The username field is not trimmed, like the password: `url_user/1`
+    # decodes the saved userinfo verbatim, spaces included, so a trim on the
+    # way back would make `given_user?/2` see a typed change where there was
+    # none and rewrite the URL on an untouched save.
+    test "a saved username with leading/trailing spaces round-trips through an untouched edit" do
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://%20u:pw@h/1"}, zones: []}
+
+      {:ok, settings} = row |> CameraForm.to_params() |> CameraForm.to_settings(row)
+
+      assert settings["rtsp_url"] == "rtsp://%20u:pw@h/1"
+    end
+
     test "a saved password-only URL round-trips through an untouched edit" do
       row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://:pw@h/1"}, zones: []}
 
@@ -497,13 +509,34 @@ defmodule CairnWeb.CameraFormTest do
     test "a saved key the form has no field for survives an edit" do
       row = %Camera{
         id: "gate",
-        settings: %{"rtsp_url" => "rtsp://cam.lan/main", "pipeline" => "membrane"},
+        settings: %{"rtsp_url" => "rtsp://cam.lan/main", "future_key" => "kept"},
         zones: []
       }
 
       {:ok, settings} = row |> CameraForm.to_params() |> CameraForm.to_settings(row)
 
-      assert settings["pipeline"] == "membrane"
+      assert settings["future_key"] == "kept"
+    end
+
+    # `pipeline` is modelled-and-omitted, not carried like a genuinely
+    # unmodelled key (see `@modelled_keys`): the form has no field for it, so
+    # an edit is the only way left to repair a row stuck on the removed
+    # `"classic"` value, and it can only do that by dropping the key outright.
+    test "a saved classic pipeline is dropped by an edit, unlike a real unmodelled key" do
+      row = %Camera{
+        id: "gate",
+        settings: %{
+          "rtsp_url" => "rtsp://cam.lan/main",
+          "pipeline" => "classic",
+          "future_key" => "kept"
+        },
+        zones: []
+      }
+
+      {:ok, settings} = row |> CameraForm.to_params() |> CameraForm.to_settings(row)
+
+      refute Map.has_key?(settings, "pipeline")
+      assert settings["future_key"] == "kept"
     end
 
     # The keys `canonical/1` drops as parse-equivalent to absent: the form
