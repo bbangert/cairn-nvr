@@ -101,6 +101,36 @@ defmodule CairnWeb.CameraForm do
     }
   end
 
+  @doc false
+  # Params are client-controlled: Phoenix decodes any bracketed input name
+  # into nested maps/lists, so a crafted `camera[id][x]=y` or
+  # `camera[labels][0][min_score][x]=y` arrives here as a map where every
+  # caller downstream (`rows/1`, `trimmed/2`, `password/1`, `camera_id/2`)
+  # assumes a scalar and raises. Every top-level value is forced to a binary
+  # except `labels`, which is walked into the row/cell shape those callers
+  # expect — anything that isn't already that shape is dropped rather than
+  # coerced, since there is no sane string to fall back to for a whole row.
+  @spec sanitize_params(map()) :: map()
+  def sanitize_params(params) when is_map(params) do
+    Map.new(params, fn
+      {"labels", value} -> {"labels", sanitize_labels(value)}
+      {key, value} when is_binary(value) -> {key, value}
+      {key, _other} -> {key, @blank}
+    end)
+  end
+
+  defp sanitize_labels(labels) when is_map(labels) do
+    labels
+    |> Enum.filter(fn {_index, row} -> is_map(row) end)
+    |> Map.new(fn {index, row} -> {index, sanitize_row(row)} end)
+  end
+
+  defp sanitize_labels(_other), do: %{}
+
+  defp sanitize_row(row) do
+    row |> Enum.filter(fn {_cell, value} -> is_binary(value) end) |> Map.new()
+  end
+
   @doc "The label rows of `params`, in index order — the socket's own copy."
   @spec rows(map()) :: [map()]
   def rows(params) do
@@ -184,9 +214,16 @@ defmodule CairnWeb.CameraForm do
   blank and only ghosts an inherited number — that is the intended landing
   place (the ghost is the number the message quotes). A label with no row at
   all cannot be shown in place, so it stays unclaimed.
+
+  `labels` are the form's own row labels — the loader joins a "values must…"
+  message's labels with `", "`, and a label can itself contain `", "` (a
+  detection class literally named "a, b"), so a plain split would invent keys
+  no row owns. Routing instead walks the joined string against the known
+  labels (longest first); anything the known labels cannot fully account for
+  leaves the whole message unclaimed rather than routed to a wrong key.
   """
-  @spec field_errors([String.t()], String.t()) :: {map(), [String.t()]}
-  def field_errors(errors, camera_id) do
+  @spec field_errors([String.t()], String.t(), [String.t()]) :: {map(), [String.t()]}
+  def field_errors(errors, camera_id, labels) do
     {per_camera, fleet} = Config.partition_by_camera(errors)
 
     # Another camera's error is fleet-level as far as this form is concerned:
@@ -198,7 +235,7 @@ defmodule CairnWeb.CameraForm do
       |> Map.get(camera_id, [])
       |> Enum.map(&strip_prefix(&1, camera_id))
       |> Enum.reduce({%{}, []}, fn message, {routed, unclaimed} ->
-        case route(message) do
+        case route(message, labels) do
           [] -> {routed, [message | unclaimed]}
           keys -> {Enum.reduce(keys, routed, &append(&2, &1, message)), unclaimed}
         end
@@ -707,7 +744,7 @@ defmodule CairnWeb.CameraForm do
   # A label is a detection class name and may hold spaces (`license plate`),
   # so the two `tier.label` forms capture up to the ` (value)` the loader
   # always writes after the label rather than up to the first space.
-  defp route(message) do
+  defp route(message, labels) do
     cond do
       # The one message that indicts a pair of cells rather than either.
       match = Regex.run(~r/\Atrack\.(.+?) \(.*effective record threshold/, message) ->
@@ -717,7 +754,7 @@ defmodule CairnWeb.CameraForm do
         [{Enum.at(match, 2), Enum.at(match, 1)}]
 
       match = Regex.run(~r/\A(min_score|track|record) values must .*\(([^)]*)\)\z/, message) ->
-        for label <- String.split(Enum.at(match, 2), ", "), do: {label, Enum.at(match, 1)}
+        joined_labels(Enum.at(match, 1), Enum.at(match, 2), labels)
 
       match = Regex.run(~r/\A(\w+) \(([^)]+)\) must be a whole number\z/, message) ->
         [{Enum.at(match, 2), Enum.at(match, 1)}]
@@ -727,6 +764,40 @@ defmodule CairnWeb.CameraForm do
 
       true ->
         first_word(message)
+    end
+  end
+
+  defp joined_labels(cell, joined, labels) do
+    case match_labels(joined, labels) do
+      {:ok, matched} -> for label <- matched, do: {label, cell}
+      :error -> []
+    end
+  end
+
+  # Consumes `joined` against the known row labels, longest first, so a label
+  # that itself contains `", "` (a detection class literally named "a, b") is
+  # matched whole before a shorter label that happens to be its prefix. Any
+  # leftover the known labels cannot account for is `:error` — a partial
+  # match would route half a message to a real row and silently drop the
+  # rest, which is worse than leaving the whole message unclaimed.
+  defp match_labels(joined, labels) do
+    sorted = Enum.sort_by(labels, &(-String.length(&1)))
+    consume_labels(joined, sorted, [])
+  end
+
+  defp consume_labels("", _labels, acc), do: {:ok, Enum.reverse(acc)}
+
+  defp consume_labels(rest, labels, acc) do
+    case Enum.find(labels, &String.starts_with?(rest, &1)) do
+      nil ->
+        :error
+
+      label ->
+        case String.replace_prefix(rest, label, "") do
+          "" -> consume_labels("", labels, [label | acc])
+          ", " <> more -> consume_labels(more, labels, [label | acc])
+          _other -> :error
+        end
     end
   end
 

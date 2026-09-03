@@ -525,6 +525,44 @@ defmodule CairnWeb.CameraFormTest do
     end
   end
 
+  describe "sanitize_params/1" do
+    # Phoenix decodes a crafted bracketed input name like `camera[id][x]=y`
+    # into a nested map, and every scalar param a hand-sent or malformed
+    # submit can carry has to survive that shape without raising downstream.
+    test "a non-binary top-level value becomes blank" do
+      params = CameraForm.sanitize_params(%{"id" => %{"x" => "y"}, "password" => ["a"]})
+
+      assert params["id"] == ""
+      assert params["password"] == ""
+    end
+
+    test "a binary top-level value passes through unchanged" do
+      params = CameraForm.sanitize_params(%{"rtsp_url" => "rtsp://h/1"})
+
+      assert params["rtsp_url"] == "rtsp://h/1"
+    end
+
+    test "labels keeps only map rows, and only their binary cells" do
+      params =
+        CameraForm.sanitize_params(%{
+          "labels" => %{
+            "0" => %{"label" => "default", "min_score" => %{"x" => "y"}},
+            "1" => "not a row",
+            "2" => %{"label" => "person", "track" => "0.5"}
+          }
+        })
+
+      assert params["labels"] == %{
+               "0" => %{"label" => "default"},
+               "2" => %{"label" => "person", "track" => "0.5"}
+             }
+    end
+
+    test "a non-map labels value becomes an empty map" do
+      assert CameraForm.sanitize_params(%{"labels" => "not a map"})["labels"] == %{}
+    end
+  end
+
   describe "urls/2" do
     test "probes the composed URL, credential and all" do
       row = rich_row()
@@ -539,7 +577,7 @@ defmodule CairnWeb.CameraFormTest do
     end
   end
 
-  describe "field_errors/2" do
+  describe "field_errors/3" do
     test "routes the loader's strings to the field or cell each names" do
       {routed, unclaimed} =
         CameraForm.field_errors(
@@ -554,7 +592,8 @@ defmodule CairnWeb.CameraFormTest do
             "camera cam1: unknown plugin \"old_group\" — define it under plugins:",
             "camera cam1: max_unseen_ms must be 100..3600000"
           ],
-          "cam1"
+          "cam1",
+          []
         )
 
       assert routed["rtsp_url"] == ["rtsp_url is required"]
@@ -582,7 +621,8 @@ defmodule CairnWeb.CameraFormTest do
             "camera cam1: track.person (0.4) must be >= min_score.person (0.5)",
             "camera cam1: record.person (0.5) must be >= track.person (0.6)"
           ],
-          "cam1"
+          "cam1",
+          ["car", "person"]
         )
 
       assert routed[{"car", "min_score"}] == ["min_score values must be 0..1 (car, person)"]
@@ -603,7 +643,7 @@ defmodule CairnWeb.CameraFormTest do
           "with no record: block video falls back to min_score, so a clip could exist with no " <>
           "track row. Give person a record: rule, or lower track.person"
 
-      {routed, []} = CameraForm.field_errors([message], "cam1")
+      {routed, []} = CameraForm.field_errors([message], "cam1", ["person"])
 
       assert [row_message] = routed[{"person", :row}]
       assert row_message =~ "effective record threshold"
@@ -619,7 +659,8 @@ defmodule CairnWeb.CameraFormTest do
             "camera cam1: track.license plate (0.4) must be >= min_score.license plate (0.5)",
             "camera cam1: min_score values must be 0..1 (license plate)"
           ],
-          "cam1"
+          "cam1",
+          ["license plate"]
         )
 
       assert routed[{"license plate", "track"}] == [
@@ -640,7 +681,7 @@ defmodule CairnWeb.CameraFormTest do
           "exist with no track row. Give license plate a record: rule, or lower " <>
           "track.license plate"
 
-      {routed, []} = CameraForm.field_errors([message], "cam1")
+      {routed, []} = CameraForm.field_errors([message], "cam1", ["license plate"])
 
       assert [row_message] = routed[{"license plate", :row}]
       assert row_message =~ "effective record threshold"
@@ -654,7 +695,8 @@ defmodule CairnWeb.CameraFormTest do
             "camera cam2: rtsp_url is required",
             "camera cam1: zones must be a list"
           ],
-          "cam1"
+          "cam1",
+          []
         )
 
       assert routed == %{}
@@ -664,6 +706,33 @@ defmodule CairnWeb.CameraFormTest do
                "camera cam2: rtsp_url is required",
                "duplicate camera id: cam1"
              ]
+    end
+
+    # A label may itself contain ", " (a detection class literally named
+    # "a, b"), so splitting the loader's joined list on ", " would invent a
+    # key no row owns and the message would vanish under a nil candidate.
+    # Routing instead walks the known row labels, longest first.
+    test "a joined label list routes to every row it names, even one whose own label holds \", \"" do
+      raw = "min_score values must be 0..1 (a, b, c)"
+      message = "camera cam1: #{raw}"
+
+      {routed, unclaimed} =
+        CameraForm.field_errors([message], "cam1", ["a, b", "c"])
+
+      assert routed[{"a, b", "min_score"}] == [raw]
+      assert routed[{"c", "min_score"}] == [raw]
+      assert unclaimed == []
+    end
+
+    test "a joined label the known rows cannot fully account for stays unclaimed" do
+      raw = "min_score values must be 0..1 (a, b, d)"
+      message = "camera cam1: #{raw}"
+
+      {routed, unclaimed} =
+        CameraForm.field_errors([message], "cam1", ["a, b", "c"])
+
+      assert routed == %{}
+      assert unclaimed == [raw]
     end
   end
 

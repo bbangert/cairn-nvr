@@ -441,6 +441,24 @@ defmodule CairnWeb.CamerasLiveTest do
       assert Cameras.get("cam2").settings == %{}
     end
 
+    # Params are client-controlled: Phoenix decodes a crafted bracketed input
+    # name into nested maps/lists that `CameraForm.rows/1`, `camera_id/2`,
+    # `trimmed/2` and `password/1` would otherwise assume are scalars and
+    # raise on, killing the view.
+    test "a crafted nested param shape does not crash the view", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/cameras/new?tab=manual")
+
+      render_change(view, "validate", %{
+        "camera" => %{
+          "id" => %{"x" => "y"},
+          "labels" => %{"0" => %{"min_score" => %{"x" => "y"}}},
+          "password" => ["a"]
+        }
+      })
+
+      assert render(view) =~ ~s(id="camera-form")
+    end
+
     test "a blank id is refused under the field before any write", %{conn: conn} do
       {:ok, view, _html} = live(conn, "/cameras/new?tab=manual")
 
@@ -567,6 +585,68 @@ defmodule CairnWeb.CamerasLiveTest do
 
       assert html =~ ~s(data-ok="true")
       assert Cameras.get("cam2").settings["rtsp_url"] == "rtsp://h/2"
+    end
+
+    # `@saved` is this form's own copy of the row, and a dirty form keeps it
+    # stale on purpose (`refresh_row/2`) — so classifying the fleet-level
+    # "different models" fault against `@saved.enabled` would still refuse
+    # even after another session disabled the row. The fault's own bind is
+    # gated on the *current* enabled fleet, so the classification has to read
+    # the database, not the form's stale copy.
+    test "a dirty edit form whose camera another session disables classifies fleet-level errors as notices",
+         %{conn: conn, dir: dir, server: server} do
+      path = Path.join(dir, "config.yml")
+
+      File.write!(path, """
+      data_dir: #{dir}
+      profile_dirs:
+        - test/support/fixtures/profiles/argv
+      plugins:
+        full:
+          profile: full
+        partial:
+          profile: partial
+      """)
+
+      {:ok, _diff, _warnings} = Config.Server.reload(server)
+
+      previous_config_path = Application.get_env(:cairn, :config_path)
+      Application.put_env(:cairn, :config_path, path)
+
+      on_exit(fn ->
+        if previous_config_path,
+          do: Application.put_env(:cairn, :config_path, previous_config_path),
+          else: Application.delete_env(:cairn, :config_path)
+      end)
+
+      # Two cameras of conflicting models can only coexist while at most one
+      # is really enabled (the loader refuses a create or toggle that would
+      # put both live at once) — so the second is created disabled and only
+      # enabled after the first is turned off below, never both at once.
+      create!("cam1", %{"rtsp_url" => "rtsp://h/1", "plugin" => "full"})
+      create!("cam2", %{"rtsp_url" => "rtsp://h/2", "plugin" => "partial"}, %{"enabled" => false})
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      # Dirties the form without touching anything the fleet-level rule cares
+      # about, so `@saved` stays the enabled row `refresh_row/2` keeps stale.
+      view |> form("#camera-form", camera: %{"pre_window_seconds" => "5"}) |> render_change()
+
+      # Another session's writes, through the context directly: cam1 goes
+      # off and cam2 (the conflicting model) comes on — the fleet/2 forces
+      # this form's own candidate back in regardless of cam1's real state,
+      # so the conflict with cam2 still trips even though cam1 is disabled.
+      {:ok, _diff, _warnings} = Cameras.set_enabled("cam1", false)
+      {:ok, _diff, _warnings} = Cameras.set_enabled("cam2", true)
+
+      html =
+        view
+        |> form("#camera-form", camera: %{"pre_window_seconds" => "5"})
+        |> render_change()
+
+      refute html =~ ~s(data-error="true")
+      assert html =~ "will not apply until this camera is enabled"
+      assert html =~ "different models (full, partial)"
     end
 
     test "removing a label row re-validates what is left", %{conn: conn} do

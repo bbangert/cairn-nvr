@@ -196,7 +196,11 @@ defmodule CairnWeb.CamerasLive do
   end
 
   def handle_event("save", %{"camera" => params}, socket) do
-    socket = validate(socket, params)
+    # Client-controlled shape, same as `validate/2`: a hand-sent or crafted
+    # submit can carry the same nested maps a bracketed input name decodes
+    # to, and this is the save path's own entry point rather than one that
+    # only ever arrives through `validate/2` first.
+    socket = validate(socket, CameraForm.sanitize_params(params))
 
     # A nil candidate is a form the validator refused, and it already renders
     # why; `saving?` drops a second submit while the first is still applying.
@@ -486,6 +490,12 @@ defmodule CairnWeb.CamerasLive do
   defp error_result(message), do: %{ok: false, diff: nil, warnings: [], errors: [message]}
 
   defp validate(socket, params) do
+    # Params are client-controlled: Phoenix decodes a crafted bracketed name
+    # like `camera[labels][0][min_score][x]=y` into nested maps the rest of
+    # this function (and `CameraForm.rows/1`, `camera_id/2`, `trimmed/2`,
+    # `password/1`) assume are scalars — sanitizing first is what keeps a
+    # hand-sent or malformed submit from raising and killing the LiveView.
+    params = CameraForm.sanitize_params(params)
     rows = CameraForm.rows(params)
     params = Map.put(params, "labels", CameraForm.index_rows(rows))
     # Against the params still on the socket, so this is read before they are
@@ -612,7 +622,7 @@ defmodule CairnWeb.CamerasLive do
     id = route_id(socket)
     {per_camera, fleet_errors} = Config.partition_by_camera(errors)
     own = Map.get(per_camera, id, [])
-    disabled? = match?(%{enabled: false}, socket.assigns.saved)
+    disabled? = disabled_now?(socket.assigns.saved)
 
     if own == [] and (fleet_errors == [] or disabled?) do
       others =
@@ -633,6 +643,21 @@ defmodule CairnWeb.CamerasLive do
       )
     else
       show_errors(socket, errors)
+    end
+  end
+
+  # `@saved` is this form's own copy of the row, taken when it was
+  # (re-)initialized — a dirty form deliberately keeps it stale across
+  # another session's write (`refresh_row/2`), so reading `saved.enabled`
+  # here would classify against a toggle flip this form never saw. The
+  # database is asked instead; a row deleted between whiles has nothing to
+  # classify against, so its last-known `enabled` (the stale copy) stands in.
+  defp disabled_now?(nil), do: false
+
+  defp disabled_now?(%{id: id, enabled: saved_enabled}) do
+    case Cameras.get(id) do
+      nil -> not saved_enabled
+      camera -> not camera.enabled
     end
   end
 
@@ -680,7 +705,8 @@ defmodule CairnWeb.CamerasLive do
   # what validate just rejected — including a fleet error raised after
   # `candidate_for/2` had already assigned one.
   defp show_errors(socket, errors) do
-    {field_errors, unclaimed} = CameraForm.field_errors(errors, route_id(socket))
+    labels = Enum.map(socket.assigns.rows, & &1["label"])
+    {field_errors, unclaimed} = CameraForm.field_errors(errors, route_id(socket), labels)
     # Warnings and the restart prediction come back only for a candidate with
     # zero errors, so they are dropped rather than left stale next to an error
     # that supersedes them — there is no config to predict against and no save
