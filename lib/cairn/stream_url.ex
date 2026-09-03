@@ -515,10 +515,12 @@ defmodule Cairn.StreamUrl do
   def compose(url, @blank, @blank), do: url
 
   def compose(url, user, pass) do
-    case display_split(url) do
-      {_scheme, _rest} -> url
-      nil -> splice(url, user, pass)
-    end
+    # A URL with no authority to splice into (`rtsp:/cam/main`, or an empty
+    # host) is returned as typed: prepending `user:pass@` to it would build
+    # `ops:pw@rtsp:/cam/main`, which a non-empty-URL check lets through.
+    if display_ambiguous?(url) or unambiguous_endpoint(url) == nil,
+      do: url,
+      else: splice(url, user, pass)
   end
 
   defp splice(url, user, pass) do

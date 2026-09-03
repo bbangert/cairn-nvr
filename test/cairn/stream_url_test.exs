@@ -480,6 +480,14 @@ defmodule Cairn.StreamUrlTest do
     end
   end
 
+  describe "compose/3 with no authority" do
+    test "a URL with no authority to splice into is returned as typed" do
+      assert StreamUrl.compose("rtsp:/cam/main", "ops", "pw") == "rtsp:/cam/main"
+      assert StreamUrl.compose("rtsp://", "ops", "pw") == "rtsp://"
+      assert StreamUrl.compose("cam/main", "ops", "pw") == "cam/main"
+    end
+  end
+
   describe "credential_key?/1" do
     test "names the vendor spellings, whatever their case" do
       assert StreamUrl.credential_key?("password")
