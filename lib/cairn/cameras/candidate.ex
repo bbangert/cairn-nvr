@@ -2,10 +2,13 @@ defmodule Cairn.Cameras.Candidate do
   @moduledoc """
   A camera row nobody has written yet, judged against the fleet it would join.
 
-  The candidate is rendered into the fleet in place of the row with its id, or
+  An edit is rendered into the fleet in place of the row with its id, or
   appended when there is none — a disabled camera's row is not among the
   rendered rows, and its candidate is validated anyway so its own field errors
-  reach the operator. The whole map then goes through `Cairn.Config.from_map/1`,
+  reach the operator. A create is always appended, even onto a fleet that
+  already has its id: replacing that row would hand the validator one camera
+  where the save would make two, and the duplicate id nobody may write would
+  never be reported. The whole map then goes through `Cairn.Config.from_map/1`,
   the same validator a load runs, and the errors come back classified by who
   can fix them.
 
@@ -18,6 +21,15 @@ defmodule Cairn.Cameras.Candidate do
 
   @typedoc "A camera as `Cairn.Config.from_map/1` reads it, keyed by strings."
   @type row :: map()
+
+  @typedoc """
+  Which save the candidate is for. `:edit` replaces the row with its id (and
+  appends when the fleet has none, the disabled case); `:create` appends
+  unconditionally, so a taken id reaches `Cairn.Config`'s duplicate-id rule.
+  Required, and with no default: the two differ only on the case that matters,
+  and a caller that guessed wrong gets silence rather than an error.
+  """
+  @type mode :: :create | :edit
 
   @typedoc """
   `errors` is the validator's whole list, in its order, for routing to fields;
@@ -39,14 +51,16 @@ defmodule Cairn.Cameras.Candidate do
 
   @doc """
   Validates `candidate` among `rows` (the fleet as a load would render it)
-  under `globals` (the config map's non-camera half). `opts` reach
-  `Cairn.Config.from_map/2` unchanged, on both passes.
+  under `globals` (the config map's non-camera half). `mode:` is required
+  (`t:mode/0`); the rest of `opts` reach `Cairn.Config.from_map/2` unchanged,
+  on both passes.
   """
   @spec validate(row(), [row()], map(), keyword()) :: result()
-  def validate(candidate, rows, globals, opts \\ []) do
+  def validate(candidate, rows, globals, opts) do
+    {mode, opts} = pop_mode(opts)
     id = Map.get(candidate, "id")
 
-    case Config.from_map(Map.put(globals, "cameras", fleet(candidate, rows, id)), opts) do
+    case Config.from_map(Map.put(globals, "cameras", fleet(candidate, rows, id, mode)), opts) do
       {:ok, _config, warnings} ->
         %{errors: [], own: [], others: %{}, fleet: [], preexisting_fleet: [], warnings: warnings}
 
@@ -68,7 +82,21 @@ defmodule Cairn.Cameras.Candidate do
   @spec render_row(%{id: String.t(), settings: map(), zones: [map()]}) :: row()
   defdelegate render_row(row), to: Cairn.Cameras
 
-  defp fleet(candidate, rows, id) do
+  defp pop_mode(opts) do
+    case Keyword.pop(opts, :mode) do
+      {mode, rest} when mode in [:create, :edit] ->
+        {mode, rest}
+
+      {other, _rest} ->
+        raise ArgumentError,
+              "Cairn.Cameras.Candidate.validate/4 needs mode: :create | :edit, got: " <>
+                inspect(other)
+    end
+  end
+
+  defp fleet(candidate, rows, _id, :create), do: rows ++ [candidate]
+
+  defp fleet(candidate, rows, id, :edit) do
     if Enum.any?(rows, &(Map.get(&1, "id") == id)),
       do: Enum.map(rows, &replace(&1, candidate, id)),
       else: rows ++ [candidate]

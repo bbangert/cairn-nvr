@@ -914,6 +914,26 @@ defmodule Cairn.Cameras.SettingsTest do
       assert row_message =~ "effective record threshold"
     end
 
+    test "routes the loader's retention bounds to the days field and the per-label cell" do
+      {routed, unclaimed} =
+        Settings.field_errors(
+          [
+            "camera cam1: retention.days must be >= 1 and <= 10000 (got 0)",
+            "camera cam1: retention.per_label (license plate) must be >= 1 and <= 10000 (got -1)"
+          ],
+          "cam1",
+          ["license plate"]
+        )
+
+      assert routed["retention_days"] == ["retention.days must be >= 1 and <= 10000 (got 0)"]
+
+      assert routed[{"license plate", "retention_days"}] == [
+               "retention.per_label (license plate) must be >= 1 and <= 10000 (got -1)"
+             ]
+
+      assert unclaimed == []
+    end
+
     # A detection label is a class name and can hold spaces, so the label in a
     # `tier.label (value)` message runs up to the value, not to the first
     # space.

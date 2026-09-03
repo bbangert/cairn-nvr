@@ -1723,10 +1723,16 @@ defmodule Cairn.Config do
   end
 
   defp validate_numbers(acc, config) do
+    # The camera-level override and the per-label values are bounded by the
+    # same range inside `Camera.parse/3`, which is where a form candidate is
+    # checked too; read from there so the two cannot drift apart. Runtime
+    # call, like `Camera.id_class/0`, to keep no compile-time edge onto it.
+    days = Camera.retention_days_range()
+
     acc
     |> check(int?(config.stall_seconds, 1, 3600), "stall_seconds must be 1..3600")
     |> check(int?(config.free_space_min_mb, 0, 10_000_000), "free_space_min_mb must be >= 0")
-    |> check(int?(config.retention_days, 1, 10_000), "retention.days must be >= 1")
+    |> check(int?(config.retention_days, days.first, days.last), "retention.days must be >= 1")
     |> check(int?(config.retention_tracks_days, 1, 10_000), "retention.tracks_days must be >= 1")
     |> check(is_binary(config.data_dir), "data_dir must be a string")
   end

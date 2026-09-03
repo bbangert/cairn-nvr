@@ -423,14 +423,37 @@ defmodule Cairn.StreamUrl do
   normalized — a URL that differs only in case is retyped rarely, and the
   wrong answer here sends a saved secret to a host the operator never gave it
   to.
+
+  A URL that names no host at all — no `//`, or nothing before the first
+  `/`, `?` or `#` after it — is never the same endpoint as anything, itself
+  included. Two of them reduce to the same empty authority and would
+  otherwise compare equal, which is a saved credential carried onto `rtsp:`.
   """
   @spec same_endpoint?(term(), term()) :: boolean()
-  def same_endpoint?(a, b) when is_binary(a) and is_binary(b), do: endpoint(a) == endpoint(b)
+  def same_endpoint?(a, b) when is_binary(a) and is_binary(b) do
+    case {endpoint(a), endpoint(b)} do
+      {nil, _b} -> false
+      {_a, nil} -> false
+      {endpoint_a, endpoint_b} -> endpoint_a == endpoint_b
+    end
+  end
+
   def same_endpoint?(_a, _b), do: false
 
+  # `nil` for a URL with no authority: `split_authority/1` reports a blank
+  # scheme when there is no `//` at all, and a blank host when there is
+  # nothing between it and the path.
   defp endpoint(url) do
-    {scheme, _userinfo, rest} = split_authority(url)
-    {scheme, rest |> split_at_path() |> elem(0)}
+    case split_authority(url) do
+      {@blank, _userinfo, _rest} ->
+        nil
+
+      {scheme, _userinfo, rest} ->
+        case split_at_path(rest) do
+          {@blank, _tail} -> nil
+          {host, _tail} -> {scheme, host}
+        end
+    end
   end
 
   defp encode(value), do: URI.encode(value, &URI.char_unreserved?/1)

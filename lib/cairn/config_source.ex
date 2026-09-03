@@ -49,15 +49,21 @@ defmodule Cairn.ConfigSource do
       degrade(path, "cameras: import failed: " <> describe_import_error(e))
   end
 
-  # `Exception.message/1` on `Exqlite.Error` appends the failing statement,
-  # which can hold values just spliced into `settings` — so the surfaced
-  # text stays generic and the full exception goes only to the log. `@doc
-  # false` rather than private so a test can drive it directly, the same
-  # reason `describe_import_error/1` is.
+  # `Exqlite.Error` carries the failing `statement`, which holds the values
+  # just spliced into `settings` — an RTSP password among them — and both
+  # `Exception.message/1` and `Exception.format/3` render it. So neither is
+  # used on the way to the log either: the line is assembled from the module
+  # and the driver's own message, with the statement left out on purpose, and
+  # the surfaced text stays generic. `@doc false` rather than private so a
+  # test can drive it directly, the same reason `describe_import_error/1` is.
   @doc false
   @spec log_db_error(Exception.t(), Exception.stacktrace()) :: String.t()
-  def log_db_error(e, stacktrace) do
-    Logger.error("cameras: database access failed: " <> Exception.format(:error, e, stacktrace))
+  def log_db_error(%module{} = e, stacktrace) do
+    Logger.error(
+      "cameras: database access failed: #{inspect(module)}: #{inspect(Map.get(e, :message))}\n" <>
+        Exception.format_stacktrace(stacktrace)
+    )
+
     "cameras: database access failed"
   end
 

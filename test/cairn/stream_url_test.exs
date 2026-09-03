@@ -373,5 +373,11 @@ defmodule Cairn.StreamUrlTest do
       refute StreamUrl.same_endpoint?("rtsp://cam.lan/main", "http://cam.lan/main")
       refute StreamUrl.same_endpoint?("rtsp://cam.lan/main", nil)
     end
+
+    test "a URL with no host is the same endpoint as nothing, another hostless one included" do
+      refute StreamUrl.same_endpoint?("rtsp:", "rtsp:/old/path?password=x")
+      refute StreamUrl.same_endpoint?("rtsp://", "rtsp://")
+      assert StreamUrl.same_endpoint?("rtsp://h/a", "rtsp://h/b")
+    end
   end
 end

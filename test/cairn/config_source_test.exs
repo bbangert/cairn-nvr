@@ -740,7 +740,7 @@ defmodule Cairn.ConfigSourceTest do
   end
 
   describe "log_db_error/2" do
-    test "returns a generic message and logs the exception, statement included" do
+    test "keeps the statement out of both the returned message and the log" do
       error = %Exqlite.Error{message: "UNIQUE constraint failed", statement: "INSERT ... SECRET"}
 
       {message, log} =
@@ -748,7 +748,9 @@ defmodule Cairn.ConfigSourceTest do
 
       assert message == "cameras: database access failed"
       refute message =~ "SECRET"
-      assert log =~ "SECRET"
+      refute log =~ "SECRET"
+      assert log =~ "Exqlite.Error"
+      assert log =~ "UNIQUE constraint failed"
     end
   end
 end

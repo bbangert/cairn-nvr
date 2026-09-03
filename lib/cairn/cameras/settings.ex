@@ -827,6 +827,9 @@ defmodule Cairn.Cameras.Settings do
         field = Enum.at(match, 1)
         [{days_label(message, field, Enum.at(match, 2), labels), field}]
 
+      String.starts_with?(message, "retention.") ->
+        retention_route(message, labels)
+
       String.starts_with?(message, "inline plugin") or String.contains?(message, "unknown plugin") ->
         ["plugin"]
 
@@ -851,6 +854,22 @@ defmodule Cairn.Cameras.Settings do
   defp days_label(message, field, fallback, labels) do
     rest = String.replace_prefix(message, field <> " (", @blank)
     longest_label(rest, labels, ") must be a whole number") || fallback
+  end
+
+  # The loader's camera-level retention messages (`Cairn.Config.Camera`): the
+  # whole block is this form's `retention_days` field, except a per-label
+  # bound, which names its label the way the tier messages above do and lands
+  # on that row's cell.
+  defp retention_route(message, labels) do
+    case Regex.run(~r/\Aretention\.per_label \((.+)\) must be /, message) do
+      nil -> ["retention_days"]
+      match -> [{per_label_days_label(message, Enum.at(match, 1), labels), "retention_days"}]
+    end
+  end
+
+  defp per_label_days_label(message, fallback, labels) do
+    rest = String.replace_prefix(message, "retention.per_label (", @blank)
+    longest_label(rest, labels, ") must be ") || fallback
   end
 
   defp longest_label(rest, labels, following) do
