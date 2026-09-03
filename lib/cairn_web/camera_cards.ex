@@ -223,7 +223,9 @@ defmodule CairnWeb.CameraCards do
   The `#save-result` card, shared by the list and the form so the two cannot
   drift: the four badge words come from the applied diff, never from what the
   form predicted. `phase` is `:applying` while the write is in flight and
-  absent on the list, which has no in-flight card.
+  absent on the list, which has no in-flight card. `unconfirmed` marks a
+  write that timed out rather than one that was rejected — the server may
+  still be applying it, so the card withholds the reassurance below.
   """
   attr :result, :map, required: true
 
@@ -288,7 +290,10 @@ defmodule CairnWeb.CameraCards do
       >
         <div :for={e <- @result.errors}>{e}</div>
       </div>
-      <div :if={!@result.ok} style="font-size: 13px; color: var(--hs-fg-2);">
+      <div
+        :if={!@result.ok and !@result[:unconfirmed]}
+        style="font-size: 13px; color: var(--hs-fg-2);"
+      >
         Your previous config is still active — nothing changed.
       </div>
     </section>

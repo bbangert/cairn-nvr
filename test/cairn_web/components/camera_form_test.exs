@@ -45,6 +45,17 @@ defmodule CairnWeb.CameraFormTest do
       refute inspect(params) =~ "s3cret"
     end
 
+    # A hand-edited row can hold a malformed escape, and the form is the only
+    # place to repair it — `URI.decode/1` raises on one.
+    test "a malformed escape in the userinfo renders instead of raising" do
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://bad%zz:pw@h/1"}, zones: []}
+
+      params = CameraForm.to_params(row)
+
+      assert params["username"] == "bad%zz"
+      assert params["rtsp_url"] == ""
+    end
+
     test "prefills a URL with no credential in it" do
       params = CameraForm.to_params(rich_row())
 

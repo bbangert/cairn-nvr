@@ -305,19 +305,25 @@ defmodule CairnWeb.ConfigLiveTest do
     # stale DOM or a hand-sent event still arrives. The discriminator is the
     # task, not the render: `start_async` links its process to the LiveView,
     # so a second re-import would show as a second link. The server this test
-    # installs applies slowly on purpose — otherwise the first task could
-    # finish between the two clicks and the second would be legitimate.
+    # installs blocks inside `apply_diff` until released, so both clicks land
+    # while the first import is provably still running.
     test "a second re-import click while one is running starts no second task", %{
       conn: conn,
       path: path
     } do
+      test_pid = self()
+
       slow =
         start_supervised!(
           {Config.Server,
            path: path,
            name: nil,
            source: {ConfigSource, :load},
-           apply_diff: fn _diff, _config -> Process.sleep(300) end,
+           apply_diff: fn _diff, _config ->
+             # Runs in the server process, so the release is sent to `slow`.
+             send(test_pid, :applying)
+             receive do: (:release -> :ok)
+           end,
            apply_native: fn _config -> :ok end},
           id: :config_live_reimport_slow_server
         )
@@ -331,9 +337,12 @@ defmodule CairnWeb.ConfigLiveTest do
 
       render_click(view, "reimport")
       assert links.() == idle + 1
+      assert_receive :applying, 2_000
 
       render_click(view, "reimport")
       assert links.() == idle + 1
+
+      send(slow, :release)
 
       html = render_async(view, 2_000)
       assert html =~ "Cameras re-imported from config.yml — changes are live"

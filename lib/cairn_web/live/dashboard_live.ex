@@ -228,9 +228,11 @@ defmodule CairnWeb.DashboardLive do
   # A config change can add, remove or reorder cameras — cheaper to re-mount
   # than to reconcile every assign (`@cameras`, the per-camera detection
   # subscriptions, `@statuses`) against a diff this page does not otherwise
-  # need to understand.
+  # need to understand. `replace: true` because the operator did not navigate:
+  # a node that reconfigures itself would otherwise fill the back button with
+  # copies of this page.
   def handle_info({:config_changed, _diff}, socket) do
-    {:noreply, push_navigate(socket, to: ~p"/")}
+    {:noreply, push_navigate(socket, to: ~p"/", replace: true)}
   end
 
   # The `"events"` topic also carries the per-object track lifecycle, and

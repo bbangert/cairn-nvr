@@ -102,6 +102,25 @@ defmodule CairnWeb.CamerasLiveTest do
     assert html =~ ~s(aria-checked="false")
   end
 
+  # The badge carries the status as data, as the dashboard tile does: the
+  # label is prose that may be reworded, and it is the only status readout on
+  # the edit page, whose header has no row to hang it on.
+  test "the status badge carries data-status on the list and the edit page", %{conn: conn} do
+    create!("cam1")
+    on_exit(fn -> Cairn.CameraStatus.merge("cam1", %{status: :unknown}) end)
+    Cairn.CameraStatus.set("cam1", :running)
+
+    {:ok, _view, list} = live(conn, "/cameras")
+    {:ok, _view, edit} = live(conn, "/cameras/cam1/edit")
+
+    for html <- [list, edit] do
+      assert [badge] =
+               Regex.run(~r/<span[^>]*id="camera-status-cam1"[^>]*>/, html)
+
+      assert badge =~ ~s(data-status="running")
+    end
+  end
+
   test "a skipped row shows the loader's errors and no status badge", %{conn: conn, server: srv} do
     create!("cam1")
 
@@ -547,13 +566,18 @@ defmodule CairnWeb.CamerasLiveTest do
     # The same removal, one step later: another session deletes the row while
     # this save is applying, so the answer arrives for a camera that is gone
     # and there is no row to re-render the form from. The window is real but
-    # narrow, so this server applies slowly on purpose — the delete lands
-    # inside it deterministically.
+    # narrow, so this server holds the apply open until released — the delete
+    # lands inside it deterministically. The row is created before the server
+    # is installed, since that write would otherwise block on the handshake
+    # too.
     test "a camera deleted while the save applies sends the page back to the list", %{
       conn: conn,
       dir: dir
     } do
+      create!("cam1")
+
       path = Path.join(dir, "config.yml")
+      test_pid = self()
 
       slow =
         start_supervised!(
@@ -561,14 +585,16 @@ defmodule CairnWeb.CamerasLiveTest do
            path: path,
            name: nil,
            source: {ConfigSource, :load},
-           apply_diff: fn _diff, _config -> Process.sleep(300) end,
+           apply_diff: fn _diff, _config ->
+             # Runs in the server process, so the release is sent to `slow`.
+             send(test_pid, :applying)
+             receive do: (:release -> :ok)
+           end,
            apply_native: fn _config -> :ok end},
           id: :cameras_live_slow_server
         )
 
       Application.put_env(:cairn, :config_server, slow)
-
-      create!("cam1")
 
       {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
 
@@ -576,9 +602,41 @@ defmodule CairnWeb.CamerasLiveTest do
       |> form("#camera-form", camera: %{"rtsp_url" => "rtsp://h/2"})
       |> render_submit()
 
-      # The write has committed and `apply_diff` is still sleeping: the row is
-      # there to delete and the LiveView has not been answered yet.
+      # The write has committed and the apply is still held: the row is there
+      # to delete and the LiveView has not been answered yet.
+      assert_receive :applying, 2_000
       Repo.delete!(Cameras.get("cam1"))
+      send(slow, :release)
+
+      assert flash = assert_redirect(view, "/cameras", 2_000)
+      assert flash["error"] == "cam1 was removed in another session"
+    end
+
+    # The row is already gone when the write runs, so `update/2` and
+    # `delete/1` answer `:not_found` — an error card would offer a retry that
+    # cannot succeed. `Repo.delete!` on purpose: it broadcasts nothing, so
+    # this page learns of the removal only from its own write.
+    test "a save whose row was already deleted sends the page back to the list", %{conn: conn} do
+      create!("cam1")
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+      Repo.delete!(Cameras.get("cam1"))
+
+      view
+      |> form("#camera-form", camera: %{"rtsp_url" => "rtsp://h/2"})
+      |> render_submit()
+
+      assert flash = assert_redirect(view, "/cameras", 2_000)
+      assert flash["error"] == "cam1 was removed in another session"
+    end
+
+    test "a remove whose row was already deleted sends the page back to the list", %{conn: conn} do
+      create!("cam1")
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+      Repo.delete!(Cameras.get("cam1"))
+
+      render_submit(view, "remove", %{})
 
       assert flash = assert_redirect(view, "/cameras", 2_000)
       assert flash["error"] == "cam1 was removed in another session"

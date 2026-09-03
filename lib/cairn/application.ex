@@ -24,11 +24,20 @@ defmodule Cairn.Application do
       # One-shot, right after the migrator's first write creates cairn.db and
       # its WAL/SHM. Runs *inline* in the supervisor's start order — a child
       # whose `start` answers `:ignore` is run and then forgotten, never
-      # restarted — because the chmod has to be finished before
-      # `Cairn.Config.Server.init/1` below imports credentialed rows into
-      # those files. A `Task` would only have been spawned by then. No-op when
-      # `db_in_data_dir` is false (test env, which points the Repo at a DB
-      # outside the data dir) so the child tree shape doesn't vary by env.
+      # restarted — so it is finished before `Cairn.Config.Server.init/1`
+      # below imports credentialed rows into those files, where a `Task`
+      # would only have been spawned by then.
+      #
+      # Defence in depth, not the guarantee: running once means a later Repo
+      # restart can recreate `-wal`/`-shm` under the umask with nothing to
+      # chmod them again. What actually keeps the DB private to this uid is
+      # the 0700 data dir from `Cairn.DataDir.ensure!/1`, which runs on every
+      # Repo start (`Cairn.Repo.init/2`) and every config apply — modes on
+      # files inside a dir no other user can enter are moot.
+      #
+      # No-op when `db_in_data_dir` is false (test env, which points the Repo
+      # at a DB outside the data dir) so the child tree shape doesn't vary by
+      # env.
       %{id: :secure_db, start: {__MODULE__, :secure_db, []}},
       # After the migrated Repo, so a config source may read rows; before
       # everything that reads the config. Its `init/1` must not broadcast —

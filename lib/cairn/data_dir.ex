@@ -29,11 +29,17 @@ defmodule Cairn.DataDir do
 
   @doc """
   Tightens `cairn.db` and its WAL/SHM siblings to 0600 wherever they already
-  exist — the DB holds camera rows with RTSP userinfo, so it gets the same
-  treatment as the log dir. Never creates a file; a missing one is skipped,
-  not an error. Never raises: a chmod an operator's restored backup or
-  volume permissions refuse (EPERM) is logged and left as is, not a reason
-  to crash-loop the boot.
+  exist — the DB holds camera rows with RTSP userinfo. Never creates a file;
+  a missing one is skipped, not an error. Never raises: a chmod an operator's
+  restored backup or volume permissions refuse (EPERM) is logged and left as
+  is, not a reason to crash-loop the boot.
+
+  Defence in depth, not the guarantee. SQLite recreates `-wal`/`-shm` under
+  the umask whenever the Repo restarts, and only the `ensure!/1` callers run
+  again by then. What keeps the DB private to this uid is the 0700 data dir
+  `ensure!/1` creates — on every Repo start (`Cairn.Repo.init/2`) and every
+  config apply — which makes the modes of the files inside it moot for other
+  users.
   """
   @spec secure_db(Path.t()) :: :ok
   def secure_db(data_dir) do

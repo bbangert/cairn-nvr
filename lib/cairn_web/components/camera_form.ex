@@ -580,11 +580,20 @@ defmodule CairnWeb.CameraForm do
   defp url_user(url) when is_binary(url) do
     case url |> URI.parse() |> Map.get(:userinfo) do
       nil -> nil
-      userinfo -> userinfo |> split_userinfo() |> elem(0) |> URI.decode()
+      userinfo -> userinfo |> split_userinfo() |> elem(0) |> decode_user()
     end
   end
 
   defp url_user(_absent), do: nil
+
+  # A hand-edited or migrated row can hold a malformed escape (`bad%zz`),
+  # which `URI.decode/1` raises on — and the form has to render the row the
+  # operator opened it to repair. The raw text is then all there is to show.
+  defp decode_user(user) do
+    URI.decode(user)
+  rescue
+    ArgumentError -> user
+  end
 
   defp args_string(args) when is_list(args), do: Enum.map_join(args, " ", &scalar_param/1)
   defp args_string(args) when is_binary(args), do: args

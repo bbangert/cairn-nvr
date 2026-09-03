@@ -287,6 +287,11 @@ defmodule CairnWeb.CamerasLive do
      |> push_navigate(to: ~p"/cameras")}
   end
 
+  # Another session deleted the row first, so there is nothing to remove and
+  # nothing to render — the same exit as `refresh_row/2`'s.
+  def handle_async(:remove, {:ok, {:error, {:write, :not_found}}}, socket),
+    do: {:noreply, removed_elsewhere(socket)}
+
   def handle_async(:remove, {:ok, result}, socket) do
     {:noreply, assign(socket, saving?: false, save_result: done(result(result)))}
   end
@@ -386,7 +391,9 @@ defmodule CairnWeb.CamerasLive do
   end
 
   # The row is gone — deleted in another session — so there is nothing to edit
-  # and nothing a save could land on. Both callers leave the page.
+  # and nothing a save could land on. Every caller leaves the page: the
+  # broadcast that noticed the deletion, and the write that answered
+  # `:not_found` because of it.
   defp removed_elsewhere(socket) do
     socket
     |> put_flash(:error, "#{socket.assigns.camera_id} was removed in another session")
@@ -663,6 +670,10 @@ defmodule CairnWeb.CamerasLive do
     socket |> show_errors(errors) |> assign(saving?: false, save_result: done(result(result)))
   end
 
+  # The row went away between this write starting and it landing: `update/2`
+  # answers `:not_found` and the form has nothing left to render.
+  defp saved(socket, {:error, {:write, :not_found}}), do: removed_elsewhere(socket)
+
   defp saved(socket, result),
     do: assign(socket, saving?: false, save_result: done(result(result)))
 
@@ -674,9 +685,16 @@ defmodule CairnWeb.CamerasLive do
   # An exit reason is `{exception, stacktrace}`, and an exception raised under
   # the write carries the settings map — password and all — so it goes to the
   # log and never to the page.
+  #
+  # `unconfirmed` because an exit is not a rollback: `Config.Server.update/3`
+  # times the caller out at 30 s while the server may still commit and apply,
+  # so the card must not promise that nothing changed.
   defp exit_result(reason) do
     Logger.error("cameras: the write did not finish: #{CameraCards.describe_exit(reason)}")
-    error_result("the save did not finish — see the log")
+
+    "the save did not finish in time — it may still apply; reload the page to see"
+    |> error_result()
+    |> Map.put(:unconfirmed, true)
   end
 
   defp probing?(socket),
@@ -827,6 +845,7 @@ defmodule CairnWeb.CamerasLive do
           <span
             :if={@mode == "edit" and @saved.enabled}
             id={"camera-status-#{@camera_id}"}
+            data-status={CameraCards.status(@statuses, @camera_id)}
             class="hs-badge"
             style={"color: #{CameraCards.status_meta(CameraCards.status(@statuses, @camera_id)).color};"}
           >
@@ -1119,6 +1138,7 @@ defmodule CairnWeb.CamerasLive do
               <span
                 :if={cam.loaded == "loaded"}
                 id={"camera-status-#{cam.id}"}
+                data-status={status(@statuses, cam)}
                 class="hs-badge"
                 style={"color: #{CameraCards.status_meta(status(@statuses, cam)).color};"}
               >

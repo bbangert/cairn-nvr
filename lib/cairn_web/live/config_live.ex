@@ -75,16 +75,19 @@ defmodule CairnWeb.ConfigLive do
 
   # The exit reason can carry the exception that raised — and with it the
   # settings map — so neither the card nor the log sees it whole.
+  #
+  # `unconfirmed` because an exit is not a rollback: `Config.Server.update/3`
+  # times the caller out at 30 s while the server may still commit and apply
+  # the new fleet, so the card must not promise that nothing changed.
   def handle_async(:reimport, {:exit, reason}, socket) do
     Logger.error("config: the re-import did not finish: #{CameraCards.describe_exit(reason)}")
 
-    {:noreply,
-     socket
-     |> assign(
-       reimporting: false,
-       reload_result: error_result("the re-import did not finish — see the log")
-     )
-     |> load()}
+    result =
+      "the re-import did not finish in time — it may still apply; reload the page to see"
+      |> error_result()
+      |> Map.put(:unconfirmed, true)
+
+    {:noreply, socket |> assign(reimporting: false, reload_result: result) |> load()}
   end
 
   # The same `catch :exit` as the mount's overlay: a reload pressed while a
@@ -291,7 +294,10 @@ defmodule CairnWeb.ConfigLive do
           <div style="display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--hs-danger); font-family: var(--hs-font-mono);">
             <div :for={e <- @reload_result.errors}>{e}</div>
           </div>
-          <div style="font-size: 13px; color: var(--hs-fg-2);">
+          <div
+            :if={!@reload_result[:unconfirmed]}
+            style="font-size: 13px; color: var(--hs-fg-2);"
+          >
             Your previous config is still active — nothing changed.
           </div>
         </section>

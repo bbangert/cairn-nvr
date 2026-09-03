@@ -45,7 +45,7 @@ defmodule CairnWeb.DashboardLiveTest do
   test "a config change redirects the dashboard so it re-mounts with the new fleet", %{
     conn: conn
   } do
-    {:ok, view, _html} = live(conn, "/")
+    {:ok, _view, _html} = live(conn, "/")
 
     Phoenix.PubSub.local_broadcast(
       Cairn.PubSub,
@@ -53,7 +53,9 @@ defmodule CairnWeb.DashboardLiveTest do
       {:config_changed, %{added: [], removed: [], changed: [], refreshed: []}}
     )
 
-    assert_redirect(view, "/")
+    # `kind: :replace` — the operator did not navigate, so a node that
+    # reconfigures itself must not fill the back button with this page.
+    assert_receive {_ref, {:redirect, _topic, %{to: "/", kind: :replace}}}
   end
 
   test "camera status updates live", %{conn: conn} do

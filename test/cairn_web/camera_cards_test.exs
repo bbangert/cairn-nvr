@@ -155,4 +155,34 @@ defmodule CairnWeb.CameraCardsTest do
                "an unexpected error — see the log"
     end
   end
+
+  describe "save_result/1" do
+    test "a rejected write says the previous config is still active" do
+      html = card(%{ok: false, diff: nil, warnings: [], errors: ["nope"], phase: :done})
+
+      assert html =~ "We couldn't save that change"
+      assert html =~ "Your previous config is still active"
+    end
+
+    # A timed-out write may still be committing and applying, so the card
+    # must not tell the operator that nothing changed.
+    test "an unconfirmed write does not" do
+      html =
+        card(%{
+          ok: false,
+          diff: nil,
+          warnings: [],
+          errors: ["the save did not finish in time"],
+          phase: :done,
+          unconfirmed: true
+        })
+
+      assert html =~ "the save did not finish in time"
+      refute html =~ "Your previous config is still active"
+    end
+
+    defp card(result) do
+      Phoenix.LiveViewTest.rendered_to_string(CameraCards.save_result(%{result: result}))
+    end
+  end
 end
