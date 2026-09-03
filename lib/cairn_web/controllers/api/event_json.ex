@@ -83,14 +83,19 @@ defmodule CairnWeb.Api.EventJSON do
   Shapes a `Cairn.PresenceEvent` broadcast (tier-1 presence transition).
 
   Self-contained like `shape_track/1`: a client that only sees the clearing
-  still learns the label, the best score, and — via `first_seen_at` against
-  `at` — the dwell. `state` spells the transition out so a client need not
-  parse it back off the SSE event name.
+  still learns the zone, the label, the best score, and — via `first_seen_at`
+  against `at` — the dwell. `state` spells the transition out so a client
+  need not parse it back off the SSE event name.
+
+  `zone` is on every presence frame, `null` for whole-frame presence on a
+  camera with no zones (D-P4): one key set to parse, and the client's state
+  key is `(camera_id, zone, label)`.
   """
   @spec shape_presence(Cairn.PresenceEvent.kind(), Cairn.PresenceEvent.t()) :: map()
   def shape_presence(kind, %Cairn.PresenceEvent{} = p) do
     %{
       camera_id: p.camera_id,
+      zone: p.zone,
       label: p.label,
       state: presence_state(kind),
       score: p.score,

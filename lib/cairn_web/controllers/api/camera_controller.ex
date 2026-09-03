@@ -5,6 +5,10 @@ defmodule CairnWeb.Api.CameraController do
   Merges configured cameras (`Cairn.Config.Server`) with live runtime status
   (`Cairn.CameraStatus`). The `id` is stable and used as the HA device
   identifier. Credentials (`rtsp_url`, `substream_url`) are never emitted.
+
+  Zones are listed as `{id, name}` alone: the id is what the `presence_*`
+  frames key on and the name is what a client shows, while the outline is
+  the editor's business and no consumer's.
   """
 
   use CairnWeb, :controller
@@ -57,6 +61,7 @@ defmodule CairnWeb.Api.CameraController do
         post_seconds: windows.post,
         max_seconds: windows.max
       },
+      zones: for(z <- cam.zones, do: %{id: z.id, name: z.name}),
       status: Map.get(status, :status, :unknown),
       probe: safe_probe(Map.get(status, :probe)),
       plugin_status: Map.get(status, :plugin_status),

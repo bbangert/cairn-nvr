@@ -165,14 +165,26 @@ cameras: []
 #    # camera. Absent ⇒ no detection. The pre-phase-6 inline-command form is
 #    # refused with the migration spelled out.
 #    plugin: detect
-#    # The motion gate's scene config, verbatim JSON — zones and thresholds
-#    # describe THIS scene, so the knob is the camera's, never a profile's
-#    # (D-P6). It must say "enabled": true or no gate is built (the load
+#    # The motion gate's scene config, verbatim JSON — its grid, thresholds
+#    # and enable flag describe THIS scene, so the knob is the camera's,
+#    # never a profile's (D-P6). Nothing to do with the presence `zones:`
+#    # below. It must say "enabled": true or no gate is built (the load
 #    # warns). Rejected on a tier-2 group: that tier claims accurate MOT,
 #    # and a gate starves the tracker of the frames it skips. Absent ⇒ no
 #    # gate, today's chain exactly. Vocabulary: docs/profile-authoring.md
 #    # and plugins/cairn-detect/src/motion.rs.
 #    motion_json: '{"enabled": true, "threshold": 30}'
+#    # Presence zones (tier-1 cameras only — elsewhere the load warns they
+#    # do nothing): a detection counts for every zone containing the bottom
+#    # centre of its box, and one outside every zone is invisible to
+#    # presence and recordings. Points are normalized 0..1, origin top-left,
+#    # 3–64 per zone, no self-crossing; `id` is the stable key the API
+#    # reports, `name` is display-only. Drawn in the UI once the zone editor
+#    # ships; listed here for a one-time YAML import.
+#    zones:
+#      - id: drive
+#        name: Driveway
+#        points: [[0.0, 0.4], [0.6, 0.4], [0.6, 1.0], [0.0, 1.0]]
 #    # Signed milliseconds, default 0, range ±30000. Compensates the lag
 #    # between the stream detection runs on and the stream that gets
 #    # recorded — most visible when they are different streams (a bridged

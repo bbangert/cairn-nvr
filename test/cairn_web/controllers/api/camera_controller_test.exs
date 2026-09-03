@@ -3,6 +3,8 @@ defmodule CairnWeb.Api.CameraControllerTest do
   use CairnWeb.ConnCase, async: false
 
   alias Cairn.CameraControl
+  alias Cairn.Config.Server
+  alias CairnWeb.Api.CameraController
 
   @token "test-ha-token"
 
@@ -31,6 +33,28 @@ defmodule CairnWeb.Api.CameraControllerTest do
     assert cam_a["detection"] == false
     assert cam_a["control"]["detection_enabled"] == true
     assert cam_a["windows"]["post_seconds"] == 10
+    # always present, `[]` for the fixture's zoneless cameras
+    assert Enum.all?(cameras, &is_list(&1["zones"]))
+    assert cam_a["zones"] == []
+  end
+
+  # The fixture cameras have no zones, and the file is shared by the whole
+  # suite, so the shaped list is asserted on directly rather than by giving
+  # one of them a polygon every other suite would then load.
+  test "a camera's zones are listed as {id, name}, geometry withheld" do
+    cam = %Cairn.Config.Camera{
+      id: "cam_z",
+      rtsp_url: "rtsp://127.0.0.1:8554/z",
+      zones: [
+        %{id: "drive", name: "Driveway", points: [[0.0, 0.0], [0.5, 0.0], [0.5, 1.0]]},
+        %{id: "porch", name: "Porch", points: [[0.5, 0.0], [1.0, 0.0], [1.0, 1.0]]}
+      ]
+    }
+
+    shaped =
+      CameraController.shape(cam, Server.get(), %{}, CameraControl.get("cam_z"))
+
+    assert shaped.zones == [%{id: "drive", name: "Driveway"}, %{id: "porch", name: "Porch"}]
   end
 
   test "index does not 500 when a camera probe is an error tuple", %{conn: conn} do

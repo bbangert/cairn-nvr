@@ -1,13 +1,13 @@
 defmodule Cairn.PresenceAggregator do
   @moduledoc """
-  A tier-1 camera's per-class present/cleared state machine — what that tier
-  runs *instead of* a tracker.
+  A tier-1 camera's per-`{zone, class}` present/cleared state machine — what
+  that tier runs *instead of* a tracker.
 
   Fed by `Cairn.Pipeline.PresenceSink` with one call per detected frame —
   a multi-frame `Detections` buffer is several calls sharing one clock
   read, which is why a sighting is counted per call, not per instant
-  (`sighted/5`): the labels seen (already floored by the camera's
-  effective `min_score`) and the frame's monotonic instant. Emits
+  (`sighted/5`): the `{zone, label}` keys seen (already floored by the
+  camera's effective `min_score`) and the frame's monotonic instant. Emits
   `Cairn.PresenceEvent`s on the transitions and nothing between them —
   presence is edge-triggered, so there is no update stream to throttle.
 
@@ -22,7 +22,7 @@ defmodule Cairn.PresenceAggregator do
   absence: whatever was present when the scene went still is, by the gate's
   own logic, still there (leaving would have moved, and motion reopens the
   gate). So the clear window is a span of absence EVIDENCE — opened by the
-  first batch that arrives without the label and closed by another at least
+  first batch that arrives without the key and closed by another at least
   `@clear_after_ms` later; frames flowed, the model ran, the class was gone,
   twice. Pure silence clears nothing until the long `@silence_timeout_ms`
   backstop, which exists for streams that die rather than scenes that
@@ -31,11 +31,19 @@ defmodule Cairn.PresenceAggregator do
   (`heartbeat/2` is how an all-skip buffer — the native gate's spelling of
   a sleeping scene — tells the backstop the stream is not dead.)
 
+  The key every leg is served for is `{zone, label}` — a zone id, or `nil`
+  for whole-frame presence on a camera with no zones. The same label in two
+  containing zones is two independent states owing two pairs, and a zone's
+  own state is fed only by the boxes the sink found inside it.
+
   The invariant every path serves: **every `presence_started` is followed
   by exactly one `presence_cleared`** — through evidence, disable, retire,
-  the backstop, and a crash. The crash leg is `Cairn.PresenceLedger`'s: a
-  restarted aggregator clears its predecessor's announced labels in
-  `init/1` before doing anything else, then re-confirms from live batches.
+  the backstop, a zone edit, and a crash. The zone-edit leg is
+  `zones_removed/2`: evidence gets there on its own while frames flow, but
+  a still scene produces none, so the edit itself does the clearing. The
+  crash leg is `Cairn.PresenceLedger`'s: a restarted aggregator clears its
+  predecessor's announced keys in `init/1` before doing anything else, then
+  re-confirms from live batches.
   """
 
   use GenServer, restart: :transient
@@ -49,7 +57,7 @@ defmodule Cairn.PresenceAggregator do
   # enough that the 40-camera floor rate (~1.9/s, 530 ms gaps) confirms on
   # its second consecutive sighting.
   @confirm_window_ms 2_000
-  # Evidence-of-absence span: from the FIRST batch without the label to an
+  # Evidence-of-absence span: from the FIRST batch without the key to an
   # absent batch at least this much later — never from `last_seen_ms`, which
   # would count any gate-closed silence toward the window and let a single
   # absent batch clear a still-present object the moment the gate reopens.
@@ -70,11 +78,13 @@ defmodule Cairn.PresenceAggregator do
   end
 
   @doc """
-  One batch's evidence: the best score per label that survived the floor,
-  at the batch's monotonic instant. An empty map is still evidence — frames
-  flowed and nothing qualified — and advances clearing.
+  One batch's evidence: the best score per `{zone_id | nil, label}` key that
+  survived the floor, at the batch's monotonic instant. A box inside two
+  zones contributes an entry under each; `nil` is the whole-frame key a
+  camera with no zones reports under. An empty map is still evidence —
+  frames flowed and nothing qualified — and advances clearing.
   """
-  @spec observed(String.t(), integer(), %{String.t() => float()}) :: :ok
+  @spec observed(String.t(), integer(), %{{String.t() | nil, String.t()} => float()}) :: :ok
   def observed(camera_id, at_ms, seen) when is_map(seen) do
     case ensure(camera_id) do
       {:ok, pid} ->
@@ -117,6 +127,37 @@ defmodule Cairn.PresenceAggregator do
     case Cairn.Registry.whereis(camera_id, :presence) do
       nil -> :ok
       pid -> GenServer.cast(pid, :detection_disabled)
+    end
+  end
+
+  @doc """
+  Zone ids that no longer exist on this camera: clear what they still hold.
+
+  What `Cairn.Zones.removed/2` names — a zone gone or reshaped, and the
+  whole-frame key `nil` for the flip either way between zoneless and zoned.
+  Two callers, splitting on whether there is a pipeline: normally
+  `Cairn.Pipeline.PresenceSink` on a `{:policy, camera, _}` refresh, and
+  `Cairn.PipelineOwner` itself while the pipeline is down.
+
+  The ordinary absence path reaches the same place while frames flow — the
+  sink stops producing the removed zone's keys, so every later batch is
+  evidence against them. What it cannot reach is a still scene: a closed
+  motion gate delivers no batches at all, and the stale key would stand
+  until the 600 s backstop. A zone's removal is a known fact rather than
+  something to infer from evidence, so this clears it outright. From the sink
+  the cast lands behind its own last `observed` on this mailbox, so a batch
+  already in flight cannot re-mint what it just cleared; from the owner there
+  is no pipeline and so no batch to order against. If the aggregator
+  restarts between the two, `init/1`'s ledger clear is the backstop — a
+  duplicate cleared at worst, never a missing one.
+  """
+  @spec zones_removed(String.t(), [String.t() | nil]) :: :ok
+  def zones_removed(camera_id, removed) when is_list(removed) do
+    # whereis, not ensure — `detection_disabled/1`'s rule: nothing running
+    # holds nothing to clear.
+    case Cairn.Registry.whereis(camera_id, :presence) do
+      nil -> :ok
+      pid -> GenServer.cast(pid, {:zones_removed, removed})
     end
   end
 
@@ -184,14 +225,15 @@ defmodule Cairn.PresenceAggregator do
   @impl true
   def init(camera_id) do
     # A predecessor's unanswered announcements clear FIRST: presence is
-    # edge-only, so a crash that lost the labels map would otherwise leave
+    # edge-only, so a crash that lost the present map would otherwise leave
     # every client that tracked the edges stuck at "present" with no
     # cleared ever coming (the every-started-gets-a-cleared invariant —
     # `Cairn.PresenceLedger`). A fresh camera has no leftovers and this is
     # a no-op.
-    for {label, first_seen_at, score} <- Cairn.PresenceLedger.leftovers(camera_id) do
+    for {zone, label, first_seen_at, score} <- Cairn.PresenceLedger.leftovers(camera_id) do
       cleared = %PresenceEvent{
         camera_id: camera_id,
+        zone: zone,
         label: label,
         score: score,
         first_seen_at: first_seen_at,
@@ -205,7 +247,7 @@ defmodule Cairn.PresenceAggregator do
       # a cleared that can vanish.
       PresenceEvent.broadcast(:presence_cleared, cleared)
       # The event lane hears every clear this process owes, this one included:
-      # a recorder holding an event open on a label whose aggregator died
+      # a recorder holding an event open on a key whose aggregator died
       # would otherwise wait out `max_event` for a scene that already ended.
       #
       # A bare cast, deliberately, where a transition goes through
@@ -223,7 +265,7 @@ defmodule Cairn.PresenceAggregator do
       # consults.
       PresenceRecorder.presence(camera_id, :presence_cleared, cleared)
 
-      Cairn.PresenceLedger.cleared(camera_id, label)
+      Cairn.PresenceLedger.cleared(camera_id, zone, label)
     end
 
     # The out-of-band half of `detection_disabled/1`: the sink's own call
@@ -237,11 +279,11 @@ defmodule Cairn.PresenceAggregator do
     {:ok,
      %{
        camera_id: camera_id,
-       # label => %{phase: :pending | :present, first_seen_ms, last_seen_ms,
-       # absent_since_ms, best_score, first_seen_at} — `first_seen_at` is the
-       # wall instant the outward-facing events carry; every bound is
-       # measured on the monotonic *_ms fields.
-       labels: %{},
+       # {zone, label} => %{phase: :pending | :present, first_seen_ms,
+       # last_seen_ms, absent_since_ms, best_score, first_seen_at} —
+       # `first_seen_at` is the wall instant the outward-facing events carry;
+       # every bound is measured on the monotonic *_ms fields.
+       present: %{},
        last_batch_ms: nil
      }}
   end
@@ -258,12 +300,12 @@ defmodule Cairn.PresenceAggregator do
         {:noreply, state}
 
       _enabled ->
-        labels =
-          state.labels
+        present =
+          state.present
           |> sightings(seen, at_ms, state.camera_id)
           |> absences(seen, at_ms, state.camera_id)
 
-        {:noreply, %{state | labels: labels, last_batch_ms: at_ms}}
+        {:noreply, %{state | present: present, last_batch_ms: at_ms}}
     end
   end
 
@@ -273,6 +315,33 @@ defmodule Cairn.PresenceAggregator do
 
   def handle_cast(:detection_disabled, state) do
     {:noreply, clear_all(state)}
+  end
+
+  # `last_batch_ms` is deliberately untouched, where `clear_all/1` resets it:
+  # this is a zone edit, not a teardown, so the keys that remain keep aging
+  # against the same batch history instead of being handed a fresh silence
+  # window. A `:pending`
+  # key in a removed zone is dropped silently — nothing was announced for
+  # it — exactly as `absences/4` drops a stale one.
+  def handle_cast({:zones_removed, removed}, state) do
+    removed = MapSet.new(removed)
+
+    present =
+      Enum.reduce(state.present, %{}, fn {{zone, _label} = key, entry}, kept ->
+        cond do
+          not MapSet.member?(removed, zone) ->
+            Map.put(kept, key, entry)
+
+          entry.phase == :present ->
+            broadcast(:presence_cleared, state.camera_id, key, entry)
+            kept
+
+          true ->
+            kept
+        end
+      end)
+
+    {:noreply, %{state | present: present}}
   end
 
   # `:transient` restarts abnormal exits only, so this normal stop is final;
@@ -303,13 +372,13 @@ defmodule Cairn.PresenceAggregator do
     end
   end
 
-  defp sightings(labels, seen, at_ms, camera_id) do
-    Enum.reduce(seen, labels, fn {label, score}, labels ->
-      Map.put(labels, label, sighted(Map.get(labels, label), label, score, at_ms, camera_id))
+  defp sightings(present, seen, at_ms, camera_id) do
+    Enum.reduce(seen, present, fn {key, score}, present ->
+      Map.put(present, key, sighted(Map.get(present, key), key, score, at_ms, camera_id))
     end)
   end
 
-  defp sighted(nil, _label, score, at_ms, _camera_id) do
+  defp sighted(nil, _key, score, at_ms, _camera_id) do
     %{
       phase: :pending,
       first_seen_ms: at_ms,
@@ -327,7 +396,7 @@ defmodule Cairn.PresenceAggregator do
   # sink's per-buffer clock read, and they are two model passes on two source
   # frames — exactly the two consecutive detections the confirm asks for —
   # so an equal `at_ms` must not be collapsed into one.
-  defp sighted(%{phase: :pending} = entry, label, score, at_ms, camera_id) do
+  defp sighted(%{phase: :pending} = entry, key, score, at_ms, camera_id) do
     if at_ms - entry.first_seen_ms <= @confirm_window_ms do
       entry = %{
         entry
@@ -337,19 +406,19 @@ defmodule Cairn.PresenceAggregator do
           absent_since_ms: nil
       }
 
-      broadcast(:presence_started, camera_id, label, entry)
+      broadcast(:presence_started, camera_id, key, entry)
       entry
     else
-      sighted(nil, label, score, at_ms, camera_id)
+      sighted(nil, key, score, at_ms, camera_id)
     end
   end
 
-  defp sighted(%{phase: :present} = entry, label, score, at_ms, camera_id) do
+  defp sighted(%{phase: :present} = entry, {zone, label}, score, at_ms, camera_id) do
     # The ledger row follows an improving best, so a crash-recovery clear
     # carries what the cleared contract promises — the best over the whole
     # stay, not the best as of the confirmation.
     if score > entry.best_score do
-      Cairn.PresenceLedger.announced(camera_id, label, entry.first_seen_at, score)
+      Cairn.PresenceLedger.announced(camera_id, zone, label, entry.first_seen_at, score)
     end
 
     %{
@@ -360,28 +429,31 @@ defmodule Cairn.PresenceAggregator do
     }
   end
 
-  # Only the labels this batch did NOT carry are absence evidence — the
-  # `seen` check is load-bearing, because a label sighted this very batch
-  # has `absent_since_ms: nil` too and the second clause would open a span
-  # on its own sighting. The span is measured absent-batch to absent-batch
-  # (see `@clear_after_ms`) — silence between the two counts, because the
-  # first already testified to the absence the silence then preserved. A
-  # stale `:pending` vanishes by the same rule, without an event — nothing
-  # was ever announced.
-  defp absences(labels, seen, at_ms, camera_id) do
-    Enum.reduce(labels, %{}, fn {label, entry}, kept ->
+  # Only the keys this batch did NOT carry are absence evidence — the `seen`
+  # check is load-bearing, because a key sighted this very batch has
+  # `absent_since_ms: nil` too and the second clause would open a span on its
+  # own sighting. The span is measured absent-batch to absent-batch (see
+  # `@clear_after_ms`) — silence between the two counts, because the first
+  # already testified to the absence the silence then preserved. A stale
+  # `:pending` vanishes by the same rule, without an event — nothing was ever
+  # announced. Absence is per key: a label that walks from one zone into
+  # another is present in BOTH for a while — the second confirms inside
+  # `@confirm_window_ms` long before the first has served its
+  # `@clear_after_ms` of absence — two live states, two pairs.
+  defp absences(present, seen, at_ms, camera_id) do
+    Enum.reduce(present, %{}, fn {key, entry}, kept ->
       cond do
-        Map.has_key?(seen, label) ->
-          Map.put(kept, label, entry)
+        Map.has_key?(seen, key) ->
+          Map.put(kept, key, entry)
 
         entry.absent_since_ms == nil ->
-          Map.put(kept, label, %{entry | absent_since_ms: at_ms})
+          Map.put(kept, key, %{entry | absent_since_ms: at_ms})
 
         at_ms - entry.absent_since_ms < @clear_after_ms ->
-          Map.put(kept, label, entry)
+          Map.put(kept, key, entry)
 
         entry.phase == :present ->
-          broadcast(:presence_cleared, camera_id, label, entry)
+          broadcast(:presence_cleared, camera_id, key, entry)
           kept
 
         true ->
@@ -394,11 +466,11 @@ defmodule Cairn.PresenceAggregator do
   # history left to age — without this the silence backstop would re-run an
   # empty clear every check until the next batch arrives.
   defp clear_all(state) do
-    for {label, %{phase: :present} = entry} <- state.labels do
-      broadcast(:presence_cleared, state.camera_id, label, entry)
+    for {key, %{phase: :present} = entry} <- state.present do
+      broadcast(:presence_cleared, state.camera_id, key, entry)
     end
 
-    %{state | labels: %{}, last_batch_ms: nil}
+    %{state | present: %{}, last_batch_ms: nil}
   end
 
   # The ledger write sits on whichever side of the emit keeps the recovery
@@ -406,14 +478,14 @@ defmodule Cairn.PresenceAggregator do
   # started may have gone out), delete after a cleared (the row survives
   # until the cleared has). A crash between either pair costs a duplicate
   # cleared, never a missing one.
-  defp broadcast(:presence_started = kind, camera_id, label, entry) do
-    Cairn.PresenceLedger.announced(camera_id, label, entry.first_seen_at, entry.best_score)
-    emit(kind, camera_id, label, entry)
+  defp broadcast(:presence_started = kind, camera_id, {zone, label} = key, entry) do
+    Cairn.PresenceLedger.announced(camera_id, zone, label, entry.first_seen_at, entry.best_score)
+    emit(kind, camera_id, key, entry)
   end
 
-  defp broadcast(:presence_cleared = kind, camera_id, label, entry) do
-    emit(kind, camera_id, label, entry)
-    Cairn.PresenceLedger.cleared(camera_id, label)
+  defp broadcast(:presence_cleared = kind, camera_id, {zone, label} = key, entry) do
+    emit(kind, camera_id, key, entry)
+    Cairn.PresenceLedger.cleared(camera_id, zone, label)
   end
 
   # Both halves of one transition: the cluster-wide broadcast every consumer
@@ -421,9 +493,10 @@ defmodule Cairn.PresenceAggregator do
   # not a second subscriber to the topic on purpose — the trigger for a
   # recording must not race PubSub delivery, and it must reach exactly the one
   # process that owns this camera's events.
-  defp emit(kind, camera_id, label, entry) do
+  defp emit(kind, camera_id, {zone, label}, entry) do
     event = %PresenceEvent{
       camera_id: camera_id,
+      zone: zone,
       label: label,
       score: entry.best_score,
       first_seen_at: entry.first_seen_at,

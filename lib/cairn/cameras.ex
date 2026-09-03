@@ -229,14 +229,14 @@ defmodule Cairn.Cameras do
           ["camera #{camera.id}: dropped unknown key #{inspect(key)}" | acc]
         end)
 
+      # The zones column rides out as the `"zones"` key the parser validates:
+      # stored string-keyed, rendered as-is, judged by `Cairn.Zones` on every
+      # load like any other camera key.
       map =
         camera.settings
         |> Map.take(known)
         |> Map.put("id", camera.id)
-
-      # `"zones"` is not rendered here: `Config.Camera` learns the key in
-      # phase 2 (P2-T1) — rendering it now would warn "unknown key" on
-      # every boot.
+        |> Map.put("zones", camera.zones)
 
       {map, warnings}
     end)

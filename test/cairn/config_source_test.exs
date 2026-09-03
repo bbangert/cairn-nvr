@@ -253,7 +253,7 @@ defmodule Cairn.ConfigSourceTest do
       refute Enum.any?(warnings2, &(&1 =~ "unknown key"))
     end
 
-    test "a YAML camera's zones earn their own warning, not the unknown-key one", %{dir: dir} do
+    test "a YAML camera's zones are imported onto the row", %{dir: dir} do
       path =
         write_yaml!(dir, """
         #{globals(dir)}
@@ -261,14 +261,21 @@ defmodule Cairn.ConfigSourceTest do
           - id: cam_a
             rtsp_url: rtsp://h/1
             zones:
-              - name: drive
+              - id: drive
+                name: Driveway
                 points: [[0, 0], [1, 0], [1, 1]]
         """)
 
       assert {:ok, _config, warnings, %{}} = ConfigSource.load(path)
-      assert Enum.any?(warnings, &(&1 =~ "camera cam_a: zones are not imported"))
-      refute Enum.any?(warnings, &(&1 =~ ~s(dropped unknown key "zones")))
-      assert Cameras.get("cam_a").zones == []
+      refute Enum.any?(warnings, &(&1 =~ "not imported" or &1 =~ ~s(unknown key "zones")))
+
+      # What the load does say about them: this camera is on no plugin, so the
+      # polygons filter nothing — which also proves the parser read them.
+      assert Enum.any?(warnings, &(&1 =~ "camera cam_a: zones have no effect"))
+
+      assert Cameras.get("cam_a").zones == [
+               %{"id" => "drive", "name" => "Driveway", "points" => [[0, 0], [1, 0], [1, 1]]}
+             ]
     end
 
     test "a first boot without a cameras key still arms the import latch", %{dir: dir} do

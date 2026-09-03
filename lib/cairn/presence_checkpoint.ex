@@ -1,13 +1,14 @@
 defmodule Cairn.PresenceCheckpoint do
   @moduledoc """
   `Cairn.EventCheckpoint`'s shape for the presence lane: a public named ETS
-  table holding each tier-1 camera's active event, the qualifying labels
-  present at that moment, the pid of the extractor writing its clip and the
-  render-slot continuity state (`%{centers: ..., next: ...}` — the adopted
-  extractor is still buffering the same sidecar, so slot centres AND the
-  per-event slot watermark must survive with the row), owned outside the pool
-  so the row survives a `Cairn.PresenceRecorder` crash and can be restored by
-  its replacement (`Cairn.PresenceRecorder.init/1`).
+  table holding each tier-1 camera's active event, the qualifying
+  `{zone, label}` keys present at that moment, the pid of the extractor
+  writing its clip and the render-slot continuity state
+  (`%{centers: ..., next: ...}` — the adopted extractor is still buffering
+  the same sidecar, so slot centres AND the per-event slot watermark must
+  survive with the row), owned outside the pool so the row survives a
+  `Cairn.PresenceRecorder` crash and can be restored by its replacement
+  (`Cairn.PresenceRecorder.init/1`).
 
   A separate table rather than a second kind of row in `cairn_active_events`,
   and the separation is load-bearing: `Cairn.CameraTracker.restore_checkpointed/0`
@@ -31,9 +32,12 @@ defmodule Cairn.PresenceCheckpoint do
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
-  @spec put(String.t(), Cairn.Event.t(), [String.t()], pid() | nil, map()) :: true
-  def put(camera_id, %Cairn.Event{} = event, labels, extractor, box_slots \\ %{}),
-    do: :ets.insert(@table, {camera_id, event, labels, extractor, box_slots})
+  @typedoc "The recorder's present key: a zone id (`nil` = whole frame) and a label."
+  @type present_key :: {String.t() | nil, String.t()}
+
+  @spec put(String.t(), Cairn.Event.t(), [present_key()], pid() | nil, map()) :: true
+  def put(camera_id, %Cairn.Event{} = event, keys, extractor, box_slots \\ %{}),
+    do: :ets.insert(@table, {camera_id, event, keys, extractor, box_slots})
 
   @spec delete(String.t()) :: true
   def delete(camera_id), do: :ets.delete(@table, camera_id)
@@ -44,15 +48,15 @@ defmodule Cairn.PresenceCheckpoint do
   A read and not a take, `Cairn.EventCheckpoint.get/1`'s rule: the row stands
   for as long as the event is open, and whoever ends it deletes it.
   """
-  @spec get(String.t()) :: {Cairn.Event.t(), [String.t()], pid() | nil, map()} | nil
+  @spec get(String.t()) :: {Cairn.Event.t(), [present_key()], pid() | nil, map()} | nil
   def get(camera_id) do
     case :ets.lookup(@table, camera_id) do
-      [{^camera_id, event, labels, extractor, box_slots}] -> {event, labels, extractor, box_slots}
+      [{^camera_id, event, keys, extractor, box_slots}] -> {event, keys, extractor, box_slots}
       [] -> nil
     end
   end
 
-  @spec all() :: [{String.t(), Cairn.Event.t(), [String.t()], pid() | nil, map()}]
+  @spec all() :: [{String.t(), Cairn.Event.t(), [present_key()], pid() | nil, map()}]
   def all, do: :ets.tab2list(@table)
 
   @doc "Empties the table in one operation."

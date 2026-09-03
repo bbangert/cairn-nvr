@@ -2,9 +2,9 @@ defmodule Cairn.Cameras.Camera do
   @moduledoc """
   A camera row. `settings` is the YAML camera mapping minus `id`/`zones`
   (rendered back through `Cairn.Cameras.raw_maps/0` in front of
-  `Cairn.Config.from_map/1`); `zones` is its own column because the editor
-  writes one column and the loader will render one key — `Config.Camera`
-  learns `zones` in phase 2, and `raw_maps/0` omits it until then.
+  `Cairn.Config.from_map/1`); `zones` is its own column so that a zone edit
+  (phase 4's editor, `Cairn.Cameras.put_zones/2` today) writes one column
+  and the loader renders one key.
   """
 
   use Ecto.Schema
@@ -41,9 +41,12 @@ defmodule Cairn.Cameras.Camera do
       message: "must be lowercase [a-z0-9_-] starting with a letter or digit"
     )
     |> validate_number(:position, greater_than_or_equal_to: 0)
-    # `zones` is only checked here to be a list of maps (what the `{:array,
-    # :map}` cast already enforces) — `Cairn.Zones` validates shape in
-    # phase 2.
+    # `zones` is checked here only to be a list of maps (what the `{:array,
+    # :map}` cast already enforces). Outline shape is `Cairn.Zones.validate/2`,
+    # which `Cairn.Config` runs on every load — and every write goes through
+    # `Cairn.Config.Server.update/3`, which re-validates the fleet inside the
+    # transaction, so a bad outline fails the save itself rather than the
+    # next boot.
     # `ecto_sqlite3` reports a string primary key's index as
     # `cameras_id_index`, not a Postgres-style `_pkey` name.
     |> unique_constraint(:id, name: :cameras_id_index)

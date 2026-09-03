@@ -89,7 +89,7 @@ See `config.example.yml` — every key is documented inline. Summary:
 | `profile_dirs` | directories of your own hardware profiles, searched after the ones cairn ships (a same-named file of yours wins, with a warning) |
 | `retention.days` / `retention.per_label` | pruning (camera overrides win; multi-label events keep the longest) |
 | `retention.tracks_days` | how long track rows live (default 365; global only, and exempt from emergency cleanup) |
-| `cameras[]` | `id`, `rtsp_url`, `substream_url` (optional second stream detection runs on while recording keeps cutting from the main one — always `rtsp://`, whatever `ingest` says, and it must share the main stream's aspect ratio), `plugin` (a `plugins:` group name — absent ⇒ no detection), `ingest` (`ffmpeg` bridge default, `rtsp` native), `min_score` per label (the wire floor), `track` / `record` (the two host-side tiers above it: what earns a track row, what earns video), `motion_json` (the motion gate's scene config, verbatim JSON — operator-owned per D-P6; rejected on a tier-2 group, see `docs/profile-authoring.md`), `extra_ffmpeg_args`, `transcode`, `retention` |
+| `cameras[]` | `id`, `rtsp_url`, `substream_url` (optional second stream detection runs on while recording keeps cutting from the main one — always `rtsp://`, whatever `ingest` says, and it must share the main stream's aspect ratio), `plugin` (a `plugins:` group name — absent ⇒ no detection), `ingest` (`ffmpeg` bridge default, `rtsp` native), `min_score` per label (the wire floor), `track` / `record` (the two host-side tiers above it: what earns a track row, what earns video), `motion_json` (the motion gate's scene config, verbatim JSON — operator-owned per D-P6; rejected on a tier-2 group, see `docs/profile-authoring.md`), `extra_ffmpeg_args`, `transcode`, `retention`, `zones` (presence zones — polygons in normalized frame coordinates; drawn in the UI, accepted here for import; tier-1 cameras only, see `docs/ha-api.md`) |
 | `plugins` | named plugin groups (`name: {profile: ...}`) — the hardware profile the in-VM engine loads for every camera naming the group (it owns the model config and the tracker's stage list); `allow_experimental:` consents to a profile whose backend is not proven in soak |
 | `integrations.token` | bearer token that enables the Home Assistant API (see below); absent ⇒ `/api` disabled |
 
@@ -113,8 +113,9 @@ Requests authenticate with `Authorization: Bearer <token>` (or `?access_token=`
 for media URLs). The browser UI (`/`, `/media`, `/hls`) is unaffected. The full
 endpoint contract is in [`docs/ha-api.md`](docs/ha-api.md).
 
-The **Python HACS integration that consumes this API lives in a separate repo**;
-`docs/ha-api.md` is the interface it builds against. Serve the API over TLS or a
+A **Python HACS integration** that consumes this API is planned, in its own
+repo, and is not written yet; `docs/ha-api.md` is the interface it will build
+against. Serve the API over TLS or a
 trusted LAN only — the token is a bearer secret.
 
 ## Deployment

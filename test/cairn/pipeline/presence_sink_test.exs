@@ -5,7 +5,24 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
   alias Cairn.Config.Camera
   alias Cairn.NativeStub
   alias Cairn.Pipeline.PresenceSink
+  alias Cairn.PresenceFixtures
   alias Membrane.Buffer
+
+  @box [0.1, 0.1, 0.2, 0.2]
+
+  # Two disjoint zones with a gap between them and a third nested inside the
+  # first, so a box can land in one, in two, or in none — `hits/2` reads the
+  # box's bottom centre, which is what the `@in_*` boxes below are named for.
+  @drive %{id: "drive", name: "Drive", points: [[0.0, 0.0], [0.45, 0.0], [0.45, 0.9], [0.0, 0.9]]}
+  @porch %{id: "porch", name: "Porch", points: [[0.55, 0.0], [1.0, 0.0], [1.0, 0.9], [0.55, 0.9]]}
+  @yard %{id: "yard", name: "Yard", points: [[0.1, 0.1], [0.4, 0.1], [0.4, 0.5], [0.1, 0.5]]}
+
+  # foot (0.2, 0.8) — inside drive, below yard
+  @in_drive [0.1, 0.6, 0.2, 0.2]
+  # foot (0.2, 0.3) — inside drive and the yard nested in it
+  @in_both [0.1, 0.1, 0.2, 0.2]
+  # foot (0.5, 0.95) — the gap between the zones, below both
+  @outside [0.4, 0.75, 0.2, 0.2]
 
   setup do
     camera_id = "psink_#{System.unique_integer([:positive])}"
@@ -46,14 +63,21 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
 
   defp frame(objects), do: %{NativeStub.frame() | objects: objects}
 
+  # `@box` rather than the fixtures' own default: it is only the zoneless
+  # cases' box, and this suite's zones are drawn around these coordinates.
   defp object(label, score, kind \\ "detected"),
-    do: %{
-      label: label,
-      score: score,
-      bbox: [0.1, 0.1, 0.2, 0.2],
-      track_id: nil,
-      observation_kind: kind
-    }
+    do: PresenceFixtures.object(label, score, kind, @box)
+
+  defp object(label, score, kind, bbox), do: PresenceFixtures.object(label, score, kind, bbox)
+
+  defp zoneless(ctx), do: %{ctx | camera: %{ctx.camera | zones: []}}
+
+  # The aggregator's `{zone, label}` state map, read through a `:sys.get_state`
+  # barrier — `observed/3` is a cast, so nothing else orders it against the
+  # assertion.
+  defp present(camera_id) do
+    camera_id |> Cairn.Registry.whereis(:presence) |> :sys.get_state() |> Map.fetch!(:present)
+  end
 
   # Two buffers back to back — the aggregator counts sightings per call, so
   # even the same millisecond's clock reading confirms.
@@ -71,7 +95,7 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
     {[], _state} = feed(state, [frame([object("person", 0.9)])])
 
     assert_receive {:presence_started,
-                    %PresenceEvent{camera_id: ^id, label: "person", score: 0.9}}
+                    %PresenceEvent{camera_id: ^id, zone: nil, label: "person", score: 0.9}}
   end
 
   test "objects below the camera's floor, and tracked-kind objects, are not evidence", ctx do
@@ -111,7 +135,7 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
     assert actions == []
     assert state.dropped == 1
 
-    assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, label: "person"}}
+    assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
   end
 
   test "a buffer without the observations key is counted-dropped, not crashed on, and the element keeps working",
@@ -144,7 +168,7 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
     {[], state} = feed(state, [skip])
 
     pid = Cairn.Registry.whereis(id, :presence)
-    assert :sys.get_state(pid).labels["person"].absent_since_ms == nil
+    assert :sys.get_state(pid).present[{nil, "person"}].absent_since_ms == nil
     refute_receive {:presence_cleared, %PresenceEvent{camera_id: ^id}}, 50
 
     # …while the buffer still proves the branch alive to the watchdog.
@@ -258,5 +282,181 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
 
     assert is_integer(stats.last_buffer_at_ms)
     assert stats.forwarded == 1
+  end
+
+  describe "zones" do
+    setup ctx do
+      %{camera: %{ctx.camera | zones: [@drive, @porch, @yard]}}
+    end
+
+    test "a box standing in a zone is presence under that zone's id", ctx do
+      id = ctx.camera_id
+
+      two_beats(sink(ctx), [frame([object("person", 0.9, "detected", @in_drive)])])
+
+      assert_receive {:presence_started,
+                      %PresenceEvent{camera_id: ^id, zone: "drive", label: "person"}}
+    end
+
+    test "a box standing outside every zone is evidence of nothing", ctx do
+      id = ctx.camera_id
+
+      two_beats(sink(ctx), [frame([object("person", 0.9, "detected", @outside)])])
+
+      refute_receive {:presence_started, %PresenceEvent{camera_id: ^id}}, 50
+      # The aggregator was still called — with an empty map, which is the
+      # absence evidence a zoned camera owes for the scene outside its zones.
+      assert present(id) == %{}
+    end
+
+    test "a box standing in two overlapping zones owes each of them a state", ctx do
+      id = ctx.camera_id
+
+      two_beats(sink(ctx), [frame([object("person", 0.9, "detected", @in_both)])])
+
+      assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: "drive"}}
+      assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: "yard"}}
+    end
+
+    test "a camera with no zones reports the one whole-frame state", ctx do
+      id = ctx.camera_id
+
+      two_beats(sink(zoneless(ctx)), [frame([object("person", 0.9, "detected", @outside)])])
+
+      assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil}}
+      assert Map.keys(present(id)) == [{nil, "person"}]
+    end
+
+    # The recorder draws an event's trigger and its sidecar from these frames,
+    # so an out-of-zone box reaching it would illustrate an event the
+    # aggregator refused to open. `pending` is where a batch waits while no
+    # event is open, and reading it is the barrier for the cast that sent it.
+    test "the recorder is given the surviving objects only", ctx do
+      state = sink(ctx)
+
+      {[], _state} =
+        feed(state, [
+          frame([
+            object("person", 0.9, "detected", @in_drive),
+            object("car", 0.9, "detected", @outside)
+          ])
+        ])
+
+      recorder = Cairn.Registry.whereis(ctx.camera_id, :presence_recorder)
+      assert {_floors, [frame], _at_ms} = :sys.get_state(recorder).pending
+      assert [%{label: "person", zones: ["drive"]}] = frame.objects
+    end
+
+    # The recorder wants a predicted box for the same reason it wants a
+    # detected one — the sidecar and the trigger — and a zoned camera must not
+    # be the thing that takes it away. `seen/2` is what keeps it out of
+    # presence state.
+    test "a tracked box inside a zone reaches the recorder but is not evidence", ctx do
+      id = ctx.camera_id
+
+      {[], _state} =
+        two_beats(sink(ctx), [frame([object("person", 0.9, "tracked", @in_drive)])])
+
+      recorder = Cairn.Registry.whereis(id, :presence_recorder)
+      assert {_floors, [frame], _at_ms} = :sys.get_state(recorder).pending
+      assert [%{label: "person", zones: ["drive"]}] = frame.objects
+
+      assert present(id) == %{}
+      refute_receive {:presence_started, %PresenceEvent{camera_id: ^id}}, 50
+    end
+
+    test "a tracked box outside every zone is dropped like any other", ctx do
+      {[], _state} = feed(sink(ctx), [frame([object("person", 0.9, "tracked", @outside)])])
+
+      recorder = Cairn.Registry.whereis(ctx.camera_id, :presence_recorder)
+      assert {_floors, [frame], _at_ms} = :sys.get_state(recorder).pending
+      assert frame.objects == []
+    end
+
+    test "the overlay is shown the boxes the zones reject", ctx do
+      id = ctx.camera_id
+      Cairn.LiveDetections.subscribe(id)
+
+      {[], _state} =
+        feed(sink(ctx), [
+          frame([
+            object("person", 0.9, "detected", @in_drive),
+            object("car", 0.9, "detected", @outside)
+          ])
+        ])
+
+      assert_receive {:detections, ^id, [%{label: "person"}, %{label: "car"}]}
+    end
+
+    test "removing a zone clears what was standing in it", ctx do
+      id = ctx.camera_id
+
+      {[], state} = two_beats(sink(ctx), [frame([object("person", 0.9, "detected", @in_drive)])])
+      assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: "drive"}}
+      assert Map.has_key?(present(id), {"drive", "person"})
+
+      camera = %{ctx.camera | zones: [@porch]}
+
+      assert {[], %{camera: ^camera}} =
+               PresenceSink.handle_parent_notification({:policy, camera, %{}}, %{}, state)
+
+      assert_receive {:presence_cleared,
+                      %PresenceEvent{camera_id: ^id, zone: "drive", label: "person"}}
+    end
+
+    test "a camera gaining its first zone clears its whole-frame state", ctx do
+      id = ctx.camera_id
+      ctx = zoneless(ctx)
+
+      {[], state} = two_beats(sink(ctx), [frame([object("person", 0.9, "detected", @in_drive)])])
+      assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil}}
+      assert Map.has_key?(present(id), {nil, "person"})
+
+      camera = %{ctx.camera | zones: [@drive]}
+      {[], _state} = PresenceSink.handle_parent_notification({:policy, camera, %{}}, %{}, state)
+
+      assert_receive {:presence_cleared,
+                      %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
+    end
+
+    test "a zone reshaped in place clears what was standing in it", ctx do
+      id = ctx.camera_id
+
+      {[], state} = two_beats(sink(ctx), [frame([object("person", 0.9, "detected", @in_drive)])])
+      assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: "drive"}}
+
+      # The same id over a smaller outline: the standing state may sit outside
+      # it, and nothing later would say so on a still scene.
+      shrunk = %{@drive | points: [[0.0, 0.0], [0.2, 0.0], [0.2, 0.2], [0.0, 0.2]]}
+      camera = %{ctx.camera | zones: [shrunk, @porch, @yard]}
+      {[], _state} = PresenceSink.handle_parent_notification({:policy, camera, %{}}, %{}, state)
+
+      assert_receive {:presence_cleared,
+                      %PresenceEvent{camera_id: ^id, zone: "drive", label: "person"}}
+    end
+
+    test "a renamed zone keeps its states", ctx do
+      id = ctx.camera_id
+
+      {[], state} = two_beats(sink(ctx), [frame([object("person", 0.9, "detected", @in_drive)])])
+      assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: "drive"}}
+
+      camera = %{ctx.camera | zones: [%{@drive | name: "Front drive"}, @porch, @yard]}
+      {[], _state} = PresenceSink.handle_parent_notification({:policy, camera, %{}}, %{}, state)
+
+      refute_receive {:presence_cleared, %PresenceEvent{camera_id: ^id}}, 50
+    end
+
+    test "a reload that leaves the zones alone clears nothing", ctx do
+      id = ctx.camera_id
+
+      {[], state} = two_beats(sink(ctx), [frame([object("person", 0.9, "detected", @in_drive)])])
+      assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: "drive"}}
+
+      {[], _state} =
+        PresenceSink.handle_parent_notification({:policy, ctx.camera, %{}}, %{}, state)
+
+      refute_receive {:presence_cleared, %PresenceEvent{camera_id: ^id}}, 50
+    end
   end
 end

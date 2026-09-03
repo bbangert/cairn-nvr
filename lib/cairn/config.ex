@@ -1263,6 +1263,7 @@ defmodule Cairn.Config do
     |> validate_tracking(config)
     |> validate_tiers(config)
     |> warn_track_inert_on_tier1(config)
+    |> warn_zones_inert(config)
     |> validate_numbers(config)
     |> validate_remux(config)
     |> validate_ha_token(config)
@@ -1623,6 +1624,28 @@ defmodule Cairn.Config do
         acc,
         "camera #{cam.id}: track: has no effect at tier 1 — tier 1 runs no tracker and " <>
           "persists no track rows; record: gates presence recordings"
+      )
+    end)
+  end
+
+  # The third state of the load-warning rule: zones that parse and store but
+  # filter nothing. Presence is the tier-1 fork alone (`style(%{tier: 1}) ->
+  # :presence`, `Cairn.Pipeline.Camera`), so every other camera — no plugin,
+  # no profile, tier 2, a tier-less profile — runs no `PresenceSink` for the
+  # polygons to reach. "No profile" is read off `profile_for/2` returning
+  # `nil`, which today covers every plugin shape (a plugin resolves to
+  # `{:group, name}` or `nil`); a plugin form that ran presence without a
+  # profile would need its own clause here.
+  defp warn_zones_inert(acc, config) do
+    config.cameras
+    |> Enum.filter(fn cam ->
+      cam.zones != [] and not match?(%Profile{tier: 1}, profile_for(config, cam))
+    end)
+    |> Enum.reduce(acc, fn cam, acc ->
+      add_warning(
+        acc,
+        "camera #{cam.id}: zones have no effect — this camera runs no presence detection " <>
+          "(zones filter tier-1 presence)"
       )
     end)
   end

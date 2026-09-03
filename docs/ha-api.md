@@ -1,8 +1,8 @@
 # Cairn HA API (`/api`)
 
-The interface spec for the Home Assistant integration. A separate Python HACS
-integration (its own repo) consumes these endpoints; this document is the
-contract it builds against.
+The interface spec for the Home Assistant integration. A Python HACS
+integration is planned, in its own repo, and is not written yet; this
+document is the contract it will build against.
 
 Everything here is served under the token-authed `/api` scope. It is entirely
 separate from the browser UI (`/`, `/media`, `/hls`), which stays cookie/
@@ -67,8 +67,10 @@ media URLs → Media Browser resolution; WHEP → native WebRTC camera
       "transcode": false,
       "min_score": {"default": 0.5, "person": 0.6},
       "windows": {"pre_seconds": 5, "post_seconds": 10, "max_seconds": 300},
+      "zones": [{"id": "drive", "name": "Driveway"}],
       "status": "running",
       "probe": null,
+      "plugin_status": null,
       "control": {"detection_enabled": true, "recording_enabled": true, "min_score": null}
     }
   ]
@@ -78,7 +80,16 @@ media URLs → Media Browser resolution; WHEP → native WebRTC camera
 `id` is stable — use it as the HA device identifier. `detection` is whether an
 inference plugin is configured. **`rtsp_url` is never emitted** (it embeds
 credentials). `control.min_score` is a runtime override (see below) or `null`
-when the configured `min_score` applies.
+when the configured `min_score` applies. `plugin_status` is the detector's own
+status object, the same one the `camera_status` SSE frame carries, or `null`
+until it reports one.
+
+`zones` lists the camera's presence zones — polygons drawn on the frame in
+Cairn's UI — as `{id, name}`, in the camera's order, `[]` when it has none.
+`id` is a stable slug minted when the zone is created and is what the
+`presence_*` frames carry; `name` is display-only, and renaming a zone never
+changes its `id`. Only a tier-1 camera acts on its zones (see below); they
+are listed here whatever the tier.
 
 ### `POST /api/cameras/:id/control`
 
@@ -147,7 +158,7 @@ the connection. Event kinds:
 | `event_clip_ready` / `event_clip_failed` | artifact object (below), with `clip_url` |
 | `event_snapshot_ready` / `event_snapshot_failed` | artifact object (below), with `snapshot_url` |
 | `track_started` / `track_updated` / `track_ended` | track object (below) |
-| `presence_started` / `presence_cleared` | `{camera_id, label, state, score, first_seen_at, at}` — tier-1 cameras only (see `profile-authoring.md` on the capability ladder). `state` is `"present"` or `"cleared"`; `score` is the best detection score over the stay so far; `first_seen_at` survives into the clearing frame, so dwell is `at - first_seen_at` off that frame alone. **The transitions are edge-only**: a `presence_*` frame carries no event id and has no `/api/events` row of its own, and a client connecting mid-presence sees nothing until the next transition — track current state client-side from the transitions. A presence history/snapshot surface is future work. Recordings are a separate thing and are ordinary events — see below |
+| `presence_started` / `presence_cleared` | `{camera_id, zone, label, state, score, first_seen_at, at}` — tier-1 cameras only (see `profile-authoring.md` on the capability ladder). **The client state key is `(camera_id, zone, label)`.** `zone` is always present: the stable `id` of one of the camera's zones (`/api/cameras` lists them), or `null` for whole-frame presence on a camera that has no zones. `state` is `"present"` or `"cleared"`; `score` is the best detection score over the stay so far; `first_seen_at` survives into the clearing frame, so dwell is `at - first_seen_at` off that frame alone. **The transitions are edge-only**: a `presence_*` frame carries no event id and has no `/api/events` row of its own, and a client connecting mid-presence sees nothing until the next transition — track current state client-side from the transitions. A presence history/snapshot surface is future work. Recordings are a separate thing and are ordinary events — see below |
 | `camera_status` | `{camera_id, status, probe, plugin_status}` — `plugin_status` is the detector's own `{state, detail, fps}` ([`plugin.status`](archive/plugin-contract.md#pluginstatus)), `null` until it reports one. A camera detected on by the in-VM native block reports here too, adding `health` (`healthy` / `saturated` / `wedged` / `idle` / `unknown` / `not_applicable`), `stream_health`, `engine`, `nif`, `canary`, `model` (the model file's **name**, never its path), `backend`, `p50_ms` (one model pass, median over the last check window), `cpu_baseline_ms` (the CPU cost of one pass on the same model, measured once at engine init; `null` on a CPU backend, where there is no accelerator to compare against) and `inferences`; those keys never appear on a plugin's status, which is whitelisted to the three above. A camera configured to detect reports here even with no stream open — that is how a refused canary or a failed model load reaches a client |
 | `camera_control` | `{camera_id, detection_enabled, recording_enabled, min_score}` |
 | `disk_alert` | `{active, free_mb, threshold_mb}` |
@@ -163,6 +174,30 @@ the connection. Event kinds:
 > `null` there (below).
 > Clients that stored or compared it as a number must treat it as an opaque
 > string. There is no compatibility mode.
+
+#### Presence zones
+
+A camera with zones reports presence **per zone**: a detection counts for
+every zone that contains the bottom-centre of its box, and one that lands in
+no zone is invisible to presence and to the recordings it drives — it is
+neither evidence for `presence_started` nor a box in a clip's sidecar. A
+label seen in two zones is two independent states, `("cam", "drive",
+"person")` and `("cam", "porch", "person")`, each with its own `started` /
+`cleared` pair; a camera with no zones reports the one whole-frame state
+under `zone: null`. The two never mix: a camera never emits both a `null`
+zone and a named one at the same time.
+
+Zone edits take effect without a camera restart, and every started still
+gets its cleared: removing a zone clears every state under it immediately
+(`presence_cleared` with that `zone`), **reshaping** one clears it the same
+way — a state announced under the old outline may sit outside the new one —
+and a camera gaining its first zone clears its whole-frame states before any
+zoned one is announced. A renamed zone keeps its `id` and its states: only
+the outline is compared. The one exception is a crash landing between the
+clear and the record of it, which replays as a duplicate `presence_cleared`
+on restart, never a missing one. A client should drop the state for a zone it
+no longer sees in `/api/cameras` after re-fetching on reconnect — a
+`presence_cleared` for it was sent, but edge-only frames are not replayed.
 
 #### Presence recordings (tier 1)
 
