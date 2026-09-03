@@ -82,15 +82,15 @@ defmodule Cairn.CamerasDeleteFlowTest do
     assert_receive {:applied, %{removed: ["cam1"]}, _config}
   end
 
-  # The finding this closes: a tombstone installed only in `after_apply:`
-  # (which runs after `apply_diff` — camera stop/start, seconds in
-  # production) leaves a window between the delete committing and the
-  # tombstone landing. A control request that read the config, found the
-  # camera present, and then called `CameraControl.set/2` could win that
-  # race and have its write pruned once the delete's `after_apply:` caught
-  # up. This blocks `apply_diff` on a handshake to hold the window open and
-  # proves `after_commit:` (which runs ahead of `apply_diff`) has already
-  # closed it.
+  # The finding this closes: a tombstone installed by any post-commit hook
+  # leaves a window between the delete committing and the tombstone landing —
+  # `after_apply:` the widest of them, since it runs after `apply_diff`
+  # (camera stop/start, seconds in production). A control request that read
+  # the config, found the camera present, and then called
+  # `CameraControl.set/2` could win that race and have its write pruned when
+  # the hook caught up. This blocks `apply_diff` on a handshake to hold the
+  # window open and proves the tombstone `delete_row/1` takes inside the
+  # write closure, before the row goes, has already closed it.
   test "a control write for the deleted camera is refused while apply_diff is still blocked", %{
     dir: dir
   } do

@@ -155,38 +155,47 @@ defmodule Cairn.ConfigSource do
   lock. Rows the file no longer lists lose their runtime state the way a
   delete does — as the write's `after_apply:`, so the prune belongs to the
   commit rather than to this caller surviving the call. Their control
-  tombstones go in first, on `after_commit:`, for the same reason
-  `Cameras.delete/1`'s does: `after_apply:` runs after `apply_diff`, and a
-  control write that read the config before this replace committed could
-  otherwise land inside that window.
+  tombstones go in inside the write closure, ahead of the row delete, for
+  the same reason `Cameras.delete/1`'s does — every hook runs after the
+  commit, and a control write that read the config while the rows were still
+  there could land in the gap. `after_rollback:` revives them again when the
+  write does not commit, since the transaction does not undo a tombstone.
+  Survivors are revived on `after_commit:` (a re-inserted id the file lists
+  was tombstoned by the closure a moment earlier), with `after_apply:`'s
+  revive as the retry — exactly as `Cameras.create/1` does for its own id.
   """
   @spec reimport(Path.t()) :: Cameras.write_result()
   def reimport(path \\ Config.default_path()) do
     ref = make_ref()
 
     Config.Server.update(Cameras.server(), fn -> replace_rows(path, ref) end,
-      after_commit: fn -> tombstone_deleted(ref) end,
+      after_commit: fn -> revive_remaining() end,
+      after_rollback: fn -> revive_deleted(ref) end,
       after_apply: fn _diff -> prune_deleted(ref) end
     )
   end
 
-  # The write closure, `after_commit:` and `after_apply:` all run in the
-  # config server process, so the deleted ids ride its dictionary — no
-  # message hop, and nothing left in a mailbox when the write rolls back. A
-  # rolled-back write does leave its entry, so a new one sweeps the old: only
-  # the callbacks for the ref just written ever read one.
+  # The write closure and all three callbacks run in the config server
+  # process, so the deleted ids ride its dictionary — no message hop, and
+  # nothing left in a mailbox when the write rolls back. A rolled-back write
+  # does leave its entry when it rolls back before `after_rollback:` can
+  # sweep it (a raised closure), so a new one sweeps the old: only the
+  # callbacks for the ref just written ever read one.
   defp stash_deleted(ref, ids) do
     for {{:reimport_deleted, _stale} = key, _ids} <- Process.get(), do: Process.delete(key)
     Process.put({:reimport_deleted, ref}, ids)
   end
 
-  # Reads rather than deletes the stash: `after_apply:`'s `prune_deleted/1`
-  # runs after this on the same ref and still needs the list.
-  defp tombstone_deleted(ref) do
-    ref
-    |> stashed_deleted()
-    |> Enum.each(&CameraControl.tombstone/1)
+  # The rollback undid the row deletes; these ids are back, so the tombstones
+  # the closure installed for them have to come off too. The stash is dropped
+  # here: on this path there is no `after_apply:` to follow.
+  defp revive_deleted(ref) do
+    deleted = stashed_deleted(ref)
+    Process.delete({:reimport_deleted, ref})
+    Enum.each(deleted, &CameraControl.revive/1)
   end
+
+  defp revive_remaining, do: Enum.each(Cameras.list(), &CameraControl.revive(&1.id))
 
   defp stashed_deleted(ref), do: Process.get({:reimport_deleted, ref}, [])
 
@@ -195,11 +204,13 @@ defmodule Cairn.ConfigSource do
   # in neither the deleted list nor the applied diff — a disabled row is in
   # no config at all, and D-P8 keys prunes on the row rather than the diff.
   # A re-import bypasses `Cameras.create/1`, so an id it re-inserts after an
-  # earlier delete would stay tombstoned in `CameraControl` (by `after_commit:`'s
-  # `tombstone_deleted/1` above, same as an ordinary delete) and refuse every
-  # control write; the survivors are revived here for the same reason
-  # `create/1` revives its own id. The stash is deleted here, not read: this
-  # is the last callback on `ref`.
+  # earlier delete would stay tombstoned in `CameraControl` (by the closure's
+  # own tombstone, same as an ordinary delete) and refuse every control
+  # write. `after_commit:`'s `revive_remaining/0` has already brought the
+  # survivors back; this repeat is the retry for the case that one raised,
+  # which `run_zero_arity/2` swallows — the same reason `Cameras.create/1`
+  # revives on both hooks. The stash is deleted here, not read: this is the
+  # last callback on `ref`.
   defp prune_deleted(ref) do
     deleted = stashed_deleted(ref)
     Process.delete({:reimport_deleted, ref})
@@ -214,15 +225,19 @@ defmodule Cairn.ConfigSource do
          :ok <- check_drift(cameras),
          {:ok, _config, _warnings} <- Config.from_map(map) do
       before = Repo.all(from(c in Camera, select: c.id))
+      # Only the ids the file no longer lists are "deleted": a survivor is
+      # replaced row for row and keeps its runtime state — its control
+      # overlay included — exactly as an edit would leave it. Stashed and
+      # tombstoned before the delete, not after it: a control write that read
+      # the old config could otherwise land between the commit and any hook.
+      deleted = before -- Enum.map(cameras, &Map.get(&1, "id"))
+      stash_deleted(ref, deleted)
+      Enum.each(deleted, &CameraControl.tombstone/1)
       Repo.delete_all(Camera)
       Repo.delete_all(from(s in Setting, where: s.key == @marker_key))
       # The write closure answers only `:ok`; the dropped-key warnings from
       # the import are logged here so they are not lost with it.
       cameras |> import_rows(path) |> Enum.each(&Logger.warning("config: #{&1}"))
-      # Only the ids the file no longer lists are "deleted": a survivor is
-      # replaced row for row and keeps its runtime state — its control
-      # overlay included — exactly as an edit would leave it.
-      stash_deleted(ref, before -- Enum.map(cameras, &Map.get(&1, "id")))
       :ok
     else
       {:error, errors} when is_list(errors) -> {:error, {:yaml, errors}}

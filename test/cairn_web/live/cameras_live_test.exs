@@ -57,6 +57,14 @@ defmodule CairnWeb.CamerasLiveTest do
       Cameras.create(Map.merge(%{"id" => id, "settings" => settings}, attrs))
   end
 
+  # Add label, Remove and Test stream are submit buttons carrying
+  # `camera[_action]`, not `phx-click`s — so a click posts the whole form and
+  # the extra param stands in for the submitter's name/value, exactly as the
+  # browser sends it.
+  defp submit_action(view, action) do
+    view |> form("#camera-form") |> render_submit(%{"camera" => %{"_action" => action}})
+  end
+
   test "lists rows with their loaded state, zones and links", %{conn: conn} do
     create!("cam1", %{"rtsp_url" => "rtsp://h/1"}, %{
       "zones" => [
@@ -363,6 +371,9 @@ defmodule CairnWeb.CamerasLiveTest do
       assert html =~ ~s(id="camera-new-tabs")
       assert html =~ ~s(id="tab-scan")
       assert html =~ ~s(id="tab-manual")
+      # Navigation links, not ARIA tabs (no roles without the keyboard model).
+      assert html =~ ~s(aria-current="page")
+      refute html =~ ~s(role="tab")
       assert html =~ ~s(id="camera-labels")
       assert html =~ ~s(id="label-row-0")
       # write-only: the field exists and can never carry a value
@@ -389,7 +400,7 @@ defmodule CairnWeb.CamerasLiveTest do
 
       {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
 
-      render_click(view, "add-label-row")
+      submit_action(view, "add-label-row")
 
       html =
         view
@@ -727,7 +738,7 @@ defmodule CairnWeb.CamerasLiveTest do
 
       {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
 
-      render_click(view, "add-label-row")
+      submit_action(view, "add-label-row")
 
       html =
         view
@@ -743,7 +754,30 @@ defmodule CairnWeb.CamerasLiveTest do
 
       assert html =~ "duplicate label"
 
-      refute render_click(view, "remove-label-row", %{"index" => "1"}) =~ "duplicate label"
+      refute submit_action(view, "remove-label-row:1") =~ "duplicate label"
+    end
+
+    # The finding this closes: as `phx-click`s these three acted on the params
+    # the 300 ms debounce had last delivered, so the keystroke a click
+    # interrupts was dropped — the row was added around a form the operator
+    # had already changed.
+    test "adding a label row keeps what was typed since the last debounce tick", %{conn: conn} do
+      create!("cam1")
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      html =
+        view
+        |> form("#camera-form",
+          camera: %{"rtsp_url" => "rtsp://h/typed", "post_window_seconds" => "9"}
+        )
+        |> render_submit(%{"camera" => %{"_action" => "add-label-row"}})
+
+      assert html =~ ~s(id="label-row-1")
+      assert html =~ ~s(value="rtsp://h/typed")
+      assert html =~ ~s(value="9")
+      # An action is not a save.
+      assert Cameras.get("cam1").settings["rtsp_url"] == "rtsp://h/1"
     end
 
     test "save creates the row and lands on the list", %{conn: conn} do
@@ -1171,7 +1205,7 @@ defmodule CairnWeb.CamerasLiveTest do
 
       {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
 
-      render_click(view, "add-label-row")
+      submit_action(view, "add-label-row")
 
       html =
         view
@@ -1311,6 +1345,33 @@ defmodule CairnWeb.CamerasLiveTest do
       assert render(view) =~ ~s(value="yard")
     end
 
+    # Same finding as the label rows, and worse here: a probe opened on the
+    # debounced URL reports on a stream the operator is no longer looking at.
+    # The saved URL is a listener that never answers, so probing *it* would
+    # still be running when the assertion runs; only the submitted one
+    # (connection refused) reaches `error` inside `render_async`'s budget.
+    test "Test stream probes the submitted URL, not the debounced one", %{conn: conn} do
+      Application.put_env(:cairn, :probe_timeout_ms, 10_000)
+      on_exit(fn -> Application.delete_env(:cairn, :probe_timeout_ms) end)
+
+      {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false])
+      on_exit(fn -> :gen_tcp.close(listener) end)
+      {:ok, port} = :inet.port(listener)
+
+      create!("cam1", %{"rtsp_url" => "rtsp://127.0.0.1:#{port}/x"})
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      view
+      |> form("#camera-form", camera: %{"rtsp_url" => "rtsp://127.0.0.1:1/x"})
+      |> render_submit(%{"camera" => %{"_action" => "probe"}})
+
+      html = render_async(view, 5_000)
+
+      assert [row] = Regex.run(~r/<div[^>]*id="probe-main"[^>]*>/, html)
+      assert row =~ ~s(data-state="error")
+    end
+
     test "a probe that cannot connect reaches the error state", %{conn: conn} do
       Application.put_env(:cairn, :probe_timeout_ms, 500)
       on_exit(fn -> Application.delete_env(:cairn, :probe_timeout_ms) end)
@@ -1319,7 +1380,7 @@ defmodule CairnWeb.CamerasLiveTest do
 
       {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
 
-      render_click(view, "probe")
+      submit_action(view, "probe")
       html = render_async(view, 5_000)
 
       assert html =~ ~s(id="probe-main")
@@ -1350,10 +1411,10 @@ defmodule CairnWeb.CamerasLiveTest do
       links = fn -> view.pid |> Process.info(:links) |> elem(1) |> length() end
       idle = links.()
 
-      render_click(view, "probe")
+      submit_action(view, "probe")
       assert links.() == idle + 1
 
-      html = render_click(view, "probe")
+      html = submit_action(view, "probe")
       assert links.() == idle + 1
 
       assert [row] = Regex.run(~r/<div[^>]*id="probe-main"[^>]*>/, html)
@@ -1380,7 +1441,7 @@ defmodule CairnWeb.CamerasLiveTest do
       links = fn -> view.pid |> Process.info(:links) |> elem(1) |> length() end
       idle = links.()
 
-      render_click(view, "probe")
+      submit_action(view, "probe")
       assert links.() == idle + 1
 
       view
@@ -1408,7 +1469,7 @@ defmodule CairnWeb.CamerasLiveTest do
 
       {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
 
-      render_click(view, "probe")
+      submit_action(view, "probe")
       html = render_async(view, 5_000)
       assert html =~ ~s(data-state="error")
 
@@ -1433,7 +1494,7 @@ defmodule CairnWeb.CamerasLiveTest do
 
       {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
 
-      render_click(view, "probe")
+      submit_action(view, "probe")
       html = render_async(view, 5_000)
       assert html =~ ~s(data-state="error")
 

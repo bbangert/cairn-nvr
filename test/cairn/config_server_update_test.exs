@@ -418,6 +418,82 @@ defmodule Cairn.Config.ServerUpdateTest do
     assert Repo.get(Camera, "cam_a") == nil
   end
 
+  # The reason `after_rollback:` exists: a closure that tombstones an id
+  # before deleting its row has stepped outside the transaction, so a
+  # rollback puts the row back and leaves the tombstone standing.
+  test "after_rollback runs on a validator rejection and on a write failure", %{server: server} do
+    test_pid = self()
+    callback = fn -> send(test_pid, :rolled_back) end
+
+    assert {:ok, _diff, _warnings} = Config.Server.update(server, insert_fun("cam_a", "full"))
+
+    assert {:error, errors} =
+             Config.Server.update(server, insert_fun("cam_x", "partial"),
+               after_rollback: callback
+             )
+
+    assert Enum.any?(errors, &(&1 =~ "different models (full, partial)"))
+    assert_received :rolled_back
+
+    assert Config.Server.update(server, fn -> {:error, :boom} end, after_rollback: callback) ==
+             {:error, {:write, :boom}}
+
+    assert_received :rolled_back
+  end
+
+  test "after_rollback does not run on a write that commits", %{server: server} do
+    test_pid = self()
+
+    assert {:ok, _diff, _warnings} =
+             Config.Server.update(server, insert_fun("cam_a", "full"),
+               after_rollback: fn -> send(test_pid, :rolled_back) end
+             )
+
+    refute_received :rolled_back
+  end
+
+  # What `Cairn.Cameras.delete/1` relies on, in the small: the closure's step
+  # outside the transaction is undone by hand when the row is not.
+  test "a closure's out-of-transaction step is reversed by after_rollback", %{server: server} do
+    tombstoned = :ets.new(:tombstoned, [:public, :set])
+
+    write = fn ->
+      :ets.insert(tombstoned, {"cam_a", true})
+      {:error, :boom}
+    end
+
+    assert Config.Server.update(server, write,
+             after_rollback: fn -> :ets.delete(tombstoned, "cam_a") end
+           ) == {:error, {:write, :boom}}
+
+    assert :ets.lookup(tombstoned, "cam_a") == []
+  end
+
+  test "an after_rollback that raises is logged and leaves the rejection intact", %{
+    server: server
+  } do
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert Config.Server.update(server, fn -> {:error, :boom} end,
+                 after_rollback: fn -> raise "rtsp://user:hunter2@host" end
+               ) == {:error, {:write, :boom}}
+      end)
+
+    assert log =~ "after_rollback raised: RuntimeError"
+    refute log =~ "hunter2"
+    assert Process.alive?(server)
+  end
+
+  test "an after_rollback that is not a 0-arity fun is refused before the write", %{
+    server: server
+  } do
+    assert_raise ArgumentError, ~r/after_rollback/, fn ->
+      Config.Server.update(server, insert_fun("cam_a", "full"), after_rollback: :nope)
+    end
+
+    assert Repo.get(Camera, "cam_a") == nil
+  end
+
   defp flush_mailbox do
     receive do
       msg -> [msg | flush_mailbox()]

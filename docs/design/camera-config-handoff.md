@@ -195,9 +195,11 @@ shown on the row as the loader's own strings.
 
 **Tabs** — FIXED:
 ```heex
-<nav id="camera-new-tabs" role="tablist">
-  <.link id="tab-scan"   patch={~p"/cameras/new?tab=scan"}   role="tab" aria-selected={@tab == :scan}>Find on network</.link>
-  <.link id="tab-manual" patch={~p"/cameras/new?tab=manual"} role="tab" aria-selected={@tab == :manual}>Enter stream URLs</.link>
+<%!-- Navigation links, not ARIA tabs: no role="tab"/"tablist" without the
+     tabs keyboard model (arrow-key roving focus, a controlled tabpanel). --%>
+<nav id="camera-new-tabs">
+  <.link id="tab-scan"   patch={~p"/cameras/new?tab=scan"}   aria-current={@tab == :scan && "page"}>Find on network</.link>
+  <.link id="tab-manual" patch={~p"/cameras/new?tab=manual"} aria-current={@tab == :manual && "page"}>Enter stream URLs</.link>
 </nav>
 ```
 
@@ -299,10 +301,10 @@ looks like), the prefilled-banner copy.
       <input name={"camera[labels][#{n}][track]"}     inputmode="decimal">     <%!-- hot --%>
       <input name={"camera[labels][#{n}][record]"}    inputmode="decimal">     <%!-- hot --%>
       <input name={"camera[labels][#{n}][retention_days]"}>                    <%!-- hot; FREE: here or in Advanced --%>
-      <button type="button" phx-click="remove-label-row" phx-value-index={n}>Remove</button>
+      <button type="submit" form="camera-form" name="camera[_action]" value={"remove-label-row:#{n}"}>Remove</button>
     </div>
     <datalist id="known-labels"> … </datalist>
-    <button type="button" phx-click="add-label-row">Add label</button>
+    <button type="submit" form="camera-form" name="camera[_action]" value="add-label-row">Add label</button>
   </fieldset>
 
   <details id="camera-advanced">                          <%!-- Advanced --%>
@@ -314,7 +316,10 @@ looks like), the prefilled-banner copy.
     <input name="camera[extra_ffmpeg_args]">              <%!-- restart; whitespace-separated argv --%>
   </details>
 
-  <button id="camera-probe" type="button" phx-click="probe">Test stream</button>
+  <button id="camera-probe" type="submit" form="camera-form" name="camera[_action]" value="probe">Test stream</button>
+  <%!-- Add label / Remove / Test stream submit the form with camera[_action] instead of
+       sending a phx-click, so they act on what the browser holds at the click rather than
+       on the params the 300 ms debounce last delivered; "save" dispatches on it. --%>
   <section id="probe-result">
     <div id="probe-main" data-state={@probe.main.state}> … </div>   <%!-- idle | running | ok | error --%>
     <div id="probe-sub"  data-state={@probe.sub.state}>  … </div>   <%!-- only when a sub URL is set --%>
@@ -584,7 +589,8 @@ timestamp. Name every new glyph.
 
 ### Add camera — Find on network
 
-- Two tabs under the H1, `role="tab"`; the scan tab is the default.
+- Two tabs under the H1 — navigation links, the active one
+  `aria-current="page"`; the scan tab is the default.
 - Scan bar: interface select (label "Scan from", default "Default
   interface") + **Scan network**. Below it the device list. **Add by IP**
   sits under the list, quiet until the none-found state makes it the

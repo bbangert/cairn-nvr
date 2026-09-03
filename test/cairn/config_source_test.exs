@@ -728,12 +728,13 @@ defmodule Cairn.ConfigSourceTest do
       Cairn.CameraControl.prune(Map.keys(Cairn.CameraControl.all()) -- ["cam_b"])
     end
 
-    # The window `after_commit:` closes for `reimport/1` the same way it does
-    # for `Cameras.delete/1`: `cam_z` is a row the file no longer lists, so
-    # `replace_rows/2` deletes it, but the old `after_apply:`-only tombstone
-    # would not land until `apply_diff` returns — camera stop/start, seconds
-    # in production. This blocks the stubbed `apply_diff` on a handshake to
-    # hold that window open and proves the tombstone is already in place.
+    # The window the closure's own tombstone closes for `reimport/1` the same
+    # way it does for `Cameras.delete/1`: `cam_z` is a row the file no longer
+    # lists, so `replace_rows/2` deletes it, and a tombstone left to any
+    # post-commit hook would not land until `apply_diff` returns — camera
+    # stop/start, seconds in production. This blocks the stubbed `apply_diff`
+    # on a handshake to hold that window open and proves the tombstone is
+    # already in place.
     test "a control write for a row reimport deletes is refused while apply_diff is still blocked",
          %{path: path} do
       on_exit(fn -> Cairn.CameraControl.revive("cam_z") end)
@@ -766,6 +767,43 @@ defmodule Cairn.ConfigSourceTest do
 
       assert {:ok, %{added: ["cam_b"], removed: ["cam_z"], changed: ["cam_a"]}, _warnings} =
                Task.await(task)
+    end
+
+    # The mirror of the test above, on the surviving side: `cam_b` is
+    # tombstoned before the write, and `replace_rows/2` re-inserts it. The
+    # revive rides `after_commit:` rather than `after_apply:` alone, so the
+    # id is writable as soon as the row is there — not seconds later, when
+    # `apply_diff` has finished starting its camera.
+    test "an id the file re-inserts is writable while apply_diff is still blocked", %{path: path} do
+      on_exit(fn -> Cairn.CameraControl.revive("cam_b") end)
+      Cairn.CameraControl.tombstone("cam_b")
+      test_pid = self()
+
+      slow =
+        start_supervised!(
+          {Config.Server,
+           path: path,
+           name: nil,
+           source: {ConfigSource, :load},
+           apply_diff: fn _diff, _config ->
+             send(test_pid, :applying)
+             receive do: (:release -> :ok)
+           end,
+           apply_native: fn _config -> :ok end},
+          id: :config_source_slow_revive_server
+        )
+
+      Application.put_env(:cairn, :config_server, slow)
+
+      task = Task.async(fn -> ConfigSource.reimport(path) end)
+      assert_receive :applying
+
+      assert %{detection_enabled: false} =
+               Cairn.CameraControl.set("cam_b", %{detection_enabled: false})
+
+      send(slow, :release)
+      assert {:ok, _diff, _warnings} = Task.await(task)
+      Cairn.CameraControl.prune(Map.keys(Cairn.CameraControl.all()) -- ["cam_b"])
     end
 
     test "a camera the file still lists keeps its control overlay through a re-import", %{

@@ -401,6 +401,32 @@ defmodule Cairn.CamerasTest do
       assert %{detection_enabled: false} = CameraControl.set("cam1", %{detection_enabled: false})
     end
 
+    # `delete/1` tombstones inside the write closure, which is outside the
+    # transaction's reach: the database undoes the row delete, nothing but
+    # `after_rollback:`'s revive undoes the tombstone. Driven through
+    # `Config.Server.update/3` with `delete/1`'s own two options, because a
+    # delete the validator or the store refuses is not reachable from
+    # `delete/1` itself — a fleet is never rejected for having one camera
+    # fewer.
+    test "a delete-shaped write that rolls back leaves the id accepting control writes" do
+      on_exit(fn -> CameraControl.set("cam1", %{detection_enabled: true}) end)
+
+      assert {:ok, _diff, []} =
+               Cameras.create(%{"id" => "cam1", "settings" => %{"rtsp_url" => "rtsp://h/1"}})
+
+      write = fn ->
+        CameraControl.tombstone("cam1")
+        {:error, :boom}
+      end
+
+      assert Config.Server.update(Cameras.server(), write,
+               after_rollback: fn -> CameraControl.revive("cam1") end
+             ) == {:error, {:write, :boom}}
+
+      assert Cameras.get("cam1")
+      assert %{detection_enabled: false} = CameraControl.set("cam1", %{detection_enabled: false})
+    end
+
     # A restarting owner exits the call `prune_runtime/1` makes into it; that
     # must not abandon the steps after it while the row delete has already
     # committed. `Cairn.CameraStatus` is a running singleton and not

@@ -1209,11 +1209,12 @@ defmodule CairnWeb.CameraForm do
                   what tells them apart. --%>
             <button
               :if={n > 0}
-              type="button"
+              type="submit"
+              form="camera-form"
+              name="camera[_action]"
+              value={"remove-label-row:#{n}"}
               class="hs-btn hs-btn--sm"
               aria-label={"Remove label #{if blank?(row["label"]), do: n, else: row["label"]}"}
-              phx-click="remove-label-row"
-              phx-value-index={n}
             >
               Remove
             </button>
@@ -1225,8 +1226,20 @@ defmodule CairnWeb.CameraForm do
         <datalist id="known-labels">
           <option :for={label <- @known_labels} value={label}></option>
         </datalist>
+        <%!-- These three buttons (Add label, Remove, Test stream) submit the
+              form with an action rather than sending a `phx-click`: the
+              server then acts on what the browser holds at the click, not on
+              the params the 300 ms `phx-debounce` last delivered. --%>
         <div>
-          <button type="button" class="hs-btn hs-btn--sm" phx-click="add-label-row">Add label</button>
+          <button
+            type="submit"
+            form="camera-form"
+            name="camera[_action]"
+            value="add-label-row"
+            class="hs-btn hs-btn--sm"
+          >
+            Add label
+          </button>
         </div>
       </fieldset>
     </section>
@@ -1410,7 +1423,14 @@ defmodule CairnWeb.CameraForm do
     ~H"""
     <section class="hs-card" style={group_style()}>
       <div style="display: flex; align-items: center; gap: 12px;">
-        <button id="camera-probe" type="button" class="hs-btn hs-btn--sm" phx-click="probe">
+        <button
+          id="camera-probe"
+          type="submit"
+          form="camera-form"
+          name="camera[_action]"
+          value="probe"
+          class="hs-btn hs-btn--sm"
+        >
           Test stream
         </button>
         <span style={help_style()}>

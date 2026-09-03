@@ -73,8 +73,7 @@ defmodule Cairn.Cameras do
   # runs before `apply_diff`, so it always clears the tombstone regardless.
   # `after_apply:` is kept too, as a backstop for the one case that isn't
   # normal — a raised or exited `after_commit:` callback, which
-  # `run_after_commit/1` swallows rather than failing the save — mirroring
-  # why `prune_steps/1` keeps its own redundant tombstone step. `revive/1` is
+  # `run_zero_arity/2` swallows rather than failing the save. `revive/1` is
   # idempotent, so calling it twice on the ordinary path costs nothing.
   @spec create(map()) :: write_result()
   def create(attrs) do
@@ -226,25 +225,31 @@ defmodule Cairn.Cameras do
   call returns can also land on a camera another session has since
   re-created under the same id.
 
-  The control tombstone rides `after_commit:` instead, ahead of the prune:
-  `after_apply:` runs after `apply_diff` (camera stop/start, seconds), and a
-  `CameraControl.set/2` that read the config before this delete committed
-  could still land its write in that window if the tombstone waited that
-  long. `prune_steps/1`'s own tombstone step is now a backstop for the case
-  `after_commit:` itself failed, not the primary path.
+  The control tombstone goes in ahead of both, inside the write closure and
+  before the row delete: every later hook runs after the commit, and a
+  `CameraControl.set/2` that read the config while the row was still there
+  can land its write in the gap between the commit and the hook. Being
+  outside the transaction is what makes it early enough, and also what makes
+  `after_rollback:` necessary — the database undoes the delete, nothing but
+  `revive/1` undoes the tombstone. `prune_steps/1`'s own tombstone step is a
+  backstop for a tombstone the closure never reached, not the primary path.
   """
   @spec delete(String.t()) :: write_result()
   def delete(id) do
     Config.Server.update(server(), fn -> delete_row(id) end,
-      after_commit: fn -> CameraControl.tombstone(id) end,
+      after_rollback: fn -> CameraControl.revive(id) end,
       after_apply: fn _diff -> prune_runtime(id) end
     )
   end
 
   defp delete_row(id) do
     case get(id) do
-      nil -> {:error, :not_found}
-      camera -> with {:ok, _row} <- Repo.delete(camera), do: :ok
+      nil ->
+        {:error, :not_found}
+
+      camera ->
+        CameraControl.tombstone(id)
+        with {:ok, _row} <- Repo.delete(camera), do: :ok
     end
   end
 
@@ -273,10 +278,10 @@ defmodule Cairn.Cameras do
   # inlined into `prune_runtime/1`) so `run_prunes/2` can be driven in a test
   # with a step that deliberately exits.
   #
-  # The tombstone step here is idempotent and redundant with `delete/1`'s
-  # `after_commit:` on the normal path — kept as the backstop for the one
-  # case that isn't normal, a raised or exited `after_commit:` callback,
-  # since `run_after_commit/1` swallows that rather than failing the save.
+  # The tombstone step is idempotent and redundant with the one both deleting
+  # closures (`delete_row/1`, `Cairn.ConfigSource.replace_rows/2`) take before
+  # the row goes — kept so a prune, whoever asks for one, always leaves the id
+  # refusing control writes.
   @doc false
   @spec prune_steps(String.t()) :: [{String.t(), (-> term())}]
   def prune_steps(id) do

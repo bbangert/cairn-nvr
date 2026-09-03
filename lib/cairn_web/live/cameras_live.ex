@@ -205,57 +205,20 @@ defmodule CairnWeb.CamerasLive do
     {:noreply, validate(socket, params)}
   end
 
+  # Add label, Remove and Test stream are submit buttons carrying
+  # `camera[_action]`, not `phx-click`s: a click posts the form, so they act
+  # on what is in the browser right now rather than on the params the 300 ms
+  # `phx-debounce` last delivered — the keystroke a click interrupts would
+  # otherwise be lost, and a probe would open the previous URL.
   def handle_event("save", %{"camera" => params}, socket) do
     # Client-controlled shape, same as `validate/2`: a hand-sent or crafted
     # submit can carry the same nested maps a bracketed input name decodes
     # to, and this is the save path's own entry point rather than one that
-    # only ever arrives through `validate/2` first.
-    socket = validate(socket, CameraForm.sanitize_params(params))
-
-    # A nil candidate is a form the validator refused, and it already renders
-    # why; `saving?` drops a second submit while the first is still applying.
-    if socket.assigns.candidate && not socket.assigns.saving? do
-      {:noreply, save(socket, socket.assigns.candidate)}
-    else
-      {:noreply, socket}
-    end
-  end
-
-  # Re-validating is the point: a row added or removed changes the duplicate,
-  # excluded and tier rules, and without this the errors from before the click
-  # stay on screen until the next keystroke.
-  def handle_event("add-label-row", _params, socket) do
-    {:noreply, revalidate(socket, socket.assigns.rows ++ [CameraForm.blank_row("")])}
-  end
-
-  # Index 0 is the `default` block and has no Remove button; the guard is here
-  # because a hand-sent event is not bound by the markup.
-  def handle_event("remove-label-row", %{"index" => index}, socket) do
-    case Integer.parse(index) do
-      {n, ""} when n > 0 ->
-        {:noreply, revalidate(socket, List.delete_at(socket.assigns.rows, n))}
-
-      _other ->
-        {:noreply, socket}
-    end
-  end
-
-  # A click while a probe is running is ignored rather than restarting it: the
-  # in-flight one is opening the same URLs — a change to the URL fields resets
-  # the rows on its own — so a second would only hold a second ffprobe open
-  # and orphan the first's answer under the bumped generation.
-  def handle_event("probe", _params, socket) do
-    urls = CameraForm.urls(socket.assigns.form.params, socket.assigns.saved)
-
-    if probing?(socket) do
-      {:noreply, socket}
-    else
-      {:noreply,
-       socket
-       |> assign(probe_gen: socket.assigns.probe_gen + 1)
-       |> probe_stream(:main, urls.main)
-       |> probe_stream(:sub, urls.sub)}
-    end
+    # only ever arrives through `validate/2` first. `_action` is sanitized
+    # with the rest before it is read.
+    params = CameraForm.sanitize_params(params)
+    {action, params} = Map.pop(params, "_action")
+    {:noreply, submitted(socket, action, params)}
   end
 
   # The submitted id is read past, not trusted: this button deletes the camera
@@ -274,6 +237,60 @@ defmodule CairnWeb.CamerasLive do
        |> start_async(:remove, fn -> Cameras.delete(id) end)}
     end
   end
+
+  # Re-validating is the point of routing an added or removed row back
+  # through `validate/2`: it changes the duplicate, excluded and tier rules,
+  # and without it the errors from before the click stay on screen until the
+  # next keystroke.
+  defp submitted(socket, "add-label-row", params) do
+    revalidate(socket, params, CameraForm.rows(params) ++ [CameraForm.blank_row("")])
+  end
+
+  # Index 0 is the `default` block and has no Remove button; the guard is here
+  # because a hand-sent submit is not bound by the markup.
+  defp submitted(socket, "remove-label-row:" <> index, params) do
+    case Integer.parse(index) do
+      {n, ""} when n > 0 -> revalidate(socket, params, List.delete_at(CameraForm.rows(params), n))
+      _other -> validate(socket, params)
+    end
+  end
+
+  # A click while a probe is running is ignored rather than restarting it: the
+  # in-flight one is opening the same URLs — a change to the URL fields resets
+  # the rows on its own — so a second would only hold a second ffprobe open
+  # and orphan the first's answer under the bumped generation. `validate/2`
+  # first, so the URLs probed are the submitted ones and `reset_probe/3` has
+  # already blanked rows describing a stream they no longer name.
+  defp submitted(socket, "probe", params) do
+    socket = validate(socket, params)
+    urls = CameraForm.urls(socket.assigns.form.params, socket.assigns.saved)
+
+    if probing?(socket) do
+      socket
+    else
+      socket
+      |> assign(probe_gen: socket.assigns.probe_gen + 1)
+      |> probe_stream(:main, urls.main)
+      |> probe_stream(:sub, urls.sub)
+    end
+  end
+
+  # No `_action` is the Save button itself; an unknown one is a hand-sent
+  # submit, and re-validating is the safe reading of it — never a save the
+  # operator did not ask for.
+  defp submitted(socket, action, params) when is_nil(action) or action == "" do
+    socket = validate(socket, params)
+
+    # A nil candidate is a form the validator refused, and it already renders
+    # why; `saving?` drops a second submit while the first is still applying.
+    if socket.assigns.candidate && not socket.assigns.saving? do
+      save(socket, socket.assigns.candidate)
+    else
+      socket
+    end
+  end
+
+  defp submitted(socket, _unknown, params), do: validate(socket, params)
 
   defp applying?(socket, id), do: MapSet.member?(socket.assigns.applying, id)
 
@@ -581,9 +598,11 @@ defmodule CairnWeb.CamerasLive do
 
   defp taken_id?(_socket), do: false
 
-  defp revalidate(socket, rows) do
-    params = Map.put(socket.assigns.form.params, "labels", CameraForm.index_rows(rows))
-    validate(socket, params)
+  # `params` are the submitted ones, not the socket's: the click that added or
+  # removed the row posted the form, so everything typed since the last
+  # debounce tick is in them and must survive the re-render.
+  defp revalidate(socket, params, rows) do
+    validate(socket, Map.put(params, "labels", CameraForm.index_rows(rows)))
   end
 
   # The id is fixed once the row exists; on `:new` it is whatever is typed.
@@ -1047,17 +1066,15 @@ defmodule CairnWeb.CamerasLive do
           <.link navigate={~p"/cameras"} class="hs-btn hs-btn--sm">Back to cameras</.link>
         </div>
 
-        <nav
-          :if={@mode == "new"}
-          id="camera-new-tabs"
-          role="tablist"
-          style="display: flex; gap: 8px;"
-        >
+        <%!-- Links that patch the URL, not ARIA tabs: the tabs pattern
+              promises arrow-key roving focus and a controlled tabpanel, and
+              claiming `role="tab"` without them is worse for a screen reader
+              than the plain navigation this is. --%>
+        <nav :if={@mode == "new"} id="camera-new-tabs" style="display: flex; gap: 8px;">
           <.link
             id="tab-scan"
             patch={~p"/cameras/new?tab=scan"}
-            role="tab"
-            aria-selected={to_string(@tab == :scan)}
+            aria-current={@tab == :scan && "page"}
             class="hs-btn hs-btn--sm"
           >
             Find on network
@@ -1065,8 +1082,7 @@ defmodule CairnWeb.CamerasLive do
           <.link
             id="tab-manual"
             patch={~p"/cameras/new?tab=manual"}
-            role="tab"
-            aria-selected={to_string(@tab == :manual)}
+            aria-current={@tab == :manual && "page"}
             class="hs-btn hs-btn--sm"
           >
             Enter stream URLs

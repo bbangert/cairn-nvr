@@ -97,7 +97,9 @@ defmodule Cairn.CameraControl do
   both — a re-created id is a camera again, and its overlay starts from the
   defaults `get/1` returns for an id with no row in the table. Idempotent, so
   the second call costs nothing on the ordinary path; see `create/1`'s
-  comment for why it rides both.
+  comment for why it rides both. Also the `after_rollback` of a delete or a
+  re-import: those tombstone inside the write closure, which the transaction
+  does not undo.
 
   A call for the same reason `prune/1` is: it runs inside the config server,
   and a cast could be handled after the new camera's first writes — which
