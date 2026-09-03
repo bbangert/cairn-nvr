@@ -27,28 +27,29 @@ defmodule Cairn.StreamUrl do
   (`rtsp://user:sec@ret@host/s`), and `URI.parse/1` splits at the first one —
   which masks half a password, strips half a password, and rewrites the host
   as `ret@host`. Anything past that boundary is `rest`, so an `@` in a path or
-  query is left alone. A URL with no `//` has no authority to split.
+  query is left alone. A URL whose `//` opens no authority (`open_authority/1`)
+  has none to split.
 
   Two shapes this cannot resolve, both of which report no userinfo here and so
   would be rendered in full: a raw `/` inside a userinfo (it ends the authority
-  before any `@` is seen) and a URL with no `//` at all (there is no authority
-  to look in). Both are *ambiguous* rather than bare — see `ambiguous?/1` and
-  the wider `display_ambiguous?/1`, which the readout, prefill and splice
-  paths consult and this function does not.
+  before any `@` is seen) and a URL with no authority opener (there is no
+  authority to look in). Both are *ambiguous* rather than bare — see
+  `ambiguous?/1` and the wider `display_ambiguous?/1`, which the readout,
+  prefill and splice paths consult and this function does not.
   """
   @spec split_authority(String.t()) :: {String.t(), String.t() | nil, String.t()}
   def split_authority(url) when is_binary(url) do
-    case String.split(url, "//", parts: 2) do
-      [prefix, authority_onward] ->
+    case open_authority(url) do
+      {scheme, authority_onward} ->
         {authority, tail} = split_at_path(authority_onward)
 
         case last_at(authority) do
-          nil -> {prefix <> "//", nil, authority_onward}
-          {userinfo, host} -> {prefix <> "//", userinfo, host <> tail}
+          nil -> {scheme, nil, authority_onward}
+          {userinfo, host} -> {scheme, userinfo, host <> tail}
         end
 
-      [_no_authority] ->
-        {"", nil, url}
+      :none ->
+        {@blank, nil, url}
     end
   end
 
@@ -56,6 +57,31 @@ defmodule Cairn.StreamUrl do
   @spec join_authority(String.t(), String.t() | nil, String.t()) :: String.t()
   def join_authority(scheme, nil, rest), do: scheme <> rest
   def join_authority(scheme, userinfo, rest), do: scheme <> userinfo <> "@" <> rest
+
+  # `{everything up to and including the `//`, the rest}`, or `:none` when no
+  # `//` in the URL opens an authority.
+  #
+  # Only a `//` reached with nothing but a scheme in front of it opens one: a
+  # path or a query has to have not started, so anything before it holding a
+  # `/`, `?` or `#` disqualifies it. Splitting on the first `//` alone read
+  # `rtsp:/broken?next=http://cam/live&password=x` as authority
+  # `cam/live&password=x` — which put the real query out of every reader's
+  # reach, so `credentialed?/1` called the row clean and the form rendered the
+  # secret. A URL with no opener has no authority at all and takes the
+  # fail-closed path: display-ambiguous on any `@` it holds, and its query —
+  # the whole string, since none of it was eaten by a false authority — masked
+  # by the ordinary pair rule.
+  defp open_authority(url) do
+    case String.split(url, "//", parts: 2) do
+      [prefix, onward] ->
+        if :binary.match(prefix, ["/", "?", "#"]) == :nomatch,
+          do: {prefix <> "//", onward},
+          else: :none
+
+      [_no_authority] ->
+        :none
+    end
+  end
 
   defp split_at_path(authority_onward) do
     case :binary.match(authority_onward, ["/", "?", "#"]) do
@@ -91,7 +117,7 @@ defmodule Cairn.StreamUrl do
       (`rtsp://u:sec@ret/part@host/live`) — this reads as ordinary userinfo
       `u:sec` at host `ret`, but a password `sec@ret/part` produces the
       identical bytes;
-    * anywhere before a `?`/`#` in a URL with no `//` to open an authority
+    * anywhere before a `?`/`#` in a URL where no `//` opens an authority
       (`rtsp:/user:secret@host/live`, a malformed stored value).
 
   A hand-typed or imported password really does contain a raw slash
@@ -146,15 +172,14 @@ defmodule Cairn.StreamUrl do
   # `{scheme, everything after the URL's last @}`, or `nil` when no `@` sits
   # beyond the readable authority.
   defp display_split(url) do
-    case String.split(url, "//", parts: 2) do
-      [prefix, onward] ->
+    case open_authority(url) do
+      {scheme, onward} ->
         {_authority, tail} = split_at_path(onward)
 
-        if :binary.match(tail, "@") != :nomatch,
-          do: last_at_anywhere(prefix <> "//", onward)
+        if :binary.match(tail, "@") != :nomatch, do: last_at_anywhere(scheme, onward)
 
       # Nothing opened an authority, so every `@` in the string is beyond one.
-      [_no_authority] ->
+      :none ->
         last_at_anywhere(@blank, url)
     end
   end
@@ -162,19 +187,19 @@ defmodule Cairn.StreamUrl do
   # `{scheme, everything after the last ambiguous @}`, or `nil` when the URL
   # reads unambiguously.
   defp ambiguous_split(url) do
-    case String.split(url, "//", parts: 2) do
-      [prefix, onward] ->
+    case open_authority(url) do
+      {scheme, onward} ->
         {authority, tail} = split_at_path(onward)
 
         if last_at(authority) == nil or at_past_slash?(tail) do
-          last_at_before_query(prefix <> "//", onward)
+          last_at_before_query(scheme, onward)
         end
 
-      # No `//`, so `split_authority/1` finds no userinfo and every reader
+      # No authority, so `split_authority/1` finds no userinfo and every reader
       # would treat the whole string as bare. An `@` in it is a credential
       # boundary as good as any other, and the scheme is not worth preserving
       # in a URL already malformed enough to reach here.
-      [_no_authority] ->
+      :none ->
         last_at_before_query(@blank, url)
     end
   end
@@ -219,20 +244,30 @@ defmodule Cairn.StreamUrl do
   """
   @spec mask(term()) :: String.t()
   def mask(url) when is_binary(url) do
-    # Query pairs first, on the URL as given: the `@` collapse below runs on
-    # the result, and a credential pair after a query `@`
-    # (`?user=a@b&password=x`) would otherwise lose its `?` to the collapse
-    # and never be masked. The username (up to the first colon) stays; with
-    # no colon the whole userinfo is a credential (`rtsp://SECRET@host` — a
+    # The `@` collapse runs first, on the URL as given: masking query pairs
+    # first can erase the very `@` the display rule reads, and for a password
+    # holding a raw `?` (`rtsp://u:pa?password=x@cam/main`) the pair
+    # replacement swallowed the URL's only `@` and left `u:pa` on the page.
+    # What survives the collapse is then swept for pairs without requiring a
+    # `?` — the collapse usually eats that — so a credential pair after a
+    # query `@` (`?user=a@b&password=x`) is still masked.
+    #
+    # An unambiguous URL keeps the username (up to the first colon); with no
+    # colon the whole userinfo is a credential (`rtsp://SECRET@host` — a
     # password to some cameras, and `credentialed?/1` calls it one) and goes
-    # entirely. An empty username (`rtsp://:secret@host`) masks like any
-    # other. A display-ambiguous URL shows none of what precedes its last `@`.
-    query_masked = mask_query_of(url)
+    # entirely. An empty username (`rtsp://:secret@host`) masks like any other.
+    case display_split(url) do
+      {scheme, rest} ->
+        scheme <> "•••••@" <> mask_pairs(rest)
 
-    case {display_split(query_masked), split_authority(query_masked)} do
-      {{scheme, rest}, _split} -> scheme <> "•••••@" <> rest
-      {nil, {_scheme, nil, _rest}} -> query_masked
-      {nil, {scheme, userinfo, rest}} -> join_authority(scheme, mask_userinfo(userinfo), rest)
+      nil ->
+        case split_authority(url) do
+          {_scheme, nil, _rest} ->
+            mask_query_of(url)
+
+          {scheme, userinfo, rest} ->
+            mask_query_of(join_authority(scheme, mask_userinfo(userinfo), rest))
+        end
     end
   end
 
@@ -271,6 +306,16 @@ defmodule Cairn.StreamUrl do
     query
     |> String.split("&")
     |> Enum.map_join("&", &mask_query_pair/1)
+  end
+
+  # What is left of a URL after the display collapse cut it at an `@`: any
+  # `?` that opened its query may be on the other side of that cut, so a pair
+  # is anything between two of `?`, `&` and `#` (or an end of the string)
+  # rather than something a surviving `?` introduces.
+  defp mask_pairs(rest) do
+    rest
+    |> String.split(~r/[?&#]/, include_captures: true)
+    |> Enum.map_join(&mask_query_pair/1)
   end
 
   defp mask_query_pair(pair) do
@@ -527,8 +572,8 @@ defmodule Cairn.StreamUrl do
   wrong answer here sends a saved secret to a host the operator never gave it
   to.
 
-  A URL that names no host at all — no `//`, or nothing before the first
-  `/`, `?` or `#` after it — is never the same endpoint as anything, itself
+  A URL that names no host at all — no `//` opening an authority, or nothing
+  before the first `/`, `?` or `#` after it — is never the same endpoint as anything, itself
   included. Two of them reduce to the same empty authority and would
   otherwise compare equal, which is a saved credential carried onto `rtsp:`.
   """
@@ -544,8 +589,8 @@ defmodule Cairn.StreamUrl do
   def same_endpoint?(_a, _b), do: false
 
   # `nil` for a URL with no authority: `split_authority/1` reports a blank
-  # scheme when there is no `//` at all, and a blank host when there is
-  # nothing between it and the path.
+  # scheme when no `//` opens one, and a blank host when there is nothing
+  # between it and the path.
   # An ambiguous URL has no readable host: its `@` may sit inside a password
   # or a path, and the authority `split_authority/1` returns for it can be
   # the credential itself. Comparing that would seed a saved secret onto

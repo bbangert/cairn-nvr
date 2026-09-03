@@ -433,17 +433,50 @@ defmodule Cairn.StreamUrlTest do
   end
 
   describe "mask/1 with a credential pair after a query @" do
-    test "the pair is masked before the @ collapse can hide the query start" do
+    test "the pair is masked though the collapse took the ? that opened it" do
       masked = StreamUrl.mask("http://h/p?user=admin@example.com&password=pw")
       refute masked =~ "pw"
       refute masked =~ "admin"
-      assert masked =~ "password=•••••"
+      assert masked == "http://•••••@example.com&password=•••••"
     end
 
     test "a non-credential query @ still collapses, and the pair after it is masked" do
       masked = StreamUrl.mask("http://h/p?x=me@h2&password=pw")
       refute masked =~ "pw"
       assert masked == "http://•••••@h2&password=•••••"
+    end
+
+    # Masking pairs first replaced `password=x` whole — taking the URL's only
+    # `@` with it, so the display rule then found nothing and the readout
+    # showed `u:pa`.
+    test "a credential pair inside the password keeps the @ the display rule reads" do
+      url = "rtsp://u:pa?password=x@cam/main"
+      masked = StreamUrl.mask(url)
+
+      assert masked == "rtsp://•••••@cam/main"
+      refute masked =~ "pa"
+      refute masked =~ "x"
+      assert StreamUrl.credentialed?(url)
+    end
+  end
+
+  describe "a // that opens no authority" do
+    # Splitting on the first `//` read `cam/live&password=x` as the authority,
+    # which put the real query out of `credentialed?/1`'s reach and let the
+    # form prefill the password into a rendered `value=`.
+    test "a // reached after a path and a query is not an authority opener" do
+      url = "rtsp:/broken?next=http://cam/live&password=x"
+      masked = StreamUrl.mask(url)
+
+      assert StreamUrl.split_authority(url) == {"", nil, url}
+      assert StreamUrl.credentialed?(url)
+      refute masked =~ "password=x"
+      assert masked =~ "password=•••••"
+    end
+
+    test "a legitimate later // still splits at the first" do
+      assert StreamUrl.split_authority("rtsp://h/p?next=http://x") ==
+               {"rtsp://", nil, "h/p?next=http://x"}
     end
   end
 
