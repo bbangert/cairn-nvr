@@ -19,8 +19,8 @@ bindings) exactly as specced; restyle everything else freely.
 Cairn is an event-clip NVR (network video recorder) for a home LAN.
 Cameras stream via RTSP; an in-VM detector finds objects (person, cat,
 car…); Cairn records one mp4 clip per event (with pre-roll) and indexes it.
-The UI is eight live routes today: a live **Dashboard** (`/`), an **Events**
-browser (`/events`) with clip playback (`/events/:id`), a **Tracks** index
+The UI is eight live routes today, nine once the zone editor ships: a live
+**Dashboard** (`/`), an **Events** browser (`/events`) with clip playback (`/events/:id`), a **Tracks** index
 (`/tracks`), the **Cameras** pages (`/cameras`, `/cameras/new`,
 `/cameras/:id/edit`, and `/cameras/:id/zones` once the zone editor
 ships), and a **Config** page (`/config`; node settings read-only, with

@@ -79,7 +79,8 @@ config :phoenix, :filter_parameters, [
   "token",
   "sdp",
   "rtsp_url",
-  "substream_url"
+  "substream_url",
+  "extra_ffmpeg_args"
 ]
 
 # Extra MIME types the HA `/api` surface negotiates: SSE for the event feed

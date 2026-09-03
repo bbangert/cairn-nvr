@@ -138,7 +138,11 @@ defmodule Cairn.CameraControl do
   # window without the server having to retry.
   def init(_opts) do
     :ets.new(@table, [:named_table, :set, :protected, read_concurrency: true])
-    {:ok, put_tombstones(%{tombstoned: MapSet.new()}, reconciled_tombstones())}
+    # Written unconditionally: `set/2` reads the term, not this state, and
+    # the reconciled set can differ from the term by being empty.
+    tombstoned = reconciled_tombstones()
+    :persistent_term.put(@ptkey, tombstoned)
+    {:ok, %{tombstoned: tombstoned}}
   end
 
   defp reconciled_tombstones do
@@ -195,8 +199,15 @@ defmodule Cairn.CameraControl do
 
   # The one place `@ptkey` is written: every tombstone/prune/revive replaces
   # it wholesale, so it never drifts from `state.tombstoned`.
-  defp put_tombstones(state, tombstoned) do
-    :persistent_term.put(@ptkey, tombstoned)
-    %{state | tombstoned: tombstoned}
+  # Unchanged sets are not rewritten: `Cairn.Config.Server.apply_config/5`
+  # revives every configured id on every save, and each `:persistent_term`
+  # put scans every process heap for the old term.
+  defp put_tombstones(%{tombstoned: current} = state, tombstoned) do
+    if MapSet.equal?(current, tombstoned) do
+      state
+    else
+      :persistent_term.put(@ptkey, tombstoned)
+      %{state | tombstoned: tombstoned}
+    end
   end
 end
