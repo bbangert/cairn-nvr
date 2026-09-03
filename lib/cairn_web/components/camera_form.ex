@@ -666,14 +666,20 @@ defmodule CairnWeb.CameraForm do
 
   defp visible_url(_absent), do: @blank
 
+  # A colonless userinfo (`rtsp://SECRET@host`) is a password to some cameras
+  # and `mask_url/1` treats the whole of it as one, so it is not a username
+  # to prefill: rendering it would expose in the form what the readout hides.
   defp url_user(url) when is_binary(url) do
     case url |> URI.parse() |> Map.get(:userinfo) do
       nil -> nil
-      userinfo -> userinfo |> split_userinfo() |> elem(0) |> decode_user()
+      userinfo -> userinfo |> split_userinfo() |> colon_user() |> decode_user()
     end
   end
 
   defp url_user(_absent), do: nil
+
+  defp colon_user({user, nil}) when is_binary(user), do: nil
+  defp colon_user({user, _password}), do: user
 
   # A hand-edited or migrated row can hold a malformed escape (`bad%zz`),
   # which `URI.decode/1` raises on — and the form has to render the row the
@@ -681,6 +687,8 @@ defmodule CairnWeb.CameraForm do
   # A well-formed escape can decode to invalid UTF-8 (`u%FF`) without raising
   # at all, and that binary would take the render down further along, so it
   # is kept raw for the same reason.
+  defp decode_user(nil), do: nil
+
   defp decode_user(user) do
     decoded = URI.decode(user)
     if String.valid?(decoded), do: decoded, else: user

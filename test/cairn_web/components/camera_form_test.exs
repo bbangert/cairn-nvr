@@ -265,6 +265,14 @@ defmodule CairnWeb.CameraFormTest do
       refute Map.has_key?(settings, "retention")
     end
 
+    test "a colonless userinfo is not prefilled as a username" do
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://SECRET@h/1"}, zones: []}
+      params = CameraForm.to_params(row)
+      assert params["username"] == ""
+      assert params["rtsp_url"] == ""
+      assert {:ok, %{"rtsp_url" => "rtsp://SECRET@h/1"}} = CameraForm.to_settings(params, row)
+    end
+
     test "a URL carrying its credential in the query is never spliced" do
       main = "http://cam.lan/flv?stream=ch0&user=admin&password=old"
 
