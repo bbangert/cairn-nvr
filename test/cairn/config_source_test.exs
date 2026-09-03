@@ -694,6 +694,15 @@ defmodule Cairn.ConfigSourceTest do
       assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
     end
 
+    test "a cameras key that is not a list is the file's fault, not an empty import", %{
+      dir: dir,
+      path: path
+    } do
+      File.write!(path, globals(dir) <> "cameras: {}\n")
+      assert {:error, {:write, {:yaml, ["cameras must be a list"]}}} = ConfigSource.reimport(path)
+      assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
+    end
+
     test "a file with no cameras to import is refused rather than emptying the fleet", %{
       dir: dir,
       path: path

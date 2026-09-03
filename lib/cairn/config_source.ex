@@ -116,7 +116,7 @@ defmodule Cairn.ConfigSource do
 
   defp replace_rows(path) do
     with {:ok, map} <- Config.raw_map(path),
-         cameras when is_list(cameras) and cameras != [] <- Map.get(map, "cameras"),
+         {:ok, cameras} <- importable_list(Map.get(map, "cameras")),
          {:ok, _config, _warnings} <- Config.from_map(map) do
       Repo.delete_all(Camera)
       Repo.delete_all(from(s in Setting, where: s.key == @marker_key))
@@ -126,9 +126,15 @@ defmodule Cairn.ConfigSource do
       :ok
     else
       {:error, errors} when is_list(errors) -> {:error, {:yaml, errors}}
-      _no_cameras -> {:error, :no_cameras}
+      {:error, :no_cameras} -> {:error, :no_cameras}
     end
   end
+
+  # The same three shapes `import_once/3` tells apart: a malformed key is the
+  # file's fault, not "nothing to import".
+  defp importable_list(cameras) when is_list(cameras) and cameras != [], do: {:ok, cameras}
+  defp importable_list(cameras) when is_nil(cameras) or cameras == [], do: {:error, :no_cameras}
+  defp importable_list(_other), do: {:error, ["cameras must be a list"]}
 
   defp load_map(map, path) do
     marker = import_marker()

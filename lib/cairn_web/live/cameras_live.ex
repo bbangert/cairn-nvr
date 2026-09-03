@@ -860,7 +860,7 @@ defmodule CairnWeb.CamerasLive do
                 {cam.id}
               </span>
               <span
-                :if={cam.loaded not in ["skipped", "unloaded"]}
+                :if={cam.loaded == "loaded"}
                 id={"camera-status-#{cam.id}"}
                 class="hs-badge"
                 style={"color: #{CameraCards.status_meta(status(@statuses, cam)).color};"}
