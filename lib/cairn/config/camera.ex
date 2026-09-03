@@ -126,10 +126,11 @@ defmodule Cairn.Config.Camera do
   @spec id_class() :: String.t()
   def id_class, do: @id_class
 
-  # The row-settings key space, taken by two callers: `Cairn.Cameras.raw_maps/0`
-  # before rendering, so an unknown key never reaches the parser as a row's
-  # fault, and `Cairn.ConfigSource.import_row/2` before storing, where the
-  # drop is permanent.
+  # The row-settings key space, taken by three callers: `Cairn.Cameras.raw_maps/0`
+  # (to warn on an unknown key before it disappears), `Cairn.Cameras.render_row/1`
+  # (the one that actually filters — an unknown key never reaches the parser
+  # as a row's fault), and `Cairn.ConfigSource.import_row/2` before storing,
+  # where the drop is permanent.
   @spec known_keys() :: [String.t()]
   def known_keys, do: @known_keys
 

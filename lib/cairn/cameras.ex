@@ -229,18 +229,26 @@ defmodule Cairn.Cameras do
           ["camera #{camera.id}: dropped unknown key #{inspect(key)}" | acc]
         end)
 
-      # The zones column rides out as the `"zones"` key the parser validates:
-      # stored string-keyed, rendered as-is, judged by `Cairn.Zones` on every
-      # load like any other camera key.
-      map =
-        camera.settings
-        |> Map.take(known)
-        |> Map.put("id", camera.id)
-        |> Map.put("zones", camera.zones)
-
-      {map, warnings}
+      {render_row(camera), warnings}
     end)
     |> then(fn {maps, warnings} -> {maps, Enum.reverse(warnings)} end)
+  end
+
+  @doc """
+  One row as the YAML-shaped camera map the parser reads. Public because
+  `Cairn.Cameras.Candidate` renders a row that is not written yet, and it
+  must go through the same key filter a load does.
+
+  The zones column rides out as the `"zones"` key the parser validates:
+  stored string-keyed, rendered as-is, judged by `Cairn.Zones` on every load
+  like any other camera key.
+  """
+  @spec render_row(%{id: String.t(), settings: map(), zones: [map()]}) :: map()
+  def render_row(%{id: id, settings: settings, zones: zones}) do
+    settings
+    |> Map.take(Config.Camera.known_keys())
+    |> Map.put("id", id)
+    |> Map.put("zones", zones)
   end
 
   @doc """
@@ -249,6 +257,11 @@ defmodule Cairn.Cameras do
   form write settings through (plan D-P5), so an untouched save renders
   byte-identically and diffs to nothing. Idempotent:
   `canonical(canonical(m)) == canonical(m)`.
+
+  A value the parser reads exactly as it reads the absent key is dropped, so
+  the two writers cannot disagree over whether to spell out a default: the
+  form has no field that can produce `pipeline: membrane`, and its checkbox
+  and args field write nothing for `transcode: false` and `[]`.
   """
   @spec canonical(map()) :: map()
   def canonical(map) when is_map(map) do
@@ -262,8 +275,22 @@ defmodule Cairn.Cameras do
   defp canonical_put(acc, key, _value) when key in ["id", "zones"], do: acc
   defp canonical_put(acc, _key, nil), do: acc
 
+  # `Cairn.Config.Camera.parse/3` reads `transcode` as `… == true` — every
+  # other value, `"false"` and `0` included, is the default it already gets
+  # from the absent key — and takes `pipeline: membrane` as the only accepted
+  # value (`check_pipeline/3` errors on every other), so both spell out what
+  # absence already says. Any other `pipeline` is kept, to be refused by name
+  # on the next load rather than silently repaired.
+  defp canonical_put(acc, "transcode", value) when value != true, do: acc
+  defp canonical_put(acc, "pipeline", "membrane"), do: acc
+
+  # An empty map holds no label rule, and `parse_min_score/3` merges what it
+  # is given over `@default_min_score` — so it reads exactly as the absent key.
   defp canonical_put(acc, "min_score", value) do
-    Map.put(acc, "min_score", canonical_min_score(value))
+    case canonical_min_score(value) do
+      empty when empty == %{} -> acc
+      scores -> Map.put(acc, "min_score", scores)
+    end
   end
 
   defp canonical_put(acc, key, value) when key in ["track", "record"] do
@@ -273,8 +300,12 @@ defmodule Cairn.Cameras do
     end
   end
 
+  # An empty list adds no arguments, which is what the absent key does.
   defp canonical_put(acc, "extra_ffmpeg_args", value) do
-    Map.put(acc, "extra_ffmpeg_args", canonical_extra_args(value))
+    case canonical_extra_args(value) do
+      [] -> acc
+      args -> Map.put(acc, "extra_ffmpeg_args", args)
+    end
   end
 
   defp canonical_put(acc, "motion_json", value) do

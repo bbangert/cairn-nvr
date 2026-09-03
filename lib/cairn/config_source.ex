@@ -46,8 +46,30 @@ defmodule Cairn.ConfigSource do
       degrade(path, "cameras: database read failed: " <> Exception.message(e))
 
     e in [Ecto.InvalidChangesetError, Ecto.ConstraintError] ->
-      degrade(path, "cameras: import failed: " <> Exception.message(e))
+      degrade(path, "cameras: import failed: " <> describe_import_error(e))
   end
+
+  # `Exception.message/1` on these two interpolates the changeset — including
+  # `changes.settings`, which can hold a password just spliced in by an
+  # import — into whatever this reaches (a log line, `/config`'s health
+  # card). Only the field-error messages (changeset) or the constraint name
+  # (constraint) are safe to surface. `@doc false` rather than private only
+  # so a test can drive it directly with a constructed exception; nothing
+  # outside this module calls it.
+  @doc false
+  @spec describe_import_error(Exception.t()) :: String.t()
+  def describe_import_error(%Ecto.InvalidChangesetError{changeset: changeset}) do
+    changeset
+    |> Ecto.Changeset.traverse_errors(fn {msg, opts} ->
+      Enum.reduce(opts, msg, fn {key, value}, acc ->
+        String.replace(acc, "%{#{key}}", to_string(value))
+      end)
+    end)
+    |> Enum.map_join("; ", fn {field, msgs} -> "#{field} #{Enum.join(msgs, ", ")}" end)
+  end
+
+  def describe_import_error(%Ecto.ConstraintError{constraint: name}),
+    do: "constraint #{name} failed"
 
   defp degrade(path, message) do
     case Config.raw_map(path) do
@@ -192,9 +214,21 @@ defmodule Cairn.ConfigSource do
     })
   end
 
-  defp cameras_sha(cameras) do
+  # `@doc false` and public: the config page's re-import compares the file's
+  # list against the marker with the same sort-then-hash rule, and must not
+  # duplicate it.
+  @doc false
+  @spec cameras_sha([map()]) :: String.t()
+  def cameras_sha(cameras) do
     :crypto.hash(:sha256, Jason.encode!(sort_keys(cameras))) |> Base.encode16(case: :lower)
   end
+
+  # The file's raw bytes, not `cameras_sha/1`'s canonicalized list: a caller
+  # pinning a write to what it displayed hashes before any YAML parsing, and
+  # the check has to hash the same thing to mean anything.
+  @doc false
+  @spec file_sha256(binary()) :: String.t()
+  def file_sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 
   # The same YAML must hash the same across boots, and map iteration order is
   # not a promise the runtime makes.
@@ -210,22 +244,36 @@ defmodule Cairn.ConfigSource do
   defp sort_keys(list) when is_list(list), do: Enum.map(list, &sort_keys/1)
   defp sort_keys(other), do: other
 
+  # `:none` for an absent or empty `cameras:` key or no marker to compare
+  # against — `cameras: []` lists nothing, so it earns neither warning, the
+  # same reading `import_once/3`'s `importable?/1` gives it. `:same` and
+  # `:changed` classify the two states the warnings below name; kept apart
+  # from `drift_warnings/3` so a caller with no message to render (the
+  # re-import's own drift check) can classify without building strings.
+  @doc false
+  @spec drift([map()] | nil, map() | nil) :: :none | :same | :changed
+  def drift(cameras, marker)
+
+  def drift(cameras, %{"sha256" => sha}) when is_list(cameras) and cameras != [] do
+    if cameras_sha(cameras) == sha, do: :same, else: :changed
+  end
+
+  def drift(_cameras, _marker), do: :none
+
   defp drift_warnings(map, path, marker) do
     base = Path.basename(path)
 
-    case {Map.get(map, "cameras"), marker} do
-      # `cameras: []` lists nothing, so it earns neither warning.
-      {cameras, %{"sha256" => sha}} when is_list(cameras) and cameras != [] ->
-        if cameras_sha(cameras) == sha do
-          ["#{base} still lists cameras: — the database is the source of truth; remove the key"]
-        else
-          [
-            "#{base}: cameras changed since they were imported — use Import again on /config " <>
-              "to replace them, or remove the key"
-          ]
-        end
+    case drift(Map.get(map, "cameras"), marker) do
+      :same ->
+        ["#{base} still lists cameras: — the database is the source of truth; remove the key"]
 
-      _no_key_or_no_marker ->
+      :changed ->
+        [
+          "#{base}: cameras changed since they were imported — use Import again on /config " <>
+            "to replace them, or remove the key"
+        ]
+
+      :none ->
         []
     end
   end
