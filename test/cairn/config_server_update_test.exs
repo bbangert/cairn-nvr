@@ -205,6 +205,31 @@ defmodule Cairn.Config.ServerUpdateTest do
     refute_received {:native_applied, _config}
   end
 
+  # The closure's step outside the transaction is a `GenServer.call` to a
+  # sibling (`CameraControl.tombstone/1`), which exits while that sibling is
+  # restarting. An escaping exit would kill the fleet's config server and skip
+  # `after_rollback:`, leaving the rolled-back row tombstoned and dark.
+  test "a write closure that exits or throws is reported as a write error", %{server: server} do
+    test_pid = self()
+    callback = fn -> send(test_pid, :rolled_back) end
+    config = Config.Server.get(server)
+
+    assert Config.Server.update(server, fn -> exit(:boom) end, after_rollback: callback) ==
+             {:error, {:write, {:exit, :boom}}}
+
+    assert_received :rolled_back
+
+    assert Config.Server.update(server, fn -> throw(:boom) end, after_rollback: callback) ==
+             {:error, {:write, {:throw, :boom}}}
+
+    assert_received :rolled_back
+
+    # Still serving: the whole point is that a sibling's restart does not take
+    # the config server and every camera it holds down with it.
+    assert Config.Server.get(server) == config
+    refute_received {:applied, _diff, _config}
+  end
+
   test "disabling a camera is validated like any other save", %{dir: dir} do
     # Four detecting cameras put the ladder at 4 fps, where the solo profile
     # is pinned; disabling one raises the ladder to 7 and the two disagree.
@@ -494,6 +519,38 @@ defmodule Cairn.Config.ServerUpdateTest do
     end
 
     assert Repo.get(Camera, "cam_a") == nil
+  end
+
+  # A committed delete owes its cleanup whatever the apply does: the row is
+  # already gone, so a skipped `after_apply:` leaves runtime state no config
+  # names behind.
+  test "after_apply runs when the apply raises, and the broadcast does not", %{path: path} do
+    test_pid = self()
+    Config.Server.subscribe()
+
+    server =
+      start_supervised!(
+        {Config.Server,
+         path: path,
+         name: nil,
+         source: {ConfigSource, :load},
+         apply_diff: fn _diff, _config -> raise "boom" end,
+         apply_native: fn _config -> :ok end},
+        id: :config_apply_raise_server,
+        restart: :temporary
+      )
+
+    ref = Process.monitor(server)
+
+    catch_exit(
+      Config.Server.update(server, insert_fun("cam_a", "full"),
+        after_apply: fn _diff -> send(test_pid, :callback_ran) end
+      )
+    )
+
+    assert_received :callback_ran
+    assert_receive {:DOWN, ^ref, :process, ^server, _reason}
+    refute_received {:config_changed, _diff}
   end
 
   defp flush_mailbox do

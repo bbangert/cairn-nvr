@@ -286,6 +286,20 @@ defmodule CairnWeb.CameraFormTest do
       assert settings["rtsp_url"] == "http://cam.lan/flv?stream=ch0"
     end
 
+    test "an @ inside the saved password is not mistaken for the host boundary" do
+      main = "rtsp://user:sec@ret@host/s"
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => main}, zones: []}
+      params = CameraForm.to_params(row)
+
+      assert params["username"] == "user"
+
+      assert {:ok, %{"rtsp_url" => "rtsp://user:new@host/s"}} =
+               CameraForm.to_settings(Map.put(params, "password", "new"), row)
+
+      assert {:ok, %{"rtsp_url" => "rtsp://user:sec@ret@new/s"}} =
+               CameraForm.to_settings(Map.put(params, "rtsp_url", "rtsp://new/s"), row)
+    end
+
     test "a URL carrying its credential in the query is never spliced" do
       main = "http://cam.lan/flv?stream=ch0&user=admin&password=old"
 

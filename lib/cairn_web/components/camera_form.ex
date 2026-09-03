@@ -479,7 +479,7 @@ defmodule CairnWeb.CameraForm do
     seeded = seed_userinfo(url, saved[key])
 
     cond do
-      URI.parse(seeded).userinfo != nil ->
+      userinfo_of(seeded) != nil ->
         compose_url(seeded, if(given_user?(user, saved), do: user, else: @blank), pass)
 
       # `seeded`, not `url`: the FLV form's credential can have arrived via
@@ -506,7 +506,7 @@ defmodule CairnWeb.CameraForm do
   # pairs — the FLV form has no userinfo slot to seed, so its credential rides
   # to the retyped URL as a query carry instead.
   defp seed_userinfo(url, saved_url) do
-    if URI.parse(url).userinfo == nil and not CameraCards.credentialed?(url) do
+    if userinfo_of(url) == nil and not CameraCards.credentialed?(url) do
       url |> carry_userinfo(saved_url) |> carry_credential_query(saved_url)
     else
       url
@@ -516,9 +516,13 @@ defmodule CairnWeb.CameraForm do
   # Copied verbatim: what is on the saved URL is already percent-encoded, and
   # re-encoding it would change the credential.
   defp carry_userinfo(url, saved_url) when is_binary(saved_url) do
-    case URI.parse(saved_url).userinfo do
-      nil -> url
-      userinfo -> URI.to_string(%{URI.parse(url) | userinfo: userinfo})
+    case userinfo_of(saved_url) do
+      nil ->
+        url
+
+      userinfo ->
+        {scheme, _own, rest} = CameraCards.split_authority(url)
+        CameraCards.join_authority(scheme, userinfo, rest)
     end
   end
 
@@ -541,11 +545,12 @@ defmodule CairnWeb.CameraForm do
   end
 
   defp append_query(url, pairs) do
-    uri = URI.parse(url)
+    {scheme, userinfo, rest} = CameraCards.split_authority(url)
+    uri = URI.parse(rest)
     added = Enum.join(pairs, "&")
     merged = if uri.query in [nil, @blank], do: added, else: uri.query <> "&" <> added
 
-    URI.to_string(%{uri | query: merged})
+    CameraCards.join_authority(scheme, userinfo, URI.to_string(%{uri | query: merged}))
   end
 
   defp given_user?(@blank, _saved), do: false
@@ -559,12 +564,12 @@ defmodule CairnWeb.CameraForm do
   defp compose_url(url, @blank, @blank), do: url
 
   defp compose_url(url, user, pass) do
-    uri = URI.parse(url)
-    {current_user, current_pass} = split_userinfo(uri.userinfo)
+    {scheme, current, rest} = CameraCards.split_authority(url)
+    {current_user, current_pass} = split_userinfo(current)
     user = if user == @blank, do: current_user, else: encode(user)
     pass = if pass == @blank, do: current_pass, else: encode(pass)
 
-    URI.to_string(%{uri | userinfo: userinfo(user, pass)})
+    CameraCards.join_authority(scheme, userinfo(user, pass), rest)
   end
 
   defp userinfo(nil, nil), do: nil
@@ -728,13 +733,15 @@ defmodule CairnWeb.CameraForm do
   # and `mask_url/1` treats the whole of it as one, so it is not a username
   # to prefill: rendering it would expose in the form what the readout hides.
   defp url_user(url) when is_binary(url) do
-    case url |> URI.parse() |> Map.get(:userinfo) do
+    case userinfo_of(url) do
       nil -> nil
       userinfo -> userinfo |> split_userinfo() |> colon_user() |> decode_user()
     end
   end
 
   defp url_user(_absent), do: nil
+
+  defp userinfo_of(url), do: url |> CameraCards.split_authority() |> elem(1)
 
   defp colon_user({user, nil}) when is_binary(user), do: nil
   defp colon_user({user, _password}), do: user

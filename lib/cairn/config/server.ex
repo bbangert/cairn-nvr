@@ -197,8 +197,9 @@ defmodule Cairn.Config.Server do
   server loads from, which only the server knows.
 
   `{:error, errors}` is the validator's; `{:error, {:write, reason}}` is
-  `write_fun`'s own (a changeset, a DB fault, a wrong-shaped return, or an
-  exception the closure raised).
+  `write_fun`'s own (a changeset, a DB fault, a wrong-shaped return, an
+  exception the closure raised, or `{:exit, reason}` / `{:throw, value}` when
+  it exited or threw — a closure calling a restarting sibling exits).
   """
   @spec update(
           GenServer.server(),
@@ -404,6 +405,15 @@ defmodule Cairn.Config.Server do
     # caller's error, not a reason the config server and every camera it holds
     # should die for a save that never applied.
     e -> {:error, {:write, e}}
+  catch
+    # Same reasoning one kind over: a closure's step outside the transaction is
+    # a `GenServer.call` to a sibling (`CameraControl.tombstone/1`), which exits
+    # while that sibling is restarting. An escaping exit would kill the fleet's
+    # config server *and* skip `after_rollback:`, leaving the rolled-back row
+    # tombstoned and dark. DBConnection has already rolled the transaction back
+    # by the time it reaches here.
+    :exit, reason -> {:error, {:write, {:exit, reason}}}
+    :throw, value -> {:error, {:write, {:throw, value}}}
   end
 
   defp attempt(state, write_fun, reject) do
@@ -446,12 +456,27 @@ defmodule Cairn.Config.Server do
     # supervisor at any point after, and must find this fleet, not the
     # last one.
     publish(state, new_config)
-    # Before the cameras: detection is the in-VM engine, so the model a
-    # restarted camera will open a stream on should already be the new
-    # one. The call is asynchronous, so this is an ordering of sends
-    # rather than of loads.
-    state.apply_native.(new_config)
-    state.apply_diff.(diff, new_config)
+    # The apply is wrapped only so the commit's cleanup cannot be lost: the
+    # transaction is already committed here, so an apply that raises or exits
+    # still owes `after_apply:` (pruning a deleted camera's runtime state). The
+    # failure itself still propagates and takes this server down as before —
+    # reconciling the runtime owners against the config on its restart is the
+    # follow-up (`.claude/plans/ui-camera-config/scratchpad.md`).
+    try do
+      # Before the cameras: detection is the in-VM engine, so the model a
+      # restarted camera will open a stream on should already be the new
+      # one. The call is asynchronous, so this is an ordering of sends
+      # rather than of loads.
+      state.apply_native.(new_config)
+      state.apply_diff.(diff, new_config)
+    after
+      # Before the broadcast: a subscriber that reacts to `{:config_changed, _}`
+      # by calling `get/1` shares this mailbox with the callback, and a prune
+      # that blocks on another owner's call would otherwise make that read wait
+      # behind cleanup the subscriber has no reason to know about.
+      run_after_apply(after_apply, diff)
+    end
+
     # A camera in an applied config is, by definition, not deleted: whatever
     # tombstoned its id — a delete this save rolled back later, a re-import,
     # another suite in the test run — is over once the fleet names it again,
@@ -459,11 +484,6 @@ defmodule Cairn.Config.Server do
     # control server is a sibling that may be restarting.
     Enum.each(new_config.cameras, &revive_control/1)
     state = %{state | config: new_config, warnings: warnings, errors: [], skipped: skipped}
-    # Before the broadcast: a subscriber that reacts to `{:config_changed, _}`
-    # by calling `get/1` shares this mailbox with the callback, and a prune
-    # that blocks on another owner's call would otherwise make that read wait
-    # behind cleanup the subscriber has no reason to know about.
-    run_after_apply(after_apply, diff)
     Phoenix.PubSub.broadcast(Cairn.PubSub, Config.topic(), {:config_changed, diff})
     {diff, state}
   end

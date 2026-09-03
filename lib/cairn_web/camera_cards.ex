@@ -32,25 +32,75 @@ defmodule CairnWeb.CameraCards do
   }
 
   @doc """
+  A URL split into everything up to and including `//`, its userinfo, and the
+  host onward — the one place the userinfo boundary is decided, so masking,
+  stripping and the form's credential splice cannot disagree about where a
+  credential ends.
+
+  The boundary is the **last** `@` before the first `/`, `?` or `#`, not the
+  first: a hand-edited or imported password can itself contain a raw `@`
+  (`rtsp://user:sec@ret@host/s`), and `URI.parse/1` splits at the first one —
+  which masks half a password, strips half a password, and rewrites the host
+  as `ret@host`. Anything past that boundary is `rest`, so an `@` in a path or
+  query is left alone. A URL with no `//` has no authority to split.
+  """
+  @spec split_authority(String.t()) :: {String.t(), String.t() | nil, String.t()}
+  def split_authority(url) when is_binary(url) do
+    case String.split(url, "//", parts: 2) do
+      [prefix, authority_onward] ->
+        {authority, tail} = split_at_path(authority_onward)
+
+        case last_at(authority) do
+          nil -> {prefix <> "//", nil, authority_onward}
+          {userinfo, host} -> {prefix <> "//", userinfo, host <> tail}
+        end
+
+      [_no_authority] ->
+        {"", nil, url}
+    end
+  end
+
+  @doc "The inverse of `split_authority/1`."
+  @spec join_authority(String.t(), String.t() | nil, String.t()) :: String.t()
+  def join_authority(scheme, nil, rest), do: scheme <> rest
+  def join_authority(scheme, userinfo, rest), do: scheme <> userinfo <> "@" <> rest
+
+  defp split_at_path(authority_onward) do
+    case :binary.match(authority_onward, ["/", "?", "#"]) do
+      {at, _len} -> String.split_at(authority_onward, at)
+      :nomatch -> {authority_onward, ""}
+    end
+  end
+
+  defp last_at(authority) do
+    case authority |> :binary.matches("@") |> List.last() do
+      nil ->
+        nil
+
+      {at, _len} ->
+        {binary_part(authority, 0, at),
+         binary_part(authority, at + 1, byte_size(authority) - at - 1)}
+    end
+  end
+
+  @doc """
   Masks `rtsp://user:secret@host/…`, `rtsp://secret@host/…` and
   `…?password=x&user=y` forms.
   """
   @spec mask_url(term()) :: String.t()
   def mask_url(url) when is_binary(url) do
-    # The userinfo is everything between `//` and the LAST `@` before the
-    # path: a hand-edited or imported password can itself contain `@`, and a
-    # mask that stopped at the first one rendered the rest in the clear. The
-    # username (up to the first colon) stays; with no colon the whole
+    # The username (up to the first colon) stays; with no colon the whole
     # userinfo is a credential (`rtsp://SECRET@host` — a password to some
     # cameras, and `credentialed?/1` calls it one) and goes entirely. An
     # empty username (`rtsp://:secret@host`) masks like any other.
     masked =
-      Regex.replace(~r{//([^/?#]*)@}, url, fn _match, userinfo ->
-        case String.split(userinfo, ":", parts: 2) do
-          [user, _password] -> "//" <> user <> ":•••••@"
-          [_password_only] -> "//•••••@"
-        end
-      end)
+      case split_authority(url) do
+        {_scheme, nil, _rest} ->
+          url
+
+        {scheme, userinfo, rest} ->
+          join_authority(scheme, mask_userinfo(userinfo), rest)
+      end
 
     case String.split(masked, "?", parts: 2) do
       [base, query] -> base <> "?" <> mask_query(query)
@@ -63,6 +113,13 @@ defmodule CairnWeb.CameraCards do
   # render. Nothing to mask reads as nothing to show — like `credentialed?/1`,
   # which calls the same value clean.
   def mask_url(_other), do: ""
+
+  defp mask_userinfo(userinfo) do
+    case String.split(userinfo, ":", parts: 2) do
+      [user, _password] -> user <> ":•••••"
+      [_password_only] -> "•••••"
+    end
+  end
 
   defp mask_query(query) do
     query
@@ -110,10 +167,10 @@ defmodule CairnWeb.CameraCards do
   """
   @spec credentialed?(term()) :: boolean()
   def credentialed?(url) when is_binary(url) do
-    uri = URI.parse(url)
+    {_scheme, userinfo, rest} = split_authority(url)
 
-    uri.userinfo != nil or
-      Enum.any?(String.split(uri.query || "", "&"), fn pair ->
+    userinfo != nil or
+      Enum.any?(String.split(URI.parse(rest).query || "", "&"), fn pair ->
         pair |> String.split("=", parts: 2) |> hd() |> credential_key?()
       end)
   end
@@ -129,6 +186,8 @@ defmodule CairnWeb.CameraCards do
   @spec credential_query_pairs(term()) :: [String.t()]
   def credential_query_pairs(url) when is_binary(url) do
     url
+    |> split_authority()
+    |> elem(2)
     |> URI.parse()
     |> Map.get(:query)
     |> case do
@@ -219,7 +278,8 @@ defmodule CairnWeb.CameraCards do
   """
   @spec strip_credentials(String.t()) :: String.t()
   def strip_credentials(url) when is_binary(url) do
-    uri = URI.parse(url)
+    {scheme, _userinfo, rest} = split_authority(url)
+    uri = URI.parse(rest)
 
     query =
       case uri.query do
@@ -237,7 +297,7 @@ defmodule CairnWeb.CameraCards do
           if kept == [], do: nil, else: Enum.join(kept, "&")
       end
 
-    URI.to_string(%{uri | userinfo: nil, query: query})
+    join_authority(scheme, nil, URI.to_string(%{uri | query: query}))
   end
 
   @doc "The last probe result for a camera, or `nil` when it was never probed."

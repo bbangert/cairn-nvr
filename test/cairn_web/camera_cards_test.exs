@@ -19,8 +19,30 @@ defmodule CairnWeb.CameraCardsTest do
     end
   end
 
+  describe "split_authority/1" do
+    test "cuts at the last @ of the authority, and only inside the authority" do
+      assert CameraCards.split_authority("rtsp://user:sec@ret@host/s") ==
+               {"rtsp://", "user:sec@ret", "host/s"}
+
+      assert CameraCards.split_authority("rtsp://SEC@RET@host/") ==
+               {"rtsp://", "SEC@RET", "host/"}
+
+      assert CameraCards.split_authority("rtsp://host/s") == {"rtsp://", nil, "host/s"}
+      assert CameraCards.split_authority("http://h/p?x=1@2") == {"http://", nil, "h/p?x=1@2"}
+    end
+
+    test "round-trips through join_authority/3" do
+      for url <- ["rtsp://user:sec@ret@host/s", "rtsp://host/s", "http://h/p?x=1@2", "h/p"] do
+        {scheme, userinfo, rest} = CameraCards.split_authority(url)
+        assert CameraCards.join_authority(scheme, userinfo, rest) == url
+      end
+    end
+  end
+
   describe "an @ inside the credential" do
     test "is consumed through the last @ of the authority" do
+      assert CameraCards.strip_credentials("rtsp://user:sec@ret@host/s") == "rtsp://host/s"
+
       assert CameraCards.mask_url("rtsp://user:sec@ret@host/s") == "rtsp://user:•••••@host/s"
       assert CameraCards.mask_url("rtsp://SEC@RET@host/s") == "rtsp://•••••@host/s"
 
