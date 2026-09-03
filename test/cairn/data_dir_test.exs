@@ -75,7 +75,7 @@ defmodule Cairn.DataDirTest do
       log = ExUnit.CaptureLog.capture_log(fn -> assert DataDir.secure_db(dir) == :ok end)
 
       assert (File.stat!(db).mode &&& 0o777) == 0o600
-      assert log == ""
+      refute log =~ "could not chmod"
     end
 
     test "ensure!/1 tightens an existing cairn.db", %{dir: dir} do

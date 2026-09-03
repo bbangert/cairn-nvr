@@ -620,12 +620,17 @@ defmodule Cairn.Cameras.Settings do
   # `Cairn.Retention`'s sweep floor down, since that takes the minimum over
   # every per-label value.
   #
-  # A saved `per_label["default"]` is nonetheless carried through untouched
+  # A saved `per_label["default"]` is nonetheless carried through
   # (`carry_saved_default/2`): it is not the camera's days at all but a rule
   # for a detection label that happens to be spelled "default", which the row
   # this function reads from has no cell for and so can neither see nor
   # clear. Dropping it on every edit would quietly delete that rule the first
-  # time an operator touched anything else on the camera.
+  # time an operator touched anything else on the camera. But it is carried
+  # only if `Config.Camera.retention_days_range/0` would accept it — same
+  # reason a value no field can hold is dropped rather than round-tripped
+  # (`scalar_param/1`, moduledoc): an out-of-range saved value has no cell to
+  # fix it in, so carrying it unchanged would fail every future save on a
+  # value the operator cannot see or edit.
   defp row_retention(rows, saved) do
     {per_label, errors} =
       rows
@@ -653,8 +658,13 @@ defmodule Cairn.Cameras.Settings do
          |> Map.get("per_label")
          |> as_map()
          |> Map.get("default") do
-      nil -> per_label
-      days -> Map.put(per_label, "default", days)
+      days when is_integer(days) ->
+        if days in Config.Camera.retention_days_range(),
+          do: Map.put(per_label, "default", days),
+          else: per_label
+
+      _other ->
+        per_label
     end
   end
 

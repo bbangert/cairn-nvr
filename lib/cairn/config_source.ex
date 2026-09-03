@@ -351,7 +351,11 @@ defmodule Cairn.ConfigSource do
 
   # Only the retention block is read off a row here: a row that is dormant
   # because it was skipped can be malformed anywhere, and a malformed
-  # override is itself one of the reasons it may have been skipped.
+  # override is itself one of the reasons it may have been skipped. Values
+  # are still bounded by `Config.Camera.retention_days_range/0` — a dormant
+  # row skips `Camera.parse/3` entirely, so an out-of-range `days` here would
+  # reach `Cairn.Retention` unchecked and, at 0 or negative, treat every one
+  # of that camera's events as already expired.
   defp dormant(rows, skipped_ids) do
     for row <- rows, not row.enabled or row.id in skipped_ids do
       retention = Map.get(row.settings, "retention")
@@ -364,14 +368,17 @@ defmodule Cairn.ConfigSource do
     end
   end
 
-  defp retention_days(%{"days" => days}) when is_integer(days), do: days
+  defp retention_days(%{"days" => days}) when is_integer(days) do
+    if days in Config.Camera.retention_days_range(), do: days, else: nil
+  end
+
   defp retention_days(_other), do: nil
 
   # A dormant row is never rendered, so the parser never validates it — a
   # string here would raise inside the hourly sweep instead.
   defp retention_per_label(%{"per_label" => per_label}) when is_map(per_label) do
     for {label, days} <- per_label,
-        is_binary(label) and is_integer(days),
+        is_binary(label) and is_integer(days) and days in Config.Camera.retention_days_range(),
         into: %{},
         do: {label, days}
   end

@@ -583,6 +583,41 @@ defmodule Cairn.Cameras.SettingsTest do
       assert settings["retention"] == %{"per_label" => %{"default" => 3}}
     end
 
+    # The default row has no cell to see or fix this value in — carrying it
+    # unchanged would fail every future save on a bound the operator cannot
+    # touch (`carry_saved_default/2`).
+    test "a saved per_label default outside the retention range is dropped, not round-tripped" do
+      for bad <- [0, -1, "7"] do
+        row = %Camera{
+          id: "gate",
+          settings: %{
+            "rtsp_url" => "rtsp://h/1",
+            "retention" => %{"per_label" => %{"default" => bad}}
+          },
+          zones: []
+        }
+
+        {:ok, settings} = row |> Settings.to_params() |> Settings.to_settings(row)
+
+        refute match?(%{"retention" => %{"per_label" => %{"default" => _}}}, settings)
+      end
+    end
+
+    test "a saved per_label default inside the retention range is carried" do
+      row = %Camera{
+        id: "gate",
+        settings: %{
+          "rtsp_url" => "rtsp://h/1",
+          "retention" => %{"per_label" => %{"default" => 5}}
+        },
+        zones: []
+      }
+
+      {:ok, settings} = row |> Settings.to_params() |> Settings.to_settings(row)
+
+      assert settings["retention"] == %{"per_label" => %{"default" => 5}}
+    end
+
     test "a per-label days cell on the default row is not written" do
       params =
         params_with_rows([

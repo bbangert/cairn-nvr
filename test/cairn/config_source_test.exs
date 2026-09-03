@@ -629,6 +629,58 @@ defmodule Cairn.ConfigSourceTest do
       # The unguarded string would raise inside `Enum.max` here.
       assert is_integer(Retention.run_prune(config))
     end
+
+    test "a dormant row's out-of-range days falls back to the global, not the parser's bound",
+         %{dir: dir} do
+      path = write_yaml!(dir, globals(dir))
+      mark_imported!(path)
+
+      insert_camera!("cam_a", 0, %{"rtsp_url" => "rtsp://h/1", "retention" => %{"days" => 0}},
+        enabled: false
+      )
+
+      assert {:ok, config, _warnings, %{}} = ConfigSource.load(path)
+      assert [%Config.Camera{id: "cam_a", retention_days: nil}] = config.dormant
+    end
+
+    test "a dormant row's out-of-range per_label value is dropped, a valid sibling survives",
+         %{dir: dir} do
+      path = write_yaml!(dir, globals(dir))
+      mark_imported!(path)
+
+      insert_camera!(
+        "cam_a",
+        0,
+        %{
+          "rtsp_url" => "rtsp://h/1",
+          "retention" => %{"per_label" => %{"person" => -1, "car" => 30}}
+        },
+        enabled: false
+      )
+
+      assert {:ok, config, _warnings, %{}} = ConfigSource.load(path)
+      assert [%Config.Camera{id: "cam_a", retention_per_label: %{"car" => 30}}] = config.dormant
+    end
+
+    test "a dormant row's out-of-range days sweeps on the global clock, not immediately",
+         %{dir: dir} do
+      path = write_yaml!(dir, globals(dir))
+      mark_imported!(path)
+
+      insert_camera!("cam_a", 0, %{"rtsp_url" => "rtsp://h/1", "retention" => %{"days" => 0}},
+        enabled: false
+      )
+
+      config = elem(ConfigSource.load(path), 1)
+
+      # global retention_days is 7 (see `globals/2`): a 3-day-old event
+      # survives on that clock but would be swept at once if the guard fell
+      # through and `days: 0` reached the sweep unbounded.
+      kept = seed_event(dir, "cam_a", 3)
+
+      assert is_integer(Retention.run_prune(config))
+      assert Events.get(kept.id)
+    end
   end
 
   defp private_server(path) do
