@@ -912,7 +912,7 @@ defmodule CairnWeb.CameraForm do
                 option for the current value posts "" — an unrelated save would
                 silently turn detection off. --%>
           <option
-            :for={name <- plugin_options(@plugins, @form.params["plugin"])}
+            :for={name <- select_options(@plugins, @form.params["plugin"])}
             value={name}
             selected={@form.params["plugin"] == name}
           >
@@ -926,8 +926,12 @@ defmodule CairnWeb.CameraForm do
         <label for="camera-ingest" style={label_style()}>Ingest<.restart_chip /></label>
         <select id="camera-ingest" name="camera[ingest]" style={input_style()}>
           <option value="" selected={@form.params["ingest"] in [nil, ""]}>ffmpeg (default)</option>
+          <%!-- A skipped row's ingest is an option whatever the static list
+                holds: without it, the invalid value the loader refused would
+                render as the blank default instead, and a save would
+                silently pick "ffmpeg" for a row the operator meant to fix. --%>
           <option
-            :for={value <- ~w(ffmpeg rtsp)}
+            :for={value <- select_options(~w(ffmpeg rtsp), @form.params["ingest"])}
             value={value}
             selected={@form.params["ingest"] == value}
           >
@@ -1015,10 +1019,14 @@ defmodule CairnWeb.CameraForm do
               style={input_style()}
             />
             <span :if={n == 0} style={help_style()}>—</span>
+            <%!-- "Remove" alone reads the same on every row to a screen
+                  reader; the label (or the row number for a blank one) is
+                  what tells them apart. --%>
             <button
               :if={n > 0}
               type="button"
               class="hs-btn hs-btn--sm"
+              aria-label={"Remove label #{if blank?(row["label"]), do: n, else: row["label"]}"}
               phx-click="remove-label-row"
               phx-value-index={n}
             >
@@ -1142,7 +1150,16 @@ defmodule CairnWeb.CameraForm do
         <label for="camera-tracker" style={label_style()}>Tracker<.restart_chip /></label>
         <select id="camera-tracker" name="camera[tracker]" style={input_style()}>
           <option value="" selected={@form.params["tracker"] in [nil, ""]}>profile default</option>
-          <option :for={name <- @trackers} value={name} selected={@form.params["tracker"] == name}>
+          <%!-- The saved tracker is an option whatever `@trackers` holds, for
+                the same reason the plugin and ingest selects keep theirs: a
+                config server busy applying answers with `[]`, and a row the
+                loader refused for an unknown tracker must stay visible so
+                the operator can see and fix what they saved. --%>
+          <option
+            :for={name <- select_options(@trackers, @form.params["tracker"])}
+            value={name}
+            selected={@form.params["tracker"] == name}
+          >
             {name}
           </option>
         </select>
@@ -1294,8 +1311,13 @@ defmodule CairnWeb.CameraForm do
   defp column_name("min_score"), do: "detect"
   defp column_name(cell), do: cell
 
-  defp plugin_options(plugins, current) when current in [nil, ""], do: plugins
-  defp plugin_options(plugins, current), do: Enum.uniq(plugins ++ [current])
+  # Shared by every select whose options come from the running config
+  # (plugin groups, trackers) or a small static list (ingest): a blank
+  # current value adds nothing, and a saved value outside the list is kept as
+  # its own option so a row the loader refused for it stays visible instead
+  # of silently reverting to the blank default.
+  defp select_options(options, current) when current in [nil, ""], do: options
+  defp select_options(options, current), do: Enum.uniq(options ++ [current])
 
   # `data-error` marks the row when anything in it is wrong, cells included —
   # a cell error is rendered in its cell, but the row is what the operator

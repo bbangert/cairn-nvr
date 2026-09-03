@@ -27,6 +27,14 @@ defmodule CairnWeb.CamerasLive do
 
   @row_style "padding: 14px 16px; display: flex; flex-direction: column; gap: 10px;"
 
+  # `Cairn.Config.Camera.id_class/0`'s own regex, anchored: an id that fails
+  # it must be refused here, before the candidate reaches the fleet
+  # validator. Reaching it as an indexed camera would route as "camera #N: id
+  # …" (the loader cannot name a row by an id it just refused), which
+  # `partition_by_camera/1` treats as fleet-level — a bad id would then bury
+  # the field-level message under `#camera-form-errors` instead.
+  @id_regex Regex.compile!("\\A#{Config.Camera.id_class()}\\z")
+
   @impl true
   def mount(_params, _session, socket) do
     if connected?(socket) do
@@ -292,12 +300,23 @@ defmodule CairnWeb.CamerasLive do
   def handle_async(:remove, {:ok, {:error, {:write, :not_found}}}, socket),
     do: {:noreply, removed_elsewhere(socket)}
 
+  # An error card rendered here sits behind the confirm dialog, which is
+  # `phx-update="ignore"` and native-modal: without closing it, the operator
+  # sees an inert page and not the reason the remove failed.
   def handle_async(:remove, {:ok, result}, socket) do
-    {:noreply, assign(socket, saving?: false, save_result: done(result(result)))}
+    {:noreply,
+     socket
+     |> assign(saving?: false, save_result: done(result(result)))
+     |> push_event("cairn:close-dialog", %{id: "camera-remove-confirm"})}
   end
 
+  # Same reason as the arm above: an exit is not a rollback, but the dialog
+  # still has to come down so the unconfirmed card is visible.
   def handle_async(:remove, {:exit, reason}, socket) do
-    {:noreply, unconfirmed(socket, reason)}
+    {:noreply,
+     socket
+     |> unconfirmed(reason)
+     |> push_event("cairn:close-dialog", %{id: "camera-remove-confirm"})}
   end
 
   # A probe answers about the URL it was opened on, and it takes seconds: by
@@ -485,6 +504,7 @@ defmodule CairnWeb.CamerasLive do
 
     cond do
       blank_id?(socket) -> refuse(socket, ["id is required"])
+      invalid_id?(socket) -> refuse(socket, ["id must match #{Config.Camera.id_class()}"])
       taken_id?(socket) -> refuse(socket, ["id has already been taken"])
       true -> candidate_for(socket, params)
     end
@@ -502,6 +522,14 @@ defmodule CairnWeb.CamerasLive do
   # the refusal has to come from here to land under the field.
   defp blank_id?(%{assigns: %{mode: "new", camera_id: ""}}), do: true
   defp blank_id?(_socket), do: false
+
+  # Same reasoning as `blank_id?/1`, for a non-blank id the parser's anchored
+  # regex would refuse: on `:edit` the id is the row's own and already valid,
+  # so this only ever fires on `:new`.
+  defp invalid_id?(%{assigns: %{mode: "new", camera_id: id}}) when id != "",
+    do: not Regex.match?(@id_regex, id)
+
+  defp invalid_id?(_socket), do: false
 
   defp refuse(socket, errors) do
     show_errors(socket, prefix(errors, route_id(socket)))
@@ -529,11 +557,16 @@ defmodule CairnWeb.CamerasLive do
 
   # Errors this module raises itself are given the loader's own `camera <id>: `
   # prefix so they route to a field through the one routing table. A camera
-  # with no id yet still needs a name to route under.
+  # with no id yet, or one that could never be a valid id, still needs a name
+  # to route under — `Config.partition_by_camera/1` matches that prefix
+  # against the same anchored id regex, so a typed id it would reject (blank
+  # or malformed) has to be swapped for a placeholder that passes, or the
+  # message reads as fleet-level and lands under `#camera-form-errors`
+  # instead of the id field.
   defp route_id(socket) do
     case socket.assigns.camera_id do
       "" -> "unnamed"
-      id -> id
+      id -> if Regex.match?(@id_regex, id), do: id, else: "unnamed"
     end
   end
 

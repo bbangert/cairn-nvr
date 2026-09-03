@@ -17,6 +17,8 @@ defmodule Cairn.Cameras do
   # `only:` — `Ecto.Query.update/2` would clash with this module's own.
   import Ecto.Query, only: [from: 2]
 
+  require Logger
+
   alias Cairn.CameraControl
   alias Cairn.Cameras.Camera
   alias Cairn.CameraStatus
@@ -191,15 +193,49 @@ defmodule Cairn.Cameras do
   # are synchronous calls so they cannot be handled after a same-id re-create's
   # first writes; that cannot deadlock, because neither owner ever calls
   # `Cairn.Config.Server` (both are ETS + PubSub only).
+  #
+  # Each step runs under its own catch (`run_prunes/2`): the four owners are
+  # independent, and a restarting `CameraStatus` timing out its `prune` call
+  # must not abandon the other three while the row delete has already
+  # committed.
   @doc false
   @spec prune_runtime(String.t()) :: :ok
   def prune_runtime(id) do
-    remaining = Enum.map(list(), & &1.id)
-    CameraStatus.prune(remaining)
-    CameraControl.prune(remaining)
-    PresenceCheckpoint.delete(id)
-    EventCheckpoint.delete(id)
+    id |> prune_steps() |> run_prunes(id)
     :ok
+  end
+
+  # One entry per owner that must forget a deleted camera. A plain list (not
+  # inlined into `prune_runtime/1`) so `run_prunes/2` can be driven in a test
+  # with a step that deliberately exits.
+  @doc false
+  @spec prune_steps(String.t()) :: [{String.t(), (-> term())}]
+  def prune_steps(id) do
+    remaining = Enum.map(list(), & &1.id)
+
+    [
+      {"camera status", fn -> CameraStatus.prune(remaining) end},
+      {"camera control", fn -> CameraControl.prune(remaining) end},
+      {"presence checkpoint", fn -> PresenceCheckpoint.delete(id) end},
+      {"event checkpoint", fn -> EventCheckpoint.delete(id) end}
+    ]
+  end
+
+  # Each step is caught on its own: an owner that is mid-restart exits the
+  # call rather than answering it, and one such exit must not skip the
+  # remaining steps — every other owner still has state to drop for `id`.
+  @doc false
+  @spec run_prunes([{String.t(), (-> term())}], String.t()) :: [term()]
+  def run_prunes(steps, id) do
+    Enum.map(steps, fn {name, fun} ->
+      try do
+        fun.()
+      catch
+        :exit, reason ->
+          Logger.warning("cameras: prune step #{name} failed for #{id}: #{inspect(reason)}")
+          {:error, reason}
+      end
+    end)
   end
 
   defp next_position do

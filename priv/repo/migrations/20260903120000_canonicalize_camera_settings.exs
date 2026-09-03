@@ -11,12 +11,14 @@ defmodule Cairn.Repo.Migrations.CanonicalizeCameraSettings do
   # `json_remove` would also rewrite the rows that never held the key, and
   # `json_remove` reserializes the whole column when it does.
   def up do
-    # `transcode` is true only when it is literally `true`; SQLite stores
-    # JSON false as 0, and a string ("false", "no") reads false as well.
+    # `transcode` is true only when it is literally JSON `true`; `json_type`
+    # rather than a value check, because SQLite JSON has more false-reading
+    # shapes than false and a string — `1` is the integer form of true and
+    # still not the boolean, and `json_type` alone also catches it.
     execute """
     UPDATE cameras SET settings = json_remove(settings, '$.transcode')
-    WHERE json_extract(settings, '$.transcode') = 0
-       OR json_type(settings, '$.transcode') = 'text'
+    WHERE json_type(settings, '$.transcode') IS NOT NULL
+      AND json_type(settings, '$.transcode') != 'true'
     """
 
     execute """

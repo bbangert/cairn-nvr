@@ -336,6 +336,26 @@ defmodule Cairn.CamerasTest do
       assert EventCheckpoint.get("cam1") == nil
     end
 
+    # A restarting owner exits the call `prune_runtime/1` makes into it; that
+    # must not abandon the steps after it while the row delete has already
+    # committed. `Cairn.CameraStatus` is a running singleton and not
+    # practical to kill mid-test, so this drives `run_prunes/2` directly with
+    # a step that exits in the middle of the list.
+    test "run_prunes runs every step even when one of them exits" do
+      test_pid = self()
+
+      steps = [
+        {"first", fn -> send(test_pid, :first) end},
+        {"boom", fn -> exit(:boom) end},
+        {"last", fn -> send(test_pid, :last) end}
+      ]
+
+      Cameras.run_prunes(steps, "cam1")
+
+      assert_received :first
+      assert_received :last
+    end
+
     # D-P8: history outlives the row — the clips and event rows are retention's
     # to sweep, under the id they were recorded with.
     test "a deleted camera's event rows and clips stay", %{dir: dir} do

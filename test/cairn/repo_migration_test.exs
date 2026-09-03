@@ -66,6 +66,14 @@ defmodule Cairn.RepoMigrationTest do
     # the default too.
     insert_settings!("string_transcode", %{"rtsp_url" => "rtsp://h/2", "transcode" => "false"})
 
+    # SQLite's JSON has no boolean storage of its own — `1` is the integer
+    # form of true, not the JSON `true` the parser reads, and `json_type`
+    # (not a value comparison) is what tells them apart.
+    insert_settings!("int_transcode", %{"rtsp_url" => "rtsp://h/4", "transcode" => 1})
+
+    # `nil` encodes as JSON `null`, which reads exactly as the absent key.
+    insert_settings!("null_transcode", %{"rtsp_url" => "rtsp://h/5", "transcode" => nil})
+
     kept = %{
       "rtsp_url" => "rtsp://h/3",
       "transcode" => true,
@@ -80,6 +88,8 @@ defmodule Cairn.RepoMigrationTest do
 
     assert settings("old_shape") == %{"rtsp_url" => "rtsp://h/1"}
     assert settings("string_transcode") == %{"rtsp_url" => "rtsp://h/2"}
+    assert settings("int_transcode") == %{"rtsp_url" => "rtsp://h/4"}
+    assert settings("null_transcode") == %{"rtsp_url" => "rtsp://h/5"}
     assert settings("kept") == kept
   end
 

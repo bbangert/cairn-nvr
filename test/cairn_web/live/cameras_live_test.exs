@@ -453,6 +453,30 @@ defmodule CairnWeb.CamerasLiveTest do
       assert Cairn.Cameras.list() == []
     end
 
+    # Without this check the malformed id reaches the fleet validator, which
+    # cannot name a row by an id it just refused — it comes back as an
+    # indexed "camera #N: id …" message that `partition_by_camera/1` treats
+    # as fleet-level, burying it under `#camera-form-errors` instead of the
+    # id field.
+    test "an id that fails the format regex is refused under the field, not the fleet banner",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/cameras/new?tab=manual")
+
+      html =
+        render_change(view, "validate", %{
+          "camera" => %{"id" => "Front Door", "rtsp_url" => "rtsp://h/x"}
+        })
+
+      assert html =~ "id must match"
+      refute html =~ ~s(id="camera-form-errors")
+
+      render_submit(view, "save", %{
+        "camera" => %{"id" => "Front Door", "rtsp_url" => "rtsp://h/x"}
+      })
+
+      assert Cairn.Cameras.list() == []
+    end
+
     test "a duplicate id is refused under the field with no credential on the page",
          %{conn: conn} do
       create!("cam1", %{"rtsp_url" => "rtsp://u:SECRET@h/1"})
@@ -770,6 +794,27 @@ defmodule CairnWeb.CamerasLiveTest do
 
       assert flash = assert_redirect(view, "/cameras", 2_000)
       assert flash["error"] == "cam1 was removed in another session"
+    end
+
+    # The confirm dialog is `phx-update="ignore"` and native-modal: an error
+    # card rendered under it would be inert and invisible unless the dialog
+    # itself comes down. Provoked the same way the save test above does —
+    # `Config.Server.update/3`'s call to a dead pid exits — since deleting
+    # the row first now redirects instead of erroring.
+    test "an unconfirmed remove closes the confirm dialog", %{conn: conn} do
+      create!("cam1")
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      dead = spawn(fn -> :ok end)
+      ref = Process.monitor(dead)
+      assert_receive {:DOWN, ^ref, :process, ^dead, :normal}
+      Application.put_env(:cairn, :config_server, dead)
+
+      render_submit(view, "remove", %{"id" => "cam1"})
+      render_async(view)
+
+      assert_push_event(view, "cairn:close-dialog", %{id: "camera-remove-confirm"})
     end
 
     test "a disabled camera's edit page carries no status badge", %{conn: conn} do

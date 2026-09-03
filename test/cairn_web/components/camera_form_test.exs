@@ -670,6 +670,22 @@ defmodule CairnWeb.CameraFormTest do
       assert html =~ ~r/<option value="yard"\s+selected/
     end
 
+    # A row the loader skipped for an ingest or tracker value the static list
+    # (or the config server) doesn't know must still show that value, not
+    # silently fall back to the blank default and hide what the operator
+    # needs to fix.
+    test "a saved ingest outside the static list is an option" do
+      html = render_form(%{"ingest" => "bogus"}, plugins: [])
+
+      assert html =~ ~r/<option value="bogus"\s+selected/
+    end
+
+    test "a saved tracker outside the known list is an option" do
+      html = render_form(%{"tracker" => "bogus"}, plugins: [])
+
+      assert html =~ ~r/<option value="bogus"\s+selected/
+    end
+
     test "the default row has no days cell" do
       html = render_form(%{}, plugins: [])
 
@@ -701,6 +717,12 @@ defmodule CairnWeb.CameraFormTest do
       html = render_form(%{}, plugins: [])
 
       assert html =~ ~s(aria-label="detection label 1")
+    end
+
+    test "a label row's remove button names the label it removes" do
+      html = render_form(%{}, plugins: [])
+
+      assert html =~ ~s(aria-label="Remove label person")
     end
 
     # `open` on a <details> is client state the server never renders, and this
