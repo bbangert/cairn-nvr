@@ -1,8 +1,13 @@
 # Cairn NVR — Claude Design Handoff
 
-**Status**: RETURNED & IMPLEMENTED 2026-07-22 — the Claude Design export (docs/design/cairn-nvr-prototype.zip) has been recreated in the LiveViews. This doc remains the functional-contract reference.
-implemented (Phases 1–5) or frozen (Phase 6–7 endpoints); attribute/id
-contracts will not change without updating this doc.
+**Status**: RETURNED & IMPLEMENTED 2026-07-22 — the round-one Claude Design
+export (`docs/design/cairn-nvr-prototype.zip`) has been recreated in the
+LiveViews. This doc remains the functional-contract reference for the
+round-one pages; attribute/id contracts will not change without updating
+it. Later rounds are request specs under `docs/design/`:
+`track-viewer-handoff.md` (Tracks, tracked-objects panel, bbox overlay) and
+`camera-config-handoff.md` (Cameras, Add/Edit camera, zone editor, the
+trimmed Config page).
 
 **Round trip**: design the pages in Claude Design → export HEEx/HTML +
 Tailwind classes back → we wire them into the existing LiveViews. Keep the
@@ -12,12 +17,15 @@ bindings) exactly as specced; restyle everything else freely.
 ## Product in one paragraph
 
 Cairn is an event-clip NVR (network video recorder) for a home LAN.
-Cameras stream via RTSP; an AI plugin detects objects (person, cat, car…);
-Cairn records one mp4 clip per event (with pre-roll) and indexes it.
-The UI is three pages: a live **Dashboard**, an **Events** browser with
-clip playback, and a read-only **Config** page. No auth in v1 (LAN-trusted).
-Think "Frigate, but event clips only" — utilitarian, glanceable at a
-distance (wall tablet), dark-mode-first is a natural fit.
+Cameras stream via RTSP; an in-VM detector finds objects (person, cat,
+car…); Cairn records one mp4 clip per event (with pre-roll) and indexes it.
+The UI is six live routes: a live **Dashboard** (`/`), an **Events**
+browser (`/events`) with clip playback (`/events/:id`), a **Tracks** index
+(`/tracks`), the **Cameras** pages (`/cameras`, `/cameras/new`,
+`/cameras/:id/edit`, `/cameras/:id/zones`), and a read-only **Config** page
+(`/config`). No auth in v1 (LAN-trusted). Think "Frigate, but event clips
+only" — utilitarian, glanceable at a distance (wall tablet), dark-mode-first
+is a natural fit.
 
 ## Tech baseline
 
@@ -25,7 +33,8 @@ distance (wall tablet), dark-mode-first is a natural fit.
 - Layout wrapper: every page renders inside `<Layouts.app flash={@flash}>`.
 - Icons: heroicons (`<.icon name="hero-...">` component available).
 - Videos are `<video>` elements driven by JS hooks — the hook manages
-  `src`; design must not set `src` or remove the `phx-*`/`data-*` attrs.
+  `src` (MSE) or `srcObject` (WebRTC); design must not set either or remove
+  the `phx-*`/`data-*` attrs.
 - LiveView re-renders server-side: interactive filtering/pagination is done
   with forms + `phx-change`/`phx-click` bindings, not client JS.
 
@@ -40,8 +49,8 @@ Camera grid; each camera is a tile. Empty state when no cameras configured.
   <h2>{cam.id}</h2>
   <span id={"camera-status-#{cam.id}"} data-status={status}>{status}</span>
   <video
-    id={"camera-video-#{cam.id}"}
-    phx-hook="MsePlayer"
+    id={"camera-video-#{cam.id}-#{transport}"}
+    phx-hook={if transport == :webrtc, do: "WebrtcPlayer", else: "MsePlayer"}
     phx-update="ignore"
     data-camera-id={cam.id}
     data-hls-url={"/hls/#{cam.id}/index.m3u8"}
@@ -49,6 +58,12 @@ Camera grid; each camera is a tile. Empty state when no cameras configured.
   ></video>
 </article>
 ```
+
+The video id carries the transport (`-webrtc` / `-mse`) and the hook is
+chosen server-side per camera (default `:webrtc`; flipped by the toggle or
+by a `transport_failed` report). The suffix is load-bearing: under
+`phx-update="ignore"` the id change is what makes LiveView replace the
+element and swap the hook.
 
 - `data-status` values to style: `connecting` (yellow/pulse), `running`
   (green), `backoff` (red — camera unreachable, retrying), `stalled`
@@ -58,8 +73,12 @@ Camera grid; each camera is a tile. Empty state when no cameras configured.
   (e.g. red recording dot / border glow). Server assign: `@live_events` is
   a `%{camera_id => true}` map (subscribed to the `"events"` topic).
 - **MSE ↔ WebRTC toggle** (Phase 7): per-tile toggle control, two states
-  ("Low latency" WebRTC vs "Standard" MSE). Contract: button with
-  `phx-click="toggle-transport"` `phx-value-camera={cam.id}`.
+  ("Low latency" WebRTC vs "Standard" MSE). Contract:
+  `#camera-transport-{id}[data-transport]` holding two buttons
+  `phx-click="toggle-transport" phx-value-camera={cam.id}
+  phx-value-transport="mse|webrtc"`. The player hooks push three reports
+  the hosting LiveView must handle — `webrtc_active {camera_id, width,
+  height}`, `webrtc_inactive`, and (WebRTC only) `transport_failed`.
 - **Disk alert banner**: page-level persistent banner when
   `@disk_alert.active` — "Low disk space: emergency cleanup is deleting
   oldest events" + free-space MB. Must be prominent but not block video.
@@ -103,26 +122,27 @@ Filterable, paginated list of recorded event clips, newest first.
 
 ## Page 4 — Config `/config`
 
-Read-only render of the active YAML config + reload workflow.
+Read-only render of the node settings from the YAML file, plus the reload
+workflow. Cameras are no longer shown here: they live in the database and
+are managed on `/cameras` (see `docs/design/camera-config-handoff.md`,
+which also specifies this page's import section and the link row that
+replaced the camera cards).
 
-- Sections: globals (data_dir, windows, retention, UDP range, thresholds),
-  then per-camera cards: id, rtsp_url (mask password part —
-  server sends it pre-masked), plugin command, min_score map, windows,
-  retention, `transcode` flag.
-- **Per-camera probe results** (Phase 8): codec, resolution, fps, profile
-  + warning states: non-H.264 camera → warning chip "switch camera to
-  H.264 or enable transcode"; `transcode_unavailable` → error chip.
-- **Reload button**: `phx-click="reload"`. Result states to design:
-  - success: diff summary (added/removed/changed camera id chips) +
-    warnings list (yellow)
+- Sections: globals (data_dir, windows, retention, thresholds), config
+  health, then a link row to Cameras.
+- **Reload button**: `phx-click="reload"`. It re-reads the file's globals
+  and the database's cameras together. Result states to design:
+  - success: diff summary (added/removed/restarted/updated camera id
+    chips) + warnings list (yellow)
   - failure: error list (red) + "previous config still active" notice
 - Last-load warnings/errors shown persistently under a "Config health"
   heading (assigns: `@last_load.warnings`, `@last_load.errors`).
 
 ## Shared / global
 
-- Nav: three items (Dashboard, Events, Config) + app name "Cairn". Current
-  page indicator. Keep it minimal; no user menu (no auth).
+- Nav: five items (Dashboard, Events, Tracks, Cameras, Config) + app name
+  "Cairn". Current page indicator. Keep it minimal; no user menu (no
+  auth).
 - Flash messages: standard LiveView flash (`Layouts.app` renders them).
 - Empty/loading states for every async panel.
 - Timestamps: render in browser-local time (`<time datetime={iso}>`; we

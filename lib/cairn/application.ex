@@ -21,6 +21,29 @@ defmodule Cairn.Application do
       Cairn.Repo,
       {Ecto.Migrator,
        repos: Application.fetch_env!(:cairn, :ecto_repos), skip: skip_migrations?()},
+      # One-shot, right after the migrator's first write creates cairn.db and
+      # its WAL/SHM. `Task.start_link` returns at spawn, so this does not run
+      # before `Cairn.Config.Server`'s own `DataDir.ensure!` call below — the
+      # two are a belt-and-suspenders pair, not an ordering guarantee: this
+      # one covers the files the migrator itself just created, and
+      # `ensure!/1` (which also chmods) is the one that runs in order, after
+      # the migrator, on the boot's next line. No-op when `db_in_data_dir` is
+      # false (test env, which points the Repo at a DB outside the data dir)
+      # so the child tree shape doesn't vary by env.
+      %{
+        id: :secure_db,
+        start:
+          {Task, :start_link,
+           [
+             fn ->
+               if Application.get_env(:cairn, :db_in_data_dir, false) do
+                 data_dir = Cairn.Config.resolve_data_dir(Cairn.Config.default_path())
+                 Cairn.DataDir.secure_db(data_dir)
+               end
+             end
+           ]},
+        restart: :temporary
+      },
       # After the migrated Repo, so a config source may read rows; before
       # everything that reads the config. Its `init/1` must not broadcast —
       # PubSub starts below it.

@@ -41,6 +41,9 @@ defmodule CairnWeb.Router do
     live "/events", EventsLive
     live "/events/:id", EventLive
     live "/tracks", TracksLive
+    live "/cameras", CamerasLive, :index
+    live "/cameras/new", CamerasLive, :new
+    live "/cameras/:id/edit", CamerasLive, :edit
     live "/config", ConfigLive
   end
 

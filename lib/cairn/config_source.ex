@@ -22,6 +22,8 @@ defmodule Cairn.ConfigSource do
 
   require Logger
 
+  import Ecto.Query, only: [from: 2]
+
   alias Cairn.Cameras
   alias Cairn.Cameras.Camera
   alias Cairn.Cameras.Setting
@@ -46,8 +48,31 @@ defmodule Cairn.ConfigSource do
       degrade(path, "cameras: database read failed: " <> Exception.message(e))
 
     e in [Ecto.InvalidChangesetError, Ecto.ConstraintError] ->
-      degrade(path, "cameras: import failed: " <> Exception.message(e))
+      degrade(path, "cameras: import failed: " <> describe_import_error(e))
   end
+
+  # `Exception.message/1` on these two interpolates the changeset — including
+  # `changes.settings`, which can hold a password just spliced in by an
+  # import — into whatever this reaches (a log line, `/config`'s health
+  # card). Only the field-error messages (changeset) or the constraint name
+  # (constraint) are safe to surface. `@doc false` rather than private only
+  # so a test can drive it directly with a constructed exception; nothing
+  # outside this module calls it.
+  @doc false
+  @spec describe_import_error(%Ecto.InvalidChangesetError{} | %Ecto.ConstraintError{}) ::
+          String.t()
+  def describe_import_error(%Ecto.InvalidChangesetError{changeset: changeset}) do
+    changeset
+    |> Ecto.Changeset.traverse_errors(fn {msg, opts} ->
+      Enum.reduce(opts, msg, fn {key, value}, acc ->
+        String.replace(acc, "%{#{key}}", to_string(value))
+      end)
+    end)
+    |> Enum.map_join("; ", fn {field, msgs} -> "#{field} #{Enum.join(msgs, ", ")}" end)
+  end
+
+  def describe_import_error(%Ecto.ConstraintError{constraint: name}),
+    do: "constraint #{name} failed"
 
   defp degrade(path, message) do
     case Config.raw_map(path) do
@@ -56,13 +81,52 @@ defmodule Cairn.ConfigSource do
     end
   end
 
-  # The config page reads it in phase 3.
-  @doc false
+  @doc "The import-once marker `%{path, sha256, imported_at}`, or `nil` before the first boot armed it."
   @spec import_marker() :: map() | nil
   def import_marker do
     case Repo.get(Setting, @marker_key) do
       %Setting{value: value} -> value
       nil -> nil
+    end
+  end
+
+  @doc """
+  Replaces every camera row with the file's `cameras:` list — the operator's
+  answer to the "changed since they were imported" warning. Serialized and
+  validated like any other write through `Cairn.Config.Server.update/3`, so
+  a file that fails to load replaces nothing (`{:error, {:write, {:yaml,
+  errors}}}`), and one with no cameras to import is refused rather than
+  silently emptying the fleet (`{:error, {:write, :no_cameras}}`). Rows the
+  file no longer lists lose their runtime state the way a delete does.
+  """
+  @spec reimport(Path.t()) :: Cameras.write_result()
+  def reimport(path \\ Config.default_path()) do
+    before = Enum.map(Cameras.list(), & &1.id)
+
+    case Config.Server.update(Cameras.server(), fn -> replace_rows(path) end) do
+      {:ok, _diff, _warnings} = applied ->
+        remaining = Enum.map(Cameras.list(), & &1.id)
+        Enum.each(before -- remaining, &Cameras.prune_runtime/1)
+        applied
+
+      rejected ->
+        rejected
+    end
+  end
+
+  defp replace_rows(path) do
+    with {:ok, map} <- Config.raw_map(path),
+         cameras when is_list(cameras) and cameras != [] <- Map.get(map, "cameras"),
+         {:ok, _config, _warnings} <- Config.from_map(map) do
+      Repo.delete_all(Camera)
+      Repo.delete_all(from(s in Setting, where: s.key == @marker_key))
+      # The write closure answers only `:ok`; the dropped-key warnings from
+      # the import are logged here so they are not lost with it.
+      cameras |> import_rows(path) |> Enum.each(&Logger.warning("config: #{&1}"))
+      :ok
+    else
+      {:error, errors} when is_list(errors) -> {:error, {:yaml, errors}}
+      _no_cameras -> {:error, :no_cameras}
     end
   end
 

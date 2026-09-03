@@ -1,88 +1,137 @@
 defmodule CairnWeb.ConfigLive do
   @moduledoc """
-  Read-only config page with reload workflow, styled per the Claude Design
-  handoff. Contract preserved: `phx-click="reload"` →
-  `Cairn.Config.Server.reload/0`; diff/warnings or errors rendered with an
-  old-config-retained notice. RTSP/FLV credentials are masked before
-  render; probe results come from `Cairn.CameraStatus`.
+  Globals page with reload/re-import workflows, styled per the Claude
+  Design handoff. Contract preserved: `phx-click="reload"` →
+  `Cairn.Config.Server.reload/1`. `phx-click="reimport"` replaces the whole
+  camera fleet from `config.yml` (`Cairn.ConfigSource.reimport/1`) — not
+  read-only, though it is the only camera write this page makes; every other
+  camera edit happens on `/cameras`, which this page only links to.
   """
 
   use CairnWeb, :live_view
 
+  alias Cairn.Cameras
   alias Cairn.Config
-
-  @credential_params ~w(password pass pwd token secret user username)
+  alias Cairn.ConfigSource
+  alias CairnWeb.CameraCards
 
   @impl true
   def mount(_params, _session, socket) do
-    {:ok, socket |> assign(page_title: "Config", reload_result: nil) |> load()}
+    {:ok,
+     socket
+     |> assign(
+       page_title: "Config",
+       reload_result: nil,
+       reimporting: false,
+       busy?: false,
+       config: nil,
+       config_path: Config.default_path(),
+       last_load: nil,
+       import_marker: nil,
+       reimport_confirm: nil
+     )
+     |> load()}
   end
 
   @impl true
   def handle_event("reload", _params, socket) do
     result =
-      case Config.Server.reload() do
-        {:ok, diff, warnings} -> %{ok: true, diff: diff, warnings: warnings, errors: []}
-        {:error, errors} -> %{ok: false, diff: nil, warnings: [], errors: errors}
+      case Config.Server.reload(Cameras.server()) do
+        {:ok, diff, warnings} ->
+          %{ok: true, diff: diff, warnings: warnings, errors: [], kind: :reload}
+
+        {:error, errors} ->
+          %{ok: false, diff: nil, warnings: [], errors: errors, kind: :reload}
       end
 
     {:noreply, socket |> assign(reload_result: result) |> load()}
   end
 
-  defp load(socket) do
-    assign(socket,
-      config: Config.Server.get(),
-      config_path: Config.default_path(),
-      last_load: Config.Server.last_load(),
-      statuses: Cairn.CameraStatus.all()
-    )
+  def handle_event("reimport", _params, socket) do
+    path = socket.assigns.config_path
+
+    {:noreply,
+     socket
+     |> assign(reimporting: true)
+     |> start_async(:reimport, fn -> ConfigSource.reimport(path) end)}
   end
 
+  @impl true
+  def handle_async(:reimport, {:ok, result}, socket) do
+    {:noreply,
+     socket
+     |> assign(reimporting: false, reload_result: reimport_result(result))
+     |> load()}
+  end
+
+  def handle_async(:reimport, {:exit, reason}, socket) do
+    {:noreply,
+     socket
+     |> assign(reimporting: false, reload_result: error_result(inspect(reason)))
+     |> load()}
+  end
+
+  # Public (not private) only so a test can drive the `{:write, reason}`
+  # mapping directly with a constructed reason — the reachable path is a
+  # `write_fun` raise inside `Cairn.ConfigSource.reimport/1`'s nested
+  # transaction, which is not practical to provoke deterministically through
+  # the LiveView. Not called from outside this module.
   @doc false
-  # rtsp://user:secret@host/... and ...?password=x&user=y forms
-  def mask_url(url) do
-    masked = String.replace(url, ~r/(\/\/[^:\/@]+:)[^@\/]+@/, "\\1•••••@")
+  @spec reimport_result(Cairn.Cameras.write_result()) :: map()
+  def reimport_result({:ok, diff, warnings}),
+    do: %{ok: true, diff: diff, warnings: warnings, errors: [], kind: :reimport}
 
-    case String.split(masked, "?", parts: 2) do
-      [base, query] -> base <> "?" <> mask_query(query)
-      [base] -> base
+  def reimport_result({:error, {:write, {:yaml, errors}}}),
+    do: %{ok: false, diff: nil, warnings: [], errors: errors, kind: :reimport}
+
+  def reimport_result({:error, {:write, reason}}),
+    do: error_result(CameraCards.describe_write_error(reason))
+
+  def reimport_result({:error, errors}) when is_list(errors),
+    do: %{ok: false, diff: nil, warnings: [], errors: errors, kind: :reimport}
+
+  defp error_result(message),
+    do: %{ok: false, diff: nil, warnings: [], errors: [message], kind: :reimport}
+
+  # Server calls, not the reimport task: `get/1` and `last_load/1` are 5 s
+  # calls the server cannot answer while it is applying a config (the save
+  # holds it through `apply_diff`) — the `Cairn.CamerasLive` treatment,
+  # rendered here as a short busy line rather than a crashed mount/event.
+  # Everything computed here runs once per `load/1` call, not per render —
+  # `@reimport_confirm` in particular used to be recomputed (a YAML re-parse
+  # and a DB count) on every `data-confirm` render.
+  defp load(socket) do
+    server = Cameras.server()
+
+    case overlay(server) do
+      {:ok, config, last_load} ->
+        path = socket.assigns.config_path
+
+        assign(socket,
+          busy?: false,
+          config: config,
+          last_load: last_load,
+          import_marker: ConfigSource.import_marker(),
+          reimport_confirm: reimport_confirm(path)
+        )
+
+      :busy ->
+        assign(socket, busy?: true)
     end
   end
 
-  defp mask_query(query) do
-    query
-    |> String.split("&")
-    |> Enum.map_join("&", &mask_query_pair/1)
+  defp overlay(server) do
+    {:ok, Config.Server.get(server), Config.Server.last_load(server)}
+  catch
+    :exit, _ -> :busy
   end
 
-  defp mask_query_pair(pair) do
-    case String.split(pair, "=", parts: 2) do
-      [key, _value] ->
-        if String.downcase(key) in @credential_params, do: "#{key}=•••••", else: pair
-
-      _ ->
-        pair
-    end
+  defp reimport_confirm(path) do
+    "Replace all #{length(Cameras.list())} saved cameras with the #{config_camera_count(path)} " <>
+      "in config.yml? Zones drawn in the UI are lost."
   end
 
   # -- view helpers -----------------------------------------------------------
-
-  defp probe(statuses, camera_id) do
-    statuses |> Map.get(camera_id, %{}) |> Map.get(:probe)
-  end
-
-  defp probe_chips(nil), do: []
-  defp probe_chips(%{error: _}), do: []
-
-  defp probe_chips(probe) do
-    [
-      probe[:codec],
-      probe[:width] && probe[:height] && "#{probe.width}×#{probe.height}",
-      probe[:fps] && "#{probe.fps} fps",
-      probe[:profile]
-    ]
-    |> Enum.reject(&(&1 in [nil, false]))
-  end
 
   defp globals(config) do
     [
@@ -103,32 +152,24 @@ defmodule CairnWeb.ConfigLive do
     " · " <> Enum.map_join(map, " · ", fn {label, days} -> "#{label}: #{days}d" end)
   end
 
-  defp camera_rows(config, cam) do
-    windows = Config.windows(config, cam)
-
-    [
-      {"plugin", plugin_label(cam.plugin)},
-      {"min_score", Enum.map_join(cam.min_score, " ", fn {l, s} -> "#{l}: #{s}" end)},
-      {"windows", "#{windows.pre}s / #{windows.post}s / #{windows.max}s"},
-      {"retention",
-       (cam.retention_days && "#{cam.retention_days}d#{per_label(cam.retention_per_label)}") ||
-         "inherit"}
-    ]
-  end
-
-  defp plugin_label({:group, name}), do: name
-  defp plugin_label(nil), do: "none"
-
-  defp not_h264?(statuses, cam) do
-    case probe(statuses, cam.id) do
-      %{codec: codec} when is_binary(codec) and codec != "h264" -> not cam.transcode
-      _ -> false
+  defp fmt_import_date(%{"imported_at" => iso}) do
+    case DateTime.from_iso8601(iso) do
+      {:ok, dt, _offset} -> CairnWeb.EventsLive.fmt_time(dt)
+      {:error, _reason} -> iso
     end
   end
 
-  defp transcode_unavailable?(statuses, camera_id) do
-    statuses |> Map.get(camera_id, %{}) |> Map.get(:status) == :transcode_unavailable
+  defp reimportable?(last_load), do: Enum.any?(last_load.warnings, &(&1 =~ ~r/changed since/))
+
+  defp config_camera_count(path) do
+    case Config.raw_map(path) do
+      {:ok, %{"cameras" => cameras}} when is_list(cameras) -> length(cameras)
+      _other -> 0
+    end
   end
+
+  defp health_visible?(last_load, marker),
+    do: last_load.warnings != [] or last_load.errors != [] or not is_nil(marker)
 
   @impl true
   def render(assigns) do
@@ -141,9 +182,7 @@ defmodule CairnWeb.ConfigLive do
               Config
             </h1>
             <div style="font-size: 13px; color: var(--hs-fg-3); margin-top: 3px;">
-              Read-only view of
-              <span style="font-family: var(--hs-font-mono); font-size: 12px;">{@config_path}</span>
-              — edit the file, then reload.
+              Node settings, read from <span style="font-family: var(--hs-font-mono); font-size: 12px;">{@config_path}</span>. Cameras are managed on Cameras.
             </div>
           </div>
           <div style="flex: 1;"></div>
@@ -161,7 +200,9 @@ defmodule CairnWeb.ConfigLive do
         >
           <div style="display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--hs-success);">
             <span class="ms" style="font-size: 19px;">check_circle</span>
-            Config reloaded — changes are live
+            {if @reload_result.kind == :reimport,
+              do: "Cameras re-imported from config.yml — changes are live",
+              else: "Config reloaded — changes are live"}
           </div>
           <div
             :if={
@@ -205,7 +246,10 @@ defmodule CairnWeb.ConfigLive do
           style="padding: 14px 16px; border-color: var(--hs-danger); display: flex; flex-direction: column; gap: 10px;"
         >
           <div style="display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--hs-danger);">
-            <span class="ms" style="font-size: 19px;">error</span> We couldn't load the new config
+            <span class="ms" style="font-size: 19px;">error</span>
+            {if @reload_result.kind == :reimport,
+              do: "We couldn't re-import the cameras",
+              else: "We couldn't load the new config"}
           </div>
           <div style="display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--hs-danger); font-family: var(--hs-font-mono);">
             <div :for={e <- @reload_result.errors}>{e}</div>
@@ -215,8 +259,15 @@ defmodule CairnWeb.ConfigLive do
           </div>
         </section>
 
+        <section :if={@busy?} id="config-busy" class="hs-card" style="padding: 16px;">
+          <div style="display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--hs-fg-2);">
+            <span class="ms" style="font-size: 19px;">hourglass_top</span>
+            Configuration is being applied — this page will refresh
+          </div>
+        </section>
+
         <section
-          :if={@last_load.warnings != [] or @last_load.errors != []}
+          :if={!@busy? and health_visible?(@last_load, @import_marker)}
           id="config-health"
           class="hs-card"
           style="padding: 16px;"
@@ -245,10 +296,33 @@ defmodule CairnWeb.ConfigLive do
             >
               <span class="ms" style="font-size: 16px; flex: none; margin-top: 1px;">warning</span>{w}
             </div>
+            <div
+              :if={@import_marker}
+              id="config-import"
+              style="display: flex; flex-direction: column; gap: 8px; margin-top: 4px;"
+            >
+              <div style="display: flex; gap: 7px; color: var(--hs-fg-3);">
+                <span class="ms" style="font-size: 16px; flex: none; margin-top: 1px;">history</span>
+                Cameras imported from
+                <span style="font-family: var(--hs-font-mono);">{@import_marker["path"]}</span>
+                on {fmt_import_date(@import_marker)}
+              </div>
+              <button
+                :if={reimportable?(@last_load)}
+                id="config-reimport"
+                phx-click="reimport"
+                disabled={@reimporting}
+                data-confirm={@reimport_confirm}
+                class="hs-btn hs-btn--secondary"
+              >
+                <span class="ms" style="font-size: 18px;">sync</span>
+                {if @reimporting, do: "Importing…", else: "Import again"}
+              </button>
+            </div>
           </div>
         </section>
 
-        <section id="config-globals" class="hs-card" style="padding: 16px;">
+        <section :if={!@busy?} id="config-globals" class="hs-card" style="padding: 16px;">
           <h3 style="margin: 0 0 12px; font-size: 14px; font-weight: 600; color: var(--hs-fg-1); display: flex; align-items: center; gap: 8px;">
             <span class="ms" style="font-size: 18px; color: var(--hs-fg-3);">public</span>Globals
           </h3>
@@ -271,68 +345,15 @@ defmodule CairnWeb.ConfigLive do
         </section>
 
         <div
-          id="config-cameras"
-          style="display: grid; grid-template-columns: repeat(auto-fill, minmax(400px, 1fr)); gap: 16px;"
+          id="config-cameras-link"
+          class="hs-card"
+          style="padding: 16px; display: flex; align-items: center; gap: 14px;"
         >
-          <section
-            :for={cam <- @config.cameras}
-            id={"config-camera-#{cam.id}"}
-            class="hs-card"
-            style="padding: 16px; display: flex; flex-direction: column; gap: 10px;"
-          >
-            <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
-              <span style="font-family: var(--hs-font-mono); font-size: 14px; font-weight: 500; color: var(--hs-fg-1);">
-                {cam.id}
-              </span>
-              <div style="flex: 1;"></div>
-              <span :if={cam.transcode} class="hs-badge hs-badge--accent">
-                <span class="hs-dot"></span>transcode
-              </span>
-              <span
-                :if={not_h264?(@statuses, cam)}
-                class="hs-badge hs-badge--warning"
-                title="Switch the camera to H.264 or enable transcode"
-              >
-                <span class="hs-dot"></span>not H.264
-              </span>
-              <span :if={transcode_unavailable?(@statuses, cam.id)} class="hs-badge hs-badge--danger">
-                <span class="hs-dot"></span>transcode unavailable
-              </span>
-            </div>
-            <div style="font-family: var(--hs-font-mono); font-size: 12px; color: var(--hs-fg-2); background: var(--hs-bg-sunken); border-radius: 6px; padding: 8px 10px; word-break: break-all;">
-              {mask_url(cam.rtsp_url)}
-            </div>
-            <div style="display: flex; gap: 6px; flex-wrap: wrap;">
-              <span
-                :for={chip <- probe_chips(probe(@statuses, cam.id))}
-                id={"probe-#{cam.id}-#{chip}"}
-                class="tnum"
-                style="display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 6px; font-size: 12px; background: var(--hs-bg-sunken); color: var(--hs-fg-2); font-family: var(--hs-font-mono);"
-              >
-                {chip}
-              </span>
-              <span
-                :if={probe_chips(probe(@statuses, cam.id)) == []}
-                style="display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 6px; font-size: 12px; background: var(--hs-bg-sunken); color: var(--hs-warning); font-family: var(--hs-font-mono);"
-              >
-                not probed yet
-              </span>
-            </div>
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px 20px; font-size: 13px;">
-              <div
-                :for={{key, value} <- camera_rows(@config, cam)}
-                style="display: flex; justify-content: space-between; gap: 10px;"
-              >
-                <span style="color: var(--hs-fg-3);">{key}</span>
-                <span
-                  class="tnum"
-                  style="font-family: var(--hs-font-mono); font-size: 12px; color: var(--hs-fg-1); text-align: right; word-break: break-all;"
-                >
-                  {value}
-                </span>
-              </div>
-            </div>
-          </section>
+          <span class="ms" style="font-size: 22px; color: var(--hs-fg-3);">videocam</span>
+          <div style="flex: 1; font-size: 13px; color: var(--hs-fg-2);">
+            Cameras are managed on the Cameras page.
+          </div>
+          <.link navigate={~p"/cameras"} class="hs-btn hs-btn--secondary">Open Cameras</.link>
         </div>
       </main>
     </Layouts.app>

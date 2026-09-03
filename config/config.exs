@@ -67,9 +67,20 @@ config :logger, :default_formatter,
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
 
-# Keep the HA integration token (accepted as `?access_token=` on media URLs)
-# and raw SDP out of request logs. Default only filters "password".
-config :phoenix, :filter_parameters, ["password", "access_token", "token", "sdp"]
+# Keep credentialed values out of request logs; the default list only
+# covers "password". "access_token" is the HA integration token, accepted
+# as `?access_token=` on media URLs; "token" and "sdp" cover the WebRTC
+# signaling params. "rtsp_url" and "substream_url" are the two camera-form
+# params that can carry a full `rtsp://user:pass@host/...` URL — one for
+# each stream a camera can configure.
+config :phoenix, :filter_parameters, [
+  "password",
+  "access_token",
+  "token",
+  "sdp",
+  "rtsp_url",
+  "substream_url"
+]
 
 # Extra MIME types the HA `/api` surface negotiates: SSE for the event feed
 # and SDP for the WHEP WebRTC offer/answer. Registering them lets the `:api`

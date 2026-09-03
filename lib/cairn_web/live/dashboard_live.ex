@@ -85,10 +85,11 @@ defmodule CairnWeb.DashboardLive do
       Cairn.CameraStatus.subscribe()
       Cairn.Event.subscribe()
       Cairn.Retention.subscribe()
+      Cairn.Config.Server.subscribe()
       # One topic per camera, so a busy camera's frames never wake a socket
-      # that is not showing it. The set is fixed for the socket's life: this
-      # page reads the camera list once at mount and a config reload does not
-      # reach it either.
+      # that is not showing it. The set is fixed only within one mount: a
+      # config change re-mounts the whole page (`handle_info/2` below), which
+      # re-reads the camera list and re-subscribes these per-camera topics.
       Enum.each(cameras, &LiveDetections.subscribe(&1.id))
     end
 
@@ -216,6 +217,14 @@ defmodule CairnWeb.DashboardLive do
   # rate that gap is visible.
   def handle_info({:detections, camera_id, detections}, socket) do
     {:noreply, update(socket, :detections, &Map.put(&1, camera_id, detections))}
+  end
+
+  # A config change can add, remove or reorder cameras — cheaper to re-mount
+  # than to reconcile every assign (`@cameras`, the per-camera detection
+  # subscriptions, `@statuses`) against a diff this page does not otherwise
+  # need to understand.
+  def handle_info({:config_changed, _diff}, socket) do
+    {:noreply, push_navigate(socket, to: ~p"/")}
   end
 
   # The `"events"` topic also carries the per-object track lifecycle, and
@@ -495,9 +504,9 @@ defmodule CairnWeb.DashboardLive do
           <div style="font-size: 15px; font-weight: 500; color: var(--hs-fg-1);">
             No cameras yet
           </div>
-          <div style="font-size: 13px; color: var(--hs-fg-3);">
-            Add one to <code>config.yml</code> and reload.
-          </div>
+          <.link id="empty-state-add" navigate={~p"/cameras/new"} class="hs-btn hs-btn--primary">
+            Add camera
+          </.link>
         </div>
 
         <section
@@ -595,8 +604,13 @@ defmodule CairnWeb.DashboardLive do
               </div>
             </div>
             <div style="display: flex; align-items: center; gap: 10px; padding: 10px 12px;">
-              <h2 style="margin: 0; font-family: var(--hs-font-mono); font-size: 13px; font-weight: 500; color: var(--hs-fg-1);">
-                {cam.id}
+              <h2 style="margin: 0; font-family: var(--hs-font-mono); font-size: 13px; font-weight: 500;">
+                <.link
+                  navigate={~p"/cameras/#{cam.id}/edit"}
+                  style="color: var(--hs-fg-1); text-decoration: none;"
+                >
+                  {cam.id}
+                </.link>
               </h2>
               <.detection_chip camera_id={cam.id} status={detection(@statuses, cam.id)} />
               <div style="flex: 1;"></div>

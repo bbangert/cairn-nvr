@@ -3,6 +3,8 @@ defmodule CairnWeb.DashboardLiveTest do
 
   import Phoenix.LiveViewTest
 
+  @fixture "test/support/fixtures/configs/valid.yml"
+
   test "renders a tile per configured camera", %{conn: conn} do
     {:ok, _view, html} = live(conn, "/")
 
@@ -10,6 +12,48 @@ defmodule CairnWeb.DashboardLiveTest do
     assert html =~ "camera-tile-cam_b"
     assert html =~ ~s(data-camera-id="cam_a")
     assert html =~ "/hls/cam_a/index.m3u8"
+  end
+
+  test "the tile heading links to the camera's edit page", %{conn: conn} do
+    {:ok, _view, html} = live(conn, "/")
+
+    assert html =~ ~s(href="/cameras/cam_a/edit")
+    assert html =~ ~s(href="/cameras/cam_b/edit")
+  end
+
+  # No injection seam here (mount reads `Config.Server.get().cameras`
+  # straight off the singleton) — reached the same way the ConfigLive empty
+  # fleet is: rewrite the fixture, reload the actual server, restore after.
+  test "the empty fleet offers an add-camera link instead of a reload hint", %{conn: conn} do
+    original = File.read!(@fixture)
+
+    on_exit(fn ->
+      File.write!(@fixture, original)
+      Cairn.Config.Server.reload()
+    end)
+
+    File.write!(@fixture, "data_dir: tmp/cairn_test_data\ncameras: []\n")
+    {:ok, _diff, _warnings} = Cairn.Config.Server.reload()
+
+    {:ok, _view, html} = live(conn, "/")
+
+    assert html =~ "empty-state"
+    assert html =~ ~s(id="empty-state-add")
+    assert html =~ ~s(href="/cameras/new")
+  end
+
+  test "a config change redirects the dashboard so it re-mounts with the new fleet", %{
+    conn: conn
+  } do
+    {:ok, view, _html} = live(conn, "/")
+
+    Phoenix.PubSub.local_broadcast(
+      Cairn.PubSub,
+      Cairn.Config.topic(),
+      {:config_changed, %{added: [], removed: [], changed: [], refreshed: []}}
+    )
+
+    assert_redirect(view, "/")
   end
 
   test "camera status updates live", %{conn: conn} do

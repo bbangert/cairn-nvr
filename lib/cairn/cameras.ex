@@ -28,7 +28,8 @@ defmodule Cairn.Cameras do
   @typedoc """
   What `Cairn.Config.Server.update/3` answers: the applied diff and its
   warnings, the validator's errors, or the write's own failure (a changeset,
-  `:not_found`, a DB fault).
+  `:not_found`, a DB fault, or — `Cairn.ConfigSource.reimport/1`'s own
+  reasons — `{:yaml, errors}` and `:no_cameras`).
   """
   @type write_result ::
           {:ok, Cairn.Config.Server.diff(), [String.t()]}
@@ -185,13 +186,17 @@ defmodule Cairn.Cameras do
   # Keyed on the row delete and never on `diff.removed` (D-P8): a skipped or
   # disabled camera is absent from the config too, and it must keep its
   # control override and last status. Event rows and clip files stay under
-  # the old id until retention sweeps them.
-  defp prune_runtime(id) do
+  # the old id until retention sweeps them. Public for the one other path
+  # that deletes rows, `Cairn.ConfigSource.reimport/1`.
+  @doc false
+  @spec prune_runtime(String.t()) :: :ok
+  def prune_runtime(id) do
     remaining = Enum.map(list(), & &1.id)
     CameraStatus.prune(remaining)
     CameraControl.prune(remaining)
     PresenceCheckpoint.delete(id)
     EventCheckpoint.delete(id)
+    :ok
   end
 
   defp next_position do
@@ -229,18 +234,26 @@ defmodule Cairn.Cameras do
           ["camera #{camera.id}: dropped unknown key #{inspect(key)}" | acc]
         end)
 
-      # The zones column rides out as the `"zones"` key the parser validates:
-      # stored string-keyed, rendered as-is, judged by `Cairn.Zones` on every
-      # load like any other camera key.
-      map =
-        camera.settings
-        |> Map.take(known)
-        |> Map.put("id", camera.id)
-        |> Map.put("zones", camera.zones)
-
-      {map, warnings}
+      {render_row(camera), warnings}
     end)
     |> then(fn {maps, warnings} -> {maps, Enum.reverse(warnings)} end)
+  end
+
+  @doc """
+  One row as the YAML-shaped camera map the parser reads. Public because the
+  edit form renders a candidate row it has not written yet and must go
+  through the same key filter a load does.
+
+  The zones column rides out as the `"zones"` key the parser validates:
+  stored string-keyed, rendered as-is, judged by `Cairn.Zones` on every load
+  like any other camera key.
+  """
+  @spec render_row(%{id: String.t(), settings: map(), zones: [map()]}) :: map()
+  def render_row(%{id: id, settings: settings, zones: zones}) do
+    settings
+    |> Map.take(Config.Camera.known_keys())
+    |> Map.put("id", id)
+    |> Map.put("zones", zones)
   end
 
   @doc """

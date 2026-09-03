@@ -1,5 +1,6 @@
 defmodule Cairn.CamerasTest do
-  # async: false — this file will later host a private Config.Server.
+  # async: false — several describe blocks here start a private,
+  # DB-backed Config.Server (see the "writes" setup below).
   use Cairn.DataCase, async: false
 
   alias Cairn.Cameras

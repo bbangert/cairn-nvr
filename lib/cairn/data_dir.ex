@@ -4,14 +4,48 @@ defmodule Cairn.DataDir do
   `events/`, `snapshots/`, `log/`. All mutable state lives under this root.
   """
 
+  require Logger
+
   @subdirs ~w(events snapshots log)
 
-  @doc "Creates the data dir and its subdirs. Raises on failure."
+  @doc """
+  Creates the data dir (mode 0700, closing the window before the chmod
+  below) and its subdirs. Raises on failure — a data dir that cannot be
+  created is a boot the node has no business continuing.
+  """
   @spec ensure!(Path.t()) :: :ok
   def ensure!(data_dir) do
-    Enum.each([data_dir | Enum.map(@subdirs, &Path.join(data_dir, &1))], &File.mkdir_p!/1)
+    File.mkdir_p!(data_dir)
+    File.chmod(data_dir, 0o700)
+    Enum.each(Enum.map(@subdirs, &Path.join(data_dir, &1)), &File.mkdir_p!/1)
     # ffmpeg/plugin logs can echo credentialed URLs — keep them private
     File.chmod(log_dir(data_dir), 0o700)
+    secure_db(data_dir)
+    :ok
+  end
+
+  @doc """
+  Tightens `cairn.db` and its WAL/SHM siblings to 0600 wherever they already
+  exist — the DB holds camera rows with RTSP userinfo, so it gets the same
+  treatment as the log dir. Never creates a file; a missing one is skipped,
+  not an error. Never raises: a chmod an operator's restored backup or
+  volume permissions refuse (EPERM) is logged and left as is, not a reason
+  to crash-loop the boot.
+  """
+  @spec secure_db(Path.t()) :: :ok
+  def secure_db(data_dir) do
+    db = db_path(data_dir)
+
+    for path <- [db, db <> "-wal", db <> "-shm"], File.exists?(path) do
+      case File.chmod(path, 0o600) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning("could not chmod #{path} to 0600: #{:file.format_error(reason)}")
+      end
+    end
+
     :ok
   end
 

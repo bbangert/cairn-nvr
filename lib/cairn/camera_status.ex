@@ -9,8 +9,9 @@ defmodule Cairn.CameraStatus do
   a bridge camera's own connect/backoff, by `Cairn.FFmpegPort` — the split is
   stated in the owner's moduledoc. The detector's health, which the in-VM
   native block reports with no process of its own, comes from
-  `Cairn.Native.Status`. Read by the dashboard and config LiveViews and by the
-  HA API.
+  `Cairn.Native.Status`. Read by the dashboard and cameras LiveViews and by
+  the HA API — `CairnWeb.ConfigLive` shows globals and the import marker
+  only, not per-camera status.
   """
 
   use GenServer

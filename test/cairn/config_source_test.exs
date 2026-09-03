@@ -6,6 +6,7 @@ defmodule Cairn.ConfigSourceTest do
   alias Cairn.Cameras
   alias Cairn.Cameras.Camera
   alias Cairn.Cameras.Setting
+  alias Cairn.CameraStatus
   alias Cairn.Config
   alias Cairn.ConfigSource
   alias Cairn.{Event, Events, Retention}
@@ -628,6 +629,119 @@ defmodule Cairn.ConfigSourceTest do
       seed_event(dir, "cam_b", 30)
       # The unguarded string would raise inside `Enum.max` here.
       assert is_integer(Retention.run_prune(config))
+    end
+  end
+
+  describe "reimport" do
+    setup %{dir: dir} do
+      path =
+        write_yaml!(dir, """
+        #{globals(dir)}
+        cameras:
+          - id: cam_a
+            rtsp_url: rtsp://yaml/1
+          - id: cam_b
+            rtsp_url: rtsp://yaml/2
+        """)
+
+      # Rows that differ from the file, under a marker whose hash the file no
+      # longer matches: the "changed since they were imported" state.
+      insert_camera!("cam_a", 0, %{"rtsp_url" => "rtsp://rows/1"})
+      insert_camera!("cam_z", 1, %{"rtsp_url" => "rtsp://rows/z"})
+      mark_imported!(path)
+
+      server = private_server(path)
+      Application.put_env(:cairn, :config_server, server)
+      on_exit(fn -> Application.delete_env(:cairn, :config_server) end)
+
+      %{path: path, server: server}
+    end
+
+    test "replaces the rows with the file's cameras and re-arms the marker", %{
+      path: path,
+      server: server
+    } do
+      assert {:ok, _config, warnings, %{}} = ConfigSource.load(path)
+      assert Enum.any?(warnings, &(&1 =~ "changed since they were imported"))
+
+      CameraStatus.set("cam_z", :running)
+
+      assert {:ok, %{added: ["cam_b"], removed: ["cam_z"], changed: ["cam_a"]}, _warnings} =
+               ConfigSource.reimport(path)
+
+      assert Enum.map(Cameras.list(), &{&1.id, &1.settings["rtsp_url"]}) == [
+               {"cam_a", "rtsp://yaml/1"},
+               {"cam_b", "rtsp://yaml/2"}
+             ]
+
+      assert Enum.map(Config.Server.get(server).cameras, & &1.id) == ["cam_a", "cam_b"]
+
+      # The marker now hashes the file's list, so the next load is quiet.
+      assert {:ok, _config, warnings, %{}} = ConfigSource.load(path)
+      refute Enum.any?(warnings, &(&1 =~ "changed since"))
+      assert Enum.any?(warnings, &(&1 =~ "still lists cameras:"))
+
+      # A row the file no longer lists loses its runtime state like a delete.
+      _status = :sys.get_state(CameraStatus)
+      assert CameraStatus.get("cam_z").status == :unknown
+    end
+
+    test "a file that fails to load replaces nothing", %{dir: dir, path: path} do
+      File.write!(path, globals(dir) <> "cameras: [{id: broken}]\n")
+
+      assert {:error, {:write, {:yaml, errors}}} = ConfigSource.reimport(path)
+      assert Enum.any?(errors, &(&1 =~ "rtsp_url is required"))
+      assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
+    end
+
+    test "a file with no cameras to import is refused rather than emptying the fleet", %{
+      dir: dir,
+      path: path
+    } do
+      File.write!(path, globals(dir))
+      assert {:error, {:write, :no_cameras}} = ConfigSource.reimport(path)
+      assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
+    end
+  end
+
+  describe "describe_import_error/1" do
+    # The rescue clause this backs (`load/1`'s `Ecto.InvalidChangesetError` /
+    # `Ecto.ConstraintError` arm) is not reachable through `load/1` or
+    # `reimport/1` with today's data: both validate the whole YAML with
+    # `Config.from_map/1` — using the same id regex, the same required
+    # fields — before either ever calls `Repo.insert!`, so nothing that
+    # would fail `Camera.changeset/2` gets past `from_map/1` first. A
+    # concurrent double-import racing the same id past both checks would
+    # reach it, but that is not a deterministic scenario to provoke in a
+    # test. `describe_import_error/1` is `@doc false` rather than private
+    # for exactly this: it is exercised directly, against constructed
+    # exceptions, rather than through the rescue.
+    test "an invalid-changeset error never carries the changeset's own credentialed values" do
+      changeset =
+        %Camera{}
+        |> Camera.changeset(%{
+          id: "bad id",
+          position: 0,
+          settings: %{"rtsp_url" => "rtsp://u:SECRET@h/1"}
+        })
+
+      message =
+        ConfigSource.describe_import_error(%Ecto.InvalidChangesetError{changeset: changeset})
+
+      refute message =~ "SECRET"
+      assert message =~ "id"
+    end
+
+    test "a constraint error names only the constraint" do
+      message =
+        ConfigSource.describe_import_error(%Ecto.ConstraintError{
+          constraint: "cameras_id_index",
+          type: :unique,
+          message: "rtsp://u:SECRET@h/1 violates unique constraint"
+        })
+
+      refute message =~ "SECRET"
+      assert message == "constraint cameras_id_index failed"
     end
   end
 

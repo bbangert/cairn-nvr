@@ -38,7 +38,7 @@ defmodule CairnWeb.Layouts do
   # rather than a literal.
   attr :page, :atom,
     default: nil,
-    doc: "which topbar nav item is active (:dashboard | :events | :tracks | :config)"
+    doc: "which topbar nav item is active (:dashboard | :events | :tracks | :cameras | :config)"
 
   slot :inner_block, required: true
 
@@ -61,6 +61,12 @@ defmodule CairnWeb.Layouts do
           </.link>
           <.link navigate={~p"/tracks"} class={["cairn-nav", @page == :tracks && "cairn-nav--active"]}>
             <span class="ms" style="font-size: 19px;">route</span>Tracks
+          </.link>
+          <.link
+            navigate={~p"/cameras"}
+            class={["cairn-nav", @page == :cameras && "cairn-nav--active"]}
+          >
+            <span class="ms" style="font-size: 19px;">video_settings</span>Cameras
           </.link>
           <.link navigate={~p"/config"} class={["cairn-nav", @page == :config && "cairn-nav--active"]}>
             <span class="ms" style="font-size: 19px;">tune</span>Config

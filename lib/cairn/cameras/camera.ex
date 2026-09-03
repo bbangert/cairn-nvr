@@ -17,7 +17,9 @@ defmodule Cairn.Cameras.Camera do
   schema "cameras" do
     field :position, :integer
     field :enabled, :boolean, default: true
-    field :settings, :map, default: %{}
+    # Holds the RTSP URLs with their passwords: redacted from `inspect/1`
+    # so a logged or rendered changeset cannot carry them.
+    field :settings, :map, default: %{}, redact: true
     field :zones, {:array, :map}, default: []
 
     timestamps(type: :utc_datetime_usec)

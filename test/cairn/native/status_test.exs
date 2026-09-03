@@ -118,6 +118,28 @@ defmodule Cairn.Native.StatusTest do
       refute published(reporter, id)
     end
 
+    # Phase-1 review: `Cairn.Cameras.delete/1` prunes `CameraStatus`
+    # synchronously, but a tick that still finds the id in `status.streams`
+    # would otherwise re-merge and undo that prune. The merge set is the
+    # union of configured cameras and open streams (`status.ex:104-114`), so
+    # an id dropped from config alone is not enough — it clears only once
+    # its stream also closes, which is what this pins on both sides.
+    test "a deleted id's status is not re-merged once its stream is also gone", %{id: id} do
+      %{host: host, reporter: reporter} =
+        start_stack(status: [config_source: detecting([])])
+
+      {:ok, _epoch} = Host.open_stream(host, id, %{})
+
+      # Absent from `configured/1` (as a deleted camera's id would be), but
+      # still reported while the engine's own stream stays open.
+      assert published(reporter, id)
+
+      :ok = Host.close_stream(host, id)
+      # Absent from both sets now: the next tick clears it rather than
+      # keeping the last status for the rest of the node's life.
+      refute published(reporter, id)
+    end
+
     # `docs/ha-api.md`: responses never emit on-disk paths, and this map is
     # served verbatim by the camera list and the SSE `camera_status` frame.
     test "the model reaches the surface as a name, never as a path", %{id: id} do
