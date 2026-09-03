@@ -40,6 +40,16 @@ defmodule CairnWeb.CameraCardsTest do
       assert CameraCards.mask_url("rtsp://:secret@host/s") == "rtsp://:•••••@host/s"
     end
 
+    # A colonless userinfo is `credentialed?/1`-true, so the form refuses to
+    # prefill it; rendering it verbatim in the row would hand back what the
+    # form withheld. Which half of `user:pass` it is cannot be known, so all
+    # of it goes.
+    test "hides a colonless userinfo whole" do
+      assert CameraCards.mask_url("rtsp://SECRET@host/s") == "rtsp://•••••@host/s"
+      refute CameraCards.mask_url("rtsp://SECRET@host/s") =~ "SECRET"
+      assert CameraCards.credentialed?("rtsp://SECRET@host/s")
+    end
+
     test "hides credential query params (http-flv style)" do
       assert CameraCards.mask_url(
                "http://10.0.0.5/flv?port=1935&stream=ch0&user=admin&password=hunter2"

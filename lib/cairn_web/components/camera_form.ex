@@ -141,6 +141,8 @@ defmodule CairnWeb.CameraForm do
   credential rule leaves it blank on purpose), and a typed password is
   spliced into that saved URL whether or not it already carries userinfo.
   Its keys that no field here models are carried through untouched.
+  `clear_substream` is the one way past that keep: checked, `substream_url`
+  is omitted whatever the field holds.
   """
   @spec to_settings(map(), Camera.t() | nil) :: {:ok, map()} | {:error, [String.t()]}
   def to_settings(params, saved \\ nil) do
@@ -246,7 +248,7 @@ defmodule CairnWeb.CameraForm do
     saved
     |> Map.drop(@modelled_keys)
     |> put_url("rtsp_url", params, saved)
-    |> put_url("substream_url", params, saved)
+    |> put_substream(params, saved)
     |> put_present("plugin", params)
     |> put_present("ingest", params)
     |> put_present("tracker", params)
@@ -343,6 +345,17 @@ defmodule CairnWeb.CameraForm do
       |> Map.new(fn row -> {row["label"], %{"min_score" => number(row[key])}} end)
 
     if tier == %{}, do: acc, else: Map.put(acc, key, tier)
+  end
+
+  # A blank URL field keeps the saved URL (the credential rule blanks it on
+  # purpose), so a sub stream cannot be removed by clearing the field —
+  # "Remove sub stream" is the act that drops the key, whatever the field
+  # holds. Omitted, not written empty: absent is how the parser reads "no sub
+  # stream".
+  defp put_substream(acc, params, saved) do
+    if trimmed(params, "clear_substream") in ["true", "on"],
+      do: acc,
+      else: put_url(acc, "substream_url", params, saved)
   end
 
   defp put_url(acc, key, params, saved) do
@@ -717,6 +730,7 @@ defmodule CairnWeb.CameraForm do
   attr :restart_predicted, :boolean, required: true
   attr :camera_id, :string, required: true
   attr :password_gen, :integer, required: true
+  attr :saved_substream, :boolean, required: true
 
   def camera_form(assigns) do
     ~H"""
@@ -736,6 +750,7 @@ defmodule CairnWeb.CameraForm do
             field_errors={@field_errors}
             plugins={@plugins}
             password_gen={@password_gen}
+            saved_substream={@saved_substream}
           />
           <.tier_rows rows={@rows} field_errors={@field_errors} known_labels={@known_labels} />
           <.windows_fields form={@form} field_errors={@field_errors} />
@@ -771,6 +786,7 @@ defmodule CairnWeb.CameraForm do
   attr :field_errors, :map, required: true
   attr :plugins, :list, required: true
   attr :password_gen, :integer, required: true
+  attr :saved_substream, :boolean, required: true
 
   defp stream_fields(assigns) do
     ~H"""
@@ -812,6 +828,28 @@ defmodule CairnWeb.CameraForm do
         field_errors={@field_errors}
         help="optional; must be rtsp://"
       />
+      <%!-- A blank URL field means "keep the saved one" (the credential rule
+            blanks it on purpose), so removing a sub stream needs its own act.
+            No hidden companion field: unchecked has to send nothing, or every
+            form would arrive dirty. Only where there is one to remove. --%>
+      <div
+        :if={@mode == "edit" and @saved_substream}
+        class="hs-field"
+        data-restart="true"
+        style={field_style()}
+      >
+        <label for="camera-clear-substream" style={label_style()}>
+          <input
+            id="camera-clear-substream"
+            type="checkbox"
+            class="hs-tog"
+            name="camera[clear_substream]"
+            value="true"
+            checked={@form.params["clear_substream"] in ["true", "on", true]}
+          /> Remove sub stream<.restart_chip />
+        </label>
+        <span style={help_style()}>the saved sub stream URL is dropped on save</span>
+      </div>
       <.text_field
         form={@form}
         field="username"

@@ -298,13 +298,30 @@ defmodule Cairn.Config.ServerUpdateTest do
       ExUnit.CaptureLog.capture_log(fn ->
         assert {:ok, %{added: ["cam_a"]}, _warnings} =
                  Config.Server.update(server, insert_fun("cam_a", "full"),
-                   after_apply: fn _diff -> raise "boom" end
+                   after_apply: fn _diff -> raise "rtsp://user:hunter2@host" end
                  )
       end)
 
-    assert log =~ "after_apply raised: boom"
+    # the module only: an exception message can carry the changeset that
+    # failed, credentials included.
+    assert log =~ "after_apply raised: RuntimeError"
+    refute log =~ "hunter2"
     assert Process.alive?(server)
     assert [%{id: "cam_a"}] = Config.Server.get(server).cameras
+  end
+
+  test "a callback that exits logs the reason's shape only", %{server: server} do
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, %{added: ["cam_a"]}, _warnings} =
+                 Config.Server.update(server, insert_fun("cam_a", "full"),
+                   after_apply: fn _diff -> exit({:shutdown, "rtsp://user:hunter2@host"}) end
+                 )
+      end)
+
+    assert log =~ "after_apply exit: non-atom exit"
+    refute log =~ "hunter2"
+    assert Process.alive?(server)
   end
 
   test "a callback that is not a 1-arity fun is refused before the write", %{server: server} do

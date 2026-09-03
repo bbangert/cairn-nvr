@@ -65,6 +65,16 @@ defmodule CairnWeb.CamerasLive do
     end
   end
 
+  # On the new page `camera_id` is not an identity: it holds whatever the
+  # operator has typed into the id field, so comparing it would call a `?tab=`
+  # patch a different form and discard the typed values. There is only ever
+  # one new form, so the mode is the whole of the question. On edit the id is
+  # the row's and fixed, and a patch to another camera must re-initialize.
+  defp same_form?(socket, nil, mode), do: socket.assigns[:mode] == mode
+
+  defp same_form?(socket, camera, mode),
+    do: socket.assigns[:mode] == mode and socket.assigns[:camera_id] == camera.id
+
   # `?tab=` defaults to `scan` in the contract, but discovery is phase 5: until
   # it lands a missing tab shows the form, which is the only tab that works.
   defp tab(%{"tab" => "scan"}), do: :scan
@@ -73,7 +83,7 @@ defmodule CairnWeb.CamerasLive do
   # A tab patch re-runs `handle_params`; re-initializing there would throw away
   # what the operator has typed.
   defp init_form(socket, camera, mode) do
-    if socket.assigns[:mode] == mode and socket.assigns[:camera_id] == (camera && camera.id) do
+    if same_form?(socket, camera, mode) do
       socket
     else
       socket
@@ -134,6 +144,12 @@ defmodule CairnWeb.CamerasLive do
       stale_notice: false
     )
   end
+
+  # Whether there is a sub stream to remove: the "Remove sub stream" checkbox
+  # renders only for a row that has one, because a blank field means "keep"
+  # and there is nothing to keep otherwise.
+  defp saved_substream?(saved),
+    do: is_map(saved) and is_binary(saved.settings["substream_url"])
 
   # The sub row is rendered only when there is a sub stream to probe, which
   # `:absent` is how the markup is told.
@@ -354,11 +370,7 @@ defmodule CairnWeb.CamerasLive do
     end
   end
 
-  defp refresh_row(socket, nil) do
-    socket
-    |> put_flash(:error, "#{socket.assigns.camera_id} was removed in another session")
-    |> push_navigate(to: ~p"/cameras")
-  end
+  defp refresh_row(socket, nil), do: removed_elsewhere(socket)
 
   # Most `{:config_changed, _}` messages are about some other camera on the
   # node, and this row is then byte-identical to the one already on screen:
@@ -371,6 +383,14 @@ defmodule CairnWeb.CamerasLive do
       Enum.empty?(socket.assigns.dirty) -> reinit_form(socket, camera)
       true -> assign(socket, stale_notice: true)
     end
+  end
+
+  # The row is gone — deleted in another session — so there is nothing to edit
+  # and nothing a save could land on. Both callers leave the page.
+  defp removed_elsewhere(socket) do
+    socket
+    |> put_flash(:error, "#{socket.assigns.camera_id} was removed in another session")
+    |> push_navigate(to: ~p"/cameras")
   end
 
   # `position` is deliberately out: a reorder elsewhere changes nothing this
@@ -623,9 +643,19 @@ defmodule CairnWeb.CamerasLive do
       |> put_flash(:info, "added #{socket.assigns.camera_id}")
       |> push_navigate(to: ~p"/cameras")
     else
-      socket
-      |> reinit_form(Cameras.get(socket.assigns.camera_id))
-      |> assign(saving?: false, save_result: done(result(result)))
+      # The row can be gone: another session may have deleted it between this
+      # write committing and this answer arriving, and `reinit_form/2` has no
+      # row to render. Same exit as `refresh_row/2`'s — there is nothing left
+      # to edit.
+      case Cameras.get(socket.assigns.camera_id) do
+        nil ->
+          removed_elsewhere(socket)
+
+        camera ->
+          socket
+          |> reinit_form(camera)
+          |> assign(saving?: false, save_result: done(result(result)))
+      end
     end
   end
 
@@ -928,6 +958,7 @@ defmodule CairnWeb.CamerasLive do
           restart_predicted={@restart_predicted?}
           camera_id={@camera_id}
           password_gen={@password_gen}
+          saved_substream={saved_substream?(@saved)}
         />
 
         <div :if={@mode == "edit"} style="display: flex; flex-direction: column; gap: 10px;">

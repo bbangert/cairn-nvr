@@ -41,9 +41,8 @@ defmodule Cairn.CameraControlTest do
     CameraControl.set(keep, %{detection_enabled: false})
     CameraControl.set(drop, %{detection_enabled: false})
 
+    # prune is a call, so its deletes are visible to these ETS reads.
     CameraControl.prune([keep])
-    # prune is a cast; force ordering with a synchronous call
-    _ = CameraControl.set(keep, %{detection_enabled: false})
 
     assert CameraControl.get(keep).detection_enabled == false
 

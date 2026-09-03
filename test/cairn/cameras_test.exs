@@ -307,6 +307,9 @@ defmodule Cairn.CamerasTest do
 
       CameraStatus.set("cam1", :running)
       CameraStatus.set("cam2", :running)
+      # set/2 is a cast; flush it so what the reads below see is the prune's
+      # doing and not a write still in flight.
+      _flush = :sys.get_state(CameraStatus)
       CameraControl.set("cam1", %{detection_enabled: false})
       event = %Event{id: Ecto.UUID.generate(), camera_id: "cam1", started_at: DateTime.utc_now()}
       PresenceCheckpoint.put("cam1", event, [], nil)
@@ -314,10 +317,6 @@ defmodule Cairn.CamerasTest do
 
       assert {:ok, %{removed: ["cam1"]}, []} = Cameras.delete("cam1")
 
-      # `prune/1` is a cast on each owner; a call to each is what orders the
-      # prune before these reads, which go to ETS and not through the owner.
-      _status = :sys.get_state(CameraStatus)
-      _control = :sys.get_state(CameraControl)
       assert CameraStatus.get("cam1").status == :unknown
       assert CameraStatus.all()["cam2"].status == :running
 
@@ -347,12 +346,12 @@ defmodule Cairn.CamerasTest do
                Cameras.create(%{"id" => "cam1", "settings" => %{"rtsp_url" => "rtsp://h/1"}})
 
       CameraStatus.set("cam1", :running)
+      # set/2 is a cast; flush it before the write whose prune must spare it.
+      _flush = :sys.get_state(CameraStatus)
       CameraControl.set("cam1", %{detection_enabled: false})
 
       assert {:ok, %{removed: ["cam1"]}, []} = Cameras.set_enabled("cam1", false)
 
-      _status = :sys.get_state(CameraStatus)
-      _control = :sys.get_state(CameraControl)
       assert CameraStatus.get("cam1").status == :running
       assert CameraControl.get("cam1").detection_enabled == false
     end

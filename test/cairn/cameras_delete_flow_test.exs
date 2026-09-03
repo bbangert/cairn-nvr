@@ -90,9 +90,9 @@ defmodule Cairn.CamerasDeleteFlowTest do
   # camera tree, per `camera_supervisor.ex:127`), and asserts the
   # `:presence_cleared` broadcast. Not duplicated here.
 
-  # CameraStatus and CameraControl reading back the empty shape after delete,
-  # synced with :sys.get_state, is `Cairn.CamerasTest`'s "delete prunes
-  # status, control and checkpoints" — not repeated here.
+  # CameraStatus and CameraControl reading back the empty shape after delete
+  # is `Cairn.CamerasTest`'s "delete prunes status, control and checkpoints" —
+  # not repeated here.
 
   # The prune is `Config.Server.update/3`'s `after_apply:`, run in the config
   # server before the call returns — so this asserts the server-owned path,

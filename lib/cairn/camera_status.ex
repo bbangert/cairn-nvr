@@ -66,9 +66,15 @@ defmodule Cairn.CameraStatus do
   @spec all() :: %{String.t() => map()}
   def all, do: Map.new(:ets.tab2list(@table))
 
-  @doc "Removes status for cameras no longer configured (on reload)."
+  @doc """
+  Removes status for cameras no longer configured (on reload).
+
+  A call, not a cast: this runs as a delete's `after_apply` inside the config
+  server, and a queued cast could be handled *after* a same-id re-create's
+  first writes and wipe them.
+  """
   @spec prune([String.t()]) :: :ok
-  def prune(known_camera_ids), do: GenServer.cast(__MODULE__, {:prune, known_camera_ids})
+  def prune(known_camera_ids), do: GenServer.call(__MODULE__, {:prune, known_camera_ids})
 
   @impl true
   def init(_opts) do
@@ -87,11 +93,12 @@ defmodule Cairn.CameraStatus do
     {:noreply, state}
   end
 
-  def handle_cast({:prune, known}, state) do
+  @impl true
+  def handle_call({:prune, known}, _from, state) do
     for {camera_id, _} <- :ets.tab2list(@table), camera_id not in known do
       :ets.delete(@table, camera_id)
     end
 
-    {:noreply, state}
+    {:reply, :ok, state}
   end
 end

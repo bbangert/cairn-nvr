@@ -301,6 +301,44 @@ defmodule CairnWeb.ConfigLiveTest do
       refute html =~ "config-reimport"
     end
 
+    # `disabled` in the markup only stops the first click's own button; a
+    # stale DOM or a hand-sent event still arrives. The discriminator is the
+    # task, not the render: `start_async` links its process to the LiveView,
+    # so a second re-import would show as a second link. The server this test
+    # installs applies slowly on purpose — otherwise the first task could
+    # finish between the two clicks and the second would be legitimate.
+    test "a second re-import click while one is running starts no second task", %{
+      conn: conn,
+      path: path
+    } do
+      slow =
+        start_supervised!(
+          {Config.Server,
+           path: path,
+           name: nil,
+           source: {ConfigSource, :load},
+           apply_diff: fn _diff, _config -> Process.sleep(300) end,
+           apply_native: fn _config -> :ok end},
+          id: :config_live_reimport_slow_server
+        )
+
+      Application.put_env(:cairn, :config_server, slow)
+
+      {:ok, view, _html} = live(conn, "/config")
+
+      links = fn -> view.pid |> Process.info(:links) |> elem(1) |> length() end
+      idle = links.()
+
+      render_click(view, "reimport")
+      assert links.() == idle + 1
+
+      render_click(view, "reimport")
+      assert links.() == idle + 1
+
+      html = render_async(view, 2_000)
+      assert html =~ "Cameras re-imported from config.yml — changes are live"
+    end
+
     test "a file that fails to load shows the re-import failure headline, not the reload one", %{
       conn: conn,
       path: path

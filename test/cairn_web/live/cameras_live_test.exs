@@ -484,6 +484,52 @@ defmodule CairnWeb.CamerasLiveTest do
       assert Cameras.get("cam1").settings["rtsp_url"] == "rtsp://h/2"
     end
 
+    # A blank URL field means "keep the saved one", so the box is the only way
+    # to remove a sub stream at all.
+    test "Remove sub stream drops the saved sub URL and restarts the camera", %{conn: conn} do
+      create!("cam1", %{"rtsp_url" => "rtsp://h/1", "substream_url" => "rtsp://h/sub"})
+
+      {:ok, view, html} = live(conn, "/cameras/cam1/edit")
+      assert html =~ ~s(name="camera[clear_substream]")
+
+      view
+      |> form("#camera-form", camera: %{"clear_substream" => "true"})
+      |> render_submit()
+
+      html = render_async(view)
+
+      assert html =~ ~s(data-ok="true")
+      assert html =~ "restarted cam1"
+      refute Map.has_key?(Cameras.get("cam1").settings, "substream_url")
+    end
+
+    test "the Remove sub stream box is absent where there is nothing to remove", %{conn: conn} do
+      create!("cam1", %{"rtsp_url" => "rtsp://h/1"})
+
+      {:ok, _view, edit} = live(conn, "/cameras/cam1/edit")
+      refute edit =~ ~s(name="camera[clear_substream]")
+
+      {:ok, _view, new} = live(conn, "/cameras/new?tab=manual")
+      refute new =~ ~s(name="camera[clear_substream]")
+    end
+
+    # After a validate the new form's `camera_id` is the *typed* id, so an
+    # identity that reads it would call a tab patch a different form and
+    # re-initialize over the operator's work.
+    test "a tab patch keeps what was typed on the add page", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/cameras/new?tab=manual")
+
+      view
+      |> form("#camera-form", camera: %{"id" => "cam9", "rtsp_url" => "rtsp://h/9"})
+      |> render_change()
+
+      render_patch(view, "/cameras/new?tab=scan")
+      html = render_patch(view, "/cameras/new?tab=manual")
+
+      assert html =~ ~s(value="cam9")
+      assert html =~ ~s(value="rtsp://h/9")
+    end
+
     # No row to edit and no save that could land on one: `update/2` would
     # answer `:not_found`, so the page leaves rather than promising a write.
     test "a camera removed in another session sends the edit page back to the list",
@@ -495,6 +541,46 @@ defmodule CairnWeb.CamerasLiveTest do
       {:ok, _diff, _warnings} = Cameras.delete("cam1")
 
       assert flash = assert_redirect(view, "/cameras")
+      assert flash["error"] == "cam1 was removed in another session"
+    end
+
+    # The same removal, one step later: another session deletes the row while
+    # this save is applying, so the answer arrives for a camera that is gone
+    # and there is no row to re-render the form from. The window is real but
+    # narrow, so this server applies slowly on purpose — the delete lands
+    # inside it deterministically.
+    test "a camera deleted while the save applies sends the page back to the list", %{
+      conn: conn,
+      dir: dir
+    } do
+      path = Path.join(dir, "config.yml")
+
+      slow =
+        start_supervised!(
+          {Config.Server,
+           path: path,
+           name: nil,
+           source: {ConfigSource, :load},
+           apply_diff: fn _diff, _config -> Process.sleep(300) end,
+           apply_native: fn _config -> :ok end},
+          id: :cameras_live_slow_server
+        )
+
+      Application.put_env(:cairn, :config_server, slow)
+
+      create!("cam1")
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      view
+      |> form("#camera-form", camera: %{"rtsp_url" => "rtsp://h/2"})
+      |> render_submit()
+
+      # The write has committed and `apply_diff` is still sleeping: the row is
+      # there to delete and the LiveView has not been answered yet.
+      Repo.delete!(Cameras.get("cam1"))
+
+      assert flash = assert_redirect(view, "/cameras", 2_000)
       assert flash["error"] == "cam1 was removed in another session"
     end
 

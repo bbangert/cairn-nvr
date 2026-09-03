@@ -31,13 +31,23 @@ defmodule CairnWeb.CameraCards do
     unknown: %{label: "Unknown", color: "var(--hs-fg-3)"}
   }
 
-  @doc "Masks `rtsp://user:secret@host/…` and `…?password=x&user=y` forms."
+  @doc """
+  Masks `rtsp://user:secret@host/…`, `rtsp://secret@host/…` and
+  `…?password=x&user=y` forms.
+  """
   @spec mask_url(term()) :: String.t()
   def mask_url(url) when is_binary(url) do
     # The username may be empty (`rtsp://:secret@host`, which cameras that
     # authenticate on the password alone do accept), so `*` — requiring a
     # character there rendered the password in the clear.
-    masked = String.replace(url, ~r/(\/\/[^:\/@]*:)[^@\/]+@/, "\\1•••••@")
+    masked =
+      url
+      |> String.replace(~r/(\/\/[^:\/@]*:)[^@\/]+@/, "\\1•••••@")
+      # `rtsp://SECRET@host` — userinfo with no colon is a password to some
+      # cameras as readily as a username, and `credentialed?/1` already calls
+      # it a credential; the whole of it goes. Never matches what the pass
+      # above wrote: that leaves a colon in the userinfo.
+      |> String.replace(~r/\/\/[^:\/@]+@/, "//•••••@")
 
     case String.split(masked, "?", parts: 2) do
       [base, query] -> base <> "?" <> mask_query(query)

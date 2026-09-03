@@ -267,6 +267,37 @@ defmodule CairnWeb.CameraFormTest do
       assert settings["substream_url"] == "rtsp://cam.lan:554/sub"
     end
 
+    # A blank field means "keep" everywhere else, so without the checkbox the
+    # sub stream could never be removed at all.
+    test "clear_substream drops the sub stream a blank field would keep" do
+      row = rich_row()
+      params = CameraForm.to_params(row)
+
+      {:ok, kept} = params |> Map.put("substream_url", "") |> CameraForm.to_settings(row)
+      assert kept["substream_url"] == "rtsp://cam.lan:554/sub"
+
+      {:ok, cleared} =
+        params
+        |> Map.merge(%{"substream_url" => "", "clear_substream" => "true"})
+        |> CameraForm.to_settings(row)
+
+      refute Map.has_key?(cleared, "substream_url")
+    end
+
+    # Checked wins over a field the operator also typed into: the box is the
+    # act, the field is only text.
+    test "clear_substream drops a typed sub stream too" do
+      row = rich_row()
+
+      {:ok, settings} =
+        row
+        |> CameraForm.to_params()
+        |> Map.merge(%{"substream_url" => "rtsp://cam.lan/other", "clear_substream" => "true"})
+        |> CameraForm.to_settings(row)
+
+      refute Map.has_key?(settings, "substream_url")
+    end
+
     # The username field is prefilled off the *main* stream, so a prefill that
     # counted as "typed" would rewrite a sub stream nobody edited (D-P5).
     test "the prefilled username alone does not splice" do
@@ -587,6 +618,18 @@ defmodule CairnWeb.CameraFormTest do
   end
 
   describe "the markup" do
+    # No hidden companion field: an unchecked box has to send nothing, or
+    # every form would arrive dirty and a pristine refresh would stop working.
+    test "the Remove sub stream box renders only where there is one, with no hidden field" do
+      html = render_form(%{}, plugins: [], saved_substream: true)
+
+      assert html =~ ~s(id="camera-clear-substream")
+      assert html =~ "Remove sub stream"
+      refute html =~ ~s(type="hidden" name="camera[clear_substream]")
+
+      refute render_form(%{}, plugins: []) =~ ~s(name="camera[clear_substream]")
+    end
+
     test "the saved plugin group is an option even when the server named none" do
       html = render_form(%{"plugin" => "yard"}, plugins: [])
 
@@ -663,7 +706,8 @@ defmodule CairnWeb.CameraFormTest do
       password_gen: 0,
       saving: false,
       restart_predicted: false,
-      camera_id: "gate"
+      camera_id: "gate",
+      saved_substream: Keyword.get(opts, :saved_substream, false)
     )
   end
 

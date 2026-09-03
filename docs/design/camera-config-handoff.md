@@ -277,6 +277,7 @@ looks like), the prefilled-banner copy.
   <input name="camera[id]">                              <%!-- new: editable, [a-z0-9][a-z0-9_-]*; edit: read-only --%>
   <input name="camera[rtsp_url]">                        <%!-- restart --%>
   <input name="camera[substream_url]">                   <%!-- restart; optional --%>
+  <input type="checkbox" name="camera[clear_substream]"> <%!-- FIXED; restart; edit only, and only when the saved row has a sub URL: "Remove sub stream" (a blank field means keep) --%>
   <input name="camera[username]" autocomplete="off">     <%!-- restart (composes into the URLs) --%>
   <input name="camera[password]" type="password" autocomplete="new-password">  <%!-- restart; write-only, never value= --%>
   <select name="camera[plugin]">                         <%!-- restart; "" = no detection; options = plugin groups from config.yml --%>

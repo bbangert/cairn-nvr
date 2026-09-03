@@ -187,7 +187,10 @@ defmodule Cairn.Cameras do
   # control override and last status. Event rows and clip files stay under
   # the old id until retention sweeps them. Public for the one other path
   # that deletes rows, `Cairn.ConfigSource.reimport/1`; both call it from
-  # inside the config server, as that write's `after_apply:`.
+  # inside the config server, as that write's `after_apply:`. The two prunes
+  # are synchronous calls so they cannot be handled after a same-id re-create's
+  # first writes; that cannot deadlock, because neither owner ever calls
+  # `Cairn.Config.Server` (both are ETS + PubSub only).
   @doc false
   @spec prune_runtime(String.t()) :: :ok
   def prune_runtime(id) do

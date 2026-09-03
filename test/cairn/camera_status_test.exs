@@ -49,9 +49,10 @@ defmodule Cairn.CameraStatusTest do
     wait_until(fn -> CameraStatus.all()[id] && CameraStatus.all()[other] end)
 
     keep = Map.keys(CameraStatus.all()) -- [other]
+    # prune is a call: no wait here, the delete has happened when it returns.
     CameraStatus.prune(keep)
 
-    wait_until(fn -> CameraStatus.all()[other] == nil end)
+    assert CameraStatus.all()[other] == nil
     assert CameraStatus.all()[id]
   end
 

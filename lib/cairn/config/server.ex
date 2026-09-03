@@ -302,15 +302,24 @@ defmodule Cairn.Config.Server do
   # for the config server, and every camera it holds, to die on a save that
   # succeeded. `catch` as well as `rescue` — a callback that exits would take
   # the server down just as effectively as one that raises.
+  #
+  # Only the shape is logged, never the message or a non-atom reason: the
+  # failure carries whatever the callback was handed, and some carry a lot —
+  # `Ecto.InvalidChangesetError`'s message embeds the whole changeset, camera
+  # credentials included.
   defp run_after_apply(nil, _diff), do: :ok
 
   defp run_after_apply(fun, diff) do
     fun.(diff)
     :ok
   rescue
-    e -> Logger.error("config: after_apply raised: #{Exception.message(e)}")
+    e -> Logger.error("config: after_apply raised: #{inspect(e.__struct__)}")
   catch
-    kind, reason -> Logger.error("config: after_apply #{kind}: #{inspect(reason)}")
+    kind, reason when is_atom(reason) ->
+      Logger.error("config: after_apply #{kind}: #{inspect(reason)}")
+
+    kind, _reason ->
+      Logger.error("config: after_apply #{kind}: non-atom exit")
   end
 
   # `mode: :immediate` takes the write lock at BEGIN rather than at the first

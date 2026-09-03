@@ -42,13 +42,21 @@ defmodule CairnWeb.ConfigLive do
     {:noreply, socket |> assign(reload_result: reload()) |> load()}
   end
 
+  # The in-flight guard is the server's own, as on `/cameras`: `disabled` in
+  # the markup stops the first click's own button, not a second event from a
+  # stale DOM or a hand-sent one — and a second re-import would replace the
+  # fleet a second time behind the first one's back.
   def handle_event("reimport", _params, socket) do
-    path = socket.assigns.config_path
+    if socket.assigns.reimporting do
+      {:noreply, socket}
+    else
+      path = socket.assigns.config_path
 
-    {:noreply,
-     socket
-     |> assign(reimporting: true)
-     |> start_async(:reimport, fn -> ConfigSource.reimport(path) end)}
+      {:noreply,
+       socket
+       |> assign(reimporting: true)
+       |> start_async(:reimport, fn -> ConfigSource.reimport(path) end)}
+    end
   end
 
   @impl true
