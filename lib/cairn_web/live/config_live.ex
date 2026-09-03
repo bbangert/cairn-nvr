@@ -58,9 +58,9 @@ defmodule CairnWeb.ConfigLive do
   end
 
   # The exit reason can carry the exception that raised — and with it the
-  # settings map — so it goes to the log, never the card.
+  # settings map — so neither the card nor the log sees it whole.
   def handle_async(:reimport, {:exit, reason}, socket) do
-    Logger.error("config: the re-import did not finish: #{inspect(reason)}")
+    Logger.error("config: the re-import did not finish: #{CameraCards.describe_exit(reason)}")
 
     {:noreply,
      socket

@@ -39,7 +39,7 @@ defmodule Cairn.DataDir do
   def secure_db(data_dir) do
     db = db_path(data_dir)
 
-    Enum.each([db, db <> "-wal", db <> "-shm"], &(File.exists?(&1) and chmod(&1, 0o600)))
+    for path <- [db, db <> "-wal", db <> "-shm"], File.exists?(path), do: chmod(path, 0o600)
     :ok
   end
 

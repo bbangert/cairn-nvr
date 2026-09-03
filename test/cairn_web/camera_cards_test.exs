@@ -5,6 +5,27 @@ defmodule CairnWeb.CameraCardsTest do
   alias Cairn.Cameras.Camera
   alias CairnWeb.CameraCards
 
+  describe "describe_exit/1" do
+    test "names the exception and never what it was holding" do
+      changeset =
+        Cairn.Cameras.Camera.changeset(%Cairn.Cameras.Camera{}, %{
+          id: "Bad Id",
+          position: 0,
+          settings: %{"rtsp_url" => "rtsp://u:SECRET@h/1"}
+        })
+
+      line = CameraCards.describe_exit({%Ecto.InvalidChangesetError{changeset: changeset}, []})
+      assert line =~ "Ecto.InvalidChangesetError"
+      assert line =~ "id"
+      refute line =~ "SECRET"
+
+      assert CameraCards.describe_exit({:timeout, []}) == ":timeout"
+      assert CameraCards.describe_exit(:killed) == ":killed"
+      assert CameraCards.describe_exit({:shutdown, {:secret, "SECRET"}}) == ":shutdown"
+      refute CameraCards.describe_exit({1, 2, "SECRET"}) =~ "SECRET"
+    end
+  end
+
   describe "mask_url/1" do
     test "hides rtsp credentials" do
       assert CameraCards.mask_url("rtsp://admin:s3cret@10.0.0.5:554/s1") ==

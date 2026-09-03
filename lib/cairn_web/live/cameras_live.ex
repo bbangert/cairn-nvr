@@ -461,7 +461,7 @@ defmodule CairnWeb.CamerasLive do
   # the write carries the settings map — password and all — so it goes to the
   # log and never to the page.
   defp exit_result(reason) do
-    Logger.error("cameras: the write did not finish: #{inspect(reason)}")
+    Logger.error("cameras: the write did not finish: #{CameraCards.describe_exit(reason)}")
     error_result("the save did not finish — see the log")
   end
 

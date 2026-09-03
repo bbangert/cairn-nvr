@@ -123,6 +123,20 @@ defmodule CairnWeb.CameraCards do
   def describe_probe_error(%Jason.DecodeError{}), do: "ffprobe returned no readable stream info"
   def describe_probe_error(_other), do: "the probe did not finish — see the log"
 
+  @doc """
+  A task's exit reason as one line for the log. An exit from a raise carries
+  the exception and its stacktrace — and an Ecto exception carries the
+  changeset, so the settings map — so only the exception's module and its
+  safe description are logged; anything else is named by shape.
+  """
+  @spec describe_exit(term()) :: String.t()
+  def describe_exit({%{__exception__: true} = e, _stacktrace}),
+    do: "#{inspect(e.__struct__)}: #{describe_write_error(e)}"
+
+  def describe_exit({reason, _stacktrace}) when is_atom(reason), do: inspect(reason)
+  def describe_exit(reason) when is_atom(reason), do: inspect(reason)
+  def describe_exit(_other), do: "an unexpected exit"
+
   @doc "The last probe result for a camera, or `nil` when it was never probed."
   @spec probe(map(), String.t()) :: map() | nil
   def probe(statuses, camera_id) do
