@@ -70,6 +70,25 @@ defmodule Cairn.Cameras.Settings do
   def restart?(field), do: field in restart_fields()
 
   @doc """
+  Whether saving `new` over `saved` restarts the camera's tree: one of
+  `restart_fields/0` — a value baked into a subprocess or a child spec at tree
+  birth — moved. A camera with no saved settings is being added, not
+  restarted.
+
+  Raw settings maps, so this is a prediction and not the diff: a resolved
+  input the camera does not carry itself (`sample_fps`, the tier, the rung)
+  can restart a camera whose own settings did not move, and only the config
+  server sees those (PR B's resolved form).
+  """
+  @spec would_restart?(map() | nil, map()) :: boolean()
+  def would_restart?(nil, _new), do: false
+
+  def would_restart?(saved, new) do
+    fields = restart_fields()
+    Map.take(saved, fields) != Map.take(new, fields)
+  end
+
+  @doc """
   A saved row rendered as form params. A saved credential is never among
   them: the password field is always empty and a URL that carries a
   credential is blank, with the readout the only place it appears.
@@ -457,10 +476,11 @@ defmodule Cairn.Cameras.Settings do
   # password, or a username the operator changed, rewrites a URL that has no
   # userinfo.
   #
-  # A retyped URL (a new host or path, still bare of its own credential) is
-  # seeded with the saved URL's userinfo *before* the fields are spliced in —
-  # not left to the final fallback below — so it lands in the first branch
-  # above like any other URL that already carries one: a changed username
+  # A retyped URL on the saved camera (a corrected path, still bare of its own
+  # credential — `seed_userinfo/2` refuses a new host) is seeded with the
+  # saved URL's userinfo *before* the fields are spliced in — not left to the
+  # final fallback below — so it lands in the first branch above like any
+  # other URL that already carries one: a changed username
   # replaces only the username and a blank password keeps the saved one,
   # instead of the splice reading "no userinfo yet" and dropping the saved
   # password outright. A retyped URL whose saved counterpart carried its
@@ -502,8 +522,15 @@ defmodule Cairn.Cameras.Settings do
   # saved URL carried: userinfo, or the recognized query pairs — the FLV form
   # has no userinfo slot to seed, so its credential rides to the retyped URL
   # as a query carry instead.
+  #
+  # Only onto the same endpoint. The case worth carrying for is a corrected
+  # path on the camera the credential belongs to; a retyped *host* is a
+  # different camera, and with no auth in front of this form, seeding there
+  # would hand the saved secret to whatever host the submitter names. A new
+  # host gets a bare URL and the operator types the password again.
   defp seed_userinfo(url, saved_url) do
-    if StreamUrl.userinfo(url) == nil and not StreamUrl.credentialed?(url) do
+    if StreamUrl.userinfo(url) == nil and not StreamUrl.credentialed?(url) and
+         StreamUrl.same_endpoint?(url, saved_url) do
       url |> carry_userinfo(saved_url) |> carry_credential_query(saved_url)
     else
       url
@@ -512,7 +539,7 @@ defmodule Cairn.Cameras.Settings do
 
   # Copied verbatim: what is on the saved URL is already percent-encoded, and
   # re-encoding it would change the credential.
-  defp carry_userinfo(url, saved_url) when is_binary(saved_url) do
+  defp carry_userinfo(url, saved_url) do
     case StreamUrl.userinfo(saved_url) do
       nil ->
         url
@@ -522,8 +549,6 @@ defmodule Cairn.Cameras.Settings do
         StreamUrl.join_authority(scheme, userinfo, rest)
     end
   end
-
-  defp carry_userinfo(url, _absent), do: url
 
   # Runs after `carry_userinfo/2`, so a saved userinfo credential has already
   # landed on `url` and made it `credentialed?/1` — this only fires for a

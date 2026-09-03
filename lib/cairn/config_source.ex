@@ -43,10 +43,22 @@ defmodule Cairn.ConfigSource do
     # installs whatever fallback comes back here. The map is re-read because
     # the fault may have come from anywhere below.
     e in [Exqlite.Error, DBConnection.ConnectionError] ->
-      degrade(path, "cameras: database read failed: " <> Exception.message(e))
+      degrade(path, log_db_error(e, __STACKTRACE__))
 
     e in [Ecto.InvalidChangesetError, Ecto.ConstraintError] ->
       degrade(path, "cameras: import failed: " <> describe_import_error(e))
+  end
+
+  # `Exception.message/1` on `Exqlite.Error` appends the failing statement,
+  # which can hold values just spliced into `settings` — so the surfaced
+  # text stays generic and the full exception goes only to the log. `@doc
+  # false` rather than private so a test can drive it directly, the same
+  # reason `describe_import_error/1` is.
+  @doc false
+  @spec log_db_error(Exception.t(), Exception.stacktrace()) :: String.t()
+  def log_db_error(e, stacktrace) do
+    Logger.error("cameras: database access failed: " <> Exception.format(:error, e, stacktrace))
+    "cameras: database write failed"
   end
 
   # `Exception.message/1` on these two interpolates the changeset — including
@@ -214,21 +226,9 @@ defmodule Cairn.ConfigSource do
     })
   end
 
-  # `@doc false` and public: the config page's re-import compares the file's
-  # list against the marker with the same sort-then-hash rule, and must not
-  # duplicate it.
-  @doc false
-  @spec cameras_sha([map()]) :: String.t()
-  def cameras_sha(cameras) do
+  defp cameras_sha(cameras) do
     :crypto.hash(:sha256, Jason.encode!(sort_keys(cameras))) |> Base.encode16(case: :lower)
   end
-
-  # The file's raw bytes, not `cameras_sha/1`'s canonicalized list: a caller
-  # pinning a write to what it displayed hashes before any YAML parsing, and
-  # the check has to hash the same thing to mean anything.
-  @doc false
-  @spec file_sha256(binary()) :: String.t()
-  def file_sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 
   # The same YAML must hash the same across boots, and map iteration order is
   # not a promise the runtime makes.
@@ -247,18 +247,15 @@ defmodule Cairn.ConfigSource do
   # `:none` for an absent or empty `cameras:` key or no marker to compare
   # against — `cameras: []` lists nothing, so it earns neither warning, the
   # same reading `import_once/3`'s `importable?/1` gives it. `:same` and
-  # `:changed` classify the two states the warnings below name; kept apart
-  # from `drift_warnings/3` so a caller with no message to render (the
-  # re-import's own drift check) can classify without building strings.
-  @doc false
-  @spec drift([map()] | nil, map() | nil) :: :none | :same | :changed
-  def drift(cameras, marker)
+  # `:changed` classify the two states `drift_warnings/3` renders; kept apart
+  # so the classification has no strings to build.
+  defp drift(cameras, marker)
 
-  def drift(cameras, %{"sha256" => sha}) when is_list(cameras) and cameras != [] do
+  defp drift(cameras, %{"sha256" => sha}) when is_list(cameras) and cameras != [] do
     if cameras_sha(cameras) == sha, do: :same, else: :changed
   end
 
-  def drift(_cameras, _marker), do: :none
+  defp drift(_cameras, _marker), do: :none
 
   defp drift_warnings(map, path, marker) do
     base = Path.basename(path)

@@ -68,25 +68,6 @@ defmodule Cairn.Cameras.Candidate do
   @spec render_row(%{id: String.t(), settings: map(), zones: [map()]}) :: row()
   defdelegate render_row(row), to: Cairn.Cameras
 
-  @doc """
-  Whether saving `new` over `saved` restarts the camera's tree: a field baked
-  into a subprocess or a child spec at tree birth moved. `restart_fields` is
-  the caller's set (`Cairn.Config.Server.restart_fields/0` plus the fields the
-  form resolves above the camera), as atoms or strings.
-
-  Settings-level and so a prediction, not the diff: the resolved comparisons
-  `Cairn.Config.Server.diff_cameras/2` makes can restart a camera whose own
-  settings did not move. A camera with no saved row is being added, not
-  restarted.
-  """
-  @spec would_restart?(map() | nil, map(), [atom() | String.t()]) :: boolean()
-  def would_restart?(nil, _new, _restart_fields), do: false
-
-  def would_restart?(saved, new, restart_fields) do
-    fields = Enum.map(restart_fields, &to_string/1)
-    Map.take(saved, fields) != Map.take(new, fields)
-  end
-
   defp fleet(candidate, rows, id) do
     if Enum.any?(rows, &(Map.get(&1, "id") == id)),
       do: Enum.map(rows, &replace(&1, candidate, id)),

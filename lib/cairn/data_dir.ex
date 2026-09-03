@@ -15,6 +15,10 @@ defmodule Cairn.DataDir do
   files to 0600, and a chmod the volume refuses (a restored backup under
   another uid, a bind mount) is logged and left as is rather than made a
   reason to crash-loop the boot.
+
+  `Cairn.Config.Server` calls this on every config apply, not only at boot,
+  so 0700 is enforced rather than merely established — a mode an operator
+  widens on the live volume does not survive the next apply.
   """
   @spec ensure!(Path.t()) :: :ok
   def ensure!(data_dir) do

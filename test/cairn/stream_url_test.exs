@@ -216,5 +216,104 @@ defmodule Cairn.StreamUrlTest do
       assert StreamUrl.compose("rtsp://user:sec@ret@host/s", "", "new") ==
                "rtsp://user:new@host/s"
     end
+
+    # The colonless userinfo is the password everywhere else in the module;
+    # reading it as a username here republished it as the form's `value=`.
+    test "a typed password replaces a colonless userinfo, keeping its shape" do
+      assert StreamUrl.compose("rtsp://SECRET@h/1", "", "pw") == "rtsp://pw@h/1"
+      refute StreamUrl.compose("rtsp://SECRET@h/1", "", "pw") =~ "SECRET"
+    end
+
+    test "a typed username makes a colonless userinfo the password" do
+      assert StreamUrl.compose("rtsp://SECRET@h/1", "user", "") == "rtsp://user:SECRET@h/1"
+    end
+
+    test "a colonless userinfo nobody typed over is untouched" do
+      assert StreamUrl.compose("rtsp://SECRET@h/1", "", "") == "rtsp://SECRET@h/1"
+    end
+  end
+
+  describe "an ambiguous @" do
+    @ambiguous "rtsp://u:pa/ss@cam.lan/main"
+
+    test "is a credential the mask hides whole" do
+      assert StreamUrl.ambiguous?(@ambiguous)
+      assert StreamUrl.mask(@ambiguous) == "rtsp://•••••@cam.lan/main"
+      refute StreamUrl.mask(@ambiguous) =~ "pa/ss"
+      assert StreamUrl.credentialed?(@ambiguous)
+    end
+
+    # Past a `?` an `@` belongs to a query (`?to=me@h` is ordinary), so the
+    # rule stops there and a raw `?` in a password stays out of reach.
+    test "does not extend past the query, where an @ is ordinary" do
+      refute StreamUrl.ambiguous?("rtsp://u:pa?ss@cam.lan/main")
+    end
+
+    test "strips through the last such @, and offers no username" do
+      assert StreamUrl.strip_credentials(@ambiguous) == "rtsp://cam.lan/main"
+      assert StreamUrl.user(@ambiguous) == nil
+      assert StreamUrl.userinfo(@ambiguous) == nil
+    end
+
+    # Splicing would have to pick a boundary, and the wrong pick rewrites the
+    # host.
+    test "is never spliced into" do
+      assert StreamUrl.compose(@ambiguous, "ops", "pw") == @ambiguous
+    end
+
+    # The `@` sits inside a readable authority, so nothing is ambiguous: the
+    # path keeps its own.
+    test "is not what an @ in the path of a normal authority is" do
+      url = "rtsp://u:p@h/live@1"
+      refute StreamUrl.ambiguous?(url)
+      assert StreamUrl.mask(url) == "rtsp://u:•••••@h/live@1"
+      assert StreamUrl.strip_credentials(url) == "rtsp://h/live@1"
+      assert StreamUrl.user(url) == "u"
+      assert StreamUrl.compose(url, "", "new") == "rtsp://u:new@h/live@1"
+    end
+
+    test "an @ after the query has no authority to confuse" do
+      refute StreamUrl.ambiguous?("http://h/p?x=1@2")
+      refute StreamUrl.credentialed?("http://h/p?x=1@2")
+      refute StreamUrl.ambiguous?(nil)
+    end
+  end
+
+  describe "credential_key?/1" do
+    test "names the vendor spellings, whatever their case" do
+      assert StreamUrl.credential_key?("password")
+      assert StreamUrl.credential_key?("Access_Token")
+      assert StreamUrl.credential_key?("USER")
+      refute StreamUrl.credential_key?("channel")
+      refute StreamUrl.credential_key?("")
+    end
+
+    # The camera decodes the key before reading it, so an escape anywhere in
+    # it would otherwise walk a credential past both the mask and the prefill.
+    test "decodes the key before judging it" do
+      assert StreamUrl.credential_key?("pass%77ord")
+      assert StreamUrl.credential_key?("access%5Ftoken")
+      assert StreamUrl.credential_key?("access_%74oken")
+    end
+
+    # A malformed escape has no decoding, and a well-formed one can decode to
+    # invalid UTF-8; the raw key is then all there is to judge.
+    test "falls back to the raw key when there is no decoding to judge" do
+      refute StreamUrl.credential_key?("%zz")
+      refute StreamUrl.credential_key?("pass%FFword")
+      refute StreamUrl.credential_key?("PASS%zzWORD")
+      # `%70assword` decodes to `password` even though the raw key is not one.
+      assert StreamUrl.credential_key?("%70assword")
+    end
+  end
+
+  describe "same_endpoint?/2" do
+    test "compares the scheme and host[:port], ignoring path, query and credential" do
+      assert StreamUrl.same_endpoint?("rtsp://cam.lan:554/main", "rtsp://u:p@cam.lan:554/sub?x=1")
+      refute StreamUrl.same_endpoint?("rtsp://cam.lan/main", "rtsp://other.lan/main")
+      refute StreamUrl.same_endpoint?("rtsp://cam.lan/main", "rtsp://cam.lan:554/main")
+      refute StreamUrl.same_endpoint?("rtsp://cam.lan/main", "http://cam.lan/main")
+      refute StreamUrl.same_endpoint?("rtsp://cam.lan/main", nil)
+    end
   end
 end

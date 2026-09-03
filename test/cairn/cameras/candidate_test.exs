@@ -104,30 +104,6 @@ defmodule Cairn.Cameras.CandidateTest do
     end
   end
 
-  describe "would_restart?/3" do
-    @fields Config.Server.restart_fields() ++ [:pre_window_seconds, :tracker, :max_live_tracks]
-
-    test "a changed restart field restarts" do
-      assert Candidate.would_restart?(
-               %{"rtsp_url" => "rtsp://h/1"},
-               %{"rtsp_url" => "rtsp://h/2"},
-               @fields
-             )
-    end
-
-    test "a changed field outside the set does not" do
-      refute Candidate.would_restart?(
-               %{"rtsp_url" => "rtsp://h/1", "max_unseen_ms" => 1000},
-               %{"rtsp_url" => "rtsp://h/1", "max_unseen_ms" => 2000},
-               @fields
-             )
-    end
-
-    test "a camera with no saved settings is being added, not restarted" do
-      refute Candidate.would_restart?(nil, %{"rtsp_url" => "rtsp://h/1"}, @fields)
-    end
-  end
-
   describe "render_row/1" do
     test "keeps the parser's keys, drops the rest, and carries id and zones" do
       zones = [%{"name" => "drive", "points" => [[0, 0], [1, 0], [1, 1]]}]

@@ -67,8 +67,15 @@ defmodule Cairn.DataDirTest do
     # tightened file, an absent one) is what the spec promises regardless
     # of what `File.chmod/2` itself reports — the warn-and-continue behaviour
     # for a failure is read off the source, not exercised here.
-    test "returns :ok even when nothing needed tightening", %{dir: dir} do
-      assert DataDir.secure_db(dir) == :ok
+    test "leaves an already-0600 db alone and logs nothing", %{dir: dir} do
+      db = DataDir.db_path(dir)
+      File.write!(db, "")
+      File.chmod!(db, 0o600)
+
+      log = ExUnit.CaptureLog.capture_log(fn -> assert DataDir.secure_db(dir) == :ok end)
+
+      assert (File.stat!(db).mode &&& 0o777) == 0o600
+      assert log == ""
     end
 
     test "ensure!/1 tightens an existing cairn.db", %{dir: dir} do

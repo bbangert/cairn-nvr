@@ -666,16 +666,16 @@ defmodule Cairn.ConfigSourceTest do
 
   describe "describe_import_error/1" do
     # The rescue clause this backs (`load/1`'s `Ecto.InvalidChangesetError` /
-    # `Ecto.ConstraintError` arm) is not reachable through `load/1` or
-    # `reimport/1` with today's data: both validate the whole YAML with
-    # `Config.from_map/1` — using the same id regex, the same required
-    # fields — before either ever calls `Repo.insert!`, so nothing that
-    # would fail `Camera.changeset/2` gets past `from_map/1` first. A
-    # concurrent double-import racing the same id past both checks would
-    # reach it, but that is not a deterministic scenario to provoke in a
-    # test. `describe_import_error/1` is `@doc false` rather than private
-    # for exactly this: it is exercised directly, against constructed
-    # exceptions, rather than through the rescue.
+    # `Ecto.ConstraintError` arm) is not reachable through `load/1` with
+    # today's data: it validates the whole YAML with `Config.from_map/1` —
+    # using the same id regex, the same required fields — before it ever
+    # calls `Repo.insert!`, so nothing that would fail `Camera.changeset/2`
+    # gets past `from_map/1` first. A concurrent double-import racing the
+    # same id past that check would reach it, but that is not a
+    # deterministic scenario to provoke in a test. `describe_import_error/1`
+    # is `@doc false` rather than private for exactly this: it is exercised
+    # directly, against constructed exceptions, rather than through the
+    # rescue.
     test "an invalid-changeset error never carries the changeset's own credentialed values" do
       changeset =
         %Camera{}
@@ -705,35 +705,16 @@ defmodule Cairn.ConfigSourceTest do
     end
   end
 
-  describe "drift/2" do
-    test "no marker is :none regardless of the file's cameras" do
-      assert ConfigSource.drift([%{"id" => "cam1"}], nil) == :none
-    end
+  describe "log_db_error/2" do
+    test "returns a generic message and logs the exception, statement included" do
+      error = %Exqlite.Error{message: "UNIQUE constraint failed", statement: "INSERT ... SECRET"}
 
-    test "an absent or empty cameras key is :none even under a marker" do
-      marker = %{"sha256" => ConfigSource.cameras_sha([%{"id" => "cam1"}])}
-      assert ConfigSource.drift(nil, marker) == :none
-      assert ConfigSource.drift([], marker) == :none
-    end
+      {message, log} =
+        ExUnit.CaptureLog.with_log(fn -> ConfigSource.log_db_error(error, []) end)
 
-    test "a matching hash is :same, a differing one is :changed" do
-      cameras = [%{"id" => "cam1"}]
-      marker = %{"sha256" => ConfigSource.cameras_sha(cameras)}
-
-      assert ConfigSource.drift(cameras, marker) == :same
-      assert ConfigSource.drift([%{"id" => "cam2"}], marker) == :changed
-    end
-  end
-
-  describe "cameras_sha/1 and file_sha256/1" do
-    test "cameras_sha ignores key order" do
-      assert ConfigSource.cameras_sha([%{"id" => "cam1", "rtsp_url" => "rtsp://h/1"}]) ==
-               ConfigSource.cameras_sha([%{"rtsp_url" => "rtsp://h/1", "id" => "cam1"}])
-    end
-
-    test "file_sha256 hashes raw bytes, not a canonicalized shape" do
-      assert ConfigSource.file_sha256("hello") == ConfigSource.file_sha256("hello")
-      refute ConfigSource.file_sha256("hello") == ConfigSource.file_sha256("world")
+      assert message == "cameras: database write failed"
+      refute message =~ "SECRET"
+      assert log =~ "SECRET"
     end
   end
 end

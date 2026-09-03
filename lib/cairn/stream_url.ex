@@ -28,6 +28,12 @@ defmodule Cairn.StreamUrl do
   which masks half a password, strips half a password, and rewrites the host
   as `ret@host`. Anything past that boundary is `rest`, so an `@` in a path or
   query is left alone. A URL with no `//` has no authority to split.
+
+  A raw `/` inside a userinfo is the case this cannot resolve: it ends the
+  authority before any `@` is seen, so no userinfo is found and the credential
+  would be rendered in full. Such a URL is *ambiguous* rather than bare — see
+  `ambiguous?/1`, which the display and splice paths consult and this function
+  does not.
   """
   @spec split_authority(String.t()) :: {String.t(), String.t() | nil, String.t()}
   def split_authority(url) when is_binary(url) do
@@ -69,6 +75,54 @@ defmodule Cairn.StreamUrl do
   end
 
   @doc """
+  Whether the URL holds an `@` past the authority's first `/` (and before any
+  `?` or `#`) with no `@` in the authority itself — `rtsp://u:pa/ss@cam.lan/main`.
+
+  A hand-typed or imported password really does contain a raw slash sometimes,
+  and there is no way to tell that URL from a bare one whose *path* holds an
+  `@`. Either guess is wrong half the time and a wrong guess renders half a
+  password, so both readings are refused: everything from `//` through the
+  last such `@` is treated as credential — masked whole, never spliced into,
+  stripped entire. The cost is a bare URL with an `@` in its path opening
+  blank in the form, which the operator repairs by retyping it; the same
+  repair path a row this module cannot read already takes.
+
+  A raw `?` or `#` in a password is out of reach: past one, an `@` is a query
+  or fragment character, and `?x=me@h` is ordinary. Those are left to the
+  query masker, which hides the value of a credential-named key and nothing
+  else.
+  """
+  @spec ambiguous?(term()) :: boolean()
+  def ambiguous?(url) when is_binary(url), do: ambiguous_split(url) != nil
+  def ambiguous?(_other), do: false
+
+  # `{scheme, everything after the last ambiguous @}`, or `nil` when the URL
+  # reads unambiguously.
+  defp ambiguous_split(url) do
+    case String.split(url, "//", parts: 2) do
+      [prefix, onward] ->
+        {authority, _tail} = split_at_path(onward)
+        if last_at(authority) == nil, do: last_at_before_query(prefix <> "//", onward)
+
+      [_no_authority] ->
+        nil
+    end
+  end
+
+  defp last_at_before_query(scheme, onward) do
+    head =
+      case :binary.match(onward, ["?", "#"]) do
+        {at, _len} -> binary_part(onward, 0, at)
+        :nomatch -> onward
+      end
+
+    case head |> :binary.matches("@") |> List.last() do
+      nil -> nil
+      {at, _len} -> {scheme, binary_part(onward, at + 1, byte_size(onward) - at - 1)}
+    end
+  end
+
+  @doc """
   Masks `rtsp://user:secret@host/…`, `rtsp://secret@host/…` and
   `…?password=x&user=y` forms.
   """
@@ -77,13 +131,17 @@ defmodule Cairn.StreamUrl do
     # The username (up to the first colon) stays; with no colon the whole
     # userinfo is a credential (`rtsp://SECRET@host` — a password to some
     # cameras, and `credentialed?/1` calls it one) and goes entirely. An
-    # empty username (`rtsp://:secret@host`) masks like any other.
+    # empty username (`rtsp://:secret@host`) masks like any other. An
+    # ambiguous URL shows none of what precedes its `@`.
     masked =
-      case split_authority(url) do
-        {_scheme, nil, _rest} ->
+      case {ambiguous_split(url), split_authority(url)} do
+        {{scheme, rest}, _split} ->
+          scheme <> "•••••@" <> rest
+
+        {nil, {_scheme, nil, _rest}} ->
           url
 
-        {scheme, userinfo, rest} ->
+        {nil, {scheme, userinfo, rest}} ->
           join_authority(scheme, mask_userinfo(userinfo), rest)
       end
 
@@ -100,9 +158,9 @@ defmodule Cairn.StreamUrl do
   def mask(_other), do: @blank
 
   defp mask_userinfo(userinfo) do
-    case String.split(userinfo, ":", parts: 2) do
-      [user, _password] -> user <> ":•••••"
-      [_password_only] -> "•••••"
+    case split_userinfo(userinfo) do
+      {nil, _password_only} -> "•••••"
+      {user, _password} -> user <> ":•••••"
     end
   end
 
@@ -151,15 +209,16 @@ defmodule Cairn.StreamUrl do
   end
 
   @doc """
-  Whether the URL carries a credential — userinfo, or one of the query
-  parameters `mask/1` masks. The form's prefill rule reads it: a credentialed
-  URL is left blank rather than rendered (the credential rule).
+  Whether the URL carries a credential — userinfo, one of the query parameters
+  `mask/1` masks, or an `@` `ambiguous?/1` refuses to read. The form's prefill
+  rule reads it: a credentialed URL is left blank rather than rendered (the
+  credential rule).
   """
   @spec credentialed?(term()) :: boolean()
   def credentialed?(url) when is_binary(url) do
     {_scheme, userinfo, rest} = split_authority(url)
 
-    userinfo != nil or
+    userinfo != nil or ambiguous?(url) or
       Enum.any?(String.split(URI.parse(rest).query || @blank, "&"), fn pair ->
         pair |> String.split("=", parts: 2) |> hd() |> credential_key?()
       end)
@@ -200,6 +259,15 @@ defmodule Cairn.StreamUrl do
   """
   @spec strip_credentials(String.t()) :: String.t()
   def strip_credentials(url) when is_binary(url) do
+    case ambiguous_split(url) do
+      # Cutting at the last ambiguous `@` leaves nothing ambiguous behind, so
+      # the recursion is one deep and finishes on the query form.
+      {scheme, rest} -> strip_credentials(scheme <> rest)
+      nil -> strip_unambiguous(url)
+    end
+  end
+
+  defp strip_unambiguous(url) do
     {scheme, _userinfo, rest} = split_authority(url)
     uri = URI.parse(rest)
 
@@ -238,14 +306,11 @@ defmodule Cairn.StreamUrl do
   def user(url) when is_binary(url) do
     case userinfo(url) do
       nil -> nil
-      userinfo -> userinfo |> split_userinfo() |> colon_user() |> decode_user()
+      userinfo -> userinfo |> split_userinfo() |> elem(0) |> decode_user()
     end
   end
 
   def user(_absent), do: nil
-
-  defp colon_user({user, nil}) when is_binary(user), do: nil
-  defp colon_user({user, _password}), do: user
 
   # A hand-edited or migrated row can hold a malformed escape (`bad%zz`),
   # which `URI.decode/1` raises on — and the form has to render the row the
@@ -266,35 +331,80 @@ defmodule Cairn.StreamUrl do
   The URL with `user` and `pass` spliced into its userinfo, each encoded. A
   blank one keeps whatever the URL already carried, which is how "leave blank
   to keep" reaches the URL.
+
+  A colonless userinfo is the password, as `mask/1` and `user/1` read it: a
+  typed password replaces it (and keeps the colonless shape the camera was
+  given), a typed username moves it into the password slot rather than
+  deleting it. Reading it as a username instead published the old password as
+  the form's `value=`.
+
+  An ambiguous URL (`ambiguous?/1`) is returned unchanged: its `@` may be
+  inside a password or inside a path, and splicing on the wrong reading
+  rewrites the host.
   """
   @spec compose(String.t(), String.t(), String.t()) :: String.t()
   def compose(url, @blank, @blank), do: url
 
   def compose(url, user, pass) do
+    case ambiguous_split(url) do
+      {_scheme, _rest} -> url
+      nil -> splice(url, user, pass)
+    end
+  end
+
+  defp splice(url, user, pass) do
     {scheme, current, rest} = split_authority(url)
     {current_user, current_pass} = split_userinfo(current)
     user = if user == @blank, do: current_user, else: encode(user)
     pass = if pass == @blank, do: current_pass, else: encode(pass)
 
-    join_authority(scheme, compose_userinfo(user, pass), rest)
+    join_authority(scheme, compose_userinfo(user, pass, colonless?(current)), rest)
   end
 
-  defp compose_userinfo(nil, nil), do: nil
+  defp colonless?(current), do: is_binary(current) and not String.contains?(current, ":")
+
+  defp compose_userinfo(nil, nil, _colonless), do: nil
+  # A URL that arrived colonless keeps that shape when its password is
+  # replaced: the camera was reached with `secret@host` and a new password is
+  # the same credential, not a new form of one.
+  defp compose_userinfo(nil, pass, true), do: pass
   # `rtsp://:pass@host` is what a camera that authenticates on the password
   # alone wants, and on create there is no saved URL to carry the credential
   # instead — dropping the userinfo here silently discarded the typed
   # password. Both `mask/1` and `credentialed?/1` already read this form.
-  defp compose_userinfo(nil, pass), do: ":" <> pass
-  defp compose_userinfo(user, nil), do: user
-  defp compose_userinfo(user, pass), do: user <> ":" <> pass
+  defp compose_userinfo(nil, pass, false), do: ":" <> pass
+  defp compose_userinfo(user, nil, _colonless), do: user
+  defp compose_userinfo(user, pass, _colonless), do: user <> ":" <> pass
 
+  # The module's one reading of a userinfo: no colon means no username, so the
+  # whole of it is the password (`mask/1`, `user/1` and `compose/3` all rest
+  # on this — a disagreement is what leaked one).
   defp split_userinfo(nil), do: {nil, nil}
 
   defp split_userinfo(userinfo) do
     case String.split(userinfo, ":", parts: 2) do
       [user, pass] -> {user, pass}
-      [user] -> {user, nil}
+      [password_only] -> {nil, password_only}
     end
+  end
+
+  @doc """
+  Whether two URLs name the same endpoint: identical scheme and identical
+  host[:port], whatever their paths, queries or credentials.
+
+  Carrying a saved credential onto a retyped URL is only "the same camera, a
+  corrected path" while this holds. Compared byte for byte rather than
+  normalized — a URL that differs only in case is retyped rarely, and the
+  wrong answer here sends a saved secret to a host the operator never gave it
+  to.
+  """
+  @spec same_endpoint?(term(), term()) :: boolean()
+  def same_endpoint?(a, b) when is_binary(a) and is_binary(b), do: endpoint(a) == endpoint(b)
+  def same_endpoint?(_a, _b), do: false
+
+  defp endpoint(url) do
+    {scheme, _userinfo, rest} = split_authority(url)
+    {scheme, rest |> split_at_path() |> elem(0)}
   end
 
   defp encode(value), do: URI.encode(value, &URI.char_unreserved?/1)

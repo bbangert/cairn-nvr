@@ -271,6 +271,43 @@ defmodule Cairn.Cameras.SettingsTest do
       assert {:ok, %{"rtsp_url" => "rtsp://SECRET@h/1"}} = Settings.to_settings(params, row)
     end
 
+    # The colonless userinfo is the password, so a typed one replaces it; it
+    # must not be promoted to a username, which is what put it back on the
+    # readout and into the form's `value=`.
+    test "a password typed over a colonless userinfo replaces it" do
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://SECRET@h/1"}, zones: []}
+
+      {:ok, settings} =
+        row |> Settings.to_params() |> Map.put("password", "pw") |> Settings.to_settings(row)
+
+      assert settings["rtsp_url"] == "rtsp://pw@h/1"
+      refute settings["rtsp_url"] =~ "SECRET"
+    end
+
+    test "a username typed over a colonless userinfo keeps it as the password" do
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://SECRET@h/1"}, zones: []}
+
+      {:ok, settings} =
+        row |> Settings.to_params() |> Map.put("username", "ops") |> Settings.to_settings(row)
+
+      assert settings["rtsp_url"] == "rtsp://ops:SECRET@h/1"
+    end
+
+    # An `@` the module cannot place is treated as credential whole: nothing
+    # is spliced into it and the form renders none of it.
+    test "an ambiguous URL is neither rendered nor spliced" do
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://u:pa/ss@cam.lan/1"}, zones: []}
+      params = Settings.to_params(row)
+
+      assert params["rtsp_url"] == ""
+      assert params["username"] == ""
+
+      {:ok, settings} =
+        params |> Map.put("password", "pw") |> Settings.to_settings(row)
+
+      assert settings["rtsp_url"] == "rtsp://u:pa/ss@cam.lan/1"
+    end
+
     test "removing saved credentials strips the query form too" do
       main = "http://cam.lan/flv?stream=ch0&user=admin&password=old"
       row = %Camera{id: "gate", settings: %{"rtsp_url" => main}, zones: []}
@@ -294,8 +331,8 @@ defmodule Cairn.Cameras.SettingsTest do
       assert {:ok, %{"rtsp_url" => "rtsp://user:new@host/s"}} =
                Settings.to_settings(Map.put(params, "password", "new"), row)
 
-      assert {:ok, %{"rtsp_url" => "rtsp://user:sec@ret@new/s"}} =
-               Settings.to_settings(Map.put(params, "rtsp_url", "rtsp://new/s"), row)
+      assert {:ok, %{"rtsp_url" => "rtsp://user:sec@ret@host/s2"}} =
+               Settings.to_settings(Map.put(params, "rtsp_url", "rtsp://host/s2"), row)
     end
 
     test "a URL carrying its credential in the query is never spliced" do
@@ -319,17 +356,65 @@ defmodule Cairn.Cameras.SettingsTest do
       assert settings["substream_url"] == "rtsp://admin:pw@cam.lan/sub"
     end
 
-    test "a retyped URL with no credential carries the saved query-form credential" do
-      main = "http://old/flv?stream=ch0&user=admin&password=x"
+    test "a corrected path carries the saved query-form credential" do
+      main = "http://cam.lan/flv?stream=ch0&user=admin&password=x"
       row = %Camera{id: "gate", settings: %{"rtsp_url" => main}, zones: []}
 
       {:ok, settings} =
         row
         |> Settings.to_params()
-        |> Map.merge(%{"rtsp_url" => "http://new/flv?stream=ch1"})
+        |> Map.merge(%{"rtsp_url" => "http://cam.lan/flv?stream=ch1"})
         |> Settings.to_settings(row)
 
-      assert settings["rtsp_url"] == "http://new/flv?stream=ch1&user=admin&password=x"
+      assert settings["rtsp_url"] == "http://cam.lan/flv?stream=ch1&user=admin&password=x"
+    end
+
+    # The saved credential belongs to the saved camera. With no auth in front
+    # of this form, following a retyped host would post the secret wherever
+    # the submitter says — so a new host gets a bare URL and the operator
+    # types the password again.
+    test "a URL retyped onto another host is seeded with neither credential form" do
+      userinfo_row = %Camera{
+        id: "gate",
+        settings: %{"rtsp_url" => "rtsp://u:pw@old/1"},
+        zones: []
+      }
+
+      {:ok, moved} =
+        userinfo_row
+        |> Settings.to_params()
+        |> Map.put("rtsp_url", "rtsp://attacker.lan/1")
+        |> Settings.to_settings(userinfo_row)
+
+      assert moved["rtsp_url"] == "rtsp://attacker.lan/1"
+
+      query_row = %Camera{
+        id: "gate",
+        settings: %{"rtsp_url" => "http://old/flv?stream=ch0&user=admin&password=x"},
+        zones: []
+      }
+
+      {:ok, moved_query} =
+        query_row
+        |> Settings.to_params()
+        |> Map.put("rtsp_url", "http://attacker.lan/flv?stream=ch0")
+        |> Settings.to_settings(query_row)
+
+      assert moved_query["rtsp_url"] == "http://attacker.lan/flv?stream=ch0"
+    end
+
+    # A port is part of the endpoint: the same name on another port is
+    # another listener.
+    test "a retyped port is a different endpoint" do
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://u:pw@cam.lan:554/1"}, zones: []}
+
+      {:ok, settings} =
+        row
+        |> Settings.to_params()
+        |> Map.put("rtsp_url", "rtsp://cam.lan:8554/1")
+        |> Settings.to_settings(row)
+
+      assert settings["rtsp_url"] == "rtsp://cam.lan:8554/1"
     end
 
     test "a retyped URL that already carries its own credential is left alone" do
@@ -361,19 +446,19 @@ defmodule Cairn.Cameras.SettingsTest do
       assert settings["rtsp_url"] == "rtsp://ops:pw@cam.lan/main"
     end
 
-    # Retyping the URL (a new host or path) used to lose the saved password:
+    # Correcting the path used to lose the saved password:
     # the typed URL carries no userinfo of its own, so the splice read "no
     # credential yet" and dropped the saved one instead of updating around it.
-    test "a retyped URL keeps the saved password when only the username changes" do
-      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://u:pw@old/1"}, zones: []}
+    test "a retyped path keeps the saved password when only the username changes" do
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://u:pw@cam.lan/1"}, zones: []}
 
       {:ok, settings} =
         row
         |> Settings.to_params()
-        |> Map.merge(%{"rtsp_url" => "rtsp://new/1", "username" => "v", "password" => ""})
+        |> Map.merge(%{"rtsp_url" => "rtsp://cam.lan/2", "username" => "v", "password" => ""})
         |> Settings.to_settings(row)
 
-      assert settings["rtsp_url"] == "rtsp://v:pw@new/1"
+      assert settings["rtsp_url"] == "rtsp://v:pw@cam.lan/2"
     end
 
     test "blank credentials leave both URLs exactly as they were" do
@@ -575,22 +660,23 @@ defmodule Cairn.Cameras.SettingsTest do
 
     # Neither field can supply the credential here: the password says "leave
     # blank to keep" and the username is a prefill, not an entry.
-    test "a retyped URL keeps the credential the saved one carried" do
-      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://u:pw@old/1"}, zones: []}
+    test "a retyped path keeps the credential the saved URL carried" do
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://u:pw@cam.lan/1"}, zones: []}
       params = Settings.to_params(row)
 
       assert params["username"] == "u"
 
-      {:ok, settings} = params |> Map.put("rtsp_url", "rtsp://new/1") |> Settings.to_settings(row)
+      {:ok, settings} =
+        params |> Map.put("rtsp_url", "rtsp://cam.lan/2") |> Settings.to_settings(row)
 
-      assert settings["rtsp_url"] == "rtsp://u:pw@new/1"
+      assert settings["rtsp_url"] == "rtsp://u:pw@cam.lan/2"
 
       {:ok, typed} =
         params
-        |> Map.merge(%{"rtsp_url" => "rtsp://new/1", "password" => "pw2"})
+        |> Map.merge(%{"rtsp_url" => "rtsp://cam.lan/2", "password" => "pw2"})
         |> Settings.to_settings(row)
 
-      assert typed["rtsp_url"] == "rtsp://u:pw2@new/1"
+      assert typed["rtsp_url"] == "rtsp://u:pw2@cam.lan/2"
     end
 
     # Cameras that authenticate on the password alone, and on create there is
@@ -971,6 +1057,53 @@ defmodule Cairn.Cameras.SettingsTest do
       assert "password" in fields
       assert Settings.restart?("tracker")
       refute Settings.restart?("post_window_seconds")
+    end
+  end
+
+  describe "would_restart?/2" do
+    test "a changed restart field restarts" do
+      assert Settings.would_restart?(%{"rtsp_url" => "rtsp://h/1"}, %{"rtsp_url" => "rtsp://h/2"})
+    end
+
+    # The field set is the module's own, so a caller cannot narrow it: this
+    # would restart under `Config.Server.restart_fields/0` alone.
+    test "a field only this module calls a restart still restarts" do
+      assert Settings.would_restart?(%{"tracker" => "cairn"}, %{"tracker" => "sparsetrack"})
+    end
+
+    test "a changed field outside the set does not" do
+      refute Settings.would_restart?(
+               %{"rtsp_url" => "rtsp://h/1", "max_unseen_ms" => 1000},
+               %{"rtsp_url" => "rtsp://h/1", "max_unseen_ms" => 2000}
+             )
+    end
+
+    test "a camera with no saved settings is being added, not restarted" do
+      refute Settings.would_restart?(nil, %{"rtsp_url" => "rtsp://h/1"})
+    end
+  end
+
+  describe "errors_for/2" do
+    test "returns the field's or the cell's messages, and none for a clean key" do
+      {routed, _unclaimed} =
+        Settings.field_errors(
+          [
+            "camera cam1: rtsp_url is required",
+            "camera cam1: min_score values must be 0..1 (person)"
+          ],
+          "cam1",
+          ["person"]
+        )
+
+      assert Settings.errors_for(routed, "rtsp_url") == ["rtsp_url is required"]
+
+      assert Settings.errors_for(routed, {"person", "min_score"}) == [
+               "min_score values must be 0..1 (person)"
+             ]
+
+      assert Settings.errors_for(routed, "tracker") == []
+      assert Settings.errors_for(routed, {"car", "min_score"}) == []
+      assert Settings.errors_for(%{}, "rtsp_url") == []
     end
   end
 
