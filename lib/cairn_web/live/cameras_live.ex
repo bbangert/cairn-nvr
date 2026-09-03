@@ -669,9 +669,17 @@ defmodule CairnWeb.CamerasLive do
           >
             {zone_summary(length(@saved.zones))}
             <div style="flex: 1;"></div>
-            <%!-- Plain href: phase 4 adds the route, and a `~p` to a route the
-                  router has not got yet fails verification. --%>
-            <.link href={"/cameras/#{@saved.id}/zones"} class="hs-btn hs-btn--sm">Edit zones</.link>
+            <%!-- Disabled, not linked: `/cameras/:id/zones` is phase 4's route,
+                  and a link to a route the router has not got is a 404 for the
+                  operator. Phase 4 swaps in the `~p` link. --%>
+            <button
+              type="button"
+              class="hs-btn hs-btn--sm"
+              disabled
+              title="The zone editor arrives with the next release"
+            >
+              Edit zones
+            </button>
           </div>
         </div>
 
@@ -906,9 +914,15 @@ defmodule CairnWeb.CamerasLive do
               ></button>
               <div style="flex: 1;"></div>
               <.link navigate={~p"/cameras/#{cam.id}/edit"} class="hs-btn hs-btn--sm">Edit</.link>
-              <%!-- Plain href: phase 4 adds the route, and a `~p` to a route the
-                    router has not got yet fails verification. --%>
-              <.link href={"/cameras/#{cam.id}/zones"} class="hs-btn hs-btn--sm">Zones</.link>
+              <%!-- Disabled until phase 4 adds the route — see the edit page. --%>
+              <button
+                type="button"
+                class="hs-btn hs-btn--sm"
+                disabled
+                title="The zone editor arrives with the next release"
+              >
+                Zones
+              </button>
               <button
                 class="hs-btn hs-btn--sm"
                 disabled={MapSet.member?(@applying, cam.id)}

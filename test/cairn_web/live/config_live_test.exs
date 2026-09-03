@@ -104,11 +104,16 @@ defmodule CairnWeb.ConfigLiveTest do
           else: Application.delete_env(:cairn, :config_server)
       end)
 
-      {:ok, _view, html} = live(conn, "/config")
+      {:ok, view, html} = live(conn, "/config")
 
       assert html =~ "config-busy"
       assert html =~ "Configuration is being applied"
       refute html =~ "config-globals"
+
+      # Reload against the same dead server: an error card, not a crash.
+      html = render_click(view, "reload", %{})
+      assert html =~ ~s(id="reload-result")
+      assert html =~ "try again in a moment"
     end
   end
 

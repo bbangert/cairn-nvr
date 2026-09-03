@@ -81,7 +81,9 @@ defmodule CairnWeb.CamerasLiveTest do
     assert html =~ "1 zone"
     assert html =~ "no detection"
     assert html =~ ~s(href="/cameras/cam1/edit")
-    assert html =~ ~s(href="/cameras/cam1/zones")
+    # Phase 4 adds the zones route; until then the button is disabled, not a 404.
+    refute html =~ "/cameras/cam1/zones"
+    assert html =~ ~r/<button[^>]*disabled[^>]*>\s*Zones/
     assert html =~ ~s(id="cameras-add")
   end
 
