@@ -16,7 +16,7 @@ defmodule CairnWeb.CameraCards do
   # Vendor spellings, not a taxonomy: a key here is masked in the readout and
   # keeps the URL out of the form's `value=`. Guessing wide is the cheap
   # direction — a misjudged non-secret is merely hidden.
-  @credential_params ~w(password pass pwd passwd psw token secret auth key
+  @credential_params ~w(password pass pwd passwd psw token access_token secret auth key
                         apikey api_key session user username)
 
   # Label and colour only. The dashboard tile keeps its own richer map: it

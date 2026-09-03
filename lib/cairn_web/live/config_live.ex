@@ -27,6 +27,7 @@ defmodule CairnWeb.ConfigLive do
        page_title: "Config",
        reload_result: nil,
        reimporting: false,
+       reimport_unconfirmed?: false,
        busy?: false,
        config: nil,
        config_path: Config.default_path(),
@@ -54,7 +55,7 @@ defmodule CairnWeb.ConfigLive do
 
       {:noreply,
        socket
-       |> assign(reimporting: true)
+       |> assign(reimporting: true, reimport_unconfirmed?: false)
        |> start_async(:reimport, fn -> ConfigSource.reimport(path) end)}
     end
   end
@@ -63,11 +64,19 @@ defmodule CairnWeb.ConfigLive do
   # The apply that ends with this message is what makes the server answerable
   # again: a page opened mid-apply renders the busy card and would otherwise
   # keep it until the operator reloaded the browser. It is also the only
-  # confirmed end of an unconfirmed re-import (see the `:exit` clause above),
-  # so it is what re-enables the button — clearing `reimporting` here is a
-  # no-op on every other path, since those already clear it themselves.
-  def handle_info({:config_changed, _diff}, socket),
-    do: {:noreply, socket |> assign(reimporting: false) |> load()}
+  # confirmed end of an unconfirmed re-import (see the `:exit` clause below),
+  # so it is what re-enables the button — but only then: the topic carries
+  # every camera save, and a broadcast that lands while this session's task
+  # is still queued or running must not re-enable a second destructive
+  # replacement behind the first. A running task clears the flag itself.
+  def handle_info({:config_changed, _diff}, socket) do
+    socket =
+      if socket.assigns.reimport_unconfirmed?,
+        do: assign(socket, reimporting: false, reimport_unconfirmed?: false),
+        else: socket
+
+    {:noreply, load(socket)}
+  end
 
   @impl true
   def handle_async(:reimport, {:ok, result}, socket) do
@@ -97,7 +106,13 @@ defmodule CairnWeb.ConfigLive do
       |> error_result()
       |> Map.put(:unconfirmed, true)
 
-    {:noreply, socket |> assign(reload_result: result) |> load()}
+    {:noreply,
+     socket
+     |> assign(
+       reimport_unconfirmed?: true,
+       reload_result: result
+     )
+     |> load()}
   end
 
   # The same `catch :exit` as the mount's overlay: a reload pressed while a

@@ -351,6 +351,50 @@ defmodule CairnWeb.ConfigLiveTest do
       assert html =~ "Cameras re-imported from config.yml — changes are live"
     end
 
+    test "a config broadcast during a running re-import does not re-enable the button", %{
+      conn: conn,
+      path: path
+    } do
+      test_pid = self()
+
+      slow =
+        start_supervised!(
+          {Config.Server,
+           path: path,
+           name: nil,
+           source: {ConfigSource, :load},
+           apply_diff: fn _diff, _config ->
+             send(test_pid, :applying)
+             receive do: (:release -> :ok)
+           end,
+           apply_native: fn _config -> :ok end},
+          id: :config_live_reimport_broadcast_server
+        )
+
+      Application.put_env(:cairn, :config_server, slow)
+
+      {:ok, view, _html} = live(conn, "/config")
+      render_click(view, "reimport")
+      assert_receive :applying, 2_000
+
+      # Another session's save lands on the same topic while this task runs.
+      Phoenix.PubSub.broadcast(
+        Cairn.PubSub,
+        Config.topic(),
+        {:config_changed, %{added: [], removed: [], changed: [], refreshed: []}}
+      )
+
+      # The server is mid-apply, so the page shows the busy card; either way no
+      # enabled Import button exists to click a second time.
+      html = render(view)
+      assert html =~ "config-busy"
+      refute view |> element("#config-reimport:not([disabled])") |> has_element?()
+
+      send(slow, :release)
+      html = render_async(view, 2_000)
+      assert html =~ "Cameras re-imported from config.yml — changes are live"
+    end
+
     test "a file that fails to load shows the re-import failure headline, not the reload one", %{
       conn: conn,
       path: path

@@ -5,6 +5,14 @@ defmodule CairnWeb.CameraCardsTest do
   alias Cairn.Cameras.Camera
   alias CairnWeb.CameraCards
 
+  describe "access_token" do
+    test "is a credential the mask and the prefill rule both see" do
+      url = "http://cam.lan/flv?stream=ch0&access_token=SECRET"
+      assert CameraCards.mask_url(url) == "http://cam.lan/flv?stream=ch0&access_token=•••••"
+      assert CameraCards.credentialed?(url)
+    end
+  end
+
   describe "describe_exit/1" do
     test "names the exception and never what it was holding" do
       changeset =
