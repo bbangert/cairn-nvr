@@ -59,7 +59,7 @@ defmodule Cairn.ConfigSource do
   # so a test can drive it directly with a constructed exception; nothing
   # outside this module calls it.
   @doc false
-  @spec describe_import_error(%Ecto.InvalidChangesetError{} | %Ecto.ConstraintError{}) ::
+  @spec describe_import_error(Exception.t()) ::
           String.t()
   def describe_import_error(%Ecto.InvalidChangesetError{changeset: changeset}) do
     changeset
