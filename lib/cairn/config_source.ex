@@ -24,6 +24,7 @@ defmodule Cairn.ConfigSource do
 
   import Ecto.Query, only: [from: 2]
 
+  alias Cairn.CameraControl
   alias Cairn.Cameras
   alias Cairn.Cameras.Camera
   alias Cairn.Cameras.Setting
@@ -126,10 +127,15 @@ defmodule Cairn.ConfigSource do
   # now: a row another session added between the call and the transaction is
   # in neither the deleted list nor the applied diff — a disabled row is in
   # no config at all, and D-P8 keys prunes on the row rather than the diff.
+  # A re-import bypasses `Cameras.create/1`, so an id it re-inserts after an
+  # earlier delete would stay tombstoned in `CameraControl` and refuse every
+  # control write; the survivors are revived here for the same reason
+  # `create/1` revives its own id.
   defp prune_deleted(ref) do
     deleted = Process.delete({:reimport_deleted, ref}) || []
     remaining = Enum.map(Cameras.list(), & &1.id)
     Enum.each(deleted -- remaining, &Cameras.prune_runtime/1)
+    Enum.each(remaining, &CameraControl.revive/1)
   end
 
   defp replace_rows(path, ref) do

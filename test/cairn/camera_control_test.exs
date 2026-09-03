@@ -41,8 +41,10 @@ defmodule Cairn.CameraControlTest do
     CameraControl.set(keep, %{detection_enabled: false})
     CameraControl.set(drop, %{detection_enabled: false})
 
-    # prune is a call, so its deletes are visible to these ETS reads.
-    CameraControl.prune([keep])
+    # prune is a call, so its deletes are visible to these ETS reads. Every
+    # other id stays known: the shared server's rows belong to other tests,
+    # and a prune now tombstones what it drops.
+    CameraControl.prune(Map.keys(CameraControl.all()) -- [drop])
 
     assert CameraControl.get(keep).detection_enabled == false
 
@@ -87,6 +89,5 @@ defmodule Cairn.CameraControlTest do
     assert {:error, :removed} = CameraControl.set(id, %{detect: false})
     assert :ok = CameraControl.revive(id)
     assert %{} = CameraControl.set(id, %{detect: false})
-    CameraControl.prune([])
   end
 end

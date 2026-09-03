@@ -715,6 +715,19 @@ defmodule Cairn.ConfigSourceTest do
       assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
     end
 
+    test "an id the file re-inserts after a delete accepts control writes again", %{path: path} do
+      # cam_b is in the file but not in the rows: tombstone it as a delete would.
+      Cairn.CameraControl.tombstone("cam_b")
+      assert {:error, :removed} = Cairn.CameraControl.set("cam_b", %{detection_enabled: false})
+
+      assert {:ok, _diff, _warnings} = ConfigSource.reimport(path)
+
+      assert %{detection_enabled: false} =
+               Cairn.CameraControl.set("cam_b", %{detection_enabled: false})
+
+      Cairn.CameraControl.prune(Map.keys(Cairn.CameraControl.all()) -- ["cam_b"])
+    end
+
     test "a second re-import of the same file is refused", %{path: path} do
       assert {:ok, _diff, _warnings} = ConfigSource.reimport(path)
 
