@@ -488,6 +488,22 @@ defmodule Cairn.StreamUrlTest do
     end
   end
 
+  describe "a // behind something that is not a scheme" do
+    test "opens no authority, so the credential before it fails closed" do
+      url = "rtsp:user:s3cret@//host/live"
+      masked = StreamUrl.mask(url)
+      refute masked =~ "s3cret"
+      assert StreamUrl.credentialed?(url)
+      assert StreamUrl.user(url) == nil
+      assert StreamUrl.compose(url, "ops", "pw") == url
+    end
+
+    test "a scheme with digits, plus, dot or dash still opens one" do
+      assert {"rtsp+tls://", nil, "h/s"} = StreamUrl.split_authority("rtsp+tls://h/s")
+      assert {"//", nil, "h/s"} = StreamUrl.split_authority("//h/s")
+    end
+  end
+
   describe "credential_key?/1" do
     test "names the vendor spellings, whatever their case" do
       assert StreamUrl.credential_key?("password")

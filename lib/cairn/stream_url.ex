@@ -71,10 +71,14 @@ defmodule Cairn.StreamUrl do
   # fail-closed path: display-ambiguous on any `@` it holds, and its query —
   # the whole string, since none of it was eaten by a false authority — masked
   # by the ordinary pair rule.
+  #
+  # The prefix must be nothing or a scheme (`rtsp:`), not merely free of those
+  # three characters: `rtsp:user:SECRET@//host/live` would otherwise open an
+  # authority at `host` with the credential sitting outside every reader.
   defp open_authority(url) do
     case String.split(url, "//", parts: 2) do
       [prefix, onward] ->
-        if :binary.match(prefix, ["/", "?", "#"]) == :nomatch,
+        if prefix == @blank or Regex.match?(~r/^[A-Za-z][A-Za-z0-9+.-]*:$/, prefix),
           do: {prefix <> "//", onward},
           else: :none
 
