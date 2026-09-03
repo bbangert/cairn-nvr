@@ -27,9 +27,16 @@ defmodule Cairn.StreamUrlTest do
 
       assert StreamUrl.mask("rtsp://user:sec@ret@host/s") == "rtsp://user:•••••@host/s"
       assert StreamUrl.mask("rtsp://SEC@RET@host/s") == "rtsp://•••••@host/s"
+    end
 
-      assert StreamUrl.mask("rtsp://u:p@host/path@x?password=p") ==
-               "rtsp://u:•••••@host/path@x?password=•••••"
+    # The path's own `@` (before the query starts) is the ambiguity rule now,
+    # not this describe's "last @ of the authority" reading: a password
+    # holding a raw `@` and `/` would produce the identical bytes, so masking
+    # runs through the LAST `@` before the query rather than the authority's.
+    test "an @ in the path before the query is the ambiguity rule, not this one" do
+      url = "rtsp://u:p@host/path@x?password=p"
+      assert StreamUrl.ambiguous?(url)
+      assert StreamUrl.mask(url) == "rtsp://•••••@x?password=•••••"
     end
   end
 
@@ -271,15 +278,50 @@ defmodule Cairn.StreamUrlTest do
       assert StreamUrl.compose(@ambiguous, "ops", "pw") == @ambiguous
     end
 
-    # The `@` sits inside a readable authority, so nothing is ambiguous: the
-    # path keeps its own.
-    test "is not what an @ in the path of a normal authority is" do
+    # The authority reads as ordinary userinfo `u:p` at host `h` — but a
+    # password `p/live` would produce these identical bytes, so this is now
+    # refused the same as an @-after-path authority with no userinfo at all:
+    # this module cannot tell "normal credential, @ in the path" from
+    # "credential holding a raw / and @" apart, and a wrong guess on either
+    # renders half a password or points a stripped/composed URL at the wrong
+    # authority.
+    test "an @ past the path of an otherwise-normal authority is ambiguous too" do
       url = "rtsp://u:p@h/live@1"
-      refute StreamUrl.ambiguous?(url)
-      assert StreamUrl.mask(url) == "rtsp://u:•••••@h/live@1"
-      assert StreamUrl.strip_credentials(url) == "rtsp://h/live@1"
-      assert StreamUrl.user(url) == "u"
-      assert StreamUrl.compose(url, "", "new") == "rtsp://u:new@h/live@1"
+      assert StreamUrl.ambiguous?(url)
+      assert StreamUrl.mask(url) == "rtsp://•••••@1"
+      refute StreamUrl.mask(url) =~ "live"
+      assert StreamUrl.credentialed?(url)
+      assert StreamUrl.strip_credentials(url) == "rtsp://1"
+      assert StreamUrl.user(url) == nil
+      assert StreamUrl.userinfo(url) == nil
+      assert StreamUrl.compose(url, "ops", "pw") == url
+    end
+
+    # A password containing both a raw `@` and a raw `/` reads exactly like
+    # ordinary userinfo `user:sec` at host `ret` whose path happens to hold an
+    # `@` — the previous test's shape — so it gets the same wide refusal:
+    # masked/stripped through the LAST `@`, never split apart or spliced into.
+    @raw_slash_password "rtsp://user:sec@ret/part@host/live"
+
+    test "a password holding a raw @ and / is masked through the last @" do
+      url = @raw_slash_password
+      assert StreamUrl.ambiguous?(url)
+      assert StreamUrl.mask(url) == "rtsp://•••••@host/live"
+      refute StreamUrl.mask(url) =~ "sec"
+      refute StreamUrl.mask(url) =~ "ret/part"
+      assert StreamUrl.credentialed?(url)
+    end
+
+    test "a password holding a raw @ and / strips through the last @, offering no username" do
+      url = @raw_slash_password
+      assert StreamUrl.strip_credentials(url) == "rtsp://host/live"
+      assert StreamUrl.user(url) == nil
+      assert StreamUrl.userinfo(url) == nil
+    end
+
+    test "a password holding a raw @ and / is never spliced into" do
+      url = @raw_slash_password
+      assert StreamUrl.compose(url, "ops", "pw") == url
     end
 
     # A stored value malformed this way reads as bare everywhere —

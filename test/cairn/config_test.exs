@@ -414,6 +414,26 @@ defmodule Cairn.ConfigTest do
       end
     end
 
+    test "the global retention.per_label value is bounded like retention.days" do
+      for value <- [0, -1, 10_001, "7"] do
+        map = Map.put(base_map(), "retention", %{"per_label" => %{"person" => value}})
+
+        assert {:error, errors} = Config.from_map(map)
+        assert Enum.any?(errors, &(&1 =~ "retention.per_label.person must be >= 1"))
+      end
+
+      map = Map.put(base_map(), "retention", %{"per_label" => %{"person" => 30}})
+      assert {:ok, config, []} = Config.from_map(map)
+      assert config.retention_per_label == %{"person" => 30}
+    end
+
+    test "a non-map global retention.per_label is an error, not a crash" do
+      map = Map.put(base_map(), "retention", %{"per_label" => "30 days"})
+
+      assert {:error, errors} = Config.from_map(map)
+      assert "retention.per_label must be a mapping" in errors
+    end
+
     # The camera block goes through `Cairn.Config.Camera`, the parser a form
     # candidate also goes through, so the file and the form agree on it.
     test "a camera's retention.days is bounded like the global one" do

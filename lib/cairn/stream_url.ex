@@ -76,20 +76,36 @@ defmodule Cairn.StreamUrl do
 
   @doc """
   Whether the URL holds an `@` that `split_authority/1` reads as no credential
-  at all: past the authority's first `/` with no `@` in the authority itself
-  (`rtsp://u:pa/ss@cam.lan/main`), or anywhere before a `?`/`#` in a URL with
-  no `//` to open an authority (`rtsp:/user:secret@host/live`, a malformed
-  stored value). Both are `@`s with a credential plausibly in front of them and
-  no boundary this module can trust, so both fail closed.
+  at all, or that it reads as an ordinary userinfo boundary but that a
+  password containing both a raw `@` and a raw `/` would produce the same way.
 
-  A hand-typed or imported password really does contain a raw slash sometimes,
-  and there is no way to tell that URL from a bare one whose *path* holds an
-  `@`. Either guess is wrong half the time and a wrong guess renders half a
-  password, so both readings are refused: everything from `//` through the
-  last such `@` is treated as credential — masked whole, never spliced into,
-  stripped entire. The cost is a bare URL with an `@` in its path opening
-  blank in the form, which the operator repairs by retyping it; the same
-  repair path a row this module cannot read already takes.
+  Three shapes fail closed, all on the same reasoning: an `@` past the
+  authority's first `/` is indistinguishable from a userinfo's password
+  running on past that `/` and ending at a *later* `@` instead —
+
+    * no `@` in the authority itself (`rtsp://u:pa/ss@cam.lan/main`) — the
+      apparent authority has no credential at all, but a password holding a
+      raw `/` reads exactly this way;
+    * an `@` in the authority AND another `@` after its first `/`
+      (`rtsp://u:sec@ret/part@host/live`) — this reads as ordinary userinfo
+      `u:sec` at host `ret`, but a password `sec@ret/part` produces the
+      identical bytes;
+    * anywhere before a `?`/`#` in a URL with no `//` to open an authority
+      (`rtsp:/user:secret@host/live`, a malformed stored value).
+
+  A hand-typed or imported password really does contain a raw slash
+  sometimes, and there is no way to tell that URL from an ordinary one whose
+  *path* holds an `@` — bare, or already read as userinfo@host. Either guess
+  is wrong half the time and a wrong guess renders half a password or points
+  a stripped/composed URL at the wrong authority, so every such reading is
+  refused: everything from `//` through the LAST such `@` is treated as
+  credential — masked whole, never spliced into, stripped entire. The cost is
+  wider now than the first two shapes alone: a bare URL with an `@` in its
+  path, or a *normal* userinfo URL whose path independently holds an `@`,
+  both now open blank in the form and get retyped — the same repair path a
+  row this module cannot read already takes. Guessing wide is the cheap
+  direction (see `@credential_params`'s note): a wrongly-blanked ordinary URL
+  costs a retype, a wrongly-read password costs a leaked or truncated secret.
 
   A raw `?` or `#` in a password is out of reach: past one, an `@` is a query
   or fragment character, and `?x=me@h` is ordinary. Those are left to the
@@ -105,8 +121,11 @@ defmodule Cairn.StreamUrl do
   defp ambiguous_split(url) do
     case String.split(url, "//", parts: 2) do
       [prefix, onward] ->
-        {authority, _tail} = split_at_path(onward)
-        if last_at(authority) == nil, do: last_at_before_query(prefix <> "//", onward)
+        {authority, tail} = split_at_path(onward)
+
+        if last_at(authority) == nil or at_past_slash?(tail) do
+          last_at_before_query(prefix <> "//", onward)
+        end
 
       # No `//`, so `split_authority/1` finds no userinfo and every reader
       # would treat the whole string as bare. An `@` in it is a credential
@@ -115,6 +134,19 @@ defmodule Cairn.StreamUrl do
       [_no_authority] ->
         last_at_before_query(@blank, url)
     end
+  end
+
+  # Whether `tail` — everything from the authority's first `/` onward — holds
+  # an `@` before any `?`/`#`. True here is ambiguous regardless of whether
+  # the authority in front of `tail` already parsed as an ordinary
+  # userinfo@host: that reading and a password holding a raw `@` *and* a raw
+  # `/` produce the same bytes, and this module cannot tell them apart.
+  defp at_past_slash?(tail) do
+    String.starts_with?(tail, "/") and
+      case :binary.match(tail, ["?", "#"]) do
+        {at, _len} -> :binary.match(binary_part(tail, 0, at), "@") != :nomatch
+        :nomatch -> :binary.match(tail, "@") != :nomatch
+      end
   end
 
   defp last_at_before_query(scheme, onward) do
@@ -309,9 +341,20 @@ defmodule Cairn.StreamUrl do
     join_authority(scheme, nil, URI.to_string(%{uri | query: query}))
   end
 
-  @doc "The URL's userinfo, or `nil`."
+  @doc """
+  The URL's userinfo, or `nil`.
+
+  Checked against `ambiguous?/1` rather than reading `split_authority/1`
+  alone: an ambiguous URL can still parse an ordinary userinfo out of its
+  apparent authority (`rtsp://u:p@h/live@1` reads as `u:p`@`h` before the
+  ambiguity rule sees the later `@`), and handing that back would publish
+  half of what might be a password holding a raw `@`.
+  """
   @spec userinfo(term()) :: String.t() | nil
-  def userinfo(url) when is_binary(url), do: url |> split_authority() |> elem(1)
+  def userinfo(url) when is_binary(url) do
+    if ambiguous?(url), do: nil, else: url |> split_authority() |> elem(1)
+  end
+
   def userinfo(_absent), do: nil
 
   @doc """

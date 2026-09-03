@@ -1735,9 +1735,30 @@ defmodule Cairn.Config do
     |> check(int?(config.retention_days, days.first, days.last), "retention.days must be >= 1")
     |> check(int?(config.retention_tracks_days, 1, 10_000), "retention.tracks_days must be >= 1")
     |> check(is_binary(config.data_dir), "data_dir must be a string")
+    |> validate_retention_per_label(config.retention_per_label, days)
   end
 
   defp int?(v, min, max), do: is_integer(v) and v >= min and v <= max
+
+  # Global `retention.per_label` bypassed this range: `from_map/2` copies it
+  # verbatim, so an out-of-range value (0, negative) read past validation and
+  # into `Cairn.Retention` as an "already expired" clip lifetime, and a
+  # non-map value raised in `Map.values/1` there instead of failing at load.
+  # Bounded on the same range as `retention.days` (`Camera.retention_days_range/0`)
+  # for the reason `validate_numbers/2`'s comment gives for the camera side:
+  # one range, read from one place, so the two cannot drift apart.
+  defp validate_retention_per_label(acc, per_label, days) when is_map(per_label) do
+    Enum.reduce(per_label, acc, fn {label, value}, acc ->
+      check(
+        acc,
+        int?(value, days.first, days.last),
+        "retention.per_label.#{label} must be >= #{days.first}"
+      )
+    end)
+  end
+
+  defp validate_retention_per_label(acc, _not_map, _days),
+    do: add_error(acc, "retention.per_label must be a mapping")
 
   # -- accumulator helpers ----------------------------------------------------
 
