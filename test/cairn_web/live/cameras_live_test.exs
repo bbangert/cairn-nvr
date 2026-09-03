@@ -800,9 +800,10 @@ defmodule CairnWeb.CamerasLiveTest do
 
       {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
 
-      dead = spawn(fn -> :ok end)
-      ref = Process.monitor(dead)
-      assert_receive {:DOWN, ^ref, :process, ^dead, :normal}
+      # spawn_monitor, not spawn-then-monitor: a process that has already exited
+      # is reported :noproc, and under CI load it always has.
+      {dead, ref} = spawn_monitor(fn -> :ok end)
+      assert_receive {:DOWN, ^ref, :process, ^dead, _reason}
       Application.put_env(:cairn, :config_server, dead)
 
       view
@@ -857,9 +858,10 @@ defmodule CairnWeb.CamerasLiveTest do
 
       {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
 
-      dead = spawn(fn -> :ok end)
-      ref = Process.monitor(dead)
-      assert_receive {:DOWN, ^ref, :process, ^dead, :normal}
+      # spawn_monitor, not spawn-then-monitor: a process that has already exited
+      # is reported :noproc, and under CI load it always has.
+      {dead, ref} = spawn_monitor(fn -> :ok end)
+      assert_receive {:DOWN, ^ref, :process, ^dead, _reason}
       Application.put_env(:cairn, :config_server, dead)
 
       render_submit(view, "remove", %{"id" => "cam1"})
@@ -1048,9 +1050,10 @@ defmodule CairnWeb.CamerasLiveTest do
 
       {:ok, _diff, _warnings} = Config.Server.reload(server)
 
-      dead = spawn(fn -> :ok end)
-      ref = Process.monitor(dead)
-      assert_receive {:DOWN, ^ref, :process, ^dead, :normal}
+      # spawn_monitor, not spawn-then-monitor: a process that has already exited
+      # is reported :noproc, and under CI load it always has.
+      {dead, ref} = spawn_monitor(fn -> :ok end)
+      assert_receive {:DOWN, ^ref, :process, ^dead, _reason}
       Application.put_env(:cairn, :config_server, dead)
 
       {:ok, view, html} = live(conn, "/cameras/new?tab=manual")

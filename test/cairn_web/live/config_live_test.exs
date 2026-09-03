@@ -91,9 +91,10 @@ defmodule CairnWeb.ConfigLiveTest do
     # what `overlay/1`'s `catch :exit` is there for either way — the mount
     # itself must not crash while the config server is applying a save.
     test "a config server that cannot answer renders a busy line, not a crash", %{conn: conn} do
-      dead = spawn(fn -> :ok end)
-      ref = Process.monitor(dead)
-      assert_receive {:DOWN, ^ref, :process, ^dead, :normal}
+      # spawn_monitor, not spawn-then-monitor: a process that has already exited
+      # is reported :noproc, and under CI load it always has.
+      {dead, ref} = spawn_monitor(fn -> :ok end)
+      assert_receive {:DOWN, ^ref, :process, ^dead, _reason}
 
       previous = Application.get_env(:cairn, :config_server)
       Application.put_env(:cairn, :config_server, dead)
@@ -119,9 +120,10 @@ defmodule CairnWeb.ConfigLiveTest do
     # The apply that made the server unanswerable ends with this message, so
     # the page leaves the busy card without the operator reloading the browser.
     test "the config change that ends the apply re-reads the page", %{conn: conn} do
-      dead = spawn(fn -> :ok end)
-      ref = Process.monitor(dead)
-      assert_receive {:DOWN, ^ref, :process, ^dead, :normal}
+      # spawn_monitor, not spawn-then-monitor: a process that has already exited
+      # is reported :noproc, and under CI load it always has.
+      {dead, ref} = spawn_monitor(fn -> :ok end)
+      assert_receive {:DOWN, ^ref, :process, ^dead, _reason}
 
       previous = Application.get_env(:cairn, :config_server)
       Application.put_env(:cairn, :config_server, dead)
