@@ -262,6 +262,11 @@ defmodule Cairn.Cameras do
   form write settings through (plan D-P5), so an untouched save renders
   byte-identically and diffs to nothing. Idempotent:
   `canonical(canonical(m)) == canonical(m)`.
+
+  A value the parser reads exactly as it reads the absent key is dropped, so
+  the two writers cannot disagree over whether to spell out a default: the
+  form has no field that can produce `pipeline: membrane`, and its checkbox
+  and args field write nothing for `transcode: false` and `[]`.
   """
   @spec canonical(map()) :: map()
   def canonical(map) when is_map(map) do
@@ -275,6 +280,14 @@ defmodule Cairn.Cameras do
   defp canonical_put(acc, key, _value) when key in ["id", "zones"], do: acc
   defp canonical_put(acc, _key, nil), do: acc
 
+  # `Cairn.Config.Camera.parse/3` defaults `transcode` to false and reads
+  # `pipeline: membrane` as the only accepted value (`check_pipeline/3` errors
+  # on every other), so both spell out what absence already says. Any other
+  # `pipeline` is kept, to be refused by name on the next load rather than
+  # silently repaired.
+  defp canonical_put(acc, "transcode", false), do: acc
+  defp canonical_put(acc, "pipeline", "membrane"), do: acc
+
   defp canonical_put(acc, "min_score", value) do
     Map.put(acc, "min_score", canonical_min_score(value))
   end
@@ -286,8 +299,12 @@ defmodule Cairn.Cameras do
     end
   end
 
+  # An empty list adds no arguments, which is what the absent key does.
   defp canonical_put(acc, "extra_ffmpeg_args", value) do
-    Map.put(acc, "extra_ffmpeg_args", canonical_extra_args(value))
+    case canonical_extra_args(value) do
+      [] -> acc
+      args -> Map.put(acc, "extra_ffmpeg_args", args)
+    end
   end
 
   defp canonical_put(acc, "motion_json", value) do

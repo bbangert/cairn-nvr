@@ -133,6 +133,24 @@ defmodule Cairn.CamerasTest do
       assert Cameras.canonical(%{"motion_json" => "not json"}) == %{"motion_json" => "not json"}
     end
 
+    # The form has no field that writes any of them, so a row that spelled a
+    # default out would read as an edit the first time it was saved.
+    test "drops values the parser reads exactly as it reads the absent key" do
+      assert Cameras.canonical(%{
+               "rtsp_url" => "rtsp://h/1",
+               "transcode" => false,
+               "extra_ffmpeg_args" => [],
+               "pipeline" => "membrane"
+             }) == %{"rtsp_url" => "rtsp://h/1"}
+    end
+
+    test "keeps a transcode and a pipeline the parser does not read as absent" do
+      assert Cameras.canonical(%{"transcode" => true}) == %{"transcode" => true}
+      # `check_pipeline/3` refuses this one by name on the next load; repairing
+      # it here would hide the key the operator has to delete.
+      assert Cameras.canonical(%{"pipeline" => "classic"}) == %{"pipeline" => "classic"}
+    end
+
     test "keeps retention days/per_label, drops nil per-label entries and an empty block" do
       assert Cameras.canonical(%{
                "retention" => %{"days" => 7, "per_label" => %{"car" => 30, "person" => nil}}
@@ -218,6 +236,22 @@ defmodule Cairn.CamerasTest do
 
       assert {:ok, %{removed: ["cam2"]}, []} = Cameras.delete("cam2")
       assert Cameras.get("cam2") == nil
+    end
+
+    test "a row imported with parser-default keys re-saves to an empty diff" do
+      imported =
+        Cameras.canonical(%{
+          "rtsp_url" => "rtsp://h/1",
+          "transcode" => false,
+          "extra_ffmpeg_args" => [],
+          "pipeline" => "membrane"
+        })
+
+      assert {:ok, %{added: ["cam1"]}, []} =
+               Cameras.create(%{"id" => "cam1", "settings" => imported})
+
+      assert {:ok, %{added: [], removed: [], changed: [], refreshed: []}, []} =
+               Cameras.update("cam1", %{"settings" => imported})
     end
 
     test "reorder refuses any id list that is not the whole fleet, exactly once each" do

@@ -123,9 +123,11 @@ Filterable, paginated list of recorded event clips, newest first.
 
 ## Page 4 — Config `/config`
 
-Read-only render of the node settings from the YAML file, plus the reload
-workflow. Cameras are no longer shown here: they live in the database and
-are managed on `/cameras` (see `docs/design/camera-config-handoff.md`,
+The node settings render read-only from the YAML file, but the page is not:
+it carries Reload and the destructive "Import again", which replaces every
+camera row with the file's. Cameras are no longer shown here: they live in
+the database and are managed on `/cameras` (see
+`docs/design/camera-config-handoff.md`,
 which also specifies this page's import section and the link row that
 replaced the camera cards).
 

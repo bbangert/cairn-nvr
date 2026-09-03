@@ -264,6 +264,77 @@ defmodule CairnWeb.CameraFormTest do
       assert {:ok, %{"extra_ffmpeg_args" => ["-rtsp_transport", "tcp"]}} =
                CameraForm.to_settings(params)
     end
+
+    # The field is one line and the split is on whitespace, so re-splitting
+    # what the field only rendered would break this argument in two.
+    test "an argument containing a space survives an untouched edit, an edited field splits" do
+      args = ["-headers", "Authorization: Bearer x"]
+      row = %Camera{id: "gate", settings: %{"extra_ffmpeg_args" => args}, zones: []}
+
+      params = CameraForm.to_params(row)
+      assert params["extra_ffmpeg_args"] == "-headers Authorization: Bearer x"
+
+      {:ok, settings} = CameraForm.to_settings(params, row)
+      assert settings["extra_ffmpeg_args"] == args
+
+      {:ok, edited} =
+        params
+        |> Map.put("extra_ffmpeg_args", "-rtsp_transport tcp")
+        |> CameraForm.to_settings(row)
+
+      assert edited["extra_ffmpeg_args"] == ["-rtsp_transport", "tcp"]
+    end
+
+    # Neither field can supply the credential here: the password says "leave
+    # blank to keep" and the username is a prefill, not an entry.
+    test "a retyped URL keeps the credential the saved one carried" do
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://u:pw@old/1"}, zones: []}
+      params = CameraForm.to_params(row)
+
+      assert params["username"] == "u"
+
+      {:ok, settings} =
+        params |> Map.put("rtsp_url", "rtsp://new/1") |> CameraForm.to_settings(row)
+
+      assert settings["rtsp_url"] == "rtsp://u:pw@new/1"
+
+      {:ok, typed} =
+        params
+        |> Map.merge(%{"rtsp_url" => "rtsp://new/1", "password" => "pw2"})
+        |> CameraForm.to_settings(row)
+
+      assert typed["rtsp_url"] == "rtsp://u:pw2@new/1"
+    end
+
+    test "a saved key the form has no field for survives an edit" do
+      row = %Camera{
+        id: "gate",
+        settings: %{"rtsp_url" => "rtsp://cam.lan/main", "pipeline" => "membrane"},
+        zones: []
+      }
+
+      {:ok, settings} = row |> CameraForm.to_params() |> CameraForm.to_settings(row)
+
+      assert settings["pipeline"] == "membrane"
+    end
+
+    # The keys `canonical/1` drops as parse-equivalent to absent: the form
+    # writes none of them, so the round trip has to land on the same map.
+    test "a row imported with parser-default keys round-trips unchanged (D-P5)" do
+      settings =
+        Cameras.canonical(%{
+          "rtsp_url" => "rtsp://cam.lan/main",
+          "transcode" => false,
+          "extra_ffmpeg_args" => [],
+          "pipeline" => "membrane"
+        })
+
+      row = %Camera{id: "gate", settings: settings, zones: []}
+
+      {:ok, saved} = row |> CameraForm.to_params() |> CameraForm.to_settings(row)
+
+      assert Cameras.canonical(saved) == settings
+    end
   end
 
   describe "urls/2" do
@@ -400,6 +471,26 @@ defmodule CairnWeb.CameraFormTest do
 
       refute html =~ ~s(camera[labels][0][retention_days])
       assert html =~ ~s(camera[labels][1][retention_days])
+    end
+
+    test "every field has a stable id its label points at" do
+      html = render_form(%{}, plugins: [])
+
+      assert html =~ ~s(id="camera-rtsp_url")
+      assert html =~ ~s(for="camera-rtsp_url")
+      assert html =~ ~s(id="camera-plugin")
+      assert html =~ ~s(for="camera-plugin")
+    end
+
+    # The grid's headings are symbols over unlabelled inputs, so the row and
+    # the column have to arrive in the accessible name.
+    test "a tier cell names its row and its column" do
+      html = render_form(%{}, plugins: [])
+
+      assert html =~ ~s(aria-label="default detect threshold")
+      assert html =~ ~s(aria-label="person track threshold")
+      assert html =~ ~s(aria-label="person record threshold")
+      assert html =~ ~s(aria-label="person keep days")
     end
   end
 

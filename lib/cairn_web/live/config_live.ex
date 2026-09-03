@@ -19,6 +19,8 @@ defmodule CairnWeb.ConfigLive do
 
   @impl true
   def mount(_params, _session, socket) do
+    if connected?(socket), do: Config.Server.subscribe()
+
     {:ok,
      socket
      |> assign(
@@ -48,6 +50,12 @@ defmodule CairnWeb.ConfigLive do
      |> assign(reimporting: true)
      |> start_async(:reimport, fn -> ConfigSource.reimport(path) end)}
   end
+
+  @impl true
+  # The apply that ends with this message is what makes the server answerable
+  # again: a page opened mid-apply renders the busy card and would otherwise
+  # keep it until the operator reloaded the browser.
+  def handle_info({:config_changed, _diff}, socket), do: {:noreply, load(socket)}
 
   @impl true
   def handle_async(:reimport, {:ok, result}, socket) do

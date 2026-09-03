@@ -37,6 +37,14 @@ defmodule CairnWeb.CameraForm do
 
   @text_fields ~w(rtsp_url substream_url plugin ingest tracker motion_json extra_ffmpeg_args)
 
+  # Every settings key this module can write. A saved key outside it — the
+  # vestigial `pipeline`, or one a future release adds before the form does —
+  # is carried through an edit rather than dropped by it, so a save the
+  # operator did not aim at that key leaves it alone. `id` and `zones` are
+  # excluded because they are columns of their own, not settings.
+  @modelled_keys ~w(rtsp_url substream_url plugin ingest tracker motion_json transcode
+                    extra_ffmpeg_args retention min_score track record id zones) ++ @int_fields
+
   # The chip's set. `Cairn.Config.Server.restart_fields/0` is what a running
   # camera cannot take in place; the five added here restart for reasons that
   # module cannot see — the resolved compares in its camera diff
@@ -129,6 +137,7 @@ defmodule CairnWeb.CameraForm do
   `saved` is the row being edited: a blank URL field keeps its URL (the
   credential rule leaves it blank on purpose), and a typed password is
   spliced into that saved URL whether or not it already carries userinfo.
+  Its keys that no field here models are carried through untouched.
   """
   @spec to_settings(map(), Camera.t() | nil) :: {:ok, map()} | {:error, [String.t()]}
   def to_settings(params, saved \\ nil) do
@@ -231,7 +240,8 @@ defmodule CairnWeb.CameraForm do
   # -- params -> settings -----------------------------------------------------
 
   defp build_settings(params, rows, ints, per_label, saved) do
-    %{}
+    saved
+    |> Map.drop(@modelled_keys)
     |> put_url("rtsp_url", params, saved)
     |> put_url("substream_url", params, saved)
     |> put_present("plugin", params)
@@ -239,7 +249,7 @@ defmodule CairnWeb.CameraForm do
     |> put_present("tracker", params)
     |> put_present("motion_json", params)
     |> put_transcode(params)
-    |> put_args(params)
+    |> put_args(params, saved)
     |> put_ints(ints)
     |> put_retention(ints, per_label)
     |> put_min_score(rows)
@@ -266,10 +276,23 @@ defmodule CairnWeb.CameraForm do
   # The row holds the split list even though the parser accepts the string
   # too: the importer stores a list, so the form has to as well or the two
   # would render different maps for the same fleet.
-  defp put_args(acc, params) do
-    case String.split(Map.get(params, "extra_ffmpeg_args") || @blank) do
-      [] -> acc
-      args -> Map.put(acc, "extra_ffmpeg_args", args)
+  #
+  # The field is one line of text and the split is on whitespace, so an
+  # element containing a space cannot survive a round trip through it. Text
+  # still equal to what `args_string/1` rendered is therefore not re-split at
+  # all: the saved list rides out as it went in, and only an edit splits
+  # (D-P5).
+  defp put_args(acc, params, saved) do
+    text = Map.get(params, "extra_ffmpeg_args") || @blank
+    saved_args = saved["extra_ffmpeg_args"]
+
+    if is_list(saved_args) and text == args_string(saved_args) do
+      if saved_args == [], do: acc, else: Map.put(acc, "extra_ffmpeg_args", saved_args)
+    else
+      case String.split(text) do
+        [] -> acc
+        args -> Map.put(acc, "extra_ffmpeg_args", args)
+      end
     end
   end
 
@@ -325,7 +348,7 @@ defmodule CairnWeb.CameraForm do
 
     case base do
       url when is_binary(url) and url != @blank ->
-        Map.put(acc, key, credentialed(url, params, saved))
+        Map.put(acc, key, credentialed(url, key, params, saved))
 
       _absent ->
         acc
@@ -346,7 +369,13 @@ defmodule CairnWeb.CameraForm do
   # splice it into a sub stream nobody edited and break the untouched-edit
   # round trip (D-P5). Only a password, or a username the operator changed,
   # rewrites a URL that has no userinfo.
-  defp credentialed(url, params, saved) do
+  #
+  # Last: a URL retyped for a stream whose saved URL carried the credential
+  # keeps it. Neither field can supply one here — the password field says
+  # "leave blank to keep" and the username is a prefill, not an entry — so
+  # without the carry, moving a camera to a new host or path would quietly
+  # save the stream without its credential.
+  defp credentialed(url, key, params, saved) do
     user = trimmed(params, "username")
     pass = password(params)
 
@@ -354,9 +383,20 @@ defmodule CairnWeb.CameraForm do
       URI.parse(url).userinfo != nil -> compose_url(url, user, pass)
       CameraCards.credentialed?(url) -> url
       pass != @blank or given_user?(user, saved) -> compose_url(url, user, pass)
-      true -> url
+      true -> carry_userinfo(url, saved[key])
     end
   end
+
+  # Copied verbatim: what is on the saved URL is already percent-encoded, and
+  # re-encoding it would change the credential.
+  defp carry_userinfo(url, saved_url) when is_binary(saved_url) do
+    case URI.parse(saved_url).userinfo do
+      nil -> url
+      userinfo -> URI.to_string(%{URI.parse(url) | userinfo: userinfo})
+    end
+  end
+
+  defp carry_userinfo(url, _absent), do: url
 
   defp given_user?(@blank, _saved), do: false
 
@@ -707,8 +747,9 @@ defmodule CairnWeb.CameraForm do
       <h2 style={heading_style()}>Stream</h2>
 
       <div class="hs-field" style={field_style()}>
-        <label style={label_style()}>Camera id</label>
+        <label for="camera-id" style={label_style()}>Camera id</label>
         <input
+          id="camera-id"
           name="camera[id]"
           value={@form.params["id"]}
           readonly={@mode == "edit"}
@@ -750,7 +791,7 @@ defmodule CairnWeb.CameraForm do
       />
 
       <div class="hs-field" data-restart="true" style={field_style()}>
-        <label style={label_style()}>Password<.restart_chip /></label>
+        <label for="camera-password" style={label_style()}>Password<.restart_chip /></label>
         <%!-- Never a value=: a saved credential is not rendered anywhere but
               the masked readout (the credential rule). `phx-update="ignore"`
               follows from that: with no value attribute to restore, the next
@@ -772,8 +813,8 @@ defmodule CairnWeb.CameraForm do
       </div>
 
       <div class="hs-field" data-restart="true" style={field_style()}>
-        <label style={label_style()}>Detection plugin group<.restart_chip /></label>
-        <select name="camera[plugin]" style={input_style()}>
+        <label for="camera-plugin" style={label_style()}>Detection plugin group<.restart_chip /></label>
+        <select id="camera-plugin" name="camera[plugin]" style={input_style()}>
           <option value="" selected={@form.params["plugin"] in [nil, ""]}>no detection</option>
           <%!-- The saved group is an option whatever `@plugins` holds: a config
                 server busy applying answers with `[]`, and a select with no
@@ -791,8 +832,8 @@ defmodule CairnWeb.CameraForm do
       </div>
 
       <div class="hs-field" data-restart="true" style={field_style()}>
-        <label style={label_style()}>Ingest<.restart_chip /></label>
-        <select name="camera[ingest]" style={input_style()}>
+        <label for="camera-ingest" style={label_style()}>Ingest<.restart_chip /></label>
+        <select id="camera-ingest" name="camera[ingest]" style={input_style()}>
           <option value="" selected={@form.params["ingest"] in [nil, ""]}>ffmpeg (default)</option>
           <option
             :for={value <- ~w(ffmpeg rtsp)}
@@ -809,11 +850,12 @@ defmodule CairnWeb.CameraForm do
       </div>
 
       <div class="hs-field" data-restart="true" style={field_style()}>
-        <label style={label_style()}>
+        <label for="camera-transcode" style={label_style()}>
           <%!-- The unchecked box sends nothing, so the hidden field is what
                 turns transcode back off. --%>
           <input type="hidden" name="camera[transcode]" value="false" />
           <input
+            id="camera-transcode"
             type="checkbox"
             class="hs-tog"
             name="camera[transcode]"
@@ -873,6 +915,7 @@ defmodule CairnWeb.CameraForm do
                   named `default` would match no detection label at all. --%>
             <input
               :if={n > 0}
+              aria-label={"#{row["label"]} keep days"}
               name={"camera[labels][#{n}][retention_days]"}
               value={row["retention_days"]}
               inputmode="numeric"
@@ -921,7 +964,10 @@ defmodule CairnWeb.CameraForm do
 
     ~H"""
     <div style="display: flex; flex-direction: column; gap: 3px;">
+      <%!-- The column heading is a symbol in a grid with no per-cell label, so
+            the accessible name has to carry both the row and the column. --%>
       <input
+        aria-label={"#{@row["label"]} #{column_name(@cell)} threshold"}
         name={"camera[labels][#{@n}][#{@cell}]"}
         value={@row[@cell]}
         inputmode="decimal"
@@ -998,8 +1044,8 @@ defmodule CairnWeb.CameraForm do
       </summary>
 
       <div class="hs-field" data-restart="true" style={field_style()}>
-        <label style={label_style()}>Tracker<.restart_chip /></label>
-        <select name="camera[tracker]" style={input_style()}>
+        <label for="camera-tracker" style={label_style()}>Tracker<.restart_chip /></label>
+        <select id="camera-tracker" name="camera[tracker]" style={input_style()}>
           <option value="" selected={@form.params["tracker"] in [nil, ""]}>profile default</option>
           <option :for={name <- @trackers} value={name} selected={@form.params["tracker"] == name}>
             {name}
@@ -1028,8 +1074,9 @@ defmodule CairnWeb.CameraForm do
       />
 
       <div class="hs-field" data-restart="true" style={field_style()}>
-        <label style={label_style()}>Motion gate (JSON)<.restart_chip /></label>
+        <label for="camera-motion_json" style={label_style()}>Motion gate (JSON)<.restart_chip /></label>
         <textarea
+          id="camera-motion_json"
           name="camera[motion_json]"
           rows="4"
           phx-debounce="300"
@@ -1126,8 +1173,9 @@ defmodule CairnWeb.CameraForm do
 
     ~H"""
     <div class="hs-field" data-restart={@restart && "true"} style={field_style()}>
-      <label style={label_style()}>{@label}<.restart_chip :if={@restart} /></label>
+      <label for={"camera-#{@field}"} style={label_style()}>{@label}<.restart_chip :if={@restart} /></label>
       <input
+        id={"camera-#{@field}"}
         name={"camera[#{@field}]"}
         value={@form.params[@field]}
         phx-debounce="300"
@@ -1145,6 +1193,11 @@ defmodule CairnWeb.CameraForm do
     <span class="hs-badge hs-badge--accent" style="font-size: 10px;">restarts camera</span>
     """
   end
+
+  # The column's name in the operator's words, not the settings key's: the
+  # heading over `min_score` reads "Detect ≥".
+  defp column_name("min_score"), do: "detect"
+  defp column_name(cell), do: cell
 
   defp plugin_options(plugins, current) when current in [nil, ""], do: plugins
   defp plugin_options(plugins, current), do: Enum.uniq(plugins ++ [current])

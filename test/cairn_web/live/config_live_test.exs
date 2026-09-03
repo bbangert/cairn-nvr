@@ -115,6 +115,41 @@ defmodule CairnWeb.ConfigLiveTest do
       assert html =~ ~s(id="reload-result")
       assert html =~ "try again in a moment"
     end
+
+    # The apply that made the server unanswerable ends with this message, so
+    # the page leaves the busy card without the operator reloading the browser.
+    test "the config change that ends the apply re-reads the page", %{conn: conn} do
+      dead = spawn(fn -> :ok end)
+      ref = Process.monitor(dead)
+      assert_receive {:DOWN, ^ref, :process, ^dead, :normal}
+
+      previous = Application.get_env(:cairn, :config_server)
+      Application.put_env(:cairn, :config_server, dead)
+
+      on_exit(fn ->
+        if previous,
+          do: Application.put_env(:cairn, :config_server, previous),
+          else: Application.delete_env(:cairn, :config_server)
+      end)
+
+      {:ok, view, html} = live(conn, "/config")
+      assert html =~ "config-busy"
+
+      if previous,
+        do: Application.put_env(:cairn, :config_server, previous),
+        else: Application.delete_env(:cairn, :config_server)
+
+      Phoenix.PubSub.broadcast(
+        Cairn.PubSub,
+        Cairn.Config.topic(),
+        {:config_changed, %{added: [], removed: [], changed: [], refreshed: []}}
+      )
+
+      html = render(view)
+
+      assert html =~ "config-globals"
+      refute html =~ "config-busy"
+    end
   end
 
   describe "import banner" do

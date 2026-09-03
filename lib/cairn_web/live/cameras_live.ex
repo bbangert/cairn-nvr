@@ -76,17 +76,10 @@ defmodule CairnWeb.CamerasLive do
     if socket.assigns[:mode] == mode and socket.assigns[:camera_id] == (camera && camera.id) do
       socket
     else
-      params = CameraForm.to_params(camera)
-
       socket
       |> assign(
         mode: mode,
-        saved: camera,
         camera_id: (camera && camera.id) || "",
-        initial_params: params,
-        rows: CameraForm.rows(params),
-        form: to_form(params, as: :camera),
-        candidate: nil,
         # The non-camera half of the fleet `candidate/2` validates. Cached
         # because a keystroke would otherwise re-read and re-parse config.yml
         # on every 300 ms debounce tick, which on a board is the most
@@ -103,7 +96,27 @@ defmodule CairnWeb.CamerasLive do
         trackers: Config.tracker_names(),
         known_labels: Cairn.Events.known_labels()
       )
+      |> reinit_form(camera)
     end
+  end
+
+  # The half of the form's state that a fresh read of the row replaces: the
+  # params, what they were when they arrived (the `dirty` baseline), and the
+  # errors and candidate that were judged against the previous ones.
+  defp reinit_form(socket, camera) do
+    params = CameraForm.to_params(camera)
+
+    assign(socket,
+      saved: camera,
+      initial_params: params,
+      rows: CameraForm.rows(params),
+      form: to_form(params, as: :camera),
+      candidate: nil,
+      field_errors: %{},
+      form_errors: [],
+      dirty: MapSet.new(),
+      stale_notice: false
+    )
   end
 
   defp blank_probe(state), do: %{state: state, chips: [], warning: false, error: nil}
@@ -176,7 +189,13 @@ defmodule CairnWeb.CamerasLive do
      |> probe_stream(:sub, urls.sub)}
   end
 
-  def handle_event("remove", %{"id" => id}, socket) do
+  # The submitted id is read past, not trusted: this button deletes the camera
+  # whose page it is on, and the hidden field it posts (a design-contract name)
+  # is as forgeable as any other. A hand-sent `remove` can only delete the row
+  # the operator could have deleted by clicking.
+  def handle_event("remove", _params, socket) do
+    id = socket.assigns.camera_id
+
     if socket.assigns.saving? do
       {:noreply, socket}
     else
@@ -247,8 +266,14 @@ defmodule CairnWeb.CamerasLive do
   @impl true
   # A save this session ran re-reads in `handle_async` as well; both arrive
   # and both are a full re-read, so the order between them does not matter.
-  def handle_info({:config_changed, _diff}, socket),
-    do: {:noreply, socket |> refresh_globals() |> load()}
+  def handle_info({:config_changed, _diff}, socket) do
+    {:noreply,
+     socket
+     |> refresh_globals()
+     |> refresh_choices()
+     |> refresh_saved()
+     |> load()}
+  end
 
   def handle_info({:camera_status, id, info}, socket) do
     {:noreply, assign(socket, statuses: Map.put(socket.assigns.statuses, id, info))}
@@ -260,6 +285,36 @@ defmodule CairnWeb.CamerasLive do
     if socket.assigns[:globals],
       do: assign(socket, globals: Config.raw_map(Config.default_path())),
       else: socket
+  end
+
+  # The same reason, for the two lists read off the config server: a form
+  # opened while the server was mid-apply got `[]` from it (`plugin_names/0`
+  # catches the exit), and the apply that ends with this message is what makes
+  # the real answer available.
+  defp refresh_choices(socket) do
+    if socket.assigns[:mode],
+      do: assign(socket, plugins: plugin_names(), trackers: Config.tracker_names()),
+      else: socket
+  end
+
+  # A row changed in another session while its edit page is open. Pristine, the
+  # form is re-initialized from the fresh row: the operator has typed nothing,
+  # and saving the params from before would silently put the old values back.
+  # Dirty, the typed input is kept — it is the operator's work — and the notice
+  # says what a save will do to the other session's change.
+  defp refresh_saved(socket) do
+    with "edit" <- socket.assigns[:mode],
+         # This session's own save broadcasts too, and it arrives before its
+         # `handle_async` has re-read the row: the form is still dirty with
+         # exactly the change that caused the message.
+         false <- socket.assigns.saving?,
+         camera when not is_nil(camera) <- Cameras.get(socket.assigns.camera_id) do
+      if Enum.empty?(socket.assigns.dirty),
+        do: reinit_form(socket, camera),
+        else: assign(socket, stale_notice: true)
+    else
+      _absent -> socket
+    end
   end
 
   defp result({:ok, diff, warnings}),
@@ -305,12 +360,8 @@ defmodule CairnWeb.CamerasLive do
   defp blank_id?(%{assigns: %{mode: "new", camera_id: ""}}), do: true
   defp blank_id?(_socket), do: false
 
-  # A refused form has no candidate: the save reads that, so a `save` event
-  # racing the debounced `validate` cannot write what validate just rejected.
   defp refuse(socket, errors) do
-    socket
-    |> assign(candidate: nil)
-    |> show_errors(prefix(errors, route_id(socket)))
+    show_errors(socket, prefix(errors, route_id(socket)))
   end
 
   # The id is a primary key, so a collision is a *write* failure — and one the
@@ -380,16 +431,28 @@ defmodule CairnWeb.CamerasLive do
     end
   end
 
+  # Every refusal lands here, so this is where the candidate is dropped: the
+  # save reads it, so a `save` racing the debounced `validate` cannot write
+  # what validate just rejected — including a fleet error raised after
+  # `candidate_for/2` had already assigned one.
   defp show_errors(socket, errors) do
     {field_errors, unclaimed} = CameraForm.field_errors(errors, route_id(socket))
     # Warnings come back only for a candidate with zero errors, so they are
     # dropped rather than left stale next to an error that supersedes them.
-    assign(socket, field_errors: field_errors, form_errors: unclaimed, warnings: [])
+    assign(socket,
+      candidate: nil,
+      field_errors: field_errors,
+      form_errors: unclaimed,
+      warnings: []
+    )
   end
 
-  # Conservative on the label rows: any cell edit marks `min_score` dirty, so
-  # the restart line can appear for a hot-only tier change. The chip is a
-  # prediction either way — the badge on the result card is the diff's word.
+  # The label rows carry one restart field between them — `min_score`, whose
+  # cells are the `label`/`min_score` pair of each row. The track, record and
+  # days cells are refreshed in place, so an edit confined to them must not
+  # raise the restart line. A row added or removed changes the set of labels
+  # `min_score` resolves for, so it counts. The chip is a prediction either
+  # way — the badge on the result card is the diff's word.
   defp dirty(initial, params) do
     scalar =
       params
@@ -397,9 +460,13 @@ defmodule CairnWeb.CamerasLive do
       |> Enum.filter(fn {key, value} -> to_string(value) != to_string(initial[key] || "") end)
       |> Enum.map(fn {key, _value} -> key end)
 
-    rows = if CameraForm.rows(params) == CameraForm.rows(initial), do: [], else: ["min_score"]
+    rows = if scores(params) == scores(initial), do: [], else: ["min_score"]
 
     MapSet.new(scalar ++ rows)
+  end
+
+  defp scores(params) do
+    params |> CameraForm.rows() |> Enum.map(&Map.take(&1, ["label", "min_score"]))
   end
 
   defp restart_dirty?(dirty),
@@ -427,21 +494,9 @@ defmodule CairnWeb.CamerasLive do
       |> put_flash(:info, "added #{socket.assigns.camera_id}")
       |> push_navigate(to: ~p"/cameras")
     else
-      camera = Cameras.get(socket.assigns.camera_id)
-      params = CameraForm.to_params(camera)
-
       socket
-      |> assign(
-        saving?: false,
-        save_result: done(result(result)),
-        saved: camera,
-        initial_params: params,
-        rows: CameraForm.rows(params),
-        form: to_form(params, as: :camera),
-        field_errors: %{},
-        form_errors: [],
-        dirty: MapSet.new()
-      )
+      |> reinit_form(Cameras.get(socket.assigns.camera_id))
+      |> assign(saving?: false, save_result: done(result(result)))
     end
   end
 
@@ -636,6 +691,15 @@ defmodule CairnWeb.CamerasLive do
         </nav>
 
         <CameraCards.save_result :if={@save_result} result={@save_result} />
+
+        <section
+          :if={@stale_notice}
+          id="camera-stale"
+          class="hs-card"
+          style="padding: 14px 16px; font-size: 13px; color: var(--hs-warning); border-color: var(--hs-warning);"
+        >
+          This camera was changed in another session — saving will overwrite it; reload to see the change.
+        </section>
 
         <section
           :if={@warnings != []}

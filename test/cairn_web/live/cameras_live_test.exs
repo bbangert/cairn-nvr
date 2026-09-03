@@ -454,6 +454,167 @@ defmodule CairnWeb.CamerasLiveTest do
       assert Cameras.get("cam1") == nil
     end
 
+    # The confirm dialog posts the id in a hidden field, which a hand-sent
+    # event can name any row with.
+    test "remove deletes the camera being edited, not the id the event carries",
+         %{conn: conn} do
+      create!("cam1")
+      create!("other")
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      render_submit(view, "remove", %{"id" => "other"})
+
+      assert flash = assert_redirect(view, "/cameras")
+      assert flash["info"] == "removed cam1"
+      assert Cameras.get("cam1") == nil
+      assert Cameras.get("other")
+    end
+
+    # The server refuses this too, but only after the write has been attempted
+    # and the card has said so; the form knows before the click.
+    test "a save the fleet validator refuses is never attempted", %{conn: conn} do
+      create!("cam1")
+      settings = Cameras.get("cam1").settings
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      render_click(view, "add-label-row")
+
+      html =
+        view
+        |> form("#camera-form",
+          camera: %{
+            "labels" => %{
+              "0" => %{"label" => "default", "min_score" => "0.5"},
+              "1" => %{"label" => "person", "min_score" => "0.5", "track" => "0.4"}
+            }
+          }
+        )
+        |> render_submit()
+
+      assert html =~ "track.person (0.4) must be &gt;= min_score.person (0.5)"
+      refute html =~ ~s(id="save-result")
+      assert Cameras.get("cam1").settings == settings
+    end
+
+    # Only `min_score` restarts a camera; the other cells are refreshed in
+    # place, so an edit confined to them must not raise the line.
+    test "the restart line follows the Detect cells, not Track", %{conn: conn} do
+      create!("cam1", %{
+        "rtsp_url" => "rtsp://h/1",
+        "min_score" => %{"default" => 0.5, "person" => 0.6}
+      })
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      html =
+        view
+        |> form("#camera-form",
+          camera: %{
+            "labels" => %{
+              "0" => %{"label" => "default", "min_score" => "0.5"},
+              "1" => %{"label" => "person", "min_score" => "0.6", "track" => "0.6"}
+            }
+          }
+        )
+        |> render_change()
+
+      refute html =~ "Saving may restart cam1"
+
+      html =
+        view
+        |> form("#camera-form",
+          camera: %{"labels" => %{"1" => %{"label" => "person", "min_score" => "0.65"}}}
+        )
+        |> render_change()
+
+      assert html =~ "Saving may restart cam1"
+    end
+
+    test "a config change re-initializes a pristine form from the fresh row", %{conn: conn} do
+      create!("cam1", %{"rtsp_url" => "rtsp://h/1"})
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      Config.Server.subscribe()
+
+      {:ok, _diff, _warnings} =
+        Cameras.update("cam1", %{"settings" => %{"rtsp_url" => "rtsp://h/OTHER"}})
+
+      assert_receive {:config_changed, _diff}
+
+      html = render(view)
+
+      assert html =~ "rtsp://h/OTHER"
+      refute html =~ ~s(id="camera-stale")
+
+      # The save that follows writes the row as it now is, not the params the
+      # form was initialized with.
+      view |> form("#camera-form") |> render_submit()
+      render_async(view)
+
+      assert Cameras.get("cam1").settings == %{"rtsp_url" => "rtsp://h/OTHER"}
+    end
+
+    test "a config change leaves a dirty form typed and warns it will overwrite",
+         %{conn: conn} do
+      create!("cam1", %{"rtsp_url" => "rtsp://h/1"})
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      view |> form("#camera-form", camera: %{"rtsp_url" => "rtsp://h/TYPED"}) |> render_change()
+
+      Config.Server.subscribe()
+
+      {:ok, _diff, _warnings} =
+        Cameras.update("cam1", %{"settings" => %{"rtsp_url" => "rtsp://h/OTHER"}})
+
+      assert_receive {:config_changed, _diff}
+
+      html = render(view)
+
+      assert html =~ ~s(id="camera-stale")
+      assert html =~ "changed in another session"
+      assert html =~ "rtsp://h/TYPED"
+    end
+
+    # A form initialized while the server was mid-apply got `[]` for its
+    # plugin groups; the apply's own message is what makes the list readable.
+    test "a config change refreshes plugin choices a busy server could not give",
+         %{conn: conn, dir: dir, server: server} do
+      File.write!(Path.join(dir, "config.yml"), """
+      data_dir: #{dir}
+      profile_dirs:
+        - test/support/fixtures/profiles/argv
+      plugins:
+        yard:
+          profile: full
+      """)
+
+      {:ok, _diff, _warnings} = Config.Server.reload(server)
+
+      dead = spawn(fn -> :ok end)
+      ref = Process.monitor(dead)
+      assert_receive {:DOWN, ^ref, :process, ^dead, :normal}
+      Application.put_env(:cairn, :config_server, dead)
+
+      {:ok, view, html} = live(conn, "/cameras/new?tab=manual")
+
+      assert html =~ ~s(id="camera-busy")
+      refute html =~ ~s(value="yard")
+
+      Application.put_env(:cairn, :config_server, server)
+
+      Phoenix.PubSub.broadcast(
+        Cairn.PubSub,
+        Config.topic(),
+        {:config_changed, %{added: [], removed: [], changed: [], refreshed: []}}
+      )
+
+      assert render(view) =~ ~s(value="yard")
+    end
+
     test "a probe that cannot connect reaches the error state", %{conn: conn} do
       Application.put_env(:cairn, :probe_timeout_ms, 500)
       on_exit(fn -> Application.delete_env(:cairn, :probe_timeout_ms) end)
