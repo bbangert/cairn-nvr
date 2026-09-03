@@ -96,10 +96,12 @@ defmodule Cairn.ConfigSource do
   validated like any other write through `Cairn.Config.Server.update/3`, so
   a file that fails to load replaces nothing (`{:error, {:write, {:yaml,
   errors}}}`), and one with no cameras to import is refused rather than
-  silently emptying the fleet (`{:error, {:write, :no_cameras}}`). Rows the
-  file no longer lists lose their runtime state the way a delete does — as
-  the write's `after_apply:`, so the prune belongs to the commit rather than
-  to this caller surviving the call.
+  silently emptying the fleet (`{:error, {:write, :no_cameras}}`). A file
+  that no longer differs from the marker is refused too (`{:error, {:write,
+  :no_drift}}`) — the button's own precondition, re-checked under the write
+  lock. Rows the file no longer lists lose their runtime state the way a
+  delete does — as the write's `after_apply:`, so the prune belongs to the
+  commit rather than to this caller surviving the call.
   """
   @spec reimport(Path.t()) :: Cameras.write_result()
   def reimport(path \\ Config.default_path()) do
@@ -133,6 +135,7 @@ defmodule Cairn.ConfigSource do
   defp replace_rows(path, ref) do
     with {:ok, map} <- Config.raw_map(path),
          {:ok, cameras} <- importable_list(Map.get(map, "cameras")),
+         :ok <- check_drift(cameras),
          {:ok, _config, _warnings} <- Config.from_map(map) do
       deleted = Repo.all(from(c in Camera, select: c.id))
       Repo.delete_all(Camera)
@@ -144,7 +147,20 @@ defmodule Cairn.ConfigSource do
       :ok
     else
       {:error, errors} when is_list(errors) -> {:error, {:yaml, errors}}
-      {:error, :no_cameras} -> {:error, :no_cameras}
+      {:error, reason} when reason in [:no_cameras, :no_drift] -> {:error, reason}
+    end
+  end
+
+  # Two `/config` sessions can each queue a re-import while both see the
+  # drift warning; the second would replace the fleet the first already
+  # imported, discarding any edit made in between. The check reads the marker
+  # inside the write closure — which runs in the config server's
+  # `mode: :immediate` transaction — so the first import's new marker is
+  # already committed and visible when the second one looks.
+  defp check_drift(cameras) do
+    case import_marker() do
+      %{"sha256" => sha} -> if cameras_sha(cameras) == sha, do: {:error, :no_drift}, else: :ok
+      _no_marker -> :ok
     end
   end
 

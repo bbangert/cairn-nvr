@@ -552,6 +552,7 @@ defmodule CairnWeb.CamerasLiveTest do
       assert html =~ ~s(data-zones="0")
       assert html =~ ~s(id="camera-remove")
       assert html =~ ~s(id="camera-remove-confirm")
+      assert html =~ ~s(id="camera-remove-form")
     end
 
     test "an untouched save diffs to nothing (D-P5)", %{conn: conn} do
@@ -712,6 +713,33 @@ defmodule CairnWeb.CamerasLiveTest do
 
       assert flash = assert_redirect(view, "/cameras", 2_000)
       assert flash["error"] == "cam1 was removed in another session"
+    end
+
+    # An exit is not a rollback: the 30 s call can time out on a server that
+    # is still applying, and while it is, the page's own reads exit too — so
+    # the unconfirmed card sits behind the busy one and the page waits for
+    # `{:config_changed, _}` like any other session does.
+    test "a save whose server never answers keeps the unconfirmed card behind the busy one",
+         %{conn: conn} do
+      create!("cam1")
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      dead = spawn(fn -> :ok end)
+      ref = Process.monitor(dead)
+      assert_receive {:DOWN, ^ref, :process, ^dead, :normal}
+      Application.put_env(:cairn, :config_server, dead)
+
+      view
+      |> form("#camera-form", camera: %{"rtsp_url" => "rtsp://h/2"})
+      |> render_submit()
+
+      html = render_async(view)
+
+      assert html =~ ~s(id="save-result")
+      assert html =~ "it may still apply"
+      assert html =~ ~s(id="camera-busy")
+      refute html =~ "nothing changed"
     end
 
     # The row is already gone when the write runs, so `update/2` and

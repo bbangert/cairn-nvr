@@ -134,6 +134,12 @@ defmodule CairnWeb.ConfigLive do
   def reimport_result({:error, {:write, {:yaml, errors}}}),
     do: %{ok: false, diff: nil, warnings: [], errors: errors, kind: :reimport}
 
+  # Another session's re-import landed first, so this one replaced nothing.
+  # The plain error card is the right one — it is the card that ends with
+  # "your previous config is still active", which here is the whole message.
+  def reimport_result({:error, {:write, :no_drift}}),
+    do: error_result(CameraCards.describe_write_error(:no_drift))
+
   def reimport_result({:error, {:write, reason}}),
     do: error_result(CameraCards.describe_write_error(reason))
 

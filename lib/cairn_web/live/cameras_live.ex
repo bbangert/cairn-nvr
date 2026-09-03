@@ -277,7 +277,7 @@ defmodule CairnWeb.CamerasLive do
   def handle_async(:save, {:ok, result}, socket), do: {:noreply, saved(socket, result)}
 
   def handle_async(:save, {:exit, reason}, socket) do
-    {:noreply, assign(socket, saving?: false, save_result: done(exit_result(reason)))}
+    {:noreply, unconfirmed(socket, reason)}
   end
 
   def handle_async(:remove, {:ok, {:ok, _diff, _warnings}}, socket) do
@@ -297,7 +297,7 @@ defmodule CairnWeb.CamerasLive do
   end
 
   def handle_async(:remove, {:exit, reason}, socket) do
-    {:noreply, assign(socket, saving?: false, save_result: done(exit_result(reason)))}
+    {:noreply, unconfirmed(socket, reason)}
   end
 
   # A probe answers about the URL it was opened on, and it takes seconds: by
@@ -310,6 +310,18 @@ defmodule CairnWeb.CamerasLive do
     if gen == socket.assigns.probe_gen,
       do: {:noreply, put_probe(socket, which, probe_outcome(socket, result))},
       else: {:noreply, socket}
+  end
+
+  # The 30 s call timed out, not the write: the server may still be applying,
+  # and while it is, `load/1`'s reads exit too — so the page shows the busy
+  # card over the unconfirmed one and re-reads on the `{:config_changed, _}`
+  # that ends the apply, exactly as it does for a save started elsewhere.
+  # `saving?` goes back to false regardless so a retry is possible once the
+  # server answers again.
+  defp unconfirmed(socket, reason) do
+    socket
+    |> assign(saving?: false, save_result: done(exit_result(reason)))
+    |> load()
   end
 
   defp probe_outcome(socket, {:ok, {:ok, probe}}), do: probe_result(socket, probe)
@@ -1045,7 +1057,15 @@ defmodule CairnWeb.CamerasLive do
             aria-labelledby="camera-remove-title"
             style="padding: 16px; border-radius: 10px; border: 1px solid var(--hs-border); background: var(--hs-bg-raised); color: var(--hs-fg-1);"
           >
-            <form phx-submit="remove" style="display: flex; flex-direction: column; gap: 12px;">
+            <%!-- A raw `<form>`, not `<.form>`: the submit carries one hidden
+                  id and nothing this LiveView needs a changeset or a CSRF
+                  token for. The id is written out rather than generated so
+                  the confirm dialog's form can be addressed by name. --%>
+            <form
+              id="camera-remove-form"
+              phx-submit="remove"
+              style="display: flex; flex-direction: column; gap: 12px;"
+            >
               <input type="hidden" name={hidden_id_name()} value={@camera_id} />
               <h2
                 id="camera-remove-title"

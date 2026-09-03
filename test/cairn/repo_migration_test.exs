@@ -1,5 +1,8 @@
 defmodule Cairn.RepoMigrationTest do
-  use Cairn.DataCase, async: true
+  # Not async: the data migration below runs through `Ecto.Migrator`, whose
+  # queries come from processes this test does not own — only a shared
+  # sandbox lends them the connection holding the fixture row.
+  use Cairn.DataCase, async: false
 
   test "events table exists with expected columns" do
     columns =
@@ -38,6 +41,68 @@ defmodule Cairn.RepoMigrationTest do
 
     assert "cameras_position_index" in index_names
   end
+
+  # Rows written before `Cairn.Cameras.canonical/1` learned to drop these
+  # four still hold them: parse-identical to the absent key, but not
+  # byte-identical, so an untouched save would diff and restart the camera.
+  # The migration is the last one, so `step: 1` down is exactly it — and its
+  # `down` is a no-op, so this only puts the version back to pending, which
+  # is what lets the fixture rows be written in the old shape.
+  #
+  # One test, not three: each `Ecto.Migrator` call reloads every migration
+  # file, and each reload warns about the module it redefines.
+  test "the canonicalize migration strips the parse-identical shapes and keeps the rest" do
+    migrate(:down, step: 1)
+
+    insert_settings!("old_shape", %{
+      "rtsp_url" => "rtsp://h/1",
+      "transcode" => false,
+      "pipeline" => "membrane",
+      "extra_ffmpeg_args" => [],
+      "min_score" => %{}
+    })
+
+    # `parse/3` reads `transcode` as `… == true`, so a hand-edited string is
+    # the default too.
+    insert_settings!("string_transcode", %{"rtsp_url" => "rtsp://h/2", "transcode" => "false"})
+
+    kept = %{
+      "rtsp_url" => "rtsp://h/3",
+      "transcode" => true,
+      "pipeline" => "classic",
+      "extra_ffmpeg_args" => ["-vf", "scale=640:480"],
+      "min_score" => %{"person" => 0.5}
+    }
+
+    insert_settings!("kept", kept)
+
+    migrate(:up, all: true)
+
+    assert settings("old_shape") == %{"rtsp_url" => "rtsp://h/1"}
+    assert settings("string_transcode") == %{"rtsp_url" => "rtsp://h/2"}
+    assert settings("kept") == kept
+  end
+
+  defp migrate(direction, opts) do
+    Ecto.Migrator.run(
+      Repo,
+      Ecto.Migrator.migrations_path(Repo),
+      direction,
+      Keyword.put(opts, :log, false)
+    )
+  end
+
+  defp insert_settings!(id, settings) do
+    Repo.query!(
+      """
+      INSERT INTO cameras (id, position, enabled, settings, zones, inserted_at, updated_at)
+      VALUES (?, 0, 1, ?, '[]', datetime('now'), datetime('now'))
+      """,
+      [id, Jason.encode!(settings)]
+    )
+  end
+
+  defp settings(id), do: Repo.get!(Cairn.Cameras.Camera, id).settings
 
   test "settings table exists with expected columns" do
     columns =

@@ -56,6 +56,17 @@ defmodule CairnWeb.CameraFormTest do
       assert params["rtsp_url"] == ""
     end
 
+    # `%FF` decodes without raising, to a binary that is not valid UTF-8 and
+    # would take the render down further along.
+    test "an escape that decodes to invalid UTF-8 keeps the raw username" do
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://u%FF:pw@h/1"}, zones: []}
+
+      params = CameraForm.to_params(row)
+
+      assert params["username"] == "u%FF"
+      assert params["rtsp_url"] == ""
+    end
+
     test "prefills a URL with no credential in it" do
       params = CameraForm.to_params(rich_row())
 

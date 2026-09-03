@@ -466,5 +466,17 @@ defmodule CairnWeb.ConfigLiveTest do
       assert result.kind == :reimport
       refute result.ok
     end
+
+    # Another session's re-import landed first. The card is the plain error
+    # one — not the unconfirmed variant — so it keeps the "your previous
+    # config is still active" line, which is the whole of the news.
+    test "a re-import that found no drift is a non-destructive card" do
+      result = CairnWeb.ConfigLive.reimport_result({:error, {:write, :no_drift}})
+
+      assert result.errors == ["the cameras already match config.yml — nothing to import"]
+      assert result.kind == :reimport
+      refute result.ok
+      refute result[:unconfirmed]
+    end
   end
 end

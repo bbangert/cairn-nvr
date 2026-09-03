@@ -81,16 +81,23 @@ defmodule CairnWeb.CameraCards do
   # it, so the raw spelling is not what to compare: an escape anywhere in the
   # key would otherwise walk a credential past both the mask and the prefill
   # rule. A malformed escape has no decoding, and the raw key is then all
-  # there is to judge.
-  defp credential_key?(key) do
-    decoded =
-      try do
-        URI.decode_www_form(key)
-      rescue
-        ArgumentError -> key
-      end
+  # there is to judge — as is a well-formed one that decodes to invalid UTF-8
+  # (`?pass%FFword=`), which `String.downcase/1` is free to refuse.
+  defp credential_key?(key), do: normalize_key(key) in @credential_params
 
-    String.downcase(decoded) in @credential_params
+  defp normalize_key(key) do
+    decoded = URI.decode_www_form(key)
+    if String.valid?(decoded), do: String.downcase(decoded), else: downcase_raw(key)
+  rescue
+    ArgumentError -> downcase_raw(key)
+  end
+
+  # The raw key came out of a URI, so it is ASCII and this is total — the
+  # rescue is the belt for a value that reached here some other way.
+  defp downcase_raw(key) do
+    String.downcase(key)
+  rescue
+    ArgumentError -> key
   end
 
   @doc """
@@ -139,6 +146,10 @@ defmodule CairnWeb.CameraCards do
   def describe_write_error(:not_found), do: "the camera no longer exists"
   def describe_write_error(:incomplete), do: "the fleet changed underneath the save"
   def describe_write_error(:no_cameras), do: "config.yml lists no cameras to import"
+
+  def describe_write_error(:no_drift),
+    do: "the cameras already match config.yml — nothing to import"
+
   def describe_write_error({:bad_return, _other}), do: "the write returned an unexpected value"
   def describe_write_error(_other), do: "an unexpected error — see the log"
 

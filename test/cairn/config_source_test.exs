@@ -706,6 +706,23 @@ defmodule Cairn.ConfigSourceTest do
       assert CameraStatus.get("cam_off").status == :unknown
     end
 
+    # Two `/config` sessions can each queue a re-import off the same drift
+    # warning; the second must not replace the fleet the first imported (and
+    # any edit made since) with the same file it already matches.
+    test "a second re-import of the same file is refused", %{path: path} do
+      assert {:ok, _diff, _warnings} = ConfigSource.reimport(path)
+
+      assert {:ok, _diff, _warnings} =
+               Cameras.update("cam_b", %{"settings" => %{"rtsp_url" => "rtsp://edited/2"}})
+
+      assert {:error, {:write, :no_drift}} = ConfigSource.reimport(path)
+
+      assert Enum.map(Cameras.list(), &{&1.id, &1.settings["rtsp_url"]}) == [
+               {"cam_a", "rtsp://yaml/1"},
+               {"cam_b", "rtsp://edited/2"}
+             ]
+    end
+
     test "a file that fails to load replaces nothing", %{dir: dir, path: path} do
       File.write!(path, globals(dir) <> "cameras: [{id: broken}]\n")
 

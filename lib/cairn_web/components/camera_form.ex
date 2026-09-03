@@ -589,8 +589,12 @@ defmodule CairnWeb.CameraForm do
   # A hand-edited or migrated row can hold a malformed escape (`bad%zz`),
   # which `URI.decode/1` raises on — and the form has to render the row the
   # operator opened it to repair. The raw text is then all there is to show.
+  # A well-formed escape can decode to invalid UTF-8 (`u%FF`) without raising
+  # at all, and that binary would take the render down further along, so it
+  # is kept raw for the same reason.
   defp decode_user(user) do
-    URI.decode(user)
+    decoded = URI.decode(user)
+    if String.valid?(decoded), do: decoded, else: user
   rescue
     ArgumentError -> user
   end

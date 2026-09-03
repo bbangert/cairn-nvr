@@ -87,6 +87,17 @@ defmodule CairnWeb.CameraCardsTest do
       assert CameraCards.credentialed?("http://10.0.0.5/live?pass%77ord=hunter2")
     end
 
+    # `%FF` is a well-formed escape whose decoding is not valid UTF-8, which
+    # `String.downcase/1` may refuse: the key is then judged raw, and the
+    # credential beside it is still masked.
+    test "an escape that decodes to invalid UTF-8 is judged on the raw key" do
+      assert CameraCards.mask_url("http://10.0.0.5/live?pass%FFword=1&password=hunter2") ==
+               "http://10.0.0.5/live?pass%FFword=1&password=•••••"
+
+      assert CameraCards.credentialed?("http://10.0.0.5/live?pass%FFword=1&password=hunter2")
+      refute CameraCards.credentialed?("http://10.0.0.5/live?pass%FFword=1")
+    end
+
     test "a malformed escape is judged on the raw key" do
       assert CameraCards.mask_url("http://10.0.0.5/live?%zz=1&password=hunter2") ==
                "http://10.0.0.5/live?%zz=1&password=•••••"
@@ -171,6 +182,11 @@ defmodule CairnWeb.CameraCardsTest do
 
       assert CameraCards.describe_write_error({:nonsense, %{"rtsp_url" => "rtsp://u:SECRET@h/1"}}) ==
                "an unexpected error — see the log"
+    end
+
+    test "a re-import another session already did says nothing was left to import" do
+      assert CameraCards.describe_write_error(:no_drift) ==
+               "the cameras already match config.yml — nothing to import"
     end
   end
 

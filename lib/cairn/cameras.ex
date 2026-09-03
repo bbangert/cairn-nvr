@@ -283,12 +283,13 @@ defmodule Cairn.Cameras do
   defp canonical_put(acc, key, _value) when key in ["id", "zones"], do: acc
   defp canonical_put(acc, _key, nil), do: acc
 
-  # `Cairn.Config.Camera.parse/3` defaults `transcode` to false and reads
-  # `pipeline: membrane` as the only accepted value (`check_pipeline/3` errors
-  # on every other), so both spell out what absence already says. Any other
-  # `pipeline` is kept, to be refused by name on the next load rather than
-  # silently repaired.
-  defp canonical_put(acc, "transcode", false), do: acc
+  # `Cairn.Config.Camera.parse/3` reads `transcode` as `… == true` — every
+  # other value, `"false"` and `0` included, is the default it already gets
+  # from the absent key — and takes `pipeline: membrane` as the only accepted
+  # value (`check_pipeline/3` errors on every other), so both spell out what
+  # absence already says. Any other `pipeline` is kept, to be refused by name
+  # on the next load rather than silently repaired.
+  defp canonical_put(acc, "transcode", value) when value != true, do: acc
   defp canonical_put(acc, "pipeline", "membrane"), do: acc
 
   # An empty map holds no label rule, and `parse_min_score/3` merges what it
