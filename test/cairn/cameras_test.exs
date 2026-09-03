@@ -255,6 +255,47 @@ defmodule Cairn.CamerasTest do
       assert Cameras.get("cam2") == nil
     end
 
+    # `raw_maps/0` renders enabled rows only, so the fleet re-validation
+    # `Config.Server.update/3` runs cannot see this row at all: without the
+    # closure's own check the settings would land and fail the day the
+    # operator enables the camera.
+    test "a disabled row's settings are validated too" do
+      assert {:ok, _diff, []} =
+               Cameras.create(%{
+                 "id" => "cam1",
+                 "enabled" => false,
+                 "settings" => %{"rtsp_url" => "rtsp://h/1"}
+               })
+
+      assert {:error, [msg]} =
+               Cameras.update("cam1", %{
+                 "settings" => %{"rtsp_url" => "rtsp://h/1", "max_unseen_ms" => 50}
+               })
+
+      assert msg =~ "camera cam1: max_unseen_ms must be 100..3600000"
+      assert Cameras.get("cam1").settings == %{"rtsp_url" => "rtsp://h/1"}
+
+      # A valid edit of the same disabled row still goes through.
+      assert {:ok, _diff, []} =
+               Cameras.update("cam1", %{
+                 "settings" => %{"rtsp_url" => "rtsp://h/1", "max_unseen_ms" => 5_000}
+               })
+
+      assert Cameras.get("cam1").settings["max_unseen_ms"] == 5_000
+    end
+
+    test "a disabled create with an invalid field is refused" do
+      assert {:error, [msg]} =
+               Cameras.create(%{
+                 "id" => "cam_bad",
+                 "enabled" => false,
+                 "settings" => %{"rtsp_url" => "rtsp://h/1", "max_unseen_ms" => 50}
+               })
+
+      assert msg =~ "camera cam_bad: max_unseen_ms must be 100..3600000"
+      assert Cameras.get("cam_bad") == nil
+    end
+
     test "a row imported with parser-default keys re-saves to an empty diff" do
       imported =
         Cameras.canonical(%{

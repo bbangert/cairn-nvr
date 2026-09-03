@@ -190,14 +190,22 @@ defmodule Cairn.Config.Server do
 
   Neither callback runs on a write the validator or the closure rejected.
 
+  `write_fun` is 0-arity, or 1-arity to be handed the server's config `path`:
+  a write that must validate against the file's globals needs the path the
+  server loads from, which only the server knows.
+
   `{:error, errors}` is the validator's; `{:error, {:write, reason}}` is
   `write_fun`'s own (a changeset, a DB fault, a wrong-shaped return, or an
   exception the closure raised).
   """
-  @spec update(GenServer.server(), (-> :ok | {:error, term()}), keyword()) ::
+  @spec update(
+          GenServer.server(),
+          (-> :ok | {:error, term()}) | (Path.t() -> :ok | {:error, term()}),
+          keyword()
+        ) ::
           {:ok, diff(), [String.t()]} | {:error, [String.t()]} | {:error, {:write, term()}}
   def update(server \\ __MODULE__, write_fun, opts \\ [])
-      when is_function(write_fun, 0) and is_list(opts) do
+      when (is_function(write_fun, 0) or is_function(write_fun, 1)) and is_list(opts) do
     reject = Keyword.get(opts, :reject_skipped, [])
     after_commit = after_commit_fun(Keyword.get(opts, :after_commit))
     after_apply = after_apply_fun(Keyword.get(opts, :after_apply))
@@ -389,7 +397,7 @@ defmodule Cairn.Config.Server do
   end
 
   defp attempt(state, write_fun, reject) do
-    with :ok <- write_fun.(),
+    with :ok <- call_write(write_fun, state.path),
          {:ok, config, warnings, skipped} <- load(state),
          [] <- own_skips(reject, skipped) do
       {config, warnings, skipped}
@@ -402,6 +410,11 @@ defmodule Cairn.Config.Server do
       other -> Cairn.Repo.rollback({:write, {:bad_return, other}})
     end
   end
+
+  # A write that must validate against the file's globals needs the path the
+  # server loads from, which only the server knows.
+  defp call_write(fun, _path) when is_function(fun, 0), do: fun.()
+  defp call_write(fun, path), do: fun.(path)
 
   # A per-camera fault skips the row on a *load*, so one drifted camera cannot
   # take the fleet down with it. On a save that row is the operator's own act:

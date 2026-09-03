@@ -82,6 +82,58 @@ defmodule Cairn.ConfigSource do
     end
   end
 
+  # `Cairn.Config.Server.update/3` re-validates the fleet through
+  # `Cairn.Cameras.raw_maps/0`, which renders enabled rows only — a disabled
+  # row's settings are in front of no validator at all. This puts them in
+  # front of one: the enabled fleet plus this row, keeping only this row's own
+  # errors.
+  #
+  # Two classes of error are deliberately dropped. A fleet-level rule the row
+  # only trips by being added (capacity, one model per VM) does not bind while
+  # the row sits outside the running fleet, and `CamerasLive` already tells
+  # the operator; and a fleet-level fault the file has *without* this row is
+  # the file's, not this write's. Both are outside
+  # `partition_by_camera/1`'s bucket for this id, so keeping only that bucket
+  # covers them without a second pass.
+  #
+  # `@doc false` and public: the caller is `Cairn.Cameras`, from inside the
+  # config server's write transaction.
+  @doc false
+  @spec validate_row(Path.t(), Camera.t()) :: :ok | {:error, [String.t()]}
+  def validate_row(path, row) do
+    case Config.raw_map(path) do
+      {:ok, map} -> row_errors(map, row)
+      # An unreadable file fails the load this same transaction is about to
+      # run, which rejects the write with the file's errors, not the row's.
+      {:error, _errors} -> :ok
+    end
+  end
+
+  defp row_errors(map, row) do
+    {rendered, _warnings} = Cameras.raw_maps()
+    candidate = Cameras.render_row(row)
+
+    cameras =
+      if Enum.any?(rendered, &(Map.get(&1, "id") == row.id)) do
+        Enum.map(rendered, &if(Map.get(&1, "id") == row.id, do: candidate, else: &1))
+      else
+        rendered ++ [candidate]
+      end
+
+    case Config.from_map(Map.put(map, "cameras", cameras)) do
+      {:ok, _config, _warnings} ->
+        :ok
+
+      {:error, errors} ->
+        {per_camera, _fleet} = Config.partition_by_camera(errors)
+
+        case Map.get(per_camera, row.id, []) do
+          [] -> :ok
+          own -> {:error, own}
+        end
+    end
+  end
+
   @doc "The import-once marker `%{path, sha256, imported_at}`, or `nil` before the first boot armed it."
   @spec import_marker() :: map() | nil
   def import_marker do

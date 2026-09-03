@@ -161,6 +161,20 @@ defmodule Cairn.Config.ServerUpdateTest do
     refute_received {:applied, _diff, _config}
   end
 
+  # A write that has to validate against the file's globals needs the path the
+  # server loads from — `Cairn.Cameras`' disabled-row check is the caller.
+  test "a 1-arity write fun is handed the server's path", %{server: server, path: path} do
+    test_pid = self()
+
+    assert {:ok, _diff, _warnings} =
+             Config.Server.update(server, fn given ->
+               send(test_pid, {:path, given})
+               :ok
+             end)
+
+    assert_received {:path, ^path}
+  end
+
   test "a write error is reported as such", %{server: server} do
     assert Config.Server.update(server, fn -> {:error, :boom} end) == {:error, {:write, :boom}}
     refute_received {:applied, _diff, _config}

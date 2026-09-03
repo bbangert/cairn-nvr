@@ -643,6 +643,10 @@ defmodule CairnWeb.CamerasLive do
   # fleet with this row left out (no candidate to stand in for it): a
   # fleet-level message that survives the row's removal was already true, so
   # it stays blocking.
+  #
+  # This is the operator-facing half only: `Cameras.create/1` and
+  # `Cameras.update/2` re-run a disabled row's own errors inside the write
+  # transaction, where a reload cannot slip in between the check and the row.
   defp candidate_with_errors(socket, settings, errors) do
     id = route_id(socket)
     {per_camera, fleet_errors} = Config.partition_by_camera(errors)
