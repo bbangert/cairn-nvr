@@ -626,21 +626,31 @@ defmodule CairnWeb.CamerasLive do
   # blocking error since this save cannot fix them and did not cause them.
   #
   # A fleet-level fault (capacity, one-model-per-VM — the rules
-  # `partition_by_camera/1` cannot pin on any one camera) is the same kind of
-  # notice, not a refusal, when the camera being edited is disabled: `fleet/2`
-  # validates it anyway so its own errors still show, but a rule it only
-  # trips alongside the *currently enabled* fleet says nothing about the save
-  # in front of the operator — it will not bind until this camera is enabled,
-  # at which point the config server's own load re-checks it. Refusing the
-  # save here would block an edit for a fault the edit did not create and the
-  # operator cannot see until they flip the toggle anyway.
+  # `partition_by_camera/1` cannot pin on any one camera) is *usually* the
+  # same kind of notice, not a refusal, when the camera being edited is
+  # disabled: `fleet/2` validates it anyway so its own errors still show, but
+  # a rule it only trips alongside the *currently enabled* fleet says nothing
+  # about the save in front of the operator — it will not bind until this
+  # camera is enabled, at which point the config server's own load re-checks
+  # it. Refusing the save here would block an edit for a fault the edit did
+  # not create and the operator cannot see until they flip the toggle anyway.
+  #
+  # But `partition_by_camera/1` also files a fault in the globals themselves
+  # (bad retention, a broken plugin config) as fleet-level — that one is not
+  # conditional on this camera at all, and downgrading it to a notice would
+  # let a save through that the config server's own load will refuse outright.
+  # `preexisting_fleet_errors/2` tells the two apart by re-validating the
+  # fleet with this row left out (no candidate to stand in for it): a
+  # fleet-level message that survives the row's removal was already true, so
+  # it stays blocking.
   defp candidate_with_errors(socket, settings, errors) do
     id = route_id(socket)
     {per_camera, fleet_errors} = Config.partition_by_camera(errors)
     own = Map.get(per_camera, id, [])
     disabled? = disabled_now?(socket.assigns.saved)
+    blocking_fleet_errors = disabled? and preexisting_fleet_errors(socket, fleet_errors) != []
 
-    if own == [] and (fleet_errors == [] or disabled?) do
+    if own == [] and (fleet_errors == [] or (disabled? and not blocking_fleet_errors)) do
       others =
         per_camera
         |> Map.delete(id)
@@ -660,6 +670,34 @@ defmodule CairnWeb.CamerasLive do
     else
       show_errors(socket, errors)
     end
+  end
+
+  # The subset of `fleet_errors` that the fleet already had without this row
+  # in it — a fault in the globals themselves, not one this candidate tripped
+  # by sitting in the enabled fleet. Only ever called with `fleet_errors` from
+  # the *same* validation pass, so a message equal to one from the baseline is
+  # the same rule failing for the same reason, not a coincidence.
+  defp preexisting_fleet_errors(socket, fleet_errors) do
+    with {:ok, raw} <- socket.assigns.globals,
+         baseline = Map.put(raw, "cameras", baseline_fleet(socket)),
+         {:error, baseline_errors} <- Config.from_map(baseline) do
+      {_per_camera, baseline_fleet_errors} = Config.partition_by_camera(baseline_errors)
+      Enum.filter(fleet_errors, &(&1 in baseline_fleet_errors))
+    else
+      _ -> []
+    end
+  end
+
+  # The enabled fleet with this camera's row left out entirely — unlike
+  # `fleet/2`, nothing stands in for it, so a rule this row alone would trip
+  # cannot appear here. Used only as the "before" side of
+  # `preexisting_fleet_errors/2`'s comparison.
+  defp baseline_fleet(socket) do
+    id = route_id(socket)
+
+    Cameras.list()
+    |> Enum.filter(&(&1.enabled and &1.id != id))
+    |> Enum.map(&Cameras.render_row/1)
   end
 
   # `@saved` is this form's own copy of the row, taken when it was
@@ -700,8 +738,9 @@ defmodule CairnWeb.CamerasLive do
   # validation anyway, on purpose: its own field errors have to reach the
   # form the same as an enabled camera's, even though a rule it only trips
   # against the currently-enabled fleet is not this save's fault —
-  # `candidate_with_errors/2` is what turns that half of the answer into a
-  # notice instead of a refusal.
+  # `candidate_with_errors/2` turns most of that half of the answer into a
+  # notice instead of a refusal (a fault that predates this row stays a
+  # refusal; see its comment).
   defp fleet(socket, settings) do
     id = route_id(socket)
     zones = (socket.assigns.saved && socket.assigns.saved.zones) || []
@@ -826,9 +865,11 @@ defmodule CairnWeb.CamerasLive do
   # times the caller out at 30 s while the server may still commit and apply,
   # so the card must not promise that nothing changed.
   defp exit_result(reason) do
-    Logger.error("cameras: the write did not finish: #{CameraCards.describe_exit(reason)}")
+    Logger.error(
+      "cameras: the write exited without confirming: #{CameraCards.describe_exit(reason)}"
+    )
 
-    "the save did not finish in time — it may still apply; reload the page to see"
+    "the save did not get a confirmed answer — it may still apply; reload the page to see"
     |> error_result()
     |> Map.put(:unconfirmed, true)
   end

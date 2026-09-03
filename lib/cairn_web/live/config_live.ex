@@ -99,10 +99,12 @@ defmodule CairnWeb.ConfigLive do
   # once `{:config_changed, _}` confirms the apply actually landed (or the
   # operator reloads the page and re-mounts to a fresh `false`).
   def handle_async(:reimport, {:exit, reason}, socket) do
-    Logger.error("config: the re-import did not finish: #{CameraCards.describe_exit(reason)}")
+    Logger.error(
+      "config: the re-import exited without confirming: #{CameraCards.describe_exit(reason)}"
+    )
 
     result =
-      "the re-import did not finish in time — it may still apply; reload the page to see"
+      "the re-import did not get a confirmed answer — it may still apply; reload the page to see"
       |> error_result()
       |> Map.put(:unconfirmed, true)
 

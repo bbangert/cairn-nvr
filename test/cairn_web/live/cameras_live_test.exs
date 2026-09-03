@@ -677,6 +677,51 @@ defmodule CairnWeb.CamerasLiveTest do
       assert html =~ "different models (full, partial)"
     end
 
+    # `partition_by_camera/1` files a broken global (here, `retention.days`)
+    # as fleet-level too, the same as the one-model-per-VM rule above — but
+    # this fault does not depend on the currently-enabled fleet at all, so
+    # enabling the camera would not clear it. Downgrading it to a notice would
+    # let a save through that the config server's own load refuses outright.
+    test "a disabled camera whose candidate is fine but the globals are broken refuses the save",
+         %{conn: conn, dir: dir} do
+      path = Path.join(dir, "config.yml")
+
+      # Created while `path` still holds the valid config the setup block
+      # wrote — `Cameras.create/1` validates the whole fleet through the same
+      # server, so a create against the broken retention below would refuse
+      # before the form under test is ever reached.
+      create!("cam1", %{"rtsp_url" => "rtsp://h/1"}, %{"enabled" => false})
+
+      File.write!(path, """
+      data_dir: #{dir}
+      retention:
+        days: -1
+      """)
+
+      previous_config_path = Application.get_env(:cairn, :config_path)
+      Application.put_env(:cairn, :config_path, path)
+
+      on_exit(fn ->
+        if previous_config_path,
+          do: Application.put_env(:cairn, :config_path, previous_config_path),
+          else: Application.delete_env(:cairn, :config_path)
+      end)
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      html =
+        view
+        |> form("#camera-form", camera: %{"rtsp_url" => "rtsp://h/2"})
+        |> render_change()
+
+      assert has_element?(view, "#camera-form-errors")
+      assert html =~ "retention.days must be &gt;= 1"
+      refute html =~ "will not apply until this camera is enabled"
+
+      view |> form("#camera-form", camera: %{"rtsp_url" => "rtsp://h/2"}) |> render_submit()
+      assert Cameras.get("cam1").settings["rtsp_url"] == "rtsp://h/1"
+    end
+
     test "removing a label row re-validates what is left", %{conn: conn} do
       create!("cam1")
 

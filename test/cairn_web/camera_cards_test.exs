@@ -216,20 +216,20 @@ defmodule CairnWeb.CameraCardsTest do
       assert html =~ "Your previous config is still active"
     end
 
-    # A timed-out write may still be committing and applying, so the card
-    # must not tell the operator that nothing changed.
+    # An exit that never confirmed may still be committing and applying, so
+    # the card must not tell the operator that nothing changed.
     test "an unconfirmed write does not" do
       html =
         card(%{
           ok: false,
           diff: nil,
           warnings: [],
-          errors: ["the save did not finish in time"],
+          errors: ["the save did not get a confirmed answer"],
           phase: :done,
           unconfirmed: true
         })
 
-      assert html =~ "the save did not finish in time"
+      assert html =~ "the save did not get a confirmed answer"
       refute html =~ "Your previous config is still active"
     end
 
