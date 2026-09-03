@@ -145,9 +145,13 @@ defmodule Cairn.StreamUrl do
           join_authority(scheme, mask_userinfo(userinfo), rest)
       end
 
-    case String.split(masked, "?", parts: 2) do
-      [base, query] -> base <> "?" <> mask_query(query)
-      [base] -> base
+    # The fragment comes off before the query is masked: a `#` after the last
+    # pair would otherwise ride inside that pair's value and vanish with it.
+    {before_fragment, fragment} = split_fragment(masked)
+
+    case String.split(before_fragment, "?", parts: 2) do
+      [base, query] -> base <> "?" <> mask_query(query) <> fragment
+      [base] -> base <> fragment
     end
   end
 
@@ -156,6 +160,13 @@ defmodule Cairn.StreamUrl do
   # render. Nothing to mask reads as nothing to show — like `credentialed?/1`,
   # which calls the same value clean.
   def mask(_other), do: @blank
+
+  defp split_fragment(url) do
+    case String.split(url, "#", parts: 2) do
+      [before, fragment] -> {before, "#" <> fragment}
+      [before] -> {before, ""}
+    end
+  end
 
   defp mask_userinfo(userinfo) do
     case split_userinfo(userinfo) do

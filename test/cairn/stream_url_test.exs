@@ -279,6 +279,17 @@ defmodule Cairn.StreamUrlTest do
     end
   end
 
+  describe "mask/1 with a fragment" do
+    test "a fragment after a credential-keyed pair survives the mask" do
+      assert StreamUrl.mask("http://h/live.flv?user=u&password=pw#frag") ==
+               "http://h/live.flv?user=•••••&password=•••••#frag"
+    end
+
+    test "a fragment with no query is left alone" do
+      assert StreamUrl.mask("rtsp://u:pw@h/s#frag") == "rtsp://u:•••••@h/s#frag"
+    end
+  end
+
   describe "credential_key?/1" do
     test "names the vendor spellings, whatever their case" do
       assert StreamUrl.credential_key?("password")
