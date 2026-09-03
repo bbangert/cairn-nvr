@@ -744,7 +744,7 @@ defmodule Cairn.ConfigSourceTest do
 
         Enum.each(deleted, fn
           "cam_a" ->
-            attempt = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
+            attempt = Agent.get_and_update(counter, fn n -> {n, n + 1} end)
             if attempt == 0, do: exit(:simulated_sibling_restart)
             Cairn.CameraControl.revive("cam_a")
 
@@ -819,7 +819,7 @@ defmodule Cairn.ConfigSourceTest do
       end
 
       callback_a = fn ->
-        attempt = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
+        attempt = Agent.get_and_update(counter, fn n -> {n, n + 1} end)
 
         if attempt == 0 do
           exit(:simulated_retry)
