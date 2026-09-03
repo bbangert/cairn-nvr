@@ -150,6 +150,9 @@ defmodule CairnWeb.CameraCards do
   def describe_write_error(:no_drift),
     do: "the cameras already match config.yml — nothing to import"
 
+  def describe_write_error(:no_marker),
+    do: "nothing was ever imported from config.yml, so there is nothing to replace"
+
   def describe_write_error({:bad_return, _other}), do: "the write returned an unexpected value"
   def describe_write_error(_other), do: "an unexpected error — see the log"
 

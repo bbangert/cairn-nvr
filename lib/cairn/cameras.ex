@@ -230,6 +230,12 @@ defmodule Cairn.Cameras do
     Enum.map(steps, fn {name, fun} ->
       try do
         fun.()
+      rescue
+        # An ETS-backed step raises rather than exits while its owner is
+        # restarting and the table is gone; the later steps must still run.
+        e ->
+          Logger.warning("cameras: prune step #{name} raised for #{id}: #{inspect(e.__struct__)}")
+          {:error, e}
       catch
         :exit, reason ->
           Logger.warning("cameras: prune step #{name} failed for #{id}: #{inspect(reason)}")

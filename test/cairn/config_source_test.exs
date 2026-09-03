@@ -709,6 +709,12 @@ defmodule Cairn.ConfigSourceTest do
     # Two `/config` sessions can each queue a re-import off the same drift
     # warning; the second must not replace the fleet the first imported (and
     # any edit made since) with the same file it already matches.
+    test "a re-import with no marker is refused without touching the rows", %{path: path} do
+      Repo.delete_all(Setting)
+      assert {:error, {:write, :no_marker}} = ConfigSource.reimport(path)
+      assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
+    end
+
     test "a second re-import of the same file is refused", %{path: path} do
       assert {:ok, _diff, _warnings} = ConfigSource.reimport(path)
 

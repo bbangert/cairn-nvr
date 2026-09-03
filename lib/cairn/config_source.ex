@@ -147,7 +147,7 @@ defmodule Cairn.ConfigSource do
       :ok
     else
       {:error, errors} when is_list(errors) -> {:error, {:yaml, errors}}
-      {:error, reason} when reason in [:no_cameras, :no_drift] -> {:error, reason}
+      {:error, reason} when reason in [:no_cameras, :no_drift, :no_marker] -> {:error, reason}
     end
   end
 
@@ -157,10 +157,13 @@ defmodule Cairn.ConfigSource do
   # inside the write closure — which runs in the config server's
   # `mode: :immediate` transaction — so the first import's new marker is
   # already committed and visible when the second one looks.
+  # No marker means no prior import to drift from: the button is never shown
+  # for that state, so a request that reaches here anyway (a crafted event, a
+  # direct call) is refused rather than allowed to replace the fleet.
   defp check_drift(cameras) do
     case import_marker() do
       %{"sha256" => sha} -> if cameras_sha(cameras) == sha, do: {:error, :no_drift}, else: :ok
-      _no_marker -> :ok
+      _no_marker -> {:error, :no_marker}
     end
   end
 
