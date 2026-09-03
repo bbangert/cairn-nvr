@@ -9,17 +9,20 @@ defmodule Cairn.DataDir do
   @subdirs ~w(events snapshots log)
 
   @doc """
-  Creates the data dir (mode 0700, closing the window before the chmod
-  below) and its subdirs. Raises on failure — a data dir that cannot be
-  created is a boot the node has no business continuing.
+  Creates the data dir and its subdirs, raising when one cannot be created —
+  a boot the node has no business continuing. Tightening permissions is a
+  second, best-effort pass: the dir and its log dir go to 0700 and the DB
+  files to 0600, and a chmod the volume refuses (a restored backup under
+  another uid, a bind mount) is logged and left as is rather than made a
+  reason to crash-loop the boot.
   """
   @spec ensure!(Path.t()) :: :ok
   def ensure!(data_dir) do
     File.mkdir_p!(data_dir)
-    File.chmod(data_dir, 0o700)
+    chmod(data_dir, 0o700)
     Enum.each(Enum.map(@subdirs, &Path.join(data_dir, &1)), &File.mkdir_p!/1)
     # ffmpeg/plugin logs can echo credentialed URLs — keep them private
-    File.chmod(log_dir(data_dir), 0o700)
+    chmod(log_dir(data_dir), 0o700)
     secure_db(data_dir)
     :ok
   end
@@ -36,17 +39,22 @@ defmodule Cairn.DataDir do
   def secure_db(data_dir) do
     db = db_path(data_dir)
 
-    for path <- [db, db <> "-wal", db <> "-shm"], File.exists?(path) do
-      case File.chmod(path, 0o600) do
-        :ok ->
-          :ok
-
-        {:error, reason} ->
-          Logger.warning("could not chmod #{path} to 0600: #{:file.format_error(reason)}")
-      end
-    end
-
+    Enum.each([db, db <> "-wal", db <> "-shm"], &(File.exists?(&1) and chmod(&1, 0o600)))
     :ok
+  end
+
+  defp chmod(path, mode) do
+    case File.chmod(path, mode) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "could not chmod #{path} to #{Integer.to_string(mode, 8)}: #{:file.format_error(reason)}"
+        )
+
+        :ok
+    end
   end
 
   @spec events_dir(Path.t(), String.t()) :: Path.t()
