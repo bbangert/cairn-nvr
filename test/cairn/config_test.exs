@@ -427,6 +427,14 @@ defmodule Cairn.ConfigTest do
       assert config.retention_per_label == %{"person" => 30}
     end
 
+    test "a false global retention.days or tracks_days is an error, not the default" do
+      for key <- ["days", "tracks_days"] do
+        map = Map.put(base_map(), "retention", %{key => false})
+        assert {:error, errors} = Config.from_map(map)
+        assert Enum.any?(errors, &(&1 =~ "retention.#{key} must be >= 1"))
+      end
+    end
+
     test "a non-map global retention.per_label is an error, not a crash" do
       for value <- ["30 days", false, 30] do
         map = Map.put(base_map(), "retention", %{"per_label" => value})

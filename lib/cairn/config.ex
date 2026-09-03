@@ -287,7 +287,9 @@ defmodule Cairn.Config do
       pre_window_seconds: get_in(map, ["events", "pre_window_seconds"]) || 5,
       post_window_seconds: get_in(map, ["events", "post_window_seconds"]) || 10,
       max_event_seconds: get_in(map, ["events", "max_event_seconds"]) || 300,
-      retention_days: get_in(map, ["retention", "days"]) || 14,
+      # `nil` alone takes the default: a `false` must reach `validate_numbers/2`
+      # as what it is, not as fourteen days.
+      retention_days: default_nil(get_in(map, ["retention", "days"]), 14),
       # `nil` alone reads as "none": a `false` or a scalar must reach
       # `validate_retention_per_label/3` as what it is, not as an empty map.
       retention_per_label: per_label_or_empty(get_in(map, ["retention", "per_label"])),
@@ -399,7 +401,10 @@ defmodule Cairn.Config do
   # did the system see and not record?" answerable only for the labels someone
   # already thought to keep, which is the question backwards.
   defp configured_retention_tracks_days(map),
-    do: get_in(map, ["retention", "tracks_days"]) || @default_retention_tracks_days
+    do: default_nil(get_in(map, ["retention", "tracks_days"]), @default_retention_tracks_days)
+
+  defp default_nil(nil, default), do: default
+  defp default_nil(value, _default), do: value
 
   @doc """
   A camera's annotation offset in milliseconds, signed, `0` when it has none

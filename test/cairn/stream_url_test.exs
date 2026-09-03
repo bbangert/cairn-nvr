@@ -437,7 +437,7 @@ defmodule Cairn.StreamUrlTest do
       masked = StreamUrl.mask("http://h/p?user=admin@example.com&password=pw")
       refute masked =~ "pw"
       refute masked =~ "admin"
-      assert masked == "http://•••••@example.com&password=•••••"
+      assert masked == "http://•••••@•••••&password=•••••"
     end
 
     test "a non-credential query @ still collapses, and the pair after it is masked" do
@@ -453,7 +453,7 @@ defmodule Cairn.StreamUrlTest do
       url = "rtsp://u:pa?password=x@cam/main"
       masked = StreamUrl.mask(url)
 
-      assert masked == "rtsp://•••••@cam/main"
+      assert masked == "rtsp://•••••@•••••"
       refute masked =~ "pa"
       refute masked =~ "x"
       assert StreamUrl.credentialed?(url)
@@ -501,6 +501,15 @@ defmodule Cairn.StreamUrlTest do
     test "a scheme with digits, plus, dot or dash still opens one" do
       assert {"rtsp+tls://", nil, "h/s"} = StreamUrl.split_authority("rtsp+tls://h/s")
       assert {"//", nil, "h/s"} = StreamUrl.split_authority("//h/s")
+    end
+  end
+
+  describe "mask/1 with an @ inside a credential value" do
+    test "nothing after the value's last @ survives" do
+      masked = StreamUrl.mask("http://h/p?password=a@example.com")
+      refute masked =~ "example.com"
+      refute masked =~ "a@"
+      assert masked == "http://•••••@•••••"
     end
   end
 

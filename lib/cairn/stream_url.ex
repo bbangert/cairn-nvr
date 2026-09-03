@@ -260,14 +260,19 @@ defmodule Cairn.StreamUrl do
     # colon the whole userinfo is a credential (`rtsp://SECRET@host` — a
     # password to some cameras, and `credentialed?/1` calls it one) and goes
     # entirely. An empty username (`rtsp://:secret@host`) masks like any other.
-    case display_split(url) do
+    # Credential pair values are masked first but with their raw `@` markers
+    # kept (`password=a@b` → `password=•••••@•••••`), so the collapse below
+    # still sees its boundary and nothing after a value's last `@` survives.
+    pre = mask_query_of(url)
+
+    case display_split(pre) do
       {scheme, rest} ->
         scheme <> "•••••@" <> mask_pairs(rest)
 
       nil ->
-        case split_authority(url) do
+        case split_authority(pre) do
           {_scheme, nil, _rest} ->
-            mask_query_of(url)
+            pre
 
           {scheme, userinfo, rest} ->
             mask_query_of(join_authority(scheme, mask_userinfo(userinfo), rest))
@@ -316,6 +321,11 @@ defmodule Cairn.StreamUrl do
   # `?` that opened its query may be on the other side of that cut, so a pair
   # is anything between two of `?`, `&` and `#` (or an end of the string)
   # rather than something a surviving `?` introduces.
+  # Each `@`-separated segment masked, the `@`s kept: the display collapse
+  # in `mask/1` needs them, and no segment of a credential may survive.
+  defp mask_value(value),
+    do: value |> String.split("@") |> Enum.map_join("@", fn _ -> "•••••" end)
+
   defp mask_pairs(rest) do
     rest
     |> String.split(~r/[?&#]/, include_captures: true)
@@ -324,8 +334,8 @@ defmodule Cairn.StreamUrl do
 
   defp mask_query_pair(pair) do
     case String.split(pair, "=", parts: 2) do
-      [key, _value] ->
-        if credential_key?(key), do: "#{key}=•••••", else: pair
+      [key, value] ->
+        if credential_key?(key), do: "#{key}=" <> mask_value(value), else: pair
 
       _ ->
         pair
