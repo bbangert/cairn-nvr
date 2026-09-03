@@ -126,4 +126,15 @@ defmodule Cairn.CameraControlTest do
       pid -> pid
     end
   end
+
+  test "a tombstone keeps the overlay, so a rollback's revive restores it intact" do
+    id = "tomb_keep_#{System.unique_integer([:positive])}"
+    assert %{min_score: 0.3} = CameraControl.set(id, %{min_score: 0.3})
+    assert :ok = CameraControl.tombstone(id)
+    assert {:error, :removed} = CameraControl.set(id, %{min_score: 0.9})
+    assert :ok = CameraControl.revive(id)
+    assert CameraControl.get(id).min_score == 0.3
+    CameraControl.prune(Map.keys(CameraControl.all()) -- [id])
+    CameraControl.revive(id)
+  end
 end

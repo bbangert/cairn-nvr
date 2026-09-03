@@ -165,8 +165,10 @@ defmodule Cairn.CameraControl do
     {:reply, :ok, put_tombstones(state, MapSet.union(state.tombstoned, MapSet.new(dropped)))}
   end
 
+  # Marks only: the row stays until the committed prune removes it, so a
+  # delete that rolls back and revives the id gets its overlay back intact
+  # rather than reset to the defaults.
   def handle_call({:tombstone, camera_id}, _from, state) do
-    :ets.delete(@table, camera_id)
     {:reply, :ok, put_tombstones(state, MapSet.put(state.tombstoned, camera_id))}
   end
 

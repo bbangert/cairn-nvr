@@ -182,7 +182,9 @@ defmodule Cairn.Config.Server do
   Three callbacks, all run on this process so a caller that dies or gives up
   on its call still gets them, in this order: `after_commit:` (0-arity) right
   after the transaction commits, before the new config is published or
-  applied; `after_apply:` (1-arity, the applied diff) once it is applied and
+  applied; `after_apply:` (1-arity, the applied diff) once the apply has been
+  attempted — it runs even when the apply raised, so a committed delete's
+  cleanup is never lost, and is not proof the runtime took the config — and
   before it is announced; and `after_rollback:` (0-arity) instead of both
   whenever the transaction did *not* commit — a validator rejection or a
   write failure.
