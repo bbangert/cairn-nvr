@@ -1060,6 +1060,14 @@ defmodule Cairn.Cameras.SettingsTest do
     end
   end
 
+  describe "nested params" do
+    test "to_settings/2 and urls/2 drop a nested value instead of raising" do
+      params = %{"rtsp_url" => %{"x" => "y"}, "password" => %{"x" => "y"}, "labels" => "no"}
+      assert {:ok, _settings} = Settings.to_settings(params)
+      assert {_main, _sub} = Settings.urls(params, nil)
+    end
+  end
+
   describe "would_restart?/2" do
     test "a changed restart field restarts" do
       assert Settings.would_restart?(%{"rtsp_url" => "rtsp://h/1"}, %{"rtsp_url" => "rtsp://h/2"})

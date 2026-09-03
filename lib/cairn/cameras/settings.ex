@@ -204,6 +204,9 @@ defmodule Cairn.Cameras.Settings do
   """
   @spec to_settings(map(), Camera.t() | nil) :: {:ok, map()} | {:error, [String.t()]}
   def to_settings(params, saved \\ nil) do
+    # Sanitized here, not only by the caller: a crafted nested value
+    # (`camera[rtsp_url][x]=y`) would otherwise reach `to_string/1` and raise.
+    params = sanitize_params(params)
     rows = rows(params)
     saved_settings = if saved, do: saved.settings, else: %{}
 
@@ -226,6 +229,7 @@ defmodule Cairn.Cameras.Settings do
   """
   @spec urls(map(), Camera.t() | nil) :: %{main: String.t() | nil, sub: String.t() | nil}
   def urls(params, saved) do
+    params = sanitize_params(params)
     settings = if saved, do: saved.settings, else: %{}
 
     # The same rule a save applies: a ticked "Remove sub stream" means no sub

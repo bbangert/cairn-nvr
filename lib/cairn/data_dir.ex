@@ -67,7 +67,7 @@ defmodule Cairn.DataDir do
       {:error, reason} ->
         Logger.error(
           "could not chmod #{path} to #{Integer.to_string(mode, 8)}: #{:file.format_error(reason)} — " <>
-            "sensitive camera data (the database, or the ffmpeg logs) may be readable by " <>
+            "camera data (the database, clips, snapshots, or the ffmpeg logs) may be readable by " <>
             "other users on this volume"
         )
 
