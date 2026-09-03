@@ -337,6 +337,14 @@ defmodule Cairn.StreamUrlTest do
     end
   end
 
+  describe "same_endpoint?/2 with an ambiguous URL" do
+    test "an ambiguous URL is the same endpoint as nothing" do
+      refute StreamUrl.same_endpoint?("rtsp://u:pa/ss@evil/live", "rtsp://evil/live")
+      refute StreamUrl.same_endpoint?("rtsp://evil/live", "rtsp://u:pa/ss@evil/live")
+      refute StreamUrl.same_endpoint?("rtsp://u:pa/ss@h/live", "rtsp://u:pa/ss@h/live")
+    end
+  end
+
   describe "credential_key?/1" do
     test "names the vendor spellings, whatever their case" do
       assert StreamUrl.credential_key?("password")

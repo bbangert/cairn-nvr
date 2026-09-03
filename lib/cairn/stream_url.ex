@@ -443,7 +443,15 @@ defmodule Cairn.StreamUrl do
   # `nil` for a URL with no authority: `split_authority/1` reports a blank
   # scheme when there is no `//` at all, and a blank host when there is
   # nothing between it and the path.
+  # An ambiguous URL has no readable host: its `@` may sit inside a password
+  # or a path, and the authority `split_authority/1` returns for it can be
+  # the credential itself. Comparing that would seed a saved secret onto
+  # whatever host follows the `@`.
   defp endpoint(url) do
+    if ambiguous?(url), do: nil, else: unambiguous_endpoint(url)
+  end
+
+  defp unambiguous_endpoint(url) do
     case split_authority(url) do
       {@blank, _userinfo, _rest} ->
         nil
