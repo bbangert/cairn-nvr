@@ -335,7 +335,11 @@ defmodule CairnWeb.CameraForm do
   # A URL that already carries userinfo takes the fields as an overwrite (a
   # typed password replaces the saved one); a URL with none takes them as a
   # splice, whether or not its own text was edited — adding credentials to a
-  # camera that never had any is the ordinary reason to type them.
+  # camera that never had any is the ordinary reason to type them. A URL
+  # whose credential rides in the query (`?user=…&password=…`, the FLV form)
+  # is left alone either way: the fields describe the userinfo form, and
+  # adding a second credential to a URL that already carries one would
+  # change a stream the operator did not touch.
   #
   # What counts as "given" is where the trap is: the username field is
   # prefilled off the *main* stream, so treating a prefill as typed would
@@ -346,9 +350,12 @@ defmodule CairnWeb.CameraForm do
     user = trimmed(params, "username")
     pass = password(params)
 
-    if URI.parse(url).userinfo != nil or pass != @blank or given_user?(user, saved),
-      do: compose_url(url, user, pass),
-      else: url
+    cond do
+      URI.parse(url).userinfo != nil -> compose_url(url, user, pass)
+      CameraCards.credentialed?(url) -> url
+      pass != @blank or given_user?(user, saved) -> compose_url(url, user, pass)
+      true -> url
+    end
   end
 
   defp given_user?(@blank, _saved), do: false
@@ -745,11 +752,19 @@ defmodule CairnWeb.CameraForm do
       <div class="hs-field" data-restart="true" style={field_style()}>
         <label style={label_style()}>Password<.restart_chip /></label>
         <%!-- Never a value=: a saved credential is not rendered anywhere but
-              the masked readout (the credential rule). --%>
+              the masked readout (the credential rule). `phx-update="ignore"`
+              follows from that: with no value attribute to restore, the next
+              patch (any keystroke elsewhere re-renders the form) would clear
+              what the operator typed here before Save, and the camera would
+              be saved without its password. The board walk caught exactly
+              that. Ignored, the DOM keeps the typed value and the submit still
+              carries it. --%>
         <input
+          id="camera-password"
           name="camera[password]"
           type="password"
           autocomplete="new-password"
+          phx-update="ignore"
           phx-debounce="300"
           style={input_style()}
         />

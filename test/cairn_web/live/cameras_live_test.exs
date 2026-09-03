@@ -217,6 +217,20 @@ defmodule CairnWeb.CamerasLiveTest do
     assert html =~ "config-globals"
   end
 
+  describe "password field" do
+    test "is write-only and survives re-renders", %{conn: conn} do
+      {:ok, _view, html} = live(conn, "/cameras/new?tab=manual")
+      [input] = Regex.scan(~r/<input[^>]*id="camera-password"[^>]*>/, html) |> List.flatten()
+
+      assert input =~ ~s(type="password")
+      assert input =~ ~s(autocomplete="new-password")
+      # Without this, LiveView's next patch clears the typed password: the
+      # input has no value attribute to restore it from (the credential rule).
+      assert input =~ ~s(phx-update="ignore")
+      refute input =~ "value="
+    end
+  end
+
   describe "the camera form" do
     test "the add page renders the form, the tabs and no password value", %{conn: conn} do
       {:ok, _view, html} = live(conn, "/cameras/new")

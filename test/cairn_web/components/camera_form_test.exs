@@ -142,6 +142,27 @@ defmodule CairnWeb.CameraFormTest do
       assert settings["substream_url"] == "rtsp://ops:new%20pass@cam.lan:554/sub"
     end
 
+    test "a URL carrying its credential in the query is never spliced" do
+      main = "http://cam.lan/flv?stream=ch0&user=admin&password=old"
+
+      row = %Camera{
+        id: "gate",
+        settings: %{"rtsp_url" => main, "substream_url" => "rtsp://cam.lan/sub"},
+        zones: []
+      }
+
+      {:ok, settings} =
+        row
+        |> CameraForm.to_params()
+        |> Map.merge(%{"rtsp_url" => main, "username" => "admin", "password" => "pw"})
+        |> CameraForm.to_settings(row)
+
+      # The typed fields reach the sub stream, which has no credential at all;
+      # the main stream already carries one, in the query, and stays as typed.
+      assert settings["rtsp_url"] == main
+      assert settings["substream_url"] == "rtsp://admin:pw@cam.lan/sub"
+    end
+
     test "credentials typed for an uncredentialed URL are spliced in, URL untouched" do
       row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://cam.lan/main"}, zones: []}
 
