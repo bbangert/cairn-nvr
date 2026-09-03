@@ -94,6 +94,7 @@ defmodule CairnWeb.CamerasLiveTest do
     {:ok, _view, html} = live(conn, "/cameras")
 
     assert html =~ ~s(data-loaded="disabled")
+    assert html =~ ~s(aria-label="Enable cam1")
     # A disabled camera has no runtime to report, so no badge rather than "Unknown".
     refute html =~ ~s(id="camera-status-)
     assert html =~ ~s(aria-checked="false")

@@ -491,12 +491,13 @@ defmodule CairnWeb.CamerasLive do
     }
   end
 
-  # The reason is logged whole and rendered only as one of the sentences
-  # `describe_probe_error/1` allows: it can be a decode error holding
-  # ffprobe's output, which quotes the credentialed URL.
+  # Neither the log nor the card sees the reason itself: it can be a decode
+  # error holding ffprobe's output, which quotes the credentialed URL. Both
+  # get one of the sentences `describe_probe_error/1` allows.
   defp probe_error(reason) do
-    Logger.warning("cameras: probe failed: #{inspect(reason)}")
-    %{state: :error, chips: [], warning: false, error: CameraCards.describe_probe_error(reason)}
+    message = CameraCards.describe_probe_error(reason)
+    Logger.warning("cameras: probe failed: #{message}")
+    %{state: :error, chips: [], warning: false, error: message}
   end
 
   defp zone_summary(0), do: "No zones — presence counts the whole frame"
@@ -521,9 +522,10 @@ defmodule CairnWeb.CamerasLive do
   defp blank_load, do: %{warnings: [], errors: [], skipped: %{}}
 
   # `get/1` and `last_load/1` are 5 s calls the server cannot answer while it
-  # is applying a config (the save holds it through `apply_diff`), so a page
-  # opened mid-save exits rather than renders — the `Cairn.CameraTracker`
-  # treatment. The `{:config_changed, _}` that ends the apply re-reads.
+  # is applying a config (the save holds it through `apply_diff`). The call's
+  # exit is caught the way `Cairn.CameraTracker` does it, and a page opened
+  # mid-save renders the busy card instead; the `{:config_changed, _}` that
+  # ends the apply re-reads.
   defp overlay do
     server = Cameras.server()
     {:ok, Config.Server.get(server), Config.Server.last_load(server)}
@@ -917,6 +919,7 @@ defmodule CairnWeb.CamerasLive do
                 class="hs-tog"
                 role="switch"
                 aria-checked={to_string(cam.enabled)}
+                aria-label={"Enable #{cam.id}"}
                 disabled={MapSet.member?(@applying, cam.id)}
                 phx-click="toggle-enabled"
                 phx-value-id={cam.id}
