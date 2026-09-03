@@ -121,6 +121,30 @@ defmodule CairnWeb.CameraCards do
   def credentialed?(_other), do: false
 
   @doc """
+  The URL's credential query pairs verbatim — the `key=value` strings whose
+  key `credentialed?/1` recognizes — so a form retyping the URL by hand can
+  carry the saved camera's FLV-form credential (`?user=…&password=…`) onto
+  the new one the same way `carry_userinfo/2` carries a userinfo credential.
+  """
+  @spec credential_query_pairs(term()) :: [String.t()]
+  def credential_query_pairs(url) when is_binary(url) do
+    url
+    |> URI.parse()
+    |> Map.get(:query)
+    |> case do
+      nil ->
+        []
+
+      query ->
+        Enum.filter(String.split(query, "&"), fn pair ->
+          pair |> String.split("=", parts: 2) |> hd() |> credential_key?()
+        end)
+    end
+  end
+
+  def credential_query_pairs(_other), do: []
+
+  @doc """
   A rejected write's reason as one line an operator may see. Never
   `inspect/1`: a rejected changeset's `:changes` and an Ecto exception's
   message both carry the settings map, and with it the camera's password.

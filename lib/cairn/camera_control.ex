@@ -18,6 +18,16 @@ defmodule Cairn.CameraControl do
   @topic "cameras:control"
   @defaults %{detection_enabled: true, recording_enabled: true, min_score: nil}
 
+  # The tombstone set lives in `:persistent_term`, not only in GenServer
+  # state: `@table` is owned by this process, so a crash takes both the ETS
+  # table and the state with it, and a plain restart would let a control
+  # request racing the restart recreate a deleted id's overlay. A persistent
+  # term survives the owning process, so `init/1` below reloads the same set
+  # a restart would otherwise have dropped. Writing it on every
+  # tombstone/prune/revive is fine because those are operator-paced (camera
+  # deletes and re-creates), not a per-request hot path like `get/1`.
+  @ptkey {__MODULE__, :tombstones}
+
   @type control :: %{
           detection_enabled: boolean(),
           recording_enabled: boolean(),
@@ -117,9 +127,12 @@ defmodule Cairn.CameraControl do
   def tombstone(camera_id), do: GenServer.call(__MODULE__, {:tombstone, camera_id})
 
   @impl true
+  # Seeded from the persistent term, not `MapSet.new()`: a restart after a
+  # crash must come back refusing the same ids it refused before, or the
+  # tombstone a caller observed would have quietly expired.
   def init(_opts) do
     :ets.new(@table, [:named_table, :set, :protected, read_concurrency: true])
-    {:ok, %{tombstoned: MapSet.new()}}
+    {:ok, %{tombstoned: tombstones()}}
   end
 
   @impl true
@@ -127,9 +140,12 @@ defmodule Cairn.CameraControl do
   # camera exists (the HA control endpoint) and then writes is not serialized
   # with deletion, so a delete can commit and prune in between — and the late
   # write would recreate the overlay under a dead id, which a later camera
-  # created under the same id would then inherit.
+  # created under the same id would then inherit. Reads the persistent term
+  # directly rather than `state.tombstoned`: they agree except in the window
+  # right after a restart, and it is exactly that window this check exists to
+  # close.
   def handle_call({:set, camera_id, attrs}, _from, state) do
-    if MapSet.member?(state.tombstoned, camera_id) do
+    if MapSet.member?(tombstones(), camera_id) do
       {:reply, {:error, :removed}, state}
     else
       control = Map.merge(get(camera_id), Map.take(attrs, Map.keys(@defaults)))
@@ -146,15 +162,24 @@ defmodule Cairn.CameraControl do
         camera_id
       end
 
-    {:reply, :ok, %{state | tombstoned: MapSet.union(state.tombstoned, MapSet.new(dropped))}}
+    {:reply, :ok, put_tombstones(state, MapSet.union(state.tombstoned, MapSet.new(dropped)))}
   end
 
   def handle_call({:tombstone, camera_id}, _from, state) do
     :ets.delete(@table, camera_id)
-    {:reply, :ok, %{state | tombstoned: MapSet.put(state.tombstoned, camera_id)}}
+    {:reply, :ok, put_tombstones(state, MapSet.put(state.tombstoned, camera_id))}
   end
 
   def handle_call({:revive, camera_id}, _from, state) do
-    {:reply, :ok, %{state | tombstoned: MapSet.delete(state.tombstoned, camera_id)}}
+    {:reply, :ok, put_tombstones(state, MapSet.delete(state.tombstoned, camera_id))}
+  end
+
+  defp tombstones, do: :persistent_term.get(@ptkey, MapSet.new())
+
+  # The one place `@ptkey` is written: every tombstone/prune/revive replaces
+  # it wholesale, so it never drifts from `state.tombstoned`.
+  defp put_tombstones(state, tombstoned) do
+    :persistent_term.put(@ptkey, tombstoned)
+    %{state | tombstoned: tombstoned}
   end
 end

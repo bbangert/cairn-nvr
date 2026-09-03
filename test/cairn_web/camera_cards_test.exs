@@ -170,6 +170,22 @@ defmodule CairnWeb.CameraCardsTest do
     end
   end
 
+  describe "credential_query_pairs/1" do
+    test "returns the recognized pairs verbatim, in order, and none for a plain URL" do
+      url = "http://cam.lan/flv?stream=ch0&user=admin&password=x"
+      assert CameraCards.credential_query_pairs(url) == ["user=admin", "password=x"]
+      assert CameraCards.credential_query_pairs("http://cam.lan/flv?stream=ch0") == []
+    end
+
+    test "a userinfo credential has no query pairs to carry" do
+      assert CameraCards.credential_query_pairs("rtsp://admin:s3cret@10.0.0.5:554/s1") == []
+    end
+
+    test "a non-string URL yields none" do
+      refute CameraCards.credential_query_pairs(nil) != []
+    end
+  end
+
   describe "describe_probe_error/1" do
     test "names the reasons a probe can fail with" do
       assert CameraCards.describe_probe_error(:timeout) == "timed out"

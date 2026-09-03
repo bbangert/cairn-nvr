@@ -1011,6 +1011,38 @@ defmodule CairnWeb.CamerasLiveTest do
     # is still applying, and while it is, the page's own reads exit too — so
     # the unconfirmed card sits behind the busy one and the page waits for
     # `{:config_changed, _}` like any other session does.
+    test "a toggle whose server never answers stays applying until a config change confirms it",
+         %{conn: conn, server: server} do
+      create!("cam1")
+      {:ok, view, _html} = live(conn, "/cameras")
+
+      {dead, ref} = spawn_monitor(fn -> :ok end)
+      assert_receive {:DOWN, ^ref, :process, ^dead, _reason}
+      Application.put_env(:cairn, :config_server, dead)
+
+      links = fn -> view.pid |> Process.info(:links) |> elem(1) |> length() end
+      idle = links.()
+
+      render_click(view, "toggle-enabled", %{"id" => "cam1"})
+      html = render_async(view)
+      assert html =~ "it may still apply"
+      assert html =~ ~s(id="cameras-busy")
+
+      # Still in flight as far as this page knows: a second click starts nothing.
+      render_click(view, "toggle-enabled", %{"id" => "cam1"})
+      assert links.() == idle
+
+      Application.put_env(:cairn, :config_server, server)
+
+      Phoenix.PubSub.broadcast(
+        Cairn.PubSub,
+        Cairn.Config.topic(),
+        {:config_changed, %{added: [], removed: [], changed: [], refreshed: []}}
+      )
+
+      assert has_element?(view, "#camera-enabled-cam1:not([disabled])")
+    end
+
     test "a save whose server never answers keeps the unconfirmed card behind the busy one",
          %{conn: conn} do
       create!("cam1")

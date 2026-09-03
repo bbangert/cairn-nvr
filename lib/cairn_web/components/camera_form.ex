@@ -465,7 +465,10 @@ defmodule CairnWeb.CameraForm do
   # above like any other URL that already carries one: a changed username
   # replaces only the username and a blank password keeps the saved one,
   # instead of the splice reading "no userinfo yet" and dropping the saved
-  # password outright.
+  # password outright. A retyped URL whose saved counterpart carried its
+  # credential in the query instead (the FLV form) gets that carried the same
+  # way, so it lands in the `credentialed?/1` branch below rather than
+  # silently losing the credential to a save nobody meant to touch it.
   defp credentialed(url, key, params, saved) do
     # Not trimmed, like the password: `url_user/1` decodes the saved
     # userinfo verbatim, spaces included, and an untouched edit re-derives
@@ -479,8 +482,11 @@ defmodule CairnWeb.CameraForm do
       URI.parse(seeded).userinfo != nil ->
         compose_url(seeded, if(given_user?(user, saved), do: user, else: @blank), pass)
 
-      CameraCards.credentialed?(url) ->
-        url
+      # `seeded`, not `url`: the FLV form's credential can have arrived via
+      # `seed_userinfo/2`'s query-pair carry rather than already being on the
+      # typed URL, and only `seeded` reflects that.
+      CameraCards.credentialed?(seeded) ->
+        seeded
 
       pass != @blank or given_user?(user, saved) ->
         compose_url(url, user, pass)
@@ -493,12 +499,15 @@ defmodule CairnWeb.CameraForm do
   # The carry that used to run only as `credentialed/4`'s last resort, now run
   # up front: a URL that already carries its own credential (userinfo, or the
   # FLV query form `CameraCards.credentialed?/1` reads) is left untouched —
-  # seeding it with the saved URL's userinfo would either overwrite a
-  # credential the operator just typed into the URL itself, or bolt userinfo
-  # onto a URL whose credential rides in the query instead.
+  # seeding it with the saved URL's credential would either overwrite a
+  # credential the operator just typed into the URL itself, or bolt a second
+  # one onto a URL that already carries its own. A URL with neither takes
+  # whichever form the saved URL carried: userinfo, or the recognized query
+  # pairs — the FLV form has no userinfo slot to seed, so its credential rides
+  # to the retyped URL as a query carry instead.
   defp seed_userinfo(url, saved_url) do
     if URI.parse(url).userinfo == nil and not CameraCards.credentialed?(url) do
-      carry_userinfo(url, saved_url)
+      url |> carry_userinfo(saved_url) |> carry_credential_query(saved_url)
     else
       url
     end
@@ -514,6 +523,30 @@ defmodule CairnWeb.CameraForm do
   end
 
   defp carry_userinfo(url, _absent), do: url
+
+  # Runs after `carry_userinfo/2`, so a saved userinfo credential has already
+  # landed on `url` and made it `credentialed?/1` — this only fires for a
+  # saved URL whose credential rode in the query instead, the case
+  # `carry_userinfo/2` cannot carry. Same verbatim-pairs rule: the saved
+  # query's `key=value` text is already encoded.
+  defp carry_credential_query(url, saved_url) do
+    if CameraCards.credentialed?(url) do
+      url
+    else
+      case CameraCards.credential_query_pairs(saved_url) do
+        [] -> url
+        pairs -> append_query(url, pairs)
+      end
+    end
+  end
+
+  defp append_query(url, pairs) do
+    uri = URI.parse(url)
+    added = Enum.join(pairs, "&")
+    merged = if uri.query in [nil, @blank], do: added, else: uri.query <> "&" <> added
+
+    URI.to_string(%{uri | query: merged})
+  end
 
   defp given_user?(@blank, _saved), do: false
 

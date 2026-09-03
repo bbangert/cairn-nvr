@@ -307,6 +307,33 @@ defmodule CairnWeb.CameraFormTest do
       assert settings["substream_url"] == "rtsp://admin:pw@cam.lan/sub"
     end
 
+    test "a retyped URL with no credential carries the saved query-form credential" do
+      main = "http://old/flv?stream=ch0&user=admin&password=x"
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => main}, zones: []}
+
+      {:ok, settings} =
+        row
+        |> CameraForm.to_params()
+        |> Map.merge(%{"rtsp_url" => "http://new/flv?stream=ch1"})
+        |> CameraForm.to_settings(row)
+
+      assert settings["rtsp_url"] == "http://new/flv?stream=ch1&user=admin&password=x"
+    end
+
+    test "a retyped URL that already carries its own credential is left alone" do
+      main = "http://old/flv?stream=ch0&user=admin&password=x"
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => main}, zones: []}
+      retyped = "http://new/flv?stream=ch1&user=other&password=y"
+
+      {:ok, settings} =
+        row
+        |> CameraForm.to_params()
+        |> Map.merge(%{"rtsp_url" => retyped})
+        |> CameraForm.to_settings(row)
+
+      assert settings["rtsp_url"] == retyped
+    end
+
     test "credentials typed for an uncredentialed URL are spliced in, URL untouched" do
       row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://cam.lan/main"}, zones: []}
 

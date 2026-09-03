@@ -155,6 +155,31 @@ defmodule Cairn.Config.ServerTest do
              Config.Server.reload(server)
   end
 
+  describe "apply and control tombstones" do
+    test "a camera the applied config names accepts control writes again" do
+      # The private server below reloads the fixture, which names cam_a.
+      Cairn.CameraControl.tombstone("cam_a")
+      assert {:error, :removed} = Cairn.CameraControl.set("cam_a", %{detection_enabled: false})
+
+      server =
+        start_supervised!(
+          {Cairn.Config.Server,
+           path: "test/support/fixtures/configs/valid.yml",
+           name: nil,
+           apply_diff: fn _diff, _config -> :ok end,
+           apply_native: fn _config -> :ok end},
+          id: :revive_server
+        )
+
+      assert {:ok, _diff, _warnings} = Cairn.Config.Server.reload(server)
+
+      assert %{detection_enabled: false} =
+               Cairn.CameraControl.set("cam_a", %{detection_enabled: false})
+
+      Cairn.CameraControl.prune(Map.keys(Cairn.CameraControl.all()) -- ["cam_a"])
+    end
+  end
+
   describe "diff_cameras/2" do
     test "an identical camera is in neither list" do
       assert camera_diff(%{}) == %{added: [], removed: [], changed: [], refreshed: []}

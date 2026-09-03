@@ -452,6 +452,12 @@ defmodule Cairn.Config.Server do
     # rather than of loads.
     state.apply_native.(new_config)
     state.apply_diff.(diff, new_config)
+    # A camera in an applied config is, by definition, not deleted: whatever
+    # tombstoned its id — a delete this save rolled back later, a re-import,
+    # another suite in the test run — is over once the fleet names it again,
+    # so its control writes are accepted from here on. Caught because the
+    # control server is a sibling that may be restarting.
+    Enum.each(new_config.cameras, &revive_control/1)
     state = %{state | config: new_config, warnings: warnings, errors: [], skipped: skipped}
     # Before the broadcast: a subscriber that reacts to `{:config_changed, _}`
     # by calling `get/1` shares this mailbox with the callback, and a prune
@@ -479,6 +485,12 @@ defmodule Cairn.Config.Server do
               "config source #{inspect(state.source)} answered #{inspect(other)}; expected " <>
                 "{:ok, %Cairn.Config{}, warnings, skipped} or {:error, errors, fallback | nil}"
     end
+  end
+
+  defp revive_control(%Config.Camera{id: id}) do
+    Cairn.CameraControl.revive(id)
+  catch
+    :exit, _ -> :ok
   end
 
   # Overwriting a persistent term scans every process for references to the

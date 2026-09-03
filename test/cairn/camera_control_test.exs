@@ -90,4 +90,40 @@ defmodule Cairn.CameraControlTest do
     assert :ok = CameraControl.revive(id)
     assert %{} = CameraControl.set(id, %{detect: false})
   end
+
+  # The tombstone set used to live only in GenServer state, which a restart
+  # resets to `MapSet.new()` — a paused (tombstoned) id would answer as live
+  # again the moment the supervisor brought a fresh CameraControl up. It now
+  # comes back out of `:persistent_term`, which the crash does not touch.
+  test "a tombstone survives the supervisor restarting CameraControl" do
+    id = "cc_restart_#{System.unique_integer([:positive])}"
+    assert :ok = CameraControl.tombstone(id)
+
+    try do
+      pid = Process.whereis(CameraControl)
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+
+      restarted = wait_for_new_pid(pid)
+      # A synchronous call as the barrier: the name is registered before
+      # `init/1` runs, so `Process.whereis/1` alone would not prove the
+      # persistent-term reload had happened yet.
+      :sys.get_state(restarted)
+
+      assert CameraControl.set(id, %{detection_enabled: false}) == {:error, :removed}
+    after
+      CameraControl.revive(id)
+    end
+  end
+
+  # No sleep: the restart is a supervisor's business, not a timed one, so
+  # this spins on the registration itself until the new pid shows up.
+  defp wait_for_new_pid(old_pid) do
+    case Process.whereis(CameraControl) do
+      nil -> wait_for_new_pid(old_pid)
+      ^old_pid -> wait_for_new_pid(old_pid)
+      pid -> pid
+    end
+  end
 end

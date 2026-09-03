@@ -44,7 +44,12 @@ defmodule CairnWeb.CamerasLive do
 
     {:ok,
      socket
-     |> assign(save_result: nil, applying: MapSet.new(), statuses: Cairn.CameraStatus.all())
+     |> assign(
+       save_result: nil,
+       applying: MapSet.new(),
+       unconfirmed: MapSet.new(),
+       statuses: Cairn.CameraStatus.all()
+     )
      |> load()}
   end
 
@@ -185,7 +190,12 @@ defmodule CairnWeb.CamerasLive do
 
   # The in-flight guards are the server's own: `disabled` in the markup stops
   # the first click's own button, but not a second event from a stale DOM, a
-  # double submit or a hand-sent one. A write already applying wins.
+  # double submit or a hand-sent one. A write already applying wins — and
+  # stays winning past a 30 s call timeout: `handle_async/3`'s `{:exit, _}`
+  # arm leaves the id in `@applying` (row still `data-busy`, button still
+  # disabled) rather than clearing it, because the server may still be
+  # applying the write. `{:config_changed, _}` is the confirmed end either
+  # way, and is what actually clears the row (`clear_unconfirmed/1`).
   @impl true
   def handle_event("toggle-enabled", %{"id" => id}, socket) do
     row = Enum.find(socket.assigns.cameras, &(&1.id == id))
@@ -305,10 +315,17 @@ defmodule CairnWeb.CamerasLive do
     {:noreply, socket |> finish(id) |> assign(save_result: result(result)) |> load()}
   end
 
+  # Not `finish/2`: an exit is not a rollback, and the server may still be
+  # applying the write, so the id stays in `@applying` (the row stays
+  # `data-busy` and its buttons stay disabled) and moves into `@unconfirmed`
+  # instead of clearing. Clearing here would let a fresh click race the write
+  # still in flight and reapply on top of whatever it is about to commit.
+  # `{:config_changed, _}` is the confirmed end either way, and
+  # `clear_unconfirmed/1` is what actually drops the id from both sets.
   def handle_async({:apply, id}, {:exit, reason}, socket) do
     {:noreply,
      socket
-     |> finish(id)
+     |> mark_unconfirmed(id)
      |> assign(save_result: exit_result(reason))
      |> load()}
   end
@@ -386,6 +403,21 @@ defmodule CairnWeb.CamerasLive do
   defp finish(socket, id),
     do: assign(socket, applying: MapSet.delete(socket.assigns.applying, id))
 
+  defp mark_unconfirmed(socket, id),
+    do: assign(socket, unconfirmed: MapSet.put(socket.assigns.unconfirmed, id))
+
+  # The confirmed end of a list-row apply `handle_async/3` could not resolve
+  # (see `mark_unconfirmed/2`): every id `{:config_changed, _}` reports as
+  # settled drops out of both `@applying` and `@unconfirmed` here, which is
+  # what re-enables the row instead of leaving it disabled forever after one
+  # timed-out toggle or delete.
+  defp clear_unconfirmed(socket) do
+    assign(socket,
+      applying: MapSet.difference(socket.assigns.applying, socket.assigns.unconfirmed),
+      unconfirmed: MapSet.new()
+    )
+  end
+
   @impl true
   # A save this session ran re-reads in `handle_async` as well; both arrive
   # and both are a full re-read, so the order between them does not matter.
@@ -402,6 +434,7 @@ defmodule CairnWeb.CamerasLive do
 
     {:noreply,
      socket
+     |> clear_unconfirmed()
      |> refresh_globals()
      |> refresh_choices()
      |> refresh_saved()

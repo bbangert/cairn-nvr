@@ -481,7 +481,9 @@ defmodule Cairn.Config.ServerUpdateTest do
 
     assert log =~ "after_rollback raised: RuntimeError"
     refute log =~ "hunter2"
-    assert Process.alive?(server)
+    # A synchronous call, not Process.alive?/1: alive only proves the pid
+    # hasn't been reaped yet, not that the GenServer loop is still answering.
+    assert %{} = Config.Server.get(server)
   end
 
   test "an after_rollback that is not a 0-arity fun is refused before the write", %{
