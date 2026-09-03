@@ -142,6 +142,48 @@ defmodule CairnWeb.CameraFormTest do
       assert settings["substream_url"] == "rtsp://ops:new%20pass@cam.lan:554/sub"
     end
 
+    # The username field is prefilled off the main stream only, so applying it
+    # to every URL that has userinfo rewrote a sub stream that authenticates
+    # as somebody else (D-P5: an untouched save diffs to nothing).
+    test "each URL keeps its own username on an untouched save" do
+      row = %Camera{
+        id: "gate",
+        settings: %{
+          "rtsp_url" => "rtsp://alice:x@cam.lan/main",
+          "substream_url" => "rtsp://bob:y@cam.lan/sub"
+        },
+        zones: []
+      }
+
+      params = CameraForm.to_params(row)
+      assert params["username"] == "alice"
+
+      {:ok, settings} = CameraForm.to_settings(params, row)
+
+      assert settings["rtsp_url"] == "rtsp://alice:x@cam.lan/main"
+      assert settings["substream_url"] == "rtsp://bob:y@cam.lan/sub"
+    end
+
+    test "a typed password reaches both URLs and neither username moves" do
+      row = %Camera{
+        id: "gate",
+        settings: %{
+          "rtsp_url" => "rtsp://alice:x@cam.lan/main",
+          "substream_url" => "rtsp://bob:y@cam.lan/sub"
+        },
+        zones: []
+      }
+
+      {:ok, settings} =
+        row
+        |> CameraForm.to_params()
+        |> Map.put("password", "pw")
+        |> CameraForm.to_settings(row)
+
+      assert settings["rtsp_url"] == "rtsp://alice:pw@cam.lan/main"
+      assert settings["substream_url"] == "rtsp://bob:pw@cam.lan/sub"
+    end
+
     test "a param the form did not send reads as blank, not a crash" do
       # A hand-sent or partial submit omits keys; `to_string(nil)` is "".
       assert {:ok, settings} = CameraForm.to_settings(%{"rtsp_url" => "rtsp://h/1"}, nil)
@@ -492,6 +534,12 @@ defmodule CairnWeb.CameraFormTest do
       assert html =~ ~s(aria-label="person record threshold")
       assert html =~ ~s(aria-label="person keep days")
     end
+
+    test "a label cell names its row" do
+      html = render_form(%{}, plugins: [])
+
+      assert html =~ ~s(aria-label="detection label 1")
+    end
   end
 
   defp render_form(params, opts) do
@@ -519,6 +567,7 @@ defmodule CairnWeb.CameraFormTest do
       trackers: [],
       known_labels: [],
       probe: %{main: blank_probe, sub: %{blank_probe | state: :absent}},
+      password_gen: 0,
       saving: false,
       restart_dirty: false,
       camera_id: "gate"

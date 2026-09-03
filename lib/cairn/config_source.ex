@@ -101,33 +101,47 @@ defmodule Cairn.ConfigSource do
   """
   @spec reimport(Path.t()) :: Cameras.write_result()
   def reimport(path \\ Config.default_path()) do
-    before = Enum.map(Cameras.list(), & &1.id)
+    caller = self()
+    ref = make_ref()
 
-    case Config.Server.update(Cameras.server(), fn -> replace_rows(path) end) do
-      {:ok, diff, _warnings} = applied ->
+    case Config.Server.update(Cameras.server(), fn -> replace_rows(path, caller, ref) end) do
+      {:ok, _diff, _warnings} = applied ->
         remaining = Enum.map(Cameras.list(), & &1.id)
-        # `before` is read outside the server's transaction, so a row another
-        # session added in between is missing from it; the applied diff names
-        # that one. Neither alone is the set: a disabled row is in no config
-        # and only `before` knows it (D-P8 keys prunes on the row, not the
-        # diff).
-        Enum.each(Enum.uniq(before ++ diff.removed) -- remaining, &Cameras.prune_runtime/1)
+        # The pruned set is the rows the write itself deleted, read inside the
+        # write and sent back out: a row another session added between the
+        # call and the transaction is in neither a list read out here nor the
+        # applied diff — a disabled row is in no config at all, and D-P8 keys
+        # prunes on the row rather than the diff.
+        Enum.each(deleted_ids(ref) -- remaining, &Cameras.prune_runtime/1)
         applied
 
       rejected ->
+        # The write may have deleted and then failed to commit; its message
+        # would otherwise sit in the mailbox for whatever receives next.
+        _flushed = deleted_ids(ref)
         rejected
     end
   end
 
-  defp replace_rows(path) do
+  defp deleted_ids(ref) do
+    receive do
+      {^ref, ids} -> ids
+    after
+      0 -> []
+    end
+  end
+
+  defp replace_rows(path, caller, ref) do
     with {:ok, map} <- Config.raw_map(path),
          {:ok, cameras} <- importable_list(Map.get(map, "cameras")),
          {:ok, _config, _warnings} <- Config.from_map(map) do
+      deleted = Repo.all(from(c in Camera, select: c.id))
       Repo.delete_all(Camera)
       Repo.delete_all(from(s in Setting, where: s.key == @marker_key))
       # The write closure answers only `:ok`; the dropped-key warnings from
       # the import are logged here so they are not lost with it.
       cameras |> import_rows(path) |> Enum.each(&Logger.warning("config: #{&1}"))
+      send(caller, {ref, deleted})
       :ok
     else
       {:error, errors} when is_list(errors) -> {:error, {:yaml, errors}}

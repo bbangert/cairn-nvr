@@ -34,6 +34,12 @@ defmodule CairnWeb.CameraCardsTest do
       assert CameraCards.mask_url("rtsp://10.0.0.5:554/s1") == "rtsp://10.0.0.5:554/s1"
     end
 
+    # Cameras that authenticate on the password alone: the userinfo is there,
+    # with nothing before the colon.
+    test "hides a password whose username is empty" do
+      assert CameraCards.mask_url("rtsp://:secret@host/s") == "rtsp://:•••••@host/s"
+    end
+
     test "hides credential query params (http-flv style)" do
       assert CameraCards.mask_url(
                "http://10.0.0.5/flv?port=1935&stream=ch0&user=admin&password=hunter2"
@@ -57,6 +63,10 @@ defmodule CairnWeb.CameraCardsTest do
       assert CameraCards.credentialed?("http://10.0.0.5/live?psw=hunter2")
       refute CameraCards.credentialed?("rtsp://10.0.0.5:554/s1")
       refute CameraCards.credentialed?("http://10.0.0.5/live?channel=1&subtype=0")
+    end
+
+    test "an empty username still leaves userinfo to hide" do
+      assert CameraCards.credentialed?("rtsp://:secret@host/s")
     end
   end
 

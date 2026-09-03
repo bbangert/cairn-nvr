@@ -355,8 +355,11 @@ defmodule CairnWeb.CameraForm do
     end
   end
 
-  # A URL that already carries userinfo takes the fields as an overwrite (a
-  # typed password replaces the saved one); a URL with none takes them as a
+  # A URL that already carries userinfo keeps its own username unless the
+  # operator changed the field, and keeps its own password unless one was
+  # typed: the username is prefilled off the *main* stream, so overwriting
+  # with it would rewrite a sub stream that authenticates as somebody else on
+  # a save nobody edited. A URL with none takes the fields as a
   # splice, whether or not its own text was edited — adding credentials to a
   # camera that never had any is the ordinary reason to type them. A URL
   # whose credential rides in the query (`?user=…&password=…`, the FLV form)
@@ -364,11 +367,10 @@ defmodule CairnWeb.CameraForm do
   # adding a second credential to a URL that already carries one would
   # change a stream the operator did not touch.
   #
-  # What counts as "given" is where the trap is: the username field is
-  # prefilled off the *main* stream, so treating a prefill as typed would
-  # splice it into a sub stream nobody edited and break the untouched-edit
-  # round trip (D-P5). Only a password, or a username the operator changed,
-  # rewrites a URL that has no userinfo.
+  # What counts as "given" is where the trap is: treating a prefill as typed
+  # would break the untouched-edit round trip (D-P5) either way. Only a
+  # password, or a username the operator changed, rewrites a URL that has no
+  # userinfo.
   #
   # Last: a URL retyped for a stream whose saved URL carried the credential
   # keeps it. Neither field can supply one here — the password field says
@@ -380,10 +382,17 @@ defmodule CairnWeb.CameraForm do
     pass = password(params)
 
     cond do
-      URI.parse(url).userinfo != nil -> compose_url(url, user, pass)
-      CameraCards.credentialed?(url) -> url
-      pass != @blank or given_user?(user, saved) -> compose_url(url, user, pass)
-      true -> carry_userinfo(url, saved[key])
+      URI.parse(url).userinfo != nil ->
+        compose_url(url, if(given_user?(user, saved), do: user, else: @blank), pass)
+
+      CameraCards.credentialed?(url) ->
+        url
+
+      pass != @blank or given_user?(user, saved) ->
+        compose_url(url, user, pass)
+
+      true ->
+        carry_userinfo(url, saved[key])
     end
   end
 
@@ -688,6 +697,7 @@ defmodule CairnWeb.CameraForm do
   attr :saving, :boolean, required: true
   attr :restart_dirty, :boolean, required: true
   attr :camera_id, :string, required: true
+  attr :password_gen, :integer, required: true
 
   def camera_form(assigns) do
     ~H"""
@@ -706,6 +716,7 @@ defmodule CairnWeb.CameraForm do
             mode={@mode}
             field_errors={@field_errors}
             plugins={@plugins}
+            password_gen={@password_gen}
           />
           <.tier_rows rows={@rows} field_errors={@field_errors} known_labels={@known_labels} />
           <.windows_fields form={@form} field_errors={@field_errors} />
@@ -740,6 +751,7 @@ defmodule CairnWeb.CameraForm do
   attr :mode, :string, required: true
   attr :field_errors, :map, required: true
   attr :plugins, :list, required: true
+  attr :password_gen, :integer, required: true
 
   defp stream_fields(assigns) do
     ~H"""
@@ -791,7 +803,9 @@ defmodule CairnWeb.CameraForm do
       />
 
       <div class="hs-field" data-restart="true" style={field_style()}>
-        <label for="camera-password" style={label_style()}>Password<.restart_chip /></label>
+        <label for={"camera-password-#{@password_gen}"} style={label_style()}>
+          Password<.restart_chip />
+        </label>
         <%!-- Never a value=: a saved credential is not rendered anywhere but
               the masked readout (the credential rule). `phx-update="ignore"`
               follows from that: with no value attribute to restore, the next
@@ -799,9 +813,15 @@ defmodule CairnWeb.CameraForm do
               what the operator typed here before Save, and the camera would
               be saved without its password. The board walk caught exactly
               that. Ignored, the DOM keeps the typed value and the submit still
-              carries it. --%>
+              carries it.
+
+              Which is also why the id carries a generation: an ignored node is
+              never patched, so without a new id the typed password would
+              outlive the save that consumed it and ride along on the next,
+              unrelated one. `CairnWeb.CamerasLive` bumps the generation
+              wherever the form is re-initialized from a fresh row. --%>
         <input
-          id="camera-password"
+          id={"camera-password-#{@password_gen}"}
           name="camera[password]"
           type="password"
           autocomplete="new-password"
@@ -900,6 +920,7 @@ defmodule CairnWeb.CameraForm do
         >
           <div style="display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr 0.8fr auto; gap: 8px; align-items: center;">
             <input
+              aria-label={"detection label #{n}"}
               name={"camera[labels][#{n}][label]"}
               value={row["label"]}
               list="known-labels"

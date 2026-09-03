@@ -288,8 +288,13 @@ defmodule Cairn.Cameras do
   defp canonical_put(acc, "transcode", false), do: acc
   defp canonical_put(acc, "pipeline", "membrane"), do: acc
 
+  # An empty map holds no label rule, and `parse_min_score/3` merges what it
+  # is given over `@default_min_score` — so it reads exactly as the absent key.
   defp canonical_put(acc, "min_score", value) do
-    Map.put(acc, "min_score", canonical_min_score(value))
+    case canonical_min_score(value) do
+      empty when empty == %{} -> acc
+      scores -> Map.put(acc, "min_score", scores)
+    end
   end
 
   defp canonical_put(acc, key, value) when key in ["track", "record"] do

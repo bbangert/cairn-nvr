@@ -23,9 +23,9 @@ The UI is six live routes: a live **Dashboard** (`/`), an **Events**
 browser (`/events`) with clip playback (`/events/:id`), a **Tracks** index
 (`/tracks`), the **Cameras** pages (`/cameras`, `/cameras/new`,
 `/cameras/:id/edit`, and `/cameras/:id/zones` once the zone editor
-ships), and a read-only **Config** page
-(`/config`). No auth in v1 (LAN-trusted). Think "Frigate, but event clips
-only" — utilitarian, glanceable at a distance (wall tablet), dark-mode-first
+ships), and a **Config** page (`/config`; node settings read-only, with
+Reload and Import again). No auth in v1 (LAN-trusted). Think "Frigate,
+but event clips only" — utilitarian, glanceable at a distance (wall tablet), dark-mode-first
 is a natural fit.
 
 ## Tech baseline

@@ -92,6 +92,7 @@ defmodule CairnWeb.CamerasLive do
         saving?: false,
         save_result: nil,
         probe: %{main: blank_probe(:idle), sub: blank_probe(:absent)},
+        probe_gen: 0,
         plugins: plugin_names(),
         trackers: Config.tracker_names(),
         known_labels: Cairn.Events.known_labels()
@@ -103,11 +104,19 @@ defmodule CairnWeb.CamerasLive do
   # The half of the form's state that a fresh read of the row replaces: the
   # params, what they were when they arrived (the `dirty` baseline), and the
   # errors and candidate that were judged against the previous ones.
+  #
+  # The password input is `phx-update="ignore"` and so keeps whatever was
+  # typed into it through every patch; only a new id makes LiveView replace
+  # the node. Bumping the generation here is what empties it — on a fresh
+  # form, on a successful save (`saved/2` re-initializes), and on a pristine
+  # refresh from another session's write — so a consumed password cannot ride
+  # along on the next, unrelated save.
   defp reinit_form(socket, camera) do
     params = CameraForm.to_params(camera)
 
     assign(socket,
       saved: camera,
+      password_gen: (socket.assigns[:password_gen] || 0) + 1,
       initial_params: params,
       rows: CameraForm.rows(params),
       form: to_form(params, as: :camera),
@@ -185,6 +194,7 @@ defmodule CairnWeb.CamerasLive do
 
     {:noreply,
      socket
+     |> assign(probe_gen: socket.assigns.probe_gen + 1)
      |> probe_stream(:main, urls.main)
      |> probe_stream(:sub, urls.sub)}
   end
@@ -248,17 +258,21 @@ defmodule CairnWeb.CamerasLive do
     {:noreply, assign(socket, saving?: false, save_result: done(exit_result(reason)))}
   end
 
-  def handle_async({:probe, which}, {:ok, {:ok, probe}}, socket) do
-    {:noreply, put_probe(socket, which, probe_result(socket, probe))}
+  # A probe answers about the URL it was opened on, and it takes seconds: by
+  # the time it lands the operator may have typed a different host, user or
+  # password, and the chips would then describe a stream that is not the one
+  # on screen. A result from an older generation is dropped rather than
+  # rendered. Exercised by hand — a probe slow enough to be overtaken is not
+  # something a test can stage deterministically.
+  def handle_async({:probe, which, gen}, result, socket) do
+    if gen == socket.assigns.probe_gen,
+      do: {:noreply, put_probe(socket, which, probe_outcome(socket, result))},
+      else: {:noreply, socket}
   end
 
-  def handle_async({:probe, which}, {:ok, {:error, reason}}, socket) do
-    {:noreply, put_probe(socket, which, probe_error(reason))}
-  end
-
-  def handle_async({:probe, which}, {:exit, reason}, socket) do
-    {:noreply, put_probe(socket, which, probe_error(reason))}
-  end
+  defp probe_outcome(socket, {:ok, {:ok, probe}}), do: probe_result(socket, probe)
+  defp probe_outcome(_socket, {:ok, {:error, reason}}), do: probe_error(reason)
+  defp probe_outcome(_socket, {:exit, reason}), do: probe_error(reason)
 
   defp finish(socket, id),
     do: assign(socket, applying: MapSet.delete(socket.assigns.applying, id))
@@ -302,20 +316,48 @@ defmodule CairnWeb.CamerasLive do
   # and saving the params from before would silently put the old values back.
   # Dirty, the typed input is kept — it is the operator's work — and the notice
   # says what a save will do to the other session's change.
+  #
+  # Removed in another session, there is nothing to edit and nothing a save
+  # could land on (`update/2` answers `:not_found`), so the page leaves —
+  # dirty or not, since keeping the typed values on a page whose row is gone
+  # only promises a save that cannot happen.
   defp refresh_saved(socket) do
     with "edit" <- socket.assigns[:mode],
          # This session's own save broadcasts too, and it arrives before its
          # `handle_async` has re-read the row: the form is still dirty with
          # exactly the change that caused the message.
-         false <- socket.assigns.saving?,
-         camera when not is_nil(camera) <- Cameras.get(socket.assigns.camera_id) do
-      if Enum.empty?(socket.assigns.dirty),
-        do: reinit_form(socket, camera),
-        else: assign(socket, stale_notice: true)
+         false <- socket.assigns.saving? do
+      refresh_row(socket, Cameras.get(socket.assigns.camera_id))
     else
-      _absent -> socket
+      _not_editing -> socket
     end
   end
+
+  defp refresh_row(socket, nil) do
+    socket
+    |> put_flash(:error, "#{socket.assigns.camera_id} was removed in another session")
+    |> push_navigate(to: ~p"/cameras")
+  end
+
+  defp refresh_row(socket, camera) do
+    if Enum.empty?(socket.assigns.dirty),
+      do: reinit_form(socket, camera),
+      else: assign(socket, stale_notice: true)
+  end
+
+  # Only the fields that compose a probed URL: the rest of the form changes on
+  # every keystroke and would invalidate a probe that is still describing the
+  # right stream.
+  @probe_fields ~w(rtsp_url substream_url username password)
+
+  defp probe_gen(socket, params) do
+    previous = socket.assigns.form.params
+    changed? = Enum.any?(@probe_fields, &(param(params, &1) != param(previous, &1)))
+
+    socket.assigns.probe_gen + if changed?, do: 1, else: 0
+  end
+
+  defp param(params, key), do: to_string(Map.get(params, key) || "")
 
   defp result({:ok, diff, warnings}),
     do: %{ok: true, diff: diff, warnings: warnings, errors: []}
@@ -334,6 +376,7 @@ defmodule CairnWeb.CamerasLive do
 
     socket =
       assign(socket,
+        probe_gen: probe_gen(socket, params),
         form: to_form(params, as: :camera),
         rows: rows,
         camera_id: camera_id(socket, params),
@@ -529,7 +572,9 @@ defmodule CairnWeb.CamerasLive do
     |> put_probe(which, blank_probe(:running))
     # The composed URL carries the credential, so it is probed and never
     # rendered — `#camera-url-readout` shows the masked form instead.
-    |> start_async({:probe, which}, fn -> Cairn.Probe.run(url, timeout) end)
+    |> start_async({:probe, which, socket.assigns.probe_gen}, fn ->
+      Cairn.Probe.run(url, timeout)
+    end)
   end
 
   defp put_probe(socket, which, result),
@@ -650,8 +695,11 @@ defmodule CairnWeb.CamerasLive do
           <h1 style="margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.01em; color: var(--hs-fg-1); font-family: var(--hs-font-mono);">
             {@page_title}
           </h1>
+          <%!-- A disabled camera has no runtime to report and its status was
+                pruned when it stopped, so the badge would read "Unknown" and
+                invite the operator to fix something that is off on purpose. --%>
           <span
-            :if={@mode == "edit"}
+            :if={@mode == "edit" and @saved.enabled}
             id={"camera-status-#{@camera_id}"}
             class="hs-badge"
             style={"color: #{CameraCards.status_meta(CameraCards.status(@statuses, @camera_id)).color};"}
@@ -783,6 +831,7 @@ defmodule CairnWeb.CamerasLive do
           saving={@saving?}
           restart_dirty={restart_dirty?(@dirty)}
           camera_id={@camera_id}
+          password_gen={@password_gen}
         />
 
         <div :if={@mode == "edit"} style="display: flex; flex-direction: column; gap: 10px;">
@@ -798,10 +847,18 @@ defmodule CairnWeb.CamerasLive do
           <dialog
             id="camera-remove-confirm"
             class="hs-modal"
+            phx-hook="Dialog"
+            aria-labelledby="camera-remove-title"
             style="padding: 16px; border-radius: 10px; border: 1px solid var(--hs-border); background: var(--hs-bg-raised); color: var(--hs-fg-1);"
           >
             <form phx-submit="remove" style="display: flex; flex-direction: column; gap: 12px;">
               <input type="hidden" name={hidden_id_name()} value={@camera_id} />
+              <h2
+                id="camera-remove-title"
+                style="margin: 0; font-size: 15px; font-weight: 600; color: var(--hs-fg-1);"
+              >
+                Remove {@camera_id}?
+              </h2>
               <div style="font-size: 13px; color: var(--hs-fg-2); max-width: 380px;">
                 Recording stops now. Its events, clips and tracks stay under the id {@camera_id} until retention removes them. Home Assistant keeps the device until it next reads the camera list.
               </div>
@@ -1023,8 +1080,11 @@ defmodule CairnWeb.CamerasLive do
   # inspect. Inlining the string back breaks the build.
   defp hidden_id_name, do: "id"
 
-  # The stock show/hide JS helpers: the dialog is opened by making it visible
-  # rather than by `showModal()`, which no server-rendered event can call.
-  defp show_modal(id), do: CairnWeb.CoreComponents.show("##{id}")
-  defp hide_modal(id), do: CairnWeb.CoreComponents.hide("##{id}")
+  # A `<dialog>` is only a dialog through `showModal()` — focus trap, inert
+  # background, Esc to close — and no attribute the server renders can call
+  # it. The event is dispatched at the element instead and the `Dialog` hook
+  # (assets/js/hooks/dialog.js) makes the call; an inline script is out, the
+  # CSP forbids it.
+  defp show_modal(id), do: JS.dispatch("cairn:show-modal", to: "##{id}")
+  defp hide_modal(id), do: JS.dispatch("cairn:hide-modal", to: "##{id}")
 end

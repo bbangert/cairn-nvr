@@ -686,6 +686,20 @@ defmodule Cairn.ConfigSourceTest do
       assert CameraStatus.get("cam_z").status == :unknown
     end
 
+    # A disabled row is in no config, so no diff names it when it goes: the
+    # prune set has to come off the rows the write itself deleted.
+    test "a disabled row the file no longer lists loses its runtime state", %{path: path} do
+      insert_camera!("cam_off", 2, %{"rtsp_url" => "rtsp://rows/off"}, enabled: false)
+      CameraStatus.set("cam_off", :running)
+
+      assert {:ok, _diff, _warnings} = ConfigSource.reimport(path)
+
+      assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_b"]
+
+      _status = :sys.get_state(CameraStatus)
+      assert CameraStatus.get("cam_off").status == :unknown
+    end
+
     test "a file that fails to load replaces nothing", %{dir: dir, path: path} do
       File.write!(path, globals(dir) <> "cameras: [{id: broken}]\n")
 

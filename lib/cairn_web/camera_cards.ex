@@ -34,7 +34,10 @@ defmodule CairnWeb.CameraCards do
   @doc "Masks `rtsp://user:secret@host/…` and `…?password=x&user=y` forms."
   @spec mask_url(String.t()) :: String.t()
   def mask_url(url) do
-    masked = String.replace(url, ~r/(\/\/[^:\/@]+:)[^@\/]+@/, "\\1•••••@")
+    # The username may be empty (`rtsp://:secret@host`, which cameras that
+    # authenticate on the password alone do accept), so `*` — requiring a
+    # character there rendered the password in the clear.
+    masked = String.replace(url, ~r/(\/\/[^:\/@]*:)[^@\/]+@/, "\\1•••••@")
 
     case String.split(masked, "?", parts: 2) do
       [base, query] -> base <> "?" <> mask_query(query)

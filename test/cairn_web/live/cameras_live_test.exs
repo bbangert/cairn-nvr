@@ -221,7 +221,9 @@ defmodule CairnWeb.CamerasLiveTest do
   describe "password field" do
     test "is write-only and survives re-renders", %{conn: conn} do
       {:ok, _view, html} = live(conn, "/cameras/new?tab=manual")
-      [input] = Regex.scan(~r/<input[^>]*id="camera-password"[^>]*>/, html) |> List.flatten()
+
+      [input] =
+        Regex.scan(~r/<input[^>]*id="camera-password-\d+"[^>]*>/, html) |> List.flatten()
 
       assert input =~ ~s(type="password")
       assert input =~ ~s(autocomplete="new-password")
@@ -229,6 +231,23 @@ defmodule CairnWeb.CamerasLiveTest do
       # input has no value attribute to restore it from (the credential rule).
       assert input =~ ~s(phx-update="ignore")
       refute input =~ "value="
+    end
+
+    # An ignored node is never patched, so the same id would keep the typed
+    # password in the DOM after the save that consumed it and re-submit it
+    # with the next, unrelated edit.
+    test "a successful save replaces the input with a fresh one", %{conn: conn} do
+      create!("cam1")
+
+      {:ok, view, html} = live(conn, "/cameras/cam1/edit")
+      [before_id] = Regex.run(~r/id="(camera-password-\d+)"/, html, capture: :all_but_first)
+
+      view |> form("#camera-form", camera: %{"rtsp_url" => "rtsp://h/2"}) |> render_submit()
+      html = render_async(view)
+
+      assert html =~ ~s(data-ok="true")
+      refute html =~ ~s(id="#{before_id}")
+      assert html =~ ~r/id="camera-password-\d+"/
     end
   end
 
@@ -440,6 +459,45 @@ defmodule CairnWeb.CamerasLiveTest do
       assert html =~ ~s(data-ok="true")
       assert html =~ "restarted cam1"
       assert Cameras.get("cam1").settings["rtsp_url"] == "rtsp://h/2"
+    end
+
+    # No row to edit and no save that could land on one: `update/2` would
+    # answer `:not_found`, so the page leaves rather than promising a write.
+    test "a camera removed in another session sends the edit page back to the list",
+         %{conn: conn} do
+      create!("cam1")
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      {:ok, _diff, _warnings} = Cameras.delete("cam1")
+
+      assert flash = assert_redirect(view, "/cameras")
+      assert flash["error"] == "cam1 was removed in another session"
+    end
+
+    test "a disabled camera's edit page carries no status badge", %{conn: conn} do
+      create!("cam1")
+      {:ok, _diff, _warnings} = Cameras.set_enabled("cam1", false)
+
+      {:ok, _view, html} = live(conn, "/cameras/cam1/edit")
+
+      refute html =~ "camera-status-"
+    end
+
+    # A <dialog> is only modal through showModal(), which the `Dialog` hook
+    # calls on the dispatched event.
+    test "the remove dialog is a labelled native dialog opened by a JS command",
+         %{conn: conn} do
+      create!("cam1")
+
+      {:ok, _view, html} = live(conn, "/cameras/cam1/edit")
+
+      assert html =~ ~s(aria-labelledby="camera-remove-title")
+      assert html =~ ~s(id="camera-remove-title")
+      assert html =~ ~s(phx-hook="Dialog")
+
+      [button] = Regex.scan(~r/<button[^>]*id="camera-remove"[^>]*>/, html) |> List.flatten()
+      assert button =~ "phx-click="
     end
 
     test "remove deletes the row and returns to the list", %{conn: conn} do

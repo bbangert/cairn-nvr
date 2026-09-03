@@ -110,6 +110,14 @@ defmodule Cairn.CamerasTest do
                %{"min_score" => %{"person" => 1.0, "car" => 0.5}}
     end
 
+    # `parse_min_score/3` merges what it is given over the default block, so
+    # an empty map reads exactly as the absent key — and a row that stored one
+    # would diff as an edit the first time the form saved it.
+    test "drops an empty min_score map" do
+      assert Cameras.canonical(%{"rtsp_url" => "rtsp://h/1", "min_score" => %{}}) ==
+               %{"rtsp_url" => "rtsp://h/1"}
+    end
+
     test "coerces track/record tier numbers and drops an empty tier" do
       assert Cameras.canonical(%{"track" => %{"person" => 1}, "record" => %{}}) ==
                %{"track" => %{"person" => %{"min_score" => 1.0}}}
