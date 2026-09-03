@@ -66,10 +66,11 @@ defmodule Cairn.Cameras.Candidate do
 
       {:error, errors} ->
         {per_camera, fleet_errors} = Config.partition_by_camera(errors)
+        {own_unnamed, fleet_errors} = claim_unnamed(fleet_errors, mode, rows, id)
 
         %{
           errors: errors,
-          own: Map.get(per_camera, id, []),
+          own: Map.get(per_camera, id, []) ++ own_unnamed,
           others: Map.delete(per_camera, id),
           fleet: fleet_errors,
           preexisting_fleet: preexisting_fleet(fleet_errors, rows, globals, opts),
@@ -77,6 +78,25 @@ defmodule Cairn.Cameras.Candidate do
         }
     end
   end
+
+  # On `:create`, `fleet/4` appends the candidate last, so a candidate whose
+  # id fails `Cairn.Config.Camera`'s check cannot even name itself and comes
+  # back index-prefixed (`camera ##{length(rows)}: id is required …`) —
+  # `Config.partition_by_camera/1` has no id to key it on and files it
+  # fleet-level. Rewriting that index onto the candidate's own id (blank or
+  # malformed alike, both render as `""`) reclaims it as `own`;
+  # `Cairn.Cameras.Settings.field_errors/3` recognizes the same literal
+  # prefix for the id it cannot validate either, and routes it to the `id`
+  # field. An edit's candidate always occupies a real position (its own row
+  # or an append), so it never produces an index-prefixed message.
+  defp claim_unnamed(fleet_errors, :create, rows, id) do
+    index_prefix = "camera ##{length(rows)}: "
+    {mine, rest} = Enum.split_with(fleet_errors, &String.starts_with?(&1, index_prefix))
+    literal_prefix = "camera #{id}: "
+    {Enum.map(mine, &String.replace_prefix(&1, index_prefix, literal_prefix)), rest}
+  end
+
+  defp claim_unnamed(fleet_errors, :edit, _rows, _id), do: {[], fleet_errors}
 
   @doc "One row rendered as the validator reads it — `Cairn.Cameras.render_row/1`."
   @spec render_row(%{id: String.t(), settings: map(), zones: [map()]}) :: row()

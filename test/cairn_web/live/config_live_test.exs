@@ -13,20 +13,35 @@ defmodule CairnWeb.ConfigLiveTest do
     assert html =~ "config-camera-cam_b"
   end
 
-  test "mask_url hides rtsp credentials" do
-    assert CairnWeb.ConfigLive.mask_url("rtsp://admin:s3cret@10.0.0.5:554/s1") ==
-             "rtsp://admin:•••••@10.0.0.5:554/s1"
+  # Masking itself is `Cairn.StreamUrl`'s contract (see stream_url_test.exs);
+  # this only proves the page actually renders through it — including the
+  # colonless-userinfo shape (`rtsp://secret@host`), the exposure a smaller,
+  # since-deleted credential list here once missed.
+  test "a credentialed camera URL renders masked on /config", %{conn: conn} do
+    original = File.read!(@fixture)
+    on_exit(fn -> File.write!(@fixture, original) end)
 
-    assert CairnWeb.ConfigLive.mask_url("rtsp://10.0.0.5:554/s1") == "rtsp://10.0.0.5:554/s1"
-  end
+    {:ok, view, _html} = live(conn, "/config")
 
-  test "mask_url hides credential query params (http-flv style)" do
-    assert CairnWeb.ConfigLive.mask_url(
-             "http://10.0.0.5/flv?port=1935&stream=ch0&user=admin&password=hunter2"
-           ) == "http://10.0.0.5/flv?port=1935&stream=ch0&user=•••••&password=•••••"
+    File.write!(
+      @fixture,
+      "data_dir: tmp/cairn_test_data\n" <>
+        "cameras:\n" <>
+        "  - id: cam_secret\n" <>
+        "    rtsp_url: rtsp://admin:s3cret@127.0.0.1:8554/a\n" <>
+        "  - id: cam_colonless\n" <>
+        "    rtsp_url: rtsp://s3cretonly@127.0.0.1:8554/b\n"
+    )
 
-    assert CairnWeb.ConfigLive.mask_url("http://10.0.0.5/flv?Token=abc&x=1") ==
-             "http://10.0.0.5/flv?Token=•••••&x=1"
+    html = render_click(view, "reload", %{})
+
+    assert html =~ "rtsp://admin:•••••@127.0.0.1:8554/a"
+    assert html =~ "rtsp://•••••@127.0.0.1:8554/b"
+    refute html =~ "s3cret@"
+    refute html =~ "s3cretonly"
+
+    File.write!(@fixture, original)
+    render_click(view, "reload", %{})
   end
 
   test "reload with valid config shows result", %{conn: conn} do

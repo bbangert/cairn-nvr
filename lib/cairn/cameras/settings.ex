@@ -263,13 +263,21 @@ defmodule Cairn.Cameras.Settings do
   def field_errors(errors, camera_id, labels) do
     {per_camera, fleet} = Config.partition_by_camera(errors)
 
+    # `Cairn.Cameras.Candidate`, on create, rewrites a nameless candidate's
+    # index-prefixed message onto its own id before handing it here — an id
+    # that fails validation can't satisfy `Cairn.Config.Camera`'s class
+    # either, so `Config.partition_by_camera/1` still files it fleet-level. A
+    # literal match of the same prefix is the only way left to claim it for
+    # this `camera_id`, blank or malformed alike.
+    literal_prefix = "camera #{camera_id}: "
+    {mine, fleet} = Enum.split_with(fleet, &String.starts_with?(&1, literal_prefix))
+
     # Another camera's error is fleet-level as far as this form is concerned:
     # it can refuse the save and there is no field here to hang it on.
     others = per_camera |> Map.delete(camera_id) |> Enum.flat_map(fn {_id, msgs} -> msgs end)
 
     {routed, unclaimed} =
-      per_camera
-      |> Map.get(camera_id, [])
+      (Map.get(per_camera, camera_id, []) ++ mine)
       |> Enum.map(&strip_prefix(&1, camera_id))
       |> Enum.reduce({%{}, []}, fn message, {routed, unclaimed} ->
         # A cell key names a row that must exist to ask for it: a label the
@@ -907,9 +915,46 @@ defmodule Cairn.Cameras.Settings do
   # leftover the known labels cannot account for is `:error` — a partial
   # match would route half a message to a real row and silently drop the
   # rest, which is worse than leaving the whole message unclaimed.
+  #
+  # The longest-first greedy reading is also `:error` when it is not the
+  # *only* reading: invalid labels `a` and `b, c` join into the same text as
+  # clean rows `a, b` and `c` (`", "` sits inside `b, c` either way), and
+  # picking the greedy segmentation would silently attach the message to
+  # whichever pair happened to sort first — a wrong route, which the same
+  # reasoning above already ranks worse than unclaimed.
   defp match_labels(joined, labels) do
     sorted = Enum.sort_by(labels, &(-String.length(&1)))
-    consume_labels(joined, sorted, [])
+
+    case segmentation_count(joined, sorted) do
+      1 -> consume_labels(joined, sorted, [])
+      _zero_or_ambiguous -> :error
+    end
+  end
+
+  # How many ways `rest` fully segments into known labels joined by `", "`,
+  # capped at 2: routing only ever needs "exactly one" told apart from
+  # "more than one", and the cap keeps a message with many similarly-shaped
+  # labels from costing more than a bounded amount of branching.
+  defp segmentation_count(@blank, _labels), do: 1
+
+  defp segmentation_count(rest, labels) do
+    labels
+    |> Enum.filter(&String.starts_with?(rest, &1))
+    |> Enum.reduce(0, fn label, total ->
+      if total >= 2 do
+        total
+      else
+        min(total + segmentation_branch(rest, label, labels), 2)
+      end
+    end)
+  end
+
+  defp segmentation_branch(rest, label, labels) do
+    case String.replace_prefix(rest, label, @blank) do
+      @blank -> segmentation_count(@blank, labels)
+      ", " <> more -> segmentation_count(more, labels)
+      _other -> 0
+    end
   end
 
   defp consume_labels(@blank, _labels, acc), do: {:ok, Enum.reverse(acc)}

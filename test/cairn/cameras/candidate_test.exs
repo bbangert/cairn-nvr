@@ -77,6 +77,36 @@ defmodule Cairn.Cameras.CandidateTest do
       assert result.preexisting_fleet == []
     end
 
+    # `Config.Camera.parse/3` can only index-prefix a row with no valid id
+    # of its own (`camera #N: id is required …`), and `partition_by_camera/1`
+    # has no id to key that on — it lands fleet-level unless this module
+    # reclaims it for the candidate that actually caused it.
+    test "a create with a missing id files the id error under own, not fleet" do
+      rows = [row("cam1")]
+      candidate = Map.put(row("cam1"), "id", "")
+
+      result = Candidate.validate(candidate, rows, globals(), mode: :create)
+
+      assert result.own == ["camera : id is required ([a-z0-9_-], lowercase)"]
+      assert result.fleet == []
+
+      {routed, unclaimed} = Cairn.Cameras.Settings.field_errors(result.own, "", [])
+      assert routed["id"] == ["id is required ([a-z0-9_-], lowercase)"]
+      assert unclaimed == []
+    end
+
+    # An edit's candidate always occupies a real slot (its own row, or an
+    # append for the disabled case) — it cannot come back index-prefixed, so
+    # there is nothing here for `:edit` to reclaim.
+    test "an edit with a missing id is unaffected by the create-only reclaim" do
+      candidate = Map.put(row("cam1"), "id", "")
+
+      result = Candidate.validate(candidate, [row("cam1")], globals(), mode: :edit)
+
+      assert result.own == []
+      assert result.fleet == ["camera #1: id is required ([a-z0-9_-], lowercase)"]
+    end
+
     test "a mode is required" do
       assert_raise ArgumentError, ~r/mode: :create \| :edit/, fn ->
         Candidate.validate(row("cam1"), [row("cam1")], globals(), [])

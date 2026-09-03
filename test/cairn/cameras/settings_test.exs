@@ -1100,6 +1100,23 @@ defmodule Cairn.Cameras.SettingsTest do
       assert routed == %{}
       assert unclaimed == [raw]
     end
+
+    # "a, b, c" segments two ways with these four labels known: as invalid
+    # "a" and "b, c" (what the loader actually meant), or as clean "a, b" and
+    # "c" (what a longest-first greedy read would pick instead, wrongly).
+    # The module already prefers unclaimed over a wrong route (the comment
+    # on `match_labels/2`), so an ambiguous joined list stays unclaimed
+    # rather than silently landing on the clean pair.
+    test "a joined label list with more than one known segmentation stays unclaimed" do
+      raw = "min_score values must be 0..1 (a, b, c)"
+      message = "camera cam1: #{raw}"
+
+      {routed, unclaimed} =
+        Settings.field_errors([message], "cam1", ["a", "b, c", "a, b", "c"])
+
+      assert routed == %{}
+      assert unclaimed == [raw]
+    end
   end
 
   describe "excluded?/3" do

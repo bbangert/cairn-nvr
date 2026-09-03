@@ -4,14 +4,14 @@ defmodule CairnWeb.ConfigLive do
   handoff. Contract preserved: `phx-click="reload"` →
   `Cairn.Config.Server.reload/0`; diff/warnings or errors rendered with an
   old-config-retained notice. RTSP/FLV credentials are masked before
-  render; probe results come from `Cairn.CameraStatus`.
+  render via `Cairn.StreamUrl.mask/1`; probe results come from
+  `Cairn.CameraStatus`.
   """
 
   use CairnWeb, :live_view
 
   alias Cairn.Config
-
-  @credential_params ~w(password pass pwd token secret user username)
+  alias Cairn.StreamUrl
 
   @impl true
   def mount(_params, _session, socket) do
@@ -36,33 +36,6 @@ defmodule CairnWeb.ConfigLive do
       last_load: Config.Server.last_load(),
       statuses: Cairn.CameraStatus.all()
     )
-  end
-
-  @doc false
-  # rtsp://user:secret@host/... and ...?password=x&user=y forms
-  def mask_url(url) do
-    masked = String.replace(url, ~r/(\/\/[^:\/@]+:)[^@\/]+@/, "\\1•••••@")
-
-    case String.split(masked, "?", parts: 2) do
-      [base, query] -> base <> "?" <> mask_query(query)
-      [base] -> base
-    end
-  end
-
-  defp mask_query(query) do
-    query
-    |> String.split("&")
-    |> Enum.map_join("&", &mask_query_pair/1)
-  end
-
-  defp mask_query_pair(pair) do
-    case String.split(pair, "=", parts: 2) do
-      [key, _value] ->
-        if String.downcase(key) in @credential_params, do: "#{key}=•••••", else: pair
-
-      _ ->
-        pair
-    end
   end
 
   # -- view helpers -----------------------------------------------------------
@@ -300,7 +273,7 @@ defmodule CairnWeb.ConfigLive do
               </span>
             </div>
             <div style="font-family: var(--hs-font-mono); font-size: 12px; color: var(--hs-fg-2); background: var(--hs-bg-sunken); border-radius: 6px; padding: 8px 10px; word-break: break-all;">
-              {mask_url(cam.rtsp_url)}
+              {StreamUrl.mask(cam.rtsp_url)}
             </div>
             <div style="display: flex; gap: 6px; flex-wrap: wrap;">
               <span
