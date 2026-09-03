@@ -47,6 +47,15 @@ defmodule Cairn.Config.Server do
   that reacted to the broadcast by calling `get/1` would otherwise queue
   behind it on this same process.
 
+  A write whose commit obliges cleanup that must win a race against the
+  *apply itself* — a deleted camera's control tombstone — cannot wait for
+  `after_apply:`, which runs after `apply_diff` (camera stop/start, seconds):
+  a caller that checked the config and found the camera present, then called
+  `CameraControl.set/2`, can still land its write in that window even though
+  the delete already committed. `after_commit:` closes it — the order for a
+  write carrying both is commit → `after_commit:` → publish/apply →
+  `after_apply:` → broadcast.
+
   A named server publishes each config it installs as a `:persistent_term`
   snapshot *before* applying it, for `snapshot_camera/2`: a camera tree
   restarted by its own supervisor is rebuilt from the child spec its tree
@@ -166,11 +175,20 @@ defmodule Cairn.Config.Server do
   a source free to skip a faulty row rolls the write back instead when one of
   these is the row it skipped, and the caller gets that camera's errors.
 
-  `after_apply: fun` is the write's post-commit half: this process calls it
-  with the applied diff once the config is installed and applied, before it
-  is announced, and never on a write the validator or the closure rejected.
-  It runs here so that a caller which dies, or whose call times out, still
-  gets it — see the moduledoc.
+  `after_commit: fun` is the write's other post-commit half, and runs first:
+  this process calls the 0-arity `fun` right after the transaction commits,
+  before the new config is published or applied. A cleanup step that has to
+  win a race against `apply_diff` — installing a tombstone before a control
+  request that read the old (pre-delete) config can act on it — cannot wait
+  for `after_apply`, which runs *after* `apply_diff`; see the moduledoc.
+
+  `after_apply: fun` is the write's other post-commit half: this process
+  calls it with the applied diff once the config is installed and applied,
+  before it is announced, and never on a write the validator or the closure
+  rejected. It runs here so that a caller which dies, or whose call times
+  out, still gets it — see the moduledoc.
+
+  Neither callback runs on a write the validator or the closure rejected.
 
   `{:error, errors}` is the validator's; `{:error, {:write, reason}}` is
   `write_fun`'s own (a changeset, a DB fault, a wrong-shaped return, or an
@@ -181,8 +199,16 @@ defmodule Cairn.Config.Server do
   def update(server \\ __MODULE__, write_fun, opts \\ [])
       when is_function(write_fun, 0) and is_list(opts) do
     reject = Keyword.get(opts, :reject_skipped, [])
+    after_commit = after_commit_fun(Keyword.get(opts, :after_commit))
     after_apply = after_apply_fun(Keyword.get(opts, :after_apply))
-    GenServer.call(server, {:update, write_fun, reject, after_apply}, 30_000)
+    GenServer.call(server, {:update, write_fun, reject, after_commit, after_apply}, 30_000)
+  end
+
+  defp after_commit_fun(nil), do: nil
+  defp after_commit_fun(fun) when is_function(fun, 0), do: fun
+
+  defp after_commit_fun(other) do
+    raise ArgumentError, "after_commit: must be a 0-arity fun, got: #{inspect(other)}"
   end
 
   defp after_apply_fun(nil), do: nil
@@ -270,22 +296,25 @@ defmodule Cairn.Config.Server do
     end
   end
 
-  def handle_call({:update, write_fun, reject, after_apply}, _from, state) do
+  def handle_call({:update, write_fun, reject, after_commit, after_apply}, _from, state) do
     if file_source?(state.source) do
       # A row written under the file source would never be read back — the
       # render comes from the file — so a caller (or a test) that forgot to
       # point the server at a store is told, not silently obeyed.
       {:reply, {:error, ["update needs a DB-backed config source"]}, state}
     else
-      do_update(state, write_fun, reject, after_apply)
+      do_update(state, write_fun, reject, after_commit, after_apply)
     end
   end
 
   defp file_source?(source), do: source == Function.capture(Config, :load_file, 1)
 
-  defp do_update(state, write_fun, reject, after_apply) do
+  defp do_update(state, write_fun, reject, after_commit, after_apply) do
     case transact(state, write_fun, reject) do
       {:ok, {new_config, warnings, skipped}} ->
+        # Before the diff/publish/apply: see the moduledoc on `after_commit:`
+        # — this has to beat `apply_diff` to close the check-then-write window.
+        run_after_commit(after_commit)
         {diff, state} = apply_config(state, new_config, warnings, skipped, after_apply)
         {:reply, {:ok, diff, warnings}, state}
 
@@ -297,6 +326,27 @@ defmodule Cairn.Config.Server do
       {:error, {:write, reason}} ->
         {:reply, {:error, {:write, reason}}, state}
     end
+  end
+
+  # Runs right after the transaction commits and before this new config is
+  # published or applied — see the moduledoc on `after_commit:`. Same
+  # rescue/catch shape as `run_after_apply/2` and for the same reason: the
+  # caller's cleanup is the caller's code running in this process, and a bug
+  # in it is not a reason for the config server, and every camera it holds,
+  # to die on a save that already committed.
+  defp run_after_commit(nil), do: :ok
+
+  defp run_after_commit(fun) do
+    fun.()
+    :ok
+  rescue
+    e -> Logger.error("config: after_commit raised: #{inspect(e.__struct__)}")
+  catch
+    kind, reason when is_atom(reason) ->
+      Logger.error("config: after_commit #{kind}: #{inspect(reason)}")
+
+    kind, _reason ->
+      Logger.error("config: after_commit #{kind}: non-atom exit")
   end
 
   # The caller's cleanup is the caller's code running in this process, and it

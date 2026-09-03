@@ -176,10 +176,18 @@ defmodule Cairn.Cameras do
   applies there whatever becomes of this caller, and a prune run after the
   call returns can also land on a camera another session has since
   re-created under the same id.
+
+  The control tombstone rides `after_commit:` instead, ahead of the prune:
+  `after_apply:` runs after `apply_diff` (camera stop/start, seconds), and a
+  `CameraControl.set/2` that read the config before this delete committed
+  could still land its write in that window if the tombstone waited that
+  long. `prune_steps/1`'s own tombstone step is now a backstop for the case
+  `after_commit:` itself failed, not the primary path.
   """
   @spec delete(String.t()) :: write_result()
   def delete(id) do
     Config.Server.update(server(), fn -> delete_row(id) end,
+      after_commit: fn -> CameraControl.tombstone(id) end,
       after_apply: fn _diff -> prune_runtime(id) end
     )
   end
@@ -215,6 +223,11 @@ defmodule Cairn.Cameras do
   # One entry per owner that must forget a deleted camera. A plain list (not
   # inlined into `prune_runtime/1`) so `run_prunes/2` can be driven in a test
   # with a step that deliberately exits.
+  #
+  # The tombstone step here is idempotent and redundant with `delete/1`'s
+  # `after_commit:` on the normal path — kept as the backstop for the one
+  # case that isn't normal, a raised or exited `after_commit:` callback,
+  # since `run_after_commit/1` swallows that rather than failing the save.
   @doc false
   @spec prune_steps(String.t()) :: [{String.t(), (-> term())}]
   def prune_steps(id) do

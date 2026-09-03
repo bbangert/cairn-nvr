@@ -23,7 +23,11 @@ defmodule Cairn.FlakyReimport do
   def init(real), do: {:ok, real}
 
   @impl true
-  def handle_call({:update, _write_fun, _reject, _after_apply}, _from, _real),
+  # Matched by tag, not arity: the update message grows an element each time
+  # `Config.Server.update/3` gains a callback, and a double that stopped
+  # matching would forward the write and the test would pass for the wrong
+  # reason.
+  def handle_call(msg, _from, _real) when elem(msg, 0) == :update,
     do: exit(:simulated_write_failure)
 
   def handle_call(msg, _from, real), do: {:reply, GenServer.call(real, msg), real}

@@ -102,37 +102,55 @@ defmodule Cairn.ConfigSource do
   :no_drift}}`) — the button's own precondition, re-checked under the write
   lock. Rows the file no longer lists lose their runtime state the way a
   delete does — as the write's `after_apply:`, so the prune belongs to the
-  commit rather than to this caller surviving the call.
+  commit rather than to this caller surviving the call. Their control
+  tombstones go in first, on `after_commit:`, for the same reason
+  `Cameras.delete/1`'s does: `after_apply:` runs after `apply_diff`, and a
+  control write that read the config before this replace committed could
+  otherwise land inside that window.
   """
   @spec reimport(Path.t()) :: Cameras.write_result()
   def reimport(path \\ Config.default_path()) do
     ref = make_ref()
 
     Config.Server.update(Cameras.server(), fn -> replace_rows(path, ref) end,
+      after_commit: fn -> tombstone_deleted(ref) end,
       after_apply: fn _diff -> prune_deleted(ref) end
     )
   end
 
-  # The write closure and the `after_apply:` callback both run in the config
-  # server process, so the deleted ids ride its dictionary — no message hop,
-  # and nothing left in a mailbox when the write rolls back. A rolled-back
-  # write does leave its entry, so a new one sweeps the old: only the
-  # callback for the ref just written ever reads one.
+  # The write closure, `after_commit:` and `after_apply:` all run in the
+  # config server process, so the deleted ids ride its dictionary — no
+  # message hop, and nothing left in a mailbox when the write rolls back. A
+  # rolled-back write does leave its entry, so a new one sweeps the old: only
+  # the callbacks for the ref just written ever read one.
   defp stash_deleted(ref, ids) do
     for {{:reimport_deleted, _stale} = key, _ids} <- Process.get(), do: Process.delete(key)
     Process.put({:reimport_deleted, ref}, ids)
   end
+
+  # Reads rather than deletes the stash: `after_apply:`'s `prune_deleted/1`
+  # runs after this on the same ref and still needs the list.
+  defp tombstone_deleted(ref) do
+    ref
+    |> stashed_deleted()
+    |> Enum.each(&CameraControl.tombstone/1)
+  end
+
+  defp stashed_deleted(ref), do: Process.get({:reimport_deleted, ref}, [])
 
   # The pruned set is the rows the write itself deleted, minus what is there
   # now: a row another session added between the call and the transaction is
   # in neither the deleted list nor the applied diff — a disabled row is in
   # no config at all, and D-P8 keys prunes on the row rather than the diff.
   # A re-import bypasses `Cameras.create/1`, so an id it re-inserts after an
-  # earlier delete would stay tombstoned in `CameraControl` and refuse every
+  # earlier delete would stay tombstoned in `CameraControl` (by `after_commit:`'s
+  # `tombstone_deleted/1` above, same as an ordinary delete) and refuse every
   # control write; the survivors are revived here for the same reason
-  # `create/1` revives its own id.
+  # `create/1` revives its own id. The stash is deleted here, not read: this
+  # is the last callback on `ref`.
   defp prune_deleted(ref) do
-    deleted = Process.delete({:reimport_deleted, ref}) || []
+    deleted = stashed_deleted(ref)
+    Process.delete({:reimport_deleted, ref})
     remaining = Enum.map(Cameras.list(), & &1.id)
     Enum.each(deleted -- remaining, &Cameras.prune_runtime/1)
     Enum.each(remaining, &CameraControl.revive/1)

@@ -728,6 +728,46 @@ defmodule Cairn.ConfigSourceTest do
       Cairn.CameraControl.prune(Map.keys(Cairn.CameraControl.all()) -- ["cam_b"])
     end
 
+    # The window `after_commit:` closes for `reimport/1` the same way it does
+    # for `Cameras.delete/1`: `cam_z` is a row the file no longer lists, so
+    # `replace_rows/2` deletes it, but the old `after_apply:`-only tombstone
+    # would not land until `apply_diff` returns — camera stop/start, seconds
+    # in production. This blocks the stubbed `apply_diff` on a handshake to
+    # hold that window open and proves the tombstone is already in place.
+    test "a control write for a row reimport deletes is refused while apply_diff is still blocked",
+         %{path: path} do
+      on_exit(fn -> Cairn.CameraControl.revive("cam_z") end)
+      test_pid = self()
+
+      slow =
+        start_supervised!(
+          {Config.Server,
+           path: path,
+           name: nil,
+           source: {ConfigSource, :load},
+           apply_diff: fn _diff, _config ->
+             send(test_pid, :applying)
+             receive do: (:release -> :ok)
+           end,
+           apply_native: fn _config -> :ok end},
+          id: :config_source_slow_server
+        )
+
+      Application.put_env(:cairn, :config_server, slow)
+
+      task = Task.async(fn -> ConfigSource.reimport(path) end)
+      assert_receive :applying
+
+      # Still blocked in `apply_diff` — the replace committed, but nothing
+      # has told `cam_z`'s tree to stop yet, and this must already be refused.
+      assert Cairn.CameraControl.set("cam_z", %{detection_enabled: false}) == {:error, :removed}
+
+      send(slow, :release)
+
+      assert {:ok, %{added: ["cam_b"], removed: ["cam_z"], changed: ["cam_a"]}, _warnings} =
+               Task.await(task)
+    end
+
     test "a second re-import of the same file is refused", %{path: path} do
       assert {:ok, _diff, _warnings} = ConfigSource.reimport(path)
 

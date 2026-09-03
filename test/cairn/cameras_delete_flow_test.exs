@@ -8,6 +8,7 @@ defmodule Cairn.CamerasDeleteFlowTest do
 
   @moduletag :capture_log
 
+  alias Cairn.CameraControl
   alias Cairn.Cameras
   alias Cairn.Cameras.Setting
   alias Cairn.Config
@@ -79,6 +80,62 @@ defmodule Cairn.CamerasDeleteFlowTest do
     # `stop_camera/1`. The stub here stands in for that call without
     # starting a camera tree.
     assert_receive {:applied, %{removed: ["cam1"]}, _config}
+  end
+
+  # The finding this closes: a tombstone installed only in `after_apply:`
+  # (which runs after `apply_diff` — camera stop/start, seconds in
+  # production) leaves a window between the delete committing and the
+  # tombstone landing. A control request that read the config, found the
+  # camera present, and then called `CameraControl.set/2` could win that
+  # race and have its write pruned once the delete's `after_apply:` caught
+  # up. This blocks `apply_diff` on a handshake to hold the window open and
+  # proves `after_commit:` (which runs ahead of `apply_diff`) has already
+  # closed it.
+  test "a control write for the deleted camera is refused while apply_diff is still blocked", %{
+    dir: dir
+  } do
+    # The control table is a shared singleton the DB sandbox does not roll
+    # back, and this test leaves "cam1" tombstoned (it never re-creates the
+    # id, unlike `CamerasTest`'s round-trip test).
+    on_exit(fn -> CameraControl.revive("cam1") end)
+
+    path = Path.join(dir, "config.yml")
+    test_pid = self()
+
+    slow =
+      start_supervised!(
+        {Config.Server,
+         path: path,
+         name: nil,
+         source: {ConfigSource, :load},
+         apply_diff: fn _diff, _config ->
+           send(test_pid, :applying)
+           receive do: (:release -> :ok)
+         end,
+         apply_native: fn _config -> :ok end},
+        id: :cameras_delete_flow_slow_server
+      )
+
+    Application.put_env(:cairn, :config_server, slow)
+
+    create_task =
+      Task.async(fn ->
+        Cameras.create(%{"id" => "cam1", "settings" => %{"rtsp_url" => "rtsp://h/1"}})
+      end)
+
+    assert_receive :applying
+    send(slow, :release)
+    assert {:ok, %{added: ["cam1"]}, []} = Task.await(create_task)
+
+    delete_task = Task.async(fn -> Cameras.delete("cam1") end)
+    assert_receive :applying
+
+    # Still blocked in `apply_diff` — the write committed, but the camera's
+    # tree has not been told to stop yet, and this must already be refused.
+    assert CameraControl.set("cam1", %{detection_enabled: false}) == {:error, :removed}
+
+    send(slow, :release)
+    assert {:ok, %{removed: ["cam1"]}, []} = Task.await(delete_task)
   end
 
   # presence_cleared for a present key on the aggregator's retire path is

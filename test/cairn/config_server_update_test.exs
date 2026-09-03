@@ -359,6 +359,51 @@ defmodule Cairn.Config.ServerUpdateTest do
     assert Repo.get(Camera, "cam_a") == nil
   end
 
+  # The reason `after_commit:` exists at all: a tombstone installed only in
+  # `after_apply:` would still be racing the seconds-long `apply_diff` this
+  # stubbed one stands in for, so this proves it runs on the near side of it.
+  test "after_commit runs before apply_diff", %{server: server} do
+    test_pid = self()
+
+    assert {:ok, _diff, _warnings} =
+             Config.Server.update(server, insert_fun("cam_a", "full"),
+               after_commit: fn -> send(test_pid, :committed) end
+             )
+
+    mailbox = flush_mailbox()
+    committed_at = Enum.find_index(mailbox, &(&1 == :committed))
+    applied_at = Enum.find_index(mailbox, &match?({:applied, %{added: ["cam_a"]}, _config}, &1))
+
+    assert committed_at, "expected :committed in #{inspect(mailbox)}"
+    assert applied_at, "expected {:applied, _, _} in #{inspect(mailbox)}"
+    assert committed_at < applied_at
+  end
+
+  test "after_commit does not run on a rejected write", %{server: server} do
+    test_pid = self()
+    callback = fn -> send(test_pid, :after_commit) end
+
+    assert {:ok, _diff, _warnings} = Config.Server.update(server, insert_fun("cam_a", "full"))
+
+    assert {:error, errors} =
+             Config.Server.update(server, insert_fun("cam_x", "partial"), after_commit: callback)
+
+    assert Enum.any?(errors, &(&1 =~ "different models (full, partial)"))
+
+    assert Config.Server.update(server, fn -> {:error, :boom} end, after_commit: callback) ==
+             {:error, {:write, :boom}}
+
+    refute_received :after_commit
+  end
+
+  test "a callback that is not a 0-arity fun is refused before the write", %{server: server} do
+    assert_raise ArgumentError, ~r/after_commit/, fn ->
+      Config.Server.update(server, insert_fun("cam_a", "full"), after_commit: :nope)
+    end
+
+    assert Repo.get(Camera, "cam_a") == nil
+  end
+
   defp flush_mailbox do
     receive do
       msg -> [msg | flush_mailbox()]
