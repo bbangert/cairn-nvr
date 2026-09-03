@@ -124,7 +124,7 @@ defmodule Cairn.Cameras.CandidateTest do
 
       result = Candidate.validate(row("cam1"), [row("cam1")], globals, mode: :edit)
 
-      assert result.fleet == ["retention.days must be >= 1"]
+      assert result.fleet == ["retention.days must be >= 1 and <= 10000"]
       assert result.preexisting_fleet == result.fleet
     end
 

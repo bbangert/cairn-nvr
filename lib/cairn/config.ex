@@ -1734,8 +1734,14 @@ defmodule Cairn.Config do
     acc
     |> check(int?(config.stall_seconds, 1, 3600), "stall_seconds must be 1..3600")
     |> check(int?(config.free_space_min_mb, 0, 10_000_000), "free_space_min_mb must be >= 0")
-    |> check(int?(config.retention_days, days.first, days.last), "retention.days must be >= 1")
-    |> check(int?(config.retention_tracks_days, 1, 10_000), "retention.tracks_days must be >= 1")
+    |> check(
+      int?(config.retention_days, days.first, days.last),
+      "retention.days must be >= #{days.first} and <= #{days.last}"
+    )
+    |> check(
+      int?(config.retention_tracks_days, days.first, days.last),
+      "retention.tracks_days must be >= #{days.first} and <= #{days.last}"
+    )
     |> check(is_binary(config.data_dir), "data_dir must be a string")
     |> validate_retention_per_label(config.retention_per_label, days)
   end
