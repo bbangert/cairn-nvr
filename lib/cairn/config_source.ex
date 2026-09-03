@@ -97,41 +97,40 @@ defmodule Cairn.ConfigSource do
   a file that fails to load replaces nothing (`{:error, {:write, {:yaml,
   errors}}}`), and one with no cameras to import is refused rather than
   silently emptying the fleet (`{:error, {:write, :no_cameras}}`). Rows the
-  file no longer lists lose their runtime state the way a delete does.
+  file no longer lists lose their runtime state the way a delete does — as
+  the write's `after_apply:`, so the prune belongs to the commit rather than
+  to this caller surviving the call.
   """
   @spec reimport(Path.t()) :: Cameras.write_result()
   def reimport(path \\ Config.default_path()) do
-    caller = self()
     ref = make_ref()
 
-    case Config.Server.update(Cameras.server(), fn -> replace_rows(path, caller, ref) end) do
-      {:ok, _diff, _warnings} = applied ->
-        remaining = Enum.map(Cameras.list(), & &1.id)
-        # The pruned set is the rows the write itself deleted, read inside the
-        # write and sent back out: a row another session added between the
-        # call and the transaction is in neither a list read out here nor the
-        # applied diff — a disabled row is in no config at all, and D-P8 keys
-        # prunes on the row rather than the diff.
-        Enum.each(deleted_ids(ref) -- remaining, &Cameras.prune_runtime/1)
-        applied
-
-      rejected ->
-        # The write may have deleted and then failed to commit; its message
-        # would otherwise sit in the mailbox for whatever receives next.
-        _flushed = deleted_ids(ref)
-        rejected
-    end
+    Config.Server.update(Cameras.server(), fn -> replace_rows(path, ref) end,
+      after_apply: fn _diff -> prune_deleted(ref) end
+    )
   end
 
-  defp deleted_ids(ref) do
-    receive do
-      {^ref, ids} -> ids
-    after
-      0 -> []
-    end
+  # The write closure and the `after_apply:` callback both run in the config
+  # server process, so the deleted ids ride its dictionary — no message hop,
+  # and nothing left in a mailbox when the write rolls back. A rolled-back
+  # write does leave its entry, so a new one sweeps the old: only the
+  # callback for the ref just written ever reads one.
+  defp stash_deleted(ref, ids) do
+    for {{:reimport_deleted, _stale} = key, _ids} <- Process.get(), do: Process.delete(key)
+    Process.put({:reimport_deleted, ref}, ids)
   end
 
-  defp replace_rows(path, caller, ref) do
+  # The pruned set is the rows the write itself deleted, minus what is there
+  # now: a row another session added between the call and the transaction is
+  # in neither the deleted list nor the applied diff — a disabled row is in
+  # no config at all, and D-P8 keys prunes on the row rather than the diff.
+  defp prune_deleted(ref) do
+    deleted = Process.delete({:reimport_deleted, ref}) || []
+    remaining = Enum.map(Cameras.list(), & &1.id)
+    Enum.each(deleted -- remaining, &Cameras.prune_runtime/1)
+  end
+
+  defp replace_rows(path, ref) do
     with {:ok, map} <- Config.raw_map(path),
          {:ok, cameras} <- importable_list(Map.get(map, "cameras")),
          {:ok, _config, _warnings} <- Config.from_map(map) do
@@ -141,7 +140,7 @@ defmodule Cairn.ConfigSource do
       # The write closure answers only `:ok`; the dropped-key warnings from
       # the import are logged here so they are not lost with it.
       cameras |> import_rows(path) |> Enum.each(&Logger.warning("config: #{&1}"))
-      send(caller, {ref, deleted})
+      stash_deleted(ref, deleted)
       :ok
     else
       {:error, errors} when is_list(errors) -> {:error, {:yaml, errors}}

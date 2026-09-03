@@ -246,6 +246,75 @@ defmodule Cairn.Config.ServerUpdateTest do
     assert [%{id: "cam_full"}] = Config.Server.get(server).cameras
   end
 
+  # The post-commit half of a write belongs to the commit: the server applies
+  # and announces whatever becomes of the caller, so a prune left on the
+  # caller's side of a 30 s call is a prune that can simply not happen.
+  test "after_apply runs on the server with the applied diff", %{server: server} do
+    test_pid = self()
+
+    assert {:ok, diff, _warnings} =
+             Config.Server.update(server, insert_fun("cam_a", "full"),
+               after_apply: fn applied -> send(test_pid, {:after_apply, applied, self()}) end
+             )
+
+    assert_received {:after_apply, ^diff, callback_pid}
+    assert callback_pid == server
+  end
+
+  # The write is committed by the time the callback runs — which is what lets
+  # a prune read the rows that are left rather than be told them.
+  test "after_apply sees the committed rows", %{server: server} do
+    test_pid = self()
+
+    assert {:ok, _diff, _warnings} =
+             Config.Server.update(server, insert_fun("cam_a", "full"),
+               after_apply: fn _diff ->
+                 send(test_pid, {:seen, Enum.map(Cameras.list(), & &1.id)})
+               end
+             )
+
+    assert_received {:seen, ["cam_a"]}
+  end
+
+  test "after_apply does not run on a rejected write", %{server: server} do
+    test_pid = self()
+    callback = fn _diff -> send(test_pid, :after_apply) end
+
+    assert {:ok, _diff, _warnings} = Config.Server.update(server, insert_fun("cam_a", "full"))
+
+    assert {:error, errors} =
+             Config.Server.update(server, insert_fun("cam_x", "partial"), after_apply: callback)
+
+    assert Enum.any?(errors, &(&1 =~ "different models (full, partial)"))
+
+    assert Config.Server.update(server, fn -> {:error, :boom} end, after_apply: callback) ==
+             {:error, {:write, :boom}}
+
+    refute_received :after_apply
+  end
+
+  test "a callback that raises is logged and leaves the save applied", %{server: server} do
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, %{added: ["cam_a"]}, _warnings} =
+                 Config.Server.update(server, insert_fun("cam_a", "full"),
+                   after_apply: fn _diff -> raise "boom" end
+                 )
+      end)
+
+    assert log =~ "after_apply raised: boom"
+    assert Process.alive?(server)
+    assert [%{id: "cam_a"}] = Config.Server.get(server).cameras
+  end
+
+  test "a callback that is not a 1-arity fun is refused before the write", %{server: server} do
+    assert_raise ArgumentError, ~r/after_apply/, fn ->
+      Config.Server.update(server, insert_fun("cam_a", "full"), after_apply: :nope)
+    end
+
+    assert Repo.get(Camera, "cam_a") == nil
+  end
+
   defp private_server(path, id) do
     test_pid = self()
 

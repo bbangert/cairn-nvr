@@ -91,6 +91,7 @@ defmodule CairnWeb.CamerasLive do
         dirty: MapSet.new(),
         saving?: false,
         save_result: nil,
+        restart_predicted?: false,
         probe: %{main: blank_probe(:idle), sub: blank_probe(:absent)},
         probe_gen: 0,
         plugins: plugin_names(),
@@ -102,8 +103,11 @@ defmodule CairnWeb.CamerasLive do
   end
 
   # The half of the form's state that a fresh read of the row replaces: the
-  # params, what they were when they arrived (the `dirty` baseline), and the
-  # errors and candidate that were judged against the previous ones.
+  # params, what they were when they arrived (the `dirty` baseline), the
+  # errors and candidate that were judged against the previous ones, and the
+  # probe — its chips describe URLs composed from params that are gone, so
+  # both rows go back to unprobed and the generation drops an answer still in
+  # flight.
   #
   # The password input is `phx-update="ignore"` and so keeps whatever was
   # typed into it through every patch; only a new id makes LiveView replace
@@ -124,8 +128,17 @@ defmodule CairnWeb.CamerasLive do
       field_errors: %{},
       form_errors: [],
       dirty: MapSet.new(),
+      restart_predicted?: false,
+      probe_gen: (socket.assigns[:probe_gen] || 0) + 1,
+      probe: blank_probes(CameraForm.urls(params, camera)),
       stale_notice: false
     )
+  end
+
+  # The sub row is rendered only when there is a sub stream to probe, which
+  # `:absent` is how the markup is told.
+  defp blank_probes(urls) do
+    %{main: blank_probe(:idle), sub: blank_probe(if(urls.sub, do: :idle, else: :absent))}
   end
 
   defp blank_probe(state), do: %{state: state, chips: [], warning: false, error: nil}
@@ -339,22 +352,42 @@ defmodule CairnWeb.CamerasLive do
     |> push_navigate(to: ~p"/cameras")
   end
 
+  # Most `{:config_changed, _}` messages are about some other camera on the
+  # node, and this row is then byte-identical to the one already on screen:
+  # re-initializing on one would empty the typed password and clear the
+  # probe, and calling it stale would accuse another camera's save of
+  # touching this one.
   defp refresh_row(socket, camera) do
-    if Enum.empty?(socket.assigns.dirty),
-      do: reinit_form(socket, camera),
-      else: assign(socket, stale_notice: true)
+    cond do
+      row_state(socket.assigns.saved) == row_state(camera) -> socket
+      Enum.empty?(socket.assigns.dirty) -> reinit_form(socket, camera)
+      true -> assign(socket, stale_notice: true)
+    end
   end
+
+  # `position` is deliberately out: a reorder elsewhere changes nothing this
+  # form renders or saves.
+  defp row_state(nil), do: nil
+  defp row_state(camera), do: Map.take(camera, [:settings, :zones, :enabled])
 
   # Only the fields that compose a probed URL: the rest of the form changes on
   # every keystroke and would invalidate a probe that is still describing the
   # right stream.
   @probe_fields ~w(rtsp_url substream_url username password)
 
-  defp probe_gen(socket, params) do
-    previous = socket.assigns.form.params
-    changed? = Enum.any?(@probe_fields, &(param(params, &1) != param(previous, &1)))
+  defp probe_fields_changed?(previous, params),
+    do: Enum.any?(@probe_fields, &(param(params, &1) != param(previous, &1)))
 
-    socket.assigns.probe_gen + if changed?, do: 1, else: 0
+  # The generation drops an answer still in flight; the rows are reset as
+  # well, because a result already rendered would otherwise go on describing
+  # a stream the form no longer names.
+  defp reset_probe(socket, false, _params), do: socket
+
+  defp reset_probe(socket, true, params) do
+    assign(socket,
+      probe_gen: socket.assigns.probe_gen + 1,
+      probe: blank_probes(CameraForm.urls(params, socket.assigns.saved))
+    )
   end
 
   defp param(params, key), do: to_string(Map.get(params, key) || "")
@@ -373,15 +406,19 @@ defmodule CairnWeb.CamerasLive do
   defp validate(socket, params) do
     rows = CameraForm.rows(params)
     params = Map.put(params, "labels", CameraForm.index_rows(rows))
+    # Against the params still on the socket, so this is read before they are
+    # replaced below.
+    probe_changed? = probe_fields_changed?(socket.assigns.form.params, params)
 
     socket =
-      assign(socket,
-        probe_gen: probe_gen(socket, params),
+      socket
+      |> assign(
         form: to_form(params, as: :camera),
         rows: rows,
         camera_id: camera_id(socket, params),
         dirty: dirty(socket.assigns.initial_params, params)
       )
+      |> reset_probe(probe_changed?, params)
 
     cond do
       blank_id?(socket) -> refuse(socket, ["id is required"])
@@ -445,11 +482,32 @@ defmodule CairnWeb.CamerasLive do
   defp candidate(socket, settings) do
     with {:ok, raw} <- socket.assigns.globals,
          candidate = Map.put(raw, "cameras", fleet(socket, settings)),
-         {:ok, _config, warnings} <- Config.from_map(candidate) do
-      assign(socket, field_errors: %{}, form_errors: [], warnings: warnings)
+         {:ok, config, warnings} <- Config.from_map(candidate) do
+      assign(socket,
+        field_errors: %{},
+        form_errors: [],
+        warnings: warnings,
+        restart_predicted?: restart_predicted?(config, socket.assigns.camera_id)
+      )
     else
       {:error, errors} -> show_errors(socket, errors)
     end
+  end
+
+  # The near-Save line, from the resolved values rather than from the set of
+  # fields that were touched: typing back the value a camera already inherits
+  # from the globals moves a field without moving anything its tree was built
+  # from. Both false-answers are the quiet ones — a camera the running config
+  # has not got is being added, not restarted, and a server mid-apply cannot
+  # be asked (the `get/1` exit `overlay/0` catches).
+  defp restart_predicted?(candidate_config, camera_id) do
+    Config.Server.would_restart?(
+      Config.Server.get(Cameras.server()),
+      candidate_config,
+      camera_id
+    )
+  catch
+    :exit, _ -> false
   end
 
   # The fleet a load would render, with this camera's unsaved settings in
@@ -480,22 +538,25 @@ defmodule CairnWeb.CamerasLive do
   # `candidate_for/2` had already assigned one.
   defp show_errors(socket, errors) do
     {field_errors, unclaimed} = CameraForm.field_errors(errors, route_id(socket))
-    # Warnings come back only for a candidate with zero errors, so they are
-    # dropped rather than left stale next to an error that supersedes them.
+    # Warnings and the restart prediction come back only for a candidate with
+    # zero errors, so they are dropped rather than left stale next to an error
+    # that supersedes them — there is no config to predict against and no save
+    # to predict for.
     assign(socket,
       candidate: nil,
       field_errors: field_errors,
       form_errors: unclaimed,
-      warnings: []
+      warnings: [],
+      restart_predicted?: false
     )
   end
 
-  # The label rows carry one restart field between them — `min_score`, whose
-  # cells are the `label`/`min_score` pair of each row. The track, record and
-  # days cells are refreshed in place, so an edit confined to them must not
-  # raise the restart line. A row added or removed changes the set of labels
-  # `min_score` resolves for, so it counts. The chip is a prediction either
-  # way — the badge on the result card is the diff's word.
+  # "Has the operator typed anything?", and nothing else: `refresh_saved/1`
+  # re-initializes a pristine form from another session's write and keeps a
+  # dirty one. So every cell counts, Track and Record and Days included — an
+  # edit this set cannot see is work the refresh would silently discard. The
+  # restart line is no longer read off it (`restart_predicted?/2` compares
+  # resolved values instead).
   defp dirty(initial, params) do
     scalar =
       params
@@ -503,17 +564,20 @@ defmodule CairnWeb.CamerasLive do
       |> Enum.filter(fn {key, value} -> to_string(value) != to_string(initial[key] || "") end)
       |> Enum.map(fn {key, _value} -> key end)
 
-    rows = if scores(params) == scores(initial), do: [], else: ["min_score"]
-
-    MapSet.new(scalar ++ rows)
+    MapSet.new(scalar ++ changed_cells(initial, params))
   end
 
-  defp scores(params) do
-    params |> CameraForm.rows() |> Enum.map(&Map.take(&1, ["label", "min_score"]))
+  @row_cells ~w(min_score track record retention_days)
+
+  # Each cell paired with its row's label, so a renamed, added or removed row
+  # reads as a change to every cell it carries rather than to none.
+  defp changed_cells(initial, params) do
+    for cell <- @row_cells, cells(initial, cell) != cells(params, cell), do: cell
   end
 
-  defp restart_dirty?(dirty),
-    do: Enum.any?(CameraForm.restart_fields(), &MapSet.member?(dirty, &1))
+  defp cells(params, cell) do
+    params |> CameraForm.rows() |> Enum.map(&{&1["label"], &1[cell]})
+  end
 
   defp save(socket, settings) do
     id = socket.assigns.camera_id
@@ -829,7 +893,7 @@ defmodule CairnWeb.CamerasLive do
           known_labels={@known_labels}
           probe={@probe}
           saving={@saving?}
-          restart_dirty={restart_dirty?(@dirty)}
+          restart_predicted={@restart_predicted?}
           camera_id={@camera_id}
           password_gen={@password_gen}
         />
@@ -844,10 +908,17 @@ defmodule CairnWeb.CamerasLive do
           >
             Remove camera
           </button>
+          <%!-- `phx-update="ignore"`: `open` is state only the client has
+                (`showModal()` sets it), and a patch that re-rendered this
+                subtree would drop it and close the dialog under the
+                operator. Nothing inside changes while the page is open — the
+                title, the hidden id and the two buttons are all fixed by the
+                camera being edited. --%>
           <dialog
             id="camera-remove-confirm"
             class="hs-modal"
             phx-hook="Dialog"
+            phx-update="ignore"
             aria-labelledby="camera-remove-title"
             style="padding: 16px; border-radius: 10px; border: 1px solid var(--hs-border); background: var(--hs-bg-raised); color: var(--hs-fg-1);"
           >
@@ -863,12 +934,12 @@ defmodule CairnWeb.CamerasLive do
                 Recording stops now. Its events, clips and tracks stay under the id {@camera_id} until retention removes them. Home Assistant keeps the device until it next reads the camera list.
               </div>
               <div style="display: flex; gap: 8px;">
-                <button
-                  type="submit"
-                  class="hs-btn hs-btn--danger"
-                  phx-disable-with="Removing…"
-                  disabled={@saving?}
-                >
+                <%!-- No `disabled={@saving?}`: an ignored subtree never takes
+                      a patched attribute, so it would freeze at whatever the
+                      first render said. `phx-disable-with` disables this
+                      button on the click itself, and `handle_event("remove",
+                      …)` drops a second submit regardless. --%>
+                <button type="submit" class="hs-btn hs-btn--danger" phx-disable-with="Removing…">
                   Remove {@camera_id}
                 </button>
                 <button

@@ -36,6 +36,14 @@ defmodule Cairn.Config.Server do
   `last_load/1` callers, on their 5 s budget, can see a slow answer while a
   save is in flight.
 
+  A write whose commit obliges cleanup elsewhere (pruning a deleted camera's
+  runtime state) hands it over as `after_apply:` rather than running it on
+  return: the commit and the apply happen here whatever becomes of the
+  caller, so a caller that dies or gives up on its 30 s call would otherwise
+  leave the cleanup undone — and a prune racing a re-create of the same id
+  from another session can delete a checkpoint that belongs to the new
+  camera.
+
   A named server publishes each config it installs as a `:persistent_term`
   snapshot *before* applying it, for `snapshot_camera/2`: a camera tree
   restarted by its own supervisor is rebuilt from the child spec its tree
@@ -155,6 +163,12 @@ defmodule Cairn.Config.Server do
   a source free to skip a faulty row rolls the write back instead when one of
   these is the row it skipped, and the caller gets that camera's errors.
 
+  `after_apply: fun` is the write's post-commit half: this process calls it
+  with the applied diff once the config is installed and announced, and never
+  on a write the validator or the closure rejected. It runs here so that a
+  caller which dies, or whose call times out, still gets it — see the
+  moduledoc.
+
   `{:error, errors}` is the validator's; `{:error, {:write, reason}}` is
   `write_fun`'s own (a changeset, a DB fault, a wrong-shaped return, or an
   exception the closure raised).
@@ -164,7 +178,15 @@ defmodule Cairn.Config.Server do
   def update(server \\ __MODULE__, write_fun, opts \\ [])
       when is_function(write_fun, 0) and is_list(opts) do
     reject = Keyword.get(opts, :reject_skipped, [])
-    GenServer.call(server, {:update, write_fun, reject}, 30_000)
+    after_apply = after_apply_fun(Keyword.get(opts, :after_apply))
+    GenServer.call(server, {:update, write_fun, reject, after_apply}, 30_000)
+  end
+
+  defp after_apply_fun(nil), do: nil
+  defp after_apply_fun(fun) when is_function(fun, 1), do: fun
+
+  defp after_apply_fun(other) do
+    raise ArgumentError, "after_apply: must be a 1-arity fun, got: #{inspect(other)}"
   end
 
   @doc """
@@ -245,23 +267,24 @@ defmodule Cairn.Config.Server do
     end
   end
 
-  def handle_call({:update, write_fun, reject}, _from, state) do
+  def handle_call({:update, write_fun, reject, after_apply}, _from, state) do
     if file_source?(state.source) do
       # A row written under the file source would never be read back — the
       # render comes from the file — so a caller (or a test) that forgot to
       # point the server at a store is told, not silently obeyed.
       {:reply, {:error, ["update needs a DB-backed config source"]}, state}
     else
-      do_update(state, write_fun, reject)
+      do_update(state, write_fun, reject, after_apply)
     end
   end
 
   defp file_source?(source), do: source == Function.capture(Config, :load_file, 1)
 
-  defp do_update(state, write_fun, reject) do
+  defp do_update(state, write_fun, reject, after_apply) do
     case transact(state, write_fun, reject) do
       {:ok, {new_config, warnings, skipped}} ->
         {diff, state} = apply_config(state, new_config, warnings, skipped)
+        run_after_apply(after_apply, diff)
         {:reply, {:ok, diff, warnings}, state}
 
       {:error, {:invalid, errors}} ->
@@ -272,6 +295,22 @@ defmodule Cairn.Config.Server do
       {:error, {:write, reason}} ->
         {:reply, {:error, {:write, reason}}, state}
     end
+  end
+
+  # The caller's cleanup is the caller's code running in this process, and it
+  # runs after the config is already installed: a bug in it is not a reason
+  # for the config server, and every camera it holds, to die on a save that
+  # succeeded. `catch` as well as `rescue` — a callback that exits would take
+  # the server down just as effectively as one that raises.
+  defp run_after_apply(nil, _diff), do: :ok
+
+  defp run_after_apply(fun, diff) do
+    fun.(diff)
+    :ok
+  rescue
+    e -> Logger.error("config: after_apply raised: #{Exception.message(e)}")
+  catch
+    kind, reason -> Logger.error("config: after_apply #{kind}: #{inspect(reason)}")
   end
 
   # `mode: :immediate` takes the write lock at BEGIN rather than at the first
@@ -391,6 +430,22 @@ defmodule Cairn.Config.Server do
       end)
 
     diff(old_ids, new_ids, changed, refreshed)
+  end
+
+  # Whether installing `new` over `old` would restart `camera_id`'s tree — the
+  # camera diff's own test, public so a form can ask it of a candidate config
+  # it has built but not written. False when either config is missing the
+  # camera: an add or a remove is not a restart, and neither is a prediction
+  # made against a config that could not be read.
+  @doc false
+  @spec would_restart?(Config.t(), Config.t(), String.t()) :: boolean()
+  def would_restart?(old, new, camera_id) do
+    with %Config.Camera{} = old_cam <- Enum.find(old.cameras, &(&1.id == camera_id)),
+         %Config.Camera{} = new_cam <- Enum.find(new.cameras, &(&1.id == camera_id)) do
+      camera_changed?(old, new, old_cam, new_cam)
+    else
+      _absent -> false
+    end
   end
 
   # The camera inputs that reach a subprocess or are baked into a child spec

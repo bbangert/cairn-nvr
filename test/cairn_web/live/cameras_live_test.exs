@@ -580,10 +580,13 @@ defmodule CairnWeb.CamerasLiveTest do
 
       refute html =~ "Saving may restart cam1"
 
+      # The default row, leaving person's Detect cell where its Track cell
+      # is: the line is only rendered for a form the validator would accept,
+      # and with no record: block `track.person` must equal `min_score.person`.
       html =
         view
         |> form("#camera-form",
-          camera: %{"labels" => %{"1" => %{"label" => "person", "min_score" => "0.65"}}}
+          camera: %{"labels" => %{"0" => %{"label" => "default", "min_score" => "0.55"}}}
         )
         |> render_change()
 
@@ -687,6 +690,178 @@ defmodule CairnWeb.CamerasLiveTest do
       assert html =~ ~s(id="probe-main")
       assert html =~ ~s(data-state="error")
       assert html =~ "Probe failed"
+    end
+
+    # A probe result describes the URL it was opened on; once that URL is not
+    # what the form holds any more, the chips would be describing a stream
+    # nobody asked about.
+    test "changing the URL puts the probe row back to unprobed", %{conn: conn} do
+      Application.put_env(:cairn, :probe_timeout_ms, 500)
+      on_exit(fn -> Application.delete_env(:cairn, :probe_timeout_ms) end)
+
+      create!("cam1", %{"rtsp_url" => "rtsp://127.0.0.1:1/x"})
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      render_click(view, "probe")
+      html = render_async(view, 5_000)
+      assert html =~ ~s(data-state="error")
+
+      html =
+        view
+        |> form("#camera-form", camera: %{"rtsp_url" => "rtsp://127.0.0.1:2/x"})
+        |> render_change()
+
+      assert [row] = Regex.run(~r/<div[^>]*id="probe-main"[^>]*>/, html)
+      assert row =~ ~s(data-state="idle")
+      refute html =~ "Probe failed"
+    end
+
+    # `open` is state only the client has, and a patch that re-rendered the
+    # dialog would drop it mid-decision.
+    test "the remove dialog is not patched", %{conn: conn} do
+      create!("cam1")
+
+      {:ok, _view, html} = live(conn, "/cameras/cam1/edit")
+
+      assert [dialog] = Regex.run(~r/<dialog[^>]*id="camera-remove-confirm"[^>]*>/, html)
+      assert dialog =~ ~s(phx-update="ignore")
+    end
+
+    # Every `{:config_changed, _}` on the node reaches this page, and most of
+    # them are another camera's save.
+    test "another camera's change leaves a dirty form alone", %{conn: conn} do
+      create!("cam1", %{"rtsp_url" => "rtsp://h/1"})
+      create!("cam2", %{"rtsp_url" => "rtsp://h/2"})
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      view |> form("#camera-form", camera: %{"rtsp_url" => "rtsp://h/TYPED"}) |> render_change()
+
+      Config.Server.subscribe()
+
+      {:ok, _diff, _warnings} =
+        Cameras.update("cam2", %{"settings" => %{"rtsp_url" => "rtsp://h/OTHER"}})
+
+      assert_receive {:config_changed, _diff}
+
+      html = render(view)
+
+      refute html =~ ~s(id="camera-stale")
+      assert html =~ "rtsp://h/TYPED"
+    end
+
+    # A pristine form is re-initialized from the fresh row, which empties the
+    # password input by giving it a new id — not something another camera's
+    # save may do to a password already typed here.
+    test "another camera's change leaves a pristine form's password input alone", %{conn: conn} do
+      create!("cam1", %{"rtsp_url" => "rtsp://h/1"})
+      create!("cam2", %{"rtsp_url" => "rtsp://h/2"})
+
+      {:ok, view, html} = live(conn, "/cameras/cam1/edit")
+      [before_id] = Regex.run(~r/id="(camera-password-\d+)"/, html, capture: :all_but_first)
+
+      Config.Server.subscribe()
+
+      {:ok, _diff, _warnings} =
+        Cameras.update("cam2", %{"settings" => %{"rtsp_url" => "rtsp://h/OTHER"}})
+
+      assert_receive {:config_changed, _diff}
+
+      assert render(view) =~ ~s(id="#{before_id}")
+    end
+
+    # The dirty set answers "is there typed work to lose?", so it has to see
+    # every cell — Track included, which restarts nothing.
+    test "a Track-only edit is dirty without predicting a restart", %{conn: conn} do
+      create!("cam1", %{
+        "rtsp_url" => "rtsp://h/1",
+        "min_score" => %{"default" => 0.5, "person" => 0.6}
+      })
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      html =
+        view
+        |> form("#camera-form",
+          camera: %{
+            "labels" => %{
+              "0" => %{"label" => "default", "min_score" => "0.5"},
+              "1" => %{"label" => "person", "min_score" => "0.6", "track" => "0.6"}
+            }
+          }
+        )
+        |> render_change()
+
+      refute html =~ "Saving may restart cam1"
+
+      Config.Server.subscribe()
+
+      {:ok, _diff, _warnings} =
+        Cameras.update("cam1", %{
+          "settings" => %{"rtsp_url" => "rtsp://h/1", "min_score" => %{"default" => 0.5}}
+        })
+
+      assert_receive {:config_changed, _diff}
+
+      html = render(view)
+
+      # Stale, not re-initialized: the typed Track cell is work the refresh
+      # would otherwise have discarded without saying so.
+      assert html =~ ~s(id="camera-stale")
+      assert html =~ ~s(value="0.6")
+    end
+
+    # The line is a prediction about the camera's tree, and what reaches that
+    # tree is the resolved value: typing back what the globals already say
+    # changes a field and restarts nothing.
+    test "the restart line follows the resolved value, not the typed field", %{conn: conn} do
+      create!("cam1", %{"rtsp_url" => "rtsp://h/1", "min_score" => %{"default" => 0.5}})
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      # 5 is what the camera already inherits, so writing it onto the camera
+      # moves a field and moves nothing the camera's tree was built from.
+      html =
+        view
+        |> form("#camera-form", camera: %{"pre_window_seconds" => "5"})
+        |> render_change()
+
+      refute html =~ "Saving may restart cam1"
+
+      html =
+        view
+        |> form("#camera-form",
+          camera: %{"labels" => %{"0" => %{"label" => "default", "min_score" => "0.9"}}}
+        )
+        |> render_change()
+
+      assert html =~ "Saving may restart cam1"
+    end
+
+    # A row can hold a settings value no form wrote — a hand edit or a
+    # migration. The loader skips it; the page that could fix it must open.
+    test "a row whose rtsp_url is not a string still opens for editing", %{
+      conn: conn,
+      server: server
+    } do
+      create!("cam1")
+
+      "cam1"
+      |> Cameras.get()
+      |> Camera.update_changeset(%{settings: %{"rtsp_url" => 123}})
+      |> Repo.update!()
+
+      {:ok, _diff, _warnings} = Config.Server.reload(server)
+
+      {:ok, view, html} = live(conn, "/cameras/cam1/edit")
+
+      assert html =~ ~s(id="camera-form")
+      assert html =~ ~s(id="camera-url-readout")
+
+      # The loader's own string, once the candidate fleet is judged: the row
+      # still carries the number, which no URL field can render.
+      assert view |> form("#camera-form") |> render_change() =~ "rtsp_url is required"
     end
 
     # The singleton keeps the YAML file source in the test env (D-P7), so a

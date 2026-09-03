@@ -687,7 +687,9 @@ defmodule Cairn.ConfigSourceTest do
     end
 
     # A disabled row is in no config, so no diff names it when it goes: the
-    # prune set has to come off the rows the write itself deleted.
+    # prune set has to come off the rows the write itself deleted. It is run
+    # by the config server as the write's `after_apply:`, in the same process
+    # the write closure that recorded those ids ran in.
     test "a disabled row the file no longer lists loses its runtime state", %{path: path} do
       insert_camera!("cam_off", 2, %{"rtsp_url" => "rtsp://rows/off"}, enabled: false)
       CameraStatus.set("cam_off", :running)

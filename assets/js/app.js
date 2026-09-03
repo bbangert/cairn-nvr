@@ -37,12 +37,13 @@ import TrackOverlay from "./hooks/track_overlay"
 import WebrtcPlayer from "./hooks/webrtc_player"
 import CopyText from "./hooks/copy_text"
 import Dialog from "./hooks/dialog"
+import KeepOpen from "./hooks/keep_open"
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: {_csrf_token: csrfToken},
-  hooks: {...colocatedHooks, MsePlayer, TimelineSeek, TrackOverlay, WebrtcPlayer, CopyText, Dialog},
+  hooks: {...colocatedHooks, MsePlayer, TimelineSeek, TrackOverlay, WebrtcPlayer, CopyText, Dialog, KeepOpen},
 })
 
 // Show progress bar on live navigation and form submits

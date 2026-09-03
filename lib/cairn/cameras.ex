@@ -162,18 +162,17 @@ defmodule Cairn.Cameras do
 
   @doc """
   Deletes a camera and clears its live runtime state — status, control
-  overlay and both event checkpoints.
+  overlay and both event checkpoints. The prune is the config server's
+  `after_apply:`, not this process's next step: the delete commits and
+  applies there whatever becomes of this caller, and a prune run after the
+  call returns can also land on a camera another session has since
+  re-created under the same id.
   """
   @spec delete(String.t()) :: write_result()
   def delete(id) do
-    case Config.Server.update(server(), fn -> delete_row(id) end) do
-      {:ok, _diff, _warnings} = applied ->
-        prune_runtime(id)
-        applied
-
-      rejected ->
-        rejected
-    end
+    Config.Server.update(server(), fn -> delete_row(id) end,
+      after_apply: fn _diff -> prune_runtime(id) end
+    )
   end
 
   defp delete_row(id) do
@@ -187,7 +186,8 @@ defmodule Cairn.Cameras do
   # disabled camera is absent from the config too, and it must keep its
   # control override and last status. Event rows and clip files stay under
   # the old id until retention sweeps them. Public for the one other path
-  # that deletes rows, `Cairn.ConfigSource.reimport/1`.
+  # that deletes rows, `Cairn.ConfigSource.reimport/1`; both call it from
+  # inside the config server, as that write's `after_apply:`.
   @doc false
   @spec prune_runtime(String.t()) :: :ok
   def prune_runtime(id) do

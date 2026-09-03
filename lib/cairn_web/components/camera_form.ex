@@ -628,13 +628,16 @@ defmodule CairnWeb.CameraForm do
   defp append(routed, key, message),
     do: Map.update(routed, key, [message], &(&1 ++ [message]))
 
+  # A label is a detection class name and may hold spaces (`license plate`),
+  # so the two `tier.label` forms capture up to the ` (value)` the loader
+  # always writes after the label rather than up to the first space.
   defp route(message) do
     cond do
       # The one message that indicts a pair of cells rather than either.
-      match = Regex.run(~r/\A(?:track)\.(\S+) .*effective record threshold/, message) ->
+      match = Regex.run(~r/\Atrack\.(.+?) \(.*effective record threshold/, message) ->
         [{Enum.at(match, 1), :row}]
 
-      match = Regex.run(~r/\A(track|record)\.([^ ]+) /, message) ->
+      match = Regex.run(~r/\A(track|record)\.(.+?) \(/, message) ->
         [{Enum.at(match, 2), Enum.at(match, 1)}]
 
       match = Regex.run(~r/\A(min_score|track|record) values must .*\(([^)]*)\)\z/, message) ->
@@ -695,7 +698,7 @@ defmodule CairnWeb.CameraForm do
   attr :known_labels, :list, required: true
   attr :probe, :map, required: true
   attr :saving, :boolean, required: true
-  attr :restart_dirty, :boolean, required: true
+  attr :restart_predicted, :boolean, required: true
   attr :camera_id, :string, required: true
   attr :password_gen, :integer, required: true
 
@@ -739,7 +742,7 @@ defmodule CairnWeb.CameraForm do
         >
           {if @mode == "new", do: "Add camera", else: "Save camera"}
         </button>
-        <span :if={@restart_dirty} style="font-size: 12px; color: var(--hs-warning);">
+        <span :if={@restart_predicted} style="font-size: 12px; color: var(--hs-warning);">
           Saving may restart {@camera_id} and clear its presence in Home Assistant
         </span>
       </div>
@@ -1059,7 +1062,10 @@ defmodule CairnWeb.CameraForm do
 
   defp advanced(assigns) do
     ~H"""
-    <details id="camera-advanced" class="hs-card" style={group_style()}>
+    <%!-- The section's `open` is client-only state; `KeepOpen`
+          (assets/js/hooks/keep_open.js) carries it across the patch every
+          keystroke in this form causes. --%>
+    <details id="camera-advanced" phx-hook="KeepOpen" class="hs-card" style={group_style()}>
       <summary style="font-size: 14px; font-weight: 600; color: var(--hs-fg-1); cursor: pointer;">
         Advanced
       </summary>

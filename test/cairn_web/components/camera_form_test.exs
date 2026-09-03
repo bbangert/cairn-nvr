@@ -463,6 +463,43 @@ defmodule CairnWeb.CameraFormTest do
       assert row_message =~ "effective record threshold"
     end
 
+    # A detection label is a class name and can hold spaces, so the label in a
+    # `tier.label (value)` message runs up to the value, not to the first
+    # space.
+    test "routes a tier string whose label has a space" do
+      {routed, unclaimed} =
+        CameraForm.field_errors(
+          [
+            "camera cam1: track.license plate (0.4) must be >= min_score.license plate (0.5)",
+            "camera cam1: min_score values must be 0..1 (license plate)"
+          ],
+          "cam1"
+        )
+
+      assert routed[{"license plate", "track"}] == [
+               "track.license plate (0.4) must be >= min_score.license plate (0.5)"
+             ]
+
+      assert routed[{"license plate", "min_score"}] == [
+               "min_score values must be 0..1 (license plate)"
+             ]
+
+      assert unclaimed == []
+    end
+
+    test "the record-covers-track message routes a label with a space to the row" do
+      message =
+        "camera cam1: track.license plate (0.6) must be <= the effective record threshold " <>
+          "(0.5) — with no record: block video falls back to min_score, so a clip could " <>
+          "exist with no track row. Give license plate a record: rule, or lower " <>
+          "track.license plate"
+
+      {routed, []} = CameraForm.field_errors([message], "cam1")
+
+      assert [row_message] = routed[{"license plate", :row}]
+      assert row_message =~ "effective record threshold"
+    end
+
     test "fleet-level and other cameras' errors stay unclaimed" do
       {routed, unclaimed} =
         CameraForm.field_errors(
@@ -540,6 +577,14 @@ defmodule CairnWeb.CameraFormTest do
 
       assert html =~ ~s(aria-label="detection label 1")
     end
+
+    # `open` on a <details> is client state the server never renders, and this
+    # form re-renders on every keystroke.
+    test "the advanced section keeps its open state across a patch" do
+      html = render_form(%{}, plugins: [])
+
+      assert html =~ ~r/<details[^>]*id="camera-advanced"[^>]*phx-hook="KeepOpen"/
+    end
   end
 
   defp render_form(params, opts) do
@@ -569,7 +614,7 @@ defmodule CairnWeb.CameraFormTest do
       probe: %{main: blank_probe, sub: %{blank_probe | state: :absent}},
       password_gen: 0,
       saving: false,
-      restart_dirty: false,
+      restart_predicted: false,
       camera_id: "gate"
     )
   end

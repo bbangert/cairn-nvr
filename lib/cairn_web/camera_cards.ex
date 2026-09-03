@@ -32,8 +32,8 @@ defmodule CairnWeb.CameraCards do
   }
 
   @doc "Masks `rtsp://user:secret@host/…` and `…?password=x&user=y` forms."
-  @spec mask_url(String.t()) :: String.t()
-  def mask_url(url) do
+  @spec mask_url(term()) :: String.t()
+  def mask_url(url) when is_binary(url) do
     # The username may be empty (`rtsp://:secret@host`, which cameras that
     # authenticate on the password alone do accept), so `*` — requiring a
     # character there rendered the password in the clear.
@@ -44,6 +44,12 @@ defmodule CairnWeb.CameraCards do
       [base] -> base
     end
   end
+
+  # A row's `rtsp_url` is whatever the column holds: a hand-edited or migrated
+  # row can carry a number, which the loader skips and the page still has to
+  # render. Nothing to mask reads as nothing to show — like `credentialed?/1`,
+  # which calls the same value clean.
+  def mask_url(_other), do: ""
 
   defp mask_query(query) do
     query
@@ -66,7 +72,7 @@ defmodule CairnWeb.CameraCards do
   parameters `mask_url/1` masks. The form's prefill rule reads it: a
   credentialed URL is left blank rather than rendered (the credential rule).
   """
-  @spec credentialed?(String.t()) :: boolean()
+  @spec credentialed?(term()) :: boolean()
   def credentialed?(url) when is_binary(url) do
     uri = URI.parse(url)
 

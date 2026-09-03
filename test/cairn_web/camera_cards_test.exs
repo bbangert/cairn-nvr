@@ -57,6 +57,18 @@ defmodule CairnWeb.CameraCardsTest do
     end
   end
 
+  describe "mask_url/1 and credentialed?/1 on a non-string" do
+    # A row's `rtsp_url` is whatever its settings column holds: a hand-edited
+    # or migrated row can carry a number, which the loader skips — and the
+    # edit page still has to render, so it can be fixed.
+    test "read as nothing to show rather than raising" do
+      assert CameraCards.mask_url(123) == ""
+      assert CameraCards.mask_url(nil) == ""
+      refute CameraCards.credentialed?(123)
+      refute CameraCards.credentialed?(nil)
+    end
+  end
+
   describe "credentialed?/1" do
     test "userinfo and credential query params count, a plain URL does not" do
       assert CameraCards.credentialed?("rtsp://admin:s3cret@10.0.0.5:554/s1")

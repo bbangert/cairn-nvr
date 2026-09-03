@@ -94,6 +94,9 @@ defmodule Cairn.CamerasDeleteFlowTest do
   # synced with :sys.get_state, is `Cairn.CamerasTest`'s "delete prunes
   # status, control and checkpoints" — not repeated here.
 
+  # The prune is `Config.Server.update/3`'s `after_apply:`, run in the config
+  # server before the call returns — so this asserts the server-owned path,
+  # not a step `Cameras.delete/1` takes after it.
   test "PresenceCheckpoint and EventCheckpoint hold no row for the deleted id" do
     assert {:ok, _diff, []} =
              Cameras.create(%{"id" => "cam1", "settings" => %{"rtsp_url" => "rtsp://h/1"}})
