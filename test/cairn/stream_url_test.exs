@@ -418,6 +418,18 @@ defmodule Cairn.StreamUrlTest do
       refute StreamUrl.same_endpoint?("rtsp://evil/live", "rtsp://u:pa/ss@evil/live")
       refute StreamUrl.same_endpoint?("rtsp://u:pa/ss@h/live", "rtsp://u:pa/ss@h/live")
     end
+
+    # A display-ambiguous URL still parses an apparent authority
+    # (`http://attacker.lan`) here; if `endpoint/1` accepted that reading,
+    # this URL would compare equal to the camera's real endpoint and
+    # `Settings.seed_userinfo/2` would copy its saved password onto the
+    # attacker's host.
+    test "a display-ambiguous URL is the same endpoint as nothing" do
+      refute StreamUrl.same_endpoint?(
+               "http://attacker.lan?x@camera.lan/live&password=secret",
+               "http://attacker.lan/new"
+             )
+    end
   end
 
   describe "mask/1 with a credential pair after a query @" do

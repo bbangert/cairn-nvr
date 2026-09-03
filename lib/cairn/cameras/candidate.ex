@@ -69,7 +69,7 @@ defmodule Cairn.Cameras.Candidate do
         {own_unnamed, fleet_errors} = claim_unnamed(fleet_errors, mode, rows, id)
 
         %{
-          errors: errors,
+          errors: rewrite_unnamed(errors, mode, rows, id),
           own: Map.get(per_camera, id, []) ++ own_unnamed,
           others: Map.delete(per_camera, id),
           fleet: fleet_errors,
@@ -90,13 +90,26 @@ defmodule Cairn.Cameras.Candidate do
   # field. An edit's candidate always occupies a real position (its own row
   # or an append), so it never produces an index-prefixed message.
   defp claim_unnamed(fleet_errors, :create, rows, id) do
-    index_prefix = "camera ##{length(rows)}: "
-    {mine, rest} = Enum.split_with(fleet_errors, &String.starts_with?(&1, index_prefix))
-    literal_prefix = "camera #{id}: "
-    {Enum.map(mine, &String.replace_prefix(&1, index_prefix, literal_prefix)), rest}
+    {mine, rest} = Enum.split_with(fleet_errors, &String.starts_with?(&1, index_prefix(rows)))
+    {Enum.map(mine, &rewrite_index(&1, rows, id)), rest}
   end
 
   defp claim_unnamed(fleet_errors, :edit, _rows, _id), do: {[], fleet_errors}
+
+  # `result.errors` is `Cairn.Cameras.Settings.field_errors/3`'s other input —
+  # the ordered list `per_camera`/`fleet_errors` only partition — so the same
+  # index-prefix rewrite `claim_unnamed/4` applies to `fleet_errors` has to
+  # land here too, at the same message, or the id error stays unclaimed
+  # whenever a caller routes off `errors` instead of `own`.
+  defp rewrite_unnamed(errors, :create, rows, id),
+    do: Enum.map(errors, &rewrite_index(&1, rows, id))
+
+  defp rewrite_unnamed(errors, :edit, _rows, _id), do: errors
+
+  defp index_prefix(rows), do: "camera ##{length(rows)}: "
+
+  defp rewrite_index(message, rows, id),
+    do: String.replace_prefix(message, index_prefix(rows), "camera #{id}: ")
 
   @doc "One row rendered as the validator reads it — `Cairn.Cameras.render_row/1`."
   @spec render_row(%{id: String.t(), settings: map(), zones: [map()]}) :: row()

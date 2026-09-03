@@ -550,12 +550,14 @@ defmodule Cairn.StreamUrl do
   # or a path, and the authority `split_authority/1` returns for it can be
   # the credential itself. Comparing that would seed a saved secret onto
   # whatever host follows the `@`.
-  # The structural rule, not `display_ambiguous?/1`: the form's credential
-  # carry refuses a `credentialed?/1` URL on the side being written before it
-  # asks, and lifts the credential off the other side through `userinfo/1`,
-  # which fails closed on the display rule itself.
+  # `display_ambiguous?/1`, not the narrower structural rule: a URL that only
+  # *displays* ambiguous (`http://attacker.lan?x@camera.lan/…`) still parses
+  # an apparent authority here, and comparing that would let
+  # `Settings.seed_userinfo/2` carry a saved credential onto a host chosen by
+  # whatever precedes that later `@` — exactly the forgery `mask/1` and
+  # `userinfo/1` already refuse to render for the same URL.
   defp endpoint(url) do
-    if ambiguous?(url), do: nil, else: unambiguous_endpoint(url)
+    if display_ambiguous?(url), do: nil, else: unambiguous_endpoint(url)
   end
 
   defp unambiguous_endpoint(url) do

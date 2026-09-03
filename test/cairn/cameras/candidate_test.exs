@@ -93,6 +93,18 @@ defmodule Cairn.Cameras.CandidateTest do
       {routed, unclaimed} = Cairn.Cameras.Settings.field_errors(result.own, "", [])
       assert routed["id"] == ["id is required ([a-z0-9_-], lowercase)"]
       assert unclaimed == []
+
+      # `result.errors` is the whole ordered list `Settings.field_errors/3`
+      # can also be called on directly — it must carry the same reclaimed
+      # message, not the index-prefixed original, or that caller leaves the
+      # id error unclaimed.
+      assert result.errors == ["camera : id is required ([a-z0-9_-], lowercase)"]
+
+      {routed_from_errors, unclaimed_from_errors} =
+        Cairn.Cameras.Settings.field_errors(result.errors, "", [])
+
+      assert routed_from_errors["id"] == ["id is required ([a-z0-9_-], lowercase)"]
+      assert unclaimed_from_errors == []
     end
 
     # An edit's candidate always occupies a real slot (its own row, or an

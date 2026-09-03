@@ -33,12 +33,16 @@ defmodule CairnWeb.ConfigLiveTest do
         "    rtsp_url: rtsp://s3cretonly@127.0.0.1:8554/b\n"
     )
 
-    html = render_click(view, "reload", %{})
+    render_click(view, "reload", %{})
 
-    assert html =~ "rtsp://admin:•••••@127.0.0.1:8554/a"
-    assert html =~ "rtsp://•••••@127.0.0.1:8554/b"
-    refute html =~ "s3cret@"
-    refute html =~ "s3cretonly"
+    assert has_element?(view, "#config-camera-cam_secret", "rtsp://admin:•••••@127.0.0.1:8554/a")
+    assert has_element?(view, "#config-camera-cam_colonless", "rtsp://•••••@127.0.0.1:8554/b")
+
+    # Scoped to the cameras section, not the whole page: a page-wide `html =~`
+    # would still pass if the secret leaked into some other row or section.
+    cameras_html = view |> element("#config-cameras") |> render()
+    refute cameras_html =~ "s3cret@"
+    refute cameras_html =~ "s3cretonly"
 
     File.write!(@fixture, original)
     render_click(view, "reload", %{})
