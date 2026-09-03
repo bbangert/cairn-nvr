@@ -102,6 +102,23 @@ defmodule CairnWeb.CamerasLiveTest do
     assert html =~ ~s(aria-checked="false")
   end
 
+  # A disabled row has no runtime, so its status is stale — the same reason
+  # the status badge itself is gated on `loaded == "loaded"` just above.
+  test "a disabled row shows no transcode-unavailable or not-H.264 badge", %{conn: conn} do
+    create!("cam1")
+    {:ok, _diff, _warnings} = Cameras.set_enabled("cam1", false)
+    on_exit(fn -> Cairn.CameraStatus.merge("cam1", %{status: :unknown, probe: nil}) end)
+    Cairn.CameraStatus.set("cam1", :transcode_unavailable)
+    Cairn.CameraStatus.set_probe("cam1", %{codec: "hevc"})
+    _ = :sys.get_state(Cairn.CameraStatus)
+
+    {:ok, _view, html} = live(conn, "/cameras")
+
+    assert html =~ ~s(data-loaded="disabled")
+    refute html =~ "transcode unavailable"
+    refute html =~ "not H.264"
+  end
+
   # The badge carries the status as data, as the dashboard tile does: the
   # label is prose that may be reworded, and it is the only status readout on
   # the edit page, whose header has no row to hang it on.
@@ -121,6 +138,20 @@ defmodule CairnWeb.CamerasLiveTest do
 
       assert badge =~ ~s(data-status="running")
     end
+  end
+
+  # A regression test for a crash: `Cairn.CameraStatus.set_probe/2` accepts a
+  # bare `{:error, reason}`, not only a `%{error: _}` map, and `probe_chips/1`
+  # used to assume the map shape and blow up on the tuple.
+  test "a bare probe error tuple reads as not probed rather than crashing", %{conn: conn} do
+    create!("cam1")
+    on_exit(fn -> Cairn.CameraStatus.set_probe("cam1", nil) end)
+    Cairn.CameraStatus.set_probe("cam1", {:error, :timeout})
+    _ = :sys.get_state(Cairn.CameraStatus)
+
+    {:ok, _view, html} = live(conn, "/cameras")
+
+    assert html =~ "not probed yet"
   end
 
   test "a skipped row shows the loader's errors and no status badge", %{conn: conn, server: srv} do
@@ -312,11 +343,14 @@ defmodule CairnWeb.CamerasLiveTest do
     end
 
     test "the scan tab is a placeholder until discovery lands", %{conn: conn} do
-      {:ok, _view, html} = live(conn, "/cameras/new?tab=scan")
+      {:ok, view, html} = live(conn, "/cameras/new?tab=scan")
 
       assert html =~ ~s(id="onvif-scan")
       assert html =~ "ONVIF discovery arrives in a later release"
-      refute html =~ ~s(id="camera-form")
+      # Hidden, not unmounted — see the comment on the wrapping div in
+      # `CamerasLive`: dropping the form node would blank the ignored
+      # password field on a round trip back to the manual tab.
+      assert has_element?(view, "[hidden] #camera-form")
     end
 
     test "validate marks the offending row and banners what no field claims", %{conn: conn} do
@@ -347,6 +381,64 @@ defmodule CairnWeb.CamerasLiveTest do
 
       assert html =~ ~s(id="camera-form-errors")
       assert html =~ "camera cam2: rtsp_url is required"
+    end
+
+    # Mirrors `Config.Server.update/3`'s `own_skips/2`: another camera's own
+    # fault is the loader's to skip on the next load, not this save's to
+    # refuse — refusing it would leave both cameras broken instead of one.
+    test "another camera's fault is a notice, not a refusal, unless it's the row being saved",
+         %{conn: conn, server: srv} do
+      # Detect-cell edits restart; a Track-cell edit refreshes — the "no
+      # badge" half of the spec needs a save that reads as `updated`, not
+      # `restarted`, so this uses the latter (see "the restart line follows
+      # the Detect cells, not Track" above).
+      create!("cam1", %{
+        "rtsp_url" => "rtsp://h/1",
+        "min_score" => %{"default" => 0.5, "person" => 0.6}
+      })
+
+      create!("cam2")
+      "cam2" |> Cameras.get() |> Camera.update_changeset(%{settings: %{}}) |> Repo.update!()
+      {:ok, _diff, _warnings} = Config.Server.reload(srv)
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      labels = %{
+        "0" => %{"label" => "default", "min_score" => "0.5"},
+        "1" => %{"label" => "person", "min_score" => "0.6", "track" => "0.6"}
+      }
+
+      html =
+        view
+        |> form("#camera-form", camera: %{"labels" => labels})
+        |> render_change()
+
+      assert html =~ ~s(id="camera-form-errors")
+
+      assert html =~
+               "another camera has errors the loader will skip: camera cam2: rtsp_url is required"
+
+      refute html =~ ~s(data-error="true")
+      refute html =~ "Saving may restart cam1"
+
+      view |> form("#camera-form", camera: %{"labels" => labels}) |> render_submit()
+      html = render_async(view)
+
+      assert html =~ ~s(data-ok="true")
+      assert html =~ "updated cam1"
+      refute html =~ "restarted cam1"
+
+      {:ok, view2, _html} = live(conn, "/cameras/cam2/edit")
+
+      html2 =
+        view2
+        |> form("#camera-form", camera: %{"rtsp_url" => ""})
+        |> render_change()
+
+      assert html2 =~ "rtsp_url is required"
+
+      render_submit(view2, "save", %{"camera" => %{"rtsp_url" => ""}})
+      assert Cameras.get("cam2").settings == %{}
     end
 
     test "a blank id is refused under the field before any write", %{conn: conn} do
@@ -544,7 +636,15 @@ defmodule CairnWeb.CamerasLiveTest do
       |> form("#camera-form", camera: %{"id" => "cam9", "rtsp_url" => "rtsp://h/9"})
       |> render_change()
 
-      render_patch(view, "/cameras/new?tab=scan")
+      scan_html = render_patch(view, "/cameras/new?tab=scan")
+
+      # The password node is `phx-update="ignore"`, so its value is
+      # client-only and cannot be asserted from rendered HTML — only that
+      # the node itself (and so whatever the operator typed into it)
+      # survives the patch instead of being unmounted and recreated empty.
+      assert scan_html =~ ~r/id="camera-password-\d+"/
+      assert has_element?(view, "[hidden] #camera-form")
+
       html = render_patch(view, "/cameras/new?tab=manual")
 
       assert html =~ ~s(value="cam9")

@@ -178,11 +178,16 @@ defmodule CairnWeb.CameraCards do
   end
 
   @doc "Codec / resolution / fps / profile chips; empty for a failed or absent probe."
-  @spec probe_chips(map() | nil) :: [String.t()]
+  @spec probe_chips(map() | nil | {:error, term()}) :: [String.t()]
   def probe_chips(nil), do: []
   def probe_chips(%{error: _}), do: []
+  # `Cairn.CameraStatus.set_probe/2` accepts a bare `{:error, reason}`, not
+  # only an `%{error: _}` map — without this clause `probe[:codec]` below
+  # raises `Protocol.UndefinedError` (tuples have no `Access` impl) and takes
+  # `/cameras` down.
+  def probe_chips({:error, _reason}), do: []
 
-  def probe_chips(probe) do
+  def probe_chips(probe) when is_map(probe) do
     [
       probe[:codec],
       probe[:width] && probe[:height] && "#{probe.width}×#{probe.height}",
@@ -191,6 +196,10 @@ defmodule CairnWeb.CameraCards do
     ]
     |> Enum.reject(&(&1 in [nil, false]))
   end
+
+  # Belt-and-suspenders with the `{:error, _}` clause above: `probe[:codec]`
+  # needs the `Access` protocol, which nothing else stored here implements.
+  def probe_chips(_other), do: []
 
   @doc """
   Whether the camera streams something other than H.264 with no transcode to

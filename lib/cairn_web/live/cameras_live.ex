@@ -541,7 +541,38 @@ defmodule CairnWeb.CamerasLive do
         restart_predicted?: restart_predicted?(config, socket.assigns.camera_id)
       )
     else
-      {:error, errors} -> show_errors(socket, errors)
+      {:error, errors} -> candidate_with_errors(socket, settings, errors)
+    end
+  end
+
+  # Mirrors `Config.Server.update/3`'s `own_skips/2`: a fault on a camera
+  # other than the one being edited is that other camera's problem, not this
+  # save's — `ConfigSource.load/1` already drops a faulty row on its own, so
+  # refusing an unrelated fix over it would just leave both cameras broken.
+  # The save is let through, with candidate the loader would still reject
+  # (a fleet-level rule, or a fault in the row being edited) refused as
+  # before. The other rows' messages are shown as a notice rather than a
+  # blocking error since this save cannot fix them and did not cause them.
+  defp candidate_with_errors(socket, settings, errors) do
+    id = route_id(socket)
+    {per_camera, fleet_errors} = Config.partition_by_camera(errors)
+
+    if fleet_errors == [] and Map.get(per_camera, id, []) == [] do
+      notices =
+        per_camera
+        |> Map.delete(id)
+        |> Enum.flat_map(fn {_other_id, msgs} -> msgs end)
+        |> Enum.map(&"another camera has errors the loader will skip: #{&1}")
+
+      assign(socket,
+        candidate: settings,
+        field_errors: %{},
+        form_errors: notices,
+        warnings: [],
+        restart_predicted?: false
+      )
+    else
+      show_errors(socket, errors)
     end
   end
 
@@ -964,23 +995,31 @@ defmodule CairnWeb.CamerasLive do
           </div>
         </section>
 
-        <CameraForm.camera_form
-          :if={not @busy? and (@mode == "edit" or @tab == :manual)}
-          form={@form}
-          rows={@rows}
-          mode={@mode}
-          field_errors={@field_errors}
-          form_errors={@form_errors}
-          plugins={@plugins}
-          trackers={@trackers}
-          known_labels={@known_labels}
-          probe={@probe}
-          saving={@saving?}
-          restart_predicted={@restart_predicted?}
-          camera_id={@camera_id}
-          password_gen={@password_gen}
-          saved_substream={saved_substream?(@saved)}
-        />
+        <%!-- Hidden, not removed, on the scan tab: unmounting drops the
+              `phx-update="ignore"` password field's client-side value (it is
+              recreated empty), so a tab patch away from and back to `manual`
+              would silently blank what the operator typed. `edit` has no
+              scan tab (`tab` is always `:manual` there), so this only ever
+              hides on `new`. --%>
+        <div hidden={@tab == :scan}>
+          <CameraForm.camera_form
+            :if={not @busy?}
+            form={@form}
+            rows={@rows}
+            mode={@mode}
+            field_errors={@field_errors}
+            form_errors={@form_errors}
+            plugins={@plugins}
+            trackers={@trackers}
+            known_labels={@known_labels}
+            probe={@probe}
+            saving={@saving?}
+            restart_predicted={@restart_predicted?}
+            camera_id={@camera_id}
+            password_gen={@password_gen}
+            saved_substream={saved_substream?(@saved)}
+          />
+        </div>
 
         <div :if={@mode == "edit"} style="display: flex; flex-direction: column; gap: 10px;">
           <button
@@ -1152,14 +1191,16 @@ defmodule CairnWeb.CamerasLive do
                 <span class="hs-dot"></span>transcode
               </span>
               <span
-                :if={CameraCards.not_h264?(@statuses, cam.id, cam.transcode)}
+                :if={
+                  cam.loaded == "loaded" and CameraCards.not_h264?(@statuses, cam.id, cam.transcode)
+                }
                 class="hs-badge hs-badge--warning"
                 title="Switch the camera to H.264 or enable transcode"
               >
                 <span class="hs-dot"></span>not H.264
               </span>
               <span
-                :if={CameraCards.transcode_unavailable?(@statuses, cam.id)}
+                :if={cam.loaded == "loaded" and CameraCards.transcode_unavailable?(@statuses, cam.id)}
                 class="hs-badge hs-badge--danger"
               >
                 <span class="hs-dot"></span>transcode unavailable

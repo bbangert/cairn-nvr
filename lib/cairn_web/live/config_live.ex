@@ -62,8 +62,12 @@ defmodule CairnWeb.ConfigLive do
   @impl true
   # The apply that ends with this message is what makes the server answerable
   # again: a page opened mid-apply renders the busy card and would otherwise
-  # keep it until the operator reloaded the browser.
-  def handle_info({:config_changed, _diff}, socket), do: {:noreply, load(socket)}
+  # keep it until the operator reloaded the browser. It is also the only
+  # confirmed end of an unconfirmed re-import (see the `:exit` clause above),
+  # so it is what re-enables the button — clearing `reimporting` here is a
+  # no-op on every other path, since those already clear it themselves.
+  def handle_info({:config_changed, _diff}, socket),
+    do: {:noreply, socket |> assign(reimporting: false) |> load()}
 
   @impl true
   def handle_async(:reimport, {:ok, result}, socket) do
@@ -79,6 +83,12 @@ defmodule CairnWeb.ConfigLive do
   # `unconfirmed` because an exit is not a rollback: `Config.Server.update/3`
   # times the caller out at 30 s while the server may still commit and apply
   # the new fleet, so the card must not promise that nothing changed.
+  #
+  # `reimporting` stays `true` here — the button stays disabled — because the
+  # server may still be mid-apply: a second click would queue a second
+  # destructive fleet replacement behind the first one's back. It only clears
+  # once `{:config_changed, _}` confirms the apply actually landed (or the
+  # operator reloads the page and re-mounts to a fresh `false`).
   def handle_async(:reimport, {:exit, reason}, socket) do
     Logger.error("config: the re-import did not finish: #{CameraCards.describe_exit(reason)}")
 
@@ -87,7 +97,7 @@ defmodule CairnWeb.ConfigLive do
       |> error_result()
       |> Map.put(:unconfirmed, true)
 
-    {:noreply, socket |> assign(reimporting: false, reload_result: result) |> load()}
+    {:noreply, socket |> assign(reload_result: result) |> load()}
   end
 
   # The same `catch :exit` as the mount's overlay: a reload pressed while a

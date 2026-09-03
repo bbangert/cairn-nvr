@@ -26,6 +26,24 @@ defmodule CairnWeb.CameraCardsTest do
     end
   end
 
+  describe "probe_chips/1" do
+    test "is empty for nil, a failed probe map, a bare error tuple, or garbage" do
+      assert CameraCards.probe_chips(nil) == []
+      assert CameraCards.probe_chips(%{error: :timeout}) == []
+      # `Cairn.CameraStatus.set_probe/2` accepts a bare `{:error, reason}`,
+      # not only a `%{error: _}` map — this is the shape `Cairn.Probe`'s own
+      # callers store on a probe that never returned a result.
+      assert CameraCards.probe_chips({:error, :timeout}) == []
+      assert CameraCards.probe_chips("not a probe") == []
+    end
+
+    test "renders codec, resolution, fps and profile" do
+      probe = %{codec: "h264", width: 1920, height: 1080, fps: 15, profile: "high"}
+
+      assert CameraCards.probe_chips(probe) == ["h264", "1920×1080", "15 fps", "high"]
+    end
+  end
+
   describe "mask_url/1" do
     test "hides rtsp credentials" do
       assert CameraCards.mask_url("rtsp://admin:s3cret@10.0.0.5:554/s1") ==
