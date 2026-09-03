@@ -260,10 +260,26 @@ defmodule Cairn.StreamUrlTest do
       assert StreamUrl.credentialed?(@ambiguous)
     end
 
-    # Past a `?` an `@` belongs to a query (`?to=me@h` is ordinary), so the
-    # rule stops there and a raw `?` in a password stays out of reach.
-    test "does not extend past the query, where an @ is ordinary" do
-      refute StreamUrl.ambiguous?("rtsp://u:pa?ss@cam.lan/main")
+    # A raw `?` or `#` in a password ends the readable authority inside the
+    # password (`u:pa`, holding no `@`), so the structural rule sees nothing —
+    # which rendered the password and prefilled it. The display rule reaches
+    # past both characters to the URL's last `@`.
+    for {name, url, password} <- [
+          {"?", "rtsp://u:pa?ss@cam.lan/main", "pa?ss"},
+          {"#", "rtsp://u:pa#ss@cam.lan/main", "pa#ss"}
+        ] do
+      test "a raw #{name} in the password is out of the structural rule's reach, not the display rule's" do
+        url = unquote(url)
+
+        refute StreamUrl.ambiguous?(url)
+        assert StreamUrl.display_ambiguous?(url)
+        assert StreamUrl.mask(url) == "rtsp://•••••@cam.lan/main"
+        refute StreamUrl.mask(url) =~ unquote(password)
+        assert StreamUrl.credentialed?(url)
+        assert StreamUrl.user(url) == nil
+        assert StreamUrl.userinfo(url) == nil
+        assert StreamUrl.compose(url, "ops", "pw") == url
+      end
     end
 
     test "strips through the last such @, and offers no username" do
@@ -353,18 +369,35 @@ defmodule Cairn.StreamUrlTest do
       assert StreamUrl.compose(url, "ops", "pw") == url
     end
 
-    # Same stopping point as the `//` form: past a `?` an `@` is a query
-    # character.
-    test "a //-less URL with no @ before the query stays bare" do
+    # The structural rule stops at the `?`, so the rewrite leaves the query
+    # alone; the display rule does not, so the readout hides it.
+    test "a //-less URL with no @ before the query is bare to a rewrite, not to the readout" do
       refute StreamUrl.ambiguous?("rtsp:/host/live?to=me@h")
-      refute StreamUrl.credentialed?("rtsp:/host/live?to=me@h")
+      assert StreamUrl.display_ambiguous?("rtsp:/host/live?to=me@h")
       assert StreamUrl.mask("rtsp:/host/live") == "rtsp:/host/live"
     end
 
-    test "an @ after the query has no authority to confuse" do
-      refute StreamUrl.ambiguous?("http://h/p?x=1@2")
-      refute StreamUrl.credentialed?("http://h/p?x=1@2")
+    # The accepted cost of the display rule: an `@` that really is part of a
+    # query value is masked through anyway, because a raw `?` in a password
+    # produces the same bytes and this module cannot tell them apart. The URL
+    # opens blank in the form and gets retyped — the price of never rendering
+    # the other reading's password.
+    test "a legitimate @ in a query value is over-masked, and left alone by a strip" do
+      url = "http://h/p?x=me@h"
+
+      refute StreamUrl.ambiguous?(url)
+      assert StreamUrl.display_ambiguous?(url)
+      assert StreamUrl.mask(url) == "http://•••••@h"
+      assert StreamUrl.credentialed?(url)
+      assert StreamUrl.userinfo(url) == nil
+      assert StreamUrl.compose(url, "ops", "pw") == url
+
+      assert StreamUrl.strip_credentials(url) == url
+    end
+
+    test "neither rule reads a non-binary" do
       refute StreamUrl.ambiguous?(nil)
+      refute StreamUrl.display_ambiguous?(nil)
     end
   end
 

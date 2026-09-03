@@ -1117,6 +1117,21 @@ defmodule Cairn.Cameras.SettingsTest do
       assert routed == %{}
       assert unclaimed == [raw]
     end
+
+    # Only one segmentation exists here — `a` + `b, c` — but it is not the
+    # longest-first one: greedy takes `a, b` and dies on the leftover `c`,
+    # which left a message the labels fully account for unclaimed.
+    test "a joined label list routes on its unique segmentation, greedy or not" do
+      raw = "min_score values must be 0..1 (a, b, c)"
+      message = "camera cam1: #{raw}"
+
+      {routed, unclaimed} =
+        Settings.field_errors([message], "cam1", ["a", "b, c", "a, b"])
+
+      assert routed[{"a", "min_score"}] == [raw]
+      assert routed[{"b, c", "min_score"}] == [raw]
+      assert unclaimed == []
+    end
   end
 
   describe "excluded?/3" do

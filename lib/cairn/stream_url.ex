@@ -32,8 +32,9 @@ defmodule Cairn.StreamUrl do
   Two shapes this cannot resolve, both of which report no userinfo here and so
   would be rendered in full: a raw `/` inside a userinfo (it ends the authority
   before any `@` is seen) and a URL with no `//` at all (there is no authority
-  to look in). Both are *ambiguous* rather than bare — see `ambiguous?/1`,
-  which the display and splice paths consult and this function does not.
+  to look in). Both are *ambiguous* rather than bare — see `ambiguous?/1` and
+  the wider `display_ambiguous?/1`, which the readout, prefill and splice
+  paths consult and this function does not.
   """
   @spec split_authority(String.t()) :: {String.t(), String.t() | nil, String.t()}
   def split_authority(url) when is_binary(url) do
@@ -107,14 +108,56 @@ defmodule Cairn.StreamUrl do
   direction (see `@credential_params`'s note): a wrongly-blanked ordinary URL
   costs a retype, a wrongly-read password costs a leaked or truncated secret.
 
-  A raw `?` or `#` in a password is out of reach: past one, an `@` is a query
-  or fragment character, and `?x=me@h` is ordinary. Those are left to the
-  query masker, which hides the value of a credential-named key and nothing
-  else.
+  This is the *structural* rule, and it stops at a `?` or `#`: past one an
+  `@` really is a query or fragment character, `?x=me@h` is ordinary text, and
+  `strip_credentials/1` — the one caller that rewrites the URL — must not cut
+  a stored URL apart at somebody's email address. The readout, the prefill and
+  the splice run on the wider `display_ambiguous?/1` instead.
   """
   @spec ambiguous?(term()) :: boolean()
   def ambiguous?(url) when is_binary(url), do: ambiguous_split(url) != nil
   def ambiguous?(_other), do: false
+
+  @doc """
+  Whether the URL holds an `@` that could be terminating a userinfo, read as
+  widely as a display decision can afford: any `@` after `//` and beyond the
+  readable authority counts, a `?` or `#` in between included.
+
+  A raw `?` or `#` inside a password puts the *readable* authority's end
+  there — `rtsp://u:pa?ss@cam.lan/main` (password `pa?ss`) reads as authority
+  `u:pa` holding no `@` at all — so the structural rule of `ambiguous?/1`
+  calls that URL bare, which renders the password in the readout and prefills
+  it into the form. Under this rule everything such an `@` could be hiding
+  goes: `mask/1` covers `//` through the URL's LAST `@`, `credentialed?/1` is
+  true, `user/1` and `userinfo/1` offer nothing, and `compose/3` refuses to
+  splice.
+
+  Display fails closed wider than mutation on purpose. The cost is a
+  legitimate `@` in a query value (`?x=me@h`) over-masked, so that row opens
+  blank and gets retyped — guessing wide is the cheap direction (see
+  `@credential_params`'s note) where the cost is a retype. In a rewrite it
+  would be data loss instead, which is why `strip_credentials/1` keeps the
+  structural rule and leaves that query value alone.
+  """
+  @spec display_ambiguous?(term()) :: boolean()
+  def display_ambiguous?(url) when is_binary(url), do: display_split(url) != nil
+  def display_ambiguous?(_other), do: false
+
+  # `{scheme, everything after the URL's last @}`, or `nil` when no `@` sits
+  # beyond the readable authority.
+  defp display_split(url) do
+    case String.split(url, "//", parts: 2) do
+      [prefix, onward] ->
+        {_authority, tail} = split_at_path(onward)
+
+        if :binary.match(tail, "@") != :nomatch,
+          do: last_at_anywhere(prefix <> "//", onward)
+
+      # Nothing opened an authority, so every `@` in the string is beyond one.
+      [_no_authority] ->
+        last_at_anywhere(@blank, url)
+    end
+  end
 
   # `{scheme, everything after the last ambiguous @}`, or `nil` when the URL
   # reads unambiguously.
@@ -156,7 +199,15 @@ defmodule Cairn.StreamUrl do
         :nomatch -> onward
       end
 
-    case head |> :binary.matches("@") |> List.last() do
+    after_last_at(scheme, onward, head)
+  end
+
+  defp last_at_anywhere(scheme, onward), do: after_last_at(scheme, onward, onward)
+
+  # `search` is a prefix of `onward`: the `@` is looked for in it, and the tail
+  # handed back is everything past that `@` in the whole string.
+  defp after_last_at(scheme, onward, search) do
+    case search |> :binary.matches("@") |> List.last() do
       nil -> nil
       {at, _len} -> {scheme, binary_part(onward, at + 1, byte_size(onward) - at - 1)}
     end
@@ -171,10 +222,10 @@ defmodule Cairn.StreamUrl do
     # The username (up to the first colon) stays; with no colon the whole
     # userinfo is a credential (`rtsp://SECRET@host` — a password to some
     # cameras, and `credentialed?/1` calls it one) and goes entirely. An
-    # empty username (`rtsp://:secret@host`) masks like any other. An
-    # ambiguous URL shows none of what precedes its `@`.
+    # empty username (`rtsp://:secret@host`) masks like any other. A
+    # display-ambiguous URL shows none of what precedes its last `@`.
     masked =
-      case {ambiguous_split(url), split_authority(url)} do
+      case {display_split(url), split_authority(url)} do
         {{scheme, rest}, _split} ->
           scheme <> "•••••@" <> rest
 
@@ -261,15 +312,15 @@ defmodule Cairn.StreamUrl do
 
   @doc """
   Whether the URL carries a credential — userinfo, one of the query parameters
-  `mask/1` masks, or an `@` `ambiguous?/1` refuses to read. The form's prefill
-  rule reads it: a credentialed URL is left blank rather than rendered (the
-  credential rule).
+  `mask/1` masks, or an `@` `display_ambiguous?/1` refuses to read. The form's
+  prefill rule reads it: a credentialed URL is left blank rather than rendered
+  (the credential rule).
   """
   @spec credentialed?(term()) :: boolean()
   def credentialed?(url) when is_binary(url) do
     {_scheme, userinfo, rest} = split_authority(url)
 
-    userinfo != nil or ambiguous?(url) or
+    userinfo != nil or display_ambiguous?(url) or
       Enum.any?(String.split(URI.parse(rest).query || @blank, "&"), fn pair ->
         pair |> String.split("=", parts: 2) |> hd() |> credential_key?()
       end)
@@ -307,6 +358,12 @@ defmodule Cairn.StreamUrl do
   The URL with every credential removed — the userinfo and the query pairs
   `credentialed?/1` recognizes — so the form's "remove saved username and
   password" strips the FLV form as well as the RTSP one, with the one key set.
+
+  The structural `ambiguous?/1` rule, not the display one: a `?x=me@h` query
+  value is ordinary text to a rewrite, and cutting the URL there would delete
+  a path and a host the operator never asked to lose. Display fails closed
+  wider than mutation, so a URL this leaves intact can still be one `mask/1`
+  hides whole.
   """
   @spec strip_credentials(String.t()) :: String.t()
   def strip_credentials(url) when is_binary(url) do
@@ -344,15 +401,15 @@ defmodule Cairn.StreamUrl do
   @doc """
   The URL's userinfo, or `nil`.
 
-  Checked against `ambiguous?/1` rather than reading `split_authority/1`
-  alone: an ambiguous URL can still parse an ordinary userinfo out of its
-  apparent authority (`rtsp://u:p@h/live@1` reads as `u:p`@`h` before the
-  ambiguity rule sees the later `@`), and handing that back would publish
-  half of what might be a password holding a raw `@`.
+  Checked against `display_ambiguous?/1` rather than reading
+  `split_authority/1` alone: such a URL can still parse an ordinary userinfo
+  out of its apparent authority (`rtsp://u:p@h/live@1` reads as `u:p`@`h`
+  before the ambiguity rule sees the later `@`), and handing that back would
+  publish half of what might be a password holding a raw `@`.
   """
   @spec userinfo(term()) :: String.t() | nil
   def userinfo(url) when is_binary(url) do
-    if ambiguous?(url), do: nil, else: url |> split_authority() |> elem(1)
+    if display_ambiguous?(url), do: nil, else: url |> split_authority() |> elem(1)
   end
 
   def userinfo(_absent), do: nil
@@ -402,15 +459,17 @@ defmodule Cairn.StreamUrl do
   therefore gets an explicit empty password slot (`user:@host`) rather than the
   colonless `user@host` this module would read back as a password.
 
-  An ambiguous URL (`ambiguous?/1`) is returned unchanged: its `@` may be
-  inside a password or inside a path, and splicing on the wrong reading
-  rewrites the host.
+  A display-ambiguous URL (`display_ambiguous?/1`) is returned unchanged: its
+  `@` may be inside a password, a path or a query, and splicing on the wrong
+  reading rewrites the host. That is the same refusal the readout makes, so a
+  URL whose `@` is a legitimate query value takes neither a splice nor a
+  render until that `@` is written `%40`.
   """
   @spec compose(String.t(), String.t(), String.t()) :: String.t()
   def compose(url, @blank, @blank), do: url
 
   def compose(url, user, pass) do
-    case ambiguous_split(url) do
+    case display_split(url) do
       {_scheme, _rest} -> url
       nil -> splice(url, user, pass)
     end
@@ -490,6 +549,10 @@ defmodule Cairn.StreamUrl do
   # or a path, and the authority `split_authority/1` returns for it can be
   # the credential itself. Comparing that would seed a saved secret onto
   # whatever host follows the `@`.
+  # The structural rule, not `display_ambiguous?/1`: the form's credential
+  # carry refuses a `credentialed?/1` URL on the side being written before it
+  # asks, and lifts the credential off the other side through `userinfo/1`,
+  # which fails closed on the display rule itself.
   defp endpoint(url) do
     if ambiguous?(url), do: nil, else: unambiguous_endpoint(url)
   end

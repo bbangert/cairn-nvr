@@ -255,8 +255,9 @@ defmodule Cairn.Cameras.Settings do
   out of a message: a detection class name may hold spaces, `", "` (a class
   literally named "a, b") or parentheses (`person (adult)`), so neither the
   loader's `", "` join nor its ` (value)` suffix can be read off the text
-  alone. Both are walked against the known labels, longest first; anything
-  they cannot fully account for leaves the message unclaimed rather than
+  alone. Both are walked against the known labels — the suffix longest first,
+  the join by whole segmentation (`match_labels/2`); anything they cannot
+  account for in exactly one way leaves the message unclaimed rather than
   routed to a wrong key.
   """
   @spec field_errors([String.t()], String.t(), [String.t()]) :: {map(), [String.t()]}
@@ -909,69 +910,58 @@ defmodule Cairn.Cameras.Settings do
     end
   end
 
-  # Consumes `joined` against the known row labels, longest first, so a label
-  # that itself contains `", "` (a detection class literally named "a, b") is
-  # matched whole before a shorter label that happens to be its prefix. Any
-  # leftover the known labels cannot account for is `:error` — a partial
-  # match would route half a message to a real row and silently drop the
-  # rest, which is worse than leaving the whole message unclaimed.
-  #
-  # The longest-first greedy reading is also `:error` when it is not the
-  # *only* reading: invalid labels `a` and `b, c` join into the same text as
-  # clean rows `a, b` and `c` (`", "` sits inside `b, c` either way), and
-  # picking the greedy segmentation would silently attach the message to
-  # whichever pair happened to sort first — a wrong route, which the same
-  # reasoning above already ranks worse than unclaimed.
+  # `joined` split back into the known row labels the loader joined with
+  # `", "`, or `:error` when the labels account for it in no way or in more
+  # than one. A leftover the labels cannot cover would route half a message to
+  # a real row and silently drop the rest; a second reading would attach it to
+  # whichever of two label sets happened to be tried first (invalid `a` and
+  # `b, c` join into the same text as clean `a, b` and `c` — `", "` sits
+  # inside `b, c` either way). Both are worse than leaving the message
+  # unclaimed.
   defp match_labels(joined, labels) do
-    sorted = Enum.sort_by(labels, &(-String.length(&1)))
-
-    case segmentation_count(joined, sorted) do
-      1 -> consume_labels(joined, sorted, [])
-      _zero_or_ambiguous -> :error
+    case segmentation(joined, labels) do
+      {:ok, matched} -> {:ok, matched}
+      _ambiguous_or_none -> :error
     end
   end
 
-  # How many ways `rest` fully segments into known labels joined by `", "`,
-  # capped at 2: routing only ever needs "exactly one" told apart from
-  # "more than one", and the cap keeps a message with many similarly-shaped
-  # labels from costing more than a bounded amount of branching.
-  defp segmentation_count(@blank, _labels), do: 1
+  # The whole search, not a greedy walk plus a count of the alternatives: a
+  # unique segmentation is often not the longest-first one (`"a, b, c"` with
+  # labels `a`, `b`, `a, b` and `b, c` splits uniquely as `a` + `b, c`, which
+  # greedy misses by taking `a, b` and failing on the rest), so the reading
+  # that gets routed has to be the one the search proved unique.
+  defp segmentation(@blank, _labels), do: {:ok, []}
 
-  defp segmentation_count(rest, labels) do
+  defp segmentation(rest, labels) do
     labels
     |> Enum.filter(&String.starts_with?(rest, &1))
-    |> Enum.reduce(0, fn label, total ->
-      if total >= 2 do
-        total
-      else
-        min(total + segmentation_branch(rest, label, labels), 2)
+    # Halts on the second reading: routing needs only "exactly one" told apart
+    # from "more than one", and stopping bounds the branching a message with
+    # many similarly-shaped labels can cost.
+    |> Enum.reduce_while(:error, fn label, found ->
+      case merge(found, branch(rest, label, labels)) do
+        :ambiguous -> {:halt, :ambiguous}
+        result -> {:cont, result}
       end
     end)
   end
 
-  defp segmentation_branch(rest, label, labels) do
+  defp branch(rest, label, labels) do
     case String.replace_prefix(rest, label, @blank) do
-      @blank -> segmentation_count(@blank, labels)
-      ", " <> more -> segmentation_count(more, labels)
-      _other -> 0
-    end
-  end
+      @blank ->
+        {:ok, [label]}
 
-  defp consume_labels(@blank, _labels, acc), do: {:ok, Enum.reverse(acc)}
+      ", " <> more ->
+        with {:ok, tail} <- segmentation(more, labels), do: {:ok, [label | tail]}
 
-  defp consume_labels(rest, labels, acc) do
-    case Enum.find(labels, &String.starts_with?(rest, &1)) do
-      nil ->
+      _other ->
         :error
-
-      label ->
-        case String.replace_prefix(rest, label, @blank) do
-          @blank -> consume_labels(@blank, labels, [label | acc])
-          ", " <> more -> consume_labels(more, labels, [label | acc])
-          _other -> :error
-        end
     end
   end
+
+  defp merge(:error, result), do: result
+  defp merge(result, :error), do: result
+  defp merge(_first, _second), do: :ambiguous
 
   defp first_word(message) do
     word = message |> String.split([" ", ":"], parts: 2) |> hd()
