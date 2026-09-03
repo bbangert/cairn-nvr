@@ -62,6 +62,14 @@ defmodule Cairn.RepoMigrationTest do
   test "the canonicalize migration strips the parse-identical shapes and keeps the rest" do
     migrate(:down, to: 20_260_903_120_000)
 
+    # Belt-and-suspenders against the explicit `:up` at the end of this body:
+    # a raise between here and there would otherwise leave the shared sandbox
+    # connection on the old schema for every later test. `on_exit` runs in a
+    # different process, but the sandbox is shared (this test's `async:
+    # false`), so it still holds the checkout `migrate/2` needs. Re-running
+    # `:up` once already there is a no-op.
+    on_exit(fn -> migrate(:up, all: true) end)
+
     insert_settings!("old_shape", %{
       "rtsp_url" => "rtsp://h/1",
       "transcode" => false,

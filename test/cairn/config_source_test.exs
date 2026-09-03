@@ -801,6 +801,44 @@ defmodule Cairn.ConfigSourceTest do
       assert Cairn.CameraControl.set("cam_z", %{detection_enabled: false}) == {:error, :removed}
     end
 
+    # `stash_deleted/2`'s own key: a lingering stash only outlives its write
+    # when every retry of its `after_rollback:` callback fails (mid-loop exit
+    # here, same shape as the test above), and a real re-import can land in
+    # that 5 s retry window since the server is otherwise idle between
+    # retries. It must not wipe the older write's stash — only that write's
+    # own retry ever reads it.
+    test "an older write's stash survives a real re-import landing before its rollback retries",
+         %{path: path, server: server} do
+      test_pid = self()
+      counter = start_supervised!({Agent, fn -> 0 end})
+      ref_a = make_ref()
+
+      write_a = fn ->
+        Process.put({:reimport_deleted, ref_a}, ["ghost_a"])
+        {:error, :boom}
+      end
+
+      callback_a = fn ->
+        attempt = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
+
+        if attempt == 0 do
+          exit(:simulated_retry)
+        else
+          send(test_pid, {:stash_a, Process.get({:reimport_deleted, ref_a}, [])})
+          Process.delete({:reimport_deleted, ref_a})
+        end
+      end
+
+      assert Config.Server.update(server, write_a, after_rollback: callback_a) ==
+               {:error, {:write, :boom}}
+
+      # Lands before the 500 ms retry fires, using the real `stash_deleted/2`
+      # via `reimport/1`'s own write closure.
+      assert {:ok, _diff, _warnings} = ConfigSource.reimport(path)
+
+      assert_receive {:stash_a, ["ghost_a"]}, 5_000
+    end
+
     test "an id the file re-inserts after a delete accepts control writes again", %{path: path} do
       # cam_b is in the file but not in the rows: tombstone it as a delete would.
       Cairn.CameraControl.tombstone("cam_b")

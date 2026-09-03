@@ -177,14 +177,14 @@ defmodule Cairn.ConfigSource do
 
   # The write closure and all three callbacks run in the config server
   # process, so the deleted ids ride its dictionary — no message hop, and
-  # nothing left in a mailbox when the write rolls back. A rolled-back write
-  # does leave its entry when it rolls back before `after_rollback:` can
-  # sweep it (a raised closure), so a new one sweeps the old: only the
-  # callbacks for the ref just written ever read one.
-  defp stash_deleted(ref, ids) do
-    for {{:reimport_deleted, _stale} = key, _ids} <- Process.get(), do: Process.delete(key)
-    Process.put({:reimport_deleted, ref}, ids)
-  end
+  # nothing left in a mailbox when the write rolls back. Only this ref's own
+  # key is written: a failed `after_rollback:` is retried under its original
+  # ref for up to 5 s, and another re-import can run in between, so sweeping
+  # older keys here would empty a stash a retry still has to read. Each
+  # callback deletes its own key; one outlives its write only when every
+  # retry raised — a few ids, left to the restart-time reconciliation
+  # follow-up.
+  defp stash_deleted(ref, ids), do: Process.put({:reimport_deleted, ref}, ids)
 
   # The rollback undid the row deletes; these ids are back, so the tombstones
   # the closure installed for them have to come off too.
