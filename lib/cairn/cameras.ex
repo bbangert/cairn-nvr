@@ -65,10 +65,17 @@ defmodule Cairn.Cameras do
   `"id"`, `"enabled"` (default true), `"settings"` (a YAML-camera-shaped map,
   normalized through `canonical/1`) and `"zones"` — string- or atom-keyed.
   """
-  # The revive is the create's `after_apply` for the same reason `delete/1`'s
-  # prune is its own: it has to run inside the config server, ordered against
-  # the delete that tombstoned this id, and not whenever this caller happens
-  # to get around to it.
+  # The revive rides `after_commit:`, not just `after_apply:`: `apply_diff`
+  # runs unguarded inside the config server, so an exit there commits the row
+  # but the server dies before `after_apply:` ever runs, and the tombstone
+  # would outlive the process that was supposed to clear it — control writes
+  # for a freshly created id then 404 until the next restart. `after_commit:`
+  # runs before `apply_diff`, so it always clears the tombstone regardless.
+  # `after_apply:` is kept too, as a backstop for the one case that isn't
+  # normal — a raised or exited `after_commit:` callback, which
+  # `run_after_commit/1` swallows rather than failing the save — mirroring
+  # why `prune_steps/1` keeps its own redundant tombstone step. `revive/1` is
+  # idempotent, so calling it twice on the ordinary path costs nothing.
   @spec create(map()) :: write_result()
   def create(attrs) do
     attrs = stringify_shallow(attrs)
@@ -92,6 +99,7 @@ defmodule Cairn.Cameras do
     server()
     |> Config.Server.update(write,
       reject_skipped: id,
+      after_commit: fn -> CameraControl.revive(id) end,
       after_apply: fn _diff -> CameraControl.revive(id) end
     )
     |> unwrap_invalid_row()

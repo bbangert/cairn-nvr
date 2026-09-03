@@ -179,8 +179,10 @@ defmodule CairnWeb.CameraForm do
   credential rule leaves it blank on purpose), and a typed password is
   spliced into that saved URL whether or not it already carries userinfo.
   Its keys that no field here models are carried through untouched.
-  `clear_substream` is the one way past that keep: checked, `substream_url`
-  is omitted whatever the field holds.
+  `clear_substream` is one way past that keep: checked, `substream_url` is
+  omitted whatever the field holds. `clear_credentials` is another: checked,
+  the username/password fields are ignored and userinfo comes off both URLs
+  instead of being spliced in.
   """
   @spec to_settings(map(), Camera.t() | nil) :: {:ok, map()} | {:error, [String.t()]}
   def to_settings(params, saved \\ nil) do
@@ -200,14 +202,18 @@ defmodule CairnWeb.CameraForm do
   @doc """
   The URLs a probe should open: the form's, composed with the credentials,
   falling back to the saved row's for a field the credential rule left blank.
-  These carry the password, so they are probed and never rendered.
+  These carry the password, so they are probed and never rendered — unless
+  `clear_credentials` is ticked, in which case there is no password left to
+  carry.
   """
   @spec urls(map(), Camera.t() | nil) :: %{main: String.t() | nil, sub: String.t() | nil}
   def urls(params, saved) do
     settings = if saved, do: saved.settings, else: %{}
 
     # The same rule a save applies: a ticked "Remove sub stream" means no sub
-    # stream to probe either.
+    # stream to probe either, and a ticked "Remove saved username and
+    # password" (read inside `put_url/4` via `resolve_url/4`) means neither
+    # URL probed here carries one.
     composed = %{} |> put_url("rtsp_url", params, settings) |> put_substream(params, settings)
 
     %{main: composed["rtsp_url"], sub: composed["substream_url"]}
@@ -410,10 +416,32 @@ defmodule CairnWeb.CameraForm do
 
     case base do
       url when is_binary(url) and url != @blank ->
-        Map.put(acc, key, credentialed(url, key, params, saved))
+        Map.put(acc, key, resolve_url(url, key, params, saved))
 
       _absent ->
         acc
+    end
+  end
+
+  # "Remove saved username and password" bypasses the whole credential splice:
+  # checked, the username/password fields are not read at all (there is no
+  # "typed new credential" to honour in the same save that asked for the
+  # saved one gone), and only userinfo comes off whichever URL — typed or
+  # carried from the saved row — `put_url/4` resolved as the base.
+  defp resolve_url(url, key, params, saved) do
+    if clear_credentials?(params) do
+      strip_userinfo(url)
+    else
+      credentialed(url, key, params, saved)
+    end
+  end
+
+  defp clear_credentials?(params), do: trimmed(params, "clear_credentials") in ["true", "on"]
+
+  defp strip_userinfo(url) do
+    case URI.parse(url).userinfo do
+      nil -> url
+      _userinfo -> URI.to_string(%{URI.parse(url) | userinfo: nil})
     end
   end
 
@@ -880,6 +908,7 @@ defmodule CairnWeb.CameraForm do
   attr :camera_id, :string, required: true
   attr :password_gen, :integer, required: true
   attr :saved_substream, :boolean, required: true
+  attr :saved_credentialed, :boolean, required: true
 
   def camera_form(assigns) do
     ~H"""
@@ -900,6 +929,7 @@ defmodule CairnWeb.CameraForm do
             plugins={@plugins}
             password_gen={@password_gen}
             saved_substream={@saved_substream}
+            saved_credentialed={@saved_credentialed}
           />
           <.tier_rows rows={@rows} field_errors={@field_errors} known_labels={@known_labels} />
           <.windows_fields form={@form} field_errors={@field_errors} />
@@ -936,6 +966,7 @@ defmodule CairnWeb.CameraForm do
   attr :plugins, :list, required: true
   attr :password_gen, :integer, required: true
   attr :saved_substream, :boolean, required: true
+  attr :saved_credentialed, :boolean, required: true
 
   defp stream_fields(assigns) do
     ~H"""
@@ -998,6 +1029,28 @@ defmodule CairnWeb.CameraForm do
           /> Remove sub stream<.restart_chip />
         </label>
         <span style={help_style()}>the saved sub stream URL is dropped on save</span>
+      </div>
+      <%!-- Same shape as "Remove sub stream": a saved credential is never
+            rendered back into the username/password fields (the credential
+            rule), so a blank field cannot tell a save "drop this" from
+            "I have nothing new to say" — only this checkbox can. --%>
+      <div
+        :if={@mode == "edit" and @saved_credentialed}
+        class="hs-field"
+        data-restart="true"
+        style={field_style()}
+      >
+        <label for="camera-clear-credentials" style={label_style()}>
+          <input
+            id="camera-clear-credentials"
+            type="checkbox"
+            class="hs-tog"
+            name="camera[clear_credentials]"
+            value="true"
+            checked={@form.params["clear_credentials"] in ["true", "on", true]}
+          /> Remove saved username and password<.restart_chip />
+        </label>
+        <span style={help_style()}>the saved credential is dropped from both URLs on save</span>
       </div>
       <.text_field
         form={@form}

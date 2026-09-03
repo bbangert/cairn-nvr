@@ -368,6 +368,53 @@ defmodule CairnWeb.CameraFormTest do
       refute Map.has_key?(settings, "substream_url")
     end
 
+    # A saved credential could not otherwise be removed: a blank username or
+    # password field means "keep" everywhere else, so the checkbox is the
+    # only act that drops it.
+    test "clear_credentials strips the saved userinfo when the fields are left blank" do
+      row = rich_row()
+
+      {:ok, settings} =
+        row
+        |> CameraForm.to_params()
+        |> Map.merge(%{"clear_credentials" => "true"})
+        |> CameraForm.to_settings(row)
+
+      assert settings["rtsp_url"] == "rtsp://cam.lan:554/main"
+      assert settings["substream_url"] == "rtsp://cam.lan:554/sub"
+    end
+
+    # Checked wins over a field the operator also typed into, same as
+    # `clear_substream`: the box is the act, the fields are only text.
+    test "clear_credentials strips userinfo from a typed clean URL too, ignoring the fields" do
+      row = rich_row()
+
+      {:ok, settings} =
+        row
+        |> CameraForm.to_params()
+        |> Map.merge(%{
+          "rtsp_url" => "rtsp://cam.lan:554/main",
+          "username" => "someone",
+          "password" => "else",
+          "clear_credentials" => "true"
+        })
+        |> CameraForm.to_settings(row)
+
+      assert settings["rtsp_url"] == "rtsp://cam.lan:554/main"
+    end
+
+    test "clear_credentials unchecked leaves the ordinary splice untouched" do
+      row = rich_row()
+
+      {:ok, settings} =
+        row
+        |> CameraForm.to_params()
+        |> Map.merge(%{"username" => "ops", "password" => "newpw"})
+        |> CameraForm.to_settings(row)
+
+      assert settings["rtsp_url"] == "rtsp://ops:newpw@cam.lan:554/main"
+    end
+
     # The username field is prefilled off the *main* stream, so a prefill that
     # counted as "typed" would rewrite a sub stream nobody edited (D-P5).
     test "the prefilled username alone does not splice" do
@@ -629,6 +676,18 @@ defmodule CairnWeb.CameraFormTest do
                sub: "rtsp://admin:other@cam.lan:554/sub"
              }
     end
+
+    # The probe has to honour the same act a save would, or it would open a
+    # URL with a credential the save is about to drop.
+    test "clear_credentials strips userinfo from the probed URLs too" do
+      row = rich_row()
+      params = CameraForm.to_params(row) |> Map.put("clear_credentials", "true")
+
+      assert CameraForm.urls(params, row) == %{
+               main: "rtsp://cam.lan:554/main",
+               sub: "rtsp://cam.lan:554/sub"
+             }
+    end
   end
 
   describe "field_errors/3" do
@@ -820,6 +879,15 @@ defmodule CairnWeb.CameraFormTest do
       refute render_form(%{}, plugins: []) =~ ~s(name="camera[clear_substream]")
     end
 
+    test "the Remove saved username and password box renders only for a credentialed saved row" do
+      html = render_form(%{}, plugins: [], saved_credentialed: true)
+
+      assert html =~ ~s(id="camera-clear-credentials")
+      assert html =~ "Remove saved username and password"
+
+      refute render_form(%{}, plugins: []) =~ ~s(name="camera[clear_credentials]")
+    end
+
     test "the saved plugin group is an option even when the server named none" do
       html = render_form(%{"plugin" => "yard"}, plugins: [])
 
@@ -919,7 +987,8 @@ defmodule CairnWeb.CameraFormTest do
       saving: false,
       restart_predicted: false,
       camera_id: "gate",
-      saved_substream: Keyword.get(opts, :saved_substream, false)
+      saved_substream: Keyword.get(opts, :saved_substream, false),
+      saved_credentialed: Keyword.get(opts, :saved_credentialed, false)
     )
   end
 

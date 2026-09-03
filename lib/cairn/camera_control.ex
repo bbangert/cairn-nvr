@@ -93,9 +93,11 @@ defmodule Cairn.CameraControl do
   @doc """
   Clears an id's tombstone, so writes for it land again.
 
-  A create's `after_apply` (`Cairn.Cameras.create/1`): a re-created id is a
-  camera again, and its overlay starts from the defaults `get/1` returns for
-  an id with no row in the table.
+  A create's `after_commit` and `after_apply` (`Cairn.Cameras.create/1`),
+  both — a re-created id is a camera again, and its overlay starts from the
+  defaults `get/1` returns for an id with no row in the table. Idempotent, so
+  the second call costs nothing on the ordinary path; see `create/1`'s
+  comment for why it rides both.
 
   A call for the same reason `prune/1` is: it runs inside the config server,
   and a cast could be handled after the new camera's first writes — which

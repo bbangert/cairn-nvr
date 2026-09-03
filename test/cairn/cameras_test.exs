@@ -465,6 +465,58 @@ defmodule Cairn.CamerasTest do
     end
   end
 
+  describe "create/1 revive ordering" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "cairn_cams_#{System.unique_integer([:positive])}")
+      Cairn.DataDir.ensure!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      path = Path.join(dir, "config.yml")
+      File.write!(path, "data_dir: #{dir}\n")
+
+      Repo.insert!(
+        Setting.changeset(%Setting{}, %{
+          key: "yaml_import",
+          value: %{"path" => path, "sha256" => String.duplicate("0", 64)}
+        })
+      )
+
+      test_pid = self()
+
+      # apply_diff runs after `after_commit:` (see Config.Server's moduledoc),
+      # so a set/2 that succeeds here — rather than {:error, :removed} — is
+      # only possible if the tombstone was already cleared before this ran.
+      server =
+        start_supervised!(
+          {Config.Server,
+           path: path,
+           name: nil,
+           source: {ConfigSource, :load},
+           apply_diff: fn _diff, _config ->
+             send(test_pid, {:applying, CameraControl.set("cam_revive_order", %{})})
+           end,
+           apply_native: fn _config -> :ok end},
+          id: :cameras_revive_order_server
+        )
+
+      Application.put_env(:cairn, :config_server, server)
+      on_exit(fn -> Application.delete_env(:cairn, :config_server) end)
+
+      %{dir: dir, server: server}
+    end
+
+    test "after_commit revives a previously tombstoned id before apply_diff runs" do
+      id = "cam_revive_order"
+      CameraControl.tombstone(id)
+      on_exit(fn -> CameraControl.revive(id) end)
+
+      assert {:ok, _diff, []} =
+               Cameras.create(%{"id" => id, "settings" => %{"rtsp_url" => "rtsp://h/1"}})
+
+      assert_received {:applying, control} when is_map(control)
+    end
+  end
+
   defp seed_event(dir, camera_id) do
     id = Ecto.UUID.generate()
     started = DateTime.utc_now()

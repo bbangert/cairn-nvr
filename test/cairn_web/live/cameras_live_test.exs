@@ -845,6 +845,36 @@ defmodule CairnWeb.CamerasLiveTest do
       refute Map.has_key?(Cameras.get("cam1").settings, "substream_url")
     end
 
+    # A blank username/password means "keep", same as a blank URL field, so
+    # the box is the only way to drop a saved credential.
+    test "Remove saved username and password strips userinfo and restarts the camera", %{
+      conn: conn
+    } do
+      create!("cam1", %{"rtsp_url" => "rtsp://admin:s3cret@h/1"})
+
+      {:ok, view, html} = live(conn, "/cameras/cam1/edit")
+      assert html =~ ~s(name="camera[clear_credentials]")
+
+      view
+      |> form("#camera-form", camera: %{"clear_credentials" => "true"})
+      |> render_submit()
+
+      html = render_async(view)
+
+      assert html =~ ~s(data-ok="true")
+      assert html =~ "restarted cam1"
+      assert Cameras.get("cam1").settings["rtsp_url"] == "rtsp://h/1"
+    end
+
+    test "the Remove saved username and password box is absent for an uncredentialed row", %{
+      conn: conn
+    } do
+      create!("cam1", %{"rtsp_url" => "rtsp://h/1"})
+
+      {:ok, _view, edit} = live(conn, "/cameras/cam1/edit")
+      refute edit =~ ~s(name="camera[clear_credentials]")
+    end
+
     test "the Remove sub stream box is absent where there is nothing to remove", %{conn: conn} do
       create!("cam1", %{"rtsp_url" => "rtsp://h/1"})
 

@@ -160,6 +160,15 @@ defmodule CairnWeb.CamerasLive do
   defp saved_substream?(saved),
     do: is_map(saved) and is_binary(saved.settings["substream_url"])
 
+  # Whether the "Remove saved username and password" checkbox has anything to
+  # remove: a saved row with no credentialed URL has no userinfo the
+  # credential rule could otherwise keep past a blank field.
+  defp saved_credentialed?(saved) do
+    is_map(saved) and
+      (CameraCards.credentialed?(saved.settings["rtsp_url"]) or
+         CameraCards.credentialed?(saved.settings["substream_url"]))
+  end
+
   # The sub row is rendered only when there is a sub stream to probe, which
   # `:absent` is how the markup is told.
   defp blank_probes(urls) do
@@ -1166,6 +1175,7 @@ defmodule CairnWeb.CamerasLive do
             camera_id={@camera_id}
             password_gen={@password_gen}
             saved_substream={saved_substream?(@saved)}
+            saved_credentialed={saved_credentialed?(@saved)}
           />
         </div>
 
