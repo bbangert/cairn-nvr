@@ -272,7 +272,10 @@ defmodule Cairn.Cameras.Settings do
       |> Map.get(camera_id, [])
       |> Enum.map(&strip_prefix(&1, camera_id))
       |> Enum.reduce({%{}, []}, fn message, {routed, unclaimed} ->
-        case route(message, labels) do
+        # A cell key names a row that must exist to ask for it: a label the
+        # regex fallback read off a message but no row carries would be
+        # claimed by nobody, and the message would vanish.
+        case message |> route(labels) |> Enum.filter(&known_key?(&1, labels)) do
           [] -> {routed, [message | unclaimed]}
           keys -> {Enum.reduce(keys, routed, &append(&2, &1, message)), unclaimed}
         end
@@ -280,6 +283,9 @@ defmodule Cairn.Cameras.Settings do
 
     {routed, Enum.reverse(unclaimed) ++ others ++ fleet}
   end
+
+  defp known_key?({label, _cell}, labels), do: label in labels
+  defp known_key?(_field, _labels), do: true
 
   @doc "Errors on one field, or on one row's cell (`{label, cell}`)."
   @spec errors_for(map(), term()) :: [String.t()]

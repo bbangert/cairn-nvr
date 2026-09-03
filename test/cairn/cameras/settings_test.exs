@@ -1161,6 +1161,15 @@ defmodule Cairn.Cameras.SettingsTest do
     end
   end
 
+  describe "field_errors/3 with a label no row carries" do
+    test "a cell message for an unknown label stays unclaimed rather than vanishing" do
+      msg = "camera cam_a: track.ghost (0.5) must be >= min_score.ghost (0.6)"
+      {routed, unclaimed} = Settings.field_errors([msg], "cam_a", ["person"])
+      assert routed == %{}
+      assert unclaimed == [String.replace(msg, "camera cam_a: ", "")]
+    end
+  end
+
   describe "errors_for/2" do
     test "returns the field's or the cell's messages, and none for a clean key" do
       {routed, _unclaimed} =
