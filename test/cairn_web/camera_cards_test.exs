@@ -5,6 +5,16 @@ defmodule CairnWeb.CameraCardsTest do
   alias Cairn.Cameras.Camera
   alias CairnWeb.CameraCards
 
+  describe "an @ inside the credential" do
+    test "is consumed through the last @ of the authority" do
+      assert CameraCards.mask_url("rtsp://user:sec@ret@host/s") == "rtsp://user:•••••@host/s"
+      assert CameraCards.mask_url("rtsp://SEC@RET@host/s") == "rtsp://•••••@host/s"
+
+      assert CameraCards.mask_url("rtsp://u:p@host/path@x?password=p") ==
+               "rtsp://u:•••••@host/path@x?password=•••••"
+    end
+  end
+
   describe "access_token" do
     test "is a credential the mask and the prefill rule both see" do
       url = "http://cam.lan/flv?stream=ch0&access_token=SECRET"

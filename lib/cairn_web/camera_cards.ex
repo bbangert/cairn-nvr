@@ -37,17 +37,20 @@ defmodule CairnWeb.CameraCards do
   """
   @spec mask_url(term()) :: String.t()
   def mask_url(url) when is_binary(url) do
-    # The username may be empty (`rtsp://:secret@host`, which cameras that
-    # authenticate on the password alone do accept), so `*` — requiring a
-    # character there rendered the password in the clear.
+    # The userinfo is everything between `//` and the LAST `@` before the
+    # path: a hand-edited or imported password can itself contain `@`, and a
+    # mask that stopped at the first one rendered the rest in the clear. The
+    # username (up to the first colon) stays; with no colon the whole
+    # userinfo is a credential (`rtsp://SECRET@host` — a password to some
+    # cameras, and `credentialed?/1` calls it one) and goes entirely. An
+    # empty username (`rtsp://:secret@host`) masks like any other.
     masked =
-      url
-      |> String.replace(~r/(\/\/[^:\/@]*:)[^@\/]+@/, "\\1•••••@")
-      # `rtsp://SECRET@host` — userinfo with no colon is a password to some
-      # cameras as readily as a username, and `credentialed?/1` already calls
-      # it a credential; the whole of it goes. Never matches what the pass
-      # above wrote: that leaves a colon in the userinfo.
-      |> String.replace(~r/\/\/[^:\/@]+@/, "//•••••@")
+      Regex.replace(~r{//([^/?#]*)@}, url, fn _match, userinfo ->
+        case String.split(userinfo, ":", parts: 2) do
+          [user, _password] -> "//" <> user <> ":•••••@"
+          [_password_only] -> "//•••••@"
+        end
+      end)
 
     case String.split(masked, "?", parts: 2) do
       [base, query] -> base <> "?" <> mask_query(query)
