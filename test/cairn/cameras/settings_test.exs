@@ -1064,7 +1064,7 @@ defmodule Cairn.Cameras.SettingsTest do
     test "to_settings/2 and urls/2 drop a nested value instead of raising" do
       params = %{"rtsp_url" => %{"x" => "y"}, "password" => %{"x" => "y"}, "labels" => "no"}
       assert {:ok, _settings} = Settings.to_settings(params)
-      assert {_main, _sub} = Settings.urls(params, nil)
+      assert %{main: nil, sub: nil} = Settings.urls(params, nil)
     end
   end
 
