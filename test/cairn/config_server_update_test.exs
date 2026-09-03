@@ -325,12 +325,46 @@ defmodule Cairn.Config.ServerUpdateTest do
     assert %{cameras: [%{id: "cam_a"}]} = Config.Server.get(server)
   end
 
+  # The ordering that matters: a subscriber reacting to the broadcast by
+  # calling `get/1` shares this mailbox with the callback, so a slow prune
+  # run after the broadcast would make that read queue behind it.
+  test "after_apply runs before the config-changed broadcast", %{server: server} do
+    test_pid = self()
+    Config.Server.subscribe()
+
+    assert {:ok, _diff, _warnings} =
+             Config.Server.update(server, insert_fun("cam_a", "full"),
+               after_apply: fn _diff -> send(test_pid, :callback_ran) end
+             )
+
+    # Order, not just presence: `assert_receive`/`assert_received` match
+    # anywhere in the mailbox, so a reversed arrival would pass either
+    # ordering just the same. The mailbox also carries `private_server/2`'s
+    # own `:native_applied`/`:applied` messages, so the two of interest are
+    # picked out of a full drain rather than assumed to be the only ones.
+    mailbox = flush_mailbox()
+    callback_at = Enum.find_index(mailbox, &(&1 == :callback_ran))
+    broadcast_at = Enum.find_index(mailbox, &match?({:config_changed, %{added: ["cam_a"]}}, &1))
+
+    assert callback_at, "expected :callback_ran in #{inspect(mailbox)}"
+    assert broadcast_at, "expected {:config_changed, _} in #{inspect(mailbox)}"
+    assert callback_at < broadcast_at
+  end
+
   test "a callback that is not a 1-arity fun is refused before the write", %{server: server} do
     assert_raise ArgumentError, ~r/after_apply/, fn ->
       Config.Server.update(server, insert_fun("cam_a", "full"), after_apply: :nope)
     end
 
     assert Repo.get(Camera, "cam_a") == nil
+  end
+
+  defp flush_mailbox do
+    receive do
+      msg -> [msg | flush_mailbox()]
+    after
+      0 -> []
+    end
   end
 
   defp private_server(path, id) do

@@ -598,21 +598,36 @@ defmodule CairnWeb.CamerasLive do
   # (a fleet-level rule, or a fault in the row being edited) refused as
   # before. The other rows' messages are shown as a notice rather than a
   # blocking error since this save cannot fix them and did not cause them.
+  #
+  # A fleet-level fault (capacity, one-model-per-VM — the rules
+  # `partition_by_camera/1` cannot pin on any one camera) is the same kind of
+  # notice, not a refusal, when the camera being edited is disabled: `fleet/2`
+  # validates it anyway so its own errors still show, but a rule it only
+  # trips alongside the *currently enabled* fleet says nothing about the save
+  # in front of the operator — it will not bind until this camera is enabled,
+  # at which point the config server's own load re-checks it. Refusing the
+  # save here would block an edit for a fault the edit did not create and the
+  # operator cannot see until they flip the toggle anyway.
   defp candidate_with_errors(socket, settings, errors) do
     id = route_id(socket)
     {per_camera, fleet_errors} = Config.partition_by_camera(errors)
+    own = Map.get(per_camera, id, [])
+    disabled? = match?(%{enabled: false}, socket.assigns.saved)
 
-    if fleet_errors == [] and Map.get(per_camera, id, []) == [] do
-      notices =
+    if own == [] and (fleet_errors == [] or disabled?) do
+      others =
         per_camera
         |> Map.delete(id)
         |> Enum.flat_map(fn {_other_id, msgs} -> msgs end)
         |> Enum.map(&"another camera has errors the loader will skip: #{&1}")
 
+      fleet_notices =
+        Enum.map(fleet_errors, &"will not apply until this camera is enabled: #{&1}")
+
       assign(socket,
         candidate: settings,
         field_errors: %{},
-        form_errors: notices,
+        form_errors: others ++ fleet_notices,
         warnings: [],
         restart_predicted?: false
       )
@@ -638,9 +653,14 @@ defmodule CairnWeb.CamerasLive do
   end
 
   # The fleet a load would render, with this camera's unsaved settings in
-  # place of its row. A *disabled* camera is not in it at all: `ConfigSource`
-  # renders enabled rows only, so validating one would invent cross-camera
-  # errors (ladder capacity, one model per VM) the save itself cannot hit.
+  # place of its row (or appended, on `:new` or for a disabled camera —
+  # `ConfigSource` renders enabled rows only, so a disabled camera's own row
+  # is never among `enabled`). A disabled camera's candidate is included for
+  # validation anyway, on purpose: its own field errors have to reach the
+  # form the same as an enabled camera's, even though a rule it only trips
+  # against the currently-enabled fleet is not this save's fault —
+  # `candidate_with_errors/2` is what turns that half of the answer into a
+  # notice instead of a refusal.
   defp fleet(socket, settings) do
     id = route_id(socket)
     zones = (socket.assigns.saved && socket.assigns.saved.zones) || []
@@ -652,11 +672,7 @@ defmodule CairnWeb.CamerasLive do
         if camera.id == id, do: candidate, else: Cameras.render_row(camera)
       end)
 
-    cond do
-      Enum.any?(enabled, &(&1.id == id)) -> rows
-      match?(%{enabled: false}, socket.assigns.saved) -> rows
-      true -> rows ++ [candidate]
-    end
+    if Enum.any?(enabled, &(&1.id == id)), do: rows, else: rows ++ [candidate]
   end
 
   # Every refusal lands here, so this is where the candidate is dropped: the
@@ -1090,11 +1106,8 @@ defmodule CairnWeb.CamerasLive do
             aria-labelledby="camera-remove-title"
             style="padding: 16px; border-radius: 10px; border: 1px solid var(--hs-border); background: var(--hs-bg-raised); color: var(--hs-fg-1);"
           >
-            <%!-- A raw `<form>`, not `<.form>`: the submit carries one hidden
-                  id and nothing this LiveView needs a changeset or a CSRF
-                  token for. The id is written out rather than generated so
-                  the confirm dialog's form can be addressed by name. --%>
-            <form
+            <.form
+              for={%{}}
               id="camera-remove-form"
               phx-submit="remove"
               style="display: flex; flex-direction: column; gap: 12px;"
@@ -1126,7 +1139,7 @@ defmodule CairnWeb.CamerasLive do
                   Cancel
                 </button>
               </div>
-            </form>
+            </.form>
           </dialog>
         </div>
       </main>

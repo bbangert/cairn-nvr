@@ -42,7 +42,10 @@ defmodule Cairn.Config.Server do
   caller, so a caller that dies or gives up on its 30 s call would otherwise
   leave the cleanup undone — and a prune racing a re-create of the same id
   from another session can delete a checkpoint that belongs to the new
-  camera.
+  camera. It runs before the config is announced on `Cairn.Config.topic/0`:
+  a prune can block up to another owner's call timeout, and a subscriber
+  that reacted to the broadcast by calling `get/1` would otherwise queue
+  behind it on this same process.
 
   A named server publishes each config it installs as a `:persistent_term`
   snapshot *before* applying it, for `snapshot_camera/2`: a camera tree
@@ -164,10 +167,10 @@ defmodule Cairn.Config.Server do
   these is the row it skipped, and the caller gets that camera's errors.
 
   `after_apply: fun` is the write's post-commit half: this process calls it
-  with the applied diff once the config is installed and announced, and never
-  on a write the validator or the closure rejected. It runs here so that a
-  caller which dies, or whose call times out, still gets it — see the
-  moduledoc.
+  with the applied diff once the config is installed and applied, before it
+  is announced, and never on a write the validator or the closure rejected.
+  It runs here so that a caller which dies, or whose call times out, still
+  gets it — see the moduledoc.
 
   `{:error, errors}` is the validator's; `{:error, {:write, reason}}` is
   `write_fun`'s own (a changeset, a DB fault, a wrong-shaped return, or an
@@ -283,8 +286,7 @@ defmodule Cairn.Config.Server do
   defp do_update(state, write_fun, reject, after_apply) do
     case transact(state, write_fun, reject) do
       {:ok, {new_config, warnings, skipped}} ->
-        {diff, state} = apply_config(state, new_config, warnings, skipped)
-        run_after_apply(after_apply, diff)
+        {diff, state} = apply_config(state, new_config, warnings, skipped, after_apply)
         {:reply, {:ok, diff, warnings}, state}
 
       {:error, {:invalid, errors}} ->
@@ -359,9 +361,10 @@ defmodule Cairn.Config.Server do
   defp own_skips(reject, skipped),
     do: Enum.flat_map(List.wrap(reject), &Map.get(skipped, &1, []))
 
-  # The ok arm shared by `:reload` and `{:update, _}`, so the three orderings
-  # below cannot drift between the two paths.
-  defp apply_config(state, new_config, warnings, skipped) do
+  # The ok arm shared by `:reload` and `{:update, _}`, so the four orderings
+  # below cannot drift between the two paths. `after_apply` is `nil` on the
+  # reload path — a reload has no caller write to hang cleanup off.
+  defp apply_config(state, new_config, warnings, skipped, after_apply \\ nil) do
     diff = diff_cameras(state.config, new_config)
     # Before the diff: newly spawned ports redirect logs into the (possibly
     # changed) data_dir, so its log subdir must already exist
@@ -377,6 +380,11 @@ defmodule Cairn.Config.Server do
     state.apply_native.(new_config)
     state.apply_diff.(diff, new_config)
     state = %{state | config: new_config, warnings: warnings, errors: [], skipped: skipped}
+    # Before the broadcast: a subscriber that reacts to `{:config_changed, _}`
+    # by calling `get/1` shares this mailbox with the callback, and a prune
+    # that blocks on another owner's call would otherwise make that read wait
+    # behind cleanup the subscriber has no reason to know about.
+    run_after_apply(after_apply, diff)
     Phoenix.PubSub.broadcast(Cairn.PubSub, Config.topic(), {:config_changed, diff})
     {diff, state}
   end

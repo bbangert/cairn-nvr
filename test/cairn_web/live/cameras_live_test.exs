@@ -497,8 +497,12 @@ defmodule CairnWeb.CamerasLiveTest do
       assert Cameras.get("cam1").settings == %{"rtsp_url" => "rtsp://u:SECRET@h/1"}
     end
 
-    test "a disabled camera is not in the fleet its own edit validates", %{conn: conn} do
+    # A disabled camera's candidate is validated too, so its own field errors
+    # show and refuse the save just as an enabled camera's would — the toggle
+    # is a runtime state, not licence to save a row nobody could ever read.
+    test "a disabled camera's own field errors show and refuse the save", %{conn: conn} do
       create!("cam1")
+      {:ok, _diff, _warnings} = Cameras.set_enabled("cam1", false)
 
       {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
 
@@ -506,16 +510,63 @@ defmodule CairnWeb.CamerasLiveTest do
 
       assert html =~ "max_unseen_ms must be 100..3600000"
 
-      {:ok, _diff, _warnings} = Cameras.set_enabled("cam1", false)
+      view |> form("#camera-form", camera: %{"max_unseen_ms" => "50"}) |> render_submit()
+      assert Cameras.get("cam1").settings["max_unseen_ms"] != 50
+    end
 
-      {:ok, disabled_view, _html} = live(conn, "/cameras/cam1/edit")
+    # A fleet-level rule (here, one model per VM) a disabled camera's
+    # candidate only trips alongside the *currently enabled* fleet is not this
+    # save's fault and will not bind until the camera is enabled — so it is a
+    # notice, not a refusal, unlike the camera's own errors above.
+    test "a disabled camera whose candidate only trips a fleet-level rule saves with a notice",
+         %{conn: conn, dir: dir, server: server} do
+      path = Path.join(dir, "config.yml")
+
+      File.write!(path, """
+      data_dir: #{dir}
+      profile_dirs:
+        - test/support/fixtures/profiles/argv
+      plugins:
+        full:
+          profile: full
+        partial:
+          profile: partial
+      """)
+
+      {:ok, _diff, _warnings} = Config.Server.reload(server)
+
+      # `CamerasLive`'s `globals` (the non-camera half the candidate fleet is
+      # validated against) comes from `Config.default_path/0`, not from the
+      # private server's own path — it has to be pointed at the same file for
+      # the fleet-level rule below to be visible to the edit page at all.
+      previous_config_path = Application.get_env(:cairn, :config_path)
+      Application.put_env(:cairn, :config_path, path)
+
+      on_exit(fn ->
+        if previous_config_path,
+          do: Application.put_env(:cairn, :config_path, previous_config_path),
+          else: Application.delete_env(:cairn, :config_path)
+      end)
+
+      create!("cam1", %{"rtsp_url" => "rtsp://h/1", "plugin" => "full"})
+      create!("cam2", %{"rtsp_url" => "rtsp://h/2", "plugin" => "partial"}, %{"enabled" => false})
+
+      {:ok, view, _html} = live(conn, "/cameras/cam2/edit")
 
       html =
-        disabled_view
-        |> form("#camera-form", camera: %{"max_unseen_ms" => "50"})
+        view
+        |> form("#camera-form", camera: %{"rtsp_url" => "rtsp://h/2"})
         |> render_change()
 
-      refute html =~ "max_unseen_ms must be"
+      refute html =~ ~s(data-error="true")
+      assert html =~ "will not apply until this camera is enabled"
+      assert html =~ "different models (full, partial)"
+
+      view |> form("#camera-form", camera: %{"rtsp_url" => "rtsp://h/2"}) |> render_submit()
+      html = render_async(view)
+
+      assert html =~ ~s(data-ok="true")
+      assert Cameras.get("cam2").settings["rtsp_url"] == "rtsp://h/2"
     end
 
     test "removing a label row re-validates what is left", %{conn: conn} do

@@ -151,7 +151,7 @@ defmodule CairnWeb.CameraForm do
 
     with [] <- row_errors(rows),
          {:ok, ints} <- parse_ints(params),
-         {:ok, per_label} <- row_retention(rows) do
+         {:ok, per_label} <- row_retention(rows, saved_settings) do
       {:ok, build_settings(params, rows, ints, per_label, saved_settings)}
     else
       {:error, errors} -> {:error, errors}
@@ -389,18 +389,21 @@ defmodule CairnWeb.CameraForm do
   # password, or a username the operator changed, rewrites a URL that has no
   # userinfo.
   #
-  # Last: a URL retyped for a stream whose saved URL carried the credential
-  # keeps it. Neither field can supply one here — the password field says
-  # "leave blank to keep" and the username is a prefill, not an entry — so
-  # without the carry, moving a camera to a new host or path would quietly
-  # save the stream without its credential.
+  # A retyped URL (a new host or path, still bare of its own credential) is
+  # seeded with the saved URL's userinfo *before* the fields are spliced in —
+  # not left to the final fallback below — so it lands in the first branch
+  # above like any other URL that already carries one: a changed username
+  # replaces only the username and a blank password keeps the saved one,
+  # instead of the splice reading "no userinfo yet" and dropping the saved
+  # password outright.
   defp credentialed(url, key, params, saved) do
     user = trimmed(params, "username")
     pass = password(params)
+    seeded = seed_userinfo(url, saved[key])
 
     cond do
-      URI.parse(url).userinfo != nil ->
-        compose_url(url, if(given_user?(user, saved), do: user, else: @blank), pass)
+      URI.parse(seeded).userinfo != nil ->
+        compose_url(seeded, if(given_user?(user, saved), do: user, else: @blank), pass)
 
       CameraCards.credentialed?(url) ->
         url
@@ -409,7 +412,21 @@ defmodule CairnWeb.CameraForm do
         compose_url(url, user, pass)
 
       true ->
-        carry_userinfo(url, saved[key])
+        url
+    end
+  end
+
+  # The carry that used to run only as `credentialed/4`'s last resort, now run
+  # up front: a URL that already carries its own credential (userinfo, or the
+  # FLV query form `CameraCards.credentialed?/1` reads) is left untouched —
+  # seeding it with the saved URL's userinfo would either overwrite a
+  # credential the operator just typed into the URL itself, or bolt userinfo
+  # onto a URL whose credential rides in the query instead.
+  defp seed_userinfo(url, saved_url) do
+    if URI.parse(url).userinfo == nil and not CameraCards.credentialed?(url) do
+      carry_userinfo(url, saved_url)
+    else
+      url
     end
   end
 
@@ -488,7 +505,14 @@ defmodule CairnWeb.CameraForm do
   # "Keep clips (days)" field writes. A stray one would also drag
   # `Cairn.Retention`'s sweep floor down, since that takes the minimum over
   # every per-label value.
-  defp row_retention(rows) do
+  #
+  # A saved `per_label["default"]` is nonetheless carried through untouched
+  # (`carry_saved_default/2`): it is not the camera's days at all but a rule
+  # for a detection label that happens to be spelled "default", which the row
+  # this function reads from has no cell for and so can neither see nor
+  # clear. Dropping it on every edit would quietly delete that rule the first
+  # time an operator touched anything else on the camera.
+  defp row_retention(rows, saved) do
     {per_label, errors} =
       rows
       |> Enum.reject(&(&1["label"] == "default"))
@@ -501,7 +525,16 @@ defmodule CairnWeb.CameraForm do
         )
       end)
 
-    if errors == [], do: {:ok, per_label}, else: {:error, Enum.reverse(errors)}
+    if errors == [],
+      do: {:ok, carry_saved_default(per_label, saved)},
+      else: {:error, Enum.reverse(errors)}
+  end
+
+  defp carry_saved_default(per_label, saved) do
+    case get_in(saved, ["retention", "per_label", "default"]) do
+      nil -> per_label
+      days -> Map.put(per_label, "default", days)
+    end
   end
 
   # A row with nothing in it at all is dropped rather than refused: the
@@ -565,7 +598,7 @@ defmodule CairnWeb.CameraForm do
         "track" => rule_string(track[label]),
         "record" => rule_string(record[label]),
         # Blank on `default` to match the cell the row no longer renders — see
-        # `row_retention/1`.
+        # `row_retention/2`.
         "retention_days" => if(label == "default", do: @blank, else: int_string(per_label[label]))
       }
     end

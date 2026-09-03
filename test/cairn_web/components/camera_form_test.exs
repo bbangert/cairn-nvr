@@ -288,6 +288,21 @@ defmodule CairnWeb.CameraFormTest do
       assert settings["rtsp_url"] == "rtsp://ops:pw@cam.lan/main"
     end
 
+    # Retyping the URL (a new host or path) used to lose the saved password:
+    # the typed URL carries no userinfo of its own, so the splice read "no
+    # credential yet" and dropped the saved one instead of updating around it.
+    test "a retyped URL keeps the saved password when only the username changes" do
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://u:pw@old/1"}, zones: []}
+
+      {:ok, settings} =
+        row
+        |> CameraForm.to_params()
+        |> Map.merge(%{"rtsp_url" => "rtsp://new/1", "username" => "v", "password" => ""})
+        |> CameraForm.to_settings(row)
+
+      assert settings["rtsp_url"] == "rtsp://v:pw@new/1"
+    end
+
     test "blank credentials leave both URLs exactly as they were" do
       row = rich_row()
 
@@ -343,6 +358,24 @@ defmodule CairnWeb.CameraFormTest do
       {:ok, settings} = CameraForm.to_settings(params, row)
 
       assert settings["substream_url"] == "rtsp://cam.lan:554/sub"
+    end
+
+    # `per_label["default"]` is a rule for a detection label spelled "default",
+    # not the camera's own days — the row that key belongs to has no cell for
+    # it at all, so an untouched edit must not drop it (D-P5).
+    test "a saved per_label rule named default round-trips through an untouched edit" do
+      row = %Camera{
+        id: "gate",
+        settings: %{
+          "rtsp_url" => "rtsp://h/1",
+          "retention" => %{"per_label" => %{"default" => 3}}
+        },
+        zones: []
+      }
+
+      {:ok, settings} = row |> CameraForm.to_params() |> CameraForm.to_settings(row)
+
+      assert settings["retention"] == %{"per_label" => %{"default" => 3}}
     end
 
     test "a per-label days cell on the default row is not written" do
