@@ -36,12 +36,16 @@ defmodule CairnWeb.Api.CameraController do
   `detection_enabled`, `recording_enabled` (booleans), `min_score` (0..1 or
   null to clear the override). Returns the resulting control state.
   """
+  # The config check and the write are not one transaction: a delete can commit
+  # and prune between them, so the write itself refuses a tombstoned id and
+  # that is answered as the 404 the check would have given a moment later.
   def control(conn, %{"id" => camera_id} = params) do
     with {:ok, _cam} <- camera(camera_id),
-         {:ok, attrs} <- validate(params) do
-      control = CameraControl.set(camera_id, attrs)
+         {:ok, attrs} <- validate(params),
+         control when is_map(control) <- CameraControl.set(camera_id, attrs) do
       json(conn, %{id: camera_id, control: control})
     else
+      {:error, :removed} -> conn |> put_status(404) |> json(%{error: "unknown camera"})
       :unknown_camera -> conn |> put_status(404) |> json(%{error: "unknown camera"})
       {:invalid, field} -> conn |> put_status(422) |> json(%{error: "invalid #{field}"})
     end

@@ -108,6 +108,7 @@ defmodule CairnWeb.CamerasLive do
         warnings: [],
         dirty: MapSet.new(),
         saving?: false,
+        save_unconfirmed?: false,
         save_result: nil,
         restart_predicted?: false,
         probe: %{main: blank_probe(:idle), sub: blank_probe(:absent)},
@@ -260,7 +261,7 @@ defmodule CairnWeb.CamerasLive do
     else
       {:noreply,
        socket
-       |> assign(saving?: true, save_result: applying_result())
+       |> assign(saving?: true, save_unconfirmed?: false, save_result: applying_result())
        |> start_async(:remove, fn -> Cameras.delete(id) end)}
     end
   end
@@ -339,11 +340,16 @@ defmodule CairnWeb.CamerasLive do
   # and while it is, `load/1`'s reads exit too — so the page shows the busy
   # card over the unconfirmed one and re-reads on the `{:config_changed, _}`
   # that ends the apply, exactly as it does for a save started elsewhere.
-  # `saving?` goes back to false regardless so a retry is possible once the
-  # server answers again.
+  #
+  # `saving?` stays true — Save stays disabled — because the write may still
+  # land: a retry submitted meanwhile would overwrite whatever the queued one
+  # is about to commit, from a form still holding the params from before it.
+  # `{:config_changed, _}` is what clears both flags, and it re-reads the row
+  # first, so the retry starts from what actually landed (`ConfigLive`'s
+  # re-import does the same).
   defp unconfirmed(socket, reason) do
     socket
-    |> assign(saving?: false, save_result: done(exit_result(reason)))
+    |> assign(save_unconfirmed?: true, save_result: done(exit_result(reason)))
     |> load()
   end
 
@@ -357,7 +363,17 @@ defmodule CairnWeb.CamerasLive do
   @impl true
   # A save this session ran re-reads in `handle_async` as well; both arrive
   # and both are a full re-read, so the order between them does not matter.
+  #
+  # This is also the only confirmed end of an unconfirmed save (see
+  # `unconfirmed/2`): clearing the flags here, *before* `refresh_saved/1`,
+  # is what lets that re-read the row — the form the operator retries from
+  # then holds what landed, not the params the timed-out write carried.
   def handle_info({:config_changed, _diff}, socket) do
+    socket =
+      if socket.assigns[:save_unconfirmed?],
+        do: assign(socket, saving?: false, save_unconfirmed?: false),
+        else: socket
+
     {:noreply,
      socket
      |> refresh_globals()
@@ -758,7 +774,7 @@ defmodule CairnWeb.CamerasLive do
         else: fn -> Cameras.create(%{"id" => id, "settings" => settings}) end
 
     socket
-    |> assign(saving?: true, save_result: applying_result())
+    |> assign(saving?: true, save_unconfirmed?: false, save_result: applying_result())
     |> start_async(:save, write)
   end
 

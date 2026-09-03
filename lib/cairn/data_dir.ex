@@ -49,9 +49,10 @@ defmodule Cairn.DataDir do
     :ok
   end
 
-  # `error`, not `warning`: on the DB file (camera credentials included) or
-  # its parent dir, a refused chmod means the DB may be readable by other
-  # users on this volume. Still non-fatal — a boot that dies on a bind mount
+  # `error`, not `warning`: every path this runs on holds camera credentials —
+  # the DB, its parent dir, and the log dir whose ffmpeg lines echo RTSP URLs —
+  # so a refused chmod means one of them may be readable by other users on
+  # this volume. Still non-fatal — a boot that dies on a bind mount
   # the operator chose, for a permission nothing inside the container can
   # fix, takes the whole NVR down over a single chmod.
   defp chmod(path, mode) do
@@ -62,7 +63,8 @@ defmodule Cairn.DataDir do
       {:error, reason} ->
         Logger.error(
           "could not chmod #{path} to #{Integer.to_string(mode, 8)}: #{:file.format_error(reason)} — " <>
-            "the DB may be readable by other users on this volume"
+            "sensitive camera data (the database, or the ffmpeg logs) may be readable by " <>
+            "other users on this volume"
         )
 
         :ok

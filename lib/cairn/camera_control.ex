@@ -52,8 +52,11 @@ defmodule Cairn.CameraControl do
   Merges `attrs` (a subset of `:detection_enabled`, `:recording_enabled`,
   `:min_score`) into a camera's control and returns the new control. Accepts
   either atom or string keys; unknown keys are ignored.
+
+  Answers `{:error, :removed}` for a tombstoned id — one `prune/1` dropped and
+  `revive/1` has not brought back.
   """
-  @spec set(String.t(), map()) :: control()
+  @spec set(String.t(), map()) :: control() | {:error, :removed}
   def set(camera_id, attrs) when is_map(attrs) do
     GenServer.call(__MODULE__, {:set, camera_id, normalize(attrs)})
   end
@@ -77,7 +80,8 @@ defmodule Cairn.CameraControl do
   end
 
   @doc """
-  Removes control for cameras no longer configured (on reload).
+  Removes control for cameras no longer configured (on reload), and tombstones
+  every id it drops.
 
   A call, not a cast: this runs as a delete's `after_apply` inside the config
   server, and a queued cast could be handled *after* a same-id re-create's
@@ -86,25 +90,67 @@ defmodule Cairn.CameraControl do
   @spec prune([String.t()]) :: :ok
   def prune(known_camera_ids), do: GenServer.call(__MODULE__, {:prune, known_camera_ids})
 
+  @doc """
+  Clears an id's tombstone, so writes for it land again.
+
+  A create's `after_apply` (`Cairn.Cameras.create/1`): a re-created id is a
+  camera again, and its overlay starts from the defaults `get/1` returns for
+  an id with no row in the table.
+
+  A call for the same reason `prune/1` is: it runs inside the config server,
+  and a cast could be handled after the new camera's first writes — which
+  would then have been refused.
+  """
+  @spec revive(String.t()) :: :ok
+  def revive(camera_id), do: GenServer.call(__MODULE__, {:revive, camera_id})
+
+  @doc """
+  Tombstones an id whether or not it ever held a control row: `prune/1` can
+  only mark the rows it drops, and a camera that never received a control
+  write would otherwise be recreatable by a late one.
+  """
+  @spec tombstone(String.t()) :: :ok
+  def tombstone(camera_id), do: GenServer.call(__MODULE__, {:tombstone, camera_id})
+
   @impl true
   def init(_opts) do
     :ets.new(@table, [:named_table, :set, :protected, read_concurrency: true])
-    {:ok, %{}}
+    {:ok, %{tombstoned: MapSet.new()}}
   end
 
   @impl true
+  # Tombstoned ids are refused rather than written: a caller that checked the
+  # camera exists (the HA control endpoint) and then writes is not serialized
+  # with deletion, so a delete can commit and prune in between — and the late
+  # write would recreate the overlay under a dead id, which a later camera
+  # created under the same id would then inherit.
   def handle_call({:set, camera_id, attrs}, _from, state) do
-    control = Map.merge(get(camera_id), Map.take(attrs, Map.keys(@defaults)))
-    :ets.insert(@table, {camera_id, control})
-    Phoenix.PubSub.broadcast(Cairn.PubSub, @topic, {:camera_control, camera_id, control})
-    {:reply, control, state}
+    if MapSet.member?(state.tombstoned, camera_id) do
+      {:reply, {:error, :removed}, state}
+    else
+      control = Map.merge(get(camera_id), Map.take(attrs, Map.keys(@defaults)))
+      :ets.insert(@table, {camera_id, control})
+      Phoenix.PubSub.broadcast(Cairn.PubSub, @topic, {:camera_control, camera_id, control})
+      {:reply, control, state}
+    end
   end
 
   def handle_call({:prune, known}, _from, state) do
-    for {camera_id, _} <- :ets.tab2list(@table), camera_id not in known do
-      :ets.delete(@table, camera_id)
-    end
+    dropped =
+      for {camera_id, _} <- :ets.tab2list(@table), camera_id not in known do
+        :ets.delete(@table, camera_id)
+        camera_id
+      end
 
-    {:reply, :ok, state}
+    {:reply, :ok, %{state | tombstoned: MapSet.union(state.tombstoned, MapSet.new(dropped))}}
+  end
+
+  def handle_call({:tombstone, camera_id}, _from, state) do
+    :ets.delete(@table, camera_id)
+    {:reply, :ok, %{state | tombstoned: MapSet.put(state.tombstoned, camera_id)}}
+  end
+
+  def handle_call({:revive, camera_id}, _from, state) do
+    {:reply, :ok, %{state | tombstoned: MapSet.delete(state.tombstoned, camera_id)}}
   end
 end

@@ -59,6 +59,10 @@ defmodule Cairn.Cameras do
   `"id"`, `"enabled"` (default true), `"settings"` (a YAML-camera-shaped map,
   normalized through `canonical/1`) and `"zones"` — string- or atom-keyed.
   """
+  # The revive is the create's `after_apply` for the same reason `delete/1`'s
+  # prune is its own: it has to run inside the config server, ordered against
+  # the delete that tombstoned this id, and not whenever this caller happens
+  # to get around to it.
   @spec create(map()) :: write_result()
   def create(attrs) do
     attrs = stringify_shallow(attrs)
@@ -79,7 +83,10 @@ defmodule Cairn.Cameras do
       with {:ok, _row} <- Repo.insert(changeset), do: :ok
     end
 
-    Config.Server.update(server(), write, reject_skipped: id)
+    Config.Server.update(server(), write,
+      reject_skipped: id,
+      after_apply: fn _diff -> CameraControl.revive(id) end
+    )
   end
 
   @doc """
@@ -216,6 +223,7 @@ defmodule Cairn.Cameras do
     [
       {"camera status", fn -> CameraStatus.prune(remaining) end},
       {"camera control", fn -> CameraControl.prune(remaining) end},
+      {"camera control tombstone", fn -> CameraControl.tombstone(id) end},
       {"presence checkpoint", fn -> PresenceCheckpoint.delete(id) end},
       {"event checkpoint", fn -> EventCheckpoint.delete(id) end}
     ]

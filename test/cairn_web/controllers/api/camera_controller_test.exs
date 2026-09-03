@@ -110,4 +110,21 @@ defmodule CairnWeb.Api.CameraControllerTest do
            |> post("/api/cameras/nope/control", %{detection_enabled: false})
            |> json_response(404)
   end
+
+  # The camera is still in the config the endpoint checks — a delete that
+  # pruned between that check and the write is what a tombstone stands for.
+  test "control 404s a camera deleted between the config check and the write", %{conn: conn} do
+    # LIFO: this runs before the setup's reset, which the tombstone would
+    # otherwise refuse.
+    on_exit(fn -> CameraControl.revive("cam_a") end)
+    CameraControl.set("cam_a", %{detection_enabled: false})
+    CameraControl.prune(CameraControl.all() |> Map.keys() |> List.delete("cam_a"))
+
+    body =
+      conn
+      |> post("/api/cameras/cam_a/control", %{detection_enabled: false})
+      |> json_response(404)
+
+    assert body["error"] == "unknown camera"
+  end
 end

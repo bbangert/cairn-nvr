@@ -336,6 +336,30 @@ defmodule Cairn.CamerasTest do
       assert EventCheckpoint.get("cam1") == nil
     end
 
+    # The window a tombstone closes: the HA control endpoint checks the config
+    # and then writes, and a delete can commit and prune between the two.
+    test "a control write for a deleted camera is refused until the id is re-created" do
+      # The control table is a shared singleton the DB sandbox does not roll
+      # back; leave "cam1" as the next test expects to find it.
+      on_exit(fn -> CameraControl.set("cam1", %{detection_enabled: true}) end)
+
+      assert {:ok, _diff, []} =
+               Cameras.create(%{"id" => "cam1", "settings" => %{"rtsp_url" => "rtsp://h/1"}})
+
+      # The overlay the delete's prune drops, and with it the tombstone: an
+      # id with nothing in the table is nothing for `prune/1` to name.
+      CameraControl.set("cam1", %{detection_enabled: false})
+
+      assert {:ok, _diff, []} = Cameras.delete("cam1")
+
+      assert CameraControl.set("cam1", %{detection_enabled: false}) == {:error, :removed}
+
+      assert {:ok, _diff, []} =
+               Cameras.create(%{"id" => "cam1", "settings" => %{"rtsp_url" => "rtsp://h/1"}})
+
+      assert %{detection_enabled: false} = CameraControl.set("cam1", %{detection_enabled: false})
+    end
+
     # A restarting owner exits the call `prune_runtime/1` makes into it; that
     # must not abandon the steps after it while the row delete has already
     # committed. `Cairn.CameraStatus` is a running singleton and not

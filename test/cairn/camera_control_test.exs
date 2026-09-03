@@ -59,4 +59,34 @@ defmodule Cairn.CameraControlTest do
     refute Map.has_key?(control, :bogus)
     assert control.detection_enabled == false
   end
+
+  test "a pruned camera's writes are refused until revive" do
+    id = "cc_gone_#{System.unique_integer([:positive])}"
+    CameraControl.set(id, %{detection_enabled: false})
+
+    # Keep every other suite's rows: a bare `prune([])` would tombstone the
+    # whole shared table, and a tombstone outlives this test.
+    CameraControl.prune(CameraControl.all() |> Map.keys() |> List.delete(id))
+
+    assert CameraControl.set(id, %{detection_enabled: false}) == {:error, :removed}
+    assert CameraControl.get(id).detection_enabled == true
+
+    assert CameraControl.revive(id) == :ok
+    assert %{detection_enabled: false} = CameraControl.set(id, %{detection_enabled: false})
+  end
+
+  test "revive is a no-op for an id that was never pruned" do
+    id = "cc_#{System.unique_integer([:positive])}"
+    assert CameraControl.revive(id) == :ok
+    assert %{min_score: 0.4} = CameraControl.set(id, %{min_score: 0.4})
+  end
+
+  test "tombstone/1 refuses writes for an id that never held a row" do
+    id = "tomb_#{System.unique_integer([:positive])}"
+    assert :ok = CameraControl.tombstone(id)
+    assert {:error, :removed} = CameraControl.set(id, %{detect: false})
+    assert :ok = CameraControl.revive(id)
+    assert %{} = CameraControl.set(id, %{detect: false})
+    CameraControl.prune([])
+  end
 end

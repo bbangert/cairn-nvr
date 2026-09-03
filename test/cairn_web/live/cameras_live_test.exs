@@ -926,6 +926,62 @@ defmodule CairnWeb.CamerasLiveTest do
       refute html =~ "nothing changed"
     end
 
+    # The same exit, seen from the Save button: the write may still land, so a
+    # retry must wait for `{:config_changed, _}` — which is also what re-reads
+    # the row, so the retry starts from what actually landed.
+    test "an unconfirmed save keeps Save disabled until a config change confirms it",
+         %{conn: conn, server: server} do
+      create!("cam1")
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      # A server that dies under the write, rather than a pid already dead:
+      # the env goes back to the live server before the page's own re-read
+      # runs, so this asserts on the rendered form and not the busy card the
+      # unreadable server would put over it.
+      test_pid = self()
+
+      breaker =
+        spawn(fn ->
+          receive do
+            _call ->
+              send(test_pid, :write_reached)
+              receive do: (:go -> exit(:boom))
+          end
+        end)
+
+      Application.put_env(:cairn, :config_server, breaker)
+
+      # Submitted unchanged on purpose: the form stays pristine, so the
+      # re-read below is the `reinit_form/2` path and not the stale notice a
+      # dirty form gets instead.
+      view
+      |> form("#camera-form", camera: %{"rtsp_url" => "rtsp://h/1"})
+      |> render_submit()
+
+      assert_receive :write_reached, 2_000
+      Application.put_env(:cairn, :config_server, server)
+      send(breaker, :go)
+
+      render_async(view)
+      assert has_element?(view, "#camera-save[disabled]")
+
+      # The apply landed after all, and the row now holds a URL neither this
+      # form nor its timed-out write had.
+      {:ok, _diff, _warnings} =
+        Cameras.update("cam1", %{"settings" => %{"rtsp_url" => "rtsp://h/3"}})
+
+      Phoenix.PubSub.broadcast(
+        Cairn.PubSub,
+        Config.topic(),
+        {:config_changed, %{added: [], removed: [], changed: ["cam1"], refreshed: []}}
+      )
+
+      html = render(view)
+      refute has_element?(view, "#camera-save[disabled]")
+      assert html =~ "rtsp://h/3"
+    end
+
     # The row is already gone when the write runs, so `update/2` and
     # `delete/1` answer `:not_found` — an error card would offer a retry that
     # cannot succeed. `Repo.delete!` on purpose: it broadcasts nothing, so
