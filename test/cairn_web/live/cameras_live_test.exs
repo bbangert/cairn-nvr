@@ -57,14 +57,6 @@ defmodule CairnWeb.CamerasLiveTest do
       Cameras.create(Map.merge(%{"id" => id, "settings" => settings}, attrs))
   end
 
-  defp wait_until(fun, attempts \\ 50) do
-    cond do
-      fun.() -> :ok
-      attempts == 0 -> flunk("condition never became true")
-      true -> Process.sleep(20) && wait_until(fun, attempts - 1)
-    end
-  end
-
   test "lists rows with their loaded state, zones and links", %{conn: conn} do
     create!("cam1", %{"rtsp_url" => "rtsp://h/1"}, %{
       "zones" => [
@@ -176,9 +168,13 @@ defmodule CairnWeb.CamerasLiveTest do
   test "a config change from another session brings the new row in", %{conn: conn} do
     {:ok, view, _html} = live(conn, "/cameras")
 
+    # The broadcast reaches this process and the view in one send each; the
+    # render call queues behind the view's copy, so no polling is needed.
+    Cairn.Config.Server.subscribe()
     create!("cam2")
+    assert_receive {:config_changed, %{added: ["cam2"]}}
 
-    wait_until(fn -> render(view) =~ ~s(id="camera-row-cam2") end)
+    assert render(view) =~ ~s(id="camera-row-cam2")
   end
 
   test "a failed load banners its errors and the rows read unloaded", %{conn: conn} = ctx do
@@ -285,6 +281,18 @@ defmodule CairnWeb.CamerasLiveTest do
 
       assert html =~ ~s(id="camera-form-errors")
       assert html =~ "camera cam2: rtsp_url is required"
+    end
+
+    test "a blank id is refused under the field before any write", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/cameras/new?tab=manual")
+
+      html =
+        render_change(view, "validate", %{"camera" => %{"id" => "", "rtsp_url" => "rtsp://h/x"}})
+
+      assert html =~ "id is required"
+
+      render_submit(view, "save", %{"camera" => %{"id" => "", "rtsp_url" => "rtsp://h/x"}})
+      assert Cairn.Cameras.list() == []
     end
 
     test "a duplicate id is refused under the field with no credential on the page",

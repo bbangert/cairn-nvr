@@ -285,15 +285,25 @@ defmodule CairnWeb.CamerasLive do
         dirty: dirty(socket.assigns.initial_params, params)
       )
 
-    if taken_id?(socket) do
-      refuse(socket, ["id has already been taken"])
-    else
-      case CameraForm.to_settings(params, socket.assigns.saved) do
-        {:ok, settings} -> socket |> assign(candidate: settings) |> candidate(settings)
-        {:error, errors} -> refuse(socket, errors)
-      end
+    cond do
+      blank_id?(socket) -> refuse(socket, ["id is required"])
+      taken_id?(socket) -> refuse(socket, ["id has already been taken"])
+      true -> candidate_for(socket, params)
     end
   end
+
+  defp candidate_for(socket, params) do
+    case CameraForm.to_settings(params, socket.assigns.saved) do
+      {:ok, settings} -> socket |> assign(candidate: settings) |> candidate(settings)
+      {:error, errors} -> refuse(socket, errors)
+    end
+  end
+
+  # An id the parser would reject is a form error like any other, but a blank
+  # one never reaches the parser: the fleet validator names cameras by id, so
+  # the refusal has to come from here to land under the field.
+  defp blank_id?(%{assigns: %{mode: "new", camera_id: ""}}), do: true
+  defp blank_id?(_socket), do: false
 
   # A refused form has no candidate: the save reads that, so a `save` event
   # racing the debounced `validate` cannot write what validate just rejected.
