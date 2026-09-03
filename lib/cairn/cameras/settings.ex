@@ -339,10 +339,10 @@ defmodule Cairn.Cameras.Settings do
     |> Map.drop(@modelled_keys)
     |> put_url("rtsp_url", params, saved)
     |> put_substream(params, saved)
-    |> put_present("plugin", params)
-    |> put_present("ingest", params)
-    |> put_present("tracker", params)
-    |> put_present("motion_json", params)
+    |> put_present("plugin", params, saved)
+    |> put_present("ingest", params, saved)
+    |> put_present("tracker", params, saved)
+    |> put_present("motion_json", params, saved)
     |> put_transcode(params)
     |> put_args(params, saved)
     |> put_ints(ints)
@@ -361,10 +361,19 @@ defmodule Cairn.Cameras.Settings do
       else: acc
   end
 
-  defp put_present(acc, key, params) do
-    case trimmed(params, key) do
-      @blank -> acc
-      value -> Map.put(acc, key, value)
+  # A value byte-identical to what was saved rides through untrimmed, like
+  # `put_args/3` already does for argv: a padded `" yard "` plugin is only
+  # whitespace to the parser, but rewriting it to `"yard"` on a save nobody
+  # edited still diffs and restarts the camera (D-P5). Only text that
+  # actually changed gets trimmed.
+  defp put_present(acc, key, params, saved) do
+    raw = Map.get(params, key) || @blank
+    trimmed_value = String.trim(raw)
+
+    cond do
+      trimmed_value == @blank -> acc
+      is_binary(saved[key]) and raw == saved[key] -> Map.put(acc, key, raw)
+      true -> Map.put(acc, key, trimmed_value)
     end
   end
 
@@ -455,9 +464,25 @@ defmodule Cairn.Cameras.Settings do
       else: put_url(acc, "substream_url", params, saved)
   end
 
+  # A visible URL the form re-rendered verbatim (whitespace included — a
+  # saved `rtsp://h/main ` renders with its trailing space, since only a
+  # *credentialed* URL is blanked by `visible_url/1`) is not an edit: `typed`
+  # is trimmed for parsing convenience, but starting from the trimmed text
+  # here would rewrite the saved bytes on a save nobody touched (D-P5). Base
+  # on `saved[key]` instead whenever the raw submission matches what was
+  # rendered; `resolve_url/4` still runs on it so a typed credential still
+  # splices onto an otherwise-untouched URL, exactly as it does for a blank
+  # field.
   defp put_url(acc, key, params, saved) do
-    typed = trimmed(params, key)
-    base = if typed == @blank, do: saved[key], else: typed
+    raw = Map.get(params, key) || @blank
+    typed = String.trim(raw)
+
+    base =
+      cond do
+        is_binary(saved[key]) and raw == visible_url(saved[key]) -> saved[key]
+        typed != @blank -> typed
+        true -> saved[key]
+      end
 
     case base do
       url when is_binary(url) and url != @blank ->
@@ -930,11 +955,20 @@ defmodule Cairn.Cameras.Settings do
   # labels `a`, `b`, `a, b` and `b, c` splits uniquely as `a` + `b, c`, which
   # greedy misses by taking `a, b` and failing on the rest), so the reading
   # that gets routed has to be the one the search proved unique.
-  defp segmentation(@blank, _labels), do: {:ok, []}
+  defp segmentation(joined, labels), do: segmentation(joined, labels, nil)
 
-  defp segmentation(rest, labels) do
+  defp segmentation(@blank, _labels, _floor), do: {:ok, []}
+
+  # `floor` bars reusing a label and bars reading them out of order: the
+  # loader joins DISTINCT keys after `Enum.sort/1`, so the only readings
+  # worth searching are the ones that could have produced that join —
+  # strictly ascending, each label at most once. Without it, known labels
+  # `a` and `a, a` make `"a, a, a"` look ambiguous (also readable as `a` +
+  # `a` + `a`, or `a, a` + `a`) even though the loader's join can only ever
+  # have meant `a` + `a, a`.
+  defp segmentation(rest, labels, floor) do
     labels
-    |> Enum.filter(&String.starts_with?(rest, &1))
+    |> Enum.filter(&(String.starts_with?(rest, &1) and after_floor?(&1, floor)))
     # Halts on the second reading: routing needs only "exactly one" told apart
     # from "more than one", and stopping bounds the branching a message with
     # many similarly-shaped labels can cost.
@@ -946,13 +980,16 @@ defmodule Cairn.Cameras.Settings do
     end)
   end
 
+  defp after_floor?(_label, nil), do: true
+  defp after_floor?(label, floor), do: label > floor
+
   defp branch(rest, label, labels) do
     case String.replace_prefix(rest, label, @blank) do
       @blank ->
         {:ok, [label]}
 
       ", " <> more ->
-        with {:ok, tail} <- segmentation(more, labels), do: {:ok, [label | tail]}
+        with {:ok, tail} <- segmentation(more, labels, label), do: {:ok, [label | tail]}
 
       _other ->
         :error

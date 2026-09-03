@@ -761,6 +761,64 @@ defmodule Cairn.Cameras.SettingsTest do
       assert settings["rtsp_url"] == "rtsp://:pw@h/1"
     end
 
+    # A padded text field is only whitespace to the parser
+    # (`Config.Camera.parse_plugin/3` splits on whitespace), so a save nobody
+    # edited must not trim it — trimming would diff and restart the camera
+    # (D-P5).
+    test "a padded text field round-trips through an untouched edit" do
+      row = %Camera{
+        id: "gate",
+        settings: %{"rtsp_url" => "rtsp://h/1", "plugin" => " yard ", "tracker" => " cairn "},
+        zones: []
+      }
+
+      {:ok, settings} = row |> Settings.to_params() |> Settings.to_settings(row)
+
+      assert settings["plugin"] == " yard "
+      assert settings["tracker"] == " cairn "
+    end
+
+    test "an edited text field is still trimmed" do
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://h/1", "plugin" => " yard "}}
+
+      params = row |> Settings.to_params() |> Map.put("plugin", " porch ")
+      {:ok, settings} = Settings.to_settings(params, row)
+
+      assert settings["plugin"] == "porch"
+    end
+
+    # A main URL only needs to be non-empty, and a substream can start with
+    # `rtsp://` and still carry trailing whitespace — the loader accepts
+    # both — so a save nobody edited must not trim either one (D-P5).
+    test "a trailing-space main URL round-trips through an untouched edit" do
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://h/main "}, zones: []}
+
+      {:ok, settings} = row |> Settings.to_params() |> Settings.to_settings(row)
+
+      assert settings["rtsp_url"] == "rtsp://h/main "
+    end
+
+    test "a trailing-space substream URL round-trips through an untouched edit" do
+      row = %Camera{
+        id: "gate",
+        settings: %{"rtsp_url" => "rtsp://h/main", "substream_url" => "rtsp://h/sub "},
+        zones: []
+      }
+
+      {:ok, settings} = row |> Settings.to_params() |> Settings.to_settings(row)
+
+      assert settings["substream_url"] == "rtsp://h/sub "
+    end
+
+    test "an edited URL is still trimmed" do
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://h/main "}, zones: []}
+
+      params = row |> Settings.to_params() |> Map.put("rtsp_url", " rtsp://h/main2 ")
+      {:ok, settings} = Settings.to_settings(params, row)
+
+      assert settings["rtsp_url"] == "rtsp://h/main2"
+    end
+
     test "a saved key the form has no field for survives an edit" do
       row = %Camera{
         id: "gate",
@@ -1130,6 +1188,22 @@ defmodule Cairn.Cameras.SettingsTest do
 
       assert routed[{"a", "min_score"}] == [raw]
       assert routed[{"b, c", "min_score"}] == [raw]
+      assert unclaimed == []
+    end
+
+    # The loader joins DISTINCT keys after `Enum.sort/1`
+    # (`Config.Camera.label_rules/2`), so with known labels `a` and `a, a`,
+    # `"a, a, a"` can only have come from `a` + `a, a` — never a repeat or a
+    # reversed order. Routing must not read it as ambiguous with those
+    # invented segmentations.
+    test "a joined label list does not admit reusing or reordering a label" do
+      raw = "min_score values must be 0..1 (a, a, a)"
+      message = "camera cam1: #{raw}"
+
+      {routed, unclaimed} = Settings.field_errors([message], "cam1", ["a", "a, a"])
+
+      assert routed[{"a", "min_score"}] == [raw]
+      assert routed[{"a, a", "min_score"}] == [raw]
       assert unclaimed == []
     end
   end
