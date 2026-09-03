@@ -420,6 +420,21 @@ defmodule Cairn.StreamUrlTest do
     end
   end
 
+  describe "mask/1 with a credential pair after a query @" do
+    test "the pair is masked before the @ collapse can hide the query start" do
+      masked = StreamUrl.mask("http://h/p?user=admin@example.com&password=pw")
+      refute masked =~ "pw"
+      refute masked =~ "admin"
+      assert masked =~ "password=•••••"
+    end
+
+    test "a non-credential query @ still collapses, and the pair after it is masked" do
+      masked = StreamUrl.mask("http://h/p?x=me@h2&password=pw")
+      refute masked =~ "pw"
+      assert masked == "http://•••••@h2&password=•••••"
+    end
+  end
+
   describe "credential_key?/1" do
     test "names the vendor spellings, whatever their case" do
       assert StreamUrl.credential_key?("password")
