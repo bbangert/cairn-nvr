@@ -104,9 +104,14 @@ defmodule Cairn.ConfigSource do
     before = Enum.map(Cameras.list(), & &1.id)
 
     case Config.Server.update(Cameras.server(), fn -> replace_rows(path) end) do
-      {:ok, _diff, _warnings} = applied ->
+      {:ok, diff, _warnings} = applied ->
         remaining = Enum.map(Cameras.list(), & &1.id)
-        Enum.each(before -- remaining, &Cameras.prune_runtime/1)
+        # `before` is read outside the server's transaction, so a row another
+        # session added in between is missing from it; the applied diff names
+        # that one. Neither alone is the set: a disabled row is in no config
+        # and only `before` knows it (D-P8 keys prunes on the row, not the
+        # diff).
+        Enum.each(Enum.uniq(before ++ diff.removed) -- remaining, &Cameras.prune_runtime/1)
         applied
 
       rejected ->

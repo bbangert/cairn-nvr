@@ -142,6 +142,12 @@ defmodule CairnWeb.CameraFormTest do
       assert settings["substream_url"] == "rtsp://ops:new%20pass@cam.lan:554/sub"
     end
 
+    test "a param the form did not send reads as blank, not a crash" do
+      # A hand-sent or partial submit omits keys; `to_string(nil)` is "".
+      assert {:ok, settings} = CameraForm.to_settings(%{"rtsp_url" => "rtsp://h/1"}, nil)
+      assert settings == %{"rtsp_url" => "rtsp://h/1"}
+    end
+
     test "a URL carrying its credential in the query is never spliced" do
       main = "http://cam.lan/flv?stream=ch0&user=admin&password=old"
 
