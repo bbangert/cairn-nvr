@@ -939,7 +939,10 @@ overrides:
   `#zone-surface`; `#zone-overlay` stays its **sibling** with
   `pointer-events: none`; the surface's percent / `viewBox` geometry.
 - `phx-update="ignore"` on any element a hook owns (video, canvas,
-  `#zone-ghost`) and on nothing else.
+  `#zone-ghost`) and on nothing else — except the password input, which
+  carries no hook: it has no `value=` to restore (write-only, never the
+  saved credential), so a patch that re-rendered it would clear whatever the
+  operator had typed.
 - Hook names (`MsePlayer`, `WebrtcPlayer`, `TimelineSeek`, `TrackOverlay`,
   `CopyText`, `ZoneEditor`) and the `data-*` they read.
 - The six `data-status` values and the four badge words `added removed

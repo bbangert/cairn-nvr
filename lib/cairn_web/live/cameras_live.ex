@@ -136,9 +136,10 @@ defmodule CairnWeb.CamerasLive do
   # The password input is `phx-update="ignore"` and so keeps whatever was
   # typed into it through every patch; only a new id makes LiveView replace
   # the node. Bumping the generation here is what empties it — on a fresh
-  # form, on a successful save (`saved/2` re-initializes), and on a pristine
-  # refresh from another session's write — so a consumed password cannot ride
-  # along on the next, unrelated save.
+  # form, on a successful save (`saved/2` re-initializes), on a pristine
+  # refresh from another session's write, and on the confirmed end of this
+  # form's own unconfirmed save (`resolve_unconfirmed_save/1`, dirty or not)
+  # — so a consumed password cannot ride along on the next, unrelated save.
   defp reinit_form(socket, camera) do
     params = CameraForm.to_params(camera)
 
@@ -396,6 +397,35 @@ defmodule CairnWeb.CamerasLive do
     |> load()
   end
 
+  # The broadcast is read as the completion of *this* form's own timed-out
+  # write, not as an ordinary external change — so unlike `refresh_saved/1`
+  # it does not defer to a dirty form. On `:edit` the row is re-read and the
+  # form re-initialized from it unconditionally (typed values and all,
+  # `reinit_form/2` clears them and bumps `password_gen`); a row that is now
+  # gone takes the same exit as `refresh_row/2`'s. On `:new` there is no row
+  # to re-read from — `camera_id` is only ever what was typed — so a row now
+  # existing under it means the create landed and the page leaves for the
+  # list; otherwise the create did not land (this broadcast was some other
+  # change) and the typed form is left alone, Save re-enabled by the caller.
+  defp resolve_unconfirmed_save(%{assigns: %{mode: "edit"}} = socket) do
+    case Cameras.get(socket.assigns.camera_id) do
+      nil -> removed_elsewhere(socket)
+      camera -> reinit_form(socket, camera)
+    end
+  end
+
+  defp resolve_unconfirmed_save(%{assigns: %{mode: "new"}} = socket) do
+    case Cameras.get(socket.assigns.camera_id) do
+      nil ->
+        socket
+
+      _camera ->
+        socket
+        |> put_flash(:info, "added #{socket.assigns.camera_id}")
+        |> push_navigate(to: ~p"/cameras")
+    end
+  end
+
   defp probe_outcome(socket, {:ok, {:ok, probe}}), do: probe_result(socket, probe)
   defp probe_outcome(_socket, {:ok, {:error, reason}}), do: probe_error(reason)
   defp probe_outcome(_socket, {:exit, reason}), do: probe_error(reason)
@@ -423,13 +453,21 @@ defmodule CairnWeb.CamerasLive do
   # and both are a full re-read, so the order between them does not matter.
   #
   # This is also the only confirmed end of an unconfirmed save (see
-  # `unconfirmed/2`): clearing the flags here, *before* `refresh_saved/1`,
-  # is what lets that re-read the row — the form the operator retries from
-  # then holds what landed, not the params the timed-out write carried.
+  # `unconfirmed/2`) — `resolve_unconfirmed_save/1` is what does that, and it
+  # runs *before* `refresh_saved/1` and clears the flags only after: a dirty
+  # form's stale `saved` row and typed password must not survive to
+  # `refresh_saved/1`, which (for the ordinary external-change case this
+  # falls through to as well) keeps a dirty form's typed values on purpose.
+  # Without resolving first, a retry from this form could re-apply a
+  # password the timed-out write already consumed, or overwrite a row a
+  # newer write has since landed.
   def handle_info({:config_changed, _diff}, socket) do
     socket =
       if socket.assigns[:save_unconfirmed?],
-        do: assign(socket, saving?: false, save_unconfirmed?: false),
+        do:
+          socket
+          |> resolve_unconfirmed_save()
+          |> assign(saving?: false, save_unconfirmed?: false),
         else: socket
 
     {:noreply,

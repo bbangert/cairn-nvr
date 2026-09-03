@@ -521,6 +521,65 @@ defmodule Cairn.Config.ServerUpdateTest do
     assert Repo.get(Camera, "cam_a") == nil
   end
 
+  # `after_rollback:` alone is retried: it undoes a step the write closure
+  # took outside the transaction (a control tombstone), and nothing else
+  # undoes that marker before the next successful `update/3` happens to
+  # revive it. A `CameraControl` restart clears in well under the 500 ms
+  # retry delay, so a callback that only fails while its sibling is
+  # restarting is expected to recover within a handful of attempts.
+  test "an after_rollback that fails is retried until it succeeds", %{server: server} do
+    test_pid = self()
+    counter = start_supervised!({Agent, fn -> 0 end})
+
+    callback = fn ->
+      attempt = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
+
+      if attempt < 3 do
+        raise "transient failure ##{attempt}"
+      else
+        send(test_pid, {:rollback_recovered, attempt})
+      end
+    end
+
+    assert Config.Server.update(server, fn -> {:error, :boom} end, after_rollback: callback) ==
+             {:error, {:write, :boom}}
+
+    assert_receive {:rollback_recovered, 3}, 5_000
+    assert Agent.get(counter, & &1) == 3
+  end
+
+  # The bound (10 attempts, matching the server's own) so a callback that is
+  # simply broken — not racing a sibling's restart — stops retrying rather
+  # than filling the mailbox forever, and the server answers calls throughout
+  # and after.
+  test "an after_rollback that never succeeds stops retrying at the bound", %{server: server} do
+    test_pid = self()
+    counter = start_supervised!({Agent, fn -> 0 end})
+
+    callback = fn ->
+      attempt = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
+      send(test_pid, {:rollback_attempt, attempt})
+      raise "permanent failure ##{attempt}"
+    end
+
+    assert Config.Server.update(server, fn -> {:error, :boom} end, after_rollback: callback) ==
+             {:error, {:write, :boom}}
+
+    attempts =
+      for _ <- 1..10,
+          do:
+            (
+              assert_receive {:rollback_attempt, n}, 6_000
+              n
+            )
+
+    assert attempts == Enum.to_list(1..10)
+    refute_receive {:rollback_attempt, _}, 1_000
+
+    assert Agent.get(counter, & &1) == 10
+    assert %{} = Config.Server.get(server)
+  end
+
   # A committed delete owes its cleanup whatever the apply does: the row is
   # already gone, so a skipped `after_apply:` leaves runtime state no config
   # names behind.

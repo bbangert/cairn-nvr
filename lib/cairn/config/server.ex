@@ -355,20 +355,75 @@ defmodule Cairn.Config.Server do
   # caller's code running in this process, and a bug in it is not a reason for
   # the config server, and every camera it holds, to die over a save whose own
   # outcome is already decided.
+  #
+  # `after_rollback:` alone gets retried on failure (`retry_rollback/3` below):
+  # it is undoing a step the write closure took outside the transaction (a
+  # control tombstone ahead of the row delete it guards — see the moduledoc),
+  # and nothing else will undo that marker before the next successful
+  # `update/3` happens to revive it. `after_commit:` and `after_apply:` have no
+  # equivalent debt — their config is already installed, so there is nothing
+  # standing for a retry to clean up — and stay best-effort as before.
   defp run_zero_arity(_name, nil), do: :ok
 
+  defp run_zero_arity(:after_rollback = name, fun), do: retry_rollback(name, fun, 1)
+
   defp run_zero_arity(name, fun) do
+    case call_zero_arity(fun) do
+      :ok -> :ok
+      {:error, reason} -> log_zero_arity_error(name, reason, :error)
+    end
+  end
+
+  # Bound low enough that a `CameraControl` restart (supervisor-paced, not
+  # operator-paced) has cleared well before attempts run out.
+  @rollback_retry_delay_ms 500
+  @rollback_retry_max_attempts 10
+
+  defp retry_rollback(name, fun, attempt) do
+    case call_zero_arity(fun) do
+      :ok ->
+        :ok
+
+      {:error, reason} when attempt < @rollback_retry_max_attempts ->
+        log_zero_arity_error(name, reason, :warning)
+
+        Process.send_after(
+          self(),
+          {:retry_callback, name, fun, attempt + 1},
+          @rollback_retry_delay_ms
+        )
+
+        :ok
+
+      {:error, reason} ->
+        log_zero_arity_error(name, reason, :error)
+    end
+  end
+
+  @impl true
+  def handle_info({:retry_callback, name, fun, attempt}, state) do
+    retry_rollback(name, fun, attempt)
+    {:noreply, state}
+  end
+
+  defp call_zero_arity(fun) do
     fun.()
     :ok
   rescue
-    e -> Logger.error("config: #{name} raised: #{inspect(e.__struct__)}")
+    e -> {:error, {:raise, e.__struct__}}
   catch
-    kind, reason when is_atom(reason) ->
-      Logger.error("config: #{name} #{kind}: #{inspect(reason)}")
-
-    kind, _reason ->
-      Logger.error("config: #{name} #{kind}: non-atom exit")
+    kind, reason when is_atom(reason) -> {:error, {kind, reason}}
+    kind, _reason -> {:error, {kind, :non_atom_exit}}
   end
+
+  defp log_zero_arity_error(name, {:raise, struct}, level),
+    do: Logger.log(level, "config: #{name} raised: #{inspect(struct)}")
+
+  defp log_zero_arity_error(name, {kind, :non_atom_exit}, level),
+    do: Logger.log(level, "config: #{name} #{kind}: non-atom exit")
+
+  defp log_zero_arity_error(name, {kind, reason}, level) when is_atom(reason),
+    do: Logger.log(level, "config: #{name} #{kind}: #{inspect(reason)}")
 
   # The caller's cleanup is the caller's code running in this process, and it
   # runs after the config is already installed: a bug in it is not a reason

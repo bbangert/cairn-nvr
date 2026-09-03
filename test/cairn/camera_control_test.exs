@@ -118,12 +118,29 @@ defmodule Cairn.CameraControlTest do
   end
 
   # No sleep: the restart is a supervisor's business, not a timed one, so
-  # this spins on the registration itself until the new pid shows up.
-  defp wait_for_new_pid(old_pid) do
+  # this spins on the registration itself until the new pid shows up. Bounded
+  # so a supervisor that never restarts (a regression, not a slow one) fails
+  # the test instead of hanging the run. The yield between checks is a
+  # `receive after` rather than `Process.sleep/1`: a bare sleep still lets
+  # this process's mailbox pile up messages it never drains until the loop
+  # exits, where a `receive` drains anything that arrives during the wait.
+  defp wait_for_new_pid(old_pid, attempts \\ 200)
+
+  defp wait_for_new_pid(_old_pid, 0),
+    do: flunk("CameraControl did not re-register a new pid after the kill")
+
+  defp wait_for_new_pid(old_pid, attempts) do
     case Process.whereis(CameraControl) do
-      nil -> wait_for_new_pid(old_pid)
-      ^old_pid -> wait_for_new_pid(old_pid)
-      pid -> pid
+      pid when pid == nil or pid == old_pid ->
+        receive do
+        after
+          10 -> :ok
+        end
+
+        wait_for_new_pid(old_pid, attempts - 1)
+
+      pid ->
+        pid
     end
   end
 

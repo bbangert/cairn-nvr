@@ -1123,6 +1123,116 @@ defmodule CairnWeb.CamerasLiveTest do
       assert html =~ "rtsp://h/3"
     end
 
+    # Unlike the pristine case above, this form is dirty at the broadcast — a
+    # typed URL and a typed password neither the write's own re-read
+    # (`handle_async`) nor an ordinary external-change refresh (which keeps a
+    # dirty form's typed values on purpose) ever confirmed landing. Treating
+    # `save_unconfirmed?` as the completion of this submit regardless of
+    # `dirty` is what a retry needs: the landed row's values on screen, and
+    # neither the stale typed URL nor the consumed password able to ride
+    # along on a second submit.
+    test "an unconfirmed save from a dirty form re-initializes from the landed row",
+         %{conn: conn, server: server} do
+      create!("cam1")
+
+      {:ok, view, html} = live(conn, "/cameras/cam1/edit")
+      [before_id] = Regex.run(~r/id="(camera-password-\d+)"/, html, capture: :all_but_first)
+
+      test_pid = self()
+
+      breaker =
+        spawn(fn ->
+          receive do
+            _call ->
+              send(test_pid, :write_reached)
+              receive do: (:go -> exit(:boom))
+          end
+        end)
+
+      Application.put_env(:cairn, :config_server, breaker)
+
+      view
+      |> form("#camera-form",
+        camera: %{"rtsp_url" => "rtsp://h/typed", "password" => "typedpass"}
+      )
+      |> render_submit()
+
+      assert_receive :write_reached, 2_000
+      Application.put_env(:cairn, :config_server, server)
+      send(breaker, :go)
+
+      render_async(view)
+      assert has_element?(view, "#camera-save[disabled]")
+
+      # A different session's write landed while this one was unconfirmed.
+      {:ok, _diff, _warnings} =
+        Cameras.update("cam1", %{"settings" => %{"rtsp_url" => "rtsp://h/landed"}})
+
+      Phoenix.PubSub.broadcast(
+        Cairn.PubSub,
+        Config.topic(),
+        {:config_changed, %{added: [], removed: [], changed: ["cam1"], refreshed: []}}
+      )
+
+      html = render(view)
+      refute has_element?(view, "#camera-save[disabled]")
+      assert html =~ "rtsp://h/landed"
+      refute html =~ "rtsp://h/typed"
+
+      # The password input got a fresh id (a new node): the typed, now-stale
+      # credential cannot ride along on a retry.
+      [after_id] = Regex.run(~r/id="(camera-password-\d+)"/, html, capture: :all_but_first)
+      refute after_id == before_id
+    end
+
+    # On `:new` there is no row to re-read from before the write: `camera_id`
+    # is only ever what the operator typed, so the broadcast is read by
+    # asking whether that id now exists. It does here — the create landed —
+    # so the page leaves for the list exactly as a confirmed create would,
+    # instead of sitting on a typed form for a camera already added.
+    test "an unconfirmed create whose row exists at the broadcast redirects to the list",
+         %{conn: conn, server: server} do
+      {:ok, view, _html} = live(conn, "/cameras/new?tab=manual")
+
+      test_pid = self()
+
+      breaker =
+        spawn(fn ->
+          receive do
+            _call ->
+              send(test_pid, :write_reached)
+              receive do: (:go -> exit(:boom))
+          end
+        end)
+
+      Application.put_env(:cairn, :config_server, breaker)
+
+      view
+      |> form("#camera-form", camera: %{"id" => "cam_new", "rtsp_url" => "rtsp://h/1"})
+      |> render_submit()
+
+      assert_receive :write_reached, 2_000
+      Application.put_env(:cairn, :config_server, server)
+      send(breaker, :go)
+
+      render_async(view)
+      assert has_element?(view, "#camera-save[disabled]")
+
+      # A row under this id now exists — same as the edit case above, this
+      # stands in for "the write landed after all"; the page cannot tell that
+      # apart from a retried create having landed instead.
+      create!("cam_new")
+
+      Phoenix.PubSub.broadcast(
+        Cairn.PubSub,
+        Config.topic(),
+        {:config_changed, %{added: ["cam_new"], removed: [], changed: [], refreshed: []}}
+      )
+
+      assert flash = assert_redirect(view, "/cameras", 2_000)
+      assert flash["info"] == "added cam_new"
+    end
+
     # The row is already gone when the write runs, so `update/2` and
     # `delete/1` answer `:not_found` — an error card would offer a retry that
     # cannot succeed. `Repo.delete!` on purpose: it broadcasts nothing, so
