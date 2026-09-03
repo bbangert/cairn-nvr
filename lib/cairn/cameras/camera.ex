@@ -17,7 +17,9 @@ defmodule Cairn.Cameras.Camera do
   schema "cameras" do
     field :position, :integer
     field :enabled, :boolean, default: true
-    field :settings, :map, default: %{}
+    # `settings` holds `rtsp_url`, which can carry live userinfo — redact so
+    # neither the struct nor a changeset over it prints it via `inspect/1`.
+    field :settings, :map, default: %{}, redact: true
     field :zones, {:array, :map}, default: []
 
     timestamps(type: :utc_datetime_usec)

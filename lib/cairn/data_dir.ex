@@ -4,15 +4,75 @@ defmodule Cairn.DataDir do
   `events/`, `snapshots/`, `log/`. All mutable state lives under this root.
   """
 
+  require Logger
+
   @subdirs ~w(events snapshots log)
 
-  @doc "Creates the data dir and its subdirs. Raises on failure."
+  @doc """
+  Creates the data dir and its subdirs, raising when one cannot be created —
+  a boot the node has no business continuing. Tightening permissions is a
+  second, best-effort pass: the dir and its log dir go to 0700 and the DB
+  files to 0600, and a chmod the volume refuses (a restored backup under
+  another uid, a bind mount) is logged and left as is rather than made a
+  reason to crash-loop the boot.
+
+  `Cairn.Config.Server` calls this on every config apply, not only at boot,
+  so 0700 is enforced rather than merely established — a mode an operator
+  widens on the live volume does not survive the next apply.
+  """
   @spec ensure!(Path.t()) :: :ok
   def ensure!(data_dir) do
-    Enum.each([data_dir | Enum.map(@subdirs, &Path.join(data_dir, &1))], &File.mkdir_p!/1)
+    File.mkdir_p!(data_dir)
+    chmod(data_dir, 0o700)
+    Enum.each(Enum.map(@subdirs, &Path.join(data_dir, &1)), &File.mkdir_p!/1)
     # ffmpeg/plugin logs can echo credentialed URLs — keep them private
-    File.chmod(log_dir(data_dir), 0o700)
+    chmod(log_dir(data_dir), 0o700)
+    secure_db(data_dir)
     :ok
+  end
+
+  @doc """
+  Tightens `cairn.db` and its WAL/SHM siblings to 0600 wherever they already
+  exist — the DB holds camera rows with RTSP userinfo. Never creates a file;
+  a missing one is skipped, not an error. Never raises: a chmod an operator's
+  restored backup or volume permissions refuse (EPERM) is logged and left as
+  is, not a reason to crash-loop the boot.
+
+  Defence in depth, not the guarantee. SQLite recreates `-wal`/`-shm` under
+  the umask whenever the Repo restarts, and only the `ensure!/1` callers run
+  again by then. What keeps the DB private to this uid is the 0700 data dir
+  `ensure!/1` creates — on every Repo start (`Cairn.Repo.init/2`) and every
+  config apply — which makes the modes of the files inside it moot for other
+  users.
+  """
+  @spec secure_db(Path.t()) :: :ok
+  def secure_db(data_dir) do
+    db = db_path(data_dir)
+
+    for path <- [db, db <> "-wal", db <> "-shm"], File.exists?(path), do: chmod(path, 0o600)
+    :ok
+  end
+
+  # `error`, not `warning`: every path this runs on holds camera credentials —
+  # the DB, its parent dir, and the log dir whose ffmpeg lines echo RTSP URLs —
+  # so a refused chmod means one of them may be readable by other users on
+  # this volume. Still non-fatal — a boot that dies on a bind mount
+  # the operator chose, for a permission nothing inside the container can
+  # fix, takes the whole NVR down over a single chmod.
+  defp chmod(path, mode) do
+    case File.chmod(path, mode) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "could not chmod #{path} to #{Integer.to_string(mode, 8)}: #{:file.format_error(reason)} — " <>
+            "camera data (the database, clips, snapshots, or the ffmpeg logs) may be readable by " <>
+            "other users on this volume"
+        )
+
+        :ok
+    end
   end
 
   @spec events_dir(Path.t(), String.t()) :: Path.t()

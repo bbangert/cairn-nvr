@@ -109,6 +109,14 @@ defmodule Cairn.CamerasTest do
                %{"min_score" => %{"person" => 1.0, "car" => 0.5}}
     end
 
+    # `parse_min_score/3` merges what it is given over the default block, so
+    # an empty map reads exactly as the absent key — and a row that stored one
+    # would diff as an edit the first time the form saved it.
+    test "drops an empty min_score map" do
+      assert Cameras.canonical(%{"rtsp_url" => "rtsp://h/1", "min_score" => %{}}) ==
+               %{"rtsp_url" => "rtsp://h/1"}
+    end
+
     test "coerces track/record tier numbers and drops an empty tier" do
       assert Cameras.canonical(%{"track" => %{"person" => 1}, "record" => %{}}) ==
                %{"track" => %{"person" => %{"min_score" => 1.0}}}
@@ -130,6 +138,33 @@ defmodule Cairn.CamerasTest do
 
     test "keeps an undecodable motion_json verbatim" do
       assert Cameras.canonical(%{"motion_json" => "not json"}) == %{"motion_json" => "not json"}
+    end
+
+    # The form has no field that writes any of them, so a row that spelled a
+    # default out would read as an edit the first time it was saved.
+    test "drops values the parser reads exactly as it reads the absent key" do
+      assert Cameras.canonical(%{
+               "rtsp_url" => "rtsp://h/1",
+               "transcode" => false,
+               "extra_ffmpeg_args" => [],
+               "pipeline" => "membrane"
+             }) == %{"rtsp_url" => "rtsp://h/1"}
+    end
+
+    # `parse/3` reads `transcode` as `… == true`, so a string or a number is
+    # the default just as `false` is — dropping only `false` would leave a
+    # hand-edited `"false"` diffing on every untouched save.
+    test "drops every transcode the parser does not read as true" do
+      for value <- [false, "false", "no", 0, %{}] do
+        assert Cameras.canonical(%{"transcode" => value}) == %{}
+      end
+    end
+
+    test "keeps a transcode and a pipeline the parser does not read as absent" do
+      assert Cameras.canonical(%{"transcode" => true}) == %{"transcode" => true}
+      # `check_pipeline/3` refuses this one by name on the next load; repairing
+      # it here would hide the key the operator has to delete.
+      assert Cameras.canonical(%{"pipeline" => "classic"}) == %{"pipeline" => "classic"}
     end
 
     test "keeps retention days/per_label, drops nil per-label entries and an empty block" do

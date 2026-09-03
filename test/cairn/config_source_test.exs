@@ -629,6 +629,58 @@ defmodule Cairn.ConfigSourceTest do
       # The unguarded string would raise inside `Enum.max` here.
       assert is_integer(Retention.run_prune(config))
     end
+
+    test "a dormant row's out-of-range days falls back to the global, not the parser's bound",
+         %{dir: dir} do
+      path = write_yaml!(dir, globals(dir))
+      mark_imported!(path)
+
+      insert_camera!("cam_a", 0, %{"rtsp_url" => "rtsp://h/1", "retention" => %{"days" => 0}},
+        enabled: false
+      )
+
+      assert {:ok, config, _warnings, %{}} = ConfigSource.load(path)
+      assert [%Config.Camera{id: "cam_a", retention_days: nil}] = config.dormant
+    end
+
+    test "a dormant row's out-of-range per_label value is dropped, a valid sibling survives",
+         %{dir: dir} do
+      path = write_yaml!(dir, globals(dir))
+      mark_imported!(path)
+
+      insert_camera!(
+        "cam_a",
+        0,
+        %{
+          "rtsp_url" => "rtsp://h/1",
+          "retention" => %{"per_label" => %{"person" => -1, "car" => 30}}
+        },
+        enabled: false
+      )
+
+      assert {:ok, config, _warnings, %{}} = ConfigSource.load(path)
+      assert [%Config.Camera{id: "cam_a", retention_per_label: %{"car" => 30}}] = config.dormant
+    end
+
+    test "a dormant row's out-of-range days sweeps on the global clock, not immediately",
+         %{dir: dir} do
+      path = write_yaml!(dir, globals(dir))
+      mark_imported!(path)
+
+      insert_camera!("cam_a", 0, %{"rtsp_url" => "rtsp://h/1", "retention" => %{"days" => 0}},
+        enabled: false
+      )
+
+      config = elem(ConfigSource.load(path), 1)
+
+      # global retention_days is 7 (see `globals/2`): a 3-day-old event
+      # survives on that clock but would be swept at once if the guard fell
+      # through and `days: 0` reached the sweep unbounded.
+      kept = seed_event(dir, "cam_a", 3)
+
+      assert is_integer(Retention.run_prune(config))
+      assert Events.get(kept.id)
+    end
   end
 
   defp private_server(path) do
@@ -662,5 +714,95 @@ defmodule Cairn.ConfigSourceTest do
     {:ok, _row} = Events.create_active(event, path)
     {:ok, row} = Events.finalize(%{event | ended_at: started, status: :finalized}, 4)
     row
+  end
+
+  describe "describe_import_error/1" do
+    # The rescue clause this backs (`load/1`'s `Ecto.InvalidChangesetError` /
+    # `Ecto.ConstraintError` arm) is not reachable through `load/1` with
+    # today's data: it validates the whole YAML with `Config.from_map/1` —
+    # using the same id regex, the same required fields — before it ever
+    # calls `Repo.insert!`, so nothing that would fail `Camera.changeset/2`
+    # gets past `from_map/1` first. A concurrent double-import racing the
+    # same id past that check would reach it, but that is not a
+    # deterministic scenario to provoke in a test. `describe_import_error/1`
+    # is `@doc false` rather than private for exactly this: it is exercised
+    # directly, against constructed exceptions, rather than through the
+    # rescue.
+    test "an invalid-changeset error never carries the changeset's own credentialed values" do
+      changeset =
+        %Camera{}
+        |> Camera.changeset(%{
+          id: "bad id",
+          position: 0,
+          settings: %{"rtsp_url" => "rtsp://u:SECRET@h/1"}
+        })
+
+      message =
+        ConfigSource.describe_import_error(%Ecto.InvalidChangesetError{changeset: changeset})
+
+      refute message =~ "SECRET"
+      assert message =~ "id"
+    end
+
+    # A cast error's `type` is the Ecto type itself, and a composite one is a
+    # tuple with no `String.Chars`. Converting every option whether or not the
+    # message interpolates it raised here — from inside the rescue whose job
+    # is to turn the import failure into text.
+    test "an error option with no String.Chars does not take the description down" do
+      changeset =
+        %Camera{}
+        |> Camera.changeset(%{id: "gate", position: 0, settings: %{}})
+        |> Ecto.Changeset.add_error(:settings, "is invalid",
+          type: {:array, :string},
+          validation: :cast
+        )
+
+      message =
+        ConfigSource.describe_import_error(%Ecto.InvalidChangesetError{changeset: changeset})
+
+      assert message == "settings is invalid"
+    end
+
+    test "a placeholder present in the message is still interpolated" do
+      changeset =
+        %Camera{}
+        |> Camera.changeset(%{id: "gate", position: 0, settings: %{}})
+        |> Ecto.Changeset.add_error(:id, "should be at most %{count} character(s)",
+          count: 3,
+          type: {:array, :string}
+        )
+
+      message =
+        ConfigSource.describe_import_error(%Ecto.InvalidChangesetError{changeset: changeset})
+
+      assert message == "id should be at most 3 character(s)"
+    end
+
+    test "a constraint error names only the constraint" do
+      message =
+        ConfigSource.describe_import_error(%Ecto.ConstraintError{
+          constraint: "cameras_id_index",
+          type: :unique,
+          message: "rtsp://u:SECRET@h/1 violates unique constraint"
+        })
+
+      refute message =~ "SECRET"
+      assert message == "constraint cameras_id_index failed"
+    end
+  end
+
+  describe "log_db_error/2" do
+    test "keeps the statement out of both the returned message and the log" do
+      error = %Exqlite.Error{message: "UNIQUE constraint failed", statement: "INSERT ... SECRET"}
+
+      {message, log} =
+        ExUnit.CaptureLog.with_log(fn -> ConfigSource.log_db_error(error, []) end)
+
+      assert message == "cameras: database access failed"
+      refute message =~ "SECRET"
+      refute log =~ "SECRET"
+      assert log =~ "Exqlite.Error"
+      assert log =~ "UNIQUE constraint failed"
+    end
   end
 end

@@ -287,8 +287,12 @@ defmodule Cairn.Config do
       pre_window_seconds: get_in(map, ["events", "pre_window_seconds"]) || 5,
       post_window_seconds: get_in(map, ["events", "post_window_seconds"]) || 10,
       max_event_seconds: get_in(map, ["events", "max_event_seconds"]) || 300,
-      retention_days: get_in(map, ["retention", "days"]) || 14,
-      retention_per_label: get_in(map, ["retention", "per_label"]) || %{},
+      # `nil` alone takes the default: a `false` must reach `validate_numbers/2`
+      # as what it is, not as fourteen days.
+      retention_days: default_nil(get_in(map, ["retention", "days"]), 14),
+      # `nil` alone reads as "none": a `false` or a scalar must reach
+      # `validate_retention_per_label/3` as what it is, not as an empty map.
+      retention_per_label: per_label_or_empty(get_in(map, ["retention", "per_label"])),
       retention_tracks_days: configured_retention_tracks_days(map),
       max_unseen_ms: configured_max_unseen_ms(map),
       max_live_tracks: configured_max_live_tracks(map),
@@ -397,7 +401,10 @@ defmodule Cairn.Config do
   # did the system see and not record?" answerable only for the labels someone
   # already thought to keep, which is the question backwards.
   defp configured_retention_tracks_days(map),
-    do: get_in(map, ["retention", "tracks_days"]) || @default_retention_tracks_days
+    do: default_nil(get_in(map, ["retention", "tracks_days"]), @default_retention_tracks_days)
+
+  defp default_nil(nil, default), do: default
+  defp default_nil(value, _default), do: value
 
   @doc """
   A camera's annotation offset in milliseconds, signed, `0` when it has none
@@ -1723,15 +1730,51 @@ defmodule Cairn.Config do
   end
 
   defp validate_numbers(acc, config) do
+    # The camera-level override and the per-label values are bounded by the
+    # same range inside `Camera.parse/3`, which is where a form candidate is
+    # checked too; read from there so the two cannot drift apart. Runtime
+    # call, like `Camera.id_class/0`, to keep no compile-time edge onto it.
+    days = Camera.retention_days_range()
+
     acc
     |> check(int?(config.stall_seconds, 1, 3600), "stall_seconds must be 1..3600")
     |> check(int?(config.free_space_min_mb, 0, 10_000_000), "free_space_min_mb must be >= 0")
-    |> check(int?(config.retention_days, 1, 10_000), "retention.days must be >= 1")
-    |> check(int?(config.retention_tracks_days, 1, 10_000), "retention.tracks_days must be >= 1")
+    |> check(
+      int?(config.retention_days, days.first, days.last),
+      "retention.days must be >= #{days.first} and <= #{days.last}"
+    )
+    |> check(
+      int?(config.retention_tracks_days, days.first, days.last),
+      "retention.tracks_days must be >= #{days.first} and <= #{days.last}"
+    )
     |> check(is_binary(config.data_dir), "data_dir must be a string")
+    |> validate_retention_per_label(config.retention_per_label, days)
   end
 
   defp int?(v, min, max), do: is_integer(v) and v >= min and v <= max
+
+  defp per_label_or_empty(nil), do: %{}
+  defp per_label_or_empty(value), do: value
+
+  # Global `retention.per_label` bypassed this range: `from_map/2` copies it
+  # verbatim, so an out-of-range value (0, negative) read past validation and
+  # into `Cairn.Retention` as an "already expired" clip lifetime, and a
+  # non-map value raised in `Map.values/1` there instead of failing at load.
+  # Bounded on the same range as `retention.days` (`Camera.retention_days_range/0`)
+  # for the reason `validate_numbers/2`'s comment gives for the camera side:
+  # one range, read from one place, so the two cannot drift apart.
+  defp validate_retention_per_label(acc, per_label, days) when is_map(per_label) do
+    Enum.reduce(per_label, acc, fn {label, value}, acc ->
+      check(
+        acc,
+        int?(value, days.first, days.last),
+        "retention.per_label.#{label} must be >= #{days.first} and <= #{days.last}"
+      )
+    end)
+  end
+
+  defp validate_retention_per_label(acc, _not_map, _days),
+    do: add_error(acc, "retention.per_label must be a mapping")
 
   # -- accumulator helpers ----------------------------------------------------
 

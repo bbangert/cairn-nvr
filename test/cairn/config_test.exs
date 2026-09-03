@@ -16,6 +16,12 @@ defmodule Cairn.ConfigTest do
     }
   end
 
+  defp camera_retention_map(retention) do
+    Map.put(base_map(), "cameras", [
+      %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1", "retention" => retention}
+    ])
+  end
+
   describe "load/1" do
     test "loads the valid fixture" do
       assert {:ok, %Config{} = config, warnings} = Config.load(@valid_fixture)
@@ -406,6 +412,75 @@ defmodule Cairn.ConfigTest do
         assert {:error, errors} = Config.from_map(map)
         assert Enum.any?(errors, &(&1 =~ "retention.tracks_days must be >= 1"))
       end
+    end
+
+    test "the global retention.per_label value is bounded like retention.days" do
+      for value <- [0, -1, 10_001, "7"] do
+        map = Map.put(base_map(), "retention", %{"per_label" => %{"person" => value}})
+
+        assert {:error, errors} = Config.from_map(map)
+        assert Enum.any?(errors, &(&1 =~ "retention.per_label.person must be >= 1"))
+      end
+
+      map = Map.put(base_map(), "retention", %{"per_label" => %{"person" => 30}})
+      assert {:ok, config, []} = Config.from_map(map)
+      assert config.retention_per_label == %{"person" => 30}
+    end
+
+    test "a false global retention.days or tracks_days is an error, not the default" do
+      for key <- ["days", "tracks_days"] do
+        map = Map.put(base_map(), "retention", %{key => false})
+        assert {:error, errors} = Config.from_map(map)
+        assert Enum.any?(errors, &(&1 =~ "retention.#{key} must be >= 1"))
+      end
+    end
+
+    test "a non-map global retention.per_label is an error, not a crash" do
+      for value <- ["30 days", false, 30] do
+        map = Map.put(base_map(), "retention", %{"per_label" => value})
+
+        assert {:error, errors} = Config.from_map(map)
+        assert "retention.per_label must be a mapping" in errors
+      end
+    end
+
+    # The camera block goes through `Cairn.Config.Camera`, the parser a form
+    # candidate also goes through, so the file and the form agree on it.
+    test "a camera's retention.days is bounded like the global one" do
+      for value <- [0, -1, 10_001, "7", 1.5] do
+        assert {:error, errors} = Config.from_map(camera_retention_map(%{"days" => value}))
+
+        assert Enum.any?(errors, &(&1 =~ "camera cam_a: retention.days must be >= 1"))
+      end
+
+      assert {:ok, config, []} = Config.from_map(camera_retention_map(%{"days" => 3}))
+      assert [%Config.Camera{retention_days: 3}] = config.cameras
+    end
+
+    test "a camera's per-label retention value is bounded the same way" do
+      for value <- [0, -1, 10_001, "7", 1.5] do
+        map = camera_retention_map(%{"per_label" => %{"person" => value}})
+
+        assert {:error, errors} = Config.from_map(map)
+
+        assert Enum.any?(
+                 errors,
+                 &(&1 =~ "camera cam_a: retention.per_label (person) must be >= 1")
+               )
+      end
+
+      map = camera_retention_map(%{"per_label" => %{"person" => 30}})
+      assert {:ok, config, []} = Config.from_map(map)
+      assert [%Config.Camera{retention_per_label: %{"person" => 30}}] = config.cameras
+    end
+
+    test "a camera's retention block that is not a mapping is the camera's error" do
+      assert {:error, errors} = Config.from_map(camera_retention_map("30 days"))
+      assert "camera cam_a: retention must be a mapping" in errors
+
+      map = camera_retention_map(%{"per_label" => 30})
+      assert {:error, errors} = Config.from_map(map)
+      assert "camera cam_a: retention.per_label must be a mapping" in errors
     end
 
     test "an unknown retention key is still only a warning" do

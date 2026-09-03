@@ -43,10 +43,61 @@ defmodule Cairn.ConfigSource do
     # installs whatever fallback comes back here. The map is re-read because
     # the fault may have come from anywhere below.
     e in [Exqlite.Error, DBConnection.ConnectionError] ->
-      degrade(path, "cameras: database read failed: " <> Exception.message(e))
+      degrade(path, log_db_error(e, __STACKTRACE__))
 
     e in [Ecto.InvalidChangesetError, Ecto.ConstraintError] ->
-      degrade(path, "cameras: import failed: " <> Exception.message(e))
+      degrade(path, "cameras: import failed: " <> describe_import_error(e))
+  end
+
+  # `Exqlite.Error` carries the failing `statement`, which holds the values
+  # just spliced into `settings` — an RTSP password among them — and both
+  # `Exception.message/1` and `Exception.format/3` render it. So neither is
+  # used on the way to the log either: the line is assembled from the module
+  # and the driver's own message, with the statement left out on purpose, and
+  # the surfaced text stays generic. `@doc false` rather than private so a
+  # test can drive it directly, the same reason `describe_import_error/1` is.
+  @doc false
+  @spec log_db_error(Exception.t(), Exception.stacktrace()) :: String.t()
+  def log_db_error(%module{} = e, stacktrace) do
+    Logger.error(
+      "cameras: database access failed: #{inspect(module)}: #{inspect(Map.get(e, :message))}\n" <>
+        Exception.format_stacktrace(stacktrace)
+    )
+
+    "cameras: database access failed"
+  end
+
+  # `Exception.message/1` on these two interpolates the changeset — including
+  # `changes.settings`, which can hold a password just spliced in by an
+  # import — into whatever this reaches (a log line, `/config`'s health
+  # card). Only the field-error messages (changeset) or the constraint name
+  # (constraint) are safe to surface. `@doc false` rather than private only
+  # so a test can drive it directly with a constructed exception; nothing
+  # outside this module calls it.
+  @doc false
+  @spec describe_import_error(Exception.t()) :: String.t()
+  def describe_import_error(%Ecto.InvalidChangesetError{changeset: changeset}) do
+    changeset
+    |> Ecto.Changeset.traverse_errors(&interpolate/1)
+    |> Enum.map_join("; ", fn {field, msgs} -> "#{field} #{Enum.join(msgs, ", ")}" end)
+  end
+
+  def describe_import_error(%Ecto.ConstraintError{constraint: name}),
+    do: "constraint #{name} failed"
+
+  # Converted only on a hit, and through `inspect/1` for anything not
+  # `String.Chars`: a cast error carries metadata like `type: {:array,
+  # :string}` that no message interpolates, and converting every option
+  # eagerly raised here — inside the rescue whose whole job is to turn an
+  # import failure into text.
+  defp interpolate({msg, opts}) do
+    Enum.reduce(opts, msg, fn {key, value}, acc ->
+      String.replace(acc, "%{#{key}}", fn _match -> printable(value) end)
+    end)
+  end
+
+  defp printable(value) do
+    if String.Chars.impl_for(value), do: to_string(value), else: inspect(value)
   end
 
   defp degrade(path, message) do
@@ -210,22 +261,33 @@ defmodule Cairn.ConfigSource do
   defp sort_keys(list) when is_list(list), do: Enum.map(list, &sort_keys/1)
   defp sort_keys(other), do: other
 
+  # `:none` for an absent or empty `cameras:` key or no marker to compare
+  # against — `cameras: []` lists nothing, so it earns neither warning, the
+  # same reading `import_once/3`'s `importable?/1` gives it. `:same` and
+  # `:changed` classify the two states `drift_warnings/3` renders; kept apart
+  # so the classification has no strings to build.
+  defp drift(cameras, marker)
+
+  defp drift(cameras, %{"sha256" => sha}) when is_list(cameras) and cameras != [] do
+    if cameras_sha(cameras) == sha, do: :same, else: :changed
+  end
+
+  defp drift(_cameras, _marker), do: :none
+
   defp drift_warnings(map, path, marker) do
     base = Path.basename(path)
 
-    case {Map.get(map, "cameras"), marker} do
-      # `cameras: []` lists nothing, so it earns neither warning.
-      {cameras, %{"sha256" => sha}} when is_list(cameras) and cameras != [] ->
-        if cameras_sha(cameras) == sha do
-          ["#{base} still lists cameras: — the database is the source of truth; remove the key"]
-        else
-          [
-            "#{base}: cameras changed since they were imported — use Import again on /config " <>
-              "to replace them, or remove the key"
-          ]
-        end
+    case drift(Map.get(map, "cameras"), marker) do
+      :same ->
+        ["#{base} still lists cameras: — the database is the source of truth; remove the key"]
 
-      _no_key_or_no_marker ->
+      :changed ->
+        [
+          "#{base}: cameras changed since they were imported — use Import again on /config " <>
+            "to replace them, or remove the key"
+        ]
+
+      :none ->
         []
     end
   end
@@ -289,7 +351,11 @@ defmodule Cairn.ConfigSource do
 
   # Only the retention block is read off a row here: a row that is dormant
   # because it was skipped can be malformed anywhere, and a malformed
-  # override is itself one of the reasons it may have been skipped.
+  # override is itself one of the reasons it may have been skipped. Values
+  # are still bounded by `Config.Camera.retention_days_range/0` — a dormant
+  # row skips `Camera.parse/3` entirely, so an out-of-range `days` here would
+  # reach `Cairn.Retention` unchecked and, at 0 or negative, treat every one
+  # of that camera's events as already expired.
   defp dormant(rows, skipped_ids) do
     for row <- rows, not row.enabled or row.id in skipped_ids do
       retention = Map.get(row.settings, "retention")
@@ -302,14 +368,17 @@ defmodule Cairn.ConfigSource do
     end
   end
 
-  defp retention_days(%{"days" => days}) when is_integer(days), do: days
+  defp retention_days(%{"days" => days}) when is_integer(days) do
+    if days in Config.Camera.retention_days_range(), do: days, else: nil
+  end
+
   defp retention_days(_other), do: nil
 
   # A dormant row is never rendered, so the parser never validates it — a
   # string here would raise inside the hourly sweep instead.
   defp retention_per_label(%{"per_label" => per_label}) when is_map(per_label) do
     for {label, days} <- per_label,
-        is_binary(label) and is_integer(days),
+        is_binary(label) and is_integer(days) and days in Config.Camera.retention_days_range(),
         into: %{},
         do: {label, days}
   end

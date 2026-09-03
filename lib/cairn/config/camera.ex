@@ -55,6 +55,14 @@ defmodule Cairn.Config.Camera do
 
   @default_min_score %{"default" => 0.5}
 
+  # The camera's `retention.days` and every per-label value are bounded like
+  # the global `retention.days` (`Cairn.Config.validate_numbers/2` reads this
+  # range for it): `Cairn.Retention` sweeps everything older than `now` minus
+  # the number, so a zero or negative one puts the cutoff at or after the
+  # present and deletes the camera's whole history on the next pass.
+  @min_retention_days 1
+  @max_retention_days 10_000
+
   defstruct id: nil,
             rtsp_url: nil,
             substream_url: nil,
@@ -126,10 +134,15 @@ defmodule Cairn.Config.Camera do
   @spec id_class() :: String.t()
   def id_class, do: @id_class
 
-  # The row-settings key space, taken by two callers: `Cairn.Cameras.raw_maps/0`
-  # before rendering, so an unknown key never reaches the parser as a row's
-  # fault, and `Cairn.ConfigSource.import_row/2` before storing, where the
-  # drop is permanent.
+  @doc false
+  @spec retention_days_range() :: Range.t()
+  def retention_days_range, do: @min_retention_days..@max_retention_days
+
+  # The row-settings key space, taken by three callers: `Cairn.Cameras.raw_maps/0`
+  # (to warn on an unknown key before it disappears), `Cairn.Cameras.render_row/1`
+  # (the one that actually filters — an unknown key never reaches the parser
+  # as a row's fault), and `Cairn.ConfigSource.import_row/2` before storing,
+  # where the drop is permanent.
   @spec known_keys() :: [String.t()]
   def known_keys, do: @known_keys
 
@@ -194,6 +207,9 @@ defmodule Cairn.Config.Camera do
 
     {zones, acc} = parse_zones(Map.get(raw, "zones"), id, acc)
 
+    {retention_days, retention_per_label, acc} =
+      parse_retention(Map.get(raw, "retention"), id, acc)
+
     cam = %__MODULE__{
       id: id,
       rtsp_url: rtsp_url,
@@ -205,8 +221,8 @@ defmodule Cairn.Config.Camera do
       extra_ffmpeg_args: extra_args,
       transcode: transcode,
       ingest: ingest,
-      retention_days: get_in(raw, ["retention", "days"]),
-      retention_per_label: get_in(raw, ["retention", "per_label"]) || %{},
+      retention_days: retention_days,
+      retention_per_label: retention_per_label,
       pre_window_seconds: Map.get(raw, "pre_window_seconds"),
       post_window_seconds: Map.get(raw, "post_window_seconds"),
       max_event_seconds: Map.get(raw, "max_event_seconds"),
@@ -276,6 +292,55 @@ defmodule Cairn.Config.Camera do
   end
 
   defp raw_zone_id(_raw), do: []
+
+  # Bounded here rather than in `Cairn.Config`'s number checks, which see only
+  # the global block: this is the one parser both the YAML and the form's
+  # candidate rows go through, so a value the file refuses is a value the form
+  # refuses. An out-of-range value is dropped as well as reported — the load
+  # fails on the error, but a fallback that inherits the global days is the
+  # safe reading of a number that reached a sweep anyway.
+  defp parse_retention(nil, _id, acc), do: {nil, %{}, acc}
+
+  defp parse_retention(retention, id, acc) when is_map(retention) do
+    {days, acc} = parse_retention_days(Map.get(retention, "days"), id, "retention.days", acc)
+    {per_label, acc} = parse_retention_per_label(Map.get(retention, "per_label"), id, acc)
+    {days, per_label, acc}
+  end
+
+  defp parse_retention(_other, id, acc),
+    do: {nil, %{}, add_error(acc, "camera #{id}: retention must be a mapping")}
+
+  defp parse_retention_days(nil, _id, _field, acc), do: {nil, acc}
+
+  defp parse_retention_days(days, _id, _field, acc)
+       when is_integer(days) and days >= @min_retention_days and days <= @max_retention_days,
+       do: {days, acc}
+
+  defp parse_retention_days(days, id, field, acc) do
+    {nil,
+     add_error(
+       acc,
+       "camera #{id}: #{field} must be >= #{@min_retention_days} " <>
+         "and <= #{@max_retention_days} (got #{inspect(days)})"
+     )}
+  end
+
+  defp parse_retention_per_label(nil, _id, acc), do: {%{}, acc}
+
+  defp parse_retention_per_label(per_label, id, acc) when is_map(per_label) do
+    # Sorted so a file with two bad labels reports them the same way twice.
+    per_label
+    |> Enum.sort_by(fn {label, _days} -> to_string(label) end)
+    |> Enum.reduce({%{}, acc}, fn {label, days}, {kept, acc} ->
+      case parse_retention_days(days, id, "retention.per_label (#{label})", acc) do
+        {nil, acc} -> {kept, acc}
+        {days, acc} -> {Map.put(kept, label, days), acc}
+      end
+    end)
+  end
+
+  defp parse_retention_per_label(_other, id, acc),
+    do: {%{}, add_error(acc, "camera #{id}: retention.per_label must be a mapping")}
 
   # Integer ms only, and signed: the correction runs either way depending on
   # which of the two streams is behind. Absent is 0, which every consumer
