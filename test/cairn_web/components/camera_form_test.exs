@@ -252,6 +252,19 @@ defmodule CairnWeb.CameraFormTest do
       assert CameraForm.urls(Map.put(params, "clear_substream", "true"), row).sub == nil
     end
 
+    test "a scalar where the retention block belongs renders blank and saves" do
+      row = %Camera{
+        id: "gate",
+        settings: %{"rtsp_url" => "rtsp://h/1", "retention" => 5},
+        zones: []
+      }
+
+      params = CameraForm.to_params(row)
+      assert params["retention_days"] == ""
+      assert {:ok, settings} = CameraForm.to_settings(params, row)
+      refute Map.has_key?(settings, "retention")
+    end
+
     test "a URL carrying its credential in the query is never spliced" do
       main = "http://cam.lan/flv?stream=ch0&user=admin&password=old"
 

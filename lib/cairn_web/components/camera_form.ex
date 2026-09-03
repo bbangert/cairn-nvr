@@ -580,7 +580,14 @@ defmodule CairnWeb.CameraForm do
   end
 
   defp carry_saved_default(per_label, saved) do
-    case get_in(saved, ["retention", "per_label", "default"]) do
+    # Through `as_map/1` at every level: a hand-edited row can hold a scalar
+    # where a block belongs, and `get_in/2` raises on it.
+    case saved
+         |> Map.get("retention")
+         |> as_map()
+         |> Map.get("per_label")
+         |> as_map()
+         |> Map.get("default") do
       nil -> per_label
       days -> Map.put(per_label, "default", days)
     end
@@ -622,7 +629,7 @@ defmodule CairnWeb.CameraForm do
 
   defp int_params(settings) do
     Map.new(@all_int_fields, fn
-      "retention_days" -> {"retention_days", int_string(get_in(settings, ["retention", "days"]))}
+      "retention_days" -> {"retention_days", int_string(retention(settings)["days"])}
       field -> {field, int_string(settings[field])}
     end)
   end
@@ -631,7 +638,7 @@ defmodule CairnWeb.CameraForm do
     min_score = as_map(settings["min_score"])
     track = as_map(settings["track"])
     record = as_map(settings["record"])
-    per_label = as_map(get_in(settings, ["retention", "per_label"]))
+    per_label = as_map(retention(settings)["per_label"])
 
     labels =
       [min_score, track, record, per_label]
@@ -708,6 +715,10 @@ defmodule CairnWeb.CameraForm do
   defp int_string(value) when is_integer(value), do: Integer.to_string(value)
   defp int_string(value) when is_binary(value), do: value
   defp int_string(_absent), do: @blank
+
+  # A scalar or list where the block belongs is a skipped row the operator
+  # must be able to open; it reads as an empty block.
+  defp retention(settings), do: settings |> Map.get("retention") |> as_map()
 
   defp as_map(value) when is_map(value), do: value
   defp as_map(_other), do: %{}
