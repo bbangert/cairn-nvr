@@ -213,13 +213,16 @@ defmodule Cairn.ConfigSource do
          {:ok, cameras} <- importable_list(Map.get(map, "cameras")),
          :ok <- check_drift(cameras),
          {:ok, _config, _warnings} <- Config.from_map(map) do
-      deleted = Repo.all(from(c in Camera, select: c.id))
+      before = Repo.all(from(c in Camera, select: c.id))
       Repo.delete_all(Camera)
       Repo.delete_all(from(s in Setting, where: s.key == @marker_key))
       # The write closure answers only `:ok`; the dropped-key warnings from
       # the import are logged here so they are not lost with it.
       cameras |> import_rows(path) |> Enum.each(&Logger.warning("config: #{&1}"))
-      stash_deleted(ref, deleted)
+      # Only the ids the file no longer lists are "deleted": a survivor is
+      # replaced row for row and keeps its runtime state — its control
+      # overlay included — exactly as an edit would leave it.
+      stash_deleted(ref, before -- Enum.map(cameras, &Map.get(&1, "id")))
       :ok
     else
       {:error, errors} when is_list(errors) -> {:error, {:yaml, errors}}

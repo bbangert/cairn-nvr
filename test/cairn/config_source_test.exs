@@ -768,6 +768,21 @@ defmodule Cairn.ConfigSourceTest do
                Task.await(task)
     end
 
+    test "a camera the file still lists keeps its control overlay through a re-import", %{
+      path: path
+    } do
+      # Another suite may have deleted a camera of this id and left its
+      # tombstone in the shared server.
+      Cairn.CameraControl.revive("cam_a")
+
+      assert %{detection_enabled: false} =
+               Cairn.CameraControl.set("cam_a", %{detection_enabled: false})
+
+      assert {:ok, _diff, _warnings} = ConfigSource.reimport(path)
+      assert Cairn.CameraControl.get("cam_a").detection_enabled == false
+      Cairn.CameraControl.prune(Map.keys(Cairn.CameraControl.all()) -- ["cam_a"])
+    end
+
     test "a second re-import of the same file is refused", %{path: path} do
       assert {:ok, _diff, _warnings} = ConfigSource.reimport(path)
 

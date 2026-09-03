@@ -1267,7 +1267,8 @@ defmodule CairnWeb.CamerasLive do
           style="padding: 14px 16px; display: flex; flex-direction: column; gap: 6px; border-color: var(--hs-danger);"
         >
           <div style="font-size: 14px; font-weight: 600; color: var(--hs-danger);">
-            The last config load failed — the cameras below are not running
+            The last config load failed — the previous config is still running, and
+            these rows could not be loaded from it
           </div>
           <div
             :for={error <- @last_load.errors}
