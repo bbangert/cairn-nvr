@@ -49,6 +49,23 @@ defmodule CairnWeb.CameraCardsTest do
                "http://10.0.0.5/flv?Token=•••••&x=1"
     end
 
+    # The camera reads `?pass%77ord=` as `password`, so the raw spelling is
+    # not what decides: an escape in the key would otherwise be a way to get a
+    # credential rendered in the clear.
+    test "hides a percent-encoded key" do
+      assert CameraCards.mask_url("http://10.0.0.5/live?pass%77ord=hunter2") ==
+               "http://10.0.0.5/live?pass%77ord=•••••"
+
+      assert CameraCards.credentialed?("http://10.0.0.5/live?pass%77ord=hunter2")
+    end
+
+    test "a malformed escape is judged on the raw key" do
+      assert CameraCards.mask_url("http://10.0.0.5/live?%zz=1&password=hunter2") ==
+               "http://10.0.0.5/live?%zz=1&password=•••••"
+
+      refute CameraCards.credentialed?("http://10.0.0.5/live?%zz=1")
+    end
+
     test "hides the vendor spellings of the same secret" do
       for key <- ~w(psw passwd auth key apikey api_key session) do
         assert CameraCards.mask_url("http://10.0.0.5/live?#{key}=hunter2&channel=1") ==

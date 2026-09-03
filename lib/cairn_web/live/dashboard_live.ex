@@ -79,19 +79,25 @@ defmodule CairnWeb.DashboardLive do
 
   @impl true
   def mount(_params, _session, socket) do
-    cameras = Config.Server.get().cameras
+    connected? = connected?(socket)
 
-    if connected?(socket) do
+    # Before the read, not after: an apply landing in between would be a
+    # change this socket never hears about and never re-reads, leaving it on
+    # a camera list the node no longer has.
+    if connected? do
       Cairn.CameraStatus.subscribe()
       Cairn.Event.subscribe()
       Cairn.Retention.subscribe()
       Cairn.Config.Server.subscribe()
-      # One topic per camera, so a busy camera's frames never wake a socket
-      # that is not showing it. The set is fixed only within one mount: a
-      # config change re-mounts the whole page (`handle_info/2` below), which
-      # re-reads the camera list and re-subscribes these per-camera topics.
-      Enum.each(cameras, &LiveDetections.subscribe(&1.id))
     end
+
+    cameras = Config.Server.get().cameras
+
+    # One topic per camera, so a busy camera's frames never wake a socket
+    # that is not showing it. The set is fixed only within one mount: a
+    # config change re-mounts the whole page (`handle_info/2` below), which
+    # re-reads the camera list and re-subscribes these per-camera topics.
+    if connected?, do: Enum.each(cameras, &LiveDetections.subscribe(&1.id))
 
     {:ok,
      assign(socket,

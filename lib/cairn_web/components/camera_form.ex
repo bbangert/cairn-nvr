@@ -13,7 +13,10 @@ defmodule CairnWeb.CameraForm do
   Nothing here validates thresholds, URLs or JSON: `Cairn.Config.from_map/1`
   is the one validator, so a cell this module cannot read as a number is
   passed through unchanged for the loader to name. `field_errors/2` then puts
-  the loader's own string back under the field it names.
+  the loader's own string back under the field it names. The exception is a
+  saved value no field can hold at all — a map where a string belongs, on a
+  row the loader skipped for that very reason: it opens blank, because
+  rendering it is what the operator came to undo (`scalar_param/1`).
   """
 
   use CairnWeb, :html
@@ -72,11 +75,11 @@ defmodule CairnWeb.CameraForm do
 
     %{
       "id" => (row && row.id) || "",
-      "plugin" => settings["plugin"] || @blank,
-      "ingest" => to_string(settings["ingest"] || @blank),
+      "plugin" => scalar_param(settings["plugin"]),
+      "ingest" => scalar_param(settings["ingest"]),
       "transcode" => if(settings["transcode"] == true, do: "true", else: "false"),
-      "tracker" => settings["tracker"] || @blank,
-      "motion_json" => settings["motion_json"] || @blank,
+      "tracker" => scalar_param(settings["tracker"]),
+      "motion_json" => scalar_param(settings["motion_json"]),
       "extra_ffmpeg_args" => args_string(settings["extra_ffmpeg_args"]),
       "labels" => index_rows(label_rows(settings))
     }
@@ -426,7 +429,12 @@ defmodule CairnWeb.CameraForm do
     URI.to_string(%{uri | userinfo: userinfo(user, pass)})
   end
 
-  defp userinfo(nil, _pass), do: nil
+  defp userinfo(nil, nil), do: nil
+  # `rtsp://:pass@host` is what a camera that authenticates on the password
+  # alone wants, and on create there is no saved URL to carry the credential
+  # instead — dropping the userinfo here silently discarded the typed
+  # password. Both `mask_url/1` and `credentialed?/1` already read this form.
+  defp userinfo(nil, pass), do: ":" <> pass
   defp userinfo(user, nil), do: user
   defp userinfo(user, pass), do: user <> ":" <> pass
 
@@ -564,9 +572,17 @@ defmodule CairnWeb.CameraForm do
 
   defp url_user(_absent), do: nil
 
-  defp args_string(args) when is_list(args), do: Enum.join(args, " ")
+  defp args_string(args) when is_list(args), do: Enum.map_join(args, " ", &scalar_param/1)
   defp args_string(args) when is_binary(args), do: args
   defp args_string(_absent), do: @blank
+
+  # The rows this has to survive are exactly the rows the loader skipped: a
+  # `plugin` that is a map or a `tracker` that is a list is why the row was
+  # refused, and the operator can only repair it by opening the form —
+  # `to_string/1` on one of those raises on the way to the input's `value=`.
+  defp scalar_param(value) when is_binary(value), do: value
+  defp scalar_param(value) when is_number(value) or is_boolean(value), do: to_string(value)
+  defp scalar_param(_other), do: @blank
 
   # `:short`, not two decimals: the cell is the value that gets saved back, so
   # rounding it would rewrite a 3-decimal threshold on an untouched save

@@ -72,6 +72,7 @@ defmodule CairnWeb.CamerasLiveTest do
     assert html =~ ~s(data-zones="1")
     assert html =~ "1 zone"
     assert html =~ "no detection"
+    assert html =~ ~s(aria-label="Disable cam1")
     assert html =~ ~s(href="/cameras/cam1/edit")
     # Phase 4 adds the zones route; until then the button is disabled, not a 404.
     refute html =~ "/cameras/cam1/zones"
@@ -94,6 +95,7 @@ defmodule CairnWeb.CamerasLiveTest do
     {:ok, _view, html} = live(conn, "/cameras")
 
     assert html =~ ~s(data-loaded="disabled")
+    # The label names what the click does, so it is the opposite of the state.
     assert html =~ ~s(aria-label="Enable cam1")
     # A disabled camera has no runtime to report, so no badge rather than "Unknown".
     refute html =~ ~s(id="camera-status-)
@@ -113,6 +115,27 @@ defmodule CairnWeb.CamerasLiveTest do
     assert html =~ ~s(data-loaded="skipped")
     assert html =~ "rtsp_url is required"
     refute html =~ ~s(id="camera-status-cam1")
+  end
+
+  # The row the loader refused can hold anything in its settings column, and a
+  # map interpolated into the markup would take the whole list down — with it
+  # the errors that say what to fix.
+  test "a skipped row whose plugin is not a string still lists", %{conn: conn, server: srv} do
+    create!("cam1")
+
+    "cam1"
+    |> Cameras.get()
+    |> Camera.update_changeset(%{settings: %{"plugin" => %{"name" => "yard"}}})
+    |> Repo.update!()
+
+    {:ok, _diff, _warnings} = Config.Server.reload(srv)
+
+    {:ok, _view, html} = live(conn, "/cameras")
+
+    assert html =~ ~s(id="camera-row-cam1")
+    assert html =~ ~s(data-loaded="skipped")
+    assert html =~ "rtsp_url is required"
+    assert html =~ "invalid"
   end
 
   test "the enable toggle disables and re-enables the camera", %{conn: conn} do
@@ -692,6 +715,65 @@ defmodule CairnWeb.CamerasLiveTest do
       assert html =~ "Probe failed"
     end
 
+    # The rendered state cannot tell the two apart — a restarted probe reads
+    # `running` too — so the discriminator is the task itself: `start_async`
+    # links its process to the LiveView, and a second click that started one
+    # would show up as a second link.
+    #
+    # TEST-NET-1 hangs rather than refusing, so the probe is still in flight
+    # while the assertions run; the timeout bounds the test.
+    test "a second Probe click while one is running starts no second task", %{conn: conn} do
+      Application.put_env(:cairn, :probe_timeout_ms, 2_000)
+      on_exit(fn -> Application.delete_env(:cairn, :probe_timeout_ms) end)
+
+      create!("cam1", %{"rtsp_url" => "rtsp://192.0.2.1:554/x"})
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      links = fn -> view.pid |> Process.info(:links) |> elem(1) |> length() end
+      idle = links.()
+
+      render_click(view, "probe")
+      assert links.() == idle + 1
+
+      html = render_click(view, "probe")
+      assert links.() == idle + 1
+
+      assert [row] = Regex.run(~r/<div[^>]*id="probe-main"[^>]*>/, html)
+      assert row =~ ~s(data-state="running")
+    end
+
+    # The generation alone would only drop the answer: the ffprobe would go on
+    # holding a socket open on a URL nobody asked about for the whole timeout,
+    # once per keystroke in the credential fields.
+    test "changing the URL cancels a probe still in flight", %{conn: conn} do
+      Application.put_env(:cairn, :probe_timeout_ms, 2_000)
+      on_exit(fn -> Application.delete_env(:cairn, :probe_timeout_ms) end)
+
+      create!("cam1", %{"rtsp_url" => "rtsp://192.0.2.1:554/x"})
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      links = fn -> view.pid |> Process.info(:links) |> elem(1) |> length() end
+      idle = links.()
+
+      render_click(view, "probe")
+      assert links.() == idle + 1
+
+      view
+      |> form("#camera-form", camera: %{"rtsp_url" => "rtsp://192.0.2.2:554/x"})
+      |> render_change()
+
+      # Returns as soon as the cancelled task is down rather than after the
+      # timeout it would otherwise have run out.
+      html = render_async(view, 1_000)
+
+      assert links.() == idle
+      assert [row] = Regex.run(~r/<div[^>]*id="probe-main"[^>]*>/, html)
+      assert row =~ ~s(data-state="idle")
+      refute html =~ "Probe failed"
+    end
+
     # A probe result describes the URL it was opened on; once that URL is not
     # what the form holds any more, the chips would be describing a stream
     # nobody asked about.
@@ -715,6 +797,41 @@ defmodule CairnWeb.CamerasLiveTest do
       assert [row] = Regex.run(~r/<div[^>]*id="probe-main"[^>]*>/, html)
       assert row =~ ~s(data-state="idle")
       refute html =~ "Probe failed"
+    end
+
+    # The rows that need the form most are the ones the loader refused, and a
+    # settings column it refused can hold anything: every non-scalar cell has
+    # to open as an empty field rather than raise on the way to `value=`.
+    test "a skipped row's non-scalar cells open as blank fields", %{conn: conn, server: srv} do
+      create!("cam1")
+
+      settings = %{
+        "rtsp_url" => "rtsp://h/1",
+        "ingest" => %{},
+        "motion_json" => %{},
+        "tracker" => [],
+        "plugin" => %{"name" => "yard"},
+        "pre_window_seconds" => %{}
+      }
+
+      "cam1" |> Cameras.get() |> Camera.update_changeset(%{settings: settings}) |> Repo.update!()
+      {:ok, _diff, _warnings} = Config.Server.reload(srv)
+
+      {:ok, view, html} = live(conn, "/cameras/cam1/edit")
+
+      assert html =~ ~s(id="camera-form")
+
+      assert view |> element("#camera-pre_window_seconds") |> render() =~ ~s(value="")
+      assert view |> element("#camera-motion_json") |> render() =~ ~r/>\s*<\/textarea>/
+      assert view |> element("#camera-plugin") |> render() =~ ~s(<option value="" selected)
+      refute html =~ "yard"
+
+      # The edit page has no mount-time surface for them, so the loader's own
+      # words are asserted where they render: the list, on the same row.
+      {:ok, _list, list_html} = live(conn, "/cameras")
+
+      assert list_html =~ ~s(data-loaded="skipped")
+      assert list_html =~ "ingest"
     end
 
     # `open` is state only the client has, and a patch that re-rendered the

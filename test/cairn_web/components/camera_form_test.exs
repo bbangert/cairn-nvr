@@ -51,6 +51,34 @@ defmodule CairnWeb.CameraFormTest do
       assert params["substream_url"] == "rtsp://cam.lan:554/sub"
     end
 
+    # These are the shapes the loader skips the row for, and the form is the
+    # only place the operator can repair them: every one has to arrive as an
+    # empty field rather than as a `to_string/1` raise.
+    test "a non-scalar cell arrives blank instead of raising" do
+      row = %Camera{
+        id: "gate",
+        settings: %{
+          "rtsp_url" => "rtsp://h/1",
+          "ingest" => %{},
+          "motion_json" => %{"enabled" => true},
+          "tracker" => [],
+          "plugin" => %{"name" => "yard"},
+          "extra_ffmpeg_args" => ["-x", %{}],
+          "pre_window_seconds" => %{}
+        },
+        zones: []
+      }
+
+      params = CameraForm.to_params(row)
+
+      assert params["ingest"] == ""
+      assert params["motion_json"] == ""
+      assert params["tracker"] == ""
+      assert params["plugin"] == ""
+      assert params["extra_ffmpeg_args"] == "-x "
+      assert params["pre_window_seconds"] == ""
+    end
+
     test "renders scores as written and puts the default row first" do
       rows = rich_row() |> CameraForm.to_params() |> CameraForm.rows()
 
@@ -346,6 +374,26 @@ defmodule CairnWeb.CameraFormTest do
         |> CameraForm.to_settings(row)
 
       assert typed["rtsp_url"] == "rtsp://u:pw2@new/1"
+    end
+
+    # Cameras that authenticate on the password alone, and on create there is
+    # no saved URL to carry the credential instead.
+    test "a password with no username composes password-only userinfo" do
+      {:ok, settings} =
+        CameraForm.to_settings(
+          %{"rtsp_url" => "rtsp://h/1", "username" => "", "password" => "pw"},
+          nil
+        )
+
+      assert settings["rtsp_url"] == "rtsp://:pw@h/1"
+    end
+
+    test "a saved password-only URL round-trips through an untouched edit" do
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => "rtsp://:pw@h/1"}, zones: []}
+
+      {:ok, settings} = row |> CameraForm.to_params() |> CameraForm.to_settings(row)
+
+      assert settings["rtsp_url"] == "rtsp://:pw@h/1"
     end
 
     test "a saved key the form has no field for survives an edit" do

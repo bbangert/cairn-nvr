@@ -363,8 +363,9 @@ Same `#camera-form` with `data-mode="edit"`, plus — FIXED:
 ```
 Credential rule (FIXED, applies to every page): a saved credential is never
 rendered — not in `value=`, not in a tooltip, not in the readout. `mask_url`
-output is the only form a saved URL takes on screen (`user:•••••@` and
-`password=•••••`). On edit the `camera[password]` field is empty with help
+output is the only form a saved URL takes on screen:
+`rtsp://user:•••••@host/…` for userinfo, `?password=•••••` for a credential
+carried as a query parameter. On edit the `camera[password]` field is empty with help
 "leave blank to keep"; `camera[username]` is prefilled; `camera[rtsp_url]`
 is prefilled only when the saved URL carries no credential (userinfo or
 query), otherwise it is empty with "leave blank to keep the saved URL".
@@ -563,7 +564,8 @@ timestamp. Name every new glyph.
 - Row: camera id (mono 13px/500), status badge (six values, same treatment
   as the tile's pill but on a surface — not over video), probe chips
   (codec / WxH / fps / profile, or a single warning "not probed yet"),
-  plugin group name or "no detection", zone count ("2 zones" or "whole
+  plugin group name, "no detection", or "invalid" when the refused row's
+  settings hold something that is not a group name, zone count ("2 zones" or "whole
   frame"), the transcode / not-H.264 / transcode-unavailable chips from
   today's config cards, the enable toggle (`.hs-tog`), then Edit (secondary
   sm), Zones (ghost sm) and Remove (ghost danger sm, `data-confirm`).

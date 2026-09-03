@@ -202,14 +202,22 @@ defmodule CairnWeb.CamerasLive do
     end
   end
 
+  # A click while a probe is running is ignored rather than restarting it: the
+  # in-flight one is opening the same URLs — a change to the URL fields resets
+  # the rows on its own — so a second would only hold a second ffprobe open
+  # and orphan the first's answer under the bumped generation.
   def handle_event("probe", _params, socket) do
     urls = CameraForm.urls(socket.assigns.form.params, socket.assigns.saved)
 
-    {:noreply,
-     socket
-     |> assign(probe_gen: socket.assigns.probe_gen + 1)
-     |> probe_stream(:main, urls.main)
-     |> probe_stream(:sub, urls.sub)}
+    if probing?(socket) do
+      {:noreply, socket}
+    else
+      {:noreply,
+       socket
+       |> assign(probe_gen: socket.assigns.probe_gen + 1)
+       |> probe_stream(:main, urls.main)
+       |> probe_stream(:sub, urls.sub)}
+    end
   end
 
   # The submitted id is read past, not trusted: this button deletes the camera
@@ -275,8 +283,8 @@ defmodule CairnWeb.CamerasLive do
   # the time it lands the operator may have typed a different host, user or
   # password, and the chips would then describe a stream that is not the one
   # on screen. A result from an older generation is dropped rather than
-  # rendered. Exercised by hand — a probe slow enough to be overtaken is not
-  # something a test can stage deterministically.
+  # rendered — including the exit of the probe `reset_probe/3` cancelled,
+  # which arrives here like any other answer.
   def handle_async({:probe, which, gen}, result, socket) do
     if gen == socket.assigns.probe_gen,
       do: {:noreply, put_probe(socket, which, probe_outcome(socket, result))},
@@ -378,16 +386,30 @@ defmodule CairnWeb.CamerasLive do
   defp probe_fields_changed?(previous, params),
     do: Enum.any?(@probe_fields, &(param(params, &1) != param(previous, &1)))
 
-  # The generation drops an answer still in flight; the rows are reset as
-  # well, because a result already rendered would otherwise go on describing
-  # a stream the form no longer names.
+  # The rows are reset because a result already rendered would otherwise go on
+  # describing a stream the form no longer names. A probe still in flight is
+  # cancelled rather than merely outvoted by the generation, which drops the
+  # answer but leaves the ffprobe holding a socket open on a URL nobody asked
+  # about for the rest of the timeout. The generation still decides, since a
+  # cancelled task's exit arrives at `handle_async/3` like any other answer.
   defp reset_probe(socket, false, _params), do: socket
 
   defp reset_probe(socket, true, params) do
-    assign(socket,
+    socket
+    |> cancel_running_probes()
+    |> assign(
       probe_gen: socket.assigns.probe_gen + 1,
       probe: blank_probes(CameraForm.urls(params, socket.assigns.saved))
     )
+  end
+
+  defp cancel_running_probes(socket) do
+    gen = socket.assigns.probe_gen
+
+    Enum.reduce(socket.assigns.probe, socket, fn
+      {which, %{state: :running}}, acc -> cancel_async(acc, {:probe, which, gen})
+      {_which, _row}, acc -> acc
+    end)
   end
 
   defp param(params, key), do: to_string(Map.get(params, key) || "")
@@ -627,6 +649,9 @@ defmodule CairnWeb.CamerasLive do
     error_result("the save did not finish — see the log")
   end
 
+  defp probing?(socket),
+    do: Enum.any?(socket.assigns.probe, fn {_which, row} -> row.state == :running end)
+
   defp probe_stream(socket, _which, nil), do: socket
 
   defp probe_stream(socket, which, url) do
@@ -706,10 +731,17 @@ defmodule CairnWeb.CamerasLive do
       loaded: loaded(camera, config, last_load),
       errors: errors,
       zones: length(camera.zones),
-      plugin: camera.settings["plugin"] || "no detection",
+      plugin: plugin_label(camera.settings["plugin"]),
       transcode: camera.settings["transcode"] == true
     }
   end
+
+  # A skipped row's `plugin` is whatever its settings column holds, map
+  # included — and a map interpolated into the markup takes the whole list
+  # down instead of the one row the operator came here to fix.
+  defp plugin_label(plugin) when is_binary(plugin), do: plugin
+  defp plugin_label(nil), do: "no detection"
+  defp plugin_label(_other), do: "invalid"
 
   defp loaded(%{enabled: false}, _config, _last_load), do: "disabled"
 
@@ -1111,7 +1143,7 @@ defmodule CairnWeb.CamerasLive do
                 class="hs-tog"
                 role="switch"
                 aria-checked={to_string(cam.enabled)}
-                aria-label={"Enable #{cam.id}"}
+                aria-label={if cam.enabled, do: "Disable #{cam.id}", else: "Enable #{cam.id}"}
                 disabled={MapSet.member?(@applying, cam.id)}
                 phx-click="toggle-enabled"
                 phx-value-id={cam.id}

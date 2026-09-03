@@ -60,11 +60,27 @@ defmodule CairnWeb.CameraCards do
   defp mask_query_pair(pair) do
     case String.split(pair, "=", parts: 2) do
       [key, _value] ->
-        if String.downcase(key) in @credential_params, do: "#{key}=•••••", else: pair
+        if credential_key?(key), do: "#{key}=•••••", else: pair
 
       _ ->
         pair
     end
+  end
+
+  # `?pass%77ord=` is the same key as `?password=` to the camera that reads
+  # it, so the raw spelling is not what to compare: an escape anywhere in the
+  # key would otherwise walk a credential past both the mask and the prefill
+  # rule. A malformed escape has no decoding, and the raw key is then all
+  # there is to judge.
+  defp credential_key?(key) do
+    decoded =
+      try do
+        URI.decode_www_form(key)
+      rescue
+        ArgumentError -> key
+      end
+
+    String.downcase(decoded) in @credential_params
   end
 
   @doc """
@@ -78,8 +94,7 @@ defmodule CairnWeb.CameraCards do
 
     uri.userinfo != nil or
       Enum.any?(String.split(uri.query || "", "&"), fn pair ->
-        key = pair |> String.split("=", parts: 2) |> hd() |> String.downcase()
-        key in @credential_params
+        pair |> String.split("=", parts: 2) |> hd() |> credential_key?()
       end)
   end
 
