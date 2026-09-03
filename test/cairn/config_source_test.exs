@@ -712,7 +712,7 @@ defmodule Cairn.ConfigSourceTest do
       {message, log} =
         ExUnit.CaptureLog.with_log(fn -> ConfigSource.log_db_error(error, []) end)
 
-      assert message == "cameras: database write failed"
+      assert message == "cameras: database access failed"
       refute message =~ "SECRET"
       assert log =~ "SECRET"
     end

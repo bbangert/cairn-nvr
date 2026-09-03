@@ -58,7 +58,7 @@ defmodule Cairn.ConfigSource do
   @spec log_db_error(Exception.t(), Exception.stacktrace()) :: String.t()
   def log_db_error(e, stacktrace) do
     Logger.error("cameras: database access failed: " <> Exception.format(:error, e, stacktrace))
-    "cameras: database write failed"
+    "cameras: database access failed"
   end
 
   # `Exception.message/1` on these two interpolates the changeset — including
