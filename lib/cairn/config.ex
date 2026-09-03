@@ -288,7 +288,9 @@ defmodule Cairn.Config do
       post_window_seconds: get_in(map, ["events", "post_window_seconds"]) || 10,
       max_event_seconds: get_in(map, ["events", "max_event_seconds"]) || 300,
       retention_days: get_in(map, ["retention", "days"]) || 14,
-      retention_per_label: get_in(map, ["retention", "per_label"]) || %{},
+      # `nil` alone reads as "none": a `false` or a scalar must reach
+      # `validate_retention_per_label/3` as what it is, not as an empty map.
+      retention_per_label: per_label_or_empty(get_in(map, ["retention", "per_label"])),
       retention_tracks_days: configured_retention_tracks_days(map),
       max_unseen_ms: configured_max_unseen_ms(map),
       max_live_tracks: configured_max_live_tracks(map),
@@ -1740,6 +1742,9 @@ defmodule Cairn.Config do
 
   defp int?(v, min, max), do: is_integer(v) and v >= min and v <= max
 
+  defp per_label_or_empty(nil), do: %{}
+  defp per_label_or_empty(value), do: value
+
   # Global `retention.per_label` bypassed this range: `from_map/2` copies it
   # verbatim, so an out-of-range value (0, negative) read past validation and
   # into `Cairn.Retention` as an "already expired" clip lifetime, and a
@@ -1752,7 +1757,7 @@ defmodule Cairn.Config do
       check(
         acc,
         int?(value, days.first, days.last),
-        "retention.per_label.#{label} must be >= #{days.first}"
+        "retention.per_label.#{label} must be >= #{days.first} and <= #{days.last}"
       )
     end)
   end

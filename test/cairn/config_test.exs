@@ -428,10 +428,12 @@ defmodule Cairn.ConfigTest do
     end
 
     test "a non-map global retention.per_label is an error, not a crash" do
-      map = Map.put(base_map(), "retention", %{"per_label" => "30 days"})
+      for value <- ["30 days", false, 30] do
+        map = Map.put(base_map(), "retention", %{"per_label" => value})
 
-      assert {:error, errors} = Config.from_map(map)
-      assert "retention.per_label must be a mapping" in errors
+        assert {:error, errors} = Config.from_map(map)
+        assert "retention.per_label must be a mapping" in errors
+      end
     end
 
     # The camera block goes through `Cairn.Config.Camera`, the parser a form
