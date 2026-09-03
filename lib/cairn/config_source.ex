@@ -163,12 +163,22 @@ defmodule Cairn.ConfigSource do
   Survivors are revived on `after_commit:` (a re-inserted id the file lists
   was tombstoned by the closure a moment earlier), with `after_apply:`'s
   revive as the retry — exactly as `Cameras.create/1` does for its own id.
-  """
-  @spec reimport(Path.t()) :: Cameras.write_result()
-  def reimport(path \\ Config.default_path()) do
-    ref = make_ref()
 
-    Config.Server.update(Cameras.server(), fn -> replace_rows(path, ref) end,
+  `expected_sha256:` pins the write to the bytes the caller rendered a
+  confirmation for: the file can change between a page displaying "replace N
+  cameras with M" and the operator clicking confirm, and without a pin the
+  write reads whatever is on disk by then, not what was confirmed. A mismatch
+  refuses before any row is deleted (`{:error, {:write, :changed}}`), the same
+  way `check_drift/1` refuses on the marker. Omitted (or `nil`), the write is
+  unpinned — today's behaviour, for `load/1`'s own file source and the two
+  test/support callers that have no rendered page to pin against.
+  """
+  @spec reimport(Path.t(), keyword()) :: Cameras.write_result()
+  def reimport(path \\ Config.default_path(), opts \\ []) do
+    ref = make_ref()
+    expected_sha256 = Keyword.get(opts, :expected_sha256)
+
+    Config.Server.update(Cameras.server(), fn -> replace_rows(path, ref, expected_sha256) end,
       after_commit: fn -> revive_remaining() end,
       after_rollback: fn -> revive_deleted(ref) end,
       after_apply: fn _diff -> prune_deleted(ref) end
@@ -229,8 +239,9 @@ defmodule Cairn.ConfigSource do
     Enum.each(remaining, &CameraControl.revive/1)
   end
 
-  defp replace_rows(path, ref) do
-    with {:ok, map} <- Config.raw_map(path),
+  defp replace_rows(path, ref, expected_sha256) do
+    with :ok <- check_pinned(path, expected_sha256),
+         {:ok, map} <- Config.raw_map(path),
          {:ok, cameras} <- importable_list(Map.get(map, "cameras")),
          :ok <- check_drift(cameras),
          {:ok, _config, _warnings} <- Config.from_map(map) do
@@ -250,10 +261,36 @@ defmodule Cairn.ConfigSource do
       cameras |> import_rows(path) |> Enum.each(&Logger.warning("config: #{&1}"))
       :ok
     else
-      {:error, errors} when is_list(errors) -> {:error, {:yaml, errors}}
-      {:error, reason} when reason in [:no_cameras, :no_drift, :no_marker] -> {:error, reason}
+      {:error, errors} when is_list(errors) ->
+        {:error, {:yaml, errors}}
+
+      {:error, reason} when reason in [:no_cameras, :no_drift, :no_marker, :changed] ->
+        {:error, reason}
     end
   end
+
+  # `nil` (the plain 1-arity call, or a caller with no rendered page to pin
+  # against) skips the check — the drift check below still guards against a
+  # stale confirmation replacing a fleet that already matches the file.
+  # Reads the raw bytes, not `cameras_sha/1`'s canonicalized list: the
+  # caller hashed what it displayed before any YAML parsing, so this has to
+  # hash the same thing to mean anything.
+  defp check_pinned(_path, nil), do: :ok
+
+  defp check_pinned(path, expected_sha256) do
+    case File.read(path) do
+      {:ok, bytes} ->
+        if file_sha256(bytes) == expected_sha256, do: :ok, else: {:error, :changed}
+
+      {:error, _reason} ->
+        # Unreadable now is unreadable to `Config.raw_map/1` a moment later
+        # too, so let that call produce the file's own `{:yaml, errors}`
+        # rather than a `:changed` that would misname the fault.
+        :ok
+    end
+  end
+
+  defp file_sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 
   # Two `/config` sessions can each queue a re-import while both see the
   # drift warning; the second would replace the fleet the first already

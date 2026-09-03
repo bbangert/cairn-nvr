@@ -137,6 +137,21 @@ defmodule Cairn.Config.Server do
   @spec snapshot_key(atom()) :: {module(), :snapshot, atom()}
   def snapshot_key(server) when is_atom(server), do: {__MODULE__, :snapshot, server}
 
+  @doc """
+  The config the server named `server` last published, or `nil` before its
+  first publish. `Cairn.CameraControl.init/1` reads this to reconcile the
+  tombstones it reloads: a plain restart, not a call, so a `CameraControl`
+  that is down cannot be asked and must find the answer already sitting in
+  `:persistent_term`.
+  """
+  @spec snapshot(atom()) :: Config.t() | nil
+  def snapshot(server \\ __MODULE__) when is_atom(server) do
+    case :persistent_term.get(snapshot_key(server), nil) do
+      %Config{} = config -> config
+      nil -> nil
+    end
+  end
+
   @spec get(GenServer.server()) :: Config.t()
   def get(server \\ __MODULE__), do: GenServer.call(server, :get)
 
@@ -566,6 +581,10 @@ defmodule Cairn.Config.Server do
     end
   end
 
+  # A dropped exit here (the sibling is mid-restart) is not the last word:
+  # `Cairn.CameraControl.init/1` reconciles its reloaded tombstones against
+  # this server's own snapshot, so an id this pass could not reach gets
+  # revived there instead, once the restart finishes.
   defp revive_control(%Config.Camera{id: id}) do
     Cairn.CameraControl.revive(id)
   catch

@@ -31,6 +31,7 @@ defmodule CairnWeb.ConfigLive do
        busy?: false,
        config: nil,
        config_path: Config.default_path(),
+       config_sha256: nil,
        last_load: nil,
        import_marker: nil,
        reimport_confirm: nil
@@ -52,11 +53,14 @@ defmodule CairnWeb.ConfigLive do
       {:noreply, socket}
     else
       path = socket.assigns.config_path
+      expected_sha256 = socket.assigns.config_sha256
 
       {:noreply,
        socket
        |> assign(reimporting: true, reimport_unconfirmed?: false)
-       |> start_async(:reimport, fn -> ConfigSource.reimport(path) end)}
+       |> start_async(:reimport, fn ->
+         ConfigSource.reimport(path, expected_sha256: expected_sha256)
+       end)}
     end
   end
 
@@ -183,6 +187,7 @@ defmodule CairnWeb.ConfigLive do
         assign(socket,
           busy?: false,
           config: config,
+          config_sha256: file_sha256(path),
           last_load: last_load,
           import_marker: ConfigSource.import_marker(),
           reimport_confirm: reimport_confirm(path)
@@ -197,6 +202,17 @@ defmodule CairnWeb.ConfigLive do
     {:ok, Config.Server.get(server), Config.Server.last_load(server)}
   catch
     :exit, _ -> :busy
+  end
+
+  # Pinned to `ConfigSource.reimport/2`'s own `expected_sha256:` check, which
+  # hashes the same raw bytes: an unreadable file here leaves the pin `nil`,
+  # which lets the write proceed unpinned rather than refuse the file's own
+  # unrelated read failure under a "changed" label.
+  defp file_sha256(path) do
+    case File.read(path) do
+      {:ok, bytes} -> Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+      {:error, _reason} -> nil
+    end
   end
 
   defp reimport_confirm(path) do

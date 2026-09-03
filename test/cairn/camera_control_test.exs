@@ -144,6 +144,56 @@ defmodule Cairn.CameraControlTest do
     end
   end
 
+  # The application's `Cairn.Config.Server` publishes `test/support/fixtures/
+  # configs/valid.yml` for the whole suite, which names "cam_a" — see that
+  # file's own header comment. A tombstone on a configured id can only be a
+  # revive that never reached a live `CameraControl` (see
+  # `Cairn.Config.Server.revive_control/1`'s comment), so `init/1` clears it
+  # on the restart the crashed process's own supervisor performs, without
+  # anyone having to ask again.
+  test "a restart revives a tombstone on an id the running config still names" do
+    id = "cam_a"
+    CameraControl.revive(id)
+
+    try do
+      assert :ok = CameraControl.tombstone(id)
+      assert CameraControl.set(id, %{}) == {:error, :removed}
+
+      pid = Process.whereis(CameraControl)
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+
+      restarted = wait_for_new_pid(pid)
+      :sys.get_state(restarted)
+
+      refute CameraControl.set(id, %{}) == {:error, :removed}
+    after
+      CameraControl.revive(id)
+    end
+  end
+
+  # The mirror: an id the running config does not name is not reconciled away
+  # — only a configured id's tombstone is a leftover a self-heal should undo.
+  test "a restart leaves a tombstone standing for an id the config does not name" do
+    id = "cc_unconfigured_#{System.unique_integer([:positive])}"
+    assert :ok = CameraControl.tombstone(id)
+
+    try do
+      pid = Process.whereis(CameraControl)
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+
+      restarted = wait_for_new_pid(pid)
+      :sys.get_state(restarted)
+
+      assert CameraControl.set(id, %{detection_enabled: false}) == {:error, :removed}
+    after
+      CameraControl.revive(id)
+    end
+  end
+
   test "a tombstone keeps the overlay, so a rollback's revive restores it intact" do
     id = "tomb_keep_#{System.unique_integer([:positive])}"
     assert %{min_score: 0.3} = CameraControl.set(id, %{min_score: 0.3})

@@ -984,6 +984,23 @@ defmodule Cairn.ConfigSourceTest do
       assert {:error, {:write, :no_cameras}} = ConfigSource.reimport(path)
       assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
     end
+
+    test "a stale expected_sha256 refuses with :changed and deletes no rows", %{path: path} do
+      stale = :crypto.hash(:sha256, "not the file on disk") |> Base.encode16(case: :lower)
+
+      assert {:error, {:write, :changed}} =
+               ConfigSource.reimport(path, expected_sha256: stale)
+
+      assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
+    end
+
+    test "a matching expected_sha256 proceeds", %{path: path} do
+      sha =
+        path |> File.read!() |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
+
+      assert {:ok, %{added: ["cam_b"], removed: ["cam_z"], changed: ["cam_a"]}, _warnings} =
+               ConfigSource.reimport(path, expected_sha256: sha)
+    end
   end
 
   describe "describe_import_error/1" do

@@ -399,8 +399,10 @@ defmodule CairnWeb.ConfigLiveTest do
       conn: conn,
       path: path
     } do
-      {:ok, view, _html} = live(conn, "/config")
-
+      # Written before mount, not after: `load/1` pins the sha of what it
+      # renders, and a file that changed post-mount is `:changed` territory
+      # (see the pin test above), not this test's own concern — a file that
+      # was already broken when the operator loaded the page.
       File.write!(path, """
       data_dir: #{Path.dirname(path)}
       retention:
@@ -409,12 +411,50 @@ defmodule CairnWeb.ConfigLiveTest do
         - id: broken
       """)
 
+      {:ok, view, _html} = live(conn, "/config")
+
       view |> element("#config-reimport") |> render_click()
       html = render_async(view)
 
       assert html =~ "We couldn&#39;t re-import the cameras"
       refute html =~ "We couldn&#39;t load the new config"
       assert html =~ "rtsp_url is required"
+    end
+
+    # `load/1` pins the sha of the bytes it rendered the confirmation count
+    # from; a file rewritten after mount but before the click no longer
+    # matches, so the write refuses before touching a row — not the fleet
+    # the operator saw the confirm dialog for.
+    test "the file changing after mount is refused, and the rows survive", %{
+      conn: conn,
+      path: path
+    } do
+      {:ok, view, _html} = live(conn, "/config")
+
+      File.write!(path, """
+      data_dir: #{Path.dirname(path)}
+      retention:
+        days: 7
+      cameras:
+        - id: cam_a
+          rtsp_url: rtsp://yaml/1
+        - id: cam_b
+          rtsp_url: rtsp://yaml/2
+        - id: cam_c
+          rtsp_url: rtsp://yaml/3
+      """)
+
+      view |> element("#config-reimport") |> render_click()
+      html = render_async(view)
+
+      assert html =~ "config.yml changed after this page loaded"
+
+      ids =
+        Cameras.list()
+        |> Enum.map(& &1.id)
+        |> Enum.filter(&(&1 in ["cam_a", "cam_b", "cam_c", "cam_z"]))
+
+      assert ids == ["cam_a", "cam_z"]
     end
 
     # `FlakyReimport` fails only the write, deterministically — driving the

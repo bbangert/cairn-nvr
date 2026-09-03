@@ -129,11 +129,26 @@ defmodule Cairn.CameraControl do
   @impl true
   # Seeded from the persistent term, not `MapSet.new()`: a restart after a
   # crash must come back refusing the same ids it refused before, or the
-  # tombstone a caller observed would have quietly expired.
+  # tombstone a caller observed would have quietly expired. Reconciled
+  # against the running config before that: `Cairn.Config.Server.apply_config/5`
+  # revives every id it names, but a `revive/1` racing this process's own
+  # restart is caught and dropped there — see its `revive_control/1`. A
+  # configured camera is never deleted, so a tombstone on a configured id can
+  # only be that dropped revive, not a real removal, and this closes the
+  # window without the server having to retry.
   def init(_opts) do
     :ets.new(@table, [:named_table, :set, :protected, read_concurrency: true])
-    {:ok, %{tombstoned: tombstones()}}
+    {:ok, put_tombstones(%{tombstoned: MapSet.new()}, reconciled_tombstones())}
   end
+
+  defp reconciled_tombstones do
+    case Cairn.Config.Server.snapshot() do
+      nil -> tombstones()
+      %Cairn.Config{cameras: cameras} -> MapSet.difference(tombstones(), configured_ids(cameras))
+    end
+  end
+
+  defp configured_ids(cameras), do: MapSet.new(cameras, & &1.id)
 
   @impl true
   # Tombstoned ids are refused rather than written: a caller that checked the
