@@ -5,6 +5,20 @@ defmodule CairnWeb.CameraCardsTest do
   alias Cairn.Cameras.Camera
   alias CairnWeb.CameraCards
 
+  describe "strip_credentials/1" do
+    test "drops the userinfo and every credential query pair, keeping the rest" do
+      assert CameraCards.strip_credentials("rtsp://u:pw@h/1") == "rtsp://h/1"
+
+      assert CameraCards.strip_credentials(
+               "http://h/flv?stream=ch0&user=admin&password=x&app=bcs"
+             ) ==
+               "http://h/flv?stream=ch0&app=bcs"
+
+      assert CameraCards.strip_credentials("http://h/flv?user=admin&password=x") == "http://h/flv"
+      assert CameraCards.strip_credentials("rtsp://h/1") == "rtsp://h/1"
+    end
+  end
+
   describe "an @ inside the credential" do
     test "is consumed through the last @ of the authority" do
       assert CameraCards.mask_url("rtsp://user:sec@ret@host/s") == "rtsp://user:•••••@host/s"

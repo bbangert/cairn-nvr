@@ -438,12 +438,9 @@ defmodule CairnWeb.CameraForm do
 
   defp clear_credentials?(params), do: trimmed(params, "clear_credentials") in ["true", "on"]
 
-  defp strip_userinfo(url) do
-    case URI.parse(url).userinfo do
-      nil -> url
-      _userinfo -> URI.to_string(%{URI.parse(url) | userinfo: nil})
-    end
-  end
+  # Both credential forms go — the userinfo and the query pairs the mask
+  # recognizes — through the one helper that defines the key set.
+  defp strip_userinfo(url), do: CameraCards.strip_credentials(url)
 
   # A URL that already carries userinfo keeps its own username unless the
   # operator changed the field, and keeps its own password unless one was
@@ -1251,7 +1248,13 @@ defmodule CairnWeb.CameraForm do
       )
 
     ~H"""
-    <div style="display: flex; flex-direction: column; gap: 3px;">
+    <%!-- `.hs-field` + `data-restart` so the design round can style a Detect
+          cell as the restart-class field it is (the contract's wrapper). --%>
+    <div
+      class="hs-field"
+      data-restart={if(@cell == "min_score", do: "true")}
+      style="display: flex; flex-direction: column; gap: 3px;"
+    >
       <%!-- The column heading is a symbol in a grid with no per-cell label, so
             the accessible name has to carry both the row and the column. --%>
       <input

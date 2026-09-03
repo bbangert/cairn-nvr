@@ -188,6 +188,34 @@ defmodule CairnWeb.CameraCards do
   def describe_exit(reason) when is_atom(reason), do: inspect(reason)
   def describe_exit(_other), do: "an unexpected exit"
 
+  @doc """
+  The URL with every credential removed — the userinfo and the query pairs
+  `credentialed?/1` recognizes — so the form's "remove saved username and
+  password" strips the FLV form as well as the RTSP one, with the one key set.
+  """
+  @spec strip_credentials(String.t()) :: String.t()
+  def strip_credentials(url) when is_binary(url) do
+    uri = URI.parse(url)
+
+    query =
+      case uri.query do
+        nil ->
+          nil
+
+        query ->
+          kept =
+            query
+            |> String.split("&")
+            |> Enum.reject(fn pair ->
+              pair |> String.split("=", parts: 2) |> hd() |> credential_key?()
+            end)
+
+          if kept == [], do: nil, else: Enum.join(kept, "&")
+      end
+
+    URI.to_string(%{uri | userinfo: nil, query: query})
+  end
+
   @doc "The last probe result for a camera, or `nil` when it was never probed."
   @spec probe(map(), String.t()) :: map() | nil
   def probe(statuses, camera_id) do

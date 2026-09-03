@@ -273,6 +273,19 @@ defmodule CairnWeb.CameraFormTest do
       assert {:ok, %{"rtsp_url" => "rtsp://SECRET@h/1"}} = CameraForm.to_settings(params, row)
     end
 
+    test "removing saved credentials strips the query form too" do
+      main = "http://cam.lan/flv?stream=ch0&user=admin&password=old"
+      row = %Camera{id: "gate", settings: %{"rtsp_url" => main}, zones: []}
+
+      {:ok, settings} =
+        row
+        |> CameraForm.to_params()
+        |> Map.put("clear_credentials", "true")
+        |> CameraForm.to_settings(row)
+
+      assert settings["rtsp_url"] == "http://cam.lan/flv?stream=ch0"
+    end
+
     test "a URL carrying its credential in the query is never spliced" do
       main = "http://cam.lan/flv?stream=ch0&user=admin&password=old"
 
