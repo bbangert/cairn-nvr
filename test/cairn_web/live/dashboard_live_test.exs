@@ -15,10 +15,10 @@ defmodule CairnWeb.DashboardLiveTest do
   end
 
   test "the tile heading links to the camera's edit page", %{conn: conn} do
-    {:ok, _view, html} = live(conn, "/")
+    {:ok, view, _html} = live(conn, "/")
 
-    assert html =~ ~s(href="/cameras/cam_a/edit")
-    assert html =~ ~s(href="/cameras/cam_b/edit")
+    assert has_element?(view, ~s(#camera-tile-cam_a h2 a[href="/cameras/cam_a/edit"]))
+    assert has_element?(view, ~s(#camera-tile-cam_b h2 a[href="/cameras/cam_b/edit"]))
   end
 
   # No injection seam here (mount reads `Config.Server.get().cameras`
@@ -35,11 +35,10 @@ defmodule CairnWeb.DashboardLiveTest do
     File.write!(@fixture, "data_dir: tmp/cairn_test_data\ncameras: []\n")
     {:ok, _diff, _warnings} = Cairn.Config.Server.reload()
 
-    {:ok, _view, html} = live(conn, "/")
+    {:ok, view, _html} = live(conn, "/")
 
-    assert html =~ "empty-state"
-    assert html =~ ~s(id="empty-state-add")
-    assert html =~ ~s(href="/cameras/new")
+    assert has_element?(view, "#empty-state")
+    assert has_element?(view, ~s(#empty-state-add[href="/cameras/new"]))
   end
 
   test "a config change redirects the dashboard so it re-mounts with the new fleet", %{
