@@ -168,8 +168,9 @@ defmodule CairnWeb.CameraForm do
   def urls(params, saved) do
     settings = if saved, do: saved.settings, else: %{}
 
-    composed =
-      %{} |> put_url("rtsp_url", params, settings) |> put_url("substream_url", params, settings)
+    # The same rule a save applies: a ticked "Remove sub stream" means no sub
+    # stream to probe either.
+    composed = %{} |> put_url("rtsp_url", params, settings) |> put_substream(params, settings)
 
     %{main: composed["rtsp_url"], sub: composed["substream_url"]}
   end

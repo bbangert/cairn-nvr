@@ -218,6 +218,18 @@ defmodule CairnWeb.CameraFormTest do
       assert settings == %{"rtsp_url" => "rtsp://h/1"}
     end
 
+    test "a ticked remove-sub-stream leaves nothing to probe on the sub row" do
+      row = %Camera{
+        id: "gate",
+        settings: %{"rtsp_url" => "rtsp://h/1", "substream_url" => "rtsp://h/2"},
+        zones: []
+      }
+
+      params = CameraForm.to_params(row)
+      assert CameraForm.urls(params, row).sub == "rtsp://h/2"
+      assert CameraForm.urls(Map.put(params, "clear_substream", "true"), row).sub == nil
+    end
+
     test "a URL carrying its credential in the query is never spliced" do
       main = "http://cam.lan/flv?stream=ch0&user=admin&password=old"
 
