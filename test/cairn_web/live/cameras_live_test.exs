@@ -109,6 +109,8 @@ defmodule CairnWeb.CamerasLiveTest do
     create!("cam1")
     on_exit(fn -> Cairn.CameraStatus.merge("cam1", %{status: :unknown}) end)
     Cairn.CameraStatus.set("cam1", :running)
+    # `set/2` is a cast; wait for it to land before mount reads the status it just set.
+    _ = :sys.get_state(Cairn.CameraStatus)
 
     {:ok, _view, list} = live(conn, "/cameras")
     {:ok, _view, edit} = live(conn, "/cameras/cam1/edit")
@@ -864,13 +866,18 @@ defmodule CairnWeb.CamerasLiveTest do
     # links its process to the LiveView, and a second click that started one
     # would show up as a second link.
     #
-    # TEST-NET-1 hangs rather than refusing, so the probe is still in flight
-    # while the assertions run; the timeout bounds the test.
+    # A listener that never sends a reply lets ffprobe's connect succeed at
+    # the kernel level while the RTSP handshake never arrives, so the probe
+    # is still in flight while the assertions run; the timeout bounds the test.
     test "a second Probe click while one is running starts no second task", %{conn: conn} do
       Application.put_env(:cairn, :probe_timeout_ms, 2_000)
       on_exit(fn -> Application.delete_env(:cairn, :probe_timeout_ms) end)
 
-      create!("cam1", %{"rtsp_url" => "rtsp://192.0.2.1:554/x"})
+      {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false])
+      on_exit(fn -> :gen_tcp.close(listener) end)
+      {:ok, port} = :inet.port(listener)
+
+      create!("cam1", %{"rtsp_url" => "rtsp://127.0.0.1:#{port}/x"})
 
       {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
 
@@ -894,7 +901,13 @@ defmodule CairnWeb.CamerasLiveTest do
       Application.put_env(:cairn, :probe_timeout_ms, 2_000)
       on_exit(fn -> Application.delete_env(:cairn, :probe_timeout_ms) end)
 
-      create!("cam1", %{"rtsp_url" => "rtsp://192.0.2.1:554/x"})
+      # A listener that never replies keeps this probe in flight (kernel-level
+      # connect succeeds, RTSP handshake never comes) until the change cancels it.
+      {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false])
+      on_exit(fn -> :gen_tcp.close(listener) end)
+      {:ok, port} = :inet.port(listener)
+
+      create!("cam1", %{"rtsp_url" => "rtsp://127.0.0.1:#{port}/x"})
 
       {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
 
@@ -936,6 +949,31 @@ defmodule CairnWeb.CamerasLiveTest do
       html =
         view
         |> form("#camera-form", camera: %{"rtsp_url" => "rtsp://127.0.0.1:2/x"})
+        |> render_change()
+
+      assert [row] = Regex.run(~r/<div[^>]*id="probe-main"[^>]*>/, html)
+      assert row =~ ~s(data-state="idle")
+      refute html =~ "Probe failed"
+    end
+
+    # `transcode` names no URL field, but it decides the not-H.264 warning a
+    # rendered probe row carries — so a stale row would go on showing (or
+    # hiding) a warning that no longer matches the toggle.
+    test "toggling transcode resets a probed row", %{conn: conn} do
+      Application.put_env(:cairn, :probe_timeout_ms, 500)
+      on_exit(fn -> Application.delete_env(:cairn, :probe_timeout_ms) end)
+
+      create!("cam1", %{"rtsp_url" => "rtsp://127.0.0.1:1/x"})
+
+      {:ok, view, _html} = live(conn, "/cameras/cam1/edit")
+
+      render_click(view, "probe")
+      html = render_async(view, 5_000)
+      assert html =~ ~s(data-state="error")
+
+      html =
+        view
+        |> form("#camera-form", camera: %{"transcode" => "true"})
         |> render_change()
 
       assert [row] = Regex.run(~r/<div[^>]*id="probe-main"[^>]*>/, html)

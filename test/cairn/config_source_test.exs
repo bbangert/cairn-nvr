@@ -665,6 +665,8 @@ defmodule Cairn.ConfigSourceTest do
       assert Enum.any?(warnings, &(&1 =~ "changed since they were imported"))
 
       CameraStatus.set("cam_z", :running)
+      # `set/2` is a cast; wait for it to land before reimport reads the row it just set.
+      _ = :sys.get_state(CameraStatus)
 
       assert {:ok, %{added: ["cam_b"], removed: ["cam_z"], changed: ["cam_a"]}, _warnings} =
                ConfigSource.reimport(path)
@@ -693,6 +695,8 @@ defmodule Cairn.ConfigSourceTest do
     test "a disabled row the file no longer lists loses its runtime state", %{path: path} do
       insert_camera!("cam_off", 2, %{"rtsp_url" => "rtsp://rows/off"}, enabled: false)
       CameraStatus.set("cam_off", :running)
+      # `set/2` is a cast; wait for it to land before reimport reads the row it just set.
+      _ = :sys.get_state(CameraStatus)
 
       assert {:ok, _diff, _warnings} = ConfigSource.reimport(path)
 

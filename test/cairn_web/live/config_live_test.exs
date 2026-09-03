@@ -177,6 +177,7 @@ defmodule CairnWeb.ConfigLiveTest do
       assert html =~ "config-import"
       assert html =~ "/config/config.yml"
       assert html =~ CairnWeb.EventsLive.fmt_time(~U[2026-09-02 21:31:07Z])
+      assert html =~ ~s(<time datetime="2026-09-02T21:31:07Z">)
     end
   end
 

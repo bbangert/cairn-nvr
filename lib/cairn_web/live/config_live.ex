@@ -348,7 +348,8 @@ defmodule CairnWeb.ConfigLive do
                 <span class="ms" style="font-size: 16px; flex: none; margin-top: 1px;">history</span>
                 Cameras imported from
                 <span style="font-family: var(--hs-font-mono);">{@import_marker["path"]}</span>
-                on {fmt_import_date(@import_marker)}
+                on
+                <time datetime={@import_marker["imported_at"]}>{fmt_import_date(@import_marker)}</time>
               </div>
               <button
                 :if={reimportable?(@last_load)}

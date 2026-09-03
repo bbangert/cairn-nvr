@@ -306,7 +306,6 @@ defmodule Cairn.Config.ServerUpdateTest do
     # failed, credentials included.
     assert log =~ "after_apply raised: RuntimeError"
     refute log =~ "hunter2"
-    assert Process.alive?(server)
     assert [%{id: "cam_a"}] = Config.Server.get(server).cameras
   end
 
@@ -321,7 +320,9 @@ defmodule Cairn.Config.ServerUpdateTest do
 
     assert log =~ "after_apply exit: non-atom exit"
     refute log =~ "hunter2"
-    assert Process.alive?(server)
+    # `alive?` only proves the process wasn't reaped; a synchronous call proves
+    # the server is actually answering after the callback's exit.
+    assert %{cameras: [%{id: "cam_a"}]} = Config.Server.get(server)
   end
 
   test "a callback that is not a 1-arity fun is refused before the write", %{server: server} do

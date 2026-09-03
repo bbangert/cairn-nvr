@@ -405,10 +405,12 @@ defmodule CairnWeb.CamerasLive do
   defp row_state(nil), do: nil
   defp row_state(camera), do: Map.take(camera, [:settings, :zones, :enabled])
 
-  # Only the fields that compose a probed URL: the rest of the form changes on
-  # every keystroke and would invalidate a probe that is still describing the
-  # right stream.
-  @probe_fields ~w(rtsp_url substream_url username password)
+  # The fields that compose a probed URL, plus the two that change what the
+  # probe rows show without changing the URL: `clear_substream` toggles the
+  # sub row's visibility and `transcode` toggles the not-H.264 warning. The
+  # rest of the form changes on every keystroke and would invalidate a probe
+  # that is still describing the right stream.
+  @probe_fields ~w(rtsp_url substream_url username password clear_substream transcode)
 
   defp probe_fields_changed?(previous, params),
     do: Enum.any?(@probe_fields, &(param(params, &1) != param(previous, &1)))
