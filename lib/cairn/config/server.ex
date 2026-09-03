@@ -506,20 +506,22 @@ defmodule Cairn.Config.Server do
   # reload path — a reload has no caller write to hang cleanup off.
   defp apply_config(state, new_config, warnings, skipped, after_apply \\ nil) do
     diff = diff_cameras(state.config, new_config)
-    # Before the diff: newly spawned ports redirect logs into the (possibly
-    # changed) data_dir, so its log subdir must already exist
-    Cairn.DataDir.ensure!(new_config.data_dir)
     # Before the apply: a tree the diff restarts may be rebuilt by its
     # supervisor at any point after, and must find this fleet, not the
     # last one.
     publish(state, new_config)
-    # The apply is wrapped only so the commit's cleanup cannot be lost: the
-    # transaction is already committed here, so an apply that raises or exits
-    # still owes `after_apply:` (pruning a deleted camera's runtime state). The
-    # failure itself still propagates and takes this server down as before —
-    # reconciling the runtime owners against the config on its restart is the
-    # follow-up (`.claude/plans/ui-camera-config/scratchpad.md`).
+    # The wrap covers this post-commit prep as well as the apply itself, not
+    # only the apply: `DataDir.ensure!/1` can raise (an unwritable new
+    # data_dir), and the transaction is already committed here, so that raise
+    # owes `after_apply:` (pruning a deleted camera's runtime state) exactly
+    # as an apply that raises or exits does. The failure itself still
+    # propagates and takes this server down as before — reconciling the
+    # runtime owners against the config on its restart is the follow-up
+    # (`.claude/plans/ui-camera-config/scratchpad.md`).
     try do
+      # Newly spawned ports redirect logs into the (possibly changed)
+      # data_dir, so its log subdir must already exist before the apply.
+      Cairn.DataDir.ensure!(new_config.data_dir)
       # Before the cameras: detection is the in-VM engine, so the model a
       # restarted camera will open a stream on should already be the new
       # one. The call is asynchronous, so this is an ordering of sends

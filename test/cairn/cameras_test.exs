@@ -427,6 +427,33 @@ defmodule Cairn.CamerasTest do
       assert %{detection_enabled: false} = CameraControl.set("cam1", %{detection_enabled: false})
     end
 
+    # The retry window a rollback's revive is given (up to 5 s) is long
+    # enough for a newer, successful delete of the same id to land inside
+    # it — the revive must not clear that delete's tombstone just because
+    # this older write never committed.
+    test "after_rollback does not revive an id a newer delete has since removed" do
+      on_exit(fn -> CameraControl.set("cam1", %{detection_enabled: true}) end)
+
+      assert {:ok, _diff, []} =
+               Cameras.create(%{"id" => "cam1", "settings" => %{"rtsp_url" => "rtsp://h/1"}})
+
+      write = fn ->
+        CameraControl.tombstone("cam1")
+        {:error, :boom}
+      end
+
+      # Stands in for the newer delete landing before this older write's
+      # rollback callback runs.
+      assert {:ok, _diff, []} = Cameras.delete("cam1")
+
+      callback = fn -> if Cameras.get("cam1"), do: CameraControl.revive("cam1") end
+
+      assert Config.Server.update(Cameras.server(), write, after_rollback: callback) ==
+               {:error, {:write, :boom}}
+
+      assert CameraControl.set("cam1", %{detection_enabled: false}) == {:error, :removed}
+    end
+
     # A restarting owner exits the call `prune_runtime/1` makes into it; that
     # must not abandon the steps after it while the row delete has already
     # committed. `Cairn.CameraStatus` is a running singleton and not

@@ -715,6 +715,92 @@ defmodule Cairn.ConfigSourceTest do
       assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
     end
 
+    # `revive_deleted/1`'s two invariants after the fix: the id-to-revive
+    # stash rides the config server's process dictionary and comes off only
+    # once every revive in it has run — not before the loop, where a mid-loop
+    # exit (the server retries the whole callback up to 5 s) would drop the
+    # ids the aborted pass never reached — and a revive is guarded on the row
+    # still being there, so a later, real delete of the same id landing
+    # before a delayed retry keeps its own tombstone. Both are driven
+    # directly through `Config.Server.update/3` with a write/callback pair
+    # shaped like `replace_rows/2`'s, since forcing the transaction to roll
+    # back *after* `replace_rows/2` has tombstoned and stashed but *before*
+    # it commits is not reachable through `reimport/1` itself — every check
+    # that can fail it runs earlier, before the stash exists.
+    test "a reimport-shaped rollback's revive survives a mid-loop exit and keeps the stash until every id is revived",
+         %{server: server} do
+      test_pid = self()
+      counter = start_supervised!({Agent, fn -> 0 end})
+
+      write = fn ->
+        Process.put(:reimport_test_stash, ["cam_a", "cam_z"])
+        Cairn.CameraControl.tombstone("cam_a")
+        Cairn.CameraControl.tombstone("cam_z")
+        {:error, :boom}
+      end
+
+      callback = fn ->
+        deleted = Process.get(:reimport_test_stash, [])
+
+        Enum.each(deleted, fn
+          "cam_a" ->
+            attempt = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
+            if attempt == 0, do: exit(:simulated_sibling_restart)
+            Cairn.CameraControl.revive("cam_a")
+
+          id ->
+            Cairn.CameraControl.revive(id)
+        end)
+
+        Process.delete(:reimport_test_stash)
+        send(test_pid, :callback_done)
+      end
+
+      assert Config.Server.update(server, write, after_rollback: callback) ==
+               {:error, {:write, :boom}}
+
+      assert_receive :callback_done, 5_000
+
+      assert %{detection_enabled: false} =
+               Cairn.CameraControl.set("cam_a", %{detection_enabled: false})
+
+      assert %{detection_enabled: false} =
+               Cairn.CameraControl.set("cam_z", %{detection_enabled: false})
+
+      Cairn.CameraControl.prune(Map.keys(Cairn.CameraControl.all()) -- ["cam_a", "cam_z"])
+    end
+
+    # The other half of the guard: a delayed retry of the rollback callback
+    # must not revive an id a genuine, newer delete has since re-tombstoned.
+    test "a reimport-shaped rollback's revive does not clear a newer delete's tombstone", %{
+      server: server
+    } do
+      on_exit(fn -> Cairn.CameraControl.revive("cam_z") end)
+
+      write = fn ->
+        Process.put(:reimport_test_stash2, ["cam_z"])
+        Cairn.CameraControl.tombstone("cam_z")
+        {:error, :boom}
+      end
+
+      # Stands in for a newer, real delete of "cam_z" landing before this
+      # older write's own rollback callback runs. The drift warning (this
+      # file's `cameras:` no longer matches the marker) is expected — the
+      # delete itself is what's under test.
+      assert {:ok, _diff, _warnings} = Cameras.delete("cam_z")
+
+      callback = fn ->
+        deleted = Process.get(:reimport_test_stash2, [])
+        Enum.each(deleted, fn id -> if Cameras.get(id), do: Cairn.CameraControl.revive(id) end)
+        Process.delete(:reimport_test_stash2)
+      end
+
+      assert Config.Server.update(server, write, after_rollback: callback) ==
+               {:error, {:write, :boom}}
+
+      assert Cairn.CameraControl.set("cam_z", %{detection_enabled: false}) == {:error, :removed}
+    end
+
     test "an id the file re-inserts after a delete accepts control writes again", %{path: path} do
       # cam_b is in the file but not in the rows: tombstone it as a delete would.
       Cairn.CameraControl.tombstone("cam_b")

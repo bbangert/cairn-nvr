@@ -187,12 +187,22 @@ defmodule Cairn.ConfigSource do
   end
 
   # The rollback undid the row deletes; these ids are back, so the tombstones
-  # the closure installed for them have to come off too. The stash is dropped
-  # here: on this path there is no `after_apply:` to follow.
+  # the closure installed for them have to come off too.
+  #
+  # Guarded on the row rather than reviving unconditionally: this callback
+  # can be retried up to 5 s later (`retry_rollback/3`), and a genuine, later
+  # delete of the same id can commit inside that window — a bare revive would
+  # then clear that newer delete's tombstone instead of only this write's own.
+  #
+  # The stash is dropped only once every revive above has returned, not
+  # before: `CameraControl.revive/1` exiting mid-loop propagates out of this
+  # whole callback, which the server retries from the top, and a stash
+  # cleared any earlier would lose the ids the aborted pass never reached.
+  # On this path there is no `after_apply:` to drop it instead.
   defp revive_deleted(ref) do
     deleted = stashed_deleted(ref)
+    Enum.each(deleted, fn id -> if Cameras.get(id), do: CameraControl.revive(id) end)
     Process.delete({:reimport_deleted, ref})
-    Enum.each(deleted, &CameraControl.revive/1)
   end
 
   defp revive_remaining, do: Enum.each(Cameras.list(), &CameraControl.revive(&1.id))

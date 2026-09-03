@@ -612,6 +612,46 @@ defmodule Cairn.Config.ServerUpdateTest do
     refute_received {:config_changed, _diff}
   end
 
+  # The post-commit prep ahead of the apply (`DataDir.ensure!/1`) owes
+  # `after_apply:` exactly as the apply itself does: both run after the
+  # transaction has committed, so a raise from either must not lose a
+  # committed delete's cleanup.
+  test "after_apply runs when the post-commit data-dir prep raises", %{
+    server: server,
+    path: path,
+    dir: dir
+  } do
+    test_pid = self()
+    Config.Server.subscribe()
+    ref = Process.monitor(server)
+
+    # A regular file sits where the new config's data_dir needs to be a
+    # directory, so `File.mkdir_p!/1` inside `Cairn.DataDir.ensure!/1` raises.
+    blocker = Path.join(dir, "blocker")
+    File.write!(blocker, "not a directory")
+
+    File.write!(path, """
+    data_dir: #{Path.join(blocker, "sub")}
+    profile_dirs:
+      - #{@argv_dir}
+    plugins:
+      full:
+        profile: full
+      partial:
+        profile: partial
+    """)
+
+    catch_exit(
+      Config.Server.update(server, insert_fun("cam_a", "full"),
+        after_apply: fn _diff -> send(test_pid, :callback_ran) end
+      )
+    )
+
+    assert_received :callback_ran
+    assert_receive {:DOWN, ^ref, :process, ^server, _reason}
+    refute_received {:config_changed, _diff}
+  end
+
   defp flush_mailbox do
     receive do
       msg -> [msg | flush_mailbox()]

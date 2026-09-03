@@ -237,7 +237,13 @@ defmodule Cairn.Cameras do
   @spec delete(String.t()) :: write_result()
   def delete(id) do
     Config.Server.update(server(), fn -> delete_row(id) end,
-      after_rollback: fn -> CameraControl.revive(id) end,
+      # Guarded on the row rather than reviving unconditionally: this
+      # callback can be retried up to 5 s later (a failed attempt), and a
+      # later, successful delete of the same id can land — and commit —
+      # inside that window. A bare revive would then clear the newer
+      # delete's tombstone; reviving only when the row is still there
+      # confines this to undoing this write's own tombstone.
+      after_rollback: fn -> if get(id), do: CameraControl.revive(id) end,
       after_apply: fn _diff -> prune_runtime(id) end
     )
   end
