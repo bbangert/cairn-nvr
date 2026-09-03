@@ -658,6 +658,21 @@ defmodule Cairn.Cameras.SettingsTest do
       assert edited["extra_ffmpeg_args"] == ["-rtsp_transport", "tcp"]
     end
 
+    # `args_string/1` renders the non-string element blank, so the field text
+    # matched what it rendered and the identity shortcut put the bad list
+    # straight back — a save the validator refuses, from a form that showed
+    # nothing wrong. The row the operator opened to repair has to be
+    # repairable.
+    test "a saved list holding a non-string element is re-split, not preserved" do
+      row = %Camera{id: "gate", settings: %{"extra_ffmpeg_args" => ["-x", %{}]}, zones: []}
+
+      params = Settings.to_params(row)
+      assert params["extra_ffmpeg_args"] == "-x "
+
+      {:ok, settings} = Settings.to_settings(params, row)
+      assert settings["extra_ffmpeg_args"] == ["-x"]
+    end
+
     # Neither field can supply the credential here: the password says "leave
     # blank to keep" and the username is a prefill, not an entry.
     test "a retyped path keeps the credential the saved URL carried" do

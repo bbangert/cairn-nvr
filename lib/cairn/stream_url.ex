@@ -29,11 +29,11 @@ defmodule Cairn.StreamUrl do
   as `ret@host`. Anything past that boundary is `rest`, so an `@` in a path or
   query is left alone. A URL with no `//` has no authority to split.
 
-  A raw `/` inside a userinfo is the case this cannot resolve: it ends the
-  authority before any `@` is seen, so no userinfo is found and the credential
-  would be rendered in full. Such a URL is *ambiguous* rather than bare — see
-  `ambiguous?/1`, which the display and splice paths consult and this function
-  does not.
+  Two shapes this cannot resolve, both of which report no userinfo here and so
+  would be rendered in full: a raw `/` inside a userinfo (it ends the authority
+  before any `@` is seen) and a URL with no `//` at all (there is no authority
+  to look in). Both are *ambiguous* rather than bare — see `ambiguous?/1`,
+  which the display and splice paths consult and this function does not.
   """
   @spec split_authority(String.t()) :: {String.t(), String.t() | nil, String.t()}
   def split_authority(url) when is_binary(url) do
@@ -75,8 +75,12 @@ defmodule Cairn.StreamUrl do
   end
 
   @doc """
-  Whether the URL holds an `@` past the authority's first `/` (and before any
-  `?` or `#`) with no `@` in the authority itself — `rtsp://u:pa/ss@cam.lan/main`.
+  Whether the URL holds an `@` that `split_authority/1` reads as no credential
+  at all: past the authority's first `/` with no `@` in the authority itself
+  (`rtsp://u:pa/ss@cam.lan/main`), or anywhere before a `?`/`#` in a URL with
+  no `//` to open an authority (`rtsp:/user:secret@host/live`, a malformed
+  stored value). Both are `@`s with a credential plausibly in front of them and
+  no boundary this module can trust, so both fail closed.
 
   A hand-typed or imported password really does contain a raw slash sometimes,
   and there is no way to tell that URL from a bare one whose *path* holds an
@@ -104,8 +108,12 @@ defmodule Cairn.StreamUrl do
         {authority, _tail} = split_at_path(onward)
         if last_at(authority) == nil, do: last_at_before_query(prefix <> "//", onward)
 
+      # No `//`, so `split_authority/1` finds no userinfo and every reader
+      # would treat the whole string as bare. An `@` in it is a credential
+      # boundary as good as any other, and the scheme is not worth preserving
+      # in a URL already malformed enough to reach here.
       [_no_authority] ->
-        nil
+        last_at_before_query(@blank, url)
     end
   end
 
@@ -347,7 +355,9 @@ defmodule Cairn.StreamUrl do
   typed password replaces it (and keeps the colonless shape the camera was
   given), a typed username moves it into the password slot rather than
   deleting it. Reading it as a username instead published the old password as
-  the form's `value=`.
+  the form's `value=`. A username typed onto a URL with no userinfo at all
+  therefore gets an explicit empty password slot (`user:@host`) rather than the
+  colonless `user@host` this module would read back as a password.
 
   An ambiguous URL (`ambiguous?/1`) is returned unchanged: its `@` may be
   inside a password or inside a path, and splicing on the wrong reading
@@ -384,7 +394,12 @@ defmodule Cairn.StreamUrl do
   # instead — dropping the userinfo here silently discarded the typed
   # password. Both `mask/1` and `credentialed?/1` already read this form.
   defp compose_userinfo(nil, pass, false), do: ":" <> pass
-  defp compose_userinfo(user, nil, _colonless), do: user
+  # The colon is kept even with nothing after it: a bare `user@host` is a
+  # colonless userinfo, which this module reads as a password-only credential
+  # everywhere else — `user/1` would then return `nil` for the name just typed
+  # and `mask/1` would hide it. Only a URL that had no userinfo at all reaches
+  # here, so there is no saved password the empty slot could be shadowing.
+  defp compose_userinfo(user, nil, _colonless), do: user <> ":"
   defp compose_userinfo(user, pass, _colonless), do: user <> ":" <> pass
 
   # The module's one reading of a userinfo: no colon means no username, so the

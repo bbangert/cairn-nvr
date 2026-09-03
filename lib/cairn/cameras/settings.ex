@@ -362,11 +362,18 @@ defmodule Cairn.Cameras.Settings do
   # still equal to what `args_string/1` rendered is therefore not re-split at
   # all: the saved list rides out as it went in, and only an edit splits
   # (D-P5).
+  #
+  # Only a list of binaries earns that: `args_string/1` renders a non-string
+  # element blank, so a malformed saved `["-x", %{}]` matches its own text and
+  # would be restored verbatim from a field that looked valid — a save the
+  # validator then rejects with no field to fix. Re-splitting the text is the
+  # repair the operator opened the form for.
   defp put_args(acc, params, saved) do
     text = Map.get(params, "extra_ffmpeg_args") || @blank
     saved_args = saved["extra_ffmpeg_args"]
 
-    if is_list(saved_args) and text == args_string(saved_args) do
+    if is_list(saved_args) and Enum.all?(saved_args, &is_binary/1) and
+         text == args_string(saved_args) do
       if saved_args == [], do: acc, else: Map.put(acc, "extra_ffmpeg_args", saved_args)
     else
       case String.split(text) do

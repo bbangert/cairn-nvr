@@ -692,6 +692,40 @@ defmodule Cairn.ConfigSourceTest do
       assert message =~ "id"
     end
 
+    # A cast error's `type` is the Ecto type itself, and a composite one is a
+    # tuple with no `String.Chars`. Converting every option whether or not the
+    # message interpolates it raised here — from inside the rescue whose job
+    # is to turn the import failure into text.
+    test "an error option with no String.Chars does not take the description down" do
+      changeset =
+        %Camera{}
+        |> Camera.changeset(%{id: "gate", position: 0, settings: %{}})
+        |> Ecto.Changeset.add_error(:settings, "is invalid",
+          type: {:array, :string},
+          validation: :cast
+        )
+
+      message =
+        ConfigSource.describe_import_error(%Ecto.InvalidChangesetError{changeset: changeset})
+
+      assert message == "settings is invalid"
+    end
+
+    test "a placeholder present in the message is still interpolated" do
+      changeset =
+        %Camera{}
+        |> Camera.changeset(%{id: "gate", position: 0, settings: %{}})
+        |> Ecto.Changeset.add_error(:id, "should be at most %{count} character(s)",
+          count: 3,
+          type: {:array, :string}
+        )
+
+      message =
+        ConfigSource.describe_import_error(%Ecto.InvalidChangesetError{changeset: changeset})
+
+      assert message == "id should be at most 3 character(s)"
+    end
+
     test "a constraint error names only the constraint" do
       message =
         ConfigSource.describe_import_error(%Ecto.ConstraintError{

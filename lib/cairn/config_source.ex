@@ -72,16 +72,27 @@ defmodule Cairn.ConfigSource do
   @spec describe_import_error(Exception.t()) :: String.t()
   def describe_import_error(%Ecto.InvalidChangesetError{changeset: changeset}) do
     changeset
-    |> Ecto.Changeset.traverse_errors(fn {msg, opts} ->
-      Enum.reduce(opts, msg, fn {key, value}, acc ->
-        String.replace(acc, "%{#{key}}", to_string(value))
-      end)
-    end)
+    |> Ecto.Changeset.traverse_errors(&interpolate/1)
     |> Enum.map_join("; ", fn {field, msgs} -> "#{field} #{Enum.join(msgs, ", ")}" end)
   end
 
   def describe_import_error(%Ecto.ConstraintError{constraint: name}),
     do: "constraint #{name} failed"
+
+  # Converted only on a hit, and through `inspect/1` for anything not
+  # `String.Chars`: a cast error carries metadata like `type: {:array,
+  # :string}` that no message interpolates, and converting every option
+  # eagerly raised here — inside the rescue whose whole job is to turn an
+  # import failure into text.
+  defp interpolate({msg, opts}) do
+    Enum.reduce(opts, msg, fn {key, value}, acc ->
+      String.replace(acc, "%{#{key}}", fn _match -> printable(value) end)
+    end)
+  end
+
+  defp printable(value) do
+    if String.Chars.impl_for(value), do: to_string(value), else: inspect(value)
+  end
 
   defp degrade(path, message) do
     case Config.raw_map(path) do

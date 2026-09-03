@@ -85,7 +85,22 @@ defmodule Cairn.Cameras.CandidateTest do
       assert result.preexisting_fleet == []
     end
 
-    test "a fleet-level fault in the globals survives the candidate's removal" do
+    # The saved row stays in the baseline unchanged, so a conflict it was
+    # already party to is not something this edit introduced. Validating the
+    # baseline with the row removed instead took the other half of the
+    # conflict away with it and reported a fault nobody just made.
+    test "an unchanged edit of a row already in a fleet conflict reports it pre-existing" do
+      rows = [row("cam1", %{"plugin" => "full"}), row("cam2", %{"plugin" => "partial"})]
+
+      result = Candidate.validate(row("cam1", %{"plugin" => "full"}), rows, model_globals())
+
+      assert result.own == []
+      assert [message] = result.fleet
+      assert message =~ "different models (full, partial)"
+      assert result.preexisting_fleet == result.fleet
+    end
+
+    test "a fleet-level fault in the globals is pre-existing, not the candidate's" do
       globals = Map.put(globals(), "retention", %{"days" => -1})
 
       result = Candidate.validate(row("cam1"), [row("cam1")], globals)

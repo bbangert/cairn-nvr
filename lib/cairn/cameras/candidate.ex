@@ -25,8 +25,8 @@ defmodule Cairn.Cameras.Candidate do
   skip is the one thing this save must not write); `others` cannot be fixed
   from this form and `Cairn.Config.Server.update/3` skips those rows anyway;
   `fleet` is everything `Cairn.Config.partition_by_camera/1` could not pin on
-  a camera, of which `preexisting_fleet` is the part that is true without the
-  candidate.
+  a camera, of which `preexisting_fleet` is the part already true of `rows`
+  before the candidate was applied to them.
   """
   @type result :: %{
           errors: [String.t()],
@@ -58,7 +58,7 @@ defmodule Cairn.Cameras.Candidate do
           own: Map.get(per_camera, id, []),
           others: Map.delete(per_camera, id),
           fleet: fleet_errors,
-          preexisting_fleet: preexisting_fleet(fleet_errors, rows, globals, id, opts),
+          preexisting_fleet: preexisting_fleet(fleet_errors, rows, globals, opts),
           warnings: []
         }
     end
@@ -76,22 +76,25 @@ defmodule Cairn.Cameras.Candidate do
 
   defp replace(row, candidate, id), do: if(Map.get(row, "id") == id, do: candidate, else: row)
 
-  # The fleet-level messages the fleet already had with this row left out
-  # entirely — nothing stands in for it, so a rule the candidate alone trips
-  # cannot appear. A fault in the globals themselves (bad retention, a broken
-  # plugin config) files as fleet-level the same as a cross-camera rule, and
-  # surviving the row's removal is what tells the two apart: the caller can
-  # excuse the second for a camera that is disabled (it will not bind until
-  # the toggle flips, and the load re-checks it then) but never the first.
+  # The fleet-level messages the fleet already had before this edit: `rows` as
+  # given, the saved row still in it and unchanged. Dropping the row instead
+  # made every fault it was already party to (a model mismatch against another
+  # camera, say) look newly introduced by an edit that touched neither side. A
+  # new or disabled candidate is simply not in `rows` to begin with, so the
+  # baseline is the fleet without it either way.
+  #
+  # A fault in the globals themselves (bad retention, a broken plugin config)
+  # files as fleet-level the same as a cross-camera rule, and surviving this
+  # pass is what tells "already broken" from "this edit broke it": the caller
+  # can excuse the first for a camera that is disabled (it will not bind until
+  # the toggle flips, and the load re-checks it then) but never the second.
   #
   # Compared against `fleet_errors` from the same pass, so an equal message is
   # the same rule failing for the same reason.
-  defp preexisting_fleet([], _rows, _globals, _id, _opts), do: []
+  defp preexisting_fleet([], _rows, _globals, _opts), do: []
 
-  defp preexisting_fleet(fleet_errors, rows, globals, id, opts) do
-    baseline = Enum.reject(rows, &(Map.get(&1, "id") == id))
-
-    case Config.from_map(Map.put(globals, "cameras", baseline), opts) do
+  defp preexisting_fleet(fleet_errors, rows, globals, opts) do
+    case Config.from_map(Map.put(globals, "cameras", rows), opts) do
       {:error, errors} ->
         {_per_camera, baseline_fleet} = Config.partition_by_camera(errors)
         Enum.filter(fleet_errors, &(&1 in baseline_fleet))

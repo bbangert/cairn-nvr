@@ -228,6 +228,16 @@ defmodule Cairn.StreamUrlTest do
       assert StreamUrl.compose("rtsp://SECRET@h/1", "user", "") == "rtsp://user:SECRET@h/1"
     end
 
+    # `user@host` is colonless, which this module reads as password-only: the
+    # name would come back as `nil` from `user/1` and be hidden by `mask/1`.
+    test "a username typed onto a bare URL gets an explicit empty password slot" do
+      composed = StreamUrl.compose("rtsp://cam.lan/main", "ops", "")
+
+      assert composed == "rtsp://ops:@cam.lan/main"
+      assert StreamUrl.user(composed) == "ops"
+      assert StreamUrl.mask(composed) == "rtsp://ops:•••••@cam.lan/main"
+    end
+
     test "a colonless userinfo nobody typed over is untouched" do
       assert StreamUrl.compose("rtsp://SECRET@h/1", "", "") == "rtsp://SECRET@h/1"
     end
@@ -270,6 +280,43 @@ defmodule Cairn.StreamUrlTest do
       assert StreamUrl.strip_credentials(url) == "rtsp://h/live@1"
       assert StreamUrl.user(url) == "u"
       assert StreamUrl.compose(url, "", "new") == "rtsp://u:new@h/live@1"
+    end
+
+    # A stored value malformed this way reads as bare everywhere —
+    # `split_authority/1` finds no `//` to open an authority in — so the
+    # readout rendered the password and the form's prefill rule called the
+    # row clean.
+    @no_slashes "rtsp:/user:secret@host/live"
+
+    test "a //-less URL with an @ is ambiguous like the @-after-path form" do
+      url = @no_slashes
+
+      assert StreamUrl.ambiguous?(url)
+      assert StreamUrl.credentialed?(url)
+      assert StreamUrl.mask(url) == "•••••@host/live"
+      refute StreamUrl.mask(url) =~ "secret"
+    end
+
+    test "a //-less URL strips through its @, and offers no username" do
+      url = @no_slashes
+
+      assert StreamUrl.strip_credentials(url) == "host/live"
+      assert StreamUrl.user(url) == nil
+      assert StreamUrl.userinfo(url) == nil
+    end
+
+    test "a //-less URL is never spliced into" do
+      url = @no_slashes
+
+      assert StreamUrl.compose(url, "ops", "pw") == url
+    end
+
+    # Same stopping point as the `//` form: past a `?` an `@` is a query
+    # character.
+    test "a //-less URL with no @ before the query stays bare" do
+      refute StreamUrl.ambiguous?("rtsp:/host/live?to=me@h")
+      refute StreamUrl.credentialed?("rtsp:/host/live?to=me@h")
+      assert StreamUrl.mask("rtsp:/host/live") == "rtsp:/host/live"
     end
 
     test "an @ after the query has no authority to confuse" do
