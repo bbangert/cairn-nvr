@@ -79,6 +79,26 @@ defmodule Cairn.CameraControlTest do
     assert CameraControl.get(id) == @defaults
   end
 
+  # The delete's membership is frozen on the delete's diff, so the create that
+  # overtook it in the snapshot cannot save the old overlay: pruning against
+  # the moving snapshot here would leave the new camera wearing it.
+  test "a delete handled after the same id was re-created still drops the overlay" do
+    id = "cc_#{System.unique_integer([:positive])}"
+    assert %{detection_enabled: false} = CameraControl.put(id, %{detection_enabled: false})
+
+    with_snapshot_naming(id, fn ->
+      send(CameraControl, {:config_changed, %{diff() | known: without(id)}})
+      :sys.get_state(CameraControl)
+
+      assert CameraControl.get(id) == @defaults
+
+      send(CameraControl, {:config_changed, %{diff() | known: with_id(id)}})
+      :sys.get_state(CameraControl)
+
+      assert CameraControl.get(id) == @defaults
+    end)
+  end
+
   # Every config server broadcasts on the one config topic, so an owner that
   # acted on a private test server's diff would prune this table against the
   # application snapshot that diff never moved.
@@ -104,9 +124,21 @@ defmodule Cairn.CameraControlTest do
     :ok
   end
 
+  # `known` is what the owner prunes against, and it rides the diff; the ids
+  # the application config names are what the real broadcast would carry.
   defp diff do
-    %{added: [], removed: [], changed: [], refreshed: [], server: Config.Server}
+    %{
+      added: [],
+      removed: [],
+      changed: [],
+      refreshed: [],
+      server: Config.Server,
+      known: Config.Server.known_ids()
+    }
   end
+
+  defp without(id), do: MapSet.delete(Config.Server.known_ids(), id)
+  defp with_id(id), do: MapSet.put(Config.Server.known_ids(), id)
 
   # The published snapshot is the application's, so both helpers restore it.
   defp with_snapshot_naming(id, fun) do

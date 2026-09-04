@@ -58,14 +58,16 @@ defmodule Cairn.Config.ServerTest do
     assert {:ok, diff, []} = Config.Server.reload(server)
 
     # `server` is the pid because this one is unnamed: the tag is what an
-    # owner filters a shared-topic broadcast on (`t:Cairn.Config.Server.diff/0`).
+    # owner filters a shared-topic broadcast on (`t:Cairn.Config.Server.diff/0`),
+    # and `known` is the fleet as of this version, which is what it prunes to.
     assert diff == %{
              added: ["cam_c"],
              removed: ["cam_b"],
              changed: ["cam_a"],
              refreshed: [],
              version: 2,
-             server: server
+             server: server,
+             known: MapSet.new(["cam_a", "cam_c"])
            }
 
     assert_received {:applied, ^diff, %Config{}}
@@ -761,6 +763,35 @@ defmodule Cairn.Config.ServerTest do
       )
 
       assert Config.Server.known_ids(name) == MapSet.new(["cam_a", "cam_off"])
+    end
+
+    # The owners prune against `diff.known` rather than the moving snapshot,
+    # so the two must agree camera for camera at the version that produced it
+    # — dormant rows included.
+    test "the diff's known is the version's own known_ids, dormant included", %{path: path} do
+      name = :"diff_known_#{System.unique_integer([:positive])}"
+      on_exit(fn -> :persistent_term.erase(Config.Server.snapshot_key(name)) end)
+
+      config = camera_config([%{"id" => "cam_a", "rtsp_url" => "rtsp://h/1"}], %{})
+
+      source = fn _path ->
+        {:ok, %{config | dormant: [%Config.Camera{id: "cam_off"}]}, [], %{}}
+      end
+
+      server =
+        start_supervised!(
+          {Config.Server,
+           path: path,
+           name: name,
+           source: source,
+           apply_diff: fn _diff, _config -> :ok end,
+           apply_native: fn _config -> :ok end},
+          id: :diff_known_server
+        )
+
+      assert {:ok, diff, []} = Config.Server.reload(server)
+      assert diff.known == MapSet.new(["cam_a", "cam_off"])
+      assert diff.known == Config.Server.known_ids(name)
     end
   end
 

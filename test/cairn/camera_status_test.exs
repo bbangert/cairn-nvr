@@ -55,6 +55,25 @@ defmodule Cairn.CameraStatusTest do
     assert CameraStatus.all()["cam_a"]
   end
 
+  # The delete's membership is frozen on the delete's diff, so the create that
+  # overtook it in the snapshot cannot save the old row: pruning against the
+  # moving snapshot here would leave the new camera wearing the old status.
+  test "a delete handled after the same id was re-created still drops the row", %{id: id} do
+    CameraStatus.put(id, %{status: :running})
+
+    with_snapshot_naming(id, fn ->
+      send(CameraStatus, {:config_changed, %{diff() | known: without(id)}})
+      :sys.get_state(CameraStatus)
+
+      assert CameraStatus.all()[id] == nil
+
+      send(CameraStatus, {:config_changed, %{diff() | known: with_id(id)}})
+      :sys.get_state(CameraStatus)
+
+      assert CameraStatus.all()[id] == nil
+    end)
+  end
+
   # Every config server broadcasts on the one config topic, so an owner that
   # acted on a private test server's diff would prune this table against the
   # application snapshot that diff never moved.
@@ -111,15 +130,21 @@ defmodule Cairn.CameraStatusTest do
     :ok
   end
 
+  # `known` is what the owner prunes against, and it rides the diff; the ids
+  # the application config names are what the real broadcast would carry.
   defp diff do
     %{
       added: [],
       removed: [],
       changed: [],
       refreshed: [],
-      server: Cairn.Config.Server
+      server: Cairn.Config.Server,
+      known: Cairn.Config.Server.known_ids()
     }
   end
+
+  defp without(id), do: MapSet.delete(Cairn.Config.Server.known_ids(), id)
+  defp with_id(id), do: MapSet.put(Cairn.Config.Server.known_ids(), id)
 
   # The published snapshot is the application's, so both helpers restore it.
   defp with_snapshot_naming(id, fun) do

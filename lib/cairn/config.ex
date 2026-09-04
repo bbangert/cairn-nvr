@@ -208,6 +208,10 @@ defmodule Cairn.Config do
   PubSub topic `Cairn.Config.Server` announces every config it applies after
   boot — reloads and accepted saves — as `{:config_changed, diff}`. The boot
   install is silent: PubSub starts below the server.
+
+  Broadcast node-locally. A config is the node's own and its subscribers act
+  on node-local state, so a peer's diff is not something a listener here can
+  or should apply.
   """
   @spec topic() :: String.t()
   def topic, do: "config"

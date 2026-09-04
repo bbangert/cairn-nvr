@@ -183,7 +183,10 @@ defmodule Cairn.CamerasDeleteFlowTest do
       changed: [],
       refreshed: [],
       version: 0,
-      server: Config.Server
+      server: Config.Server,
+      # What the owners prune against: the fleet as of this diff, which
+      # `publish_fleet/1` has just moved.
+      known: Config.Server.known_ids()
     }
 
     for owner <- @owners, do: send(owner, {:config_changed, diff})

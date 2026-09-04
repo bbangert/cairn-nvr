@@ -46,6 +46,8 @@ defmodule Cairn.PresenceRecorderTest do
 
   setup do
     camera_id = "prec_#{System.unique_integer([:positive])}"
+    # The checkpoint owner drops a write for a camera the fleet does not name.
+    Cairn.SnapshotHelpers.lend_cameras(camera_id)
     camera = %Camera{id: camera_id, rtsp_url: "rtsp://h/1", min_score: %{"default" => 0.5}}
 
     Event.subscribe()
@@ -881,7 +883,7 @@ defmodule Cairn.PresenceRecorderTest do
     }
 
     eid = event.id
-    PresenceCheckpoint.put(id, event, [{nil, "person"}], nil)
+    PresenceCheckpoint.put!(id, event, [{nil, "person"}], nil)
 
     log =
       capture_log(fn ->

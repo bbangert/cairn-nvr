@@ -32,6 +32,8 @@ defmodule Cairn.CameraTrackerTest do
 
   setup do
     camera_id = "trk_#{System.unique_integer([:positive])}"
+    # The checkpoint owner drops a write for a camera the fleet does not name.
+    Cairn.SnapshotHelpers.lend_cameras(camera_id)
     camera = %Camera{id: camera_id, rtsp_url: "rtsp://h/1", min_score: %{"default" => 0.5}}
     test_pid = self()
 
@@ -1357,7 +1359,7 @@ defmodule Cairn.CameraTrackerTest do
 
   test "orphaned checkpoint entries are ended as partial on restart", %{camera_id: id} do
     event = %Event{id: Ecto.UUID.generate(), camera_id: id, started_at: DateTime.utc_now()}
-    EventCheckpoint.put(id, event)
+    EventCheckpoint.put!(id, event)
 
     start_supervised!({CameraTracker, camera_id: id, name: nil}, id: :tracker_restore)
 
@@ -1374,7 +1376,7 @@ defmodule Cairn.CameraTrackerTest do
     event = %Event{id: Ecto.UUID.generate(), camera_id: id, started_at: DateTime.utc_now()}
     {:ok, _} = Events.create_active(event, "clip.mp4")
     {:ok, _} = Events.finalize(%{event | ended_at: DateTime.utc_now()}, 1_024)
-    EventCheckpoint.put(id, event)
+    EventCheckpoint.put!(id, event)
 
     start_supervised!({CameraTracker, camera_id: id, name: nil}, id: :tracker_restore_finalized)
 
@@ -1391,7 +1393,7 @@ defmodule Cairn.CameraTrackerTest do
     event = %Event{id: Ecto.UUID.generate(), camera_id: id, started_at: DateTime.utc_now()}
     stale = stale_entry(id, {:extractor, event.id})
     refute Process.alive?(stale)
-    EventCheckpoint.put(id, event)
+    EventCheckpoint.put!(id, event)
 
     eid = event.id
 
@@ -1416,7 +1418,7 @@ defmodule Cairn.CameraTrackerTest do
       end)
 
     assert_receive :registered
-    EventCheckpoint.put(id, event)
+    EventCheckpoint.put!(id, event)
 
     tracker =
       start_supervised!(
@@ -1460,7 +1462,7 @@ defmodule Cairn.CameraTrackerTest do
       last_seen_at: event.started_at
     }
 
-    EventCheckpoint.put(id, event, [track])
+    EventCheckpoint.put!(id, event, [track])
 
     test_pid = self()
 
@@ -2186,7 +2188,7 @@ defmodule Cairn.CameraTrackerTest do
       # process removed from CameraTracker, so its snapshot is read off the
       # driver rather than off the dead process's own state
       event = %Event{id: Ecto.UUID.generate(), camera_id: dead_id, started_at: DateTime.utc_now()}
-      EventCheckpoint.put(dead_id, event, checkpoint_tracks(dead_id))
+      EventCheckpoint.put!(dead_id, event, checkpoint_tracks(dead_id))
 
       ref = Process.monitor(dead)
       Process.exit(dead, :kill)
@@ -2280,7 +2282,7 @@ defmodule Cairn.CameraTrackerTest do
          %{camera_id: id} do
       event = %Event{id: Ecto.UUID.generate(), camera_id: id, started_at: DateTime.utc_now()}
       track = restored_track(id)
-      EventCheckpoint.put(id, event, [track])
+      EventCheckpoint.put!(id, event, [track])
 
       refute Cairn.Registry.whereis(id, :camera_tracker)
       assert :ok = CameraTracker.restore_checkpointed()
@@ -2298,7 +2300,7 @@ defmodule Cairn.CameraTrackerTest do
          %{camera_id: id} do
       event = %Event{id: Ecto.UUID.generate(), camera_id: id, started_at: DateTime.utc_now()}
       extractor = registered_relay(id, event.id)
-      EventCheckpoint.put(id, event, [])
+      EventCheckpoint.put!(id, event, [])
 
       assert :ok = CameraTracker.restore_checkpointed()
       assert tracker = Cairn.Registry.whereis(id, :camera_tracker)
@@ -2322,6 +2324,7 @@ defmodule Cairn.CameraTrackerTest do
     # child left running would answer a later `ensure/1` for the same id.
     defp registered_camera_id do
       id = "trkreg_#{System.unique_integer([:positive])}"
+      Cairn.SnapshotHelpers.lend_cameras(id)
       Cairn.CameraControl.put(id, %{recording_enabled: false})
 
       on_exit(fn ->

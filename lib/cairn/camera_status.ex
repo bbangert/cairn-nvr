@@ -16,9 +16,9 @@ defmodule Cairn.CameraStatus do
   also what prunes. It subscribes to the config topic and drops the rows of
   cameras the new config no longer names, in its own callback — nobody hands
   it a list of ids, and a camera that comes back starts at `:unknown`. It
-  prunes against the application config server's published snapshot, and only
-  on that server's broadcasts — and drops a write for a camera that snapshot
-  does not name, so a late report cannot restore a pruned row.
+  prunes against the membership the diff carries and only on the application
+  config server's broadcasts — and drops a write for a camera that server's
+  moving snapshot does not name, so a late report cannot restore a pruned row.
   """
 
   use GenServer
@@ -137,27 +137,29 @@ defmodule Cairn.CameraStatus do
     Phoenix.PubSub.local_broadcast(Cairn.PubSub, @topic, {:camera_status, camera_id, info})
   end
 
-  # Only the application server's diffs: they name the snapshot this prunes
-  # against (`t:Cairn.Config.Server.diff/0`).
+  # Only the application server's diffs: this table holds that server's fleet
+  # (`t:Cairn.Config.Server.diff/0`).
   @impl true
-  def handle_info({:config_changed, %{server: Cairn.Config.Server}}, state) do
-    prune(Cairn.Config.Server.known_ids())
+  def handle_info(
+        {:config_changed, %{server: Cairn.Config.Server, known: %MapSet{} = known}},
+        state
+      ) do
+    prune(known)
     {:noreply, state}
   end
 
-  def handle_info({:config_changed, _another_servers_diff}, state), do: {:noreply, state}
+  # Another server's diff, or one without the membership this owner prunes on.
+  def handle_info({:config_changed, _other}, state), do: {:noreply, state}
 
   # No snapshot is not an empty fleet: a server that has published none (an
   # unnamed one, or one still in `init/1`) cannot say which cameras exist, so
-  # it can neither drop a write nor empty the table.
+  # it cannot drop a write.
   defp known?(camera_id) do
     case Cairn.Config.Server.known_ids() do
       nil -> true
       known -> MapSet.member?(known, camera_id)
     end
   end
-
-  defp prune(nil), do: :ok
 
   defp prune(known) do
     for {camera_id, _} <- :ets.tab2list(@table), not MapSet.member?(known, camera_id) do
