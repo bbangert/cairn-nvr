@@ -29,4 +29,21 @@ defmodule Cairn.SnapshotHelpers do
 
     :ok
   end
+
+  @doc """
+  A `:config_changed` diff's `known` set for a delete of `camera_id` alone.
+
+  The real snapshot minus the id under test is not enough in the full suite:
+  every other suite's fixture recorder/tracker is registered too, and a
+  `known` that omits them makes this delete look like theirs as well —
+  `Cairn.CameraReaper` and `Cairn.EventCheckpoint` stop processes no test
+  here is expecting to lose. Adding every currently-registered lane-owner id
+  keeps the diff's effect scoped to `camera_id`.
+  """
+  @spec known_ids_excluding(String.t()) :: MapSet.t(String.t())
+  def known_ids_excluding(camera_id) do
+    Cairn.Config.Server.known_ids()
+    |> MapSet.union(MapSet.new(Cairn.Registry.camera_ids([:presence_recorder, :camera_tracker])))
+    |> MapSet.delete(camera_id)
+  end
 end

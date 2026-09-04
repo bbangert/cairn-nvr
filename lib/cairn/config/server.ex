@@ -104,10 +104,9 @@ defmodule Cairn.Config.Server do
   `Cairn.Config.topic/0` is one topic for every server, so a private server
   (a test's) broadcasts onto the same wire as the application singleton. The
   runtime owners — `Cairn.CameraStatus`, `Cairn.CameraControl`,
-  `Cairn.EventCheckpoint`, `Cairn.PresenceCheckpoint`, and the three
-  `Cairn.CameraReaper`s that end a deleted camera's recorder, tracker and
-  extractors —
-  own tables and processes for the singleton's fleet, so acting on another
+  `Cairn.EventCheckpoint`, `Cairn.PresenceCheckpoint`, and the
+  `Cairn.CameraReaper` that ends a deleted camera's recorder, tracker and
+  extractors — own tables and processes for the singleton's fleet, so acting on another
   server's diff would prune them against a fleet that diff never described.
   They match `server: Cairn.Config.Server` and ignore the rest.
   """

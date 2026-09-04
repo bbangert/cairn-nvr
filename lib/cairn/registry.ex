@@ -80,4 +80,10 @@ defmodule Cairn.Registry do
       {{{:"$1", role}, :_, :_}, [], [:"$1"]}
     ])
   end
+
+  @doc "Camera ids currently registered under any of `roles`, deduplicated."
+  @spec camera_ids([atom()]) :: [String.t()]
+  def camera_ids(roles) do
+    roles |> Enum.flat_map(&ids_for_role/1) |> Enum.uniq()
+  end
 end

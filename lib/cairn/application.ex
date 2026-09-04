@@ -66,9 +66,10 @@ defmodule Cairn.Application do
       {Cairn.TrackerSupervisor, []},
       {Cairn.PresenceSupervisor, []},
       {Cairn.EventSupervisor, []},
-      # After the extractors it ends: a camera deleted from the config leaves
-      # its clips open under that supervisor, which nothing else closes.
-      {Cairn.CameraReaper, role: :extractor, name: Cairn.EventSupervisor.Reaper},
+      # After all three pools it reaps — recorders, trackers, extractors — and
+      # one process for the three, so a deleted camera's lane owners are
+      # stopped before its extractors are swept rather than racing them.
+      {Cairn.CameraReaper, []},
       # Before the cameras that mint epochs into it
       {Cairn.StreamEpochs, []},
       # After the epochs it announces under, before the cameras that open

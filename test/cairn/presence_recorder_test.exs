@@ -1589,7 +1589,7 @@ defmodule Cairn.PresenceRecorderTest do
   defp deleted(camera_id) do
     prune(%{
       removed: [camera_id],
-      known: MapSet.delete(Cairn.Config.Server.known_ids(), camera_id)
+      known: Cairn.SnapshotHelpers.known_ids_excluding(camera_id)
     })
   end
 
@@ -1613,10 +1613,12 @@ defmodule Cairn.PresenceRecorderTest do
       )
 
     # `:sys.get_state/1` after each send is what orders the prune, which runs
-    # in the owner's process, against the assertions below it.
-    for owner <- [PresenceCheckpoint, Cairn.PresenceSupervisor.Reaper] do
+    # in the owner's process, against the assertions below it. The reaper's
+    # answer can wait on every lane owner the full suite has registered, so
+    # the sync gets a generous timeout rather than the default 5 s.
+    for owner <- [PresenceCheckpoint, Cairn.CameraReaper] do
       send(owner, {:config_changed, diff})
-      :sys.get_state(owner)
+      :sys.get_state(owner, 15_000)
     end
 
     :ok

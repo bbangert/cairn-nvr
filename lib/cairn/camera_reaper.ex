@@ -1,6 +1,6 @@
 defmodule Cairn.CameraReaper do
   @moduledoc """
-  Ends one role's per-camera work when the camera leaves the config.
+  Ends a camera's per-camera work when the camera leaves the config.
 
   The event lanes live outside their camera's media tree — a
   `Cairn.PresenceRecorder` under `Cairn.PresenceSupervisor.Pool`, a
@@ -20,8 +20,8 @@ defmodule Cairn.CameraReaper do
   `Cairn.PresenceRecorder.ensure/1` could hand a caller anything but a fresh
   process for a re-created id.
 
-  The `:extractor` role is the third instance and the one that does not stop
-  what it finds. An extractor under `Cairn.EventSupervisor` outlives both its
+  The extractors are what this does not stop. An extractor under
+  `Cairn.EventSupervisor` outlives both its
   lane owner and its camera's tree: nothing but a `{:finalize, event}` ends
   one, so a deleted camera's clip would stay open and its row `active` for as
   long as the node runs — and once the id is re-created,
@@ -32,9 +32,16 @@ defmodule Cairn.CameraReaper do
   row keyed by the event rather than the camera, which is why nothing about it
   can collide with a re-created id.
 
-  One instance per pool, told its `Cairn.Registry` role. Prunes on the
-  application config server's diffs alone and against the membership that diff
-  carries, `Cairn.EventCheckpoint`'s rule and for its reason.
+  One process for all three roles, because the order among them is the point.
+  Split across the pools they would have been three subscribers of one
+  broadcast, and the extractor sweep could run first: a tracker with a batch
+  queued ahead of its stop opens an event and starts an extractor while it is
+  being stopped, and a sweep that has already run leaves that extractor
+  writing a clip on an `active` row for a camera that no longer exists.
+
+  Prunes on the application config server's diffs alone and against the
+  membership that diff carries, `Cairn.EventCheckpoint`'s rule and for its
+  reason.
   """
 
   use GenServer
@@ -42,48 +49,71 @@ defmodule Cairn.CameraReaper do
   require Logger
 
   # A stopped lane owner's open event is abandoned rather than closed here:
-  # the clip itself belongs to the extractor, which the `:extractor` instance
-  # ends partial on the same broadcast.
+  # the clip itself belongs to the extractor, which the sweep below ends
+  # partial in the same pass.
   @stop_timeout 5_000
 
-  @doc "`:role` is the `t:Cairn.Registry.role/0` this instance reaps."
+  @lane_roles [:presence_recorder, :camera_tracker]
+
   def start_link(opts) do
     {name, opts} = Keyword.pop(opts, :name, __MODULE__)
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
   @impl true
-  def init(opts) do
+  def init(_opts) do
     Cairn.Config.Server.subscribe()
-    {:ok, %{role: Keyword.fetch!(opts, :role)}}
+    {:ok, %{}}
   end
 
   @impl true
   def handle_info(
         {:config_changed, %{server: Cairn.Config.Server, known: %MapSet{} = known}},
-        %{role: :extractor} = state
-      ) do
-    Cairn.Registry.extractors()
-    |> Enum.reject(fn {camera_id, _event_id, _pid} -> MapSet.member?(known, camera_id) end)
-    |> Enum.each(&end_partial/1)
-
-    {:noreply, state}
-  end
-
-  def handle_info(
-        {:config_changed, %{server: Cairn.Config.Server, known: %MapSet{} = known}},
         state
       ) do
-    state.role
-    |> Cairn.Registry.ids_for_role()
-    |> Enum.reject(&MapSet.member?(known, &1))
-    |> Enum.each(&stop(&1, state.role))
-
+    stop_lane_owners(known)
+    end_extractors(known)
     {:noreply, state}
   end
 
   # Another server's diff, or one without the membership this owner prunes on.
   def handle_info({:config_changed, _other}, state), do: {:noreply, state}
+
+  # Every stop happens before the sweep below (a lane owner drains what is
+  # queued ahead of its stop, so one can still open an event and start an
+  # extractor while it is being stopped), but the stops among themselves run
+  # concurrently: a production delete is one id, but this pass also runs on
+  # every restart's diff against a surviving snapshot, where it can be many
+  # at once, and one slow `terminate/2` must not serialize the rest behind
+  # its `@stop_timeout`. `on_timeout: :kill_task` bounds the pass even if a
+  # stop somehow outlives `GenServer.stop/3`'s own timeout; `Stream.run/1`
+  # is what makes this await every task before the sweep runs.
+  defp stop_lane_owners(known) do
+    @lane_roles
+    |> Enum.flat_map(fn role ->
+      role
+      |> Cairn.Registry.ids_for_role()
+      |> Enum.reject(&MapSet.member?(known, &1))
+      |> Enum.map(&{role, &1})
+    end)
+    |> Task.async_stream(
+      fn {role, camera_id} -> stop(camera_id, role) end,
+      max_concurrency: System.schedulers_online(),
+      timeout: @stop_timeout + 1_000,
+      on_timeout: :kill_task
+    )
+    |> Stream.run()
+  end
+
+  # One read of the registry is the whole set: an extractor registers in its
+  # own `start_link`, inside the `start_child` its producer is blocked on, so
+  # a producer that is down has none in flight — and above, every producer a
+  # deleted id had is down.
+  defp end_extractors(known) do
+    Cairn.Registry.extractors()
+    |> Enum.reject(fn {camera_id, _event_id, _pid} -> MapSet.member?(known, camera_id) end)
+    |> Enum.each(&end_partial/1)
+  end
 
   # `Cairn.PresenceRecorder.end_stranded/3`'s close, with its ordering: the
   # window is announced closed before the clip is told to land, and the cast

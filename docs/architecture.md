@@ -126,10 +126,13 @@ Cairn.Supervisor
 ├── Cairn.TrackerSupervisor        (rest_for_one)
 │   ├── pool (DynamicSupervisor)
 │   │   └── Cairn.CameraTracker    (one per camera, transient, ETS-checkpointed)
-│   ├── checkpoint restore sweep   (Task, transient; re-runs when the pool restarts)
-│   └── Cairn.CameraReaper         (stops the tracker of a camera the config no longer names)
+│   └── checkpoint restore sweep   (Task, transient; re-runs when the pool restarts)
+├── Cairn.PresenceSupervisor       (rest_for_one: checkpoint, ledger, pool of recorders/aggregators)
 ├── Cairn.EventSupervisor (DynamicSupervisor)
 │   └── Cairn.EventExtractor       (one per active event, temporary)
+├── Cairn.CameraReaper             (after all three pools: for a camera the config no longer
+│                                   names, stops its recorder and tracker, then ends its
+│                                   extractors partial — one process, so that order holds)
 ├── Cairn.StreamEpochs             (before the cameras that mint epochs into it)
 ├── Cairn.Native.Host              (the one engine; outside camera trees so a camera
 │                                   restart never reloads the model)

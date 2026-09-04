@@ -4,6 +4,7 @@ defmodule Cairn.CameraReaperTest do
 
   @moduletag :capture_log
 
+  alias Cairn.CameraReaper
   alias Cairn.CameraTracker
   alias Cairn.Config
   alias Cairn.Event
@@ -11,6 +12,46 @@ defmodule Cairn.CameraReaperTest do
   alias Cairn.Events
   alias Cairn.Registry
   alias Cairn.RingBuffer
+
+  # Registered under the tracker role and starting its extractor from
+  # `terminate/2`: that is the only instant a real tracker's own race is
+  # reachable on demand. A `{:tracked, ...}` cast queued ahead of the reaper's
+  # stop is drained before it, so the tracker can open an event — and register
+  # its extractor — while the reaper is inside `GenServer.stop/3`. Driving a
+  # `Cairn.CameraTracker` to that point needs a whole inference batch and
+  # still leaves the instant to chance.
+  defmodule TrackerStub do
+    @moduledoc false
+    # `:temporary`: the reaper's stop is a normal exit, and a restarted stub
+    # would start the same event's extractor a second time at test teardown.
+    use GenServer, restart: :temporary
+
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
+    @impl true
+    def init(opts) do
+      Process.flag(:trap_exit, true)
+      {:ok, _} = Cairn.Registry.register(Keyword.fetch!(opts, :camera_id), :camera_tracker)
+      {:ok, Map.new(opts)}
+    end
+
+    @impl true
+    def terminate(_reason, state) do
+      {:ok, pid} =
+        DynamicSupervisor.start_child(
+          Cairn.EventSupervisor,
+          {Cairn.EventExtractor, state.extractor_opts}
+        )
+
+      # The `active` row lands in the extractor's `handle_continue(:open,
+      # ...)`, which a real tracker's start would have waited out too: it
+      # holds the pid the supervisor answered with, and the reaper's sweep is
+      # the next thing to run either way.
+      :sys.get_state(pid)
+      send(state.test, {:extractor_started, pid})
+      :ok
+    end
+  end
 
   setup do
     camera_id = "reap_#{System.unique_integer([:positive])}"
@@ -28,9 +69,9 @@ defmodule Cairn.CameraReaperTest do
     tracker = start_supervised!({CameraTracker, camera_id: camera_id})
     ref = Process.monitor(tracker)
 
-    prune(Cairn.TrackerSupervisor.Reaper, %{
+    prune(%{
       removed: [camera_id],
-      known: MapSet.delete(Config.Server.known_ids(), camera_id)
+      known: Cairn.SnapshotHelpers.known_ids_excluding(camera_id)
     })
 
     assert_receive {:DOWN, ^ref, :process, ^tracker, :normal}
@@ -41,12 +82,12 @@ defmodule Cairn.CameraReaperTest do
   end
 
   # Every config server broadcasts on one topic, and a private server's fleet
-  # is not the one this pool's cameras come from.
+  # is not the one this node's cameras come from.
   test "a diff from another server is ignored", %{camera_id: camera_id} do
     tracker = start_supervised!({CameraTracker, camera_id: camera_id})
     ref = Process.monitor(tracker)
 
-    prune(Cairn.TrackerSupervisor.Reaper, %{
+    prune(%{
       server: :private_test_server,
       removed: [camera_id],
       known: MapSet.new()
@@ -65,12 +106,41 @@ defmodule Cairn.CameraReaperTest do
     {extractor, event_id} = start_extractor(camera_id)
     ref = Process.monitor(extractor)
 
-    prune(Cairn.EventSupervisor.Reaper, %{
+    prune(%{
       removed: [camera_id],
-      known: MapSet.delete(Config.Server.known_ids(), camera_id)
+      known: Cairn.SnapshotHelpers.known_ids_excluding(camera_id)
     })
 
     assert_receive {:DOWN, ^ref, :process, ^extractor, :normal}, 5_000
+    assert Events.get(event_id).status == :partial
+    assert Registry.whereis(camera_id, {:extractor, event_id}) == nil
+  end
+
+  # The reason the three roles are one process: the stops come first and are
+  # synchronous, so an extractor a lane owner starts on its way down is
+  # already registered when the sweep reads the registry. Three subscribers of
+  # one broadcast could sweep before the stop and leave this extractor writing
+  # a clip on an `active` row for a camera that no longer exists.
+  test "an extractor started while its tracker is being stopped is ended too", %{
+    camera_id: camera_id
+  } do
+    {opts, event_id} = extractor_opts(camera_id)
+
+    stub =
+      start_supervised!({TrackerStub, camera_id: camera_id, extractor_opts: opts, test: self()})
+
+    stub_ref = Process.monitor(stub)
+
+    prune(%{
+      removed: [camera_id],
+      known: Cairn.SnapshotHelpers.known_ids_excluding(camera_id)
+    })
+
+    assert_receive {:DOWN, ^stub_ref, :process, ^stub, :normal}
+    assert_received {:extractor_started, extractor}
+
+    ref = Process.monitor(extractor)
+    assert_receive {:DOWN, ^ref, :process, ^extractor, _reason}, 5_000
     assert Events.get(event_id).status == :partial
     assert Registry.whereis(camera_id, {:extractor, event_id}) == nil
   end
@@ -81,7 +151,7 @@ defmodule Cairn.CameraReaperTest do
     {extractor, event_id} = start_extractor(camera_id)
     ref = Process.monitor(extractor)
 
-    prune(Cairn.EventSupervisor.Reaper, %{
+    prune(%{
       removed: ["some_other_camera"],
       known: Config.Server.known_ids()
     })
@@ -91,6 +161,19 @@ defmodule Cairn.CameraReaperTest do
   end
 
   defp start_extractor(camera_id) do
+    {opts, event_id} = extractor_opts(camera_id)
+    pid = start_supervised!({EventExtractor, opts})
+
+    # `:sys.get_state/1` returns only once `handle_continue(:open, ...)` has,
+    # and that is where the `active` row is written: a prune that arrives
+    # first finds no row to close and stops the process instead, a real path
+    # but not the one under test.
+    :sys.get_state(pid)
+    assert Events.get(event_id).status == :active
+    {pid, event_id}
+  end
+
+  defp extractor_opts(camera_id) do
     dir = Path.join(System.tmp_dir!(), "cairn_reap_#{System.unique_integer([:positive])}")
     Cairn.DataDir.ensure!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
@@ -103,38 +186,17 @@ defmodule Cairn.CameraReaperTest do
       started_at: DateTime.utc_now()
     }
 
-    pid =
-      start_supervised!(
-        {EventExtractor,
-         camera: %Config.Camera{id: camera_id, rtsp_url: "rtsp://h/1"},
-         event: event,
-         config: %Config{data_dir: dir, remux_clips: false},
-         snapshot_fun: fn _row, _config -> :ok end}
-      )
+    opts = [
+      camera: %Config.Camera{id: camera_id, rtsp_url: "rtsp://h/1"},
+      event: event,
+      config: %Config{data_dir: dir, remux_clips: false},
+      snapshot_fun: fn _row, _config -> :ok end
+    ]
 
-    # The `active` row is written in the extractor's `handle_continue(:open,
-    # ...)`, after `start_link` has returned: a prune sent before it lands
-    # finds no row to close and stops the process instead, which is a real
-    # path but not the one under test.
-    wait_row(event.id)
-    {pid, event.id}
+    {opts, event.id}
   end
 
-  defp wait_row(id, attempts \\ 100) do
-    case Events.get(id) do
-      nil when attempts > 0 ->
-        Process.sleep(10)
-        wait_row(id, attempts - 1)
-
-      nil ->
-        flunk("no index row for event #{id} within 1s")
-
-      row ->
-        row
-    end
-  end
-
-  defp prune(owner, fields) do
+  defp prune(fields) do
     diff =
       Map.merge(
         %{
@@ -148,8 +210,12 @@ defmodule Cairn.CameraReaperTest do
         fields
       )
 
-    send(owner, {:config_changed, diff})
-    :sys.get_state(owner)
+    # `:sys.get_state/1` is what orders the prune, which runs in the reaper's
+    # process, against the assertions below it. Its own delete is one id, but
+    # in the full suite it must also outlast every other suite's fixture
+    # lane owners, so the sync gets a generous timeout.
+    send(CameraReaper, {:config_changed, diff})
+    :sys.get_state(CameraReaper, 15_000)
     :ok
   end
 end
