@@ -680,6 +680,41 @@ defmodule Cairn.Config.ServerTest do
       assert %Config{version: 8} = Config.Server.snapshot(name)
     end
 
+    # A callback that raises after its apply's transaction committed and its
+    # snapshot published takes the server down before the broadcast at the
+    # end of `apply_config/4` — the owners' only prune path. The restart must
+    # not leave them stuck pruning against the fleet before that lost apply.
+    test "a boot with a surviving snapshot announces the diff against the fresh load", %{
+      path: path
+    } do
+      name = :"restart_announce_#{System.unique_integer([:positive])}"
+      key = Config.Server.snapshot_key(name)
+      on_exit(fn -> :persistent_term.erase(key) end)
+
+      stale = %Config.Camera{id: "cam_stale", rtsp_url: "rtsp://h/stale"}
+      :persistent_term.put(key, %Config{version: 7, cameras: [stale]})
+
+      Config.Server.subscribe()
+
+      server = named_server(path, name, :restart_announce_server)
+
+      assert_receive {:config_changed, diff}
+      assert %{version: 8, server: ^name, known: known} = diff
+      refute MapSet.member?(known, "cam_stale")
+      assert "cam_stale" in diff.removed
+
+      assert Config.Server.get(server).version == 8
+    end
+
+    test "a boot with no surviving snapshot announces nothing", %{path: path} do
+      name = :"restart_announce_none_#{System.unique_integer([:positive])}"
+
+      Config.Server.subscribe()
+      _server = named_server(path, name, :restart_announce_none_server)
+
+      refute_receive {:config_changed, _diff}
+    end
+
     # The owners prune on the broadcast against the published snapshot, so the
     # publish has to be the older of the two. The apply callback runs between
     # them, and reads the term while the server is still inside the apply.

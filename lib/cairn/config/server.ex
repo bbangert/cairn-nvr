@@ -5,7 +5,10 @@ defmodule Cairn.Config.Server do
   the diff (start/stop/restart camera trees, and refresh in place the
   cameras whose change reaches no subprocess). An invalid reload keeps the
   old config and returns the errors. Every applied config is announced on
-  `Cairn.Config.topic/0` as `{:config_changed, diff}` — see `subscribe/0`.
+  `Cairn.Config.topic/0` as `{:config_changed, diff}` — see `subscribe/0`. A
+  restart that finds a surviving snapshot re-announces once at boot, against
+  the fresh load, since a crash between an apply's commit and its broadcast
+  would otherwise leave that config never announced at all.
 
   The source is the `source:` opt, else the `:config_loader` app env — a
   1-arity fun of the config path, or `{module, function}` naming one; the
@@ -297,6 +300,10 @@ defmodule Cairn.Config.Server do
       |> source_fun()
 
     name = Keyword.get(opts, :name, __MODULE__)
+    # Fetched once and held rather than re-read after publish/2 overwrites the
+    # term: it is both the version seed and, when present, the "old" side of
+    # the restart-announce diff below.
+    surviving = name && snapshot(name)
 
     state = %{
       path: path,
@@ -306,7 +313,7 @@ defmodule Cairn.Config.Server do
       snapshot: name,
       apply_diff: apply_diff,
       apply_native: apply_native,
-      config: %Config{version: surviving_version(name)},
+      config: %Config{version: surviving_version(surviving)},
       warnings: [],
       errors: [],
       skipped: %{}
@@ -318,6 +325,7 @@ defmodule Cairn.Config.Server do
         config = installed(state, config)
         Cairn.DataDir.ensure!(config.data_dir)
         publish(state, config)
+        announce_restart(state, surviving, config)
         {:ok, %{state | config: config, warnings: warnings, skipped: skipped}}
 
       {:error, errors, fallback} ->
@@ -337,8 +345,30 @@ defmodule Cairn.Config.Server do
         config = installed(state, config)
         Cairn.DataDir.ensure!(config.data_dir)
         publish(state, config)
+        announce_restart(state, surviving, config)
         {:ok, %{state | config: config, errors: errors}}
     end
+  end
+
+  # The owners' only prune path is the broadcast at the end of
+  # `apply_config/4`; a callback that raises after that apply's transaction
+  # committed and its snapshot published crashes this process before the
+  # broadcast fires. The restart above re-seeds from the surviving snapshot
+  # and re-publishes, but without this, never re-broadcasts — the owners
+  # would keep pruning against the membership before the apply that crashed
+  # until some later, unrelated apply finally caught them up. Diffing the
+  # surviving snapshot against the fresh load and broadcasting once at boot
+  # closes that gap. A fresh boot has no surviving snapshot to diff against
+  # and stays silent, as it always has.
+  #
+  # What this does not cover: a PubSub restart that drops subscriptions
+  # while the owners themselves keep running. Cairn is single-node
+  # `:one_for_one`, so that gap is accepted rather than solved here.
+  defp announce_restart(_state, nil, _new_config), do: :ok
+
+  defp announce_restart(state, %Config{} = surviving, new_config) do
+    diff = build_diff(surviving, new_config, state.snapshot || self())
+    Phoenix.PubSub.local_broadcast(Cairn.PubSub, Config.topic(), {:config_changed, diff})
   end
 
   @impl true
@@ -435,6 +465,19 @@ defmodule Cairn.Config.Server do
   defp own_skips(reject, skipped),
     do: Enum.flat_map(List.wrap(reject), &Map.get(skipped, &1, []))
 
+  # Shared by `apply_config/4` and the restart announce in `init/1`, so the
+  # two `{:config_changed, diff}` producers cannot drift into different
+  # shapes for `t:diff/0`.
+  defp build_diff(old_config, new_config, server) do
+    old_config
+    |> diff_cameras(new_config)
+    |> Map.merge(%{
+      version: new_config.version,
+      server: server,
+      known: ids(new_config)
+    })
+  end
+
   # The ok arm shared by `:reload` and `{:update, _}`, so the orderings below
   # cannot drift between the two paths. The one every reader depends on:
   # publish the snapshot, then apply, then broadcast — the snapshot is what a
@@ -446,15 +489,7 @@ defmodule Cairn.Config.Server do
   # fleet prunes nothing (`t:diff/0`).
   defp apply_config(state, new_config, warnings, skipped) do
     new_config = installed(state, new_config)
-
-    diff =
-      state.config
-      |> diff_cameras(new_config)
-      |> Map.merge(%{
-        version: new_config.version,
-        server: state.snapshot || self(),
-        known: ids(new_config)
-      })
+    diff = build_diff(state.config, new_config, state.snapshot || self())
 
     # Before the diff: newly spawned ports redirect logs into the (possibly
     # changed) data_dir, so its log subdir must already exist
@@ -512,13 +547,7 @@ defmodule Cairn.Config.Server do
   # its predecessor's count: restarting at 1 would re-issue versions that
   # pinned saves still hold, and a stale `expected_version:` would pass.
   defp surviving_version(nil), do: 0
-
-  defp surviving_version(name) do
-    case snapshot(name) do
-      %Config{version: version} -> version
-      nil -> 0
-    end
-  end
+  defp surviving_version(%Config{version: version}), do: version
 
   defp source_fun(fun) when is_function(fun, 1), do: fun
   # A named capture, so the boundary error prints `&Mod.fun/1`, not a closure.
