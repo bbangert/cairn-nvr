@@ -34,13 +34,12 @@ defmodule Cairn.Cameras do
   @typedoc """
   What `Cairn.Config.Server.update/3` answers: the applied diff and its
   warnings, the validator's errors, or the write's own failure (a changeset,
-  `:not_found`, a DB fault, or an `expected_version:` the installed config has
-  moved past).
+  `:not_found`, a DB fault, or `{:stale, version}` when an `expected_version:`
+  the installed config has moved past).
   """
   @type write_result ::
           {:ok, Cairn.Config.Server.diff(), [String.t()]}
           | {:error, [String.t()]}
-          | {:error, {:write, {:stale, non_neg_integer()}}}
           | {:error, {:write, term()}}
 
   @spec list() :: [Camera.t()]

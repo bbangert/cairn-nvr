@@ -51,7 +51,7 @@ defmodule Cairn.CameraSupervisor do
   its running session still holds the pre-reload policy, so it is handed
   the new one instead of being restarted.
   """
-  @spec apply_diff(Config.Server.diff(), Config.t()) :: :ok
+  @spec apply_diff(Config.Server.camera_diff(), Config.t()) :: :ok
   # The full diff shape is matched in the head: all four keys are the
   # contract (`Cairn.Config.Server.diff/0`), and a caller handing a partial
   # map should fail here, loudly, not by KeyError three lines in — and not be

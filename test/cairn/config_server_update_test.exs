@@ -163,6 +163,32 @@ defmodule Cairn.Config.ServerUpdateTest do
       assert Config.Server.get(server).version == 2
     end
 
+    # A pin answers before the write runs, so there is no fleet to judge and
+    # the version is the whole answer even when the save also names a row.
+    test "a stale pin answers before reject_skipped: has a fleet to judge", %{server: server} do
+      test_pid = self()
+      assert {:ok, _diff, _warnings} = Config.Server.update(server, insert_fun("cam_a", "full"))
+
+      write = fn ->
+        send(test_pid, :wrote)
+        :ok
+      end
+
+      assert Config.Server.update(server, write, reject_skipped: "cam_a", expected_version: 1) ==
+               {:error, {:write, {:stale, 2}}}
+
+      refute_received :wrote
+    end
+
+    # A write that raises is not an install: the transaction rolls back and
+    # the count has to stay where the last applied config left it.
+    test "a write that fails leaves the version alone", %{server: server} do
+      assert {:error, {:write, %RuntimeError{}}} =
+               Config.Server.update(server, fn -> raise "boom" end)
+
+      assert Config.Server.get(server).version == 1
+    end
+
     test "no expected_version pins nothing", %{server: server} do
       assert {:ok, %{version: 2}, _warnings} =
                Config.Server.update(server, insert_fun("cam_a", "full"))

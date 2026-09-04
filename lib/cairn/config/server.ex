@@ -148,9 +148,8 @@ defmodule Cairn.Config.Server do
 
   @doc """
   The config the server named `server` last published, or `nil` before its
-  first publish (and always, for an unnamed server). A term read rather than
-  a call: it answers while the server is inside an apply, which is the one
-  moment it cannot.
+  first publish. A term read rather than a call: it answers while the server
+  is inside an apply, which is the one moment it cannot.
   """
   @spec snapshot(atom()) :: Config.t() | nil
   def snapshot(server \\ __MODULE__) when is_atom(server) do
@@ -242,10 +241,7 @@ defmodule Cairn.Config.Server do
 
     name = Keyword.get(opts, :name, __MODULE__)
 
-    # `nil` is the only "no name": `false` is an atom and a legal registered
-    # name, so `name && snapshot(name)` would treat a server named `false` as
-    # unnamed and silently drop its surviving snapshot.
-    surviving = if is_nil(name), do: nil, else: snapshot(name)
+    surviving = snapshot(name)
 
     state = %{
       path: path,
