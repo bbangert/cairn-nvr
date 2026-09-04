@@ -469,12 +469,10 @@ defmodule Cairn.Config.Server do
     state.apply_native.(new_config)
     state.apply_diff.(diff, new_config)
     state = %{state | config: new_config, warnings: warnings, errors: [], skipped: skipped}
-    # local_broadcast, not broadcast: a config is this node's own, and the
-    # subscribers act on node-local state — the owners prune their ETS tables,
-    # LiveViews re-read this server. Under a clustered PubSub a peer's diff
-    # carries `server: Cairn.Config.Server` too, a name every node registers,
-    # so it would pass the owners' filter and prune this node's fleet against
-    # another node's membership.
+    # Cairn is a single node by design (the DNSCluster child is generator
+    # boilerplate and never configured); there is no peer for this to reach.
+    # local_broadcast states that: a config is this node's own and every
+    # subscriber acts on node-local state.
     Phoenix.PubSub.local_broadcast(Cairn.PubSub, Config.topic(), {:config_changed, diff})
     {diff, state}
   end
