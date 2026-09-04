@@ -339,8 +339,11 @@ defmodule Cairn.Config.Server do
 
     # Fetched once and held rather than re-read after publish/2 overwrites the
     # term: it is both the version seed and, when present, the "old" side of
-    # the restart-announce diff below.
-    surviving = name && snapshot(name)
+    # the restart-announce diff below. `nil` is the only "no name" — `false`
+    # is an atom and a legal registered name, so `name && ...` would treat a
+    # server named `false` as unnamed and either crash `surviving_version/1`
+    # or silently drop its surviving snapshot.
+    surviving = if is_nil(name), do: nil, else: snapshot(name)
 
     state = %{
       path: path,
@@ -412,7 +415,7 @@ defmodule Cairn.Config.Server do
 
   defp announce_restart(state, %Config{} = surviving, new_config) do
     if Process.whereis(Cairn.PubSub) do
-      diff = restart_diff(surviving, new_config, state.snapshot || self())
+      diff = restart_diff(surviving, new_config, identity(state))
 
       # The crash that lost the broadcast is a crash *inside* one of these two,
       # so the runtime is the half of the world this restart cannot assume:
@@ -572,7 +575,7 @@ defmodule Cairn.Config.Server do
   # fleet prunes nothing (`t:diff/0`).
   defp apply_config(state, new_config, warnings, skipped) do
     new_config = installed(state, new_config)
-    diff = build_diff(state.config, new_config, state.snapshot || self())
+    diff = build_diff(state.config, new_config, identity(state))
 
     # Before the diff: newly spawned ports redirect logs into the (possibly
     # changed) data_dir, so its log subdir must already exist
@@ -652,6 +655,13 @@ defmodule Cairn.Config.Server do
   # only a config this server is about to install can carry one: a candidate
   # a form validated, or a load that was rejected, keeps `from_map/1`'s 0.
   defp installed(state, config), do: %{config | version: state.config.version + 1}
+
+  # The `server` a diff/broadcast is attributed to: the registered name, or
+  # this process when unnamed. `nil` is the only "no name" state carries —
+  # `false` is an atom and a legal registered name, so `state.snapshot ||
+  # self()` would misreport a server named `false` as unnamed.
+  defp identity(%{snapshot: nil}), do: self()
+  defp identity(%{snapshot: name}), do: name
 
   # Overwriting a persistent term scans every process for references to the
   # old one — bounded here by boot plus the reload and save rate, both

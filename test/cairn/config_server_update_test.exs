@@ -16,34 +16,7 @@ defmodule Cairn.Config.ServerUpdateTest do
   # across them fail the one-model-per-VM rule.
   @argv_dir "test/support/fixtures/profiles/argv"
 
-  # Stands in for a runtime owner: it subscribes to the config topic like the
-  # real ones and takes its time over the diff, so a barrier that did not wait
-  # would return first. Registered under its own name because that is how
-  # `Cairn.Config.Server` addresses an owner.
-  defmodule OwnerStub do
-    @moduledoc false
-    use GenServer
-
-    def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-
-    def sync(server \\ __MODULE__, timeout \\ 5_000), do: GenServer.call(server, :sync, timeout)
-
-    @impl true
-    def init(opts) do
-      Cairn.Config.Server.subscribe()
-      {:ok, Map.new(opts)}
-    end
-
-    @impl true
-    def handle_call(:sync, _from, state), do: {:reply, :ok, state}
-
-    @impl true
-    def handle_info({:config_changed, diff}, state) do
-      Process.sleep(state.delay)
-      send(state.test, {:diff_handled, diff})
-      {:noreply, state}
-    end
-  end
+  # `Cairn.OwnerStub` lives in test/support/owner_stub.ex.
 
   setup do
     dir = Path.join(System.tmp_dir!(), "cairn_upd_#{System.unique_integer([:positive])}")
@@ -340,8 +313,8 @@ defmodule Cairn.Config.ServerUpdateTest do
   # generation. The save returning only once every owner has handled the diff
   # is what closes it — the next write cannot take this mailbox before then.
   test "a save returns only after every owner has handled the diff", %{path: path} do
-    start_supervised!({OwnerStub, delay: 300, test: self()})
-    server = private_server(path, :barrier_server, owners: [OwnerStub])
+    start_supervised!({Cairn.OwnerStub, delay: 300, test: self()})
+    server = private_server(path, :barrier_server, owners: [Cairn.OwnerStub])
 
     assert {:ok, _diff, _warnings} = Config.Server.update(server, insert_fun("cam_full", "full"))
 

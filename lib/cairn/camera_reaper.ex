@@ -122,10 +122,23 @@ defmodule Cairn.CameraReaper do
   # own `start_link`, inside the `start_child` its producer is blocked on, so
   # a producer that is down has none in flight — and above, every producer a
   # deleted id had is down.
+  #
+  # `end_partial/1` only casts a finalize; without waiting for the extractor
+  # to actually exit, this pass — and with it `sync/2`'s barrier — would
+  # return before the file closes, the row leaves `active` and the process
+  # deregisters, letting a same-id create's `ensure/1` race a still-registered
+  # deleted-generation extractor. Run concurrently like the stops above, for
+  # the same reason: one slow finalize must not serialize the rest.
   defp end_extractors(known) do
     Cairn.Registry.extractors()
     |> Enum.reject(fn {camera_id, _event_id, _pid} -> MapSet.member?(known, camera_id) end)
-    |> Enum.each(&end_partial/1)
+    |> Task.async_stream(
+      &end_partial/1,
+      max_concurrency: System.schedulers_online(),
+      timeout: @stop_timeout + 1_000,
+      on_timeout: :kill_task
+    )
+    |> Stream.run()
   end
 
   # `Cairn.PresenceRecorder.end_stranded/3`'s close, with its ordering: the
@@ -143,7 +156,29 @@ defmodule Cairn.CameraReaper do
         Logger.info("camera #{camera_id}: deleted, ending event #{event_id} partial")
         event = Cairn.Events.partial_event(row, DateTime.utc_now())
         Cairn.Event.broadcast(:event_ended, event)
+        # `finalize/2` only enqueues a cast; waiting out the `:DOWN` (with the
+        # same bound and kill-on-timeout as `stop_pid/3`) is what keeps this
+        # extractor's exit, not just its finalize message, inside the pass.
+        ref = Process.monitor(pid)
         Cairn.EventExtractor.finalize(pid, event)
+        await_finalize(pid, ref, camera_id, event_id)
+    end
+  end
+
+  defp await_finalize(pid, ref, camera_id, event_id) do
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+    after
+      @stop_timeout ->
+        Logger.warning(
+          "camera #{camera_id}: finalizing event #{event_id} did not finish in " <>
+            "#{@stop_timeout}ms; killing it"
+        )
+
+        # `kill_and_await/1` monitors again itself; drop this one first so its
+        # `:DOWN` does not sit unread in the mailbox once the kill lands.
+        Process.demonitor(ref, [:flush])
+        kill_and_await(pid)
     end
   end
 
