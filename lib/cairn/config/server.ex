@@ -101,10 +101,17 @@ defmodule Cairn.Config.Server do
   ]
 
   # Per owner, and generous: the reaper's pass is bounded by its own stop
-  # timeout per lane owner and a delete can name several. A wedged owner then
-  # surfaces as a logged barrier timeout rather than as a server stuck for
-  # good — though `update/3`'s caller, waiting 30 s, may have given up first.
+  # timeout per lane owner and a delete can name several. A wedged owner
+  # exhausts the retries below and takes this server down rather than
+  # leaving it stuck for good — though `update/3`'s caller, waiting 30 s,
+  # may have given up first.
   @sync_timeout 15_000
+
+  # Bounds the barrier at `@sync_retries * @sync_timeout` per owner: the first
+  # attempt trusts the broadcast just sent, and each retry resends the diff
+  # directly before trying again, because an owner that crashed and restarted
+  # between the broadcast and its sync has a fresh mailbox and never saw it.
+  @sync_retries 3
 
   @typedoc "Which cameras the new config adds, removes, restarts and refreshes."
   @type camera_diff :: %{
@@ -337,6 +344,10 @@ defmodule Cairn.Config.Server do
     owners =
       Keyword.get_lazy(opts, :owners, fn -> if name == __MODULE__, do: @owners, else: [] end)
 
+    # Same seam as `owners:`: the barrier's own tests need retries that don't
+    # each cost `@sync_timeout` real milliseconds.
+    sync_timeout = Keyword.get(opts, :sync_timeout, @sync_timeout)
+
     # Fetched once and held rather than re-read after publish/2 overwrites the
     # term: it is both the version seed and, when present, the "old" side of
     # the restart-announce diff below. `nil` is the only "no name" — `false`
@@ -352,6 +363,7 @@ defmodule Cairn.Config.Server do
       # snapshot of a server it cannot name.
       snapshot: name,
       owners: owners,
+      sync_timeout: sync_timeout,
       apply_diff: apply_diff,
       apply_native: apply_native,
       config: %Config{version: surviving_version(surviving)},
@@ -431,7 +443,7 @@ defmodule Cairn.Config.Server do
       state.apply_diff.(diff, new_config)
 
       Phoenix.PubSub.local_broadcast(Cairn.PubSub, Config.topic(), {:config_changed, diff})
-      sync_owners(state)
+      sync_owners(state, diff)
     else
       :ok
     end
@@ -595,7 +607,7 @@ defmodule Cairn.Config.Server do
     # local_broadcast states that: a config is this node's own and every
     # subscriber acts on node-local state.
     Phoenix.PubSub.local_broadcast(Cairn.PubSub, Config.topic(), {:config_changed, diff})
-    sync_owners(state)
+    sync_owners(state, diff)
     {diff, state}
   end
 
@@ -615,21 +627,36 @@ defmodule Cairn.Config.Server do
   # `GenServer.stop/3`; that cycle is broken by the reaper's own stop timeout
   # and the kill behind it, well inside `@sync_timeout`.
   #
-  # A timeout is logged rather than raised: the config is installed, published
-  # and applied by now, and taking this server down would leave the fleet
-  # without one over an owner that is merely late.
-  defp sync_owners(state) do
-    Enum.each(state.owners, fn owner ->
-      try do
-        owner.sync(owner, @sync_timeout)
-      catch
-        :exit, reason ->
-          Logger.warning(
-            "config: #{inspect(owner)} did not acknowledge the config change " <>
-              "(#{inspect(reason)}); a re-created camera id may adopt its state"
-          )
-      end
-    end)
+  # Fails closed: the write mailbox stays shut until every owner has
+  # acknowledged THIS diff, which is the guarantee the barrier exists for.
+  # Logging a timeout and returning anyway — the previous behaviour — let the
+  # next write through while the diff it depended on was still unacknowledged,
+  # which is exactly the generation race this barrier is supposed to prevent.
+  # Exhausting the retries raises instead, taking this server down: its
+  # restart path (`announce_restart/3`) republishes the surviving diff,
+  # replays the apply for every shared camera and syncs the owners again, so
+  # a fleet an owner would not acknowledge is reconciled by that path rather
+  # than left half-applied behind a barrier that quietly gave up.
+  defp sync_owners(state, diff) do
+    Enum.each(state.owners, &sync_owner(&1, diff, state.sync_timeout, @sync_retries))
+  end
+
+  defp sync_owner(owner, diff, _timeout, 0) do
+    raise "config: #{inspect(owner)} did not acknowledge #{inspect(diff.version)} after " <>
+            "#{@sync_retries} attempts"
+  end
+
+  defp sync_owner(owner, diff, timeout, attempts_left) do
+    owner.sync(owner, timeout)
+  catch
+    :exit, reason ->
+      Logger.warning(
+        "config: #{inspect(owner)} did not acknowledge the config change " <>
+          "(#{inspect(reason)}); resending and retrying (#{attempts_left - 1} attempt(s) left)"
+      )
+
+      send(owner, {:config_changed, diff})
+      sync_owner(owner, diff, timeout, attempts_left - 1)
   end
 
   # A source is the seam a later store plugs into, so its answer is checked

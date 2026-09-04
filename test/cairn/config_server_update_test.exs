@@ -323,6 +323,43 @@ defmodule Cairn.Config.ServerUpdateTest do
     assert_received {:diff_handled, %{added: ["cam_full"]}}
   end
 
+  # The barrier fails closed: a `:sync` that times out is retried with the
+  # diff resent, not logged and let through. `ignore: 1` withholds the first
+  # reply so the first attempt times out against the short `sync_timeout:`,
+  # and the resend on retry is what the owner acks.
+  test "a save returns once a resent diff is acknowledged after a missed sync", %{path: path} do
+    start_supervised!({Cairn.OwnerStub, ignore: 1, test: self()})
+
+    server =
+      private_server(path, :barrier_retry_server,
+        owners: [Cairn.OwnerStub],
+        sync_timeout: 50
+      )
+
+    assert {:ok, _diff, _warnings} = Config.Server.update(server, insert_fun("cam_full", "full"))
+    assert_received {:diff_handled, %{added: ["cam_full"]}}
+  end
+
+  # An owner that never acknowledges exhausts the retries; this server raises
+  # rather than let the write return with the diff unaccounted for — the
+  # generation race the barrier exists to prevent. Its restart path is the
+  # recovery, not this call, so the caller sees the server go down.
+  test "a save crashes the server when an owner never acknowledges the diff", %{path: path} do
+    start_supervised!({Cairn.OwnerStub, ignore: 999, test: self()})
+
+    server =
+      private_server(path, :barrier_never_acks_server,
+        owners: [Cairn.OwnerStub],
+        sync_timeout: 20
+      )
+
+    ref = Process.monitor(server)
+
+    catch_exit(Config.Server.update(server, insert_fun("cam_full", "full")))
+
+    assert_receive {:DOWN, ^ref, :process, ^server, _reason}, 2_000
+  end
+
   defp private_server(path, id, extra \\ []) do
     test_pid = self()
 

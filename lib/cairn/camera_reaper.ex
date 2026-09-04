@@ -98,9 +98,12 @@ defmodule Cairn.CameraReaper do
   # every restart's diff against a surviving snapshot, where it can be many
   # at once, and one slow `terminate/2` must not serialize the rest behind
   # its `@stop_timeout`. A stop that outlives that timeout is followed by a
-  # kill (`stop_pid/3`), so `on_timeout: :kill_task` is only the backstop for
-  # the kill itself; `Stream.run/1` is what makes this await every task
-  # before the sweep runs.
+  # kill (`stop_pid/3`), so the bound already lives in that per-process path;
+  # an outer timeout here could fire between it and `kill_and_await/1` and,
+  # since `Task.async_stream/3`'s results are discarded, let this pass
+  # advance with the process still alive. `timeout: :infinity` leaves the
+  # per-process path as the only bound, and `Stream.run/1` is what makes this
+  # await every task before the sweep runs.
   defp stop_lane_owners(known) do
     @lane_roles
     |> Enum.flat_map(fn role ->
@@ -112,8 +115,7 @@ defmodule Cairn.CameraReaper do
     |> Task.async_stream(
       fn {role, camera_id} -> stop(camera_id, role) end,
       max_concurrency: System.schedulers_online(),
-      timeout: @stop_timeout + 1_000,
-      on_timeout: :kill_task
+      timeout: :infinity
     )
     |> Stream.run()
   end
@@ -128,15 +130,18 @@ defmodule Cairn.CameraReaper do
   # return before the file closes, the row leaves `active` and the process
   # deregisters, letting a same-id create's `ensure/1` race a still-registered
   # deleted-generation extractor. Run concurrently like the stops above, for
-  # the same reason: one slow finalize must not serialize the rest.
+  # the same reason: one slow finalize must not serialize the rest. The bound
+  # is `await_finalize/4`'s own `@stop_timeout` and the kill behind it, not
+  # this stream — an outer timeout could kill the task between the two and,
+  # with the result discarded, let this pass advance with the extractor still
+  # alive, so `timeout: :infinity` leaves that per-process path as the only one.
   defp end_extractors(known) do
     Cairn.Registry.extractors()
     |> Enum.reject(fn {camera_id, _event_id, _pid} -> MapSet.member?(known, camera_id) end)
     |> Task.async_stream(
       &end_partial/1,
       max_concurrency: System.schedulers_online(),
-      timeout: @stop_timeout + 1_000,
-      on_timeout: :kill_task
+      timeout: :infinity
     )
     |> Stream.run()
   end

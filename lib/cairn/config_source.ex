@@ -253,11 +253,14 @@ defmodule Cairn.ConfigSource do
           do: Config.raw_map_from_binary(bytes, path),
           else: {:error, :changed}
 
-      # Unreadable now is unreadable to `Config.raw_map/1` a moment later
-      # too, so let that call produce the file's own `{:yaml, errors}`
-      # rather than a `:changed` that would misname the fault.
-      {:error, _reason} ->
-        Config.raw_map(path)
+      # Never a second, unpinned read: the file could become readable between
+      # the two (another process finishing a write, a remount), and importing
+      # whatever that read turns up is exactly the bytes this pin was meant to
+      # rule out, matched against nothing. The error is phrased like
+      # `Config.raw_map/1`'s own read failure so this looks the same as any
+      # other unreadable-file load to `replace_rows/2`'s caller.
+      {:error, reason} ->
+        {:error, ["cannot read config #{path}: #{inspect(reason)}"]}
     end
   end
 

@@ -834,6 +834,19 @@ defmodule Cairn.ConfigSourceTest do
       assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
     end
 
+    # A pinned re-import must never fall through to an unverified second read:
+    # if the path became readable between the two, that second read could
+    # succeed and import bytes that were never checked against the pin.
+    test "a pinned re-import against an unreadable path refuses and deletes no rows" do
+      missing = "/nonexistent/#{System.unique_integer([:positive])}/config.yml"
+
+      assert {:error, {:write, {:yaml, [error]}}} =
+               ConfigSource.reimport(missing, expected_sha256: ConfigSource.file_sha256("x"))
+
+      assert error =~ "cannot read config #{missing}"
+      assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
+    end
+
     # The pinned write parses the bytes it hashed rather than re-reading the
     # path, so what lands is what the sha covers: a file swapped in after the
     # check cannot be the one imported.
