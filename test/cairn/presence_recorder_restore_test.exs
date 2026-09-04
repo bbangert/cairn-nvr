@@ -32,6 +32,8 @@ defmodule Cairn.PresenceRecorderRestoreTest do
 
   setup do
     camera_id = "prest_#{System.unique_integer([:positive])}"
+    # The checkpoint owner drops a write for a camera the fleet does not name.
+    Cairn.SnapshotHelpers.lend_cameras(camera_id)
     camera = %Camera{id: camera_id, rtsp_url: "rtsp://h/1", min_score: %{"default" => 0.5}}
 
     Event.subscribe()
@@ -174,7 +176,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     # the aggregator still holds the label, which is what makes it a present
     # one rather than a ghost (`still_announced/2`)
     announce(ctx, "person")
-    PresenceCheckpoint.put(ctx.camera_id, event, [{nil, "person"}], extractor)
+    PresenceCheckpoint.put!(ctx.camera_id, event, [{nil, "person"}], extractor)
 
     rec = recorder(ctx)
 
@@ -211,7 +213,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     event = event(ctx)
     announce(ctx, "person")
 
-    PresenceCheckpoint.put(ctx.camera_id, event, [{nil, "person"}], extractor, %{
+    PresenceCheckpoint.put!(ctx.camera_id, event, [{nil, "person"}], extractor, %{
       centers: %{"person" => %{1 => {0.55, 0.35}}},
       next: %{"person" => 2}
     })
@@ -232,7 +234,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     event = %{event(ctx) | started_at: DateTime.add(DateTime.utc_now(), -400)}
     eid = event.id
     announce(ctx, "person")
-    PresenceCheckpoint.put(ctx.camera_id, event, [{nil, "person"}], extractor)
+    PresenceCheckpoint.put!(ctx.camera_id, event, [{nil, "person"}], extractor)
 
     # @policy max is 300; 400 s spent means the remainder is negative and the
     # timer fires immediately — no fire/3 helper, the real timer does it.
@@ -253,7 +255,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     extractor = relay(self())
     event = event(ctx, %{"person" => 0.9})
     announce(ctx, "person", 0.4)
-    PresenceCheckpoint.put(ctx.camera_id, event, [{nil, "person"}], extractor)
+    PresenceCheckpoint.put!(ctx.camera_id, event, [{nil, "person"}], extractor)
 
     rec = recorder(ctx)
 
@@ -272,7 +274,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     extractor = relay(self())
     event = event(ctx)
     eid = event.id
-    PresenceCheckpoint.put(ctx.camera_id, event, [], extractor)
+    PresenceCheckpoint.put!(ctx.camera_id, event, [], extractor)
 
     rec = recorder(ctx)
 
@@ -293,7 +295,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     extractor = relay(self())
     event = event(ctx)
     eid = event.id
-    PresenceCheckpoint.put(ctx.camera_id, event, [{nil, "person"}], extractor)
+    PresenceCheckpoint.put!(ctx.camera_id, event, [{nil, "person"}], extractor)
 
     rec = recorder(ctx)
 
@@ -319,7 +321,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
 
     event = event(ctx)
     eid = event.id
-    PresenceCheckpoint.put(ctx.camera_id, event, [{nil, "person"}], dead)
+    PresenceCheckpoint.put!(ctx.camera_id, event, [{nil, "person"}], dead)
 
     rec = recorder(ctx)
 
@@ -339,7 +341,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     event = event(ctx)
     announce(ctx, "person", 0.8, "drive")
 
-    PresenceCheckpoint.put(
+    PresenceCheckpoint.put!(
       ctx.camera_id,
       event,
       [{"drive", "person"}, {"porch", "person"}],
@@ -365,7 +367,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     {:ok, _row} = Events.create_active(event, "/tmp/#{eid}.mp4")
     {:ok, _row} = Events.finalize(%{event | ended_at: DateTime.utc_now()}, 1_024)
 
-    PresenceCheckpoint.put(ctx.camera_id, event, [{nil, "person"}], nil)
+    PresenceCheckpoint.put!(ctx.camera_id, event, [{nil, "person"}], nil)
 
     rec = recorder(ctx)
 
@@ -386,7 +388,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     eid = event.id
     {:ok, _row} = Events.create_active(event, "/tmp/#{eid}.mp4")
     {:ok, _row} = Events.finalize(%{event | ended_at: DateTime.utc_now()}, 1_024)
-    PresenceCheckpoint.put(ctx.camera_id, event, [{nil, "person"}], extractor)
+    PresenceCheckpoint.put!(ctx.camera_id, event, [{nil, "person"}], extractor)
 
     rec = recorder(ctx)
     assert :sys.get_state(rec).extractor == extractor
@@ -500,7 +502,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     {:ok, _row} = Events.create_active(event, "/tmp/#{eid}.mp4")
     tracked = registered_relay(id, eid, self())
     assert await_extractor(id, eid) == tracked
-    EventCheckpoint.put(id, event)
+    EventCheckpoint.put!(id, event)
     on_exit(fn -> EventCheckpoint.delete(id) end)
 
     rec = recorder(ctx)
@@ -584,7 +586,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     extractor = relay(self())
     event = event(ctx)
     eid = event.id
-    PresenceCheckpoint.put(id, event, [{nil, "person"}], extractor)
+    PresenceCheckpoint.put!(id, event, [{nil, "person"}], extractor)
     PresenceLedger.announced(id, nil, "person", DateTime.utc_now(), 0.9)
 
     rec = recorder(ctx)
@@ -709,7 +711,13 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     extractor = relay(self())
     event = event(ctx)
     eid = event.id
-    PresenceCheckpoint.put(id, event, [{nil, "person"}], extractor)
+    PresenceCheckpoint.put!(id, event, [{nil, "person"}], extractor)
+    # leave nothing holding a clip open for the next test, even if an assertion
+    # below fails first
+    on_exit(fn ->
+      PresenceCheckpoint.delete(id)
+      Process.exit(extractor, :kill)
+    end)
 
     ledger = Process.whereis(Cairn.PresenceLedger)
     ref = Process.monitor(ledger)
@@ -730,10 +738,6 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     assert state.event.id == eid
     assert state.extractor == extractor
     refute_received {:event_started, %Event{camera_id: ^id}}
-
-    # leave nothing holding a clip open for the next test
-    PresenceCheckpoint.delete(id)
-    Process.exit(extractor, :kill)
   end
 
   defp await_post_armed(recorder, attempts \\ 100),
