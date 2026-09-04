@@ -53,6 +53,27 @@ defmodule Cairn.CameraReaperTest do
     end
   end
 
+  # A lane owner whose `terminate/2` never returns: `GenServer.stop/3` times
+  # out on it with the process still alive and still able to produce. The real
+  # shape is a terminate blocked on the config server, which is itself blocked
+  # on this very pass (`Cairn.Config.Server`'s barrier).
+  defmodule HangingTrackerStub do
+    @moduledoc false
+    use GenServer, restart: :temporary
+
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
+    @impl true
+    def init(opts) do
+      Process.flag(:trap_exit, true)
+      {:ok, _} = Cairn.Registry.register(Keyword.fetch!(opts, :camera_id), :camera_tracker)
+      {:ok, Map.new(opts)}
+    end
+
+    @impl true
+    def terminate(_reason, _state), do: Process.sleep(:infinity)
+  end
+
   setup do
     camera_id = "reap_#{System.unique_integer([:positive])}"
     Cairn.SnapshotHelpers.lend_cameras(camera_id)
@@ -158,6 +179,28 @@ defmodule Cairn.CameraReaperTest do
 
     refute_receive {:DOWN, ^ref, :process, ^extractor, _reason}, 200
     assert Events.get(event_id).status == :active
+  end
+
+  # A stop taken for done while the target still runs is the failure this
+  # guards: the sweep would then read the registry while a live producer can
+  # still start an extractor into it. Takes `@stop_timeout` to run — the wait
+  # is the thing under test.
+  test "a lane owner that outlasts the stop timeout is killed, and the sweep still runs", %{
+    camera_id: camera_id
+  } do
+    {extractor, event_id} = start_extractor(camera_id)
+    stub = start_supervised!({HangingTrackerStub, camera_id: camera_id})
+    stub_ref = Process.monitor(stub)
+    extractor_ref = Process.monitor(extractor)
+
+    prune(%{
+      removed: [camera_id],
+      known: Cairn.SnapshotHelpers.known_ids_excluding(camera_id)
+    })
+
+    assert_receive {:DOWN, ^stub_ref, :process, ^stub, :killed}, 10_000
+    assert_receive {:DOWN, ^extractor_ref, :process, ^extractor, :normal}, 5_000
+    assert Events.get(event_id).status == :partial
   end
 
   defp start_extractor(camera_id) do

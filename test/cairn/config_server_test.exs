@@ -743,6 +743,31 @@ defmodule Cairn.Config.ServerTest do
       assert {:config_changed, ^diff} = third
     end
 
+    # The crash was inside an apply, so the fresh load and the surviving
+    # snapshot name the same cameras with the same settings: diffing them puts
+    # every shared id in neither `changed` nor `refreshed` and the replay would
+    # restart nothing, while how far the crashed apply got is unknown.
+    test "a boot with a surviving snapshot restarts every camera it shares with the load", %{
+      path: path
+    } do
+      name = :"restart_shared_#{System.unique_integer([:positive])}"
+      key = Config.Server.snapshot_key(name)
+      on_exit(fn -> :persistent_term.erase(key) end)
+
+      # Identical to the camera the file loads, which is the case the diff
+      # cannot see: nothing about cam_a moved.
+      shared = %Config.Camera{id: "cam_a", rtsp_url: "rtsp://h/1"}
+      :persistent_term.put(key, %Config{version: 7, cameras: [shared]})
+
+      Config.Server.subscribe()
+      _server = named_server(path, name, :restart_shared_server)
+
+      assert_receive {:config_changed, diff}
+      assert diff.changed == ["cam_a"]
+      assert diff.refreshed == []
+      assert diff.added == ["cam_b"]
+    end
+
     test "a fresh boot replays no apply", %{path: path} do
       name = :"fresh_apply_#{System.unique_integer([:positive])}"
       on_exit(fn -> :persistent_term.erase(Config.Server.snapshot_key(name)) end)
@@ -759,6 +784,18 @@ defmodule Cairn.Config.ServerTest do
 
       refute_receive {:native_applied, _config}, 200
       refute_receive {:applied, _diff, _config}, 200
+    end
+
+    # The runtime owners act on the application server's diffs alone
+    # (`t:Cairn.Config.Server.diff/0`), so a server that is not it has nobody
+    # to wait for and must not: the empty list is the barrier's gate.
+    test "a server that is not the application's waits on no owner", %{path: path} do
+      name = :"private_owners_#{System.unique_integer([:positive])}"
+      on_exit(fn -> :persistent_term.erase(Config.Server.snapshot_key(name)) end)
+
+      server = named_server(path, name, :private_owners_server)
+
+      assert :sys.get_state(server).owners == []
     end
 
     test "a boot with no surviving snapshot announces nothing", %{path: path} do

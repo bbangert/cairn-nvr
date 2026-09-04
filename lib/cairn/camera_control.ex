@@ -100,6 +100,15 @@ defmodule Cairn.CameraControl do
     end)
   end
 
+  @doc """
+  Returns once this process has handled everything already in its mailbox —
+  `Cairn.Config.Server`'s barrier after a config change, which is how a
+  delete's prune of this table is known to be done before the id can be
+  re-created.
+  """
+  @spec sync(GenServer.server(), timeout()) :: :ok
+  def sync(server \\ __MODULE__, timeout \\ 5_000), do: GenServer.call(server, :sync, timeout)
+
   @impl true
   def init(_opts) do
     :ets.new(@table, [:named_table, :set, :protected, read_concurrency: true])
@@ -119,6 +128,8 @@ defmodule Cairn.CameraControl do
       do: {:reply, write(camera_id, attrs), state},
       else: {:reply, {:error, :unknown_camera}, state}
   end
+
+  def handle_call(:sync, _from, state), do: {:reply, :ok, state}
 
   if Mix.env() == :test do
     def handle_call({:put, camera_id, attrs}, _from, state) do

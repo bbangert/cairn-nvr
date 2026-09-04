@@ -11,6 +11,16 @@ defmodule Cairn.Config.Server do
   its broadcast would otherwise leave that config never applied to the
   runtime and never announced at all.
 
+  The broadcast is a barrier, not a send: the application server calls
+  `sync/2` on every runtime owner afterwards and returns only once each has
+  handled the diff. `Phoenix.PubSub.local_broadcast/3` dispatches in this
+  process, so the diff is already in an owner's mailbox when the `:sync` call
+  is sent, and a call from the same process is ordered behind it. Every row
+  write goes through this mailbox, so a delete's reaping — its trees stopped,
+  its extractors ended, its tables pruned — is complete before a create can
+  re-use the id, and no generation has to be plumbed through the runtime to
+  tell the two apart.
+
   The source is the `source:` opt, else the `:config_loader` app env — a
   1-arity fun of the config path, or `{module, function}` naming one; the
   file source is `Cairn.Config.load_file/1`. A missing or malformed loader
@@ -35,10 +45,10 @@ defmodule Cairn.Config.Server do
   holds a fleet the validator rejects and two sessions' saves serialize on the
   mailbox instead of racing the cross-camera rules — and, with
   `reject_skipped:`, a save cannot leave its own camera skipped and dark. The
-  cost is that a save holds the server for all of that plus the apply, and
-  `apply_diff` can take seconds on restart-class changes — so `get/1` and
-  `last_load/1` callers, on their 5 s budget, can see a slow answer while a
-  save is in flight.
+  cost is that a save holds the server for all of that plus the apply and the
+  owner barrier, and `apply_diff` can take seconds on restart-class changes —
+  so `get/1` and `last_load/1` callers, on their 5 s budget, can see a slow
+  answer while a save is in flight.
 
   A named server publishes each config it installs as a `:persistent_term`
   snapshot *before* applying it (`snapshot/1`, `snapshot_camera/2`,
@@ -77,6 +87,24 @@ defmodule Cairn.Config.Server do
 
   alias Cairn.Config
   alias Cairn.Native.Host
+
+  # The processes that own runtime state keyed by camera id and prune it on
+  # this server's diffs. The barrier at the end of an apply waits on each in
+  # turn; `Cairn.CameraReaper` is the slow one (it stops the deleted camera's
+  # trees and ends its extractors).
+  @owners [
+    Cairn.CameraStatus,
+    Cairn.CameraControl,
+    Cairn.EventCheckpoint,
+    Cairn.PresenceCheckpoint,
+    Cairn.CameraReaper
+  ]
+
+  # Per owner, and generous: the reaper's pass is bounded by its own stop
+  # timeout per lane owner and a delete can name several. A wedged owner then
+  # surfaces as a logged barrier timeout rather than as a server stuck for
+  # good — though `update/3`'s caller, waiting 30 s, may have given up first.
+  @sync_timeout 15_000
 
   @typedoc "Which cameras the new config adds, removes, restarts and refreshes."
   @type camera_diff :: %{
@@ -302,6 +330,13 @@ defmodule Cairn.Config.Server do
       |> source_fun()
 
     name = Keyword.get(opts, :name, __MODULE__)
+    # The owners act on the application server's diffs alone and ignore every
+    # other server's (`t:diff/0`), so a private server has nothing to wait
+    # for and must not: the list is the barrier's gate. The `owners:` opt is
+    # how a test puts a stub in that position.
+    owners =
+      Keyword.get_lazy(opts, :owners, fn -> if name == __MODULE__, do: @owners, else: [] end)
+
     # Fetched once and held rather than re-read after publish/2 overwrites the
     # term: it is both the version seed and, when present, the "old" side of
     # the restart-announce diff below.
@@ -313,6 +348,7 @@ defmodule Cairn.Config.Server do
       # An unnamed server has no key to publish under; nothing reads a
       # snapshot of a server it cannot name.
       snapshot: name,
+      owners: owners,
       apply_diff: apply_diff,
       apply_native: apply_native,
       config: %Config{version: surviving_version(surviving)},
@@ -376,7 +412,7 @@ defmodule Cairn.Config.Server do
 
   defp announce_restart(state, %Config{} = surviving, new_config) do
     if Process.whereis(Cairn.PubSub) do
-      diff = build_diff(surviving, new_config, state.snapshot || self())
+      diff = restart_diff(surviving, new_config, state.snapshot || self())
 
       # The crash that lost the broadcast is a crash *inside* one of these two,
       # so the runtime is the half of the world this restart cannot assume:
@@ -392,9 +428,30 @@ defmodule Cairn.Config.Server do
       state.apply_diff.(diff, new_config)
 
       Phoenix.PubSub.local_broadcast(Cairn.PubSub, Config.topic(), {:config_changed, diff})
+      sync_owners(state)
     else
       :ok
     end
+  end
+
+  # The restart's own diff. The two sides usually name the same cameras with
+  # the same settings — the crash was inside the apply, after the config was
+  # loaded and committed — so `diff_cameras/2` puts every shared id in neither
+  # `changed` nor `refreshed`, and the replay would restart nothing while how
+  # far the crashed apply got is unknown: a camera may be running the old
+  # policy, the new one, or nothing. So every shared id is restarted: a
+  # restart per surviving camera is what not knowing costs.
+  defp restart_diff(surviving, new_config, server) do
+    diff = build_diff(surviving, new_config, server)
+    old_ids = MapSet.new(surviving.cameras, & &1.id)
+
+    shared =
+      new_config.cameras
+      |> Enum.filter(&MapSet.member?(old_ids, &1.id))
+      |> Enum.map(& &1.id)
+      |> Enum.sort()
+
+    %{diff | changed: shared, refreshed: []}
   end
 
   @impl true
@@ -491,9 +548,9 @@ defmodule Cairn.Config.Server do
   defp own_skips(reject, skipped),
     do: Enum.flat_map(List.wrap(reject), &Map.get(skipped, &1, []))
 
-  # Shared by `apply_config/4` and the restart announce in `init/1`, so the
-  # two `{:config_changed, diff}` producers cannot drift into different
-  # shapes for `t:diff/0`.
+  # Shared by `apply_config/4` and, through `restart_diff/3`, the restart
+  # announce in `init/1`, so the two `{:config_changed, diff}` producers
+  # cannot drift into different shapes for `t:diff/0`.
   defp build_diff(old_config, new_config, server) do
     old_config
     |> diff_cameras(new_config)
@@ -535,7 +592,41 @@ defmodule Cairn.Config.Server do
     # local_broadcast states that: a config is this node's own and every
     # subscriber acts on node-local state.
     Phoenix.PubSub.local_broadcast(Cairn.PubSub, Config.topic(), {:config_changed, diff})
+    sync_owners(state)
     {diff, state}
+  end
+
+  # The barrier. `local_broadcast/3` dispatched the diff from this process, so
+  # each owner's `:sync` is sent after its own copy of the diff and is handled
+  # after it. Returning before they had all reaped would let the next write
+  # through this mailbox — a create re-using a just-deleted id — start a new
+  # generation of trees, checkpoints and extractors that the pending delete
+  # pass would then reap as the old one's.
+  #
+  # No owner's prune calls back here: the four table owners' `known?/1` reads
+  # the `:persistent_term` snapshot, and the reaper stops processes, reads and
+  # writes the event index and broadcasts — no call into this server. A lane
+  # owner it stops may itself be blocked in a
+  # `Config.Server` call (`Cairn.CameraTracker`'s role lookup,
+  # `Cairn.PresenceRecorder`'s policy resolve) and so deaf to
+  # `GenServer.stop/3`; that cycle is broken by the reaper's own stop timeout
+  # and the kill behind it, well inside `@sync_timeout`.
+  #
+  # A timeout is logged rather than raised: the config is installed, published
+  # and applied by now, and taking this server down would leave the fleet
+  # without one over an owner that is merely late.
+  defp sync_owners(state) do
+    Enum.each(state.owners, fn owner ->
+      try do
+        owner.sync(owner, @sync_timeout)
+      catch
+        :exit, reason ->
+          Logger.warning(
+            "config: #{inspect(owner)} did not acknowledge the config change " <>
+              "(#{inspect(reason)}); a re-created camera id may adopt its state"
+          )
+      end
+    end)
   end
 
   # A source is the seam a later store plugs into, so its answer is checked

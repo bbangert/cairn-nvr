@@ -93,7 +93,7 @@ Memory is bounded by `pre_window × bitrate × camera_count`, independent of eve
 
 ## The camera tracker
 
-Event lifecycle is owned one camera at a time: a `Cairn.CameraTracker` per camera under `Cairn.TrackerSupervisor` (a `:rest_for_one` DynamicSupervisor pool, a checkpoint-restore sweep and the reaper that stops a deleted camera's tracker), fed observations by the detect branch through `Cairn.Detect.Dispatch` — plain functions in the caller's process, so no per-frame GenServer hop and no config-server call on the frame path (policy is resolved at session start and on refresh).
+Event lifecycle is owned one camera at a time: a `Cairn.CameraTracker` per camera under `Cairn.TrackerSupervisor` (a `:rest_for_one` DynamicSupervisor pool and a checkpoint-restore sweep), fed observations by the detect branch through `Cairn.Detect.Dispatch` — plain functions in the caller's process, so no per-frame GenServer hop and no config-server call on the frame path (policy is resolved at session start and on refresh). A deleted camera's tracker is stopped by `Cairn.CameraReaper`, which sits beside the three pools rather than inside one because it reaps across all of them, and which the config server waits on before the id can be re-created.
 
 The tracker assigns identities itself (`Cairn.Tracker`: IoU + optional staged admissions — BBD, ORU, OCR, Re-ID fusion — per the profile's stage list), debounces detections into events, and keys suspend/adopt off **stream epoch identity**: one epoch is one continuous decode session, so nothing (pts, object continuity) carries across a respawn except by the tracker's own adopt-across-reset rule. Trackers are `:transient` and checkpoint to ETS, so a crash restores in `init/1`.
 

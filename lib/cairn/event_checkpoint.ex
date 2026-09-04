@@ -81,6 +81,15 @@ defmodule Cairn.EventCheckpoint do
   @spec clear() :: true
   def clear, do: :ets.delete_all_objects(@table)
 
+  @doc """
+  Returns once this process has handled everything already in its mailbox —
+  `Cairn.Config.Server`'s barrier after a config change, which is how a
+  delete's prune of this table is known to be done before the id can be
+  re-created.
+  """
+  @spec sync(GenServer.server(), timeout()) :: :ok
+  def sync(server \\ __MODULE__, timeout \\ 5_000), do: GenServer.call(server, :sync, timeout)
+
   @impl true
   def init(_opts) do
     :ets.new(@table, [:named_table, :set, :public, write_concurrency: true])
@@ -100,6 +109,8 @@ defmodule Cairn.EventCheckpoint do
     if known?(camera_id), do: write(camera_id, event, tracks)
     {:reply, :ok, state}
   end
+
+  def handle_call(:sync, _from, state), do: {:reply, :ok, state}
 
   if Mix.env() == :test do
     def handle_call({:put!, camera_id, event, tracks}, _from, state) do

@@ -60,11 +60,23 @@ defmodule Cairn.CameraReaper do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
+  @doc """
+  Returns once this process has handled everything already in its mailbox —
+  `Cairn.Config.Server`'s barrier after a config change, which is how a
+  delete's stops and extractor sweep are known to be done before the id can
+  be re-created.
+  """
+  @spec sync(GenServer.server(), timeout()) :: :ok
+  def sync(server \\ __MODULE__, timeout \\ 5_000), do: GenServer.call(server, :sync, timeout)
+
   @impl true
   def init(_opts) do
     Cairn.Config.Server.subscribe()
     {:ok, %{}}
   end
+
+  @impl true
+  def handle_call(:sync, _from, state), do: {:reply, :ok, state}
 
   @impl true
   def handle_info(
@@ -85,9 +97,10 @@ defmodule Cairn.CameraReaper do
   # concurrently: a production delete is one id, but this pass also runs on
   # every restart's diff against a surviving snapshot, where it can be many
   # at once, and one slow `terminate/2` must not serialize the rest behind
-  # its `@stop_timeout`. `on_timeout: :kill_task` bounds the pass even if a
-  # stop somehow outlives `GenServer.stop/3`'s own timeout; `Stream.run/1`
-  # is what makes this await every task before the sweep runs.
+  # its `@stop_timeout`. A stop that outlives that timeout is followed by a
+  # kill (`stop_pid/3`), so `on_timeout: :kill_task` is only the backstop for
+  # the kill itself; `Stream.run/1` is what makes this await every task
+  # before the sweep runs.
   defp stop_lane_owners(known) do
     @lane_roles
     |> Enum.flat_map(fn role ->
@@ -162,12 +175,38 @@ defmodule Cairn.CameraReaper do
   end
 
   # Every pid here is a stale registry read: it may already be exiting, and
-  # `GenServer.stop/3` on a process that dies of anything else — or that
-  # outlasts the timeout — exits the caller with it.
+  # `GenServer.stop/3` on a process that dies of anything else exits the
+  # caller with it.
   defp stop_pid(pid, camera_id, what) do
     Logger.info("camera #{camera_id}: deleted, #{what}")
     GenServer.stop(pid, :normal, @stop_timeout)
   catch
-    :exit, _dying -> :ok
+    # A timeout leaves the target ALIVE — the process `GenServer.stop/3` kills
+    # on its way out is the helper that was waiting on it — and Elixir reports
+    # it as `{:timeout, {GenServer, :stop, _}}`. Taking that for a stop would
+    # run the extractor sweep against a live producer, the one thing the stops
+    # exist to prevent, so the slow one is taken away instead. Its terminate
+    # can be blocked on this node's config server, which is itself blocked on
+    # this pass (`Cairn.Config.Server`'s barrier); the kill is what bounds
+    # that. A target that died *of* a timeout of its own matches too, and a
+    # kill it does not need is harmless.
+    :exit, {:timeout, _stop} ->
+      Logger.warning(
+        "camera #{camera_id}: #{what} did not finish in #{@stop_timeout}ms; killing it"
+      )
+
+      kill_and_await(pid)
+
+    :exit, _dying ->
+      :ok
+  end
+
+  defp kill_and_await(pid) do
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+    end
   end
 end
