@@ -2,7 +2,7 @@ defmodule Cairn.Zones do
   @moduledoc """
   Polygon zones over a camera's frame: validation, containment, and the
   draft state for the zone editor (phase 4 — nothing in `lib/` drives
-  `Draft` yet; `Cairn.Cameras.put_zones/2` is how zones change today). Pure
+  `Draft` yet; `Cairn.Cameras.put_zones/3` is how zones change today). Pure
   — no process, no store.
 
   A zone's `points` are normalized 0..1 frame coordinates with the origin at

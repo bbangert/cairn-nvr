@@ -558,7 +558,7 @@ defmodule Cairn.ConfigSourceTest do
       assert {:ok, diff, warnings} = Config.Server.reload(server)
       # Without the hold the reduced N=2 would derive 10 fps, putting cam_a
       # and cam_b in `changed` — a repair that restarts the cameras beside it.
-      assert diff == %{added: [], changed: [], refreshed: [], removed: ["cam_c"]}
+      assert %{added: [], changed: [], refreshed: [], removed: ["cam_c"]} = diff
       assert Enum.any?(warnings, &(&1 =~ "camera cam_c: skipped — "))
 
       after_skip = Config.Server.get(server)

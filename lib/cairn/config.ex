@@ -144,6 +144,15 @@ defmodule Cairn.Config do
             # override instead of the global days, so no second reader of the
             # rows exists. `from_map/2` never fills it; only a source does.
             dormant: [],
+            # Which install of the config this is, counted by
+            # `Cairn.Config.Server` (boot = 1, each applied reload or save
+            # +1). A caller pins the fleet it read to the write it makes with
+            # `update/3`'s `expected_version:`; a client that lost the answer
+            # to a timeout learns from the next broadcast's `diff.version`
+            # whether anything landed. Nothing that builds a config fills it
+            # — `from_map/1` leaves it 0 and the server stamps what it
+            # installs.
+            version: 0,
             plugin_groups: [],
             profiles: %{},
             ha_token: nil

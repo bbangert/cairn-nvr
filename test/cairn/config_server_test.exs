@@ -56,7 +56,15 @@ defmodule Cairn.Config.ServerTest do
     File.write!(path, updated)
 
     assert {:ok, diff, []} = Config.Server.reload(server)
-    assert diff == %{added: ["cam_c"], removed: ["cam_b"], changed: ["cam_a"], refreshed: []}
+
+    assert diff == %{
+             added: ["cam_c"],
+             removed: ["cam_b"],
+             changed: ["cam_a"],
+             refreshed: [],
+             version: 2
+           }
+
     assert_received {:applied, ^diff, %Config{}}
 
     assert [%{id: "cam_a", rtsp_url: "rtsp://h/CHANGED"}, %{id: "cam_c"}] =
@@ -620,6 +628,79 @@ defmodule Cairn.Config.ServerTest do
 
     assert {:ok, %Config.Camera{id: "cam_a"}, %Config{}} =
              Config.Server.snapshot_camera("cam_a", name)
+  end
+
+  describe "version" do
+    test "the boot install is version 1", %{server: server} do
+      assert Config.Server.get(server).version == 1
+    end
+
+    test "every applied reload increments it, on the config and in the diff", %{
+      server: server,
+      path: path,
+      dir: dir
+    } do
+      File.write!(path, """
+      data_dir: #{Path.join(dir, "data")}
+      cameras:
+        - id: cam_a
+          rtsp_url: rtsp://h/1
+      """)
+
+      assert {:ok, %{version: 2}, []} = Config.Server.reload(server)
+      assert Config.Server.get(server).version == 2
+
+      assert {:ok, %{version: 3}, []} = Config.Server.reload(server)
+      assert Config.Server.get(server).version == 3
+    end
+
+    test "a reload that installs nothing leaves it alone", %{server: server, path: path} do
+      File.write!(path, "cameras: [{id: cam_a}]\n")
+
+      assert {:error, _errors} = Config.Server.reload(server)
+      assert Config.Server.get(server).version == 1
+    end
+
+    test "the published snapshot carries it", %{path: path} do
+      name = :"version_snap_#{System.unique_integer([:positive])}"
+      on_exit(fn -> :persistent_term.erase(Config.Server.snapshot_key(name)) end)
+
+      server = named_server(path, name, :version_snapshot_server)
+
+      assert %Config{version: 1} = Config.Server.snapshot(name)
+      assert {:ok, _diff, []} = Config.Server.reload(server)
+      assert %Config{version: 2} = Config.Server.snapshot(name)
+    end
+
+    # The term outlives the process, so a restarted server continues the count:
+    # restarting at 1 would re-accept a pin the old server had already spent.
+    test "a boot seeds it from the surviving snapshot", %{path: path} do
+      name = :"version_seed_#{System.unique_integer([:positive])}"
+      key = Config.Server.snapshot_key(name)
+      on_exit(fn -> :persistent_term.erase(key) end)
+      :persistent_term.put(key, %Config{version: 7})
+
+      server = named_server(path, name, :version_seed_server)
+
+      assert Config.Server.get(server).version == 8
+      assert %Config{version: 8} = Config.Server.snapshot(name)
+    end
+
+    test "a server that has published nothing has no snapshot" do
+      assert Config.Server.snapshot(:"never_published_#{System.unique_integer([:positive])}") ==
+               nil
+    end
+  end
+
+  defp named_server(path, name, id) do
+    start_supervised!(
+      {Config.Server,
+       path: path,
+       name: name,
+       apply_diff: fn _diff, _config -> :ok end,
+       apply_native: fn _config -> :ok end},
+      id: id
+    )
   end
 
   # Two configs whose only difference is what `edit` does to cam_a and what

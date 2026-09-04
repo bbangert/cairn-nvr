@@ -348,6 +348,34 @@ defmodule Cairn.CamerasTest do
       assert CameraStatus.get("cam1").status == :running
       assert CameraControl.get("cam1").detection_enabled == false
     end
+
+    test "a write pinned to a version the server has moved past is refused", %{server: server} do
+      assert {:ok, _diff, []} =
+               Cameras.create(%{"id" => "cam1", "settings" => %{"rtsp_url" => "rtsp://h/1"}})
+
+      version = Config.Server.get(server).version
+
+      assert {:ok, _diff, []} =
+               Cameras.update("cam1", %{"settings" => %{"rtsp_url" => "rtsp://h/2"}},
+                 expected_version: version
+               )
+
+      # That save installed a config of its own, so the same pin is stale now.
+      assert {:error, {:write, {:stale, current}}} =
+               Cameras.update("cam1", %{"settings" => %{"rtsp_url" => "rtsp://h/3"}},
+                 expected_version: version
+               )
+
+      assert current == Config.Server.get(server).version
+      assert Cameras.get("cam1").settings["rtsp_url"] == "rtsp://h/2"
+
+      # Every write takes the pin, not just the ones that carry a form.
+      assert Cameras.delete("cam1", expected_version: version) ==
+               {:error, {:write, {:stale, current}}}
+
+      assert Cameras.get("cam1")
+      assert {:ok, %{removed: ["cam1"]}, []} = Cameras.delete("cam1", expected_version: current)
+    end
   end
 
   defp seed_event(dir, camera_id) do
