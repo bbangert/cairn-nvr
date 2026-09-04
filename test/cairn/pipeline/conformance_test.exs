@@ -326,8 +326,8 @@ defmodule Cairn.Pipeline.ConformanceTest do
       # The gate itself is the stamper's (it drops the batch and emits the
       # ending on its pad); what is asserted here is the close-out, so both
       # paths take that event directly.
-      CameraControl.set(classic_id, %{detection_enabled: false})
-      CameraControl.set(membrane_id, %{detection_enabled: false})
+      CameraControl.put(classic_id, %{detection_enabled: false})
+      CameraControl.put(membrane_id, %{detection_enabled: false})
 
       TrackerDriver.end_all(
         classic,

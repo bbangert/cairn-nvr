@@ -18,9 +18,19 @@ defmodule Cairn.ConfigSource do
   The skip pass holds N (`fleet_count:`, D-P1) so survivors keep the rung and
   derived rate they already had. A held N that leaves the reduced fleet
   disagreeing is a hard fail, not a silent lowering.
+
+  `reimport/2` is the operator's answer to the drift warning: every row is
+  replaced by the file's list inside one `Cairn.Config.Server.update/3`
+  transaction, so a file that fails to load replaces nothing. It touches no
+  runtime state — the owners drop what the new config no longer names when
+  they see the broadcast. Two pins guard it against a stale confirmation:
+  `expected_version:` pins the rows it was composed against, `expected_sha256:`
+  pins the file bytes the operator confirmed.
   """
 
   require Logger
+
+  import Ecto.Query, only: [from: 2]
 
   alias Cairn.Cameras
   alias Cairn.Cameras.Camera
@@ -116,6 +126,100 @@ defmodule Cairn.ConfigSource do
       nil -> nil
     end
   end
+
+  @doc """
+  Replaces every camera row with the file's `cameras:` list. Serialized and
+  validated like any other write through `Cairn.Config.Server.update/3`, so a
+  file that fails to load replaces nothing (`{:error, {:write, {:yaml,
+  errors}}}`), a file with no cameras is refused rather than silently emptying
+  the fleet (`{:error, {:write, :no_cameras}}`), and a file that no longer
+  differs from the marker is refused too (`{:error, {:write, :no_drift}}`) —
+  the button's own precondition, re-checked inside the transaction so two
+  `/config` sessions cannot both replace off the same warning. No marker at
+  all (`{:error, {:write, :no_marker}}`) means no import to drift from: the
+  button is never shown for that state, and a request that reaches here anyway
+  replaces nothing.
+
+  `expected_sha256:` pins the write to the bytes the caller rendered a
+  confirmation for — the file can change between a page displaying "replace N
+  cameras with M" and the operator confirming, and without a pin the write
+  reads whatever is on disk by then (`{:error, {:write, :changed}}`). Omitted
+  or `nil`, the write is unpinned, for callers with no rendered page to pin
+  against.
+  """
+  @spec reimport(Path.t(), keyword()) :: Cameras.write_result()
+  def reimport(path \\ Config.default_path(), opts \\ []) do
+    expected_sha256 = Keyword.get(opts, :expected_sha256)
+
+    Config.Server.update(
+      Cameras.server(),
+      fn -> replace_rows(path, expected_sha256) end,
+      Keyword.take(opts, [:expected_version])
+    )
+  end
+
+  defp replace_rows(path, expected_sha256) do
+    with :ok <- check_pinned(path, expected_sha256),
+         {:ok, map} <- Config.raw_map(path),
+         {:ok, cameras} <- importable_list(Map.get(map, "cameras")),
+         :ok <- check_drift(cameras),
+         {:ok, _config, _warnings} <- Config.from_map(map) do
+      Repo.delete_all(Camera)
+      Repo.delete_all(from(s in Setting, where: s.key == @marker_key))
+      # The write closure answers only `:ok`; the dropped-key warnings from
+      # the import are logged here so they are not lost with it.
+      cameras |> import_rows(path) |> Enum.each(&Logger.warning("config: #{&1}"))
+      :ok
+    else
+      {:error, errors} when is_list(errors) ->
+        {:error, {:yaml, errors}}
+
+      {:error, reason} when reason in [:no_cameras, :no_drift, :no_marker, :changed] ->
+        {:error, reason}
+    end
+  end
+
+  # `nil` (no rendered page to pin against) skips the check; the drift check
+  # below still guards a stale confirmation from replacing a fleet that
+  # already matches the file. Reads the raw bytes, not `cameras_sha/1`'s
+  # canonicalized list: the caller hashed what it displayed before any YAML
+  # parsing, so this has to hash the same thing to mean anything.
+  defp check_pinned(_path, nil), do: :ok
+
+  defp check_pinned(path, expected_sha256) do
+    case File.read(path) do
+      {:ok, bytes} ->
+        if file_sha256(bytes) == expected_sha256, do: :ok, else: {:error, :changed}
+
+      {:error, _reason} ->
+        # Unreadable now is unreadable to `Config.raw_map/1` a moment later
+        # too, so let that call produce the file's own `{:yaml, errors}`
+        # rather than a `:changed` that would misname the fault.
+        :ok
+    end
+  end
+
+  @doc false
+  @spec file_sha256(binary()) :: String.t()
+  def file_sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+
+  # Read inside the write closure, which runs in the config server's
+  # `mode: :immediate` transaction: a re-import that has already committed is
+  # visible here, so the second of two queued sessions sees `:same` and is
+  # refused rather than replacing what the first imported.
+  defp check_drift(cameras) do
+    case drift(cameras, import_marker()) do
+      :changed -> :ok
+      :same -> {:error, :no_drift}
+      :none -> {:error, :no_marker}
+    end
+  end
+
+  # The same three shapes `import_once/3` tells apart: a malformed key is the
+  # file's fault, not "nothing to import".
+  defp importable_list(cameras) when is_list(cameras) and cameras != [], do: {:ok, cameras}
+  defp importable_list(cameras) when is_nil(cameras) or cameras == [], do: {:error, :no_cameras}
+  defp importable_list(_other), do: {:error, ["cameras must be a list"]}
 
   defp load_map(map, path) do
     marker = import_marker()
@@ -263,9 +367,11 @@ defmodule Cairn.ConfigSource do
 
   # `:none` for an absent or empty `cameras:` key or no marker to compare
   # against — `cameras: []` lists nothing, so it earns neither warning, the
-  # same reading `import_once/3`'s `importable?/1` gives it. `:same` and
-  # `:changed` classify the two states `drift_warnings/3` renders; kept apart
-  # so the classification has no strings to build.
+  # same reading `import_once/3`'s `importable?/1` gives it. The
+  # classification builds no strings because it has two readers that render it
+  # differently: `drift_warnings/3` into the operator's warning, and
+  # `check_drift/1` into `reimport/2`'s refusals, where `:none` means no
+  # marker (the empty-list case never reaches it).
   defp drift(cameras, marker)
 
   defp drift(cameras, %{"sha256" => sha}) when is_list(cameras) and cameras != [] do

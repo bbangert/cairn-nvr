@@ -38,8 +38,8 @@ defmodule CairnWeb.Api.CameraController do
   """
   def control(conn, %{"id" => camera_id} = params) do
     with {:ok, _cam} <- camera(camera_id),
-         {:ok, attrs} <- validate(params) do
-      control = CameraControl.set(camera_id, attrs)
+         {:ok, attrs} <- validate(params),
+         {:ok, control} <- set(camera_id, attrs) do
       json(conn, %{id: camera_id, control: control})
     else
       :unknown_camera -> conn |> put_status(404) |> json(%{error: "unknown camera"})
@@ -76,10 +76,21 @@ defmodule CairnWeb.Api.CameraController do
   defp safe_probe({:error, reason}), do: %{error: inspect(reason)}
   defp safe_probe(_), do: nil
 
+  # The fast path: it answers 404 without a call, but it runs in this request's
+  # process, ordered against nothing. A delete applied between it and the write
+  # is caught by the owner, which checks the published config in the same
+  # mailbox the prune runs in — both refusals are the same 404.
   defp camera(camera_id) do
     case Server.camera(camera_id) do
       {:ok, cam} -> {:ok, cam}
       :error -> :unknown_camera
+    end
+  end
+
+  defp set(camera_id, attrs) do
+    case CameraControl.set(camera_id, attrs) do
+      {:error, :unknown_camera} -> :unknown_camera
+      control -> {:ok, control}
     end
   end
 

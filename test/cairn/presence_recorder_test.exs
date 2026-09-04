@@ -227,8 +227,8 @@ defmodule Cairn.PresenceRecorderTest do
   # nothing here.
   test "a confirm ahead of the first frames cast honors a lowered min_score override", ctx do
     id = ctx.camera_id
-    CameraControl.set(id, %{min_score: 0.3})
-    on_exit(fn -> CameraControl.set(id, %{min_score: nil}) end)
+    CameraControl.put(id, %{min_score: 0.3})
+    on_exit(fn -> CameraControl.put(id, %{min_score: nil}) end)
 
     recorder(ctx)
 
@@ -523,8 +523,8 @@ defmodule Cairn.PresenceRecorderTest do
     assert_receive {:extractor_started, %Event{id: eid}, _pid}
     assert_receive {:event_started, %Event{id: ^eid}}
 
-    CameraControl.set(id, %{min_score: 0.95})
-    on_exit(fn -> CameraControl.set(id, %{min_score: nil}) end)
+    CameraControl.put(id, %{min_score: 0.95})
+    on_exit(fn -> CameraControl.put(id, %{min_score: nil}) end)
 
     fire(rec, :max_event, eid)
     assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
@@ -790,8 +790,8 @@ defmodule Cairn.PresenceRecorderTest do
     assert_receive {:extractor_started, %Event{id: eid}, _pid}
     assert_receive {:event_started, %Event{id: ^eid}}
 
-    CameraControl.set(id, %{recording_enabled: false})
-    on_exit(fn -> CameraControl.set(id, %{recording_enabled: true}) end)
+    CameraControl.put(id, %{recording_enabled: false})
+    on_exit(fn -> CameraControl.put(id, %{recording_enabled: true}) end)
 
     fire(rec, :max_event, eid)
     assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
@@ -924,8 +924,8 @@ defmodule Cairn.PresenceRecorderTest do
 
   test "recording disabled refuses to open an event", ctx do
     id = ctx.camera_id
-    CameraControl.set(id, %{recording_enabled: false})
-    on_exit(fn -> CameraControl.set(id, %{recording_enabled: true}) end)
+    CameraControl.put(id, %{recording_enabled: false})
+    on_exit(fn -> CameraControl.put(id, %{recording_enabled: true}) end)
 
     rec = recorder(ctx)
     started(ctx)
@@ -948,8 +948,8 @@ defmodule Cairn.PresenceRecorderTest do
     started(ctx)
     assert_receive {:extractor_started, %Event{id: eid}, ex_pid}
 
-    CameraControl.set(id, %{recording_enabled: false})
-    on_exit(fn -> CameraControl.set(id, %{recording_enabled: true}) end)
+    CameraControl.put(id, %{recording_enabled: false})
+    on_exit(fn -> CameraControl.put(id, %{recording_enabled: true}) end)
 
     frames(ctx, [object("person", 0.95)])
     assert_receive {:extractor_cast, {:track_boxes, _}}
@@ -1340,8 +1340,8 @@ defmodule Cairn.PresenceRecorderTest do
     frames(ctx, [object("person", 0.9)])
     assert :sys.get_state(rec).floors == %{"default" => 0.5}
 
-    CameraControl.set(id, %{min_score: 0.3})
-    on_exit(fn -> CameraControl.set(id, %{min_score: nil}) end)
+    CameraControl.put(id, %{min_score: 0.3})
+    on_exit(fn -> CameraControl.put(id, %{min_score: nil}) end)
 
     started(ctx, "person", 0.4)
 

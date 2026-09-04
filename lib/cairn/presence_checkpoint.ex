@@ -66,6 +66,27 @@ defmodule Cairn.PresenceCheckpoint do
   @impl true
   def init(_opts) do
     :ets.new(@table, [:named_table, :set, :public, write_concurrency: true])
+    Cairn.Config.Server.subscribe()
     {:ok, %{}}
+  end
+
+  # The table is public — writes come from the recorders — but the rows of a
+  # camera that left the config have no recorder left to end them, so this
+  # process drops them itself on the config change rather than being told to.
+  @impl true
+  def handle_info({:config_changed, _diff}, state) do
+    case Cairn.Config.Server.known_ids() do
+      # No snapshot is not an empty fleet: nothing to prune against.
+      nil ->
+        :ok
+
+      known ->
+        for {camera_id, _event, _keys, _extractor, _slots} <- all(),
+            not MapSet.member?(known, camera_id) do
+          delete(camera_id)
+        end
+    end
+
+    {:noreply, state}
   end
 end

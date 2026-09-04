@@ -1,11 +1,14 @@
 defmodule Cairn.CameraStatusTest do
+  # Uses the globally-supervised Cairn.CameraStatus with unique camera ids.
+  # NOT async: the prune tests empty the shared table of every id the test
+  # env's config does not name.
   use ExUnit.Case, async: false
 
   alias Cairn.CameraStatus
 
   setup do
     id = "st_#{System.unique_integer([:positive])}"
-    on_exit(fn -> CameraStatus.prune(Map.keys(CameraStatus.all()) -- [id]) end)
+    on_exit(fn -> prune_now() end)
     %{id: id}
   end
 
@@ -40,32 +43,24 @@ defmodule Cairn.CameraStatusTest do
     assert CameraStatus.all()[id] == info
   end
 
-  test "prune removes cameras not in the known list", %{id: id} do
-    other = "st_other_#{System.unique_integer([:positive])}"
+  # The owner prunes its own table in its own callback: nobody hands it a list
+  # of ids, it asks the published snapshot which cameras exist.
+  test "a config change drops the cameras the snapshot no longer names", %{id: id} do
     CameraStatus.set(id, :running)
-    CameraStatus.set(other, :running)
+    CameraStatus.set("cam_a", :running)
 
-    # set/2 is a cast; wait until both writes have landed before snapshotting
-    wait_until(fn -> CameraStatus.all()[id] && CameraStatus.all()[other] end)
+    prune_now()
 
-    keep = Map.keys(CameraStatus.all()) -- [other]
-    CameraStatus.prune(keep)
-
-    wait_until(fn -> CameraStatus.all()[other] == nil end)
-    assert CameraStatus.all()[id]
+    assert CameraStatus.all()[id] == nil
+    assert CameraStatus.all()["cam_a"]
   end
 
-  defp wait_until(fun, attempts \\ 100) do
-    cond do
-      fun.() ->
-        :ok
-
-      attempts == 0 ->
-        flunk("condition never became true")
-
-      true ->
-        Process.sleep(10)
-        wait_until(fun, attempts - 1)
-    end
+  # Sends the broadcast the owner subscribes to straight at it, rather than
+  # publishing on the config topic: the other owners share that topic and
+  # would prune the ids of whatever else the run has already started.
+  defp prune_now do
+    send(CameraStatus, {:config_changed, %{added: [], removed: [], changed: [], refreshed: []}})
+    :sys.get_state(CameraStatus)
+    :ok
   end
 end

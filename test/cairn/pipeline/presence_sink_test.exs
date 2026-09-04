@@ -31,7 +31,7 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
     # A confirm here would otherwise open a real recording through the
     # `Cairn.PresenceRecorder` that starts beside the aggregator — this suite
     # feeds the sink, and what it asserts is what reaches presence state.
-    CameraControl.set(camera_id, %{recording_enabled: false})
+    CameraControl.put(camera_id, %{recording_enabled: false})
 
     # The sink's feeds start real aggregators in the application-wide
     # pool; retire them or every test leaks one for the suite's life.
@@ -112,8 +112,8 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
 
   test "a runtime min_score override replaces the camera's configured floor", ctx do
     id = ctx.camera_id
-    CameraControl.set(id, %{min_score: 0.95})
-    on_exit(fn -> CameraControl.set(id, %{min_score: nil}) end)
+    CameraControl.put(id, %{min_score: 0.95})
+    on_exit(fn -> CameraControl.put(id, %{min_score: nil}) end)
 
     state = sink(ctx)
     # Clears the camera's configured 0.5 floor but not the 0.95 override.
@@ -128,8 +128,8 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
     {_actions, state} = two_beats(state, [frame([object("person", 0.9)])])
     assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
 
-    CameraControl.set(id, %{detection_enabled: false})
-    on_exit(fn -> CameraControl.set(id, %{detection_enabled: true}) end)
+    CameraControl.put(id, %{detection_enabled: false})
+    on_exit(fn -> CameraControl.put(id, %{detection_enabled: true}) end)
 
     {actions, state} = feed(state, [frame([object("person", 0.9)])])
     assert actions == []
@@ -254,8 +254,8 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
       {[], state} = feed(state, [frame([object("person", 0.9)])])
       assert_received {:detections, ^id, [%{label: "person"}]}
 
-      CameraControl.set(id, %{detection_enabled: false})
-      on_exit(fn -> CameraControl.set(id, %{detection_enabled: true}) end)
+      CameraControl.put(id, %{detection_enabled: false})
+      on_exit(fn -> CameraControl.put(id, %{detection_enabled: true}) end)
 
       {[], state} = feed(state, [frame([object("person", 0.9)])])
       assert_received {:detections, ^id, []}

@@ -21,6 +21,17 @@ defmodule Cairn.Application do
       Cairn.Repo,
       {Ecto.Migrator,
        repos: Application.fetch_env!(:cairn, :ecto_repos), skip: skip_migrations?()},
+      # After the Migrator, which creates the DB and its WAL under the umask,
+      # and before anything that reads config: the rows hold RTSP userinfo.
+      #
+      # Defence in depth, not the guarantee. SQLite recreates `-wal`/`-shm`
+      # under the umask whenever the Repo restarts, with nothing to chmod them
+      # again; what keeps the DB private to this uid is the 0700 data dir
+      # `Cairn.DataDir.ensure!/1` creates on every Repo start and config apply.
+      #
+      # No-op when `db_in_data_dir` is false (test env, whose Repo is outside
+      # the data dir), so the child tree's shape does not vary by env.
+      %{id: :secure_db, start: {__MODULE__, :secure_db, []}},
       # After the migrated Repo, so a config source may read rows; before
       # everything that reads the config. Its `init/1` must not broadcast —
       # PubSub starts below it.
@@ -83,6 +94,20 @@ defmodule Cairn.Application do
     # for other strategies and supported options
     opts = [strategy: :one_for_one, name: Cairn.Supervisor]
     Supervisor.start_link(children, opts)
+  end
+
+  # A supervisor child, not an API: public only because a child spec's `start`
+  # is an MFA. `:ignore` is what keeps it inline and unsupervised.
+  @doc false
+  @spec secure_db() :: :ignore
+  def secure_db do
+    if Application.get_env(:cairn, :db_in_data_dir, false) do
+      Cairn.Config.default_path()
+      |> Cairn.Config.resolve_data_dir()
+      |> Cairn.DataDir.secure_db()
+    end
+
+    :ignore
   end
 
   # Tell Phoenix to update the endpoint configuration

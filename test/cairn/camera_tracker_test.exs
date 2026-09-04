@@ -2322,7 +2322,7 @@ defmodule Cairn.CameraTrackerTest do
     # child left running would answer a later `ensure/1` for the same id.
     defp registered_camera_id do
       id = "trkreg_#{System.unique_integer([:positive])}"
-      Cairn.CameraControl.set(id, %{recording_enabled: false})
+      Cairn.CameraControl.put(id, %{recording_enabled: false})
 
       on_exit(fn ->
         case Cairn.Registry.whereis(id, :camera_tracker) do

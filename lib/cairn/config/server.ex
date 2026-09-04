@@ -37,14 +37,28 @@ defmodule Cairn.Config.Server do
   save is in flight.
 
   A named server publishes each config it installs as a `:persistent_term`
-  snapshot *before* applying it, for `snapshot_camera/2`: a camera tree
-  restarted by its own supervisor is rebuilt from the child spec its tree
-  was born with, and the snapshot is how the owner recovers what a refresh
-  since then delivered. A term rather than a call because `apply_diff`
-  runs inside this process — a camera started from a reload that called
-  back here would wait on the very call that is starting it. For the
-  duration of an apply the snapshot therefore leads `get/1`, which answers
-  the previous config until the apply returns.
+  snapshot *before* applying it (`snapshot/1`, `snapshot_camera/2`,
+  `known_ids/1`). A camera tree restarted by its own supervisor is rebuilt
+  from the child spec its tree was born with, and the snapshot is how the
+  owner recovers what a refresh since then delivered; the runtime owners read
+  it to prune their tables and to refuse a write for a camera that no longer
+  exists. A term rather than a call because `apply_diff` runs inside this
+  process — a camera started from a reload that called back here would wait
+  on the very call that is starting it, and the owners read it in the same
+  window. For the duration of an apply the snapshot therefore leads `get/1`,
+  which answers the previous config until the apply returns.
+
+  Every config this server installs carries a `version` (boot = 1, each
+  applied reload or save +1; a rejected or failed write leaves it alone), on
+  the snapshot, on `get/1` and in the broadcast as `diff.version`.
+  `update/3`'s `expected_version:` is checked against it before the
+  transaction opens, so a save made from a stale view is refused with
+  `{:error, {:write, {:stale, current}}}` rather than applied over a fleet
+  its caller never saw. The comparison is exact and not advisory because
+  writes serialize on this mailbox: no version can be installed between the
+  check and the transaction it guards. It replaces the two guesses the UI
+  made instead — "the fleet changed underneath this save", and treating any
+  `{:config_changed, _}` as confirmation of a save that had timed out.
   """
 
   use GenServer
@@ -54,11 +68,25 @@ defmodule Cairn.Config.Server do
   alias Cairn.Config
   alias Cairn.Native.Host
 
-  @type diff :: %{
+  @typedoc "Which cameras the new config adds, removes, restarts and refreshes."
+  @type camera_diff :: %{
           added: [String.t()],
           removed: [String.t()],
           changed: [String.t()],
           refreshed: [String.t()]
+        }
+
+  @typedoc """
+  A `t:camera_diff/0` plus the `version` of the config that produced it, so a
+  subscriber that lost an answer to a timeout can tell from the next
+  broadcast whether its own write is the one that landed.
+  """
+  @type diff :: %{
+          added: [String.t()],
+          removed: [String.t()],
+          changed: [String.t()],
+          refreshed: [String.t()],
+          version: non_neg_integer()
         }
 
   @typedoc "Cameras a source left out of the config, and why."
@@ -113,6 +141,35 @@ defmodule Cairn.Config.Server do
   @spec snapshot_key(atom()) :: {module(), :snapshot, atom()}
   def snapshot_key(server) when is_atom(server), do: {__MODULE__, :snapshot, server}
 
+  @doc """
+  The config the server named `server` last published, or `nil` before its
+  first publish (and always, for an unnamed server). A term read rather than
+  a call: the runtime owners read it while this server is inside an apply,
+  which is the one moment it cannot answer.
+  """
+  @spec snapshot(atom()) :: Config.t() | nil
+  def snapshot(server \\ __MODULE__) when is_atom(server) do
+    case :persistent_term.get(snapshot_key(server), nil) do
+      %Config{} = config -> config
+      nil -> nil
+    end
+  end
+
+  @doc """
+  The camera ids the published snapshot names, or `nil` when there is none.
+
+  `dormant` counts: a disabled or skipped camera is a row that still exists,
+  and an owner that pruned it would drop the control overlay and status of a
+  camera the operator is about to switch back on.
+  """
+  @spec known_ids(atom()) :: MapSet.t(String.t()) | nil
+  def known_ids(server \\ __MODULE__) when is_atom(server) do
+    case snapshot(server) do
+      %Config{} = config -> MapSet.new(config.cameras ++ config.dormant, & &1.id)
+      nil -> nil
+    end
+  end
+
   @spec get(GenServer.server()) :: Config.t()
   def get(server \\ __MODULE__), do: GenServer.call(server, :get)
 
@@ -155,6 +212,11 @@ defmodule Cairn.Config.Server do
   a source free to skip a faulty row rolls the write back instead when one of
   these is the row it skipped, and the caller gets that camera's errors.
 
+  `expected_version: n` pins the save to the fleet its caller read: the
+  handler compares `n` with the installed config's version before the
+  transaction opens and answers `{:error, {:write, {:stale, current}}}`
+  when they differ. Absent, nothing is checked.
+
   `{:error, errors}` is the validator's; `{:error, {:write, reason}}` is
   `write_fun`'s own (a changeset, a DB fault, a wrong-shaped return, or an
   exception the closure raised).
@@ -164,13 +226,14 @@ defmodule Cairn.Config.Server do
   def update(server \\ __MODULE__, write_fun, opts \\ [])
       when is_function(write_fun, 0) and is_list(opts) do
     reject = Keyword.get(opts, :reject_skipped, [])
-    GenServer.call(server, {:update, write_fun, reject}, 30_000)
+    expected = Keyword.get(opts, :expected_version)
+    GenServer.call(server, {:update, write_fun, reject, expected}, 30_000)
   end
 
   @doc """
   Subscribes the caller to `Cairn.Config.topic/0`: `{:config_changed, diff}`
-  — the added, removed, changed and refreshed ids — after every config
-  applied past boot.
+  — the added, removed, changed and refreshed ids, and the new config's
+  `version` — after every config applied past boot.
   """
   @spec subscribe() :: :ok | {:error, term()}
   def subscribe, do: Phoenix.PubSub.subscribe(Cairn.PubSub, Config.topic())
@@ -203,6 +266,7 @@ defmodule Cairn.Config.Server do
     case load(state) do
       {:ok, config, warnings, skipped} ->
         Enum.each(warnings, &Logger.warning("config: #{&1}"))
+        config = installed(state, config)
         Cairn.DataDir.ensure!(config.data_dir)
         publish(state, config)
         {:ok, %{state | config: config, warnings: warnings, skipped: skipped}}
@@ -221,6 +285,7 @@ defmodule Cairn.Config.Server do
               %Config{}
           end
 
+        config = installed(state, config)
         Cairn.DataDir.ensure!(config.data_dir)
         publish(state, config)
         {:ok, %{state | config: config, errors: errors}}
@@ -245,14 +310,21 @@ defmodule Cairn.Config.Server do
     end
   end
 
-  def handle_call({:update, write_fun, reject}, _from, state) do
-    if file_source?(state.source) do
-      # A row written under the file source would never be read back — the
-      # render comes from the file — so a caller (or a test) that forgot to
-      # point the server at a store is told, not silently obeyed.
-      {:reply, {:error, ["update needs a DB-backed config source"]}, state}
-    else
-      do_update(state, write_fun, reject)
+  def handle_call({:update, write_fun, reject, expected}, _from, state) do
+    cond do
+      file_source?(state.source) ->
+        # A row written under the file source would never be read back — the
+        # render comes from the file — so a caller (or a test) that forgot to
+        # point the server at a store is told, not silently obeyed.
+        {:reply, {:error, ["update needs a DB-backed config source"]}, state}
+
+      # Before the transaction, not inside it: a stale save must not take the
+      # write lock, and there is nothing to roll back if it never opened.
+      not is_nil(expected) and expected != state.config.version ->
+        {:reply, {:error, {:write, {:stale, state.config.version}}}, state}
+
+      true ->
+        do_update(state, write_fun, reject)
     end
   end
 
@@ -311,16 +383,20 @@ defmodule Cairn.Config.Server do
   defp own_skips(reject, skipped),
     do: Enum.flat_map(List.wrap(reject), &Map.get(skipped, &1, []))
 
-  # The ok arm shared by `:reload` and `{:update, _}`, so the three orderings
-  # below cannot drift between the two paths.
+  # The ok arm shared by `:reload` and `{:update, _}`, so the orderings below
+  # cannot drift between the two paths. The one every reader depends on:
+  # publish the snapshot, then apply, then broadcast — the runtime owners
+  # prune on the broadcast against the snapshot, so it must already name the
+  # new fleet, and a control write handled before the publish is caught by
+  # the prune the broadcast that follows triggers.
   defp apply_config(state, new_config, warnings, skipped) do
-    diff = diff_cameras(state.config, new_config)
+    new_config = installed(state, new_config)
+    diff = Map.put(diff_cameras(state.config, new_config), :version, new_config.version)
     # Before the diff: newly spawned ports redirect logs into the (possibly
     # changed) data_dir, so its log subdir must already exist
     Cairn.DataDir.ensure!(new_config.data_dir)
-    # Before the apply: a tree the diff restarts may be rebuilt by its
-    # supervisor at any point after, and must find this fleet, not the
-    # last one.
+    # A tree the diff restarts may be rebuilt by its supervisor at any point
+    # after the apply starts, and must find this fleet, not the last one.
     publish(state, new_config)
     # Before the cameras: detection is the in-VM engine, so the model a
     # restarted camera will open a stream on should already be the new
@@ -352,6 +428,11 @@ defmodule Cairn.Config.Server do
     end
   end
 
+  # The version is stamped here rather than by whatever built the config, so
+  # only a config this server is about to install can carry one: a candidate
+  # a form validated, or a load that was rejected, keeps `from_map/1`'s 0.
+  defp installed(state, config), do: %{config | version: state.config.version + 1}
+
   # Overwriting a persistent term scans every process for references to the
   # old one — bounded here by boot plus the reload and save rate, both
   # operator paced. An ETS table owned by this server is the alternative if a
@@ -370,8 +451,25 @@ defmodule Cairn.Config.Server do
             "1-arity fun or {module, function}, got: #{inspect(other)}"
   end
 
+  # Whether installing `new` over `old` would restart `camera_id`'s tree — the
+  # camera diff's own test, public so a form can ask it of a candidate config
+  # it has built but not written. Both configs must be resolved: the answer
+  # reads globals and profiles, not the camera's raw settings. False when
+  # either config is missing the camera: an add or a remove is not a restart,
+  # and neither is a prediction made against a config that could not be read.
   @doc false
-  @spec diff_cameras(Config.t(), Config.t()) :: diff()
+  @spec would_restart?(Config.t(), Config.t(), String.t()) :: boolean()
+  def would_restart?(old, new, camera_id) do
+    with %Config.Camera{} = old_cam <- Enum.find(old.cameras, &(&1.id == camera_id)),
+         %Config.Camera{} = new_cam <- Enum.find(new.cameras, &(&1.id == camera_id)) do
+      camera_changed?(old, new, old_cam, new_cam)
+    else
+      _absent -> false
+    end
+  end
+
+  @doc false
+  @spec diff_cameras(Config.t(), Config.t()) :: camera_diff()
   def diff_cameras(old, new) do
     old_by_id = Map.new(old.cameras, &{&1.id, &1})
     new_by_id = Map.new(new.cameras, &{&1.id, &1})

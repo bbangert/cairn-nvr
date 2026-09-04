@@ -56,7 +56,15 @@ defmodule Cairn.Config.ServerTest do
     File.write!(path, updated)
 
     assert {:ok, diff, []} = Config.Server.reload(server)
-    assert diff == %{added: ["cam_c"], removed: ["cam_b"], changed: ["cam_a"], refreshed: []}
+
+    assert diff == %{
+             added: ["cam_c"],
+             removed: ["cam_b"],
+             changed: ["cam_a"],
+             refreshed: [],
+             version: 2
+           }
+
     assert_received {:applied, ^diff, %Config{}}
 
     assert [%{id: "cam_a", rtsp_url: "rtsp://h/CHANGED"}, %{id: "cam_c"}] =
@@ -620,6 +628,129 @@ defmodule Cairn.Config.ServerTest do
 
     assert {:ok, %Config.Camera{id: "cam_a"}, %Config{}} =
              Config.Server.snapshot_camera("cam_a", name)
+  end
+
+  describe "version" do
+    test "the boot install is version 1", %{server: server} do
+      assert Config.Server.get(server).version == 1
+    end
+
+    test "every applied reload increments it, on the config and in the diff", %{
+      server: server,
+      path: path,
+      dir: dir
+    } do
+      File.write!(path, """
+      data_dir: #{Path.join(dir, "data")}
+      cameras:
+        - id: cam_a
+          rtsp_url: rtsp://h/1
+      """)
+
+      assert {:ok, %{version: 2}, []} = Config.Server.reload(server)
+      assert Config.Server.get(server).version == 2
+
+      assert {:ok, %{version: 3}, []} = Config.Server.reload(server)
+      assert Config.Server.get(server).version == 3
+    end
+
+    test "a reload that installs nothing leaves it alone", %{server: server, path: path} do
+      File.write!(path, "cameras: [{id: cam_a}]\n")
+
+      assert {:error, _errors} = Config.Server.reload(server)
+      assert Config.Server.get(server).version == 1
+    end
+
+    test "the published snapshot carries it", %{path: path} do
+      name = :"version_snap_#{System.unique_integer([:positive])}"
+      on_exit(fn -> :persistent_term.erase(Config.Server.snapshot_key(name)) end)
+
+      server = named_server(path, name, :version_snapshot_server)
+
+      assert %Config{version: 1} = Config.Server.snapshot(name)
+      assert {:ok, _diff, []} = Config.Server.reload(server)
+      assert %Config{version: 2} = Config.Server.snapshot(name)
+    end
+  end
+
+  describe "snapshot/1 and known_ids/1" do
+    test "both answer nil for a server that has published nothing" do
+      name = :"never_published_#{System.unique_integer([:positive])}"
+
+      assert Config.Server.snapshot(name) == nil
+      assert Config.Server.known_ids(name) == nil
+    end
+
+    # A disabled or skipped row is dormant, not gone: an owner that pruned it
+    # would drop the state of a camera the operator can switch back on.
+    test "known_ids counts the dormant rows too", %{path: path} do
+      name = :"known_ids_#{System.unique_integer([:positive])}"
+      on_exit(fn -> :persistent_term.erase(Config.Server.snapshot_key(name)) end)
+
+      config = camera_config([%{"id" => "cam_a", "rtsp_url" => "rtsp://h/1"}], %{})
+
+      source = fn _path ->
+        {:ok, %{config | dormant: [%Config.Camera{id: "cam_off"}]}, [], %{}}
+      end
+
+      start_supervised!(
+        {Config.Server,
+         path: path,
+         name: name,
+         source: source,
+         apply_diff: fn _diff, _config -> :ok end,
+         apply_native: fn _config -> :ok end},
+        id: :known_ids_server
+      )
+
+      assert Config.Server.known_ids(name) == MapSet.new(["cam_a", "cam_off"])
+    end
+  end
+
+  describe "would_restart?/3" do
+    test "an edit that reaches a subprocess would restart the camera" do
+      assert would_restart?(%{"rtsp_url" => "rtsp://h/CHANGED"})
+    end
+
+    test "a host-side edit would not" do
+      refute would_restart?(%{"post_window_seconds" => 42})
+    end
+
+    # Resolved configs, not raw settings: a global the camera does not
+    # override moves it too.
+    test "a global the camera resolves through would restart it" do
+      assert would_restart?(%{}, %{"events" => %{"pre_window_seconds" => 9}})
+    end
+
+    test "an added or removed camera is not a restart" do
+      one = camera_config([%{"id" => "cam_a", "rtsp_url" => "rtsp://h/1"}], %{})
+      none = camera_config([], %{})
+
+      refute Config.Server.would_restart?(none, one, "cam_a")
+      refute Config.Server.would_restart?(one, none, "cam_a")
+      refute Config.Server.would_restart?(one, one, "cam_absent")
+    end
+  end
+
+  defp would_restart?(edit, global \\ %{}) do
+    base = %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1"}
+
+    Config.Server.would_restart?(
+      camera_config([base], %{}),
+      camera_config([Map.merge(base, edit)], global),
+      "cam_a"
+    )
+  end
+
+  defp named_server(path, name, id) do
+    start_supervised!(
+      {Config.Server,
+       path: path,
+       name: name,
+       apply_diff: fn _diff, _config -> :ok end,
+       apply_native: fn _config -> :ok end},
+      id: id
+    )
   end
 
   # Two configs whose only difference is what `edit` does to cam_a and what

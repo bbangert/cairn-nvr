@@ -10,9 +10,7 @@ defmodule Cairn.CamerasTest do
   alias Cairn.Config
   alias Cairn.ConfigSource
   alias Cairn.Event
-  alias Cairn.EventCheckpoint
   alias Cairn.Events
-  alias Cairn.PresenceCheckpoint
 
   defp insert!(attrs) do
     Repo.insert!(Camera.changeset(%Camera{}, attrs))
@@ -290,36 +288,6 @@ defmodule Cairn.CamerasTest do
       assert Config.Server.get(server)
     end
 
-    test "delete prunes status, control and checkpoints" do
-      assert {:ok, _diff, []} =
-               Cameras.create(%{"id" => "cam1", "settings" => %{"rtsp_url" => "rtsp://h/1"}})
-
-      assert {:ok, _diff, []} =
-               Cameras.create(%{"id" => "cam2", "settings" => %{"rtsp_url" => "rtsp://h/2"}})
-
-      CameraStatus.set("cam1", :running)
-      CameraStatus.set("cam2", :running)
-      CameraControl.set("cam1", %{detection_enabled: false})
-      event = %Event{id: Ecto.UUID.generate(), camera_id: "cam1", started_at: DateTime.utc_now()}
-      PresenceCheckpoint.put("cam1", event, [], nil)
-      EventCheckpoint.put("cam1", event)
-
-      assert {:ok, %{removed: ["cam1"]}, []} = Cameras.delete("cam1")
-
-      # `prune/1` is a cast on each owner; a call to each is what orders the
-      # prune before these reads, which go to ETS and not through the owner.
-      _status = :sys.get_state(CameraStatus)
-      _control = :sys.get_state(CameraControl)
-      assert CameraStatus.get("cam1").status == :unknown
-      assert CameraStatus.all()["cam2"].status == :running
-
-      assert CameraControl.get("cam1") ==
-               %{detection_enabled: true, recording_enabled: true, min_score: nil}
-
-      assert PresenceCheckpoint.get("cam1") == nil
-      assert EventCheckpoint.get("cam1") == nil
-    end
-
     # D-P8: history outlives the row — the clips and event rows are retention's
     # to sweep, under the id they were recorded with.
     test "a deleted camera's event rows and clips stay", %{dir: dir} do
@@ -334,19 +302,59 @@ defmodule Cairn.CamerasTest do
       assert File.exists?(clip)
     end
 
+    # A disabled row is in no config's `cameras`, but it still exists — it
+    # rides `dormant`, which `known_ids/0` counts, so no owner prunes it.
+    #
+    # `cam_a` rather than `cam1`: the owners read the *application* config
+    # server's snapshot, which is the suite fixture and which this file's
+    # private server does not publish into, so an id that must survive a
+    # prune has to be one that file names.
     test "disabling keeps status and control" do
+      on_exit(fn ->
+        CameraStatus.set("cam_a", :unknown)
+        CameraControl.set("cam_a", %{detection_enabled: true})
+      end)
+
       assert {:ok, _diff, []} =
-               Cameras.create(%{"id" => "cam1", "settings" => %{"rtsp_url" => "rtsp://h/1"}})
+               Cameras.create(%{"id" => "cam_a", "settings" => %{"rtsp_url" => "rtsp://h/1"}})
 
-      CameraStatus.set("cam1", :running)
-      CameraControl.set("cam1", %{detection_enabled: false})
+      CameraStatus.set("cam_a", :running)
+      assert CameraControl.set("cam_a", %{detection_enabled: false}).detection_enabled == false
 
-      assert {:ok, %{removed: ["cam1"]}, []} = Cameras.set_enabled("cam1", false)
+      assert {:ok, %{removed: ["cam_a"]}, []} = Cameras.set_enabled("cam_a", false)
 
       _status = :sys.get_state(CameraStatus)
       _control = :sys.get_state(CameraControl)
-      assert CameraStatus.get("cam1").status == :running
-      assert CameraControl.get("cam1").detection_enabled == false
+      assert CameraStatus.get("cam_a").status == :running
+      assert CameraControl.get("cam_a").detection_enabled == false
+    end
+
+    test "a write pinned to a version the server has moved past is refused", %{server: server} do
+      assert {:ok, _diff, []} =
+               Cameras.create(%{"id" => "cam1", "settings" => %{"rtsp_url" => "rtsp://h/1"}})
+
+      version = Config.Server.get(server).version
+
+      assert {:ok, _diff, []} =
+               Cameras.update("cam1", %{"settings" => %{"rtsp_url" => "rtsp://h/2"}},
+                 expected_version: version
+               )
+
+      # That save installed a config of its own, so the same pin is stale now.
+      assert {:error, {:write, {:stale, current}}} =
+               Cameras.update("cam1", %{"settings" => %{"rtsp_url" => "rtsp://h/3"}},
+                 expected_version: version
+               )
+
+      assert current == Config.Server.get(server).version
+      assert Cameras.get("cam1").settings["rtsp_url"] == "rtsp://h/2"
+
+      # Every write takes the pin, not just the ones that carry a form.
+      assert Cameras.delete("cam1", expected_version: version) ==
+               {:error, {:write, {:stale, current}}}
+
+      assert Cameras.get("cam1")
+      assert {:ok, %{removed: ["cam1"]}, []} = Cameras.delete("cam1", expected_version: current)
     end
   end
 

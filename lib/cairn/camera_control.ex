@@ -10,6 +10,11 @@ defmodule Cairn.CameraControl do
   `get/1` reads the ETS table directly (hot path: the detect branch's
   `Cairn.Pipeline.ObservationStamper` reads it per buffer and
   `Cairn.CameraTracker` per batch); writes go through the GenServer owner.
+
+  This process owns the table: every write goes through it, and it is also
+  what prunes. It subscribes to the config topic and drops the rows of
+  cameras the new config no longer names, in its own callback, and refuses a
+  write for a camera the published config does not name (`set/2`).
   """
 
   use GenServer
@@ -52,10 +57,23 @@ defmodule Cairn.CameraControl do
   Merges `attrs` (a subset of `:detection_enabled`, `:recording_enabled`,
   `:min_score`) into a camera's control and returns the new control. Accepts
   either atom or string keys; unknown keys are ignored.
+
+  `{:error, :unknown_camera}` when the published config does not name the
+  camera — the overlay is only meaningful for a camera that exists.
   """
-  @spec set(String.t(), map()) :: control()
+  @spec set(String.t(), map()) :: control() | {:error, :unknown_camera}
   def set(camera_id, attrs) when is_map(attrs) do
     GenServer.call(__MODULE__, {:set, camera_id, normalize(attrs)})
+  end
+
+  # `set/2` without the existence check, for the suites whose camera exists
+  # only as a pipeline fixture and never in a fleet config. Same mailbox and
+  # same table: the ordering `set/2`'s check depends on is not weakened, only
+  # the check itself is skipped.
+  @doc false
+  @spec put(String.t(), map()) :: control()
+  def put(camera_id, attrs) when is_map(attrs) do
+    GenServer.call(__MODULE__, {:put, camera_id, normalize(attrs)})
   end
 
   # Accept string- or atom-keyed input, keeping only the known keys. Only maps
@@ -76,30 +94,60 @@ defmodule Cairn.CameraControl do
     end)
   end
 
-  @doc "Removes control for cameras no longer configured (on reload)."
-  @spec prune([String.t()]) :: :ok
-  def prune(known_camera_ids), do: GenServer.cast(__MODULE__, {:prune, known_camera_ids})
-
   @impl true
   def init(_opts) do
     :ets.new(@table, [:named_table, :set, :protected, read_concurrency: true])
+    Cairn.Config.Server.subscribe()
     {:ok, %{}}
   end
 
+  # The existence check runs here, in the mailbox that also handles the prune,
+  # and that is the whole ordering: the config server publishes its snapshot
+  # before it applies and broadcasts after, so a write handled after the
+  # publish finds no id and is refused, and one handled before is deleted by
+  # the prune the broadcast that follows triggers. Nothing is marked, nothing
+  # needs reviving, and a check made outside this process could be neither.
   @impl true
   def handle_call({:set, camera_id, attrs}, _from, state) do
+    if known?(camera_id),
+      do: {:reply, write(camera_id, attrs), state},
+      else: {:reply, {:error, :unknown_camera}, state}
+  end
+
+  def handle_call({:put, camera_id, attrs}, _from, state) do
+    {:reply, write(camera_id, attrs), state}
+  end
+
+  defp write(camera_id, attrs) do
     control = Map.merge(get(camera_id), Map.take(attrs, Map.keys(@defaults)))
     :ets.insert(@table, {camera_id, control})
     Phoenix.PubSub.broadcast(Cairn.PubSub, @topic, {:camera_control, camera_id, control})
-    {:reply, control, state}
+    control
   end
 
   @impl true
-  def handle_cast({:prune, known}, state) do
-    for {camera_id, _} <- :ets.tab2list(@table), camera_id not in known do
+  def handle_info({:config_changed, _diff}, state) do
+    prune(Cairn.Config.Server.known_ids())
+    {:noreply, state}
+  end
+
+  # No snapshot is not an empty fleet: a server that has published none (an
+  # unnamed one, or one still in `init/1`) cannot say which cameras exist, so
+  # it can neither refuse a write nor empty the table.
+  defp known?(camera_id) do
+    case Cairn.Config.Server.known_ids() do
+      nil -> true
+      known -> MapSet.member?(known, camera_id)
+    end
+  end
+
+  defp prune(nil), do: :ok
+
+  defp prune(known) do
+    for {camera_id, _} <- :ets.tab2list(@table), not MapSet.member?(known, camera_id) do
       :ets.delete(@table, camera_id)
     end
 
-    {:noreply, state}
+    :ok
   end
 end

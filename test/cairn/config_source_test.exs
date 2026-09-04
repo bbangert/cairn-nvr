@@ -558,7 +558,7 @@ defmodule Cairn.ConfigSourceTest do
       assert {:ok, diff, warnings} = Config.Server.reload(server)
       # Without the hold the reduced N=2 would derive 10 fps, putting cam_a
       # and cam_b in `changed` — a repair that restarts the cameras beside it.
-      assert diff == %{added: [], changed: [], refreshed: [], removed: ["cam_c"]}
+      assert %{added: [], changed: [], refreshed: [], removed: ["cam_c"]} = diff
       assert Enum.any?(warnings, &(&1 =~ "camera cam_c: skipped — "))
 
       after_skip = Config.Server.get(server)
@@ -714,6 +714,150 @@ defmodule Cairn.ConfigSourceTest do
     {:ok, _row} = Events.create_active(event, path)
     {:ok, row} = Events.finalize(%{event | ended_at: started, status: :finalized}, 4)
     row
+  end
+
+  describe "reimport" do
+    setup %{dir: dir} do
+      path =
+        write_yaml!(dir, """
+        #{globals(dir)}
+        cameras:
+          - id: cam_a
+            rtsp_url: rtsp://yaml/1
+          - id: cam_b
+            rtsp_url: rtsp://yaml/2
+        """)
+
+      # Rows that differ from the file, under a marker whose hash the file no
+      # longer matches: the "changed since they were imported" state the
+      # re-import is the operator's answer to.
+      insert_camera!("cam_a", 0, %{"rtsp_url" => "rtsp://rows/1"})
+      insert_camera!("cam_z", 1, %{"rtsp_url" => "rtsp://rows/z"})
+      mark_imported!(path)
+
+      server = private_server(path)
+      Application.put_env(:cairn, :config_server, server)
+      on_exit(fn -> Application.delete_env(:cairn, :config_server) end)
+
+      %{path: path, server: server}
+    end
+
+    test "replaces the rows with the file's cameras and re-arms the marker", %{
+      path: path,
+      server: server
+    } do
+      assert {:ok, _config, warnings, %{}} = ConfigSource.load(path)
+      assert Enum.any?(warnings, &(&1 =~ "changed since they were imported"))
+
+      assert {:ok, %{added: ["cam_b"], removed: ["cam_z"], changed: ["cam_a"]}, _warnings} =
+               ConfigSource.reimport(path)
+
+      assert Enum.map(Cameras.list(), &{&1.id, &1.settings["rtsp_url"]}) == [
+               {"cam_a", "rtsp://yaml/1"},
+               {"cam_b", "rtsp://yaml/2"}
+             ]
+
+      assert Enum.map(Config.Server.get(server).cameras, & &1.id) == ["cam_a", "cam_b"]
+
+      # The marker now hashes the file's list, so the next load only asks for
+      # the key to be removed.
+      assert {:ok, _config, warnings, %{}} = ConfigSource.load(path)
+      refute Enum.any?(warnings, &(&1 =~ "changed since"))
+      assert Enum.any?(warnings, &(&1 =~ "still lists cameras:"))
+    end
+
+    # Two `/config` sessions can each queue a re-import off the same drift
+    # warning; the second must not replace the fleet the first imported, and
+    # any edit made since, with a file it already matches.
+    test "a second re-import of the same file is refused", %{path: path} do
+      assert {:ok, _diff, _warnings} = ConfigSource.reimport(path)
+
+      assert {:ok, _diff, _warnings} =
+               Cameras.update("cam_b", %{"settings" => %{"rtsp_url" => "rtsp://edited/2"}})
+
+      assert {:error, {:write, :no_drift}} = ConfigSource.reimport(path)
+
+      assert Enum.map(Cameras.list(), &{&1.id, &1.settings["rtsp_url"]}) == [
+               {"cam_a", "rtsp://yaml/1"},
+               {"cam_b", "rtsp://edited/2"}
+             ]
+    end
+
+    # No marker is no import to drift from: the button is never shown for that
+    # state, so a request that reaches here anyway replaces nothing.
+    test "a re-import with no marker is refused without touching the rows", %{path: path} do
+      Repo.delete_all(Setting)
+
+      assert {:error, {:write, :no_marker}} = ConfigSource.reimport(path)
+      assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
+    end
+
+    test "a file that fails to load replaces nothing", %{dir: dir, path: path} do
+      File.write!(path, globals(dir) <> "cameras: [{id: broken}]\n")
+
+      assert {:error, {:write, {:yaml, errors}}} = ConfigSource.reimport(path)
+      assert Enum.any?(errors, &(&1 =~ "rtsp_url"))
+
+      # The rows and the marker are the transaction's to roll back, and it did.
+      assert Enum.map(Cameras.list(), &{&1.id, &1.settings["rtsp_url"]}) == [
+               {"cam_a", "rtsp://rows/1"},
+               {"cam_z", "rtsp://rows/z"}
+             ]
+
+      assert ConfigSource.import_marker()["sha256"] == String.duplicate("0", 64)
+    end
+
+    test "a cameras key that is not a list is the file's fault, not an empty import", %{
+      dir: dir,
+      path: path
+    } do
+      File.write!(path, globals(dir) <> "cameras: {}\n")
+
+      assert {:error, {:write, {:yaml, ["cameras must be a list"]}}} = ConfigSource.reimport(path)
+      assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
+    end
+
+    test "a file with no cameras to import is refused rather than emptying the fleet", %{
+      dir: dir,
+      path: path
+    } do
+      File.write!(path, globals(dir))
+
+      assert {:error, {:write, :no_cameras}} = ConfigSource.reimport(path)
+      assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
+    end
+
+    test "a stale expected_sha256 refuses with :changed and deletes no rows", %{path: path} do
+      stale = ConfigSource.file_sha256("not the file on disk")
+
+      assert {:error, {:write, :changed}} = ConfigSource.reimport(path, expected_sha256: stale)
+      assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
+    end
+
+    test "a matching expected_sha256 proceeds", %{path: path} do
+      sha = path |> File.read!() |> ConfigSource.file_sha256()
+
+      assert {:ok, %{added: ["cam_b"], removed: ["cam_z"], changed: ["cam_a"]}, _warnings} =
+               ConfigSource.reimport(path, expected_sha256: sha)
+    end
+
+    # The sha pins the file, this pins the rows: a confirmation rendered from
+    # a fleet that has changed since must not replace the one that is there.
+    test "a stale expected_version refuses and deletes no rows", %{path: path, server: server} do
+      version = Config.Server.get(server).version
+
+      assert {:ok, _diff, _warnings} =
+               Cameras.update("cam_z", %{"settings" => %{"rtsp_url" => "rtsp://rows/z2"}})
+
+      assert {:error, {:write, {:stale, current}}} =
+               ConfigSource.reimport(path, expected_version: version)
+
+      assert current == Config.Server.get(server).version
+      assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
+
+      assert {:ok, _diff, _warnings} = ConfigSource.reimport(path, expected_version: current)
+      assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_b"]
+    end
   end
 
   describe "describe_import_error/1" do

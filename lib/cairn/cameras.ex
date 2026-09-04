@@ -12,27 +12,36 @@ defmodule Cairn.Cameras do
   `reject_skipped:`, so a save cannot leave its own row skipped and dark.
   `delete/1`, `reorder/1` and a disable do not: none of them asks the parser
   to accept a row the operator just wrote.
+
+  Every write also takes an optional trailing `opts`, forwarded to
+  `Cairn.Config.Server.update/3`. `expected_version:` is the one a caller
+  editing a rendered view should pass: the write is accepted only if the
+  config it was composed against is still the installed one, and refused with
+  `{:error, {:write, {:stale, current}}}` otherwise.
+
+  A write changes rows and nothing else. The runtime owners — `CameraStatus`,
+  `CameraControl` and the two checkpoints — drop what the new config no longer
+  names when they see the server's `{:config_changed, _}`, each in its own
+  process.
   """
 
   # `only:` — `Ecto.Query.update/2` would clash with this module's own.
   import Ecto.Query, only: [from: 2]
 
-  alias Cairn.CameraControl
   alias Cairn.Cameras.Camera
-  alias Cairn.CameraStatus
   alias Cairn.Config
-  alias Cairn.EventCheckpoint
-  alias Cairn.PresenceCheckpoint
   alias Cairn.Repo
 
   @typedoc """
   What `Cairn.Config.Server.update/3` answers: the applied diff and its
   warnings, the validator's errors, or the write's own failure (a changeset,
-  `:not_found`, a DB fault).
+  `:not_found`, a DB fault, or an `expected_version:` the installed config has
+  moved past).
   """
   @type write_result ::
           {:ok, Cairn.Config.Server.diff(), [String.t()]}
           | {:error, [String.t()]}
+          | {:error, {:write, {:stale, non_neg_integer()}}}
           | {:error, {:write, term()}}
 
   @spec list() :: [Camera.t()]
@@ -56,8 +65,8 @@ defmodule Cairn.Cameras do
   `"id"`, `"enabled"` (default true), `"settings"` (a YAML-camera-shaped map,
   normalized through `canonical/1`) and `"zones"` — string- or atom-keyed.
   """
-  @spec create(map()) :: write_result()
-  def create(attrs) do
+  @spec create(map(), keyword()) :: write_result()
+  def create(attrs, opts \\ []) do
     attrs = stringify_shallow(attrs)
     id = Map.get(attrs, "id")
 
@@ -76,22 +85,31 @@ defmodule Cairn.Cameras do
       with {:ok, _row} <- Repo.insert(changeset), do: :ok
     end
 
-    Config.Server.update(server(), write, reject_skipped: id)
+    Config.Server.update(server(), write, [reject_skipped: id] ++ pin(opts))
   end
+
+  # The only `update/3` option a context caller passes through. Taken rather
+  # than forwarded whole so a caller cannot reach the server's other options
+  # (`reject_skipped:`, which every write here already decides for itself).
+  defp pin(opts), do: Keyword.take(opts, [:expected_version])
 
   @doc """
   Writes `attrs` (`"position"`, `"enabled"`, `"settings"`, `"zones"`) onto an
   existing row. The id is immutable, so it is not among them.
   """
-  @spec update(String.t(), map()) :: write_result()
-  def update(id, attrs) do
+  @spec update(String.t(), map(), keyword()) :: write_result()
+  def update(id, attrs, opts \\ []) do
     changes =
       attrs
       |> stringify_shallow()
       |> Map.take(~w(position enabled settings zones))
       |> canonicalize_settings()
 
-    Config.Server.update(server(), fn -> update_row(id, changes) end, reject_skipped: id)
+    Config.Server.update(
+      server(),
+      fn -> update_row(id, changes) end,
+      [reject_skipped: id] ++ pin(opts)
+    )
   end
 
   defp update_row(id, changes) do
@@ -112,30 +130,34 @@ defmodule Cairn.Cameras do
   Flips a camera's `enabled` column. A disable is a fleet edit like any
   other: the validator sees the fleet without the camera and can refuse it.
   """
-  @spec set_enabled(String.t(), boolean()) :: write_result()
+  @spec set_enabled(String.t(), boolean(), keyword()) :: write_result()
   # Enabling puts the row back in front of the parser, so it carries the same
   # bar a create does; a disabled row is not rendered and cannot be skipped.
-  def set_enabled(id, true), do: update(id, %{"enabled" => true})
+  def set_enabled(id, enabled, opts \\ [])
+  def set_enabled(id, true, opts), do: update(id, %{"enabled" => true}, opts)
 
-  def set_enabled(id, false) do
-    Config.Server.update(server(), fn -> update_row(id, %{"enabled" => false}) end)
+  def set_enabled(id, false, opts) do
+    Config.Server.update(server(), fn -> update_row(id, %{"enabled" => false}) end, pin(opts))
   end
 
-  @spec put_zones(String.t(), [map()]) :: write_result()
-  def put_zones(id, zones) when is_list(zones), do: update(id, %{"zones" => zones})
+  @spec put_zones(String.t(), [map()], keyword()) :: write_result()
+  def put_zones(id, zones, opts \\ []) when is_list(zones),
+    do: update(id, %{"zones" => zones}, opts)
 
   @doc """
   Renumbers `position` to the order of `ids`, which must name every row
   exactly once.
   """
-  @spec reorder([String.t()]) :: write_result()
-  def reorder(ids) when is_list(ids) do
-    Config.Server.update(server(), fn ->
+  @spec reorder([String.t()], keyword()) :: write_result()
+  def reorder(ids, opts \\ []) when is_list(ids) do
+    write = fn ->
       # A partial list would leave the omitted rows on their old positions,
       # colliding with the new indices; `list/0`'s id tiebreak hides the tie,
       # so the fleet's order would silently stop matching what was asked for.
       if whole_fleet?(ids), do: reposition_all(ids), else: {:error, :incomplete}
-    end)
+    end
+
+    Config.Server.update(server(), write, pin(opts))
   end
 
   defp whole_fleet?(ids), do: Enum.sort(ids) == list() |> Enum.map(& &1.id) |> Enum.sort()
@@ -160,19 +182,14 @@ defmodule Cairn.Cameras do
   end
 
   @doc """
-  Deletes a camera and clears its live runtime state — status, control
-  overlay and both event checkpoints.
+  Deletes a camera's row. Its live runtime state goes with the config the
+  server publishes and broadcasts: each owner prunes its own table, in its own
+  process, so nothing here can land a prune on a camera another session has
+  since re-created under the same id.
   """
-  @spec delete(String.t()) :: write_result()
-  def delete(id) do
-    case Config.Server.update(server(), fn -> delete_row(id) end) do
-      {:ok, _diff, _warnings} = applied ->
-        prune_runtime(id)
-        applied
-
-      rejected ->
-        rejected
-    end
+  @spec delete(String.t(), keyword()) :: write_result()
+  def delete(id, opts \\ []) do
+    Config.Server.update(server(), fn -> delete_row(id) end, pin(opts))
   end
 
   defp delete_row(id) do
@@ -180,18 +197,6 @@ defmodule Cairn.Cameras do
       nil -> {:error, :not_found}
       camera -> with {:ok, _row} <- Repo.delete(camera), do: :ok
     end
-  end
-
-  # Keyed on the row delete and never on `diff.removed` (D-P8): a skipped or
-  # disabled camera is absent from the config too, and it must keep its
-  # control override and last status. Event rows and clip files stay under
-  # the old id until retention sweeps them.
-  defp prune_runtime(id) do
-    remaining = Enum.map(list(), & &1.id)
-    CameraStatus.prune(remaining)
-    CameraControl.prune(remaining)
-    PresenceCheckpoint.delete(id)
-    EventCheckpoint.delete(id)
   end
 
   defp next_position do

@@ -20,7 +20,7 @@ defmodule Cairn.Native.StatusTest do
 
     on_exit(fn ->
       :persistent_term.erase(@control)
-      CameraStatus.prune(Map.keys(CameraStatus.all()) -- [id])
+      CameraStatus.delete(id)
     end)
 
     %{id: id}

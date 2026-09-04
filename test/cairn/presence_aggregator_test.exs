@@ -16,7 +16,7 @@ defmodule Cairn.PresenceAggregatorTest do
     # `Cairn.PresenceRecorder` starts beside every aggregator, and a camera
     # the config does not name has no `record:` block to refuse anything.
     # This suite is about the transitions, not the lane they drive.
-    Cairn.CameraControl.set(camera_id, %{recording_enabled: false})
+    Cairn.CameraControl.put(camera_id, %{recording_enabled: false})
 
     # Aggregators live in the application-wide pool; without this every
     # test leaks a timer-bearing control subscriber for the suite's life.
@@ -293,8 +293,8 @@ defmodule Cairn.PresenceAggregatorTest do
 
     # The out-of-band path: no buffer arrives (still scene, closed gate) —
     # the aggregator hears the control broadcast itself.
-    Cairn.CameraControl.set(id, %{detection_enabled: false})
-    on_exit(fn -> Cairn.CameraControl.set(id, %{detection_enabled: true}) end)
+    Cairn.CameraControl.put(id, %{detection_enabled: false})
+    on_exit(fn -> Cairn.CameraControl.put(id, %{detection_enabled: true}) end)
 
     assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
   end
@@ -303,8 +303,8 @@ defmodule Cairn.PresenceAggregatorTest do
     # The race the sink cannot close: its control read happens a message
     # before the disable broadcast; the aggregator's own read at consume
     # time is the authoritative one.
-    Cairn.CameraControl.set(id, %{detection_enabled: false})
-    on_exit(fn -> Cairn.CameraControl.set(id, %{detection_enabled: true}) end)
+    Cairn.CameraControl.put(id, %{detection_enabled: false})
+    on_exit(fn -> Cairn.CameraControl.put(id, %{detection_enabled: true}) end)
 
     PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.9})
     PresenceAggregator.observed(id, @base + 500, %{{nil, "person"} => 0.9})

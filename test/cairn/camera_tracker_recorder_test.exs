@@ -239,7 +239,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
   describe "a track that ended with no event open" do
     setup ctx do
       # no event can open, so every track here takes the tier-gated branch
-      CameraControl.set(ctx.camera_id, %{recording_enabled: false})
+      CameraControl.put(ctx.camera_id, %{recording_enabled: false})
       :ok
     end
 
@@ -424,7 +424,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
     setup ctx do
       # recording off throughout: these are about the `track:` tier and the row
       # it opens, and an open event would record every track unconditionally.
-      CameraControl.set(ctx.camera_id, %{recording_enabled: false})
+      CameraControl.put(ctx.camera_id, %{recording_enabled: false})
       :ok
     end
 
@@ -483,7 +483,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
 
   describe "a track under the track: tier" do
     setup ctx do
-      CameraControl.set(ctx.camera_id, %{recording_enabled: false})
+      CameraControl.put(ctx.camera_id, %{recording_enabled: false})
       camera = %{ctx.camera | track: %{"person" => %{min_score: 0.8}}}
       %{ctx | camera: camera}
     end

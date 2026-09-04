@@ -110,4 +110,22 @@ defmodule CairnWeb.Api.CameraControllerTest do
            |> post("/api/cameras/nope/control", %{detection_enabled: false})
            |> json_response(404)
   end
+
+  # The pre-check is the fast path and runs in this request's process, ordered
+  # against nothing: a delete can apply between it and the write. The owner
+  # reads the published snapshot instead, which leads `get/1` for the length
+  # of an apply — so narrowing the snapshot alone puts the request in exactly
+  # that window, and the owner's refusal has to be the same 404.
+  test "control 404s a camera the owner no longer knows, though the pre-check found it", %{
+    conn: conn
+  } do
+    key = Server.snapshot_key(Cairn.Config.Server)
+    published = :persistent_term.get(key)
+    on_exit(fn -> :persistent_term.put(key, published) end)
+    :persistent_term.put(key, %{published | cameras: [], dormant: []})
+
+    assert conn
+           |> post("/api/cameras/cam_a/control", %{detection_enabled: false})
+           |> json_response(404)
+  end
 end
