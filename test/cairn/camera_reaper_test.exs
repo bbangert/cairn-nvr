@@ -217,6 +217,34 @@ defmodule Cairn.CameraReaperTest do
     assert Registry.whereis(camera_id, {:extractor, event_id}) == nil
   end
 
+  # Under `:one_for_one`, a delete's diff can land on the OLD reaper pid and
+  # be lost to a restart racing `Cairn.Config.Server`'s owner sync — the fresh
+  # process would otherwise answer `sync/2` having pruned nothing. The stub
+  # here stands for a lane owner that survived exactly that: never named in
+  # the published snapshot, still registered when a private reaper starts.
+  test "a fresh reaper reconciles against the published snapshot on init" do
+    camera_id = "reap_orphan_#{System.unique_integer([:positive])}"
+
+    stub =
+      start_supervised!(%{
+        id: :orphan_tracker_stub,
+        restart: :temporary,
+        start:
+          {Agent, :start_link,
+           [fn -> {:ok, _} = Registry.register(camera_id, :camera_tracker) end]}
+      })
+
+    ref = Process.monitor(stub)
+
+    reaper = start_supervised!({CameraReaper, name: nil})
+    :sys.get_state(reaper)
+
+    assert_receive {:DOWN, ^ref, :process, ^stub, :normal}
+    Registry.await_unregistered(camera_id, :camera_tracker)
+    assert Registry.whereis(camera_id, :camera_tracker) == nil
+    assert CameraReaper.sync(reaper) == :ok
+  end
+
   defp start_extractor(camera_id) do
     {opts, event_id} = extractor_opts(camera_id)
     pid = start_supervised!({EventExtractor, opts})

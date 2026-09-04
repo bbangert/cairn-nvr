@@ -69,7 +69,10 @@ defmodule Cairn.CameraReaper do
 
   def start_link(opts) do
     {name, opts} = Keyword.pop(opts, :name, __MODULE__)
-    GenServer.start_link(__MODULE__, opts, name: name)
+    # `name: nil` starts an unregistered instance — a test's private reaper,
+    # run alongside the application's own without contending for its name.
+    gen_opts = if name, do: [name: name], else: []
+    GenServer.start_link(__MODULE__, opts, gen_opts)
   end
 
   @doc """
@@ -84,6 +87,13 @@ defmodule Cairn.CameraReaper do
   @impl true
   def init(_opts) do
     Cairn.Config.Server.subscribe()
+    # First in this process's mailbox, ahead of anything a caller's `sync/2`
+    # could enqueue: under `:one_for_one`, a delete's diff can reach the OLD
+    # pid and be lost to a restart racing `Cairn.Config.Server`'s owner sync,
+    # in which case the fresh process would otherwise answer `:sync` having
+    # never pruned it. The published membership is complete, so replaying
+    # this pass against it closes that gap regardless of what was missed.
+    send(self(), :reconcile)
     {:ok, %{}}
   end
 
@@ -95,13 +105,28 @@ defmodule Cairn.CameraReaper do
         {:config_changed, %{server: Cairn.Config.Server, known: %MapSet{} = known}},
         state
       ) do
-    stop_lane_owners(known)
-    end_extractors(known)
+    reconcile(known)
     {:noreply, state}
   end
 
   # Another server's diff, or one without the membership this owner prunes on.
   def handle_info({:config_changed, _other}, state), do: {:noreply, state}
+
+  # No snapshot published yet (a fresh node's boot order, or a test that never
+  # lends one) means nothing is known to reconcile against.
+  def handle_info(:reconcile, state) do
+    case Cairn.Config.Server.known_ids() do
+      %MapSet{} = known -> reconcile(known)
+      nil -> :ok
+    end
+
+    {:noreply, state}
+  end
+
+  defp reconcile(known) do
+    stop_lane_owners(known)
+    end_extractors(known)
+  end
 
   # Every stop happens before the sweep below (a lane owner drains what is
   # queued ahead of its stop, so one can still open an event and start an
