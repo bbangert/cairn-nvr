@@ -185,7 +185,7 @@ defmodule Cairn.PipelineOwnerTest do
     # Two sightings confirm, which is what gives the refresh below a state to
     # clear. Recording off: a confirm would otherwise open a real clip.
     defp announce(camera_id, key) do
-      Cairn.CameraControl.set(camera_id, %{recording_enabled: false})
+      Cairn.CameraControl.put(camera_id, %{recording_enabled: false})
 
       on_exit(fn ->
         PresenceAggregator.retire(camera_id)
@@ -528,7 +528,7 @@ defmodule Cairn.PipelineOwnerTest do
     # nothing about the age of its last buffer is news.
     test "a detect branch stale behind a closed detection gate is not a wedge" do
       cam = camera(uid("pd"), plugin: {:group, "g"})
-      Cairn.CameraControl.set(cam.id, %{detection_enabled: false})
+      Cairn.CameraControl.put(cam.id, %{detection_enabled: false})
       owner = start_owner(cam, watchdog_interval_ms: 50)
 
       assert_receive {:pipeline_started, _first, _opts}, 2_000
@@ -538,7 +538,7 @@ defmodule Cairn.PipelineOwnerTest do
 
       # Re-enabling does not rebuild on the age the disable left behind: the
       # branch gets a full stall window to produce its first real buffer.
-      Cairn.CameraControl.set(cam.id, %{detection_enabled: true})
+      Cairn.CameraControl.put(cam.id, %{detection_enabled: true})
       refute_receive {:pipeline_started, _pid, _opts}, 500
     end
 

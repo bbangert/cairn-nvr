@@ -110,4 +110,49 @@ defmodule CairnWeb.Api.CameraControllerTest do
            |> post("/api/cameras/nope/control", %{detection_enabled: false})
            |> json_response(404)
   end
+
+  # The owner reads the published snapshot, which leads `get/1` for the length
+  # of an apply — so narrowing the snapshot alone puts the request in exactly
+  # the window between a delete's publish and its broadcast, and the owner's
+  # refusal is the 404.
+  #
+  # The restore runs in `after`, not `on_exit`: the setup block's `on_exit`
+  # resets cam_a's control through `CameraControl.set/2`, which the owner
+  # refuses while the snapshot here is narrowed. `on_exit` callbacks run
+  # LIFO, so today's registration order happens to restore first — but that
+  # is an accident of ordering, not a guarantee. `after` runs inside this
+  # test, before any `on_exit` callback, so the reset always sees the real
+  # snapshot regardless of registration order.
+  test "control 404s a camera the published config no longer names", %{conn: conn} do
+    key = Server.snapshot_key(Cairn.Config.Server)
+    published = :persistent_term.get(key)
+    :persistent_term.put(key, %{published | cameras: [], dormant: []})
+
+    try do
+      assert conn
+             |> post("/api/cameras/cam_a/control", %{detection_enabled: false})
+             |> json_response(404)
+    after
+      :persistent_term.put(key, published)
+    end
+  end
+
+  # A disabled camera is out of the running config but still a row, and its
+  # control overlay is meant to survive the disable: the owner counts it as
+  # known, so the endpoint accepts the write.
+  test "control accepts a disabled camera the owner still knows", %{conn: conn} do
+    key = Server.snapshot_key(Cairn.Config.Server)
+    published = :persistent_term.get(key)
+    dormant = [%Cairn.Config.Camera{id: "cam_a"}]
+    :persistent_term.put(key, %{published | cameras: [], dormant: dormant})
+
+    try do
+      assert %{"id" => "cam_a", "control" => %{"detection_enabled" => false}} =
+               conn
+               |> post("/api/cameras/cam_a/control", %{detection_enabled: false})
+               |> json_response(200)
+    after
+      :persistent_term.put(key, published)
+    end
+  end
 end

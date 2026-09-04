@@ -363,14 +363,17 @@ defmodule CairnWeb.Api.EventStreamEndpointTest do
   # barrier, and the loop only ends when we send it one ourselves.
   test "a plugin status reaches the live SSE endpoint as a camera_status frame" do
     id = "sse_#{System.unique_integer([:positive])}"
-    on_exit(fn -> Cairn.CameraStatus.prune(Map.keys(Cairn.CameraStatus.all()) -- [id]) end)
+    on_exit(fn -> Cairn.CameraStatus.delete(id) end)
 
     conn = build_conn(:get, "/api/stream?access_token=#{@token}")
     stream = Task.async(fn -> CairnWeb.Endpoint.call(conn, []) end)
 
     assert_receive {:plug_conn, :sent}, 5_000
 
-    Cairn.CameraStatus.set_plugin_status(id, %{"state" => "degraded", "detail" => "cpu fallback"})
+    Cairn.CameraStatus.put(id, %{
+      plugin_status: %{"state" => "degraded", "detail" => "cpu fallback"}
+    })
+
     # the cast, and the broadcast inside it, are done once the server's mailbox
     # flushes — so the frame is in the stream's mailbox ahead of the stop below
     _ = :sys.get_state(Cairn.CameraStatus)

@@ -189,8 +189,8 @@ defmodule Cairn.Pipeline.ObservationStamperTest do
 
   describe "the runtime control overlay" do
     test "the effective min_score rides the context, override included", ctx do
-      CameraControl.set(ctx.camera_id, %{min_score: 0.95})
-      on_exit(fn -> CameraControl.set(ctx.camera_id, %{min_score: nil}) end)
+      CameraControl.put(ctx.camera_id, %{min_score: 0.95})
+      on_exit(fn -> CameraControl.put(ctx.camera_id, %{min_score: nil}) end)
 
       {actions, _state} = feed(stamper(ctx), [NativeStub.frame()], ctx.epoch)
 
@@ -205,8 +205,8 @@ defmodule Cairn.Pipeline.ObservationStamperTest do
     end
 
     test "detection off drops the batch and tells the tracker to let go, once", ctx do
-      CameraControl.set(ctx.camera_id, %{detection_enabled: false})
-      on_exit(fn -> CameraControl.set(ctx.camera_id, %{detection_enabled: true}) end)
+      CameraControl.put(ctx.camera_id, %{detection_enabled: false})
+      on_exit(fn -> CameraControl.put(ctx.camera_id, %{detection_enabled: true}) end)
 
       {actions, state} = feed(stamper(ctx), [NativeStub.frame()], ctx.epoch)
 
@@ -219,15 +219,15 @@ defmodule Cairn.Pipeline.ObservationStamperTest do
     end
 
     test "detection back on stamps again and re-arms the ending", ctx do
-      CameraControl.set(ctx.camera_id, %{detection_enabled: false})
+      CameraControl.put(ctx.camera_id, %{detection_enabled: false})
       {_actions, state} = feed(stamper(ctx), [NativeStub.frame()], ctx.epoch)
 
-      CameraControl.set(ctx.camera_id, %{detection_enabled: true})
+      CameraControl.put(ctx.camera_id, %{detection_enabled: true})
       {actions, state} = feed(state, [NativeStub.frame()], ctx.epoch)
       assert [%{context: _}] = batches(actions)
 
-      CameraControl.set(ctx.camera_id, %{detection_enabled: false})
-      on_exit(fn -> CameraControl.set(ctx.camera_id, %{detection_enabled: true}) end)
+      CameraControl.put(ctx.camera_id, %{detection_enabled: false})
+      on_exit(fn -> CameraControl.put(ctx.camera_id, %{detection_enabled: true}) end)
       {actions, _state} = feed(state, [NativeStub.frame()], ctx.epoch)
       assert actions == [event: {:output, %EndAll{reason: :detection_disabled}}]
     end
@@ -238,16 +238,16 @@ defmodule Cairn.Pipeline.ObservationStamperTest do
     # parent hop this replaces had no such order — the ending could arrive
     # behind the resumed batch and end exactly the tracks it had just minted.
     test "an off→on flip ends the old tracks and leaves the new ones alone", ctx do
-      on_exit(fn -> CameraControl.set(ctx.camera_id, %{detection_enabled: true}) end)
+      on_exit(fn -> CameraControl.put(ctx.camera_id, %{detection_enabled: true}) end)
 
       {actions, state} = feed(stamper(ctx), [frame_with_person()], ctx.epoch)
       {tracked, element} = drive(tracker_element(), actions)
       assert [%{tagged: [%{object_id: old_id}]}] = tracked
 
-      CameraControl.set(ctx.camera_id, %{detection_enabled: false})
+      CameraControl.put(ctx.camera_id, %{detection_enabled: false})
       {off, state} = feed(state, [frame_with_person()], ctx.epoch)
 
-      CameraControl.set(ctx.camera_id, %{detection_enabled: true})
+      CameraControl.put(ctx.camera_id, %{detection_enabled: true})
       {on, _state} = feed(state, [frame_with_person()], ctx.epoch)
 
       # In the order the pad delivers them, which is the order the stamper

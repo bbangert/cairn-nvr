@@ -37,12 +37,15 @@ defmodule Cairn.Config.Server do
   save is in flight.
 
   A named server publishes each config it installs as a `:persistent_term`
-  snapshot *before* applying it (`snapshot/1`, `snapshot_camera/2`): a camera tree
-  restarted by its own supervisor is rebuilt from the child spec its tree
-  was born with, and the snapshot is how the owner recovers what a refresh
-  since then delivered. A term rather than a call because `apply_diff`
-  runs inside this process — a camera started from a reload that called
-  back here would wait on the very call that is starting it. For the
+  snapshot *before* applying it (`snapshot/1`, `snapshot_camera/2`,
+  `known_ids/1`). A camera tree restarted by its own supervisor is rebuilt
+  from the child spec its tree was born with, and the snapshot is how the
+  owner recovers what a refresh since then delivered; the runtime owners read
+  it to refuse a write for a camera that no longer exists (they prune against
+  the membership the diff carries, not this one — `t:diff/0`). A term rather
+  than a call because `apply_diff` runs inside this process — a camera
+  started from a reload that called back here would wait on the very call
+  that is starting it, and the owners read it in the same window. For the
   duration of an apply the snapshot therefore leads `get/1`, which answers
   the previous config until the apply returns.
 
@@ -84,14 +87,33 @@ defmodule Cairn.Config.Server do
   @typedoc """
   A `t:camera_diff/0` plus the `version` of the config that produced it, so a
   subscriber that lost an answer to a timeout can tell from the next
-  broadcast whether its own write is the one that landed.
+  broadcast whether its own write is the one that landed, the `server` that
+  published it — its registered name, or its pid when unnamed — and `known`,
+  the camera ids that config names (`known_ids/1`'s answer, frozen at this
+  version).
+
+  `known` rides the diff because the snapshot moves and the mailbox does not:
+  a delete followed at once by a create of the same id would leave an owner
+  handling the delete against a snapshot that already names the id again, and
+  the re-created camera would inherit the deleted one's row. Pruning against
+  the membership of the version that produced the diff gives each broadcast
+  the fleet it was about.
+
+  `Cairn.Config.topic/0` is one topic for every server, so a private server
+  (a test's) broadcasts onto the same wire as the application singleton. The
+  runtime owners — `Cairn.CameraStatus` and `Cairn.CameraControl` — own
+  tables for the singleton's fleet, so acting on another server's diff would
+  prune them against a fleet that diff never described. They match
+  `server: Cairn.Config.Server` and ignore the rest.
   """
   @type diff :: %{
           added: [String.t()],
           removed: [String.t()],
           changed: [String.t()],
           refreshed: [String.t()],
-          version: non_neg_integer()
+          version: non_neg_integer(),
+          server: atom() | pid(),
+          known: MapSet.t(String.t())
         }
 
   @typedoc "Cameras a source left out of the config, and why."
@@ -148,8 +170,9 @@ defmodule Cairn.Config.Server do
 
   @doc """
   The config the server named `server` last published, or `nil` before its
-  first publish. A term read rather than a call: it answers while the server
-  is inside an apply, which is the one moment it cannot.
+  first publish (and always, for an unnamed server). A term read rather than
+  a call: the runtime owners read it while this server is inside an apply,
+  which is the one moment it cannot answer.
   """
   @spec snapshot(atom()) :: Config.t() | nil
   def snapshot(server \\ __MODULE__) when is_atom(server) do
@@ -158,6 +181,28 @@ defmodule Cairn.Config.Server do
       nil -> nil
     end
   end
+
+  @doc """
+  The camera ids the published snapshot names, or `nil` when there is none.
+
+  The *moving* view: it answers for whatever config is installed when it is
+  called, which is what a write has to be judged against (a write for a
+  re-created id must be accepted). An owner pruning on a broadcast wants the
+  membership of the version that produced it instead — `diff.known`.
+
+  `dormant` counts: a disabled or skipped camera is a row that still exists,
+  and an owner that pruned it would drop the control overlay and status of a
+  camera the operator is about to switch back on.
+  """
+  @spec known_ids(atom()) :: MapSet.t(String.t()) | nil
+  def known_ids(server \\ __MODULE__) when is_atom(server) do
+    case snapshot(server) do
+      %Config{} = config -> ids(config)
+      nil -> nil
+    end
+  end
+
+  defp ids(%Config{} = config), do: MapSet.new(config.cameras ++ config.dormant, & &1.id)
 
   @spec get(GenServer.server()) :: Config.t()
   def get(server \\ __MODULE__), do: GenServer.call(server, :get)
@@ -221,9 +266,11 @@ defmodule Cairn.Config.Server do
 
   @doc """
   Subscribes the caller to `Cairn.Config.topic/0`: `{:config_changed, diff}`
-  — the added, removed, changed and refreshed ids and the new config's
-  `version` — after every config applied past boot. Node-local: a subscriber
-  on another node hears nothing.
+  — the added, removed, changed and refreshed ids, the new config's `version`,
+  the ids it `known`s and the `server` that published it — after every config
+  applied past boot. Every server shares the topic, so a subscriber whose
+  reaction reads one server's state must filter on `diff.server`
+  (`t:diff/0`). Node-local: a subscriber on another node hears nothing.
   """
   @spec subscribe() :: :ok | {:error, term()}
   def subscribe, do: Phoenix.PubSub.subscribe(Cairn.PubSub, Config.topic())
@@ -378,16 +425,31 @@ defmodule Cairn.Config.Server do
     do: Enum.flat_map(List.wrap(reject), &Map.get(skipped, &1, []))
 
   # The ok arm shared by `:reload` and `{:update, _}`, so the three orderings
-  # below cannot drift between the two paths.
+  # below cannot drift between the two paths. The one every reader depends
+  # on: publish the snapshot, then apply, then broadcast — the snapshot is
+  # what a write is judged against, so it must already name the new fleet,
+  # and a write handled before the publish is caught by the prune the
+  # broadcast that follows triggers. The prune itself runs against
+  # `diff.known`, the membership frozen here: the snapshot has moved on by
+  # the time a slow owner reaches this diff, and a delete pruned against a
+  # later create's fleet prunes nothing (`t:diff/0`).
   defp apply_config(state, new_config, warnings, skipped) do
     new_config = installed(state, new_config)
-    diff = Map.put(diff_cameras(state.config, new_config), :version, new_config.version)
+
+    diff =
+      state.config
+      |> diff_cameras(new_config)
+      |> Map.merge(%{
+        version: new_config.version,
+        server: identity(state),
+        known: ids(new_config)
+      })
+
     # Before the diff: newly spawned ports redirect logs into the (possibly
     # changed) data_dir, so its log subdir must already exist
     Cairn.DataDir.ensure!(new_config.data_dir)
-    # Before the apply: a tree the diff restarts may be rebuilt by its
-    # supervisor at any point after, and must find this fleet, not the
-    # last one.
+    # A tree the diff restarts may be rebuilt by its supervisor at any point
+    # after the apply starts, and must find this fleet, not the last one.
     publish(state, new_config)
     # Before the cameras: detection is the in-VM engine, so the model a
     # restarted camera will open a stream on should already be the new
@@ -427,6 +489,13 @@ defmodule Cairn.Config.Server do
   # only a config this server is about to install can carry one: a candidate
   # a form validated, or a load that was rejected, keeps `from_map/1`'s 0.
   defp installed(state, config), do: %{config | version: state.config.version + 1}
+
+  # The `server` a diff is attributed to: the registered name, or this process
+  # when unnamed. `nil` is the only "no name" state carries — `false` is an
+  # atom and a legal registered name, so `state.snapshot || self()` would
+  # misreport a server named `false` as unnamed.
+  defp identity(%{snapshot: nil}), do: self()
+  defp identity(%{snapshot: name}), do: name
 
   # The snapshot outlives the process that published it, so a restart resumes
   # its predecessor's count: restarting at 1 would re-issue versions that

@@ -691,8 +691,8 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     id = ctx.camera_id
     # nothing may open a REAL event here: this recorder runs under the
     # application's pool, with no stub in sight
-    CameraControl.set(id, %{recording_enabled: false})
-    on_exit(fn -> CameraControl.set(id, %{recording_enabled: true}) end)
+    CameraControl.put(id, %{recording_enabled: false})
+    on_exit(fn -> CameraControl.put(id, %{recording_enabled: true}) end)
 
     on_exit(fn ->
       PresenceAggregator.retire(id)
