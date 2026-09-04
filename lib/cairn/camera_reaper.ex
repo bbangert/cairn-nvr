@@ -1,6 +1,6 @@
 defmodule Cairn.CameraReaper do
   @moduledoc """
-  Stops the per-camera process in one pool when the camera leaves the config.
+  Ends one role's per-camera work when the camera leaves the config.
 
   The event lanes live outside their camera's media tree — a
   `Cairn.PresenceRecorder` under `Cairn.PresenceSupervisor.Pool`, a
@@ -20,6 +20,18 @@ defmodule Cairn.CameraReaper do
   `Cairn.PresenceRecorder.ensure/1` could hand a caller anything but a fresh
   process for a re-created id.
 
+  The `:extractor` role is the third instance and the one that does not stop
+  what it finds. An extractor under `Cairn.EventSupervisor` outlives both its
+  lane owner and its camera's tree: nothing but a `{:finalize, event}` ends
+  one, so a deleted camera's clip would stay open and its row `active` for as
+  long as the node runs — and once the id is re-created,
+  `Cairn.PresenceRecorder.sweep_stranded/1` would find the deleted
+  generation's extractor and end its event as the new camera's. Killing it
+  would leave the row `active` until the next boot's reconciliation, so it is
+  finalized `:partial` instead: the same honest close the sweep performs, on a
+  row keyed by the event rather than the camera, which is why nothing about it
+  can collide with a re-created id.
+
   One instance per pool, told its `Cairn.Registry` role. Prunes on the
   application config server's diffs alone and against the membership that diff
   carries, `Cairn.EventCheckpoint`'s rule and for its reason.
@@ -29,9 +41,9 @@ defmodule Cairn.CameraReaper do
 
   require Logger
 
-  # An open event's clip is abandoned rather than finalized: its camera is
-  # gone, so there is nothing the recording is of any more, and the alternative
-  # is a finalize racing the re-create it is meant to be invisible to.
+  # A stopped lane owner's open event is abandoned rather than closed here:
+  # the clip itself belongs to the extractor, which the `:extractor` instance
+  # ends partial on the same broadcast.
   @stop_timeout 5_000
 
   @doc "`:role` is the `t:Cairn.Registry.role/0` this instance reaps."
@@ -49,6 +61,17 @@ defmodule Cairn.CameraReaper do
   @impl true
   def handle_info(
         {:config_changed, %{server: Cairn.Config.Server, known: %MapSet{} = known}},
+        %{role: :extractor} = state
+      ) do
+    Cairn.Registry.extractors()
+    |> Enum.reject(fn {camera_id, _event_id, _pid} -> MapSet.member?(known, camera_id) end)
+    |> Enum.each(&end_partial/1)
+
+    {:noreply, state}
+  end
+
+  def handle_info(
+        {:config_changed, %{server: Cairn.Config.Server, known: %MapSet{} = known}},
         state
       ) do
     state.role
@@ -62,18 +85,58 @@ defmodule Cairn.CameraReaper do
   # Another server's diff, or one without the membership this owner prunes on.
   def handle_info({:config_changed, _other}, state), do: {:noreply, state}
 
-  # The registry is a stale-read site: the pid may already be exiting, and
-  # `GenServer.stop/3` on a process that dies of anything else — or that
-  # outlasts the timeout — exits the caller with it.
+  # `Cairn.PresenceRecorder.end_stranded/3`'s close, with its ordering: the
+  # window is announced closed before the clip is told to land, and the cast
+  # carries every box already sent ahead of it. A row that is not `active` is
+  # an extractor already finalizing, and one the index cannot answer for has
+  # nothing to close honestly — both are stopped instead, which leaves the row
+  # to boot reconciliation rather than the process to the re-created id.
+  defp end_partial({camera_id, event_id, pid}) do
+    case active_row(event_id) do
+      nil ->
+        stop_pid(pid, camera_id, "stopping the extractor for event #{event_id}")
+
+      row ->
+        Logger.info("camera #{camera_id}: deleted, ending event #{event_id} partial")
+        event = Cairn.Events.partial_event(row, DateTime.utc_now())
+        Cairn.Event.broadcast(:event_ended, event)
+        Cairn.EventExtractor.finalize(pid, event)
+    end
+  end
+
+  # `Cairn.PresenceRecorder.active_rows/1`'s guards, for its reason: an index
+  # that will not answer costs this event's honest close, not the prune.
+  defp active_row(event_id) do
+    case Cairn.Events.get(event_id) do
+      %{status: :active} = row -> row
+      _other -> nil
+    end
+  rescue
+    e in [DBConnection.ConnectionError, DBConnection.OwnershipError, Exqlite.Error] ->
+      Logger.warning("event #{event_id}: could not read the index (#{Exception.message(e)})")
+      nil
+  catch
+    :exit, reason ->
+      Logger.warning("event #{event_id}: could not read the index (#{inspect(reason)})")
+      nil
+  end
+
   defp stop(camera_id, role) do
     case Cairn.Registry.whereis(camera_id, role) do
       nil ->
         :ok
 
       pid ->
-        Logger.info("camera #{camera_id}: deleted, stopping #{role}")
-        GenServer.stop(pid, :normal, @stop_timeout)
+        stop_pid(pid, camera_id, "stopping #{role}")
     end
+  end
+
+  # Every pid here is a stale registry read: it may already be exiting, and
+  # `GenServer.stop/3` on a process that dies of anything else — or that
+  # outlasts the timeout — exits the caller with it.
+  defp stop_pid(pid, camera_id, what) do
+    Logger.info("camera #{camera_id}: deleted, #{what}")
+    GenServer.stop(pid, :normal, @stop_timeout)
   catch
     :exit, _dying -> :ok
   end

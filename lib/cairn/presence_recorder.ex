@@ -1293,8 +1293,10 @@ defmodule Cairn.PresenceRecorder do
   # `Cairn.PresenceCheckpoint` crash takes the ledger, the aggregators and the
   # recorders with it, while the extractors, which live under
   # `Cairn.EventSupervisor`, keep writing: both witnesses to their events are
-  # gone at once. Nothing else would ever end them — an extractor has no cap of
-  # its own — and the camera's next confirm would open a SECOND one beside each.
+  # gone at once. Nothing else would end them while the camera is in the config
+  # — an extractor has no cap of its own, and `Cairn.CameraReaper` reaps only a
+  # camera the config has dropped — and the camera's next confirm would open a
+  # SECOND one beside each.
   # What is left to find them by is the `:active` index row the extractor wrote
   # and its own registration under `{:extractor, event_id}`.
   #
@@ -1348,26 +1350,7 @@ defmodule Cairn.PresenceRecorder do
         "to restore from — ending it partial"
     )
 
-    # Rebuilt from the row rather than emptied: the extractor writes what it is
-    # handed back over the row when it finalizes (`Cairn.Events.finalize/2`),
-    # so an event with no labels would erase the ones the clip actually earned.
-    labels = row.labels || %{}
-    max_scores = Map.get(labels, "max_scores", %{})
-
-    event = %Event{
-      id: row.id,
-      camera_id: row.camera_id,
-      started_at: row.started_at,
-      ended_at: now(),
-      status: :partial,
-      labels: Map.get(labels, "entries", []),
-      max_scores: max_scores,
-      # `create_active/2` writes no `max_score` column — only the close does —
-      # so an event that never got that far has it only inside the labels map.
-      max_score: row.max_score || best_score(max_scores),
-      trigger: Map.get(labels, "trigger"),
-      path: row.path
-    }
+    event = Events.partial_event(row, now())
 
     # `maybe_finalize/3`'s ordering, for its reason: the window is announced
     # closed before the clip is told to land, and the cast carries every box

@@ -706,6 +706,61 @@ defmodule Cairn.Config.ServerTest do
       assert Config.Server.get(server).version == 8
     end
 
+    # The crash the restart is recovering from happened inside one of the two
+    # apply callbacks, so the fresh load has to reach the runtime as well as
+    # the wire: the store and the snapshot already name the new fleet while the
+    # camera trees and the engine may be the old one.
+    test "a boot with a surviving snapshot replays the apply before the broadcast", %{path: path} do
+      name = :"restart_apply_#{System.unique_integer([:positive])}"
+      key = Config.Server.snapshot_key(name)
+      on_exit(fn -> :persistent_term.erase(key) end)
+
+      stale = %Config.Camera{id: "cam_stale", rtsp_url: "rtsp://h/stale"}
+      :persistent_term.put(key, %Config{version: 7, cameras: [stale]})
+
+      test_pid = self()
+      Config.Server.subscribe()
+
+      start_supervised!(
+        {Config.Server,
+         path: path,
+         name: name,
+         apply_diff: fn diff, config -> send(test_pid, {:applied, diff, config}) end,
+         apply_native: fn config -> send(test_pid, {:native_applied, config}) end},
+        id: :restart_apply_server
+      )
+
+      # Bare patterns, in mailbox order: a matching `assert_receive` would pass
+      # on all three whatever order they were sent in, and the order is the
+      # point — the runtime is caught up before anyone is told.
+      assert_receive first
+      assert_receive second
+      assert_receive third
+
+      assert {:native_applied, %Config{version: 8}} = first
+      assert {:applied, diff, %Config{version: 8}} = second
+      assert "cam_stale" in diff.removed
+      assert {:config_changed, ^diff} = third
+    end
+
+    test "a fresh boot replays no apply", %{path: path} do
+      name = :"fresh_apply_#{System.unique_integer([:positive])}"
+      on_exit(fn -> :persistent_term.erase(Config.Server.snapshot_key(name)) end)
+      test_pid = self()
+
+      start_supervised!(
+        {Config.Server,
+         path: path,
+         name: name,
+         apply_diff: fn diff, config -> send(test_pid, {:applied, diff, config}) end,
+         apply_native: fn config -> send(test_pid, {:native_applied, config}) end},
+        id: :fresh_apply_server
+      )
+
+      refute_receive {:native_applied, _config}, 200
+      refute_receive {:applied, _diff, _config}, 200
+    end
+
     test "a boot with no surviving snapshot announces nothing", %{path: path} do
       name = :"restart_announce_none_#{System.unique_integer([:positive])}"
 

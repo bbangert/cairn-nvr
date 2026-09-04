@@ -66,6 +66,9 @@ defmodule Cairn.Application do
       {Cairn.TrackerSupervisor, []},
       {Cairn.PresenceSupervisor, []},
       {Cairn.EventSupervisor, []},
+      # After the extractors it ends: a camera deleted from the config leaves
+      # its clips open under that supervisor, which nothing else closes.
+      {Cairn.CameraReaper, role: :extractor, name: Cairn.EventSupervisor.Reaper},
       # Before the cameras that mint epochs into it
       {Cairn.StreamEpochs, []},
       # After the epochs it announces under, before the cameras that open

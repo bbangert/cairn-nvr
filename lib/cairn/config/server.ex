@@ -6,9 +6,10 @@ defmodule Cairn.Config.Server do
   cameras whose change reaches no subprocess). An invalid reload keeps the
   old config and returns the errors. Every applied config is announced on
   `Cairn.Config.topic/0` as `{:config_changed, diff}` — see `subscribe/0`. A
-  restart that finds a surviving snapshot re-announces once at boot, against
-  the fresh load, since a crash between an apply's commit and its broadcast
-  would otherwise leave that config never announced at all.
+  restart that finds a surviving snapshot re-applies and re-announces once at
+  boot, against the fresh load, since a crash between an apply's commit and
+  its broadcast would otherwise leave that config never applied to the
+  runtime and never announced at all.
 
   The source is the `source:` opt, else the `:config_loader` app env — a
   1-arity fun of the config path, or `{module, function}` naming one; the
@@ -103,8 +104,9 @@ defmodule Cairn.Config.Server do
   `Cairn.Config.topic/0` is one topic for every server, so a private server
   (a test's) broadcasts onto the same wire as the application singleton. The
   runtime owners — `Cairn.CameraStatus`, `Cairn.CameraControl`,
-  `Cairn.EventCheckpoint`, `Cairn.PresenceCheckpoint`, and the two
-  `Cairn.CameraReaper`s that stop a deleted camera's recorder and tracker —
+  `Cairn.EventCheckpoint`, `Cairn.PresenceCheckpoint`, and the three
+  `Cairn.CameraReaper`s that end a deleted camera's recorder, tracker and
+  extractors —
   own tables and processes for the singleton's fleet, so acting on another
   server's diff would prune them against a fleet that diff never described.
   They match `server: Cairn.Config.Server` and ignore the rest.
@@ -355,11 +357,11 @@ defmodule Cairn.Config.Server do
   # `apply_config/4`; a callback that raises after that apply's transaction
   # committed and its snapshot published crashes this process before the
   # broadcast fires. The restart above re-seeds from the surviving snapshot
-  # and re-publishes, but without this, never re-broadcasts — the owners
-  # would keep pruning against the membership before the apply that crashed
-  # until some later, unrelated apply finally caught them up. Diffing the
-  # surviving snapshot against the fresh load and broadcasting once at boot
-  # closes that gap. A fresh boot has no surviving snapshot to diff against
+  # and re-publishes, but without this, never re-applies or re-broadcasts —
+  # the owners would keep pruning against the membership before the apply that
+  # crashed until some later, unrelated apply finally caught them up. Diffing
+  # the surviving snapshot against the fresh load, applying it and
+  # broadcasting once at boot closes that gap. A fresh boot has no surviving snapshot to diff against
   # and stays silent, as it always has.
   #
   # What this does not cover: a PubSub restart that drops subscriptions
@@ -368,13 +370,28 @@ defmodule Cairn.Config.Server do
   #
   # Skipped when PubSub is not up: a whole-tree restart in the same VM keeps
   # the persistent term, and this server starts before `Cairn.PubSub`. A
-  # broadcast then would fail the boot, and it is not needed — that restart
-  # gives every owner a fresh, empty table.
+  # broadcast then would fail the boot, and neither it nor the replay below is
+  # needed — that restart gives every owner a fresh, empty table and starts
+  # every camera tree from the config this boot installs.
   defp announce_restart(_state, nil, _new_config), do: :ok
 
   defp announce_restart(state, %Config{} = surviving, new_config) do
     if Process.whereis(Cairn.PubSub) do
       diff = build_diff(surviving, new_config, state.snapshot || self())
+
+      # The crash that lost the broadcast is a crash *inside* one of these two,
+      # so the runtime is the half of the world this restart cannot assume:
+      # the store, the snapshot and the owners already name the new fleet while
+      # the camera trees and the engine may be the old one, or half of it.
+      # Replayed in `apply_config/4`'s order and ahead of the broadcast, so a
+      # commit that never reached its apply cannot leave the runtime behind the
+      # fleet for as long as the node runs. Both are safe over a partly applied
+      # attempt: `Cairn.CameraSupervisor` stops by registry lookup and starts
+      # only what is not running, and `Cairn.Native.Host.reconfigure/1` takes a
+      # whole config.
+      state.apply_native.(new_config)
+      state.apply_diff.(diff, new_config)
+
       Phoenix.PubSub.local_broadcast(Cairn.PubSub, Config.topic(), {:config_changed, diff})
     else
       :ok
