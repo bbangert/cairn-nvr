@@ -130,6 +130,50 @@ defmodule Cairn.Config.ServerUpdateTest do
     assert_receive {:config_changed, %{added: [], changed: [], refreshed: [], removed: []}}
   end
 
+  describe "expected_version:" do
+    test "a save pinned to the current version applies and increments it", %{server: server} do
+      Config.Server.subscribe()
+      assert Config.Server.get(server).version == 1
+
+      assert {:ok, %{version: 2}, _warnings} =
+               Config.Server.update(server, insert_fun("cam_a", "full"), expected_version: 1)
+
+      assert_receive {:config_changed, %{added: ["cam_a"], version: 2}}
+      assert Config.Server.get(server).version == 2
+    end
+
+    # The check is before the transaction, so the write never runs — the point
+    # of pinning is that a save made from a stale view leaves no trace.
+    test "a save pinned to a version that is gone is refused, and its write never runs", %{
+      server: server
+    } do
+      test_pid = self()
+
+      assert {:ok, _diff, _warnings} = Config.Server.update(server, insert_fun("cam_a", "full"))
+
+      write = fn ->
+        send(test_pid, :wrote)
+        :ok
+      end
+
+      assert Config.Server.update(server, write, expected_version: 1) ==
+               {:error, {:write, {:stale, 2}}}
+
+      refute_received :wrote
+      assert Config.Server.get(server).version == 2
+    end
+
+    test "no expected_version pins nothing", %{server: server} do
+      assert {:ok, %{version: 2}, _warnings} =
+               Config.Server.update(server, insert_fun("cam_a", "full"))
+    end
+
+    test "a rejected save leaves the version alone", %{server: server} do
+      assert {:error, [_ | _]} = create("cam_x", "full", %{"min_score" => 2})
+      assert Config.Server.get(server).version == 1
+    end
+  end
+
   test "the snapshot is published before apply_diff", %{path: path} do
     name = :update_snapshot_server
     test_pid = self()
