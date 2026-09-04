@@ -55,6 +55,18 @@ defmodule Cairn.CameraReaper do
 
   @lane_roles [:presence_recorder, :camera_tracker]
 
+  # Where `stop/2` looks a role's owner up to terminate it *through* its pool
+  # rather than by messaging the pid directly — see `stop_pid/4` for why.
+  @lane_pools %{
+    presence_recorder: Cairn.PresenceSupervisor.Pool,
+    camera_tracker: Cairn.TrackerSupervisor.Pool
+  }
+
+  # `stop_pass/2`'s bound on the abnormal-exit race it exists to close (see
+  # there): a role that keeps handing back a fresh registrant after every
+  # stop is a crash loop, not a race, and no amount of reaping fixes that.
+  @max_stop_passes 3
+
   def start_link(opts) do
     {name, opts} = Keyword.pop(opts, :name, __MODULE__)
     GenServer.start_link(__MODULE__, opts, name: name)
@@ -93,18 +105,49 @@ defmodule Cairn.CameraReaper do
 
   # Every stop happens before the sweep below (a lane owner drains what is
   # queued ahead of its stop, so one can still open an event and start an
-  # extractor while it is being stopped), but the stops among themselves run
-  # concurrently: a production delete is one id, but this pass also runs on
-  # every restart's diff against a surviving snapshot, where it can be many
-  # at once, and one slow `terminate/2` must not serialize the rest behind
-  # its `@stop_timeout`. A stop that outlives that timeout is followed by a
-  # kill (`stop_pid/3`), so the bound already lives in that per-process path;
-  # an outer timeout here could fire between it and `kill_and_await/1` and,
-  # since `Task.async_stream/3`'s results are discarded, let this pass
-  # advance with the process still alive. `timeout: :infinity` leaves the
-  # per-process path as the only bound, and `Stream.run/1` is what makes this
-  # await every task before the sweep runs.
-  defp stop_lane_owners(known) do
+  # extractor while it is being stopped), but the stops within one pass run
+  # concurrently: a production delete is one id, but this also runs on every
+  # restart's diff against a surviving snapshot, where it can be many at
+  # once, and one slow stop must not serialize the rest. The bound is
+  # `stop_pid/4`'s own — the child's `shutdown:` under
+  # `DynamicSupervisor.terminate_child/2`, or `@stop_timeout` and its kill for
+  # the direct fallback — so `timeout: :infinity` here leaves that per-process
+  # path as the only one: an outer timeout could fire between it and its kill
+  # and, since `Task.async_stream/3`'s results are discarded, let this pass
+  # advance with the process still alive.
+  #
+  # One pass cannot see a race that happens inside it: a `:transient` pool
+  # child that exits ABNORMALLY, for a reason of its own, between the
+  # registry read below and this pass reaching it is restarted by its pool
+  # first — and `DynamicSupervisor.terminate_child/2` on the now-stale pid
+  # only answers `:not_found`, having stopped nothing. The replacement is
+  # left registered under a deleted id, invisible to a pass that already
+  # built its target list. Re-reading the registry and repeating is what
+  # catches it, bounded at `@max_stop_passes` rather than looped forever
+  # (see there).
+  defp stop_lane_owners(known), do: stop_pass(known, @max_stop_passes)
+
+  defp stop_pass(_known, 0), do: :ok
+
+  defp stop_pass(known, passes_left) do
+    case absent_lane_owners(known) do
+      [] ->
+        :ok
+
+      targets ->
+        targets
+        |> Task.async_stream(
+          fn {role, camera_id} -> stop(camera_id, role) end,
+          max_concurrency: System.schedulers_online(),
+          timeout: :infinity
+        )
+        |> Stream.run()
+
+        stop_pass(known, passes_left - 1)
+    end
+  end
+
+  defp absent_lane_owners(known) do
     @lane_roles
     |> Enum.flat_map(fn role ->
       role
@@ -112,18 +155,14 @@ defmodule Cairn.CameraReaper do
       |> Enum.reject(&MapSet.member?(known, &1))
       |> Enum.map(&{role, &1})
     end)
-    |> Task.async_stream(
-      fn {role, camera_id} -> stop(camera_id, role) end,
-      max_concurrency: System.schedulers_online(),
-      timeout: :infinity
-    )
-    |> Stream.run()
   end
 
   # One read of the registry is the whole set: an extractor registers in its
   # own `start_link`, inside the `start_child` its producer is blocked on, so
-  # a producer that is down has none in flight — and above, every producer a
-  # deleted id had is down.
+  # a producer that is down has none in flight — and above, `stop_pass/2` has
+  # already brought every producer a deleted id had down (short of the crash
+  # loop it gives up on past `@max_stop_passes`, which is not this sweep's
+  # problem to solve).
   #
   # `end_partial/1` only casts a finalize; without waiting for the extractor
   # to actually exit, this pass — and with it `sync/2`'s barrier — would
@@ -148,26 +187,50 @@ defmodule Cairn.CameraReaper do
 
   # `Cairn.PresenceRecorder.end_stranded/3`'s close, with its ordering: the
   # window is announced closed before the clip is told to land, and the cast
-  # carries every box already sent ahead of it. A row that is not `active` is
-  # an extractor already finalizing, and one the index cannot answer for has
-  # nothing to close honestly — both are stopped instead, which leaves the row
-  # to boot reconciliation rather than the process to the re-created id.
+  # carries every box already sent ahead of it. `drain/1` runs first so a
+  # normal finalize a lane owner already cast — its own post-window firing in
+  # the same breath it was told to leave — is processed before `active_row/1`
+  # is read: without that, the row still answers `active` and this pass would
+  # broadcast a contradictory partial ending and cast a second finalize behind
+  # the one already under way.
+  #
+  # Still `active` after the drain, there was no such cast, and this is the
+  # one thing that closes the event; gone, the extractor is finalizing on its
+  # own (or the index could not answer, which is the same "nothing to close
+  # honestly" either way) and there is nothing left to do but wait it out,
+  # with the same kill fallback both branches share.
   defp end_partial({camera_id, event_id, pid}) do
+    drain(pid)
+
     case active_row(event_id) do
       nil ->
-        stop_pid(pid, camera_id, "stopping the extractor for event #{event_id}")
+        ref = Process.monitor(pid)
+        await_finalize(pid, ref, camera_id, event_id)
 
       row ->
         Logger.info("camera #{camera_id}: deleted, ending event #{event_id} partial")
         event = Cairn.Events.partial_event(row, DateTime.utc_now())
         Cairn.Event.broadcast(:event_ended, event)
         # `finalize/2` only enqueues a cast; waiting out the `:DOWN` (with the
-        # same bound and kill-on-timeout as `stop_pid/3`) is what keeps this
+        # same bound and kill-on-timeout as `stop_pid/4`) is what keeps this
         # extractor's exit, not just its finalize message, inside the pass.
         ref = Process.monitor(pid)
         Cairn.EventExtractor.finalize(pid, event)
         await_finalize(pid, ref, camera_id, event_id)
     end
+  end
+
+  # Flushes whatever is already queued for this extractor before the row
+  # below is read — chiefly a normal finalize cast a lane owner enqueued
+  # ahead of its own stop. `:sys.get_state/2` processes the mailbox up to and
+  # including itself and costs nothing extra when nothing is queued; bounded
+  # the same as every other wait here, so an extractor too slow to answer is
+  # treated as already gone rather than stalling the pass.
+  defp drain(pid) do
+    :sys.get_state(pid, @stop_timeout)
+    :ok
+  catch
+    :exit, _ -> :ok
   end
 
   defp await_finalize(pid, ref, camera_id, event_id) do
@@ -210,15 +273,34 @@ defmodule Cairn.CameraReaper do
         :ok
 
       pid ->
-        stop_pid(pid, camera_id, "stopping #{role}")
+        stop_pid(pid, camera_id, role, "stopping #{role}")
     end
   end
 
-  # Every pid here is a stale registry read: it may already be exiting, and
-  # `GenServer.stop/3` on a process that dies of anything else exits the
-  # caller with it.
-  defp stop_pid(pid, camera_id, what) do
+  # Every pid here is a stale registry read: it may already be exiting, may
+  # already have been replaced by its pool's own restart (the abnormal-exit
+  # race `stop_pass/2` repeats passes to catch), or — a test harness that
+  # starts one directly rather than under its pool — may never have been that
+  # pool's child at all.
+  #
+  # `DynamicSupervisor.terminate_child/2` is tried first, through the pool
+  # that owns this role: an explicit terminate is never mistaken for a crash
+  # to restart, which is exactly the property `GenServer.stop/3` could not
+  # give — a target whose shutdown dies of anything else exits the *caller*
+  # with it, leaving its pool to read the crash as its own and restart a
+  # `:transient` child this pass meant to end for good. `:not_found` covers
+  # every case above where the pool has nothing of this pid to terminate, and
+  # falls back to a direct stop bounded the same way.
+  defp stop_pid(pid, camera_id, role, what) do
     Logger.info("camera #{camera_id}: deleted, #{what}")
+
+    case DynamicSupervisor.terminate_child(Map.fetch!(@lane_pools, role), pid) do
+      :ok -> :ok
+      {:error, :not_found} -> stop_directly(pid, camera_id, what)
+    end
+  end
+
+  defp stop_directly(pid, camera_id, what) do
     GenServer.stop(pid, :normal, @stop_timeout)
   catch
     # A timeout leaves the target ALIVE — the process `GenServer.stop/3` kills

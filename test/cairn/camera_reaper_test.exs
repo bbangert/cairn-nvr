@@ -13,8 +13,8 @@ defmodule Cairn.CameraReaperTest do
   alias Cairn.Registry
   alias Cairn.RingBuffer
 
-  # `Cairn.TrackerStub` and `Cairn.HangingTrackerStub` live in
-  # test/support/tracker_stubs.ex — see there for what each stands in for.
+  # `Cairn.TrackerStub`, `Cairn.HangingTrackerStub` and `Cairn.RaisingTrackerStub`
+  # live in test/support/tracker_stubs.ex — see there for what each stands in for.
 
   setup do
     camera_id = "reap_#{System.unique_integer([:positive])}"
@@ -145,6 +145,76 @@ defmodule Cairn.CameraReaperTest do
     assert_receive {:DOWN, ^stub_ref, :process, ^stub, :killed}, 10_000
     assert_receive {:DOWN, ^extractor_ref, :process, ^extractor, :normal}, 5_000
     assert Events.get(event_id).status == :partial
+  end
+
+  # `DynamicSupervisor.terminate_child/2` treats an explicit terminate as
+  # ended regardless of how badly `terminate/2` behaves, unlike
+  # `GenServer.stop/3`: a target that dies of anything else while that call
+  # is in flight exits the *caller* with it, and the pool reads the crash as
+  # its own and restarts the `:transient` child this pass meant to end for
+  # good. Started under the real pool (not `start_supervised!`), because that
+  # restart is exactly what is under test here.
+  test "a lane owner whose terminate/2 raises is not restarted by its pool", %{
+    camera_id: camera_id
+  } do
+    {:ok, stub} =
+      DynamicSupervisor.start_child(
+        Cairn.TrackerSupervisor.Pool,
+        {Cairn.RaisingTrackerStub, camera_id: camera_id}
+      )
+
+    on_exit(fn ->
+      case Registry.whereis(camera_id, :camera_tracker) do
+        nil -> :ok
+        pid -> DynamicSupervisor.terminate_child(Cairn.TrackerSupervisor.Pool, pid)
+      end
+    end)
+
+    ref = Process.monitor(stub)
+
+    prune(%{
+      removed: [camera_id],
+      known: Cairn.SnapshotHelpers.known_ids_excluding(camera_id)
+    })
+
+    assert_receive {:DOWN, ^ref, :process, ^stub, _reason}
+
+    # Not merely "eventually unregistered": a restart would leave a FRESH
+    # registrant behind under the same id, which this also rules out.
+    Registry.await_unregistered(camera_id, :camera_tracker)
+    refute Registry.whereis(camera_id, :camera_tracker)
+  end
+
+  # A lane owner may cast its extractor's normal finalize just ahead of its
+  # own stop — a post window firing in the same breath the owner is told to
+  # leave — and this pass must see that finalize land before it decides
+  # whether the event is still open, or it emits a partial ending that
+  # contradicts the finalize already under way.
+  test "an extractor already told to finalize is not ended partial", %{camera_id: camera_id} do
+    {extractor, event_id} = start_extractor(camera_id)
+    ref = Process.monitor(extractor)
+    Event.subscribe()
+
+    # `EventExtractor.finalize/2` takes the runtime `%Cairn.Event{}` the
+    # tracker/recorder carries, not the `Cairn.Events.Event` row `Events.get/1`
+    # answers with — `Events.partial_event/2` is the same conversion
+    # `end_partial/1` itself uses, with the status a normal close carries.
+    event = %{Events.partial_event(Events.get(event_id), DateTime.utc_now()) | status: :finalized}
+    EventExtractor.finalize(extractor, event)
+
+    prune(%{
+      removed: [camera_id],
+      known: Cairn.SnapshotHelpers.known_ids_excluding(camera_id)
+    })
+
+    assert_receive {:DOWN, ^ref, :process, ^extractor, :normal}, 5_000
+    # This test's extractor never saw a keyframe, so its own close still
+    # lands `:partial` on the row (`Cairn.EventExtractor.finish/2`'s no-media
+    # rule) — a fact about this fixture, not about the reaper. What proves the
+    # fix is that the reaper never spoke: no second, contradictory
+    # `:event_ended` of its own.
+    refute_received {:event_ended, %Event{id: ^event_id, status: :partial}}
+    assert Registry.whereis(camera_id, {:extractor, event_id}) == nil
   end
 
   defp start_extractor(camera_id) do

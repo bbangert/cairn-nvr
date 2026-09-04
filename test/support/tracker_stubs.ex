@@ -40,6 +40,32 @@ defmodule Cairn.TrackerStub do
   end
 end
 
+defmodule Cairn.RaisingTrackerStub do
+  @moduledoc """
+  A lane owner whose `terminate/2` raises — proof that
+  `DynamicSupervisor.terminate_child/2` does not read that as a crash to
+  restart. `GenServer.stop/3` could not survive this: a target that dies of
+  anything else while the call is in flight exits the *caller* with it, and
+  the pool then restarts what it takes for an ordinary crash — precisely the
+  abnormal-exit race `Cairn.CameraReaper.stop_pid/4` moved off that call to
+  close.
+  """
+
+  use GenServer, restart: :transient
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
+  @impl true
+  def init(opts) do
+    Process.flag(:trap_exit, true)
+    {:ok, _} = Cairn.Registry.register(Keyword.fetch!(opts, :camera_id), :camera_tracker)
+    {:ok, Map.new(opts)}
+  end
+
+  @impl true
+  def terminate(_reason, _state), do: raise("boom")
+end
+
 defmodule Cairn.HangingTrackerStub do
   @moduledoc """
   A lane owner whose `terminate/2` never returns: `GenServer.stop/3` times out
