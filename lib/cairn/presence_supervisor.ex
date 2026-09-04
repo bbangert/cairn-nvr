@@ -2,7 +2,9 @@ defmodule Cairn.PresenceSupervisor do
   @moduledoc """
   The presence subtree: one `Cairn.PresenceAggregator` and one
   `Cairn.PresenceRecorder` per tier-1 camera, started on demand and restarted
-  after a crash.
+  after a crash, plus the `Cairn.CameraReaper` that stops a recorder whose
+  camera the config no longer names — the one stop the recorder's retire latch
+  must not outlive.
 
   Not a child of `Cairn.TrackerSupervisor` — that tree is tracking's, and its
   checkpoint-restore sweep is the one presence must never be swept by
@@ -45,7 +47,10 @@ defmodule Cairn.PresenceSupervisor do
     children = [
       Cairn.PresenceCheckpoint,
       Cairn.PresenceLedger,
-      {DynamicSupervisor, name: Cairn.PresenceSupervisor.Pool, strategy: :one_for_one}
+      {DynamicSupervisor, name: Cairn.PresenceSupervisor.Pool, strategy: :one_for_one},
+      # Last, so its own crash restarts nothing: it holds no state but a
+      # subscription, and the pool restarting above it takes it with them.
+      {Cairn.CameraReaper, role: :presence_recorder, name: Cairn.PresenceSupervisor.Reaper}
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)

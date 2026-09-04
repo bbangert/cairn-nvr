@@ -1519,4 +1519,106 @@ defmodule Cairn.PresenceRecorderTest do
 
     assert PresenceRecorder.frames("prec_absent", %{}, [frame([])]) == :ok
   end
+
+  # The latch is written for a camera that is coming back — a restart, a
+  # disable. A delete frees the id, so the process that outlived the retire is
+  # one a camera re-created under that id would adopt, event and all.
+  test "a diff that drops the camera stops the recorder its retire latched", ctx do
+    rec = recorder(ctx)
+    ref = Process.monitor(rec)
+
+    started(ctx)
+    assert_receive {:extractor_started, %Event{}, _pid}
+
+    PresenceRecorder.retire(ctx.camera_id)
+    assert :sys.get_state(rec).retiring?
+
+    deleted(ctx.camera_id)
+
+    assert_receive {:DOWN, ^ref, :process, ^rec, :normal}
+  end
+
+  # A disabled camera is still in the config, so nothing here changes for it:
+  # its recorder keeps the latch and closes the clip it has open.
+  test "a diff that still names the camera leaves the latched recorder alive", ctx do
+    rec = recorder(ctx)
+    ref = Process.monitor(rec)
+
+    started(ctx)
+    assert_receive {:extractor_started, %Event{}, _pid}
+
+    PresenceRecorder.retire(ctx.camera_id)
+    dormant(ctx.camera_id)
+
+    refute_receive {:DOWN, ^ref, :process, ^rec, _reason}, 200
+    assert :sys.get_state(rec).retiring?
+  end
+
+  test "a re-created id gets a fresh recorder and none of the deleted one's state", ctx do
+    id = ctx.camera_id
+    rec = recorder(ctx)
+
+    started(ctx)
+    assert_receive {:extractor_started, %Event{}, _pid}
+    # The row is written after the extractor is started, inside the same
+    # handled cast the message above was sent from.
+    _ = :sys.get_state(rec)
+    assert PresenceCheckpoint.get(id)
+
+    PresenceRecorder.retire(id)
+    deleted(id)
+    Registry.await_unregistered(id, :presence_recorder)
+
+    assert PresenceCheckpoint.get(id) == nil
+
+    on_exit(fn ->
+      PresenceRecorder.retire(id)
+      Registry.await_unregistered(id, :presence_recorder)
+    end)
+
+    assert {:ok, fresh} = PresenceRecorder.ensure(id)
+    assert fresh != rec
+    assert :sys.get_state(fresh).event == nil
+  end
+
+  # The delete the application config server would have broadcast, sent
+  # straight at the owners that prune on it — never on the real topic, which
+  # every other suite's owners are subscribed to. Only this camera leaves the
+  # fleet: the rest of `known` is the real snapshot's, so no other recorder is
+  # in range of the prune.
+  defp deleted(camera_id) do
+    prune(%{
+      removed: [camera_id],
+      known: MapSet.delete(Cairn.Config.Server.known_ids(), camera_id)
+    })
+  end
+
+  # A disable: the row is still there, so the id is still known.
+  defp dormant(camera_id) do
+    prune(%{changed: [camera_id], known: Cairn.Config.Server.known_ids()})
+  end
+
+  defp prune(fields) do
+    diff =
+      Map.merge(
+        %{
+          added: [],
+          removed: [],
+          changed: [],
+          refreshed: [],
+          version: 0,
+          server: Cairn.Config.Server
+        },
+        fields
+      )
+
+    # `:sys.get_state/1` after each send is what orders the prune, which runs
+    # in the owner's process, against the assertions below it.
+    for owner <- [PresenceCheckpoint, Cairn.PresenceSupervisor.Reaper] do
+      send(owner, {:config_changed, diff})
+      :sys.get_state(owner)
+    end
+
+    :ok
+  end
 end

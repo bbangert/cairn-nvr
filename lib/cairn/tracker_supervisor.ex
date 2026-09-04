@@ -19,6 +19,11 @@ defmodule Cairn.TrackerSupervisor do
   ffmpeg or plugin restarting is an ordinary event — a stream reset the tracker
   is written to absorb by suspending its identities — and it must not take the
   tracking state, the open event or the checkpoint's owner-side timers with it.
+
+  Which leaves one stop with nothing to end it, and that is the third child's:
+  a camera deleted from the config frees its id, and `Cairn.CameraReaper` stops
+  its tracker so a camera re-created under that id cannot inherit the process,
+  the open event or the checkpoint row.
   """
 
   use Supervisor
@@ -41,7 +46,10 @@ defmodule Cairn.TrackerSupervisor do
       Supervisor.child_spec({Task, &Cairn.CameraTracker.restore_checkpointed/0},
         id: :restore_checkpointed,
         restart: :transient
-      )
+      ),
+      # Last, so its own crash restarts nothing: it holds no state but a
+      # subscription, and the pool restarting above it takes it with them.
+      {Cairn.CameraReaper, role: :camera_tracker, name: Cairn.TrackerSupervisor.Reaper}
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)

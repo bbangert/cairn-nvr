@@ -103,10 +103,11 @@ defmodule Cairn.Config.Server do
   `Cairn.Config.topic/0` is one topic for every server, so a private server
   (a test's) broadcasts onto the same wire as the application singleton. The
   runtime owners — `Cairn.CameraStatus`, `Cairn.CameraControl`,
-  `Cairn.EventCheckpoint`, `Cairn.PresenceCheckpoint` — own tables the
-  singleton's fleet, so acting on another server's diff would prune them
-  against a fleet that diff never described. They match
-  `server: Cairn.Config.Server` and ignore the rest.
+  `Cairn.EventCheckpoint`, `Cairn.PresenceCheckpoint`, and the two
+  `Cairn.CameraReaper`s that stop a deleted camera's recorder and tracker —
+  own tables and processes for the singleton's fleet, so acting on another
+  server's diff would prune them against a fleet that diff never described.
+  They match `server: Cairn.Config.Server` and ignore the rest.
   """
   @type diff :: %{
           added: [String.t()],
@@ -364,11 +365,20 @@ defmodule Cairn.Config.Server do
   # What this does not cover: a PubSub restart that drops subscriptions
   # while the owners themselves keep running. Cairn is single-node
   # `:one_for_one`, so that gap is accepted rather than solved here.
+  #
+  # Skipped when PubSub is not up: a whole-tree restart in the same VM keeps
+  # the persistent term, and this server starts before `Cairn.PubSub`. A
+  # broadcast then would fail the boot, and it is not needed — that restart
+  # gives every owner a fresh, empty table.
   defp announce_restart(_state, nil, _new_config), do: :ok
 
   defp announce_restart(state, %Config{} = surviving, new_config) do
-    diff = build_diff(surviving, new_config, state.snapshot || self())
-    Phoenix.PubSub.local_broadcast(Cairn.PubSub, Config.topic(), {:config_changed, diff})
+    if Process.whereis(Cairn.PubSub) do
+      diff = build_diff(surviving, new_config, state.snapshot || self())
+      Phoenix.PubSub.local_broadcast(Cairn.PubSub, Config.topic(), {:config_changed, diff})
+    else
+      :ok
+    end
   end
 
   @impl true

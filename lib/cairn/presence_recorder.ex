@@ -155,8 +155,10 @@ defmodule Cairn.PresenceRecorder do
   tier 1, and the recorder that outlived the stop for its open event is the one
   the new session gets. Un-latching it here is what keeps it: the latch is
   paid when the event closes, and this is the only call that says the camera
-  came back. A camera that really left never reaches here again, so its latch
-  still stops it.
+  came back. A camera that really left never reaches here again: a disabled
+  one's latch stops it when its event closes, and a deleted one is stopped
+  outright by `Cairn.CameraReaper`, so the pid this can hand back for a
+  re-created id is always a fresh process.
 
   The un-latching is a **call**, and that is the whole point. The registry is a
   stale-read site and a `:retire` may already be in the mailbox ahead of us: a
@@ -245,6 +247,11 @@ defmodule Cairn.PresenceRecorder do
   labels immediately after, so the cleareds that close the event are on their
   way here; the latch is also what keeps the cap from segmenting into a clip
   for a camera that is leaving (`resegment/2`).
+
+  A camera being *deleted* is retired like any other, and the latch is then
+  overruled: `Cairn.CameraReaper` stops this process on the config broadcast,
+  because a latch that outlives the id lets a camera re-created under it adopt
+  the deleted one's event.
   """
   @spec retire(String.t()) :: :ok
   def retire(camera_id), do: cast(camera_id, :retire)

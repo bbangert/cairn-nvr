@@ -93,7 +93,7 @@ Memory is bounded by `pre_window × bitrate × camera_count`, independent of eve
 
 ## The camera tracker
 
-Event lifecycle is owned one camera at a time: a `Cairn.CameraTracker` per camera under `Cairn.TrackerSupervisor` (a `:rest_for_one` pair of a DynamicSupervisor pool and a checkpoint-restore sweep), fed observations by the detect branch through `Cairn.Detect.Dispatch` — plain functions in the caller's process, so no per-frame GenServer hop and no config-server call on the frame path (policy is resolved at session start and on refresh).
+Event lifecycle is owned one camera at a time: a `Cairn.CameraTracker` per camera under `Cairn.TrackerSupervisor` (a `:rest_for_one` DynamicSupervisor pool, a checkpoint-restore sweep and the reaper that stops a deleted camera's tracker), fed observations by the detect branch through `Cairn.Detect.Dispatch` — plain functions in the caller's process, so no per-frame GenServer hop and no config-server call on the frame path (policy is resolved at session start and on refresh).
 
 The tracker assigns identities itself (`Cairn.Tracker`: IoU + optional staged admissions — BBD, ORU, OCR, Re-ID fusion — per the profile's stage list), debounces detections into events, and keys suspend/adopt off **stream epoch identity**: one epoch is one continuous decode session, so nothing (pts, object continuity) carries across a respawn except by the tracker's own adopt-across-reset rule. Trackers are `:transient` and checkpoint to ETS, so a crash restores in `init/1`.
 
@@ -126,7 +126,8 @@ Cairn.Supervisor
 ├── Cairn.TrackerSupervisor        (rest_for_one)
 │   ├── pool (DynamicSupervisor)
 │   │   └── Cairn.CameraTracker    (one per camera, transient, ETS-checkpointed)
-│   └── checkpoint restore sweep   (Task, transient; re-runs when the pool restarts)
+│   ├── checkpoint restore sweep   (Task, transient; re-runs when the pool restarts)
+│   └── Cairn.CameraReaper         (stops the tracker of a camera the config no longer names)
 ├── Cairn.EventSupervisor (DynamicSupervisor)
 │   └── Cairn.EventExtractor       (one per active event, temporary)
 ├── Cairn.StreamEpochs             (before the cameras that mint epochs into it)
