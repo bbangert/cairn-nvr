@@ -248,6 +248,9 @@ defmodule Cairn.Pipeline.ConformanceTest do
       membrane = uid("mstatus")
 
       CameraStatus.subscribe()
+      # `CameraStatus` drops a write for a camera the published snapshot does
+      # not name, and this id belongs to no config: lend it one for the test.
+      lend_snapshot(membrane)
 
       start_ring(membrane)
       start_hub(membrane)
@@ -626,6 +629,20 @@ defmodule Cairn.Pipeline.ConformanceTest do
        ] ++ owner_opts},
       id: {:owner, cam.id}
     )
+  end
+
+  # `async: false` is what makes writing the process-global snapshot safe.
+  defp lend_snapshot(id) do
+    key = Config.Server.snapshot_key(Config.Server)
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        :ok
+
+      snapshot ->
+        on_exit(fn -> :persistent_term.put(key, snapshot) end)
+        :persistent_term.put(key, %{snapshot | cameras: [%Camera{id: id} | snapshot.cameras]})
+    end
   end
 
   defp assert_status_running(id) do

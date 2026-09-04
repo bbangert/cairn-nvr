@@ -202,8 +202,7 @@ defmodule Cairn.ConfigSource do
   end
 
   defp replace_rows(path, expected_sha256) do
-    with :ok <- check_pinned(path, expected_sha256),
-         {:ok, map} <- Config.raw_map(path),
+    with {:ok, map} <- pinned_map(path, expected_sha256),
          {:ok, cameras} <- importable_list(Map.get(map, "cameras")),
          :ok <- check_drift(cameras),
          {:ok, _config, _warnings} <- Config.from_map(map) do
@@ -236,25 +235,29 @@ defmodule Cairn.ConfigSource do
 
   # `nil` (no rendered page to pin against) skips the check; the drift check
   # below still guards a stale confirmation from replacing a fleet that
-  # already matches the file. Reads the raw bytes, not `cameras_sha/1`'s
+  # already matches the file. Hashes the raw bytes, not `cameras_sha/1`'s
   # canonicalized list: the caller hashed what it displayed before any YAML
   # parsing, so this has to hash the same thing to mean anything.
-  # `replace_rows/2` reads the file again right after via `Config.raw_map/1`,
-  # which only parses from a path — there is no bytes-in variant to thread
-  # this read's bytes into, so the two reads stay (both run inside the
-  # transaction; only the file on disk between them is outside it).
-  defp check_pinned(_path, nil), do: :ok
+  #
+  # One read, parsed from the bytes it hashed: checking the pin and then
+  # re-reading the path would import a file swapped in between the two.
+  # What the pin covers is the cameras list the operator confirmed — the
+  # server's load after this write reads the path again for the file's
+  # globals, and that read is deliberately outside it.
+  defp pinned_map(path, nil), do: Config.raw_map(path)
 
-  defp check_pinned(path, expected_sha256) do
+  defp pinned_map(path, expected_sha256) do
     case File.read(path) do
       {:ok, bytes} ->
-        if file_sha256(bytes) == expected_sha256, do: :ok, else: {:error, :changed}
+        if file_sha256(bytes) == expected_sha256,
+          do: Config.raw_map_from_binary(bytes, path),
+          else: {:error, :changed}
 
+      # Unreadable now is unreadable to `Config.raw_map/1` a moment later
+      # too, so let that call produce the file's own `{:yaml, errors}`
+      # rather than a `:changed` that would misname the fault.
       {:error, _reason} ->
-        # Unreadable now is unreadable to `Config.raw_map/1` a moment later
-        # too, so let that call produce the file's own `{:yaml, errors}`
-        # rather than a `:changed` that would misname the fault.
-        :ok
+        Config.raw_map(path)
     end
   end
 

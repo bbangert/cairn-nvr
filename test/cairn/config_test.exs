@@ -48,6 +48,21 @@ defmodule Cairn.ConfigTest do
     end
   end
 
+  # The pinned re-import parses the bytes it hashed, so the two must agree.
+  describe "raw_map_from_binary/2" do
+    test "answers what raw_map/1 answers for the same file" do
+      assert {:ok, map} = Config.raw_map(@valid_fixture)
+
+      assert {:ok, ^map} =
+               Config.raw_map_from_binary(File.read!(@valid_fixture), @valid_fixture)
+    end
+
+    test "non-mapping yaml is the same error" do
+      assert {:error, ["config must be a YAML mapping"]} =
+               Config.raw_map_from_binary("- just\n- a list\n", "any.yml")
+    end
+  end
+
   describe "from_map/1 validation" do
     test "valid map with defaults applied" do
       assert {:ok, config, []} = Config.from_map(base_map())

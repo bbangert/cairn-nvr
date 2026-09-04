@@ -17,7 +17,8 @@ defmodule Cairn.CameraStatus do
   cameras the new config no longer names, in its own callback — nobody hands
   it a list of ids, and a camera that comes back starts at `:unknown`. It
   prunes against the application config server's published snapshot, and only
-  on that server's broadcasts.
+  on that server's broadcasts — and drops a write for a camera that snapshot
+  does not name, so a late report cannot restore a pruned row.
   """
 
   use GenServer
@@ -51,6 +52,20 @@ defmodule Cairn.CameraStatus do
   @spec merge(String.t(), map()) :: :ok
   def merge(camera_id, attrs) when is_map(attrs) do
     GenServer.cast(__MODULE__, {:merge, camera_id, attrs})
+  end
+
+  # `merge/2` without the existence check, for the suites whose camera exists
+  # only as a pipeline fixture and never in a fleet config. Same mailbox and
+  # same table: the ordering the check depends on is not weakened, only the
+  # check itself is skipped. Compiled only in :test — `:erpc` and the HA API
+  # can reach any exported function, and an unchecked write is not a surface
+  # to leave on a running node.
+  if Mix.env() == :test do
+    @doc false
+    @spec put(String.t(), map()) :: :ok
+    def put(camera_id, attrs) when is_map(attrs) do
+      GenServer.cast(__MODULE__, {:put, camera_id, attrs})
+    end
   end
 
   @spec get(String.t()) :: map()
@@ -92,15 +107,34 @@ defmodule Cairn.CameraStatus do
     {:reply, :ok, state}
   end
 
+  # The existence check runs here, in the mailbox that also handles the prune,
+  # and that is the whole ordering: the config server publishes its snapshot
+  # before it applies and broadcasts after, so a write handled after the
+  # publish finds no id and is dropped, and one handled before is deleted by
+  # the prune the broadcast that follows triggers. Without it a deleted
+  # camera's row comes back: `Cairn.Native.Status` keeps reporting open
+  # streams for it until the asynchronous native reconfiguration lands, and
+  # the first poll after the prune would re-insert what the prune removed.
   @impl true
   def handle_cast({:merge, camera_id, attrs}, state) do
+    if known?(camera_id), do: write(camera_id, attrs)
+    {:noreply, state}
+  end
+
+  if Mix.env() == :test do
+    def handle_cast({:put, camera_id, attrs}, state) do
+      write(camera_id, attrs)
+      {:noreply, state}
+    end
+  end
+
+  defp write(camera_id, attrs) do
     info = Map.merge(get(camera_id), attrs)
     :ets.insert(@table, {camera_id, info})
     # local_broadcast, not broadcast: the backing table is a node-local named
     # ETS table, so a remote subscriber could never read what it was told
     # about — and plugin status arrives at line rate, one message per member.
     Phoenix.PubSub.local_broadcast(Cairn.PubSub, @topic, {:camera_status, camera_id, info})
-    {:noreply, state}
   end
 
   # Only the application server's diffs: they name the snapshot this prunes
@@ -114,8 +148,15 @@ defmodule Cairn.CameraStatus do
   def handle_info({:config_changed, _another_servers_diff}, state), do: {:noreply, state}
 
   # No snapshot is not an empty fleet: a server that has published none (an
-  # unnamed one, or one still in `init/1`) cannot say which cameras exist, and
-  # pruning against nothing would empty the table.
+  # unnamed one, or one still in `init/1`) cannot say which cameras exist, so
+  # it can neither drop a write nor empty the table.
+  defp known?(camera_id) do
+    case Cairn.Config.Server.known_ids() do
+      nil -> true
+      known -> MapSet.member?(known, camera_id)
+    end
+  end
+
   defp prune(nil), do: :ok
 
   defp prune(known) do

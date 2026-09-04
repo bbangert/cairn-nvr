@@ -215,8 +215,18 @@ defmodule Cairn.Config do
   @doc "The YAML mapping at `path`, parsed and nothing more."
   @spec raw_map(Path.t()) :: {:ok, map()} | {:error, [String.t()]}
   def raw_map(path) do
-    with {:ok, raw} <- read_file(path), do: parse_yaml(raw)
+    with {:ok, raw} <- read_file(path), do: raw_map_from_binary(raw, path)
   end
+
+  @doc """
+  `raw_map/1` for bytes already in hand, for a caller that must parse the
+  same bytes it hashed rather than re-reading the path (`Cairn.ConfigSource`'s
+  `expected_sha256:` pin). `path` names the file the bytes came from; only
+  the read can fail with a filename, so it goes unused here — parse errors
+  are byte-level and identical either way.
+  """
+  @spec raw_map_from_binary(binary(), Path.t()) :: {:ok, map()} | {:error, [String.t()]}
+  def raw_map_from_binary(raw, _path), do: parse_yaml(raw)
 
   @doc """
   Resolves the effective data dir without a running server: env override,

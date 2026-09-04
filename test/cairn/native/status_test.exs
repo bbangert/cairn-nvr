@@ -18,9 +18,20 @@ defmodule Cairn.Native.StatusTest do
     :persistent_term.put(@control, %{test: self()})
     id = "ns_#{System.unique_integer([:positive])}"
 
+    # `Cairn.CameraStatus` drops a write for a camera its published snapshot
+    # does not name, and the reporter under test writes through the real one.
+    # The ids here belong to no config, so the application snapshot is lent
+    # them for the test — `async: false` is what makes that safe.
+    key = Cairn.Config.Server.snapshot_key(Cairn.Config.Server)
+    snapshot = :persistent_term.get(key, nil)
+    lent = Enum.map([id, id <> "_b"], &%Cairn.Config.Camera{id: &1})
+    if snapshot, do: :persistent_term.put(key, %{snapshot | cameras: lent ++ snapshot.cameras})
+
     on_exit(fn ->
+      if snapshot, do: :persistent_term.put(key, snapshot)
       :persistent_term.erase(@control)
       CameraStatus.delete(id)
+      CameraStatus.delete(id <> "_b")
     end)
 
     %{id: id}
@@ -102,7 +113,7 @@ defmodule Cairn.Native.StatusTest do
     test "a camera with no native stream is never written", %{id: id} do
       %{host: host, reporter: reporter} = start_stack()
       classic = id <> "_classic"
-      CameraStatus.set(classic, :running)
+      CameraStatus.put(classic, %{status: :running})
       {:ok, _epoch} = Host.open_stream(host, id, %{})
 
       assert published(reporter, id)
@@ -261,7 +272,7 @@ defmodule Cairn.Native.StatusTest do
       control(%{available?: false})
       other = id <> "_b"
       classic = id <> "_classic"
-      CameraStatus.set(classic, :running)
+      CameraStatus.put(classic, %{status: :running})
 
       %{reporter: reporter} =
         start_stack(status: [config_source: detecting([id, other])])

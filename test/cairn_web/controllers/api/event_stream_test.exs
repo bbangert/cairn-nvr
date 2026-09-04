@@ -370,7 +370,10 @@ defmodule CairnWeb.Api.EventStreamEndpointTest do
 
     assert_receive {:plug_conn, :sent}, 5_000
 
-    Cairn.CameraStatus.set_plugin_status(id, %{"state" => "degraded", "detail" => "cpu fallback"})
+    Cairn.CameraStatus.put(id, %{
+      plugin_status: %{"state" => "degraded", "detail" => "cpu fallback"}
+    })
+
     # the cast, and the broadcast inside it, are done once the server's mailbox
     # flushes — so the frame is in the stream's mailbox ahead of the stop below
     _ = :sys.get_state(Cairn.CameraStatus)

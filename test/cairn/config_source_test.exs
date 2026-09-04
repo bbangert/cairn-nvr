@@ -834,11 +834,23 @@ defmodule Cairn.ConfigSourceTest do
       assert Enum.map(Cameras.list(), & &1.id) == ["cam_a", "cam_z"]
     end
 
-    test "a matching expected_sha256 proceeds", %{path: path} do
-      sha = path |> File.read!() |> ConfigSource.file_sha256()
+    # The pinned write parses the bytes it hashed rather than re-reading the
+    # path, so what lands is what the sha covers: a file swapped in after the
+    # check cannot be the one imported.
+    test "a matching expected_sha256 imports exactly the pinned bytes' cameras", %{path: path} do
+      bytes = File.read!(path)
+      sha = ConfigSource.file_sha256(bytes)
 
       assert {:ok, %{added: ["cam_b"], removed: ["cam_z"], changed: ["cam_a"]}, _warnings} =
                ConfigSource.reimport(path, expected_sha256: sha)
+
+      pinned =
+        bytes
+        |> YamlElixir.read_from_string!()
+        |> Map.fetch!("cameras")
+        |> Enum.map(&{&1["id"], &1["rtsp_url"]})
+
+      assert Enum.map(Cameras.list(), &{&1.id, &1.settings["rtsp_url"]}) == pinned
     end
 
     # The sha pins the file, this pins the rows: a confirmation rendered from
