@@ -7,11 +7,16 @@ defmodule Cairn.Cameras do
   re-renders and re-validates the whole fleet: a save the validator rejects
   never lands, so the cross-camera rules (one model per VM, ladder capacity)
   hold on the rows and not only on what a form could see. A write that puts a
-  row in front of the parser as the operator's own act — `create/1`,
-  `update/2`, `put_zones/2`, `set_enabled(id, true)` — passes it as
+  row in front of the parser as the operator's own act — `create/2`,
+  `update/3`, `put_zones/3`, `set_enabled(id, true, opts)` — passes it as
   `reject_skipped:`, so a save cannot leave its own row skipped and dark.
-  `delete/1`, `reorder/1` and a disable do not: none of them asks the parser
+  `delete/2`, `reorder/2` and a disable do not: none of them asks the parser
   to accept a row the operator just wrote.
+
+  That fleet re-validation renders enabled rows only, so a row `create/2` or
+  `update/3` leaves disabled would reach the store unchecked; those two put it
+  in front of `Cairn.ConfigSource.validate_row/2` from inside the same
+  transaction instead — see `check_disabled_row/2`.
 
   Every write also takes an optional trailing `opts`, forwarded to
   `Cairn.Config.Server.update/3`. `expected_version:` is the one a caller
@@ -30,6 +35,7 @@ defmodule Cairn.Cameras do
 
   alias Cairn.Cameras.Camera
   alias Cairn.Config
+  alias Cairn.ConfigSource
   alias Cairn.Repo
 
   @typedoc """
@@ -70,7 +76,7 @@ defmodule Cairn.Cameras do
     attrs = stringify_shallow(attrs)
     id = Map.get(attrs, "id")
 
-    write = fn ->
+    write = fn path ->
       changeset =
         Camera.changeset(%Camera{}, %{
           id: id,
@@ -82,11 +88,35 @@ defmodule Cairn.Cameras do
           zones: Map.get(attrs, "zones", [])
         })
 
-      with {:ok, _row} <- Repo.insert(changeset), do: :ok
+      with {:ok, row} <- Repo.insert(changeset), do: check_disabled_row(row, path)
     end
 
-    Config.Server.update(server(), write, [reject_skipped: id] ++ pin(opts))
+    server()
+    |> Config.Server.update(write, [reject_skipped: id] ++ pin(opts))
+    |> unwrap_invalid_row()
   end
+
+  # A disabled row is not rendered by `raw_maps/0`, so the fleet re-validation
+  # `Cairn.Config.Server.update/3` runs never sees it and would commit
+  # settings that fail the day the row is enabled. The check belongs in the
+  # write closure rather than in the caller: there it is serialized with
+  # reloads and inside the same transaction, so an error rolls the row back
+  # and nothing can slip between the check and the write.
+  defp check_disabled_row(%Camera{enabled: true}, _path), do: :ok
+
+  defp check_disabled_row(%Camera{} = row, path) do
+    case ConfigSource.validate_row(row, path) do
+      :ok -> :ok
+      {:error, errors} -> {:error, {:invalid_row, errors}}
+    end
+  end
+
+  # The row's own errors are already `camera <id>: …`-prefixed, which is the
+  # shape the validator's own rejection has and the form routes to fields — so
+  # this rejection is handed back as one rather than as a write failure no
+  # caller knows how to read.
+  defp unwrap_invalid_row({:error, {:write, {:invalid_row, errors}}}), do: {:error, errors}
+  defp unwrap_invalid_row(result), do: result
 
   # The only `update/3` option a context caller passes through. Taken rather
   # than forwarded whole so a caller cannot reach the server's other options
@@ -105,17 +135,20 @@ defmodule Cairn.Cameras do
       |> Map.take(~w(position enabled settings zones))
       |> canonicalize_settings()
 
-    Config.Server.update(
-      server(),
-      fn -> update_row(id, changes) end,
+    server()
+    |> Config.Server.update(
+      fn path ->
+        with {:ok, row} <- update_row(id, changes), do: check_disabled_row(row, path)
+      end,
       [reject_skipped: id] ++ pin(opts)
     )
+    |> unwrap_invalid_row()
   end
 
   defp update_row(id, changes) do
     case get(id) do
       nil -> {:error, :not_found}
-      camera -> with {:ok, _row} <- Repo.update(Camera.update_changeset(camera, changes)), do: :ok
+      camera -> Repo.update(Camera.update_changeset(camera, changes))
     end
   end
 
@@ -136,8 +169,12 @@ defmodule Cairn.Cameras do
   def set_enabled(id, enabled, opts \\ [])
   def set_enabled(id, true, opts), do: update(id, %{"enabled" => true}, opts)
 
+  # No `check_disabled_row/2`: a disable writes no settings, and the ones on
+  # the row are either already validated or the very drift the operator is
+  # turning off — refusing the disable would leave them no way out.
   def set_enabled(id, false, opts) do
-    Config.Server.update(server(), fn -> update_row(id, %{"enabled" => false}) end, pin(opts))
+    write = fn -> with {:ok, _row} <- update_row(id, %{"enabled" => false}), do: :ok end
+    Config.Server.update(server(), write, pin(opts))
   end
 
   @spec put_zones(String.t(), [map()], keyword()) :: write_result()

@@ -130,6 +130,21 @@ defmodule Cairn.Config.ServerUpdateTest do
     assert_receive {:config_changed, %{added: [], changed: [], refreshed: [], removed: []}}
   end
 
+  # A write that must validate a row the fleet re-render will not see needs the
+  # same file globals the server loads through, and only the server knows which
+  # file that is.
+  test "a 1-arity write fun is handed the server's config path", %{server: server, path: path} do
+    test_pid = self()
+
+    write = fn given ->
+      send(test_pid, {:path, given})
+      :ok
+    end
+
+    assert {:ok, _diff, _warnings} = Config.Server.update(server, write)
+    assert_received {:path, ^path}
+  end
+
   describe "expected_version:" do
     test "a save pinned to the current version applies and increments it", %{server: server} do
       Config.Server.subscribe()

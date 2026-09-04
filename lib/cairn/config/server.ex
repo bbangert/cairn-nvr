@@ -107,6 +107,15 @@ defmodule Cairn.Config.Server do
 
   @type last_load :: %{warnings: [String.t()], errors: [String.t()], skipped: skipped()}
 
+  @typedoc """
+  `update/3`'s write, run inside the transaction. A 1-arity fun is handed the
+  server's config path: a write that has to validate a row the fleet re-render
+  will not see — a disabled one, which `Cairn.Cameras.raw_maps/0` does not
+  render — needs the same file globals the server loads through, and only the
+  server knows which file that is.
+  """
+  @type write_fun :: (-> :ok | {:error, term()}) | (Path.t() -> :ok | {:error, term()})
+
   # Atom names only: the snapshot is keyed by the name, and every reader of
   # a snapshot has to be able to spell it.
   def start_link(opts) do
@@ -217,14 +226,16 @@ defmodule Cairn.Config.Server do
   transaction opens and answers `{:error, {:write, {:stale, current}}}`
   when they differ. Absent, nothing is checked.
 
+  `write_fun` may take the config path (`t:write_fun/0`).
+
   `{:error, errors}` is the validator's; `{:error, {:write, reason}}` is
   `write_fun`'s own (a changeset, a DB fault, a wrong-shaped return, or an
   exception the closure raised).
   """
-  @spec update(GenServer.server(), (-> :ok | {:error, term()}), keyword()) ::
+  @spec update(GenServer.server(), write_fun(), keyword()) ::
           {:ok, diff(), [String.t()]} | {:error, [String.t()]} | {:error, {:write, term()}}
   def update(server \\ __MODULE__, write_fun, opts \\ [])
-      when is_function(write_fun, 0) and is_list(opts) do
+      when (is_function(write_fun, 0) or is_function(write_fun, 1)) and is_list(opts) do
     reject = Keyword.get(opts, :reject_skipped, [])
     expected = Keyword.get(opts, :expected_version)
     GenServer.call(server, {:update, write_fun, reject, expected}, 30_000)
@@ -361,7 +372,7 @@ defmodule Cairn.Config.Server do
   end
 
   defp attempt(state, write_fun, reject) do
-    with :ok <- write_fun.(),
+    with :ok <- run_write(write_fun, state.path),
          {:ok, config, warnings, skipped} <- load(state),
          [] <- own_skips(reject, skipped) do
       {config, warnings, skipped}
@@ -374,6 +385,9 @@ defmodule Cairn.Config.Server do
       other -> Cairn.Repo.rollback({:write, {:bad_return, other}})
     end
   end
+
+  defp run_write(write_fun, _path) when is_function(write_fun, 0), do: write_fun.()
+  defp run_write(write_fun, path), do: write_fun.(path)
 
   # A per-camera fault skips the row on a *load*, so one drifted camera cannot
   # take the fleet down with it. On a save that row is the operator's own act:

@@ -288,6 +288,54 @@ defmodule Cairn.CamerasTest do
       assert Config.Server.get(server)
     end
 
+    # The fleet re-render `Config.Server.update/3` runs skips disabled rows, so
+    # these settings reach the store checked by nothing else.
+    test "a disabled create the loader would refuse never lands", %{server: server} do
+      assert {:error, [msg]} =
+               Cameras.create(%{
+                 "id" => "cam_off",
+                 "enabled" => false,
+                 "settings" => %{"rtsp_url" => "rtsp://h/off", "min_score" => 2}
+               })
+
+      assert msg =~ "camera cam_off: min_score values must be 0..1"
+      refute Cameras.get("cam_off")
+      # a form error, not config health
+      assert Config.Server.last_load(server).errors == []
+    end
+
+    test "a disabled update the loader would refuse never lands" do
+      assert {:ok, _diff, []} =
+               Cameras.create(%{
+                 "id" => "cam_off",
+                 "enabled" => false,
+                 "settings" => %{"rtsp_url" => "rtsp://h/off"}
+               })
+
+      assert {:error, [msg]} =
+               Cameras.update("cam_off", %{"settings" => %{"retention" => "forever"}})
+
+      assert msg =~ "camera cam_off:"
+      assert Cameras.get("cam_off").settings == %{"rtsp_url" => "rtsp://h/off"}
+    end
+
+    test "a valid disabled row saves and stays out of the running config", %{server: server} do
+      assert {:ok, %{added: [], changed: [], refreshed: [], removed: []}, []} =
+               Cameras.create(%{
+                 "id" => "cam_off",
+                 "enabled" => false,
+                 "settings" => %{"rtsp_url" => "rtsp://h/off", "min_score" => 0.4}
+               })
+
+      assert Cameras.get("cam_off").settings["min_score"] == %{"default" => 0.4}
+      assert Config.Server.get(server).cameras == []
+
+      assert {:ok, _diff, []} =
+               Cameras.update("cam_off", %{"settings" => %{"rtsp_url" => "rtsp://h/other"}})
+
+      assert Cameras.get("cam_off").settings == %{"rtsp_url" => "rtsp://h/other"}
+    end
+
     # D-P8: history outlives the row — the clips and event rows are retention's
     # to sweep, under the id they were recorded with.
     test "a deleted camera's event rows and clips stay", %{dir: dir} do

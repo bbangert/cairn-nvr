@@ -34,6 +34,7 @@ defmodule Cairn.ConfigSource do
 
   alias Cairn.Cameras
   alias Cairn.Cameras.Camera
+  alias Cairn.Cameras.Candidate
   alias Cairn.Cameras.Setting
   alias Cairn.Config
   alias Cairn.Repo
@@ -114,6 +115,41 @@ defmodule Cairn.ConfigSource do
     case Config.raw_map(path) do
       {:ok, map} -> {:error, [message], Config.globals_fallback(map)}
       {:error, _errors} -> {:error, [message], nil}
+    end
+  end
+
+  @doc """
+  Judges one row against the file's globals and the rendered fleet, and
+  answers only that camera's errors — the same verdict the load would reach
+  the day the row is enabled.
+
+  Two classes of error are deliberately dropped, both outside
+  `Cairn.Config.partition_by_camera/1`'s bucket for this id. A fleet-level
+  rule the row only trips by joining (capacity, one model per VM) does not
+  bind while the row sits outside the running fleet; and a fleet-level fault
+  the file has *without* this row is the file's, not this write's.
+
+  The one caller is `Cairn.Cameras`, from inside the config server's write
+  transaction — the row is already inserted there, and an error rolls it back.
+  """
+  @spec validate_row(Camera.t() | %{id: String.t(), settings: map(), zones: [map()]}, Path.t()) ::
+          :ok | {:error, [String.t()]}
+  def validate_row(row, path) do
+    case Config.raw_map(path) do
+      {:ok, globals} ->
+        {rendered, _warnings} = Cameras.raw_maps()
+
+        # `:edit` — the row is written, and `rendered` holds it only when it is
+        # enabled, which by construction it is not; the candidate is appended.
+        case Candidate.validate(Cameras.render_row(row), rendered, globals, mode: :edit) do
+          %{own: []} -> :ok
+          %{own: own} -> {:error, own}
+        end
+
+      # An unreadable file fails the load this same transaction is about to
+      # run, which rejects the write with the file's errors, not the row's.
+      {:error, _errors} ->
+        :ok
     end
   end
 
