@@ -116,16 +116,27 @@ defmodule CairnWeb.Api.CameraControllerTest do
   # reads the published snapshot instead, which leads `get/1` for the length
   # of an apply — so narrowing the snapshot alone puts the request in exactly
   # that window, and the owner's refusal has to be the same 404.
+  #
+  # The restore runs in `after`, not `on_exit`: the setup block's `on_exit`
+  # resets cam_a's control through `CameraControl.set/2`, which the owner
+  # refuses while the snapshot here is narrowed. `on_exit` callbacks run
+  # LIFO, so today's registration order happens to restore first — but that
+  # is an accident of ordering, not a guarantee. `after` runs inside this
+  # test, before any `on_exit` callback, so the reset always sees the real
+  # snapshot regardless of registration order.
   test "control 404s a camera the owner no longer knows, though the pre-check found it", %{
     conn: conn
   } do
     key = Server.snapshot_key(Cairn.Config.Server)
     published = :persistent_term.get(key)
-    on_exit(fn -> :persistent_term.put(key, published) end)
     :persistent_term.put(key, %{published | cameras: [], dormant: []})
 
-    assert conn
-           |> post("/api/cameras/cam_a/control", %{detection_enabled: false})
-           |> json_response(404)
+    try do
+      assert conn
+             |> post("/api/cameras/cam_a/control", %{detection_enabled: false})
+             |> json_response(404)
+    after
+      :persistent_term.put(key, published)
+    end
   end
 end

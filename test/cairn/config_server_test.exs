@@ -57,12 +57,15 @@ defmodule Cairn.Config.ServerTest do
 
     assert {:ok, diff, []} = Config.Server.reload(server)
 
+    # `server` is the pid because this one is unnamed: the tag is what an
+    # owner filters a shared-topic broadcast on (`t:Cairn.Config.Server.diff/0`).
     assert diff == %{
              added: ["cam_c"],
              removed: ["cam_b"],
              changed: ["cam_a"],
              refreshed: [],
-             version: 2
+             version: 2,
+             server: server
            }
 
     assert_received {:applied, ^diff, %Config{}}
@@ -659,6 +662,60 @@ defmodule Cairn.Config.ServerTest do
 
       assert {:error, _errors} = Config.Server.reload(server)
       assert Config.Server.get(server).version == 1
+    end
+
+    # The term outlives the process, so a restarted server continues the count:
+    # restarting at 1 would re-accept a pin the old server had already spent.
+    test "a boot seeds it from the surviving snapshot", %{path: path} do
+      name = :"version_seed_#{System.unique_integer([:positive])}"
+      key = Config.Server.snapshot_key(name)
+      on_exit(fn -> :persistent_term.erase(key) end)
+      :persistent_term.put(key, %Config{version: 7})
+
+      server = named_server(path, name, :version_seed_server)
+
+      assert Config.Server.get(server).version == 8
+      assert %Config{version: 8} = Config.Server.snapshot(name)
+    end
+
+    # The owners prune on the broadcast against the published snapshot, so the
+    # publish has to be the older of the two. The apply callback runs between
+    # them, and reads the term while the server is still inside the apply.
+    test "the snapshot is published before the broadcast", %{path: path, dir: dir} do
+      name = :"publish_first_#{System.unique_integer([:positive])}"
+      on_exit(fn -> :persistent_term.erase(Config.Server.snapshot_key(name)) end)
+      test_pid = self()
+
+      server =
+        start_supervised!(
+          {Config.Server,
+           path: path,
+           name: name,
+           apply_diff: fn diff, _config ->
+             send(
+               test_pid,
+               {:snapshot_at_apply, Config.Server.snapshot(name).version, diff.version}
+             )
+           end,
+           apply_native: fn _config -> :ok end},
+          id: :publish_first_server
+        )
+
+      Config.Server.subscribe()
+
+      File.write!(path, """
+      data_dir: #{Path.join(dir, "data")}
+      cameras:
+        - id: cam_a
+          rtsp_url: rtsp://h/1
+      """)
+
+      assert {:ok, _diff, []} = Config.Server.reload(server)
+
+      assert_receive {:snapshot_at_apply, version, version}
+      assert_receive {:config_changed, diff}
+      assert diff.version == version
+      assert diff.server == name
     end
 
     test "the published snapshot carries it", %{path: path} do

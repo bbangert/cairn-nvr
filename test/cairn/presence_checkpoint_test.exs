@@ -33,15 +33,41 @@ defmodule Cairn.PresenceCheckpointTest do
     assert {%Event{id: "e2"}, [], _pid, %{}} = PresenceCheckpoint.get("cam_a")
   end
 
+  # Every config server broadcasts on the one config topic, so an owner that
+  # acted on a private test server's diff would prune this table against the
+  # application snapshot that diff never moved.
+  test "a diff from another config server is ignored" do
+    id = "prck_#{System.unique_integer([:positive])}"
+    on_exit(fn -> PresenceCheckpoint.delete(id) end)
+
+    PresenceCheckpoint.put(
+      id,
+      %Event{id: "e3", camera_id: id, started_at: DateTime.utc_now()},
+      [],
+      self()
+    )
+
+    send(PresenceCheckpoint, {:config_changed, %{diff() | server: :private_test_server}})
+    :sys.get_state(PresenceCheckpoint)
+
+    assert PresenceCheckpoint.get(id)
+  end
+
   # Straight at the owner rather than on the config topic: the other owners
   # share that topic and would prune the ids of whatever else is running.
   defp prune_now do
-    send(
-      PresenceCheckpoint,
-      {:config_changed, %{added: [], removed: [], changed: [], refreshed: []}}
-    )
-
+    send(PresenceCheckpoint, {:config_changed, diff()})
     :sys.get_state(PresenceCheckpoint)
     :ok
+  end
+
+  defp diff do
+    %{
+      added: [],
+      removed: [],
+      changed: [],
+      refreshed: [],
+      server: Cairn.Config.Server
+    }
   end
 end

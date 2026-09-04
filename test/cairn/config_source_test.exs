@@ -862,16 +862,17 @@ defmodule Cairn.ConfigSourceTest do
 
   describe "describe_import_error/1" do
     # The rescue clause this backs (`load/1`'s `Ecto.InvalidChangesetError` /
-    # `Ecto.ConstraintError` arm) is not reachable through `load/1` with
-    # today's data: it validates the whole YAML with `Config.from_map/1` —
-    # using the same id regex, the same required fields — before it ever
-    # calls `Repo.insert!`, so nothing that would fail `Camera.changeset/2`
-    # gets past `from_map/1` first. A concurrent double-import racing the
-    # same id past that check would reach it, but that is not a
-    # deterministic scenario to provoke in a test. `describe_import_error/1`
-    # is `@doc false` rather than private for exactly this: it is exercised
-    # directly, against constructed exceptions, rather than through the
-    # rescue.
+    # `Ecto.ConstraintError` arm, and `replace_rows/2`'s identical rescue for
+    # `reimport/2`) is not reachable through either path with today's data:
+    # both validate the whole YAML with `Config.from_map/1` — using the same
+    # id regex, the same required fields, the same duplicate-id check — before
+    # any row reaches `Repo.insert!`, so nothing that would fail
+    # `Camera.changeset/2` gets past `from_map/1` first. A concurrent
+    # double-import racing the same id past that check would reach it, but
+    # that is not a deterministic scenario to provoke in a test.
+    # `describe_import_error/1` is `@doc false` rather than private for
+    # exactly this: it is exercised directly, against constructed exceptions,
+    # rather than through either rescue.
     test "an invalid-changeset error never carries the changeset's own credentialed values" do
       changeset =
         %Camera{}

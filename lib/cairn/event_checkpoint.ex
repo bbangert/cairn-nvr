@@ -12,6 +12,9 @@ defmodule Cairn.EventCheckpoint do
   camera's tracker core), not something the writer derived: the tracking lives
   in the pipeline now, and this row is the only place it crosses into
   something that outlives one.
+
+  Like the other runtime owners, it prunes against the application config
+  server's published snapshot, and only on that server's broadcasts.
   """
 
   use GenServer
@@ -64,8 +67,10 @@ defmodule Cairn.EventCheckpoint do
   # The table is public — writes come from the trackers — but the rows of a
   # camera that left the config have no tracker left to end them, so this
   # process drops them itself on the config change rather than being told to.
+  # Only the application server's diffs: they name the snapshot this prunes
+  # against (`t:Cairn.Config.Server.diff/0`).
   @impl true
-  def handle_info({:config_changed, _diff}, state) do
+  def handle_info({:config_changed, %{server: Cairn.Config.Server}}, state) do
     case Cairn.Config.Server.known_ids() do
       # No snapshot is not an empty fleet: nothing to prune against.
       nil ->
@@ -79,4 +84,6 @@ defmodule Cairn.EventCheckpoint do
 
     {:noreply, state}
   end
+
+  def handle_info({:config_changed, _another_servers_diff}, state), do: {:noreply, state}
 end

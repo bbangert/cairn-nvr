@@ -14,7 +14,9 @@ defmodule Cairn.CameraControl do
   This process owns the table: every write goes through it, and it is also
   what prunes. It subscribes to the config topic and drops the rows of
   cameras the new config no longer names, in its own callback, and refuses a
-  write for a camera the published config does not name (`set/2`).
+  write for a camera the published config does not name (`set/2`). It prunes
+  and checks against the application config server's published snapshot, and
+  prunes only on that server's broadcasts.
   """
 
   use GenServer
@@ -69,11 +71,15 @@ defmodule Cairn.CameraControl do
   # `set/2` without the existence check, for the suites whose camera exists
   # only as a pipeline fixture and never in a fleet config. Same mailbox and
   # same table: the ordering `set/2`'s check depends on is not weakened, only
-  # the check itself is skipped.
-  @doc false
-  @spec put(String.t(), map()) :: control()
-  def put(camera_id, attrs) when is_map(attrs) do
-    GenServer.call(__MODULE__, {:put, camera_id, normalize(attrs)})
+  # the check itself is skipped. Compiled only in :test — `:erpc` and the HA
+  # API can reach any exported function, and an unchecked write is not a
+  # surface to leave on a running node.
+  if Mix.env() == :test do
+    @doc false
+    @spec put(String.t(), map()) :: control()
+    def put(camera_id, attrs) when is_map(attrs) do
+      GenServer.call(__MODULE__, {:put, camera_id, normalize(attrs)})
+    end
   end
 
   # Accept string- or atom-keyed input, keeping only the known keys. Only maps
@@ -114,8 +120,10 @@ defmodule Cairn.CameraControl do
       else: {:reply, {:error, :unknown_camera}, state}
   end
 
-  def handle_call({:put, camera_id, attrs}, _from, state) do
-    {:reply, write(camera_id, attrs), state}
+  if Mix.env() == :test do
+    def handle_call({:put, camera_id, attrs}, _from, state) do
+      {:reply, write(camera_id, attrs), state}
+    end
   end
 
   defp write(camera_id, attrs) do
@@ -125,11 +133,15 @@ defmodule Cairn.CameraControl do
     control
   end
 
+  # Only the application server's diffs: they name the snapshot this prunes
+  # against (`t:Cairn.Config.Server.diff/0`).
   @impl true
-  def handle_info({:config_changed, _diff}, state) do
+  def handle_info({:config_changed, %{server: Cairn.Config.Server}}, state) do
     prune(Cairn.Config.Server.known_ids())
     {:noreply, state}
   end
+
+  def handle_info({:config_changed, _another_servers_diff}, state), do: {:noreply, state}
 
   # No snapshot is not an empty fleet: a server that has published none (an
   # unnamed one, or one still in `init/1`) cannot say which cameras exist, so

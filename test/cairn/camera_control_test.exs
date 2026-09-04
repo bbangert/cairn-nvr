@@ -79,13 +79,33 @@ defmodule Cairn.CameraControlTest do
     assert CameraControl.get(id) == @defaults
   end
 
+  # Every config server broadcasts on the one config topic, so an owner that
+  # acted on a private test server's diff would prune this table against the
+  # application snapshot that diff never moved.
+  test "a diff from another config server is ignored" do
+    id = "cc_#{System.unique_integer([:positive])}"
+    assert %{detection_enabled: false} = CameraControl.put(id, %{detection_enabled: false})
+
+    send(CameraControl, {:config_changed, %{diff() | server: :private_test_server}})
+    :sys.get_state(CameraControl)
+
+    assert CameraControl.get(id).detection_enabled == false
+
+    prune_now()
+    assert CameraControl.get(id) == @defaults
+  end
+
   # Sends the broadcast the owner subscribes to straight at it, rather than
   # publishing on the config topic: the other owners share that topic and
   # would prune the ids of whatever else the run has already started.
   defp prune_now do
-    send(CameraControl, {:config_changed, %{added: [], removed: [], changed: [], refreshed: []}})
+    send(CameraControl, {:config_changed, diff()})
     :sys.get_state(CameraControl)
     :ok
+  end
+
+  defp diff do
+    %{added: [], removed: [], changed: [], refreshed: [], server: Config.Server}
   end
 
   # The published snapshot is the application's, so both helpers restore it.

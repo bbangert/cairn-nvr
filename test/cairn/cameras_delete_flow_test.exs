@@ -16,14 +16,18 @@ defmodule Cairn.CamerasDeleteFlowTest do
   alias Cairn.EventCheckpoint
   alias Cairn.PresenceCheckpoint
 
-  # The owners prune against `Cairn.Config.Server.known_ids/0` — the
-  # *application* server's published snapshot, which is the suite fixture
-  # (`test/support/fixtures/configs/valid.yml`) and which this file's private,
-  # DB-backed server does not publish into. So a surviving camera has to be
-  # one that file names: `cam_a` stands in for it here, and `cam1` for the
-  # camera the fleet no longer has.
+  # The owners prune against the *application* server's published snapshot and
+  # only on its broadcasts (`t:Cairn.Config.Server.diff/0`); this file's
+  # private, DB-backed server feeds neither. So the app snapshot is swapped to
+  # stand for the fleet the owners see (`publish_fleet/1`), and the delete
+  # reaches them as the tagged message the app server would have broadcast
+  # (`prune_owners/0`). `cam_a` is a camera the suite fixture
+  # (`test/support/fixtures/configs/valid.yml`) names, and so survives every
+  # swap; `cam1` is the one being deleted.
   @survivor "cam_a"
   @deleted "cam1"
+
+  @owners [CameraStatus, CameraControl, PresenceCheckpoint, EventCheckpoint]
 
   setup do
     dir = Path.join(System.tmp_dir!(), "cairn_delete_flow_#{System.unique_integer([:positive])}")
@@ -58,6 +62,11 @@ defmodule Cairn.CamerasDeleteFlowTest do
     Application.put_env(:cairn, :config_server, server)
     on_exit(fn -> Application.delete_env(:cairn, :config_server) end)
 
+    # The app snapshot is process-global; this suite is `async: false`, so no
+    # other suite is reading it while it is swapped.
+    original = :persistent_term.get(app_key(), nil)
+    on_exit(fn -> if original, do: :persistent_term.put(app_key(), original) end)
+
     # The status, control and checkpoint tables are singletons the DB sandbox
     # does not roll back.
     on_exit(fn ->
@@ -72,18 +81,18 @@ defmodule Cairn.CamerasDeleteFlowTest do
 
   test "delete takes the row, and the owners drop the camera on the broadcast", %{server: server} do
     assert {:ok, _diff, []} = create(@deleted)
+    publish_fleet([@deleted])
     seed_runtime_state(@survivor)
-    # No control overlay for `@deleted`: `set/2` is refused for an id the
-    # published snapshot does not name, and the owners' snapshot here is the
-    # application server's. The rest of its state is written straight to ETS.
-    CameraStatus.set(@deleted, :running)
-    put_checkpoints(@deleted)
-    sync_owners()
+    seed_runtime_state(@deleted)
 
     Config.Server.subscribe()
     assert {:ok, %{removed: [@deleted]}, []} = Cameras.delete(@deleted)
-    assert_receive {:config_changed, %{removed: [@deleted]}}
-    sync_owners()
+    # The private server's own broadcast, tagged with it — which is exactly
+    # why the owners do not act on it.
+    assert_receive {:config_changed, %{removed: [@deleted], server: ^server}}
+
+    publish_fleet([])
+    prune_owners()
 
     refute Cameras.get(@deleted)
     assert Enum.map(Config.Server.get(server).cameras, & &1.id) == []
@@ -103,10 +112,12 @@ defmodule Cairn.CamerasDeleteFlowTest do
 
   test "a control write for the deleted camera is refused by the owner" do
     assert {:ok, _diff, []} = create(@deleted)
+    publish_fleet([@deleted])
+    assert CameraControl.set(@deleted, %{detection_enabled: false}).detection_enabled == false
 
-    Config.Server.subscribe()
     assert {:ok, %{removed: [@deleted]}, []} = Cameras.delete(@deleted)
-    assert_receive {:config_changed, %{removed: [@deleted]}}
+    publish_fleet([])
+    prune_owners()
 
     assert CameraControl.set(@deleted, %{detection_enabled: false}) ==
              {:error, :unknown_camera}
@@ -120,14 +131,15 @@ defmodule Cairn.CamerasDeleteFlowTest do
   # inherit from the old one.
   test "the id can be created again and starts from defaults" do
     assert {:ok, _diff, []} = create(@deleted)
+    publish_fleet([@deleted])
+    seed_runtime_state(@deleted)
 
-    Config.Server.subscribe()
     assert {:ok, %{removed: [@deleted]}, []} = Cameras.delete(@deleted)
-    assert_receive {:config_changed, %{removed: [@deleted]}}
+    publish_fleet([])
+    prune_owners()
 
     assert {:ok, %{added: [@deleted]}, []} = create(@deleted)
-    assert_receive {:config_changed, %{added: [@deleted]}}
-    sync_owners()
+    publish_fleet([@deleted])
 
     assert Cameras.get(@deleted)
     assert CameraStatus.get(@deleted).status == :unknown
@@ -157,9 +169,35 @@ defmodule Cairn.CamerasDeleteFlowTest do
   # rather than through it; a call to each is what orders one against the
   # other.
   defp sync_owners do
-    for owner <- [CameraStatus, CameraControl, PresenceCheckpoint, EventCheckpoint],
-        do: :sys.get_state(owner)
-
+    for owner <- @owners, do: :sys.get_state(owner)
     :ok
   end
+
+  # The message the application server would have broadcast for this delete,
+  # sent straight at the owners: an untagged one, or one tagged with the
+  # private server, is ignored by design.
+  defp prune_owners do
+    diff = %{
+      added: [],
+      removed: [@deleted],
+      changed: [],
+      refreshed: [],
+      version: 0,
+      server: Config.Server
+    }
+
+    for owner <- @owners, do: send(owner, {:config_changed, diff})
+    sync_owners()
+  end
+
+  # The application fleet the owners prune against, plus `extra`: the app
+  # server itself is left running on its own config, only its snapshot moves.
+  defp publish_fleet(extra) do
+    config = Config.Server.get()
+    cameras = Enum.map(extra, &%Config.Camera{id: &1}) ++ config.cameras
+    :persistent_term.put(app_key(), %{config | cameras: cameras})
+    :ok
+  end
+
+  defp app_key, do: Config.Server.snapshot_key(Config.Server)
 end

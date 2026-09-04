@@ -60,9 +60,11 @@ defmodule Cairn.ConfigSource do
       degrade(path, "cameras: import failed: " <> describe_import_error(e))
   end
 
-  # `Exqlite.Error` carries the failing `statement`, which holds the values
-  # just spliced into `settings` — an RTSP password among them — and both
-  # `Exception.message/1` and `Exception.format/3` render it. So neither is
+  # `Exqlite.Error` carries the failing `statement`, and both
+  # `Exception.message/1` and `Exception.format/3` render it. exqlite binds
+  # parameters separately, so the statement itself is just `?`-placeholder SQL
+  # — it does not carry the spliced values today — but it still discloses the
+  # schema, and a future adapter path could bind differently. So neither is
   # used on the way to the log either: the line is assembled from the module
   # and the driver's own message, with the statement left out on purpose, and
   # the surfaced text stays generic. `@doc false` rather than private so a
@@ -174,7 +176,12 @@ defmodule Cairn.ConfigSource do
   `/config` sessions cannot both replace off the same warning. No marker at
   all (`{:error, {:write, :no_marker}}`) means no import to drift from: the
   button is never shown for that state, and a request that reaches here anyway
-  replaces nothing.
+  replaces nothing. A row that fails to insert (a collision the loader's own
+  validation does not catch) answers `{:error, {:write, {:import, message}}}`
+  — `message` built by `describe_import_error/1`, never the exception itself,
+  so a password just spliced into `settings` cannot ride
+  `Exception.message/1`'s bypass of `redact: true` out through a caller that
+  logs or inspects the reason.
 
   `expected_sha256:` pins the write to the bytes the caller rendered a
   confirmation for — the file can change between a page displaying "replace N
@@ -203,8 +210,11 @@ defmodule Cairn.ConfigSource do
       Repo.delete_all(Camera)
       Repo.delete_all(from(s in Setting, where: s.key == @marker_key))
       # The write closure answers only `:ok`; the dropped-key warnings from
-      # the import are logged here so they are not lost with it.
-      cameras |> import_rows(path) |> Enum.each(&Logger.warning("config: #{&1}"))
+      # the import are logged here so they are not lost with it. No
+      # transaction here: this already runs inside the config server's own
+      # `mode: :immediate` transaction, unlike `import_rows/2`'s boot-time
+      # caller, which has none of its own.
+      cameras |> insert_rows(path) |> Enum.each(&Logger.warning("config: #{&1}"))
       :ok
     else
       {:error, errors} when is_list(errors) ->
@@ -213,6 +223,15 @@ defmodule Cairn.ConfigSource do
       {:error, reason} when reason in [:no_cameras, :no_drift, :no_marker, :changed] ->
         {:error, reason}
     end
+  rescue
+    # `Repo.insert!/1` inside `insert_rows/2` can raise on a row the loader's
+    # own validation let through (a constraint a later migration adds, a cast
+    # the fleet validator does not reject). `Exception.message/1` on the
+    # changeset variant prints the applied changes — `settings`, an RTSP
+    # password among them — bypassing `redact: true`, so the raw exception
+    # must never reach the server; only `describe_import_error/1`'s text does.
+    e in [Ecto.InvalidChangesetError, Ecto.ConstraintError] ->
+      {:error, {:import, describe_import_error(e)}}
   end
 
   # `nil` (no rendered page to pin against) skips the check; the drift check
@@ -220,6 +239,10 @@ defmodule Cairn.ConfigSource do
   # already matches the file. Reads the raw bytes, not `cameras_sha/1`'s
   # canonicalized list: the caller hashed what it displayed before any YAML
   # parsing, so this has to hash the same thing to mean anything.
+  # `replace_rows/2` reads the file again right after via `Config.raw_map/1`,
+  # which only parses from a path — there is no bytes-in variant to thread
+  # this read's bytes into, so the two reads stay (both run inside the
+  # transaction; only the file on disk between them is outside it).
   defp check_pinned(_path, nil), do: :ok
 
   defp check_pinned(path, expected_sha256) do
@@ -327,19 +350,26 @@ defmodule Cairn.ConfigSource do
     Repo.insert!(marker_changeset(if(is_list(cameras), do: cameras, else: []), path))
   end
 
+  # Wraps its own transaction: the boot-time import path (`import_once/3`,
+  # via `Repo.insert!/1` outside any transaction) has none of its own to join.
+  # `replace_rows/2` calls `insert_rows/2` directly instead, so a re-import
+  # stays the single transaction its moduledoc promises rather than nesting a
+  # second `BEGIN` inside the config server's.
   defp import_rows(cameras, path) do
+    {:ok, warnings} = Repo.transaction(fn -> insert_rows(cameras, path) end)
+
+    Logger.info("config: imported #{length(cameras)} camera(s) from #{path} into the database")
+    warnings
+  end
+
+  defp insert_rows(cameras, path) do
     {rows, warnings} =
       cameras
       |> Enum.with_index()
       |> Enum.map_reduce([], &import_row/2)
 
-    {:ok, _result} =
-      Repo.transaction(fn ->
-        Enum.each(rows, &Repo.insert!/1)
-        Repo.insert!(marker_changeset(cameras, path))
-      end)
-
-    Logger.info("config: imported #{length(rows)} camera(s) from #{path} into the database")
+    Enum.each(rows, &Repo.insert!/1)
+    Repo.insert!(marker_changeset(cameras, path))
     warnings
   end
 

@@ -15,7 +15,9 @@ defmodule Cairn.CameraStatus do
   This process owns the table: every write above goes through it, and it is
   also what prunes. It subscribes to the config topic and drops the rows of
   cameras the new config no longer names, in its own callback — nobody hands
-  it a list of ids, and a camera that comes back starts at `:unknown`.
+  it a list of ids, and a camera that comes back starts at `:unknown`. It
+  prunes against the application config server's published snapshot, and only
+  on that server's broadcasts.
   """
 
   use GenServer
@@ -101,11 +103,15 @@ defmodule Cairn.CameraStatus do
     {:noreply, state}
   end
 
+  # Only the application server's diffs: they name the snapshot this prunes
+  # against (`t:Cairn.Config.Server.diff/0`).
   @impl true
-  def handle_info({:config_changed, _diff}, state) do
+  def handle_info({:config_changed, %{server: Cairn.Config.Server}}, state) do
     prune(Cairn.Config.Server.known_ids())
     {:noreply, state}
   end
+
+  def handle_info({:config_changed, _another_servers_diff}, state), do: {:noreply, state}
 
   # No snapshot is not an empty fleet: a server that has published none (an
   # unnamed one, or one still in `init/1`) cannot say which cameras exist, and

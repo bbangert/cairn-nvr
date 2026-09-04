@@ -48,9 +48,14 @@ defmodule Cairn.Config.Server do
   window. For the duration of an apply the snapshot therefore leads `get/1`,
   which answers the previous config until the apply returns.
 
-  Every config this server installs carries a `version` (boot = 1, each
-  applied reload or save +1; a rejected or failed write leaves it alone), on
-  the snapshot, on `get/1` and in the broadcast as `diff.version`.
+  Every config this server installs carries a `version` (each applied reload
+  or save +1; a rejected or failed write leaves it alone), on the snapshot,
+  on `get/1` and in the broadcast as `diff.version`. The count is monotonic
+  for as long as the `:persistent_term` snapshot lives, which is longer than
+  this process: `init/1` seeds it from the surviving snapshot, so a restarted
+  server continues at the version its predecessor last installed rather than
+  handing out a 1 that a still-pinned save would match. A fresh node, with no
+  term, starts at 1.
   `update/3`'s `expected_version:` is checked against it before the
   transaction opens, so a save made from a stale view is refused with
   `{:error, {:write, {:stale, current}}}` rather than applied over a fleet
@@ -79,14 +84,24 @@ defmodule Cairn.Config.Server do
   @typedoc """
   A `t:camera_diff/0` plus the `version` of the config that produced it, so a
   subscriber that lost an answer to a timeout can tell from the next
-  broadcast whether its own write is the one that landed.
+  broadcast whether its own write is the one that landed, and the `server`
+  that published it — its registered name, or its pid when unnamed.
+
+  `Cairn.Config.topic/0` is one topic for every server, so a private server
+  (a test's) broadcasts onto the same wire as the application singleton. The
+  runtime owners — `Cairn.CameraStatus`, `Cairn.CameraControl`,
+  `Cairn.EventCheckpoint`, `Cairn.PresenceCheckpoint` — prune against
+  `known_ids/1` of the named singleton alone, so acting on another server's
+  diff would prune the singleton's fleet against a snapshot that diff never
+  moved. They match `server: Cairn.Config.Server` and ignore the rest.
   """
   @type diff :: %{
           added: [String.t()],
           removed: [String.t()],
           changed: [String.t()],
           refreshed: [String.t()],
-          version: non_neg_integer()
+          version: non_neg_integer(),
+          server: atom() | pid()
         }
 
   @typedoc "Cameras a source left out of the config, and why."
@@ -243,8 +258,10 @@ defmodule Cairn.Config.Server do
 
   @doc """
   Subscribes the caller to `Cairn.Config.topic/0`: `{:config_changed, diff}`
-  — the added, removed, changed and refreshed ids, and the new config's
-  `version` — after every config applied past boot.
+  — the added, removed, changed and refreshed ids, the new config's `version`
+  and the `server` that published it — after every config applied past boot.
+  Every server shares the topic, so a subscriber whose reaction reads one
+  server's state must filter on `diff.server` (`t:diff/0`).
   """
   @spec subscribe() :: :ok | {:error, term()}
   def subscribe, do: Phoenix.PubSub.subscribe(Cairn.PubSub, Config.topic())
@@ -260,15 +277,17 @@ defmodule Cairn.Config.Server do
       |> Keyword.get_lazy(:source, fn -> Application.fetch_env!(:cairn, :config_loader) end)
       |> source_fun()
 
+    name = Keyword.get(opts, :name, __MODULE__)
+
     state = %{
       path: path,
       source: source,
       # An unnamed server has no key to publish under; nothing reads a
       # snapshot of a server it cannot name.
-      snapshot: Keyword.get(opts, :name, __MODULE__),
+      snapshot: name,
       apply_diff: apply_diff,
       apply_native: apply_native,
-      config: %Config{},
+      config: %Config{version: surviving_version(name)},
       warnings: [],
       errors: [],
       skipped: %{}
@@ -405,7 +424,12 @@ defmodule Cairn.Config.Server do
   # the prune the broadcast that follows triggers.
   defp apply_config(state, new_config, warnings, skipped) do
     new_config = installed(state, new_config)
-    diff = Map.put(diff_cameras(state.config, new_config), :version, new_config.version)
+
+    diff =
+      state.config
+      |> diff_cameras(new_config)
+      |> Map.merge(%{version: new_config.version, server: state.snapshot || self()})
+
     # Before the diff: newly spawned ports redirect logs into the (possibly
     # changed) data_dir, so its log subdir must already exist
     Cairn.DataDir.ensure!(new_config.data_dir)
@@ -453,6 +477,18 @@ defmodule Cairn.Config.Server do
   # save rate ever makes that scan measurable.
   defp publish(%{snapshot: nil}, _config), do: :ok
   defp publish(%{snapshot: name}, config), do: :persistent_term.put(snapshot_key(name), config)
+
+  # The snapshot outlives the process that published it, so a restart resumes
+  # its predecessor's count: restarting at 1 would re-issue versions that
+  # pinned saves still hold, and a stale `expected_version:` would pass.
+  defp surviving_version(nil), do: 0
+
+  defp surviving_version(name) do
+    case snapshot(name) do
+      %Config{version: version} -> version
+      nil -> 0
+    end
+  end
 
   defp source_fun(fun) when is_function(fun, 1), do: fun
   # A named capture, so the boundary error prints `&Mod.fun/1`, not a closure.

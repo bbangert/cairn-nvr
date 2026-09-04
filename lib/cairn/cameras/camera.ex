@@ -3,7 +3,7 @@ defmodule Cairn.Cameras.Camera do
   A camera row. `settings` is the YAML camera mapping minus `id`/`zones`
   (rendered back through `Cairn.Cameras.raw_maps/0` in front of
   `Cairn.Config.from_map/1`); `zones` is its own column so that a zone edit
-  (phase 4's editor, `Cairn.Cameras.put_zones/2` today) writes one column
+  (phase 4's editor, `Cairn.Cameras.put_zones/3` today) writes one column
   and the loader renders one key.
   """
 

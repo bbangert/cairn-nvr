@@ -55,12 +55,34 @@ defmodule Cairn.CameraStatusTest do
     assert CameraStatus.all()["cam_a"]
   end
 
+  # Every config server broadcasts on the one config topic, so an owner that
+  # acted on a private test server's diff would prune this table against the
+  # application snapshot that diff never moved.
+  test "a diff from another config server is ignored", %{id: id} do
+    CameraStatus.set(id, :running)
+
+    send(CameraStatus, {:config_changed, %{diff() | server: :private_test_server}})
+    :sys.get_state(CameraStatus)
+
+    assert CameraStatus.all()[id]
+  end
+
   # Sends the broadcast the owner subscribes to straight at it, rather than
   # publishing on the config topic: the other owners share that topic and
   # would prune the ids of whatever else the run has already started.
   defp prune_now do
-    send(CameraStatus, {:config_changed, %{added: [], removed: [], changed: [], refreshed: []}})
+    send(CameraStatus, {:config_changed, diff()})
     :sys.get_state(CameraStatus)
     :ok
+  end
+
+  defp diff do
+    %{
+      added: [],
+      removed: [],
+      changed: [],
+      refreshed: [],
+      server: Cairn.Config.Server
+    }
   end
 end

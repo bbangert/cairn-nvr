@@ -79,7 +79,10 @@ defmodule CairnWeb.Api.CameraController do
   # The fast path: it answers 404 without a call, but it runs in this request's
   # process, ordered against nothing. A delete applied between it and the write
   # is caught by the owner, which checks the published config in the same
-  # mailbox the prune runs in — both refusals are the same 404.
+  # mailbox the prune runs in — both refusals are the same 404. The owner's
+  # `known?/1` is the authority and counts `dormant` rows as known; this
+  # pre-check reads only `config.cameras`, so it is narrower and can 404 a
+  # disabled camera the owner would otherwise accept.
   defp camera(camera_id) do
     case Server.camera(camera_id) do
       {:ok, cam} -> {:ok, cam}
