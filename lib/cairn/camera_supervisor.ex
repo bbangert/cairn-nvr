@@ -52,8 +52,9 @@ defmodule Cairn.CameraSupervisor do
   the new one instead of being restarted.
   """
   @spec apply_diff(Config.Server.camera_diff(), Config.t()) :: :ok
-  # The full diff shape is matched in the head: all four keys are the
-  # contract (`Cairn.Config.Server.diff/0`), and a caller handing a partial
+  # The four camera keys are matched in the head: they are the contract
+  # (`Cairn.Config.Server.camera_diff/0`, which the broadcast diff carries
+  # alongside keys this never reads), and a caller handing a partial
   # map should fail here, loudly, not by KeyError three lines in — and not be
   # silently tolerated with defaults, which would let a malformed diff skip
   # work it named.
