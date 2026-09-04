@@ -111,11 +111,10 @@ defmodule CairnWeb.Api.CameraControllerTest do
            |> json_response(404)
   end
 
-  # The pre-check is the fast path and runs in this request's process, ordered
-  # against nothing: a delete can apply between it and the write. The owner
-  # reads the published snapshot instead, which leads `get/1` for the length
+  # The owner reads the published snapshot, which leads `get/1` for the length
   # of an apply — so narrowing the snapshot alone puts the request in exactly
-  # that window, and the owner's refusal has to be the same 404.
+  # the window between a delete's publish and its broadcast, and the owner's
+  # refusal is the 404.
   #
   # The restore runs in `after`, not `on_exit`: the setup block's `on_exit`
   # resets cam_a's control through `CameraControl.set/2`, which the owner
@@ -124,9 +123,7 @@ defmodule CairnWeb.Api.CameraControllerTest do
   # is an accident of ordering, not a guarantee. `after` runs inside this
   # test, before any `on_exit` callback, so the reset always sees the real
   # snapshot regardless of registration order.
-  test "control 404s a camera the owner no longer knows, though the pre-check found it", %{
-    conn: conn
-  } do
+  test "control 404s a camera the published config no longer names", %{conn: conn} do
     key = Server.snapshot_key(Cairn.Config.Server)
     published = :persistent_term.get(key)
     :persistent_term.put(key, %{published | cameras: [], dormant: []})
@@ -135,6 +132,25 @@ defmodule CairnWeb.Api.CameraControllerTest do
       assert conn
              |> post("/api/cameras/cam_a/control", %{detection_enabled: false})
              |> json_response(404)
+    after
+      :persistent_term.put(key, published)
+    end
+  end
+
+  # A disabled camera is out of the running config but still a row, and its
+  # control overlay is meant to survive the disable: the owner counts it as
+  # known, so the endpoint accepts the write.
+  test "control accepts a disabled camera the owner still knows", %{conn: conn} do
+    key = Server.snapshot_key(Cairn.Config.Server)
+    published = :persistent_term.get(key)
+    dormant = [%Cairn.Config.Camera{id: "cam_a"}]
+    :persistent_term.put(key, %{published | cameras: [], dormant: dormant})
+
+    try do
+      assert %{"id" => "cam_a", "control" => %{"detection_enabled" => false}} =
+               conn
+               |> post("/api/cameras/cam_a/control", %{detection_enabled: false})
+               |> json_response(200)
     after
       :persistent_term.put(key, published)
     end

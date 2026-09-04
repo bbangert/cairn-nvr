@@ -37,8 +37,7 @@ defmodule CairnWeb.Api.CameraController do
   null to clear the override). Returns the resulting control state.
   """
   def control(conn, %{"id" => camera_id} = params) do
-    with {:ok, _cam} <- camera(camera_id),
-         {:ok, attrs} <- validate(params),
+    with {:ok, attrs} <- validate(params),
          {:ok, control} <- set(camera_id, attrs) do
       json(conn, %{id: camera_id, control: control})
     else
@@ -76,20 +75,11 @@ defmodule CairnWeb.Api.CameraController do
   defp safe_probe({:error, reason}), do: %{error: inspect(reason)}
   defp safe_probe(_), do: nil
 
-  # The fast path: it answers 404 without a call, but it runs in this request's
-  # process, ordered against nothing. A delete applied between it and the write
-  # is caught by the owner, which checks the published config in the same
-  # mailbox the prune runs in — both refusals are the same 404. The owner's
-  # `known?/1` is the authority and counts `dormant` rows as known; this
-  # pre-check reads only `config.cameras`, so it is narrower and can 404 a
-  # disabled camera the owner would otherwise accept.
-  defp camera(camera_id) do
-    case Server.camera(camera_id) do
-      {:ok, cam} -> {:ok, cam}
-      :error -> :unknown_camera
-    end
-  end
-
+  # No pre-check in this process: the owner decides whether the camera exists,
+  # against the published config and in the same mailbox that prunes on a
+  # delete, so its answer is ordered where a check here would not be. It
+  # counts a disabled (`dormant`) camera as known — its overlay is meant to
+  # survive a disable — where the running config alone would 404 it.
   defp set(camera_id, attrs) do
     case CameraControl.set(camera_id, attrs) do
       {:error, :unknown_camera} -> :unknown_camera
