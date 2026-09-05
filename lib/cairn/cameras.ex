@@ -20,10 +20,9 @@ defmodule Cairn.Cameras do
   `{:error, {:write, {:stale, current}}}` otherwise.
 
   A write changes rows; it does not reach into the runtime owners' tables.
-  `CameraStatus` and `CameraControl` drop what the new config no longer names
-  when they see the server's `{:config_changed, _}`, each in its own process.
-  (`delete/2` is the interim exception: it still clears the two checkpoint
-  tables directly until their owners prune themselves — see the note there.)
+  `CameraStatus`, `CameraControl` and the two checkpoint owners drop what the
+  new config no longer names when they see the server's `{:config_changed, _}`,
+  each in its own process.
   """
 
   # `only:` — `Ecto.Query.update/2` would clash with this module's own.
@@ -31,8 +30,6 @@ defmodule Cairn.Cameras do
 
   alias Cairn.Cameras.Camera
   alias Cairn.Config
-  alias Cairn.EventCheckpoint
-  alias Cairn.PresenceCheckpoint
   alias Cairn.Repo
 
   @typedoc """
@@ -192,19 +189,7 @@ defmodule Cairn.Cameras do
   """
   @spec delete(String.t(), keyword()) :: write_result()
   def delete(id, opts \\ []) do
-    case Config.Server.update(server(), fn -> delete_row(id) end, pin(opts)) do
-      {:ok, _diff, _warnings} = applied ->
-        # The status and control owners drop the id themselves on the
-        # broadcast this write ends with. The two checkpoint tables have no
-        # such owner yet, so their rows are still cleared from here; the
-        # change that gives them one takes these two lines with it.
-        PresenceCheckpoint.delete(id)
-        EventCheckpoint.delete(id)
-        applied
-
-      rejected ->
-        rejected
-    end
+    Config.Server.update(server(), fn -> delete_row(id) end, pin(opts))
   end
 
   defp delete_row(id) do
