@@ -18,14 +18,18 @@ defmodule Cairn.Cameras do
   editing a rendered view should pass: the write is accepted only if the
   config it was composed against is still the installed one, and refused with
   `{:error, {:write, {:stale, current}}}` otherwise.
+
+  A write changes rows; it does not reach into the runtime owners' tables.
+  `CameraStatus` and `CameraControl` drop what the new config no longer names
+  when they see the server's `{:config_changed, _}`, each in its own process.
+  (`delete/2` is the interim exception: it still clears the two checkpoint
+  tables directly until their owners prune themselves — see the note there.)
   """
 
   # `only:` — `Ecto.Query.update/2` would clash with this module's own.
   import Ecto.Query, only: [from: 2]
 
-  alias Cairn.CameraControl
   alias Cairn.Cameras.Camera
-  alias Cairn.CameraStatus
   alias Cairn.Config
   alias Cairn.EventCheckpoint
   alias Cairn.PresenceCheckpoint
@@ -181,14 +185,21 @@ defmodule Cairn.Cameras do
   end
 
   @doc """
-  Deletes a camera and clears its live runtime state — status, control
-  overlay and both event checkpoints.
+  Deletes a camera's row. Its live runtime state goes with the config the
+  server publishes and broadcasts: each owner prunes its own table, in its own
+  process, so nothing here can land a prune on a camera another session has
+  since re-created under the same id.
   """
   @spec delete(String.t(), keyword()) :: write_result()
   def delete(id, opts \\ []) do
     case Config.Server.update(server(), fn -> delete_row(id) end, pin(opts)) do
       {:ok, _diff, _warnings} = applied ->
-        prune_runtime(id)
+        # The status and control owners drop the id themselves on the
+        # broadcast this write ends with. The two checkpoint tables have no
+        # such owner yet, so their rows are still cleared from here; the
+        # change that gives them one takes these two lines with it.
+        PresenceCheckpoint.delete(id)
+        EventCheckpoint.delete(id)
         applied
 
       rejected ->
@@ -201,18 +212,6 @@ defmodule Cairn.Cameras do
       nil -> {:error, :not_found}
       camera -> with {:ok, _row} <- Repo.delete(camera), do: :ok
     end
-  end
-
-  # Keyed on the row delete and never on `diff.removed` (D-P8): a skipped or
-  # disabled camera is absent from the config too, and it must keep its
-  # control override and last status. Event rows and clip files stay under
-  # the old id until retention sweeps them.
-  defp prune_runtime(id) do
-    remaining = Enum.map(list(), & &1.id)
-    CameraStatus.prune(remaining)
-    CameraControl.prune(remaining)
-    PresenceCheckpoint.delete(id)
-    EventCheckpoint.delete(id)
   end
 
   defp next_position do

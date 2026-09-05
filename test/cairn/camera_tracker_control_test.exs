@@ -87,7 +87,7 @@ defmodule Cairn.CameraTrackerControlTest do
   # does once a batch has already reached it (below).
 
   test "recording_enabled=false suppresses event start", ctx do
-    CameraControl.set(ctx.camera_id, %{recording_enabled: false})
+    CameraControl.put(ctx.camera_id, %{recording_enabled: false})
 
     detect(ctx.tracker, ctx.camera)
 
@@ -95,7 +95,7 @@ defmodule Cairn.CameraTrackerControlTest do
   end
 
   test "min_score override raises the threshold", ctx do
-    CameraControl.set(ctx.camera_id, %{min_score: 0.95})
+    CameraControl.put(ctx.camera_id, %{min_score: 0.95})
 
     # 0.9 is above the configured 0.5 but below the 0.95 override → filtered out
     detect(ctx.tracker, ctx.camera, 0.9)
@@ -126,7 +126,7 @@ defmodule Cairn.CameraTrackerControlTest do
     end
 
     test "an override above the tier raises the bar", ctx do
-      CameraControl.set(ctx.camera_id, %{min_score: 0.8})
+      CameraControl.put(ctx.camera_id, %{min_score: 0.8})
 
       # clears record.person (0.6) but not the override
       detect(ctx.tracker, ctx.camera, "person", 0.7, @record_policy)
@@ -137,7 +137,7 @@ defmodule Cairn.CameraTrackerControlTest do
     end
 
     test "an override below the tier does not lower it", ctx do
-      CameraControl.set(ctx.camera_id, %{min_score: 0.3})
+      CameraControl.put(ctx.camera_id, %{min_score: 0.3})
 
       # clears the lowered floor, still under record.person
       detect(ctx.tracker, ctx.camera, "person", 0.5, @record_policy)
@@ -149,7 +149,7 @@ defmodule Cairn.CameraTrackerControlTest do
 
     test "a label the block leaves out stays out whatever the override", ctx do
       for override <- [nil, 0.1, 0.99] do
-        CameraControl.set(ctx.camera_id, %{min_score: override})
+        CameraControl.put(ctx.camera_id, %{min_score: override})
 
         detect(ctx.tracker, ctx.camera, "cat", 0.99, @record_policy)
         refute_event_started(ctx.tracker)

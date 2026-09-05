@@ -26,10 +26,34 @@ defmodule Cairn.Application do
       # PubSub starts below it.
       {Cairn.Config.Server, []},
       {DNSCluster, query: Application.get_env(:cairn, :dns_cluster_query) || :ignore},
-      {Phoenix.PubSub, name: Cairn.PubSub},
       Cairn.Registry,
-      {Cairn.CameraStatus, []},
-      {Cairn.CameraControl, []},
+      # PubSub heads a :rest_for_one group with the config-subscribing table
+      # owners. They subscribe in init/1, so a PubSub restart they would
+      # otherwise survive would drop the subscription and leave them silently
+      # no longer pruning — a recreated camera could then inherit a stale
+      # overlay. Under :rest_for_one a PubSub restart re-inits both owners and
+      # they re-subscribe.
+      #
+      # Control is before status on purpose: :rest_for_one only restarts
+      # children after the one that failed, so a status crash (the observational
+      # table, rebuilt from the next probe) leaves control untouched. The
+      # reverse order would let a status crash wipe control's ETS and silently
+      # revert an operator's `detection_enabled: false` / `recording_enabled:
+      # false` back to the enabled defaults.
+      %{
+        id: Cairn.ConfigOwners,
+        type: :supervisor,
+        start:
+          {Supervisor, :start_link,
+           [
+             [
+               {Phoenix.PubSub, name: Cairn.PubSub},
+               {Cairn.CameraControl, []},
+               {Cairn.CameraStatus, []}
+             ],
+             [strategy: :rest_for_one]
+           ]}
+      },
       {CairnWeb.Api.StreamLimiter, []},
       {Cairn.EventCheckpoint, []},
       {Task.Supervisor, name: Cairn.TaskSupervisor},

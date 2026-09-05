@@ -37,9 +37,8 @@ defmodule CairnWeb.Api.CameraController do
   null to clear the override). Returns the resulting control state.
   """
   def control(conn, %{"id" => camera_id} = params) do
-    with {:ok, _cam} <- camera(camera_id),
-         {:ok, attrs} <- validate(params) do
-      control = CameraControl.set(camera_id, attrs)
+    with {:ok, attrs} <- validate(params),
+         {:ok, control} <- set(camera_id, attrs) do
       json(conn, %{id: camera_id, control: control})
     else
       :unknown_camera -> conn |> put_status(404) |> json(%{error: "unknown camera"})
@@ -76,10 +75,15 @@ defmodule CairnWeb.Api.CameraController do
   defp safe_probe({:error, reason}), do: %{error: inspect(reason)}
   defp safe_probe(_), do: nil
 
-  defp camera(camera_id) do
-    case Server.camera(camera_id) do
-      {:ok, cam} -> {:ok, cam}
-      :error -> :unknown_camera
+  # No pre-check in this process: the owner decides whether the camera exists,
+  # against the published config and in the same mailbox that prunes on a
+  # delete, so its answer is ordered where a check here would not be. It
+  # counts a disabled (`dormant`) camera as known — its overlay is meant to
+  # survive a disable — where the running config alone would 404 it.
+  defp set(camera_id, attrs) do
+    case CameraControl.set(camera_id, attrs) do
+      {:error, :unknown_camera} -> :unknown_camera
+      control -> {:ok, control}
     end
   end
 
