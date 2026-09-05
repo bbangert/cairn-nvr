@@ -1,9 +1,9 @@
 defmodule Cairn.CamerasDeleteFlowTest do
   # The delete flow end to end: the row goes inside the config server's
   # transaction, and every runtime owner drops the camera in its own process
-  # when the broadcast lands. Nothing here calls a prune. The two checkpoint
-  # owners, and the recorders, trackers and extractors a delete has to end,
-  # get their owners in later PRs and are not asserted here.
+  # when the broadcast lands. Nothing here calls a prune. The recorders,
+  # trackers and extractors a delete has to end get their owner in a later PR
+  # and are not asserted here.
   use Cairn.DataCase, async: false
 
   @moduletag :capture_log
@@ -29,7 +29,7 @@ defmodule Cairn.CamerasDeleteFlowTest do
   @survivor "cam_a"
   @deleted "cam1"
 
-  @owners [CameraStatus, CameraControl]
+  @owners [CameraStatus, CameraControl, PresenceCheckpoint, EventCheckpoint]
 
   setup do
     dir = Path.join(System.tmp_dir!(), "cairn_delete_flow_#{System.unique_integer([:positive])}")
@@ -74,15 +74,17 @@ defmodule Cairn.CamerasDeleteFlowTest do
         else: :persistent_term.erase(app_key())
     end)
 
-    # The status and control tables are singletons the DB sandbox does not
-    # roll back.
+    # The status, control and checkpoint tables are singletons the DB sandbox
+    # does not roll back.
     on_exit(fn ->
       CameraStatus.set(@survivor, :unknown)
       CameraControl.set(@survivor, %{detection_enabled: true, recording_enabled: true})
-      # The checkpoint tables are global singletons; the delete case below
-      # seeds @deleted rows, so clear them in case an assertion fails first.
-      EventCheckpoint.delete(@deleted)
+      # The checkpoint tables are global singletons the sandbox does not roll
+      # back; clear both ids the cases here seed.
+      PresenceCheckpoint.delete(@survivor)
+      EventCheckpoint.delete(@survivor)
       PresenceCheckpoint.delete(@deleted)
+      EventCheckpoint.delete(@deleted)
     end)
 
     %{dir: dir, server: server}
@@ -108,31 +110,15 @@ defmodule Cairn.CamerasDeleteFlowTest do
 
     assert CameraStatus.get(@deleted).status == :unknown
     assert CameraControl.get(@deleted) == defaults()
+    assert PresenceCheckpoint.get(@deleted) == nil
+    assert EventCheckpoint.get(@deleted) == nil
 
     # The prune is against the ids the config still names, not against every
     # id: a camera that is still there keeps what it had.
     assert CameraStatus.get(@survivor).status == :running
     assert CameraControl.get(@survivor).detection_enabled == false
-  end
-
-  # The two checkpoint tables have no owner until B3, so `delete/2` still
-  # clears them directly. Pin that interim guarantee: without it the two lines
-  # could go early and nothing here would catch it.
-  test "delete clears the two checkpoint tables it still owns until B3" do
-    assert {:ok, _diff, []} = create(@deleted)
-    publish_fleet([@deleted])
-
-    event = %Event{id: Ecto.UUID.generate(), camera_id: @deleted, started_at: DateTime.utc_now()}
-    EventCheckpoint.put(@deleted, event)
-    PresenceCheckpoint.put(@deleted, event, [{nil, "person"}], self())
-
-    assert EventCheckpoint.get(@deleted)
-    assert PresenceCheckpoint.get(@deleted)
-
-    assert {:ok, %{removed: [@deleted]}, []} = Cameras.delete(@deleted)
-
-    assert EventCheckpoint.get(@deleted) == nil
-    assert PresenceCheckpoint.get(@deleted) == nil
+    assert PresenceCheckpoint.get(@survivor)
+    assert EventCheckpoint.get(@survivor)
   end
 
   test "a control write for the deleted camera is refused by the owner" do
@@ -180,7 +166,14 @@ defmodule Cairn.CamerasDeleteFlowTest do
   defp seed_runtime_state(id) do
     CameraStatus.set(id, :running)
     assert CameraControl.set(id, %{detection_enabled: false}).detection_enabled == false
+    put_checkpoints(id)
     settle_owners()
+  end
+
+  defp put_checkpoints(id) do
+    event = %Event{id: Ecto.UUID.generate(), camera_id: id, started_at: DateTime.utc_now()}
+    PresenceCheckpoint.put(id, event, [], nil)
+    EventCheckpoint.put(id, event)
   end
 
   # The prune runs in each owner's own process, and the reads above go to ETS

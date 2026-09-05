@@ -28,7 +28,7 @@ defmodule Cairn.CameraTrackerRestoreTest do
       started_at: DateTime.utc_now()
     }
 
-    EventCheckpoint.put(camera_id, event)
+    EventCheckpoint.put!(camera_id, event)
     eid = event.id
 
     log =
@@ -68,7 +68,7 @@ defmodule Cairn.CameraTrackerRestoreTest do
       started_at: DateTime.utc_now()
     }
 
-    EventCheckpoint.put(camera_id, event)
+    EventCheckpoint.put!(camera_id, event)
     eid = event.id
     on_exit(fn -> terminate_tracker(camera_id) end)
 

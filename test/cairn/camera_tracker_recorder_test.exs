@@ -17,6 +17,8 @@ defmodule Cairn.CameraTrackerRecorderTest do
 
   setup do
     camera_id = "trkr_#{System.unique_integer([:positive])}"
+    # The checkpoint owner drops a write for a camera the fleet does not name.
+    Cairn.SnapshotHelpers.lend_cameras(camera_id)
     camera = %Camera{id: camera_id, rtsp_url: "rtsp://h/1", min_score: %{"default" => 0.5}}
     test_pid = self()
 
@@ -792,7 +794,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
         last_seen_at: DateTime.utc_now()
       }
 
-      EventCheckpoint.put(ctx.camera_id, event, [track])
+      EventCheckpoint.put!(ctx.camera_id, event, [track])
 
       # a second tracker for the same camera: this one runs restore over the
       # checkpoint above
