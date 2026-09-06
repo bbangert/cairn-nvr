@@ -150,13 +150,13 @@ defmodule Cairn.PresenceRecorder do
   Called where the aggregator is ensured, so the two are always started
   together; a caller on the frame path uses `frames/3`, which never starts one.
 
-  An existing recorder is **adopted, not merely found**: a camera restarting
-  under a changed config stops (latching `retire/1`) and comes back still
-  tier 1, and the recorder that outlived the stop for its open event is the one
-  the new session gets. Un-latching it here is what keeps it: the latch is
-  paid when the event closes, and this is the only call that says the camera
-  came back. A camera that really left never reaches here again, so its latch
-  still stops it.
+  An existing recorder is **adopted, not merely found**: a camera whose media
+  is replaced under a changed config is retired (latching `retire/1`) and
+  comes back still tier 1, and the recorder that outlived the replacement for
+  its open event is the one the new session gets. Un-latching it here is what
+  keeps it: the latch is paid when the event closes, and this is the only
+  call that says the camera came back. A camera that really left never
+  reaches here again, so its latch still stops it.
 
   The un-latching is a **call**, and that is the whole point. The registry is a
   stale-read site and a `:retire` may already be in the mailbox ahead of us: a

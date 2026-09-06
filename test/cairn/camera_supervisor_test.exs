@@ -48,13 +48,15 @@ defmodule Cairn.CameraSupervisorTest do
     assert Cairn.Registry.whereis(b.id, :camera)
   end
 
-  test "apply_diff restarts changed cameras and applies adds/removals" do
+  test "apply_diff replaces a changed camera's media and applies adds/removals" do
     a = camera("cs_a_#{System.unique_integer([:positive])}")
     b = camera("cs_b_#{System.unique_integer([:positive])}")
     c = camera("cs_c_#{System.unique_integer([:positive])}")
 
     :ok = CameraSupervisor.sync(config([a, b]))
-    old_b = Cairn.Registry.whereis(b.id, :camera)
+    sup_b = Cairn.Registry.whereis(b.id, :camera)
+    old_media = child_pid(sup_b, :media)
+    old_lane = child_pid(sup_b, :lane)
 
     diff = %{added: [c.id], removed: [a.id], changed: [b.id], refreshed: []}
     new_config = config([%Camera{b | rtsp_url: "file:///dev/zero"}, c])
@@ -63,9 +65,139 @@ defmodule Cairn.CameraSupervisorTest do
     refute Cairn.Registry.whereis(a.id, :camera)
     assert Cairn.Registry.whereis(c.id, :camera)
 
-    new_b = wait_new_pid(b.id, old_b)
-    assert is_pid(new_b)
-    assert new_b != old_b
+    # a restart-class change is media-only: the camera's supervisor, its
+    # Registry name and its lane are the same processes afterwards
+    assert Cairn.Registry.whereis(b.id, :camera) == sup_b
+    assert Process.alive?(sup_b)
+    assert child_pid(sup_b, :lane) == old_lane
+
+    new_media = child_pid(sup_b, :media)
+    assert new_media != old_media
+    refute Process.alive?(old_media)
+
+    # and it was built from the NEW camera, not the struct the tree was born with
+    owner = Cairn.Registry.whereis(b.id, :pipeline)
+    assert :sys.get_state(owner).camera.rtsp_url == "file:///dev/zero"
+  end
+
+  test "a camera rebuilt by its DynamicSupervisor comes back on the changed config" do
+    b = camera("cs_rebuild_#{System.unique_integer([:positive])}")
+    :ok = CameraSupervisor.sync(config([b]))
+    sup = Cairn.Registry.whereis(b.id, :camera)
+
+    new_config = config([%Camera{b | rtsp_url: "file:///dev/zero"}])
+    # what the server publishes before it calls apply_diff — the only record of
+    # the change a whole-tree rebuild can read, since `DynamicSupervisor` keeps
+    # the spec this camera was started with
+    publish(new_config)
+    diff = %{added: [], removed: [], changed: [b.id], refreshed: []}
+    :ok = CameraSupervisor.apply_diff(diff, new_config)
+
+    # What a media crash-loop past `Cairn.Camera`'s own intensity ends in: the
+    # camera's supervisor exits and `CameraSupervisor` restarts it (`:permanent`)
+    # from the spec it stored, which still names the pre-change camera. Stopped
+    # rather than killed so the old tree's Registry names are gone first — a
+    # rebuild racing them would only fail to start.
+    Supervisor.stop(sup, :shutdown)
+    Cairn.Registry.await_unregistered(b.id, :camera)
+
+    owner = wait_for(fn -> Cairn.Registry.whereis(b.id, :pipeline) end)
+    assert is_pid(owner)
+    assert :sys.get_state(owner).camera.rtsp_url == "file:///dev/zero"
+  end
+
+  test "a changed camera whose new media will not start is stopped, not left dark" do
+    id = "cs_badmedia_#{System.unique_integer([:positive])}"
+    :ok = CameraSupervisor.sync(config([camera(id)]))
+    assert Cairn.Registry.whereis(id, :camera)
+
+    # Hold the new media's first Registry name from this process, so its
+    # `RingBuffer` cannot register and the subtree's start fails. The old media
+    # has to be down first — the name is unique, and Registry only evicts a
+    # dead owner. Held by a *live* process on purpose: the registry evicts a
+    # stale entry whose owner is dead rather than refusing the registration,
+    # so a dead holder would not fail the start at all.
+    sup = Cairn.Registry.whereis(id, :camera)
+    :ok = Supervisor.terminate_child(sup, :media)
+    Cairn.Registry.await_unregistered(id, :ring_buffer)
+    {:ok, _} = Registry.register(Cairn.Registry, {id, :ring_buffer}, nil)
+
+    ExUnit.CaptureLog.capture_log(fn ->
+      :ok = CameraSupervisor.restart_media(config([camera(id)]), id)
+    end)
+
+    refute Cairn.Registry.whereis(id, :camera)
+  end
+
+  test "a media replacement is not stopped by names the registry has not reaped" do
+    id = "cs_stale_#{System.unique_integer([:positive])}"
+    cfg = config([camera(id)])
+    :ok = CameraSupervisor.sync(cfg)
+    sup = Cairn.Registry.whereis(id, :camera)
+    old_media = child_pid(sup, :media)
+
+    # Registry unregisters on the owner's DOWN, handled by the partition
+    # process below — a `terminate_child` can return before it runs. Suspended,
+    # that lag is
+    # unbounded and the state below is the one `restart_media/2` would race:
+    # every media name still in the table, every owner dead. Resumed first on
+    # the way out, ahead of the setup's camera teardown.
+    partition = Process.whereis(Cairn.Registry.PIDPartition0)
+    assert is_pid(partition)
+    :sys.suspend(partition)
+    on_exit(fn -> :sys.resume(partition) end)
+
+    :ok = Supervisor.terminate_child(sup, :media)
+
+    for role <- [:ring_buffer, :ffmpeg, :pipeline, :rtp_hub] do
+      pid = Cairn.Registry.whereis(id, role)
+      assert is_pid(pid) and not Process.alive?(pid), "#{role} was reaped, not stale"
+    end
+
+    :ok = CameraSupervisor.restart_media(cfg, id)
+
+    # `Registry.register/3` drops a unique entry whose owner is dead and
+    # retries, so the new chain takes each name rather than being refused it —
+    # no name is awaited in between, and the camera is not stopped.
+    assert Cairn.Registry.whereis(id, :camera) == sup
+    assert child_pid(sup, :media) != old_media
+    owner = Cairn.Registry.whereis(id, :pipeline)
+    assert is_pid(owner) and Process.alive?(owner)
+  end
+
+  test "a camera tree nests an empty lane alongside its media" do
+    a = camera("cs_nest_#{System.unique_integer([:positive])}")
+    :ok = CameraSupervisor.sync(config([a]))
+    sup = Cairn.Registry.whereis(a.id, :camera)
+
+    children = Supervisor.which_children(sup)
+
+    assert MapSet.new(children, fn {id, _pid, _type, _mods} -> id end) ==
+             MapSet.new([:lane, :media])
+
+    assert {:lane, _pid, :supervisor, [Cairn.Camera.Lane]} = List.keyfind(children, :lane, 0)
+    assert {:media, _pid, :supervisor, [Cairn.Camera.Media]} = List.keyfind(children, :media, 0)
+
+    # S1 moves no workers: the lane exists so S2/S3 have somewhere to put them
+    assert Supervisor.which_children(child_pid(sup, :lane)) == []
+  end
+
+  test "a removed camera stops its whole tree, lane and media with it" do
+    id = "cs_gone_#{System.unique_integer([:positive])}"
+    old = config([camera(id)])
+
+    :ok = CameraSupervisor.sync(old)
+    sup = Cairn.Registry.whereis(id, :camera)
+    lane = child_pid(sup, :lane)
+    media = child_pid(sup, :media)
+
+    diff = %{added: [], removed: [id], changed: [], refreshed: []}
+    :ok = CameraSupervisor.apply_diff(diff, config([]))
+
+    refute Cairn.Registry.whereis(id, :camera)
+    refute Process.alive?(sup)
+    refute Process.alive?(lane)
+    refute Process.alive?(media)
   end
 
   test "apply_diff refreshes a camera in place instead of restarting it" do
@@ -176,19 +308,36 @@ defmodule Cairn.CameraSupervisorTest do
     assert Cairn.Registry.whereis(a.id, :rtp_hub)
   end
 
-  # Flunks rather than returning nil: a "restarted" assertion that compares
+  # Stands in for a reload: `Cairn.Config.Server` publishes its snapshot before
+  # applying the diff, and that term is what a tree rebuilt from a stale child
+  # spec resolves itself from.
+  defp publish(config) do
+    key = Cairn.Config.Server.snapshot_key(Cairn.Config.Server)
+    previous = :persistent_term.get(key, nil)
+    :persistent_term.put(key, config)
+
+    on_exit(fn ->
+      if previous, do: :persistent_term.put(key, previous), else: :persistent_term.erase(key)
+    end)
+  end
+
+  defp wait_for(fun, attempts \\ 200) do
+    case fun.() do
+      nil when attempts > 0 ->
+        Process.sleep(5)
+        wait_for(fun, attempts - 1)
+
+      other ->
+        other
+    end
+  end
+
+  # Flunks rather than returning nil: a "replaced" assertion that compares
   # against the old pid passes trivially on nil.
-  defp wait_new_pid(id, old, attempts \\ 100) do
-    case Cairn.Registry.whereis(id, :camera) do
-      pid when is_pid(pid) and pid != old ->
-        pid
-
-      _ when attempts > 0 ->
-        Process.sleep(10)
-        wait_new_pid(id, old, attempts - 1)
-
-      _ ->
-        flunk("camera #{id} never came back with a new pid (was #{inspect(old)})")
+  defp child_pid(sup, id) do
+    case List.keyfind(Supervisor.which_children(sup), id, 0) do
+      {^id, pid, _type, _mods} when is_pid(pid) -> pid
+      other -> flunk("#{inspect(sup)} has no running #{inspect(id)} child: #{inspect(other)}")
     end
   end
 end

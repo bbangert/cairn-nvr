@@ -135,17 +135,19 @@ Cairn.Supervisor
 ├── Cairn.Native.Health            (its own process: probes the host under a deadline)
 ├── Cairn.Native.Status            (maps engine health onto cameras:status)
 ├── Cairn.CameraSupervisor (DynamicSupervisor)
-│   └── Cairn.Camera (one per camera, rest_for_one)
-│       ├── probe                  (ffprobe task, temporary)
-│       ├── Cairn.RingBuffer
-│       ├── Cairn.FFmpegPort       (bridge cameras only: the ffmpeg Port)
-│       ├── Cairn.PipelineOwner    (the camera's long-lived Membrane pipeline)
-│       └── Cairn.RTPHub           (socketless; fed by the pipeline's RTP branch)
+│   └── Cairn.Camera (one per camera, one_for_one)
+│       ├── :lane  Cairn.Camera.Lane  (one_for_one; empty until the event workers move in)
+│       └── :media Cairn.Camera.Media (rest_for_one; replaced alone on a restart-class change)
+│           ├── probe              (ffprobe task, temporary)
+│           ├── Cairn.RingBuffer
+│           ├── Cairn.FFmpegPort   (bridge cameras only: the ffmpeg Port)
+│           ├── Cairn.PipelineOwner (the camera's long-lived Membrane pipeline)
+│           └── Cairn.RTPHub       (socketless; fed by the pipeline's RTP branch)
 ├── Cairn.Retention / CairnWeb.WebRTC.Supervisor / Cairn.Boot
 └── CairnWeb.Endpoint
 ```
 
-Restart shape worth naming: the pipeline is *not* in this tree — `Cairn.PipelineOwner` monitors it and its jittered backoff (not supervisor intensity) owns the "camera is down" state, as `Cairn.FFmpegPort`'s does for the bridge. Ring death restarts the ingest (`:rest_for_one`): a fresh ring is empty anyway.
+Restart shape worth naming: the pipeline is *not* in this tree — `Cairn.PipelineOwner` monitors it and its jittered backoff (not supervisor intensity) owns the "camera is down" state, as `Cairn.FFmpegPort`'s does for the bridge. Ring death restarts the ingest (`Cairn.Camera.Media` is `:rest_for_one`): a fresh ring is empty anyway. A restart-class config change replaces `:media` alone; the camera's supervisor, its Registry name and its lane survive, and the new subtree is built from the applied diff's explicit camera and config — a whole tree `Cairn.CameraSupervisor` rebuilds instead resolves itself from the config server's published snapshot, since its stored child spec cannot be rewritten.
 
 ## Resource budget
 

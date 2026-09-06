@@ -354,15 +354,16 @@ defmodule Cairn.CameraTracker do
   # substream, `:main` otherwise. A config round trip, which is why it is asked
   # only at init and on this camera's `:started` announcements — a session
   # start is both rare and the one moment the answer can have moved, since a
-  # `substream_url` edit restarts the camera tree (`Cairn.Config.Server`'s
-  # restart fields) and the pipeline that comes back announces `:started`.
+  # `substream_url` edit replaces the camera's media subtree
+  # (`Cairn.Config.Server`'s restart fields) and the pipeline that comes back
+  # announces `:started`.
   #
   # Failure mode: the config server serves the *new* config while the *old*
   # pipeline is still running. A `:started` in that window resolves the role
   # the camera is about to have rather than the one it has, and until the
   # restart lands this process ignores the announcements it should follow —
   # `stale?/2` then drops the old pipeline's last batches. The window is the
-  # camera restart itself, and a mint needs a fresh RTSP session and its first
+  # media replacement itself, and a mint needs a fresh RTSP session and its first
   # buffer, so nothing reaches it in practice. A config server that is down or
   # too slow (the call exits) keeps the role already held: degrading to `:main`
   # would silently move a dual-stream camera's tracker onto the recording
