@@ -78,11 +78,19 @@ defmodule Cairn.Config.Server do
   alias Cairn.Config
   alias Cairn.Native.Host
 
-  @typedoc "Which cameras the new config adds, removes, restarts and refreshes."
+  @typedoc """
+  Which cameras the new config adds, removes, restarts, rebuilds and refreshes.
+
+  A camera is in at most one of `changed`, `rebuilt` and `refreshed`: they are
+  three different operations on its tree (replace `:media`, stop and start the
+  whole tree, hand the running one the new config), and the classification
+  picks the largest one that applies.
+  """
   @type camera_diff :: %{
           added: [String.t()],
           removed: [String.t()],
           changed: [String.t()],
+          rebuilt: [String.t()],
           refreshed: [String.t()]
         }
 
@@ -112,6 +120,7 @@ defmodule Cairn.Config.Server do
           added: [String.t()],
           removed: [String.t()],
           changed: [String.t()],
+          rebuilt: [String.t()],
           refreshed: [String.t()],
           version: non_neg_integer(),
           server: atom() | pid(),
@@ -268,7 +277,7 @@ defmodule Cairn.Config.Server do
 
   @doc """
   Subscribes the caller to `Cairn.Config.topic/0`: `{:config_changed, diff}`
-  — the added, removed, changed and refreshed ids, the new config's `version`,
+  — the added, removed, changed, rebuilt and refreshed ids, the new config's `version`,
   the ids it `known`s and the `server` that published it — after every config
   applied past boot. Every server shares the topic, so a subscriber whose
   reaction reads one server's state must filter on `diff.server`
@@ -531,19 +540,26 @@ defmodule Cairn.Config.Server do
     old_ids = MapSet.new(Map.keys(old_by_id))
     new_ids = MapSet.new(Map.keys(new_by_id))
 
-    # `changed` replaces the camera's media subtree, `refreshed` hands the running one
-    # the new config: a camera is in exactly one of them, and in neither when
-    # nothing about it moved.
-    {changed, refreshed} =
-      Enum.reduce(MapSet.intersection(old_ids, new_ids), {[], []}, fn id, {changed, refreshed} ->
+    # `rebuilt` stops and starts the whole tree, `changed` replaces the camera's
+    # media subtree, `refreshed` hands the running one the new config: a camera
+    # is in exactly one of the three, and in none when nothing about it moved.
+    # Tested first, and the order is the contract — a tier flip is also a
+    # restart-class change, and rebuilding the tree does the media replacement's
+    # work as well as the lane's.
+    {rebuilt, changed, refreshed} =
+      Enum.reduce(MapSet.intersection(old_ids, new_ids), {[], [], []}, fn id, {reb, ch, ref} ->
+        old_cam = old_by_id[id]
+        new_cam = new_by_id[id]
+
         cond do
-          camera_changed?(old, new, old_by_id[id], new_by_id[id]) -> {[id | changed], refreshed}
-          camera_refreshed?(old, new, old_by_id[id], new_by_id[id]) -> {changed, [id | refreshed]}
-          true -> {changed, refreshed}
+          camera_rebuilt?(old, new, old_cam, new_cam) -> {[id | reb], ch, ref}
+          camera_changed?(old, new, old_cam, new_cam) -> {reb, [id | ch], ref}
+          camera_refreshed?(old, new, old_cam, new_cam) -> {reb, ch, [id | ref]}
+          true -> {reb, ch, ref}
         end
       end)
 
-    diff(old_ids, new_ids, changed, refreshed)
+    diff(old_ids, new_ids, changed, rebuilt, refreshed)
   end
 
   # The camera inputs that reach a subprocess or are baked into a child spec
@@ -580,7 +596,8 @@ defmodule Cairn.Config.Server do
   The camera fields baked into a subprocess or a child spec at tree birth,
   so a running camera cannot take them in place. Not the whole restart set:
   the resolved comparisons in the camera diff (pre-window, tracker core,
-  sample rate, live-track cap, tier, rung) restart a camera too.
+  sample rate, live-track cap, rung) restart a camera too, and a resolved tier
+  change rebuilds its whole tree (`camera_rebuilt?/4`).
   """
   @spec restart_fields() :: [atom()]
   def restart_fields, do: @restart_fields
@@ -609,11 +626,6 @@ defmodule Cairn.Config.Server do
   # The rest of the effective policy — `post`/`max`, the other tracking bounds,
   # the `track:` / `record:` tiers — is host-side and refreshes in place through
   # `Cairn.PipelineOwner.refresh/3`.
-  # The capability tier joins them for the same reason at a larger grain:
-  # it picks the whole TAIL of the detect branch (`Cairn.Pipeline.Camera`'s
-  # `detect_tail/4` — presence sink vs stamper/tracker/track sink), and a
-  # refresh routed by the old tail would feed the new policy to a shape the
-  # tier no longer means.
   #
   # The resolved ladder rung is the newest resolved comparison (D-L5): a
   # fleet edit elsewhere on the node can move N across a rung boundary,
@@ -628,8 +640,23 @@ defmodule Cairn.Config.Server do
       Config.tracker(old, old_cam) != Config.tracker(new, new_cam) or
       Config.sample_fps(old, old_cam) != Config.sample_fps(new, new_cam) or
       Config.policy(old, old_cam).max_live_tracks != Config.policy(new, new_cam).max_live_tracks or
-      Map.get(Config.policy(old, old_cam), :tier) != Map.get(Config.policy(new, new_cam), :tier) or
       Config.resolved_rung(old, old_cam) != Config.resolved_rung(new, new_cam)
+  end
+
+  # The one change a media replacement cannot serve. The capability tier picks
+  # the whole TAIL of the detect branch (`Cairn.Pipeline.Camera`'s
+  # `detect_tail/4` — presence sink vs stamper/tracker/track sink) *and* which
+  # event workers the camera runs (`Cairn.Camera.Lane` — tier 1 has an
+  # aggregator and a recorder, and nothing else does). The lane survives a
+  # media replacement by design, so classifying a tier flip as `changed` would
+  # leave presence workers standing on a camera that is no longer tier 1; the
+  # whole tree is stopped and started instead.
+  #
+  # `Map.get`, not `.tier`: a tier-less profile — and every unprofiled camera —
+  # has no such key at all (`Cairn.Config.put_tier/2`), and `nil` is the tier
+  # every branch that is not the presence fork reads as.
+  defp camera_rebuilt?(old, new, old_cam, new_cam) do
+    Map.get(Config.policy(old, old_cam), :tier) != Map.get(Config.policy(new, new_cam), :tier)
   end
 
   # Everything else the running camera was handed: the camera struct itself
@@ -640,11 +667,12 @@ defmodule Cairn.Config.Server do
     old_cam != new_cam or Config.policy(old, old_cam) != Config.policy(new, new_cam)
   end
 
-  defp diff(old_keys, new_keys, changed, refreshed) do
+  defp diff(old_keys, new_keys, changed, rebuilt, refreshed) do
     %{
       added: MapSet.difference(new_keys, old_keys) |> Enum.sort(),
       removed: MapSet.difference(old_keys, new_keys) |> Enum.sort(),
       changed: Enum.sort(changed),
+      rebuilt: Enum.sort(rebuilt),
       refreshed: Enum.sort(refreshed)
     }
   end

@@ -1,9 +1,10 @@
 defmodule Cairn.CamerasDeleteFlowTest do
   # The delete flow end to end: the row goes inside the config server's
   # transaction, and every runtime owner drops the camera in its own process
-  # when the broadcast lands. Nothing here calls a prune. The recorders,
-  # trackers and extractors a delete has to end get their owner in a later PR
-  # and are not asserted here.
+  # when the broadcast lands. Nothing here calls a prune, and `apply_diff` is
+  # stubbed, so the camera tree is not exercised: the presence lane's own
+  # teardown on a delete is asserted against the real tree in
+  # `Cairn.CameraSupervisorTest`, and the tracker's arrives with S3.
   use Cairn.DataCase, async: false
 
   @moduletag :capture_log

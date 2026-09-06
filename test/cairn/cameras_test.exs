@@ -231,7 +231,7 @@ defmodule Cairn.CamerasTest do
 
       # D-P5: an untouched re-save renders byte-identically, so it diffs to
       # nothing and no camera restarts.
-      assert {:ok, %{added: [], removed: [], changed: [], refreshed: []}, []} =
+      assert {:ok, %{added: [], removed: [], changed: [], rebuilt: [], refreshed: []}, []} =
                Cameras.update("cam1", %{
                  "settings" => %{"rtsp_url" => "rtsp://h/1", "min_score" => 0.6}
                })
@@ -239,7 +239,7 @@ defmodule Cairn.CamerasTest do
       assert {:ok, %{changed: ["cam1"]}, []} =
                Cameras.update("cam1", %{"settings" => %{"rtsp_url" => "rtsp://h/CHANGED"}})
 
-      assert {:ok, %{added: [], removed: [], changed: [], refreshed: []}, []} =
+      assert {:ok, %{added: [], removed: [], changed: [], rebuilt: [], refreshed: []}, []} =
                Cameras.reorder(["cam2", "cam1"])
 
       assert Enum.map(Cameras.list(), & &1.id) == ["cam2", "cam1"]

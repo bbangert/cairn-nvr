@@ -7,12 +7,35 @@ defmodule Cairn.EventExtractor do
   `events/{camera}/{event_id}_{camera}_{ts}.mp4`, writes the init segment,
   then atomically drains the ring's pre-window and subscribes for live
   fragments (`Cairn.RingBuffer.drain_and_subscribe/3` — race-free
-  boundary). Those drained fragments are the only sight anyone gets of the
-  clip's own time-zero, so the anchor taken there (`anchor/3`) pairs it with a
-  wall clock for the sidecar header; it would otherwise be discarded with the
-  fragments. The first fragment to arrive *live* completes that anchor with a
-  second, tighter pairing (`note_live_fragment/2`) — the one a reader prefers,
-  and the reason `Cairn.TrackPath` documents two.
+  boundary), monitoring the ring it drained. Those drained fragments are the
+  only sight anyone gets of the clip's own time-zero, so the anchor taken there
+  (`anchor/3`) pairs it with a wall clock for the sidecar header; it would
+  otherwise be discarded with the fragments. The first fragment to arrive
+  *live* completes that anchor with a second, tighter pairing
+  (`note_live_fragment/2`) — the one a reader prefers, and the reason
+  `Cairn.TrackPath` documents two.
+
+  ## Who ends the clip
+
+  Its **owner** does, always, by casting `{:finalize, event}` — the process
+  that opened the event and has been updating its labels, scores and trigger
+  ever since. The event this process holds is the one the clip opened with and
+  is stale from the first detection, and `Cairn.Events.finalize/2` persists
+  whatever it is handed, so a close from here would overwrite the row with it.
+
+  A ring that goes is therefore reported, not acted on: the subscription lives
+  in the ring's own state, so a replacement — the one a media restart builds —
+  has never heard of this process, and `{:ring_lost, event_id}` tells the owner
+  there will be no more media. It answers with its ordinary close. Waiting
+  costs nothing, there being nothing left to receive. An extractor started
+  with **no** owner (`Cairn.CameraTracker`, until S3 wires one) does nothing at
+  all on ring loss: its clip starves until that lane's own window closes it,
+  which is the behaviour that lane has today.
+
+  The one close this process performs itself is the orphan: the owner is gone
+  and nothing will ever cast a finalize, so rather than hold an `:active` row
+  and an open file for the life of the node it closes with the metadata it
+  has — logged as such, because that metadata is the opening snapshot.
 
   ## The clip starts on a keyframe
 
@@ -101,6 +124,10 @@ defmodule Cairn.EventExtractor do
   and is written into the sidecar's header for the reader that colours by
   them: `:object` for `Cairn.CameraTracker`'s tracked identities, `:label` for
   `Cairn.PresenceRecorder`'s label-keyed ones (`Cairn.TrackPath`).
+
+  `:owner` names the process that will finalize this clip — see the moduledoc
+  on what it is for. A caller that names none can still be told later with
+  `owner/2`, which is how a replacement owner claims an extractor it adopted.
   """
   @spec start(Cairn.Config.Camera.t(), Cairn.Event.t(), keyword()) ::
           DynamicSupervisor.on_start_child()
@@ -115,6 +142,18 @@ defmodule Cairn.EventExtractor do
   @spec finalize(pid() | nil, Cairn.Event.t()) :: :ok
   def finalize(nil, _event), do: :ok
   def finalize(pid, event), do: GenServer.cast(pid, {:finalize, event})
+
+  @doc """
+  Names the process that will finalize this clip, replacing whatever this
+  extractor was started with.
+
+  A replacement lane owner sends this when it adopts a running extractor from
+  a checkpoint: the owner it was started with is dead, and without this the
+  extractor would read a ring loss as having no owner and close itself with
+  the stale event it holds.
+  """
+  @spec owner(pid(), pid()) :: :ok
+  def owner(pid, owner) when is_pid(owner), do: GenServer.cast(pid, {:owner, owner})
 
   # -- server -----------------------------------------------------------------
 
@@ -151,11 +190,29 @@ defmodule Cairn.EventExtractor do
       max_path_entries: Keyword.get(opts, :max_path_entries, @max_path_entries),
       # Built at the drain in `handle_continue(:open, ...)` — nil until then —
       # and completed with its live half by the first fragment to arrive after.
-      anchor: nil
+      anchor: nil,
+      # The monitor on the ring this clip is fed by, taken at the drain. The
+      # subscription is one-shot — the ring holds it in its own state — so a
+      # ring that dies takes the feed with it and no later ring inherits it.
+      ring_ref: nil,
+      # Set by that ring's `:DOWN`. Nothing more can arrive after it, so it is
+      # half of what makes this clip an orphan; the owner is the other half.
+      ring_lost?: false,
+      # The process that will cast `{:finalize, event}`, and its monitor. It is
+      # the only process holding the event's CURRENT labels, scores and
+      # trigger; the copy here is the one this clip opened with and goes stale
+      # from the first detection. So an owned clip is never closed from here
+      # with local state — see the ring's `:DOWN`. `nil` for a caller that
+      # names none (`Cairn.CameraTracker`, until S3).
+      owner: Keyword.get(opts, :owner),
+      owner_ref: monitor_owner(Keyword.get(opts, :owner))
     }
 
     {:ok, state, {:continue, :open}}
   end
+
+  defp monitor_owner(nil), do: nil
+  defp monitor_owner(pid) when is_pid(pid), do: Process.monitor(pid)
 
   @impl true
   def handle_continue(:open, state) do
@@ -173,8 +230,16 @@ defmodule Cairn.EventExtractor do
 
     with {:ok, _row} <- Events.create_active(event, path),
          {:ok, io} <- File.open(path, [:write, :binary, :raw, :delayed_write]) do
-      {:ok, %{init: init, fragments: drained}} =
+      {:ok, %{init: init, fragments: drained, owner: ring}} =
         RingBuffer.drain_and_subscribe(camera.id, nil, self())
+
+      # The ring the subscription was taken on, monitored: this clip is fed by
+      # that process and by no other. A replacement ring (a media restart)
+      # knows nothing of this subscription, so the clip is over when this one
+      # goes — see the `:DOWN` handler. `owner` from the reply rather than a
+      # Registry read, which would be a second question with a different
+      # answer available.
+      ring_ref = Process.monitor(ring)
 
       # Read here and nowhere later: the drained fragments are in hand and none
       # of them has been written yet, so this is as close as a wall clock gets
@@ -200,6 +265,7 @@ defmodule Cairn.EventExtractor do
         state
         | io: io,
           path: path,
+          ring_ref: ring_ref,
           anchor: anchor(kept, event, drain_wall_ms),
           skipped_fragments: length(dropped),
           skipped_ms: Enum.sum(Enum.map(dropped, & &1.duration_ms))
@@ -240,7 +306,67 @@ defmodule Cairn.EventExtractor do
     {:noreply, live_fragment(state, frag)}
   end
 
+  # The ring is gone, so this clip's source is gone: nothing more will ever
+  # arrive, and the subscription cannot be carried to whatever ring replaces it
+  # (`Cairn.CameraSupervisor.restart_media/2` builds a new one that has never
+  # heard of this process).
+  #
+  # The OWNER is told and then waited for. It holds the event's current labels,
+  # scores and trigger, which `Cairn.Events.finalize/2` persists; the copy here
+  # is the one this clip opened with, so closing from here would overwrite the
+  # row with stale metadata and tell nobody the window had closed. Told, the
+  # owner runs its ordinary close — `:event_ended` first, then the finalize
+  # cast that lands in this mailbox — and the clip ends the way every other
+  # clip does.
+  #
+  # Waiting costs nothing: with no ring there is nothing left to receive, and
+  # the owner is monitored, so an owner that dies without casting is caught by
+  # the clause below.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{ring_ref: ref} = state) do
+    Logger.info("event #{state.event.id}: the ring went (#{inspect(reason)})")
+    ring_lost(%{state | ring_ref: nil, ring_lost?: true})
+  end
+
+  # The owner is gone. Not a reason to close by itself: while the ring is still
+  # feeding this clip, the owner's replacement restores the checkpoint row,
+  # finds this process alive and adopts it — claiming it with `owner/2`. So
+  # this only records that there is nobody to finalize, and the orphan close
+  # below is reached solely when the media has ALSO stopped.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{owner_ref: ref} = state) do
+    Logger.info("event #{state.event.id}: the owner went (#{inspect(reason)})")
+    state = %{state | owner: :lost, owner_ref: nil}
+
+    if state.ring_lost?, do: orphan_close(state), else: {:noreply, state}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
+
+  # No owner was ever named — `Cairn.CameraTracker`'s extractors until S3 wires
+  # one. The pre-S2 behaviour is kept deliberately: the clip starves until that
+  # lane's own window closes it, with the metadata that lane holds.
+  defp ring_lost(%{owner: nil} = state) do
+    Logger.info("event #{state.event.id}: no owner to tell; the clip waits for its finalize")
+    {:noreply, state}
+  end
+
+  # There was an owner and it is dead, so nothing will ever cast a finalize and
+  # nothing more will ever arrive. Rather than hold an `:active` row and an open
+  # file for the life of the node, this process closes — the ONLY path on which
+  # it finalizes itself, and logged, because what it closes with is the clip's
+  # opening snapshot rather than the event's current state.
+  defp ring_lost(%{owner: :lost} = state) do
+    Logger.warning(
+      "event #{state.event.id}: no owner left to finalize the clip; " <>
+        "closing it here, with the metadata it opened with"
+    )
+
+    orphan_close(state)
+  end
+
+  defp ring_lost(state) do
+    send(state.owner, {:ring_lost, state.event.id})
+    {:noreply, state}
+  end
 
   @impl true
   def handle_cast({:track_boxes, %{t_ms: t_ms, boxes: boxes}}, state) do
@@ -248,6 +374,22 @@ defmodule Cairn.EventExtractor do
   end
 
   def handle_cast({:finalize, event}, state) do
+    finalize_now(state, event)
+  end
+
+  # A replacement owner claiming an adopted clip. The old monitor goes with the
+  # old owner, whose DOWN may already be in this mailbox — it is judged against
+  # the ref, so a stale one falls through to the catch-all.
+  def handle_cast({:owner, owner}, state) do
+    if state.owner_ref, do: Process.demonitor(state.owner_ref, [:flush])
+    {:noreply, %{state | owner: owner, owner_ref: Process.monitor(owner)}}
+  end
+
+  defp orphan_close(state) do
+    finalize_now(state, %{state.event | ended_at: DateTime.utc_now(), status: :finalized})
+  end
+
+  defp finalize_now(state, event) do
     snapshot_fun = Keyword.get(state.opts, :snapshot_fun, &Cairn.Snapshot.take_async/2)
 
     # The other end of `open_media/1`'s report: an event that never saw a

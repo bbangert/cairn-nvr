@@ -36,6 +36,11 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     Cairn.SnapshotHelpers.lend_cameras(camera_id)
     camera = %Camera{id: camera_id, rtsp_url: "rtsp://h/1", min_score: %{"default" => 0.5}}
 
+    # The lane will not open a clip without the ring the extractor drains
+    # (`Cairn.PresenceRecorder.start_event/3`); on a real camera it is
+    # `Cairn.Camera.Media`'s second child.
+    start_supervised!({Cairn.RingBuffer, camera_id: camera_id, pre_window_seconds: 5}, id: :ring)
+
     Event.subscribe()
 
     on_exit(fn ->
@@ -60,7 +65,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
       {PresenceRecorder,
        camera_id: ctx.camera_id,
        resolve_policy: fn _camera_id -> {camera, @policy} end,
-       start_extractor: fn _camera, event ->
+       start_extractor: fn _camera, event, _config ->
          pid = relay(test_pid)
          send(test_pid, {:extractor_started, event, pid})
          {:ok, pid}
@@ -439,11 +444,10 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     refute_received {:event_ended, %Event{camera_id: ^id}}
   end
 
-  # `Cairn.PresenceSupervisor` is `:rest_for_one` with the tables ahead of the
-  # pool, so a checkpoint-table crash takes the ledger, the aggregators and the
-  # recorders with it while the extractors — app-level siblings under
-  # `Cairn.EventSupervisor` — keep writing. Both witnesses to the event are gone
-  # at once, nothing else would ever end it (an extractor has no cap of its
+  # A checkpoint-table crash empties the ledger with it (`:rest_for_one`) while
+  # the extractors — app-level siblings under `Cairn.EventSupervisor` — keep
+  # writing, so a recorder restarting after one finds both witnesses to its
+  # event gone. Nothing else would ever end it (an extractor has no cap of its
   # own), and the camera's next confirm would open a second one beside it.
   test "an extractor still writing with no checkpoint is ended partial, then replaced", ctx do
     id = ctx.camera_id
@@ -566,7 +570,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
          resolve_policy: fn _camera_id ->
            {camera, %{@policy | record: %{"person" => %{min_score: 0.6}}}}
          end,
-         start_extractor: fn _camera, event ->
+         start_extractor: fn _camera, event, _config ->
            pid = relay(test_pid)
            send(test_pid, {:extractor_started, event, pid})
            {:ok, pid}
@@ -632,7 +636,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
             {PresenceRecorder,
              camera_id: id,
              resolve_policy: fn _camera_id -> {camera, @policy} end,
-             start_extractor: fn _camera, _event -> exit(:noproc) end,
+             start_extractor: fn _camera, _event, _config -> exit(:noproc) end,
              finalize_extractor: fn _pid, _event -> :ok end},
             id: :exiting_extractor_recorder
           )
@@ -656,11 +660,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
   test "an aggregator crash's owed cleared closes the event through the post window", ctx do
     id = ctx.camera_id
     rec = recorder(ctx)
-
-    on_exit(fn ->
-      PresenceAggregator.retire(id)
-      Registry.await_unregistered(id, :presence)
-    end)
+    start_supervised!({PresenceAggregator, camera_id: id}, id: :aggregator)
 
     base = System.monotonic_time(:millisecond)
     PresenceAggregator.observed(id, base, %{{nil, "person"} => 0.6})
@@ -681,43 +681,21 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     assert_receive {:extractor_finalized, ^ex_pid, %Event{id: ^eid}}
   end
 
-  # `Cairn.PresenceSupervisor` is `:rest_for_one` with the tables ahead of the
-  # pool, so a ledger crash restarts every aggregator and recorder while the
-  # checkpoint table — one child earlier — keeps its rows. That ordering is the
-  # whole reason an extractor is not stranded by it: the replacement recorder
-  # finds the row and adopts the clip that is still being written.
+  # `Cairn.PresenceSupervisor` holds only the two tables now: the lane workers
+  # are children of their own cameras' trees, so a ledger crash restarts none
+  # of them and cannot strand a clip. What survives is what matters — the
+  # recorder that owns the open event, and the checkpoint row one child earlier
+  # in the `:rest_for_one` order.
   #
   # Kills a process the whole application shares, so it is safe only in a
   # non-async suite.
-  test "a ledger crash restarts the pool without stranding an open extractor", ctx do
+  test "a ledger crash leaves the camera's recorder and its open clip alone", ctx do
     id = ctx.camera_id
-    # nothing may open a REAL event here: this recorder runs under the
-    # application's pool, with no stub in sight
-    CameraControl.put(id, %{recording_enabled: false})
-    on_exit(fn -> CameraControl.put(id, %{recording_enabled: true}) end)
+    rec = recorder(ctx)
 
-    on_exit(fn ->
-      PresenceAggregator.retire(id)
-      Registry.await_unregistered(id, :presence)
-      Registry.await_unregistered(id, :presence_recorder)
-    end)
-
-    base = System.monotonic_time(:millisecond)
-    PresenceAggregator.observed(id, base, %{{nil, "person"} => 0.9})
-    pooled = Registry.whereis(id, :presence_recorder)
-    assert is_pid(pooled)
-
-    # the clip a crashed predecessor left mid-write
-    extractor = relay(self())
-    event = event(ctx)
-    eid = event.id
-    PresenceCheckpoint.put!(id, event, [{nil, "person"}], extractor)
-    # leave nothing holding a clip open for the next test, even if an assertion
-    # below fails first
-    on_exit(fn ->
-      PresenceCheckpoint.delete(id)
-      Process.exit(extractor, :kill)
-    end)
+    announce(ctx, "person")
+    started(ctx)
+    assert_receive {:extractor_started, %Event{id: eid}, ex_pid}
 
     ledger = Process.whereis(Cairn.PresenceLedger)
     ref = Process.monitor(ledger)
@@ -725,19 +703,495 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     assert_receive {:DOWN, ^ref, :process, ^ledger, _reason}
     assert await_new_ledger(ledger)
 
-    # the pool went with it…
-    Registry.await_unregistered(id, :presence_recorder)
-    # …and the row it was writing did not
-    assert {%Event{id: ^eid}, [{nil, "person"}], ^extractor, _slots} =
-             PresenceCheckpoint.get(id)
+    assert Registry.whereis(id, :presence_recorder) == rec
 
-    assert {:ok, replacement} = PresenceRecorder.ensure(id)
-    assert replacement != pooled
-
-    state = :sys.get_state(replacement)
+    # the `:sys.get_state/1` is the liveness assertion: it would exit if this
+    # process had gone with the ledger
+    state = :sys.get_state(rec)
     assert state.event.id == eid
-    assert state.extractor == extractor
-    refute_received {:event_started, %Event{camera_id: ^id}}
+    assert state.extractor == ex_pid
+    assert {%Event{id: ^eid}, [{nil, "person"}], ^ex_pid, _slots} = PresenceCheckpoint.get(id)
+  end
+
+  # What `Cairn.Camera.Lane`'s child order buys, and the only place it shows:
+  # a whole-lane start, no live batches, an event checkpointed against keys the
+  # ledger still announces. The recorder starts first, so it restores those
+  # keys as present, and the aggregator's `init/1` clear — which deletes the
+  # same ledger rows — lands in a live mailbox and starts the close clock. The
+  # event ends at its post window.
+  #
+  # Started the other way round the clear reaches nobody, and the row this
+  # process restores from names keys the ledger no longer holds: they are
+  # dropped as ghosts (`still_announced/2`), which arms the same clock by
+  # another door — so what the order really decides is `adopt_announced/1`,
+  # pinned by the test below it.
+  test "a whole-lane start closes a restored event at its post window", ctx do
+    id = ctx.camera_id
+    extractor = relay(self())
+    event = event(ctx)
+    eid = event.id
+    announce(ctx, "person")
+    PresenceCheckpoint.put!(id, event, [{nil, "person"}], extractor)
+
+    rec = start_lane(ctx)
+
+    state = :sys.get_state(rec)
+    assert state.event.id == eid
+    assert state.present_labels == MapSet.new()
+    assert state.post_token != nil
+
+    fire(rec, :post_window, eid)
+    assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
+    assert_receive {:extractor_finalized, ^extractor, %Event{id: ^eid}}
+  end
+
+  # The order's real consequence. An announced key with no checkpoint is a
+  # `presence_started` the recorder was down for, and nothing will mention it
+  # again — a key the aggregator holds as present never confirms twice. Only
+  # `adopt_announced/1` can open its clip, and only if it reads the ledger
+  # before the aggregator's `init/1` deletes those rows. Started second, the
+  # recorder finds an empty ledger and the whole stay goes unrecorded.
+  test "a whole-lane start records a presence announced while the lane was down", ctx do
+    id = ctx.camera_id
+    PresenceLedger.announced(id, nil, "person", DateTime.add(DateTime.utc_now(), -20), 0.9)
+
+    rec = start_lane(ctx)
+
+    assert_receive {:extractor_started, %Event{id: eid, max_scores: %{"person" => 0.9}}, _pid}
+    assert_receive {:event_started, %Event{id: ^eid}}
+    # and the aggregator's own clear, which followed, closed it through the
+    # post window rather than leaving it to the cap
+    assert :sys.get_state(rec).post_token != nil
+    assert PresenceLedger.leftovers(id) == []
+  end
+
+  # `Cairn.PresenceLedger`'s table is owned by its process and has no heir, so
+  # between a crash and the supervisor recreating it there is no table at all —
+  # and a `Cairn.PresenceAggregator`, being its camera's child rather than the
+  # table's, is still running and still being fed. A raise from the write would
+  # take it down with a table it only borrows, and its restart's `init/1` reads
+  # the same missing table.
+  #
+  # Here rather than in `Cairn.PresenceAggregatorTest`, which is `async: true`:
+  # the table is node-wide, and removing it would break whatever else is
+  # running. `:ets.delete/1` from inside the owner rather than killing it: the
+  # supervisor's restart is far too fast to race a cast against, and the window
+  # — table gone, callers alive — is what has to be exercised.
+  test "a batch during the ledger's restart window does not take the aggregator down", ctx do
+    id = ctx.camera_id
+    start_supervised!({PresenceAggregator, camera_id: id}, id: :aggregator)
+    CameraControl.put(id, %{recording_enabled: false})
+
+    base = System.monotonic_time(:millisecond)
+    PresenceAggregator.observed(id, base, %{{nil, "person"} => 0.9})
+    PresenceAggregator.observed(id, base + 500, %{{nil, "person"} => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+
+    aggregator = Registry.whereis(id, :presence)
+    ledger = Process.whereis(Cairn.PresenceLedger)
+    ref = Process.monitor(ledger)
+    :sys.replace_state(ledger, fn state -> :ets.delete(Cairn.PresenceLedger) && state end)
+
+    # every entry the aggregator reaches the table by, with it gone
+    assert PresenceLedger.leftovers(id) == []
+    assert PresenceLedger.announced(id, nil, "person", DateTime.utc_now(), 0.9) == :ok
+    assert PresenceLedger.cleared(id, nil, "nobody") == :ok
+
+    PresenceAggregator.observed(id, base + 1_000, %{{nil, "person"} => 0.9})
+    assert is_map(:sys.get_state(aggregator))
+    # the ledger process itself never died — only its table went
+    refute_received {:DOWN, ^ref, :process, ^ledger, _reason}
+
+    # the table back, and one more batch refills the row the window dropped
+    :sys.replace_state(ledger, fn state ->
+      :ets.new(Cairn.PresenceLedger, [:named_table, :public, :set, write_concurrency: true])
+      state
+    end)
+
+    PresenceAggregator.observed(id, base + 1_500, %{{nil, "person"} => 0.9})
+    _ = :sys.get_state(aggregator)
+    assert [{nil, "person", _at, 0.9}] = PresenceLedger.leftovers(id)
+  end
+
+  # `Cairn.PresenceCheckpoint`'s window, the ledger's twin one child earlier in
+  # the same `:rest_for_one`: its table dies with it and its callers do not, so
+  # every tier-1 recorder on the node is still writing checkpoints into
+  # nothing. Two halves, because the API has two shapes — a `put/5` that finds
+  # no process (a `GenServer.call` that exits) and a `get/1`, `delete/1` or
+  # `all/0` that finds no table.
+  #
+  # Neither half kills anything: the name is unregistered and put back, and the
+  # table is deleted from its owner and restored by stopping it so the
+  # supervisor builds a fresh one. A kill would race its own restart, and this
+  # suite shares the node's real presence tree.
+  test "a checkpoint crash's window does not take the recorders with it", ctx do
+    id = ctx.camera_id
+    rec = recorder(ctx)
+
+    announce(ctx, "person")
+    started(ctx)
+    assert_receive {:extractor_started, %Event{id: eid}, _pid}
+    # the stub reports from inside the open, so the row lands after it
+    _ = :sys.get_state(rec)
+    assert {%Event{id: ^eid}, _keys, _pid, _slots} = PresenceCheckpoint.get(id)
+
+    checkpoint = Process.whereis(Cairn.PresenceCheckpoint)
+
+    # the write path with no process behind the name
+    Process.unregister(Cairn.PresenceCheckpoint)
+    assert PresenceCheckpoint.put(id, event(ctx), [], nil) == :ok
+    Process.register(checkpoint, Cairn.PresenceCheckpoint)
+
+    # and the table paths with no table
+    on_exit(fn -> restore_checkpoint_table() end)
+
+    :sys.replace_state(checkpoint, fn state ->
+      :ets.delete(:cairn_active_presence_events) && state
+    end)
+
+    assert PresenceCheckpoint.get(id) == nil
+    assert PresenceCheckpoint.delete(id) == :ok
+    assert PresenceCheckpoint.all() == []
+
+    # a live recorder writing through the window survives it — and so does the
+    # owner it writes to, which would otherwise crash-loop for as long as any
+    # camera kept checkpointing
+    frames(ctx, [object("person", 0.95, "detected", [0.2, 0.2, 0.2, 0.2])])
+    assert :sys.get_state(rec).event.id == eid
+    # answering is the liveness claim; a pid can read as alive after its exit
+    assert is_map(:sys.get_state(checkpoint))
+
+    # and a recorder that restarts inside the window comes up rather than
+    # crash-looping on a table its `init/1` cannot read. What it cannot do is
+    # restore: with no row to read it treats the camera as one with nothing
+    # open, and the announced key the ledger still holds opens a fresh clip —
+    # which is the same state, and the same sweep, as a row that was never
+    # written.
+    Process.exit(rec, :kill)
+    replacement = await_recorder(id, rec)
+    state = :sys.get_state(replacement)
+    assert state.event != nil and state.event.id != eid
+  end
+
+  # The owner recreates the table in `init/1`, so stopping it is how a test
+  # that removed the table hands the node a healthy one back.
+  defp restore_checkpoint_table do
+    case Process.whereis(Cairn.PresenceCheckpoint) do
+      nil ->
+        :ok
+
+      pid ->
+        if :ets.whereis(:cairn_active_presence_events) == :undefined do
+          GenServer.stop(pid, :shutdown)
+          await_new_checkpoint(pid)
+        end
+
+        :ok
+    end
+  end
+
+  # The clip's dependency on its ring, end to end and with both real: the
+  # subscription lives in the ring's state, so a ring that dies — a media
+  # replacement, or a crash — takes the feed with it and no replacement
+  # inherits it. The extractor monitors the ring it drained and closes the clip
+  # `:finalized` rather than writing into nothing; the recorder reads that as
+  # the event's end, and the presence still standing opens the next clip on the
+  # next ring.
+  #
+  # Here rather than in the sibling suite because the recorder decides
+  # `:finalized` from the INDEX row the extractor wrote — the one thing that
+  # keeps the two from disagreeing — and that needs a reachable index.
+  test "a ring that goes ends the clip through its owner, with the CURRENT event", ctx do
+    id = ctx.camera_id
+    test_pid = self()
+
+    dir = Path.join(System.tmp_dir!(), "cairn_ringgo_#{System.unique_integer([:positive])}")
+    Cairn.DataDir.ensure!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    config = %Cairn.Config{data_dir: dir, remux_clips: false}
+
+    # the suite's setup ring is the one this clip will be fed by
+    assert is_pid(Cairn.Registry.whereis(id, :ring_buffer))
+    fill_ring(id)
+
+    rec =
+      start_supervised!(
+        {PresenceRecorder,
+         camera_id: id,
+         resolve_policy: fn _camera_id -> {ctx.camera, @policy} end,
+         start_extractor: fn camera, event, _config ->
+           # `self()` is the recorder: the seam runs in its process, and the
+           # owner is what the real `start_extractor/3` names too
+           result =
+             Cairn.EventExtractor.start(camera, event,
+               identity: :label,
+               config: config,
+               owner: self()
+             )
+
+           send(test_pid, {:started_real, event, result})
+           result
+         end},
+        id: :ring_recorder
+      )
+
+    announce(ctx, "person")
+    started(ctx)
+    assert_receive {:started_real, %Event{id: first} = opened, {:ok, extractor}}
+    # the snapshot the extractor holds, and will hold forever
+    assert Map.keys(opened.max_scores) == ["person"]
+    ref = Process.monitor(extractor)
+    # `handle_continue(:open, _)` runs before any other message, so one state
+    # read is the barrier for the drain and the ring monitor it takes
+    assert :sys.get_state(extractor).ring_ref != nil
+
+    # the event moves on: a label the clip did not open with
+    frames(ctx, [object("cat", 0.95, "detected", [0.2, 0.2, 0.2, 0.2])])
+    assert :sys.get_state(rec).event.max_scores["cat"] == 0.95
+
+    log =
+      capture_log(fn ->
+        # the ring goes, as `restart_media/2` takes it
+        :ok = stop_supervised(:ring)
+
+        # the OWNER closes it, and what it hands over is the current event
+        assert_receive {:event_ended,
+                        %Event{id: ^first, status: :finalized, max_scores: ended_scores}},
+                       2_000
+
+        assert ended_scores["cat"] == 0.95
+        assert_receive {:DOWN, ^ref, :process, ^extractor, :normal}, 5_000
+      end)
+
+    # The owner closed it, not the extractor: the orphan close is the only
+    # path that warns, and the test env logs at `:warning`, so its absence is
+    # the assertion available here. What the owner handed over is asserted
+    # above and below.
+    refute log =~ "closing it here"
+
+    # the row the extractor wrote carries what the owner handed it, not the
+    # snapshot it opened with
+    row = Events.get(first)
+    assert row.status == :finalized
+    assert row.labels["max_scores"]["cat"] == 0.95
+    # exactly one lifecycle end for this event
+    refute_received {:event_ended, %Event{id: ^first}}
+
+    # the recorder let the event go and is waiting for a ring to open the next
+    state = :sys.get_state(rec)
+    assert state.event == nil
+    assert MapSet.member?(state.present_labels, {nil, "person"})
+    assert state.retry_token != nil
+    assert PresenceCheckpoint.get(id) == nil
+
+    # the replacement ring arrives, and the retry opens the second clip on it
+    start_supervised!({Cairn.RingBuffer, camera_id: id, pre_window_seconds: 5}, id: :new_ring)
+    fill_ring(id)
+    send(rec, {:retry_open, :sys.get_state(rec).retry_token})
+
+    assert_receive {:started_real, %Event{id: second}, {:ok, next}}, 2_000
+    assert second != first
+    # awaited, so nothing writes under this test's directory during cleanup
+    next_ref = Process.monitor(next)
+    Cairn.EventExtractor.finalize(next, %Event{event(ctx) | id: second, status: :finalized})
+    assert_receive {:DOWN, ^next_ref, :process, ^next, :normal}, 5_000
+  end
+
+  # The one close the extractor performs itself: its owner is gone, so nothing
+  # will ever cast a finalize and the alternative is an `:active` row and an
+  # open file for the life of the node. Logged, because the metadata it closes
+  # with is the clip's opening snapshot.
+  test "an extractor whose owner is gone closes its own clip on ring loss", ctx do
+    id = ctx.camera_id
+
+    dir = Path.join(System.tmp_dir!(), "cairn_orphring_#{System.unique_integer([:positive])}")
+    Cairn.DataDir.ensure!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    config = %Cairn.Config{data_dir: dir, remux_clips: false}
+
+    fill_ring(id)
+    owner = spawn(fn -> Process.sleep(:infinity) end)
+    event = event(ctx)
+    eid = event.id
+
+    {:ok, extractor} =
+      Cairn.EventExtractor.start(ctx.camera, event,
+        identity: :label,
+        config: config,
+        owner: owner
+      )
+
+    ref = Process.monitor(extractor)
+    assert :sys.get_state(extractor).ring_ref != nil
+
+    log =
+      capture_log(fn ->
+        # the owner first, so the extractor is already ownerless when the ring
+        # goes — the order a lane owner crashing and its media restarting has
+        owner_ref = Process.monitor(owner)
+        Process.exit(owner, :kill)
+        assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}
+        # the extractor's own DOWN for that owner was enqueued at the same
+        # exit, so it is ahead of this read in its mailbox
+        assert :sys.get_state(extractor).owner == :lost
+
+        :ok = stop_supervised(:ring)
+        assert_receive {:DOWN, ^ref, :process, ^extractor, :normal}, 5_000
+      end)
+
+    assert log =~ "closing it here"
+    assert Events.get(eid).status == :finalized
+  end
+
+  # A replacement owner claims the clip it adopted, so a ring lost afterwards
+  # is closed by the process that has the event's current state — not by the
+  # extractor with the metadata a dead recorder opened it with.
+  test "an adopted extractor is finalized by its new owner, not orphaned", ctx do
+    id = ctx.camera_id
+    test_pid = self()
+
+    dir = Path.join(System.tmp_dir!(), "cairn_adopt_#{System.unique_integer([:positive])}")
+    Cairn.DataDir.ensure!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    config = %Cairn.Config{data_dir: dir, remux_clips: false}
+
+    fill_ring(id)
+
+    rec =
+      start_supervised!(
+        {PresenceRecorder,
+         camera_id: id,
+         resolve_policy: fn _camera_id -> {ctx.camera, @policy} end,
+         start_extractor: fn camera, event, _config ->
+           # `self()` is the recorder: the seam runs in its process, and the
+           # owner is what the real `start_extractor/3` names too
+           result =
+             Cairn.EventExtractor.start(camera, event,
+               identity: :label,
+               config: config,
+               owner: self()
+             )
+
+           send(test_pid, {:started_real, event, result})
+           result
+         end},
+        id: :adopt_recorder
+      )
+
+    announce(ctx, "person")
+    started(ctx)
+    assert_receive {:started_real, %Event{id: eid}, {:ok, extractor}}
+    assert :sys.get_state(extractor).ring_ref != nil
+    assert :sys.get_state(extractor).owner == rec
+
+    Process.exit(rec, :kill)
+    replacement = await_recorder(id, rec)
+    # the replacement answering proves its `init/1` returned, and so that the
+    # claim below was sent; the extractor answering proves it landed
+    assert :sys.get_state(replacement).event.id == eid
+    # the claim, without which the ring loss below would orphan-close
+    assert :sys.get_state(extractor).owner == replacement
+
+    ref = Process.monitor(extractor)
+
+    log =
+      capture_log(fn ->
+        :ok = stop_supervised(:ring)
+        assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}, 2_000
+        assert_receive {:DOWN, ^ref, :process, ^extractor, :normal}, 5_000
+      end)
+
+    # closed by the replacement owner, not orphaned — see the test above on why
+    # the absence of the orphan's warning is what is asserted
+    refute log =~ "closing it here"
+  end
+
+  # The orphaned-finalize contract, with a REAL extractor: the recorder casts
+  # the finalize from `terminate/2` and returns without awaiting it, and the
+  # extractor — `:temporary` under `Cairn.EventSupervisor`, outside the camera's
+  # tree — runs its close to `:finalized` on its own.
+  test "a stopped recorder's extractor finalizes itself, with nobody waiting", ctx do
+    id = ctx.camera_id
+    test_pid = self()
+
+    dir = Path.join(System.tmp_dir!(), "cairn_orphan_#{System.unique_integer([:positive])}")
+    Cairn.DataDir.ensure!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    # The clip's own config: remux off, so the close is the write and nothing
+    # else — this is about who casts the finalize, not what a remux costs. What
+    # that leaves unproven is the slow variant: `Cairn.ClipRemux` allows 60 s
+    # while `Cairn.EventSupervisor`'s children take the default 5 s shutdown, so
+    # a finalize cast at NODE shutdown with remux on can still be killed
+    # mid-remux and leave an `:active` row for boot reconciliation. Nothing in
+    # this PR changed that bound; it only made the path reachable at shutdown.
+    config = %Cairn.Config{data_dir: dir, remux_clips: false}
+    fill_ring(id)
+
+    rec =
+      start_supervised!(
+        {
+          PresenceRecorder,
+          # the real seams: an extractor under `Cairn.EventSupervisor`, and the
+          # default `Cairn.EventExtractor.finalize/2` as the close
+          camera_id: id,
+          resolve_policy: fn _camera_id -> {ctx.camera, @policy} end,
+          start_extractor: fn camera, event, _config ->
+            result = Cairn.EventExtractor.start(camera, event, identity: :label, config: config)
+            send(test_pid, {:started_real, event, result})
+            result
+          end
+        },
+        id: :orphan_recorder
+      )
+
+    started(ctx)
+    assert_receive {:started_real, %Event{id: eid}, {:ok, extractor}}
+    ref = Process.monitor(extractor)
+    rec_ref = Process.monitor(rec)
+
+    :ok = stop_supervised(:orphan_recorder)
+
+    assert_receive {:DOWN, ^rec_ref, :process, ^rec, _shutdown}
+    assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
+    # the extractor outlived the recorder and closed itself
+    assert_receive {:DOWN, ^ref, :process, ^extractor, :normal}, 5_000
+    assert Events.get(eid).status == :finalized
+  end
+
+  # Real media in the ring, so the clip the extractor closes has something in
+  # it: a clip with no media closes `:partial` by the extractor's own rule,
+  # which would say nothing about who finalized it.
+  defp fill_ring(camera_id) do
+    {_demuxer, events} =
+      Cairn.MP4.Demuxer.push(
+        Cairn.MP4.Demuxer.new(camera_id),
+        File.read!("test/support/fixtures/media/testsrc.fmp4")
+      )
+
+    [{:init, init} | fragments] = events
+
+    Cairn.RingBuffer.put_init(
+      camera_id,
+      init.data,
+      init.codec,
+      init.timescale,
+      Cairn.ULID.generate()
+    )
+
+    for {:fragment, fragment} <- fragments,
+        do: Cairn.RingBuffer.put_fragment(camera_id, fragment)
+  end
+
+  # A tier-1 lane starting whole, in `Cairn.Camera.Lane`'s order and with its
+  # `:one_for_one` semantics: the recorder, then the aggregator. Returns the
+  # recorder, drained of the aggregator's `init/1` casts — the aggregator's own
+  # `:sys.get_state/1` proves they were sent, the recorder's that they landed.
+  defp start_lane(ctx) do
+    rec = recorder(ctx)
+    agg = start_supervised!({PresenceAggregator, camera_id: ctx.camera_id}, id: :aggregator)
+    _ = :sys.get_state(agg)
+    _ = :sys.get_state(rec)
+    rec
   end
 
   defp await_post_armed(recorder, attempts \\ 100),
@@ -759,6 +1213,20 @@ defmodule Cairn.PresenceRecorderRestoreTest do
 
       true ->
         flunk("the recorder #{what}")
+    end
+  end
+
+  defp await_new_checkpoint(dead, attempts \\ 200) do
+    case Process.whereis(Cairn.PresenceCheckpoint) do
+      pid when is_pid(pid) and pid != dead ->
+        true
+
+      _absent when attempts > 0 ->
+        Process.sleep(10)
+        await_new_checkpoint(dead, attempts - 1)
+
+      _absent ->
+        flunk("the presence checkpoint never came back")
     end
   end
 

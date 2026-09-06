@@ -12,21 +12,27 @@ defmodule Cairn.PresenceAggregatorTest do
     camera_id = "pres_#{System.unique_integer([:positive])}"
     Event.subscribe()
 
-    # A confirm here would otherwise open a real recording:
-    # `Cairn.PresenceRecorder` starts beside every aggregator, and a camera
-    # the config does not name has no `record:` block to refuse anything.
-    # This suite is about the transitions, not the lane they drive.
+    # A confirm here would otherwise open a real recording if a recorder were
+    # running beside this aggregator — this suite runs it alone, and the flag
+    # keeps that true even for a camera the config does not name (no `record:`
+    # block refuses anything). This suite is about the transitions, not the
+    # lane they drive.
     Cairn.CameraControl.put(camera_id, %{recording_enabled: false})
 
-    # Aggregators live in the application-wide pool; without this every
-    # test leaks a timer-bearing control subscriber for the suite's life.
-    on_exit(fn ->
-      PresenceAggregator.retire(camera_id)
-      Registry.await_unregistered(camera_id, :presence)
-      Registry.await_unregistered(camera_id, :presence_recorder)
-    end)
+    # Started here, as a tier-1 camera's `Cairn.Camera.Lane` starts it: nothing
+    # on the data path creates one any more. `start_supervised!` also supplies
+    # the `:transient` restart the crash-recovery cases below exercise, and
+    # stops it — reason `:shutdown`, so `terminate/2` runs — at test end.
+    start_supervised!({PresenceAggregator, camera_id: camera_id}, id: :aggregator)
 
     %{camera_id: camera_id}
+  end
+
+  test "an observation for a camera with no aggregator starts none" do
+    id = "pres_none_#{System.unique_integer([:positive])}"
+
+    assert PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.9}) == :ok
+    assert Registry.whereis(id, :presence) == nil
   end
 
   test "a single sighting alone broadcasts nothing", %{camera_id: id} do
@@ -329,6 +335,33 @@ defmodule Cairn.PresenceAggregatorTest do
                     %PresenceEvent{camera_id: ^id, zone: nil, label: "person", score: 0.9}}
   end
 
+  # This process survives a `Cairn.PresenceLedger` crash — it is its camera's
+  # child, not the table's — and presence is edge-only, so a key already
+  # `:present` never announces again. Rewriting the row on every sighting is
+  # therefore the only thing that can refill an emptied table, and
+  # `Cairn.PresenceRecorder` reads it to segment a clip at `max_event` and to
+  # tell a restored key from a ghost.
+  test "a present key's ledger row is rewritten on every sighting", %{camera_id: id} do
+    PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.9})
+    PresenceAggregator.observed(id, @base + 500, %{{nil, "person"} => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+    assert [{nil, "person", _at, 0.9}] = PresenceLedger.leftovers(id)
+
+    # what a crash of the table leaves for this camera
+    PresenceLedger.cleared(id, nil, "person")
+    assert PresenceLedger.leftovers(id) == []
+
+    # One batch that still sees it, at a WORSE score: the row comes back
+    # carrying the best over the whole stay, which is what the cleared
+    # contract promises and what a segment opened from it should claim.
+    PresenceAggregator.observed(id, @base + 1_000, %{{nil, "person"} => 0.7})
+    _ = :sys.get_state(Registry.whereis(id, :presence))
+
+    assert [{nil, "person", _at, 0.9}] = PresenceLedger.leftovers(id)
+    # and nothing was re-announced to subscribers: presence is still edge-only
+    refute_received {:presence_started, %PresenceEvent{camera_id: ^id}}
+  end
+
   test "a crash's unanswered zoned presence_started clears under its zone", %{camera_id: id} do
     PresenceAggregator.observed(id, @base, %{{"drive", "person"} => 0.6})
     PresenceAggregator.observed(id, @base + 500, %{{"drive", "person"} => 0.9})
@@ -364,25 +397,25 @@ defmodule Cairn.PresenceAggregatorTest do
     refute_receive {:presence_cleared, %PresenceEvent{camera_id: ^id}}, 50
   end
 
-  test "retire/1 clears, stops, and stays gone until the next batch", %{camera_id: id} do
+  # What a disable or a delete is now: the camera's tree stops this process,
+  # and `terminate/2` pays the every-started-gets-a-cleared invariant. No
+  # imperative retire, and nothing restarts it — a batch cannot.
+  test "a graceful stop clears what it holds, and nothing brings it back", %{camera_id: id} do
     PresenceAggregator.observed(id, @base, %{{nil, "person"} => 0.6})
     PresenceAggregator.observed(id, @base + 500, %{{nil, "person"} => 0.9})
     assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
 
     pid = Registry.whereis(id, :presence)
     ref = Process.monitor(pid)
-    PresenceAggregator.retire(id)
+    :ok = stop_supervised(:aggregator)
 
     assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, zone: nil, label: "person"}}
-    # A normal stop: `:transient` must not restart it, and the registry
-    # entry dies with the process — awaited, since the registry's own DOWN
-    # handling races the test's monitor.
-    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+    assert_receive {:DOWN, ^ref, :process, ^pid, _shutdown}
     Registry.await_unregistered(id, :presence)
     assert Registry.whereis(id, :presence) == nil
 
-    # Retiring a camera that has no aggregator is the common (tracked) case.
-    assert PresenceAggregator.retire("no_such_#{System.unique_integer([:positive])}") == :ok
+    PresenceAggregator.observed(id, @base + 9_000, %{{nil, "person"} => 0.9})
+    assert Registry.whereis(id, :presence) == nil
   end
 
   test "silence alone (no batches at all) never clears presence", %{camera_id: id} do

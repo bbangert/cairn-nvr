@@ -127,7 +127,9 @@ defmodule Cairn.Config.ServerUpdateTest do
     assert_receive {:config_changed, %{added: ["cam_a"]}}
 
     assert {:ok, _diff, _warnings} = Config.Server.reload(server)
-    assert_receive {:config_changed, %{added: [], changed: [], refreshed: [], removed: []}}
+
+    assert_receive {:config_changed,
+                    %{added: [], changed: [], rebuilt: [], refreshed: [], removed: []}}
   end
 
   describe "expected_version:" do

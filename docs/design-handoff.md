@@ -113,8 +113,10 @@ Read-only render of the active YAML config + reload workflow.
   + warning states: non-H.264 camera → warning chip "switch camera to
   H.264 or enable transcode"; `transcode_unavailable` → error chip.
 - **Reload button**: `phx-click="reload"`. Result states to design:
-  - success: diff summary (added/removed/changed camera id chips) +
-    warnings list (yellow)
+  - success: diff summary (added/removed/changed/rebuilt/refreshed camera
+    id chips; `changed` and `rebuilt` both read as "restarted", `refreshed`
+    as "updated" — a refreshed camera keeps its stream) + warnings list
+    (yellow)
   - failure: error list (red) + "previous config still active" notice
 - Last-load warnings/errors shown persistently under a "Config health"
   heading (assigns: `@last_load.warnings`, `@last_load.errors`).

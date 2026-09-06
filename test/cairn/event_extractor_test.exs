@@ -84,6 +84,53 @@ defmodule Cairn.EventExtractorTest do
     }
   end
 
+  # The tracked lane names no owner (S3 wires one), and until it does a ring
+  # that goes must change nothing here: the clip starves until that lane's own
+  # window closes it, with the metadata that lane holds. Closing from here
+  # would overwrite the row with the snapshot this process opened with.
+  test "an extractor with no owner ignores a ring that goes", %{
+    camera: camera,
+    config: config,
+    frags: frags
+  } do
+    event = new_event(camera)
+    test_pid = self()
+
+    pid =
+      start_supervised!(
+        {EventExtractor,
+         camera: camera,
+         event: event,
+         config: config,
+         snapshot_fun: fn row, _cfg -> send(test_pid, {:snapshot_requested, row.id}) end}
+      )
+
+    ref = Process.monitor(pid)
+    assert %{status: :active} = wait_row(event.id)
+    assert :sys.get_state(pid).owner == nil
+
+    # real media, so the close below is a clip and not the no-media path
+    Enum.each(frags, &RingBuffer.put_fragment(camera.id, &1))
+    wait_until(fn -> :sys.get_state(pid).fragments == length(frags) end)
+
+    ring = Cairn.Registry.whereis(camera.id, :ring_buffer)
+    ring_ref = Process.monitor(ring)
+    :ok = stop_supervised(Cairn.RingBuffer)
+    assert_receive {:DOWN, ^ring_ref, :process, ^ring, _reason}
+
+    # it noticed and did nothing: still running, still `:active`
+    state = :sys.get_state(pid)
+    assert state.ring_lost?
+    refute_received {:DOWN, ^ref, :process, ^pid, _reason}
+    assert Events.get(event.id).status == :active
+
+    # and its owner's finalize still lands, with that owner's metadata
+    finalized = %{event | ended_at: DateTime.utc_now(), status: :finalized}
+    EventExtractor.finalize(pid, finalized)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 2_000
+    assert Events.get(event.id).status == :finalized
+  end
+
   test "writes pre-window + live fragments into a valid clip and finalizes",
        %{camera: camera, config: config, frags: frags} do
     {pre, live} = Enum.split(frags, 2)

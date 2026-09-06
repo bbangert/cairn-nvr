@@ -5,10 +5,13 @@ defmodule Cairn.PresenceRecorder do
   recording.
 
   One process per camera, registered as `Cairn.Registry.via(camera_id,
-  :presence_recorder)` and started beside the camera's
-  `Cairn.PresenceAggregator` in `Cairn.PresenceSupervisor`'s pool. It is fed
-  two streams, both direct casts from the same node (no PubSub on the trigger
-  path):
+  :presence_recorder)` and started by the camera's own tree — the FIRST child
+  of `Cairn.Camera.Lane` on a tier-1 camera, ahead of the
+  `Cairn.PresenceAggregator` that feeds it, so that this process is already
+  listening when that one's `init/1` clears what its predecessor announced
+  (see the lane for why that decides the order). A stopping camera therefore
+  stops the aggregator first and this process last. It is fed two streams,
+  both direct casts from the same node (no PubSub on the trigger path):
 
     * **transitions**, from the aggregator, at the points it broadcasts a
       `Cairn.PresenceEvent`. Presence is per `{zone, label}` — a zone id, or
@@ -111,11 +114,6 @@ defmodule Cairn.PresenceRecorder do
   # is mailbox slack. Anything older describes a scene this event was not
   # opened for.
   @pending_max_age_ms 3_000
-  # One camera start's worth of patience for an adoptee that is dying — see
-  # `adopt/3`. Small and bounded because the alternative to waiting is starting
-  # a second recorder for a camera that still has one.
-  @adopt_attempts 3
-  @adopt_retry_ms 20
   # How long a lane waits before trying an open again after one failed
   # (`arm_retry/1`). Short against every window it competes with — the post
   # window's 10 s, the cap's 300 s — so a supervisor that was mid-restart is
@@ -128,14 +126,16 @@ defmodule Cairn.PresenceRecorder do
   @doc """
   Starts the recorder for one camera.
 
-  `:camera_id` is required. `:name` defaults to this camera's registered
-  via-tuple; `nil` starts it unregistered, which is how a test drives one
-  directly. `:resolve_policy`, `:start_extractor`, `:finalize_extractor` and
-  `:monotonic_ms` are injection seams documented at their defaults in
-  `init/1`.
+  `Cairn.Camera.Lane` passes the pair the tree resolved (`camera:`, `config:`),
+  which seeds the policy this process applies until its first re-resolve; a
+  test may name the camera by `camera_id:` alone. `:name` defaults to this
+  camera's registered via-tuple; `nil` starts it unregistered, which is how a
+  test drives one directly. `:resolve_policy`, `:start_extractor`,
+  `:finalize_extractor` and `:monotonic_ms` are injection seams documented at
+  their defaults in `init/1`.
   """
   def start_link(opts) do
-    camera_id = Keyword.fetch!(opts, :camera_id)
+    camera_id = camera_id!(opts)
 
     case Keyword.get(opts, :name, Cairn.Registry.via(camera_id, :presence_recorder)) do
       nil -> GenServer.start_link(__MODULE__, opts)
@@ -143,67 +143,11 @@ defmodule Cairn.PresenceRecorder do
     end
   end
 
-  @doc """
-  The recorder for `camera_id`, started under `Cairn.PresenceSupervisor.Pool`
-  if it is not running yet.
-
-  Called where the aggregator is ensured, so the two are always started
-  together; a caller on the frame path uses `frames/3`, which never starts one.
-
-  An existing recorder is **adopted, not merely found**: a camera whose media
-  is replaced under a changed config is retired (latching `retire/1`) and
-  comes back still tier 1, and the recorder that outlived the replacement for
-  its open event is the one the new session gets. Un-latching it here is what
-  keeps it: the latch is paid when the event closes, and this is the only
-  call that says the camera came back. A camera that really left never
-  reaches here again, so its latch still stops it.
-
-  The un-latching is a **call**, and that is the whole point. The registry is a
-  stale-read site and a `:retire` may already be in the mailbox ahead of us: a
-  cast would be accepted by a process that then stops without ever handling it,
-  and this function would hand back a pid the lane is about to lose — with
-  nothing ever calling `ensure/1` again to notice. A reply proves the latch is
-  off. An exit means the adoptee was dying, so the lookup is retried and a
-  vacant registry starts a fresh recorder.
-  """
-  @spec ensure(String.t()) :: {:ok, pid()} | {:error, term()}
-  def ensure(camera_id), do: ensure(camera_id, @adopt_attempts)
-
-  defp ensure(camera_id, attempts) do
-    case Cairn.Registry.whereis(camera_id, :presence_recorder) do
-      pid when is_pid(pid) -> adopt(camera_id, pid, attempts)
-      nil -> start_recorder(camera_id)
+  defp camera_id!(opts) do
+    case Keyword.fetch(opts, :camera_id) do
+      {:ok, id} -> id
+      :error -> Keyword.fetch!(opts, :camera).id
     end
-  end
-
-  # The sleep is affordable exactly here: this runs when a camera's presence
-  # tree is being started, once, and never on the frame path. What it waits out
-  # is the registry's unregistration, which rides the DOWN the partition sends
-  # itself — so a corpse can still answer `whereis` for a moment after the
-  # process that would have replied is gone.
-  defp adopt(camera_id, pid, attempts) do
-    :ok = GenServer.call(pid, :resume)
-    {:ok, pid}
-  catch
-    :exit, _dying when attempts > 0 ->
-      Process.sleep(@adopt_retry_ms)
-      ensure(camera_id, attempts - 1)
-
-    :exit, reason ->
-      {:error, reason}
-  end
-
-  defp start_recorder(camera_id) do
-    case DynamicSupervisor.start_child(
-           Cairn.PresenceSupervisor.Pool,
-           {__MODULE__, camera_id: camera_id}
-         ) do
-      {:ok, pid} -> {:ok, pid}
-      {:error, {:already_started, pid}} -> {:ok, pid}
-      {:error, reason} -> {:error, reason}
-    end
-  catch
-    :exit, reason -> {:error, reason}
   end
 
   @doc """
@@ -237,17 +181,12 @@ defmodule Cairn.PresenceRecorder do
   end
 
   @doc """
-  The camera is going away: stop, unless an event is open.
-
-  An open event outlives the retire — its clip is being written and its post
-  window is what closes it — so this only latches, and the process stops when
-  the event does. The aggregator retires this process first and flushes its own
-  labels immediately after, so the cleareds that close the event are on their
-  way here; the latch is also what keeps the cap from segmenting into a clip
-  for a camera that is leaving (`resegment/2`).
+  `Cairn.CameraSupervisor.refresh_camera/2`'s cast: re-resolve the policy, so
+  the NEXT event opens under the new one. An event already open keeps the
+  policy it opened with.
   """
-  @spec retire(String.t()) :: :ok
-  def retire(camera_id), do: cast(camera_id, :retire)
+  @spec refresh(String.t(), Config.Camera.t(), Config.t()) :: :ok
+  def refresh(camera_id, camera, config), do: cast(camera_id, {:refresh, camera, config})
 
   defp cast(camera_id, message) do
     case Cairn.Registry.whereis(camera_id, :presence_recorder) do
@@ -260,15 +199,34 @@ defmodule Cairn.PresenceRecorder do
 
   @impl true
   def init(opts) do
-    camera_id = Keyword.fetch!(opts, :camera_id)
+    camera_id = camera_id!(opts)
+    # The camera stopping is a graceful stop of this process, and an event
+    # still open then is finalized in `terminate/2`.
+    Process.flag(:trap_exit, true)
 
     state = %{
       camera_id: camera_id,
-      # Resolved here and again at every qualifying transition: `record:` is
-      # the gate this process exists to apply, and an operator who edits it
-      # should not have to wait for the next event to see it take.
-      camera: nil,
-      policy: nil,
+      # Seeded from the tree's resolved pair when the lane started this
+      # process, then re-resolved here and at every qualifying transition:
+      # `record:` is the gate this process exists to apply, and an operator who
+      # edits it should not have to wait for the next event to see it take. The
+      # seed is what `hold_policy/1` falls back to when the config server
+      # cannot answer during a restart.
+      camera: Keyword.get(opts, :camera),
+      policy: seed_policy(opts),
+      # The policy the OPEN event was opened under, `nil` between events. The
+      # windows an event is closed by are the ones it began with, so they are
+      # read from here and never from `policy`, which keeps moving with every
+      # refresh and every transition. Before this they were the same field, so
+      # "an in-flight event keeps its opening policy" held only until the next
+      # `presence_started` or refresh re-resolved — true in the common case,
+      # approximate in exactly the one an operator would notice.
+      event_policy: nil,
+      # The `%Cairn.Config{}` that camera and policy were resolved from, kept
+      # because the clip is written under it: `Cairn.EventExtractor` otherwise
+      # reads it by calling the config server, which this process must never
+      # make happen from `init/1` (`policy_from_config/1`).
+      config: Keyword.get(opts, :config),
       # The effective floors the sink judged the last frames against — the
       # runtime `min_score` override included, which the camera struct does
       # not carry. `nil` until the first buffer arrives, and kept by the idle
@@ -316,13 +274,12 @@ defmodule Cairn.PresenceRecorder do
       # `arm_retry/1`. Presence itself is what bounds it.
       retry_ref: nil,
       retry_token: nil,
-      retiring?: false,
       # The camera's `record:` tier and event windows, re-read at every
       # qualifying transition. Injectable because the config server is the
       # only way to reach a camera's tiers, and a test needs to drive one
       # without a config file behind it.
       resolve_policy: Keyword.get(opts, :resolve_policy, &policy_from_config/1),
-      start_extractor: Keyword.get(opts, :start_extractor, &start_extractor/2),
+      start_extractor: Keyword.get(opts, :start_extractor, &start_extractor/3),
       finalize_extractor:
         Keyword.get(opts, :finalize_extractor, &Cairn.EventExtractor.finalize/2),
       monotonic_ms: Keyword.get(opts, :monotonic_ms, &default_monotonic_ms/0)
@@ -331,10 +288,32 @@ defmodule Cairn.PresenceRecorder do
     {:ok, state |> resolve_policy() |> restore()}
   end
 
+  defp seed_policy(opts) do
+    with %Config.Camera{} = cam <- Keyword.get(opts, :camera),
+         %Config{} = config <- Keyword.get(opts, :config) do
+      Config.policy(config, cam)
+    else
+      _no_pair -> nil
+    end
+  end
+
   # The identity variant is declared once, here, and travels with the event to
   # the sidecar's header: everything this lane forwards is label-keyed.
-  defp start_extractor(camera, event) do
-    Cairn.EventExtractor.start(camera, event, identity: :label)
+  #
+  # `config:` is passed rather than left to the extractor's own default, which
+  # is `Cairn.Config.Server.get/0` — a call this process can reach from
+  # `init/1` (`restore/1` can open an event), on a server that may be blocked
+  # starting this very lane. The seam takes it as an argument so a caller
+  # cannot forget it.
+  defp start_extractor(camera, event, config) do
+    Cairn.EventExtractor.start(camera, event,
+      identity: :label,
+      config: config,
+      # This process finalizes the clip, so it is what the extractor reports a
+      # lost ring to and monitors: the current labels, scores and trigger live
+      # here, never there.
+      owner: self()
+    )
   end
 
   @impl true
@@ -374,29 +353,23 @@ defmodule Cairn.PresenceRecorder do
     {:noreply, Enum.reduce(frames, %{state | floors: floors}, &frame/2)}
   end
 
-  def handle_cast(:retire, %{event: nil} = state), do: {:stop, :normal, state}
-
-  # Latched rather than stopped, because an event is open. The `cancel_retry/1`
-  # is belt and braces: a retry is armed only with no event open, so nothing can
-  # be pending in this clause today, and one nil check keeps that from becoming
-  # a leak if a later path arms one.
-  def handle_cast(:retire, state),
-    do: {:noreply, cancel_retry(%{state | retiring?: true})}
-
-  # The camera came back — see `ensure/1`. A recorder that stopped on its latch
-  # is replaced there instead; this is only for the one that could not, because
-  # its event was still open. The reply is the contract: it is what tells the
-  # caller this process handled the un-latching rather than dying with it
-  # queued.
-  @impl true
-  def handle_call(:resume, _from, state), do: {:reply, :ok, %{state | retiring?: false}}
+  # The refresh path into the lane. Only the policy moves, and only for the
+  # next event: an in-flight one keeps the windows it opened with, so a
+  # shortened post window cannot cut a clip that is already being written.
+  # The pair rides the message for the lane's other workers; this one goes
+  # back through `resolve_policy/1` — the config server has already published
+  # the new snapshot when this arrives, and that seam is where a test's policy
+  # lives.
+  def handle_cast({:refresh, _camera, _config}, state) do
+    {:noreply, resolve_policy(state)}
+  end
 
   @impl true
   def handle_info({:post_window, event_id, token}, state) do
     # the token guards a stale timer message that was already in the mailbox
     # when a fresh `presence_started` cancelled the window
     if token == state.post_token do
-      settle(maybe_finalize(state, event_id, :post_window))
+      {:noreply, maybe_finalize(state, event_id, :post_window)}
     else
       {:noreply, state}
     end
@@ -404,7 +377,7 @@ defmodule Cairn.PresenceRecorder do
 
   def handle_info({:max_event, event_id, token}, state) do
     if token == state.max_token do
-      settle(maybe_finalize(state, event_id, :max_event))
+      {:noreply, maybe_finalize(state, event_id, :max_event)}
     else
       {:noreply, state}
     end
@@ -419,6 +392,19 @@ defmodule Cairn.PresenceRecorder do
 
   def handle_info({:retry_open, _stale}, state), do: {:noreply, state}
 
+  # The clip's source is gone (`Cairn.EventExtractor`): a media replacement
+  # took the ring, or it crashed. The close is the ordinary one — this process
+  # holds the event's current labels, scores and trigger, and they are what the
+  # row must end with — and the retry is armed because the presence has not
+  # ended, only the clip: with the new ring up, `start_event/3`'s gate opens
+  # the next one. A stale id (the event has already closed) falls out of
+  # `maybe_finalize/3` and arms nothing.
+  def handle_info({:ring_lost, event_id}, %{event: %Event{id: event_id}} = state) do
+    {:noreply, arm_retry(maybe_finalize(state, event_id, :ring_lost))}
+  end
+
+  def handle_info({:ring_lost, _stale}, state), do: {:noreply, state}
+
   # An exit while the event is open ends it `:partial`, whatever the reason —
   # `:normal` and `:noproc` included. `Cairn.CameraTracker` reads those two as
   # a clean finish; that rule belongs to an extractor it adopted from a
@@ -427,6 +413,10 @@ defmodule Cairn.PresenceRecorder do
   # silently would strand the checkpoint row, the `:active` DB row and every
   # `:event_ended` subscriber. The exit that FOLLOWS a finalize is the clause
   # below, not this one: `clear_event/1` moved that monitor to `finalizing`.
+  #
+  # A lost ring is not a death and does not arrive here: the extractor reports
+  # it (`{:ring_lost, _}` above) and waits, so the clip ends through the
+  # ordinary close and its exit is then the `finalizing` case.
   #
   # An ADOPTED extractor is the case CameraTracker's rule was written for, and
   # gets it: the process that started it crashed, so its finalize may have been
@@ -449,10 +439,10 @@ defmodule Cairn.PresenceRecorder do
         # `handle_continue`, so a failure there — or any death mid-clip —
         # arrives here, and presence will not trigger again for a label it
         # already holds. The retry re-checks every gate when it fires.
-        settle(arm_retry(clear_event(%{state | extractor_ref: nil})))
+        {:noreply, arm_retry(clear_event(%{state | extractor_ref: nil}))}
 
       nil ->
-        settle(clear_event(%{state | extractor_ref: nil}))
+        {:noreply, clear_event(%{state | extractor_ref: nil})}
     end
   end
 
@@ -483,10 +473,38 @@ defmodule Cairn.PresenceRecorder do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
-  # A retire that arrived with an event open latched instead of stopping; this
-  # is where it is paid, once the event that outranked it has closed.
-  defp settle(%{retiring?: true, event: nil} = state), do: {:stop, :normal, state}
-  defp settle(state), do: {:noreply, state}
+  @doc """
+  The camera is going away — disabled, deleted, or its tree rebuilt on a tier
+  flip — and an event still open is closed here rather than at the end of its
+  post window: a supervisor shutdown cannot wait out 600 s, and a camera being
+  switched off ending its clip now is the honest behavior.
+
+  The close is `maybe_finalize/3`'s, in its order and from this process, which
+  is the load-bearing part: this is the process that cast the boxes, so its
+  finalize cast lands behind every one of them in the extractor's mailbox.
+  Nothing is awaited. The extractor is `:temporary` under
+  `Cairn.EventSupervisor`, outside the camera's tree, and runs its close,
+  remux and `Cairn.Events.finalize` alone — so this returns at once and the
+  `terminate_child` that stopped the camera is not held for a remux.
+
+  A crash reason does none of this: the replacement restores from the
+  checkpoint row and re-adopts the still-running extractor, as it always has.
+  """
+  @impl true
+  def terminate(:shutdown, state), do: close_on_stop(state)
+  def terminate({:shutdown, _reason}, state), do: close_on_stop(state)
+  def terminate(_crash, _state), do: :ok
+
+  defp close_on_stop(%{event: nil}), do: :ok
+
+  defp close_on_stop(%{event: %Event{} = event} = state) do
+    Logger.info("event #{event.id} (#{state.camera_id}): finalizing (camera stopped)")
+    event = %{event | ended_at: now(), status: :finalized}
+    Event.broadcast(:event_ended, event)
+    state.finalize_extractor.(state.extractor, event)
+    PresenceCheckpoint.delete(state.camera_id)
+    :ok
+  end
 
   # -- transitions ------------------------------------------------------------
 
@@ -566,9 +584,45 @@ defmodule Cairn.PresenceRecorder do
     end
   end
 
+  # No ring, no clip. The camera's `:lane` starts ahead of its `:media`
+  # (`Cairn.Camera`), so on a whole-camera start this process can be restoring
+  # an announced key — and opening an event for it — before
+  # `Cairn.RingBuffer` holds its name. The extractor drains the ring in its own
+  # `handle_continue`, so it would exit `:noproc`, and the `:DOWN` that follows
+  # would announce an `:event_ended` `:partial` for a clip that never began.
+  # Waiting instead costs nothing: the ring is `Cairn.Camera.Media`'s second
+  # child, ahead of the pipeline, so it is up before any frame this event
+  # could hold, and `arm_retry/1` is already the loop that re-runs every gate.
+  defp start_event(state, started_at, seeds) do
+    if ring_ready?(state.camera_id) do
+      open_event(state, started_at, seeds)
+    else
+      Logger.debug("camera #{state.camera_id}: no ring buffer yet; deferring the open")
+      arm_retry(state)
+    end
+  end
+
+  # `Process.alive?/1` as well as the name: `Cairn.Registry.whereis/2` does not
+  # filter dead pids, and the single partition's DOWN handling can lag a read
+  # arbitrarily — so a corpse answers here for a while after a media
+  # replacement kills the old ring. A whole-tree stop cannot reach this (the
+  # camera name is awaited by `Cairn.CameraSupervisor.stop_camera/1`, and the
+  # ring's DOWN is queued ahead of it), but a `:retry_open` timer firing inside
+  # `restart_media/2`'s gap can.
+  #
+  # A ring that dies AFTER this check is not this gate's business: that is an
+  # ordinary mid-clip crash, which the extractor's `:DOWN` already turns into
+  # an `:event_ended` `:partial` and a retry.
+  defp ring_ready?(camera_id) do
+    case Cairn.Registry.whereis(camera_id, :ring_buffer) do
+      pid when is_pid(pid) -> Process.alive?(pid)
+      nil -> false
+    end
+  end
+
   # `started_at` is the event's t=0, and every box's `t_ms` is measured from it;
   # `seeds` are the labels it opens with, at the best score known for each.
-  defp start_event(state, started_at, seeds) do
+  defp open_event(state, started_at, seeds) do
     max_scores = Map.new(seeds)
 
     event = %Event{
@@ -596,6 +650,7 @@ defmodule Cairn.PresenceRecorder do
         replay_pending(%{
           state
           | event: event,
+            event_policy: state.policy,
             started_unix_ms: DateTime.to_unix(started_at, :millisecond),
             checkpointed_at: state.monotonic_ms.(),
             extractor: pid,
@@ -616,8 +671,10 @@ defmodule Cairn.PresenceRecorder do
   # `policy_from_config/1`'s hazard, and worse here, because `restore/1` can
   # reach this from `init/1`: a crash there is re-driven by the `:transient`
   # restart, deterministically, since the ledger row that led to it is not
-  # consumed by reading it. Such a loop spends the pool's restart intensity in
-  # seconds, and `:rest_for_one` takes both presence tables down with the pool.
+  # consumed by reading it. Such a loop spends `Cairn.Camera.Lane`'s restart
+  # intensity in seconds; `Cairn.Camera` is `:one_for_one`, so what that
+  # restarts is the LANE, with the media streaming throughout — only the lane
+  # exhausting the camera's own intensity in turn takes the tree.
   #
   # The state a refusal leaves is a consistent one — keys present, no event —
   # and the next qualifying transition opens from it.
@@ -626,7 +683,7 @@ defmodule Cairn.PresenceRecorder do
   # `{:ok, pid, info}` and `:ignore` — either would otherwise crash the one
   # caller's case, inside `init/1` on the adoption path.
   defp launch_extractor(state, event) do
-    case state.start_extractor.(state.camera, event) do
+    case state.start_extractor.(state.camera, event, state.config) do
       {:ok, pid} -> {:ok, pid}
       {:ok, pid, _info} -> {:ok, pid}
       :ignore -> {:error, :ignore}
@@ -956,6 +1013,12 @@ defmodule Cairn.PresenceRecorder do
 
   # -- lifecycle --------------------------------------------------------------
 
+  # `cause` is what ended the clip and what `resegment/2` is judged on:
+  # `:post_window` (the scene ended), `:max_event` (the cap, which opens the
+  # next segment), `:ring_lost` (the media went — the next clip is opened by
+  # the retry the caller arms, not here, because there is no ring to open it
+  # on yet), and `:camera_stopped`'s equivalent in `terminate/2`, which does
+  # this close by hand.
   defp maybe_finalize(%{event: %Event{id: event_id} = event} = state, event_id, cause) do
     Logger.info("event #{event.id} (#{state.camera_id}): finalizing (#{cause})")
     event = %{event | ended_at: now(), status: :finalized}
@@ -974,9 +1037,9 @@ defmodule Cairn.PresenceRecorder do
   defp maybe_finalize(state, _event_id, _cause), do: state
 
   # The cap is segmentation, not a stop (moduledoc): labels still present get
-  # the next clip. `retiring?` is the exception — a camera on its way out gets
-  # no new clips, and the cleareds its aggregator flushed are already in this
-  # mailbox.
+  # the next clip. A camera on its way out opens no clip here either, and needs
+  # no flag to say so — it is stopped by its tree, and a stopped process serves
+  # no timer.
   #
   # The present set is answered by `Cairn.PresenceLedger` and not by this
   # process's own mirror of it. The mirror is maintained by casts, and a
@@ -987,13 +1050,13 @@ defmodule Cairn.PresenceRecorder do
   # aggregator's own announced set, so it settles the disagreement; when the
   # ledger itself was lost, its silence costs the continuation of one event
   # rather than an unbounded chain of them.
-  defp resegment(%{retiring?: true} = state, _cause), do: state
-
   defp resegment(state, :max_event) do
     # The gate is re-read here for the reason it is re-read at a transition: a
     # boundary opens an event, and neither a `record:` block an operator has
     # since narrowed nor a raised floor should be found out about one whole
-    # clip late.
+    # clip late. The NEXT segment therefore takes the CURRENT policy, unlike
+    # the clip that just closed, which kept the windows it opened with
+    # (`arm_post/1`): a boundary is an open, and an open resolves.
     state = resolve_policy(state)
     seeds = open_seeds(state)
 
@@ -1029,8 +1092,6 @@ defmodule Cairn.PresenceRecorder do
   # Nothing arms this but a failure, and the retry re-runs every gate, so the
   # loop ends the moment there is an event, no presence, or no permission to
   # record.
-  defp arm_retry(%{retiring?: true} = state), do: state
-
   defp arm_retry(state) do
     if MapSet.size(state.present_labels) == 0 do
       state
@@ -1050,12 +1111,14 @@ defmodule Cairn.PresenceRecorder do
   end
 
   # The retry itself, through the same gates a segmentation boundary passes:
-  # the camera may have been retired, something may have opened an event in the
-  # meantime, recording may have been switched off, the policy may have
-  # narrowed, and the presence that wanted the clip may have ended. A failure
-  # here arms the next one from `start_event/3`; anything else lets the loop
-  # stop.
-  defp retry_open(%{retiring?: true} = state), do: state
+  # something may have opened an event in the meantime, recording may have been
+  # switched off, the policy may have narrowed, and the presence that wanted the
+  # clip may have ended. A camera that left needs no gate — its tree stops this
+  # process, and a stopped process serves no timer. The ring gate is not
+  # checked here either: it lives in `start_event/3`, which is what this calls,
+  # so a retry that is still ahead of the media simply arms the next one.
+  # A failure here arms the next one from `start_event/3`; anything else lets
+  # the loop stop.
   defp retry_open(%{event: %Event{}} = state), do: state
 
   defp retry_open(state) do
@@ -1078,6 +1141,7 @@ defmodule Cairn.PresenceRecorder do
     %{
       state
       | event: nil,
+        event_policy: nil,
         started_unix_ms: nil,
         extractor: nil,
         extractor_ref: nil,
@@ -1106,9 +1170,13 @@ defmodule Cairn.PresenceRecorder do
 
   defp retain_monitor(state), do: Map.put(state.finalizing, state.extractor_ref, state.event.id)
 
+  # `event_policy`, not `policy`: the clip is closed by the window it opened
+  # under, however many refreshes have landed since. The cap re-armed on a
+  # restore (`reattach/5`) is the same rule with the same field, seeded there
+  # from what could be resolved at the time.
   defp arm_post(state) do
     state = cancel_post(state)
-    {post_ref, post_token} = schedule(:post_window, state.event.id, state.policy.post)
+    {post_ref, post_token} = schedule(:post_window, state.event.id, state.event_policy.post)
     %{state | post_ref: post_ref, post_token: post_token}
   end
 
@@ -1155,14 +1223,17 @@ defmodule Cairn.PresenceRecorder do
   # `Cairn.CameraTracker.restore_from_checkpoint/1`'s shape plus the ledger
   # read the tracked lane has no analogue of.
   #
-  # This runs inside `init/1`, and two things follow. Nothing may call the
-  # presence pool from here — `ensure/1`'s `DynamicSupervisor.start_child/2`
-  # would block until it timed out when the pool is inside its own restart of
-  # this process, the deadlock `Cairn.PresenceAggregator.init/1` documents;
-  # nothing below reaches it (an extractor is started under
-  # `Cairn.EventSupervisor`, a different tree). And an `ensure/1` `:resume` call
-  # can already be queued behind the start: a GenServer serves calls only after
-  # `init/1` returns, so it waits this out rather than racing it.
+  # This runs inside `init/1`, so nothing here may make a synchronous call to
+  # the supervisor starting this process, nor to a sibling of it: this is
+  # `Cairn.Camera.Lane`'s first child, and a call to the lane, to the camera's
+  # supervisor, or to the `Cairn.PresenceAggregator` behind it would block on
+  # the very start it is part of — the aggregator does not exist yet at all.
+  # Nothing below reaches any of them: an extractor is started under
+  # `Cairn.EventSupervisor`, a different tree, and the aggregator is only ever
+  # cast to.
+  #
+  # `adopt_announced/1`'s ledger read is also why this process starts first:
+  # the aggregator's own `init/1` deletes the rows it reads here.
   defp restore(state) do
     state |> restore_checkpoint() |> adopt_announced()
   end
@@ -1196,6 +1267,11 @@ defmodule Cairn.PresenceRecorder do
   # degrades to the defaults by itself when the config server cannot answer.
   defp reattach(state, event, keys, extractor, box_slots) do
     Logger.info("event #{event.id} (#{state.camera_id}): re-attached to a live extractor")
+    # This process is its owner now. Without the claim the extractor still
+    # monitors the recorder that started it, which is dead, so a ring lost
+    # after this restore would read as having no owner and close the clip with
+    # the metadata it opened with (`Cairn.EventExtractor`'s orphan path).
+    Cairn.EventExtractor.owner(extractor, self())
     spent = DateTime.diff(now(), event.started_at, :second)
     {max_ref, max_token} = schedule(:max_event, event.id, max(state.policy.max - spent, 0))
     announced = announced_scores(state)
@@ -1204,6 +1280,10 @@ defmodule Cairn.PresenceRecorder do
     state = %{
       state
       | event: event,
+        # The best this replacement can know of what the dead one opened
+        # under: the row carries no policy, so the camera's current one stands
+        # in, and from here it is the adopted event's for as long as it runs.
+        event_policy: state.policy,
         started_unix_ms: DateTime.to_unix(event.started_at, :millisecond),
         extractor: extractor,
         extractor_ref: Process.monitor(extractor),
@@ -1241,11 +1321,15 @@ defmodule Cairn.PresenceRecorder do
   # LAST key leaving, one ghost keeps every later event on the camera running
   # to the cap.
   #
-  # The ledger being empty for another reason costs little, and
-  # `Cairn.PresenceSupervisor`'s `:rest_for_one` is why: the table sits ahead of
-  # the pool, so rows lost with it are lost together with the aggregator that
-  # announced them. That aggregator comes back blank and re-confirms whatever is
-  # still in front of the camera, which cancels the post window this arms.
+  # The ledger being empty for another reason costs little, and NOT because
+  # anything re-confirms: presence is edge-only, so a key the aggregator holds
+  # as `:present` never announces a second time. What refills the table is the
+  # aggregator rewriting the row on every sighting of a present key
+  # (`Cairn.PresenceAggregator.sighted/5`) — it survives a ledger crash, being
+  # its camera's child rather than the table's — so an emptied ledger is back
+  # within one batch for anything still in front of the camera. Only a key
+  # whose scene ended in that window stays missing, which is the ghost this
+  # drops anyway.
   defp still_announced(keys, announced) do
     keys |> Enum.filter(&Map.has_key?(announced, &1)) |> MapSet.new()
   end
@@ -1281,15 +1365,15 @@ defmodule Cairn.PresenceRecorder do
   end
 
   # No checkpoint row is the ordinary case — a camera with nothing open — and
-  # one supervision accident makes it a lie. `Cairn.PresenceSupervisor` is
-  # `:rest_for_one` with the tables ahead of the pool, so a
-  # `Cairn.PresenceCheckpoint` crash takes the ledger, the aggregators and the
-  # recorders with it, while the extractors, which live under
-  # `Cairn.EventSupervisor`, keep writing: both witnesses to their events are
-  # gone at once. Nothing else would ever end them — an extractor has no cap of
-  # its own — and the camera's next confirm would open a SECOND one beside each.
-  # What is left to find them by is the `:active` index row the extractor wrote
-  # and its own registration under `{:extractor, event_id}`.
+  # one accident makes it a lie: a `Cairn.PresenceCheckpoint` crash empties the
+  # table (and, `:rest_for_one`, the ledger with it) while the extractors, which
+  # live under `Cairn.EventSupervisor`, keep writing. The recorders now survive
+  # that crash — they are in their cameras' own trees — so the row is missed
+  # only by one that restarts afterwards, but for that one both witnesses to its
+  # event are gone at once. Nothing else would ever end it — an extractor has no
+  # cap of its own — and the camera's next confirm would open a SECOND one
+  # beside it. What is left to find them by is the `:active` index row the
+  # extractor wrote and its own registration under `{:extractor, event_id}`.
   #
   # Ended, not adopted: with no checkpoint there are no present keys, no scores
   # and no trigger to carry on with, so adopting would mean guessing what the
@@ -1452,12 +1536,14 @@ defmodule Cairn.PresenceRecorder do
   #
   # Read, never consumed: those rows are the aggregator's to clear (its
   # `init/1` emits the cleareds they owe), and taking them here would delete a
-  # clear a client is still waiting on. The two restarts may be in flight
-  # together, which needs no ordering — a cleared for a key adopted here
-  # arrives as an ordinary transition and closes the event through the post
-  # window, and one for a key not adopted falls out on membership. That is
-  # also this read's worst case: an aggregator about to clear a key leaves an
-  # event that opens and closes one post window later.
+  # clear a client is still waiting on. On a whole-lane start this read is
+  # guaranteed to come first — that is what the lane's child order buys — and
+  # otherwise the two restarts may be in flight together, which needs no
+  # ordering either: a cleared for a key adopted here arrives as an ordinary
+  # transition and closes the event through the post window, and one for a key
+  # not adopted falls out on membership. That is also this read's worst case:
+  # an aggregator about to clear a key leaves an event that opens and closes
+  # one post window later.
   defp adopt_announced(state) do
     case announced_seeds(state) do
       [] ->
@@ -1560,25 +1646,45 @@ defmodule Cairn.PresenceRecorder do
   # unaffected — it is being written.
   defp recording_enabled?(state), do: CameraControl.get(state.camera_id).recording_enabled
 
+  # A seam may answer with the config it read (the default does — it has it
+  # from the same snapshot); one that does not leaves the config in hand, which
+  # is the seeded one and the only one a test drives with.
   defp resolve_policy(state) do
     case state.resolve_policy.(state.camera_id) do
-      {%Config.Camera{} = camera, policy} -> %{state | camera: camera, policy: policy}
-      :error -> hold_policy(state)
+      {%Config.Camera{} = camera, policy, %Config{} = config} ->
+        %{state | camera: camera, policy: policy, config: config}
+
+      {%Config.Camera{} = camera, policy} ->
+        %{state | camera: camera, policy: policy}
+
+      :error ->
+        hold_policy(state)
     end
   end
 
-  # The camera's own config, or `:error` when the config server cannot answer —
-  # it is a `call`, and a lane must not die inside its own restart window.
+  # The camera's own config, read from the PUBLISHED snapshot and never by
+  # calling `Cairn.Config.Server` — `Cairn.Camera.resolve/1`'s rule, and for a
+  # sharper reason one level down. This runs in `init/1`, and a reload that
+  # adds or rebuilds a tier-1 camera starts this process from inside the
+  # server's own `handle_call`: `apply_diff/2` → `sync/1` → `start_camera/2` →
+  # `Cairn.Camera.init/1` → `Cairn.Camera.Lane.init/1` → here. A call back to
+  # that server waits on a process that is waiting on this one, so it can only
+  # end in its 5 s timeout — and the cost lands on the SERVER, not here: those
+  # 5 s are spent inside its call, per tier-1 camera the reload starts, so
+  # enough of them run `Cairn.Config.Server.update/3`'s own 30 s budget out and
+  # fail an operator's save. This process merely comes up with a policy read
+  # off a bare `%Config.Camera{}` instead of its own.
+  #
+  # The snapshot is not a weaker answer: the server publishes it before it
+  # applies the diff (`Cairn.Config.Server.apply_config/2`), so it is exactly
+  # the config the server will hold when the call returns. `:error` when there
+  # is none — no publish yet, or a camera that has left the config — which
+  # leaves `hold_policy/1` holding the pair the lane seeded this process with.
   defp policy_from_config(camera_id) do
-    camera =
-      case Config.Server.camera(camera_id) do
-        {:ok, camera} -> camera
-        :error -> %Config.Camera{id: camera_id}
-      end
-
-    {camera, Config.policy(Config.Server.get(), camera)}
-  catch
-    :exit, _ -> :error
+    case Config.Server.snapshot_camera(camera_id) do
+      {:ok, camera, config} -> {camera, Config.policy(config, camera), config}
+      :error -> :error
+    end
   end
 
   # Whatever was last resolved still answers; at init there is nothing to keep,
@@ -1586,7 +1692,8 @@ defmodule Cairn.PresenceRecorder do
   # admits everything above the wire floor.
   defp hold_policy(%{policy: nil} = state) do
     camera = %Config.Camera{id: state.camera_id}
-    %{state | camera: camera, policy: Config.policy(%Config{}, camera)}
+    config = state.config || %Config{}
+    %{state | camera: camera, policy: Config.policy(config, camera), config: config}
   end
 
   defp hold_policy(state), do: state
