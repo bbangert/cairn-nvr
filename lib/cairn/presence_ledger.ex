@@ -18,6 +18,14 @@ defmodule Cairn.PresenceLedger do
   an in-memory ledger buys, and the moduledoc of `Cairn.PresenceAggregator`
   states the recovery bargain it serves.
 
+  Its callers outlive it and must not die with it. The table is owned by this
+  process and has no heir, so between its crash and its supervisor restarting
+  it there is no table at all — and every aggregator on the node is still
+  running, still being fed batches. So a missing table reads as an empty one
+  here rather than raising: the write is dropped, the read answers `[]`, and
+  the aggregator's next sighting of a still-present key writes the row again
+  (`Cairn.PresenceAggregator.sighted/5`).
+
   Writes come only from aggregators, on the same process that broadcasts,
   ordered for at-least-once recovery: the row is inserted BEFORE the
   started may go out and deleted only AFTER the cleared has — a crash
@@ -33,14 +41,22 @@ defmodule Cairn.PresenceLedger do
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
   @doc "Record an announced `{camera, zone, label}` — called before the started broadcast."
-  @spec announced(String.t(), zone(), String.t(), DateTime.t(), float() | nil) :: true
+  @spec announced(String.t(), zone(), String.t(), DateTime.t(), float() | nil) :: :ok
   def announced(camera_id, zone, label, first_seen_at, score) do
-    :ets.insert(@table, {{camera_id, zone, label}, first_seen_at, score})
+    if_table_lives(:ok, fn ->
+      :ets.insert(@table, {{camera_id, zone, label}, first_seen_at, score})
+      :ok
+    end)
   end
 
   @doc "The matching cleared went out."
-  @spec cleared(String.t(), zone(), String.t()) :: true
-  def cleared(camera_id, zone, label), do: :ets.delete(@table, {camera_id, zone, label})
+  @spec cleared(String.t(), zone(), String.t()) :: :ok
+  def cleared(camera_id, zone, label) do
+    if_table_lives(:ok, fn ->
+      :ets.delete(@table, {camera_id, zone, label})
+      :ok
+    end)
+  end
 
   @doc """
   One camera's announced keys: the rows a dead aggregator left, and the
@@ -56,9 +72,21 @@ defmodule Cairn.PresenceLedger do
   """
   @spec leftovers(String.t()) :: [{zone(), String.t(), DateTime.t(), float() | nil}]
   def leftovers(camera_id) do
-    for {{_camera_id, zone, label}, first_seen_at, score} <-
-          :ets.match_object(@table, {{camera_id, :_, :_}, :_, :_}),
+    rows =
+      if_table_lives([], fn -> :ets.match_object(@table, {{camera_id, :_, :_}, :_, :_}) end)
+
+    for {{_camera_id, zone, label}, first_seen_at, score} <- rows,
         do: {zone, label, first_seen_at, score}
+  end
+
+  # `rescue` and not an `:ets.whereis/1` guard: the table can vanish between
+  # the check and the operation, so a guard would still need this — and while
+  # the table is there a `try` costs nothing, where a `whereis` is a second
+  # lookup on a path that now runs per present key per batch.
+  defp if_table_lives(absent, operation) do
+    operation.()
+  rescue
+    ArgumentError -> absent
   end
 
   @impl true

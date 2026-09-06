@@ -36,9 +36,13 @@ defmodule Cairn.PresenceAggregator do
   containing zones is two independent states owing two pairs, and a zone's
   own state is fed only by the boxes the sink found inside it.
 
-  The invariant every path serves: **every `presence_started` is followed
-  by exactly one `presence_cleared`** — through evidence, disable, the camera
-  being stopped, the backstop, a zone edit, and a crash. The zone-edit leg is
+  The invariant every path serves: **every `presence_started` is followed by
+  at least one `presence_cleared`, and by exactly one on every path but a
+  crash between the emit and the ledger delete** — through evidence, disable,
+  the camera being stopped, the backstop, a zone edit, and a crash. The
+  at-least-once is deliberate and stated at `broadcast/4`: the row outlives
+  the cleared it owes, so a crash in that window costs a duplicate on the next
+  restart rather than a clear that never comes. The zone-edit leg is
   `zones_removed/2`: evidence gets there on its own while frames flow, but
   a still scene produces none, so the edit itself does the clearing. The
   crash leg is `Cairn.PresenceLedger`'s: a restarted aggregator clears its
@@ -509,8 +513,9 @@ defmodule Cairn.PresenceAggregator do
     PresenceEvent.broadcast(kind, event)
     # A transition that finds no recorder is dropped there, and this process
     # neither starts nor waits for one: the recorder is this camera's own
-    # `:lane` sibling, started after it and restarted by the lane. What a
-    # missed transition costs is a recording, never the
+    # `:lane` sibling — its FIRST child, started ahead of this one — and the
+    # lane is what restarts it. What a missed transition costs is a recording,
+    # never the
     # every-started-gets-a-cleared invariant this process owes its subscribers.
     PresenceRecorder.presence(camera_id, kind, event)
   end

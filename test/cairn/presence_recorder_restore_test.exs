@@ -699,8 +699,9 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     assert await_new_ledger(ledger)
 
     assert Registry.whereis(id, :presence_recorder) == rec
-    assert Process.alive?(rec)
 
+    # the `:sys.get_state/1` is the liveness assertion: it would exit if this
+    # process had gone with the ledger
     state = :sys.get_state(rec)
     assert state.event.id == eid
     assert state.extractor == ex_pid
@@ -757,6 +758,54 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     # post window rather than leaving it to the cap
     assert :sys.get_state(rec).post_token != nil
     assert PresenceLedger.leftovers(id) == []
+  end
+
+  # `Cairn.PresenceLedger`'s table is owned by its process and has no heir, so
+  # between a crash and the supervisor recreating it there is no table at all —
+  # and a `Cairn.PresenceAggregator`, being its camera's child rather than the
+  # table's, is still running and still being fed. A raise from the write would
+  # take it down with a table it only borrows, and its restart's `init/1` reads
+  # the same missing table.
+  #
+  # Here rather than in `Cairn.PresenceAggregatorTest`, which is `async: true`:
+  # the table is node-wide, and removing it would break whatever else is
+  # running. `:ets.delete/1` from inside the owner rather than killing it: the
+  # supervisor's restart is far too fast to race a cast against, and the window
+  # — table gone, callers alive — is what has to be exercised.
+  test "a batch during the ledger's restart window does not take the aggregator down", ctx do
+    id = ctx.camera_id
+    start_supervised!({PresenceAggregator, camera_id: id}, id: :aggregator)
+    CameraControl.put(id, %{recording_enabled: false})
+
+    base = System.monotonic_time(:millisecond)
+    PresenceAggregator.observed(id, base, %{{nil, "person"} => 0.9})
+    PresenceAggregator.observed(id, base + 500, %{{nil, "person"} => 0.9})
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id, label: "person"}}
+
+    aggregator = Registry.whereis(id, :presence)
+    ledger = Process.whereis(Cairn.PresenceLedger)
+    ref = Process.monitor(ledger)
+    :sys.replace_state(ledger, fn state -> :ets.delete(Cairn.PresenceLedger) && state end)
+
+    # every entry the aggregator reaches the table by, with it gone
+    assert PresenceLedger.leftovers(id) == []
+    assert PresenceLedger.announced(id, nil, "person", DateTime.utc_now(), 0.9) == :ok
+    assert PresenceLedger.cleared(id, nil, "nobody") == :ok
+
+    PresenceAggregator.observed(id, base + 1_000, %{{nil, "person"} => 0.9})
+    assert is_map(:sys.get_state(aggregator))
+    # the ledger process itself never died — only its table went
+    refute_received {:DOWN, ^ref, :process, ^ledger, _reason}
+
+    # the table back, and one more batch refills the row the window dropped
+    :sys.replace_state(ledger, fn state ->
+      :ets.new(Cairn.PresenceLedger, [:named_table, :public, :set, write_concurrency: true])
+      state
+    end)
+
+    PresenceAggregator.observed(id, base + 1_500, %{{nil, "person"} => 0.9})
+    _ = :sys.get_state(aggregator)
+    assert [{nil, "person", _at, 0.9}] = PresenceLedger.leftovers(id)
   end
 
   # The orphaned-finalize contract, with a REAL extractor: the recorder casts

@@ -249,7 +249,59 @@ defmodule Cairn.CameraSupervisorTest do
     assert child_pid(sup, :media) != old_media
     assert Cairn.Registry.whereis(cam.id, :presence) == agg
     assert Cairn.Registry.whereis(cam.id, :presence_recorder) == rec
-    assert Process.alive?(agg) and Process.alive?(rec)
+    # answering a call is liveness `Process.alive?/1` cannot claim: a pid that
+    # has already exited can still read as alive for a moment
+    assert is_map(:sys.get_state(agg))
+    assert is_map(:sys.get_state(rec))
+  end
+
+  # A lane worker's `init/1` may not call `Cairn.Config.Server`, because that
+  # is exactly who starts it: a reload or a save that adds or rebuilds a
+  # tier-1 camera runs `apply_diff/2` → `sync/1` → `start_camera/2` →
+  # `Cairn.Camera.init/1` → `Cairn.Camera.Lane.init/1` → the recorder's
+  # `init/1`, all inside the server's own `handle_call`. A call back would wait
+  # on a process waiting on it.
+  #
+  # Suspended is that server's state, exactly: inside a call it cannot answer
+  # another. So the tree is started against a suspended config server, and what
+  # is asserted is that it comes up anyway — from the snapshot the server
+  # publishes BEFORE it applies a diff, which is what both `Cairn.Camera` and
+  # the recorder read.
+  test "a tier-1 lane starts while the config server cannot answer a call" do
+    {cam, group} = tiered("cs_nocall_#{System.unique_integer([:positive])}", 1)
+    id = cam.id
+    cfg = tiered_config([{cam, group}])
+    publish(cfg)
+
+    :sys.suspend(Cairn.Config.Server)
+    on_exit(fn -> :sys.resume(Cairn.Config.Server) end)
+
+    started_at = System.monotonic_time(:millisecond)
+    :ok = CameraSupervisor.sync(cfg)
+    rec = wait_for(fn -> Cairn.Registry.whereis(id, :presence_recorder) end, 200)
+    elapsed = System.monotonic_time(:millisecond) - started_at
+
+    assert is_pid(rec)
+    assert Cairn.Registry.whereis(id, :presence)
+    # promptly, not after a call timed out
+    assert elapsed < 1_000, "the lane took #{elapsed}ms to come up"
+    # and it resolved a real policy from the snapshot, not the seeded default
+    assert is_map(:sys.get_state(rec).policy)
+
+    # the same for a tier flip, which `rebuilt` routes through a whole-tree stop
+    # and start — the second place a lane is born inside that call
+    {cam2, group2} = tiered(id, 2)
+    tier2 = tiered_config([{cam2, group2}])
+    # published first, as the server does — the tree resolves from the snapshot
+    publish(tier2)
+    :ok = CameraSupervisor.apply_diff(rebuilt_diff(id), tier2)
+    refute Cairn.Registry.whereis(id, :presence_recorder)
+
+    publish(cfg)
+
+    :ok = CameraSupervisor.apply_diff(rebuilt_diff(id), cfg)
+    back = wait_for(fn -> Cairn.Registry.whereis(id, :presence_recorder) end, 200)
+    assert is_pid(back) and back != rec
   end
 
   # The one path S2 changes on a running node, through the real tree: a tier-1
@@ -491,6 +543,9 @@ defmodule Cairn.CameraSupervisorTest do
       if previous, do: :persistent_term.put(key, previous), else: :persistent_term.erase(key)
     end)
   end
+
+  defp rebuilt_diff(id),
+    do: %{added: [], removed: [], changed: [], rebuilt: [id], refreshed: []}
 
   defp open_event(camera_id) do
     %Cairn.Event{

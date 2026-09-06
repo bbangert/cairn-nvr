@@ -1547,18 +1547,29 @@ defmodule Cairn.PresenceRecorder do
     end
   end
 
-  # The camera's own config, or `:error` when the config server cannot answer —
-  # it is a `call`, and a lane must not die inside its own restart window.
+  # The camera's own config, read from the PUBLISHED snapshot and never by
+  # calling `Cairn.Config.Server` — `Cairn.Camera.resolve/1`'s rule, and for a
+  # sharper reason one level down. This runs in `init/1`, and a reload that
+  # adds or rebuilds a tier-1 camera starts this process from inside the
+  # server's own `handle_call`: `apply_diff/2` → `sync/1` → `start_camera/2` →
+  # `Cairn.Camera.init/1` → `Cairn.Camera.Lane.init/1` → here. A call back to
+  # that server waits on a process that is waiting on this one, so it can only
+  # end in its 5 s timeout — and the cost lands on the SERVER, not here: those
+  # 5 s are spent inside its call, per tier-1 camera the reload starts, so
+  # enough of them run `Cairn.Config.Server.update/3`'s own 30 s budget out and
+  # fail an operator's save. This process merely comes up with a policy read
+  # off a bare `%Config.Camera{}` instead of its own.
+  #
+  # The snapshot is not a weaker answer: the server publishes it before it
+  # applies the diff (`Cairn.Config.Server.apply_config/2`), so it is exactly
+  # the config the server will hold when the call returns. `:error` when there
+  # is none — no publish yet, or a camera that has left the config — which
+  # leaves `hold_policy/1` holding the pair the lane seeded this process with.
   defp policy_from_config(camera_id) do
-    camera =
-      case Config.Server.camera(camera_id) do
-        {:ok, camera} -> camera
-        :error -> %Config.Camera{id: camera_id}
-      end
-
-    {camera, Config.policy(Config.Server.get(), camera)}
-  catch
-    :exit, _ -> :error
+    case Config.Server.snapshot_camera(camera_id) do
+      {:ok, camera, config} -> {camera, Config.policy(config, camera)}
+      :error -> :error
+    end
   end
 
   # Whatever was last resolved still answers; at init there is nothing to keep,
