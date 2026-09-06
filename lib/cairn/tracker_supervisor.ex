@@ -19,6 +19,12 @@ defmodule Cairn.TrackerSupervisor do
   ffmpeg or plugin restarting is an ordinary event — a stream reset the tracker
   is written to absorb by suspending its identities — and it must not take the
   tracking state, the open event or the checkpoint's owner-side timers with it.
+
+  Which leaves one stop with nothing in this tree to end it: a camera deleted
+  from the config frees its id, and `Cairn.CameraReaper` — a sibling of this
+  supervisor, since it orders that stop against the other roles' — stops its
+  tracker so a camera re-created under that id cannot inherit the process, the
+  open event or the checkpoint row.
   """
 
   use Supervisor

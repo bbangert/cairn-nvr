@@ -24,7 +24,12 @@ config :cairn,
   # The application's own `Cairn.TrackRecorder` buffers whatever any test's
   # camera tracker casts at it; without this its timer would flush those tracks
   # into whichever sandbox connection happens to be checked out at the time.
-  track_recorder_manual: true
+  track_recorder_manual: true,
+  # `Cairn.CameraReaper` gives a real finalize 90 s because it may be inside
+  # `Cairn.ClipRemux`. A suite's leftover extractor never is — it is idle, or
+  # its sandbox connection is gone — and no test can afford to wait one out.
+  # The test that covers the bound raises it for itself.
+  reaper_finalize_timeout: 5_000
 
 # We don't run a server during test. If one is required,
 # you can enable the server option below.

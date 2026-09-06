@@ -103,8 +103,8 @@ defmodule Cairn.CameraControl do
   @impl true
   def init(_opts) do
     :ets.new(@table, [:named_table, :set, :protected, read_concurrency: true])
-    Cairn.Config.Server.subscribe()
-    {:ok, %{}}
+    ref = Cairn.ConfigSubscription.subscribe()
+    {:ok, %{pubsub_ref: ref}}
   end
 
   # The existence check runs here, in the mailbox that also handles the prune,
@@ -146,6 +146,22 @@ defmodule Cairn.CameraControl do
 
   # Another server's diff, or one without the membership this owner prunes on.
   def handle_info({:config_changed, _other}, state), do: {:noreply, state}
+
+  # PubSub restarted under us: `Cairn.ConfigSubscription` re-subscribes and
+  # re-monitors, then reconciles the table against the current fleet — a config
+  # change that landed while the subscription was down would otherwise leave a
+  # deleted camera's overlay here until the next diff. Placed after the specific
+  # `{:config_changed, ...}` clauses so it never shadows them.
+  def handle_info({:DOWN, _ref, :process, _pid, _reason} = msg, state) do
+    case Cairn.ConfigSubscription.handle_down(msg, state.pubsub_ref) do
+      {:ok, ref} ->
+        Cairn.ConfigSubscription.reconcile(&prune/1)
+        {:noreply, %{state | pubsub_ref: ref}}
+
+      :other ->
+        {:noreply, state}
+    end
+  end
 
   # No snapshot is not an empty fleet: a server that has published none (an
   # unnamed one, or one still in `init/1`) cannot say which cameras exist, so

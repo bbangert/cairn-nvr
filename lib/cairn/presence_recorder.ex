@@ -155,8 +155,10 @@ defmodule Cairn.PresenceRecorder do
   tier 1, and the recorder that outlived the stop for its open event is the one
   the new session gets. Un-latching it here is what keeps it: the latch is
   paid when the event closes, and this is the only call that says the camera
-  came back. A camera that really left never reaches here again, so its latch
-  still stops it.
+  came back. A camera that really left never reaches here again: a disabled
+  one's latch stops it when its event closes, and a deleted one is stopped
+  outright by `Cairn.CameraReaper`, so the pid this can hand back for a
+  re-created id is always a fresh process.
 
   The un-latching is a **call**, and that is the whole point. The registry is a
   stale-read site and a `:retire` may already be in the mailbox ahead of us: a
@@ -245,6 +247,11 @@ defmodule Cairn.PresenceRecorder do
   labels immediately after, so the cleareds that close the event are on their
   way here; the latch is also what keeps the cap from segmenting into a clip
   for a camera that is leaving (`resegment/2`).
+
+  A camera being *deleted* is retired like any other, and the latch is then
+  overruled: `Cairn.CameraReaper` stops this process on the config broadcast,
+  because a latch that outlives the id lets a camera re-created under it adopt
+  the deleted one's event.
   """
   @spec retire(String.t()) :: :ok
   def retire(camera_id), do: cast(camera_id, :retire)
@@ -1286,8 +1293,10 @@ defmodule Cairn.PresenceRecorder do
   # `Cairn.PresenceCheckpoint` crash takes the ledger, the aggregators and the
   # recorders with it, while the extractors, which live under
   # `Cairn.EventSupervisor`, keep writing: both witnesses to their events are
-  # gone at once. Nothing else would ever end them — an extractor has no cap of
-  # its own — and the camera's next confirm would open a SECOND one beside each.
+  # gone at once. Nothing else would end them while the camera is in the config
+  # — an extractor has no cap of its own, and `Cairn.CameraReaper` reaps only a
+  # camera the config has dropped — and the camera's next confirm would open a
+  # SECOND one beside each.
   # What is left to find them by is the `:active` index row the extractor wrote
   # and its own registration under `{:extractor, event_id}`.
   #
@@ -1341,26 +1350,7 @@ defmodule Cairn.PresenceRecorder do
         "to restore from — ending it partial"
     )
 
-    # Rebuilt from the row rather than emptied: the extractor writes what it is
-    # handed back over the row when it finalizes (`Cairn.Events.finalize/2`),
-    # so an event with no labels would erase the ones the clip actually earned.
-    labels = row.labels || %{}
-    max_scores = Map.get(labels, "max_scores", %{})
-
-    event = %Event{
-      id: row.id,
-      camera_id: row.camera_id,
-      started_at: row.started_at,
-      ended_at: now(),
-      status: :partial,
-      labels: Map.get(labels, "entries", []),
-      max_scores: max_scores,
-      # `create_active/2` writes no `max_score` column — only the close does —
-      # so an event that never got that far has it only inside the labels map.
-      max_score: row.max_score || best_score(max_scores),
-      trigger: Map.get(labels, "trigger"),
-      path: row.path
-    }
+    event = Events.partial_event(row, now())
 
     # `maybe_finalize/3`'s ordering, for its reason: the window is announced
     # closed before the clip is told to land, and the cast carries every box

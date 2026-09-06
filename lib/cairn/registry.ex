@@ -59,6 +59,20 @@ defmodule Cairn.Registry do
     end
   end
 
+  @doc """
+  Every registered extractor as `{camera_id, event_id, pid}`.
+
+  Its own selector because the extractor role is the one keyed per event
+  rather than per camera, so `ids_for_role/1`'s exact-role match cannot name
+  it and one camera can hold several at once.
+  """
+  @spec extractors() :: [{String.t(), String.t(), pid()}]
+  def extractors do
+    Registry.select(__MODULE__, [
+      {{{:"$1", {:extractor, :"$2"}}, :"$3", :_}, [], [{{:"$1", :"$2", :"$3"}}]}
+    ])
+  end
+
   @doc "Camera ids currently registered for a given role."
   @spec ids_for_role(atom()) :: [String.t()]
   def ids_for_role(role) do

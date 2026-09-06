@@ -160,6 +160,37 @@ defmodule Cairn.Events do
     |> Repo.all()
   end
 
+  @doc """
+  The runtime `Cairn.Event` an `active` row should be closed as when the lane
+  that owned it is gone: `:partial`, ended at `ended_at`.
+
+  Rebuilt from the row rather than emptied. What the extractor is handed is
+  written back over the row when it finalizes (`finalize_partial/2`), so an
+  event carrying no labels would erase the ones the clip actually earned.
+  """
+  @spec partial_event(Event.t(), DateTime.t()) :: Cairn.Event.t()
+  def partial_event(%Event{} = row, ended_at) do
+    labels = row.labels || %{}
+    max_scores = Map.get(labels, "max_scores", %{})
+
+    %Cairn.Event{
+      id: row.id,
+      camera_id: row.camera_id,
+      started_at: row.started_at,
+      ended_at: ended_at,
+      status: :partial,
+      labels: Map.get(labels, "entries", []),
+      max_scores: max_scores,
+      # `create_active/2` writes no `max_score` column — only the close does —
+      # so an event that never got that far has it only inside the labels map.
+      max_score: row.max_score || best_score(max_scores),
+      trigger: Map.get(labels, "trigger"),
+      path: row.path
+    }
+  end
+
+  defp best_score(max_scores), do: max_scores |> Map.values() |> Enum.max(fn -> nil end)
+
   @doc "Finished (non-active) events, oldest first — emergency cleanup order."
   @spec oldest_for_cleanup(pos_integer()) :: [Event.t()]
   def oldest_for_cleanup(count) do

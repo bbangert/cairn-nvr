@@ -2,6 +2,9 @@ defmodule Cairn.EventSupervisor do
   @moduledoc """
   DynamicSupervisor over `Cairn.EventExtractor` processes — one `:temporary`
   child per active event.
+
+  `Cairn.CameraReaper` starts after this one and ends the extractors of a
+  camera the config no longer names, which no lane owner is left to finalize.
   """
 
   use DynamicSupervisor

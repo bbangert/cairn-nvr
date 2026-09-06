@@ -90,8 +90,8 @@ defmodule Cairn.EventCheckpoint do
   @impl true
   def init(_opts) do
     :ets.new(@table, [:named_table, :set, :public, write_concurrency: true])
-    Cairn.Config.Server.subscribe()
-    {:ok, %{}}
+    ref = Cairn.ConfigSubscription.subscribe()
+    {:ok, %{pubsub_ref: ref}}
   end
 
   # The existence check runs here, in the mailbox that also handles the prune,
@@ -135,13 +135,34 @@ defmodule Cairn.EventCheckpoint do
         {:config_changed, %{server: Cairn.Config.Server, known: %MapSet{} = known}},
         state
       ) do
-    for {camera_id, _event, _tracks} <- all(), not MapSet.member?(known, camera_id) do
-      delete(camera_id)
-    end
-
+    prune(known)
     {:noreply, state}
   end
 
   # Another server's diff, or one without the membership this owner prunes on.
   def handle_info({:config_changed, _other}, state), do: {:noreply, state}
+
+  # PubSub restarted under us: `Cairn.ConfigSubscription` re-subscribes and
+  # re-monitors, then reconciles against the current fleet — a config change
+  # that landed while the subscription was down would otherwise leave a deleted
+  # camera's row here until the next diff. Placed after the specific
+  # `{:config_changed, ...}` clauses so it never shadows them.
+  def handle_info({:DOWN, _ref, :process, _pid, _reason} = msg, state) do
+    case Cairn.ConfigSubscription.handle_down(msg, state.pubsub_ref) do
+      {:ok, ref} ->
+        Cairn.ConfigSubscription.reconcile(&prune/1)
+        {:noreply, %{state | pubsub_ref: ref}}
+
+      :other ->
+        {:noreply, state}
+    end
+  end
+
+  defp prune(known) do
+    for {camera_id, _event, _tracks} <- all(), not MapSet.member?(known, camera_id) do
+      delete(camera_id)
+    end
+
+    :ok
+  end
 end

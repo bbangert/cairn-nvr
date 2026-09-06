@@ -4,6 +4,10 @@ defmodule Cairn.PresenceSupervisor do
   `Cairn.PresenceRecorder` per tier-1 camera, started on demand and restarted
   after a crash.
 
+  A recorder whose camera the config no longer names is stopped from outside
+  this tree, by `Cairn.CameraReaper` — the one stop the recorder's retire
+  latch must not outlive.
+
   Not a child of `Cairn.TrackerSupervisor` — that tree is tracking's, and its
   checkpoint-restore sweep is the one presence must never be swept by
   (`Cairn.PresenceCheckpoint`'s keyspace argument). What a restarted
