@@ -186,12 +186,10 @@ defmodule Cairn.PipelineOwnerTest do
     # clear. Recording off: a confirm would otherwise open a real clip.
     defp announce(camera_id, key) do
       Cairn.CameraControl.put(camera_id, %{recording_enabled: false})
-
-      on_exit(fn ->
-        PresenceAggregator.retire(camera_id)
-        Cairn.Registry.await_unregistered(camera_id, :presence)
-        Cairn.Registry.await_unregistered(camera_id, :presence_recorder)
-      end)
+      # Started here as the camera's lane starts it — the sink's feeds create
+      # nothing. `start_supervised!` stops it (`:shutdown`) at test end, so its
+      # `terminate/2` clears whatever is left standing.
+      start_supervised!({PresenceAggregator, camera_id: camera_id}, id: :aggregator)
 
       PresenceAggregator.observed(camera_id, @presence_base, %{key => 0.9})
       PresenceAggregator.observed(camera_id, @presence_base + 500, %{key => 0.9})

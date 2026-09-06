@@ -1,21 +1,19 @@
 defmodule Cairn.PresenceSupervisor do
   @moduledoc """
-  The presence subtree: one `Cairn.PresenceAggregator` and one
-  `Cairn.PresenceRecorder` per tier-1 camera, started on demand and restarted
-  after a crash.
+  The presence lane's two node-level tables: `Cairn.PresenceCheckpoint` and
+  `Cairn.PresenceLedger`.
+
+  The workers that read them are not here — a tier-1 camera's
+  `Cairn.PresenceAggregator` and `Cairn.PresenceRecorder` are children of that
+  camera's own `Cairn.Camera.Lane`, so they start and stop with the camera. The
+  tables are per-node and outlive any one of them, which is the whole point:
+  what a restarted aggregator owes the world is not its state but the
+  `presence_cleared` events its predecessor's announcements are still waiting
+  on.
 
   Not a child of `Cairn.TrackerSupervisor` — that tree is tracking's, and its
   checkpoint-restore sweep is the one presence must never be swept by
-  (`Cairn.PresenceCheckpoint`'s keyspace argument). What a restarted
-  aggregator owes the world is not its state but the `presence_cleared`
-  events its predecessor's announcements are still waiting on, which is the
-  `Cairn.PresenceLedger`'s job to make possible.
-
-  The pool keeps the default restart intensity deliberately: one
-  aggregator crash-looping past it takes the pool down and every camera's
-  presence state with it — the same cascade bargain
-  `Cairn.TrackerSupervisor.Pool` makes — and the restarted, on-demand
-  aggregators clear whatever the ledger says the dead ones had announced.
+  (`Cairn.PresenceCheckpoint`'s keyspace argument).
   """
 
   use Supervisor
@@ -24,30 +22,19 @@ defmodule Cairn.PresenceSupervisor do
     Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  # `:rest_for_one`, tables before the pool: aggregators and recorders die
-  # without taking the announced set or the active-event rows with them, while
-  # a table's own crash restarts the pool into the empty world the fresh table
-  # reflects. Both survivals are read on restart — an aggregator clears what
-  # its predecessor announced, and a recorder re-attaches to the extractor its
-  # predecessor's checkpoint names, adopting from the ledger the labels that
-  # checkpoint could not have known about.
+  # `:rest_for_one`, checkpoint before ledger: a checkpoint crash empties the
+  # ledger too, so a recorder restarting afterwards cannot restore an event
+  # from a row whose announced keys it has no way to check. The reverse is
+  # harmless and stays harmless — a ledger crash leaves the checkpoint alone.
   #
-  # That empty world is not quite empty, and one thing outside this tree is why:
-  # the extractors live under `Cairn.EventSupervisor` and go on writing their
-  # clips through a crash here. A `Cairn.PresenceCheckpoint` crash therefore
-  # destroys the only record of them at the same moment it kills everyone who
-  # could finalize them. What makes the sentence above safe is the sweep in
+  # The extractors live under `Cairn.EventSupervisor` and go on writing their
+  # clips through a crash here, so a `Cairn.PresenceCheckpoint` crash destroys
+  # the only record of them. What covers that is the sweep in
   # `Cairn.PresenceRecorder`'s restore: a recorder that finds no checkpoint row
   # asks the event index and the registry whether an extractor of its camera is
   # still writing, and ends what it finds.
   @impl true
   def init(_opts) do
-    children = [
-      Cairn.PresenceCheckpoint,
-      Cairn.PresenceLedger,
-      {DynamicSupervisor, name: Cairn.PresenceSupervisor.Pool, strategy: :one_for_one}
-    ]
-
-    Supervisor.init(children, strategy: :rest_for_one)
+    Supervisor.init([Cairn.PresenceCheckpoint, Cairn.PresenceLedger], strategy: :rest_for_one)
   end
 end

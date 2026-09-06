@@ -33,18 +33,24 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
     # feeds the sink, and what it asserts is what reaches presence state.
     CameraControl.put(camera_id, %{recording_enabled: false})
 
-    # The sink's feeds start real aggregators in the application-wide
-    # pool; retire them or every test leaks one for the suite's life.
-    on_exit(fn ->
-      Cairn.PresenceAggregator.retire(camera_id)
-      Cairn.Registry.await_unregistered(camera_id, :presence)
-      Cairn.Registry.await_unregistered(camera_id, :presence_recorder)
-    end)
+    # Started here as a tier-1 camera's `Cairn.Camera.Lane` starts it: the
+    # sink's feeds create nothing, they address it by name and drop when it is
+    # absent. Stopped with the test, so nothing leaks into the next one.
+    start_supervised!({Cairn.PresenceAggregator, camera_id: camera_id}, id: :aggregator)
 
     %{
       camera_id: camera_id,
       camera: %Camera{id: camera_id, rtsp_url: "rtsp://h/1", min_score: %{"default" => 0.5}}
     }
+  end
+
+  # The lane's recorder, for the three cases that read what the sink cast to
+  # it. Started only there, and always before the sink is fed: nothing on the
+  # sink's path creates one, so a batch cast ahead of it is dropped. The
+  # setup's `recording_enabled: false` is what keeps a confirm from opening a
+  # real clip through it.
+  defp recorder(ctx) do
+    start_supervised!({Cairn.PresenceRecorder, camera_id: ctx.camera_id}, id: :recorder)
   end
 
   defp sink(ctx) do
@@ -332,6 +338,7 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
     # aggregator refused to open. `pending` is where a batch waits while no
     # event is open, and reading it is the barrier for the cast that sent it.
     test "the recorder is given the surviving objects only", ctx do
+      recorder = recorder(ctx)
       state = sink(ctx)
 
       {[], _state} =
@@ -342,7 +349,6 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
           ])
         ])
 
-      recorder = Cairn.Registry.whereis(ctx.camera_id, :presence_recorder)
       assert {_floors, [frame], _at_ms} = :sys.get_state(recorder).pending
       assert [%{label: "person", zones: ["drive"]}] = frame.objects
     end
@@ -353,11 +359,11 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
     # presence state.
     test "a tracked box inside a zone reaches the recorder but is not evidence", ctx do
       id = ctx.camera_id
+      recorder = recorder(ctx)
 
       {[], _state} =
         two_beats(sink(ctx), [frame([object("person", 0.9, "tracked", @in_drive)])])
 
-      recorder = Cairn.Registry.whereis(id, :presence_recorder)
       assert {_floors, [frame], _at_ms} = :sys.get_state(recorder).pending
       assert [%{label: "person", zones: ["drive"]}] = frame.objects
 
@@ -366,9 +372,9 @@ defmodule Cairn.Pipeline.PresenceSinkTest do
     end
 
     test "a tracked box outside every zone is dropped like any other", ctx do
+      recorder = recorder(ctx)
       {[], _state} = feed(sink(ctx), [frame([object("person", 0.9, "tracked", @outside)])])
 
-      recorder = Cairn.Registry.whereis(ctx.camera_id, :presence_recorder)
       assert {_floors, [frame], _at_ms} = :sys.get_state(recorder).pending
       assert frame.objects == []
     end

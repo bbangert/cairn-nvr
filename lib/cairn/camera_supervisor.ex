@@ -4,8 +4,9 @@ defmodule Cairn.CameraSupervisor do
 
   `sync/1` reconciles running cameras against a config; `apply_diff/2`
   applies a reload diff, replacing the media subtree of the cameras it marks
-  `changed` (`restart_media/2`) and handing the new config to the ones it
-  marks `refreshed` (`refresh_camera/2`).
+  `changed` (`restart_media/2`), stopping and restarting the whole tree of the
+  ones it marks `rebuilt`, and handing the new config to the ones it marks
+  `refreshed` (`refresh_camera/2`).
   """
 
   use DynamicSupervisor
@@ -50,20 +51,31 @@ defmodule Cairn.CameraSupervisor do
   A `refreshed` camera is one deliberately left running: its running session
   still holds the pre-reload policy, so it is handed the new one instead of
   being restarted. A `changed` camera keeps its tree and gets a new `:media`
-  subtree; only a `removed` one is stopped.
+  subtree. A `rebuilt` one is stopped like a `removed` one and started again by
+  the `sync/1` below, because what moved is the composition of its `:lane`
+  (`Cairn.Camera.Lane` — which event workers a tier means), and a running
+  supervisor cannot be edited into a different child list.
   """
   @spec apply_diff(Config.Server.camera_diff(), Config.t()) :: :ok
-  # The four camera keys are matched in the head: they are the contract
+  # The five camera keys are matched in the head: they are the contract
   # (`Cairn.Config.Server.camera_diff/0`, which the broadcast diff carries
   # alongside keys this never reads), and a caller handing a partial
   # map should fail here, loudly, not by KeyError three lines in — and not be
   # silently tolerated with defaults, which would let a malformed diff skip
   # work it named.
   def apply_diff(
-        %{removed: removed, changed: changed, refreshed: refreshed, added: _},
+        %{removed: removed, changed: changed, rebuilt: rebuilt, refreshed: refreshed, added: _},
         %Config{} = new_config
       ) do
     Enum.each(removed, &stop_camera/1)
+    # Before `sync/1`, which is what starts them again — from the new config,
+    # so the new tree's lane is built for the new tier. That makes `rebuilt`
+    # the one class whose restart rides `sync/1`, and therefore the one the
+    # `:start_cameras` flag can suppress: with it false a rebuilt camera stops
+    # and stays stopped, where a changed one is replaced regardless. Only the
+    # test env sets it (`config/test.exs`), where no camera should be running
+    # to begin with.
+    Enum.each(rebuilt, &stop_camera/1)
     Enum.each(changed, &restart_media(new_config, &1))
     sync(new_config)
     Enum.each(refreshed, &refresh_camera(new_config, &1))
@@ -77,13 +89,10 @@ defmodule Cairn.CameraSupervisor do
   would rebuild it from the struct the tree was born with. A camera that is
   not running has nothing to replace — `sync/1` starts it.
 
-  The presence aggregator is retired in the gap between the old media dying
-  and the new one starting, exactly where `stop_camera/1` retires it: with the
-  producer dead nothing can recreate an aggregator mid-await, so the new
-  pipeline finds the registration gone rather than a dying pid that would
-  swallow its first observations. It moves into the lane later
-  (`design-supervision.md`, S2); until then this keeps a `changed` camera's
-  presence from outliving the config that meant tier 1.
+  The `:lane` workers run on through the gap, which is the point of the split:
+  a restart-class change leaves the camera's tier alone (a tier flip is
+  `rebuilt`, not `changed`), so its presence state and its open clip survive a
+  new pipeline exactly as they survive a reconnect.
 
   A start that fails is logged, not raised: `apply_diff/2` walks every changed
   camera and one bad config must not strand the rest. That camera's tree is
@@ -106,9 +115,6 @@ defmodule Cairn.CameraSupervisor do
         {:error, :not_found} -> :ok
       end
 
-      Cairn.PresenceAggregator.retire(camera_id)
-      Cairn.Registry.await_unregistered(camera_id, :presence)
-
       # The old chain's Registry names are deliberately not awaited here, and
       # the start below is not racing them: `Registry.register/3` deletes a
       # unique entry whose owner is dead and retries, so a name the registry
@@ -130,10 +136,16 @@ defmodule Cairn.CameraSupervisor do
   end
 
   @doc """
-  Hands a still-running camera's pipeline owner the new camera and config — it
-  owns the pipeline whose sink applies the policy. A camera that is not
-  running has no process to tell, and the config lookup guards the case a
-  diff cannot produce: an id `config` does not carry.
+  Hands a still-running camera the new camera and config: its pipeline owner,
+  which owns the pipeline whose sink applies the policy, and then each `:lane`
+  worker, which is how a refresh-class field reaches a worker the tree built
+  from the pre-change pair. A camera that is not running has no process to
+  tell, and the config lookup guards the case a diff cannot produce: an id
+  `config` does not carry.
+
+  The lane casts are dropped when the name is absent — a tier-2 camera has no
+  presence workers, and a tier-1 one may have a worker mid-restart, which
+  resolves the config for itself in `init/1` anyway.
 
   A bridge camera's `Cairn.FFmpegPort` is deliberately not told: every field
   its argv reads (`rtsp_url`, `transcode`, `extra_ffmpeg_args`) is a
@@ -142,12 +154,20 @@ defmodule Cairn.CameraSupervisor do
   """
   @spec refresh_camera(Config.t(), String.t()) :: :ok
   def refresh_camera(%Config{} = config, camera_id) do
-    with %Config.Camera{} = cam <- Enum.find(config.cameras, &(&1.id == camera_id)),
-         pid when is_pid(pid) <- Cairn.Registry.whereis(camera_id, :pipeline) do
-      Cairn.PipelineOwner.refresh(pid, cam, config)
-    else
-      _absent -> :ok
+    case Enum.find(config.cameras, &(&1.id == camera_id)) do
+      %Config.Camera{} = cam -> refresh_tree(config, cam)
+      nil -> :ok
     end
+  end
+
+  defp refresh_tree(config, cam) do
+    case Cairn.Registry.whereis(cam.id, :pipeline) do
+      pid when is_pid(pid) -> Cairn.PipelineOwner.refresh(pid, cam, config)
+      nil -> :ok
+    end
+
+    Cairn.PresenceAggregator.refresh(cam.id, cam, config)
+    Cairn.PresenceRecorder.refresh(cam.id, cam, config)
   end
 
   @spec start_camera(Config.t(), Config.Camera.t()) :: DynamicSupervisor.on_start_child()
@@ -177,18 +197,5 @@ defmodule Cairn.CameraSupervisor do
         DynamicSupervisor.terminate_child(__MODULE__, pid)
         Cairn.Registry.await_unregistered(camera_id, :camera)
     end
-
-    # The camera's presence aggregator goes with it — this function runs for
-    # removed cameras and for a changed one whose new media would not start
-    # (`restart_media/2` retires it itself for the ordinary replacement),
-    # never for a crash/watchdog rebuild, which is exactly the split presence
-    # wants: survive reconnects, but never outlive the config that meant tier 1
-    # (`Cairn.PresenceAggregator.retire/1` clears before stopping). AFTER
-    # the camera tree above, and awaited: with the producer dead nothing can
-    # recreate an aggregator mid-await, and a replacement camera started
-    # once this returns finds the registration gone rather than a dying pid
-    # that would swallow its first observations.
-    Cairn.PresenceAggregator.retire(camera_id)
-    Cairn.Registry.await_unregistered(camera_id, :presence)
   end
 end

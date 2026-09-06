@@ -11,13 +11,12 @@ defmodule Cairn.PresenceLedger do
   restarted aggregator that starts blank leaves every client that tracked
   the edges stuck at "present" forever; instead its `init` reads this table
   and clears what the dead process had announced. The table therefore lives
-  beside the pool, not in it: `Cairn.PresenceSupervisor` starts this
-  process ahead of the pool, `:rest_for_one`, so a crashing
-  aggregator — or the whole pool — never takes the ledger down, while a
-  ledger crash restarts the pool into the empty world it now reflects. A
-  collapse of the entire supervisor loses the set; so does the VM — that is
-  the depth of guarantee an in-memory ledger buys, and the moduledoc of
-  `Cairn.PresenceAggregator` states the recovery bargain it serves.
+  outside every camera's tree: `Cairn.PresenceSupervisor` owns it at node
+  level, so no aggregator's crash — and no camera's stop — can take it down,
+  and an aggregator restarting finds the set its predecessor left. A crash of
+  this process loses the set; so does the VM — that is the depth of guarantee
+  an in-memory ledger buys, and the moduledoc of `Cairn.PresenceAggregator`
+  states the recovery bargain it serves.
 
   Writes come only from aggregators, on the same process that broadcasts,
   ordered for at-least-once recovery: the row is inserted BEFORE the

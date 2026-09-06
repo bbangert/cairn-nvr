@@ -107,8 +107,8 @@ defmodule Cairn.PresenceCheckpoint do
   # before it applies and broadcasts after, so a write handled after the
   # publish finds no id and is dropped, and one handled before is deleted by
   # the prune the broadcast that follows triggers. Without it a deleted
-  # camera's row comes back — a recorder arming its post window outlives
-  # `retire/1` and checkpoints once more on its way out.
+  # camera's row comes back — a recorder's last writes can land after the
+  # camera it belongs to has left the config.
   @impl true
   def handle_call({:put, camera_id, event, keys, extractor, slots}, _from, state) do
     if known?(camera_id), do: write(camera_id, event, keys, extractor, slots)

@@ -86,6 +86,13 @@ defmodule Cairn.PresenceRecorderTest do
     )
   end
 
+  # The camera's aggregator, started as `Cairn.Camera.Lane` starts it —
+  # nothing on the data path creates one. Stopped with `:shutdown` at test end,
+  # so its `terminate/2` clear is what closes out the suite's presence.
+  defp aggregator(ctx) do
+    start_supervised!({PresenceAggregator, camera_id: ctx.camera_id}, id: :aggregator)
+  end
+
   # A clock the test moves by hand, for the seams that measure an age. Shared
   # by every reader in the recorder, which is what a monotonic clock is.
   defp fake_clock do
@@ -643,9 +650,9 @@ defmodule Cairn.PresenceRecorderTest do
     assert :sys.get_state(rec).event == nil
   end
 
-  # Nothing about a pending retry outranks a camera that is going away — the
-  # latch only defers to an event already being written, and there is none.
-  test "a retire stops a recorder that is holding nothing but a retry", ctx do
+  # A retry keeps no clip alive and holds nothing open, so a camera going away
+  # takes the recorder with it at once — no timer is waited out.
+  test "a graceful stop with only a retry armed exits at once", ctx do
     id = ctx.camera_id
     camera = ctx.camera
 
@@ -656,7 +663,7 @@ defmodule Cairn.PresenceRecorderTest do
          resolve_policy: fn _camera_id -> {camera, @policy} end,
          start_extractor: fn _camera, _event -> {:error, :no_event_supervisor} end,
          finalize_extractor: fn _pid, _event -> :ok end},
-        id: :retry_retire_recorder
+        id: :retry_stop_recorder
       )
 
     announce(ctx, "person")
@@ -664,38 +671,10 @@ defmodule Cairn.PresenceRecorderTest do
     assert :sys.get_state(rec).retry_token != nil
 
     ref = Process.monitor(rec)
-    PresenceRecorder.retire(id)
+    :ok = stop_supervised(:retry_stop_recorder)
 
-    assert_receive {:DOWN, ^ref, :process, ^rec, :normal}
-  end
-
-  # The moduledoc's named exception to segmentation: a camera on its way out
-  # gets no further clips. Its aggregator's flushed cleareds may still be in
-  # flight, and a segment opened here would be a clip for a camera that is
-  # gone by the time it closes.
-  test "a retiring recorder does not segment at the cap", ctx do
-    id = ctx.camera_id
-    rec = recorder(ctx)
-    announce(ctx, "person")
-
-    started(ctx, "person", 0.9)
-    assert_receive {:extractor_started, %Event{id: eid}, _pid}
-    assert_receive {:event_started, %Event{id: ^eid}}
-
-    ref = Process.monitor(rec)
-    PresenceRecorder.retire(id)
-    assert :sys.get_state(rec).retiring?
-    # the label is still present and still announced — everything a segment
-    # needs except the camera
-    assert MapSet.member?(:sys.get_state(rec).present_labels, {nil, "person"})
-
-    fire(rec, :max_event, eid)
-
-    assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
-    refute_received {:extractor_started, %Event{}, _pid}
-    refute_received {:event_started, %Event{camera_id: ^id}}
-    # and the latch is paid the moment the event it outranked has closed
-    assert_receive {:DOWN, ^ref, :process, ^rec, :normal}
+    assert_receive {:DOWN, ^ref, :process, ^rec, _shutdown}
+    refute_received {:event_ended, %Event{camera_id: ^id}}
   end
 
   # The other half of the boundary's re-read: an operator who narrowed
@@ -1269,64 +1248,141 @@ defmodule Cairn.PresenceRecorderTest do
     assert :sys.get_state(rec).post_token == nil
   end
 
-  # A config `changed` restart stops the camera (which retires the lane) and
-  # starts it again still tier 1. The recorder that outlived the stop for its
-  # open event is the one the new session's `ensure/1` finds — and if the latch
-  # survived that adoption, the close would stop the process and nothing would
-  # ever call `ensure/1` again: every later transition would drop at the
-  # registry lookup and the camera would record nothing more.
-  test "a camera that comes back adopts its latched recorder and keeps the lane", ctx do
+  # Decision 1 of the supervision design, and the contract the reaper risked:
+  # the process that cast the boxes is the process that casts the finalize, so
+  # BEAM per-pair ordering keeps every box ahead of it. Both casts go to the
+  # one relay here, which is what makes the order observable.
+  test "boxes cast before a supervisor shutdown reach the extractor ahead of the finalize", ctx do
+    id = ctx.camera_id
+    test_pid = self()
+
+    rec =
+      start_supervised!(
+        {
+          PresenceRecorder,
+          # The real seam is `Cairn.EventExtractor.finalize/2`, a cast to the
+          # same pid the boxes went to — stubbing it as anything else would
+          # test a different ordering than the one that ships.
+          camera_id: id,
+          resolve_policy: fn _camera_id -> {ctx.camera, @policy} end,
+          start_extractor: fn _camera, event ->
+            pid = relay(test_pid)
+            send(test_pid, {:extractor_started, event, pid})
+            {:ok, pid}
+          end,
+          finalize_extractor: fn pid, event -> GenServer.cast(pid, {:finalize, event}) end
+        },
+        id: :ordering_recorder
+      )
+
+    started(ctx)
+    assert_receive {:extractor_started, %Event{id: eid}, _relay}
+
+    frames(ctx, [object("person", 0.9)])
+    frames(ctx, [object("person", 0.95)])
+
+    ref = Process.monitor(rec)
+    :ok = stop_supervised(:ordering_recorder)
+    assert_receive {:DOWN, ^ref, :process, ^rec, _shutdown}
+
+    assert_receive {:extractor_cast, {:track_boxes, _first}}
+    assert_receive {:extractor_cast, {:track_boxes, _second}}
+    assert_receive {:extractor_cast, {:finalize, %Event{id: ^eid, status: :finalized}}}
+    # nothing after the finalize: the tail of the sidecar is not truncated,
+    # and no box arrives behind it either
+    refute_received {:extractor_cast, _anything}
+  end
+
+  # The post window is cut short deliberately (decision 2): a camera being
+  # switched off or deleted ends its clip now rather than up to 600 s later.
+  test "a graceful stop finalizes an open event at once, without waiting on the extractor", ctx do
     id = ctx.camera_id
     rec = recorder(ctx)
 
     started(ctx)
-    assert_receive {:extractor_started, %Event{id: first}, _pid}
-
-    PresenceRecorder.retire(id)
-    assert :sys.get_state(rec).retiring?
-
-    assert {:ok, ^rec} = PresenceRecorder.ensure(id)
-    refute :sys.get_state(rec).retiring?
+    assert_receive {:extractor_started, %Event{id: eid}, ex_pid}
+    assert_receive {:event_started, %Event{id: ^eid}}
 
     ref = Process.monitor(rec)
+    :ok = stop_supervised(:recorder)
+
+    assert_receive {:event_ended, %Event{id: ^eid, status: :finalized, camera_id: ^id}}
+    assert_receive {:extractor_finalized, ^ex_pid, %Event{id: ^eid}}
+    assert_receive {:DOWN, ^ref, :process, ^rec, _shutdown}
+    # the row the replacement would have restored from is gone with the event
+    assert PresenceCheckpoint.get(id) == nil
+  end
+
+  test "a graceful stop with nothing open ends no event", ctx do
+    id = ctx.camera_id
+    rec = recorder(ctx)
+    ref = Process.monitor(rec)
+
+    :ok = stop_supervised(:recorder)
+
+    assert_receive {:DOWN, ^ref, :process, ^rec, _shutdown}
+    refute_received {:event_ended, %Event{camera_id: ^id}}
+  end
+
+  # A crash is not a stop: the replacement restores from the checkpoint and
+  # re-adopts the extractor, so a crashing recorder must not finalize.
+  test "a crash finalizes nothing", ctx do
+    rec = recorder(ctx)
+
+    started(ctx)
+    assert_receive {:extractor_started, %Event{id: eid}, ex_pid}
+    assert_receive {:event_started, %Event{id: ^eid}}
+
+    ref = Process.monitor(rec)
+    Process.exit(rec, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^rec, :killed}
+
+    refute_received {:extractor_finalized, ^ex_pid, _event}
+  end
+
+  # Decision 6: the refresh reaches the lane, and it lands at the next event
+  # boundary — an in-flight event keeps the windows it opened with.
+  test "a refresh gives the NEXT event the new policy, not the running one", ctx do
+    id = ctx.camera_id
+    test_pid = self()
+    windows = :counters.new(1, [])
+    :counters.add(windows, 1, 10)
+    camera = ctx.camera
+
+    rec =
+      start_supervised!(
+        {PresenceRecorder,
+         camera_id: id,
+         resolve_policy: fn _camera_id ->
+           {camera, %{@policy | post: :counters.get(windows, 1)}}
+         end,
+         start_extractor: fn _camera, event ->
+           pid = relay(test_pid)
+           send(test_pid, {:extractor_started, event, pid})
+           {:ok, pid}
+         end,
+         finalize_extractor: fn _pid, _event -> :ok end},
+        id: :refresh_recorder
+      )
+
+    started(ctx)
+    assert_receive {:extractor_started, %Event{id: first}, _pid}
+    assert :sys.get_state(rec).policy.post == 10
+
+    :counters.put(windows, 1, 42)
+    PresenceRecorder.refresh(id, camera, %Cairn.Config{})
+    assert :sys.get_state(rec).policy.post == 42
+
+    # the open event keeps the window it armed with: closing it uses the
+    # timer already scheduled, and only the event after it sees 42
     cleared(ctx)
     fire(rec, :post_window, first)
     assert_receive {:event_ended, %Event{id: ^first, status: :finalized}}
-    refute_receive {:DOWN, ^ref, :process, ^rec, _reason}, 200
 
     started(ctx)
     assert_receive {:extractor_started, %Event{id: second}, _pid}
     assert second != first
-  end
-
-  test "a retire with nothing open stops the recorder", ctx do
-    rec = recorder(ctx)
-    ref = Process.monitor(rec)
-
-    PresenceRecorder.retire(ctx.camera_id)
-
-    assert_receive {:DOWN, ^ref, :process, ^rec, :normal}
-  end
-
-  # The race the adoption is a *call* for: the retire is already in the mailbox
-  # when the camera comes back, and with nothing open the recorder honours it
-  # and stops. Whether `ensure/1` then adopts the dying one or starts a fresh
-  # one is not the assertion — that the caller is handed a recorder that is
-  # alive and answering is.
-  test "ensure after a retire that is already in flight yields a live recorder", ctx do
-    id = ctx.camera_id
-    recorder(ctx)
-
-    on_exit(fn ->
-      PresenceRecorder.retire(id)
-      Registry.await_unregistered(id, :presence_recorder)
-    end)
-
-    PresenceRecorder.retire(id)
-
-    assert {:ok, pid} = PresenceRecorder.ensure(id)
-    assert is_map(:sys.get_state(pid))
-    refute :sys.get_state(pid).retiring?
+    assert :sys.get_state(rec).policy.post == 42
   end
 
   # The floors ride in with the frames, from a different sender than the
@@ -1352,52 +1408,10 @@ defmodule Cairn.PresenceRecorderTest do
 
   # -- wiring -----------------------------------------------------------------
 
-  # `start_aggregator/1` ensures the recorder once, at the aggregator's birth;
-  # every observation after that finds the aggregator registered and never
-  # reaches it again. Without a retry on the transition itself, a lane that
-  # failed to start — or that stopped and was not replaced — would record
-  # nothing for the life of the aggregator.
-  #
-  # The healed recorder is a real one, so its extractor dies on the sandbox it
-  # has no ownership of; the event opening is what this test is about, and the
-  # crash it logs is the price of not stubbing the process under test.
-  test "a transition heals a lane whose recorder is gone", ctx do
-    id = ctx.camera_id
-    recorder(ctx)
-
-    on_exit(fn ->
-      PresenceAggregator.retire(id)
-      Registry.await_unregistered(id, :presence)
-      Registry.await_unregistered(id, :presence_recorder)
-    end)
-
-    # The aggregator starts here, while the lane is up — so nothing later can
-    # heal it by that path.
-    base = System.monotonic_time(:millisecond)
-    PresenceAggregator.observed(id, base, %{{nil, "person"} => 0.6})
-    assert Registry.whereis(id, :presence) != nil
-
-    PresenceRecorder.retire(id)
-    Registry.await_unregistered(id, :presence_recorder)
-    refute Registry.whereis(id, :presence_recorder)
-
-    capture_log(fn ->
-      PresenceAggregator.observed(id, base + 500, %{{nil, "person"} => 0.9})
-
-      assert_receive {:event_started, %Event{camera_id: ^id}}, 2_000
-    end)
-
-    assert Registry.whereis(id, :presence_recorder) != nil
-  end
-
   test "the aggregator's confirm and clear reach the recorder", ctx do
     id = ctx.camera_id
     rec = recorder(ctx)
-
-    on_exit(fn ->
-      PresenceAggregator.retire(id)
-      Registry.await_unregistered(id, :presence)
-    end)
+    aggregator(ctx)
 
     base = System.monotonic_time(:millisecond)
     PresenceAggregator.observed(id, base, %{{nil, "person"} => 0.6})
@@ -1422,11 +1436,7 @@ defmodule Cairn.PresenceRecorderTest do
   test "a detection_disabled flush closes the event through the normal post window", ctx do
     id = ctx.camera_id
     rec = recorder(ctx)
-
-    on_exit(fn ->
-      PresenceAggregator.retire(id)
-      Registry.await_unregistered(id, :presence)
-    end)
+    aggregator(ctx)
 
     base = System.monotonic_time(:millisecond)
     PresenceAggregator.observed(id, base, %{{nil, "person"} => 0.6})
@@ -1448,45 +1458,43 @@ defmodule Cairn.PresenceRecorderTest do
     assert_receive {:extractor_finalized, ^ex_pid, %Event{id: ^eid}}
   end
 
-  # A camera stop is `PresenceAggregator.retire/1`, which latches this process
-  # and then flushes the aggregator's labels — so the drain the tracked lane
-  # does on `:camera_stopped` (ending the tracks nothing else will end,
-  # camera_tracker.ex's `apply_epoch/3`) has no analogue here: there are no
-  # tracks, and the cleareds the flush emits are the drain. The recorder
-  # outlives its own retire for exactly as long as the clip takes to close.
-  test "a retire flush closes the open event through the post window, then stops", ctx do
+  # Reverse start order: the tree stops the aggregator first, then the
+  # recorder. The aggregator's `terminate/2` clear therefore reaches a live
+  # recorder, which treats it as an ordinary transition — the close clock
+  # starts, the event does not end there — and the recorder's own stop is what
+  # finalizes, a moment later rather than a post window later.
+  test "stopping the lane in reverse order clears presence, then ends the event", ctx do
     id = ctx.camera_id
     rec = recorder(ctx)
-    ref = Process.monitor(rec)
+    agg = aggregator(ctx)
 
     base = System.monotonic_time(:millisecond)
     PresenceAggregator.observed(id, base, %{{nil, "person"} => 0.6})
     PresenceAggregator.observed(id, base + 500, %{{nil, "person"} => 0.9})
     assert_receive {:extractor_started, %Event{id: eid}, ex_pid}
+    assert_receive {:presence_started, %PresenceEvent{camera_id: ^id}}
 
-    PresenceAggregator.retire(id)
-    Registry.await_unregistered(id, :presence)
+    agg_ref = Process.monitor(agg)
+    :ok = stop_supervised(:aggregator)
+    assert_receive {:presence_cleared, %PresenceEvent{camera_id: ^id, label: "person"}}
+    assert_receive {:DOWN, ^agg_ref, :process, ^agg, _shutdown}
 
+    # the recorder heard it: no keys left, close clock running, clip still open
     state = :sys.get_state(rec)
-    assert state.retiring?
     assert state.present_labels == MapSet.new()
     assert state.post_token != nil
     refute_received {:event_ended, %Event{camera_id: ^id}}
 
-    fire(rec, :post_window, eid)
+    ref = Process.monitor(rec)
+    :ok = stop_supervised(:recorder)
     assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
     assert_receive {:extractor_finalized, ^ex_pid, %Event{id: ^eid}}
-    assert_receive {:DOWN, ^ref, :process, ^rec, :normal}
+    assert_receive {:DOWN, ^ref, :process, ^rec, _shutdown}
   end
 
   test "the sink forwards its inferred frames to the recorder", ctx do
-    id = ctx.camera_id
     recorder(ctx)
-
-    on_exit(fn ->
-      PresenceAggregator.retire(id)
-      Registry.await_unregistered(id, :presence)
-    end)
+    aggregator(ctx)
 
     started(ctx)
     assert_receive {:extractor_started, %Event{id: _eid}, _pid}

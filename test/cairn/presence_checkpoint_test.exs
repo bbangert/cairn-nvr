@@ -22,8 +22,9 @@ defmodule Cairn.PresenceCheckpointTest do
     assert {%Event{id: "e2"}, [], _pid, %{}} = PresenceCheckpoint.get("cam_a")
   end
 
-  # A recorder arming its post window outlives `retire/1` — a late write would
-  # otherwise re-create the row the prune just dropped.
+  # A recorder's last writes can land after the camera it belongs to has left
+  # the config — a late write would otherwise re-create the row the prune just
+  # dropped.
   test "a write for a camera the snapshot does not name is dropped" do
     id = unique_id()
 

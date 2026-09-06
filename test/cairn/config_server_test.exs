@@ -64,6 +64,7 @@ defmodule Cairn.Config.ServerTest do
              added: ["cam_c"],
              removed: ["cam_b"],
              changed: ["cam_a"],
+             rebuilt: [],
              refreshed: [],
              version: 2,
              server: server,
@@ -170,7 +171,13 @@ defmodule Cairn.Config.ServerTest do
 
   describe "diff_cameras/2" do
     test "an identical camera is in neither list" do
-      assert camera_diff(%{}) == %{added: [], removed: [], changed: [], refreshed: []}
+      assert camera_diff(%{}) == %{
+               added: [],
+               removed: [],
+               changed: [],
+               rebuilt: [],
+               refreshed: []
+             }
     end
 
     test "host-side edits refresh the camera instead of restarting it" do
@@ -187,7 +194,7 @@ defmodule Cairn.Config.ServerTest do
             %{"annotation_offset_ms" => -250}
           ] do
         assert camera_diff(edit) ==
-                 %{added: [], removed: [], changed: [], refreshed: ["cam_a"]},
+                 %{added: [], removed: [], changed: [], rebuilt: [], refreshed: ["cam_a"]},
                "expected #{inspect(edit)} to refresh, not restart"
       end
     end
@@ -206,7 +213,7 @@ defmodule Cairn.Config.ServerTest do
             %{"motion_json" => ~s({"enabled": true, "threshold": 30})}
           ] do
         assert camera_diff(edit) ==
-                 %{added: [], removed: [], changed: ["cam_a"], refreshed: []},
+                 %{added: [], removed: [], changed: ["cam_a"], rebuilt: [], refreshed: []},
                "expected #{inspect(edit)} to restart"
       end
     end
@@ -217,7 +224,7 @@ defmodule Cairn.Config.ServerTest do
       assert Config.Server.diff_cameras(
                profiled_config([base]),
                profiled_config([Map.put(base, "plugin", "detect")])
-             ) == %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+             ) == %{added: [], removed: [], changed: ["cam_a"], rebuilt: [], refreshed: []}
     end
 
     test "naming a different tracker core restarts the camera, at any level" do
@@ -226,16 +233,16 @@ defmodule Cairn.Config.ServerTest do
       # can be named on the camera or on the global, which is why the
       # comparison is of the *resolved* answer.
       assert camera_diff(%{"tracker" => "sparsetrack"}) ==
-               %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+               %{added: [], removed: [], changed: ["cam_a"], rebuilt: [], refreshed: []}
 
       assert camera_diff(%{}, %{"tracking" => %{"tracker" => "sparsetrack"}}) ==
-               %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+               %{added: [], removed: [], changed: ["cam_a"], rebuilt: [], refreshed: []}
     end
 
-    test "claiming a different tier restarts the camera — the tail is built, not refreshed" do
+    test "claiming a different tier rebuilds the whole tree, tail and lane" do
       # The tier picks the detect branch's whole tail (presence sink vs the
-      # tracking chain) at build; a refresh routed by the old tail would
-      # feed the new policy to a shape the tier no longer means.
+      # tracking chain) at build, and the lane's children with it — a media
+      # replacement would leave presence workers standing on a tier-2 camera.
       dir = Path.join(System.tmp_dir!(), "cairn_srv_tier_#{System.unique_integer([:positive])}")
       File.mkdir_p!(dir)
       on_exit(fn -> File.rm_rf(dir) end)
@@ -260,8 +267,19 @@ defmodule Cairn.Config.ServerTest do
       old = config.(base_yaml)
       new = config.(base_yaml <> "tier: 2\n")
 
+      # In `rebuilt` and nowhere else: the three restart classes are exclusive.
       assert Config.Server.diff_cameras(old, new) ==
-               %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+               %{added: [], removed: [], changed: [], rebuilt: ["cam_a"], refreshed: []}
+
+      # And a tier flip that also moves a restart-class field is still only
+      # rebuilt — the bigger operation does the smaller one's work.
+      also_changed = %{
+        new
+        | cameras: Enum.map(new.cameras, &%{&1 | rtsp_url: "rtsp://h/CHANGED"})
+      }
+
+      assert Config.Server.diff_cameras(old, also_changed) ==
+               %{added: [], removed: [], changed: [], rebuilt: ["cam_a"], refreshed: []}
     end
 
     test "raising the live-track cap restarts the camera, at any level" do
@@ -270,10 +288,10 @@ defmodule Cairn.Config.ServerTest do
       # branch keeps the old one however the policy is refreshed, and it can be
       # raised on the camera or above it.
       assert camera_diff(%{"max_live_tracks" => 16}) ==
-               %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+               %{added: [], removed: [], changed: ["cam_a"], rebuilt: [], refreshed: []}
 
       assert camera_diff(%{}, %{"tracking" => %{"max_live_tracks" => 16}}) ==
-               %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+               %{added: [], removed: [], changed: ["cam_a"], rebuilt: [], refreshed: []}
     end
 
     test "a profile's sample_fps restarts the cameras on it" do
@@ -286,7 +304,7 @@ defmodule Cairn.Config.ServerTest do
       assert Config.Server.diff_cameras(
                profiled_config([base], "partial"),
                profiled_config([base], "sample-fps")
-             ) == %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+             ) == %{added: [], removed: [], changed: ["cam_a"], rebuilt: [], refreshed: []}
     end
 
     test "a fleet edit that crosses a rung boundary restarts the detecting cameras (D-L5)" do
@@ -325,7 +343,7 @@ defmodule Cairn.Config.ServerTest do
 
     test "an unchanged ladder fleet reloads as a no-op" do
       assert Config.Server.diff_cameras(ladder_config(8), ladder_config(8)) ==
-               %{added: [], removed: [], changed: [], refreshed: []}
+               %{added: [], removed: [], changed: [], rebuilt: [], refreshed: []}
     end
 
     test "a capacity-metadata edit that moves neither model nor rate touches nothing" do
@@ -334,12 +352,12 @@ defmodule Cairn.Config.ServerTest do
       # (8 × 1.875 = 15 fits 17 and 18 alike), and the rung comparison is of
       # the rung's RUNTIME identity, not its authoring metadata.
       assert Config.Server.diff_cameras(ladder_config(8, 17), ladder_config(8, 18)) ==
-               %{added: [], removed: [], changed: [], refreshed: []}
+               %{added: [], removed: [], changed: [], rebuilt: [], refreshed: []}
     end
 
     test "a camera edited both ways is restarted, not refreshed" do
       assert camera_diff(%{"rtsp_url" => "rtsp://h/2", "stationary_after_ms" => 20_000}) ==
-               %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+               %{added: [], removed: [], changed: ["cam_a"], rebuilt: [], refreshed: []}
     end
 
     test "flipping a camera's ingest restarts it — the source process itself changes" do
@@ -352,12 +370,12 @@ defmodule Cairn.Config.ServerTest do
       assert Config.Server.diff_cameras(
                camera_config([base], %{}),
                camera_config([flipped], %{})
-             ) == %{added: [], removed: [], changed: ["cam_a"], refreshed: []}
+             ) == %{added: [], removed: [], changed: ["cam_a"], rebuilt: [], refreshed: []}
     end
 
     test "a global tracking edit refreshes the cameras that resolve through it" do
       assert camera_diff(%{}, %{"tracking" => %{"stationary_after_ms" => 20_000}}) ==
-               %{added: [], removed: [], changed: [], refreshed: ["cam_a"]}
+               %{added: [], removed: [], changed: [], rebuilt: [], refreshed: ["cam_a"]}
     end
 
     test "a camera overriding the pre window is untouched when the global moves" do
@@ -368,7 +386,7 @@ defmodule Cairn.Config.ServerTest do
       # the override wins in `Config.windows/2`, so the ring this camera would
       # be built with has not moved: no restart, and nothing to refresh either
       assert Config.Server.diff_cameras(old, new) ==
-               %{added: [], removed: [], changed: [], refreshed: []}
+               %{added: [], removed: [], changed: [], rebuilt: [], refreshed: []}
     end
 
     test "a camera overriding a global is untouched when that global moves" do
@@ -379,7 +397,7 @@ defmodule Cairn.Config.ServerTest do
       # the override wins in `Config.policy/2`, so nothing this camera resolves
       # moved at all: the classification is on resolved values, not raw globals
       assert Config.Server.diff_cameras(old, new) ==
-               %{added: [], removed: [], changed: [], refreshed: []}
+               %{added: [], removed: [], changed: [], rebuilt: [], refreshed: []}
     end
   end
 
@@ -444,7 +462,7 @@ defmodule Cairn.Config.ServerTest do
     # the file at `path` holds cam_a/cam_b; nothing read it
     assert [%{id: "cam_z"}] = Config.Server.get(server).cameras
 
-    assert {:ok, %{added: [], removed: [], changed: [], refreshed: []}, []} =
+    assert {:ok, %{added: [], removed: [], changed: [], rebuilt: [], refreshed: []}, []} =
              Config.Server.reload(server)
 
     assert_received {:source, ^path}

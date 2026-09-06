@@ -139,7 +139,8 @@ defmodule CairnWeb.ConfigLive do
           <div
             :if={
               @reload_result.diff.added != [] or @reload_result.diff.removed != [] or
-                @reload_result.diff.changed != [] or @reload_result.diff.refreshed != []
+                @reload_result.diff.changed != [] or @reload_result.diff.rebuilt != [] or
+                @reload_result.diff.refreshed != []
             }
             style="display: flex; gap: 6px; flex-wrap: wrap;"
           >
@@ -149,7 +150,13 @@ defmodule CairnWeb.ConfigLive do
             <span :for={id <- @reload_result.diff.removed} class="hs-badge hs-badge--danger">
               <span class="hs-dot"></span>removed {id}
             </span>
-            <span :for={id <- @reload_result.diff.changed} class="hs-badge hs-badge--accent">
+            <%!-- `changed` and `rebuilt` read the same to an operator: the
+                  camera's stream was replaced. What differs is how much of its
+                  tree went with it, which is the supervisor's business. --%>
+            <span
+              :for={id <- @reload_result.diff.changed ++ @reload_result.diff.rebuilt}
+              class="hs-badge hs-badge--accent"
+            >
               <span class="hs-dot"></span>restarted {id}
             </span>
             <%!-- Distinguished from "restarted" because the difference is what the

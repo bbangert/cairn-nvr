@@ -201,10 +201,9 @@ defmodule Cairn.PipelineOwner do
       send(state.pipeline, {:policy, camera, Config.policy(config, camera)})
     else
       # Except a zone edit, which the aggregator has to be told outright: it
-      # outlives the pipeline by design (only `Cairn.CameraSupervisor` retires
-      # it, from `stop_camera/1` or `restart_media/2` — a stopped camera or a
-      # replaced media, never a rebuild), so through a backoff it would hold the
-      # gone zone's keys with nothing left producing evidence against them.
+      # outlives the pipeline by design (it is the camera's `:lane` child, and
+      # only the camera stopping stops it), so through a backoff it would hold
+      # the gone zone's keys with nothing left producing evidence against them.
       # Safe from here only because there is no pipeline: with one up, an
       # `observed` batch already in flight could re-mint what this cleared,
       # which is why `Cairn.Pipeline.PresenceSink` owns that case — its cast

@@ -29,6 +29,26 @@ defmodule Cairn.CameraSupervisorTest do
     %Config{data_dir: "tmp/camsup_test", cameras: cameras}
   end
 
+  # A camera whose resolved tier is `tier`, which is what `Cairn.Camera.Lane`
+  # composes from. The tier lives on the group's profile, never on the camera,
+  # so a tiered fixture is a camera plus the group it points at.
+  defp tiered(id, tier) do
+    group = "tier#{tier}"
+
+    {%Camera{camera(id) | plugin: {:group, group}},
+     %Cairn.Config.PluginGroup{
+       name: group,
+       profile: %Cairn.Config.Profile{name: group, tier: tier}
+     }}
+  end
+
+  defp tiered_config(pairs) do
+    %Config{
+      config(Enum.map(pairs, &elem(&1, 0)))
+      | plugin_groups: Enum.map(pairs, &elem(&1, 1))
+    }
+  end
+
   test "sync starts missing cameras, is idempotent, and stops removed ones" do
     a = camera("cs_a_#{System.unique_integer([:positive])}")
     b = camera("cs_b_#{System.unique_integer([:positive])}")
@@ -58,7 +78,7 @@ defmodule Cairn.CameraSupervisorTest do
     old_media = child_pid(sup_b, :media)
     old_lane = child_pid(sup_b, :lane)
 
-    diff = %{added: [c.id], removed: [a.id], changed: [b.id], refreshed: []}
+    diff = %{added: [c.id], removed: [a.id], changed: [b.id], rebuilt: [], refreshed: []}
     new_config = config([%Camera{b | rtsp_url: "file:///dev/zero"}, c])
     :ok = CameraSupervisor.apply_diff(diff, new_config)
 
@@ -90,7 +110,7 @@ defmodule Cairn.CameraSupervisorTest do
     # the change a whole-tree rebuild can read, since `DynamicSupervisor` keeps
     # the spec this camera was started with
     publish(new_config)
-    diff = %{added: [], removed: [], changed: [b.id], refreshed: []}
+    diff = %{added: [], removed: [], changed: [b.id], rebuilt: [], refreshed: []}
     :ok = CameraSupervisor.apply_diff(diff, new_config)
 
     # What a media crash-loop past `Cairn.Camera`'s own intensity ends in: the
@@ -178,8 +198,153 @@ defmodule Cairn.CameraSupervisorTest do
     assert {:lane, _pid, :supervisor, [Cairn.Camera.Lane]} = List.keyfind(children, :lane, 0)
     assert {:media, _pid, :supervisor, [Cairn.Camera.Media]} = List.keyfind(children, :media, 0)
 
-    # S1 moves no workers: the lane exists so S2/S3 have somewhere to put them
+    # this camera resolves to no tier, so it runs no event workers yet
     assert Supervisor.which_children(child_pid(sup, :lane)) == []
+  end
+
+  test "a tier-1 camera's lane runs the recorder and then the aggregator" do
+    {cam, group} = tiered("cs_t1_#{System.unique_integer([:positive])}", 1)
+    :ok = CameraSupervisor.sync(tiered_config([{cam, group}]))
+    sup = Cairn.Registry.whereis(cam.id, :camera)
+
+    # The recorder starts first so it is listening when the aggregator's
+    # `init/1` clears its predecessor's announced keys (`Cairn.Camera.Lane`).
+    # `which_children/1` answers in reverse, which is also the shutdown order.
+    assert [{Cairn.PresenceAggregator, _agg, _, _}, {Cairn.PresenceRecorder, _rec, _, _}] =
+             Supervisor.which_children(child_pid(sup, :lane))
+
+    assert Cairn.Registry.whereis(cam.id, :presence)
+    assert Cairn.Registry.whereis(cam.id, :presence_recorder)
+  end
+
+  test "a tier-2 camera's lane is empty" do
+    {cam, group} = tiered("cs_t2_#{System.unique_integer([:positive])}", 2)
+    :ok = CameraSupervisor.sync(tiered_config([{cam, group}]))
+    sup = Cairn.Registry.whereis(cam.id, :camera)
+
+    assert Supervisor.which_children(child_pid(sup, :lane)) == []
+    refute Cairn.Registry.whereis(cam.id, :presence)
+    refute Cairn.Registry.whereis(cam.id, :presence_recorder)
+  end
+
+  # The survival property the media/lane split exists for, and the deliberate
+  # reversal of the old behaviour: `restart_media/2` used to retire the
+  # aggregator in the gap. A restart-class change cannot move the tier — a tier
+  # flip is `rebuilt` — so the presence workers outlive the new pipeline
+  # exactly as they outlive a reconnect.
+  test "a media-only change leaves the tier-1 lane's workers running" do
+    {cam, group} = tiered("cs_survive_#{System.unique_integer([:positive])}", 1)
+    :ok = CameraSupervisor.sync(tiered_config([{cam, group}]))
+
+    sup = Cairn.Registry.whereis(cam.id, :camera)
+    agg = Cairn.Registry.whereis(cam.id, :presence)
+    rec = Cairn.Registry.whereis(cam.id, :presence_recorder)
+    old_media = child_pid(sup, :media)
+
+    moved = %Camera{cam | rtsp_url: "file:///dev/zero"}
+    new_config = tiered_config([{moved, group}])
+    diff = %{added: [], removed: [], changed: [cam.id], rebuilt: [], refreshed: []}
+    :ok = CameraSupervisor.apply_diff(diff, new_config)
+
+    assert child_pid(sup, :media) != old_media
+    assert Cairn.Registry.whereis(cam.id, :presence) == agg
+    assert Cairn.Registry.whereis(cam.id, :presence_recorder) == rec
+    assert Process.alive?(agg) and Process.alive?(rec)
+  end
+
+  # The one path S2 changes on a running node, through the real tree: a tier-1
+  # camera with a clip open leaves the config, `apply_diff` stops its tree, and
+  # the lane's reverse-order teardown clears the presence and finalizes the
+  # event. Nothing is stubbed but the extractor, which stands in as a plain
+  # process so this suite needs no database — what it has to prove is that the
+  # RECORDER cast the finalize on the way out, and that the row and the names
+  # are gone with the camera.
+  test "removing a tier-1 camera finalizes its open event and takes the lane with it" do
+    {cam, group} = tiered("cs_del_#{System.unique_integer([:positive])}", 1)
+    id = cam.id
+    test_pid = self()
+    cfg = tiered_config([{cam, group}])
+    # The snapshot, not `Cairn.SnapshotHelpers.lend_cameras/1`: `Cairn.Camera`
+    # resolves its tree from the published config, and a lent bare camera would
+    # shadow the group this one's tier comes from — an empty lane.
+    publish(cfg)
+    Cairn.Event.subscribe()
+
+    :ok = CameraSupervisor.sync(cfg)
+    rec = Cairn.Registry.whereis(id, :presence_recorder)
+    assert is_pid(rec)
+    assert Cairn.Registry.whereis(id, :presence)
+
+    # An open event on the real recorder, in the shape a restore produces: a
+    # live extractor it adopts, and the ledger row its aggregator would have
+    # left. Driving detections instead would need the model and the database
+    # this suite deliberately does without.
+    extractor = Cairn.PresenceFixtures.relay(test_pid)
+    event = open_event(id)
+    eid = event.id
+    Cairn.PresenceLedger.announced(id, nil, "person", DateTime.utc_now(), 0.9)
+    Cairn.PresenceCheckpoint.put!(id, event, [{nil, "person"}], extractor)
+    on_exit(fn -> Cairn.PresenceCheckpoint.delete(id) end)
+
+    # the restore happens in `init/1`, so the recorder is replaced rather than
+    # told — a crash of the one the lane started is the ordinary way in
+    Process.exit(rec, :kill)
+    restored = wait_for(fn -> replacement(id, rec) end)
+    assert :sys.get_state(restored).event.id == eid
+
+    # …and a live presence in the aggregator, so its own teardown has something
+    # to clear. Two sightings inside the confirm window is what a confirm is.
+    base = System.monotonic_time(:millisecond)
+    Cairn.PresenceAggregator.observed(id, base, %{{nil, "person"} => 0.9})
+    Cairn.PresenceAggregator.observed(id, base + 500, %{{nil, "person"} => 0.9})
+    assert_receive {:presence_started, %Cairn.PresenceEvent{camera_id: ^id}}
+
+    diff = %{added: [], removed: [id], changed: [], rebuilt: [], refreshed: []}
+    :ok = CameraSupervisor.apply_diff(diff, config([]))
+
+    # reverse order: the aggregator cleared into a live recorder, and the
+    # recorder's own stop is what finalized
+    assert_receive {:presence_cleared, %Cairn.PresenceEvent{camera_id: ^id, label: "person"}}
+    assert_receive {:event_ended, %Cairn.Event{id: ^eid, status: :finalized}}
+    # and the finalize was cast by the recorder itself, to its own extractor
+    assert_receive {:extractor_cast, {:finalize, %Cairn.Event{id: ^eid}}}
+
+    refute Cairn.Registry.whereis(id, :camera)
+    refute Cairn.Registry.whereis(id, :presence)
+    refute Cairn.Registry.whereis(id, :presence_recorder)
+    assert Cairn.PresenceCheckpoint.get(id) == nil
+  end
+
+  # The lane's composition is a child list, which no running supervisor can be
+  # edited into — so a tier flip is the whole tree, not the media.
+  test "a rebuilt camera's whole tree is replaced, where a changed one's is not" do
+    {cam, group} = tiered("cs_flip_#{System.unique_integer([:positive])}", 1)
+    :ok = CameraSupervisor.sync(tiered_config([{cam, group}]))
+
+    sup = Cairn.Registry.whereis(cam.id, :camera)
+    assert Cairn.Registry.whereis(cam.id, :presence)
+
+    {_cam2, tier2_group} = tiered(cam.id, 2)
+    flipped = %Camera{cam | plugin: {:group, tier2_group.name}}
+    new_config = tiered_config([{flipped, tier2_group}])
+
+    assert %{changed: [], rebuilt: [id], refreshed: []} =
+             Config.Server.diff_cameras(tiered_config([{cam, group}]), new_config)
+
+    assert id == cam.id
+
+    :ok =
+      CameraSupervisor.apply_diff(
+        %{added: [], removed: [], changed: [], rebuilt: [cam.id], refreshed: []},
+        new_config
+      )
+
+    new_sup = Cairn.Registry.whereis(cam.id, :camera)
+    assert is_pid(new_sup) and new_sup != sup
+    refute Process.alive?(sup)
+    # and the tree it came back as is the new tier's: no presence workers
+    assert Supervisor.which_children(child_pid(new_sup, :lane)) == []
+    refute Cairn.Registry.whereis(cam.id, :presence)
   end
 
   test "a removed camera stops its whole tree, lane and media with it" do
@@ -191,7 +356,7 @@ defmodule Cairn.CameraSupervisorTest do
     lane = child_pid(sup, :lane)
     media = child_pid(sup, :media)
 
-    diff = %{added: [], removed: [id], changed: [], refreshed: []}
+    diff = %{added: [], removed: [id], changed: [], rebuilt: [], refreshed: []}
     :ok = CameraSupervisor.apply_diff(diff, config([]))
 
     refute Cairn.Registry.whereis(id, :camera)
@@ -214,7 +379,7 @@ defmodule Cairn.CameraSupervisorTest do
     # and with it every live track on the camera
     new = %Config{old | post_window_seconds: 42}
     diff = Config.Server.diff_cameras(old, new)
-    assert diff == %{added: [], removed: [], changed: [], refreshed: [id]}
+    assert diff == %{added: [], removed: [], changed: [], rebuilt: [], refreshed: [id]}
 
     :ok = CameraSupervisor.apply_diff(diff, new)
 
@@ -247,7 +412,13 @@ defmodule Cairn.CameraSupervisorTest do
     :ok = CameraSupervisor.sync(new_config)
     pid = Cairn.Registry.whereis(plain.id, :camera)
 
-    diff = %{added: [], removed: [], changed: [], refreshed: [plain.id, "never_started"]}
+    diff = %{
+      added: [],
+      removed: [],
+      changed: [],
+      rebuilt: [],
+      refreshed: [plain.id, "never_started"]
+    }
 
     assert :ok = CameraSupervisor.apply_diff(diff, new_config)
     assert Cairn.Registry.whereis(plain.id, :camera) == pid
@@ -319,6 +490,25 @@ defmodule Cairn.CameraSupervisorTest do
     on_exit(fn ->
       if previous, do: :persistent_term.put(key, previous), else: :persistent_term.erase(key)
     end)
+  end
+
+  defp open_event(camera_id) do
+    %Cairn.Event{
+      id: Ecto.UUID.generate(),
+      camera_id: camera_id,
+      started_at: DateTime.add(DateTime.utc_now(), -30),
+      status: :active,
+      labels: [%{t: +0.0, label: "person", score: 0.9}],
+      max_scores: %{"person" => 0.9},
+      max_score: 0.9
+    }
+  end
+
+  defp replacement(camera_id, dead) do
+    case Cairn.Registry.whereis(camera_id, :presence_recorder) do
+      pid when is_pid(pid) and pid != dead -> pid
+      _absent_or_dead -> nil
+    end
   end
 
   defp wait_for(fun, attempts \\ 200) do
