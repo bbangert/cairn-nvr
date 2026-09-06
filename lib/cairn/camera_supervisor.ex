@@ -91,8 +91,14 @@ defmodule Cairn.CameraSupervisor do
 
   The `:lane` workers run on through the gap, which is the point of the split:
   a restart-class change leaves the camera's tier alone (a tier flip is
-  `rebuilt`, not `changed`), so its presence state and its open clip survive a
-  new pipeline exactly as they survive a reconnect.
+  `rebuilt`, not `changed`), so its presence state survives a new pipeline.
+  An open CLIP does not, and cannot: the ring is inside `:media`, and the
+  extractor's subscription is held by the ring it drained, which no
+  replacement inherits. The extractor monitors that ring and closes the clip
+  `:finalized` when it goes, and the recorder — still holding the present keys
+  — opens the next clip on the new ring. A reconnect is the case that differs:
+  the ring is ahead of the pipeline in `Cairn.Camera.Media`, so it survives one
+  and the clip runs on unbroken.
 
   A start that fails is logged, not raised: `apply_diff/2` walks every changed
   camera and one bad config must not strand the rest. That camera's tree is

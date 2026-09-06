@@ -53,8 +53,10 @@ defmodule Cairn.Camera.Lane do
 
   # Built from the pair `Cairn.Camera.init/1` resolved for the whole tree, and
   # then held: `Cairn.CameraSupervisor.restart_media/2` replaces `:media`
-  # alone, so after a restart-class change these workers still hold the
-  # pre-change struct — and a `changed` camera gets no `{:refresh, _, _}` cast
+  # alone — the workers themselves survive it, though the clip one of them has
+  # open does not (the ring goes with the media; see `restart_media/2`) — so
+  # after a restart-class change these workers still hold the pre-change
+  # struct — and a `changed` camera gets no `{:refresh, _, _}` cast
   # to correct it. The classes are not disjoint: `:min_score` is restart-class
   # and `Cairn.PresenceRecorder.configured_floors/1` reads it off this struct.
   # What makes the stale copy harmless is that nothing consults it without

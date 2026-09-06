@@ -1285,6 +1285,9 @@ defmodule Cairn.PresenceRecorderTest do
 
     frames(ctx, [object("person", 0.9)])
     frames(ctx, [object("person", 0.95)])
+    # both casts handled before the shutdown, which comes from the supervisor
+    # and not from this process: nothing orders the two otherwise
+    _ = :sys.get_state(rec)
 
     ref = Process.monitor(rec)
     :ok = stop_supervised(:ordering_recorder)

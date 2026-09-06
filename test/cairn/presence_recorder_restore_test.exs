@@ -858,7 +858,8 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     # camera kept checkpointing
     frames(ctx, [object("person", 0.95, "detected", [0.2, 0.2, 0.2, 0.2])])
     assert :sys.get_state(rec).event.id == eid
-    assert Process.alive?(checkpoint)
+    # answering is the liveness claim; a pid can read as alive after its exit
+    assert is_map(:sys.get_state(checkpoint))
 
     # and a recorder that restarts inside the window comes up rather than
     # crash-looping on a table its `init/1` cannot read. What it cannot do is
@@ -887,6 +888,79 @@ defmodule Cairn.PresenceRecorderRestoreTest do
 
         :ok
     end
+  end
+
+  # The clip's dependency on its ring, end to end and with both real: the
+  # subscription lives in the ring's state, so a ring that dies — a media
+  # replacement, or a crash — takes the feed with it and no replacement
+  # inherits it. The extractor monitors the ring it drained and closes the clip
+  # `:finalized` rather than writing into nothing; the recorder reads that as
+  # the event's end, and the presence still standing opens the next clip on the
+  # next ring.
+  #
+  # Here rather than in the sibling suite because the recorder decides
+  # `:finalized` from the INDEX row the extractor wrote — the one thing that
+  # keeps the two from disagreeing — and that needs a reachable index.
+  test "a ring that goes ends the clip and the next one opens on its replacement", ctx do
+    id = ctx.camera_id
+    test_pid = self()
+
+    dir = Path.join(System.tmp_dir!(), "cairn_ringgo_#{System.unique_integer([:positive])}")
+    Cairn.DataDir.ensure!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    config = %Cairn.Config{data_dir: dir, remux_clips: false}
+
+    # the suite's setup ring is the one this clip will be fed by
+    ring = Cairn.Registry.whereis(id, :ring_buffer)
+    assert is_pid(ring)
+    fill_ring(id)
+
+    rec =
+      start_supervised!(
+        {PresenceRecorder,
+         camera_id: id,
+         resolve_policy: fn _camera_id -> {ctx.camera, @policy} end,
+         start_extractor: fn camera, event, _config ->
+           result = Cairn.EventExtractor.start(camera, event, identity: :label, config: config)
+           send(test_pid, {:started_real, event, result})
+           result
+         end},
+        id: :ring_recorder
+      )
+
+    announce(ctx, "person")
+    started(ctx)
+    assert_receive {:started_real, %Event{id: first}, {:ok, extractor}}
+    ref = Process.monitor(extractor)
+    # the drain (and so the monitor) happens in the extractor's own continue
+    assert wait_for_state(extractor, &(&1.ring_ref != nil))
+
+    # the ring goes, as `restart_media/2` takes it
+    :ok = stop_supervised(:ring)
+
+    assert_receive {:DOWN, ^ref, :process, ^extractor, :normal}, 5_000
+    assert Events.get(first).status == :finalized
+    # one `:event_ended`, from the recorder, agreeing with the row
+    assert_receive {:event_ended, %Event{id: ^first, status: :finalized}}, 2_000
+
+    # the recorder let the event go and is waiting for a ring to open the next
+    state = :sys.get_state(rec)
+    assert state.event == nil
+    assert MapSet.member?(state.present_labels, {nil, "person"})
+    assert state.retry_token != nil
+    assert PresenceCheckpoint.get(id) == nil
+
+    # the replacement ring arrives, and the retry opens the second clip on it
+    start_supervised!({Cairn.RingBuffer, camera_id: id, pre_window_seconds: 5}, id: :new_ring)
+    fill_ring(id)
+    send(rec, {:retry_open, :sys.get_state(rec).retry_token})
+
+    assert_receive {:started_real, %Event{id: second}, {:ok, next}}, 2_000
+    assert second != first
+    # awaited, so nothing writes under this test's directory during cleanup
+    next_ref = Process.monitor(next)
+    Cairn.EventExtractor.finalize(next, %Event{event(ctx) | id: second, status: :finalized})
+    assert_receive {:DOWN, ^next_ref, :process, ^next, :normal}, 5_000
   end
 
   # The orphaned-finalize contract, with a REAL extractor: the recorder casts
@@ -996,6 +1070,14 @@ defmodule Cairn.PresenceRecorderRestoreTest do
 
       true ->
         flunk("the recorder #{what}")
+    end
+  end
+
+  defp wait_for_state(pid, ready?, attempts \\ 200) do
+    cond do
+      ready?.(:sys.get_state(pid)) -> true
+      attempts > 0 -> Process.sleep(10) && wait_for_state(pid, ready?, attempts - 1)
+      true -> flunk("#{inspect(pid)} never reached the expected state")
     end
   end
 

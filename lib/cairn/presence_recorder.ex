@@ -385,29 +385,45 @@ defmodule Cairn.PresenceRecorder do
 
   def handle_info({:retry_open, _stale}, state), do: {:noreply, state}
 
-  # An exit while the event is open ends it `:partial`, whatever the reason —
-  # `:normal` and `:noproc` included. `Cairn.CameraTracker` reads those two as
-  # a clean finish; that rule belongs to an extractor it adopted from a
-  # checkpoint, and for an extractor this process started itself a
-  # clean-looking reason is one that died before doing its work, where clearing
-  # silently would strand the checkpoint row, the `:active` DB row and every
-  # `:event_ended` subscriber. The exit that FOLLOWS a finalize is the clause
-  # below, not this one: `clear_event/1` moved that monitor to `finalizing`.
+  # An exit while the event is open, and the index is what says which kind it
+  # was. Two are clean and one is not:
   #
-  # An ADOPTED extractor is the case CameraTracker's rule was written for, and
-  # gets it: the process that started it crashed, so its finalize may have been
-  # in flight when this one restored the row, and the index — which the
-  # extractor itself wrote — is what says whether that is what happened.
+  #   * the extractor CLOSED ITSELF, because the ring feeding it went — a media
+  #     replacement, or the ring crashing. The clip is complete up to that
+  #     instant, so the window is announced closed `:finalized`. The ordinary
+  #     ordering is inverted here (the clip landed before this broadcast) and
+  #     unavoidably so: the extractor is the process that noticed;
+  #   * an ADOPTED extractor whose finalize was already in flight when this
+  #     process restored the row;
+  #   * anything else — a death mid-clip, including one wearing `:normal` or
+  #     `:noproc`, which for an extractor this process started means it died
+  #     before doing its work. Clearing silently would strand the checkpoint
+  #     row, the `:active` DB row and every `:event_ended` subscriber.
+  #
+  # All three ask the same question, and asking the index is what keeps this
+  # process and the extractor from disagreeing: the row the extractor wrote is
+  # the fact, and exactly one `:event_ended` goes out — the extractor never
+  # broadcasts one. An index that cannot answer degrades to `:partial`, which
+  # `event_ended` being at-least-once and consumers re-fetching by id corrects.
+  #
+  # The exit that FOLLOWS a finalize this process cast is the clause below, not
+  # this one: `clear_event/1` moved that monitor to `finalizing`.
   def handle_info({:DOWN, _ref, :process, pid, reason}, %{extractor: pid} = state) do
     case state.event do
       %Event{} = event ->
         PresenceCheckpoint.delete(state.camera_id)
 
-        if finished_before_restore?(state, event) do
-          Logger.info("event #{event.id}: the adopted extractor had already finalized it")
-        else
-          Logger.warning("event #{event.id}: extractor exited open (#{inspect(reason)})")
-          Event.broadcast(:event_ended, %{event | status: :partial, ended_at: now()})
+        cond do
+          finished_before_restore?(state, event) ->
+            Logger.info("event #{event.id}: the adopted extractor had already finalized it")
+
+          indexed_status(event.id) == :finalized ->
+            Logger.info("event #{event.id}: the extractor closed its own clip")
+            Event.broadcast(:event_ended, %{event | status: :finalized, ended_at: now()})
+
+          true ->
+            Logger.warning("event #{event.id}: extractor exited open (#{inspect(reason)})")
+            Event.broadcast(:event_ended, %{event | status: :partial, ended_at: now()})
         end
 
         # The stay is not over just because its clip is: an extractor answers

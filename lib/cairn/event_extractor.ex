@@ -7,7 +7,12 @@ defmodule Cairn.EventExtractor do
   `events/{camera}/{event_id}_{camera}_{ts}.mp4`, writes the init segment,
   then atomically drains the ring's pre-window and subscribes for live
   fragments (`Cairn.RingBuffer.drain_and_subscribe/3` — race-free
-  boundary). Those drained fragments are the only sight anyone gets of the
+  boundary), monitoring the ring it drained. The clip ends either when its
+  owner casts `{:finalize, event}` or when that ring goes: the subscription
+  lives in the ring's own state, so a replacement — the one a media restart
+  builds — has never heard of this process, and there is nothing left to
+  wait for. Ended that way the clip is `:finalized`, not `:partial`: it is
+  complete up to the moment its source vanished. Those drained fragments are the only sight anyone gets of the
   clip's own time-zero, so the anchor taken there (`anchor/3`) pairs it with a
   wall clock for the sidecar header; it would otherwise be discarded with the
   fragments. The first fragment to arrive *live* completes that anchor with a
@@ -151,7 +156,11 @@ defmodule Cairn.EventExtractor do
       max_path_entries: Keyword.get(opts, :max_path_entries, @max_path_entries),
       # Built at the drain in `handle_continue(:open, ...)` — nil until then —
       # and completed with its live half by the first fragment to arrive after.
-      anchor: nil
+      anchor: nil,
+      # The monitor on the ring this clip is fed by, taken at the drain. The
+      # subscription is one-shot — the ring holds it in its own state — so a
+      # ring that dies takes the feed with it and no later ring inherits it.
+      ring_ref: nil
     }
 
     {:ok, state, {:continue, :open}}
@@ -173,8 +182,16 @@ defmodule Cairn.EventExtractor do
 
     with {:ok, _row} <- Events.create_active(event, path),
          {:ok, io} <- File.open(path, [:write, :binary, :raw, :delayed_write]) do
-      {:ok, %{init: init, fragments: drained}} =
+      {:ok, %{init: init, fragments: drained, owner: ring}} =
         RingBuffer.drain_and_subscribe(camera.id, nil, self())
+
+      # The ring the subscription was taken on, monitored: this clip is fed by
+      # that process and by no other. A replacement ring (a media restart)
+      # knows nothing of this subscription, so the clip is over when this one
+      # goes — see the `:DOWN` handler. `owner` from the reply rather than a
+      # Registry read, which would be a second question with a different
+      # answer available.
+      ring_ref = Process.monitor(ring)
 
       # Read here and nowhere later: the drained fragments are in hand and none
       # of them has been written yet, so this is as close as a wall clock gets
@@ -200,6 +217,7 @@ defmodule Cairn.EventExtractor do
         state
         | io: io,
           path: path,
+          ring_ref: ring_ref,
           anchor: anchor(kept, event, drain_wall_ms),
           skipped_fragments: length(dropped),
           skipped_ms: Enum.sum(Enum.map(dropped, & &1.duration_ms))
@@ -240,6 +258,27 @@ defmodule Cairn.EventExtractor do
     {:noreply, live_fragment(state, frag)}
   end
 
+  # The ring is gone, so this clip's source is gone: nothing more will ever
+  # arrive, and the subscription cannot be carried to whatever ring replaces
+  # it (`Cairn.CameraSupervisor.restart_media/2` builds a new one that has
+  # never heard of this process). The clip is closed with the media it has,
+  # `:finalized` and not `:partial` — it is complete up to the instant its
+  # source vanished, which is what a media replacement or a ring crash is.
+  #
+  # The owner is not told and is not waited for: it learns from this process's
+  # own exit (`Cairn.PresenceRecorder`'s and `Cairn.CameraTracker`'s
+  # `:DOWN` handlers), which is also what lets it open the next clip on the
+  # new ring.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{ring_ref: ref} = state) do
+    Logger.info("event #{state.event.id}: the ring went (#{inspect(reason)}); closing the clip")
+
+    finalize_now(%{state | ring_ref: nil}, %{
+      state.event
+      | ended_at: DateTime.utc_now(),
+        status: :finalized
+    })
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
@@ -248,6 +287,10 @@ defmodule Cairn.EventExtractor do
   end
 
   def handle_cast({:finalize, event}, state) do
+    finalize_now(state, event)
+  end
+
+  defp finalize_now(state, event) do
     snapshot_fun = Keyword.get(state.opts, :snapshot_fun, &Cairn.Snapshot.take_async/2)
 
     # The other end of `open_media/1`'s report: an event that never saw a

@@ -232,27 +232,87 @@ defmodule Cairn.CameraSupervisorTest do
   # aggregator in the gap. A restart-class change cannot move the tier — a tier
   # flip is `rebuilt` — so the presence workers outlive the new pipeline
   # exactly as they outlive a reconnect.
-  test "a media-only change leaves the tier-1 lane's workers running" do
+  # What survives a media replacement and what does not. The lane's workers do,
+  # with their presence state; the open CLIP does not, because the ring feeding
+  # it is inside `:media` and the extractor's subscription is held by that ring
+  # alone. So the first clip ends `:finalized` at the replacement and the next
+  # opens on the new ring, with the same recorder holding the same keys
+  # throughout.
+  test "a media-only change keeps the tier-1 lane and splits its open clip" do
     {cam, group} = tiered("cs_survive_#{System.unique_integer([:positive])}", 1)
-    :ok = CameraSupervisor.sync(tiered_config([{cam, group}]))
+    id = cam.id
+    cfg = tiered_config([{cam, group}])
+    publish(cfg)
+    Cairn.Event.subscribe()
 
-    sup = Cairn.Registry.whereis(cam.id, :camera)
-    agg = Cairn.Registry.whereis(cam.id, :presence)
-    rec = Cairn.Registry.whereis(cam.id, :presence_recorder)
+    :ok = CameraSupervisor.sync(cfg)
+    sup = Cairn.Registry.whereis(id, :camera)
+    agg = Cairn.Registry.whereis(id, :presence)
+    rec = Cairn.Registry.whereis(id, :presence_recorder)
     old_media = child_pid(sup, :media)
+    assert wait_for(fn -> Cairn.Registry.whereis(id, :ring_buffer) end, 200)
+
+    # a clip open on the ring the replacement is about to take, through a stand
+    # -in extractor that holds the ring subscription the real one would
+    extractor = ring_subscriber(id)
+    event = open_event(id)
+    eid = event.id
+    Cairn.PresenceLedger.announced(id, nil, "person", DateTime.utc_now(), 0.9)
+    on_exit(fn -> Cairn.PresenceLedger.cleared(id, nil, "person") end)
+    Cairn.PresenceCheckpoint.put!(id, event, [{nil, "person"}], extractor)
+    on_exit(fn -> Cairn.PresenceCheckpoint.delete(id) end)
+
+    Process.exit(rec, :kill)
+    restored = wait_for(fn -> replacement(id, rec) end, 400)
+    assert :sys.get_state(restored).event.id == eid
 
     moved = %Camera{cam | rtsp_url: "file:///dev/zero"}
     new_config = tiered_config([{moved, group}])
-    diff = %{added: [], removed: [], changed: [cam.id], rebuilt: [], refreshed: []}
+    publish(new_config)
+    diff = %{added: [], removed: [], changed: [id], rebuilt: [], refreshed: []}
     :ok = CameraSupervisor.apply_diff(diff, new_config)
 
+    # the workers are the same processes, and answering
     assert child_pid(sup, :media) != old_media
-    assert Cairn.Registry.whereis(cam.id, :presence) == agg
-    assert Cairn.Registry.whereis(cam.id, :presence_recorder) == rec
+    assert Cairn.Registry.whereis(id, :presence) == agg
+    assert Cairn.Registry.whereis(id, :presence_recorder) == restored
     # answering a call is liveness `Process.alive?/1` cannot claim: a pid that
     # has already exited can still read as alive for a moment
     assert is_map(:sys.get_state(agg))
-    assert is_map(:sys.get_state(rec))
+
+    # the clip did not: its ring went with the old media, so the stand-in saw
+    # the DOWN a real extractor closes on, and the recorder let the event go
+    assert_receive {:ring_gone, ^extractor}, 2_000
+    assert wait_for_state(restored, &(&1.event == nil))
+    state = :sys.get_state(restored)
+    assert MapSet.member?(state.present_labels, {nil, "person"})
+    assert state.retry_token != nil
+  end
+
+  # A stand-in for the extractor's half of the contract: it takes the same
+  # subscription on the same ring and reports the `:DOWN` that a real one
+  # closes its clip on, then exits — which is what the recorder reads. It
+  # stands in rather than proves: the monitor the real extractor takes is
+  # pinned in `Cairn.PresenceRecorderRestoreTest`, which has the index the
+  # `:finalized` decision is read from and which this suite has not. What is
+  # proved here is the consequence — the lane's workers keep their pids and
+  # their keys across a media replacement while the clip does not.
+  defp ring_subscriber(camera_id) do
+    test_pid = self()
+
+    pid =
+      spawn(fn ->
+        {:ok, %{owner: ring}} = Cairn.RingBuffer.drain_and_subscribe(camera_id, nil, self())
+        ref = Process.monitor(ring)
+        send(test_pid, {:subscribed, self()})
+
+        receive do
+          {:DOWN, ^ref, :process, _pid, _reason} -> send(test_pid, {:ring_gone, self()})
+        end
+      end)
+
+    assert_receive {:subscribed, ^pid}
+    pid
   end
 
   # A lane worker's `init/1` may not call `Cairn.Config.Server`, because that
@@ -742,6 +802,14 @@ defmodule Cairn.CameraSupervisorTest do
         ref = Process.monitor(pid)
         assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
         :ok
+    end
+  end
+
+  defp wait_for_state(pid, ready?, attempts \\ 200) do
+    cond do
+      ready?.(:sys.get_state(pid)) -> true
+      attempts > 0 -> Process.sleep(10) && wait_for_state(pid, ready?, attempts - 1)
+      true -> flunk("#{inspect(pid)} never reached the expected state")
     end
   end
 

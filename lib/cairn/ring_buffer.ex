@@ -65,6 +65,11 @@ defmodule Cairn.RingBuffer do
   Atomically returns the init segment plus all buffered fragments with
   `pts >= since_pts` and registers `pid` (monitored) to receive every
   subsequent fragment as `{:ring_fragment, frag}`.
+
+  `owner` is this process, so a subscriber can monitor the ring it is now fed
+  by without a second Registry read — which would be a different question, and
+  could answer with a different (or dead) pid than the one that took this
+  subscription.
   """
   @spec drain_and_subscribe(String.t(), non_neg_integer() | nil, pid()) ::
           {:ok,
@@ -72,6 +77,7 @@ defmodule Cairn.RingBuffer do
              init: binary() | nil,
              codec: String.t() | nil,
              epoch: Cairn.ULID.t() | nil,
+             owner: pid(),
              fragments: [Fragment.t()]
            }}
   def drain_and_subscribe(camera_id, since_pts, pid) do
@@ -182,8 +188,14 @@ defmodule Cairn.RingBuffer do
       end
 
     {:reply,
-     {:ok, %{init: state.init, codec: state.codec, epoch: state.epoch, fragments: fragments}},
-     state}
+     {:ok,
+      %{
+        init: state.init,
+        codec: state.codec,
+        epoch: state.epoch,
+        owner: self(),
+        fragments: fragments
+      }}, state}
   end
 
   def handle_call(:last_fragment_at, _from, state) do
