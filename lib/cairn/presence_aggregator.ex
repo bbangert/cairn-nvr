@@ -165,11 +165,12 @@ defmodule Cairn.PresenceAggregator do
   The camera is going away (removed, or restarting under a changed config —
   a tier flip included): clear everything, then stop.
 
-  `Cairn.CameraSupervisor.stop_camera/1` is the one caller, which is what
-  scopes the lifecycle: an ordinary crash/watchdog rebuild never passes
-  through there, so presence survives reconnects — and a camera that leaves
-  the config or changes shape takes its aggregator with it instead of
-  leaving stale presence standing until the silence backstop.
+  `Cairn.CameraSupervisor` is the only caller, from `stop_camera/1` (a camera
+  that left the config) and `restart_media/2` (one whose media is being
+  replaced), which is what scopes the lifecycle: an ordinary crash/watchdog
+  rebuild never passes through either, so presence survives reconnects — and a
+  camera that leaves the config or changes shape takes its aggregator with it
+  instead of leaving stale presence standing until the silence backstop.
   """
   @spec retire(String.t()) :: :ok
   def retire(camera_id) do

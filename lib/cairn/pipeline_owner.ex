@@ -161,7 +161,7 @@ defmodule Cairn.PipelineOwner do
   end
 
   # A supervisor restart hands this process the struct its tree was BUILT
-  # from (`Cairn.Camera` is `:rest_for_one`; a ring death restarts the owner
+  # from (`Cairn.Camera.Media` is `:rest_for_one`; a ring death restarts the owner
   # from the stored child spec), while a refresh since then reached only the
   # process that died. The server's snapshot is authoritative for the
   # refresh-class fields; the restart-class ones stay with opts because the
@@ -169,9 +169,10 @@ defmodule Cairn.PipelineOwner do
   # still running. The config comes from the snapshot whole: nothing in it
   # is compared by the camera diff, so a global that moved (`stall_seconds`)
   # reaches this watchdog here while a bridge sibling keeps the old value
-  # until its tree restarts — newer, and timing only. The pre-window stays
-  # safe only because the diff compares it resolved and restarts the whole
-  # tree when it moves; the ring above was sized from the opts pair.
+  # until its subtree is replaced — newer, and timing only. The pre-window
+  # stays safe only because the diff compares it resolved and replaces the
+  # whole media subtree when it moves; the ring above was sized from the opts
+  # pair.
   # Never a call to `Cairn.Config.Server`: `apply_diff` runs inside that
   # server, so a tree started from a reload would deadlock on it until the
   # call timed out — serially, per camera.
@@ -200,8 +201,9 @@ defmodule Cairn.PipelineOwner do
       send(state.pipeline, {:policy, camera, Config.policy(config, camera)})
     else
       # Except a zone edit, which the aggregator has to be told outright: it
-      # outlives the pipeline by design (only `Cairn.CameraSupervisor`'s
-      # `stop_camera/1` retires it), so through a backoff it would hold the
+      # outlives the pipeline by design (only `Cairn.CameraSupervisor` retires
+      # it, from `stop_camera/1` or `restart_media/2` — a stopped camera or a
+      # replaced media, never a rebuild), so through a backoff it would hold the
       # gone zone's keys with nothing left producing evidence against them.
       # Safe from here only because there is no pipeline: with one up, an
       # `observed` batch already in flight could re-mint what this cleared,
@@ -542,7 +544,8 @@ defmodule Cairn.PipelineOwner do
   # rules still require a connected source before any of this becomes a
   # rebuild, so a camera that is merely down stays exempt. An empty ring
   # cannot pair with an OLD start: the ring is upstream of this process in
-  # the camera's :rest_for_one, so a ring restart restarts the owner too.
+  # the camera's :rest_for_one media chain, so a ring restart restarts the
+  # owner too.
   defp ring_stale?(state) do
     since = last_fragment_at(state.camera.id) || state.pipeline_started_at_ms
 

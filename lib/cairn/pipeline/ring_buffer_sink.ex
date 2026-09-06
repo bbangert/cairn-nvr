@@ -51,7 +51,7 @@ defmodule Cairn.Pipeline.RingBufferSink do
     # nil means our box walker failed on the muxer's init, not that the init
     # is unusable; falling back to Fragment's default keeps timing math
     # wrong-but-bounded instead of crashing the ring — whose death restarts
-    # the whole camera tree (:rest_for_one), a far worse outcome.
+    # the camera's whole media chain (:rest_for_one), a far worse outcome.
     timescale = video_timescale(format.header) || 90_000
 
     {[], maybe_put_init(%{state | format: format, timescale: timescale})}

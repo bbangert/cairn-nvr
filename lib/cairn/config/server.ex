@@ -2,8 +2,9 @@ defmodule Cairn.Config.Server do
   @moduledoc """
   Holds the active `Cairn.Config`. Loads it through its `source` at boot;
   `reload/0` loads again, diffs cameras against the running set and applies
-  the diff (start/stop/restart camera trees, and refresh in place the
-  cameras whose change reaches no subprocess). An invalid reload keeps the
+  the diff (start/stop camera trees, replace the media subtree of the ones
+  whose restart-class config moved, and refresh in place the cameras whose
+  change reaches no subprocess). An invalid reload keeps the
   old config and returns the errors. Every applied config is announced on
   `Cairn.Config.topic/0` as `{:config_changed, diff}` — see `subscribe/0`.
 
@@ -24,7 +25,7 @@ defmodule Cairn.Config.Server do
 
   Detection lives in `Cairn.Native.Host`, so the new config goes there
   first (`reconfigure/1`) — the model a camera's next session opens a
-  stream on should already be the new one when its tree restarts.
+  stream on should already be the new one when its media restarts.
 
   `update/3` runs the caller's write, the source read and `Cairn.Config.from_map/1`
   inside one immediate-mode transaction on this process, so the store never
@@ -39,8 +40,9 @@ defmodule Cairn.Config.Server do
   A named server publishes each config it installs as a `:persistent_term`
   snapshot *before* applying it (`snapshot/1`, `snapshot_camera/2`,
   `known_ids/1`). A camera tree restarted by its own supervisor is rebuilt
-  from the child spec its tree was born with, and the snapshot is how the
-  owner recovers what a refresh since then delivered; the runtime owners read
+  from the child spec its tree was born with — which no later reload rewrites
+  — so the snapshot is what `Cairn.Camera.init/1` resolves the rebuilt tree
+  from and what the owner recovers a refresh from; the runtime owners read
   it to refuse a write for a camera that no longer exists (they prune against
   the membership the diff carries, not this one — `t:diff/0`). A term rather
   than a call because `apply_diff` runs inside this process — a camera
@@ -529,7 +531,7 @@ defmodule Cairn.Config.Server do
     old_ids = MapSet.new(Map.keys(old_by_id))
     new_ids = MapSet.new(Map.keys(new_by_id))
 
-    # `changed` restarts the camera's tree, `refreshed` hands the running one
+    # `changed` replaces the camera's media subtree, `refreshed` hands the running one
     # the new config: a camera is in exactly one of them, and in neither when
     # nothing about it moved.
     {changed, refreshed} =
