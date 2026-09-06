@@ -283,8 +283,12 @@ defmodule Cairn.CameraSupervisorTest do
     # the clip did not: its ring went with the old media, so the stand-in saw
     # the DOWN a real extractor closes on, and the recorder let the event go
     assert_receive {:ring_gone, ^extractor}, 2_000
-    assert wait_for_state(restored, &(&1.event == nil))
+    # the stand-in exits on that message, and the recorder's monitor DOWN is
+    # enqueued at the exit — ahead of this read in its mailbox
+    ex_ref = Process.monitor(extractor)
+    assert_receive {:DOWN, ^ex_ref, :process, ^extractor, _reason}, 2_000
     state = :sys.get_state(restored)
+    assert state.event == nil
     assert MapSet.member?(state.present_labels, {nil, "person"})
     assert state.retry_token != nil
   end
@@ -802,14 +806,6 @@ defmodule Cairn.CameraSupervisorTest do
         ref = Process.monitor(pid)
         assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
         :ok
-    end
-  end
-
-  defp wait_for_state(pid, ready?, attempts \\ 200) do
-    cond do
-      ready?.(:sys.get_state(pid)) -> true
-      attempts > 0 -> Process.sleep(10) && wait_for_state(pid, ready?, attempts - 1)
-      true -> flunk("#{inspect(pid)} never reached the expected state")
     end
   end
 

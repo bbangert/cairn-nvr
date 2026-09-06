@@ -901,7 +901,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
   # Here rather than in the sibling suite because the recorder decides
   # `:finalized` from the INDEX row the extractor wrote — the one thing that
   # keeps the two from disagreeing — and that needs a reachable index.
-  test "a ring that goes ends the clip and the next one opens on its replacement", ctx do
+  test "a ring that goes ends the clip through its owner, with the CURRENT event", ctx do
     id = ctx.camera_id
     test_pid = self()
 
@@ -911,8 +911,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     config = %Cairn.Config{data_dir: dir, remux_clips: false}
 
     # the suite's setup ring is the one this clip will be fed by
-    ring = Cairn.Registry.whereis(id, :ring_buffer)
-    assert is_pid(ring)
+    assert is_pid(Cairn.Registry.whereis(id, :ring_buffer))
     fill_ring(id)
 
     rec =
@@ -921,7 +920,15 @@ defmodule Cairn.PresenceRecorderRestoreTest do
          camera_id: id,
          resolve_policy: fn _camera_id -> {ctx.camera, @policy} end,
          start_extractor: fn camera, event, _config ->
-           result = Cairn.EventExtractor.start(camera, event, identity: :label, config: config)
+           # `self()` is the recorder: the seam runs in its process, and the
+           # owner is what the real `start_extractor/3` names too
+           result =
+             Cairn.EventExtractor.start(camera, event,
+               identity: :label,
+               config: config,
+               owner: self()
+             )
+
            send(test_pid, {:started_real, event, result})
            result
          end},
@@ -930,18 +937,45 @@ defmodule Cairn.PresenceRecorderRestoreTest do
 
     announce(ctx, "person")
     started(ctx)
-    assert_receive {:started_real, %Event{id: first}, {:ok, extractor}}
+    assert_receive {:started_real, %Event{id: first} = opened, {:ok, extractor}}
+    # the snapshot the extractor holds, and will hold forever
+    assert Map.keys(opened.max_scores) == ["person"]
     ref = Process.monitor(extractor)
-    # the drain (and so the monitor) happens in the extractor's own continue
-    assert wait_for_state(extractor, &(&1.ring_ref != nil))
+    # `handle_continue(:open, _)` runs before any other message, so one state
+    # read is the barrier for the drain and the ring monitor it takes
+    assert :sys.get_state(extractor).ring_ref != nil
 
-    # the ring goes, as `restart_media/2` takes it
-    :ok = stop_supervised(:ring)
+    # the event moves on: a label the clip did not open with
+    frames(ctx, [object("cat", 0.95, "detected", [0.2, 0.2, 0.2, 0.2])])
+    assert :sys.get_state(rec).event.max_scores["cat"] == 0.95
 
-    assert_receive {:DOWN, ^ref, :process, ^extractor, :normal}, 5_000
-    assert Events.get(first).status == :finalized
-    # one `:event_ended`, from the recorder, agreeing with the row
-    assert_receive {:event_ended, %Event{id: ^first, status: :finalized}}, 2_000
+    log =
+      capture_log(fn ->
+        # the ring goes, as `restart_media/2` takes it
+        :ok = stop_supervised(:ring)
+
+        # the OWNER closes it, and what it hands over is the current event
+        assert_receive {:event_ended,
+                        %Event{id: ^first, status: :finalized, max_scores: ended_scores}},
+                       2_000
+
+        assert ended_scores["cat"] == 0.95
+        assert_receive {:DOWN, ^ref, :process, ^extractor, :normal}, 5_000
+      end)
+
+    # The owner closed it, not the extractor: the orphan close is the only
+    # path that warns, and the test env logs at `:warning`, so its absence is
+    # the assertion available here. What the owner handed over is asserted
+    # above and below.
+    refute log =~ "closing it here"
+
+    # the row the extractor wrote carries what the owner handed it, not the
+    # snapshot it opened with
+    row = Events.get(first)
+    assert row.status == :finalized
+    assert row.labels["max_scores"]["cat"] == 0.95
+    # exactly one lifecycle end for this event
+    refute_received {:event_ended, %Event{id: ^first}}
 
     # the recorder let the event go and is waiting for a ring to open the next
     state = :sys.get_state(rec)
@@ -961,6 +995,115 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     next_ref = Process.monitor(next)
     Cairn.EventExtractor.finalize(next, %Event{event(ctx) | id: second, status: :finalized})
     assert_receive {:DOWN, ^next_ref, :process, ^next, :normal}, 5_000
+  end
+
+  # The one close the extractor performs itself: its owner is gone, so nothing
+  # will ever cast a finalize and the alternative is an `:active` row and an
+  # open file for the life of the node. Logged, because the metadata it closes
+  # with is the clip's opening snapshot.
+  test "an extractor whose owner is gone closes its own clip on ring loss", ctx do
+    id = ctx.camera_id
+
+    dir = Path.join(System.tmp_dir!(), "cairn_orphring_#{System.unique_integer([:positive])}")
+    Cairn.DataDir.ensure!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    config = %Cairn.Config{data_dir: dir, remux_clips: false}
+
+    fill_ring(id)
+    owner = spawn(fn -> Process.sleep(:infinity) end)
+    event = event(ctx)
+    eid = event.id
+
+    {:ok, extractor} =
+      Cairn.EventExtractor.start(ctx.camera, event,
+        identity: :label,
+        config: config,
+        owner: owner
+      )
+
+    ref = Process.monitor(extractor)
+    assert :sys.get_state(extractor).ring_ref != nil
+
+    log =
+      capture_log(fn ->
+        # the owner first, so the extractor is already ownerless when the ring
+        # goes — the order a lane owner crashing and its media restarting has
+        owner_ref = Process.monitor(owner)
+        Process.exit(owner, :kill)
+        assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}
+        # the extractor's own DOWN for that owner was enqueued at the same
+        # exit, so it is ahead of this read in its mailbox
+        assert :sys.get_state(extractor).owner == :lost
+
+        :ok = stop_supervised(:ring)
+        assert_receive {:DOWN, ^ref, :process, ^extractor, :normal}, 5_000
+      end)
+
+    assert log =~ "closing it here"
+    assert Events.get(eid).status == :finalized
+  end
+
+  # A replacement owner claims the clip it adopted, so a ring lost afterwards
+  # is closed by the process that has the event's current state — not by the
+  # extractor with the metadata a dead recorder opened it with.
+  test "an adopted extractor is finalized by its new owner, not orphaned", ctx do
+    id = ctx.camera_id
+    test_pid = self()
+
+    dir = Path.join(System.tmp_dir!(), "cairn_adopt_#{System.unique_integer([:positive])}")
+    Cairn.DataDir.ensure!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    config = %Cairn.Config{data_dir: dir, remux_clips: false}
+
+    fill_ring(id)
+
+    rec =
+      start_supervised!(
+        {PresenceRecorder,
+         camera_id: id,
+         resolve_policy: fn _camera_id -> {ctx.camera, @policy} end,
+         start_extractor: fn camera, event, _config ->
+           # `self()` is the recorder: the seam runs in its process, and the
+           # owner is what the real `start_extractor/3` names too
+           result =
+             Cairn.EventExtractor.start(camera, event,
+               identity: :label,
+               config: config,
+               owner: self()
+             )
+
+           send(test_pid, {:started_real, event, result})
+           result
+         end},
+        id: :adopt_recorder
+      )
+
+    announce(ctx, "person")
+    started(ctx)
+    assert_receive {:started_real, %Event{id: eid}, {:ok, extractor}}
+    assert :sys.get_state(extractor).ring_ref != nil
+    assert :sys.get_state(extractor).owner == rec
+
+    Process.exit(rec, :kill)
+    replacement = await_recorder(id, rec)
+    # the replacement answering proves its `init/1` returned, and so that the
+    # claim below was sent; the extractor answering proves it landed
+    assert :sys.get_state(replacement).event.id == eid
+    # the claim, without which the ring loss below would orphan-close
+    assert :sys.get_state(extractor).owner == replacement
+
+    ref = Process.monitor(extractor)
+
+    log =
+      capture_log(fn ->
+        :ok = stop_supervised(:ring)
+        assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}, 2_000
+        assert_receive {:DOWN, ^ref, :process, ^extractor, :normal}, 5_000
+      end)
+
+    # closed by the replacement owner, not orphaned — see the test above on why
+    # the absence of the orphan's warning is what is asserted
+    refute log =~ "closing it here"
   end
 
   # The orphaned-finalize contract, with a REAL extractor: the recorder casts
@@ -1070,14 +1213,6 @@ defmodule Cairn.PresenceRecorderRestoreTest do
 
       true ->
         flunk("the recorder #{what}")
-    end
-  end
-
-  defp wait_for_state(pid, ready?, attempts \\ 200) do
-    cond do
-      ready?.(:sys.get_state(pid)) -> true
-      attempts > 0 -> Process.sleep(10) && wait_for_state(pid, ready?, attempts - 1)
-      true -> flunk("#{inspect(pid)} never reached the expected state")
     end
   end
 

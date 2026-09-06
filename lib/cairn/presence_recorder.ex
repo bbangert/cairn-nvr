@@ -306,7 +306,14 @@ defmodule Cairn.PresenceRecorder do
   # starting this very lane. The seam takes it as an argument so a caller
   # cannot forget it.
   defp start_extractor(camera, event, config) do
-    Cairn.EventExtractor.start(camera, event, identity: :label, config: config)
+    Cairn.EventExtractor.start(camera, event,
+      identity: :label,
+      config: config,
+      # This process finalizes the clip, so it is what the extractor reports a
+      # lost ring to and monitors: the current labels, scores and trigger live
+      # here, never there.
+      owner: self()
+    )
   end
 
   @impl true
@@ -385,45 +392,46 @@ defmodule Cairn.PresenceRecorder do
 
   def handle_info({:retry_open, _stale}, state), do: {:noreply, state}
 
-  # An exit while the event is open, and the index is what says which kind it
-  # was. Two are clean and one is not:
+  # The clip's source is gone (`Cairn.EventExtractor`): a media replacement
+  # took the ring, or it crashed. The close is the ordinary one — this process
+  # holds the event's current labels, scores and trigger, and they are what the
+  # row must end with — and the retry is armed because the presence has not
+  # ended, only the clip: with the new ring up, `start_event/3`'s gate opens
+  # the next one. A stale id (the event has already closed) falls out of
+  # `maybe_finalize/3` and arms nothing.
+  def handle_info({:ring_lost, event_id}, %{event: %Event{id: event_id}} = state) do
+    {:noreply, arm_retry(maybe_finalize(state, event_id, :ring_lost))}
+  end
+
+  def handle_info({:ring_lost, _stale}, state), do: {:noreply, state}
+
+  # An exit while the event is open ends it `:partial`, whatever the reason —
+  # `:normal` and `:noproc` included. `Cairn.CameraTracker` reads those two as
+  # a clean finish; that rule belongs to an extractor it adopted from a
+  # checkpoint, and for an extractor this process started itself a
+  # clean-looking reason is one that died before doing its work, where clearing
+  # silently would strand the checkpoint row, the `:active` DB row and every
+  # `:event_ended` subscriber. The exit that FOLLOWS a finalize is the clause
+  # below, not this one: `clear_event/1` moved that monitor to `finalizing`.
   #
-  #   * the extractor CLOSED ITSELF, because the ring feeding it went — a media
-  #     replacement, or the ring crashing. The clip is complete up to that
-  #     instant, so the window is announced closed `:finalized`. The ordinary
-  #     ordering is inverted here (the clip landed before this broadcast) and
-  #     unavoidably so: the extractor is the process that noticed;
-  #   * an ADOPTED extractor whose finalize was already in flight when this
-  #     process restored the row;
-  #   * anything else — a death mid-clip, including one wearing `:normal` or
-  #     `:noproc`, which for an extractor this process started means it died
-  #     before doing its work. Clearing silently would strand the checkpoint
-  #     row, the `:active` DB row and every `:event_ended` subscriber.
+  # A lost ring is not a death and does not arrive here: the extractor reports
+  # it (`{:ring_lost, _}` above) and waits, so the clip ends through the
+  # ordinary close and its exit is then the `finalizing` case.
   #
-  # All three ask the same question, and asking the index is what keeps this
-  # process and the extractor from disagreeing: the row the extractor wrote is
-  # the fact, and exactly one `:event_ended` goes out — the extractor never
-  # broadcasts one. An index that cannot answer degrades to `:partial`, which
-  # `event_ended` being at-least-once and consumers re-fetching by id corrects.
-  #
-  # The exit that FOLLOWS a finalize this process cast is the clause below, not
-  # this one: `clear_event/1` moved that monitor to `finalizing`.
+  # An ADOPTED extractor is the case CameraTracker's rule was written for, and
+  # gets it: the process that started it crashed, so its finalize may have been
+  # in flight when this one restored the row, and the index — which the
+  # extractor itself wrote — is what says whether that is what happened.
   def handle_info({:DOWN, _ref, :process, pid, reason}, %{extractor: pid} = state) do
     case state.event do
       %Event{} = event ->
         PresenceCheckpoint.delete(state.camera_id)
 
-        cond do
-          finished_before_restore?(state, event) ->
-            Logger.info("event #{event.id}: the adopted extractor had already finalized it")
-
-          indexed_status(event.id) == :finalized ->
-            Logger.info("event #{event.id}: the extractor closed its own clip")
-            Event.broadcast(:event_ended, %{event | status: :finalized, ended_at: now()})
-
-          true ->
-            Logger.warning("event #{event.id}: extractor exited open (#{inspect(reason)})")
-            Event.broadcast(:event_ended, %{event | status: :partial, ended_at: now()})
+        if finished_before_restore?(state, event) do
+          Logger.info("event #{event.id}: the adopted extractor had already finalized it")
+        else
+          Logger.warning("event #{event.id}: extractor exited open (#{inspect(reason)})")
+          Event.broadcast(:event_ended, %{event | status: :partial, ended_at: now()})
         end
 
         # The stay is not over just because its clip is: an extractor answers
@@ -1005,6 +1013,12 @@ defmodule Cairn.PresenceRecorder do
 
   # -- lifecycle --------------------------------------------------------------
 
+  # `cause` is what ended the clip and what `resegment/2` is judged on:
+  # `:post_window` (the scene ended), `:max_event` (the cap, which opens the
+  # next segment), `:ring_lost` (the media went — the next clip is opened by
+  # the retry the caller arms, not here, because there is no ring to open it
+  # on yet), and `:camera_stopped`'s equivalent in `terminate/2`, which does
+  # this close by hand.
   defp maybe_finalize(%{event: %Event{id: event_id} = event} = state, event_id, cause) do
     Logger.info("event #{event.id} (#{state.camera_id}): finalizing (#{cause})")
     event = %{event | ended_at: now(), status: :finalized}
@@ -1253,6 +1267,11 @@ defmodule Cairn.PresenceRecorder do
   # degrades to the defaults by itself when the config server cannot answer.
   defp reattach(state, event, keys, extractor, box_slots) do
     Logger.info("event #{event.id} (#{state.camera_id}): re-attached to a live extractor")
+    # This process is its owner now. Without the claim the extractor still
+    # monitors the recorder that started it, which is dead, so a ring lost
+    # after this restore would read as having no owner and close the clip with
+    # the metadata it opened with (`Cairn.EventExtractor`'s orphan path).
+    Cairn.EventExtractor.owner(extractor, self())
     spent = DateTime.diff(now(), event.started_at, :second)
     {max_ref, max_token} = schedule(:max_event, event.id, max(state.policy.max - spent, 0))
     announced = announced_scores(state)
