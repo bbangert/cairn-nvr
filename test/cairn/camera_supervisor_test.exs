@@ -304,6 +304,109 @@ defmodule Cairn.CameraSupervisorTest do
     assert is_pid(back) and back != rec
   end
 
+  # The same rule one process further down. A leftover ledger row makes the
+  # recorder open an event inside its own `init/1`, and that starts a real
+  # `Cairn.EventExtractor`, whose own default reads the config by CALLING the
+  # server — the second door into the same deadlock. A lane worker restarting
+  # on its own is where this is reachable: the media is up, so the ring gate is
+  # open and the restore really does open a clip.
+  test "a restore-driven open starts an extractor without calling the config server" do
+    {cam, group} = tiered("cs_exconf_#{System.unique_integer([:positive])}", 1)
+    id = cam.id
+    cfg = tiered_config([{cam, group}])
+    publish(cfg)
+    Cairn.Event.subscribe()
+
+    :ok = CameraSupervisor.sync(cfg)
+    rec = wait_for(fn -> Cairn.Registry.whereis(id, :presence_recorder) end, 200)
+    assert wait_for(fn -> Cairn.Registry.whereis(id, :ring_buffer) end, 200)
+
+    # the announced key its replacement will adopt, as an aggregator that is
+    # still running left it
+    Cairn.PresenceLedger.announced(id, nil, "person", DateTime.utc_now(), 0.9)
+    on_exit(fn -> Cairn.PresenceLedger.cleared(id, nil, "person") end)
+
+    :sys.suspend(Cairn.Config.Server)
+    on_exit(fn -> :sys.resume(Cairn.Config.Server) end)
+
+    started_at = System.monotonic_time(:millisecond)
+    Process.exit(rec, :kill)
+    assert is_pid(wait_for(fn -> replacement(id, rec) end, 400))
+    elapsed = System.monotonic_time(:millisecond) - started_at
+
+    assert elapsed < 1_000, "the lane took #{elapsed}ms to come back"
+
+    # The adopted key opened a clip, promptly — a real `Cairn.EventExtractor`
+    # started and answered. Whether it stays alive is not asserted: this suite
+    # has no database, so its first write fails and it exits. The open landing
+    # at all is the contract; with the config left to the extractor's own
+    # `Cairn.Config.Server.get/0` it never lands while the server is blocked.
+    assert_receive {:event_started, %Cairn.Event{camera_id: ^id}}, 2_000
+  end
+
+  # No ring, no clip. A whole-camera start brings the `:lane` up ahead of
+  # `:media` by design, so a restored key reaches the open before
+  # `Cairn.RingBuffer` holds its name — and the extractor drains that ring in
+  # its own `handle_continue`. Opening anyway cost an `:event_ended`
+  # `:partial` for a clip that never began, once per camera-tree start with a
+  # standing presence.
+  test "a whole lane starting ahead of the media announces no clip it cannot fill" do
+    {cam, group} = tiered("cs_noring_#{System.unique_integer([:positive])}", 1)
+    id = cam.id
+    cfg = tiered_config([{cam, group}])
+    publish(cfg)
+    Cairn.Event.subscribe()
+
+    Cairn.PresenceLedger.announced(id, nil, "person", DateTime.utc_now(), 0.9)
+    on_exit(fn -> Cairn.PresenceLedger.cleared(id, nil, "person") end)
+
+    # the lane alone, exactly as `Cairn.Camera` starts it before `:media`
+    start_supervised!({Cairn.Camera.Lane, camera: cam, config: cfg}, id: :bare_lane)
+
+    rec = Cairn.Registry.whereis(id, :presence_recorder)
+    assert is_pid(rec)
+    refute Cairn.Registry.whereis(id, :ring_buffer)
+
+    # The recorder adopted the announced key and deferred; the aggregator,
+    # starting behind it, cleared the same key — so the stay ends with no
+    # event at all, where before it ended with a junk `:partial` for a clip
+    # the extractor never opened.
+    assert_receive {:presence_cleared, %Cairn.PresenceEvent{camera_id: ^id, label: "person"}}
+    assert :sys.get_state(rec).event == nil
+    refute_received {:event_started, %Cairn.Event{camera_id: ^id}}
+    refute_received {:event_ended, %Cairn.Event{camera_id: ^id}}
+  end
+
+  # The deferral is a wait, not a refusal: the retry loop the gate arms is what
+  # opens the clip once the ring is up. Driven on the recorder alone, which is
+  # the lane-restart shape — with the whole lane starting, the aggregator's
+  # own restore clears the adopted key first (the case above).
+  test "a deferred open is retried once the ring buffer arrives" do
+    {cam, group} = tiered("cs_ringwait_#{System.unique_integer([:positive])}", 1)
+    id = cam.id
+    publish(tiered_config([{cam, group}]))
+    Cairn.Event.subscribe()
+
+    Cairn.PresenceLedger.announced(id, nil, "person", DateTime.utc_now(), 0.9)
+    on_exit(fn -> Cairn.PresenceLedger.cleared(id, nil, "person") end)
+
+    rec = start_supervised!({Cairn.PresenceRecorder, camera: cam}, id: :bare_recorder)
+    refute Cairn.Registry.whereis(id, :ring_buffer)
+
+    state = :sys.get_state(rec)
+    assert state.event == nil
+    assert MapSet.member?(state.present_labels, {nil, "person"})
+    assert state.retry_token != nil
+    refute_received {:event_started, %Cairn.Event{camera_id: ^id}}
+    refute_received {:event_ended, %Cairn.Event{camera_id: ^id}}
+
+    # the ring arrives, as `:media` starting behind the lane brings it
+    start_supervised!({Cairn.RingBuffer, camera_id: id, pre_window_seconds: 5}, id: :late_ring)
+    send(rec, {:retry_open, :sys.get_state(rec).retry_token})
+
+    assert_receive {:event_started, %Cairn.Event{camera_id: ^id}}, 2_000
+  end
+
   # The one path S2 changes on a running node, through the real tree: a tier-1
   # camera with a clip open leaves the config, `apply_diff` stops its tree, and
   # the lane's reverse-order teardown clears the presence and finalizes the

@@ -36,6 +36,11 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     Cairn.SnapshotHelpers.lend_cameras(camera_id)
     camera = %Camera{id: camera_id, rtsp_url: "rtsp://h/1", min_score: %{"default" => 0.5}}
 
+    # The lane will not open a clip without the ring the extractor drains
+    # (`Cairn.PresenceRecorder.start_event/3`); on a real camera it is
+    # `Cairn.Camera.Media`'s second child.
+    start_supervised!({Cairn.RingBuffer, camera_id: camera_id, pre_window_seconds: 5}, id: :ring)
+
     Event.subscribe()
 
     on_exit(fn ->
@@ -60,7 +65,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
       {PresenceRecorder,
        camera_id: ctx.camera_id,
        resolve_policy: fn _camera_id -> {camera, @policy} end,
-       start_extractor: fn _camera, event ->
+       start_extractor: fn _camera, event, _config ->
          pid = relay(test_pid)
          send(test_pid, {:extractor_started, event, pid})
          {:ok, pid}
@@ -565,7 +570,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
          resolve_policy: fn _camera_id ->
            {camera, %{@policy | record: %{"person" => %{min_score: 0.6}}}}
          end,
-         start_extractor: fn _camera, event ->
+         start_extractor: fn _camera, event, _config ->
            pid = relay(test_pid)
            send(test_pid, {:extractor_started, event, pid})
            {:ok, pid}
@@ -631,7 +636,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
             {PresenceRecorder,
              camera_id: id,
              resolve_policy: fn _camera_id -> {camera, @policy} end,
-             start_extractor: fn _camera, _event -> exit(:noproc) end,
+             start_extractor: fn _camera, _event, _config -> exit(:noproc) end,
              finalize_extractor: fn _pid, _event -> :ok end},
             id: :exiting_extractor_recorder
           )
@@ -827,7 +832,6 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     # mid-remux and leave an `:active` row for boot reconciliation. Nothing in
     # this PR changed that bound; it only made the path reachable at shutdown.
     config = %Cairn.Config{data_dir: dir, remux_clips: false}
-    start_supervised!({Cairn.RingBuffer, camera_id: id, pre_window_seconds: 60}, id: :ring)
     fill_ring(id)
 
     rec =
@@ -838,7 +842,7 @@ defmodule Cairn.PresenceRecorderRestoreTest do
           # default `Cairn.EventExtractor.finalize/2` as the close
           camera_id: id,
           resolve_policy: fn _camera_id -> {ctx.camera, @policy} end,
-          start_extractor: fn camera, event ->
+          start_extractor: fn camera, event, _config ->
             result = Cairn.EventExtractor.start(camera, event, identity: :label, config: config)
             send(test_pid, {:started_real, event, result})
             result

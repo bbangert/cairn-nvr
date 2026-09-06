@@ -214,6 +214,11 @@ defmodule Cairn.PresenceRecorder do
       # cannot answer during a restart.
       camera: Keyword.get(opts, :camera),
       policy: seed_policy(opts),
+      # The `%Cairn.Config{}` that camera and policy were resolved from, kept
+      # because the clip is written under it: `Cairn.EventExtractor` otherwise
+      # reads it by calling the config server, which this process must never
+      # make happen from `init/1` (`policy_from_config/1`).
+      config: Keyword.get(opts, :config),
       # The effective floors the sink judged the last frames against — the
       # runtime `min_score` override included, which the camera struct does
       # not carry. `nil` until the first buffer arrives, and kept by the idle
@@ -266,7 +271,7 @@ defmodule Cairn.PresenceRecorder do
       # only way to reach a camera's tiers, and a test needs to drive one
       # without a config file behind it.
       resolve_policy: Keyword.get(opts, :resolve_policy, &policy_from_config/1),
-      start_extractor: Keyword.get(opts, :start_extractor, &start_extractor/2),
+      start_extractor: Keyword.get(opts, :start_extractor, &start_extractor/3),
       finalize_extractor:
         Keyword.get(opts, :finalize_extractor, &Cairn.EventExtractor.finalize/2),
       monotonic_ms: Keyword.get(opts, :monotonic_ms, &default_monotonic_ms/0)
@@ -286,8 +291,14 @@ defmodule Cairn.PresenceRecorder do
 
   # The identity variant is declared once, here, and travels with the event to
   # the sidecar's header: everything this lane forwards is label-keyed.
-  defp start_extractor(camera, event) do
-    Cairn.EventExtractor.start(camera, event, identity: :label)
+  #
+  # `config:` is passed rather than left to the extractor's own default, which
+  # is `Cairn.Config.Server.get/0` — a call this process can reach from
+  # `init/1` (`restore/1` can open an event), on a server that may be blocked
+  # starting this very lane. The seam takes it as an argument so a caller
+  # cannot forget it.
+  defp start_extractor(camera, event, config) do
+    Cairn.EventExtractor.start(camera, event, identity: :label, config: config)
   end
 
   @impl true
@@ -541,9 +552,27 @@ defmodule Cairn.PresenceRecorder do
     end
   end
 
+  # No ring, no clip. The camera's `:lane` starts ahead of its `:media`
+  # (`Cairn.Camera`), so on a whole-camera start this process can be restoring
+  # an announced key — and opening an event for it — before
+  # `Cairn.RingBuffer` holds its name. The extractor drains the ring in its own
+  # `handle_continue`, so it would exit `:noproc`, and the `:DOWN` that follows
+  # would announce an `:event_ended` `:partial` for a clip that never began.
+  # Waiting instead costs nothing: the ring is `Cairn.Camera.Media`'s second
+  # child, ahead of the pipeline, so it is up before any frame this event
+  # could hold, and `arm_retry/1` is already the loop that re-runs every gate.
+  defp start_event(state, started_at, seeds) do
+    if Cairn.Registry.whereis(state.camera_id, :ring_buffer) do
+      open_event(state, started_at, seeds)
+    else
+      Logger.debug("camera #{state.camera_id}: no ring buffer yet; deferring the open")
+      arm_retry(state)
+    end
+  end
+
   # `started_at` is the event's t=0, and every box's `t_ms` is measured from it;
   # `seeds` are the labels it opens with, at the best score known for each.
-  defp start_event(state, started_at, seeds) do
+  defp open_event(state, started_at, seeds) do
     max_scores = Map.new(seeds)
 
     event = %Event{
@@ -592,7 +621,9 @@ defmodule Cairn.PresenceRecorder do
   # reach this from `init/1`: a crash there is re-driven by the `:transient`
   # restart, deterministically, since the ledger row that led to it is not
   # consumed by reading it. Such a loop spends `Cairn.Camera.Lane`'s restart
-  # intensity in seconds, and takes the camera's whole tree with it.
+  # intensity in seconds; `Cairn.Camera` is `:one_for_one`, so what that
+  # restarts is the LANE, with the media streaming throughout — only the lane
+  # exhausting the camera's own intensity in turn takes the tree.
   #
   # The state a refusal leaves is a consistent one — keys present, no event —
   # and the next qualifying transition opens from it.
@@ -601,7 +632,7 @@ defmodule Cairn.PresenceRecorder do
   # `{:ok, pid, info}` and `:ignore` — either would otherwise crash the one
   # caller's case, inside `init/1` on the adoption path.
   defp launch_extractor(state, event) do
-    case state.start_extractor.(state.camera, event) do
+    case state.start_extractor.(state.camera, event, state.config) do
       {:ok, pid} -> {:ok, pid}
       {:ok, pid, _info} -> {:ok, pid}
       :ignore -> {:error, :ignore}
@@ -1024,9 +1055,11 @@ defmodule Cairn.PresenceRecorder do
   # something may have opened an event in the meantime, recording may have been
   # switched off, the policy may have narrowed, and the presence that wanted the
   # clip may have ended. A camera that left needs no gate — its tree stops this
-  # process, and a stopped process serves no timer. A failure
-  # here arms the next one from `start_event/3`; anything else lets the loop
-  # stop.
+  # process, and a stopped process serves no timer. The ring gate is not
+  # checked here either: it lives in `start_event/3`, which is what this calls,
+  # so a retry that is still ahead of the media simply arms the next one.
+  # A failure here arms the next one from `start_event/3`; anything else lets
+  # the loop stop.
   defp retry_open(%{event: %Event{}} = state), do: state
 
   defp retry_open(state) do
@@ -1540,10 +1573,19 @@ defmodule Cairn.PresenceRecorder do
   # unaffected — it is being written.
   defp recording_enabled?(state), do: CameraControl.get(state.camera_id).recording_enabled
 
+  # A seam may answer with the config it read (the default does — it has it
+  # from the same snapshot); one that does not leaves the config in hand, which
+  # is the seeded one and the only one a test drives with.
   defp resolve_policy(state) do
     case state.resolve_policy.(state.camera_id) do
-      {%Config.Camera{} = camera, policy} -> %{state | camera: camera, policy: policy}
-      :error -> hold_policy(state)
+      {%Config.Camera{} = camera, policy, %Config{} = config} ->
+        %{state | camera: camera, policy: policy, config: config}
+
+      {%Config.Camera{} = camera, policy} ->
+        %{state | camera: camera, policy: policy}
+
+      :error ->
+        hold_policy(state)
     end
   end
 
@@ -1567,7 +1609,7 @@ defmodule Cairn.PresenceRecorder do
   # leaves `hold_policy/1` holding the pair the lane seeded this process with.
   defp policy_from_config(camera_id) do
     case Config.Server.snapshot_camera(camera_id) do
-      {:ok, camera, config} -> {camera, Config.policy(config, camera)}
+      {:ok, camera, config} -> {camera, Config.policy(config, camera), config}
       :error -> :error
     end
   end
@@ -1577,7 +1619,8 @@ defmodule Cairn.PresenceRecorder do
   # admits everything above the wire floor.
   defp hold_policy(%{policy: nil} = state) do
     camera = %Config.Camera{id: state.camera_id}
-    %{state | camera: camera, policy: Config.policy(%Config{}, camera)}
+    config = state.config || %Config{}
+    %{state | camera: camera, policy: Config.policy(config, camera), config: config}
   end
 
   defp hold_policy(state), do: state

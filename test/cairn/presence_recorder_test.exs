@@ -50,6 +50,11 @@ defmodule Cairn.PresenceRecorderTest do
     Cairn.SnapshotHelpers.lend_cameras(camera_id)
     camera = %Camera{id: camera_id, rtsp_url: "rtsp://h/1", min_score: %{"default" => 0.5}}
 
+    # The lane will not open a clip without the ring the extractor drains
+    # (`Cairn.PresenceRecorder.start_event/3`); on a real camera it is
+    # `Cairn.Camera.Media`'s second child.
+    start_supervised!({Cairn.RingBuffer, camera_id: camera_id, pre_window_seconds: 5}, id: :ring)
+
     Event.subscribe()
 
     on_exit(fn ->
@@ -73,7 +78,7 @@ defmodule Cairn.PresenceRecorderTest do
        [
          camera_id: ctx.camera_id,
          resolve_policy: fn _camera_id -> {camera, policy} end,
-         start_extractor: fn _camera, event ->
+         start_extractor: fn _camera, event, _config ->
            pid = relay(test_pid)
            send(test_pid, {:extractor_started, event, pid})
            {:ok, pid}
@@ -400,7 +405,7 @@ defmodule Cairn.PresenceRecorderTest do
         {PresenceRecorder,
          camera_id: id,
          resolve_policy: fn _id -> {ctx.camera, @policy} end,
-         start_extractor: fn _camera, event ->
+         start_extractor: fn _camera, event, _config ->
            pid = relay(test_pid)
            send(test_pid, {:extractor_started, event, pid})
            {:ok, pid}
@@ -586,7 +591,7 @@ defmodule Cairn.PresenceRecorderTest do
         {PresenceRecorder,
          camera_id: id,
          resolve_policy: fn _camera_id -> {camera, @policy} end,
-         start_extractor: fn _camera, event ->
+         start_extractor: fn _camera, event, _config ->
            if :counters.get(failing, 1) == 1 do
              {:error, :no_event_supervisor}
            else
@@ -630,7 +635,7 @@ defmodule Cairn.PresenceRecorderTest do
         {PresenceRecorder,
          camera_id: id,
          resolve_policy: fn _camera_id -> {camera, @policy} end,
-         start_extractor: fn _camera, _event -> {:error, :no_event_supervisor} end,
+         start_extractor: fn _camera, _event, _config -> {:error, :no_event_supervisor} end,
          finalize_extractor: fn _pid, _event -> :ok end},
         id: :retry_stop_recorder
       )
@@ -661,7 +666,7 @@ defmodule Cairn.PresenceRecorderTest do
         {PresenceRecorder,
          camera_id: id,
          resolve_policy: fn _camera_id -> {camera, @policy} end,
-         start_extractor: fn _camera, _event -> {:error, :no_event_supervisor} end,
+         start_extractor: fn _camera, _event, _config -> {:error, :no_event_supervisor} end,
          finalize_extractor: fn _pid, _event -> :ok end},
         id: :retry_stop_recorder
       )
@@ -696,7 +701,7 @@ defmodule Cairn.PresenceRecorderTest do
 
            {camera, %{@policy | record: record}}
          end,
-         start_extractor: fn _camera, event ->
+         start_extractor: fn _camera, event, _config ->
            pid = relay(test_pid)
            send(test_pid, {:extractor_started, event, pid})
            {:ok, pid}
@@ -819,7 +824,7 @@ defmodule Cairn.PresenceRecorderTest do
         {PresenceRecorder,
          camera_id: id,
          resolve_policy: fn _camera_id -> {camera, @policy} end,
-         start_extractor: fn _camera, event ->
+         start_extractor: fn _camera, event, _config ->
            pid = spawn(fn -> receive(do: (:finish -> :ok)) end)
            send(test_pid, {:extractor_started, event, pid})
            {:ok, pid}
@@ -1265,7 +1270,7 @@ defmodule Cairn.PresenceRecorderTest do
           # test a different ordering than the one that ships.
           camera_id: id,
           resolve_policy: fn _camera_id -> {ctx.camera, @policy} end,
-          start_extractor: fn _camera, event ->
+          start_extractor: fn _camera, event, _config ->
             pid = relay(test_pid)
             send(test_pid, {:extractor_started, event, pid})
             {:ok, pid}
@@ -1356,7 +1361,7 @@ defmodule Cairn.PresenceRecorderTest do
          resolve_policy: fn _camera_id ->
            {camera, %{@policy | post: :counters.get(windows, 1)}}
          end,
-         start_extractor: fn _camera, event ->
+         start_extractor: fn _camera, event, _config ->
            pid = relay(test_pid)
            send(test_pid, {:extractor_started, event, pid})
            {:ok, pid}
