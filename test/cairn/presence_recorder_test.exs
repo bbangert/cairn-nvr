@@ -1390,6 +1390,54 @@ defmodule Cairn.PresenceRecorderTest do
     assert :sys.get_state(rec).policy.post == 42
   end
 
+  # The same contract on a real timer, which is the only way to see it: the
+  # test above fires the post window by hand, so it cannot tell which duration
+  # was armed. The window an event closes on is the one it OPENED with, so a
+  # refresh that lengthens it mid-clip must not stretch the clip.
+  test "a refresh does not stretch the open event's post window", ctx do
+    id = ctx.camera_id
+    test_pid = self()
+    windows = :counters.new(1, [])
+    :counters.add(windows, 1, 1)
+    camera = ctx.camera
+
+    rec =
+      start_supervised!(
+        {PresenceRecorder,
+         camera_id: id,
+         resolve_policy: fn _camera_id ->
+           {camera, %{@policy | post: :counters.get(windows, 1)}}
+         end,
+         start_extractor: fn _camera, event, _config ->
+           pid = relay(test_pid)
+           send(test_pid, {:extractor_started, event, pid})
+           {:ok, pid}
+         end,
+         finalize_extractor: fn _pid, _event -> :ok end},
+        id: :window_recorder
+      )
+
+    started(ctx)
+    assert_receive {:extractor_started, %Event{id: first}, _pid}
+    assert :sys.get_state(rec).event_policy.post == 1
+
+    # thirty times longer, landing while the clip is being written
+    :counters.put(windows, 1, 30)
+    PresenceRecorder.refresh(id, camera, %Cairn.Config{})
+    assert :sys.get_state(rec).policy.post == 30
+    assert :sys.get_state(rec).event_policy.post == 1
+
+    cleared(ctx)
+    # the real timer, unfired by this test: one second, not thirty
+    assert_receive {:event_ended, %Event{id: ^first, status: :finalized}}, 3_000
+
+    # and the event after it opens under the refreshed window
+    started(ctx)
+    assert_receive {:extractor_started, %Event{id: second}, _pid}
+    assert second != first
+    assert :sys.get_state(rec).event_policy.post == 30
+  end
+
   # The floors ride in with the frames, from a different sender than the
   # transitions: a confirm can land ahead of the batch that produced it. An
   # operator LOWERING the runtime floor mid-scene would otherwise have the

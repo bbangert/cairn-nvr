@@ -813,6 +813,82 @@ defmodule Cairn.PresenceRecorderRestoreTest do
     assert [{nil, "person", _at, 0.9}] = PresenceLedger.leftovers(id)
   end
 
+  # `Cairn.PresenceCheckpoint`'s window, the ledger's twin one child earlier in
+  # the same `:rest_for_one`: its table dies with it and its callers do not, so
+  # every tier-1 recorder on the node is still writing checkpoints into
+  # nothing. Two halves, because the API has two shapes — a `put/5` that finds
+  # no process (a `GenServer.call` that exits) and a `get/1`, `delete/1` or
+  # `all/0` that finds no table.
+  #
+  # Neither half kills anything: the name is unregistered and put back, and the
+  # table is deleted from its owner and restored by stopping it so the
+  # supervisor builds a fresh one. A kill would race its own restart, and this
+  # suite shares the node's real presence tree.
+  test "a checkpoint crash's window does not take the recorders with it", ctx do
+    id = ctx.camera_id
+    rec = recorder(ctx)
+
+    announce(ctx, "person")
+    started(ctx)
+    assert_receive {:extractor_started, %Event{id: eid}, _pid}
+    # the stub reports from inside the open, so the row lands after it
+    _ = :sys.get_state(rec)
+    assert {%Event{id: ^eid}, _keys, _pid, _slots} = PresenceCheckpoint.get(id)
+
+    checkpoint = Process.whereis(Cairn.PresenceCheckpoint)
+
+    # the write path with no process behind the name
+    Process.unregister(Cairn.PresenceCheckpoint)
+    assert PresenceCheckpoint.put(id, event(ctx), [], nil) == :ok
+    Process.register(checkpoint, Cairn.PresenceCheckpoint)
+
+    # and the table paths with no table
+    on_exit(fn -> restore_checkpoint_table() end)
+
+    :sys.replace_state(checkpoint, fn state ->
+      :ets.delete(:cairn_active_presence_events) && state
+    end)
+
+    assert PresenceCheckpoint.get(id) == nil
+    assert PresenceCheckpoint.delete(id) == :ok
+    assert PresenceCheckpoint.all() == []
+
+    # a live recorder writing through the window survives it — and so does the
+    # owner it writes to, which would otherwise crash-loop for as long as any
+    # camera kept checkpointing
+    frames(ctx, [object("person", 0.95, "detected", [0.2, 0.2, 0.2, 0.2])])
+    assert :sys.get_state(rec).event.id == eid
+    assert Process.alive?(checkpoint)
+
+    # and a recorder that restarts inside the window comes up rather than
+    # crash-looping on a table its `init/1` cannot read. What it cannot do is
+    # restore: with no row to read it treats the camera as one with nothing
+    # open, and the announced key the ledger still holds opens a fresh clip —
+    # which is the same state, and the same sweep, as a row that was never
+    # written.
+    Process.exit(rec, :kill)
+    replacement = await_recorder(id, rec)
+    state = :sys.get_state(replacement)
+    assert state.event != nil and state.event.id != eid
+  end
+
+  # The owner recreates the table in `init/1`, so stopping it is how a test
+  # that removed the table hands the node a healthy one back.
+  defp restore_checkpoint_table do
+    case Process.whereis(Cairn.PresenceCheckpoint) do
+      nil ->
+        :ok
+
+      pid ->
+        if :ets.whereis(:cairn_active_presence_events) == :undefined do
+          GenServer.stop(pid, :shutdown)
+          await_new_checkpoint(pid)
+        end
+
+        :ok
+    end
+  end
+
   # The orphaned-finalize contract, with a REAL extractor: the recorder casts
   # the finalize from `terminate/2` and returns without awaiting it, and the
   # extractor — `:temporary` under `Cairn.EventSupervisor`, outside the camera's
@@ -920,6 +996,20 @@ defmodule Cairn.PresenceRecorderRestoreTest do
 
       true ->
         flunk("the recorder #{what}")
+    end
+  end
+
+  defp await_new_checkpoint(dead, attempts \\ 200) do
+    case Process.whereis(Cairn.PresenceCheckpoint) do
+      pid when is_pid(pid) and pid != dead ->
+        true
+
+      _absent when attempts > 0 ->
+        Process.sleep(10)
+        await_new_checkpoint(dead, attempts - 1)
+
+      _absent ->
+        flunk("the presence checkpoint never came back")
     end
   end
 

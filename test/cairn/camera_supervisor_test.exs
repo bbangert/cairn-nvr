@@ -313,7 +313,16 @@ defmodule Cairn.CameraSupervisorTest do
   test "a restore-driven open starts an extractor without calling the config server" do
     {cam, group} = tiered("cs_exconf_#{System.unique_integer([:positive])}", 1)
     id = cam.id
-    cfg = tiered_config([{cam, group}])
+
+    # A real extractor writes a clip, so it gets a data dir of its own rather
+    # than the suite's shared one: it has no sandbox connection here, so its
+    # first row fails and it exits — and a file it creates under a directory
+    # the setup's `on_exit` is removing races that removal.
+    dir = Path.join(System.tmp_dir!(), "cairn_exconf_#{System.unique_integer([:positive])}")
+    Cairn.DataDir.ensure!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+
+    cfg = %Config{tiered_config([{cam, group}]) | data_dir: dir}
     publish(cfg)
     Cairn.Event.subscribe()
 
@@ -341,7 +350,10 @@ defmodule Cairn.CameraSupervisorTest do
     # has no database, so its first write fails and it exits. The open landing
     # at all is the contract; with the config left to the extractor's own
     # `Cairn.Config.Server.get/0` it never lands while the server is blocked.
-    assert_receive {:event_started, %Cairn.Event{camera_id: ^id}}, 2_000
+    assert_receive {:event_started, %Cairn.Event{camera_id: ^id} = event}, 2_000
+
+    # awaited, so nothing is still writing when this test's directory goes
+    await_extractor_gone(id, event.id)
   end
 
   # No ring, no clip. A whole-camera start brings the `:lane` up ahead of
@@ -390,7 +402,16 @@ defmodule Cairn.CameraSupervisorTest do
     Cairn.PresenceLedger.announced(id, nil, "person", DateTime.utc_now(), 0.9)
     on_exit(fn -> Cairn.PresenceLedger.cleared(id, nil, "person") end)
 
-    rec = start_supervised!({Cairn.PresenceRecorder, camera: cam}, id: :bare_recorder)
+    # The extractor is stubbed: what this proves is that the RETRY opens once
+    # the ring is there, not that a clip is written — and a real one would
+    # write an `:active` row this suite has no sandbox for, then crash, having
+    # already created files under the data dir the setup's `on_exit` is
+    # removing.
+    rec =
+      start_supervised!({Cairn.PresenceRecorder, [camera: cam] ++ stub_extractor()},
+        id: :bare_recorder
+      )
+
     refute Cairn.Registry.whereis(id, :ring_buffer)
 
     state = :sys.get_state(rec)
@@ -405,6 +426,51 @@ defmodule Cairn.CameraSupervisorTest do
     send(rec, {:retry_open, :sys.get_state(rec).retry_token})
 
     assert_receive {:event_started, %Cairn.Event{camera_id: ^id}}, 2_000
+    assert_receive {:extractor_started, %Cairn.Event{camera_id: ^id}, _relay}
+  end
+
+  # `Cairn.Registry.whereis/2` does not filter dead pids, and the single
+  # partition's DOWN handling can lag a read: inside a media replacement a
+  # `:retry_open` timer can see the old ring's corpse. Answering it would open
+  # a clip against a ring that cannot be drained.
+  test "a ring the registry has not reaped yet does not open the gate" do
+    {cam, group} = tiered("cs_deadring_#{System.unique_integer([:positive])}", 1)
+    id = cam.id
+    publish(tiered_config([{cam, group}]))
+    Cairn.Event.subscribe()
+
+    ring = start_supervised!({Cairn.RingBuffer, camera_id: id, pre_window_seconds: 5}, id: :ring)
+
+    rec =
+      start_supervised!({Cairn.PresenceRecorder, [camera: cam] ++ stub_extractor()},
+        id: :gate_recorder
+      )
+
+    # Suspended, the registry's unregistration lag is unbounded, which is the
+    # state a read inside a media replacement can land in. Resumed on the way
+    # out, ahead of this suite's camera teardown.
+    partition = Process.whereis(Cairn.Registry.PIDPartition0)
+    :sys.suspend(partition)
+    on_exit(fn -> :sys.resume(partition) end)
+
+    :ok = stop_supervised(:ring)
+    refute Process.alive?(ring)
+    assert Cairn.Registry.whereis(id, :ring_buffer) == ring
+
+    Cairn.PresenceRecorder.presence(id, :presence_started, %Cairn.PresenceEvent{
+      camera_id: id,
+      zone: nil,
+      label: "person",
+      score: 0.9,
+      first_seen_at: DateTime.utc_now(),
+      at: DateTime.utc_now()
+    })
+
+    state = :sys.get_state(rec)
+    assert state.event == nil
+    assert state.retry_token != nil
+    refute_received {:extractor_started, %Cairn.Event{camera_id: ^id}, _relay}
+    refute_received {:event_started, %Cairn.Event{camera_id: ^id}}
   end
 
   # The one path S2 changes on a running node, through the real tree: a tier-1
@@ -645,6 +711,38 @@ defmodule Cairn.CameraSupervisorTest do
     on_exit(fn ->
       if previous, do: :persistent_term.put(key, previous), else: :persistent_term.erase(key)
     end)
+  end
+
+  # The lane suites' extractor stand-in: a plain process that reports and never
+  # touches the database or the data dir, which this suite has neither a
+  # sandbox connection nor a lifetime for.
+  defp stub_extractor do
+    test_pid = self()
+
+    [
+      start_extractor: fn _camera, event, _config ->
+        pid = Cairn.PresenceFixtures.relay(test_pid)
+        send(test_pid, {:extractor_started, event, pid})
+        {:ok, pid}
+      end,
+      finalize_extractor: fn pid, event -> send(test_pid, {:extractor_finalized, pid, event}) end
+    ]
+  end
+
+  # A real extractor is `:temporary` under `Cairn.EventSupervisor`, outside
+  # every tree this suite stops, so a test that started one waits for it before
+  # its directory is removed. Already gone is the ordinary answer: with no
+  # sandbox connection its first write fails.
+  defp await_extractor_gone(camera_id, event_id) do
+    case Cairn.Registry.whereis(camera_id, {:extractor, event_id}) do
+      nil ->
+        :ok
+
+      pid ->
+        ref = Process.monitor(pid)
+        assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
+        :ok
+    end
   end
 
   defp rebuilt_diff(id),

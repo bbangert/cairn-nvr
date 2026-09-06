@@ -214,6 +214,14 @@ defmodule Cairn.PresenceRecorder do
       # cannot answer during a restart.
       camera: Keyword.get(opts, :camera),
       policy: seed_policy(opts),
+      # The policy the OPEN event was opened under, `nil` between events. The
+      # windows an event is closed by are the ones it began with, so they are
+      # read from here and never from `policy`, which keeps moving with every
+      # refresh and every transition. Before this they were the same field, so
+      # "an in-flight event keeps its opening policy" held only until the next
+      # `presence_started` or refresh re-resolved — true in the common case,
+      # approximate in exactly the one an operator would notice.
+      event_policy: nil,
       # The `%Cairn.Config{}` that camera and policy were resolved from, kept
       # because the clip is written under it: `Cairn.EventExtractor` otherwise
       # reads it by calling the config server, which this process must never
@@ -562,11 +570,29 @@ defmodule Cairn.PresenceRecorder do
   # child, ahead of the pipeline, so it is up before any frame this event
   # could hold, and `arm_retry/1` is already the loop that re-runs every gate.
   defp start_event(state, started_at, seeds) do
-    if Cairn.Registry.whereis(state.camera_id, :ring_buffer) do
+    if ring_ready?(state.camera_id) do
       open_event(state, started_at, seeds)
     else
       Logger.debug("camera #{state.camera_id}: no ring buffer yet; deferring the open")
       arm_retry(state)
+    end
+  end
+
+  # `Process.alive?/1` as well as the name: `Cairn.Registry.whereis/2` does not
+  # filter dead pids, and the single partition's DOWN handling can lag a read
+  # arbitrarily — so a corpse answers here for a while after a media
+  # replacement kills the old ring. A whole-tree stop cannot reach this (the
+  # camera name is awaited by `Cairn.CameraSupervisor.stop_camera/1`, and the
+  # ring's DOWN is queued ahead of it), but a `:retry_open` timer firing inside
+  # `restart_media/2`'s gap can.
+  #
+  # A ring that dies AFTER this check is not this gate's business: that is an
+  # ordinary mid-clip crash, which the extractor's `:DOWN` already turns into
+  # an `:event_ended` `:partial` and a retry.
+  defp ring_ready?(camera_id) do
+    case Cairn.Registry.whereis(camera_id, :ring_buffer) do
+      pid when is_pid(pid) -> Process.alive?(pid)
+      nil -> false
     end
   end
 
@@ -600,6 +626,7 @@ defmodule Cairn.PresenceRecorder do
         replay_pending(%{
           state
           | event: event,
+            event_policy: state.policy,
             started_unix_ms: DateTime.to_unix(started_at, :millisecond),
             checkpointed_at: state.monotonic_ms.(),
             extractor: pid,
@@ -997,7 +1024,9 @@ defmodule Cairn.PresenceRecorder do
     # The gate is re-read here for the reason it is re-read at a transition: a
     # boundary opens an event, and neither a `record:` block an operator has
     # since narrowed nor a raised floor should be found out about one whole
-    # clip late.
+    # clip late. The NEXT segment therefore takes the CURRENT policy, unlike
+    # the clip that just closed, which kept the windows it opened with
+    # (`arm_post/1`): a boundary is an open, and an open resolves.
     state = resolve_policy(state)
     seeds = open_seeds(state)
 
@@ -1082,6 +1111,7 @@ defmodule Cairn.PresenceRecorder do
     %{
       state
       | event: nil,
+        event_policy: nil,
         started_unix_ms: nil,
         extractor: nil,
         extractor_ref: nil,
@@ -1110,9 +1140,13 @@ defmodule Cairn.PresenceRecorder do
 
   defp retain_monitor(state), do: Map.put(state.finalizing, state.extractor_ref, state.event.id)
 
+  # `event_policy`, not `policy`: the clip is closed by the window it opened
+  # under, however many refreshes have landed since. The cap re-armed on a
+  # restore (`reattach/5`) is the same rule with the same field, seeded there
+  # from what could be resolved at the time.
   defp arm_post(state) do
     state = cancel_post(state)
-    {post_ref, post_token} = schedule(:post_window, state.event.id, state.policy.post)
+    {post_ref, post_token} = schedule(:post_window, state.event.id, state.event_policy.post)
     %{state | post_ref: post_ref, post_token: post_token}
   end
 
@@ -1211,6 +1245,10 @@ defmodule Cairn.PresenceRecorder do
     state = %{
       state
       | event: event,
+        # The best this replacement can know of what the dead one opened
+        # under: the row carries no policy, so the camera's current one stands
+        # in, and from here it is the adopted event's for as long as it runs.
+        event_policy: state.policy,
         started_unix_ms: DateTime.to_unix(event.started_at, :millisecond),
         extractor: extractor,
         extractor_ref: Process.monitor(extractor),
