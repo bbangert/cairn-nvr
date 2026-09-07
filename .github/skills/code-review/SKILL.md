@@ -76,7 +76,11 @@ ownership or the tree wrong; fix that, not the symptom.
   the instant its subtree stops is a double fault to document, not an
   orchestrator to build.
 - **An explicit stop signal** to distinguish an intentional stop from a
-  supervisor restart. `:shutdown` is the signal; closing cleanly on it beats
+  crash. The exit reason already says which: a process that must react to
+  another's end links or monitors it and reads `:shutdown`, `{:shutdown, _}`
+  or `:normal` against a crash reason from the `EXIT` or `DOWN` message, and
+  the stopping process receives the same reason in `terminate/2`. Neither
+  side needs a bespoke message. Closing cleanly on `:shutdown` beats
   stranded state, and an ancestor past its restart budget is a crash loop
   where a clean close beats a stuck one.
 - **A call in place of a cast** to close a window that ordering does not
