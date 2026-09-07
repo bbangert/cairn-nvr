@@ -5,150 +5,101 @@ description: Reviews Elixir and Erlang changes against the principles of Designi
 
 # Reviewing OTP code
 
-The bar is the layering in *Designing Elixir Systems with OTP*: data, then
-functions, then tests, then boundaries, then lifecycles, then workers. A
-finding is worth raising when the code puts something in the wrong layer —
-state without one owner, a lifecycle managed from outside the tree, a
-boundary crossed by a call that should be a message — not when it could be
-made more defensive. Judge every concern against the project's stated
-deployment shape: a race that needs a second node, a second tenant, or a
-second operator does not occur in a system that has none, and a fix that adds
-coordination to prevent it is a regression in design.
+The bar is *Designing Elixir Systems with OTP*: data, functions, tests,
+boundaries, lifecycles, workers. Raise a finding when code is in the wrong
+layer — state without one owner, a lifecycle managed from outside the tree,
+a boundary crossed by a call that should be a message — not when it could be
+more defensive. Judge concerns against the project's stated deployment
+shape: a race that needs a second node, tenant, or operator does not occur
+in a system that has none, and coordination added to prevent it is a
+regression.
 
-## The tree is the authority over process lifetime
-
-A process's restart characteristics are expressed by where it sits in the
-supervision tree and which strategy its parent uses, not by another process
-deciding for it. Strategy follows dependency: `:rest_for_one` where a child
-cannot work without the one before it, `:one_for_one` where children are
-independent, `:one_for_all` only where they share state that cannot be
-rebuilt piecemeal. Child order is chosen twice over: for what must exist
-first at start, and — since shutdown runs in reverse — for what must close
-first at stop. If the design needs a retry, a stash, a reconcile-on-restart,
-or a process that reaches across trees to end things, the ownership or the
-tree shape is wrong; fix that rather than adding the mechanism.
+**The tree owns process lifetime.** Restart behaviour is where a process
+sits and its parent's strategy, never another process deciding for it.
+Strategy follows dependency: `:rest_for_one` where a child needs the one
+before it, `:one_for_one` where children are independent. Child order is
+chosen for start and, in reverse, for stop. A design that needs a retry, a
+stash, a reconcile-on-restart, or a process reaching across trees has the
+ownership or the tree wrong; fix that, not the symptom.
 
 ## Flag these classes
 
-Look for the class, not the instance. Each is a defect that has shipped in
-real OTP systems and survived unit tests.
-
-- **A synchronous call from `init/1`, or from anything it runs, back to the
-  process that is starting the tree.** A supervisor started from inside a
-  GenServer's `handle_call` (a config server applying a change, a
-  coordinator reconciling) starts children whose init may call that same
-  server, which is waiting on the start: a timeout per child, spent inside
-  the caller's request. Config must reach a child through its start
-  arguments or a snapshot in `:persistent_term` or ETS, never a call to its
-  starter. The same rule applies one level down, to any process the child
+- **A call from `init/1` back to the process starting the tree.** A child
+  started from inside a server's `handle_call` that calls that server
+  deadlocks until timeout. Config reaches a child through start arguments
+  or a `:persistent_term`/ETS snapshot — and the same for anything the child
   starts from its own init.
-- **A worker that dies with a table or process it does not own.** When
-  workers outlive the owner of an ETS table (no heir) or a named GenServer
-  they write to, a bare `:ets` call on the missing table raises and a call
-  to the absent name exits. If that read sits on a restore path in `init/1`,
-  the failure is a child failing to start, which escalates through every
-  supervisor above it. The owner's API should read a missing table as empty
-  and drop a write to an absent owner, and say so in its contract.
-- **A subscription assumed to survive the replacement of what it subscribed
-  to.** A subscriber list lives in the state of the process that holds it;
-  a restarted or replaced holder has never heard of the subscriber. The
-  dependency must be a monitor, and the process that detects the loss must
-  report to whoever owns the outcome rather than act on a stale snapshot.
-- **The wrong process closing a resource.** The process that has been
-  updating a record since it opened holds the current metadata; a helper
-  holding the opening snapshot does not. A close from anywhere but the owner
-  persists stale data and skips the owner's lifecycle notifications. Only an
-  orphan — owner dead — may close itself, and then it must emit what the
-  owner would have.
-- **Message ordering relied on across a pair the messages do not share.**
-  The BEAM orders messages between one sender and one receiver. Two casts
-  that must arrive in order (data, then the finalize that ends it) must
-  leave the same process for the same process; routing one through a third
-  process, or turning it into a call, silently reorders them.
-- **A configuration refresh reaching in-flight work.** A new policy applies
-  to the next unit of work; the one in flight keeps the values it started
-  under. Reading `state.policy` when a timer is armed, instead of a copy
-  captured at open, is the bug, and a test that fires the timer by hand
-  cannot see it.
-- **A held struct that flows onward.** A worker that keeps the arguments it
-  was started with and passes them into every process it starts must be
-  refreshed on every change class that can reach it, not only the class
-  someone labelled "refresh". Follow where the held value goes.
-- **Child order that makes the stop lie.** Reverse-order shutdown decides
-  which teardown message arrives first. If a producer stops before the
-  consumer that must close cleanly, the consumer sees the producer's stop
-  as a failure and records it as one. The side that must close first goes
-  last in the child list.
-- **A read-path lookup treated as liveness.** `Registry.whereis` and
-  similar reads can return a dead pid until the registry processes its
-  DOWN. A gate on a name must also check `Process.alive?/1`. The register
-  path is different: a unique `Registry.register` evicts a dead holder and
-  retries, so terminate-then-start of a named child needs no wait between.
-- **`terminate/2` doing less than the process's normal close.** A process
-  that traps exits so it can clean up on a supervisor's `:shutdown` should
-  run the same close it would run in the ordinary case — same order, same
-  notifications — and return without awaiting other processes, because a
-  supervisor's shutdown budget is not a place to wait out another process's
-  work or a timer window. A crash reason should do nothing; restore covers it.
-- **A comment that declares a case impossible.** Comments asserting a
-  guarantee ("can never", "the only caller", "already announced before")
-  are the ones most often false after a refactor, and most often hiding a
-  defect. Check the claim against the code, not the diff.
-- **A test that passes in both states.** A test added to pin a fix must
-  fail without it. Prefer real processes and real timers over stubs and
-  manual timer firing when ordering or duration is the thing under test.
-  Synchronize with monitors, `assert_receive`, and `:sys.get_state/1`
-  barriers, never `Process.sleep` polling. A test that starts a real
-  process writing to a database or a directory must give it sandbox access
-  and await its exit before cleanup.
+- **A worker that dies with a table or process it does not own.** Callers
+  outliving an ETS owner with no heir raise on the missing table; callers of
+  a restarting named process exit. On a restore path that is a child failing
+  to start and escalating. The owner's API reads a missing table as empty and
+  drops a write to an absent owner.
+- **A subscription assumed to survive its holder's replacement.** Subscriber
+  lists live in the holder's state. The dependency must be a monitor, and the
+  detector reports to whoever owns the outcome rather than acting on a stale
+  snapshot.
+- **The wrong process closing a resource.** The owner holds the current
+  data; a helper holds the opening snapshot. Only an orphan (owner dead)
+  closes itself, and then it emits what the owner would have.
+- **Ordering relied on across a pair the messages do not share.** The BEAM
+  orders messages per sender–receiver pair. Two casts that must arrive in
+  order leave the same process for the same process; a third process or a
+  call in between reorders them.
+- **Configuration reaching work it should not.** A refresh applies to the
+  next unit of work; in-flight work keeps the values it started under, so
+  timers arm from a copy captured at open, not from `state.policy`. And a
+  held struct that flows into processes the worker starts must be refreshed
+  on every change class that can reach it.
+- **Child order that makes the stop lie.** If a producer stops before the
+  consumer that must close cleanly, the consumer records the producer's stop
+  as a failure. What must close first goes last in the child list.
+- **A read-path lookup treated as liveness.** `Registry.whereis` can return
+  a dead pid until the DOWN is processed; a gate on a name also checks
+  `Process.alive?/1`. Registering is different: a unique `Registry.register`
+  evicts a dead holder and retries, so terminate-then-start needs no wait.
+- **`terminate/2` doing less than the normal close.** Trap exits, run the
+  ordinary close in the ordinary order on `:shutdown`, and return without
+  awaiting other processes. A crash reason does nothing; restore covers it.
+- **A comment declaring a case impossible.** "Can never", "the only
+  caller", "already announced" are the claims most often false after a
+  refactor and most often hiding a defect. Check them against the code.
+- **A test that passes in both states.** A test pinning a fix must fail
+  without it. Prefer real processes and timers to stubs and manual firing
+  when ordering or duration is under test; synchronize with monitors,
+  `assert_receive`, and `:sys.get_state/1`, never `Process.sleep` polling.
 
 ## Do not suggest these
 
-Each has been proposed in review of OTP code and was wrong.
-
-- **A reaper, reconciler, or stop-time sweep** that reaches across trees to
-  end workers or drain their rows. That is imperative teardown. A stop is a
+- **A reaper, reconciler, or stop-time sweep** across trees. A stop is a
   supervisor stopping a subtree; each worker closes its own resources in
   `terminate/2`; a crash restores from a checkpoint. A worker crashing at
-  the instant its subtree is stopped is a double fault whose bounded residue
-  is documented, not a reason for an orchestrator.
-- **An explicit "stop signal"** so a worker can tell an intentional stop
-  from a supervisor restart. A supervisor's `:shutdown` is the stop signal.
-  Closing cleanly on it leaves finished records instead of stranded active
-  ones, and an ancestor giving up after its restart intensity is spent is a
-  crash loop past its budget, where a clean close beats a stuck one.
-- **Acknowledged or atomic handoffs** — a call in place of a cast — to
-  close a window that message ordering does not close anyway. Ask whether
-  the outcome inside the window is already honest before adding a
-  rendezvous.
+  the instant its subtree stops is a double fault to document, not an
+  orchestrator to build.
+- **An explicit stop signal** to distinguish an intentional stop from a
+  supervisor restart. `:shutdown` is the signal; closing cleanly on it beats
+  stranded state, and an ancestor past its restart budget is a crash loop
+  where a clean close beats a stuck one.
+- **A call in place of a cast** to close a window that ordering does not
+  close anyway. Ask whether the outcome inside the window is already honest.
 - **Waits on registry unregistration before a start**, or the claim that
-  `Supervisor.terminate_child/2` on an already-down child fails. It returns
-  `:ok` for a running, down, or restarting child and `{:error, :not_found}`
-  only when no spec exists, so terminate, delete, start cannot hit
-  `:already_present`.
-- **A timeout on `GenServer.start_link` from init**, or a guard on
-  `Process.exit` of a possibly-dead pid. A start's `:timeout` option
-  defaults to `:infinity` — the 5 000 ms that comes to mind is
-  `GenServer.call/3`'s default, a different function — and exiting a dead
-  pid returns `true`. Both were asserted otherwise and shown false by
-  running them.
-- **Clustering, distribution, or multi-node consistency concerns** in a
-  project whose deployment is one node. Generator boilerplate such as
-  `DNSCluster` is not evidence of a cluster.
-- **Resilience against the restart of a shared service** (monitor the
-  PubSub, resubscribe, reconcile) when that service sits above its
-  subscribers in the application tree. Its restart takes them with it, or
-  the project has decided not to harden for it; either way, per-subscriber
-  hardening is the over-engineering the tree exists to avoid.
+  `Supervisor.terminate_child/2` on a down child fails: it returns `:ok` for
+  a running, down, or restarting child, `{:error, :not_found}` only with no
+  spec, so terminate, delete, start cannot hit `:already_present`.
+- **A timeout on `GenServer.start_link`** or a guard on `Process.exit` of a
+  dead pid. A start's `:timeout` defaults to `:infinity` (5 000 ms is
+  `GenServer.call/3`'s default); exiting a dead pid returns `true`.
+- **Cluster or multi-node concerns** in a single-node project. Generator
+  boilerplate such as `DNSCluster` is not evidence of a cluster.
+- **Per-subscriber hardening against a shared service's restart** (monitor
+  the PubSub, resubscribe, reconcile) when that service sits above its
+  subscribers in the tree.
 
-## How to write a finding
+## Writing a finding
 
-Name the layer the code violates — boundary, lifecycle, ownership,
-ordering — and give the concrete sequence: which process sends what to
-whom, in what order, and what the user of the system then sees. A finding
-that cannot be stated as a sequence is a preference, and preferences are not
-raised. When the correct fix is structural — a child order, a strategy, an
-owner — say that rather than proposing a guard that papers over it. When a
-claim depends on OTP semantics, state the semantic explicitly and expect it
-to be checked against the runtime, because confident claims about OTP
-defaults are wrong often enough that a reproduction settles them.
+Name the layer violated — boundary, lifecycle, ownership, ordering — and
+give the sequence: which process sends what to whom, in what order, and
+what the user then sees. A finding that cannot be stated as a sequence is
+a preference; do not raise it. When the fix is structural — a child order,
+a strategy, an owner — say so instead of proposing a guard. State any OTP
+semantic a claim rests on; confident claims about OTP defaults are wrong
+often enough that a reproduction settles them.
