@@ -287,6 +287,12 @@ defmodule Cairn.CameraSupervisorTest do
     # has already exited can still read as alive for a moment
     assert is_map(:sys.get_state(agg))
 
+    # and the recorder took the new pair, which it re-resolves from the
+    # published snapshot on the same cast — the `%Config{}` half is what its
+    # next clip is written under
+    assert %{camera: %Camera{rtsp_url: "file:///dev/zero"}, config: ^new_config} =
+             :sys.get_state(restored)
+
     # the clip did not: its ring went with the old media, so the stand-in saw
     # the DOWN a real extractor closes on, and the recorder let the event go
     assert_receive {:ring_gone, ^extractor}, 2_000
@@ -700,8 +706,15 @@ defmodule Cairn.CameraSupervisorTest do
 
     assert child_pid(sup, :media) != old_media
     assert Cairn.Registry.whereis(id, :camera_tracker) == tracker
-    # answering a call is liveness `Process.alive?/1` cannot claim
-    assert is_map(:sys.get_state(tracker))
+
+    # …and it was told: the pair it was built with is older than the tree
+    # around it now, and the `%Config{}` half is handed to every extractor it
+    # starts. The cast is sent inside `apply_diff/2`, so this read is behind
+    # it. Answering at all is also the liveness claim `Process.alive?/1` cannot
+    # make.
+    state = :sys.get_state(tracker)
+    assert state.camera == moved
+    assert state.config == new_config
   end
 
   # The lane's composition is a child list, which no running supervisor can be

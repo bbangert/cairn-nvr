@@ -130,7 +130,15 @@ defmodule Cairn.CameraSupervisor do
       # pids, but that is a reader's problem (`sync/1`), not a registrant's.
       case Supervisor.start_child(pid, Cairn.Camera.media_spec(camera: cam, config: config)) do
         {:ok, _media} ->
-          :ok
+          # The lane survived, holding the pair the tree was built from. Most
+          # of it does not matter — a restart-class field is media-baked and a
+          # lane worker judges nothing by its copy — but the `%Config{}` it
+          # keeps is handed to every `Cairn.EventExtractor` it starts
+          # (`config:`), so a clip opened after this would be written under the
+          # pre-change config until something re-resolved it. Told here rather
+          # than left to the next `refreshed` diff, which may never come: the
+          # two classes are disjoint.
+          refresh_lane(config, cam)
 
         other ->
           Logger.error("camera #{camera_id}: failed to start new media: #{inspect(other)}")
@@ -148,14 +156,6 @@ defmodule Cairn.CameraSupervisor do
   from the pre-change pair. A camera that is not running has no process to
   tell, and the config lookup guards the case a diff cannot produce: an id
   `config` does not carry.
-
-  Every tier's workers are cast to and the absent names dropped, rather than
-  the tier being read again here: a tier-1 camera has no tracker and a tier-2
-  one has no presence workers, and either may have a worker mid-restart, which
-  resolves the pair for itself in `init/1` anyway. Reading the tier here would
-  be a second answer to a question the tree has already answered
-  (`Cairn.Camera.Lane`), and a tier change is not a refresh at all — it is
-  `rebuilt`.
 
   A bridge camera's `Cairn.FFmpegPort` is deliberately not told: every field
   its argv reads (`rtsp_url`, `transcode`, `extra_ffmpeg_args`) is a
@@ -176,6 +176,22 @@ defmodule Cairn.CameraSupervisor do
       nil -> :ok
     end
 
+    refresh_lane(config, cam)
+  end
+
+  # The one way a new pair reaches the workers the tree built from the old one,
+  # and both classes of change that leave those workers standing go through it:
+  # a `refreshed` camera above, and a `changed` one whose `:media` was replaced
+  # under them (`restart_media/2`).
+  #
+  # Every tier's workers are cast to and the absent names dropped, rather than
+  # the tier being read again here: a tier-1 camera has no tracker and a tier-2
+  # one has no presence workers, and either may have a worker mid-restart,
+  # which resolves the pair for itself in `init/1` anyway. Reading the tier
+  # here would be a second answer to a question the tree has already answered
+  # (`Cairn.Camera.Lane`), and a tier change is not a refresh at all — it is
+  # `rebuilt`.
+  defp refresh_lane(config, cam) do
     Cairn.PresenceAggregator.refresh(cam.id, cam, config)
     Cairn.PresenceRecorder.refresh(cam.id, cam, config)
     Cairn.CameraTracker.refresh(cam.id, cam, config)

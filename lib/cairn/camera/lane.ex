@@ -56,23 +56,23 @@ defmodule Cairn.Camera.Lane do
   end
 
   # Built from the pair `Cairn.Camera.init/1` resolved for the whole tree, and
-  # then held: `Cairn.CameraSupervisor.restart_media/2` replaces `:media`
-  # alone — the workers themselves survive it, though the clip one of them has
-  # open does not (the ring goes with the media; see `restart_media/2`) — so
-  # after a restart-class change these workers still hold the pre-change
-  # struct — and a `changed` camera gets no `{:refresh, _, _}` cast
-  # to correct it. The classes are not disjoint: `:min_score` is restart-class
-  # and `Cairn.PresenceRecorder.configured_floors/1` reads it off this struct.
-  # What makes the stale copy harmless is that nothing consults it without
-  # re-resolving first — every qualifying transition runs `resolve_policy/1`,
-  # which replaces `camera` and `policy` from the snapshot before the floors
-  # are read — and the floors a frame is actually judged against ride in with
-  # the sink's batch. A refresh-class edit reaches the lane the ordinary way,
-  # through `Cairn.CameraSupervisor.refresh_camera/2`.
+  # then held — the workers survive a `:media` replacement, though the clip one
+  # of them has open does not (the ring goes with the media; see
+  # `Cairn.CameraSupervisor.restart_media/2`). So the copy each holds can be
+  # older than the tree around it, and both classes of change that leave these
+  # workers standing correct it the same way: a `changed` camera through
+  # `restart_media/2` once its new `:media` is up, a `refreshed` one through
+  # `refresh_camera/2` — both by way of `refresh_lane/2`. The only window in
+  # which a worker holds a stale pair is between the new media starting and
+  # that cast landing.
   #
-  # `Cairn.CameraTracker` holds the same copy under the same rule, and its
-  # correction is even more direct: the camera and the floors it judges by
-  # arrive with every batch, from the pipeline the replacement rebuilt.
+  # It has to be corrected, not merely tolerated: each worker hands its
+  # `%Cairn.Config{}` to every `Cairn.EventExtractor` it starts (`config:`), so
+  # a clip opened on a stale one is *written* under it. The camera struct is
+  # the softer half — `Cairn.PresenceRecorder` re-resolves it at every
+  # qualifying transition and `Cairn.CameraTracker` takes it off every batch,
+  # and the floors a frame is judged against ride in with the sink's batch
+  # either way.
   defp children(opts) do
     cam = Keyword.fetch!(opts, :camera)
     config = Keyword.fetch!(opts, :config)
