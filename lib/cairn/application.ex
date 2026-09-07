@@ -68,15 +68,6 @@ defmodule Cairn.Application do
       # from a process no test owns. Suites that exercise the recorder start
       # their own.
       {Cairn.TrackRecorder, manual: Application.get_env(:cairn, :track_recorder_manual, false)},
-      # The whole tracking subtree — the pool of per-camera trackers and, under
-      # the same `:rest_for_one`, the sweep that restores the trackers of
-      # cameras whose checkpoint rows outlived them. The sweep re-runs whenever
-      # the pool restarts (a tracker crash-looping past the pool's restart
-      # intensity), which is the case where rows outlive their trackers: those
-      # cameras get their `:host_restart` finals immediately rather than
-      # waiting for each camera's next observation. Outside the media tree on
-      # purpose — see the module's own doc.
-      {Cairn.TrackerSupervisor, []},
       {Cairn.PresenceSupervisor, []},
       {Cairn.EventSupervisor, []},
       # Before the cameras that mint epochs into it

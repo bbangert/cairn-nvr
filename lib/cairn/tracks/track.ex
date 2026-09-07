@@ -71,7 +71,8 @@ defmodule Cairn.Tracks.Track do
         :stream_reset,
         :evicted,
         :detection_disabled,
-        :host_restart
+        :host_restart,
+        :camera_stopped
       ]
 
     field :stationary_since, :utc_datetime_usec

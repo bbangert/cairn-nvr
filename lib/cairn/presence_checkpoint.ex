@@ -11,10 +11,11 @@ defmodule Cairn.PresenceCheckpoint do
   (`Cairn.PresenceRecorder.init/1`).
 
   A separate table rather than a second kind of row in `cairn_active_events`,
-  and the separation is load-bearing: `Cairn.CameraTracker.restore_checkpointed/0`
-  starts a `Cairn.CameraTracker` for every camera with a row in that table, so
-  a presence event checkpointed there would grow tier-2 machinery on a tier-1
-  camera at the next tracker-pool restart.
+  and the separation is by row shape: this one carries the present keys and the
+  slot state, that one the live tracks, and each is read back by exactly one
+  restore path that knows how to. One table keyed by camera id could not hold
+  both for a camera whose tier has just flipped, and a reader would have to
+  discriminate on shape to find out which kind it had.
 
   The row carries the extractor **pid** where the tracked lane's restore looks
   its extractor up in `Cairn.Registry` by `{:extractor, event_id}`. Both work

@@ -27,10 +27,11 @@ defmodule Cairn.EventExtractor do
   in the ring's own state, so a replacement — the one a media restart builds —
   has never heard of this process, and `{:ring_lost, event_id}` tells the owner
   there will be no more media. It answers with its ordinary close. Waiting
-  costs nothing, there being nothing left to receive. An extractor started
-  with **no** owner (`Cairn.CameraTracker`, until S3 wires one) does nothing at
-  all on ring loss: its clip starves until that lane's own window closes it,
-  which is the behaviour that lane has today.
+  costs nothing, there being nothing left to receive. Every lane owner names
+  itself, so an extractor with **no** owner is the fallback rather than a live
+  caller — a test driving one directly, or a caller that forgets. It does
+  nothing at all on ring loss: its clip waits for a finalize, which is the
+  only close that can carry current metadata.
 
   The one close this process performs itself is the orphan: the owner is gone
   and nothing will ever cast a finalize, so rather than hold an `:active` row
@@ -93,7 +94,7 @@ defmodule Cairn.EventExtractor do
 
   require Logger
 
-  alias Cairn.{Config, DataDir, EventArtifact, Events, RingBuffer, TrackPath}
+  alias Cairn.{Config, DataDir, Event, EventArtifact, Events, RingBuffer, TrackPath}
 
   @fsync_media_ms 2_000
   # Box entries, not batches, and global rather than per track: `max_live_tracks`
@@ -203,7 +204,7 @@ defmodule Cairn.EventExtractor do
       # trigger; the copy here is the one this clip opened with and goes stale
       # from the first detection. So an owned clip is never closed from here
       # with local state — see the ring's `:DOWN`. `nil` for a caller that
-      # names none (`Cairn.CameraTracker`, until S3).
+      # names none; both lane owners name themselves.
       owner: Keyword.get(opts, :owner),
       owner_ref: monitor_owner(Keyword.get(opts, :owner))
     }
@@ -341,9 +342,10 @@ defmodule Cairn.EventExtractor do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
-  # No owner was ever named — `Cairn.CameraTracker`'s extractors until S3 wires
-  # one. The pre-S2 behaviour is kept deliberately: the clip starves until that
-  # lane's own window closes it, with the metadata that lane holds.
+  # No owner was ever named. Both lane owners name themselves, so this is the
+  # fallback: waiting is the only answer that cannot persist stale metadata,
+  # and the clip closes when a finalize arrives or when its owner's window
+  # would have closed it.
   defp ring_lost(%{owner: nil} = state) do
     Logger.info("event #{state.event.id}: no owner to tell; the clip waits for its finalize")
     {:noreply, state}
@@ -385,8 +387,25 @@ defmodule Cairn.EventExtractor do
     {:noreply, %{state | owner: owner, owner_ref: Process.monitor(owner)}}
   end
 
+  # The **only** `Cairn.Event.broadcast/2` this process ever makes, and the one
+  # case that earns it: every other close is its owner's, and the owner
+  # announces `:event_ended` before it casts the finalize
+  # (`Cairn.CameraTracker.maybe_finalize/3`, `Cairn.PresenceRecorder`'s) — so
+  # broadcasting here as well would double it. An orphan has no owner left to
+  # speak for it, and without this the event is announced started and never
+  # ended: every SSE and dashboard consumer holds it open until it reloads.
+  # Ahead of the close, keeping the owners' ordering — the window closed before
+  # `:event_clip_ready` says the clip landed.
+  #
+  # The event it announces is this process's own snapshot, taken when the clip
+  # opened, so its labels and trigger are as stale as the row this close
+  # writes. That is the orphan's whole shape (the `Logger.warning` above says
+  # so) and it is still the honest end: the process that held the current
+  # metadata is gone with it.
   defp orphan_close(state) do
-    finalize_now(state, %{state.event | ended_at: DateTime.utc_now(), status: :finalized})
+    event = %{state.event | ended_at: DateTime.utc_now(), status: :finalized}
+    Event.broadcast(:event_ended, event)
+    finalize_now(state, event)
   end
 
   defp finalize_now(state, event) do

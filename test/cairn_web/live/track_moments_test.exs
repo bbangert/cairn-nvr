@@ -32,4 +32,17 @@ defmodule CairnWeb.TrackMomentsTest do
     assert TrackMoments.reason_gloss(:evicted) == "Dropped to cap memory use"
     assert TrackMoments.reason_gloss(:not_a_reason) == nil
   end
+
+  # A reason the schema accepts without an entry here renders a bare atom and
+  # no tooltip, which nothing else would catch — so the two lists are compared
+  # rather than spot-checked.
+  test "every end reason the schema accepts has a gloss" do
+    values = Ecto.Enum.values(Cairn.Tracks.Track, :end_reason)
+    assert values != []
+
+    for reason <- values do
+      assert is_binary(TrackMoments.reason_gloss(reason)),
+             "no gloss for #{inspect(reason)}"
+    end
+  end
 end

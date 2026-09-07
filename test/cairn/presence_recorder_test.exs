@@ -184,7 +184,7 @@ defmodule Cairn.PresenceRecorderTest do
     assert [%{label: "person", t: +0.0}] = event.labels
 
     # D-E6: the row is in the recorder's own table and nowhere near the one
-    # `CameraTracker.restore_checkpointed/0` spawns trackers from.
+    # `Cairn.CameraTracker` restores its camera's tracked event from.
     _ = :sys.get_state(Registry.whereis(id, :presence_recorder))
     assert {%Event{id: ^eid}, [{nil, "person"}], extractor, _slots} = PresenceCheckpoint.get(id)
     # the row names the extractor writing the clip: what a restore re-attaches to

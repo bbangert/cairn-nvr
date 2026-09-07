@@ -52,9 +52,9 @@ defmodule Cairn.Detect.DispatchTest do
     end
 
     test "with no tracker named, routes to the camera's own tracker", ctx do
-      # `Cairn.CameraTracker.ensure/1` resolves the registry before it starts
-      # anything, so standing in under the camera's own key is the production
-      # path minus the tracker's body.
+      # `Cairn.CameraTracker.tracked/3` resolves the camera's registered name
+      # and casts, so standing in under that key is the production path minus
+      # the tracker's body.
       {:ok, _} = Registry.register(Cairn.Registry, {ctx.camera_id, :camera_tracker}, nil)
 
       assert :ok = Dispatch.forward(ctx.camera, @policy, batch(ctx.camera_id, "o1"))

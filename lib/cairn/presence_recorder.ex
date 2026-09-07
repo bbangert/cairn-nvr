@@ -414,14 +414,20 @@ defmodule Cairn.PresenceRecorder do
   # `:event_ended` subscriber. The exit that FOLLOWS a finalize is the clause
   # below, not this one: `clear_event/1` moved that monitor to `finalizing`.
   #
-  # A lost ring is not a death and does not arrive here: the extractor reports
-  # it (`{:ring_lost, _}` above) and waits, so the clip ends through the
-  # ordinary close and its exit is then the `finalizing` case.
+  # A lost ring is not a death and does not arrive here for an extractor this
+  # process owns: it reports the loss (`{:ring_lost, _}` above) and waits, so
+  # the clip ends through the ordinary close and its exit is then the
+  # `finalizing` case.
   #
   # An ADOPTED extractor is the case CameraTracker's rule was written for, and
-  # gets it: the process that started it crashed, so its finalize may have been
-  # in flight when this one restored the row, and the index — which the
-  # extractor itself wrote — is what says whether that is what happened.
+  # gets it. The process that started it crashed, so it can have finished under
+  # that process two ways: its finalize was in flight when this one restored
+  # the row, or its ring died in the same window and the owner `:DOWN` that
+  # followed made it an orphan closing itself. Both leave a `:finalized` row —
+  # which the extractor itself wrote — so the index is what says whether that
+  # is what happened, and both announced `:event_ended` on the way out
+  # (`maybe_finalize/3` there, `Cairn.EventExtractor.orphan_close/1` here), so
+  # a second one from this process would be the duplicate rather than the fix.
   def handle_info({:DOWN, _ref, :process, pid, reason}, %{extractor: pid} = state) do
     case state.event do
       %Event{} = event ->

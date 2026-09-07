@@ -12,8 +12,11 @@ defmodule Cairn.Camera.Lane do
 
   Composition follows the resolved camera's capability tier, the same fork the
   detect branch takes (`Cairn.Pipeline.Camera.detect_tail/4`): tier 1 gets
-  `Cairn.PresenceRecorder` and then `Cairn.PresenceAggregator`. Every other
-  tier gets nothing until the tracker moves in (`design-supervision.md`, S3).
+  `Cairn.PresenceRecorder` and then `Cairn.PresenceAggregator`, every other
+  tier — 2, and the `nil` of an unprofiled camera — gets
+  `Cairn.CameraTracker`. The tier, not the presence of a detect branch: it is
+  what the matrix forks on, and a camera whose branch is off costs one idle
+  process, which holds no timer until an event opens.
 
   The **recorder first**, against the data's direction, and the reason is a
   read that only happens once: `Cairn.PresenceAggregator.init/1` clears its
@@ -32,7 +35,8 @@ defmodule Cairn.Camera.Lane do
   before the first batch either way. Shutdown, in reverse, stops the aggregator
   first — its cleareds land in a live recorder's mailbox ahead of the
   supervisor's own exit signal, and the recorder finalizes what is still open
-  in `terminate/2`.
+  in `terminate/2`. That pairing is the presence lane's alone: the tracker is
+  the only worker in its own lane and its `terminate/2` waits on nothing.
 
   A tier change is therefore not a media change but a change of *this* list,
   which no running supervisor can be edited into: `Cairn.Config.Server` sorts
@@ -65,6 +69,10 @@ defmodule Cairn.Camera.Lane do
   # are read — and the floors a frame is actually judged against ride in with
   # the sink's batch. A refresh-class edit reaches the lane the ordinary way,
   # through `Cairn.CameraSupervisor.refresh_camera/2`.
+  #
+  # `Cairn.CameraTracker` holds the same copy under the same rule, and its
+  # correction is even more direct: the camera and the floors it judges by
+  # arrive with every batch, from the pipeline the replacement rebuilt.
   defp children(opts) do
     cam = Keyword.fetch!(opts, :camera)
     config = Keyword.fetch!(opts, :config)
@@ -72,7 +80,7 @@ defmodule Cairn.Camera.Lane do
 
     case Map.get(Config.policy(config, cam), :tier) do
       1 -> [{Cairn.PresenceRecorder, args}, {Cairn.PresenceAggregator, args}]
-      _other -> []
+      _other -> [{Cairn.CameraTracker, args}]
     end
   end
 end

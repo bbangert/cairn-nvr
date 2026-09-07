@@ -93,9 +93,9 @@ Memory is bounded by `pre_window × bitrate × camera_count`, independent of eve
 
 ## The camera tracker
 
-Event lifecycle is owned one camera at a time: a `Cairn.CameraTracker` per camera under `Cairn.TrackerSupervisor` (a `:rest_for_one` pair of a DynamicSupervisor pool and a checkpoint-restore sweep), fed observations by the detect branch through `Cairn.Detect.Dispatch` — plain functions in the caller's process, so no per-frame GenServer hop and no config-server call on the frame path (policy is resolved at session start and on refresh).
+Event lifecycle is owned one camera at a time: a `Cairn.CameraTracker` in that camera's own `Cairn.Camera.Lane`, ahead of its media, fed observations by the detect branch through `Cairn.Detect.Dispatch` — plain functions in the caller's process, so no per-frame GenServer hop and no config-server call on the frame path (policy is resolved at session start and on refresh).
 
-The tracker assigns identities itself (`Cairn.Tracker`: IoU + optional staged admissions — BBD, ORU, OCR, Re-ID fusion — per the profile's stage list), debounces detections into events, and keys suspend/adopt off **stream epoch identity**: one epoch is one continuous decode session, so nothing (pts, object continuity) carries across a respawn except by the tracker's own adopt-across-reset rule. Trackers are `:transient` and checkpoint to ETS, so a crash restores in `init/1`.
+The tracker assigns identities itself (`Cairn.Tracker`: IoU + optional staged admissions — BBD, ORU, OCR, Re-ID fusion — per the profile's stage list), debounces detections into events, and keys suspend/adopt off **stream epoch identity**: one epoch is one continuous decode session, so nothing (pts, object continuity) carries across a respawn except by the tracker's own adopt-across-reset rule. Trackers are `:transient` and checkpoint to ETS, so a crash restores in `init/1`; a camera disabled or deleted stops its tracker, which finalizes an open event on the way out.
 
 ## The event extractor
 
@@ -123,10 +123,6 @@ Cairn.Supervisor
 ├── Cairn.Repo / Ecto.Migrator     (SQLite event + track index; the Repo reads data_dir off the file itself)
 ├── Cairn.Config.Server            (after the migrated Repo, so a source may read rows; everything below hangs off it)
 ├── Phoenix.PubSub / Cairn.Registry / Cairn.CameraStatus ...
-├── Cairn.TrackerSupervisor        (rest_for_one)
-│   ├── pool (DynamicSupervisor)
-│   │   └── Cairn.CameraTracker    (one per camera, transient, ETS-checkpointed)
-│   └── checkpoint restore sweep   (Task, transient; re-runs when the pool restarts)
 ├── Cairn.EventSupervisor (DynamicSupervisor)
 │   └── Cairn.EventExtractor       (one per active event, temporary)
 ├── Cairn.StreamEpochs             (before the cameras that mint epochs into it)
@@ -136,7 +132,9 @@ Cairn.Supervisor
 ├── Cairn.Native.Status            (maps engine health onto cameras:status)
 ├── Cairn.CameraSupervisor (DynamicSupervisor)
 │   └── Cairn.Camera (one per camera, one_for_one)
-│       ├── :lane  Cairn.Camera.Lane  (one_for_one; empty until the event workers move in)
+│       ├── :lane  Cairn.Camera.Lane  (one_for_one; the event workers, by tier —
+│       │                              tier 1: PresenceRecorder + PresenceAggregator,
+│       │                              otherwise: CameraTracker, transient, ETS-checkpointed)
 │       └── :media Cairn.Camera.Media (rest_for_one; replaced alone on a restart-class change)
 │           ├── probe              (ffprobe task, temporary)
 │           ├── Cairn.RingBuffer

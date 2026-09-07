@@ -149,9 +149,13 @@ defmodule Cairn.CameraSupervisor do
   tell, and the config lookup guards the case a diff cannot produce: an id
   `config` does not carry.
 
-  The lane casts are dropped when the name is absent — a tier-2 camera has no
-  presence workers, and a tier-1 one may have a worker mid-restart, which
-  resolves the config for itself in `init/1` anyway.
+  Every tier's workers are cast to and the absent names dropped, rather than
+  the tier being read again here: a tier-1 camera has no tracker and a tier-2
+  one has no presence workers, and either may have a worker mid-restart, which
+  resolves the pair for itself in `init/1` anyway. Reading the tier here would
+  be a second answer to a question the tree has already answered
+  (`Cairn.Camera.Lane`), and a tier change is not a refresh at all — it is
+  `rebuilt`.
 
   A bridge camera's `Cairn.FFmpegPort` is deliberately not told: every field
   its argv reads (`rtsp_url`, `transcode`, `extra_ffmpeg_args`) is a
@@ -174,6 +178,7 @@ defmodule Cairn.CameraSupervisor do
 
     Cairn.PresenceAggregator.refresh(cam.id, cam, config)
     Cairn.PresenceRecorder.refresh(cam.id, cam, config)
+    Cairn.CameraTracker.refresh(cam.id, cam, config)
   end
 
   @spec start_camera(Config.t(), Config.Camera.t()) :: DynamicSupervisor.on_start_child()

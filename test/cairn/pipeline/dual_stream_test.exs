@@ -418,19 +418,19 @@ defmodule Cairn.Pipeline.DualStreamTest do
   defp tracker(camera_id) do
     on_exit(fn -> Cairn.EventCheckpoint.delete(camera_id) end)
 
-    # `Cairn.CameraTracker.tracked/3` starts one under the application's own
-    # pool for any camera that has none, and it outlives the test that
-    # provoked it — carrying that test's epoch, which would make this one's
-    # batches stale. Two tests here share `@configured`, so the pool is cleared
-    # on the way in and on the way out.
+    # Two tests here share `@configured`, so a tracker left registered by the
+    # first would carry its epoch into the second and make its batches stale.
+    # Nothing starts one but this helper now — `tracked/3` drops a batch it
+    # finds no tracker for — so clearing on the way in is belt and braces
+    # against a `start_supervised!` child the previous test has not finished
+    # unregistering.
     reap_tracker(camera_id)
-    on_exit(fn -> reap_tracker(camera_id) end)
 
     start_supervised!(
       {CameraTracker,
        camera_id: camera_id,
        name: Cairn.Registry.via(camera_id, :camera_tracker),
-       start_extractor: fn _camera, _event ->
+       start_extractor: fn _camera, _event, _config ->
          {:ok, spawn(fn -> Process.sleep(:infinity) end)}
        end,
        finalize_extractor: fn _pid, _event -> :ok end},
@@ -441,10 +441,8 @@ defmodule Cairn.Pipeline.DualStreamTest do
   defp reap_tracker(camera_id) do
     case Cairn.Registry.whereis(camera_id, :camera_tracker) do
       nil -> :ok
-      pid -> DynamicSupervisor.terminate_child(Cairn.TrackerSupervisor.Pool, pid)
+      _pid -> Cairn.Registry.await_unregistered(camera_id, :camera_tracker)
     end
-
-    Cairn.Registry.await_unregistered(camera_id, :camera_tracker)
   end
 
   # The decode and inference NIFs, stubbed under the name the pipeline builds

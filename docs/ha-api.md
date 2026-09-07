@@ -382,8 +382,10 @@ Same schema for all three kinds:
   nothing on the far side turned out to be this object), `evicted` (the camera
   hit its `tracking.max_live_tracks` cap and this was the least recently seen
   track),
-  `detection_disabled` (detection was switched off for this camera) or
-  `host_restart` (Cairn restarted; the track is over whatever the camera sees).
+  `detection_disabled` (detection was switched off for this camera),
+  `host_restart` (Cairn restarted; the track is over whatever the camera sees)
+  or `camera_stopped` (the camera was disabled or deleted, and everything it
+  was still tracking ended with it).
 
   **It is sent for every ending Cairn observes, but it is not a guarantee
   across a restart.** The checkpoint it would be replayed from is in memory

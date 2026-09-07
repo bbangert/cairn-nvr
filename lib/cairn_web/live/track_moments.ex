@@ -31,7 +31,7 @@ defmodule CairnWeb.TrackMoments do
           title: String.t() | nil
         }
 
-  # Plain-language glosses for `Cairn.Tracks.Track`'s six end reasons, shown as
+  # Plain-language glosses for `Cairn.Tracks.Track`'s seven end reasons, shown as
   # the tooltip on the "ended" moment. Every value the schema's `Ecto.Enum`
   # accepts needs an entry here — a new reason there without one here renders a
   # bare atom name with no tooltip.
@@ -41,7 +41,8 @@ defmodule CairnWeb.TrackMoments do
     stream_reset: "The camera stream restarted",
     evicted: "Dropped to cap memory use",
     detection_disabled: "Detection was turned off",
-    host_restart: "Cairn restarted"
+    host_restart: "Cairn restarted",
+    camera_stopped: "The camera was switched off or removed"
   }
 
   @doc """

@@ -388,6 +388,12 @@ defmodule Cairn.Pipeline.ConformanceTest do
   defp start_tracker(camera_id) do
     on_exit(fn -> Cairn.EventCheckpoint.delete(camera_id) end)
 
+    # No ring, no event (`Cairn.CameraTracker.start_event/5`), and an
+    # `event_started` is half of what this compares.
+    start_supervised!({Cairn.RingBuffer, camera_id: camera_id, pre_window_seconds: 5},
+      id: {:ring, camera_id}
+    )
+
     start_supervised!(
       {
         CameraTracker,
@@ -395,7 +401,7 @@ defmodule Cairn.Pipeline.ConformanceTest do
         # is the broadcast, so the extractor is a process that does nothing.
         camera_id: camera_id,
         name: nil,
-        start_extractor: fn _camera, _event ->
+        start_extractor: fn _camera, _event, _config ->
           {:ok, spawn(fn -> Process.sleep(:infinity) end)}
         end,
         finalize_extractor: fn _pid, _event -> :ok end

@@ -139,7 +139,7 @@ see and not record?* Rows exist for objects that never triggered a clip
   - `zones` — a `{:array, :string}`, frequently empty. Show as small mono chips
     on sunken bg, or `—`. Decide how many fit before truncating with "+N".
   - `end_reason` — one of `unseen` · `plugin_ended` · `stream_reset` ·
-    `evicted` · `detection_disabled` · `host_restart`; nil while the track is
+    `evicted` · `detection_disabled` · `host_restart` · `camera_stopped`; nil while the track is
     live. These are terse and internal-sounding; propose how much room they get
     and whether they read as a badge, a muted suffix, or a tooltip.
   - Optional if it earns its place: `source` (`host` | `plugin`),

@@ -39,7 +39,9 @@ defmodule Cairn.Track do
       `:stream_reset` (a new stream epoch severed it and nothing adopted it),
       `:evicted` (the camera hit its live-track cap and this was the least
       recently seen track), `:detection_disabled` (detection was turned off at
-      runtime), `:host_restart` (restored from a checkpoint after a crash).
+      runtime), `:host_restart` (restored from a checkpoint after a crash),
+      `:camera_stopped` (the camera was disabled, deleted or rebuilt, and its
+      tracker ended what it still held on the way out).
       `:plugin_ended` is retained in the type but no longer emitted — like
       `:plugin` above, it appears only on historical rows.
 
@@ -135,6 +137,7 @@ defmodule Cairn.Track do
           | :evicted
           | :detection_disabled
           | :host_restart
+          | :camera_stopped
 
   # Cluster `broadcast`, like `Cairn.Event` and `Cairn.EventArtifact`: the
   # `"events"` topic is consumer-facing (SSE, dashboard) and a subscriber may
