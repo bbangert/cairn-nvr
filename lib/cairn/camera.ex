@@ -1,16 +1,32 @@
 defmodule Cairn.Camera do
   @moduledoc """
-  Per-camera supervision tree, `:one_for_one` over two subtrees: `:lane`
-  (`Cairn.Camera.Lane`, the event workers) ahead of `:media`
-  (`Cairn.Camera.Media`, the media chain).
+  Per-camera supervision tree, `:one_for_one` over two subtrees: `:media`
+  (`Cairn.Camera.Media`, the media chain) ahead of `:lane`
+  (`Cairn.Camera.Lane`, the event workers).
 
   `:one_for_one` because the two are independent: the media reaches the lane
   by resolving Registry names per batch and casting, so a lane worker
   restarting is invisible to it — and `:rest_for_one` here would bounce the
   RTSP connection every time a lane worker crash-looped past its intensity.
-  Order still does its two jobs — the lane's names exist before the first
-  batch arrives, and shutdown runs in reverse: media first, so the source is
-  quiet before the workers that finalize its events stop.
+
+  What the order decides is the **stop**, which runs in reverse: the lane goes
+  first, while its media is still standing. That is what the lane's
+  `terminate/2` needs — `Cairn.CameraTracker` and `Cairn.PresenceRecorder`
+  each cast a finalize to an extractor that is still draining a live
+  `Cairn.RingBuffer`, and the tracker labels the tracks it ends
+  `:camera_stopped`, which is what actually happened to them. Stopping the
+  media first inverts that: `Cairn.PipelineOwner.terminate/2` publishes the
+  camera's `:camera_stopped` epoch, and the tracker's `apply_epoch/3` — a
+  message, so it is handled long before the supervisor gets round to stopping
+  the lane — has already ended every live track `:stream_reset` and counted a
+  stream reset that never happened.
+
+  The cost is at the start, and it is nothing: the pipeline can produce a
+  batch or two before the lane holds its Registry names, and those are cast to
+  absent names and dropped with a debug line
+  (`Cairn.CameraTracker.tracked/3`). A camera that has been up for a second
+  has lost at most its first few frames of detections, where the old order
+  risked mislabelling every track the camera ever held.
 
   A restart-class config change replaces `:media` alone
   (`Cairn.CameraSupervisor.restart_media/2`) — the restart-class fields are
@@ -46,7 +62,7 @@ defmodule Cairn.Camera do
   @impl true
   def init(opts) do
     opts = resolve(opts)
-    Supervisor.init([lane_spec(opts), media_spec(opts)], strategy: :one_for_one)
+    Supervisor.init([media_spec(opts), lane_spec(opts)], strategy: :one_for_one)
   end
 
   # One resolved pair for the whole tree: the ring's pre-window, the bridge's

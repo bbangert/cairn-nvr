@@ -37,12 +37,18 @@ defmodule Cairn.CameraTrackerTest do
     camera = %Camera{id: camera_id, rtsp_url: "rtsp://h/1", min_score: %{"default" => 0.5}}
     test_pid = self()
 
+    # No ring, no event (`Cairn.CameraTracker.start_event/5`): the extractor
+    # drains it, and on a real camera it is `Cairn.Camera.Media`'s second
+    # child. The gate reads the camera's registered name, so an unregistered
+    # tracker still passes it.
+    start_supervised!({Cairn.RingBuffer, camera_id: camera_id, pre_window_seconds: 5}, id: :ring)
+
     tracker =
       start_supervised!(
         {CameraTracker,
          camera_id: camera_id,
          name: nil,
-         start_extractor: fn _camera, event ->
+         start_extractor: fn _camera, event, _config ->
            pid = spawn(fn -> Process.sleep(:infinity) end)
            send(test_pid, {:extractor_started, event, pid})
            {:ok, pid}
@@ -883,12 +889,16 @@ defmodule Cairn.CameraTrackerTest do
 
       test_pid = self()
 
+      start_supervised!({Cairn.RingBuffer, camera_id: camera.id, pre_window_seconds: 5},
+        id: :dual_ring
+      )
+
       dual =
         start_supervised!(
           {CameraTracker,
            camera_id: camera.id,
            name: nil,
-           start_extractor: fn _camera, event ->
+           start_extractor: fn _camera, event, _config ->
              pid = spawn(fn -> Process.sleep(:infinity) end)
              send(test_pid, {:extractor_started, event, pid})
              {:ok, pid}
@@ -1010,7 +1020,7 @@ defmodule Cairn.CameraTrackerTest do
          camera_id: id,
          name: nil,
          monotonic_ms: fn -> Agent.get(clock, & &1) end,
-         start_extractor: fn _camera, ev ->
+         start_extractor: fn _camera, ev, _config ->
            pid = spawn(fn -> Process.sleep(:infinity) end)
            send(test_pid, {:extractor_started, ev, pid})
            {:ok, pid}
@@ -1057,12 +1067,16 @@ defmodule Cairn.CameraTrackerTest do
          camera_id: id,
          name: nil,
          monotonic_ms: fn -> Agent.get(clock, & &1) end,
-         start_extractor: fn _camera, ev ->
+         start_extractor: fn _camera, ev, _config ->
            pid = spawn(fn -> Process.sleep(:infinity) end)
            send(test_pid, {:extractor_started, ev, pid})
            {:ok, pid}
          end},
-        id: :tracker_suspended_checkpoint
+        id: :tracker_suspended_checkpoint,
+        # killed below, and the test starts the replacement itself: a
+        # `:transient` child would be restarted here too, and two processes
+        # would race to restore the one row.
+        restart: :temporary
       )
 
     # tagged so the reset below is a real boundary (see the note on the
@@ -1092,13 +1106,18 @@ defmodule Cairn.CameraTrackerTest do
     assert length(ids) == 2
     assert ids == Enum.sort(ids)
 
-    stop_supervised!(:tracker_suspended_checkpoint)
+    # Killed, not stopped: a graceful stop is the camera going away, and
+    # `terminate/2` finalizes the open event and deletes the row, leaving the
+    # replacement nothing to restore. A crash is what the checkpoint is for.
+    ref = Process.monitor(tracker)
+    Process.exit(tracker, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^tracker, :killed}
 
     start_supervised!(
       {CameraTracker,
        camera_id: id,
        name: nil,
-       start_extractor: fn _camera, ev ->
+       start_extractor: fn _camera, ev, _config ->
          pid = spawn(fn -> Process.sleep(:infinity) end)
          send(test_pid, {:extractor_started, ev, pid})
          {:ok, pid}
@@ -1254,7 +1273,7 @@ defmodule Cairn.CameraTrackerTest do
       {CameraTracker,
        camera_id: camera_id,
        name: nil,
-       start_extractor: fn _camera, event ->
+       start_extractor: fn _camera, event, _config ->
          pid = spawn(fn -> Process.sleep(:infinity) end)
          send(test_pid, {:extractor_started, event, pid})
          {:ok, pid}
@@ -1471,7 +1490,7 @@ defmodule Cairn.CameraTrackerTest do
         {CameraTracker,
          camera_id: id,
          name: nil,
-         start_extractor: fn _camera, ev ->
+         start_extractor: fn _camera, ev, _config ->
            pid = spawn(fn -> Process.sleep(:infinity) end)
            send(test_pid, {:extractor_started, ev, pid})
            {:ok, pid}
@@ -1511,7 +1530,7 @@ defmodule Cairn.CameraTrackerTest do
            camera_id: id,
            name: nil,
            monotonic_ms: fn -> Agent.get(clock, & &1) end,
-           start_extractor: fn _camera, ev ->
+           start_extractor: fn _camera, ev, _config ->
              pid = spawn(fn -> Process.sleep(:infinity) end)
              send(test_pid, {:extractor_started, ev, pid})
              {:ok, pid}
@@ -1706,7 +1725,7 @@ defmodule Cairn.CameraTrackerTest do
            camera_id: id,
            name: nil,
            monotonic_ms: fn -> Agent.get(clock, & &1) end,
-           start_extractor: fn _camera, ev ->
+           start_extractor: fn _camera, ev, _config ->
              pid = spawn(fn -> Process.sleep(:infinity) end)
              send(test_pid, {:extractor_started, ev, pid})
              {:ok, pid}
@@ -1863,7 +1882,7 @@ defmodule Cairn.CameraTrackerTest do
            [
              camera_id: camera_id,
              name: nil,
-             start_extractor: fn _camera, event ->
+             start_extractor: fn _camera, event, _config ->
                pid = spawn(fn -> relay(test_pid) end)
                send(test_pid, {:extractor_started, event, pid})
                {:ok, pid}
@@ -1878,8 +1897,13 @@ defmodule Cairn.CameraTrackerTest do
       )
     end
 
+    # `:stop` is the stand-in for a real extractor's clean finish: it exits
+    # `:normal` where a kill would look like a crash to the watching tracker.
     defp relay(test_pid) do
       receive do
+        :stop ->
+          :ok
+
         msg ->
           send(test_pid, {:extractor_got, msg})
           relay(test_pid)
@@ -2077,7 +2101,7 @@ defmodule Cairn.CameraTrackerTest do
       refute_received {:extractor_got, {:"$gen_cast", {:track_boxes, _}}}
     end
 
-    # The ordering `forward_boxes/3` documents and the sidecar's completeness
+    # The ordering `forward_boxes/2` documents and the sidecar's completeness
     # rests on: the batch casts and the finalize cast share a sender *and* a
     # receiver, so the BEAM's per-pair FIFO puts every batch in the extractor's
     # mailbox ahead of the finalize. Nothing raises or logs if that stops being
@@ -2111,6 +2135,32 @@ defmodule Cairn.CameraTrackerTest do
                [{:boxes, 0}, {:boxes, 1_000}, {:boxes, 2_000}, {:boxes, 3_000}, :finalize]
     end
 
+    # The same contract across the close that is not a timer: a supervisor
+    # `:shutdown`. `terminate/2` runs in this process, so the pair is the same
+    # pair — the reaper this tree replaced cast finalize from a third process,
+    # where the ordering does not hold and nothing would have said so.
+    test "the finalize a supervisor shutdown casts lands behind them too",
+         %{camera: camera, camera_id: id} do
+      tracker =
+        relay_tracker(id, :tracker_boxes_shutdown_order,
+          finalize_extractor: &Cairn.EventExtractor.finalize/2
+        )
+
+      t0 = DateTime.utc_now()
+
+      for seconds <- 0..3 do
+        observe(tracker, camera, [object("person", 0.9, [0.1, 0.1, 0.2, 0.4])],
+          observed_at: DateTime.add(t0, seconds, :second)
+        )
+      end
+
+      assert_receive {:extractor_started, %Event{}, _pid}
+      stop_supervised!(:tracker_boxes_shutdown_order)
+
+      assert relayed_until_finalize() ==
+               [{:boxes, 0}, {:boxes, 1_000}, {:boxes, 2_000}, {:boxes, 3_000}, :finalize]
+    end
+
     # Flunks rather than returning what it has: a comparison against a
     # truncated list would otherwise pass whenever the finalize never arrived.
     defp relayed_until_finalize(acc \\ []) do
@@ -2127,12 +2177,334 @@ defmodule Cairn.CameraTrackerTest do
     end
   end
 
+  # `Cairn.Camera` starts `:media` first, so a tracker judging a batch before
+  # `Cairn.RingBuffer` holds its name is the media being replaced or
+  # crash-looping under a lane that lives on — `restart_media/2`'s gap. Every
+  # other test in this file registers a ring in `setup`; this one is about the
+  # camera that has none.
+  describe "the ring gate" do
+    setup do
+      id = "trkgate_#{System.unique_integer([:positive])}"
+      Cairn.SnapshotHelpers.lend_cameras(id)
+      test_pid = self()
+
+      tracker =
+        start_supervised!(
+          {CameraTracker,
+           camera_id: id,
+           name: nil,
+           start_extractor: fn _camera, ev, _config ->
+             pid = spawn(fn -> Process.sleep(:infinity) end)
+             send(test_pid, {:extractor_started, ev, pid})
+             {:ok, pid}
+           end},
+          id: :ring_gate_tracker
+        )
+
+      on_exit(fn -> EventCheckpoint.delete(id) end)
+
+      %{
+        gate: tracker,
+        gate_id: id,
+        gate_camera: %Camera{id: id, rtsp_url: "rtsp://h/1", min_score: %{"default" => 0.5}}
+      }
+    end
+
+    test "no ring, no event — and the next batch after the ring is up opens one", ctx do
+      detect(ctx.gate, ctx.gate_camera)
+      # the barrier first: the refutes below are only real once the cast that
+      # would have opened the event has been handled
+      assert :sys.get_state(ctx.gate).event == nil
+
+      # nothing at all: no extractor to die `:noproc`, so no `:active` row, no
+      # checkpoint row and no `:event_ended` `:partial` for a clip that never
+      # began
+      refute_received {:extractor_started, _event, _pid}
+      refute_received {:event_started, _event}
+      assert EventCheckpoint.get(ctx.gate_id) == nil
+
+      # no timer was armed to retry: the next batch carrying evidence is what
+      # re-checks, and evidence is what an event needs anyway
+      start_supervised!(
+        {Cairn.RingBuffer, camera_id: ctx.gate_id, pre_window_seconds: 5},
+        id: :gate_ring
+      )
+
+      detect(ctx.gate, ctx.gate_camera)
+      id = ctx.gate_id
+      assert_receive {:event_started, %Event{camera_id: ^id}}
+    end
+  end
+
+  # `Cairn.EventExtractor` reports a lost ring to its owner rather than closing
+  # itself: the labels, scores and trigger the row must end with live here, and
+  # the snapshot it opened with is stale. Before S3 the tracker named no owner
+  # and this message did not exist, so the clip starved until the post window.
+  describe "a lost ring" do
+    test "closes the current event through the ordinary path", %{
+      tracker: tracker,
+      camera: camera,
+      camera_id: id
+    } do
+      observe(tracker, camera, [object("person", 0.9, @box)])
+      assert_receive {:event_started, %Event{id: eid}}
+      assert_receive {:extractor_started, %Event{id: ^eid}, extractor}
+
+      # a second label, so "the current event" is distinguishable from the
+      # snapshot the extractor was started with
+      observe(tracker, camera, [object("car", 0.95, @far_box)])
+      assert_receive {:event_updated, %Event{id: ^eid}}
+
+      send(tracker, {:ring_lost, eid})
+
+      assert_receive {:event_ended, %Event{id: ^eid, status: :finalized} = ended}
+      assert Map.has_key?(ended.max_scores, "car")
+      assert_receive {:extractor_finalized, ^extractor, %Event{id: ^eid, status: :finalized}}
+      assert EventCheckpoint.get(id) == nil
+      assert :sys.get_state(tracker).event == nil
+    end
+
+    test "a stale event id changes nothing", %{tracker: tracker, camera: camera} do
+      observe(tracker, camera, [object("person", 0.9, @box)])
+      assert_receive {:event_started, %Event{id: eid}}
+
+      send(tracker, {:ring_lost, Ecto.UUID.generate()})
+      _ = :sys.get_state(tracker)
+
+      refute_received {:event_ended, _}
+      assert %Event{id: ^eid} = :sys.get_state(tracker).event
+    end
+  end
+
+  # A supervisor `:shutdown` is the camera going away — disabled, deleted, or
+  # its tree rebuilt on a tier flip — and it is the one death that closes the
+  # open event here rather than leaving it to the checkpoint.
+  describe "a graceful stop" do
+    test "finalizes the open event, ends the live tracks and drops the row", %{
+      tracker: tracker,
+      camera: camera,
+      camera_id: id
+    } do
+      observe(tracker, camera, [object("person", 0.9, @box)])
+      assert_receive {:event_started, %Event{id: eid}}
+      assert_receive {:extractor_started, %Event{id: ^eid}, extractor}
+      assert_receive {:track_started, %Track{object_id: oid}}
+
+      stop_supervised!(CameraTracker)
+
+      assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
+      assert_receive {:extractor_finalized, ^extractor, %Event{id: ^eid, status: :finalized}}
+      # the tracker element went with the pipeline, so nothing else will ever
+      # emit this final. `:camera_stopped`, never `:stream_reset`: that reason
+      # is counted by `report_expired/2` and measured by
+      # `[:cairn, :tracker, :stream_reset]`, and a camera being switched off is
+      # not a reset.
+      assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :camera_stopped} = final}
+
+      assert_self_contained(final)
+      assert EventCheckpoint.get(id) == nil
+    end
+
+    # And the crash does not: it leaves the row, which is what the replacement
+    # restores from. The two paths must not be one.
+    test "a crash finalizes nothing and leaves the checkpoint", %{
+      tracker: tracker,
+      camera: camera,
+      camera_id: id
+    } do
+      observe(tracker, camera, [object("person", 0.9, @box)])
+      assert_receive {:event_started, %Event{id: eid}}
+      assert_receive {:extractor_started, %Event{id: ^eid}, _extractor}
+
+      ref = Process.monitor(tracker)
+      Process.exit(tracker, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^tracker, :killed}
+
+      refute_received {:extractor_finalized, _pid, _event}
+      refute_received {:event_ended, %Event{status: :finalized}}
+
+      # what closes it instead is the replacement, restoring the row this
+      # crash left behind: the stub extractor is in no registry, so it reads
+      # as an orphan
+      assert_receive {:event_ended, %Event{id: ^eid, status: :partial}}
+      assert EventCheckpoint.get(id) == nil
+    end
+  end
+
+  # `Cairn.CameraSupervisor.refresh_camera/2`'s third cast. What it carries is
+  # the pair alone; the thresholds ride in with every batch, which is why the
+  # window rule below is the part worth pinning.
+  describe "refresh" do
+    test "replaces the pair the paths no batch drives read", %{camera: camera, camera_id: id} do
+      tracker =
+        relay_tracker(id, :tracker_refresh, name: Cairn.Registry.via(id, :camera_tracker))
+
+      moved = %Camera{camera | min_score: %{"default" => 0.9}}
+      config = %Config{data_dir: "tmp/refresh"}
+
+      assert :ok = CameraTracker.refresh(id, moved, config)
+      _ = :sys.get_state(tracker)
+
+      state = :sys.get_state(tracker)
+      assert state.camera == moved
+      assert state.config == config
+    end
+
+    test "a camera with no tracker drops the cast" do
+      assert :ok = CameraTracker.refresh("trk_never_started", %Camera{id: "x"}, %Config{})
+    end
+
+    # The rule S2 set for the presence lane, held to here with a real timer:
+    # the windows an OPEN event closes by are the ones it opened with, so a
+    # policy that moves under it — a refresh, which reaches the pipeline and
+    # comes back in the next batch — cannot cut its clip short. A `post` of 0
+    # fires on the next scheduler pass, so if this batch's policy were what
+    # re-armed the window the event would already be over.
+    test "an open event keeps the post window it opened with, and the next one takes the new",
+         %{tracker: tracker, camera: camera} do
+      observe(tracker, camera, [object("person", 0.9, @box)])
+      assert_receive {:event_started, %Event{id: first}}
+
+      TrackerDriver.detections(
+        tracker,
+        camera,
+        %{@policy | post: 0},
+        observation([object("person", 0.95, @box)], [])
+      )
+
+      assert_receive {:event_updated, %Event{id: ^first}}
+      refute_receive {:event_ended, %Event{id: ^first}}, 200
+
+      # closed on its own window, and the batch that opens the NEXT event is
+      # the one whose policy that event lives under
+      fire(tracker, :post_window, first)
+      assert_receive {:event_ended, %Event{id: ^first}}
+
+      TrackerDriver.detections(
+        tracker,
+        camera,
+        %{@policy | post: 0},
+        observation([object("person", 0.9, @far_box)], [])
+      )
+
+      assert_receive {:event_started, %Event{id: second}} when second != first
+      assert_receive {:event_ended, %Event{id: ^second, status: :finalized}}, 1_000
+    end
+  end
+
+  # `Cairn.EventCheckpoint`'s restart window. Its table dies with it and its
+  # callers do not — every tier-2 tracker on the node is a child of its own
+  # camera's tree — so the whole fleet is writing checkpoints into nothing for
+  # as long as the window lasts. Two halves, because the API has two shapes: a
+  # `put/3` that finds no process (a `GenServer.call` that exits) and a `get/1`,
+  # `delete/1` or `all/0` that finds no table.
+  #
+  # Neither half kills anything: the name is unregistered and put back, and the
+  # table is deleted from inside its owner and restored by stopping it so the
+  # supervisor builds a fresh one. A kill would race its own restart, and this
+  # suite shares the node's real checkpoint owner.
+  describe "the checkpoint owner's restart window" do
+    test "does not take the trackers with it", %{camera: camera, camera_id: id} do
+      tracker =
+        relay_tracker(id, :tracker_checkpoint_window,
+          name: Cairn.Registry.via(id, :camera_tracker)
+        )
+
+      observe(tracker, camera, [object("person", 0.9, @box)])
+      assert_receive {:event_started, %Event{id: first}}
+      assert [{^id, %Event{id: ^first}, _tracks}] = checkpoint(id)
+
+      owner = Process.whereis(Cairn.EventCheckpoint)
+
+      # the write path with no process behind the name
+      Process.unregister(Cairn.EventCheckpoint)
+      row = %Event{id: Ecto.UUID.generate(), camera_id: id, started_at: DateTime.utc_now()}
+      assert EventCheckpoint.put(id, row, []) == :ok
+      Process.register(owner, Cairn.EventCheckpoint)
+
+      # and the table paths with no table
+      on_exit(fn -> restore_checkpoint_table() end)
+      :sys.replace_state(owner, fn state -> :ets.delete(:cairn_active_events) && state end)
+
+      assert EventCheckpoint.get(id) == nil
+      assert EventCheckpoint.delete(id) == :ok
+      assert EventCheckpoint.all() == []
+
+      # A live tracker driving both table ops through the window survives it:
+      # the close deletes a row that is not there, and the next event's open
+      # writes one into a table that is not there. So does the owner, which
+      # would otherwise crash-loop for as long as any camera kept checkpointing.
+      fire(tracker, :post_window, first)
+      assert_receive {:event_ended, %Event{id: ^first, status: :finalized}}
+
+      observe(tracker, camera, [object("person", 0.9, @box)])
+      assert_receive {:event_started, %Event{id: second}} when second != first
+      # answering is the liveness claim; a pid can read as alive after its exit
+      assert is_map(:sys.get_state(tracker))
+      assert is_map(:sys.get_state(owner))
+
+      # and a tracker that restarts inside the window comes up rather than
+      # failing to start — which is a lane child's death, and after `:lane`'s
+      # intensity and `Cairn.Camera`'s, a whole-tree rebuild that would take the
+      # RTSP session with it. What it cannot do is restore: with no row to read
+      # it comes up as a camera with nothing open, which is the state it would
+      # be in had the row never been written.
+      ref = Process.monitor(tracker)
+      Process.exit(tracker, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^tracker, :killed}
+
+      replacement = await_replacement(id, tracker)
+      assert :sys.get_state(replacement).event == nil
+    end
+
+    defp await_replacement(camera_id, dead, attempts \\ 200) do
+      case Cairn.Registry.whereis(camera_id, :camera_tracker) do
+        pid when is_pid(pid) and pid != dead ->
+          pid
+
+        _absent_or_dead when attempts > 0 ->
+          Process.sleep(5)
+          await_replacement(camera_id, dead, attempts - 1)
+
+        other ->
+          flunk("no replacement tracker for #{camera_id}: #{inspect(other)}")
+      end
+    end
+
+    # The owner recreates the table in `init/1`, so stopping it is how a test
+    # that removed the table hands the node a healthy one back.
+    defp restore_checkpoint_table do
+      case Process.whereis(Cairn.EventCheckpoint) do
+        nil ->
+          :ok
+
+        pid ->
+          if :ets.whereis(:cairn_active_events) == :undefined do
+            ref = Process.monitor(pid)
+            GenServer.stop(pid, :shutdown)
+            assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
+            wait_for_table()
+          end
+
+          :ok
+      end
+    end
+
+    defp wait_for_table(attempts \\ 200) do
+      cond do
+        :ets.whereis(:cairn_active_events) != :undefined -> :ok
+        attempts > 0 -> Process.sleep(5) && wait_for_table(attempts - 1)
+        true -> flunk("the event checkpoint table never came back")
+      end
+    end
+  end
+
   # Everything above drives an unregistered process by hand. These start
-  # trackers the way production does — registered in `Cairn.Registry`, under
-  # `Cairn.TrackerSupervisor`, both of which the application tree already runs
-  # in tests — because what they are about is the routing and the isolation
-  # that registration and a process per camera buy. Camera ids are minted per
-  # test, so two of them never collide on one registered name.
+  # trackers the way production does — from the camera's own
+  # `Cairn.Camera.Lane`, registered in `Cairn.Registry` — because what they are
+  # about is the routing and the isolation that registration and a process per
+  # camera buy. Camera ids are minted per test, so two of them never collide on
+  # one registered name.
   #
   # Recording is off throughout: no event opens, so no test here drags a real
   # `Cairn.EventExtractor` (and the ring buffer and index writes behind it) in
@@ -2143,12 +2515,27 @@ defmodule Cairn.CameraTrackerTest do
       %{camera_id: registered_camera_id()}
     end
 
-    test "ensure/1 hands two callers the same process", %{camera_id: id} do
-      assert {:ok, pid} = CameraTracker.ensure(id)
-      # the second caller finds the registration rather than starting a rival:
-      # two ports, or a port and the restore sweep, race here on every restart
-      assert {:ok, ^pid} = CameraTracker.ensure(id)
+    test "the lane starts the camera's tracker under its registered name", %{camera_id: id} do
+      assert pid = lane(id)
       assert Cairn.Registry.whereis(id, :camera_tracker) == pid
+    end
+
+    # The pool is gone and nothing starts a tracker from the data path: a batch
+    # for a camera whose lane is not up is lost, and the camera does not
+    # quietly grow a tracker outside its own tree. The same drop covers a
+    # tier-1 camera, whose lane has no tracker at all.
+    test "a batch for a camera with no tracker is dropped, not started", %{camera_id: id} do
+      TrackerDriver.detections(
+        nil,
+        tracked_camera(id),
+        @policy,
+        observation([object("person", 0.9, @box)], [])
+      )
+
+      refute Cairn.Registry.whereis(id, :camera_tracker)
+      # the batch was tracked — the element is in the driver — and then had
+      # nowhere to go, so nothing was published about it
+      refute_received {:track_started, _}
     end
 
     # The reason the aggregator was dissolved. One process per camera means one
@@ -2163,8 +2550,8 @@ defmodule Cairn.CameraTrackerTest do
       dead_cam = tracked_camera(dead_id)
       live_cam = tracked_camera(live_id)
 
-      assert {:ok, dead} = CameraTracker.ensure(dead_id)
-      assert {:ok, live} = CameraTracker.ensure(live_id)
+      dead = lane(dead_id)
+      live = lane(live_id)
 
       TrackerDriver.detections(
         nil,
@@ -2218,11 +2605,10 @@ defmodule Cairn.CameraTrackerTest do
       # The comeback, driven the way production drives it — through
       # `TrackerDriver.detections(nil, ...)`, which routes through `Dispatch`
       # and `CameraTracker.tracked/3` exactly as `Cairn.Pipeline.TrackSink`
-      # does, landing on whatever tracker `ensure/1` finds registered. Nothing
-      # here asserts *what* brought the process back: a `:transient` child is
-      # restarted by its supervisor and a `:temporary` one by this very call,
-      # and the restore is the same either way. The wait is for `ensure/1`'s
-      # stale-read window
+      # does, landing on whatever tracker the registry answers with. What
+      # brought the process back is the lane: the child is `:transient` and
+      # `Cairn.Camera.Lane` is `:one_for_one`, so a crash restarts it alone.
+      # The wait is for the registry's stale-read window
       # (`.claude/solutions/registry-stale-read-at-decision-sites-20260728.md`):
       # while the registry still answers with the corpse, the batch that
       # follows is dropped by design.
@@ -2250,7 +2636,7 @@ defmodule Cairn.CameraTrackerTest do
     end
 
     test "a batch addressed to another camera is dropped and said out loud", %{camera_id: id} do
-      assert {:ok, tracker} = CameraTracker.ensure(id)
+      tracker = lane(id)
       stranger = tracked_camera(registered_camera_id())
 
       log =
@@ -2275,18 +2661,17 @@ defmodule Cairn.CameraTrackerTest do
       assert :sys.get_state(tracker).track_updates == %{}
     end
 
-    # The restore sweep, which exists so a restore does not wait for the camera's
-    # next observation. Both branches of `restore_event/3` are covered: an
-    # orphan the extractor did not outlive, and an extractor that did.
-    test "restore_checkpointed/0 starts a tracker and ends the camera's orphan",
-         %{camera_id: id} do
+    # A tracker restores its own camera's row when its lane starts it — which
+    # is every restart, so nothing sweeps for rows any more. Both branches of
+    # `restore_event/3` are covered: an orphan the extractor did not outlive,
+    # and an extractor that did.
+    test "a starting tracker ends its camera's orphan", %{camera_id: id} do
       event = %Event{id: Ecto.UUID.generate(), camera_id: id, started_at: DateTime.utc_now()}
       track = restored_track(id)
       EventCheckpoint.put!(id, event, [track])
 
       refute Cairn.Registry.whereis(id, :camera_tracker)
-      assert :ok = CameraTracker.restore_checkpointed()
-      assert is_pid(Cairn.Registry.whereis(id, :camera_tracker))
+      assert is_pid(lane(id))
 
       eid = event.id
       oid = track.object_id
@@ -2296,14 +2681,18 @@ defmodule Cairn.CameraTrackerTest do
       assert EventCheckpoint.get(id) == nil
     end
 
-    test "restore_checkpointed/0 re-attaches to a live extractor and can finalize it",
+    test "a starting tracker re-attaches to a live extractor, claims it, and can finalize it",
          %{camera_id: id} do
       event = %Event{id: Ecto.UUID.generate(), camera_id: id, started_at: DateTime.utc_now()}
       extractor = registered_relay(id, event.id)
       EventCheckpoint.put!(id, event, [])
 
-      assert :ok = CameraTracker.restore_checkpointed()
-      assert tracker = Cairn.Registry.whereis(id, :camera_tracker)
+      assert tracker = lane(id)
+
+      # Claimed with `owner/2`: the owner this extractor was started with is
+      # the process that crashed, and an extractor whose owner is dead closes a
+      # lost ring itself, with the stale snapshot it opened on.
+      assert_receive {:extractor_got, {:"$gen_cast", {:owner, ^tracker}}}
 
       # re-attached, not orphaned: the event is still open, so the row stays
       # for the *next* restore to find and nothing was announced ended
@@ -2319,22 +2708,50 @@ defmodule Cairn.CameraTrackerTest do
       assert Process.alive?(extractor)
     end
 
-    # A camera id no other test can be holding, whose tracker is stopped at the
-    # end of this one: `Cairn.TrackerSupervisor.Pool` outlives the test, so a
-    # child left running would answer a later `ensure/1` for the same id.
+    # An adopted extractor that finishes under its PREDECESSOR — the finalize
+    # was cast before that process died, and it died before its own
+    # `EventCheckpoint.delete/1`. Nothing is announced (the predecessor did
+    # that), but the row is this process's to drop: left behind, the next
+    # restart restores an event that is already over.
+    test "an adopted extractor exiting cleanly drops the row it was restored from",
+         %{camera_id: id} do
+      event = %Event{id: Ecto.UUID.generate(), camera_id: id, started_at: DateTime.utc_now()}
+      extractor = registered_relay(id, event.id)
+      EventCheckpoint.put!(id, event, [])
+
+      assert tracker = lane(id)
+      assert {%Event{}, []} = EventCheckpoint.get(id)
+
+      ref = Process.monitor(extractor)
+      send(extractor, :stop)
+      assert_receive {:DOWN, ^ref, :process, ^extractor, :normal}
+      _ = :sys.get_state(tracker)
+
+      assert EventCheckpoint.get(id) == nil
+      assert :sys.get_state(tracker).event == nil
+      eid = event.id
+      refute_received {:event_ended, %Event{id: ^eid}}
+    end
+
+    # A camera id no other test can be holding. Nothing has to be cleaned up
+    # after it: every tracker here comes from a `start_supervised!` lane, which
+    # goes down with the test.
     defp registered_camera_id do
       id = "trkreg_#{System.unique_integer([:positive])}"
       Cairn.SnapshotHelpers.lend_cameras(id)
       Cairn.CameraControl.put(id, %{recording_enabled: false})
-
-      on_exit(fn ->
-        case Cairn.Registry.whereis(id, :camera_tracker) do
-          nil -> :ok
-          pid -> DynamicSupervisor.terminate_child(Cairn.TrackerSupervisor.Pool, pid)
-        end
-      end)
-
       id
+    end
+
+    # The camera's real lane, which is what starts a tracker in production:
+    # an unprofiled camera is tier `nil`, so its lane is the tracker alone.
+    defp lane(id) do
+      start_supervised!(
+        {Cairn.Camera.Lane, camera: tracked_camera(id), config: %Config{}},
+        id: {:lane, id}
+      )
+
+      Cairn.Registry.whereis(id, :camera_tracker)
     end
 
     defp tracked_camera(id),
@@ -2378,7 +2795,7 @@ defmodule Cairn.CameraTrackerTest do
     # Flunks rather than handing back the corpse: a caller that went on to cast
     # at it would be testing the dropped-batch path instead of the restore.
     defp await_revived(camera_id, dead, attempts \\ 200) do
-      with {:ok, pid} <- CameraTracker.ensure(camera_id),
+      with pid when is_pid(pid) <- Cairn.Registry.whereis(camera_id, :camera_tracker),
            true <- pid != dead and Process.alive?(pid) do
         pid
       else

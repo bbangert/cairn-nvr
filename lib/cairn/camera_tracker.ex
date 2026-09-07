@@ -17,19 +17,19 @@ defmodule Cairn.CameraTracker do
       finalizes and lets the next piece of evidence open a fresh event
 
   One process per camera, registered as `Cairn.Registry.via(camera_id,
-  :camera_tracker)` and started on demand by `ensure/1` under
-  `Cairn.TrackerSupervisor` — deliberately *outside* the per-camera media tree,
-  so restarting a camera's ingest does not take its open event with it. The
-  tracks themselves do die with a pipeline rebuild, which is where the
-  checkpoint below earns its keep: the event finalizes from it either way.
-  The process is `:transient`: a crash restarts it and the fresh
-  process restores from `Cairn.EventCheckpoint` in `init/1` — so the
-  `:host_restart` finals a checkpoint owes go out immediately, not when the
-  camera's next observation happens to arrive (a camera whose stream died with
-  its tracker would otherwise strand them indefinitely). The clean stop that is
-  not restarted is the app shutting down; removing a camera does not stop this
-  process — the `:camera_stopped` epoch ends its tracks and the idle tracker
-  lingers until shutdown.
+  :camera_tracker)` and started by the camera's own tree: it is the sole child
+  of `Cairn.Camera.Lane` on every tier but 1, after `:media`. A media
+  replacement — a restart-class config change, a crash of the ingest — leaves
+  it and its open event standing; the tracks themselves die with the
+  pipeline, which is where the checkpoint below earns its keep, since the event
+  finalizes from it either way. The process is `:transient`: a crash restarts
+  it and the fresh process restores from `Cairn.EventCheckpoint` in `init/1`,
+  so the `:host_restart` finals a checkpoint owes go out immediately rather
+  than when the camera's next observation happens to arrive (a camera whose
+  stream died with its tracker would otherwise strand them indefinitely). A
+  *graceful* stop is the camera going away — disabled, deleted, or its tree
+  rebuilt on a tier flip — and there the open event is closed here and now, in
+  `terminate/2`, rather than at the end of its post window.
 
   Not every detection is evidence (`evidence?/3`, the one gate both of the
   first two bullets pass through): a predicted ("tracked") object is refused,
@@ -168,14 +168,15 @@ defmodule Cairn.CameraTracker do
   @doc """
   Starts the tracker for one camera.
 
-  `:camera_id` is required. `:name` defaults to this camera's registered
-  via-tuple; `nil` starts it unregistered, which is how a test drives one
-  directly. The remaining options (`:start_extractor`, `:finalize_extractor`,
-  `:recorder`, `:monotonic_ms`) are injection seams documented at their
-  defaults in `init/1`.
+  `Cairn.Camera.Lane` passes the pair the tree resolved (`camera:`, `config:`);
+  a test may name the camera by `camera_id:` alone. `:name` defaults to this
+  camera's registered via-tuple; `nil` starts it unregistered, which is how a
+  test drives one directly. The remaining options (`:start_extractor`,
+  `:finalize_extractor`, `:recorder`, `:monotonic_ms`) are injection seams
+  documented at their defaults in `init/1`.
   """
   def start_link(opts) do
-    camera_id = Keyword.fetch!(opts, :camera_id)
+    camera_id = camera_id!(opts)
 
     case Keyword.get(opts, :name, Cairn.Registry.via(camera_id, :camera_tracker)) do
       nil -> GenServer.start_link(__MODULE__, opts)
@@ -183,47 +184,11 @@ defmodule Cairn.CameraTracker do
     end
   end
 
-  @doc """
-  The tracker for `camera_id`, started under `Cairn.TrackerSupervisor` if it
-  is not running yet.
-
-  The registry read is a stale-read site (see
-  `.claude/solutions/registry-stale-read-at-decision-sites-20260728.md`), and
-  it errs toward inaction on purpose: an entry the registry has not reaped yet
-  hands back a dead pid, the cast that follows is a no-op, and one batch of
-  detections is lost. What replaces the corpse is usually the supervisor: the
-  child is `:transient`, so by the next batch the registry answers with the
-  restarted tracker. Starting one from here is the fallback for the deaths the
-  supervisor does not undo — a clean stop, or a pool that spent its restart
-  intensity. Nothing here polls for that, because a detection dropped during a
-  tracker's death is indistinguishable from one dropped by its crash.
-
-  `DynamicSupervisor.start_child/2` is a `call`, so it *exits* when the
-  supervisor is down (its own restart window). This runs in the camera's
-  pipeline, in `Cairn.Pipeline.TrackSink`, and a detect branch must not die
-  because the tracker tree is briefly absent — the exit is caught and reported
-  as an error instead.
-  """
-  @spec ensure(String.t()) :: {:ok, pid()} | {:error, term()}
-  def ensure(camera_id) do
-    case Cairn.Registry.whereis(camera_id, :camera_tracker) do
-      pid when is_pid(pid) -> {:ok, pid}
-      nil -> start_tracker(camera_id)
+  defp camera_id!(opts) do
+    case Keyword.fetch(opts, :camera_id) do
+      {:ok, id} -> id
+      :error -> Keyword.fetch!(opts, :camera).id
     end
-  end
-
-  defp start_tracker(camera_id) do
-    spec = {__MODULE__, camera_id: camera_id}
-
-    case DynamicSupervisor.start_child(Cairn.TrackerSupervisor.Pool, spec) do
-      {:ok, pid} -> {:ok, pid}
-      # something got there first: the supervisor's own restart of a
-      # `:transient` child, another port, or the checkpoint restore sweep
-      {:error, {:already_started, pid}} -> {:ok, pid}
-      {:error, reason} -> {:error, reason}
-    end
-  catch
-    :exit, reason -> {:error, reason}
   end
 
   @doc """
@@ -234,16 +199,27 @@ defmodule Cairn.CameraTracker do
   tracking settings and the host-side `track:` / `record:` tiers, resolved at
   pipeline birth so this per-frame path never calls the config server.
 
-  Routes to the camera's own tracker, starting it if this is the first batch.
+  A missing tracker drops the batch rather than starting one: the camera's tree
+  starts its tracker, and this runs inside that camera's pipeline, whose
+  invariants must not depend on the lane being up. Absent means either a worker
+  mid-restart — the child is `:transient`, so the next batch finds the
+  replacement — or a tier-1 camera, whose lane has no tracker at all and whose
+  detect branch never builds a `Cairn.Pipeline.TrackSink` to reach one.
+
+  The registry read is also a stale-read site (see
+  `.claude/solutions/registry-stale-read-at-decision-sites-20260728.md`): an
+  entry the registry has not reaped yet hands back a dead pid and the cast that
+  follows is a no-op, losing one batch of detections. Indistinguishable from
+  the batch a crash itself loses, and covered the same way — by the next one.
   """
   @spec tracked(Cairn.Config.Camera.t(), map(), Dispatch.batch()) :: :ok
   def tracked(camera, policy, batch) when is_map(batch) do
-    case ensure(camera.id) do
-      {:ok, pid} ->
+    case Cairn.Registry.whereis(camera.id, :camera_tracker) do
+      pid when is_pid(pid) ->
         GenServer.cast(pid, {:tracked, camera, policy, batch})
 
-      {:error, reason} ->
-        Logger.debug("camera #{camera.id}: no tracker for this batch (#{inspect(reason)})")
+      nil ->
+        Logger.debug("camera #{camera.id}: no tracker for this batch")
         :ok
     end
   end
@@ -260,26 +236,26 @@ defmodule Cairn.CameraTracker do
     do: GenServer.cast(server, {:tracked, camera, policy, batch})
 
   @doc """
-  Starts a tracker for every camera holding a checkpointed event, so a restore
-  does not wait for that camera's next observation.
-
-  Runs as the second child of `Cairn.TrackerSupervisor`, after the tracker
-  pool. At boot it is always a no-op: `Cairn.EventCheckpoint`'s table is ETS,
-  so it dies with the VM and is created empty a few children earlier in the
-  same start sequence. It earns its keep on a pool restart, where the rows
-  outlive every tracker that wrote them and the subtree's `:rest_for_one`
-  cascade re-runs this.
+  `Cairn.CameraSupervisor.refresh_camera/2`'s cast: re-resolve the camera and
+  config this process holds. Dropped when the name is absent — a tier-1 camera
+  has no tracker, and one mid-restart resolves the pair for itself in `init/1`.
   """
-  @spec restore_checkpointed() :: :ok
-  def restore_checkpointed do
-    Enum.each(EventCheckpoint.all(), fn {camera_id, _event, _tracks} -> ensure(camera_id) end)
+  @spec refresh(String.t(), Config.Camera.t(), Config.t()) :: :ok
+  def refresh(camera_id, camera, config) do
+    case Cairn.Registry.whereis(camera_id, :camera_tracker) do
+      nil -> :ok
+      pid -> GenServer.cast(pid, {:refresh, camera, config})
+    end
   end
 
   # -- server -----------------------------------------------------------------
 
   @impl true
   def init(opts) do
-    camera_id = Keyword.fetch!(opts, :camera_id)
+    camera_id = camera_id!(opts)
+    # The camera stopping is a graceful stop of this process, and an event
+    # still open then is finalized in `terminate/2`.
+    Process.flag(:trap_exit, true)
 
     # Subscribe before reading, never after: a mint landing between the two is
     # then delivered as a message rather than missed, and the worst case is
@@ -287,7 +263,8 @@ defmodule Cairn.CameraTracker do
     # and does nothing with.
     StreamEpochs.subscribe()
 
-    detect_role = detect_role(camera_id, :main)
+    {camera, config} = resolve_pair(opts)
+    detect_role = Config.Camera.detect_role(camera)
 
     state = %{
       camera_id: camera_id,
@@ -297,9 +274,9 @@ defmodule Cairn.CameraTracker do
       # Which of this camera's streams the detect branch is fed from, and so
       # the only role whose epochs are this process's business. Re-resolved on
       # every `:started` this camera announces rather than frozen here: this
-      # process outlives the camera's pipeline (it sits outside the media
-      # tree), and `substream_url` is a restart field, so the role can move
-      # under it. See `detect_role/2`.
+      # process outlives the camera's pipeline (`:lane` survives a `:media`
+      # replacement), and `substream_url` is a restart field, so the role can
+      # move under it. See `detect_role/2`.
       detect_role: detect_role,
       current_epoch: seed_epoch(camera_id, detect_role),
       # The epoch that was current when this camera was stopped, held until the
@@ -316,15 +293,33 @@ defmodule Cairn.CameraTracker do
       # only until the first batch of the new epoch measures the gap to it
       # (`report_gap/2`)
       gap_from: nil,
-      # last seen in `process_batch/4`; see the comment there
+      # Last seen in `process_batch/4`; see the comment there. `policy` is not
+      # seeded from the pair below and deliberately: the thresholds this
+      # process judges by arrive with every batch, so the only correct value
+      # before the first one is "none known".
       policy: nil,
-      camera: nil,
+      # The policy the OPEN event was opened under, `nil` between events. The
+      # windows an event is closed by are read from here and never from
+      # `policy`, which moves with every batch: a refresh mid-event must not
+      # change how long the event that is already running has left
+      # (`Cairn.PresenceRecorder`'s `event_policy`, same rule, same reason).
+      event_policy: nil,
+      # Seeded from the tree's resolved pair and replaced by each batch's own
+      # camera. Read on the paths that get neither a batch nor a policy —
+      # `qualifies?/2`'s `min_score` floor, and the windows a restored event's
+      # timers are armed with.
+      camera: camera,
+      # The `%Cairn.Config{}` the pair was resolved from, kept because the clip
+      # is written under it: `Cairn.EventExtractor` otherwise reads it by
+      # calling the config server, which this process must never make happen
+      # from `init/1` (`resolve_pair/1`).
+      config: config,
       checkpointed_at: nil,
       post_ref: nil,
       post_token: nil,
       max_ref: nil,
       max_token: nil,
-      start_extractor: Keyword.get(opts, :start_extractor, &Cairn.EventExtractor.start/2),
+      start_extractor: Keyword.get(opts, :start_extractor, &start_extractor/3),
       finalize_extractor:
         Keyword.get(opts, :finalize_extractor, &Cairn.EventExtractor.finalize/2),
       # The track index's batch writer, injectable for the same reason as the
@@ -338,11 +333,56 @@ defmodule Cairn.CameraTracker do
     {:ok, restore_from_checkpoint(state)}
   end
 
-  # The epoch the detect stream is running under right now, if anything is: it
-  # is minted at each session's first buffer, upstream of decode and inference,
-  # so it exists before any detection of that session can create this
-  # process — reading it here is what lets `stale?/2` judge the very first
-  # batch and what makes the next announcement of the same epoch a no-op.
+  # The camera and config this process starts on, read from the PUBLISHED
+  # snapshot and never by calling `Cairn.Config.Server` — `Cairn.Camera`'s rule
+  # (`resolve/1`), and sharper one level down. This runs in `init/1`, and a
+  # reload that adds or rebuilds a tier-2 camera starts this process from
+  # inside the server's own `handle_call`: `apply_diff/2` → `sync/1` →
+  # `start_camera/2` → `Cairn.Camera.init/1` → `Cairn.Camera.Lane.init/1` →
+  # here. A call back to that server waits on a process that is waiting on this
+  # one, so it can only end in its 5 s timeout, and those 5 s are spent inside
+  # the SERVER's call — per camera the reload starts, until an operator's save
+  # runs out of budget.
+  #
+  # The snapshot is not a weaker answer: the server publishes it before it
+  # applies the diff (`Cairn.Config.Server.apply_config/2`), so it is exactly
+  # the config the server will hold when the call returns. Falling back to the
+  # pair the tree passed in covers the two cases it cannot answer — no publish
+  # yet, and a test's fixture camera the config does not name.
+  defp resolve_pair(opts) do
+    case Config.Server.snapshot_camera(camera_id!(opts)) do
+      {:ok, camera, config} ->
+        {camera, config}
+
+      :error ->
+        {Keyword.get(opts, :camera) || %Config.Camera{id: camera_id!(opts)},
+         Keyword.get(opts, :config) || %Config{}}
+    end
+  end
+
+  # `config:` is passed rather than left to the extractor's own default, which
+  # is `Cairn.Config.Server.get/0`. No open is reachable from this process's
+  # own `init/1` — a restore adopts an extractor, it never starts one — but the
+  # call would still be made on the detection path, against a server that may
+  # be mid-reload starting another camera's lane, and the config a clip is
+  # written under is one this process already holds. The seam takes it as an
+  # argument so a caller cannot forget it.
+  defp start_extractor(camera, event, config) do
+    Cairn.EventExtractor.start(camera, event,
+      config: config,
+      # This process finalizes the clip, so it is what the extractor reports a
+      # lost ring to and monitors: the event's current labels, scores and
+      # trigger live here, never there.
+      owner: self()
+    )
+  end
+
+  # The epoch the detect stream is running under right now, if anything is.
+  # Usually already minted when this process starts: the lane comes up after
+  # `:media`, and on a lane-only restart under a session that has been running
+  # for hours. That is the case it is for — reading the epoch here is what lets
+  # `stale?/2` judge the very first batch, and what makes the next announcement
+  # of the same epoch a no-op. Empty only when the mint has not landed yet.
   defp seed_epoch(camera_id, role) do
     case StreamEpochs.current({camera_id, role}) do
       {:ok, epoch} -> epoch
@@ -351,33 +391,33 @@ defmodule Cairn.CameraTracker do
   end
 
   # The role the camera's detect branch is built off: `:sub` when it has a
-  # substream, `:main` otherwise. A config round trip, which is why it is asked
-  # only at init and on this camera's `:started` announcements — a session
-  # start is both rare and the one moment the answer can have moved, since a
-  # `substream_url` edit replaces the camera's media subtree
-  # (`Cairn.Config.Server`'s restart fields) and the pipeline that comes back
-  # announces `:started`.
+  # substream, `:main` otherwise. Re-read only on this camera's `:started`
+  # announcements — a session start is both rare and the one moment the answer
+  # can have moved, since a `substream_url` edit replaces the camera's media
+  # subtree (`Cairn.Config.Server`'s restart fields) and the pipeline that
+  # comes back announces `:started`. `init/1` takes it from the pair it
+  # resolved instead.
   #
-  # Failure mode: the config server serves the *new* config while the *old*
-  # pipeline is still running. A `:started` in that window resolves the role
-  # the camera is about to have rather than the one it has, and until the
-  # restart lands this process ignores the announcements it should follow —
-  # `stale?/2` then drops the old pipeline's last batches. The window is the
-  # media replacement itself, and a mint needs a fresh RTSP session and its first
-  # buffer, so nothing reaches it in practice. A config server that is down or
-  # too slow (the call exits) keeps the role already held: degrading to `:main`
-  # would silently move a dual-stream camera's tracker onto the recording
-  # stream, which is the failure this whole axis exists to prevent.
+  # The published snapshot, never a call — `resolve_pair/1`'s rule, and it
+  # holds on this path too: the announcement is broadcast by a pipeline the
+  # config server may be starting from inside its own `handle_call`.
+  #
+  # Failure mode: the snapshot is the *new* config while the *old* pipeline is
+  # still running. A `:started` in that window resolves the role the camera is
+  # about to have rather than the one it has, and until the restart lands this
+  # process ignores the announcements it should follow — `stale?/2` then drops
+  # the old pipeline's last batches. The window is the media replacement
+  # itself, and a mint needs a fresh RTSP session and its first buffer, so
+  # nothing reaches it in practice. A camera the snapshot does not name (no
+  # publish yet, or a removal mid-transition) keeps the role already held:
+  # degrading to `:main` would silently move a dual-stream camera's tracker
+  # onto the recording stream, which is the failure this whole axis exists to
+  # prevent.
   defp detect_role(camera_id, held) do
-    case Config.Server.camera(camera_id) do
-      {:ok, camera} -> Config.Camera.detect_role(camera)
-      # A camera the config no longer names (a removal mid-transition) is a
-      # lookup failure like any other: keep the role already held rather than
-      # silently moving a dual camera's filter onto the recording stream.
+    case Config.Server.snapshot_camera(camera_id) do
+      {:ok, camera, _config} -> Config.Camera.detect_role(camera)
       :error -> held
     end
-  catch
-    :exit, _ -> held
   end
 
   @impl true
@@ -392,8 +432,21 @@ defmodule Cairn.CameraTracker do
     end
   end
 
-  # A batch addressed to another camera. The producer routes through `ensure/1`
-  # on its own camera, so this is a misroute rather than a race — dropped and
+  # `Cairn.CameraSupervisor.refresh_camera/2`'s cast. Only the pair is
+  # replaced: every threshold this process judges by — the windows, the
+  # `track:` and `record:` tiers, the floors — arrives with each batch from a
+  # pipeline the same refresh has already reached
+  # (`Cairn.PipelineOwner.refresh/3`), so there is nothing else here to
+  # correct — and the windows an OPEN event closes by are deliberately not
+  # corrected either: they are the ones it opened with (`event_policy`), so a
+  # refresh takes effect at the next event, as it does on the presence lane.
+  # What the pair is read for is the paths no batch drives: `qualifies?/2`'s
+  # floor and the config a clip is written under.
+  def handle_cast({:refresh, camera, config}, state),
+    do: {:noreply, %{state | camera: camera, config: config}}
+
+  # A batch addressed to another camera. The producer resolves its own camera's
+  # tracker by name, so this is a misroute rather than a race — dropped and
   # said out loud, never folded into this camera's event.
   def handle_cast({:tracked, camera, _policy, _batch}, state) do
     Logger.warning(
@@ -512,7 +565,7 @@ defmodule Cairn.CameraTracker do
         # recording disabled: evaluate detections but don't open a new event
         state.event == nil and not recording_enabled?(state) -> state
         state.event == nil -> start_event(state, camera, policy, batch, passing)
-        true -> update_event(state, policy, batch, passing)
+        true -> update_event(state, batch, passing)
       end
 
     # After the lifecycle `cond` and on its result, deliberately: the batch
@@ -592,7 +645,7 @@ defmodule Cairn.CameraTracker do
   defp forward_boxes(_state, _batch), do: :ok
 
   # The single gate: the objects this accepts are `passing`, which is what both
-  # `start_event/5` and `update_event/4` are handed, so what is refused here
+  # `start_event/5` and `update_event/3` are handed, so what is refused here
   # can neither open an event nor hold one open. That pairing is the whole
   # point of the stationary rule — a parked car keeps producing detections, and
   # refusing them is what lets the post-window run out instead of being reset
@@ -672,6 +725,16 @@ defmodule Cairn.CameraTracker do
     end
   end
 
+  # The clip's source is gone (`Cairn.EventExtractor`): a media replacement
+  # took the ring, or it crashed. The close is the ordinary one — this process
+  # holds the event's current labels, scores and trigger, and they are what the
+  # row must end with. Nothing is armed after it, where the presence lane arms
+  # a retry: an event here is opened by evidence in a batch and by nothing
+  # else, so the next batch carrying some is the retry. A stale id (the event
+  # has already closed) falls out of `maybe_finalize/3`.
+  def handle_info({:ring_lost, event_id}, state),
+    do: {:noreply, maybe_finalize(state, event_id, :ring_lost)}
+
   # `:noproc` is a clean finish, not a crash. `restore_from_checkpoint/1` can
   # monitor a pid the registry still lists but whose process is already gone
   # (unregistration rides the async DOWN the partition sends itself), and
@@ -692,10 +755,97 @@ defmodule Cairn.CameraTracker do
     end
   end
 
-  def handle_info({:DOWN, _ref, :process, pid, _reason}, %{extractor: pid} = state),
-    do: {:noreply, clear_event(state)}
+  # A clean exit with the event still open. With the owner protocol wired, an
+  # extractor this process started cannot reach here that way — it exits
+  # `:normal` only after a finalize, which `clear_event/1` has already run, and
+  # a lost ring is reported as `{:ring_lost, _}` rather than by dying. What is
+  # left is the extractor this process ADOPTED in `restore_from_checkpoint/1`,
+  # which has two ways to finish under its predecessor rather than under this
+  # process: that predecessor's finalize was in flight when the row was
+  # restored, or its ring died first and the owner `:DOWN` that followed made
+  # it an orphan closing itself. Nothing is said here in either case, and for
+  # the same reason — the process that closed the event announced
+  # `:event_ended` on its way out, the owner before it died
+  # (`maybe_finalize/3`) or the extractor itself (`orphan_close/1`, the one
+  # broadcast that process ever makes). The two branches stay split for exactly
+  # this pair.
+  #
+  # The row goes here because nobody else will: the predecessor died between
+  # its finalize cast and its own `EventCheckpoint.delete/1`, which is the same
+  # window that put this process on an already-ending event. Left behind, it is
+  # restored again by the *next* restart and dropped there by `end_orphan/2`
+  # against an index that says `:finalized` — a wasted restore cycle rather
+  # than a loop, and a row naming an event that is over.
+  def handle_info({:DOWN, _ref, :process, pid, _reason}, %{extractor: pid} = state) do
+    if match?(%Event{}, state.event), do: EventCheckpoint.delete(state.camera_id)
+    {:noreply, clear_event(state)}
+  end
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  @doc """
+  The camera is going away — disabled, deleted, or its tree rebuilt on a tier
+  flip — and an event still open is closed here rather than at the end of its
+  post window: a supervisor shutdown cannot wait out 600 s, and a camera being
+  switched off ending its clip now is the honest behavior.
+
+  The close is `maybe_finalize/3`'s, in its order and from this process, which
+  is the load-bearing part: this is the process that cast the boxes
+  (`forward_boxes/2`), so its finalize cast lands behind every one of them in
+  the extractor's mailbox. Nothing is awaited. The extractor is `:temporary`
+  under `Cairn.EventSupervisor`, outside the camera's tree, and runs its close,
+  remux and `Cairn.Events.finalize` alone — so this returns at once and the
+  `terminate_child` that stopped the camera is not held for a remux.
+
+  The live tracks are ended too, `:camera_stopped`, and usually there are none
+  left to end: `:media` is torn down first (reverse start order), so its
+  `:camera_stopped` epoch has normally already ended them as `:stream_reset` —
+  which is the honest reason there, since that same announcement is what a
+  media *replacement* makes on a camera that is staying. This is the backstop
+  for the stop that emits none, a killed pipeline, where the rows would
+  otherwise stay live until the next boot; the reason names what actually
+  happened to them.
+
+  A crash reason does none of this: the replacement restores from the
+  checkpoint row and re-adopts the still-running extractor, as it always has.
+  """
+  @impl true
+  def terminate(:shutdown, state), do: close_on_stop(state)
+  def terminate({:shutdown, _reason}, state), do: close_on_stop(state)
+  def terminate(_crash, _state), do: :ok
+
+  defp close_on_stop(state) do
+    end_live_tracks(state)
+    close_event_on_stop(state)
+  end
+
+  defp close_event_on_stop(%{event: nil}), do: :ok
+
+  defp close_event_on_stop(%{event: %Event{} = event} = state) do
+    Logger.info("event #{event.id} (#{state.camera_id}): finalizing (camera stopped)")
+    event = %{event | ended_at: now(), status: :finalized}
+    Event.broadcast(:event_ended, event)
+    state.finalize_extractor.(state.extractor, event)
+    EventCheckpoint.delete(state.camera_id)
+    :ok
+  end
+
+  # The last summary this process saw for each: the tracker element is in the
+  # pipeline and is going away with it, so nothing else will ever emit their
+  # finals. Deliberately NOT `:stream_reset`, which `report_expired/2` counts
+  # and `[:cairn, :tracker, :stream_reset]` measures — a camera being switched
+  # off is not a reset, and reporting it as one would inflate a metric about
+  # stream health and put a reset in the history that never happened.
+  # Recorded against the open event if there is one —
+  # `record_final/2`'s open-event rule — so a track live during the clip has
+  # its row, which is what the table exists to guarantee.
+  defp end_live_tracks(state) do
+    for {_id, %{track: %Track{} = track}} <- state.track_updates do
+      final = %{track | end_reason: :camera_stopped}
+      Track.broadcast(:track_ended, final)
+      record_final(state, final)
+    end
+  end
 
   # Deliberately not on `:camera_stopped`: a stop is minted per role by the
   # pipeline that is going away, so it has to be judged against the role that
@@ -955,8 +1105,9 @@ defmodule Cairn.CameraTracker do
   # happened to be open.
   #
   # Every end reason goes through the same rule. `:evicted`, `:stream_reset`,
-  # `:detection_disabled` and `:host_restart` are the reasons a reader is most
-  # likely to be investigating, and a row costs nothing.
+  # `:detection_disabled`, `:host_restart` and `:camera_stopped` are the
+  # reasons a reader is most likely to be investigating, and a row costs
+  # nothing.
   #
   # "Open" means open when the track ended: `publish_tracks/2` runs on the
   # state as it was before this batch, so a track that expires in the same
@@ -995,19 +1146,18 @@ defmodule Cairn.CameraTracker do
   # The `track:` tier, resolved for one track. The gate on opening a row and,
   # for a track that never opened one, on writing it at the end.
   #
-  # Belt and braces on the cached pair: every path that can produce a live
-  # track today has been through `process_batch/4`, which caches both. A
-  # tracker that has never received a batch does exist — `ensure/1` is public
-  # and `restore_checkpointed/0` starts one per checkpointed camera — but it
-  # knows no tracks, so none reaches here and the nil caches are never read. An
-  # end path that ever skips it must not silently exclude the track, so an
-  # absent policy is read as an absent `track:` block, i.e. the label's wire
-  # floor off a default camera.
+  # `policy` is the cache `process_batch/4` fills, and every path that can
+  # produce a live track has been through it — a tracker starts with its
+  # camera now, so one that has never received a batch is the ordinary state of
+  # an idle camera, but it knows no tracks and none reaches here. An end path
+  # that ever skips it must not silently exclude the track, so an absent policy
+  # is read as an absent `track:` block, i.e. the label's wire floor. The
+  # camera is never absent — `resolve_pair/1` always answers with one — so the
+  # floor is this camera's own from the first moment.
   defp qualifies?(state, track) do
-    camera = state.camera || %Config.Camera{id: track.camera_id}
     tier = state.policy && Map.get(state.policy, :track)
 
-    case Config.tier_threshold(tier, track.label, camera.min_score) do
+    case Config.tier_threshold(tier, track.label, state.camera.min_score) do
       :excluded -> false
       threshold when is_number(threshold) -> track.best_score >= threshold
     end
@@ -1098,7 +1248,41 @@ defmodule Cairn.CameraTracker do
 
   # -- lifecycle --------------------------------------------------------------
 
+  # No ring, no event. The camera's `:lane` starts after its `:media`, so a
+  # whole-camera start does not reach this — but the media can be mid-restart
+  # while this lane lives on: `Cairn.CameraSupervisor.restart_media/2` leaves
+  # exactly that gap, as does a media crash under `Cairn.Camera`'s
+  # `:one_for_one`. The extractor drains the ring in its own
+  # `handle_continue`, so it would exit `:noproc`, and the `:DOWN` that follows
+  # would announce an `:event_ended` `:partial` for a clip that never began —
+  # plus an `:active` row and a checkpoint row for it. Waiting costs nothing
+  # and needs no timer: the next batch carrying evidence re-checks, and
+  # evidence is what an event needs anyway.
   defp start_event(state, camera, policy, batch, dets) do
+    if ring_ready?(state.camera_id) do
+      open_event(state, camera, policy, batch, dets)
+    else
+      Logger.debug("camera #{state.camera_id}: no ring buffer yet; deferring the open")
+      state
+    end
+  end
+
+  # `Process.alive?/1` as well as the name: `Cairn.Registry.whereis/2` does not
+  # filter dead pids, and the single partition's DOWN handling can lag a read
+  # arbitrarily — so a corpse answers here for a while after a media
+  # replacement killed the old ring.
+  #
+  # A ring that dies AFTER this check is not this gate's business: the
+  # extractor monitors the ring it drained and reports the loss
+  # (`{:ring_lost, _}`), which closes the clip through the ordinary path.
+  defp ring_ready?(camera_id) do
+    case Cairn.Registry.whereis(camera_id, :ring_buffer) do
+      pid when is_pid(pid) -> Process.alive?(pid)
+      nil -> false
+    end
+  end
+
+  defp open_event(state, camera, policy, batch, dets) do
     observed_at = batch.observed_at
 
     event = %Event{
@@ -1113,7 +1297,7 @@ defmodule Cairn.CameraTracker do
 
     event = %{event | max_score: event.max_scores |> Map.values() |> Enum.max(fn -> nil end)}
 
-    case state.start_extractor.(camera, event) do
+    case state.start_extractor.(camera, event, state.config) do
       {:ok, pid} ->
         Process.monitor(pid)
         EventCheckpoint.put(camera.id, event, batch.snapshot)
@@ -1125,6 +1309,7 @@ defmodule Cairn.CameraTracker do
         %{
           state
           | event: event,
+            event_policy: policy,
             checkpointed_at: state.monotonic_ms.(),
             extractor: pid,
             post_ref: post_ref,
@@ -1139,7 +1324,12 @@ defmodule Cairn.CameraTracker do
     end
   end
 
-  defp update_event(%{event: event} = state, policy, batch, dets) do
+  # Takes no policy, unlike `start_event/5`: both windows an open event closes
+  # by are the ones it opened with (`event_policy`), so a refresh mid-event
+  # moves neither and the batch's own policy has nothing to say here. The
+  # detections it admitted were filtered in `process_batch/4`, against that
+  # policy, before they got this far.
+  defp update_event(%{event: event} = state, batch, dets) do
     max_scores = max_scores(event.max_scores, dets)
     observed_at = batch.observed_at
 
@@ -1160,7 +1350,7 @@ defmodule Cairn.CameraTracker do
     state = checkpoint(%{state | event: event}, batch.snapshot)
     Event.broadcast(:event_updated, event)
 
-    {post_ref, post_token} = schedule(:post_window, event.id, policy.post)
+    {post_ref, post_token} = schedule(:post_window, event.id, state.event_policy.post)
     %{state | post_ref: post_ref, post_token: post_token}
   end
 
@@ -1234,9 +1424,7 @@ defmodule Cairn.CameraTracker do
       # Unconditionally, and with the checkpointed event's id: a checkpoint
       # row exists only while an event is open, so every track restored here
       # was live during that clip — the same rule `record_final/2` applies to
-      # an open event. No tier is consulted because none is known here; the
-      # camera's policy lives in the config server, and this runs inside
-      # `init/1`.
+      # an open event, and the one that makes no tier worth consulting here.
       TrackRecorder.record_final(state.recorder, final, event.id)
     end)
 
@@ -1254,14 +1442,22 @@ defmodule Cairn.CameraTracker do
       # `handle_info/2` treats as the same clean finish.
       pid ->
         Process.monitor(pid)
-        # the camera's own policy is unknown here; use the global defaults
-        policy = Config.policy(config(), %Config.Camera{id: state.camera_id})
+        # Claimed: the owner it was started with is the process that just
+        # crashed, and an extractor whose owner is dead closes a lost ring
+        # itself, with the stale event snapshot it opened on. The cast is a
+        # no-op on the corpse case above.
+        Cairn.EventExtractor.owner(pid, self())
+        # The pair `init/1` resolved, so a restored event's windows are the
+        # camera's own; before the lane they were the global defaults, which is
+        # all a process with no camera in hand could reach.
+        policy = Config.policy(state.config, state.camera)
         {post_ref, post_token} = schedule(:post_window, event.id, policy.post)
         {max_ref, max_token} = schedule(:max_event, event.id, policy.max)
 
         %{
           state
           | event: event,
+            event_policy: policy,
             extractor: pid,
             post_ref: post_ref,
             post_token: post_token,
@@ -1327,14 +1523,6 @@ defmodule Cairn.CameraTracker do
     )
   end
 
-  defp config do
-    Config.Server.get()
-  rescue
-    _ -> %Config{}
-  catch
-    :exit, _ -> %Config{}
-  end
-
   # -- helpers ----------------------------------------------------------------
 
   defp label_entries(entries, dets, started_at, observed_at) do
@@ -1391,6 +1579,7 @@ defmodule Cairn.CameraTracker do
     %{
       state
       | event: nil,
+        event_policy: nil,
         extractor: nil,
         checkpointed_at: nil,
         post_ref: nil,

@@ -4,9 +4,9 @@ defmodule Cairn.TrackAssertions do
   finals: the summary stands on its own.
 
   Kept in one place on purpose — asserted ad hoc, each end path (`:unseen`,
-  `:stream_reset`, `:evicted`, `:detection_disabled`, `:host_restart`) grows
-  its own list of checked fields and a regression that nils one of them on a
-  single path goes unnoticed.
+  `:stream_reset`, `:evicted`, `:detection_disabled`, `:host_restart`,
+  `:camera_stopped`) grows its own list of checked fields and a regression
+  that nils one of them on a single path goes unnoticed.
   """
 
   import ExUnit.Assertions

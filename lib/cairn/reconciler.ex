@@ -68,12 +68,11 @@ defmodule Cairn.Reconciler do
     # Deliberately not coordinated with the camera trackers' checkpoint
     # restore, which closes the tracks of cameras that had an open event: at
     # boot there is nothing to coordinate with. `Cairn.EventCheckpoint` is ETS,
-    # created empty a few children before this runs, so the sweep under
-    # `Cairn.TrackerSupervisor` finds no rows and every live row closed here is
-    # one no restore was ever going to touch. That sweep does re-run mid-life
-    # when the tracker pool restarts, long after this has finished; even then
-    # both writes say `:host_restart` and track rows upsert, so the only thing
-    # at stake would be `ended_at`.
+    # created empty a few children before this runs, so no tracker's `init/1`
+    # finds a row and every live row closed here is one no restore was ever
+    # going to touch. A tracker crash does re-run a restore mid-life, long
+    # after this has finished; even then both writes say `:host_restart` and
+    # track rows upsert, so the only thing at stake would be `ended_at`.
     tracks_closed = Tracks.close_live()
 
     summary = %{

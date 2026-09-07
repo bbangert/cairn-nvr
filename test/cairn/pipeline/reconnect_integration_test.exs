@@ -514,7 +514,7 @@ defmodule Cairn.Pipeline.ReconnectIntegrationTest do
     defaults = [
       camera_id: camera_id,
       name: nil,
-      start_extractor: fn _camera, _event ->
+      start_extractor: fn _camera, _event, _config ->
         {:ok, spawn(fn -> Process.sleep(:infinity) end)}
       end,
       finalize_extractor: fn _pid, _event -> :ok end

@@ -20,9 +20,23 @@ defmodule Cairn.EventCheckpoint do
   ordering below rests on their keeping it. Like the other runtime owners it
   prunes on the application config server's broadcasts alone, against the
   membership that diff carries.
+
+  Its callers outlive it. Every `Cairn.CameraTracker` is a child of its own
+  camera's tree, so a crash here — which takes the table with it, there being
+  no heir — leaves them all running and still writing. So the window between
+  that crash and the supervisor's restart is absorbed here rather than raising
+  into them: a `put/3` that finds no process is dropped, a `get/1` that finds
+  no table answers `nil`, a `delete/1` `:ok`. Every one of those is a state the
+  callers already handle, because it is the state a camera with no open event
+  is in. What raising instead would cost is not one lost row: a `get/1` runs in
+  `Cairn.CameraTracker.init/1`, so it would be a lane child failing to start,
+  and `:lane`'s intensity, then `Cairn.Camera`'s, then a whole-tree rebuild
+  that takes `:media` and the RTSP session with it.
   """
 
   use GenServer
+
+  require Logger
 
   @table :cairn_active_events
 
@@ -39,7 +53,7 @@ defmodule Cairn.EventCheckpoint do
   """
   @spec put(String.t(), Cairn.Event.t(), [Cairn.Track.t()]) :: :ok
   def put(camera_id, %Cairn.Event{} = event, tracks \\ []),
-    do: GenServer.call(__MODULE__, {:put, camera_id, event, tracks})
+    do: write_through(camera_id, {:put, camera_id, event, tracks})
 
   # `put/3` without the existence check, for the suites whose camera exists
   # only as a fixture and never in a fleet config. Same mailbox and same
@@ -51,14 +65,19 @@ defmodule Cairn.EventCheckpoint do
     @doc false
     @spec put!(String.t(), Cairn.Event.t(), [Cairn.Track.t()]) :: :ok
     def put!(camera_id, %Cairn.Event{} = event, tracks \\ []),
-      do: GenServer.call(__MODULE__, {:put!, camera_id, event, tracks})
+      do: write_through(camera_id, {:put!, camera_id, event, tracks})
   end
 
   # Direct, unlike `put/3`: a delete only ever removes the row an owner of the
   # event is done with, so there is nothing for the existence check to stop
   # and nothing to order against the prune — which is itself deletes.
-  @spec delete(String.t()) :: true
-  def delete(camera_id), do: :ets.delete(@table, camera_id)
+  @spec delete(String.t()) :: :ok
+  def delete(camera_id) do
+    if_table_lives(:ok, fn ->
+      :ets.delete(@table, camera_id)
+      :ok
+    end)
+  end
 
   @doc """
   One camera's checkpoint, or `nil`.
@@ -69,14 +88,14 @@ defmodule Cairn.EventCheckpoint do
   """
   @spec get(String.t()) :: {Cairn.Event.t(), [Cairn.Track.t()]} | nil
   def get(camera_id) do
-    case :ets.lookup(@table, camera_id) do
+    case if_table_lives([], fn -> :ets.lookup(@table, camera_id) end) do
       [{^camera_id, event, tracks}] -> {event, tracks}
       [] -> nil
     end
   end
 
   @spec all() :: [{String.t(), Cairn.Event.t(), [Cairn.Track.t()]}]
-  def all, do: :ets.tab2list(@table)
+  def all, do: if_table_lives([], fn -> :ets.tab2list(@table) end)
 
   @doc """
   Empties the table in one operation.
@@ -84,8 +103,38 @@ defmodule Cairn.EventCheckpoint do
   Deleting row by row off `all/0` is not atomic: anything inserting between
   the read and the deletes survives.
   """
-  @spec clear() :: true
-  def clear, do: :ets.delete_all_objects(@table)
+  @spec clear() :: :ok
+  def clear do
+    if_table_lives(:ok, fn ->
+      :ets.delete_all_objects(@table)
+      :ok
+    end)
+  end
+
+  # The write goes through this process for the ordering the existence check
+  # rests on, so it is also the one entry that can find no process at all.
+  # Dropped, not raised: a row that never landed is a row the restore does not
+  # find, which is the same state as a camera that had nothing open.
+  defp write_through(camera_id, message) do
+    GenServer.call(__MODULE__, message)
+  catch
+    :exit, reason ->
+      Logger.debug(
+        "camera #{camera_id}: event checkpoint unavailable (#{inspect(reason)}); " <>
+          "the write is dropped"
+      )
+
+      :ok
+  end
+
+  # `Cairn.PresenceCheckpoint.if_table_lives/2`'s guard, for its reason: the
+  # table can vanish between an `:ets.whereis/1` check and the operation, so
+  # the rescue is needed either way.
+  defp if_table_lives(absent, operation) do
+    operation.()
+  rescue
+    ArgumentError -> absent
+  end
 
   @impl true
   def init(_opts) do
@@ -114,7 +163,16 @@ defmodule Cairn.EventCheckpoint do
     end
   end
 
-  defp write(camera_id, event, tracks), do: :ets.insert(@table, {camera_id, event, tracks})
+  # Guarded like every other table op, and here it protects THIS process: a
+  # write arriving in its own restart window — the table gone, the mailbox
+  # already served — would otherwise raise inside the owner and turn one crash
+  # into a loop for as long as any tracker keeps checkpointing.
+  defp write(camera_id, event, tracks) do
+    if_table_lives(:ok, fn ->
+      :ets.insert(@table, {camera_id, event, tracks})
+      :ok
+    end)
+  end
 
   # No snapshot is not an empty fleet: a server that has published none (an
   # unnamed one, or one still in `init/1`) cannot say which cameras exist, so

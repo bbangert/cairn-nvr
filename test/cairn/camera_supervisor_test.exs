@@ -8,6 +8,8 @@ defmodule Cairn.CameraSupervisorTest do
   alias Cairn.Config
   alias Cairn.Config.Camera
 
+  @track_policy %{pre: 5, post: 10, max: 300, max_unseen_ms: 3_000, max_live_tracks: 128}
+
   setup do
     # the sh wrapper appends every subprocess's stderr here
     File.mkdir_p!("tmp/camsup_test/log")
@@ -185,21 +187,28 @@ defmodule Cairn.CameraSupervisorTest do
     assert is_pid(owner) and Process.alive?(owner)
   end
 
-  test "a camera tree nests an empty lane alongside its media" do
+  test "a camera tree nests a lane alongside its media" do
     a = camera("cs_nest_#{System.unique_integer([:positive])}")
     :ok = CameraSupervisor.sync(config([a]))
     sup = Cairn.Registry.whereis(a.id, :camera)
 
     children = Supervisor.which_children(sup)
 
-    assert MapSet.new(children, fn {id, _pid, _type, _mods} -> id end) ==
-             MapSet.new([:lane, :media])
+    # `which_children/1` answers in REVERSE start order, which is also the
+    # shutdown order — so `:lane` first here is the lane stopping first, with
+    # its media still standing (`Cairn.Camera`). Order, not just membership:
+    # the whole reason for it is which subtree stops first.
+    assert Enum.map(children, fn {id, _pid, _type, _mods} -> id end) == [:lane, :media]
 
     assert {:lane, _pid, :supervisor, [Cairn.Camera.Lane]} = List.keyfind(children, :lane, 0)
     assert {:media, _pid, :supervisor, [Cairn.Camera.Media]} = List.keyfind(children, :media, 0)
 
-    # this camera resolves to no tier, so it runs no event workers yet
-    assert Supervisor.which_children(child_pid(sup, :lane)) == []
+    # An unprofiled camera resolves to no tier at all, which is every tier but
+    # 1 as far as the lane is concerned: the tracker, alone.
+    assert [{Cairn.CameraTracker, tracker, _, _}] =
+             Supervisor.which_children(child_pid(sup, :lane))
+
+    assert Cairn.Registry.whereis(a.id, :camera_tracker) == tracker
   end
 
   test "a tier-1 camera's lane runs the recorder and then the aggregator" do
@@ -217,12 +226,15 @@ defmodule Cairn.CameraSupervisorTest do
     assert Cairn.Registry.whereis(cam.id, :presence_recorder)
   end
 
-  test "a tier-2 camera's lane is empty" do
+  test "a tier-2 camera's lane is the tracker alone" do
     {cam, group} = tiered("cs_t2_#{System.unique_integer([:positive])}", 2)
     :ok = CameraSupervisor.sync(tiered_config([{cam, group}]))
     sup = Cairn.Registry.whereis(cam.id, :camera)
 
-    assert Supervisor.which_children(child_pid(sup, :lane)) == []
+    assert [{Cairn.CameraTracker, tracker, _, _}] =
+             Supervisor.which_children(child_pid(sup, :lane))
+
+    assert Cairn.Registry.whereis(cam.id, :camera_tracker) == tracker
     refute Cairn.Registry.whereis(cam.id, :presence)
     refute Cairn.Registry.whereis(cam.id, :presence_recorder)
   end
@@ -279,6 +291,12 @@ defmodule Cairn.CameraSupervisorTest do
     # answering a call is liveness `Process.alive?/1` cannot claim: a pid that
     # has already exited can still read as alive for a moment
     assert is_map(:sys.get_state(agg))
+
+    # and the recorder took the new pair, which it re-resolves from the
+    # published snapshot on the same cast — the `%Config{}` half is what its
+    # next clip is written under
+    assert %{camera: %Camera{rtsp_url: "file:///dev/zero"}, config: ^new_config} =
+             :sys.get_state(restored)
 
     # the clip did not: its ring went with the old media, so the stand-in saw
     # the DOWN a real extractor closes on, and the recorder let the event go
@@ -420,13 +438,14 @@ defmodule Cairn.CameraSupervisorTest do
     await_extractor_gone(id, event.id)
   end
 
-  # No ring, no clip. A whole-camera start brings the `:lane` up ahead of
-  # `:media` by design, so a restored key reaches the open before
-  # `Cairn.RingBuffer` holds its name — and the extractor drains that ring in
-  # its own `handle_continue`. Opening anyway cost an `:event_ended`
-  # `:partial` for a clip that never began, once per camera-tree start with a
-  # standing presence.
-  test "a whole lane starting ahead of the media announces no clip it cannot fill" do
+  # No ring, no clip. A whole-camera start no longer reaches this — `:media`
+  # comes up first — but a lane restarting while its media is being replaced
+  # does, and so does a lane whose media is crash-looping: the restored key
+  # reaches the open before `Cairn.RingBuffer` holds its name, and the
+  # extractor drains that ring in its own `handle_continue`. Opening anyway
+  # cost an `:event_ended` `:partial` for a clip that never began. The lane is
+  # started alone here to hold that condition still.
+  test "a lane restoring with no ring under it announces no clip it cannot fill" do
     {cam, group} = tiered("cs_noring_#{System.unique_integer([:positive])}", 1)
     id = cam.id
     cfg = tiered_config([{cam, group}])
@@ -436,7 +455,7 @@ defmodule Cairn.CameraSupervisorTest do
     Cairn.PresenceLedger.announced(id, nil, "person", DateTime.utc_now(), 0.9)
     on_exit(fn -> Cairn.PresenceLedger.cleared(id, nil, "person") end)
 
-    # the lane alone, exactly as `Cairn.Camera` starts it before `:media`
+    # the lane alone, which is the tree with its `:media` away
     start_supervised!({Cairn.Camera.Lane, camera: cam, config: cfg}, id: :bare_lane)
 
     rec = Cairn.Registry.whereis(id, :presence_recorder)
@@ -485,7 +504,7 @@ defmodule Cairn.CameraSupervisorTest do
     refute_received {:event_started, %Cairn.Event{camera_id: ^id}}
     refute_received {:event_ended, %Cairn.Event{camera_id: ^id}}
 
-    # the ring arrives, as `:media` starting behind the lane brings it
+    # the ring arrives, as a replacement `:media` brings it
     start_supervised!({Cairn.RingBuffer, camera_id: id, pre_window_seconds: 5}, id: :late_ring)
     send(rec, {:retry_open, :sys.get_state(rec).retry_token})
 
@@ -600,6 +619,154 @@ defmodule Cairn.CameraSupervisorTest do
     assert Cairn.PresenceCheckpoint.get(id) == nil
   end
 
+  # The tracked lane's half of the same path: the whole tree stops, and the
+  # tracker's `terminate/2` finalizes its open event from the process that cast
+  # the boxes rather than leaving it to a post window a shutdown cannot wait
+  # out.
+  # The order's whole point, end to end and through the real tree: a live track
+  # on a camera that is being removed ends `:camera_stopped`, because the LANE
+  # stops first and its `terminate/2` is what ends it. With the media stopping
+  # first, `Cairn.PipelineOwner.terminate/2`'s `:camera_stopped` epoch reaches
+  # the tracker as an ordinary message long before the supervisor gets to the
+  # lane, and `apply_epoch/3` has already ended it `:stream_reset` — a reset
+  # that never happened, on every track the camera held.
+  test "removing a tier-2 camera ends its live tracks :camera_stopped" do
+    {cam, group} = tiered("cs_livetrk_#{System.unique_integer([:positive])}", 2)
+    id = cam.id
+    cfg = tiered_config([{cam, group}])
+    publish(cfg)
+    Cairn.Event.subscribe()
+
+    :ok = CameraSupervisor.sync(cfg)
+    assert is_pid(wait_for(fn -> Cairn.Registry.whereis(id, :camera_tracker) end, 200))
+
+    events = attach_tracker_telemetry()
+
+    # The session the tracker's identities belong to. Minted by hand because
+    # this suite's ffmpeg never produces a buffer to mint one from — and it has
+    # to exist, or the `:camera_stopped` epoch `Cairn.PipelineOwner.terminate/2`
+    # publishes is judged against nothing and `apply_epoch/3` never runs. With
+    # it, that announcement is a genuine successor, which is exactly the race
+    # the child order settles.
+    epoch = Cairn.StreamEpochs.new_epoch({id, :main}, :started)
+    tracker = Cairn.Registry.whereis(id, :camera_tracker)
+    _ = :sys.get_state(tracker)
+
+    # One batch with evidence, through the real element and the real sink into
+    # the camera's own registered tracker — the pipeline this suite cannot run.
+    Cairn.TrackerDriver.detections(nil, cam, @track_policy, tracked_observation(epoch))
+    assert_receive {:track_started, %Cairn.Track{object_id: oid, camera_id: ^id}}
+
+    diff = %{added: [], removed: [id], changed: [], rebuilt: [], refreshed: []}
+    :ok = CameraSupervisor.apply_diff(diff, config([]))
+
+    assert_receive {:track_ended, %Cairn.Track{object_id: ^oid, end_reason: :camera_stopped}}
+    refute Cairn.Registry.whereis(id, :camera)
+
+    # and nothing counted a stream reset for it
+    assert :ets.tab2list(events) == []
+  end
+
+  test "removing a tier-2 camera finalizes its open event and takes the tracker with it" do
+    {cam, group} = tiered("cs_delt2_#{System.unique_integer([:positive])}", 2)
+    id = cam.id
+    cfg = tiered_config([{cam, group}])
+    publish(cfg)
+    Cairn.Event.subscribe()
+
+    :ok = CameraSupervisor.sync(cfg)
+    tracker = Cairn.Registry.whereis(id, :camera_tracker)
+    assert is_pid(tracker)
+
+    # An open event on the real tracker, in the shape a restore produces: an
+    # extractor registered where `restore_event/3` looks for it. Driving
+    # detections instead would need the model and the database this suite
+    # deliberately does without.
+    event = open_event(id)
+    eid = event.id
+    extractor = registered_relay(id, eid)
+    Cairn.EventCheckpoint.put!(id, event, [])
+    on_exit(fn -> Cairn.EventCheckpoint.delete(id) end)
+
+    # the restore happens in `init/1`, so the tracker is replaced rather than
+    # told — a crash of the one the lane started is the ordinary way in
+    Process.exit(tracker, :kill)
+    restored = wait_for(fn -> tracker_replacement(id, tracker) end)
+    assert :sys.get_state(restored).event.id == eid
+    # claimed on the way in, so a ring loss would reach this process
+    assert_receive {:extractor_cast, {:owner, ^restored}}
+
+    diff = %{added: [], removed: [id], changed: [], rebuilt: [], refreshed: []}
+    :ok = CameraSupervisor.apply_diff(diff, config([]))
+
+    assert_receive {:event_ended, %Cairn.Event{id: ^eid, status: :finalized}}
+    # cast by the tracker itself, to its own extractor
+    assert_receive {:extractor_cast, {:finalize, %Cairn.Event{id: ^eid}}}
+    assert Process.alive?(extractor)
+
+    refute Cairn.Registry.whereis(id, :camera)
+    refute Cairn.Registry.whereis(id, :camera_tracker)
+    assert Cairn.EventCheckpoint.get(id) == nil
+  end
+
+  # `Cairn.CameraTracker.init/1` may not call `Cairn.Config.Server` either, and
+  # it has two reads that used to: the camera's detect role and, on the restore
+  # path, the config a restored event's windows come from. A suspended server
+  # answers no call, so a lane that comes up promptly is one that made none.
+  test "a tier-2 lane starts while the config server cannot answer a call" do
+    {cam, group} = tiered("cs_nocall2_#{System.unique_integer([:positive])}", 2)
+    id = cam.id
+    cfg = tiered_config([{cam, group}])
+    publish(cfg)
+
+    :sys.suspend(Cairn.Config.Server)
+    on_exit(fn -> :sys.resume(Cairn.Config.Server) end)
+
+    started_at = System.monotonic_time(:millisecond)
+    :ok = CameraSupervisor.sync(cfg)
+    tracker = wait_for(fn -> Cairn.Registry.whereis(id, :camera_tracker) end, 200)
+    elapsed = System.monotonic_time(:millisecond) - started_at
+
+    assert is_pid(tracker)
+    # promptly, not after a call timed out
+    assert elapsed < 1_000, "the lane took #{elapsed}ms to come up"
+    # and it resolved the real pair from the snapshot, not a bare seed
+    assert %Camera{id: ^id, plugin: {:group, _}} = :sys.get_state(tracker).camera
+  end
+
+  # The survival property, tier 2: a restart-class change replaces `:media` and
+  # the tracker runs on through it — the event it has open is not restarted
+  # with the pipeline.
+  test "a media-only change leaves a tier-2 camera's tracker untouched" do
+    {cam, group} = tiered("cs_survive2_#{System.unique_integer([:positive])}", 2)
+    id = cam.id
+    cfg = tiered_config([{cam, group}])
+    publish(cfg)
+
+    :ok = CameraSupervisor.sync(cfg)
+    sup = Cairn.Registry.whereis(id, :camera)
+    tracker = Cairn.Registry.whereis(id, :camera_tracker)
+    old_media = child_pid(sup, :media)
+
+    moved = %Camera{cam | rtsp_url: "file:///dev/zero"}
+    new_config = tiered_config([{moved, group}])
+    publish(new_config)
+    diff = %{added: [], removed: [], changed: [id], rebuilt: [], refreshed: []}
+    :ok = CameraSupervisor.apply_diff(diff, new_config)
+
+    assert child_pid(sup, :media) != old_media
+    assert Cairn.Registry.whereis(id, :camera_tracker) == tracker
+
+    # …and it was told: the pair it was built with is older than the tree
+    # around it now, and the `%Config{}` half is handed to every extractor it
+    # starts. The cast is sent inside `apply_diff/2`, so this read is behind
+    # it. Answering at all is also the liveness claim `Process.alive?/1` cannot
+    # make.
+    state = :sys.get_state(tracker)
+    assert state.camera == moved
+    assert state.config == new_config
+  end
+
   # The lane's composition is a child list, which no running supervisor can be
   # edited into — so a tier flip is the whole tree, not the media.
   test "a rebuilt camera's whole tree is replaced, where a changed one's is not" do
@@ -627,9 +794,45 @@ defmodule Cairn.CameraSupervisorTest do
     new_sup = Cairn.Registry.whereis(cam.id, :camera)
     assert is_pid(new_sup) and new_sup != sup
     refute Process.alive?(sup)
-    # and the tree it came back as is the new tier's: no presence workers
-    assert Supervisor.which_children(child_pid(new_sup, :lane)) == []
+    # and the tree it came back as is the new tier's: the tracker, and no
+    # presence workers left standing on a camera that is no longer tier 1
+    assert [{Cairn.CameraTracker, _, _, _}] =
+             Supervisor.which_children(child_pid(new_sup, :lane))
+
     refute Cairn.Registry.whereis(cam.id, :presence)
+  end
+
+  # The flip back, which the matrix treats identically and the lane does not:
+  # 2 → 1 has to lose the tracker as surely as 1 → 2 loses the presence pair.
+  test "a tier flip back to 1 rebuilds the tree with the presence pair" do
+    {cam, group} = tiered("cs_flipback_#{System.unique_integer([:positive])}", 2)
+    :ok = CameraSupervisor.sync(tiered_config([{cam, group}]))
+
+    sup = Cairn.Registry.whereis(cam.id, :camera)
+    assert Cairn.Registry.whereis(cam.id, :camera_tracker)
+
+    {_cam1, tier1_group} = tiered(cam.id, 1)
+    flipped = %Camera{cam | plugin: {:group, tier1_group.name}}
+    new_config = tiered_config([{flipped, tier1_group}])
+
+    assert %{changed: [], rebuilt: [id], refreshed: []} =
+             Config.Server.diff_cameras(tiered_config([{cam, group}]), new_config)
+
+    assert id == cam.id
+
+    :ok =
+      CameraSupervisor.apply_diff(
+        %{added: [], removed: [], changed: [], rebuilt: [cam.id], refreshed: []},
+        new_config
+      )
+
+    new_sup = Cairn.Registry.whereis(cam.id, :camera)
+    assert is_pid(new_sup) and new_sup != sup
+
+    assert [{Cairn.PresenceAggregator, _, _, _}, {Cairn.PresenceRecorder, _, _, _}] =
+             Supervisor.which_children(child_pid(new_sup, :lane))
+
+    refute Cairn.Registry.whereis(cam.id, :camera_tracker)
   end
 
   test "a removed camera stops its whole tree, lane and media with it" do
@@ -829,6 +1032,71 @@ defmodule Cairn.CameraSupervisorTest do
       pid when is_pid(pid) and pid != dead -> pid
       _absent_or_dead -> nil
     end
+  end
+
+  defp tracked_observation(epoch) do
+    at_ms = System.monotonic_time(:millisecond)
+
+    %Cairn.Observation{
+      epoch: epoch,
+      pts: 90_000,
+      media_ms: at_ms,
+      at_ms: at_ms,
+      observed_at: DateTime.utc_now(),
+      time_quality: :arrival,
+      protocol: :v0,
+      objects: [
+        %{
+          label: "person",
+          score: 0.9,
+          bbox: [0.1, 0.1, 0.2, 0.4],
+          track_id: nil,
+          observation_kind: "detected"
+        }
+      ]
+    }
+  end
+
+  # The two events a stream reset would raise, collected into a table so the
+  # assertion is "none of these", not "not this one".
+  defp attach_tracker_telemetry do
+    table = :ets.new(:tracker_telemetry, [:public, :duplicate_bag])
+    handler = "cs-tracker-telemetry-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach_many(
+      handler,
+      [[:cairn, :tracker, :stream_reset], [:cairn, :tracker, :suspension_expired]],
+      fn event, measurements, _meta, _cfg -> :ets.insert(table, {event, measurements}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+    table
+  end
+
+  defp tracker_replacement(camera_id, dead) do
+    case Cairn.Registry.whereis(camera_id, :camera_tracker) do
+      pid when is_pid(pid) and pid != dead -> pid
+      _absent_or_dead -> nil
+    end
+  end
+
+  # An extractor as far as the registry is concerned — which is where
+  # `Cairn.CameraTracker`'s restore looks one up — and a relay as far as the
+  # test is concerned.
+  defp registered_relay(camera_id, event_id) do
+    test_pid = self()
+
+    pid =
+      spawn(fn ->
+        {:ok, _} = Registry.register(Cairn.Registry, {camera_id, {:extractor, event_id}}, nil)
+        send(test_pid, {:relay_registered, self()})
+        Cairn.PresenceFixtures.relay_loop(test_pid)
+      end)
+
+    assert_receive {:relay_registered, ^pid}
+    on_exit(fn -> Process.exit(pid, :kill) end)
+    pid
   end
 
   defp wait_for(fun, attempts \\ 200) do

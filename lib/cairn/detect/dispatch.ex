@@ -44,8 +44,8 @@ defmodule Cairn.Detect.Dispatch do
 
   `opts[:tracker]` is the producer's injection seam — a process that receives
   the same `{:tracked, …}` cast in place of the camera's own tracker. Absent
-  (production) the batch goes to that camera's tracker, started on the first
-  batch if it is not running yet.
+  (production) the batch goes to that camera's tracker, and is dropped if the
+  camera's `Cairn.Camera.Lane` has none registered at that instant.
   """
   @spec forward(Config.Camera.t(), map(), batch(), keyword()) :: :ok
   def forward(%Config.Camera{} = camera, policy, batch, opts \\ []) when is_map(batch) do

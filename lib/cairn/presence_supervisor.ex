@@ -10,10 +10,6 @@ defmodule Cairn.PresenceSupervisor do
   what a restarted aggregator owes the world is not its state but the
   `presence_cleared` events its predecessor's announcements are still waiting
   on.
-
-  Not a child of `Cairn.TrackerSupervisor` — that tree is tracking's, and its
-  checkpoint-restore sweep is the one presence must never be swept by
-  (`Cairn.PresenceCheckpoint`'s keyspace argument).
   """
 
   use Supervisor

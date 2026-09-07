@@ -414,14 +414,20 @@ defmodule Cairn.PresenceRecorder do
   # `:event_ended` subscriber. The exit that FOLLOWS a finalize is the clause
   # below, not this one: `clear_event/1` moved that monitor to `finalizing`.
   #
-  # A lost ring is not a death and does not arrive here: the extractor reports
-  # it (`{:ring_lost, _}` above) and waits, so the clip ends through the
-  # ordinary close and its exit is then the `finalizing` case.
+  # A lost ring is not a death and does not arrive here for an extractor this
+  # process owns: it reports the loss (`{:ring_lost, _}` above) and waits, so
+  # the clip ends through the ordinary close and its exit is then the
+  # `finalizing` case.
   #
   # An ADOPTED extractor is the case CameraTracker's rule was written for, and
-  # gets it: the process that started it crashed, so its finalize may have been
-  # in flight when this one restored the row, and the index — which the
-  # extractor itself wrote — is what says whether that is what happened.
+  # gets it. The process that started it crashed, so it can have finished under
+  # that process two ways: its finalize was in flight when this one restored
+  # the row, or its ring died in the same window and the owner `:DOWN` that
+  # followed made it an orphan closing itself. Both leave a `:finalized` row —
+  # which the extractor itself wrote — so the index is what says whether that
+  # is what happened, and both announced `:event_ended` on the way out
+  # (`maybe_finalize/3` there, `Cairn.EventExtractor.orphan_close/1` here), so
+  # a second one from this process would be the duplicate rather than the fix.
   def handle_info({:DOWN, _ref, :process, pid, reason}, %{extractor: pid} = state) do
     case state.event do
       %Event{} = event ->
@@ -584,15 +590,15 @@ defmodule Cairn.PresenceRecorder do
     end
   end
 
-  # No ring, no clip. The camera's `:lane` starts ahead of its `:media`
-  # (`Cairn.Camera`), so on a whole-camera start this process can be restoring
-  # an announced key — and opening an event for it — before
-  # `Cairn.RingBuffer` holds its name. The extractor drains the ring in its own
+  # No ring, no clip. The camera's `:lane` starts after its `:media`, so a
+  # whole-camera start does not reach this — but the media can be mid-restart
+  # while this lane lives on, which is where a restored key opening an event
+  # finds no `Cairn.RingBuffer` name. The extractor drains the ring in its own
   # `handle_continue`, so it would exit `:noproc`, and the `:DOWN` that follows
   # would announce an `:event_ended` `:partial` for a clip that never began.
-  # Waiting instead costs nothing: the ring is `Cairn.Camera.Media`'s second
-  # child, ahead of the pipeline, so it is up before any frame this event
-  # could hold, and `arm_retry/1` is already the loop that re-runs every gate.
+  # Waiting instead costs nothing: `arm_retry/1` is already the loop that
+  # re-runs every gate, and the ring is `Cairn.Camera.Media`'s second child, so
+  # it is back before any frame this event could hold.
   defp start_event(state, started_at, seeds) do
     if ring_ready?(state.camera_id) do
       open_event(state, started_at, seeds)
@@ -1116,7 +1122,7 @@ defmodule Cairn.PresenceRecorder do
   # clip may have ended. A camera that left needs no gate — its tree stops this
   # process, and a stopped process serves no timer. The ring gate is not
   # checked here either: it lives in `start_event/3`, which is what this calls,
-  # so a retry that is still ahead of the media simply arms the next one.
+  # so a retry that still finds no ring simply arms the next one.
   # A failure here arms the next one from `start_event/3`; anything else lets
   # the loop stop.
   defp retry_open(%{event: %Event{}} = state), do: state

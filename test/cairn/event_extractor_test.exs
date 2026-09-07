@@ -84,10 +84,11 @@ defmodule Cairn.EventExtractorTest do
     }
   end
 
-  # The tracked lane names no owner (S3 wires one), and until it does a ring
-  # that goes must change nothing here: the clip starves until that lane's own
-  # window closes it, with the metadata that lane holds. Closing from here
-  # would overwrite the row with the snapshot this process opened with.
+  # Both lanes name an owner now, so this is the fallback rather than a live
+  # caller: a ring that goes with nobody to tell must change nothing here. The
+  # clip waits for a finalize with the metadata its owner holds, because
+  # closing from here would overwrite the row with the snapshot this process
+  # opened with — which is exactly what an unclaimed clip must not do.
   test "an extractor with no owner ignores a ring that goes", %{
     camera: camera,
     config: config,
@@ -129,6 +130,98 @@ defmodule Cairn.EventExtractorTest do
     EventExtractor.finalize(pid, finalized)
     assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 2_000
     assert Events.get(event.id).status == :finalized
+  end
+
+  # The orphan: an owner was named and is gone, so nothing will ever cast a
+  # finalize and nothing but this process can say the event ended. Reachable
+  # for real — a lane owner crashing while a media replacement takes the ring
+  # — and the one close this process performs itself.
+  test "an orphaned extractor announces the event ended exactly once", %{
+    camera: camera,
+    config: config,
+    frags: frags
+  } do
+    event = new_event(camera)
+    test_pid = self()
+    owner = spawn(fn -> Process.sleep(:infinity) end)
+
+    pid =
+      start_supervised!(
+        {EventExtractor,
+         camera: camera,
+         event: event,
+         config: config,
+         owner: owner,
+         snapshot_fun: fn row, _cfg -> send(test_pid, {:snapshot_requested, row.id}) end}
+      )
+
+    ref = Process.monitor(pid)
+    assert %{status: :active} = wait_row(event.id)
+
+    # real media, so this is a clip and not the no-media path
+    Enum.each(frags, &RingBuffer.put_fragment(camera.id, &1))
+    wait_until(fn -> :sys.get_state(pid).fragments == length(frags) end)
+
+    # the owner first, so the ring `:DOWN` finds `owner: :lost` — the order the
+    # extractor's own state machine makes the orphan in
+    owner_ref = Process.monitor(owner)
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}
+    wait_until(fn -> :sys.get_state(pid).owner == :lost end)
+
+    ring = Cairn.Registry.whereis(camera.id, :ring_buffer)
+    ring_ref = Process.monitor(ring)
+    :ok = stop_supervised(Cairn.RingBuffer)
+    assert_receive {:DOWN, ^ring_ref, :process, ^ring, _reason}
+
+    eid = event.id
+    assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}, 2_000
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 2_000
+    assert Events.get(eid).status == :finalized
+
+    # exactly one: the ordinary close is the owner's, and an owner that is gone
+    # cannot also have announced
+    refute_received {:event_ended, %Event{id: ^eid}}
+  end
+
+  # The camera-stop shape, now that `:lane` stops before `:media`: the owner's
+  # finalize lands here first and the ring dies a moment later, while this
+  # process is closing. The late `:DOWN` must change nothing — no
+  # `{:ring_lost, _}` to an owner that has already spoken, and no second close.
+  test "a ring that dies behind a finalize changes nothing", %{
+    camera: camera,
+    config: config,
+    frags: frags
+  } do
+    event = new_event(camera)
+    test_pid = self()
+
+    pid =
+      start_supervised!(
+        {EventExtractor,
+         camera: camera,
+         event: event,
+         config: config,
+         owner: test_pid,
+         snapshot_fun: fn row, _cfg -> send(test_pid, {:snapshot_requested, row.id}) end}
+      )
+
+    ref = Process.monitor(pid)
+    assert %{status: :active} = wait_row(event.id)
+    Enum.each(frags, &RingBuffer.put_fragment(camera.id, &1))
+    wait_until(fn -> :sys.get_state(pid).fragments == length(frags) end)
+
+    # the owner's close, then the media going — the order a camera stop makes
+    EventExtractor.finalize(pid, %{event | ended_at: DateTime.utc_now(), status: :finalized})
+    :ok = stop_supervised(Cairn.RingBuffer)
+
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 2_000
+    assert Events.get(event.id).status == :finalized
+
+    # this test process is the owner: it was told nothing about a lost ring,
+    # and nothing closed the clip a second time
+    refute_received {:ring_lost, _}
+    refute_received {:event_ended, _}
   end
 
   test "writes pre-window + live fragments into a valid clip and finalizes",
@@ -352,7 +445,7 @@ defmodule Cairn.EventExtractorTest do
         # left at its default — the real cast.
         camera_id: camera.id,
         name: nil,
-        start_extractor: fn cam, event ->
+        start_extractor: fn cam, event, _config ->
           DynamicSupervisor.start_child(
             Cairn.EventSupervisor,
             {EventExtractor,
@@ -716,7 +809,7 @@ defmodule Cairn.EventExtractorTest do
 
       # Same sender, same receiver as the batches: the finalize cast cannot
       # overtake them. That is the whole reason the flush needs no draining
-      # handshake — see `Cairn.CameraTracker.forward_boxes/3`.
+      # handshake — see `Cairn.CameraTracker.forward_boxes/2`.
       EventExtractor.finalize(pid, %{event | ended_at: DateTime.utc_now(), status: :finalized})
 
       if fun = Keyword.get(opts, :on_clip_ready) do

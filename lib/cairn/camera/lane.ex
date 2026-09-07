@@ -1,19 +1,24 @@
 defmodule Cairn.Camera.Lane do
   @moduledoc """
   A camera's event workers, `:one_for_one` — the `:lane` child of
-  `Cairn.Camera`, ahead of `:media`.
+  `Cairn.Camera`, after `:media`.
 
-  Ahead, so a media restart touches none of them: the pipeline reaches these
+  A media restart touches none of them either way: the pipeline reaches these
   workers by resolving their Registry names per batch and casting, holding no
   pid and no monitor, so a worker restarting is invisible to it and the media
   never depends on the lane. `:one_for_one`, so a single worker's crash
   restarts only itself, restoring from its checkpoint, isolated from the other
-  workers and from the media.
+  workers and from the media. Last, so that on a whole-camera stop this
+  subtree goes down FIRST, with its media still standing — see `Cairn.Camera`
+  for what these workers need a live ring and an unstopped pipeline for.
 
   Composition follows the resolved camera's capability tier, the same fork the
   detect branch takes (`Cairn.Pipeline.Camera.detect_tail/4`): tier 1 gets
-  `Cairn.PresenceRecorder` and then `Cairn.PresenceAggregator`. Every other
-  tier gets nothing until the tracker moves in (`design-supervision.md`, S3).
+  `Cairn.PresenceRecorder` and then `Cairn.PresenceAggregator`, every other
+  tier — 2, and the `nil` of an unprofiled camera — gets
+  `Cairn.CameraTracker`. The tier, not the presence of a detect branch: it is
+  what the matrix forks on, and a camera whose branch is off costs one idle
+  process, which holds no timer until an event opens.
 
   The **recorder first**, against the data's direction, and the reason is a
   read that only happens once: `Cairn.PresenceAggregator.init/1` clears its
@@ -29,10 +34,11 @@ defmodule Cairn.Camera.Lane do
 
   Nothing is owed the other way: neither `init/1` calls the other, only casts,
   so the order costs no deadlock, and the aggregator's registration is up well
-  before the first batch either way. Shutdown, in reverse, stops the aggregator
-  first — its cleareds land in a live recorder's mailbox ahead of the
-  supervisor's own exit signal, and the recorder finalizes what is still open
-  in `terminate/2`.
+  before the first batch that matters either way. Shutdown, in reverse, stops
+  the aggregator first — its cleareds land in a live recorder's mailbox ahead
+  of the supervisor's own exit signal, and the recorder finalizes what is still
+  open in `terminate/2`. That pairing is the presence lane's alone: the tracker is
+  the only worker in its own lane and its `terminate/2` waits on nothing.
 
   A tier change is therefore not a media change but a change of *this* list,
   which no running supervisor can be edited into: `Cairn.Config.Server` sorts
@@ -52,19 +58,23 @@ defmodule Cairn.Camera.Lane do
   end
 
   # Built from the pair `Cairn.Camera.init/1` resolved for the whole tree, and
-  # then held: `Cairn.CameraSupervisor.restart_media/2` replaces `:media`
-  # alone — the workers themselves survive it, though the clip one of them has
-  # open does not (the ring goes with the media; see `restart_media/2`) — so
-  # after a restart-class change these workers still hold the pre-change
-  # struct — and a `changed` camera gets no `{:refresh, _, _}` cast
-  # to correct it. The classes are not disjoint: `:min_score` is restart-class
-  # and `Cairn.PresenceRecorder.configured_floors/1` reads it off this struct.
-  # What makes the stale copy harmless is that nothing consults it without
-  # re-resolving first — every qualifying transition runs `resolve_policy/1`,
-  # which replaces `camera` and `policy` from the snapshot before the floors
-  # are read — and the floors a frame is actually judged against ride in with
-  # the sink's batch. A refresh-class edit reaches the lane the ordinary way,
-  # through `Cairn.CameraSupervisor.refresh_camera/2`.
+  # then held — the workers survive a `:media` replacement, though the clip one
+  # of them has open does not (the ring goes with the media; see
+  # `Cairn.CameraSupervisor.restart_media/2`). So the copy each holds can be
+  # older than the tree around it, and both classes of change that leave these
+  # workers standing correct it the same way: a `changed` camera through
+  # `restart_media/2` once its new `:media` is up, a `refreshed` one through
+  # `refresh_camera/2` — both by way of `refresh_lane/2`. The only window in
+  # which a worker holds a stale pair is between the new media starting and
+  # that cast landing.
+  #
+  # It has to be corrected, not merely tolerated: each worker hands its
+  # `%Cairn.Config{}` to every `Cairn.EventExtractor` it starts (`config:`), so
+  # a clip opened on a stale one is *written* under it. The camera struct is
+  # the softer half — `Cairn.PresenceRecorder` re-resolves it at every
+  # qualifying transition and `Cairn.CameraTracker` takes it off every batch,
+  # and the floors a frame is judged against ride in with the sink's batch
+  # either way.
   defp children(opts) do
     cam = Keyword.fetch!(opts, :camera)
     config = Keyword.fetch!(opts, :config)
@@ -72,7 +82,7 @@ defmodule Cairn.Camera.Lane do
 
     case Map.get(Config.policy(config, cam), :tier) do
       1 -> [{Cairn.PresenceRecorder, args}, {Cairn.PresenceAggregator, args}]
-      _other -> []
+      _other -> [{Cairn.CameraTracker, args}]
     end
   end
 end

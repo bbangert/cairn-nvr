@@ -24,13 +24,18 @@ defmodule Cairn.CameraTrackerRecorderTest do
 
     rec = start_supervised!({TrackRecorder, name: nil, manual: true})
 
+    # No ring, no event (`Cairn.CameraTracker.start_event/5`): the extractor
+    # drains it, and on a real camera it is `Cairn.Camera.Media`'s second
+    # child.
+    start_supervised!({Cairn.RingBuffer, camera_id: camera_id, pre_window_seconds: 5}, id: :ring)
+
     tracker =
       start_supervised!(
         {CameraTracker,
          camera_id: camera_id,
          name: nil,
          recorder: rec,
-         start_extractor: fn _camera, event ->
+         start_extractor: fn _camera, event, _config ->
            pid = spawn(fn -> Process.sleep(:infinity) end)
            send(test_pid, {:extractor_started, event, pid})
            {:ok, pid}
@@ -598,7 +603,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
            camera_id: ctx.camera_id,
            name: nil,
            recorder: ctx.rec,
-           start_extractor: fn _camera, _event ->
+           start_extractor: fn _camera, _event, _config ->
              {:ok, spawn(fn -> Process.sleep(:infinity) end)}
            end,
            finalize_extractor: fn _pid, _event -> :ok end},
@@ -706,7 +711,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
              camera_id: ctx.camera_id,
              name: nil,
              recorder: self(),
-             start_extractor: fn _camera, _event ->
+             start_extractor: fn _camera, _event, _config ->
                {:ok, spawn(fn -> Process.sleep(:infinity) end)}
              end,
              finalize_extractor: fn _pid, _event -> :ok end
@@ -836,7 +841,7 @@ defmodule Cairn.CameraTrackerRecorderTest do
            name: nil,
            recorder: ctx.rec,
            monotonic_ms: fn -> Agent.get(clock, & &1) end,
-           start_extractor: fn _camera, _event ->
+           start_extractor: fn _camera, _event, _config ->
              {:ok, spawn(fn -> Process.sleep(:infinity) end)}
            end,
            finalize_extractor: fn _pid, _event -> :ok end},

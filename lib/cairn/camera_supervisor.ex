@@ -100,6 +100,18 @@ defmodule Cairn.CameraSupervisor do
   the ring is ahead of the pipeline in `Cairn.Camera.Media`, so it survives one
   and the clip runs on unbroken.
 
+  One thing the replacement does not preserve is the camera's child ORDER.
+  `Supervisor.start_child/2` appends, so the new `:media` lands after `:lane`
+  rather than in the position `Cairn.Camera.init/1` gave it, and this camera's
+  reverse-order shutdown then stops `:media` before `:lane` — the inversion
+  `Cairn.Camera`'s order exists to prevent. What that costs is the *labels*,
+  not the clip: the lane's `terminate/2` still finalizes through a
+  `{:ring_lost, _}` the extractor reports, but `Cairn.CameraTracker` has by
+  then ended its live tracks `:stream_reset` on the epoch the dying pipeline
+  published, rather than `:camera_stopped`. OTP offers no way to replace a
+  child's spec in place, and moving `:lane` back to the end would mean
+  restarting the workers this split exists to keep alive.
+
   A start that fails is logged, not raised: `apply_diff/2` walks every changed
   camera and one bad config must not strand the rest. That camera's tree is
   then stopped, so it is absent rather than registered-but-dark: `do_sync`
@@ -130,7 +142,15 @@ defmodule Cairn.CameraSupervisor do
       # pids, but that is a reader's problem (`sync/1`), not a registrant's.
       case Supervisor.start_child(pid, Cairn.Camera.media_spec(camera: cam, config: config)) do
         {:ok, _media} ->
-          :ok
+          # The lane survived, holding the pair the tree was built from. Most
+          # of it does not matter — a restart-class field is media-baked and a
+          # lane worker judges nothing by its copy — but the `%Config{}` it
+          # keeps is handed to every `Cairn.EventExtractor` it starts
+          # (`config:`), so a clip opened after this would be written under the
+          # pre-change config until something re-resolved it. Told here rather
+          # than left to the next `refreshed` diff, which may never come: the
+          # two classes are disjoint.
+          refresh_lane(config, cam)
 
         other ->
           Logger.error("camera #{camera_id}: failed to start new media: #{inspect(other)}")
@@ -148,10 +168,6 @@ defmodule Cairn.CameraSupervisor do
   from the pre-change pair. A camera that is not running has no process to
   tell, and the config lookup guards the case a diff cannot produce: an id
   `config` does not carry.
-
-  The lane casts are dropped when the name is absent — a tier-2 camera has no
-  presence workers, and a tier-1 one may have a worker mid-restart, which
-  resolves the config for itself in `init/1` anyway.
 
   A bridge camera's `Cairn.FFmpegPort` is deliberately not told: every field
   its argv reads (`rtsp_url`, `transcode`, `extra_ffmpeg_args`) is a
@@ -172,8 +188,25 @@ defmodule Cairn.CameraSupervisor do
       nil -> :ok
     end
 
+    refresh_lane(config, cam)
+  end
+
+  # The one way a new pair reaches the workers the tree built from the old one,
+  # and both classes of change that leave those workers standing go through it:
+  # a `refreshed` camera above, and a `changed` one whose `:media` was replaced
+  # under them (`restart_media/2`).
+  #
+  # Every tier's workers are cast to and the absent names dropped, rather than
+  # the tier being read again here: a tier-1 camera has no tracker and a tier-2
+  # one has no presence workers, and either may have a worker mid-restart,
+  # which resolves the pair for itself in `init/1` anyway. Reading the tier
+  # here would be a second answer to a question the tree has already answered
+  # (`Cairn.Camera.Lane`), and a tier change is not a refresh at all — it is
+  # `rebuilt`.
+  defp refresh_lane(config, cam) do
     Cairn.PresenceAggregator.refresh(cam.id, cam, config)
     Cairn.PresenceRecorder.refresh(cam.id, cam, config)
+    Cairn.CameraTracker.refresh(cam.id, cam, config)
   end
 
   @spec start_camera(Config.t(), Config.Camera.t()) :: DynamicSupervisor.on_start_child()

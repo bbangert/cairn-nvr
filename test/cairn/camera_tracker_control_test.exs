@@ -15,12 +15,17 @@ defmodule Cairn.CameraTrackerControlTest do
     camera = %Camera{id: camera_id, rtsp_url: "rtsp://h/1", min_score: %{"default" => 0.5}}
     test_pid = self()
 
+    # No ring, no event (`Cairn.CameraTracker.start_event/5`): the extractor
+    # drains it, and on a real camera it is `Cairn.Camera.Media`'s second
+    # child.
+    start_supervised!({Cairn.RingBuffer, camera_id: camera_id, pre_window_seconds: 5}, id: :ring)
+
     tracker =
       start_supervised!(
         {CameraTracker,
          camera_id: camera_id,
          name: nil,
-         start_extractor: fn _camera, event ->
+         start_extractor: fn _camera, event, _config ->
            pid = spawn(fn -> Process.sleep(:infinity) end)
            send(test_pid, {:extractor_started, event, pid})
            {:ok, pid}
