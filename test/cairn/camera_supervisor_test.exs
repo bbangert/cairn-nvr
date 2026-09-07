@@ -1117,9 +1117,10 @@ defmodule Cairn.CameraSupervisorTest do
 
       start_config_server(path, :b5_config_server_restarted)
 
-      # The version is NOT re-published: `init/1` seeds from the surviving
-      # snapshot and `installed/2` stamps +1, so a restart consumes a version
-      # even though the fleet is identical.
+      # A restart publishes a NEW snapshot at the next version: `init/1` seeds
+      # from the surviving one and `installed/2` stamps +1, so an identical
+      # fleet still consumes a version. What it does not do is replay the apply
+      # or re-announce a diff.
       assert Cairn.Config.Server.get().version == version + 1
       assert Cairn.Config.Server.snapshot().version == version + 1
       assert Cairn.Config.Server.known_ids() == MapSet.new([id])
