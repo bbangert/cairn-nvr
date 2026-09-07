@@ -42,9 +42,11 @@ ownership or the tree wrong; fix that, not the symptom.
   data; a helper holds the opening snapshot. Only an orphan (owner dead)
   closes itself, and then it emits what the owner would have.
 - **Ordering relied on across a pair the messages do not share.** The BEAM
-  orders messages per sender–receiver pair. Two casts that must arrive in
-  order leave the same process for the same process; a third process or a
-  call in between reorders them.
+  orders messages per sender–receiver pair, whatever their kind: `cast A;
+  call B; cast C` from one process to one server arrive in that order, and
+  B's reply is a barrier. What breaks the order is changing the pair —
+  routing one message through a third process, or sending it from a
+  different process than the rest.
 - **Configuration reaching work it should not.** A refresh applies to the
   next unit of work; in-flight work keeps the values it started under, so
   timers arm from a copy captured at open, not from `state.policy`. And a
@@ -53,10 +55,11 @@ ownership or the tree wrong; fix that, not the symptom.
 - **Child order that makes the stop lie.** If a producer stops before the
   consumer that must close cleanly, the consumer records the producer's stop
   as a failure. What must close first goes last in the child list.
-- **A read-path lookup treated as liveness.** `Registry.whereis` can return
-  a dead pid until the DOWN is processed; a gate on a name also checks
-  `Process.alive?/1`. Registering is different: a unique `Registry.register`
-  evicts a dead holder and retries, so terminate-then-start needs no wait.
+- **A read-path lookup treated as liveness.** `Registry.lookup/2` can
+  return a dead pid until the registry processes its DOWN; a gate on a name
+  also checks `Process.alive?/1`. Registering is different: a unique
+  `Registry.register/3` evicts a dead holder and retries, so
+  terminate-then-start needs no wait.
 - **`terminate/2` doing less than the normal close.** Trap exits, run the
   ordinary close in the ordinary order on `:shutdown`, and return without
   awaiting other processes. A crash reason does nothing; restore covers it.
