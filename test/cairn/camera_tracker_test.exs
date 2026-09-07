@@ -2177,10 +2177,11 @@ defmodule Cairn.CameraTrackerTest do
     end
   end
 
-  # The lane starts ahead of `:media`, so a tracker can be judging a batch
-  # before `Cairn.RingBuffer` holds its name — and `restart_media/2` reopens
-  # the same gap mid-run. Every other test in this file registers a ring in
-  # `setup`; this one is about the camera that has none.
+  # `Cairn.Camera` starts `:media` first, so a tracker judging a batch before
+  # `Cairn.RingBuffer` holds its name is the media being replaced or
+  # crash-looping under a lane that lives on — `restart_media/2`'s gap. Every
+  # other test in this file registers a ring in `setup`; this one is about the
+  # camera that has none.
   describe "the ring gate" do
     setup do
       id = "trkgate_#{System.unique_integer([:positive])}"
@@ -2298,7 +2299,9 @@ defmodule Cairn.CameraTrackerTest do
       # is counted by `report_expired/2` and measured by
       # `[:cairn, :tracker, :stream_reset]`, and a camera being switched off is
       # not a reset.
-      assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :camera_stopped}}
+      assert_receive {:track_ended, %Track{object_id: ^oid, end_reason: :camera_stopped} = final}
+
+      assert_self_contained(final)
       assert EventCheckpoint.get(id) == nil
     end
 

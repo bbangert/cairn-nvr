@@ -1,14 +1,16 @@
 defmodule Cairn.Camera.Lane do
   @moduledoc """
   A camera's event workers, `:one_for_one` — the `:lane` child of
-  `Cairn.Camera`, ahead of `:media`.
+  `Cairn.Camera`, after `:media`.
 
-  Ahead, so a media restart touches none of them: the pipeline reaches these
+  A media restart touches none of them either way: the pipeline reaches these
   workers by resolving their Registry names per batch and casting, holding no
   pid and no monitor, so a worker restarting is invisible to it and the media
   never depends on the lane. `:one_for_one`, so a single worker's crash
   restarts only itself, restoring from its checkpoint, isolated from the other
-  workers and from the media.
+  workers and from the media. Last, so that on a whole-camera stop this
+  subtree goes down FIRST, with its media still standing — see `Cairn.Camera`
+  for what these workers need a live ring and an unstopped pipeline for.
 
   Composition follows the resolved camera's capability tier, the same fork the
   detect branch takes (`Cairn.Pipeline.Camera.detect_tail/4`): tier 1 gets
@@ -32,10 +34,10 @@ defmodule Cairn.Camera.Lane do
 
   Nothing is owed the other way: neither `init/1` calls the other, only casts,
   so the order costs no deadlock, and the aggregator's registration is up well
-  before the first batch either way. Shutdown, in reverse, stops the aggregator
-  first — its cleareds land in a live recorder's mailbox ahead of the
-  supervisor's own exit signal, and the recorder finalizes what is still open
-  in `terminate/2`. That pairing is the presence lane's alone: the tracker is
+  before the first batch that matters either way. Shutdown, in reverse, stops
+  the aggregator first — its cleareds land in a live recorder's mailbox ahead
+  of the supervisor's own exit signal, and the recorder finalizes what is still
+  open in `terminate/2`. That pairing is the presence lane's alone: the tracker is
   the only worker in its own lane and its `terminate/2` waits on nothing.
 
   A tier change is therefore not a media change but a change of *this* list,

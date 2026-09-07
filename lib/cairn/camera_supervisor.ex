@@ -100,6 +100,18 @@ defmodule Cairn.CameraSupervisor do
   the ring is ahead of the pipeline in `Cairn.Camera.Media`, so it survives one
   and the clip runs on unbroken.
 
+  One thing the replacement does not preserve is the camera's child ORDER.
+  `Supervisor.start_child/2` appends, so the new `:media` lands after `:lane`
+  rather than in the position `Cairn.Camera.init/1` gave it, and this camera's
+  reverse-order shutdown then stops `:media` before `:lane` — the inversion
+  `Cairn.Camera`'s order exists to prevent. What that costs is the *labels*,
+  not the clip: the lane's `terminate/2` still finalizes through a
+  `{:ring_lost, _}` the extractor reports, but `Cairn.CameraTracker` has by
+  then ended its live tracks `:stream_reset` on the epoch the dying pipeline
+  published, rather than `:camera_stopped`. OTP offers no way to replace a
+  child's spec in place, and moving `:lane` back to the end would mean
+  restarting the workers this split exists to keep alive.
+
   A start that fails is logged, not raised: `apply_diff/2` walks every changed
   camera and one bad config must not strand the rest. That camera's tree is
   then stopped, so it is absent rather than registered-but-dark: `do_sync`

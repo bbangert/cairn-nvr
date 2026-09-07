@@ -18,9 +18,9 @@ defmodule Cairn.CameraTracker do
 
   One process per camera, registered as `Cairn.Registry.via(camera_id,
   :camera_tracker)` and started by the camera's own tree: it is the sole child
-  of `Cairn.Camera.Lane` on every tier but 1, ahead of `:media`. Ahead, so a
-  media replacement — a restart-class config change, a crash of the ingest —
-  leaves it and its open event standing; the tracks themselves die with the
+  of `Cairn.Camera.Lane` on every tier but 1, after `:media`. A media
+  replacement — a restart-class config change, a crash of the ingest — leaves
+  it and its open event standing; the tracks themselves die with the
   pipeline, which is where the checkpoint below earns its keep, since the event
   finalizes from it either way. The process is `:transient`: a crash restarts
   it and the fresh process restores from `Cairn.EventCheckpoint` in `init/1`,
@@ -378,11 +378,11 @@ defmodule Cairn.CameraTracker do
   end
 
   # The epoch the detect stream is running under right now, if anything is.
-  # Empty on a whole-camera start — the lane comes up before the `:media` that
-  # mints one — and not on a restart, where this process comes back under a
-  # session that has been running for hours. That is the case it is for:
-  # reading the epoch here is what lets `stale?/2` judge the very first batch,
-  # and what makes the next announcement of the same epoch a no-op.
+  # Usually already minted when this process starts: the lane comes up after
+  # `:media`, and on a lane-only restart under a session that has been running
+  # for hours. That is the case it is for — reading the epoch here is what lets
+  # `stale?/2` judge the very first batch, and what makes the next announcement
+  # of the same epoch a no-op. Empty only when the mint has not landed yet.
   defp seed_epoch(camera_id, role) do
     case StreamEpochs.current({camera_id, role}) do
       {:ok, epoch} -> epoch
@@ -1248,18 +1248,16 @@ defmodule Cairn.CameraTracker do
 
   # -- lifecycle --------------------------------------------------------------
 
-  # No ring, no event. The camera's `:lane` starts ahead of its `:media`
-  # (`Cairn.Camera`), so on a whole-camera start this process can be judging a
-  # batch — the pipeline is up, and its detect branch is downstream of the ring
-  # only in the media sense — before `Cairn.RingBuffer` holds its name; and
-  # `Cairn.CameraSupervisor.restart_media/2` leaves the same gap mid-run. The
-  # extractor drains the ring in its own `handle_continue`, so it would exit
-  # `:noproc`, and the `:DOWN` that follows would announce an `:event_ended`
-  # `:partial` for a clip that never began — plus an `:active` row and a
-  # checkpoint row for it. Waiting costs nothing and needs no timer: the next
-  # batch carrying evidence re-checks, and evidence is what an event needs
-  # anyway. The ring is `Cairn.Camera.Media`'s second child, ahead of the
-  # pipeline, so it is up before any frame this event could hold.
+  # No ring, no event. The camera's `:lane` starts after its `:media`, so a
+  # whole-camera start does not reach this — but the media can be mid-restart
+  # while this lane lives on: `Cairn.CameraSupervisor.restart_media/2` leaves
+  # exactly that gap, as does a media crash under `Cairn.Camera`'s
+  # `:one_for_one`. The extractor drains the ring in its own
+  # `handle_continue`, so it would exit `:noproc`, and the `:DOWN` that follows
+  # would announce an `:event_ended` `:partial` for a clip that never began —
+  # plus an `:active` row and a checkpoint row for it. Waiting costs nothing
+  # and needs no timer: the next batch carrying evidence re-checks, and
+  # evidence is what an event needs anyway.
   defp start_event(state, camera, policy, batch, dets) do
     if ring_ready?(state.camera_id) do
       open_event(state, camera, policy, batch, dets)

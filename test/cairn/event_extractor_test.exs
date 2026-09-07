@@ -184,6 +184,46 @@ defmodule Cairn.EventExtractorTest do
     refute_received {:event_ended, %Event{id: ^eid}}
   end
 
+  # The camera-stop shape, now that `:lane` stops before `:media`: the owner's
+  # finalize lands here first and the ring dies a moment later, while this
+  # process is closing. The late `:DOWN` must change nothing — no
+  # `{:ring_lost, _}` to an owner that has already spoken, and no second close.
+  test "a ring that dies behind a finalize changes nothing", %{
+    camera: camera,
+    config: config,
+    frags: frags
+  } do
+    event = new_event(camera)
+    test_pid = self()
+
+    pid =
+      start_supervised!(
+        {EventExtractor,
+         camera: camera,
+         event: event,
+         config: config,
+         owner: test_pid,
+         snapshot_fun: fn row, _cfg -> send(test_pid, {:snapshot_requested, row.id}) end}
+      )
+
+    ref = Process.monitor(pid)
+    assert %{status: :active} = wait_row(event.id)
+    Enum.each(frags, &RingBuffer.put_fragment(camera.id, &1))
+    wait_until(fn -> :sys.get_state(pid).fragments == length(frags) end)
+
+    # the owner's close, then the media going — the order a camera stop makes
+    EventExtractor.finalize(pid, %{event | ended_at: DateTime.utc_now(), status: :finalized})
+    :ok = stop_supervised(Cairn.RingBuffer)
+
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 2_000
+    assert Events.get(event.id).status == :finalized
+
+    # this test process is the owner: it was told nothing about a lost ring,
+    # and nothing closed the clip a second time
+    refute_received {:ring_lost, _}
+    refute_received {:event_ended, _}
+  end
+
   test "writes pre-window + live fragments into a valid clip and finalizes",
        %{camera: camera, config: config, frags: frags} do
     {pre, live} = Enum.split(frags, 2)

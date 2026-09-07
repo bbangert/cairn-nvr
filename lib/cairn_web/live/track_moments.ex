@@ -42,7 +42,7 @@ defmodule CairnWeb.TrackMoments do
     evicted: "Dropped to cap memory use",
     detection_disabled: "Detection was turned off",
     host_restart: "Cairn restarted",
-    camera_stopped: "The camera was switched off or removed"
+    camera_stopped: "The camera was switched off, removed, or its tier changed"
   }
 
   @doc """

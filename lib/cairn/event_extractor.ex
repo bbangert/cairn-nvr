@@ -323,6 +323,14 @@ defmodule Cairn.EventExtractor do
   # Waiting costs nothing: with no ring there is nothing left to receive, and
   # the owner is monitored, so an owner that dies without casting is caught by
   # the clause below.
+  #
+  # No guard is needed against this arriving while the clip is already closing,
+  # which is the ordinary shape of a camera stop — the lane goes first, its
+  # finalize lands here, and the media dying takes the ring a moment later.
+  # `finalize_now/2` runs to completion inside one `handle_cast` and answers
+  # `{:stop, :normal, _}`, so a ring `:DOWN` queued behind that cast is never
+  # handled at all: this process is already exiting, and messages left in the
+  # mailbox die with it.
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{ring_ref: ref} = state) do
     Logger.info("event #{state.event.id}: the ring went (#{inspect(reason)})")
     ring_lost(%{state | ring_ref: nil, ring_lost?: true})
