@@ -1897,8 +1897,13 @@ defmodule Cairn.CameraTrackerTest do
       )
     end
 
+    # `:stop` is the stand-in for a real extractor's clean finish: it exits
+    # `:normal` where a kill would look like a crash to the watching tracker.
     defp relay(test_pid) do
       receive do
+        :stop ->
+          :ok
+
         msg ->
           send(test_pid, {:extractor_got, msg})
           relay(test_pid)
@@ -2698,6 +2703,31 @@ defmodule Cairn.CameraTrackerTest do
       assert_receive {:event_ended, %Event{id: ^eid, status: :finalized}}
       assert_receive {:extractor_got, {:"$gen_cast", {:finalize, %Event{id: ^eid}}}}
       assert Process.alive?(extractor)
+    end
+
+    # An adopted extractor that finishes under its PREDECESSOR — the finalize
+    # was cast before that process died, and it died before its own
+    # `EventCheckpoint.delete/1`. Nothing is announced (the predecessor did
+    # that), but the row is this process's to drop: left behind, the next
+    # restart restores an event that is already over.
+    test "an adopted extractor exiting cleanly drops the row it was restored from",
+         %{camera_id: id} do
+      event = %Event{id: Ecto.UUID.generate(), camera_id: id, started_at: DateTime.utc_now()}
+      extractor = registered_relay(id, event.id)
+      EventCheckpoint.put!(id, event, [])
+
+      assert tracker = lane(id)
+      assert {%Event{}, []} = EventCheckpoint.get(id)
+
+      ref = Process.monitor(extractor)
+      send(extractor, :stop)
+      assert_receive {:DOWN, ^ref, :process, ^extractor, :normal}
+      _ = :sys.get_state(tracker)
+
+      assert EventCheckpoint.get(id) == nil
+      assert :sys.get_state(tracker).event == nil
+      eid = event.id
+      refute_received {:event_ended, %Event{id: ^eid}}
     end
 
     # A camera id no other test can be holding. Nothing has to be cleaned up

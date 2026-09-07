@@ -769,8 +769,17 @@ defmodule Cairn.CameraTracker do
   # (`maybe_finalize/3`) or the extractor itself (`orphan_close/1`, the one
   # broadcast that process ever makes). The two branches stay split for exactly
   # this pair.
-  def handle_info({:DOWN, _ref, :process, pid, _reason}, %{extractor: pid} = state),
-    do: {:noreply, clear_event(state)}
+  #
+  # The row goes here because nobody else will: the predecessor died between
+  # its finalize cast and its own `EventCheckpoint.delete/1`, which is the same
+  # window that put this process on an already-ending event. Left behind, it is
+  # restored again by the *next* restart and dropped there by `end_orphan/2`
+  # against an index that says `:finalized` — a wasted restore cycle rather
+  # than a loop, and a row naming an event that is over.
+  def handle_info({:DOWN, _ref, :process, pid, _reason}, %{extractor: pid} = state) do
+    if match?(%Event{}, state.event), do: EventCheckpoint.delete(state.camera_id)
+    {:noreply, clear_event(state)}
+  end
 
   def handle_info(_msg, state), do: {:noreply, state}
 
