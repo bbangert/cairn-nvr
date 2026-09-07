@@ -123,8 +123,11 @@ class, not the instance.
   when no spec exists, so terminate, delete, start cannot hit
   `:already_present`.
 - **Timeouts on `GenServer.start_link` from init**, or `Process.exit` on a
-  possibly-dead pid needing a guard. Start-link's init timeout defaults to
-  infinity; exiting a dead pid returns `true`.
+  possibly-dead pid needing a guard. A start's `:timeout` option defaults to
+  `:infinity` — the 5 000 ms that comes to mind is `GenServer.call/3`'s
+  default, a different function — and exiting a dead pid returns `true`.
+  Both were asserted otherwise in review here and shown false by running
+  them.
 - **Multi-node, clustering, or distributed-consistency concerns.** One node
   by design; `DNSCluster` is generator boilerplate.
 - **PubSub-restart resilience helpers** (monitor the PubSub, resubscribe,
