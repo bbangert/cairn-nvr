@@ -32,12 +32,15 @@ ownership or the tree wrong; fix that, not the symptom.
 - **A worker that dies with a table or process it does not own.** Callers
   outliving an ETS owner with no heir raise on the missing table; callers of
   a restarting named process exit. On a restore path that is a child failing
-  to start and escalating. The owner's API reads a missing table as empty and
-  drops a write to an absent owner.
+  to start and escalating. The owner's API must state its contract for an
+  absent owner: best-effort state reads empty and drops the write, durable
+  state fails loudly or is retried — and callers die with the owner only
+  when the tree says they should.
 - **A subscription assumed to survive its holder's replacement.** Subscriber
-  lists live in the holder's state. The dependency must be a monitor, and the
-  detector reports to whoever owns the outcome rather than acting on a stale
-  snapshot.
+  lists live in the holder's state. Where the tree does not already couple
+  the two lifecycles (siblings under `:rest_for_one` need nothing), the
+  dependency must be a monitor, and the detector reports to whoever owns the
+  outcome rather than acting on a stale snapshot.
 - **The wrong process closing a resource.** The owner holds the current
   data; a helper holds the opening snapshot. Only an orphan (owner dead)
   closes itself, and then it emits what the owner would have.
@@ -47,11 +50,12 @@ ownership or the tree wrong; fix that, not the symptom.
   B's reply is a barrier. What breaks the order is changing the pair —
   routing one message through a third process, or sending it from a
   different process than the rest.
-- **Configuration reaching work it should not.** A refresh applies to the
-  next unit of work; in-flight work keeps the values it started under, so
-  timers arm from a copy captured at open, not from `state.policy`. And a
-  held struct that flows into processes the worker starts must be refreshed
-  on every change class that can reach it.
+- **Configuration reaching work by accident.** The project's contract
+  decides whether a change applies to in-flight work or only to the next
+  unit; either must be deliberate — a copy captured at open, or an explicit
+  cancel — never live state read when a timer happens to arm. And a held
+  struct that flows into processes the worker starts must be refreshed on
+  every change class that can reach it.
 - **Child order that makes the stop lie.** If a producer stops before the
   consumer that must close cleanly, the consumer records the producer's stop
   as a failure. What must close first goes last in the child list.
@@ -62,7 +66,10 @@ ownership or the tree wrong; fix that, not the symptom.
   terminate-then-start needs no wait.
 - **`terminate/2` doing less than the normal close.** Trap exits, run the
   ordinary close in the ordinary order on `:shutdown`, and return without
-  awaiting other processes. A crash reason does nothing; restore covers it.
+  awaiting other processes. What a crash reason must do follows the
+  resource's recovery contract: state a replacement restores from a
+  checkpoint can be left; an external handle with no such path — a socket,
+  a port, a device stream — closes on every reason.
 - **A comment declaring a case impossible.** "Can never", "the only
   caller", "already announced" are the claims most often false after a
   refactor and most often hiding a defect. Check them against the code.
