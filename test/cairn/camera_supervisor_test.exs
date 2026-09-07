@@ -967,6 +967,282 @@ defmodule Cairn.CameraSupervisorTest do
     assert Cairn.Registry.whereis(a.id, :rtp_hub)
   end
 
+  # The runtime owners prune only on `server: Cairn.Config.Server` diffs and
+  # judge a write against that server's snapshot, so the ordering B5 promised a
+  # barrier for can only be exercised with a server registered under that name
+  # driving the real trees. The application's own is file-backed at a fixture
+  # this suite must not edit, so it is stood down for the duration and a
+  # test-owned one on a temporary file takes its name.
+  describe "through the real config server" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "cairn_b5_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(Path.join(dir, "profiles"))
+      Cairn.DataDir.ensure!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      File.write!(Path.join([dir, "profiles", "t1.yml"]), """
+      backend: ort
+      tier: 1
+      model_profile: yolox
+      input_size: 416
+      model:
+        onnx: test/support/fixtures/models/stub.onnx
+      labels: test/support/fixtures/models/stub.names
+      """)
+
+      path = Path.join(dir, "config.yml")
+      write_fleet(path, dir, [])
+
+      :ok = Supervisor.terminate_child(Cairn.Supervisor, Cairn.Config.Server)
+
+      # Kill first, then hand the name back: the restore must not depend on
+      # whether ExUnit's supervisor has stopped this test's children yet.
+      on_exit(fn ->
+        kill_and_await(Process.whereis(Cairn.Config.Server))
+
+        case Supervisor.restart_child(Cairn.Supervisor, Cairn.Config.Server) do
+          {:ok, _pid} -> :ok
+          {:error, :running} -> :ok
+        end
+      end)
+
+      %{dir: dir, path: path, server: start_config_server(path, :b5_config_server)}
+    end
+
+    # T1 (ABA). The tree half of B5's promise holds structurally: `stop_camera`
+    # awaits the `:camera` name, so the first tree is gone before the second
+    # starts. The owner half holds because the prune runs against `diff.known`
+    # rather than the moving snapshot, so the delete's diff — even handled
+    # late — describes a fleet the re-created id was never in.
+    test "an id removed and re-added gets a new tree, and no stale diff prunes it", %{
+      path: path,
+      dir: dir
+    } do
+      id = "cs_b5_aba_#{System.unique_integer([:positive])}"
+      Cairn.Event.subscribe()
+
+      write_fleet(path, dir, [{id, "file:///dev/null"}])
+      assert {:ok, %{added: [^id]}, _warnings} = Cairn.Config.Server.reload()
+      first = Cairn.Registry.whereis(id, :camera)
+      assert is_pid(first)
+      rec = wait_for(fn -> Cairn.Registry.whereis(id, :presence_recorder) end)
+
+      # F2, executable: the write is judged against the snapshot the apply
+      # published BEFORE it started this tree, so the first row of a camera the
+      # same diff added lands without waiting for that diff's broadcast.
+      extractor = Cairn.PresenceFixtures.relay(self())
+      event = open_event(id)
+      eid = event.id
+      :ok = Cairn.PresenceCheckpoint.put(id, event, [{nil, "person"}], extractor)
+
+      assert {%Cairn.Event{id: ^eid}, _keys, ^extractor, _slots} =
+               Cairn.PresenceCheckpoint.get(id)
+
+      # the recorder adopts it in `init/1`, so the open event is the running
+      # lane's and not merely a row
+      Process.exit(rec, :kill)
+      restored = wait_for(fn -> replacement(id, rec) end)
+      assert :sys.get_state(restored).event.id == eid
+
+      # A live presence through the aggregator rather than a hand-written
+      # `Cairn.PresenceLedger` row: the ledger is not one of the config owners
+      # and nothing prunes it on a diff, so only the aggregator's own
+      # `terminate/2` takes the row down with the lane. Injected behind its
+      # back, the row outlives the delete and the RE-CREATED camera's recorder
+      # adopts it — a stale presence with no barrier in sight (below).
+      base = System.monotonic_time(:millisecond)
+      Cairn.PresenceAggregator.observed(id, base, %{{nil, "person"} => 0.9})
+      Cairn.PresenceAggregator.observed(id, base + 500, %{{nil, "person"} => 0.9})
+      assert_receive {:presence_started, %Cairn.PresenceEvent{camera_id: ^id}}
+
+      write_fleet(path, dir, [])
+      assert {:ok, %{removed: [^id]}, _warnings} = Cairn.Config.Server.reload()
+
+      # the delete finished inside the call that answered it
+      refute Process.alive?(first)
+      refute Cairn.Registry.whereis(id, :camera)
+      assert_receive {:presence_cleared, %Cairn.PresenceEvent{camera_id: ^id, label: "person"}}
+      assert_receive {:event_ended, %Cairn.Event{id: ^eid, status: :finalized}}
+
+      write_fleet(path, dir, [{id, "file:///dev/zero"}])
+      assert {:ok, %{added: [^id]}, _warnings} = Cairn.Config.Server.reload()
+
+      second = Cairn.Registry.whereis(id, :camera)
+      assert is_pid(second)
+      assert second != first
+      owner = wait_for(fn -> Cairn.Registry.whereis(id, :pipeline) end)
+      assert :sys.get_state(owner).camera.rtsp_url == "file:///dev/zero"
+
+      # the new tree inherited nothing: no row, no adopted event
+      new_rec = wait_for(fn -> Cairn.Registry.whereis(id, :presence_recorder) end)
+      assert :sys.get_state(new_rec).event == nil
+      assert Cairn.PresenceCheckpoint.get(id) == nil
+
+      # …and the new tree's own first row survives both diffs
+      fresh = open_event(id)
+      fresh_id = fresh.id
+      :ok = Cairn.PresenceCheckpoint.put(id, fresh, [], nil)
+      settle_owners()
+      assert {%Cairn.Event{id: ^fresh_id}, _keys, nil, _slots} = Cairn.PresenceCheckpoint.get(id)
+      on_exit(fn -> Cairn.PresenceCheckpoint.delete(id) end)
+
+      refute_received {:event_started, %Cairn.Event{camera_id: ^id}}
+    end
+
+    # T2 (restart). `init/1` publishes a snapshot and nothing else: it does not
+    # diff, does not `sync`, and does not broadcast (PubSub starts below it in
+    # the application tree). So a restart is not a replay — the trees are
+    # untouched because they live under `Cairn.CameraSupervisor`, and an owner
+    # that missed a diff to the crash window is healed by the NEXT config
+    # change, whose `known` no longer names the departed camera.
+    test "a config-server restart leaves the trees standing and re-publishes", %{
+      path: path,
+      dir: dir
+    } do
+      id = "cs_b5_restart_#{System.unique_integer([:positive])}"
+
+      write_fleet(path, dir, [{id, "file:///dev/null"}])
+      assert {:ok, %{added: [^id]}, _warnings} = Cairn.Config.Server.reload()
+      tree = Cairn.Registry.whereis(id, :camera)
+      lane = child_pid(tree, :lane)
+      version = Cairn.Config.Server.get().version
+
+      Cairn.Config.Server.subscribe()
+      kill_and_await(Process.whereis(Cairn.Config.Server))
+
+      # the trees do not die with it
+      assert Process.alive?(tree)
+      assert Cairn.Registry.whereis(id, :camera) == tree
+      assert child_pid(tree, :lane) == lane
+
+      start_config_server(path, :b5_config_server_restarted)
+
+      # A restart publishes a NEW snapshot at the next version: `init/1` seeds
+      # from the surviving one and `installed/2` stamps +1, so an identical
+      # fleet still consumes a version. What it does not do is replay the apply
+      # or re-announce a diff.
+      assert Cairn.Config.Server.get().version == version + 1
+      assert Cairn.Config.Server.snapshot().version == version + 1
+      assert Cairn.Config.Server.known_ids() == MapSet.new([id])
+
+      # …and it announces nothing, so an owner hears nothing on a restart
+      refute_receive {:config_changed, _diff}, 200
+
+      # the self-heal: the next real change carries the membership the owners
+      # need, and prunes what the crash window lost
+      stale = open_event(id)
+      :ok = Cairn.PresenceCheckpoint.put(id, stale, [], nil)
+      write_fleet(path, dir, [])
+      assert {:ok, %{removed: [^id]}, _warnings} = Cairn.Config.Server.reload()
+      settle_owners()
+      assert Cairn.PresenceCheckpoint.get(id) == nil
+    end
+
+    # T3. The in-flight put is queued AHEAD of both diffs, which is the worst
+    # ordering the mailbox can produce. It is accepted — `known?` reads the
+    # moving snapshot, which by then names the re-created id — and then deleted
+    # by the delete's own prune, because that prune runs against `diff.known`
+    # frozen at the version that produced it. The contract's answer, asserted:
+    # the row is ABSENT, so the new camera inherits nothing from the old one's
+    # last write.
+    test "a put in flight across a delete and a re-create is dropped by the delete's prune", %{
+      path: path,
+      dir: dir
+    } do
+      id = "cs_b5_race_#{System.unique_integer([:positive])}"
+
+      write_fleet(path, dir, [{id, "file:///dev/null"}])
+      assert {:ok, %{added: [^id]}, _warnings} = Cairn.Config.Server.reload()
+      assert is_pid(Cairn.Registry.whereis(id, :camera))
+      on_exit(fn -> Cairn.PresenceCheckpoint.delete(id) end)
+
+      owner = Process.whereis(Cairn.PresenceCheckpoint)
+      :sys.suspend(owner)
+
+      stale = open_event(id)
+      task = Task.async(fn -> Cairn.PresenceCheckpoint.put(id, stale, [], nil) end)
+      wait_for_queue(owner, 1)
+
+      write_fleet(path, dir, [])
+      assert {:ok, %{removed: [^id]}, _warnings} = Cairn.Config.Server.reload()
+      write_fleet(path, dir, [{id, "file:///dev/zero"}])
+      assert {:ok, %{added: [^id]}, _warnings} = Cairn.Config.Server.reload()
+
+      :sys.resume(owner)
+      assert Task.await(task, 10_000) == :ok
+      settle_owners()
+
+      assert Cairn.PresenceCheckpoint.get(id) == nil
+      assert Process.alive?(owner)
+      assert is_pid(Cairn.Registry.whereis(id, :camera))
+    end
+
+    defp start_config_server(path, id) do
+      start_supervised!(
+        %{
+          id: id,
+          restart: :temporary,
+          start:
+            {Cairn.Config.Server, :start_link,
+             [[path: path, name: Cairn.Config.Server, apply_native: fn _config -> :ok end]]}
+        },
+        id: id
+      )
+    end
+
+    defp write_fleet(path, dir, cameras) do
+      body = """
+      data_dir: #{dir}
+      profile_dirs:
+        - #{Path.join(dir, "profiles")}
+      plugins:
+        t1:
+          profile: t1
+      """
+
+      rows =
+        Enum.map_join(cameras, "", fn {id, url} ->
+          "  - id: #{id}\n    rtsp_url: #{url}\n    plugin: t1\n"
+        end)
+
+      File.write!(path, if(rows == "", do: body, else: body <> "cameras:\n" <> rows))
+    end
+
+    # The reads above go to ETS while the prune runs in each owner's process; a
+    # call to each is what orders one against the other.
+    defp settle_owners do
+      :sys.get_state(Cairn.Config.Server)
+
+      for owner <- [
+            Cairn.CameraStatus,
+            Cairn.CameraControl,
+            Cairn.EventCheckpoint,
+            Cairn.PresenceCheckpoint
+          ],
+          do: :sys.get_state(owner)
+
+      :ok
+    end
+
+    defp wait_for_queue(pid, len) do
+      wait_for(fn ->
+        case Process.info(pid, :message_queue_len) do
+          {:message_queue_len, n} when n >= len -> n
+          _short -> nil
+        end
+      end)
+    end
+
+    defp kill_and_await(nil), do: :ok
+
+    defp kill_and_await(pid) do
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
+      :ok
+    end
+  end
+
   # Stands in for a reload: `Cairn.Config.Server` publishes its snapshot before
   # applying the diff, and that term is what a tree rebuilt from a stale child
   # spec resolves itself from.

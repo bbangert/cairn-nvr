@@ -93,13 +93,15 @@ Memory is bounded by `pre_window × bitrate × camera_count`, independent of eve
 
 ## The camera tracker
 
-Event lifecycle is owned one camera at a time: a `Cairn.CameraTracker` in that camera's own `Cairn.Camera.Lane`, ahead of its media, fed observations by the detect branch through `Cairn.Detect.Dispatch` — plain functions in the caller's process, so no per-frame GenServer hop and no config-server call on the frame path (policy is resolved at session start and on refresh).
+Event lifecycle is owned one camera at a time: a `Cairn.CameraTracker` in that camera's own `Cairn.Camera.Lane`, fed observations by the detect branch through `Cairn.Detect.Dispatch` — plain functions in the caller's process, so no per-frame GenServer hop and no config-server call on the frame path (policy is resolved at session start and on refresh). The dispatch resolves the tracker's Registry name per batch and casts; it holds no pid and no monitor, which is why a lane worker's restart is invisible to the media and a batch cast into the gap is merely dropped.
 
 The tracker assigns identities itself (`Cairn.Tracker`: IoU + optional staged admissions — BBD, ORU, OCR, Re-ID fusion — per the profile's stage list), debounces detections into events, and keys suspend/adopt off **stream epoch identity**: one epoch is one continuous decode session, so nothing (pts, object continuity) carries across a respawn except by the tracker's own adopt-across-reset rule. Trackers are `:transient` and checkpoint to ETS, so a crash restores in `init/1`; a camera disabled or deleted stops its tracker, which finalizes an open event on the way out.
 
 ## The event extractor
 
 One `Cairn.EventExtractor` per active event; the only component writing permanent storage. It drains the pre-window atomically, then streams live fragments, writing nothing until the first keyframe-headed fragment (which becomes the clip's t=0), and finalizes into the SQLite index on post-window quiet. Fragmented mp4 keeps unfinalized files playable up to the last complete fragment; `remux_clips: true` rewrites the finished clip so it knows its own duration.
+
+Extractors are `:temporary` under `Cairn.EventSupervisor`, not in the camera tree: they are scoped to an event, so they outlive a lane owner's crash and the replacement re-adopts them from its checkpoint. The clip is ended by its **owner** — the lane worker that opened it, passed in as `owner:` at start and re-claimed with `owner/2` after an adoption. That worker has been updating the event's labels, scores and trigger ever since, and the snapshot the extractor holds is stale from the first detection, so a self-close would persist the opening metadata and emit no `:event_ended`. The extractor therefore monitors the ring its subscription came from and, when that ring dies, only *reports* it — `{:ring_lost, event_id}` to its owner, which answers with its ordinary finalize. The single close it performs itself is the orphan: owner dead, nothing left to cast, so it closes with what it has rather than hold an `:active` row forever.
 
 ## Live view
 
@@ -113,7 +115,13 @@ Detection boxes are drawn over the live feed by LiveView, not by a canvas hook: 
 
 `config.yml` is the source of truth. A **hardware profile** (one YAML per board class) names the model, input geometry, backend, fps band and tracker stage list; a `plugins:` group is a profile reference, and every camera naming that group detects on it. Config load expands the profile into the engine's model config and the host's tracking policy from one file, so the two halves cannot disagree.
 
-On reload, the new config reaches the engine first (`Cairn.Native.Host.reconfigure/1` — a model change is handled there, not by restarting cameras), then the camera diff: edits that reach a subprocess, the ring, or a detect-branch element built from them (`rtsp_url`, `substream_url`, `plugin`, `min_score`, `ingest`, `transcode`, `extra_ffmpeg_args`, `motion_json`, the pre-window, and the resolved tracker core, sample rate, live-track cap, capability tier and ladder rung) restart that camera's tree; everything else refreshes in place through the running session.
+On reload, the new config reaches the engine first (`Cairn.Native.Host.reconfigure/1` — a model change is handled there, not by restarting cameras), then the camera diff. It sorts each camera into exactly one of `added`, `removed`, `rebuilt`, `changed` and `refreshed`, and the tests are in that order because the coarser answer subsumes the finer:
+
+- **`changed`** — an edit that reaches a subprocess, the ring, or a detect-branch element built from it: `rtsp_url`, `substream_url`, `plugin`, `min_score`, `ingest`, `transcode`, `extra_ffmpeg_args`, `motion_json`, and the *resolved* pre-window, tracker core, sample rate, live-track cap and ladder rung. None of them is readable into a running session, and none is consumed by a lane worker — so the camera's `:media` subtree is replaced and everything else stands.
+- **`rebuilt`** — the resolved capability tier, and only that. It picks the detect branch's tail *and* which event workers the camera runs, and no running supervisor can be edited into a different child list, so the whole tree is stopped and started.
+- **`refreshed`** — everything else the running camera was handed: the camera struct and its effective policy, including a *global* window or tracking edit that moves neither. It is cast into the running tree.
+
+The contract for a field added to `Cairn.Config.Camera` later is refresh-only; nothing joins the restart list by being new.
 
 ## Process supervision tree
 
@@ -122,7 +130,13 @@ Cairn.Supervisor
 ├── Cairn.Native.Drain             (first, so its terminate runs last: drains native teardown)
 ├── Cairn.Repo / Ecto.Migrator     (SQLite event + track index; the Repo reads data_dir off the file itself)
 ├── Cairn.Config.Server            (after the migrated Repo, so a source may read rows; everything below hangs off it)
-├── Phoenix.PubSub / Cairn.Registry / Cairn.CameraStatus ...
+├── Cairn.Registry
+├── Phoenix.PubSub / Cairn.CameraControl / Cairn.CameraStatus
+│                                  (a rest_for_one group: both tables subscribe to config in init/1)
+├── Cairn.EventCheckpoint          (node-level ETS: each tracker's open event)
+├── Cairn.PresenceSupervisor (rest_for_one)
+│   ├── Cairn.PresenceCheckpoint   (each recorder's open event)
+│   └── Cairn.PresenceLedger       (announced presence keys; a checkpoint crash empties it too)
 ├── Cairn.EventSupervisor (DynamicSupervisor)
 │   └── Cairn.EventExtractor       (one per active event, temporary)
 ├── Cairn.StreamEpochs             (before the cameras that mint epochs into it)
@@ -132,20 +146,44 @@ Cairn.Supervisor
 ├── Cairn.Native.Status            (maps engine health onto cameras:status)
 ├── Cairn.CameraSupervisor (DynamicSupervisor)
 │   └── Cairn.Camera (one per camera, one_for_one)
-│       ├── :lane  Cairn.Camera.Lane  (one_for_one; the event workers, by tier —
-│       │                              tier 1: PresenceRecorder + PresenceAggregator,
-│       │                              otherwise: CameraTracker, transient, ETS-checkpointed)
-│       └── :media Cairn.Camera.Media (rest_for_one; replaced alone on a restart-class change)
-│           ├── probe              (ffprobe task, temporary)
-│           ├── Cairn.RingBuffer
-│           ├── Cairn.FFmpegPort   (bridge cameras only: the ffmpeg Port)
-│           ├── Cairn.PipelineOwner (the camera's long-lived Membrane pipeline)
-│           └── Cairn.RTPHub       (socketless; fed by the pipeline's RTP branch)
+│       ├── :media Cairn.Camera.Media (rest_for_one; replaced alone on a restart-class change)
+│       │   ├── probe              (ffprobe task, temporary)
+│       │   ├── Cairn.RingBuffer
+│       │   ├── Cairn.FFmpegPort   (bridge cameras only: the ffmpeg Port)
+│       │   ├── Cairn.PipelineOwner (the camera's long-lived Membrane pipeline)
+│       │   └── Cairn.RTPHub       (socketless; fed by the pipeline's RTP branch)
+│       └── :lane  Cairn.Camera.Lane  (one_for_one; the event workers, transient and
+│           checkpoint-restoring, composed by the resolved tier — tier 1:
+│           Cairn.PresenceRecorder then Cairn.PresenceAggregator; every other
+│           tier, including an unprofiled camera's nil: Cairn.CameraTracker)
 ├── Cairn.Retention / CairnWeb.WebRTC.Supervisor / Cairn.Boot
 └── CairnWeb.Endpoint
 ```
 
-Restart shape worth naming: the pipeline is *not* in this tree — `Cairn.PipelineOwner` monitors it and its jittered backoff (not supervisor intensity) owns the "camera is down" state, as `Cairn.FFmpegPort`'s does for the bridge. Ring death restarts the ingest (`Cairn.Camera.Media` is `:rest_for_one`): a fresh ring is empty anyway. A restart-class config change replaces `:media` alone; the camera's supervisor, its Registry name and its lane survive, and the new subtree is built from the applied diff's explicit camera and config — a whole tree `Cairn.CameraSupervisor` rebuilds instead resolves itself from the config server's published snapshot, since its stored child spec cannot be rewritten.
+The two per-camera subtrees are independent — the media reaches the lane only by resolving a Registry name and casting — so `Cairn.Camera` is `:one_for_one`, and a lane worker crash-looping past its intensity does not bounce the camera's RTSP connection. What the child order decides is the **stop**, which runs in reverse: `:media` first means the lane goes down first, while its ring is still live and its pipeline has not yet published the camera's `:camera_stopped` epoch. That is what the lane's `terminate/2` needs — the tracker and the recorder each cast a finalize to an extractor still draining a live ring, and the tracker gets to end its live tracks `:camera_stopped`, which is what actually happened to them. Stopping the media first inverts it: the epoch arrives as a message and ends every track `:stream_reset`, counting a reset that never happened. The cost of this order is at the start, and it is a batch or two cast to absent names and dropped.
+
+Inside `:lane`, the recorder starts before the aggregator — against the data's direction, and decided by a read that happens once. `Cairn.PresenceAggregator.init/1` clears its predecessor's announced keys and deletes those ledger rows; the recorder's `adopt_announced/1` reads the same rows to find a presence that began while the lane was down. Read after the aggregator has run, they are gone and the whole stay goes unrecorded. Neither `init/1` calls the other — only casts — so the order costs no deadlock, and reverse-order shutdown still stops the aggregator first, into a live recorder's mailbox.
+
+`Cairn.Camera.Media` stays `:rest_for_one` because there the dependency is real: ring death restarts the ingest (a fresh ring is empty anyway), and ingest death restarts only its downstream consumers. The pipeline itself is *not* in the tree — `Cairn.PipelineOwner` monitors it and its jittered backoff (not supervisor intensity) owns the "camera is down" state, as `Cairn.FFmpegPort`'s does for the bridge.
+
+Escalation is three-level: `Cairn.Camera.Media`'s intensity, then `Cairn.Camera`'s (which restarts `:media` alone), then `Cairn.CameraSupervisor`'s, which rebuilds the whole tree. The `:camera` Registry name survives the first two, so a camera whose media is crash-looping still counts as running to `sync/1`. The third level is why `Cairn.Camera.init/1` resolves its camera and config from the config server's published snapshot, falling back to the opts pair only when no snapshot names it: a `Cairn.Camera` is a `:permanent` child of a DynamicSupervisor and its stored child spec cannot be rewritten, so a tree rebuilt from those baked args alone would revert to the camera's pre-change restart-class fields and stay there. The baked args are the tree's identity, not its configuration.
+
+The node-level tables sit outside every camera tree, and the lane workers **outlive** them: an aggregator being fed batches must not die because the ledger's ETS table went with a crashing owner, so each table's API reads a missing table as an empty one — a `get/1` answers `nil`, a `delete/1` `:ok`. The reverse also holds: what a restarted aggregator owes the world is not its state but the `presence_cleared` events its predecessor's announcements are still waiting on.
+
+How each diff class lands on the tree:
+
+- **`refreshed`** — `Cairn.PipelineOwner.refresh/3` for `:media`, then a refresh cast to every lane worker (absent names dropped; the tier is not re-read here, the tree already answered that question).
+- **`changed`** — `:media` is terminated, deleted and started again from the new camera; the restart-class fields are baked into its children's arguments, so a `restart_child` would rebuild from the old struct. The lane runs on through the gap and is handed the new pair immediately afterwards, because the `%Cairn.Config{}` each worker holds is what it passes to every extractor it starts.
+- **`rebuilt`** — stop the whole tree, and let `sync/1` start it again from the new config so the lane is built for the new tier.
+- **`removed`**, and a disable, which produces the identical diff — the tree is stopped. Nothing distinguishes them here, and nothing should: what differs is state, and the checkpoint, status and control tables prune against the diff's `known` ids (which include the dormant), so a disabled camera's rows survive for re-enable and a deleted camera's do not.
+
+A media replacement **splits** an open clip rather than preserving or losing it. The ring is inside `:media` and the extractor's subscription lives in the ring's own state, so no replacement inherits it; the extractor reports `{:ring_lost, _}` to its owner, the owner closes with the *current* event, and its retry — or the next qualifying batch — opens a fresh clip on the new ring. A reconnect is the case that differs: the ring is ahead of the pipeline in `Cairn.Camera.Media`, so it survives one and the clip runs unbroken. One residual: `Supervisor.start_child/2` appends, so a replaced `:media` sits after `:lane` and a later whole-camera stop tears it down first — which costs the track *labels* (`:stream_reset` instead of `:camera_stopped`), not the clip. OTP cannot reorder a spec in place, and moving `:lane` would restart the workers the split exists to keep alive.
+
+Three rules every lane child obeys, each of them a real defect found in review:
+
+- **No `Cairn.Config.Server` call from `init/1`.** A reload or UI edit runs `apply_diff → sync → start_child` *inside* the server's `handle_call`, so a child that calls the server during init waits on a server waiting on it. Config comes from the published snapshot, or from the pair the tree passed in.
+- **Both `config:` and `owner:` into every extractor it starts.** Without `config:` the extractor calls the config server itself — the same deadlock through a second door, since a restore-driven open happens in `init/1`. Without `owner:` a lost ring is only logged and the clip starves until its window runs out.
+- **Gate the open on a live ring.** The lane outlives its media, so `:media` can be mid-restart under it — a ring crash restarts the ingest chain, a restart-class change replaces the subtree outright — and a restore- or retry-driven open landing in that gap would die `:noproc` and leave a junk `:partial` event. No ring, no clip: arm the retry instead. Both the name and `Process.alive?/1` are checked, because "`Cairn.Registry.whereis/2` does not filter dead pids, and the single partition's DOWN handling can lag a read arbitrarily — so a corpse answers here for a while after a media replacement". A ring that dies *after* the check is not the gate's business: the extractor reports the loss.
 
 ## Resource budget
 
