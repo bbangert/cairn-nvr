@@ -16,18 +16,23 @@ must come back after its own `{:stop, :normal, state}` needs `:permanent`.
 a `:temporary` child placed to run "again" runs once; right for a one-shot
 whose failure is not the tree's business. A `:transient` or `:temporary`
 child may be `significant: true`, and `auto_shutdown: :any_significant |
-:all_significant` makes the parent stop itself when it exits — the tree
-saying "this subtree exists for that child" instead of a reaper. The
-default `:never` is right whenever the parent has its own reasons to live.
+:all_significant` makes the parent stop itself when it ends — the tree
+saying "this subtree exists for that child" instead of a reaper. A
+significant `:transient` child counts only on a normal exit (an abnormal
+one is restarted as usual); a significant `:temporary` child counts on any
+exit. The default `:never` is right whenever the parent has its own
+reasons to live.
 
 ## Shutdown budget
 
 The supervisor sends `:shutdown`, waits the child's `shutdown` value, then
-kills. Default 5 000 ms for a worker, `:infinity` for a supervisor — and a
-supervisor child must keep `:infinity`, anything else races its own
-children's teardown. `:infinity` on a worker makes the whole tree's
-teardown wait on that worker returning; `:brutal_kill` skips `terminate/2`
-and is right for a process holding nothing that can be flushed.
+kills. Default 5 000 ms for a worker, `:infinity` for a supervisor. A finite
+value on a supervisor child caps total teardown time at the cost that the
+parent may kill it before its descendants finish, so `:infinity` is the
+default for a reason but not a rule. `:infinity` on a worker makes the
+whole tree's teardown wait on that worker returning; `:brutal_kill` skips
+`terminate/2` and is right for a process holding nothing that can be
+flushed.
 
 ## Restart intensity
 
@@ -70,12 +75,14 @@ OTP 24 the call uses a process alias, so a late reply is dropped rather
 than leaking into the mailbox. Raising the timeout is right for a
 known-slow external, not on a supervisor-critical path. A deferred reply —
 `{:noreply, state}` now, `GenServer.reply/2` later from any process — keeps
-a server responsive across slow work; the `from` must be tracked, and a
-crash between the two leaves the caller to its own timeout. A mailbox is
-bounded only by memory: a `cast` or `send` producer faster than its
-consumer kills the node by memory with no error at the producer. A `call`
-is implicit back-pressure; deliberate shedding (a latest-wins slot, a drop
-counter) is the alternative, and dropping silently is the bug.
+a server responsive across slow work; the `from` must be tracked, and if
+the server crashes between the two the caller — which monitors it for the
+call — exits at once with the server's reason rather than waiting out its
+timeout. A mailbox is bounded only by memory: a `cast` or `send` producer
+faster than its consumer kills the node by memory with no error at the
+producer. A `call` is implicit back-pressure; deliberate shedding (a
+latest-wins slot, a drop counter) is the alternative, and dropping silently
+is the bug.
 
 ## Message ordering
 
@@ -94,8 +101,10 @@ child must be `:temporary`, the default) is the one that does not take a
 GenServer down; `Task.Supervisor.start_child/3` is fire-and-forget.
 `Task.async_stream/3` defaults to 5 000 ms per element with
 `on_timeout: :exit` — the caller exits — and `ordered: true`, which buffers;
-`async_stream_nolink` under a `Task.Supervisor` is the form safe inside a
-GenServer.
+`async_stream_nolink` under a `Task.Supervisor` isolates the caller from
+a task's abnormal exit and nothing more: `on_timeout: :exit` still exits
+the caller unless changed to `:kill_task`, and consuming the stream inside
+a callback keeps the server busy for its duration.
 
 ## Registry
 
@@ -136,11 +145,13 @@ across versions, so nothing may persist a partition index.
 An ETS table dies with its owner unless `{:heir, pid, data}` is set, in
 which case the heir receives `{:"ETS-TRANSFER", tab, from, data}`;
 `:ets.give_away/3` transfers ownership without changing the heir.
-`read_concurrency` costs on read/write alternation and `write_concurrency`
-on reads; a table with one writer wants neither. A `:persistent_term` read
-is free; a `put` or `erase` scans every process heap and can pause the
-node, so it fits config written on reload and read everywhere, not
-anything per request.
+`read_concurrency` costs on read/write alternation and pays when many
+readers share one writer; `write_concurrency` costs on reads and buys
+nothing with a single writer. A `:persistent_term` read is free. Adding a
+new key only copies the term table; replacing or erasing a key whose old
+value is not an immediate scans every process heap and can pause the node.
+So it fits config written on reload and read everywhere, not anything
+rewritten per request.
 
 ## Timers
 

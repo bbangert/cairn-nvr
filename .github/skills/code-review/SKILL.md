@@ -109,11 +109,13 @@ asserting any of them.
 
 ## Do not suggest these
 
-- **A reaper, reconciler, or stop-time sweep** across trees. A stop is a
-  supervisor stopping a subtree; each worker closes its own resources in
-  `terminate/2`; a crash restores from a checkpoint. A worker crashing at
-  the instant its subtree stops is a double fault to document, not an
-  orchestrator to build.
+- **A reaper, reconciler, or stop-time sweep** that compensates for
+  lifetime owned in the wrong tree. A stop is a supervisor stopping a
+  subtree; each worker closes its own resources in `terminate/2`; a crash
+  restores from a checkpoint. A worker crashing at the instant its subtree
+  stops is a double fault to document, not an orchestrator to build. A
+  successor reconciling durable external resources its predecessor was
+  killed holding is not this — that is the recovery the kill demands.
 - **An explicit stop signal** to tell an intentional stop from a crash. The
   exit reason a link or monitor delivers already says which, and the
   stopping process receives the same reason in `terminate/2`.
