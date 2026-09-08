@@ -48,8 +48,10 @@ asserting any of them.
   starts from its own init.
 - **Post-init work that is not `handle_continue`.** Work in `init/1` blocks
   the starter and, under a supervisor, the start sequence; `{:continue, _}`
-  runs before any message a registered name already attracts. Blocking in
-  `init/1` is right only when a later child must wait for this one.
+  runs before any message a registered name already attracts. Work belongs in
+  `init/1` when its outcome must be the start result — a starter that must
+  see the failure, or must never observe a half-ready process — or when a
+  later child must wait for this one.
 - **An unbounded producer into a slower consumer.** A mailbox is bounded
   only by memory, so a `cast` or `send` path with nothing pacing it fails
   as node memory, with no error where it was sent. A `call` paces one caller,
@@ -86,8 +88,9 @@ asserting any of them.
   process; a third process, or a different sender, reorders them.
 - **Configuration reaching work by accident.** The project's contract
   decides whether a change applies to in-flight work or only to the next
-  unit; either must be deliberate — a copy captured at open, or an explicit
-  cancel — never live state read when a timer happens to arm. A held struct
+  unit; either must be deliberate — a copy captured at open, a read of the
+  current value at a defined boundary, or an explicit cancel — never live
+  state read because a timer happened to arm. A held struct
   that flows into processes the worker starts must be refreshed on every
   change class that can reach it.
 - **Child order that makes the stop lie.** If a producer stops before the
@@ -132,7 +135,9 @@ asserting any of them.
 - **A call in place of a cast** to close a window that ordering does not
   close anyway. Ask whether the outcome inside the window is already honest.
 - **Waits on registry unregistration before a re-register**, guards
-  against `terminate_child` failing on a down child, timeouts on
+  against `terminate_child` failing on a down child whose spec remains (a
+  `:temporary` child's is deleted on exit, and that one does return
+  `:not_found`), timeouts on
   `start_link` from init, or guards on `Process.exit` of a dead pid — see
   the reference; each was asserted in review and shown false by running it.
   A read used to decide whether something is still running is the one

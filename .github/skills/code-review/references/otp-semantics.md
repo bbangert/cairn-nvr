@@ -50,13 +50,17 @@ comment.
 
 `GenServer.start_link/3`'s `:timeout` defaults to `:infinity`; the 5 000 ms
 that comes to mind is `GenServer.call/3`'s. Work in `init/1` blocks the
-starter, and under a supervisor the whole start sequence — right only when
-a later child must not start until this one is ready. `{:continue, arg}`
+starter, and under a supervisor the whole start sequence; `start_link/3`
+does not return until `init/1` has, and a `{:stop, reason}` there becomes
+the start's `{:error, reason}`. So work belongs in `init/1` when the starter
+must receive its failure or must never observe a half-ready process, and
+when a later child must not start until this one is ready. `{:continue, arg}`
 from `init/1` runs before any other message; `send(self(), :init)` does
 not, because a registered name already attracts messages.
-`terminate/2` runs when a callback returns `:stop`, raises, or returns a bad
-value, and on an external exit signal only when the process traps exits;
-never on `:kill`, including a supervisor's forced kill after the shutdown
+`terminate/2` runs when a callback other than `init/1` returns `:stop`,
+raises, or returns a bad value — an `init/1` that fails gets no
+`terminate/2`, so what it acquired is not cleaned there — and on an
+external exit signal only when the process traps exits; never on `:kill`, including a supervisor's forced kill after the shutdown
 budget. So cleanup that only `terminate/2` performs is a leak waiting for a
 kill. A port dies with its owner process; the OS process behind it may not,
 and a hung one needs its `os_pid` killed. `Process.exit/2` on a dead pid
@@ -115,8 +119,10 @@ a callback keeps the server busy for its duration.
 ## Registry
 
 Lookup, dispatch, and register run in the calling process against the
-partition's ETS; the registry process only holds the monitors, and it
-processes a `DOWN` asynchronously. So `Registry.lookup/2` can return a dead
+partition's ETS; registering links the caller to the partition, which
+traps exits and removes the entries on the `EXIT` — asynchronously, and
+with the link's other edge: a partition that exits abnormally takes down
+every linked registrant that does not trap exits. So `Registry.lookup/2` can return a dead
 pid; `Process.alive?/1` filters that stale entry at that instant and no
 more, since the process can exit right after, so a decision that needs the
 target to handle an operation uses a call or a monitor that observes it. Registering is different: a unique
@@ -140,7 +146,11 @@ first on the next reverse-order shutdown; nothing reorders a spec in place.
 
 ## Lifecycle coupling by strategy
 
-`:rest_for_one` restarts a child and every child ordered after it. A
+`:rest_for_one` restarts a child and every child ordered after it — when
+the terminating child is one that is to be restarted: a `:transient`
+child's clean exit or a `:temporary` child's exit cascades nothing, and a
+later `:temporary` sibling is terminated in the cascade but never
+restarted. A
 subscriber ordered after its holder restarts with the holder; one ordered
 before it, a `:one_for_one` sibling, or a process in another tree survives
 the holder's replacement holding a subscription the new holder never heard
