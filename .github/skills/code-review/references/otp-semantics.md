@@ -102,10 +102,11 @@ the same sender.
 
 ## Tasks
 
-`Task.async/1` spawns a process the caller links and monitors, and it
-always sends its reply:
-an un-awaited task leaks a message and its crash kills the caller, and only
-the calling process may await. `Task.Supervisor.async_nolink/3` (the
+`Task.async/1` spawns a process the caller links and monitors. A task that
+completes always sends its reply, so an un-awaited task leaks a message; a
+task that raises sends nothing — its failure arrives through the link,
+which kills the caller, and the monitor's `DOWN` without a reply is how a
+crash reads. Only the calling process may await. `Task.Supervisor.async_nolink/3` (the
 child must be `:temporary`, the default) is the one that does not take a
 GenServer down; `Task.Supervisor.start_child/3` is fire-and-forget.
 `Task.async_stream/3` defaults to 5 000 ms per element with
@@ -148,9 +149,10 @@ first on the next reverse-order shutdown; nothing reorders a spec in place.
 
 `:rest_for_one` restarts a child and every child ordered after it — when
 the terminating child is one that is to be restarted: a `:transient`
-child's clean exit or a `:temporary` child's exit cascades nothing, and a
-later `:temporary` sibling is terminated in the cascade but never
-restarted. A
+child's clean exit or a `:temporary` child's exit cascades nothing (unless
+the child is significant under a configured `auto_shutdown`, in which case
+the parent stops itself — see restart types), and a later `:temporary`
+sibling is terminated in the cascade but never restarted. A
 subscriber ordered after its holder restarts with the holder; one ordered
 before it, a `:one_for_one` sibling, or a process in another tree survives
 the holder's replacement holding a subscription the new holder never heard

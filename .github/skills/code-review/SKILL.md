@@ -137,8 +137,9 @@ asserting any of them.
 - **Waits on registry unregistration before a re-register**, guards
   against `terminate_child` failing on a down child whose spec remains (a
   `:temporary` child's is deleted on exit, and that one does return
-  `:not_found`), timeouts on
-  `start_link` from init, or guards on `Process.exit` of a dead pid — see
+  `:not_found`), a `start_link` timeout added because someone assumed a five-second
+  default (a deliberate `:timeout` that bounds an init hanging on an
+  external dependency is a different thing, and valid), or guards on `Process.exit` of a dead pid — see
   the reference; each was asserted in review and shown false by running it.
   A read used to decide whether something is still running is the one
   place a Registry wait or an alive check belongs, and there it only
