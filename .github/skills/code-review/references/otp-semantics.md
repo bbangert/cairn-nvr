@@ -26,10 +26,11 @@ reasons to live.
 ## Shutdown budget
 
 The supervisor sends `:shutdown`, waits the child's `shutdown` value, then
-kills. Default 5 000 ms for a worker, `:infinity` for a supervisor. A finite
-value on a supervisor child caps total teardown time at the cost that the
-parent may kill it before its descendants finish, so `:infinity` is the
-default for a reason but not a rule. `:infinity` on a worker makes the
+kills. Default 5 000 ms for a worker, `:infinity` for a supervisor. The Erlang docs
+require `:infinity` for a supervisor child — with a finite value the parent
+can kill it before it has terminated its own children — and Elixir calls
+anything else discouraged; a finite value is a measured exception, not a
+default choice. `:infinity` on a worker makes the
 whole tree's teardown wait on that worker returning; `:brutal_kill` skips
 `terminate/2` and is right for a process holding nothing that can be
 flushed.
@@ -57,7 +58,7 @@ not, because a registered name already attracts messages.
 value, and on an external exit signal only when the process traps exits;
 never on `:kill`, including a supervisor's forced kill after the shutdown
 budget. So cleanup that only `terminate/2` performs is a leak waiting for a
-kill. A linked port dies with its owner; the OS process behind it may not,
+kill. A port dies with its owner process; the OS process behind it may not,
 and a hung one needs its `os_pid` killed. `Process.exit/2` on a dead pid
 returns `true`.
 
@@ -90,11 +91,14 @@ The BEAM keeps message order per sender–receiver pair, whatever the message
 kind: `cast A; call B; cast C` from one process to one server arrive in that
 order, and B's reply is a barrier. Order is lost only when the pair changes:
 a message routed through a third process, or sent from a different process
-than the rest.
+than the rest. Priority messages are the other exception: delivered in
+order, but they may be taken from the queue ahead of ordinary messages from
+the same sender.
 
 ## Tasks
 
-`Task.async/1` links and monitors the caller and always sends its reply:
+`Task.async/1` spawns a process the caller links and monitors, and it
+always sends its reply:
 an un-awaited task leaks a message and its crash kills the caller, and only
 the calling process may await. `Task.Supervisor.async_nolink/3` (the
 child must be `:temporary`, the default) is the one that does not take a
@@ -102,7 +106,8 @@ GenServer down; `Task.Supervisor.start_child/3` is fire-and-forget.
 `Task.async_stream/3` defaults to 5 000 ms per element with
 `on_timeout: :exit` — the caller exits — and `ordered: true`, which buffers;
 `async_stream_nolink` under a `Task.Supervisor` isolates the caller from
-a task's abnormal exit and nothing more: `on_timeout: :exit` still exits
+a task's abnormal exit and leaves no task running once the stream halts,
+and no more than that: `on_timeout: :exit` still exits
 the caller unless changed to `:kill_task`, and consuming the stream inside
 a callback keeps the server busy for its duration.
 
@@ -114,16 +119,17 @@ processes a `DOWN` asynchronously. So `Registry.lookup/2` can return a dead
 pid, and a read used to decide whether something is running needs
 `Process.alive?/1` or a wait. Registering is different: a unique
 `Registry.register/3` that collides with a dead holder evicts it and
-retries, so only a live holder yields `{:error, {:already_registered, pid}}`
-and terminate-then-start needs no wait between. `:via` requires `:unique`;
+retries — the check is `Process.alive?/1` at register time, not a wait for
+the `DOWN` — so only a live holder yields `{:error, {:already_registered,
+pid}}`, and a synchronous terminate needs no wait before the start. `:via` requires `:unique`;
 `:duplicate` keys are the pub-sub shape; `:partitions` above the default 1
 helps only for measured contention.
 
 ## Supervisor child management
 
 `Supervisor.terminate_child/2` returns `:ok` for a running, down, or
-restarting child — the spec stays — and `{:error, :not_found}` only with
-no spec. Terminate, delete, start from one caller against a supervisor that
+restarting child — the spec stays unless the child is `:temporary` — and
+`{:error, :not_found}` only with no spec. Terminate, delete, start from one caller against a supervisor that
 is not itself restarting cannot hit `:already_present`; the calls are
 serialized, not atomic, so a second caller on the same child id, or a
 supervisor rebuilding its static specs between them, can.
@@ -145,11 +151,14 @@ across versions, so nothing may persist a partition index.
 An ETS table dies with its owner unless `{:heir, pid, data}` is set, in
 which case the heir receives `{:"ETS-TRANSFER", tab, from, data}`;
 `:ets.give_away/3` transfers ownership without changing the heir.
-`read_concurrency` costs on read/write alternation and pays when many
-readers share one writer; `write_concurrency` costs on reads and buys
-nothing with a single writer. A `:persistent_term` read is free. Adding a
-new key only copies the term table; replacing or erasing a key whose old
-value is not an immediate scans every process heap and can pause the node.
+`read_concurrency` costs when reads and writes alternate a few at a time
+and pays when reads far outnumber writes or arrive in bursts;
+`write_concurrency` costs memory, sequential access, and concurrent reads,
+so it wants concurrent writers to earn it. A `:persistent_term` read copies
+nothing and takes no lock. Adding a new key copies the key table, so a put
+costs in the number of terms already stored; replacing or erasing a key
+whose old value is not an immediate scans every process heap and can pause
+the node.
 So it fits config written on reload and read everywhere, not anything
 rewritten per request.
 
