@@ -46,9 +46,14 @@ durable recovery, or backpressure — ask what the mechanism compensates for.
   `:one_for_one` sibling, does not — the dependency must be a monitor, and
   the detector reports to whoever owns the outcome rather than acting on a
   stale snapshot.
-- **The wrong process closing a resource.** The owner holds the current
-  data; a helper holds the opening snapshot. Only an orphan (owner dead)
-  closes itself, and then it emits what the owner would have.
+- **The wrong process closing a record.** Ownership follows the live
+  resource: the process holding a socket, port, or file closes that handle
+  when it is done, whatever its coordinator is doing. The record that
+  describes the work is different — the process that has been updating it
+  holds the current data, and a helper holds the opening snapshot, so a
+  helper finalizing the record persists stale data and skips the owner's
+  notifications. Only an orphan (owner dead) finalizes the record itself,
+  and then it emits what the owner would have.
 - **Ordering relied on across a pair the messages do not share.** The BEAM
   orders messages per sender–receiver pair, whatever their kind: `cast A;
   call B; cast C` from one process to one server arrive in that order, and
@@ -108,7 +113,10 @@ durable recovery, or backpressure — ask what the mechanism compensates for.
 - **Waits on registry unregistration before a start**, or the claim that
   `Supervisor.terminate_child/2` on a down child fails: it returns `:ok` for
   a running, down, or restarting child, `{:error, :not_found}` only with no
-  spec, so terminate, delete, start cannot hit `:already_present`.
+  spec. Terminate, delete, start from one caller against a supervisor that
+  is not itself restarting cannot hit `:already_present`; the three calls
+  are serialized, not atomic, so a second caller managing the same child
+  id, or a supervisor rebuilding its static specs in between, can.
 - **A timeout on `GenServer.start_link`** or a guard on `Process.exit` of a
   dead pid. A start's `:timeout` defaults to `:infinity` (5 000 ms is
   `GenServer.call/3`'s default); exiting a dead pid returns `true`.
@@ -123,10 +131,13 @@ durable recovery, or backpressure — ask what the mechanism compensates for.
 
 ## Writing a finding
 
-Name the layer violated — boundary, lifecycle, ownership, ordering — and
-give the sequence: which process sends what to whom, in what order, and
-what the user then sees. A finding that cannot be stated as a sequence is
-a preference; do not raise it. When the fix is structural — a child order,
+For a process-interaction or lifecycle finding, name the layer violated —
+boundary, lifecycle, ownership, ordering — and give the sequence: which
+process sends what to whom, in what order, and what the user then sees. A
+finding of that kind that cannot be stated as a sequence is a preference;
+do not raise it. Objective defects — a compile error, a misused API, a
+security hole — need no sequence. When the fix is structural — a child
+order,
 a strategy, an owner — say so instead of proposing a guard. State any OTP
 semantic a claim rests on; confident claims about OTP defaults are wrong
 often enough that a reproduction settles them.
