@@ -18,9 +18,12 @@ regression.
 sits and its parent's strategy, never another process deciding for it.
 Strategy follows dependency: `:rest_for_one` where a child needs the one
 before it, `:one_for_one` where children are independent. Child order is
-chosen for start and, in reverse, for stop. A design that needs a retry, a
-stash, a reconcile-on-restart, or a process reaching across trees has the
-ownership or the tree wrong; fix that, not the symptom.
+chosen for start and, in reverse, for stop. A retry, a stash, a
+reconcile-on-restart, or a process reaching across trees that exists to
+compensate for process lifetime being owned in the wrong place means the
+ownership or the tree is wrong; fix that, not the symptom. The same
+mechanisms are legitimate when they answer a transient external failure,
+durable recovery, or backpressure — ask what the mechanism compensates for.
 
 ## Flag these classes
 
@@ -38,9 +41,11 @@ ownership or the tree wrong; fix that, not the symptom.
   when the tree says they should.
 - **A subscription assumed to survive its holder's replacement.** Subscriber
   lists live in the holder's state. Where the tree does not already couple
-  the two lifecycles (siblings under `:rest_for_one` need nothing), the
-  dependency must be a monitor, and the detector reports to whoever owns the
-  outcome rather than acting on a stale snapshot.
+  the two lifecycles — a subscriber ordered after its holder under
+  `:rest_for_one` restarts with it; one ordered before it, or a
+  `:one_for_one` sibling, does not — the dependency must be a monitor, and
+  the detector reports to whoever owns the outcome rather than acting on a
+  stale snapshot.
 - **The wrong process closing a resource.** The owner holds the current
   data; a helper holds the opening snapshot. Only an orphan (owner dead)
   closes itself, and then it emits what the owner would have.
@@ -69,7 +74,12 @@ ownership or the tree wrong; fix that, not the symptom.
   awaiting other processes. What a crash reason must do follows the
   resource's recovery contract: state a replacement restores from a
   checkpoint can be left; an external handle with no such path — a socket,
-  a port, a device stream — closes on every reason.
+  a port, a device stream — closes on every reason `terminate/2` sees. And
+  `terminate/2` is not guaranteed: `:kill`, including a supervisor's forced
+  kill after its shutdown timeout, skips it, so the handle must also be
+  owned by the process (a linked port or socket dies with it) or recoverable
+  by whoever comes next; cleanup that only `terminate/2` performs is a leak
+  waiting for a kill.
 - **A comment declaring a case impossible.** "Can never", "the only
   caller", "already announced" are the claims most often false after a
   refactor and most often hiding a defect. Check them against the code.
@@ -105,8 +115,11 @@ ownership or the tree wrong; fix that, not the symptom.
 - **Cluster or multi-node concerns** in a single-node project. Generator
   boilerplate such as `DNSCluster` is not evidence of a cluster.
 - **Per-subscriber hardening against a shared service's restart** (monitor
-  the PubSub, resubscribe, reconcile) when that service sits above its
-  subscribers in the tree.
+  the PubSub, resubscribe, reconcile) when the supervision topology already
+  restarts the subscribers with the service — ordered after it under
+  `:rest_for_one`, or below it. Where they are independent (`:one_for_one`
+  siblings, different trees), resubscription is a real recovery path and
+  the review should ask for it.
 
 ## Writing a finding
 
