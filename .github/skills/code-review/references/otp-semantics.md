@@ -64,9 +64,10 @@ returns `true`.
 
 ## Exit reasons
 
-A linked or monitoring process reads why another ended from the `EXIT` or
-`DOWN` message: `:normal`, `:shutdown`, `{:shutdown, term}`, or a crash
-reason. The stopping process receives the same reason in `terminate/2`.
+A monitoring process reads why another ended from the `DOWN` message; a
+linked one reads it from `EXIT` only if it traps exits — otherwise a
+`:normal` exit is ignored and any other reason takes it down. The reasons
+are `:normal`, `:shutdown`, `{:shutdown, term}`, or a crash reason. The stopping process receives the same reason in `terminate/2`.
 Nothing further is needed to tell an intentional stop from a failure.
 
 ## Calls, replies, mailboxes
@@ -81,9 +82,9 @@ the server crashes between the two the caller — which monitors it for the
 call — exits at once with the server's reason rather than waiting out its
 timeout. A mailbox is bounded only by memory: a `cast` or `send` producer
 faster than its consumer kills the node by memory with no error at the
-producer. A `call` is implicit back-pressure; deliberate shedding (a
-latest-wins slot, a drop counter) is the alternative, and dropping silently
-is the bug.
+producer. A `call` paces one caller and not the aggregate, so many callers still
+grow the mailbox; the bound is admission control or deliberate shedding (a
+latest-wins slot, a drop counter), and dropping silently is the bug.
 
 ## Message ordering
 
@@ -116,8 +117,9 @@ a callback keeps the server busy for its duration.
 Lookup, dispatch, and register run in the calling process against the
 partition's ETS; the registry process only holds the monitors, and it
 processes a `DOWN` asynchronously. So `Registry.lookup/2` can return a dead
-pid, and a read used to decide whether something is running needs
-`Process.alive?/1` or a wait. Registering is different: a unique
+pid; `Process.alive?/1` filters that stale entry at that instant and no
+more, since the process can exit right after, so a decision that needs the
+target to handle an operation uses a call or a monitor that observes it. Registering is different: a unique
 `Registry.register/3` that collides with a dead holder evicts it and
 retries — the check is `Process.alive?/1` at register time, not a wait for
 the `DOWN` — so only a live holder yields `{:error, {:already_registered,

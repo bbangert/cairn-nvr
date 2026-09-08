@@ -16,8 +16,10 @@ regression.
 
 **The tree owns process lifetime.** Restart behaviour is where a process
 sits and its parent's strategy, never another process deciding for it.
-Strategy follows dependency: `:rest_for_one` where a child needs the one
-before it, `:one_for_one` where children are independent. Child order is
+Strategy expresses restart coupling: `:rest_for_one` where an earlier
+child's replacement invalidates the later ones, `:one_for_one` where each
+recovers on its own — a later child that survives the earlier one's
+replacement through its own recovery does not need restarting with it. Child order is
 chosen for start and, in reverse, for stop. A retry, a stash, a
 reconcile-on-restart, or a process reaching across trees is wrong when it
 compensates for lifetime owned in the wrong place; the same mechanisms are
@@ -50,9 +52,10 @@ asserting any of them.
   `init/1` is right only when a later child must wait for this one.
 - **An unbounded producer into a slower consumer.** A mailbox is bounded
   only by memory, so a `cast` or `send` path with nothing pacing it fails
-  as node memory, with no error where it was sent. A `call` is the default
-  back-pressure; shedding is the deliberate alternative, and silent
-  dropping is the bug.
+  as node memory, with no error where it was sent. A `call` paces one caller,
+  not the aggregate — many callers still grow the mailbox — so the bound
+  is admission control or observable shedding, and silent dropping is the
+  bug.
 - **A restart type or budget that does not say what it means.** A
   `:transient` child does not come back from its own clean stop; a
   `:temporary` one runs once and is forgotten; `:infinity` shutdown on a
@@ -68,9 +71,10 @@ asserting any of them.
   when the tree says they should.
 - **A subscription assumed to survive its holder's replacement.** Subscriber
   lists live in the holder's state. Where the tree does not restart the
-  subscriber with the holder, the dependency must be a monitor, and the
-  detector reports to whoever owns the outcome rather than acting on a
-  stale snapshot.
+  subscriber with the holder, there must be an explicit mechanism — a
+  monitor, a readiness announcement, restoration from durable state — and
+  whoever detects the loss reports to whoever owns the outcome rather than
+  acting on a stale snapshot.
 - **The wrong process closing a record.** A process closes the handle it
   holds when it is done. The record describing the work belongs to the
   process that has been updating it; a helper finalizing it persists the
@@ -90,10 +94,16 @@ asserting any of them.
   consumer that must close cleanly, the consumer records the producer's stop
   as a failure. What must close first goes last in the child list.
 - **A read-path lookup treated as liveness.** A name lookup can return a
-  dead pid; a gate on a name also checks `Process.alive?/1`.
+  dead pid; `Process.alive?/1` filters that stale entry and nothing more,
+  since the process can exit right after. Where correctness depends on the
+  target handling the operation, the protocol is a call or a monitor that
+  observes the outcome, not a check before the act.
 - **`terminate/2` doing less than the normal close, or more than it can.**
-  Trap exits, run the ordinary close in the ordinary order on `:shutdown`,
-  return without awaiting other processes. What a crash reason must do
+  A process that must close on an external `:shutdown` traps exits — and
+  then every linked peer's failure arrives as an `EXIT` message it must
+  handle, where before it would have taken the process down — runs the
+  ordinary close in the ordinary order, and returns without awaiting other
+  processes. What a crash reason must do
   follows the resource's recovery contract, and because a kill skips the
   callback, an external handle must also be owned by the process or
   recoverable by its successor.
@@ -126,7 +136,9 @@ asserting any of them.
   `start_link` from init, or guards on `Process.exit` of a dead pid — see
   the reference; each was asserted in review and shown false by running it.
   A read used to decide whether something is still running is the one
-  place a Registry wait or an alive check is right.
+  place a Registry wait or an alive check belongs, and there it only
+  filters a stale entry; the decision that follows still needs a protocol
+  that observes the target.
 - **Hibernation or a `PartitionSupervisor` without a measurement.** The
   first trades a GC per message for a compact heap, the second shards a
   singleton whose contention has not been shown; both are right after the
