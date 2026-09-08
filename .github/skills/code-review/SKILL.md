@@ -24,18 +24,41 @@ compensates for lifetime owned in the wrong place; the same mechanisms are
 legitimate for transient external failure, durable recovery, or
 backpressure. Ask what the mechanism compensates for.
 
-Runtime facts a finding may rest on — message ordering, Registry, child
-management, strategy coupling, start and stop, exit reasons — are in
-[references/otp-semantics.md](references/otp-semantics.md). Read it before
+Runtime facts a finding may rest on — restart types, shutdown budgets,
+restart intensity, start and continue, exit reasons, calls and mailboxes,
+message ordering, Tasks, Registry, child management, strategy coupling,
+tables and terms, timers — are in
+[references/otp-semantics.md](references/otp-semantics.md), each with the
+production case where the "wrong" choice is right. Read it before
 asserting any of them.
 
 ## Flag these classes
 
+- **A process that does not earn its existence.** A process is justified
+  by a runtime property — concurrency, serialized access to a shared
+  resource, an isolation domain, state that outlives a call — never by code
+  organization or a namespace. A GenServer kept as a serialization point is
+  a legitimate bottleneck; one wrapping pure functions is not.
 - **A call from `init/1` back to the process starting the tree.** A child
   started from inside a server's `handle_call` that calls that server
   deadlocks until timeout. Config reaches a child through start arguments
   or a `:persistent_term`/ETS snapshot, and the same for anything the child
   starts from its own init.
+- **Post-init work that is not `handle_continue`.** Work in `init/1` blocks
+  the starter and, under a supervisor, the start sequence; `{:continue, _}`
+  runs before any message a registered name already attracts. Blocking in
+  `init/1` is right only when a later child must wait for this one.
+- **An unbounded producer into a slower consumer.** A mailbox is bounded
+  only by memory, so a `cast` or `send` path with nothing pacing it fails
+  as node memory, with no error where it was sent. A `call` is the default
+  back-pressure; shedding is the deliberate alternative, and silent
+  dropping is the bug.
+- **A restart type or budget that does not say what it means.** A
+  `:transient` child does not come back from its own clean stop; a
+  `:temporary` one runs once and is forgotten; `:infinity` shutdown on a
+  worker holds the whole tree's teardown; a DynamicSupervisor with no
+  `:max_children` on a per-request path has no ceiling. Each is right
+  somewhere; the review asks whether it was chosen.
 - **A worker that dies with a table or process it does not own.** Callers
   outliving an ETS owner with no heir raise on the missing table; callers of
   a restarting named process exit; on a restore path that is a child failing
@@ -81,6 +104,8 @@ asserting any of them.
   without it. Prefer real processes and timers to stubs and manual firing
   when ordering or duration is under test; synchronize with monitors,
   `assert_receive`, and `:sys.get_state/1`, never `Process.sleep` polling.
+  A guard against calling a named singleton must run against that
+  singleton, not a private instance the lookup never resolves to.
 
 ## Do not suggest these
 
@@ -94,10 +119,16 @@ asserting any of them.
   stopping process receives the same reason in `terminate/2`.
 - **A call in place of a cast** to close a window that ordering does not
   close anyway. Ask whether the outcome inside the window is already honest.
-- **Waits on registry unregistration before a start**, guards against
-  `terminate_child` failing on a down child, timeouts on `start_link` from
-  init, or guards on `Process.exit` of a dead pid — see the reference; each
-  was asserted in review and shown false by running it.
+- **Waits on registry unregistration before a re-register**, guards
+  against `terminate_child` failing on a down child, timeouts on
+  `start_link` from init, or guards on `Process.exit` of a dead pid — see
+  the reference; each was asserted in review and shown false by running it.
+  A read used to decide whether something is still running is the one
+  place a Registry wait or an alive check is right.
+- **Hibernation or a `PartitionSupervisor` without a measurement.** The
+  first trades a GC per message for a compact heap, the second shards a
+  singleton whose contention has not been shown; both are right after the
+  number, not before.
 - **Cluster or multi-node concerns** in a single-node project. Generator
   boilerplate such as `DNSCluster` is not evidence of a cluster.
 - **Per-subscriber hardening against a shared service's restart** where
