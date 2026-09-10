@@ -71,7 +71,7 @@ defmodule Cairn.MixProject do
        depth: 1},
       {:daisyui,
        github: "saadeghi/daisyui",
-       tag: "v5.7.22",
+       tag: "v5.7.29",
        sparse: "packages/bundle",
        app: false,
        compile: false,
