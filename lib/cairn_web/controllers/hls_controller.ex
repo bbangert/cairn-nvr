@@ -12,6 +12,10 @@ defmodule CairnWeb.HLSController do
 
   @playlist_fragments 6
 
+  # Every response here carries an explicit non-HTML content type (an HLS
+  # playlist or fMP4 media) and its body is built from ring-buffer data, not
+  # request input, so sobelow 0.16's XSS.SendResp finding does not apply.
+  # sobelow_skip ["XSS.SendResp"]
   def playlist(conn, %{"camera" => camera_id}) do
     case ring_data(camera_id, @playlist_fragments) do
       {:ok, %{fragments: [_ | _] = frags}} ->
@@ -43,6 +47,7 @@ defmodule CairnWeb.HLSController do
     end
   end
 
+  # sobelow_skip ["XSS.SendResp"]
   def init_segment(conn, %{"camera" => camera_id}) do
     case ring_data(camera_id, 0) do
       {:ok, %{init: init}} when is_binary(init) ->
@@ -56,6 +61,7 @@ defmodule CairnWeb.HLSController do
     end
   end
 
+  # sobelow_skip ["XSS.SendResp"]
   def segment(conn, %{"camera" => camera_id, "segment" => name}) do
     with {seq, ".m4s"} <- Integer.parse(name),
          {:ok, %{fragments: frags}} <- ring_data(camera_id, 100),
