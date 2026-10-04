@@ -115,7 +115,7 @@ defmodule Cairn.MixProject do
       # D-C3: the motion gate's arithmetic — plain BinaryBackend, no EXLA;
       # the gate exists to *skip* heavy work, so it must not need an
       # accelerator (or a native dep) of its own.
-      {:nx, "~> 0.13"},
+      {:nx, "~> 1.0"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:sobelow, "~> 0.14", only: [:dev, :test], runtime: false}
