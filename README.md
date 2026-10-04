@@ -50,7 +50,7 @@ it. Details in `docs/architecture.md`.
 
 ## Running (dev)
 
-Requires Elixir 1.17+, ffmpeg/ffprobe on PATH.
+Requires Elixir 1.19+, ffmpeg/ffprobe on PATH.
 
 ```bash
 mix setup
