@@ -6,6 +6,7 @@
     analysis: "coupling",
     file: "lib/cairn/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Cairn.CameraTracker registers with Cairn.EventExtractor when it starts, and Cairn.EventExtractor keeps a monitor or link for it. Both are children of the one_for_one supervisor Cairn.Application, which restarts either alone. When Cairn.EventExtractor restarts, its init/1 starts it afresh without what Cairn.CameraTracker put there, and Cairn.CameraTracker, which is not restarted with it, never registers again. When Cairn.CameraTracker restarts, it registers a second time beside what its old process left.",
     reason:
@@ -15,6 +16,7 @@
     analysis: "coupling",
     file: "lib/cairn/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Cairn.CameraTracker registers with Cairn.TrackRecorder when it starts, and Cairn.TrackRecorder keeps it in its state. Both are children of the one_for_one supervisor Cairn.Application, which restarts either alone. When Cairn.TrackRecorder restarts, its init/1 starts it afresh without what Cairn.CameraTracker put there, and Cairn.CameraTracker, which is not restarted with it, never registers again. When Cairn.CameraTracker restarts, it registers a second time beside what its old process left.",
     reason:
@@ -24,6 +26,7 @@
     analysis: "coupling",
     file: "lib/cairn/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Cairn.EventExtractor registers with Cairn.Config.Server when it starts, and Cairn.Config.Server keeps it in its state. Both are children of the one_for_one supervisor Cairn.Application, which restarts either alone. When Cairn.Config.Server restarts, its init/1 starts it afresh without what Cairn.EventExtractor put there, and Cairn.EventExtractor, which is not restarted with it, never registers again. When Cairn.EventExtractor restarts, it registers a second time beside what its old process left.",
     reason:
@@ -33,6 +36,7 @@
     analysis: "coupling",
     file: "lib/cairn/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Cairn.EventExtractor registers with Cairn.RingBuffer when it starts, and Cairn.RingBuffer keeps a monitor or link for it. Both are children of the one_for_one supervisor Cairn.Application, which restarts either alone. When Cairn.RingBuffer restarts, its init/1 starts it afresh without what Cairn.EventExtractor put there, and Cairn.EventExtractor, which is not restarted with it, never registers again. When Cairn.EventExtractor restarts, it registers a second time beside what its old process left.",
     reason:
@@ -42,6 +46,7 @@
     analysis: "coupling",
     file: "lib/cairn/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Cairn.PresenceRecorder registers with Cairn.EventExtractor when it starts, and Cairn.EventExtractor keeps a monitor or link for it. Both are children of the one_for_one supervisor Cairn.Application, which restarts either alone. When Cairn.EventExtractor restarts, its init/1 starts it afresh without what Cairn.PresenceRecorder put there, and Cairn.PresenceRecorder, which is not restarted with it, never registers again. When Cairn.PresenceRecorder restarts, it registers a second time beside what its old process left.",
     reason:
@@ -51,6 +56,7 @@
     analysis: "coupling",
     file: "lib/cairn/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Cairn.PresenceRecorder registers with Cairn.PresenceCheckpoint when it starts, and Cairn.PresenceCheckpoint keeps it as an ETS row. Both are children of the one_for_one supervisor Cairn.Application, which restarts either alone. When Cairn.PresenceCheckpoint restarts, its init/1 starts it afresh without what Cairn.PresenceRecorder put there, and Cairn.PresenceRecorder, which is not restarted with it, never registers again. When Cairn.PresenceRecorder restarts, it registers a second time beside what its old process left.",
     reason:
@@ -60,6 +66,7 @@
     analysis: "coupling",
     file: "lib/cairn/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Cairn.SoakMonitor registers with Cairn.Config.Server when it starts, and Cairn.Config.Server keeps it in its state. Both are children of the one_for_one supervisor Cairn.Application, which restarts either alone. When Cairn.Config.Server restarts, its init/1 starts it afresh without what Cairn.SoakMonitor put there, and Cairn.SoakMonitor, which is not restarted with it, never registers again. When Cairn.SoakMonitor restarts, it registers a second time beside what its old process left.",
     reason:
@@ -69,6 +76,7 @@
     analysis: "shutdown",
     file: "lib/cairn/ffmpeg_port.ex",
     title: "terminate/2 does unbounded work inside the shutdown timeout",
+    at_label: "unbounded work inside the shutdown timeout",
     detail:
       "Cairn.FFmpegPort.kill_port/1 calls System.cmd/3 — a port or OS operation — from Cairn.FFmpegPort's terminate/2. The module traps exits, so the callback is reached, but a GenServer child gets only its shutdown timeout (5000ms unless the child spec says otherwise) before the supervisor brutal-kills it. A call with no bound of its own can exceed that, and the cleanup is truncated at whatever point it had reached — often worse than not starting.",
     reason:
@@ -78,6 +86,7 @@
     analysis: "shutdown",
     file: "lib/cairn_web/webrtc/session.ex",
     title: "Children started under another tree outlive their owner",
+    at_label: "start_child onto a supervisor in another tree",
     detail:
       "CairnWeb.WebRTC.Session.start/2 starts children under CairnWeb.WebRTC.Supervisor, a DynamicSupervisor CairnWeb.WebRTCChannel does not sit under. Their lifetime follows CairnWeb.WebRTC.Supervisor's tree, not CairnWeb.WebRTCChannel's: when CairnWeb.WebRTCChannel's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and CairnWeb.WebRTCChannel's terminate/2 does not stop them.",
     reason:
@@ -87,6 +96,7 @@
     analysis: "shutdown",
     file: "lib/cairn_web/webrtc/session.ex",
     title: "terminate/2 does work a supervisor shutdown will skip",
+    at_label: "a supervisor shutdown skips this",
     detail:
       "CairnWeb.WebRTC.Session does not trap exits, so a GenServer shutdown from its supervisor kills it outright and terminate/2 never runs. CairnWeb.WebRTC.Session.terminate/2 calls ExWebRTC.PeerConnection.close/1, which the effect model cannot classify — so this cannot say WHAT is skipped, only that terminate/2 does more than log and none of it will happen on the normal stop path. If that call releases a lease, closes a session or flushes a buffer, it is silently not happening in production.",
     reason:
@@ -96,6 +106,7 @@
     analysis: "failure",
     file: "lib/membrane_rtsp_dual_stream/source.ex",
     title: "Unlinked process spawned",
+    at_label: "spawned here",
     detail:
       "Membrane.RTSPDualStream.Source.stop_client_async/2 spawns a process with bare spawn — no link, no monitor. If the process crashes, nothing observes it: no restart, no log, no cleanup.",
     reason:
@@ -105,6 +116,7 @@
     analysis: "startup",
     file: "lib/cairn/event_extractor.ex",
     title: "init/1 makes a synchronous supervisor call",
+    at_label: "this call blocks init until the supervisor answers",
     detail:
       "Cairn.CameraTracker.init/1 reaches DynamicSupervisor.start_child on Cairn.EventSupervisor. Every supervisor management call is a GenServer.call into the supervisor; start_child in particular does not return until the new child's init/1 has, so those inits now run inside this one, on the tree's startup path. A child that calls back into Cairn.CameraTracker, or into anything not yet started, deadlocks the boot; terminate_child waits for the whole shutdown of the child.",
     reason:
@@ -114,6 +126,7 @@
     analysis: "startup",
     file: "lib/cairn/event_extractor.ex",
     title: "init/1 makes a synchronous supervisor call",
+    at_label: "this call blocks init until the supervisor answers",
     detail:
       "Cairn.PresenceRecorder.init/1 reaches DynamicSupervisor.start_child on Cairn.EventSupervisor. Every supervisor management call is a GenServer.call into the supervisor; start_child in particular does not return until the new child's init/1 has, so those inits now run inside this one, on the tree's startup path. A child that calls back into Cairn.PresenceRecorder, or into anything not yet started, deadlocks the boot; terminate_child waits for the whole shutdown of the child.",
     reason:
@@ -123,6 +136,7 @@
     analysis: "mailbox",
     file: "lib/cairn/native/parity.ex",
     title: "Task.async in library code links to an unknown caller",
+    at_label: "linked task started in library code",
     detail:
       "Cairn.Native.Parity.plugin_run/3 is a plain function, not a process callback, so the task it starts with Task.async is linked to whichever process called it. A caller that traps exits then receives the task's exit as an {:EXIT, pid, :normal} message that Task.await never consumes, and a crashing task takes the caller down with it.",
     reason:
@@ -132,6 +146,7 @@
     analysis: "failure",
     file: "test/support/presence_fixtures.ex",
     title: "Unlinked process spawned",
+    at_label: "spawned here",
     detail:
       "Cairn.PresenceFixtures.relay/1 spawns a process with bare spawn — no link, no monitor. If the process crashes, nothing observes it: no restart, no log, no cleanup.",
     reason:
