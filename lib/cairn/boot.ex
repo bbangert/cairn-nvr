@@ -7,13 +7,15 @@ defmodule Cairn.Boot do
 
   use Task, restart: :transient
 
+  alias Cairn.Config.Server
+
   def start_link(opts) do
     Task.start_link(__MODULE__, :run, [opts])
   end
 
   @doc false
   def run(_opts) do
-    config = Cairn.Config.Server.get()
+    config = Server.get()
     Cairn.Reconciler.run(config)
     Cairn.CameraSupervisor.sync(config)
   end

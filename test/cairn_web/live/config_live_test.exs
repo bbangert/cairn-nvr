@@ -3,6 +3,8 @@ defmodule CairnWeb.ConfigLiveTest do
 
   import Phoenix.LiveViewTest
 
+  alias Cairn.Config.Server
+
   @fixture "test/support/fixtures/configs/valid.yml"
 
   test "renders globals and cameras with masked credentials", %{conn: conn} do
@@ -83,7 +85,7 @@ defmodule CairnWeb.ConfigLiveTest do
 
     on_exit(fn ->
       File.write!(@fixture, original)
-      Cairn.Config.Server.reload()
+      Server.reload()
     end)
 
     {:ok, view, _html} = live(conn, "/config")

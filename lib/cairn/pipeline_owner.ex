@@ -110,7 +110,10 @@ defmodule Cairn.PipelineOwner do
             rebuilt_at_ms: nil,
             # stands in for the ring's last-fragment time until the first
             # fragment exists — see ring_stale?/1
-            pipeline_started_at_ms: nil
+            pipeline_started_at_ms: nil,
+            # the ref the one pending `{:start, ref}` carries; any other is
+            # stale — see enter_backoff/2
+            start_ref: nil
 
   def start_link(opts) do
     cam = Keyword.fetch!(opts, :camera)
@@ -155,9 +158,10 @@ defmodule Cairn.PipelineOwner do
     # Deferred rather than started here: `init/1` blocks the camera's
     # supervisor, and a pipeline whose elements are slow to set up would hold
     # up the whole tree behind it.
-    send(self(), :start)
+    start_ref = make_ref()
+    send(self(), {:start, start_ref})
     schedule_watchdog(state)
-    {:ok, state}
+    {:ok, %{state | start_ref: start_ref}}
   end
 
   # A supervisor restart hands this process the struct its tree was BUILT
@@ -218,9 +222,14 @@ defmodule Cairn.PipelineOwner do
   end
 
   @impl true
-  def handle_info(:start, state) do
+  def handle_info({:start, ref}, %{start_ref: ref} = state) do
     {:noreply, start_pipeline(state, state.restart_reason)}
   end
+
+  # A start superseded by one that already ran — the watchdog's rebuild can
+  # start a pipeline while a backoff's timer is still pending. Taking it would
+  # start a second pipeline over the running one and orphan it.
+  def handle_info({:start, _stale}, state), do: {:noreply, state}
 
   # Our own teardown never lands here — `stop_pipeline/1` demonitors with flush
   # first — so any reason, even :normal, is a pipeline that ended without being
@@ -360,7 +369,8 @@ defmodule Cairn.PipelineOwner do
       set_status(
         %{
           state
-          | init_seen: false,
+          | start_ref: nil,
+            init_seen: false,
             got_fragment: false,
             sources: %{},
             detect_at_ms: nil,
@@ -394,14 +404,18 @@ defmodule Cairn.PipelineOwner do
   defp enter_backoff(state, reason) do
     state = state |> stop_pipeline() |> set_status(:backoff)
     delay = trunc(state.backoff_ms * (0.5 + :rand.uniform()))
-    Process.send_after(self(), :start, delay)
+    # Tagged so only this timer's message starts a pipeline: a rebuild that
+    # starts one first clears `start_ref`, and this one then lands as stale.
+    start_ref = make_ref()
+    Process.send_after(self(), {:start, start_ref}, delay)
 
     %{
       state
       | pipeline: nil,
         pipeline_ref: nil,
         backoff_ms: min(state.backoff_ms * 2, backoff_max(state)),
-        restart_reason: reason
+        restart_reason: reason,
+        start_ref: start_ref
     }
   end
 

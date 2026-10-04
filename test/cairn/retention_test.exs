@@ -1,8 +1,8 @@
 defmodule Cairn.RetentionTest do
   use Cairn.DataCase, async: false
 
-  alias Cairn.Config.Camera
   alias Cairn.{Config, Event, Events, Retention, Tracks}
+  alias Cairn.Config.Camera
 
   setup do
     dir = Path.join(System.tmp_dir!(), "cairn_ret_#{System.unique_integer([:positive])}")

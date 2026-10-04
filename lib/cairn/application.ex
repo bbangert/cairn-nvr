@@ -108,7 +108,7 @@ defmodule Cairn.Application do
     :ok
   end
 
-  defp skip_migrations?() do
+  defp skip_migrations? do
     # Migrations run at boot everywhere (Boot's reconciliation needs the
     # schema); tests migrate via the mix test alias instead
     Application.get_env(:cairn, :skip_boot_migrations, false)

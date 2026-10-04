@@ -21,6 +21,8 @@ defmodule Cairn.CameraControl do
 
   use GenServer
 
+  alias Cairn.Config.Server
+
   @table __MODULE__
   @topic "cameras:control"
   @defaults %{detection_enabled: true, recording_enabled: true, min_score: nil}
@@ -103,7 +105,7 @@ defmodule Cairn.CameraControl do
   @impl true
   def init(_opts) do
     :ets.new(@table, [:named_table, :set, :protected, read_concurrency: true])
-    Cairn.Config.Server.subscribe()
+    Server.subscribe()
     {:ok, %{}}
   end
 
@@ -151,7 +153,7 @@ defmodule Cairn.CameraControl do
   # unnamed one, or one still in `init/1`) cannot say which cameras exist, so
   # it cannot refuse a write.
   defp known?(camera_id) do
-    case Cairn.Config.Server.known_ids() do
+    case Server.known_ids() do
       nil -> true
       known -> MapSet.member?(known, camera_id)
     end

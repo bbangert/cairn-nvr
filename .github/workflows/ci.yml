@@ -12,11 +12,134 @@ permissions:
   contents: read
 
 jobs:
-  ci:
-    name: Compile · Format · Credo · Sobelow · Dialyzer · Test
+  compile:
+    name: Compile · Format
     runs-on: ubuntu-latest
-    # Elixir only. The Rust plugin is a separate crate with its own toolchain
-    # and its own gates — see the `cairn-detect` job below.
+    # Elixir gates run as parallel jobs below, each with its own cache key.
+    # The Rust plugin is a separate crate with its own toolchain and its own
+    # gates — see the `cairn-detect` job below.
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          elixir-version: "1.20"
+          otp-version: "28"
+
+      - name: Cache deps and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: mix-compile-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-compile-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+
+      - run: mix deps.get
+
+      - run: mix compile --warnings-as-errors
+
+      - run: mix format --check-formatted
+
+  credo:
+    name: Credo
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          elixir-version: "1.20"
+          otp-version: "28"
+
+      - name: Cache deps and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: mix-credo-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-credo-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+
+      - run: mix deps.get
+
+      - run: mix credo --strict
+
+  sobelow:
+    name: Sobelow
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          elixir-version: "1.20"
+          otp-version: "28"
+
+      - name: Cache deps and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: mix-sobelow-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-sobelow-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+
+      - run: mix deps.get
+
+      # Config.HTTPS ignored deliberately: cairn's v1 posture is LAN-trusted
+      # plain http with no TLS terminator anywhere in the deployment, and
+      # force_ssl 301'd the vagus panel's webui link into a listener that
+      # doesn't exist (device-proven on the Q6A).
+      - run: mix sobelow --skip --exit --threshold medium --ignore Config.HTTPS
+
+  dialyzer:
+    name: Dialyzer
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          elixir-version: "1.20"
+          otp-version: "28"
+
+      - name: Cache deps and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: mix-dialyzer-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-dialyzer-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+
+      - name: Cache dialyzer PLTs
+        uses: actions/cache@v6
+        with:
+          path: priv/plts
+          key: plt-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            plt-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+
+      - run: mix deps.get
+
+      - run: mix dialyzer --format github
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v7
@@ -37,38 +160,95 @@ jobs:
           path: |
             deps
             _build
-          key: mix-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          key: mix-test-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            mix-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
-
-      - name: Cache dialyzer PLTs
-        uses: actions/cache@v6
-        with:
-          path: priv/plts
-          key: plt-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            plt-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+            mix-test-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
 
       - run: mix deps.get
-
-      - run: mix compile --warnings-as-errors
-
-      - run: mix format --check-formatted
-
-      - run: mix credo
-
-      # Config.HTTPS ignored deliberately: cairn's v1 posture is LAN-trusted
-      # plain http with no TLS terminator anywhere in the deployment, and
-      # force_ssl 301'd the vagus panel's webui link into a listener that
-      # doesn't exist (device-proven on the Q6A).
-      - run: mix sobelow --skip --exit --threshold medium --ignore Config.HTTPS
-
-      - run: mix dialyzer --format github
 
       - run: mix test
 
       - name: Full-pipeline integration test (real ffmpeg)
         run: mix test --only integration
+
+  audit:
+    name: Hex audit · Unused deps
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          elixir-version: "1.20"
+          otp-version: "28"
+
+      - name: Cache deps and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: mix-audit-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-audit-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+
+      - run: mix deps.get
+
+      - run: mix hex.audit
+
+      - run: mix deps.unlock --check-unused
+
+  argus:
+    name: Argus
+    runs-on: ubuntu-24.04
+    # Souffle's PPA package depends on libffi7, which Ubuntu 24.04 no longer
+    # ships; the Install Souffle step adds a checksum-pinned libffi7 first.
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          elixir-version: "1.20"
+          otp-version: "28"
+
+      - name: Install Souffle
+        run: |
+          # Souffle's PPA package links against libffi7, which Ubuntu 24.04
+          # dropped; install the Ubuntu 20.04 build (checksum-pinned) first.
+          curl -fsSLo /tmp/libffi7.deb http://archive.ubuntu.com/ubuntu/pool/main/libf/libffi/libffi7_3.3-4_amd64.deb
+          echo "4584aa8fef1bf5086168ce2f7078cd2ebd78fdc4cc0d86d958d795d4e0b0f50d  /tmp/libffi7.deb" | sha256sum -c -
+          sudo apt-get install -y /tmp/libffi7.deb
+          sudo wget https://souffle-lang.github.io/ppa/souffle-key.public -O /usr/share/keyrings/souffle-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/souffle-archive-keyring.gpg] https://souffle-lang.github.io/ppa/ubuntu/ stable main" | sudo tee /etc/apt/sources.list.d/souffle.list
+          sudo apt-get update
+          sudo apt-get install -y souffle
+
+      - name: Cache deps and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: mix-argus-u2404-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-argus-u2404-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+
+      - run: mix deps.get
+
+      # Compile first so build output never mixes into the JSON report.
+      - run: mix compile
+
+      # No file-level ignores: every finding must be fixed or carry a reviewed
+      # entry in .argus-baseline.exs (see scripts/argus_baseline.exs).
+      - run: mix argus --format json > argus.json
+
+      - run: elixir scripts/argus_baseline.exs --self-test
+
+      - run: elixir scripts/argus_baseline.exs argus.json .argus-baseline.exs
 
   campaign-driver:
     name: HTP campaign driver (mix test)

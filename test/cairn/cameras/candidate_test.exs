@@ -2,6 +2,7 @@ defmodule Cairn.Cameras.CandidateTest do
   use ExUnit.Case, async: true
 
   alias Cairn.Cameras.Candidate
+  alias Cairn.Cameras.Settings
   alias Cairn.Config
 
   @valid_fixture "test/support/fixtures/configs/valid.yml"
@@ -90,7 +91,7 @@ defmodule Cairn.Cameras.CandidateTest do
       assert result.own == ["camera : id is required ([a-z0-9_-], lowercase)"]
       assert result.fleet == []
 
-      {routed, unclaimed} = Cairn.Cameras.Settings.field_errors(result.own, "", [])
+      {routed, unclaimed} = Settings.field_errors(result.own, "", [])
       assert routed["id"] == ["id is required ([a-z0-9_-], lowercase)"]
       assert unclaimed == []
 
@@ -101,7 +102,7 @@ defmodule Cairn.Cameras.CandidateTest do
       assert result.errors == ["camera : id is required ([a-z0-9_-], lowercase)"]
 
       {routed_from_errors, unclaimed_from_errors} =
-        Cairn.Cameras.Settings.field_errors(result.errors, "", [])
+        Settings.field_errors(result.errors, "", [])
 
       assert routed_from_errors["id"] == ["id is required ([a-z0-9_-], lowercase)"]
       assert unclaimed_from_errors == []

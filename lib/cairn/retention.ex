@@ -27,6 +27,7 @@ defmodule Cairn.Retention do
   require Logger
 
   alias Cairn.{Config, Events, Tracks}
+  alias Cairn.Config.Server
 
   @topic "system:alerts"
   @prune_interval_ms :timer.hours(1)
@@ -58,7 +59,7 @@ defmodule Cairn.Retention do
     state = %{
       opts: opts,
       alert: %{active: false},
-      config_fun: Keyword.get(opts, :config_fun, &Cairn.Config.Server.get/0),
+      config_fun: Keyword.get(opts, :config_fun, &Server.get/0),
       free_space_fun: Keyword.get(opts, :free_space_fun, &free_space_bytes/1)
     }
 

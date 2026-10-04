@@ -133,7 +133,10 @@ defmodule CairnWeb.WebRTC.Session do
            }),
          {:ok, answer} <- PeerConnection.create_answer(state.pc),
          :ok <- PeerConnection.set_local_description(state.pc, answer) do
-      timer = Process.send_after(self(), :gather_timeout, @gather_timeout_ms)
+      # `:erlang.start_timer/3` rather than `Process.send_after/3`: its message
+      # carries the timer's own ref, so a timeout that was already delivered
+      # when `reply_answer/1` cancelled it is told apart from the current one.
+      timer = :erlang.start_timer(@gather_timeout_ms, self(), :gather_timeout)
       {:noreply, %{state | await_from: from, gather_timer: timer}}
     else
       error ->
@@ -203,7 +206,8 @@ defmodule CairnWeb.WebRTC.Session do
 
   # Gathering didn't finish in time: answer with whatever we have (LAN host
   # candidates are effectively immediate, so this rarely fires).
-  def handle_info(:gather_timeout, %{await_from: from} = state) when not is_nil(from) do
+  def handle_info({:timeout, timer, :gather_timeout}, %{gather_timer: timer} = state)
+      when not is_nil(timer) do
     {:noreply, reply_answer(state)}
   end
 
@@ -220,7 +224,9 @@ defmodule CairnWeb.WebRTC.Session do
     PeerConnection.close(state.pc)
     :ok
   catch
-    _, _ -> :ok
+    # The PeerConnection is linked and may already be gone (or stopping) —
+    # closing it is then a call that exits, and there is nothing left to close.
+    :exit, _ -> :ok
   end
 
   # Reply to the deferred non-trickle offer with the fully-gathered answer.

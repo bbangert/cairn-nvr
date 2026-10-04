@@ -10,6 +10,7 @@ defmodule Cairn.TrackerTest do
   alias Cairn.Track
   alias Cairn.Tracker
   alias Cairn.Tracker.Bbd
+  alias Cairn.Tracker.Reid
   alias Membrane.MOTTracker.Kalman
 
   @max_unseen 3_000
@@ -4223,7 +4224,7 @@ defmodule Cairn.TrackerTest do
       after_adopt = tracker.objects[id][:embedding]
       assert is_list(after_adopt)
       refute after_adopt == before_cut
-      assert after_adopt != Cairn.Tracker.Reid.dequant(int8_axis(1))
+      assert after_adopt != Reid.dequant(int8_axis(1))
     end
 
     test "the veto keeps a coasted identity from taking a stranger" do

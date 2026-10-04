@@ -13,6 +13,8 @@ defmodule Cairn.NativeStub do
 
   @behaviour Cairn.Native.Engine
 
+  alias Cairn.Native.Host
+
   @control {:native_stub, :control}
 
   @impl true
@@ -106,7 +108,7 @@ defmodule Cairn.NativeStub do
     meta =
       Map.take(frame, [:width, :height, :orig_width, :orig_height, :pts, :observed_at_ms, :motion])
 
-    Cairn.Native.Host.push_frame(host, camera_id, frame.payload, meta, {1, 90_000})
+    Host.push_frame(host, camera_id, frame.payload, meta, {1, 90_000})
   end
 
   defp notify(message) do
