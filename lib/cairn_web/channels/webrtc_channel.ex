@@ -10,11 +10,12 @@ defmodule CairnWeb.WebRTCChannel do
 
   use Phoenix.Channel
 
+  alias Cairn.Config.Server
   alias CairnWeb.WebRTC.Session
 
   @impl true
   def join("webrtc:" <> camera_id, _params, socket) do
-    with {:ok, _cam} <- Cairn.Config.Server.camera(camera_id),
+    with {:ok, _cam} <- Server.camera(camera_id),
          {:ok, session} <- Session.start(camera_id, self()) do
       {:ok, assign(socket, :session, session)}
     else

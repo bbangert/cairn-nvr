@@ -12,12 +12,14 @@ defmodule Cairn.SnapshotHelpers do
   restore is per-test.
   """
 
+  alias Cairn.Config.Server
+
   @doc "Names `ids` in the application snapshot until the test ends."
   @spec lend_cameras(String.t() | [String.t()]) :: :ok
   def lend_cameras(ids) do
-    key = Cairn.Config.Server.snapshot_key(Cairn.Config.Server)
+    key = Server.snapshot_key(Cairn.Config.Server)
     restore = :persistent_term.get(key, nil)
-    config = restore || Cairn.Config.Server.get()
+    config = restore || Server.get()
     present = MapSet.new(config.cameras ++ config.dormant, & &1.id)
 
     # Append, and drop ids the snapshot already names: a real camera stays

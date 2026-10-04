@@ -13,6 +13,8 @@ defmodule Cairn.RTPHub do
 
   use GenServer
 
+  alias Cairn.RTP.H264
+
   # bounds memory if a camera emits pathological GOPs (~4096 * ~1200B ≈ 5MB)
   @max_gop_packets 4096
 
@@ -55,7 +57,7 @@ defmodule Cairn.RTPHub do
 
   defp update_gop(state, packet) do
     cond do
-      Cairn.RTP.H264.keyframe_start?(packet.payload) and packet.timestamp != state.gop_ts ->
+      H264.keyframe_start?(packet.payload) and packet.timestamp != state.gop_ts ->
         %{state | gop: [packet], gop_count: 1, gop_ts: packet.timestamp}
 
       state.gop_count >= @max_gop_packets ->

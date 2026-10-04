@@ -3,6 +3,7 @@ defmodule CairnWeb.TracksLiveTest do
 
   import Phoenix.LiveViewTest
 
+  alias Cairn.Events.Event
   alias Cairn.Tracks
 
   @filters %{"camera" => "", "label" => "", "zone" => "", "from" => "", "to" => ""}
@@ -36,7 +37,7 @@ defmodule CairnWeb.TracksLiveTest do
   # around a track, which the capture pipeline's writers do not expose.
   defp clip(camera_id, started_at, ended_at) do
     %Cairn.Events.Event{}
-    |> Cairn.Events.Event.changeset(%{
+    |> Event.changeset(%{
       id: Ecto.UUID.generate(),
       camera_id: camera_id,
       started_at: started_at,

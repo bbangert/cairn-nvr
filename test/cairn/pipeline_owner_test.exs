@@ -147,6 +147,20 @@ defmodule Cairn.PipelineOwnerTest do
       assert :sys.get_state(owner).pipeline == pipeline
     end
 
+    # A backoff's timer can still be pending when the watchdog's rebuild has
+    # already started a pipeline; its start must not build a second one over
+    # the running one.
+    test "a superseded start is dropped rather than starting a second pipeline" do
+      cam = camera(uid("ps"))
+      owner = start_owner(cam)
+
+      assert_receive {:pipeline_started, pipeline, _opts}, 2_000
+      send(owner, {:start, make_ref()})
+
+      refute_receive {:pipeline_started, _pid, _opts}, 300
+      assert :sys.get_state(owner).pipeline == pipeline
+    end
+
     @tag :capture_log
     test "a crash is a backoff and a fresh pipeline under :source_lost" do
       cam = camera(uid("pc"))

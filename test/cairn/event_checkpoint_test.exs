@@ -4,6 +4,7 @@ defmodule Cairn.EventCheckpointTest do
   # snapshot the write check reads is process-global.
   use ExUnit.Case, async: false
 
+  alias Cairn.Config.Server
   alias Cairn.Event
   alias Cairn.EventCheckpoint
 
@@ -118,23 +119,23 @@ defmodule Cairn.EventCheckpointTest do
       changed: [],
       refreshed: [],
       server: Cairn.Config.Server,
-      known: Cairn.Config.Server.known_ids()
+      known: Server.known_ids()
     }
   end
 
-  defp without(id), do: MapSet.delete(Cairn.Config.Server.known_ids(), id)
-  defp with_id(id), do: MapSet.put(Cairn.Config.Server.known_ids(), id)
+  defp without(id), do: MapSet.delete(Server.known_ids(), id)
+  defp with_id(id), do: MapSet.put(Server.known_ids(), id)
 
   # The published snapshot is the application's, so both helpers restore it.
   defp with_snapshot_naming(id, fun) do
-    config = Cairn.Config.Server.get()
+    config = Server.get()
     swap_snapshot(%{config | cameras: [%Cairn.Config.Camera{id: id} | config.cameras]}, fun)
   end
 
   defp without_snapshot(fun), do: swap_snapshot(nil, fun)
 
   defp swap_snapshot(config, fun) do
-    key = Cairn.Config.Server.snapshot_key(Cairn.Config.Server)
+    key = Server.snapshot_key(Cairn.Config.Server)
     restore = :persistent_term.get(key, nil)
 
     try do

@@ -2,10 +2,10 @@ defmodule Cairn.CamerasTest do
   # async: false — this file will later host a private Config.Server.
   use Cairn.DataCase, async: false
 
+  alias Cairn.CameraControl
   alias Cairn.Cameras
   alias Cairn.Cameras.Camera
   alias Cairn.Cameras.Setting
-  alias Cairn.CameraControl
   alias Cairn.CameraStatus
   alias Cairn.Config
   alias Cairn.ConfigSource

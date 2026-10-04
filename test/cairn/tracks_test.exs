@@ -4,6 +4,7 @@ defmodule Cairn.TracksTest do
   # async sandboxing is not recommended outside PostgreSQL.
   use Cairn.DataCase, async: false
 
+  alias Cairn.Events.Event
   alias Cairn.Tracks
   alias Cairn.Tracks.TrackEvent
 
@@ -158,7 +159,7 @@ defmodule Cairn.TracksTest do
     # expose.
     defp clip(camera_id, started_at, ended_at) do
       %Cairn.Events.Event{}
-      |> Cairn.Events.Event.changeset(%{
+      |> Event.changeset(%{
         id: Ecto.UUID.generate(),
         camera_id: camera_id,
         started_at: started_at,

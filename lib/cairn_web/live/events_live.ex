@@ -15,6 +15,7 @@ defmodule CairnWeb.EventsLive do
 
   use CairnWeb, :live_view
 
+  alias Cairn.Config.Server
   alias Cairn.{Event, Events}
 
   @page_size 25
@@ -242,7 +243,7 @@ defmodule CairnWeb.EventsLive do
     end
   end
 
-  defp camera_ids, do: Enum.map(Cairn.Config.Server.get().cameras, & &1.id)
+  defp camera_ids, do: Enum.map(Server.get().cameras, & &1.id)
 
   defp filters_active?(filters) do
     Enum.any?([filters.camera, filters.label, filters.from, filters.to], &(&1 != ""))

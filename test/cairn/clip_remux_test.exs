@@ -20,7 +20,7 @@ defmodule Cairn.ClipRemuxTest do
 
   import ExUnit.CaptureLog, only: [capture_log: 1]
 
-  alias Cairn.{ClipRemux, MP4Boxes, MP4.Demuxer}
+  alias Cairn.{ClipRemux, MP4.Demuxer, MP4Boxes}
 
   # Fragments 0/3/6 are keyframe-headed; the GOP spans three fragments. See
   # `mix cairn.gen.fixtures`.
