@@ -4,6 +4,7 @@ error[E0423]: cannot initialize a tuple struct which contains private fields
   |         NormBox(b)
   |         ^^^^^^^
   |
+  = note: a struct named `NormBox` exists in another namespace
 note: constructor is not visible here due to private fields
  --> tests/ui/support/../../../src/infer/geometry.rs
   |
