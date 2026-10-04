@@ -120,7 +120,7 @@
     detail:
       "Cairn.CameraTracker.init/1 reaches DynamicSupervisor.start_child on Cairn.EventSupervisor. Every supervisor management call is a GenServer.call into the supervisor; start_child in particular does not return until the new child's init/1 has, so those inits now run inside this one, on the tree's startup path. A child that calls back into Cairn.CameraTracker, or into anything not yet started, deadlocks the boot; terminate_child waits for the whole shutdown of the child.",
     reason:
-      "Benign: the start_child is reached only when restoring an event from the checkpoint. Cairn.EventSupervisor is started before every camera tree, and EventExtractor.init/1 never calls back into the tracker (it reads Config.Server and the camera's RingBuffer), so it cannot deadlock the boot."
+      "False positive (call-graph edge, not an execution path): CameraTracker.init/1 only stores the `&start_extractor/3` callback in state and calls restore_from_checkpoint/1, which either ends an orphaned checkpointed event (end_orphan/2) or monitors and re-owns the still-running extractor via EventExtractor.owner/2 (a cast). EventExtractor.start/3 (DynamicSupervisor.start_child) runs only later, when a tracked batch cast (handle_cast/2) carries evidence that opens a new event (start_event/5 -> open_event/5 -> state.start_extractor), never during init/1."
   },
   %{
     analysis: "startup",
@@ -130,7 +130,7 @@
     detail:
       "Cairn.PresenceRecorder.init/1 reaches DynamicSupervisor.start_child on Cairn.EventSupervisor. Every supervisor management call is a GenServer.call into the supervisor; start_child in particular does not return until the new child's init/1 has, so those inits now run inside this one, on the tree's startup path. A child that calls back into Cairn.PresenceRecorder, or into anything not yet started, deadlocks the boot; terminate_child waits for the whole shutdown of the child.",
     reason:
-      "Benign: the start_child is reached only when restoring an event from the checkpoint. Cairn.EventSupervisor is started before every camera tree, and EventExtractor.init/1 never calls back into the recorder (it reads Config.Server and the camera's RingBuffer), so it cannot deadlock the boot."
+      "Deliberate and safe: unlike CameraTracker this edge is real. PresenceRecorder.init/1 -> restore/1 -> adopt_announced/1 -> admit -> launch_extractor/2 calls EventExtractor.start/3 (DynamicSupervisor.start_child) when the PresenceLedger holds announced keys that have no event after a restart. Cairn.EventSupervisor is started before Cairn.CameraSupervisor in Cairn.Application, EventExtractor.init/1 never calls back into the recorder (it reads Config.Server and the camera's RingBuffer), and launch_extractor/2 catches the exit of a restarting supervisor, so it cannot deadlock or crash-loop the boot."
   },
   %{
     analysis: "mailbox",
