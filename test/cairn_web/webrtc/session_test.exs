@@ -54,6 +54,34 @@ defmodule CairnWeb.WebRTC.SessionTest do
     assert_receive {:DOWN, ^ref, :process, ^session, :normal}, 2_000
   end
 
+  # A gather timeout already delivered when its timer was cancelled must not
+  # answer the *next* deferred offer: only the current timer's ref does.
+  test "a stale gather timeout does not answer the current deferred offer" do
+    # The session answers from this peer's local description. Its gathering
+    # notifications come to the test, not the session, so nothing but the
+    # timeouts sent below can complete the deferred offer.
+    {browser, _offer} = browser_offer()
+    session = start_supervised!({Session, camera_id: "cam_a", owner: self()})
+
+    stale_ref = make_ref()
+    current_ref = make_ref()
+    tag = make_ref()
+    test = self()
+
+    # A deferred offer awaiting gathering, armed with the current timer.
+    :sys.replace_state(session, fn state ->
+      %{state | pc: browser, await_from: {test, tag}, gather_timer: current_ref}
+    end)
+
+    send(session, {:timeout, stale_ref, :gather_timeout})
+    refute_receive {^tag, _reply}, 200
+    assert %{await_from: {^test, ^tag}} = :sys.get_state(session)
+
+    send(session, {:timeout, current_ref, :gather_timeout})
+    assert_receive {^tag, {:ok, answer_sdp}}, 1_000
+    assert answer_sdp =~ "H264"
+  end
+
   describe "WHEP (self-owned, non-trickle)" do
     defp start_whep(whep_id) do
       start_supervised!(
