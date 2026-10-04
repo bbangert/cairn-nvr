@@ -147,20 +147,6 @@ defmodule Cairn.PipelineOwnerTest do
       assert :sys.get_state(owner).pipeline == pipeline
     end
 
-    # A backoff's timer can still be pending when the watchdog's rebuild has
-    # already started a pipeline; its start must not build a second one over
-    # the running one.
-    test "a superseded start is dropped rather than starting a second pipeline" do
-      cam = camera(uid("ps"))
-      owner = start_owner(cam)
-
-      assert_receive {:pipeline_started, pipeline, _opts}, 2_000
-      send(owner, {:start, make_ref()})
-
-      refute_receive {:pipeline_started, _pid, _opts}, 300
-      assert :sys.get_state(owner).pipeline == pipeline
-    end
-
     @tag :capture_log
     test "a crash is a backoff and a fresh pipeline under :source_lost" do
       cam = camera(uid("pc"))
@@ -566,6 +552,34 @@ defmodule Cairn.PipelineOwnerTest do
       assert_receive {:pipeline_started, second, opts}, 2_000
       assert second != first
       assert opts[:initial_reason] == :stall_bounce
+    end
+
+    # The race the start ref closes: a crash leaves a backoff `:start` timer
+    # pending, and the watchdog's rebuild starts a pipeline before it fires.
+    # Without the ref the late timer would start a second pipeline over the
+    # rebuilt one and orphan it.
+    @tag :capture_log
+    test "a backoff start still pending when a rebuild runs does not start a second pipeline" do
+      cam = camera(uid("ps"), ingest: :rtsp)
+      stale_ring(cam.id)
+
+      # backoff delay = 1_500 * (0.5..1.5): the timer fires 750..2_250 ms after
+      # the crash, well after the 50 ms watchdog has rebuilt.
+      owner =
+        start_owner(cam, watchdog_interval_ms: 50, backoff_min_ms: 1_500, backoff_max_ms: 1_500)
+
+      assert_receive {:pipeline_started, first, _opts}, 2_000
+      Process.exit(first, :kill)
+      assert_receive {:status, _id, :backoff}, 2_000
+
+      # The source reports itself connected while the ring stays stale: the
+      # next watchdog tick rebuilds, ahead of the pending backoff timer.
+      send(owner, {:stream_connected, :main, []})
+      assert_receive {:pipeline_started, rebuilt, opts}, 2_000
+      assert opts[:initial_reason] == :stall_bounce
+
+      refute_receive {:pipeline_started, _pid, _opts}, 2_500
+      assert :sys.get_state(owner).pipeline == rebuilt
     end
 
     @tag :capture_log
