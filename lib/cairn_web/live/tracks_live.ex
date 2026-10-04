@@ -15,6 +15,7 @@ defmodule CairnWeb.TracksLive do
 
   use CairnWeb, :live_view
 
+  alias Cairn.Config.Server
   alias Cairn.Tracks
   alias CairnWeb.EventsLive
   alias CairnWeb.TrackMoments
@@ -233,7 +234,7 @@ defmodule CairnWeb.TracksLive do
     end
   end
 
-  defp camera_ids, do: Enum.map(Cairn.Config.Server.get().cameras, & &1.id)
+  defp camera_ids, do: Enum.map(Server.get().cameras, & &1.id)
 
   defp filters_active?(filters) do
     Enum.any?(

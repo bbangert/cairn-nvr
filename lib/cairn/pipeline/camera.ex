@@ -76,6 +76,7 @@ defmodule Cairn.Pipeline.Camera do
 
   require Membrane.Logger
 
+  alias Cairn.Config
   alias Cairn.Detect.SparseTrack
   alias Cairn.Motion
 
@@ -278,7 +279,7 @@ defmodule Cairn.Pipeline.Camera do
   # as every camera has: nothing about this path changes for a camera that has
   # one stream.
   defp detect_head(camera, ingest, reason, rtsp) do
-    case Cairn.Config.Camera.detect_role(camera) do
+    case Config.Camera.detect_role(camera) do
       :main -> get_child(:tee)
       :sub -> sub_head(camera, ingest, reason, rtsp)
     end

@@ -15,6 +15,7 @@ defmodule CairnWeb.StreamChannel do
 
   use Phoenix.Channel
 
+  alias Cairn.Config.Server
   alias Cairn.RingBuffer
 
   @high_water 8
@@ -28,7 +29,7 @@ defmodule CairnWeb.StreamChannel do
     # back a ring the registry has not reaped yet, and a via-tuple call on a
     # dead pid exits — this `else` matches values, so the join would crash
     # instead of answering "camera offline".
-    with {:ok, _cam} <- Cairn.Config.Server.camera(camera_id),
+    with {:ok, _cam} <- Server.camera(camera_id),
          ring when is_pid(ring) <- Cairn.Registry.whereis(camera_id, :ring_buffer),
          {:ok, %{codec: codec} = data} <- RingBuffer.fetch_recent_safe(camera_id, 3) do
       Phoenix.PubSub.subscribe(Cairn.PubSub, RingBuffer.topic(camera_id))

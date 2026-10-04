@@ -15,6 +15,8 @@ defmodule Cairn.PresenceRecorderRestoreTest do
 
   import Cairn.PresenceFixtures, only: [frame: 1, object: 4, relay: 1, relay_loop: 1]
 
+  alias Cairn.MP4.Demuxer
+
   alias Cairn.{
     CameraControl,
     Event,
@@ -1163,8 +1165,8 @@ defmodule Cairn.PresenceRecorderRestoreTest do
   # which would say nothing about who finalized it.
   defp fill_ring(camera_id) do
     {_demuxer, events} =
-      Cairn.MP4.Demuxer.push(
-        Cairn.MP4.Demuxer.new(camera_id),
+      Demuxer.push(
+        Demuxer.new(camera_id),
         File.read!("test/support/fixtures/media/testsrc.fmp4")
       )
 

@@ -10,7 +10,10 @@ defmodule Membrane.MOTTrackerTest do
   alias Membrane.Testing
 
   # Returns whatever actions the test hands it, so a batch — or a buffer that
-  # breaks the metadata contract — can be scripted exactly.
+  # breaks the metadata contract — can be scripted exactly. Actions that arrive
+  # before the element is playing are held until it is: `start_pipeline/2`
+  # notifies the stream format straight after the pipeline starts, and an
+  # action from a stopped element would crash the pipeline.
   defmodule ScriptSource do
     @moduledoc false
     use Membrane.Source
@@ -18,11 +21,18 @@ defmodule Membrane.MOTTrackerTest do
     def_output_pad(:output, accepted_format: _any, flow_control: :push)
 
     @impl true
-    def handle_init(_ctx, _opts), do: {[], %{}}
+    def handle_init(_ctx, _opts), do: {[], %{pending: []}}
 
     @impl true
+    def handle_playing(_ctx, state), do: {state.pending, %{state | pending: []}}
+
+    @impl true
+    def handle_parent_notification(actions, %{playback: :playing}, state)
+        when is_list(actions),
+        do: {actions, state}
+
     def handle_parent_notification(actions, _ctx, state) when is_list(actions),
-      do: {actions, state}
+      do: {[], %{state | pending: state.pending ++ actions}}
   end
 
   # A core whose every output is a function of how many objects it has ever

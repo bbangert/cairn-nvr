@@ -11,6 +11,7 @@ defmodule Cairn.Tracker.Stage.BbdTest do
   use ExUnit.Case, async: true
 
   alias Cairn.Tracker.Batch
+  alias Cairn.Tracker.Reid
   alias Cairn.Tracker.Stage
 
   # Predicted box 0.05 × 0.1; the detection sits 0.2 to the right — zero
@@ -115,7 +116,7 @@ defmodule Cairn.Tracker.Stage.BbdTest do
       )
     end
 
-    defp rolling(index), do: Cairn.Tracker.Reid.dequant(feature(index))
+    defp rolling(index), do: Reid.dequant(feature(index))
 
     test "a geometry-admitted pair with clashing appearance is vetoed" do
       %Cairn.Tracker.Batch{assignment: {assignments, _, _}} =
