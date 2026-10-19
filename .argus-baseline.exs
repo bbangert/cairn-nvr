@@ -85,16 +85,6 @@
   %{
     analysis: "shutdown",
     file: "lib/cairn_web/webrtc/session.ex",
-    title: "Children started under another tree outlive their owner",
-    at_label: "start_child onto a supervisor in another tree",
-    detail:
-      "CairnWeb.WebRTC.Session.start/2 starts children under CairnWeb.WebRTC.Supervisor, a DynamicSupervisor CairnWeb.WebRTCChannel does not sit under. Their lifetime follows CairnWeb.WebRTC.Supervisor's tree, not CairnWeb.WebRTCChannel's: when CairnWeb.WebRTCChannel's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and CairnWeb.WebRTCChannel's terminate/2 does not stop them.",
-    reason:
-      "Deliberate: WebRTC sessions live under the capped CairnWeb.WebRTC.Supervisor on purpose (a signaling flood cannot exhaust recording or the machine). A channel-owned session monitors its owner and stops `:normal` on its DOWN, so it never outlives the channel; WHEP sessions have no owner by design and are reaped by DELETE or the connect deadline."
-  },
-  %{
-    analysis: "shutdown",
-    file: "lib/cairn_web/webrtc/session.ex",
     title: "terminate/2 does work a supervisor shutdown will skip",
     at_label: "a supervisor shutdown skips this",
     detail:
@@ -118,7 +108,7 @@
     title: "Task.async in library code links to an unknown caller",
     at_label: "linked task started in library code",
     detail:
-      "Cairn.Native.Parity.plugin_run/3 is a plain function, not a process callback, so the task it starts with Task.async is linked to whichever process called it. A caller that traps exits then receives the task's exit as an {:EXIT, pid, :normal} message that Task.await never consumes, and a crashing task takes the caller down with it.",
+      "Cairn.Native.Parity.plugin_run/3 is a plain function, not a process callback, so the task it starts with Task.async is linked to whichever process called it. A caller that traps exits then receives the task's exit as an {:EXIT, pid, :normal} message that collecting the task (Task.await, Task.yield) never consumes, and a crashing task takes the caller down with it.",
     reason:
       "Deliberate: Cairn.Native.Parity is an offline comparison harness driven by `mix cairn.parity` and its tests, not runtime code; plugin_run/3 awaits the feed task inline (Task.await :infinity) and no caller traps exits, so the link is the intended crash propagation."
   },
