@@ -113,26 +113,6 @@
       "Deliberate: the stopper must outlive the source element that is tearing down (a link would kill it with the element, defeating the point), and this Membrane plugin is Cairn-agnostic, so there is no Cairn.TaskSupervisor to start it under. It monitors its own worker (spawn_monitor) and its only job is a 3s-bounded stop-then-kill of the RTSP client."
   },
   %{
-    analysis: "startup",
-    file: "lib/cairn/event_extractor.ex",
-    title: "init/1 makes a synchronous supervisor call",
-    at_label: "this call blocks init until the supervisor answers",
-    detail:
-      "Cairn.CameraTracker.init/1 reaches DynamicSupervisor.start_child on Cairn.EventSupervisor. Every supervisor management call is a GenServer.call into the supervisor; start_child in particular does not return until the new child's init/1 has, so those inits now run inside this one, on the tree's startup path. A child that calls back into Cairn.CameraTracker, or into anything not yet started, deadlocks the boot; terminate_child waits for the whole shutdown of the child.",
-    reason:
-      "False positive (call-graph edge, not an execution path): CameraTracker.init/1 only stores the `&start_extractor/3` callback in state and calls restore_from_checkpoint/1, which either ends an orphaned checkpointed event (end_orphan/2) or monitors and re-owns the still-running extractor via EventExtractor.owner/2 (a cast). EventExtractor.start/3 (DynamicSupervisor.start_child) runs only later, when a tracked batch cast (handle_cast/2) carries evidence that opens a new event (start_event/5 -> open_event/5 -> state.start_extractor), never during init/1."
-  },
-  %{
-    analysis: "startup",
-    file: "lib/cairn/event_extractor.ex",
-    title: "init/1 makes a synchronous supervisor call",
-    at_label: "this call blocks init until the supervisor answers",
-    detail:
-      "Cairn.PresenceRecorder.init/1 reaches DynamicSupervisor.start_child on Cairn.EventSupervisor. Every supervisor management call is a GenServer.call into the supervisor; start_child in particular does not return until the new child's init/1 has, so those inits now run inside this one, on the tree's startup path. A child that calls back into Cairn.PresenceRecorder, or into anything not yet started, deadlocks the boot; terminate_child waits for the whole shutdown of the child.",
-    reason:
-      "Deliberate and safe: unlike CameraTracker this edge is real. PresenceRecorder.init/1 -> restore/1 -> adopt_announced/1 -> admit -> launch_extractor/2 calls EventExtractor.start/3 (DynamicSupervisor.start_child) when the PresenceLedger holds announced keys that have no event after a restart. Cairn.EventSupervisor is started before Cairn.CameraSupervisor in Cairn.Application, EventExtractor.init/1 never calls back into the recorder (it reads Config.Server and the camera's RingBuffer), and launch_extractor/2 catches the exit of a restarting supervisor, so it cannot deadlock or crash-loop the boot."
-  },
-  %{
     analysis: "mailbox",
     file: "lib/cairn/native/parity.ex",
     title: "Task.async in library code links to an unknown caller",
