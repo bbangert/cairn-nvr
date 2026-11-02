@@ -83,7 +83,7 @@ defmodule Cairn.MixProject do
       {:dns_cluster, "~> 0.3.0"},
       {:bandit, "~> 1.5"},
       {:yaml_elixir, "~> 2.11"},
-      {:ex_webrtc, "~> 0.17.0"},
+      {:ex_webrtc, "~> 0.18.0"},
       # Membrane pipeline (all Apache-2.0)
       {:membrane_core, "~> 1.3.4"},
       # membrane_core → ratio 4.0.1 caps its *optional* decimal dep at ~> 2.0
