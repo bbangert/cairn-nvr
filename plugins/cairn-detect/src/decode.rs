@@ -1422,8 +1422,8 @@ fn pack_as<T: Copy + Default>(
         }
         TensorLayout::Nhwc => {
             if let Some(pad) = pad {
-                for px in tensor.chunks_exact_mut(3) {
-                    px.copy_from_slice(&pad);
+                for px in tensor.as_chunks_mut::<3>().0 {
+                    *px = pad;
                 }
             }
             place(&mut tensor, plane, stride, fit, spec, &encode, |p, at| {
