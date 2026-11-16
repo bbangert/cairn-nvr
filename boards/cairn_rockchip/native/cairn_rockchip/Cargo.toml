@@ -5,8 +5,8 @@ edition = "2021"
 rust-version = "1.88"
 publish = false
 
-# `cdylib` is the NIF library the BEAM loads; `rlib` lets the probe binary
-# link this crate.
+# `cdylib` is the NIF library the BEAM loads; `rlib` is how the probe binary
+# reaches the `rknn` backend it registers.
 [lib]
 crate-type = ["cdylib", "rlib"]
 
@@ -15,7 +15,9 @@ name = "cairn-rockchip-probe"
 path = "src/bin/cairn-rockchip-probe.rs"
 
 [dependencies]
+anyhow = "1.0"
 cairn-detect = { path = "../../../../plugins/cairn-detect" }
+libloading = "0.8"
 rustler = "0.38"
 
 [features]

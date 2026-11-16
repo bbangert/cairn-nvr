@@ -1382,8 +1382,9 @@ fn pack(plane: &[u8], stride: usize, fit: Fit, spec: InputSpec) -> TensorValues 
         })),
         // The same loop over a per-channel byte->code table
         // (`quantized_lut`): the quantizer has 256 inputs per channel, so the
-        // pixel loop is a lookup — and for RawBgr with identity qparams
-        // (the 0..255 case) the table degenerates to a pure byte shuffle.
+        // pixel loop is a lookup — and under the encoding's `pixel_quant`
+        // (RawBgr's 0..255 case, or an artifact fed pixel bytes) the table
+        // is the identity, a pure byte shuffle.
         Some(quant) => {
             let luts: [[u8; 256]; 3] = std::array::from_fn(|p| packing.quantized_lut(p, quant));
             TensorValues::U8(pack_as(plane, stride, fit, spec, |p, byte| {

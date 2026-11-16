@@ -51,7 +51,9 @@ pub(super) const MAX_DETS: usize = 32;
 pub use backend::{BackendKind, QnnOptions};
 // The backend seam, for a board library implementing `Backend` outside this
 // crate and opening a detector over it with `Detector::with_backend`.
-pub use backend::{Backend, InputTensor, ModelIo, RknnOptions, SessionOptions, Tensors};
+pub use backend::{
+    Backend, InputElement, InputTensor, ModelIo, RknnOptions, SessionOptions, Tensors,
+};
 pub use baseline::{
     cpu_baseline_ms, measure_cpu_baseline, open_baseline_detector, BASELINE_PASSES,
 };

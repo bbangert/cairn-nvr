@@ -27,7 +27,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use super::backend::onnxruntime::OrtBackend;
-use super::backend::{Backend, BackendKind, InputTensor, SessionOptions};
+use super::backend::{Backend, BackendKind, InputElement, InputTensor, SessionOptions};
 use super::encoding::{TensorEncoding, TensorLayout, TensorValues};
 use super::geometry::{InputSize, Projection};
 use super::profile::InputSpec;
@@ -88,7 +88,7 @@ impl Embedder {
         // first person crop, hours in, on a dtype bind error. There is no
         // u8-IO embedder contract (this open loads no sidecar), so refuse
         // while the operator is watching.
-        if io.input_is_u8 || !io.u8_outputs.is_empty() {
+        if io.input_element != InputElement::F32 || !io.u8_outputs.is_empty() {
             bail!(
                 "embedder {} declares uint8 graph IO — no u8-IO embedder \
                  contract exists; use the float-IO export",
@@ -400,7 +400,7 @@ mod tests {
                 declared_input_size: Some(size),
                 declared_input_batch: Some(1),
                 outputs: Vec::new(),
-                input_is_u8: false,
+                input_element: InputElement::F32,
                 u8_outputs: Vec::new(),
                 input_layout: TensorLayout::Nchw,
             })),

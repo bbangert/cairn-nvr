@@ -257,9 +257,10 @@ fn serve(providers: &[Provider]) -> Result<()> {
             ),
         }
     }
-    // Same early-refusal geometry for a uint8-IO detector: the embedder
-    // crops from the detector's packed tensor, which under a quantized input
-    // holds u8 codes its affine inversion cannot read.
+    // The early case, before the detector's open, of the refusal
+    // `open_embedder` makes for any uint8-fed detector: the embedder crops
+    // from the detector's packed tensor, which under a quantized input holds
+    // u8 codes its affine inversion cannot read. The sidecar answers it here.
     if args.embedder_model.is_some() {
         if let Some(quant) = infer::IoQuant::load_for(&args.model)? {
             if quant.input.is_some() {
@@ -616,10 +617,9 @@ fn infer_loop(
 /// refuse a run.
 ///
 /// `spec` is the opened detector's. The crop source is the tensor packed for
-/// it and the crop reads that as NCHW planes, so any other layout is refused
-/// here, before the embedder's session load — the uint8-input refusal in
-/// [`serve`] is the same check for the dtype, made earlier because the
-/// sidecar alone answers it.
+/// it and the crop reads that as float NCHW planes, so any other layout or a
+/// uint8 input is refused here for every backend, before the embedder's
+/// session load — [`serve`] makes the sidecar-answerable uint8 case earlier.
 fn open_embedder(args: &Args, labels: &Labels, spec: InputSpec) -> Result<Option<Embedder>> {
     let Some(model) = args.embedder_model.as_deref() else {
         return Ok(None);
@@ -630,6 +630,13 @@ fn open_embedder(args: &Args, labels: &Labels, spec: InputSpec) -> Result<Option
              (the reid crop source is the detector's packed tensor, read as NCHW \
              planes) — drop the embedder",
             spec.layout
+        );
+    }
+    if spec.input_quant.is_some() {
+        bail!(
+            "--embedder-model cannot run with a detector fed uint8 \
+             (the reid crop source is the detector's packed tensor, read as floats) \
+             — drop the embedder"
         );
     }
     let embedder = Embedder::open(model, args.backend)?;
@@ -889,7 +896,7 @@ mod tests {
                     declared_input_size,
                     declared_input_batch: None,
                     outputs: Vec::new(),
-                    input_is_u8: false,
+                    input_element: infer::InputElement::F32,
                     u8_outputs: Vec::new(),
                     input_layout: TensorLayout::Nhwc,
                 },
@@ -942,7 +949,7 @@ mod tests {
     /// Refused on the spec alone, before the embedder's model is touched —
     /// proven by a path that does not exist.
     #[test]
-    fn an_embedder_is_refused_over_a_non_nchw_detector() {
+    fn an_embedder_is_refused_over_a_non_nchw_or_uint8_fed_detector() {
         use infer::{ResizePolicy, TensorEncoding};
 
         let args = parse(&[
@@ -962,13 +969,17 @@ mod tests {
             layout: TensorLayout::Nhwc,
         };
         let labels = Labels::load(None).unwrap();
-        let msg = match open_embedder(&args, &labels, spec) {
-            Ok(_) => panic!("an embedder opened over an NHWC detector"),
+        let refusal = |spec| match open_embedder(&args, &labels, spec) {
+            Ok(_) => panic!("an embedder opened over {spec:?}"),
             Err(err) => format!("{err:#}"),
         };
-        assert!(
-            msg.contains("--embedder-model cannot run with a detector whose input is Nhwc"),
-            "{msg}"
-        );
+        assert!(refusal(spec)
+            .contains("--embedder-model cannot run with a detector whose input is Nhwc"),);
+        let uint8 = InputSpec {
+            input_quant: TensorEncoding::UnitRgb.pixel_quant(),
+            layout: TensorLayout::Nchw,
+            ..spec
+        };
+        assert!(refusal(uint8).contains("detector fed uint8"));
     }
 }

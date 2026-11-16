@@ -99,6 +99,13 @@ by format but is not the same file as the fp32 export. One profile can
 therefore carry the artifacts for several backends, and its own `backend:`
 picks which one becomes `--model`.
 
+An `.rknn` has its mean and std folded in at conversion and is fed the frame's
+bytes, so the `model_profile:` beside it must name the family it was converted
+as: the channel order and scale are the ones in "Input conventions" in
+`tools/rknn-export/README.md`, and nothing at load can check them. A family
+with per-channel statistics folded in (`rfdetr`) is refused at open: the
+packer has no path for it.
+
 ## `tier:` — the ascending capability ladder
 
 `tier:` names the capability a profile claims, on a ladder that ascends:
@@ -571,9 +578,10 @@ Four profiles in `priv/profiles/`, each with its reasoning in the file:
 | `qcs6490-tier1` | `qnn` | derived per rung | none (tier 1 — no tracker) | the model-ladder file: six rungs serving both installation states (yolo26 packs installed, or only the baked Apache models — yolox_m carries small fleets there), claim 40 cameras; tiny/nano boundary-measured, the rest provisional |
 
 Three of the four are `experimental: true` for the same blunt reason: their
-backends have not proven out in soak. Only `ort` runs today; `rknn` (a stub)
-and `qnn` (executes, unsoaked) parse everywhere, and a group naming one
-refuses to load without your `allow_experimental: true`.
+backends have not proven out in soak. Only `ort` runs today; `rknn` (opens in
+the Rockchip board library's probe binary only, unproven on a board) and `qnn`
+(executes, unsoaked) parse everywhere, and a group naming one refuses to load
+without your `allow_experimental: true`.
 
 A group that named the retired `qcs6490` placeholder now fails with
 "unknown profile" — point it at `qcs6490-tier1`. The placeholder was a

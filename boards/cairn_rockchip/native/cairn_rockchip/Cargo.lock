@@ -169,7 +169,9 @@ dependencies = [
 name = "cairn-rockchip"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "cairn-detect",
+ "libloading 0.8.9",
  "rustler",
 ]
 

@@ -22,7 +22,9 @@ use super::super::heads::Raw;
 use super::super::resolve::{
     declared_input_batch, declared_input_size, static_output_dims, Declared,
 };
-use super::{Backend, BackendKind, InputTensor, ModelIo, QnnOptions, SessionOptions, Tensors};
+use super::{
+    Backend, BackendKind, InputElement, InputTensor, ModelIo, QnnOptions, SessionOptions, Tensors,
+};
 
 /// The reused input buffer, in the dtype the artifact's contract picked at
 /// open. One variant per [`TensorValues`] arm: a session only ever sees one
@@ -78,7 +80,11 @@ impl OrtBackend {
             input_name: input.name().to_string(),
             declared_input_size: declared_input_size(input.dtype()),
             declared_input_batch: declared_input_batch(input.dtype()),
-            input_is_u8: tensor_is_u8(input.dtype()),
+            input_element: if tensor_is_u8(input.dtype()) {
+                InputElement::U8Codes
+            } else {
+                InputElement::F32
+            },
             u8_outputs: session
                 .outputs()
                 .iter()

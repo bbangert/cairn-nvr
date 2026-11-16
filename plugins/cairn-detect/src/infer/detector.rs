@@ -9,7 +9,9 @@ use crate::emit::Det;
 use crate::note;
 
 use super::backend::onnxruntime::{OrtBackend, QnnBackend};
-use super::backend::{Backend, BackendKind, InputTensor, ModelIo, QnnOptions, SessionOptions};
+use super::backend::{
+    Backend, BackendKind, InputElement, InputTensor, ModelIo, QnnOptions, SessionOptions,
+};
 use super::encoding::TensorValues;
 use super::geometry::{InputSize, Projection};
 use super::heads::{decode_output, Raw};
@@ -157,7 +159,8 @@ impl Detector {
     /// `model` names the artifact, and its sidecar's path, in errors; it is
     /// never opened here. `io_quant` must be the sidecar the backend was
     /// opened with — the one its [`SessionOptions::io_quant`] carried —
-    /// since the backend dequantizes by it and the packer quantizes by it.
+    /// since the backend dequantizes by it and, for an
+    /// [`InputElement::U8Codes`] input, the packer quantizes by it.
     pub fn with_backend(
         backend: Box<dyn Backend>,
         model: &Path,
@@ -176,11 +179,26 @@ impl Detector {
             bail!("model {} has no outputs", model.display());
         }
         let (mut profile, outputs, output) = resolve_profile(profile, declared, input_size, model)?;
-        // The sidecar's input qparams and the backend's layout ride the
-        // resolved spec so the packer — on either side of `input_spec()` —
-        // packs for the artifact that opened, never for a profile default.
-        profile.input.input_quant =
-            io_quant.and_then(|quant| quant.input.as_ref().map(|(_, qp)| *qp));
+        // The input qparams and the backend's layout ride the resolved spec
+        // so the packer — on either side of `input_spec()` — packs for the
+        // artifact that opened, never for a profile default. Pixel bytes are
+        // the quantized packer under the encoding's identity qparams, so
+        // `InputSpec` and the NIF wire carry no third element kind.
+        profile.input.input_quant = match io.input_element {
+            InputElement::F32 | InputElement::U8Codes => {
+                io_quant.and_then(|quant| quant.input.as_ref().map(|(_, qp)| *qp))
+            }
+            InputElement::U8Pixels => {
+                Some(profile.input.encoding.pixel_quant().with_context(|| {
+                    format!(
+                        "model {} takes pixel bytes, which profile {} ({}) cannot be fed as",
+                        model.display(),
+                        profile.name,
+                        profile.input.encoding
+                    )
+                })?)
+            }
+        };
         profile.input.layout = io.input_layout;
         check_grid_divides_input(profile.output.layout, input_size)?;
         if let Some(output) = output {
@@ -298,14 +316,15 @@ impl Detector {
 
 /// A uint8-IO artifact and its sidecar must describe each other exactly,
 /// judged against the session's *sniffed* dtypes rather than either one's
-/// claim. Three refusals, all at open: a u8 edge with no qparams (nothing
-/// downstream could quantize or dequantize it), qparams next to a float edge
-/// (a sidecar for some other artifact — quantizing anyway would corrupt
-/// every value), and an input-name mismatch (same failure, caught by name).
+/// claim. Refused at open: a u8-code input with no qparams (nothing
+/// downstream could quantize it), input qparams next to a float or a
+/// pixel-byte input (a sidecar for some other artifact — quantizing anyway
+/// would corrupt every value), an input-name mismatch (same failure, caught
+/// by name), and an output set the sidecar does not cover exactly.
 fn check_io_quant(io: &ModelIo, quant: Option<&IoQuant>, model: &Path) -> Result<()> {
     let input_quant = quant.and_then(|quant| quant.input.as_ref());
-    match (io.input_is_u8, input_quant) {
-        (true, None) => bail!(
+    match (io.input_element, input_quant) {
+        (InputElement::U8Codes, None) => bail!(
             "model {} declares a uint8 input but its qparams sidecar ({}) {} — \
              re-export with u8_io_surgery.py, which writes both",
             model.display(),
@@ -316,12 +335,17 @@ fn check_io_quant(io: &ModelIo, quant: Option<&IoQuant>, model: &Path) -> Result
                 "is missing"
             }
         ),
-        (false, Some(_)) => bail!(
+        (InputElement::F32, Some(_)) => bail!(
             "qparams sidecar declares input quantization but model {} takes float input — \
              wrong sidecar, or wrong artifact",
             model.display()
         ),
-        (true, Some((name, _))) if *name != io.input_name => bail!(
+        (InputElement::U8Pixels, Some(_)) => bail!(
+            "qparams sidecar declares input quantization but model {} takes pixel bytes \
+             (its runtime quantizes them) — wrong sidecar, or wrong artifact",
+            model.display()
+        ),
+        (InputElement::U8Codes, Some((name, _))) if *name != io.input_name => bail!(
             "qparams sidecar quantizes input {name:?} but model {} calls its input {:?}",
             model.display(),
             io.input_name
@@ -351,7 +375,7 @@ mod tests {
     use super::super::encoding::TensorLayout;
     use super::*;
 
-    /// The four-way refusal matrix the uint8-IO open-time safety rests on,
+    /// The refusal matrix the u8-input open-time safety rests on,
     /// driven directly: it is a pure function over sniffed IO and the
     /// sidecar, so every arm is pinned without a model file.
     #[test]
@@ -360,12 +384,12 @@ mod tests {
 
         let model = Path::new("m.onnx");
         let qp = QuantParams::new(1.0, 0).unwrap();
-        let io = |input_is_u8: bool, u8_outputs: &[&str]| ModelIo {
+        let io = |input_element: InputElement, u8_outputs: &[&str]| ModelIo {
             input_name: "images".to_string(),
             declared_input_size: None,
             declared_input_batch: None,
             outputs: Vec::new(),
-            input_is_u8,
+            input_element,
             u8_outputs: u8_outputs.iter().map(|s| s.to_string()).collect(),
             input_layout: TensorLayout::Nchw,
         };
@@ -375,24 +399,32 @@ mod tests {
         };
 
         // Float model, no sidecar: the ordinary case.
-        assert!(check_io_quant(&io(false, &[]), None, model).is_ok());
+        assert!(check_io_quant(&io(InputElement::F32, &[]), None, model).is_ok());
         // The full u8io shape, sidecar agreeing on name and output set.
         let full = quant(Some("images"), &["output"]);
-        assert!(check_io_quant(&io(true, &["output"]), Some(&full), model).is_ok());
+        assert!(
+            check_io_quant(&io(InputElement::U8Codes, &["output"]), Some(&full), model).is_ok()
+        );
         // Output-only conversion: float input plus a u8-output sidecar.
         let out_only = quant(None, &["output"]);
-        assert!(check_io_quant(&io(false, &["output"]), Some(&out_only), model).is_ok());
+        assert!(
+            check_io_quant(&io(InputElement::F32, &["output"]), Some(&out_only), model).is_ok()
+        );
 
         // u8 input with no sidecar at all — the orphan-artifact case.
-        let err = check_io_quant(&io(true, &[]), None, model).unwrap_err();
+        let err = check_io_quant(&io(InputElement::U8Codes, &[]), None, model).unwrap_err();
         assert!(err.to_string().contains("is missing"), "{err}");
         // Sidecar quantizing the input of a float artifact — wrong sidecar.
-        let err =
-            check_io_quant(&io(false, &[]), Some(&quant(Some("images"), &[])), model).unwrap_err();
+        let err = check_io_quant(
+            &io(InputElement::F32, &[]),
+            Some(&quant(Some("images"), &[])),
+            model,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("takes float input"), "{err}");
         // Input-name mismatch — a sidecar for some other model.
         let err = check_io_quant(
-            &io(true, &["output"]),
+            &io(InputElement::U8Codes, &["output"]),
             Some(&quant(Some("input"), &["output"])),
             model,
         )
@@ -400,13 +432,24 @@ mod tests {
         assert!(err.to_string().contains("calls its input"), "{err}");
         // Output-set mismatch, both directions through one sorted compare.
         let err = check_io_quant(
-            &io(true, &["output"]),
+            &io(InputElement::U8Codes, &["output"]),
             Some(&quant(Some("images"), &[])),
             model,
         )
         .unwrap_err();
         assert!(err.to_string().contains("uint8 outputs"), "{err}");
-        let err = check_io_quant(&io(false, &[]), Some(&out_only), model).unwrap_err();
+        let err = check_io_quant(&io(InputElement::F32, &[]), Some(&out_only), model).unwrap_err();
+        assert!(err.to_string().contains("uint8 outputs"), "{err}");
+
+        // Pixel bytes: no sidecar is the normal case, an input entry is a
+        // sidecar for another artifact, and outputs are still held to it.
+        let pixels = |u8_outputs| io(InputElement::U8Pixels, u8_outputs);
+        assert!(check_io_quant(&pixels(&[]), None, model).is_ok());
+        let err =
+            check_io_quant(&pixels(&[]), Some(&quant(Some("images"), &[])), model).unwrap_err();
+        assert!(err.to_string().contains("takes pixel bytes"), "{err}");
+        assert!(check_io_quant(&pixels(&["output"]), Some(&out_only), model).is_ok());
+        let err = check_io_quant(&pixels(&[]), Some(&out_only), model).unwrap_err();
         assert!(err.to_string().contains("uint8 outputs"), "{err}");
     }
 
@@ -496,7 +539,7 @@ mod tests {
                         name: "output".to_string(),
                         dims: Some(vec![1, 126, 85]),
                     }],
-                    input_is_u8: false,
+                    input_element: InputElement::F32,
                     u8_outputs: Vec::new(),
                     input_layout: layout,
                 },
@@ -529,6 +572,63 @@ mod tests {
             assert!(dets.is_empty());
             assert_eq!(*seen.lock().unwrap(), [(shape, layout)]);
         }
+    }
+
+    /// A pixel-byte backend's spec carries the encoding's identity qparams,
+    /// with no sidecar; an encoding that has none is refused at open, naming
+    /// the profile.
+    #[test]
+    fn a_pixel_byte_backend_resolves_to_the_identity_qparams() {
+        let open = |size: usize, outputs: Vec<Declared>| {
+            let backend = FakeBackend {
+                io: ModelIo {
+                    input_name: "images".to_string(),
+                    declared_input_size: Some(InputSize::square(size)),
+                    declared_input_batch: Some(1),
+                    outputs,
+                    input_element: InputElement::U8Pixels,
+                    u8_outputs: Vec::new(),
+                    input_layout: TensorLayout::Nhwc,
+                },
+                output: Vec::new(),
+                seen: Seen::default(),
+            };
+            Detector::with_backend(
+                Box::new(backend),
+                Path::new("m.rknn"),
+                None,
+                None,
+                &Labels::load(None).unwrap(),
+                true,
+                None,
+            )
+        };
+        let declared = |name: &str, dims: Vec<i64>| Declared {
+            name: name.to_string(),
+            dims: Some(dims),
+        };
+
+        let detector = match open(64, vec![declared("output", vec![1, 84, 85])]) {
+            Ok(detector) => detector,
+            Err(err) => panic!("{err:#}"),
+        };
+        let spec = detector.input_spec();
+        assert_eq!(detector.profile().name, "yolox");
+        assert_eq!(spec.input_quant, spec.encoding.pixel_quant());
+        assert!(spec.input_quant.is_some());
+
+        let detr = vec![
+            declared("dets", vec![1, 300, 4]),
+            declared("labels", vec![1, 300, 91]),
+        ];
+        let err = match open(384, detr) {
+            Ok(_) => panic!("an imagenet-normalized profile opened over pixel bytes"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(
+            err.contains("m.rknn") && err.contains("takes pixel bytes") && err.contains("rfdetr"),
+            "{err}"
+        );
     }
 
     /// The report/reset boundary, driven through `record` itself rather than
