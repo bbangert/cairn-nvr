@@ -17,6 +17,7 @@ tools/board-soak/
 tools/mot-bench/
 tools/qdq-export/
 tools/qnn-spike/
+tools/rknn-export/
 plugins/*/target/
 plugins/cairn-detect/*.onnx
 plugins/cairn-detect/model/
