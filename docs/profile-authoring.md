@@ -578,10 +578,10 @@ Four profiles in `priv/profiles/`, each with its reasoning in the file:
 | `qcs6490-tier1` | `qnn` | derived per rung | none (tier 1 — no tracker) | the model-ladder file: six rungs serving both installation states (yolo26 packs installed, or only the baked Apache models — yolox_m carries small fleets there), claim 40 cameras; tiny/nano boundary-measured, the rest provisional |
 
 Three of the four are `experimental: true` for the same blunt reason: their
-backends have not proven out in soak. Only `ort` runs today; `rknn` (opens in
-the Rockchip board library's probe binary only, unproven on a board) and `qnn`
-(executes, unsoaked) parse everywhere, and a group naming one refuses to load
-without your `allow_experimental: true`.
+backends have not proven out in soak. Only `ort` runs today; `rknn` (executes
+on an RK3566's NPU, in the Rockchip board library's probe binary only) and
+`qnn` (executes, unsoaked) parse everywhere, and a group naming one refuses to
+load without your `allow_experimental: true`.
 
 A group that named the retired `qcs6490` placeholder now fails with
 "unknown profile" — point it at `qcs6490-tier1`. The placeholder was a
