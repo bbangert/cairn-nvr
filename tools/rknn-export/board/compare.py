@@ -23,6 +23,6 @@ np.savez(os.path.join(rk, name + "_board.parity.npz"),
          **{f"sim{i}_{j}": b[f"npu{i}_{j}"] for i in range(5) for j in outs},
          **{f"ref{i}_{j}": t[f"ref{i}_{j}"] for i in range(5) for j in outs})
 print("-- board NPU vs FP32 (parity.py):")
-subprocess.run([PY, "-I", PARITY, name + "_board", kind], env=env)
+subprocess.run([PY, "-I", PARITY, name + "_board", kind], env=env, check=True)
 print("-- simulator vs FP32 (trial):")
-subprocess.run([PY, "-I", PARITY, name, kind], env=env)
+subprocess.run([PY, "-I", PARITY, name, kind], env=env, check=True)

@@ -13,7 +13,7 @@ sync = rk.rk.rknn_mem_sync; sync.argtypes = [rk.ctx_t, C.POINTER(rk.Mem), C.c_in
 a = m.attr(rk.Q_NATIVE_IN, 0); a.type, a.fmt, a.pass_through = rk.UINT8, rk.NHWC, 0
 mem = rk.rk.rknn_create_mem(m.ctx, a.size_with_stride)
 dst = np.ctypeslib.as_array(C.cast(mem.contents.virt_addr, C.POINTER(C.c_uint8)), (a.size_with_stride,))
-dst[: x.nbytes] = x.ravel()
+wst = a.w_stride or m.w; dst[: m.h * wst * 3].reshape(m.h, wst, 3)[:, : m.w] = x[0]
 sync(m.ctx, mem, 1)
 r = {"model": path}
 try:

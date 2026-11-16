@@ -10,7 +10,7 @@ m.set_input(x); m.run(); ref = m.fetch_float()[0]
 a = m.attr(rk.Q_NATIVE_IN, 0); a.type, a.fmt, a.pass_through = rk.UINT8, rk.NHWC, 0
 mem = rk.rk.rknn_create_mem(m.ctx, a.size_with_stride)
 dst = np.ctypeslib.as_array(C.cast(mem.contents.virt_addr, C.POINTER(C.c_uint8)), (a.size_with_stride,))
-dst[: x.nbytes] = x.ravel()
+wst = a.w_stride or m.w; dst[: m.h * wst * 3].reshape(m.h, wst, 3)[:, : m.w] = x[0]
 rk.ck(rk.rk.rknn_set_io_mem(m.ctx, mem, C.byref(a)), "set_io_mem in")
 oa = m.attr(rk.Q_NATIVE_OUT, 0)
 om = rk.rk.rknn_create_mem(m.ctx, oa.size_with_stride)
