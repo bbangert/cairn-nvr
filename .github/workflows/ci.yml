@@ -256,3 +256,22 @@ jobs:
       - run: pip install -r tools/qdq-export/requirements.txt
 
       - run: python -m pytest tools/qdq-export
+
+  rknn-export-tools:
+    name: rknn-export pytest
+    runs-on: ubuntu-latest
+    # The toolkit is not installed: the build needs it, the pure parts do not.
+    # Those parts are tested because the parity numbers decide which rungs ship.
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: tools/rknn-export/tests/requirements.txt
+
+      - run: pip install -r tools/rknn-export/tests/requirements.txt
+
+      - run: python -m pytest tools/rknn-export
