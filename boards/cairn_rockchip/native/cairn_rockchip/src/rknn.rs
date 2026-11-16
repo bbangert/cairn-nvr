@@ -5,8 +5,9 @@
 //! No test here calls librknnrt itself: there is no NPU and no library on x86
 //! or in CI. The tests cover the struct layouts (as compile-time assertions),
 //! the mapping from tensor attrs to [`ModelIo`], the input check, the loader's
-//! failure paths, and the call sequence and output-buffer guard over stub
-//! entry points. The board run is the proof of the runtime.
+//! failure paths, and the call sequence, the input descriptor and the
+//! output-buffer guard over stub entry points. The board run is the proof of
+//! the runtime.
 //!
 //! The artifact folds its normalisation and quantisation in, so it takes the
 //! frame's own bytes ([`InputElement::U8Pixels`]), NHWC; the runtime hands
@@ -218,12 +219,17 @@ impl RknnBackend {
     ) -> Result<Self> {
         let mut bytes = std::fs::read(model)
             .with_context(|| format!("reading artifact {}", model.display()))?;
+        // `rknn_init` reads `model` as a file path when size is 0.
+        if bytes.is_empty() {
+            bail!("artifact {} is empty", model.display());
+        }
         let len = u32::try_from(bytes.len())
             .with_context(|| format!("artifact {} is over 4 GiB", model.display()))?;
         let mut ctx: sys::Context = 0;
-        // SAFETY: `bytes` is `len` bytes and outlives the context (it moves
-        // into the `Session` that destroys it); flag 0 and a null extend are
-        // rk.py's call.
+        // SAFETY: `bytes` is `len` bytes, non-zero (so `model` is read as
+        // bytes, not a path), and outlives the context (it moves into the
+        // `Session` that destroys it); flag 0 and a null extend are rk.py's
+        // call.
         check("rknn_init", unsafe {
             (library.init)(
                 &mut ctx,
@@ -563,7 +569,24 @@ mod tests {
     static N_OUTPUT: AtomicU32 = AtomicU32::new(1);
     static OUT_BYTES: AtomicU32 = AtomicU32::new(24);
     static RUN_CODE: AtomicI32 = AtomicI32::new(0);
+    static INITS: AtomicUsize = AtomicUsize::new(0);
+    static CALLS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    static SET_INPUT: Mutex<Option<SetInput>> = Mutex::new(None);
     static OUT_VALUES: [f32; 6] = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0];
+
+    struct SetInput {
+        n_inputs: u32,
+        index: u32,
+        size: u32,
+        pass_through: u8,
+        type_: c_int,
+        fmt: c_int,
+        bytes: Vec<u8>,
+    }
+
+    fn call(name: &'static str) {
+        CALLS.lock().unwrap().push(name);
+    }
 
     fn stubs() -> MutexGuard<'static, ()> {
         let guard = STUBS
@@ -571,6 +594,9 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         RELEASED.store(0, SeqCst);
         DESTROYED.store(0, SeqCst);
+        INITS.store(0, SeqCst);
+        CALLS.lock().unwrap().clear();
+        *SET_INPUT.lock().unwrap() = None;
         N_INPUT.store(1, SeqCst);
         N_OUTPUT.store(1, SeqCst);
         OUT_BYTES.store(24, SeqCst);
@@ -585,6 +611,7 @@ mod tests {
         _: u32,
         _: *mut c_void,
     ) -> c_int {
+        INITS.fetch_add(1, SeqCst);
         // SAFETY: `with_library` passes the address of a live `Context`.
         unsafe { *ctx = 7 };
         0
@@ -625,11 +652,31 @@ mod tests {
         0
     }
 
-    unsafe extern "C" fn stub_inputs_set(_: sys::Context, _: u32, _: *mut sys::Input) -> c_int {
+    unsafe extern "C" fn stub_inputs_set(
+        _: sys::Context,
+        n_inputs: u32,
+        input: *mut sys::Input,
+    ) -> c_int {
+        call("rknn_inputs_set");
+        // SAFETY: `run` passes one live `Input`.
+        let input = unsafe { &*input };
+        // SAFETY: its `buf` is `size` bytes `run` owns until it returns.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(input.buf.cast::<u8>(), input.size as usize) };
+        *SET_INPUT.lock().unwrap() = Some(SetInput {
+            n_inputs,
+            index: input.index,
+            size: input.size,
+            pass_through: input.pass_through,
+            type_: input.type_,
+            fmt: input.fmt,
+            bytes: bytes.to_vec(),
+        });
         0
     }
 
     unsafe extern "C" fn stub_run(_: sys::Context, _: *mut c_void) -> c_int {
+        call("rknn_run");
         RUN_CODE.load(SeqCst)
     }
 
@@ -639,6 +686,7 @@ mod tests {
         outs: *mut sys::Output,
         _: *mut c_void,
     ) -> c_int {
+        call("rknn_outputs_get");
         // SAFETY: `run` passes one live `Output` for the one output reported.
         unsafe {
             (*outs).buf = ptr::from_ref(&OUT_VALUES).cast_mut().cast();
@@ -652,6 +700,7 @@ mod tests {
         _: u32,
         _: *mut sys::Output,
     ) -> c_int {
+        call("rknn_outputs_release");
         RELEASED.fetch_add(1, SeqCst);
         0
     }
@@ -661,9 +710,13 @@ mod tests {
     }
 
     fn open_stub(tag: &str) -> Result<RknnBackend> {
+        open_stub_with(tag, b"stub")
+    }
+
+    fn open_stub_with(tag: &str, artifact: &[u8]) -> Result<RknnBackend> {
         let path =
             std::env::temp_dir().join(format!("rknn-stub-{}-{tag}.rknn", std::process::id()));
-        std::fs::write(&path, b"stub").unwrap();
+        std::fs::write(&path, artifact).unwrap();
         let library = sys::Library {
             init: stub_init,
             destroy: stub_destroy,
@@ -681,7 +734,15 @@ mod tests {
 
     fn frame() -> InputTensor {
         let size = InputSize { w: 6, h: 4 };
-        InputTensor::new(size, TensorLayout::Nhwc, TensorValues::U8(vec![0; 72]))
+        InputTensor::new(
+            size,
+            TensorLayout::Nhwc,
+            TensorValues::U8((0..72).collect()),
+        )
+    }
+
+    fn calls() -> Vec<&'static str> {
+        CALLS.lock().unwrap().clone()
     }
 
     #[test]
@@ -690,15 +751,54 @@ mod tests {
         let mut backend = open_stub("happy").unwrap();
         let outputs = backend.run(frame()).unwrap();
         assert_eq!(RELEASED.load(SeqCst), 0);
+        assert_eq!(calls(), ["rknn_inputs_set", "rknn_run", "rknn_outputs_get"]);
         let raw = outputs.get("output").unwrap();
         assert_eq!(raw.dims, [1, 2, 3]);
         assert_eq!(raw.values, OUT_VALUES);
         assert!(err(outputs.get("missing")).contains("no output \"missing\""));
         drop(outputs);
         assert_eq!(RELEASED.load(SeqCst), 1);
+        assert_eq!(
+            calls(),
+            [
+                "rknn_inputs_set",
+                "rknn_run",
+                "rknn_outputs_get",
+                "rknn_outputs_release"
+            ]
+        );
         assert_eq!(DESTROYED.load(SeqCst), 0);
         drop(backend);
         assert_eq!(DESTROYED.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn a_run_hands_the_runtime_the_frame_as_one_uint8_nhwc_input() {
+        let _guard = stubs();
+        let mut backend = open_stub("descriptor").unwrap();
+        drop(backend.run(frame()).unwrap());
+        // Taken, not borrowed: a failed assert below must not poison the mutex
+        // for the next test.
+        let set = SET_INPUT.lock().unwrap().take();
+        let set = set.expect("rknn_inputs_set was not called");
+        assert_eq!(set.n_inputs, 1);
+        assert_eq!(set.index, 0);
+        assert_eq!(set.size, 72);
+        assert_eq!(set.pass_through, 0);
+        assert_eq!(set.type_, sys::TENSOR_UINT8);
+        assert_eq!(set.fmt, sys::TENSOR_NHWC);
+        assert_eq!(set.bytes, (0..72).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn an_empty_artifact_is_refused_before_the_runtime_sees_it() {
+        let _guard = stubs();
+        let msg = err(open_stub_with("empty", b""));
+        assert!(
+            msg.contains("rknn-stub-") && msg.contains("is empty"),
+            "{msg}"
+        );
+        assert_eq!(INITS.load(SeqCst), 0);
     }
 
     #[test]
@@ -725,6 +825,7 @@ mod tests {
             "{msg}"
         );
         assert_eq!(RELEASED.load(SeqCst), 0);
+        assert_eq!(calls(), ["rknn_inputs_set", "rknn_run"]);
     }
 
     #[test]
