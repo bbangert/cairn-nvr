@@ -40,8 +40,8 @@ pub const YOLOX: ModelProfile = ModelProfile {
 ///
 /// `yolo26` used to sit in this contract's families on the claim that YOLO26 is
 /// end-to-end like yolov10 — disproven by the first real export run against
-/// this decode (yolo26m QDQ on-device, 2026-08-19): the only YOLO26 exports
-/// this stack can run are `end2end=False` (the NMS-free tail segfaults
+/// this decode (yolo26m QDQ on-device, 2026-08-19): the only whole-head YOLO26
+/// exports this stack can run are `end2end=False` (the NMS-free tail segfaults
 /// quantized QNN — tools/qdq-export/README.md), and their raw `[1, 4+nc, A]`
 /// head is the yolov8 contract, whose families list now carries it. A true end-to-end
 /// export, should one ever work, names `yolov10` explicitly.
@@ -65,7 +65,7 @@ pub const YOLOV10: ModelProfile = ModelProfile {
 
 /// Stock Ultralytics detect exports.
 ///
-/// yolov8, yolov9, yolo11, yolov11 — and yolo26 in the only exportable form
+/// yolov8, yolov9, yolo11, yolov11 — and yolo26 in the only whole-head form
 /// this stack runs (`end2end=False`; see the yolov10 doc) — are all this one
 /// profile: every
 /// generation's detect head exports the same `[1, 4 + nc, A]` channels-first
@@ -121,9 +121,57 @@ pub const RFDETR: ModelProfile = ModelProfile {
     variant_sizes: Some("nano 384, small 512, base 560, medium 576, large 704"),
 };
 
+/// Ultralytics yolov8 and yolo11 exported with the head cut before the box
+/// decode, so the DFL runs on the host.
+///
+/// Same preprocessing and NMS as [`YOLOV8`]; only the tensors differ — three
+/// strides of box logits and class scores instead of one decoded tensor. The
+/// two generations share this contract. Its own profile rather than a family of
+/// `yolov8`, whose output it does not share.
+pub const YOLOV8_SPLIT: ModelProfile = ModelProfile {
+    name: "yolov8split",
+    families: &[],
+    input: InputSpec {
+        size: InputSize::square(640),
+        encoding: TensorEncoding::UnitRgb,
+        resize: ResizePolicy::Stretch,
+        input_quant: None,
+        layout: TensorLayout::Nchw,
+    },
+    output: OutputSpec {
+        layout: Layout::SplitDfl {
+            nc: 80,
+            reg_max: 16,
+        },
+        score: ScoreComposition::Class,
+        nms: Some(DEFAULT_NMS),
+    },
+    variant_sizes: None,
+};
+
+/// yolo26's one2one head exported with the same cut: `reg_max` is 1, so the
+/// box tensors carry l, t, r, b distances directly and there is no DFL.
+pub const YOLO26_SPLIT: ModelProfile = ModelProfile {
+    name: "yolo26split",
+    families: &[],
+    input: InputSpec {
+        size: InputSize::square(640),
+        encoding: TensorEncoding::UnitRgb,
+        resize: ResizePolicy::Stretch,
+        input_quant: None,
+        layout: TensorLayout::Nchw,
+    },
+    output: OutputSpec {
+        layout: Layout::SplitLtrb { nc: 80 },
+        score: ScoreComposition::Class,
+        nms: Some(DEFAULT_NMS),
+    },
+    variant_sizes: None,
+};
+
 /// Every profile `--model-profile` accepts and sniffing considers, in the
 /// order an ambiguity error lists them.
-pub const PROFILES: &[ModelProfile] = &[YOLOX, YOLOV10, YOLOV8, RFDETR];
+pub const PROFILES: &[ModelProfile] = &[YOLOX, YOLOV10, YOLOV8, RFDETR, YOLOV8_SPLIT, YOLO26_SPLIT];
 
 impl ModelProfile {
     /// `--model-profile` value parser, so a typo's error names the real set.

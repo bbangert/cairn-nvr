@@ -1,7 +1,8 @@
-//! The four decode heads and the tail every one of them converges on.
+//! The decode heads and the tail every one of them converges on.
 //!
 //! Uniform free-function signatures per head rather than a trait: the set is
-//! closed by design — a new family is a catalog entry — and an enum plus plain
+//! closed by design — a new family is a catalog entry unless its output is a
+//! new layout — and an enum plus plain
 //! functions gives the readability without dynamic dispatch.
 
 use std::num::NonZeroUsize;
@@ -12,7 +13,9 @@ use crate::emit::{Det, ObservationKind};
 
 use super::geometry::{Bbox, InputSize, ModelBox, NormBox, Projection};
 use super::labels::{Labels, ScoreFloors};
-use super::profile::{grid_anchors, show, Layout, NmsSpec, OutputSpec, Outputs, ScoreComposition};
+use super::profile::{
+    grid_anchors, show, Layout, NmsSpec, OutputSpec, Outputs, ScoreComposition, SPLIT_STRIDES,
+};
 use super::resolve::validate_layout;
 use super::MAX_DETS;
 
@@ -133,9 +136,10 @@ pub(super) struct Candidate {
 /// is still emitted with the flag on, at the same score under the same label,
 /// which is three separate properties and not one:
 ///
-///   * [`raw_classes`] and [`grid_objectness`] pick their class by an argmax
-///     that reads no floor at all, so the winning class of an anchor does not
-///     move; the floor only decides whether that winner is kept.
+///   * [`raw_classes`], [`grid_objectness`] and [`split_head`] pick their
+///     class by an argmax that reads no floor at all, so the winning class of
+///     an anchor does not move; the floor only decides whether that winner is
+///     kept.
 ///   * [`detr_queries`] does pick by floor, and so tracks the evidence and
 ///     band bests apart and prefers evidence — a single pick against the
 ///     shared emission floor would let a band class take the query and lose
@@ -221,6 +225,42 @@ pub(super) fn candidates_from(
                 &class_floors(nc, labels, floors),
             ))
         }
+        (Layout::SplitDfl { nc, reg_max }, Outputs::Split { boxes, scores }) => {
+            let box_channels = reg_max.saturating_mul(4);
+            require_split(boxes, scores, box_channels, nc, size)?;
+            let nc = classes(output.layout, nc)?;
+            Ok(split_head(
+                boxes.each_ref().map(|t| t.values),
+                scores.each_ref().map(|t| t.values),
+                nc,
+                size,
+                &class_floors(nc, labels, floors),
+                |values, cells, cell| {
+                    let side = |k: usize| {
+                        dfl_distance(
+                            |bin| f64::from(values[(k * reg_max + bin) * cells + cell]),
+                            reg_max,
+                        )
+                    };
+                    [side(0), side(1), side(2), side(3)]
+                },
+            ))
+        }
+        (Layout::SplitLtrb { nc }, Outputs::Split { boxes, scores }) => {
+            require_split(boxes, scores, 4, nc, size)?;
+            let nc = classes(output.layout, nc)?;
+            Ok(split_head(
+                boxes.each_ref().map(|t| t.values),
+                scores.each_ref().map(|t| t.values),
+                nc,
+                size,
+                &class_floors(nc, labels, floors),
+                |values, cells, cell| {
+                    let side = |k: usize| f64::from(values[k * cells + cell]);
+                    [side(0), side(1), side(2), side(3)]
+                },
+            ))
+        }
         (layout, raw) => bail!(
             "{layout} cannot be read from {}",
             show(&raw.map(|tensor| tensor.dims.clone()))
@@ -252,8 +292,8 @@ fn classes(layout: Layout, nc: usize) -> Result<NonZeroUsize> {
 /// The product is `checked_mul` rather than `*` because both factors come off
 /// a *runtime* tensor shape — whatever the backend reported alongside the
 /// buffer. onnxruntime's extents are consistent with the buffer it hands back,
-/// so on the one backend that executes a wrap is unreachable today; a backend
-/// whose SDK reports the two separately has no such guarantee. Either way this
+/// so a wrap is unreachable there; a backend whose SDK reports the two
+/// separately, as RKNN's does, has no such guarantee. Either way this
 /// is the one place the "trust the dims" pattern is not defended, and a wrapped
 /// `need` would pass the length check and let the decode loop walk off the
 /// slice.
@@ -263,6 +303,28 @@ fn require_values(have: usize, rows: usize, row: usize, dims: &[i64]) -> Result<
         .ok_or_else(|| anyhow!("output {dims:?} declares an impossible element count"))?;
     if have < need {
         bail!("output {dims:?} declares {need} values but carries {have}");
+    }
+    Ok(())
+}
+
+/// Does every level of a split head carry the values its grid and channel
+/// counts say it is about to be indexed by?
+fn require_split(
+    boxes: &[Raw; 3],
+    scores: &[Raw; 3],
+    box_channels: usize,
+    nc: usize,
+    size: InputSize,
+) -> Result<()> {
+    for (level, stride) in SPLIT_STRIDES.iter().enumerate() {
+        let cells = (size.w / stride) * (size.h / stride);
+        require_values(
+            boxes[level].values.len(),
+            cells,
+            box_channels,
+            &boxes[level].dims,
+        )?;
+        require_values(scores[level].values.len(), cells, nc, &scores[level].dims)?;
     }
     Ok(())
 }
@@ -396,7 +458,7 @@ fn grid_objectness(
                     ScoreComposition::Class | ScoreComposition::SigmoidClass => 1.0,
                 };
                 let (class_id, class_score) = argmax(nc, |c| f64::from(values[base + 5 + c]));
-                // NaN wins total_cmp's argmax and survives every comparison
+                // A NaN that wins `argmax` survives every comparison
                 // against a floor, then serializes as `null` and takes the
                 // whole output line out of the contract.
                 //
@@ -543,6 +605,82 @@ fn detr_queries(
     candidates
 }
 
+/// A split head: per stride level, class scores `[1, nc, H, W]` and box
+/// channels `[1, C, H, W]`, so channel `c` of cell `(y, x)` is at
+/// `c * H * W + y * W + x`. `distances` reads one cell's l, t, r, b in stride
+/// units out of a level's box tensor, given that level's cell count and the
+/// cell's index.
+///
+/// The class gate runs before the box is touched so that DFL — four softmaxes
+/// over `reg_max` logits — runs only for the cells that survive it. For every
+/// one of a 640x640 input's 8,400 cells that is ~540,000 exponentials a frame,
+/// where few cells clear a floor.
+///
+/// The box is `dist2bbox` with the anchor at the cell *centre* (`+ 0.5`), in
+/// input pixels — the same space [`centered`] hands the other heads. `floors`
+/// is one [`ClassFloor`] per class id; see [`raw_classes`] for what the gate
+/// and `evidence` mean.
+fn split_head(
+    boxes: [&[f32]; 3],
+    scores: [&[f32]; 3],
+    nc: NonZeroUsize,
+    size: InputSize,
+    floors: &[ClassFloor],
+    distances: impl Fn(&[f32], usize, usize) -> [f64; 4],
+) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    for ((stride, boxes), scores) in SPLIT_STRIDES.iter().zip(boxes).zip(scores) {
+        let (cols, rows) = (size.w / stride, size.h / stride);
+        let cells = cols * rows;
+        let stride = *stride as f64;
+        for cell in 0..cells {
+            let (class_id, score) = argmax(nc, |c| f64::from(scores[c * cells + cell]));
+            // A NaN that wins `argmax` is rejected here, as in `raw_classes`.
+            let Some(floor) = floors.get(class_id) else {
+                continue;
+            };
+            if score.is_nan() || score < floor.emit {
+                continue;
+            }
+            let [l, t, r, b] = distances(boxes, cells, cell);
+            let (x, y) = ((cell % cols) as f64 + 0.5, (cell / cols) as f64 + 0.5);
+            if let Some(corners) = from_corners(
+                (x - l) * stride,
+                (y - t) * stride,
+                (x + r) * stride,
+                (y + b) * stride,
+                size,
+            ) {
+                candidates.push(Candidate {
+                    score,
+                    class_id,
+                    corners,
+                    evidence: score >= floor.min_score,
+                });
+            }
+        }
+    }
+    candidates
+}
+
+/// Distribution Focal Loss decode: the expectation of the bin index under the
+/// softmax of `reg_max` logits.
+///
+/// A NaN or `+inf` logit makes the result NaN, which [`from_corners`] refuses;
+/// `-inf` is just a bin with no mass.
+fn dfl_distance(logit: impl Fn(usize) -> f64, reg_max: usize) -> f64 {
+    // Subtracting the max keeps `exp` from overflowing on large logits; it
+    // does not change the softmax.
+    let max = (0..reg_max).map(&logit).fold(f64::NEG_INFINITY, f64::max);
+    let (mut total, mut weighted) = (0.0, 0.0);
+    for bin in 0..reg_max {
+        let weight = (logit(bin) - max).exp();
+        total += weight;
+        weighted += weight * bin as f64;
+    }
+    weighted / total
+}
+
 /// The squash a DETR head leaves to its postprocess.
 ///
 /// Saturates instead of overflowing — an infinite logit lands on 0 or 1, both
@@ -552,8 +690,9 @@ fn sigmoid(logit: f64) -> f64 {
     1.0 / (1.0 + (-logit).exp())
 }
 
-/// Argmax over `n` scores. `total_cmp` orders NaN, so a NaN wins — every
-/// caller rejects the result rather than letting one reach the output.
+/// Argmax over `n` scores. `total_cmp` orders NaN — a positive one above every
+/// number, a negative one below — so a NaN can win, and every caller rejects
+/// the result rather than letting one reach the output.
 ///
 /// [`NonZeroUsize`] rather than `usize` so there is no empty range to answer for: a
 /// zero class count is refused once, in [`classes`], rather than arriving here as a
@@ -572,6 +711,11 @@ fn argmax(n: NonZeroUsize, score: impl Fn(usize) -> f64) -> (usize, f64) {
     })
 }
 
+/// How far past the input rectangle an extent may still be a real box.
+/// Generous: a letterboxed decode legitimately puts boxes outside the
+/// content rectangle, and un-projection is what brings them back.
+const MAX_EXTENT: f64 = 4.0;
+
 /// Center/extent -> corners, dropping anything non-finite or absurdly large.
 ///
 /// The extent bound is not tidiness. `exp()` in the grid decode stays finite up
@@ -582,10 +726,6 @@ fn argmax(n: NonZeroUsize, score: impl Fn(usize) -> f64) -> (usize, f64) {
 /// real is `MAX_EXTENT` times the input rectangle, so cutting there costs
 /// nothing and removes the failure mode.
 fn centered(cx: f64, cy: f64, w: f64, h: f64, size: InputSize) -> Option<ModelBox> {
-    /// How far past the input rectangle an extent may still be a real box.
-    /// Generous: a letterboxed decode legitimately puts boxes outside the
-    /// content rectangle, and un-projection is what brings them back.
-    const MAX_EXTENT: f64 = 4.0;
     let finite = cx.is_finite() && cy.is_finite() && w.is_finite() && h.is_finite();
     let bounded = w <= MAX_EXTENT * size.w as f64 && h <= MAX_EXTENT * size.h as f64;
     (finite && bounded).then(|| {
@@ -596,6 +736,14 @@ fn centered(cx: f64, cy: f64, w: f64, h: f64, size: InputSize) -> Option<ModelBo
             y2: cy + h / 2.0,
         })
     })
+}
+
+/// Corners as a head that already has them: the same refusals as [`centered`],
+/// without a round trip through centre form.
+fn from_corners(x1: f64, y1: f64, x2: f64, y2: f64, size: InputSize) -> Option<ModelBox> {
+    let finite = x1.is_finite() && y1.is_finite() && x2.is_finite() && y2.is_finite();
+    let bounded = x2 - x1 <= MAX_EXTENT * size.w as f64 && y2 - y1 <= MAX_EXTENT * size.h as f64;
+    (finite && bounded).then_some(ModelBox(Bbox { x1, y1, x2, y2 }))
 }
 
 /// Where every layout converges, in this order: candidates the host would
@@ -2457,6 +2605,11 @@ mod tests {
                 strides: STRIDES,
             },
             Layout::DetrQueries { nc: 91 },
+            Layout::SplitDfl {
+                nc: 80,
+                reg_max: 16,
+            },
+            Layout::SplitLtrb { nc: 80 },
         ] {
             let err = check_label_count(layout, &labels(), false)
                 .unwrap_err()
@@ -3160,17 +3313,431 @@ mod tests {
                     SQUARE,
                 )
             },
+            {
+                let split = SplitOutput::new(TINY, 0, 16);
+                refuse(split.spec(), &split.raw(), TINY)
+            },
+            {
+                let split = SplitOutput::new(TINY, 0, 1);
+                refuse(split.spec(), &split.raw(), TINY)
+            },
         ];
         for message in cases {
             assert!(message.contains("no classes"), "{message}");
             // and names the layout, which says whether the profile or the export is
             // the thing to look at
             assert!(
-                ["raw-classes", "grid-objectness", "detr-queries"]
-                    .iter()
-                    .any(|kind| message.contains(kind)),
+                [
+                    "raw-classes",
+                    "grid-objectness",
+                    "detr-queries",
+                    "split-dfl",
+                    "split-ltrb",
+                ]
+                .iter()
+                .any(|kind| message.contains(kind)),
                 "{message}"
             );
         }
+    }
+
+    // ---- split heads: DFL and l/t/r/b over three strides --------------------
+
+    /// A split export's nine tensors in the exporter's order, `box{i}`,
+    /// `cls{i}`, `sum{i}` per level, every value zero until planted.
+    ///
+    /// `reg_max` 1 is the `SplitLtrb` form, whose box channels are the
+    /// distances themselves; anything larger is DFL logits.
+    struct SplitOutput {
+        size: InputSize,
+        nc: usize,
+        reg_max: usize,
+        tensors: Vec<(String, Vec<i64>, Vec<f32>)>,
+    }
+
+    /// Logit standing in for "no mass": `exp(-30)` is 1e-13 of the planted bins.
+    const NO_MASS: f32 = -30.0;
+
+    impl SplitOutput {
+        fn new(size: InputSize, nc: usize, reg_max: usize) -> Self {
+            let mut tensors = Vec::new();
+            for (level, stride) in SPLIT_STRIDES.iter().enumerate() {
+                let (h, w) = (size.h / stride, size.w / stride);
+                for (prefix, channels) in [("box", 4 * reg_max), ("cls", nc), ("sum", 1)] {
+                    tensors.push((
+                        format!("{prefix}{level}"),
+                        vec![1, channels as i64, h as i64, w as i64],
+                        // `sum` is never read; 0.27 is where it floors on the NPU.
+                        vec![if prefix == "sum" { 0.27 } else { 0.0 }; channels * h * w],
+                    ));
+                }
+            }
+            Self {
+                size,
+                nc,
+                reg_max,
+                tensors,
+            }
+        }
+
+        fn layout(&self) -> Layout {
+            match self.reg_max {
+                1 => Layout::SplitLtrb { nc: self.nc },
+                reg_max => Layout::SplitDfl {
+                    nc: self.nc,
+                    reg_max,
+                },
+            }
+        }
+
+        fn spec(&self) -> OutputSpec {
+            OutputSpec {
+                layout: self.layout(),
+                ..YOLOV8.output
+            }
+        }
+
+        /// Plant one cell: class `class` at `score`, and the four distances
+        /// `l, t, r, b` in stride units.
+        ///
+        /// A DFL distance is written as mass on the two bins around it —
+        /// all of it on one when the distance is a whole number — so the
+        /// expectation decoded back out is the distance itself.
+        fn put(
+            &mut self,
+            level: usize,
+            (x, y): (usize, usize),
+            class: usize,
+            score: f32,
+            distances: [f64; 4],
+        ) -> &mut Self {
+            let w = self.size.w / SPLIT_STRIDES[level];
+            let cells = w * (self.size.h / SPLIT_STRIDES[level]);
+            let cell = y * w + x;
+            self.tensors[3 * level + 1].2[class * cells + cell] = score;
+            let reg_max = self.reg_max;
+            let boxes = &mut self.tensors[3 * level].2;
+            for (side, distance) in distances.into_iter().enumerate() {
+                if reg_max == 1 {
+                    boxes[side * cells + cell] = distance as f32;
+                    continue;
+                }
+                let (low, frac) = (distance.floor(), distance.fract());
+                for bin in 0..reg_max {
+                    boxes[(side * reg_max + bin) * cells + cell] = NO_MASS;
+                }
+                let at = |bin: usize| (side * reg_max + bin) * cells + cell;
+                if frac == 0.0 {
+                    boxes[at(low as usize)] = 0.0;
+                } else {
+                    boxes[at(low as usize)] = (1.0 - frac).ln() as f32;
+                    boxes[at(low as usize + 1)] = frac.ln() as f32;
+                }
+            }
+            self
+        }
+
+        /// The tensors a decode reads, picked by name as the detector does;
+        /// the `sum` ones are in `tensors` and never looked up.
+        fn raw(&self) -> Outputs<Raw<'_>> {
+            let level = |prefix: &str, i: usize| {
+                let name = format!("{prefix}{i}");
+                let (_, dims, values) = self
+                    .tensors
+                    .iter()
+                    .find(|(n, ..)| *n == name)
+                    .expect("the fixture carries all nine tensors");
+                Raw {
+                    dims: dims.clone(),
+                    values,
+                }
+            };
+            Outputs::Split {
+                boxes: [0, 1, 2].map(|i| level("box", i)),
+                scores: [0, 1, 2].map(|i| level("cls", i)),
+            }
+        }
+
+        fn decode(&self, projection: &Projection) -> Vec<Det> {
+            decode_output(
+                self.spec(),
+                &self.raw(),
+                &labels(),
+                &open(),
+                self.size,
+                projection,
+            )
+            .unwrap()
+        }
+    }
+
+    /// The wire box for model-pixel corners under a stretch, which is how a
+    /// split profile reports against any source frame.
+    fn stretched(size: InputSize, [x1, y1, x2, y2]: [f64; 4]) -> [f64; 4] {
+        let (w, h) = (size.w as f64, size.h as f64);
+        [x1 / w, y1 / h, (x2 - x1) / w, (y2 - y1) / h]
+    }
+
+    /// Detections equal to the expected ones up to the wire's rounding.
+    ///
+    /// Not `assert_eq!` on rounded boxes: at stride 8 an integer distance puts
+    /// a corner at an odd multiple of 4 px, and `4 * odd / 640` always has a
+    /// 5 in the fifth decimal — a tie the f32 inputs may round either way.
+    fn assert_dets_close(dets: &[Det], expected: &[(&str, f64, [f64; 4])]) {
+        assert_eq!(dets.len(), expected.len(), "{dets:?}");
+        for (det, (label, score, bbox)) in dets.iter().zip(expected) {
+            assert_eq!((det.label.as_str(), det.score), (*label, *score));
+            for (got, want) in det.bbox.iter().zip(bbox) {
+                assert!(
+                    (got - want).abs() <= 6e-5,
+                    "{label}: {:?} vs {bbox:?}",
+                    det.bbox
+                );
+            }
+        }
+    }
+
+    /// One box per level, each a different class, at distances every side of
+    /// which differs so a swapped side cannot cancel.
+    fn plant_three_levels(out: &mut SplitOutput) {
+        out.put(0, (10, 20), 0, 0.9, [1.0, 2.0, 3.0, 4.0])
+            .put(1, (30, 5), 1, 0.8, [2.0, 1.0, 5.0, 3.0])
+            .put(2, (4, 12), 2, 0.7, [3.0, 4.0, 2.0, 1.0]);
+    }
+
+    /// Corners in input pixels, worked by hand from `(x + 0.5 -+ l) * stride`.
+    ///
+    /// Level 0 cell (10, 20): x 10.5 - 1 = 9.5 and 10.5 + 3 = 13.5 at stride 8,
+    /// y 20.5 - 2 = 18.5 and 20.5 + 4 = 24.5.
+    /// Level 1 cell (30, 5): x 30.5 - 2 and 30.5 + 5 at stride 16, y 5.5 - 1
+    /// and 5.5 + 3.
+    /// Level 2 cell (4, 12): x 4.5 - 3 and 4.5 + 2 at stride 32, y 12.5 - 4 and
+    /// 12.5 + 1.
+    const THREE_LEVELS: [(&str, f64, [f64; 4]); 3] = [
+        ("person", 0.9, [76.0, 148.0, 108.0, 196.0]),
+        ("bicycle", 0.8, [456.0, 72.0, 568.0, 136.0]),
+        ("car", 0.7, [48.0, 272.0, 208.0, 432.0]),
+    ];
+
+    fn assert_three_levels(dets: &[Det], size: InputSize) {
+        let expected: Vec<_> = THREE_LEVELS
+            .iter()
+            .map(|(label, score, corners)| (*label, *score, stretched(size, *corners)))
+            .collect();
+        assert_dets_close(dets, &expected);
+    }
+
+    #[test]
+    fn a_dfl_split_head_decodes_a_box_at_each_of_its_three_strides() {
+        for reg_max in [16, 8] {
+            let mut out = SplitOutput::new(SQUARE, NC, reg_max);
+            plant_three_levels(&mut out);
+            assert_three_levels(&out.decode(&Projection::stretch(SQUARE)), SQUARE);
+        }
+    }
+
+    #[test]
+    fn an_ltrb_split_head_reads_its_box_channels_as_the_distances() {
+        let mut out = SplitOutput::new(SQUARE, NC, 1);
+        plant_three_levels(&mut out);
+        assert_three_levels(&out.decode(&Projection::stretch(SQUARE)), SQUARE);
+    }
+
+    #[test]
+    fn a_split_head_is_the_same_boxes_against_a_wide_or_a_four_by_three_source() {
+        // The model input is the source stretched to a square, so the
+        // projection back is a pure per-axis rescale and the source's aspect
+        // cancels: the same normalized boxes whatever the frame was.
+        for reg_max in [16, 8, 1] {
+            let mut out = SplitOutput::new(SQUARE, NC, reg_max);
+            plant_three_levels(&mut out);
+            for source in [WIDE, InputSize { w: 1280, h: 960 }] {
+                let projection = ResizePolicy::Stretch.project(SQUARE, source);
+                assert_three_levels(&out.decode(&projection), SQUARE);
+            }
+        }
+    }
+
+    #[test]
+    fn a_split_head_walks_a_non_square_grid_row_major() {
+        // 640x384: 80 x 48 cells at stride 8. A walk that took the grid as
+        // square, or column-major, would put this cell somewhere else.
+        let size = InputSize { w: 640, h: 384 };
+        for reg_max in [16, 1] {
+            let mut out = SplitOutput::new(size, NC, reg_max);
+            out.put(0, (70, 40), 1, 0.9, [1.0, 2.0, 3.0, 4.0]);
+            let dets = out.decode(&Projection::stretch(size));
+            // x 70.5 - 1 and 70.5 + 3 at stride 8; y 40.5 - 2 and 40.5 + 4
+            let corners = stretched(size, [556.0, 308.0, 588.0, 356.0]);
+            assert_dets_close(&dets, &[("bicycle", 0.9, corners)]);
+        }
+    }
+
+    #[test]
+    fn a_dfl_distance_between_two_bins_is_the_expectation_not_the_argmax_bin() {
+        // 0.25 / 0.75 mass on bins 2 and 3 is a distance of 2.75, where the
+        // argmax bin is 3. Read off the candidate in pixels rather than the
+        // wire's four decimals: f32 logits cost ~1e-7 of a bin, 3e-6 of a
+        // pixel at stride 32, so 1e-4 is two orders above the noise and still
+        // far under what a wrong bin would move (a quarter bin = 2 px at
+        // stride 8).
+        let mut out = SplitOutput::new(SQUARE, NC, 16);
+        out.put(0, (10, 20), 0, 0.9, [2.75, 1.25, 0.5, 14.5]);
+        let candidates = candidates_from(out.spec(), &out.raw(), SQUARE, &labels(), &open())
+            .expect("well-formed");
+        assert_eq!(candidates.len(), 1);
+        let ModelBox(got) = candidates[0].corners;
+        let want = [
+            (10.5 - 2.75) * 8.0,
+            (20.5 - 1.25) * 8.0,
+            (10.5 + 0.5) * 8.0,
+            (20.5 + 14.5) * 8.0,
+        ];
+        for (got, want) in [got.x1, got.y1, got.x2, got.y2].into_iter().zip(want) {
+            assert!((got - want).abs() < 1e-4, "{got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn a_split_head_gates_on_the_class_floor_before_touching_the_box() {
+        for reg_max in [16, 1] {
+            let mut out = SplitOutput::new(SQUARE, NC, reg_max);
+            // 0.0034 is the NPU's floor-level noise in every class of every cell
+            for (name, _, values) in &mut out.tensors {
+                if name.starts_with("cls") {
+                    values.fill(0.0034);
+                }
+            }
+            assert!(out.decode(&Projection::stretch(SQUARE)).is_empty());
+
+            // Box logits that no decode could survive. The gate is what keeps
+            // the decode off them: every cell below the floor still comes out
+            // empty and without error, rather than NaN boxes the finite check
+            // would refuse one by one.
+            for (name, _, values) in &mut out.tensors {
+                if name.starts_with("box") {
+                    values.fill(f32::NAN);
+                }
+            }
+            assert!(out.decode(&Projection::stretch(SQUARE)).is_empty());
+            let below = candidates_from(out.spec(), &out.raw(), SQUARE, &labels(), &open());
+            assert!(below.expect("well-formed").is_empty());
+
+            // ...and a cell that clears the floor does reach its NaN box and is
+            // refused there, not emitted with NaN corners.
+            out.put(1, (3, 3), 0, 0.9, [1.0, 1.0, 1.0, 1.0]);
+            out.tensors[3].2.fill(f32::NAN);
+            assert!(out.decode(&Projection::stretch(SQUARE)).is_empty());
+        }
+
+        // Finite, valid boxes under the floor are no candidates either.
+        let mut out = SplitOutput::new(SQUARE, NC, 1);
+        out.put(0, (10, 10), 0, 0.0034, [1.0; 4])
+            .put(2, (5, 5), 1, 0.0034, [1.0; 4]);
+        let below = candidates_from(out.spec(), &out.raw(), SQUARE, &labels(), &open());
+        assert!(below.expect("well-formed").is_empty());
+
+        // The box read is counted: none below the floor, one per survivor.
+        let calls = std::cell::Cell::new(0);
+        let nc = NonZeroUsize::new(NC).expect("NC is nonzero");
+        let floors = class_floors(nc, &labels(), &open());
+        let walk = |out: &SplitOutput| {
+            let Outputs::Split { boxes, scores } = out.raw() else {
+                unreachable!()
+            };
+            split_head(
+                boxes.each_ref().map(|t| t.values),
+                scores.each_ref().map(|t| t.values),
+                nc,
+                SQUARE,
+                &floors,
+                |_, _, _| {
+                    calls.set(calls.get() + 1);
+                    [1.0; 4]
+                },
+            )
+        };
+        assert!(walk(&out).is_empty());
+        assert_eq!(calls.get(), 0);
+        out.put(1, (3, 3), 0, 0.9, [1.0; 4]);
+        assert_eq!(walk(&out).len(), 1);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_split_cell_between_the_track_floor_and_min_score_is_emitted_as_band() {
+        let mut out = SplitOutput::new(SQUARE, NC, 1);
+        out.put(0, (10, 10), 0, 0.3, [1.0; 4]);
+        let decode = |floors: &ScoreFloors| {
+            decode_output(
+                out.spec(),
+                &out.raw(),
+                &labels(),
+                floors,
+                SQUARE,
+                &Projection::stretch(SQUARE),
+            )
+            .unwrap()
+        };
+        assert!(decode(&floors(r#"{"default":0.5}"#)).is_empty());
+        let dets = decode(&banded());
+        assert_eq!(dets.len(), 1, "{dets:?}");
+        assert_eq!(dets[0].score, 0.3);
+        assert!(!dets[0].evidence);
+    }
+
+    #[test]
+    fn a_split_head_applies_the_floor_and_the_evidence_mark_like_the_other_heads() {
+        let mut out = SplitOutput::new(SQUARE, NC, 1);
+        out.put(0, (10, 10), 2, 0.75, [1.0; 4])
+            .put(1, (10, 10), 0, 0.55, [1.0; 4]);
+        // car holds 0.8, so its 0.75 is gated; person's 0.55 clears 0.3
+        let dets = decode_output(
+            out.spec(),
+            &out.raw(),
+            &labels(),
+            &mixed_floors(),
+            SQUARE,
+            &Projection::stretch(SQUARE),
+        )
+        .unwrap();
+        assert_eq!(dets.len(), 1, "{dets:?}");
+        assert_eq!(dets[0].label, "person");
+        assert!(dets[0].evidence);
+    }
+
+    #[test]
+    fn a_split_head_refuses_tensors_that_are_not_on_its_grid_or_are_short() {
+        let mut out = SplitOutput::new(SQUARE, NC, 16);
+        plant_three_levels(&mut out);
+        let spec = out.spec();
+        let decode = |raw: &Outputs<Raw>| {
+            decode_output(
+                spec,
+                raw,
+                &labels(),
+                &open(),
+                SQUARE,
+                &Projection::stretch(SQUARE),
+            )
+        };
+        assert!(decode(&out.raw()).is_ok());
+
+        // a level at the wrong grid
+        let Outputs::Split { mut boxes, scores } = out.raw() else {
+            unreachable!()
+        };
+        boxes[1].dims = vec![1, 64, 20, 20];
+        assert!(decode(&Outputs::Split { boxes, scores }).is_err());
+
+        // dims that fit over values that do not cover them
+        let Outputs::Split { boxes, mut scores } = out.raw() else {
+            unreachable!()
+        };
+        scores[0].values = &scores[0].values[..100];
+        assert!(decode(&Outputs::Split { boxes, scores }).is_err());
+
+        // a one-tensor read of a split layout
+        assert!(decode(&raw_one(&[0.0; 6], &[1, 1, 6])).is_err());
     }
 }

@@ -1,0 +1,6 @@
+# The same cut of yolo26 is past the zoo's range, as yolo26 is under yolov8's
+# row.
+backend: rknn
+model:
+  rknn: test/support/fixtures/models/stub.rknn
+model_profile: yolo26split

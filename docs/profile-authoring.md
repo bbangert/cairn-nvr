@@ -241,7 +241,7 @@ Two consequences worth an operator's attention:
 | field | menu | where the menu lives |
 |---|---|---|
 | `backend` | `ort`, `rknn`, `qnn` | the release's board (`Cairn.Stage.Board.backends/0`); the generic board's mirrors `BackendKind`, `plugins/cairn-detect/src/infer/backend.rs` |
-| `model_profile` | `yolox`, `yolov10`, `yolov8` (or `yolov9`, `yolo11`, `yolov11`, `yolo26`), `rfdetr` (hyphenated spelling accepted) | `PROFILES`, `plugins/cairn-detect/src/infer/catalog.rs` |
+| `model_profile` | `yolox`, `yolov10`, `yolov8` (or `yolov9`, `yolo11`, `yolov11`, `yolo26`), `rfdetr`, `yolov8split`, `yolo26split` (hyphenated spelling accepted) | `PROFILES`, `plugins/cairn-detect/src/infer/catalog.rs` |
 | `decoder` | `auto`, `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` | the release's board (`Cairn.Stage.Board.decoders/0`); the generic board's are `DecoderKind`, `plugins/cairn-detect/src/decode.rs` |
 | `tracking:` stage keys | `bbd`, `oru`, `ocr`, `twin_mint` | `Cairn.Tracker.Stage.Bbd` / `.Oru` / `.Ocr` / `.TwinMint` |
 
@@ -250,7 +250,10 @@ The `backend` and `decoder` menus shown are the generic board's.
 Each catalog row is a decode contract listing the model families it applies
 to: `yolo11` and `yolov8` share one row because several Ultralytics
 generations export byte-identical tensor layouts, and the error messages say
-which decode contract a family resolves to.
+which decode contract a family resolves to. `yolov8split` and `yolo26split`
+are rows of their own for the same generations exported with the head cut
+before its box decode (`tools/rknn-export`): the tensors differ, so the
+contract does.
 
 `decoder:` and `backend:` are different knobs that both sound like "how do I
 run this fast". `decoder:` is the **video** path — how H.264 frames get
@@ -392,17 +395,21 @@ Two rules come out of it, both from `docs/npu-backends.md`:
 1. **A backend that cannot run the NMS op needs a family that does not need
    one.** Either an NMS-free head (`yolov10`'s end-to-end head, `rfdetr`'s
    queries) or a family cairn suppresses host-side on the CPU (`yolox`,
-   `yolov8`). Every family in today's catalog satisfies this, so the rule
-   cannot fire from the menu as it stands — it is in the code as data so that
-   a family added later with suppression fused into its graph is refused on
-   the NPU backends without anyone having to remember the rule exists.
+   `yolov8`, and the split-head `yolov8split` and `yolo26split`). Every family
+   in today's catalog satisfies this, so the rule cannot fire from the menu
+   as it stands — it is in the code as data so that a family added later with
+   suppression fused into its graph is refused on the NPU backends without
+   anyone having to remember the rule exists.
 
-2. **An rknn conversion nobody here has done must say so.** The rknn model
-   zoo's documented coverage is YOLOv5–v11; a profile pairing `rknn` with any
-   other family (`yolov10`, `rfdetr`, and `yolox`, which no source read here
-   places in that range) must declare `experimental: true`. Undocumented is
-   not "known broken" — it means the artifact is one nobody in this repo has
-   built, which is exactly what the acknowledgement is for.
+2. **An rknn conversion the model zoo does not cover must say so.** The rknn
+   model zoo's documented coverage is YOLOv5–v11; a profile pairing `rknn`
+   with any other family (`yolov10`, `rfdetr`, `yolo26` under either of its
+   profiles, and `yolox`, which no source read here places in that range)
+   must declare `experimental: true`. `yolov8split` is inside the range: its
+   generations are, and its cut is the layout the zoo's own post-process
+   reads. Undocumented is not "known broken" — it means the conversion is
+   outside what the zoo covers, which is exactly what the acknowledgement is
+   for.
 
 Both rules need a family to read. A profile that leaves `model_profile:` unset
 lets the plugin sniff the family from the model's own tensor shapes, which is
@@ -437,8 +444,8 @@ the running config kept. Message shapes as they are emitted:
 ```
 profile my-board: unknown backend "hailo" — the generic board provides ort,
   qnn or rknn
-profile my-board: unknown model_profile "yolov12" (rfdetr, yolov10,
-  yolov8 (or yolov9, yolo11, yolov11, yolo26), yolox)
+profile my-board: unknown model_profile "yolov12" (rfdetr, yolo26split,
+  yolov10, yolov8 (or yolov9, yolo11, yolov11, yolo26), yolov8split, yolox)
 profile my-board: unknown decoder "cuda" — the generic board provides auto,
   nvdec, qsv, sw, v4l2, vaapi or videotoolbox; decoder: is the video decode
   path, the inference runtime is backend:
@@ -451,7 +458,7 @@ profile my-board: sample_fps 6 contradicts fps_band [8, 12] — a declared
 profile my-board: tracking.bbd must be true, false or a params mapping, got 1
 profile my-board: rknn conversion is undocumented for model_profile rfdetr
   (docs/npu-backends.md covers the model zoo's YOLOv5–v11) — declare
-  experimental: true to ship a profile whose artifact nobody here has converted
+  experimental: true to ship a conversion outside it
 profile my-board: model artifact models/gone.rknn does not exist or is not a
   regular file (relative paths resolve against the working directory the plugin
   is spawned from)

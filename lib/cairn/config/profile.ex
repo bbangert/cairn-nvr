@@ -161,24 +161,30 @@ defmodule Cairn.Config.Profile do
   #     remember the rule was here.
   #   * `rknn_conversion:` — whether anything in `docs/npu-backends.md`
   #     documents converting this family with rknn-toolkit2. `:documented` is
-  #     the model zoo's stated YOLOv5–v11 coverage; `:undocumented` is
-  #     everything else, which the research names outright for yolov10 and
-  #     DETR-class and which yolox falls into by silence (Megvii's, outside
-  #     that range, placed there by no source read here). Undocumented is not
-  #     "known broken" — it is "nobody in this repo has converted one", which
-  #     is what `experimental: true` acknowledges.
+  #     the model zoo's stated YOLOv5–v11 coverage, which takes in
+  #     `yolov8split`: its generations are in that range and its cut is the
+  #     layout the zoo's own post-process reads. `:undocumented` is everything
+  #     else, which the research names outright for yolov10 and DETR-class,
+  #     which yolox falls into by silence (Megvii's, outside that range,
+  #     placed there by no source read here), and which yolo26 is in under
+  #     either of its rows. Undocumented is not "known broken" — it is
+  #     "outside what the zoo covers", which is what `experimental: true`
+  #     acknowledges.
   @model_families %{
     "yolox" => %{families: [], nms: :host_side, rknn_conversion: :undocumented},
     "yolov10" => %{families: [], nms: :none, rknn_conversion: :undocumented},
-    # yolo26 belongs to this contract, not yolov10's: the only exports this stack can run
-    # are end2end=False (the NMS-free tail segfaults quantized QNN), whose
-    # raw head is the yolov8 contract — device-proven on yolo26m 2026-08-19.
+    # yolo26 belongs to this contract, not yolov10's: the only whole-head
+    # exports this stack can run are end2end=False (the NMS-free tail
+    # segfaults quantized QNN), whose raw head is the yolov8 contract —
+    # device-proven on yolo26m 2026-08-19.
     "yolov8" => %{
       families: ["yolov9", "yolo11", "yolov11", "yolo26"],
       nms: :host_side,
       rknn_conversion: :documented
     },
-    "rfdetr" => %{families: [], nms: :none, rknn_conversion: :undocumented}
+    "rfdetr" => %{families: [], nms: :none, rknn_conversion: :undocumented},
+    "yolov8split" => %{families: [], nms: :host_side, rknn_conversion: :documented},
+    "yolo26split" => %{families: [], nms: :host_side, rknn_conversion: :undocumented}
   }
 
   @stage_modules %{
@@ -705,8 +711,7 @@ defmodule Cairn.Config.Profile do
       backend != "rknn" or family.rknn_conversion == :documented or experimental,
       "profile #{name}: rknn conversion is undocumented for model_profile " <>
         "#{model_profile} (docs/npu-backends.md covers the model zoo's YOLOv5–v11) — " <>
-        "declare experimental: true to ship a profile whose artifact nobody here has " <>
-        "converted"
+        "declare experimental: true to ship a conversion outside it"
     )
   end
 

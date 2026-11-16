@@ -72,7 +72,14 @@ pub enum Outputs<T> {
     /// regression over queries and the logits a classification over the same
     /// queries, with different trailing extents.
     BoxesAndLogits { boxes: T, logits: T },
+    /// A split head: a box tensor and a class-score tensor per stride level,
+    /// each array in [`SPLIT_STRIDES`] order. The levels' grids differ, so each
+    /// is its own tensor rather than a stretch of one anchor axis.
+    Split { boxes: [T; 3], scores: [T; 3] },
 }
+
+/// The stride of each level of a split head, finest first.
+pub(super) const SPLIT_STRIDES: [usize; 3] = [8, 16, 32];
 
 /// A layout's role structure with nothing attached.
 pub type Roles = Outputs<()>;
@@ -88,6 +95,10 @@ impl<T> Outputs<T> {
                 boxes: f(boxes),
                 logits: f(logits),
             },
+            Self::Split { boxes, scores } => Outputs::Split {
+                boxes: boxes.each_ref().map(&mut f),
+                scores: scores.each_ref().map(&mut f),
+            },
         }
     }
 
@@ -99,6 +110,10 @@ impl<T> Outputs<T> {
                 boxes: f(boxes)?,
                 logits: f(logits)?,
             },
+            Self::Split { boxes, scores } => Outputs::Split {
+                boxes: try_levels(boxes, &mut f)?,
+                scores: try_levels(scores, &mut f)?,
+            },
         })
     }
 
@@ -107,16 +122,22 @@ impl<T> Outputs<T> {
         match self {
             Self::One(one) => vec![one],
             Self::BoxesAndLogits { boxes, logits } => vec![boxes, logits],
+            Self::Split { boxes, scores } => boxes.iter().chain(scores).collect(),
         }
     }
 }
 
+fn try_levels<T, U>(levels: &[T; 3], f: &mut impl FnMut(&T) -> Option<U>) -> Option<[U; 3]> {
+    let [fine, mid, coarse] = levels;
+    Some([f(fine)?, f(mid)?, f(coarse)?])
+}
+
 /// How a detect head's output tensor is laid out.
 ///
-/// The counts here (`nc`, and the anchor total the strides imply) are read off
-/// the model's real output shape by `resolve::fit_layout`; a built-in profile
-/// carries
-/// COCO's 80 only as the shape of the thing to fit.
+/// The counts here (`nc`, `reg_max`, and the anchor total the strides imply)
+/// are read off the model's real output shape by `resolve::fit_layout`; a
+/// built-in profile carries COCO's 80 and DFL's usual 16 only as the shape of
+/// the thing to fit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
     /// `[1, N, 6]` rows of `[x1, y1, x2, y2, score, class_id]` in input
@@ -144,6 +165,22 @@ pub enum Layout {
     /// there is no NMS either — running one would merge the distinct boxes two
     /// queries legitimately place on neighbouring objects.
     DetrQueries { nc: usize },
+    /// An Ultralytics head cut before its box decode, across six tensors (the
+    /// export's per-level `sum` tensors are never read): per level, class
+    /// scores `[1, nc, H, W]`, already sigmoided, and DFL logits
+    /// `[1, 4 * reg_max, H, W]` — for each of the sides l, t, r, b, `reg_max`
+    /// logits whose softmax-weighted bin index is the distance from the cell
+    /// centre to that edge, in stride units (yolov8, yolo11). Strides are
+    /// [`SPLIT_STRIDES`].
+    ///
+    /// The cut exists because the DFL decode does not survive INT8 on the NPU
+    /// these exports target; the host runs it, and only for cells that already
+    /// cleared a class floor.
+    SplitDfl { nc: usize, reg_max: usize },
+    /// The same split with `reg_max` 1: the box tensor is `[1, 4, H, W]` and
+    /// its channels already are the l, t, r, b distances in stride units
+    /// (yolo26's one2one head).
+    SplitLtrb { nc: usize },
 }
 
 impl Layout {
@@ -153,7 +190,9 @@ impl Layout {
             Self::EndToEnd => None,
             Self::RawClasses { nc }
             | Self::GridObjectness { nc, .. }
-            | Self::DetrQueries { nc } => Some(nc),
+            | Self::DetrQueries { nc }
+            | Self::SplitDfl { nc, .. }
+            | Self::SplitLtrb { nc } => Some(nc),
         }
     }
 
@@ -166,6 +205,10 @@ impl Layout {
             Self::DetrQueries { .. } => Outputs::BoxesAndLogits {
                 boxes: (),
                 logits: (),
+            },
+            Self::SplitDfl { .. } | Self::SplitLtrb { .. } => Outputs::Split {
+                boxes: [(); 3],
+                scores: [(); 3],
             },
         }
     }
@@ -180,8 +223,19 @@ impl Layout {
                 grid_anchors(size, strides)
             ),
             Self::DetrQueries { .. } => "[1, Q, 4] boxes with [1, Q, nc] logits".to_string(),
+            Self::SplitDfl { .. } => split_expected("4 * reg_max (reg_max at least 2)", size),
+            Self::SplitLtrb { .. } => split_expected("4", size),
         }
     }
+}
+
+fn split_expected(box_channels: &str, size: InputSize) -> String {
+    let strides: Vec<String> = SPLIT_STRIDES.iter().map(usize::to_string).collect();
+    format!(
+        "box0..box2 [1, {box_channels}, H, W] with cls0..cls2 [1, nc, H, W], each level's H and \
+         W being input {size} over its stride ({})",
+        strides.join("/")
+    )
 }
 
 impl fmt::Display for Layout {
@@ -198,6 +252,10 @@ impl fmt::Display for Layout {
                 )
             }
             Self::DetrQueries { nc } => write!(f, "detr-queries [1, Q, 4] + [1, Q, {nc}]"),
+            Self::SplitDfl { nc, reg_max } => {
+                write!(f, "split-dfl [1, {}, H, W] + [1, {nc}, H, W]", 4 * reg_max)
+            }
+            Self::SplitLtrb { nc } => write!(f, "split-ltrb [1, 4, H, W] + [1, {nc}, H, W]"),
         }
     }
 }
