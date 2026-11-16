@@ -1,0 +1,44 @@
+# Cairn NVR for RK3566 boards (HA Green): the image built with
+# CAIRN_BOARD=rockchip.
+name: Cairn NVR (Rockchip)
+version: "0.1.8"
+slug: cairn_rockchip
+description: >-
+  Presence-detection NVR for RK3566 boards. Inference runs on the CPU until
+  the RKNN engine lands.
+# aarch64 only: the shipped NIFs, canary and Rockchip vendor libraries are
+# arm64. Pulls are platform-pinned by vagus.
+arch:
+  - aarch64
+image: ghcr.io/bbangert/cairn-nvr-rockchip-{arch}
+startup: application
+boot: auto
+# Not the schema default (true): the release's BEAM runs as PID 1 and its
+# erl_child_setup reaps the ffmpeg/port processes it spawns, so reaping needs
+# no init shim — and the QCS6490 host does not ship the one the default execs.
+init: false
+# host_network per D-C5: NAT-free LAN realism for RTSP cameras, WebRTC and
+# mDNS, and the UI directly on host:4000 (host_network add-ons get no port
+# mapping).
+host_network: true
+# MPP picks its codec table by matching /proc/device-tree/compatible; without
+# it MPP registers no codec and the RKNN runtime fails to init.
+devicetree: true
+devices:
+  # The hardware video decoder (MPP).
+  - /dev/mpp_service
+  # The RGA 2D scaler/colour converter; it takes dma-buf fds only.
+  - /dev/rga
+  # The NPU: a DRM device on this kernel, not /dev/rknpu.
+  - /dev/dri/card1
+  - /dev/dri/renderD129
+  # Where MPP allocates decoded frames, and where the buffers RGA and the NPU
+  # share come from.
+  - /dev/dma_heap/system
+  - /dev/dma_heap/system-uncached
+map:
+  # /config read-only: cairn reads CAIRN_CONFIG=/config/config.yml and never
+  # writes it; the operator edits it host-side. /data is always mounted rw by
+  # vagus — no map entry needed.
+  - addon_config
+webui: http://[HOST]:[PORT:4000]
