@@ -34,7 +34,7 @@ for addon in "$@"; do
   fi
   # The mirror copies the working tree, so anything uncommitted or ignored
   # in it (a config.yml with camera credentials, say) would be published.
-  dirty=$(git -C "$SRC" status --porcelain --ignored -- "$addon")
+  dirty=$(git -C "$SRC" status --porcelain --untracked-files=all --ignored -- "$addon")
   if [ -n "$dirty" ]; then
     echo "$addon: deploy/vagus-addon/$addon differs from HEAD; commit or remove:" >&2
     echo "$dirty" >&2
@@ -42,7 +42,7 @@ for addon in "$@"; do
   fi
   summary+=("$addon $version")
 done
-dirty=$(git -C "$SRC" status --porcelain --ignored -- repository.yaml)
+dirty=$(git -C "$SRC" status --porcelain --untracked-files=all --ignored -- repository.yaml)
 if [ -n "$dirty" ]; then
   echo "deploy/vagus-addon/repository.yaml differs from HEAD; commit or remove:" >&2
   echo "$dirty" >&2
