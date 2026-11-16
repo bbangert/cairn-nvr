@@ -174,6 +174,14 @@ def test_dfl_is_the_softmax_expectation():
     assert a.result()["g"]["strides"]["16"]["box_err_px"] == approx(3 * 16 / 4, abs=1e-4)
 
 
+def test_dfl_survives_extreme_finite_logits():
+    x = np.full((64, 1, 1), -1000.0)
+    assert parity._dfl(x) == approx(np.full((4, 1, 1), 7.5))
+    for side, k in enumerate((0, 5, 9, 15)):
+        x[side * 16 + k] = 1000.0
+    assert parity._dfl(x)[:, 0, 0] == approx([0, 5, 9, 15])
+
+
 def test_no_ref_positives_gives_none_not_zero():
     a = parity.Acc("yolox")
     a.add("g", yolox({}), yolox({}))

@@ -45,7 +45,8 @@ def _scores(sbest, rbest, sper, rper):
 def _dfl(x):
     if x.shape[0] == 4:
         return x.astype(np.float64)
-    e = np.exp(x.reshape(4, -1, *x.shape[1:]).astype(np.float64))
+    z = x.reshape(4, -1, *x.shape[1:]).astype(np.float64)
+    e = np.exp(z - z.max(1, keepdims=True))
     return (e / e.sum(1, keepdims=True) * np.arange(e.shape[1]).reshape(1, -1, 1, 1)).sum(1)
 
 
