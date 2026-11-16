@@ -12,7 +12,9 @@ the NPU yet.
 
 1. Add the repository that carries this add-on in the vagus store.
 2. Install "Cairn NVR (Rockchip)" and place your `config.yml` in the add-on's
-   config directory (mounted read-only at `/config`). No shipped profile
+   config directory (mounted read-only at `/config`). vagus creates that
+   directory on the first start, which therefore runs with no cameras:
+   restart once the file is there. No shipped profile
    runs on this board yet — `rk3566-lowfps` names the `rknn` backend, which
    nothing executes. Copy `priv/profiles/generic-ort.yml` under a name of
    your own into a directory beside your config (`/config/profiles`, say),

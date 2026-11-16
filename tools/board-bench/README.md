@@ -83,6 +83,34 @@ curl -H "Authorization: Bearer <integrations.token>" http://192.168.2.155:4000/a
 - A hand-run container is not a vagus app: nothing here exercises the
   add-on's `config.yaml`. `/proc/device-tree` is absent without the add-on's
   `devicetree: true`, which MPP needs before it registers a codec.
-- The board's busybox has no `sed`, `head`, `cut`, `tr`, `tee` or `tar`: edit
-  files on the host and `put` them again.
+- The board's busybox has no `head`, `tr`, `tee`, `tar`, `wc`, `du` or `awk`;
+  `grep`, `sed`, `cut` and `tail` are there.
 - The artifact expires after three days.
+
+## The add-on on a bench board, through vagus
+
+Once the image is on ghcr and the add-on's directory is in a store repository
+the board already has, the same ssh eval channel installs it: it runs inside
+vagus. These are vagus's own functions as the HA Green answered them, not a
+published interface.
+
+```elixir
+slug = "<repository slug>_cairn_rockchip"
+Vagus.Addon.Store.reload()
+{:ok, %{config: c}} = Vagus.Addon.Store.get(slug)
+c = %{c | slug: slug}                     # the store entry carries the bare slug
+{true, nil} = Vagus.Addon.Availability.check(c)
+:ok = Vagus.App.install(c)                # pulls the image; does not start it
+{:ok, _} = Vagus.App.start(slug)          # restart/1 and stop/1 take it too
+```
+
+- The first start creates the two host directories, so it comes up with no
+  cameras. On the Green they are `/root/vagus/addons/addon_configs/<slug>`
+  (mounted read-only at `/config`) and
+  `/root/vagus/addons/addons/data/<slug>` (`/data`). `sftp` the config into
+  the first, then `Vagus.App.restart(slug)`.
+- Remove a hand-loaded image carrying the same tag first, or nothing shows
+  that the pull came from the registry.
+- vagus grants `devices:` as one cgroup rule per node over a read-only bind
+  of the host's `/dev`: a node the add-on does not list is visible and
+  refuses to open.
