@@ -109,7 +109,7 @@ struct Args {
     track_floor_json: Option<String>,
 
     /// Detection model: a yolox, rfdetr, yolov10 or yolov8/yolov9/yolo11/yolo26
-    /// head, as the artifact `--backend` compiles against (`.onnx` for `ort`).
+    /// head, or a split-head export, as the artifact `--backend` compiles against (`.onnx` for `ort`).
     #[arg(long)]
     model: PathBuf,
 
@@ -156,10 +156,11 @@ struct Args {
     embedder_model: Option<PathBuf>,
 
     /// Preprocessing and decode steps to run this model under: `yolox`,
-    /// `rfdetr` (hyphenated spellings accepted), `yolov10` or `yolov8` (or
-    /// `yolov9`, `yolo11`, `yolov11`, `yolo26` — its runnable exports are
-    /// raw-head). Sniffed from the model's own input and output when
-    /// omitted; required when a shape fits more than one profile, and for
+    /// `rfdetr` (hyphenated spellings accepted), `yolov10`, `yolov8` (or
+    /// `yolov9`, `yolo11`, `yolov11`, `yolo26` — its whole-head exports that
+    /// run are raw-head), or `yolov8split` / `yolo26split` for a head cut
+    /// before its box decode. Sniffed from the model's own input and output
+    /// when omitted; required when a shape fits more than one profile, and for
     /// rfdetr, whose exports leave their input geometry dynamic.
     #[arg(long, value_parser = ModelProfile::parse)]
     model_profile: Option<ModelProfile>,

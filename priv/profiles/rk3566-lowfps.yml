@@ -5,7 +5,7 @@
 # backend parses everywhere but executes nowhere yet (only `ort` runs, D-P10),
 # so a group naming this profile must also set `allow_experimental: true`; and
 # nothing in `docs/npu-backends.md` documents converting the yolox family
-# with rknn-toolkit2, so the artifact below is one nobody here has built.
+# with rknn-toolkit2, so the conversion below is outside what it covers.
 experimental: true
 backend: rknn
 model:

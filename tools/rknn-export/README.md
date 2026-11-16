@@ -26,7 +26,9 @@ This toolkit gives an INT8 output tensor one scale. Everything else follows.
   taken from its one2one head), `cls` is the sigmoided scores, `sum` is
   airockchip's early-reject channel. The export sets those names and asserts
   names and shapes before the file reaches its destination; all nine survive
-  into the `.rknn`.
+  into the `.rknn`. `cairn-detect` reads them as `--model-profile
+  yolov8split` (v8/v11) or `yolo26split`, which bind `box*` and `cls*` by
+  those names.
 - **YOLOX survives as one tensor** because its box columns are raw
   regressions, not pixels. The price is a coarse score: boxes and scores
   still share a scale, and the step is 0.025–0.028 (listed under the parity

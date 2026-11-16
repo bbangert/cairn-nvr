@@ -14,6 +14,7 @@ use super::catalog::{names, PROFILES};
 use super::geometry::{InputSize, MAX_INPUT_DIM, MAX_INPUT_PIXELS};
 use super::profile::{
     grid_anchors, show, InputSizeSource, Layout, ModelProfile, OutputSpec, Outputs, Roles, Shapes,
+    SPLIT_STRIDES,
 };
 
 /// Every way this module can refuse to settle a profile or an input size.
@@ -21,11 +22,11 @@ use super::profile::{
 /// One variant per operator-facing failure, each carrying the *values* its
 /// message interpolates. **No variant stores rendered prose**, which is the
 /// property that matters: the wording lives in the `#[error]` attributes and in
-/// the three helpers they call — [`unbindable_hint`], [`expected_profiles`] and
-/// [`describe_outputs`], each a pure function of the values the variant already
-/// holds. So a caller — or a test — can tell an ambiguity from a shape mismatch
-/// without reading prose, and rewording a message for an operator touches the
-/// one message test that asserts that message.
+/// the helpers they call ([`expected_roles`], [`describe_outputs`] and the
+/// like), each a pure function of the values the variant already holds. So a
+/// caller — or a test — can tell an ambiguity from a shape mismatch without
+/// reading prose, and rewording a message for an operator touches the one
+/// message test that asserts that message.
 ///
 /// The notes explaining *why* a given sentence is worded as it is sit on the
 /// variants below.
@@ -44,14 +45,13 @@ use super::profile::{
 /// [`ProfileMismatch`]: ResolveError::ProfileMismatch
 #[derive(Debug, Error)]
 pub(super) enum ResolveError {
-    /// A grid head asked to decode at a size its coarsest stride does not
-    /// divide. See [`check_grid_divides_input`] for why this is fatal rather
-    /// than approximated.
+    /// A grid or split head asked to decode at a size its coarsest stride does
+    /// not divide. See [`check_grid_divides_input`] for why this is fatal
+    /// rather than approximated.
     #[error(
-        "input size {size} is not a multiple of {stride}, the coarsest stride of a \
-         grid-objectness head — its cells would be walked in a layout the model does not \
-         use, putting every box in the wrong cell. Round each axis to a multiple of \
-         {stride}."
+        "input size {size} is not a multiple of {stride}, the head's coarsest stride — its \
+         cells would be walked in a layout the model does not use, putting every box in the \
+         wrong cell. Round each axis to a multiple of {stride}."
     )]
     GridDoesNotDivide { size: InputSize, stride: usize },
 
@@ -61,22 +61,25 @@ pub(super) enum ResolveError {
     #[error("model has no outputs")]
     NoOutputs,
 
-    /// A two-tensor layout whose roles the model's outputs do not settle:
-    /// either no pair fits, or two candidates claim one role. Naming what the
-    /// model offers is the point — a guess at which tensor is which decodes
-    /// plausible garbage.
+    /// A multi-tensor layout whose roles the model's outputs do not settle:
+    /// for DETR, either no pair fits or two candidates claim one role; for a
+    /// split head, a level's tensor is not there under its name. Naming what
+    /// the model offers is the point — a guess at which tensor is which
+    /// decodes plausible garbage.
     #[error(
-        "expected one [1, Q, 4] box output and one [1, Q, nc] logit output over \
-         the same Q queries, but the model offers {}{}",
+        "expected {}, but the model offers {}{}",
+        expected_roles(*roles),
         describe_outputs(declared),
-        unbindable_hint(*unshaped)
+        unbindable_hint(*roles, *unshaped)
     )]
     RolesUnbindable {
+        roles: Roles,
         declared: Vec<Declared>,
         /// The export pinned no shape anywhere, so [`bind_detr_by_name`] was
         /// the last resort and it is the *names* that failed. The message says
         /// what that fallback wanted rather than repeating shapes there are
-        /// none of.
+        /// none of. Only a DETR pair has such a fallback; a split head is bound
+        /// by name always.
         unshaped: bool,
     },
 
@@ -102,7 +105,9 @@ pub(super) enum ResolveError {
     LayoutDoesNotFit {
         proposed: Layout,
         size: InputSize,
-        got: Shapes,
+        /// Boxed in both variants: a split head's six shapes would otherwise
+        /// put every `Result` in this module past `result_large_err`.
+        got: Box<Shapes>,
     },
 
     /// A tensor whose extents disagree with an *already resolved* layout, from
@@ -115,7 +120,7 @@ pub(super) enum ResolveError {
     OutputShapeMismatch {
         layout: Layout,
         size: InputSize,
-        got: Shapes,
+        got: Box<Shapes>,
     },
 
     /// `--model-profile` named a profile that does not describe this model.
@@ -130,11 +135,6 @@ pub(super) enum ResolveError {
     /// to it and [`ModelProfile`]'s own `Display` writes nothing else — and a
     /// profile by value rides the `Err` side of every function in this module,
     /// which `clippy::result_large_err` objects to once it crosses 128 bytes.
-    /// Measured under `rustc -O` when this was written: `ModelProfile` is 136
-    /// bytes and would put the enum at 168, where the name keeps it at 104.
-    /// Those are a measurement at one point in time, not an invariant —
-    /// `result_large_err` is the gate, the numbers are only what motivated the
-    /// choice.
     #[error("--model-profile {profile} does not describe model {}", model.display())]
     ProfileMismatch {
         profile: &'static str,
@@ -268,13 +268,26 @@ pub(super) enum ResolveError {
     },
 }
 
+/// What [`ResolveError::RolesUnbindable`] says the layout wanted.
+fn expected_roles(roles: Roles) -> &'static str {
+    match roles {
+        Outputs::One(()) => "one output",
+        Outputs::BoxesAndLogits { .. } => {
+            "one [1, Q, 4] box output and one [1, Q, nc] logit output over the same Q queries"
+        }
+        Outputs::Split { .. } => {
+            "outputs named box0, box1, box2 and cls0, cls1, cls2 (sum0..sum2 are not read)"
+        }
+    }
+}
+
 /// The tail of [`ResolveError::RolesUnbindable`], when there was no shape to
-/// read the roles from.
+/// read a DETR pair's roles from.
 ///
 /// The shape rule had nothing to work with, so the message says what the name
 /// fallback wanted rather than repeating shapes the export never declared.
-fn unbindable_hint(unshaped: bool) -> &'static str {
-    if unshaped {
+fn unbindable_hint(roles: Roles, unshaped: bool) -> &'static str {
+    if unshaped && matches!(roles, Outputs::BoxesAndLogits { .. }) {
         "; with no shape to read the roles from, the names have to say which \
          is which (pred_boxes/logits or dets/labels)"
     } else {
@@ -292,23 +305,29 @@ fn expected_profiles(size: InputSize) -> String {
         .join(", ")
 }
 
-/// A grid head only decodes at a size its strides divide.
+/// A grid or split head only decodes at a size its strides divide.
 ///
 /// [`grid_anchors`] floor-divides, and so does the walk in
 /// `heads::grid_objectness`. At a size the coarsest stride does not divide,
-/// both
-/// agree with each other and neither agrees with the model: a real head lays
-/// its cells out by the ceiling its own downsampling produced. The total-count
-/// check in [`validate_layout`] catches that whenever the two totals differ,
-/// but they can coincide — and when they do every box lands in the wrong cell,
-/// which is wrong coordinates with nothing on stderr. So the size is rejected
-/// at startup instead, where the operator who typed it is still watching.
+/// both agree with each other and neither agrees with the model: a real head
+/// lays its cells out by the ceiling its own downsampling produced. The
+/// total-count check in [`validate_layout`] catches that whenever the two
+/// totals differ, but they can coincide — and when they do every box lands in
+/// the wrong cell, which is wrong coordinates with nothing on stderr. So the
+/// size is rejected at startup instead, where the operator who typed it is
+/// still watching.
+///
+/// A split head cannot coincide that way — [`split_channels`] holds every
+/// level to `size / stride` — but its refusal would be shapes that fit
+/// nothing; this one names the size.
 pub(super) fn check_grid_divides_input(
     layout: Layout,
     size: InputSize,
 ) -> Result<(), ResolveError> {
-    let Layout::GridObjectness { strides, .. } = layout else {
-        return Ok(());
+    let strides = match layout {
+        Layout::GridObjectness { strides, .. } => strides,
+        Layout::SplitDfl { .. } | Layout::SplitLtrb { .. } => &SPLIT_STRIDES,
+        _ => return Ok(()),
     };
     let Some(&coarsest) = strides.iter().max() else {
         return Ok(());
@@ -394,6 +413,16 @@ pub(super) fn static_output_dims(dtype: &ValueType) -> Option<Vec<i64>> {
 /// leaves the shape rule nothing to read, and falls back to
 /// [`bind_detr_by_name`]. See its comment for why that is safe here and not a
 /// general licence to bind by name.
+///
+/// [`Outputs::Split`] binds by *name*, the opposite choice to the DETR rule
+/// above and for the opposite reason. DETR exporters we do not control
+/// disagree about names; a split head's names are set and asserted by this
+/// repo's own exporter, and its shapes do not always tell a level's box
+/// tensor from its class tensor: 64 classes under DFL, or 4 under ltrb, and
+/// the two are one shape.
+/// Only exactly `box0..box2` and `cls0..cls2` bind; the exporter's `sum*` and
+/// anything else are never looked at, and a missing name is an error rather
+/// than a fallback to position.
 fn bind(roles: Roles, declared: &[Declared]) -> Result<Outputs<Declared>, ResolveError> {
     match roles {
         Outputs::One(()) => declared
@@ -433,8 +462,26 @@ fn bind(roles: Roles, declared: &[Declared]) -> Result<Outputs<Declared>, Resolv
             paired
                 .or_else(|| unshaped.then(|| bind_detr_by_name(declared)).flatten())
                 .ok_or_else(|| ResolveError::RolesUnbindable {
+                    roles,
                     declared: declared.to_vec(),
                     unshaped,
+                })
+        }
+        Outputs::Split { .. } => {
+            let named = |prefix: &str| -> Option<[Declared; 3]> {
+                let level = |i: usize| {
+                    let name = format!("{prefix}{i}");
+                    declared.iter().find(|output| output.name == name).cloned()
+                };
+                Some([level(0)?, level(1)?, level(2)?])
+            };
+            named("box")
+                .zip(named("cls"))
+                .map(|(boxes, scores)| Outputs::Split { boxes, scores })
+                .ok_or_else(|| ResolveError::RolesUnbindable {
+                    roles,
+                    declared: declared.to_vec(),
+                    unshaped: false,
                 })
         }
     }
@@ -492,9 +539,9 @@ fn static_shapes(roles: Roles, declared: &[Declared]) -> Option<Shapes> {
 /// fit.
 ///
 /// Nothing here guesses: the layout kind is given, and this only fills in what
-/// the shape declares (`nc`) and refuses shapes the kind cannot describe.
+/// the shape declares (`nc`, a split head's `reg_max`) and refuses shapes the kind cannot describe.
 fn fit_layout(layout: Layout, shapes: &Shapes, size: InputSize) -> Result<Layout, ResolveError> {
-    // Every arm requires the roles to match first, so a two-tensor shape can
+    // Every arm requires the roles to match first, so a multi-tensor shape can
     // never be read as a one-tensor head or the reverse.
     let fitted = match (layout, shapes) {
         (Layout::EndToEnd, Outputs::One(dims)) if rank3(dims) && dims[2] == 6 => {
@@ -528,18 +575,69 @@ fn fit_layout(layout: Layout, shapes: &Shapes, size: InputSize) -> Result<Layout
                 nc: logits[2] as usize,
             })
         }
+        // A split head's `reg_max` is what the box channel count says it is,
+        // so the two layouts claim disjoint shapes: 4 channels is `SplitLtrb`
+        // alone, and `SplitDfl` takes only 4 x (2 or more).
+        (Layout::SplitDfl { .. }, Outputs::Split { boxes, scores }) => {
+            split_channels(boxes, scores, size).and_then(|(box_ch, nc)| {
+                (box_ch % 4 == 0 && box_ch >= 8 && nc >= 1).then_some(Layout::SplitDfl {
+                    nc: nc as usize,
+                    reg_max: (box_ch / 4) as usize,
+                })
+            })
+        }
+        (Layout::SplitLtrb { .. }, Outputs::Split { boxes, scores }) => {
+            split_channels(boxes, scores, size).and_then(|(box_ch, nc)| {
+                (box_ch == 4 && nc >= 1).then_some(Layout::SplitLtrb { nc: nc as usize })
+            })
+        }
         _ => None,
     };
     fitted.ok_or_else(|| ResolveError::LayoutDoesNotFit {
         proposed: layout,
         size,
-        got: shapes.clone(),
+        got: Box::new(shapes.clone()),
     })
 }
 
-/// A single-frame rank-3 output, the shape every layout here indexes.
+/// A single-frame rank-3 output, the shape every layout but a split head
+/// indexes.
 fn rank3(dims: &[i64]) -> bool {
     dims.len() == 3 && dims[0] == 1
+}
+
+/// A split head's box and class channel counts, if every level is a
+/// single-frame rank-4 tensor on exactly its stride's grid and the levels
+/// agree with each other.
+///
+/// The grid is `size / stride` exactly. An input the coarsest stride does not
+/// divide fits nothing: the head's own downsampling rounds its grids, and
+/// the decode walks `size / stride` cells, so the two would disagree. Counts
+/// are not range-checked here; each caller knows what it accepts.
+fn split_channels(
+    boxes: &[Vec<i64>; 3],
+    scores: &[Vec<i64>; 3],
+    size: InputSize,
+) -> Option<(i64, i64)> {
+    let coarsest = SPLIT_STRIDES[SPLIT_STRIDES.len() - 1];
+    if !size.w.is_multiple_of(coarsest) || !size.h.is_multiple_of(coarsest) {
+        return None;
+    }
+    let mut channels = [0i64; 2];
+    for (slot, tensors) in channels.iter_mut().zip([boxes, scores]) {
+        for (level, (dims, stride)) in tensors.iter().zip(SPLIT_STRIDES).enumerate() {
+            let grid = [(size.h / stride) as i64, (size.w / stride) as i64];
+            if dims.len() != 4 || dims[0] != 1 || dims[2..] != grid[..] {
+                return None;
+            }
+            if level == 0 {
+                *slot = dims[1];
+            } else if *slot != dims[1] {
+                return None;
+            }
+        }
+    }
+    Some((channels[0], channels[1]))
 }
 
 /// Does a *resolved* layout describe `dims` exactly?
@@ -572,13 +670,19 @@ pub(super) fn validate_layout(
                 && boxes[1] == logits[1]
                 && logits[2] == nc as i64
         }
+        (Layout::SplitDfl { nc, reg_max }, Outputs::Split { boxes, scores }) => {
+            split_channels(boxes, scores, size) == Some(((4 * reg_max) as i64, nc as i64))
+        }
+        (Layout::SplitLtrb { nc }, Outputs::Split { boxes, scores }) => {
+            split_channels(boxes, scores, size) == Some((4, nc as i64))
+        }
         _ => false,
     };
     if !ok {
         return Err(ResolveError::OutputShapeMismatch {
             layout,
             size,
-            got: shapes.clone(),
+            got: Box::new(shapes.clone()),
         });
     }
     Ok(())
@@ -646,10 +750,11 @@ pub(super) fn resolve_profile(
         Some(shapes) => Some(fit_output(profile.output, &shapes, size).map_err(mismatch)?),
         // A dynamic output shape declares nothing to validate against; the
         // input half is still fully known, so frames can be packed correctly
-        // and only `nc` waits for the first real output. This covers the
-        // two-tensor families as well as the one-tensor ones: `bind` has
-        // already settled the roles above — by shape where the export pins
-        // them, by name where it pins nothing — and `decode_output` re-checks
+        // and only the counts (`nc`, a split head's `reg_max`) wait for the
+        // first real output. This covers the multi-tensor families as well as
+        // the one-tensor ones: `bind` has already settled the roles above — by
+        // shape where the export pins them, by name where it pins nothing (a
+        // split head is always bound by name) — and `decode_output` re-checks
         // the layout against the real dims on every frame, so a deferral that
         // guessed wrong fails on the first output rather than decoding it.
         None => None,
@@ -832,7 +937,7 @@ mod tests {
 
     use ort::value::ValueType;
 
-    use super::super::catalog::{RFDETR, YOLOV10, YOLOV8, YOLOX};
+    use super::super::catalog::{RFDETR, YOLO26_SPLIT, YOLOV10, YOLOV8, YOLOV8_SPLIT, YOLOX};
     use super::super::encoding::TensorEncoding;
     use super::super::geometry::{InputSize, ResizePolicy};
     use super::super::profile::*;
@@ -908,7 +1013,14 @@ mod tests {
         assert_eq!(ModelProfile::parse("  YOLOX ").unwrap(), YOLOX);
         assert_eq!(ModelProfile::parse("RFDETR").unwrap(), RFDETR);
         let err = ModelProfile::parse("yolov7").unwrap_err().to_string();
-        for expected in ["yolox", "yolov10", "yolov8", "rfdetr"] {
+        for expected in [
+            "yolox",
+            "yolov10",
+            "yolov8",
+            "rfdetr",
+            "yolov8split",
+            "yolo26split",
+        ] {
             assert!(err.contains(expected), "{err}");
         }
         // and the error names the families too, because `yolo11` resolving to
@@ -925,16 +1037,18 @@ mod tests {
         for name in ["yolov8", "yolov9", "yolo11", "yolov11", "yolo26"] {
             assert_eq!(ModelProfile::parse(name).unwrap(), YOLOV8, "{name}");
         }
-        // yolo26 sat under yolov10 until a real export disproved it: the
-        // only runnable YOLO26 exports are raw-head (see the catalog doc).
+        // yolo26 sat under yolov10 until a real export disproved it: a
+        // whole-head YOLO26 export that runs is raw-head (see the catalog doc).
         assert_ne!(ModelProfile::parse("yolo26").unwrap(), YOLOV10);
         // hyphens are spelling, not identity — normalized at parse
         assert_eq!(ModelProfile::parse("rf-detr").unwrap(), RFDETR);
+        assert_eq!(ModelProfile::parse("yolov8-split").unwrap(), YOLOV8_SPLIT);
+        assert_eq!(ModelProfile::parse("YOLO26-Split").unwrap(), YOLO26_SPLIT);
         // a family resolves to the contract's canonical identity, so the
         // startup line and every error say `yolov8`, not the family name
         assert_eq!(ModelProfile::parse("yolo11").unwrap().to_string(), "yolov8");
         // ...and one profile per distinct decode keeps sniffing unambiguous
-        assert_eq!(PROFILES.len(), 4);
+        assert_eq!(PROFILES.len(), 6);
         assert_eq!(sniff(&declared(&[1, 84, 8400]), SQUARE).len(), 1);
         assert_eq!(sniff(&declared(&[1, 300, 6]), SQUARE).len(), 1);
     }
@@ -977,7 +1091,16 @@ mod tests {
         assert_eq!(RFDETR.output.layout, Layout::DetrQueries { nc: 91 });
         assert_eq!(RFDETR.output.score, ScoreComposition::SigmoidClass);
         assert!(RFDETR.output.nms.is_none());
-        // it is the only family here that reads more than one tensor
+
+        for (profile, layout) in [(YOLOV8_SPLIT, DFL), (YOLO26_SPLIT, LTRB)] {
+            assert_eq!(profile.input.encoding, TensorEncoding::UnitRgb);
+            assert_eq!(profile.input.resize, ResizePolicy::Stretch);
+            assert_eq!(profile.input.size, SQUARE);
+            assert_eq!(profile.output.layout, layout);
+            assert_eq!(profile.output.score, ScoreComposition::Class);
+            assert_eq!(profile.output.nms, Some(DEFAULT_NMS));
+        }
+        // it is the only family here that reads a boxes-and-logits pair
         for profile in PROFILES {
             let two = matches!(
                 profile.output.layout.roles(),
@@ -1294,7 +1417,7 @@ mod tests {
             "{proposed:?}"
         );
         assert_eq!(*size, SQUARE);
-        assert_eq!(*got, one(&[1, 3549, 85]));
+        assert_eq!(**got, one(&[1, 3549, 85]));
         // an end-to-end profile pointed at a raw head
         assert!(resolve_profile(
             Some(YOLOV10),
@@ -1332,7 +1455,7 @@ mod tests {
         };
         assert_eq!(*layout, Layout::EndToEnd);
         assert_eq!(*size, SQUARE);
-        assert_eq!(*got, one(&[1, 300, 7]));
+        assert_eq!(**got, one(&[1, 300, 7]));
 
         // A resolved layout is checked on extents alone, so the shape the
         // sniffing heuristic would refuse — one anchor is not "far longer" than
@@ -1519,6 +1642,7 @@ mod tests {
         let ResolveError::RolesUnbindable {
             declared: offered,
             unshaped,
+            ..
         } = &err
         else {
             panic!("{err:?}");
@@ -1543,6 +1667,7 @@ mod tests {
         let ResolveError::RolesUnbindable {
             declared: offered,
             unshaped,
+            ..
         } = &err
         else {
             panic!("{err:?}");
@@ -1559,6 +1684,7 @@ mod tests {
         let ResolveError::RolesUnbindable {
             declared: offered,
             unshaped,
+            ..
         } = &err
         else {
             panic!("{err:?}");
@@ -2058,8 +2184,24 @@ mod tests {
             assert!(check_grid_divides_input(grid, size).is_ok(), "{size}");
         }
         // and no other layout has a grid to divide
-        for layout in [Layout::EndToEnd, Layout::RawClasses { nc: 80 }] {
+        for layout in [
+            Layout::EndToEnd,
+            Layout::RawClasses { nc: 80 },
+            Layout::DetrQueries { nc: 91 },
+        ] {
             assert!(check_grid_divides_input(layout, InputSize { w: 640, h: 350 }).is_ok());
+        }
+
+        // a split head walks `size / stride` per level, so it is held to 32 too
+        for layout in [DFL, LTRB] {
+            for size in [SQUARE, InputSize { w: 640, h: 384 }] {
+                assert!(check_grid_divides_input(layout, size).is_ok(), "{size}");
+            }
+            let err = check_grid_divides_input(layout, InputSize { w: 640, h: 350 }).unwrap_err();
+            assert!(
+                matches!(err, ResolveError::GridDoesNotDivide { stride: 32, .. }),
+                "{err:?}"
+            );
         }
     }
 
@@ -2093,6 +2235,303 @@ mod tests {
         );
     }
 
+    // ---- split heads --------------------------------------------------------
+
+    /// What a split export declares, in the exporter's order: `box{i}`,
+    /// `cls{i}`, `sum{i}` per level, every extent on its stride's grid.
+    fn declared_split(box_ch: i64, nc: i64, size: InputSize) -> Vec<Declared> {
+        (0..3)
+            .flat_map(|level| {
+                let (h, w) = (
+                    (size.h / SPLIT_STRIDES[level]) as i64,
+                    (size.w / SPLIT_STRIDES[level]) as i64,
+                );
+                [("box", box_ch), ("cls", nc), ("sum", 1)].map(|(prefix, channels)| Declared {
+                    name: format!("{prefix}{level}"),
+                    dims: Some(vec![1, channels, h, w]),
+                })
+            })
+            .collect()
+    }
+
+    fn split_shapes(box_ch: i64, nc: i64, size: InputSize) -> Shapes {
+        let level = |channels: i64| {
+            [0, 1, 2].map(|i| {
+                vec![
+                    1,
+                    channels,
+                    (size.h / SPLIT_STRIDES[i]) as i64,
+                    (size.w / SPLIT_STRIDES[i]) as i64,
+                ]
+            })
+        };
+        Outputs::Split {
+            boxes: level(box_ch),
+            scores: level(nc),
+        }
+    }
+
+    const DFL: Layout = Layout::SplitDfl {
+        nc: 80,
+        reg_max: 16,
+    };
+    const LTRB: Layout = Layout::SplitLtrb { nc: 80 };
+
+    #[test]
+    fn a_split_head_is_bound_by_name_whatever_order_the_export_lists_them_in() {
+        let mut shuffled = declared_split(64, 80, SQUARE);
+        shuffled.reverse();
+        shuffled.swap(1, 6);
+        for layout in [DFL, LTRB] {
+            let names = bind(layout.roles(), &shuffled)
+                .unwrap()
+                .map(|output| output.name.clone());
+            assert_eq!(
+                names,
+                Outputs::Split {
+                    boxes: ["box0", "box1", "box2"].map(String::from),
+                    scores: ["cls0", "cls1", "cls2"].map(String::from),
+                }
+            );
+        }
+        // the `sum` tensors are tolerated absent too: they are never read
+        let without_sums: Vec<Declared> = declared_split(64, 80, SQUARE)
+            .into_iter()
+            .filter(|output| !output.name.starts_with("sum"))
+            .collect();
+        assert!(bind(DFL.roles(), &without_sums).is_ok());
+    }
+
+    #[test]
+    fn a_split_head_missing_a_name_is_refused_not_bound_by_position() {
+        let roles = DFL.roles();
+        for missing in ["cls1", "box0", "box2", "cls0"] {
+            let declared: Vec<Declared> = declared_split(64, 80, SQUARE)
+                .into_iter()
+                .filter(|output| output.name != missing)
+                .collect();
+            let err = bind(roles, &declared).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ResolveError::RolesUnbindable {
+                        unshaped: false,
+                        ..
+                    }
+                ),
+                "{missing}: {err:?}"
+            );
+        }
+        // nine outputs under other names are the same refusal: a model whose
+        // first output merely has the right rank is not a split head
+        let renamed: Vec<Declared> = declared_split(64, 80, SQUARE)
+            .into_iter()
+            .map(|output| Declared {
+                name: format!("out_{}", output.name),
+                ..output
+            })
+            .collect();
+        assert!(bind(roles, &renamed).is_err());
+    }
+
+    #[test]
+    fn fitting_a_split_head_reads_nc_and_reg_max_off_the_shapes() {
+        assert_eq!(
+            fit_layout(DFL, &split_shapes(64, 3, SQUARE), SQUARE).unwrap(),
+            Layout::SplitDfl { nc: 3, reg_max: 16 }
+        );
+        assert_eq!(
+            fit_layout(DFL, &split_shapes(32, 80, SQUARE), SQUARE).unwrap(),
+            Layout::SplitDfl { nc: 80, reg_max: 8 }
+        );
+        assert_eq!(
+            fit_layout(LTRB, &split_shapes(4, 91, SQUARE), SQUARE).unwrap(),
+            Layout::SplitLtrb { nc: 91 }
+        );
+        // the grid is the size's, not 640's
+        let wide = InputSize { w: 640, h: 384 };
+        assert_eq!(
+            fit_layout(LTRB, &split_shapes(4, 80, wide), wide).unwrap(),
+            LTRB
+        );
+        // 4 channels is `reg_max` 1, which is never a DFL: the layouts claim
+        // disjoint shapes
+        assert!(fit_layout(DFL, &split_shapes(4, 80, SQUARE), SQUARE).is_err());
+        assert!(fit_layout(LTRB, &split_shapes(64, 80, SQUARE), SQUARE).is_err());
+    }
+
+    #[test]
+    fn a_split_head_off_its_grid_or_inconsistent_across_levels_fits_nothing() {
+        let fits = |layout, shapes: &Shapes, size| fit_layout(layout, shapes, size).is_ok();
+        assert!(fits(DFL, &split_shapes(64, 80, SQUARE), SQUARE));
+
+        // a grid that is 416's at a 640 input
+        assert!(!fits(DFL, &split_shapes(64, 80, YOLOX_416), SQUARE));
+        // a width and height swapped
+        let wide = InputSize { w: 640, h: 384 };
+        assert!(!fits(
+            DFL,
+            &split_shapes(64, 80, InputSize { w: 384, h: 640 }),
+            wide
+        ));
+
+        let Outputs::Split { boxes, scores } = split_shapes(64, 80, SQUARE) else {
+            unreachable!()
+        };
+        let with = |boxes: [Vec<i64>; 3], scores: [Vec<i64>; 3]| Outputs::Split { boxes, scores };
+        // box channels that differ between levels
+        let mut mixed = boxes.clone();
+        mixed[2][1] = 32;
+        assert!(!fits(DFL, &with(mixed, scores.clone()), SQUARE));
+        // class channels that differ between levels
+        let mut mixed = scores.clone();
+        mixed[1][1] = 79;
+        assert!(!fits(DFL, &with(boxes.clone(), mixed), SQUARE));
+        // no classes at all
+        assert!(!fits(DFL, &split_shapes(64, 0, SQUARE), SQUARE));
+        // box channels no `reg_max` explains
+        assert!(!fits(DFL, &split_shapes(66, 80, SQUARE), SQUARE));
+        // rank 3 where rank 4 is read
+        let mut flat = boxes.clone();
+        flat[0] = vec![1, 64, 6400];
+        assert!(!fits(DFL, &with(flat, scores.clone()), SQUARE));
+        // a batch that is not one
+        let mut batched = scores.clone();
+        batched[0][0] = 2;
+        assert!(!fits(DFL, &with(boxes, batched), SQUARE));
+
+        // An input the coarsest stride does not divide has no grid to walk,
+        // however the tensors are written: these are on the floor-divided
+        // grids of 640x350.
+        let ragged = InputSize { w: 640, h: 350 };
+        assert!(!fits(DFL, &split_shapes(64, 80, ragged), ragged));
+        assert!(!fits(LTRB, &split_shapes(4, 80, ragged), ragged));
+    }
+
+    #[test]
+    fn a_resolved_split_layout_is_validated_exactly() {
+        let ok = |layout, shapes: &Shapes, size| validate_layout(layout, shapes, size).is_ok();
+        assert!(ok(DFL, &split_shapes(64, 80, SQUARE), SQUARE));
+        assert!(ok(LTRB, &split_shapes(4, 80, SQUARE), SQUARE));
+        // nc and reg_max are exact, not fitted
+        assert!(!ok(DFL, &split_shapes(64, 79, SQUARE), SQUARE));
+        assert!(!ok(DFL, &split_shapes(32, 80, SQUARE), SQUARE));
+        assert!(!ok(LTRB, &split_shapes(4, 79, SQUARE), SQUARE));
+        assert!(!ok(LTRB, &split_shapes(64, 80, SQUARE), SQUARE));
+        // the grid is exact
+        assert!(!ok(DFL, &split_shapes(64, 80, YOLOX_416), SQUARE));
+        assert!(!ok(LTRB, &split_shapes(4, 80, TINY), SQUARE));
+        // one tensor is not six
+        assert!(!ok(DFL, &one(&[1, 64, 80, 80]), SQUARE));
+        assert!(!ok(
+            RFDETR.output.layout,
+            &split_shapes(64, 80, SQUARE),
+            SQUARE
+        ));
+        // a head declaring no classes validates, so `classes` is what refuses it
+        assert!(ok(
+            Layout::SplitLtrb { nc: 0 },
+            &split_shapes(4, 0, SQUARE),
+            SQUARE
+        ));
+    }
+
+    #[test]
+    fn a_split_model_sniffs_by_its_box_channels_and_nothing_else_sniffs_as_split() {
+        let names = |declared: &[Declared], size| -> Vec<&'static str> {
+            sniff(declared, size).iter().map(|p| p.name).collect()
+        };
+        assert_eq!(
+            names(&declared_split(64, 80, SQUARE), SQUARE),
+            ["yolov8split"]
+        );
+        assert_eq!(
+            names(&declared_split(4, 80, SQUARE), SQUARE),
+            ["yolo26split"]
+        );
+        let sniffed = sniff(&declared_split(64, 5, SQUARE), SQUARE);
+        assert_eq!(
+            sniffed[0].output.layout,
+            Layout::SplitDfl { nc: 5, reg_max: 16 }
+        );
+        let wide = InputSize { w: 640, h: 384 };
+        assert_eq!(names(&declared_split(4, 80, wide), wide), ["yolo26split"]);
+
+        // a model whose outputs are the right ranks under other names, or at
+        // the wrong grid, is no split head
+        let mut renamed = declared_split(64, 80, SQUARE);
+        renamed[3].name = "other".into();
+        assert!(names(&renamed, SQUARE).is_empty());
+        assert!(names(&declared_split(64, 80, YOLOX_416), SQUARE).is_empty());
+
+        // the right names over rank-3 dims fit no split layout: the names
+        // bind and the shapes refuse. (The first output alone still reads as
+        // a one-tensor head, as for any model with extra outputs.)
+        let mut flat = declared_split(64, 80, SQUARE);
+        for output in &mut flat {
+            output.dims = Some(vec![1, 64, 6400]);
+        }
+        let sniffed = names(&flat, SQUARE);
+        assert!(
+            sniffed.iter().all(|name| !name.ends_with("split")),
+            "{sniffed:?}"
+        );
+        assert!(names(&declared_detr(300, 91), InputSize::square(384)) == ["rfdetr"]);
+    }
+
+    #[test]
+    fn a_dynamic_split_export_is_bound_by_name_and_fitted_on_the_first_real_shapes() {
+        let dynamic: Vec<Declared> = declared_split(64, 80, SQUARE)
+            .into_iter()
+            .map(|output| Declared {
+                dims: None,
+                ..output
+            })
+            .collect();
+        let err = sniff_profile(&dynamic, SQUARE, Path::new("m.onnx")).unwrap_err();
+        assert!(
+            matches!(err, ResolveError::NothingToSniff { .. }),
+            "{err:?}"
+        );
+
+        let (_, names, output) =
+            resolve_profile(Some(YOLOV8_SPLIT), &dynamic, SQUARE, Path::new("m.onnx")).unwrap();
+        assert!(output.is_none(), "the counts wait for the first output");
+        assert_eq!(names.each().len(), 6);
+        assert_eq!(
+            fit_layout(DFL, &split_shapes(32, 3, SQUARE), SQUARE).unwrap(),
+            Layout::SplitDfl { nc: 3, reg_max: 8 }
+        );
+    }
+
+    #[test]
+    fn a_split_profile_named_against_a_one_tensor_model_is_a_mismatch() {
+        let err = resolve_profile(
+            Some(YOLO26_SPLIT),
+            &declared(&[1, 84, 8400]),
+            SQUARE,
+            Path::new("m.onnx"),
+        )
+        .unwrap_err();
+        let ResolveError::ProfileMismatch { source, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert!(matches!(**source, ResolveError::RolesUnbindable { .. }));
+
+        // and against a split model of the other kind, the shape is what says so
+        let err = resolve_profile(
+            Some(YOLO26_SPLIT),
+            &declared_split(64, 80, SQUARE),
+            SQUARE,
+            Path::new("m.onnx"),
+        )
+        .unwrap_err();
+        let ResolveError::ProfileMismatch { source, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert!(matches!(**source, ResolveError::LayoutDoesNotFit { .. }));
+    }
+
     // ---- the operator-facing messages ---------------------------------------
     //
     // One test per variant, and the only place any of this prose is asserted.
@@ -2109,9 +2548,9 @@ mod tests {
                 stride: 32,
             }
             .to_string(),
-            "input size 640x350 is not a multiple of 32, the coarsest stride of a grid-objectness \
-             head — its cells would be walked in a layout the model does not use, putting every \
-             box in the wrong cell. Round each axis to a multiple of 32."
+            "input size 640x350 is not a multiple of 32, the head's coarsest stride — its cells \
+             would be walked in a layout the model does not use, putting every box in the wrong \
+             cell. Round each axis to a multiple of 32."
         );
     }
 
@@ -2127,7 +2566,9 @@ mod tests {
 
     #[test]
     fn the_roles_unbindable_message_falls_back_to_names_only_when_unshaped() {
+        let detr = Layout::DetrQueries { nc: 91 }.roles();
         let shaped = ResolveError::RolesUnbindable {
+            roles: detr,
             declared: declared(&[1, 300, 6]),
             unshaped: false,
         };
@@ -2137,6 +2578,7 @@ mod tests {
              queries, but the model offers \"output\" [1, 300, 6]"
         );
         let unshaped = ResolveError::RolesUnbindable {
+            roles: detr,
             declared: dynamic(),
             unshaped: true,
         };
@@ -2149,12 +2591,26 @@ mod tests {
     }
 
     #[test]
+    fn the_split_roles_message_names_the_outputs_and_not_a_detr_pair() {
+        let declared: Vec<Declared> = declared_split(64, 80, SQUARE)
+            .into_iter()
+            .filter(|output| output.name != "cls1")
+            .take(2)
+            .collect();
+        assert_eq!(
+            bind(DFL.roles(), &declared).unwrap_err().to_string(),
+            "expected outputs named box0, box1, box2 and cls0, cls1, cls2 (sum0..sum2 are not \
+             read), but the model offers \"box0\" [1, 64, 80, 80], \"cls0\" [1, 80, 80, 80]"
+        );
+    }
+
+    #[test]
     fn the_layout_does_not_fit_message_says_what_the_kind_expects() {
         assert_eq!(
             ResolveError::LayoutDoesNotFit {
                 proposed: Layout::RawClasses { nc: 80 },
                 size: SQUARE,
-                got: one(&[1, 300, 6]),
+                got: Box::new(one(&[1, 300, 6])),
             }
             .to_string(),
             "output shape [1, 300, 6] does not fit raw-classes [1, 4 + 80, A]; expected \
@@ -2168,7 +2624,7 @@ mod tests {
             ResolveError::OutputShapeMismatch {
                 layout: Layout::EndToEnd,
                 size: SQUARE,
-                got: one(&[1, 300, 7]),
+                got: Box::new(one(&[1, 300, 7])),
             }
             .to_string(),
             "expected a end-to-end [1, N, 6] output at input 640x640, got [1, 300, 7]"
@@ -2219,7 +2675,7 @@ mod tests {
             "model m.onnx leaves its output shape dynamic, so there is nothing to sniff a profile \
              from — and the encoding and resize policy have to be settled before the first frame \
              is converted. Pass --model-profile <yolox, yolov10, yolov8 (or yolov9, yolo11, yolov11, \
-             yolo26), rfdetr>."
+             yolo26), rfdetr, yolov8split, yolo26split>."
         );
     }
 
@@ -2235,7 +2691,11 @@ mod tests {
             "model m.onnx has unsupported outputs \"output\" [1, 10, 7] at input 640x640; \
              expected [1, 8400, 5 + nc] at input 640x640 (yolox), [1, N, 6] (yolov10), \
              [1, 4 + nc, A] with A far longer than 4 + nc (yolov8), [1, Q, 4] boxes with \
-             [1, Q, nc] logits (rfdetr)"
+             [1, Q, nc] logits (rfdetr), box0..box2 [1, 4 * reg_max (reg_max at least 2), H, W] \
+             with cls0..cls2 [1, nc, H, W], each level's H and W being input 640x640 over its \
+             stride (8/16/32) (yolov8split), box0..box2 [1, 4, H, W] with cls0..cls2 \
+             [1, nc, H, W], each level's H and W being input 640x640 over its stride (8/16/32) \
+             (yolo26split)"
         );
     }
 

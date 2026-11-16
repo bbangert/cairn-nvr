@@ -2949,6 +2949,14 @@ defmodule Cairn.ConfigTest do
       # (device-proven 2026-08-19; the catalog moved with the evidence).
       assert {"yolov8", _row} = Profile.family("yolo26")
       assert {"rfdetr", _row} = Profile.family("RF-DETR ")
+      # hyphens are spelling, so the split contracts resolve either way
+      assert {"yolov8split", %{nms: :host_side, rknn_conversion: :documented}} =
+               Profile.family("yolov8-split")
+
+      # yolo26 is past the zoo's range under this row as under yolov8's
+      assert {"yolo26split", %{nms: :host_side, rknn_conversion: :undocumented}} =
+               Profile.family("YOLO26-Split")
+
       assert Profile.family("yolov12") == nil
     end
 
@@ -3021,6 +3029,20 @@ defmodule Cairn.ConfigTest do
              )
     end
 
+    test "on rknn the yolo26 split head demands experimental: true, the yolov8 one does not" do
+      assert Enum.any?(
+               caps_errors(@caps_bad_dir),
+               &(&1 =~
+                   "profile rknn-yolo26split: rknn conversion is undocumented for " <>
+                     "model_profile yolo26split")
+             )
+
+      assert {:ok, config, []} =
+               Config.from_map(Map.put(base_map(), "profile_dirs", [@caps_dir]))
+
+      refute config.profiles["rknn-split-documented"].experimental
+    end
+
     # A truthy non-boolean is a type error AND not an acknowledgement: both
     # messages must surface, or the type error hides the actionable one.
     test "a non-boolean experimental does not satisfy the rknn rule" do
@@ -3058,6 +3080,8 @@ defmodule Cairn.ConfigTest do
              )
 
       assert Enum.any?(errors, &(&1 =~ "yolov8 (or yolov9, yolo11, yolov11, yolo26)"))
+      assert Enum.any?(errors, &(&1 =~ "yolov8split"))
+      assert Enum.any?(errors, &(&1 =~ "yolo26split"))
     end
 
     test "an unknown decoder is refused, and says which knob it is" do

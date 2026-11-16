@@ -254,7 +254,7 @@ impl Detector {
     pub fn layout_summary(&self) -> String {
         match self.output {
             Some(output) => format!("{} (from model)", output.layout),
-            None => format!("{} (nc from first output)", self.profile.output.layout),
+            None => format!("{} (counts from first output)", self.profile.output.layout),
         }
     }
 
@@ -290,13 +290,26 @@ impl Detector {
         let tensors = self.backend.run(input)?;
         self.latency.record(started.elapsed(), kind);
         // Extract every role this profile reads, by the name settled at
-        // startup, so a two-tensor family never depends on output ordering.
+        // startup, so a multi-tensor family never depends on output ordering.
         let raw: Outputs<Raw> = match &self.outputs {
             Outputs::One(name) => Outputs::One(tensors.get(name)?),
             Outputs::BoxesAndLogits { boxes, logits } => Outputs::BoxesAndLogits {
                 boxes: tensors.get(boxes)?,
                 logits: tensors.get(logits)?,
             },
+            Outputs::Split { boxes, scores } => {
+                let levels = |names: &[String; 3]| -> Result<[Raw; 3]> {
+                    Ok([
+                        tensors.get(&names[0])?,
+                        tensors.get(&names[1])?,
+                        tensors.get(&names[2])?,
+                    ])
+                };
+                Outputs::Split {
+                    boxes: levels(boxes)?,
+                    scores: levels(scores)?,
+                }
+            }
         };
         let shapes = raw.map(|tensor| tensor.dims.clone());
         let output = match self.output {

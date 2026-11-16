@@ -514,6 +514,30 @@ mod tests {
     }
 
     #[test]
+    fn a_split_export_reports_its_nine_rank_four_outputs_in_order() {
+        let names = [
+            "box0", "cls0", "sum0", "box1", "cls1", "sum1", "box2", "cls2", "sum2",
+        ];
+        let channels = [64, 80, 1];
+        let outs: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let side = 80 >> (i / 3);
+                let text = format!("{name}\0");
+                output(text.as_bytes(), &[1, channels[i % 3], side, side])
+            })
+            .collect();
+        let (io, _, metas) =
+            model_io(Path::new("m.rknn"), &input(&[1, 640, 640, 3]), &outs).unwrap();
+        let got: Vec<_> = io.outputs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(got, names);
+        assert_eq!(io.outputs[3].dims, Some(vec![1, 64, 40, 40]));
+        assert_eq!(io.outputs[8].dims, Some(vec![1, 1, 20, 20]));
+        assert_eq!(metas[4].elems, 80 * 40 * 40);
+    }
+
+    #[test]
     fn an_input_that_is_not_nhwc_int8_is_refused_by_what_it_is() {
         let outs = [output(b"output\0", &[1, 84, 85])];
         let nchw = attr(sys::TENSOR_NCHW, sys::TENSOR_INT8, &[1, 3, 64, 64], b"x\0");

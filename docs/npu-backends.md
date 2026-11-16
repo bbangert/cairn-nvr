@@ -63,7 +63,9 @@ rather than silicon — Frigate #18878 shows a VPU session allocated and consumi
 
 - Compilation is host-side Python only: rknn-toolkit2 (x86) converts
   ONNX→.rknn, INT8 (calibration dataset required) or FP16; INT4 on rk3576
-  only. No dynamic shapes. YOLOv5-v11 officially covered by the model zoo;
+  only. No dynamic shapes. YOLOv5-v11 officially covered by the model zoo (v8/v11
+  as exports with the head cut before its box decode — the nine-tensor
+  layout `tools/rknn-export`'s split export emits);
   **yolov10 (NMS-free) and DETR-class (rfdetr) not documented — treat as
   unsupported until trialed.**
 - Runtime from Rust: rknpu2-rs binds librknnrt (2.3.2 API), zero-copy

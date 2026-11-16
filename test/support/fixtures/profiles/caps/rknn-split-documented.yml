@@ -1,0 +1,6 @@
+# yolov8's generations cut the way the model zoo's own exports are: inside
+# what it documents, so no acknowledgement.
+backend: rknn
+model:
+  rknn: test/support/fixtures/models/stub.rknn
+model_profile: yolov8split

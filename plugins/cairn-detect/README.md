@@ -118,7 +118,7 @@ named group under `plugins:` and point cameras at it by name — see
 | `--labels` | no | newline-separated class names, **indexed by class id** — line 1 is class 0. Must match the model: a count that disagrees with the model's class count is a startup error, because positional indexing would emit every detection under another class's name. Ids past the end, and blank lines (unnamed slots), fall back to the numeric id |
 | `--allow-label-mismatch` | no | start anyway when `--labels` and the model disagree about the class count. For a deliberately partial label file; the mislabelling it permits is silent |
 | `--input-size` | no, except RF-DETR | model input `WxH` (or `N` for a square N×N). Read from the model when omitted; **required** when the model's spatial dims are dynamic, which every RF-DETR export leaves them — `--model-profile` does not substitute for it there (see [Geometry](#geometry)) |
-| `--model-profile` | no | `yolox`, `rfdetr`, `yolov10` or `yolov8` (plus the families each contract also applies to: `yolo26`, `yolov9`, `yolo11`, `yolov11`; hyphenated spellings like `rf-detr` normalize) — the preprocessing and decode steps to run the model under. Sniffed from the model when omitted; required when a shape fits more than one profile or the model's *output* shape is dynamic (see [Model profiles](#model-profiles)) |
+| `--model-profile` | no | `yolox`, `rfdetr`, `yolov10`, `yolov8`, `yolov8split` or `yolo26split` (plus the families each contract also applies to: `yolo26`, `yolov9`, `yolo11`, `yolov11`; hyphenated spellings like `rf-detr` or `yolov8-split` normalize) — the preprocessing and decode steps to run the model under. Sniffed from the model when omitted; required when a shape fits more than one profile or the model's *output* shape is dynamic (see [Model profiles](#model-profiles)) |
 | `--decoder` | no | `auto` (default), `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` |
 | `--motion-json` | no | JSON object of motion-gate knobs. **Off by default** — see [Motion gate](#motion-gate) |
 | `--track-floor-json` | no | JSON object with one knob, `floor`: emit detections below their class's `min_score` down to it, for the host's low-confidence tracking stage. **Off by default** — see [Track floor](#track-floor) |
@@ -745,11 +745,12 @@ This README will not walk you through obtaining them.
 ### Model profiles
 
 Everything that differs between detector families lives in one **profile**: how
-frames are fed to the model, and how its output is read. Four ship built in,
+frames are fed to the model, and how its output is read. Six ship built in,
 covering the model families — the Ultralytics generations are *family names
 on one contract*, not
 separate profiles, because their exports are byte-for-byte the same tensor
-contract:
+contract (the two split profiles are those generations again, exported with
+the head cut before its box decode, which is a different contract):
 
 | profile (and the names it answers to) | default size | input encoding | resize | output layout | score | NMS | weights license |
 |---|---|---|---|---|---|---|---|
@@ -757,6 +758,8 @@ contract:
 | **`rfdetr`** — nano … large | none — `--input-size` required | **ImageNet-normalized** RGB | stretch | `[1, Q, 4]` + `[1, Q, nc]` detr-queries (**two tensors**) | `sigmoid(class logit)` | none (set prediction) | Apache-2.0 |
 | **`yolov10`** | 640 | `0..1` **RGB** | stretch | `[1, N, 6]` end-to-end | class | none (the model did it) | AGPL-3.0 |
 | **`yolov8`** (`yolov9`, `yolo11`, `yolov11`, `yolo26`) — what Frigate commonly ships | 640 | `0..1` **RGB** | stretch | `[1, 4 + nc, A]` raw-classes | class | IoU 0.45, top 300 | AGPL-3.0 (GPL-3.0 for YOLOv9) |
+| **`yolov8split`** — yolov8 and yolo11 exported with the head cut before the box decode | 640 | `0..1` **RGB** | stretch | split-dfl: `box0..2` `[1, 4·reg_max, H, W]` (64 for v8/v11) + `cls0..2` `[1, nc, H, W]` (**six tensors read**) | class | IoU 0.45, top 300 | AGPL-3.0 |
+| **`yolo26split`** — yolo26's head cut the same way, `reg_max` 1 | 640 | `0..1` **RGB** | stretch | split-ltrb: `box0..2` `[1, 4, H, W]` + `cls0..2` `[1, nc, H, W]` (**six tensors read**) | class | IoU 0.45, top 300 | AGPL-3.0 |
 
 A family name resolves to its contract's canonical identity, so
 `--model-profile yolo11` runs and reports `profile=yolov8`. Two of the
@@ -768,8 +771,8 @@ families are worth calling out:
     anything in this repo. An export that turns out not to match is rejected
     by the shape check rather than decoded wrong.
   * **`yolo26` is verified on-device** (yolo26m QDQ, QCS6490, 2026-08-19) —
-    under the *yolov8* profile, not yolov10: the only exports this stack can
-    run are `end2end=False` (the NMS-free tail segfaults quantized QNN; see
+    under the *yolov8* profile, not yolov10: the only whole-head exports this
+    stack can run are `end2end=False` (the NMS-free tail segfaults quantized QNN; see
     tools/qdq-export), and their raw head is the yolov8 tensor. The original
     end-to-end guess placed it under yolov10, and the shape check rejected
     that mis-fit exactly as promised.
@@ -786,9 +789,11 @@ What each layout means, and what the plugin does with it:
 | `[1, N, 6]` end-to-end | rows of `[x1, y1, x2, y2, score, class_id]` in input pixels, already sorted and de-duplicated | un-project, clamp, gate on the score floors |
 | `[1, 4 + nc, A]` raw-classes | channels-first over `A` anchors: `cx, cy, w, h` in input pixels then `nc` sigmoided class scores, no objectness row | argmax class per anchor, centers → corners, NMS, then the same un-project/clamp/gate |
 | `[1, Q, 4]` + `[1, Q, nc]` detr-queries | **two tensors** over `Q` learned object queries: normalized `cx, cy, w, h` in `0..1`, and **raw** class logits (roughly `-12..+2`, not probabilities) | argmax class per query, `sigmoid` the logit, scale the box into model pixels, centers → corners, **no NMS**, then the same un-project/clamp/gate |
+| split-dfl `box0..2` `[1, 4·reg_max, H, W]` + `cls0..2` `[1, nc, H, W]` | **six tensors**, one box and one class tensor per stride 8/16/32, `H, W` the input over the stride: DFL logits (`reg_max` bins per side l, t, r, b; 16 in v8/v11) and already-sigmoided class scores. The exporter's `sum0..2` are never read | per cell, argmax class and gate on its floor *first*; only survivors run the DFL softmax (distance = expected bin, in stride units) and `(cell + 0.5 ± distance) × stride` corners, then NMS and the same un-project/clamp/gate |
+| split-ltrb `box0..2` `[1, 4, H, W]` + `cls0..2` `[1, nc, H, W]` | the same six tensors with `reg_max` 1: the box channels are the l, t, r, b distances themselves | the same walk with no softmax |
 
-The DETR layout is the one that breaks the older assumptions, in two ways.
-It reads **more than one output tensor**, and it has **no grid**: there is no
+The DETR layout breaks the older assumptions in two ways. It reads **more than
+one output tensor** (the split heads do too), and it has **no grid**: there is no
 stride, no cell offset, no `exp` on the extents and no anchor, because a query
 is a learned slot whose box is already the whole picture's coordinates.
 Duplicates are suppressed by the bipartite matching the model was trained
@@ -801,6 +806,12 @@ emits `pred_boxes`/`logits` — the plugin binds the roles by **shape**: the
 rank-3 output ending in 4 is the boxes, the rank-3 output over the same query
 axis is the logits. Both export conventions work, and a model where the pair
 is genuinely ambiguous is an error naming the outputs rather than a guess.
+
+The split heads bind the other way, by **name**: exactly `box0`..`box2` and
+`cls0`..`cls2`, because those names are set and asserted by this repo's own
+exporter (`tools/rknn-export`) and the shapes do not always tell a level's box
+tensor from its class tensor (a 64-class DFL head's are one shape). A missing name is an error, never a fallback to
+position; `sum0`..`sum2` and any other output are ignored.
 
 **Adding a family is adding a profile**, not editing the decode path: a
 `ModelProfile` is a name, an `InputSpec` (size, encoding, resize policy) and an
@@ -860,7 +871,7 @@ You need the flag in three cases:
     `export_onnx.py --dynamic` does). There is then nothing to sniff, and the
     encoding and resize policy have to be settled *before* the first frame is
     converted — so this is a startup error naming the flag, not a guess. `nc`
-    is read off the first real output.
+    (and a split head's `reg_max`) is read off the first real output.
   * the export leaves its **input geometry dynamic** and you have not passed
     `--input-size`. Every RF-DETR export does; a symbolic *batch* axis on its
     own does not count, since this plugin always feeds one frame. Here the
@@ -987,9 +998,9 @@ packing path rather than three.
 Neither is the resize policy — **the profile says which**, because a model was
 trained one way and only that way.
 
-  * **stretch** (`rfdetr`, `yolov10`, `yolov8`) scales each axis independently
-    to fill `H × W`. For RF-DETR this is its own transform: a square
-    `A.Resize(height=s, width=s)` with `do_pad: false`.
+  * **stretch** (`rfdetr`, `yolov10`, `yolov8`, and the split heads) scales
+    each axis independently to fill `H × W`. For RF-DETR this is its own
+    transform: a square `A.Resize(height=s, width=s)` with `do_pad: false`.
   * **letterbox** (`yolox`) scales by `min(W/w_src, H/h_src)`, places the
     picture at the **top-left corner** and fills the rest with the pad value
     (114). That is what YOLOX's own `preproc` does —
@@ -1046,9 +1057,9 @@ per-axis check and then asks for a 768 MB tensor plus a 201 MB RGB frame **per
 camera** on the first frame. Both limits are an order of magnitude past any
 real detector input — RF-DETR-Large is 704 and Ultralytics tops out at 1280 —
 so hitting one means a typo or a bad model, and it is a startup error either
-way. A `yolox` grid head additionally requires each axis to be a multiple of
-32, its coarsest stride: at a size the strides do not divide, the cell walk
-cannot match the one the model was exported with.
+way. A `yolox` grid head and the split heads additionally require each axis
+to be a multiple of 32, their coarsest stride: at a size the strides do not
+divide, the cell walk cannot match the one the model was exported with.
 
 The startup line records which of the three it came from. RF-DETR is the case
 that shapes the rule: its exports declare `[?, 3, ?, ?]`, so **nothing in the

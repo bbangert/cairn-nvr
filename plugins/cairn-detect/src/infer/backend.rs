@@ -292,7 +292,9 @@ pub struct ModelIo {
     /// Every output the model declares, in the model's own order — which a
     /// single-output layout depends on: it reads the first. A two-output
     /// layout binds its roles by shape where the dims pin them, by name where
-    /// they do not. Without `--model-profile` the profile is sniffed from
+    /// they do not, and a split layout by exact name (`box0..box2`,
+    /// `cls0..cls2`), so a backend reports the names the artifact carries.
+    /// Without `--model-profile` the profile is sniffed from
     /// these dims, and the bound names are what [`Tensors::get`] is asked
     /// for. [`Declared::dims`] `None` defers the class count to the first
     /// run's [`Raw::dims`] and gives the sniff nothing to match.
@@ -397,7 +399,7 @@ pub trait Backend: Send {
 pub trait Tensors {
     /// The tensor the model calls `name`, or an error naming what was asked
     /// for. Roles are looked up by name, never by position, so a family with
-    /// two outputs never depends on the order the export listed them in.
+    /// several outputs never depends on the order the export listed them in.
     fn get(&self, name: &str) -> Result<Raw<'_>>;
 }
 
