@@ -1,0 +1,5 @@
+JSON:{"model": "models/yolox_s_640_i8.rknn", "cos_zc_input_vs_inputs_set": [1.0], "zc_input_run_ms_p50": 100.14, "cos_zero_frame_vs_real": [0.7998]}
+JSON:{"model": "models/yolox_s_640_fp16.rknn", "cos_zc_input_vs_inputs_set": [1.0], "zc_input_run_ms_p50": 307.9, "cos_zero_frame_vs_real": [0.78877]}
+JSON:{"model": "models/yolov8n_split_640_i8.rknn", "cos_zc_input_vs_inputs_set": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], "zc_input_run_ms_p50": 33.12, "cos_zero_frame_vs_real": [0.8432, 0.73272, 0.99601]}
+[exit 0]
+:ok
