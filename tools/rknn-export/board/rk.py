@@ -269,7 +269,9 @@ def input_paths(path, frame):
     except RuntimeError as e:
         res["pt0_nchw_u8"] = {"error": str(e)}
 
-    # pass_through=1: buffer must already be in the model's native input type/layout.
+    # pass_through=1 skips the runtime's conversion, so the buffer has to be what the input node
+    # takes. This one is built from the native attr's type, zp and scale alone, packed NHWC: it
+    # knows no mean/std the model folded in, so a low cosine can be this buffer and not the runtime.
     if na.type == INT8:
         q = np.clip(np.round(x.astype(np.float32) / na.scale) + na.zp, -128, 127).astype(np.int8)
     elif na.type == FLOAT16:
@@ -278,6 +280,8 @@ def input_paths(path, frame):
         q = x
     q = np.ascontiguousarray(q)
     try:
+        if na.fmt != NHWC or na.w_stride not in (0, m.w):
+            raise RuntimeError("native input is not packed NHWC")
         m.set_input(q, pass_through=1, typ=na.type, fmt=na.fmt); m.run(); o = m.fetch_float()
         res["pt1_native"] = {"buf_dtype": str(q.dtype), "inputs_set": timed(lambda: m.set_input(q, pass_through=1, typ=na.type, fmt=na.fmt)),
                              "cos_vs_pt0": [cosine(a, b) for a, b in zip(o, ref)]}
