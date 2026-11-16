@@ -25,7 +25,7 @@ the NPU yet.
 ## Licenses
 
 The image bundles: ONNX Runtime (MIT); Rockchip MPP (Apache-2.0, most
-files alternatively MIT) and librga (Apache-2.0), each built with its own
-copies of MIT DRM headers — texts at `/opt/rockchip/licenses`; and YOLOX
-models (Apache-2.0). Rockchip's RKNN runtime is not redistributable and is
-not in the image.
+files alternatively MIT; built without its ION allocator, whose header is
+GPLv2) and librga (Apache-2.0), each built with its own copies of MIT DRM
+headers — texts at `/opt/rockchip/licenses`; and YOLOX models (Apache-2.0).
+Rockchip's RKNN runtime is not redistributable and is not in the image.

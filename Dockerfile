@@ -197,6 +197,14 @@ mkdir /tmp/mpp /tmp/librga
 tar -xzf /tmp/mpp.tar.gz -C /tmp/mpp --strip-components=1
 tar -xzf /tmp/librga.tar.gz -C /tmp/librga --strip-components=1
 
+# MPP's ION allocator compiles in Android's ion.h, which carries plain GPLv2
+# text. The add-on grants no /dev/ion, so that allocator could never be
+# chosen here. The files go too, so a pin bump that brings a reference back
+# fails the build.
+sed -i '/allocator\/allocator_ion\.c/d' /tmp/mpp/osal/CMakeLists.txt
+sed -i '/MPP_BUFFER_TYPE_ION) != 0) ? allocator_ion :/d' /tmp/mpp/osal/mpp_allocator.c
+rm /tmp/mpp/osal/allocator/allocator_ion.c /tmp/mpp/osal/allocator/ion.h
+
 # The root path keeps MPP's find_library(mvec) probe in the arm64 sysroot
 # instead of the build host's.
 cat > /tmp/aarch64.cmake <<'EOF'
@@ -215,6 +223,12 @@ cmake -S /tmp/mpp -B /tmp/mpp-out -G Ninja -DCMAKE_TOOLCHAIN_FILE=/tmp/aarch64.c
 # or the test utils.
 cmake --build /tmp/mpp-out --target rockchip_mpp -j"$(nproc)"
 cp -a /tmp/mpp-out/mpp/librockchip_mpp.so* /opt/rockchip/lib/
+# A shared object links with undefined symbols, so a leftover reference to the
+# removed allocator would only fail at load time on the board.
+mpp_syms=$(aarch64-linux-gnu-nm -D /opt/rockchip/lib/librockchip_mpp.so.1)
+case "$mpp_syms" in
+  *allocator_ion*) echo "librockchip_mpp still references allocator_ion" >&2; exit 1 ;;
+esac
 
 cat > /tmp/aarch64.meson <<'EOF'
 [binaries]
@@ -238,6 +252,12 @@ cp -a /tmp/librga-stage/opt/rockchip/lib/librga.so* /opt/rockchip/lib/
 cp /tmp/mpp/LICENSES/Apache-2.0 /opt/rockchip/licenses/mpp-Apache-2.0
 cp /tmp/mpp/LICENSES/MIT /opt/rockchip/licenses/mpp-MIT
 cp /tmp/librga/COPYING /opt/rockchip/licenses/librga-COPYING
+printf '%s\n' \
+  'librockchip_mpp is built from rockchip-linux/mpp at commit' \
+  'c08762ebfadeb4e986d2fed993bc7a54862d3ebe with the ION allocator removed:' \
+  'osal/allocator/allocator_ion.c and osal/allocator/ion.h are deleted, and' \
+  'their references dropped from osal/CMakeLists.txt and osal/mpp_allocator.c.' \
+  > /opt/rockchip/licenses/mpp-CHANGES
 # Both libraries compile in their own copies of MIT DRM uapi headers, each
 # with its own copyright holders, and MIT's notice has to travel with the
 # object code. drm.h opens with an author comment, so the cut is the end of
