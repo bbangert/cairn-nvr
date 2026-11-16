@@ -36,6 +36,13 @@ The a8 rungs read ~3–18% hot on the HTP relative to CPU (the EP's 8-bit
 sigmoid qparam vs the graph's pinned 1/256): a floor tuned on an a16
 rung is conservative on an a8 rung. See the ladder file's note.
 
-Paths here are what `priv/profiles/qcs6490-tier1.yml` names
-(`models/…` resolves against the node's working directory — `/app` in
-the image, the repo root in dev).
+The Rockchip image (`CAIRN_BOARD=rockchip`) also carries
+`models/yolox_tiny.onnx` and `models/yolox_s.onnx`: Megvii's FP32 release
+exports (YOLOX 0.1.1rc0, bytes unchanged), fetched sha256-pinned by the
+Dockerfile's `rockchip-libs` stage and not committed here. The qdq files
+above are quantized for the HTP; on that board's CPU the FP32 files are
+the ones to run.
+
+The qdq paths are what `priv/profiles/qcs6490-tier1.yml` names; no shipped
+profile names the FP32 pair. `models/…` resolves against the node's working
+directory — `/app` in the image, the repo root in dev.
