@@ -281,11 +281,14 @@ def input_paths(path, frame):
         m.set_input(q, pass_through=1, typ=na.type, fmt=na.fmt); m.run(); o = m.fetch_float()
         res["pt1_native"] = {"buf_dtype": str(q.dtype), "inputs_set": timed(lambda: m.set_input(q, pass_through=1, typ=na.type, fmt=na.fmt)),
                              "cos_vs_pt0": [cosine(a, b) for a, b in zip(o, ref)]}
-        # pass_through=1 with raw uint8: shows whether the driver silently accepts the wrong type.
+    except RuntimeError as e:
+        res["pt1_native"] = {"error": str(e)}
+    # pass_through=1 with raw uint8: shows whether the driver silently accepts the wrong type.
+    try:
         m.set_input(x, pass_through=1, typ=UINT8, fmt=NHWC); m.run(); o = m.fetch_float()
         res["pt1_raw_u8"] = {"cos_vs_pt0": [cosine(a, b) for a, b in zip(o, ref)]}
     except RuntimeError as e:
-        res["pt1_native"] = {"error": str(e)}
+        res["pt1_raw_u8"] = {"error": str(e)}
     res["run_after_inputs_set"] = timed(m.run, 50)
     m.close()
 
