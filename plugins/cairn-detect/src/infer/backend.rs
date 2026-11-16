@@ -10,8 +10,8 @@
 //! [`Detector::open`](super::Detector::open).
 //!
 //! No SDK type appears in a signature here. A backend reports its model as
-//! [`ModelIo`] — a name, a size, a batch, the sniffed uint8 edges, the input
-//! layout and a [`Declared`] per output — and answers a
+//! [`ModelIo`] — a name, a size, a batch, the input's element kind, the uint8
+//! outputs, the input layout and a [`Declared`] per output — and answers a
 //! run with [`Raw`] tensors, dims plus floats. Both of those types predate this
 //! module and neither mentions `ort`, which is what let the seam go in without
 //! touching sniffing, sizing or decode. The one place ort types still reach
@@ -247,6 +247,27 @@ pub struct RknnOptions {
     pub core_mask: Option<u32>,
 }
 
+/// What the bytes of a model's input are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputElement {
+    /// Floats in the profile's encoding: the ordinary contract.
+    F32,
+    /// uint8 codes of a uint8-IO artifact. The caller must pass a qparams
+    /// sidecar whose input entry names [`ModelIo::input_name`]; its qparams
+    /// are what make the packer emit the codes.
+    U8Codes,
+    /// The frame's own bytes, in the profile encoding's channel order: the
+    /// artifact folds its normalisation and quantisation in (an `.rknn`).
+    /// A sidecar input entry is refused as belonging to some other artifact.
+    ///
+    /// The bytes go through the quantized packer under
+    /// [`TensorEncoding::pixel_quant`](super::TensorEncoding::pixel_quant),
+    /// so an encoding that has none is refused at open: a limit of that
+    /// route, not of such an artifact. Nothing at open can check that the
+    /// channel order and scale folded into the artifact are the profile's.
+    U8Pixels,
+}
+
 /// What a backend reports about the model it opened, in terms no SDK defines.
 ///
 /// Whatever reads a field reads it at open, before any frame, which is what
@@ -276,13 +297,11 @@ pub struct ModelIo {
     /// for. [`Declared::dims`] `None` defers the class count to the first
     /// run's [`Raw::dims`] and gives the sniff nothing to match.
     pub outputs: Vec<Declared>,
-    /// Whether the model declares its input tensor as uint8 — a uint8-IO
-    /// artifact. Sniffed at open so a u8 artifact without its qparams
-    /// sidecar (or a sidecar next to a float artifact) fails while the
-    /// operator is watching, not at the first pass. `true` obliges the
-    /// caller to pass a sidecar whose input entry names [`Self::input_name`];
-    /// its qparams are what make the packer emit u8 codes.
-    pub input_is_u8: bool,
+    /// What the input tensor's elements are. Read at open, so an artifact
+    /// and a qparams sidecar that disagree fail while the operator is
+    /// watching, not at the first pass. See [`InputElement`] for what each
+    /// variant commits the caller to.
+    pub input_element: InputElement,
     /// The declared outputs whose element type is uint8, by name. Must match
     /// the sidecar's `outputs` keys exactly, and listing one commits the
     /// backend to dequantizing it: [`Raw::values`] is f32 whatever the model
@@ -305,7 +324,8 @@ pub struct ModelIo {
 /// batches. `shape` is `[1, 3, h, w]` or `[1, h, w, 3]` as `layout` says:
 /// outside this crate the only constructor is [`InputTensor::new`], which
 /// derives one from the other. `values` carries the packer's dtype choice
-/// (f32, or u8 codes for a uint8-IO artifact) to the session bind.
+/// (f32, u8 codes for a uint8-IO artifact, or u8 pixel bytes) to the
+/// session bind.
 #[non_exhaustive]
 pub struct InputTensor {
     pub shape: [i64; 4],

@@ -97,7 +97,9 @@ rather than silicon — Frigate #18878 shows a VPU session allocated and consumi
 
 The `Detector::open`/`detect` trait seam survives. QNN is an ort EP (same
 crate, new registration path + EP options on the session builder). RKNN is
-a second trait impl over rknpu2-rs. The trait's contract should include:
+a second trait impl over rknpu2-rs (as built, `boards/cairn_rockchip` binds
+librknnrt itself through `dlopen`; rknpu2-rs is not a dependency). The
+trait's contract should include:
 (a) per-backend session options from the profile (htp_arch, perf mode,
 core mask), (b) a capability report (supports fused NMS? dynamic shapes?)
 that profile validation consumes, (c) model artifact format expected

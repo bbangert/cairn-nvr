@@ -22,11 +22,13 @@ pub struct InputSpec {
     pub size: InputSize,
     pub encoding: TensorEncoding,
     pub resize: ResizePolicy,
-    /// `Some` for a uint8-IO artifact: the input edge's qparams, from the
-    /// model's sidecar, never from a profile — no catalog entry sets this.
-    /// The packer then emits u8 codes (`encoding` still decides the affine
-    /// the codes quantize) and the letterbox pad goes through the same
-    /// encode-then-quantize path as every pixel.
+    /// `Some` for a u8-input artifact, never from a profile — no catalog
+    /// entry sets this. It is the input edge's qparams from the model's
+    /// sidecar, or, for an artifact that takes pixel bytes, the encoding's
+    /// [`pixel_quant`](super::TensorEncoding::pixel_quant), under which the
+    /// codes are the bytes. The packer then emits u8 codes (`encoding` still
+    /// decides the affine the codes quantize) and the letterbox pad goes
+    /// through the same encode-then-quantize path as every pixel.
     pub input_quant: Option<QuantParams>,
     /// The packed tensor's value order, from the backend's
     /// [`ModelIo`](super::ModelIo) — like `input_quant`, a fact about the

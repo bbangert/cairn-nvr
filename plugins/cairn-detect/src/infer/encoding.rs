@@ -88,6 +88,20 @@ impl TensorEncoding {
             },
         }
     }
+
+    /// The input qparams under which [`Packing::quantized_lut`] maps every
+    /// byte to itself: how a model that takes the frame's own bytes is fed
+    /// through the quantized packer. `None` for [`Self::ImageNetRgb`]: its
+    /// affine differs per channel and the packer takes one scale, so an
+    /// artifact with ImageNet statistics folded in cannot be fed this way.
+    pub fn pixel_quant(self) -> Option<QuantParams> {
+        let scale = match self {
+            Self::RawBgr => 1.0,
+            Self::UnitRgb => 1.0 / 255.0,
+            Self::ImageNetRgb => return None,
+        };
+        Some(QuantParams::new(scale, 0).expect("a finite positive literal"))
+    }
 }
 
 /// An encoding reduced to arithmetic: for each output channel, which byte of an
@@ -111,10 +125,10 @@ impl Packing {
 
     /// One channel's byte -> uint8-code table for a quantized-input model:
     /// `quantize(value(channel, byte))` for all 256 bytes, computed once per
-    /// pack so the pixel loop is a lookup instead of float math. For the
-    /// identity-qparams RawBgr case (scale 1, zero-point 0 — every 0..255
-    /// model the surgery converts today) the table degenerates to the
-    /// identity and u8 packing is a pure byte shuffle.
+    /// pack so the pixel loop is a lookup instead of float math. Under
+    /// [`TensorEncoding::pixel_quant`] — for RawBgr scale 1, zero-point 0,
+    /// which every 0..255 model the surgery converts today has — the table
+    /// is the identity and u8 packing is a pure byte shuffle.
     pub fn quantized_lut(&self, channel: usize, quant: QuantParams) -> [u8; 256] {
         std::array::from_fn(|byte| quant.quantize(self.value(channel, byte as u8)))
     }
@@ -301,6 +315,29 @@ mod tests {
         let lut = packing.quantized_lut(0, QuantParams::new(0.5, 3).unwrap());
         assert_eq!(lut[114], 231);
         assert_eq!(lut[200], 255); // saturates
+    }
+
+    /// What lets a pixel-input artifact ride the quantized packer: under
+    /// `pixel_quant` every byte of every channel comes back as itself.
+    #[test]
+    fn pixel_quant_is_the_identity_through_the_lut() {
+        for encoding in [
+            TensorEncoding::UnitRgb,
+            TensorEncoding::RawBgr,
+            TensorEncoding::ImageNetRgb,
+        ] {
+            let Some(quant) = encoding.pixel_quant() else {
+                assert_eq!(encoding, TensorEncoding::ImageNetRgb);
+                continue;
+            };
+            let packing = encoding.packing();
+            for channel in 0..3 {
+                let lut = packing.quantized_lut(channel, quant);
+                for byte in 0..=255u8 {
+                    assert_eq!(lut[byte as usize], byte, "{encoding} channel {channel}");
+                }
+            }
+        }
     }
 
     #[test]
