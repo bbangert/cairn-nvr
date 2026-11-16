@@ -11,7 +11,7 @@ defmodule Cairn.NativeStub do
   fail inside the call).
   """
 
-  @behaviour Cairn.Native.Engine
+  @behaviour Cairn.Stage.DecoderNif
 
   alias Cairn.Native.Host
 

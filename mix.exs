@@ -1,6 +1,10 @@
 defmodule Cairn.MixProject do
   use Mix.Project
 
+  # The board this release is built for; `config/config.exs` picks
+  # `config/boards/<board>.exs` from the same variable.
+  @board System.get_env("CAIRN_BOARD", "generic")
+
   def project do
     [
       app: :cairn,
@@ -14,6 +18,14 @@ defmodule Cairn.MixProject do
       listeners: [Phoenix.CodeReloader],
       dialyzer: [
         plt_add_apps: [:mix, :ex_unit],
+        # A path dependency in the PLT goes stale: dialyxir rebuilds on the lock
+        # file and the app list, neither of which a change under `libs/` touches.
+        # Analysed as project code instead.
+        plt_ignore_apps: [:cairn_stage],
+        paths: [
+          "_build/#{Mix.env()}/lib/cairn/ebin",
+          "_build/#{Mix.env()}/lib/cairn_stage/ebin"
+        ],
         plt_core_path: "priv/plts",
         plt_local_path: "priv/plts"
       ],
@@ -119,8 +131,15 @@ defmodule Cairn.MixProject do
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:sobelow, "~> 0.14", only: [:dev, :test], runtime: false},
-      {:argus_beam, "~> 0.20", only: [:dev, :test], runtime: false}
-    ]
+      {:argus_beam, "~> 0.20", only: [:dev, :test], runtime: false},
+      {:cairn_stage, path: "libs/cairn_stage"}
+    ] ++ board_deps(@board)
+  end
+
+  defp board_deps("generic"), do: []
+
+  defp board_deps(board) do
+    Mix.raise("CAIRN_BOARD=#{inspect(board)} is not a board this tree can build; known: generic")
   end
 
   # Aliases are shortcuts or tasks specific to the current project.

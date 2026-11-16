@@ -45,9 +45,11 @@ defmodule Cairn.Native.Canary do
 
     * `:enabled` — `false` skips the probe outright, the only way to load a model
       that was never rehearsed.
-    * `:binary` — path to `cairn-detect`. Falls back to
-      `config :cairn, Cairn.Native.Canary, binary: …` and then to `cairn-detect`
+    * `:binary` — path to the probe executable. Falls back to
+      `config :cairn, Cairn.Native.Canary, binary: …` and then to `:command`
       on `PATH`. Absent everywhere is an error, not a skip.
+    * `:command` — the executable's name, `cairn-detect` unless given;
+      `Cairn.Native.Host` passes the board's (`c:Cairn.Stage.Board.engine/1`).
     * `:timeout_ms` — a QNN HTP graph compile is multiple seconds and a cold
       one can be tens; the default is #{@timeout_ms} ms.
   """
@@ -167,14 +169,17 @@ defmodule Cairn.Native.Canary do
   defp configured(opts) do
     Keyword.get(opts, :binary) ||
       Application.get_env(:cairn, __MODULE__, [])[:binary] ||
-      System.find_executable("cairn-detect")
+      System.find_executable(command(opts))
   end
 
-  defp no_binary(opts) do
-    tried = configured(opts) || "cairn-detect (nowhere on PATH)"
+  defp command(opts), do: Keyword.get(opts, :command, "cairn-detect")
 
-    "the probe load cannot run: no cairn-detect binary at #{tried}. Install it, or point " <>
-      "`config :cairn, Cairn.Native.Canary, binary: \"/path/to/cairn-detect\"` at it. Setting " <>
+  defp no_binary(opts) do
+    command = command(opts)
+    tried = configured(opts) || "#{command} (nowhere on PATH)"
+
+    "the probe load cannot run: no #{command} binary at #{tried}. Install it, or point " <>
+      "`config :cairn, Cairn.Native.Canary, binary: \"/path/to/#{command}\"` at it. Setting " <>
       "`enabled: false` there loads the model in this VM with no rehearsal, which is a crash " <>
       "of the whole node if it goes wrong"
   end

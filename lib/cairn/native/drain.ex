@@ -50,6 +50,8 @@ defmodule Cairn.Native.Drain do
 
   @impl true
   def terminate(_reason, state) do
+    # The generic board's two libraries, named outright: a board that brings
+    # its own NIF is not drained here until the drain goes through the board.
     drain(CairnOrt, state)
     drain(Cairn.Native, state)
   end

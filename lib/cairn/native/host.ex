@@ -129,10 +129,10 @@ defmodule Cairn.Native.Host do
   Open `camera_id`'s decoder against the engine, so both halves of the split
   boundary are built for the same model.
 
-  Answers with the decoder's handle, the module to drive it through
-  (`Cairn.Native`, or the test stub the host was configured with) and the
-  engine's `sample_fps` — `Cairn.Pipeline.SampleGate`'s rate, handed out here
-  so every camera's gate reads the one configured value. The handle is the
+  Answers with the decoder's handle, the module to drive it through (the
+  board's decode library, or the test stub the host was configured with) and
+  the engine's `sample_fps` — `Cairn.Pipeline.SampleGate`'s rate, handed out
+  here so every camera's gate reads the one configured value. The handle is the
   *caller's*: no registry claim guards it
   (that belongs to the inference stream), the per-frame `decode_au` calls
   never come back through this process, and freeing it promptly is the
@@ -275,14 +275,16 @@ defmodule Cairn.Native.Host do
     inflight = :"#{table}.inflight"
     :ets.new(inflight, [:named_table, :set, :public, write_concurrency: true])
 
-    state = %__MODULE__{
-      table: table,
-      inflight: inflight,
-      native: Keyword.get(opts, :native_module, Cairn.Native),
-      ort: Keyword.get(opts, :ort_module, CairnOrt),
-      canary: Keyword.get(opts, :canary_module, Canary),
-      opts: opts
-    }
+    state =
+      %__MODULE__{
+        table: table,
+        inflight: inflight,
+        canary: Keyword.get(opts, :canary_module, Canary),
+        opts: opts
+      }
+      # Until a config names its own: status reads both libraries before any
+      # model is configured.
+      |> libraries(NativeConfig.default(:decoder), NativeConfig.default(:backend))
 
     # The model load is seconds and the canary is another OS process: neither
     # belongs in a supervisor's start sequence.
@@ -429,7 +431,7 @@ defmodule Cairn.Native.Host do
     # `push_frame/5` would exhaust on its own.
     close_streams(state)
     # The measurement task is nolink: without this, a clean shutdown would
-    # leave its cairn-detect subprocess running out its deadline.
+    # leave its probe subprocess running out its deadline.
     stop_baseline(state)
     :ok
   end
@@ -506,6 +508,8 @@ defmodule Cairn.Native.Host do
   end
 
   defp canary_then_load(state, config) do
+    state = libraries(state, config.decoder, config.backend)
+
     if state.ort.available?() do
       probe(state, config)
     else
@@ -519,7 +523,7 @@ defmodule Cairn.Native.Host do
   end
 
   defp probe(state, config) do
-    case state.canary.probe(config, canary_opts(state)) do
+    case state.canary.probe(config, canary_opts(state, config)) do
       :ok ->
         load_model(state, config, :passed)
 
@@ -595,7 +599,7 @@ defmodule Cairn.Native.Host do
       true ->
         passes = Keyword.get(state.opts, :baseline_passes, @baseline_passes)
         timeout = Keyword.get(state.opts, :baseline_timeout_ms, @baseline_timeout_ms)
-        opts = state |> canary_opts() |> Keyword.put(:timeout_ms, timeout)
+        opts = state |> canary_opts(config) |> Keyword.put(:timeout_ms, timeout)
         canary = state.canary
 
         task =
@@ -608,7 +612,7 @@ defmodule Cairn.Native.Host do
   end
 
   # A superseded measurement is shut down, never abandoned: its canary runner
-  # traps exits and kills the cairn-detect subprocess on the way out, so a
+  # traps exits and kills the probe subprocess on the way out, so a
   # reload cannot stack CPU-heavy measurement processes behind one another
   # (and starve the replacement into its own timeout).
   defp stop_baseline(%{baseline_task: %{task: task}} = state) do
@@ -640,10 +644,26 @@ defmodule Cairn.Native.Host do
     nil
   end
 
-  defp canary_opts(state) do
+  # The board's libraries for this decoder and backend, unless a suite pinned
+  # them. Per config, because a board may carry more than one of each; a
+  # reload closes every stream before it gets here (`reload_engine/2`), so
+  # none is left driven through a module it was not opened with.
+  defp libraries(state, decoder, backend) do
+    board = Cairn.Board.module()
+
+    %{
+      state
+      | native:
+          Keyword.get_lazy(state.opts, :native_module, fn -> board.decoder_backend(decoder) end),
+        ort: Keyword.get_lazy(state.opts, :ort_module, fn -> board.engine(backend).module end)
+    }
+  end
+
+  defp canary_opts(state, config) do
     state.opts
     |> Keyword.get(:canary, [])
     |> Keyword.merge(Application.get_env(:cairn, Canary, []))
+    |> Keyword.put_new_lazy(:command, fn -> Cairn.Board.module().engine(config.backend).canary end)
   end
 
   # Token-gated, because a reopen can complete before the retired caller is

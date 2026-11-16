@@ -8,7 +8,7 @@ defmodule Cairn.CairnOrtStub do
   so a test can take this library away while the decode one stays.
   """
 
-  @behaviour CairnOrt.Engine
+  @behaviour Cairn.Stage.EngineNif
 
   alias Cairn.NativeStub
 
@@ -74,7 +74,6 @@ defmodule Cairn.CairnOrtStub do
 
   defp timed(other, _micros), do: other
 
-  @impl true
   def cpu_baseline_ms(config, passes) do
     notify({:cpu_baseline_ms, config, passes})
 

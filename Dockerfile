@@ -321,6 +321,8 @@ ENV MIX_ENV=prod
 RUN mix local.hex --force && mix local.rebar --force
 
 COPY mix.exs mix.lock ./
+# Path dependencies (`libs/`) resolve at deps.get, so they come in with mix.exs.
+COPY libs libs
 RUN mix deps.get --only prod
 COPY config config
 RUN mix deps.compile

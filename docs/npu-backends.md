@@ -1,7 +1,8 @@
 # NPU backend workflows: QNN (QCS6490) and RKNN (rk3566/rk3576)
 
-The research record behind `Cairn.Config.Profile`'s backend-capability
-table and the plugin's `BackendKind::capabilities` — both cite this file.
+The research record behind the generic board's backend-capability table
+(`Cairn.Board.Generic.backends/0`) and the plugin's
+`BackendKind::capabilities` — both cite this file.
 
 Second-cycle research, 2026-08-05. 11 sources. Numbers below are
 agent-reported and marked with confidence; fps claims should be re-verified

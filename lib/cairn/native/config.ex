@@ -98,6 +98,10 @@ defmodule Cairn.Native.Config do
   @spec default_sample_fps() :: pos_integer()
   def default_sample_fps, do: @model_defaults.sample_fps
 
+  @doc "The decoder or backend a config that names none runs."
+  @spec default(:decoder | :backend) :: String.t()
+  def default(key) when key in [:decoder, :backend], do: Map.fetch!(@model_defaults, key)
+
   @doc "One stream's scene config, in the shape `Cairn.Native.open_stream/3` decodes."
   @spec stream_params(map() | keyword()) :: {:ok, t()} | {:error, String.t()}
   def stream_params(params) when is_map(params) or is_list(params) do

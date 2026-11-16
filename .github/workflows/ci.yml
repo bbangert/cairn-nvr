@@ -258,6 +258,42 @@ jobs:
       - run: mix test
         working-directory: tools/qdq-export/driver
 
+  cairn-stage:
+    name: Stage contract library (mix test)
+    runs-on: ubuntu-latest
+    # The library boards build against, so it must also build on its own
+    # rather than only as the base's path dependency.
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          elixir-version: "1.20"
+          otp-version: "28"
+
+      - name: Cache deps and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            libs/cairn_stage/deps
+            libs/cairn_stage/_build
+          key: mix-cairn-stage-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('libs/cairn_stage/mix.lock') }}
+          restore-keys: |
+            mix-cairn-stage-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+
+      - run: mix deps.get
+        working-directory: libs/cairn_stage
+
+      - run: mix format --check-formatted
+        working-directory: libs/cairn_stage
+
+      - run: mix compile --warnings-as-errors
+        working-directory: libs/cairn_stage
+
+      - run: mix test
+        working-directory: libs/cairn_stage
+
   cairn-detect:
     name: Rust · Format · Clippy · Test · Release build
     runs-on: ubuntu-latest

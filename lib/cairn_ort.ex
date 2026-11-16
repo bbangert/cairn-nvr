@@ -63,38 +63,8 @@ defmodule CairnOrt do
              drain_teardown: 1,
              cpu_baseline_ms: 2}
 
-  @typedoc """
-  The engine's resolved input spec as plain terms: what the decode library
-  (`Cairn.Native.open_decoder/2`) is built from, since no resource can cross
-  between two NIF libraries. The spellings round-trip through `cairn-detect`'s
-  own wire helpers.
-  """
-  @type input_spec :: %{
-          width: pos_integer(),
-          height: pos_integer(),
-          encoding: String.t(),
-          resize: String.t(),
-          resize_pad: non_neg_integer()
-        }
-
-  @typedoc "The motion measurement taken on the decode side, when configured."
-  @type motion_verdict :: %{
-          changed_fraction: float(),
-          motion: boolean(),
-          calibrating: boolean(),
-          scene_cut: boolean()
-        }
-
-  @typedoc "What `push_frame/4` takes alongside the payload binary."
-  @type frame_meta :: %{
-          width: pos_integer(),
-          height: pos_integer(),
-          orig_width: pos_integer(),
-          orig_height: pos_integer(),
-          pts: integer() | nil,
-          observed_at_ms: integer(),
-          motion: motion_verdict() | nil
-        }
+  @type input_spec :: Cairn.Stage.EngineNif.input_spec()
+  @type frame_meta :: Cairn.Stage.EngineNif.frame_meta()
 
   @spec init(map()) :: {:ok, reference()} | {:error, {atom(), String.t()}}
   def init(_config), do: :erlang.nif_error(:nif_not_loaded)

@@ -50,7 +50,8 @@ defmodule Cairn.Native.HostTest do
     test "the canary runs before the NIF is allowed to load the model" do
       host = start_host()
 
-      assert_receive {:canary, %{model: "m.onnx"}, _opts}
+      assert_receive {:canary, %{model: "m.onnx"}, opts}
+      assert opts[:command] == "cairn-detect"
       assert_receive {:init, %{model: "m.onnx", backend: "qnn"}}
 
       status = Host.status(host)

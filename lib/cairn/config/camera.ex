@@ -365,8 +365,8 @@ defmodule Cairn.Config.Camera do
   end
 
   # Validated here rather than at pipeline build, where the same string
-  # raises inside `Cairn.Pipeline.Camera.motion_gate/3` as a crash-looping
-  # camera instead of a config error naming the problem. The string is
+  # raises inside `Cairn.Pipeline.DetectChain` as a crash-looping camera
+  # instead of a config error naming the problem. The string is
   # carried VERBATIM on success — the gate resolves it again itself, so
   # nothing here can drift from what the element actually reads.
   defp parse_motion_json(nil, _id, acc), do: {nil, acc}

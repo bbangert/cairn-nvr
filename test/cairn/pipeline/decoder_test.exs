@@ -6,6 +6,7 @@ defmodule Cairn.Pipeline.DecoderTest do
   alias Cairn.Native.Host
   alias Cairn.NativeStub
   alias Cairn.Pipeline.Decoder
+  alias Cairn.Stage.FrameMeta
   alias Membrane.Buffer
 
   @moduletag :capture_log
@@ -404,6 +405,8 @@ defmodule Cairn.Pipeline.DecoderTest do
                motion: verdict,
                stream_epoch: nil
              }
+
+      assert {:ok, _meta} = FrameMeta.fetch(buffer.metadata)
     end
 
     test "carries the stream epoch of the access units it decoded", ctx do
