@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """ctypes harness against librknnrt (2.3.2 header layout), no rknnlite.
 
-Timing is per C call, so Python pre/post work is outside every number.
+bench and input time one wrapper call each: the C call with its ctypes marshalling, which was
+not measured apart. Sustained and worker rates are whole iterations (set, run, get, release).
+Frame preparation and output copies are outside every number.
 
   rk.py info   MODEL
   rk.py bench  MODEL [--warm 200] [--sustain 60] [--want-float 0] [--input zero|frame.npy]
