@@ -34,7 +34,7 @@ def test_matching_hash_writes_both_outputs(tmp_path):
 
 
 @pytest.mark.parametrize("over", [{"rknn_sha256": "0" * 64}, {"rknn_sha256": None},
-                                  {"steps": {"load": "ok", "export": "ERR boom"}}])
+                                  {"steps": {"load": "ok", "export": "ERR boom"}}, {"sim_outputs": "ERR boom"}])
 def test_json_that_does_not_vouch_for_the_file_writes_nothing(tmp_path, over):
     p, written = run(tmp_path, **over)
     assert p.returncode != 0 and "yolox_s_640_i8.rknn" in p.stderr

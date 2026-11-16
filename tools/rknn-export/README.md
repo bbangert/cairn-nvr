@@ -213,7 +213,7 @@ venv/bin/python -I parity.py yolox_s_640_i8 yolox
 
 ## Tests
 
-`python -m pytest tools/rknn-export` covers the parity arithmetic and the
-ONNX edits, the pieces whose errors would be silent, and the manifest's
-refusals. CI runs it with neither the toolkit nor onnxruntime, so the one
+`python -m pytest tools/rknn-export` covers the parity arithmetic, the ONNX
+edits and the letterbox size rule, the pieces whose errors would be silent,
+and the manifest's refusals. CI runs it with neither the toolkit nor onnxruntime, so the one
 check that runs a resized model is skipped there.

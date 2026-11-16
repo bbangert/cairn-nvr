@@ -198,3 +198,12 @@ def test_shared_sources():
     fr = lambda *names: [{"src": n} for n in names]
     assert parity.shared_sources(fr("a_1785_01.png", "b_1785_01.png"), fr("a_1785_02.jpg", "b_1999_01.png")) == ["a_1785"]
     assert parity.shared_sources(fr("a_01.png"), fr("b_01.png")) == []
+
+
+@pytest.mark.parametrize("bad", ["sim", "ref"])
+def test_frame_stats_rejects_non_finite(bad):
+    t = yolox(REF)[0]
+    x = t.copy(); x[0, 3, 4] = np.nan if bad == "sim" else np.inf
+    pair = ([x], [t]) if bad == "sim" else ([t], [x])
+    with pytest.raises(ValueError, match="non-finite"):
+        parity.frame_stats("yolox", *pair)

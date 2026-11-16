@@ -86,6 +86,8 @@ def frame_stats(kind, sim, ref):
     shapes = [(s.shape, r.shape) for s, r in zip(sim, ref)]
     if len(sim) != len(ref) or any(a != b for a, b in shapes):
         raise ValueError(f"sim/ref outputs differ: {len(sim)} vs {len(ref)} tensors, shapes {shapes}")
+    if not all(np.isfinite(t).all() for t in (*sim, *ref)):
+        raise ValueError("non-finite values in sim/ref outputs")  # NaN scores compare False and vanish from every count
     d = {"frames": 1}
     for j, (s, r) in enumerate(zip(sim, ref)):
         d[f"cos.{j}"] = cos(s, r)
