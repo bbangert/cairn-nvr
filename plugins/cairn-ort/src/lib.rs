@@ -169,6 +169,10 @@ pub struct RawFrameMeta {
 /// spellings round-trip through `cairn-detect`'s own `wire` helpers, so the
 /// decoder cannot be built for a subtly different model than the one that
 /// resolved them.
+///
+/// No layout, and none is needed: the decode half produces RGB24, and the
+/// tensor is packed on this side (`stream.rs`) from the engine's own spec,
+/// which carries the layout its backend reported.
 #[derive(NifMap)]
 pub struct RawInputSpec {
     width: usize,

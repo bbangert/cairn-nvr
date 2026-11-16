@@ -206,7 +206,7 @@ pub fn hello_line() -> String {
 /// last and pushes it to every subscriber; an identical repeat is forwarded
 /// at most once every 5 s as a liveness heartbeat, and the ones in between are
 /// dropped and counted. So these are sent on transitions only, never per
-/// frame: the process's own lifecycle (main.rs) and, with the motion gate on,
+/// frame: the process's own lifecycle (cli.rs) and, with the motion gate on,
 /// a change in whether that camera's samples are reaching the model
 /// ([`crate::gate::Telemetry`], which reports one line per camera per window
 /// and whose consecutive reports name opposite transitions, so no gate report

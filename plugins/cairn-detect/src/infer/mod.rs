@@ -2,8 +2,9 @@
 //!
 //! Two things vary independently here and are separated on purpose. *Which
 //! runtime executes the model* is [`backend`]: one trait, two implementations
-//! (onnxruntime on the CPU EP, and on Qualcomm's HTP via the QNN plugin EP),
-//! and one name — `rknn` — that parses and refuses. *How a family is fed and read* is everything else in this
+//! here (onnxruntime on the CPU EP, and on Qualcomm's HTP via the QNN plugin
+//! EP), and one name — `rknn` — that a board library implements in its own
+//! crate. *How a family is fed and read* is everything else in this
 //! module, and it is backend-agnostic: sniffing, sizing and decode work from a
 //! model's declared names and shapes, never from an SDK's types.
 //!
@@ -44,20 +45,24 @@ mod resolve;
 /// outside `infer` names it (T1.4).
 pub(super) const MAX_DETS: usize = 32;
 
-// What `infer::X` resolves to for the rest of this library, for main.rs and for
-// `cairn-native`. Deliberately *narrower* than the pre-split surface: fifteen items
-// that were `pub` only because everything shared one module are named nowhere
-// outside `infer` and are no longer re-exported (T1.4).
+// What `infer::X` resolves to for the rest of this library and for the crates
+// that link it. An item is here because something outside `infer` names it,
+// not because it is `pub` inside (T1.4).
 pub use backend::{BackendKind, QnnOptions};
+// The backend seam, for a board library implementing `Backend` outside this
+// crate and opening a detector over it with `Detector::with_backend`.
+pub use backend::{Backend, InputTensor, ModelIo, RknnOptions, SessionOptions, Tensors};
 pub use baseline::{
     cpu_baseline_ms, measure_cpu_baseline, open_baseline_detector, BASELINE_PASSES,
 };
 pub use detector::Detector;
 pub use embedder::{embed_persons, quantize_base64, Embedder};
 pub use geometry::{Fit, InputSize, Projection};
+pub use heads::Raw;
 pub use labels::{Labels, ScoreFloors, TrackFloorOverrides};
 pub use profile::{InputSpec, ModelProfile};
 pub use qparams::IoQuant;
+pub use resolve::Declared;
 
 // Once test-only, now load-bearing across the split NIF boundary: a resolved
 // spec crosses between the inference library (cairn-ort, the producer via
@@ -66,6 +71,8 @@ pub use qparams::IoQuant;
 pub use {encoding::TensorEncoding, geometry::ResizePolicy};
 
 // The uint8-IO spike's payload types: the packer's output enum and the edge
-// qparams it quantizes through — named by decode.rs (`pack_chw`'s return and
+// qparams it quantizes through — named by decode.rs (`pack`'s return and
 // `ModelInput.tensor`'s field type) and by tests that build quantized specs.
 pub use encoding::{QuantParams, TensorValues};
+// The packer's other axis, reported by a backend and carried on `InputSpec`.
+pub use encoding::TensorLayout;

@@ -56,7 +56,7 @@ defmodule Cairn.Native.ConfigNodeQnnTest do
 
   test "the node env rides along inert on a CPU backend" do
     # The crate reads qnn options only under `--backend qnn`
-    # (plugins/cairn-detect/src/main.rs qnn_options), so an ort config in a
+    # (plugins/cairn-detect/src/cli.rs qnn_options), so an ort config in a
     # container that sets CAIRN_QNN_* must still normalize — the values are
     # carried, deliberately unread.
     Application.put_env(:cairn, :qnn, library: "/opt/qnn/ep.so", soc_model: 35)

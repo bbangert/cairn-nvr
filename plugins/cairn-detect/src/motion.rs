@@ -318,7 +318,7 @@ impl GrayThumb {
     /// Box-filter downsample of packed RGB24 rows to the thumbnail size.
     ///
     /// `plane` must cover `stride * content.h` bytes with `content.w` pixels
-    /// of picture in each row — the same precondition `decode::pack_chw`
+    /// of picture in each row — the same precondition `decode::pack`
     /// carries, and for the same reason: this reads the scaler's own output
     /// frame, whose geometry is the one it was built for.
     ///

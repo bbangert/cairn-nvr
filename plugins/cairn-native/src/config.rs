@@ -13,7 +13,7 @@
 //! built for a subtly different model than the one that resolved them.
 
 use cairn_detect::decode::DecoderKind;
-use cairn_detect::infer::{InputSize, InputSpec, ResizePolicy, TensorEncoding};
+use cairn_detect::infer::{InputSize, InputSpec, ResizePolicy, TensorEncoding, TensorLayout};
 use cairn_detect::motion::{self, MotionConfig, MotionOverrides};
 use clap::ValueEnum;
 use rustler::NifMap;
@@ -89,10 +89,11 @@ impl RawDecoderParams {
                     .map_err(|error| NativeError::Config(crate::error::chain(&error)))?,
                 resize: ResizePolicy::from_wire(&self.resize, self.resize_pad)
                     .map_err(|error| NativeError::Config(crate::error::chain(&error)))?,
-                // Never set on the decode side: the split path packs no
-                // tensor here, and the uint8-IO spike is binary-only — no
-                // quant spec crosses the NIF wire.
+                // Neither is read on the decode side, which packs no tensor:
+                // the uint8-IO spike is binary-only and no quant spec crosses
+                // the NIF wire, and neither does a layout.
                 input_quant: None,
+                layout: TensorLayout::Nchw,
             },
             source: source_size(self.source_width, self.source_height)?,
             motion: motion::resolve(&overrides, &MotionOverrides::default()),

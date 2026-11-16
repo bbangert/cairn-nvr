@@ -178,7 +178,7 @@ pub fn run(
 ///
 /// The single-camera contract is the opposite: there, an open failure or the
 /// 30s read timeout is fatal so Cairn restarts the process (see `run_single`
-/// in main.rs). Here the process serves other cameras that are still live,
+/// in cli.rs). Here the process serves other cameras that are still live,
 /// and a member's silence is an expected state rather than a fault.
 fn stream_loop(
     spec: &CameraSpec,

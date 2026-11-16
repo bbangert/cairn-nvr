@@ -187,7 +187,7 @@ def load_image_chw(
     extracted per quantize-model.md passes through untouched.
 
     Padding goes in *before* the encoding, as a pixel value, because that is
-    where the plugin puts it (`pack_chw` in src/decode.rs encodes pad bytes
+    where the plugin puts it (`pack` in src/decode.rs encodes pad bytes
     through the same `Packing` as real pixels) — the model was trained on a
     padded picture, not on an out-of-range constant.
     """
