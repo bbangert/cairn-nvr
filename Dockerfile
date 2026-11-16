@@ -357,8 +357,8 @@ ARG TARGETARCH
 RUN [ "$TARGETARCH" = "arm64" ] \
   || { echo "CAIRN_BOARD=rockchip is arm64 only (TARGETARCH=$TARGETARCH)" >&2; exit 1; }
 
-# No extra packages: both libraries link only glibc's own libraries and
-# libstdc++, which the base image has. The ldd check proves it here, on the
+# No extra packages: the libraries need only glibc, libstdc++ and libgcc_s,
+# which the base image has. The ldd check proves it here, on the
 # target platform, rather than at the first dlopen on the board.
 COPY --from=rockchip-libs /opt/rockchip /opt/rockchip
 RUN <<'EOS'
