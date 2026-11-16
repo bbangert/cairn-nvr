@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Cross-build the three Rust artifacts for the aarch64 container image:
+# Cross-build the Rust artifacts for the aarch64 container image:
 #
 #   plugins/cairn-native  -> libcairn_native.so   (decode NIF, links FFmpeg)
 #   plugins/cairn-ort     -> libcairn_ort.so      (inference NIF)
 #   plugins/cairn-detect  -> cairn-detect         (canary / parity binary)
 #
-# Cross, never qemu (D-C3): NIFs and the canary are the only arch-native
-# artifacts; BEAM bytecode is arch-neutral and ERTS comes from the arm64
+# and, when CAIRN_BOARD=rockchip, the board library's probe binary:
+#
+#   boards/cairn_rockchip -> rockchip/cairn-rockchip-probe
+#
+# Cross, never qemu (D-C3): the NIFs and these binaries are the only
+# arch-native artifacts; BEAM bytecode is arch-neutral and ERTS comes from the arm64
 # release build. Runs on any amd64 Debian trixie with:
 #
 #   dpkg --add-architecture arm64 && apt-get update
@@ -54,8 +58,20 @@ cp plugins/cairn-detect/target/$TARGET/release/cairn-detect \
   plugins/cairn-native/target/$TARGET/release/libcairn_native.so \
   plugins/cairn-ort/target/$TARGET/release/libcairn_ort.so \
   "$DIST/"
+artifacts=(cairn-detect libcairn_native.so libcairn_ort.so)
 
-for f in cairn-detect libcairn_native.so libcairn_ort.so; do
+# libcairn_rockchip.so comes out of the same invocation and is not copied:
+# no release depends on the board library.
+if [ "${CAIRN_BOARD:-}" = rockchip ]; then
+  (cd boards/cairn_rockchip/native/cairn_rockchip &&
+    cargo build --release --target "$TARGET" --features ort-load-dynamic)
+  mkdir -p "$DIST/rockchip"
+  cp boards/cairn_rockchip/native/cairn_rockchip/target/$TARGET/release/cairn-rockchip-probe \
+    "$DIST/rockchip/"
+  artifacts+=(rockchip/cairn-rockchip-probe)
+fi
+
+for f in "${artifacts[@]}"; do
   file "$DIST/$f" | grep -q aarch64 || {
     echo "ERROR: $f is not aarch64" >&2
     exit 1
