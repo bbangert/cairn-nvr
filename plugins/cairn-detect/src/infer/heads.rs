@@ -19,13 +19,13 @@ use super::MAX_DETS;
 /// One extracted output tensor: the values and the shape they came with.
 ///
 /// The borrow is the backend's — this is what
-/// [`Tensors::get`](super::backend::Tensors::get) hands back, borrowed from the
-/// run that produced it rather than copied out of it. (A uint8-IO artifact's
-/// outputs are the one exception: the run dequantizes those codes into owned
-/// buffers, and this borrows the dequant buffer instead of the session's.)
-pub(super) struct Raw<'a> {
-    pub(super) dims: Vec<i64>,
-    pub(super) values: &'a [f32],
+/// [`Tensors::get`](super::Tensors::get) hands back, borrowed from the
+/// run that produced it rather than copied out of it. Where the runtime's own
+/// buffer is not f32, it borrows the buffer the run converted into instead:
+/// the onnxruntime backend dequantizes a uint8-IO artifact's outputs that way.
+pub struct Raw<'a> {
+    pub dims: Vec<i64>,
+    pub values: &'a [f32],
 }
 
 /// Read one output tensor into contract detections.

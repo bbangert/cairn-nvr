@@ -16,7 +16,7 @@
 //!
 //! What that costs: a line is no longer ordered against libav's own writes, and
 //! whatever is still queued at an exit is lost unless something calls [`drain`]
-//! first — `main` and the control thread do.
+//! first — [`crate::cli::run`] and the control thread do.
 
 use std::fmt::Arguments;
 use std::io::Write;

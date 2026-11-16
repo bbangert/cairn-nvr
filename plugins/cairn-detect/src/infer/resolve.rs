@@ -31,7 +31,7 @@ use super::profile::{
 /// variants below.
 ///
 /// `anyhow` owns the boundary, and the conversion into it happens at **three**
-/// sites, not one: `Detector::open` once at startup, and per frame both
+/// sites, not one: `Detector::with_backend` once at startup, and per frame both
 /// `Detector::detect` (`with_context` on [`fit_output`]) and
 /// `heads::decode_output` (`?` on [`validate_layout`]). An audit that reads
 /// only the first misses the two that run on every frame. All three are
@@ -56,7 +56,7 @@ pub(super) enum ResolveError {
     GridDoesNotDivide { size: InputSize, stride: usize },
 
     /// A single-output layout bound against a model that declares no output at
-    /// all. `Detector::open` rejects that earlier with its own message, so this
+    /// all. `Detector::with_backend` rejects that earlier with its own message, so this
     /// is reachable only through a direct [`bind`].
     #[error("model has no outputs")]
     NoOutputs,
@@ -229,6 +229,16 @@ pub(super) enum ResolveError {
     )]
     SizeUndeclared { model: PathBuf },
 
+    /// A zero axis. No flag and no ONNX model produces one — `dim` rejects it
+    /// on the flag and `declared_input_size` requires `> 0` — so this is a
+    /// backend outside this crate reporting it, and nothing after the
+    /// resolution is written for an empty input.
+    #[error("input size {size} ({provenance}) has a zero dimension")]
+    InputSizeZero {
+        size: InputSize,
+        provenance: InputSizeSource,
+    },
+
     /// A size past the per-axis ceiling, whichever provenance it came from.
     ///
     /// The field is `provenance` rather than `source` only because `thiserror`
@@ -247,7 +257,7 @@ pub(super) enum ResolveError {
     /// megabytes are what makes the case, so the message computes them.
     #[error(
         "input size {size} ({provenance}) is {pixels} pixels, over the {}-pixel \
-         limit (2048x2048): the CHW f32 tensor alone would be {} MB, per camera",
+         limit (2048x2048): the input tensor alone would be {} MB as f32, per camera",
         MAX_INPUT_PIXELS,
         pixels.saturating_mul(3 * std::mem::size_of::<f32>()) / (1024 * 1024)
     )]
@@ -316,8 +326,10 @@ pub(super) fn check_grid_divides_input(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Declared {
     pub name: String,
-    /// Dims when the export pins the ones that identify a layout, `None`
-    /// otherwise. See [`static_output_dims`].
+    /// Dims when the model pins the ones that identify a layout, `None`
+    /// otherwise: `Some` means every axis after the batch is a fixed positive
+    /// count, with the batch written as 1 whatever the model left there. See
+    /// [`static_output_dims`] for why the batch is exempt.
     pub dims: Option<Vec<i64>>,
 }
 
@@ -687,6 +699,20 @@ fn sniff_profile(
     }
 }
 
+/// The declared batch dimension of a rank-4 input, `None` when the shape is
+/// not rank-4 or the batch is symbolic/dynamic (negative). The embedder's
+/// N=1 contract checks this at open: a fixed batch of 16 dies mid-run at the
+/// first crop otherwise, with onnxruntime's shape error instead of ours.
+pub(super) fn declared_input_batch(dtype: &ValueType) -> Option<i64> {
+    let ValueType::Tensor { shape, .. } = dtype else {
+        return None;
+    };
+    if shape.len() != 4 || shape[0] <= 0 {
+        return None;
+    }
+    Some(shape[0])
+}
+
 /// Spatial dims declared by a `[N, 3, H, W]` model input, if it pins them.
 ///
 /// Only a confidently NCHW 3-channel shape yields a size. Everything else —
@@ -702,20 +728,6 @@ fn sniff_profile(
 /// tensor before onnxruntime ever sees the mismatch.
 ///
 /// [`RgbScaler`]: crate::decode::RgbScaler
-/// The declared batch dimension of a rank-4 input, `None` when the shape is
-/// not rank-4 or the batch is symbolic/dynamic (negative). The embedder's
-/// N=1 contract checks this at open: a fixed batch of 16 dies mid-run at the
-/// first crop otherwise, with onnxruntime's shape error instead of ours.
-pub(super) fn declared_input_batch(dtype: &ValueType) -> Option<i64> {
-    let ValueType::Tensor { shape, .. } = dtype else {
-        return None;
-    };
-    if shape.len() != 4 || shape[0] <= 0 {
-        return None;
-    }
-    Some(shape[0])
-}
-
 pub(super) fn declared_input_size(dtype: &ValueType) -> Option<InputSize> {
     let ValueType::Tensor { shape, .. } = dtype else {
         return None;
@@ -785,9 +797,14 @@ pub(super) fn resolve_input_size(
             }
         },
     };
-    // Every provenance funnels through here, so both ceilings cover a model's
-    // declared dims as well as a typo'd flag. Zero is already impossible:
-    // `dim` rejects it on the flag and `declared_input_size` requires `> 0`.
+    // Every provenance funnels through here, so the floor and both ceilings
+    // cover a model's declared dims as well as a typo'd flag.
+    if size.w == 0 || size.h == 0 {
+        return Err(ResolveError::InputSizeZero {
+            size,
+            provenance: source,
+        });
+    }
     if size.w > MAX_INPUT_DIM || size.h > MAX_INPUT_DIM {
         return Err(ResolveError::InputSizeOverAxisLimit {
             size,
@@ -2320,6 +2337,32 @@ mod tests {
         );
     }
 
+    /// Only a backend outside this crate can report one: the flag parser and the ONNX reader both refuse zero before this.
+    #[test]
+    fn a_zero_axis_is_refused_with_its_provenance() {
+        let model = Path::new("m.onnx");
+        for size in [InputSize { w: 0, h: 64 }, InputSize { w: 64, h: 0 }] {
+            let err = resolve_input_size(Some(size), None, None, model).unwrap_err();
+            let ResolveError::InputSizeZero {
+                size: got,
+                provenance,
+            } = &err
+            else {
+                panic!("{err:?}");
+            };
+            assert_eq!(*got, size);
+            assert_eq!(*provenance, InputSizeSource::Model);
+        }
+        assert_eq!(
+            ResolveError::InputSizeZero {
+                size: InputSize { w: 0, h: 64 },
+                provenance: InputSizeSource::Model,
+            }
+            .to_string(),
+            "input size 0x64 (from model) has a zero dimension"
+        );
+    }
+
     #[test]
     fn the_over_pixel_limit_message_carries_the_megabytes_that_make_the_case() {
         assert_eq!(
@@ -2330,7 +2373,7 @@ mod tests {
             }
             .to_string(),
             "input size 4096x2048 (from --input-size) is 8388608 pixels, over the 4194304-pixel \
-             limit (2048x2048): the CHW f32 tensor alone would be 96 MB, per camera"
+             limit (2048x2048): the input tensor alone would be 96 MB as f32, per camera"
         );
     }
 }

@@ -23,8 +23,7 @@ use super::resolve::{
 
 pub struct Detector {
     /// The runtime holding the open model. Boxed rather than an enum over the
-    /// backends: `rknn` has no type to be a variant of yet, and a variant
-    /// nothing constructs is dead code under `-D warnings`.
+    /// backends: a board library's backend is a type this crate never sees.
     backend: Box<dyn Backend>,
     /// The model's own name for each tensor this profile's layout reads,
     /// settled at startup so a decode never looks one up by index.
@@ -104,9 +103,8 @@ impl Detector {
     /// uint8-IO artifact, refused next to a float one, checked against the
     /// session's sniffed dtypes either way.
     ///
-    /// Everything after the backend opens is backend-agnostic: the size and
-    /// profile resolution below read a [`ModelIo`],
-    /// which is the model's declared names and shapes with no SDK type in it.
+    /// Opens only the backends this crate carries; the rest is
+    /// [`Detector::with_backend`].
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         model: &Path,
@@ -126,20 +124,51 @@ impl Detector {
         let backend: Box<dyn Backend> = match backend {
             BackendKind::Ort => Box::new(OrtBackend::open(model, &options)?),
             BackendKind::Qnn => Box::new(QnnBackend::open(model, &options)?),
-            // The host refuses this at config load unless the profile and the
-            // group both acknowledge it as experimental; this is the same
-            // refusal one process later, for the argv that got here anyway.
-            // Spelled out rather than a wildcard so that implementing it — or
-            // adding a fourth kind — is a compile error here, not a runtime
-            // refusal of a backend that exists.
+            // This crate carries no rknn backend; a board library's arrives
+            // through `with_backend`. The host refuses a non-`ort` profile at
+            // config load unless the profile and the group both acknowledge
+            // it as experimental, so this is for the name that got here
+            // anyway. Spelled out rather than a wildcard so that a fourth
+            // kind is a compile error here rather than silently joining this
+            // refusal.
             kind @ BackendKind::Rknn => bail!(
-                "backend {kind} is not yet implemented — only ort and qnn execute today. \
+                "backend {kind} is provided by a board library this build does not carry. \
                  Its expected artifact is {} (see --backend).",
                 kind.capabilities().artifact
             ),
         };
+        Self::with_backend(
+            backend,
+            model,
+            requested,
+            profile,
+            labels,
+            allow_label_mismatch,
+            options.io_quant.as_ref(),
+        )
+    }
+
+    /// Everything after the backend opens, for a backend opened anywhere —
+    /// this crate's, through [`Detector::open`], or a board library's. It is
+    /// backend-agnostic: the size and profile resolution below read a
+    /// [`ModelIo`], which is the model's declared names and shapes with no SDK
+    /// type in it.
+    ///
+    /// `model` names the artifact, and its sidecar's path, in errors; it is
+    /// never opened here. `io_quant` must be the sidecar the backend was
+    /// opened with — the one its [`SessionOptions::io_quant`] carried —
+    /// since the backend dequantizes by it and the packer quantizes by it.
+    pub fn with_backend(
+        backend: Box<dyn Backend>,
+        model: &Path,
+        requested: Option<InputSize>,
+        profile: Option<ModelProfile>,
+        labels: &Labels,
+        allow_label_mismatch: bool,
+        io_quant: Option<&IoQuant>,
+    ) -> Result<Self> {
         let io = backend.io();
-        check_io_quant(io, options.io_quant.as_ref(), model)?;
+        check_io_quant(io, io_quant, model)?;
         let (input_size, input_size_source) =
             resolve_input_size(io.declared_input_size, requested, profile, model)?;
         let declared: &[Declared] = &io.outputs;
@@ -147,13 +176,12 @@ impl Detector {
             bail!("model {} has no outputs", model.display());
         }
         let (mut profile, outputs, output) = resolve_profile(profile, declared, input_size, model)?;
-        // The sidecar's input qparams ride the resolved spec so the packer —
-        // on either side of `input_spec()` — quantizes with the artifact's
-        // own scale, never a profile default.
-        profile.input.input_quant = options
-            .io_quant
-            .as_ref()
-            .and_then(|quant| quant.input.as_ref().map(|(_, qp)| *qp));
+        // The sidecar's input qparams and the backend's layout ride the
+        // resolved spec so the packer — on either side of `input_spec()` —
+        // packs for the artifact that opened, never for a profile default.
+        profile.input.input_quant =
+            io_quant.and_then(|quant| quant.input.as_ref().map(|(_, qp)| *qp));
+        profile.input.layout = io.input_layout;
         check_grid_divides_input(profile.output.layout, input_size)?;
         if let Some(output) = output {
             check_label_count(output.layout, labels, allow_label_mismatch)?;
@@ -176,7 +204,7 @@ impl Detector {
 
     /// Startup description of the runtime that opened this model and what it
     /// accepts — rendered here, like [`Detector::layout_summary`], so
-    /// `Capabilities` stays inside `infer` and main.rs prints rather than
+    /// `Capabilities` stays inside `infer` and `cli.rs` prints rather than
     /// interprets it.
     pub fn backend_summary(&self) -> String {
         format!(
@@ -231,10 +259,8 @@ impl Detector {
             }
             _ => {}
         }
-        let input = InputTensor {
-            shape: [1i64, 3, self.input_size.h as i64, self.input_size.w as i64],
-            values: tensor,
-        };
+        let spec = self.input_spec();
+        let input = InputTensor::new(spec.size, spec.layout, tensor);
         // Timed around `run` alone — the model pass plus the copy of this
         // frame's values into the session's input (plus, for a uint8-IO
         // artifact, the output dequant the graph's stripped DequantizeLinear
@@ -321,6 +347,8 @@ fn check_io_quant(io: &ModelIo, quant: Option<&IoQuant>, model: &Path) -> Result
 
 #[cfg(test)]
 mod tests {
+    use super::super::backend::Tensors;
+    use super::super::encoding::TensorLayout;
     use super::*;
 
     /// The four-way refusal matrix the uint8-IO open-time safety rests on,
@@ -339,6 +367,7 @@ mod tests {
             outputs: Vec::new(),
             input_is_u8,
             u8_outputs: u8_outputs.iter().map(|s| s.to_string()).collect(),
+            input_layout: TensorLayout::Nchw,
         };
         let quant = |input: Option<&str>, outputs: &[&str]| IoQuant {
             input: input.map(|name| (name.to_string(), qp)),
@@ -381,11 +410,11 @@ mod tests {
         assert!(err.to_string().contains("uint8 outputs"), "{err}");
     }
 
-    /// The stub refusal is the whole operator-visible behaviour of the
-    /// `--backend` seam for a backend that has not landed, and it must fire
-    /// before any model access — proven here by a path that does not exist.
+    /// Without the board library that provides it, `rknn` is refused by name
+    /// and before any model access — proven here by a path that does not
+    /// exist — so an argv naming it fails on the backend, not on the file.
     #[test]
-    fn stub_backend_is_refused_before_any_model_access() {
+    fn a_board_backend_this_build_lacks_is_refused_before_any_model_access() {
         // Not `unwrap_err`: `Detector` has no `Debug`, deliberately.
         let err = match Detector::open(
             Path::new("does/not/exist"),
@@ -397,12 +426,109 @@ mod tests {
             QnnOptions::default(),
             None,
         ) {
-            Ok(_) => panic!("stub backend rknn opened"),
+            Ok(_) => panic!("backend rknn opened without its board library"),
             Err(err) => err,
         };
         let msg = err.to_string();
-        assert!(msg.contains("backend rknn is not yet implemented"), "{msg}");
+        assert!(
+            msg.contains("backend rknn is provided by a board library this build does not carry"),
+            "{msg}"
+        );
         assert!(msg.contains(".rknn"), "{msg}");
+    }
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<([i64; 4], TensorLayout)>>>;
+
+    /// A backend opened outside this crate, over a 96x64 yolox-shaped model.
+    /// Every run's input shape is recorded in `seen`, and every output is
+    /// zeros — no detections, only the plumbing.
+    struct FakeBackend {
+        io: ModelIo,
+        output: Vec<f32>,
+        seen: Seen,
+    }
+
+    struct FakeTensors<'a>(&'a [f32]);
+
+    impl Tensors for FakeTensors<'_> {
+        fn get(&self, _name: &str) -> Result<Raw<'_>> {
+            Ok(Raw {
+                dims: vec![1, 126, 85],
+                values: self.0,
+            })
+        }
+    }
+
+    impl Backend for FakeBackend {
+        fn open(_: &Path, _: &SessionOptions) -> Result<Self> {
+            unreachable!("built directly")
+        }
+        fn kind(&self) -> BackendKind {
+            BackendKind::Rknn
+        }
+        fn io(&self) -> &ModelIo {
+            &self.io
+        }
+        fn run(&mut self, input: InputTensor) -> Result<Box<dyn Tensors + '_>> {
+            self.seen.lock().unwrap().push((input.shape, input.layout));
+            Ok(Box::new(FakeTensors(&self.output)))
+        }
+    }
+
+    /// The layout is the backend's to decide: whatever `io()` reports is what
+    /// the resolved spec carries and what shape the run is handed. The input is
+    /// not square, so a swapped height and width cannot pass.
+    #[test]
+    fn with_backend_takes_the_input_layout_from_the_backend() {
+        use super::super::geometry::ResizePolicy;
+
+        for (layout, shape) in [
+            (TensorLayout::Nhwc, [1, 64, 96, 3]),
+            (TensorLayout::Nchw, [1, 3, 64, 96]),
+        ] {
+            let seen = Seen::default();
+            let backend = FakeBackend {
+                io: ModelIo {
+                    input_name: "images".to_string(),
+                    declared_input_size: Some(InputSize { w: 96, h: 64 }),
+                    declared_input_batch: Some(1),
+                    outputs: vec![Declared {
+                        name: "output".to_string(),
+                        dims: Some(vec![1, 126, 85]),
+                    }],
+                    input_is_u8: false,
+                    u8_outputs: Vec::new(),
+                    input_layout: layout,
+                },
+                output: vec![0.0; 126 * 85],
+                seen: std::sync::Arc::clone(&seen),
+            };
+            let labels = Labels::load(None).unwrap();
+            let mut detector = match Detector::with_backend(
+                Box::new(backend),
+                Path::new("m.rknn"),
+                None,
+                None,
+                &labels,
+                false,
+                None,
+            ) {
+                Ok(detector) => detector,
+                Err(err) => panic!("{err:#}"),
+            };
+            let spec = detector.input_spec();
+            assert_eq!(spec.layout, layout);
+            assert_eq!(detector.profile().name, "yolox");
+
+            let projection = ResizePolicy::Stretch.project(spec.size, spec.size);
+            let floors = ScoreFloors::parse("{}").unwrap();
+            let tensor = TensorValues::F32(vec![0.0; spec.size.tensor_len()]);
+            let dets = detector
+                .detect(tensor, projection, &labels, &floors)
+                .unwrap();
+            assert!(dets.is_empty());
+            assert_eq!(*seen.lock().unwrap(), [(shape, layout)]);
+        }
     }
 
     /// The report/reset boundary, driven through `record` itself rather than

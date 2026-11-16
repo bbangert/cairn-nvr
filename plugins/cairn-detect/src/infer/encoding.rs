@@ -58,7 +58,7 @@ impl TensorEncoding {
         }
     }
 
-    /// The per-plane affine and channel pick this encoding amounts to.
+    /// The per-channel affine and channel pick this encoding amounts to.
     pub fn packing(self) -> Packing {
         match self {
             Self::UnitRgb => Packing {
@@ -90,33 +90,33 @@ impl TensorEncoding {
     }
 }
 
-/// An encoding reduced to arithmetic: for each output plane, which byte of an
+/// An encoding reduced to arithmetic: for each output channel, which byte of an
 /// RGB24 pixel feeds it and the affine applied on the way in.
 ///
-/// Per-plane rather than scalar so a `mean`/`std` normalization is expressible
+/// Per-channel rather than scalar so a `mean`/`std` normalization is expressible
 /// here without changing a single caller.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Packing {
-    /// Index into an RGB24 pixel for output plane 0, 1, 2.
+    /// Index into an RGB24 pixel for output channel 0, 1, 2.
     pub source: [usize; 3],
     pub scale: [f32; 3],
     pub bias: [f32; 3],
 }
 
 impl Packing {
-    /// One byte of one plane, encoded.
-    pub fn value(&self, plane: usize, byte: u8) -> f32 {
-        f32::from(byte) * self.scale[plane] + self.bias[plane]
+    /// One byte of one channel, encoded.
+    pub fn value(&self, channel: usize, byte: u8) -> f32 {
+        f32::from(byte) * self.scale[channel] + self.bias[channel]
     }
 
-    /// One plane's byte -> uint8-code table for a quantized-input model:
-    /// `quantize(value(plane, byte))` for all 256 bytes, computed once per
+    /// One channel's byte -> uint8-code table for a quantized-input model:
+    /// `quantize(value(channel, byte))` for all 256 bytes, computed once per
     /// pack so the pixel loop is a lookup instead of float math. For the
     /// identity-qparams RawBgr case (scale 1, zero-point 0 — every 0..255
     /// model the surgery converts today) the table degenerates to the
     /// identity and u8 packing is a pure byte shuffle.
-    pub fn quantized_lut(&self, plane: usize, quant: QuantParams) -> [u8; 256] {
-        std::array::from_fn(|byte| quant.quantize(self.value(plane, byte as u8)))
+    pub fn quantized_lut(&self, channel: usize, quant: QuantParams) -> [u8; 256] {
+        std::array::from_fn(|byte| quant.quantize(self.value(channel, byte as u8)))
     }
 }
 
@@ -164,6 +164,20 @@ impl QuantParams {
     pub fn dequantize(self, code: u8) -> f32 {
         (f32::from(code) - f32::from(self.zero_point)) * self.scale
     }
+}
+
+/// The order a packed input tensor's values are in: NCHW is planar, NHWC
+/// interleaves each pixel's three channels.
+///
+/// A property of the runtime that opened the model, not of the family — one
+/// set of weights compiled for onnxruntime and for RKNN takes NCHW float on
+/// the first and NHWC uint8 on the second. No `Default`, so every site that
+/// builds an [`InputSpec`](super::InputSpec) names one; the one a packer reads
+/// is always a backend's report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TensorLayout {
+    Nchw,
+    Nhwc,
 }
 
 /// A packed input tensor's payload: f32 for the float graph-IO contract every

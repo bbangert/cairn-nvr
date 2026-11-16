@@ -17,7 +17,7 @@ use ort::value::{Tensor, TensorElementType, ValueType};
 
 use crate::note;
 
-use super::super::encoding::{QuantParams, TensorValues};
+use super::super::encoding::{QuantParams, TensorLayout, TensorValues};
 use super::super::heads::Raw;
 use super::super::resolve::{
     declared_input_batch, declared_input_size, static_output_dims, Declared,
@@ -93,6 +93,7 @@ impl OrtBackend {
                     dims: static_output_dims(output.dtype()),
                 })
                 .collect(),
+            input_layout: TensorLayout::Nchw,
         };
         Ok(Self {
             session,

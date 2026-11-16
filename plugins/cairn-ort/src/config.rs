@@ -61,7 +61,7 @@ impl RawInitConfig {
         let backend = enum_value::<BackendKind>("backend", &self.backend)?;
         let embedder_model = self.embedder_model.map(PathBuf::from);
         // The embedder's own open refuses qnn too, but only after the detector's
-        // multi-second HTP graph compile. `main.rs`'s `run` refuses it up front as
+        // multi-second HTP graph compile. `cli.rs`'s `serve` refuses it up front as
         // well, so the two hosts answer the same profile the same way.
         if embedder_model.is_some() && backend == BackendKind::Qnn {
             return Err(NativeError::Config(

@@ -1,8 +1,11 @@
-//! Cairn detection plugin: H.264 RTP in, protocol v1 ndjson out.
+//! The `cairn-detect` command line: H.264 RTP in, protocol v1 ndjson out.
 //!
-//! See `docs/plugin-contract.md`. Cairn appends the arguments of one of the
-//! two contract variants to whatever command it is configured with; the model
-//! flags and the motion gate's `--motion-json` come from that configured
+//! A library function rather than the binary's body so that a board crate's
+//! probe binary is one call to [`run`], naming the backends it carries.
+//!
+//! See `docs/archive/plugin-contract.md`. Cairn appends the arguments of one
+//! of the two contract variants to whatever command it is configured with; the
+//! model flags and the motion gate's `--motion-json` come from that configured
 //! command, which is why the gate needs no host change to reach either mode.
 //!
 //!   * per-camera: `--camera-id`, `--udp-port`, `--min-score-json` — one
@@ -16,13 +19,8 @@
 //! ([`control`]). stdout carries protocol lines and nothing else — every
 //! diagnostic, here and in the stages, goes to stderr where Cairn logs it.
 
-// The library's deny, repeated because this is a separate crate — see `lib.rs` for
-// why. Clippy exempts the call inside `fn main`, which is where this crate's one
-// legitimate exit lives; the exemption goes by enclosing body, so `main` here
-// spawns nothing.
-#![deny(clippy::exit)]
-
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -32,15 +30,15 @@ use clap::Parser;
 use crossbeam_channel::{bounded, Receiver};
 use rsmpeg::ffi;
 
-use cairn_detect::note;
-use cairn_detect::{control, decode, emit, gate, infer, motion, multiplex, rtp};
+use crate::note;
+use crate::{control, decode, emit, gate, infer, motion, multiplex, rtp};
 use control::Streams;
 use decode::{DecoderKind, Sample};
 use emit::Publisher;
 use gate::Gate;
 use infer::{
-    BackendKind, Detector, Embedder, InputSize, Labels, ModelProfile, QnnOptions, ScoreFloors,
-    TrackFloorOverrides,
+    Backend, BackendKind, Detector, Embedder, InputSize, InputSpec, IoQuant, Labels, ModelProfile,
+    QnnOptions, ScoreFloors, SessionOptions, TensorLayout, TrackFloorOverrides,
 };
 use motion::{MotionConfig, MotionOverrides};
 
@@ -116,9 +114,9 @@ struct Args {
     model: PathBuf,
 
     /// Inference runtime. `ort` (CPU) and `qnn` (Qualcomm HTP, needs
-    /// `--qnn-library` and a QDQ model) execute; `rknn` is accepted here and
-    /// refused when the model opens, so a profile naming hardware whose
-    /// runtime has not landed fails with a message about the backend rather
+    /// `--qnn-library` and a QDQ model) execute in every build; `rknn` executes
+    /// only in a build whose board library provides it, and elsewhere is
+    /// refused when the model opens with a message about the backend rather
     /// than a usage error about the flag.
     #[arg(long, value_enum, default_value_t = BackendKind::Ort)]
     backend: BackendKind,
@@ -198,20 +196,33 @@ struct Args {
     sample_fps: u32,
 }
 
-fn main() {
-    let failed = run().inspect_err(|e| {
+/// A backend the core does not carry, opened for the kind it names.
+///
+/// [`run`] consults its providers before the core's own backends, so a
+/// provider for a kind the core also opens replaces it.
+pub struct Provider {
+    pub kind: BackendKind,
+    pub open: fn(&Path, &SessionOptions) -> Result<Box<dyn Backend>>,
+}
+
+/// Everything a binary's `main` does: argv in, exit code out, with a failure
+/// reported on stderr as `fatal: …`.
+pub fn run(providers: &[Provider]) -> ExitCode {
+    let failed = serve(providers).inspect_err(|e| {
         // Exit loudly: Cairn restarts us with jittered backoff.
         note!("fatal: {e:#}");
     });
     // On both paths, because `note!` only queues: a clean run has lines of its own
     // still in flight.
-    cairn_detect::log::drain();
+    crate::log::drain();
     if failed.is_err() {
-        std::process::exit(1);
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
-fn run() -> Result<()> {
+fn serve(providers: &[Provider]) -> Result<()> {
     let args = Args::parse();
 
     if let Some(passes) = args.cpu_baseline {
@@ -229,15 +240,22 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    // The embedder's own open refuses qnn too, but it runs after the
-    // detector's — which on qnn is a multi-second HTP graph compile. An
+    // The embedder's own open refuses qnn and rknn too, but it runs after
+    // the detector's — which on qnn is a multi-second HTP graph compile. An
     // argv combination that is going down either way should say so before
     // that, not after.
-    if args.embedder_model.is_some() && args.backend == BackendKind::Qnn {
-        anyhow::bail!(
-            "the embedder does not run on qnn yet (no QDQ embedder artifact) \
-             — drop --embedder-model or use --backend ort"
-        );
+    if args.embedder_model.is_some() {
+        match args.backend {
+            BackendKind::Ort => {}
+            BackendKind::Qnn => anyhow::bail!(
+                "the embedder does not run on qnn yet (no QDQ embedder artifact) \
+                 — drop --embedder-model or use --backend ort"
+            ),
+            kind @ BackendKind::Rknn => anyhow::bail!(
+                "the embedder runs on ort only, not {kind} — \
+                 drop --embedder-model or use --backend ort"
+            ),
+        }
     }
     // Same early-refusal geometry for a uint8-IO detector: the embedder
     // crops from the detector's packed tensor, which under a quantized input
@@ -258,8 +276,8 @@ fn run() -> Result<()> {
     emit::stdout_line(&emit::hello_line())?;
 
     match args.cameras_json.as_deref() {
-        Some(json) => run_multiplexed(&args, json),
-        None => run_single(&args),
+        Some(json) => run_multiplexed(&args, json, providers),
+        None => run_single(&args, providers),
     }
 }
 
@@ -277,7 +295,7 @@ fn start_control<'a>(camera_ids: impl IntoIterator<Item = &'a str>) -> Result<Ar
 }
 
 /// One process, a whole plugin group: see [`multiplex`] for the error policy.
-fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
+fn run_multiplexed(args: &Args, cameras_json: &str, providers: &[Provider]) -> Result<()> {
     let specs = multiplex::parse_specs(cameras_json)?;
     // Every argument check before the control thread and the model load: a
     // malformed argument is a start-up failure the operator should see
@@ -300,17 +318,8 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
     let labels = Labels::load(args.labels.as_deref())?;
     // Before any decoder: every scaler and GPU filter graph is built for the
     // size the model resolves to.
-    let detector = Detector::open(
-        &args.model,
-        args.backend,
-        args.input_size,
-        args.model_profile,
-        &labels,
-        args.allow_label_mismatch,
-        qnn_options(args),
-        infer::IoQuant::load_for(&args.model)?,
-    )?;
-    let embedder = open_embedder(args, &labels)?;
+    let detector = open_detector(args, &labels, providers)?;
+    let embedder = open_embedder(args, &labels, detector.input_spec())?;
     note!(
         "cairn-detect up: cameras=[{}] {} {}",
         specs
@@ -340,9 +349,50 @@ fn run_multiplexed(args: &Args, cameras_json: &str) -> Result<()> {
     )
 }
 
-/// The `--qnn-*` flags as one group. Read by `Detector::open` only when
-/// `--backend qnn` — always built, because collecting five `Option`s costs
-/// nothing and keeps both call sites identical.
+/// The detector `args` describe, from a provider when one carries
+/// `--backend`, otherwise from the core's own backends.
+fn open_detector(args: &Args, labels: &Labels, providers: &[Provider]) -> Result<Detector> {
+    let options = SessionOptions {
+        qnn: qnn_options(args),
+        io_quant: IoQuant::load_for(&args.model)?,
+        ..SessionOptions::default()
+    };
+    match providers.iter().find(|p| p.kind == args.backend) {
+        Some(provider) => {
+            let backend = (provider.open)(&args.model, &options)?;
+            // The startup line names the backend's own kind, so without this
+            // it would report a runtime `--backend` did not ask for.
+            if backend.kind() != provider.kind {
+                bail!(
+                    "the provider registered for --backend {} opened backend {}",
+                    provider.kind,
+                    backend.kind()
+                );
+            }
+            Detector::with_backend(
+                backend,
+                &args.model,
+                args.input_size,
+                args.model_profile,
+                labels,
+                args.allow_label_mismatch,
+                options.io_quant.as_ref(),
+            )
+        }
+        None => Detector::open(
+            &args.model,
+            args.backend,
+            args.input_size,
+            args.model_profile,
+            labels,
+            args.allow_label_mismatch,
+            options.qnn,
+            options.io_quant,
+        ),
+    }
+}
+
+/// The `--qnn-*` flags as one group, read only by a `qnn` session.
 fn qnn_options(args: &Args) -> QnnOptions {
     QnnOptions {
         library: args.qnn_library.clone(),
@@ -368,7 +418,7 @@ fn track_floor_overrides(args: &Args) -> Result<TrackFloorOverrides> {
 /// One process, one camera. Any stream failure is fatal by design: Cairn
 /// restarts this process with jittered backoff, and there is nothing else
 /// running here to keep alive.
-fn run_single(args: &Args) -> Result<()> {
+fn run_single(args: &Args, providers: &[Provider]) -> Result<()> {
     let camera_id = args
         .camera_id
         .clone()
@@ -394,18 +444,9 @@ fn run_single(args: &Args) -> Result<()> {
     let motion = motion::resolve(&motion_overrides(args)?, &MotionOverrides::default());
     let labels = Labels::load(args.labels.as_deref())?;
     // Before the stream opens: `decode::open` below needs the resolved size.
-    let detector = Detector::open(
-        &args.model,
-        args.backend,
-        args.input_size,
-        args.model_profile,
-        &labels,
-        args.allow_label_mismatch,
-        qnn_options(args),
-        infer::IoQuant::load_for(&args.model)?,
-    )?;
+    let detector = open_detector(args, &labels, providers)?;
     let input_spec = detector.input_spec();
-    let embedder = open_embedder(args, &labels)?;
+    let embedder = open_embedder(args, &labels, input_spec)?;
     note!(
         "cairn-detect up: camera={camera_id} udp={udp_port} {} {}",
         model_summary(args, &detector),
@@ -573,10 +614,24 @@ fn infer_loop(
 /// no `person` entry means every crop filter below will match nothing; that
 /// is a configuration worth flagging once, at startup, not a reason to
 /// refuse a run.
-fn open_embedder(args: &Args, labels: &Labels) -> Result<Option<Embedder>> {
+///
+/// `spec` is the opened detector's. The crop source is the tensor packed for
+/// it and the crop reads that as NCHW planes, so any other layout is refused
+/// here, before the embedder's session load — the uint8-input refusal in
+/// [`serve`] is the same check for the dtype, made earlier because the
+/// sidecar alone answers it.
+fn open_embedder(args: &Args, labels: &Labels, spec: InputSpec) -> Result<Option<Embedder>> {
     let Some(model) = args.embedder_model.as_deref() else {
         return Ok(None);
     };
+    if spec.layout != TensorLayout::Nchw {
+        bail!(
+            "--embedder-model cannot run with a detector whose input is {:?} \
+             (the reid crop source is the detector's packed tensor, read as NCHW \
+             planes) — drop the embedder",
+            spec.layout
+        );
+    }
     let embedder = Embedder::open(model, args.backend)?;
     if !labels.contains("person") {
         note!(
@@ -802,5 +857,118 @@ mod tests {
         assert!(with("1").is_ok());
         assert!(with("30").is_ok());
         assert_eq!(with("30").unwrap().sample_fps, 30);
+    }
+
+    /// A provider replaces the core's backend of the same kind, and is
+    /// trusted for nothing but an open: one that hands back another kind's
+    /// backend is refused before the model is resolved.
+    #[test]
+    fn a_provider_is_consulted_first_and_must_open_its_own_kind() {
+        use infer::{InputTensor, ModelIo, Tensors};
+
+        struct Fake(BackendKind, ModelIo);
+        impl Backend for Fake {
+            fn open(_: &Path, _: &SessionOptions) -> Result<Self> {
+                unreachable!("built by the provider")
+            }
+            fn kind(&self) -> BackendKind {
+                self.0
+            }
+            fn io(&self) -> &ModelIo {
+                &self.1
+            }
+            fn run(&mut self, _: InputTensor) -> Result<Box<dyn Tensors + '_>> {
+                unreachable!("refused before any run")
+            }
+        }
+        fn fake(kind: BackendKind, declared_input_size: Option<InputSize>) -> Box<dyn Backend> {
+            Box::new(Fake(
+                kind,
+                ModelIo {
+                    input_name: "images".to_string(),
+                    declared_input_size,
+                    declared_input_batch: None,
+                    outputs: Vec::new(),
+                    input_is_u8: false,
+                    u8_outputs: Vec::new(),
+                    input_layout: TensorLayout::Nhwc,
+                },
+            ))
+        }
+        fn mislabelled(_: &Path, _: &SessionOptions) -> Result<Box<dyn Backend>> {
+            Ok(fake(BackendKind::Ort, None))
+        }
+        fn ort_provider(_: &Path, _: &SessionOptions) -> Result<Box<dyn Backend>> {
+            Ok(fake(BackendKind::Ort, Some(InputSize::square(64))))
+        }
+        let labels = Labels::load(None).unwrap();
+        // Not `unwrap_err`: `Detector` has no `Debug`, deliberately.
+        let fail =
+            |args: &Args, providers: &[Provider]| match open_detector(args, &labels, providers) {
+                Ok(_) => panic!("the open succeeded"),
+                Err(err) => format!("{err:#}"),
+            };
+
+        let args = parse(&[
+            "--camera-id",
+            "front",
+            "--udp-port",
+            "17000",
+            "--backend",
+            "rknn",
+        ])
+        .unwrap();
+        let msg = fail(
+            &args,
+            &[Provider {
+                kind: BackendKind::Rknn,
+                open: mislabelled,
+            }],
+        );
+        assert!(msg.contains("--backend rknn opened backend ort"), "{msg}");
+
+        // The core's ort backend would have failed on the missing file.
+        let args = parse(&["--camera-id", "front", "--udp-port", "17000"]).unwrap();
+        let msg = fail(
+            &args,
+            &[Provider {
+                kind: BackendKind::Ort,
+                open: ort_provider,
+            }],
+        );
+        assert!(msg.contains("has no outputs"), "{msg}");
+    }
+
+    /// Refused on the spec alone, before the embedder's model is touched —
+    /// proven by a path that does not exist.
+    #[test]
+    fn an_embedder_is_refused_over_a_non_nchw_detector() {
+        use infer::{ResizePolicy, TensorEncoding};
+
+        let args = parse(&[
+            "--camera-id",
+            "front",
+            "--udp-port",
+            "17000",
+            "--embedder-model",
+            "does/not/exist.onnx",
+        ])
+        .unwrap();
+        let spec = InputSpec {
+            size: InputSize::square(64),
+            encoding: TensorEncoding::UnitRgb,
+            resize: ResizePolicy::Stretch,
+            input_quant: None,
+            layout: TensorLayout::Nhwc,
+        };
+        let labels = Labels::load(None).unwrap();
+        let msg = match open_embedder(&args, &labels, spec) {
+            Ok(_) => panic!("an embedder opened over an NHWC detector"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(
+            msg.contains("--embedder-model cannot run with a detector whose input is Nhwc"),
+            "{msg}"
+        );
     }
 }

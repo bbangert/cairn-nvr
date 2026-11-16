@@ -551,6 +551,7 @@ mod tests {
                     encoding: crate::infer::TensorEncoding::UnitRgb,
                     resize: crate::infer::ResizePolicy::Stretch,
                     input_quant: None,
+                    layout: crate::infer::TensorLayout::Nchw,
                 },
                 None,
             );

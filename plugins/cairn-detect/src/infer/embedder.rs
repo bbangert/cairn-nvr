@@ -28,7 +28,7 @@ use anyhow::{bail, Context, Result};
 
 use super::backend::onnxruntime::OrtBackend;
 use super::backend::{Backend, BackendKind, InputTensor, SessionOptions};
-use super::encoding::TensorEncoding;
+use super::encoding::{TensorEncoding, TensorLayout, TensorValues};
 use super::geometry::{InputSize, Projection};
 use super::profile::InputSpec;
 
@@ -74,10 +74,11 @@ impl Embedder {
                 "the embedder does not run on qnn yet (no QDQ embedder \
                  artifact) — drop --embedder-model or use --backend ort"
             ),
+            // Even in a build whose board library provides rknn for the
+            // detector: this open reaches only this crate's backends.
             kind @ BackendKind::Rknn => bail!(
-                "backend {kind} is not yet implemented — only ort and qnn execute today. \
-                 Its expected artifact is {} (see --backend).",
-                kind.capabilities().artifact
+                "the embedder runs on ort only, not {kind} — \
+                 drop --embedder-model or use --backend ort"
             ),
         };
         let io = backend.io();
@@ -166,6 +167,9 @@ impl Embedder {
     /// Crops one wire box out of the detector's input tensor and embeds it:
     /// a unit-norm feature vector, or `None` when the box holds too little
     /// canvas to crop (degenerate after clamping to the content rect).
+    ///
+    /// `spec` must be NCHW: the crop reads planes, and read from an
+    /// interleaved tensor it would embed noise without failing.
     pub fn embed_crop(
         &mut self,
         tensor: &[f32],
@@ -173,14 +177,16 @@ impl Embedder {
         projection: &Projection,
         bbox: [f64; 4],
     ) -> Result<Option<Vec<f32>>> {
+        if spec.layout != TensorLayout::Nchw {
+            bail!("embedder cannot crop from a {:?} tensor", spec.layout);
+        }
         let Some(crop) = crop_chw(tensor, spec, projection, bbox, self.input_size) else {
             return Ok(None);
         };
 
-        let input = InputTensor {
-            shape: [1, 3, self.input_size.h as i64, self.input_size.w as i64],
-            values: super::encoding::TensorValues::F32(crop),
-        };
+        // `crop_chw` writes planes, and the only backend `Embedder::open`
+        // builds reports NCHW.
+        let input = InputTensor::new(self.input_size, TensorLayout::Nchw, TensorValues::F32(crop));
         let tensors = self.backend.run(input).context("running the embedder")?;
         let raw = tensors.get(&self.output_name)?;
         if raw.values.len() != self.dim {
@@ -342,12 +348,12 @@ mod tests {
     use super::*;
     use crate::infer::geometry::ResizePolicy;
 
-    /// The embedder's qnn refusal must fire before any model access — proven
-    /// by a path that does not exist — and name the way out, because a
+    /// The embedder's qnn and rknn refusals must fire before any model access
+    /// — proven by a path that does not exist — and name the way out, because a
     /// regression that fell through to a session open would silently put the
     /// embedder on whatever EP the fallthrough chose.
     #[test]
-    fn qnn_is_refused_before_any_model_access() {
+    fn qnn_and_rknn_are_refused_before_any_model_access() {
         let err = match Embedder::open(Path::new("does/not/exist"), BackendKind::Qnn) {
             Ok(_) => panic!("embedder opened on qnn"),
             Err(err) => err,
@@ -355,6 +361,67 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("does not run on qnn"), "{msg}");
         assert!(msg.contains("--embedder-model"), "{msg}");
+
+        let err = match Embedder::open(Path::new("does/not/exist"), BackendKind::Rknn) {
+            Ok(_) => panic!("embedder opened on rknn"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("ort only"), "{msg}");
+        assert!(msg.contains("--embedder-model"), "{msg}");
+    }
+
+    /// An interleaved detector tensor is refused before any crop or run:
+    /// the planar read would embed noise without failing.
+    #[test]
+    fn a_non_nchw_crop_source_is_refused() {
+        use super::super::backend::{ModelIo, Tensors};
+
+        struct NeverRuns(ModelIo);
+        impl Backend for NeverRuns {
+            fn open(_: &Path, _: &SessionOptions) -> Result<Self> {
+                unreachable!("built directly")
+            }
+            fn kind(&self) -> BackendKind {
+                BackendKind::Ort
+            }
+            fn io(&self) -> &ModelIo {
+                &self.0
+            }
+            fn run(&mut self, _: InputTensor) -> Result<Box<dyn Tensors + '_>> {
+                panic!("the embedder ran on a refused crop source")
+            }
+        }
+
+        let size = InputSize { w: 128, h: 256 };
+        let mut embedder = Embedder {
+            backend: Box::new(NeverRuns(ModelIo {
+                input_name: "input".to_string(),
+                declared_input_size: Some(size),
+                declared_input_batch: Some(1),
+                outputs: Vec::new(),
+                input_is_u8: false,
+                u8_outputs: Vec::new(),
+                input_layout: TensorLayout::Nchw,
+            })),
+            input_size: size,
+            output_name: "features".to_string(),
+            dim: 512,
+        };
+        let src = InputSize::square(64);
+        let spec = InputSpec {
+            size: src,
+            encoding: TensorEncoding::RawBgr,
+            resize: ResizePolicy::Stretch,
+            input_quant: None,
+            layout: TensorLayout::Nhwc,
+        };
+        let projection = ResizePolicy::Stretch.project(src, src);
+        let tensor = vec![0f32; src.tensor_len()];
+        let err = embedder
+            .embed_crop(&tensor, &spec, &projection, [0.0, 0.0, 1.0, 1.0])
+            .unwrap_err();
+        assert!(err.to_string().contains("Nhwc"), "{err}");
     }
 
     // RFC 4648 vectors, driven as bytes.
@@ -425,6 +492,7 @@ mod tests {
             encoding: TensorEncoding::UnitRgb,
             resize: ResizePolicy::Stretch,
             input_quant: None,
+            layout: TensorLayout::Nchw,
         };
         let projection = ResizePolicy::Stretch.project(src, src);
         // Solid (255, 128, 0) in UnitRgb: planes hold v/255.
@@ -460,6 +528,7 @@ mod tests {
             encoding: TensorEncoding::RawBgr,
             resize: ResizePolicy::Stretch,
             input_quant: None,
+            layout: TensorLayout::Nchw,
         };
         let projection = ResizePolicy::Stretch.project(src, src);
         // Solid (255, 128, 0) RGB in RawBgr planes: plane 0 = B = 0,
@@ -497,6 +566,7 @@ mod tests {
             encoding: TensorEncoding::UnitRgb,
             resize: ResizePolicy::Letterbox { pad: 114 },
             input_quant: None,
+            layout: TensorLayout::Nchw,
         };
         let projection = ResizePolicy::Letterbox { pad: 114 }.project(input, source);
 
@@ -534,6 +604,7 @@ mod tests {
             encoding: TensorEncoding::UnitRgb,
             resize: ResizePolicy::Letterbox { pad: 114 },
             input_quant: None,
+            layout: TensorLayout::Nchw,
         };
         let projection = ResizePolicy::Letterbox { pad: 114 }.project(input, source);
         let plane = input.w * input.h;
@@ -567,6 +638,7 @@ mod tests {
             encoding: TensorEncoding::UnitRgb,
             resize: ResizePolicy::Stretch,
             input_quant: None,
+            layout: TensorLayout::Nchw,
         };
         let projection = ResizePolicy::Stretch.project(src, src);
         let tensor = vec![0f32; 3 * src.w * src.h];

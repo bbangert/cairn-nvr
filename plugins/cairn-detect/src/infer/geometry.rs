@@ -26,7 +26,7 @@ pub(super) const MAX_INPUT_DIM: usize = 8192;
 /// A per-axis bound says nothing about how much memory a size asks for, and
 /// the size can come straight off the model: `declared_input_size` reads
 /// `shape[2]`/`shape[3]` of an untrusted ONNX. At `8192x8192` — inside the
-/// per-axis limit — the first frame allocates a 768 MiB `pack_chw` tensor and
+/// per-axis limit — the first frame allocates a 768 MiB `pack` tensor and
 /// a 192 MiB RGB24 AVFrame, per decode thread, plus one tensor parked in each
 /// multiplexed member's slot. Four cameras is over 4 GB of steady-state RSS on
 /// the NVR host, all of it decided by a file the operator downloaded.
@@ -68,7 +68,8 @@ impl InputSize {
         }
     }
 
-    /// Elements in the CHW f32 tensor a frame of this size packs into.
+    /// Elements in the tensor a frame of this size packs into, in either
+    /// layout and either dtype.
     pub fn tensor_len(self) -> usize {
         3 * self.w * self.h
     }
@@ -502,7 +503,7 @@ mod tests {
         // `ResizePolicy::fit` hard-codes `offset: (0, 0)` in both of its arms, so
         // no production path can hand `unproject` a non-zero one and its two
         // `v - self.offset.N` terms subtract a constant nothing everywhere the
-        // pipeline runs. The field is not unused — `decode::pack_chw` reads it to
+        // pipeline runs. The field is not unused — `decode::pack` reads it to
         // place the scaled content inside the input rectangle — and it is what a
         // *centered* letterbox would set. `Fit`'s fields are public, so this
         // builds that `Fit` directly and gives both terms a caller that notices

@@ -92,8 +92,8 @@ python3 -c "import sys; sys.path.insert(0,'.'); \
 
 Preprocessing must match the plugin exactly, and **it is per family, resize
 policy included**. The plugin composes it from the resolved profile —
-`InputSpec { size, encoding, resize }` in `plugins/cairn-detect/src/infer.rs`,
-applied by `ResizePolicy::fit` and `pack_chw` in `src/decode.rs`, with the
+`InputSpec { size, encoding, resize, .. }` in `plugins/cairn-detect/src/infer/profile.rs`,
+applied by `ResizePolicy::fit` and `pack` in `src/decode.rs`, with the
 per-family channel order and scale in `TensorEncoding::packing`. The scripts
 mirror that table in `quantize_model.PROFILES`:
 

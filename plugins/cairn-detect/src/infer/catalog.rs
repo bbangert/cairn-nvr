@@ -10,7 +10,7 @@
 
 use anyhow::{anyhow, Result};
 
-use super::encoding::TensorEncoding;
+use super::encoding::{TensorEncoding, TensorLayout};
 use super::geometry::{InputSize, ResizePolicy};
 use super::profile::{InputSpec, Layout, ModelProfile, OutputSpec, ScoreComposition, DEFAULT_NMS};
 
@@ -23,6 +23,7 @@ pub const YOLOX: ModelProfile = ModelProfile {
         encoding: TensorEncoding::RawBgr,
         resize: ResizePolicy::Letterbox { pad: 114 },
         input_quant: None,
+        layout: TensorLayout::Nchw,
     },
     output: OutputSpec {
         layout: Layout::GridObjectness {
@@ -52,6 +53,7 @@ pub const YOLOV10: ModelProfile = ModelProfile {
         encoding: TensorEncoding::UnitRgb,
         resize: ResizePolicy::Stretch,
         input_quant: None,
+        layout: TensorLayout::Nchw,
     },
     output: OutputSpec {
         layout: Layout::EndToEnd,
@@ -80,6 +82,7 @@ pub const YOLOV8: ModelProfile = ModelProfile {
         encoding: TensorEncoding::UnitRgb,
         resize: ResizePolicy::Stretch,
         input_quant: None,
+        layout: TensorLayout::Nchw,
     },
     output: OutputSpec {
         layout: Layout::RawClasses { nc: 80 },
@@ -104,6 +107,7 @@ pub const RFDETR: ModelProfile = ModelProfile {
         encoding: TensorEncoding::ImageNetRgb,
         resize: ResizePolicy::Stretch,
         input_quant: None,
+        layout: TensorLayout::Nchw,
     },
     output: OutputSpec {
         // 91 is COCO's *id* space, not its class count: RF-DETR indexes

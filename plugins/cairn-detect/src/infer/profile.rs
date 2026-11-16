@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use super::encoding::{QuantParams, TensorEncoding};
+use super::encoding::{QuantParams, TensorEncoding, TensorLayout};
 use super::geometry::{InputSize, ResizePolicy};
 
 /// Everything a decoder needs to build a tensor this model will accept.
@@ -28,6 +28,11 @@ pub struct InputSpec {
     /// the codes quantize) and the letterbox pad goes through the same
     /// encode-then-quantize path as every pixel.
     pub input_quant: Option<QuantParams>,
+    /// The packed tensor's value order, from the backend's
+    /// [`ModelIo`](super::ModelIo) — like `input_quant`, a fact about the
+    /// opened artifact, so every catalog entry says NCHW and the detector
+    /// overwrites it at open.
+    pub layout: TensorLayout,
 }
 
 /// Where the resolved [`InputSize`] came from, for the startup line.

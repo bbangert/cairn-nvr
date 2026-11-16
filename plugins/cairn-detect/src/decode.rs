@@ -38,7 +38,7 @@ use rsmpeg::swscale::SwsContext;
 use rsmpeg::UnsafeDerefMut;
 
 use crate::hwdecode::{HwBackend, HwDecoder};
-use crate::infer::{Fit, InputSize, InputSpec, Projection, TensorValues};
+use crate::infer::{Fit, InputSize, InputSpec, Projection, TensorLayout, TensorValues};
 use crate::motion::{GrayThumb, MotionConfig, MotionDetector, MotionVerdict};
 use crate::note;
 
@@ -134,9 +134,10 @@ pub struct RgbSampled {
 /// letterboxed run silently reports every box against the wrong geometry.
 #[derive(Debug)]
 pub struct ModelInput {
-    /// CHW, `3 * w * h` values for the resolved model input, in whichever
-    /// `TensorEncoding` the detector asked for — f32 for the float graph-IO
-    /// contract, u8 codes when the spec carries `input_quant`.
+    /// `3 * w * h` values for the resolved model input, in whichever
+    /// `TensorEncoding` and `TensorLayout` the detector asked for — f32 for
+    /// the float graph-IO contract, u8 codes when the spec carries
+    /// `input_quant`.
     pub tensor: TensorValues,
     /// Model-space boxes back to this frame's own normalized coordinates.
     pub projection: Projection,
@@ -1166,7 +1167,7 @@ impl RgbScaler {
             let motion = observe(&mut self.motion, &rgb, stride, fit.inner, pts_ns);
             return Ok(Sampled {
                 input: ModelInput {
-                    tensor: pack_chw(&rgb, stride, fit, spec),
+                    tensor: pack(&rgb, stride, fit, spec),
                     projection: fit.projection(source),
                 },
                 motion,
@@ -1179,7 +1180,7 @@ impl RgbScaler {
         let motion = observe(&mut self.motion, plane, stride, fit.inner, pts_ns);
         Ok(Sampled {
             input: ModelInput {
-                tensor: pack_chw(plane, stride, fit, spec),
+                tensor: pack(plane, stride, fit, spec),
                 projection: fit.projection(source),
             },
             motion,
@@ -1357,15 +1358,15 @@ pub fn cap_frame_size(ctx: &mut AVCodecContext) {
     unsafe { ctx.deref_mut() }.max_pixels = MAX_PIXELS;
 }
 
-/// Packed RGB24 rows (`stride` may exceed the row width) -> CHW values,
-/// placed into the model's input rectangle according to `fit`: f32 for the
-/// float graph-IO contract, u8 codes when `spec.input_quant` says the
-/// artifact takes its input quantized.
+/// Packed RGB24 rows (`stride` may exceed the row width) -> the model's input
+/// values, in `spec.layout`'s order, placed into the model's input rectangle
+/// according to `fit`: f32 for the float graph-IO contract, u8 codes when
+/// `spec.input_quant` says the artifact takes its input quantized.
 ///
 /// The scale target is always RGB24 because that is one pixel format for
 /// swscale to reach from anything; the encoding decides only what happens on
-/// the way into the planes — the affine, and for BGR which source byte each
-/// plane draws from.
+/// the way into the channels — the affine, and for BGR which source byte each
+/// channel draws from.
 ///
 /// The padding goes through the same encoding as the pixels: the model was
 /// trained on a padded picture, not on an out-of-range constant. On the u8
@@ -1373,54 +1374,88 @@ pub fn cap_frame_size(ctx: &mut AVCodecContext) {
 /// writing the raw pad byte would poison every border. Under a stretch
 /// `fit.inner` *is* the input, so there is no padding and the fill is
 /// skipped rather than written and immediately overwritten.
-fn pack_chw(plane: &[u8], stride: usize, fit: Fit, spec: InputSpec) -> TensorValues {
-    let size = spec.size;
+fn pack(plane: &[u8], stride: usize, fit: Fit, spec: InputSpec) -> TensorValues {
     let packing = spec.encoding.packing();
-    let plane_len = size.w * size.h;
-    let (ox, oy) = fit.offset;
     match spec.input_quant {
-        None => {
-            let mut tensor = vec![0f32; size.tensor_len()];
-            if fit.inner != size {
-                for (p, chunk) in tensor.chunks_exact_mut(plane_len).enumerate() {
-                    chunk.fill(packing.value(p, fit.pad));
-                }
-            }
-            for y in 0..fit.inner.h {
-                let row = &plane[y * stride..y * stride + fit.inner.w * 3];
-                for x in 0..fit.inner.w {
-                    let px = &row[x * 3..x * 3 + 3];
-                    let at = (oy + y) * size.w + ox + x;
-                    for (p, source) in packing.source.iter().enumerate() {
-                        tensor[p * plane_len + at] = packing.value(p, px[*source]);
-                    }
-                }
-            }
-            TensorValues::F32(tensor)
-        }
-        // Same shape of loop over a per-plane byte->code table
-        // (`quantized_lut`): the quantizer has 256 inputs per plane, so the
+        None => TensorValues::F32(pack_as(plane, stride, fit, spec, |p, byte| {
+            packing.value(p, byte)
+        })),
+        // The same loop over a per-channel byte->code table
+        // (`quantized_lut`): the quantizer has 256 inputs per channel, so the
         // pixel loop is a lookup — and for RawBgr with identity qparams
         // (the 0..255 case) the table degenerates to a pure byte shuffle.
         Some(quant) => {
             let luts: [[u8; 256]; 3] = std::array::from_fn(|p| packing.quantized_lut(p, quant));
-            let mut tensor = vec![0u8; size.tensor_len()];
-            if fit.inner != size {
+            TensorValues::U8(pack_as(plane, stride, fit, spec, |p, byte| {
+                luts[p][byte as usize]
+            }))
+        }
+    }
+}
+
+/// [`pack`] for one dtype: `encode` turns channel `p`'s source byte into its
+/// value. The layout is matched here, once, and each arm hands [`place`] its
+/// own index closure, so the pixel loop is monomorphised per layout rather
+/// than branching per value.
+fn pack_as<T: Copy + Default>(
+    plane: &[u8],
+    stride: usize,
+    fit: Fit,
+    spec: InputSpec,
+    encode: impl Fn(usize, u8) -> T,
+) -> Vec<T> {
+    let size = spec.size;
+    let plane_len = size.w * size.h;
+    let mut tensor = vec![T::default(); size.tensor_len()];
+    let pad: Option<[T; 3]> =
+        (fit.inner != size).then(|| std::array::from_fn(|p| encode(p, fit.pad)));
+    match spec.layout {
+        TensorLayout::Nchw => {
+            if let Some(pad) = pad {
                 for (p, chunk) in tensor.chunks_exact_mut(plane_len).enumerate() {
-                    chunk.fill(luts[p][fit.pad as usize]);
+                    chunk.fill(pad[p]);
                 }
             }
-            for y in 0..fit.inner.h {
-                let row = &plane[y * stride..y * stride + fit.inner.w * 3];
-                for x in 0..fit.inner.w {
-                    let px = &row[x * 3..x * 3 + 3];
-                    let at = (oy + y) * size.w + ox + x;
-                    for (p, source) in packing.source.iter().enumerate() {
-                        tensor[p * plane_len + at] = luts[p][px[*source] as usize];
-                    }
+            place(&mut tensor, plane, stride, fit, spec, &encode, |p, at| {
+                p * plane_len + at
+            });
+        }
+        TensorLayout::Nhwc => {
+            if let Some(pad) = pad {
+                for px in tensor.as_chunks_mut::<3>().0 {
+                    *px = pad;
                 }
             }
-            TensorValues::U8(tensor)
+            place(&mut tensor, plane, stride, fit, spec, &encode, |p, at| {
+                at * 3 + p
+            });
+        }
+    }
+    tensor
+}
+
+/// The content rectangle's pixels, at `fit.offset` inside the input:
+/// channel `p` of input pixel `at` lands at `index(p, at)`.
+fn place<T>(
+    tensor: &mut [T],
+    plane: &[u8],
+    stride: usize,
+    fit: Fit,
+    spec: InputSpec,
+    encode: &impl Fn(usize, u8) -> T,
+    index: impl Fn(usize, usize) -> usize,
+) {
+    let size = spec.size;
+    let packing = spec.encoding.packing();
+    let (ox, oy) = fit.offset;
+    for y in 0..fit.inner.h {
+        let row = &plane[y * stride..y * stride + fit.inner.w * 3];
+        for x in 0..fit.inner.w {
+            let px = &row[x * 3..x * 3 + 3];
+            let at = (oy + y) * size.w + ox + x;
+            for (p, source) in packing.source.iter().enumerate() {
+                tensor[index(p, at)] = encode(p, px[*source]);
+            }
         }
     }
 }
@@ -1430,7 +1465,7 @@ fn pack_chw(plane: &[u8], stride: usize, fit: Fit, spec: InputSpec) -> TensorVal
 /// The seam the NIF decoder/inference split crosses: the decode side produces
 /// the content-rect RGB24 plane ([`RgbScaler`]'s scale target, tightly packed
 /// rows) plus the source geometry, and the inference side calls this to pack
-/// the very tensor [`RgbScaler::tensor_from`] would have — same `pack_chw`,
+/// the very tensor [`RgbScaler::tensor_from`] would have — same `pack`,
 /// same projection, so the two paths cannot drift.
 ///
 /// `content` is the producer's claim about the plane's geometry, and it is
@@ -1469,7 +1504,7 @@ pub fn model_input_from_rgb(
         );
     }
     Ok(ModelInput {
-        tensor: pack_chw(plane, content.w * 3, fit, spec),
+        tensor: pack(plane, content.w * 3, fit, spec),
         projection: fit.projection(source),
     })
 }
@@ -1652,6 +1687,7 @@ mod tests {
             encoding,
             resize,
             input_quant: None,
+            layout: TensorLayout::Nchw,
         }
     }
 
@@ -1677,7 +1713,7 @@ mod tests {
         encoding: TensorEncoding,
     ) -> Vec<f32> {
         let spec = spec(size, encoding, ResizePolicy::Stretch);
-        f32s(pack_chw(
+        f32s(pack(
             plane,
             stride,
             ResizePolicy::Stretch.fit(size, size),
@@ -2247,7 +2283,7 @@ mod tests {
 
         let stride = fit.inner.w * 3 + 8;
         let plane = vec![255u8; stride * fit.inner.h];
-        let tensor = f32s(pack_chw(
+        let tensor = f32s(pack(
             &plane,
             stride,
             fit,
@@ -2287,7 +2323,7 @@ mod tests {
         assert_eq!(fit.inner, InputSize { w: 64, h: 32 });
         let stride = fit.inner.w * 3;
         let plane = vec![0u8; stride * fit.inner.h];
-        let tensor = f32s(pack_chw(
+        let tensor = f32s(pack(
             &plane,
             stride,
             fit,
@@ -2318,7 +2354,7 @@ mod tests {
             .collect();
         let mut spec = spec(input, TensorEncoding::RawBgr, resize);
         spec.input_quant = Some(QuantParams::new(1.0, 0).unwrap());
-        let tensor = match pack_chw(&plane, stride, fit, spec) {
+        let tensor = match pack(&plane, stride, fit, spec) {
             TensorValues::U8(codes) => codes,
             TensorValues::F32(_) => panic!("input_quant must pack codes"),
         };
@@ -2344,7 +2380,7 @@ mod tests {
         let plane = vec![0u8; stride * fit.inner.h];
         let mut spec = spec(input, TensorEncoding::RawBgr, resize);
         spec.input_quant = Some(QuantParams::new(0.5, 3).unwrap());
-        let tensor = match pack_chw(&plane, stride, fit, spec) {
+        let tensor = match pack(&plane, stride, fit, spec) {
             TensorValues::U8(codes) => codes,
             TensorValues::F32(_) => panic!("input_quant must pack codes"),
         };
@@ -2353,6 +2389,84 @@ mod tests {
         assert_eq!(tensor[fit.inner.h * input.w], 231);
         // Content zeros quantize to the zero-point, not to 0.
         assert_eq!(tensor[0], 3);
+    }
+
+    /// NHWC is NCHW transposed, value for value, over the whole input —
+    /// content and letterbox pad alike, both dtypes. Which source byte feeds
+    /// which channel is shared by the two layouts and pinned by the NCHW
+    /// tests; this pins where each channel lands. ImageNet's per-channel
+    /// affine gives the pad three different values, so a pad written in the
+    /// wrong channel order cannot pass.
+    #[test]
+    fn an_nhwc_pack_is_the_nchw_pack_transposed() {
+        use crate::infer::QuantParams;
+        let input = InputSize { w: 48, h: 40 };
+        let resize = ResizePolicy::Letterbox { pad: 114 };
+        let fit = resize.fit(input, InputSize { w: 160, h: 90 });
+        assert_ne!(fit.inner, input, "the case needs padding");
+        // A stride wider than the row, as a scaler's frame may have.
+        let stride = fit.inner.w * 3 + 5;
+        let plane: Vec<u8> = (0..stride * fit.inner.h)
+            .map(|i| (i * 37 % 251) as u8)
+            .collect();
+        fn assert_transposed<T: PartialEq + std::fmt::Debug>(
+            nchw: &[T],
+            nhwc: &[T],
+            size: InputSize,
+        ) {
+            let plane_len = size.w * size.h;
+            for p in 0..3 {
+                for at in 0..plane_len {
+                    assert_eq!(
+                        nhwc[at * 3 + p],
+                        nchw[p * plane_len + at],
+                        "channel {p} pixel {at}"
+                    );
+                }
+            }
+        }
+        for (encoding, quant) in [
+            (TensorEncoding::RawBgr, QuantParams::new(1.0, 0).unwrap()),
+            (
+                TensorEncoding::ImageNetRgb,
+                QuantParams::new(0.02, 114).unwrap(),
+            ),
+        ] {
+            let packed = |layout, input_quant| {
+                let mut spec = spec(input, encoding, resize);
+                spec.layout = layout;
+                spec.input_quant = input_quant;
+                pack(&plane, stride, fit, spec)
+            };
+            match (
+                packed(TensorLayout::Nchw, None),
+                packed(TensorLayout::Nhwc, None),
+            ) {
+                (TensorValues::F32(nchw), TensorValues::F32(nhwc)) => {
+                    if encoding == TensorEncoding::ImageNetRgb {
+                        // The bottom-right pixel is padding: the pad sits at
+                        // the bottom.
+                        let plane_len = input.w * input.h;
+                        let pad: Vec<f32> = (0..3).map(|c| nchw[(c + 1) * plane_len - 1]).collect();
+                        assert!(
+                            pad[0] != pad[1] && pad[1] != pad[2] && pad[0] != pad[2],
+                            "the channels' pad values must differ: {pad:?}"
+                        );
+                    }
+                    assert_transposed(&nchw, &nhwc, input)
+                }
+                _ => panic!("no input_quant must pack f32"),
+            }
+            match (
+                packed(TensorLayout::Nchw, Some(quant)),
+                packed(TensorLayout::Nhwc, Some(quant)),
+            ) {
+                (TensorValues::U8(nchw), TensorValues::U8(nhwc)) => {
+                    assert_transposed(&nchw, &nhwc, input)
+                }
+                _ => panic!("input_quant must pack codes"),
+            }
+        }
     }
 
     #[test]

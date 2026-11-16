@@ -1,24 +1,25 @@
 //! The seam between "run this model on this frame" and the SDK that does it.
 //!
-//! Two backends execute, and both are onnxruntime sessions:
+//! This crate carries two backends, and both are onnxruntime sessions:
 //! [`onnxruntime::OrtBackend`] on the CPU execution provider and
 //! [`onnxruntime::QnnBackend`] on Qualcomm's HTP via the QNN plugin execution
-//! provider. The remaining name in [`BackendKind`], `rknn`, parses on the
-//! command line and fails at [`Detector::open`](super::Detector::open) — it
-//! exists so a hardware profile can *name* the runtime it targets before that
-//! runtime lands, and so [`BackendKind::capabilities`] has somewhere to say
-//! what each one will and will not accept.
+//! provider. The third name in [`BackendKind`], `rknn`, is a runtime a board
+//! library provides: it implements [`Backend`] in its own crate and hands the
+//! open backend to [`Detector::with_backend`](super::Detector::with_backend).
+//! A build without that library refuses the name at
+//! [`Detector::open`](super::Detector::open).
 //!
 //! No SDK type appears in a signature here. A backend reports its model as
-//! [`ModelIo`] — a name, a size, a batch, the sniffed uint8 edges and a
-//! [`Declared`] per output — and answers a
+//! [`ModelIo`] — a name, a size, a batch, the sniffed uint8 edges, the input
+//! layout and a [`Declared`] per output — and answers a
 //! run with [`Raw`] tensors, dims plus floats. Both of those types predate this
 //! module and neither mentions `ort`, which is what let the seam go in without
 //! touching sniffing, sizing or decode. The one place ort types still reach
 //! outside [`onnxruntime`] is `resolve`'s trio of `ort::value::ValueType`
 //! readers, `declared_input_size`/`declared_input_batch`/`static_output_dims`: the ort backend
-//! calls them to fill its [`ModelIo`], and a second backend would fill the same
-//! struct from its own metadata without going near them.
+//! calls them to fill its [`ModelIo`], and a board library's backend fills the
+//! same struct from its own runtime's metadata — those readers are private to
+//! `infer`.
 //!
 //! Opening is [`Backend::open`] rather than a free function so each backend
 //! owns its own failure modes, and the run half is two calls rather than one
@@ -34,7 +35,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use clap::ValueEnum;
 
-use super::encoding::TensorValues;
+use super::encoding::{TensorLayout, TensorValues};
 use super::geometry::InputSize;
 use super::heads::Raw;
 use super::qparams::IoQuant;
@@ -42,9 +43,11 @@ use super::resolve::Declared;
 
 /// Which runtime executes the model.
 ///
-/// `rknn` is accepted by `--backend` and rejected at
-/// [`Detector::open`](super::Detector::open). Parsing it is the point: the
-/// host already refuses to run a group on a non-`ort` profile unless the
+/// `rknn` is accepted by `--backend` everywhere and executes only where a
+/// board library hands its backend to
+/// [`Detector::with_backend`](super::Detector::with_backend); this crate's own
+/// [`Detector::open`](super::Detector::open) rejects it. Parsing it is the
+/// point: the host already refuses to run a group on a non-`ort` profile unless the
 /// profile declares `experimental: true` *and* the group sets
 /// `allow_experimental: true` (`Cairn.Config.check_backend_implemented/3`), and
 /// this is the belt to that suspender — a name that reached the plugin anyway
@@ -55,7 +58,7 @@ use super::resolve::Declared;
 pub enum BackendKind {
     /// onnxruntime, CPU execution provider.
     Ort,
-    /// Rockchip NPU (rk3566/rk3576) via librknnrt. Not implemented.
+    /// Rockchip NPU (rk3566/rk3576) via librknnrt, from a board library.
     Rknn,
     /// Qualcomm HTP via onnxruntime's QNN plugin execution provider. Needs
     /// `--qnn-library` and a full-op-coverage QDQ model.
@@ -191,14 +194,12 @@ impl fmt::Display for ArtifactFormat {
 /// There is no `ort` group: the only session setting the ort backend makes
 /// is the CPU execution provider, which is not a profile knob and has
 /// nothing to configure. The `qnn` group is read by
-/// [`onnxruntime::QnnBackend`]; `rknn` is the knobs a profile will carry when
-/// that backend lands.
+/// [`onnxruntime::QnnBackend`]; `rknn` is read by a board library's backend,
+/// and nothing in this crate fills it — the CLI has no flag for it, so it
+/// arrives at its default.
 #[derive(Debug, Default, Clone)]
-pub(super) struct SessionOptions {
+pub struct SessionOptions {
     pub qnn: QnnOptions,
-    /// `#[allow(dead_code)]`: read by nothing until the rknn backend lands —
-    /// see [`RknnOptions`] for why the group exists anyway.
-    #[allow(dead_code)]
     pub rknn: RknnOptions,
     /// The uint8-IO artifact's edge qparams (`<model>.qparams.json`), `None`
     /// for the ordinary float-IO contract. At the session level this carries
@@ -238,15 +239,8 @@ pub struct QnnOptions {
 }
 
 /// Rockchip NPU knobs, per librknnrt.
-///
-/// `#[allow(dead_code)]`: written by `Default`, read by nothing, because the
-/// code that would read it is the backend that does not exist yet. `-D
-/// warnings` would otherwise make the option surface of an unimplemented
-/// backend inexpressible, which is the opposite of designing it in. The rknn
-/// backend's `open` reading this group removes the attribute.
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
-pub(super) struct RknnOptions {
+pub struct RknnOptions {
     /// Which NPU core(s) the model is bound to, as librknnrt's core mask. The
     /// runtime is sequential per model (`docs/npu-backends.md`), so this
     /// spreads *models* across cores and never one model's frames.
@@ -254,48 +248,107 @@ pub(super) struct RknnOptions {
 }
 
 /// What a backend reports about the model it opened, in terms no SDK defines.
-pub(super) struct ModelIo {
-    /// The model's own name for its first input, settled at startup so a run
-    /// never looks one up by index.
+///
+/// Whatever reads a field reads it at open, before any frame, which is what
+/// lets a wrong artifact fail while the operator is watching. Each field's doc
+/// says what reporting it commits to.
+pub struct ModelIo {
+    /// The model's own name for its first input. Printed on the startup line
+    /// and matched against the qparams sidecar's input entry; binding the
+    /// input on a run is the backend's own business.
     pub input_name: String,
     /// The input's spatial size when the artifact pins it, `None` when the
-    /// export left it symbolic and `--input-size` has to supply it.
+    /// export left it symbolic and `--input-size` has to supply it. `Some` is
+    /// binding: it outranks the profile's default and a disagreeing
+    /// `--input-size` is refused at open, so a fixed-geometry runtime reports
+    /// it.
     pub declared_input_size: Option<InputSize>,
     /// The input's declared batch when it is a fixed positive rank-4 dim,
     /// `None` for symbolic/dynamic. The embedder's open refuses a fixed
     /// batch other than 1; the detector's own N=1 discipline predates the
     /// field and never reads it.
     pub declared_input_batch: Option<i64>,
-    /// Every output the model declares, in the model's own order.
+    /// Every output the model declares, in the model's own order — which a
+    /// single-output layout depends on: it reads the first. A two-output
+    /// layout binds its roles by shape where the dims pin them, by name where
+    /// they do not. Without `--model-profile` the profile is sniffed from
+    /// these dims, and the bound names are what [`Tensors::get`] is asked
+    /// for. [`Declared::dims`] `None` defers the class count to the first
+    /// run's [`Raw::dims`] and gives the sniff nothing to match.
     pub outputs: Vec<Declared>,
     /// Whether the model declares its input tensor as uint8 — a uint8-IO
     /// artifact. Sniffed at open so a u8 artifact without its qparams
     /// sidecar (or a sidecar next to a float artifact) fails while the
-    /// operator is watching, not at the first pass.
+    /// operator is watching, not at the first pass. `true` obliges the
+    /// caller to pass a sidecar whose input entry names [`Self::input_name`];
+    /// its qparams are what make the packer emit u8 codes.
     pub input_is_u8: bool,
     /// The declared outputs whose element type is uint8, by name. Must match
-    /// the sidecar's `outputs` keys exactly — see [`ModelIo::input_is_u8`].
+    /// the sidecar's `outputs` keys exactly, and listing one commits the
+    /// backend to dequantizing it: [`Raw::values`] is f32 whatever the model
+    /// emitted.
     pub u8_outputs: Vec<String>,
+    /// The order the backend wants the input's values in. The detector copies
+    /// it into its resolved [`InputSpec`](super::InputSpec), which is what the
+    /// packer reads, so the backend decides it and no profile does. The
+    /// onnxruntime backends always report NCHW, which is also the only shape
+    /// `declared_input_size` reads a size from; an NHWC ONNX export gets no
+    /// declared size there and is not detected as NHWC anywhere — onnxruntime
+    /// refuses the NCHW tensor at its first run.
+    pub input_layout: TensorLayout,
 }
 
 /// One tensor, packed for the model this backend opened — a frame for the
 /// detector, a person crop for the embedder.
 ///
-/// `shape` is NCHW with N=1: this plugin infers one tensor per run, and
-/// nothing in the crate batches. `values` carries the packer's dtype choice
+/// N=1: this plugin infers one tensor per run, and nothing in the crate
+/// batches. `shape` is `[1, 3, h, w]` or `[1, h, w, 3]` as `layout` says:
+/// outside this crate the only constructor is [`InputTensor::new`], which
+/// derives one from the other. `values` carries the packer's dtype choice
 /// (f32, or u8 codes for a uint8-IO artifact) to the session bind.
-pub(super) struct InputTensor {
+#[non_exhaustive]
+pub struct InputTensor {
     pub shape: [i64; 4],
+    pub layout: TensorLayout,
     pub values: TensorValues,
+}
+
+impl InputTensor {
+    pub fn new(size: InputSize, layout: TensorLayout, values: TensorValues) -> Self {
+        let (w, h) = (size.w as i64, size.h as i64);
+        let shape = match layout {
+            TensorLayout::Nchw => [1, 3, h, w],
+            TensorLayout::Nhwc => [1, h, w, 3],
+        };
+        Self {
+            shape,
+            layout,
+            values,
+        }
+    }
 }
 
 /// An inference runtime holding one open model.
 ///
-/// `Send` because single-camera mode moves the whole
-/// [`Detector`](super::Detector) onto a spawned inference thread (`run_single`
-/// in main.rs); multiplexed mode keeps it on the thread that opened it. Either
-/// way one detector is owned by one thread — nothing shares one.
-pub(super) trait Backend: Send {
+/// Implementable outside this crate: a board library provides its runtime
+/// this way. What [`Backend::io`] reports is checked and acted on at open (see
+/// [`ModelIo`]); what follows is what the rest of the contract holds.
+///
+/// **Output ownership.** [`Backend::run`] returns tensors that borrow the
+/// backend, and [`Tensors::get`] lends a [`Raw`] whose `values` is `&[f32]`
+/// and whose `dims` are this run's — a deferred class count is settled from
+/// them and every decode re-checks its layout against them. A runtime whose
+/// outputs are not f32 it can lend in place (quantized codes, f16) converts
+/// them into f32 buffers the returned [`Tensors`] owns, and lends those: the
+/// uint8-IO path in [`onnxruntime`] dequantizes its outputs inside `run`
+/// exactly that way.
+///
+/// **`Send`, not `Sync`.** A detector moves between threads: `run_single` in
+/// `cli.rs` hands it to a spawned inference thread, and `cairn-ort` keeps one
+/// behind a mutex that NIF calls take from whichever scheduler thread runs
+/// them. Nothing calls one backend from two threads at once, so it never has
+/// to be `Sync`.
+pub trait Backend: Send {
     /// Load `model` and settle everything [`ModelIo`] reports.
     ///
     /// Failing here rather than on the first frame is deliberate: a wrong
@@ -321,7 +374,7 @@ pub(super) trait Backend: Send {
 }
 
 /// One run's output tensors, still owned by the backend that produced them.
-pub(super) trait Tensors {
+pub trait Tensors {
     /// The tensor the model calls `name`, or an error naming what was asked
     /// for. Roles are looked up by name, never by position, so a family with
     /// two outputs never depends on the order the export listed them in.

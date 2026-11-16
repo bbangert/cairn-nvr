@@ -1,11 +1,12 @@
 //! The detection stages, as a library: everything between a compressed access
 //! unit and a detection.
 //!
-//! Two hosts consume it and neither owns it — the `cairn-detect` binary (RTP in,
-//! ndjson out) and `cairn-native`, the Rustler NIF the Membrane pipeline loads
-//! in-VM — so the stages have one implementation and the two cannot drift into
-//! disagreeing about what a frame means. Neither host's transport or lifecycle is
-//! here.
+//! Its hosts consume it and none owns it — the `cairn-detect` binary and any
+//! board crate's probe binary (RTP in, ndjson out), and `cairn-native` and
+//! `cairn-ort`, the Rustler NIFs the Membrane pipeline loads in-VM — so the
+//! stages have one implementation and the hosts cannot drift into disagreeing
+//! about what a frame means. No NIF's transport or lifecycle is here; the
+//! binaries' is [`cli`], so that a board binary is the same program.
 
 // `process::exit` runs atexit handlers and C++ static destructors, and off the main
 // thread that is a live hazard here: the control thread can fire while the main
@@ -24,6 +25,7 @@
 // stopped resolving, is a different lint and stays on.
 #![allow(rustdoc::private_intra_doc_links)]
 
+pub mod cli;
 pub mod control;
 pub mod decode;
 pub mod emit;

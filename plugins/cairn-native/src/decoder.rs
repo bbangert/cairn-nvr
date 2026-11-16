@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn a_probe_refusal_is_a_hard_error_not_a_tolerated_skip() {
-        use cairn_detect::infer::{InputSize, ResizePolicy, TensorEncoding};
+        use cairn_detect::infer::{InputSize, ResizePolicy, TensorEncoding, TensorLayout};
 
         let mut stream = DecodeStream {
             camera_id: "cam".into(),
@@ -725,6 +725,7 @@ mod tests {
                 encoding: TensorEncoding::UnitRgb,
                 resize: ResizePolicy::Stretch,
                 input_quant: None,
+                layout: TensorLayout::Nchw,
             },
             decode_errors: 0,
             convert_errors: 0,
