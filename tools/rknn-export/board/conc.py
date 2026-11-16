@@ -16,5 +16,5 @@ outs = [p.communicate()[0] for p in procs]
 s.stop = True; s.join()
 res = [json.loads(l[5:]) for o in outs for l in o.splitlines() if l.startswith("JSON:")]
 errs = [o[-400:] for o in outs if "JSON:" not in o]
-print("JSON:" + json.dumps({"workers": res, "agg_ips": round(sum(r["ips"] for r in res), 2), "temp_before": max(t0),
+print("JSON:" + json.dumps({"workers": res, "agg_ips": round(sum(r["ips"] for r in res if "ips" in r), 2), "temp_before": max(t0),
                             "temp_after": max(rk.temps()), "mem_before": m0, **s.summary(), "raw_errors": errs}))

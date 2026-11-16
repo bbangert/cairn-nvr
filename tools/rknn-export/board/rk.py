@@ -219,7 +219,7 @@ class Sampler(threading.Thread):
 def bench(path, warm=200, sustain=60, want_float=0, frame=None):
     t0, m0 = temps(), meminfo()
     m = Model(path)
-    x = nhwc(frame, m) if frame else np.zeros((1, m.h, m.w, 3), np.uint8)
+    x = nhwc(frame, m) if frame and frame != "zero" else np.zeros((1, m.h, m.w, 3), np.uint8)
     for _ in range(5):
         m.set_input(x); m.run(); m.get(want_float); m.release()
     ts, tr, tg = [], [], []

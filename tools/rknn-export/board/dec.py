@@ -26,10 +26,11 @@ el = time.time() - t0
 stop[0] = True; th.join()
 after = mi()
 heaps = sorted({m for o in outs for m in re.findall(r"open dma_heap (\S+)", o)})
-fps = [re.findall(r"frame (\d+) .*?fps ([\d.]+)|decode (\d+) frames.*?fps ([\d.]+)", o) for o in outs]
+decoded = [int(m[-1]) if (m := re.findall(r"decode (\d+) frames", o)) else None for o in outs]
 tail = [[l for l in o.splitlines() if "fps" in l or "error" in l.lower() or "failed" in l.lower()][-3:] for o in outs]
 print("JSON:" + json.dumps({"clip": os.path.basename(clip), "k": k, "frames_each": frames, "bufmode": bufmode or "hi",
-    "wall_s": round(el, 2), "agg_fps_wall": round(k * frames / el, 1), "rc": [p.returncode for p in ps],
+    "wall_s": round(el, 2), "agg_fps_wall": round(sum(decoded) / el, 1) if None not in decoded else None,
+    "rc": [p.returncode for p in ps], "decoded": decoded,
     "cma_free_base_mb": base["CmaFree"], "cma_free_min_mb": min(s["CmaFree"] for s in samples),
     "cma_free_after_mb": after["CmaFree"], "mem_avail_base_mb": base["MemAvailable"],
     "mem_avail_min_mb": min(s["MemAvailable"] for s in samples), "heaps_opened": heaps, "tail": tail}))

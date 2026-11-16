@@ -48,17 +48,17 @@ def main():
         except OSError as e:
             res[h] = {"open": str(e)}; continue
         magic = "R" if "rk_dma_heap" in h else "H"
-        held = []
+        held, got = [], 0
         c0 = cma()
         for name, size in [("rgb640", SIZES["rgb640"])] + [(f"nv12_1088#{i}", SIZES["nv12_1088"]) for i in range(n_nv12)]:
             try:
                 d = alloc(hfd, size, magic)
-                held.append(d)
+                held.append(d); got += size
                 r[name] = {"ok": True, **({"phys": phys(d, size)} if name in ("rgb640", "nv12_1088#0") else {})}
             except OSError as e:
                 r[name] = {"ok": False, "err": str(e)}
         r["cma_free_drop_kb"] = c0 - cma()
-        r["alloc_kb"] = (SIZES["rgb640"] + n_nv12 * SIZES["nv12_1088"]) // 1024
+        r["alloc_kb"] = got // 1024
         for d in held:
             os.close(d)
         os.close(hfd)
