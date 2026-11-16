@@ -266,14 +266,21 @@ defmodule Cairn.Config do
   Builds and validates a config from a YAML-shaped map — the one validator,
   whatever produced the map (the file, or rows rendered into its `"cameras"`
   key). Not pure: it reads `CAIRN_DATA_DIR`, the profile files under
-  `profile_dirs` and their model artifacts.
+  `profile_dirs` and the board's, their model artifacts and the board's
+  preflight.
 
   `fleet_count:` replaces the N that ladder resolution sizes for. Only a
   source re-rendering a reduced fleet passes it, to hold the rung and derived
   rate the full fleet resolved to (D-P1).
+
+  `board:` replaces the release's board (`Cairn.Board.module/0`) for its
+  profile directory and its preflight, so the suite can reach states the
+  generic board never produces; the menus `Cairn.Config.Profile` checks still
+  come from the release's board.
   """
   @spec from_map(map(), keyword()) :: {:ok, t(), [String.t()]} | {:error, [String.t()]}
   def from_map(map, opts \\ []) do
+    board = Keyword.get(opts, :board, Cairn.Board.module())
     acc = %{errors: [], warnings: []}
     acc = warn_unknown(acc, map, @known_keys, "config")
     acc = warn_unknown(acc, Map.get(map, "events"), @known_events_keys, "events")
@@ -285,7 +292,7 @@ defmodule Cairn.Config do
     acc = warn_unknown(acc, Map.get(map, "tracking"), @known_tracking_keys, "tracking")
 
     {cameras, acc} = parse_cameras(Map.get(map, "cameras", []), acc)
-    {profiles, acc} = load_profiles(Map.get(map, "profile_dirs"), acc)
+    {profiles, acc} = load_profiles(Map.get(map, "profile_dirs"), board, acc)
     {plugin_groups, acc} = parse_plugins(Map.get(map, "plugins"), acc)
 
     config = %__MODULE__{
@@ -319,7 +326,7 @@ defmodule Cairn.Config do
 
     {config, acc} = resolve_plugins(config, acc, declared_plugin_names(map))
     {config, acc} = resolve_ladders(config, acc, opts)
-    {config, acc} = resolve_profiles(config, acc)
+    {config, acc} = resolve_profiles(config, board, acc)
     acc = check_group_profiles(config, acc)
     acc = validate(config, acc)
 
@@ -823,18 +830,19 @@ defmodule Cairn.Config do
 
   # -- profiles ---------------------------------------------------------------
 
-  # Shipped profiles first, operator dirs after — `Profile.load_dirs/2` gives
-  # later files the name on a collision (with a warning), so an operator file
-  # shadows a shipped one. The shipped dir not existing is the normal state
-  # until built-in profiles land; nothing warns about it.
-  defp load_profiles(dirs, acc) do
+  # Shipped profiles first, the board's next, operator dirs last —
+  # `Profile.load_dirs/2` gives later files the name on a collision (with a
+  # warning), so an operator file shadows both.
+  defp load_profiles(dirs, board, acc) do
+    base = [shipped_profiles_dir() | List.wrap(board.profiles_dir())]
+
     case dirs do
       nil ->
-        Profile.load_dirs([shipped_profiles_dir()], acc)
+        Profile.load_dirs(base, acc)
 
       dirs when is_list(dirs) ->
         if Enum.all?(dirs, &is_binary/1) do
-          Profile.load_dirs([shipped_profiles_dir() | dirs], acc)
+          Profile.load_dirs(base ++ dirs, acc)
         else
           {%{}, add_error(acc, "profile_dirs must be a list of directory paths")}
         end
@@ -1025,12 +1033,15 @@ defmodule Cairn.Config do
   # plugin references: a group's `profile:` name becomes the parsed
   # `Cairn.Config.Profile` struct, or (typo, missing file) a config error
   # naming what was looked for.
-  defp resolve_profiles(config, acc) do
+  defp resolve_profiles(config, board, acc) do
+    unusable = board.preflight()
+
     {groups, acc} =
       Enum.map_reduce(config.plugin_groups, acc, fn
         %PluginGroup{profile: name} = group, acc when is_binary(name) ->
           case Map.fetch(config.profiles, name) do
             {:ok, profile} ->
+              acc = warn_unusable(acc, group, profile, board, unusable)
               {%{group | profile: profile}, acc}
 
             :error ->
@@ -1038,7 +1049,7 @@ defmodule Cairn.Config do
                add_error(
                  acc,
                  "plugin #{group.name}: unknown profile #{inspect(name)} — no such file " <>
-                   "in priv/profiles or any profile_dirs entry"
+                   "in priv/profiles, the board's profiles or any profile_dirs entry"
                )}
           end
 
@@ -1047,6 +1058,28 @@ defmodule Cairn.Config do
       end)
 
     {%{config | plugin_groups: groups}, acc}
+  end
+
+  # Only for a profile a group selects: a shipped one nobody runs is not
+  # operator intent. Valid, but it would do nothing on this host.
+  defp warn_unusable(acc, group, profile, board, unusable) do
+    [
+      {"backend", profile.backend, unusable.backends},
+      {"decoder", profile.decoder, unusable.decoders}
+    ]
+    |> Enum.reduce(acc, fn {key, value, reasons}, acc ->
+      case Map.fetch(reasons, value) do
+        {:ok, reason} ->
+          add_warning(
+            acc,
+            "plugin #{group.name}: profile #{profile.name} names #{key} #{inspect(value)}, " <>
+              "which the #{board.name()} board provides but cannot use on this host: #{reason}"
+          )
+
+        :error ->
+          acc
+      end
+    end)
   end
 
   @doc """

@@ -77,9 +77,9 @@ impl BackendKind {
     ///
     /// Static because profile validation on the Elixir side has to answer the
     /// same questions at config load, with no plugin running and possibly no
-    /// such hardware attached. `Cairn.Config.Profile`'s
-    /// `@backend_capabilities` mirrors all three columns of this table:
-    /// `fused_nms` feeds its `check_capabilities` rule, `artifact` picks the
+    /// such hardware attached. `Cairn.Board.Generic.backends/0` mirrors all
+    /// three columns of this table: `fused_nms` feeds `Cairn.Config.Profile`'s
+    /// `check_capabilities` rule, `artifact` picks the
     /// `model:` key a profile is read by, and `dynamic_shapes` is mirrored but
     /// read by no rule on either side (an `input_size:` disagreeing with a
     /// compiled artifact is a fact about a file the host cannot open — the

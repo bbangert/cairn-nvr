@@ -587,7 +587,7 @@ defmodule Cairn.Config.Server do
     :transcode,
     :extra_ffmpeg_args,
     # The gate element is built into the detect branch at birth
-    # (`Cairn.Pipeline.Camera.motion_gate/2`) — a changed scene config is a
+    # (`Cairn.Pipeline.DetectChain`) — a changed scene config is a
     # different branch, not a refreshable knob.
     :motion_json
   ]

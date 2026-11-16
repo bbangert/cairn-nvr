@@ -3,6 +3,16 @@ defmodule Cairn.ConfigTest do
 
   alias Cairn.Config
 
+  # Load asks a board for its name, profile directory and preflight; the
+  # menus stay the release's.
+  defmodule BenchBoard do
+    def name, do: "bench"
+    def profiles_dir, do: "test/support/fixtures/profiles/board"
+
+    def preflight,
+      do: %{backends: %{"rknn" => "no /dev/rknpu"}, decoders: %{"vaapi" => "no /dev/dri"}}
+  end
+
   @valid_fixture "test/support/fixtures/configs/valid.yml"
   @groups_fixture "test/support/fixtures/configs/plugin_groups.yml"
 
@@ -1306,11 +1316,56 @@ defmodule Cairn.ConfigTest do
       refute Map.has_key?(stages, :bbd)
     end
 
+    test "a board's unusable backend or decoder warns for a group that selects it" do
+      warning =
+        "plugin det: profile rk-test names backend \"rknn\", which the bench board " <>
+          "provides but cannot use on this host: no /dev/rknpu"
+
+      assert {:ok, _config, [^warning]} = Config.from_map(profiled_map(), board: BenchBoard)
+      assert {:ok, _config, []} = Config.from_map(profiled_map())
+      # rk-test is still loaded, but no group runs it.
+      assert {:ok, _config, []} = Config.from_map(profiled_map("minimal"), board: BenchBoard)
+
+      warning =
+        "plugin det: profile bench-vaapi names decoder \"vaapi\", which the bench board " <>
+          "provides but cannot use on this host: no /dev/dri"
+
+      assert {:ok, _config, [^warning]} =
+               Config.from_map(profiled_map("bench-vaapi"), board: BenchBoard)
+    end
+
+    test "the board's profiles load after the shipped ones and before profile_dirs" do
+      assert {:error, _errors} = Config.from_map(profiled_map("bench-only"))
+
+      assert {:ok, config, []} = Config.from_map(profiled_map("bench-only"), board: BenchBoard)
+      assert [%{profile: %Profile{name: "bench-only", stages: nil}}] = config.plugin_groups
+
+      dir =
+        tmp_profile_dir("bench-only", """
+        backend: ort
+        model:
+          onnx: test/support/fixtures/models/stub.onnx
+        tracking:
+          twin_mint: true
+        """)
+
+      map = Map.update!(profiled_map("bench-only"), "profile_dirs", &(&1 ++ [dir]))
+      shadow = "profile bench-only: #{dir}/bench-only.yml shadows a previously loaded profile"
+      assert {:ok, config, warnings} = Config.from_map(map, board: BenchBoard)
+      assert Enum.any?(warnings, &(&1 =~ shadow))
+      assert [%{profile: %Profile{stages: %{twin_mint: %{}}}}] = config.plugin_groups
+    end
+
     test "a broken profile file fails the whole load with named errors" do
       map = Map.put(base_map(), "profile_dirs", [@bad_dir])
 
       assert {:error, errors} = Config.from_map(map)
-      assert Enum.any?(errors, &(&1 =~ "unknown backend \"quantum\""))
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ ~s(unknown backend "quantum" — the generic board provides ort, qnn or rknn))
+             )
+
       assert Enum.any?(errors, &(&1 =~ "fps_band must be"))
       assert Enum.any?(errors, &(&1 =~ "tracking.bbd must be"))
     end
@@ -1745,8 +1800,8 @@ defmodule Cairn.ConfigTest do
     end
 
     test "valid JSON with an unknown knob is the same load error the build would raise" do
-      # The exact string `Cairn.Pipeline.Camera.motion_gate/3` raises on —
-      # load validation exists so that raise is unreachable from config.
+      # The exact string `Cairn.Pipeline.DetectChain` raises on — load
+      # validation exists so that raise is unreachable from config.
       assert {:error, errors} =
                Config.from_map(gated_map(ort_yaml("tier: 1"), ~s({"treshold":30})))
 
@@ -2867,7 +2922,7 @@ defmodule Cairn.ConfigTest do
     # trips something here. The regex failing to find three rows is itself the
     # tripwire — it means the Rust shape moved and the mirror needs re-pairing
     # by hand. `artifact` is deliberately not compared: the two sides disagree
-    # for qnn by design (format vs `model:` key — see the table's comment).
+    # for qnn by design (format vs `model:` key — see the comment on `Cairn.Board.Generic.backends/0`).
     test "the capability booleans match the plugin's source, mechanically" do
       rust = File.read!("plugins/cairn-detect/src/infer/backend.rs")
 
@@ -2879,7 +2934,7 @@ defmodule Cairn.ConfigTest do
 
       assert length(rows) == 3,
              "BackendKind::capabilities rows moved in backend.rs — re-pair the mirror " <>
-               "(this regex and @backend_capabilities)"
+               "(this regex and Cairn.Board.Generic.backends/0)"
 
       for [_, kind, fused, dynamic] <- rows do
         caps = kind |> String.downcase() |> Profile.capabilities()
@@ -3008,7 +3063,13 @@ defmodule Cairn.ConfigTest do
     test "an unknown decoder is refused, and says which knob it is" do
       errors = caps_errors(@caps_bad_dir)
 
-      assert Enum.any?(errors, &(&1 =~ "profile bad-decoder: unknown decoder \"cuda\""))
+      assert Enum.any?(
+               errors,
+               &(&1 =~
+                   ~s(profile bad-decoder: unknown decoder "cuda" — the generic board provides ) <>
+                     "auto, nvdec, qsv, sw, v4l2, vaapi or videotoolbox")
+             )
+
       assert Enum.any?(errors, &(&1 =~ "decoder: is the video decode path"))
     end
   end

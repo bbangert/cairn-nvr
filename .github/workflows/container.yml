@@ -33,6 +33,7 @@ on:
       - config/**
       - priv/**
       - assets/**
+      - libs/**
       - mix.exs
       - mix.lock
       - .github/workflows/container.yml

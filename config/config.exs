@@ -92,6 +92,11 @@ config :mime, :types, %{
   "application/sdp" => ["sdp"]
 }
 
+# Which `Cairn.Stage.Board` this release is built with — `mix.exs` picks the
+# board's library from the same variable. Before the env import, so an env
+# file can still override what a board sets.
+import_config "boards/#{System.get_env("CAIRN_BOARD", "generic")}.exs"
+
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
 import_config "#{config_env()}.exs"

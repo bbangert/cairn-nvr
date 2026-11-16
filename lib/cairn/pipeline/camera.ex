@@ -49,10 +49,12 @@ defmodule Cairn.Pipeline.Camera do
   detect branch — takes its input on a `:manual` pad. That is the invariant the
   detect branch depends on: a manual input behind our push source arms
   membrane_core's toilet and is killed under exactly the overload it exists to
-  survive, so the manual pads are internal to the branch — access units between
-  `Cairn.Pipeline.Picker` and `Cairn.Pipeline.Decoder`, sampled RGB frames
-  between the decoder and `Cairn.Pipeline.Inference` (D-C2's seam: frames as
-  plain buffers, letterbox maths and motion verdict in metadata). The
+  survive, so the manual pads are internal to the branch, behind
+  `Cairn.Pipeline.Picker`. What follows the picker is the release's board's
+  (`Cairn.Pipeline.DetectChain`); on the generic board it is access units into
+  `Cairn.Pipeline.Decoder` and sampled RGB frames between the decoder and
+  `Cairn.Pipeline.Inference` (D-C2's seam: frames as plain buffers, letterbox
+  maths and motion verdict in metadata). The
   observations then flow as `Detections` buffers into
   `Cairn.Pipeline.ObservationStamper`, which clocks them and resolves the
   tracking context, through the generic `Membrane.MOTTracker` hosting the
@@ -78,16 +80,12 @@ defmodule Cairn.Pipeline.Camera do
 
   alias Cairn.Config
   alias Cairn.Detect.SparseTrack
-  alias Cairn.Motion
 
   alias Cairn.Pipeline.{
     BridgeSource,
-    Decoder,
+    DetectChain,
     EpochTagger,
-    Inference,
-    MotionGate,
     ObservationStamper,
-    Picker,
     PresenceSink,
     RingBufferSink,
     RTPOut,
@@ -438,36 +436,10 @@ defmodule Cairn.Pipeline.Camera do
   defp detect_spec(_camera, nil, _head), do: []
 
   defp detect_spec(camera, detect, head) do
-    stream_params = Keyword.get(detect, :stream_params, %{})
-    gate = motion_gate(camera.id, stream_params)
-    policy = Keyword.fetch!(detect, :policy)
-
-    inferred =
-      head
-      |> child(:picker, Picker)
-      # One AU between the two, so the picker learns that the decoder is free
-      # the moment it is, and no more than one is ever in flight.
-      |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
-      |> child(:decoder, %Decoder{
-        camera_id: camera.id,
-        stream_params: decoder_params(stream_params, gate)
-      })
-      |> maybe_gate(gate)
-      # …and one sampled frame between decoder and inference, for the same
-      # reason: inference demands only after `push_frame/5` returns.
-      |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
-      |> child(:infer, %Inference{
-        session: {Cairn.Native.Host, Cairn.Native.Host},
-        stream_id: camera.id,
-        stream_params: stream_params
-      })
-
-    [detect_tail(inferred, camera, detect, policy)]
+    inferred = DetectChain.build(head, camera, detect)
+    [detect_tail(inferred, camera, detect, Keyword.fetch!(detect, :policy))]
   end
 
-  # Evaluated BEFORE `detect_spec/3` in `handle_init` on purpose: past that
-  # call, dialyzer refines `detect` through the spec-builder's success typing
-  # down to `nil` and reports this function's second clause unreachable.
   defp detect_style(nil), do: nil
   defp detect_style(detect), do: detect |> Keyword.fetch!(:policy) |> style()
 
@@ -524,41 +496,5 @@ defmodule Cairn.Pipeline.Camera do
       module ->
         {module, []}
     end
-  end
-
-  # The Nx measurement (D-C3): a configured gate becomes an element between
-  # decoder and inference, and the decoder is told nothing about motion — the
-  # verdict in the buffer metadata comes from `Cairn.Pipeline.MotionGate`
-  # instead of from the decode NIF, behind the same contract. A bad
-  # motion_json raises here, at pipeline build, where the operator reads a
-  # config error rather than a per-frame one.
-  defp motion_gate(camera_id, stream_params) do
-    case Motion.Config.resolve_json(Map.get(stream_params, :motion_json)) do
-      {:ok, nil} ->
-        nil
-
-      {:ok, config} ->
-        %MotionGate{config: config}
-
-      {:error, message} ->
-        raise ArgumentError, "camera #{camera_id}: motion_json: #{message}"
-    end
-  end
-
-  # `Cairn.Pipeline.Inference` keeps the FULL stream params — the gate
-  # *policy* (linger/epoch bypass/re-verify) lives with the model session and
-  # still reads these knobs; only the measurement moved.
-  defp decoder_params(stream_params, nil), do: stream_params
-  defp decoder_params(stream_params, _gate), do: Map.put(stream_params, :motion_json, nil)
-
-  defp maybe_gate(link, nil), do: link
-
-  defp maybe_gate(link, %MotionGate{} = gate) do
-    # The same one-frame seam as either side of it: the gate element passes
-    # demand through one-for-one, so the decoder's latest-wins slot still
-    # sees inference's real pace.
-    link
-    |> via_in(:input, target_queue_size: 1, min_demand_factor: 0.5)
-    |> child(:motion_gate, gate)
   end
 end

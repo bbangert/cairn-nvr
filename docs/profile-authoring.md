@@ -18,18 +18,20 @@ has. You want one when you are running cairn on an accelerator, when you want
 the model choice to be a reviewable file rather than a line of argv, or when
 different cameras on one node run different hardware.
 
-Shipped profiles live in `priv/profiles/`; yours live wherever you point
-`profile_dirs:`. The schema and every validation message quoted below come
-from `Cairn.Config.Profile`.
+Shipped profiles live in `priv/profiles/`; a board's own live in the directory
+its release names (`Cairn.Stage.Board.profiles_dir/0` — the generic board has
+none); yours live wherever you point `profile_dirs:`. The schema and the
+`profile …:` messages quoted below come from `Cairn.Config.Profile`; the
+`backend:` and `decoder:` menus come from the release's board.
 
 ## Attaching one
 
 Three config keys, none of which existed before profiles:
 
 ```yaml
-# Where your own profiles live. Cairn's shipped dir is always searched first;
-# these are searched after, so a file of yours shadows a shipped one of the
-# same name — with a warning naming the file that won.
+# Where your own profiles live. Cairn's shipped dir is searched first, then
+# the board's; these are searched after, so a file of yours shadows either of
+# the same name — with a warning naming the file that won.
 profile_dirs:
   - /etc/cairn/profiles
 
@@ -231,10 +233,12 @@ Two consequences worth an operator's attention:
 
 | field | menu | where the menu lives |
 |---|---|---|
-| `backend` | `ort`, `rknn`, `qnn` | `BackendKind`, `plugins/cairn-detect/src/infer/backend.rs` — mirrored in `Cairn.Config.Profile`'s capability table |
+| `backend` | `ort`, `rknn`, `qnn` | the release's board (`Cairn.Stage.Board.backends/0`); the generic board's mirrors `BackendKind`, `plugins/cairn-detect/src/infer/backend.rs` |
 | `model_profile` | `yolox`, `yolov10`, `yolov8` (or `yolov9`, `yolo11`, `yolov11`, `yolo26`), `rfdetr` (hyphenated spelling accepted) | `PROFILES`, `plugins/cairn-detect/src/infer/catalog.rs` |
-| `decoder` | `auto`, `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` | `DecoderKind`, `plugins/cairn-detect/src/decode.rs` |
+| `decoder` | `auto`, `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` | the release's board (`Cairn.Stage.Board.decoders/0`); the generic board's are `DecoderKind`, `plugins/cairn-detect/src/decode.rs` |
 | `tracking:` stage keys | `bbd`, `oru`, `ocr`, `twin_mint` | `Cairn.Tracker.Stage.Bbd` / `.Oru` / `.Ocr` / `.TwinMint` |
+
+The `backend` and `decoder` menus shown are the generic board's.
 
 Each catalog row is a decode contract listing the model families it applies
 to: `yolo11` and `yolov8` share one row because several Ultralytics
@@ -364,8 +368,9 @@ against.
 
 ## The capability table, and what it refuses
 
-`Cairn.Config.Profile` carries a static table of what each backend accepts,
-mirroring `BackendKind::capabilities` on the Rust side. It is static because
+The release's board carries a static table of what each backend accepts
+(`Cairn.Stage.Board.backends/0`); the generic board's mirrors
+`BackendKind::capabilities` on the Rust side. It is static because
 config load has to answer these questions with no plugin running and, for a
 board profile written ahead of its hardware, no such device attached.
 
@@ -423,12 +428,13 @@ from — at boot that is a refusal to start, on Reload it is a rejected file wit
 the running config kept. Message shapes as they are emitted:
 
 ```
-profile my-board: unknown backend "hailo" (ort, qnn or rknn)
+profile my-board: unknown backend "hailo" — the generic board provides ort,
+  qnn or rknn
 profile my-board: unknown model_profile "yolov12" (rfdetr, yolov10,
   yolov8 (or yolov9, yolo11, yolov11, yolo26), yolox)
-profile my-board: unknown decoder "cuda" (auto, nvdec, qsv, sw, v4l2, vaapi or
-  videotoolbox) — decoder: is the video decode path; the inference runtime is
-  backend:
+profile my-board: unknown decoder "cuda" — the generic board provides auto,
+  nvdec, qsv, sw, v4l2, vaapi or videotoolbox; decoder: is the video decode
+  path, the inference runtime is backend:
 profile my-board: name "other" does not match its filename — the filename is
   the name; drop the key or make them agree
 profile my-board: fps_band must be [min, max] with 0 < min <= max, got [4, 2]
@@ -449,8 +455,8 @@ profile my-board: labels file models/gone.names does not exist or is not a
 And the ones about attaching it, which name the plugin group instead:
 
 ```
-plugin detect: unknown profile "rk3566" — no such file in priv/profiles or any
-  profile_dirs entry
+plugin detect: unknown profile "rk3566" — no such file in priv/profiles, the
+  board's profiles or any profile_dirs entry
 plugin detect: profile my-board uses backend rknn, which is experimental
   — only ort is proven in soak, and a profile naming another backend must
   declare experimental: true
@@ -471,7 +477,13 @@ tracking.reid has no effect for group detect: its profile my-board lists no
   bbd stage
 camera front: track: has no effect at tier 1 — tier 1 runs no tracker and
   persists no track rows; record: gates presence recordings
+plugin detect: profile my-board names backend "rknn", which the <board> board
+  provides but cannot use on this host: <the board's reason>
 ```
+
+The last is raised once per selected profile, for `backend:` and `decoder:`
+alike, from the board's own check of the host. The generic board reports
+nothing unusable and never raises it.
 
 A profile's *files* are checked only for a profile some group actually runs, so
 a board profile for hardware this node does not have costs it nothing. That is

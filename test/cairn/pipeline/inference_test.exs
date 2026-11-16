@@ -11,6 +11,7 @@ defmodule Cairn.Pipeline.InferenceTest do
   alias Cairn.NativeStub
   alias Cairn.Pipeline.{Decoder, Inference, ObservationStamper, Picker, TrackSink}
   alias Cairn.Pipeline.Inference.Detections
+  alias Cairn.Stage.FrameMeta
   alias Membrane.Buffer
   alias Membrane.Testing
 
@@ -284,6 +285,25 @@ defmodule Cairn.Pipeline.InferenceTest do
 
       assert actions == [demand: {:input, 1}]
       assert state.dropped == 1
+    end
+
+    # `Cairn.Stage.FrameMeta` is the contract a board's decode side is written
+    # against; this holds the element's own match to the same key list.
+    test "every key the frame-metadata contract requires is one inference drops a frame without",
+         ctx do
+      {_actions, state} = playing(element(ctx))
+      buffer = frame_buffer(1, ctx.epoch)
+      assert {:ok, _meta} = FrameMeta.fetch(buffer.metadata)
+
+      {_actions, accepted} = Inference.handle_buffer(:input, buffer, %{}, state)
+      assert accepted.dropped == state.dropped
+      assert_receive {:open_stream, _engine, _camera_id, _params}
+
+      for key <- FrameMeta.required_keys() do
+        stripped = %{buffer | metadata: Map.delete(buffer.metadata, key)}
+        {_actions, after_drop} = Inference.handle_buffer(:input, stripped, %{}, state)
+        assert after_drop.dropped == state.dropped + 1, "#{key} was not required"
+      end
     end
 
     test "a frame carrying no epoch is dropped and counted, and the stream untouched", ctx do

@@ -467,8 +467,8 @@ defmodule Cairn.PipelineOwner do
       stream_params: %{
         min_score: state.camera.min_score,
         # The operator's scene knob (D-P6), verbatim from config — the
-        # branch builds its gate element from it (`motion_gate/2`), nil
-        # meaning no gate, today's chain exactly.
+        # branch builds its gate element from it
+        # (`Cairn.Pipeline.DetectChain`), nil meaning no gate.
         motion_json: state.camera.motion_json
       }
     ]

@@ -49,36 +49,8 @@ defmodule Cairn.Native do
   # dynamic. The nowarn covers the specs, which describe the loaded library.
   @dialyzer {:nowarn_function, open_decoder: 2, decode_au: 4, close_decoder: 1, drain_teardown: 1}
 
-  @typedoc """
-  One decoded frame on its way across the boundary: `payload` is tightly
-  packed RGB24 rows of the *content* rectangle (`width`×`height`), scaled from
-  a `orig_width`×`orig_height` source; `pad_w`/`pad_h` are what the model rect
-  adds around it (right and bottom), `scale_x`/`scale_y` the per-axis content
-  pixels per source pixel. `pts` is the frame's own timestamp in the caller's
-  time base, `nil` when the decoder had none to offer.
-  """
-  @type decoded_frame :: %{
-          payload: binary(),
-          width: pos_integer(),
-          height: pos_integer(),
-          orig_width: pos_integer(),
-          orig_height: pos_integer(),
-          pts: integer() | nil,
-          observed_at_ms: integer(),
-          scale_x: float(),
-          scale_y: float(),
-          pad_w: non_neg_integer(),
-          pad_h: non_neg_integer(),
-          motion: motion_verdict() | nil
-        }
-
-  @typedoc "The motion measurement taken on the decode side, when configured."
-  @type motion_verdict :: %{
-          changed_fraction: float(),
-          motion: boolean(),
-          calibrating: boolean(),
-          scene_cut: boolean()
-        }
+  @type decoded_frame :: Cairn.Stage.DecoderNif.decoded_frame()
+  @type motion_verdict :: Cairn.Stage.FrameMeta.motion_verdict()
 
   @doc """
   Open one camera's decoder for the input spec an engine resolved.

@@ -10,19 +10,18 @@ defmodule Cairn.Config.Profile do
   unknown keys, malformed bands, illegal stage compositions, and the type of
   every field the model half reads (`model:` a mapping of path strings,
   `model_profile:`/`decoder:`/`labels:` strings, `experimental:` a boolean)
-  are rejected here. So are names outside the menus the plugin itself
-  accepts — `backend:` against the capability table below, `model_profile:`
-  against the Rust catalog's decode contracts and their families, `decoder:` against the
-  video decode kinds — and the two backend/family combinations
-  `docs/npu-backends.md` calls out, one broken and one unverified (see
-  `check_capabilities/5`).
+  are rejected here. So are names outside the menus — `backend:` and
+  `decoder:` against the release's board (`Cairn.Stage.Board`), `model_profile:`
+  against the Rust catalog's decode contracts and their families — and the two
+  backend/family combinations `docs/npu-backends.md` calls out, one broken and
+  one unverified (see `check_capabilities/5`).
   `Cairn.Config` rejects a profiled group whose model artifact or labels file
   is missing, or whose backend is stubbed (see "Rust argv" below).
   Profiles are files, never inline config: shipped ones live
-  in `priv/profiles/*.yml` — the four board profiles cairn ships — operator
-  ones in the directories the top-level `profile_dirs:` key lists, and an
-  operator file wins a name collision with a shipped one (with a warning
-  saying so).
+  in `priv/profiles/*.yml` — the four board profiles cairn ships — then the
+  board's `profiles_dir/0`, then operator ones in the directories the
+  top-level `profile_dirs:` key lists; a later file wins a name collision
+  (with a warning saying so).
 
   `docs/profile-authoring.md` is the operator-facing half of this module: the
   menus, the errors, and the two rules the schema cannot express.
@@ -144,43 +143,6 @@ defmodule Cairn.Config.Profile do
   @known_rung_keys ~w(model model_profile input_size engine_budget pack)
   @known_tracking_keys ~w(bbd oru ocr twin_mint max_unseen_ms max_live_tracks stationary_after_ms
                           tracker)
-  # What each backend accepts, as static data — the Elixir half of
-  # `BackendKind::capabilities` in
-  # `plugins/cairn-detect/src/infer/backend.rs`, which names this table as its
-  # host-side mirror. Both sides are *claims* about a runtime rather than
-  # probes of one, and the evidence for each row (established by
-  # `docs/npu-backends.md` against conservative reading) is written out on
-  # the Rust rows; this side carries the same values because config load has to
-  # answer the same questions with no plugin running and, for a board profile
-  # written ahead of its hardware, no such device attached.
-  #
-  # `artifact` is the `model:` **key** naming this backend's compiled file, not
-  # that file's format, and the two deliberately disagree for qnn: Rust reports
-  # `ArtifactFormat::Onnx` there because QNN is an onnxruntime execution
-  # provider, while the key here is `qnn:` because the QDQ graph it loads is a
-  # different *file* from the fp32 export. Neither is a stale copy of the
-  # other. Backends consume different formats (prior-art §1), so a profile
-  # ships one artifact per backend and the profile's own backend picks which
-  # path becomes `--model`.
-  #
-  # `dynamic_shapes` is mirrored and read by no rule: what it would refuse — an
-  # `input_size:` that disagrees with a fixed-geometry artifact — is a fact
-  # about a compiled file the host cannot open, so a check here could only
-  # guess. It is in the authoring guide instead (`docs/profile-authoring.md`),
-  # beside the RKNN-sequential note, which the schema cannot express either.
-  @backend_capabilities %{
-    "ort" => %{artifact: "onnx", fused_nms: true, dynamic_shapes: true},
-    "rknn" => %{artifact: "rknn", fused_nms: false, dynamic_shapes: false},
-    "qnn" => %{artifact: "qnn", fused_nms: false, dynamic_shapes: false}
-  }
-  # Derived rather than repeated so a backend cannot be added to one list and
-  # forgotten in the other.
-  @backend_artifacts Map.new(@backend_capabilities, fn {backend, caps} ->
-                       {backend, caps.artifact}
-                     end)
-  @backends Map.keys(@backend_artifacts)
-  @known_model_keys Map.values(@backend_artifacts)
-
   # The Rust catalog's model families, row for row with `PROFILES` in
   # `plugins/cairn-detect/src/infer/catalog.rs` — family names included, so
   # `model_profile:` is checked against the same set the plugin's own
@@ -219,13 +181,6 @@ defmodule Cairn.Config.Profile do
     "rfdetr" => %{families: [], nms: :none, rknn_conversion: :undocumented}
   }
 
-  # `decoder:`'s menu, mirroring `DecoderKind` in
-  # `plugins/cairn-detect/src/decode.rs`. This is the **video** decode path and
-  # not `backend:`'s inference one; the plugin's own flag help draws the same
-  # distinction. Checked here because clap rejects an unknown value as a usage
-  # error, which reaches an operator as a plugin that will not start and a
-  # restart loop rather than as a config error naming the typo.
-  @decoders ~w(auto vaapi qsv nvdec v4l2 videotoolbox sw)
   @stage_modules %{
     "bbd" => {:bbd, Stage.Bbd},
     "oru" => {:oru, Stage.Oru},
@@ -312,13 +267,13 @@ defmodule Cairn.Config.Profile do
         }
 
   @doc """
-  What `backend` accepts, from the table mirroring the plugin's own.
+  What `backend` accepts, from the release's board (`Cairn.Stage.Board.backends/0`).
 
-  Raises on a backend outside the schema's menu — every caller has already had
+  Raises on a backend outside the board's menu — every caller has already had
   `check_backend/3` reject one.
   """
   @spec capabilities(String.t()) :: capabilities()
-  def capabilities(backend), do: Map.fetch!(@backend_capabilities, backend)
+  def capabilities(backend), do: Map.fetch!(backends(), backend)
 
   @doc """
   The catalog family `name` resolves to (family names included), or `nil` for a name
@@ -358,7 +313,7 @@ defmodule Cairn.Config.Profile do
   profile's `--model` is read from.
   """
   @spec artifact_key(String.t()) :: String.t()
-  def artifact_key(backend), do: Map.fetch!(@backend_artifacts, backend)
+  def artifact_key(backend), do: capabilities(backend).artifact
 
   @doc "The ladder rate bounds for `tier`, or `nil` for a tier no ladder ships on."
   @spec ladder_floor(term()) :: %{floor_fps: pos_integer(), cap_fps: pos_integer()} | nil
@@ -434,12 +389,11 @@ defmodule Cairn.Config.Profile do
   end
 
   @doc """
-  Loads every `*.yml` under the shipped dir and the operator dirs into a
-  name → profile map.
+  Loads every `*.yml` under `dirs` into a name → profile map.
 
   Later dirs win name collisions — `Cairn.Config` passes the shipped dir
-  first and operator `profile_dirs:` after, so an operator file shadows a
-  shipped one — and each collision is warned about by name, since a silently
+  first, the board's next and operator `profile_dirs:` last, so an operator
+  file shadows both — and each collision is warned about by name, since a silently
   shadowed profile is how a fleet ends up running settings nobody can find
   in a file they are reading.
   """
@@ -499,7 +453,7 @@ defmodule Cairn.Config.Profile do
       )
 
     acc =
-      Config.warn_unknown(acc, Map.get(raw, "model"), @known_model_keys, "profile #{name} model")
+      Config.warn_unknown(acc, Map.get(raw, "model"), model_keys(), "profile #{name} model")
 
     errors_before = length(acc.errors)
 
@@ -631,16 +585,16 @@ defmodule Cairn.Config.Profile do
   end
 
   defp check_backend(acc, raw, name) do
-    case Map.get(raw, "backend", "ort") do
-      backend when backend in @backends ->
-        acc
+    backend = Map.get(raw, "backend", "ort")
+    board = Cairn.Board.module()
+    names = Map.keys(board.backends())
 
-      other ->
-        Config.add_error(
-          acc,
-          "profile #{name}: unknown backend #{inspect(other)} (#{natural_list(@backends)})"
-        )
-    end
+    Config.check(
+      acc,
+      backend in names,
+      "profile #{name}: unknown backend #{inspect(backend)} — the #{board.name()} board " <>
+        "provides #{natural_list(names)}"
+    )
   end
 
   # A family this side does not know is one the plugin's own parser would
@@ -681,11 +635,14 @@ defmodule Cairn.Config.Profile do
   defp check_decoder(acc, raw, name) do
     case Map.get(raw, "decoder") do
       value when is_binary(value) and value != "" ->
+        board = Cairn.Board.module()
+        names = board.decoders()
+
         Config.check(
           acc,
-          value in @decoders,
-          "profile #{name}: unknown decoder #{inspect(value)} " <>
-            "(#{natural_list(@decoders)}) — decoder: is the video decode path; " <>
+          value in names,
+          "profile #{name}: unknown decoder #{inspect(value)} — the #{board.name()} board " <>
+            "provides #{natural_list(names)}; decoder: is the video decode path, " <>
             "the inference runtime is backend:"
         )
 
@@ -704,7 +661,7 @@ defmodule Cairn.Config.Profile do
     backend = Map.get(raw, "backend", "ort")
     requested = Map.get(raw, "model_profile")
 
-    case {backend in @backends, family(requested)} do
+    case {backend?(backend), family(requested)} do
       {true, {_canonical, row}} ->
         # `=== true`, not `|| false`: a non-boolean `experimental:` is already
         # an error (`check_experimental/3`, same pipeline), and treating its
@@ -893,7 +850,7 @@ defmodule Cairn.Config.Profile do
 
     acc
     |> Config.warn_unknown(rung, @known_rung_keys, where)
-    |> Config.warn_unknown(Map.get(rung, "model"), @known_model_keys, "#{where} model")
+    |> Config.warn_unknown(Map.get(rung, "model"), model_keys(), "#{where} model")
     |> check_rung_model(rung, index, backend, name)
     |> check_pos_int(rung, "input_size", name, "model_ladder rung #{index} input_size")
     |> check_rung_required(rung, "input_size", index, name)
@@ -950,16 +907,18 @@ defmodule Cairn.Config.Profile do
 
   # Skipped for a backend outside the menu — `check_backend/3` already spoke,
   # and there is no artifact key to hold the rung against.
-  defp check_rung_backend_key(acc, model, index, backend, name) when backend in @backends do
-    Config.check(
-      acc,
-      is_binary(Map.get(model, artifact_key(backend))),
-      "profile #{name}: model_ladder rung #{index} names no model.#{artifact_key(backend)} " <>
-        "artifact for this profile's #{backend} backend — every rung must carry one"
-    )
+  defp check_rung_backend_key(acc, model, index, backend, name) do
+    if backend?(backend) do
+      Config.check(
+        acc,
+        is_binary(Map.get(model, artifact_key(backend))),
+        "profile #{name}: model_ladder rung #{index} names no model.#{artifact_key(backend)} " <>
+          "artifact for this profile's #{backend} backend — every rung must carry one"
+      )
+    else
+      acc
+    end
   end
-
-  defp check_rung_backend_key(acc, _model, _index, _backend, _name), do: acc
 
   # `check_pos_int/5` says nothing about an absent key (top-level fields are
   # optional); a rung's `input_size` is not. Tested by value, not key
@@ -1015,18 +974,18 @@ defmodule Cairn.Config.Profile do
         acc
 
       value when is_binary(value) and value != "" ->
-        case family(value) do
-          nil ->
+        case {family(value), backend?(backend)} do
+          {nil, _any_backend} ->
             Config.add_error(
               acc,
               "profile #{name}: model_ladder rung #{index} unknown model_profile " <>
                 "#{inspect(value)} (#{family_menu()})"
             )
 
-          family when backend in @backends ->
+          {family, true} ->
             check_capabilities(acc, name, backend, Map.get(raw, "experimental") === true, family)
 
-          _family_but_unknown_backend ->
+          {_family, false} ->
             acc
         end
 
@@ -1077,12 +1036,14 @@ defmodule Cairn.Config.Profile do
   # share availability even when their model maps differ in entries nothing
   # reads. Outside the backend menu there is no artifact key — the whole
   # model map stands in, and `check_backend/3` already errored.
-  defp rung_availability_key(rung, backend) when backend in @backends do
-    is_map(rung) &&
-      rung |> Map.get("model", %{}) |> then(&(is_map(&1) && Map.get(&1, artifact_key(backend))))
+  defp rung_availability_key(rung, backend) do
+    if backend?(backend) do
+      is_map(rung) &&
+        rung |> Map.get("model", %{}) |> then(&(is_map(&1) && Map.get(&1, artifact_key(backend))))
+    else
+      is_map(rung) && Map.get(rung, "model")
+    end
   end
-
-  defp rung_availability_key(rung, _backend), do: is_map(rung) && Map.get(rung, "model")
 
   # A rung's shadow is every earlier rung that can never be absent while this
   # one is available: the always-present (non-pack) rungs, plus pack rungs
@@ -1218,6 +1179,10 @@ defmodule Cairn.Config.Profile do
       Map.get(rung, "engine_budget") > 0 and
       (is_nil(Map.get(rung, "pack")) or is_binary(Map.get(rung, "pack")))
   end
+
+  defp backends, do: Cairn.Board.module().backends()
+  defp backend?(backend), do: Map.has_key?(backends(), backend)
+  defp model_keys, do: backends() |> Map.values() |> Enum.map(& &1.artifact)
 
   # "a, b or c" — enumerated from the table rather than hand-written so a value
   # added to one can't be forgotten in the message.
