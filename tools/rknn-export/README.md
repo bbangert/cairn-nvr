@@ -8,7 +8,7 @@ ignored, and so is any `.onnx`, `.rknn`, `.pt`, `.npy` or `.npz` wherever it
 lands.
 
 Simulator parity measures INT8 quantisation error, not the NPU's numerics.
-The board is a separate measurement.
+The board is a separate measurement (`board/`).
 
 ## Why the rungs look the way they do
 
@@ -36,7 +36,7 @@ This toolkit gives an INT8 output tensor one scale. Everything else follows.
   and RT-DETR-l fails at build.
 - **FP16 is not a rung.** It is exact in parity and three times slower on
   the board end to end: yolox_s 640 takes 101 ms a frame INT8 and 310 ms
-  FP16, 65 of them converting the input.
+  FP16, 65 of them converting the input (`board/results/m1.log`).
 
 ## Environments
 
@@ -210,6 +210,44 @@ venv/bin/python -I parity.py yolox_s_640_i8 yolox
 ./run.sh rfdetr_nano_384_fp16 work/src/rfdetr_nano.onnx fp16 --mean 123.675,116.28,103.53 \
   --std 58.395,57.12,57.375 --calib work/calib/st384_rgb --size 384x384 --input-name pixel_values
 ```
+
+## board/
+
+Probes that ran on the Green during bring-up, with the board's `python3` and
+numpy and nothing from the toolkit. Each prints `JSON:`-prefixed records, and
+`results/` holds what they printed; the other lines there (`DONE`,
+`[exit 0]`, `:ok`, a checksum) come from the commands around them. The models
+were trial builds, not the pinned rungs.
+
+- `rk.py` is a ctypes harness over librknnrt: `info`, `bench` (200 timed
+  calls, then 60 s sustained with NPU load, temperature and free memory
+  sampled), `input` (the ways to hand over a frame, timed and checked against
+  each other), `acc` (float outputs for the host) and `worker` (the child
+  `conc.py` starts). `matrix.sh` runs `bench` over `models/NAME.rknn` into
+  `m1.log`, `m2.log` and `m3.log`; `tab.py` prints those a line per record.
+- `zcin.py` and `zc.py` try zero-copy I/O through `rknn_create_mem` and
+  `rknn_set_io_mem`. A zero-copy input gives the outputs `rknn_inputs_set`
+  gives, at cosine 1.000 (`zcin.log`). A zero-copy output does not: `zc.py`
+  read the native buffer back at cosine 0.05 under every layout it tried
+  (`zc.log`), so nothing here shows how to read one.
+- `conc.py` and `conc.sh` run one context per process, started on one epoch
+  (`conc.log`).
+- `heaps.py` and `heapcap.py` allocate from each dma-heap, report what that
+  takes from CMA, and count the 1080p NV12 buffers the 32 MiB
+  `rk-dma-heap-cma` pool yields (`heaps.log`, `heapcap.log`).
+- `dec.py` runs K concurrent `mpi_dec_test` decodes with free CMA sampled
+  (`dec.log`).
+- `syms.py` checks the exported symbols of librknnrt, librga and
+  librockchip_mpp against the calls a board library makes. No log is kept.
+- `cpu_ort.py` times ONNX Runtime on the CPU, for the NPU's margin over it.
+  It has not been run on the board.
+
+`compare.py` runs on the host and answers whether the NPU agrees with the
+simulator: it scores an `rk.py acc` dump against the simulator and FP32
+tensors of the same build, `$RKNN_OUT/NAME.parity.npz` (default `work/rknn`).
+A `run.sh` build writes that file for five calibration frames, and `acc` must
+be given the same five in the same order. `build_rungs.sh` keeps no tensors,
+so a rung from `work/rungs` cannot be scored this way.
 
 ## Tests
 
