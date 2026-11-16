@@ -294,6 +294,41 @@ jobs:
       - run: mix test
         working-directory: libs/cairn_stage
 
+  rockchip-board:
+    name: Rockchip board library (mix test)
+    runs-on: ubuntu-latest
+    # Builds and tests on its own, without the base and without its NIF.
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          elixir-version: "1.20"
+          otp-version: "28"
+
+      - name: Cache deps and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            boards/cairn_rockchip/deps
+            boards/cairn_rockchip/_build
+          key: mix-rockchip-board-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('boards/cairn_rockchip/mix.lock') }}
+          restore-keys: |
+            mix-rockchip-board-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+
+      - run: mix deps.get
+        working-directory: boards/cairn_rockchip
+
+      - run: mix format --check-formatted
+        working-directory: boards/cairn_rockchip
+
+      - run: mix compile --warnings-as-errors
+        working-directory: boards/cairn_rockchip
+
+      - run: mix test
+        working-directory: boards/cairn_rockchip
+
   cairn-detect:
     name: Rust · Format · Clippy · Test · Release build
     runs-on: ubuntu-latest
@@ -356,7 +391,8 @@ jobs:
             plugins/cairn-detect/target
             plugins/cairn-native/target
             plugins/cairn-ort/target
-          key: cargo-debian13-${{ hashFiles('plugins/*/Cargo.lock') }}
+            boards/cairn_rockchip/native/cairn_rockchip/target
+          key: cargo-debian13-${{ hashFiles('plugins/*/Cargo.lock', 'boards/cairn_rockchip/native/cairn_rockchip/Cargo.lock') }}
           restore-keys: |
             cargo-debian13-
 
@@ -391,14 +427,14 @@ jobs:
       # Broken intra-doc links are a *rustdoc* lint, so clippy and
       # -D warnings cannot see them — the module split in #22 broke twelve of
       # them with every other gate green. --document-private-items because
-      # this is a binary crate: the docs exist for maintainers, and every
-      # cross-module reference in `infer` points at a private item.
+      # the docs exist for maintainers: almost everything worth reading in the
+      # crate is private to it, and the default doc build visits none of that.
       - run: cargo doc --no-deps --document-private-items
         working-directory: plugins/cairn-detect
         env:
           RUSTDOCFLAGS: -D warnings
 
-      # The two NIF crates, same gates. Their end-to-end clip tests need model
+      # cairn-native and cairn-ort, same gates. Their end-to-end clip tests need model
       # artifacts CI does not carry, and the harness's sanctioned waiver is the
       # env var — a test that silently skipped would be indistinguishable from
       # one that passed, so the waiver has to be explicit here.
@@ -435,6 +471,24 @@ jobs:
 
       - run: cargo doc --no-deps --document-private-items
         working-directory: plugins/cairn-ort
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # The Rockchip board library's native half, same gates.
+      - run: cargo fmt --check
+        working-directory: boards/cairn_rockchip/native/cairn_rockchip
+
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: boards/cairn_rockchip/native/cairn_rockchip
+
+      - run: cargo test
+        working-directory: boards/cairn_rockchip/native/cairn_rockchip
+
+      - run: cargo build --release
+        working-directory: boards/cairn_rockchip/native/cairn_rockchip
+
+      - run: cargo doc --no-deps --document-private-items
+        working-directory: boards/cairn_rockchip/native/cairn_rockchip
         env:
           RUSTDOCFLAGS: -D warnings
 

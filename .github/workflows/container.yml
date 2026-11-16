@@ -27,6 +27,7 @@ on:
       - Dockerfile
       - .dockerignore
       - plugins/**
+      - boards/**
       - tools/container/**
       - models/**
       - lib/**

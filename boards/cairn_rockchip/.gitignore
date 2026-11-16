@@ -1,0 +1,4 @@
+/_build/
+/deps/
+# The cdylib is copied here as a build artifact.
+/priv/native/

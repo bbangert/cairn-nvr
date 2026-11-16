@@ -27,7 +27,8 @@ ARG CAIRN_BOARD=generic
 
 # ---------------------------------------------------------------------------
 # Rust artifacts: the two NIFs and the cairn-detect canary, plus (arm64) the
-# fastrpc userspace. Runs on the build platform, links for the target.
+# fastrpc userspace and, for CAIRN_BOARD=rockchip, the board's probe binary.
+# Runs on the build platform, links for the target.
 FROM --platform=$BUILDPLATFORM rust:1.97-trixie AS native-build
 ARG TARGETARCH
 
@@ -55,12 +56,16 @@ EOS
 
 WORKDIR /src
 COPY plugins plugins
+COPY boards boards
 COPY tools/container/build-rust-aarch64.sh tools/container/
 
+# Declared here, not at the top of the stage: an ARG keys the cache of every
+# RUN after it, and the toolchain layer above is the same for every board.
+ARG CAIRN_BOARD
 RUN <<'EOS'
 set -eux
 if [ "$TARGETARCH" = "arm64" ]; then
-  tools/container/build-rust-aarch64.sh /dist
+  CAIRN_BOARD="$CAIRN_BOARD" tools/container/build-rust-aarch64.sh /dist
 else
   # Native build for the smoke image. Same ort-load-dynamic linkage as the
   # board build so both arches dlopen the pinned base ORT; the per-crate
@@ -405,6 +410,14 @@ done
 EOS
 
 COPY --from=rockchip-libs /dist/models/ /app/models/
+COPY --from=native-build /dist/rockchip/ /usr/local/bin/
+# Nothing in the image runs the probe, so an unresolved library would first
+# show on the board.
+RUN <<'EOS'
+set -eux
+ldd /usr/local/bin/cairn-rockchip-probe
+if ldd /usr/local/bin/cairn-rockchip-probe | grep -q 'not found'; then exit 1; fi
+EOS
 
 # ---------------------------------------------------------------------------
 FROM vendor-${CAIRN_BOARD} AS runtime

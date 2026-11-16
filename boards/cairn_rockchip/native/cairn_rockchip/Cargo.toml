@@ -1,0 +1,29 @@
+[package]
+name = "cairn-rockchip"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+# `cdylib` is the NIF library the BEAM loads; `rlib` lets the probe binary
+# link this crate.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "cairn-rockchip-probe"
+path = "src/bin/cairn-rockchip-probe.rs"
+
+[dependencies]
+cairn-detect = { path = "../../../../plugins/cairn-detect" }
+rustler = "0.38"
+
+[features]
+# Passed through to cairn-detect for the aarch64 cross-build, where ort loads
+# the runtime at startup instead of statically linking the downloaded x86
+# archive.
+ort-load-dynamic = ["cairn-detect/ort-load-dynamic"]
+
+[profile.release]
+lto = "thin"
+strip = true
