@@ -5,9 +5,9 @@
 //! No test here calls librknnrt itself: there is no NPU and no library on x86
 //! or in CI. The tests cover the struct layouts (as compile-time assertions),
 //! the mapping from tensor attrs to [`ModelIo`], the input check, the loader's
-//! failure paths, and the call sequence, the input descriptor and the
-//! output-buffer guard over stub entry points. The board run is the proof of
-//! the runtime.
+//! failure paths, the artifact refusals (empty, not a regular file), and the
+//! call sequence, the input descriptor and the output-buffer guard over stub
+//! entry points. The board run is the proof of the runtime.
 //!
 //! The artifact folds its normalisation and quantisation in, so it takes the
 //! frame's own bytes ([`InputElement::U8Pixels`]), NHWC; the runtime hands
@@ -22,6 +22,7 @@
 pub mod sys;
 
 use std::ffi::{c_int, c_void, OsString};
+use std::io::Read as _;
 use std::path::Path;
 use std::ptr;
 
@@ -217,17 +218,27 @@ impl RknnBackend {
         model: &Path,
         options: &SessionOptions,
     ) -> Result<Self> {
-        // Stat first: reading a file that large would exhaust a board's memory
-        // before the check after the read ran.
+        // An unbounded read of a stream or a growing file would exhaust a
+        // board's memory, so the read is capped at the size the open file
+        // reports.
+        let reading = || format!("reading artifact {}", model.display());
         let too_big = || anyhow::anyhow!("artifact {} is over 4 GiB", model.display());
-        let on_disk = std::fs::metadata(model)
-            .with_context(|| format!("reading artifact {}", model.display()))?
-            .len();
-        if u32::try_from(on_disk).is_err() {
+        let mut file = std::fs::File::open(model).with_context(reading)?;
+        let metadata = file.metadata().with_context(reading)?;
+        if !metadata.is_file() {
+            bail!("artifact {} is not a regular file", model.display());
+        }
+        if u32::try_from(metadata.len()).is_err() {
             return Err(too_big());
         }
-        let mut bytes = std::fs::read(model)
-            .with_context(|| format!("reading artifact {}", model.display()))?;
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(metadata.len() + 1)
+            .read_to_end(&mut bytes)
+            .with_context(reading)?;
+        if bytes.len() as u64 > metadata.len() {
+            bail!("artifact {} grew while it was read", model.display());
+        }
         // `rknn_init` reads `model` as a file path when size is 0.
         if bytes.is_empty() {
             bail!("artifact {} is empty", model.display());
@@ -717,15 +728,8 @@ mod tests {
         0
     }
 
-    fn open_stub(tag: &str) -> Result<RknnBackend> {
-        open_stub_with(tag, b"stub")
-    }
-
-    fn open_stub_with(tag: &str, artifact: &[u8]) -> Result<RknnBackend> {
-        let path =
-            std::env::temp_dir().join(format!("rknn-stub-{}-{tag}.rknn", std::process::id()));
-        std::fs::write(&path, artifact).unwrap();
-        let library = sys::Library {
+    fn stub_library() -> sys::Library {
+        sys::Library {
             init: stub_init,
             destroy: stub_destroy,
             query: stub_query,
@@ -734,8 +738,22 @@ mod tests {
             outputs_get: stub_outputs_get,
             outputs_release: stub_outputs_release,
             set_core_mask: stub_set_core_mask,
-        };
-        let opened = RknnBackend::with_library(library, &path, &SessionOptions::default());
+        }
+    }
+
+    fn open_path(path: &Path) -> Result<RknnBackend> {
+        RknnBackend::with_library(stub_library(), path, &SessionOptions::default())
+    }
+
+    fn open_stub(tag: &str) -> Result<RknnBackend> {
+        open_stub_with(tag, b"stub")
+    }
+
+    fn open_stub_with(tag: &str, artifact: &[u8]) -> Result<RknnBackend> {
+        let path =
+            std::env::temp_dir().join(format!("rknn-stub-{}-{tag}.rknn", std::process::id()));
+        std::fs::write(&path, artifact).unwrap();
+        let opened = open_path(&path);
         std::fs::remove_file(&path).unwrap();
         opened
     }
@@ -806,6 +824,24 @@ mod tests {
             msg.contains("rknn-stub-") && msg.contains("is empty"),
             "{msg}"
         );
+        assert_eq!(INITS.load(SeqCst), 0);
+    }
+
+    #[test]
+    fn a_directory_as_the_artifact_is_refused_before_the_runtime_sees_it() {
+        let _guard = stubs();
+        let msg = err(open_path(&std::env::temp_dir()));
+        assert!(msg.contains("is not a regular file"), "{msg}");
+        assert_eq!(INITS.load(SeqCst), 0);
+    }
+
+    /// A device that streams without end reports length 0; reading it would
+    /// not return.
+    #[test]
+    fn an_endless_stream_as_the_artifact_is_refused_before_the_runtime_sees_it() {
+        let _guard = stubs();
+        let msg = err(open_path(Path::new("/dev/zero")));
+        assert!(msg.contains("is not a regular file"), "{msg}");
         assert_eq!(INITS.load(SeqCst), 0);
     }
 
