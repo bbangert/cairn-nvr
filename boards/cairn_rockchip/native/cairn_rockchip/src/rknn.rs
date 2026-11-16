@@ -217,14 +217,22 @@ impl RknnBackend {
         model: &Path,
         options: &SessionOptions,
     ) -> Result<Self> {
+        // Stat first: reading a file that large would exhaust a board's memory
+        // before the check after the read ran.
+        let too_big = || anyhow::anyhow!("artifact {} is over 4 GiB", model.display());
+        let on_disk = std::fs::metadata(model)
+            .with_context(|| format!("reading artifact {}", model.display()))?
+            .len();
+        if u32::try_from(on_disk).is_err() {
+            return Err(too_big());
+        }
         let mut bytes = std::fs::read(model)
             .with_context(|| format!("reading artifact {}", model.display()))?;
         // `rknn_init` reads `model` as a file path when size is 0.
         if bytes.is_empty() {
             bail!("artifact {} is empty", model.display());
         }
-        let len = u32::try_from(bytes.len())
-            .with_context(|| format!("artifact {} is over 4 GiB", model.display()))?;
+        let len = u32::try_from(bytes.len()).map_err(|_| too_big())?;
         let mut ctx: sys::Context = 0;
         // SAFETY: `bytes` is `len` bytes, non-zero (so `model` is read as
         // bytes, not a path), and outlives the context (it moves into the

@@ -221,16 +221,19 @@ impl Library {
         // what every program that links it runs too.
         let library = unsafe { libloading::Library::new(path) }
             .with_context(|| format!("loading the RKNN runtime {shown}"))?;
+        // Never dropped, so a failed symbol lookup below does not `dlclose` a
+        // runtime whose initialisers have already run.
+        let library = std::mem::ManuallyDrop::new(library);
         macro_rules! symbol {
             ($name:literal) => {
                 // SAFETY: the type is the C prototype this symbol has in
                 // librknnrt; the pointer is copied out of the `Symbol`, and
-                // `library` is forgotten, not dropped, once all are resolved.
+                // `library` is never dropped, so it stays valid.
                 *unsafe { library.get(concat!($name, "\0").as_bytes()) }
                     .with_context(|| format!("the RKNN runtime {shown} has no {}", $name))?
             };
         }
-        let this = Self {
+        Ok(Self {
             init: symbol!("rknn_init"),
             destroy: symbol!("rknn_destroy"),
             query: symbol!("rknn_query"),
@@ -239,9 +242,7 @@ impl Library {
             outputs_get: symbol!("rknn_outputs_get"),
             outputs_release: symbol!("rknn_outputs_release"),
             set_core_mask: symbol!("rknn_set_core_mask"),
-        };
-        std::mem::forget(library);
-        Ok(this)
+        })
     }
 }
 
