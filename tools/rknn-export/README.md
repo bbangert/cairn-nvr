@@ -236,7 +236,10 @@ were trial builds, not the pinned rungs.
   takes from CMA, and count the 1080p NV12 buffers the 32 MiB
   `rk-dma-heap-cma` pool yields (`heaps.log`, `heapcap.log`).
 - `dec.py` runs K concurrent `mpi_dec_test` decodes with free CMA sampled
-  (`dec.log`).
+  (`dec.log`). That log was taken while `dec.py` still read the decoders'
+  pipes one after another. Its 1080p rows at K = 2 and 4 show the decoders
+  finishing in order, 2.2 s apart, so each waited on a full pipe: read those
+  aggregate rates as a floor. The 2560x1920 pair finished together.
 - `syms.py` checks the exported symbols of librknnrt, librga and
   librockchip_mpp against the calls a board library makes. No log is kept.
 - `cpu_ort.py` times ONNX Runtime on the CPU, for the NPU's margin over it.

@@ -2,6 +2,7 @@
 """K concurrent mpi_dec_test decodes of one clip, CmaFree/MemAvailable sampled at 20 Hz.
 usage: dec.py CLIP FRAMES K [bufmode]   bufmode: hi (default) | i | e"""
 import json, os, subprocess, sys, threading, time, re
+from concurrent.futures import ThreadPoolExecutor
 clip, frames, k = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 bufmode = sys.argv[4] if len(sys.argv) > 4 else None
 def mi():
@@ -21,7 +22,8 @@ env = dict(os.environ, dma_heap_debug="0x3", mpp_buffer_debug="0")
 cmd = ["mpi_dec_test", "-t", "7", "-i", clip, "-n", str(frames), "-v", "f"] + (["-bufmode", bufmode] if bufmode else [])
 t0 = time.time()
 ps = [subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env) for _ in range(k)]
-outs = [p.communicate()[0] for p in ps]
+with ThreadPoolExecutor(k) as ex:   # a child with an unread pipe stalls on a full one
+    outs = list(ex.map(lambda p: p.communicate()[0], ps))
 el = time.time() - t0
 stop[0] = True; th.join()
 after = mi()
