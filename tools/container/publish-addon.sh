@@ -1,18 +1,50 @@
 #!/usr/bin/env bash
-# Mirror deploy/vagus-addon/ to the public add-on repo (branch master —
-# vagus's store fetcher defaults to ref "master"). First run: create the
-# public repo once with `gh repo create bbangert/cairn-addons --public`.
-# The ghcr image itself is pushed by .github/workflows/container.yml; its
-# package must be flipped to public once — vagus pulls anonymously.
+# Mirror repository.yaml and the named add-on directories of
+# deploy/vagus-addon/ (default: cairn) to the public add-on repo (branch
+# master — vagus's store fetcher defaults to ref "master"). An add-on reaches
+# the public repo only when named here, so an unreleased one stays private;
+# directories already published and not named are left as they are.
+#   tools/container/publish-addon.sh [addon-dir ...]
+# First run: create the public repo once with
+# `gh repo create bbangert/cairn-addons --public`. The ghcr images are pushed
+# by .github/workflows/container.yml; each package must be flipped to public
+# once — vagus pulls anonymously.
 set -euo pipefail
 
 REPO="${ADDON_REPO:-git@github.com:bbangert/cairn-addons.git}"
 SRC="$(cd "$(dirname "$0")/../../deploy/vagus-addon" && pwd)"
+[ "$#" -gt 0 ] || set -- cairn
+
+summary=()
+for addon in "$@"; do
+  case "$addon" in
+  "" | . | .. | */*)
+    echo "not an add-on directory name: '$addon'" >&2
+    exit 1
+    ;;
+  esac
+  if [ ! -f "$SRC/$addon/config.yaml" ]; then
+    echo "$addon: no deploy/vagus-addon/$addon/config.yaml" >&2
+    exit 1
+  fi
+  version=$(sed -n 's/^version: "\(.*\)"/\1/p' "$SRC/$addon/config.yaml")
+  if [ -z "$version" ]; then
+    echo "$addon: config.yaml has no quoted version:" >&2
+    exit 1
+  fi
+  summary+=("$addon $version")
+done
+
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 git clone --depth 1 "$REPO" "$WORK/repo"
-rsync -a --delete --exclude .git "$SRC"/ "$WORK/repo"/
+cp "$SRC/repository.yaml" "$WORK/repo/repository.yaml"
+for addon in "$@"; do
+  # --delete scoped to this add-on's directory: stale files inside it go,
+  # sibling add-ons are untouched.
+  rsync -a --delete "$SRC/$addon"/ "$WORK/repo/$addon"/
+done
 cd "$WORK/repo"
 # status --porcelain, not diff --quiet: the first publish into an empty
 # repo (and any later new file) is all untracked additions, which diff
@@ -21,8 +53,9 @@ if [ -z "$(git status --porcelain)" ]; then
   echo "add-on repo already up to date"
   exit 0
 fi
-version=$(sed -n 's/^version: "\(.*\)"/\1/p' cairn/config.yaml)
+joined=$(printf '%s, ' "${summary[@]}")
+joined=${joined%, }
 git add -A
-git commit -m "cairn ${version}: sync from cairn-nvr deploy/vagus-addon"
+git commit -m "${joined}: sync from cairn-nvr deploy/vagus-addon"
 git push origin HEAD:master
-echo "published add-on repo at ${version}"
+echo "published add-on repo: ${joined}"

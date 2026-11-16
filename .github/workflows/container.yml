@@ -1,12 +1,19 @@
 name: Container
 
-# The add-on image (tier1-container plan). Two jobs:
+# The add-on image (tier1-container plan). Three jobs:
 #  - smoke: the amd64 build + boot assertions (tools/container/smoke-x86.sh)
 #    on every PR touching anything the image ships — the devcontainer has no
 #    docker, so CI is where the x86 smoke actually runs.
-#  - publish: the linux/arm64 image to ghcr on a version tag or manual
-#    dispatch. VAGUS-2 pulls anonymously, so the ghcr package must be
-#    flipped to PUBLIC once after the first push (repo settings → packages).
+#  - rockchip-libs: the CAIRN_BOARD=rockchip vendor stage on the same PRs, so
+#    a pinned source that no longer fetches, cross-builds or exports the
+#    symbols the bindings need fails the PR, not a release.
+#  - publish: a linux/arm64 image — generic to ghcr on a version tag, the
+#    board chosen on manual dispatch. A dispatch pushes only when asked:
+#    left alone it builds the full image and uploads it as a `docker load`
+#    tarball, which is how a branch proves it builds and how an unpublished
+#    image reaches a bench board. VAGUS-2 pulls anonymously, so each ghcr
+#    package must be flipped to PUBLIC once after its first push (repo
+#    settings → packages).
 #
 # Actions are pinned to commit SHAs: the publish job holds the registry
 # token, and a mutable tag there would be the one unpinned link in an
@@ -31,10 +38,20 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      board:
+        description: CAIRN_BOARD to build
+        type: choice
+        options: [generic, rockchip]
+        default: generic
+      push:
+        description: Push the image to ghcr
+        type: boolean
+        default: false
 
 # Baseline for every job; publish alone raises itself to packages: write —
-# the smoke job builds and runs PR-authored code and must not hold a token
-# that can push the image vagus pulls anonymously.
+# the PR jobs build (and smoke runs) PR-authored code and must not hold a
+# token that can push the images vagus pulls anonymously.
 permissions:
   contents: read
 
@@ -52,19 +69,38 @@ jobs:
           name: smoke-log
           path: tools/container/smoke-x86.log
 
+  rockchip-libs:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      # No qemu: the stage runs on the build platform and cross-compiles.
+      - run: >-
+          docker buildx build --platform linux/arm64
+          --build-arg CAIRN_BOARD=rockchip --target rockchip-libs .
+
   publish:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    env:
+      # A v* tag publishes generic only: the Rockchip add-on is not released
+      # until its profile has passed its soak, so it is published by dispatch
+      # only.
+      BOARD: ${{ github.event_name == 'workflow_dispatch' && inputs.board || 'generic' }}
+      PUSH: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+      EVENT: ${{ github.event_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # qemu for the arm64 BEAM release stage; the Rust stages cross-compile
-      # natively (D-C3) and never emulate.
+      # qemu for the arm64 BEAM release stage; the Rust and Rockchip stages
+      # cross-compile natively (D-C3) and never emulate.
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - if: env.PUSH == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -72,24 +108,42 @@ jobs:
       # vagus pulls the tag named by config.yaml's `version:`, so a git tag
       # that disagrees with it would publish an image nothing ever pulls —
       # refused here rather than deployed stale.
-      - id: version
+      - id: target
         run: |
-          config_version=$(sed -n 's/^version: "\(.*\)"/\1/p' deploy/vagus-addon/cairn/config.yaml)
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          case "$BOARD" in
+            generic) addon=cairn image=cairn-nvr-aarch64 ;;
+            rockchip) addon=cairn-rockchip image=cairn-nvr-rockchip-aarch64 ;;
+            *) echo "unknown board $BOARD" >&2; exit 1 ;;
+          esac
+          config_version=$(sed -n 's/^version: "\(.*\)"/\1/p' "deploy/vagus-addon/$addon/config.yaml")
+          if [ -z "$config_version" ]; then
+            echo "no version in deploy/vagus-addon/$addon/config.yaml" >&2
+            exit 1
+          fi
+          if [ "$EVENT" = "workflow_dispatch" ]; then
             v="$config_version"
           else
             v="${GITHUB_REF_NAME#v}"
             if [ "$v" != "$config_version" ]; then
-              echo "tag $GITHUB_REF_NAME != config.yaml version $config_version" >&2
+              echo "tag $GITHUB_REF_NAME != $addon/config.yaml version $config_version" >&2
               exit 1
             fi
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$GITHUB_REPOSITORY_OWNER/$image" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/arm64
-          push: true
+          build-args: CAIRN_BOARD=${{ env.BOARD }}
+          push: ${{ env.PUSH == 'true' }}
+          outputs: ${{ env.PUSH != 'true' && 'type=docker,dest=/tmp/cairn-image.tar' || '' }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/cairn-nvr-aarch64:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/cairn-nvr-aarch64:latest
+            ${{ steps.target.outputs.image }}:${{ steps.target.outputs.version }}
+            ${{ steps.target.outputs.image }}:latest
+      - if: env.PUSH != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cairn-image-${{ env.BOARD }}
+          path: /tmp/cairn-image.tar
+          retention-days: 3

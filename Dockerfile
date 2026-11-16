@@ -1,21 +1,29 @@
 # syntax=docker/dockerfile:1
 # The in-VM detection stack as a vagus add-on image (tier1-container plan).
-# Two arch targets:
-#   linux/arm64 — the shipped add-on (QCS6490; QNN/HTP via the dsp: true bind)
-#   linux/amd64 — the x86 smoke build (sw decode, ORT CPU; qnn refuses loudly)
-# Rust artifacts cross-compile on the build host (D-C3); only the BEAM release
-# stage runs under emulation, because BEAM bytecode is arch-neutral and ERTS
-# comes from the arm64 hexpm image.
+# CAIRN_BOARD picks the vendor layer:
+#   generic  — linux/arm64 is the QCS6490 add-on (QNN/HTP via the dsp: true
+#              bind); linux/amd64 is the x86 smoke build (sw decode, ORT CPU;
+#              qnn refuses loudly)
+#   rockchip — linux/arm64 only, the RK3566 add-on: ORT CPU and sw decode;
+#              the MPP and librga userspace is carried, and nothing loads it
+#              yet
+# Rust artifacts and the Rockchip libraries cross-compile on the build host
+# (D-C3); the only compile under emulation is the BEAM release, because BEAM
+# bytecode is arch-neutral and ERTS comes from the arm64 hexpm image.
 #
-# The QAIRT libraries ship under Qualcomm's AI Stack License, which permits
-# object-code redistribution incorporated in an application but not standalone
-# — the wheel is the licensed channel, its notice files must stay beside the
-# libs, and the Qualcomm .so files must not be stripped. Verdict + obligations:
-# .claude/plans/tier1-container/research/qairt-licensing.md.
+# The QAIRT libraries (generic arm64) ship under Qualcomm's AI Stack License,
+# which permits object-code redistribution incorporated in an application but
+# not standalone — the wheel is the licensed channel, its notice files must
+# stay beside the libs, and the Qualcomm .so files must not be stripped.
+# Verdict + obligations: .claude/plans/tier1-container/research/qairt-licensing.md.
 
 ARG ELIXIR_VERSION=1.20.2
 ARG OTP_VERSION=29.0.3
 ARG DEBIAN_TAG=trixie-20260713
+# generic | rockchip. The switch is `FROM vendor-${CAIRN_BOARD}`: any other
+# value names no stage, so BuildKit fails trying to pull vendor-<value> as an
+# image.
+ARG CAIRN_BOARD=generic
 
 # ---------------------------------------------------------------------------
 # Rust artifacts: the two NIFs and the cairn-detect canary, plus (arm64) the
@@ -152,6 +160,121 @@ fi
 EOS
 
 # ---------------------------------------------------------------------------
+# Rockchip vendor userspace (CAIRN_BOARD=rockchip), cross-built from pinned
+# source: MPP (hardware video codec API; Apache-2.0 + MIT) and librga (RGA 2D
+# engine API; Apache-2.0). librknnrt is not built, fetched or copied: its
+# licence does not permit redistribution.
+FROM --platform=$BUILDPLATFORM debian:${DEBIAN_TAG}-slim AS rockchip-libs
+ARG TARGETARCH
+
+# g++ for MPP too, although the library is C: its CMakeLists adds -fPIC and
+# -march only once it has identified the C++ compiler as GNU, and the link
+# fails on non-PIC objects without it. librga carries its own copy of the
+# DRM uapi headers and issues the ioctls itself, so no libdrm is needed.
+RUN <<'EOS'
+set -eux
+[ "$TARGETARCH" = "arm64" ] || exit 0
+apt-get update
+apt-get install -y --no-install-recommends \
+  ca-certificates curl cmake meson ninja-build \
+  gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
+rm -rf /var/lib/apt/lists/*
+EOS
+
+RUN <<'EOS'
+set -eux
+# Always present so the runtime COPYs have a source off arm64.
+mkdir -p /opt/rockchip/lib /opt/rockchip/licenses /dist/models
+[ "$TARGETARCH" = "arm64" ] || exit 0
+curl -fsSL -o /tmp/mpp.tar.gz \
+  https://github.com/rockchip-linux/mpp/archive/c08762ebfadeb4e986d2fed993bc7a54862d3ebe.tar.gz
+echo "82da3d7ea5926021d48fcaf56cde2e6cb39c3eaad11e06f3cf2a9bfbb3133852 /tmp/mpp.tar.gz" | sha256sum -c -
+curl -fsSL -o /tmp/librga.tar.gz \
+  https://github.com/JeffyCN/mirrors/archive/57a1067a246c71fa6c9a355d1668884fda155dd5.tar.gz
+echo "c539db8a4059d13975e12f596fbe6fd0ba818288cc067300c5e00f3a9f0442e0 /tmp/librga.tar.gz" | sha256sum -c -
+mkdir /tmp/mpp /tmp/librga
+tar -xzf /tmp/mpp.tar.gz -C /tmp/mpp --strip-components=1
+tar -xzf /tmp/librga.tar.gz -C /tmp/librga --strip-components=1
+
+# The root path keeps MPP's find_library(mvec) probe in the arm64 sysroot
+# instead of the build host's.
+cat > /tmp/aarch64.cmake <<'EOF'
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+set(CMAKE_C_COMPILER aarch64-linux-gnu-gcc)
+set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
+set(CMAKE_FIND_ROOT_PATH /usr/aarch64-linux-gnu)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+EOF
+cmake -S /tmp/mpp -B /tmp/mpp-out -DCMAKE_TOOLCHAIN_FILE=/tmp/aarch64.cmake \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_TEST=OFF
+# librockchip_mpp alone: not the legacy librockchip_vpu, the static archive
+# or the test utils.
+cmake --build /tmp/mpp-out --target rockchip_mpp -j"$(nproc)"
+cp -a /tmp/mpp-out/mpp/librockchip_mpp.so* /opt/rockchip/lib/
+
+cat > /tmp/aarch64.meson <<'EOF'
+[binaries]
+c = 'aarch64-linux-gnu-gcc'
+cpp = 'aarch64-linux-gnu-g++'
+ar = 'aarch64-linux-gnu-ar'
+strip = 'aarch64-linux-gnu-strip'
+
+[host_machine]
+system = 'linux'
+cpu_family = 'aarch64'
+cpu = 'aarch64'
+endian = 'little'
+EOF
+meson setup /tmp/librga-out /tmp/librga --cross-file /tmp/aarch64.meson \
+  --buildtype=release --prefix=/opt/rockchip --libdir=lib
+meson compile -C /tmp/librga-out
+DESTDIR=/tmp/librga-stage meson install -C /tmp/librga-out
+cp -a /tmp/librga-stage/opt/rockchip/lib/librga.so* /opt/rockchip/lib/
+
+cp /tmp/mpp/LICENSES/Apache-2.0 /opt/rockchip/licenses/mpp-Apache-2.0
+cp /tmp/mpp/LICENSES/MIT /opt/rockchip/licenses/mpp-MIT
+cp /tmp/librga/COPYING /opt/rockchip/licenses/librga-COPYING
+# librga compiles in its own copies of two MIT DRM uapi headers; MIT's notice
+# has to travel with the object code.
+for f in drm_fourcc.h drm_mode.h; do
+  echo "core/3rdparty/libdrm/include/drm/$f:"
+  awk '/\*\//{print; exit} {print}' "/tmp/librga/core/3rdparty/libdrm/include/drm/$f"
+  echo
+done > /opt/rockchip/licenses/librga-libdrm-headers-NOTICE
+
+# The Rust bindings bind these exact names: the ones C callers write
+# (imcheck, wrapbuffer_handle, mpp_buffer_get_fd) are macros or C++-mangled
+# overloads, and importbuffer_fd has mangled overloads beside the extern "C"
+# one, so only an exact unmangled match counts.
+need() {
+  lib=$1
+  shift
+  for sym in "$@"; do
+    aarch64-linux-gnu-nm -D --defined-only "$lib" | awk '{print $NF}' | grep -qxF "$sym" \
+      || { echo "$lib does not export $sym" >&2; exit 1; }
+  done
+}
+need /opt/rockchip/lib/librga.so.2 imcheck_t wrapbuffer_handle_t importbuffer_fd
+need /opt/rockchip/lib/librockchip_mpp.so.1 mpp_buffer_get_fd_with_caller
+EOS
+
+# FP32 YOLOX release exports (Apache-2.0, bytes as Megvii published them):
+# the CPU twins of the tiny and s rungs, whose shipped qdq files are
+# quantized for the HTP.
+RUN <<'EOS'
+set -eux
+[ "$TARGETARCH" = "arm64" ] || exit 0
+base=https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0
+curl -fsSL -o /dist/models/yolox_tiny.onnx "$base/yolox_tiny.onnx"
+echo "427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7 /dist/models/yolox_tiny.onnx" | sha256sum -c -
+curl -fsSL -o /dist/models/yolox_s.onnx "$base/yolox_s.onnx"
+echo "c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063 /dist/models/yolox_s.onnx" | sha256sum -c -
+EOS
+
+# ---------------------------------------------------------------------------
 # The Elixir release, built on the target platform (qemu under buildx for
 # arm64 — BEAM-only work, the NIFs arrive prebuilt from native-build).
 FROM hexpm/elixir:${ELIXIR_VERSION}-erlang-${OTP_VERSION}-debian-${DEBIAN_TAG} AS release-build
@@ -182,15 +305,16 @@ COPY --from=native-build /dist/libcairn_native.so /dist/libcairn_ort.so priv/nat
 RUN mix release
 
 # ---------------------------------------------------------------------------
-FROM debian:${DEBIAN_TAG}-slim AS runtime
+# What every board's runtime shares; the vendor-* stages below add the board.
+FROM debian:${DEBIAN_TAG}-slim AS runtime-base
 
 # Distro FFmpeg 7.1 — the same major.minor the NIFs' rsmpeg feature binds and
 # the same sonames the native-build stage cross-linked against.
-# libyaml-0-2 + libbsd0: fastrpc's libcdsprpc.so links both (YAML_LIBS /
-# BSD_LIBS in its Makefile.am) — without them the QNN stub's dlopen chain
-# fails on arm64 before FastRPC reaches the DSP. procps: four modules
-# (FFmpegPort stall-kill, canary teardown, probe, clip_remux) signal OS
-# processes via `System.cmd("kill", …)`, and slim ships no kill binary —
+# libyaml-0-2 + libbsd0: fastrpc's libcdsprpc.so (generic) links both
+# (YAML_LIBS / BSD_LIBS in its Makefile.am) — without them the QNN stub's
+# dlopen chain fails on arm64 before FastRPC reaches the DSP. procps: four
+# modules (FFmpegPort stall-kill, canary teardown, probe, clip_remux) signal
+# OS processes via `System.cmd("kill", …)`, and slim ships no kill binary —
 # device-proven: the canary LOADED the model on the HTP, then its teardown
 # raised :enoent.
 RUN apt-get update \
@@ -204,6 +328,12 @@ ENV LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8
 ENV PHX_SERVER=true CAIRN_DATA_DIR=/data CAIRN_CONFIG=/config/config.yml
 # ort-load-dynamic builds dlopen the pinned base ORT here at startup.
 ENV ORT_DYLIB_PATH=/opt/ort/libonnxruntime.so.1
+
+COPY --from=ort-libs /opt/ort /opt/ort
+
+# ---------------------------------------------------------------------------
+FROM runtime-base AS vendor-generic
+
 # Node-level QNN facts (runtime.exs → Cairn.Native.Config): the EP plugin
 # location in THIS image and the QCS6490 identity (soc 35, HTP v68 — platform
 # detection fails without them). Inert unless a profile says backend: qnn; on
@@ -212,12 +342,40 @@ ENV CAIRN_QNN_LIBRARY=/opt/qnn/libonnxruntime_providers_qnn.so \
   CAIRN_QNN_SOC_MODEL=35 \
   CAIRN_QNN_HTP_ARCH=68
 
-COPY --from=ort-libs /opt/ort /opt/ort
 COPY --from=ort-libs /opt/qnn /opt/qnn
 COPY --from=native-build /dist/fastrpc/ /opt/qnn/
 RUN echo /opt/ort > /etc/ld.so.conf.d/cairn.conf \
   && echo /opt/qnn >> /etc/ld.so.conf.d/cairn.conf \
   && ldconfig
+
+# ---------------------------------------------------------------------------
+# No CAIRN_QNN_* and no /opt/qnn: this board has no HTP, and runtime.exs
+# merges no node qnn facts when the variables are unset.
+FROM runtime-base AS vendor-rockchip
+ARG TARGETARCH
+
+RUN [ "$TARGETARCH" = "arm64" ] \
+  || { echo "CAIRN_BOARD=rockchip is arm64 only (TARGETARCH=$TARGETARCH)" >&2; exit 1; }
+
+# No extra packages: both libraries link only glibc's own libraries and
+# libstdc++, which the base image has. The ldd check proves it here, on the
+# target platform, rather than at the first dlopen on the board.
+COPY --from=rockchip-libs /opt/rockchip /opt/rockchip
+RUN <<'EOS'
+set -eux
+echo /opt/ort > /etc/ld.so.conf.d/cairn.conf
+echo /opt/rockchip/lib >> /etc/ld.so.conf.d/cairn.conf
+ldconfig
+for lib in /opt/rockchip/lib/librga.so.2 /opt/rockchip/lib/librockchip_mpp.so.1; do
+  ldd "$lib"
+  if ldd "$lib" | grep -q 'not found'; then exit 1; fi
+done
+EOS
+
+COPY --from=rockchip-libs /dist/models/ /app/models/
+
+# ---------------------------------------------------------------------------
+FROM vendor-${CAIRN_BOARD} AS runtime
 
 WORKDIR /app
 COPY --from=release-build /app/_build/prod/rel/cairn ./
@@ -235,7 +393,7 @@ RUN ln -s /data /app/data
 VOLUME ["/data", "/config"]
 EXPOSE 4000
 
-# No USER: the QNN-touching process must run as root to pass the fastrpc
-# nodes' root:root 0600 DAC — the host never chmods them (no udev on Nerves),
-# and vagus add-on containers run as root by design.
+# No USER: on the generic board the QNN-touching process must run as root to
+# pass the fastrpc nodes' root:root 0600 DAC — the host never chmods them (no
+# udev on Nerves), and vagus add-on containers run as root by design.
 CMD ["bin/cairn", "start"]
