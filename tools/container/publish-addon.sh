@@ -32,8 +32,22 @@ for addon in "$@"; do
     echo "$addon: config.yaml has no quoted version:" >&2
     exit 1
   fi
+  # The mirror copies the working tree, so anything uncommitted or ignored
+  # in it (a config.yml with camera credentials, say) would be published.
+  dirty=$(git -C "$SRC" status --porcelain --ignored -- "$addon")
+  if [ -n "$dirty" ]; then
+    echo "$addon: deploy/vagus-addon/$addon differs from HEAD; commit or remove:" >&2
+    echo "$dirty" >&2
+    exit 1
+  fi
   summary+=("$addon $version")
 done
+dirty=$(git -C "$SRC" status --porcelain --ignored -- repository.yaml)
+if [ -n "$dirty" ]; then
+  echo "deploy/vagus-addon/repository.yaml differs from HEAD; commit or remove:" >&2
+  echo "$dirty" >&2
+  exit 1
+fi
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT

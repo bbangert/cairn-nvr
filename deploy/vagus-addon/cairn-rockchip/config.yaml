@@ -13,9 +13,9 @@ arch:
 image: ghcr.io/bbangert/cairn-nvr-rockchip-{arch}
 startup: application
 boot: auto
-# Not the schema default (true): that has the engine exec an init shim the
-# host does not ship. The release's BEAM runs as PID 1; its ffmpeg/port
-# processes are direct children, so reaping needs no init shim.
+# Not the schema default (true): the release's BEAM runs as PID 1 and its
+# ffmpeg/port processes are direct children, so reaping needs no init shim —
+# and the QCS6490 host does not ship the one the default execs.
 init: false
 # host_network per D-C5: NAT-free LAN realism for RTSP cameras, WebRTC and
 # mDNS, and the UI directly on host:4000 (host_network add-ons get no port
@@ -32,7 +32,8 @@ devices:
   # The NPU: a DRM device on this kernel, not /dev/rknpu.
   - /dev/dri/card1
   - /dev/dri/renderD129
-  # Where the frame buffers RGA and the NPU share are allocated.
+  # Where MPP allocates decoded frames, and where the buffers RGA and the NPU
+  # share come from.
   - /dev/dma_heap/system
   - /dev/dma_heap/system-uncached
 map:

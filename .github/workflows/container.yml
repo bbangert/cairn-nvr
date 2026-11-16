@@ -4,9 +4,10 @@ name: Container
 #  - smoke: the amd64 build + boot assertions (tools/container/smoke-x86.sh)
 #    on every PR touching anything the image ships — the devcontainer has no
 #    docker, so CI is where the x86 smoke actually runs.
-#  - rockchip-libs: the CAIRN_BOARD=rockchip vendor stage on the same PRs, so
-#    a pinned source that no longer fetches, cross-builds or exports the
-#    symbols the bindings need fails the PR, not a release.
+#  - rockchip-libs: the Dockerfile stage of that name on the same PRs, so a
+#    pinned source that no longer fetches, cross-builds or exports the
+#    symbols the board NIF will bind fails a PR, not the next Rockchip image
+#    build. The vendor layer's ldd check runs only in that full build.
 #  - publish: a linux/arm64 image — generic to ghcr on a version tag, the
 #    board chosen on manual dispatch. A dispatch pushes only when asked:
 #    left alone it builds the full image and uploads it as a `docker load`
@@ -77,8 +78,7 @@ jobs:
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       # No qemu: the stage runs on the build platform and cross-compiles.
       - run: >-
-          docker buildx build --platform linux/arm64
-          --build-arg CAIRN_BOARD=rockchip --target rockchip-libs .
+          docker buildx build --platform linux/arm64 --target rockchip-libs .
 
   publish:
     if: github.event_name != 'pull_request'
@@ -95,8 +95,9 @@ jobs:
       EVENT: ${{ github.event_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # qemu for the arm64 BEAM release stage; the Rust and Rockchip stages
-      # cross-compile natively (D-C3) and never emulate.
+      # qemu for the arm64 BEAM release and runtime stages; the Rust and
+      # rockchip-libs stages cross-compile on the build host (D-C3) and never
+      # emulate.
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - if: env.PUSH == 'true'
@@ -147,3 +148,12 @@ jobs:
           name: cairn-image-${{ env.BOARD }}
           path: /tmp/cairn-image.tar
           retention-days: 3
+      - env:
+          IMAGE: ${{ steps.target.outputs.image }}
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          if [ "$PUSH" = true ]; then
+            echo "Pushed \`$IMAGE:$VERSION\` and \`:latest\`." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Built \`$IMAGE:$VERSION\` — not pushed; download the \`cairn-image-$BOARD\` artifact." >> "$GITHUB_STEP_SUMMARY"
+          fi

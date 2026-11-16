@@ -183,7 +183,8 @@ EOS
 
 RUN <<'EOS'
 set -eux
-# Always present so the runtime COPYs have a source off arm64.
+# Off arm64 the stage is these empty directories: vendor-rockchip refuses
+# that platform before it copies from here.
 mkdir -p /opt/rockchip/lib /opt/rockchip/licenses /dist/models
 [ "$TARGETARCH" = "arm64" ] || exit 0
 curl -fsSL -o /tmp/mpp.tar.gz \
@@ -237,15 +238,22 @@ cp -a /tmp/librga-stage/opt/rockchip/lib/librga.so* /opt/rockchip/lib/
 cp /tmp/mpp/LICENSES/Apache-2.0 /opt/rockchip/licenses/mpp-Apache-2.0
 cp /tmp/mpp/LICENSES/MIT /opt/rockchip/licenses/mpp-MIT
 cp /tmp/librga/COPYING /opt/rockchip/licenses/librga-COPYING
-# librga compiles in its own copies of two MIT DRM uapi headers; MIT's notice
-# has to travel with the object code.
-for f in drm_fourcc.h drm_mode.h; do
-  echo "core/3rdparty/libdrm/include/drm/$f:"
-  awk '/\*\//{print; exit} {print}' "/tmp/librga/core/3rdparty/libdrm/include/drm/$f"
+# Both libraries compile in their own copies of MIT DRM uapi headers, each
+# with its own copyright holders, and MIT's notice has to travel with the
+# object code. drm.h opens with an author comment, so the cut is the end of
+# the comment holding the permission text, not of the first comment.
+for f in mpp/osal/linux/drm.h mpp/osal/linux/drm_mode.h \
+  librga/core/3rdparty/libdrm/include/drm/drm.h \
+  librga/core/3rdparty/libdrm/include/drm/drm_mode.h \
+  librga/core/3rdparty/libdrm/include/drm/drm_fourcc.h; do
+  echo "$f:"
+  awk '{print} /Permission is hereby granted/{f=1} f&&/\*\//{exit}' "/tmp/$f"
   echo
-done > /opt/rockchip/licenses/librga-libdrm-headers-NOTICE
+done > /opt/rockchip/licenses/drm-uapi-headers-NOTICE
+# A pin bump that reshapes a header must not quietly drop its notice.
+[ "$(grep -c 'Permission is hereby granted' /opt/rockchip/licenses/drm-uapi-headers-NOTICE)" = 5 ]
 
-# The Rust bindings bind these exact names: the ones C callers write
+# The board NIF will bind these exact names: the ones C callers write
 # (imcheck, wrapbuffer_handle, mpp_buffer_get_fd) are macros or C++-mangled
 # overloads, and importbuffer_fd has mangled overloads beside the extern "C"
 # one, so only an exact unmangled match counts.

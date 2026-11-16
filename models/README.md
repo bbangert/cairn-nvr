@@ -43,6 +43,6 @@ Dockerfile's `rockchip-libs` stage and not committed here. The qdq files
 above are quantized for the HTP; on that board's CPU the FP32 files are
 the ones to run.
 
-Paths here are what `priv/profiles/qcs6490-tier1.yml` names
-(`models/…` resolves against the node's working directory — `/app` in
-the image, the repo root in dev).
+The qdq paths are what `priv/profiles/qcs6490-tier1.yml` names; no shipped
+profile names the FP32 pair. `models/…` resolves against the node's working
+directory — `/app` in the image, the repo root in dev.
