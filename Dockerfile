@@ -208,7 +208,7 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 EOF
-cmake -S /tmp/mpp -B /tmp/mpp-out -DCMAKE_TOOLCHAIN_FILE=/tmp/aarch64.cmake \
+cmake -S /tmp/mpp -B /tmp/mpp-out -G Ninja -DCMAKE_TOOLCHAIN_FILE=/tmp/aarch64.cmake \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_TEST=OFF
 # librockchip_mpp alone: not the legacy librockchip_vpu, the static archive
 # or the test utils.
