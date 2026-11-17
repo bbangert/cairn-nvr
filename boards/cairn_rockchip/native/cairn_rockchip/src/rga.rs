@@ -40,6 +40,10 @@ const MAX_TEXT: usize = 160;
 pub const MIN_SCALE: f64 = 1.0 / 16.0;
 pub const MAX_SCALE: f64 = 16.0;
 
+/// RGA2's largest destination per axis. It is also what bounds a slot's
+/// allocation (48 MiB at most) and keeps its size's casts in range.
+pub const MAX_SLOT: usize = 4096;
+
 /// Read once per process: `querystring` builds its text in a process-global
 /// string, so a second call on any thread frees the text a first is still
 /// reading. librga also calls it itself, on its format-refusal paths, which
@@ -158,6 +162,10 @@ impl ChannelOrder {
 /// core's byte stride, 4 on RGA2: for RGB888 a width stride that is a
 /// multiple of 4. A slot's rows are packed, so that is its width.
 fn check_slot(size: InputSize) -> Result<()> {
+    ensure!(
+        (2..=MAX_SLOT).contains(&size.w) && (2..=MAX_SLOT).contains(&size.h),
+        "RGB888 slot {size} is outside RGA2's 2x2 to {MAX_SLOT}x{MAX_SLOT} output"
+    );
     ensure!(
         size.w.is_multiple_of(4),
         "RGB888 width stride {} is not a multiple of 4 (RGA2)",
@@ -429,6 +437,11 @@ mod tests {
     #[test]
     fn what_rga2_alignment_forbids_is_refused() {
         let hd = geometry(1920, 1080);
+        for (w, h) in [(640, 1_000_000), (8192, 640), (640, 0)] {
+            let says = format!("RGB888 slot {w}x{h} is outside RGA2's 2x2 to 4096x4096 output");
+            refused(plan(hd, w, h, ResizePolicy::Stretch), &says);
+        }
+        assert!(check_slot(InputSize::square(MAX_SLOT)).is_ok());
         refused(
             plan(hd, 642, 640, LETTERBOX),
             "RGB888 width stride 642 is not a multiple of 4",

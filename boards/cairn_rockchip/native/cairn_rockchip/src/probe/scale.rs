@@ -2,7 +2,7 @@
 //! rectangle read back under the dma-buf sync and hashed, then the lease let
 //! go, so consecutive samples alternate slots. A sample of a new geometry
 //! gets a new plan and pool. Two output lines: the last plan, and the
-//! timings, hashes and pad check.
+//! timings, hashes and a pad check over every pool.
 //!
 //! `blit_ms` covers the source's import, the blit and the import's release.
 //! `read_ms` covers the sync start, the copy of the content rectangle and the
@@ -71,6 +71,14 @@ fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
     bytes.iter().fold(hash, step)
 }
 
+/// `None` while no pool so far had a pad; a spoiled pad in any pool sticks.
+fn fold_pad(run: Option<bool>, pool: Option<bool>) -> Option<bool> {
+    match (run, pool) {
+        (Some(run), Some(pool)) => Some(run && pool),
+        (run, pool) => run.or(pool),
+    }
+}
+
 fn ms(d: Duration) -> f64 {
     (d.as_secs_f64() * 1e6).round() / 1e3
 }
@@ -96,6 +104,8 @@ struct Run {
     plans: u64,
     /// Over the pools already dropped.
     exhausted: u64,
+    /// Over the pools already dropped, by [`fold_pad`].
+    pad_intact: Option<bool>,
     frames: u64,
     blit_ms: Vec<f64>,
     read_ms: Vec<f64>,
@@ -135,6 +145,7 @@ impl Scaler {
         if current != Some(geometry) {
             if let Some(old) = self.run.planned.take() {
                 self.run.exhausted += old.pool.stats().exhausted;
+                self.run.pad_intact = fold_pad(self.run.pad_intact, self.pad_intact(&old)?);
             }
             let plan = Plan::new(geometry, self.scale.size, self.scale.policy)?;
             let order = ChannelOrder::Rgb;
@@ -186,7 +197,7 @@ impl Scaler {
             return Ok(None);
         }
         let leases: Vec<_> = (0..SLOTS).filter_map(|_| planned.pool.acquire()).collect();
-        ensure!(leases.len() == SLOTS, "a slot is still held after the run");
+        ensure!(leases.len() == SLOTS, "a slot is still held");
         let mut intact = true;
         for lease in &leases {
             intact &= lease.slot().read(|bytes| {
@@ -202,7 +213,7 @@ impl Scaler {
     pub(super) fn report(mut self) -> Result<Vec<Value>> {
         let mut plan =
             json!({"event": "scale_plan", "rga": self.rga.version(), "plans": self.run.plans});
-        let (mut pad_intact, mut exhausted) = (None, self.run.exhausted);
+        let (mut pad_intact, mut exhausted) = (self.run.pad_intact, self.run.exhausted);
         if let Some(planned) = &self.run.planned {
             let p = *planned.blitter.plan();
             let rect = |r: crate::rga::sys::Rect| [r.x, r.y, r.width, r.height];
@@ -212,7 +223,7 @@ impl Scaler {
                 "dst_rect": rect(p.dst), "scale": [p.scale.0, p.scale.1],
             });
             exhausted += planned.pool.stats().exhausted;
-            pad_intact = self.pad_intact(planned)?;
+            pad_intact = fold_pad(pad_intact, self.pad_intact(planned)?);
         }
         let line = json!({
             "event": "scale", "every": self.scale.every, "sampled": self.run.blit_ms.len(),
@@ -236,5 +247,12 @@ mod tests {
         let expected = json!({"count": 100, "p50": 51.0, "p99": 99.0, "max": 100.0});
         assert_eq!(summary(&mut samples), expected);
         assert_eq!(summary(&mut []), json!({"count": 0}));
+        assert_eq!([None, None].into_iter().fold(None, fold_pad), None);
+        let pools = [Some(true), None, Some(false), Some(true)];
+        assert_eq!(pools.into_iter().fold(None, fold_pad), Some(false));
+        assert_eq!(
+            [None, Some(true)].into_iter().fold(None, fold_pad),
+            Some(true)
+        );
     }
 }
