@@ -477,6 +477,12 @@ impl Frame {
             && fmt & (sys::FRAME_FBC_MASK | sys::FRAME_TILE_FLAG) == 0
     }
 
+    /// Whether the stream signals full-range YUV. Unspecified (no VUI) counts
+    /// as limited, which is how the software path's swscale converts it.
+    pub fn is_full_range(&self) -> bool {
+        self.get(self.context.library.frame_get_color_range) == sys::RANGE_FULL
+    }
+
     /// The picture's dma-buf. MPP owns the descriptor: it is valid only while
     /// this frame lives, and is not to be closed.
     pub fn fd(&self) -> RawFd {
@@ -516,6 +522,7 @@ pub(crate) mod tests {
         geometry: Geometry,
         pts: i64,
         fmt: u32,
+        range: u32,
         info_change: u32,
         errinfo: u32,
         discard: u32,
@@ -538,6 +545,10 @@ pub(crate) mod tests {
         edit(StubFrame::default(), |f| {
             (f.geometry, f.pts, f.buffer) = (geometry, pts, 0x7000)
         })
+    }
+
+    pub(crate) fn full_range(pts: i64) -> StubFrame {
+        edit(picture(pts), |f| f.range = sys::RANGE_FULL)
     }
 
     fn info(width: u32, height: u32, buf_size: usize) -> StubFrame {
@@ -700,6 +711,7 @@ pub(crate) mod tests {
         get_eos -> u32: |f| f.eos;
         get_info_change -> u32: |f| f.info_change;
         get_fmt -> u32: |f| f.fmt;
+        get_color_range -> u32: |f| f.range;
         get_pts -> i64: |f| f.pts;
         get_buffer -> sys::Buffer: |f| ptr::without_provenance_mut(f.buffer);
     }
@@ -761,6 +773,7 @@ pub(crate) mod tests {
             frame_get_eos: get_eos,
             frame_get_info_change: get_info_change,
             frame_get_fmt: get_fmt,
+            frame_get_color_range: get_color_range,
             frame_get_pts: get_pts,
             frame_get_buf_size: get_buf_size,
             frame_get_buffer: get_buffer,
@@ -949,6 +962,17 @@ pub(crate) mod tests {
                 !decoder.next_frame().unwrap().unwrap().is_nv12(),
                 "{fmt:#x}"
             );
+        }
+    }
+
+    #[test]
+    fn only_the_jpeg_range_is_full_and_unspecified_is_limited() {
+        let _guard = stubs();
+        let mut decoder = open();
+        for (range, full) in [(0, false), (1, false), (2, true)] {
+            queue(&[edit(picture(0), |f| f.range = range)]);
+            let frame = decoder.next_frame().unwrap().unwrap();
+            assert_eq!(frame.is_full_range(), full, "range {range}");
         }
     }
 

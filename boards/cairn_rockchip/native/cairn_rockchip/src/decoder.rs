@@ -163,7 +163,8 @@ impl Scaler for Rk {
     }
 
     fn blit(&mut self, plan: &Plan, frame: &Frame, lease: &mut Lease<Slot>) -> anyhow::Result<()> {
-        Blitter::new(self.rga, *plan).blit(frame.fd(), frame.geometry(), lease)
+        let (fd, geometry) = (frame.fd(), frame.geometry());
+        Blitter::new(self.rga, *plan).blit(fd, geometry, frame.is_full_range(), lease)
     }
 
     fn handle(lease: Lease<Slot>, plan: &Plan, downloads: &Timings) -> Self::Handle {
@@ -619,8 +620,9 @@ mod tests {
 
     const LETTERBOX: ResizePolicy = ResizePolicy::Letterbox { pad: 114 };
 
-    /// Slots of nothing, and a blit that fails when told to.
-    struct Fake(bool);
+    /// Slots of nothing, a blit that fails when told to, and the range of
+    /// each picture it blitted.
+    struct Fake(bool, Vec<bool>);
 
     impl Allocator for Fake {
         type Slot = ();
@@ -635,8 +637,9 @@ mod tests {
         fn pool(&mut self, _: &Plan) -> anyhow::Result<Pool<()>> {
             Pool::new(POOL_SLOTS, self)
         }
-        fn blit(&mut self, _: &Plan, _: &Frame, _: &mut Lease<()>) -> anyhow::Result<()> {
+        fn blit(&mut self, _: &Plan, frame: &Frame, _: &mut Lease<()>) -> anyhow::Result<()> {
             ensure!(!self.0, "improcess returned -1");
+            self.1.push(frame.is_full_range());
             Ok(())
         }
         fn handle(lease: Lease<()>, _: &Plan, _: &Timings) -> Lease<()> {
@@ -648,7 +651,7 @@ mod tests {
         let mpp = MppDecoder::with_library(stub::library()).unwrap();
         stub::calls();
         let target = (InputSize::square(640), LETTERBOX);
-        Stream::new("cam".into(), mpp, Fake(blit_fails), target)
+        Stream::new("cam".into(), mpp, Fake(blit_fails, Vec::new()), target)
     }
 
     fn err<T>(result: Result<T>) -> DecodeError {
@@ -760,6 +763,17 @@ mod tests {
             sample(&mut s, 90).is_some(),
             "dropping a lease frees its slot"
         );
+    }
+
+    #[test]
+    fn a_range_change_between_two_pictures_of_one_geometry_reaches_the_next_blit() {
+        let _guard = stub::stubs();
+        let mut s = stream(false);
+        for frame in [stub::picture(1), stub::full_range(2), stub::picture(3)] {
+            stub::queue(&[frame]);
+            assert!(s.decode_au(&[1], 1, true).unwrap().1.is_some());
+        }
+        assert_eq!(s.scaler.1, [false, true, false]);
     }
 
     #[test]

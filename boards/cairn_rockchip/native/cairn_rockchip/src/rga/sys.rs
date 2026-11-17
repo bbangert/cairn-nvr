@@ -25,6 +25,11 @@ pub const STATUS_FAILED: c_int = 0;
 
 pub const SYNC: c_int = 1 << 19;
 
+/// `IM_COLOR_SPACE_MODE`'s YUV-to-RGB entries, read from the destination
+/// buffer; 0 leaves the choice to librga.
+pub const YUV_TO_RGB_BT601_LIMIT: c_int = 1;
+pub const YUV_TO_RGB_BT601_FULL: c_int = 2;
+
 /// `querystring`'s `RGA_VERSION`.
 pub const INFO_VERSION: c_int = 1;
 
@@ -63,7 +68,8 @@ pub struct HandleParam {
 }
 
 /// `rga_buffer_t`, passed and returned by value. Only [`Buffer::EMPTY`] and
-/// `wrapbuffer_handle_t` make one here; the fields past `format` are opaque.
+/// `wrapbuffer_handle_t` make one here; the fields past `color_space_mode`
+/// are opaque.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Buffer {
@@ -75,9 +81,10 @@ pub struct Buffer {
     pub wstride: c_int,
     pub hstride: c_int,
     pub format: c_int,
-    /// `color_space_mode`, the `global_alpha` union, `rd_mode`, `color`,
-    /// `colorkey_range`, `nn`, `rop_code`.
-    pub rest: [c_int; 13],
+    pub color_space_mode: c_int,
+    /// The `global_alpha` union, `rd_mode`, `color`, `colorkey_range`, `nn`,
+    /// `rop_code`.
+    pub rest: [c_int; 12],
     pub handle: Handle,
 }
 
@@ -91,8 +98,9 @@ const _: () = {
     assert!(offset_of!(Buffer, wstride) == 28);
     assert!(offset_of!(Buffer, hstride) == 32);
     assert!(offset_of!(Buffer, format) == 36);
-    // `color_space_mode` 40 through `rop_code` 88.
-    assert!(offset_of!(Buffer, rest) == 40);
+    assert!(offset_of!(Buffer, color_space_mode) == 40);
+    // The `global_alpha` union 44 through `rop_code` 88.
+    assert!(offset_of!(Buffer, rest) == 44);
     assert!(offset_of!(Buffer, handle) == 92);
     assert!(size_of::<Rect>() == 16);
     assert!(size_of::<HandleParam>() == 12);

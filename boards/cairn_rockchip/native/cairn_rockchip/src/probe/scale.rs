@@ -149,7 +149,7 @@ impl Scaler {
             return Ok(());
         };
         let started = Instant::now();
-        blitter.blit(frame.fd(), geometry, &mut lease)?;
+        blitter.blit(frame.fd(), geometry, frame.is_full_range(), &mut lease)?;
         let blitted = Instant::now();
         let (inner, row) = (blitter.plan().fit.inner, self.scale.size.w * 3);
         let content = &mut self.run.content;
