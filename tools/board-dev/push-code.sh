@@ -7,8 +7,8 @@
 #
 # What rides: every app's ebin from the assembled release (deps included —
 # pushing "just cairn" would miss a dep bump silently), cairn's priv —
-# priv/profiles, priv/repo AND priv/static — plus runtime.exs, sys.config
-# and the boot artifacts below. What cannot ride: NIFs/canary (arch-native),
+# priv/profiles, priv/repo AND priv/static — and a board app's (its
+# profiles), plus runtime.exs, sys.config and the boot artifacts below. What cannot ride: NIFs/canary (arch-native),
 # ERTS, apt packages, Dockerfile-level anything.
 #
 # priv/static used to be excluded so a dev build could not clobber the
@@ -67,8 +67,8 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
 (cd "$REL" && tar czf "$STAGE/push.tgz" \
-  --exclude='*.so' --exclude='lib/cairn-*/priv/native' \
-  lib/*/ebin lib/cairn-*/priv \
+  --exclude='*.so' --exclude='lib/cairn*/priv/native' \
+  lib/*/ebin lib/cairn*/priv \
   releases/*/runtime.exs releases/*/sys.config \
   releases/*/start.boot releases/*/start.script releases/*/cairn.rel releases/*/consolidated)
 
