@@ -7,6 +7,7 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
     import Membrane.ChildrenSpec
 
     alias Cairn.Config
+    alias Cairn.Config.Profile
     alias Cairn.Native.Drain
     alias Cairn.Pipeline.DetectChain
     alias Cairn.Rockchip.{DecodeScale, Download}
@@ -80,18 +81,118 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
              )
     end
 
-    test "the shipped qnn profile is skipped, so naming it is an unknown profile" do
-      assert {:ok, config, _warnings} = Config.from_map(%{"data_dir" => "tmp/cfg_test"})
-      refute Map.has_key?(config.profiles, "qcs6490-tier1")
-      assert Map.has_key?(config.profiles, "rk3566-lowfps")
+    # The generic board's rows are paired in config_test.exs; this is rknn's.
+    test "the rknn capability booleans match the plugin's source" do
+      [[_, fused, dynamic]] =
+        Regex.scan(
+          ~r/Self::Rknn => Capabilities \{\s*supports_fused_nms: (\w+),\s*supports_dynamic_shapes: (\w+),/,
+          File.read!("plugins/cairn-detect/src/infer/backend.rs")
+        )
+
+      caps = Profile.capabilities("rknn")
+      assert caps.fused_nms == (fused == "true")
+      assert caps.dynamic_shapes == (dynamic == "true")
+    end
+
+    test "the release's profiles are the base's and the board's; qcs6490-tier1 is not one" do
+      assert {:ok, config, []} = Config.from_map(%{"data_dir" => "tmp/cfg_test"})
+      assert Enum.sort(Map.keys(config.profiles)) == ["generic-ort", "rk3566-tier1"]
 
       assert {:error, errors} = Config.from_map(map("qcs6490-tier1", []))
       assert Enum.any?(errors, &(&1 =~ ~s(unknown profile "qcs6490-tier1")))
     end
 
-    test "a shipped rknn profile without a twin is a twin error" do
-      assert {:error, errors} = Config.from_map(map("rk3566-lowfps", []))
-      assert twin_error?(errors)
+    @rungs [
+      {"c61524bca75d6f5df3fd255c8f27b5eaca544c94cbd05d4ce835a82a48733282", "yolox_s_640_i8.rknn",
+       "models/yolox_s.onnx", 640, 9.7},
+      {"cd146e38777ea0c38e20c114c4166fb9b7553c379e20651a999167acb0bb044a",
+       "yolox_tiny_640_i8.rknn", "models/yolox_tiny_640.onnx", 640, 11.96},
+      {"832df464bc84259d8d612bb7e9d4f6dd8573acb94f9847e051cce4c438c78304",
+       "yolox_tiny_416_i8.rknn", "models/yolox_tiny.onnx", 416, 23.2}
+    ]
+
+    test "rk3566-tier1: three fetched Apache rungs with their twins, and the store's set" do
+      assert {:ok, config, []} = Config.from_map(%{"data_dir" => "tmp/cfg_test"})
+      profile = config.profiles["rk3566-tier1"]
+      assert %{tier: 1, experimental: true, backend: "rknn", decoder: "rkmpp"} = profile
+      assert profile.supported_cameras == 12
+      url = "https://github.com/bbangert/cairn-nvr/releases/download/models-rk3566-1/"
+      assert length(profile.model_ladder) == length(@rungs)
+
+      for {rung, {sha256, file, twin, size, budget}} <- Enum.zip(profile.model_ladder, @rungs) do
+        assert %{sha256: ^sha256, model: %{"onnx" => ^twin}, input_size: ^size} = rung
+        assert rung.url == url <> file
+        assert rung.engine_budget == budget
+        assert rung.pack == nil
+      end
+
+      entries = Profile.fetch_entries(Config.release_profile_dirs())
+
+      assert Enum.map(entries, &{&1.sha256, &1.name}) ==
+               Enum.map(@rungs, &{elem(&1, 0), elem(&1, 1)})
+    end
+
+    test "rk3566-tier1 runs on the store's files, and is refused while one is missing" do
+      verified = fn _sha256 -> {:ok, @stub_rknn} end
+
+      assert {:ok, config, _warnings} =
+               Config.from_map(map("rk3566-tier1", []), artifact: verified)
+
+      assert {:ok, %{model: @stub_rknn, cpu_twin: "models/yolox_s.onnx", input_size: 640}} =
+               Config.native_model_config(config)
+
+      [{tiny640, _, _, _, _} | _] = tl(@rungs)
+
+      state = fn sha256 ->
+        if sha256 == tiny640, do: {:missing, "timeout"}, else: verified.(sha256)
+      end
+
+      assert {:error, [error]} = Config.from_map(map("rk3566-tier1", []), artifact: state)
+
+      assert error ==
+               "plugin det: profile rk3566-tier1 needs yolox_tiny_640_i8.rknn (ladder rung 2), " <>
+                 "not downloaded yet: the last fetch failed: timeout — the download is retried " <>
+                 "until it succeeds; no camera can run on this group before then"
+    end
+
+    # Rule 2 of the capability table, which needs rknn on the menu.
+    test "rknn plus an undocumented conversion demands experimental: true, as a boolean" do
+      dir = "test/support/fixtures/profiles/rknn-caps-bad"
+      assert {:error, errors} = Config.from_map(map("none", [dir]))
+
+      # The family the operator wrote, not its canonical: "undocumented for
+      # yolov8" would contradict the table's own yolov8 row.
+      for {name, family} <- [
+            {"rknn-unverified", "rfdetr"},
+            {"rknn-truthy-experimental", "rfdetr"},
+            {"rknn-yolo26", "yolo26"},
+            {"rknn-yolo26split", "yolo26split"}
+          ] do
+        message = "profile #{name}: rknn conversion is undocumented for model_profile #{family} "
+        assert Enum.any?(errors, &(&1 =~ message and &1 =~ "declare experimental: true"))
+      end
+
+      assert Enum.any?(
+               errors,
+               &(&1 =~ "profile rknn-truthy-experimental: experimental must be true or false")
+             )
+
+      fused = {"fusednet", %{families: [], nms: :fused, rknn_conversion: :documented}}
+      acc = %{errors: [], warnings: []}
+
+      assert %{errors: [_error]} =
+               Profile.check_capabilities(acc, "s", "rknn", true, fused)
+    end
+
+    test "the acknowledgement, or a documented family, satisfies rule 2" do
+      dir = "test/support/fixtures/profiles/rknn-caps"
+
+      assert {:ok, config, []} =
+               Config.from_map(%{"data_dir" => "tmp/cfg_test", "profile_dirs" => [dir]})
+
+      assert config.profiles["rknn-acknowledged"].experimental
+      refute config.profiles["rknn-documented"].experimental
+      refute config.profiles["rknn-split-documented"].experimental
     end
 
     test "rknn needs a twin: none is an error, a missing file a warning" do

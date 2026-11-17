@@ -18,8 +18,9 @@ defmodule Cairn.Board.Generic do
   @impl true
   def decoders, do: ~w(auto vaapi qsv nvdec v4l2 videotoolbox sw)
 
-  # The host-side mirror of `BackendKind::capabilities` in
-  # `plugins/cairn-detect/src/infer/backend.rs`, whose rows carry the evidence.
+  # The host-side mirror of `BackendKind::capabilities`' ort and qnn rows in
+  # `plugins/cairn-detect/src/infer/backend.rs`, whose rows carry the evidence
+  # (rknn's is `Cairn.Rockchip.Board`'s).
   # Claims, not probes: config load answers them with no engine running and,
   # for a profile written ahead of its hardware, no device attached.
   #
@@ -33,16 +34,14 @@ defmodule Cairn.Board.Generic do
   # file the host cannot open, so `docs/profile-authoring.md` says it instead.
   #
   # `cpu_twin` has no Rust mirror — the baseline is the host's concern — and
-  # is false on every row: the CPU baseline runs qnn's QDQ `.onnx` itself,
-  # and `rknn` here is parse-only — it stays so the shipped rknn profiles
-  # parse behind `experimental:`, but no engine in a generic release runs it,
-  # so nothing would read a twin. `Cairn.Rockchip.Board` is where `rknn`
+  # is false on both rows: the CPU baseline runs qnn's QDQ `.onnx` itself.
+  # No `rknn`: no engine in a generic release runs it, so a profile naming it
+  # is refused with this board's name. `Cairn.Rockchip.Board` is where `rknn`
   # executes.
   @impl true
   def backends do
     %{
       "ort" => %{artifact: "onnx", fused_nms: true, dynamic_shapes: true, cpu_twin: false},
-      "rknn" => %{artifact: "rknn", fused_nms: false, dynamic_shapes: false, cpu_twin: false},
       "qnn" => %{artifact: "qnn", fused_nms: false, dynamic_shapes: false, cpu_twin: false}
     }
   end
@@ -59,6 +58,7 @@ defmodule Cairn.Board.Generic do
   @impl true
   def artifacts(_context), do: []
 
+  # The QCS6490's ladder: it names `qnn`, which the Rockchip board refuses.
   @impl true
-  def profiles_dir, do: nil
+  def profiles_dir, do: Application.app_dir(:cairn, "priv/profiles/generic")
 end

@@ -8,6 +8,7 @@ defmodule Cairn.ArtifactsTest do
 
   alias Cairn.Artifacts
   alias Cairn.Artifacts.{Fetcher, HTTP}
+  alias Cairn.Config.Profile
 
   @wait 2_000
   @content "the runtime library"
@@ -76,6 +77,9 @@ defmodule Cairn.ArtifactsTest do
 
   defp file(ctx), do: Path.join(ctx.dir, @sha256)
 
+  defp restore_env(env, nil), do: System.delete_env(env)
+  defp restore_env(env, value), do: System.put_env(env, value)
+
   # Queues behind the fetcher's pass in progress, if any.
   defp refute_attempted(ctx) do
     :sys.get_state(ctx.fetcher)
@@ -83,35 +87,45 @@ defmodule Cairn.ArtifactsTest do
   end
 
   describe "the store at start" do
-    test "a valid file is kept, not fetched and not hashed again; a new want/2 fetches", ctx do
+    # A rung's entry has no backend: missing, it gates nothing here, and the
+    # config reads it by hash.
+    test "a valid file is kept and not fetched; one without a backend gates none", ctx do
       File.write!(file(ctx), @content)
-      start_store(ctx, [artifact()])
-      start_fetcher(ctx, writes_named(["b"]))
+      start_store(ctx, [artifact(), named("b")])
 
       assert Artifacts.unusable(ctx.store) == %{}
       assert Artifacts.path(String.upcase(@sha256), ctx.store) == file(ctx)
-      refute_attempted(ctx)
-      File.write!(file(ctx), "junk")
-      Artifacts.want([artifact()], ctx.store)
-      :sys.get_state(ctx.store)
-      assert Artifacts.path(@sha256, ctx.store) == file(ctx)
-      refute_attempted(ctx)
-      Artifacts.want([named("b")], ctx.store)
+      assert Artifacts.state(@sha256, ctx.store) == {:ok, file(ctx)}
+      assert Artifacts.state(sha_of("b"), ctx.store) == {:missing, nil}
+      assert Artifacts.state(sha_of("c"), ctx.store) == {:missing, :unlisted}
+      assert Artifacts.name(String.upcase(@sha256), ctx.store) == "lib.so"
+      assert Artifacts.name(sha_of("b"), ctx.store) == "b"
+
+      assert [sha_of("c"), "../x", @sha256] |> Enum.map(&Artifacts.name(&1, ctx.store)) == [
+               nil,
+               nil,
+               "lib.so"
+             ]
+
+      assert Artifacts.name(@sha256, :no_such_store) == nil
+      start_fetcher(ctx, writes_named(["b"]))
       assert_receive {:attempt, 1, %{name: "b"}, _unusable}, @wait
       assert_receive :reloaded, @wait
-      assert Artifacts.missing(ctx.store) == []
+      refute_attempted(ctx)
+      assert Artifacts.state(sha_of("b"), ctx.store) == {:ok, Path.join(ctx.dir, sha_of("b"))}
     end
 
     test "with no store nothing is known; a corrupt file is deleted, then fetched", ctx do
       assert Artifacts.unusable(ctx.store) == %{}
       assert Artifacts.missing(ctx.store) == []
       assert Artifacts.path(@sha256, ctx.store) == nil
+      assert Artifacts.state(@sha256, ctx.store) == {:missing, :not_started}
 
       File.write!(file(ctx), "not it")
       start_store(ctx, [artifact()])
       refute File.exists?(file(ctx))
       assert %{"rknn" => [%{name: "lib.so", failure: nil}]} = Artifacts.unusable(ctx.store)
-      assert Artifacts.path(@sha256, ctx.store) == nil
+      assert Artifacts.state(@sha256, ctx.store) == {:missing, nil}
 
       start_fetcher(ctx, writes(@content))
       assert_receive {:attempt, 1, %{url: "https://h/lib.so"}, _unusable}, @wait
@@ -132,7 +146,7 @@ defmodule Cairn.ArtifactsTest do
                Artifacts.unusable(ctx.store)
 
       assert Artifacts.unusable(:"#{ctx.store}_never") == %{}
-      assert Artifacts.path(@sha256, ctx.store) == nil
+      assert Artifacts.state(@sha256, ctx.store) == {:missing, :restarting}
       start_store(ctx, [artifact()])
       assert_receive {:"$gen_cast", :reload}, @wait
       assert Artifacts.path(@sha256, ctx.store) == file(ctx)
@@ -175,14 +189,75 @@ defmodule Cairn.ArtifactsTest do
       refute_attempted(ctx)
     end
 
-    test "want/2 drops env:, and a malformed entry is ignored", ctx do
-      pid = start_store(ctx, [artifact(%{size: "7"}), artifact(%{size: 0}), artifact(%{env: :x})])
+    test "a malformed entry is ignored", ctx do
+      bad = [
+        artifact(%{size: "7"}),
+        artifact(%{size: 0}),
+        artifact(%{env: :x}),
+        :junk,
+        %{name: "x"}
+      ]
+
+      start_store(ctx, bad ++ [artifact(%{sha256: "not a hash"})])
       assert Artifacts.missing(ctx.store) == []
-      Artifacts.want([:junk, %{name: "x"}, artifact(%{env: @env})], ctx.store)
-      :sys.get_state(ctx.store)
-      assert System.get_env(@env) == nil
-      assert [%{name: "lib.so"}] = Artifacts.missing(ctx.store)
-      assert Process.whereis(ctx.store) == pid
+    end
+
+    # The default is the release's: whatever this board's profiles fetch.
+    test "without artifacts:, the set is the board's and its release profiles' rungs", ctx do
+      board = Cairn.Board.module()
+
+      expected =
+        board.artifacts(%{}) ++ Profile.fetch_entries(Cairn.Config.release_profile_dirs())
+
+      envs = for %{env: env} <- expected, do: {env, System.get_env(env)}
+      on_exit(fn -> Enum.each(envs, fn {env, value} -> restore_env(env, value) end) end)
+
+      opts = [name: ctx.store, dir: ctx.dir, fetcher: ctx.fetcher]
+      start_supervised!(%{id: ctx.store, start: {Artifacts, :start_link, [opts]}})
+
+      assert Enum.sort(Enum.map(Artifacts.missing(ctx.store), & &1.sha256)) ==
+               Enum.sort(Enum.map(expected, &String.downcase(&1.sha256)))
+
+      assert Artifacts.state(sha_of("none"), ctx.store) == {:missing, :unlisted}
+    end
+
+    test "the Rockchip profile's three rungs, from this repo's models release" do
+      release = "https://github.com/bbangert/cairn-nvr/releases/download/models-rk3566-1/"
+      entries = Profile.fetch_entries(["boards/cairn_rockchip/priv/profiles"])
+
+      assert Enum.map(entries, & &1.name) ==
+               ~w(yolox_s_640_i8.rknn yolox_tiny_640_i8.rknn yolox_tiny_416_i8.rknn)
+
+      for entry <- entries do
+        assert entry.sha256 =~ ~r/\A[0-9a-f]{64}\z/
+        assert entry.url == release <> entry.name
+      end
+    end
+
+    test "fetch_entries/1 takes each well-formed fetched rung once, skipping the rest" do
+      dir = Path.join(System.tmp_dir!(), "cairn_fetch_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+      sha = String.upcase(@sha256)
+
+      File.write!(Path.join(dir, "a.yml"), """
+      model_ladder:
+        - {sha256: #{sha}, url: "https://h/m/x.rknn?sig=1"}
+        - {sha256: #{sha}, url: "https://h/m/x.rknn?sig=1"}
+        - {sha256: #{sha}, url: "http://h/x.rknn"}
+        - {sha256: #{sha}, url: "https://u:p@h/x.rknn"}
+        - {sha256: #{sha}, url: "https://h/p.rknn", pack: p}
+        - {sha256: abc, url: "https://h/y.rknn"}
+        - {url: "https://h/z.rknn"}
+      """)
+
+      File.write!(Path.join(dir, "b.yml"), "model_ladder: [")
+      File.write!(Path.join(dir, "c.yml"), "model_ladder: {sha256: #{sha}}")
+      File.write!(Path.join(dir, "d.yml"), "model_ladder: [junk, [#{sha}]]")
+
+      assert Profile.fetch_entries([dir]) == [
+               %{name: "x.rknn", url: "https://h/m/x.rknn?sig=1", sha256: @sha256}
+             ]
     end
   end
 
@@ -334,17 +409,18 @@ defmodule Cairn.ArtifactsTest do
       stop_supervised!(ctx.fetcher)
     end
 
+    # A backoff the test never waits out: only the restart attempts again.
     test "after_boot: true holds until boot_done/1, and a restart does not hold again", ctx do
       start_store(ctx, [artifact()])
-      pid = start_fetcher(ctx, writes_named([@content, "b"]), after_boot: true)
+      fails = fn _n, _path -> {:error, :down} end
+      opts = [after_boot: true, initial_backoff_ms: 60_000, max_backoff_ms: 60_000]
+      pid = start_fetcher(ctx, fails, opts)
       GenServer.cast(ctx.fetcher, :work)
       refute_attempted(ctx)
       Fetcher.boot_done(ctx.fetcher)
       assert_receive {:attempt, 1, _artifact, _unusable}, @wait
-      assert_receive :reloaded, @wait
       Process.exit(pid, :kill)
-      Artifacts.want([named("b")], ctx.store)
-      assert_receive {:attempt, 2, %{name: "b"}, _unusable}, @wait
+      assert_receive {:attempt, 2, _artifact, _unusable}, @wait
     end
 
     test "restarted after boot, it owes a reload: the last one's may have been refused", ctx do

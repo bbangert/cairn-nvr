@@ -147,7 +147,7 @@ defmodule Cairn.Rockchip.Board do
   end
 
   @impl true
-  def profiles_dir, do: nil
+  def profiles_dir, do: Application.app_dir(:cairn_rockchip, "priv/profiles")
 
   defp generic(key),
     do: :cairn_rockchip |> Application.fetch_env!(:generic) |> Keyword.fetch!(key)

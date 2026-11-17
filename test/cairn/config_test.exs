@@ -10,14 +10,22 @@ defmodule Cairn.ConfigTest do
     def profiles_dir, do: "test/support/fixtures/profiles/board"
 
     def preflight,
-      do: %{backends: %{"rknn" => "no /dev/rknpu"}, decoders: %{"vaapi" => "no /dev/dri"}}
+      do: %{backends: %{"qnn" => "no /dev/fastrpc"}, decoders: %{"vaapi" => "no /dev/dri"}}
   end
 
   # The Rockchip board's preflight when its NIF did not load.
   defmodule NifBoard do
     def name, do: "nif"
     def profiles_dir, do: "test/support/fixtures/profiles/board"
-    def preflight, do: %{backends: %{"rknn" => "the board NIF did not load (:x)"}, decoders: %{}}
+    def preflight, do: %{backends: %{"qnn" => "the board NIF did not load (:x)"}, decoders: %{}}
+  end
+
+  # A board whose own profile dir is the test's: a release dir, where a rung
+  # may name a file to fetch.
+  defmodule FetchBoard do
+    def name, do: "fetch"
+    def profiles_dir, do: Process.get(:release_dir)
+    def preflight, do: %{backends: %{}, decoders: %{}}
   end
 
   @valid_fixture "test/support/fixtures/configs/valid.yml"
@@ -1245,8 +1253,8 @@ defmodule Cairn.ConfigTest do
     @shadow_dir "test/support/fixtures/profiles/shadow"
     @bad_dir "test/support/fixtures/profiles/bad"
 
-    # `rk-test` is an experimental rknn profile, so the group acknowledges the
-    # stubbed backend; an ort profile ignores the key.
+    # `rk-test` is an experimental qnn profile, so the group acknowledges the
+    # backend; an ort profile ignores the key.
     defp profiled_map(profile \\ "rk-test") do
       base_map()
       |> Map.put("profile_dirs", [@profiles_dir])
@@ -1296,7 +1304,7 @@ defmodule Cairn.ConfigTest do
 
       assert [%{profile: %Profile{} = profile}] = config.plugin_groups
       assert profile.name == "rk-test"
-      assert profile.backend == "rknn"
+      assert profile.backend == "qnn"
       assert profile.experimental
       assert profile.fps_band == [2, 4]
       assert profile.max_unseen_ms == 6000
@@ -1325,8 +1333,8 @@ defmodule Cairn.ConfigTest do
 
     test "a board's unusable backend or decoder warns for a group that selects it" do
       warning =
-        "plugin det: profile rk-test names backend \"rknn\", which the bench board " <>
-          "provides but cannot use on this host: no /dev/rknpu"
+        "plugin det: profile rk-test names backend \"qnn\", which the bench board " <>
+          "provides but cannot use on this host: no /dev/fastrpc"
 
       assert {:ok, _config, [^warning]} = Config.from_map(profiled_map(), board: BenchBoard)
       assert {:ok, _config, []} = Config.from_map(profiled_map())
@@ -1341,10 +1349,10 @@ defmodule Cairn.ConfigTest do
                Config.from_map(profiled_map("bench-vaapi"), board: BenchBoard)
     end
 
-    @untried %{"rknn" => [%{name: "librknnrt.so", failure: nil}]}
+    @untried %{"qnn" => [%{name: "lib.so", failure: nil}]}
 
     defp unfetched(reason) do
-      "plugin det: profile rk-test runs backend \"rknn\", which needs librknnrt.so, " <>
+      "plugin det: profile rk-test runs backend \"qnn\", which needs lib.so, " <>
         "not downloaded yet: #{reason} — the download is retried until it succeeds; " <>
         "no camera can run on this group before then"
     end
@@ -1353,14 +1361,14 @@ defmodule Cairn.ConfigTest do
       message = unfetched("the fetch has not been tried")
       assert {:error, [^message]} = Config.from_map(profiled_map(), artifacts: @untried)
 
-      failed = %{"rknn" => [%{name: "librknnrt.so", failure: "could not connect: :nxdomain"}]}
+      failed = %{"qnn" => [%{name: "lib.so", failure: "could not connect: :nxdomain"}]}
       message = unfetched("the last fetch failed: could not connect: :nxdomain")
       assert {:error, [^message]} = Config.from_map(profiled_map(), artifacts: failed)
 
-      restarting = %{"rknn" => [%{name: "librknnrt.so", failure: :restarting}]}
+      restarting = %{"qnn" => [%{name: "lib.so", failure: :restarting}]}
 
       message =
-        "plugin det: profile rk-test runs backend \"rknn\", which needs librknnrt.so, " <>
+        "plugin det: profile rk-test runs backend \"qnn\", which needs lib.so, " <>
           "whose status is unknown: the artifact store is restarting — the config reloads " <>
           "once it is back; no camera can run on this group before then"
 
@@ -1368,7 +1376,7 @@ defmodule Cairn.ConfigTest do
 
       # Another backend's artifact is nobody's concern here.
       assert {:ok, _config, []} =
-               Config.from_map(profiled_map(), artifacts: %{"qnn" => @untried["rknn"]})
+               Config.from_map(profiled_map(), artifacts: %{"rknn" => @untried["qnn"]})
     end
 
     test "for a group no camera runs on it warns, beside the board's own warning" do
@@ -1378,7 +1386,7 @@ defmodule Cairn.ConfigTest do
 
       # A NIF that did not load is reported though the download would not fix it.
       preflight =
-        "plugin det: profile rk-test names backend \"rknn\", which the nif board provides " <>
+        "plugin det: profile rk-test names backend \"qnn\", which the nif board provides " <>
           "but cannot use on this host: the board NIF did not load (:x)"
 
       assert {:ok, _config, [^message, ^preflight]} =
@@ -1414,7 +1422,7 @@ defmodule Cairn.ConfigTest do
 
       assert Enum.any?(
                errors,
-               &(&1 =~ ~s(unknown backend "quantum" — the generic board provides ort, qnn or rknn))
+               &(&1 =~ ~s(unknown backend "quantum" — the generic board provides ort or qnn))
              )
 
       assert Enum.any?(errors, &(&1 =~ "fps_band must be"))
@@ -1989,10 +1997,11 @@ defmodule Cairn.ConfigTest do
     end
 
     test "a non-experimental profile on a non-ort backend is refused for the group that runs it" do
-      map = argv_map("stable-rknn", %{"allow_experimental" => true})
+      dir = "test/support/fixtures/profiles/stable"
+      map = argv_map("stable-qnn", %{"allow_experimental" => true}, dir)
 
       assert {:error, errors} = Config.from_map(map)
-      assert Enum.any?(errors, &(&1 =~ "uses backend rknn, which is experimental"))
+      assert Enum.any?(errors, &(&1 =~ "uses backend qnn, which is experimental"))
       assert Enum.any?(errors, &(&1 =~ "must declare experimental: true"))
     end
 
@@ -2016,11 +2025,10 @@ defmodule Cairn.ConfigTest do
         })
         |> put_plugin(0, "det")
 
-      # The model comes from the rknn artifact, not the onnx one: the
-      # backend picks the key.
+      # The model comes from the qnn artifact: the backend picks the key.
       assert {:ok, config, _warnings} = Config.from_map(map)
 
-      assert {:ok, %{model: "test/support/fixtures/models/stub.rknn", backend: "rknn"}} =
+      assert {:ok, %{model: "test/support/fixtures/models/stub.onnx", backend: "qnn"}} =
                Config.native_model_config(config)
     end
 
@@ -2694,7 +2702,7 @@ defmodule Cairn.ConfigTest do
     test "pack rungs sharing an artifact share availability — the shadow holds" do
       # Same active-backend artifact path = installed and absent together, so
       # "the pack is absent" can never free the second rung from the first:
-      # refused. The extra rknn entry on rung 2 must not fool the check —
+      # refused. The extra qnn entry on rung 2 must not fool the check —
       # availability is the ACTIVE backend's path, not the whole model map.
       yaml =
         String.replace(
@@ -2704,7 +2712,7 @@ defmodule Cairn.ConfigTest do
         )
         |> String.replace(
           "onnx: #{@stub_onnx}",
-          "onnx: #{@absent_pack}\n      rknn: #{@stub_onnx}",
+          "onnx: #{@absent_pack}\n      qnn: #{@stub_onnx}",
           global: false
         )
 
@@ -2731,7 +2739,7 @@ defmodule Cairn.ConfigTest do
     test "a rung without this backend's artifact key is refused" do
       errors =
         ladder_errors(
-          String.replace(ladder_yaml(), "onnx: #{@absent_pack}", "rknn: #{@absent_pack}")
+          String.replace(ladder_yaml(), "onnx: #{@absent_pack}", "qnn: #{@absent_pack}")
         )
 
       assert Enum.any?(
@@ -2962,13 +2970,6 @@ defmodule Cairn.ConfigTest do
                dynamic_shapes: false,
                cpu_twin: false
              }
-
-      assert Profile.capabilities("rknn") == %{
-               artifact: "rknn",
-               fused_nms: false,
-               dynamic_shapes: false,
-               cpu_twin: false
-             }
     end
 
     # The mechanical half of the pairing: read the Rust rows out of the source
@@ -2977,6 +2978,8 @@ defmodule Cairn.ConfigTest do
     # tripwire — it means the Rust shape moved and the mirror needs re-pairing
     # by hand. `artifact` is deliberately not compared: the two sides disagree
     # for qnn by design (format vs `model:` key — see the comment on `Cairn.Board.Generic.backends/0`).
+    # rknn's row is the Rockchip board's, so this menu pairs two of the three;
+    # `rockchip_release_test.exs` pairs the third.
     test "the capability booleans match the plugin's source, mechanically" do
       rust = File.read!("plugins/cairn-detect/src/infer/backend.rs")
 
@@ -2990,7 +2993,7 @@ defmodule Cairn.ConfigTest do
              "BackendKind::capabilities rows moved in backend.rs — re-pair the mirror " <>
                "(this regex and Cairn.Board.Generic.backends/0)"
 
-      for [_, kind, fused, dynamic] <- rows do
+      for [_, kind, fused, dynamic] <- rows, kind != "Rknn" do
         caps = kind |> String.downcase() |> Profile.capabilities()
         assert caps.fused_nms == (fused == "true"), "fused_nms drifted for #{kind}"
         assert caps.dynamic_shapes == (dynamic == "true"), "dynamic_shapes drifted for #{kind}"
@@ -3018,7 +3021,8 @@ defmodule Cairn.ConfigTest do
     # catalog row is NMS-free or host-side — so the reject side cannot be built
     # from a real profile, and the rule is exercised against the row a future
     # catalog addition would have. Coverage composes: rule 2's fixture tests
-    # run the public parse path through the same `check_capabilities/5`, so
+    # (rockchip_release_test.exs, where rknn is on the menu) run the public
+    # parse path through the same `check_capabilities/5`, so
     # the wiring is proven there and only this branch needs the direct call —
     # splitting the two rules into separate functions breaks that composition
     # and needs a public-path test for each half.
@@ -3029,9 +3033,6 @@ defmodule Cairn.ConfigTest do
       assert %{errors: [error]} = Profile.check_capabilities(acc, "synthetic", "qnn", true, fused)
       assert error =~ "qnn backend requires an NMS-free family or host-side-NMS decode"
       assert error =~ "model_profile fusednet fuses the suppression op"
-
-      assert %{errors: [_rknn_error]} =
-               Profile.check_capabilities(acc, "synthetic", "rknn", true, fused)
     end
 
     test "the same family is accepted on ort, which implements the op" do
@@ -3049,80 +3050,12 @@ defmodule Cairn.ConfigTest do
       assert config.profiles["qnn-host-side-nms"].model_profile == "yolox"
     end
 
-    # Rule 2. The rknn conversions the research does not document are shipped
-    # only with the acknowledgement — both fixtures live in the dir above.
-    test "rknn plus an undocumented conversion demands experimental: true" do
-      errors = caps_errors(@caps_bad_dir)
-
-      assert Enum.any?(
-               errors,
-               &(&1 =~
-                   "profile rknn-unverified: rknn conversion is undocumented for " <>
-                     "model_profile rfdetr")
-             )
-
-      assert Enum.any?(errors, &(&1 =~ "declare experimental: true"))
-    end
-
+    # Rule 2 itself runs where rknn is on the menu, in rockchip_release_test.exs.
     test "yolo26 does not inherit its contract row's documented rknn conversion" do
       # Conversion coverage is per FAMILY (the zoo documents through
       # YOLOv11); yolo26 shares yolov8's decode contract, not its claim.
       assert {"yolov8", %{rknn_conversion: :undocumented}} = Profile.family("yolo26")
       assert {"yolov8", %{rknn_conversion: :documented}} = Profile.family("yolov11")
-    end
-
-    test "the rknn refusal names the family the operator wrote, not the canonical" do
-      errors = caps_errors(@caps_bad_dir)
-
-      # "undocumented for yolov8" would contradict the table's own yolov8 row.
-      assert Enum.any?(
-               errors,
-               &(&1 =~
-                   "profile rknn-yolo26: rknn conversion is undocumented for " <>
-                     "model_profile yolo26")
-             )
-    end
-
-    test "on rknn the yolo26 split head demands experimental: true, the yolov8 one does not" do
-      assert Enum.any?(
-               caps_errors(@caps_bad_dir),
-               &(&1 =~
-                   "profile rknn-yolo26split: rknn conversion is undocumented for " <>
-                     "model_profile yolo26split")
-             )
-
-      assert {:ok, config, []} =
-               Config.from_map(Map.put(base_map(), "profile_dirs", [@caps_dir]))
-
-      refute config.profiles["rknn-split-documented"].experimental
-    end
-
-    # A truthy non-boolean is a type error AND not an acknowledgement: both
-    # messages must surface, or the type error hides the actionable one.
-    test "a non-boolean experimental does not satisfy the rknn rule" do
-      errors = caps_errors(@caps_bad_dir)
-
-      assert Enum.any?(
-               errors,
-               &(&1 =~ "profile rknn-truthy-experimental: experimental must be true or false")
-             )
-
-      assert Enum.any?(
-               errors,
-               &(&1 =~
-                   "profile rknn-truthy-experimental: rknn conversion is undocumented for " <>
-                     "model_profile rfdetr")
-             )
-    end
-
-    test "the acknowledgement, or a documented family, satisfies the rule" do
-      assert {:ok, config, []} =
-               Config.from_map(Map.put(base_map(), "profile_dirs", [@caps_dir]))
-
-      assert config.profiles["rknn-acknowledged"].experimental
-      # yolo11 resolves to yolov8, whose conversion the model zoo documents:
-      # no acknowledgement asked for by *this* rule.
-      refute config.profiles["rknn-documented"].experimental
     end
 
     test "an unknown model_profile is refused, naming the menu it must come from" do
@@ -3152,18 +3085,155 @@ defmodule Cairn.ConfigTest do
     end
   end
 
-  describe "built-in profiles" do
-    # These four load on *every* config load, this suite's included, so a
-    # broken one is a broken host and not just a broken board.
-    test "the shipped dir parses clean and holds the four board profiles" do
-      assert {:ok, config, []} = Config.from_map(base_map())
+  describe "fetched ladder rungs" do
+    @stub "test/support/fixtures/models/stub.onnx"
+    @fetch_sha String.duplicate("ab", 32)
+    @no_camera "no camera can run on this group"
 
-      assert Enum.sort(Map.keys(config.profiles)) == [
-               "generic-ort",
-               "qcs6490-tier1",
-               "rk3566-lowfps",
-               "rk3576"
-             ]
+    defp fetch_yaml do
+      """
+      tier: 1
+      experimental: true
+      backend: qnn
+      model_profile: yolox
+      model_ladder:
+        - sha256: #{String.upcase(@fetch_sha)}
+          url: https://h/models/m.qnn
+          input_size: 416
+          engine_budget: 75
+      supported_cameras: 40
+      """
+    end
+
+    defp fetch_map(yaml, cameras \\ 1) do
+      Process.put(:release_dir, tmp_profile_dir("fetched", yaml))
+      camera = %{"id" => "cam_a", "rtsp_url" => "rtsp://h/1", "plugin" => "det"}
+
+      base_map()
+      |> Map.put("plugins", %{"det" => %{"profile" => "fetched", "allow_experimental" => true}})
+      |> Map.put("cameras", Enum.take([camera], cameras))
+    end
+
+    defp fetch_load(yaml, state, cameras \\ 1),
+      do: Config.from_map(fetch_map(yaml, cameras), board: FetchBoard, artifact: state)
+
+    defp verified(sha256) do
+      send(self(), {:state, sha256})
+      {:ok, @stub}
+    end
+
+    test "malformed: each value refused, a bare key read as absent" do
+      for {from, to, error} <- [
+            {"url: https://h/models/m.qnn", "url:", "needs both sha256: and url:"},
+            {"sha256: #{String.upcase(@fetch_sha)}", "sha256:", "needs both sha256: and url:"},
+            {String.upcase(@fetch_sha), "abc", ~s(sha256 must be 64 hex characters, got "abc")},
+            {String.upcase(@fetch_sha), String.slice(@fetch_sha, 1..-1//1),
+             "sha256 must be 64 hex characters"},
+            {String.upcase(@fetch_sha), String.duplicate("zz", 32),
+             "sha256 must be 64 hex characters"},
+            {"https://h", "http://h", "url must be an https URL"},
+            {"https://h", "https://", "url must be an https URL"},
+            {"https://h", "https://u:p@h", "url must be an https URL"},
+            {"engine_budget: 75", "engine_budget: 75\n    pack: p",
+             "is a pack rung, and a pack is installed by hand"},
+            {"engine_budget: 75", "engine_budget: 75\n    model:\n      qnn: #{@stub}",
+             "names both a file to fetch and model.qnn"}
+          ] do
+        assert {:error, errors} = fetch_load(String.replace(fetch_yaml(), from, to), &verified/1)
+        assert Enum.any?(errors, &(&1 =~ "profile fetched: model_ladder rung 1 " <> error)), error
+        refute Enum.any?(errors, &(&1 =~ "u:p"))
+      end
+    end
+
+    test "outside the release's own profiles a fetch is refused, a shadow included" do
+      dir = tmp_profile_dir("fetched", fetch_yaml())
+      map = Map.put(fetch_map(fetch_yaml()), "profile_dirs", [dir])
+
+      for opts <- [[board: FetchBoard], []] do
+        assert {:error, errors} = Config.from_map(map, [artifact: &verified/1] ++ opts)
+
+        assert Enum.any?(
+                 errors,
+                 &(&1 =~ "profile fetched: model_ladder rung 1 names a file to fetch" and
+                     &1 =~ "#{dir}/fetched.yml is not one — place the model file by hand")
+               )
+      end
+    end
+
+    test "in an operator file, a bare sha256: and url: are absent: an ordinary rung" do
+      yaml =
+        fetch_yaml()
+        |> String.replace(~r/sha256: \w+/, "sha256:")
+        |> String.replace("url: https://h/models/m.qnn", "url:\n    model:\n      qnn: #{@stub}")
+
+      map =
+        fetch_yaml()
+        |> fetch_map()
+        |> Map.put("profile_dirs", [tmp_profile_dir("bare", yaml)])
+        |> Map.put("plugins", %{"det" => %{"profile" => "bare", "allow_experimental" => true}})
+
+      assert {:ok, config, []} = Config.from_map(map, board: FetchBoard, artifact: &verified/1)
+      assert {:ok, %{model: @stub, backend: "qnn"}} = Config.native_model_config(config)
+    end
+
+    test "one rung of two unfetched refuses the group, though the resolved one is verified" do
+      yaml =
+        String.replace(fetch_yaml(), "model_ladder:\n", """
+        model_ladder:
+          - sha256: #{String.duplicate("cd", 32)}
+            url: https://h/models/small.qnn
+            input_size: 320
+            engine_budget: 30
+        """)
+
+      state = fn
+        @fetch_sha -> {:missing, nil}
+        _resolved -> {:ok, @stub}
+      end
+
+      assert {:error, [error]} = fetch_load(yaml, state)
+      assert error =~ "plugin det: profile fetched needs m.qnn (ladder rung 2), not downloaded"
+    end
+
+    test "verified: the store's file is the rung's artifact, and it counts as non-pack" do
+      assert {:ok, config, []} = fetch_load(fetch_yaml(), &verified/1)
+      assert_received {:state, @fetch_sha}
+      assert {:ok, %{model: @stub, backend: "qnn"}} = Config.native_model_config(config)
+
+      yaml = String.replace(fetch_yaml(), "supported_cameras: 40", "supported_cameras: 41")
+      assert {:error, errors} = fetch_load(yaml, &verified/1)
+      assert Enum.any?(errors, &(&1 =~ "the non-pack rungs alone cover ~40 cameras"))
+    end
+
+    test "declared but absent: refused with the store's reason, warned with no camera on it" do
+      retried = "the download is retried until it succeeds; #{@no_camera} before then"
+      idle = "nothing is fetching it; #{@no_camera}"
+
+      for {failure, reason} <- [
+            {nil, "not downloaded yet: the fetch has not been tried — #{retried}"},
+            {"could not connect: :nxdomain",
+             "not downloaded yet: the last fetch failed: could not connect: :nxdomain — " <>
+               retried},
+            {:restarting,
+             "whose status is unknown: the artifact store is restarting — the config " <>
+               "reloads once it is back; #{@no_camera} before then"},
+            {:not_started, "not downloaded: the artifact store is not running — #{idle}"},
+            {:unlisted, "not downloaded: the artifact store was started without it — #{idle}"}
+          ] do
+        state = fn _sha256 -> {:missing, failure} end
+        message = "plugin det: profile fetched needs m.qnn (ladder rung 1), #{reason}"
+        assert {:error, [^message]} = fetch_load(fetch_yaml(), state)
+        assert {:ok, _config, [^message]} = fetch_load(fetch_yaml(), state, 0)
+      end
+    end
+  end
+
+  describe "built-in profiles" do
+    # These load on *every* config load on this board, this suite's included,
+    # so a broken one is a broken host and not just a broken board.
+    test "the shipped dir and the generic board's parse clean" do
+      assert {:ok, config, []} = Config.from_map(base_map())
+      assert Enum.sort(Map.keys(config.profiles)) == ["generic-ort", "qcs6490-tier1"]
 
       # Every single-model profile declares a band; a ladder profile cannot
       # (the ladder is the rate authority, D-L4) and derives instead.
@@ -3190,17 +3260,6 @@ defmodule Cairn.ConfigTest do
       assert profile.max_unseen_ms == Config.default_max_unseen_ms()
       assert profile.max_live_tracks == Config.default_max_live_tracks()
       assert profile.stationary_after_ms == Config.default_stationary_after_ms()
-    end
-
-    test "the two rknn boards ship the full low-fps stage set, experimental" do
-      assert {:ok, config, []} = Config.from_map(base_map())
-
-      for name <- ["rk3566-lowfps", "rk3576"] do
-        profile = config.profiles[name]
-        assert profile.experimental, "#{name} runs a stubbed backend"
-        assert profile.backend == "rknn"
-        assert profile.stages == %{bbd: %{}, oru: %{}, twin_mint: %{}}
-      end
     end
 
     test "qcs6490-tier1 is the shipped ladder: one list for every installation state" do
@@ -3254,17 +3313,13 @@ defmodule Cairn.ConfigTest do
       assert 40 * floor_rate <= nano.engine_budget
     end
 
-    test "qcs6490-tier1 is the only shipped profile that names a decoder" do
+    test "qcs6490-tier1 names its decoder, generic-ort leaves it to auto" do
       assert {:ok, config, []} = Config.from_map(base_map())
 
       # Naming one is a requirement on the membrane path, so it belongs only
-      # where a decode path has been measured — Venus, spike 0.3. The other
-      # three leave it unset and take `auto`'s fallback.
+      # where a decode path has been measured — Venus, spike 0.3.
       assert config.profiles["qcs6490-tier1"].decoder == "v4l2"
-
-      for name <- ["generic-ort", "rk3566-lowfps", "rk3576"] do
-        assert config.profiles[name].decoder == nil, "#{name} names a decoder"
-      end
+      assert config.profiles["generic-ort"].decoder == nil
     end
 
     # The D-L6 docs-honesty gate, running where `mix check` runs: a shipped
@@ -3278,7 +3333,13 @@ defmodule Cairn.ConfigTest do
     # that the note exists, not that it is true — while pack-ness comes
     # from the parsed rungs, paired by order.
     test "every shipped ladder budget carries provenance; non-pack provisional ⇒ DRAFT" do
-      for path <- Path.wildcard("priv/profiles/*.yml"),
+      shipped =
+        Path.wildcard("priv/profiles/**/*.yml") ++
+          Path.wildcard("boards/*/priv/profiles/*.yml")
+
+      assert "boards/cairn_rockchip/priv/profiles/rk3566-tier1.yml" in shipped
+
+      for path <- shipped,
           raw = File.read!(path),
           raw =~ "model_ladder:" do
         lines = String.split(raw, "\n")

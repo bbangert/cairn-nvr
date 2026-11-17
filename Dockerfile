@@ -316,9 +316,9 @@ need /opt/rockchip/lib/librockchip_mpp.so.1 \
   mpp_buffer_group_clear mpp_buffer_group_limit_config
 EOS
 
-# FP32 YOLOX release exports (Apache-2.0, bytes as Megvii published them):
-# the CPU twins of the tiny and s rungs, whose shipped qdq files are
-# quantized for the HTP.
+# FP32 YOLOX exports (Apache-2.0), the CPU twins of rk3566-tier1's rungs,
+# whose `.rknn` files the release fetches at first start: two as Megvii
+# published them, and one derived from the tiny file (below).
 RUN <<'EOS'
 set -eux
 [ "$TARGETARCH" = "arm64" ] || exit 0
@@ -327,6 +327,11 @@ curl -fsSL -o /dist/models/yolox_tiny.onnx "$base/yolox_tiny.onnx"
 echo "427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7 /dist/models/yolox_tiny.onnx" | sha256sum -c -
 curl -fsSL -o /dist/models/yolox_s.onnx "$base/yolox_s.onnx"
 echo "c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063 /dist/models/yolox_s.onnx" | sha256sum -c -
+# The 640 tiny rung's twin: the tiny release file with its input size
+# rewritten (tools/rknn-export), published beside the rungs.
+curl -fsSL -o /dist/models/yolox_tiny_640.onnx \
+  https://github.com/bbangert/cairn-nvr/releases/download/models-rk3566-1/yolox_tiny_640.onnx
+echo "6066fa79efe783a554a6f7e13792e0ee9246bc0c7b27d6eddad3f43bdd000a61 /dist/models/yolox_tiny_640.onnx" | sha256sum -c -
 EOS
 
 # ---------------------------------------------------------------------------
@@ -365,6 +370,9 @@ COPY boards/cairn_rockchip/lib boards/cairn_rockchip/lib
 # build only if it exists then, and `Cairn.Rockchip.Native` loads from
 # `:code.priv_dir(:cairn_rockchip)`. Empty for a generic build.
 COPY --from=native-build /dist/rockchip-nif/ boards/cairn_rockchip/priv/native/
+# The board's profiles (`Cairn.Rockchip.Board.profiles_dir/0`), present for
+# a generic build too, which never reads them.
+COPY boards/cairn_rockchip/priv/profiles boards/cairn_rockchip/priv/profiles/
 RUN mix deps.compile
 COPY priv priv
 COPY lib lib
@@ -376,9 +384,11 @@ RUN mix assets.setup && mix assets.deploy
 COPY --from=native-build /dist/libcairn_native.so /dist/libcairn_ort.so priv/native/
 RUN mix release
 # Where `Cairn.Rockchip.Native` loads it from: a NIF missing here would show
-# only on the board, as rknn refused at preflight.
+# only on the board, as rknn refused at preflight. Likewise the profile, whose
+# absence shows only as an unknown-profile config error.
 RUN if [ "$CAIRN_BOARD" = rockchip ]; then \
-    test -f _build/prod/rel/cairn/lib/cairn_rockchip-*/priv/native/libcairn_rockchip.so; \
+    test -f _build/prod/rel/cairn/lib/cairn_rockchip-*/priv/native/libcairn_rockchip.so \
+      && test -f _build/prod/rel/cairn/lib/cairn_rockchip-*/priv/profiles/rk3566-tier1.yml; \
   fi
 
 # ---------------------------------------------------------------------------

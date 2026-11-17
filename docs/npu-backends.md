@@ -75,12 +75,11 @@ silicon — Frigate #18878 shows a VPU session allocated and consuming
   API equivalent to QNN's.
 - Per-board reality (inference-only vs pipeline):
   - rk3566 (~1 TOPS): model-zoo yolov8n@640 claimed 34 fps, but Frigate
-    real-world reports 95-250 ms inference (~4-10 fps with overhead) —
-    consistent with the profile's declared 2-4 fps band once decode +
-    tracking overhead lands.
+    real-world reports 95-250 ms inference (~4-10 fps with overhead). On
+    the HA Green, INT8 yolox_tiny@416 sustains 23.2 passes/s and
+    yolox_s@640 9.7 — `rk3566-tier1`'s provisional budgets.
   - rk3576 (6 TOPS, INT4-capable): no official benchmarks found; ~6×
     rk3566 expected; Frigate discussions confirm multi-stream viability.
-    Profile band likely 8-16 fps pending measurement.
 - **Preprocessing: no Rust crate for RGA** (Rockchip's 2D accelerator for
   resize/color-convert, librga C API, dma_fd zero-copy), so the board crate
   binds librga by hand (`rga.rs`); `rkmpp` scales there. Not standard

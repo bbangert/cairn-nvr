@@ -19,10 +19,10 @@ the model choice to be a reviewable file rather than a line of argv, or when
 different cameras on one node run different hardware.
 
 Shipped profiles live in `priv/profiles/`; a board's own live in the directory
-its release names (`Cairn.Stage.Board.profiles_dir/0` — the generic board has
-none); yours live wherever you point `profile_dirs:`. The schema and the
-`profile …:` messages quoted below come from `Cairn.Config.Profile`; the
-`backend:` and `decoder:` menus come from the release's board.
+its release names (`Cairn.Stage.Board.profiles_dir/0`); yours live wherever
+you point `profile_dirs:`. The schema and the `profile …:` messages quoted
+below come from `Cairn.Config.Profile`; the `backend:` and `decoder:` menus
+come from the release's board.
 
 ## Attaching one
 
@@ -40,12 +40,13 @@ plugins:
     # The profile's filename, without .yml. A group is nothing but this
     # reference and your consent flags — the external-plugin `command:` form
     # died with membrane port phase 6.
-    profile: rk3566-lowfps
-    # Required to run a profile whose backend is not `ort`: only `ort`
-    # executes today, and the other two names exist so a board profile can be
-    # written and validated before its runtime lands. Both halves are needed —
-    # the profile says `experimental: true`, you say `allow_experimental: true`
-    # — because one is the author's claim and the other is your consent.
+    profile: rk3566-tier1
+    # Required to run a profile whose backend is not `ort`: each release
+    # offers `ort` plus its own (`qnn` on the generic board, `rknn` on the
+    # Rockchip one), and both of those are experimental. Both halves are
+    # needed — the profile says `experimental: true`, you say
+    # `allow_experimental: true` — because one is the author's claim and the
+    # other is your consent.
     allow_experimental: true
 
 cameras:
@@ -180,6 +181,17 @@ model_ladder:
 supported_cameras: 40          # the support claim, enforced as a bound
 ```
 
+A rung in a profile the release ships may name its file by hash instead of
+by path: `sha256:` (64 hex characters) and `url:` (https, no user info), both
+or neither, and no `model:` entry for the backend's own artifact (`model:`
+then holds only the twin, if the backend needs one). The release fetches the
+file into `<data_dir>/artifacts/` at start and the rung runs on it once its
+bytes hash to `sha256:`. While it is missing, a config whose cameras run the
+profile is refused, saying why (the last fetch's failure, or that it has not
+been tried); with no camera on the group it only warns. In a `profile_dirs:`
+file either key is an error, a file shadowing a shipped one included: place
+the model file by hand and name its path.
+
 The rules, each refused or warned at load:
 
 * **The ladder is the model and rate authority (D-L4).** `model_ladder:`
@@ -247,14 +259,15 @@ Two consequences worth an operator's attention:
 
 | field | menu | where the menu lives |
 |---|---|---|
-| `backend` | `ort`, `rknn`, `qnn` | the release's board (`Cairn.Stage.Board.backends/0`); the generic board's mirrors `BackendKind`, `plugins/cairn-detect/src/infer/backend.rs` |
+| `backend` | `ort`, `qnn` | the release's board (`Cairn.Stage.Board.backends/0`); the generic board's mirrors `BackendKind`'s ort and qnn rows, `plugins/cairn-detect/src/infer/backend.rs`, and the Rockchip board's carries rknn's |
 | `model_profile` | `yolox`, `yolov10`, `yolov8` (or `yolov9`, `yolo11`, `yolov11`, `yolo26`), `rfdetr`, `yolov8split`, `yolo26split` (hyphenated spelling accepted) | `PROFILES`, `plugins/cairn-detect/src/infer/catalog.rs` |
 | `decoder` | `auto`, `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` | the release's board (`Cairn.Stage.Board.decoders/0`); the generic board's are `DecoderKind`, `plugins/cairn-detect/src/decode.rs` |
 | `tracking:` stage keys | `bbd`, `oru`, `ocr`, `twin_mint` | `Cairn.Tracker.Stage.Bbd` / `.Oru` / `.Ocr` / `.TwinMint` |
 
 The `backend` and `decoder` menus shown are the generic board's. The
-Rockchip release's decoder menu is `auto`, `sw` and `rkmpp` (MPP decode + RGA
-scale in `boards/cairn_rockchip`), and its `auto` never picks `rkmpp`.
+Rockchip release's backends are `ort` and `rknn`, its decoders `auto`, `sw`
+and `rkmpp` (MPP decode + RGA scale in `boards/cairn_rockchip`), and its
+`auto` never picks `rkmpp`.
 
 Each catalog row is a decode contract listing the model families it applies
 to: `yolo11` and `yolov8` share one row because several Ultralytics
@@ -318,8 +331,8 @@ declares an `fps_band:`, `sample_fps:` must fall inside it — a value outside
 the band is a config error naming both, since a profile that both bounds a
 rate and then names a value outside that bound is contradicting itself, not
 expressing a choice. A profile with `fps_band:` and no `sample_fps:` is
-unaffected either way: none of the four board profiles cairn ships sets
-`sample_fps:`, and their bands keep emitting nothing.
+unaffected either way: no profile cairn ships sets `sample_fps:`, and
+`generic-ort`'s band emits nothing.
 
 The one profile shape this paragraph does not describe is a `model_ladder:`
 profile, which may declare neither key (both are refused alongside a
@@ -388,18 +401,19 @@ against.
 ## The capability table, and what it refuses
 
 The release's board carries a static table of what each backend accepts
-(`Cairn.Stage.Board.backends/0`); the generic board's mirrors
-`BackendKind::capabilities` on the Rust side. It is static because
+(`Cairn.Stage.Board.backends/0`), each row a mirror of its
+`BackendKind::capabilities` row on the Rust side. It is static because
 config load has to answer these questions with no plugin running and, for a
 board profile written ahead of its hardware, no such device attached.
 
 | backend | artifact key | runs a fused-NMS export | takes dynamic shapes | needs a CPU twin |
 |---|---|---|---|---|
 | `ort` | `model.onnx` | yes | yes | no |
-| `rknn` | `model.rknn` | no | no | no (generic) / yes (Rockchip) |
+| `rknn` | `model.rknn` | no | no | yes |
 | `qnn` | `model.qnn` | no | no | no |
 
-The Rockchip board's table has only the `ort` and `rknn` rows.
+The generic board's table has the `ort` and `qnn` rows, the Rockchip
+board's the `ort` and `rknn` rows.
 
 Two rules come out of it, both from `docs/npu-backends.md`:
 
@@ -436,7 +450,7 @@ see what it is checking is worse than a sentence you can read.
 and no multi-core orchestration for one model: assume one inference at a time
 per model. Nothing in a profile can say otherwise — there is no batch size and
 no concurrency field — so this is a sizing fact, not a setting. If an rk3566
-band looks achievable only by overlapping inferences, it is not achievable.
+budget looks achievable only by overlapping inferences, it is not achievable.
 
 **A fixed-geometry artifact pins `input_size:` and nothing here can check
 it.** Both NPU backends compile the model at one input geometry, so an
@@ -453,8 +467,8 @@ from — at boot that is a refusal to start, on Reload it is a rejected file wit
 the running config kept. Message shapes as they are emitted:
 
 ```
-profile my-board: unknown backend "hailo" — the generic board provides ort,
-  qnn or rknn
+profile my-board: unknown backend "hailo" — the generic board provides ort
+  or qnn
 profile my-board: unknown model_profile "yolov12" (rfdetr, yolo26split,
   yolov10, yolov8 (or yolov9, yolo11, yolov11, yolo26), yolov8split, yolox)
 profile my-board: unknown decoder "cuda" — the generic board provides auto,
@@ -475,6 +489,10 @@ profile my-board: model artifact models/gone.rknn does not exist or is not a
   is spawned from)
 profile my-board: labels file models/gone.names does not exist or is not a
   regular file …
+profile my-board: model_ladder rung 1 names a file to fetch (sha256:/url:),
+  which only the release's own profiles may, and /etc/cairn/profiles/my-board.yml
+  is not one — place the model file by hand and name its path under model:
+  instead
 ```
 
 And the ones about attaching it, which name the plugin group instead:
@@ -495,16 +513,19 @@ plugin detect: profile my-board runs backend rknn, whose artifact the CPU
 plugin detect: profile my-board runs backend "rknn", which needs librknnrt.so,
   not downloaded yet: the last fetch failed: <why> — the download is retried
   until it succeeds; no camera can run on this group before then
+plugin detect: profile rk3566-tier1 needs yolox_s_640_i8.rknn (ladder rung 1),
+  not downloaded yet: the fetch has not been tried — the download is retried
+  until it succeeds; no camera can run on this group before then
 ```
 
-The last is an error only while a camera runs on the group, else a warning;
-before the first attempt it says `the fetch has not been tried`.
+The last two are errors only while a camera runs on the group, else
+warnings.
 
 And warnings, which do not fail the load:
 
 ```
-profile rk3576: /etc/cairn/profiles/rk3576.yml shadows a previously loaded
-  profile of the same name
+profile my-board: /etc/cairn/profiles/my-board.yml shadows a previously
+  loaded profile of the same name
 plugin detect: profile my-board supersedes the global tracking.bbd/oru/ocr
   flags for its cameras — the profile's stage list wins
 tracking.reid has no effect for group detect: its profile my-board lists no
@@ -523,8 +544,7 @@ for `backend:` and `decoder:` alike, from the board's own check of the host.
 The generic board reports nothing unusable and never raises it.
 
 A profile's *files* are checked only for a profile some group actually runs, so
-a board profile for hardware this node does not have costs it nothing. That is
-what makes shipping four of them reasonable.
+a board profile for hardware this node does not have costs it nothing.
 
 There is one more class of error you are unlikely to see: an illegal stage
 composition (`Cairn.Tracker.Stage.validate_lists/1` — adjacency, pairing and
@@ -541,15 +561,14 @@ already in the code: if it loads, every value in it is one cairn implements. If
 it does not load, the error says which value is not.
 
 The path into the repo is the same file: if the board is one others will meet,
-open a PR adding it to `priv/profiles/` — that is a data change, and the review
-is about whether the claims in it are true, not about whether the code can run
-it. Follow what the shipped four do:
+open a PR adding it to `priv/profiles/` or its board's own directory — that is
+a data change, and the review is about whether the claims in it are true, not
+about whether the code can run it. Follow what the shipped ones do:
 
 - say in a comment **why** the profile is experimental, in the file itself;
 - say what each `fps_band` number was derived from, and that it is pending
   on-hardware measurement;
-- write placeholder artifact paths (nobody else has your compiled model), and
-  say what toolchain produces them;
+- say what toolchain produces each artifact, and where the release gets it;
 - say what a stage choice is grounded in — and, where it is a decision rather
   than a measurement, say that too;
 - for a ladder file, give every `engine_budget` its provenance (`measured`
@@ -598,22 +617,17 @@ group is not.
 
 ## What cairn ships
 
-Four profiles in `priv/profiles/`, each with its reasoning in the file:
+Three profiles, each with its reasoning in the file, and each loaded only by
+the release that can run it:
 
-| profile | backend | rate | stages | notes |
-|---|---|---|---|---|
-| `generic-ort` | `ort` | band 5–5 | twin gate only | today's behaviour, named; the migration target and the one non-experimental profile |
-| `rk3566-lowfps` | `rknn` | band 2–4 | bbd, oru, twin gate | the low-fps set; wants `--track-floor-json` alongside it |
-| `rk3576` | `rknn` | band 8–16 | bbd, oru, twin gate | same pipeline, faster board; the band is scaled from rk3566's and **unmeasured** |
-| `qcs6490-tier1` | `qnn` | derived per rung | none (tier 1 — no tracker) | the model-ladder file: six rungs serving both installation states (yolo26 packs installed, or only the baked Apache models — yolox_m carries small fleets there), claim 40 cameras; tiny/nano boundary-measured, the rest provisional |
+| profile | where | backend | rate | stages | notes |
+|---|---|---|---|---|---|
+| `generic-ort` | `priv/profiles/` | `ort` | band 5–5 | twin gate only | today's behaviour, named; the migration target and the one non-experimental profile |
+| `qcs6490-tier1` | `priv/profiles/generic/` (generic board) | `qnn` | derived per rung | none (tier 1 — no tracker) | the model-ladder file: six rungs serving both installation states (yolo26 packs installed, or only the baked Apache models — yolox_m carries small fleets there), claim 40 cameras; tiny/nano boundary-measured, the rest provisional |
+| `rk3566-tier1` | `boards/cairn_rockchip/priv/profiles/` | `rknn` | derived per rung | none (tier 1) | three fetched Apache YOLOX rungs with baked CPU twins, `decoder: rkmpp`, claim 12 cameras; every budget provisional |
 
-Three of the four are `experimental: true` for the same blunt reason: their
-backends have not proven out in soak. `rknn` (executes on a Rockchip
-release, unsoaked) and `qnn` (executes on the generic one, unsoaked) need
-your `allow_experimental: true` on the group that names one. A Rockchip
-release does not load `qcs6490-tier1` (its board provides no `qnn`), and the
-two `rknn` profiles name no CPU twin, so selecting either there fails the
-load until they are replaced with the board's own.
+The two ladders are `experimental: true` because their backends have not
+proven out in soak: a group naming one needs your `allow_experimental: true`.
 
 A group that named the retired `qcs6490` placeholder now fails with
 "unknown profile" — point it at `qcs6490-tier1`. The placeholder was a

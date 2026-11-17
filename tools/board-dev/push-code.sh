@@ -127,6 +127,8 @@ fi
 for d in lib/*/; do
   name=$(basename "$d")
   mkdir -p /app/lib/"$name"
+  # Profiles are read by directory: one this push no longer carries would still load.
+  if [ -d "$d"priv/profiles ]; then rm -rf /app/lib/"$name"/priv/profiles; fi
   cp -r "$d". /app/lib/"$name"/
 done
 # By existing dir, not by version — like the app loop above: a local
