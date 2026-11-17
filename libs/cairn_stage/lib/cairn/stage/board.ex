@@ -21,7 +21,16 @@ defmodule Cairn.Stage.Board do
           generic: [Step.t()]
         }
 
-  @type capabilities :: %{artifact: String.t(), fused_nms: boolean(), dynamic_shapes: boolean()}
+  @typedoc """
+  `cpu_twin` is true when the CPU baseline cannot run the backend's artifact,
+  so a profile on it must name an FP32 ONNX twin under `model.onnx`.
+  """
+  @type capabilities :: %{
+          artifact: String.t(),
+          fused_nms: boolean(),
+          dynamic_shapes: boolean(),
+          cpu_twin: boolean()
+        }
 
   # Config errors name the release's board with it.
   @callback name() :: String.t()

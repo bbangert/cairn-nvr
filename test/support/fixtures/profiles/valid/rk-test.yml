@@ -1,5 +1,5 @@
-# A full profile exercising every schema field (backend stubbed until Phase 6,
-# so a group running this one has to set allow_experimental: true).
+# A full profile exercising every schema field (rknn is experimental, so a
+# group running this one has to set allow_experimental: true).
 name: rk-test
 experimental: true
 backend: rknn

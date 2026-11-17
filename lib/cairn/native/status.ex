@@ -34,6 +34,7 @@ defmodule Cairn.Native.Status do
 
   alias Cairn.CameraStatus
   alias Cairn.Config.Server, as: ConfigServer
+  alias Cairn.Native.Config, as: NativeConfig
   alias Cairn.Native.Health
   alias Cairn.Native.Host
 
@@ -252,8 +253,12 @@ defmodule Cairn.Native.Status do
     {"idle", "the engine is loaded and no model pass completed in the last check window"}
   end
 
+  # An accelerator reads :not_applicable while its CPU baseline is pending or
+  # absent (unmeasurable, or a twin not on disk), not for want of a device.
   defp accelerator(%{health: :not_applicable} = status) do
-    {"ready", "detecting on #{status.backend}, which has no accelerator to judge"}
+    if NativeConfig.accelerator?(status),
+      do: {"ready", "detecting on #{status.backend}; no CPU baseline to judge it against"},
+      else: {"ready", "detecting on #{status.backend}, which has no accelerator to judge"}
   end
 
   defp accelerator(%{health: :unknown} = status) do

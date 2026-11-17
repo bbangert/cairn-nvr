@@ -3,9 +3,10 @@ defmodule Cairn.Native.Canary do
   Probe-load a model in a throwaway OS process, before the in-VM NIF opens it.
 
   Model load is the known NPU crash/wedge vector (D-M3's risk row), and in-VM a
-  crash there is the whole node. `cairn-detect` links the same library the NIF
-  does and opens the model through the same `Detector::open`, so running the
-  binary is the same load.
+  crash there is the whole node. The backend's canary binary (the board's
+  choice: `cairn-detect`, or a board library's own) links the same library the
+  engine NIF does and opens the model the same way, so running it is the same
+  load.
 
   The binary has no load-and-exit mode, so the probe runs `group` mode
   (`--cameras-json` with one synthetic member): `run_multiplexed` writes its
@@ -63,11 +64,12 @@ defmodule Cairn.Native.Canary do
   end
 
   @doc """
-  Median CPU model-pass latency, measured by `cairn-detect --cpu-baseline` in
-  a fresh OS process — the only venue where "CPU" is structural. The engine's
-  own process cannot prove it after its first QNN load (the plugin EP
-  registration is process-wide and permanent), and a subprocess timeout is a
-  kill rather than an orphaned native call. Options are `probe/2`'s.
+  Median CPU model-pass latency, measured by the canary binary's
+  `--cpu-baseline` in a fresh OS process — the only venue where "CPU" is
+  structural. The engine's own process cannot prove it after its first QNN
+  load (the plugin EP registration is process-wide and permanent), and a
+  subprocess timeout is a kill rather than an orphaned native call. Options
+  are `probe/2`'s.
   """
   @spec cpu_baseline(Config.t(), pos_integer(), keyword()) ::
           {:ok, float()} | {:error, String.t()}

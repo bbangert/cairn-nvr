@@ -32,13 +32,18 @@ defmodule Cairn.Board.Generic do
   # `input_size:` disagreeing with a fixed-geometry artifact, is a fact about a
   # file the host cannot open, so `docs/profile-authoring.md` says it instead.
   #
-  # `rknn` stays: it parses on every release today behind `experimental:`.
+  # `cpu_twin` has no Rust mirror — the baseline is the host's concern — and
+  # is false on every row: the CPU baseline runs qnn's QDQ `.onnx` itself,
+  # and `rknn` here is parse-only — it stays so the shipped rknn profiles
+  # parse behind `experimental:`, but no engine in a generic release runs it,
+  # so nothing would read a twin. `Cairn.Rockchip.Board` is where `rknn`
+  # executes.
   @impl true
   def backends do
     %{
-      "ort" => %{artifact: "onnx", fused_nms: true, dynamic_shapes: true},
-      "rknn" => %{artifact: "rknn", fused_nms: false, dynamic_shapes: false},
-      "qnn" => %{artifact: "qnn", fused_nms: false, dynamic_shapes: false}
+      "ort" => %{artifact: "onnx", fused_nms: true, dynamic_shapes: true, cpu_twin: false},
+      "rknn" => %{artifact: "rknn", fused_nms: false, dynamic_shapes: false, cpu_twin: false},
+      "qnn" => %{artifact: "qnn", fused_nms: false, dynamic_shapes: false, cpu_twin: false}
     }
   end
 

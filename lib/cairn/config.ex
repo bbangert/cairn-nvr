@@ -833,8 +833,13 @@ defmodule Cairn.Config do
   # Shipped profiles first, the board's next, operator dirs last —
   # `Profile.load_dirs/2` gives later files the name on a collision (with a
   # warning), so an operator file shadows both.
+  #
+  # A shipped file naming a backend this release's board does not provide is
+  # left out, silently: it is not operator intent, and erroring would fail
+  # every load on that board. Goes away when shipped profiles move to their
+  # board (D-G19, phase 11).
   defp load_profiles(dirs, board, acc) do
-    base = [shipped_profiles_dir() | List.wrap(board.profiles_dir())]
+    base = [{shipped_profiles_dir(), :provided_only} | List.wrap(board.profiles_dir())]
 
     case dirs do
       nil ->
@@ -1188,6 +1193,7 @@ defmodule Cairn.Config do
     |> check_backend_implemented(group, profile)
     |> check_artifact(group, profile)
     |> check_ladder_artifacts(profile)
+    |> check_cpu_twin(group, profile)
     |> check_labels(profile)
   end
 
@@ -1197,12 +1203,11 @@ defmodule Cairn.Config do
   # them so board profiles can ship before their backends do — but a group
   # actually running one needs both halves of the acknowledgement, the
   # profile's own `experimental:` and the operator's `allow_experimental:`.
-  # The gate is the same whether the backend is a plugin-side stub (rknn)
-  # or executes but has not soaked (qnn since the phase-2 wiring): non-ort
-  # means experimental until this comment says otherwise. Refused at load
-  # rather than at group start because this is where an operator reads
-  # diagnostics; a start-time refusal is a respawn loop in a log file
-  # nobody is tailing.
+  # Both execute (qnn on the generic board, rknn on the Rockchip one) and
+  # neither has soaked: non-ort means experimental until this comment says
+  # otherwise. Refused at load rather than at group start because this is
+  # where an operator reads diagnostics; a start-time refusal is a respawn
+  # loop in a log file nobody is tailing.
   defp check_backend_implemented(acc, _group, %Profile{backend: "ort"}), do: acc
 
   defp check_backend_implemented(acc, group, %Profile{experimental: false} = profile) do
@@ -1285,6 +1290,63 @@ defmodule Cairn.Config do
   end
 
   defp check_ladder_artifacts(acc, _profile), do: acc
+
+  # D-G17: the health ratio is the accelerator against the CPU, and a backend
+  # whose artifact the CPU cannot run is measured on its FP32 ONNX twin. No
+  # twin named is an error, like a missing artifact; a named twin that is not
+  # on disk only costs the ratio, so it warns. For a ladder every rung must
+  # name one (tomorrow's fleet edit selects another), pack rungs included —
+  # naming is the profile file's promise, not the disk's, and a pack installs
+  # later — and the file is checked for the rung that runs.
+  defp check_cpu_twin(acc, group, %Profile{} = profile) do
+    if Profile.cpu_twin?(profile.backend),
+      do: check_twin_named(acc, group, profile),
+      else: acc
+  end
+
+  defp check_twin_named(acc, group, %Profile{model_ladder: rungs} = profile)
+       when is_list(rungs) do
+    acc =
+      rungs
+      |> Enum.with_index(1)
+      |> Enum.reject(fn {rung, _index} -> Profile.cpu_twin(%{profile | model: rung.model}) end)
+      |> Enum.reduce(acc, fn {_rung, index}, acc ->
+        add_error(acc, no_twin(group, profile, "ladder rung #{index}"))
+      end)
+
+    if profile.resolved_rung, do: check_twin_file(acc, profile), else: acc
+  end
+
+  defp check_twin_named(acc, group, profile) do
+    if Profile.cpu_twin(profile),
+      do: check_twin_file(acc, profile),
+      else: add_error(acc, no_twin(group, profile, "it"))
+  end
+
+  defp no_twin(group, profile, where) do
+    "plugin #{group.name}: profile #{profile.name} runs backend #{profile.backend}, whose " <>
+      "artifact the CPU baseline cannot run, but #{where} names no model.onnx — name the " <>
+      "model's FP32 ONNX twin there"
+  end
+
+  defp check_twin_file(acc, profile) do
+    case Profile.cpu_twin(profile) do
+      nil ->
+        acc
+
+      path ->
+        if File.regular?(path) do
+          acc
+        else
+          add_warning(
+            acc,
+            "profile #{profile.name}: CPU twin #{path} does not exist or is not a regular " <>
+              "file — #{profile.backend} will load and detect, but its health cannot be " <>
+              "judged against the CPU"
+          )
+        end
+    end
+  end
 
   # The labels file gets the artifact's treatment for the artifact's reason:
   # it is a path the engine reads against the same cwd. Absence is not an

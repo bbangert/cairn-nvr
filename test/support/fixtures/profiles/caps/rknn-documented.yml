@@ -1,5 +1,5 @@
 # A family the model zoo documents: no acknowledgement needed by this rule
-# (running a stubbed backend still needs one — that is a different check).
+# (running an unproven backend still needs one — that is a different check).
 backend: rknn
 model:
   rknn: test/support/fixtures/models/stub.rknn

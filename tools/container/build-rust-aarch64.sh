@@ -5,9 +5,13 @@
 #   plugins/cairn-ort     -> libcairn_ort.so      (inference NIF)
 #   plugins/cairn-detect  -> cairn-detect         (canary / parity binary)
 #
-# and, when CAIRN_BOARD=rockchip, the board library's probe binary:
+# and, when CAIRN_BOARD=rockchip, the board library's NIF and probe binary:
 #
-#   boards/cairn_rockchip -> rockchip/cairn-rockchip-probe
+#   boards/cairn_rockchip -> rockchip-nif/libcairn_rockchip.so  (RKNN engine NIF)
+#                         -> rockchip/cairn-rockchip-probe       (its canary)
+#
+# in separate directories, because the image copies rockchip/ wholesale onto
+# PATH and rockchip-nif/ into the board library's priv/native.
 #
 # Cross, never qemu (D-C3): the NIFs and these binaries are the only
 # arch-native artifacts; BEAM bytecode is arch-neutral and ERTS comes from the arm64
@@ -60,15 +64,14 @@ cp plugins/cairn-detect/target/$TARGET/release/cairn-detect \
   "$DIST/"
 artifacts=(cairn-detect libcairn_native.so libcairn_ort.so)
 
-# libcairn_rockchip.so comes out of the same invocation and is not copied:
-# no release depends on the board library.
 if [ "${CAIRN_BOARD:-}" = rockchip ]; then
   (cd boards/cairn_rockchip/native/cairn_rockchip &&
     cargo build --release --target "$TARGET" --features ort-load-dynamic)
-  mkdir -p "$DIST/rockchip"
-  cp boards/cairn_rockchip/native/cairn_rockchip/target/$TARGET/release/cairn-rockchip-probe \
-    "$DIST/rockchip/"
-  artifacts+=(rockchip/cairn-rockchip-probe)
+  board_out=boards/cairn_rockchip/native/cairn_rockchip/target/$TARGET/release
+  mkdir -p "$DIST/rockchip" "$DIST/rockchip-nif"
+  cp "$board_out/cairn-rockchip-probe" "$DIST/rockchip/"
+  cp "$board_out/libcairn_rockchip.so" "$DIST/rockchip-nif/"
+  artifacts+=(rockchip/cairn-rockchip-probe rockchip-nif/libcairn_rockchip.so)
 fi
 
 for f in "${artifacts[@]}"; do

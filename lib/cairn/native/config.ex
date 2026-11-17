@@ -22,6 +22,7 @@ defmodule Cairn.Native.Config do
     embedder_model: nil,
     decoder: "auto",
     sample_fps: 5,
+    cpu_twin: nil,
     qnn: %{}
   }
 
@@ -53,7 +54,11 @@ defmodule Cairn.Native.Config do
     decoder: :string,
     # The crate's own range (`SAMPLE_FPS` in config.rs), checked twice because its
     # check is on the far side of a decode that raises.
-    sample_fps: {:integer, 1..30}
+    sample_fps: {:integer, 1..30},
+    # The FP32 ONNX file `Cairn.Native.Host` measures the CPU baseline on when
+    # the CPU cannot run `model`. Host-side only: the NIFs' map decode ignores
+    # the key and `to_argv/1` does not render it.
+    cpu_twin: {:optional, :string}
   ]
 
   @qnn_types [

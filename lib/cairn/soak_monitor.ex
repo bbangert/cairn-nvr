@@ -117,6 +117,7 @@ defmodule Cairn.SoakMonitor do
 
   defp sample(state) do
     memory = :erlang.memory()
+    board = Cairn.Board.module()
 
     %{
       at: DateTime.utc_now(),
@@ -125,11 +126,15 @@ defmodule Cairn.SoakMonitor do
       memory_binary: memory[:binary],
       memory_ets: memory[:ets],
       process_count: length(Process.list()),
-      # Both NIFs, separately: the decode and inference halves load
+      # The two halves separately: decode and inference libraries load
       # independently, and a report that aggregated them would say "loaded"
-      # while the inference half silently wasn't.
-      native_available: Cairn.Native.available?(),
-      ort_available: CairnOrt.available?(),
+      # while the inference half silently wasn't. Each half is every library
+      # the board names for it, so a Rockchip release whose board NIF failed
+      # reads false although CairnOrt loaded. The keys keep their names for
+      # sample-file continuity.
+      native_available: loaded?(Enum.map(board.decoders(), &board.decoder_backend/1)),
+      ort_available:
+        loaded?(for backend <- Map.keys(board.backends()), do: board.engine(backend).module),
       host_restarts: state.host_restarts,
       presence_ledger: ets_size(Cairn.PresenceLedger),
       counts: state.counts,
@@ -137,6 +142,8 @@ defmodule Cairn.SoakMonitor do
       max_temp_mc: max_thermal()
     }
   end
+
+  defp loaded?(modules), do: modules |> Enum.uniq() |> Enum.all?(& &1.available?())
 
   defp ets_size(table) do
     case :ets.info(table, :size) do

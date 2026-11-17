@@ -516,7 +516,7 @@ defmodule Cairn.Native.Host do
       refuse(
         state,
         {:nif_unavailable, state.ort.load_error()},
-        "cairn-ort is not loaded (#{inspect(state.ort.load_error())}); " <>
+        "#{inspect(state.ort)} is not loaded (#{inspect(state.ort.load_error())}); " <>
           "no camera on this node will be detected on"
       )
     end
@@ -545,8 +545,8 @@ defmodule Cairn.Native.Host do
     case state.ort.init(config) do
       {:ok, engine} ->
         Logger.info(
-          "cairn-ort: engine ready — model #{config.model} backend #{config.backend} " <>
-            "(canary #{inspect(canary)})"
+          "cairn-native: #{inspect(state.ort)} engine ready — model #{config.model} " <>
+            "backend #{config.backend} (canary #{inspect(canary)})"
         )
 
         %{state | engine: engine, engine_state: :ready, cpu_baseline_ms: nil}
@@ -584,8 +584,12 @@ defmodule Cairn.Native.Host do
   # deadline can be sized from pass arithmetic alone). A model too big to
   # finish inside the deadline costs one killed subprocess in the background
   # and stays at nil — the monitor's honest :not_applicable.
+  #
+  # A backend whose artifact the CPU cannot run is measured on its FP32 ONNX
+  # twin (`cpu_twin`, D-G17); the logs keep naming the accelerator's model.
   defp start_baseline(state, config) do
     state = stop_baseline(state)
+    measured = if config.cpu_twin, do: %{config | model: config.cpu_twin}, else: config
 
     cond do
       not NativeConfig.accelerator?(config) ->
@@ -593,7 +597,12 @@ defmodule Cairn.Native.Host do
 
       # The engine has already refused or will serve without a baseline
       # either way; a subprocess run against a missing file is only noise.
-      not File.exists?(config.model) ->
+      config.cpu_twin == nil and not File.exists?(config.model) ->
+        state
+
+      # The engine loaded from another file, so this one's absence is news.
+      not File.exists?(measured.model) ->
+        no_baseline(config, "its CPU twin #{measured.model} does not exist")
         state
 
       true ->
@@ -604,7 +613,7 @@ defmodule Cairn.Native.Host do
 
         task =
           Task.Supervisor.async_nolink(Cairn.TaskSupervisor, fn ->
-            canary.cpu_baseline(config, passes, opts)
+            canary.cpu_baseline(measured, passes, opts)
           end)
 
         %{state | baseline_task: %{task: task, config: config}}
@@ -800,11 +809,12 @@ defmodule Cairn.Native.Host do
   end
 
   # The one place the two libraries meet: the engine's resolved input spec is
-  # read out of cairn-ort as plain terms and handed to cairn-native's open,
-  # with the host's own decode config (`decoder`) alongside — so both halves
-  # are built for the same model without either naming the other. `sample_fps`
-  # stays host-side: it is `Cairn.Pipeline.SampleGate`'s rate, handed out in
-  # the reply below, and the crate no longer consumes it.
+  # read out of the engine library (cairn-ort, or a board's) as plain terms
+  # and handed to cairn-native's open, with the host's own decode config
+  # (`decoder`) alongside — so both halves are built for the same model
+  # without either naming the other. `sample_fps` stays host-side: it is
+  # `Cairn.Pipeline.SampleGate`'s rate, handed out in the reply below, and the
+  # crate no longer consumes it.
   defp do_open_decoder(%{engine_state: :ready} = state, camera_id, params, {:ok, source}) do
     # A plain field-read NIF (sub-microsecond, deliberately not
     # dirty-scheduled), so calling it from this process costs nothing.
@@ -1087,9 +1097,10 @@ defmodule Cairn.Native.Host do
     )
   end
 
-  # Two libraries now stand behind one `nif` key: the model side (cairn-ort)
-  # is the one whose absence stops detection wholesale, so it speaks first;
-  # a missing decode library is equally fatal to the branch and is named too.
+  # Two libraries now stand behind one `nif` key: the engine (the board's for
+  # this backend) is the one whose absence stops detection wholesale, so it
+  # speaks first; a missing decode library is equally fatal to the branch and
+  # is named too.
   defp nif_status(state) do
     case {state.ort.load_error(), state.native.load_error()} do
       {nil, nil} -> :available

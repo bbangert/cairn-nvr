@@ -2,10 +2,12 @@
 # and the profile the low-fps stage set was assembled for.
 #
 # experimental: true for two reasons, either one enough on its own. The `rknn`
-# backend parses everywhere but executes nowhere yet (only `ort` runs, D-P10),
-# so a group naming this profile must also set `allow_experimental: true`; and
-# nothing in `docs/npu-backends.md` documents converting the yolox family
-# with rknn-toolkit2, so the conversion below is outside what it covers.
+# backend parses everywhere, executes only on a Rockchip release and has not
+# soaked (D-P10), so a group naming this profile must also set
+# `allow_experimental: true`; and nothing in `docs/npu-backends.md` documents
+# converting the yolox family with rknn-toolkit2, so the conversion below is
+# outside what it covers. It names no `onnx:` CPU twin, so selecting it on a
+# Rockchip release is a load error.
 experimental: true
 backend: rknn
 model:

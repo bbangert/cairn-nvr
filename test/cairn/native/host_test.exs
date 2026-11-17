@@ -695,5 +695,37 @@ defmodule Cairn.Native.HostTest do
       refute_received {:cpu_baseline, _config, _passes, _opts}
       assert GenServer.call(host, :probe).cpu_baseline_ms == nil
     end
+
+    test "a named CPU twin is what the baseline measures, under the accelerator's name" do
+      host = start_host(config: %{model: "m.rknn", backend: "rknn", cpu_twin: @stub_onnx})
+
+      assert_receive {:init, %{model: "m.rknn"}}
+      assert_receive {:cpu_baseline, %{model: @stub_onnx}, 5, _opts}
+      assert settled_baseline(host) == 45.0
+
+      # Info is below the suite's log level, so the name is read off a warning.
+      control(%{cpu_baseline: {:error, "it said nothing"}})
+
+      log =
+        capture_log(fn ->
+          host = start_host(config: %{model: "m.rknn", backend: "rknn", cpu_twin: @stub_onnx})
+          assert settled_baseline(host) == nil
+        end)
+
+      assert log =~ "no CPU baseline for m.rknn: it said nothing"
+    end
+
+    test "a named CPU twin that is missing is said, not skipped silently" do
+      log =
+        capture_log(fn ->
+          host = start_host(config: %{model: "m.rknn", backend: "rknn", cpu_twin: "gone.onnx"})
+
+          assert_receive {:init, %{model: "m.rknn"}}
+          assert GenServer.call(host, :probe).cpu_baseline_ms == nil
+        end)
+
+      refute_received {:cpu_baseline, _config, _passes, _opts}
+      assert log =~ "no CPU baseline for m.rknn: its CPU twin gone.onnx does not exist"
+    end
   end
 end
