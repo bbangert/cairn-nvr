@@ -2897,7 +2897,8 @@ defmodule Cairn.ConfigTest do
       assert Profile.capabilities("ort") == %{
                artifact: "onnx",
                fused_nms: true,
-               dynamic_shapes: true
+               dynamic_shapes: true,
+               cpu_twin: false
              }
 
       # The documented near-collision: Rust reports `.onnx` as qnn's artifact
@@ -2907,13 +2908,15 @@ defmodule Cairn.ConfigTest do
       assert Profile.capabilities("qnn") == %{
                artifact: "qnn",
                fused_nms: false,
-               dynamic_shapes: false
+               dynamic_shapes: false,
+               cpu_twin: false
              }
 
       assert Profile.capabilities("rknn") == %{
                artifact: "rknn",
                fused_nms: false,
-               dynamic_shapes: false
+               dynamic_shapes: false,
+               cpu_twin: false
              }
     end
 

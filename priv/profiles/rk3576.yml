@@ -1,9 +1,11 @@
 # Rockchip RK3576 (6 TOPS, INT4-capable) — rk3566-lowfps's pipeline with room
 # to run it faster.
 #
-# experimental: true on both of rk3566-lowfps's counts: the `rknn` backend is a
-# stub (a group naming this profile also needs `allow_experimental: true`), and
-# no source read here documents converting the yolox family with rknn-toolkit2.
+# experimental: true on both of rk3566-lowfps's counts: the `rknn` backend has
+# not soaked (a group naming this profile also needs `allow_experimental:
+# true`), and no source read here documents converting the yolox family with
+# rknn-toolkit2. It names no `onnx:` CPU twin either, so selecting it on a
+# Rockchip release is a load error.
 experimental: true
 backend: rknn
 model:

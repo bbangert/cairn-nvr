@@ -4,9 +4,9 @@
 #   generic  — linux/arm64 is the QCS6490 add-on (QNN/HTP via the dsp: true
 #              bind); linux/amd64 is the x86 smoke build (sw decode, ORT CPU;
 #              qnn refuses loudly)
-#   rockchip — linux/arm64 only, the RK3566 add-on: ORT CPU and sw decode;
-#              the MPP and librga userspace is carried, and nothing loads it
-#              yet
+#   rockchip — linux/arm64 only, the RK3566 add-on: sw decode, ORT CPU or
+#              the RKNN engine NIF (librknnrt is not in the image); the MPP
+#              and librga userspace is carried, and nothing loads it yet
 # Rust artifacts and the Rockchip libraries cross-compile on the build host
 # (D-C3); the only compile under emulation is the BEAM release, because BEAM
 # bytecode is arch-neutral and ERTS comes from the arm64 hexpm image.
@@ -27,7 +27,8 @@ ARG CAIRN_BOARD=generic
 
 # ---------------------------------------------------------------------------
 # Rust artifacts: the two NIFs and the cairn-detect canary, plus (arm64) the
-# fastrpc userspace and, for CAIRN_BOARD=rockchip, the board's probe binary.
+# fastrpc userspace and, for CAIRN_BOARD=rockchip, the board's NIF and probe
+# binary.
 # Runs on the build platform, links for the target.
 FROM --platform=$BUILDPLATFORM rust:1.97-trixie AS native-build
 ARG TARGETARCH
@@ -64,6 +65,9 @@ COPY tools/container/build-rust-aarch64.sh tools/container/
 ARG CAIRN_BOARD
 RUN <<'EOS'
 set -eux
+# Always present, so release-build's COPY of the board NIF has a source on
+# every board and arch.
+mkdir -p /dist/rockchip-nif
 if [ "$TARGETARCH" = "arm64" ]; then
   CAIRN_BOARD="$CAIRN_BOARD" tools/container/build-rust-aarch64.sh /dist
 else
@@ -325,11 +329,26 @@ ENV MIX_ENV=prod
 
 RUN mix local.hex --force && mix local.rebar --force
 
+# mix.exs and config/config.exs both read it: the board picks the board
+# library dependency and `config/boards/<board>.exs`.
+ARG CAIRN_BOARD
+ENV CAIRN_BOARD=${CAIRN_BOARD}
+
 COPY mix.exs mix.lock ./
-# Path dependencies (`libs/`) resolve at deps.get, so they come in with mix.exs.
+# Path dependencies (`libs/`, `boards/`) resolve at deps.get, so they come in
+# with mix.exs; a generic build carries the board library and uses none. Only
+# the board library's mix.exs here and its lib/ before deps.compile — never
+# boards/ whole, whose Rust crate under native/ native-build already built,
+# and whose every edit would otherwise invalidate the dependency layers.
 COPY libs libs
+COPY boards/cairn_rockchip/mix.exs boards/cairn_rockchip/
 RUN mix deps.get --only prod
 COPY config config
+COPY boards/cairn_rockchip/lib boards/cairn_rockchip/lib
+# Before the board library compiles: mix links a dependency's priv/ into the
+# build only if it exists then, and `Cairn.Rockchip.Native` loads from
+# `:code.priv_dir(:cairn_rockchip)`. Empty for a generic build.
+COPY --from=native-build /dist/rockchip-nif/ boards/cairn_rockchip/priv/native/
 RUN mix deps.compile
 COPY priv priv
 COPY lib lib
@@ -340,6 +359,11 @@ RUN mix compile
 RUN mix assets.setup && mix assets.deploy
 COPY --from=native-build /dist/libcairn_native.so /dist/libcairn_ort.so priv/native/
 RUN mix release
+# Where `Cairn.Rockchip.Native` loads it from: a NIF missing here would show
+# only on the board, as rknn refused at preflight.
+RUN if [ "$CAIRN_BOARD" = rockchip ]; then \
+    test -f _build/prod/rel/cairn/lib/cairn_rockchip-*/priv/native/libcairn_rockchip.so; \
+  fi
 
 # ---------------------------------------------------------------------------
 # What every board's runtime shares; the vendor-* stages below add the board.
@@ -411,12 +435,16 @@ EOS
 
 COPY --from=rockchip-libs /dist/models/ /app/models/
 COPY --from=native-build /dist/rockchip/ /usr/local/bin/
-# Nothing in the image runs the probe, so an unresolved library would first
-# show on the board.
-RUN <<'EOS'
+# The host runs the probe as rknn's canary and CPU baseline and loads the NIF
+# at boot, both only on the board, so an unresolved library is caught here on
+# the target platform instead. The NIF is checked from native-build's copy,
+# the file the release-build stage puts in the release.
+RUN --mount=type=bind,from=native-build,source=/dist/rockchip-nif,target=/tmp/rockchip-nif <<'EOS'
 set -eux
-ldd /usr/local/bin/cairn-rockchip-probe
-if ldd /usr/local/bin/cairn-rockchip-probe | grep -q 'not found'; then exit 1; fi
+for bin in /usr/local/bin/cairn-rockchip-probe /tmp/rockchip-nif/libcairn_rockchip.so; do
+  ldd "$bin"
+  if ldd "$bin" | grep -q 'not found'; then exit 1; fi
+done
 EOS
 
 # ---------------------------------------------------------------------------

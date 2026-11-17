@@ -11,14 +11,18 @@ defmodule Cairn.Config.Profile do
   every field the model half reads (`model:` a mapping of path strings,
   `model_profile:`/`decoder:`/`labels:` strings, `experimental:` a boolean)
   are rejected here. So are names outside the menus — `backend:` and
-  `decoder:` against the release's board (`Cairn.Stage.Board`), `model_profile:`
-  against the Rust catalog's decode contracts and their families — and the two
-  backend/family combinations `docs/npu-backends.md` calls out, one broken and
-  one unverified (see `check_capabilities/5`).
+  `decoder:` against the release's board (`Cairn.Stage.Board`),
+  `model_profile:` against the Rust catalog's decode contracts and their
+  families — and the two backend/family combinations `docs/npu-backends.md`
+  calls out, one broken and one unverified (see `check_capabilities/5`).
   `Cairn.Config` rejects a profiled group whose model artifact or labels file
-  is missing, or whose backend is stubbed (see "Rust argv" below).
-  Profiles are files, never inline config: shipped ones live
-  in `priv/profiles/*.yml` — the four board profiles cairn ships — then the
+  is missing, that names no CPU twin its backend needs (a named twin missing
+  on disk only warns), or whose backend is unproven (see "The model half"
+  below). Shipped files naming a backend the release's board does not
+  provide are not loaded.
+
+  Profiles are files, never inline config: shipped ones live in
+  `priv/profiles/*.yml` — the four board profiles cairn ships — then the
   board's `profiles_dir/0`, then operator ones in the directories the
   top-level `profile_dirs:` key lists; a later file wins a name collision
   (with a warning saying so).
@@ -38,9 +42,11 @@ defmodule Cairn.Config.Profile do
                              # 1 = presence detection, 2 = accurate MOT.
                              # Absent = no tier semantics (today's behavior).
   experimental: false        # true before any group may run a non-ort backend
-  backend: ort               # ort | rknn | qnn — qnn executes behind the
-                             # experimental gate; rknn is still a stub
-  model:                     # per-backend artifact paths
+  backend: ort               # ort | rknn | qnn, as the release's board offers;
+                             # rknn and qnn run behind the experimental gate
+  model:                     # per-backend artifact paths; onnx: is also the
+                             # FP32 CPU twin a backend the CPU cannot run
+                             # needs (rknn on a Rockchip release)
     onnx: models/yolox_nano.onnx
   model_profile: yolox       # Rust catalog family name
   input_size: 416
@@ -122,14 +128,16 @@ defmodule Cairn.Config.Profile do
   of those six (D-P4); the motion and track-floor scene knobs are not among
   them and stay operator-owned (D-P6).
 
-  Three things `Cairn.Config` refuses at load, which is where an operator
+  Four things `Cairn.Config` refuses at load, which is where an operator
   reads diagnostics: a `model:` artifact that is not on disk, a `labels:`
-  file that is not on disk, and a group running a backend other than `ort`
-  — experimental until proven in soak, whether the engine executes it (qnn)
-  or stubs it (rknn) (D-P10) — unless the profile declares
-  `experimental: true` *and* the group sets `allow_experimental: true`. The two file paths are checked only for a
-  profile some group actually runs, so a board profile for hardware this node
-  does not have costs it nothing.
+  file that is not on disk, a backend whose capability asks for a CPU twin
+  with no `model.onnx` named (a named twin that is not on disk only warns:
+  health then has no baseline), and a group running a backend other than
+  `ort` — experimental until proven in soak (D-P10) — unless the profile
+  declares `experimental: true` *and* the group sets
+  `allow_experimental: true`. The file paths are checked only for a profile
+  some group actually runs, so a board profile for hardware this node does
+  not have costs it nothing.
 
   Parsed on `Cairn.Config`'s `add_error/2`/`add_warning/2` contract like
   its `Camera`/`PluginGroup` siblings.
@@ -254,12 +262,15 @@ defmodule Cairn.Config.Profile do
   @typedoc """
   One backend's row of the capability table: the `model:` key its artifact is
   named under, whether it runs an export with the NMS op fused into the graph,
-  and whether it accepts a graph that leaves a spatial dim symbolic.
+  whether it accepts a graph that leaves a spatial dim symbolic, and whether
+  the CPU baseline needs an FP32 ONNX twin under `model.onnx` because it
+  cannot run the artifact.
   """
   @type capabilities :: %{
           artifact: String.t(),
           fused_nms: boolean(),
-          dynamic_shapes: boolean()
+          dynamic_shapes: boolean(),
+          cpu_twin: boolean()
         }
 
   @typedoc """
@@ -350,6 +361,9 @@ defmodule Cairn.Config.Profile do
   def artifact(%__MODULE__{backend: backend, model: model}),
     do: Map.get(model, artifact_key(backend))
 
+  # Where a twin is named: the key `ort`'s own artifact goes under.
+  @twin_key "onnx"
+
   # The six model decisions a profile owns. `--motion-json`/
   # `--track-floor-json` equivalents are absent on purpose: they describe
   # the scene, not the model (D-P6).
@@ -384,15 +398,34 @@ defmodule Cairn.Config.Profile do
   defaults it, and the two of the six with a default (`decoder: "auto"`,
   `sample_fps: 5`) take the crate's own clap values.
 
-  `backend:` rides along here; it is not one of the six model fields.
+  `backend:` rides along here; it is not one of the six model fields, and
+  nor is `cpu_twin`, the `model.onnx` path, carried only when the backend's
+  capability asks for one.
   """
   @spec native_config(t()) :: map()
   def native_config(%__MODULE__{} = profile) do
     profile
     |> model()
+    |> Map.put(:cpu_twin, cpu_twin(profile))
     |> Map.reject(fn {_field, value} -> is_nil(value) end)
     |> Map.put(:backend, profile.backend)
   end
+
+  @doc """
+  The FP32 ONNX twin this profile names for the CPU baseline, or `nil` when
+  its backend needs none or it names none.
+  """
+  @spec cpu_twin(t()) :: String.t() | nil
+  def cpu_twin(%__MODULE__{backend: backend, model: model}) do
+    if cpu_twin?(backend), do: Map.get(model, @twin_key)
+  end
+
+  @doc "Whether `backend`'s CPU baseline needs an FP32 ONNX twin."
+  @spec cpu_twin?(String.t()) :: boolean()
+  # Access, not `.cpu_twin`: on a board whose rows are all false (generic)
+  # the type checker infers `false` here and warns that `cpu_twin/1`'s twin
+  # branch is dead.
+  def cpu_twin?(backend), do: capabilities(backend)[:cpu_twin]
 
   @doc """
   Loads every `*.yml` under `dirs` into a name → profile map.
@@ -402,19 +435,33 @@ defmodule Cairn.Config.Profile do
   file shadows both — and each collision is warned about by name, since a silently
   shadowed profile is how a fleet ends up running settings nobody can find
   in a file they are reading.
+
+  A `{dir, :provided_only}` entry skips, without a diagnostic, each file whose
+  `backend:` the release's board does not provide.
   """
-  @spec load_dirs([Path.t()], map()) :: {%{String.t() => t()}, map()}
+  @spec load_dirs([Path.t() | {Path.t(), :provided_only}], map()) ::
+          {%{String.t() => t()}, map()}
   def load_dirs(dirs, acc) do
-    Enum.reduce(dirs, {%{}, acc}, fn dir, {profiles, acc} ->
-      dir |> Path.join("*.yml") |> Path.wildcard() |> Enum.sort() |> load_files(profiles, acc)
+    Enum.reduce(dirs, {%{}, acc}, fn entry, {profiles, acc} ->
+      {dir, provided_only?} =
+        case entry do
+          {dir, :provided_only} -> {dir, true}
+          dir -> {dir, false}
+        end
+
+      dir
+      |> Path.join("*.yml")
+      |> Path.wildcard()
+      |> Enum.sort()
+      |> load_files(profiles, acc, provided_only?)
     end)
   end
 
-  defp load_files(paths, profiles, acc) do
+  defp load_files(paths, profiles, acc, provided_only?) do
     Enum.reduce(paths, {profiles, acc}, fn path, {profiles, acc} ->
       name = Path.basename(path, ".yml")
 
-      case load_file(path, name, acc) do
+      case load_file(path, name, acc, provided_only?) do
         {nil, acc} ->
           {profiles, acc}
 
@@ -438,10 +485,16 @@ defmodule Cairn.Config.Profile do
     end
   end
 
-  defp load_file(path, name, acc) do
+  defp load_file(path, name, acc, provided_only?) do
     case YamlElixir.read_from_file(path) do
-      {:ok, raw} -> parse(raw, name, acc)
-      {:error, err} -> {nil, Config.add_error(acc, "profile #{name}: #{Exception.message(err)}")}
+      {:ok, %{} = raw} when provided_only? ->
+        if provided?(raw), do: parse(raw, name, acc), else: {nil, acc}
+
+      {:ok, raw} ->
+        parse(raw, name, acc)
+
+      {:error, err} ->
+        {nil, Config.add_error(acc, "profile #{name}: #{Exception.message(err)}")}
     end
   end
 
@@ -1187,6 +1240,7 @@ defmodule Cairn.Config.Profile do
 
   defp backends, do: Cairn.Board.module().backends()
   defp backend?(backend), do: Map.has_key?(backends(), backend)
+  defp provided?(raw), do: backend?(Map.get(raw, "backend", "ort"))
   defp model_keys, do: backends() |> Map.values() |> Enum.map(& &1.artifact)
 
   # "a, b or c" — enumerated from the table rather than hand-written so a value

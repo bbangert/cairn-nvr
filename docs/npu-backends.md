@@ -141,8 +141,9 @@ criterion live there and in
   enforces. The plugin's own surface for that check is the
   `infer latency: backend=… p50=… p95=…` stderr line `Detector::detect`
   emits every 100 runs. The in-VM host runs the same check unattended:
-  `Cairn.Native.Host` measures the CPU pass once at engine init
-  (`cpu_baseline_ms`, a second ORT session on the same model) and
+  `Cairn.Native.Host` measures the CPU pass once per engine load, in a
+  subprocess (`--cpu-baseline` on the same model, or on the profile's FP32
+  ONNX twin where the CPU cannot run the artifact — `rknn`), and
   `Cairn.Native.Health` reads the live pass latency against it. A backend
   it cannot measure is left unjudged rather than guessed at.
 - **Measured, phase-2 proof runs (2026-08-07, board .87, yolox_nano

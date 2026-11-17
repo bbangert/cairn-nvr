@@ -99,6 +99,13 @@ by format but is not the same file as the fp32 export. One profile can
 therefore carry the artifacts for several backends, and its own `backend:`
 picks which one becomes `--model`.
 
+A backend whose artifact the CPU cannot run (`rknn` on a Rockchip release)
+also needs `onnx:`: the FP32 export the `.rknn` was converted from, its **CPU
+twin**. The node's health check judges the accelerator against one CPU pass
+of the same model, and that pass is measured on the twin. No `onnx:` on such
+a profile — or on any rung of such a ladder — fails the load; one that names
+a file not on disk loads with a warning and no health ratio.
+
 An `.rknn` has its mean and std folded in at conversion and is fed the frame's
 bytes, so the `model_profile:` beside it must name the family it was converted
 as: the channel order and scale are the ones in "Input conventions" in
@@ -384,11 +391,13 @@ The release's board carries a static table of what each backend accepts
 config load has to answer these questions with no plugin running and, for a
 board profile written ahead of its hardware, no such device attached.
 
-| backend | artifact key | runs a fused-NMS export | takes dynamic shapes |
-|---|---|---|---|
-| `ort` | `model.onnx` | yes | yes |
-| `rknn` | `model.rknn` | no | no |
-| `qnn` | `model.qnn` | no | no |
+| backend | artifact key | runs a fused-NMS export | takes dynamic shapes | needs a CPU twin |
+|---|---|---|---|---|
+| `ort` | `model.onnx` | yes | yes | no |
+| `rknn` | `model.rknn` | no | no | no (generic) / yes (Rockchip) |
+| `qnn` | `model.qnn` | no | no | no |
+
+The Rockchip board's table has only the `ort` and `rknn` rows.
 
 Two rules come out of it, both from `docs/npu-backends.md`:
 
@@ -478,6 +487,9 @@ plugin detect: profile my-board uses backend rknn, which is experimental
   — set allow_experimental: true on this plugin group to run it anyway
 plugin detect: profile my-board names no model.rknn artifact for its rknn
   backend — the engine takes its model from the profile alone
+plugin detect: profile my-board runs backend rknn, whose artifact the CPU
+  baseline cannot run, but it names no model.onnx — name the model's FP32
+  ONNX twin there
 ```
 
 And warnings, which do not fail the load:
@@ -493,6 +505,9 @@ camera front: track: has no effect at tier 1 — tier 1 runs no tracker and
   persists no track rows; record: gates presence recordings
 plugin detect: profile my-board names backend "rknn", which the <board> board
   provides but cannot use on this host: <the board's reason>
+profile my-board: CPU twin models/gone.onnx does not exist or is not a regular
+  file — rknn will load and detect, but its health cannot be judged against
+  the CPU
 ```
 
 The last is raised once per selected profile, for `backend:` and `decoder:`
@@ -585,10 +600,12 @@ Four profiles in `priv/profiles/`, each with its reasoning in the file:
 | `qcs6490-tier1` | `qnn` | derived per rung | none (tier 1 — no tracker) | the model-ladder file: six rungs serving both installation states (yolo26 packs installed, or only the baked Apache models — yolox_m carries small fleets there), claim 40 cameras; tiny/nano boundary-measured, the rest provisional |
 
 Three of the four are `experimental: true` for the same blunt reason: their
-backends have not proven out in soak. Only `ort` runs today; `rknn` (executes
-on an RK3566's NPU, in the Rockchip board library's probe binary only) and
-`qnn` (executes, unsoaked) parse everywhere, and a group naming one refuses to
-load without your `allow_experimental: true`.
+backends have not proven out in soak. `rknn` (executes on a Rockchip
+release, unsoaked) and `qnn` (executes on the generic one, unsoaked) need
+your `allow_experimental: true` on the group that names one. A Rockchip
+release does not load `qcs6490-tier1` (its board provides no `qnn`), and the
+two `rknn` profiles name no CPU twin, so selecting either there fails the
+load until they are replaced with the board's own.
 
 A group that named the retired `qcs6490` placeholder now fails with
 "unknown profile" — point it at `qcs6490-tier1`. The placeholder was a

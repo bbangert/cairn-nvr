@@ -47,6 +47,7 @@ defmodule Cairn.NativeTest do
                labels: nil,
                allow_label_mismatch: false,
                embedder_model: nil,
+               cpu_twin: nil,
                decoder: "auto",
                sample_fps: 5,
                qnn: %{

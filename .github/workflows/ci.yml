@@ -74,6 +74,12 @@ jobs:
   sobelow:
     name: Sobelow
     runs-on: ubuntu-latest
+    # Per board: the board picks a dependency and a config file.
+    strategy:
+      matrix:
+        board: [generic, rockchip]
+    env:
+      CAIRN_BOARD: ${{ matrix.board }}
 
     steps:
       - uses: actions/checkout@v7
@@ -90,9 +96,9 @@ jobs:
           path: |
             deps
             _build
-          key: mix-sobelow-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          key: mix-sobelow-${{ matrix.board }}-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            mix-sobelow-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+            mix-sobelow-${{ matrix.board }}-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
 
       - run: mix deps.get
 
@@ -105,6 +111,12 @@ jobs:
   dialyzer:
     name: Dialyzer
     runs-on: ubuntu-latest
+    # Per board: the board picks a dependency and a config file.
+    strategy:
+      matrix:
+        board: [generic, rockchip]
+    env:
+      CAIRN_BOARD: ${{ matrix.board }}
 
     steps:
       - uses: actions/checkout@v7
@@ -121,17 +133,17 @@ jobs:
           path: |
             deps
             _build
-          key: mix-dialyzer-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          key: mix-dialyzer-${{ matrix.board }}-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            mix-dialyzer-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+            mix-dialyzer-${{ matrix.board }}-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
 
       - name: Cache dialyzer PLTs
         uses: actions/cache@v6
         with:
           path: priv/plts
-          key: plt-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          key: plt-${{ matrix.board }}-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            plt-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+            plt-${{ matrix.board }}-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
 
       - run: mix deps.get
 
@@ -170,6 +182,55 @@ jobs:
 
       - name: Full-pipeline integration test (real ffmpeg)
         run: mix test --only integration
+
+  test-rockchip:
+    name: Test (CAIRN_BOARD=rockchip)
+    runs-on: ubuntu-latest
+    # Not the full suite: it assumes the generic menu (qnn ladders, hardware
+    # decoder names, rknn fixtures without a twin), so config_test.exs and its
+    # kin are generic-only; rockchip_release_test.exs covers that menu instead.
+    env:
+      CAIRN_BOARD: rockchip
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        id: beam
+        with:
+          elixir-version: "1.20"
+          otp-version: "28"
+
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Cache deps and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: mix-test-rockchip-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-test-rockchip-${{ steps.beam.outputs.elixir-version }}-${{ steps.beam.outputs.otp-version }}-
+
+      - run: mix deps.get
+
+      - run: mix compile --warnings-as-errors
+
+      - run: >-
+          mix test
+          test/cairn/rockchip_release_test.exs
+          test/cairn/camera_tracker_test.exs
+          test/cairn/camera_tracker_control_test.exs
+          test/cairn/camera_tracker_recorder_test.exs
+          test/cairn/camera_tracker_restore_test.exs
+          test/cairn/event_extractor_test.exs
+          test/cairn/reconnect_integration_test.exs
+          test/cairn/native/
+          test/cairn/config_server_test.exs
+          test/cairn/config_server_update_test.exs
+          test/cairn/config_source_test.exs
 
   audit:
     name: Hex audit · Unused deps
