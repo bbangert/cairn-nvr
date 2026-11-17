@@ -537,7 +537,12 @@ defmodule CairnWeb.Api.EventStreamEndpointTest do
       {sock, body} = open_stream(server)
 
       {:ok, _, _} = Server.reload()
-      send(handler(server), {:disk_alert, %{after_reload: true}})
+      pid = handler(server)
+      # Signals from two senders arrive in no guaranteed order, so the reload's
+      # broadcast alone would not prove a notification is handled before the
+      # alert; one from this process is.
+      send(pid, {:config_changed, %{}})
+      send(pid, {:disk_alert, %{after_reload: true}})
 
       body = recv_until(sock, body, &(&1 =~ ~s("after_reload":true}\n\n)))
       refute body =~ @end_of_body
