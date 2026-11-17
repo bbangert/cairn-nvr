@@ -250,8 +250,15 @@ fn decode_stream(data: &[u8], aus: &[Au], args: &Args) -> Result<(Value, Vec<Val
         s.drain(&mut decoder, args.hold_after)?;
         thread::sleep(RETRY_SLEEP);
     }
-    let elapsed = started.elapsed();
     let stats = decoder.stats();
+    if !decoder.eos() {
+        bail!(
+            "no EOS frame {DEADLINE:?} after the last AU: {} frames of {} AUs",
+            stats.frames,
+            stats.accepted
+        );
+    }
+    let elapsed = started.elapsed();
     let first_idr_au = (args.skip_aus..aus.len()).find(|&index| aus[index].idr);
     let summary = json!({
         "event": "stream", "aus": s.fed, "accepted": stats.accepted,

@@ -338,15 +338,17 @@ impl MppDecoder {
             if frame.get(self.context.library.frame_get_eos) != 0 {
                 self.eos = true;
             }
-            if frame.buffer().is_null() {
-                continue;
-            }
+            // Before the buffer check: MPP's buffer-less EOS frame carries
+            // errinfo or discard when the stream ended in error.
             if frame.get(self.context.library.frame_get_errinfo) != 0 {
                 self.stats.errinfo += 1;
                 continue;
             }
             if frame.get(self.context.library.frame_get_discard) != 0 {
                 self.stats.discarded += 1;
+                continue;
+            }
+            if frame.buffer().is_null() {
                 continue;
             }
             self.stats.frames += 1;
@@ -898,6 +900,20 @@ mod tests {
         assert_eq!(calls().matches("frame_deinit").count(), 3);
         let stats = decoder.stats();
         assert_eq!((stats.errinfo, stats.discarded, stats.frames), (1, 1, 0));
+    }
+
+    #[test]
+    fn an_error_marked_bufferless_eos_frame_is_counted_and_still_ends_the_stream() {
+        let _guard = stubs();
+        let mut decoder = open();
+        queue(&[edit(StubFrame::default(), |f| {
+            f.errinfo = 1;
+            f.eos = 1;
+        })]);
+        assert!(decoder.next_frame().unwrap().is_none());
+        assert!(decoder.eos());
+        let stats = decoder.stats();
+        assert_eq!((stats.errinfo, stats.discarded, stats.frames), (1, 0, 0));
     }
 
     #[test]
