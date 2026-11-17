@@ -14,4 +14,12 @@ defmodule Cairn.Rockchip.NativeTest do
       assert kind in [:load_failed, :bad_lib, :load, :reload, :upgrade, :old_code]
     end
   end
+
+  # Undeclared (the behaviours conflict), so the compiler checks none of it.
+  test "the module exports every decoder callback" do
+    Code.ensure_loaded!(Native)
+
+    for {name, arity} <- Cairn.Stage.DecoderNif.behaviour_info(:callbacks),
+        do: assert(function_exported?(Native, name, arity), "#{name}/#{arity}")
+  end
 end

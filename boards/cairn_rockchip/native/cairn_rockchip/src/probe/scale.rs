@@ -10,12 +10,13 @@
 //! rectangle; `hash` is FNV-1a 64 over every sample's such hash, in order.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{ensure, Context as _, Result};
 use cairn_detect::infer::{InputSize, ResizePolicy};
 use serde_json::{json, Value};
 
+use crate::decoder::{ms, summary};
 use crate::dma::{DmaHeap, SYSTEM_HEAP};
 use crate::mpp::Frame;
 use crate::pool::Pool;
@@ -76,19 +77,6 @@ fn fold_pad(run: Option<bool>, pool: Option<bool>) -> Option<bool> {
     match (run, pool) {
         (Some(run), Some(pool)) => Some(run && pool),
         (run, pool) => run.or(pool),
-    }
-}
-
-fn ms(d: Duration) -> f64 {
-    (d.as_secs_f64() * 1e6).round() / 1e3
-}
-
-fn summary(samples: &mut [f64]) -> Value {
-    samples.sort_by(f64::total_cmp);
-    let at = |p: f64| samples[((samples.len() - 1) as f64 * p).round() as usize];
-    match samples.len() {
-        0 => json!({"count": 0}),
-        n => json!({"count": n, "p50": at(0.5), "p99": at(0.99), "max": at(1.0)}),
     }
 }
 

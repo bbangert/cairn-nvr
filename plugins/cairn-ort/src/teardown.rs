@@ -6,7 +6,8 @@
 //! release that on QNN gives back an HTP context, or `rknn_destroy` in the board
 //! library hosting this engine: work bounded by nothing this crate controls.
 //! Calling `close_stream` does not avoid it, since nothing stops the BEAM from
-//! collecting a term.
+//! collecting a term. [`defer`] is public so a library linking this crate can
+//! defer its own resources too.
 //!
 //! One thread, not one per drop: a supervisor restarting every camera at once
 //! queues N teardowns rather than spawning N threads onto a busy box. One per
@@ -26,8 +27,8 @@ type Discarded = Box<dyn Send + 'static>;
 /// Nothing in here may unwind. rustler does not wrap a destructor in
 /// [`catch_unwind`] the way it wraps a NIF body, so an unwind out of this
 /// function reaches C and aborts the node — hence every drop, the two inline
-/// fallbacks included, goes through [`drop_swallowing_panics`].
-pub(crate) fn defer<T: Send + 'static>(value: T) {
+/// fallbacks included, goes through `drop_swallowing_panics`.
+pub fn defer<T: Send + 'static>(value: T) {
     defer_to(queue(), value)
 }
 

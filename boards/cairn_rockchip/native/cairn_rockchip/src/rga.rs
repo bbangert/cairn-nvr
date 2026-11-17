@@ -161,7 +161,7 @@ impl ChannelOrder {
 /// librga's `rga_check_align` wants a row's bytes to be a multiple of the
 /// core's byte stride, 4 on RGA2: for RGB888 a width stride that is a
 /// multiple of 4. A slot's rows are packed, so that is its width.
-fn check_slot(size: InputSize) -> Result<()> {
+pub(crate) fn check_slot(size: InputSize) -> Result<()> {
     ensure!(
         (2..=MAX_SLOT).contains(&size.w) && (2..=MAX_SLOT).contains(&size.h),
         "RGB888 slot {size} is outside RGA2's 2x2 to {MAX_SLOT}x{MAX_SLOT} output"
