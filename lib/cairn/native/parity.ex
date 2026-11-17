@@ -3,7 +3,7 @@ defmodule Cairn.Native.Parity do
   The same clip through both detection producers, frame by frame: `cairn-detect`
   over RTP on 127.0.0.1, fed by `plugins/cairn-detect/verify/feed.py` and decoded
   by `Cairn.PluginProtocol.decode_line/2`, against the split NIF boundary —
-  `Cairn.Native.decode_au/4` through `Cairn.Pipeline.SampleGate` into
+  `Cairn.Native.decode_au/4` through `Cairn.Stage.SampleGate` into
   `CairnOrt.push_frame/4`, the very sequence `Cairn.Pipeline.Decoder` and
   `Cairn.Pipeline.Inference` run — over the clip's own access units. Both ends
   are `Cairn.Observation` structs.
@@ -42,8 +42,8 @@ defmodule Cairn.Native.Parity do
   alias Cairn.Native.Config
   alias Cairn.Native.Observations
   alias Cairn.Observation
-  alias Cairn.Pipeline.SampleGate
   alias Cairn.PluginProtocol
+  alias Cairn.Stage.SampleGate
 
   @default_plugin "plugins/cairn-detect/target/release/cairn-detect"
   @feed_py "plugins/cairn-detect/verify/feed.py"

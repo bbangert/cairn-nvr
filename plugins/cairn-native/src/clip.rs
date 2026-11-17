@@ -229,7 +229,7 @@ impl From<cairn_ort::NativeError> for RigError {
 }
 
 /// Both halves of the boundary plus the orchestration the Elixir side owns
-/// between them: the wall-clock rate gate (`Cairn.Pipeline.SampleGate`'s
+/// between them: the wall-clock rate gate (`Cairn.Stage.SampleGate`'s
 /// semantics, restated here because the whole point of the split is that the
 /// crate no longer has them) and the frame handoff. Everything goes through
 /// the same resource wrappers the NIFs use, so the locks under test are the

@@ -66,7 +66,7 @@ defmodule Cairn.Native do
 
   @doc """
   Feed one access unit; take its frame when `sample` cleared the caller's
-  rate gate (`Cairn.Pipeline.SampleGate`).
+  rate gate (`Cairn.Stage.SampleGate`).
 
   The boolean is whether the decoder *completed* a frame for this access unit —
   what the rate gate spends its interval on, whatever became of the

@@ -13,7 +13,7 @@ defmodule Cairn.Pipeline.Picker do
   A keyframe is the exception and displaces whatever is waiting.
 
   The rate lives past the decoder, in `Cairn.Pipeline.Decoder`'s
-  `Cairn.Pipeline.SampleGate` — after decode and before the conversion.
+  `Cairn.Stage.SampleGate` — after decode and before the conversion.
   Thinning here instead would admit only keyframe-headed AUs, since a stateful
   decoder needs its references — capping detection at the GOP rate, which on
   this fleet is 0.21-0.50/s against a `sample_fps` of 5. And because

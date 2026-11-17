@@ -57,7 +57,8 @@ elixirc "${PA[@]}" -o "$OUT" \
   "$ROOT/lib/cairn/native/health.ex" \
   "$ROOT/lib/cairn/native/canary.ex" \
   "$ROOT/lib/cairn/native/host.ex" \
-  "$ROOT/lib/cairn/pipeline/sample_gate.ex" \
+  "$ROOT/libs/cairn_stage/lib/cairn/stage/sample_gate.ex" \
+  "$ROOT/libs/cairn_stage/lib/cairn/stage/decoder_core.ex" \
   "$ROOT/lib/cairn/pipeline/picker.ex" \
   "$ROOT/lib/cairn/pipeline/decoder.ex" \
   "$ROOT/lib/cairn/pipeline/inference.ex" \

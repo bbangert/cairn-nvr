@@ -131,7 +131,7 @@ defmodule Cairn.Native.Host do
 
   Answers with the decoder's handle, the module to drive it through (the
   board's decode library, or the test stub the host was configured with) and
-  the engine's `sample_fps` — `Cairn.Pipeline.SampleGate`'s rate, handed out
+  the engine's `sample_fps` — `Cairn.Stage.SampleGate`'s rate, handed out
   here so every camera's gate reads the one configured value. The handle is the
   *caller's*: no registry claim guards it
   (that belongs to the inference stream), the per-frame `decode_au` calls
@@ -813,7 +813,7 @@ defmodule Cairn.Native.Host do
   # and handed to cairn-native's open, with the host's own decode config
   # (`decoder`) alongside — so both halves are built for the same model
   # without either naming the other. `sample_fps` stays host-side: it is
-  # `Cairn.Pipeline.SampleGate`'s rate, handed out in the reply below, and the
+  # `Cairn.Stage.SampleGate`'s rate, handed out in the reply below, and the
   # crate no longer consumes it.
   defp do_open_decoder(%{engine_state: :ready} = state, camera_id, params, {:ok, source}) do
     # A plain field-read NIF (sub-microsecond, deliberately not
