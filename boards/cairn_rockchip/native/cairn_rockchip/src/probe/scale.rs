@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use crate::decoder::{ms, summary};
 use crate::dma::{DmaHeap, SYSTEM_HEAP};
 use crate::mpp::Frame;
-use crate::pool::Pool;
+use crate::pool::{Allocator, Pool};
 use crate::rga::{Blitter, ChannelOrder, Plan, Rga, Slot, SlotAllocator};
 
 pub(super) const FLAGS: [&str; 5] = ["--scale", "--resize", "--pad", "--every", "--dump"];
@@ -65,11 +65,20 @@ pub(super) fn resolve(flags: &[(&str, &str)]) -> Result<Option<Scale>, String> {
     }))
 }
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+pub(super) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
-fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
+pub(super) fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
     let step = |h: u64, &b: &u8| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
     bytes.iter().fold(hash, step)
+}
+
+/// `run` with one more sample's hash folded in.
+pub(super) fn chain(run: Option<u64>, hash: u64) -> u64 {
+    fnv1a(run.unwrap_or(FNV_OFFSET), &hash.to_le_bytes())
+}
+
+pub(super) fn hex(hash: Option<u64>) -> Option<String> {
+    hash.map(|h| format!("{h:016x}"))
 }
 
 /// `None` while no pool so far had a pad; a spoiled pad in any pool sticks.
@@ -81,9 +90,35 @@ fn fold_pad(run: Option<bool>, pool: Option<bool>) -> Option<bool> {
 }
 
 /// One geometry's plan, its blitter and the pool filled for it.
-struct Planned {
-    blitter: Blitter,
-    pool: Pool<Slot>,
+pub(super) struct Planned {
+    pub(super) blitter: Blitter,
+    pub(super) pool: Pool<Slot>,
+}
+
+impl Planned {
+    pub(super) fn new(
+        rga: Rga,
+        plan: Plan,
+        count: usize,
+        slots: &mut impl Allocator<Slot = Slot>,
+    ) -> Result<Self> {
+        let pool = Pool::new(count, slots)?;
+        Ok(Self {
+            blitter: Blitter::new(rga, plan),
+            pool,
+        })
+    }
+
+    /// The `scale_plan` line's `plan`.
+    pub(super) fn json(&self, policy: ResizePolicy) -> Value {
+        let p = *self.blitter.plan();
+        let rect = |r: crate::rga::sys::Rect| [r.x, r.y, r.width, r.height];
+        json!({
+            "slot": [p.slot.w, p.slot.h], "policy": policy.to_string(),
+            "src_rect": rect(p.src), "src_strides": [p.source.hor_stride, p.source.ver_stride],
+            "dst_rect": rect(p.dst), "scale": [p.scale.0, p.scale.1],
+        })
+    }
 }
 
 #[derive(Default)]
@@ -138,9 +173,7 @@ impl Scaler {
             let plan = Plan::new(geometry, self.scale.size, self.scale.policy)?;
             let order = ChannelOrder::Rgb;
             let mut slots = SlotAllocator::new(self.rga, &self.heap, &plan, order);
-            let pool = Pool::new(SLOTS, &mut slots)?;
-            let blitter = Blitter::new(self.rga, plan);
-            self.run.planned = Some(Planned { blitter, pool });
+            self.run.planned = Some(Planned::new(self.rga, plan, SLOTS, &mut slots)?);
             self.run.plans += 1;
         }
         let Planned { blitter, pool } = self.run.planned.as_mut().expect("set above");
@@ -163,10 +196,7 @@ impl Scaler {
         self.run.blit_ms.push(ms(blitted - started));
         let hash = fnv1a(FNV_OFFSET, content);
         self.run.first_hash.get_or_insert(hash);
-        self.run.hash = Some(fnv1a(
-            self.run.hash.unwrap_or(FNV_OFFSET),
-            &hash.to_le_bytes(),
-        ));
+        self.run.hash = Some(chain(self.run.hash, hash));
         if let (1, Some(path)) = (self.run.blit_ms.len(), &self.scale.dump) {
             let size = self.scale.size;
             let mut ppm = format!("P6\n{} {}\n255\n", size.w, size.h).into_bytes();
@@ -203,21 +233,15 @@ impl Scaler {
             json!({"event": "scale_plan", "rga": self.rga.version(), "plans": self.run.plans});
         let (mut pad_intact, mut exhausted) = (self.run.pad_intact, self.run.exhausted);
         if let Some(planned) = &self.run.planned {
-            let p = *planned.blitter.plan();
-            let rect = |r: crate::rga::sys::Rect| [r.x, r.y, r.width, r.height];
-            plan["plan"] = json!({
-                "slot": [p.slot.w, p.slot.h], "policy": self.scale.policy.to_string(),
-                "src_rect": rect(p.src), "src_strides": [p.source.hor_stride, p.source.ver_stride],
-                "dst_rect": rect(p.dst), "scale": [p.scale.0, p.scale.1],
-            });
+            plan["plan"] = planned.json(self.scale.policy);
             exhausted += planned.pool.stats().exhausted;
             pad_intact = fold_pad(pad_intact, self.pad_intact(planned)?);
         }
         let line = json!({
             "event": "scale", "every": self.scale.every, "sampled": self.run.blit_ms.len(),
             "blit_ms": summary(&mut self.run.blit_ms), "read_ms": summary(&mut self.run.read_ms),
-            "first_hash": self.run.first_hash.map(|h| format!("{h:016x}")),
-            "hash": self.run.hash.map(|h| format!("{h:016x}")), "pad_intact": pad_intact,
+            "first_hash": hex(self.run.first_hash),
+            "hash": hex(self.run.hash), "pad_intact": pad_intact,
             "exhausted": exhausted,
         });
         Ok(vec![plan, line])

@@ -4,6 +4,10 @@
 //! `offset_of!` assertions. Rockchip's header is not in the repo and is
 //! never to be copied in.
 //!
+//! No board script declares the prototype of `rknn_create_mem_from_fd` or
+//! the value of [`MEM_SYNC_FROM_DEVICE`]; only the probe's `--infer` calls
+//! them.
+//!
 //! The library is opened with `dlopen` at [`Library::load`], never linked: a
 //! build host has no librknnrt, and a board that lacks it should fail on the
 //! open naming the file rather than refuse to start the binary.
@@ -32,6 +36,12 @@ pub const QUERY_IN_OUT_NUM: c_int = 0;
 pub const QUERY_INPUT_ATTR: c_int = 1;
 pub const QUERY_OUTPUT_ATTR: c_int = 2;
 pub const QUERY_SDK_VERSION: c_int = 5;
+pub const QUERY_NATIVE_INPUT_ATTR: c_int = 8;
+
+/// `rknn_mem_sync` directions. `zcin.py` ran to-device on the board;
+/// from-device is the public API's value, not run on a board before.
+pub const MEM_SYNC_TO_DEVICE: c_int = 1;
+pub const MEM_SYNC_FROM_DEVICE: c_int = 2;
 
 /// A return code's name, for an error message that can be looked up.
 pub fn code_name(code: c_int) -> &'static str {
@@ -130,6 +140,17 @@ pub struct Output {
 }
 
 #[repr(C)]
+pub struct TensorMem {
+    pub virt_addr: *mut c_void,
+    pub phys_addr: u64,
+    pub fd: i32,
+    pub offset: i32,
+    pub size: u32,
+    pub flags: u32,
+    pub priv_data: *mut c_void,
+}
+
+#[repr(C)]
 pub struct SdkVersion {
     pub api_version: [u8; 256],
     pub drv_version: [u8; 256],
@@ -185,6 +206,15 @@ const _: () = {
     assert!(offset_of!(Output, buf) == 8);
     assert!(offset_of!(Output, size) == 16);
 
+    assert!(size_of::<TensorMem>() == 40);
+    assert!(offset_of!(TensorMem, virt_addr) == 0);
+    assert!(offset_of!(TensorMem, phys_addr) == 8);
+    assert!(offset_of!(TensorMem, fd) == 16);
+    assert!(offset_of!(TensorMem, offset) == 20);
+    assert!(offset_of!(TensorMem, size) == 24);
+    assert!(offset_of!(TensorMem, flags) == 28);
+    assert!(offset_of!(TensorMem, priv_data) == 32);
+
     assert!(size_of::<SdkVersion>() == 512);
     assert!(offset_of!(SdkVersion, api_version) == 0);
     assert!(offset_of!(SdkVersion, drv_version) == 256);
@@ -198,6 +228,22 @@ type RunFn = unsafe extern "C" fn(Context, *mut c_void) -> c_int;
 type OutputsGetFn = unsafe extern "C" fn(Context, u32, *mut Output, *mut c_void) -> c_int;
 type OutputsReleaseFn = unsafe extern "C" fn(Context, u32, *mut Output) -> c_int;
 type SetCoreMaskFn = unsafe extern "C" fn(Context, c_int) -> c_int;
+type CreateMemFn = unsafe extern "C" fn(Context, u32) -> *mut TensorMem;
+type CreateMemFromFdFn =
+    unsafe extern "C" fn(Context, c_int, *mut c_void, u32, c_int) -> *mut TensorMem;
+type DestroyMemFn = unsafe extern "C" fn(Context, *mut TensorMem) -> c_int;
+type SetIoMemFn = unsafe extern "C" fn(Context, *mut TensorMem, *mut TensorAttr) -> c_int;
+type MemSyncFn = unsafe extern "C" fn(Context, *mut TensorMem, c_int) -> c_int;
+
+/// The input-mem entry points, loaded as a set apart from the required ones:
+/// a runtime without them still opens and runs by copy.
+pub struct MemApi {
+    pub(super) create_mem: CreateMemFn,
+    pub(super) create_mem_from_fd: CreateMemFromFdFn,
+    pub(super) destroy_mem: DestroyMemFn,
+    pub(super) set_io_mem: SetIoMemFn,
+    pub(super) mem_sync: MemSyncFn,
+}
 
 /// The entry points this crate calls. The runtime is never unloaded, so they
 /// stay valid for the process: a `dlclose` under whatever threads and exit
@@ -212,6 +258,8 @@ pub struct Library {
     pub(super) outputs_get: OutputsGetFn,
     pub(super) outputs_release: OutputsReleaseFn,
     pub(super) set_core_mask: SetCoreMaskFn,
+    /// Or the first of them the runtime lacks, named.
+    pub(super) mem: std::result::Result<MemApi, String>,
 }
 
 impl Library {
@@ -233,6 +281,16 @@ impl Library {
                     .with_context(|| format!("the RKNN runtime {shown} has no {}", $name))?
             };
         }
+        let mem = (|| -> Result<MemApi> {
+            Ok(MemApi {
+                create_mem: symbol!("rknn_create_mem"),
+                create_mem_from_fd: symbol!("rknn_create_mem_from_fd"),
+                destroy_mem: symbol!("rknn_destroy_mem"),
+                set_io_mem: symbol!("rknn_set_io_mem"),
+                mem_sync: symbol!("rknn_mem_sync"),
+            })
+        })()
+        .map_err(|err| format!("{err:#}"));
         Ok(Self {
             init: symbol!("rknn_init"),
             destroy: symbol!("rknn_destroy"),
@@ -242,6 +300,7 @@ impl Library {
             outputs_get: symbol!("rknn_outputs_get"),
             outputs_release: symbol!("rknn_outputs_release"),
             set_core_mask: symbol!("rknn_set_core_mask"),
+            mem,
         })
     }
 }
