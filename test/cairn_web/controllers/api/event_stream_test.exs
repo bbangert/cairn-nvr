@@ -351,41 +351,432 @@ defmodule CairnWeb.Api.EventStreamTest do
 end
 
 defmodule CairnWeb.Api.EventStreamEndpointTest do
-  # async: false — drives the global Cairn.CameraStatus and its PubSub topic
+  # async: false — drives the global Cairn.CameraStatus and its PubSub topic,
+  # the application's Config.Server and its fixture file, and the limiter
   use CairnWeb.ConnCase, async: false
 
-  @token "test-ha-token"
+  import ExUnit.CaptureLog
 
-  # The controller loop stops on `{:plug_conn, :sent}`, which is how the test
-  # adapter reports a response to the conn's *owner*. Building the conn here
-  # and running the endpoint in a task keeps the test process as that owner:
-  # the message becomes this test's "the stream is open, and it subscribed"
-  # barrier, and the loop only ends when we send it one ourselves.
+  alias Cairn.Config.Server
+  alias CairnWeb.Api.EventStreamController
+  alias CairnWeb.Api.StreamLimiter
+
+  @token "test-ha-token"
+  @fixture "test/support/fixtures/configs/valid.yml"
+  @end_of_body "\r\n0\r\n\r\n"
+
+  # Goes through a real listener because the test adapter reports
+  # `{:plug_conn, :sent}` to the conn's owner, while a real adapter sends it to
+  # the request process; only the latter puts it in the loop's mailbox as
+  # production does.
   test "a plugin status reaches the live SSE endpoint as a camera_status frame" do
     id = "sse_#{System.unique_integer([:positive])}"
     on_exit(fn -> Cairn.CameraStatus.delete(id) end)
 
-    conn = build_conn(:get, "/api/stream?access_token=#{@token}")
-    stream = Task.async(fn -> CairnWeb.Endpoint.call(conn, []) end)
-
-    assert_receive {:plug_conn, :sent}, 5_000
+    server = start_listener()
+    slots = StreamLimiter.count()
+    {sock, body} = open_stream(server)
 
     Cairn.CameraStatus.put(id, %{
       plugin_status: %{"state" => "degraded", "detail" => "cpu fallback"}
     })
 
-    # the cast, and the broadcast inside it, are done once the server's mailbox
-    # flushes — so the frame is in the stream's mailbox ahead of the stop below
-    _ = :sys.get_state(Cairn.CameraStatus)
-    send(stream.pid, {:plug_conn, :sent})
+    # Through the frame's blank line: TCP may split it anywhere.
+    body = recv_until(sock, body, &frame?(&1, id, "cpu fallback"))
 
-    body = Task.await(stream, 5_000).resp_body
-
-    assert body =~ ": connected\n\n"
     assert body =~ "event: camera_status\n"
-    assert body =~ ~s("camera_id":"#{id}")
     assert body =~ ~s("plugin_status":{)
     assert body =~ ~s("state":"degraded")
-    assert body =~ ~s("detail":"cpu fallback")
+
+    # A second frame proves the stream outlived the first: a refute on the
+    # bytes read so far cannot see an end that has not arrived yet.
+    Cairn.CameraStatus.put(id, %{plugin_status: %{"state" => "ok", "detail" => "npu back"}})
+    body = recv_until(sock, body, &frame?(&1, id, "npu back"))
+    refute body =~ @end_of_body
+
+    :ok = :gen_tcp.close(sock)
+
+    # The client is gone; the next write fails and the handler releases.
+    assert eventually(fn ->
+             Cairn.CameraStatus.put(id, %{status: :running})
+             StreamLimiter.count() == slots
+           end)
+  end
+
+  test "an open stream does not hold up the listener's shutdown" do
+    server = start_listener()
+    slots = StreamLimiter.count()
+    {_sock, _body} = open_stream(server)
+    assert StreamLimiter.count() == slots + 1
+
+    {micros, :ok} = :timer.tc(fn -> stop_supervised(:listener) end)
+
+    # Far under the listener's 15 s shutdown_timeout, after which the handler
+    # would be killed instead.
+    assert micros < 3_000_000
+    assert eventually(fn -> StreamLimiter.count() == slots end)
+  end
+
+  test "a handler killed outright frees its slot" do
+    server = start_listener()
+    slots = StreamLimiter.count()
+    {_sock, _body} = open_stream(server)
+    assert StreamLimiter.count() == slots + 1
+
+    Process.exit(handler(server), :kill)
+
+    assert eventually(fn -> StreamLimiter.count() == slots end)
+  end
+
+  test "the stream past the cap is refused with 503" do
+    server = start_listener()
+    previous = Application.fetch_env(:cairn, :max_sse_connections)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, max} -> Application.put_env(:cairn, :max_sse_connections, max)
+        :error -> Application.delete_env(:cairn, :max_sse_connections)
+      end
+    end)
+
+    Application.put_env(:cairn, :max_sse_connections, StreamLimiter.count() + 1)
+    {_sock, _body} = open_stream(server)
+
+    head = recv_until(request(server), "", &(&1 =~ "\r\n\r\n"))
+    assert head =~ ~r/\AHTTP\/1.1 503 /
+  end
+
+  # The supervisor's restart is logged as an error report.
+  @tag :capture_log
+  test "a limiter restart ends the streams whose slots it dropped" do
+    server = start_listener()
+    {sock, body} = open_stream(server)
+    limiter = Process.whereis(StreamLimiter)
+
+    :ok = Supervisor.stop(limiter, :shutdown)
+
+    assert recv_until(sock, body, &String.ends_with?(&1, @end_of_body))
+    # The name is registered before the successor's tables exist.
+    assert eventually(fn ->
+             Process.whereis(StreamLimiter) not in [nil, limiter] and
+               try do
+                 StreamLimiter.count() == 0
+               rescue
+                 ArgumentError -> false
+               end
+           end)
+  end
+
+  # The window between `ApiAuth` and the stream's subscribe, which no
+  # broadcast will cover: entered directly with the token the plug would have
+  # recorded before a rotation. Opened, the stream would block until the
+  # test timed out.
+  @tag timeout: 5_000
+  test "a stream whose token changed before it subscribed is refused with 401" do
+    conn =
+      build_conn()
+      |> put_private(:cairn_api_token, "rotated-away")
+      |> EventStreamController.stream(%{})
+
+    assert json_response(conn, 401) == %{"error" => "unauthorized"}
+    # It subscribed before it was refused, so its process must not serve again.
+    assert get_resp_header(conn, "connection") == ["close"]
+  end
+
+  describe "a config change" do
+    setup :restore_fixture
+
+    test "that rotates the token ends a stream opened with the old one", %{original: original} do
+      server = start_listener()
+      {sock, body} = open_stream(server)
+
+      File.write!(@fixture, String.replace(original, "token: #{@token}", "token: rotated"))
+      {:ok, _, _} = Server.reload()
+
+      assert recv_until(sock, body, &String.ends_with?(&1, @end_of_body))
+      # Not kept alive: the next request on this connection would run in the
+      # process that still holds this stream's subscriptions.
+      assert :gen_tcp.recv(sock, 0, 1_000) == {:error, :closed}
+    end
+
+    test "that removes the token ends the stream", %{original: original} do
+      server = start_listener()
+      {sock, body} = open_stream(server)
+
+      File.write!(@fixture, String.replace(original, "integrations:\n  token: #{@token}\n", ""))
+      {:ok, _, _} = Server.reload()
+      assert Server.ha_token() == nil
+
+      assert recv_until(sock, body, &String.ends_with?(&1, @end_of_body))
+    end
+
+    test "published without a broadcast ends the stream at its next frame" do
+      server = start_listener()
+      {sock, body} = open_stream(server)
+
+      # What a restarted server does: a snapshot, and no `config_changed`.
+      key = Server.snapshot_key(Server)
+      :persistent_term.put(key, %{Server.snapshot() | ha_token: "rotated"})
+      send(handler(server), {:disk_alert, %{after_rotation: true}})
+
+      body = recv_until(sock, body, &String.ends_with?(&1, @end_of_body))
+      refute body =~ "after_rotation"
+    end
+
+    test "that keeps the token leaves the stream open" do
+      server = start_listener()
+      {sock, body} = open_stream(server)
+
+      {:ok, _, _} = Server.reload()
+      pid = handler(server)
+      # Signals from two senders arrive in no guaranteed order, so the reload's
+      # broadcast alone would not prove a notification is handled before the
+      # alert; one from this process is.
+      send(pid, {:config_changed, %{}})
+      send(pid, {:disk_alert, %{after_reload: true}})
+
+      body = recv_until(sock, body, &(&1 =~ ~s("after_reload":true}\n\n)))
+      refute body =~ @end_of_body
+    end
+  end
+
+  describe "over HTTP/2" do
+    setup :restore_fixture
+
+    test "a stream opens and carries frames, with no connection header" do
+      server = start_listener()
+      {conn, ref, resp} = open_h2_stream(server)
+
+      assert Mint.HTTP.protocol(conn) == :http2
+      assert resp.status == 200
+      assert List.keyfind(resp.headers, "connection", 0) == nil
+
+      Phoenix.PubSub.broadcast(
+        Cairn.PubSub,
+        Cairn.Retention.topic(),
+        {:disk_alert, %{over_h2: true}}
+      )
+
+      {_conn, _ref, resp} = h2_recv_until(conn, ref, resp, &(&1.data =~ ~s("over_h2":true}\n\n)))
+      assert resp.data =~ "event: disk_alert\n"
+      refute resp.done
+    end
+
+    test "rotating the token ends the stream and keeps the connection", %{original: original} do
+      server = start_listener()
+      slots = StreamLimiter.count()
+      {conn, ref, resp} = open_h2_stream(server)
+
+      File.write!(@fixture, String.replace(original, "token: #{@token}", "token: rotated"))
+      {:ok, _, _} = Server.reload()
+
+      {conn, _ref, resp} = h2_recv_until(conn, ref, resp, & &1.done)
+      assert resp.done
+      assert Mint.HTTP.open?(conn)
+      assert eventually(fn -> StreamLimiter.count() == slots end)
+    end
+
+    test "an open stream does not hold up the listener's shutdown" do
+      server = start_listener()
+      slots = StreamLimiter.count()
+      {_conn, _ref, _resp} = open_h2_stream(server)
+      assert StreamLimiter.count() == slots + 1
+
+      {micros, :ok} = :timer.tc(fn -> stop_supervised(:listener) end)
+
+      assert micros < 3_000_000
+      assert eventually(fn -> StreamLimiter.count() == slots end)
+    end
+  end
+
+  # A client that reads nothing parks the handler in a socket write: small
+  # buffers on both ends and frames far larger than both — more than one,
+  # because the port driver queues the first whole and it is the next write
+  # that waits. The flood is sent only once the handler is parked, so it all
+  # queues; when the client reads again the handler finishes the write and
+  # finds the backlog before its next receive.
+  test "a client too slow for its backlog has the stream ended" do
+    server = start_listener(thousand_island_options: [transport_options: [sndbuf: 4_096]])
+    {sock, body} = open_stream(server, recbuf: 4_096)
+    pid = handler(server)
+
+    big = String.duplicate("x", 1_000_000)
+    for n <- 1..3, do: send(pid, {:disk_alert, %{n: n, pad: big}})
+    send(pid, :noise)
+    assert eventually(fn -> parked_in_write?(pid) end)
+
+    log =
+      capture_log(fn ->
+        for _ <- 1..1_100, do: send(pid, :noise)
+        assert recv_until(sock, body, &String.ends_with?(&1, @end_of_body))
+      end)
+
+    assert log =~ "reads too slowly"
+  end
+
+  # The listener's exit signal is queued behind the frames; a shutdown that
+  # waited for them would write all of them first.
+  test "a shutdown is not held up by frames queued ahead of it" do
+    server = start_listener(thousand_island_options: [transport_options: [sndbuf: 4_096]])
+    {sock, body} = open_stream(server, recbuf: 4_096)
+    pid = handler(server)
+
+    big = String.duplicate("x", 1_000_000)
+    for n <- 1..3, do: send(pid, {:disk_alert, %{n: n, pad: big}})
+    assert eventually(fn -> parked_in_write?(pid) end)
+
+    for n <- 1..4, do: send(pid, {:disk_alert, %{n: n + 3, pad: big}})
+    send(pid, {:disk_alert, %{last: true, pad: big}})
+
+    {:message_queue_len, queued} = Process.info(pid, :message_queue_len)
+    # `stop_supervised/1` only works from the test process, which is reading
+    # the socket; the supervisor's restart of the stopped listener is harmless.
+    task = Task.async(fn -> Supervisor.stop(server, :shutdown) end)
+
+    assert eventually(fn ->
+             Process.info(pid, :message_queue_len) == {:message_queue_len, queued + 1}
+           end)
+
+    body = recv_until(sock, body, &String.ends_with?(&1, @end_of_body))
+
+    refute body =~ ~s("last":true)
+    assert {:ok, :ok} = Task.yield(task, 3_000)
+  end
+
+  # The loop's own `receive` matches any message, so a waiting process with a
+  # non-empty queue is in someone else's selective receive: the socket write.
+  defp parked_in_write?(pid) do
+    info = Process.info(pid, [:status, :message_queue_len])
+    info[:status] == :waiting and info[:message_queue_len] > 0
+  end
+
+  defp start_listener(opts \\ []) do
+    start_supervised!(
+      Supervisor.child_spec(
+        {Bandit, [plug: CairnWeb.Endpoint, port: 0, ip: :loopback, startup_log: false] ++ opts},
+        id: :listener
+      )
+    )
+  end
+
+  defp open_stream(server, sock_opts \\ []) do
+    sock = request(server, sock_opts)
+    {sock, recv_until(sock, "", &(&1 =~ ": connected\n\n"))}
+  end
+
+  defp request(server, sock_opts \\ []) do
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+
+    {:ok, sock} =
+      :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false] ++ sock_opts)
+
+    :ok =
+      :gen_tcp.send(
+        sock,
+        "GET /api/stream?access_token=#{@token} HTTP/1.1\r\nhost: localhost\r\n\r\n"
+      )
+
+    sock
+  end
+
+  defp restore_fixture(_context) do
+    original = File.read!(@fixture)
+
+    on_exit(fn ->
+      File.write!(@fixture, original)
+      {:ok, _, _} = Server.reload()
+    end)
+
+    %{original: original}
+  end
+
+  defp open_h2_stream(server) do
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+
+    {:ok, conn} =
+      Mint.HTTP.connect(:http, "127.0.0.1", port, protocols: [:http2], mode: :passive)
+
+    {:ok, conn, ref} =
+      Mint.HTTP.request(conn, "GET", "/api/stream", [{"authorization", "Bearer #{@token}"}], nil)
+
+    resp = %{status: nil, headers: [], data: "", done: false}
+    h2_recv_until(conn, ref, resp, &(&1.data =~ ": connected\n\n"))
+  end
+
+  defp h2_recv_until(conn, ref, resp, done?) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    do_h2_recv_until(conn, ref, resp, done?, deadline)
+  end
+
+  defp do_h2_recv_until(conn, ref, resp, done?, deadline) do
+    if done?.(resp) do
+      {conn, ref, resp}
+    else
+      left = max(deadline - System.monotonic_time(:millisecond), 0)
+
+      case Mint.HTTP.recv(conn, 0, left) do
+        {:ok, conn, responses} ->
+          resp = Enum.reduce(responses, resp, &h2_apply(&1, &2, ref))
+          do_h2_recv_until(conn, ref, resp, done?, deadline)
+
+        {:error, _conn, reason, _responses} ->
+          flunk(
+            "HTTP/2 stream ended before the frame arrived: #{inspect(reason)}\n#{inspect(resp)}"
+          )
+      end
+    end
+  end
+
+  defp h2_apply({:status, ref, status}, resp, ref), do: %{resp | status: status}
+
+  defp h2_apply({:headers, ref, headers}, resp, ref),
+    do: %{resp | headers: resp.headers ++ headers}
+
+  defp h2_apply({:data, ref, data}, resp, ref), do: %{resp | data: resp.data <> data}
+  defp h2_apply({:done, ref}, resp, ref), do: %{resp | done: true}
+  defp h2_apply(_other, resp, _ref), do: resp
+
+  defp handler(server) do
+    {:ok, [pid]} = ThousandIsland.connection_pids(server)
+    pid
+  end
+
+  defp frame?(body, id, detail) do
+    body =~ ~r/data: \{[^\n]*"camera_id":"#{id}"[^\n]*"detail":"#{detail}"[^\n]*\}\n\n/
+  end
+
+  defp recv_until(sock, acc, done?) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    do_recv_until(sock, acc, done?, deadline)
+  end
+
+  defp do_recv_until(sock, acc, done?, deadline) do
+    if done?.(acc) do
+      acc
+    else
+      left = max(deadline - System.monotonic_time(:millisecond), 0)
+
+      case :gen_tcp.recv(sock, 0, left) do
+        {:ok, data} ->
+          do_recv_until(sock, acc <> data, done?, deadline)
+
+        {:error, reason} ->
+          flunk("stream ended before the frame arrived: #{inspect(reason)}\n#{acc}")
+      end
+    end
+  end
+
+  defp eventually(fun, tries \\ 50) do
+    cond do
+      fun.() ->
+        true
+
+      tries > 0 ->
+        Process.sleep(100)
+        eventually(fun, tries - 1)
+
+      true ->
+        false
+    end
   end
 end

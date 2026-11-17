@@ -150,7 +150,14 @@ exposed**. `GET /api/events/:id` returns one event object (same shape) or `404`.
 
 `Content-Type: text/event-stream`. Frames are `event: <kind>\ndata: <json>\n\n`.
 A `: ping` comment heartbeat is sent every 20s; entity availability should follow
-the connection. Event kinds:
+the connection. At most 64 streams are open at once; the next is answered
+`503`.
+
+The server ends a stream, and closes its connection, when Cairn shuts down,
+when `integrations.token` is rotated or removed (the reconnect is answered
+`401` until the client has the new token), and when the client reads too
+slowly for the frames queued behind it (more than 1,000 waiting). Edge-only
+frames are not replayed, so re-fetch state on every reconnect. Event kinds:
 
 | `event:` | `data` |
 |----------|--------|

@@ -29,7 +29,9 @@ defmodule CairnWeb.Plugs.ApiAuth do
     with configured when is_binary(configured) <- token_fun.(),
          presented when is_binary(presented) <- presented_token(conn),
          true <- Plug.Crypto.secure_compare(presented, configured) do
-      conn
+      # A long-lived response (`/api/stream`) re-checks against this after
+      # a config change: the token it was let in with may since have gone.
+      put_private(conn, :cairn_api_token, configured)
     else
       _ -> unauthorized(conn)
     end
