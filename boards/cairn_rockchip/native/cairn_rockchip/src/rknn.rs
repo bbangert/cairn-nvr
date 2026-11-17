@@ -6,8 +6,13 @@
 //! or in CI. The tests cover the struct layouts (as compile-time assertions),
 //! the mapping from tensor attrs to [`ModelIo`], the input check, the loader's
 //! failure paths, the artifact refusals (empty, not a regular file), and the
-//! call sequence, the input descriptor and the output-buffer guard over stub
-//! entry points. The board run is the proof of the runtime.
+//! call sequence, the input descriptor, the output-buffer guard and the input
+//! mems' binding, refusals and teardown over stub entry points. The board run
+//! is the proof of the runtime.
+//!
+//! The steps [`Backend::run`] is made of, and the input mems
+//! ([`RknnBackend::bind_input`]), are public for the probe's `--infer`;
+//! nothing in the NIF calls them.
 //!
 //! The artifact folds its normalisation and quantisation in, so it takes the
 //! frame's own bytes ([`InputElement::U8Pixels`]), NHWC; the runtime hands
@@ -23,8 +28,9 @@ pub mod sys;
 
 use std::ffi::{c_int, c_void, OsString};
 use std::io::Read as _;
+use std::os::fd::{BorrowedFd, RawFd};
 use std::path::Path;
-use std::ptr;
+use std::ptr::{self, NonNull};
 
 use anyhow::{bail, Context as _, Result};
 use cairn_detect::cli::Provider;
@@ -52,10 +58,19 @@ fn check(call: &str, code: c_int) -> Result<()> {
     Ok(())
 }
 
-/// One live `rknn_context`, destroyed on drop.
+/// A mem descriptor the runtime returned on a [`Session`]'s context.
+struct MemPtr(NonNull<sys::TensorMem>);
+
+// SAFETY: the descriptor is only read, and handed back to the runtime, by
+// calls on the context that owns it; `MemPtr` is not `Sync`, so neither is a
+// `Session`, and no two threads hold a reference to it at once.
+unsafe impl Send for MemPtr {}
+
+/// One live `rknn_context` and the mems created on it, all destroyed on drop.
 struct Session {
     library: sys::Library,
     ctx: sys::Context,
+    mems: Vec<MemPtr>,
     /// The artifact bytes `rknn_init` was handed. rk.py keeps its copy for the
     /// context's lifetime and the API does not say the runtime copies it, so
     /// this one is freed only after `rknn_destroy`.
@@ -96,6 +111,21 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // A mem is freed through its context, so the mems go first. One
+        // exists only where the mem entry points loaded.
+        if let Ok(api) = &self.library.mem {
+            for mem in self.mems.drain(..) {
+                // SAFETY: a mem the runtime returned on the live `ctx`,
+                // destroyed once, here.
+                let code = unsafe { (api.destroy_mem)(self.ctx, mem.0.as_ptr()) };
+                if code != 0 {
+                    cairn_detect::note!(
+                        "rknn: rknn_destroy_mem returned {code} ({})",
+                        sys::code_name(code)
+                    );
+                }
+            }
+        }
         // SAFETY: `ctx` came from a successful `rknn_init` and is destroyed
         // once, here; no output borrowed from it outlives the backend.
         let code = unsafe { (self.library.destroy)(self.ctx) };
@@ -115,14 +145,30 @@ struct OutputMeta {
     elems: usize,
 }
 
-/// `Send` with no `unsafe impl`, because it stores no raw pointer: the
-/// context is an integer handle, and a run's output pointers live in the
-/// `RunOutputs` that borrows it.
+/// `Send` through `MemPtr`'s `unsafe impl` alone: the context is an
+/// integer handle, and a run's output pointers live in the `RunOutputs` that
+/// borrows it.
 pub struct RknnBackend {
     session: Session,
     io: ModelIo,
     input_size: InputSize,
     outputs: Vec<OutputMeta>,
+    /// The native input attr, queried at the first use.
+    native: Option<sys::TensorAttr>,
+    /// The last [`RknnBackend::set_input`]'s tensor, whose bytes the runtime
+    /// was handed, until the next [`RknnBackend::infer`] takes it.
+    held: Option<InputTensor>,
+}
+
+/// An input mem the backend created; it destroys every one before its
+/// context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputMem(usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemSync {
+    ToDevice,
+    FromDevice,
 }
 
 impl Backend for RknnBackend {
@@ -140,7 +186,20 @@ impl Backend for RknnBackend {
         &self.io
     }
 
-    fn run(&mut self, mut input: InputTensor) -> Result<Box<dyn Tensors + '_>> {
+    fn run(&mut self, input: InputTensor) -> Result<Box<dyn Tensors + '_>> {
+        self.set_input(input)?;
+        // The API does not say when the runtime is done with the bytes, so
+        // they live until the outputs are fetched.
+        let _input = self.infer()?;
+        self.outputs()
+    }
+}
+
+impl RknnBackend {
+    /// `rknn_inputs_set` with the frame's bytes. The API does not say the
+    /// runtime has copied them by the time it returns, so the backend holds
+    /// them until [`Self::infer`] takes them.
+    pub fn set_input(&mut self, mut input: InputTensor) -> Result<()> {
         let bytes = check_input(&mut input, self.input_size)?;
         let (library, ctx) = (&self.session.library, self.session.ctx);
         let size = u32::try_from(bytes.len()).context("rknn input over 4 GiB")?;
@@ -153,14 +212,30 @@ impl Backend for RknnBackend {
             fmt: sys::TENSOR_NHWC,
         };
         // SAFETY: one input, as `ctx` was checked to have at open; `buf` is
-        // `size` bytes this function owns until it returns, so they outlive
-        // `rknn_run` too, should the runtime read them there.
+        // `size` bytes of `input`, which `held` keeps until `infer` has
+        // called `rknn_run` (moving the tensor does not move its bytes).
         check("rknn_inputs_set", unsafe {
             (library.inputs_set)(ctx, 1, &mut set)
         })?;
-        // SAFETY: `ctx` is live; a null extend is the blocking run.
-        check("rknn_run", unsafe { (library.run)(ctx, ptr::null_mut()) })?;
+        self.held = Some(input);
+        Ok(())
+    }
 
+    /// `rknn_run`, blocking. Takes the last [`Self::set_input`]'s tensor and
+    /// hands it back when the run succeeds; a failed run drops it.
+    pub fn infer(&mut self) -> Result<Option<InputTensor>> {
+        let held = self.held.take();
+        // SAFETY: `ctx` is live; a null extend is the blocking run.
+        check("rknn_run", unsafe {
+            (self.session.library.run)(self.session.ctx, ptr::null_mut())
+        })?;
+        Ok(held)
+    }
+
+    /// `rknn_outputs_get`, the buffers checked, released when the result
+    /// drops.
+    pub fn outputs(&mut self) -> Result<Box<dyn Tensors + '_>> {
+        let (library, ctx) = (&self.session.library, self.session.ctx);
         let mut outs: Vec<sys::Output> = (0..self.outputs.len() as u32)
             .map(|index| sys::Output {
                 want_float: 1,
@@ -262,6 +337,7 @@ impl RknnBackend {
         let session = Session {
             library,
             ctx,
+            mems: Vec::new(),
             _model: bytes,
         };
 
@@ -307,6 +383,133 @@ impl RknnBackend {
             io,
             input_size,
             outputs,
+            native: None,
+            held: None,
+        })
+    }
+
+    /// The input attr `rknn_query` reports for the NPU's own layout.
+    pub fn native_input(&mut self) -> Result<sys::TensorAttr> {
+        if let Some(attr) = self.native {
+            return Ok(attr);
+        }
+        // SAFETY: the native-input-attr command fills a tensor attr.
+        let attr = unsafe { self.session.attr(sys::QUERY_NATIVE_INPUT_ATTR, 0) }?;
+        self.native = Some(attr);
+        Ok(attr)
+    }
+
+    fn mem_api(&self) -> Result<&sys::MemApi> {
+        self.session
+            .library
+            .mem
+            .as_ref()
+            .map_err(|missing| anyhow::anyhow!("{missing}"))
+    }
+
+    fn mem(&self, mem: InputMem) -> Result<NonNull<sys::TensorMem>> {
+        let found = self.session.mems.get(mem.0).map(|m| m.0);
+        found.with_context(|| format!("no input mem {}", mem.0))
+    }
+
+    /// The native input's `size_with_stride`, refused unless its rows are
+    /// packed RGB888, as an RGA slot's are.
+    fn packed_input(&mut self) -> Result<u32> {
+        let attr = self.native_input()?;
+        let InputSize { w, h } = self.input_size;
+        let packed = w * h * 3;
+        let row_ok = attr.w_stride == 0 || attr.w_stride as usize == w;
+        if !row_ok || attr.size_with_stride as usize != packed {
+            bail!(
+                "the native input is not packed {w}x{h} RGB888: w_stride {} (want 0 or {w}), \
+                 size_with_stride {} (want {packed})",
+                attr.w_stride,
+                attr.size_with_stride
+            );
+        }
+        Ok(attr.size_with_stride)
+    }
+
+    /// Owns what `call` returned before checking it, so a mem refused here
+    /// is still destroyed.
+    fn keep(&mut self, call: &str, mem: *mut sys::TensorMem, size: u32) -> Result<InputMem> {
+        let mem = NonNull::new(mem).with_context(|| format!("{call} returned no mem"))?;
+        self.session.mems.push(MemPtr(mem));
+        // SAFETY: a descriptor the runtime just returned, live until drop.
+        let given = unsafe { mem.as_ref() }.size;
+        if given < size {
+            bail!("{call} returned a {given}-byte mem for a {size}-byte input");
+        }
+        Ok(InputMem(self.session.mems.len() - 1))
+    }
+
+    /// The dma-buf `fd`, mapped at `virt`, wrapped as an input mem
+    /// (`rknn_create_mem_from_fd`).
+    ///
+    /// # Safety
+    /// `fd` and a mapping of at least the input's size at `virt` must stay
+    /// valid until the backend drops. The runtime is never asked to write an
+    /// input, so the mapping may be read-only. Whether `rknn_destroy_mem`
+    /// closes `fd` is not documented.
+    pub unsafe fn import_input(&mut self, fd: RawFd, virt: *mut c_void) -> Result<InputMem> {
+        let size = self.packed_input()?;
+        let create = self.mem_api()?.create_mem_from_fd;
+        // SAFETY: `ctx` is live; the caller vouches for `fd` and `virt`.
+        let mem = unsafe { create(self.session.ctx, fd, virt, size, 0) };
+        self.keep("rknn_create_mem_from_fd", mem, size)
+    }
+
+    /// An input mem the runtime allocates (`rknn_create_mem`).
+    pub fn create_input(&mut self) -> Result<InputMem> {
+        let size = self.packed_input()?;
+        let create = self.mem_api()?.create_mem;
+        // SAFETY: `ctx` is live; a size is all the call takes.
+        let mem = unsafe { create(self.session.ctx, size) };
+        self.keep("rknn_create_mem", mem, size)
+    }
+
+    /// `mem`'s dma-buf and the input's `size_with_stride`: for a
+    /// [`Self::create_input`] mem the runtime's fd, for an imported one the
+    /// caller's own. Valid while the backend lives, never to be closed here;
+    /// dup it to keep it.
+    pub fn input_fd(&self, mem: InputMem) -> Result<(BorrowedFd<'_>, usize)> {
+        let ptr = self.mem(mem)?;
+        // SAFETY: a live descriptor; mems are destroyed only on drop.
+        let mem_ref = unsafe { ptr.as_ref() };
+        let (fd, size) = (mem_ref.fd, self.native.map_or(0, |a| a.size_with_stride));
+        if fd < 0 {
+            bail!("input mem {} has no fd ({fd})", mem.0);
+        }
+        // SAFETY: the runtime's open descriptor, closed only by
+        // `rknn_destroy_mem`, which runs on drop, after this borrow ends.
+        Ok((unsafe { BorrowedFd::borrow_raw(fd) }, size as usize))
+    }
+
+    /// `rknn_set_io_mem` of `mem` as the input, typed UINT8 NHWC with no
+    /// pass-through, as `zcin.py` bound it.
+    pub fn bind_input(&mut self, mem: InputMem) -> Result<()> {
+        let mut attr = self.native_input()?;
+        attr.type_ = sys::TENSOR_UINT8;
+        attr.fmt = sys::TENSOR_NHWC;
+        attr.pass_through = 0;
+        let (ptr, api) = (self.mem(mem)?, self.mem_api()?);
+        // SAFETY: a live mem of the live `ctx` and a live attr, both read
+        // during the call.
+        check("rknn_set_io_mem", unsafe {
+            (api.set_io_mem)(self.session.ctx, ptr.as_ptr(), &mut attr)
+        })
+    }
+
+    /// `rknn_mem_sync` of `mem`.
+    pub fn sync_input(&mut self, mem: InputMem, mode: MemSync) -> Result<()> {
+        let mode = match mode {
+            MemSync::ToDevice => sys::MEM_SYNC_TO_DEVICE,
+            MemSync::FromDevice => sys::MEM_SYNC_FROM_DEVICE,
+        };
+        let (ptr, api) = (self.mem(mem)?, self.mem_api()?);
+        // SAFETY: a live mem of the live `ctx`; the mode is a plain value.
+        check("rknn_mem_sync", unsafe {
+            (api.mem_sync)(self.session.ctx, ptr.as_ptr(), mode)
         })
     }
 }
@@ -326,8 +529,8 @@ impl Tensors for RunOutputs<'_> {
             .position(|meta| meta.name == name)
             .with_context(|| format!("the artifact has no output {name:?}"))?;
         let meta = &self.backend.outputs[index];
-        // SAFETY: `run` checked this buffer is non-null, f32-aligned and
-        // exactly `elems` f32s before building `self`, and the runtime keeps
+        // SAFETY: `outputs` checked this buffer is non-null, f32-aligned and
+        // exactly `elems` f32s before returning `self`, and the runtime keeps
         // it until `rknn_outputs_release`, which only drop calls — and drop
         // cannot run while this borrow of `self` lives.
         let values =
@@ -463,7 +666,7 @@ fn check_input(input: &mut InputTensor, size: InputSize) -> Result<&mut [u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering::SeqCst};
     use std::sync::{Mutex, MutexGuard};
 
     fn attr(fmt: c_int, type_: c_int, dims: &[u32], name: &[u8]) -> sys::TensorAttr {
@@ -613,8 +816,14 @@ mod tests {
     static OUT_BYTES: AtomicU32 = AtomicU32::new(24);
     static RUN_CODE: AtomicI32 = AtomicI32::new(0);
     static INITS: AtomicUsize = AtomicUsize::new(0);
-    static CALLS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    static CALLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
     static SET_INPUT: Mutex<Option<SetInput>> = Mutex::new(None);
+    static NATIVE_W_STRIDE: AtomicU32 = AtomicU32::new(0);
+    static NATIVE_SIZE: AtomicU32 = AtomicU32::new(72);
+    static CREATE_NULL: AtomicBool = AtomicBool::new(false);
+    static SET_IO_CODE: AtomicI32 = AtomicI32::new(0);
+    static NEXT_FD: AtomicI32 = AtomicI32::new(0);
+    static MEM_SHORT: AtomicU32 = AtomicU32::new(0);
     static OUT_VALUES: [f32; 6] = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0];
 
     struct SetInput {
@@ -627,8 +836,8 @@ mod tests {
         bytes: Vec<u8>,
     }
 
-    fn call(name: &'static str) {
-        CALLS.lock().unwrap().push(name);
+    fn call(name: impl Into<String>) {
+        CALLS.lock().unwrap().push(name.into());
     }
 
     fn stubs() -> MutexGuard<'static, ()> {
@@ -644,6 +853,12 @@ mod tests {
         N_OUTPUT.store(1, SeqCst);
         OUT_BYTES.store(24, SeqCst);
         RUN_CODE.store(0, SeqCst);
+        NATIVE_W_STRIDE.store(0, SeqCst);
+        NATIVE_SIZE.store(72, SeqCst);
+        CREATE_NULL.store(false, SeqCst);
+        SET_IO_CODE.store(0, SeqCst);
+        NEXT_FD.store(0, SeqCst);
+        MEM_SHORT.store(0, SeqCst);
         guard
     }
 
@@ -661,6 +876,7 @@ mod tests {
     }
 
     unsafe extern "C" fn stub_destroy(_: sys::Context) -> c_int {
+        call("rknn_destroy");
         DESTROYED.fetch_add(1, SeqCst);
         0
     }
@@ -689,6 +905,12 @@ mod tests {
                 }
                 sys::QUERY_INPUT_ATTR => *info.cast() = input(&[1, 4, 6, 3]),
                 sys::QUERY_OUTPUT_ATTR => *info.cast() = output(b"output\0", &[1, 2, 3]),
+                sys::QUERY_NATIVE_INPUT_ATTR => {
+                    let mut native = input(&[1, 4, 6, 3]);
+                    native.w_stride = NATIVE_W_STRIDE.load(SeqCst);
+                    native.size_with_stride = NATIVE_SIZE.load(SeqCst);
+                    *info.cast() = native;
+                }
                 _ => return -1,
             }
         }
@@ -701,9 +923,9 @@ mod tests {
         input: *mut sys::Input,
     ) -> c_int {
         call("rknn_inputs_set");
-        // SAFETY: `run` passes one live `Input`.
+        // SAFETY: `set_input` passes one live `Input`.
         let input = unsafe { &*input };
-        // SAFETY: its `buf` is `size` bytes `run` owns until it returns.
+        // SAFETY: its `buf` is `size` bytes the backend holds past the call.
         let bytes =
             unsafe { std::slice::from_raw_parts(input.buf.cast::<u8>(), input.size as usize) };
         *SET_INPUT.lock().unwrap() = Some(SetInput {
@@ -730,7 +952,7 @@ mod tests {
         _: *mut c_void,
     ) -> c_int {
         call("rknn_outputs_get");
-        // SAFETY: `run` passes one live `Output` for the one output reported.
+        // SAFETY: `outputs` passes one live `Output` for the one output reported.
         unsafe {
             (*outs).buf = ptr::from_ref(&OUT_VALUES).cast_mut().cast();
             (*outs).size = OUT_BYTES.load(SeqCst);
@@ -752,6 +974,66 @@ mod tests {
         0
     }
 
+    /// A boxed descriptor whose fd numbers it, so the log tells mems apart.
+    fn stub_mem(call_name: &str, size: u32) -> *mut sys::TensorMem {
+        let fd = NEXT_FD.fetch_add(1, SeqCst);
+        call(format!("{call_name} {size} -> {fd}"));
+        if CREATE_NULL.load(SeqCst) {
+            return ptr::null_mut();
+        }
+        // SAFETY: null pointers and zeros are valid for every field.
+        let mut mem: sys::TensorMem = unsafe { std::mem::zeroed() };
+        (mem.fd, mem.size) = (fd, size - MEM_SHORT.load(SeqCst));
+        Box::into_raw(Box::new(mem))
+    }
+
+    unsafe extern "C" fn stub_create_mem(_: sys::Context, size: u32) -> *mut sys::TensorMem {
+        stub_mem("rknn_create_mem", size)
+    }
+
+    unsafe extern "C" fn stub_create_mem_from_fd(
+        _: sys::Context,
+        fd: c_int,
+        _: *mut c_void,
+        size: u32,
+        _: c_int,
+    ) -> *mut sys::TensorMem {
+        stub_mem(&format!("rknn_create_mem_from_fd({fd})"), size)
+    }
+
+    unsafe extern "C" fn stub_destroy_mem(_: sys::Context, mem: *mut sys::TensorMem) -> c_int {
+        // SAFETY: a `stub_mem` box; destroying one twice would be a double
+        // free.
+        let mem = unsafe { Box::from_raw(mem) };
+        call(format!("rknn_destroy_mem {}", mem.fd));
+        0
+    }
+
+    unsafe extern "C" fn stub_set_io_mem(
+        _: sys::Context,
+        mem: *mut sys::TensorMem,
+        attr: *mut sys::TensorAttr,
+    ) -> c_int {
+        // SAFETY: `bind_input` passes a live mem and a live attr.
+        let (mem, a) = unsafe { (&*mem, &*attr) };
+        let (ty, fmt) = (sys::type_name(a.type_), sys::format_name(a.fmt));
+        call(format!(
+            "rknn_set_io_mem {} {ty} {fmt} pt{} {}",
+            mem.fd, a.pass_through, a.size_with_stride
+        ));
+        SET_IO_CODE.load(SeqCst)
+    }
+
+    unsafe extern "C" fn stub_mem_sync(
+        _: sys::Context,
+        mem: *mut sys::TensorMem,
+        mode: c_int,
+    ) -> c_int {
+        // SAFETY: `sync_input` passes a live mem.
+        call(format!("rknn_mem_sync {} {mode}", unsafe { &*mem }.fd));
+        0
+    }
+
     fn stub_library() -> sys::Library {
         sys::Library {
             init: stub_init,
@@ -762,22 +1044,33 @@ mod tests {
             outputs_get: stub_outputs_get,
             outputs_release: stub_outputs_release,
             set_core_mask: stub_set_core_mask,
+            mem: Ok(sys::MemApi {
+                create_mem: stub_create_mem,
+                create_mem_from_fd: stub_create_mem_from_fd,
+                destroy_mem: stub_destroy_mem,
+                set_io_mem: stub_set_io_mem,
+                mem_sync: stub_mem_sync,
+            }),
         }
     }
 
     fn open_path(path: &Path) -> Result<RknnBackend> {
-        RknnBackend::with_library(stub_library(), path, &SessionOptions::default())
+        open_path_with(path, stub_library())
+    }
+
+    fn open_path_with(path: &Path, library: sys::Library) -> Result<RknnBackend> {
+        RknnBackend::with_library(library, path, &SessionOptions::default())
     }
 
     fn open_stub(tag: &str) -> Result<RknnBackend> {
-        open_stub_with(tag, b"stub")
+        open_stub_with(tag, b"stub", stub_library())
     }
 
-    fn open_stub_with(tag: &str, artifact: &[u8]) -> Result<RknnBackend> {
+    fn open_stub_with(tag: &str, artifact: &[u8], library: sys::Library) -> Result<RknnBackend> {
         let path =
             std::env::temp_dir().join(format!("rknn-stub-{}-{tag}.rknn", std::process::id()));
         std::fs::write(&path, artifact).unwrap();
-        let opened = open_path(&path);
+        let opened = open_path_with(&path, library);
         std::fs::remove_file(&path).unwrap();
         opened
     }
@@ -791,7 +1084,7 @@ mod tests {
         )
     }
 
-    fn calls() -> Vec<&'static str> {
+    fn calls() -> Vec<String> {
         CALLS.lock().unwrap().clone()
     }
 
@@ -843,7 +1136,7 @@ mod tests {
     #[test]
     fn an_empty_artifact_is_refused_before_the_runtime_sees_it() {
         let _guard = stubs();
-        let msg = err(open_stub_with("empty", b""));
+        let msg = err(open_stub_with("empty", b"", stub_library()));
         assert!(
             msg.contains("rknn-stub-") && msg.contains("is empty"),
             "{msg}"
@@ -894,6 +1187,7 @@ mod tests {
         );
         assert_eq!(RELEASED.load(SeqCst), 0);
         assert_eq!(calls(), ["rknn_inputs_set", "rknn_run"]);
+        assert!(backend.held.is_none());
     }
 
     #[test]
@@ -907,5 +1201,100 @@ mod tests {
             assert!(msg.contains(what), "{msg}");
             assert_eq!(DESTROYED.load(SeqCst), 1, "{what}");
         }
+    }
+
+    #[test]
+    fn a_bound_pass_sets_the_mem_as_uint8_nhwc_and_never_calls_inputs_set() {
+        let _guard = stubs();
+        let mut backend = open_stub("bound").unwrap();
+        let mem = backend.create_input().unwrap();
+        assert_eq!(backend.input_fd(mem).unwrap().1, 72);
+        backend.sync_input(mem, MemSync::ToDevice).unwrap();
+        backend.bind_input(mem).unwrap();
+        assert!(backend.infer().unwrap().is_none());
+        drop(backend.outputs().unwrap());
+        drop(backend);
+        let expected = [
+            "rknn_create_mem 72 -> 0",
+            "rknn_mem_sync 0 1",
+            "rknn_set_io_mem 0 UINT8 NHWC pt0 72",
+            "rknn_run",
+            "rknn_outputs_get",
+            "rknn_outputs_release",
+            "rknn_destroy_mem 0",
+            "rknn_destroy",
+        ];
+        assert_eq!(calls(), expected);
+    }
+
+    #[test]
+    fn mems_are_destroyed_once_each_before_the_context_even_after_a_failed_bind() {
+        let _guard = stubs();
+        let mut backend = open_stub("teardown").unwrap();
+        backend.create_input().unwrap();
+        // SAFETY: the stub never reads the fd or the address.
+        let imported = unsafe { backend.import_input(9, ptr::null_mut()) }.unwrap();
+        SET_IO_CODE.store(-5, SeqCst);
+        let msg = err(backend.bind_input(imported));
+        assert!(msg.contains("rknn_set_io_mem returned -5"), "{msg}");
+        drop(backend);
+        let calls = calls();
+        let teardown = ["rknn_destroy_mem 0", "rknn_destroy_mem 1", "rknn_destroy"];
+        assert_eq!(calls[calls.len() - 3..], teardown, "{calls:?}");
+        assert_eq!(calls[1], "rknn_create_mem_from_fd(9) 72 -> 1");
+    }
+
+    #[test]
+    fn a_padded_native_input_or_a_null_mem_is_refused_by_what_it_is() {
+        let _guard = stubs();
+        let mut backend = open_stub("refused").unwrap();
+        CREATE_NULL.store(true, SeqCst);
+        assert!(err(backend.create_input()).contains("rknn_create_mem returned no mem"));
+        // SAFETY: the stub never reads the fd or the address.
+        let msg = err(unsafe { backend.import_input(9, ptr::null_mut()) });
+        assert!(
+            msg.contains("rknn_create_mem_from_fd returned no mem"),
+            "{msg}"
+        );
+
+        let mut backend = open_stub("padded").unwrap();
+        NATIVE_W_STRIDE.store(8, SeqCst);
+        NATIVE_SIZE.store(96, SeqCst);
+        let says = "not packed 6x4 RGB888: w_stride 8 (want 0 or 6), size_with_stride 96 (want 72)";
+        assert!(err(backend.create_input()).contains(says));
+        // SAFETY: refused before the runtime is called.
+        assert!(err(unsafe { backend.import_input(9, ptr::null_mut()) }).contains(says));
+        assert_eq!(NEXT_FD.load(SeqCst), 2, "a create past the refusal");
+    }
+
+    #[test]
+    fn a_mem_smaller_than_the_input_is_refused_and_still_destroyed() {
+        let _guard = stubs();
+        let mut backend = open_stub("short").unwrap();
+        MEM_SHORT.store(1, SeqCst);
+        let msg = err(backend.create_input());
+        assert!(
+            msg.contains("returned a 71-byte mem for a 72-byte input"),
+            "{msg}"
+        );
+        drop(backend);
+        assert!(calls().contains(&"rknn_destroy_mem 0".to_string()));
+    }
+
+    #[test]
+    fn a_runtime_without_the_mem_entry_points_runs_by_copy_and_names_the_missing_one() {
+        let _guard = stubs();
+        let library = sys::Library {
+            mem: Err("the RKNN runtime stub has no rknn_create_mem".into()),
+            ..stub_library()
+        };
+        let mut backend = open_stub_with("nomem", b"stub", library).unwrap();
+        drop(backend.run(frame()).unwrap());
+        assert!(err(backend.create_input()).contains("has no rknn_create_mem"));
+        // SAFETY: refused before the runtime is called.
+        let msg = err(unsafe { backend.import_input(9, ptr::null_mut()) });
+        assert!(msg.contains("has no rknn_create_mem"), "{msg}");
+        drop(backend);
+        assert_eq!(calls().last().unwrap(), "rknn_destroy");
     }
 }

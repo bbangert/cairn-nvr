@@ -20,6 +20,7 @@ pub mod sys;
 
 use std::ffi::{c_char, c_int, CStr, OsString};
 use std::os::fd::RawFd;
+use std::ptr::NonNull;
 use std::sync::OnceLock;
 
 use anyhow::{bail, ensure, Result};
@@ -175,7 +176,7 @@ pub(crate) fn check_slot(size: InputSize) -> Result<()> {
 }
 
 /// A packed RGB888 dma-buf imported into RGA once. Its pad is filled once,
-/// at allocation, around the content rectangle of the plan it was built
+/// when the slot is made, around the content rectangle of the plan it was built
 /// for, and blits write only that rectangle; [`Blitter::blit`] refuses a
 /// slot built for another fit.
 pub struct Slot {
@@ -193,13 +194,24 @@ impl Slot {
         self.buf.read(read)
     }
 
+    /// For a device that reads the slot itself; see [`DmaBuf::fd`].
+    pub(crate) fn fd(&self) -> RawFd {
+        self.buf.fd()
+    }
+
+    /// The slot's read-only mapping; see [`DmaBuf::addr`].
+    pub(crate) fn addr(&self) -> NonNull<u8> {
+        self.buf.addr()
+    }
+
     fn buffer(&self, rga: &Rga) -> sys::Buffer {
         let (w, h) = (self.size.w as u32, self.size.h as u32);
         rga.wrap(self.import.handle, [w, h, w, h], self.order.format())
     }
 }
 
-/// Slots for one [`Plan`], in one channel order, from `heap`.
+/// Slots for one [`Plan`], in one channel order, from `heap` or from buffers
+/// handed to [`SlotAllocator::slot`].
 pub struct SlotAllocator<'a> {
     rga: Rga,
     heap: &'a DmaHeap,
@@ -219,14 +231,22 @@ impl<'a> SlotAllocator<'a> {
             order,
         }
     }
-}
 
-impl Allocator for SlotAllocator<'_> {
-    type Slot = Slot;
+    /// The bytes a slot's buffer must hold: packed RGB888 rows.
+    pub fn buf_len(&self) -> usize {
+        self.size.tensor_len()
+    }
 
-    fn allocate(&mut self, _: usize) -> Result<Slot> {
+    /// A slot over `buf`, which must be [`Self::buf_len`] bytes: imported and its
+    /// pad filled, as [`Allocator::allocate`] does to a heap buffer.
+    pub fn slot(&self, buf: DmaBuf) -> Result<Slot> {
+        ensure!(
+            buf.len() == self.buf_len(),
+            "a slot buffer is {} bytes, not the {} its plan needs",
+            buf.len(),
+            self.buf_len()
+        );
         let (w, h) = (self.size.w as u32, self.size.h as u32);
-        let buf = self.heap.alloc(self.size.tensor_len())?;
         let import = self.rga.import(buf.fd(), w, h, self.order.format())?;
         let slot = Slot {
             import,
@@ -244,6 +264,14 @@ impl Allocator for SlotAllocator<'_> {
         let status = unsafe { (self.rga.library.fill)(dst, all, color, 1) };
         self.rga.check("imfill_t", status)?;
         Ok(slot)
+    }
+}
+
+impl Allocator for SlotAllocator<'_> {
+    type Slot = Slot;
+
+    fn allocate(&mut self, _: usize) -> Result<Slot> {
+        self.slot(self.heap.alloc(self.buf_len())?)
     }
 }
 

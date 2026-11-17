@@ -369,7 +369,7 @@ impl<S: Scaler> Stream<S> {
     }
 }
 
-/// Shared with the probe's `--scale`.
+/// Shared with the probe's `--scale` and `--infer`.
 pub(crate) fn ms(d: Duration) -> f64 {
     (d.as_secs_f64() * 1e6).round() / 1e3
 }

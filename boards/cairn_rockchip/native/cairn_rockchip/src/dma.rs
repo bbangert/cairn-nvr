@@ -1,4 +1,5 @@
-//! dma-buf allocation from a dma-heap, each buffer mapped once for CPU reads.
+//! dma-buf allocation from a dma-heap, or adoption of one another driver
+//! allocated, each buffer mapped once for CPU reads.
 //!
 //! The `system` heap is cached memory that hardware writes behind the CPU's
 //! back, so every CPU read is bracketed by `DMA_BUF_IOCTL_SYNC`; without it
@@ -10,7 +11,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::ptr::NonNull;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 
 /// Not a CMA heap: contiguous memory is scarce, and RGA2's MMU does not need
 /// it. That MMU takes 32-bit physical addresses only, so where RAM reaches
@@ -115,23 +116,8 @@ impl DmaHeap {
             .with_context(|| format!("allocating {len} bytes from {}", self.path))?;
         // SAFETY: the kernel returned a new descriptor that nothing else owns.
         let fd = unsafe { OwnedFd::from_raw_fd(data.fd as RawFd) };
-        // SAFETY: a fresh shared read-only mapping of a buffer of `len` bytes.
-        let map = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd.as_raw_fd(),
-                0,
-            )
-        };
-        if map == libc::MAP_FAILED {
-            let err = std::io::Error::last_os_error();
-            bail!("mapping a {len}-byte dma-buf from {}: {err}", self.path);
-        }
-        let map = NonNull::new(map.cast()).context("mmap returned null")?;
-        Ok(DmaBuf { fd, map, len })
+        DmaBuf::map(fd, len)
+            .map_err(|err| anyhow!("mapping a {len}-byte dma-buf from {}: {err}", self.path))
     }
 }
 
@@ -148,10 +134,55 @@ pub struct DmaBuf {
 unsafe impl Send for DmaBuf {}
 // SAFETY: concurrent `read`s each bracket their own access. A device write
 // during a `read` is the obligation `fd` states; here `rga` writes: a fill
-// before the slot is shared, and blits that need its lease by `&mut`.
+// before the slot is shared, and blits that need its lease by `&mut`. The
+// NPU only reads an input, and an adopted buffer's allocator is never asked
+// to write it.
 unsafe impl Sync for DmaBuf {}
 
 impl DmaBuf {
+    /// A dma-buf another driver allocated, of at least `len` bytes, mapped as
+    /// [`DmaHeap::alloc`] maps its own. `fd` is this buffer's to close: a
+    /// dup, where the allocator keeps its own.
+    pub fn adopt(fd: OwnedFd, len: usize) -> Result<Self> {
+        if len == 0 {
+            bail!("a dma-buf of 0 bytes");
+        }
+        Self::map(fd, len).map_err(|err| anyhow!("an adopted dma-buf: mapping {len} bytes: {err}"))
+    }
+
+    fn map(fd: OwnedFd, len: usize) -> std::io::Result<Self> {
+        // SAFETY: a fresh shared read-only mapping of `len` bytes of a buffer
+        // at least that long.
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if map == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        let map =
+            NonNull::new(map.cast()).ok_or_else(|| std::io::Error::other("mmap returned null"))?;
+        Ok(DmaBuf { fd, map, len })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The read-only mapping's start, for a runtime that takes an address
+    /// beside the fd. Valid while this buffer lives; nothing may write
+    /// through it, and a CPU read through it belongs between [`Self::read`]'s
+    /// syncs.
+    pub(crate) fn addr(&self) -> NonNull<u8> {
+        self.map
+    }
+
     /// Owned by this buffer: valid while it lives, not to be closed. Whoever
     /// hands it to a device for writing keeps every `read` out until the
     /// write is done.
@@ -183,7 +214,7 @@ impl DmaBuf {
 
 impl Drop for DmaBuf {
     fn drop(&mut self) {
-        // SAFETY: the mapping `alloc` made, unmapped once; no slice of it
+        // SAFETY: the mapping `map` made, unmapped once; no slice of it
         // outlives a `read` call.
         unsafe { libc::munmap(self.map.as_ptr().cast(), self.len) };
     }
@@ -208,5 +239,15 @@ mod tests {
         let msg = format!("{:#}", heap.alloc(4096).err().unwrap());
         assert!(msg.contains("4096 bytes from /dev/null"), "{msg}");
         assert!(format!("{:#}", heap.alloc(0).err().unwrap()).contains("0 bytes"));
+    }
+
+    /// `/dev/null` cannot be mapped, so this is the refusal, not the mapping.
+    #[test]
+    fn an_adopted_fd_that_will_not_map_is_refused_with_its_length() {
+        let fd = OwnedFd::from(File::open("/dev/null").unwrap());
+        let msg = format!("{:#}", DmaBuf::adopt(fd, 4096).err().unwrap());
+        assert!(msg.contains("adopted dma-buf: mapping 4096 bytes"), "{msg}");
+        let fd = OwnedFd::from(File::open("/dev/null").unwrap());
+        assert!(format!("{:#}", DmaBuf::adopt(fd, 0).err().unwrap()).contains("0 bytes"));
     }
 }

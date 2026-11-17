@@ -3,7 +3,7 @@
 //! and the [`rga`] scaler, which blits into [`dma`] buffers held in a
 //! [`pool`], all four driven by the `decoder` NIFs; and the probe binary that
 //! runs `cairn-detect`'s CLI with that backend registered, or for
-//! `--rk-probe` the decode-and-scale [`probe`].
+//! `--rk-probe` the decode, scale and infer [`probe`].
 //!
 //! The engine NIFs are `CairnOrt`'s surface over [`rknn::provider`]: same
 //! functions, arities, schedulers, term shapes and `{reason, message}` errors,

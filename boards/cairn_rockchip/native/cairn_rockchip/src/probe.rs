@@ -2,11 +2,13 @@
 //! [`MppDecoder`] the way the pipeline will feed it — one whole access unit
 //! per packet, parameter sets in band, pts = AU index — and report what came
 //! back as bounded JSON lines on stdout. `--scale` also blits samples of it
-//! through RGA (the `scale` submodule).
+//! through RGA (the `scale` submodule), and `--infer` hands those to an
+//! `.rknn` model on the NPU instead (the `infer` submodule).
 //!
 //! This is a standalone binary, so it may sleep and retry; nothing here is
 //! reachable from a NIF.
 
+mod infer;
 mod scale;
 
 use std::ops::Range;
@@ -19,17 +21,21 @@ use anyhow::{bail, Context as _, Result};
 use serde_json::{json, Value};
 
 use crate::mpp::{Frame, Geometry, MppDecoder, Put};
+pub use infer::{Infer, InputMode, SyncMode};
 pub use scale::Scale;
 
 const USAGE: &str = "usage: cairn-rockchip-probe --rk-probe <annexb-file> \
 [--skip-aus N] [--hold-after N] [--streams N] [--fps F] \
-[--scale WxH [--resize letterbox|stretch] [--pad N] [--every N] [--dump PATH]]";
+[--scale WxH [--resize letterbox|stretch] [--pad N] [--every N] [--dump PATH] \
+[--infer MODEL.rknn [--input copy|fd|mem] [--sync none|dmabuf|to-device|from-device] \
+[--order rgb|bgr] [--slots N] [--samples N]]]";
 
 /// Output is at most 34 lines whatever the input: the open line, up to
 /// [`INFO_CHANGE_LINES`], one line per stream and the total, plus
-/// `--scale`'s two (it runs one stream) — or, on an error, the lines before
-/// it and the error line. Under `--scale` librga adds lines of its own, not
-/// JSON (see [`crate::rga`]).
+/// `--scale`'s two or `--infer`'s two (each runs one stream) — or, on an
+/// error, the lines before it and the error line. Under `--scale` librga
+/// adds lines of its own, not JSON (see [`crate::rga`]), and under `--infer`
+/// librknnrt may too.
 const MAX_STREAMS: usize = 16;
 const INFO_CHANGE_LINES: usize = 16;
 
@@ -50,6 +56,7 @@ pub struct Args {
     pub streams: usize,
     pub fps: Option<f64>,
     pub scale: Option<Scale>,
+    pub infer: Option<Infer>,
 }
 
 pub fn parse(args: &[String]) -> Result<Args, String> {
@@ -60,8 +67,9 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
         streams: 1,
         fps: None,
         scale: None,
+        infer: None,
     };
-    let mut scale = Vec::new();
+    let (mut scale, mut infer) = (Vec::new(), Vec::new());
     let mut it = args.iter();
     if it.next().is_none_or(|first| first != "--rk-probe") {
         return Err("--rk-probe comes first".into());
@@ -84,10 +92,12 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
                 _ => return Err("--fps is 0.1 to 1000".into()),
             },
             name if scale::FLAGS.contains(&name) => scale.push((name, value()?.as_str())),
+            name if infer::FLAGS.contains(&name) => infer.push((name, value()?.as_str())),
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
     parsed.scale = scale::resolve(&scale)?;
+    parsed.infer = infer::resolve(&infer, parsed.scale.as_ref())?;
     if parsed.scale.is_some() && parsed.streams != 1 {
         return Err("--scale runs one stream".into());
     }
@@ -181,6 +191,7 @@ struct Stream {
     hold_reached: bool,
     info_changes: Vec<Value>,
     scale: Option<scale::Scaler>,
+    infer: Option<infer::Inferer>,
 }
 
 impl Stream {
@@ -209,6 +220,9 @@ impl Stream {
             if let Some(scaler) = &mut self.scale {
                 scaler.frame(&frame)?;
             }
+            if let Some(inferer) = &mut self.infer {
+                inferer.frame(&frame)?;
+            }
             if let Some(held) = &self.held {
                 self.held_fd_reused |= frame.fd() == held.fd();
                 self.frames_while_held += 1;
@@ -224,12 +238,19 @@ impl Stream {
     }
 }
 
-/// A stream's summary line, its info-change lines and `--scale`'s.
+/// A stream's summary line, its info-change lines and `--scale`'s or
+/// `--infer`'s.
 fn decode_stream(data: &[u8], aus: &[Au], args: &Args) -> Result<(Value, Vec<Value>, Vec<Value>)> {
     let mut decoder = MppDecoder::open()?;
-    let mut s = Stream {
-        scale: args.scale.as_ref().map(scale::Scaler::open).transpose()?,
-        ..Stream::default()
+    let mut s = match (&args.scale, &args.infer) {
+        (Some(scale), Some(infer)) => Stream {
+            infer: Some(infer::Inferer::open(scale, infer)?),
+            ..Stream::default()
+        },
+        (scale, _) => Stream {
+            scale: scale.as_ref().map(scale::Scaler::open).transpose()?,
+            ..Stream::default()
+        },
     };
     let started = Instant::now();
     let period = args.fps.map(|fps| Duration::from_secs_f64(1.0 / fps));
@@ -298,8 +319,12 @@ fn decode_stream(data: &[u8], aus: &[Au], args: &Args) -> Result<(Value, Vec<Val
         "held_fd_reused": s.held_pts.map(|_| s.held_fd_reused),
         "hold_reached": s.hold_reached,
     });
-    let scale = s.scale.map(scale::Scaler::report).transpose()?;
-    Ok((summary, s.info_changes, scale.unwrap_or_default()))
+    let lines = match (s.scale, s.infer) {
+        (Some(scaler), _) => scaler.report()?,
+        (_, Some(inferer)) => inferer.report()?,
+        _ => Vec::new(),
+    };
+    Ok((summary, s.info_changes, lines))
 }
 
 pub fn run(args: &[String]) -> ExitCode {
@@ -395,6 +420,8 @@ fn probe(args: &Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rga::ChannelOrder;
+    use crate::rknn::MemSync;
     use cairn_detect::infer::{InputSize, ResizePolicy};
 
     /// A NAL with a 4-byte start code: header byte, then payload.
@@ -483,6 +510,73 @@ mod tests {
         ] {
             assert!(scale(bad).unwrap_err().contains(says), "{bad:?}");
         }
+    }
+
+    /// `--rk-probe f --scale 416` and then `rest`'s words.
+    fn infer(rest: &str) -> Result<Option<Infer>, String> {
+        let base = ["--rk-probe", "f", "--scale", "416"];
+        let words: Vec<&str> = base.into_iter().chain(rest.split_whitespace()).collect();
+        args(&words).map(|parsed| parsed.infer)
+    }
+
+    #[test]
+    fn infer_arguments_default_parse_and_refuse() {
+        let defaults = Infer {
+            model: "m".into(),
+            input: InputMode::Copy,
+            sync: SyncMode::None,
+            order: ChannelOrder::Rgb,
+            slots: 2,
+            samples: 200,
+        };
+        assert_eq!(infer("--infer m"), Ok(Some(defaults.clone())));
+        assert_eq!(infer(""), Ok(None));
+        let given = "--input fd --sync from-device --order bgr --slots 4 --samples 50 --infer y";
+        let expected = Infer {
+            model: "y".into(),
+            input: InputMode::Fd,
+            sync: SyncMode::Rknn(MemSync::FromDevice),
+            order: ChannelOrder::Bgr,
+            slots: 4,
+            samples: 50,
+        };
+        assert_eq!(infer(given), Ok(Some(expected)));
+        let mem = infer("--infer m --input mem --sync dmabuf")
+            .unwrap()
+            .unwrap();
+        assert_eq!((mem.input, mem.sync), (InputMode::Mem, SyncMode::DmaBuf));
+        let to = infer("--infer m --input fd --sync to-device")
+            .unwrap()
+            .unwrap();
+        assert_eq!(to.sync, SyncMode::Rknn(MemSync::ToDevice));
+        let sync = "--sync needs --input fd or mem";
+        for (bad, says) in [
+            ("--input fd", "--input needs --infer"),
+            ("--samples 5", "--samples needs --infer"),
+            (
+                "--infer m --input dma",
+                "\"dma\" is not one of copy, fd, mem",
+            ),
+            (
+                "--infer m --sync cpu",
+                "not one of none, dmabuf, to-device, from-device",
+            ),
+            ("--infer m --sync dmabuf", sync),
+            ("--infer m --input copy --sync to-device", sync),
+            ("--infer m --sync from-device", sync),
+            ("--infer m --order rgba", "is not one of rgb, bgr"),
+            ("--infer m --slots 0", "--slots is 1 to 4"),
+            ("--infer m --slots 5", "--slots is 1 to 4"),
+            ("--infer m --samples 0", "--samples counts from 1"),
+            ("--infer m --samples x", "not a number"),
+            ("--infer m --dump s.ppm", "--dump is --scale's alone"),
+            ("--infer m --streams 2", "one stream"),
+            ("--infer", "needs a value"),
+        ] {
+            assert!(infer(bad).unwrap_err().contains(says), "{bad:?}");
+        }
+        let unscaled = args(&["--rk-probe", "f", "--infer", "m"]).unwrap_err();
+        assert!(unscaled.contains("--infer needs --scale"), "{unscaled}");
     }
 
     #[test]

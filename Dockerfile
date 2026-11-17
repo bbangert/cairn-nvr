@@ -4,10 +4,10 @@
 #   generic  — linux/arm64 is the QCS6490 add-on (QNN/HTP via the dsp: true
 #              bind); linux/amd64 is the x86 smoke build (sw decode, ORT CPU;
 #              qnn refuses loudly)
-#   rockchip — linux/arm64 only, the RK3566 add-on: sw decode, ORT CPU or
-#              the RKNN engine NIF (librknnrt is not in the image); the MPP
-#              and librga userspace is carried; only the probe binary's
-#              `--rk-probe` loads either yet
+#   rockchip — linux/arm64 only, the RK3566 add-on: sw or MPP decode, ORT
+#              CPU or the RKNN engine NIF (librknnrt is not in the image);
+#              the MPP and librga userspace that `decoder: rkmpp` and the
+#              probe binary's `--rk-probe` load is carried
 # Rust artifacts and the Rockchip libraries cross-compile on the build host
 # (D-C3); the only compile under emulation is the BEAM release, because BEAM
 # bytecode is arch-neutral and ERTS comes from the arm64 hexpm image.
