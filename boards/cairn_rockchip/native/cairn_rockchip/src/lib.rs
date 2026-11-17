@@ -156,7 +156,7 @@ mod tests {
             ("open_decoder", 2, io),
             ("open_stream", 3, cpu),
             ("push_frame", 4, cpu),
-            ("release", 1, normal),
+            ("release", 1, io),
         ]
         .map(|(name, arity, flags)| (name.to_string(), arity, flags));
         assert_eq!(nifs, expected);
