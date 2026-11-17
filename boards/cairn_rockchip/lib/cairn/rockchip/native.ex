@@ -2,13 +2,18 @@ defmodule Cairn.Rockchip.Native do
   @moduledoc """
   The Rockchip board's one NIF library: the RKNN engine, on `CairnOrt`'s
   engine surface (no `cpu_baseline_ms`: the host measures the baseline in a
-  subprocess).
+  subprocess), and the MPP decoder on `Cairn.Stage.DecoderNif`, whose
+  frames are leases on RGA-scaled dma-buf slots that `download/1` reads and
+  `release/1` gives back.
 
   A missing library is a normal state, not a boot failure: this module loads
   `priv/native/libcairn_rockchip`, overridable via `config :cairn_rockchip,
   Cairn.Rockchip.Native, path: ...`, and `load_error/0` says why it did not.
   """
 
+  # Also a `Cairn.Stage.DecoderNif`, undeclared: the two behaviours share
+  # `available?/0`, `load_error/0` and `drain_teardown/1`, which the compiler
+  # reports as conflicting. The suite checks the decoder half instead.
   @behaviour Cairn.Stage.EngineNif
 
   @on_load :load_nif
@@ -45,6 +50,11 @@ defmodule Cairn.Rockchip.Native do
              open_stream: 3,
              push_frame: 4,
              close_stream: 1,
+             open_decoder: 2,
+             decode_au: 4,
+             close_decoder: 1,
+             download: 1,
+             release: 1,
              drain_teardown: 1}
 
   @impl true
@@ -61,6 +71,25 @@ defmodule Cairn.Rockchip.Native do
 
   @impl true
   def close_stream(_stream), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec open_decoder(String.t(), map()) :: {:ok, reference()} | {:error, {atom(), String.t()}}
+  def open_decoder(_camera_id, _params), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec decode_au(reference(), binary(), integer(), boolean()) ::
+          {:ok, {boolean(), Cairn.Stage.DecoderNif.lease_frame() | nil}}
+          | {:error, {atom(), String.t()}}
+  def decode_au(_decoder, _au, _pts, _sample), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec close_decoder(reference()) :: {:ok, boolean()} | {:error, {atom(), String.t()}}
+  def close_decoder(_decoder), do: :erlang.nif_error(:nif_not_loaded)
+
+  # On a dirty CPU scheduler: a frame-sized copy out of the slot.
+  @spec download(reference()) :: {:ok, binary()} | {:error, {atom(), String.t()}}
+  def download(_lease), do: :erlang.nif_error(:nif_not_loaded)
+
+  # Idempotent. A release racing a download waits out its copy.
+  @spec release(reference()) :: :ok
+  def release(_lease), do: :erlang.nif_error(:nif_not_loaded)
 
   # This library's own teardown queue: `CairnOrt`'s drain does not reach it.
   @impl true

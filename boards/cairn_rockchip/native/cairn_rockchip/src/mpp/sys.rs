@@ -37,6 +37,9 @@ pub const FRAME_FMT_MASK: u32 = 0x000f_ffff;
 pub const FRAME_FBC_MASK: u32 = 0x00f0_0000;
 pub const FRAME_TILE_FLAG: u32 = 0x0200_0000;
 
+/// `MPP_FRAME_RANGE_JPEG`; `UNSPECIFIED` is 0 and `MPEG` 1.
+pub const RANGE_FULL: u32 = 2;
+
 /// A return code's name, for an error message that can be looked up.
 pub fn code_name(code: c_int) -> &'static str {
     match code {
@@ -136,6 +139,8 @@ pub struct Library {
     pub(super) frame_get_info_change: FrameU32Fn,
     /// `MppFrameFormat`, a 4-byte enum.
     pub(super) frame_get_fmt: FrameU32Fn,
+    /// `MppFrameColorRange`, a 4-byte enum.
+    pub(super) frame_get_color_range: FrameU32Fn,
     pub(super) frame_get_pts: FramePtsFn,
     pub(super) frame_get_buf_size: FrameBufSizeFn,
     pub(super) frame_get_buffer: FrameBufferFn,
@@ -183,6 +188,7 @@ impl Library {
             frame_get_eos: symbol!("mpp_frame_get_eos"),
             frame_get_info_change: symbol!("mpp_frame_get_info_change"),
             frame_get_fmt: symbol!("mpp_frame_get_fmt"),
+            frame_get_color_range: symbol!("mpp_frame_get_color_range"),
             frame_get_pts: symbol!("mpp_frame_get_pts"),
             frame_get_buf_size: symbol!("mpp_frame_get_buf_size"),
             frame_get_buffer: symbol!("mpp_frame_get_buffer"),

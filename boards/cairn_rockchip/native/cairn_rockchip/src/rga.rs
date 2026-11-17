@@ -161,7 +161,7 @@ impl ChannelOrder {
 /// librga's `rga_check_align` wants a row's bytes to be a multiple of the
 /// core's byte stride, 4 on RGA2: for RGB888 a width stride that is a
 /// multiple of 4. A slot's rows are packed, so that is its width.
-fn check_slot(size: InputSize) -> Result<()> {
+pub(crate) fn check_slot(size: InputSize) -> Result<()> {
     ensure!(
         (2..=MAX_SLOT).contains(&size.w) && (2..=MAX_SLOT).contains(&size.h),
         "RGB888 slot {size} is outside RGA2's 2x2 to {MAX_SLOT}x{MAX_SLOT} output"
@@ -315,14 +315,15 @@ impl Plan {
     }
 }
 
-/// [`Plan`]'s blits. Usage is `IM_SYNC` alone and every buffer's colour space
-/// is left at its default, so librga picks both conversion and kernel. Its
-/// guide gives BT.601 limited range as the default YUV-to-RGB conversion
-/// (under `imcvtcolor`) and, for RK3566's RGA2, average for a downscale and
-/// bilinear or bicubic for an upscale. On the HA Green a downscaled test
-/// pattern sat closest to a software reference of exactly that (about 30 dB,
-/// 7 dB clear of BT.709 or full range); parity with the software path's own
-/// resize is not established.
+/// [`Plan`]'s blits. Usage is `IM_SYNC` alone. The conversion is set on every
+/// blit: BT.601 in the picture's own range, which is what the software path's
+/// swscale does (BT.601 whatever matrix the stream names; libavcodec hands it
+/// `yuvj420p` for a full-range one). The kernel is librga's choice: its guide
+/// gives, for RK3566's RGA2, average for a downscale and bilinear or bicubic
+/// for an upscale. On the HA Green a downscaled limited-range test pattern sat
+/// closest to a software reference of BT.601 limited and that kernel (about
+/// 30 dB, 7 dB clear of BT.709 or full range); parity with the software
+/// path's own resize is not established.
 pub struct Blitter {
     rga: Rga,
     plan: Plan,
@@ -340,7 +341,15 @@ impl Blitter {
     /// The NV12 picture on `fd`, laid out as `geometry`, into the leased
     /// slot's content rectangle. `fd` need only be live for the call. The
     /// `&mut` is what keeps every read of the slot out while RGA writes it.
-    pub fn blit(&mut self, fd: RawFd, geometry: Geometry, lease: &mut Lease<Slot>) -> Result<()> {
+    /// `full_range` is the picture's own, so a stream whose range changes
+    /// never keeps the last one's conversion.
+    pub fn blit(
+        &mut self,
+        fd: RawFd,
+        geometry: Geometry,
+        full_range: bool,
+        lease: &mut Lease<Slot>,
+    ) -> Result<()> {
         let (plan, slot) = (self.plan, lease.slot());
         ensure!(
             geometry == plan.source,
@@ -355,12 +364,28 @@ impl Blitter {
             plan.slot,
             plan.fit
         );
-        let g = geometry;
+        self.convert(fd, geometry, slot.buffer(&self.rga), full_range)
+    }
+
+    /// `dst` is the one buffer librga reads the conversion from; it refuses
+    /// a mode on any blit that is not YUV to RGB.
+    fn convert(
+        &self,
+        fd: RawFd,
+        g: Geometry,
+        mut dst: sys::Buffer,
+        full_range: bool,
+    ) -> Result<()> {
+        let plan = &self.plan;
         let format = sys::FORMAT_YCBCR_420_SP;
         let import = self.rga.import(fd, g.hor_stride, g.ver_stride, format)?;
         let size = [g.width, g.height, g.hor_stride, g.ver_stride];
         let src = self.rga.wrap(import.handle, size, format);
-        let dst = slot.buffer(&self.rga);
+        dst.color_space_mode = if full_range {
+            sys::YUV_TO_RGB_BT601_FULL
+        } else {
+            sys::YUV_TO_RGB_BT601_LIMIT
+        };
         let (none, nowhere) = (sys::Buffer::EMPTY, sys::Rect::default());
         // SAFETY: both buffers wrap live handles; `IM_SYNC`, so the hardware
         // is done on return and `import` may then be released. librga checks
@@ -459,6 +484,72 @@ mod tests {
             plan(unaligned, 640, 640, LETTERBOX),
             "NV12 width stride 1922 is not a multiple of 4",
         );
+    }
+
+    static MODES: std::sync::Mutex<Vec<c_int>> = std::sync::Mutex::new(Vec::new());
+
+    unsafe extern "C" fn stub_import(_: c_int, _: *mut sys::HandleParam) -> sys::Handle {
+        7
+    }
+
+    unsafe extern "C" fn stub_release(_: sys::Handle) -> c_int {
+        sys::STATUS_SUCCESS
+    }
+
+    unsafe extern "C" fn stub_wrap(
+        _: sys::Handle,
+        _: c_int,
+        _: c_int,
+        _: c_int,
+        _: c_int,
+        _: c_int,
+    ) -> sys::Buffer {
+        sys::Buffer::EMPTY
+    }
+
+    unsafe extern "C" fn stub_process(
+        _: sys::Buffer,
+        dst: sys::Buffer,
+        _: sys::Buffer,
+        _: Rect,
+        _: Rect,
+        _: Rect,
+        _: c_int,
+    ) -> c_int {
+        MODES.lock().unwrap().push(dst.color_space_mode);
+        sys::STATUS_SUCCESS
+    }
+
+    unsafe extern "C" fn stub_fill(_: sys::Buffer, _: Rect, _: c_int, _: c_int) -> c_int {
+        sys::STATUS_SUCCESS
+    }
+
+    unsafe extern "C" fn stub_text(_: c_int) -> *const c_char {
+        std::ptr::null()
+    }
+
+    #[test]
+    fn each_blit_sets_the_conversion_from_the_pictures_own_range() {
+        let rga = Rga {
+            library: sys::Library {
+                import_fd: stub_import,
+                release: stub_release,
+                wrap_handle: stub_wrap,
+                process: stub_process,
+                fill: stub_fill,
+                str_error: stub_text,
+                query: stub_text,
+            },
+        };
+        let source = geometry(1920, 1080);
+        let blitter = Blitter::new(rga, plan(source, 640, 640, LETTERBOX).unwrap());
+        MODES.lock().unwrap().clear();
+        for full_range in [true, false, false, true] {
+            let dst = sys::Buffer::EMPTY;
+            blitter.convert(3, source, dst, full_range).unwrap();
+        }
+        let (full, limit) = (sys::YUV_TO_RGB_BT601_FULL, sys::YUV_TO_RGB_BT601_LIMIT);
+        assert_eq!(*MODES.lock().unwrap(), [full, limit, limit, full]);
     }
 
     #[test]
