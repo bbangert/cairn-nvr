@@ -73,6 +73,26 @@
       "False positive: SoakMonitor calls Config.Server.get/0 once in init/1 to read data_dir; that is a read, and Config.Server keeps nothing for SoakMonitor, so no registration can be lost or duplicated on either restart."
   },
   %{
+    analysis: "coupling",
+    file: "lib/cairn/application.ex",
+    title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
+    detail:
+      "Cairn.Artifacts registers with Cairn.Artifacts.Fetcher when it starts, and Cairn.Artifacts.Fetcher keeps it in its state. Both are children of the one_for_one supervisor Cairn.Application, which restarts either alone. When Cairn.Artifacts.Fetcher restarts, its init/1 starts it afresh without what Cairn.Artifacts put there, and Cairn.Artifacts, which is not restarted with it, never registers again. When Cairn.Artifacts restarts, it registers a second time beside what its old process left.",
+    reason:
+      "Deliberate, with both restarts handled: the store's cast is a wake (`:work`) or a request for one config reload (`:reload`), not a registration, and all the fetcher keeps of it is that one owed reload. A fetcher restarted after boot starts owing a reload of its own (init/1: `after_boot?` and `booted?`), which covers one the store had asked for; restarted before boot's end it has not acted on anything yet. A restarted store's second `:reload` merges into the one already owed (`state.owed ||`). The two cannot share a rest_for_one group: the store must start before Cairn.Config.Server and the fetcher after everything a config reload reaches."
+  },
+  %{
+    analysis: "startup",
+    file: "lib/cairn/application.ex",
+    title: "Child starts before its dependency",
+    at_label: "supervision tree defined here",
+    detail:
+      "Cairn.Artifacts starts before Cairn.Artifacts.Fetcher under Cairn.Application, yet depends on it. During startup, Cairn.Artifacts can run while Cairn.Artifacts.Fetcher is not yet alive — calls into it fail until the tree finishes booting.",
+    reason:
+      "Deliberate: all the store sends the fetcher is a GenServer.cast to its registered name, which returns :ok whether or not the process exists, so nothing fails. At boot that cast is meant to be lost: the fetcher starts later, holds until Cairn.Boot ends, and asks the store what is missing itself (init/1's comment in lib/cairn/artifacts.ex). The cast matters only when the store restarts under a running fetcher. The order is forced: the store must be up before Cairn.Config.Server loads, the fetcher after everything a config reload reaches."
+  },
+  %{
     analysis: "shutdown",
     file: "lib/cairn/ffmpeg_port.ex",
     title: "terminate/2 does unbounded work inside the shutdown timeout",
