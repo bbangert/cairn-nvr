@@ -1,11 +1,13 @@
 defmodule Cairn.Artifacts.Fetcher do
   @moduledoc """
   Downloads what `Cairn.Artifacts` has missing, one at a time, and reloads the
-  config after each file it verifies: a config refused for want of the file
-  loads once it is there. A failure is recorded on the artifact, for the
-  config error to name, and reloads when its text changed, since only a load
-  refreshes that error; the missing set is tried again after a backoff of 5 s
-  doubling to 5 min, for as long as the node runs.
+  config after a pass that verified a file: a config refused for want of the
+  file loads once it is there. That reload is owed until one succeeds, as is
+  the one a restarted store asks for; until then the pass is retried, and
+  fetches only what is still missing. A failure is recorded on the artifact,
+  for the config error to name, and reloads when its text changed, since only
+  a load refreshes that error — best effort, never owed. A pass is retried
+  after a backoff of 5 s doubling to 5 min, for as long as the node runs.
 
   Nothing a fetch does may crash this process: the application's top
   supervisor allows three restarts in five seconds and takes the node down on
@@ -37,7 +39,7 @@ defmodule Cairn.Artifacts.Fetcher do
 
   @doc """
   `fetch:` is `(artifact, path) -> :ok | {:error, reason}`, writing the file to
-  `path`; `reload:` is called after each verified file and each changed
+  `path`; `reload:` is called while a reload is owed and after each changed
   failure. `artifacts:` names the `Cairn.Artifacts` server. `after_boot: true`
   waits for `boot_done/1`. `enabled: false` starts nothing.
   """
@@ -68,7 +70,10 @@ defmodule Cairn.Artifacts.Fetcher do
       attempt_timeout: Keyword.get(opts, :attempt_timeout_ms, @attempt_timeout_ms),
       held: held?(opts),
       backoff: nil,
-      retry: nil
+      retry: nil,
+      # While a reload is owed: the file it follows (`nil`: the store's
+      # restart), and whether a failure of it was logged.
+      owed: nil
     }
 
     {:ok, %{state | backoff: state.initial_backoff}, {:continue, :work}}
@@ -85,6 +90,10 @@ defmodule Cairn.Artifacts.Fetcher do
   @impl true
   def handle_cast(:work, state), do: {:noreply, work(state)}
   def handle_cast(:boot_done, state), do: {:noreply, work(%{state | held: false})}
+
+  def handle_cast(:reload, state),
+    do: {:noreply, work(%{state | owed: state.owed || %{name: nil, logged?: false}})}
+
   def handle_cast(_message, state), do: {:noreply, state}
 
   @impl true
@@ -100,10 +109,10 @@ defmodule Cairn.Artifacts.Fetcher do
   defp work(state) do
     with {timer, _ref} <- state.retry, do: Process.cancel_timer(timer)
 
-    results =
-      for entry <- Artifacts.missing(state.artifacts), do: attempt(state, entry)
+    {results, state} = Enum.map_reduce(Artifacts.missing(state.artifacts), state, &attempt/2)
+    state = settle(state)
 
-    if Enum.all?(results, &(&1 == :ok)) do
+    if state.owed == nil and Enum.all?(results, &(&1 == :ok)) do
       %{state | retry: nil, backoff: state.initial_backoff}
     else
       ref = make_ref()
@@ -112,7 +121,7 @@ defmodule Cairn.Artifacts.Fetcher do
     end
   end
 
-  defp attempt(state, entry) do
+  defp attempt(entry, state) do
     partial = "#{entry.path}.#{System.unique_integer([:positive])}.part"
 
     result =
@@ -130,11 +139,12 @@ defmodule Cairn.Artifacts.Fetcher do
     outcome(state, entry, result)
   end
 
+  # Owed whether or not the store took the record: the file is in place,
+  # and a restarted store verifies it from disk.
   defp outcome(state, entry, :ok) do
     Logger.info("artifacts: #{entry.name} fetched and verified (#{entry.sha256})")
     record(state, entry, :verified)
-    reload(state, entry, :verified)
-    :ok
+    {:ok, %{state | owed: %{name: entry.name, logged?: false}}}
   end
 
   defp outcome(state, entry, {:error, failure}) do
@@ -144,8 +154,12 @@ defmodule Cairn.Artifacts.Fetcher do
     )
 
     record(state, entry, {:failed, failure})
-    if failure != entry.failure, do: reload(state, entry, :failed)
-    :error
+
+    with true <- failure != entry.failure,
+         {:error, why} <- reload(state),
+         do: Logger.warning("artifacts: config reload after #{entry.name} #{why}")
+
+    {:error, state}
   end
 
   # A query or userinfo can carry a credential.
@@ -226,38 +240,46 @@ defmodule Cairn.Artifacts.Fetcher do
       Logger.warning("artifacts: could not record #{entry.name}: #{describe(reason)}")
   end
 
-  # After a failure the reload only refreshes the config error, so a refusal
-  # is its expected answer and a success says nothing worth a line.
-  defp reload(state, entry, cause) do
+  # A failure is logged once per owed reload: a config refused for a reason
+  # no file fixes is retried for as long as the node runs.
+  defp settle(%{owed: nil} = state), do: state
+
+  defp settle(%{owed: owed} = state) do
+    what = owed.name || "the store's restart"
+
+    case reload(state) do
+      :ok ->
+        line = if owed.name, do: "with #{what} in place", else: "after #{what}"
+        Logger.info("artifacts: config reloaded #{line}#{if owed.logged?, do: ", on a retry"}")
+        %{state | owed: nil}
+
+      {_failed, why} when not owed.logged? ->
+        Logger.warning("artifacts: config reload after #{what} #{why}")
+        %{state | owed: %{owed | logged?: true}}
+
+      _still_failing ->
+        state
+    end
+  end
+
+  # A refusal apart from the other failures: after a failed fetch it is the
+  # expected answer, and goes unlogged. Only its count is worded: a config
+  # error can quote a camera's URL, and the config page shows them all.
+  defp reload(state) do
     case state.reload.() do
-      {:ok, _diff, _warnings} when cause == :verified ->
-        Logger.info("artifacts: config reloaded with #{entry.name} in place")
-
-      {:error, errors} when is_list(errors) and cause == :verified ->
-        Logger.warning(
-          "artifacts: config reload after #{entry.name} refused, " <>
-            "with #{length(errors)} error(s) the config server logs"
-        )
-
       {:ok, _diff, _warnings} ->
         :ok
 
       {:error, errors} when is_list(errors) ->
-        :ok
+        {:refused, "refused, with #{length(errors)} error(s) the config page shows"}
 
       other ->
-        Logger.warning("artifacts: config reload after #{entry.name} answered #{describe(other)}")
+        {:error, "answered #{describe(other)}"}
     end
   rescue
-    error ->
-      Logger.warning(
-        "artifacts: config reload after #{entry.name} raised: #{Exception.message(error)}"
-      )
+    error -> {:error, "raised: #{Exception.message(error)}"}
   catch
-    kind, reason ->
-      Logger.warning(
-        "artifacts: config reload after #{entry.name} failed: #{describe({kind, reason})}"
-      )
+    kind, reason -> {:error, "failed: #{describe({kind, reason})}"}
   end
 
   # Every failure lands in a config error an operator reads: short, and never

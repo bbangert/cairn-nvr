@@ -41,8 +41,8 @@ defmodule Cairn.MixProject do
   def application do
     [
       mod: {Cairn.Application, []},
-      # `Cairn.Artifacts.HTTP`: `:httpc` and its TLS.
-      extra_applications: [:logger, :runtime_tools, :inets, :ssl, :public_key]
+      # `Cairn.Artifacts.HTTP` calls `:public_key` for the OS's trusted CAs.
+      extra_applications: [:logger, :runtime_tools, :public_key]
     ]
   end
 
@@ -89,6 +89,7 @@ defmodule Cairn.MixProject do
       {:telemetry_metrics, "~> 1.0"},
       {:telemetry_poller, "~> 1.0"},
       {:jason, "~> 1.2"},
+      {:req, "~> 0.5"},
       {:msgpax, "~> 2.4"},
       {:dns_cluster, "~> 0.3.0"},
       {:bandit, "~> 1.5"},

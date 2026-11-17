@@ -1100,14 +1100,20 @@ defmodule Cairn.Config do
           "plugin #{group.name}: profile #{profile.name} runs backend " <>
             "#{inspect(profile.backend)}, which needs " <>
             Enum.map_join(missing, "; ", &unfetched_reason/1) <>
-            " — the download is retried until it succeeds; no camera can run on " <>
-            "this group before then"
+            " — #{unfetched_until(missing)}; no camera can run on this group before then"
 
         if Enum.any?(config.cameras, &(&1.plugin == {:group, group.name})),
           do: add_error(acc, message),
           else: add_warning(acc, message)
     end
   end
+
+  # A restarting store's entries are all `:restarting`, others never.
+  defp unfetched_until([%{failure: :restarting} | _]), do: "the config reloads once it is back"
+  defp unfetched_until(_missing), do: "the download is retried until it succeeds"
+
+  defp unfetched_reason(%{name: name, failure: :restarting}),
+    do: "#{name}, whose status is unknown: the artifact store is restarting"
 
   defp unfetched_reason(%{name: name, failure: nil}),
     do: "#{name}, not downloaded yet: the fetch has not been tried"

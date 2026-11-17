@@ -35,9 +35,9 @@ defmodule Cairn.ArtifactsTest do
 
   defp named(content), do: %{name: content, url: "https://h/#{content}", sha256: sha_of(content)}
 
-  defp start_store(ctx, artifacts) do
+  defp start_store(ctx, artifacts, spec \\ []) do
     opts = [name: ctx.store, dir: ctx.dir, artifacts: artifacts, fetcher: ctx.fetcher]
-    start_supervised!(%{id: ctx.store, start: {Artifacts, :start_link, [opts]}})
+    start_supervised!(%{id: ctx.store, start: {Artifacts, :start_link, [opts]}}, spec)
   end
 
   # Each attempt reports itself, then its task and the partials left before it,
@@ -120,6 +120,24 @@ defmodule Cairn.ArtifactsTest do
       assert Artifacts.path(@sha256, ctx.store) == file(ctx)
     end
 
+    test "a restarting store gates all it published; restarted, it asks for a reload", ctx do
+      File.write!(file(ctx), @content)
+      Process.register(self(), ctx.fetcher)
+      start_store(ctx, [artifact()])
+      assert Artifacts.unusable(ctx.store) == %{}
+      stop_supervised!(ctx.store)
+      refute_received {:"$gen_cast", _message}
+
+      assert %{"rknn" => [%{name: "lib.so", failure: :restarting}]} =
+               Artifacts.unusable(ctx.store)
+
+      assert Artifacts.unusable(:"#{ctx.store}_never") == %{}
+      assert Artifacts.path(@sha256, ctx.store) == nil
+      start_store(ctx, [artifact()])
+      assert_receive {:"$gen_cast", :reload}, @wait
+      assert Artifacts.path(@sha256, ctx.store) == file(ctx)
+    end
+
     test "partials and a symlink to the right bytes are removed; the fetcher is woken", ctx do
       partial = Path.join(ctx.dir, "#{@sha256}.123.part")
       File.write!(partial, "half")
@@ -198,7 +216,7 @@ defmodule Cairn.ArtifactsTest do
     end
 
     # Each failure's text differs from the last, so each reloads, as the
-    # verified file does: eight reloads, which exit, raise, answer oddly or refuse.
+    # verified file does: eight reloads, which exit, raise or answer oddly.
     test "a fetch or reload that raises, throws, exits, is killed, hangs or answers oddly",
          ctx do
       start_store(ctx, [artifact()])
@@ -211,7 +229,6 @@ defmodule Cairn.ArtifactsTest do
           1 -> exit(:config_server_down)
           2 -> raise "boom"
           3 -> :weird
-          8 -> {:error, ["camera rtsp://secret"]}
           _n -> {:ok, %{}, []}
         end
       end
@@ -257,8 +274,44 @@ defmodule Cairn.ArtifactsTest do
 
       assert Artifacts.missing(ctx.store) == []
       assert :counters.get(reloads, 1) == 8
-      assert log =~ "refused, with 1 error(s)"
+      assert log =~ "config reload after lib.so raised: boom"
+    end
+
+    # The fetch stops the store, so the record fails too, and later passes
+    # find nothing missing.
+    test "a reload refused or raising after a verified file is retried, not the fetch", ctx do
+      start_store(ctx, [artifact()], restart: :temporary)
+      store = ctx.store
+      reloads = :counters.new(1, [])
+      test = self()
+
+      reload = fn ->
+        :counters.add(reloads, 1, 1)
+        n = :counters.get(reloads, 1)
+        send(test, {:reload, n})
+        if n == 3, do: raise("db down")
+        if n < 4, do: {:error, ["camera rtsp://secret", "other"]}, else: {:ok, %{}, []}
+      end
+
+      fetch = fn _n, path ->
+        :ok = GenServer.stop(store)
+        File.write(path, @content)
+      end
+
+      log =
+        capture_log(fn ->
+          start_fetcher(ctx, fetch, reload: reload)
+          assert_receive {:reload, 4}, @wait
+          assert %{owed: nil, retry: nil} = :sys.get_state(ctx.fetcher)
+        end)
+
+      assert_received {:attempt, 1, _artifact, _unusable}
+      refute_received {:attempt, 2, _artifact, _unusable}
+      assert File.read!(file(ctx)) == @content
+      assert log =~ "could not record lib.so"
+      assert [_once] = Regex.scan(~r/after lib.so refused, with 2 error\(s\)/, log)
       refute log =~ "rtsp://secret"
+      refute log =~ "db down"
     end
 
     test "a retry that fired behind a :work cast does not start a second chain", ctx do
@@ -338,6 +391,29 @@ defmodule Cairn.ArtifactsTest do
 
       request = hops(Map.put(chain, "https://a/4", :ok))
       assert :ok = HTTP.fetch(%{url: "https://a/1"}, "unused", request)
+    end
+
+    test "a non-200 body is dropped at its first chunk; a 200's is capped", ctx do
+      path = Path.join(ctx.dir, "body")
+      file = File.open!(path, [:write, :binary, :raw])
+      into = HTTP.into(file, 10, System.monotonic_time(:millisecond) + 60_000)
+
+      on = fn status, headers ->
+        {Req.new(), Req.Response.new(status: status, headers: headers)}
+      end
+
+      assert {:halt, _acc} = into.({:data, "body"}, on.(404, []))
+
+      assert {:halt, {_req, refused}} = into.({:data, "x"}, on.(200, [{"content-length", "11"}]))
+      assert {:error, "the response is 11 bytes, more than 10"} = refused.private.failure
+
+      assert {:cont, acc} = into.({:data, "123456"}, on.(200, []))
+      assert {:cont, {_req, written}} = into.({:data, "7890"}, acc)
+      assert {:halt, {_req, cut}} = into.({:data, "1"}, {Req.new(), written})
+      assert {:error, "the response is more than 10 bytes"} = cut.private.failure
+
+      File.close(file)
+      assert File.read!(path) == "1234567890"
     end
   end
 end

@@ -8,9 +8,12 @@ defmodule Cairn.Artifacts do
   This process checks what is already on disk — synchronously and without the
   network, so that the config loaded right after it knows what is missing —
   and owns the status table. `Cairn.Artifacts.Fetcher` downloads the rest from
-  late in the boot. A reader reads the table and never waits on a download;
-  with no table (this process not running, as in tests) it learns nothing,
-  and nothing is reported missing.
+  late in the boot. A reader reads the table, filled under another name so
+  that it is seen only complete, and never waits on a download. With no
+  table, a store that has been up is taken to be restarting: each backend
+  any of its artifacts is needed for, as published in `:persistent_term`, is
+  unusable, its status unknown. One never started (as in tests) published
+  nothing, and nothing is missing.
 
   An artifact with `env:` — the board's only, as `want/1` drops the key —
   names a variable. Unless the operator already set it, it is set to the
@@ -40,6 +43,10 @@ defmodule Cairn.Artifacts do
           failure: String.t() | nil
         }
 
+  @type unusable :: %{
+          String.t() => [%{name: String.t(), failure: String.t() | nil | :restarting}]
+        }
+
   @sha256 ~r/\A[0-9a-f]{64}\z/
 
   @doc """
@@ -66,15 +73,21 @@ defmodule Cairn.Artifacts do
 
   @doc """
   Each backend some missing artifact is needed for, with what is missing and
-  the last fetch's failure (`nil` before the first attempt). Empty when the
-  store is not running.
+  the last fetch's failure (`nil` before the first attempt). With no table,
+  see the moduledoc.
   """
-  @spec unusable(atom()) :: %{String.t() => [%{name: String.t(), failure: String.t() | nil}]}
+  @spec unusable(atom()) :: unusable()
   def unusable(table \\ __MODULE__) do
-    table
-    |> entries()
-    |> Enum.filter(&(&1.status == :missing and is_binary(&1.backend)))
-    |> Enum.group_by(& &1.backend, &%{name: &1.name, failure: &1.failure})
+    case entries(table) do
+      nil -> :persistent_term.get({__MODULE__, table}, %{})
+      entries -> entries |> Enum.filter(&(&1.status == :missing)) |> gated(& &1.failure)
+    end
+  end
+
+  defp gated(entries, failure) do
+    entries
+    |> Enum.filter(&is_binary(&1.backend))
+    |> Enum.group_by(& &1.backend, &%{name: &1.name, failure: failure.(&1)})
   end
 
   @doc """
@@ -88,7 +101,7 @@ defmodule Cairn.Artifacts do
   @doc false
   @spec missing(atom()) :: [entry()]
   def missing(table \\ __MODULE__),
-    do: table |> entries() |> Enum.filter(&(&1.status == :missing))
+    do: Enum.filter(entries(table) || [], &(&1.status == :missing))
 
   @doc false
   @spec record(atom(), String.t(), :verified | {:failed, String.t()}) :: :ok
@@ -104,8 +117,8 @@ defmodule Cairn.Artifacts do
     |> Base.encode16(case: :lower)
   end
 
-  # No table — this process not started, or stopping mid-read — raises,
-  # which a config load must not.
+  # No table — this process not started, restarting, or stopping mid-read —
+  # raises, which a config load must not.
   defp lookup(table, sha256) do
     case :ets.lookup(table, sha256) do
       [{_sha, entry}] -> entry
@@ -118,7 +131,7 @@ defmodule Cairn.Artifacts do
   defp entries(table) do
     Enum.map(:ets.tab2list(table), &elem(&1, 1))
   rescue
-    ArgumentError -> []
+    ArgumentError -> nil
   end
 
   @impl true
@@ -129,7 +142,10 @@ defmodule Cairn.Artifacts do
     artifacts =
       Keyword.get_lazy(opts, :artifacts, fn -> Cairn.Board.module().artifacts(%{}) end)
 
-    :ets.new(name, [:named_table, :set, :protected, read_concurrency: true])
+    restarted? = :persistent_term.get({__MODULE__, name}, nil) != nil
+
+    filling =
+      :ets.new(:"#{name} filling", [:named_table, :set, :protected, read_concurrency: true])
 
     case File.mkdir_p(dir) do
       :ok -> remove_partials(dir)
@@ -137,16 +153,32 @@ defmodule Cairn.Artifacts do
     end
 
     state = %{
-      table: name,
+      table: filling,
       dir: dir,
       fetcher: Keyword.get(opts, :fetcher, Cairn.Artifacts.Fetcher)
     }
 
     Enum.each(artifacts, &register(state, &1))
-    # At boot the fetcher is not up yet, or holds, and this is lost or ignored;
-    # after a restart of this process it is what fetches again.
-    if missing(name) != [], do: GenServer.cast(state.fetcher, :work)
+    state = %{state | table: :ets.rename(filling, name)}
+    publish(state)
+
+    # A first start's `:work` is lost at boot, where the fetcher starts later
+    # and looks for itself. A restart's `:reload` fetches too, and reloads: a
+    # reload refused while this process was down stands until another.
+    cond do
+      restarted? -> GenServer.cast(state.fetcher, :reload)
+      missing(name) != [] -> GenServer.cast(state.fetcher, :work)
+      true -> :ok
+    end
+
     {:ok, state}
+  end
+
+  # What `unusable/1` answers with no table. Never erased: it is what marks
+  # this store as having been up.
+  defp publish(state) do
+    gated = gated(entries(state.table), fn _entry -> :restarting end)
+    :persistent_term.put({__MODULE__, state.table}, gated)
   end
 
   # What the Repo resolves too: the env override, else the config file's.
@@ -165,6 +197,7 @@ defmodule Cairn.Artifacts do
     for artifact <- artifacts,
         do: register(state, if(is_map(artifact), do: Map.delete(artifact, :env), else: artifact))
 
+    publish(state)
     if missing(state.table) != [], do: GenServer.cast(state.fetcher, :work)
     {:noreply, state}
   end

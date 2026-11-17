@@ -1357,6 +1357,15 @@ defmodule Cairn.ConfigTest do
       message = unfetched("the last fetch failed: could not connect: :nxdomain")
       assert {:error, [^message]} = Config.from_map(profiled_map(), artifacts: failed)
 
+      restarting = %{"rknn" => [%{name: "librknnrt.so", failure: :restarting}]}
+
+      message =
+        "plugin det: profile rk-test runs backend \"rknn\", which needs librknnrt.so, " <>
+          "whose status is unknown: the artifact store is restarting — the config reloads " <>
+          "once it is back; no camera can run on this group before then"
+
+      assert {:error, [^message]} = Config.from_map(profiled_map(), artifacts: restarting)
+
       # Another backend's artifact is nobody's concern here.
       assert {:ok, _config, []} =
                Config.from_map(profiled_map(), artifacts: %{"qnn" => @untried["rknn"]})
