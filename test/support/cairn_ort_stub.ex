@@ -98,6 +98,10 @@ defmodule Cairn.CairnOrtStub do
     end
   end
 
+  # Drain calls the release board's real modules, never a stub.
+  @impl true
+  def drain_teardown(_timeout_ms), do: true
+
   defp notify(message) do
     case control(:test, nil) do
       nil -> :ok

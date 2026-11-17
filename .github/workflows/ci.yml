@@ -466,6 +466,13 @@ jobs:
       - run: cargo test
         working-directory: plugins/cairn-ort
 
+      # Without the `nif` feature: the configuration the board crate links.
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+        working-directory: plugins/cairn-ort
+
+      - run: cargo test --no-default-features
+        working-directory: plugins/cairn-ort
+
       - run: cargo build --release
         working-directory: plugins/cairn-ort
 

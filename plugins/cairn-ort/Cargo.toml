@@ -5,9 +5,11 @@ edition = "2021"
 rust-version = "1.88"
 publish = false
 
-# `cdylib` is the NIF library the BEAM loads; `rlib` is for cairn-native's
-# dev-dependency, whose clip harness drives both halves of the split boundary
-# through one end-to-end test.
+# `cdylib` is the NIF library the BEAM loads as `CairnOrt`. The `rlib` has two
+# consumers: cairn-native's dev-dependency, whose clip harness drives both
+# halves of the split boundary through one end-to-end test, and the Rockchip
+# board crate, which hosts this engine over its own backend under its own NIF
+# module (`default-features = false`).
 [lib]
 crate-type = ["cdylib", "rlib"]
 
@@ -28,6 +30,12 @@ clap = { version = "4.5", default-features = false, features = ["std"] }
 serde_json = "1.0"
 
 [features]
+default = ["nif"]
+# `CairnOrt`'s NIF functions and `rustler::init!`. rustler collects every
+# `#[rustler::nif]` in the final binary into whichever `init!` that binary
+# runs, so a crate linking this one under its own NIF module turns this off;
+# the resource types and everything a NIF body calls stay public without it.
+nif = []
 # Passed through to cairn-detect for the aarch64 cross-build, where ort loads
 # the QAIRT-bundled runtime at startup instead of statically linking the
 # downloaded x86 archive.

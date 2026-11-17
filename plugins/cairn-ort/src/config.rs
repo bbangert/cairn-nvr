@@ -60,15 +60,27 @@ impl RawInitConfig {
     pub fn resolve(self) -> Result<InitConfig> {
         let backend = enum_value::<BackendKind>("backend", &self.backend)?;
         let embedder_model = self.embedder_model.map(PathBuf::from);
-        // The embedder's own open refuses qnn too, but only after the detector's
-        // multi-second HTP graph compile. `cli.rs`'s `serve` refuses it up front as
-        // well, so the two hosts answer the same profile the same way.
-        if embedder_model.is_some() && backend == BackendKind::Qnn {
-            return Err(NativeError::Config(
-                "the embedder does not run on qnn yet (no QDQ embedder artifact) \
-                 — drop embedder_model or use the ort backend"
-                    .to_string(),
-            ));
+        // The embedder's own open refuses both, but only after the detector's
+        // load — on qnn a multi-second HTP graph compile. `cli.rs`'s `serve`
+        // refuses them up front as well, so the hosts answer the same profile
+        // the same way.
+        if embedder_model.is_some() {
+            match backend {
+                BackendKind::Ort => {}
+                BackendKind::Qnn => {
+                    return Err(NativeError::Config(
+                        "the embedder does not run on qnn yet (no QDQ embedder artifact) \
+                         — drop embedder_model or use the ort backend"
+                            .to_string(),
+                    ))
+                }
+                kind @ BackendKind::Rknn => {
+                    return Err(NativeError::Config(format!(
+                        "the embedder runs on ort only, not {kind} — drop embedder_model \
+                         or use the ort backend"
+                    )))
+                }
+            }
         }
 
         Ok(InitConfig {
@@ -231,16 +243,18 @@ mod tests {
     }
 
     #[test]
-    fn an_embedder_on_qnn_is_refused_before_the_model_load() {
-        let error = RawInitConfig {
-            backend: "qnn".into(),
-            embedder_model: Some("osnet.onnx".into()),
-            ..init()
+    fn an_embedder_off_ort_is_refused_before_the_model_load() {
+        for backend in ["qnn", "rknn"] {
+            let error = RawInitConfig {
+                backend: backend.into(),
+                embedder_model: Some("osnet.onnx".into()),
+                ..init()
+            }
+            .resolve()
+            .unwrap_err();
+            assert_eq!(error.reason(), "config");
+            assert!(error.message().contains(backend), "{}", error.message());
         }
-        .resolve()
-        .unwrap_err();
-        assert_eq!(error.reason(), "config");
-        assert!(error.message().contains("qnn"), "{}", error.message());
     }
 
     #[test]
