@@ -56,9 +56,26 @@ defmodule Cairn.Stage.Board do
               backends: %{optional(String.t()) => String.t()}
             }
 
-  # Runtime files the board needs fetched; the shape is loose until a board
-  # has some.
-  @callback artifacts(context :: map()) :: [map()]
+  @typedoc """
+  A runtime file the board needs and a release does not carry, which the base
+  downloads from `url` and keeps only if it hashes to `sha256` (hex). `size`,
+  in bytes, also bounds the download. `backend` is the backend that cannot run
+  without the file, so a camera on it is a config error while the file is
+  missing. `env` is the variable the base sets to the file's path; one the
+  operator has already set means they supplied the file, and the base neither
+  fetches nor checks it.
+  """
+  @type artifact :: %{
+          required(:name) => String.t(),
+          required(:url) => String.t(),
+          required(:sha256) => String.t(),
+          optional(:size) => pos_integer(),
+          optional(:backend) => String.t(),
+          optional(:env) => String.t()
+        }
+
+  # The base passes `%{}`.
+  @callback artifacts(context :: map()) :: [artifact()]
 
   @callback profiles_dir() :: Path.t() | nil
 end

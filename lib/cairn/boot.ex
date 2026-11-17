@@ -7,6 +7,7 @@ defmodule Cairn.Boot do
 
   use Task, restart: :transient
 
+  alias Cairn.Artifacts.Fetcher
   alias Cairn.Config.Server
 
   def start_link(opts) do
@@ -18,5 +19,8 @@ defmodule Cairn.Boot do
     config = Server.get()
     Cairn.Reconciler.run(config)
     Cairn.CameraSupervisor.sync(config)
+    # Only now may a download's reload start cameras: one under the reconcile
+    # would be stopped by the sync above, of the config read before it.
+    Fetcher.boot_done()
   end
 end

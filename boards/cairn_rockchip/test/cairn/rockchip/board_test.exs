@@ -74,6 +74,24 @@ defmodule Cairn.Rockchip.BoardTest do
     end
   end
 
+  test "librknnrt is the one artifact: pinned, for rknn, exported through CAIRN_RKNN_LIBRARY" do
+    assert [library] = Board.artifacts(%{})
+
+    assert %{
+             name: "librknnrt.so",
+             sha256: "d31fc19c85b85f6091b2bd0f6af9d962d5264a4e410bfb536402ec92bac738e8",
+             size: 7_726_232,
+             backend: "rknn",
+             env: "CAIRN_RKNN_LIBRARY"
+           } = library
+
+    assert %URI{scheme: "https", host: "raw.githubusercontent.com", path: path} =
+             URI.parse(library.url)
+
+    # A commit, never a branch: the hash would not survive a moved ref.
+    assert path =~ ~r|^/airockchip/rknn-toolkit2/[0-9a-f]{40}/.*/aarch64/librknnrt\.so$|
+  end
+
   describe "preflight" do
     setup do
       previous = System.get_env("CAIRN_RKNN_LIBRARY")

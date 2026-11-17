@@ -26,6 +26,7 @@
 
 pub mod sys;
 
+use std::cell::RefCell;
 use std::ffi::{c_int, c_void, OsString};
 use std::io::Read as _;
 use std::os::fd::{BorrowedFd, RawFd};
@@ -39,9 +40,44 @@ use cairn_detect::infer::{
     SessionOptions, TensorLayout, TensorValues, Tensors,
 };
 
-/// `CAIRN_RKNN_LIBRARY` names the runtime to load; unset, the loader's search
-/// path finds this one.
+/// The runtime the loader's search path finds when nothing names one: no
+/// [`with_runtime`] path and no `CAIRN_RKNN_LIBRARY`.
 const DEFAULT_LIBRARY: &str = "librknnrt.so";
+
+thread_local! {
+    /// The runtime [`with_runtime`] names for the opens on this thread.
+    static LIBRARY: RefCell<Option<OsString>> = const { RefCell::new(None) };
+}
+
+/// Runs `open` with `library` as the runtime every [`RknnBackend::open`] it
+/// makes on the calling thread loads, `librknnrt.so` from the search path for
+/// `None`, in place of `CAIRN_RKNN_LIBRARY`.
+///
+/// For the NIF, which cannot read the variable: the BEAM keeps its own copy of
+/// the environment and does not write it back to libc's, so a path the VM set
+/// is not in `std::env`. The VM's value arrives as an argument instead. A
+/// process of its own, like the probe binary, reads its real environment.
+pub fn with_runtime<T>(library: Option<OsString>, open: impl FnOnce() -> T) -> T {
+    struct Restore(Option<OsString>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LIBRARY.set(self.0.take());
+        }
+    }
+
+    let library = library.unwrap_or_else(|| OsString::from(DEFAULT_LIBRARY));
+    let _restore = Restore(LIBRARY.replace(Some(library)));
+    open()
+}
+
+/// The runtime [`RknnBackend::open`] loads on this thread.
+pub(crate) fn runtime() -> OsString {
+    LIBRARY
+        .with_borrow(Clone::clone)
+        .or_else(|| std::env::var_os("CAIRN_RKNN_LIBRARY"))
+        .unwrap_or_else(|| OsString::from(DEFAULT_LIBRARY))
+}
 
 /// `--backend rknn` for [`cairn_detect::cli::run`].
 pub fn provider() -> Provider {
@@ -173,9 +209,7 @@ pub enum MemSync {
 
 impl Backend for RknnBackend {
     fn open(model: &Path, options: &SessionOptions) -> Result<Self> {
-        let path = std::env::var_os("CAIRN_RKNN_LIBRARY")
-            .unwrap_or_else(|| OsString::from(DEFAULT_LIBRARY));
-        Self::with_library(sys::Library::load(&path)?, model, options)
+        Self::with_library(sys::Library::load(&runtime())?, model, options)
     }
 
     fn kind(&self) -> BackendKind {
@@ -286,8 +320,8 @@ impl RknnBackend {
 }
 
 impl RknnBackend {
-    /// [`Backend::open`] over a runtime already loaded, so the environment is
-    /// read in one place.
+    /// [`Backend::open`] over a runtime already loaded, so the runtime's path
+    /// is chosen in one place.
     pub fn with_library(
         library: sys::Library,
         model: &Path,
@@ -692,6 +726,17 @@ mod tests {
             Ok(_) => panic!("accepted"),
             Err(err) => format!("{err:#}"),
         }
+    }
+
+    /// Without the environment, which `lib.rs`'s one test owns.
+    #[test]
+    fn with_runtime_names_the_runtime_and_restores_the_outer_one() {
+        with_runtime(None, || {
+            assert_eq!(runtime(), DEFAULT_LIBRARY);
+            assert_eq!(with_runtime(Some("/inner.so".into()), runtime), "/inner.so");
+            assert_eq!(runtime(), DEFAULT_LIBRARY);
+        });
+        assert_eq!(LIBRARY.with_borrow(Clone::clone), None);
     }
 
     #[test]

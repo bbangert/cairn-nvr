@@ -276,7 +276,8 @@ defmodule Cairn.Config do
   `board:` replaces the release's board (`Cairn.Board.module/0`) for its
   profile directory and its preflight, so the suite can reach states the
   generic board never produces; the menus `Cairn.Config.Profile` checks still
-  come from the release's board.
+  come from the release's board. `artifacts:` replaces
+  `Cairn.Artifacts.unusable/0`'s answer the same way.
   """
   @spec from_map(map(), keyword()) :: {:ok, t(), [String.t()]} | {:error, [String.t()]}
   def from_map(map, opts \\ []) do
@@ -326,7 +327,8 @@ defmodule Cairn.Config do
 
     {config, acc} = resolve_plugins(config, acc, declared_plugin_names(map))
     {config, acc} = resolve_ladders(config, acc, opts)
-    {config, acc} = resolve_profiles(config, board, acc)
+    unfetched = Keyword.get_lazy(opts, :artifacts, &Cairn.Artifacts.unusable/0)
+    {config, acc} = resolve_profiles(config, board, unfetched, acc)
     acc = check_group_profiles(config, acc)
     acc = validate(config, acc)
 
@@ -1050,7 +1052,7 @@ defmodule Cairn.Config do
   # plugin references: a group's `profile:` name becomes the parsed
   # `Cairn.Config.Profile` struct, or (typo, missing file) a config error
   # naming what was looked for.
-  defp resolve_profiles(config, board, acc) do
+  defp resolve_profiles(config, board, unfetched, acc) do
     unusable = board.preflight()
 
     {groups, acc} =
@@ -1058,6 +1060,7 @@ defmodule Cairn.Config do
         %PluginGroup{profile: name} = group, acc when is_binary(name) ->
           case Map.fetch(config.profiles, name) do
             {:ok, profile} ->
+              acc = check_unfetched(acc, config, group, profile, unfetched)
               acc = warn_unusable(acc, group, profile, board, unusable)
               {%{group | profile: profile}, acc}
 
@@ -1076,6 +1079,41 @@ defmodule Cairn.Config do
 
     {%{config | plugin_groups: groups}, acc}
   end
+
+  # An error rather than `warn_unusable/5`'s warning: the host loads an engine
+  # only when the model in the config moves, so a config that loaded while
+  # the file was missing would not detect once it arrived. Refused, the
+  # server runs its fallback until the fetcher's reload brings this config in.
+  #
+  # Only for a group cameras run on: the fallback is this map without its
+  # cameras, and must load. For a group with none, the same words warn.
+  #
+  # The board's preflight warning for the backend stands beside it: its reason
+  # may name the same path, or something no download fixes.
+  defp check_unfetched(acc, config, group, profile, unfetched) do
+    case Map.get(unfetched, profile.backend, []) do
+      [] ->
+        acc
+
+      missing ->
+        message =
+          "plugin #{group.name}: profile #{profile.name} runs backend " <>
+            "#{inspect(profile.backend)}, which needs " <>
+            Enum.map_join(missing, "; ", &unfetched_reason/1) <>
+            " — the download is retried until it succeeds; no camera can run on " <>
+            "this group before then"
+
+        if Enum.any?(config.cameras, &(&1.plugin == {:group, group.name})),
+          do: add_error(acc, message),
+          else: add_warning(acc, message)
+    end
+  end
+
+  defp unfetched_reason(%{name: name, failure: nil}),
+    do: "#{name}, not downloaded yet: the fetch has not been tried"
+
+  defp unfetched_reason(%{name: name, failure: failure}),
+    do: "#{name}, not downloaded yet: the last fetch failed: #{failure}"
 
   # Only for a profile a group selects: a shipped one nobody runs is not
   # operator intent. Valid, but it would do nothing on this host.

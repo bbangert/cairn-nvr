@@ -21,6 +21,9 @@ defmodule Cairn.Application do
       Cairn.Repo,
       {Ecto.Migrator,
        repos: Application.fetch_env!(:cairn, :ecto_repos), skip: skip_migrations?()},
+      # Before the config, whose load reads which board artifacts are missing.
+      # It only checks the disk: the download is the `Fetcher`'s, far below.
+      {Cairn.Artifacts, enabled: artifacts?()},
       # After the migrated Repo, so a config source may read rows; before
       # everything that reads the config. Its `init/1` must not broadcast —
       # PubSub starts below it.
@@ -88,6 +91,11 @@ defmodule Cairn.Application do
       {Cairn.CameraSupervisor, []},
       {Cairn.Retention, []},
       {CairnWeb.WebRTC.Supervisor, []},
+      # Calls `Cairn.Config.Server.reload/0` as its downloads end, so it sits
+      # after everything a reload reaches — PubSub, the host, the camera
+      # supervisor — and holds until `Cairn.Boot`, below, ends its sync with
+      # `boot_done/1`, so that no reload lands under the reconcile.
+      {Cairn.Artifacts.Fetcher, enabled: artifacts?(), after_boot: true},
       # Reconcile index with disk, then start cameras from config
       {Cairn.Boot, []},
       # Start to serve requests, typically the last entry
@@ -107,6 +115,11 @@ defmodule Cairn.Application do
     CairnWeb.Endpoint.config_change(changed, removed)
     :ok
   end
+
+  # Off in the test env: a Rockchip test boot would otherwise download into
+  # `data/` and point `CAIRN_RKNN_LIBRARY` there for the whole VM. Suites
+  # start their own against a tmp dir.
+  defp artifacts?, do: Application.get_env(:cairn, :artifacts, true)
 
   defp skip_migrations? do
     # Migrations run at boot everywhere (Boot's reconciliation needs the

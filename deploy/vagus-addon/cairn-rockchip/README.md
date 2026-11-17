@@ -4,10 +4,18 @@ Presence-detection NVR for RK3566 vagus boards (Home Assistant Green): RTSP
 cameras in, events and a live UI out.
 
 **Not released.** Decode is software unless a profile says `decoder: rkmpp`.
-Detection runs on the CPU. The image carries the RKNN engine, but `backend: rknn` needs Rockchip's `librknnrt.so`,
-which is not in the image (it must be on the loader's path or named by
-`CAIRN_RKNN_LIBRARY`), and this add-on has no way to supply either yet — so
-`backend: rknn` runs only in a hand-run container for now. The image also
+Detection runs on the CPU. The image carries the RKNN engine, but `backend:
+rknn` needs Rockchip's `librknnrt.so`, whose licence does not permit
+shipping it in the image: at first start Cairn downloads it from Rockchip's
+own repository (`airockchip/rknn-toolkit2` at a pinned commit), keeps it only
+if its sha256 matches the pin, and stores it as `/data/artifacts/<sha256>`;
+later starts check it again and never re-download a verified file. Offline,
+the UI comes up and the config error says the library is missing and why the
+last download failed. While it is missing, a config with a camera on an
+`rknn` profile is refused whole: **no** camera runs or records, the others
+included, until a retry succeeds. A config with no camera on `rknn` at most
+warns. In a hand-run container, `CAIRN_RKNN_LIBRARY` set to a file of your
+own replaces the download. The image also
 carries Rockchip's MPP and librga libraries and the add-on grants their device
 nodes: `decoder: rkmpp` decodes through MPP and scales through the RGA, and
 `decoder: auto` never picks it.

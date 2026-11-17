@@ -41,7 +41,8 @@ defmodule Cairn.MixProject do
   def application do
     [
       mod: {Cairn.Application, []},
-      extra_applications: [:logger, :runtime_tools]
+      # `Cairn.Artifacts.HTTP`: `:httpc` and its TLS.
+      extra_applications: [:logger, :runtime_tools, :inets, :ssl, :public_key]
     ]
   end
 
