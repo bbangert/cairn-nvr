@@ -8,8 +8,9 @@
 # What rides: every app's ebin from the assembled release (deps included —
 # pushing "just cairn" would miss a dep bump silently), cairn's priv —
 # priv/profiles, priv/repo AND priv/static — and a board app's (its
-# profiles), plus runtime.exs, sys.config and the boot artifacts below. What cannot ride: NIFs/canary (arch-native),
-# ERTS, apt packages, Dockerfile-level anything.
+# profiles), plus runtime.exs, sys.config and the boot artifacts below.
+# What cannot ride: NIFs/canary (arch-native), ERTS, apt packages,
+# Dockerfile-level anything.
 #
 # priv/static used to be excluded so a dev build could not clobber the
 # image's digested assets. Shipping the COMPLETE digested set answers that:
