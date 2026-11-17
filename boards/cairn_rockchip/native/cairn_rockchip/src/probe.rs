@@ -1,10 +1,13 @@
 //! `cairn-rockchip-probe --rk-probe`: decode an H.264 Annex-B file through
 //! [`MppDecoder`] the way the pipeline will feed it — one whole access unit
 //! per packet, parameter sets in band, pts = AU index — and report what came
-//! back as bounded JSON lines on stdout.
+//! back as bounded JSON lines on stdout. `--scale` also blits samples of it
+//! through RGA (the `scale` submodule).
 //!
 //! This is a standalone binary, so it may sleep and retry; nothing here is
 //! reachable from a NIF.
+
+mod scale;
 
 use std::ops::Range;
 use std::path::PathBuf;
@@ -16,13 +19,16 @@ use anyhow::{bail, Context as _, Result};
 use serde_json::{json, Value};
 
 use crate::mpp::{Frame, Geometry, MppDecoder, Put};
+pub use scale::Scale;
 
 const USAGE: &str = "usage: cairn-rockchip-probe --rk-probe <annexb-file> \
-[--skip-aus N] [--hold-after N] [--streams N] [--fps F]";
+[--skip-aus N] [--hold-after N] [--streams N] [--fps F] \
+[--scale WxH [--resize letterbox|stretch] [--pad N] [--every N] [--dump PATH]]";
 
 /// Output is at most 34 lines whatever the input: the open line, up to
-/// [`INFO_CHANGE_LINES`], one line per stream and the total — or, on an
-/// error, the lines before it and the error line.
+/// [`INFO_CHANGE_LINES`], one line per stream and the total, plus
+/// `--scale`'s two (it runs one stream) — or, on an error, the lines before
+/// it and the error line.
 const MAX_STREAMS: usize = 16;
 const INFO_CHANGE_LINES: usize = 16;
 
@@ -42,6 +48,7 @@ pub struct Args {
     pub hold_after: Option<u64>,
     pub streams: usize,
     pub fps: Option<f64>,
+    pub scale: Option<Scale>,
 }
 
 pub fn parse(args: &[String]) -> Result<Args, String> {
@@ -51,7 +58,9 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
         hold_after: None,
         streams: 1,
         fps: None,
+        scale: None,
     };
+    let mut scale = Vec::new();
     let mut it = args.iter();
     if it.next().is_none_or(|first| first != "--rk-probe") {
         return Err("--rk-probe comes first".into());
@@ -73,8 +82,13 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
                 f if (0.1..=1000.0).contains(&f) => parsed.fps = Some(f),
                 _ => return Err("--fps is 0.1 to 1000".into()),
             },
+            name if scale::FLAGS.contains(&name) => scale.push((name, value()?.as_str())),
             other => return Err(format!("unknown argument {other:?}")),
         }
+    }
+    parsed.scale = scale::resolve(&scale)?;
+    if parsed.scale.is_some() && parsed.streams != 1 {
+        return Err("--scale runs one stream".into());
     }
     Ok(parsed)
 }
@@ -165,6 +179,7 @@ struct Stream {
     frames_while_held: u64,
     hold_reached: bool,
     info_changes: Vec<Value>,
+    scale: Option<scale::Scaler>,
 }
 
 impl Stream {
@@ -190,6 +205,9 @@ impl Stream {
             self.first_frame_pts.get_or_insert(frame.pts());
             self.nv12 = (self.returned == 1 || self.nv12) && frame.is_nv12();
             self.max_lag = self.max_lag.max(self.last_fed - frame.pts());
+            if let Some(scaler) = &mut self.scale {
+                scaler.frame(&frame)?;
+            }
             if let Some(held) = &self.held {
                 self.held_fd_reused |= frame.fd() == held.fd();
                 self.frames_while_held += 1;
@@ -205,10 +223,13 @@ impl Stream {
     }
 }
 
-/// A stream's summary line, and its info-change lines.
-fn decode_stream(data: &[u8], aus: &[Au], args: &Args) -> Result<(Value, Vec<Value>)> {
+/// A stream's summary line, its info-change lines and `--scale`'s.
+fn decode_stream(data: &[u8], aus: &[Au], args: &Args) -> Result<(Value, Vec<Value>, Vec<Value>)> {
     let mut decoder = MppDecoder::open()?;
-    let mut s = Stream::default();
+    let mut s = Stream {
+        scale: args.scale.as_ref().map(scale::Scaler::open).transpose()?,
+        ..Stream::default()
+    };
     let started = Instant::now();
     let period = args.fps.map(|fps| Duration::from_secs_f64(1.0 / fps));
     for (index, au) in aus.iter().enumerate().skip(args.skip_aus) {
@@ -276,7 +297,8 @@ fn decode_stream(data: &[u8], aus: &[Au], args: &Args) -> Result<(Value, Vec<Val
         "held_fd_reused": s.held_pts.map(|_| s.held_fd_reused),
         "hold_reached": s.hold_reached,
     });
-    Ok((summary, s.info_changes))
+    let scale = s.scale.map(scale::Scaler::report).transpose()?;
+    Ok((summary, s.info_changes, scale.unwrap_or_default()))
 }
 
 pub fn run(args: &[String]) -> ExitCode {
@@ -343,7 +365,7 @@ fn probe(args: &Args) -> Result<()> {
     let wall = started.elapsed();
     let (mut frames, mut changes, mut printed) = (0, 0, 0);
     for (stream, result) in results.into_iter().enumerate() {
-        let (mut summary, lines) = result.with_context(|| format!("stream {stream}"))?;
+        let (mut summary, lines, scale) = result.with_context(|| format!("stream {stream}"))?;
         for mut line in lines.into_iter().take(INFO_CHANGE_LINES - printed) {
             printed += 1;
             line["event"] = "info_change".into();
@@ -354,6 +376,9 @@ fn probe(args: &Args) -> Result<()> {
         changes += summary["info_changes"].as_u64().unwrap_or(0);
         summary["stream"] = stream.into();
         println!("{summary}");
+        for line in scale {
+            println!("{line}");
+        }
     }
     let total = json!({
         "event": "total", "streams": args.streams, "frames": frames,
@@ -369,6 +394,7 @@ fn probe(args: &Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_detect::infer::{InputSize, ResizePolicy};
 
     /// A NAL with a 4-byte start code: header byte, then payload.
     fn nal(ty: u8, payload: &[u8]) -> Vec<u8> {
@@ -410,6 +436,51 @@ mod tests {
             (&["--rk-probe", "f", "--model", "m"], "unknown"),
         ] {
             assert!(args(bad).unwrap_err().contains(says), "{bad:?}");
+        }
+    }
+
+    /// `--rk-probe f` and then `rest`.
+    fn scale(rest: &[&str]) -> Result<Option<Scale>, String> {
+        args(&[&["--rk-probe", "f"][..], rest].concat()).map(|parsed| parsed.scale)
+    }
+
+    #[test]
+    fn scale_arguments_default_parse_and_refuse() {
+        let letterbox = |w, h, pad| Scale {
+            size: InputSize { w, h },
+            policy: ResizePolicy::Letterbox { pad },
+            every: 5,
+            dump: None,
+        };
+        // The last of a repeated flag wins.
+        let repeated = scale(&["--scale", "320", "--scale", "640x384"]);
+        assert_eq!(repeated, Ok(Some(letterbox(640, 384, 114))));
+        let padded = scale(&["--scale", "640", "--pad", "0"]);
+        assert_eq!(padded, Ok(Some(letterbox(640, 640, 0))));
+        let given = [
+            "--every", "1", "--resize", "stretch", "--scale", "416", "--dump", "s.ppm",
+        ];
+        let expected = Scale {
+            size: InputSize::square(416),
+            policy: ResizePolicy::Stretch,
+            every: 1,
+            dump: Some("s.ppm".into()),
+        };
+        assert_eq!(scale(&given), Ok(Some(expected)));
+        assert_eq!(scale(&[]), Ok(None));
+        for (bad, says) in [
+            (&["--pad", "1"][..], "--pad needs --scale"),
+            (&["--scale", "0x640"], "must be positive"),
+            (&["--scale", "640", "--resize", "crop"], "unknown resize"),
+            (
+                &["--scale", "640", "--resize", "stretch", "--pad", "3"],
+                "no pad",
+            ),
+            (&["--scale", "640", "--pad", "256"], "not a number"),
+            (&["--scale", "640", "--every", "0"], "from 1"),
+            (&["--scale", "640", "--streams", "2"], "one stream"),
+        ] {
+            assert!(scale(bad).unwrap_err().contains(says), "{bad:?}");
         }
     }
 
