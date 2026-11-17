@@ -6,7 +6,7 @@
 //!
 //! What blocks on drop — an `MppDecoder` (reset, destroy, thread join), a
 //! pool's last reference (RGA release, munmap, close) — goes to
-//! `cairn_ort`'s teardown thread: destructors and `release/1` run on normal
+//! `cairn_ort`'s teardown thread: resource destructors run on normal
 //! schedulers.
 
 use std::any::Any;
@@ -591,11 +591,10 @@ fn download<'a>(env: Env<'a>, lease: ResourceArc<LeaseRef>) -> Result<Binary<'a>
     })
 }
 
-/// A normal scheduler: freeing the slot is atomics, and the pool reference
-/// is a channel send. The lock is the one `download/1` holds across the
+/// DirtyIo for the lock alone: it is the one `download/1` holds across the
 /// dma-buf sync bracket and the copy, so a release racing a download waits
-/// behind both.
-#[rustler::nif]
+/// behind both. The rest is atomics and a channel send.
+#[rustler::nif(schedule = "DirtyIo")]
 fn release(lease: ResourceArc<LeaseRef>) -> Atom {
     lease.held.release();
     atom::ok()

@@ -87,7 +87,8 @@ defmodule Cairn.Rockchip.Native do
   @spec download(reference()) :: {:ok, binary()} | {:error, {atom(), String.t()}}
   def download(_lease), do: :erlang.nif_error(:nif_not_loaded)
 
-  # Idempotent. A release racing a download waits out its copy.
+  # Idempotent. On a dirty I/O scheduler: a release racing a download waits
+  # out its copy.
   @spec release(reference()) :: :ok
   def release(_lease), do: :erlang.nif_error(:nif_not_loaded)
 
