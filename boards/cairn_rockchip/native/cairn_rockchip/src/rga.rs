@@ -11,6 +11,10 @@
 //! import of the source on every blit. That import is not cached: MPP
 //! recycles and reallocates its buffers, so an fd number names no buffer for
 //! long.
+//!
+//! librga logs to the process's **stdout**, through C stdio: one version line
+//! when its session opens, which [`Rga::open`]'s query does, and its error
+//! log. Opening the session also `setenv`s `ROCKCHIP_RGA_API_VERSION`.
 
 pub mod sys;
 
@@ -307,8 +311,10 @@ impl Plan {
 /// is left at its default, so librga picks both conversion and kernel. Its
 /// guide gives BT.601 limited range as the default YUV-to-RGB conversion
 /// (under `imcvtcolor`) and, for RK3566's RGA2, average for a downscale and
-/// bilinear or bicubic for an upscale. Neither is checked against the
-/// software path.
+/// bilinear or bicubic for an upscale. On the HA Green a downscaled test
+/// pattern sat closest to a software reference of exactly that (about 30 dB,
+/// 7 dB clear of BT.709 or full range); parity with the software path's own
+/// resize is not established.
 pub struct Blitter {
     rga: Rga,
     plan: Plan,
