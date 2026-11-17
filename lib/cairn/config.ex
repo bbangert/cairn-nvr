@@ -563,16 +563,28 @@ defmodule Cairn.Config do
   The rate a camera's detect branch delivers frames at: its profile's
   `sample_fps`, or the engine default a profile that names none leaves it to.
 
-  Nothing is told to thin by reading this — `Cairn.Pipeline.Decoder` already
-  gates on the rate `Cairn.Native.Host` opened its decoder with, which is this
-  same profile field — so it is a reading, for the elements whose own
-  arithmetic counts frames.
+  Nothing is told to thin by reading this — the decode step
+  (`Cairn.Stage.DecoderCore`) already gates on the rate `Cairn.Native.Host`
+  opened its decoder with, which is this same profile field — so it is a
+  reading, for the elements whose own arithmetic counts frames.
   """
   @spec sample_fps(t(), Camera.t()) :: pos_integer()
   def sample_fps(%__MODULE__{} = config, %Camera{} = cam) do
     profile = profile_for(config, cam)
 
     (profile && profile.sample_fps) || NativeConfig.default_sample_fps()
+  end
+
+  @doc """
+  The camera's decoder name, from the profile `native_model_config/1` hands
+  the engine: the board picks the detect chain's elements by it. An engine
+  whose config was pinned apart from this one (tests, tools) may disagree.
+  """
+  @spec decoder(t(), Camera.t()) :: String.t()
+  def decoder(%__MODULE__{} = config, %Camera{} = cam) do
+    profile = profile_for(config, cam)
+
+    (profile && profile.decoder) || NativeConfig.default(:decoder)
   end
 
   @doc "The tracker-core names a config may choose between, for error messages."

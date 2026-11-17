@@ -19,7 +19,7 @@ not transfer between them (D-M6, confirmed by spike 0.4).
 |---|---|---|---|---|
 | QCS6490 | mainline | Venus, V4L2 stateful M2M | `h264_v4l2m2m` | `v4l2` — **measured**, spike 0.3 |
 | RK3576 | mainline 7.0+ | `rkvdec` VDPU383, V4L2 **stateless** (request API) | not by `h264_v4l2m2m`; unsettled | left at `auto` |
-| RK3566 | vendor BSP 6.1 | MPP, `/dev/mpp_service` | only in the `ffmpeg-rockchip` fork (`h264_rkmpp`) | no menu entry exists |
+| RK3566 | vendor BSP 6.1 | MPP, `/dev/mpp_service` | only in the `ffmpeg-rockchip` fork (`h264_rkmpp`) | `rkmpp`, the Rockchip release's own MPP binding, not ffmpeg |
 
 The NPU half forks less than the decode half does: RK3566 and RK3576 share one
 runtime (`librknnrt`), one converter (rknn-toolkit2, only `--target` differs),
@@ -29,9 +29,10 @@ NPU-runtime abstraction. (RK3566's 1 TOPS NPU is RKNPU2-family, *not* the older
 rknpu1/`librknn_api` line — an earlier plan label said otherwise.)
 
 Two consequences worth carrying: a board profile that names a decoder now gets
-it or refuses (see `docs/profile-authoring.md`), which is why only QCS6490 names
-one here; and on RK3566 expect the surrounding work to be device-node plumbing
-rather than silicon — Frigate #18878 shows a VPU session allocated and consuming
+it or refuses (see `docs/profile-authoring.md`), which is why only QCS6490's
+shipped profile names one (RK3566's `rkmpp` is an operator's opt-in); and on
+RK3566 expect the surrounding work to be device-node plumbing rather than
+silicon — Frigate #18878 shows a VPU session allocated and consuming
 0 MiB because the container exposed too few nodes, with nothing reporting it.
 
 ## QNN EP on QCS6490 (via ort)
@@ -81,10 +82,9 @@ rather than silicon — Frigate #18878 shows a VPU session allocated and consumi
     rk3566 expected; Frigate discussions confirm multi-stream viability.
     Profile band likely 8-16 fps pending measurement.
 - **Preprocessing: no Rust crate for RGA** (Rockchip's 2D accelerator for
-  resize/color-convert, librga C API, dma_fd zero-copy). GPU/RGA
-  preprocessing on rk35xx means writing an FFI wrapper — a real work item
-  if CPU resize proves too costly at the target fps; not standard practice
-  in Frigate either.
+  resize/color-convert, librga C API, dma_fd zero-copy), so the board crate
+  binds librga by hand (`rga.rs`); `rkmpp` scales there. Not standard
+  practice in Frigate either.
 
 ## Known-broken combinations → profile validation rules
 

@@ -84,6 +84,7 @@ defmodule Cairn.NativeTest do
         Config.normalize(
           model: "m.onnx",
           backend: "qnn",
+          decoder: "rkmpp",
           input_size: "640x352",
           model_profile: "yolox",
           allow_label_mismatch: true,
@@ -102,6 +103,8 @@ defmodule Cairn.NativeTest do
       # absent stays absent rather than becoming an empty flag value
       refute "--labels" in argv
       refute "--embedder-model" in argv
+      # a board decoder name the canary's CLI would refuse
+      refute "--decoder" in argv
     end
 
     defp value_of(argv, flag) do

@@ -16,6 +16,16 @@ defmodule Cairn.Pipeline.DetectChainTest do
     def detect_chain(%{stream_params: %{chain: chain}, generic: generic}), do: chain.(generic)
   end
 
+  defmodule DecoderBoard do
+    @moduledoc false
+    def name, do: "decoder"
+
+    def detect_chain(%{decoder: decoder, generic: generic}) do
+      send(self(), {:decoder, decoder})
+      generic
+    end
+  end
+
   @camera %Camera{id: "cam"}
   @motion ~s({"enabled":true,"threshold":30})
   @seam [target_queue_size: 1, min_demand_factor: 0.5]
@@ -56,6 +66,15 @@ defmodule Cairn.Pipeline.DetectChainTest do
       assert DetectChain.build(head(), @camera, stream_params: params) ==
                by_hand(params, %MotionGate{config: config})
     end
+  end
+
+  test "the detect opts' decoder reaches the board, nil when absent" do
+    params = %{min_score: %{}, motion_json: nil}
+    DetectChain.build(head(), @camera, [stream_params: params, decoder: "sw"], DecoderBoard)
+    assert_received {:decoder, "sw"}
+
+    DetectChain.build(head(), @camera, [stream_params: params], DecoderBoard)
+    assert_received {:decoder, nil}
   end
 
   describe "a board's chain is checked before anything is built" do

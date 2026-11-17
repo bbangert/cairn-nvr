@@ -4,8 +4,12 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
   defmodule Cairn.RockchipReleaseTest do
     use ExUnit.Case, async: true
 
+    import Membrane.ChildrenSpec
+
     alias Cairn.Config
     alias Cairn.Native.Drain
+    alias Cairn.Pipeline.DetectChain
+    alias Cairn.Rockchip.{DecodeScale, Download}
 
     @stub_rknn "test/support/fixtures/models/stub.rknn"
     @stub_onnx "test/support/fixtures/models/stub.onnx"
@@ -52,7 +56,17 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
 
       assert board.engine("ort") == %{module: CairnOrt, canary: "cairn-detect"}
       assert board.decoder_backend("sw") == Cairn.Native
+      assert board.decoder_backend("rkmpp") == Cairn.Rockchip.Native
       assert Drain.libraries() == [CairnOrt, Cairn.Rockchip.Native, Cairn.Native]
+    end
+
+    test "an rkmpp camera decodes on the board, opened through the base's host" do
+      detect = [stream_params: %{min_score: %{}, motion_json: nil}, decoder: "rkmpp"]
+      spec = DetectChain.build(get_child(:tagger), %{id: "cam_a"}, detect)
+      children = Map.new(spec.children, fn {name, element, _opts} -> {name, element} end)
+
+      assert %DecodeScale{host: Cairn.Native.Host} = children.decoder
+      assert %Download{} = children.download
     end
 
     test "qnn is refused by name of board" do

@@ -10,8 +10,8 @@ defmodule Cairn.Stage.Board do
   @typedoc """
   What a board builds one camera's chain from. `generic` is the base's own
   steps for this camera, so a board can reuse the software decoder, the gate
-  or ORT inference without depending on the base. `decoder` is the profile's
-  decoder name when the caller knows it, else `nil`.
+  or ORT inference without depending on the base. `decoder` is the camera's
+  resolved `decoder:` name, `nil` from a caller that names none.
   """
   @type context :: %{
           camera_id: String.t(),

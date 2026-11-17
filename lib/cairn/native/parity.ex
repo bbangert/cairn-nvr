@@ -370,7 +370,7 @@ defmodule Cairn.Native.Parity do
     sample_fps = Keyword.fetch!(opts, :sample_fps)
     {:ok, engine} = CairnOrt.init(config)
 
-    # The exact seam `Cairn.Native.Host.open_decoder/4` crosses: the engine's
+    # The exact seam `Cairn.Native.Host.open_decoder/5` crosses: the engine's
     # resolved spec, as terms, plus the decode config.
     spec = CairnOrt.engine_spec(engine)
 

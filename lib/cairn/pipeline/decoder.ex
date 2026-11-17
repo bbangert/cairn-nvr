@@ -2,7 +2,10 @@ defmodule Cairn.Pipeline.Decoder do
   @moduledoc """
   Decode and resize as their own element: AU-aligned H.264 in, sampled
   content-rect RGB frames out as plain buffers — the seam that makes the
-  detection stages composable (D-C2).
+  detection stages composable (D-C2). It is the base's decode step; a board
+  with its own decode library may put another in its place
+  (`c:Cairn.Stage.Board.detect_chain/1`), behind the same payload convention
+  by the time frames reach inference.
 
   ## The payload convention
 
@@ -42,7 +45,7 @@ defmodule Cairn.Pipeline.Decoder do
   `Cairn.Stage.DecoderCore` holds the decoder's lifecycle, the sample gate
   and the output slot, with their rules; this element supplies the input
   geometry, the host and the output buffer. Both pads are `:manual`. The rate
-  is the `Cairn.Native.Host.open_decoder/4` reply's `sample_fps`, and because
+  is the `Cairn.Native.Host.open_decoder/5` reply's `sample_fps`, and because
   the core demands access units at line rate, `Cairn.Pipeline.Picker`
   upstream sheds only when *decode* falls behind the line rate.
 
@@ -138,9 +141,10 @@ defmodule Cairn.Pipeline.Decoder do
   # A plain `GenServer.call`: the host's liveness is application-supervised
   # (it sits outside every camera's tree), so a missing host is a boot-order
   # fault that should crash this element, not a state to retry around.
+  # `Cairn.Native` is named because `output/2` reads its RGB frames' payload.
   @impl DecoderCore
   def open_decoder(arg, source),
-    do: Host.open_decoder(arg.host, arg.camera_id, arg.params, source)
+    do: Host.open_decoder(arg.host, arg.camera_id, arg.params, source, Cairn.Native)
 
   # The reason reaches `cameras:status` through the host.
   @impl DecoderCore

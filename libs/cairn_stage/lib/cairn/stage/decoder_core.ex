@@ -17,8 +17,9 @@ defmodule Cairn.Stage.DecoderCore do
 
   The decoder reopens on a cooldown after a failed open or a stream-fatal
   error, at once when the source geometry changes, and not at all after a
-  refusal until it does. A decoder that completes nothing in its first 400
-  access units is reported once per open, not restarted.
+  refusal until it does. A handle poisoned or panicked three times in a row
+  with no frame between is refused too. A decoder that completes nothing in
+  its first 400 access units is reported once per open, not restarted.
 
   `Membrane.ResourceGuard.cleanup/2` is asynchronous: a reopen can overlap
   the previous handle's native close. A `Cairn.Stage.DecoderNif` handle must
@@ -50,6 +51,12 @@ defmodule Cairn.Stage.DecoderCore do
   @callback output(frame :: term(), epoch :: term()) ::
               {stream_format :: struct(), Buffer.t()}
 
+  # A frame replaced before it was output. For a frame that holds a native
+  # resource, so it is given back now rather than when the term is collected.
+  @callback discard(arg :: term(), frame :: term()) :: term()
+
+  @optional_callbacks discard: 2
+
   @enforce_keys [:camera_id, :element, :cooldown_ms]
   defstruct [
     :camera_id,
@@ -70,15 +77,18 @@ defmodule Cairn.Stage.DecoderCore do
     errors: 0,
     since_open: 0,
     completed: 0,
+    failed: 0,
     blind?: false
   ]
 
   @type t :: %__MODULE__{}
 
   # A `Cairn.Stage.DecoderNif`'s stream-fatal class: the handle is unusable and
-  # the remedy is reopening. Engine-fatal reasons cannot come back from a
-  # decoder — it never touches the model.
+  # the remedy is reopening, until `@refuse_after` poisoned or panicked
+  # handles in a row have yielded no frame. Engine-fatal reasons cannot come
+  # back from a decoder — it never touches the model.
   @fatal [:closed, :poisoned, :panicked]
+  @refuse_after 3
 
   # Access units a decoder may complete nothing from before it is called blind.
   # Comfortably past a fleet GOP (the longest measured is 5 s, ~150 frames) so
@@ -115,8 +125,12 @@ defmodule Cairn.Stage.DecoderCore do
     known = core.source
 
     case source do
-      ^known -> {[], core}
-      source -> {[], core |> reopen_for(source, resource_guard) |> ensure_decoder(resource_guard)}
+      ^known ->
+        {[], core}
+
+      source ->
+        core = %{core | failed: 0} |> reopen_for(source, resource_guard)
+        {[], ensure_decoder(core, resource_guard)}
     end
   end
 
@@ -198,29 +212,50 @@ defmodule Cairn.Stage.DecoderCore do
         admit(count(core, completed), frame)
 
       {:error, {:decoder_refused, message}} ->
-        # Permanent, not a fault to cool down from: reopening would defer and
-        # refuse again, so `:refused` (unlike `:closed`) is a state
-        # `ensure_decoder` never retries out of. The branch goes dark —
-        # recording is unaffected — and the reason goes to the element's
-        # `c:decoder_refused/2`.
-        Logger.error(
-          "camera #{core.camera_id}: #{message} — detection is off for this camera; " <>
-            "recording is unaffected"
-        )
-
-        core.element.decoder_refused(core.arg, message)
-        {[], core |> drop_decoder(guard) |> Map.put(:decoder, :refused)}
+        refuse(core, guard, message)
 
       {:error, {reason, message}} when reason in @fatal ->
-        Logger.error(
-          "camera #{core.camera_id}: decoder is #{reason} (#{message}); reopening after cooldown"
-        )
-
-        {[], core |> drop_decoder(guard) |> reopen_later()}
+        fatal(core, guard, reason, message)
 
       {:error, _transient} ->
         {[], count(%{core | errors: core.errors + 1}, false)}
     end
+  end
+
+  # `:closed` never counts: the host closes every handle on an engine reload,
+  # and reloads in a row are an operator editing config.
+  defp fatal(core, guard, reason, message) do
+    failed = if reason == :closed, do: core.failed, else: core.failed + 1
+
+    if failed >= @refuse_after do
+      refuse(
+        core,
+        guard,
+        "the decoder failed #{failed} times in a row without a frame " <>
+          "(last: #{reason}, #{message})"
+      )
+    else
+      Logger.error(
+        "camera #{core.camera_id}: decoder is #{reason} (#{message}); reopening after cooldown"
+      )
+
+      {[], %{(core |> drop_decoder(guard) |> reopen_later()) | failed: failed}}
+    end
+  end
+
+  # Not a fault to cool down from: reopening would fail the same way, so
+  # `:refused` (unlike `:closed`) is a state `ensure_decoder` never retries
+  # out of; only a new stream format lifts it. The branch goes dark —
+  # recording is unaffected — and the reason goes to the element's
+  # `c:decoder_refused/2`.
+  defp refuse(core, guard, message) do
+    Logger.error(
+      "camera #{core.camera_id}: #{message} — detection is off for this camera; " <>
+        "recording is unaffected"
+    )
+
+    core.element.decoder_refused(core.arg, message)
+    {[], core |> drop_decoder(guard) |> Map.put(:decoder, :refused)}
   end
 
   # A decoder that has never completed a frame is the one failure a decode
@@ -262,11 +297,19 @@ defmodule Cairn.Stage.DecoderCore do
   defp admit(core, nil), do: {[], core}
 
   defp admit(%{pending: pending} = core, frame) do
+    core = %{core | failed: 0}
     # Newest wins: a frame waiting out a busy model pass is strictly worth
     # less than the one that just arrived, and unlike an access unit it owes
     # nothing to what follows it.
-    core = if pending == nil, do: core, else: %{core | replaced: core.replaced + 1}
+    core = if pending == nil, do: core, else: replace(core, pending)
     maybe_send(%{core | pending: frame})
+  end
+
+  # The only place a decoded frame is dropped: a reopen or a refusal leaves
+  # the pending one to go out on the next demand.
+  defp replace(core, pending) do
+    if function_exported?(core.element, :discard, 2), do: core.element.discard(core.arg, pending)
+    %{core | replaced: core.replaced + 1}
   end
 
   # The rendezvous: whichever of demand and a pending frame arrives second

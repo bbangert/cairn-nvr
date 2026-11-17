@@ -139,14 +139,14 @@ defmodule Cairn.Native.Config do
   model half only: nothing about a scene knob can make a model load or fail to.
   """
   @spec to_argv(t()) :: [String.t()]
+  # No `--decoder`: the probe opens no decoder, and the name may be a board
+  # library's that the binary's CLI does not know and would refuse.
   def to_argv(config) do
     [
       "--model",
       config.model,
       "--backend",
       config.backend,
-      "--decoder",
-      config.decoder,
       "--sample-fps",
       to_string(config.sample_fps)
     ] ++

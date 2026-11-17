@@ -2,27 +2,58 @@ defmodule Cairn.Rockchip.Board do
   @moduledoc """
   The board of a Rockchip release: the base's generic detect chain, with the
   RKNN engine (`Cairn.Rockchip.Native`) behind its inference step for
-  `backend: rknn`.
+  `backend: rknn`, and for `decoder: rkmpp` its decode step replaced by MPP
+  decode and RGA scale (`Cairn.Rockchip.DecodeScale`) plus the
+  `Cairn.Rockchip.Download` that turns their dma-buf frames back into RGB.
 
-  The base's own libraries — the ffmpeg-backed decoder, the onnxruntime engine
-  and its canary — are lent through `config :cairn_rockchip, :generic`, which
-  the base's `config/boards/rockchip.exs` sets: this library depends only on
+  The base's own libraries — the ffmpeg-backed decoder, the decoder host, the
+  onnxruntime engine and its canary — are lent through
+  `config :cairn_rockchip, :generic`, which the base's
+  `config/boards/rockchip.exs` sets: this library depends only on
   `cairn_stage`, so it cannot name a base module itself.
   """
 
   @behaviour Cairn.Stage.Board
 
-  alias Cairn.Rockchip.Native
+  alias Cairn.Rockchip.{DecodeScale, Download, Native}
+  alias Cairn.Stage.Step
 
   @impl true
   def name, do: "rockchip"
 
+  # Still named `:decoder`, the child tools read decoder stats from. The NIF
+  # refuses a `motion_json`, and measures none: a configured gate is the
+  # generic `:motion_gate` step after the download.
   @impl true
+  def detect_chain(%{decoder: "rkmpp"} = context) do
+    decode = %Step{
+      name: :decoder,
+      element: %DecodeScale{
+        camera_id: context.camera_id,
+        host: generic(:host),
+        stream_params: Map.put(context.stream_params, :motion_json, nil)
+      },
+      covers: [:decode, :scale],
+      input: :h264,
+      output: :dma_frame
+    }
+
+    download = %Step{
+      name: :download,
+      element: %Download{},
+      covers: [],
+      input: :dma_frame,
+      output: :rgb
+    }
+
+    [decode, download | Enum.reject(context.generic, &(:decode in &1.covers))]
+  end
+
   def detect_chain(context), do: context.generic
 
-  # Software decode only until the MPP decoder lands (phase 9).
+  # `auto` stays software: `rkmpp` is only ever named (D-G11).
   @impl true
-  def decoders, do: ~w(auto sw)
+  def decoders, do: ~w(auto sw rkmpp)
 
   # No `qnn`: this board has no HTP, so a profile naming it is refused with
   # this board's name. Only librknnrt runs an `.rknn`, so the CPU baseline
@@ -36,6 +67,7 @@ defmodule Cairn.Rockchip.Board do
   end
 
   @impl true
+  def decoder_backend("rkmpp"), do: Native
   def decoder_backend(_decoder), do: generic(:decoder)
 
   @impl true
@@ -47,12 +79,27 @@ defmodule Cairn.Rockchip.Board do
   # which cannot be checked from here.
   @impl true
   def preflight do
-    reasons =
-      Enum.reject([nif_reason(Native.load_error()), library_reason()], &is_nil/1)
+    nif = nif_reason(Native.load_error())
 
-    backends = if reasons == [], do: %{}, else: %{"rknn" => Enum.join(reasons, "; ")}
-    %{decoders: %{}, backends: backends}
+    %{
+      decoders: named("rkmpp", [nif | Enum.map(devices(), &device_reason/1)]),
+      backends: named("rknn", [nif, library_reason()])
+    }
   end
+
+  defp named(name, reasons) do
+    case Enum.reject(reasons, &is_nil/1) do
+      [] -> %{}
+      reasons -> %{name => Enum.join(reasons, "; ")}
+    end
+  end
+
+  @devices ~w(/dev/mpp_service /dev/rga /dev/dma_heap/system)
+
+  # Overridable so a suite can point at paths that do or do not exist.
+  defp devices, do: Application.get_env(:cairn_rockchip, :devices, @devices)
+
+  defp device_reason(path), do: unless(File.exists?(path), do: "#{path} is missing")
 
   defp nif_reason(nil), do: nil
   defp nif_reason(error), do: "the board NIF did not load (#{inspect(error)})"
