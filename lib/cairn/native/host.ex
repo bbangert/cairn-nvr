@@ -67,6 +67,9 @@ defmodule Cairn.Native.Host do
     :table,
     :inflight,
     :native,
+    # The board's library for the configured decoder, set with `native`. An
+    # opener must name it: `native` may be a suite's stand-in.
+    :decode_library,
     :ort,
     :canary,
     :config,
@@ -146,16 +149,26 @@ defmodule Cairn.Native.Host do
   this call returns promptly with a software decoder that may still promote
   itself — `decode::open` in `plugins/cairn-detect/src/decode.rs`. A board
   library's decoder may open its hardware here, and fail here.
+
+  `library` is the decode library whose frames the caller reads. One other
+  than the configured decoder's is refused, `{:error, {:config, message}}`,
+  before anything opens: its frames would not be the caller's shape.
   """
-  @spec open_decoder(atom(), String.t(), map() | keyword(), {pos_integer(), pos_integer()} | nil) ::
+  @spec open_decoder(
+          atom(),
+          String.t(),
+          map() | keyword(),
+          {pos_integer(), pos_integer()} | nil,
+          module()
+        ) ::
           {:ok, %{ref: reference(), module: module(), sample_fps: pos_integer()}}
           | {:error, term()}
-  def open_decoder(server \\ __MODULE__, camera_id, params, source) do
+  def open_decoder(server \\ __MODULE__, camera_id, params, source, library) do
     # Above the 5 s default for headroom, though the crate now defers and
     # deadline-bounds its hardware probing: a slow open here is engine or
     # scheduler pressure, and a caller timing out would crash a camera whose
     # decoder was still coming up.
-    GenServer.call(server, {:open_decoder, camera_id, params, source}, 15_000)
+    GenServer.call(server, {:open_decoder, camera_id, params, source, library}, 15_000)
   end
 
   @doc """
@@ -308,13 +321,13 @@ defmodule Cairn.Native.Host do
   # No parking and no registry bookkeeping: a decoder handle is the caller's,
   # and a reopen racing the old handle's close costs nothing but memory the
   # destructor frees — unlike a stream, whose camera-id claim must land first.
-  def handle_call({:open_decoder, camera_id, params, source}, _from, state) do
+  def handle_call({:open_decoder, camera_id, params, source, library}, _from, state) do
     # Every refusal is recorded, the params-vocabulary one included: a config
     # error repeats identically on each of the caller's retries, so this
     # camera's status saying why beats it reading "ready" at 0 fps.
     result =
       case NativeConfig.stream_params(params) do
-        {:ok, params} -> do_open_decoder(state, camera_id, params, source_dims(source))
+        {:ok, params} -> do_open_decoder(state, camera_id, params, source_dims(source), library)
         {:error, message} -> {:error, {:config, message}}
       end
 
@@ -660,11 +673,12 @@ defmodule Cairn.Native.Host do
   # none is left driven through a module it was not opened with.
   defp libraries(state, decoder, backend) do
     board = Cairn.Board.module()
+    decode_library = board.decoder_backend(decoder)
 
     %{
       state
-      | native:
-          Keyword.get_lazy(state.opts, :native_module, fn -> board.decoder_backend(decoder) end),
+      | decode_library: decode_library,
+        native: Keyword.get(state.opts, :native_module, decode_library),
         ort: Keyword.get_lazy(state.opts, :ort_module, fn -> board.engine(backend).module end)
     }
   end
@@ -820,19 +834,29 @@ defmodule Cairn.Native.Host do
   # Only the engine library's absence is checked at load, so the decode
   # library's is answered here, per camera: its stubs raise, and this runs
   # inside the host's `handle_call`.
-  defp do_open_decoder(%{engine_state: :ready} = state, camera_id, params, {:ok, source}) do
-    if state.native.available?(),
-      do: open_native_decoder(state, camera_id, params, source),
-      else:
+  defp do_open_decoder(%{engine_state: :ready} = state, camera_id, params, {:ok, source}, library) do
+    cond do
+      library != state.decode_library ->
+        {:error,
+         {:config,
+          "this chain decodes through #{inspect(library)}; the engine's decoder " <>
+            "(#{state.config.decoder}) is #{inspect(state.decode_library)}'s"}}
+
+      state.native.available?() ->
+        open_native_decoder(state, camera_id, params, source)
+
+      true ->
         {:error,
          {:nif_unavailable,
           "#{inspect(state.native)} is not loaded (#{inspect(state.native.load_error())})"}}
+    end
   end
 
-  defp do_open_decoder(%{engine_state: :ready}, _camera_id, _params, {:error, message}),
+  defp do_open_decoder(%{engine_state: :ready}, _camera_id, _params, {:error, message}, _library),
     do: {:error, {:config, message}}
 
-  defp do_open_decoder(state, _camera_id, _params, _source), do: {:error, state.engine_state}
+  defp do_open_decoder(state, _camera_id, _params, _source, _library),
+    do: {:error, state.engine_state}
 
   defp open_native_decoder(state, camera_id, params, source) do
     # A plain field-read NIF (sub-microsecond, deliberately not

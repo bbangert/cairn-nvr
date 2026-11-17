@@ -665,8 +665,10 @@ defmodule Cairn.BoardPipeline do
   defp decoder_open({:in, message, _from}), do: decoder_open_message(message)
   defp decoder_open(_event), do: :not_one
 
-  defp decoder_open_message({:"$gen_call", _from, {:open_decoder, _camera, _params, source}}),
-    do: {:ok, source}
+  defp decoder_open_message(
+         {:"$gen_call", _from, {:open_decoder, _camera, _params, source, _library}}
+       ),
+       do: {:ok, source}
 
   defp decoder_open_message(_message), do: :not_one
 

@@ -10,8 +10,10 @@ defmodule Cairn.Rockchip.ElementsTest do
   # Host and NIF in one. The decoder handle is the test pid and a lease is
   # `{pid, pts}`, so every call reports to the test without shared state.
   defmodule Stub do
-    def open_decoder(_camera_id, params, _source),
-      do: {:ok, %{ref: params.test, module: Map.get(params, :module, __MODULE__), sample_fps: 30}}
+    def open_decoder(_camera_id, params, _source, library) do
+      send(params.test, {:opened_through, library})
+      {:ok, %{ref: params.test, module: library, sample_fps: 30}}
+    end
 
     def report_decoder_refusal(_camera_id, _message), do: :ok
 
@@ -48,13 +50,6 @@ defmodule Cairn.Rockchip.ElementsTest do
     def release({pid, pts}) do
       send(pid, {:release, pts})
       :ok
-    end
-  end
-
-  defmodule Foreign do
-    def close_decoder(pid) do
-      send(pid, {:closed, __MODULE__})
-      {:ok, true}
     end
   end
 
@@ -134,11 +129,10 @@ defmodule Cairn.Rockchip.ElementsTest do
             ], _} = Download.handle_stream_format(:input, format, %{}, state)
   end
 
-  test "a decoder opened through another library is closed and refused" do
-    arg = %{host: Stub, camera_id: "cam", native: Stub, params: %{test: self(), module: Foreign}}
+  test "DecodeScale names its own library to the host" do
+    arg = %{host: Stub, camera_id: "cam", native: Stub, params: %{test: self()}}
 
-    assert {:error, {:config, message}} = DecodeScale.open_decoder(arg, {640, 480})
-    assert message =~ "Foreign decoder"
-    assert_received {:closed, Foreign}
+    assert {:ok, %{module: Stub}} = DecodeScale.open_decoder(arg, {640, 480})
+    assert_received {:opened_through, Stub}
   end
 end

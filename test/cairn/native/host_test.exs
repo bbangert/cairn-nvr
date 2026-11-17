@@ -146,12 +146,12 @@ defmodule Cairn.Native.HostTest do
 
       refusal = {:open_stream, "decoder v4l2 was named but did not open"}
       control(%{open_decoder: {:error, refusal}})
-      assert {:error, ^refusal} = Host.open_decoder(host, id, %{}, {2560, 1920})
+      assert {:error, ^refusal} = Host.open_decoder(host, id, %{}, {2560, 1920}, Cairn.Native)
       assert Host.status(host).decoder_failures == %{id => refusal}
 
       # The cooldown retry that succeeds is also what clears the surface.
       control(%{open_decoder: nil})
-      assert {:ok, _handle} = Host.open_decoder(host, id, %{}, {2560, 1920})
+      assert {:ok, _handle} = Host.open_decoder(host, id, %{}, {2560, 1920}, Cairn.Native)
       assert Host.status(host).decoder_failures == %{}
     end
 
@@ -161,7 +161,10 @@ defmodule Cairn.Native.HostTest do
       pid = Process.whereis(host)
 
       control(%{available?: false, open_decoder: fn _, _ -> raise "nif_not_loaded" end})
-      assert {:error, {:nif_unavailable, message}} = Host.open_decoder(host, id, %{}, nil)
+
+      assert {:error, {:nif_unavailable, message}} =
+               Host.open_decoder(host, id, %{}, nil, Cairn.Native)
+
       assert message =~ "Cairn.NativeStub is not loaded"
       assert Process.whereis(host) == pid
       assert %{^id => {:nif_unavailable, ^message}} = Host.status(host).decoder_failures
@@ -171,7 +174,9 @@ defmodule Cairn.Native.HostTest do
       host = start_host()
       assert_receive {:init, _config}
 
-      assert {:error, {:config, message}} = Host.open_decoder(host, id, %{}, [2560, 1920])
+      assert {:error, {:config, message}} =
+               Host.open_decoder(host, id, %{}, [2560, 1920], Cairn.Native)
+
       assert message =~ "{width, height}"
       # The host survived to answer — the failure was a value, not an exit —
       # and the camera it strands is on the surface like any other refusal:
@@ -189,7 +194,9 @@ defmodule Cairn.Native.HostTest do
       # then raise badarg inside the NIF's argument decode — in the host's own
       # handle_call.
       for source <- [{0, 1920}, {-2560, 1920}, {2560, -1}, {2_147_483_648, 1920}] do
-        assert {:error, {:config, message}} = Host.open_decoder(host, id, %{}, source)
+        assert {:error, {:config, message}} =
+                 Host.open_decoder(host, id, %{}, source, Cairn.Native)
+
         assert message =~ "positive"
       end
 
@@ -203,7 +210,7 @@ defmodule Cairn.Native.HostTest do
       assert_receive {:init, _config}
 
       assert {:error, {:config, message}} =
-               Host.open_decoder(host, id, %{typo: 1}, {2560, 1920})
+               Host.open_decoder(host, id, %{typo: 1}, {2560, 1920}, Cairn.Native)
 
       # Same argument as the malformed source: this camera retries into the
       # identical refusal for ever, so the surface must say why.
@@ -216,15 +223,58 @@ defmodule Cairn.Native.HostTest do
 
       # The deferred probe's shape: the open succeeds (and clears nothing,
       # there was nothing), the refusal arrives later from the pipeline.
-      assert {:ok, _handle} = Host.open_decoder(host, id, %{}, {2560, 1920})
+      assert {:ok, _handle} = Host.open_decoder(host, id, %{}, {2560, 1920}, Cairn.Native)
       message = "decoder v4l2 was named but did not open"
       Host.report_decoder_refusal(host, id, message)
 
       assert %{^id => {:decoder_refused, ^message}} = Host.status(host).decoder_failures
 
       # The next successful open — a fixed profile, a reload — clears it.
-      assert {:ok, _handle} = Host.open_decoder(host, id, %{}, {2560, 1920})
+      assert {:ok, _handle} = Host.open_decoder(host, id, %{}, {2560, 1920}, Cairn.Native)
       assert Host.status(host).decoder_failures == %{}
+    end
+
+    test "an opener built for another decode library is refused before any open", %{id: id} do
+      host = start_host()
+      assert_receive {:init, _config}
+
+      assert {:error, {:config, message}} =
+               Host.open_decoder(host, id, %{}, {2560, 1920}, Cairn.Rockchip.Native)
+
+      assert message =~ "this chain decodes through Cairn.Rockchip.Native"
+      refute_received {:open_decoder, _camera_id, _params}
+      assert %{^id => {:config, ^message}} = Host.status(host).decoder_failures
+
+      assert {:ok, _handle} = Host.open_decoder(host, id, %{}, {2560, 1920}, Cairn.Native)
+      assert Host.status(host).decoder_failures == %{}
+    end
+  end
+
+  if Cairn.Board.module() == Cairn.Rockchip.Board do
+    describe "the decode library on the Rockchip board" do
+      test "rkmpp and sw each refuse the other's chain", %{id: id} do
+        for {decoder, foreign} <- [{"rkmpp", Cairn.Native}, {"sw", Cairn.Rockchip.Native}] do
+          host = start_host(config: %{model: "m.onnx", backend: "qnn", decoder: decoder})
+          assert_receive {:init, _config}
+
+          assert {:error, {:config, message}} =
+                   Host.open_decoder(host, id, %{}, {2560, 1920}, foreign)
+
+          assert message =~ "(#{decoder})"
+        end
+
+        refute_received {:open_decoder, _camera_id, _params}
+      end
+
+      test "auto and sw are one library, so an sw chain opens under either", %{id: id} do
+        for decoder <- ["auto", "sw"] do
+          host = start_host(config: %{model: "m.onnx", backend: "qnn", decoder: decoder})
+          assert_receive {:init, _config}
+
+          assert {:ok, %{module: NativeStub}} =
+                   Host.open_decoder(host, id, %{}, {2560, 1920}, Cairn.Native)
+        end
+      end
     end
   end
 

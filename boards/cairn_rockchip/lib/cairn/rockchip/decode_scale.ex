@@ -30,7 +30,7 @@ defmodule Cairn.Rockchip.DecodeScale do
     host: [
       spec: module(),
       description:
-        "The base's decoder host, called as `open_decoder/3` and `report_decoder_refusal/2`"
+        "The base's decoder host, called as `open_decoder/4` and `report_decoder_refusal/2`"
     ],
     stream_params: [spec: map(), default: %{}],
     reopen_cooldown_ms: [spec: non_neg_integer(), default: 5_000],
@@ -78,28 +78,9 @@ defmodule Cairn.Rockchip.DecodeScale do
   def handle_parent_notification(:stats, _ctx, core),
     do: {[notify_parent: {:stats, DecoderCore.stats(core)}], core}
 
-  # The host opens through the decoder library its engine config names, which
-  # need not be this one (a profile on another decoder, a host pinned to
-  # another library). Such a decoder would emit RGB frames into a DmaFrame
-  # pad, so it is closed and the open fails, on the core's cooldown.
   @impl DecoderCore
-  def open_decoder(%{native: native} = arg, source) do
-    case arg.host.open_decoder(arg.camera_id, arg.params, source) do
-      {:ok, %{module: ^native}} = ok ->
-        ok
-
-      {:ok, %{ref: ref, module: module}} ->
-        module.close_decoder(ref)
-
-        {:error,
-         {:config,
-          "the host opened a #{inspect(module)} decoder; this chain decodes " <>
-            "through #{inspect(native)} (decoder: rkmpp)"}}
-
-      error ->
-        error
-    end
-  end
+  def open_decoder(arg, source),
+    do: arg.host.open_decoder(arg.camera_id, arg.params, source, arg.native)
 
   @impl DecoderCore
   def decoder_refused(arg, message), do: arg.host.report_decoder_refusal(arg.camera_id, message)
