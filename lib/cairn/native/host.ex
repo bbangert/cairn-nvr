@@ -141,10 +141,11 @@ defmodule Cairn.Native.Host do
   `source` is what the camera is sending, as `{width, height}`, or `nil` from a
   caller that does not know. Software decode does not need it; a V4L2 M2M
   decoder does, and one opened without it opens anyway and then fails every
-  frame (`research/board-first-light.md`). The hardware open itself is
-  *deferred* by the crate until the stream's in-band SPS/PPS arrive, so this
-  call returns promptly with a software decoder that may still promote
-  itself — `decode::open` in `plugins/cairn-detect/src/decode.rs`.
+  frame (`research/board-first-light.md`). The generic decode library
+  *defers* the hardware open until the stream's in-band SPS/PPS arrive, so
+  this call returns promptly with a software decoder that may still promote
+  itself — `decode::open` in `plugins/cairn-detect/src/decode.rs`. A board
+  library's decoder may open its hardware here, and fail here.
   """
   @spec open_decoder(atom(), String.t(), map() | keyword(), {pos_integer(), pos_integer()} | nil) ::
           {:ok, %{ref: reference(), module: module(), sample_fps: pos_integer()}}
@@ -176,8 +177,8 @@ defmodule Cairn.Native.Host do
   end
 
   @doc """
-  Take one of `Cairn.Pipeline.Decoder`'s sampled frames through the detection
-  gate and the model.
+  Take one of the decode step's sampled frames through the detection gate and
+  the model.
 
   Blocks the caller for the model pass — and, under saturation, for as long as
   the streams ahead of it hold the model session too. `meta` is
@@ -815,7 +816,25 @@ defmodule Cairn.Native.Host do
   # without either naming the other. `sample_fps` stays host-side: it is
   # `Cairn.Stage.SampleGate`'s rate, handed out in the reply below, and the
   # crate no longer consumes it.
+  #
+  # Only the engine library's absence is checked at load, so the decode
+  # library's is answered here, per camera: its stubs raise, and this runs
+  # inside the host's `handle_call`.
   defp do_open_decoder(%{engine_state: :ready} = state, camera_id, params, {:ok, source}) do
+    if state.native.available?(),
+      do: open_native_decoder(state, camera_id, params, source),
+      else:
+        {:error,
+         {:nif_unavailable,
+          "#{inspect(state.native)} is not loaded (#{inspect(state.native.load_error())})"}}
+  end
+
+  defp do_open_decoder(%{engine_state: :ready}, _camera_id, _params, {:error, message}),
+    do: {:error, {:config, message}}
+
+  defp do_open_decoder(state, _camera_id, _params, _source), do: {:error, state.engine_state}
+
+  defp open_native_decoder(state, camera_id, params, source) do
     # A plain field-read NIF (sub-microsecond, deliberately not
     # dirty-scheduled), so calling it from this process costs nothing.
     spec = state.ort.engine_spec(state.engine)
@@ -843,11 +862,6 @@ defmodule Cairn.Native.Host do
         error
     end
   end
-
-  defp do_open_decoder(%{engine_state: :ready}, _camera_id, _params, {:error, message}),
-    do: {:error, {:config, message}}
-
-  defp do_open_decoder(state, _camera_id, _params, _source), do: {:error, state.engine_state}
 
   # The codecpar fields these land on are i32, and the crate re-refuses at the
   # same bound; checking here too turns an out-of-range pair into a config

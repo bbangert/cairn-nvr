@@ -52,9 +52,9 @@ defmodule Cairn.Pipeline.DetectChain do
     context = %{
       camera_id: camera.id,
       stream_params: stream_params,
-      # The profile's decoder is engine config (`Cairn.Config.native_model_config/1`)
-      # and does not reach the detect opts.
-      decoder: nil,
+      # `Cairn.Config.decoder/2`: the engine's decode library's name unless the
+      # engine's config was pinned apart; a caller that passes none gets `nil`.
+      decoder: Keyword.get(detect, :decoder),
       motion: gate && gate.config,
       generic: generic(camera, stream_params, gate)
     }

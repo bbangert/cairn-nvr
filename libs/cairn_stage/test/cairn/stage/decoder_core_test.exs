@@ -60,16 +60,29 @@ defmodule Cairn.Stage.DecoderCoreTest do
     end
   end
 
+  defmodule Discarding do
+    @behaviour DecoderCore
+
+    @impl true
+    defdelegate open_decoder(arg, source), to: Element
+    @impl true
+    defdelegate decoder_refused(arg, message), to: Element
+    @impl true
+    defdelegate output(frame, epoch), to: Element
+    @impl true
+    def discard(arg, frame), do: send(arg.test, {:discarded, frame.pts})
+  end
+
   setup do
     {:ok, guard} = Membrane.ResourceGuard.start_link()
     %{guard: guard}
   end
 
-  defp core(cooldown_ms \\ 0) do
+  defp core(cooldown_ms \\ 0, element \\ Element) do
     {[demand: {:input, 1}], core} =
       DecoderCore.new(
         camera_id: "cam",
-        element: Element,
+        element: element,
         arg: %{test: self()},
         cooldown_ms: cooldown_ms
       )
@@ -136,6 +149,25 @@ defmodule Cairn.Stage.DecoderCoreTest do
     core = feed!(core, g, 1)
     assert_received {:open, {640, 480}}
     assert %{ref: _} = core.decoder
+  end
+
+  test "three fatal handles in a row without a frame refuse; :closed never counts", %{guard: g} do
+    feed_all = fn core, range, reply ->
+      Process.put(:decode, fn _pts, _sample -> {:error, reply} end)
+      Enum.reduce(range, core, &feed!(&2, g, &1))
+    end
+
+    core = declare(core(), g) |> feed_all.(0..1, {:poisoned, "bad"})
+    Process.delete(:decode)
+    core = core |> feed!(g, 2) |> feed_all.(3..5, {:closed, "reload"})
+    core = feed_all.(core, 6..7, {:poisoned, "bad"})
+    assert core.decoder == :closed
+    refute_received {:refused, _}
+
+    assert feed_all.(core, 8..8, {:poisoned, "bad"}).decoder == :refused
+
+    assert_received {:refused,
+                     "the decoder failed 3 times in a row without a frame (last: poisoned, bad)"}
   end
 
   test "a refusal goes dark, reports once and waits for a new source", %{guard: g} do
@@ -224,6 +256,19 @@ defmodule Cairn.Stage.DecoderCoreTest do
 
     assert %{emitted: 3, replaced: 1, errors: 0, decoder: :open} =
              DecoderCore.stats(core)
+  end
+
+  test "a replaced frame is discarded, an output one is not", %{guard: g} do
+    Process.put(:decode, fn pts, _sample -> {:ok, {true, %{pts: pts, width: 4}}} end)
+    core = declare(core(0, Discarding), g)
+    core = feed!(core, g, 0)
+    refute_received {:discarded, _}
+
+    core = feed!(core, g, 1)
+    assert_received {:discarded, 0}
+
+    {[_format, buffer: {:output, %{pts: 1}}], _core} = DecoderCore.demand(core, 1)
+    refute_received {:discarded, _}
   end
 
   test "an undated buffer counts an error, decodes nothing and still demands", %{guard: g} do

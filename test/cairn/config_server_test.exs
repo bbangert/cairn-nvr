@@ -282,6 +282,43 @@ defmodule Cairn.Config.ServerTest do
                %{added: [], removed: [], changed: [], rebuilt: ["cam_a"], refreshed: []}
     end
 
+    test "a profile's resolved decoder restarts the cameras on it" do
+      # It picks the decode elements on a board that has its own; naming the
+      # default it already resolved to moves nothing.
+      dir = Path.join(System.tmp_dir!(), "cairn_srv_dec_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      config = fn extra ->
+        File.write!(
+          Path.join(dir, "dec.yml"),
+          "backend: ort\nmodel:\n  onnx: " <>
+            "test/support/fixtures/models/stub.onnx\n" <> extra
+        )
+
+        from_map!(%{
+          "data_dir" => "tmp/cfg_srv_test",
+          "profile_dirs" => [dir],
+          "plugins" => %{"det" => %{"profile" => "dec"}},
+          "cameras" => [%{"id" => "cam_a", "rtsp_url" => "rtsp://h/1", "plugin" => "det"}]
+        })
+      end
+
+      old = config.("")
+      assert Config.decoder(old, hd(old.cameras)) == "auto"
+
+      assert Config.Server.diff_cameras(old, config.("decoder: sw\n")) ==
+               %{added: [], removed: [], changed: ["cam_a"], rebuilt: [], refreshed: []}
+
+      assert Config.Server.diff_cameras(old, config.("decoder: auto\n")) ==
+               %{added: [], removed: [], changed: [], rebuilt: [], refreshed: []}
+    end
+
+    test "a camera with no plugin resolves the default decoder" do
+      config = from_map!(%{"cameras" => [%{"id" => "cam_a", "rtsp_url" => "rtsp://h/1"}]})
+      assert Config.decoder(config, hd(config.cameras)) == "auto"
+    end
+
     test "raising the live-track cap restarts the camera, at any level" do
       # The cap is construction input to the detect branch — the element's
       # `max_suspended` and a frame-counting core's `max_live` — so a running

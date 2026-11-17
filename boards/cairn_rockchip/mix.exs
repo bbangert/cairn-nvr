@@ -17,7 +17,8 @@ defmodule Cairn.Rockchip.MixProject do
   # that is what keeps this library extractable.
   defp deps do
     [
-      {:cairn_stage, path: "../../libs/cairn_stage"}
+      {:cairn_stage, path: "../../libs/cairn_stage"},
+      {:membrane_h264_format, "~> 0.6.1"}
     ]
   end
 end

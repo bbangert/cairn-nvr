@@ -3,13 +3,14 @@
 Presence-detection NVR for RK3566 vagus boards (Home Assistant Green): RTSP
 cameras in, events and a live UI out.
 
-**Not released.** Decode is software. Detection runs on the CPU. The image
-carries the RKNN engine, but `backend: rknn` needs Rockchip's `librknnrt.so`,
+**Not released.** Decode is software unless a profile says `decoder: rkmpp`.
+Detection runs on the CPU. The image carries the RKNN engine, but `backend: rknn` needs Rockchip's `librknnrt.so`,
 which is not in the image (it must be on the loader's path or named by
 `CAIRN_RKNN_LIBRARY`), and this add-on has no way to supply either yet — so
 `backend: rknn` runs only in a hand-run container for now. The image also
 carries Rockchip's MPP and librga libraries and the add-on grants their device
-nodes, but nothing uses the hardware decoder or the RGA yet.
+nodes: `decoder: rkmpp` decodes through MPP and scales through the RGA, and
+`decoder: auto` never picks it.
 
 ## Install
 

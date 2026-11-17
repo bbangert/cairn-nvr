@@ -155,6 +155,18 @@ defmodule Cairn.Native.HostTest do
       assert Host.status(host).decoder_failures == %{}
     end
 
+    test "an unloaded decode library is a refusal on status, not a host crash", %{id: id} do
+      host = start_host()
+      assert_receive {:init, _config}
+      pid = Process.whereis(host)
+
+      control(%{available?: false, open_decoder: fn _, _ -> raise "nif_not_loaded" end})
+      assert {:error, {:nif_unavailable, message}} = Host.open_decoder(host, id, %{}, nil)
+      assert message =~ "Cairn.NativeStub is not loaded"
+      assert Process.whereis(host) == pid
+      assert %{^id => {:nif_unavailable, ^message}} = Host.status(host).decoder_failures
+    end
+
     test "a malformed source is a config error, not a host crash", %{id: id} do
       host = start_host()
       assert_receive {:init, _config}

@@ -1,9 +1,8 @@
 defmodule Cairn.Stage.DmaFrame do
   @moduledoc """
   The stream format of frames that stay in a dma-buf between elements, rather
-  than being copied out as RGB binaries. Defined ahead of any element that
-  produces one so that `Cairn.Stage.Step`'s `:dma_frame` and the board
-  elements share one name. `owner` is whatever holds the buffers' pool.
+  than being copied out as RGB binaries: `Cairn.Stage.Step`'s `:dma_frame`.
+  `owner` identifies the buffers' pool, so a rebuilt pool is a new format.
   """
 
   @enforce_keys [:width, :height, :format, :owner]

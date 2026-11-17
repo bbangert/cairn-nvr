@@ -252,7 +252,9 @@ Two consequences worth an operator's attention:
 | `decoder` | `auto`, `vaapi`, `qsv`, `nvdec`, `v4l2`, `videotoolbox`, `sw` | the release's board (`Cairn.Stage.Board.decoders/0`); the generic board's are `DecoderKind`, `plugins/cairn-detect/src/decode.rs` |
 | `tracking:` stage keys | `bbd`, `oru`, `ocr`, `twin_mint` | `Cairn.Tracker.Stage.Bbd` / `.Oru` / `.Ocr` / `.TwinMint` |
 
-The `backend` and `decoder` menus shown are the generic board's.
+The `backend` and `decoder` menus shown are the generic board's. The
+Rockchip release's decoder menu is `auto`, `sw` and `rkmpp` (MPP decode + RGA
+scale in `boards/cairn_rockchip`), and its `auto` never picks `rkmpp`.
 
 Each catalog row is a decode contract listing the model families it applies
 to: `yolo11` and `yolov8` share one row because several Ultralytics
@@ -269,9 +271,9 @@ Naming a hardware video decoder says nothing about where the model runs.
 
 Naming one is a **requirement**: if the device or the hwaccel is missing, the
 decoder refuses the software fallback and the camera's detect branch goes dark
-with the reason on `cameras:status`, while recording carries on. (The refusal
-lands when the hardware probe decides, which for a live H.264 stream is at the
-first keyframe: the probe waits for the stream's own SPS/PPS before opening —
+with the reason on `cameras:status`, while recording carries on. (On the
+generic board the refusal lands when the hardware probe decides, which for a
+live H.264 stream is at the first keyframe: the probe waits for the stream's own SPS/PPS before opening —
 see `decode::open` in `plugins/cairn-detect/src/decode.rs`.) Write `decoder: auto` — the default — to mean "the best available, software
 if that is all there is". The distinction is worth the refusal on a board: on
 QCS6490 the ASIC decodes the whole fleet for about 2% CPU where software decode

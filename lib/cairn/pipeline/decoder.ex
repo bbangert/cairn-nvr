@@ -2,7 +2,10 @@ defmodule Cairn.Pipeline.Decoder do
   @moduledoc """
   Decode and resize as their own element: AU-aligned H.264 in, sampled
   content-rect RGB frames out as plain buffers — the seam that makes the
-  detection stages composable (D-C2).
+  detection stages composable (D-C2). It is the base's decode step; a board
+  with its own decode library may put another in its place
+  (`c:Cairn.Stage.Board.detect_chain/1`), behind the same payload convention
+  by the time frames reach inference.
 
   ## The payload convention
 

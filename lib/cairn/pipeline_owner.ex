@@ -455,15 +455,16 @@ defmodule Cairn.PipelineOwner do
   # gate's calibration window stopped reading it: it is sized on the frames'
   # own pts.)
   #
-  # `tracker:` is resolved here rather than carried in the policy because it
-  # wires an element rather than feeding one: a reload cannot swap a core under
-  # a running branch, which is why a changed core is a camera restart rather
-  # than a refresh (`Cairn.Config.Server`).
+  # `tracker:` and `decoder:` are resolved here rather than carried in the
+  # policy because each wires elements rather than feeding one: a reload cannot
+  # swap them under a running branch, which is why a change to either is a
+  # camera restart rather than a refresh (`Cairn.Config.Server`).
   defp detect_opts(state) do
     [
       policy: Config.policy(state.config, state.camera),
       tracker: Config.tracker(state.config, state.camera),
       sample_fps: Config.sample_fps(state.config, state.camera),
+      decoder: Config.decoder(state.config, state.camera),
       stream_params: %{
         min_score: state.camera.min_score,
         # The operator's scene knob (D-P6), verbatim from config — the

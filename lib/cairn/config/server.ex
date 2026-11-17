@@ -596,8 +596,8 @@ defmodule Cairn.Config.Server do
   The camera fields baked into a subprocess or a child spec at tree birth,
   so a running camera cannot take them in place. Not the whole restart set:
   the resolved comparisons in the camera diff (pre-window, tracker core,
-  sample rate, live-track cap, rung) restart a camera too, and a resolved tier
-  change rebuilds its whole tree (`camera_rebuilt?/4`).
+  sample rate, live-track cap, rung, decoder) restart a camera too, and a
+  resolved tier change rebuilds its whole tree (`camera_rebuilt?/4`).
   """
   @spec restart_fields() :: [atom()]
   def restart_fields, do: @restart_fields
@@ -627,20 +627,24 @@ defmodule Cairn.Config.Server do
   # the `track:` / `record:` tiers — is host-side and refreshes in place through
   # `Cairn.PipelineOwner.refresh/3`.
   #
-  # The resolved ladder rung is the newest resolved comparison (D-L5): a
-  # fleet edit elsewhere on the node can move N across a rung boundary,
-  # which is a model change for this camera with none of its own fields
-  # moving — engine first, then the restart, the tested reload ordering.
-  # The rung's derived sample_fps rides the `sample_fps/2` row above; the
-  # rung compares as well because two rungs can derive the same clamped
-  # rate while the model differs.
+  # The resolved ladder rung (D-L5): a fleet edit elsewhere on the node can
+  # move N across a rung boundary, which is a model change for this camera
+  # with none of its own fields moving — engine first, then the restart, the
+  # tested reload ordering. The rung's derived sample_fps rides the
+  # `sample_fps/2` row above; the rung compares as well because two rungs can
+  # derive the same clamped rate while the model differs.
+  #
+  # The resolved decoder picks the chain's decode elements on a board that
+  # has its own (`c:Cairn.Stage.Board.detect_chain/1`), which no refresh swaps;
+  # compared on every board, so a generic one restarts too, with no need to.
   defp camera_changed?(old, new, old_cam, new_cam) do
     Map.take(old_cam, @restart_fields) != Map.take(new_cam, @restart_fields) or
       Config.windows(old, old_cam).pre != Config.windows(new, new_cam).pre or
       Config.tracker(old, old_cam) != Config.tracker(new, new_cam) or
       Config.sample_fps(old, old_cam) != Config.sample_fps(new, new_cam) or
       Config.policy(old, old_cam).max_live_tracks != Config.policy(new, new_cam).max_live_tracks or
-      Config.resolved_rung(old, old_cam) != Config.resolved_rung(new, new_cam)
+      Config.resolved_rung(old, old_cam) != Config.resolved_rung(new, new_cam) or
+      Config.decoder(old, old_cam) != Config.decoder(new, new_cam)
   end
 
   # The one change a media replacement cannot serve. The capability tier picks
