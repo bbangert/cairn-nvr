@@ -354,38 +354,90 @@ defmodule CairnWeb.Api.EventStreamEndpointTest do
   # async: false — drives the global Cairn.CameraStatus and its PubSub topic
   use CairnWeb.ConnCase, async: false
 
+  alias CairnWeb.Api.StreamLimiter
+
   @token "test-ha-token"
 
-  # The controller loop stops on `{:plug_conn, :sent}`, which is how the test
-  # adapter reports a response to the conn's *owner*. Building the conn here
-  # and running the endpoint in a task keeps the test process as that owner:
-  # the message becomes this test's "the stream is open, and it subscribed"
-  # barrier, and the loop only ends when we send it one ourselves.
+  # Goes through a real listener because the test adapter reports
+  # `{:plug_conn, :sent}` to the conn's owner, while a real adapter sends it to
+  # the request process; only the latter puts it in the loop's mailbox as
+  # production does.
   test "a plugin status reaches the live SSE endpoint as a camera_status frame" do
     id = "sse_#{System.unique_integer([:positive])}"
     on_exit(fn -> Cairn.CameraStatus.delete(id) end)
 
-    conn = build_conn(:get, "/api/stream?access_token=#{@token}")
-    stream = Task.async(fn -> CairnWeb.Endpoint.call(conn, []) end)
+    server =
+      start_supervised!(
+        {Bandit, plug: CairnWeb.Endpoint, port: 0, ip: :loopback, startup_log: false}
+      )
 
-    assert_receive {:plug_conn, :sent}, 5_000
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    slots = StreamLimiter.count()
+
+    {:ok, sock} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+
+    :ok =
+      :gen_tcp.send(
+        sock,
+        "GET /api/stream?access_token=#{@token} HTTP/1.1\r\nhost: localhost\r\n\r\n"
+      )
+
+    body = recv_until(sock, "", &(&1 =~ ": connected\n\n"))
 
     Cairn.CameraStatus.put(id, %{
       plugin_status: %{"state" => "degraded", "detail" => "cpu fallback"}
     })
 
-    # the cast, and the broadcast inside it, are done once the server's mailbox
-    # flushes — so the frame is in the stream's mailbox ahead of the stop below
-    _ = :sys.get_state(Cairn.CameraStatus)
-    send(stream.pid, {:plug_conn, :sent})
+    body = recv_until(sock, body, &(&1 =~ ~s("camera_id":"#{id}")))
 
-    body = Task.await(stream, 5_000).resp_body
-
-    assert body =~ ": connected\n\n"
     assert body =~ "event: camera_status\n"
-    assert body =~ ~s("camera_id":"#{id}")
     assert body =~ ~s("plugin_status":{)
     assert body =~ ~s("state":"degraded")
     assert body =~ ~s("detail":"cpu fallback")
+    refute body =~ "\r\n0\r\n\r\n"
+
+    :ok = :gen_tcp.close(sock)
+
+    # Only a failed write ends the handler, and a handler killed at listener
+    # teardown would skip the limiter release in its `after`.
+    assert eventually(fn ->
+             Cairn.CameraStatus.put(id, %{status: :running})
+             StreamLimiter.count() == slots
+           end)
+  end
+
+  defp recv_until(sock, acc, done?) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    do_recv_until(sock, acc, done?, deadline)
+  end
+
+  defp do_recv_until(sock, acc, done?, deadline) do
+    if done?.(acc) do
+      acc
+    else
+      left = max(deadline - System.monotonic_time(:millisecond), 0)
+
+      case :gen_tcp.recv(sock, 0, left) do
+        {:ok, data} ->
+          do_recv_until(sock, acc <> data, done?, deadline)
+
+        {:error, reason} ->
+          flunk("stream ended before the frame arrived: #{inspect(reason)}\n#{acc}")
+      end
+    end
+  end
+
+  defp eventually(fun, tries \\ 50) do
+    cond do
+      fun.() ->
+        true
+
+      tries > 0 ->
+        Process.sleep(100)
+        eventually(fun, tries - 1)
+
+      true ->
+        false
+    end
   end
 end

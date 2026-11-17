@@ -9,8 +9,9 @@ defmodule CairnWeb.Api.EventStreamController do
   heartbeat every 20s keeps intermediaries from closing an idle connection;
   HA follows entity availability off this connection.
 
-  The loop exits cleanly when the client disconnects (`chunk/2` returns
-  `{:error, _}`) or the connection is closed (`{:plug_conn, :sent}`).
+  The loop ends only when a write fails (`chunk/2` returns `{:error, _}`), so
+  a client that has gone is noticed at the next frame or, at the latest, the
+  next heartbeat.
   """
 
   use CairnWeb, :controller
@@ -70,9 +71,6 @@ defmodule CairnWeb.Api.EventStreamController do
           {:error, _reason} ->
             conn
         end
-
-      {:plug_conn, :sent} ->
-        conn
 
       msg ->
         continue(conn, frame_for(msg))
@@ -139,6 +137,8 @@ defmodule CairnWeb.Api.EventStreamController do
     encode_frame("disk_alert", payload)
   end
 
+  # `{:plug_conn, :sent}` lands here too: Bandit sends it to the request
+  # process as the response starts, so it is no sign that the stream ended.
   def frame_for(_other), do: :ignore
 
   defp encode_frame(event, payload) do
