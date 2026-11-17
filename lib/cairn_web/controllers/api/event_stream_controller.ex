@@ -15,7 +15,7 @@ defmodule CairnWeb.Api.EventStreamController do
       gone is noticed at the next frame or, at the latest, the next heartbeat;
     * the connection process receives an exit signal — the listener shutting
       down, or the `CairnWeb.Api.StreamLimiter` registry holding its slot
-      going down;
+      going down. It is seen ahead of any frames already queued;
     * `integrations.token` is other than the token the request was
       authenticated with (rotated or removed). Checked on a config change
       (`Cairn.Config.topic/0`), straight after subscribing (a mismatch answers
@@ -95,38 +95,47 @@ defmodule CairnWeb.Api.EventStreamController do
   end
 
   defp loop(conn) do
-    if backlogged?() do
-      Logger.warning("SSE: client reads too slowly, closing the stream")
-      conn
-    else
-      receive do
-        :heartbeat ->
-          case write(conn, ": ping\n\n") do
-            {:ok, conn} ->
-              schedule_heartbeat()
-              loop(conn)
+    cond do
+      exit_pending?() ->
+        conn
 
-            {:error, _reason} ->
-              conn
-          end
+      backlogged?() ->
+        Logger.warning("SSE: client reads too slowly, closing the stream")
+        conn
 
-        # Ends an idle stream promptly instead of at the next heartbeat. Any
-        # server's diff: the re-check reads the singleton's snapshot, not the
-        # diff, so another server's broadcast only costs a term read.
-        {:config_changed, _diff} ->
-          if authorized?(conn), do: loop(conn), else: conn
+      true ->
+        wait_for_message(conn)
+    end
+  end
 
-        # The handler traps exits, so its supervisor's shutdown arrives here
-        # and would otherwise wait out the listener's shutdown timeout before
-        # a kill. Put back, not consumed: the gen_server underneath has to see
-        # its parent's exit to terminate; Bandit ignores any other.
-        {:EXIT, _pid, _reason} = signal ->
-          send(self(), signal)
-          conn
+  defp wait_for_message(conn) do
+    receive do
+      :heartbeat ->
+        case write(conn, ": ping\n\n") do
+          {:ok, conn} ->
+            schedule_heartbeat()
+            loop(conn)
 
-        msg ->
-          continue(conn, frame_for(msg))
-      end
+          {:error, _reason} ->
+            conn
+        end
+
+      # Ends an idle stream promptly instead of at the next heartbeat. Any
+      # server's diff: the re-check reads the singleton's snapshot, not the
+      # diff, so another server's broadcast only costs a term read.
+      {:config_changed, _diff} ->
+        if authorized?(conn), do: loop(conn), else: conn
+
+      # The handler traps exits, so its supervisor's shutdown arrives here
+      # and would otherwise wait out the listener's shutdown timeout before
+      # a kill. Put back, not consumed: the gen_server underneath has to see
+      # its parent's exit to terminate; Bandit ignores any other.
+      {:EXIT, _pid, _reason} = signal ->
+        send(self(), signal)
+        conn
+
+      msg ->
+        continue(conn, frame_for(msg))
     end
   end
 
@@ -140,6 +149,19 @@ defmodule CairnWeb.Api.EventStreamController do
     if get_http_protocol(conn) in [:"HTTP/1.0", :"HTTP/1.1"],
       do: put_resp_header(conn, "connection", "close"),
       else: conn
+  end
+
+  # Ahead of whatever is queued: a shutdown must not wait for a backlog of
+  # frames to be written first. Put back for the reason given in
+  # `wait_for_message/1`.
+  defp exit_pending? do
+    receive do
+      {:EXIT, _pid, _reason} = signal ->
+        send(self(), signal)
+        true
+    after
+      0 -> false
+    end
   end
 
   defp backlogged? do

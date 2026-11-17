@@ -484,16 +484,7 @@ defmodule CairnWeb.Api.EventStreamEndpointTest do
   end
 
   describe "a config change" do
-    setup do
-      original = File.read!(@fixture)
-
-      on_exit(fn ->
-        File.write!(@fixture, original)
-        {:ok, _, _} = Server.reload()
-      end)
-
-      %{original: original}
-    end
+    setup :restore_fixture
 
     test "that rotates the token ends a stream opened with the old one", %{original: original} do
       server = start_listener()
@@ -549,6 +540,55 @@ defmodule CairnWeb.Api.EventStreamEndpointTest do
     end
   end
 
+  describe "over HTTP/2" do
+    setup :restore_fixture
+
+    test "a stream opens and carries frames, with no connection header" do
+      server = start_listener()
+      {conn, ref, resp} = open_h2_stream(server)
+
+      assert Mint.HTTP.protocol(conn) == :http2
+      assert resp.status == 200
+      assert List.keyfind(resp.headers, "connection", 0) == nil
+
+      Phoenix.PubSub.broadcast(
+        Cairn.PubSub,
+        Cairn.Retention.topic(),
+        {:disk_alert, %{over_h2: true}}
+      )
+
+      {_conn, _ref, resp} = h2_recv_until(conn, ref, resp, &(&1.data =~ ~s("over_h2":true}\n\n)))
+      assert resp.data =~ "event: disk_alert\n"
+      refute resp.done
+    end
+
+    test "rotating the token ends the stream and keeps the connection", %{original: original} do
+      server = start_listener()
+      slots = StreamLimiter.count()
+      {conn, ref, resp} = open_h2_stream(server)
+
+      File.write!(@fixture, String.replace(original, "token: #{@token}", "token: rotated"))
+      {:ok, _, _} = Server.reload()
+
+      {conn, _ref, resp} = h2_recv_until(conn, ref, resp, & &1.done)
+      assert resp.done
+      assert Mint.HTTP.open?(conn)
+      assert eventually(fn -> StreamLimiter.count() == slots end)
+    end
+
+    test "an open stream does not hold up the listener's shutdown" do
+      server = start_listener()
+      slots = StreamLimiter.count()
+      {_conn, _ref, _resp} = open_h2_stream(server)
+      assert StreamLimiter.count() == slots + 1
+
+      {micros, :ok} = :timer.tc(fn -> stop_supervised(:listener) end)
+
+      assert micros < 3_000_000
+      assert eventually(fn -> StreamLimiter.count() == slots end)
+    end
+  end
+
   # A client that reads nothing parks the handler in a socket write: small
   # buffers on both ends and frames far larger than both — more than one,
   # because the port driver queues the first whole and it is the next write
@@ -572,6 +612,35 @@ defmodule CairnWeb.Api.EventStreamEndpointTest do
       end)
 
     assert log =~ "reads too slowly"
+  end
+
+  # The listener's exit signal is queued behind the frames; a shutdown that
+  # waited for them would write all of them first.
+  test "a shutdown is not held up by frames queued ahead of it" do
+    server = start_listener(thousand_island_options: [transport_options: [sndbuf: 4_096]])
+    {sock, body} = open_stream(server, recbuf: 4_096)
+    pid = handler(server)
+
+    big = String.duplicate("x", 1_000_000)
+    for n <- 1..3, do: send(pid, {:disk_alert, %{n: n, pad: big}})
+    assert eventually(fn -> parked_in_write?(pid) end)
+
+    for n <- 1..4, do: send(pid, {:disk_alert, %{n: n + 3, pad: big}})
+    send(pid, {:disk_alert, %{last: true, pad: big}})
+
+    {:message_queue_len, queued} = Process.info(pid, :message_queue_len)
+    # `stop_supervised/1` only works from the test process, which is reading
+    # the socket; the supervisor's restart of the stopped listener is harmless.
+    task = Task.async(fn -> Supervisor.stop(server, :shutdown) end)
+
+    assert eventually(fn ->
+             Process.info(pid, :message_queue_len) == {:message_queue_len, queued + 1}
+           end)
+
+    body = recv_until(sock, body, &String.ends_with?(&1, @end_of_body))
+
+    refute body =~ ~s("last":true)
+    assert {:ok, :ok} = Task.yield(task, 3_000)
   end
 
   # The loop's own `receive` matches any message, so a waiting process with a
@@ -609,6 +678,63 @@ defmodule CairnWeb.Api.EventStreamEndpointTest do
 
     sock
   end
+
+  defp restore_fixture(_context) do
+    original = File.read!(@fixture)
+
+    on_exit(fn ->
+      File.write!(@fixture, original)
+      {:ok, _, _} = Server.reload()
+    end)
+
+    %{original: original}
+  end
+
+  defp open_h2_stream(server) do
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+
+    {:ok, conn} =
+      Mint.HTTP.connect(:http, "127.0.0.1", port, protocols: [:http2], mode: :passive)
+
+    {:ok, conn, ref} =
+      Mint.HTTP.request(conn, "GET", "/api/stream", [{"authorization", "Bearer #{@token}"}], nil)
+
+    resp = %{status: nil, headers: [], data: "", done: false}
+    h2_recv_until(conn, ref, resp, &(&1.data =~ ": connected\n\n"))
+  end
+
+  defp h2_recv_until(conn, ref, resp, done?) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    do_h2_recv_until(conn, ref, resp, done?, deadline)
+  end
+
+  defp do_h2_recv_until(conn, ref, resp, done?, deadline) do
+    if done?.(resp) do
+      {conn, ref, resp}
+    else
+      left = max(deadline - System.monotonic_time(:millisecond), 0)
+
+      case Mint.HTTP.recv(conn, 0, left) do
+        {:ok, conn, responses} ->
+          resp = Enum.reduce(responses, resp, &h2_apply(&1, &2, ref))
+          do_h2_recv_until(conn, ref, resp, done?, deadline)
+
+        {:error, _conn, reason, _responses} ->
+          flunk(
+            "HTTP/2 stream ended before the frame arrived: #{inspect(reason)}\n#{inspect(resp)}"
+          )
+      end
+    end
+  end
+
+  defp h2_apply({:status, ref, status}, resp, ref), do: %{resp | status: status}
+
+  defp h2_apply({:headers, ref, headers}, resp, ref),
+    do: %{resp | headers: resp.headers ++ headers}
+
+  defp h2_apply({:data, ref, data}, resp, ref), do: %{resp | data: resp.data <> data}
+  defp h2_apply({:done, ref}, resp, ref), do: %{resp | done: true}
+  defp h2_apply(_other, resp, _ref), do: resp
 
   defp handler(server) do
     {:ok, [pid]} = ThousandIsland.connection_pids(server)
