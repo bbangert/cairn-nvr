@@ -6,7 +6,8 @@
 #              qnn refuses loudly)
 #   rockchip — linux/arm64 only, the RK3566 add-on: sw decode, ORT CPU or
 #              the RKNN engine NIF (librknnrt is not in the image); the MPP
-#              and librga userspace is carried, and nothing loads it yet
+#              and librga userspace is carried; only the probe binary's
+#              `--rk-probe` loads MPP yet, and nothing loads librga
 # Rust artifacts and the Rockchip libraries cross-compile on the build host
 # (D-C3); the only compile under emulation is the BEAM release, because BEAM
 # bytecode is arch-neutral and ERTS comes from the arm64 hexpm image.

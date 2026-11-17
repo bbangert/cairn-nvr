@@ -52,12 +52,14 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
         streams: 1,
         fps: None,
     };
-    let mut file = None;
     let mut it = args.iter();
+    if it.next().is_none_or(|first| first != "--rk-probe") {
+        return Err("--rk-probe comes first".into());
+    }
+    parsed.file = it.next().ok_or("--rk-probe needs a file")?.into();
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
-            "--rk-probe" => file = Some(PathBuf::from(value()?)),
             "--skip-aus" => parsed.skip_aus = number(flag, value()?)?,
             "--hold-after" => match number(flag, value()?)? {
                 0 => return Err("--hold-after counts from 1".into()),
@@ -68,13 +70,12 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
                 _ => return Err(format!("--streams is 1 to {MAX_STREAMS}")),
             },
             "--fps" => match number::<f64>(flag, value()?)? {
-                f if f.is_finite() && f > 0.0 => parsed.fps = Some(f),
-                _ => return Err("--fps must be above 0".into()),
+                f if (0.1..=1000.0).contains(&f) => parsed.fps = Some(f),
+                _ => return Err("--fps is 0.1 to 1000".into()),
             },
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    parsed.file = file.ok_or("--rk-probe needs a file")?;
     Ok(parsed)
 }
 
@@ -159,6 +160,8 @@ struct Stream {
     max_poll_us: u128,
     held: Option<Frame>,
     held_pts: Option<i64>,
+    /// Whether a frame came back on the held frame's dma-buf while it was held.
+    held_fd_reused: bool,
     frames_while_held: u64,
     hold_reached: bool,
     info_changes: Vec<Value>,
@@ -187,7 +190,8 @@ impl Stream {
             self.first_frame_pts.get_or_insert(frame.pts());
             self.nv12 = (self.returned == 1 || self.nv12) && frame.is_nv12();
             self.max_lag = self.max_lag.max(self.last_fed - frame.pts());
-            if self.held.is_some() {
+            if let Some(held) = &self.held {
+                self.held_fd_reused |= frame.fd() == held.fd();
                 self.frames_while_held += 1;
                 if self.frames_while_held == HOLD_FOR {
                     self.held = None;
@@ -262,6 +266,7 @@ fn decode_stream(data: &[u8], aus: &[Au], args: &Args) -> Result<(Value, Vec<Val
         "max_put_us": s.max_put_us, "max_poll_us": s.max_poll_us,
         "eos": decoder.eos(),
         "held_pts": s.held_pts, "frames_while_held": s.frames_while_held,
+        "held_fd_reused": s.held_pts.map(|_| s.held_fd_reused),
         "hold_reached": s.hold_reached,
     });
     Ok((summary, s.info_changes))
@@ -275,7 +280,10 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match probe(&args) {
+    let result = probe(&args);
+    // Every decoder is gone by now; their teardown failures are only queued.
+    cairn_detect::log::drain();
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             println!(
@@ -380,13 +388,16 @@ mod tests {
             parsed.hold_after,
         );
         assert_eq!(fields, ("f.h264".into(), 3, 2, None));
-        let parsed = args(&["--fps", "12.5", "--hold-after", "4", "--rk-probe", "f"]).unwrap();
+        let parsed = args(&["--rk-probe", "f", "--fps", "12.5", "--hold-after", "4"]).unwrap();
         assert_eq!((parsed.fps, parsed.hold_after), (Some(12.5), Some(4)));
         for (bad, says) in [
-            (&["--skip-aus", "1"][..], "needs a file"),
-            (&["--rk-probe"], "needs a value"),
+            (&["--skip-aus", "1", "--rk-probe", "f"][..], "comes first"),
+            (&["--rk-probe"], "needs a file"),
+            (&["--rk-probe", "f", "--streams"], "needs a value"),
             (&["--rk-probe", "f", "--streams", "0"], "1 to 16"),
-            (&["--rk-probe", "f", "--fps", "0"], "above 0"),
+            (&["--rk-probe", "f", "--fps", "0"], "0.1 to 1000"),
+            (&["--rk-probe", "f", "--fps", "1e-20"], "0.1 to 1000"),
+            (&["--rk-probe", "f", "--fps", "1001"], "0.1 to 1000"),
             (&["--rk-probe", "f", "--hold-after", "0"], "from 1"),
             (&["--rk-probe", "f", "--skip-aus", "x"], "not a number"),
             (&["--rk-probe", "f", "--model", "m"], "unknown"),

@@ -13,9 +13,11 @@
 //! - [`MppDecoder::next_frame`] gets with the output timeout at 0, which
 //!   returns no frame when none is ready, and takes at most
 //!   [`GETS_PER_CALL`] frames per call.
-//! - An info change makes one control command, `MPP_DEC_SET_INFO_CHANGE_READY`,
-//!   that MPP hands to its parser thread (waking it) and waits on until that
-//!   thread takes it; decoding does not resume without it.
+//! - An info change makes two control commands: `MPP_DEC_SET_EXT_BUF_GROUP`,
+//!   which MPP handles in the calling thread, then
+//!   `MPP_DEC_SET_INFO_CHANGE_READY`, which it hands to its parser thread
+//!   (waking it) and waits on until that thread has run it; decoding does not
+//!   resume without it.
 //! - Dropping the last holder of a context, the decoder or any frame, resets
 //!   and destroys it, which joins MPP's threads: that blocks.
 //!
@@ -103,9 +105,12 @@ struct Context {
     group: AtomicPtr<c_void>,
 }
 
-// SAFETY: every call into `ctx` — put, get and `Context::control` — is made
-// through `&mut MppDecoder`, so from one thread at a time, and `drop` has the
-// last reference. A `Frame` reaches only `library`, plain function pointers;
+// SAFETY: put, get and `Context::control` are made through `&mut
+// MppDecoder`, so from one thread at a time, and `drop` has the last
+// reference. A `Frame` does reach the decoder, concurrently with those: its
+// drop can release its buffer, and MPP then runs, under the group's lock, the
+// callback it installed with the external group, which notifies the decoder
+// under its parser thread's lock. MPP's locks make that sound, not `&mut`.
 // `group` is atomic.
 unsafe impl Send for Context {}
 // SAFETY: as for `Send`.
@@ -158,6 +163,9 @@ pub struct MppDecoder {
     eos: bool,
     stats: Stats,
     geometry: Option<Geometry>,
+    /// Only `MPP_DEC_SET_INFO_CHANGE_READY` lets MPP's parser past an info
+    /// change, so after a failed one puts only fill up and gets come back empty.
+    info_change_failed: bool,
 }
 
 impl MppDecoder {
@@ -228,12 +236,21 @@ impl MppDecoder {
             eos: false,
             stats: Stats::default(),
             geometry: None,
+            info_change_failed: false,
         })
+    }
+
+    fn usable(&self) -> Result<()> {
+        if self.info_change_failed {
+            bail!("mpp: the decoder is unusable after a failed info change");
+        }
+        Ok(())
     }
 
     /// One `decode_put_packet` of `au` (a whole access unit), stamped `pts`.
     /// [`Put::Full`] is counted and never retried here.
     pub fn put(&mut self, au: &[u8], pts: i64) -> Result<Put> {
+        self.usable()?;
         if self.finished {
             bail!("mpp: a put after the EOS packet can block in MPP");
         }
@@ -247,6 +264,7 @@ impl MppDecoder {
     /// The EOS packet. A [`Put::Full`] one was not taken and may be sent
     /// again; once taken, every later [`MppDecoder::put`] is refused.
     pub fn finish(&mut self) -> Result<Put> {
+        self.usable()?;
         if self.finished {
             return Ok(Put::Accepted);
         }
@@ -294,6 +312,7 @@ impl MppDecoder {
     /// (the decoder stalls until they are); error, discard and buffer-less
     /// frames are dropped.
     pub fn next_frame(&mut self) -> Result<Option<Frame>> {
+        self.usable()?;
         for _ in 0..GETS_PER_CALL {
             let mut raw = ptr::null_mut();
             // SAFETY: `ctx` is live, `&mut self` makes this the only call
@@ -310,7 +329,10 @@ impl MppDecoder {
                 frame: raw,
             };
             if frame.get(self.context.library.frame_get_info_change) != 0 {
-                self.info_change(&frame)?;
+                if let Err(err) = self.info_change(&frame) {
+                    self.info_change_failed = true;
+                    return Err(err);
+                }
                 continue;
             }
             if frame.get(self.context.library.frame_get_eos) != 0 {
@@ -396,6 +418,10 @@ impl MppDecoder {
 /// A decoded picture. It holds its context, so it may outlive later puts,
 /// later gets and the decoder itself; dropping it returns the buffer to MPP.
 /// Handed out only with a buffer.
+///
+/// Dropping one may drop the context's last holder, which resets and
+/// destroys it, joining MPP's threads: it **blocks**. No holder can tell which
+/// drop is the last, so a NIF hands every frame to a teardown thread to drop.
 pub struct Frame {
     context: Arc<Context>,
     frame: sys::Frame,
@@ -403,7 +429,8 @@ pub struct Frame {
 
 // SAFETY: this value alone owns `frame`. Its getters read the frame's own
 // fields, and its drop puts the buffer back under the buffer's and the
-// group's locks inside MPP, so either may run on any thread.
+// group's locks inside MPP, the decoder notify that can follow under the
+// parser thread's (see `Context`), so either may run on any thread.
 unsafe impl Send for Frame {}
 
 impl Frame {
@@ -476,6 +503,8 @@ mod tests {
     static CALLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
     static FRAMES: Mutex<VecDeque<StubFrame>> = Mutex::new(VecDeque::new());
     static PUT_CODE: AtomicI32 = AtomicI32::new(0);
+    static INIT_CODE: AtomicI32 = AtomicI32::new(0);
+    static LIMIT_CODE: AtomicI32 = AtomicI32::new(0);
     static API_SIZE: AtomicU32 = AtomicU32::new(184);
 
     #[derive(Clone, Copy, Default)]
@@ -536,6 +565,8 @@ mod tests {
         CALLS.lock().unwrap().clear();
         FRAMES.lock().unwrap().clear();
         PUT_CODE.store(0, SeqCst);
+        INIT_CODE.store(0, SeqCst);
+        LIMIT_CODE.store(0, SeqCst);
         API_SIZE.store(184, SeqCst);
         guard
     }
@@ -568,7 +599,7 @@ mod tests {
 
     unsafe extern "C" fn stub_init(_: sys::Ctx, ty: c_int, coding: c_int) -> c_int {
         call(format!("init({ty},{coding})"));
-        0
+        INIT_CODE.load(SeqCst)
     }
 
     unsafe extern "C" fn stub_control(_: sys::Ctx, cmd: c_int, param: *mut c_void) -> c_int {
@@ -705,7 +736,7 @@ mod tests {
 
     unsafe extern "C" fn stub_group_limit(_: sys::BufferGroup, size: usize, count: i32) -> c_int {
         call(format!("limit({size},{count})"));
-        0
+        LIMIT_CODE.load(SeqCst)
     }
 
     fn library() -> sys::Library {
@@ -768,6 +799,15 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_init_is_destroyed_once_without_timeouts_or_reset() {
+        let _guard = stubs();
+        INIT_CODE.store(-1, SeqCst);
+        let msg = err(MppDecoder::with_library(library()));
+        assert!(msg.contains("mpp_init returned -1"), "{msg}");
+        assert_eq!(calls(), "create init(0,7) destroy");
+    }
+
+    #[test]
     fn a_put_hands_over_data_and_pts_once_and_deinits_the_packet_either_way() {
         let _guard = stubs();
         let mut decoder = open();
@@ -821,6 +861,28 @@ mod tests {
         assert_eq!((g.width, g.height, g.ver_stride), (1280, 720, 720));
         drop(decoder);
         assert_eq!(calls(), "reset destroy group_put");
+    }
+
+    #[test]
+    fn after_a_failed_info_change_nothing_reaches_mpp() {
+        let _guard = stubs();
+        let mut decoder = open();
+        LIMIT_CODE.store(-1, SeqCst);
+        queue(&[info(1920, 1080, 3_133_440), picture(1)]);
+        let msg = err(decoder.next_frame());
+        assert!(msg.contains("limit_config returned -1"), "{msg}");
+        let failed = "get group_get(4,0) limit(3133440,24) frame_deinit";
+        assert_eq!(calls(), failed);
+        LIMIT_CODE.store(0, SeqCst);
+        let later = [
+            err(decoder.put(&[1], 0)),
+            err(decoder.finish()),
+            err(decoder.next_frame()),
+        ];
+        for msg in later {
+            assert!(msg.contains("unusable after a failed info change"), "{msg}");
+        }
+        assert_eq!(calls(), "");
     }
 
     #[test]

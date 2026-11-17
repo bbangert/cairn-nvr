@@ -1,6 +1,7 @@
 //! The Rockchip board library's native half: one cdylib the BEAM loads as
-//! `Cairn.Rockchip.Native`, the [`rknn`] backend, and the probe binary that
-//! runs `cairn-detect`'s CLI with that backend registered.
+//! `Cairn.Rockchip.Native`, the [`rknn`] backend, the [`mpp`] decoder binding
+//! (no NIF reaches it yet), and the probe binary that runs `cairn-detect`'s
+//! CLI with that backend registered, or for `--rk-probe` the decode [`probe`].
 //!
 //! The NIFs are `CairnOrt`'s engine surface over [`rknn::provider`]: same
 //! functions, arities, schedulers, term shapes and `{reason, message}` errors,
