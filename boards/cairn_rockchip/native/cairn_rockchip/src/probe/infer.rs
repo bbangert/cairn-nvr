@@ -1,9 +1,9 @@
 //! `--infer`: `--scale`'s blit, then the slot handed to the model on the NPU
 //! one of three ways, one way per run — `copy` reads the slot out under the
 //! dma-buf sync and `rknn_inputs_set`s it; `fd` binds the slot's own dma-buf,
-//! wrapped once per slot with `rknn_create_mem_from_fd`; `mem` blits into
-//! buffers `rknn_create_mem` allocated and binds those. Outputs always come
-//! back through `rknn_outputs_get`. One geometry per run.
+//! a dup of its fd wrapped once per slot with `rknn_create_mem_from_fd`;
+//! `mem` blits into buffers `rknn_create_mem` allocated and binds those.
+//! Outputs always come back through `rknn_outputs_get`. One geometry per run.
 //!
 //! Per sample, each on the wall clock: `blit_ms` the lease and the blit;
 //! `input_ms` the hand-over (`copy`: the read and `rknn_inputs_set`; `fd` and
@@ -16,13 +16,14 @@
 //! the samples as `--scale`'s `hash` is. `slot_changes` counts samples whose
 //! slot was not the previous sample's.
 //!
-//! In `fd` mode `slot_fds_intact` counts the slots' fds that still name the
-//! same file after the backend is destroyed: the runtime's behaviour on
-//! `rknn_destroy_mem` of an imported fd is undocumented. It is `null` for
-//! `copy` and `mem`.
+//! In `fd` mode `slot_fds_intact` counts the dups handed to the runtime that
+//! still name the same file after the backend is destroyed: the runtime's
+//! behaviour on `rknn_destroy_mem` of an imported fd is undocumented. The
+//! probe closes those the runtime left open. It is `null` for `copy` and
+//! `mem`.
 
 use std::ffi::c_void;
-use std::os::fd::RawFd;
+use std::os::fd::{BorrowedFd, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -180,6 +181,49 @@ fn identity(fd: RawFd) -> Option<(u64, u64)> {
     (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev as u64, st.st_ino as u64))
 }
 
+/// A dup of a slot's fd handed to `rknn_create_mem_from_fd`, and the file it
+/// named. The runtime may close the number in `rknn_destroy_mem`, so nothing
+/// owns it until the backend is gone.
+struct ImportedFd {
+    fd: RawFd,
+    who: (u64, u64),
+}
+
+impl ImportedFd {
+    /// Whether the runtime left the dup open, closing it if so. A number that
+    /// names another file is the runtime's closed one, or someone else's by
+    /// now, and is left alone.
+    fn settle(self) -> bool {
+        let intact = identity(self.fd) == Some(self.who);
+        if intact {
+            // SAFETY: still the dup, and the backend that held it is gone.
+            drop(unsafe { OwnedFd::from_raw_fd(self.fd) });
+        }
+        intact
+    }
+}
+
+/// `fd`'s dups; dropping it settles any still held.
+#[derive(Default)]
+struct Imports(Vec<ImportedFd>);
+
+impl Imports {
+    /// How many the runtime left open.
+    fn settle(&mut self) -> usize {
+        self.0
+            .drain(..)
+            .map(ImportedFd::settle)
+            .filter(|&b| b)
+            .count()
+    }
+}
+
+impl Drop for Imports {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
 /// `mem`'s slots: each a dup of a `rknn_create_mem` buffer's fd, adopted;
 /// slot `index` is mem `index`.
 struct FromMems<'a, 'b> {
@@ -219,14 +263,15 @@ struct Samples {
 }
 
 pub(super) struct Inferer {
-    // Before `planned`: the backend's mems wrap, or are, the slots' buffers,
-    // so they and the context are destroyed before the slots go.
+    // Declared in drop order: the backend's mems wrap, or are, the slots'
+    // buffers, so they and the context go first, then the dups they were
+    // handed, then the slots.
     backend: RknnBackend,
+    /// One per slot, for `slot_fds_intact`.
+    imported: Imports,
     planned: Option<Planned>,
     /// By slot index, for `fd` and `mem`.
     mems: Vec<InputMem>,
-    /// `fd`'s slot fds as imported, for `slot_fds_intact`.
-    imported: Vec<(RawFd, (u64, u64))>,
     rga: Rga,
     heap: DmaHeap,
     scale: Scale,
@@ -257,9 +302,9 @@ impl Inferer {
         let native = backend.native_input()?;
         Ok(Self {
             backend,
+            imported: Imports::default(),
             planned: None,
             mems: Vec::new(),
-            imported: Vec::new(),
             rga,
             heap,
             scale: scale.clone(),
@@ -295,9 +340,9 @@ impl Inferer {
             self.mems = mems.mems;
             return Ok(());
         }
-        // Stored before any import: the mems the backend holds wrap its slots,
-        // so a failed import must leave them owned by `self`, which drops them
-        // after the backend.
+        // Stored before any import: the mems the backend holds are handed the
+        // slots' mappings, so a failed import must leave the slots owned by
+        // `self`, which drops them after the backend.
         let planned = self
             .planned
             .insert(Planned::new(self.rga, plan, count, &mut slots)?);
@@ -308,15 +353,21 @@ impl Inferer {
             for lease in &leases {
                 let slot = lease.slot();
                 let who = identity(slot.fd()).context("fstat of a slot's fd")?;
-                // SAFETY: the slot is owned by `self.planned`, which drops
-                // after the backend (see the field order), and the mapping is
-                // only ever read.
+                // SAFETY: the slot, and so its fd, is live while `lease` is.
+                let dup = unsafe { BorrowedFd::borrow_raw(slot.fd()) }
+                    .try_clone_to_owned()
+                    .context("dup of a slot's fd")?
+                    .into_raw_fd();
+                // Before the import, which may fail having taken the dup.
+                self.imported.0.push(ImportedFd { fd: dup, who });
+                // SAFETY: `self.imported` keeps the dup open, and
+                // `self.planned` the mapping, until after the backend drops
+                // (see the field order); the mapping is only ever read.
                 let mem = unsafe {
                     self.backend
-                        .import_input(slot.fd(), slot.addr().as_ptr().cast::<c_void>())
+                        .import_input(dup, slot.addr().as_ptr().cast::<c_void>())
                 }?;
                 self.mems.push(mem);
-                self.imported.push((slot.fd(), who));
             }
         }
         Ok(())
@@ -406,13 +457,10 @@ impl Inferer {
     }
 
     pub(super) fn report(mut self) -> Result<Vec<Value>> {
-        // Destroys the mems and the context, before the slots and so before
-        // the fd check below.
+        // Destroys the mems and the context, so no dup settled below is
+        // still the runtime's.
         drop(self.backend);
-        let intact = (self.infer.input == InputMode::Fd).then(|| {
-            let same = |(fd, who): &(RawFd, (u64, u64))| identity(*fd) == Some(*who);
-            self.imported.iter().filter(|e| same(e)).count()
-        });
+        let intact = (self.infer.input == InputMode::Fd).then(|| self.imported.settle());
         let mut plan = json!({"event": "scale_plan", "rga": self.rga.version(), "plans": 0});
         if let Some(planned) = &self.planned {
             plan["plans"] = 1.into();
@@ -445,5 +493,37 @@ impl Inferer {
             "process_cpu_ms": process_cpu(),
         });
         Ok(vec![plan, line])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+
+    /// The file is returned too, so its inode outlives the assertions.
+    fn dup_of(tag: &str) -> (File, ImportedFd) {
+        let path = std::env::temp_dir().join(format!("infer-{}-{tag}", std::process::id()));
+        let file = File::create(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let fd = OwnedFd::from(file.try_clone().unwrap()).into_raw_fd();
+        let who = identity(fd).unwrap();
+        (file, ImportedFd { fd, who })
+    }
+
+    #[test]
+    fn a_dup_left_open_is_closed() {
+        let (_file, dup) = dup_of("open");
+        let (fd, who) = (dup.fd, dup.who);
+        assert!(dup.settle());
+        assert_ne!(identity(fd), Some(who));
+    }
+
+    #[test]
+    fn a_dup_closed_elsewhere_is_left_alone() {
+        let (_file, dup) = dup_of("closed");
+        // SAFETY: the test's own dup, closed as the runtime might.
+        drop(unsafe { OwnedFd::from_raw_fd(dup.fd) });
+        assert!(!dup.settle());
     }
 }
