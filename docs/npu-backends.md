@@ -66,9 +66,15 @@ silicon — Frigate #18878 shows a VPU session allocated and consuming
   ONNX→.rknn, INT8 (calibration dataset required) or FP16; INT4 on rk3576
   only. No dynamic shapes. YOLOv5-v11 officially covered by the model zoo (v8/v11
   as exports with the head cut before its box decode — the nine-tensor
-  layout `tools/rknn-export`'s split export emits);
-  **yolov10 (NMS-free) and DETR-class (rfdetr) not documented — treat as
-  unsupported until trialed.**
+  layout `tools/rknn-export`'s split export emits). **Trialed with
+  rknn-toolkit2 and librknnrt 2.3.2:** in INT8 on the RK3566, yolox_s,
+  yolox_tiny and both split heads (`yolov8split`, `yolo26split`) run and
+  detect. In INT8 in the toolkit's simulator, the stock Ultralytics whole
+  heads and the end-to-end head detect nothing (one output scale zeroes the
+  scores) and rfdetr's scores are unusable. In FP16 on the board, the
+  end-to-end head's boxes are wrong and rfdetr crashes the runtime (no
+  GridSample op); Cairn's backend opens INT8 artifacts only —
+  `tools/rknn-export/README.md`.
 - Runtime from Rust: rknpu2-rs binds librknnrt (2.3.2 API), zero-copy
   in/out, but no async, no batching, no multi-core orchestration
   documented — assume sequential single-inference per model. No perf-mode
@@ -89,8 +95,10 @@ silicon — Frigate #18878 shows a VPU session allocated and consuming
 
 1. QNN backend + model export containing a fused NMS op → reject at
    profile validation (require NMS-free head or host-side-NMS decode).
-2. RKNN backend + yolov10/DETR-class families → unverified; reject or mark
-   experimental until a conversion trial succeeds.
+2. RKNN backend + a family whose conversion was not measured to detect
+   (stock whole heads, the end-to-end head, rfdetr) → reject unless the
+   profile declares `experimental: true`, and warn with the reason when it
+   does.
 3. Any profile assuming async/batched inference on RKNN → invalid;
    runtime is sequential.
 

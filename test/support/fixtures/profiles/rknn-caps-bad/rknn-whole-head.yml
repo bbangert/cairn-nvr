@@ -1,0 +1,6 @@
+# Rule 2: a stock whole-head export, which converts and detects nothing in
+# INT8. The refusal names yolo11, as written, and points at the split profile.
+backend: rknn
+model:
+  rknn: test/support/fixtures/models/stub.rknn
+model_profile: yolo11

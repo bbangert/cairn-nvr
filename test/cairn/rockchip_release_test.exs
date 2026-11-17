@@ -32,15 +32,15 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
       dir
     end
 
-    # yolov8, whose rknn conversion is documented, so `experimental:` is the
-    # D-P10 gate alone.
+    # yolox, a proven rknn conversion, so `experimental:` is the D-P10 gate
+    # alone.
     defp rknn(model, experimental \\ true) do
       """
       experimental: #{experimental}
       backend: rknn
       model:
       #{Enum.map_join(model, "\n", fn {key, path} -> "  #{key}: #{path}" end)}
-      model_profile: yolov8
+      model_profile: yolox
       input_size: 416
       """
     end
@@ -156,43 +156,63 @@ if Cairn.Board.module() == Cairn.Rockchip.Board do
     end
 
     # Rule 2 of the capability table, which needs rknn on the menu.
-    test "rknn plus an undocumented conversion demands experimental: true, as a boolean" do
+    test "rknn plus an unproven conversion demands experimental: true, as a boolean" do
       dir = "test/support/fixtures/profiles/rknn-caps-bad"
       assert {:error, errors} = Config.from_map(map("none", [dir]))
 
-      # The family the operator wrote, not its canonical: "undocumented for
-      # yolov8" would contradict the table's own yolov8 row.
-      for {name, family} <- [
-            {"rknn-unverified", "rfdetr"},
-            {"rknn-truthy-experimental", "rfdetr"},
-            {"rknn-yolo26", "yolo26"},
-            {"rknn-yolo26split", "yolo26split"}
-          ] do
-        message = "profile #{name}: rknn conversion is undocumented for model_profile #{family} "
-        assert Enum.any?(errors, &(&1 =~ message and &1 =~ "declare experimental: true"))
-      end
+      rknn_errors = Enum.filter(errors, &(&1 =~ "is not a proven rknn conversion"))
+
+      # The family the operator wrote, not its canonical: yolo11 and yolo26
+      # are refused by name, not as "yolov8". The reasons' own wording is
+      # pinned in config_test.exs.
+      expected =
+        for {where, family} <- [
+              {"rknn-rfdetr", "rfdetr"},
+              {"rknn-truthy-experimental", "rfdetr"},
+              {"rknn-yolov10", "yolov10"},
+              {"rknn-whole-head", "yolo11"},
+              {"rknn-yolo26", "yolo26"},
+              # a rung's own family, over a profile whose family is proven
+              {"rknn-rung: model_ladder rung 1", "yolo11"}
+            ] do
+          {_canonical, %{rknn_conversion: {:unproven, why}}} = Profile.family(family)
+
+          "profile #{where}: model_profile #{family} is not a proven rknn conversion: " <>
+            "#{why} — experimental: true loads it regardless " <>
+            "(measurements: tools/rknn-export/README.md)"
+        end
+
+      assert Enum.sort(rknn_errors) == Enum.sort(expected)
 
       assert Enum.any?(
                errors,
                &(&1 =~ "profile rknn-truthy-experimental: experimental must be true or false")
              )
 
-      fused = {"fusednet", %{families: [], nms: :fused, rknn_conversion: :documented}}
+      fused = {"fusednet", %{families: [], nms: :fused, rknn_conversion: :proven}}
       acc = %{errors: [], warnings: []}
 
-      assert %{errors: [_error]} =
-               Profile.check_capabilities(acc, "s", "rknn", true, fused)
+      assert %{errors: [error]} =
+               Profile.check_capabilities(acc, "profile s", "rknn", true, fused)
+
+      assert error =~ "profile s: rknn backend requires an NMS-free family or host-side-NMS"
     end
 
-    test "the acknowledgement, or a documented family, satisfies rule 2" do
+    test "a proven conversion satisfies rule 2; the acknowledgement loads with its reason" do
       dir = "test/support/fixtures/profiles/rknn-caps"
 
-      assert {:ok, config, []} =
+      assert {:ok, config, [warning]} =
                Config.from_map(%{"data_dir" => "tmp/cfg_test", "profile_dirs" => [dir]})
 
+      assert warning =~
+               "profile rknn-acknowledged: experimental: true loads model_profile yolov10, " <>
+                 "which is not a proven rknn conversion: its end-to-end output detects nothing"
+
       assert config.profiles["rknn-acknowledged"].experimental
-      refute config.profiles["rknn-documented"].experimental
-      refute config.profiles["rknn-split-documented"].experimental
+
+      for name <- ~w(rknn-yolox rknn-split rknn-yolo26split) do
+        refute config.profiles[name].experimental, name
+      end
     end
 
     test "rknn needs a twin: none is an error, a missing file a warning" do

@@ -14,9 +14,9 @@
 # on live cameras (p50 45-48 ms on the 416 rung against 33 ms here), so
 # these may be optimistic; Phase 12 says.
 #
-# experimental: true because rknn has not soaked (D-P10) — a group naming
-# this profile also needs `allow_experimental: true` — and because the
-# model zoo documents no yolox conversion. AGPL pack rungs are not here.
+# experimental: true because rknn has not soaked (D-P10); a group naming
+# this profile also needs `allow_experimental: true`. AGPL pack rungs are
+# not here.
 experimental: true
 tier: 1
 backend: rknn

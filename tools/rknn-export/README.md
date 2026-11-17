@@ -18,7 +18,12 @@ This toolkit gives an INT8 output tensor one scale. Everything else follows.
   end-to-end `[1, 300, 6]`) carries pixel-range boxes and 0..1 scores in one
   tensor, so the scores quantise to zero: all six models convert, run, keep a
   box cosine of 0.998, and emit zero detections ≥ 0.3. FP16 of the same
-  graphs is exact.
+  graphs is exact in the simulator. On the board, FP16 builds of the v8
+  and v11 stock heads and of yolo26's end-to-end head ran, and only
+  yolo26n's was scored: its scores and classes matched and its boxes came
+  back near the origin, the runtime logging
+  `GatherElements op: Out of range value in index tensor` on every pass
+  (`board/results/m3.log` has its timing; the comparison was not kept).
 - **The split head is the fix.** `export_ultralytics_rknn.py … split` cuts
   the head before DFL/decode and emits nine tensors, `box{i}`, `cls{i}`,
   `sum{i}` for strides 8/16/32. `box` is `[1, 4*reg_max, H, W]` (64 channels
@@ -35,7 +40,10 @@ This toolkit gives an INT8 output tensor one scale. Everything else follows.
   table).
 - **yolox_nano does not survive INT8** (recall 0.00; the `mmse` quantiser
   does not rescue it). rfdetr_nano INT8 is unusable (score error 0.09–0.25)
-  and RT-DETR-l fails at build.
+  and RT-DETR-l fails at build. rfdetr_nano FP16 passes the simulator and
+  crashes librknnrt 2.3.2 on the board: `Unsupport CPU op: GridSample`,
+  then a segfault (the last lines of `board/results/m3.log`, which do not
+  name the model).
 - **FP16 is not a rung.** It is exact in parity and three times slower on
   the board end to end: yolox_s 640 takes 101 ms a frame INT8 and 310 ms
   FP16, 65 of them converting the input (`board/results/m1.log`).

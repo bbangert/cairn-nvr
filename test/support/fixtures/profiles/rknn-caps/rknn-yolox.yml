@@ -1,0 +1,6 @@
+# A proven rknn conversion: no acknowledgement needed by this rule (running
+# an unproven backend still needs one — that is a different check).
+backend: rknn
+model:
+  rknn: test/support/fixtures/models/stub.rknn
+model_profile: yolox

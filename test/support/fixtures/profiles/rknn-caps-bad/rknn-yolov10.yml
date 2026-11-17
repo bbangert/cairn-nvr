@@ -1,0 +1,5 @@
+# Rule 2: the end-to-end head, unproven, with no experimental: true.
+backend: rknn
+model:
+  rknn: test/support/fixtures/models/stub.rknn
+model_profile: yolov10
