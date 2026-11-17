@@ -7,9 +7,10 @@
 #
 # What rides: every app's ebin from the assembled release (deps included —
 # pushing "just cairn" would miss a dep bump silently), cairn's priv —
-# priv/profiles, priv/repo AND priv/static — plus runtime.exs, sys.config
-# and the boot artifacts below. What cannot ride: NIFs/canary (arch-native),
-# ERTS, apt packages, Dockerfile-level anything.
+# priv/profiles, priv/repo AND priv/static — and a board app's (its
+# profiles), plus runtime.exs, sys.config and the boot artifacts below.
+# What cannot ride: NIFs/canary (arch-native), ERTS, apt packages,
+# Dockerfile-level anything.
 #
 # priv/static used to be excluded so a dev build could not clobber the
 # image's digested assets. Shipping the COMPLETE digested set answers that:
@@ -67,8 +68,8 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
 (cd "$REL" && tar czf "$STAGE/push.tgz" \
-  --exclude='*.so' --exclude='lib/cairn-*/priv/native' \
-  lib/*/ebin lib/cairn-*/priv \
+  --exclude='*.so' --exclude='lib/cairn*/priv/native' \
+  lib/*/ebin lib/cairn*/priv \
   releases/*/runtime.exs releases/*/sys.config \
   releases/*/start.boot releases/*/start.script releases/*/cairn.rel releases/*/consolidated)
 
@@ -127,6 +128,8 @@ fi
 for d in lib/*/; do
   name=$(basename "$d")
   mkdir -p /app/lib/"$name"
+  # Profiles are read by directory: one this push no longer carries would still load.
+  if [ -d "$d"priv/profiles ]; then rm -rf /app/lib/"$name"/priv/profiles; fi
   cp -r "$d". /app/lib/"$name"/
 done
 # By existing dir, not by version — like the app loop above: a local

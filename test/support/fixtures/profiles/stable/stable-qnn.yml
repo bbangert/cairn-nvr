@@ -1,5 +1,5 @@
 # An unproven backend without the `experimental: true` half of the
 # acknowledgement: parses fine, refused for any group that runs it.
-backend: rknn
+backend: qnn
 model:
-  rknn: test/support/fixtures/models/stub.rknn
+  qnn: test/support/fixtures/models/stub.onnx

@@ -4,8 +4,9 @@ Presence-detection NVR for RK3566 vagus boards (Home Assistant Green): RTSP
 cameras in, events and a live UI out.
 
 **Not released.** Decode is software unless a profile says `decoder: rkmpp`.
-Detection runs on the CPU. The image carries the RKNN engine, but `backend:
-rknn` needs Rockchip's `librknnrt.so`, whose licence does not permit
+Detection runs on the CPU unless a group names an `rknn` profile, such as the
+shipped `rk3566-tier1`, to run it on the NPU. `backend: rknn` needs
+Rockchip's `librknnrt.so`, whose licence does not permit
 shipping it in the image: at first start Cairn downloads it from Rockchip's
 own repository (`airockchip/rknn-toolkit2` at a pinned commit), keeps it only
 if its sha256 matches the pin, and stores it as `/data/artifacts/<sha256>`;
@@ -26,14 +27,11 @@ nodes: `decoder: rkmpp` decodes through MPP and scales through the RGA, and
 2. Install "Cairn NVR (Rockchip)" and place your `config.yml` in the add-on's
    config directory (mounted read-only at `/config`). vagus creates that
    directory on the first start, which therefore runs with no cameras:
-   restart once the file is there. No shipped profile runs on this board
-   yet — `rk3566-lowfps` names a placeholder `.rknn` and no CPU twin. Copy
-   `priv/profiles/generic-ort.yml` under a name of your own into a directory
-   beside your config (`/config/profiles`, say), list that directory under
-   `profile_dirs:`, and point the copy's `model.onnx` at one of the baked
-   FP32 models, `models/yolox_tiny.onnx` (`input_size: 416`) or
-   `models/yolox_s.onnx` (`input_size: 640`) — see
-   `docs/profile-authoring.md`. All state lives in `/data`.
+   restart once the file is there. Name the shipped `rk3566-tier1` from a
+   plugin group (with `allow_experimental: true`) to detect on the NPU: its
+   `.rknn` models download at first start into `/data/artifacts`, and until
+   they have, the config is refused with an error naming what is missing.
+   See `docs/profile-authoring.md`. All state lives in `/data`.
 3. The UI is on the host directly at port 4000 (`host_network`).
 
 ## Licenses

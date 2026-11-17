@@ -18,21 +18,21 @@ defmodule Cairn.Config.Profile do
   `Cairn.Config` rejects a profiled group whose model artifact or labels file
   is missing, that names no CPU twin its backend needs (a named twin missing
   on disk only warns), or whose backend is unproven (see "The model half"
-  below). Shipped files naming a backend the release's board does not
-  provide are not loaded.
+  below).
 
   Profiles are files, never inline config: shipped ones live in
-  `priv/profiles/*.yml` — the four board profiles cairn ships — then the
-  board's `profiles_dir/0`, then operator ones in the directories the
-  top-level `profile_dirs:` key lists; a later file wins a name collision
-  (with a warning saying so).
+  `priv/profiles/*.yml`, then the board's `profiles_dir/0`, then operator
+  ones in the directories the top-level `profile_dirs:` key lists; a later
+  file wins a name collision (with a warning saying so). Only the first two
+  are the release's own, and only a ladder rung in one of those may name a
+  file to fetch (`sha256:` and `url:`) instead of a model path.
 
   `docs/profile-authoring.md` is the operator-facing half of this module: the
   menus, the errors, and the two rules the schema cannot express.
 
   ## Schema
 
-  Every key. The four profiles cairn ships are worked examples of it, with
+  Every key. The profiles cairn ships are worked examples of it, with
   their reasoning in their own comments:
 
   ```yaml
@@ -86,6 +86,10 @@ defmodule Cairn.Config.Profile do
       input_size: 640
       engine_budget: 17
       pack: yolo26m           # skipped (warned) while its artifact is absent
+    - sha256: <64 hex>        # the release's own profiles only: the file is
+      url: https://h/s.onnx   # fetched, usable once it hashes to sha256:; any
+      input_size: 640         # model: then holds only a twin
+      engine_budget: 30
     - model:
         qnn: models/nano.onnx
       model_profile: yolox
@@ -129,7 +133,8 @@ defmodule Cairn.Config.Profile do
   them and stay operator-owned (D-P6).
 
   Four things `Cairn.Config` refuses at load, which is where an operator
-  reads diagnostics: a `model:` artifact that is not on disk, a `labels:`
+  reads diagnostics: a `model:` artifact that is not on disk (for a fetched
+  rung, not yet in `Cairn.Artifacts` while a camera runs on it), a `labels:`
   file that is not on disk, a backend whose capability asks for a CPU twin
   with no `model.onnx` named (a named twin that is not on disk only warns:
   health then has no baseline), and a group running a backend other than
@@ -148,7 +153,7 @@ defmodule Cairn.Config.Profile do
 
   @known_keys ~w(name experimental backend model model_profile input_size decoder labels
                  fps_band sample_fps tracking tier model_ladder supported_cameras)
-  @known_rung_keys ~w(model model_profile input_size engine_budget pack)
+  @known_rung_keys ~w(model model_profile input_size engine_budget pack sha256 url)
   @known_tracking_keys ~w(bbd oru ocr twin_mint max_unseen_ms max_live_tracks stationary_after_ms
                           tracker)
   # The Rust catalog's model families, row for row with `PROFILES` in
@@ -436,32 +441,25 @@ defmodule Cairn.Config.Profile do
   shadowed profile is how a fleet ends up running settings nobody can find
   in a file they are reading.
 
-  A `{dir, :provided_only}` entry skips, without a diagnostic, each file whose
-  `backend:` the release's board does not provide.
+  Each dir comes with its origin: `:release` for the release's own, where a
+  rung may name a file to fetch, `:operator` for the rest.
   """
-  @spec load_dirs([Path.t() | {Path.t(), :provided_only}], map()) ::
-          {%{String.t() => t()}, map()}
+  @spec load_dirs([{Path.t(), :release | :operator}], map()) :: {%{String.t() => t()}, map()}
   def load_dirs(dirs, acc) do
-    Enum.reduce(dirs, {%{}, acc}, fn entry, {profiles, acc} ->
-      {dir, provided_only?} =
-        case entry do
-          {dir, :provided_only} -> {dir, true}
-          dir -> {dir, false}
-        end
-
+    Enum.reduce(dirs, {%{}, acc}, fn {dir, origin}, {profiles, acc} ->
       dir
       |> Path.join("*.yml")
       |> Path.wildcard()
       |> Enum.sort()
-      |> load_files(profiles, acc, provided_only?)
+      |> load_files(profiles, acc, origin)
     end)
   end
 
-  defp load_files(paths, profiles, acc, provided_only?) do
+  defp load_files(paths, profiles, acc, origin) do
     Enum.reduce(paths, {profiles, acc}, fn path, {profiles, acc} ->
       name = Path.basename(path, ".yml")
 
-      case load_file(path, name, acc, provided_only?) do
+      case load_file(path, name, acc, origin) do
         {nil, acc} ->
           {profiles, acc}
 
@@ -485,22 +483,55 @@ defmodule Cairn.Config.Profile do
     end
   end
 
-  defp load_file(path, name, acc, provided_only?) do
+  defp load_file(path, name, acc, origin) do
     case YamlElixir.read_from_file(path) do
-      {:ok, %{} = raw} when provided_only? ->
-        if provided?(raw), do: parse(raw, name, acc), else: {nil, acc}
-
-      {:ok, raw} ->
-        parse(raw, name, acc)
-
-      {:error, err} ->
-        {nil, Config.add_error(acc, "profile #{name}: #{Exception.message(err)}")}
+      {:ok, raw} -> parse(raw, name, acc, {origin, path})
+      {:error, err} -> {nil, Config.add_error(acc, "profile #{name}: #{Exception.message(err)}")}
     end
   end
 
+  @doc """
+  `Cairn.Artifacts`' entry for each well-formed fetched rung under `dirs`,
+  read here because the store starts before any config load. A malformed
+  rung is skipped, left to the load to report.
+  """
+  @spec fetch_entries([Path.t()]) :: [%{name: String.t(), url: String.t(), sha256: String.t()}]
+  def fetch_entries(dirs) do
+    for dir <- dirs,
+        path <- dir |> Path.join("*.yml") |> Path.wildcard() |> Enum.sort(),
+        {:ok, %{"model_ladder" => rungs}} when is_list(rungs) <- [YamlElixir.read_from_file(path)],
+        %{"sha256" => sha256, "url" => url} = rung <- rungs,
+        sha256?(sha256) and https_url?(url) and Map.get(rung, "pack") == nil,
+        uniq: true,
+        do: %{name: fetch_name(url, sha256), url: url, sha256: String.downcase(sha256)}
+  end
+
+  @doc "The name a fetched rung's file goes by in diagnostics: the URL's last segment."
+  @spec fetch_name(String.t(), String.t()) :: String.t()
+  def fetch_name(url, sha256) do
+    case Path.basename(URI.parse(url).path || "") do
+      "" -> sha256
+      name -> name
+    end
+  end
+
+  defp sha256?(value), do: is_binary(value) and value =~ ~r/\A[0-9a-fA-F]{64}\z/
+
+  # The store's transport refuses anything but https; userinfo is a credential
+  # this file would publish. `URI.new/1` because the transport parses with it:
+  # a URL only the lenient `URI.parse/1` takes would load and fail every fetch.
+  defp https_url?(url) when is_binary(url),
+    do:
+      match?(
+        {:ok, %URI{scheme: "https", host: host, userinfo: nil}} when host not in [nil, ""],
+        URI.new(url)
+      )
+
+  defp https_url?(_url), do: false
+
   @doc false
-  @spec parse(term(), String.t(), map()) :: {t() | nil, map()}
-  def parse(raw, name, acc) when is_map(raw) do
+  @spec parse(term(), String.t(), map(), {:release | :operator, Path.t()}) :: {t() | nil, map()}
+  def parse(raw, name, acc, source) when is_map(raw) do
     acc = Config.warn_unknown(acc, raw, @known_keys, "profile #{name}")
 
     acc =
@@ -533,7 +564,7 @@ defmodule Cairn.Config.Profile do
       |> check_decoder(raw, name)
       |> check_capability_rules(raw, name)
       |> check_tier(raw, name)
-      |> check_model_ladder(raw, name)
+      |> check_model_ladder(raw, name, source)
       |> check_supported_cameras(raw, name)
       |> check_ladder_coverage(raw, name)
 
@@ -567,7 +598,7 @@ defmodule Cairn.Config.Profile do
     end
   end
 
-  def parse(_raw, name, acc) do
+  def parse(_raw, name, acc, _source) do
     {nil, Config.add_error(acc, "profile #{name}: must be a YAML mapping")}
   end
 
@@ -743,10 +774,10 @@ defmodule Cairn.Config.Profile do
   # Public only so the fused-NMS rule can be exercised against a family row
   # today's catalog does not contain — see `@model_families`. `family` is the
   # `{name, row}` pair `family/1` returns. Test coverage leans on both rules
-  # living in this one function: the rknn rule's fixtures prove the
-  # parse→here wiring on the public path, the synthetic fused row proves the
-  # NMS branch directly — split the rules apart and each half needs its own
-  # public-path test.
+  # living in this one function: the rknn rule's fixtures (run on the
+  # Rockchip board, whose menu has rknn) prove the parse→here wiring on the
+  # public path, the synthetic fused row proves the NMS branch directly —
+  # split the rules apart and each half needs its own public-path test.
   @spec check_capabilities(map(), String.t(), String.t(), boolean(), {String.t(), family()}) ::
           map()
   def check_capabilities(acc, name, backend, experimental, {model_profile, family}) do
@@ -805,16 +836,20 @@ defmodule Cairn.Config.Profile do
   # The struct's rung shape: atom keys, only built once every check passed, so
   # construction may assume the raw shapes are valid. `model_profile` stays
   # nil where a rung leans on the profile-level family; resolution coalesces.
+  # A fetched rung's `model` lacks the backend's artifact until `Cairn.Config`
+  # puts the store's path there.
   defp rungs(nil), do: nil
 
   defp rungs(list) do
     Enum.map(list, fn rung ->
       %{
-        model: Map.get(rung, "model"),
+        model: Map.get(rung, "model") || %{},
         model_profile: Map.get(rung, "model_profile"),
         input_size: Map.get(rung, "input_size"),
         engine_budget: Map.get(rung, "engine_budget"),
-        pack: Map.get(rung, "pack")
+        pack: Map.get(rung, "pack"),
+        sha256: if(sha256 = Map.get(rung, "sha256"), do: String.downcase(sha256)),
+        url: Map.get(rung, "url")
       }
     end)
   end
@@ -825,7 +860,7 @@ defmodule Cairn.Config.Profile do
   # rung no installation state can reach is dead weight or a misordering,
   # while a rung shadowed only by pack rungs wins exactly when those packs
   # are absent.
-  defp check_model_ladder(acc, raw, name) do
+  defp check_model_ladder(acc, raw, name, source) do
     case Map.get(raw, "model_ladder") do
       nil ->
         acc
@@ -834,7 +869,7 @@ defmodule Cairn.Config.Profile do
         acc
         |> check_ladder_exclusions(raw, name)
         |> check_ladder_tier(raw, name)
-        |> check_rungs(list, raw, name)
+        |> check_rungs(list, raw, name, source)
         |> check_budget_order(list, raw, name)
 
       other ->
@@ -893,23 +928,24 @@ defmodule Cairn.Config.Profile do
     end
   end
 
-  defp check_rungs(acc, list, raw, name) do
+  defp check_rungs(acc, list, raw, name, source) do
     backend = Map.get(raw, "backend", "ort")
 
     list
     |> Enum.with_index(1)
     |> Enum.reduce(acc, fn {rung, index}, acc ->
-      check_rung(acc, rung, index, backend, raw, name)
+      check_rung(acc, rung, index, backend, raw, name, source)
     end)
   end
 
-  defp check_rung(acc, rung, index, backend, raw, name) when is_map(rung) do
+  defp check_rung(acc, rung, index, backend, raw, name, source) when is_map(rung) do
     where = "profile #{name} model_ladder rung #{index}"
 
     acc
     |> Config.warn_unknown(rung, @known_rung_keys, where)
     |> Config.warn_unknown(Map.get(rung, "model"), model_keys(), "#{where} model")
     |> check_rung_model(rung, index, backend, name)
+    |> check_rung_fetch(rung, index, backend, name, source)
     |> check_pos_int(rung, "input_size", name, "model_ladder rung #{index} input_size")
     |> check_rung_required(rung, "input_size", index, name)
     |> check_rung_budget(rung, index, name)
@@ -917,7 +953,7 @@ defmodule Cairn.Config.Profile do
     |> check_rung_model_profile(rung, index, backend, raw, name)
   end
 
-  defp check_rung(acc, rung, index, _backend, _raw, name) do
+  defp check_rung(acc, rung, index, _backend, _raw, name, _source) do
     Config.add_error(
       acc,
       "profile #{name}: model_ladder rung #{index} must be a mapping, got #{inspect(rung)}"
@@ -927,13 +963,18 @@ defmodule Cairn.Config.Profile do
   # Each rung is a model choice for THIS profile's backend, so beyond the
   # top-level `model:` shape rules it must actually carry the backend's
   # artifact key — a rung without one could never be resolved into anything
-  # the engine loads.
+  # the engine loads — unless it names the file to fetch instead
+  # (`check_rung_fetch/6`), when `model:` holds only a twin, if anything.
   defp check_rung_model(acc, rung, index, backend, name) do
+    fetched? = fetch_named?(rung)
+
     case Map.get(rung, "model") do
       model when is_map(model) and model != %{} ->
+        acc = check_rung_model_leaves(acc, model, index, name)
+        if fetched?, do: acc, else: check_rung_backend_key(acc, model, index, backend, name)
+
+      nil when fetched? ->
         acc
-        |> check_rung_model_leaves(model, index, name)
-        |> check_rung_backend_key(model, index, backend, name)
 
       _absent_or_not_a_map ->
         Config.add_error(
@@ -976,6 +1017,64 @@ defmodule Cairn.Config.Profile do
     else
       acc
     end
+  end
+
+  # Values, not keys: a bare `sha256:` or `url:` is absent, as everywhere
+  # here. Only the release's own files may name a fetch, as only they are
+  # read into the store's set (`fetch_entries/1`) — and an operator file
+  # making this node download is a door the release does not open. A pack is
+  # installed by hand, never fetched.
+  defp check_rung_fetch(acc, rung, index, backend, name, {origin, path}) do
+    where = "profile #{name}: model_ladder rung #{index}"
+
+    cond do
+      not fetch_named?(rung) ->
+        acc
+
+      origin == :operator ->
+        Config.add_error(
+          acc,
+          "#{where} names a file to fetch (sha256:/url:), which only the release's own " <>
+            "profiles may, and #{path} is not one — place the model file by hand and " <>
+            "name its path under model: instead"
+        )
+
+      true ->
+        check_fetch_values(acc, rung, where, backend)
+    end
+  end
+
+  defp fetch_named?(rung), do: Map.get(rung, "sha256") != nil or Map.get(rung, "url") != nil
+
+  defp check_fetch_values(acc, rung, where, backend) do
+    sha256 = Map.get(rung, "sha256")
+    url = Map.get(rung, "url")
+    key = if backend?(backend), do: artifact_key(backend)
+    model = Map.get(rung, "model")
+
+    acc
+    |> Config.check(
+      sha256 != nil and url != nil,
+      "#{where} needs both sha256: and url: — the file is fetched from the one " <>
+        "and usable only once it hashes to the other"
+    )
+    |> Config.check(
+      sha256 == nil or sha256?(sha256),
+      "#{where} sha256 must be 64 hex characters, got #{inspect(sha256)}"
+    )
+    |> Config.check(
+      url == nil or https_url?(url),
+      "#{where} url must be an https URL with a host and no user info"
+    )
+    |> Config.check(
+      Map.get(rung, "pack") == nil,
+      "#{where} is a pack rung, and a pack is installed by hand, never fetched"
+    )
+    |> Config.check(
+      key == nil or not is_map(model) or Map.get(model, key) == nil,
+      "#{where} names both a file to fetch and model.#{key} — the fetched file " <>
+        "is the rung's #{backend} artifact; drop one"
+    )
   end
 
   # `check_pos_int/5` says nothing about an absent key (top-level fields are
@@ -1240,7 +1339,6 @@ defmodule Cairn.Config.Profile do
 
   defp backends, do: Cairn.Board.module().backends()
   defp backend?(backend), do: Map.has_key?(backends(), backend)
-  defp provided?(raw), do: backend?(Map.get(raw, "backend", "ort"))
   defp model_keys, do: backends() |> Map.values() |> Enum.map(& &1.artifact)
 
   # "a, b or c" — enumerated from the table rather than hand-written so a value

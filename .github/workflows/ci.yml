@@ -186,9 +186,9 @@ jobs:
   test-rockchip:
     name: Test (CAIRN_BOARD=rockchip)
     runs-on: ubuntu-latest
-    # Not the full suite: it assumes the generic menu (qnn ladders, hardware
-    # decoder names, rknn fixtures without a twin), so config_test.exs and its
-    # kin are generic-only; rockchip_release_test.exs covers that menu instead.
+    # Not the full suite: it assumes the generic menu (qnn profiles and
+    # ladders, hardware decoder names), so config_test.exs and its kin are
+    # generic-only; rockchip_release_test.exs covers that menu instead.
     env:
       CAIRN_BOARD: rockchip
 

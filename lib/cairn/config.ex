@@ -266,8 +266,8 @@ defmodule Cairn.Config do
   Builds and validates a config from a YAML-shaped map — the one validator,
   whatever produced the map (the file, or rows rendered into its `"cameras"`
   key). Not pure: it reads `CAIRN_DATA_DIR`, the profile files under
-  `profile_dirs` and the board's, their model artifacts and the board's
-  preflight.
+  `profile_dirs` and the board's, their model artifacts, the artifact store's
+  table and the board's preflight.
 
   `fleet_count:` replaces the N that ladder resolution sizes for. Only a
   source re-rendering a reduced fleet passes it, to hold the rung and derived
@@ -277,7 +277,8 @@ defmodule Cairn.Config do
   profile directory and its preflight, so the suite can reach states the
   generic board never produces; the menus `Cairn.Config.Profile` checks still
   come from the release's board. `artifacts:` replaces
-  `Cairn.Artifacts.unusable/0`'s answer the same way.
+  `Cairn.Artifacts.unusable/0`'s answer the same way, and `artifact:`
+  `Cairn.Artifacts.state/1`, which a fetched ladder rung is looked up with.
   """
   @spec from_map(map(), keyword()) :: {:ok, t(), [String.t()]} | {:error, [String.t()]}
   def from_map(map, opts \\ []) do
@@ -294,6 +295,8 @@ defmodule Cairn.Config do
 
     {cameras, acc} = parse_cameras(Map.get(map, "cameras", []), acc)
     {profiles, acc} = load_profiles(Map.get(map, "profile_dirs"), board, acc)
+    state = Keyword.get(opts, :artifact, &Cairn.Artifacts.state/1)
+    {profiles, unfetched_rungs} = fetch_rungs(profiles, state)
     {plugin_groups, acc} = parse_plugins(Map.get(map, "plugins"), acc)
 
     config = %__MODULE__{
@@ -328,7 +331,7 @@ defmodule Cairn.Config do
     {config, acc} = resolve_plugins(config, acc, declared_plugin_names(map))
     {config, acc} = resolve_ladders(config, acc, opts)
     unfetched = Keyword.get_lazy(opts, :artifacts, &Cairn.Artifacts.unusable/0)
-    {config, acc} = resolve_profiles(config, board, unfetched, acc)
+    {config, acc} = resolve_profiles(config, board, {unfetched, unfetched_rungs}, acc)
     acc = check_group_profiles(config, acc)
     acc = validate(config, acc)
 
@@ -844,16 +847,12 @@ defmodule Cairn.Config do
 
   # -- profiles ---------------------------------------------------------------
 
-  # Shipped profiles first, the board's next, operator dirs last —
-  # `Profile.load_dirs/2` gives later files the name on a collision (with a
-  # warning), so an operator file shadows both.
-  #
-  # A shipped file naming a backend this release's board does not provide is
-  # left out, silently: it is not operator intent, and erroring would fail
-  # every load on that board. Goes away when shipped profiles move to their
-  # board (D-G19, phase 11).
+  # The release's own dirs first, operator dirs last — `Profile.load_dirs/2`
+  # gives later files the name on a collision (with a warning), so an
+  # operator file shadows either. The origin decides whether a rung may name
+  # a file to fetch.
   defp load_profiles(dirs, board, acc) do
-    base = [{shipped_profiles_dir(), :provided_only} | List.wrap(board.profiles_dir())]
+    base = Enum.map(release_profile_dirs(board), &{&1, :release})
 
     case dirs do
       nil ->
@@ -861,7 +860,7 @@ defmodule Cairn.Config do
 
       dirs when is_list(dirs) ->
         if Enum.all?(dirs, &is_binary/1) do
-          Profile.load_dirs(base ++ dirs, acc)
+          Profile.load_dirs(base ++ Enum.map(dirs, &{&1, :operator}), acc)
         else
           {%{}, add_error(acc, "profile_dirs must be a list of directory paths")}
         end
@@ -871,7 +870,54 @@ defmodule Cairn.Config do
     end
   end
 
-  defp shipped_profiles_dir, do: Application.app_dir(:cairn, "priv/profiles")
+  @doc """
+  The release's own profile directories: the base's shipped one, then the
+  board's (`c:Cairn.Stage.Board.profiles_dir/0`).
+  """
+  @spec release_profile_dirs(module()) :: [Path.t()]
+  def release_profile_dirs(board \\ Cairn.Board.module()),
+    do: [Application.app_dir(:cairn, "priv/profiles") | List.wrap(board.profiles_dir())]
+
+  # A fetched rung's artifact is the store's file once verified. Until then
+  # the rung names none, and what the store says is kept, by profile, for a
+  # group that runs it (`check_unfetched/5`): one read per rung, so the
+  # rung's path and its missing record cannot disagree.
+  defp fetch_rungs(profiles, state) do
+    {profiles, unfetched} =
+      Enum.map_reduce(profiles, %{}, fn
+        {name, %Profile{model_ladder: rungs} = profile}, unfetched when is_list(rungs) ->
+          key = Profile.artifact_key(profile.backend)
+
+          {rungs, missing} =
+            rungs
+            |> Enum.with_index(1)
+            |> Enum.map_reduce([], fn {rung, index}, missing ->
+              fetch_rung(rung, index, key, state, missing)
+            end)
+
+          unfetched = if missing == [], do: unfetched, else: Map.put(unfetched, name, missing)
+          {{name, %{profile | model_ladder: rungs}}, unfetched}
+
+        entry, unfetched ->
+          {entry, unfetched}
+      end)
+
+    {Map.new(profiles),
+     Map.new(unfetched, fn {name, missing} -> {name, Enum.reverse(missing)} end)}
+  end
+
+  defp fetch_rung(%{sha256: sha256} = rung, index, key, state, missing) when is_binary(sha256) do
+    case state.(sha256) do
+      {:ok, path} ->
+        {%{rung | model: Map.put(rung.model, key, path)}, missing}
+
+      {:missing, failure} ->
+        name = "#{Profile.fetch_name(rung.url, sha256)} (ladder rung #{index})"
+        {rung, [%{name: name, failure: failure} | missing]}
+    end
+  end
+
+  defp fetch_rung(rung, _index, _key, _state, missing), do: {rung, missing}
 
   # -- ladder resolution ------------------------------------------------------
 
@@ -964,7 +1010,9 @@ defmodule Cairn.Config do
 
     # D-L4: a pack rung whose artifact is not on disk is skipped, warned; a
     # non-pack rung is always a candidate — a missing artifact there is the
-    # load error `check_ladder_artifacts/2` raises, not a silent skip.
+    # load error `check_ladder_artifacts/2` raises (for a fetched one,
+    # `check_unfetched/5`'s, a warning with no camera on the group), not a
+    # silent skip.
     {candidates, skipped} =
       Enum.split_with(indexed, fn {rung, _index} ->
         rung.pack == nil or File.regular?(rung_artifact(rung, profile.backend))
@@ -1017,10 +1065,16 @@ defmodule Cairn.Config do
 
     "profile #{profile.name}: no ladder rung covers #{n} cameras at tier " <>
       "#{profile.tier}'s #{floor.floor_fps} fps floor (#{floor_rate}/s effective) — " <>
-      "the largest eligible rung (#{rung_artifact(largest, profile.backend)}) budgets " <>
+      "the largest eligible rung (#{rung_label(largest, profile.backend)}) budgets " <>
       "#{largest.engine_budget} passes/s, about #{trunc(largest.engine_budget / floor_rate)} " <>
       "cameras. Remove cameras from this node's detecting groups or split the node"
   end
+
+  # A fetched rung the store does not have yet has no path to show.
+  defp rung_label(%{sha256: sha256, url: url} = rung, backend) when is_binary(sha256),
+    do: rung_artifact(rung, backend) || Profile.fetch_name(url, sha256)
+
+  defp rung_label(rung, backend), do: rung_artifact(rung, backend)
 
   # The derived rate (D-L4): the largest nominal fps within the tier's bounds
   # whose EFFECTIVE demand fits the rung's budget. Chosen over
@@ -1052,7 +1106,7 @@ defmodule Cairn.Config do
   # plugin references: a group's `profile:` name becomes the parsed
   # `Cairn.Config.Profile` struct, or (typo, missing file) a config error
   # naming what was looked for.
-  defp resolve_profiles(config, board, unfetched, acc) do
+  defp resolve_profiles(config, board, {unfetched, unfetched_rungs}, acc) do
     unusable = board.preflight()
 
     {groups, acc} =
@@ -1060,7 +1114,7 @@ defmodule Cairn.Config do
         %PluginGroup{profile: name} = group, acc when is_binary(name) ->
           case Map.fetch(config.profiles, name) do
             {:ok, profile} ->
-              acc = check_unfetched(acc, config, group, profile, unfetched)
+              acc = check_unfetched(acc, config, group, profile, {unfetched, unfetched_rungs})
               acc = warn_unusable(acc, group, profile, board, unusable)
               {%{group | profile: profile}, acc}
 
@@ -1084,36 +1138,62 @@ defmodule Cairn.Config do
   # only when the model in the config moves, so a config that loaded while
   # the file was missing would not detect once it arrived. Refused, the
   # server runs its fallback until the fetcher's reload brings this config in.
+  # The same for a fetched ladder rung, any of them: the non-pack rungs are
+  # the ladder the file promises whatever the fleet's size.
   #
   # Only for a group cameras run on: the fallback is this map without its
   # cameras, and must load. For a group with none, the same words warn.
   #
   # The board's preflight warning for the backend stands beside it: its reason
   # may name the same path, or something no download fixes.
-  defp check_unfetched(acc, config, group, profile, unfetched) do
-    case Map.get(unfetched, profile.backend, []) do
-      [] ->
+  defp check_unfetched(acc, config, group, profile, {unfetched, unfetched_rungs}) do
+    [
+      {"runs backend #{inspect(profile.backend)}, which needs",
+       Map.get(unfetched, profile.backend, [])},
+      {"needs", Map.get(unfetched_rungs, profile.name, [])}
+    ]
+    |> Enum.reduce(acc, fn
+      {_what, []}, acc ->
         acc
 
-      missing ->
+      {what, missing}, acc ->
         message =
-          "plugin #{group.name}: profile #{profile.name} runs backend " <>
-            "#{inspect(profile.backend)}, which needs " <>
+          "plugin #{group.name}: profile #{profile.name} #{what} " <>
             Enum.map_join(missing, "; ", &unfetched_reason/1) <>
-            " — #{unfetched_until(missing)}; no camera can run on this group before then"
+            " — " <> unfetched_until(missing)
 
         if Enum.any?(config.cameras, &(&1.plugin == {:group, group.name})),
           do: add_error(acc, message),
           else: add_warning(acc, message)
+    end)
+  end
+
+  # A restarting store's entries are all `:restarting`. A store not running,
+  # or not holding the file, fetches nothing, and a restart rebuilds it with
+  # the same set: no "before then" to promise.
+  defp unfetched_until(missing) do
+    failures = Enum.map(missing, & &1.failure)
+
+    cond do
+      :restarting in failures ->
+        "the config reloads once it is back; no camera can run on this group before then"
+
+      Enum.any?(failures, &(&1 in [:not_started, :unlisted])) ->
+        "nothing is fetching it; no camera can run on this group"
+
+      true ->
+        "the download is retried until it succeeds; no camera can run on this group before then"
     end
   end
 
-  # A restarting store's entries are all `:restarting`, others never.
-  defp unfetched_until([%{failure: :restarting} | _]), do: "the config reloads once it is back"
-  defp unfetched_until(_missing), do: "the download is retried until it succeeds"
-
   defp unfetched_reason(%{name: name, failure: :restarting}),
     do: "#{name}, whose status is unknown: the artifact store is restarting"
+
+  defp unfetched_reason(%{name: name, failure: :not_started}),
+    do: "#{name}, not downloaded: the artifact store is not running"
+
+  defp unfetched_reason(%{name: name, failure: :unlisted}),
+    do: "#{name}, not downloaded: the artifact store was started without it"
 
   defp unfetched_reason(%{name: name, failure: nil}),
     do: "#{name}, not downloaded yet: the fetch has not been tried"
@@ -1255,15 +1335,13 @@ defmodule Cairn.Config do
 
   defp check_group_profile(_group, acc), do: acc
 
-  # D-P10: `rknn` and `qnn` are legal names in a profile — the schema knows
-  # them so board profiles can ship before their backends do — but a group
-  # actually running one needs both halves of the acknowledgement, the
-  # profile's own `experimental:` and the operator's `allow_experimental:`.
-  # Both execute (qnn on the generic board, rknn on the Rockchip one) and
-  # neither has soaked: non-ort means experimental until this comment says
-  # otherwise. Refused at load rather than at group start because this is
-  # where an operator reads diagnostics; a start-time refusal is a respawn
-  # loop in a log file nobody is tailing.
+  # D-P10: a group running `rknn` or `qnn` needs both halves of the
+  # acknowledgement, the profile's own `experimental:` and the operator's
+  # `allow_experimental:`. Both execute (qnn on the generic board, rknn on
+  # the Rockchip one) and neither has soaked: non-ort means experimental
+  # until this comment says otherwise. Refused at load rather than at group
+  # start because this is where an operator reads diagnostics; a start-time
+  # refusal is a respawn loop in a log file nobody is tailing.
   defp check_backend_implemented(acc, _group, %Profile{backend: "ort"}), do: acc
 
   defp check_backend_implemented(acc, group, %Profile{experimental: false} = profile) do
@@ -1302,6 +1380,10 @@ defmodule Cairn.Config do
 
   defp check_artifact(acc, group, profile) do
     case Profile.artifact(profile) do
+      # A fetched rung the store does not have yet: `check_unfetched/5` says so.
+      nil when is_map(profile.resolved_rung) and is_binary(profile.resolved_rung.sha256) ->
+        acc
+
       nil ->
         add_error(
           acc,
@@ -1331,9 +1413,13 @@ defmodule Cairn.Config do
     rungs
     |> Enum.with_index(1)
     |> Enum.filter(fn {rung, _index} -> rung.pack == nil and rung != profile.resolved_rung end)
-    |> Enum.reduce(acc, fn {rung, index}, acc ->
-      path = Map.get(rung.model, Profile.artifact_key(profile.backend))
-
+    |> Enum.map(fn {rung, index} ->
+      {rung, Profile.artifact(%{profile | model: rung.model}), index}
+    end)
+    # A rung without a path is a fetched one not yet in the store, which
+    # `check_unfetched/5` reports.
+    |> Enum.reject(fn {_rung, path, _index} -> path == nil end)
+    |> Enum.reduce(acc, fn {_rung, path, index}, acc ->
       check(
         acc,
         File.regular?(path),
@@ -1666,7 +1752,7 @@ defmodule Cairn.Config do
 
   # A profile's band-tuned bounds go through `bound/3` into the same tracker
   # the global and camera values reach, so they answer to the same ranges —
-  # checked here rather than in `Profile.parse/3` so the numbers live in one
+  # checked here rather than in `Profile.parse/4` so the numbers live in one
   # place, beside the global checks they mirror.
   defp validate_profile_bounds(acc, config) do
     ranges = [

@@ -1,0 +1,58 @@
+# DRAFT: every budget below is PROVISIONAL, taken from the bring-up
+# benches; the measurement campaign (plan Phase 12: a boundary run per
+# rung) replaces them, and the claim with them.
+#
+# Rockchip RK3566 (HA Green): the three Apache YOLOX rungs, INT8 for the
+# NPU (rknn-toolkit2 2.3.2, tools/rknn-export). No release carries them:
+# the artifact store fetches each from its `url:` at first start and the
+# rung is usable once the file hashes to its `sha256:`. While one is
+# missing, a config whose cameras run this profile is refused, naming it.
+#
+# Budgets are passes/s through one engine, every frame offered: sustained,
+# not a p50 — rungs 1 and 3 on a recorded 1080p clip through the probe
+# binary, rung 2 as its own comment says. The in-VM engine has read slower
+# on live cameras (p50 45-48 ms on the 416 rung against 33 ms here), so
+# these may be optimistic; Phase 12 says.
+#
+# experimental: true because rknn has not soaked (D-P10) — a group naming
+# this profile also needs `allow_experimental: true` — and because the
+# model zoo documents no yolox conversion. AGPL pack rungs are not here.
+experimental: true
+tier: 1
+backend: rknn
+model_profile: yolox
+model_ladder:
+  # Best accuracy (40.5 paper mAP). provisional budget: 756 passes in
+  # 78 s (board-p4).
+  - sha256: c61524bca75d6f5df3fd255c8f27b5eaca544c94cbd05d4ce835a82a48733282
+    url: https://github.com/bbangert/cairn-nvr/releases/download/models-rk3566-1/yolox_s_640_i8.rknn
+    model:
+      onnx: models/yolox_s.onnx
+    input_size: 640
+    engine_budget: 9.7
+  # tiny's weights at 640, kept by its parity bar (person recall 0.94 vs
+  # the 416 rung's 0.87). provisional budget: the 60 s sustained loop of
+  # a trial build (board probe); this pinned file has no run of its own.
+  # Its twin is the 416 release file with the input size rewritten.
+  - sha256: cd146e38777ea0c38e20c114c4166fb9b7553c379e20651a999167acb0bb044a
+    url: https://github.com/bbangert/cairn-nvr/releases/download/models-rk3566-1/yolox_tiny_640_i8.rknn
+    model:
+      onnx: models/yolox_tiny_640.onnx
+    input_size: 640
+    engine_budget: 11.96
+  # provisional budget: 1,812 passes in 78 s (board-p4).
+  - sha256: 832df464bc84259d8d612bb7e9d4f6dd8573acb94f9847e051cce4c438c78304
+    url: https://github.com/bbangert/cairn-nvr/releases/download/models-rk3566-1/yolox_tiny_416_i8.rknn
+    model:
+      onnx: models/yolox_tiny.onnx
+    input_size: 416
+    engine_budget: 23.2
+# Arithmetic, not a measured fleet: the 416 rung's budget at tier 1's
+# 2 fps floor (1.875/s effective), 23.2 / 1.875 = 12.
+supported_cameras: 12
+# MPP decode and RGA scale. Named because a named decoder is a requirement:
+# without the device nodes detection stops and says so, rather than
+# decoding in software on the cores the rest of the pipeline needs.
+decoder: rkmpp
+labels: models/coco.names
+# No tracking block, and none would be legal: tier 1 runs no tracker.

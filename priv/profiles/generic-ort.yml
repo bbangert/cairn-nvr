@@ -32,8 +32,8 @@ tracking:
   # `bbd` and `oru` ship off, and a migration target that listed them would
   # change what a config does on the day it adopts a profile, which is the one
   # thing this file must not do. Adding them is a per-profile decision — see
-  # the stage descriptions in rk3566-lowfps.yml — and note that bbd's
-  # measured win needs the plugin's own `--track-floor-json` alongside it.
+  # docs/profile-authoring.md on each stage — and note that bbd's measured
+  # win needs the plugin's own `--track-floor-json` alongside it.
   twin_mint: true
   # The globals, restated so that adopting this profile changes nothing.
   max_unseen_ms: 3000

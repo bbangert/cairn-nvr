@@ -118,10 +118,10 @@ retention:
 #   token: "replace-with-a-long-random-secret"
 
 # Directories holding your own hardware profiles (docs/profile-authoring.md).
-# The profiles cairn ships (priv/profiles/) are always loaded first and these
-# are loaded after, so a file of yours shadows a shipped one of the same name —
-# with a warning naming the file that won. Omit the key entirely to use only
-# the shipped ones.
+# The profiles cairn ships (priv/profiles/, then the board's own) are always
+# loaded first and these are loaded after, so a file of yours shadows a
+# shipped one of the same name — with a warning naming the file that won.
+# Omit the key entirely to use only the shipped ones.
 # profile_dirs:
 #   - /etc/cairn/profiles
 
@@ -131,17 +131,19 @@ retention:
 # group is nothing but that profile reference plus your consent flags.
 # plugins:
 #   detect:
-#     # A filename under priv/profiles/ or a profile_dirs entry, without .yml.
+#     # A filename under priv/profiles/, the board's own profile directory or
+#     # a profile_dirs entry, without .yml.
 #     # The profile names the model, the family, the input size, the labels
 #     # and the inference backend — and the tracker stages that go with them,
 #     # for every camera on this group.
 #     profile: generic-ort
 #
 #   npu:
-#     profile: rk3566-lowfps
-#     # Required to run a profile whose backend is not `ort`: only `ort`
-#     # executes today. Both halves are needed — the profile declares
-#     # `experimental: true`, this key is your consent to it.
+#     profile: rk3566-tier1
+#     # Required to run a profile whose backend is not `ort`: each release
+#     # offers `ort` plus its own (`qnn` on the generic board, `rknn` on the
+#     # Rockchip one), and both are experimental. Both halves are needed —
+#     # the profile declares `experimental: true`, this key is your consent.
 #     allow_experimental: true
 
 cameras: []

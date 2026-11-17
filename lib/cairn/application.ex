@@ -21,7 +21,7 @@ defmodule Cairn.Application do
       Cairn.Repo,
       {Ecto.Migrator,
        repos: Application.fetch_env!(:cairn, :ecto_repos), skip: skip_migrations?()},
-      # Before the config, whose load reads which board artifacts are missing.
+      # Before the config, whose load reads which artifacts are missing.
       # It only checks the disk: the download is the `Fetcher`'s, far below.
       {Cairn.Artifacts, enabled: artifacts?()},
       # After the migrated Repo, so a config source may read rows; before

@@ -2,8 +2,12 @@ defmodule Cairn.Artifacts do
   @moduledoc """
   Runtime files a release does not carry, stored as
   `<data_dir>/artifacts/<sha256>` and usable only once their bytes hash to
-  that name. The set starts as the board's (`c:Cairn.Stage.Board.artifacts/1`)
-  and grows through `want/1`.
+  that name. The set is fixed at start: the board's
+  (`c:Cairn.Stage.Board.artifacts/1`) and one per ladder rung in the
+  release's own profiles that names a file to fetch
+  (`Cairn.Config.Profile.fetch_entries/1`). A rung's entry carries no
+  `backend:`: a missing model refuses the groups that run its profile, where
+  a missing library would gate its whole backend.
 
   This process checks what is already on disk — synchronously and without the
   network, so that the config loaded right after it knows what is missing —
@@ -13,14 +17,14 @@ defmodule Cairn.Artifacts do
   table, a store that has been up is taken to be restarting: each backend
   any of its artifacts is needed for, as published in `:persistent_term`, is
   unusable, its status unknown. One never started (as in tests) published
-  nothing, and nothing is missing.
+  nothing: no backend is unusable, and `state/2` says it is not running.
 
-  An artifact with `env:` — the board's only, as `want/1` drops the key —
-  names a variable. Unless the operator already set it, it is set to the
-  file's path whether or not the file is there yet, so the board's preflight
-  and the canary — a subprocess that inherits the VM's environment — see
-  where it will be. Set by the operator, the artifact is overridden: the
-  operator supplied the file, and it is neither fetched nor checked.
+  An artifact with `env:` — only the board's has one — names a variable.
+  Unless the operator already set it, it is set to the file's path whether
+  or not the file is there yet, so the board's preflight and the canary — a
+  subprocess that inherits the VM's environment — see where it will be. Set
+  by the operator, the artifact is overridden: the operator supplied the
+  file, and it is neither fetched nor checked.
   """
 
   use GenServer
@@ -28,6 +32,7 @@ defmodule Cairn.Artifacts do
   require Logger
 
   alias Cairn.Config
+  alias Cairn.Config.Profile
 
   @type status :: :verified | :overridden | :missing
 
@@ -65,10 +70,43 @@ defmodule Cairn.Artifacts do
   @doc "The file for `sha256` once verified, or the operator's; else `nil`."
   @spec path(String.t(), atom()) :: Path.t() | nil
   def path(sha256, table \\ __MODULE__) do
-    case lookup(table, String.downcase(sha256)) do
-      %{status: status, path: path} when status in [:verified, :overridden] -> path
-      _missing_or_unknown -> nil
+    case state(sha256, table) do
+      {:ok, path} -> path
+      {:missing, _why} -> nil
     end
+  end
+
+  @doc "The `name:` of the entry for `sha256`, or `nil` for anything this store does not hold."
+  @spec name(String.t(), atom()) :: String.t() | nil
+  def name(sha256, table \\ __MODULE__) do
+    with true <- is_binary(sha256) and byte_size(sha256) == 64,
+         %{name: name} <- lookup(table, String.downcase(sha256)) do
+      name
+    else
+      _ -> nil
+    end
+  end
+
+  @doc """
+  One artifact as the config layer reads it, never raising: its file once
+  usable, else why not — the last fetch's failure (`nil` before the first
+  attempt), `:unlisted` for one this store does not hold, and with no table
+  `:restarting` for a store that has been up, `:not_started` for one never
+  started.
+  """
+  @spec state(String.t(), atom()) ::
+          {:ok, Path.t()} | {:missing, String.t() | nil | :unlisted | :restarting | :not_started}
+  def state(sha256, table \\ __MODULE__) do
+    case lookup(table, String.downcase(sha256)) do
+      %{status: status, path: path} when status in [:verified, :overridden] -> {:ok, path}
+      %{failure: failure} -> {:missing, failure}
+      nil -> {:missing, :unlisted}
+      :no_table -> {:missing, no_table(table)}
+    end
+  end
+
+  defp no_table(table) do
+    if :persistent_term.get({__MODULE__, table}, nil), do: :restarting, else: :not_started
   end
 
   @doc """
@@ -89,14 +127,6 @@ defmodule Cairn.Artifacts do
     |> Enum.filter(&is_binary(&1.backend))
     |> Enum.group_by(& &1.backend, &%{name: &1.name, failure: failure.(&1)})
   end
-
-  @doc """
-  Adds artifacts to the set, without their `env:`: only the board's may export
-  a variable. The fetcher is woken for any that are missing.
-  """
-  @spec want([map()], atom()) :: :ok
-  def want(artifacts, server \\ __MODULE__) when is_list(artifacts),
-    do: GenServer.cast(server, {:want, artifacts})
 
   @doc false
   @spec missing(atom()) :: [entry()]
@@ -125,7 +155,7 @@ defmodule Cairn.Artifacts do
       [] -> nil
     end
   rescue
-    ArgumentError -> nil
+    ArgumentError -> :no_table
   end
 
   defp entries(table) do
@@ -139,8 +169,7 @@ defmodule Cairn.Artifacts do
     name = Keyword.get(opts, :name, __MODULE__)
     dir = Keyword.get_lazy(opts, :dir, &default_dir/0)
 
-    artifacts =
-      Keyword.get_lazy(opts, :artifacts, fn -> Cairn.Board.module().artifacts(%{}) end)
+    artifacts = Keyword.get_lazy(opts, :artifacts, &default_artifacts/0)
 
     restarted? = :persistent_term.get({__MODULE__, name}, nil) != nil
 
@@ -174,6 +203,11 @@ defmodule Cairn.Artifacts do
     {:ok, state}
   end
 
+  defp default_artifacts do
+    board = Cairn.Board.module()
+    board.artifacts(%{}) ++ Profile.fetch_entries(Config.release_profile_dirs(board))
+  end
+
   # What `unusable/1` answers with no table. Never erased: it is what marks
   # this store as having been up.
   defp publish(state) do
@@ -193,16 +227,6 @@ defmodule Cairn.Artifacts do
     do: dir |> Path.join("*.part") |> Path.wildcard() |> Enum.each(&File.rm/1)
 
   @impl true
-  def handle_cast({:want, artifacts}, state) do
-    for artifact <- artifacts,
-        do: register(state, if(is_map(artifact), do: Map.delete(artifact, :env), else: artifact))
-
-    publish(state)
-    if missing(state.table) != [], do: GenServer.cast(state.fetcher, :work)
-    {:noreply, state}
-  end
-
-  @impl true
   def handle_call({:record, sha256, outcome}, _from, state) do
     case :ets.lookup(state.table, sha256) do
       [{^sha256, entry}] -> :ets.insert(state.table, {sha256, recorded(entry, outcome)})
@@ -215,8 +239,7 @@ defmodule Cairn.Artifacts do
   defp recorded(entry, :verified), do: %{entry | status: :verified, failure: nil}
   defp recorded(entry, {:failed, failure}), do: %{entry | status: :missing, failure: failure}
 
-  # An artifact already in the table keeps its status: a second `want/1` of a
-  # verified file must not hash it again or forget it was overridden.
+  # The first entry for a hash is the one kept: two profiles may name one file.
   defp register(state, %{name: name, url: url, sha256: sha256} = artifact)
        when is_binary(name) and is_binary(url) and is_binary(sha256) do
     sha256 = String.downcase(sha256)

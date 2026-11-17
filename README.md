@@ -42,9 +42,10 @@ it. Details in `docs/architecture.md`.
   family, the inference backend, the rate (a declared fps band, or derived
   per rung) and the tracker stages that go with it. A plugin group names
   its profile and config load expands it into the engine's model config and
-  the host's tracking policy, so the two halves cannot disagree. Four ship
-  in `priv/profiles/`; writing one for a new board needs no code change —
-  see [`docs/profile-authoring.md`](docs/profile-authoring.md).
+  the host's tracking policy, so the two halves cannot disagree. Shipped
+  ones live in `priv/profiles/` and a board's own directory; writing one for
+  a new board needs no code change — see
+  [`docs/profile-authoring.md`](docs/profile-authoring.md).
 - **Retention**: per-label day counts, plus emergency cleanup that
   deletes oldest events when disk runs low.
 

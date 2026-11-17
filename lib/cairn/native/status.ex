@@ -269,9 +269,14 @@ defmodule Cairn.Native.Status do
 
   # The configured model is a path on this box, and everything here is served
   # through `/api` and the SSE stream, which never emit one (`docs/ha-api.md`).
-  # The file's name is what identifies the model to an operator.
+  # The file's name is what identifies the model to an operator — but a fetched
+  # model's file is named by its hash, so its entry's name stands in.
   defp model_name(nil), do: nil
-  defp model_name(model), do: Path.basename(model)
+
+  defp model_name(model) do
+    base = Path.basename(model)
+    Cairn.Artifacts.name(base) || base
+  end
 
   # Tuples carry a message `headline/1` has already spent; what is left is the
   # class, which is what a surface groups and filters on.
