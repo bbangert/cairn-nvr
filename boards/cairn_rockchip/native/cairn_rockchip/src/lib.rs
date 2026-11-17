@@ -12,6 +12,8 @@
 //!
 //! No `cpu_baseline_ms`: the host measures the CPU baseline in a subprocess.
 
+pub mod mpp;
+pub mod probe;
 pub mod rknn;
 
 use std::sync::Arc;
