@@ -3,11 +3,13 @@ defmodule Cairn.Artifacts.Fetcher do
   Downloads what `Cairn.Artifacts` has missing, one at a time, and reloads the
   config after a pass that verified a file: a config refused for want of the
   file loads once it is there. That reload is owed until one succeeds, as is
-  the one a restarted store asks for; until then the pass is retried, and
-  fetches only what is still missing. A failure is recorded on the artifact,
-  for the config error to name, and reloads when its text changed, since only
-  a load refreshes that error — best effort, never owed. A pass is retried
-  after a backoff of 5 s doubling to 5 min, for as long as the node runs.
+  the one a restarted store asks for and the one this process starts with
+  when it is itself restarted, not knowing what the last one owed; until then
+  the pass is retried, and fetches only what is still missing. A failure is
+  recorded on the artifact, for the config error to name, and reloads when
+  its text changed, since only a load refreshes that error — best effort,
+  never owed. A pass is retried after a backoff of 5 s doubling to 5 min, for
+  as long as the node runs.
 
   Nothing a fetch does may crash this process: the application's top
   supervisor allows three restarts in five seconds and takes the node down on
@@ -60,6 +62,9 @@ defmodule Cairn.Artifacts.Fetcher do
 
   @impl true
   def init(opts) do
+    after_boot? = Keyword.get(opts, :after_boot, false)
+    booted? = :persistent_term.get({__MODULE__, :boot_done, name(opts)}, false)
+
     state = %{
       artifacts: Keyword.get(opts, :artifacts, Artifacts),
       fetch: Keyword.get(opts, :fetch, &HTTP.fetch/2),
@@ -68,21 +73,19 @@ defmodule Cairn.Artifacts.Fetcher do
       initial_backoff: Keyword.get(opts, :initial_backoff_ms, @initial_backoff_ms),
       max_backoff: Keyword.get(opts, :max_backoff_ms, @max_backoff_ms),
       attempt_timeout: Keyword.get(opts, :attempt_timeout_ms, @attempt_timeout_ms),
-      held: held?(opts),
+      held: after_boot? and not booted?,
       backoff: nil,
       retry: nil,
-      # While a reload is owed: the file it follows (`nil`: the store's
-      # restart), and whether a failure of it was logged.
-      owed: nil
+      # While a reload is owed: the file it follows, or whose restart, and
+      # whether a failure of it was logged. Started after Boot ended, this is
+      # a restart.
+      owed: if(after_boot? and booted?, do: %{for: :fetcher, logged?: false})
     }
 
     {:ok, %{state | backoff: state.initial_backoff}, {:continue, :work}}
   end
 
-  defp held?(opts) do
-    done = {__MODULE__, :boot_done, Keyword.get(opts, :name, __MODULE__)}
-    Keyword.get(opts, :after_boot, false) and not :persistent_term.get(done, false)
-  end
+  defp name(opts), do: Keyword.get(opts, :name, __MODULE__)
 
   @impl true
   def handle_continue(:work, state), do: {:noreply, work(state)}
@@ -92,7 +95,7 @@ defmodule Cairn.Artifacts.Fetcher do
   def handle_cast(:boot_done, state), do: {:noreply, work(%{state | held: false})}
 
   def handle_cast(:reload, state),
-    do: {:noreply, work(%{state | owed: state.owed || %{name: nil, logged?: false}})}
+    do: {:noreply, work(%{state | owed: state.owed || %{for: :store, logged?: false}})}
 
   def handle_cast(_message, state), do: {:noreply, state}
 
@@ -144,7 +147,7 @@ defmodule Cairn.Artifacts.Fetcher do
   defp outcome(state, entry, :ok) do
     Logger.info("artifacts: #{entry.name} fetched and verified (#{entry.sha256})")
     record(state, entry, :verified)
-    {:ok, %{state | owed: %{name: entry.name, logged?: false}}}
+    {:ok, %{state | owed: %{for: entry.name, logged?: false}}}
   end
 
   defp outcome(state, entry, {:error, failure}) do
@@ -245,11 +248,12 @@ defmodule Cairn.Artifacts.Fetcher do
   defp settle(%{owed: nil} = state), do: state
 
   defp settle(%{owed: owed} = state) do
-    what = owed.name || "the store's restart"
+    file? = is_binary(owed.for)
+    what = if file?, do: owed.for, else: "the #{owed.for}'s restart"
 
     case reload(state) do
       :ok ->
-        line = if owed.name, do: "with #{what} in place", else: "after #{what}"
+        line = if file?, do: "with #{what} in place", else: "after #{what}"
         Logger.info("artifacts: config reloaded #{line}#{if owed.logged?, do: ", on a retry"}")
         %{state | owed: nil}
 

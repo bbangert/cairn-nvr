@@ -346,6 +346,38 @@ defmodule Cairn.ArtifactsTest do
       Artifacts.want([named("b")], ctx.store)
       assert_receive {:attempt, 2, %{name: "b"}, _unusable}, @wait
     end
+
+    test "restarted after boot, it owes a reload: the last one's may have been refused", ctx do
+      start_store(ctx, [artifact()])
+      test = self()
+      reloads = :counters.new(1, [])
+
+      reload = fn ->
+        :counters.add(reloads, 1, 1)
+        n = :counters.get(reloads, 1)
+        send(test, {:reload, n})
+        if n == 1, do: {:error, ["db down"]}, else: {:ok, %{}, []}
+      end
+
+      # A backoff the test never waits out: only the restart reloads again.
+      opts = [
+        after_boot: true,
+        reload: reload,
+        initial_backoff_ms: 60_000,
+        max_backoff_ms: 60_000
+      ]
+
+      pid = start_fetcher(ctx, writes(@content), opts)
+      Fetcher.boot_done(ctx.fetcher)
+      assert_receive {:reload, 1}, @wait
+      assert %{owed: %{for: "lib.so"}} = :sys.get_state(ctx.fetcher)
+      Process.exit(pid, :kill)
+      assert_receive {:reload, 2}, @wait
+      assert %{owed: nil, retry: nil} = :sys.get_state(ctx.fetcher)
+
+      assert_received {:attempt, 1, _artifact, _unusable}
+      refute_received {:attempt, 2, _artifact, _unusable}
+    end
   end
 
   describe "the https fetch's hops" do
