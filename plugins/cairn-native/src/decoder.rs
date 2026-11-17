@@ -7,7 +7,7 @@
 //! tensor packed on the far side (`model_input_from_rgb`) is the one the
 //! unsplit path would have packed. The rate gate does *not* live here — the
 //! caller passes `sample` per access unit and owns the wall clock
-//! (`Cairn.Pipeline.SampleGate`) — but every access unit is decoded whatever
+//! (`Cairn.Stage.SampleGate`) — but every access unit is decoded whatever
 //! `sample` says, because a stateful decoder needs its references.
 //!
 //! The tolerated per-frame failures (a decode error mid-GOP, a frame that

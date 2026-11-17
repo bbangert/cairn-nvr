@@ -1,7 +1,7 @@
-defmodule Cairn.Pipeline.SampleGateTest do
+defmodule Cairn.Stage.SampleGateTest do
   use ExUnit.Case, async: true
 
-  alias Cairn.Pipeline.SampleGate
+  alias Cairn.Stage.SampleGate
 
   test "the interval is the crate's own arithmetic: integer nanoseconds" do
     # `decode::sample_interval` is `1_000_000_000 / fps` in integer nanos; a

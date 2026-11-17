@@ -337,7 +337,7 @@ defmodule Cairn.Config.Profile do
   def ladder_floor(tier), do: Map.get(@ladder_floors, tier)
 
   @doc """
-  The rate `Cairn.Pipeline.SampleGate` actually delivers for a nominal `fps`
+  The rate `Cairn.Stage.SampleGate` actually delivers for a nominal `fps`
   on the measured substream grid: admissions land on frame slots, so the gate
   opens every `ceil(grid / fps)` frames — "2 fps" is 1.875/s. An exact
   divisor (5 → every 3rd frame) is returned undamped although jitter

@@ -270,7 +270,7 @@ defmodule Cairn.Pipeline.Inference do
   # The epoch is fixed at `open_stream` (`push_frame/5` carries none), so a new
   # session is a new stream. The cooldown is cleared with it: a refused open
   # this element is waiting out was made for the OLD session and says nothing
-  # about the new one — the same reasoning `Cairn.Pipeline.Decoder` applies to
+  # about the new one — the same reasoning `Cairn.Stage.DecoderCore` applies to
   # a geometry change.
   # A parked element calls into its provider for nothing, boundary included.
   defp for_epoch(%{engine: :dead} = state, _epoch), do: state

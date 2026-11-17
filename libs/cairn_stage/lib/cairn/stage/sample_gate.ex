@@ -1,12 +1,12 @@
-defmodule Cairn.Pipeline.SampleGate do
+defmodule Cairn.Stage.SampleGate do
   @moduledoc """
   The wall-clock rate gate: which decoded frames become *model passes*.
 
   `sample_fps`'s one home. The crate used to hold this rule (`Stream::push_au`,
   after the decoder and before the tensor); with decode its own element the
-  rule lives in the pipeline, and nothing native second-guesses it — the rate
-  no longer crosses the NIF boundary at all (the motion detector's calibration
-  window is sized on the frames' own pts, `Cairn.Motion`).
+  rule lives on the Elixir side, and nothing native second-guesses it — the
+  rate no longer crosses the NIF boundary at all (the motion detector's
+  calibration window is sized on the frames' own pts, `Cairn.Motion`).
 
   The semantics phase 3 of the membrane port measured for, restated:
 
@@ -21,8 +21,9 @@ defmodule Cairn.Pipeline.SampleGate do
       model pass.
 
   Two calls, because the admission is decided *before* the decode call and
-  spent only on its answer: `open?/2` before `Cairn.Native.decode_au/4`, then
-  `spend/2` when the gate was open and the decoder reported a completed frame.
+  spent only on its answer: `open?/2` before
+  `c:Cairn.Stage.DecoderNif.decode_au/4`, then `spend/2` when the gate was open
+  and the decoder reported a completed frame.
   """
 
   @enforce_keys [:interval_ns]
