@@ -69,8 +69,8 @@ tier: 2                    # optional; the capability rung this profile claims
 experimental: true         # this profile is unproven — see below
 backend: rknn              # which runtime executes the model
 model:                     # one artifact path per backend, not one model
-  onnx: models/yolox_nano.onnx
-  rknn: models/yolox_nano_rk3566.rknn
+  onnx: models/yolox_tiny.onnx
+  rknn: models/yolox_tiny_rk3566.rknn
 model_profile: yolox       # the detector family, from the plugin's catalog
 input_size: 416            # square N; the model's own geometry when omitted
 decoder: auto              # the *video* decode path — not the backend
@@ -426,15 +426,33 @@ Two rules come out of it, both from `docs/npu-backends.md`:
    suppression fused into its graph is refused on the NPU backends without
    anyone having to remember the rule exists.
 
-2. **An rknn conversion the model zoo does not cover must say so.** The rknn
-   model zoo's documented coverage is YOLOv5–v11; a profile pairing `rknn`
-   with any other family (`yolov10`, `rfdetr`, `yolo26` under either of its
-   profiles, and `yolox`, which no source read here places in that range)
-   must declare `experimental: true`. `yolov8split` is inside the range: its
-   generations are, and its cut is the layout the zoo's own post-process
-   reads. Undocumented is not "known broken" — it means the conversion is
-   outside what the zoo covers, which is exactly what the acknowledgement is
-   for.
+2. **An rknn conversion that was not measured to detect must say so.**
+   `yolox`, `yolov8split` and `yolo26split` converted to INT8 with
+   rknn-toolkit2 2.3.2, ran on the RK3566 NPU and detected. A profile pairing
+   `rknn` with any other family is refused unless it declares
+   `experimental: true`, and then loads with a warning that gives the same
+   reason:
+
+   - **The stock whole head** (`yolov8` and its row: `yolov9`, `yolo11`,
+     `yolo26`) carries pixel-range boxes and 0..1 scores in one tensor. INT8
+     gives a tensor one scale, which zeroes the scores: yolov8, yolo11 and
+     yolo26 converted and detected nothing in the toolkit's simulator (yolov9
+     was not tried). For a v8, v11 or 26 model, export the split head and
+     name `yolov8split` (or `yolo26split`) instead.
+   - **The end-to-end head** (`yolov10`), measured on yolo26's export of it:
+     no detections in INT8 in the simulator, and in FP16 on the board the
+     right scores and classes with wrong boxes.
+   - **`rfdetr`**: its INT8 scores are unusable in the simulator, and no
+     INT8 build was run on the board. Its FP16 build crashed librknnrt 2.3.2
+     there: the runtime has no GridSample op.
+
+   The verdict is per decode contract, not per model size: a yolox_nano
+   build passes this rule and detected nothing in INT8 in the simulator.
+   FP16 is not a way around it. The backend opens INT8 artifacts only and
+   refuses an FP16 build at load; the FP16 results above come from the
+   bench harness, where FP16 also ran about three times slower than INT8
+   end to end on the two models timed both ways (yolox_s, yolox_tiny).
+   `tools/rknn-export/README.md` in the source tree has the measurements.
 
 Both rules need a family to read. A profile that leaves `model_profile:` unset
 lets the plugin sniff the family from the model's own tensor shapes, which is
@@ -481,9 +499,11 @@ profile my-board: sample_fps must be an integer between 1 and 30, got "fast"
 profile my-board: sample_fps 6 contradicts fps_band [8, 12] — a declared
   sample_fps must fall inside its own fps_band
 profile my-board: tracking.bbd must be true, false or a params mapping, got 1
-profile my-board: rknn conversion is undocumented for model_profile rfdetr
-  (docs/npu-backends.md covers the model zoo's YOLOv5–v11) — declare
-  experimental: true to ship a conversion outside it
+profile my-board: model_profile yolov10 is not a proven rknn conversion: its
+  end-to-end output detects nothing in INT8 in the toolkit's simulator and
+  has wrong boxes in FP16 on the board, both measured on yolo26's export of
+  that head — experimental: true loads it regardless (measurements:
+  tools/rknn-export/README.md)
 profile my-board: model artifact models/gone.rknn does not exist or is not a
   regular file (relative paths resolve against the working directory the plugin
   is spawned from)
@@ -537,6 +557,8 @@ plugin detect: profile my-board names backend "rknn", which the <board> board
 profile my-board: CPU twin models/gone.onnx does not exist or is not a regular
   file — rknn will load and detect, but its health cannot be judged against
   the CPU
+profile my-board: model_ladder rung 2: experimental: true loads model_profile
+  yolov10, which is not a proven rknn conversion: <the same reason>
 ```
 
 The `cannot use on this host` warning is raised once per selected profile,

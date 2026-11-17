@@ -1,4 +1,5 @@
-# An undocumented rknn conversion with the acknowledgement the rule asks for.
+# An unproven rknn conversion, acknowledged: it loads, with a warning that
+# gives the reason.
 experimental: true
 backend: rknn
 model:

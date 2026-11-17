@@ -1,0 +1,13 @@
+# Rule 2 on a rung that names its own family: refused under the name the
+# rung wrote, though the profile's own family is proven.
+tier: 1
+backend: rknn
+model_profile: yolox
+model_ladder:
+  - model:
+      rknn: test/support/fixtures/models/stub.rknn
+      onnx: test/support/fixtures/models/stub.onnx
+    model_profile: yolo11
+    input_size: 640
+    engine_budget: 10
+supported_cameras: 4

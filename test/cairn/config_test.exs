@@ -3007,11 +3007,10 @@ defmodule Cairn.ConfigTest do
       assert {"yolov8", _row} = Profile.family("yolo26")
       assert {"rfdetr", _row} = Profile.family("RF-DETR ")
       # hyphens are spelling, so the split contracts resolve either way
-      assert {"yolov8split", %{nms: :host_side, rknn_conversion: :documented}} =
+      assert {"yolov8split", %{nms: :host_side, rknn_conversion: :proven}} =
                Profile.family("yolov8-split")
 
-      # yolo26 is past the zoo's range under this row as under yolov8's
-      assert {"yolo26split", %{nms: :host_side, rknn_conversion: :undocumented}} =
+      assert {"yolo26split", %{nms: :host_side, rknn_conversion: :proven}} =
                Profile.family("YOLO26-Split")
 
       assert Profile.family("yolov12") == nil
@@ -3024,22 +3023,24 @@ defmodule Cairn.ConfigTest do
     # (rockchip_release_test.exs, where rknn is on the menu) run the public
     # parse path through the same `check_capabilities/5`, so
     # the wiring is proven there and only this branch needs the direct call —
-    # splitting the two rules into separate functions breaks that composition
-    # and needs a public-path test for each half.
+    # giving the two rules separate entry points breaks that composition and
+    # needs a public-path test for each.
     test "a fused-NMS family is refused on a backend that cannot run the op" do
       acc = %{errors: [], warnings: []}
-      fused = {"fusednet", %{families: [], nms: :fused, rknn_conversion: :documented}}
+      fused = {"fusednet", %{families: [], nms: :fused, rknn_conversion: :proven}}
 
-      assert %{errors: [error]} = Profile.check_capabilities(acc, "synthetic", "qnn", true, fused)
-      assert error =~ "qnn backend requires an NMS-free family or host-side-NMS decode"
+      assert %{errors: [error]} =
+               Profile.check_capabilities(acc, "profile synthetic", "qnn", true, fused)
+
+      assert error =~ "profile synthetic: qnn backend requires an NMS-free family"
       assert error =~ "model_profile fusednet fuses the suppression op"
     end
 
     test "the same family is accepted on ort, which implements the op" do
       acc = %{errors: [], warnings: []}
-      fused = {"fusednet", %{families: [], nms: :fused, rknn_conversion: :documented}}
+      fused = {"fusednet", %{families: [], nms: :fused, rknn_conversion: :proven}}
 
-      assert Profile.check_capabilities(acc, "synthetic", "ort", true, fused) == acc
+      assert Profile.check_capabilities(acc, "profile synthetic", "ort", true, fused) == acc
     end
 
     test "an NMS-free family and a host-side-NMS one both load on qnn" do
@@ -3051,11 +3052,21 @@ defmodule Cairn.ConfigTest do
     end
 
     # Rule 2 itself runs where rknn is on the menu, in rockchip_release_test.exs.
-    test "yolo26 does not inherit its contract row's documented rknn conversion" do
-      # Conversion coverage is per FAMILY (the zoo documents through
-      # YOLOv11); yolo26 shares yolov8's decode contract, not its claim.
-      assert {"yolov8", %{rknn_conversion: :undocumented}} = Profile.family("yolo26")
-      assert {"yolov8", %{rknn_conversion: :documented}} = Profile.family("yolov11")
+    test "each unproven rknn conversion says what was measured, and where" do
+      # The verdict is per decode contract: yolo26's whole head shares it.
+      for name <- ~w(yolov8 yolov9 yolo11 yolov11 yolo26) do
+        assert {"yolov8", %{rknn_conversion: {:unproven, why}}} = Profile.family(name)
+        assert why =~ "one INT8 scale zeroes the scores"
+        assert why =~ "detected nothing in the toolkit's simulator"
+        assert why =~ "model_profile yolov8split for v8 and v11, yolo26split for yolo26"
+      end
+
+      assert {"yolov10", %{rknn_conversion: {:unproven, why}}} = Profile.family("yolov10")
+      assert why =~ "wrong boxes in FP16 on the board"
+      assert why =~ "measured on yolo26's export of that head"
+
+      assert {"rfdetr", %{rknn_conversion: {:unproven, why}}} = Profile.family("rfdetr")
+      assert why =~ "no INT8 build ran on the board, where its FP16 build crashed librknnrt 2.3.2"
     end
 
     test "an unknown model_profile is refused, naming the menu it must come from" do
