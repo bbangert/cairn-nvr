@@ -65,6 +65,7 @@ sftp -b put.sftp 192.168.2.155            # into /root/<dir>: ext4, exec-capable
 # board (nerves_ssh eval → sh): verify, load, run as the add-on would
 sha256sum -c SHA256SUMS && podman load -q -i cairn-image.tar
 podman run -d --name cairn-p1 --network host \
+  --security-opt unmask=/sys/firmware \
   --device /dev/mpp_service --device /dev/rga \
   --device /dev/dri/card1 --device /dev/dri/renderD129 \
   --device /dev/dma_heap/system --device /dev/dma_heap/system-uncached \
@@ -81,8 +82,10 @@ curl -H "Authorization: Bearer <integrations.token>" http://192.168.2.155:4000/a
 - `--network host` is what makes port 4000 reachable from the LAN; the
   RK3566 probe's hand-run found a published port (`-p`) was not.
 - A hand-run container is not a vagus app: nothing here exercises the
-  add-on's `config.yaml`. `/proc/device-tree` is absent without the add-on's
-  `devicetree: true`, which MPP needs before it registers a codec.
+  add-on's `config.yaml`. `unmask=/sys/firmware` stands in for its
+  `devicetree: true`: without it `/proc/device-tree` is absent, MPP matches
+  no SoC and `mpp_init` fails (`MPP_NOK`; every `--rk-probe` case, on the
+  HA Green).
 - The board's busybox has no `head`, `tr`, `tee`, `tar`, `wc`, `du` or `awk`;
   `grep`, `sed`, `cut` and `tail` are there.
 - The artifact expires after three days.
